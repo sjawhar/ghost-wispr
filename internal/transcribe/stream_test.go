@@ -109,6 +109,64 @@ func TestCapturedSinceCountsTheAudioQueuedBeforeTheClient(t *testing.T) {
 	}
 }
 
+// gateSocket takes writes only once open is closed, reporting each.
+type gateSocket struct {
+	entered chan struct{}
+	open    chan struct{}
+	got     chan int
+}
+
+func (s *gateSocket) Write(p []byte) (int, error) {
+	select {
+	case s.entered <- struct{}{}:
+	default:
+	}
+	<-s.open
+	s.got <- len(p)
+	return len(p), nil
+}
+
+func (*gateSocket) Close() error    { return nil }
+func (*gateSocket) Finalize() error { return nil }
+
+// TestADropBeforeAWordDoesNotCountForIt fails if audio the send queue dropped
+// before a word counts in how long ago that word was captured: every word
+// after a drop then read as captured that much earlier, until the next
+// reconnect, so recordings led with that much more audio, and a word spoken
+// after an ending session's recording closed was taken as spoken before.
+func TestADropBeforeAWordDoesNotCountForIt(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	socket := &gateSocket{entered: make(chan struct{}, 1), open: make(chan struct{}), got: make(chan int, 64)}
+	rc := NewResilientClient(ctx, func(context.Context) (io.WriteCloser, error) { return socket, nil }, ResilientConfig{}, nil, nil)
+	rc.reconnect(0)
+	sender := NewAsyncSender(ctx, rc, 3, nil)
+	_, _ = sender.Write(make([]byte, secondOfAudio)) // stream 0-1 s; this write waits on the uplink
+	<-socket.entered
+	_, _ = sender.Write(make([]byte, secondOfAudio)) // queued: stream 1-2 s
+	_, _ = sender.Write(make([]byte, secondOfAudio)) // queued: stream 2-3 s
+	_, _ = sender.Write(make([]byte, secondOfAudio)) // dropped
+	_, _ = sender.Write(make([]byte, secondOfAudio)) // dropped
+	close(socket.open)                               // the uplink recovers
+	for range 3 {
+		<-socket.got
+	}
+	for range 10 { // stream 3-13 s
+		_, _ = sender.Write(make([]byte, secondOfAudio))
+		<-socket.got
+	}
+	time.Sleep(50 * time.Millisecond) // the sender's last slot is back
+	// A word 5 s into the stream was captured 7 s into the capture, after
+	// the 2 s dropped; of the 15 s captured, 8 s came after it.
+	if got, want := rc.CapturedSince(5*time.Second), 8*time.Second; got != want {
+		t.Fatalf("CapturedSince(5s) = %v, want %v: the drop came before the word", got, want)
+	}
+	// A word 2 s into the stream came before the drop, which counts for it.
+	if got, want := rc.CapturedSince(2*time.Second), 13*time.Second; got != want {
+		t.Fatalf("CapturedSince(2s) = %v, want %v: the 2 s dropped came after the word", got, want)
+	}
+}
+
 // eventSocket logs its Close as "close <name>".
 type eventSocket struct {
 	name     string

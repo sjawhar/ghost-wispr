@@ -104,7 +104,14 @@ func NewManager(store Store, recorder Recorder, summarizer Summarizer, hub Event
 	detector.OnSessionEnd(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		_ = m.endCurrentSession(ctx)
+		// The silence is the current session's: a session that opens while
+		// this end waits for another (openWaitingSession) has its own timer.
+		m.mu.Lock()
+		silent := m.currentSessionID
+		m.mu.Unlock()
+		if silent != "" {
+			_ = m.endSession(ctx, silent)
+		}
 	})
 
 	return m
@@ -499,6 +506,13 @@ func (m *Manager) nextSessionID(taken string, startedAt time.Time) string {
 }
 
 func (m *Manager) endCurrentSession(ctx context.Context) error {
+	return m.endSession(ctx, "")
+}
+
+// endSession ends the current session, or, with want set, only session want:
+// if another session is current once any end under way is done, it ends
+// nothing and returns ErrNoActiveSession.
+func (m *Manager) endSession(ctx context.Context, want string) error {
 	m.mu.Lock()
 	// Another end of the session (silence timer, pause, stop) is under way: wait
 	// for it, up to ctx's deadline, instead of reporting no session while one
@@ -521,7 +535,7 @@ func (m *Manager) endCurrentSession(ctx context.Context) error {
 	}
 	sessionID := m.currentSessionID
 	startedAt := m.currentStartedAt
-	if sessionID == "" {
+	if sessionID == "" || (want != "" && sessionID != want) {
 		m.mu.Unlock()
 		return ErrNoActiveSession
 	}
@@ -1078,13 +1092,18 @@ func (m *Manager) recordingStart(now time.Time) time.Time {
 }
 
 // openWaitingSession opens the next session with the words spoken while the
-// last one was ending, which flushBuffer left in the buffer.
+// last one was ending, which flushBuffer left in the buffer, and starts its
+// silence timer: their utterance end came during the end, so the timer it
+// started may have run out before this session existed.
 func (m *Manager) openWaitingSession() {
 	if m.buffer.Len() == 0 {
 		return
 	}
 	if err := m.flushBuffer(); err != nil {
 		m.logger.Warn("could not save the words spoken while the last session ended", "operation", "end_session", "error", err)
+	}
+	if id, _ := m.ActiveSession(); id != "" {
+		m.detector.OnUtteranceEnd()
 	}
 }
 

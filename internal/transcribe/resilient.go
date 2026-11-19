@@ -94,15 +94,19 @@ func (rc *ResilientClient) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
-// Close stops reconnection attempts and closes the underlying client.
+// Close stops reconnection attempts and closes the underlying client. It
+// closes the client without holding Mu: a socket's close waits for its
+// reader, which may be timing a result's words (CapturedSince), and that
+// takes Mu.
 func (rc *ResilientClient) Close() error {
 	rc.cancel()
 
 	rc.Mu.Lock()
-	defer rc.Mu.Unlock()
+	client := rc.Client
+	rc.Mu.Unlock()
 
-	if rc.Client != nil {
-		return rc.Client.Close()
+	if client != nil {
+		return client.Close()
 	}
 	return nil
 }
@@ -182,12 +186,16 @@ func (rc *ResilientClient) reconnect(wait time.Duration) {
 		}
 
 		rc.Mu.Lock()
+		if rc.ctx.Err() != nil {
+			// Close ran during the dial, and closed the client it saw.
+			rc.Mu.Unlock()
+			_ = newClient.Close()
+			return
+		}
 		rc.Client = newClient
 		// The new socket's stream starts at the oldest buffered byte.
 		rc.origin = rc.accepted - int64(rc.Buffer.Len())
-		if rc.backlog != nil {
-			_, rc.skippedAtSwap = rc.backlog()
-		}
+		rc.keepDropsAfterLocked(rc.origin)
 		rc.setStateLocked(StateDraining)
 		rc.Mu.Unlock()
 
@@ -262,17 +270,21 @@ func (rc *ResilientClient) IsConnected() bool {
 // CapturedSince returns how much audio was captured after the point at into
 // the current socket's stream, the time Deepgram gives the words it hears:
 // the audio sent to that socket since, the audio buffered for it or for the
-// next, and the audio queued in front of the client (AsyncSender), with any
-// the queue dropped since the socket connected, which may count a little
-// too much and so lengthens a recording's lead, never shortens it. Audio
-// Finalize drops from the buffer is taken out of the stream, as it never
-// reaches the socket.
+// next, the audio queued in front of the client (AsyncSender), and the audio
+// that queue dropped after that point, which never reached the socket.
+// Audio Finalize drops from the buffer is taken out of the stream, as it
+// never reaches the socket.
 func (rc *ResilientClient) CapturedSince(at time.Duration) time.Duration {
 	rc.Mu.Lock()
-	since := rc.accepted - rc.origin - rc.streamBytes(at)
-	if rc.backlog != nil {
-		queued, skipped := rc.backlog()
-		since += queued + skipped - rc.skippedAtSwap
+	point := rc.origin + rc.streamBytes(at)
+	since := rc.accepted - point
+	if rc.queuedAhead != nil {
+		since += rc.queuedAhead()
+	}
+	for _, drop := range rc.drops {
+		if drop.at > point {
+			since += drop.n
+		}
 	}
 	rc.Mu.Unlock()
 	if since <= 0 {
@@ -281,13 +293,56 @@ func (rc *ResilientClient) CapturedSince(at time.Duration) time.Duration {
 	return rc.streamDuration(since)
 }
 
-// countBacklog makes CapturedSince count the audio an AsyncSender in front
-// of the client holds or dropped (backlogCounter).
-func (rc *ResilientClient) countBacklog(backlog func() (queued, skipped int64)) {
+// streamDrop is audio a send queue in front of the client dropped: n bytes
+// that would have come at, in the count of the bytes Write takes.
+type streamDrop struct{ at, n int64 }
+
+// maxStreamDrops bounds the drops the client remembers: past it, the oldest
+// two merge into one at the later place, which counts the earlier one's
+// bytes after a few more words than it should, and so only lengthens a
+// recording's lead.
+const maxStreamDrops = 1024
+
+// watchSendQueue makes CapturedSince count the audio an AsyncSender in
+// front of the client holds (sendQueueWatcher).
+func (rc *ResilientClient) watchSendQueue(queued func() int64) {
 	rc.Mu.Lock()
 	defer rc.Mu.Unlock()
-	rc.backlog = backlog
-	_, rc.skippedAtSwap = backlog()
+	rc.queuedAhead = queued
+}
+
+// sendQueueDropped records n bytes the send queue in front of the client
+// dropped: they come after every byte taken or queued so far
+// (sendQueueWatcher).
+func (rc *ResilientClient) sendQueueDropped(n int64) {
+	rc.Mu.Lock()
+	defer rc.Mu.Unlock()
+	at := rc.accepted
+	if rc.queuedAhead != nil {
+		at += rc.queuedAhead()
+	}
+	if last := len(rc.drops) - 1; last >= 0 && rc.drops[last].at == at {
+		rc.drops[last].n += n
+		return
+	}
+	if len(rc.drops) == maxStreamDrops {
+		rc.drops[1].n += rc.drops[0].n
+		rc.drops = rc.drops[1:]
+	}
+	rc.drops = append(rc.drops, streamDrop{at: at, n: n})
+}
+
+// keepDropsAfterLocked forgets the drops at or before from, the start of a
+// new socket's stream: no word Deepgram hears on it comes before them. It
+// must be called with Mu held.
+func (rc *ResilientClient) keepDropsAfterLocked(from int64) {
+	kept := rc.drops[:0]
+	for _, drop := range rc.drops {
+		if drop.at > from {
+			kept = append(kept, drop)
+		}
+	}
+	rc.drops = kept
 }
 
 // MaxBehind returns how far the stream Deepgram hears can fall behind the

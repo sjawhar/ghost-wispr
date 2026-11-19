@@ -5,9 +5,12 @@ import (
 	"io"
 	"slices"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	api "github.com/deepgram/deepgram-go-sdk/v3/pkg/api/listen/v1/websocket/interfaces"
 
 	"github.com/sjawhar/ghost-wispr/internal/audio"
 )
@@ -75,32 +78,42 @@ func TestNoHoldWhileASessionIsOpen(t *testing.T) {
 	}
 }
 
-// slowEndRecorder is the real recorder whose EndSession, once the recording
-// is closed, waits for release: the time the MP3 encode and the session row's
-// write take while the session is still current.
+// slowEndRecorder is the real recorder whose first EndSession, once the
+// recording is closed, waits for release: the time the MP3 encode and the
+// session row's write take while the session is still current.
 type slowEndRecorder struct {
 	*audio.Recorder
+	once    sync.Once
 	closed  chan struct{}
 	release chan struct{}
 }
 
 func (s *slowEndRecorder) EndSession(id string) (string, error) {
 	path, err := s.Recorder.EndSession(id)
-	close(s.closed)
-	<-s.release
+	first := false
+	s.once.Do(func() { first = true; close(s.closed) })
+	if first {
+		<-s.release
+	}
 	return path, err
 }
 
-// endingCapture is a capture whose recorder holds each session end open
-// after its recording closes, until the test releases it.
+// endingCapture is a capture whose recorder holds its first session end
+// open after the recording closes, until the test releases it.
 func endingCapture(t *testing.T) (*capture, *slowEndRecorder) {
 	t.Helper()
-	var slow *slowEndRecorder
-	c := newCaptureOn(t, func(r *audio.Recorder) Recorder {
-		slow = &slowEndRecorder{Recorder: r, closed: make(chan struct{}), release: make(chan struct{})}
-		return slow
-	})
-	return c, slow
+	return endingCaptureWithTimeout(t, time.Hour)
+}
+
+// endingCaptureWithTimeout is endingCapture with a silence timeout.
+func endingCaptureWithTimeout(t *testing.T, timeout time.Duration) (*capture, *slowEndRecorder) {
+	t.Helper()
+	dir := t.TempDir()
+	recorder := audio.NewRecorder(dir)
+	slow := &slowEndRecorder{Recorder: recorder, closed: make(chan struct{}), release: make(chan struct{})}
+	store := newStoreMock()
+	manager := NewManager(store, slow, nil, nil, NewDetector(timeout), 0)
+	return &capture{t: t, dir: dir, store: store, recorder: recorder, manager: manager, mic: recorder.Writer(io.Discard)}, slow
 }
 
 // TestWordsSpokenWhileASessionEndsOpenTheNextSession fails if words spoken
@@ -204,5 +217,90 @@ func TestASessionStartsWhenItsRecordingDoes(t *testing.T) {
 	c.store.mu.Unlock()
 	if started.Before(before.Add(-lead-time.Second)) || started.After(after.Add(-lead+time.Second)) {
 		t.Fatalf("the session started at %s; want its recording's start, %v before it began (%s)", started.Format(time.RFC3339Nano), lead, before.Format(time.RFC3339Nano))
+	}
+}
+
+// nextSession waits up to wait for a current session other than first.
+func (c *capture) nextSession(first string, wait time.Duration) string {
+	c.t.Helper()
+	deadline := time.Now().Add(wait)
+	for time.Now().Before(deadline) {
+		if next, _ := c.manager.ActiveSession(); next != "" && next != first {
+			return next
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	c.t.Fatalf("no session after %s opened within %v", first, wait)
+	return ""
+}
+
+// endsWithin reports whether session id is no longer current within wait.
+func (c *capture) endsWithin(id string, wait time.Duration) bool {
+	deadline := time.Now().Add(wait)
+	for time.Now().Before(deadline) {
+		if current, _ := c.manager.ActiveSession(); current != id {
+			return true
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	return false
+}
+
+// TestASessionWordsOpenAfterAnEndEndsAfterSilence fails if the session the
+// words spoken during a session end open has no silence timer. Their
+// utterance end armed the timer during the end; it fired while the end still
+// ran (an encode can take a minute), and its end gave up after 5 s, so the
+// next session recorded the empty room until someone spoke again.
+func TestASessionWordsOpenAfterAnEndEndsAfterSilence(t *testing.T) {
+	timeout := 200 * time.Millisecond
+	c, slow := endingCaptureWithTimeout(t, timeout)
+	c.say(1, 2)
+	c.hear(liveResult(t, true, true, "Bye."))
+	first, _ := c.manager.ActiveSession()
+	if err := c.manager.UtteranceEnd(&api.UtteranceEndResponse{}); err != nil {
+		t.Fatal(err)
+	}
+	<-slow.closed // the silence timer ended the first session; its encode runs
+	c.say(10)
+	c.hear(liveResult(t, true, true, "See", "you."))
+	if err := c.manager.UtteranceEnd(&api.UtteranceEndResponse{}); err != nil {
+		t.Fatal(err)
+	}
+	// The timer fires during the end, and its end waits 5 s for the end
+	// under way, then gives up.
+	time.Sleep(6 * time.Second)
+	close(slow.release)
+	next := c.nextSession(first, 2*time.Second)
+	if !c.endsWithin(next, 10*timeout) {
+		t.Fatalf("session %s, opened by words spoken while %s ended, is still open after %v of silence with a %v silence timeout", next, first, 10*timeout, timeout)
+	}
+}
+
+// TestASilenceTimerFromBeforeAnEndDoesNotEndTheNextSession fails if a silence
+// timer that fired while a session was ending ends the next session the
+// moment it opens: the timer was for silence before that session existed.
+func TestASilenceTimerFromBeforeAnEndDoesNotEndTheNextSession(t *testing.T) {
+	timeout := time.Second
+	c, slow := endingCaptureWithTimeout(t, timeout)
+	c.say(1, 2)
+	c.hear(liveResult(t, true, true, "Bye."))
+	first, _ := c.manager.ActiveSession()
+	if err := c.manager.UtteranceEnd(&api.UtteranceEndResponse{}); err != nil {
+		t.Fatal(err)
+	}
+	<-slow.closed
+	c.say(10)
+	c.hear(liveResult(t, true, true, "See", "you."))
+	if err := c.manager.UtteranceEnd(&api.UtteranceEndResponse{}); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(timeout + 500*time.Millisecond) // the timer fires; its end waits for the end under way
+	close(slow.release)
+	next := c.nextSession(first, 2*time.Second)
+	if c.endsWithin(next, timeout/2) {
+		t.Fatalf("session %s ended within %v of opening, before its own %v of silence: a timer from before it ended it", next, timeout/2, timeout)
+	}
+	if !c.endsWithin(next, 5*timeout) {
+		t.Fatalf("session %s is still open after %v of silence with a %v silence timeout", next, 5*timeout, timeout)
 	}
 }

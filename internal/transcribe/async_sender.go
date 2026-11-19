@@ -14,8 +14,9 @@ import (
 // slots in order. With every slot taken, Write drops the chunk; the recording
 // has it already. Finalize goes through the same queue, so it follows every
 // chunk written before it. A ResilientClient behind it counts the audio
-// queued and dropped here in its stream's clock (CapturedSince): that audio
-// was captured after any the client has, though it took none of it.
+// queued here, and each chunk dropped here at its place, in its stream's
+// clock (CapturedSince): that audio was captured after any the client has,
+// though it took none of it.
 type AsyncSender struct {
 	dst interface {
 		io.Writer
@@ -26,16 +27,17 @@ type AsyncSender struct {
 	queue   chan sendItem
 	dropped atomic.Int64
 	log     func(string, ...any)
-	// queued counts the bytes in slots not yet handed to dst, and skipped
-	// the bytes Write ever dropped.
-	queued  atomic.Int64
-	skipped atomic.Int64
+	// queued counts the bytes in slots not yet handed to dst.
+	queued atomic.Int64
+	// watcher is dst when it counts this queue (ResilientClient), else nil.
+	watcher sendQueueWatcher
 }
 
-// backlogCounter is a destination that counts the audio an AsyncSender
-// holds or dropped in front of it (ResilientClient).
-type backlogCounter interface {
-	countBacklog(backlog func() (queued, skipped int64))
+// sendQueueWatcher is a destination that counts, in its stream's clock, the
+// audio an AsyncSender in front of it holds and drops (ResilientClient).
+type sendQueueWatcher interface {
+	watchSendQueue(queued func() int64)
+	sendQueueDropped(n int64)
 }
 
 type sendItem struct {
@@ -65,16 +67,12 @@ func NewAsyncSender(ctx context.Context, dst interface {
 	for i := range chunks {
 		s.free <- i
 	}
-	if counter, ok := dst.(backlogCounter); ok {
-		counter.countBacklog(s.backlog)
+	if watcher, ok := dst.(sendQueueWatcher); ok {
+		s.watcher = watcher
+		watcher.watchSendQueue(s.queued.Load)
 	}
 	go s.run(ctx)
 	return s
-}
-
-// backlog returns the bytes queued for dst now and the bytes ever dropped.
-func (s *AsyncSender) backlog() (queued, skipped int64) {
-	return s.queued.Load(), s.skipped.Load()
 }
 
 // Write queues a copy of p and never blocks.
@@ -85,7 +83,9 @@ func (s *AsyncSender) Write(p []byte) (int, error) {
 		s.queued.Add(int64(len(p)))
 		s.queue <- sendItem{slot: i}
 	default:
-		s.skipped.Add(int64(len(p)))
+		if s.watcher != nil {
+			s.watcher.sendQueueDropped(int64(len(p)))
+		}
 		if s.dropped.Add(1) == 1 {
 			s.log("warning: live transcription is behind; dropping audio for it (the recording keeps it)")
 		}
