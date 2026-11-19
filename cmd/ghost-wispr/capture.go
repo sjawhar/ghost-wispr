@@ -614,9 +614,20 @@ func (g *captureGate) confirmMicOpen() error {
 // confirmMicOpenRed confirms the light red for a microphone open. Through
 // beforeMicOpenRed it writes the light only while the gate has not closed
 // since the open's mark (openAllowed), checked under the light's lock just
-// before the write: red says the unit records, so a pause never meets a light
-// lit red after it for an open that then opens nothing. Without
-// beforeMicOpenRed it is confirmMicStart.
+// before the write: red says the unit records, so a pause before that check
+// leaves the light as it was for an open that then opens nothing. A pause
+// after the check, while the confirmation takes its red hold and writes red,
+// does not stop that write: Pause takes no light lock, so that it never waits
+// on a light command in progress. A start is then refused under its red hold
+// (startUnderRed), opens nothing, releases the hold, and the light goes off
+// with the pause, within the half second a pause allows
+// (TestAPauseDuringAStartsRedWriteLetsTheLightGoOff, on the three start
+// paths). The mic loop instead opens the device under that red, then finds
+// the gate closed since its mark and closes the device before it streams it
+// (TestNoAudioCapturedDuringAPauseReachesTheRecording, a pause during the red
+// confirmation): no audio passes, and the light goes off once that open has
+// returned, with no bound tested. Without beforeMicOpenRed it is
+// confirmMicStart.
 func (g *captureGate) confirmMicOpenRed() error {
 	if g.beforeMicOpenRed == nil {
 		return g.confirmMicStart()

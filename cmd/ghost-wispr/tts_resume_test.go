@@ -356,8 +356,12 @@ func (w *ringCheckingRecording) Write(p []byte) (int, error) {
 // before the open, the resume opens the gate during the open's light settle,
 // and the light cannot change once the microphone is open. The microphone must
 // be closed, the Jabra darkened and the microphone opened again before audio
-// passes; the loop closes it without streaming it, since a pause came during
-// its open. The control has no pause during the open.
+// passes. The pause comes after the open's mark (markMicOpen), so the loop
+// closes that microphone after its open, before it streams any buffer: the
+// test fails if the loop streams it instead (the check after the open), not
+// if the ring guard (ringGuard) lets audio pass, which this race no longer
+// reaches. TestAJabraThatConnectsWhileRecordingIsLitBeforeAudioPasses tests
+// the ring guard. The control has no pause during the open.
 func TestNoAudioPassesWhileTheJabraRingShowsMuted(t *testing.T) {
 	for _, race := range []bool{false, true} {
 		name := "control, no pause during the open"

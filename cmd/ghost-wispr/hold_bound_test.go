@@ -561,6 +561,72 @@ func TestAPauseBeforeAStartsLightCheckLeavesTheLightOff(t *testing.T) {
 	}
 }
 
+// TestAPauseDuringAStartsRedWriteLetsTheLightGoOff fails if a pause that lands
+// after a start's light check passed, while the confirmation takes its red
+// hold and writes red, leaves the light red past lightOffBound, or lets the
+// start run. Pause takes no light lock, so that it never waits on a light
+// command, and the red write goes ahead (confirmMicOpenRed); the start is
+// refused under its red hold, which is then released, and the light must go
+// off within the bound of any pause, without the test waking the light
+// controller. The control checks that the pause landed in that window: the
+// light was written red after it. (Review 5975477041 of #93, its probe.)
+func TestAPauseDuringAStartsRedWriteLetsTheLightGoOff(t *testing.T) {
+	for _, tc := range pauseCancelledStartLoops {
+		t.Run(tc.name, func(t *testing.T) {
+			r := startLightRig(t, false)
+			type pausedAt struct {
+				when time.Time
+				ops  int
+			}
+			paused := make(chan pausedAt, 1)
+			var pause sync.Once
+			openRed := r.capture.beforeMicOpenRed
+			r.capture.beforeMicOpenRed = func(allowed func() error) error {
+				return openRed(func() error {
+					err := allowed()
+					if err == nil {
+						pause.Do(func() { // the check passed; the hold and the red write come next
+							pauseCapture(r.capture, r.hardware)
+							paused <- pausedAt{time.Now(), len(r.device.snapshot())}
+						})
+					}
+					return err
+				})
+			}
+			starts := tc.runOn(t, r.capture, func(int) error { return nil })
+			var at pausedAt
+			select {
+			case at = <-paused:
+			case <-time.After(testWait):
+				t.Fatal("no start passed its light check")
+			}
+			var ops []lightOp
+			redAfter, off := false, false
+			for deadline := at.when.Add(lightOffBound); ; time.Sleep(time.Millisecond) {
+				ops = r.device.snapshot()[at.ops:]
+				redAfter = slices.ContainsFunc(ops, func(op lightOp) bool { return !op.read && isRedOp(op) })
+				off = len(ops) > 0 && !isRedOp(ops[len(ops)-1])
+				if (redAfter && off) || time.Now().After(deadline) {
+					break
+				}
+			}
+			if !redAfter {
+				t.Fatalf("control: the light was not written red after the pause, so the pause did not land between the check and the red write: operations since the pause %v", ops)
+			}
+			if !off {
+				t.Fatalf("the light was still red %v after a pause during a start's red write: operations since the pause %v", lightOffBound, ops)
+			}
+			select {
+			case got := <-starts:
+				t.Fatalf("start %d ran after a pause during its red write", got)
+			default:
+			}
+			r.capture.Resume()
+			nextStart(t, starts, 1, "after the resume that followed the pause")
+		})
+	}
+}
+
 func receiveWithin(t *testing.T, ch <-chan int) int {
 	t.Helper()
 	select {

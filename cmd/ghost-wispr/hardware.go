@@ -397,6 +397,8 @@ func (h *hardwareControl) EnsureRed() error {
 // EnsureRedWhile is EnsureRed for a microphone open: it calls allowed, if not
 // nil, under the light's lock just before the red write, and if allowed
 // returns an error it writes nothing, takes no hold and returns that error.
+// A pause after allowed returned does not stop the write (captureGate's
+// confirmMicOpenRed says why, and how soon the light then goes off).
 func (h *hardwareControl) EnsureRedWhile(allowed func() error) error {
 	if h.stopped.Load() {
 		return fmt.Errorf("recording light stopped")
