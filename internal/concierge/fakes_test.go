@@ -140,9 +140,12 @@ func (f *fakeRecords) eventLimits() []int {
 	return append([]int(nil), f.limits...)
 }
 
-func (f *fakeRecords) DocumentText(_ context.Context, key, slug string) (string, error) {
+func (f *fakeRecords) DocumentText(ctx context.Context, key, slug string) (string, error) {
 	if f.err != nil {
 		return "", f.err
+	}
+	if err := ctx.Err(); err != nil {
+		return "", err
 	}
 	text, ok := f.docs[key+"/"+slug]
 	if !ok {

@@ -343,9 +343,11 @@ func (r *runner) readIssue(ctx context.Context, key string) (map[string]any, err
 		result["updated_ago"] = ago(now, issue.UpdatedAt)
 	}
 	if slug := issue.PrimaryDocument(); slug != "" {
-		if spec, err := records.DocumentText(ctx, issue.Key, slug); err == nil {
+		switch spec, err := records.DocumentText(ctx, issue.Key, slug); {
+		case err == nil:
 			result["spec_summary"] = cut(spec, specSummaryChars)
-		} else {
+		case ctx.Err() == nil:
+			// A read a newer target or a stop cancelled is no failure.
 			r.c.logger.Warn("concierge could not read an issue's spec", "issue", issue.Key, "error", err)
 		}
 	}

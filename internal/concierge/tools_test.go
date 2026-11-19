@@ -123,6 +123,27 @@ func TestReadIssueGivesStatusSpecSummaryAndRecentEvents(t *testing.T) {
 	}
 }
 
+// TestACancelledSpecReadLogsNoFailure: a read that a newer target or a stop
+// cancelled is no failure of Dispatch's, so it logs no warning; run 7's log
+// sent its readers after one.
+func TestACancelledSpecReadLogsNoFailure(t *testing.T) {
+	r := newRig(t)
+	logs := r.captureLogs()
+	issue := &dispatch.Issue{Key: "ABC-12", Title: "Realtime voice", Status: "in_progress", PrimaryArtifactID: "doc-1"}
+	issue.Artifacts = append(issue.Artifacts, struct {
+		ID   string `json:"id"`
+		Slug string `json:"slug"`
+	}{ID: "doc-1", Slug: "spec"})
+	r.records.issues["ABC-12"] = issue
+	r.records.docs["ABC-12/spec"] = "## Summary"
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, _ = (&runner{c: r.concierge, x: &r.exchange}).readIssue(ctx, "ABC-12")
+	if strings.Contains(logs.String(), "could not read an issue's spec") {
+		t.Fatalf("a cancelled read logged a failure: %s", logs)
+	}
+}
+
 func actor(kind, id, title string) dispatch.Actor {
 	var a dispatch.Actor
 	a.Kind, a.ID = kind, id

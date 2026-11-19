@@ -103,9 +103,22 @@ var errOutOfReach = fmt.Errorf("concierge: %w", voice.ErrUnreachable)
 // a read, a lookup or the ask, the voice says so and the error wraps
 // voice.ErrUnreachable, for R10's error sound.
 func (c *Concierge) Answer(parent context.Context, x *voice.Exchange, turn string, say voice.SayFunc) error {
+	sp := newSpeaker(parent, say)
+	err := c.answer(parent, x, turn, sp)
+	spokenErr := sp.wait()
+	switch {
+	case parent.Err() != nil:
+		return parent.Err()
+	case spokenErr != nil && !errors.Is(err, spokenErr):
+		return errors.Join(err, spokenErr)
+	}
+	return err
+}
+
+// answer is Answer's work, bounded by c.fastBound; sp speaks it.
+func (c *Concierge) answer(parent context.Context, x *voice.Exchange, turn string, sp *speaker) error {
 	ctx, cancel := context.WithTimeout(parent, c.fastBound)
 	defer cancel()
-	sp := &speaker{say: say}
 	defer sp.routeAfter(ctx, c.routingAfter, c.routingLine(ctx, turn))()
 	found := c.readFor(ctx, x, turn)
 	switch {
@@ -632,45 +645,119 @@ func (c *Concierge) rewriteForEar(ctx context.Context, written, reason string) (
 	return text, nil
 }
 
-// speaker says texts one at a time, through say, and keeps what it said. Its
-// routing line plays only when nothing else was said first.
+// speaker says texts in order, on a goroutine of its own, and keeps what it
+// queued. A voice's Say returns once a text's audio is queued, at playback
+// speed, so the speech runs under the exchange's context, apart from the
+// answer's work: the 8 s bound the Concierge's work (R6), and the model
+// writes while the room listens. Its routing line plays only when nothing
+// else was queued first.
 type speaker struct {
-	say    voice.SayFunc
-	mu     sync.Mutex
-	texts  []string
+	say voice.SayFunc
+	// ctx is the exchange's: a stop ends the speech.
+	ctx context.Context
+	mu  sync.Mutex
+	// texts are the texts queued, the routing line not counted.
+	texts []string
+	// queue waits for say; drained, while the goroutine runs, closes when
+	// it stops.
+	queue   []queuedText
+	drained chan struct{}
+	// err is the first Say that failed: nothing after it is said.
+	err    error
 	closed bool
 }
 
-// sayText says text as mode and keeps it.
+type queuedText struct {
+	text string
+	mode voice.SayMode
+}
+
+func newSpeaker(ctx context.Context, say voice.SayFunc) *speaker {
+	return &speaker{ctx: ctx, say: say}
+}
+
+// sayText queues text as mode and keeps it. ctx is the work's: nothing is
+// queued once it ended. The error is that of a Say that already failed.
 func (s *speaker) sayText(ctx context.Context, text string, mode voice.SayMode) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.err != nil {
+		return s.err
+	}
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if err := s.say(ctx, text, mode); err != nil {
-		return err
-	}
 	s.texts = append(s.texts, text)
+	s.enqueueLocked(text, mode)
 	return nil
 }
 
-// count is how many texts were said, the routing line not counted.
+// enqueueLocked queues text, and starts the goroutine that says the queue
+// when none runs. s.mu is held.
+func (s *speaker) enqueueLocked(text string, mode voice.SayMode) {
+	s.queue = append(s.queue, queuedText{text, mode})
+	if s.drained == nil {
+		s.drained = make(chan struct{})
+		go s.speak(s.drained)
+	}
+}
+
+// speak says the queue until it is empty, or a Say failed.
+func (s *speaker) speak(drained chan struct{}) {
+	for {
+		s.mu.Lock()
+		if len(s.queue) == 0 || s.err != nil {
+			s.queue, s.drained = nil, nil
+			s.mu.Unlock()
+			close(drained)
+			return
+		}
+		next := s.queue[0]
+		s.queue = s.queue[1:]
+		s.mu.Unlock()
+		err := s.ctx.Err()
+		if err == nil {
+			err = s.say(s.ctx, next.text, next.mode)
+		}
+		if err != nil {
+			s.mu.Lock()
+			s.err = err
+			s.mu.Unlock()
+		}
+	}
+}
+
+// wait returns once everything queued was said, or a Say failed, with that
+// failure.
+func (s *speaker) wait() error {
+	s.mu.Lock()
+	drained := s.drained
+	s.mu.Unlock()
+	if drained != nil {
+		<-drained
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.err
+}
+
+// count is how many texts were queued, the routing line not counted.
 func (s *speaker) count() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return len(s.texts)
 }
 
-// said is a copy of the texts said, the routing line not counted.
+// said is a copy of the texts queued, the routing line not counted.
 func (s *speaker) said() []string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return append([]string(nil), s.texts...)
 }
 
-// routeAfter says line after the wait when nothing was said by then (R6). The
-// returned stop ends it; once stop returns, the line is not said.
+// routeAfter queues line after the wait when nothing was queued by then
+// (R6). The returned stop ends it; once stop returns, the line is not
+// queued.
 func (s *speaker) routeAfter(ctx context.Context, wait time.Duration, line string) (stop func()) {
 	timer := time.AfterFunc(wait, func() {
 		s.mu.Lock()
@@ -679,7 +766,7 @@ func (s *speaker) routeAfter(ctx context.Context, wait time.Duration, line strin
 			return
 		}
 		s.closed = true
-		_ = s.say(ctx, line, voice.Ack)
+		s.enqueueLocked(line, voice.Ack)
 	})
 	return func() {
 		timer.Stop()

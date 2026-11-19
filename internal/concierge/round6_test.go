@@ -342,6 +342,53 @@ func TestTheRoutingLineOnlyWhenNothingWasSaid(t *testing.T) {
 	}
 }
 
+// TestSpeechDoesNotSpendTheAnswersBound (c-fast-answer, R6): a voice's Say
+// returns once a sentence's audio is queued, at playback speed. The answer's
+// 8 s bound the Concierge's work, not the room's listening: the model starts
+// while the holder's case still plays, and a slow voice cuts no fact. Run 7
+// of the end-to-end test lost every fast answer this way.
+func TestSpeechDoesNotSpendTheAnswersBound(t *testing.T) {
+	r := newRig(t)
+	r.concierge.fastBound = time.Second
+	heldIssue(r, "none", false)
+	r.model.turns = [][]*genai.GenerateContentResponse{{chunk(text("PR 80 is in review. It is in review."))}}
+	var mu sync.Mutex
+	var modelAt, leadPlayed time.Time
+	r.model.onCall = func(int) {
+		mu.Lock()
+		defer mu.Unlock()
+		if modelAt.IsZero() {
+			modelAt = time.Now()
+		}
+	}
+	var spoken []string
+	say := func(ctx context.Context, text string, _ voice.SayMode) error {
+		select {
+		case <-time.After(600 * time.Millisecond):
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		spoken = append(spoken, text)
+		if len(spoken) == 1 {
+			leadPlayed = time.Now()
+		}
+		return nil
+	}
+	if err := r.concierge.Answer(context.Background(), &r.exchange, "what is happening with ABC-12", say); err != nil {
+		t.Fatalf("Answer with a voice that plays 600 ms a sentence and a 1 s bound: %v", err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(spoken) != 3 {
+		t.Fatalf("spoken = %q, want the holder's case and both facts", spoken)
+	}
+	if !modelAt.Before(leadPlayed) {
+		t.Fatalf("the model started %v after the holder's case played, want before", modelAt.Sub(leadPlayed))
+	}
+}
+
 // TestAskAgentMessage (c-ask-holder, R7): the message holds the question's
 // words, the pointer and the read-only line, and nothing else; a retry of the
 // same question reuses its idempotency key.
