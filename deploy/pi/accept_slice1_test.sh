@@ -154,21 +154,36 @@ stopped() {
   done
   return 1
 }
+# The stop waits at most 5 s for the light's lock (flock -w 5), the Light hang step's own bound. Of
+# those 5 s the test takes its 0.5 s hold and the start of the one flock that lets the light go,
+# however slowly processes start on a loaded runner: until then it waits with shell builtins only
+# (reads of /proc, and timed-out reads of a pipe nothing writes to), and it runs ps only after.
+mkfifo "$state_dir/tick"
+exec {tick}<>"$state_dir/tick"
+# The other HID device's lock is not the light's: the test holds it throughout.
+exec {other_lock}<"$dev/hidraw0"
+flock "$other_lock"
 # The recorder is inside a command to the light, so it holds the light's lock.
 exec {light_lock}<"$dev/hidraw1"
 flock "$light_lock"
 bash -c "$(light_locked_stop_command "$recorder" "$sysfs" "$dev")" &
 stopper=$!
-sleep 0.5
-! stopped || fail "the Light hang step stopped the recorder while it held the blink(1)'s lock"
-# The other HID device's lock is not the light's: hold it, and let the light go.
-exec {other_lock}<"$dev/hidraw0"
-flock "$other_lock"
+# Once the stop's shell has run its command, a stop that did not wait for the lock has stopped the
+# recorder within the 0.5 s the test then holds it.
+for _ in {1..1000}; do
+  read -r stopper_command <"/proc/$stopper/comm" 2>/dev/null || break
+  [[ $stopper_command == bash ]] || break
+  read -r -t 0.01 -u "$tick" _ || :
+done
+read -r -t 0.5 -u "$tick" _ || :
+read -r recorder_stat <"/proc/$recorder/stat"
+recorder_state=${recorder_stat##*) }
 flock -u "$light_lock"
+[[ $recorder_state != T* ]] || fail "the Light hang step stopped the recorder while it held the blink(1)'s lock"
 wait "$stopper" || fail "the Light hang step's stop failed once the blink(1) was free"
 stopped || fail "the Light hang step did not stop the recorder once the blink(1) was free"
 kill -CONT "$recorder"
-exec {light_lock}<&- {other_lock}<&-
+exec {light_lock}<&- {other_lock}<&- {tick}<&-
 # With no blink(1), the stop fails and stops nothing.
 rm -- "$sysfs/class/hidraw/hidraw1/device/uevent"
 if bash -c "$(light_locked_stop_command "$recorder" "$sysfs" "$dev")"; then
