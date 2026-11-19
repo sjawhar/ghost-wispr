@@ -109,3 +109,57 @@ func TestSideTalkToADrivingVoiceGetsNoWords(t *testing.T) {
 		})
 	}
 }
+
+// didYouMean is the Concierge's question when a search has no one clear
+// match; the person's answer to it is no question.
+const didYouMean = "Did you mean ABC-12, Realtime voice, or ABC-13, Wake word?"
+
+// TestAnAnswerToWisprsQuestionContinuesTheExchange fails if a reply with no
+// wake phrase to a question Wispr itself asked ("Did you mean A or B?") is
+// taken for side talk because it is no question.
+func TestAnAnswerToWisprsQuestionContinuesTheExchange(t *testing.T) {
+	t.Run("tts", func(t *testing.T) {
+		c := newFakeConcierge()
+		c.acks = []string{didYouMean}
+		r := newRigWith(t, c, func(cfg *SupervisorConfig, _ *rig) { cfg.FollowUpWait = time.Minute })
+		sess := r.ask("what is happening with the voice work?")
+		waitSaid(t, sess)
+		r.speaker.finish(audio.InputVoice)
+		r.waitEvent("voice_spoken:sess-1")
+		r.heard("The first one.", true, true)
+		if got := r.waitTurn(); got != "The first one." {
+			t.Fatalf("the pick went to the Concierge as %q", got)
+		}
+	})
+	t.Run("driving", func(t *testing.T) {
+		c := newFakeConcierge()
+		c.acks = []string{didYouMean}
+		r := newDrivingRigWith(t, time.Minute, c)
+		r.s.cfg.FollowUpWait = time.Minute
+		r.heard("Wispr, what is happening with the voice work?", true, true)
+		sess := r.waitSession()
+		if _, err := sess.x.Tools.Run(t.Context(), ToolCall{ID: "d1", Name: AnswerTool, Args: json.RawMessage(`{}`)}); err != nil {
+			t.Fatalf("the answer tool: %v", err)
+		}
+		<-c.asked
+		r.waitSpeaking()
+		r.speaker.finish(audio.InputVoice)
+		eventually(t, "the follow-up window opened", func() bool {
+			r.s.mu.Lock()
+			defer r.s.mu.Unlock()
+			return r.s.ex != nil && r.s.ex.followUpTimer != nil
+		})
+		r.heard("The first one.", true, true)
+		if _, err := sess.x.Tools.Run(t.Context(), ToolCall{ID: "d2", Name: AnswerTool, Args: json.RawMessage(`{}`)}); err != nil {
+			t.Fatalf("the answer tool: %v", err)
+		}
+		select {
+		case got := <-c.asked:
+			if got != "The first one." {
+				t.Fatalf("the pick went to the Concierge as %q", got)
+			}
+		default:
+			t.Fatal("the pick was taken for side talk")
+		}
+	})
+}

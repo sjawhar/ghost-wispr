@@ -3,7 +3,10 @@ package voice
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"slices"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -102,6 +105,38 @@ func TestAnAnswerReturningAsTheFollowUpWindowCloses(t *testing.T) {
 	close(c.afterAcks)
 	<-done
 	never(t, "the exchange ended before the voice spoke the answer", 400*time.Millisecond, func() bool { _, _, closed := sess.state(); return closed })
+}
+
+// TestAnExchangeAtItsCapSaysSo fails if an exchange that reaches its
+// exchangeMax is not ended by the Supervisor, or ends logged as something
+// else, such as "the voice ended by itself" (GWGptLive's proof run).
+func TestAnExchangeAtItsCapSaysSo(t *testing.T) {
+	cap := exchangeMax
+	exchangeMax = 300 * time.Millisecond
+	t.Cleanup(func() { exchangeMax = cap })
+	var mu sync.Mutex
+	var logs []string
+	r := newRigWith(t, newFakeConcierge(), func(cfg *SupervisorConfig, r *rig) {
+		v := drivingVoice{r.voice}
+		cfg.Voice = func() (Voice, error) { return v, nil }
+		cfg.IdleWait = time.Minute
+		cfg.Logf = func(format string, args ...any) {
+			mu.Lock()
+			defer mu.Unlock()
+			logs = append(logs, fmt.Sprintf(format, args...))
+		}
+	})
+	r.heard("Wispr, what is happening?", true, true)
+	sess := r.waitSession()
+	eventually(t, "the exchange ended at its cap", func() bool { _, _, closed := sess.state(); return closed })
+	mu.Lock()
+	defer mu.Unlock()
+	for _, line := range logs {
+		if strings.Contains(line, "exchange ended") && strings.Contains(line, "limit of 300ms") {
+			return
+		}
+	}
+	t.Fatalf("no log line names the cap: %q", logs)
 }
 
 // TestAVoiceThatEndsByItselfEndsTheExchange fails if a session whose events
