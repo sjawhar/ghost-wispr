@@ -1,6 +1,7 @@
 package concierge
 
 import (
+	"regexp"
 	"strings"
 	"unicode"
 )
@@ -49,12 +50,28 @@ func init() {
 	}
 }
 
+// describedIssue finds where a turn describes the issue it means: "the issue
+// about realtime spoken conversation", up to where the question goes on.
+var describedIssue = regexp.MustCompile(`(?i)\b(?:issue|ticket|task|work|project|thing)s?\s+(?:about|on|for|called|named|of|with)\s+(.+?)(?:\s+(?:when|whether|if|and|but|what|how|why|who|which|so|because)\b|[?.!,;]|$)`)
+
 // searchTerms is what a search sends Dispatch for words said in the room:
 // their words that name work, at most maxSearchTerms, in order and once each.
-// What reads as an issue key ("infra 4592", but also "the last 30") is left
-// out: a read tries it as a key. Dispatch gets the fewest words, never the
-// sentence; empty when none of the words names work.
+// A turn that describes the issue ("the issue about X") gives the
+// description's words alone. What reads as an issue key ("infra 4592", but
+// also "the last 30") is left out: a read tries it as a key. Dispatch gets
+// the fewest words, never the sentence; empty when none of the words names
+// work.
 func searchTerms(words string) string {
+	if match := describedIssue.FindStringSubmatch(words); match != nil {
+		if terms := workWords(match[1]); terms != "" {
+			return terms
+		}
+	}
+	return workWords(words)
+}
+
+// workWords is the words of text that name work, at most maxSearchTerms.
+func workWords(text string) string {
 	var terms []string
 	seen := map[string]bool{}
 	add := func(term string) {
@@ -63,7 +80,7 @@ func searchTerms(words string) string {
 			terms = append(terms, term)
 		}
 	}
-	rest := spokenKey.ReplaceAllString(words, " ")
+	rest := spokenKey.ReplaceAllString(text, " ")
 	for _, word := range strings.FieldsFunc(strings.ToLower(rest), func(r rune) bool {
 		return !unicode.IsLetter(r) && !unicode.IsDigit(r) && r != '\''
 	}) {

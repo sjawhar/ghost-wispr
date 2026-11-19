@@ -313,6 +313,9 @@ func TestWhenToAskTheHolder(t *testing.T) {
 		{"where, not about status", "where does ABC-12 keep the session tokens", false, false, "where does ABC-12 keep the session tokens"},
 		{"state, not about status", "what state does the parser of ABC-12 keep", false, false, "what state does the parser of ABC-12 keep"},
 		{"new, not about status", "is the new retry on ABC-12 safe to run twice", false, false, "is the new retry on ABC-12 safe to run twice"},
+		{"who, not about the holder", "who decided to drop the cache on ABC-12", false, false, "who decided to drop the cache on ABC-12"},
+		{"can you ask", "can you ask ABC-12 for a status update", false, false, "can you ask ABC-12 for a status update"},
+		{"going to, not about status", "is the migration on ABC-12 going to drop the old table", false, false, "is the migration on ABC-12 going to drop the old table"},
 	} {
 		r := newRig(t)
 		heldIssue(r, "session", c.stale)
@@ -486,9 +489,10 @@ func TestAskAgentMessage(t *testing.T) {
 //   - The same question again in one exchange, while the first waits, sends
 //     nothing and replaces nothing.
 //   - A retry after a send that Envoy stored but did not confirm reuses its
-//     key; its task keeps its local id, and the holder's reply to the event
-//     the unit never learned gets the request to reply again, whose reply
-//     lands on the task.
+//     key. When Envoy answers that it holds it already, the holder may have
+//     answered the event the unit never learned, and that reply was dropped:
+//     the unit at once asks the holder to send its answer again, and that
+//     reply lands on the task.
 //   - A new question after a replace gets a key of its own, so it reaches
 //     the holder.
 func TestARepeatedQuestionKeepsItsAnswer(t *testing.T) {
@@ -521,26 +525,25 @@ func TestARepeatedQuestionKeepsItsAnswer(t *testing.T) {
 	if result := r.run(t, "ask_agent", ask); result["error"] != questionNotSent {
 		t.Fatalf("control: a send that failed answered %v", result)
 	}
+	// The holder answers the question Envoy stored; the unit never learned
+	// its event and holds no task for it, so the reply finds nothing.
+	if err := r.concierge.Deliver(context.Background(), &envoy.Message{EventID: "reply-0", SourceSession: "agent-7", InReplyTo: "evt-1", Text: "Yes."}); err != nil {
+		t.Fatal(err)
+	}
 	r.agents.landedErr = nil
 	result := r.run(t, "ask_agent", ask)
-	if keys := r.agents.attempts; len(keys) != 2 || keys[0].IdempotencyKey != keys[1].IdempotencyKey {
+	if keys := r.agents.attempts; len(keys) < 2 || keys[0].IdempotencyKey != keys[1].IdempotencyKey {
 		t.Fatalf("attempts %+v, want one key reused", keys)
 	}
 	taskID, _ := result["task_id"].(string)
-	if strings.HasPrefix(taskID, "unstored-") || taskID == "" {
-		t.Fatalf("the retry's task is %q, an event Envoy never stored", taskID)
-	}
 	if task, err := r.store.VoiceTask(taskID); err != nil || task.State != storage.VoiceTaskWorking {
-		t.Fatalf("the retry's task = %+v, %v; want working", task, err)
+		t.Fatalf("the retry's task %q = %+v, %v; want working", taskID, task, err)
 	}
-	if err := r.concierge.Deliver(context.Background(), &envoy.Message{EventID: "reply-1", SourceSession: "agent-7", InReplyTo: "evt-1", Text: "Yes."}); err != nil {
-		t.Fatal(err)
-	}
-	if len(r.agents.sent) != 2 || r.agents.sent[1].InReplyTo != "reply-1" {
-		t.Fatalf("sent %+v; want the request to reply again, in reply to reply-1", r.agents.sent)
+	if len(r.agents.sent) != 2 || r.agents.sent[1].NoReply || !strings.Contains(r.agents.sent[1].Message, "send that answer again") {
+		t.Fatalf("sent %+v; want, at once, the request to send the answer again", r.agents.sent)
 	}
 	r.model.turns = [][]*genai.GenerateContentResponse{{chunk(text("Yes."))}}
-	if err := r.concierge.Deliver(context.Background(), &envoy.Message{EventID: "reply-2", SourceSession: "agent-7", InReplyTo: "evt-2", Text: "Yes."}); err != nil {
+	if err := r.concierge.Deliver(context.Background(), &envoy.Message{EventID: "reply-1", SourceSession: "agent-7", InReplyTo: "evt-2", Text: "Yes."}); err != nil {
 		t.Fatal(err)
 	}
 	if task, _ := r.store.VoiceTask(taskID); task.State != storage.VoiceTaskDone || task.AnswerWritten != "Yes." {

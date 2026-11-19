@@ -71,12 +71,13 @@ func TestAQuestionSentAsTheMeetingEndsIsCancelled(t *testing.T) {
 	}
 }
 
-// TestAnEndBeforeTheTaskWasRecordedStillCancelsIt: the meeting's end lands
-// after ask_agent found it open but before its task was written, so the
-// end's own cancel found no row. The cancel after the send still ends it.
-// The send's hook marks the meeting ended without the end's row cancel,
-// which is that window's state.
-func TestAnEndBeforeTheTaskWasRecordedStillCancelsIt(t *testing.T) {
+// TestAnEndThatCancelledNoRowStillCancelsTheSentQuestion: a meeting's end
+// that lands after ask_agent found the meeting open, and whose own cancel of
+// working rows missed this question's row, leaves the question working. The
+// cancel after the send still ends it. The test cannot place the end between
+// the closed check and the row's write; it marks the meeting ended during
+// the send with no row cancel, which is the state such an end leaves.
+func TestAnEndThatCancelledNoRowStillCancelsTheSentQuestion(t *testing.T) {
 	r := newRig(t)
 	r.name(t, "agent-7")
 	r.agents.onSend = func(context.Context, string) error {

@@ -11,6 +11,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode"
 
 	"google.golang.org/genai"
 
@@ -23,14 +24,15 @@ import (
 // who holds it, and asks the holder (R5 to R7).
 const systemPrompt = `You are Wispr, the meeting helper of the office meeting recorder. People in the room ask you, out loud, about work tracked in Dispatch, the team's issue tracker, and about the agents working on it.
 
-The recorder has already told the room which issue it took and who holds it. It asks the holder itself, and only when the record cannot answer. Your part is the facts.
+The recorder tells the room who holds the issue when that matters, and asks the holder itself, only when the record cannot answer. Your part is the facts.
 
 How you answer:
-- Say the facts of the record that answer the question, the conclusion first. Do not say again which issue it is or who holds it.
+- Say the facts of the record that answer the question, the conclusion first. Do not say who holds the issue.
 - Say how old the fact is, using the ages the tools give, such as "updated two hours ago".
 - Use the record you are given. Call a tool only for what it does not hold.
 - Speak for the ear: one to three short sentences, at most 50 words, and at most 20 words a sentence. No lists, tables, file paths, links, code or markdown.
 - Say issue keys, pull request numbers, names and figures exactly as written in the record, such as ABC-12 or PR 80. Say nothing the record does not hold.
+- When the record does not say when or whether something happens, say that the record does not say; never guess a date, a time or a duration.
 - When a tool says Dispatch cannot be reached, say "I cannot reach Dispatch yet." and stop.
 - Do not say that you are checking or looking things up; the room already heard a chime.
 
@@ -47,6 +49,11 @@ const (
 	// knownAfter is when, with no fact yet, the model stops and the voice
 	// says what is known (R6).
 	knownAfter = 6 * time.Second
+	// lookupBound and callBound bound one Envoy lookup and one Dispatch
+	// read: a service that takes the connection and never answers must not
+	// spend the answer's 8 s (R6, R10).
+	lookupBound = 2 * time.Second
+	callBound   = 3 * time.Second
 	// maxToolCalls bounds the model's tool calls in one fast answer (R6).
 	maxToolCalls = 6
 	// maxSearches bounds one answer's searches, the read's and the model's
@@ -152,7 +159,7 @@ func (c *Concierge) answer(parent context.Context, x *voice.Exchange, turn strin
 		return c.routingLine(ctx, turn)
 	})()
 	var onHolder func(*reading)
-	if askWord.MatchString(turn) {
+	if saysAsk(turn) {
 		onHolder = func(early *reading) {
 			if session := c.askPlan(turn, early); session != "" {
 				startAsk(session, early)
@@ -215,7 +222,7 @@ func (c *Concierge) answer(parent context.Context, x *voice.Exchange, turn strin
 			stopFacts()
 		}
 	})
-	err := c.facts(factsCtx, tools, turn, found, sp)
+	err := c.facts(factsCtx, tools, turn, found, askStarted.Load(), sp)
 	knownTimer.Stop()
 	switch {
 	case parent.Err() != nil:
@@ -275,16 +282,35 @@ func (c *Concierge) answer(parent context.Context, x *voice.Exchange, turn strin
 }
 
 // didYouMean asks which of a search's top two issues the person meant (R5),
-// by key and title when that has the ear's form, else by key.
+// by key and the start of its title when that has the ear's form, else by
+// key.
 func didYouMean(candidates []candidate) string {
 	named := func(c candidate) string {
-		if title := spokenName(c.title); title != "" {
+		if title := titleStart(c.title); title != "" {
 			return c.key + ", " + title
 		}
 		return c.key
 	}
 	return spokenLine("Did you mean "+named(candidates[0])+", or "+named(candidates[1])+"?",
 		"Did you mean "+candidates[0].key+" or "+candidates[1].key+"?")
+}
+
+// titleWords is how much of a title the question which issue says.
+const titleWords = 5
+
+// titleStart is a title's first words, as the voice may say them, without a
+// trailing word that leads nowhere ("with", "and").
+func titleStart(title string) string {
+	words := strings.Fields(spokenName(title))
+	words = words[:min(len(words), titleWords)]
+	for len(words) > 0 {
+		last := strings.ToLower(strings.TrimRight(words[len(words)-1], ",;:"))
+		if !searchStopwords[last] {
+			break
+		}
+		words = words[:len(words)-1]
+	}
+	return strings.TrimRight(strings.Join(words, " "), ",;:")
 }
 
 // known is what the voice says when no fact came by the mark (R6): the
@@ -361,18 +387,31 @@ func holderLine(key string, holder map[string]any) string {
 	return ""
 }
 
+// askNounBefore are the words before "ask" that make it a noun: "an ask",
+// "the open ask".
+var askNounBefore = set(strings.Fields("a an the this that these those open pending any my your his her their our its another"))
+
+// saysAsk reports whether turn tells the Concierge to ask: "ask" as a verb
+// ("ask the agent", "can you ask ABC-12"), not the noun ("the open asks").
+func saysAsk(turn string) bool {
+	words := strings.FieldsFunc(strings.ToLower(turn), func(r rune) bool { return !unicode.IsLetter(r) })
+	for i, word := range words {
+		if word == "ask" && (i == 0 || !askNounBefore[words[i-1]]) {
+			return true
+		}
+	}
+	return false
+}
+
 var (
-	// askWord is "ask" as a person says it to send the question on: at the
-	// turn's start, or before whom or what to ask. "The open asks" is none.
-	askWord = regexp.MustCompile(`(?i)^\s*(?:please\s+)?ask\b|\bask\s+(?:the|its|it|agent|holder|session|whether|if|them|him|her)\b`)
 	// askPrefix is what a person says before the question itself: "ask the
 	// agent on ABC-12".
 	askPrefix = regexp.MustCompile(`(?i)^\s*(?:please\s+)?ask\s+(?:the\s+)?(?:agent|holder|session)\b(?:\s+(?:on|for|of|working\s+on|holding)\s+(?:issue\s+)?(?:[A-Za-z][A-Za-z0-9]*[- ]\d{2,}))?[\s,:]*`)
 	// statusWords are the words of a question about status, or about what
 	// the record holds: who holds the issue, its priority, its assignee, its
 	// asks (R7). Words that as often start another question ("where",
-	// "state", "new") are none.
-	statusWords = set(strings.Fields("status happening going progress update updates updated latest news moving stuck blocked doing done finished changed changes next who holds holding held holder priority assigned assignee asks review"))
+	// "state", "new", "who") are none; "going to" is no status (aboutStatus).
+	statusWords = set(strings.Fields("status happening going progress update updates updated latest news moving stuck blocked doing done finished changed changes next holds holding held holder priority assigned assignee asks review"))
 )
 
 // askResult is what the voice says of an ask, and whether Envoy was out of
@@ -394,7 +433,7 @@ func (c *Concierge) askPlan(turn string, found *reading) string {
 		return ""
 	case found.searched && !found.clear:
 		return ""
-	case !askWord.MatchString(turn) && aboutStatus(turn) && c.now().Sub(found.newest) <= staleRecord:
+	case !saysAsk(turn) && aboutStatus(turn) && c.now().Sub(found.newest) <= staleRecord:
 		return ""
 	}
 	return session
@@ -417,10 +456,13 @@ func (c *Concierge) ask(ctx context.Context, x *voice.Exchange, session, turn st
 	}
 }
 
-// aboutStatus reports whether turn asks about status.
+// aboutStatus reports whether turn asks about status. "Going to" speaks of
+// what will happen, not of status.
 func aboutStatus(turn string) bool {
-	for _, word := range strings.FieldsFunc(strings.ToLower(turn), func(r rune) bool { return !strings.ContainsRune("abcdefghijklmnopqrstuvwxyz", r) }) {
-		if statusWords[word] {
+	words := strings.FieldsFunc(strings.ToLower(turn), func(r rune) bool { return !strings.ContainsRune("abcdefghijklmnopqrstuvwxyz", r) })
+	for i, word := range words {
+		goingTo := word == "going" && i+1 < len(words) && words[i+1] == "to"
+		if statusWords[word] && !goingTo {
 			return true
 		}
 	}
@@ -448,7 +490,7 @@ func fewestWords(turn string) string {
 // A sentence that fails R8's check is not spoken: the model writes once
 // more, told why, and after a second failure the voice says it can only say
 // what the record holds. R8's bounds hold across both tries.
-func (c *Concierge) facts(ctx context.Context, tools *runner, turn string, found *reading, sp *speaker) error {
+func (c *Concierge) facts(ctx context.Context, tools *runner, turn string, found *reading, asking bool, sp *speaker) error {
 	prompt := c.turnPrompt(transcriptOf(tools.x.Recent), turn)
 	switch {
 	case found.text == "":
@@ -457,6 +499,9 @@ func (c *Concierge) facts(ctx context.Context, tools *runner, turn string, found
 	default:
 		prompt += "\n\nThe record of the issue the question names, read while it was asked:\n" + found.text +
 			"\nAnswer from it. Call a tool only for what it does not hold."
+	}
+	if asking {
+		prompt += "\n\nThe recorder is asking the agent that holds " + found.key + " this question. Say only what the record holds; the agent's answer comes later."
 	}
 	source := &strings.Builder{}
 	source.WriteString(found.text)
@@ -693,29 +738,28 @@ func (c *Concierge) forEar(ctx context.Context, written, issueKey string) string
 }
 
 // rewrite rewrites an agent's written answer to be spoken, and checks the
-// rewrite against it (R8, earCheck). The issue key the question named is put
-// in front when the rewrite does not hold it; the form is checked before, so
-// that word counts against no bound. A rewrite that fails the check, or a
-// model that fails, gets one more try, told why; after the second the voice
-// says the fixed sentence. The log says only why, never the words.
+// spoken text against it (R8 as written, earCheck). The model is told the
+// issue key the question named; when its rewrite does not hold it, the key
+// is put in front, and the check reads the text with it. A rewrite that
+// fails the check, or a model that fails, gets one more try, told why; after
+// the second the voice says the fixed sentence. The log says only why, never
+// the words.
 func (c *Concierge) rewrite(ctx context.Context, written, issueKey string) EarRewrite {
 	reason := ""
 	tries := 0
 	for try := 1; try <= earTries && ctx.Err() == nil; try++ {
 		tries = try
-		text, err := c.rewriteForEar(ctx, written, reason)
+		text, err := c.rewriteForEar(ctx, written, issueKey, reason)
 		if err != nil {
 			c.logger.Warn("concierge could not rewrite an answer for the ear", "try", try, "error", quiet(err))
 			reason = "the rewrite was empty or failed"
 			continue
 		}
-		if reason = earForm(text); reason == "" {
-			if issueKey != "" && !set(earKey.FindAllString(text, -1))[issueKey] {
-				text = issueKey + ": " + text
-			}
-			if reason = earFacts(text, written, issueKey); reason == "" {
-				return EarRewrite{Text: text, Tries: try, Passed: true}
-			}
+		if issueKey != "" && !set(earKey.FindAllString(text, -1))[issueKey] {
+			text = issueKey + ": " + text
+		}
+		if reason = earCheck(text, written, issueKey); reason == "" {
+			return EarRewrite{Text: text, Tries: try, Passed: true}
 		}
 		c.logger.Info("concierge's rewrite for the ear failed R8's check", "try", try, "reason", reason)
 	}
@@ -727,10 +771,14 @@ func (c *Concierge) rewrite(ctx context.Context, written, issueKey string) EarRe
 	return EarRewrite{Text: fixedSentence, Tries: tries}
 }
 
-// rewriteForEar asks the model for one rewrite; reason, when set, is why the
-// last one failed the check.
-func (c *Concierge) rewriteForEar(ctx context.Context, written, reason string) (string, error) {
+// rewriteForEar asks the model for one rewrite; issueKey, when set, is the
+// key the question named, which the rewrite starts with; reason, when set, is
+// why the last one failed the check.
+func (c *Concierge) rewriteForEar(ctx context.Context, written, issueKey, reason string) (string, error) {
 	prompt := "The agent's written answer:\n" + written
+	if issueKey != "" {
+		prompt += "\n\nThe question was about " + issueKey + ": start the spoken text with it, as \"" + issueKey + ": ...\", within the limits."
+	}
 	if reason != "" {
 		prompt += "\n\nThe last rewrite broke a rule: " + reason + ". Write it again, keeping every rule."
 	}
@@ -899,7 +947,8 @@ func (s *sentences) add(ctx context.Context, text string) error {
 	buffered := s.pending.String()
 	start := 0
 	for i := range len(buffered) - 1 {
-		if strings.ContainsRune(".!?", rune(buffered[i])) && (buffered[i+1] == ' ' || buffered[i+1] == '\n') {
+		if strings.ContainsRune(".!?", rune(buffered[i])) && (buffered[i+1] == ' ' || buffered[i+1] == '\n') &&
+			(buffered[i] != '.' || !endsInAbbreviation(buffered[start:i])) {
 			if err := s.speak(ctx, buffered[start:i+1]); err != nil {
 				return err
 			}

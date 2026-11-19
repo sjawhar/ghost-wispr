@@ -538,9 +538,9 @@ func TestWithoutDispatchHeardReadsNothing(t *testing.T) {
 
 // TestARequestToReplyAgainKeepsItsKey: a request to reply again that may
 // have reached Envoy before its send failed is sent again under the same
-// idempotency key, so the agent gets it once. Envoy then answers that it
-// already held it, under an event the unit never learned: the agent's reply
-// to that event gets a request under a key of its own, whose reply lands.
+// idempotency key, so the agent gets it once. When Envoy answers that it held
+// it already, under an event the unit never learned, the unit at once sends
+// a new request under a key of its own, whose reply lands.
 func TestARequestToReplyAgainKeepsItsKey(t *testing.T) {
 	r := newRig(t)
 	r.ask(t, "agent-7", "q", "")
@@ -557,17 +557,11 @@ func TestARequestToReplyAgainKeepsItsKey(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if len(r.agents.attempts) != 3 || len(r.agents.sent) != 2 {
-		t.Fatalf("attempts %d, sent %d; want the question and the request tried twice and stored once", len(r.agents.attempts), len(r.agents.sent))
+	if len(r.agents.attempts) != 4 || len(r.agents.sent) != 3 {
+		t.Fatalf("attempts %d, sent %d; want the question, the request tried twice under one key, and a new request", len(r.agents.attempts), len(r.agents.sent))
 	}
-	if first, second := r.agents.attempts[1].IdempotencyKey, r.agents.attempts[2].IdempotencyKey; first == "" || first != second {
-		t.Fatalf("the request's keys = %q and %q, want one key", first, second)
-	}
-	if err := r.concierge.Deliver(context.Background(), &envoy.Message{EventID: "m3", SourceSession: "agent-7", InReplyTo: "evt-2", Text: "pong"}); err != nil {
-		t.Fatal(err)
-	}
-	if len(r.agents.sent) != 3 || r.agents.sent[2].IdempotencyKey == r.agents.attempts[1].IdempotencyKey {
-		t.Fatalf("sent %+v; want a new request, under a key of its own, after a reply to the request the unit never learned", r.agents.sent)
+	if first, second, third := r.agents.attempts[1].IdempotencyKey, r.agents.attempts[2].IdempotencyKey, r.agents.attempts[3].IdempotencyKey; first == "" || first != second || third == first {
+		t.Fatalf("the requests' keys = %q, %q and %q; want one key reused, then a key of its own", first, second, third)
 	}
 	r.model.turns = [][]*genai.GenerateContentResponse{{chunk(text("Pong."))}}
 	if err := r.concierge.Deliver(context.Background(), &envoy.Message{EventID: "m4", SourceSession: "agent-7", InReplyTo: "evt-3", Text: "pong"}); err != nil {
