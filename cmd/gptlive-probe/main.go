@@ -120,7 +120,7 @@ func probe(ctx context.Context, cfg *probeConfig, out io.Writer) error {
 	}
 	printf(out, "control: a token for another audience was refused (invalid_subject_token)\n")
 
-	tokens, err := gptlive.NewTokenSource(gptlive.TokenConfig{
+	tokens, err := gptlive.NewTokenSource(&gptlive.TokenConfig{
 		Endpoint:           cfg.TokenURL,
 		IdentityProviderID: cfg.IdentityProviderID,
 		ServiceAccountID:   cfg.ServiceAccountID,
@@ -193,7 +193,7 @@ func probe(ctx context.Context, cfg *probeConfig, out io.Writer) error {
 // must refuse as an invalid subject token: then a refusal of the real token
 // means the mapping, not the token.
 func control(ctx context.Context, cfg *probeConfig) error {
-	tokens, err := gptlive.NewTokenSource(gptlive.TokenConfig{
+	tokens, err := gptlive.NewTokenSource(&gptlive.TokenConfig{
 		Endpoint:           cfg.TokenURL,
 		Audience:           controlAudience,
 		IdentityProviderID: cfg.IdentityProviderID,

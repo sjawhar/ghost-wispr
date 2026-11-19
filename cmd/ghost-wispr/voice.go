@@ -285,6 +285,19 @@ func voiceTiming(logger *slog.Logger) func(event, sessionID string, at time.Time
 	return func(event, sessionID string, at time.Time, kv ...any) {
 		attrs := append([]any{"event", event, "session_id", sessionID, "at_unix_ns", at.UnixNano()}, kv...)
 		logger.Info("voice timing", attrs...)
+// newVoiceB builds voice B: GPT-Live with the unit's own OpenAI identity,
+// an access token exchanged for its Google ID token (voice.gptlive).
+func newVoiceB(cfg *config.Config) (voice.Voice, error) {
+	credentials := cfg.GoogleCredentialsFile
+	tokens, err := gptlive.NewTokenSource(&gptlive.TokenConfig{
+		IdentityProviderID: cfg.Voice.GPTLive.OpenAIIdentityProviderID,
+		ServiceAccountID:   cfg.Voice.GPTLive.OpenAIServiceAccountID,
+		Subject: func(ctx context.Context, audience string) (string, error) {
+			return googleauth.IDToken(ctx, credentials, audience)
+		},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("voice B: %w (set voice.gptlive.openai_identity_provider_id and openai_service_account_id)", err)
 	}
 }
 

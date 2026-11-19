@@ -19,11 +19,11 @@ import (
 // The tests in this file pin behaviours that single changes to the code
 // broke with every other test still passing.
 
-func answerArgs(t *testing.T, ev voice.Event) voice.AnswerArgs {
+func answerArgs(t *testing.T, raw json.RawMessage) voice.AnswerArgs {
 	t.Helper()
 	var args voice.AnswerArgs
-	if err := json.Unmarshal(ev.Call.Args, &args); err != nil {
-		t.Fatalf("tool call args %s: %v", ev.Call.Args, err)
+	if err := json.Unmarshal(raw, &args); err != nil {
+		t.Fatalf("tool call args %s: %v", raw, err)
 	}
 	return args
 }
@@ -188,12 +188,12 @@ func TestASecondDelegationAsksOnlyWhatWasHeardSince(t *testing.T) {
 
 	c.heard("Tell me about ABC-7.")
 	c.delegate("item_1")
-	if q := answerArgs(t, waitEvent(t, s, voice.EventToolCall)).Question; !strings.Contains(q, "what is happening with ABC-123") {
+	if q := answerArgs(t, waitEvent(t, s, voice.EventToolCall).Call.Args).Question; !strings.Contains(q, "what is happening with ABC-123") {
 		t.Fatalf("first question %q lacks the asker's words at the wake", q)
 	}
 	c.heard("And ABC-8?")
 	c.delegate("item_2")
-	if q := answerArgs(t, waitEvent(t, s, voice.EventToolCall)).Question; q != "And ABC-8?" {
+	if q := answerArgs(t, waitEvent(t, s, voice.EventToolCall).Call.Args).Question; q != "And ABC-8?" {
 		t.Fatalf("second question %q, want only what was heard since the first", q)
 	}
 }
@@ -208,7 +208,7 @@ func TestADelegationWithNothingNewHeardAsksTheLastWordsHeard(t *testing.T) {
 	c.delegate("item_1")
 	waitEvent(t, s, voice.EventToolCall)
 	c.delegate("item_2")
-	if q := answerArgs(t, waitEvent(t, s, voice.EventToolCall)).Question; q != "Is ABC-5 done?" {
+	if q := answerArgs(t, waitEvent(t, s, voice.EventToolCall).Call.Args).Question; q != "Is ABC-5 done?" {
 		t.Fatalf("question %q, want the last words GPT-Live heard", q)
 	}
 }

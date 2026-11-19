@@ -108,7 +108,7 @@ func newTestTokenSource(t *testing.T, e *tokenEndpoint, clock *fakeClock, subjec
 	if subject == nil {
 		subject = func(context.Context, string) (string, error) { return "google-id-token", nil }
 	}
-	s, err := NewTokenSource(TokenConfig{
+	s, err := NewTokenSource(&TokenConfig{
 		Endpoint:           e.server.URL + "/oauth/token",
 		IdentityProviderID: "idp_test",
 		ServiceAccountID:   "user-test",
@@ -282,7 +282,7 @@ func TestNewTokenSourceRequiresTheProviderAndServiceAccount(t *testing.T) {
 		"no service account": {IdentityProviderID: "idp_x", Subject: subject},
 		"no subject token":   {IdentityProviderID: "idp_x", ServiceAccountID: "user-x"},
 	} {
-		if _, err := NewTokenSource(cfg); err == nil {
+		if _, err := NewTokenSource(&cfg); err == nil {
 			t.Errorf("%s: NewTokenSource accepted %+v", name, cfg)
 		}
 	}
@@ -421,7 +421,7 @@ func TestTokenSourceMintsForTheAudienceItIsGiven(t *testing.T) {
 	clock := &fakeClock{t: time.Unix(1_800_000_000, 0)}
 	e := newTokenEndpoint(t, clock.Now)
 	var audience string
-	s, err := NewTokenSource(TokenConfig{
+	s, err := NewTokenSource(&TokenConfig{
 		Endpoint:           e.server.URL + "/oauth/token",
 		IdentityProviderID: "idp_test",
 		ServiceAccountID:   "user-test",

@@ -68,8 +68,9 @@ type TokenSource struct {
 	expireAt time.Time
 }
 
-// NewTokenSource makes a TokenSource.
-func NewTokenSource(cfg TokenConfig) (*TokenSource, error) {
+// NewTokenSource makes a TokenSource. It keeps a copy of config.
+func NewTokenSource(config *TokenConfig) (*TokenSource, error) {
+	cfg := *config
 	if strings.TrimSpace(cfg.IdentityProviderID) == "" {
 		return nil, errors.New("openai token: no identity provider id")
 	}
