@@ -166,6 +166,16 @@ func TestACommandOpenDoesNotFailForAnotherCommand(t *testing.T) {
 // as light-state did, so it lost the light to them: with 4 light-state loops
 // on a uhid blink(1), 18 buffers were dropped in 20 s (review of #79). A
 // waiting recorder must go first; light-state waits longer, and can.
+//
+// The recorder goes first only because the runtime wakes it every
+// recorderPoll and light-state only every commandPoll. On a loaded host the
+// runtime wakes sleeps late, and once a sleep of recorderPoll wakes later than
+// commandPoll, every waiter wakes at once and that order is gone: with the
+// host's load average at 40 to 60, 10 of 300 runs lost one read of about 70.
+// So a probe sleeps recorderPoll over and over, and a read during which the
+// probe woke later than commandPoll is not counted. The test reads until 40
+// reads are counted, and fails if the runtime woke late through too many reads
+// to count 40 in 10 s: it then measured nothing.
 func TestAWaitingRecorderGoesBeforeLightState(t *testing.T) {
 	sysfsRoot, devRoot, _ := fakeBlink1Sysfs(t)
 	original := featureIOCTL
@@ -212,24 +222,100 @@ func TestAWaitingRecorderGoesBeforeLightState(t *testing.T) {
 			}
 		}()
 	}
+	late := watchLateTimers(stop, &loops)
 
-	reads, unknown := 0, 0
-	for deadline := time.Now().Add(1500 * time.Millisecond); time.Now().Before(deadline); time.Sleep(10 * time.Millisecond) {
+	// A read is counted only once the probe has ended: a late sleep that
+	// spans a read's end is recorded only when the probe wakes. The loop
+	// counts as it goes, so it reads a few more than it needs.
+	const counted = 40
+	type read struct {
+		from, to  time.Time
+		contended bool
+	}
+	var done []read
+	start := time.Now()
+	for deadline, seen := start.Add(10*time.Second), 0; seen < counted+5 && time.Now().Before(deadline); time.Sleep(10 * time.Millisecond) {
+		from := time.Now()
 		_, _, _, err := recorder.ReadRGB()
-		reads++
-		if Contended(err) {
-			unknown++
-		} else if err != nil {
+		r := read{from: from, to: time.Now(), contended: Contended(err)}
+		if err != nil && !r.contended {
 			t.Fatalf("the recorder's read: %v", err)
 		}
+		done = append(done, r)
+		if !late.during(r.from, r.to) {
+			seen++
+		}
 	}
+	took := time.Since(start)
 	close(stop)
 	loops.Wait()
+	clean, unknown, excused := 0, 0, 0
+	for _, r := range done {
+		lateDuring := late.during(r.from, r.to)
+		if !lateDuring {
+			clean++
+		}
+		switch {
+		case r.contended && lateDuring:
+			excused++
+		case r.contended:
+			unknown++
+		}
+	}
 	if n := runs.Load(); n < 20 {
-		t.Fatalf("control: light-state read the light %d times in 1.5 s, want at least 20", n)
+		t.Fatalf("control: light-state read the light %d times in %v, want at least 20", n, took.Round(time.Millisecond))
+	}
+	if clean < counted {
+		t.Fatalf("control: the runtime woke a %v sleep later than %v during %d of %d reads in %v, so only %d could be counted, want %d: this run measured nothing", recorderPoll, commandPoll, len(done)-clean, len(done), took.Round(time.Millisecond), clean, counted)
 	}
 	if unknown > 0 {
-		t.Fatalf("the recorder's read got no light %d of %d times while light-state ran back to back in 4 processes, want 0", unknown, reads)
+		t.Fatalf("the recorder's read got no light %d of %d times while light-state ran back to back in 4 processes, want 0 (%d more reads got no light while the runtime woke late)", unknown, clean, excused)
 	}
-	t.Logf("the recorder read the light %d times; light-state read it %d times", reads, runs.Load())
+	t.Logf("the recorder read the light %d times, %d counted; %d reads that the runtime woke late through got no light; light-state read it %d times", len(done), clean, excused, runs.Load())
+}
+
+// lateTimers is the stretches in which the runtime woke a sleep of
+// recorderPoll later than commandPoll (watchLateTimers).
+type lateTimers struct {
+	mu    sync.Mutex
+	spans [][2]time.Time
+}
+
+// watchLateTimers sleeps recorderPoll over and over until stop closes, and
+// records each sleep that woke later than commandPoll. loops counts its
+// goroutine.
+func watchLateTimers(stop <-chan struct{}, loops *sync.WaitGroup) *lateTimers {
+	late := &lateTimers{}
+	loops.Add(1)
+	go func() {
+		defer loops.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			from := time.Now()
+			time.Sleep(recorderPoll)
+			if to := time.Now(); to.Sub(from) > commandPoll {
+				late.mu.Lock()
+				late.spans = append(late.spans, [2]time.Time{from, to})
+				late.mu.Unlock()
+			}
+		}
+	}()
+	return late
+}
+
+// during reports whether a late sleep overlapped the stretch from from to to.
+// A sleep still under way is not seen until the probe wakes from it.
+func (l *lateTimers) during(from, to time.Time) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	for _, span := range l.spans {
+		if span[0].Before(to) && span[1].After(from) {
+			return true
+		}
+	}
+	return false
 }
