@@ -1678,7 +1678,8 @@ type configResponse struct {
 	Models map[string]string `json:"models"`
 	// RecordingRules are the rules the page shows under Recording rules, each
 	// as written in recording_rules; empty when there are none. Read-only.
-	RecordingRules []string `json:"recording_rules"`
+	RecordingRules []string            `json:"recording_rules"`
+	Voice          configVoiceResponse `json:"voice"`
 }
 
 type configSummarizationResponse struct {
@@ -1702,6 +1703,14 @@ type configGCResponse struct {
 	Enabled        bool `json:"enabled"`
 	MaxAgeDays     int  `json:"max_age_days"`
 	MaxAudioSizeMB int  `json:"max_audio_size_mb"`
+}
+
+// configVoiceResponse is the meeting voice as the settings page changes it:
+// whether it is on, which voice answers and voice A's engine.
+type configVoiceResponse struct {
+	Enabled   bool   `json:"enabled"`
+	Engine    string `json:"engine"`
+	TTSEngine string `json:"tts_engine"`
 }
 
 func handleGetConfig(cfgStore *config.Store) http.HandlerFunc {
@@ -1749,6 +1758,11 @@ func handleGetConfig(cfgStore *config.Store) http.HandlerFunc {
 				"tts_voice":                    cfg.TTSVoice,
 			},
 			RecordingRules: cfg.RecordingRules,
+			Voice: configVoiceResponse{
+				Enabled:   cfg.Voice.Enabled,
+				Engine:    cfg.Voice.Engine,
+				TTSEngine: cfg.Voice.TTSEngine,
+			},
 		}
 		if resp.Summarization.Presets == nil {
 			resp.Summarization.Presets = map[string]config.Preset{}
@@ -1769,6 +1783,7 @@ type configPatch struct {
 	APIKeys            map[string]string   `json:"api_keys,omitempty"`
 	GDrive             *gdrivePatch        `json:"gdrive,omitempty"`
 	GC                 *gcPatch            `json:"gc,omitempty"`
+	Voice              *voicePatch         `json:"voice,omitempty"`
 }
 
 type summarizationPatch struct {
@@ -1792,6 +1807,12 @@ type gcPatch struct {
 	Enabled        *bool `json:"enabled,omitempty"`
 	MaxAgeDays     *int  `json:"max_age_days,omitempty"`
 	MaxAudioSizeMB *int  `json:"max_audio_size_mb,omitempty"`
+}
+
+type voicePatch struct {
+	Enabled   *bool   `json:"enabled,omitempty"`
+	Engine    *string `json:"engine,omitempty"`
+	TTSEngine *string `json:"tts_engine,omitempty"`
 }
 
 func handlePatchConfig(cfgStore *config.Store) http.HandlerFunc {
@@ -1915,6 +1936,28 @@ func applyConfigPatch(c *config.Config, p *configPatch) error {
 				return fmt.Errorf("gc.max_audio_size_mb must be 0 (no audio budget) or positive")
 			}
 			c.GCMaxAudioSizeMB = *p.GC.MaxAudioSizeMB
+		}
+	}
+
+	if p.Voice != nil {
+		if p.Voice.Enabled != nil {
+			c.Voice.Enabled = *p.Voice.Enabled
+		}
+		if p.Voice.Engine != nil {
+			switch *p.Voice.Engine {
+			case config.VoiceEngineTTS, config.VoiceEngineGPTLive, config.VoiceEngineDGAgent:
+				c.Voice.Engine = *p.Voice.Engine
+			default:
+				return fmt.Errorf("invalid voice.engine %q: supported engines are tts, gptlive, dgagent", *p.Voice.Engine)
+			}
+		}
+		if p.Voice.TTSEngine != nil {
+			switch *p.Voice.TTSEngine {
+			case config.TTSEngineGemini, config.TTSEngineAura:
+				c.Voice.TTSEngine = *p.Voice.TTSEngine
+			default:
+				return fmt.Errorf("invalid voice.tts_engine %q: supported engines are gemini, aura", *p.Voice.TTSEngine)
+			}
 		}
 	}
 	return nil

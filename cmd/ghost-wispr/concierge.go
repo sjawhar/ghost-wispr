@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"log/slog"
@@ -13,6 +15,7 @@ import (
 	"github.com/sjawhar/ghost-wispr/internal/dispatch"
 	"github.com/sjawhar/ghost-wispr/internal/envoy"
 	"github.com/sjawhar/ghost-wispr/internal/storage"
+	"github.com/sjawhar/ghost-wispr/internal/voice"
 )
 
 // startConcierge builds the voice's Concierge: its Gemini model client on the
@@ -199,4 +202,143 @@ func cancelRecoveredQuestions(store *storage.SQLiteStore, sessionIDs []string, l
 			logf("warning: cancel the questions of recovered session %s: %v", id, err)
 		}
 	}
+}
+
+// lazyConcierge is the voice's Concierge, started at the first call that
+// needs it: a unit whose voice is off at start-up runs no Concierge (R13)
+// until a person turns the voice on. One that cannot start fails each answer
+// as unreachable, so the voice says sorry and plays the error sound.
+type lazyConcierge struct {
+	startFn func() (*concierge.Concierge, func(), error)
+	onStart func(*concierge.Concierge)
+	logger  *slog.Logger
+	answers chan voice.PendingAnswer
+	done    chan struct{}
+
+	once   sync.Once
+	mu     sync.Mutex
+	c      *concierge.Concierge
+	stop   func()
+	err    error
+	closed bool
+}
+
+func newLazyConcierge(start func() (*concierge.Concierge, func(), error), onStart func(*concierge.Concierge), logger *slog.Logger) *lazyConcierge {
+	return &lazyConcierge{startFn: start, onStart: onStart, logger: logger, answers: make(chan voice.PendingAnswer), done: make(chan struct{})}
+}
+
+// start starts the Concierge once, and returns it or why it did not start.
+func (l *lazyConcierge) start() (*concierge.Concierge, error) {
+	l.once.Do(func() {
+		l.mu.Lock()
+		closed := l.closed
+		l.mu.Unlock()
+		if closed {
+			l.err = errors.New("the unit is shutting down")
+			return
+		}
+		c, stop, err := l.startFn()
+		l.mu.Lock()
+		l.c, l.stop, l.err = c, stop, err
+		l.mu.Unlock()
+		if err != nil {
+			l.logger.Warn("concierge: did not start; the voice answers that it cannot reach Dispatch", "error", err)
+			return
+		}
+		if l.onStart != nil {
+			l.onStart(c)
+		}
+		go l.forward(c.Answers())
+	})
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.c, l.err
+}
+
+// started returns the Concierge if it has started, without starting it.
+func (l *lazyConcierge) started() *concierge.Concierge {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.c
+}
+
+func (l *lazyConcierge) forward(in <-chan voice.PendingAnswer) {
+	for {
+		select {
+		case a, ok := <-in:
+			if !ok {
+				return
+			}
+			select {
+			case l.answers <- a:
+			case <-l.done:
+				return
+			}
+		case <-l.done:
+			return
+		}
+	}
+}
+
+// Stop stops the Concierge if it started, at shutdown.
+func (l *lazyConcierge) Stop() {
+	l.mu.Lock()
+	if l.closed {
+		l.mu.Unlock()
+		return
+	}
+	l.closed = true
+	stop := l.stop
+	l.mu.Unlock()
+	close(l.done)
+	if stop != nil {
+		stop()
+	}
+}
+
+func (l *lazyConcierge) Tools(x *voice.Exchange) voice.ToolRunner {
+	c, err := l.start()
+	if err != nil {
+		return unreachableTools{err}
+	}
+	return c.Tools(x)
+}
+
+func (l *lazyConcierge) Heard(ctx context.Context, x *voice.Exchange, words string) {
+	if c, err := l.start(); err == nil {
+		c.Heard(ctx, x, words)
+	}
+}
+
+func (l *lazyConcierge) Answer(ctx context.Context, x *voice.Exchange, turn string, say voice.SayFunc) error {
+	c, err := l.start()
+	if err != nil {
+		return fmt.Errorf("concierge: %w: %w", voice.ErrUnreachable, err)
+	}
+	return c.Answer(ctx, x, turn, say)
+}
+
+func (l *lazyConcierge) Answers() <-chan voice.PendingAnswer { return l.answers }
+
+// Spoken and NeverMind do nothing before the Concierge started: it then has
+// no question to record or cancel.
+func (l *lazyConcierge) Spoken(ctx context.Context, taskID string) error {
+	if c := l.started(); c != nil {
+		return c.Spoken(ctx, taskID)
+	}
+	return nil
+}
+
+func (l *lazyConcierge) NeverMind(ctx context.Context, sessionID string) error {
+	if c := l.started(); c != nil {
+		return c.NeverMind(ctx, sessionID)
+	}
+	return nil
+}
+
+// unreachableTools answers every tool of a Concierge that did not start.
+type unreachableTools struct{ err error }
+
+func (u unreachableTools) Run(context.Context, voice.ToolCall) (json.RawMessage, error) {
+	return nil, fmt.Errorf("concierge: %w: %w", voice.ErrUnreachable, u.err)
 }

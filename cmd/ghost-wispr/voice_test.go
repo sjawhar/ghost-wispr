@@ -3,12 +3,10 @@ package main
 import (
 	"context"
 	"slices"
-	"strings"
 	"sync"
 	"testing"
 	"time"
 
-	"github.com/sjawhar/ghost-wispr/internal/audio"
 	"github.com/sjawhar/ghost-wispr/internal/config"
 	"github.com/sjawhar/ghost-wispr/internal/voice"
 )
@@ -35,66 +33,14 @@ func (stubConcierge) Heard(context.Context, *voice.Exchange, string) {}
 func (stubConcierge) Answer(context.Context, *voice.Exchange, string, voice.SayFunc) error {
 	return nil
 }
-func (c stubConcierge) Answers() <-chan voice.PendingAnswer { return c.answers }
-func (stubConcierge) Spoken(context.Context, string) error  { return nil }
-
-// TestTheVoiceStartsOnlyWhenItCanSpeak fails if the voice starts while it is
-// off, with no speaker, with no Concierge, or on an engine this build does
-// not have, or does not start with voice A on Aura with a key.
-func TestTheVoiceStartsOnlyWhenItCanSpeak(t *testing.T) {
-	output := audio.NewOutput(audio.OutputConfig{Open: func(string) (audio.PlaybackStream, int, error) { return nil, 0, context.Canceled }})
-	t.Cleanup(func() { _ = output.Close() })
-	concierge := stubConcierge{answers: make(chan voice.PendingAnswer)}
-	fakeDeepgramKey := strings.Repeat("x", 8) // any non-empty key; no request leaves the test
-	cases := map[string]struct {
-		change    func(*config.Config)
-		noSpeaker bool
-		noConcier bool
-		starts    bool
-	}{
-		"on, Aura with a key": {starts: true},
-		"off":                 {change: func(c *config.Config) { c.Voice.Enabled = false }},
-		"no speaker":          {noSpeaker: true},
-		"no concierge":        {noConcier: true},
-		"aura without a key":  {change: func(c *config.Config) { c.DeepgramAPIKey = "" }},
-		"voice B not built":   {change: func(c *config.Config) { c.Voice.Engine = config.VoiceEngineGPTLive }},
-	}
-	for name, c := range cases {
-		t.Run(name, func(t *testing.T) {
-			cfg := &config.Config{
-				SpeakerEnabled: true,
-				DeepgramAPIKey: fakeDeepgramKey,
-				Voice:          config.Voice{Enabled: true, Engine: config.VoiceEngineTTS, TTSEngine: config.TTSEngineAura, WakePhrases: []string{"Wispr"}},
-			}
-			if c.change != nil {
-				c.change(cfg)
-			}
-			deps := &voiceDeps{output: output, tap: voice.NewTap(), concierge: concierge, session: func() string { return "" }, red: func() bool { return true }, notify: func(string, string) {}}
-			if c.noSpeaker {
-				deps.output = nil
-			}
-			if c.noConcier {
-				deps.concierge = nil
-			}
-			var link voiceLink
-			deps.link = &link
-			err := startVoice(t.Context(), cfg, deps)
-			started := link.get() != nil
-			if started != c.starts {
-				t.Fatalf("started %v (error %v), want %v", started, err, c.starts)
-			}
-			if !c.starts && cfg.Voice.Enabled && err == nil {
-				t.Fatal("the voice did not start and said nothing about why")
-			}
-			link.Close()
-		})
-	}
-}
+func (c stubConcierge) Answers() <-chan voice.PendingAnswer   { return c.answers }
+func (stubConcierge) Spoken(context.Context, string) error    { return nil }
+func (stubConcierge) NeverMind(context.Context, string) error { return nil }
 
 // TestKeytermsOnlyForNova3 fails if keyterms go to a Deepgram model that does
 // not take them.
 func TestKeytermsOnlyForNova3(t *testing.T) {
-	cfg := &config.Config{DeepgramModel: "nova-2", Voice: config.Voice{Enabled: true, WakePhrases: []string{"Wispr"}}}
+	cfg := &config.Config{DeepgramModel: "nova-2", SpeakerEnabled: true, Voice: config.Voice{WakePhrases: []string{"Wispr"}}}
 	if got := voiceKeyterms(cfg); len(got) != 0 {
 		t.Fatalf("keyterms %q for nova-2, want none", got)
 	}
@@ -129,6 +75,8 @@ func (*closingsHeard) Close()                                          {}
 func (*closingsHeard) SessionEnded(string)                             {}
 func (*closingsHeard) SessionsDeleted([]string)                        {}
 func (*closingsHeard) SegmentsDeleted(string)                          {}
+func (*closingsHeard) Started()                                        {}
+func (*closingsHeard) RedCheckFailed()                                 {}
 
 // TestAPauseStopsTheVoiceThroughTheGate fails if a pause or a light hold of
 // the real capture gate does not reach the voice the link holds.

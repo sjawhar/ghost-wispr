@@ -2,9 +2,9 @@ package server
 
 import "encoding/json"
 
-// configSchema documents the GC settings of GET and PATCH /api/config (a
-// JSON merge patch has the same shape) and the read-only models and recording
-// rules GET reports; the other settings are untyped.
+// configSchema documents the GC and voice settings of GET and PATCH
+// /api/config (a JSON merge patch has the same shape) and the read-only models
+// and recording rules GET reports; the other settings are untyped.
 var configSchema = map[string]any{
 	"type": "object",
 	"properties": map[string]any{
@@ -38,6 +38,26 @@ var configSchema = map[string]any{
 			"readOnly":    true,
 			"items":       map[string]any{"type": "string"},
 			"description": "GET only: the rules the web UI shows under Recording rules, each as written in recording_rules. GHOST_WISPR_RECORDING_RULES overrides it with a JSON list of strings, and a settings save (any PATCH /api/config) then writes the override's rules into the config file, where they stay after the variable is removed. Empty when none are set; the page then shows no Recording rules button. A PATCH cannot set it.",
+		},
+		"voice": map[string]any{
+			"type":        "object",
+			"description": "The meeting voice. A change applies from the next exchange, with no restart.",
+			"properties": map[string]any{
+				"enabled": map[string]any{
+					"type":        "boolean",
+					"description": "Turn the meeting voice on or off",
+				},
+				"engine": map[string]any{
+					"type":        "string",
+					"enum":        []string{"tts", "gptlive", "dgagent"},
+					"description": "The voice that answers: tts (voice A, our own voice), gptlive (voice B, GPT-Live) or dgagent (voice C, the Deepgram voice agent)",
+				},
+				"tts_engine": map[string]any{
+					"type":        "string",
+					"enum":        []string{"gemini", "aura"},
+					"description": "Voice A's text-to-speech engine: gemini or aura",
+				},
+			},
 		},
 	},
 }

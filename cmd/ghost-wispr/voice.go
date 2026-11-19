@@ -5,8 +5,10 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"log/slog"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/sjawhar/ghost-wispr/internal/audio"
 	"github.com/sjawhar/ghost-wispr/internal/config"
@@ -25,6 +27,8 @@ type voiceControl interface {
 	SegmentsDeleted(sessionID string)
 	GateClosed(closings int)
 	Stop(reason string)
+	Started()
+	RedCheckFailed()
 	OnTranscript(t *voice.Transcript)
 	OnUtteranceEnd(closings int, gateOpen bool)
 	WithFloor(ctx context.Context, start func()) error
@@ -118,16 +122,36 @@ func (l *voiceLink) SegmentsDeleted(sessionID string) {
 	}
 }
 
-// wireVoiceToCapture stops the voice on every capture gate closing. It must
-// run before anything can close the gate.
-func wireVoiceToCapture(capture *captureGate, link *voiceLink) {
-	capture.onClosed = link.GateClosed
+// Started plays the start sound: capture moved into recording.
+func (l *voiceLink) Started() {
+	if v := l.get(); v != nil {
+		v.Started()
+	}
 }
 
-// voiceKeyterms are the keyterms the live Deepgram request carries while the
-// voice is on: the wake phrases. Only Nova-3 takes keyterms.
+// RedCheckFailed plays the error sound of a failed red check.
+func (l *voiceLink) RedCheckFailed() {
+	if v := l.get(); v != nil {
+		v.RedCheckFailed()
+	}
+}
+
+// wireVoiceToCapture stops the voice on every capture gate closing, and plays
+// the start sound on every opening into recording and the error sound on
+// every failed red check (R10). It must run before anything can close the
+// gate.
+func wireVoiceToCapture(capture *captureGate, link *voiceLink) {
+	capture.onClosed = link.GateClosed
+	capture.onOpened = link.Started
+	capture.onRedCheckFailed = link.RedCheckFailed
+}
+
+// voiceKeyterms are the keyterms the live Deepgram request carries while a
+// voice can run, which is while the unit has a speaker: a person turns the
+// voice on with no restart, and the live request is not redialled for it.
+// Only Nova-3 takes keyterms.
 func voiceKeyterms(cfg *config.Config) []string {
-	if !cfg.Voice.Enabled || !strings.HasPrefix(cfg.DeepgramModel, "nova-3") {
+	if !cfg.SpeakerEnabled || !strings.HasPrefix(cfg.DeepgramModel, "nova-3") {
 		return nil
 	}
 	return transcript.Keyterms(cfg.Voice.WakePhrases, nil)
@@ -135,49 +159,95 @@ func voiceKeyterms(cfg *config.Config) []string {
 
 // voiceDeps is what the voice needs from the rest of the unit.
 type voiceDeps struct {
-	output    *audio.Output // the speaker output; nil without a speaker
-	tap       *voice.Tap
-	concierge voice.Concierge
-	link      *voiceLink
-	session   func() string // the recording session now
-	red       func() bool   // the light reads red and audio passes the gate
-	notify    func(kind, sessionID string)
+	output      *audio.Output // the speaker output; nil without a speaker
+	tap         *voice.Tap
+	concierge   voice.Concierge
+	link        *voiceLink
+	voices      func() (voice.Voice, error) // the voice for the next call
+	enabled     func() bool                 // voice.enabled, live
+	wakePhrases []string
+	timing      func(event, sessionID string, at time.Time, kv ...any)
+	session     func() string // the recording session now
+	red         func() bool   // the light reads red and audio passes the gate
+	notify      func(kind, sessionID string)
 }
 
-// startVoice starts the meeting voice when the config turns it on, and sets it
-// on deps.link. It returns why the voice cannot start; the unit then runs
-// without it.
-func startVoice(ctx context.Context, cfg *config.Config, deps *voiceDeps) error {
-	if !cfg.Voice.Enabled {
-		return nil
-	}
+// startVoice starts the Supervisor over the speaker output, and sets it on
+// deps.link. voice.enabled and the voice are read at each call, so it starts
+// whatever they say; it returns why it cannot start.
+func startVoice(deps *voiceDeps) error {
 	if deps.output == nil {
 		return errors.New("the voice needs the speaker: set speaker_enabled")
 	}
 	if deps.concierge == nil {
 		return errors.New("the voice has no Concierge")
 	}
-	if cfg.Voice.Engine != config.VoiceEngineTTS {
-		return fmt.Errorf("voice.engine %q is not in this build; use %q", cfg.Voice.Engine, config.VoiceEngineTTS)
-	}
-	v, err := newVoiceA(ctx, cfg)
-	if err != nil {
-		return err
-	}
 	sup := voice.NewSupervisor(&voice.SupervisorConfig{
-		Voice:       func() voice.Voice { return v },
+		Voice:       deps.voices,
 		Concierge:   deps.concierge,
 		Speaker:     voice.SpeakerOf(deps.output),
-		WakePhrases: cfg.Voice.WakePhrases,
+		WakePhrases: deps.wakePhrases,
 		Session:     deps.session,
 		Red:         deps.red,
+		Enabled:     deps.enabled,
 		Notify:      deps.notify,
 		Tap:         deps.tap,
+		Timing:      deps.timing,
 		Logf:        log.Printf,
 	})
 	deps.link.set(sup)
-	log.Printf("voice: on (voice A on %s, wake phrases %q)", cfg.Voice.TTSEngine, cfg.Voice.WakePhrases)
+	log.Printf("voice: ready (wake phrases %q; voice.enabled and voice.engine are read at each call)", deps.wakePhrases)
 	return nil
+}
+
+// voiceSource holds the voice each call uses, built from the settings saved
+// last. It builds off the Supervisor's path: apply runs at start-up and after
+// each settings change, and Voice only reads what apply built.
+type voiceSource struct {
+	mu    sync.Mutex
+	key   string
+	built voice.Voice
+	err   error
+}
+
+// apply builds the voice cfg names, unless the voice settings did not change.
+func (v *voiceSource) apply(ctx context.Context, cfg *config.Config) {
+	if cfg.Voice.Engine != config.VoiceEngineTTS {
+		v.set("", nil, fmt.Errorf("voice.engine %q is not in this build; use %q", cfg.Voice.Engine, config.VoiceEngineTTS))
+		return
+	}
+	key := strings.Join([]string{cfg.Voice.TTSEngine, cfg.Voice.TTSModel, cfg.Voice.TTSVoice, cfg.Voice.TTSLocation, cfg.GCPProject, cfg.GoogleCredentialsFile, cfg.DeepgramAPIKey}, "\x00")
+	v.mu.Lock()
+	same := v.key == key && (v.built != nil || v.err != nil)
+	v.mu.Unlock()
+	if same {
+		return
+	}
+	built, err := newVoiceA(ctx, cfg)
+	v.set(key, built, err)
+}
+
+func (v *voiceSource) set(key string, built voice.Voice, err error) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	v.key, v.built, v.err = key, built, err
+}
+
+// Voice returns the voice for the next call, or why there is none.
+func (v *voiceSource) Voice() (voice.Voice, error) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	return v.built, v.err
+}
+
+// voiceTiming writes the Supervisor's timing events to the journal, as the
+// acceptance driver reads them: msg "voice timing", with event, session_id
+// and at_unix_ns.
+func voiceTiming(logger *slog.Logger) func(event, sessionID string, at time.Time, kv ...any) {
+	return func(event, sessionID string, at time.Time, kv ...any) {
+		attrs := append([]any{"event", event, "session_id", sessionID, "at_unix_ns", at.UnixNano()}, kv...)
+		logger.Info("voice timing", attrs...)
+	}
 }
 
 // newVoiceA builds voice A on the text-to-speech engine cfg names.
