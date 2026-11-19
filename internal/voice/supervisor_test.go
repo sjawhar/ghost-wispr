@@ -21,8 +21,8 @@ func TestEveryStopSilencesTheExchangeWithin100ms(t *testing.T) {
 		// A pause and a light hold both close the capture gate; the cmd tests
 		// prove each reaches GateClosed (TestAPauseStopsTheVoiceThroughTheGate).
 		"gate closing": func(r *rig) { r.closeGate() },
-		"jabra":      func(r *rig) { r.s.Stop("jabra button") },
-		"shutdown":   func(r *rig) { r.s.Close() },
+		"jabra":        func(r *rig) { r.s.Stop("jabra button") },
+		"shutdown":     func(r *rig) { r.s.Close() },
 	}
 	for name, stop := range stops {
 		t.Run(name, func(t *testing.T) {
