@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"sync"
 
 	interfaces "github.com/deepgram/deepgram-go-sdk/v3/pkg/client/interfaces"
 
@@ -54,18 +55,33 @@ type liveManager interface {
 // manager takes one, so a session's recording starts before the first words
 // Deepgram hears, even when it hears them late after a reconnect.
 func newLiveTranscription(ctx context.Context, apiKey string, cOptions *interfaces.ClientOptions, tOptions *interfaces.LiveTranscriptionOptions, config transcribe.ResilientConfig, callback transcriptCallback, warnings *warningsRegistry, hub *server.Hub) *transcribe.ResilientClient {
-	// The client hands each change of its state to this callback in the order
-	// the changes happened (transcribe.ResilientClient.OnStateChange), so the
-	// warning and the hub's "deepgram" status both end at the client's last
-	// state, and every web client sees the changes in that order.
-	rc := transcribe.NewResilientClient(ctx, nil, config, log.Printf, func(state transcribe.ConnectionState) {
-		if state == transcribe.StateConnected {
+	// The client hands each change of its state to this callback in order,
+	// but a change can be heard of after newer ones happened: the callback
+	// may run behind. The warning and the hub's "deepgram" status show the
+	// state as it is, so each call applies the client's current state, and
+	// only if it is newer than the one last applied (by its Seq): a change
+	// heard of late never clears the warning of a newer outage, nor tells the
+	// pages connected during one.
+	var (
+		rc        *transcribe.ResilientClient
+		appliedMu sync.Mutex
+		applied   uint64
+	)
+	rc = transcribe.NewResilientClient(ctx, nil, config, log.Printf, func(context.Context, transcribe.StateChange) {
+		appliedMu.Lock()
+		defer appliedMu.Unlock()
+		current := rc.CurrentState()
+		if current.Seq <= applied {
+			return
+		}
+		applied = current.Seq
+		if current.State == transcribe.StateConnected {
 			warnings.Clear(deepgramWarningKey)
 		} else {
 			warnings.Set(deepgramWarningKey, deepgramNotConnected)
 		}
 		if hub != nil {
-			hub.BroadcastComponentStatus("deepgram", state.String(), fmt.Sprintf("Deepgram %s", state.String()))
+			hub.BroadcastComponentStatusSeq("deepgram", current.State.String(), fmt.Sprintf("Deepgram %s", current.State.String()), current.Seq)
 		}
 	})
 	rc.Factory = makeDeepgramClientFactory(ctx, apiKey, cOptions, tOptions, callback, deepgramWriteTimeout)

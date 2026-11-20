@@ -64,13 +64,16 @@ type ConnectionEvent struct {
 
 // ComponentStatusEvent is a component's status. A status about one session
 // (its refinement, summary or sync) names it in SessionID; a status of the
-// whole unit (the microphone, Deepgram) has none.
+// whole unit (the microphone, Deepgram) has none. Seq, when set, numbers the
+// component's changes in the order they happened (Deepgram's does), so a
+// client keeps the status with the highest Seq.
 type ComponentStatusEvent struct {
 	Event
 	SessionID string `json:"session_id,omitempty"`
 	Component string `json:"component"`
 	Status    string `json:"status"`
 	Message   string `json:"message"`
+	Seq       uint64 `json:"seq,omitempty"`
 }
 
 // SessionDeletedEvent tells a web client that a session was deleted, with

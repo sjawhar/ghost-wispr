@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -260,6 +261,96 @@ func TestTheHubsDeepgramStatusEndsAtTheClientsState(t *testing.T) {
 			return !rc.IsConnected()
 		})
 		settled("a reconnect: client connected and the hub's status connected")
+	}
+}
+
+// blockingStatusStore is an event store that holds two Deepgram statuses
+// while it stores them: the first "reconnecting", until release closes, so
+// the hub's status callback runs behind the client's changes, as a slow disk
+// makes it; and the first "connected", until the test ends, so a connected
+// announced late stays visible to the test instead of passing in microseconds.
+type blockingStatusStore struct {
+	reconnecting, connected chan struct{}
+	release, end            chan struct{}
+	onceReconnecting        *sync.Once
+	onceConnected           *sync.Once
+}
+
+func (blockingStatusStore) HasSession(string) (bool, error) { return true, nil }
+
+func (s blockingStatusStore) StoreEvent(_, payload string) error {
+	var event struct{ Component, Status string }
+	_ = json.Unmarshal([]byte(payload), &event)
+	switch {
+	case event.Component != "deepgram":
+	case event.Status == "reconnecting":
+		s.onceReconnecting.Do(func() { close(s.reconnecting); <-s.release })
+	case event.Status == "connected":
+		s.onceConnected.Do(func() { close(s.connected); <-s.end })
+	}
+	return nil
+}
+
+// TestALateConnectedNeverHidesACurrentOutage fails if a change heard of late
+// clears the "Deepgram is not connected" warning, or tells the pages
+// connected, while Deepgram is down now. The status callback is held on the
+// first dial's "reconnecting" while the socket connects and is dropped; once
+// it runs again, it hears of "draining" and "connected" after the outage
+// began. In #109's first version they cleared the warning and told the pages
+// connected; on main the warning stayed but the pages were told connected.
+func TestALateConnectedNeverHidesACurrentOutage(t *testing.T) {
+	peer, host := startSwitchableDeepgram(t)
+	store := blockingStatusStore{
+		reconnecting: make(chan struct{}), connected: make(chan struct{}),
+		release: make(chan struct{}), end: make(chan struct{}),
+		onceReconnecting: &sync.Once{}, onceConnected: &sync.Once{},
+	}
+	var released sync.Once
+	free := func() { released.Do(func() { close(store.release) }) }
+	hub := server.NewHub()
+	hub.SetEventStore(store)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	warnings := newWarningsRegistry()
+	rc := newLiveTranscription(ctx, "test-key",
+		&interfaces.ClientOptions{Host: host, EnableKeepAlive: true},
+		&interfaces.LiveTranscriptionOptions{Model: "nova-3", Language: "en-US", Encoding: "linear16", SampleRate: 16000, Channels: 1},
+		// No reconnect during the test: the outage lasts.
+		transcribe.ResilientConfig{BufferSize: 1 << 16, InitialReconnectDelay: time.Hour, MaxReconnectBackoff: time.Hour},
+		transcriptCallback{}, warnings, hub)
+	t.Cleanup(func() { free(); close(store.end); _ = rc.Close() })
+
+	select {
+	case <-store.reconnecting:
+	case <-time.After(3 * time.Second):
+		t.Fatal("the first dial's reconnecting status was not stored")
+	}
+	waitForHardwareWithin(t, 3*time.Second, "the socket to connect while the status callback is held", func() bool {
+		return rc.IsConnected() && peer.held() == 1
+	})
+	peer.dropAll()
+	waitForHardwareWithin(t, 3*time.Second, "the outage", func() bool {
+		_, _ = rc.Write(make([]byte, 3200))
+		return !rc.IsConnected()
+	})
+	free()
+
+	// The held callback and every change behind it run now. A "connected"
+	// announced from here on is one heard of late: the client stays down.
+	select {
+	case <-store.connected:
+		t.Fatalf("during the outage (connected=%t) the pages were told Deepgram is connected; the warning is shown: %t",
+			rc.IsConnected(), notConnectedWarning(warnings))
+	case <-time.After(500 * time.Millisecond):
+	}
+	if rc.IsConnected() {
+		t.Fatal("the client reconnected, though its reconnect delay is an hour")
+	}
+	if !notConnectedWarning(warnings) {
+		t.Fatalf("during the outage the warning is gone (hub status %q): a change heard of late cleared it", hubDeepgramStatus(hub))
+	}
+	if status := hubDeepgramStatus(hub); status == "connected" || status == "" {
+		t.Fatalf("during the outage the hub's deepgram status is %q", status)
 	}
 }
 

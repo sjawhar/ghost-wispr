@@ -356,6 +356,39 @@ describe('a deleted session', () => {
   })
 })
 
+describe("Deepgram's numbered status", () => {
+  const deepgram = (status: ComponentStatus, seq: number) =>
+    applyEvent({
+      type: 'component_status',
+      version: 1,
+      timestamp: '2026-11-20T05:07:08Z',
+      component: 'deepgram',
+      status,
+      message: `Deepgram ${status}`,
+      seq,
+    })
+
+  it('keeps the newest status when an older one comes after it', () => {
+    deepgram(ComponentStatus.Connected, 7)
+    deepgram(ComponentStatus.Draining, 6)
+
+    expect(appState.componentStatuses['deepgram']?.status).toBe(ComponentStatus.Connected)
+  })
+
+  it('takes the statuses of a new connection, whose unit may have restarted', () => {
+    deepgram(ComponentStatus.Connected, 40)
+    applyEvent({
+      type: 'connection',
+      version: 1,
+      timestamp: '2026-11-20T05:08:00Z',
+      connected: true,
+    })
+    deepgram(ComponentStatus.Paused, 3)
+
+    expect(appState.componentStatuses['deepgram']?.status).toBe(ComponentStatus.Paused)
+  })
+})
+
 describe('voice tasks', () => {
   const waiting: VoiceTask = {
     id: 'evt-1',
