@@ -1,5 +1,6 @@
 // Package earcheck verifies text intended for the ear against written source.
 package earcheck
+
 import (
 	"regexp"
 	"strconv"

@@ -20,7 +20,7 @@ func (solR5CurrentQuestionTools) Run(_ context.Context, call voice.ToolCall) (js
 	if strings.Contains(args.Question, "XYZ-456") {
 		key = "XYZ-456"
 	}
-	return json.Marshal(voice.AnswerResult{Say: key + " is in review."})
+	return json.Marshal(voice.AnswerResult{Say: key + " is in review.", IssueKey: key})
 }
 
 func TestSolR5AuditUsesTheCurrentFollowUpKey(t *testing.T) {
@@ -61,27 +61,21 @@ func TestSolR5AuditUsesTheCurrentFollowUpKey(t *testing.T) {
 	}
 }
 
-func TestSolR5SpokenQuestionKeyFormsRetainTheirKey(t *testing.T) {
-	for _, question := range []string{
-		"What is happening with INFRA-1027?",
-		"What is happening with infra 1027?",
-		"What is happening with infra ten twenty-seven?",
-	} {
-		t.Run(question, func(t *testing.T) {
-			x := testExchange(newFakeOutput(), newFakeTools(voice.AnswerResult{}))
-			x.AskerTurn = question
-			srv := newLiveServer(t)
-			s, c, _ := openSession(t, srv, x)
-			done := make(chan error, 1)
-			go func() { done <- s.Say(context.Background(), "INFRA-1027 is in review.", voice.Fact) }()
-			c.expect(evCommentaryAppend)
-			c.speak("It is in review.")
-			if err := <-done; err != nil {
-				t.Fatal(err)
-			}
-			if n := waitFactCheck(t, s); n == 0 {
-				t.Error("a supported spoken key form disabled required-key retention")
-			}
-		})
+func TestSolR5HeldAnswerRetainsExchangeKey(t *testing.T) {
+	x := testExchange(newFakeOutput(), newFakeTools(voice.AnswerResult{}))
+	// Supervisor.speakLocked supplies the canonical pending-answer key even
+	// though a held exchange has no AskerTurn or Recent turn.
+	x.AskerTurn, x.Recent, x.IssueKey = "", nil, "ABC-123"
+	srv := newLiveServer(t)
+	s, c, _ := openSession(t, srv, x)
+	done := make(chan error, 1)
+	go func() { done <- s.Say(context.Background(), "ABC-123 is in review.", voice.Answer) }()
+	c.expect(evCommentaryAppend)
+	c.speak("It is in review.")
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if n := waitFactCheck(t, s); n == 0 {
+		t.Fatal("held answer omitted its canonical key but reported zero failures")
 	}
 }

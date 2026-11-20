@@ -16,23 +16,15 @@ type factAudit struct {
 	actual      strings.Builder
 }
 
-// beginFactAudit starts measuring a fact or an answer. Empty sources need no
-// audit. The shared R8 checker is the sole check for Concierge rewrites and
-// GPT-Live speech: names, key and figure rules, number words and ear form
-// all stay the same.
-func (s *session) beginFactAudit(source string) *factAudit {
+// beginFactAudit starts measuring a fact or an answer with its canonical
+// resolved issue key. No transcript or spoken text supplies that key.
+func (s *session) beginFactAudit(source, questionKey string) *factAudit {
 	if strings.TrimSpace(source) == "" {
 		return nil
 	}
-	s.mu.Lock()
-	question := s.currentQuestion
-	if question == "" {
-		question = s.x.AskerTurn
-	}
-	s.mu.Unlock()
 	a := &factAudit{
 		source:      source,
-		questionKey: earcheck.QuestionKey(question),
+		questionKey: questionKey,
 	}
 	s.factMu.Lock()
 	s.facts = append(s.facts, a)
