@@ -2,6 +2,7 @@ package dgagent
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"sync"
@@ -11,6 +12,16 @@ import (
 	"github.com/sjawhar/ghost-wispr/internal/audio"
 	"github.com/sjawhar/ghost-wispr/internal/voice"
 )
+
+// silentConcierge never answers: after a UserStartedSpeaking, the model's
+// own words answer the room's turn, and the session asks the Concierge
+// instead. These tests are about what plays, so the answer never comes.
+func silentConcierge() tools {
+	return func(ctx context.Context, _ voice.ToolCall) (json.RawMessage, error) {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+}
 
 // sharedSentence is one sentence of a Deepgram reply whose sentences share a
 // single AgentAudioDone, such as an injection and the model's own words after
@@ -94,7 +105,7 @@ func TestSpeechGateSharedDoneReplies(t *testing.T) {
 func testUserStartOverPlayedSpeech(t *testing.T, userStart bool) {
 	stand := startStandIn(t)
 	out := newFakeOutput()
-	sess, c, _ := open(t, stand, Config{speechGap: time.Minute}, voice.Exchange{Out: out, Tools: tools(nil)})
+	sess, c, _ := open(t, stand, Config{speechGap: time.Minute}, voice.Exchange{Out: out, Tools: silentConcierge()})
 	defer func() { _ = sess.Close() }()
 	approved := tone(OutputRate, 40*time.Millisecond, 800)
 	done := sayAsync(sess, "Approved words.")
@@ -262,7 +273,7 @@ func runSharedDoneTrace(t *testing.T, trace []sharedEvent, sentences, injected i
 	stand := startStandIn(t)
 	base := newFakeOutput()
 	out := newGateOrderingOutput(base)
-	sess, c, _ := open(t, stand, Config{sayLimit: 2 * time.Second, speechGap: time.Minute}, voice.Exchange{Out: out, Tools: tools(nil)})
+	sess, c, _ := open(t, stand, Config{sayLimit: 2 * time.Second, speechGap: time.Minute}, voice.Exchange{Out: out, Tools: silentConcierge()})
 	defer func() { _ = sess.Close() }()
 
 	texts := make([]string, sentences)
