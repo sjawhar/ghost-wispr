@@ -204,7 +204,7 @@ func checkSafeUnit(ctx context.Context, url, when string) error {
 	if err != nil {
 		return fmt.Errorf("probe safety guard %s: read status: %w", when, err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("probe safety guard %s: status HTTP %d", when, resp.StatusCode)
 	}
