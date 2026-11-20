@@ -355,6 +355,17 @@ printf '%s \n' '1: lo    inet 127.0.0.1/8 scope global dynamic' '2: eth0    inet
 # F-ip-lo-only: only the lo and tailscale0 lines of F-ip-pi. F-ip-empty: no line.
 sed -n '1p;3p' "$fixtures/F-ip-pi" >"$fixtures/F-ip-lo-only"
 : >"$fixtures/F-ip-empty"
+# F-ip-ptp-control: F-ip-ptp with an ESC in the interface name of its wg0 line.
+{
+  cat -- "$fixtures/F-ip-pi"
+  printf '%s\033%s\n' '5: wg' '0    inet 10.0.0.1 peer 10.0.0.2/32 scope global wg0\       valid_lft forever preferred_lft forever'
+} >"$fixtures/F-ip-ptp-control"
+# F-ip-control-name: F-ip-pi with an ESC in the interface name of its wlan0 line.
+{
+  sed -n '1p' "$fixtures/F-ip-pi"
+  printf '%s\033%s\n' '3: wl' 'an0    inet 192.168.1.136/24 brd 192.168.1.255 scope global dynamic noprefixroute wlan0\       valid_lft 85520sec preferred_lft 85520sec'
+  sed -n '3p' "$fixtures/F-ip-pi"
+} >"$fixtures/F-ip-control-name"
 
 # The tailnet's statuses, as `tailscale status --json` prints them.
 # F-status-router: a status in the shape of Tailscale v1.104.1's ipn/ipnstate/ipnstate.go, with
@@ -456,6 +467,13 @@ jq '("nodekey:" + "f" * 64) as $key | .Peer[$key] = {ID: "n3000", PublicKey: $ke
 # terminal escape sequence ESC ]0; that sets a window's title, ended by a BEL.
 jq '(.Peer[] | select(.HostName == "router-a") | .HostName) = "router-a\u001b]0;pwned\u0007"' \
   "$fixtures/F-status-router" >"$fixtures/F-status-control-host"
+# F-status-control-overlap: F-status-overlap with ESC, BEL and U+202E in office-router's HostName.
+jq '(.Peer[] | select(.HostName == "office-router") | .HostName) = "office-router\u001b]0;pwned\u0007\u202e"' \
+  "$fixtures/F-status-overlap" >"$fixtures/F-status-control-overlap"
+# F-status-control-state: F-status-router with an ESC in its BackendState.
+jq '.BackendState = "Needs\u001bLogin"' "$fixtures/F-status-router" >"$fixtures/F-status-control-state"
+# F-status-control-route: F-status-router with an ESC at the end of router-a's route.
+with_routes F-status-control-route '["10.1.0.0/16\u001b"]'
 
 readonly accepted_prefix='ghost-wispr routes: no route of a peer overlaps a network of the Pi: '
 readonly not_accepting="ghost-wispr routes: not accepting the tailnet's subnet routes: an accepted route would take the Pi's own traffic for that network"
@@ -603,6 +621,16 @@ route_row() {
   done
 }
 
+# clean_route_row runs route_row on its arguments, then fails when the check's output holds an ESC,
+# a BEL or a U+202E: a terminal runs an escape sequence, and shows the text after a U+202E in
+# another order.
+clean_route_row() {
+  route_row "$@"
+  if grep -q -e $'\033' -e $'\007' -e $'\xe2\x80\xae' "$work_dir/check.out"; then
+    fail "route check $1 prints a control or format character: $(cat -v -- "$work_dir/check.out")"
+  fi
+}
+
 route_row 'G1 route holds the network' 1 F-ip-pi F-status-overlap 'wlan0 192.168.1.136/24 overlaps 192.168.0.0/16'
 route_row 'G2 network holds the route' 1 F-ip-pi F-status-host-route 'overlaps 192.168.1.10/32'
 route_row 'G3 adjacent' 0 F-ip-pi F-status-adjacent "$accepted_prefix"
@@ -634,10 +662,15 @@ TEST_STATUS_EXIT=1 route_row 'G19 status fails' 2 F-ip-pi F-status-router 'canno
 route_row 'G20 status prints nothing' 2 F-ip-pi F-status-empty 'cannot compare'
 route_row 'G21 status is not JSON' 2 F-ip-pi F-status-not-json 'cannot compare'
 route_row 'G22 Tailscale not running' 2 F-ip-pi F-status-needs-login 'cannot compare' 'NeedsLogin'
-route_row 'G23 control characters in a host name' 0 F-ip-pi F-status-control-host 'router-a?]0;pwned?'
-if grep -q -e $'\033' -e $'\007' "$work_dir/check.out"; then
-  fail "route check G23 control characters in a host name prints a control character: $(cat -v -- "$work_dir/check.out")"
-fi
+clean_route_row 'G23 control characters in a host name' 0 F-ip-pi F-status-control-host 'router-a?]0;pwned?'
+clean_route_row 'G24 control and format characters in a refusal' 1 F-ip-pi F-status-control-overlap \
+  'wlan0 192.168.1.136/24 overlaps 192.168.0.0/16 of office-router?]0;pwned??'
+clean_route_row 'G25 control characters in an ip line with no prefix' 2 F-ip-ptp-control F-status-router 'cannot compare' 'wg?0'
+clean_route_row 'G26 control characters in BackendState' 2 F-ip-pi F-status-control-state 'Needs?Login'
+clean_route_row 'G27 control characters in a route that is no prefix' 2 F-ip-pi F-status-control-route 'cannot compare' \
+  '10.1.0.0/16?'
+clean_route_row 'G28 control characters in an interface name' 1 F-ip-control-name F-status-overlap \
+  'wl?an0 192.168.1.136/24 overlaps'
 
 # J0: provision.sh on a Pi already joined as tag:ghost-wispr at $PI_HOST. exits before the join, so
 # it installs no route check and leaves the accept-routes setting as it is.
