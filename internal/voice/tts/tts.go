@@ -183,7 +183,7 @@ type sayRequest struct {
 }
 
 // errNoAudio is a speech vendor that ended a non-empty text with no frame.
-var errNoAudio = errors.New("tts: the engine returned no audio")
+var errNoAudio = errors.New("tts: the engine gave no audio")
 
 // errPlaybackEnded stops a Say's synthesis once play could not write it.
 var errPlaybackEnded = errors.New("tts: the playback ended")

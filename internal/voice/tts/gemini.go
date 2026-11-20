@@ -321,9 +321,9 @@ func (g *Gemini) Stream(ctx context.Context, text string, emit func(pcm []byte) 
 	}
 	if !audioSeen {
 		if finishReason != "" {
-			return fmt.Errorf("gemini tts: stream ended with %s and no audio", finishReason)
+			return fmt.Errorf("gemini tts: the engine gave no audio (finish reason: %s)", finishReason)
 		}
-		return errors.New("gemini tts: stream returned no audio")
+		return errors.New("gemini tts: the engine gave no audio")
 	}
 	return nil
 }
