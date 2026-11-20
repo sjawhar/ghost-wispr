@@ -2,10 +2,11 @@
 # Provision the Ghost Wispr Raspberry Pi from a release binary and a credential bundle on stdin.
 set -euo pipefail
 
-# GHOST_WISPR_DEPLOY_DIR, GHOST_WISPR_IDENTITY_KEY and GHOST_WISPR_PI_ENV exist for
-# provision_run_test.sh, as update.sh's GHOST_WISPR_DEPLOY_DIR does for update_test.sh.
+# GHOST_WISPR_DEPLOY_DIR, GHOST_WISPR_IDENTITY_KEY, GHOST_WISPR_JOIN_DIR and GHOST_WISPR_PI_ENV exist
+# for provision_run_test.sh, as update.sh's GHOST_WISPR_DEPLOY_DIR does for update_test.sh.
 readonly DEPLOY_DIR="${GHOST_WISPR_DEPLOY_DIR:-/opt/ghost-wispr}"
-readonly JOIN_DIR=/var/lib/ghost-wispr-join
+readonly JOIN_DIR="${GHOST_WISPR_JOIN_DIR:-/var/lib/ghost-wispr-join}"
+readonly JOIN_ROUTE_CHECK="$JOIN_DIR/route-overlap-check"
 readonly JOIN_TOKEN="$JOIN_DIR/token"
 readonly IDENTITY_KEY="${GHOST_WISPR_IDENTITY_KEY:-/home/ghost-wispr/.config/ghost-wispr-identity/key.pem}"
 readonly SERVICE_USER=ghost-wispr
@@ -104,6 +105,95 @@ provision_models() {
   sudo install -o "$SERVICE_USER" -g "$SERVICE_USER" -m 0640 "$staging_dir/ghost-wispr.yaml" "$DEPLOY_DIR/ghost-wispr.yaml"
   run_user_systemctl restart ghost-wispr.service
   printf 'ghost-wispr provision: installed models configuration and restarted ghost-wispr.service\n'
+}
+
+# route_overlap_check_script prints the route check, a POSIX sh program. It compares each IPv4
+# network of the Pi (`ip -4 -o addr`, with tailscale0 left out) with each peer's PrimaryRoutes in
+# `tailscale status --json` (IPv6 routes left out), because an accepted route that overlaps a network
+# of the Pi would take the Pi's own traffic for that network. It exits 0 when it compared at least
+# one network and no route overlaps one, and prints its one line on stdout only then; 1 when a route
+# overlaps, naming each overlap on stderr; and 2 when it cannot compare, naming the step that failed.
+# Two callers run it: the detached join, from $JOIN_ROUTE_CHECK, before it accepts the routes, and
+# docs/pi-setup.md's "Accept the tailnet's subnet routes", on the Pi over ssh. It runs under dash,
+# with no pipefail, so it checks each command's status itself. Its whole body is one function that
+# its last line calls, so a program cut short runs nothing.
+route_overlap_check_script() {
+  cat <<'CHECK'
+# Ghost Wispr's route check, printed by route_overlap_check_script in deploy/pi/provision.sh.
+route_overlap_check() {
+  not_accepting="ghost-wispr routes: not accepting the tailnet's subnet routes: an accepted route would take the Pi's own traffic for that network"
+  cannot='ghost-wispr routes: cannot compare the routes with the networks of the Pi'
+  newline='
+'
+  cannot_compare() { printf '%s\n' "$cannot: $1" "$not_accepting" >&2; exit 2; }
+  networks=$(ip -4 -o addr) || cannot_compare "ip -4 -o addr failed (exit $?)"
+  status=$(tailscale status --json) || cannot_compare "tailscale status --json failed (exit $?)"
+  [ -n "$status" ] || cannot_compare "tailscale status --json printed nothing"
+  # The status of a large tailnet can pass the 128 KiB limit for one argument, so jq reads it on
+  # stdin, from the printf builtin.
+  # jq prints the exit code on its first line, then the lines to print. Where a text from ip or
+  # tailscale enters a value that a line prints, clean replaces each control or format character in
+  # it with ?: the owner of a peer sets its HostName, a terminal runs the escape sequences in a line,
+  # and a format character such as U+202E changes the order in which a terminal shows the text after
+  # it. prefix and the tailscale0 filter read the raw texts.
+  verdict=$(printf '%s\n' "$status" | jq -r -s --arg ip_lines "$networks" --arg cannot "$cannot" '
+    def prefix:
+      if test("^[0-9]{1,3}([.][0-9]{1,3}){3}/[0-9]{1,2}$") then
+        split("/") as [$address, $bits]
+        | ($address | split(".") | map(tonumber)) as $octets
+        | ($bits | tonumber) as $bits
+        | if all($octets[]; . <= 255) and $bits <= 32
+          then {bits: $bits, number: ($octets[0] * 16777216 + $octets[1] * 65536 + $octets[2] * 256 + $octets[3])}
+          else null end
+      else null end;
+    def size($bits): reduce range(32 - $bits) as $bit (1; . * 2);
+    def overlap($a; $b): size([$a.bits, $b.bits] | min) as $size
+      | ($a.number / $size | floor) == ($b.number / $size | floor);
+    def refuse($step): "2\n\($cannot): \($step)";
+    def clean: tostring | gsub("[[:cntrl:]\\p{Cf}]"; "?");
+    [$ip_lines | split("\n")[] | select(test("[^ \t]"))
+      | {line: clean, fields: [splits("[ \t]+") | select(. != "")]}
+      | select(.fields[1] != "tailscale0")
+      | . + {name: (.fields[1] | clean), address: (.fields[3] | clean), prefix: (.fields[3] // "" | prefix)}] as $networks
+    | ($networks | map(select(.prefix == null)) | first) as $unread
+    | if $unread != null then refuse("ip -4 -o addr gives no IPv4 address/prefix in field 4 of: \($unread.line)")
+      elif ($networks | map(select(.name != "lo")) | length) == 0 then
+        refuse("ip -4 -o addr gives no network other than lo and tailscale0")
+      elif length != 1 then refuse("tailscale status --json gave \(length) JSON values, not one")
+      elif .[0].BackendState != "Running" then
+        refuse("BackendState is \(.[0].BackendState | clean), not Running")
+      else
+        [.[0].Peer // {} | .[] | (.HostName // "a peer with no HostName") as $host
+          | .PrimaryRoutes // [] | .[] | select(contains(":") | not)
+          | {route: clean, host: ($host | clean), prefix: prefix}] as $routes
+        | ($routes | map(select(.prefix == null)) | first) as $unknown
+        | if $unknown != null then refuse("the route \($unknown.route) of \($unknown.host) is no IPv4 or IPv6 prefix")
+          else
+            [$networks[] as $network | $routes[] as $route | select(overlap($network.prefix; $route.prefix))
+              | "ghost-wispr routes: \($network.name) \($network.address) overlaps \($route.route) of \($route.host)"]
+            | if length > 0 then "1\n" + join("\n")
+              else "0\nghost-wispr routes: no route of a peer overlaps a network of the Pi: "
+                + ($networks | map("\(.name) \(.address)") | join(", ")) + "; routes compared: "
+                + (if $routes == [] then "none" else $routes | map("\(.route) of \(.host)") | join(", ") end)
+              end
+          end
+      end
+  ') || cannot_compare "jq could not read tailscale status --json (exit $?)"
+  case $verdict in
+    [012]"$newline"?*) ;;
+    *) cannot_compare "jq gave no verdict" ;;
+  esac
+  code=${verdict%%"$newline"*}
+  lines=${verdict#*"$newline"}
+  if [ "$code" = 0 ]; then
+    printf '%s\n' "$lines"
+    exit 0
+  fi
+  printf '%s\n' "$lines" "$not_accepting" >&2
+  exit "$code"
+}
+route_overlap_check
+CHECK
 }
 
 if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
@@ -295,10 +385,26 @@ fi
 
 sudo install -d -o root -g root -m 0700 "$JOIN_DIR"
 printf '%s' "$id_token" | sudo install -m 0600 /dev/stdin "$JOIN_TOKEN"
+route_overlap_check_script | sudo install -o root -g root -m 0700 /dev/stdin "$JOIN_ROUTE_CHECK"
 join_unit="ghost-wispr-tailnet-join-$(date +%s)"
-# Serve is set above for a node that is joined already, and again after the re-authentication:
-# the join can start a new login profile, which would not carry the setting over.
-join_command="tailscale up --force-reauth --client-id='$tailscale_client_id?ephemeral=false&preauthorized=true' --id-token=file:$JOIN_TOKEN --advertise-tags=tag:ghost-wispr --hostname=ghost-wispr --ssh; rc=\$?; rm -f $JOIN_TOKEN; if [ \$rc -eq 0 ]; then tailscale serve --bg --https 443 http://127.0.0.1:8080 || rc=\$?; fi; exit \$rc"
+# The join brings the node up with the tailnet's subnet routes off, `--accept-routes=false`:
+# `tailscale up` refuses to leave out a setting that is not the default (tailscale v1.104.1,
+# cmd/tailscale/cli/up.go, checkForAccidentalSettingReverts), and a re-join must not accept a route
+# that now overlaps a network of the Pi. So only the route check turns the routes on, through
+# `tailscale set --accept-routes` once it passed. The check runs even when Serve failed, as the
+# routes do not depend on Serve, and the unit ends failed when up, serve or set failed or the check
+# refused. Serve is set above for a node that is joined already, and again after the
+# re-authentication: the join can start a new login profile, which would not carry the setting over.
+join_command="tailscale up --force-reauth --client-id='$tailscale_client_id?ephemeral=false&preauthorized=true'"
+join_command+=" --id-token=file:$JOIN_TOKEN --advertise-tags=tag:ghost-wispr --hostname=ghost-wispr --ssh --accept-routes=false;"
+join_command+=" rc=\$?; rm -f $JOIN_TOKEN;"
+join_command+=" if [ \$rc -eq 0 ]; then"
+join_command+=" tailscale serve --bg --https 443 http://127.0.0.1:8080 || rc=\$?;"
+join_command+=" if /bin/sh $JOIN_ROUTE_CHECK; then tailscale set --accept-routes || rc=\$?; else rc=\$?; fi;"
+join_command+=" fi; rm -f $JOIN_ROUTE_CHECK; exit \$rc"
 printf 'ghost-wispr provision: starting the tagged tailnet join as %s\n' "$join_unit"
-sudo systemd-run --unit="$join_unit" /bin/sh -c "$join_command"
-printf 'ghost-wispr provision: reconnect with Tailscale SSH, then check tailscale status and journalctl -u %s.\n' "$join_unit"
+# systemd-run(1): the service manager expands ${NAME} and $$ in the command's arguments unless
+# --expand-environment=no, which systemd 254 added (Raspberry Pi OS Trixie has 257). The join
+# command is shell code for the unit's /bin/sh, which must get it as written.
+sudo systemd-run --expand-environment=no --unit="$join_unit" /bin/sh -c "$join_command"
+printf 'ghost-wispr provision: reconnect with Tailscale SSH, then check tailscale status and sudo journalctl -u %s.\n' "$join_unit"
