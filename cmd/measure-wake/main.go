@@ -13,20 +13,29 @@
 // stream. Every phrase the listener accepts in it is a false start.
 //
 // -splice is a directory of start-phrase clips, spliced into the -audio
-// streams once every -splice-every of audio: the control that shows the false
-// start count comes from an instrument that can fire. A wake within 2 s of a
-// spliced clip's end counts as a spliced hit, not a false start, and the
-// spliced audio is not counted in the hours.
+// streams once every -splice-every of audio: the first control, which shows
+// the listener can hear the phrase in that speech, so that 0 false starts is
+// not a deaf listener's. A wake within 2 s of a spliced clip's end counts as a
+// spliced hit, not a false start, and the spliced audio is not counted in the
+// hours. With no -splice, the clips of -phrases are spliced in.
+//
+// The second control runs the spotter at its most permissive, stage 1 alone at
+// -control-boost and -control-threshold (the lowest), on the same speech
+// (check c-listener-accuracy). It must count more false starts than the
+// listener: else the speech holds too little that sounds like the phrase to
+// show that the listener rejects it.
 //
 // -phrases is a directory whose subdirectories are cells (a person at a
 // distance), each holding WAV files of one start phrase each; each clip is
 // played between seconds of silence, and is a hit if the listener accepts it.
 //
-// The run prints key=value lines, then a verdict: PASS when it read at least
-// -min-hours of audio with fewer than -limit false starts per hour, and, with
-// -phrases, at least -min-hit-rate of the phrases, every cell holding at least
-// -min-cell clips; FAIL otherwise; UNKNOWN when it read too little to judge,
-// or when a splice control heard none of its clips.
+// The run prints key=value lines, then a verdict: FAIL when it read at least
+// -min-hours with at least -limit false starts per hour, or with -phrases
+// heard fewer than -min-hit-rate of them; PASS when it read at least
+// -min-hours with fewer than -limit false starts per hour, both controls
+// fired, and with -phrases every cell holds at least -min-cell clips and it
+// heard at least -min-hit-rate of them; UNKNOWN otherwise: too little audio,
+// a small cell, or a control that did not fire.
 package main
 
 import (
@@ -51,21 +60,23 @@ func main() {
 }
 
 type options struct {
-	mode        string
-	audio       string
-	phrases     string
-	splice      string
-	spliceEvery time.Duration
-	boost       float64
-	threshold   float64
-	decoys      string
-	stage2      bool
-	parallel    int
-	minHours    float64
-	limit       float64
-	minHitRate  float64
-	minCell     int
-	each        bool
+	mode             string
+	audio            string
+	phrases          string
+	splice           string
+	spliceEvery      time.Duration
+	boost            float64
+	threshold        float64
+	decoys           string
+	stage2           bool
+	controlBoost     float64
+	controlThreshold float64
+	parallel         int
+	minHours         float64
+	limit            float64
+	minHitRate       float64
+	minCell          int
+	each             bool
 	// detector makes each detector the run uses: newDetector, the
 	// listener's own.
 	detector func(*options) (*local.Detector, error)
@@ -84,6 +95,8 @@ func run(args []string, stdout, stderr io.Writer, detector func(*options) (*loca
 	flags.Float64Var(&o.threshold, "threshold", local.DefaultThresholds.Threshold, "stage 1's threshold")
 	flags.StringVar(&o.decoys, "decoys", "", `"stop": add the stop-recording decoy lines to stage 1`)
 	flags.BoolVar(&o.stage2, "stage2", true, "confirm each stage-1 hit with the recognizer")
+	flags.Float64Var(&o.controlBoost, "control-boost", 3, "the control's stage-1 boost: the most permissive")
+	flags.Float64Var(&o.controlThreshold, "control-threshold", 0.01, "the control's stage-1 threshold: the lowest")
 	flags.IntVar(&o.parallel, "parallel", 1, "detectors that share -audio's streams, each on its own CPU")
 	flags.Float64Var(&o.minHours, "min-hours", 10, "the least audio a verdict rests on")
 	flags.Float64Var(&o.limit, "limit", 0.5, "false starts per hour the verdict allows, exclusive")
@@ -268,30 +281,9 @@ func countStreams(d *local.Detector, all [][]string, worker, workers int, splice
 	return c, nil
 }
 
-func measureFalseStarts(o *options, out io.Writer) (string, error) {
-	all, err := streams(o.audio)
-	if err != nil {
-		return "", err
-	}
-	var spliced [][]int16
-	if o.splice != "" {
-		clips, err := filepath.Glob(filepath.Join(o.splice, "*.wav"))
-		if err != nil {
-			return "", err
-		}
-		sort.Strings(clips)
-		for _, clip := range clips {
-			pcm, err := local.ReadWAV(clip)
-			if err != nil {
-				return "", err
-			}
-			spliced = append(spliced, pcm)
-		}
-		if len(spliced) == 0 {
-			return "", fmt.Errorf("-splice %s holds no WAV clip", o.splice)
-		}
-	}
-	spliceEvery := int(o.spliceEvery.Seconds() * local.SampleRate)
+// countAll runs a detector of o's on each of -parallel shares of the streams
+// at once, and sums what they counted.
+func countAll(o *options, all [][]string, spliced [][]int16, spliceEvery int) (speechCounts, error) {
 	detectors := make([]*local.Detector, o.parallel)
 	defer func() {
 		for _, d := range detectors {
@@ -303,11 +295,10 @@ func measureFalseStarts(o *options, out io.Writer) (string, error) {
 	for i := range detectors {
 		d, err := o.detector(o)
 		if err != nil {
-			return "", err
+			return speechCounts{}, err
 		}
 		detectors[i] = d
 	}
-	started := cpuTime()
 	var (
 		mu    sync.Mutex
 		total speechCounts
@@ -326,10 +317,62 @@ func measureFalseStarts(o *options, out io.Writer) (string, error) {
 		})
 	}
 	wg.Wait()
-	if first != nil {
-		return "", first
+	return total, first
+}
+
+// spliceClips reads the clips the run splices into the speech: -splice's, else
+// every clip of -phrases.
+func spliceClips(o *options) ([][]int16, error) {
+	var clips []string
+	var err error
+	switch {
+	case o.splice != "":
+		clips, err = filepath.Glob(filepath.Join(o.splice, "*.wav"))
+	case o.phrases != "":
+		clips, err = filepath.Glob(filepath.Join(o.phrases, "*", "*.wav"))
+	}
+	if err != nil {
+		return nil, err
+	}
+	sort.Strings(clips)
+	var spliced [][]int16
+	for _, clip := range clips {
+		pcm, err := local.ReadWAV(clip)
+		if err != nil {
+			return nil, err
+		}
+		spliced = append(spliced, pcm)
+	}
+	if o.splice != "" && len(spliced) == 0 {
+		return nil, fmt.Errorf("-splice %s holds no WAV clip", o.splice)
+	}
+	return spliced, nil
+}
+
+func measureFalseStarts(o *options, out io.Writer) (string, error) {
+	all, err := streams(o.audio)
+	if err != nil {
+		return "", err
+	}
+	spliced, err := spliceClips(o)
+	if err != nil {
+		return "", err
+	}
+	spliceEvery := int(o.spliceEvery.Seconds() * local.SampleRate)
+	started := cpuTime()
+	total, err := countAll(o, all, spliced, spliceEvery)
+	if err != nil {
+		return "", err
 	}
 	used := cpuTime() - started
+	// The control runs after the listener, so the CPU above is the listener's.
+	control := *o
+	control.boost, control.threshold, control.stage2, control.decoys = o.controlBoost, o.controlThreshold, false, ""
+	controlCounts, err := countAll(&control, all, nil, 0)
+	if err != nil {
+		return "", err
+	}
+
 	hours := float64(total.samples) / local.SampleRate / 3600
 	perHour, stageOnePerHour := 0.0, 0.0
 	if hours > 0 {
@@ -344,23 +387,31 @@ func measureFalseStarts(o *options, out io.Writer) (string, error) {
 		total.files, hours, total.falseStarts, perHour)
 	_, _ = fmt.Fprintf(out, "stage1_hits_in_speech=%d stage1_hits_per_hour=%.3f\n", total.stageOneInSpeech, stageOnePerHour)
 	_, _ = fmt.Fprintf(out, "cpu_seconds_per_audio_second=%.4f\n", cpuShare)
-	if len(spliced) > 0 {
-		_, _ = fmt.Fprintf(out, "spliced_clips=%d spliced_heard=%d\n", total.splicedClips, total.splicedHeard)
-	}
+	_, _ = fmt.Fprintf(out, "spliced_clips=%d spliced_heard=%d\n", total.splicedClips, total.splicedHeard)
+	_, _ = fmt.Fprintf(out, "control_boost=%g control_threshold=%g control_false_starts=%d\n", o.controlBoost, o.controlThreshold, controlCounts.falseStarts)
 	switch {
 	case total.files == 0:
 		_, _ = fmt.Fprintf(out, "UNKNOWN: no WAV file read under %s\n", o.audio)
 		return "UNKNOWN", nil
-	case len(spliced) > 0 && total.splicedHeard == 0:
-		_, _ = fmt.Fprintln(out, "UNKNOWN: the listener heard none of the spliced phrases, so a count of 0 false starts proves nothing")
-		return "UNKNOWN", nil
 	case hours < o.minHours:
 		_, _ = fmt.Fprintf(out, "UNKNOWN: %.3f h of audio, fewer than %g h\n", hours, o.minHours)
 		return "UNKNOWN", nil
-	case perHour < o.limit:
-		return "PASS", nil
-	default:
+	case perHour >= o.limit:
 		return "FAIL", nil
+	case total.splicedClips == 0:
+		_, _ = fmt.Fprintln(out, "UNKNOWN: no start phrase was spliced into the speech (give -splice or -phrases, and -splice-every under the length of a stream), so nothing shows the listener can hear one")
+		return "UNKNOWN", nil
+	case total.splicedHeard == 0:
+		_, _ = fmt.Fprintln(out, "UNKNOWN: the listener heard none of the spliced phrases, so a count of 0 false starts proves nothing")
+		return "UNKNOWN", nil
+	case controlCounts.falseStarts == 0:
+		_, _ = fmt.Fprintln(out, "UNKNOWN: the control counted no false start in this speech: it holds too little that sounds like the phrase to show that the listener rejects it")
+		return "UNKNOWN", nil
+	case controlCounts.falseStarts <= total.falseStarts:
+		_, _ = fmt.Fprintln(out, "UNKNOWN: the control counted no more false starts than the listener, so it does not show the listener rejects anything")
+		return "UNKNOWN", nil
+	default:
+		return "PASS", nil
 	}
 }
 
