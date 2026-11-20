@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -227,27 +228,53 @@ func TestWithModule_RenamingKeepsBoundValuesAsBound(t *testing.T) {
 }
 
 // A value bound after a group opened is written as a plain JSON logger writes
-// it: HTML characters unescaped, an error as its text, a struct, a nil and a
-// value whose JSON fails each as that logger writes them.
+// it: HTML characters unescaped, an error as its text, a struct, a nil, a
+// value whose JSON fails, a MarshalJSON that panics and a nil error pointer
+// each as that logger writes them, and logging never panics.
 func TestWithModule_GroupedValuesRenderAsAPlainLogger(t *testing.T) {
-	values := []any{
-		"tag", map[string]string{"html": "<b>&</b>"},
-		"failure", errors.New("disk <full>"),
-		"point", struct{ X, Y int }{1, 2},
-		"none", nil,
-		"unrenderable", func() {},
+	values := func() []any { // fresh for each logger: a failing marshaler counts its calls
+		return []any{
+			"tag", map[string]string{"html": "<b>&</b>"},
+			"failure", errors.New("disk <full>"),
+			"point", struct{ X, Y int }{1, 2},
+			"none", nil,
+			"unrenderable", func() {},
+			"refused", failingMarshaler{new(int)},
+			"panicked", panickingMarshaler{},
+			"nil error", (*nilError)(nil),
+		}
 	}
 	var plain, named bytes.Buffer
-	New(&plain, slog.LevelInfo).WithGroup("request").With(values...).Info("bound")
-	WithModule(New(&named, slog.LevelInfo), "server").WithGroup("request").With(values...).Info("bound")
+	New(&plain, slog.LevelInfo).WithGroup("request").With(values()...).Info("bound")
+	WithModule(New(&named, slog.LevelInfo), "server").WithGroup("request").With(values()...).Info("bound")
 
 	want, _ := decodeJSONLine(t, plain.String())["request"].(map[string]any)
 	got, _ := decodeJSONLine(t, named.String())["request"].(map[string]any)
-	if len(want) != 5 || !reflect.DeepEqual(got, want) {
+	if len(want) != 8 || !reflect.DeepEqual(got, want) {
 		t.Fatalf("grouped values = %v, a plain logger writes %v\nplain: %snamed: %s", got, want, plain.String(), named.String())
 	}
 	if !strings.Contains(named.String(), `"html":"<b>&</b>"`) {
 		t.Fatalf("HTML characters were escaped: %s", named.String())
+	}
+}
+
+// A grouped value whose MarshalJSON fails is rendered once, so the logger and
+// the one that renames its module write the same failure.
+func TestWithModule_AFailingGroupedValueIsRenderedOnce(t *testing.T) {
+	var out bytes.Buffer
+	calls := 0
+	logger := WithModule(New(&out, slog.LevelInfo), "server").WithGroup("request").With("refused", failingMarshaler{&calls})
+	logger.Info("original logger")
+	WithModule(logger, "health").Info("renamed logger")
+
+	lines := strings.Split(strings.TrimSpace(out.String()), "\n")
+	if calls != 1 || len(lines) != 2 {
+		t.Fatalf("MarshalJSON ran %d times for %d records, want once: %s", calls, len(lines), out.String())
+	}
+	first, _ := decodeJSONLine(t, lines[0])["request"].(map[string]any)
+	second, _ := decodeJSONLine(t, lines[1])["request"].(map[string]any)
+	if first["refused"] != second["refused"] {
+		t.Fatalf("the two loggers wrote %v and %v", first["refused"], second["refused"])
 	}
 }
 
@@ -262,6 +289,22 @@ func (m countingMarshaler) MarshalJSON() ([]byte, error) {
 	*m.calls++
 	return json.Marshal(*m.calls)
 }
+
+// failingMarshaler fails to render, naming how many times it was asked.
+type failingMarshaler struct{ calls *int }
+
+func (m failingMarshaler) MarshalJSON() ([]byte, error) {
+	*m.calls++
+	return nil, fmt.Errorf("refused %d", *m.calls)
+}
+
+type panickingMarshaler struct{}
+
+func (panickingMarshaler) MarshalJSON() ([]byte, error) { panic("marshal panicked") }
+
+type nilError struct{ text string }
+
+func (e *nilError) Error() string { return e.text }
 
 func TestRequestIDMiddleware_AddsRequestIDToContextHeaderAndLogs(t *testing.T) {
 	var out bytes.Buffer

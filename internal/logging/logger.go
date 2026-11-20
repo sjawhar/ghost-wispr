@@ -7,11 +7,13 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"log/slog"
 	"net/http"
 	"os"
+	"reflect"
 	"runtime"
 	"slices"
 	"strings"
@@ -232,10 +234,13 @@ func (h *moduleHandler) WithGroup(name string) slog.Handler {
 }
 
 // renderAttrs renders each value of attrs, in groups too, in place, as
-// slog's JSON handler renders it: a LogValuer is resolved, an error that is no
-// json.Marshaler becomes its text, and any other value of kind Any becomes its
-// JSON, so each runs once however many handlers bind the result. A value whose
-// JSON fails stays, and each handler writes the same failure.
+// slog's JSON handler renders it, so each runs once however many handlers
+// bind the result: a LogValuer is resolved, and a value of kind Any becomes
+// its JSON. A value whose JSON fails becomes slog's "!ERROR:" text, and one
+// that panics slog's "!PANIC:" text, or "<nil>" for a nil pointer. An error
+// that is no json.Marshaler stays an error, for each handler to write as its
+// text: Error has no effect a record can show, and a handler's ReplaceAttr
+// can still read the error.
 func renderAttrs(attrs []slog.Attr) {
 	for i := range attrs {
 		value := attrs[i].Value.Resolve()
@@ -251,20 +256,29 @@ func renderAttrs(attrs []slog.Attr) {
 	}
 }
 
-func renderAny(value slog.Value) slog.Value {
+func renderAny(value slog.Value) (rendered slog.Value) {
 	v := value.Any()
-	if err, ok := v.(error); ok {
+	if _, isError := v.(error); isError {
 		if _, marshals := v.(json.Marshaler); !marshals {
-			return slog.StringValue(err.Error())
+			return value
 		}
 	}
-	var rendered bytes.Buffer
-	encoder := json.NewEncoder(&rendered)
+	defer func() {
+		if r := recover(); r != nil {
+			if pointer := reflect.ValueOf(v); pointer.Kind() == reflect.Pointer && pointer.IsNil() {
+				rendered = slog.StringValue("<nil>")
+				return
+			}
+			rendered = slog.StringValue(fmt.Sprintf("!PANIC: %v", r))
+		}
+	}()
+	var buf bytes.Buffer
+	encoder := json.NewEncoder(&buf)
 	encoder.SetEscapeHTML(false)
 	if err := encoder.Encode(v); err != nil {
-		return value
+		return slog.StringValue(fmt.Sprintf("!ERROR:%v", err))
 	}
-	return slog.AnyValue(json.RawMessage(bytes.TrimSuffix(rendered.Bytes(), []byte("\n"))))
+	return slog.AnyValue(json.RawMessage(bytes.TrimSuffix(buf.Bytes(), []byte("\n"))))
 }
 
 func ContextWithLogger(ctx context.Context, logger *slog.Logger) context.Context {
