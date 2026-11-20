@@ -331,8 +331,9 @@ func (l *lazyConcierge) followEnabled(on bool) {
 }
 
 // halt stops the running Concierge, for a turn-off or, with shutdown, for
-// good. A turn-off also cancels the questions still working (VoiceOff); a
-// shutdown keeps them for the next start.
+// good. A turn-off first cancels the questions still working and tells their
+// holders (VoiceOff), while the Envoy session is open; a shutdown keeps them
+// for the next start.
 func (l *lazyConcierge) halt(shutdown bool) {
 	l.mu.Lock()
 	if l.closed {
@@ -352,10 +353,10 @@ func (l *lazyConcierge) halt(shutdown bool) {
 		l.onStart(nil)
 	}
 	close(fwd)
-	stop()
 	if !shutdown {
 		c.VoiceOff()
 	}
+	stop()
 }
 
 func (l *lazyConcierge) forward(in <-chan voice.PendingAnswer, done <-chan struct{}) {
