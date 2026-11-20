@@ -9,87 +9,48 @@ import (
 	"strings"
 	"sync/atomic"
 
-	"google.golang.org/api/option"
-
 	"github.com/sjawhar/ghost-wispr/internal/config"
 	"github.com/sjawhar/ghost-wispr/internal/envoy"
-	"github.com/sjawhar/ghost-wispr/internal/googleauth"
-	"github.com/sjawhar/ghost-wispr/internal/secrets"
 	"github.com/sjawhar/ghost-wispr/internal/session"
 	"github.com/sjawhar/ghost-wispr/internal/storage"
 )
 
 // envoyWarningKey keys the /api/status warning that Envoy events are not sent
-// because the signing key cannot be read.
+// because envoy_hub_url names no listener.
 const envoyWarningKey = "envoy"
 
 // envoyPublishing owns the Envoy publisher the settings choose. Each settings
-// change builds a new one, or none, and hands it to the session manager. Its
-// signing key is read from Secret Manager in the background, so neither the
-// settings change nor recording waits on Secret Manager; a key that cannot be
-// read stops the events and shows in /api/status, nothing else, and each sweep
-// reads it again until it reads.
+// change builds a new one, or none, and hands it to the session manager. A
+// publish reaches the hub's listener over the tailnet with no credential, so
+// nothing is read before the first event; an event the hub does not take
+// stays pending, and each sweep sends it again.
 type envoyPublishing struct {
 	store    *storage.SQLiteStore
 	manager  *session.Manager
 	warnings *warningsRegistry
-	// openSecrets opens Secret Manager with the unit's Google credential.
-	openSecrets func(context.Context, *config.Config) (*secrets.Reader, error)
 
 	current atomic.Pointer[envoy.Publisher]
 }
 
-// openSecretManager opens Secret Manager with the Google credential Drive and
-// Gemini use (google_credentials_file, else Application Default Credentials).
-func openSecretManager(ctx context.Context, cfg *config.Config) (*secrets.Reader, error) {
-	credentials, err := googleauth.Detect(ctx, cfg.GoogleCredentialsFile, googleauth.CloudPlatformScope)
-	if err != nil {
-		return nil, fmt.Errorf("load Google credentials: %w", err)
-	}
-	return secrets.NewReader(ctx, option.WithAuthCredentials(credentials))
-}
-
 // configure builds the publisher cfg asks for, or turns Envoy off. A config
-// with no webhook URL, or no signing key secret to read, sends nothing; the
-// startup warning names the missing setting.
+// with Envoy off or no envoy_hub_url sends nothing; the startup warning names
+// a missing URL.
 func (e *envoyPublishing) configure(ctx context.Context, cfg *config.Config, logger *slog.Logger) {
-	if !cfg.EnvoyEnabled || strings.TrimSpace(cfg.EnvoyWebhookURL) == "" || strings.TrimSpace(cfg.EnvoyWebhookSecretName) == "" {
+	if !cfg.EnvoyEnabled || strings.TrimSpace(cfg.EnvoyHubURL) == "" {
 		e.warnings.Clear(envoyWarningKey)
 		e.set(nil)
 		return
 	}
-	settings := *cfg
-	name := settings.EnvoyWebhookSecretName
-	readKey := func(ctx context.Context) (string, error) {
-		reader, err := e.openSecrets(ctx, &settings)
-		if err != nil {
-			return "", err
-		}
-		return reader.Read(ctx, name)
+	pub, err := envoy.NewPublisher(cfg.EnvoyHubURL, e.store, envoy.WithLogger(logger), envoy.WithPublicURL(cfg.PublicURL))
+	if err != nil {
+		e.warnings.Set(envoyWarningKey, fmt.Sprintf("Envoy events are not sent: %v", err))
+		e.set(nil)
+		return
 	}
-	var pub *envoy.Publisher
-	pub = envoy.NewPublisher(settings.EnvoyWebhookURL, readKey, e.store,
-		envoy.WithLogger(logger),
-		envoy.WithPublicURL(settings.PublicURL),
-		envoy.WithKeyStatus(func(err error) { e.reportKey(pub, name, err) }),
-	)
 	e.warnings.Clear(envoyWarningKey)
 	e.set(pub)
-	log.Printf("envoy webhook publishing enabled")
+	log.Printf("envoy hub publishing enabled")
 	go e.sweepWith(ctx, pub)
-}
-
-// reportKey shows in /api/status whether pub's signing key reads, while pub
-// is the publisher in use.
-func (e *envoyPublishing) reportKey(pub *envoy.Publisher, name string, err error) {
-	if e.current.Load() != pub {
-		return
-	}
-	if err == nil {
-		e.warnings.Clear(envoyWarningKey)
-		return
-	}
-	e.warnings.Set(envoyWarningKey, fmt.Sprintf("Envoy events are not sent: the webhook signing key %s could not be read (%v). Recording is not affected; the events go out once the key reads.", name, err))
 }
 
 func (e *envoyPublishing) set(pub *envoy.Publisher) {
@@ -102,10 +63,8 @@ func (e *envoyPublishing) set(pub *envoy.Publisher) {
 	e.manager.SetEventPublisher(pub)
 }
 
-// sweep reads the signing key again while its last read failed, so
-// /api/status shows within one sweep whether it reads, and then sends what
-// Envoy has not received: lifecycle events and completed summaries, from
-// before an outage or a key that could not be read.
+// sweep sends what Envoy has not received: lifecycle events and completed
+// summaries, from before an outage.
 func (e *envoyPublishing) sweep(ctx context.Context) {
 	if pub := e.current.Load(); pub != nil {
 		e.sweepWith(ctx, pub)
@@ -113,9 +72,6 @@ func (e *envoyPublishing) sweep(ctx context.Context) {
 }
 
 func (e *envoyPublishing) sweepWith(ctx context.Context, pub *envoy.Publisher) {
-	if err := pub.CheckSigningKey(ctx); err != nil {
-		log.Printf("warning: %v", err)
-	}
 	if err := pub.PublishPendingLifecycleEvents(ctx); err != nil {
 		log.Printf("envoy lifecycle sweep error: %v", err)
 	}

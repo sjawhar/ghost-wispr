@@ -32,29 +32,14 @@ valid_drive_id() {
   [[ $1 =~ ^[A-Za-z0-9_-]+$ ]]
 }
 
-valid_relay_url() {
-  [[ $1 =~ ^https://[^[:space:]]+/webhook/ghostwispr$ ]]
-}
-
-# render_base_config writes the template with the Envoy webhook URL: Drive sync and GC stay off.
-# Its URL argument is not named relay_url: the full provisioner's relay_url is readonly, and bash
-# refuses a local of that name, so the function would render the global and ignore its argument.
-render_base_config() {
-  local template=$1 webhook_url=$2 escaped_webhook_url
-  valid_relay_url "$webhook_url" || return 1
-  escaped_webhook_url=${webhook_url//\\/\\\\}
-  escaped_webhook_url=${escaped_webhook_url//&/\\&}
-  escaped_webhook_url=${escaped_webhook_url//|/\\|}
-  sed "s|__ENVOY_WEBHOOK_URL__|$escaped_webhook_url|" "$template"
-}
-
-# render_models_config also syncs to the shared drive and turns GC on. GC
-# removes audio only after Drive confirms a durable copy.
+# render_models_config writes the template with the shared drive: it also syncs to the drive and
+# turns GC on. GC removes only local audio that Drive holds a copy of. The full provisioner installs
+# the template as it is when the Pi has no shared drive yet: Drive sync and GC stay off.
 render_models_config() {
-  local template=$1 webhook_url=$2 drive_id=$3
+  local template=$1 drive_id=$2
   valid_drive_id "$drive_id" || return 1
-  render_base_config "$template" "$webhook_url" \
-    | awk '!/^(gdrive_folder_id|gdrive_sync_enabled|gc_enabled):/' || return 1
+  [[ -f $template ]] || return 1
+  awk '!/^(gdrive_folder_id|gdrive_sync_enabled|gc_enabled):/' "$template" || return 1
   printf 'gdrive_folder_id: "%s"\n' "$drive_id"
   printf '%s\n' 'gdrive_sync_enabled: true' 'gc_enabled: true'
 }
@@ -78,17 +63,8 @@ deployed_drive_id() {
   return 1
 }
 
-deployed_relay_url() {
-  local config=$1 line url pattern='^envoy_webhook_url: (.+)$'
-  line=$(grep '^envoy_webhook_url:' "$config") || return 1
-  [[ $line =~ $pattern ]] || return 1
-  url=${BASH_REMATCH[1]}
-  valid_relay_url "$url" || return 1
-  printf '%s' "$url"
-}
-
-# render_models_env keeps the deployed .env but the Envoy signing key an earlier provisioner wrote:
-# the recorder reads that key from Secret Manager now, so it is not left on disk.
+# render_models_env keeps the deployed .env but the Envoy webhook signing key an earlier
+# provisioner wrote, which nothing reads now, so it is not left on disk.
 render_models_env() {
   local env_file=$1
   awk '!/^GHOST_WISPR_(EMBEDDING_LOCATION|ENVOY_WEBHOOK_SECRET)=/' "$env_file" || return 1
@@ -109,20 +85,18 @@ provision_models() {
     fail "run as $SERVICE_USER"
   fi
 
-  local service_uid runtime_dir relay_url
+  local service_uid runtime_dir
   service_uid=$(id -u "$SERVICE_USER")
   runtime_dir="/run/user/$service_uid"
   [[ -d "$runtime_dir" ]] || fail "$runtime_dir is unavailable; log in as $SERVICE_USER before provisioning"
   [[ -f "$DEPLOY_DIR/ghost-wispr.yaml" && -f "$DEPLOY_DIR/.env" ]] \
     || fail "missing $DEPLOY_DIR/ghost-wispr.yaml or $DEPLOY_DIR/.env; run the full provisioner first"
-  relay_url=$(deployed_relay_url "$DEPLOY_DIR/ghost-wispr.yaml") \
-    || fail "$DEPLOY_DIR/ghost-wispr.yaml has no valid envoy_webhook_url; run the full provisioner first"
 
   # Global, not local: the EXIT trap runs after this function returns.
   staging_dir=$(mktemp -d -p "$runtime_dir" ghost-wispr-models.XXXXXX)
   chmod 0700 "$staging_dir"
   trap 'rm -rf -- "$staging_dir"' EXIT
-  render_models_config "$CONFIG_TEMPLATE" "$relay_url" "$drive_id" >"$staging_dir/ghost-wispr.yaml" \
+  render_models_config "$CONFIG_TEMPLATE" "$drive_id" >"$staging_dir/ghost-wispr.yaml" \
     || fail "could not render the models configuration from $CONFIG_TEMPLATE"
   render_models_env "$DEPLOY_DIR/.env" >"$staging_dir/env" || fail "could not read $DEPLOY_DIR/.env"
   printf 'ghost-wispr provision: --models replaces settings saved in the UI with the approved models configuration.\n'
@@ -168,20 +142,19 @@ archive="$staging_dir/credentials.tar"
 cat >"$archive"
 
 mapfile -t archive_entries < <(tar --list --file="$archive")
-# The Envoy webhook signing key is not in the bundle: the recorder reads it from Secret Manager
-# with its Google identity, so a bundle that carries one is refused.
+# The bundle holds no Envoy credential: the recorder publishes to the Envoy hub over the tailnet
+# with none, so a bundle that carries an Envoy file is refused.
 readonly required_entries=(
   device.crt
   google-credentials.json
   certificate_config.json
   tailscale-client-id
   tailscale-subject
-  envoy-webhook-url
   deepgram-key
 )
 for entry in "${archive_entries[@]}"; do
   case "$entry" in
-    device.crt|google-credentials.json|certificate_config.json|tailscale-client-id|tailscale-subject|envoy-webhook-url|deepgram-key) ;;
+    device.crt|google-credentials.json|certificate_config.json|tailscale-client-id|tailscale-subject|deepgram-key) ;;
     # The unit's own no-scope Dispatch token, for the meeting voice's Concierge; optional.
     dispatch-token) ;;
     *) fail "credential bundle contains unexpected path: $entry" ;;
@@ -193,8 +166,6 @@ for entry in "${required_entries[@]}"; do
   [[ -f "$staging_dir/$entry" && ! -L "$staging_dir/$entry" ]] || fail "credential bundle is missing regular file: $entry"
 done
 
-relay_url=$(require_single_line_file envoy-webhook-url)
-readonly relay_url
 tailscale_client_id=$(require_single_line_file tailscale-client-id)
 readonly tailscale_client_id
 tailscale_subject=$(require_single_line_file tailscale-subject)
@@ -207,7 +178,6 @@ if [[ -e "$staging_dir/dispatch-token" || -L "$staging_dir/dispatch-token" ]]; t
   dispatch_token=$(require_single_line_file dispatch-token)
 fi
 readonly dispatch_token
-valid_relay_url "$relay_url" || fail "envoy-webhook-url must be an HTTPS Ghost Wispr webhook URL"
 [[ -n "$tailscale_client_id" && "$tailscale_client_id" != null && "$tailscale_client_id" =~ ^[A-Za-z0-9._:-]+$ ]] || fail "tailscale-client-id is empty or invalid"
 [[ "$tailscale_subject" =~ ^[0-9]+$ ]] || fail "tailscale-subject must be the service account unique ID"
 
@@ -233,11 +203,10 @@ fi
 readonly deployed_drive
 # A rerun keeps the shared drive provision.sh --models configured, and with it sync and GC.
 if [[ -n "$deployed_drive" ]]; then
-  render_models_config "$CONFIG_TEMPLATE" "$relay_url" "$deployed_drive" >"$staging_dir/ghost-wispr.yaml" \
+  render_models_config "$CONFIG_TEMPLATE" "$deployed_drive" >"$staging_dir/ghost-wispr.yaml" \
     || fail "could not render $CONFIG_TEMPLATE"
 else
-  render_base_config "$CONFIG_TEMPLATE" "$relay_url" >"$staging_dir/ghost-wispr.yaml" \
-    || fail "could not render $CONFIG_TEMPLATE"
+  cp -- "$CONFIG_TEMPLATE" "$staging_dir/ghost-wispr.yaml" || fail "could not read $CONFIG_TEMPLATE"
 fi
 sudo install -o "$SERVICE_USER" -g "$SERVICE_USER" -m 0640 "$staging_dir/ghost-wispr.yaml" "$DEPLOY_DIR/ghost-wispr.yaml"
 {

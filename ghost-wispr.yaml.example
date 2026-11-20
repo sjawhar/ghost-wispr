@@ -63,12 +63,10 @@ summarization:
 # google_credentials_file: /opt/ghost-wispr/google-credentials.json
 # gdrive_sync_enabled: false
 
-# Envoy webhook (optional). Posts are signed with the key Ghost Wispr reads from Secret Manager,
-# the secret version below, with google_credentials_file; it reads the key again on a 401. The
-# secret version has no default: with Envoy enabled and none named, no event is sent.
+# Envoy events (optional): published to the Envoy hub's listener over the tailnet, with no
+# credential. With Envoy enabled and no hub URL, no event is sent.
 # envoy_enabled: false
-# envoy_webhook_url: https://relay.example.test/webhook/ghostwispr
-# envoy_webhook_secret_name: projects/example-project/secrets/example-signing-secret/versions/latest
+# envoy_hub_url: http://hub.example.ts.net:9020
 
 # The meeting voice (README "Meeting voice"), off unless enabled. "Wispr, ..." at the start of a
 # sentence asks the Concierge about the work in Dispatch, and voice A speaks the answer through the

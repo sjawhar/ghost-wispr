@@ -15,23 +15,21 @@ The `bootstrap` identity apply signs that request, so it cannot run before those
 
 After the certificate-signing request exists, do these before provisioning:
 
-1. Apply the approved `agent-infra` changes for the Google X.509 identity, the
-   `tag:ghost-wispr` Tailscale identity, and the Envoy webhook. Each value the bundle needs is
-   then on `agent-infra` `main`:
+1. Apply the approved `agent-infra` changes for the Google X.509 identity and the
+   `tag:ghost-wispr` Tailscale identity. Each value the bundle needs is then on `agent-infra`
+   `main`:
    - the device certificate: the `bootstrap` apply publishes it as the latest version of Secret
      Manager secret `ghost-wispr-device-certificate` (`bootstrap/README.md`);
    - the Ghost Wispr Tailscale client ID: `root` creates the Tailscale identity `ghost-wispr-x509`
      and prints its client ID as `ghostWisprTailnetClientId` in the log of the `seed` workflow's
      `root` job that creates it. `tailscaleIds` has no entry for it;
    - the service account's unique ID: `ghostWisprAccountUniqueId` in `root`'s prod
-     configuration (`root/Pulumi.prod.yaml`);
-   - the relay URL: the URL of `envoy-cluster`'s webhook relay, the Cloud Run service
-     `envoy-webhook-relay-*` in `theorem-agent-infra`.
-2. Ensure Secret Manager has `envoy-ghostwispr-signing-secret` and that `ghost-wispr@` has
-   Secret Accessor on it (dispatch://INFRA-3599). Ghost Wispr reads the key itself at runtime,
-   with the same Google identity it uses for Drive and Gemini, so no person or bundle carries
-   it to the Pi. Box identities cannot read it: a process that holds the secret can sign events
-   that Envoy accepts as the recorder's.
+     configuration (`root/Pulumi.prod.yaml`).
+2. Apply the tailnet policy that gives `tag:ghost-wispr` the Envoy hub's 4222 and 9020
+   (theorem-labs/agent-infra#4761, `seed`'s `root` job). Ghost Wispr publishes its events to the
+   hub's listener, `envoy_hub_url` in `deploy/pi/files/ghost-wispr.yaml`, over the tailnet with
+   no credential; until the policy applies, the events wait on the Pi and go out with the first
+   sweep after it.
 3. Wait for the Ghost Wispr release workflow to publish `ghost-wispr-linux-arm64` and
    `ghost-wispr-linux-arm64.sha256`.
 
@@ -149,7 +147,7 @@ configuration for a normal certificate renewal.
 
 ## Prepare the bundle's public files
 
-The credential bundle holds six public files and one secret:
+The credential bundle holds five public files and one secret:
 
 | File | Source |
 | --- | --- |
@@ -157,24 +155,17 @@ The credential bundle holds six public files and one secret:
 | `google-credentials.json` and `certificate_config.json` | the rewritten files in `$d` from the `gcloud ... create-cred-config` command above |
 | `tailscale-client-id` | `ghostWisprTailnetClientId`, which `agent-infra`'s `seed` workflow printed in the log of the `root` job that created the Tailscale identity `ghost-wispr-x509` |
 | `tailscale-subject` | `ghostWisprAccountUniqueId` in `root/Pulumi.prod.yaml` on `agent-infra` `main` |
-| `envoy-webhook-url` | the URL of the Cloud Run service `envoy-webhook-relay-*` in `theorem-agent-infra` (`envoy-cluster`'s relay), followed by `/webhook/ghostwispr` |
 | `deepgram-key` | `DEEPGRAM_API_KEY` from the operator's `secrets` store |
 
-The Envoy webhook signing key is not in the bundle, and `provision.sh` refuses a bundle that
-holds an `envoy-webhook-secret` file. Ghost Wispr reads the key from Secret Manager
-(`envoy_webhook_secret_name`, which `deploy/pi/files/ghost-wispr.yaml` sets to
-`projects/theorem-agent-infra/secrets/envoy-ghostwispr-signing-secret/versions/latest`; Ghost
-Wispr has no default for it) and keeps
-it in memory. When Envoy answers 401 it reads the key again once, so a rotation needs no change on
-the Pi. When it cannot read the key it sends no events and `/api/status` says so; recording goes on.
-It reads the key again every five minutes, so the warning clears within five minutes of the key
-becoming readable, and the held events go out then.
+The bundle holds no Envoy file: Ghost Wispr publishes to the Envoy hub over the tailnet with no
+credential, and `provision.sh` refuses a bundle that holds an `envoy-webhook-url` or
+`envoy-webhook-secret` from the webhook it used before.
 
-Make the six public files on the development machine where you ran `create-cred-config`, from a
+Make the five public files on the development machine where you ran `create-cred-config`, from a
 Ghost Wispr checkout. Its `gcloud` must be the devbox identity, its `gh` must read
 `theorem-labs/agent-infra`'s Actions logs, and it needs `agent-infra` checked out at
 `~/src/agent-infra`. The block reads no Pulumi state: the devbox identity cannot list the `root`
-and `envoy-cluster` state buckets (403). Each value comes from a source that identity reads, at
+state bucket (403). Each value comes from a source that identity reads, at
 the time you run the block:
 
 - `tailscale-subject` from `root/Pulumi.prod.yaml` on `agent-infra`'s `origin/main`.
@@ -191,8 +182,6 @@ the time you run the block:
   identity, it says so; then read the ID from `/opt/ghost-wispr/tailscale-client-id` on a Pi
   provisioned before, or ask someone who can read `root`'s Pulumi state for
   `pulumi stack output ghostWisprTailnetClientId --stack prod`.
-- `envoy-webhook-url` from the Cloud Run service list: `envoy-cluster` gives the relay's service
-  name a suffix, so the block matches its prefix `envoy-webhook-relay-`.
 
 <!-- provision_bundle_test.sh: prepare -->
 ```bash
@@ -205,17 +194,14 @@ git -C "$PI_INFRA_CHECKOUT" fetch --quiet origin main
 git -C "$PI_INFRA_CHECKOUT" show "origin/main:$PI_SUBJECT_FILE" \
   | sed -n "s/^  $PI_SUBJECT_KEY: \"\{0,1\}\([0-9][0-9]*\)\"\{0,1\}\$/\1/p" >"$prepared/tailscale-subject"
 deploy/pi/tailnet-client-id.sh >"$prepared/tailscale-client-id"
-relay=$(gcloud run services list --project="$PI_GCP_PROJECT" --filter="metadata.name ~ ^$PI_RELAY_SERVICE_PREFIX" --format='value(status.url)')
-printf '%s/webhook/ghostwispr\n' "$relay" >"$prepared/envoy-webhook-url"
-head "$prepared/tailscale-subject" "$prepared/tailscale-client-id" "$prepared/envoy-webhook-url"
+head "$prepared/tailscale-subject" "$prepared/tailscale-client-id"
 rm -rf -- "$d"
 ```
 
-`openssl` must print `subject=CN=ghost-wispr`, and `head` one line for each of the three files:
-the subject is digits, the client ID one token, and the URL an `https://...run.app` address
-ending in `/webhook/ghostwispr`. `provision-pi.sh` refuses an empty file, and `provision.sh` a
-file of another form. None of these files is a secret: if another machine provisions the Pi, copy
-`$prepared` there.
+`openssl` must print `subject=CN=ghost-wispr`, and `head` one line for each of the two files:
+the subject is digits and the client ID one token. `provision-pi.sh` refuses an empty file, and
+`provision.sh` a file of another form. None of these files is a secret: if another machine
+provisions the Pi, copy `$prepared` there.
 
 ## Provision
 
@@ -317,8 +303,8 @@ it, because it is a listener outside loopback and Tailscale.
 Run the models step after the shared drive exists and its members are added. It takes the
 shared-drive ID and rejects an absent or malformed one. It replaces settings saved in the UI
 with `deploy/pi/files/ghost-wispr.yaml` rendered with that ID,
-`gdrive_sync_enabled: true` and `gc_enabled: true`, keeps the deployed
-`envoy_webhook_url`, installs the result over `/opt/ghost-wispr/ghost-wispr.yaml`, and
+`gdrive_sync_enabled: true` and `gc_enabled: true`, installs the result over
+`/opt/ghost-wispr/ghost-wispr.yaml`, and
 restarts Ghost Wispr. The credential files from the full provisioner stay as they are. A later
 full-provisioner run keeps the drive ID and both enablements.
 
@@ -585,8 +571,8 @@ ssh ghost-wispr@ghost-wispr 'XDG_RUNTIME_DIR=/run/user/$(id -u) systemctl --user
 ## Roll out a release that adds a config key
 
 Follow this order for every release whose code reads a new key from
-`/opt/ghost-wispr/ghost-wispr.yaml`, such as `recording_rules` or `mic_device`, or needs a key that
-used to have a default, such as `envoy_webhook_secret_name`. The nightly update replaces only
+`/opt/ghost-wispr/ghost-wispr.yaml`, such as `recording_rules`, `mic_device` or `envoy_hub_url`,
+or needs a key that used to have a default. The nightly update replaces only
 the binary: `update.sh` never writes the config, so a new binary that the timer installs starts
 on a config without the new key. The other order fails too: while the old binary runs on a config
 that has the key, a settings save drops the key, because the old binary writes back only the keys
@@ -599,7 +585,7 @@ outside meetings. Save no settings in the web UI from step 1 until step 4 passes
 A setting the Pi holds in `/opt/ghost-wispr/.env` overrides its YAML, and the steps treat the two
 files differently. The office Pi can set the Jabra's Mute button there, with
 `GHOST_WISPR_JABRA_MUTE_BUTTON` ("Pause and resume at the unit"). The models step keeps every
-`.env` line but an old Envoy signing key and the embedding location, which it writes again, so
+`.env` line but an old Envoy webhook signing key and the embedding location, which it writes again, so
 that line stays as it is. The full provisioner rewrites `.env` without it, and the template's
 `jabra_mute_button: true` applies.
 
@@ -625,7 +611,7 @@ that line stays as it is. The full provisioner rewrites `.env` without it, and t
    session; leaving the current binary in place` and changes nothing: run it again once the
    session has ended.
 4. Check that the new binary reads the key. For `recording_rules`, the template's five rules must
-   come back; for `envoy_webhook_secret_name`, `/api/status` must hold no Envoy warning; for
+   come back; for `envoy_hub_url`, `/api/status` must hold no Envoy warning; for
    `mic_device`, the config must hold `mic_device: J75`, `/api/status` no `No microphone found`
    warning, and `capture_state` must be `capturing` or `paused`. The Jabra's Mute button must be on:
    each line the last `grep` prints ends in `true`.
@@ -782,28 +768,19 @@ with the unit paused and no session active:
 
 ## Accept slice 1
 
-Run the acceptance driver from a tailnet member. Give it the relay URL. To run the signed
-Envoy control, inject the signing secret only into the driver's process: `webhook-secret.sh`
-reads it under a one-hour secrets-broker grant that Sami approves, as the admin login
-`secret-run --register --ttl 1h GCLOUD_SAMI` mints through `gcloud-broker`. Set `broker_host`
-to run the read on a machine whose `secret-run` has a broker identity when this one has none
-(Sami's laptop: name the devbox), or `broker_key` to read a broker key that holds a copy.
+Run the acceptance driver from a tailnet member, after the tailnet policy of "Prerequisites and
+release order" applies.
 
 <!-- provision_bundle_test.sh: accept -->
 ```bash
 source "${GHOST_WISPR_PI_ENV:-deploy/pi/files/pi.env}" &&
-secret=$(deploy/pi/webhook-secret.sh ${broker_host:+--broker-host "$broker_host"} ${broker_key:+--broker-key "$broker_key"}) &&
-relay=$(gcloud run services list --project="$PI_GCP_PROJECT" --filter="metadata.name ~ ^$PI_RELAY_SERVICE_PREFIX" --format='value(status.url)') &&
-[[ $relay =~ ^https://[^[:space:]]+$ ]] &&
-GHOST_WISPR_RELAY_URL="$relay/webhook/ghostwispr" \
-GHOST_WISPR_ENVOY_WEBHOOK_SECRET="$secret" \
 deploy/pi/accept-slice1.sh
-unset secret
 ```
 
 The driver pauses and resumes the recorder, asks the operator to power-cycle it, checks the
-light state, verifies the tagged identity and loopback listeners, and tests the signed and
-unsigned webhook paths. Before the pause it requires the Ghost Wispr Deepgram socket to grow by
+light state, verifies the tagged identity and loopback listeners, and checks that the Pi reaches
+the Envoy hub its config names (`envoy_hub_url`, `GET /healthz` from the Pi) and that
+`/api/status` holds no Envoy warning. Before the pause it requires the Ghost Wispr Deepgram socket to grow by
 at least 32 kB/s over 60 s, between two readings that one command on the Pi takes 60 s apart: the
 stream runs less than 1 % above 32 kB/s in 8060-byte chunks, so a 5-second window can hold one
 chunk fewer and fail. When a socket to `api.deepgram.com` opens or closes between the two readings
@@ -817,8 +794,7 @@ and running-service inventories against `deploy/pi/baseline.txt`, allowing only
 `libportaudio2`, `ffmpeg`, `lame`, `jq`, their package dependencies, and Ghost Wispr's user
 services. An empty inventory is UNKNOWN, not a pass. While it runs, a member device must also
 subscribe with `nats sub 'notifications.ghostwispr.>' --server nats://envoy-hub.tail12ec1c.ts.net:4222`
-and confirm the signed probe plus a real
-`session.started` and `session.ended` notification.
+and confirm a real `session.started` and `session.ended` notification.
 
 A2 asks a person to open the unit's page and choose Recording rules. The page shows the rules
 under `recording_rules` in the Pi's config, `/opt/ghost-wispr/ghost-wispr.yaml`, which

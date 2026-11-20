@@ -457,14 +457,17 @@ func TestTTSFirstAudioEngineErrorExitsNonzero(t *testing.T) {
 // TestTTSFirstAudioAnEngineWithNoAudioExitsNonzeroAtOnce fails if a sentence
 // the engine answers with no audio leaves tts-first-audio exiting 0, or
 // waiting seconds before it says so: voice A's Say returns once the text's
-// first frame is queued, or once the text ended with none.
+// first frame is queued, or once the text ended with none. The engine can say
+// `stream returned no audio` before the timer sees its empty sink, or the
+// timer can say `the engine gave no audio`; both tell the caller the required
+// fact and neither prints a result line.
 func TestTTSFirstAudioAnEngineWithNoAudioExitsNonzeroAtOnce(t *testing.T) {
 	vertex := startFakeVertex(t, &fakeVertex{silent: true})
 	unit := firstAudioUnit(t, "")
 	start := time.Now()
 	run := runFirstAudio(t, unit, &voiceAOptions{vertexBaseURL: vertex.url}, "One fact.\n", "--engine", "gemini")
 	took := time.Since(start)
-	if run.code == 0 || !strings.Contains(run.stderr, "the engine gave no audio") || run.stdout != "" {
+	if run.code == 0 || !strings.Contains(run.stderr, "no audio") || run.stdout != "" {
 		t.Fatalf("exit %d, stdout %q, stderr %q; want nonzero, nothing printed, and no audio on stderr", run.code, run.stdout, run.stderr)
 	}
 	if took > 2*time.Second {

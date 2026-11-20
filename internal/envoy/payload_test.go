@@ -2,12 +2,8 @@ package envoy
 
 import (
 	"context"
-	"encoding/json"
-	"io"
-	"net/http"
-	"net/http/httptest"
+	"reflect"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
@@ -18,34 +14,6 @@ const (
 	privateTitle   = "Private title words"
 	privateSummary = "The summary repeats the private deleted words."
 )
-
-// rawWebhookServer records each event's body exactly as it was sent.
-func rawWebhookServer(t *testing.T) (*httptest.Server, func() map[string][]byte) {
-	t.Helper()
-	var mu sync.Mutex
-	bodies := make(map[string][]byte)
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		body, err := io.ReadAll(r.Body)
-		if err != nil {
-			http.Error(w, "invalid body", http.StatusBadRequest)
-			return
-		}
-		mu.Lock()
-		bodies[normalizeListenerEventType(r.Header.Get("X-GhostWispr-Event"))] = body
-		mu.Unlock()
-		w.WriteHeader(http.StatusOK)
-	}))
-	t.Cleanup(server.Close)
-	return server, func() map[string][]byte {
-		mu.Lock()
-		defer mu.Unlock()
-		copied := make(map[string][]byte, len(bodies))
-		for event, body := range bodies {
-			copied[event] = body
-		}
-		return copied
-	}
-}
 
 func privateSession() *storeStub {
 	endedAt := time.Date(2026, 11, 10, 12, 30, 45, 0, time.UTC)
@@ -70,12 +38,10 @@ func privateSession() *storeStub {
 // summary to Envoy. Envoy keeps every event for 72 hours and no deletion can
 // recall it, so a summary sent there would outlive a segment deletion that
 // removed the words it repeats. It also fails unless the links and times an
-// agent reads instead are in the body's payload object, beside session_id,
-// where Envoy's listener reads them (cybermonklabs/legion#4111).
+// agent reads instead reach the envelope's payload.
 func TestEventsCarryNoSessionText(t *testing.T) {
-	server, bodies := rawWebhookServer(t)
-	publisher := NewPublisher(server.URL, staticKey("shared-secret"), privateSession(), WithPublicURL("https://ghost-wispr.example.ts.net"))
-	publisher.client.retryDelays = nil
+	listener := newHubListener(t)
+	publisher := testPublisher(t, listener, privateSession(), WithPublicURL("https://ghost-wispr.example.ts.net"))
 
 	ctx := context.Background()
 	if err := publisher.PublishSessionStarted(ctx, "session-1"); err != nil {
@@ -88,24 +54,24 @@ func TestEventsCarryNoSessionText(t *testing.T) {
 		t.Fatalf("PublishSummaryReady: %v", err)
 	}
 
-	sent := bodies()
-	for _, event := range []string{"session_started", "session_ended", "summary_ready"} {
-		body, ok := sent[event]
-		if !ok {
-			t.Fatalf("no %s event was sent; sent %d events", event, len(sent))
-		}
-		for _, text := range []string{privateTitle, privateSummary, "private"} {
-			if strings.Contains(string(body), text) {
-				t.Errorf("%s body carries session text %q: %s", event, text, body)
+	sent := listener.requests()
+	if len(sent) != 3 {
+		t.Fatalf("publishes = %d, want 3", len(sent))
+	}
+	for _, body := range sent {
+		topic, _ := body["topic"].(string)
+		for field, value := range body {
+			text, _ := value.(string)
+			for _, private := range []string{privateTitle, privateSummary, "private"} {
+				if strings.Contains(text, private) {
+					t.Errorf("%s %s carries session text %q: %s", topic, field, private, text)
+				}
 			}
 		}
-		var decoded webhookBody
-		if err := json.Unmarshal(body, &decoded); err != nil {
-			t.Fatalf("%s body is not JSON: %v", event, err)
-		}
+		payload := payloadOf(t, body)
 		for _, key := range []string{"title", "summary"} {
-			if _, ok := decoded.Payload[key]; ok {
-				t.Errorf("%s payload has a %q field: %s", event, key, body)
+			if _, ok := payload[key]; ok {
+				t.Errorf("%s payload has a %q field: %#v", topic, key, payload)
 			}
 		}
 		for key, want := range map[string]string{
@@ -115,8 +81,8 @@ func TestEventsCarryNoSessionText(t *testing.T) {
 			"drive_folder_url": "https://drive.google.com/drive/folders/folder-1",
 			"session_url":      "https://ghost-wispr.example.ts.net/api/sessions/session-1",
 		} {
-			if got := decoded.Payload[key]; got != want {
-				t.Errorf("%s payload %s = %#v, want %q: %s", event, key, got, want, body)
+			if got := payload[key]; got != want {
+				t.Errorf("%s payload %s = %q, want %q", topic, key, got, want)
 			}
 		}
 	}
@@ -124,40 +90,34 @@ func TestEventsCarryNoSessionText(t *testing.T) {
 
 // TestEventsLinkTheSessionAndItsTimes fails if an event stops saying which
 // session it is, when it ran, or where an agent reads its current text, or
-// if the Envoy listener stand-in (newListenerTestServer, which copies its
-// checks) would refuse it.
+// says anything else.
 func TestEventsLinkTheSessionAndItsTimes(t *testing.T) {
-	server, requests := newListenerTestServer(t, "shared-secret")
-	defer server.Close()
-	publisher := NewPublisher(server.URL, staticKey("shared-secret"), privateSession(), WithPublicURL("https://ghost-wispr.example.ts.net/"))
-	publisher.client.retryDelays = nil
+	listener := newHubListener(t)
+	publisher := testPublisher(t, listener, privateSession(), WithPublicURL("https://ghost-wispr.example.ts.net/"))
+	publisher.client.now = func() time.Time { return time.Date(2026, 11, 10, 12, 31, 0, 0, time.UTC) }
 	if err := publisher.PublishSummaryReady(context.Background(), "session-1"); err != nil {
 		t.Fatalf("PublishSummaryReady: %v", err)
 	}
-	got := requests()
+	got := listener.requests()
 	if len(got) != 1 {
-		t.Fatalf("summary_ready requests = %d, want 1", len(got))
+		t.Fatalf("summary_ready publishes = %d, want 1", len(got))
 	}
-	want := map[string]any{
+	want := map[string]string{
+		"event_type":       "summary_ready",
+		"payload_type":     "summary_ready",
 		"session_id":       "session-1",
-		"type":             "summary_ready",
 		"started_at":       "2026-11-10T11:45:45Z",
 		"ended_at":         "2026-11-10T12:30:45Z",
-		"duration":         float64(2700),
+		"duration":         "2700",
+		"created_at":       "2026-11-10T12:31:00Z",
 		"drive_folder_url": "https://drive.google.com/drive/folders/folder-1",
 		"session_url":      "https://ghost-wispr.example.ts.net/api/sessions/session-1",
 		"summary_preset":   "default",
 		"summary_model":    "provider-summary-model",
-		"version":          float64(3),
+		"version":          "3",
 	}
-	payload := got[0].body.Payload
-	for key, value := range want {
-		if payload[key] != value {
-			t.Errorf("payload %s = %#v, want %#v", key, payload[key], value)
-		}
-	}
-	if len(payload) != len(want) {
-		t.Errorf("payload has %d fields, want exactly %d: %#v", len(payload), len(want), payload)
+	if payload := payloadOf(t, got[0]); !reflect.DeepEqual(payload, want) {
+		t.Errorf("payload = %#v, want %#v", payload, want)
 	}
 
 	// A session not yet in Drive, on a unit with no public_url, still says
@@ -166,23 +126,22 @@ func TestEventsLinkTheSessionAndItsTimes(t *testing.T) {
 	session := store.sessions["session-1"]
 	session.GDriveFolderID = ""
 	store.sessions["session-1"] = session
-	server2, requests2 := newListenerTestServer(t, "shared-secret")
-	defer server2.Close()
-	publisher = NewPublisher(server2.URL, staticKey("shared-secret"), store)
-	publisher.client.retryDelays = nil
+	listener2 := newHubListener(t)
+	publisher = testPublisher(t, listener2, store)
 	if err := publisher.PublishSessionStarted(context.Background(), "session-1"); err != nil {
 		t.Fatalf("PublishSessionStarted: %v", err)
 	}
-	started := requests2()
+	started := listener2.requests()
 	if len(started) != 1 {
-		t.Fatalf("session_started requests = %d, want 1", len(started))
+		t.Fatalf("session_started publishes = %d, want 1", len(started))
 	}
+	payload := payloadOf(t, started[0])
 	for _, key := range []string{"drive_folder_url", "session_url"} {
-		if _, ok := started[0].body.Payload[key]; ok {
-			t.Errorf("session_started payload has %s with no folder or public_url: %#v", key, started[0].body.Payload)
+		if _, ok := payload[key]; ok {
+			t.Errorf("session_started payload has %s with no folder or public_url: %#v", key, payload)
 		}
 	}
-	if started[0].body.Payload["started_at"] != "2026-11-10T11:45:45Z" {
-		t.Errorf("session_started started_at = %#v", started[0].body.Payload["started_at"])
+	if payload["started_at"] != "2026-11-10T11:45:45Z" {
+		t.Errorf("session_started started_at = %q", payload["started_at"])
 	}
 }

@@ -5,21 +5,17 @@ set -euo pipefail
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 readonly script_dir
 readonly baseline_file="$script_dir/baseline.txt"
-# The office Pi's deployment settings (PI_HOST, PI_DENIED_TAG); GHOST_WISPR_PI_ENV names another
-# file, as the tests do.
+# The office Pi's deployment settings (PI_HOST, PI_DENIED_TAG, PI_NATS_SERVER); GHOST_WISPR_PI_ENV
+# names another file, as the tests do.
 pi_env=${GHOST_WISPR_PI_ENV:-$script_dir/files/pi.env}
 # shellcheck source=files/pi.env
 source "$pi_env" || { printf 'cannot read the Pi deployment settings in %s\n' "$pi_env" >&2; exit 1; }
 host=${GHOST_WISPR_HOST:-$PI_HOST}
-relay_url=${GHOST_WISPR_RELAY_URL:-}
 self_test=false
 
 usage() {
   cat <<'EOF'
-Usage: deploy/pi/accept-slice1.sh [--host HOST] [--relay-url URL] [--self-test]
-
-GHOST_WISPR_ENVOY_WEBHOOK_SECRET is optional. When present, the driver sends
-an authenticated Envoy probe before it checks that an unsigned Pi request is refused.
+Usage: deploy/pi/accept-slice1.sh [--host HOST] [--self-test]
 EOF
 }
 
@@ -38,11 +34,6 @@ while [[ $# -gt 0 ]]; do
     --host)
       [[ $# -ge 2 ]] || fail "--host needs a value"
       host=$2
-      shift 2
-      ;;
-    --relay-url)
-      [[ $# -ge 2 ]] || fail "--relay-url needs a value"
-      relay_url=$2
       shift 2
       ;;
     --self-test)
@@ -225,30 +216,13 @@ assert_listener_boundary() {
   assert_listener_boundary_from "$tailscale_ips" "$listeners"
 }
 
-hmac_signature() {
-  local body=$1 helper="$scratch_dir/ghost-wispr-hmac.go"
-  cat >"$helper" <<'EOF'
-package main
-
-import (
-	"crypto/hmac"
-	"crypto/sha256"
-	"fmt"
-	"io"
-	"os"
-)
-
-func main() {
-	secret, err := io.ReadAll(os.Stdin)
-	if err != nil {
-		panic(err)
-	}
-	mac := hmac.New(sha256.New, secret)
-	_, _ = mac.Write([]byte(os.Args[1]))
-	fmt.Printf("%x", mac.Sum(nil))
-}
-EOF
-  printf '%s' "$GHOST_WISPR_ENVOY_WEBHOOK_SECRET" | go run "$helper" "$body"
+# envoy_hub_url_from prints the envoy_hub_url a Ghost Wispr config holds, and fails when it holds
+# none that names an http(s) host.
+envoy_hub_url_from() {
+  local url
+  url=$(sed -n 's/^envoy_hub_url: *//p' | tail -n 1)
+  [[ $url =~ ^https?://[A-Za-z0-9.-]+(:[0-9]+)?/?$ ]] || return 1
+  printf '%s' "${url%/}"
 }
 
 assert_set_subset() {
@@ -492,6 +466,17 @@ run_control_tests() {
     fail "self-test expected a public TCP listener to be rejected"
   fi
   printf 'self-test: TCP listener fixture accepted tailnet IPv6 and rejected 0.0.0.0:22\n'
+
+  hub_url=$(envoy_hub_url_from <"$script_dir/files/ghost-wispr.yaml") \
+    || fail "self-test expected the Envoy check to read envoy_hub_url from deploy/pi/files/ghost-wispr.yaml"
+  [[ $hub_url =~ ^http://[A-Za-z0-9.-]+:9020$ ]] || fail "self-test read $hub_url as the template's envoy_hub_url"
+  for config in 'envoy_enabled: true' $'envoy_webhook_url: https://relay.example.test/webhook/ghostwispr' \
+    "envoy_hub_url: http://hub.example.test:9020';reboot;'"; do
+    if envoy_hub_url_from <<<"$config" >/dev/null; then
+      fail "self-test expected the Envoy check to refuse a config holding only: $config"
+    fi
+  done
+  printf 'self-test: Envoy check read the template'\''s hub and refused configs with none\n'
 }
 
 if [[ "$self_test" == true ]]; then
@@ -591,33 +576,16 @@ status >/dev/null
 check_sshd_loopback
 printf 'A5 RAN: local listener boundary passed. A5 NEEDS-PERSON: test a phone off-tailnet and a %s device (docs/pi-setup.md, "Accept slice 1"); both must fail.\n' "$PI_DENIED_TAG"
 
-if [[ -n "$relay_url" ]]; then
-  printf 'Envoy RAN: check a signed probe and an unsigned Pi request.\n'
-  [[ "$relay_url" =~ ^https://[A-Za-z0-9.-]+/webhook/ghostwispr$ ]] || fail "Envoy FAILED: invalid relay URL"
-  if [[ -n ${GHOST_WISPR_ENVOY_WEBHOOK_SECRET:-} ]]; then
-    command -v go >/dev/null || fail "Envoy FAILED: Go is required to sign the probe without exposing its secret"
-    now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-    delivery="acceptance-probe.session_ended.$(date +%s)"
-    body="{\"event_type\":\"session_ended\",\"created_at\":\"$now\",\"payload\":{\"session_id\":\"acceptance-probe\",\"type\":\"session_ended\",\"title\":\"Acceptance probe\",\"summary\":\"\",\"duration\":0}}"
-    signature=$(hmac_signature "$body")
-    signed_code=$(curl --silent --show-error --output /dev/null --write-out '%{http_code}' \
-      --request POST "$relay_url" \
-      --header 'Content-Type: application/json' \
-      --header 'X-GhostWispr-Event: session.ended' \
-      --header "X-GhostWispr-Delivery: $delivery" \
-      --header "X-GhostWispr-Signature: sha256=$signature" \
-      --data "$body")
-    [[ "$signed_code" =~ ^2 ]] || fail "Envoy FAILED: signed probe returned HTTP $signed_code"
-    printf 'Envoy RAN: signed probe accepted; verify its notification with nats sub '\''notifications.ghostwispr.>'\''.\n'
-  else
-    printf 'Envoy NEEDS-PERSON: inject GHOST_WISPR_ENVOY_WEBHOOK_SECRET from deploy/pi/webhook-secret.sh to run the signed probe (docs/pi-setup.md, "Accept slice 1").\n'
-  fi
-  unsigned_code=$(remote_run "curl --silent --output /dev/null --write-out '%{http_code}' --request POST '$relay_url' --header 'X-GhostWispr-Delivery: unsigned-probe' --header 'X-GhostWispr-Event: session.ended' --data '{}'")
-  [[ "$unsigned_code" == 401 ]] || fail "Envoy FAILED: unsigned Pi request returned HTTP $unsigned_code, expected 401"
-  printf 'Envoy RAN: unsigned Pi request was refused.\n'
-else
-  printf 'Envoy NEEDS-PERSON: rerun with --relay-url, the relay URL docs/pi-setup.md, "Accept slice 1", reads.\n'
-fi
+printf 'Envoy RAN: the Pi reaches the Envoy hub it publishes its events to.\n'
+hub_url=$(remote_run 'cat /opt/ghost-wispr/ghost-wispr.yaml' | envoy_hub_url_from) \
+  || fail "Envoy FAILED: /opt/ghost-wispr/ghost-wispr.yaml names no envoy_hub_url"
+hub_code=$(remote_run "curl --silent --output /dev/null --write-out '%{http_code}' --max-time 10 '$hub_url/healthz'") || true
+[[ $hub_code =~ ^2 ]] \
+  || fail "Envoy FAILED: the Pi got HTTP ${hub_code:-none} from $hub_url/healthz; the tailnet policy must give tag:ghost-wispr the hub's 9020"
+envoy_warnings=$(status | jq -r '.warnings[] | select(test("Envoy"))')
+[[ -z $envoy_warnings ]] || fail "Envoy FAILED: /api/status warns: $envoy_warnings"
+printf 'Envoy RAN: the Pi reached %s/healthz (HTTP %s), and /api/status has no Envoy warning. Envoy NEEDS-PERSON: run nats sub '\''notifications.ghostwispr.>'\'' --server %s from a tailnet member; the next session'\''s session_started must arrive.\n' \
+  "$hub_url" "$hub_code" "$PI_NATS_SERVER"
 
 printf 'A2 NEEDS-PERSON: open %s and choose Recording rules; each rule under recording_rules in the Pi'\''s config, /opt/ghost-wispr/ghost-wispr.yaml (rendered from deploy/pi/files/ghost-wispr.yaml), must appear verbatim and in order.\n' "$unit_url"
 printf 'A7 RAN: compare the Pi inventory with deploy/pi/baseline.txt.\n'

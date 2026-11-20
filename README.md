@@ -340,27 +340,26 @@ as `curl` or an agent, is not affected.
 
 ### Envoy events
 
-With `envoy_enabled`, Ghost Wispr posts `session_started`, `session_ended` and `summary_ready` to
-`envoy_webhook_url`; Envoy publishes them under
-`notifications.ghostwispr.<session>.{session.started,session.ended,summary.ready}`. No event
-carries a session's title, summary or transcript, because Envoy keeps every event for 72 hours
-and a segment deletion cannot recall it. Each payload has `session_id`, `type`, `started_at`,
-`ended_at` (once the session has ended), `duration` in seconds, `drive_folder_url` (once the
-session has a Drive folder) and `session_url` (`public_url` + `/api/sessions/{id}`, when
-`public_url` is set). `summary_ready` adds `summary_preset`, `summary_model` and `version`. To
-read the text, fetch `session_url`, which returns what is left after any deletion.
-`GET /api/openapi.json` describes the payload under `webhooks`.
+With `envoy_enabled`, Ghost Wispr publishes `session_started`, `session_ended` and `summary_ready`
+to the Envoy hub's listener at `envoy_hub_url` (`GHOST_WISPR_ENVOY_HUB_URL`), such as
+`http://hub.example.ts.net:9020`, through its `POST /v1/messages/publish`. The hub takes a publish
+from a tailnet device with no credential, so Ghost Wispr holds none. Envoy stores the events under
+`notifications.ghostwispr.<session>.{session.started,session.ended,summary.ready}`, with the
+summary and payload Envoy's Ghost Wispr normalizer writes. No event carries a session's title,
+summary or transcript, because Envoy keeps every event for 72 hours and a segment deletion cannot
+recall it. Each payload is a JSON object of strings: `event_type`, `session_id`, `started_at`,
+`ended_at` (once the session has ended), `duration` in seconds, `created_at`, `drive_folder_url`
+(once the session has a Drive folder) and `session_url` (`public_url` + `/api/sessions/{id}`, when
+`public_url` is set). `summary_ready` adds `summary_preset`, `summary_model`, `version` and
+`payload_type`. To read the text, fetch `session_url`, which returns what is left after any
+deletion. `GET /api/openapi.json` describes the publish under `webhooks`.
 
-Each event is signed with Envoy's webhook signing key, which Ghost Wispr reads from Google Secret
-Manager with its Google credential (`google_credentials_file`): the secret version
-`envoy_webhook_secret_name` (`GHOST_WISPR_ENVOY_WEBHOOK_SECRET_NAME`), such as
-`projects/example-project/secrets/example-signing-secret/versions/latest`. It has no default:
-with Envoy enabled and no secret named, Ghost Wispr sends no event and warns at startup. It keeps
-the key in memory and reads it again once when Envoy answers 401, so a rotated key needs no
-change on the unit. While the key cannot be read, no event is sent and `/api/status` warns. The
-five-minute sweep reads the key again, so the warning clears within five minutes of the key
-becoming readable, and the unsent events go out then. Recording does not depend on it.
-`GHOST_WISPR_ENVOY_WEBHOOK_SECRET` is no longer read, and a start that finds it warns.
+Every send of one event carries the same `idempotency_key`, the name-based UUID of
+`<session>.<event>` (and `.<version>` for `summary_ready`), so Envoy stores and delivers a resend
+once. An event the hub does not take stays pending, and the five-minute sweep sends it again;
+recording does not depend on it. With Envoy enabled and no `envoy_hub_url`, no event is sent and
+the start warns. The webhook settings `envoy_webhook_url` and `envoy_webhook_secret_name` are
+gone, and a start that finds one, or a leftover `GHOST_WISPR_ENVOY_WEBHOOK_SECRET`, warns.
 
 ## Development
 

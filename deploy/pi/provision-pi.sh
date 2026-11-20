@@ -5,18 +5,18 @@
 #
 #   --prepared DIR     the bundle's public files, made as docs/pi-setup.md says: device.crt,
 #                      google-credentials.json, certificate_config.json, tailscale-client-id,
-#                      tailscale-subject, envoy-webhook-url.
+#                      tailscale-subject.
 #
 # The Deepgram key comes from `secrets DEEPGRAM_API_KEY` on this machine. It reaches disk only in a
 # mode-0700 directory under $XDG_RUNTIME_DIR, while the tar stream for provision.sh is made. That
 # directory is removed as soon as provision.sh returns, whether it worked or not, and on any exit.
-# No secret is put in an argument. The Envoy webhook signing key is not in the bundle: the
-# recorder reads it from Secret Manager with its own Google identity.
+# No secret is put in an argument. The bundle holds no Envoy credential: the recorder publishes to
+# the Envoy hub over the tailnet with none.
 set -euo pipefail
 umask 077
 
 readonly PREPARED_FILES=(device.crt google-credentials.json certificate_config.json tailscale-client-id
-  tailscale-subject envoy-webhook-url)
+  tailscale-subject)
 readonly SECRET_FILES=(deepgram-key)
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 readonly script_dir

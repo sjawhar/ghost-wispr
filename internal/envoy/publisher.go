@@ -1,22 +1,40 @@
 package envoy
 
+// This file publishes Ghost Wispr's events (session_started, session_ended,
+// summary_ready) to Envoy through the hub's listener, POST /v1/messages/publish,
+// which takes a tailnet client's publish with no credential. NATS itself is no
+// way in: the hub's credential-free user may publish only reply inboxes and
+// agent stream frames (legion packages/envoy/infra/core/permissions.go,
+// SessionPermissions).
+//
+// Each publish carries the topic, source, summary and payload Envoy's Ghost
+// Wispr webhook normalizer makes from the same event (legion
+// packages/envoy/internal/contracts/normalize.go, GhostWisprEnvelope and
+// ghostWisprPayload). The listener mints the envelope's source_event_id itself
+// (contracts.MessageEnvelope), so a dedupe_key of the webhook's shape,
+// "ghostwispr.<delivery>", would name no event there: the stream would store
+// every resend, and no host would drop one. The event's idempotency key instead
+// is a UUID named by its delivery id, which the listener makes the dedupe key
+// "publish.<uuid>": a key the stream and every host count as naming its message
+// (contracts.MintedDedupeKeyPattern), so a resend of one event is stored and
+// delivered once.
+
 import (
-	"bytes"
 	"context"
-	"crypto/hmac"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 	"maps"
+	"math"
 	"net/http"
 	"net/url"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
+	"unicode/utf8"
+
+	"github.com/google/uuid"
 
 	"github.com/sjawhar/ghost-wispr/internal/logging"
 	"github.com/sjawhar/ghost-wispr/internal/storage"
@@ -30,7 +48,31 @@ const (
 	eventSummaryReady   EventType = "summary_ready"
 )
 
+const ghostWisprTopicPrefix = "notifications.ghostwispr."
+
+// publishPath is the hub listener's route for a publish to a topic.
+const publishPath = "/v1/messages/publish"
+
+// maxEnvelopeTextRunes caps each text the payload copies, as the webhook
+// normalizer caps it (legion contracts.maxEnvelopeTextRunes).
+const maxEnvelopeTextRunes = 2048
+
 var defaultRetryDelays = []time.Duration{5 * time.Second, 30 * time.Second, 120 * time.Second}
+
+// keyNamespace scopes the idempotency keys of Ghost Wispr's events: each key
+// is the name-based UUID of the event's delivery id in it.
+var keyNamespace = uuid.NewSHA1(uuid.NameSpaceURL, []byte("https://github.com/sjawhar/ghost-wispr#envoy-event"))
+
+var topicSegmentSanitizer = strings.NewReplacer(
+	".", "_",
+	" ", "_",
+	"\n", "_",
+	"\r", "_",
+	"\t", "_",
+	">", "_",
+	"*", "_",
+	"/", "_",
+)
 
 type Store interface {
 	GetSession(id string) (storage.Session, error)
@@ -40,7 +82,7 @@ type Store interface {
 	MarkEnvoyLifecycleEventDelivered(eventType, sessionID string) error
 }
 
-// Event is one Ghost Wispr event sent to Envoy's webhook.
+// Event is one Ghost Wispr event sent to Envoy.
 type Event struct {
 	Type           EventType
 	SessionID      string
@@ -48,35 +90,24 @@ type Event struct {
 	Payload        map[string]any
 }
 
-// KeyReader reads Envoy's webhook signing key: on the unit, from Secret
-// Manager with the unit's Google credential.
-type KeyReader func(ctx context.Context) (string, error)
-
-// keyReadTimeout bounds one read of the signing key, so an event waits for a
-// read that does not answer no longer than this.
-const keyReadTimeout = 30 * time.Second
-
 // Option configures a Client or a Publisher.
 type Option func(*options)
 
 type options struct {
-	logger    *slog.Logger
-	publicURL string
-	keyStatus func(error)
+	logger     *slog.Logger
+	publicURL  string
+	httpClient *http.Client
 }
 
-// WithKeyStatus calls report after every read of the signing key, with nil
-// when it read a key and the read's error when it did not; the unit shows the
-// error in /api/status. report runs with the client's key lock held, so the
-// last report always describes the read whose result the client keeps; it
-// must not call the client.
-func WithKeyStatus(report func(error)) Option {
+// WithHTTPClient sets the HTTP client the listener is called with; nil keeps
+// the default, with a 10 s timeout.
+func WithHTTPClient(client *http.Client) Option {
 	return func(o *options) {
-		o.keyStatus = report
+		o.httpClient = client
 	}
 }
 
-// WithLogger sets the logger used for webhook request failures and retries.
+// WithLogger sets the logger used for publish failures and retries.
 func WithLogger(logger *slog.Logger) Option {
 	return func(o *options) {
 		if logger != nil {
@@ -103,150 +134,87 @@ func collectOptions(opts []Option) options {
 	return collected
 }
 
-// Client sends Ghost Wispr events to Envoy's webhook, signed with a key it
-// reads once and keeps in memory.
+// Client publishes Ghost Wispr's events through the hub's listener.
 type Client struct {
-	url         string
-	readKey     KeyReader
-	keyStatus   func(error)
-	httpClient  *http.Client
+	listener    *Listener
 	logger      *slog.Logger
 	now         func() time.Time
 	sleep       func(context.Context, time.Duration) error
 	retryDelays []time.Duration
-
-	keyMu         sync.Mutex
-	key           []byte // the key the last working read returned; nil until a read works
-	keyReadFailed bool   // the last read failed; key still holds the one before it, if any
-}
-type webhookStatusError struct {
-	status int
 }
 
-func (err *webhookStatusError) Error() string {
-	return fmt.Sprintf("envoy webhook responded with status %d", err.status)
+// NewClient returns a client of the hub's listener at listenerURL, such as
+// http://hub.example:9020. It does not contact the listener until Send. A URL
+// that is not http or https, such as the hub's NATS address, is refused: the
+// listener's publish route is HTTP, and every send to it would fail.
+func NewClient(listenerURL string, opts ...Option) (*Client, error) {
+	return newClient(listenerURL, collectOptions(opts))
 }
 
-// NewClient creates a webhook client. It reads the signing key with readKey
-// at the first Send, not before.
-func NewClient(webhookURL string, readKey KeyReader, opts ...Option) *Client {
-	return newClient(webhookURL, readKey, collectOptions(opts))
-}
-
-func newClient(webhookURL string, readKey KeyReader, opts options) *Client {
+func newClient(listenerURL string, opts options) (*Client, error) {
+	parsed, err := url.Parse(strings.TrimSpace(listenerURL))
+	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" {
+		return nil, fmt.Errorf("envoy: the hub URL %q is not an http or https URL of the hub's listener", listenerURL)
+	}
+	listener, err := NewListener(listenerURL, opts.httpClient)
+	if err != nil {
+		return nil, err
+	}
 	return &Client{
-		url:       strings.TrimSpace(webhookURL),
-		readKey:   readKey,
-		keyStatus: opts.keyStatus,
-		httpClient: &http.Client{
-			Timeout: 10 * time.Second,
-			CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
-				return http.ErrUseLastResponse
-			},
-		},
+		listener:    listener,
 		logger:      opts.logger,
 		now:         func() time.Time { return time.Now().UTC() },
 		sleep:       sleepWithContext,
 		retryDelays: append([]time.Duration(nil), defaultRetryDelays...),
-	}
+	}, nil
 }
 
-// signingKey returns the key the client keeps, reading it first when it has
-// none. With stale set it reads the key again, unless another send already
-// replaced stale. The key is trimmed as Envoy trims
-// ENVOY_GHOSTWISPR_SIGNING_SECRET, so both sides sign with the same bytes.
-func (c *Client) signingKey(ctx context.Context, stale []byte) ([]byte, error) {
-	c.keyMu.Lock()
-	kept := c.key
-	c.keyMu.Unlock()
-	if kept != nil && (stale == nil || !bytes.Equal(kept, stale)) {
-		return kept, nil
-	}
-	readCtx, cancel := context.WithTimeout(ctx, keyReadTimeout)
-	raw, err := c.readKey(readCtx)
-	cancel()
-	key := []byte(strings.TrimSpace(raw))
-	if err == nil && len(key) == 0 {
-		err = errors.New("the signing key is empty")
-	}
-	// Reported under keyMu, so the last report always describes the read
-	// whose result keyReadFailed holds.
-	c.keyMu.Lock()
-	c.keyReadFailed = err != nil
-	if err == nil {
-		c.key = key
-	}
-	if c.keyStatus != nil {
-		c.keyStatus(err)
-	}
-	c.keyMu.Unlock()
-	if err != nil {
-		return nil, fmt.Errorf("read envoy webhook signing key: %w", err)
-	}
-	return key, nil
+// publishRequest is the body of the listener's POST /v1/messages/publish.
+type publishRequest struct {
+	Source         string `json:"source"`
+	Topic          string `json:"topic"`
+	Message        string `json:"message"`
+	Payload        string `json:"payload"`
+	IdempotencyKey string `json:"idempotency_key"`
 }
 
-// Send posts ev to Envoy's webhook (sendWithRetries). A 401 is what a
-// rotated key gives: then Send reads the key again, once, and when it changed
-// sends again with it, with a new retry budget. It sends nothing when it has
-// no key.
+// Send publishes ev, retrying a failure a retry can fix (no answer, 408, 429
+// or 5xx) after each of retryDelays with the same idempotency key. A refusal
+// (any other 4xx) returns at once.
 func (c *Client) Send(ctx context.Context, ev Event) error {
 	if c == nil {
-		return errors.New("envoy webhook client is nil")
+		return errors.New("envoy client is nil")
 	}
-	if strings.TrimSpace(c.url) == "" {
-		return errors.New("envoy webhook URL is required")
-	}
-
 	eventType, delivery, err := eventDelivery(ev)
 	if err != nil {
 		return err
 	}
-	body, err := webhookEventBody(eventType, ev.SessionID, ev.SummaryVersion, ev.Payload, c.now())
+	body, err := publishBody(eventType, delivery, ev, c.now())
 	if err != nil {
 		return err
 	}
-	key, err := c.signingKey(ctx, nil)
-	if err != nil {
-		return err
-	}
-
-	err = c.sendWithRetries(ctx, ev.SessionID, eventType, delivery, body, key)
-	var status *webhookStatusError
-	if !errors.As(err, &status) || status.status != http.StatusUnauthorized {
-		return err
-	}
-	fresh, readErr := c.signingKey(ctx, key)
-	if readErr != nil {
-		return errors.Join(err, readErr)
-	}
-	if bytes.Equal(fresh, key) {
-		return err
-	}
-	return c.sendWithRetries(ctx, ev.SessionID, eventType, delivery, body, fresh)
-}
-
-// sendWithRetries posts body signed with key, retrying transient failures
-// after each of retryDelays with the event's stable delivery ID; a 4xx
-// response is returned at once.
-func (c *Client) sendWithRetries(ctx context.Context, sessionID string, eventType EventType, delivery string, body, key []byte) error {
-	signature := webhookSignature(key, body)
 	for attempt := 0; ; attempt++ {
-		retry, err := c.sendOnce(ctx, eventType, delivery, body, signature)
+		var answer struct {
+			EventID string `json:"event_id"`
+		}
+		err := c.listener.do(ctx, http.MethodPost, publishPath, nil, body, &answer)
+		if err == nil && answer.EventID == "" {
+			err = errors.New("envoy: the publish answered no event id")
+		}
 		if err == nil {
 			return nil
 		}
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		if !retry || attempt == len(c.retryDelays) {
+		if !retryable(err) || attempt == len(c.retryDelays) {
+			c.logger.Warn("envoy publish failed", "event", eventType, "session_id", ev.SessionID, "delivery", delivery, "error", err)
 			return err
 		}
-
 		delay := c.retryDelays[attempt]
-		c.logger.Warn("envoy webhook retry scheduled",
+		c.logger.Warn("envoy publish retry scheduled",
 			"event", eventType,
-			"session_id", sessionID,
+			"session_id", ev.SessionID,
 			"delivery", delivery,
 			"delay", delay.String(),
 			"error", err,
@@ -257,76 +225,199 @@ func (c *Client) sendWithRetries(ctx context.Context, sessionID string, eventTyp
 	}
 }
 
-func (c *Client) sendOnce(ctx context.Context, eventType EventType, delivery string, body []byte, signature string) (retry bool, err error) {
-	request, err := http.NewRequestWithContext(ctx, http.MethodPost, c.url, bytes.NewReader(body))
-	if err != nil {
-		return false, fmt.Errorf("create envoy webhook request: %w", err)
+// retryable reports whether a publish that failed with err may succeed if
+// sent again: one the listener did not answer, or answered 408, 429 or 5xx.
+func retryable(err error) bool {
+	var refusal *ListenerError
+	if !errors.As(err, &refusal) {
+		return true
 	}
-	request.Header.Set("Content-Type", "application/json")
-	request.Header.Set("X-GhostWispr-Event", strings.ReplaceAll(string(eventType), "_", "."))
-	request.Header.Set("X-GhostWispr-Delivery", delivery)
-	request.Header.Set("X-GhostWispr-Signature", signature)
-
-	response, err := c.httpClient.Do(request)
-	if err != nil {
-		return true, fmt.Errorf("post envoy webhook: %w", err)
-	}
-	defer func() { _ = response.Body.Close() }()
-
-	if response.StatusCode >= http.StatusOK && response.StatusCode < http.StatusMultipleChoices {
-		return false, nil
-	}
-
-	err = &webhookStatusError{status: response.StatusCode}
-	if response.StatusCode == http.StatusRequestTimeout || response.StatusCode == http.StatusTooManyRequests {
-		return true, err
-	}
-	if response.StatusCode >= http.StatusBadRequest && response.StatusCode < http.StatusInternalServerError {
-		c.logger.Warn("envoy webhook request rejected",
-			"event", eventType,
-			"delivery", delivery,
-			"status", response.StatusCode,
-		)
-		return false, err
-	}
-	return true, err
+	return refusal.Status == http.StatusRequestTimeout || refusal.Status == http.StatusTooManyRequests ||
+		refusal.Status >= http.StatusInternalServerError
 }
 
-// Publisher builds Ghost Wispr event payloads from stored sessions.
+// publishBody builds the publish of ev: the topic, summary and payload the
+// webhook normalizer made from the webhook body (eventBody) for the same event.
+func publishBody(eventType EventType, delivery string, ev Event, now time.Time) (publishRequest, error) {
+	raw, err := eventBody(eventType, ev.SessionID, ev.SummaryVersion, ev.Payload, now)
+	if err != nil {
+		return publishRequest{}, err
+	}
+	var body map[string]any
+	if err := json.Unmarshal(raw, &body); err != nil {
+		return publishRequest{}, fmt.Errorf("decode Ghost Wispr event: %w", err)
+	}
+	event := string(eventType)
+	return publishRequest{
+		Source:         "ghostwispr",
+		Topic:          ghostWisprTopicPrefix + topicSessionID(summarySessionID(body)) + "." + topicKind(eventType),
+		Message:        eventSummary(event, body),
+		Payload:        eventPayload(event, body),
+		IdempotencyKey: uuid.NewSHA1(keyNamespace, []byte(delivery)).String(),
+	}, nil
+}
+
+// eventBody is the body Ghost Wispr's webhook posted for the event, which the
+// normalizer read; the payload is built from it so that every value (a
+// duration's number, a version's) is written as the normalizer wrote it.
+func eventBody(eventType EventType, sessionID string, summaryVersion int, payload map[string]any, createdAt time.Time) ([]byte, error) {
+	bodyPayload := make(map[string]any, len(payload)+3)
+	maps.Copy(bodyPayload, payload)
+	bodyPayload["session_id"] = strings.TrimSpace(sessionID)
+	bodyPayload["type"] = eventType
+	if eventType == eventSummaryReady {
+		bodyPayload["version"] = summaryVersion
+	}
+	return json.Marshal(struct {
+		EventType EventType      `json:"event_type"`
+		CreatedAt string         `json:"created_at"`
+		Payload   map[string]any `json:"payload"`
+	}{
+		EventType: eventType,
+		CreatedAt: createdAt.UTC().Format(time.RFC3339),
+		Payload:   bodyPayload,
+	})
+}
+
+func topicKind(eventType EventType) string {
+	return strings.ReplaceAll(string(eventType), "_", ".")
+}
+
+// eventSummary is the normalizer's ghostWisprSummary: the envelope's one-line
+// payload_summary.
+func eventSummary(eventType string, body map[string]any) string {
+	summary := fmt.Sprintf("ghostwispr %s for session %s", eventType, summarySessionID(body))
+	if title := nestedString(body, "payload", "title"); title != "" {
+		summary += ": " + truncateWithEllipsis(firstNonEmptyLine(title), 80)
+	}
+	line := firstNonEmptyLine(summary)
+	if utf8.RuneCountInString(line) <= 160 {
+		return line
+	}
+	return string([]rune(line)[:159]) + "…"
+}
+
+// eventPayload is the normalizer's ghostWisprPayload: a JSON object of
+// strings, without the fields the event did not carry.
+func eventPayload(eventType string, body map[string]any) string {
+	data := map[string]string{
+		"event_type":       eventType,
+		"session_id":       summarySessionID(body),
+		"started_at":       nestedString(body, "payload", "started_at"),
+		"ended_at":         nestedString(body, "payload", "ended_at"),
+		"drive_folder_url": nestedString(body, "payload", "drive_folder_url"),
+		"session_url":      nestedString(body, "payload", "session_url"),
+		"title":            nestedString(body, "payload", "title"),
+		"duration":         nestedNumberString(body, "payload", "duration"),
+		"created_at":       stringValue(body["created_at"]),
+	}
+	if eventType == string(eventSummaryReady) {
+		data["status"] = nestedString(body, "payload", "status")
+		if summary := nestedString(body, "payload", "summary"); summary != "" {
+			runes := []rune(summary)
+			if len(runes) > maxEnvelopeTextRunes {
+				summary = string(runes[:maxEnvelopeTextRunes])
+				data["body_truncated"] = "true"
+			}
+			data["summary"] = summary
+		}
+		data["summary_preset"] = nestedString(body, "payload", "summary_preset")
+		data["summary_model"] = nestedString(body, "payload", "summary_model")
+		data["timestamp"] = nestedString(body, "payload", "timestamp")
+		data["version"] = nestedNumberString(body, "payload", "version")
+		data["payload_type"] = nestedString(body, "payload", "type")
+	}
+	for key, value := range data {
+		if value == "" {
+			delete(data, key)
+			continue
+		}
+		data[key] = truncateWithEllipsis(value, maxEnvelopeTextRunes)
+	}
+	encoded, _ := json.Marshal(data)
+	return string(encoded)
+}
+
+func summarySessionID(body map[string]any) string {
+	return strings.TrimSpace(nestedString(body, "payload", "session_id"))
+}
+
+func topicSessionID(sessionID string) string {
+	sessionID = strings.Trim(topicSegmentSanitizer.Replace(sessionID), "_")
+	if sessionID == "" {
+		return "unknown"
+	}
+	return sessionID
+}
+
+func nestedString(body map[string]any, keys ...string) string {
+	return stringValue(nested(body, keys...))
+}
+
+// nestedNumberString writes a whole JSON number as an integer, so a large one
+// is not written in scientific notation.
+func nestedNumberString(body map[string]any, keys ...string) string {
+	value := nested(body, keys...)
+	if value == nil {
+		return ""
+	}
+	if number, ok := value.(float64); ok && !math.IsNaN(number) && !math.IsInf(number, 0) && number == math.Trunc(number) {
+		return strconv.FormatFloat(number, 'f', -1, 64)
+	}
+	return fmt.Sprintf("%v", value)
+}
+
+func nested(body map[string]any, keys ...string) any {
+	var current any = body
+	for _, key := range keys {
+		item, _ := current.(map[string]any)
+		if item == nil {
+			return nil
+		}
+		current = item[key]
+	}
+	return current
+}
+
+func stringValue(value any) string {
+	text, _ := value.(string)
+	return text
+}
+
+func firstNonEmptyLine(text string) string {
+	for line := range strings.SplitSeq(text, "\n") {
+		line = strings.TrimLeft(line, " \t\r")
+		if strings.TrimSpace(line) != "" {
+			return line
+		}
+	}
+	return ""
+}
+
+func truncateWithEllipsis(text string, maxRunes int) string {
+	if utf8.RuneCountInString(text) <= maxRunes {
+		return text
+	}
+	return string([]rune(text)[:maxRunes]) + "…"
+}
+
+// Publisher builds Ghost Wispr's events from stored sessions and publishes
+// them through the hub (Client).
 type Publisher struct {
 	store     Store
 	client    *Client
 	publicURL string
 }
 
-// NewPublisher creates a session-aware Envoy webhook publisher whose events
-// are signed with the key readKey reads.
-func NewPublisher(webhookURL string, readKey KeyReader, store Store, opts ...Option) *Publisher {
+// NewPublisher creates a session-aware publisher for the hub's listener at
+// listenerURL.
+func NewPublisher(listenerURL string, store Store, opts ...Option) (*Publisher, error) {
 	collected := collectOptions(opts)
-	return &Publisher{
-		store:     store,
-		client:    newClient(webhookURL, readKey, collected),
-		publicURL: collected.publicURL,
+	client, err := newClient(listenerURL, collected)
+	if err != nil {
+		return nil, err
 	}
-}
-
-// CheckSigningKey reads the signing key when the publisher has none yet or
-// its last read failed, so a key that cannot be read is reported
-// (WithKeyStatus) before an event needs it, and a key that reads again clears
-// the report without waiting for an event. While the last read worked it
-// reads nothing.
-func (p *Publisher) CheckSigningKey(ctx context.Context) error {
-	c := p.client
-	c.keyMu.Lock()
-	kept, failed := c.key, c.keyReadFailed
-	c.keyMu.Unlock()
-	if kept != nil && !failed {
-		return nil
-	}
-	// With kept as stale, signingKey reads again unless a send's read has
-	// replaced kept meanwhile.
-	_, err := c.signingKey(ctx, kept)
-	return err
+	return &Publisher{store: store, client: client, publicURL: collected.publicURL}, nil
 }
 
 // PublishSessionStarted sends a session_started event.
@@ -340,12 +431,11 @@ func (p *Publisher) PublishSessionEnded(ctx context.Context, sessionID string) e
 }
 
 // PublishSummaryReady sends a summary_ready event and tracks its delivery
-// state so the existing sweep retries a completed summary after an outage.
+// state so the sweep sends a completed summary again after an outage.
 func (p *Publisher) PublishSummaryReady(ctx context.Context, sessionID string) error {
 	if p == nil || p.client == nil || p.store == nil {
 		return nil
 	}
-
 	sess, err := p.store.GetSession(sessionID)
 	if err != nil {
 		return fmt.Errorf("get session %s: %w", sessionID, err)
@@ -367,7 +457,6 @@ func (p *Publisher) PublishSummaryReady(ctx context.Context, sessionID string) e
 	} else if !updated {
 		return nil
 	}
-
 	if err := p.sendSession(ctx, eventSummaryReady, &sess); err != nil {
 		if ctx.Err() != nil {
 			return ctx.Err()
@@ -379,11 +468,8 @@ func (p *Publisher) PublishSummaryReady(ctx context.Context, sessionID string) e
 		}
 		return fmt.Errorf("publish summary-ready event for session %s: %w", sessionID, err)
 	}
-
-	if updated, err := p.store.UpdateEnvoyPublishStatusAtVersion(sessionID, sess.SummaryVersion, storage.EnvoyPublishPublished); err != nil {
+	if _, err := p.store.UpdateEnvoyPublishStatusAtVersion(sessionID, sess.SummaryVersion, storage.EnvoyPublishPublished); err != nil {
 		return fmt.Errorf("mark envoy publish published for session %s: %w", sessionID, err)
-	} else if !updated {
-		return nil
 	}
 	return nil
 }
@@ -402,18 +488,16 @@ func (p *Publisher) publishSession(ctx context.Context, eventType EventType, ses
 	if err := p.sendSession(ctx, eventType, &sess); err != nil {
 		return fmt.Errorf("publish %s event for session %s: %w", eventType, sessionID, err)
 	}
-	if err := p.store.MarkEnvoyLifecycleEventDelivered(string(eventType), sessionID); err != nil {
-		return err
-	}
-	return nil
+	return p.store.MarkEnvoyLifecycleEventDelivered(string(eventType), sessionID)
 }
 
+// PublishPendingLifecycleEvents sends again the lifecycle events no publish
+// has delivered, an earlier process's included.
 func (p *Publisher) PublishPendingLifecycleEvents(ctx context.Context) error {
 	events, err := p.store.PendingEnvoyLifecycleEvents()
 	if err != nil {
 		return err
 	}
-
 	var firstErr error
 	for _, event := range events {
 		var publishErr error
@@ -477,55 +561,26 @@ func sessionDuration(sess *storage.Session) int64 {
 	return int64(sess.EndedAt.Sub(sess.StartedAt).Seconds())
 }
 
+// eventDelivery normalizes ev's type and names the event: the session and the
+// event, and the summary's version for summary_ready. Every send of one event
+// has the same delivery id, and so the same idempotency key.
 func eventDelivery(ev Event) (eventType EventType, delivery string, err error) {
-	eventType = EventType(normalizeEventType(string(ev.Type)))
+	eventType = EventType(strings.ReplaceAll(strings.TrimSpace(strings.ToLower(string(ev.Type))), ".", "_"))
 	sessionID := strings.TrimSpace(ev.SessionID)
 	if sessionID == "" {
-		return "", "", errors.New("envoy webhook session ID is required")
+		return "", "", errors.New("envoy event session ID is required")
 	}
-
 	switch eventType {
 	case eventSessionStarted, eventSessionEnded:
 		return eventType, sessionID + "." + string(eventType), nil
 	case eventSummaryReady:
 		if ev.SummaryVersion <= 0 {
-			return "", "", errors.New("envoy webhook summary version must be a positive integer")
+			return "", "", errors.New("envoy event summary version must be a positive integer")
 		}
 		return eventType, sessionID + "." + string(eventType) + "." + strconv.Itoa(ev.SummaryVersion), nil
 	default:
-		return "", "", fmt.Errorf("unsupported envoy webhook event type %q", ev.Type)
+		return "", "", fmt.Errorf("unsupported envoy event type %q", ev.Type)
 	}
-}
-
-func webhookEventBody(eventType EventType, sessionID string, summaryVersion int, payload map[string]any, createdAt time.Time) ([]byte, error) {
-	bodyPayload := make(map[string]any, len(payload)+3)
-	maps.Copy(bodyPayload, payload)
-	bodyPayload["session_id"] = strings.TrimSpace(sessionID)
-	bodyPayload["type"] = eventType
-	if eventType == eventSummaryReady {
-		bodyPayload["version"] = summaryVersion
-	}
-
-	return json.Marshal(struct {
-		EventType EventType      `json:"event_type"`
-		CreatedAt string         `json:"created_at"`
-		Payload   map[string]any `json:"payload"`
-	}{
-		EventType: eventType,
-		CreatedAt: createdAt.UTC().Format(time.RFC3339),
-		Payload:   bodyPayload,
-	})
-}
-
-func webhookSignature(secret, body []byte) string {
-	mac := hmac.New(sha256.New, secret)
-	_, _ = mac.Write(body)
-	return "sha256=" + hex.EncodeToString(mac.Sum(nil))
-}
-
-func normalizeEventType(event string) string {
-	event = strings.TrimSpace(strings.ToLower(event))
-	return strings.ReplaceAll(event, ".", "_")
 }
 
 func sleepWithContext(ctx context.Context, delay time.Duration) error {

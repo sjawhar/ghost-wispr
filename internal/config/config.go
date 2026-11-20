@@ -21,9 +21,9 @@ const EnvPrefix = "GHOST_WISPR_"
 
 const (
 	IndicatorLightBlink1 = "blink1"
-	// leftoverEnvoyWebhookSecretWarning names a signing key an earlier
+	// leftoverEnvoyWebhookSecretWarning names a webhook signing key an earlier
 	// provisioner left in the environment or .env.
-	leftoverEnvoyWebhookSecretWarning = EnvPrefix + "ENVOY_WEBHOOK_SECRET is no longer read: Ghost Wispr reads the Envoy signing key from Secret Manager (envoy_webhook_secret_name). Remove it from the environment and .env."
+	leftoverEnvoyWebhookSecretWarning = EnvPrefix + "ENVOY_WEBHOOK_SECRET is no longer read: Ghost Wispr publishes to the Envoy hub (envoy_hub_url), which needs no key. Remove it from the environment and .env."
 )
 
 // Config holds all application configuration. Secrets (API keys) are loaded
@@ -115,8 +115,7 @@ type Config struct {
 	GenAIBackend                  string             `yaml:"genai_backend"`
 	GDriveSyncEnabled             bool               `yaml:"gdrive_sync_enabled"`
 	EnvoyEnabled                  bool               `yaml:"envoy_enabled"`
-	EnvoyWebhookURL               string             `yaml:"envoy_webhook_url"`
-	EnvoyWebhookSecretName        string             `yaml:"envoy_webhook_secret_name"`
+	EnvoyHubURL                   string             `yaml:"envoy_hub_url"`
 	GCEnabled                     bool               `yaml:"gc_enabled"`
 	GCMaxAgeDays                  int                `yaml:"gc_max_age_days"`
 	GCMaxAudioSizeMB              int                `yaml:"gc_max_audio_size_mb"`
@@ -250,6 +249,11 @@ func Load(path string) (Config, []string, error) {
 	return cfg, warnings, nil
 }
 
+// removedEnvoyKeys are the settings of the Envoy paths Ghost Wispr no longer
+// has: NATS, then the webhook. A start that finds one says so, since the unit
+// would otherwise send nothing and say nothing.
+var removedEnvoyKeys = []string{"nats_url", "envoy_topic", "envoy_webhook_url", "envoy_webhook_secret_name"}
+
 func deprecatedEnvoyConfigWarnings(data []byte) []string {
 	var values map[string]any
 	if err := yaml.Unmarshal(data, &values); err != nil {
@@ -257,9 +261,9 @@ func deprecatedEnvoyConfigWarnings(data []byte) []string {
 	}
 
 	var warnings []string
-	for _, key := range []string{"nats_url", "envoy_topic"} {
+	for _, key := range removedEnvoyKeys {
 		if _, found := values[key]; found {
-			warnings = append(warnings, key+" has been removed; use envoy_webhook_url instead.")
+			warnings = append(warnings, key+" has been removed; use envoy_hub_url instead.")
 		}
 	}
 	return warnings
@@ -267,9 +271,10 @@ func deprecatedEnvoyConfigWarnings(data []byte) []string {
 
 func deprecatedEnvoyEnvironmentWarnings() []string {
 	var warnings []string
-	for _, key := range []string{"NATS_URL", "ENVOY_TOPIC"} {
-		if _, found := os.LookupEnv(EnvPrefix + key); found {
-			warnings = append(warnings, EnvPrefix+key+" has been removed; use "+EnvPrefix+"ENVOY_WEBHOOK_URL instead.")
+	for _, key := range removedEnvoyKeys {
+		name := EnvPrefix + strings.ToUpper(key)
+		if os.Getenv(name) != "" {
+			warnings = append(warnings, name+" has been removed; use envoy_hub_url ("+EnvPrefix+"ENVOY_HUB_URL) instead.")
 		}
 	}
 	if os.Getenv(EnvPrefix+"ENVOY_WEBHOOK_SECRET") != "" {
@@ -406,11 +411,8 @@ func applyEnvOverrides(cfg *Config) []string {
 	if v := os.Getenv(EnvPrefix + "ENVOY_ENABLED"); v != "" {
 		cfg.EnvoyEnabled = strings.EqualFold(v, "true") || v == "1"
 	}
-	if v := os.Getenv(EnvPrefix + "ENVOY_WEBHOOK_URL"); v != "" {
-		cfg.EnvoyWebhookURL = strings.TrimSpace(v)
-	}
-	if v := os.Getenv(EnvPrefix + "ENVOY_WEBHOOK_SECRET_NAME"); v != "" {
-		cfg.EnvoyWebhookSecretName = strings.TrimSpace(v)
+	if v := os.Getenv(EnvPrefix + "ENVOY_HUB_URL"); v != "" {
+		cfg.EnvoyHubURL = strings.TrimSpace(v)
 	}
 	if v := os.Getenv(EnvPrefix + "PUBLIC_URL"); v != "" {
 		cfg.PublicURL = strings.TrimSpace(v)
@@ -628,21 +630,14 @@ func validate(cfg *Config, hasExternalAccount bool) []string {
 	if cfg.BatchTranscription.Provider == "" {
 		cfg.BatchTranscription.Provider = "deepgram"
 	}
-	cfg.EnvoyWebhookSecretName = strings.TrimSpace(cfg.EnvoyWebhookSecretName)
+	cfg.EnvoyHubURL = strings.TrimSpace(cfg.EnvoyHubURL)
 	if cfg.EnvoyEnabled {
-		webhookURL := strings.TrimSpace(cfg.EnvoyWebhookURL)
-		switch webhookURL {
-		case "":
-			warnings = append(warnings, "Envoy enabled but webhook URL not configured — set "+EnvPrefix+"ENVOY_WEBHOOK_URL or disable Envoy publishing.")
-		default:
-			parsedURL, err := url.Parse(webhookURL)
-			if err != nil || parsedURL.Scheme != "https" || parsedURL.Host == "" {
-				warnings = append(warnings, "Envoy webhook URL must be an absolute HTTPS URL.")
-			}
-		}
-		// No signing key secret is a default: each deployment names its own.
-		if cfg.EnvoyWebhookSecretName == "" {
-			warnings = append(warnings, "Envoy enabled but its signing key secret is not named — set envoy_webhook_secret_name ("+EnvPrefix+"ENVOY_WEBHOOK_SECRET_NAME) to its Secret Manager version, or disable Envoy publishing.")
+		parsedURL, err := url.Parse(cfg.EnvoyHubURL)
+		switch {
+		case cfg.EnvoyHubURL == "":
+			warnings = append(warnings, "Envoy enabled but its hub is not configured — set envoy_hub_url ("+EnvPrefix+"ENVOY_HUB_URL) to the hub listener's URL, or disable Envoy publishing.")
+		case err != nil || (parsedURL.Scheme != "http" && parsedURL.Scheme != "https") || parsedURL.Host == "":
+			warnings = append(warnings, fmt.Sprintf("Invalid envoy_hub_url %q — it must be the absolute URL of the hub's listener, http or https, such as http://hub.example.ts.net:9020; Envoy events are not sent.", cfg.EnvoyHubURL))
 		}
 	}
 	if publicURL := strings.TrimSpace(cfg.PublicURL); publicURL != "" {
