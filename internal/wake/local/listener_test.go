@@ -57,15 +57,19 @@ func (c *fakeCapture) isClosed() bool {
 	}
 }
 
-// listenerRig runs a listener on a fake capture until the test ends.
+// listenerRig runs a listener on a fake capture until the test ends. The unit
+// listens while want holds, in its stretch of listening number stretch.
 type listenerRig struct {
 	detector *Detector
 	spot     *fakeSpotter
 	verify   *fakeVerifier
 	want     atomic.Bool
+	stretch  atomic.Uint64
 	opens    chan *fakeCapture
 	heard    atomic.Int32
+	heardIn  chan uint64 // the stretch of each resume request
 	failures chan error
+	failedIn chan uint64 // the stretch of each reported failure
 	openErr  atomic.Pointer[error]
 	listener *Listener
 	// atHeard, when set by a setup, runs inside the listener's resume request.
@@ -78,34 +82,40 @@ func startListenerRig(t *testing.T, hits []int, setup ...func(*listenerRig)) *li
 		spot:     &fakeSpotter{hits: hits},
 		verify:   &fakeVerifier{text: "WHISPER START RECORDING"},
 		opens:    make(chan *fakeCapture, 8),
+		heardIn:  make(chan uint64, 8),
 		failures: make(chan error, 8),
+		failedIn: make(chan uint64, 8),
 	}
 	for _, s := range setup {
 		s(r)
 	}
 	r.detector = NewDetectorOf(r.spot, r.verify)
 	r.listener = NewListener(r.detector, ListenerConfig{
-		Open: func() (Capture, error) {
+		Open: func(stretch uint64) (Capture, error) {
 			if err := r.openErr.Load(); err != nil {
 				return nil, *err
 			}
-			if !r.want.Load() {
+			if !r.want.Load() || r.stretch.Load() != stretch {
 				return nil, ErrNotNow
 			}
 			c := newFakeCapture()
 			r.opens <- c
 			return c, nil
 		},
-		Want: r.want.Load,
-		Heard: func() {
+		Want: func() (uint64, bool) { return r.stretch.Load(), r.want.Load() },
+		Heard: func(stretch uint64) {
 			r.heard.Add(1)
+			r.heardIn <- stretch
 			if r.atHeard != nil {
 				r.atHeard()
 			}
 			r.want.Store(false)
 		},
-		Failed: func(err error) { r.failures <- err },
-		Poll:   time.Millisecond,
+		Failed: func(stretch uint64, err error) {
+			r.failedIn <- stretch
+			r.failures <- err
+		},
+		Poll: time.Millisecond,
 	})
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
@@ -122,6 +132,53 @@ func startListenerRig(t *testing.T, hits []int, setup ...func(*listenerRig)) *li
 		}
 	})
 	return r
+}
+
+// TestAHitCarriesTheStretchItWasCapturedIn fails if the listener's resume
+// request or failure does not name the stretch of listening its stream was
+// opened in, or if a stream from one stretch goes on reading once the unit
+// is in another: the unit then cannot tell a phrase from an ended stretch from
+// one in the current stretch (review of #123).
+func TestAHitCarriesTheStretchItWasCapturedIn(t *testing.T) {
+	t.Run("a phrase", func(t *testing.T) {
+		r := startListenerRig(t, []int{SampleRate / 10}, func(r *listenerRig) { r.stretch.Store(7) })
+		r.want.Store(true)
+		c := r.opened(t)
+		r.stretch.Store(8) // a new stretch while the read below is under way
+		c.reads <- samplesOf(1, SampleRate/10)
+		select {
+		case got := <-r.heardIn:
+			if got != 7 {
+				t.Fatalf("the resume request names stretch %d, want 7, the stream's", got)
+			}
+		case <-time.After(testWait):
+			t.Fatal("control: the listener did not ask to resume")
+		}
+	})
+	t.Run("a failure", func(t *testing.T) {
+		r := startListenerRig(t, nil, func(r *listenerRig) { r.stretch.Store(3) })
+		busy := errors.New("device or resource busy")
+		r.openErr.Store(&busy)
+		r.want.Store(true)
+		select {
+		case got := <-r.failedIn:
+			if got != 3 {
+				t.Fatalf("the failure names stretch %d, want 3", got)
+			}
+		case <-time.After(testWait):
+			t.Fatal("control: the open's failure was not reported")
+		}
+	})
+	t.Run("a new stretch ends the stream", func(t *testing.T) {
+		r := startListenerRig(t, nil, func(r *listenerRig) { r.stretch.Store(1) })
+		r.want.Store(true)
+		c := r.opened(t)
+		r.stretch.Store(2)
+		waitFor(t, "the stream of stretch 1 to close in stretch 2", c.isClosed)
+		if next := r.opened(t); next == c {
+			t.Fatal("control: no new stream opened for stretch 2")
+		}
+	})
 }
 
 func (r *listenerRig) opened(t *testing.T) *fakeCapture {

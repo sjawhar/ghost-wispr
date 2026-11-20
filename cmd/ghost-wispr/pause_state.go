@@ -82,22 +82,26 @@ func wirePauseControls(hooks *server.ControlHooks, controls *persistentControls,
 	}
 	hooks.Pause = func() error { return saved(controls.Pause()) }
 	hooks.Close = func() error { return saved(controls.Close()) }
-	hooks.Resume = func() error {
-		err := controls.Resume()
-		if err != nil {
-			if errors.Is(err, errRefusedResumeNotPersisted) {
-				pauseNotSaved()
-			}
-		} else {
-			warnings.Clear(captureStateWarningKey)
-		}
-		return err
-	}
+	hooks.Resume = func() error { return noteResume(warnings, controls.Resume()) }
 	wireLightConsent(capture, hardware, warnings, func(error) {
 		if err := controls.RefuseResume(); err != nil {
 			pauseNotSaved()
 		}
 	})
+}
+
+// noteResume keeps the warning that the saved pause switch is not what a
+// restart would restore after a resume's err: set when a refused resume
+// could not save the state it returned to, cleared when the resume worked.
+// It returns err.
+func noteResume(warnings *warningsRegistry, err error) error {
+	switch {
+	case err == nil:
+		warnings.Clear(captureStateWarningKey)
+	case errors.Is(err, errRefusedResumeNotPersisted):
+		warnings.Set(captureStateWarningKey, "Pause not saved; a restart will resume recording")
+	}
+	return err
 }
 
 // seedPausedState writes the durable pause before a test instance starts, so
@@ -168,9 +172,11 @@ type listenerParts struct {
 // micLevels is the capture gate's side of the three states.
 type micLevels interface {
 	micState() micState
+	listeningStretch() (uint64, bool)
 	PauseListening()
 	CloseMicrophone()
 	leaveListening() bool
+	leaveListeningIn(stretch uint64) bool
 	enterListening() bool
 }
 
@@ -181,6 +187,7 @@ type micLevels interface {
 // controls' lock, and IsPaused is the gate's switch.
 type resumeGate interface {
 	prepareResume() (resumeTicket, error)
+	prepareResumeIn(stretch uint64) (resumeTicket, error)
 	resumeWith(t resumeTicket, persist func() error) error
 	pauseRequested()
 	IsPaused() bool
@@ -273,13 +280,29 @@ func (c *persistentControls) savePause(what string) error {
 // nil (review 5961636823 of #79). The resume saves the switch on just before
 // it confirms the light red, and, if the light refuses it, saves the state it
 // came from again: the unit goes back to it.
-func (c *persistentControls) Resume() error {
+func (c *persistentControls) Resume() error { return c.resume(c.gate.prepareResume) }
+
+// resumeFromListening is the paused listener's resume, for the phrase heard
+// in stretch: Resume, except that it returns errStaleListening, having
+// changed nothing, unless the unit still listens in that stretch when the
+// resume takes its ticket, and does nothing unless it still does when the
+// resume moves the switch (prepareResumeIn). A close, a detach, a setting
+// turned off or a new stretch of listening after the phrase's audio was read
+// wins over it (review 5998292452 of #123).
+func (c *persistentControls) resumeFromListening(stretch uint64) error {
+	return c.resume(func() (resumeTicket, error) { return c.gate.prepareResumeIn(stretch) })
+}
+
+func (c *persistentControls) resume(prepare func() (resumeTicket, error)) error {
 	c.resumes.Add(1)
 	defer c.resumes.Add(-1)
 	if p := c.parts.Load(); p != nil {
 		p.stop()
 	}
-	ticket, err := c.gate.prepareResume()
+	ticket, err := prepare()
+	if errors.Is(err, errStaleListening) {
+		return err // nothing changed, and nothing is announced
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.restoreListening = false
@@ -339,12 +362,16 @@ func (c *persistentControls) RefuseResume() error {
 	return nil
 }
 
-// listenerWanted reports whether the paused listener should hold the
-// microphone now: the unit is listening, the listener can run, and no resume
-// is under way.
-func (c *persistentControls) listenerWanted() bool {
+// listenerWanted reports the current stretch of listening, and whether the
+// paused listener should hold the microphone in it now: the unit is
+// listening, the listener can run, and no resume is under way.
+func (c *persistentControls) listenerWanted() (uint64, bool) {
 	p := c.parts.Load()
-	return p != nil && p.levels.micState() == micListening && c.resumes.Load() == 0 && p.ready()
+	if p == nil {
+		return 0, false
+	}
+	stretch, listening := p.levels.listeningStretch()
+	return stretch, listening && c.resumes.Load() == 0 && p.ready()
 }
 
 // armRestoredListening makes a saved listening state, restored as closed,
@@ -382,18 +409,19 @@ func (c *persistentControls) listenerChanged() error {
 	return nil
 }
 
-// listenerFailed moves a listening unit to closed: its listener's capture
-// failed, so nothing listens, and the ring must show that the microphone is
-// closed.
-func (c *persistentControls) listenerFailed() error {
+// listenerFailed moves a unit that listens in stretch to closed: its
+// listener's capture failed, so nothing listens, and the ring must show that
+// the microphone is closed. It reports whether it moved the unit: a failure
+// from a stretch that has ended moves nothing.
+func (c *persistentControls) listenerFailed(stretch uint64) (bool, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	p := c.parts.Load()
-	if p == nil || !p.levels.leaveListening() {
-		return nil
+	if p == nil || !p.levels.leaveListeningIn(stretch) {
+		return false, nil
 	}
 	p.wake()
-	return c.savePause("persist the microphone closed for the listener")
+	return true, c.savePause("persist the microphone closed for the listener")
 }
 
 // micStartFailureMessages returns the microphone warning and the start-up

@@ -21,19 +21,27 @@ type Capture interface {
 // any more, or the recording microphone is open. The listener looks again.
 var ErrNotNow = errors.New("the paused listener may not open now")
 
-// ListenerConfig is what the listener needs from the unit.
+// ListenerConfig is what the listener needs from the unit. Each entry into the
+// listening state starts a new stretch of listening, numbered by the unit: a
+// stream, and every phrase or failure that comes of it, belongs to the
+// stretch it was opened in, so the unit can refuse those of a stretch that has
+// ended (review 5998292452 of #123).
 type ListenerConfig struct {
-	// Open opens the capture stream, only while Want holds and the recording
-	// microphone is closed, or returns ErrNotNow.
-	Open func() (Capture, error)
-	// Want reports whether the unit is in the listening state.
-	Want func() bool
-	// Heard is the listener's only output: a resume request, which the unit
-	// serves as POST /api/resume does. The capture is closed when it runs.
-	Heard func()
-	// Failed reports a capture that would not open, or failed while it read:
-	// nothing listens, so the unit closes the microphone's state.
-	Failed func(error)
+	// Open opens the capture stream for stretch, only while the unit listens
+	// in stretch and the recording microphone is closed, or returns ErrNotNow.
+	Open func(stretch uint64) (Capture, error)
+	// Want reports the unit's current stretch, and whether the listener
+	// should hold the microphone in it.
+	Want func() (stretch uint64, wanted bool)
+	// Heard is the listener's only output: a resume request for a phrase
+	// heard in stretch, which the unit serves as POST /api/resume does, and
+	// only while it still listens in that stretch. The capture is closed when
+	// it runs.
+	Heard func(stretch uint64)
+	// Failed reports a capture of stretch that would not open, or failed
+	// while it read: nothing listens, so the unit closes the microphone's
+	// state if it still listens in that stretch.
+	Failed func(stretch uint64, err error)
 	// Poll is how often the listener looks at Want while it does not listen;
 	// 0 means 100 ms.
 	Poll time.Duration
@@ -52,10 +60,10 @@ const openTries = 5
 // for nothing else.
 type Listener struct {
 	detector    *Detector
-	openCapture func() (Capture, error)
-	want        func() bool
-	heard       func()
-	failed      func(error)
+	openCapture func(stretch uint64) (Capture, error)
+	want        func() (uint64, bool)
+	heard       func(stretch uint64)
+	failed      func(stretch uint64, err error)
 	poll        time.Duration
 	// interrupted asks the open stream to close at its next read (Interrupt).
 	interrupted atomic.Bool
@@ -89,15 +97,19 @@ func (l *Listener) Interrupt() { l.interrupted.Store(true) }
 
 // Run listens while Want holds, until ctx ends.
 func (l *Listener) Run(ctx context.Context) {
-	failures := 0
+	failures, failingStretch := 0, uint64(0)
 	for ctx.Err() == nil {
-		if !l.want() {
+		stretch, wanted := l.want()
+		if !wanted {
 			failures = 0
 			l.sleep(ctx)
 			continue
 		}
+		if stretch != failingStretch {
+			failures, failingStretch = 0, stretch
+		}
 		l.interrupted.Store(false)
-		capture, err := l.openCapture()
+		capture, err := l.openCapture(stretch)
 		switch {
 		case errors.Is(err, ErrNotNow):
 			l.sleep(ctx)
@@ -107,13 +119,13 @@ func (l *Listener) Run(ctx context.Context) {
 			if failures >= openTries {
 				failures = 0
 				slog.Warn("paused listener: the capture did not open", "error", err)
-				l.failed(err)
+				l.failed(stretch, err)
 			}
 			l.sleep(ctx)
 			continue
 		}
 		failures = 0
-		heard, readErr := l.listen(ctx, capture)
+		heard, readErr := l.listen(ctx, capture, stretch)
 		if err := capture.Close(); err != nil {
 			slog.Warn("paused listener: close the capture", "error", err)
 		}
@@ -121,21 +133,22 @@ func (l *Listener) Run(ctx context.Context) {
 		switch {
 		case readErr != nil:
 			slog.Warn("paused listener: the capture failed", "error", readErr)
-			l.failed(readErr)
+			l.failed(stretch, readErr)
 		case heard:
 			slog.Info("paused listener: heard the phrase; asking to resume")
-			l.heard()
+			l.heard(stretch)
 		}
 	}
 }
 
-// listen feeds the stream to the detector until the phrase is heard, Want
-// turns false, Interrupt asks, ctx ends or a read fails.
-func (l *Listener) listen(ctx context.Context, capture Capture) (heard bool, err error) {
+// listen feeds the stream of stretch to the detector until the phrase is
+// heard, the unit stops listening or starts another stretch, Interrupt asks,
+// ctx ends or a read fails.
+func (l *Listener) listen(ctx context.Context, capture Capture, stretch uint64) (heard bool, err error) {
 	l.mu.Lock()
 	l.open = true
 	l.mu.Unlock()
-	for ctx.Err() == nil && !l.interrupted.Load() && l.want() {
+	for ctx.Err() == nil && !l.interrupted.Load() && l.inStretch(stretch) {
 		n, err := capture.Read(l.buf)
 		if err != nil {
 			return false, err
@@ -148,6 +161,12 @@ func (l *Listener) listen(ctx context.Context, capture Capture) (heard bool, err
 		}
 	}
 	return false, nil
+}
+
+// inStretch reports whether the unit still wants the listener in stretch.
+func (l *Listener) inStretch(stretch uint64) bool {
+	current, wanted := l.want()
+	return wanted && current == stretch
 }
 
 // reset zeroes the ring, the spotter's stream and the read buffer once the

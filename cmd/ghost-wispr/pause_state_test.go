@@ -55,6 +55,8 @@ type resumeFunc func() error
 
 func (resumeFunc) prepareResume() (resumeTicket, error) { return resumeTicket{}, nil }
 
+func (resumeFunc) prepareResumeIn(uint64) (resumeTicket, error) { return resumeTicket{}, nil }
+
 func (resumeFunc) pauseRequested() {}
 
 func (resumeFunc) IsPaused() bool { return true }

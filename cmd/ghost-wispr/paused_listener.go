@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"sync"
 	"sync/atomic"
@@ -122,9 +123,13 @@ func runPausedListener(ctx context.Context, u *pausedListenerUnit, started *atom
 	}
 	defer detector.Close()
 	listener := local.NewListener(detector, local.ListenerConfig{
-		Open: func() (local.Capture, error) {
+		Open: func(stretch uint64) (local.Capture, error) {
 			var capture local.Capture
-			err := u.device.openListener(u.controls.listenerWanted, func() error {
+			inStretch := func() bool {
+				current, wanted := u.controls.listenerWanted()
+				return wanted && current == stretch
+			}
+			err := u.device.openListener(inStretch, func() error {
 				var err error
 				capture, err = u.openCapture()
 				return err
@@ -136,10 +141,16 @@ func runPausedListener(ctx context.Context, u *pausedListenerUnit, started *atom
 			return listenerStream{capture: capture, device: u.device}, nil
 		},
 		Want: u.controls.listenerWanted,
-		// The phrase resumes as POST /api/resume does: the light is
-		// confirmed red before any audio passes the gate.
-		Heard: func() {
-			if err := u.hooks.Resume(); err != nil {
+		// The phrase resumes as POST /api/resume does, so the light is
+		// confirmed red before any audio passes the gate, but only while the
+		// unit still listens in the stretch the phrase was heard in.
+		Heard: func(stretch uint64) {
+			err := noteResume(u.warnings, u.controls.resumeFromListening(stretch))
+			switch {
+			case errors.Is(err, errStaleListening):
+				slog.Info("paused listener: the phrase came from a stretch of listening that has ended; nothing resumed")
+				return
+			case err != nil:
 				slog.Warn("paused listener: resume refused", "error", err)
 				return
 			}
@@ -147,9 +158,12 @@ func runPausedListener(ctx context.Context, u *pausedListenerUnit, started *atom
 				u.hooks.OnStatusChanged(false)
 			}
 		},
-		Failed: func(error) {
-			u.warnings.Set(pausedListenerWarningKey, "Paused listener stopped: its microphone did not open or failed; the microphone is closed")
-			if err := u.controls.listenerFailed(); err != nil {
+		Failed: func(stretch uint64, _ error) {
+			moved, err := u.controls.listenerFailed(stretch)
+			if moved {
+				u.warnings.Set(pausedListenerWarningKey, "Paused listener stopped: its microphone did not open or failed; the microphone is closed")
+			}
+			if err != nil {
 				slog.Warn("paused listener", "error", err)
 			}
 		},
