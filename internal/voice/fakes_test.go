@@ -301,7 +301,8 @@ type fakeVoice struct {
 	sessions []*fakeSession
 	opened   chan *fakeSession
 	openErr  error
-	sayErr   error // every Say of a session opened while set fails with it
+	sayErr   error  // every Say of a session opened while set fails with it
+	onOpen   func() // runs at the start of each Open, when set
 }
 
 func newFakeVoice() *fakeVoice { return &fakeVoice{opened: make(chan *fakeSession, 16)} }
@@ -314,8 +315,11 @@ func (v *fakeVoice) failOpens(err error) {
 
 func (v *fakeVoice) Open(ctx context.Context, x *Exchange) (Session, error) {
 	v.mu.Lock()
-	err := v.openErr
+	err, onOpen := v.openErr, v.onOpen
 	v.mu.Unlock()
+	if onOpen != nil {
+		onOpen()
+	}
 	if err != nil {
 		return nil, err
 	}

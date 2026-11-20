@@ -2,6 +2,7 @@ package joined
 
 import (
 	"context"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -264,8 +265,10 @@ func TestFloorRequests(t *testing.T) {
 		ID: request.EventID, SessionID: "sess-1", Agent: "agent-1", Membership: r.roster.Joined()[0].ID, IssueKey: "ABC-12", Name: "ABC-12",
 		Text: "ABC-12's agent says: The deploy of the new keys moved to Friday.", Expires: request.IssuedAt.Add(60 * time.Second),
 	}
-	if *h != *want {
-		t.Fatalf("hand %+v, want %+v", h, want)
+	got := *h
+	got.Current = nil
+	if !reflect.DeepEqual(got, *want) {
+		t.Fatalf("hand %+v, want %+v", got, want)
 	}
 
 	refused := func(text, reason string) {

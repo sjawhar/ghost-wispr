@@ -4,6 +4,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -63,6 +64,62 @@ func TestALowerTakesOnlyItsMembershipsHands(t *testing.T) {
 	r.heard("Wispr, go ahead.", true, true)
 	if got := waitSaid(t, r.waitSession()); got != later.Text {
 		t.Fatalf("said %q, want the later membership's words %q", got, later.Text)
+	}
+}
+
+// TestAHandWhoseMembershipEndedIsWithdrawn fails if the Supervisor speaks, or
+// names on "Wispr, who has a hand up?", a hand whose membership is no longer
+// current, whether it ended before the invitation or between the invitation
+// and the words; or if its agent is not told it was withdrawn. The Supervisor
+// asks the hand (Current) at the moment of each effect.
+func TestAHandWhoseMembershipEndedIsWithdrawn(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		// endAt is when the membership ends: before the go-ahead, or as the
+		// voice opens to say the words, after the invitation was accepted.
+		endAt string
+	}{{"before the invitation", "before"}, {"between the invitation and the words", "open"}} {
+		t.Run(tc.name, func(t *testing.T) {
+			r, outcomes := newHandsRig(t)
+			var ended atomic.Bool
+			var asked atomic.Int32
+			hand := testHand("h1", "ABC-12", time.Minute)
+			hand.Current = func() bool { asked.Add(1); return !ended.Load() }
+			if err := r.s.RaiseHand(hand); err != nil {
+				t.Fatalf("RaiseHand: %v", err)
+			}
+			eventually(t, "the hand sound", func() bool { return slices.Equal(r.speaker.soundsPlayed(), []string{"hand"}) })
+			switch tc.endAt {
+			case "before":
+				ended.Store(true)
+				r.heard("Wispr, who has a hand up?", true, true)
+				if got, want := waitSaid(t, r.waitSession()), "Nobody has a hand up."; got != want {
+					t.Fatalf("said %q, want %q: an ended membership's hand was named", got, want)
+				}
+				r.speaker.finish("voice")
+				time.Sleep(100 * time.Millisecond)
+			case "open":
+				r.voice.mu.Lock()
+				r.voice.onOpen = func() { ended.Store(true) }
+				r.voice.mu.Unlock()
+			}
+			r.heard("Wispr, go ahead.", true, true)
+			eventually(t, "the hand reported withdrawn", func() bool { return slices.Equal(outcomes.all(), []string{"h1:withdrawn"}) })
+			r.voice.mu.Lock()
+			sessions := slices.Clone(r.voice.sessions)
+			r.voice.mu.Unlock()
+			for _, s := range sessions {
+				s.mu.Lock()
+				says := slices.Clone(s.says)
+				s.mu.Unlock()
+				if slices.Contains(says, hand.Text) {
+					t.Fatalf("the ended membership's words were spoken: %q", says)
+				}
+			}
+			if asked.Load() == 0 {
+				t.Fatal("control: the Supervisor never asked the hand whether its membership is current")
+			}
+		})
 	}
 }
 

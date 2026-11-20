@@ -1220,6 +1220,7 @@ func (s *Supervisor) followUpLocked(ex *exchange) {
 func (s *Supervisor) goAheadLocked(keys []string) {
 	s.dropEndedLocked()
 	s.dropExpiredLocked(time.Now())
+	s.dropWithdrawnLocked() // asked now, right before an invitation is accepted
 	if !s.cfg.Red() || s.ex != nil || len(s.pending) == 0 {
 		return
 	}
@@ -1262,6 +1263,14 @@ func (s *Supervisor) speakLocked(p *pendingAnswer) {
 		}
 		s.mu.Lock()
 		sess := ex.session
+		if p.hand != nil && !p.hand.current() {
+			// Its membership ended after the invitation: withdrawn, not said.
+			s.handDoneLocked(p, HandWithdrawn)
+			ex.answer = nil
+			s.endLocked(ex, false, "a withdrawn hand")
+			s.mu.Unlock()
+			return
+		}
 		s.addOwnLocked(p.Text, time.Now())
 		s.mu.Unlock()
 		if sess == nil {
@@ -1367,6 +1376,7 @@ func (s *Supervisor) offer() {
 	}
 	now := time.Now()
 	s.dropExpiredLocked(now)
+	s.dropWithdrawnLocked()
 	if len(s.pending) == 0 || !s.cfg.Red() {
 		return
 	}

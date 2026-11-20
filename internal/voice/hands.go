@@ -33,7 +33,17 @@ type Hand struct {
 	Text string
 	// Expires is when it comes down unspoken.
 	Expires time.Time
+	// Current reports whether the membership the hand belongs to is still
+	// current; nil is always. The Supervisor asks it under its own lock at
+	// the moment of each effect: right before it accepts an invitation for
+	// the hand or names it, and again right before it says the hand's words.
+	// A hand whose membership is not current is withdrawn, never spoken. It
+	// must return at once and never call the Supervisor.
+	Current func() bool
 }
+
+// current reports whether h's membership is current (Current), asked now.
+func (h *Hand) current() bool { return h.Current == nil || h.Current() }
 
 // HandOutcome says how a raised hand came down.
 type HandOutcome int
@@ -134,11 +144,24 @@ func (s *Supervisor) dropExpiredLocked(now time.Time) {
 	})
 }
 
+// dropWithdrawnLocked takes down the hands whose membership is no longer
+// current, asking each now: they are withdrawn, never spoken or named.
+func (s *Supervisor) dropWithdrawnLocked() {
+	s.pending = slices.DeleteFunc(s.pending, func(p *pendingAnswer) bool {
+		if p.hand == nil || p.hand.current() {
+			return false
+		}
+		s.handDoneLocked(p, HandWithdrawn)
+		return true
+	})
+}
+
 // handsUpLocked says, in an exchange of its own, which agents of meeting
 // sessionID have a hand up, on "Wispr, who has a hand up?".
 func (s *Supervisor) handsUpLocked(sessionID string) {
 	s.dropEndedLocked()
 	s.dropExpiredLocked(time.Now())
+	s.dropWithdrawnLocked()
 	if !s.cfg.Red() {
 		return
 	}
