@@ -14,11 +14,14 @@ const kwsClips = "../../internal/wake/local/testdata"
 
 // TestKWSSelfTestHearsOnlyTheStartPhrase fails if the release build's
 // self-test passes a build whose spotter does not hear the stored start
-// phrases, or hears the stored stop phrase, or does not time the spotter. In
-// a build with no listener it must fail and say so: the release builds with
-// the listener, and a release without it must not pass.
+// phrases, or hears a stored near miss, or does not time the spotter. In a
+// build with no listener it must fail and say so: the release builds with the
+// listener, and a release without it must not pass.
 func TestKWSSelfTestHearsOnlyTheStartPhrase(t *testing.T) {
-	clips := []string{filepath.Join(kwsClips, "start.wav"), filepath.Join(kwsClips, "ghost-start.wav"), filepath.Join(kwsClips, "stop.wav")}
+	clips, err := filepath.Glob(filepath.Join(kwsClips, "*.wav"))
+	if err != nil || len(clips) < 9 {
+		t.Fatalf("UNKNOWN: %d stored clips (%v), want 9", len(clips), err)
+	}
 	var out, errs bytes.Buffer
 	code := runKWSSelfTest(clips, &out, &errs)
 	if !local.Built {
@@ -27,13 +30,13 @@ func TestKWSSelfTestHearsOnlyTheStartPhrase(t *testing.T) {
 		}
 		return
 	}
-	if code != 0 || strings.Count(out.String(), "PASS kws-selftest") != 3 || !strings.Contains(out.String(), "cpu_seconds_per_audio_second=") {
-		t.Fatalf("exit %d:\n%s%s\nwant three passes and a CPU reading", code, out.String(), errs.String())
+	if code != 0 || strings.Count(out.String(), "PASS kws-selftest") != len(clips) || !strings.Contains(out.String(), "cpu_seconds_per_audio_second=") {
+		t.Fatalf("exit %d:\n%s%s\nwant %d passes and a CPU reading", code, out.String(), errs.String(), len(clips))
 	}
 
-	// Control: the stop clip under a start clip's name must fail the test.
+	// Control: a stop clip under a start clip's name must fail the test.
 	dir := t.TempDir()
-	stop, err := os.ReadFile(filepath.Join(kwsClips, "stop.wav"))
+	stop, err := os.ReadFile(filepath.Join(kwsClips, "stop-vctk23.wav"))
 	if err != nil {
 		t.Fatal(err)
 	}

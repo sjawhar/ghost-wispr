@@ -122,13 +122,12 @@ jobs:
           sha256sum ghost-wispr-linux-arm64 > ghost-wispr-linux-arm64.sha256
 
       # The binary itself, on arm64: its spotter links, loads the embedded model, hears the stored
-      # start phrases and not the stop phrase, and its CPU per second of audio, one thread.
+      # start phrases and none of the stored near misses, and its CPU per second of audio, one thread.
       - name: Self-test the paused listener
         run: |
           ls -l ghost-wispr-linux-arm64
           ldd ghost-wispr-linux-arm64
-          ./ghost-wispr-linux-arm64 kws-selftest internal/wake/local/testdata/start.wav \
-            internal/wake/local/testdata/ghost-start.wav internal/wake/local/testdata/stop.wav
+          ./ghost-wispr-linux-arm64 kws-selftest internal/wake/local/testdata/*.wav
 
       - name: Upload arm64 artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2

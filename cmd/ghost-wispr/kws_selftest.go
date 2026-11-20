@@ -19,7 +19,8 @@ const kwsSelfTestSeconds = 60
 // check, on the architecture it is built for, that the paused listener's
 // spotter links, loads its embedded model and hears the start phrase. Each
 // clip, a stored 16 kHz WAV, plays between seconds of silence: one whose name
-// starts with "stop" must not be heard, and every other must. It then times
+// starts with "start-" or "ghost-start-" must be heard, and every other, a
+// near miss, must not. It then times
 // both stages on kwsSelfTestSeconds of those clips and prints the CPU they
 // take per second of audio. It never opens a microphone.
 func runKWSSelfTest(args []string, stdout, stderr io.Writer) int {
@@ -48,7 +49,8 @@ func runKWSSelfTest(args []string, stdout, stderr io.Writer) int {
 		}
 		audio := slices.Concat(silence, pcm, silence)
 		timing = append(timing, audio...)
-		want := !strings.HasPrefix(filepath.Base(clip), "stop")
+		name := filepath.Base(clip)
+		want := strings.HasPrefix(name, "start-") || strings.HasPrefix(name, "ghost-start-")
 		d.Reset()
 		got := feedSelfTest(d, audio)
 		status := "PASS"
