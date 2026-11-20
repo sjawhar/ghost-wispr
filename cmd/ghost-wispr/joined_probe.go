@@ -71,6 +71,9 @@ func runJoinedProbeCommand(ctx context.Context, args []string, configPath string
 	session, err := envoy.OpenSession(ctx, listener, &envoy.SessionConfig{
 		SessionID: uuid.NewString(), Title: "ghost-wispr joined probe", Dir: "ghost-wispr", Host: host,
 		Plugin: "ghost-wispr-joined-probe", PluginVersion: Version,
+		// Dispatch sends a person's message only to a session that
+		// advertises its delivery mode.
+		Capabilities: []string{"btw"},
 		Deliver: func(_ context.Context, m *envoy.Message) error {
 			p.messages <- m
 			return nil
