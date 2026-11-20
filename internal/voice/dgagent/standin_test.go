@@ -437,21 +437,16 @@ func open(t *testing.T, s *standIn, cfg Config, x voice.Exchange) (voice.Session
 
 // injectSpeech starts a session-owned injection and gives the stand-in its
 // text and audio. Tests that exercise playback use it: unmatched vendor
-// audio is never authorized to reach Output. A reply that ends sends its
-// text first; one left open sends its audio first, since audio after an
-// injection's last text is held until the reply ends.
+// audio is never authorized to reach Output.
 func injectSpeech(t *testing.T, sess voice.Session, c *agentConn, text string, pcm []byte, ended bool) chan error {
 	t.Helper()
 	done := sayAsync(sess, text)
 	c.expect(t, "InjectAgentMessage")
-	if ended {
-		c.send(map[string]any{"type": "ConversationText", "role": "assistant", "content": text})
-		c.sendAudio(pcm)
-		c.send(map[string]any{"type": "AgentAudioDone"})
-		return done
-	}
-	c.sendAudio(pcm)
 	c.send(map[string]any{"type": "ConversationText", "role": "assistant", "content": text})
+	c.sendAudio(pcm)
+	if ended {
+		c.send(map[string]any{"type": "AgentAudioDone"})
+	}
 	return done
 }
 

@@ -358,7 +358,8 @@ func probeOnce(t *testing.T, key, dir string, r probeRun, question, interject []
 		logMu.Unlock()
 	}()
 	logger := slog.New(slog.NewTextHandler(logWriter(func(p []byte) { log("%s", bytes.TrimSpace(p)) }), &slog.HandlerOptions{Level: slog.LevelDebug}))
-	agent, err := New(&Config{APIKey: key, ThinkModel: r.think, Keyterms: []string{"Wispr", "Ghost Wispr"}, Logger: logger})
+	relay := probeRelay(t, filepath.Join(dir, "frames-"+r.name+".jsonl"))
+	agent, err := New(&Config{APIKey: key, URL: relay, ThinkModel: r.think, Keyterms: []string{"Wispr", "Ghost Wispr"}, Logger: logger})
 	if err != nil {
 		t.Fatal(err)
 	}

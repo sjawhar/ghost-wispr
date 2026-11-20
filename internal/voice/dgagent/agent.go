@@ -121,6 +121,7 @@ type Config struct {
 	sayLimit   time.Duration // how long Say waits for Deepgram to speak its words
 	ackLimit   time.Duration // how long Say waits for Deepgram to start an Ack, such as a routing line
 	speechGap  time.Duration // a reply has ended when no more of it came for this long
+	holdTail   time.Duration // how long audio after an injection's last text waits for model text
 	keepAlive  time.Duration // how often the session tells Deepgram it is still there
 	retryGrace time.Duration // how long after a refusal or the room's turn a refused answer is handed over again
 	askerWait  time.Duration // how long after the session opens with no turn heard the asker's words go to Deepgram as text
@@ -152,6 +153,14 @@ const (
 	// streams speech faster than it plays, so a gap this long means the
 	// reply has stopped.
 	speechGap = time.Second
+	// holdTail is how long audio after an injection's last text waits before
+	// it plays. No message names the sentence an audio frame belongs to, so
+	// that audio may be the model's own words after the injection, whose text
+	// Deepgram sends shortly after their first audio; model text within this
+	// time drops what still waits. Model audio leading its text by more plays.
+	// The probe's frame log measures the lead; Deepgram streams audio in real
+	// time, so this is also the delay it adds before such audio plays.
+	holdTail = 250 * time.Millisecond
 	// keepAlive is how often the session tells Deepgram it is still there,
 	// so a stretch with no room audio, such as a closed gate, does not end
 	// it.
@@ -228,6 +237,7 @@ func New(cfg *Config) (*Agent, error) {
 	c.sayLimit = cmp.Or(c.sayLimit, sayLimit)
 	c.ackLimit = cmp.Or(c.ackLimit, ackLimit)
 	c.speechGap = cmp.Or(c.speechGap, speechGap)
+	c.holdTail = cmp.Or(c.holdTail, holdTail)
 	c.keepAlive = cmp.Or(c.keepAlive, keepAlive)
 	c.retryGrace = cmp.Or(c.retryGrace, retryGrace)
 	c.askerWait = cmp.Or(c.askerWait, askerWait)
