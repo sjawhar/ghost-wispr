@@ -144,6 +144,33 @@ type Roster struct {
 	mu      sync.Mutex
 	agents  Agents
 	members map[string]*member // by agent session
+	// ended are the recording sessions that ended or were deleted, newest
+	// last, at most maxEnded: a decision made from a slow read commits
+	// nothing for one of them.
+	ended []string
+}
+
+// maxEnded bounds the ended sessions the roster remembers; a unit records
+// a few meetings a day.
+const maxEnded = 64
+
+// meetingOpenLocked reports whether sessionID is the recording session now
+// and has not ended. Every commit that follows a slow read checks it under
+// r.mu, since the meeting may have ended while the read ran.
+func (r *Roster) meetingOpenLocked(sessionID string) bool {
+	return sessionID != "" && sessionID == r.cfg.Session() && !slices.Contains(r.ended, sessionID)
+}
+
+// endLocked records the sessions of ids as ended.
+func (r *Roster) endLocked(ids []string) {
+	for _, id := range ids {
+		if id != "" && !slices.Contains(r.ended, id) {
+			r.ended = append(r.ended, id)
+		}
+	}
+	if extra := len(r.ended) - maxEnded; extra > 0 {
+		r.ended = slices.Delete(r.ended, 0, extra)
+	}
 }
 
 // New returns an empty Roster; Run keeps its pointers and its sweep going.
@@ -170,13 +197,13 @@ func New(cfg *Config) *Roster {
 func (r *Roster) SetAgents(agents Agents) {
 	if agents == nil {
 		r.mu.Lock()
-		var gone []string
-		for agent := range r.members {
-			gone = append(gone, agent)
+		gone := make(map[string]*member, len(r.members))
+		for agent, m := range r.members {
+			gone[agent] = m
 		}
 		r.mu.Unlock()
-		for _, agent := range gone {
-			if r.leaveQuietly(agent) {
+		for agent, m := range gone {
+			if r.leaveQuietly(agent, m) {
 				r.send(r.ctx, agent, "", "notice", voiceStoppedText)
 			}
 		}
@@ -334,6 +361,13 @@ func (r *Roster) join(ctx context.Context, m *envoy.Message, key string) {
 	}
 	now := r.cfg.Now()
 	r.mu.Lock()
+	// The reads above are slow: the meeting may have ended, or been
+	// deleted, while they ran, and an ended meeting takes no agent.
+	if !r.meetingOpenLocked(sessionID) {
+		r.mu.Unlock()
+		r.reply(ctx, m, "refused", meetingWentText)
+		return
+	}
 	old := r.members[agent]
 	joined := &member{Member: Member{Agent: agent, IssueKey: key, Title: title, SessionID: sessionID, JoinedAt: now}, name: name, words: titleWords(title)}
 	again := old != nil && old.SessionID == sessionID
@@ -367,19 +401,9 @@ func (r *Roster) floor(ctx context.Context, m *envoy.Message, draft string) {
 	now := r.cfg.Now()
 	r.mu.Lock()
 	joined := r.members[agent]
-	if joined == nil || joined.SessionID != r.cfg.Session() {
+	if joined == nil || !r.meetingOpenLocked(joined.SessionID) {
 		r.mu.Unlock()
 		r.reply(ctx, m, "refused", notJoinedText)
-		return
-	}
-	if joined.floorEvent == m.EventID {
-		r.mu.Unlock()
-		return // a redelivery of the request already taken
-	}
-	if !joined.lastFloor.IsZero() && now.Sub(joined.lastFloor) < r.cfg.FloorEvery {
-		next := joined.lastFloor.Add(r.cfg.FloorEvery)
-		r.mu.Unlock()
-		r.reply(ctx, m, "refused", fmt.Sprintf("You may ask for the floor at most once in %s, so this request was not taken. You may ask again from %s UTC.", every(r.cfg.FloorEvery), next.UTC().Format("15:04:05")))
 		return
 	}
 	hand := &voice.Hand{ID: m.EventID, SessionID: joined.SessionID, Agent: agent, IssueKey: joined.IssueKey, Name: joined.name}
@@ -407,7 +431,33 @@ func (r *Roster) floor(ctx context.Context, m *envoy.Message, draft string) {
 		raised = m.IssuedAt
 	}
 	hand.Expires = raised.Add(r.cfg.FloorExpiry)
-	if err := r.cfg.Floor.RaiseHand(hand); err != nil {
+
+	// The hand is raised under r.mu, on the membership read above if it is
+	// still the agent's, in a meeting still open: a leave or a meeting's end
+	// meanwhile takes the request with it, and one after lowers the hand.
+	// The Supervisor never calls the roster under its own lock, so holding
+	// r.mu across RaiseHand cannot deadlock.
+	r.mu.Lock()
+	switch {
+	case r.members[agent] != joined || !r.meetingOpenLocked(joined.SessionID):
+		r.mu.Unlock()
+		r.reply(ctx, m, "refused", notJoinedText)
+		return
+	case joined.floorEvent == m.EventID:
+		r.mu.Unlock()
+		return // a redelivery of the request already taken
+	case !joined.lastFloor.IsZero() && now.Sub(joined.lastFloor) < r.cfg.FloorEvery:
+		next := joined.lastFloor.Add(r.cfg.FloorEvery)
+		r.mu.Unlock()
+		r.reply(ctx, m, "refused", fmt.Sprintf("You may ask for the floor at most once in %s, so this request was not taken. You may ask again from %s UTC.", every(r.cfg.FloorEvery), next.UTC().Format("15:04:05")))
+		return
+	}
+	err := r.cfg.Floor.RaiseHand(hand)
+	if err == nil {
+		joined.lastFloor, joined.floorEvent = now, m.EventID
+	}
+	r.mu.Unlock()
+	if err != nil {
 		text := fmt.Sprintf("Your floor request was not taken: %v.", err)
 		if errors.Is(err, voice.ErrHandExpired) {
 			text = fmt.Sprintf("Your floor request reached the room more than %s after you sent it, so it was dropped. Ask again if the room still needs to hear it.", every(r.cfg.FloorExpiry))
@@ -415,28 +465,29 @@ func (r *Roster) floor(ctx context.Context, m *envoy.Message, draft string) {
 		r.reply(ctx, m, "refused", text)
 		return
 	}
-	r.mu.Lock()
-	if current := r.members[agent]; current == joined {
-		joined.lastFloor, joined.floorEvent = now, m.EventID
-	}
-	r.mu.Unlock()
 	r.logf("joined: an agent of meeting %s asked for the floor", hand.SessionID)
 }
 
 // leave takes agent off the roster and lowers its hands; a reason is sent to
 // it as a notice.
-func (r *Roster) leave(agent, reason string) {
-	if r.leaveQuietly(agent) && reason != "" {
+func (r *Roster) leave(agent, reason string) { r.leaveMember(agent, nil, reason) }
+
+// leaveMember takes agent off the roster, as leave does, when its membership
+// is still want (any membership for nil): a decision made from an earlier
+// read never takes a membership that began since.
+func (r *Roster) leaveMember(agent string, want *member, reason string) {
+	if r.leaveQuietly(agent, want) && reason != "" {
 		r.async(func(ctx context.Context) { r.send(ctx, agent, "", "notice", reason) })
 	}
 }
 
 // leaveQuietly takes agent off the roster, lowers its hands and tells the
-// pages, and reports whether it was joined.
-func (r *Roster) leaveQuietly(agent string) bool {
+// pages, and reports whether it was joined; with want set, only while its
+// membership is want.
+func (r *Roster) leaveQuietly(agent string, want *member) bool {
 	r.mu.Lock()
 	joined := r.members[agent]
-	if joined == nil {
+	if joined == nil || (want != nil && joined != want) {
 		r.mu.Unlock()
 		return false
 	}
@@ -462,15 +513,16 @@ func (r *Roster) SessionsDeleted(ids []string) { r.leaveMeetings(ids, deletedTex
 
 func (r *Roster) leaveMeetings(ids []string, reason string) {
 	r.mu.Lock()
-	var gone []string
+	r.endLocked(ids) // a join or a segment still in its reads commits nothing for them
+	gone := map[string]*member{}
 	for agent, m := range r.members {
 		if slices.Contains(ids, m.SessionID) {
-			gone = append(gone, agent)
+			gone[agent] = m
 		}
 	}
 	r.mu.Unlock()
-	for _, agent := range gone {
-		r.leave(agent, reason)
+	for agent, m := range gone {
+		r.leaveMember(agent, m, reason)
 	}
 }
 
@@ -482,12 +534,12 @@ func (r *Roster) Sweep(ctx context.Context) {
 		return
 	}
 	r.mu.Lock()
-	ids := make([]string, 0, len(r.members))
-	for agent := range r.members {
-		ids = append(ids, agent)
+	read := make(map[string]*member, len(r.members))
+	for agent, m := range r.members {
+		read[agent] = m
 	}
 	r.mu.Unlock()
-	for _, agent := range ids {
+	for agent, target := range read {
 		info, err := agents.Lookup(ctx, agent)
 		if err != nil {
 			r.logf("joined: read whether a joined agent is live: %v", err)
@@ -495,10 +547,12 @@ func (r *Roster) Sweep(ctx context.Context) {
 		}
 		now := r.cfg.Now()
 		r.mu.Lock()
+		// The lookup is slow: it counts only toward the membership it was
+		// made for, not one that began since.
 		joined := r.members[agent]
 		gone := false
 		switch {
-		case joined == nil:
+		case joined == nil || joined != target:
 		case info.State == envoy.StateLive:
 			joined.notLiveSince = time.Time{}
 		case joined.notLiveSince.IsZero():
@@ -508,7 +562,7 @@ func (r *Roster) Sweep(ctx context.Context) {
 		}
 		r.mu.Unlock()
 		if gone {
-			r.leave(agent, notLiveText)
+			r.leaveMember(agent, target, notLiveText)
 		}
 	}
 }
@@ -524,6 +578,10 @@ func (r *Roster) OnSegment(s *voice.Segment) {
 	now := r.cfg.Now()
 	var sends []*pointer
 	r.mu.Lock()
+	if !r.meetingOpenLocked(s.SessionID) {
+		r.mu.Unlock()
+		return // its meeting ended while the segment was on its way
+	}
 	for _, m := range r.members {
 		if m.SessionID != s.SessionID || !m.comesUp(s.Text) {
 			continue

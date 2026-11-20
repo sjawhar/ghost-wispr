@@ -142,4 +142,5 @@ const (
 	notLiveText      = "Envoy listed your session as not live for 10 minutes, so you left the meeting Ghost Wispr records. Join again if a person asks you to."
 	voiceStoppedText = "Ghost Wispr's meeting voice stopped, so you left the meeting it records. Join again if a person asks you to."
 	goneJoinText     = "Envoy lists your session as gone, so you did not join: Ghost Wispr could not reach you. Join again from a live session."
+	meetingWentText  = "The meeting ended while your join was on its way, so you did not join it. Join again if a person asks you to during a meeting."
 )

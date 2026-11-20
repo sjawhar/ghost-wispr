@@ -22,6 +22,8 @@ type fakeAgents struct {
 	mu     sync.Mutex
 	states map[string]envoy.SessionInfo
 	sent   []envoy.SendRequest
+	// beforeLookup, when set, runs before each lookup answers, outside mu.
+	beforeLookup func(id string)
 }
 
 func newFakeAgents() *fakeAgents { return &fakeAgents{states: map[string]envoy.SessionInfo{}} }
@@ -29,6 +31,12 @@ func newFakeAgents() *fakeAgents { return &fakeAgents{states: map[string]envoy.S
 func (f *fakeAgents) ID() string { return "unit-session" }
 
 func (f *fakeAgents) Lookup(_ context.Context, id string) (envoy.SessionInfo, error) {
+	f.mu.Lock()
+	hook := f.beforeLookup
+	f.mu.Unlock()
+	if hook != nil {
+		hook(id)
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if info, ok := f.states[id]; ok {
@@ -63,28 +71,63 @@ func (f *fakeAgents) to(agent string) []envoy.SendRequest {
 	return out
 }
 
-// fakeFloor is the Supervisor as the roster raises hands on it.
+// fakeFloor is the Supervisor as the roster raises hands on it. events holds
+// each raise and lower in order, "raise:<agent>" and "lower:<agent>".
 type fakeFloor struct {
 	mu      sync.Mutex
 	raised  []*voice.Hand
 	lowered []string
+	events  []string
 	err     error
+	// beforeRaise and beforeLower, when set, run first, outside mu.
+	beforeRaise func(h *voice.Hand)
+	beforeLower func(agent string)
 }
 
 func (f *fakeFloor) RaiseHand(h *voice.Hand) error {
+	f.mu.Lock()
+	hook := f.beforeRaise
+	f.mu.Unlock()
+	if hook != nil {
+		hook(h)
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.err != nil {
 		return f.err
 	}
 	f.raised = append(f.raised, h)
+	f.events = append(f.events, "raise:"+h.Agent)
 	return nil
 }
 
 func (f *fakeFloor) LowerHands(agent string) {
 	f.mu.Lock()
+	hook := f.beforeLower
+	f.mu.Unlock()
+	if hook != nil {
+		hook(agent)
+	}
+	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.lowered = append(f.lowered, agent)
+	f.events = append(f.events, "lower:"+agent)
+}
+
+// handUp reports whether agent's last raise came after its last lower.
+func (f *fakeFloor) handUp(agent string) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	up := false
+	for _, e := range f.events {
+		switch e {
+		case "raise:" + agent:
+			up = true
+		case "lower:" + agent:
+			up = false
+		}
+	}
+	return up
 }
 
 func (f *fakeFloor) hands() []*voice.Hand {
