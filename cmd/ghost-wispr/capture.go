@@ -561,7 +561,7 @@ func (g *captureGate) resumeWith(t resumeTicket, persist func() error) error {
 
 	g.mu.Lock()
 	overtaken := g.pauses != t.pauses ||
-		(t.fromListener && !(g.switchOff && g.listening && g.stretch == t.stretch))
+		(t.fromListener && (!g.switchOff || !g.listening || g.stretch != t.stretch))
 	g.mu.Unlock()
 	if overtaken {
 		return errResumeOvertaken
