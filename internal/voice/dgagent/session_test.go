@@ -1681,25 +1681,33 @@ func TestInterruptSendsTheHeldAudioBeforeTheNextReply(t *testing.T) {
 // audio stops with no AgentAudioDone, as when Deepgram cut it for someone
 // who spoke, keeps the voice speaking and the room silenced for good; or if
 // the next reply after an interrupted one that Deepgram stopped is not
-// played.
+// played. Each reply's text comes first, so its audio is held after the
+// text and plays once no audio has come for the speech gap.
 func TestSpeechEndsWhenDeepgramStopsSending(t *testing.T) {
 	setSpeechGap(t, 300*time.Millisecond)
 	s := startStandIn(t)
 	out := newFakeOutput()
 	sess, c, _ := open(t, s, Config{}, voice.Exchange{Out: out, Tools: tools(nil)})
-	first := injectSpeech(t, sess, c, "First.", tone(OutputRate, 20*time.Millisecond, 100), false)
+	sayOpen := func(text string, pcm []byte) chan error {
+		done := sayAsync(sess, text)
+		c.expect(t, "InjectAgentMessage")
+		c.send(map[string]any{"type": "ConversationText", "role": "assistant", "content": text})
+		c.sendAudio(pcm)
+		return done
+	}
+	first := sayOpen("First.", tone(OutputRate, 20*time.Millisecond, 100))
 	waitEvent(t, sess, voice.EventSpeechStarted)
 	waitEvent(t, sess, voice.EventSpeechEnded)
 	_ = returned(t, first)
 
-	second := injectSpeech(t, sess, c, "Second.", tone(OutputRate, 20*time.Millisecond, 200), false)
+	second := sayOpen("Second.", tone(OutputRate, 20*time.Millisecond, 200))
 	waitEvent(t, sess, voice.EventSpeechStarted)
 	sess.Interrupt()
 	_ = returned(t, second)
 	waitEvent(t, sess, voice.EventSpeechEnded)
 	time.Sleep(500 * time.Millisecond) // Deepgram sent nothing more of it
 	next := tone(OutputRate, 20*time.Millisecond, 300)
-	nextDone := injectSpeech(t, sess, c, "Next.", next, false)
+	nextDone := sayOpen("Next.", next)
 	waitEvent(t, sess, voice.EventSpeechStarted)
 	plays := out.playbacks()
 	last := plays[len(plays)-1]
