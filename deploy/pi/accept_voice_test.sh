@@ -1817,6 +1817,7 @@ for line in 'PASS: states: ghost-wispr.service runs with LimitCORE=0 and MemoryS
   'PASS: states: listening: no socket to Deepgram or OpenAI' \
   'PASS: states: listening: 0 bytes to the Envoy hub (envoy.example)' \
   'NOTE: states: listening: a socket to 198.51.100.7:443, not counted' \
+  'NOTE: states: listening: a socket to the Envoy hub at 192.0.2.10:4222, read by its bytes below' \
   'PASS: states: "Wispr, start recording" in listening: recording' \
   'PASS: states: the power button from recording: listening' \
   'PASS: states: the power button from listening: recording' \

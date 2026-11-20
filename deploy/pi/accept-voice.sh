@@ -2042,28 +2042,7 @@ hub_bytes() {
 # the phrase: registration and keepalives, never a message. Every other socket, such as Google's for
 # Drive and Vertex, is listed and not counted.
 check_listening_sends_nothing() {
-  local sockets peer kind vendors=0 envoy_url host addresses before after deadline
-  sockets=$(unit_sockets) || unknown "$step: cannot read the service's sockets with ss"
-  while read -r _ peer _; do
-    [[ -n $peer ]] || continue
-    kind=other
-    if [[ $peer == *:443 ]]; then
-      if serves "$peer" api.deepgram.com; then
-        kind=Deepgram
-      elif serves "$peer" api.openai.com; then
-        kind=OpenAI
-      fi
-    fi
-    if [[ $kind == other ]]; then
-      note "$step: listening: a socket to $peer, not counted"
-    else
-      printf 'FAIL: %s: listening: the service holds a socket to %s at %s\n' "$step" "$kind" "$peer"
-      vendors=$((vendors + 1))
-    fi
-  done <<<"$sockets"
-  ((vendors == 0)) || fail "$step: listening: $vendors socket(s) to a voice vendor"
-  pass "$step: listening: no socket to Deepgram or OpenAI"
-
+  local sockets peer address kind vendors=0 envoy_url host addresses before after deadline
   envoy_url=$(setting GHOST_WISPR_CONCIERGE_ENVOY_URL concierge envoy_url) \
     || unknown "$step: the unit names no Envoy hub (concierge.envoy_url)"
   host=${envoy_url#*://}
@@ -2071,6 +2050,34 @@ check_listening_sends_nothing() {
   host=${host%:*}
   addresses=$(getent ahosts "$host" | awk '{ print $1 }' | LC_ALL=C sort -u | paste -sd ' ' -)
   [[ -n $addresses ]] || unknown "$step: $host, the Envoy hub, resolves to no address"
+  sockets=$(unit_sockets) || unknown "$step: cannot read the service's sockets with ss"
+  while read -r _ peer _; do
+    [[ -n $peer ]] || continue
+    address=${peer%:*}
+    address=${address#[}
+    address=${address%]}
+    kind=other
+    if [[ " $addresses " == *" $address "* ]]; then
+      kind=hub
+    elif [[ $peer == *:443 ]]; then
+      if serves "$peer" api.deepgram.com; then
+        kind=Deepgram
+      elif serves "$peer" api.openai.com; then
+        kind=OpenAI
+      fi
+    fi
+    case $kind in
+      hub) note "$step: listening: a socket to the Envoy hub at $peer, read by its bytes below" ;;
+      other) note "$step: listening: a socket to $peer, not counted" ;;
+      *)
+        printf 'FAIL: %s: listening: the service holds a socket to %s at %s\n' "$step" "$kind" "$peer"
+        vendors=$((vendors + 1))
+        ;;
+    esac
+  done <<<"$sockets"
+  ((vendors == 0)) || fail "$step: listening: $vendors socket(s) to a voice vendor"
+  pass "$step: listening: no socket to Deepgram or OpenAI"
+
   before=$(hub_bytes "$addresses")
   deadline=$(($(now_ms) + hub_seconds * 1000))
   while (($(now_ms) < deadline)); do
