@@ -44,8 +44,9 @@ readonly recording_times
 # room's own level (calibrate_rig).
 readonly loopback_threshold_db=-50
 readonly silence_seconds=0.15 silence_ms=150
-# The voice's sounds last at most 400 ms, so speech is a sound that starts at least that long after
-# the chime starts.
+# The sound after voice_wake, the wake sound, lasts at most 400 ms, so speech is a sound that starts
+# at least that long after the chime starts. (The answer sound lasts 660 ms; it plays only once an
+# agent's answer is ready.)
 readonly sound_max_ms=400
 # The wake chime lasts 240 ms (internal/voice/chime.go); at the rig, with the room's echo, a sound
 # longer than this is not the chime alone.

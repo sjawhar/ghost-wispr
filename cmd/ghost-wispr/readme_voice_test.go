@@ -39,7 +39,7 @@ func TestReadmeStatesVoiceConsent(t *testing.T) {
 		// R7 and R10: when an answer may speak, and the sounds.
 		"It speaks by itself only when nobody has spoken since the question and the light still reads red",
 		"Every gate closing, a pause or a light hold, ends the recording session, and an ended session's answers are never spoken: they stay in writing on that session's page",
-		"Wispr plays a three-note sound after a second in which nobody speaks",
+		"Wispr plays a rising three-note sound twice after a second in which nobody speaks",
 		"For 6 s after Wispr's answer, a follow-up that the transcript ends with a question mark needs no wake phrase",
 		"Anything else said in those 6 s is side talk: no voice answers it, and nothing of it goes to Dispatch",
 		"the live Deepgram request carries them, and Dispatch's project keys, as Nova-3 keyterms",
