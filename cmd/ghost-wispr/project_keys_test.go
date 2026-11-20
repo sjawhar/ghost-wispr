@@ -3,13 +3,14 @@ package main
 import (
 	"context"
 	"errors"
-	"fmt"
+	"log/slog"
 	"slices"
-	"sync"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/sjawhar/ghost-wispr/internal/config"
+	"github.com/sjawhar/ghost-wispr/internal/logtest"
 )
 
 // TestLiveOptionsCarryTheProjectKeys fails if Dispatch's project keys are
@@ -43,7 +44,7 @@ func TestProjectKeysAreReadDaily(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	var keys projectKeys
-	watchProjectKeys(ctx, read, 10*time.Millisecond, &keys, t.Logf)
+	watchProjectKeys(ctx, read, 10*time.Millisecond, &keys)
 	waitKeys := func(want []string) {
 		t.Helper()
 		deadline := time.Now().Add(2 * time.Second)
@@ -78,9 +79,30 @@ func TestProjectKeysDoNotHoldTheStart(t *testing.T) {
 	t.Cleanup(cancel)
 	var keys projectKeys
 	start := time.Now()
-	watchProjectKeys(ctx, read, time.Hour, &keys, t.Logf)
+	watchProjectKeys(ctx, read, time.Hour, &keys)
 	if took := time.Since(start); took > 100*time.Millisecond {
 		t.Fatalf("reading the project keys held the start %v", took)
+	}
+}
+
+// TestAFailedProjectKeysReadWarns fails if a read of the project keys that
+// fails while the watcher runs is not a WARN record, which a unit with
+// log_level: warn keeps. It is also the control of
+// TestProjectKeysLogNothingOnceStopped: the record that test looks for.
+func TestAFailedProjectKeysReadWarns(t *testing.T) {
+	logged := logtest.Capture(t)
+	read := func(context.Context) ([]string, error) { return nil, errors.New("dispatch: no answer") }
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	var keys projectKeys
+	watchProjectKeys(ctx, read, time.Hour, &keys)
+	deadline := time.Now().Add(2 * time.Second)
+	for len(projectKeysRecords(logged)) == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	records := projectKeysRecords(logged)
+	if len(records) != 1 || records[0].Level != slog.LevelWarn.String() || records[0].Attrs["error"] != "dispatch: no answer" {
+		t.Fatalf("records of the failed read = %+v, want one WARN record with its error", records)
 	}
 }
 
@@ -89,24 +111,28 @@ func TestProjectKeysDoNotHoldTheStart(t *testing.T) {
 // then, and in tests it ran past the test's end (the data race seen once at
 // 8e6a143 and again in a 10-run pass, project_keys.go:44).
 func TestProjectKeysLogNothingOnceStopped(t *testing.T) {
-	var mu sync.Mutex
-	var logs []string
+	logged := logtest.Capture(t)
 	read := func(ctx context.Context) ([]string, error) {
 		<-ctx.Done()
 		return nil, errors.New("dispatch: no answer")
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	var keys projectKeys
-	watchProjectKeys(ctx, read, time.Hour, &keys, func(format string, args ...any) {
-		mu.Lock()
-		defer mu.Unlock()
-		logs = append(logs, fmt.Sprintf(format, args...))
-	})
+	watchProjectKeys(ctx, read, time.Hour, &keys)
 	cancel()
 	time.Sleep(200 * time.Millisecond)
-	mu.Lock()
-	defer mu.Unlock()
-	if len(logs) != 0 {
-		t.Fatalf("the stopped watcher logged %q", logs)
+	if records := projectKeysRecords(logged); len(records) != 0 {
+		t.Fatalf("the stopped watcher logged %+v", records)
 	}
+}
+
+// projectKeysRecords returns the records the project keys watcher wrote.
+func projectKeysRecords(logged *logtest.Log) []logtest.Record {
+	var records []logtest.Record
+	for _, record := range logged.Records() {
+		if strings.Contains(record.Message, "project keys") {
+			records = append(records, record)
+		}
+	}
+	return records
 }

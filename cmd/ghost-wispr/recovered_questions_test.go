@@ -21,7 +21,7 @@ func TestARecoveredSessionsQuestionsAreCancelled(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	cancelRecoveredQuestions(store, []string{"recovered"}, t.Logf)
+	cancelRecoveredQuestions(store, []string{"recovered"})
 	for id, want := range map[string]storage.VoiceTaskState{"recovered": storage.VoiceTaskCancelled, "other": storage.VoiceTaskWorking} {
 		task, err := store.VoiceTask("task-" + id)
 		if err != nil {

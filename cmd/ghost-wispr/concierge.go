@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
 	"log/slog"
 	"sync"
 	"time"
@@ -189,7 +188,7 @@ func (h *conciergeHooks) get() conciergeSessions {
 func (h *conciergeHooks) SessionEnded(sessionID string) {
 	if c := h.get(); c != nil {
 		if err := c.SessionEnded(sessionID); err != nil {
-			log.Printf("warning: concierge: cancel the questions of ended session %s: %v", sessionID, err)
+			slog.Warn("concierge: cancel the questions of an ended session", "session_id", sessionID, "error", err)
 		}
 	}
 }
@@ -217,10 +216,10 @@ func (h *conciergeHooks) GateClosed() {
 // cancelRecoveredQuestions cancels the questions still working of each session
 // the start-up recovery ended, as a session end does while the unit runs: their
 // late answers stay on the session's page and are never announced.
-func cancelRecoveredQuestions(store *storage.SQLiteStore, sessionIDs []string, logf func(string, ...any)) {
+func cancelRecoveredQuestions(store *storage.SQLiteStore, sessionIDs []string) {
 	for _, id := range sessionIDs {
 		if _, err := store.CancelWorkingVoiceTasks(id); err != nil {
-			logf("warning: cancel the questions of recovered session %s: %v", id, err)
+			slog.Warn("cancel the questions of a recovered session", "session_id", id, "error", err)
 		}
 	}
 }

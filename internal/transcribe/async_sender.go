@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"log/slog"
 	"sync/atomic"
 	"time"
 )
@@ -90,7 +91,7 @@ func (s *AsyncSender) Write(p []byte) (int, error) {
 			s.watcher.sendQueueDropped(int64(len(p)))
 		}
 		if s.dropped.Add(1) == 1 {
-			s.log("warning: live transcription is behind; dropping audio for it (the recording keeps it)")
+			slog.Warn("live transcription is behind; dropping audio for it (the recording keeps it)")
 		}
 	}
 	return len(p), nil

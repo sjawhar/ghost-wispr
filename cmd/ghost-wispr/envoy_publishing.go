@@ -95,7 +95,7 @@ func (e *envoyPublishing) publishSummaryReady(sessionID string) {
 	}
 	go func() {
 		if err := pub.PublishSummaryReady(context.Background(), sessionID); err != nil {
-			log.Printf("warning: envoy publish failed for %s: %v", sessionID, err)
+			slog.Warn("envoy publish failed", "session_id", sessionID, "error", err)
 		}
 	}()
 }
@@ -111,7 +111,7 @@ func (e *envoyPublishing) publishRecoveredEnds(ids []string) {
 	go func() {
 		for _, sessionID := range ids {
 			if err := pub.PublishSessionEnded(context.Background(), sessionID); err != nil {
-				log.Printf("warning: failed to publish recovered session end for %s: %v", sessionID, err)
+				slog.Warn("failed to publish recovered session end", "session_id", sessionID, "error", err)
 			}
 		}
 	}()

@@ -208,7 +208,7 @@ func TestAResumedMicrophoneOpensOnlyAfterTheLightReadsRed(t *testing.T) {
 		time.Sleep(portAudioOpenTook)
 		opened <- device.snapshot()
 		mic.open.Store(true)
-		return startOpenedMic(capture, &scriptedStartMic{}, func() { mic.open.Store(false) }, func(string, ...any) {})
+		return startOpenedMic(capture, &scriptedStartMic{}, func() { mic.open.Store(false) })
 	}, func() {})
 
 	if err := capture.RequestResume(); err != nil {

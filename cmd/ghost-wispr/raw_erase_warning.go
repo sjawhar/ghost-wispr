@@ -2,7 +2,7 @@ package main
 
 import (
 	"fmt"
-	"log"
+	"log/slog"
 	"path/filepath"
 
 	"github.com/sjawhar/ghost-wispr/internal/storage"
@@ -32,7 +32,7 @@ func refreshRawEraseReservationWarnings(store rawEraseReservationStore, registry
 		key := rawEraseReservationWarningKeyPrefix + reservation.SessionID + "-" + reservation.HiddenPath
 		exists, err := store.HasSession(reservation.SessionID)
 		if err != nil {
-			log.Printf("warning: could not check whether session %s of a raw erase reservation exists: %v", reservation.SessionID, err)
+			slog.Warn("could not check whether the session of a raw erase reservation exists", "session_id", reservation.SessionID, "error", err)
 		}
 		if err == nil && exists {
 			warnings[key] = fmt.Sprintf(

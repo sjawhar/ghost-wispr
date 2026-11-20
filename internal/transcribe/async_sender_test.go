@@ -2,11 +2,14 @@ package transcribe
 
 import (
 	"context"
+	"log/slog"
 	"slices"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/sjawhar/ghost-wispr/internal/logtest"
 )
 
 // blockingDestination is a live-transcription socket whose writes wait for
@@ -45,13 +48,8 @@ func TestAsyncSenderDropsWhenFullWithoutBlocking(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	dst := &blockingDestination{release: make(chan struct{})}
-	var logged []string
-	var logMu sync.Mutex
-	sender := NewAsyncSender(ctx, dst, 2, func(format string, _ ...any) {
-		logMu.Lock()
-		defer logMu.Unlock()
-		logged = append(logged, format)
-	})
+	logged := logtest.Capture(t)
+	sender := NewAsyncSender(ctx, dst, 2, nil)
 
 	done := make(chan struct{})
 	go func() {
@@ -78,10 +76,8 @@ func TestAsyncSenderDropsWhenFullWithoutBlocking(t *testing.T) {
 	if got := dst.calls(); !slices.Equal(got, []string{"a", "b"}) {
 		t.Fatalf("socket got %q, want the two chunks the queue held, in order", got)
 	}
-	logMu.Lock()
-	defer logMu.Unlock()
-	if !slices.ContainsFunc(logged, func(line string) bool { return strings.Contains(line, "dropping audio") }) {
-		t.Fatalf("logs = %q, want one saying live transcription drops audio", logged)
+	if !slices.ContainsFunc(logged.At(slog.LevelWarn), func(record logtest.Record) bool { return strings.Contains(record.Message, "dropping audio") }) {
+		t.Fatalf("logs = %+v, want a warning saying live transcription drops audio", logged.Records())
 	}
 }
 

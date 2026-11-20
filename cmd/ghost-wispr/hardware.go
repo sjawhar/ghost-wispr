@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"log/slog"
 	"os"
 	"sync"
 	"sync/atomic"
@@ -220,7 +221,7 @@ func (t *buttonToggle) press(keepPaused func() bool, after func()) <-chan struct
 			defer close(done)
 			defer t.endResume(generation)
 			if err := t.controls.Resume(); err != nil {
-				log.Printf("warning: %s toggle: %v", t.name, err)
+				slog.Warn("button toggle failed", "button", t.name, "error", err)
 			} else if t.controls.OnStatusChanged != nil {
 				t.controls.OnStatusChanged(false)
 			}
@@ -233,7 +234,7 @@ func (t *buttonToggle) press(keepPaused func() bool, after func()) <-chan struct
 			t.controls.OnStatusChanged(true)
 		}
 		if err != nil {
-			log.Printf("warning: %s toggle: %v", t.name, err)
+			slog.Warn("button toggle failed", "button", t.name, "error", err)
 		}
 		close(done)
 	}
@@ -877,14 +878,14 @@ func runPowerButton(ctx context.Context, capture *captureGate, controls *server.
 	for ctx.Err() == nil {
 		path, err := powerbutton.FindDevice(inputDevices, inputDevRoot)
 		if err != nil {
-			log.Printf("warning: find power button: %v", err)
+			slog.Warn("find power button", "error", err)
 			warnings.Set("power-button", powerButtonWarning(err))
 			waitForHardwareRetry(ctx)
 			continue
 		}
 		file, err := os.Open(path)
 		if err != nil {
-			log.Printf("warning: open power button: %v", err)
+			slog.Warn("open power button", "error", err)
 			warnings.Set("power-button", powerButtonWarning(err))
 			waitForHardwareRetry(ctx)
 			continue
@@ -915,7 +916,7 @@ func runPowerButton(ctx context.Context, capture *captureGate, controls *server.
 				cancelDevice()
 				_ = file.Close()
 				if err != nil {
-					log.Printf("warning: read power button: %v", err)
+					slog.Warn("read power button", "error", err)
 				}
 				warnings.Set("power-button", powerButtonWarning(err))
 				waitForHardwareRetry(ctx)

@@ -5,7 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"os"
 	"sync"
 	"time"
@@ -117,7 +117,7 @@ func (b *jabraMuteButton) run(ctx context.Context) {
 			return
 		}
 		if text := jabraMuteButtonWarning(err); text != warned {
-			log.Printf("warning: Jabra mute button: %v", err)
+			slog.Warn("Jabra mute button", "error", err)
 			warned = text
 		}
 		b.warnings.Set(jabraWarningKey, warned)

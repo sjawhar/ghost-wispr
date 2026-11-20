@@ -1,16 +1,16 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"errors"
-	"log"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/sjawhar/ghost-wispr/internal/logtest"
 	"github.com/sjawhar/ghost-wispr/internal/storage"
 )
 
@@ -48,16 +48,17 @@ func TestR7StartupPendingSpliceWarningsHaveDistinctStatusKeys(t *testing.T) {
 
 func TestR7PendingSpliceFailureLogsItsSpan(t *testing.T) {
 	registry := newWarningsRegistry()
-	var output bytes.Buffer
-	previousOutput := log.Writer()
-	log.SetOutput(&output)
-	t.Cleanup(func() { log.SetOutput(previousOutput) })
+	logged := logtest.Capture(t)
 
 	span := storage.DeletedSpan{SessionID: "session-42", AudioPath: "/recordings/meeting.mp3"}
 	applyPendingSpliceRecoveryWarnings(registry, []pendingSpliceOutcome{{Span: span, Err: errors.New("splicing failed")}})
 
-	if entry := output.String(); !strings.Contains(entry, span.SessionID) || !strings.Contains(entry, span.AudioPath) {
-		t.Fatalf("pending splice log = %q, want session and recording", entry)
+	warned := logged.At(slog.LevelWarn)
+	if len(warned) != 1 || warned[0].Message != "pending segment splice failed" {
+		t.Fatalf("pending splice log = %+v, want one warning that the splice failed", logged.Records())
+	}
+	if got := warned[0].Attrs; got["session_id"] != span.SessionID || got["recording"] != span.AudioPath || got["error"] != "splicing failed" {
+		t.Fatalf("pending splice warning attributes = %v, want session %s, recording %s and the error", got, span.SessionID, span.AudioPath)
 	}
 }
 

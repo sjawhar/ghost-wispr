@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"log/slog"
 	"slices"
 	"sync"
 	"time"
@@ -35,7 +36,7 @@ func (p *projectKeys) set(keys []string) {
 // background until ctx ends, so a Dispatch out of reach never holds the
 // start; a live request dialled before the first read answers carries no
 // project keys. A read that fails keeps the keys known.
-func watchProjectKeys(ctx context.Context, read func(context.Context) ([]string, error), every time.Duration, keys *projectKeys, logf func(string, ...any)) {
+func watchProjectKeys(ctx context.Context, read func(context.Context) ([]string, error), every time.Duration, keys *projectKeys) {
 	refresh := func() {
 		readCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 		defer cancel()
@@ -44,7 +45,7 @@ func watchProjectKeys(ctx context.Context, read func(context.Context) ([]string,
 			if ctx.Err() != nil {
 				return // stopped, as at shutdown: nothing to warn of
 			}
-			logf("warning: read Dispatch's project keys, for the voice's keyterms: %v", err)
+			slog.Warn("read Dispatch's project keys, for the voice's keyterms", "error", err)
 			return
 		}
 		keys.set(got)
