@@ -9,20 +9,34 @@
 # log lines, the sounds the speaker plays, and the questions to agents. A stop cuts a sound and the
 # events it would still have caused. The fake curl streams /ws from the timeline, the fake journalctl
 # prints its journal, the fake ffmpeg reports its sounds in a recording, and the fake service writes
-# the speaker's /proc status from it. The fake journalctl is the Pi's: it has no user journal, the
-# system journal needs root, and each record goes through logging.New, the logger the service writes
-# its journal with (deploy/pi/journalrecords), so a driver that reads another journal, another
-# process's lines or another key reads nothing. Each step runs once as it should pass and once
-# against its verification check's negative control. Cases run in parallel; each records its
-# failures, and the run goes on, so that one run shows every assertion that fails.
+# the speaker's /proc status from it. With that status, the service applies the voice's stops and
+# XRUNs itself, so that what the driver reads does not hang on how soon a loaded machine runs a fake:
+# a stop line comes only once the status shows the drop, and an XRUN lasts exactly one read of the
+# status. The fake journalctl is the Pi's: it has no user journal, the system journal needs root,
+# and each record goes through logging.New, the logger the service writes its journal with
+# (deploy/pi/journalrecords), so a driver that reads another journal, another process's lines or
+# another key reads nothing. Each step runs once as it should pass and once against its
+# verification check's negative control. Cases run in parallel; each records its failures, and the
+# run goes on, so that one run shows every assertion that fails.
 set -uo pipefail
 
 repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 readonly repo_root
 readonly driver="$repo_root/deploy/pi/accept-voice.sh"
 readonly literals_test="$repo_root/tests/public_literals_test.go"
-# Cases run in parallel, as many as the machine has cores, at most 8.
-readonly max_jobs=${GW_TEST_JOBS:-$(cores=$(nproc 2>/dev/null || printf 2) && printf '%s' $((cores < 2 ? 2 : cores > 8 ? 8 : cores)))}
+# Cases run in parallel, as many as the CPUs the test may use, at least 2 and at most 8: the
+# machine's cores, or fewer when its cgroup caps its CPU time (cpu.max, as docker --cpus and a
+# systemd CPUQuota set it). More cases than CPUs hold each fake back, and its timings with it.
+cpus_for_test() {
+  local cores max period cgroup
+  cores=$(nproc 2>/dev/null || printf 2)
+  cgroup=$(sed -n 's/^0:://p' /proc/self/cgroup 2>/dev/null)
+  if read -r max period 2>/dev/null <"/sys/fs/cgroup${cgroup}/cpu.max" && [[ $max =~ ^[0-9]+$ ]]; then
+    ((cores > (max + period - 1) / period)) && cores=$(((max + period - 1) / period))
+  fi
+  printf '%s' $((cores < 2 ? 2 : cores > 8 ? 8 : cores))
+}
+readonly max_jobs=${GW_TEST_JOBS:-$(cpus_for_test)}
 
 failures=0
 # check_failed MESSAGE: record one failed assertion.
@@ -53,6 +67,7 @@ readonly config_yaml=$'db_path: data/ghost-wispr.db\nspeaker_device: J75\nmic_de
 
 cat >"$fakepi" <<'EOF'
 """The fake Pi of accept_voice_test.sh: every fake command, chosen by its first argument."""
+import errno
 import fcntl
 import json
 import os
@@ -66,7 +81,11 @@ from datetime import datetime, timezone
 STATE = os.environ.get("GW_FAKE_STATE", "")
 SCENARIO = set(filter(None, os.environ.get("GW_FAKE_SCENARIO", "").split(",")))
 ASOUND = os.environ.get("GW_FAKE_ASOUND", "")
+TEST_PID = int(os.environ.get("GW_FAKE_TEST_PID", "0") or 0)
 FAR = 10**15
+# The rig's sound card clock against the Pi's: with clock-fast or clock-slow, it records 200 ppm more
+# or fewer samples a second, so that a place in the file is that much off the Pi's clock.
+CLOCK = 1.0002 if "clock-fast" in SCENARIO else 0.9998 if "clock-slow" in SCENARIO else 1.0
 
 
 def now_ms():
@@ -107,6 +126,12 @@ def alive(pid):
             return f.read().rsplit(")", 1)[1].split()[0] != "Z"
     except (OSError, IndexError):
         return False
+
+
+def test_running():
+    """A fake service, or the /ws stream, lives as long as its case's directory and the test: a slow
+    run must not outlive a fixed lifetime, and nothing outlives the test."""
+    return os.path.isdir(STATE) and (not TEST_PID or alive(TEST_PID))
 
 
 def service_pid():
@@ -158,9 +183,17 @@ def append(item):
         f.write(json.dumps(item) + "\n")
 
 
+def cut_item(item, cut):
+    """ITEM as CUT leaves it: a sound ends at the cut's sound_end, and anything else the cut's tag
+    would still have caused after the cut is gone (None)."""
+    if item["kind"] == "sound":
+        item = dict(item, end=min(item["end"], cut["sound_end"]), cut_at=cut["at"], drain=cut.get("drain", False))
+        return item if item["end"] > item["start"] else None
+    return None if item["due"] > cut["at"] else item
+
+
 def timeline():
-    """The timeline's items with every cut applied: a cut item drops what its tag would still have
-    caused after the cut, and ends its sound at sound_end."""
+    """The timeline's items with every cut applied (cut_item)."""
     items, cuts = [], {}
     for line in read("timeline.jsonl").splitlines():
         try:
@@ -173,15 +206,9 @@ def timeline():
             items.append(item)
     out = []
     for item in items:
-        cut = cuts.get(item.get("tag"))
-        if item["kind"] == "sound":
-            if cut:
-                item = dict(item, end=min(item["end"], cut["sound_end"]), cut_at=cut["at"], drain=cut.get("drain", False))
-            if item["end"] > item["start"]:
-                out.append(item)
-        elif cut and item["due"] > cut["at"]:
-            continue
-        else:
+        if item.get("tag") in cuts:
+            item = cut_item(item, cuts[item["tag"]])
+        if item and (item["kind"] != "sound" or item["end"] > item["start"]):
             out.append(item)
     return out
 
@@ -196,9 +223,10 @@ def systemctl(args):
     verb = args[1]
     if verb == "stop" and "sigint" in SCENARIO:
         # The systemctl wrapper first checks it inherited the driver's INT
-        # ignore. CPython resets an inherited ignored SIGINT to its
-        # KeyboardInterrupt handler on start, so the wrapper passes its check
-        # here and this fake reapplies only the verified disposition.
+        # ignore. CPython itself keeps an inherited ignored SIGINT, but the
+        # python3 on PATH can be a shim that resets it (mise's does), so the
+        # wrapper passes its check here and this fake reapplies only the
+        # verified disposition.
         if os.environ.get("GW_FAKE_SYSTEMCTL_SIGINT_IGNORED") != "1":
             sys.stderr.write("fake systemctl: missing verified sigint disposition\n")
             return 1
@@ -206,8 +234,10 @@ def systemctl(args):
         # Hold until the controller sends the second Ctrl-C while restore stops
         # the service; then stop normally.
         log_to("systemctl.log", verb)
-        for _ in range(500):
-            if os.path.exists(spath("stop-go")):
+        deadline = time.time() + 120
+        while not os.path.exists(spath("stop-go")):
+            if time.time() > deadline:
+                write("fake-error", "the test never released the restore's stop in 120 s\n")
                 break
             time.sleep(0.02)
         stop()
@@ -274,7 +304,8 @@ def start():
     if "verbose-journal" in SCENARIO:
         # More than a pipe buffer after the startup marker: a reader must drain journalctl.
         emit(kind="raw", due=now_ms(), text="startup detail " + "x" * 200_000)
-    for _ in range(500):
+    deadline = time.time() + 60
+    while time.time() < deadline and alive(process.pid):
         try:
             if any(os.readlink("/proc/%d/fd/%s" % (process.pid, fd)).endswith("-shm") for fd in os.listdir("/proc/%d/fd" % process.pid)):
                 return 0
@@ -289,14 +320,20 @@ def stop():
     pid = service_pid()
     if pid and alive(pid):
         os.kill(pid, signal.SIGTERM)
-        for _ in range(500):
-            if not alive(pid):
-                break
+        deadline = time.time() + 60
+        while alive(pid) and time.time() < deadline:
             time.sleep(0.01)
+        if alive(pid):
+            write("fake-error", "the service process %d outlived SIGTERM for 60 s\n" % pid)
+            os.kill(pid, signal.SIGKILL)
     try:
         os.remove(spath("main.pid"))
     except FileNotFoundError:
         pass
+
+
+STATUS_RUNNING = "state: RUNNING\nowner_pid   : 1\ntrigger_time: 1.0\ntstamp      : 1.0\ndelay       : %d\navail       : 480\navail_max   : 960\n-----\nhw_ptr      : 1\nappl_ptr    : 1\n"
+STATUS_XRUN = "state: XRUN\nowner_pid   : 1\ndelay       : 0\n"
 
 
 def service():
@@ -307,12 +344,15 @@ def service():
     connection = sqlite3.connect(os.environ["GW_FAKE_DB"])
     connection.execute("SELECT count(*) FROM app_state").fetchall()
     if not ASOUND:
-        time.sleep(600)
+        while test_running():
+            time.sleep(0.5)
         return
+    # The speaker's /proc status, which this loop rewrites from the timeline. The voice's stops and
+    # the XRUNs are this process's own to apply (drop, show_xrun): each waits on what the status has
+    # shown, not on how soon this loop or a reader of the status runs.
     status = os.path.join(ASOUND, "card3", "pcm0p", "sub0", "status")
-    size, sounds, xruns = -1, [], []
-    deadline = time.time() + 600
-    while time.time() < deadline:
+    size, items, done = -1, [], set()
+    while test_running():
         try:
             current = os.path.getsize(spath("timeline.jsonl"))
         except OSError:
@@ -320,31 +360,98 @@ def service():
         if current != size:
             size = current
             items = timeline()
-            sounds = [i for i in items if i["kind"] == "sound"]
-            xruns = [i for i in items if i["kind"] == "xrun"]
         t = now_ms()
-        # The kernel computes /proc status as it is read; this file is written by a loop that a
-        # loaded machine can hold back. So a dropped stream shows as dropped as soon as its cut is
-        # known, well before its stop line, and journalctl shows the stop line only once this loop
-        # has applied the timeline that holds the cut (status.applied). A draining stream shows its
-        # true queue.
-        active = [s for s in sounds if s["start"] <= t < s["end"] and s.get("drain", True)]
-        if any(x["start"] <= t < x["end"] for x in xruns):
-            text = "state: XRUN\nowner_pid   : 1\ndelay       : 0\n"
-        elif active:
-            delay = 1440
-            for s in active:
-                if s.get("drain") and t >= s["cut_at"]:
-                    delay = (s["end"] - t) * 48
-            text = "state: RUNNING\nowner_pid   : 1\ntrigger_time: 1.0\ntstamp      : 1.0\ndelay       : %d\navail       : 480\navail_max   : 960\n-----\nhw_ptr      : 1\nappl_ptr    : 1\n" % delay
-        else:
-            text = "closed\n"
-        tmp = status + ".tmp"
-        with open(tmp, "w") as f:
-            f.write(text)
-        os.replace(tmp, status)
-        write("status.applied", str(size))
+        due = [i for i in items if i["kind"] in ("stop-request", "xrun") and i["pid"] == os.getpid() and i["due"] <= t and i["id"] not in done]
+        if due:
+            done.add(due[0]["id"])
+            (show_xrun if due[0]["kind"] == "xrun" else drop)(status, items, due[0])
+            continue
+        replace_status(status, status_text(items, t))
         time.sleep(0.003)
+
+
+def status_text(items, t):
+    """The status at T: RUNNING while a sound plays, with 30 ms queued, or a draining stream's true
+    queue; a dropped stream is closed at once, or, with rewind, keeps running for its 300 ms idle
+    close with 80 ms of silence queued, as the Output does on a device that rewinds. With
+    slow-status, a stream shows as running only 3 s after its sound starts: well after a driver
+    that sleeps 300 ms past first_audio and looks once would look."""
+    late = 3000 if "slow-status" in SCENARIO else 0
+    active = [s for s in items if s["kind"] == "sound" and s["start"] + late <= t < s["end"] and s.get("drain", True)]
+    if not active:
+        if "rewind" in SCENARIO and any(s["kind"] == "sound" and "cut_at" in s and s["cut_at"] <= t < s["cut_at"] + 300 for s in items):
+            return STATUS_RUNNING % 3840
+        return "closed\n"
+    delay = 1440
+    for s in active:
+        if s.get("drain") and t >= s["cut_at"]:
+            delay = (s["end"] - t) * 48
+    return STATUS_RUNNING % delay
+
+
+def replace_status(status, text):
+    tmp = status + ".tmp"
+    with open(tmp, "w") as f:
+        f.write(text)
+    os.replace(tmp, status)
+
+
+def serve_once(status, text, then):
+    """Answer the next read of the status with TEXT, as the kernel computes /proc status as it is
+    read: a FIFO takes the status's place until a reader opens it and gets TEXT; THEN puts a file
+    back before that read ends, so no later read opens the FIFO."""
+    os.mkfifo(status + ".fifo")
+    os.replace(status + ".fifo", status)
+    deadline = time.time() + 120
+    while True:
+        try:
+            fd = os.open(status, os.O_WRONLY | os.O_NONBLOCK)
+            break
+        except OSError as error:
+            if error.errno != errno.ENXIO:
+                raise
+            if time.time() > deadline:
+                write("fake-error", "nothing read the speaker's status in 120 s\n")
+                then()
+                return
+            time.sleep(0.001)
+    try:
+        os.write(fd, text.encode())
+    except BrokenPipeError:
+        write("fake-error", "the reader of the speaker's status left before its read\n")
+    try:
+        then()
+    finally:
+        os.close(fd)
+
+
+def show_xrun(status, items, xrun):
+    """An underrun the speaker does not log: its stream is in XRUN for exactly one read of the
+    status, which the poller gets however late it reads."""
+    serve_once(status, STATUS_XRUN, lambda: replace_status(status, status_text(items, now_ms())))
+
+
+def drop(status, items, request):
+    """The voice's stop: the stream stops its audio within 5 ms (or plays on for the drain's
+    length: 800 ms on today's path, 50 ms with tail-50), and only then does the timing log get its
+    stop line, timed when the status already showed the stop. The speaker logs how it cancelled.
+    Leaks, each a word that plays after the stop anyway: leak-150, 150 ms on, after a pause in the
+    speech; leak-1100, 1.1 s on, after a silence long enough to pass for the end; leak-after-quiet,
+    150 ms on, with the speech already quiet for 1 s at the stop, which leaves the cancel untimed."""
+    drain = request["drain"]
+    end = -1000 if "leak-after-quiet" in SCENARIO else drain or 5
+    at = now_ms()
+    cut = dict(kind="cut", tag=request["speech"], at=at, sound_end=at + end, drain=drain > 0)
+    after = [cut_item(i, cut) if i.get("tag") == cut["tag"] else i for i in items]
+    replace_status(status, status_text([i for i in after if i], at))
+    at = now_ms()
+    append(dict(cut, at=at, sound_end=at + end))
+    emit(kind="timing", due=at, event="stop", session_id="session-1", reason=request["reason"])
+    write("stop-count", "%d\n" % (int(read("stop-count", "0").strip() or 0) + 1))
+    emit(kind="log", due=at, level="INFO", msg="speaker cancel", fields={"device": "plughw:CARD=J75,DEV=0", "way": "rewind" if "rewind" in SCENARIO else "drop"})
+    leak = 1100 if "leak-1100" in SCENARIO else 150 if SCENARIO & {"leak-150", "leak-after-quiet"} else None
+    if leak is not None:
+        emit(kind="sound", start=at + leak, end=at + leak + 250, tag="leaked-word")
 
 
 # ---- the voice ----
@@ -385,17 +492,32 @@ def react(kind, key, start, end):
         return
     n = voice_state(lambda s: s.__setitem__("n", s.get("n", 0) + 1) or s["n"])
     if kind in ("question", "ask", "second"):
+        if read("stop-count"):
+            # A word of a cancelled answer still plays as the next question goes in: well before its
+            # chime (leak-before-chime); just before it, apart (leak-apart-chime); running into it
+            # (leak-into-chime; leak-into-quiet-chime adds 70 ms to a quiet chime); or after the
+            # chime and before the answer's first audio, apart from both (leak-after-chime).
+            leaks = (("leak-before-chime", 30, 200), ("leak-apart-chime", 60, 100), ("leak-into-chime", 100, 250),
+                     ("leak-into-quiet-chime", 200, 260), ("leak-after-chime", 700, 800))
+            for scenario, leak_start, leak_end in leaks:
+                if scenario in SCENARIO:
+                    emit(kind="sound", start=start + leak_start, end=start + leak_end, tag="leaked-word")
         wake = start + 150
         chime = 120
         if "late-chime" in SCENARIO:
             chime = 600
         if "wake-310" in SCENARIO:
             chime = 310
+        # The rig hears the 240 ms chime for 200 ms; with quiet-chime, a chime played or heard more
+        # quietly, for 130 ms.
+        chime_heard = 130 if "quiet-chime" in SCENARIO else 200
         emit(kind="ws", due=wake, event={"type": "voice_wake", "session_id": ""})
-        emit(kind="timing", due=wake, event="wake_heard", session_id="")
+        if not ("no-wake-after-stop" in SCENARIO and read("stop-count")):
+            emit(kind="timing", due=wake, event="wake_heard", session_id="")
         emit(kind="timing", due=wake + 5, event="wake_chime_queued", session_id="")
         emit(kind="ws", due=wake + 20, event={"type": "transcript", "session_id": "session-1", "speaker": 0, "text": "the injected question", "start_time": 0})
-        emit(kind="sound", start=wake + chime, end=wake + chime + 200, tag="chime-%d" % n)
+        if not ("no-chime-after-stop" in SCENARIO and read("stop-count")):
+            emit(kind="sound", start=wake + chime, end=wake + chime + chime_heard, tag="chime-%d" % n)
         emit(kind="ws", due=end + 200, event={"type": "voice_exchange_started", "session_id": "session-1"})
         emit(kind="timing", due=end + 200, event="turn_end", session_id="session-1")
         tag = "speech-%d" % n
@@ -454,17 +576,23 @@ def react(kind, key, start, end):
         for item in timeline():
             if item["kind"] == "sound" and item["tag"].startswith("speech-") and item["start"] <= stop_at < item["end"]:
                 drain = "drain" in SCENARIO
-                # The Output drops its queue within 5 ms; today's path drains 800 ms more. The cut
-                # comes first, so a stop line shows once the status file has its cut (journalctl).
-                emit(kind="cut", tag=item["tag"], at=stop_at, sound_end=stop_at + (800 if drain else 5), drain=drain)
-                emit(kind="timing", due=stop_at, event="stop", session_id="session-1", reason="talk-over" if kind != "stop" else "stop phrase")
+                reason = "talk-over" if kind != "stop" else "stop phrase"
+                if ASOUND:
+                    # The service applies the stop, as it writes the speaker's status (drop): the
+                    # audio's tail after it, in ms.
+                    tail = 800 if drain else 50 if "tail-50" in SCENARIO else 21 if "tail-21" in SCENARIO else 0
+                    emit(kind="stop-request", due=stop_at, speech=item["tag"], drain=tail, reason=reason)
+                else:
+                    # The Output drops its queue within 5 ms; today's path drains 800 ms more.
+                    emit(kind="cut", tag=item["tag"], at=stop_at, sound_end=stop_at + (800 if drain else 5), drain=drain)
+                    emit(kind="timing", due=stop_at, event="stop", session_id="session-1", reason=reason)
                 break
     if kind in ("question", "ask", "second") and n == 1:
         first = end + 700
         if "underrun" in SCENARIO:
             emit(kind="log", due=first + 500, level="WARN", msg="speaker underrun", fields={"device": "plughw:CARD=J75,DEV=0", "underruns": 1, "buffer": 40_000_000})
         if "xrun" in SCENARIO:
-            emit(kind="xrun", start=first + 500, end=first + 540)
+            emit(kind="xrun", due=first + 500)
 
 
 def aplay(args):
@@ -488,12 +616,16 @@ def aplay(args):
     n = int(read("aplays", "0").strip() or 0) + 1
     write("aplays", "%d\n" % n)
     log_to("aplay.log", "%s %s" % (device, path))
+    write("aplay-pid.%d" % n, "%d\n" % os.getpid())
     start = now_ms()
     write("aplay-start.%d" % n, "%d\n" % start)
-    time.sleep(0.3)
-    end = now_ms()
-    write("aplay-end.%d" % n, "%d\n" % end)
+    # The voice's reaction is worked out while the 300 ms clip plays, so that aplay ends at the end
+    # the reaction counts from whenever that work fits in the clip: the driver times its clip's end
+    # when aplay exits, and the fake's own work would otherwise sit between the two.
+    end = start + 300
     react(words[0], words[1] if len(words) > 1 else "", start, end)
+    time.sleep(max(0, end - now_ms()) / 1000)
+    write("aplay-end.%d" % n, "%d\n" % now_ms())
     return 0
 
 
@@ -525,9 +657,26 @@ def arecord(args):
         begun = now_ms()
         log_to("recordings", "%s %d" % (path, begun))
         written = 0
+        # From the first clip played after the recording began: arecord-lag makes the file run 1 s
+        # behind for 2 s, as an arecord the machine holds back writes late, so that the anchor after
+        # the chime is late, and then catch up, well before the step stops the recording;
+        # arecord-overrun loses 250 ms of audio for good, as an arecord overrun does, so that every
+        # later sound sits 250 ms earlier in the file (and the recordings log says so for ffmpeg);
+        # arecord-dies ends the recording 1 s later.
+        aplays, lag_until, skip = read("aplays", "0"), None, 0
         while True:
             time.sleep(0.005)
-            target = (now_ms() - begun) * 48
+            t = now_ms()
+            if lag_until is None and SCENARIO & {"arecord-lag", "arecord-overrun", "arecord-dies"} and read("aplays", "0") != aplays:
+                lag_until = t + 2000 if "arecord-lag" in SCENARIO else t
+                if "arecord-overrun" in SCENARIO:
+                    skip = 250
+                    log_to("recordings", "%s %d" % (path, begun + skip))
+            if "arecord-dies" in SCENARIO and lag_until is not None and t > lag_until + 1000:
+                return 1
+            lag = 1000 if lag_until is not None and t < lag_until else 0
+            # Whole 2-byte samples at 24 kHz of the rig's clock, CLOCK times the Pi's.
+            target = 2 * int((t - lag - skip - begun) * CLOCK * 24)
             if target > written:
                 f.write(bytes(target - written))
                 f.flush()
@@ -539,7 +688,7 @@ def ffmpeg(args):
     if not os.path.exists(path):
         sys.stderr.write("%s: No such file or directory\n" % path)
         return 1
-    duration = (os.path.getsize(path) - 44) // 48
+    duration = (os.path.getsize(path) - 44) / 48
     sys.stderr.write("Input #0, wav, from '%s':\n  Duration: %02d:%02d:%02d.%02d, bitrate: 384 kb/s\n" % (path, duration // 3600000, duration // 60000 % 60, duration // 1000 % 60, duration % 1000 // 10))
     filters = args[args.index("-af") + 1]
     if filters.startswith("volumedetect"):
@@ -555,7 +704,8 @@ def ffmpeg(args):
     if begun is not None and "silent" not in SCENARIO:
         for item in timeline():
             if item["kind"] == "sound":
-                a, b = max(item["start"] - begun, 0), min(item["end"] - begun, duration)
+                # A sound's place in the file, in ms of the rig's clock.
+                a, b = max((item["start"] - begun) * CLOCK, 0), min((item["end"] - begun) * CLOCK, duration)
                 if b > a:
                     sounds.append([a, b])
     sounds.sort()
@@ -565,16 +715,17 @@ def ffmpeg(args):
             merged[-1][1] = max(merged[-1][1], b)
         else:
             merged.append([a, b])
+    # As ffmpeg prints them: %.6g, six significant digits.
     out = []
     cursor = 0
     for a, b in merged:
         if a - cursor >= minimum or (cursor == 0 and a > 0 and a >= minimum):
-            out.append("[silencedetect @ 0x1] silence_start: %.3f" % (cursor / 1000))
-            out.append("[silencedetect @ 0x1] silence_end: %.3f | silence_duration: %.3f" % (a / 1000, (a - cursor) / 1000))
+            out.append("[silencedetect @ 0x1] silence_start: %.6g" % (cursor / 1000))
+            out.append("[silencedetect @ 0x1] silence_end: %.6g | silence_duration: %.6g" % (a / 1000, (a - cursor) / 1000))
         cursor = b
     if duration - cursor >= minimum:
-        out.append("[silencedetect @ 0x1] silence_start: %.3f" % (cursor / 1000))
-        out.append("[silencedetect @ 0x1] silence_end: %.3f | silence_duration: %.3f" % (duration / 1000, (duration - cursor) / 1000))
+        out.append("[silencedetect @ 0x1] silence_start: %.6g" % (cursor / 1000))
+        out.append("[silencedetect @ 0x1] silence_end: %.6g | silence_duration: %.6g" % (duration / 1000, (duration - cursor) / 1000))
     out.append("size=N/A time=00:00:01.00 bitrate=N/A speed= 500x")
     sys.stderr.write("\n".join(out) + "\n")
     return 0
@@ -616,25 +767,10 @@ def journalctl(args):
             sys.stderr.write("Failed to read journal: Input/output error\n")
             return 1
         write("journal-end-read", "1")
-    # The kernel's /proc status is current when it is read; the fake's is a file its writer
-    # rewrites, which a loaded machine can hold back. So a stop line shows only once the status
-    # writer has applied the timeline that holds it, with its cut just before it: a reading after
-    # the stop line then sees the cut, however long the writer was held back.
-    applied, gated = int(read("status.applied") or "-1") if ASOUND else None, set()
-    if applied is not None:
-        offset = 0
-        for raw in read("timeline.jsonl").splitlines(keepends=True):
-            offset += len(raw.encode())
-            try:
-                item = json.loads(raw)
-            except ValueError:
-                continue
-            if item.get("kind") == "timing" and item.get("event") == "stop" and offset > applied:
-                gated.add(item["id"])
     records = []
     for item in sorted(timeline(), key=lambda item: item.get("due", 0)):
         due = item.get("due", 0)
-        if item["id"] in gated or not since <= due <= t:
+        if not since <= due <= t:
             continue
         if pids and str(item.get("pid")) not in pids:
             continue
@@ -786,7 +922,8 @@ def curl(args):
 def stream():
     """/ws as real curl prints it: each message's payload, one after another, with nothing between."""
     if "ws-silent" in SCENARIO:
-        time.sleep(600)
+        while test_running():
+            time.sleep(0.5)
         return 0
     begun = now_ms()
     pid = service_pid()
@@ -864,7 +1001,7 @@ if [[ \${GW_FAKE_SCENARIO:-} == *sigint* && \${1:-} == --user && \${2:-} == stop
   trap -p INT >"\$GW_FAKE_STATE/systemctl-sigint-trap"
   grep -qx "trap -- '' SIGINT" "\$GW_FAKE_STATE/systemctl-sigint-trap" || { printf 'fake systemctl: the sigint restore did not ignore SIGINT\\n' >&2; exit 1; }
   # Bash observed the driver's mask. Pass that observation to the Python fake,
-  # which must reapply it because CPython resets it at program startup.
+  # which reapplies it: a python3 shim on PATH can reset an ignored SIGINT.
   trap '' INT
   exec env GW_FAKE_SYSTEMCTL_SIGINT_IGNORED=1 python3 $(printf '%q' "$fakepi") systemctl "\$@"
 fi
@@ -883,6 +1020,22 @@ shift
 exec env GW_FAKE_ROOT=1 "$@"
 EOF
 chmod +x "$root/bin/"*
+# The sigint case's sleep. The driver's first 0.1 s poll after its question has played, in the
+# foreground (where Ctrl-C is not ignored), is a child that handles Ctrl-C itself and exits 0, as many
+# programs do: it marks that it holds, then waits for SIGINT. Every other sleep is the real one. A
+# driver whose wait goes on after its child handled the first Ctrl-C does not restore in time.
+mkdir -p "$root/sigint-bin"
+cat >"$root/sigint-bin/sleep" <<EOF
+#!/usr/bin/env bash
+if [[ \${1:-} == 0.1 && -e \$GW_FAKE_STATE/aplay-end.1 && ! -e \$GW_FAKE_STATE/sleep-held && \$(trap -p INT) != "trap -- '' SIGINT" ]]; then
+  trap 'exit 0' INT
+  printf '%s\n' "\$\$" >"\$GW_FAKE_STATE/sleep-held"
+  for ((i = 0; i < 1200; i++)); do $(printf '%q' "$(type -P sleep)") 0.1 & wait "\$!"; done
+  exit 0
+fi
+exec $(printf '%q' "$(type -P sleep)") "\$@"
+EOF
+chmod +x "$root/sigint-bin/sleep"
 
 # new_case NAME [ENV]: a fake Pi for one case, paused with no session, its .env ENV (the original
 # by default), its saved capture state 1 and its Envoy session id, with the service running.
@@ -916,14 +1069,14 @@ connection.execute("CREATE TABLE app_state (key TEXT PRIMARY KEY, value TEXT NOT
 connection.execute("INSERT INTO app_state(key, value) VALUES(?, ?)", ("capture_paused", "1"))
 connection.execute("INSERT INTO app_state(key, value) VALUES(?, ?)", ("voice_envoy_session_id", "pi-session-1"))
 connection.commit()' "$dir/ghost-wispr.db"
-  GW_FAKE_STATE="$dir/state" GW_FAKE_DB="$dir/ghost-wispr.db" GHOST_WISPR_DEPLOY_DIR="$dir/deploy" PATH="$root/bin:$PATH" \
+  GW_FAKE_STATE="$dir/state" GW_FAKE_DB="$dir/ghost-wispr.db" GW_FAKE_TEST_PID=$$ GHOST_WISPR_DEPLOY_DIR="$dir/deploy" PATH="$root/bin:$PATH" \
     "$root/bin/systemctl" --user start ghost-wispr.service || printf 'the fake service did not start\n' >"$dir/setup-error"
   printf '%s\n' "$dir"
 }
 
 # driver_env DIR SCENARIO: the environment the driver runs in for that case.
 driver_env() {
-  printf '%s\n' "PATH=$root/bin:$PATH" "GW_FAKE_STATE=$1/state" "GW_FAKE_DB=$1/ghost-wispr.db" \
+  printf '%s\n' "PATH=$root/bin:$PATH" "GW_FAKE_STATE=$1/state" "GW_FAKE_DB=$1/ghost-wispr.db" "GW_FAKE_TEST_PID=$$" \
     "GW_FAKE_SCENARIO=$2" "GHOST_WISPR_DEPLOY_DIR=$1/deploy" "GHOST_WISPR_ASOUND_ROOT=$1/asound" "TMPDIR=$1/tmp"
   [[ $2 != *asound* ]] || printf '%s\n' "GW_FAKE_ASOUND=$1/asound"
 }
@@ -1052,10 +1205,13 @@ for other in states listener-cpu pause-closes-vendors vendor-probe joined room-t
 done
 launch wake-needs pass '' -- --step wake-sound --calls 2
 
-# wake-sound: a pass; the chime 310 ms after wake_heard (the verification's negative control: a
-# median over 300 ms) and 600 ms (a call over 400 ms); no person; a journal the driver cannot read;
-# a loud room; a rig microphone that is not connected.
+# wake-sound: a pass; a pass while the rig recording runs 1 s behind for a while, which the driver's
+# clock must not take for a late chime; the chime 310 ms after wake_heard (the verification's
+# negative control: a median over 300 ms) and 600 ms (a call over 400 ms); no person; a journal the
+# driver cannot read; a loud room; a rig microphone that is not connected.
 launch wake pass yes -- --step wake-sound --calls 3 --question @question.wav --rig-mic "$rig" --event-timeout 10
+launch wake-lag arecord-lag yes -- --step wake-sound --calls 1 --question @question.wav --rig-mic "$rig" --event-timeout 10
+launch wake-overrun arecord-overrun yes -- --step wake-sound --calls 1 --question @question.wav --rig-mic "$rig" --event-timeout 10
 launch wake-median wake-310 yes -- --step wake-sound --calls 3 --question @question.wav --rig-mic "$rig" --event-timeout 10
 launch wake-max late-chime yes -- --step wake-sound --calls 2 --question @question.wav --rig-mic "$rig" --event-timeout 10
 launch wake-no-person pass '' -- --step wake-sound --calls 2 --question @question.wav --rig-mic "$rig"
@@ -1110,11 +1266,57 @@ launch barge-backchannel long,backchannel-stops yes -- --step barge-in --talkove
 # A journal that cannot be read once the voice stops: UNKNOWN, not a talk-over with no stop.
 launch barge-journal-error long,journal-error-after-stop yes -- --step barge-in --talkovers 1 --backchannels 0 --question @question.wav --talkover-dir @talkovers --backchannel-dir @backchannels --rig-mic "$rig" --event-timeout 15
 
-# playback-cancel: a pass; today's draining path (the negative control); a logged underrun; an XRUN
-# the speaker did not log.
+# playback-cancel, timed by the end of the cancelled speech at the rig microphone: a pass; a correct
+# cancel that keeps the stream running with 80 ms of silence queued, which must pass; a status that
+# shows the stream running only 3 s after it starts; today's draining path, heard 800 ms on (the
+# negative control); audio heard 50 ms on; a stop just before a pause in the speech whose next word
+# still plays 150 ms later; a word 1.1 s on, after a silence long enough to pass for the end; a word
+# 150 ms on with the speech already quiet for 1 s at the stop, which the rig cannot time (UNKNOWN);
+# a word still playing as the next question goes in: well before its chime, just before it and
+# apart, running into it, and after it, before the answer's first audio; a quiet chime, which must
+# pass, and a word that runs into it; the rig's clock 200 ppm fast and slow, which must pass, and a
+# 21 ms tail on the fast clock, which must fail; a rig recording that ends before the step stops it,
+# no chime heard where the next question's belongs, and no wake_heard for it (each UNKNOWN); a
+# logged underrun; an XRUN the speaker did not log.
 readonly cancel_args="--step playback-cancel --stops 2 --playback-seconds 3 --question @question.wav --stop-clip @stop.wav --rig-mic $rig --event-timeout 15"
 # shellcheck disable=SC2086
 launch cancel long,asound yes -- $cancel_args
+# shellcheck disable=SC2086
+launch cancel-rewind long,asound,rewind yes -- $cancel_args
+# shellcheck disable=SC2086
+launch cancel-slow-status long,asound,slow-status yes -- $cancel_args
+# shellcheck disable=SC2086
+launch cancel-tail long,asound,tail-50 yes -- $cancel_args
+# shellcheck disable=SC2086
+launch cancel-leak long,asound,leak-150 yes -- $cancel_args
+# shellcheck disable=SC2086
+launch cancel-leak-late long,asound,leak-1100 yes -- $cancel_args
+# shellcheck disable=SC2086
+launch cancel-leak-quiet long,asound,leak-after-quiet yes -- $cancel_args
+# shellcheck disable=SC2086
+launch cancel-leak-chime long,asound,leak-before-chime yes -- $cancel_args
+# shellcheck disable=SC2086
+launch cancel-leak-apart-chime long,asound,leak-apart-chime yes -- $cancel_args
+# shellcheck disable=SC2086
+launch cancel-leak-into-chime long,asound,leak-into-chime yes -- $cancel_args
+# shellcheck disable=SC2086
+launch cancel-leak-after-chime long,asound,leak-after-chime yes -- $cancel_args
+# shellcheck disable=SC2086
+launch cancel-quiet-chime long,asound,quiet-chime yes -- $cancel_args
+# shellcheck disable=SC2086
+launch cancel-leak-into-quiet-chime long,asound,quiet-chime,leak-into-quiet-chime yes -- $cancel_args
+# shellcheck disable=SC2086
+launch cancel-clock-fast long,asound,clock-fast yes -- $cancel_args
+# shellcheck disable=SC2086
+launch cancel-clock-slow long,asound,clock-slow yes -- $cancel_args
+# shellcheck disable=SC2086
+launch cancel-tail-21-fast long,asound,clock-fast,tail-21 yes -- $cancel_args
+# shellcheck disable=SC2086
+launch cancel-recorder-dies long,asound,arecord-dies yes -- $cancel_args
+# shellcheck disable=SC2086
+launch cancel-no-chime long,asound,no-chime-after-stop yes -- $cancel_args
+# shellcheck disable=SC2086
+launch cancel-no-wake long,asound,no-wake-after-stop yes -- $cancel_args
 # shellcheck disable=SC2086
 launch cancel-drain long,asound,drain yes -- $cancel_args
 # shellcheck disable=SC2086
@@ -1134,29 +1336,48 @@ wait
 
 # Ctrl-C while the driver waits for voice_wake, then Ctrl-C again while the restore stops the
 # service: each goes to the driver's whole process group, as a terminal sends it. The restore still
-# runs to the end, byte for byte. A refusal on a unit that is not paused, and on a saved state that
-# would resume ("Pause not saved"), run here too, as each changes its case before the driver starts.
+# runs to the end, byte for byte. Each step waits on what the case shows, never on a guess of time:
+# the first Ctrl-C once the driver waits for voice_wake on a child that handles Ctrl-C itself (the
+# sigint case's sleep, which holds until it), so that the driver must act on a Ctrl-C its child also
+# took; the second once the fake systemctl holds the restore's stop, which it lets go only after
+# that. The driver starts with SIGINT at its default, as from a terminal, whatever this test
+# inherited: a test started in the background (nohup, cmd &) ignores it, and a driver that inherits
+# that cannot trap Ctrl-C at all. python3 resets it and the two it ignores itself (SIGPIPE, SIGXFSZ),
+# then runs the driver. A refusal on a unit that is not paused, and on a saved state that would
+# resume ("Pause not saved"), run here too, as each changes its case before the driver starts.
 dir=$(new_case sigint)
 mapfile -t vars < <(driver_env "$dir" sigint)
+vars=("PATH=$root/sigint-bin:${vars[0]#PATH=}" "${vars[@]:1}")
 set -m
-env "${vars[@]}" bash "$driver" --question "$dir/question.wav" --event-timeout 30 </dev/null >"$dir/out" 2>&1 &
+python3 -c 'import os, signal, sys; [signal.signal(s, signal.SIG_DFL) for s in (signal.SIGINT, signal.SIGPIPE, signal.SIGXFSZ)]; os.execvp(sys.argv[1], sys.argv[1:])' \
+  env "${vars[@]}" bash "$driver" --question "$dir/question.wav" --event-timeout 300 </dev/null >"$dir/out" 2>&1 &
 driver_pid=$!
 set +m
-for _ in $(seq 1000); do
-  [[ -f $dir/state/aplay-end.1 ]] && break
-  sleep 0.02
-done
-sleep 0.3
+# sigint_wait SECONDS COMMAND...: wait until COMMAND succeeds, at most SECONDS; it fails at once if
+# the driver has ended.
+sigint_wait() {
+  local deadline=$((SECONDS + $1))
+  shift
+  until "$@"; do
+    kill -0 "$driver_pid" 2>/dev/null && ((SECONDS < deadline)) || return 1
+    sleep 0.05
+  done
+}
+sigint_wait 120 test -e "$dir/state/sleep-held" \
+  || check_failed "sigint: the driver did not wait for voice_wake within 120 s: $(tr '\n' '|' <"$dir/out")"
 kill -INT -- "-$driver_pid"
-for _ in $(seq 500); do
-  grep -qx stop "$dir/state/systemctl.log" && break
-  sleep 0.02
-done
-grep -qx stop "$dir/state/systemctl.log" || check_failed 'sigint: the restore never stopped the service'
-grep -qx "trap -- '' SIGINT" "$dir/state/systemctl-sigint-trap" \
-  || check_failed 'sigint: fake systemctl did not observe the driver ignoring SIGINT before its restore stop'
+sigint_wait 120 grep -qx stop "$dir/state/systemctl.log"
+grep -qx stop "$dir/state/systemctl.log" \
+  || check_failed "sigint: the restore never stopped the service: $(tr '\n' '|' <"$dir/out")"
+grep -qx "trap -- '' SIGINT" "$dir/state/systemctl-sigint-trap" 2>/dev/null \
+  || check_failed "sigint: fake systemctl did not observe the driver ignoring SIGINT before its restore stop: $(tr '\n' '|' <"$dir/out")"
 kill -INT -- "-$driver_pid" 2>/dev/null
 touch "$dir/state/stop-go"
+sigint_wait 120 false
+if kill -0 "$driver_pid" 2>/dev/null; then
+  check_failed "sigint: the driver did not end within 120 s of the restore's stop: $(tr '\n' '|' <"$dir/out")"
+  kill -KILL -- "-$driver_pid" 2>/dev/null
+fi
 wait "$driver_pid"
 printf '%s\n' "$?" >"$dir/rc"
 
@@ -1177,6 +1398,9 @@ printf '%s\n' "$?" >"$dir/rc"
 
 for setup in "$root"/*/setup-error; do
   [[ -e $setup ]] && check_failed "${setup%/setup-error}: $(<"$setup")"
+done
+for error in "$root"/*/state/fake-error; do
+  [[ -e $error ]] && check_failed "${error%/state/fake-error}: the fake Pi: $(<"$error")"
 done
 
 # ---- the checks ----
@@ -1317,6 +1541,12 @@ grep -Fq 'GHOST_WISPR_SPEAKER_DEVICE' "$root/wake/state/started-env.2" && check_
 grep -Fq -- "-D $rig " "$root/wake/state/arecord.log" || check_failed "wake: arecord did not record the rig microphone"
 expect_restored wake
 expect_no_leftovers wake
+expect_rc wake-lag 0
+expect_between 'wake-lag: median' "$(measured wake-lag 'wake-sound: median')" 60 280
+expect_restored wake-lag
+expect_rc wake-overrun 0
+expect_between 'wake-overrun: median' "$(measured wake-overrun 'wake-sound: median')" 60 280
+expect_restored wake-overrun
 expect_rc wake-median 1
 expect_line wake-median 'more than 300 ms'
 expect_between 'wake-median: the median the negative control reports' "$(measured wake-median 'wake-sound: median')" 301 399
@@ -1459,15 +1689,74 @@ expect_restored barge-journal-error
 # playback-cancel.
 expect_rc cancel 0
 expect_line cancel 'PASS: playback-cancel: the poller sees the speaker'\''s stream run at '
-expect_line cancel 'PASS: playback-cancel: every stop left at most 20 ms queued in ALSA'
+expect_line cancel "PASS: playback-cancel: no stop's speech was heard at the rig microphone 20 ms after it"
+expect_line cancel 'NOTE: playback-cancel: the speaker logged 2 cancels: 0 by rewind, 2 by drop'
 expect_line cancel 'PASS: playback-cancel: 0 underruns over '
 expect_line cancel 'can miss a short underrun'
 expect_restored cancel
+expect_rc cancel-rewind 0
+expect_line cancel-rewind "PASS: playback-cancel: no stop's speech was heard at the rig microphone 20 ms after it"
+expect_line cancel-rewind 'NOTE: playback-cancel: the speaker logged 2 cancels: 2 by rewind, 0 by drop'
+expect_restored cancel-rewind
+expect_rc cancel-slow-status 0
+expect_line cancel-slow-status "PASS: playback-cancel: no stop's speech was heard at the rig microphone 20 ms after it"
+expect_restored cancel-slow-status
+# heard_after NAME: the milliseconds a FAIL line says a stop's speech was heard after it.
+heard_after() {
+  sed -n "s/^FAIL: playback-cancel: a stop's speech was heard at the rig microphone \([0-9]*\) ms after it.*/\1/p" "$root/$1/out"
+}
 expect_rc cancel-drain 1
-expect_line cancel-drain 'FAIL: playback-cancel: a stop left '
-expect_between 'cancel-drain: the queue the negative control reports' \
-  "$(sed -n 's/^FAIL: playback-cancel: a stop left \([0-9]*\) ms queued.*/\1/p' "$root/cancel-drain/out")" 500 800
+expect_line cancel-drain "FAIL: playback-cancel: a stop's speech was heard at the rig microphone "
+expect_between 'cancel-drain: how long the negative control is heard' "$(heard_after cancel-drain)" 400 900
 expect_restored cancel-drain
+expect_rc cancel-tail 1
+expect_between 'cancel-tail: how long the 50 ms tail is heard' "$(heard_after cancel-tail)" 30 120
+expect_restored cancel-tail
+expect_rc cancel-leak 1
+expect_between 'cancel-leak: how long the leaked word is heard' "$(heard_after cancel-leak)" 150 500
+expect_restored cancel-leak
+expect_rc cancel-leak-late 1
+expect_between 'cancel-leak-late: how long the word after a long silence is heard' "$(heard_after cancel-leak-late)" 1300 1500
+expect_restored cancel-leak-late
+expect_rc cancel-leak-quiet 2
+expect_line cancel-leak-quiet 'UNKNOWN: playback-cancel stop 1: the rig microphone did not hear the speech up to the stop'
+expect_restored cancel-leak-quiet
+expect_rc cancel-leak-chime 1
+expect_between 'cancel-leak-chime: how long the word before the next chime is heard' "$(heard_after cancel-leak-chime)" 1500 6000
+expect_restored cancel-leak-chime
+expect_rc cancel-leak-apart-chime 1
+expect_line cancel-leak-apart-chime "FAIL: playback-cancel stop 1: a sound at the rig microphone starts "
+expect_restored cancel-leak-apart-chime
+expect_rc cancel-leak-into-chime 1
+expect_line cancel-leak-into-chime "FAIL: playback-cancel stop 1: the sound at the next question's chime is not the chime alone: it lasts "
+expect_restored cancel-leak-into-chime
+expect_rc cancel-leak-after-chime 1
+expect_line cancel-leak-after-chime "FAIL: playback-cancel stop 1: a sound at the rig microphone starts "
+expect_line cancel-leak-after-chime "after the next question's chime ends, before its answer's first audio"
+expect_restored cancel-leak-after-chime
+expect_rc cancel-quiet-chime 0
+expect_line cancel-quiet-chime "PASS: playback-cancel: no stop's speech was heard at the rig microphone 20 ms after it"
+expect_restored cancel-quiet-chime
+expect_rc cancel-leak-into-quiet-chime 1
+expect_line cancel-leak-into-quiet-chime "FAIL: playback-cancel stop 1: the sound at the next question's chime is not the chime alone: it lasts "
+expect_line cancel-leak-into-quiet-chime "than the step's first chime"
+expect_restored cancel-leak-into-quiet-chime
+expect_rc cancel-clock-fast 0
+expect_restored cancel-clock-fast
+expect_rc cancel-clock-slow 0
+expect_restored cancel-clock-slow
+expect_rc cancel-tail-21-fast 1
+expect_between 'cancel-tail-21-fast: how long a 21 ms tail is heard with the rig clock 200 ppm fast' "$(heard_after cancel-tail-21-fast)" 21 40
+expect_restored cancel-tail-21-fast
+expect_rc cancel-recorder-dies 2
+expect_line cancel-recorder-dies 'UNKNOWN: recording: arecord stopped before the step ended it'
+expect_restored cancel-recorder-dies
+expect_rc cancel-no-chime 2
+expect_line cancel-no-chime "UNKNOWN: playback-cancel stop 1: no sound at the rig microphone where the next question's chime belongs"
+expect_restored cancel-no-chime
+expect_rc cancel-no-wake 2
+expect_line cancel-no-wake 'UNKNOWN: playback-cancel stop 1: the timing log has no wake_heard for the next question'
+expect_restored cancel-no-wake
 expect_rc cancel-underrun 1
 expect_line cancel-underrun 'FAIL: playback-cancel: the speaker logged 1 underruns'
 expect_restored cancel-underrun

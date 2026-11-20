@@ -32,19 +32,27 @@ readonly loopback_speaker='GHOST_WISPR_SPEAKER_DEVICE=plughw:CARD=Loopback,DEV=0
 readonly voice_on=GHOST_WISPR_VOICE_ENABLED=true
 readonly injection_device=plughw:CARD=Loopback,DEV=1
 readonly speaker_capture=plughw:CARD=Loopback,DEV=1,SUBDEV=1
-# Every recording: 24 kHz mono PCM16, 48 bytes a millisecond, after the 44-byte header arecord
-# writes.
+# Every recording: 24 kHz mono PCM16, 2 bytes a sample, after the 44-byte header arecord writes.
+# recording-times.awk, beside this file, gives the times of its sounds on the driver's clock.
 readonly sample_rate=24000
-readonly bytes_per_ms=48
+readonly sample_bytes=2
 readonly wav_header_bytes=44
+recording_times=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/recording-times.awk
+readonly recording_times
 # Silence on the loopback is digital zeros. A gap of 150 ms ends a sound, so that the chime and the
 # speech after it are two sounds. The rig microphone hears the room, so its threshold is set from the
 # room's own level (calibrate_rig).
 readonly loopback_threshold_db=-50
-readonly silence_seconds=0.15
+readonly silence_seconds=0.15 silence_ms=150
 # The voice's sounds last at most 400 ms, so speech is a sound that starts at least that long after
 # the chime starts.
 readonly sound_max_ms=400
+# The wake chime lasts 240 ms (internal/voice/chime.go); at the rig, with the room's echo, a sound
+# longer than this is not the chime alone.
+readonly chime_max_ms=300
+# The same chime, played the same way into the same room, is heard for as long each time, give or
+# take this much; the step's first chime, before any stop, shows how long.
+readonly chime_tolerance_ms=20
 # A sound may start this much before the event that names it: the voice can start the chime just
 # before it sends voice_wake, and logs a sentence just after its first frame is written.
 readonly lead_ms=100
@@ -63,7 +71,8 @@ readonly restart_seconds=120
 readonly wake_median_ms=300 wake_max_ms=400
 readonly fact_median_ms=2500 fact_p90_ms=4000
 readonly talkover_median_ms=1500
-readonly queue_max_ms=20
+# No audio of a cancelled input may be heard this long after its cancel (c-playback-pi).
+readonly cancel_heard_ms=20
 readonly first_frame_median_ms=700
 readonly clip_ratio_min=3
 
@@ -122,8 +131,8 @@ Steps:
                       --second-question cancelled by --never-mind.
   barge-in            --talkovers N clips from --talkover-dir and --backchannels N from
                       --backchannel-dir while the voice answers --question. Needs --rig-mic.
-  playback-cancel     --stops N stops by --stop-clip during the answer to --question: the queue
-                      in ALSA and the silence at the Jabra, and underruns over --playback-seconds of
+  playback-cancel     --stops N stops by --stop-clip during the answer to --question: when the
+                      speech ends at the Jabra after each, and underruns over --playback-seconds of
                       playback. Needs --rig-mic.
   tts-first-audio     --sentences N sentences to each --engine (gemini, aura2 or aura,
                       gemini-clip) through ghost-wispr tts-first-audio. Changes nothing.
@@ -355,11 +364,15 @@ maximum() {
   printf '%s\n' "$@" | sort -n | tail -n 1
 }
 
-# wait_for_status SECONDS: wait until /api/status answers, and print it.
+# wait_for_status SECONDS: wait until /api/status answers; set status_json to its answer. Like every
+# wait, it runs in the driver's own shell, never in a command substitution: a Ctrl-C there reaches
+# the INT trap at once, while a $(...) that waits goes on waiting when the child it waits on handles
+# the Ctrl-C itself and exits 0, and the trap runs only when that wait ends.
+status_json=
 wait_for_status() {
   local deadline=$(($(now_ms) + $1 * 1000))
   while :; do
-    api_status 2>/dev/null && return 0
+    status_json=$(api_status 2>/dev/null) && return 0
     (($(now_ms) < deadline)) || return 1
     sleep 0.5
   done
@@ -463,15 +476,13 @@ ws_count() {
   jq -n --arg type "$1" '[inputs | select(type == "object" and .type == $type)] | length' "$ws_capture" 2>/dev/null || printf 0
 }
 
-# wait_for_event TYPE N DEADLINE_MS: wait until the Nth /ws message of TYPE has come, and print it.
+# wait_for_event TYPE N DEADLINE_MS: wait until the Nth /ws message of TYPE has come; set event_json
+# to it. Run it in the driver's own shell (wait_for_status says why).
+event_json=
 wait_for_event() {
-  local event
   while :; do
-    event=$(ws_event "$1" "$2")
-    if [[ -n $event ]]; then
-      printf '%s\n' "$event"
-      return 0
-    fi
+    event_json=$(ws_event "$1" "$2")
+    [[ -n $event_json ]] && return 0
     (($(now_ms) < $3)) || return 1
     sleep 0.1
   done
@@ -658,7 +669,7 @@ service_database() {
 # step prints its line and the next step runs whatever happened; it returns 1 if any step failed.
 # shellcheck disable=SC2329 # The EXIT trap calls it.
 restore() {
-  local result=0 stopped=false value status
+  local result=0 stopped=false value status_json
   if api_status >/dev/null 2>&1; then
     if api_post /api/pause >/dev/null; then
       pass 'restore: capture paused (POST /api/pause)'
@@ -696,10 +707,10 @@ restore() {
     printf 'FAIL: restore: could not start %s\n' "$unit"
     result=1
   }
-  if status=$(wait_for_status "$restart_seconds") && jq -e '.paused == true' >/dev/null <<<"$status"; then
+  if wait_for_status "$restart_seconds" && jq -e '.paused == true' >/dev/null <<<"$status_json"; then
     pass 'restore: /api/status reads paused'
   else
-    printf 'FAIL: restore: /api/status does not read paused after the restart: %s\n' "${status:-no answer}"
+    printf 'FAIL: restore: /api/status does not read paused after the restart: %s\n' "${status_json:-no answer}"
     result=1
   fi
   return "$result"
@@ -808,7 +819,7 @@ start_unit_run() {
   } >"$env_file" || fail "loopback: could not write $env_file"
   restart_ms=$(now_ms)
   service restart || fail "loopback: could not restart $unit"
-  status_json=$(wait_for_status "$restart_seconds") || fail "loopback: $unit did not answer within $restart_seconds s of its restart"
+  wait_for_status "$restart_seconds" || fail "loopback: $unit did not answer within $restart_seconds s of its restart"
   unit_pid=$(service show --property=MainPID --value 2>/dev/null)
   environment=$(tr '\0' '\n' <"/proc/$unit_pid/environ") || fail "loopback: cannot read the environment of $unit (process $unit_pid)"
   for setting in "$@"; do
@@ -827,7 +838,7 @@ start_unit_run() {
   curl --silent --show-error --no-buffer "$ws_url" >"$ws_capture" 2>"$ws_err" &
   ws_pid=$!
   deadline=$(($(now_ms) + event_timeout * 1000))
-  if ! wait_for_event connection 1 "$deadline" >/dev/null; then
+  if ! wait_for_event connection 1 "$deadline"; then
     if [[ -s $ws_capture ]]; then
       unknown "/ws: no connection event in $event_timeout s; it read: $(head -c 300 "$ws_capture")"
     fi
@@ -874,128 +885,110 @@ play_clip() {
 
 # wait_spoken N DEADLINE_MS NAME: wait for this unit run's Nth voice_spoken.
 wait_spoken() {
-  wait_for_event voice_spoken "$1" "$2" >/dev/null || fail "$3: no voice_spoken within $event_timeout s$(ws_ended)"
+  wait_for_event voice_spoken "$1" "$2" || fail "$3: no voice_spoken within $event_timeout s$(ws_ended)"
 }
 
 # ---- recordings ----
 
-# start_recording DEVICE FILE: record DEVICE to FILE. A background loop writes anchors, "MS BYTES"
-# pairs: by MS, BYTES of the file were written. to_clock maps a place in the file to the driver's
-# clock with the anchor just after it, so that the device's clock drifting from the Pi's over a
-# long recording does not move the times. arecord writes what it captured a little later, so a
-# mapped time errs late, never early.
+# start_recording DEVICE FILE: record DEVICE to FILE. A background loop writes anchors, "US BYTES"
+# lines: by the driver's clock US (microseconds, read just after the size, with no fork between
+# them), BYTES of the file were written. recording-times.awk bounds each sound's time with the
+# anchors after it, late only by how late its best anchor was read (analyse_recording).
 recording=
 anchors_file=
+recording_cut=false
+recording_started=
 start_recording() {
   local deadline size seen
   recording=$2
   anchors_file="$recording.anchors"
+  recording_cut=false
   : >"$anchors_file"
+  # arecord captures nothing before it starts: the earliest the file's first sample can be.
+  recording_started=${EPOCHREALTIME//[!0-9]/}
   arecord -q -D "$1" -f S16_LE -r "$sample_rate" -c 1 -t wav --buffer-time=40000 --period-time=10000 \
     "$recording" 2>"$work_dir/arecord.err" &
   arecord_pid=$!
   deadline=$(($(now_ms) + 5000))
   while :; do
     size=$(wc -c 2>/dev/null <"$recording" || printf 0)
-    seen=$(now_ms)
+    seen=${EPOCHREALTIME//[!0-9]/}
     if ((size > wav_header_bytes)); then
       printf '%s %s\n' "$seen" "$size" >>"$anchors_file"
       break
     fi
     kill -0 "$arecord_pid" 2>/dev/null || unknown "recording: arecord stopped: $(tr '\n' ' ' <"$work_dir/arecord.err")"
-    ((seen < deadline)) || unknown "recording: arecord wrote no audio from $1 within 5 s"
+    ((seen / 1000 < deadline)) || unknown "recording: arecord wrote no audio from $1 within 5 s"
     sleep 0.01
   done
   (
     while kill -0 "$arecord_pid" 2>/dev/null; do
       sleep 0.5
       size=$(wc -c 2>/dev/null <"$recording") || break
-      printf '%s %s\n' "$(now_ms)" "$size" >>"$anchors_file"
+      seen=${EPOCHREALTIME//[!0-9]/}
+      printf '%s %s\n' "$seen" "$size" >>"$anchors_file"
     done
   ) &
   anchor_pid=$!
   note "recording: from $1"
 }
 
-# stop_recording: end the recording; arecord finishes the file's header on SIGTERM.
+# stop_recording: end the recording. On SIGTERM arecord finishes the file's header and drops what it
+# had captured but not yet written. Every sample in the file was captured before arecord ended, so a
+# last anchor, taken once it has, bounds the end of the file too. An arecord that already ended on
+# its own cut the recording short, which analyse_recording reports.
 stop_recording() {
+  local size seen stopped=false
   if [[ -n $arecord_pid ]]; then
-    kill -TERM "$arecord_pid" 2>/dev/null
+    kill -TERM "$arecord_pid" 2>/dev/null || recording_cut=true
     wait "$arecord_pid" 2>/dev/null
     arecord_pid=
+    stopped=true
   fi
   if [[ -n $anchor_pid ]]; then
     kill "$anchor_pid" 2>/dev/null
     wait "$anchor_pid" 2>/dev/null
     anchor_pid=
   fi
+  if [[ $stopped == true ]] && size=$(wc -c 2>/dev/null <"$recording"); then
+    seen=${EPOCHREALTIME//[!0-9]/}
+    printf '%s %s\n' "$seen" "$size" >>"$anchors_file"
+  fi
 }
 
-# to_clock REL_MS: set clock_ms to the driver's time of the place REL_MS into the recording.
-clock_ms=
-anchor_rel=()
-anchor_origin=()
-to_clock() {
-  local k
-  for k in "${!anchor_rel[@]}"; do
-    if ((anchor_rel[k] >= $1)); then
-      clock_ms=$((anchor_origin[k] + $1))
-      return
-    fi
-  done
-  clock_ms=$((anchor_origin[${#anchor_origin[@]} - 1] + $1))
-}
-
-# sounds_in SILENCEDETECT DURATION_MS: the sounds in ffmpeg's silencedetect report, "START END" in
-# milliseconds from the recording's start, one a line. A sound runs from where a silence ends (or
-# from the start) to where the next silence starts (or to the end). The silence silencedetect ends
-# at the end of the file starts no sound.
-sounds_in() {
-  awk -v duration="$2" '
-    function ms(text) { return int(text * 1000 + 0.5) }
-    /silence_start: / { value = $0; sub(/.*silence_start: /, "", value); starts[++n_starts] = ms(value) }
-    /silence_end: / { value = $0; sub(/.*silence_end: /, "", value); sub(/[^0-9.].*/, "", value); ends[++n_ends] = ms(value) }
-    END {
-      if (n_starts == 0 || starts[1] > 0) print 0, (n_starts > 0 ? starts[1] : duration)
-      for (i = 1; i <= n_ends; i++)
-        if (ends[i] < duration - 20) print ends[i], (i < n_starts ? starts[i + 1] : duration)
-    }' <<<"$1"
-}
-
-# analyse_recording THRESHOLD_DB: read the sounds in the recording: sound_on and sound_off hold each
-# sound's start and end on the driver's clock, and recording_end the end of the recording.
+# analyse_recording THRESHOLD_DB: read the sounds in the recording. sound_on and sound_off hold each
+# sound's onset and end on the driver's clock, never early; sound_len its length in the file, in
+# microseconds; recording_end the driver's time, never late, before which the recording shows every
+# sound that starts (recording-times.awk).
 sound_on=()
 sound_off=()
+sound_len=()
 recording_end=
 analyse_recording() {
-  local analysis duration_ms ms size onset end
+  local analysis bytes kind rest on off len
   analysis=$(ffmpeg -hide_banner -nostats -i "$recording" -af "silencedetect=noise=${1}dB:d=$silence_seconds" -f null - 2>&1) \
     || unknown "recording: ffmpeg could not read $recording: $(tail -n 3 <<<"$analysis" | tr '\n' ' ')"
-  duration_ms=$(sed -n 's/^ *Duration: \([0-9]*\):\([0-9]*\):\([0-9]*\)\.\([0-9]*\),.*/\1 \2 \3 \4/p' <<<"$analysis" \
-    | awk 'NR == 1 { print (($1 * 60 + $2) * 60 + $3) * 1000 + $4 * 10 }')
-  if ! whole_number "$duration_ms" || ((duration_ms == 0)); then
-    unknown "recording: ffmpeg read no duration from $recording"
-  fi
-  anchor_rel=()
-  anchor_origin=()
-  while read -r ms size; do
-    size=$(((size - wav_header_bytes) / bytes_per_ms))
-    ((size > 0)) || continue
-    anchor_rel+=("$size")
-    anchor_origin+=($((ms - size)))
-  done <"$anchors_file"
-  ((${#anchor_rel[@]} > 0)) || unknown "recording: no anchor ties $recording to the clock"
+  [[ $recording_cut == false ]] \
+    || unknown "recording: arecord stopped before the step ended it, so the recording does not cover the step: $(tr '\n' ' ' <"$work_dir/arecord.err")"
+  bytes=$(wc -c <"$recording") || unknown "recording: cannot read the size of $recording"
   sound_on=()
   sound_off=()
-  while read -r onset end; do
-    [[ -n $onset ]] || continue
-    to_clock "$onset"
-    sound_on+=("$clock_ms")
-    to_clock "$end"
-    sound_off+=("$clock_ms")
-  done < <(sounds_in "$analysis" "$duration_ms")
-  to_clock "$duration_ms"
-  recording_end=$clock_ms
+  sound_len=()
+  recording_end=
+  while read -r kind rest; do
+    case $kind in
+      sound)
+        read -r on off len <<<"$rest"
+        sound_on+=("$on")
+        sound_off+=("$off")
+        sound_len+=("$len")
+        ;;
+      end) recording_end=$rest ;;
+      error) unknown "recording: $recording: $rest" ;;
+    esac
+  done < <(awk -v rate="$sample_rate" -v header="$wav_header_bytes" -v frame="$sample_bytes" -v bytes="$bytes" \
+    -v started_us="$recording_started" -f "$recording_times" "$anchors_file" - <<<"$analysis")
+  whole_number "$recording_end" || unknown "recording: the times of $recording could not be read"
 }
 
 # first_sound FROM_MS TO_MS: set found_sound to the index of the first sound that starts in
@@ -1026,6 +1019,23 @@ silence_from() {
     return 1
   done
   return 1
+}
+
+# cancel_heard STOP_MS NEXT_MS: set heard_ms to how long after STOP the rig still heard sound before
+# NEXT, the next sound the step expects: the end of the last sound that spans STOP or starts after
+# it, so a word after any pause or silence counts; 0 when the rig was quiet from STOP. It fails when
+# the rig did not hear sound up to STOP (within a pause of silence_ms), which leaves the cancel
+# untimed.
+heard_ms=
+cancel_heard() {
+  local i heard_up_to=false
+  heard_ms=0
+  for i in "${!sound_on[@]}"; do
+    ((sound_on[i] < $2)) || continue
+    ((sound_on[i] <= $1 && sound_off[i] >= $1 - silence_ms)) && heard_up_to=true
+    ((sound_off[i] > $1 + heard_ms)) && heard_ms=$((sound_off[i] - $1))
+  done
+  [[ $heard_up_to == true ]]
 }
 
 # ---- the rig microphone ----
@@ -1097,34 +1107,39 @@ step_exchange() {
   question_started=$clip_started
   question_ended=$clip_ended
 
-  wake=$(wait_for_event voice_wake 1 $((question_ended + event_timeout * 1000))) \
+  wait_for_event voice_wake 1 $((question_ended + event_timeout * 1000)) \
     || fail "voice_wake: none within $event_timeout s of the end of the question$(ws_ended)"
+  wake=$event_json
   check_voice_event voice_wake "$wake"
   wake_ms=$event_at
   pass "voice_wake $((wake_ms - question_started)) ms after the question began; session_id $(jq '.session_id' <<<"$wake")"
 
-  exchange=$(wait_for_event voice_exchange_started 1 $((question_ended + event_timeout * 1000))) \
+  wait_for_event voice_exchange_started 1 $((question_ended + event_timeout * 1000)) \
     || fail "voice_exchange_started: none within $event_timeout s of the end of the question$(ws_ended)"
+  exchange=$event_json
   check_voice_event voice_exchange_started "$exchange"
   exchange_ms=$event_at
   session=$(jq -r '.session_id' <<<"$exchange")
   [[ -n $session ]] || fail 'voice_exchange_started: its session_id is empty'
   pass "voice_exchange_started $((exchange_ms - question_ended)) ms after the question ended; session_id \"$session\""
 
-  spoken=$(wait_for_event voice_spoken 1 $((exchange_ms + event_timeout * 1000))) \
+  wait_for_event voice_spoken 1 $((exchange_ms + event_timeout * 1000)) \
     || fail "voice_spoken: none within $event_timeout s of voice_exchange_started$(ws_ended)"
+  spoken=$event_json
   check_voice_event voice_spoken "$spoken" "$session"
   spoken_ms=$event_at
   pass "voice_spoken $((spoken_ms - exchange_ms)) ms after voice_exchange_started; same session_id"
 
   if [[ -n $go_ahead ]]; then
-    ready=$(wait_for_event voice_answer_ready 1 $((spoken_ms + answer_timeout * 1000))) \
+    wait_for_event voice_answer_ready 1 $((spoken_ms + answer_timeout * 1000)) \
       || fail "voice_answer_ready: none within $answer_timeout s of voice_spoken$(ws_ended)"
+    ready=$event_json
     check_voice_event voice_answer_ready "$ready" "$session"
     pass "voice_answer_ready $((event_at - spoken_ms)) ms after voice_spoken; same session_id"
     play_clip go-ahead "$go_ahead"
-    spoken_again=$(wait_for_event voice_spoken 2 $((clip_ended + event_timeout * 1000))) \
+    wait_for_event voice_spoken 2 $((clip_ended + event_timeout * 1000)) \
       || fail "voice_spoken after go-ahead: none within $event_timeout s of the end of the go-ahead$(ws_ended)"
+    spoken_again=$event_json
     check_voice_event 'voice_spoken after go-ahead' "$spoken_again" "$session"
     pass "voice_spoken after go-ahead $((event_at - clip_ended)) ms after the go-ahead ended; same session_id"
   fi
@@ -1410,8 +1425,9 @@ step_ask_holder() {
   check_timing_log
 
   play_clip question "$question"
-  exchange=$(wait_for_event voice_exchange_started 1 $((clip_ended + event_timeout * 1000))) \
+  wait_for_event voice_exchange_started 1 $((clip_ended + event_timeout * 1000)) \
     || fail "ask-holder: no voice_exchange_started within $event_timeout s of the question$(ws_ended)"
+  exchange=$event_json
   check_voice_event voice_exchange_started "$exchange"
   session=$(jq -r '.session_id' <<<"$exchange")
   [[ -n $session ]] || fail 'ask-holder: voice_exchange_started has an empty session_id'
@@ -1422,8 +1438,9 @@ step_ask_holder() {
   pass "ask-holder: the question went to $(jq -r '.holder' <<<"$task") as Envoy event $first"
   asked=$(time_ms "$(jq -r '.asked_at' <<<"$task")")
 
-  ready=$(wait_for_event voice_answer_ready 1 $(($(now_ms) + answer_timeout * 1000))) \
+  wait_for_event voice_answer_ready 1 $(($(now_ms) + answer_timeout * 1000)) \
     || fail "ask-holder: no voice_answer_ready within $answer_timeout s of the question; the holder of $issue_live reads $holder_text, and no answer was spoken"
+  ready=$event_json
   check_voice_event voice_answer_ready "$ready" "$session"
   pass "ask-holder: voice_answer_ready on /ws, same session_id"
   answer_at=
@@ -1577,7 +1594,7 @@ step_barge_in() {
   pass "barge-in: median $median ms from a talk-over clip's start to silence at the Jabra, at most $talkover_median_ms ms"
 }
 
-# speaker_status: set status_path and params_path to the /proc files of the speaker's playback
+# speaker_status: set status_path to the /proc status file of the speaker's playback
 # substream: the card speaker_device names (as findCard finds it) and its first playback device.
 speaker_status() {
   local device card dev index id name line pcm
@@ -1588,7 +1605,7 @@ speaker_status() {
   elif [[ -n $device && $device != *:* ]]; then
     card=$device
   else
-    unknown "playback-cancel: the speaker plays to \"${device:-default}\", which names no sound card whose queue the step can read"
+    unknown "playback-cancel: the speaker plays to \"${device:-default}\", which names no sound card whose status the step can read"
   fi
   index=
   while IFS= read -r line; do
@@ -1607,12 +1624,10 @@ speaker_status() {
     dev=${dev%p}
   fi
   status_path=$asound_root/card$index/pcm${dev}p/sub0/status
-  params_path=$asound_root/card$index/pcm${dev}p/sub0/hw_params
   [[ -r $status_path ]] || unknown "playback-cancel: cannot read $status_path"
 }
 
-# start_poller: read the speaker substream's status every 5 ms into poll_log, "MS STATE DELAY" (the
-# queued frames), and its rate once, "rate HZ", the first time the stream runs.
+# start_poller: read the speaker substream's status every 5 ms into poll_log, "MS STATE".
 poll_log=
 start_poller() {
   poll_log="$work_dir/playback.poll"
@@ -1620,23 +1635,13 @@ start_poller() {
   mkfifo "$work_dir/never" || unknown 'playback-cancel: cannot make the poller its fifo'
   (
     exec 3<>"$work_dir/never"
-    rated=false
     while :; do
       content=
       IFS= read -r -d '' content <"$status_path"
       now=${EPOCHREALTIME//[!0-9]/}
-      state=CLOSED delay=0
+      state=CLOSED
       [[ $content =~ state:\ ([A-Z_]+) ]] && state=${BASH_REMATCH[1]}
-      [[ $content =~ delay\ +:\ (-?[0-9]+) ]] && delay=${BASH_REMATCH[1]}
-      printf '%s %s %s\n' "$((now / 1000))" "$state" "$delay" >>"$poll_log"
-      if [[ $rated == false && $state == RUNNING ]]; then
-        params=
-        IFS= read -r -d '' params <"$params_path"
-        if [[ $params =~ rate:\ ([0-9]+) ]]; then
-          printf 'rate %s\n' "${BASH_REMATCH[1]}" >>"$poll_log"
-          rated=true
-        fi
-      fi
+      printf '%s %s\n' "$((now / 1000))" "$state" >>"$poll_log"
       read -r -t 0.005 -u 3 _
     done
   ) &
@@ -1653,28 +1658,49 @@ stop_poller() {
 
 # running_ms: how long the poller has seen the speaker stream running so far.
 running_ms() {
-  awk '$1 == "rate" { next } { if (state == "RUNNING") total += $1 - last; last = $1; state = $2 } END { print total + 0 }' "$poll_log"
+  awk '{ if (state == "RUNNING") total += $1 - last; last = $1; state = $2 } END { print total + 0 }' "$poll_log"
 }
 
-# step_playback_cancel: verification c-playback-pi. At each stop (the stop line of the timing log)
-# the queue still to play is the speaker substream's delay 20 ms later, the Output's own cancel
-# bound: 0 once the stream has left RUNNING, as snd_pcm_drop leaves it. Underruns are the lines the
-# speaker logs for each one; the poller's XRUN states cross-check them.
+# step_playback_cancel: verification c-playback-pi. No audio of the cancelled input may be heard
+# cancel_heard_ms after the cancel, at the rig microphone: the last sound the rig hears from each
+# stop (the stop line of the timing log) until its next question's chime can start, at least
+# stop_silence_ms later, must end by then (cancel_heard), so that a word after a pause in the speech
+# does not pass. The chime must be the chime alone, heard no longer than the step's first chime,
+# before any stop, give or take chime_tolerance_ms; and nothing else may start after it before that
+# question's answer (its first_audio), since the next question plays into the microphone, not the
+# speaker. Nothing else plays after a stop: the voice has no stop sound. ALSA's queue is not the
+# measure: after a cancel the Output can keep the stream running and fill it with silence. Underruns
+# are the lines the speaker logs for each one; the poller's XRUN states cross-check them.
+#
+# Known limits. A leak can hide only where it runs into the next question's chime, with less than
+# silence_ms between them: the part of it outside the chime must add at most chime_tolerance_ms to
+# the chime as the rig hears it, and any of it that plays during the chime is not told apart. And a
+# leak that starts so shortly before the next answer's first_audio that the recording's time for it,
+# late by however late its best anchor was read, falls after first_audio, passes for that answer.
 step_playback_cancel() {
-  local i spoken_count speech_at wait_ms stop_ats=() queued=() silences=() rate value deadline max xruns streams
+  local i q wake first spoken_count speech_at wait_ms stop_ats=() question_starts=() question_wakes=()
+  local question_firsts=() heard=() deadline max xruns streams ways next chime chime_len boundary_unknown
   local underruns played
   speaker_status
   start_rig_run
   start_poller
   for ((i = 1; i <= stops; i++)); do
     play_clip "playback-cancel stop $i question" "$question"
+    question_starts+=("$clip_started")
     wait_for_timing first_audio "$clip_started" $((clip_ended + event_timeout * 1000)) \
       || timing_fail "playback-cancel stop $i: the voice did not start speaking within $event_timeout s (no first_audio)"
     speech_at=$timing_at
+    wake=$(timing_first wake_heard "$clip_started" "$speech_at") \
+      || unknown "voice timing log: cannot read the journal of $unit (process $unit_pid)$(journal_error)"
+    question_wakes+=("$wake")
+    question_firsts+=("$speech_at")
     if ((i == 1)); then
-      sleep 0.3
-      awk -v from="$speech_at" '$1 >= from && $2 == "RUNNING" { found = 1 } END { exit !found }' "$poll_log" \
-        || unknown "playback-cancel: the poller never saw $status_path running while the voice spoke: it reads another device"
+      deadline=$(($(now_ms) + event_timeout * 1000))
+      until awk -v from="$speech_at" '$1 >= from && $2 == "RUNNING" { found = 1 } END { exit !found }' "$poll_log"; do
+        (($(now_ms) < deadline)) \
+          || unknown "playback-cancel: the poller never saw $status_path running within $event_timeout s of the voice's first audio: it reads another device"
+        sleep 0.1
+      done
       pass "playback-cancel: the poller sees the speaker's stream run at $status_path"
     fi
     wait_ms=$((200 + RANDOM % 2300))
@@ -1691,43 +1717,84 @@ step_playback_cancel() {
     (($(now_ms) < deadline)) || unknown "playback-cancel: only $(($(running_ms) / 1000)) s of playback in the time allowed; the underrun check needs $playback_seconds s"
     spoken_count=$(ws_count voice_spoken)
     play_clip 'playback-cancel playback' "$question"
+    question_starts+=("$clip_started")
     wait_spoken $((spoken_count + 1)) $((clip_ended + event_timeout * 1000)) 'playback-cancel playback'
+    wake=$(timing_first wake_heard "$clip_started" 9999999999999) \
+      || unknown "voice timing log: cannot read the journal of $unit (process $unit_pid)$(journal_error)"
+    first=$(timing_first first_audio "$clip_started" 9999999999999) \
+      || unknown "voice timing log: cannot read the journal of $unit (process $unit_pid)$(journal_error)"
+    question_wakes+=("$wake")
+    question_firsts+=("$first")
     sleep "$idle_seconds"
   done
   played=$(running_ms)
   stop_poller
   analyse_rig
-  rate=$(awk '$1 == "rate" { print $2; exit }' "$poll_log")
-  if ! whole_number "${rate:-}" || ((rate == 0)); then
-    unknown "playback-cancel: the poller read no rate from $params_path"
-  fi
+  # The chime as the rig hears it: the step's first, before any stop.
+  [[ -n ${question_wakes[0]} ]] \
+    || unknown "playback-cancel: the timing log has no wake_heard for the first question, so how long the rig hears the chime is not known"
+  first_sound $((question_wakes[0] - lead_ms)) $((question_wakes[0] + wake_max_ms)) \
+    || unknown "playback-cancel: no sound at the rig microphone where the first question's chime belongs (up to $wake_max_ms ms after its wake_heard)"
+  chime_len=${sound_len[found_sound]}
+  ((chime_len <= chime_max_ms * 1000)) \
+    || unknown "playback-cancel: the first question's chime lasts $((chime_len / 1000)) ms at the rig microphone, more than $chime_max_ms ms, so how long the rig hears the chime alone is not known"
+  note "playback-cancel: the rig microphone hears the step's first chime for $((chime_len / 1000)) ms"
+  boundary_unknown=
   for i in "${!stop_ats[@]}"; do
-    value=$(awk -v at=$((stop_ats[i] + 20)) -v rate="$rate" '$1 == "rate" { next }
-      $1 >= at { if ($2 == "RUNNING" || $2 == "DRAINING") printf "%d", $3 * 1000 / rate; else print 0; found = 1; exit }
-      END { if (!found) exit 1 }' "$poll_log") \
-      || unknown "playback-cancel stop $((i + 1)): the poller has no reading after the stop"
-    queued+=("$value")
-    if silence_from "${stop_ats[i]}" $((stop_ats[i] + stop_window_ms)); then
-      silences+=($((silent_at - stop_ats[i])))
-      note "playback-cancel stop $((i + 1)): ${value} ms queued 20 ms after the stop; the Jabra went quiet ${silences[-1]} ms after it"
-    else
-      note "playback-cancel stop $((i + 1)): ${value} ms queued 20 ms after the stop; the Jabra did not go quiet within $stop_window_ms ms"
-      silences+=("$stop_window_ms")
-    fi
+    # Every sound that starts from the stop until the earliest the next question's chime can start
+    # (its wake_heard, less lead_ms) is audio after the cancel. The first sound that starts where the
+    # chime belongs (up to wake_max_ms after the wake) is taken for the chime: it must be heard no
+    # longer than the first chime and chime_tolerance_ms, and the next sound must not start before
+    # the answer's first_audio. With no wake_heard or first_audio for that question, or no sound
+    # where its chime belongs, the window is not known: UNKNOWN, unless what was heard fails.
+    next=$recording_end
+    for q in "${!question_starts[@]}"; do
+      ((question_starts[q] > stop_ats[i])) || continue
+      next=${question_starts[q]}
+      if [[ -z ${question_wakes[q]} ]]; then
+        boundary_unknown=${boundary_unknown:-"playback-cancel stop $((i + 1)): the timing log has no wake_heard for the next question, so where its chime belongs is not known"}
+        break
+      fi
+      next=$((question_wakes[q] - lead_ms))
+      if ! first_sound "$next" $((question_wakes[q] + wake_max_ms)); then
+        boundary_unknown=${boundary_unknown:-"playback-cancel stop $((i + 1)): no sound at the rig microphone where the next question's chime belongs (up to $wake_max_ms ms after its wake_heard), so the window's end is not known"}
+        break
+      fi
+      chime=$found_sound
+      ((sound_len[chime] <= chime_len + chime_tolerance_ms * 1000)) \
+        || fail "playback-cancel stop $((i + 1)): the sound at the next question's chime is not the chime alone: it lasts $((sound_len[chime] / 1000)) ms, more than the step's first chime ($((chime_len / 1000)) ms) by over $chime_tolerance_ms ms"
+      if [[ -z ${question_firsts[q]} ]]; then
+        boundary_unknown=${boundary_unknown:-"playback-cancel stop $((i + 1)): the timing log has no first_audio for the next question's answer, so the quiet after its chime cannot be checked"}
+      elif ((chime + 1 < ${#sound_on[@]} && sound_on[chime + 1] < question_firsts[q])); then
+        fail "playback-cancel stop $((i + 1)): a sound at the rig microphone starts $((sound_on[chime + 1] - sound_off[chime])) ms after the next question's chime ends, before its answer's first audio ($((question_firsts[q] - sound_on[chime + 1])) ms later): audio of the cancelled answer"
+      fi
+      break
+    done
+    ((next <= recording_end)) \
+      || unknown "playback-cancel stop $((i + 1)): the rig recording ends before the step's next sound after the stop"
+    ((next - stop_ats[i] >= stop_silence_ms)) \
+      || unknown "playback-cancel stop $((i + 1)): the step's next sound came $((next - stop_ats[i])) ms after the stop, less than $stop_silence_ms ms"
+    cancel_heard "${stop_ats[i]}" "$next" \
+      || unknown "playback-cancel stop $((i + 1)): the rig microphone did not hear the speech up to the stop, so it cannot time the cancel"
+    heard+=("$heard_ms")
+    note "playback-cancel stop $((i + 1)): the rig microphone heard sound until ${heard_ms} ms after the stop, then nothing until the step's next sound could start, $((next - stop_ats[i])) ms after it"
   done
-  max=$(maximum "${queued[@]}")
-  ((max <= queue_max_ms)) || fail "playback-cancel: a stop left $max ms queued in ALSA, more than $queue_max_ms ms"
-  pass "playback-cancel: every stop left at most $queue_max_ms ms queued in ALSA (the most $max ms, over $stops stops)"
-  note "playback-cancel: the Jabra went quiet a median $(percentile 50 "${silences[@]}") ms after a stop, the longest $(maximum "${silences[@]}") ms"
+  max=$(maximum "${heard[@]}")
+  ((max <= cancel_heard_ms)) || fail "playback-cancel: a stop's speech was heard at the rig microphone $max ms after it, more than $cancel_heard_ms ms"
+  [[ -z $boundary_unknown ]] || unknown "$boundary_unknown"
+  pass "playback-cancel: no stop's speech was heard at the rig microphone $cancel_heard_ms ms after it, and the rig stayed quiet until the step's next sound (the longest $max ms, over $stops stops)"
   streams=$(journal_records 'speaker stream' | jq -s 'length') \
     || unknown "playback-cancel: cannot read the speaker stream lines from the journal$(journal_error)"
   ((streams > 0)) || unknown "playback-cancel: the journal has no \"speaker stream\" line, so the speaker's underrun lines cannot be read"
   underruns=$(journal_records 'speaker underrun' | jq -s 'length') \
     || unknown "playback-cancel: cannot read the speaker underrun lines from the journal$(journal_error)"
-  xruns=$(awk '$1 != "rate" { if ($2 == "XRUN" && last != "XRUN") n++; last = $2 } END { print n + 0 }' "$poll_log")
+  xruns=$(awk '{ if ($2 == "XRUN" && last != "XRUN") n++; last = $2 } END { print n + 0 }' "$poll_log")
   ((underruns == 0)) || fail "playback-cancel: the speaker logged $underruns underruns over $((played / 1000)) s of playback"
   ((xruns == 0)) || fail "playback-cancel: the speaker logged no underrun, but the poller saw its stream in XRUN $xruns times"
   pass "playback-cancel: 0 underruns over $((played / 1000)) s of playback ($streams speaker streams opened; the poller, which reads every 5 ms and can miss a short underrun, saw no XRUN)"
+  ways=$(journal_records 'speaker cancel' | jq -r '.way // ""') \
+    || unknown "playback-cancel: cannot read the speaker cancel lines from the journal$(journal_error)"
+  note "playback-cancel: the speaker logged $(grep -c . <<<"$ways") cancels: $(grep -cx rewind <<<"$ways") by rewind, $(grep -cx drop <<<"$ways") by drop"
 }
 
 # default_sentences: tts-first-audio's sentences when no file names them.
