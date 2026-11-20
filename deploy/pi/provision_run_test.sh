@@ -452,6 +452,10 @@ jq '.Peer = ([range(1000) | (10000 + . | tostring | .[1:]) as $n | {
   }] | from_entries)' "$fixtures/F-status-router" >"$fixtures/F-status-large"
 jq '("nodekey:" + "f" * 64) as $key | .Peer[$key] = {ID: "n3000", PublicKey: $key, HostName: "office-router",
     PrimaryRoutes: ["192.168.0.0/16"]}' "$fixtures/F-status-large" >"$fixtures/F-status-large-overlap"
+# F-status-control-host: F-status-router with router-a's HostName holding control characters, the
+# terminal escape sequence ESC ]0; that sets a window's title, ended by a BEL.
+jq '(.Peer[] | select(.HostName == "router-a") | .HostName) = "router-a\u001b]0;pwned\u0007"' \
+  "$fixtures/F-status-router" >"$fixtures/F-status-control-host"
 
 readonly accepted_prefix='ghost-wispr routes: no route of a peer overlaps a network of the Pi: '
 readonly not_accepting="ghost-wispr routes: not accepting the tailnet's subnet routes: an accepted route would take the Pi's own traffic for that network"
@@ -490,16 +494,18 @@ manager_expansion() {
 }
 
 # run_join runs the join's command as its unit does, on F-ip-pi and the status fixture given second,
-# with RouteAll set to the first argument beforehand. It starts a fresh log, and puts the route check
-# provision.sh installed back at the path the command names, because the command removes it. When
-# the systemd-run line lacks --expand-environment=no, the command first gets the service manager's
-# expansion. The exit status is kept in join_exit, stdout and stderr in $work_dir/join.out.
+# with RouteAll set to the first argument beforehand. It starts a fresh log, writes a token, and puts
+# the route check provision.sh installed back, each at the path the command names, because the
+# command removes both. When the systemd-run line lacks --expand-environment=no, the command first
+# gets the service manager's expansion. The exit status is kept in join_exit, stdout and stderr in
+# $work_dir/join.out.
 run_join() {
   local command options
   printf '%s\n' "$1" >"$TEST_ROUTE_ALL"
   [[ -f $TEST_LOG.installed-route-overlap-check ]] \
     || fail "provision.sh installed no route check: $TEST_LOG.installed-route-overlap-check is missing"
   cp -- "$TEST_LOG.installed-route-overlap-check" "$work_dir/join/route-overlap-check"
+  printf 'id-token' >"$work_dir/join/token"
   rm -f -- "$TEST_LOG.up-exit"
   : >"$TEST_LOG"
   command=$(<"$TEST_LOG.join")
@@ -512,6 +518,7 @@ run_join() {
 }
 
 # J1: no route overlaps a network of the Pi, so the join accepts the routes once the check passed.
+# It removes the route check and the token.
 run_join false "$fixtures/F-status-router"
 j1="the join did not accept the tailnet's subnet routes although no route overlaps the Pi's networks: $(<"$work_dir/join.out")"
 mapfile -t calls <"$TEST_LOG"
@@ -522,6 +529,7 @@ mapfile -t calls <"$TEST_LOG"
 accepted=$(grep -e "^$accepted_prefix" "$work_dir/join.out") || fail "$j1"
 [[ $accepted == *'wlan0 192.168.1.136/24'* && $accepted == *'10.1.0.0/16'* ]] || fail "$j1"
 [[ ! -e $work_dir/join/route-overlap-check ]] || fail "$j1"
+[[ ! -e $work_dir/join/token ]] || fail "the join left the token in the join directory (J1)"
 
 # J2: office-router's route holds wlan0's network, so the join refuses: it runs no `tailscale set`,
 # leaves RouteAll false, ends failed, and names the overlap.
@@ -555,11 +563,12 @@ run_join true "$fixtures/F-status-router"
 grep -Fxq 'tailscale set --accept-routes' "$TEST_LOG" || fail "a re-join with no overlapping route left RouteAll false"
 [[ $join_exit == 0 ]] || fail "a re-join with no overlapping route left RouteAll false"
 
-# J5: when `tailscale up` fails, the join stops there and ends failed.
+# J5: when `tailscale up` fails, the join stops there and ends failed. It still removes the token.
 TEST_UP_EXIT=1 run_join false "$fixtures/F-status-router"
 if [[ $join_exit == 0 ]] || grep -q -e '^tailscale serve' -e '^tailscale status --json$' -e '^tailscale set' "$TEST_LOG"; then
   fail "the join went on after tailscale up failed: $(<"$TEST_LOG")"
 fi
+[[ ! -e $work_dir/join/token ]] || fail "the join left the token in the join directory after tailscale up failed (J5)"
 
 # J6: accepting the routes does not depend on Serve, so a failed `tailscale serve` still runs the
 # check and accepts the routes, and the join ends failed.
@@ -625,6 +634,10 @@ TEST_STATUS_EXIT=1 route_row 'G19 status fails' 2 F-ip-pi F-status-router 'canno
 route_row 'G20 status prints nothing' 2 F-ip-pi F-status-empty 'cannot compare'
 route_row 'G21 status is not JSON' 2 F-ip-pi F-status-not-json 'cannot compare'
 route_row 'G22 Tailscale not running' 2 F-ip-pi F-status-needs-login 'cannot compare' 'NeedsLogin'
+route_row 'G23 control characters in a host name' 0 F-ip-pi F-status-control-host 'router-a?]0;pwned?'
+if grep -q -e $'\033' -e $'\007' "$work_dir/check.out"; then
+  fail "route check G23 control characters in a host name prints a control character: $(cat -v -- "$work_dir/check.out")"
+fi
 
 # J0: provision.sh on a Pi already joined as tag:ghost-wispr at $PI_HOST. exits before the join, so
 # it installs no route check and leaves the accept-routes setting as it is.

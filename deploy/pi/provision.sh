@@ -131,7 +131,9 @@ route_overlap_check() {
   [ -n "$status" ] || cannot_compare "tailscale status --json printed nothing"
   # The status of a large tailnet can pass the 128 KiB limit for one argument, so jq reads it on
   # stdin, from the printf builtin.
-  # jq prints the exit code on its first line, then the lines to print.
+  # jq prints the exit code on its first line, then the lines to print. Before a text from ip or
+  # tailscale goes into a line, clean replaces each control character in it with ?, because the
+  # owner of a peer sets its HostName, and a terminal runs the escape sequences that a line holds.
   verdict=$(printf '%s\n' "$status" | jq -r -s --arg ip_lines "$networks" --arg cannot "$cannot" '
     def prefix:
       if test("^[0-9]{1,3}([.][0-9]{1,3}){3}/[0-9]{1,2}$") then
@@ -146,30 +148,31 @@ route_overlap_check() {
     def overlap($a; $b): size([$a.bits, $b.bits] | min) as $size
       | ($a.number / $size | floor) == ($b.number / $size | floor);
     def refuse($step): "2\n\($cannot): \($step)";
+    def clean: tostring | gsub("[[:cntrl:]]"; "?");
     [$ip_lines | split("\n")[] | select(test("[^ \t]"))
       | {line: ., fields: [splits("[ \t]+") | select(. != "")]}
       | select(.fields[1] != "tailscale0")
       | . + {name: .fields[1], address: .fields[3], prefix: (.fields[3] // "" | prefix)}] as $networks
     | ($networks | map(select(.prefix == null)) | first) as $unread
-    | if $unread != null then refuse("ip -4 -o addr gives no IPv4 address/prefix in field 4 of: \($unread.line)")
+    | if $unread != null then refuse("ip -4 -o addr gives no IPv4 address/prefix in field 4 of: \($unread.line | clean)")
       elif ($networks | map(select(.name != "lo")) | length) == 0 then
         refuse("ip -4 -o addr gives no network other than lo and tailscale0")
       elif length != 1 then refuse("tailscale status --json gave \(length) JSON values, not one")
       elif .[0].BackendState != "Running" then
-        refuse("BackendState is \(.[0].BackendState), not Running")
+        refuse("BackendState is \(.[0].BackendState | clean), not Running")
       else
         [.[0].Peer // {} | .[] | (.HostName // "a peer with no HostName") as $host
           | .PrimaryRoutes // [] | .[] | select(contains(":") | not)
           | {route: ., host: $host, prefix: prefix}] as $routes
         | ($routes | map(select(.prefix == null)) | first) as $unknown
-        | if $unknown != null then refuse("the route \($unknown.route) of \($unknown.host) is no IPv4 or IPv6 prefix")
+        | if $unknown != null then refuse("the route \($unknown.route | clean) of \($unknown.host | clean) is no IPv4 or IPv6 prefix")
           else
             [$networks[] as $network | $routes[] as $route | select(overlap($network.prefix; $route.prefix))
-              | "ghost-wispr routes: \($network.name) \($network.address) overlaps \($route.route) of \($route.host)"]
+              | "ghost-wispr routes: \($network.name | clean) \($network.address | clean) overlaps \($route.route | clean) of \($route.host | clean)"]
             | if length > 0 then "1\n" + join("\n")
               else "0\nghost-wispr routes: no route of a peer overlaps a network of the Pi: "
-                + ($networks | map("\(.name) \(.address)") | join(", ")) + "; routes compared: "
-                + (if $routes == [] then "none" else $routes | map("\(.route) of \(.host)") | join(", ") end)
+                + ($networks | map("\(.name | clean) \(.address | clean)") | join(", ")) + "; routes compared: "
+                + (if $routes == [] then "none" else $routes | map("\(.route | clean) of \(.host | clean)") | join(", ") end)
               end
           end
       end
