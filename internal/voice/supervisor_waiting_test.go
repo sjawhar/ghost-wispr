@@ -171,8 +171,8 @@ func pendingCount(r *rig) int {
 }
 
 // TestNeverMindTwiceDropsTwoAnswers fails if two "Wispr, never mind" in a
-// row, both answered by the Concierge after the second, drop only one of two
-// held answers: each must drop its own.
+// row, the second said while the Concierge still answers the first, drop
+// only one of two held answers: each drops its own, in order.
 func TestNeverMindTwiceDropsTwoAnswers(t *testing.T) {
 	c := newFakeConcierge()
 	c.neverMindHold = make(chan struct{})
@@ -184,13 +184,86 @@ func TestNeverMindTwiceDropsTwoAnswers(t *testing.T) {
 	r.heard("Wispr, never mind.", true, true)
 	eventually(t, "the first cancel", func() bool { return len(c.neverMindCalls()) == 1 })
 	r.heard("Wispr, never mind.", true, true)
-	eventually(t, "the second cancel", func() bool { return len(c.neverMindCalls()) == 2 })
 	c.neverMindHold <- struct{}{}
+	eventually(t, "the second cancel", func() bool { return len(c.neverMindCalls()) == 2 })
 	c.neverMindHold <- struct{}{}
 	eventually(t, "the waiting light off: both answers dropped", func() bool { return !light.lit() })
 	if got := pendingCount(r); got != 0 {
 		t.Fatalf("%d answers still held after two never minds, want none", got)
 	}
+}
+
+// TestTwoNeverMindsCancelTheWorkingQuestionThenDropTheNewestAnswer fails if,
+// with one question still working and two answers held, two "Wispr, never
+// mind" in a row do anything but cancel that question and then drop the
+// newest answer: the older one still waits.
+func TestTwoNeverMindsCancelTheWorkingQuestionThenDropTheNewestAnswer(t *testing.T) {
+	c := newFakeConcierge()
+	c.working = 1
+	c.neverMindHold = make(chan struct{})
+	r, light := newWaitingRig(t, c)
+	holdAnswer(t, r, light, "t1", "One.")
+	c.answers <- PendingAnswer{TaskID: "t2", SessionID: "sess-1", Text: "Two."}
+	r.waitEvent("voice_answer_ready:sess-1")
+
+	r.heard("Wispr, never mind.", true, true)
+	eventually(t, "the first cancel", func() bool { return len(c.neverMindCalls()) == 1 })
+	r.heard("Wispr, never mind.", true, true)
+	c.neverMindHold <- struct{}{}
+	eventually(t, "the second cancel", func() bool { return len(c.neverMindCalls()) == 2 })
+	c.neverMindHold <- struct{}{}
+	eventually(t, "one answer dropped", func() bool { return pendingCount(r) == 1 })
+	r.heard("Wispr, go ahead.", true, true)
+	if got := waitSaid(t, r.waitSession()); got != "One." {
+		t.Fatalf("said %q, want the older answer: the second never mind drops the newest", got)
+	}
+}
+
+// TestAGoAheadWithNoVoiceOutlivesAnOlderNeverMind fails if a "Wispr, go
+// ahead" that could not speak, for want of a voice, leaves its answer to an
+// older never mind still running: the later word keeps it waiting.
+func TestAGoAheadWithNoVoiceOutlivesAnOlderNeverMind(t *testing.T) {
+	c := newFakeConcierge()
+	c.neverMindHold = make(chan struct{})
+	r, light := newWaitingRig(t, c)
+	holdAnswer(t, r, light, "t1", "It ships tomorrow.")
+	r.heard("Wispr, never mind.", true, true)
+	eventually(t, "the cancel asked of the Concierge", func() bool { return len(c.neverMindCalls()) == 1 })
+	r.mu.Lock()
+	r.voiceErr = errors.New("no voice")
+	r.mu.Unlock()
+	r.heard("Wispr, go ahead.", true, true)
+
+	c.neverMindHold <- struct{}{}
+	never(t, "the older never mind dropped the answer", 300*time.Millisecond, func() bool { return pendingCount(r) == 0 || !light.lit() })
+	r.mu.Lock()
+	r.voiceErr = nil
+	r.mu.Unlock()
+	r.heard("Wispr, go ahead.", true, true)
+	if got := waitSaid(t, r.waitSession()); got != "It ships tomorrow." {
+		t.Fatalf("said %q", got)
+	}
+}
+
+// TestNeverMindCutsAnAnswerSoundStillPlaying fails if the answer sound,
+// queued in full on the speaker but still playing, goes on after "Wispr,
+// never mind" drops the last answer.
+func TestNeverMindCutsAnAnswerSoundStillPlaying(t *testing.T) {
+	c := newFakeConcierge()
+	r, light := newWaitingRig(t, c)
+	holdAnswer(t, r, light, "t1", "It ships tomorrow.")
+	eventually(t, "the answer sound queued in full", func() bool {
+		r.s.mu.Lock()
+		defer r.s.mu.Unlock()
+		return r.speaker.written(audio.InputChime) > 0 && r.s.chimeCancel == nil
+	})
+	before := time.Now()
+	r.heard("Wispr, never mind.", true, true)
+	eventually(t, "the waiting light off", func() bool { return !light.lit() })
+	eventually(t, "the answer sound cut", func() bool {
+		at, ok := r.speaker.cancelledAt(audio.InputChime)
+		return ok && at.After(before)
+	})
 }
 
 // TestALaterGoAheadOutlivesAnOlderNeverMind fails if a "Wispr, never mind"
