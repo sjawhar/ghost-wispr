@@ -92,6 +92,9 @@ type staleRig struct {
 	// ready is whether the listener can run (the Jabra attached, the setting
 	// on); a test turns it off to end the stretch as a detach does.
 	ready atomic.Bool
+	// checks counts the light checks resumes ran; announcedResumed counts
+	// the times the clients were told the unit records.
+	checks, announcedResumed atomic.Int32
 }
 
 // startStaleRig runs the real listener wiring (runPausedListener) with the
@@ -103,6 +106,8 @@ func startStaleRig(t *testing.T, holdRead, holdHit, failRead bool, setup ...func
 		reading: make(chan struct{}), release: make(chan struct{}), done: make(chan struct{})}
 	r.ready.Store(true)
 	r.gate = newCaptureGate(nil, nil, nil)
+	r.gate.beforeResumeRequest = func() error { return nil }
+	r.gate.checkLightPattern = func() error { r.checks.Add(1); return nil }
 	for _, s := range setup {
 		s(r)
 	}
@@ -120,7 +125,11 @@ func startStaleRig(t *testing.T, holdRead, holdHit, failRead bool, setup ...func
 	unit := &pausedListenerUnit{
 		capture: r.gate, controls: r.controls, device: device,
 		warnings: newWarningsRegistry(), wake: func() {}, built: true,
-		hooks: &server.ControlHooks{Resume: r.controls.Resume},
+		hooks: &server.ControlHooks{Resume: r.controls.Resume, OnStatusChanged: func(paused bool) {
+			if !paused {
+				r.announcedResumed.Add(1)
+			}
+		}},
 		newDetector: func() (*local.Detector, error) {
 			return local.NewDetectorOf(holdSpotter{r: r}, startVerifier{}), nil
 		},
@@ -250,11 +259,23 @@ func TestAPhraseFromAnEndedStretchResumesNothing(t *testing.T) {
 			r.releaseOnce()
 			if tc.want == micRecording {
 				r.reaches(t, micRecording, "the phrase with no change of state")
+				if r.checks.Load() == 0 {
+					t.Fatal("control: the phrase's resume checked no light")
+				}
 				return
 			}
 			r.stays(t, tc.want, 300*time.Millisecond, "the phrase after "+tc.name)
 			if after := r.saved(); after != before {
 				t.Fatalf("the stale phrase changed the saved state from %q to %q", before, after)
+			}
+			// Its resume asked nothing: a light check would keep the listener
+			// of a new stretch deaf while it ran, and the clients would hear
+			// of a resume that never was.
+			if n := r.checks.Load(); n != 0 {
+				t.Fatalf("the stale phrase's resume ran %d light checks", n)
+			}
+			if n := r.announcedResumed.Load(); n != 0 {
+				t.Fatalf("the clients were told %d times that the unit records after the stale phrase", n)
 			}
 		})
 	}
@@ -324,6 +345,9 @@ func TestAStretchThatEndsDuringTheLightCheckWins(t *testing.T) {
 			r.stays(t, micClosed, 300*time.Millisecond, "the phrase's resume after a detach during its light check")
 			if got := r.saved(); got != savedClosed {
 				t.Fatalf("saved %q after the detach, want %q", got, savedClosed)
+			}
+			if n := r.announcedResumed.Load(); n != 0 {
+				t.Fatalf("the clients were told %d times that the unit records after the overtaken resume", n)
 			}
 		})
 	}

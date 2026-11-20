@@ -327,6 +327,10 @@ func (c *persistentControls) resume(prepare func() (resumeTicket, error)) error 
 	switch {
 	case persistErr != nil:
 		return fmt.Errorf("persist capture resume: %w", persistErr)
+	case errors.Is(err, errResumeOvertaken) && ticket.fromListener:
+		// Its stretch ended during the light check: nothing resumed, so the
+		// listener must not announce a resume.
+		return errStaleListening
 	case errors.Is(err, errResumeOvertaken):
 		return nil // the later pause saved and announced the switch off
 	case err != nil:
