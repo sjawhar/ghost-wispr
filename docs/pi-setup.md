@@ -751,8 +751,8 @@ anything**:
 
 ```bash
 PI='ssh -o BatchMode=yes -o IdentityAgent=/run/user/1000/gcr/ssh ghost-wispr@ghost-wispr.tail12ec1c.ts.net'
-$PI 'curl -fsS localhost:8080/api/status | jq -e ".paused == true and .active_session_id == \"\"" >/dev/null' ||
-  { echo 'the unit is not paused and idle; do not copy or run the probe' >&2; exit 1; }
+$PI 'curl -fsS localhost:8080/api/status | jq -e ".paused == true and .capturing == false and .active_session_id == \"\"" >/dev/null' ||
+  { echo 'the unit is not paused, not idle or still captures; do not copy or run the probe' >&2; exit 1; }
 ```
 
 The program reads the same endpoint at its start, and again after

@@ -70,6 +70,10 @@ type standIns struct {
 	// delegationSpeak is the transcript GPT-Live sends after the probe's
 	// backend answers; empty means the backend answer's evidence.
 	delegationSpeak string
+	// delegationTail sends more answer audio after the marker, to check the
+	// probe waits until the complete answer drains.
+	delegationTail time.Duration
+	tailSent       chan time.Time
 }
 
 func (s *standIns) delegationText() string {
@@ -100,6 +104,7 @@ func newStandIns(t *testing.T) *standIns {
 		start:    make(chan map[string]any, 1),
 		conns:    make(chan struct{}, 2),
 		answered: make(chan string, 4),
+		tailSent: make(chan time.Time, 1),
 	}
 	s.token = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		s.tokenCalls.Add(1)
@@ -186,7 +191,16 @@ func newStandIns(t *testing.T) *standIns {
 				if ev.DelegationID != nil && *ev.DelegationID == probeDelegation {
 					s.answered <- ev.Content
 					send(transcript(s.delegationText(), s.inputMs()))
-					send(speechDelta(time.Second))
+					send(speechDelta(100 * time.Millisecond))
+					if s.delegationTail > 0 {
+						go func() {
+							time.Sleep(s.delegationTail)
+							for range 20 {
+								send(speechDelta(100 * time.Millisecond))
+							}
+							s.tailSent <- time.Now()
+						}()
+					}
 					continue
 				}
 				s.said <- ev.Content

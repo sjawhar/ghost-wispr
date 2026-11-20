@@ -108,14 +108,24 @@ func TestSolReviewCLIParsesSafetyGuardFlags(t *testing.T) {
 			"--status-url", os.Getenv("GPTLIVE_STATUS_URL"),
 			"--timeout", "2s",
 		}
-		_ = os.Setenv("GOOGLE_API_USE_CLIENT_CERTIFICATE", "false")
-		os.Exit(run())
+		_ = os.Unsetenv(clientCertificateEnv)
+		code := run()
+		if os.Getenv(clientCertificateEnv) != "false" {
+			os.Exit(3)
+		}
+		os.Exit(code)
 	}
 	cmd := exec.Command(os.Args[0], "-test.run=TestSolReviewCLIParsesSafetyGuardFlags")
 	cmd.Env = append(os.Environ(), "GPTLIVE_CLI_HELPER=1", "GPTLIVE_STATUS_URL="+status.server.URL)
 	out, err := cmd.CombinedOutput()
 	exit, ok := err.(*exec.ExitError)
-	if !ok || exit.ExitCode() != 1 {
+	if !ok {
+		t.Fatalf("run exit = %v, want 1; output:\n%s", err, out)
+	}
+	if exit.ExitCode() == 3 {
+		t.Fatalf("run did not call clientCertificatesOff in production; output:\n%s", out)
+	}
+	if exit.ExitCode() != 1 {
 		t.Fatalf("run exit = %v, want 1; output:\n%s", err, out)
 	}
 	if strings.Contains(string(out), "needs --identity-provider-id") || !strings.Contains(string(out), "probe safety guard at start") {

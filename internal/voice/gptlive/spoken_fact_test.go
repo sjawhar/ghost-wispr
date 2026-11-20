@@ -30,9 +30,8 @@ func waitFactCheck(t *testing.T, s voice.Session) int {
 	}
 }
 
-// GPT-Live can paraphrase a written fact. Count each changed issue key, pull
-// request number and figure after speech without holding or changing the
-// words the room hears.
+// GPT-Live can paraphrase a written fact. Count the shared R8 ear-check
+// verdict after speech without holding or changing the words the room hears.
 func TestSpokenFactCheckCountsChangedKeysAndFigures(t *testing.T) {
 	srv := newLiveServer(t)
 	s, c, _ := openSession(t, srv, testExchange(newFakeOutput(), newFakeTools(voice.AnswerResult{})))
@@ -46,8 +45,8 @@ func TestSpokenFactCheckCountsChangedKeysAndFigures(t *testing.T) {
 	if err := <-done; err != nil {
 		t.Fatalf("Say: %v", err)
 	}
-	if got := waitFactCheck(t, s); got != 6 {
-		t.Fatalf("spoken fact errors = %d, want 6 for three changed facts", got)
+	if got := waitFactCheck(t, s); got != 1 {
+		t.Fatalf("spoken fact errors = %d, want one failed R8 verdict", got)
 	}
 }
 
@@ -84,7 +83,30 @@ func TestSpokenFactCheckCoversHeldAnswer(t *testing.T) {
 	if err := <-done; err != nil {
 		t.Fatalf("Deliver: %v", err)
 	}
-	if got := waitFactCheck(t, s); got != 2 {
-		t.Fatalf("held answer errors = %d, want 2 for a changed issue key", got)
+	if got := waitFactCheck(t, s); got != 1 {
+		t.Fatalf("held answer errors = %d, want one failed R8 verdict", got)
+	}
+}
+
+// The voice B count is Concierge's R8 result: names and form matter, while
+// a figure read in words is the same figure.
+func TestSpokenFactCheckUsesConciergeR8(t *testing.T) {
+	for name, c := range map[string]struct {
+		source string
+		spoken string
+		want   int
+	}{
+		"unchanged":      {"The owner is Alice. PR 3 is ready.", "The owner is Alice. PR 3 is ready.", 0},
+		"name changed":   {"The owner is Alice. PR 3 is ready.", "The owner is Bob. PR 3 is ready.", 1},
+		"number words":   {"PR 3 is ready.", "PR three is ready.", 0},
+		"four sentences": {"PR 3 is ready.", "One. Two. Three. Four.", 1},
+		"changed key":    {"ABC-123 is ready.", "ABC-999 is ready.", 1},
+		"changed figure": {"PR 3 is ready.", "PR 4 is ready.", 1},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if got := spokenFactErrors(c.source, c.spoken); got != c.want {
+				t.Fatalf("spokenFactErrors(%q, %q) = %d, want %d", c.source, c.spoken, got, c.want)
+			}
+		})
 	}
 }

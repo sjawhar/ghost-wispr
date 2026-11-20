@@ -1,9 +1,9 @@
 package gptlive
 
 import (
-	"regexp"
 	"strings"
 
+	"github.com/sjawhar/ghost-wispr/internal/earcheck"
 	"github.com/sjawhar/ghost-wispr/internal/voice"
 )
 
@@ -15,12 +15,12 @@ type factAudit struct {
 	actual strings.Builder
 }
 
-var factToken = regexp.MustCompile(`(?i)\b(?:[a-z][a-z0-9]+-\d+|pr\s*#?\s*\d+|\d+(?:\.\d+)?%?)\b`)
-
-// beginFactAudit starts measuring a fact or an answer. Empty sources hold no
-// keys or figures and do not need an audit.
+// beginFactAudit starts measuring a fact or an answer. Empty sources need no
+// audit. The shared R8 checker is the sole check for Concierge rewrites and
+// GPT-Live speech: names, key and figure rules, number words and ear form
+// all stay the same.
 func (s *session) beginFactAudit(source string) *factAudit {
-	if len(factToken.FindAllString(source, -1)) == 0 {
+	if strings.TrimSpace(source) == "" {
 		return nil
 	}
 	a := &factAudit{source: source}
@@ -32,8 +32,8 @@ func (s *session) beginFactAudit(source string) *factAudit {
 
 // recordFactText adds actual model words to every fact that is waiting for
 // its speech to finish. Sessions normally speak one answer at a time; this
-// makes a concurrent app-owned acknowledgement conservative: its identifiers
-// count as unexpected rather than disappearing from the measurement.
+// makes a concurrent app-owned acknowledgement conservative: its words are
+// checked rather than disappearing from the measurement.
 func (s *session) recordFactText(text string) {
 	s.factMu.Lock()
 	defer s.factMu.Unlock()
@@ -74,30 +74,12 @@ func (s *session) finishFactAudits() {
 // no source or spoken words.
 func (s *session) SpokenFactErrors() int { return int(s.factErrors.Load()) }
 
-// spokenFactErrors counts changed or dropped issue keys, pull request
-// numbers and figures. Every missing written token and every unexpected
-// spoken token is one error. Other words are deliberate paraphrase space.
+// spokenFactErrors counts R8 verdicts: a valid spoken rewrite is zero and an
+// invented name, changed key/figure or failed ear form is one. The count has
+// no fact text, so the room test can record it safely.
 func spokenFactErrors(source, spoken string) int {
-	want, got := factTokens(source), factTokens(spoken)
-	errors := 0
-	for token, n := range want {
-		if got[token] < n {
-			errors += n - got[token]
-		}
+	if earcheck.Check(spoken, source, "") != "" {
+		return 1
 	}
-	for token, n := range got {
-		if want[token] < n {
-			errors += n - want[token]
-		}
-	}
-	return errors
-}
-
-func factTokens(text string) map[string]int {
-	out := map[string]int{}
-	for _, token := range factToken.FindAllString(text, -1) {
-		normalized := strings.ToUpper(strings.ReplaceAll(strings.ReplaceAll(token, "#", ""), " ", ""))
-		out[normalized]++
-	}
-	return out
+	return 0
 }

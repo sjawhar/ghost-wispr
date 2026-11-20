@@ -105,6 +105,10 @@ type probeConfig struct {
 // to hear synthetic audio alongside a person.
 const defaultStatusURL = "http://localhost:8080/api/status"
 
+// answerTailQuiet is the quiet after a delegated answer's audio stops before
+// the probe calls it complete.
+const answerTailQuiet = 2 * time.Second
+
 // delegateWait is how long the probe waits, after its question ends, for
 // GPT-Live to delegate it and for the answer to start playing.
 const delegateWait = 20 * time.Second
@@ -133,6 +137,7 @@ func run() int {
 	statusURL := flag.String("status-url", defaultStatusURL, "the office unit's local /api/status endpoint; it must say paused, not capturing and no active session")
 	timeout := flag.Duration("timeout", 3*time.Minute, "give up after this long")
 	flag.Parse()
+	clientCertificatesOff()
 	if *provider == "" || *account == "" {
 		printf(os.Stderr, "gptlive-probe needs --identity-provider-id and --service-account-id\n")
 		return 2
@@ -408,6 +413,7 @@ type events struct {
 	text     strings.Builder
 	first    error
 	spoken   []spoken
+	ended    []time.Time
 	open     bool      // a speech is under way
 	pending  time.Time // a word that came between speeches, for the next
 	factErrs int
@@ -440,6 +446,7 @@ func watch(c <-chan voice.Event) *events {
 				e.open, e.pending = true, time.Time{}
 			case voice.EventSpeechEnded:
 				e.open = false
+				e.ended = append(e.ended, now)
 			case voice.EventFactCheck:
 				e.factErrs += ev.Count
 			case voice.EventErr:
@@ -475,6 +482,17 @@ func (e *events) factErrors() int {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	return e.factErrs
+}
+
+func (e *events) endedAfter(at time.Time) bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	for _, ended := range e.ended {
+		if ended.After(at) {
+			return true
+		}
+	}
+	return false
 }
 
 // feeder waits for the safety guard before it feeds the tap. It sends the
@@ -579,23 +597,26 @@ func delegation(ctx context.Context, cfg *probeConfig, in *feeder, tools *probeT
 			return ctx.Err()
 		}
 	}
-	// Let the answer play to its end, for its words and lead, and require the
-	// backend's code-like fact. An acknowledgement such as "One moment" is
-	// not a delegation round trip.
-	for last := rec.duration(); ; {
-		if evidence(seen.words(), delegationEvidence) {
+	// The marker proves the backend answer reached GPT-Live, not that the
+	// model finished it. Require its speech to end and its recorded audio to
+	// stay unchanged after that, so a key in chunk 1 of 20 cannot pass a
+	// truncated answer.
+	last, quietAt := rec.duration(), time.Now()
+	for {
+		now := rec.duration()
+		if now != last {
+			last, quietAt = now, time.Now()
+		}
+		if evidence(seen.words(), delegationEvidence) && seen.endedAfter(called) && time.Since(quietAt) >= answerTailQuiet {
 			return nil
 		}
 		if time.Now().After(deadline) {
-			return fmt.Errorf("delegation: the backend answered, but GPT-Live did not speak its answer's %s", delegationEvidence)
+			return fmt.Errorf("delegation: the backend answer did not finish and drain after its %s marker", delegationEvidence)
 		}
 		select {
 		case <-time.After(50 * time.Millisecond):
 		case <-ctx.Done():
 			return ctx.Err()
-		}
-		if now := rec.duration(); now != last {
-			last = now
 		}
 	}
 }
