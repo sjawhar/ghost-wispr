@@ -489,6 +489,119 @@ func TestResilientClient_OnStateChange(t *testing.T) {
 	}
 }
 
+// TestResilientClient_StateChangesArriveInOrder fails if two quick changes can
+// reach OnStateChange reversed. On the office Pi on 2026-11-20 a resume's
+// draining and connected reached the web clients 25 µs apart in the wrong
+// order, so every client held "draining" while Deepgram was connected. The
+// callback for the first change here waits until the second has been handed
+// over, or 1 s: a client that hands each change over on a goroutine of its own
+// hands the second over first, and the pair is recorded reversed.
+func TestResilientClient_StateChangesArriveInOrder(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var mu sync.Mutex
+	var got []ConnectionState
+	secondHandedOver := make(chan struct{})
+	both := make(chan struct{})
+	record := func(state ConnectionState) {
+		mu.Lock()
+		defer mu.Unlock()
+		got = append(got, state)
+		switch len(got) {
+		case 1:
+			if state == StateConnected {
+				close(secondHandedOver)
+			}
+		case 2:
+			close(both)
+		}
+	}
+	rc := NewResilientClient(ctx, nil, ResilientConfig{BufferSize: 1024}, nil, func(state ConnectionState) {
+		if state == StateDraining {
+			select {
+			case <-secondHandedOver:
+			case <-time.After(time.Second):
+			}
+		}
+		record(state)
+	})
+	rc.Mu.Lock()
+	rc.State = StateReconnecting
+	rc.setStateLocked(StateDraining)
+	rc.Mu.Unlock()
+	rc.Mu.Lock()
+	rc.setStateLocked(StateConnected)
+	rc.Mu.Unlock()
+
+	select {
+	case <-both:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the two state changes did not both reach OnStateChange within 5 s")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if want := []ConnectionState{StateDraining, StateConnected}; !slices.Equal(got, want) {
+		t.Fatalf("OnStateChange got %v, want %v: the client's last state is connected, but a listener that keeps the last change it got holds %v", got, want, got[len(got)-1])
+	}
+}
+
+// TestResilientClient_AStuckStateCallbackNeverHoldsTheAudio fails if a state
+// change waits for OnStateChange: Write changes the state on the capture path
+// (a socket that refuses a write), and the microphone's audio must keep going
+// in while a callback is stuck. It also fails if the changes made meanwhile
+// are lost or reordered once the callback is free again.
+func TestResilientClient_AStuckStateCallbackNeverHoldsTheAudio(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	release := make(chan struct{})
+	var mu sync.Mutex
+	var got []ConnectionState
+	rc := NewResilientClient(ctx, nil, ResilientConfig{BufferSize: 1 << 16, InitialReconnectDelay: time.Hour, MaxReconnectBackoff: time.Hour}, nil, func(state ConnectionState) {
+		<-release
+		mu.Lock()
+		defer mu.Unlock()
+		got = append(got, state)
+	})
+	rc.State = StateConnected
+	rc.Client = &mockWriter{writeErr: errors.New("socket closed")}
+
+	wrote := make(chan struct{})
+	go func() {
+		defer close(wrote)
+		// The first write fails on the socket: disconnected, then reconnecting,
+		// with the callback stuck on the first. The rest are buffered.
+		for range 50 {
+			_, _ = rc.Write(make([]byte, 320))
+		}
+	}()
+	select {
+	case <-wrote:
+	case <-time.After(2 * time.Second):
+		close(release)
+		t.Fatal("50 writes did not return within 2 s while OnStateChange was stuck: a state change held the capture path")
+	}
+	if rc.IsConnected() {
+		t.Fatal("the client reads connected after its socket refused a write")
+	}
+
+	close(release)
+	waitFor := time.Now().Add(5 * time.Second)
+	for {
+		mu.Lock()
+		n := len(got)
+		mu.Unlock()
+		if n >= 2 || time.Now().After(waitFor) {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if want := []ConnectionState{StateDisconnected, StateReconnecting}; !slices.Equal(got, want) {
+		t.Fatalf("once the callback was free it got %v, want %v", got, want)
+	}
+}
+
 func TestResilientClient_Close(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

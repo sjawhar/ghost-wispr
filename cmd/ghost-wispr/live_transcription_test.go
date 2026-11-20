@@ -17,6 +17,7 @@ import (
 	interfaces "github.com/deepgram/deepgram-go-sdk/v3/pkg/client/interfaces"
 	"github.com/dvonthenen/websocket"
 
+	"github.com/sjawhar/ghost-wispr/internal/server"
 	"github.com/sjawhar/ghost-wispr/internal/transcribe"
 )
 
@@ -210,6 +211,55 @@ func TestDeepgramWarningFollowsLaterDisconnects(t *testing.T) {
 	time.Sleep(300 * time.Millisecond)
 	if !rc.IsConnected() || notConnectedWarning(warnings) {
 		t.Fatalf("300 ms after reconnecting: connected=%t, warnings %q; want connected and no warning", rc.IsConnected(), warnings.List())
+	}
+}
+
+// hubDeepgramStatus is the "deepgram" status the hub hands a web client that
+// connects now: the last one it broadcast.
+func hubDeepgramStatus(hub *server.Hub) string {
+	for _, event := range hub.SnapshotComponentStatuses() {
+		if event.Component == "deepgram" {
+			return event.Status
+		}
+	}
+	return ""
+}
+
+// TestTheHubsDeepgramStatusEndsAtTheClientsState fails if the "deepgram"
+// status the web clients hold is not the client's own state once it settles,
+// after the first dial and after each reconnect. On the office Pi on
+// 2026-11-20 the hub sent connected and then draining, so the page and the
+// acceptance driver read "draining" for as long as Deepgram stayed connected.
+func TestTheHubsDeepgramStatusEndsAtTheClientsState(t *testing.T) {
+	peer, host := startSwitchableDeepgram(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	hub := server.NewHub()
+	rc := newLiveTranscription(ctx, "test-key",
+		&interfaces.ClientOptions{Host: host, EnableKeepAlive: true},
+		&interfaces.LiveTranscriptionOptions{Model: "nova-3", Language: "en-US", Encoding: "linear16", SampleRate: 16000, Channels: 1},
+		transcribe.ResilientConfig{BufferSize: 1 << 16, InitialReconnectDelay: 20 * time.Millisecond, MaxReconnectBackoff: 50 * time.Millisecond},
+		transcriptCallback{}, newWarningsRegistry(), hub)
+	t.Cleanup(func() { _ = rc.Close() })
+
+	settled := func(what string) {
+		t.Helper()
+		waitForHardwareWithin(t, 5*time.Second, what, func() bool {
+			return rc.IsConnected() && hubDeepgramStatus(hub) == "connected"
+		})
+		time.Sleep(100 * time.Millisecond)
+		if got := hubDeepgramStatus(hub); !rc.IsConnected() || got != "connected" {
+			t.Fatalf("%s: 100 ms later the client is connected=%t and the hub's deepgram status is %q, want connected", what, rc.IsConnected(), got)
+		}
+	}
+	settled("the first dial: client connected and the hub's status connected")
+	for round := 1; round <= 5; round++ {
+		peer.dropAll()
+		waitForHardwareWithin(t, 3*time.Second, "the client to notice the drop", func() bool {
+			_, _ = rc.Write(make([]byte, 3200))
+			return !rc.IsConnected()
+		})
+		settled("a reconnect: client connected and the hub's status connected")
 	}
 }
 

@@ -112,7 +112,10 @@ type ResilientClient struct {
 	// Client is the current underlying io.WriteCloser (Deepgram SDK client).
 	Client io.WriteCloser
 
-	// OnStateChange is an optional callback for state transitions.
+	// OnStateChange is an optional callback for state transitions. It gets
+	// every change, one at a time and in the order the changes happened, on
+	// a goroutine that holds no lock of the client's (notifyStateChanges), so
+	// a slow callback delays later callbacks, never the audio.
 	OnStateChange ConnectionCallback
 
 	// ctx is the application context; cancellation stops the reconnect loop.
@@ -142,4 +145,9 @@ type ResilientClient struct {
 	queuedAhead    func() int64
 	drops          []streamDrop
 	forgottenDrops int64
+	// stateChanges are the changes not yet handed to OnStateChange, oldest
+	// first, and notifying says a goroutine is handing them over. Guarded by
+	// Mu.
+	stateChanges []ConnectionState
+	notifying    bool
 }

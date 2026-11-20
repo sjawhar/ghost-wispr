@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"log"
-	"sync"
 
 	interfaces "github.com/deepgram/deepgram-go-sdk/v3/pkg/client/interfaces"
 
@@ -55,23 +54,16 @@ type liveManager interface {
 // manager takes one, so a session's recording starts before the first words
 // Deepgram hears, even when it hears them late after a reconnect.
 func newLiveTranscription(ctx context.Context, apiKey string, cOptions *interfaces.ClientOptions, tOptions *interfaces.LiveTranscriptionOptions, config transcribe.ResilientConfig, callback transcriptCallback, warnings *warningsRegistry, hub *server.Hub) *transcribe.ResilientClient {
-	var rc *transcribe.ResilientClient
-	// syncWarning sets the warning from the client's state as it is now. The
-	// client reports each change on a goroutine of its own, so reports can
-	// arrive out of order; reading the state under one lock still leaves the
-	// warning matching the last state.
-	var warningMu sync.Mutex
-	syncWarning := func() {
-		warningMu.Lock()
-		defer warningMu.Unlock()
-		if rc.IsConnected() {
+	// The client hands each change of its state to this callback in the order
+	// the changes happened (transcribe.ResilientClient.OnStateChange), so the
+	// warning and the hub's "deepgram" status both end at the client's last
+	// state, and every web client sees the changes in that order.
+	rc := transcribe.NewResilientClient(ctx, nil, config, log.Printf, func(state transcribe.ConnectionState) {
+		if state == transcribe.StateConnected {
 			warnings.Clear(deepgramWarningKey)
 		} else {
 			warnings.Set(deepgramWarningKey, deepgramNotConnected)
 		}
-	}
-	rc = transcribe.NewResilientClient(ctx, nil, config, log.Printf, func(state transcribe.ConnectionState) {
-		syncWarning()
 		if hub != nil {
 			hub.BroadcastComponentStatus("deepgram", state.String(), fmt.Sprintf("Deepgram %s", state.String()))
 		}

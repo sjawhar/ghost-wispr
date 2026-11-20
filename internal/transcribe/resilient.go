@@ -127,14 +127,43 @@ func (rc *ResilientClient) Close() error {
 	return nil
 }
 
-// setStateLocked updates state and invokes callback. Must be called with rc.Mu held.
+// setStateLocked updates state and queues the change for OnStateChange. Must
+// be called with rc.Mu held. It never waits for the callback: Write calls it
+// on the capture path.
 func (rc *ResilientClient) setStateLocked(newState ConnectionState) {
 	if rc.State == newState {
 		return
 	}
 	rc.State = newState
-	if rc.OnStateChange != nil {
-		go rc.OnStateChange(newState)
+	if rc.OnStateChange == nil {
+		return
+	}
+	rc.stateChanges = append(rc.stateChanges, newState)
+	if !rc.notifying {
+		rc.notifying = true
+		go rc.notifyStateChanges()
+	}
+}
+
+// notifyStateChanges hands the queued changes to OnStateChange one at a time,
+// oldest first, with Mu released during each call, and returns once none is
+// left. Each change used to get a goroutine of its own, so two quick changes
+// could reach the callback reversed: on the office Pi on 2026-11-20 a resume's
+// draining and connected reached the web clients in the wrong order, and
+// every client held "draining" while Deepgram was connected.
+func (rc *ResilientClient) notifyStateChanges() {
+	for {
+		rc.Mu.Lock()
+		if len(rc.stateChanges) == 0 {
+			rc.stateChanges = nil
+			rc.notifying = false
+			rc.Mu.Unlock()
+			return
+		}
+		state := rc.stateChanges[0]
+		rc.stateChanges = rc.stateChanges[1:]
+		rc.Mu.Unlock()
+		rc.OnStateChange(state)
 	}
 }
 
