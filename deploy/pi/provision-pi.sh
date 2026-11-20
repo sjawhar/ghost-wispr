@@ -5,19 +5,21 @@
 #
 #   --prepared DIR     the bundle's public files, made as docs/pi-setup.md says: device.crt,
 #                      google-credentials.json, certificate_config.json, tailscale-client-id,
-#                      tailscale-subject.
+#                      tailscale-subject; and, for the meeting voice, the unit's own Dispatch
+#                      token as dispatch-token, one line, mode 0600 (docs/pi-setup.md, "Turn on
+#                      the meeting voice").
 #
-# The Deepgram key comes from `secrets DEEPGRAM_API_KEY` on this machine. It reaches disk only in a
-# mode-0700 directory under $XDG_RUNTIME_DIR, while the tar stream for provision.sh is made. That
-# directory is removed as soon as provision.sh returns, whether it worked or not, and on any exit.
-# No secret is put in an argument. The bundle holds no Envoy credential: the recorder publishes to
-# the Envoy hub over the tailnet with none.
+# The Deepgram key comes from `secrets DEEPGRAM_API_KEY` on this machine. It and the Dispatch token
+# reach the bundle only through a mode-0700 directory under $XDG_RUNTIME_DIR, while the tar stream
+# for provision.sh is made. That directory is removed as soon as provision.sh returns, whether it
+# worked or not, and on any exit. No secret is put in an argument. The bundle holds no Envoy
+# credential: the recorder publishes to the Envoy hub over the tailnet with none.
 set -euo pipefail
 umask 077
 
 readonly PREPARED_FILES=(device.crt google-credentials.json certificate_config.json tailscale-client-id
   tailscale-subject)
-readonly SECRET_FILES=(deepgram-key)
+readonly DISPATCH_TOKEN_FILE=dispatch-token
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 readonly script_dir
 repo_root="$(cd -- "$script_dir/../.." && pwd)"
@@ -34,7 +36,7 @@ fail() {
   log "FAILED: $*"
   exit 1
 }
-usage() { sed -n '4,8p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '4,10p' "$0" | sed 's/^# \{0,1\}//'; }
 
 prepared=
 while [[ $# -gt 0 ]]; do
@@ -61,6 +63,17 @@ done
 for f in "${PREPARED_FILES[@]}"; do
   [[ -f $prepared/$f && ! -L $prepared/$f && -s $prepared/$f ]] || fail "missing $prepared/$f"
 done
+# The bundle's secrets: the Deepgram key, and the unit's own Dispatch token when $prepared holds
+# one. Without the token the meeting voice says it cannot reach Dispatch yet.
+secret_files=(deepgram-key)
+with_dispatch_token=false
+if [[ -e $prepared/$DISPATCH_TOKEN_FILE || -L $prepared/$DISPATCH_TOKEN_FILE ]]; then
+  [[ -f $prepared/$DISPATCH_TOKEN_FILE && ! -L $prepared/$DISPATCH_TOKEN_FILE && -s $prepared/$DISPATCH_TOKEN_FILE ]] \
+    || fail "$prepared/$DISPATCH_TOKEN_FILE must be a regular file that is not empty"
+  with_dispatch_token=true
+  secret_files+=("$DISPATCH_TOKEN_FILE")
+fi
+readonly secret_files with_dispatch_token
 [[ -n ${XDG_RUNTIME_DIR:-} && -d $XDG_RUNTIME_DIR && -O $XDG_RUNTIME_DIR ]] \
   || fail "XDG_RUNTIME_DIR must name this user's runtime directory, which holds the secrets while the bundle is made"
 
@@ -97,6 +110,9 @@ done
 # shellcheck disable=SC2016 # The child shell expands the key the secrets store gave it.
 secrets DEEPGRAM_API_KEY -- sh -c 'printf %s "$DEEPGRAM_API_KEY" >"$1"' sh "$stage/deepgram-key"
 [[ -s $stage/deepgram-key ]] || fail "DEEPGRAM_API_KEY came back empty"
+if [[ $with_dispatch_token == true ]]; then
+  cp -- "$prepared/$DISPATCH_TOKEN_FILE" "$stage/$DISPATCH_TOKEN_FILE"
+fi
 
 log "running provision.sh on the Pi"
 # provision.sh's output is kept to tell the expected drop from another one: Tailscale's
@@ -104,7 +120,7 @@ log "running provision.sh on the Pi"
 provision_log=$(mktemp -p "$XDG_RUNTIME_DIR" ghost-wispr-provision-log.XXXXXX)
 set +e
 # shellcheck disable=SC2029 # remote_dir is the path the Pi printed; it expands here on purpose.
-tar -C "$stage" -cf - "${PREPARED_FILES[@]}" "${SECRET_FILES[@]}" | ssh "$PI" "$remote_dir/deploy/pi/provision.sh" | tee "$provision_log"
+tar -C "$stage" -cf - "${PREPARED_FILES[@]}" "${secret_files[@]}" | ssh "$PI" "$remote_dir/deploy/pi/provision.sh" | tee "$provision_log"
 provision_rc=${PIPESTATUS[1]}
 set -e
 rm -rf -- "$stage"

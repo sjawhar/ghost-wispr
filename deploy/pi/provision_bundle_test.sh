@@ -23,25 +23,39 @@ fail() {
   exit 1
 }
 
-# block prints the bash block that follows the runbook's marker for name.
+# block prints the bash block that follows the runbook's marker for name. The marker and the block
+# may be indented, as in a list item.
 block() {
   awk -v marker="<!-- provision_bundle_test.sh: $1 -->" '
-    $0 == marker { found = 1; next }
-    found && !capture && /^```bash$/ { capture = 1; next }
-    capture && /^```$/ { exit }
+    { line = $0; sub(/^ +/, "", line) }
+    line == marker { found = 1; next }
+    found && !capture && line == "```bash" { capture = 1; next }
+    capture && line == "```" { exit }
     capture { print }
   ' "$doc"
 }
 
-for name in credentials prepare provision accept renew; do
+for name in credentials prepare dispatch-token provision accept renew; do
   [[ -n $(block "$name") ]] || fail "docs/pi-setup.md has no bash block after <!-- provision_bundle_test.sh: $name -->"
 done
-runbook="$work_dir/runbook.sh"
-{
+# compose prints the runbook's credential, prepare and provision blocks in order, with the lines
+# given as arguments between the prepare block and the provision block.
+compose() {
   block credentials
   block prepare
+  [[ $# -eq 0 ]] || printf '%s\n' "$@"
   block provision
-} >"$runbook"
+}
+runbook="$work_dir/runbook.sh"
+compose >"$runbook"
+# The meeting voice's step ("Turn on the meeting voice") mints the unit's own Dispatch token into
+# $prepared/dispatch-token before the provision block runs. The other token runbooks put a link to
+# nothing there, and an empty file.
+compose "$(block dispatch-token)" >"$work_dir/runbook-token.sh"
+# shellcheck disable=SC2016 # The lines are runbook text, expanded when the runbook runs.
+compose 'ln -s "$prepared/no-such-token" "$prepared/dispatch-token"' >"$work_dir/runbook-token-link.sh"
+# shellcheck disable=SC2016
+compose '(umask 077 && : >"$prepared/dispatch-token")' >"$work_dir/runbook-token-empty.sh"
 # The slice 1 block, with the acceptance driver replaced by one that reports what it was given.
 accept="$work_dir/accept.sh"
 # shellcheck disable=SC2016 # The replacement is the runbook's text, expanded when the block runs.
@@ -49,10 +63,13 @@ block accept | sed 's#^deploy/pi/accept-slice1\.sh$#"$TEST_ACCEPT_DRIVER"#' >"$a
 grep -q TEST_ACCEPT_DRIVER "$accept" || fail "the slice 1 block does not end by running deploy/pi/accept-slice1.sh"
 
 readonly DEEPGRAM_SECRET=deepgram-secret-value-0123456789abcdef
+# The unit's Dispatch token that the fake Dispatch mints, and the operator's own token it takes.
+readonly DISPATCH_SECRET=dispatch-token-secret-value-0123456789abcdef
+readonly OPERATOR_DISPATCH_SECRET=operator-dispatch-secret-value-0123456789abcdef
 readonly CLIENT_ID=k-test-client-id
 readonly SUBJECT=123456789012345678901
 deepgram_key_name="DEEPGRAM""_API_KEY"
-export DEEPGRAM_SECRET CLIENT_ID SUBJECT deepgram_key_name
+export DEEPGRAM_SECRET DISPATCH_SECRET OPERATOR_DISPATCH_SECRET CLIENT_ID SUBJECT deepgram_key_name
 
 mkdir -p "$work_dir/bin"
 # A real certificate, so the runbook's openssl check runs for real.
@@ -85,13 +102,23 @@ cat >"$work_dir/bin/gh" <<'EOF'
 set -euo pipefail
 printf 'gh %s\n' "$*" >>"$TEST_ARGV_LOG"
 jq_filter=
+escapes_allowed=false
 args=()
 while [[ $# -gt 0 ]]; do
   case $1 in
     --jq) jq_filter=$2; shift 2 ;;
+    --allow-escape-sequences) escapes_allowed=true; shift ;;
     *) args+=("$1"); shift ;;
   esac
 done
+# A job log carries the runner's colour codes, and gh refuses to print one without the flag.
+job_log() {
+  [[ $escapes_allowed == true ]] || {
+    printf 'fake gh: the response contains terminal escape sequences; pass --allow-escape-sequences to output it anyway\n' >&2
+    exit 1
+  }
+  printf '%s\n' "$@"
+}
 answer() {
   if [[ -n $jq_filter ]]; then jq -r "$jq_filter"; else cat; fi
 }
@@ -109,11 +136,11 @@ root_job() {
   printf '{"id":%s,"name":"root","status":"%s","conclusion":%s,"steps":[%s]}]}\n' "$1" "$2" "$3" "$4"
 }
 step=$(printf '{"started_at":"%s"}' "$recent")
-preview='2026-11-16T06:20:21.4658172Z   + exampleTailnetClientId                   : [unknown]'
-created='2026-11-16T06:25:09.3203883Z  +  tailscale:index:FederatedIdentity example-x509 created (1s) '
+preview=$'2026-11-16T06:20:21.4658172Z   + exampleTailnetClientId                   : [unknown]'
+created=$'2026-11-16T06:25:09.3203883Z \e[0;32m +  tailscale:index:FederatedIdentity example-x509 created (1s) \e[0m'
 created_id() { printf '2026-11-16T06:29:36.3829213Z   + exampleTailnetClientId                   : "%s"\n' "$1"; }
-preview_replace='2026-11-16T06:20:21.4658172Z   ~ exampleTailnetClientId                   : "k-stale-client-id" => [unknown]'
-replaced='2026-11-16T06:25:09.3203883Z  +-  tailscale:index:FederatedIdentity example-x509 replaced (1s) [diff: ~audience]'
+preview_replace=$'2026-11-16T06:20:21.4658172Z   ~ exampleTailnetClientId                   : "k-stale-client-id" => [unknown]'
+replaced=$'2026-11-16T06:25:09.3203883Z \e[0;33m +-  tailscale:index:FederatedIdentity example-x509 replaced (1s) [diff: ~audience]\e[0m'
 replaced_id='2026-11-16T06:29:36.3829213Z   ~ exampleTailnetClientId                   : "k-stale-client-id" => "'"$CLIENT_ID"'"'
 case "${args[*]}" in
   "api $api/workflows/seed.yaml/runs?per_page=100&page="*)
@@ -147,26 +174,26 @@ case "${args[*]}" in
       printf 'fake gh: HTTP 502: Server Error\n' >&2
       exit 1
     fi
-    printf '%s\n' "$preview"
+    job_log "$preview"
     ;;
-  "api $api/jobs/90331/logs") printf '%s\n' "$preview_replace" ;;
+  "api $api/jobs/90331/logs") job_log "$preview_replace" ;;
   "api $api/jobs/90321/logs")
     if [[ -n ${TEST_CREATION_EXPIRED:-} ]]; then
-      printf '%s\n' "$preview"
+      job_log "$preview"
     elif [[ ${TEST_CREATION_FORM:-} == create ]]; then
-      printf '%s\n' "$preview" "$created" "$(created_id "$CLIENT_ID")"
+      job_log "$preview" "$created" "$(created_id "$CLIENT_ID")"
     else
-      printf '%s\n' "$preview_replace" "$replaced" "$replaced_id"
+      job_log "$preview_replace" "$replaced" "$replaced_id"
     fi
     ;;
   "api $api/jobs/90311/logs" | "api $api/jobs/90211/logs")
     if [[ -n ${TEST_CREATION_EXPIRED:-} ]]; then
-      printf '%s\n' "$preview"
+      job_log "$preview"
     else
-      printf '%s\n' "$preview" "$created" "$(created_id k-stale-client-id)"
+      job_log "$preview" "$created" "$(created_id k-stale-client-id)"
     fi
     ;;
-  "api $api/jobs/90111/logs") printf '%s\n' "$preview" "$created" "$(created_id k-expired-client-id)" ;;
+  "api $api/jobs/90111/logs") job_log "$preview" "$created" "$(created_id k-expired-client-id)" ;;
   *) not_found ;;
 esac
 EOF
@@ -209,6 +236,20 @@ printf 'secrets %s\n' "$*" >>"$TEST_ARGV_LOG"
 [[ $1 == "$deepgram_key_name" && $2 == -- ]]
 shift 2
 env "$deepgram_key_name=$DEEPGRAM_SECRET" "$@"
+EOF
+
+# curl answers as Dispatch does to the mint of an agent token, whose answer is the one place the
+# new token shows. It answers only the operator's own token, given as a header on stdin.
+cat >"$work_dir/bin/curl" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+printf 'curl %s\n' "$*" >>"$TEST_ARGV_LOG"
+expected=(-fsS -H @- -H 'Content-Type: application/json' --data '{"name":"ghost-wispr-office-pi","scopes":[]}'
+  https://dispatch.example-tailnet.ts.net/api/v1/me/agent-tokens)
+[[ "$*" == "${expected[*]}" ]] || { printf 'fake curl: unexpected call: %s\n' "$*" >&2; exit 2; }
+[[ $(cat) == "Authorization: Bearer $OPERATOR_DISPATCH_SECRET" ]] || { printf 'fake curl: 401\n' >&2; exit 22; }
+jq -n --arg token "$DISPATCH_SECRET" \
+  '{id: "00000000-0000-4000-8000-000000000001", name: "ghost-wispr-office-pi", prefix: "dispatch", scopes: [], token: $token}'
 EOF
 
 # ssh reaches the fake Pi.
@@ -255,7 +296,7 @@ for subject in 987654321098765432109 "$SUBJECT"; do
 done
 git -C "$infra_seed" push --quiet "$infra_origin" main
 
-# run_runbook runs the runbook's blocks in a fresh home.
+# run_runbook runs the runbook's blocks in a fresh home: TEST_RUNBOOK names another composition.
 run_runbook() {
   local case_dir=$1
   mkdir -p "$case_dir/home/src" "$case_dir/tmp" "$case_dir/pi"
@@ -266,19 +307,23 @@ run_runbook() {
   (
     cd "$repo_root"
     HOME="$case_dir/home" TMPDIR="$case_dir/tmp" XDG_RUNTIME_DIR="$case_dir/run" TEST_PI="$case_dir/pi" \
-      PATH="$work_dir/bin:$PATH" bash -euo pipefail "$runbook"
+      PATH="$work_dir/bin:$PATH" bash -euo pipefail "${TEST_RUNBOOK:-$runbook}"
   )
 }
 
 # check_case checks one finished run: the bundle the Pi received, where the secrets were kept,
-# and that no secret is left on disk or was ever an argument.
+# and that no secret is left on disk or was ever an argument. A second argument, dispatch-token,
+# says $prepared held the unit's Dispatch token, which the bundle must then carry.
 check_case() {
-  local case_dir=$1
+  local case_dir=$1 with=${2:-}
   local received="$case_dir/pi/bundle"
-  printf '%s\n' certificate_config.json deepgram-key device.crt \
-    google-credentials.json tailscale-client-id tailscale-subject >"$case_dir/expected.list"
+  printf '%s\n' certificate_config.json deepgram-key device.crt google-credentials.json \
+    tailscale-client-id tailscale-subject ${with:+"$with"} | LC_ALL=C sort >"$case_dir/expected.list"
   cmp -s "$case_dir/expected.list" "$case_dir/pi/bundle.list" \
     || fail "$case_dir: the Pi received $(tr '\n' ' ' <"$case_dir/pi/bundle.list")"
+  if [[ $with == dispatch-token ]]; then
+    [[ $(<"$received/dispatch-token") == "$DISPATCH_SECRET" ]] || fail "dispatch-token is not the token \$prepared held"
+  fi
   cmp -s "$received/device.crt" "$TEST_CERTIFICATE" || fail "device.crt is not the latest version of the certificate secret"
   [[ $(<"$received/tailscale-client-id") == "$CLIENT_ID" ]] \
     || fail "tailscale-client-id is not the client ID of the identity's newest creation: $(<"$received/tailscale-client-id")"
@@ -304,6 +349,34 @@ check_case "$work_dir/local"
 # form, subject=CN = ghost-wispr, unless the command asks for RFC 2253.
 grep -qx 'subject=CN=ghost-wispr' "$work_dir/local.out" \
   || fail "the runbook's certificate check did not print subject=CN=ghost-wispr: $(grep '^subject=' "$work_dir/local.out")"
+
+# The runbook mints the unit's Dispatch token with the operator's own, and it reaches the Pi in the
+# bundle, through the same mode-0700 directory under XDG_RUNTIME_DIR as the Deepgram key. Nothing
+# prints either token, and the unit's is on disk only as $prepared/dispatch-token, mode 0600.
+(umask 077 && printf '%s\n' "$OPERATOR_DISPATCH_SECRET" >"$work_dir/operator-dispatch-token")
+DISPATCH_TOKEN_FILE="$work_dir/operator-dispatch-token" TEST_RUNBOOK="$work_dir/runbook-token.sh" \
+  run_runbook "$work_dir/token" >"$work_dir/token.out" 2>&1 \
+  || { cat "$work_dir/token.out"; fail "the runbook failed to mint the Dispatch token into \$prepared and provision with it"; }
+check_case "$work_dir/token" dispatch-token
+grep -Fqx '{"id":"00000000-0000-4000-8000-000000000001","name":"ghost-wispr-office-pi","scopes":[]}' "$work_dir/token.out" \
+  || fail "the runbook did not print the new token's id, name and scopes: $(<"$work_dir/token.out")"
+if grep -F -e "$DISPATCH_SECRET" -e "$OPERATOR_DISPATCH_SECRET" "$work_dir/token.out" >/dev/null; then
+  fail "the runbook's output holds a Dispatch token"
+fi
+left=$(grep -rlF -e "$DISPATCH_SECRET" "$work_dir/token/home" "$work_dir/token/tmp" "$work_dir/token/run" || true)
+[[ $left == "$work_dir/token/tmp/"*/dispatch-token && $left != *$'\n'* ]] \
+  || fail "the Dispatch token is on disk outside \$prepared/dispatch-token: $left"
+[[ $(find "$left" -printf '%m') == 600 ]] || fail "\$prepared/dispatch-token is mode $(find "$left" -printf '%m'), not 0600"
+# A dispatch-token that is a link or empty is refused before anything reaches the Pi.
+for kind in link empty; do
+  if TEST_RUNBOOK="$work_dir/runbook-token-$kind.sh" run_runbook "$work_dir/token-$kind" >"$work_dir/token-$kind.out" 2>&1; then
+    fail "the runbook succeeded with a dispatch-token that is $kind"
+  fi
+  grep -Fq 'dispatch-token' "$work_dir/token-$kind.out" \
+    || fail "a dispatch-token that is $kind was refused for another reason: $(<"$work_dir/token-$kind.out")"
+  [[ ! -e $work_dir/token-$kind/pi/bundle.list && ! -e $work_dir/token-$kind/pi/sources.abc123 ]] \
+    || fail "with a dispatch-token that is $kind, the runbook reached the Pi"
+done
 
 if TEST_PROVISION_EXIT=1 run_runbook "$work_dir/failed" 2>/dev/null; then
   fail "the runbook succeeded although provision.sh failed"
@@ -398,7 +471,7 @@ TEST_CERT_READ_FAIL=1 run_renew "$work_dir/renew-failed"
 [[ -z $(find "$work_dir/renew/tmp" "$work_dir/renew-failed/tmp" -mindepth 1 -print -quit) ]] \
   || fail "renewal left its certificate file behind"
 
-if grep -F -e "$DEEPGRAM_SECRET" "$TEST_ARGV_LOG" >/dev/null; then
+if grep -F -e "$DEEPGRAM_SECRET" -e "$DISPATCH_SECRET" -e "$OPERATOR_DISPATCH_SECRET" "$TEST_ARGV_LOG" >/dev/null; then
   fail "a secret was passed as a command argument"
 fi
 if grep -E 'ghostWisprCertificates|tailscaleIds|service-accounts describe' "$TEST_ARGV_LOG" >/dev/null; then
