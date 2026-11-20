@@ -3,6 +3,7 @@ package tts_test
 import (
 	"context"
 	"encoding/binary"
+	"math"
 	"slices"
 	"sync"
 	"testing"
@@ -68,7 +69,8 @@ func (l *lightAt) wentOff() (int, bool) {
 // ms) plays, leaves any of that sound playing more than two 10 ms frames
 // after the drop; or, when speech started on the voice input under the
 // sound, if that speech is cut, or does not come back from ducked to its own
-// level within 10 ms of the sound's end and stay there.
+// level within 10 ms of the sound's end and stay there, or comes back with a
+// jump, a click, rather than over 9 ms or more.
 func TestNeverMindCutsTheAnswerSoundOnTheRealSpeaker(t *testing.T) {
 	const rate = 24000
 	const speechLevel = 8000
@@ -188,6 +190,27 @@ func TestNeverMindCutsTheAnswerSoundOnTheRealSpeaker(t *testing.T) {
 			}
 			if full < 0 || full > rate/100 {
 				t.Fatalf("the speech came back to %d at sample %d after the cut, want within 240 (10 ms)", speechLevel, full)
+			}
+			// The release, as the ramp tests of the speaker's ducking bound it
+			// (internal/audio TestOutputDucksTheVoiceUnderASound): from its
+			// ducked level to its own, the speech moves at most step from one
+			// sample to the next, so its gain takes 9 ms or more to come back.
+			// The release starts where the cut leaves the sound's last frame,
+			// a step this check does not bound: Cancel cuts a sound at once.
+			ducked := speechLevel * math.Pow(10, -15.0/20) // the speaker's 15 dB duck
+			step := int((speechLevel - ducked) / float64(9*rate/1000))
+			back := slices.Index(got[speechFrom:], speechLevel)
+			if back < 0 {
+				t.Fatalf("the speech never played at its level %d", speechLevel)
+			}
+			back += speechFrom
+			for i := back; float64(got[i]) > ducked+float64(step); i-- {
+				if i == speechFrom {
+					t.Fatalf("the speech was above its ducked level %.0f from its start to sample %d, where it reached %d: it never played ducked", ducked, back, speechLevel)
+				}
+				if d := int(got[i]) - int(got[i-1]); d < 0 || d > step {
+					t.Fatalf("the speech comes back from ducked (%.0f) to %d with a jump from %d to %d at sample %d, more than the %d a 9 ms release allows: a click", ducked, speechLevel, got[i-1], got[i], i, step)
+				}
 			}
 		})
 	}
