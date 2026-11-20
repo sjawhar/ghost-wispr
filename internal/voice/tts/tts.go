@@ -182,6 +182,9 @@ type sayRequest struct {
 	more     chan struct{} // signalled when chunks grow or synthesis ends
 }
 
+// errNoAudio is a speech vendor that ended a non-empty text with no frame.
+var errNoAudio = errors.New("tts: the engine returned no audio")
+
 // errPlaybackEnded stops a Say's synthesis once play could not write it.
 var errPlaybackEnded = errors.New("tts: the playback ended")
 
@@ -580,6 +583,9 @@ func (s *session) speak(r *sayRequest) error {
 				// not a whole sample is not audio.
 				if n := len(s.carry) - len(s.carry)%s.sample; n > 0 {
 					err = s.writeFrame(r, s.carry[:n], &first)
+				}
+				if err == nil && first {
+					err = errNoAudio
 				}
 			}
 			s.carry = s.carry[:0]

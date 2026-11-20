@@ -207,7 +207,8 @@ type geminiVoiceConfig struct {
 // encoding/json decodes the base64 data into its bytes.
 type geminiEvent struct {
 	Candidates []struct {
-		Content struct {
+		FinishReason string `json:"finishReason"`
+		Content      struct {
 			Parts []struct {
 				InlineData struct {
 					Data []byte `json:"data"`
@@ -276,6 +277,8 @@ func (g *Gemini) Stream(ctx context.Context, text string, emit func(pcm []byte) 
 	events := bufio.NewScanner(stallReader{r: resp.Body, stall: stall})
 	events.Buffer(make([]byte, 0, 64<<10), geminiMaxEvent)
 	var data []byte
+	var audioSeen bool
+	var finishReason string
 	for {
 		more := events.Scan()
 		line := events.Bytes()
@@ -293,8 +296,15 @@ func (g *Gemini) Stream(ctx context.Context, text string, emit func(pcm []byte) 
 		// A blank line, or the end of the stream, ends an event.
 		if len(data) > 0 {
 			stall.Stop()
-			if err := g.emitEvent(data, text, emit); err != nil {
+			reason, err := g.emitEvent(data, text, func(pcm []byte) error {
+				audioSeen = audioSeen || len(pcm) > 0
+				return emit(pcm)
+			})
+			if err != nil {
 				return err
+			}
+			if reason != "" {
+				finishReason = reason
 			}
 			stall.Reset(geminiStallTimeout)
 			data = data[:0]
@@ -308,6 +318,12 @@ func (g *Gemini) Stream(ctx context.Context, text string, emit func(pcm []byte) 
 			return context.Cause(reqCtx)
 		}
 		return fmt.Errorf("gemini tts: read stream: %w", err)
+	}
+	if !audioSeen {
+		if finishReason != "" {
+			return fmt.Errorf("gemini tts: stream ended with %s and no audio", finishReason)
+		}
+		return errors.New("gemini tts: stream returned no audio")
 	}
 	return nil
 }
@@ -326,27 +342,31 @@ func (s stallReader) Read(p []byte) (int, error) {
 	return n, err
 }
 
-// emitEvent decodes one event of the stream speaking text, and emits its
-// audio.
-func (*Gemini) emitEvent(data []byte, text string, emit func(pcm []byte) error) error {
+// emitEvent decodes one event of the stream, emits its audio and returns the
+// server's finish reason when the event supplied one.
+func (*Gemini) emitEvent(data []byte, text string, emit func(pcm []byte) error) (string, error) {
 	var event geminiEvent
 	if err := json.Unmarshal(data, &event); err != nil {
-		return fmt.Errorf("gemini tts: decode event: %w", err)
+		return "", fmt.Errorf("gemini tts: decode event: %w", err)
 	}
 	if e := event.Error; e != nil {
-		return fmt.Errorf("gemini tts: stream error %d %s: %s", e.Code, e.Status, spokentext.Withhold(e.Message, text))
+		return "", fmt.Errorf("gemini tts: stream error %d %s: %s", e.Code, e.Status, spokentext.Withhold(e.Message, text))
 	}
+	var finishReason string
 	for _, candidate := range event.Candidates {
+		if candidate.FinishReason != "" {
+			finishReason = candidate.FinishReason
+		}
 		for _, part := range candidate.Content.Parts {
 			if len(part.InlineData.Data) == 0 {
 				continue
 			}
 			if err := emit(part.InlineData.Data); err != nil {
-				return err
+				return "", err
 			}
 		}
 	}
-	return nil
+	return finishReason, nil
 }
 
 // geminiStatusError is the error of a refused request to speak text: Vertex
