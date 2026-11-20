@@ -377,10 +377,8 @@ func runSharedDoneTrace(t *testing.T, trace []sharedEvent, sentences, injected i
 	// The room's words after the trace show the session has read all of it;
 	// only then does the hold run out.
 	c.send(map[string]any{"type": "ConversationText", "role": "user", "content": "trace read"})
-	for {
-		if waitEvent(t, sess, voice.EventUserTurn).Text == "trace read" {
-			break
-		}
+	for waitEvent(t, sess, voice.EventUserTurn).Text != "trace read" {
+		// each pass waits for the next turn the session reports
 	}
 	clock.release()
 
