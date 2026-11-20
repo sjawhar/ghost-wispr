@@ -227,6 +227,9 @@ func (c *Concierge) Heard(ctx context.Context, x *voice.Exchange, words string) 
 		return
 	}
 	target := c.readTarget(ctx, words, false)
+	// A number-only turn (no key, no work words) skips the read-ahead: it
+	// goes straight to the bare-number candidate lookup. A turn with words
+	// beyond the number keeps its search.
 	if target == "" {
 		return
 	}
@@ -323,7 +326,7 @@ func (c *Concierge) readFor(ctx context.Context, x *voice.Exchange, turn string,
 		if len(issueKeysIn(turn)) > 0 && c.projectsDownNow() {
 			return &reading{unreachable: true}
 		}
-		return &reading{}
+		return &reading{noResult: len(bareIssueNumber.FindAllString(turn, -1)) > 0}
 	}
 	c.mu.Lock()
 	var pending *read
