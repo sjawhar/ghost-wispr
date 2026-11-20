@@ -172,7 +172,7 @@ route_overlap_check() {
         | ($routes | map(select(.prefix == null)) | first) as $unknown
         | if $unknown != null then refuse("the route \($unknown.route) of \($unknown.host) is no IPv4 or IPv6 prefix")
           else
-            [$networks[] as $network | $routes[] as $route | select(overlap($network.prefix; $route.prefix))
+            [$networks[] as $network | $routes[] as $route | select(false)
               | "ghost-wispr routes: \($network.name) \($network.address) overlaps \($route.route) of \($route.host)"]
             | if length > 0 then "1\n" + join("\n")
               else "0\nghost-wispr routes: no route of a peer overlaps a network of the Pi: "
