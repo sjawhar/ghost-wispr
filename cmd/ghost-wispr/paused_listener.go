@@ -36,21 +36,26 @@ type pausedListenerUnit struct {
 	openCapture func() (local.Capture, error)
 }
 
+// listenerOn reports whether the settings turn the paused listener on: both
+// voice.paused_listener and voice.enabled, since with the voice off Ghost
+// Wispr runs no wake detection (INFRA-4592 R13).
+func listenerOn(cfg *config.Config) bool { return cfg.Voice.Enabled && cfg.Voice.PausedListener }
+
 // startPausedListener gives the unit its first pause level, listening, in a
 // build that has the paused listener (INFRA-4592 R1, R2). A pause goes to
-// listening only while voice.paused_listener is on, the listener has started
-// and the Jabra's mute button is attached; otherwise, and always in a build
-// without the listener, the unit is today's two-state machine: every pause
-// closes the microphone. A saved listening comes back closed until the
+// listening only while the settings turn it on (listenerOn), the listener has
+// started and the Jabra's mute button is attached; otherwise, and always in a
+// build without the listener, the unit is today's two-state machine: every
+// pause closes the microphone. A saved listening comes back closed until the
 // listener can run, and a listening unit goes to closed when it no longer can:
-// the button detaches, the setting turns off, or the listener's capture fails.
+// the button detaches, a setting turns off, or the listener's capture fails.
 // The listener is an ALSA capture in this process, opened and closed through
 // the capture device, which hands the microphone to and from the recording
 // microphone.
 func startPausedListener(ctx context.Context, cfgStore *config.Store, u pausedListenerUnit) {
 	cfg := cfgStore.Get()
 	if !u.built {
-		if cfg.Voice.PausedListener {
+		if listenerOn(&cfg) {
 			slog.Warn("voice.paused_listener is on, but this build has no paused listener; every pause closes the microphone")
 			u.warnings.Set(pausedListenerWarningKey, "voice.paused_listener is on, but this build has no paused listener: every pause closes the microphone")
 		}
@@ -64,10 +69,10 @@ func startPausedListener(ctx context.Context, cfgStore *config.Store, u pausedLi
 		u.openCapture = func() (local.Capture, error) { return audio.OpenALSACapture(name, local.SampleRate) }
 	}
 	var configured, started atomic.Bool
-	configured.Store(cfg.Voice.PausedListener)
+	configured.Store(listenerOn(&cfg))
 	ready := func() bool { return configured.Load() && started.Load() && u.device.jabraAttached() }
 	u.controls.useListener(u.capture, u.wake, ready, u.device.closeListener)
-	if u.restored == micListening && cfg.Voice.PausedListener {
+	if u.restored == micListening && listenerOn(&cfg) {
 		u.controls.armRestoredListening()
 	}
 	changed := func() {
@@ -81,7 +86,7 @@ func startPausedListener(ctx context.Context, cfgStore *config.Store, u pausedLi
 		start.Do(func() { go runPausedListener(ctx, u, &started, changed) })
 	}
 	onConfigChange(cfgStore, func(cfg *config.Config) {
-		on := cfg.Voice.PausedListener
+		on := listenerOn(cfg)
 		if configured.Swap(on) != on {
 			changed()
 		}
@@ -89,7 +94,7 @@ func startPausedListener(ctx context.Context, cfgStore *config.Store, u pausedLi
 			startListener()
 		}
 	})
-	if cfg.Voice.PausedListener {
+	if listenerOn(&cfg) {
 		startListener()
 	}
 }

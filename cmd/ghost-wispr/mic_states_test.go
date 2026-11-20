@@ -290,6 +290,8 @@ func (r *micStatesRig) requireHandoverKept(t *testing.T) {
 
 type statesOptions struct {
 	listener bool   // voice.paused_listener
+	voiceOff bool   // voice.enabled off, which turns the listener off with the voice
+	notBuilt bool   // a build without the listener (no -tags kws)
 	jabra    bool   // a Jabra's mute button is attached
 	saved    string // the saved state at start, "" for none
 	noLight  bool   // no blink(1) is plugged in; give a saved pause
@@ -373,13 +375,16 @@ func startMicStatesRig(t *testing.T, opts statesOptions) *micStatesRig {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := cfgStore.Update(func(c *config.Config) { c.Voice.PausedListener = opts.listener }); err != nil {
+	if err := cfgStore.Update(func(c *config.Config) {
+		c.Voice.Enabled = !opts.voiceOff
+		c.Voice.PausedListener = opts.listener
+	}); err != nil {
 		t.Fatal(err)
 	}
 	r.cfgStore = cfgStore
 	startPausedListener(ctx, cfgStore, pausedListenerUnit{
 		capture: r.capture, controls: r.controls, hooks: r.hooks, device: r.device,
-		wake: r.hardware.Wake, warnings: r.warnings, restored: saved, built: true,
+		wake: r.hardware.Wake, warnings: r.warnings, restored: saved, built: !opts.notBuilt,
 		newDetector: func() (*local.Detector, error) { return local.NewDetectorOf(r.spotter, startVerifier{}), nil },
 		openCapture: func() (local.Capture, error) {
 			if r.openFails.Load() {
@@ -418,7 +423,7 @@ func startMicStatesRig(t *testing.T, opts statesOptions) *micStatesRig {
 	if saved == micRecording {
 		r.requireState(t, micRecording, "at start")
 	}
-	if opts.listener && opts.jabra {
+	if opts.listener && opts.jabra && !opts.voiceOff && !opts.notBuilt {
 		// The spotter loads in the background; until it has, every pause
 		// closes the microphone.
 		waitForStates(t, "the paused listener to start", r.controls.canListen)
@@ -605,25 +610,85 @@ func TestMicStatesFollowEachControl(t *testing.T) {
 	}
 }
 
-// TestListenerOffIsTodaysMachine fails if, with voice.paused_listener off, the
-// unit is not the two-state machine it was before the listener: every pause
-// closes the microphone, the ring shows Muted for every pause, and a Jabra
-// press after a page pause resumes recording.
+// TestListenerOffIsTodaysMachine fails if, with the listener off, the unit is
+// not the two-state machine it was before the listener: every pause closes
+// the microphone, the ring shows Muted for every pause, a Jabra press after a
+// page pause resumes recording, and nothing hears the phrase. The listener is
+// off with voice.paused_listener off, with voice.enabled off (R13: no wake
+// detection with the voice off), and in a build without it, which warns when
+// the setting asks for it.
 func TestListenerOffIsTodaysMachine(t *testing.T) {
-	r := startMicStatesRig(t, statesOptions{listener: false, jabra: true})
-	if err := r.hooks.Pause(); err != nil {
-		t.Fatal(err)
+	for _, tc := range []struct {
+		name string
+		opts statesOptions
+		warn bool
+	}{
+		{"voice.paused_listener off", statesOptions{listener: false, jabra: true}, false},
+		{"voice.enabled off", statesOptions{listener: true, voiceOff: true, jabra: true}, false},
+		{"a build without the listener", statesOptions{listener: true, notBuilt: true, jabra: true}, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := startMicStatesRig(t, tc.opts)
+			if err := r.hooks.Pause(); err != nil {
+				t.Fatal(err)
+			}
+			r.requireState(t, micClosed, "a page pause with the listener off")
+			if got := r.saved(); got != savedClosed {
+				t.Fatalf("saved %q after the pause, want %q", got, savedClosed)
+			}
+			r.pressJabra(t)
+			r.requireState(t, micRecording, "a Jabra press after a page pause")
+			<-r.power.press(nil, nil)
+			r.requireState(t, micClosed, "a power-button pause with the listener off")
+			r.saidPhrase()
+			r.requireState(t, micClosed, "the phrase, with the listener off")
+			if _, opened := r.opens(); opened != 0 {
+				t.Fatalf("the listener opened %d times while off", opened)
+			}
+			warned := warningAbout(r.warnings, "no paused listener")
+			if warned != tc.warn {
+				t.Fatalf("warns of a build with no listener %t, want %t (warnings %q)", warned, tc.warn, r.warnings.List())
+			}
+		})
 	}
-	r.requireState(t, micClosed, "a page pause with the listener off")
-	if got := r.saved(); got != savedClosed {
-		t.Fatalf("saved %q after the pause, want %q", got, savedClosed)
+}
+
+// TestListenerTurnedOffInListeningCloses fails if a unit that listens keeps
+// listening once a person turns the listener off on the settings page, with
+// voice.paused_listener or voice.enabled, or if it does not listen again at the
+// next pause once the setting is back on.
+func TestListenerTurnedOffInListeningCloses(t *testing.T) {
+	for _, setting := range []string{"voice.paused_listener", "voice.enabled"} {
+		t.Run(setting, func(t *testing.T) {
+			r := startMicStatesRig(t, statesOptions{listener: true, jabra: true})
+			r.moveTo(t, micListening)
+			set := func(on bool) {
+				t.Helper()
+				if err := r.cfgStore.Update(func(c *config.Config) {
+					if setting == "voice.enabled" {
+						c.Voice.Enabled = on
+					} else {
+						c.Voice.PausedListener = on
+					}
+				}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			set(false)
+			r.requireState(t, micClosed, setting+" turned off while listening")
+			if got := r.saved(); got != savedClosed {
+				t.Fatalf("saved %q after the setting turned off, want %q", got, savedClosed)
+			}
+			set(true)
+			time.Sleep(100 * time.Millisecond)
+			r.requireState(t, micClosed, setting+" turned on again: the unit stays closed")
+			if err := r.hooks.Resume(); err != nil {
+				t.Fatal(err)
+			}
+			r.requireState(t, micRecording, "the resume")
+			r.moveTo(t, micListening)
+		})
 	}
-	r.pressJabra(t)
-	r.requireState(t, micRecording, "a Jabra press after a page pause")
-	<-r.power.press(nil, nil)
-	r.requireState(t, micClosed, "a power-button pause with the listener off")
-	r.saidPhrase()
-	r.requireState(t, micClosed, "the phrase, with the listener off")
 }
 
 // TestNoJabraButtonEveryPauseCloses fails if a pause goes to listening while

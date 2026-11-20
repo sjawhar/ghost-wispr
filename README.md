@@ -255,13 +255,14 @@ mute ring shows Muted in closed only.
   back red before any audio passes the gate. In closed nothing hears it, and in recording it is not
   a control.
 
-The paused listener can run only with `voice.paused_listener` on, in a build that has it (`go build
--tags kws`, after `deploy/sherpa/fetch.sh`; the release binary has it), while the Jabra's mute button
-is attached, and once its spotter has loaded. Otherwise every pause closes the microphone, as
+The paused listener can run only with `voice.enabled` and `voice.paused_listener` both on (with the
+voice off, nothing hears the room for a wake phrase), in a build that has it (`go build -tags kws`,
+after `deploy/sherpa/fetch.sh`; the release binary has it), while the Jabra's mute button is
+attached, and once its spotter has loaded. Otherwise every pause closes the microphone, as
 before the listener. A pause saved before the listener comes back closed, so its first deploy
 opens no microphone. A saved listening comes back closed at start-up until the Jabra's button is
 attached and the listener has started, then listening. A listening unit goes to closed when the
-Jabra's button detaches, when `voice.paused_listener` turns off, and when the listener's capture
+Jabra's button detaches, when either setting turns off, and when the listener's capture
 fails, and stays closed until a person resumes. A resume the light refuses returns the unit to the
 state it came from.
 
@@ -381,7 +382,7 @@ What the voice hears, and where the room's words go:
 | `voice.tts_engine` | `gemini` | Voice A's text-to-speech provider: `gemini` (Vertex AI, `gcp_project`) or `aura` (the Deepgram key) |
 | `voice.tts_model`, `voice.tts_voice` | the provider's | Gemini: `gemini-3.8-flash-tts`, `Kore`; Aura: the voice `aura-2-harmonia-en` |
 | `voice.tts_location` | `us` | The Vertex AI location Gemini streams from; `us` is faster to first audio than `global` |
-| `voice.paused_listener` | `false` | A pause from the power button or the page goes to listening, where the paused listener hears only "Wispr, start recording" ([The three states of the microphone](#the-three-states-of-the-microphone)); it needs a build with the listener and the Jabra's mute button. It does not need `voice.enabled`. Turned off, a listening unit closes its microphone at once |
+| `voice.paused_listener` | `false` | A pause from the power button or the page goes to listening, where the paused listener hears only "Wispr, start recording" ([The three states of the microphone](#the-three-states-of-the-microphone)); it needs `voice.enabled`, a build with the listener and the Jabra's mute button. Turned off, a listening unit closes its microphone at once |
 | `voice.gptlive.openai_identity_provider_id`, `voice.gptlive.openai_service_account_id` | — | Voice B's OpenAI workload identity, ids and not secrets: the unit exchanges its Google ID token (`google_credentials_file`) for an OpenAI access token of an hour at most. `gptlive-probe` (`cmd/gptlive-probe`) checks the route from the unit |
 | `concierge.model` | `gemini-3.5-flash-lite` | The Concierge's Gemini model, on the unit's genai settings |
 | `concierge.dispatch_url`, `GHOST_WISPR_DISPATCH_TOKEN` | — | Dispatch and the unit's own token; without both, the voice says it cannot reach Dispatch yet |

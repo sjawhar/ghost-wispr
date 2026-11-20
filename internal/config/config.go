@@ -77,7 +77,8 @@ type Voice struct {
 	// listening, where a listener in the process holds the microphone for
 	// "Wispr, start recording" alone, in a build that has it (-tags kws) and
 	// while the Jabra's mute button is attached; off, every pause closes the
-	// microphone. It does not need Enabled: the listener only resumes.
+	// microphone. It needs Enabled: with the voice off, nothing hears the room
+	// for a wake phrase.
 	PausedListener bool   `yaml:"paused_listener"`
 	TTSEngine      string `yaml:"tts_engine"`   // voice A's text-to-speech provider: gemini or aura
 	TTSModel       string `yaml:"tts_model"`    // "" is the provider's default

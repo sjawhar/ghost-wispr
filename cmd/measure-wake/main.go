@@ -39,6 +39,7 @@ import (
 	"slices"
 	"sort"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -46,7 +47,7 @@ import (
 )
 
 func main() {
-	os.Exit(run(os.Args[1:], os.Stdout, os.Stderr))
+	os.Exit(run(os.Args[1:], os.Stdout, os.Stderr, newDetector))
 }
 
 type options struct {
@@ -59,16 +60,18 @@ type options struct {
 	threshold   float64
 	decoys      string
 	stage2      bool
-	shard       int
-	shards      int
+	parallel    int
 	minHours    float64
 	limit       float64
 	minHitRate  float64
 	minCell     int
+	// detector makes each detector the run uses: newDetector, the
+	// listener's own.
+	detector func(options) (*local.Detector, error)
 }
 
-func run(args []string, stdout, stderr io.Writer) int {
-	var o options
+func run(args []string, stdout, stderr io.Writer, detector func(options) (*local.Detector, error)) int {
+	o := options{detector: detector}
 	flags := flag.NewFlagSet("measure-wake", flag.ContinueOnError)
 	flags.SetOutput(stderr)
 	flags.StringVar(&o.mode, "mode", "listener", "what to measure: listener")
@@ -80,8 +83,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 	flags.Float64Var(&o.threshold, "threshold", local.DefaultThresholds.Threshold, "stage 1's threshold")
 	flags.StringVar(&o.decoys, "decoys", "", `"stop": add the stop-recording decoy lines to stage 1`)
 	flags.BoolVar(&o.stage2, "stage2", true, "confirm each stage-1 hit with the recognizer")
-	flags.IntVar(&o.shard, "shard", 0, "with -shards, the share of -audio's streams this run reads, from 0")
-	flags.IntVar(&o.shards, "shards", 1, "how many runs share -audio's streams")
+	flags.IntVar(&o.parallel, "parallel", 1, "detectors that share -audio's streams, each on its own CPU")
 	flags.Float64Var(&o.minHours, "min-hours", 10, "the least audio a verdict rests on")
 	flags.Float64Var(&o.limit, "limit", 0.5, "false starts per hour the verdict allows, exclusive")
 	flags.Float64Var(&o.minHitRate, "min-hit-rate", 0.9, "the share of -phrases the verdict needs")
@@ -97,8 +99,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 		_, _ = fmt.Fprintln(stderr, "measure-wake: give -audio, -phrases or both")
 		return 2
 	}
-	if o.shards < 1 || o.shard < 0 || o.shard >= o.shards {
-		_, _ = fmt.Fprintf(stderr, "measure-wake: -shard %d of -shards %d\n", o.shard, o.shards)
+	if o.parallel < 1 {
+		_, _ = fmt.Fprintf(stderr, "measure-wake: -parallel %d: at least 1\n", o.parallel)
 		return 2
 	}
 	verdict, err := measure(o, stdout)
@@ -128,22 +130,17 @@ func newDetector(o options) (*local.Detector, error) {
 // measure runs the listener's detector over the audio and the phrases and
 // returns the verdict.
 func measure(o options, out io.Writer) (string, error) {
-	d, err := newDetector(o)
-	if err != nil {
-		return "", err
-	}
-	defer d.Close()
-	_, _ = fmt.Fprintf(out, "boost=%g threshold=%g stage2=%t decoys=%q shard=%d/%d\n", o.boost, o.threshold, o.stage2, o.decoys, o.shard, o.shards)
+	_, _ = fmt.Fprintf(out, "boost=%g threshold=%g stage2=%t decoys=%q parallel=%d\n", o.boost, o.threshold, o.stage2, o.decoys, o.parallel)
 	verdicts := []string{}
 	if o.audio != "" {
-		v, err := measureFalseStarts(o, d, out)
+		v, err := measureFalseStarts(o, out)
 		if err != nil {
 			return "", err
 		}
 		verdicts = append(verdicts, v)
 	}
 	if o.phrases != "" {
-		v, err := measurePhrases(o, d, out)
+		v, err := measurePhrases(o, out)
 		if err != nil {
 			return "", err
 		}
@@ -210,7 +207,66 @@ func cpuTime() time.Duration {
 	return time.Duration(usage.Utime.Nano() + usage.Stime.Nano())
 }
 
-func measureFalseStarts(o options, d *local.Detector, out io.Writer) (string, error) {
+// speechCounts are what one detector counted on its share of -audio.
+type speechCounts struct {
+	files, samples                int
+	falseStarts, stageOneInSpeech int
+	splicedClips, splicedHeard    int
+}
+
+func (c *speechCounts) add(o speechCounts) {
+	c.files += o.files
+	c.samples += o.samples
+	c.falseStarts += o.falseStarts
+	c.stageOneInSpeech += o.stageOneInSpeech
+	c.splicedClips += o.splicedClips
+	c.splicedHeard += o.splicedHeard
+}
+
+// countStreams runs d over every -parallel'th stream of all, from the
+// worker'th, splicing a clip of spliced in once every spliceEvery samples of
+// speech, straight after the speech, as a person says it after others talk.
+// Each stream ends with 2 s of silence, not counted in the hours, in which a
+// phrase at its very end is heard, as it would be in a stream that goes on.
+func countStreams(d *local.Detector, all [][]string, worker, workers int, spliced [][]int16, spliceEvery int) (speechCounts, error) {
+	var c speechCounts
+	sinceSplice := 0
+	silence := make([]int16, 2*local.SampleRate)
+	speech := func(pcm []int16) {
+		before := d.StageOneHits()
+		feed(d, pcm, func(int) { c.falseStarts++ })
+		c.stageOneInSpeech += d.StageOneHits() - before
+	}
+	for i := worker; i < len(all); i += workers {
+		d.Reset()
+		for _, file := range all[i] {
+			pcm, err := local.ReadWAV(file)
+			if err != nil {
+				return c, err
+			}
+			c.files++
+			c.samples += len(pcm)
+			speech(pcm)
+			sinceSplice += len(pcm)
+			if len(spliced) > 0 && sinceSplice >= spliceEvery {
+				sinceSplice = 0
+				clip := spliced[(c.splicedClips*workers+worker)%len(spliced)]
+				c.splicedClips++
+				// The clip, then 2 s of silence, inside which its wake must
+				// come: neither is counted in the hours.
+				heard := false
+				feed(d, slices.Concat(clip, silence), func(int) { heard = true })
+				if heard {
+					c.splicedHeard++
+				}
+			}
+		}
+		speech(silence)
+	}
+	return c, nil
+}
+
+func measureFalseStarts(o options, out io.Writer) (string, error) {
 	all, err := streams(o.audio)
 	if err != nil {
 		return "", err
@@ -234,71 +290,64 @@ func measureFalseStarts(o options, d *local.Detector, out io.Writer) (string, er
 		}
 	}
 	spliceEvery := int(o.spliceEvery.Seconds() * local.SampleRate)
-	var (
-		samples, sinceSplice     int
-		falseStarts, hitsBefore  int
-		splicedClips, splicedHit int
-		files                    int
-	)
-	hitsBefore = d.StageOneHits()
+	detectors := make([]*local.Detector, o.parallel)
+	for i := range detectors {
+		d, err := o.detector(o)
+		if err != nil {
+			return "", err
+		}
+		defer d.Close()
+		detectors[i] = d
+	}
 	started := cpuTime()
-	for i, stream := range all {
-		if i%o.shards != o.shard {
-			continue
-		}
-		d.Reset()
-		for _, file := range stream {
-			pcm, err := local.ReadWAV(file)
-			if err != nil {
-				return "", err
+	var (
+		mu    sync.Mutex
+		total speechCounts
+		first error
+		wg    sync.WaitGroup
+	)
+	for worker, d := range detectors {
+		wg.Go(func() {
+			c, err := countStreams(d, all, worker, o.parallel, spliced, spliceEvery)
+			mu.Lock()
+			defer mu.Unlock()
+			total.add(c)
+			if first == nil {
+				first = err
 			}
-			files++
-			samples += len(pcm)
-			feed(d, pcm, func(int) { falseStarts++ })
-			sinceSplice += len(pcm)
-			if len(spliced) > 0 && sinceSplice >= spliceEvery {
-				sinceSplice = 0
-				clip := spliced[splicedClips%len(spliced)]
-				splicedClips++
-				// The clip, then 2 s of silence, inside which its wake must
-				// come: neither is counted in the hours.
-				audio := append(append([]int16{}, clip...), make([]int16, 2*local.SampleRate)...)
-				heard := false
-				feed(d, audio, func(int) { heard = true })
-				if heard {
-					splicedHit++
-				}
-			}
-		}
+		})
+	}
+	wg.Wait()
+	if first != nil {
+		return "", first
 	}
 	used := cpuTime() - started
-	hours := float64(samples) / local.SampleRate / 3600
-	perHour := 0.0
+	hours := float64(total.samples) / local.SampleRate / 3600
+	perHour, stageOnePerHour := 0.0, 0.0
 	if hours > 0 {
-		perHour = float64(falseStarts) / hours
+		perHour = float64(total.falseStarts) / hours
+		stageOnePerHour = float64(total.stageOneInSpeech) / hours
 	}
 	cpuShare := 0.0
-	if samples > 0 {
-		cpuShare = used.Seconds() / (float64(samples) / local.SampleRate)
+	if total.samples > 0 {
+		cpuShare = used.Seconds() / (float64(total.samples) / local.SampleRate)
 	}
-	_, _ = fmt.Fprintf(out, "audio_files=%d audio_hours=%.3f false_starts=%d false_starts_per_hour=%.3f stage1_hits=%d\n",
-		files, hours, falseStarts, perHour, d.StageOneHits()-hitsBefore)
+	_, _ = fmt.Fprintf(out, "audio_files=%d audio_hours=%.3f false_starts=%d false_starts_per_hour=%.3f\n",
+		total.files, hours, total.falseStarts, perHour)
+	_, _ = fmt.Fprintf(out, "stage1_hits_in_speech=%d stage1_hits_per_hour=%.3f\n", total.stageOneInSpeech, stageOnePerHour)
 	_, _ = fmt.Fprintf(out, "cpu_seconds_per_audio_second=%.4f\n", cpuShare)
 	if len(spliced) > 0 {
-		_, _ = fmt.Fprintf(out, "spliced_clips=%d spliced_heard=%d\n", splicedClips, splicedHit)
+		_, _ = fmt.Fprintf(out, "spliced_clips=%d spliced_heard=%d\n", total.splicedClips, total.splicedHeard)
 	}
 	switch {
-	case files == 0:
+	case total.files == 0:
 		_, _ = fmt.Fprintf(out, "UNKNOWN: no WAV file read under %s\n", o.audio)
 		return "UNKNOWN", nil
-	case len(spliced) > 0 && splicedHit == 0:
+	case len(spliced) > 0 && total.splicedHeard == 0:
 		_, _ = fmt.Fprintln(out, "UNKNOWN: the listener heard none of the spliced phrases, so a count of 0 false starts proves nothing")
 		return "UNKNOWN", nil
-	case hours < o.minHours && o.shards == 1:
+	case hours < o.minHours:
 		_, _ = fmt.Fprintf(out, "UNKNOWN: %.3f h of audio, fewer than %g h\n", hours, o.minHours)
-		return "UNKNOWN", nil
-	case o.shards > 1:
-		_, _ = fmt.Fprintf(out, "UNKNOWN: shard %d of %d; the verdict rests on the sum of every shard's counts\n", o.shard, o.shards)
 		return "UNKNOWN", nil
 	case perHour < o.limit:
 		return "PASS", nil
@@ -307,7 +356,12 @@ func measureFalseStarts(o options, d *local.Detector, out io.Writer) (string, er
 	}
 }
 
-func measurePhrases(o options, d *local.Detector, out io.Writer) (string, error) {
+func measurePhrases(o options, out io.Writer) (string, error) {
+	d, err := o.detector(o)
+	if err != nil {
+		return "", err
+	}
+	defer d.Close()
 	entries, err := os.ReadDir(o.phrases)
 	if err != nil {
 		return "", err
