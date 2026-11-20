@@ -154,7 +154,8 @@ Linux it plays through the ALSA playback device that `speaker_device` names (a P
 `plughw:CARD=J75,DEV=0`, or a sound card's id or name, as `Jabra`), opening no microphone and
 needing no red light, so it speaks while capture is paused. It opens one stream at the device's
 native rate when the first sound is queued, mixes the voice and the chimes into it, and closes it
-0.3 s after the last sound.
+0.3 s after the last sound. While a chime plays, the voice plays 15 dB down, so that the two never
+clip together; it goes down over 10 ms before the chime starts, and back up over 10 ms after.
 
 The microphone is never open while the blink(1) is off. The light stays red while the microphone is
 open, and goes off only once the recorder has closed it: after a pause, once no audio has reached
@@ -240,7 +241,7 @@ Wispr plays a short two-note sound, the Concierge reads Dispatch's record, and t
 answer. For 6 s after Wispr's answer, a follow-up that the transcript ends with a question mark needs no wake phrase, and so does a reply when Wispr asked ("Did you mean ABC-12, or
 ABC-13?"). Anything else said in those 6 s is side talk: no voice answers it, and nothing of it goes to Dispatch.
 "Thanks, Wispr" ends the exchange. When the record cannot answer, the Concierge asks the agent that holds the issue. When
-its answer lands, Wispr plays a three-note sound after a second in which nobody speaks, and speaks
+its answer lands, Wispr plays a rising three-note sound twice after a second in which nobody speaks, and speaks
 the answer on "Wispr, go ahead" ("Wispr, go ahead, ABC-12" picks one of several). It speaks by
 itself only when nobody has spoken since the question and the light still reads red. "Wispr, never
 mind" cancels the newest question to an agent. "Wispr, stop" stops it, and so does talking over it

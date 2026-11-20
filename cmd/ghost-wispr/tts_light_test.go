@@ -43,7 +43,7 @@ func playThroughDevice(t *testing.T, device *captureDevice) (out *heldOutput, fi
 	output := audio.NewOutput(audio.OutputConfig{
 		Device:  "Jabra",
 		Opening: device.playbackOpening,
-		Closing: func(closeStream func()) {
+		Closing: func(closeStream func() error) {
 			device.playbackClosing(closeStream)
 			closed <- struct{}{}
 		},

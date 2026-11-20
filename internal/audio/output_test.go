@@ -5,6 +5,8 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
+	"log/slog"
 	"math"
 	"runtime"
 	"slices"
@@ -32,8 +34,10 @@ type fakeStream struct {
 	// writing is closed at the first Write.
 	writing     chan struct{}
 	writingOnce sync.Once
-	// closePanics makes Close panic, as a PortAudio close that fails does.
+	// closePanics makes Close panic, as a PortAudio close that fails does;
+	// closeErr makes it return that error.
 	closePanics bool
+	closeErr    error
 
 	mu       sync.Mutex
 	frames   []playedFrame
@@ -66,7 +70,7 @@ func (f *fakeStream) Close() error {
 	if f.closePanics {
 		panic("output stream close failed")
 	}
-	return nil
+	return f.closeErr
 }
 
 // Drop has nothing to drop: the fake holds no frames once its Write returns.
@@ -271,9 +275,10 @@ func TestOutputCancelSilencesTheNextFrameWithin20ms(t *testing.T) {
 	t.Logf("longest wall-clock time from Cancel to the first silent frame: %v", longest)
 }
 
-// TestOutputMixesTwoInputs fails if the voice and the chime do not sum into
-// one stream, sample by sample, with a stereo input taken as the mean of its
-// channels and a sum beyond PCM16 clipped rather than wrapped.
+// TestOutputMixesTwoInputs fails if two inputs that do not duck each other,
+// the chime and an input of another name, do not sum into one stream, sample
+// by sample, with a stereo input taken as the mean of its channels and a sum
+// beyond PCM16 clipped rather than wrapped.
 func TestOutputMixesTwoInputs(t *testing.T) {
 	for _, tc := range []struct {
 		name         string
@@ -294,7 +299,7 @@ func TestOutputMixesTwoInputs(t *testing.T) {
 			stream := newFakeStream(48000)
 			out := newTestOutput(t, OutputConfig{}, &fakeOpener{streams: []*fakeStream{stream}, gate: gate})
 			ctx := testContext(t)
-			voice, chime := out.Begin(InputVoice), out.Begin(InputChime)
+			voice, chime := out.Begin("other"), out.Begin(InputChime)
 			if err := voice.WriteAll(ctx, tc.voice, tc.voiceFormat); err != nil {
 				t.Fatal(err)
 			}
@@ -323,6 +328,95 @@ func TestOutputMixesTwoInputs(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestOutputDucksTheVoiceUnderASound fails if a sound on the chime input does
+// not duck the voice playing under it to duckGain, or the sound overlaps the
+// voice before it is down, or the voice's gain jumps rather than moving over
+// about 10 ms, down and back up, or the sound does not play whole at its own
+// level. A voice that starts under a sound starts ducked, and a sound over a
+// silent voice does not wait.
+func TestOutputDucksTheVoiceUnderASound(t *testing.T) {
+	const voiceLevel, soundLevel = 16000, 1000
+	ducked := int16(math.Round(voiceLevel * float64(duckGain)))
+	t.Run("over a voice already playing", func(t *testing.T) {
+		stream := newFakeStream(48000)
+		out := newTestOutput(t, OutputConfig{}, &fakeOpener{streams: []*fakeStream{stream}})
+		ctx := testContext(t)
+		voice, chime := out.Begin(InputVoice), out.Begin(InputChime)
+		spoken := make(chan error, 1)
+		go func() {
+			err := voice.WriteAll(ctx, constant(48000, 600*time.Millisecond, voiceLevel), mono48k)
+			if err == nil {
+				err = voice.Drain(ctx)
+			}
+			spoken <- err
+		}()
+		waitFor(t, "50 ms of the voice", func() bool { return len(stream.played()) >= 5 })
+		if err := chime.WriteAll(ctx, constant(48000, 50*time.Millisecond, soundLevel), mono48k); err != nil {
+			t.Fatal(err)
+		}
+		if err := <-spoken; err != nil {
+			t.Fatal(err)
+		}
+		got := stream.samples()
+		under := slices.Index(got, ducked+soundLevel)
+		if under < 0 {
+			t.Fatalf("the sound never played over the voice at %d (%d ducked and the sound's %d)", ducked+soundLevel, ducked, soundLevel)
+		}
+		n := 0
+		for under+n < len(got) && got[under+n] == ducked+soundLevel {
+			n++
+		}
+		if n != 2400 {
+			t.Errorf("the sound played over the ducked voice for %d samples, want all of its 2400 (50 ms at 48 kHz)", n)
+		}
+		if got[under-1] != ducked {
+			t.Errorf("just before the sound the voice played at %d, want %d: the voice is down before the sound starts", got[under-1], ducked)
+		}
+		if down := slices.IndexFunc(got, func(s int16) bool { return s != voiceLevel }); down < 0 || under-down > 480 {
+			t.Errorf("the voice began going down at sample %d and the sound started at %d, want the sound within 480 samples (10 ms): it waits only for the voice to go down", down, under)
+		}
+		// The voice's part of the stream moves at most this much from one
+		// sample to the next while it plays: its gain goes all the way down or
+		// up over no less than 9 ms.
+		voiceAt := func(i int) int {
+			if i >= under && i < under+n {
+				return int(got[i]) - soundLevel
+			}
+			return int(got[i])
+		}
+		step := (voiceLevel - int(ducked)) / 432
+		for i := 1; i < len(got) && got[i] != 0; i++ {
+			if d := voiceAt(i) - voiceAt(i-1); d > step || d < -step {
+				t.Fatalf("the voice jumps from %d to %d at sample %d, more than the %d a 9 ms change of its gain allows: a click", voiceAt(i-1), voiceAt(i), i, step)
+			}
+		}
+		if back := slices.Index(got[under+n:], voiceLevel); back < 0 || back > 480 {
+			t.Errorf("the voice came back to %d %d samples after the sound, want within 480 (10 ms)", voiceLevel, back)
+		}
+	})
+	t.Run("a voice that starts under it, and over silence", func(t *testing.T) {
+		gate := make(chan struct{})
+		stream := newFakeStream(48000)
+		out := newTestOutput(t, OutputConfig{}, &fakeOpener{streams: []*fakeStream{stream}, gate: gate})
+		ctx := testContext(t)
+		voice, chime := out.Begin(InputVoice), out.Begin(InputChime)
+		if err := chime.WriteAll(ctx, constant(48000, 50*time.Millisecond, soundLevel), mono48k); err != nil {
+			t.Fatal(err)
+		}
+		if err := voice.WriteAll(ctx, constant(48000, 100*time.Millisecond, voiceLevel), mono48k); err != nil {
+			t.Fatal(err)
+		}
+		close(gate) // both are queued before the stream opens
+		if err := voice.Drain(ctx); err != nil {
+			t.Fatal(err)
+		}
+		got := stream.samples()
+		if len(got) < 4800 || slices.ContainsFunc(got[:2400], func(s int16) bool { return s != ducked+soundLevel }) || got[4799] != voiceLevel {
+			t.Errorf("the stream began %v, want the sound at once over the voice %d down, all 2400 samples, then the voice back at %d", got[:min(len(got), 8)], ducked, voiceLevel)
+		}
+	})
 }
 
 // TestOutputResamplesToTheStreamRate fails if an input at another rate than
@@ -544,52 +638,57 @@ func TestOutputKeepsOneStreamAcrossSpeechesAndClosesItWhenIdle(t *testing.T) {
 // TestOutputHooksBracketTheStream fails if the output hooks do not run around
 // the playback stream: opening before the stream opens, and closing once the
 // Output is done with it, with the stream still open until closing's
-// closeStream runs. The Jabra mute button counts a playback stream as open
-// from opening to closing, so it writes no light while one is open on the
-// Jabra.
+// closeStream runs, which returns the stream's close error. The Jabra mute
+// button counts a playback stream as open from opening to closing, so it
+// writes no light while one is open on the Jabra.
 func TestOutputHooksBracketTheStream(t *testing.T) {
-	stream := newFakeStream(48000)
-	var mu sync.Mutex
-	var calls []string
-	call := func(c string) {
-		mu.Lock()
-		defer mu.Unlock()
-		calls = append(calls, c)
-	}
-	opener := &fakeOpener{streams: []*fakeStream{stream}}
-	cfg := OutputConfig{
-		IdleClose: 10 * time.Millisecond,
-		Opening:   func() { call("opening") },
-		Closing: func(closeStream func()) {
-			call(fmt.Sprintf("closing (closed before closeStream: %t)", stream.isClosed()))
-			closeStream()
-			call(fmt.Sprintf("closed: %t", stream.isClosed()))
-		},
-	}
-	cfg.Open = func(device string) (PlaybackStream, int, error) {
-		call("open")
-		return opener.open(device)
-	}
-	out := NewOutput(cfg)
-	t.Cleanup(func() { _ = out.Close() })
-	ctx := testContext(t)
-	pb := out.Begin(InputVoice)
-	if err := pb.WriteAll(ctx, constant(48000, 20*time.Millisecond, 1000), mono48k); err != nil {
-		t.Fatal(err)
-	}
-	if err := pb.Drain(ctx); err != nil {
-		t.Fatal(err)
-	}
-	want := []string{"opening", "open", "closing (closed before closeStream: false)", "closed: true"}
-	waitFor(t, "the idle stream to close", func() bool {
-		mu.Lock()
-		defer mu.Unlock()
-		return len(calls) == len(want)
-	})
-	mu.Lock()
-	defer mu.Unlock()
-	if !slices.Equal(calls, want) {
-		t.Fatalf("calls = %q, want %q", calls, want)
+	for _, closeErr := range []error{nil, errors.New("speaker close failed")} {
+		t.Run(fmt.Sprintf("close error %v", closeErr), func(t *testing.T) {
+			stream := newFakeStream(48000)
+			stream.closeErr = closeErr
+			var mu sync.Mutex
+			var calls []string
+			call := func(c string) {
+				mu.Lock()
+				defer mu.Unlock()
+				calls = append(calls, c)
+			}
+			opener := &fakeOpener{streams: []*fakeStream{stream}}
+			cfg := OutputConfig{
+				IdleClose: 10 * time.Millisecond,
+				Opening:   func() { call("opening") },
+				Closing: func(closeStream func() error) {
+					call(fmt.Sprintf("closing (closed before closeStream: %t)", stream.isClosed()))
+					err := closeStream()
+					call(fmt.Sprintf("closed: %t, error %v", stream.isClosed(), err))
+				},
+			}
+			cfg.Open = func(device string) (PlaybackStream, int, error) {
+				call("open")
+				return opener.open(device)
+			}
+			out := NewOutput(cfg)
+			t.Cleanup(func() { _ = out.Close() })
+			ctx := testContext(t)
+			pb := out.Begin(InputVoice)
+			if err := pb.WriteAll(ctx, constant(48000, 20*time.Millisecond, 1000), mono48k); err != nil {
+				t.Fatal(err)
+			}
+			if err := pb.Drain(ctx); err != nil {
+				t.Fatal(err)
+			}
+			want := []string{"opening", "open", "closing (closed before closeStream: false)", fmt.Sprintf("closed: true, error %v", closeErr)}
+			waitFor(t, "the idle stream to close", func() bool {
+				mu.Lock()
+				defer mu.Unlock()
+				return len(calls) == len(want)
+			})
+			mu.Lock()
+			defer mu.Unlock()
+			if !slices.Equal(calls, want) {
+				t.Fatalf("calls = %q, want %q", calls, want)
+			}
+		})
 	}
 }
 
@@ -602,7 +701,14 @@ func TestOutputHooksRunWhenTheStreamDoesNotOpen(t *testing.T) {
 	opened, closed := 0, 0
 	out := newTestOutput(t, OutputConfig{
 		Opening: func() { mu.Lock(); opened++; mu.Unlock() },
-		Closing: func(closeStream func()) { mu.Lock(); closed++; mu.Unlock(); closeStream() },
+		Closing: func(closeStream func() error) {
+			mu.Lock()
+			closed++
+			mu.Unlock()
+			if err := closeStream(); err != nil {
+				t.Errorf("closeStream with no stream opened = %v, want nil", err)
+			}
+		},
 	}, &fakeOpener{err: errors.New("no output device")})
 	ctx := testContext(t)
 	pb := out.Begin(InputVoice)
@@ -622,6 +728,54 @@ func TestOutputHooksRunWhenTheStreamDoesNotOpen(t *testing.T) {
 
 func containsText(err error, text string) bool {
 	return err != nil && strings.Contains(err.Error(), text)
+}
+
+// TestOutputLogsAStreamThatFailsToClose fails if an Output with no closing
+// hook drops the error of a stream that did not close instead of logging it
+// at WARN.
+func TestOutputLogsAStreamThatFailsToClose(t *testing.T) {
+	var mu sync.Mutex
+	var logs strings.Builder
+	original := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(lockedWriter{&mu, &logs}, nil)))
+	defer slog.SetDefault(original)
+	stream := newFakeStream(48000)
+	stream.closeErr = errors.New("speaker close failed")
+	out := newTestOutput(t, OutputConfig{IdleClose: 10 * time.Millisecond}, &fakeOpener{streams: []*fakeStream{stream}})
+	ctx := testContext(t)
+	pb := out.Begin(InputVoice)
+	if err := pb.WriteAll(ctx, constant(48000, 20*time.Millisecond, 1000), mono48k); err != nil {
+		t.Fatal(err)
+	}
+	if err := pb.Drain(ctx); err != nil {
+		t.Fatal(err)
+	}
+	logged := func() string {
+		mu.Lock()
+		defer mu.Unlock()
+		return logs.String()
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for !stream.isClosed() || !strings.Contains(logged(), "speaker close failed") {
+		if time.Now().After(deadline) {
+			t.Fatalf("the stream closed: %t; the log holds %q; want a WARN line with the close's error", stream.isClosed(), logged())
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if line := logged(); !strings.Contains(line, "level=WARN") || !strings.Contains(line, `msg="speaker stream close failed"`) {
+		t.Fatalf("the log holds %q; want a WARN line, speaker stream close failed", line)
+	}
+}
+
+type lockedWriter struct {
+	mu *sync.Mutex
+	w  io.Writer
+}
+
+func (l lockedWriter) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.w.Write(p)
 }
 
 // TestOutputReportsAStreamFailureToTheWriter fails if a write the device

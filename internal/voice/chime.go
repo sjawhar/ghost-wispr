@@ -3,12 +3,13 @@ package voice
 import (
 	"encoding/binary"
 	"math"
+	"slices"
 	"sync"
 
 	"github.com/sjawhar/ghost-wispr/internal/audio"
 )
 
-// ChimeFormat is the format of both chimes: the voice output's mix rate.
+// ChimeFormat is the format of every sound: the voice output's mix rate.
 var ChimeFormat = audio.AudioFormat{SampleRate: 24000, Channels: 1, Encoding: audio.EncodingPCM16}
 
 // note is one tone of a chime: a sine with a little of its octave, a 5 ms
@@ -20,16 +21,18 @@ type note struct {
 }
 
 // chimeNotes are the sounds (R10). The wake sound rises a fifth over two
-// notes (E5, B5): "I heard you". The answer sound is three notes up a major
-// triad (G5, C6, E6): "an answer is ready". The start sound is one soft high
-// note (A5): "recording". The error sound falls a fourth over two notes from
-// A4, 7 semitones under the wake sound's start: "that did not work". Sounds
-// with as many notes start at least 4 semitones apart.
+// notes (E5, B5): "I heard you". The answer sound runs up a major triad
+// (G5, C6, E6) twice, 660 ms, so that it is hard to miss: "an answer is
+// ready". The start sound is one high note (A5): "recording". The error sound
+// falls a fourth over two notes from A4, 7 semitones under the wake sound's
+// start: "that did not work". Sounds with as many notes start at least 4
+// semitones apart. Each sound, while it plays, is as loud as Wispr's speech,
+// -15 LUFS, with a true peak under -1 dBTP (chime_test.go).
 var chimeNotes = map[string][]note{
-	"wake":   {{659.25, 90, 0.30}, {987.77, 150, 0.26}},
-	"answer": {{783.99, 80, 0.26}, {1046.50, 80, 0.26}, {1318.51, 170, 0.22}},
-	"start":  {{880.00, 220, 0.26}},
-	"error":  {{440.00, 130, 0.32}, {329.63, 200, 0.32}},
+	"wake":   {{659.25, 90, 0.546}, {987.77, 150, 0.473}},
+	"answer": slices.Repeat([]note{{783.99, 80, 0.48}, {1046.50, 80, 0.48}, {1318.51, 170, 0.406}}, 2),
+	"start":  {{880.00, 220, 0.68}},
+	"error":  {{440.00, 130, 0.63}, {329.63, 200, 0.63}},
 }
 
 var (

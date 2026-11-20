@@ -924,8 +924,12 @@ with the unit paused and no session active:
    in point 4. `holder-cases` runs `ghost-wispr issue-holder KEY`, which prints the Concierge's
    answer for the issue's holder without opening an Envoy session; `tts-first-audio` runs
    `ghost-wispr tts-first-audio --engine NAME`, which times each sentence to its first audio frame
-   and plays nothing. The steps that read the service's log lines (the voice timing lines, the
-   speaker's stream and underrun lines, the Concierge's cancel line) read the system journal with
+   and plays nothing. `playback-cancel` starts with `ghost-wispr play-sound wake`, which plays the
+   wake sound once on the speaker as the voice plays it and returns once the speaker's stream has
+   closed: how long the rig hears that sound alone is the step's calibration, and a chime after a
+   stop may be heard at most 20 ms longer. The steps that read the service's log lines (the voice
+   timing lines, the speaker's stream and underrun lines, the Concierge's cancel line) read the
+   system journal with
    `sudo -n journalctl _SYSTEMD_USER_UNIT=ghost-wispr.service _PID=<MainPID> --boot=0`, the
    running process's lines in the current boot: the Pi keeps no user journal, and a process ID can
    recur after a reboot. The underrun check reports UNKNOWN if its journal read fails. The windows
