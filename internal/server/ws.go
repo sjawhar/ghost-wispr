@@ -17,13 +17,13 @@ var upgrader = websocket.Upgrader{
 	CheckOrigin: func(*http.Request) bool { return true },
 }
 
+// registerWSRoute serves the live event stream; logger names the module
+// already.
 func registerWSRoute(mux *http.ServeMux, hub *Hub, logger *slog.Logger) {
-	moduleLogger := logging.WithModule(logger, "server")
-
 	mux.HandleFunc("GET /ws", func(w http.ResponseWriter, r *http.Request) {
 		conn, err := upgrader.Upgrade(w, r, nil)
 		if err != nil {
-			logging.FromContext(r.Context(), moduleLogger).Warn("websocket upgrade failed", "operation", "ws_upgrade", "error", err)
+			logging.FromContext(r.Context(), logger).Warn("websocket upgrade failed", "operation", "ws_upgrade", "error", err)
 			return
 		}
 		defer func() { _ = conn.Close() }()

@@ -1087,7 +1087,7 @@ func OpenAPISpec() map[string]any {
 						{
 							"name":        "level",
 							"in":          "query",
-							"description": "Log level filter (debug, info, warn, error)",
+							"description": "Log level filter: debug, info, warn or error, in any case. ALL, or no level, returns every level",
 							"required":    false,
 							"schema":      map[string]any{"type": "string"},
 						},

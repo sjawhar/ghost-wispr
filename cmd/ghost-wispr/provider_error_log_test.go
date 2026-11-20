@@ -6,8 +6,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
-	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -49,10 +47,9 @@ func TestAProviderErrorPutsNoRoomWordInTheLog(t *testing.T) {
 		}},
 	} {
 		t.Run(tc.provider, func(t *testing.T) {
-			keepTheDefaultLogger(t)
-			sink := logging.NewLogSink(1000)
+			keepDefaultLogger(t)
 			var stdout bytes.Buffer
-			logging.SetDefault(logging.New(io.MultiWriter(&stdout, sink), "info")) // as main builds the app's logger
+			_, sink := startAppLogger(appLogConfigStore(t), &stdout) // the app's logger, as main builds it
 			h, err := server.Handler(fstest.MapFS{"index.html": {Data: []byte("ok")}}, server.NewHub(), nil, &server.ControlHooks{GetLogs: sink.GetLogs}, "", nil, nil)
 			if err != nil {
 				t.Fatal(err)
@@ -128,18 +125,6 @@ func TestAProviderErrorPutsNoRoomWordInTheLog(t *testing.T) {
 			}
 		})
 	}
-}
-
-// keepTheDefaultLogger puts slog's default logger, and the log package's
-// output and flags, back as they were when the test ends.
-func keepTheDefaultLogger(t *testing.T) {
-	t.Helper()
-	logger, writer, flags := slog.Default(), log.Writer(), log.Flags()
-	t.Cleanup(func() {
-		slog.SetDefault(logger)
-		log.SetOutput(writer)
-		log.SetFlags(flags)
-	})
 }
 
 const summarySessionID = "20261120090000"

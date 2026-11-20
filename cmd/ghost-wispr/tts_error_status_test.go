@@ -13,7 +13,6 @@ import (
 
 	"cloud.google.com/go/auth"
 
-	"github.com/sjawhar/ghost-wispr/internal/logging"
 	"github.com/sjawhar/ghost-wispr/internal/server"
 	"github.com/sjawhar/ghost-wispr/internal/tts"
 )
@@ -32,9 +31,8 @@ func TestASpeechErrorShowsNoRoomWord(t *testing.T) {
 	const planted = "quokkaplantedroomword"
 	for _, name := range []string{"gemini", "google", "elevenlabs"} {
 		t.Run(name, func(t *testing.T) {
-			keepTheDefaultLogger(t)
-			sink := logging.NewLogSink(1000)
-			logging.SetDefault(logging.New(sink, "debug"))
+			keepDefaultLogger(t)
+			_, sink := startAppLogger(appLogConfigStore(t), io.Discard) // the app's logger, as main builds it
 			quoted := 0
 			fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				body, _ := io.ReadAll(r.Body)

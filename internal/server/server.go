@@ -261,12 +261,12 @@ func Serve(addr string, staticFS fs.FS, hub *Hub, store SessionStore, controls *
 	return http.ListenAndServe(addr, h)
 }
 
+// serveSPA serves the web app; logger names the module already.
 func serveSPA(staticFS fs.FS, fileServer http.Handler, logger *slog.Logger) func(http.ResponseWriter, *http.Request) {
-	moduleLogger := logging.WithModule(logger, "server")
 	// Read index.html once at startup for SPA fallback
 	indexHTML, err := fs.ReadFile(staticFS, "index.html")
 	if err != nil {
-		moduleLogger.Error("failed to read index.html from static assets", "operation", "load_static_index", "error", err)
+		logger.Error("failed to read index.html from static assets", "operation", "load_static_index", "error", err)
 		panic(err)
 	}
 
@@ -289,7 +289,7 @@ func serveSPA(staticFS fs.FS, fileServer http.Handler, logger *slog.Logger) func
 			// SPA route: serve index.html directly (avoids FileServer redirect loop)
 			w.Header().Set("Content-Type", "text/html; charset=utf-8")
 			if _, err := w.Write(indexHTML); err != nil {
-				logging.FromContext(r.Context(), moduleLogger).Warn("failed to write index.html", "operation", "write_index", "error", err)
+				logging.FromContext(r.Context(), logger).Warn("failed to write index.html", "operation", "write_index", "error", err)
 				return
 			}
 			return
