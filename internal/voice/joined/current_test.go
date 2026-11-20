@@ -24,6 +24,7 @@ type pausingFloor struct {
 	next        Floor
 	beforeRaise func()
 	afterRaise  func()
+	beforeLower func()
 	wrapCurrent func(current func() bool) func() bool
 }
 
@@ -41,7 +42,12 @@ func (f *pausingFloor) RaiseHand(h *voice.Hand) error {
 	return err
 }
 
-func (f *pausingFloor) LowerHands(membership string) { f.next.LowerHands(membership) }
+func (f *pausingFloor) LowerHands(membership string) {
+	if f.beforeLower != nil {
+		f.beforeLower()
+	}
+	f.next.LowerHands(membership)
+}
 
 // TestAnEndedMembershipsHandIsNeverSpoken fails if a floor request whose raise
 // reaches the Supervisor only after its agent's leave completed, lowering
@@ -160,7 +166,7 @@ func TestAStaleEndCannotOverwriteNewerKeyterms(t *testing.T) {
 func TestHandCurrentCannotDeadlockWithTheRoster(t *testing.T) {
 	sup := newSupervisorRig(t)
 	inCurrent, leaveCurrent := make(chan struct{}), make(chan struct{})
-	var holdOnce atomic.Bool
+	var holdOnce, abort atomic.Bool
 	holdOnce.Store(true)
 	floor := &pausingFloor{
 		next: sup.s,
@@ -169,6 +175,9 @@ func TestHandCurrentCannotDeadlockWithTheRoster(t *testing.T) {
 				if holdOnce.CompareAndSwap(true, false) {
 					close(inCurrent)
 					<-leaveCurrent
+				}
+				if abort.Load() {
+					return false // the roster's lock is held: asking it now would deadlock the test
 				}
 				return current()
 			}
@@ -193,30 +202,49 @@ func TestHandCurrentCannotDeadlockWithTheRoster(t *testing.T) {
 	case <-time.After(testWait):
 		t.Fatal("control: the Supervisor never asked the hand whether its membership is current")
 	}
-	// The roster raises a hand and ends a membership while the Supervisor is
-	// held in Current: each waits on the Supervisor, and must hold no lock of
-	// the roster's while it does.
+	// The roster raises a hand, then ends a membership whose hand is up, while
+	// the Supervisor is held in Current: each waits on the Supervisor, and
+	// must hold no lock of the roster's while it does.
+	lockFree := func(what string) {
+		t.Helper()
+		deadline := time.Now().Add(150 * time.Millisecond)
+		for time.Now().Before(deadline) {
+			if !r.roster.mu.TryLock() {
+				time.Sleep(time.Millisecond)
+				if !r.roster.mu.TryLock() {
+					abort.Store(true)
+					close(leaveCurrent)
+					t.Fatalf("the roster held its lock while %s waited on the Supervisor, which waits on the roster's lock in Current: a deadlock", what)
+				}
+			}
+			r.roster.mu.Unlock()
+			time.Sleep(5 * time.Millisecond)
+		}
+	}
+	raising, lowering := make(chan struct{}), make(chan struct{})
+	floor.beforeRaise = func() { close(raising) }
+	floor.beforeLower = func() { close(lowering) }
 	raised, left := make(chan struct{}), make(chan struct{})
 	go func() {
 		defer close(raised)
 		_, _ = r.roster.Deliver(context.Background(), &envoy.Message{EventID: "second-floor", SourceSession: "agent-2", Text: "ghost-wispr floor\nThe keys rotated.", IssuedAt: time.Now()})
 	}()
+	select {
+	case <-raising:
+	case <-time.After(testWait):
+		t.Fatal("control: the second floor request never reached the Supervisor")
+	}
+	lockFree("a raise")
 	go func() {
 		defer close(left)
-		_, _ = r.roster.Deliver(context.Background(), &envoy.Message{EventID: "leave-2", SourceSession: "agent-2", Text: "ghost-wispr leave", IssuedAt: time.Now()})
+		_, _ = r.roster.Deliver(context.Background(), &envoy.Message{EventID: "leave-1", SourceSession: "agent-1", Text: "ghost-wispr leave", IssuedAt: time.Now()})
 	}()
-	deadline := time.Now().Add(300 * time.Millisecond)
-	for time.Now().Before(deadline) {
-		if !r.roster.mu.TryLock() {
-			time.Sleep(time.Millisecond)
-			if !r.roster.mu.TryLock() {
-				close(leaveCurrent)
-				t.Fatal("the roster held its lock while it waited on the Supervisor, which waits on the roster's lock in Current: a deadlock")
-			}
-		}
-		r.roster.mu.Unlock()
-		time.Sleep(5 * time.Millisecond)
+	select {
+	case <-lowering:
+	case <-time.After(testWait):
+		t.Fatal("control: the leave never lowered its hand on the Supervisor")
 	}
+	lockFree("a lower")
 	close(leaveCurrent)
 	for name, ch := range map[string]chan struct{}{"the go-ahead": heard, "the floor request": raised, "the leave": left} {
 		select {

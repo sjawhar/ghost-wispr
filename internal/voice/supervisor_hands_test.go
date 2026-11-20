@@ -123,6 +123,29 @@ func TestAHandWhoseMembershipEndedIsWithdrawn(t *testing.T) {
 	}
 }
 
+// TestAGoAheadSkipsAWithdrawnHand fails if "Wispr, go ahead" accepts the
+// invitation for the oldest hand without asking whether its membership is
+// still current: a hand whose membership ended just before is withdrawn,
+// and the next hand is the one spoken.
+func TestAGoAheadSkipsAWithdrawnHand(t *testing.T) {
+	r, outcomes := newHandsRig(t)
+	var ended atomic.Bool
+	first, second := testHand("h1", "ABC-12", time.Minute), testHand("h2", "XYZ-9", time.Minute)
+	first.Current = func() bool { return !ended.Load() }
+	for _, h := range []*Hand{first, second} {
+		if err := r.s.RaiseHand(h); err != nil {
+			t.Fatalf("RaiseHand: %v", err)
+		}
+	}
+	eventually(t, "the hand sound", func() bool { return slices.Equal(r.speaker.soundsPlayed(), []string{"hand"}) })
+	ended.Store(true)
+	r.heard("Wispr, go ahead.", true, true)
+	if got := waitSaid(t, r.waitSession()); got != second.Text {
+		t.Fatalf("said %q, want the next hand's words %q", got, second.Text)
+	}
+	eventually(t, "the first hand reported withdrawn", func() bool { return slices.Contains(outcomes.all(), "h1:withdrawn") })
+}
+
 // TestRaisedHandWaitsForAnInvitation fails if a raised hand plays no hand
 // sound, speaks by itself on a free floor, or is not spoken, as its agent's
 // words, on "Wispr, go ahead".
