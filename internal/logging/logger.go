@@ -174,6 +174,12 @@ func providerSDK(pc uintptr) string {
 // module already, it names module in that one's place, so a record holds one
 // "module" key: with two, a reader keeps whichever its JSON library picks. A
 // module named after a group opened is in that group.
+//
+// On a handler New did not build, once a group opens the module named before
+// it stays: a module renamed again after a group opens on such a handler is
+// written inside the group, and a second rename at the same depth repeats it.
+// That keeps each bound value rendered once, by that handler, under its own
+// ReplaceAttr and format (moduleHandler).
 func WithModule(logger *slog.Logger, module string) *slog.Logger {
 	if logger == nil {
 		logger = slog.Default()
@@ -185,6 +191,9 @@ func WithModule(logger *slog.Logger, module string) *slog.Logger {
 
 	bare := logger.Handler()
 	if named, ok := bare.(*moduleHandler); ok {
+		if named.bare == nil {
+			return slog.New(&moduleHandler{module: module, named: named.named.WithAttrs([]slog.Attr{slog.String(moduleKey, module)})})
+		}
 		bare = named.bare
 	}
 	return slog.New(newModuleHandler(bare, module))
@@ -196,13 +205,15 @@ func WithModule(logger *slog.Logger, module string) *slog.Logger {
 // value is rendered once, as it was when it was bound, and naming another
 // module binds that one on bare.
 //
-// Once a group opens, the module stays outside it: named then binds each
-// later attribute itself, as bare does. On New's handler, such an attribute
-// is rendered once before either binds it (renderAttrs), so both hold the
-// same text. Any other handler gets the value as it was bound, so its own
-// ReplaceAttr and format apply, and renders it on each.
+// Once a group opens, named binds each later attribute itself, as bare does.
+// On New's handler, such an attribute is rendered once before either binds it
+// (renderAttrs), so both hold the same text. Any other handler must get the
+// value as it was bound, so its own ReplaceAttr and format apply, and binding
+// it on two handlers would render it twice: such a handler keeps named alone
+// (bare is nil) from the group on, and a module renamed on it is bound on
+// named, inside the group (WithModule).
 type moduleHandler struct {
-	bare    slog.Handler
+	bare    slog.Handler // nil on a handler New did not build, once a group opened
 	module  string
 	named   slog.Handler
 	grouped bool // a group opened since the module was bound on named
@@ -222,21 +233,24 @@ func (h *moduleHandler) Handle(ctx context.Context, record slog.Record) error {
 }
 
 func (h *moduleHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
-	if len(attrs) == 0 {
+	switch {
+	case len(attrs) == 0:
 		return h
-	}
-	if !h.grouped {
+	case h.bare == nil:
+		return &moduleHandler{module: h.module, named: h.named.WithAttrs(attrs), grouped: true}
+	case !h.grouped:
 		return newModuleHandler(h.bare.WithAttrs(attrs), h.module)
 	}
-	if _, own := h.bare.(appHandler); own {
-		renderAttrs(attrs)
-	}
+	renderAttrs(attrs)
 	return &moduleHandler{bare: h.bare.WithAttrs(slices.Clone(attrs)), module: h.module, named: h.named.WithAttrs(attrs), grouped: true}
 }
 
 func (h *moduleHandler) WithGroup(name string) slog.Handler {
 	if name == "" {
 		return h
+	}
+	if _, own := h.bare.(appHandler); !own {
+		return &moduleHandler{module: h.module, named: h.named.WithGroup(name), grouped: true}
 	}
 	return &moduleHandler{bare: h.bare.WithGroup(name), module: h.module, named: h.named.WithGroup(name), grouped: true}
 }

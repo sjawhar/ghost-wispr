@@ -286,6 +286,36 @@ func TestWithModule_AnotherHandlerGetsGroupedValuesAsBound(t *testing.T) {
 
 type secretValue struct{ Secret string }
 
+// On a handler New did not build, a value bound after a group opened is
+// rendered once, by that handler, and a module renamed after the group
+// opened is written inside the group, beside the module named before; a
+// second rename at the same depth repeats "module" inside the group.
+func TestWithModule_AForeignHandlerRendersAGroupedValueOnce(t *testing.T) {
+	var out bytes.Buffer
+	calls := 0
+	logger := WithModule(slog.New(slog.NewJSONHandler(&out, nil)), "server").WithGroup("request").With("value", countingMarshaler{&calls})
+	logger.Info("original")
+	WithModule(logger, "health").Info("renamed")
+	WithModule(WithModule(logger, "health"), "retry").Info("renamed twice")
+
+	if calls != 1 {
+		t.Fatalf("MarshalJSON ran %d times, want once: %s", calls, out.String())
+	}
+	lines := strings.Split(strings.TrimSpace(out.String()), "\n")
+	if len(lines) != 3 {
+		t.Fatalf("want three records: %s", out.String())
+	}
+	for i, want := range []string{
+		`"module":"server","request":{"value":1}`,
+		`"module":"server","request":{"value":1,"module":"health"}`,
+		`"module":"server","request":{"value":1,"module":"health","module":"retry"}`,
+	} {
+		if !strings.Contains(lines[i], want) {
+			t.Errorf("record %d = %s, want it to hold %s", i, lines[i], want)
+		}
+	}
+}
+
 // A grouped value whose MarshalJSON fails is rendered once, so the logger and
 // the one that renames its module write the same failure.
 func TestWithModule_AFailingGroupedValueIsRenderedOnce(t *testing.T) {
