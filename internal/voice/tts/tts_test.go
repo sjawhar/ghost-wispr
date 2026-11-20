@@ -519,65 +519,71 @@ func TestInterruptDoesNotWaitForTheEngine(t *testing.T) {
 // that was queued behind the one Interrupt stopped: no word of it may reach
 // the vendor once a person said "Wispr, stop".
 //
-// Interrupt cancels each context of the generation in turn, in map order,
-// and the Say in flight ends at its own. The synthesis stage can then take a
-// queued Say whose context Interrupt has not cancelled yet. The generation's
-// context is the standard library's, so the test cannot stop it in that
-// state; many queued Says give Interrupt many contexts to cancel, so the
-// synthesis stage acts in the middle of it in most rounds, as a loaded
-// machine lets it by chance with one.
+// Interrupt ends the generation's context, and Go then cancels the contexts
+// derived from it one by one, so the Say in flight can end, and free the
+// synthesis stage, while the queued Say's own contexts are not cancelled yet.
+// The session's generation context here is one the test owns: Interrupt ends
+// it with only the in-flight Say's contexts cancelled, exactly that state.
 func TestInterruptCancelsQueuedSays(t *testing.T) {
-	const rounds, queuedSays = 10, 100
-	for round := range rounds {
-		var mu sync.Mutex
-		var streamed []string
-		s := openSession(t, fakeEngine{stream: func(ctx context.Context, text string, emit func([]byte) error) error {
-			mu.Lock()
-			streamed = append(streamed, text)
-			mu.Unlock()
-			if err := emit(ramp(0, frame20ms)); err != nil {
-				return err
-			}
-			if text == "after" {
-				return nil
-			}
-			<-ctx.Done()
-			return ctx.Err()
-		}}, newFakeOutput())
-
-		// The Say in flight returned once its first frame was queued. A Say
-		// called after it belongs to its generation once it is pending.
-		if err := s.Say(context.Background(), "first", voice.Fact); err != nil {
-			t.Fatalf("round %d: the Say in flight: %v", round, err)
-		}
-		queued := make(chan error, queuedSays)
-		for range queuedSays {
-			go func() { queued <- s.Say(context.Background(), "queued", voice.Fact) }()
-		}
-		waitPending(t, s, 1+queuedSays)
-		s.Interrupt()
-		for range queuedSays {
-			select {
-			case err := <-queued:
-				if !errors.Is(err, ErrInterrupted) {
-					t.Fatalf("round %d: queued Say = %v, want ErrInterrupted", round, err)
-				}
-			case <-time.After(time.Second):
-				t.Fatalf("round %d: a queued Say still running 1 s after Interrupt", round)
-			}
-		}
-		// The synthesis stage takes Says in order: once the next one has
-		// streamed, it is done with every queued one.
-		if err := s.Say(context.Background(), "after", voice.Fact); err != nil {
-			t.Fatalf("round %d: Say after Interrupt: %v", round, err)
-		}
+	var mu sync.Mutex
+	var streamed []string
+	s := openSession(t, fakeEngine{stream: func(ctx context.Context, text string, emit func([]byte) error) error {
 		mu.Lock()
-		got := slices.Clone(streamed)
+		streamed = append(streamed, text)
 		mu.Unlock()
-		if !slices.Equal(got, []string{"first", "after"}) {
-			t.Fatalf("round %d: streamed %q, want the Say in flight and the Say after Interrupt", round, got)
+		if err := emit(ramp(0, frame20ms)); err != nil {
+			return err
 		}
-		_ = s.Close()
+		if text == "after" {
+			return nil
+		}
+		<-ctx.Done()
+		return ctx.Err()
+	}}, newFakeOutput())
+	streamedSoFar := func() []string {
+		mu.Lock()
+		defer mu.Unlock()
+		return slices.Clone(streamed)
+	}
+
+	// The generation the Says are called in. Interrupt calls the session's
+	// interrupt function under the session's lock, then moves the generation.
+	epoch := newSteppedContext()
+	t.Cleanup(func() { epoch.cancelDerived(0, epoch.derived()) })
+	inFlight := 0
+	ss := s.(*session)
+	ss.mu.Lock()
+	opened := ss.interrupt
+	ss.epoch, ss.interrupt = epoch, func(error) {
+		epoch.stop()
+		epoch.cancelDerived(0, inFlight)
+	}
+	ss.mu.Unlock()
+	opened(context.Canceled)
+
+	if err := s.Say(context.Background(), "first", voice.Fact); err != nil {
+		t.Fatalf("the Say in flight: %v", err)
+	}
+	inFlight = epoch.derived()
+	queued := make(chan error, 1)
+	go func() { queued <- s.Say(context.Background(), "queued", voice.Fact) }()
+	epoch.waitDerived(t, 2*inFlight)
+	s.Interrupt()
+	select {
+	case err := <-queued:
+		if !errors.Is(err, ErrInterrupted) {
+			t.Fatalf("queued Say = %v, want ErrInterrupted (streamed %q)", err, streamedSoFar())
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("queued Say still running 2 s after Interrupt (streamed %q)", streamedSoFar())
+	}
+	// The synthesis stage takes Says in order: once the next one has
+	// streamed, it is done with the queued one.
+	if err := s.Say(context.Background(), "after", voice.Fact); err != nil {
+		t.Fatalf("Say after Interrupt: %v", err)
+	}
+	if got := streamedSoFar(); !slices.Equal(got, []string{"first", "after"}) {
+		t.Fatalf("streamed %q, want the Say in flight and the Say after Interrupt", got)
 	}
 }
 
@@ -690,10 +696,10 @@ func TestAStoppedSayBeginsNoPlaybackBeforeItsContextsEnd(t *testing.T) {
 	}
 }
 
-// steppedContext is an exchange context whose stop cancels the contexts
-// derived from it one registration at a time, under the test's control. Go's
-// context package hands that cancellation to a parent with an AfterFunc
-// method.
+// steppedContext is an exchange or generation context whose stop cancels the
+// contexts derived from it one registration at a time, under the test's
+// control. Go's context package hands that cancellation to a parent with an
+// AfterFunc method.
 type steppedContext struct {
 	context.Context // Background: no deadline and no values
 	done            chan struct{}
@@ -768,26 +774,6 @@ func (c *steppedContext) cancelDerived(from, to int) {
 		if f != nil {
 			f()
 		}
-	}
-}
-
-// waitPending waits until n Says of the session are pending: each holds the
-// generation it was called in.
-func waitPending(t *testing.T, s voice.Session, n int) {
-	t.Helper()
-	ss := s.(*session)
-	deadline := time.Now().Add(2 * time.Second)
-	for {
-		ss.mu.Lock()
-		pending := ss.pending
-		ss.mu.Unlock()
-		if pending >= n {
-			return
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("%d Says pending after 2 s, want %d", pending, n)
-		}
-		time.Sleep(time.Millisecond)
 	}
 }
 

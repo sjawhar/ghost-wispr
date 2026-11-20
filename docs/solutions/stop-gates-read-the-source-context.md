@@ -31,6 +31,7 @@ Voice A (the streaming text-to-speech voice) gives each Say two contexts derived
 
 - Sleeping in the test before the Interrupt: the race is not about the Say reaching its queue, it is inside the Interrupt.
 - Widening the window by hanging many child contexts off the Say in flight: the synthesis stage reads that context's `Err`, which waits for its children to be cancelled, so the window closed.
+- Widening it by queueing 100 Says behind the one in flight: the old gate still passed 3 of 200 runs at 2 CPUs. A test that only makes a race likely can pass on broken code.
 
 ## Solution
 
@@ -50,7 +51,7 @@ It holds only while every Say of one exchange gets the exchange's context itself
 
 ## Testing it deterministically
 
-A test can own the stop's cancellation order. Go's `context` package hands the cancellation of a derived context to a parent that has an `AfterFunc(func()) func() bool` method. `steppedContext` in `internal/voice/tts/tts_test.go` keeps those functions, sets its error, and cancels only the in-flight Say's derived contexts, which is the state the race needs. The old gate then starts the queued Say on every run. The generation context is the standard library's and cannot be stepped, so the Interrupt test queues 100 Says to widen the window instead.
+A test can own the stop's cancellation order. Go's `context` package hands the cancellation of a derived context to a parent that has an `AfterFunc(func()) func() bool` method. `steppedContext` in `internal/voice/tts/tts_test.go` keeps those functions, sets its error, and cancels only the in-flight Say's derived contexts, which is the state the race needs. The stop test passes one as the exchange context. The Interrupt test, which is in the package, swaps the session's generation context and its cancel function for one: `Interrupt` calls that function under the session lock. Both tests make the old gate start the queued Say on every run.
 
 ## Prevention
 
