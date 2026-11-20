@@ -802,8 +802,10 @@ func (s *Supervisor) neverMindLocked(sessionID string) {
 }
 
 // chimeQueueLasts is how long the answer sound may still play once its last
-// frame is queued: the speaker queues up to 200 ms of an input ahead.
-const chimeQueueLasts = 250 * time.Millisecond
+// frame is queued: the speaker queues up to 200 ms of an input ahead, and the
+// device buffers about 80 ms more (internal/audio), with room for a device
+// that grants a larger buffer.
+const chimeQueueLasts = 400 * time.Millisecond
 
 // cutAnswerSoundLocked stops the answer sound queued or still playing: once
 // its last answer is dropped, nothing of it plays.
@@ -1538,6 +1540,7 @@ func (s *Supervisor) stopLocked(reason string) {
 		s.chimeCancel() // an answer chime, even one whose playback has not begun
 		s.chimeCancel, s.chimeCtx = nil, nil
 	}
+	s.chimeQueuedAt = time.Time{} // the chime input is cut below, or by endLocked
 	if ex := s.ex; ex != nil {
 		s.endLocked(ex, true, reason)
 		return
@@ -1609,6 +1612,7 @@ func (s *Supervisor) takeFloorLocked(ex *exchange) {
 		s.chimeCancel()
 		s.chimeCancel, s.chimeCtx = nil, nil
 	}
+	s.chimeQueuedAt = time.Time{} // and is cut on the chime input below
 	s.cfg.Speaker.Cancel(audio.InputVoice)
 	s.cfg.Speaker.Cancel(audio.InputChime)
 }

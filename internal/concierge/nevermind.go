@@ -19,6 +19,9 @@ import (
 // passed over for the next one. With no such question it does nothing and
 // reports false: the voice then drops its newest held answer.
 func (c *Concierge) NeverMind(ctx context.Context, sessionID string, said time.Time) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, err // the voice stopped: nothing to cancel for it
+	}
 	tasks, err := c.store.VoiceTasks(sessionID)
 	if err != nil {
 		return false, err

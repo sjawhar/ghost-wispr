@@ -118,3 +118,19 @@ func TestNeverMindCancelsOnlyAQuestionAskedBeforeIt(t *testing.T) {
 		t.Fatalf("evt-1 %s, want cancelled", task.State)
 	}
 }
+
+// TestNeverMindWithAStoppedVoiceCancelsNothing fails if a never mind whose
+// context the voice's shutdown cancelled still cancels a question: one that
+// raced the shutdown must leave the ledger as it is.
+func TestNeverMindWithAStoppedVoiceCancelsNothing(t *testing.T) {
+	r := newRig(t)
+	r.ask(t, "agent-7", "first question", "ABC-12")
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if cancelled, err := r.concierge.NeverMind(ctx, "meeting-1", testNow.Add(time.Minute)); err == nil || cancelled {
+		t.Fatalf("NeverMind with a cancelled context = %v, %v; want nothing cancelled and its error", cancelled, err)
+	}
+	if task, _ := r.store.VoiceTask("evt-1"); task.State != storage.VoiceTaskWorking {
+		t.Fatalf("evt-1 %s, want working", task.State)
+	}
+}

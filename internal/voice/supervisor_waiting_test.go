@@ -340,6 +340,30 @@ func TestNoNeverMindStartsAfterClose(t *testing.T) {
 	never(t, "a queued never mind asked the Concierge after Close", 300*time.Millisecond, func() bool { return len(c.neverMindCalls()) > 1 })
 }
 
+// TestNeverMindLeavesASoundAfterTheAnswerSoundAlone fails if a never mind
+// cuts the chime input for an answer sound already cut, as when a
+// go-ahead's exchange took the floor: the error sound of that exchange's
+// failed open plays on.
+func TestNeverMindLeavesASoundAfterTheAnswerSoundAlone(t *testing.T) {
+	c := newFakeConcierge()
+	r, light := newWaitingRig(t, c)
+	holdAnswer(t, r, light, "t1", "It ships tomorrow.")
+	eventually(t, "the answer sound queued in full", func() bool {
+		r.s.mu.Lock()
+		defer r.s.mu.Unlock()
+		return r.speaker.written(audio.InputChime) > 0 && r.s.chimeCancel == nil
+	})
+	r.voice.failOpens(errors.New("the vendor refused the connection"))
+	r.heard("Wispr, go ahead.", true, true) // its open fails: the error sound, and the answer waits again
+	eventually(t, "the answer waiting again", func() bool { return pendingCount(r) == 1 && light.lit() })
+	before := time.Now()
+	r.heard("Wispr, never mind.", true, true)
+	eventually(t, "the waiting light off", func() bool { return !light.lit() })
+	if at, ok := r.speaker.cancelledAt(audio.InputChime); ok && at.After(before) {
+		t.Fatal("the never mind cut the chime input after the answer sound was already cut")
+	}
+}
+
 // TestALaterGoAheadOutlivesAnOlderNeverMind fails if a "Wispr, never mind"
 // whose Concierge call is still running drops an answer that a later "Wispr,
 // go ahead" spoke and a stop then put back to wait: the later word wins.
