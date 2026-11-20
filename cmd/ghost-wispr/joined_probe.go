@@ -20,7 +20,7 @@ import (
 	"github.com/sjawhar/ghost-wispr/internal/transcribe"
 )
 
-const joinedProbeUsage = "usage: ghost-wispr joined-probe [--envoy URL] (--invitation FILE | --wait-invitation) [--floor TEXT] [--timeout SECONDS]"
+const joinedProbeUsage = "usage: ghost-wispr joined-probe [--envoy URL] (--invitation FILE | --wait-invitation) [--api URL] [--floor TEXT] [--timeout SECONDS]"
 
 // joinedProbeFloor is the floor request the probe sends when --floor is not
 // set: words for the ear, with no word of a meeting.
@@ -43,13 +43,16 @@ func runJoinedProbeCommand(ctx context.Context, args []string, configPath string
 	envoyURL := flags.String("envoy", "", "")
 	invitationFile := flags.String("invitation", "", "")
 	waitInvitation := flags.Bool("wait-invitation", false, "")
+	// api replaces the API the join message names, for a development run
+	// whose unit has no public address of its own (public_url).
+	api := flags.String("api", "", "")
 	floor := flags.String("floor", joinedProbeFloor, "")
 	timeout := flags.Int("timeout", 120, "")
 	if err := flags.Parse(args[1:]); err != nil || flags.NArg() > 0 || (*invitationFile == "") == !*waitInvitation || *timeout <= 0 {
 		_, _ = fmt.Fprintln(stderr, joinedProbeUsage)
 		return 2
 	}
-	p := &joinedProbe{out: stdout, wait: time.Duration(*timeout) * time.Second, messages: make(chan *envoy.Message, 64)}
+	p := &joinedProbe{out: stdout, wait: time.Duration(*timeout) * time.Second, messages: make(chan *envoy.Message, 64), api: *api}
 	fail := func(err error) int {
 		p.emit("failed", map[string]any{"error": err.Error()})
 		_, _ = fmt.Fprintf(stderr, "joined-probe: %v\n", err)
@@ -108,6 +111,8 @@ type joinedProbe struct {
 	session  *envoy.Session
 	messages chan *envoy.Message
 	unit     string
+	// api replaces the join message's API when it is set.
+	api string
 }
 
 func (p *joinedProbe) emit(step string, fields map[string]any) {
@@ -139,6 +144,9 @@ func (p *joinedProbe) run(ctx context.Context, invitationFile, floor string) err
 	inv, err := parseInvitation(text)
 	if err != nil {
 		return err
+	}
+	if p.api != "" {
+		inv.api = p.api
 	}
 	p.unit = inv.unit
 	p.emit("invited", map[string]any{"via": via, "unit": inv.unit, "api": inv.api, "join": inv.join})
