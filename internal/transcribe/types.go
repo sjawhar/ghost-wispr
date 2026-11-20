@@ -52,6 +52,24 @@ type ResilientConfig struct {
 	// InitialReconnectDelay is the initial delay before the first reconnection attempt.
 	// Default: 500 milliseconds
 	InitialReconnectDelay time.Duration
+
+	// GracefulCloseWait bounds how long a healthy socket replaced after an
+	// options change may take to return its final results (GracefulCloser).
+	// Zero is DefaultGracefulCloseWait.
+	GracefulCloseWait time.Duration
+}
+
+// DefaultGracefulCloseWait is how long a healthy socket replaced after an
+// options change may take to return its final results, when ResilientConfig
+// sets none.
+const DefaultGracefulCloseWait = 3 * time.Second
+
+// GracefulCloser is a client that can end its stream gracefully: it tells the
+// peer the stream ends, so the peer processes the audio it has and returns its
+// final results, and closes once the peer has closed or wait has passed. A
+// client that is not one is closed at once.
+type GracefulCloser interface {
+	CloseGracefully(wait time.Duration) error
 }
 
 // ClientFactory is a function type that creates a new Deepgram client.
@@ -187,4 +205,13 @@ type ResilientClient struct {
 	stateChanges []StateChange
 	notifying    bool
 	notifierDone chan struct{}
+	// owning says a reconnect owner runs: the one goroutine that dials,
+	// drains and rotates sockets, from its start until it leaves the client
+	// connected (drainChunk). There is at most one. optionsGen counts the
+	// changes of the factory's options (OptionsChanged), and dialedGen is
+	// optionsGen when the current socket's dial began: the owner redials once
+	// when they differ. All guarded by Mu.
+	owning     bool
+	optionsGen uint64
+	dialedGen  uint64
 }

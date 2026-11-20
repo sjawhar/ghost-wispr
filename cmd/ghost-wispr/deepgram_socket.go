@@ -59,7 +59,10 @@ type deepgramSocket struct {
 	timeout time.Duration
 	writeMu sync.Mutex
 	closed  atomic.Bool
-	done    chan struct{}
+	// ended says CloseStream went out on a graceful close: every write after
+	// it fails, so audio sent after it goes to the next socket (CloseGracefully).
+	ended atomic.Bool
+	done  chan struct{}
 
 	// A Configure waits for Deepgram's answer before the next is sent
 	// (Deepgram refuses a second, CONFIGURE_ALREADY_PENDING): configWant is
@@ -270,10 +273,53 @@ func (s *deepgramSocket) Close() error {
 	return nil
 }
 
+// CloseGracefully ends the stream as Deepgram documents it (Close Stream):
+// CloseStream makes Deepgram process the audio it has, return its final
+// results, and close the connection. It waits for that close, or wait, before
+// closing the connection itself, and the final results reach the callback
+// meanwhile, so the audio this socket accepted is transcribed. A write in
+// progress is sent first (the write lock). It replaces a healthy socket after
+// an options change (transcribe.GracefulCloser); Close ends a failed one.
+func (s *deepgramSocket) CloseGracefully(wait time.Duration) error {
+	if s.endStream() {
+		timer := time.NewTimer(wait)
+		select {
+		case <-s.done:
+		case <-timer.C:
+		}
+		timer.Stop()
+	}
+	s.abort()
+	<-s.done
+	return nil
+}
+
+// endStream sends CloseStream and makes every later write fail, under the
+// write lock: a write in progress goes out first, and audio a writer sends
+// after it would reach a stream Deepgram has finished, so it fails instead and
+// the client sends it on the next socket. It reports whether CloseStream went
+// out.
+func (s *deepgramSocket) endStream() bool {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	if s.closed.Load() || s.ended.Swap(true) {
+		return false
+	}
+	if err := s.conn.SetWriteDeadline(time.Now().Add(s.timeout)); err != nil {
+		s.abort()
+		return false
+	}
+	if err := s.conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"CloseStream"}`)); err != nil {
+		s.abort()
+		return false
+	}
+	return true
+}
+
 func (s *deepgramSocket) write(messageType int, data []byte) error {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
-	if s.closed.Load() {
+	if s.closed.Load() || s.ended.Load() {
 		return errDeepgramSocketClosed
 	}
 	if err := s.conn.SetWriteDeadline(time.Now().Add(s.timeout)); err != nil {

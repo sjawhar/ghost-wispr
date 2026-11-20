@@ -25,7 +25,7 @@ func TestTheVoiceGetsWhenEachWordWasCaptured(t *testing.T) {
 	t.Cleanup(cancel)
 	rc := newLiveTranscription(ctx, "test-key",
 		&interfaces.ClientOptions{Host: host},
-		&interfaces.LiveTranscriptionOptions{Model: "nova-3", Language: "en-US", Encoding: "linear16", SampleRate: 16000, Channels: 1},
+		constOpts(&interfaces.LiveTranscriptionOptions{Model: "nova-3", Language: "en-US", Encoding: "linear16", SampleRate: 16000, Channels: 1}),
 		transcribe.ResilientConfig{SampleRate: 16000, InitialReconnectDelay: 20 * time.Millisecond, MaxReconnectBackoff: 50 * time.Millisecond},
 		transcriptCallback{voice: heard, stamp: func() (int, bool) { return 1, true }}, newWarningsRegistry(), nil)
 	t.Cleanup(func() { _ = rc.Close() })
