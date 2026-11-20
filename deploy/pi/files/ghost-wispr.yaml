@@ -51,8 +51,8 @@ jabra_mute_button: true
 envoy_enabled: true
 envoy_hub_url: http://envoy-hub.tail12ec1c.ts.net:9020
 # The meeting voice (README "Meeting voice"): "Wispr, …" at the start of a sentence asks about the
-# work in Dispatch. Voice A speaks with the Pi's own Gemini TTS voice, streamed from Vertex AI's us
-# multi-region, which is faster to first audio than global.
+# work in Dispatch. Voice A, text-to-speech, speaks with Gemini TTS through the Pi's own Google
+# identity, streamed from Vertex AI's us multi-region, which is faster to first audio than global.
 voice:
   enabled: true
   engine: tts

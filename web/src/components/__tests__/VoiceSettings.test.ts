@@ -34,11 +34,12 @@ describe('VoiceSettings', () => {
     render(VoiceSettings, { config })
 
     expect(checked('Enable meeting voice')).toBe(true)
-    expect(checked('Our own voice (tts)')).toBe(true)
-    expect(checked('GPT-Live (gptlive)')).toBe(false)
-    expect(checked('Deepgram voice agent (dgagent)')).toBe(false)
+    expect(checked('Text-to-speech (tts)')).toBe(true)
+    expect(checked('Speech-to-speech: OpenAI GPT-Live (gptlive)')).toBe(false)
+    expect(checked('Voice agent: Deepgram (dgagent)')).toBe(false)
     expect(checked('Aura')).toBe(true)
     expect(checked('Gemini')).toBe(false)
+    expect(screen.getByRole('group', { name: 'Text-to-speech provider' })).toBeTruthy()
   })
 
   it('shows a voice that is off and another voice', () => {
@@ -47,8 +48,8 @@ describe('VoiceSettings', () => {
     })
 
     expect(checked('Enable meeting voice')).toBe(false)
-    expect(checked('Deepgram voice agent (dgagent)')).toBe(true)
-    expect(checked('Our own voice (tts)')).toBe(false)
+    expect(checked('Voice agent: Deepgram (dgagent)')).toBe(true)
+    expect(checked('Text-to-speech (tts)')).toBe(false)
   })
 
   it('sends only the voice fields that changed, and keeps what the unit answers', async () => {
@@ -60,7 +61,7 @@ describe('VoiceSettings', () => {
     vi.stubGlobal('fetch', fetch)
     render(VoiceSettings, { config })
 
-    await fireEvent.click(screen.getByLabelText('GPT-Live (gptlive)'))
+    await fireEvent.click(screen.getByLabelText('Speech-to-speech: OpenAI GPT-Live (gptlive)'))
     await save()
 
     expect(fetch).toHaveBeenCalledTimes(1)
@@ -71,7 +72,7 @@ describe('VoiceSettings', () => {
     await waitFor(() => expect(configState.config).toEqual(answer))
   })
 
-  it("sends the switch and voice A's engine", async () => {
+  it('sends the switch and the text-to-speech provider', async () => {
     const fetch = vi.fn().mockResolvedValue(new Response(JSON.stringify(config)))
     vi.stubGlobal('fetch', fetch)
     render(VoiceSettings, { config })
@@ -104,7 +105,7 @@ describe('VoiceSettings', () => {
     )
     render(VoiceSettings, { config })
 
-    await fireEvent.click(screen.getByLabelText('Deepgram voice agent (dgagent)'))
+    await fireEvent.click(screen.getByLabelText('Voice agent: Deepgram (dgagent)'))
     await save()
 
     const shown = await screen.findByText(/supported engines are tts, gptlive, dgagent/)
@@ -127,6 +128,6 @@ describe('SettingsPage', () => {
     render(SettingsPage, { onBack: () => {} })
 
     expect(await screen.findByRole('heading', { name: 'Meeting voice' })).toBeTruthy()
-    expect(checked('Our own voice (tts)')).toBe(true)
+    expect(checked('Text-to-speech (tts)')).toBe(true)
   })
 })

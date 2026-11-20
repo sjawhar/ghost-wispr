@@ -1706,7 +1706,7 @@ type configGCResponse struct {
 }
 
 // configVoiceResponse is the meeting voice as the settings page changes it:
-// whether it is on, which voice answers and voice A's engine.
+// whether it is on, which voice answers and voice A's text-to-speech provider.
 type configVoiceResponse struct {
 	Enabled   bool   `json:"enabled"`
 	Engine    string `json:"engine"`

@@ -56,12 +56,12 @@ type BatchTranscription struct {
 
 // The voices, voice.engine's values.
 const (
-	VoiceEngineTTS     = "tts"     // voice A: our own streaming text-to-speech
-	VoiceEngineGPTLive = "gptlive" // voice B
-	VoiceEngineDGAgent = "dgagent" // voice C
+	VoiceEngineTTS     = "tts"     // voice A: text-to-speech
+	VoiceEngineGPTLive = "gptlive" // voice B: speech-to-speech, OpenAI GPT-Live
+	VoiceEngineDGAgent = "dgagent" // voice C: voice agent, Deepgram
 )
 
-// Voice A's text-to-speech engines, voice.tts_engine's values.
+// Voice A's text-to-speech providers, voice.tts_engine's values.
 const (
 	TTSEngineGemini = "gemini" // Gemini TTS streamed from Vertex AI
 	TTSEngineAura   = "aura"   // Deepgram Aura-2, with the Deepgram key
@@ -76,9 +76,9 @@ type Voice struct {
 	// PausedListener is the wake listener that holds the microphone while
 	// paused (slice 4). It is not built yet; true is ignored, with a warning.
 	PausedListener bool   `yaml:"paused_listener"`
-	TTSEngine      string `yaml:"tts_engine"`   // voice A's engine: gemini or aura
-	TTSModel       string `yaml:"tts_model"`    // "" is the engine's default
-	TTSVoice       string `yaml:"tts_voice"`    // "" is the engine's default
+	TTSEngine      string `yaml:"tts_engine"`   // voice A's text-to-speech provider: gemini or aura
+	TTSModel       string `yaml:"tts_model"`    // "" is the provider's default
+	TTSVoice       string `yaml:"tts_voice"`    // "" is the provider's default
 	TTSLocation    string `yaml:"tts_location"` // the Vertex AI location Gemini streams from
 	// GPTLive is voice B's OpenAI route: the workload identity ids its token
 	// exchange names. They are not secrets.
