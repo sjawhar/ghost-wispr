@@ -37,6 +37,7 @@ type Manager struct {
 	refinementWait     time.Duration
 	refinementWarning  func(sessionID, warning string)
 	sessionEnded       func(sessionID string)
+	sessionStarted     func(sessionID string, seq uint64)
 
 	mu               sync.Mutex
 	currentSessionID string
@@ -49,18 +50,20 @@ type Manager struct {
 	meetingCancel                  context.CancelFunc
 	manualSession                  bool
 	prevTimeout                    time.Duration
-	capturePaused                  bool          // no session may start while true
-	sessionStarts                  int           // session starts under way
-	startsDone                     *sync.Cond    // signalled (with mu) when a session start finishes
-	endingSession                  bool          // an end of the current session is under way
-	endsDone                       *sync.Cond    // signalled (with mu) when an end of the session finishes, and when endsRunning falls
-	endsRunning                    int           // session ends under way, from their claim until they return (WaitForLifecyclePublishes)
-	failedEnd                      sessionEnd    // how far an end of the current session that failed got
-	finalizeWaiter                 chan struct{} // closed by Deepgram's next Finalize reply; see AwaitFinalize
-	lastIDTime                     time.Time     // the start second the latest session ID names
-	stream                         LiveStream    // the live transcription's audio stream (SetLiveStream); nil until set
-	floor                          time.Duration // on the live stream's Captured() count, no word from before it reaches a later session (afterFloorLocked); 0 before any
-	resumes                        int           // capture resumes so far
+	capturePaused                  bool              // no session may start while true
+	sessionStarts                  int               // session starts under way
+	sessionSeq                     uint64            // settled session starts so far; each start's sequence number (SessionMark)
+	startIDs                       map[uint64]string // the last startIDsKept settled starts' ids, by sequence number (SessionOfStart)
+	startsDone                     *sync.Cond        // signalled (with mu) when a session start finishes
+	endingSession                  bool              // an end of the current session is under way
+	endsDone                       *sync.Cond        // signalled (with mu) when an end of the session finishes, and when endsRunning falls
+	endsRunning                    int               // session ends under way, from their claim until they return (WaitForLifecyclePublishes)
+	failedEnd                      sessionEnd        // how far an end of the current session that failed got
+	finalizeWaiter                 chan struct{}     // closed by Deepgram's next Finalize reply; see AwaitFinalize
+	lastIDTime                     time.Time         // the start second the latest session ID names
+	stream                         LiveStream        // the live transcription's audio stream (SetLiveStream); nil until set
+	floor                          time.Duration     // on the live stream's Captured() count, no word from before it reaches a later session (afterFloorLocked); 0 before any
+	resumes                        int               // capture resumes so far
 	lifecyclePublishes             sync.WaitGroup
 	lifecycleStartPublishesStopped bool
 
@@ -1089,6 +1092,19 @@ func (m *Manager) moveSessionLocked(id string) {
 	}
 }
 
+// SettledSession is the current session once its start is done, or "" while
+// none is current or a start is under way: a start may find the id it claimed
+// taken and move to the next (startSession), and ActiveSession names the
+// candidate meanwhile.
+func (m *Manager) SettledSession() string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.sessionStarts > 0 {
+		return ""
+	}
+	return m.currentSessionID
+}
+
 // SetSummarizer replaces the summarizer used for new sessions.
 // Safe to call concurrently.
 func (m *Manager) SetSummarizer(s Summarizer) {
@@ -1140,6 +1156,43 @@ func (m *Manager) SetSessionEndedHook(hook func(sessionID string)) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.sessionEnded = hook
+}
+
+// SetSessionStartedHook sets what runs, in its own goroutine, each time a
+// session starts, with the id its start settled on and the start's sequence
+// number, which counts settled starts from 1 with no gaps: the meeting voice
+// binds a session to the exchange that opened just before it (seq = the
+// exchange's open sequence plus one) and writes the lines it held for it.
+func (m *Manager) SetSessionStartedHook(hook func(sessionID string, seq uint64)) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.sessionStarted = hook
+}
+
+// startIDsKept is how many settled starts' ids SessionOfStart can still name:
+// far more than can start during one exchange, which lasts minutes at most.
+const startIDsKept = 64
+
+// SessionMark is the settled session now (SettledSession) and the count of
+// settled session starts, read together: an exchange that opens with no
+// settled session reads them at its open, and its session is the start after
+// that count (SessionOfStart), the one under way or the next to begin.
+func (m *Manager) SessionMark() (sessionID string, starts uint64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.sessionStarts > 0 {
+		return "", m.sessionSeq
+	}
+	return m.currentSessionID, m.sessionSeq
+}
+
+// SessionOfStart is the id of the settled session start with sequence number
+// seq, counted from 1 with no gaps, whether or not that session has ended
+// since; "" while that start has not settled, or is older than startIDsKept.
+func (m *Manager) SessionOfStart(seq uint64) string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.startIDs[seq]
 }
 
 func (m *Manager) SetBatchTranscriber(t transcribe.BatchTranscriber) {
@@ -1382,11 +1435,33 @@ func (m *Manager) WaitForSessionStarts() {
 	}
 }
 
+// finishSessionStart ends a session start and, once the start has settled on
+// its id, runs the session-started hook with it, in its own goroutine: a
+// failed start left currentSessionID empty, and runs no hook. The hook runs
+// after the start settled, so a reader (the meeting voice) sees the settled
+// session, not a candidate a taken id moved past.
 func (m *Manager) finishSessionStart() {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	m.sessionStarts--
 	m.startsDone.Broadcast()
+	id, hook := m.currentSessionID, m.sessionStarted
+	var seq uint64
+	if id != "" {
+		m.sessionSeq++
+		seq = m.sessionSeq
+		if m.startIDs == nil {
+			m.startIDs = map[uint64]string{}
+		}
+		m.startIDs[seq] = id
+		// The start startIDsKept back, in the counter's own wrapping
+		// arithmetic: before that many starts it names none, and across the
+		// counter's wrap it names the start the record must drop.
+		delete(m.startIDs, seq-startIDsKept)
+	}
+	m.mu.Unlock()
+	if hook != nil && id != "" {
+		go hook(id, seq)
+	}
 }
 
 // AwaitFinalize returns a channel that is closed once Deepgram's reply to a

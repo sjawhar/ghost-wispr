@@ -175,8 +175,8 @@ func (s *Supervisor) dropWithdrawnLocked() {
 }
 
 // handsUpLocked says, in an exchange of its own, which agents of meeting
-// sessionID have a hand up, on "Wispr, who has a hand up?".
-func (s *Supervisor) handsUpLocked(sessionID string) {
+// sessionID have a hand up, on "Wispr, who has a hand up?", heard at at.
+func (s *Supervisor) handsUpLocked(sessionID string, at time.Time) {
 	s.dropEndedLocked()
 	s.dropExpiredLocked(time.Now())
 	s.dropWithdrawnLocked()
@@ -191,7 +191,7 @@ func (s *Supervisor) handsUpLocked(sessionID string) {
 			}
 		}
 	}
-	s.speakLocked(&pendingAnswer{PendingAnswer: PendingAnswer{SessionID: sessionID, Text: handsLine(names)}, line: true})
+	s.speakLocked(&pendingAnswer{PendingAnswer: PendingAnswer{SessionID: sessionID, Text: handsLine(names)}, line: true}, at)
 }
 
 // handsLine names the agents with a hand up.

@@ -742,8 +742,8 @@ def react(kind, key, start, end):
         chime_heard = wake_heard_ms()
         emit(kind="ws", due=wake, event={"type": "voice_wake", "session_id": ""})
         if not ("no-wake-after-stop" in SCENARIO and read("stop-count")):
-            emit(kind="timing", due=wake, event="wake_heard", session_id="")
-        emit(kind="timing", due=wake + 5, event="wake_chime_queued", session_id="")
+            emit(kind="timing", due=wake, event="wake_heard", session_id="session-1")
+        emit(kind="timing", due=wake + 5, event="wake_chime_queued", session_id="session-1")
         emit(kind="ws", due=wake + 20, event={"type": "transcript", "session_id": "session-1", "speaker": 0, "text": "the injected question", "start_time": 0})
         if not ("no-chime-after-stop" in SCENARIO and read("stop-count")):
             emit(kind="sound", start=wake + chime, end=wake + chime + chime_heard, tag="chime-%d" % n)

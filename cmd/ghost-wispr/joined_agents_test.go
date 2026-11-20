@@ -168,7 +168,7 @@ func TestSessionChangesReachTheJoinedAgents(t *testing.T) {
 	var hooks conciergeHooks
 	var joinedLink joinedHooks
 	other := &forgetting{}
-	manager := &endedHookHolder{}
+	manager := &sessionHookHolder{}
 	forgotten := wireVoiceSessionHooks(manager, &hooks, &link, &joinedLink, other)
 	roster := testRoster(t, &link)
 	agents := &recordingAgents{}
@@ -181,7 +181,7 @@ func TestSessionChangesReachTheJoinedAgents(t *testing.T) {
 		}
 	}
 	join()
-	manager.hook("meeting")
+	manager.ended("meeting")
 	if len(roster.Joined()) != 0 {
 		t.Fatal("the agent stayed joined after its session ended")
 	}

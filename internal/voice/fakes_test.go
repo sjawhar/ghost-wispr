@@ -316,11 +316,24 @@ func (s *fakeSpeaker) delayCancels(input string, d time.Duration) {
 // finish plays out what input holds: its playbacks drain, and its speech
 // ends.
 func (s *fakeSpeaker) finish(input string) {
+	s.drain(input)
+	s.endSpeech(input)
+}
+
+// drain lets input's playbacks drain, with its speech not yet ended: as
+// audio.Output does, whose speech ends speechEndHold after its last audio.
+func (s *fakeSpeaker) drain(input string) {
 	s.mu.Lock()
+	defer s.mu.Unlock()
 	if ch := s.finished[input]; ch != nil {
 		close(ch)
 		s.finished[input] = nil
 	}
+}
+
+// endSpeech ends input's speech, if it was under way.
+func (s *fakeSpeaker) endSpeech(input string) {
+	s.mu.Lock()
 	if s.speaking[input] {
 		s.queueLocked(audio.SpeechEvent{Input: input, Started: false, At: time.Now(), Owner: s.owners[input]})
 	}
@@ -777,15 +790,25 @@ type rig struct {
 	events    *events
 	tap       *Tap
 
-	mu       sync.Mutex
-	red      bool
-	enabled  bool
-	voiceErr error // the next exchanges' voice cannot be built
-	closings int
-	session  string
-	start    float64 // the next transcript's socket time
-	timings  []string
-	timingAt map[string]time.Time
+	mu         sync.Mutex
+	red        bool
+	enabled    bool
+	voiceErr   error // the next exchanges' voice cannot be built
+	closings   int
+	session    string            // the current settled session, "" for none
+	sessionSeq uint64            // settled session starts so far
+	starts     map[uint64]string // each settled start's id, by sequence number
+	start      float64           // the next transcript's socket time
+	timings    []string
+	timingAt   map[string]time.Time
+	lines      []timingLine
+}
+
+// timingLine is one timing event as the Supervisor reported it.
+type timingLine struct {
+	event, sessionID string
+	at               time.Time
+	kv               []any
 }
 
 func newRig(t *testing.T, c *fakeConcierge) *rig {
@@ -796,7 +819,7 @@ func newRig(t *testing.T, c *fakeConcierge) *rig {
 // newRigWith is newRig with change applied to the Supervisor's config.
 func newRigWith(t *testing.T, c *fakeConcierge, change func(*SupervisorConfig, *rig)) *rig {
 	t.Helper()
-	r := &rig{t: t, speaker: newFakeSpeaker(), voice: newFakeVoice(), concierge: c, events: newEvents(), tap: NewTap(), red: true, enabled: true, session: "sess-1"}
+	r := &rig{t: t, speaker: newFakeSpeaker(), voice: newFakeVoice(), concierge: c, events: newEvents(), tap: NewTap(), red: true, enabled: true, session: "sess-1", sessionSeq: 1, starts: map[uint64]string{1: "sess-1"}}
 	cfg := &SupervisorConfig{
 		Voice: func() (Voice, error) {
 			r.mu.Lock()
@@ -813,6 +836,16 @@ func newRigWith(t *testing.T, c *fakeConcierge, change func(*SupervisorConfig, *
 			r.mu.Lock()
 			defer r.mu.Unlock()
 			return r.session
+		},
+		SessionMark: func() (string, uint64) {
+			r.mu.Lock()
+			defer r.mu.Unlock()
+			return r.session, r.sessionSeq
+		},
+		SessionOfStart: func(seq uint64) string {
+			r.mu.Lock()
+			defer r.mu.Unlock()
+			return r.starts[seq]
 		},
 		Red: func() bool {
 			r.mu.Lock()
@@ -843,16 +876,48 @@ func newRigWith(t *testing.T, c *fakeConcierge, change func(*SupervisorConfig, *
 }
 
 // timing records the Supervisor's timing events, and when each said it was.
-func (r *rig) timing(event, sessionID string, at time.Time, _ ...any) {
+func (r *rig) timing(event, sessionID string, at time.Time, kv ...any) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.timings = append(r.timings, event)
+	r.lines = append(r.lines, timingLine{event: event, sessionID: sessionID, at: at, kv: kv})
 	if r.timingAt == nil {
 		r.timingAt = map[string]time.Time{}
 	}
 	if _, ok := r.timingAt[event]; !ok {
 		r.timingAt[event] = at
 	}
+}
+
+// timingLines is every timing event reported so far, in order.
+func (r *rig) timingLines() []timingLine {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]timingLine(nil), r.lines...)
+}
+
+// setSession ends the current session when id is "", or else settles a new
+// session start, id, as the session manager does, without running the
+// session-started hook: the hook comes late, or never.
+func (r *rig) setSession(id string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.session = id
+	if id != "" {
+		r.sessionSeq++
+		r.starts[r.sessionSeq] = id
+	}
+}
+
+// startSession settles a new session start, id, and runs the session-started
+// hook for it at once, as the manager does: it returns the start's sequence.
+func (r *rig) startSession(id string) uint64 {
+	r.setSession(id)
+	r.mu.Lock()
+	seq := r.sessionSeq
+	r.mu.Unlock()
+	r.s.SessionStarted(id, seq)
+	return seq
 }
 
 // timingOf is when timing event first said it was, zero if it did not come.

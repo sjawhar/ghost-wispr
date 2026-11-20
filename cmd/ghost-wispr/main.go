@@ -493,7 +493,7 @@ type transcriptCallback struct {
 // voice.Supervisor.
 type voiceListener interface {
 	OnTranscript(t *voice.Transcript)
-	OnUtteranceEnd(closings int, gateOpen bool)
+	OnUtteranceEnd(closings int, gateOpen bool, at time.Time)
 }
 
 // keptMessager is a session manager that reports what of each result its
@@ -510,8 +510,10 @@ var _ keptMessager = (*session.Manager)(nil)
 
 // Message hands a Deepgram result to the session manager, then what the
 // manager's transcript kept of it to the voice, with the capture gate's stamp
-// taken as the result arrived.
+// and the time taken as the result arrived: the manager's work comes first,
+// and on the first words of a recording session it starts the session.
 func (c transcriptCallback) Message(mr *api.MessageResponse) error {
+	arrived := time.Now()
 	var closings int
 	open := true
 	if c.stamp != nil {
@@ -527,17 +529,18 @@ func (c transcriptCallback) Message(mr *api.MessageResponse) error {
 		err = manager.Message(mr)
 	}
 	if c.voice != nil && kept != nil {
-		if t := voiceTranscript(kept, func() (int, bool) { return closings, open }, c.heardAt); t != nil {
+		if t := voiceTranscript(kept, arrived, func() (int, bool) { return closings, open }, c.heardAt); t != nil {
 			c.voice.OnTranscript(t)
 		}
 	}
 	return err
 }
 
-// voiceTranscript is mr as the voice reads it, or nil when it holds no text.
-// heardAt, when set, times each word by when its start was captured, which
-// the voice's barge-in reads: a result can come seconds after its words.
-func voiceTranscript(mr *api.MessageResponse, stamp func() (int, bool), heardAt func(time.Duration) (time.Time, bool)) *voice.Transcript {
+// voiceTranscript is mr, which arrived at at, as the voice reads it, or nil
+// when it holds no text. heardAt, when set, times each word by when its start
+// was captured, which the voice's barge-in reads: a result can come seconds
+// after its words.
+func voiceTranscript(mr *api.MessageResponse, at time.Time, stamp func() (int, bool), heardAt func(time.Duration) (time.Time, bool)) *voice.Transcript {
 	if len(mr.Channel.Alternatives) == 0 || strings.TrimSpace(mr.Channel.Alternatives[0].Transcript) == "" {
 		return nil
 	}
@@ -548,7 +551,7 @@ func voiceTranscript(mr *api.MessageResponse, stamp func() (int, bool), heardAt 
 		IsFinal:      mr.IsFinal,
 		SpeechFinal:  mr.SpeechFinal,
 		FromFinalize: mr.FromFinalize,
-		At:           time.Now(),
+		At:           at,
 	}
 	if stamp != nil {
 		t.Closings, t.GateOpen = stamp()
@@ -589,7 +592,10 @@ func (c transcriptCallback) Metadata(*api.MetadataResponse) error { return nil }
 
 func (c transcriptCallback) SpeechStarted(*api.SpeechStartedResponse) error { return nil }
 
+// UtteranceEnd hands Deepgram's UtteranceEnd to the session manager, then to
+// the voice with the gate's stamp and the time taken as it arrived.
 func (c transcriptCallback) UtteranceEnd(ur *api.UtteranceEndResponse) error {
+	arrived := time.Now()
 	var closings int
 	open := true
 	if c.stamp != nil {
@@ -600,7 +606,7 @@ func (c transcriptCallback) UtteranceEnd(ur *api.UtteranceEndResponse) error {
 		err = c.manager.UtteranceEnd(ur)
 	}
 	if c.voice != nil {
-		c.voice.OnUtteranceEnd(closings, open)
+		c.voice.OnUtteranceEnd(closings, open, arrived)
 	}
 	return err
 }
@@ -2105,7 +2111,9 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 			enabled:     func() bool { return cfgStore.Get().Voice.Enabled },
 			wakePhrases: cfg.Voice.WakePhrases,
 			timing:      voiceTiming(appLogger),
-			session:     func() string { id, _ := manager.ActiveSession(); return id },
+			session:     manager.SettledSession,
+			mark:        manager.SessionMark,
+			ofStart:     manager.SessionOfStart,
 			meeting:     manager.MeetingContext,
 			red:         func() bool { return capture.capturing(micStatus) },
 			notify:      hub.BroadcastVoiceEvent,
