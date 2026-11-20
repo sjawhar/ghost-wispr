@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"math"
 	"slices"
 	"strings"
@@ -152,9 +153,9 @@ func TestSoundsWaitForAGap(t *testing.T) {
 	eventually(t, "the answer sound after the gap", func() bool { return slices.Equal(r.speaker.soundsPlayed(), []string{"answer"}) })
 }
 
-// TestSoundTriggersAndPitch fails if a sound does not play on its trigger, is
-// longer than 400 ms, or shares both its note count and a starting pitch
-// within 4 semitones with another sound (R10).
+// TestSoundTriggersAndPitch fails if a sound does not play on its trigger, or
+// shares both its note count and a starting pitch within 4 semitones with
+// another sound (R10). TestChimesAreShortAndDistinct bounds their lengths.
 func TestSoundTriggersAndPitch(t *testing.T) {
 	triggers := map[string]func(r *rig){
 		"wake":   func(r *rig) { r.heard("Wispr,", false, false) },
@@ -184,19 +185,7 @@ func TestSoundTriggersAndPitch(t *testing.T) {
 			eventually(t, "the "+want+" sound", func() bool { return slices.Contains(r.speaker.soundsPlayed(), want) })
 		})
 	}
-	sounds := map[string][]byte{"wake": WakeChime(), "answer": AnswerChime(), "hand": HandChime(), "start": StartChime(), "error": ErrorChime()}
-	for name, pcm := range sounds {
-		if d := time.Duration(len(pcm)/2) * time.Second / time.Duration(ChimeFormat.SampleRate); d > 400*time.Millisecond {
-			t.Errorf("the %s sound lasts %v, want at most 400 ms", name, d)
-		}
-	}
-	names := slices.Sorted(func(yield func(string) bool) {
-		for n := range sounds {
-			if !yield(n) {
-				return
-			}
-		}
-	})
+	names := slices.Sorted(maps.Keys(chimeNotes))
 	for i, a := range names {
 		for _, b := range names[i+1:] {
 			na, nb := chimeNotes[a], chimeNotes[b]

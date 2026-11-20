@@ -50,12 +50,12 @@ var configSchema = map[string]any{
 				"engine": map[string]any{
 					"type":        "string",
 					"enum":        []string{"tts", "gptlive", "dgagent"},
-					"description": "The voice that answers: tts (voice A, our own voice), gptlive (voice B, GPT-Live) or dgagent (voice C, the Deepgram voice agent)",
+					"description": "The voice that answers: tts (voice A, text-to-speech), gptlive (voice B, speech-to-speech: OpenAI GPT-Live) or dgagent (voice C, voice agent: Deepgram)",
 				},
 				"tts_engine": map[string]any{
 					"type":        "string",
 					"enum":        []string{"gemini", "aura"},
-					"description": "Voice A's text-to-speech engine: gemini or aura",
+					"description": "Voice A's text-to-speech provider: gemini or aura",
 				},
 			},
 		},

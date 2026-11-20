@@ -77,9 +77,9 @@ summarization:
 # the speaker (speaker_enabled). The voice hears the room only while the light reads red.
 # voice:
 #   enabled: false
-#   engine: tts                       # tts (voice A), gptlive (voice B) or dgagent (voice C)
+#   engine: tts                       # tts (voice A, text-to-speech), gptlive (voice B, speech-to-speech: OpenAI GPT-Live) or dgagent (voice C, voice agent: Deepgram)
 #   wake_phrases: [Wispr, Ghost Wispr]
-#   tts_engine: gemini                # voice A: gemini (Vertex AI, gcp_project) or aura (the Deepgram key)
+#   tts_engine: gemini                # voice A's text-to-speech provider: gemini (Vertex AI, gcp_project) or aura (the Deepgram key)
 #   tts_model: gemini-3.8-flash-tts
 #   tts_voice: Kore                   # aura: an Aura-2 voice such as aura-2-harmonia-en
 #   tts_location: us

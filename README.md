@@ -154,7 +154,8 @@ Linux it plays through the ALSA playback device that `speaker_device` names (a P
 `plughw:CARD=J75,DEV=0`, or a sound card's id or name, as `Jabra`), opening no microphone and
 needing no red light, so it speaks while capture is paused. It opens one stream at the device's
 native rate when the first sound is queued, mixes the voice and the chimes into it, and closes it
-0.3 s after the last sound.
+0.3 s after the last sound. While a chime plays, the voice plays 15 dB down, so that the two never
+clip together; it goes down over 10 ms before the chime starts, and back up over 10 ms after.
 
 The microphone is never open while the blink(1) is off. The light stays red while the microphone is
 open, and goes off only once the recorder has closed it: after a pause, once no audio has reached
@@ -240,7 +241,7 @@ Wispr plays a short two-note sound, the Concierge reads Dispatch's record, and t
 answer. For 6 s after Wispr's answer, a follow-up that the transcript ends with a question mark needs no wake phrase, and so does a reply when Wispr asked ("Did you mean ABC-12, or
 ABC-13?"). Anything else said in those 6 s is side talk: no voice answers it, and nothing of it goes to Dispatch.
 "Thanks, Wispr" ends the exchange. When the record cannot answer, the Concierge asks the agent that holds the issue. When
-its answer lands, Wispr plays a three-note sound after a second in which nobody speaks, and speaks
+its answer lands, Wispr plays a rising three-note sound twice after a second in which nobody speaks, and speaks
 the answer on "Wispr, go ahead" ("Wispr, go ahead, ABC-12" picks one of several). It speaks by
 itself only when nobody has spoken since the question and the light still reads red. "Wispr, never
 mind" cancels the newest question to an agent. "Wispr, stop" stops it, and so does talking over it
@@ -249,7 +250,7 @@ its queue while the voice speaks. Two more sounds: a single high note when captu
 recording, and a falling two-note sound when Wispr cannot do what was asked (Dispatch or Envoy out
 of reach, a voice that fails, or a failed red check).
 
-The settings page turns the voice on or off and picks its engine, with no restart; the change
+The settings page turns the voice on or off and picks the voice and the text-to-speech provider, with no restart; the change
 applies from the next exchange. With the voice off, the unit reads no wake phrase and runs no
 Concierge, and plays only the start sound and the error sound of a failed red check.
 
@@ -264,11 +265,11 @@ What the voice hears, and where the room's words go:
   sent. Every gate closing, a pause or a light hold, ends the recording session, and an ended
   session's answers are never spoken: they stay in writing on that session's page. A gate closing
   also clears the two minutes of transcript the voice keeps.
-- Voice A sends no room audio anywhere. The asker's words after the wake phrase go to the
+- Voice A, text-to-speech (`voice.engine: tts`), sends no room audio anywhere. The asker's words after the wake phrase go to the
   Concierge's model (Gemini on Vertex AI), with the last two minutes of the transcript. The text
-  Wispr speaks goes to the text-to-speech engine: Gemini TTS on Vertex AI, or Deepgram Aura-2 with
+  Wispr speaks goes to the text-to-speech provider: Gemini TTS on Vertex AI, or Deepgram Aura-2 with
   `mip_opt_out=true`.
-- Voice B (`voice.engine: gptlive`) sends room audio to OpenAI's GPT-Live, only while the light reads
+- Voice B, speech-to-speech (`voice.engine: gptlive`), sends room audio to OpenAI's GPT-Live, only while the light reads
   red, from the wake phrase to the end of the exchange: nothing said before the wake phrase goes. The
   audio held for the wake starts inside the phrase itself, about 0.3 s into it in our tests.
   An exchange opens at the wake phrase; a held answer also opens voice B without one, but only on
@@ -285,7 +286,7 @@ What the voice hears, and where the room's words go:
   someone talks over Wispr, the words GPT-Live had already sent count as spoken, though up to about
   1.4 s of them never played. In that time, matching calls and commands can be ignored for up to 30 s while Wispr speaks or its echo can still be heard.
   That is broader than barge-in: `Wispr, never mind` can be ignored too when its words match an unplayed cut answer.
-- With `voice.engine: dgagent` (voice C), during an exchange only, the unit streams the room's
+- With `voice.engine: dgagent` (voice C, a voice agent), during an exchange only, the unit streams the room's
   audio and the last two minutes of the meeting's transcript to Deepgram's Voice Agent, with
   `mip_opt_out` set so Deepgram does not use them to train its models. Deepgram's model keeps the
   turn: Deepgram's own model, or the provider `voice.dgagent.think_model` names (such as Google);
@@ -332,11 +333,11 @@ What the voice hears, and where the room's words go:
 | Setting | Default | Description |
 |---------|---------|-------------|
 | `voice.enabled` (`GHOST_WISPR_VOICE_ENABLED`) | `false` | Turn the meeting voice on; it needs `speaker_enabled` |
-| `voice.engine` | `tts` | The voice: `tts` (voice A, our own streaming speech), `gptlive` (voice B, OpenAI's GPT-Live) or `dgagent` (voice C, Deepgram's Voice Agent with the Deepgram key: it hears the room, keeps the turn and speaks the Concierge's answers word for word) |
+| `voice.engine` | `tts` | The voice: `tts` (voice A, text-to-speech: the `voice.tts_engine` provider reads the Concierge's answers), `gptlive` (voice B, speech-to-speech: OpenAI's GPT-Live) or `dgagent` (voice C, a voice agent: Deepgram's Voice Agent with the Deepgram key; it hears the room, keeps the turn and speaks the Concierge's answers word for word) |
 | `voice.dgagent.think_model` | Deepgram's `phonellm-mini-alpha-2-fp8` | Voice C: the model, as provider/model, that Deepgram runs to keep the turn, such as `google/gemini-3.1-flash-lite`; `open_ai/gpt-4.1-mini` stands behind it if it fails. `deepgram/think-fast` is refused: it needs Deepgram's model training, which voice C opts out of |
 | `voice.wake_phrases` | `[Wispr, Ghost Wispr]` | The phrases that call Wispr; the live Deepgram request carries them, and Dispatch's project keys, as Nova-3 keyterms |
-| `voice.tts_engine` | `gemini` | Voice A's engine: `gemini` (Vertex AI, `gcp_project`) or `aura` (the Deepgram key) |
-| `voice.tts_model`, `voice.tts_voice` | the engine's | Gemini: `gemini-3.8-flash-tts`, `Kore`; Aura: the voice `aura-2-harmonia-en` |
+| `voice.tts_engine` | `gemini` | Voice A's text-to-speech provider: `gemini` (Vertex AI, `gcp_project`) or `aura` (the Deepgram key) |
+| `voice.tts_model`, `voice.tts_voice` | the provider's | Gemini: `gemini-3.8-flash-tts`, `Kore`; Aura: the voice `aura-2-harmonia-en` |
 | `voice.tts_location` | `us` | The Vertex AI location Gemini streams from; `us` is faster to first audio than `global` |
 | `voice.paused_listener` | `false` | The wake listener while paused; not built yet, so it is ignored |
 | `voice.gptlive.openai_identity_provider_id`, `voice.gptlive.openai_service_account_id` | — | Voice B's OpenAI workload identity, ids and not secrets: the unit exchanges its Google ID token (`google_credentials_file`) for an OpenAI access token of an hour at most. `gptlive-probe` (`cmd/gptlive-probe`) checks the route from the unit |

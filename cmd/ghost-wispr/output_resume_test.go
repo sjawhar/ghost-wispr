@@ -2,6 +2,9 @@ package main
 
 import (
 	"context"
+	"errors"
+	"log/slog"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -12,11 +15,14 @@ import (
 
 // jabraStream is the speaker's playback stream on the Jabra, playing in real
 // time at 48 kHz. open is true from when it opens until it closes, and
-// closedAt is when it closed.
+// closedAt is when it closed. With closeErr, Close fails with it and leaves
+// the stream open.
 type jabraStream struct {
 	open     atomic.Bool
+	closeErr error
 	mu       sync.Mutex
 	closedAt time.Time
+	closes   int
 }
 
 func (s *jabraStream) Write(frame []int16) error {
@@ -28,10 +34,20 @@ func (s *jabraStream) Drop() (int, error) { return 0, nil }
 
 func (s *jabraStream) Close() error {
 	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.closes++
+	if s.closeErr != nil {
+		return s.closeErr
+	}
 	s.closedAt = time.Now()
-	s.mu.Unlock()
 	s.open.Store(false)
 	return nil
+}
+
+func (s *jabraStream) closeCalls() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.closes
 }
 
 func (s *jabraStream) closed() time.Time {
@@ -135,5 +151,27 @@ func TestAnOutputIdle300msClosesAndTheResumeProceeds(t *testing.T) {
 	}
 	if r.ring.Load() {
 		t.Fatal("the microphone opened while the Jabra's ring showed Muted")
+	}
+}
+
+// TestAFailedSpeakerCloseIsLogged fails if the speaker's Output, wired as
+// main wires it, drops the error of a playback stream that did not close
+// instead of logging it at WARN.
+func TestAFailedSpeakerCloseIsLogged(t *testing.T) {
+	keepDefaultLogger(t)
+	var logs cliOutput
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, nil)))
+	out, stream := outputOnDevice(t, newCaptureDevice(func() bool { return false }))
+	stream.closeErr = errors.New("speaker close failed")
+	speakOn(t, out, 20*time.Millisecond)
+	deadline := time.Now().Add(testWait)
+	for stream.closeCalls() == 0 || !strings.Contains(logs.String(), "speaker close failed") {
+		if time.Now().After(deadline) {
+			t.Fatalf("after %d closes of the stream, the log holds %q; want a WARN line with the close's error", stream.closeCalls(), logs.String())
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if line := logs.String(); !strings.Contains(line, "level=WARN") || !strings.Contains(line, `msg="speaker stream close failed"`) {
+		t.Fatalf("the log holds %q; want a WARN line, speaker stream close failed", line)
 	}
 }
