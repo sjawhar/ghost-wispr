@@ -12,6 +12,7 @@ import (
 
 	"github.com/sjawhar/ghost-wispr/internal/genaiconfig"
 	"github.com/sjawhar/ghost-wispr/internal/llm"
+	"github.com/sjawhar/ghost-wispr/internal/logging"
 
 	"gopkg.in/yaml.v3"
 )
@@ -550,6 +551,14 @@ func validate(cfg *Config, hasExternalAccount bool) []string {
 
 	if cfg.DeepgramAPIKey == "" {
 		warnings = append(warnings, "Deepgram API key not configured — live transcription is disabled. Set "+EnvPrefix+"DEEPGRAM_API_KEY.")
+	}
+
+	if _, known := logging.LevelNamed(cfg.LogLevel); !known && strings.TrimSpace(cfg.LogLevel) != "" {
+		where := "log_level"
+		if os.Getenv(EnvPrefix+"LOG_LEVEL") != "" { // the override applyEnvOverrides took
+			where = EnvPrefix + "LOG_LEVEL"
+		}
+		warnings = append(warnings, fmt.Sprintf("Invalid %s %q — logging at info. Set it to debug, info, warn or error.", where, cfg.LogLevel))
 	}
 
 	if cfg.GenAIBackend != "" && genaiconfig.NormalizeBackend(cfg.GenAIBackend) == "" {
