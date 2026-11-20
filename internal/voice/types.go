@@ -148,6 +148,14 @@ type TextAudioReporter interface {
 	ReportsTextAudio() bool
 }
 
+// SpeechWaiter is a Session whose Say returns before its text has played, as
+// voice A's does. WaitSpoken returns nil once every Say called before it has
+// played its last frame, else why one did not: an Interrupt, a failed
+// synthesis or write, or a playback the Output ended.
+type SpeechWaiter interface {
+	WaitSpoken(ctx context.Context) error
+}
+
 // Event is one thing a Session reports.
 type Event struct {
 	Kind EventKind

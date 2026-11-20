@@ -325,6 +325,53 @@ func TestSayReturnsOnceItsFirstFrameIsQueued(t *testing.T) {
 	expectEvents(t, s.Events(), voice.EventSpeechEnded)
 }
 
+// TestWaitSpokenWaitsForANewGroupAfterThePreviousSpeech fails if a routing
+// line's completed speech satisfies the wait for a later answer whose tail is
+// still synthesising.
+func TestWaitSpokenWaitsForANewGroupAfterThePreviousSpeech(t *testing.T) {
+	releaseTail := make(chan struct{})
+	out := newFakeOutput()
+	s := openSession(t, fakeEngine{stream: func(_ context.Context, text string, emit func([]byte) error) error {
+		if err := emit(ramp(0, frame20ms)); err != nil {
+			return err
+		}
+		if text == "answer" {
+			<-releaseTail
+			return emit(ramp(0, frame20ms))
+		}
+		return nil
+	}}, out)
+	waiter, ok := s.(voice.SpeechWaiter)
+	if !ok {
+		t.Fatal("voice A does not report its speech completion")
+	}
+	if err := s.Say(context.Background(), "routing", voice.Ack); err != nil {
+		t.Fatalf("routing Say: %v", err)
+	}
+	if err := waiter.WaitSpoken(context.Background()); err != nil {
+		t.Fatalf("routing WaitSpoken: %v", err)
+	}
+	if err := s.Say(context.Background(), "answer", voice.Answer); err != nil {
+		t.Fatalf("answer Say: %v", err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- waiter.WaitSpoken(context.Background()) }()
+	select {
+	case err := <-done:
+		t.Fatalf("WaitSpoken returned %v before the answer tail was synthesised", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(releaseTail)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("answer WaitSpoken: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("WaitSpoken did not return after the answer tail played")
+	}
+}
+
 // TestSaysQueuedBehindASpeechPlayInOrderInOnePlayback fails if Says called
 // while another speaks play out of order, mix, or end the speech between
 // them.

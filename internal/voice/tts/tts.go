@@ -132,11 +132,28 @@ type session struct {
 	interrupt    context.CancelCauseFunc
 	pending      int            // Says called and not yet finished
 	speaking     bool           // a SpeechStarted awaits its SpeechEnded
+	speech       *speech        // the group of Says whose final playback WaitSpoken waits for
 	draining     int            // drains of this generation's playbacks in progress
 	pb           voice.Playback // the worker's playback; written by the worker under mu
 	pbGen        int            // the generation pb belongs to
 
 	carry []byte // worker only: the start of a frame not yet written
+}
+
+// speech is one contiguous group of Says. Its error is set under session.mu
+// before done closes, so WaitSpoken sees the group result.
+type speech struct {
+	done chan struct{}
+	err  error
+}
+
+func (sp *speech) over() bool {
+	select {
+	case <-sp.done:
+		return true
+	default:
+		return false
+	}
 }
 
 // sayRequest is one Say: its text's audio, as synthesis gives it, waits in
@@ -256,6 +273,24 @@ func (r *sayRequest) writeErr() error {
 	return r.playErr
 }
 
+func (s *session) beginSpeechLocked() {
+	if s.speech == nil || s.speech.over() {
+		s.speech = &speech{done: make(chan struct{})}
+	}
+}
+
+func (s *session) failSpeechLocked(err error) {
+	if s.speech != nil && !s.speech.over() && s.speech.err == nil {
+		s.speech.err = err
+	}
+}
+
+func (s *session) endSpeechLocked() {
+	if s.speech != nil && !s.speech.over() {
+		close(s.speech.done)
+	}
+}
+
 // Say speaks text after every Say called before it, and returns once its
 // first frame is queued to the Output, or with the reason none will be. Its
 // text is synthesised while the Say before it plays, so the caller's next Say
@@ -278,9 +313,9 @@ func (s *session) Say(ctx context.Context, text string, _ voice.SayMode) error {
 		return ErrClosed
 	}
 	epoch, gen := s.epoch, s.gen
+	s.beginSpeechLocked()
 	s.pending++
 	s.mu.Unlock()
-
 	// The request's synthesis ends with its generation, synchronously, so an
 	// Interrupt reaches it, and its audio synthesised ahead, at once. Its
 	// writes end with the caller's ctx, the exchange's, synchronously, until
@@ -305,6 +340,9 @@ func (s *session) Say(ctx context.Context, text string, _ voice.SayMode) error {
 		release(nil)
 		s.mu.Lock()
 		s.pending--
+		if gen == s.gen {
+			s.failSpeechLocked(context.Cause(rctx))
+		}
 		s.settleLocked()
 		s.mu.Unlock()
 		return context.Cause(rctx)
@@ -342,6 +380,28 @@ func (*session) ReportsTextAudio() bool { return true }
 
 var _ voice.TextAudioReporter = (*session)(nil)
 
+// WaitSpoken waits until the contiguous group holding every Say already
+// called has played its final frame, or returns the first reason it could not.
+func (s *session) WaitSpoken(ctx context.Context) error {
+	s.mu.Lock()
+	sp := s.speech
+	s.mu.Unlock()
+	if sp == nil {
+		return nil
+	}
+	select {
+	case <-sp.done:
+		s.mu.Lock()
+		err := sp.err
+		s.mu.Unlock()
+		return err
+	case <-ctx.Done():
+		return context.Cause(ctx)
+	}
+}
+
+var _ voice.SpeechWaiter = (*session)(nil)
+
 // Interrupt stops the Say in flight and every Say queued, and ends the
 // speech, without waiting for the engine or the Output. The next Say begins
 // a fresh Playback.
@@ -354,13 +414,15 @@ func (s *session) Interrupt() {
 }
 
 func (s *session) interruptLocked() {
+	s.failSpeechLocked(ErrInterrupted)
+	s.endSpeechLocked()
 	s.interrupt(ErrInterrupted)
 	s.gen++
 	s.epoch, s.interrupt = context.WithCancelCause(s.ctx)
 	s.draining = 0
 	if s.speaking {
 		s.speaking = false
-		s.emitLocked(&voice.Event{Kind: voice.EventSpeechEnded})
+		s.emitLocked(&voice.Event{Kind: voice.EventSpeechEnded, Err: ErrInterrupted})
 	}
 }
 
@@ -423,10 +485,18 @@ func (s *session) emitLocked(e *voice.Event) {
 // settleLocked ends the speech once nothing more of it can play: no Say
 // pending, no playback open, and no drain in progress.
 func (s *session) settleLocked() {
-	if s.speaking && s.pending == 0 && s.draining == 0 && (s.pb == nil || s.pbGen != s.gen) {
-		s.speaking = false
-		s.emitLocked(&voice.Event{Kind: voice.EventSpeechEnded})
+	if s.pending != 0 || s.draining != 0 || (s.pb != nil && s.pbGen == s.gen) {
+		return
 	}
+	if s.speaking {
+		s.speaking = false
+		var err error
+		if s.speech != nil {
+			err = s.speech.err
+		}
+		s.emitLocked(&voice.Event{Kind: voice.EventSpeechEnded, Err: err})
+	}
+	s.endSpeechLocked()
 }
 
 // run is the synthesis stage: it streams each Say's text, in order, into the
@@ -543,6 +613,9 @@ func (s *session) finish(r *sayRequest, err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.pending--
+	if err != nil && r.gen == s.gen {
+		s.failSpeechLocked(err)
+	}
 	if s.pb != nil && s.pbGen != s.gen {
 		s.pb = nil // an Interrupt ended its speech
 	}
@@ -556,15 +629,17 @@ func (s *session) finish(r *sayRequest, err error) {
 }
 
 // drain waits for pb to play, then ends the speech if nothing followed it.
-// The Output reports its own failures, so a failed drain only ends it too.
 func (s *session) drain(pb voice.Playback, gen int) {
-	_ = pb.Drain(s.ctx)
+	err := pb.Drain(s.ctx)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if gen != s.gen {
 		return // an Interrupt already ended this speech
 	}
 	s.draining--
+	if err != nil {
+		s.failSpeechLocked(err)
+	}
 	s.settleLocked()
 }
 

@@ -1123,11 +1123,15 @@ func (s *Supervisor) answer(ex *exchange, x *Exchange, turn string) {
 // whether ex spoke and played to its end, with no stop.
 func (s *Supervisor) finish(ex *exchange, sessionID string) bool {
 	s.mu.Lock()
-	last, said := ex.last, ex.said
+	last, said, sess := ex.last, ex.said, ex.session
 	s.mu.Unlock()
 	played := true
-	if said && last != nil {
-		played = last.Drain(ex.ctx) == nil
+	if said {
+		if waiter, ok := sess.(SpeechWaiter); ok {
+			played = waiter.WaitSpoken(ex.ctx) == nil
+		} else if last != nil {
+			played = last.Drain(ex.ctx) == nil
+		}
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
