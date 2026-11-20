@@ -294,10 +294,10 @@ What the voice hears, and where the room's words go:
   spoken since its question and the light reads red. Between exchanges nothing goes to the Voice Agent.
 - Voice C plays only the Concierge's words and routing lines. The words of Deepgram's own model
   never play, within one bound. No message from Deepgram says which sentence an audio frame belongs
-  to, so each frame of an answer waits 250 ms before it plays. When the model's own text comes, the
-  frames still waiting are dropped. Model audio that comes more than 250 ms before its own text
-  would play. The probe measured that lead at 24 ms at most, over 146 sentences in 28 real
-  sessions. The wait makes each answer start 250 ms later.
+  to, so each frame of an answer waits 250 ms before it plays. When the model's own text comes, or
+  Deepgram hears someone start to speak over the voice, the frames still waiting are dropped. Model
+  audio that comes more than 250 ms before its own text would play. The probe measured that lead at
+  24 ms at most, over 146 sentences in 28 real sessions. The wait makes each answer start 250 ms later.
 - Dispatch gets a question's words only as a few search keywords (at most five), never the whole
   sentence. Each search runs Dispatch's keyword search and its search by meaning at once, so those
   keywords also reach its embedding model, Cohere Embed v4 on Microsoft Azure, even when the
