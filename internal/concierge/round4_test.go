@@ -49,7 +49,6 @@ func TestAReplyLandsAfterTheMeetingEndedWhenItsRekeyFailed(t *testing.T) {
 	r.name(t, "agent-7")
 	r.agents.onSend = func(context.Context, string) error { return r.concierge.SessionEnded("meeting-1") }
 	r.run(t, "ask_agent", map[string]string{"session": "agent-7", "question": "q"})
-	r.agents.onSend = nil
 	if err := r.concierge.Deliver(context.Background(), &envoy.Message{EventID: "m", SourceSession: "agent-7", InReplyTo: "evt-1", Text: "late"}); err != nil {
 		t.Fatal(err)
 	}
