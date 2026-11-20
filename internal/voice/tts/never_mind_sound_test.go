@@ -3,6 +3,7 @@ package tts_test
 import (
 	"context"
 	"encoding/binary"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -171,14 +172,13 @@ func TestNeverMindCutsTheAnswerSoundOnTheRealSpeaker(t *testing.T) {
 				}
 				return
 			}
-			// After the cut, only the speech: rising from ducked to its level
-			// without a dip, then at its level until it ends.
+			// After the cut, only the speech, until it ends: rising from
+			// ducked to its level without a dip, then at its level.
+			if end := slices.Index(after, 0); end >= 0 {
+				after = after[:end]
+			}
 			full := -1
 			for i, v := range after {
-				if v == 0 && full >= 0 {
-					after = after[:i] // the speech ended
-					break
-				}
 				if v < 0 || v > speechLevel || (i > 0 && v < after[i-1]) {
 					t.Fatalf("sample %d after the cut is %d (the one before %d): more than the speech, which is %d at most and only rises back from ducked; the answer sound still plays", i, v, after[max(0, i-1)], speechLevel)
 				}
