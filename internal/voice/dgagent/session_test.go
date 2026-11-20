@@ -702,7 +702,9 @@ func TestAGivenUpLineThatStartsTheNextIsNotTakenForIt(t *testing.T) {
 	setSpeechGap(t, time.Minute)
 	s := startStandIn(t)
 	out := newFakeOutput()
-	sess, c, _ := open(t, s, Config{sayLimit: 100 * time.Millisecond}, voice.Exchange{Out: out, Tools: tools(nil)})
+	// The limit gives up on the first Say quickly, and leaves the next one
+	// time to hear its words after the hold below.
+	sess, c, _ := open(t, s, Config{sayLimit: 4 * holdTail}, voice.Exchange{Out: out, Tools: tools(nil)})
 	done := sayAsync(sess, "Reading the record.")
 	c.expect(t, "InjectAgentMessage")
 	if err := returned(t, done); !errors.Is(err, ErrNotSpoken) {
