@@ -215,11 +215,15 @@ type Concierge interface {
 	Answers() <-chan PendingAnswer
 	// Spoken records that a pending answer was spoken.
 	Spoken(ctx context.Context, taskID string) error
-	// NeverMind cancels the newest working question of sessionID asked before
-	// said, when "Wispr, never mind" was said, and tells its holder so.
-	// cancelled reports that there was one; with none, the Supervisor drops
-	// its newest held answer instead.
-	NeverMind(ctx context.Context, sessionID string, said time.Time) (cancelled bool, err error)
+	// QuestionsAsked is how many questions the Concierge has asked so far: a
+	// mark, read when "Wispr, never mind" is said, that orders the never mind
+	// among the questions whatever the wall clock does. It returns at once.
+	QuestionsAsked() uint64
+	// NeverMind cancels the newest working question of sessionID among the
+	// first asked questions (QuestionsAsked when "Wispr, never mind" was
+	// said), and tells its holder so. cancelled reports that there was one;
+	// with none, the Supervisor drops its newest held answer instead.
+	NeverMind(ctx context.Context, sessionID string, asked uint64) (cancelled bool, err error)
 }
 
 // WaitingLight shows the room that something waits for a person: a held

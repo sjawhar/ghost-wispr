@@ -556,7 +556,9 @@ func (c *fakeConcierge) Spoken(ctx context.Context, taskID string) error {
 	return nil
 }
 
-func (c *fakeConcierge) NeverMind(ctx context.Context, sessionID string, _ time.Time) (bool, error) {
+func (c *fakeConcierge) QuestionsAsked() uint64 { return 0 }
+
+func (c *fakeConcierge) NeverMind(ctx context.Context, sessionID string, _ uint64) (bool, error) {
 	c.mu.Lock()
 	c.neverMinds = append(c.neverMinds, sessionID)
 	hold := c.neverMindHold

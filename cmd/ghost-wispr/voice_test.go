@@ -35,9 +35,10 @@ func (stubConcierge) Heard(context.Context, *voice.Exchange, string) {}
 func (stubConcierge) Answer(context.Context, *voice.Exchange, string, voice.SayFunc) error {
 	return nil
 }
-func (c stubConcierge) Answers() <-chan voice.PendingAnswer                      { return c.answers }
-func (stubConcierge) Spoken(context.Context, string) error                       { return nil }
-func (stubConcierge) NeverMind(context.Context, string, time.Time) (bool, error) { return false, nil }
+func (c stubConcierge) Answers() <-chan voice.PendingAnswer                   { return c.answers }
+func (stubConcierge) Spoken(context.Context, string) error                    { return nil }
+func (stubConcierge) QuestionsAsked() uint64                                  { return 0 }
+func (stubConcierge) NeverMind(context.Context, string, uint64) (bool, error) { return false, nil }
 
 // TestVoiceCTakesTheKeyTheWakePhrasesAndTheThinkModel fails if voice C is
 // not built with the unit's Deepgram key, the wake phrases as Flux keyterms,

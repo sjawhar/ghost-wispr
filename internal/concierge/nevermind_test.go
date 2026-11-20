@@ -3,6 +3,7 @@ package concierge
 import (
 	"context"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -20,7 +21,7 @@ func TestNeverMindCancelsTheNewestWorkingTask(t *testing.T) {
 	r.ask(t, "agent-7", "first question", "ABC-12")
 	r.ask(t, "agent-8", "second question", "")
 
-	if cancelled, err := r.concierge.NeverMind(context.Background(), "meeting-1", testNow.Add(time.Minute)); err != nil || !cancelled {
+	if cancelled, err := r.concierge.NeverMind(context.Background(), "meeting-1", r.concierge.QuestionsAsked()); err != nil || !cancelled {
 		t.Fatalf("NeverMind = %v, %v; want a working question cancelled", cancelled, err)
 	}
 	newest, _ := r.store.VoiceTask("evt-2")
@@ -42,13 +43,13 @@ func TestNeverMindCancelsTheNewestWorkingTask(t *testing.T) {
 		t.Fatalf("the log lacks the cancel line:\n%s", logs)
 	}
 
-	if cancelled, err := r.concierge.NeverMind(context.Background(), "meeting-1", testNow.Add(time.Minute)); err != nil || !cancelled {
+	if cancelled, err := r.concierge.NeverMind(context.Background(), "meeting-1", r.concierge.QuestionsAsked()); err != nil || !cancelled {
 		t.Fatalf("second NeverMind = %v, %v; want the older question cancelled", cancelled, err)
 	}
 	if older, _ := r.store.VoiceTask("evt-1"); older.State != storage.VoiceTaskCancelled {
 		t.Fatalf("after a second never mind: evt-1 %s, want cancelled", older.State)
 	}
-	if cancelled, err := r.concierge.NeverMind(context.Background(), "meeting-1", testNow.Add(time.Minute)); err != nil || cancelled {
+	if cancelled, err := r.concierge.NeverMind(context.Background(), "meeting-1", r.concierge.QuestionsAsked()); err != nil || cancelled {
 		t.Fatalf("NeverMind with no working question = %v, %v; want none cancelled", cancelled, err)
 	}
 	if len(r.agents.sent) != 4 {
@@ -85,7 +86,7 @@ func TestNeverMindCancelsTheNextWorkingTaskWhenTheNewestIsAnsweredMeanwhile(t *t
 	r.ask(t, "agent-8", "second question", "")
 	r.concierge.store = &answeredMeanwhile{Store: r.store}
 
-	if cancelled, err := r.concierge.NeverMind(context.Background(), "meeting-1", testNow.Add(time.Minute)); err != nil || !cancelled {
+	if cancelled, err := r.concierge.NeverMind(context.Background(), "meeting-1", r.concierge.QuestionsAsked()); err != nil || !cancelled {
 		t.Fatalf("NeverMind = %v, %v; want the older working question cancelled", cancelled, err)
 	}
 	if newest, _ := r.store.VoiceTask("evt-2"); newest.State != storage.VoiceTaskDone {
@@ -103,19 +104,63 @@ func TestNeverMindCancelsTheNextWorkingTaskWhenTheNewestIsAnsweredMeanwhile(t *t
 func TestNeverMindCancelsOnlyAQuestionAskedBeforeIt(t *testing.T) {
 	r := newRig(t)
 	r.ask(t, "agent-7", "first question", "ABC-12")
-	later := storage.VoiceTask{ID: "later", SessionID: "meeting-1", AskedAt: testNow.Add(2 * time.Second), Holder: "session:agent-8"}
-	if err := r.store.CreateVoiceTask(&later); err != nil {
-		t.Fatal(err)
-	}
+	said := r.concierge.QuestionsAsked() // the never mind is said
+	r.ask(t, "agent-8", "later question", "")
 
-	if cancelled, err := r.concierge.NeverMind(context.Background(), "meeting-1", testNow.Add(time.Second)); err != nil || !cancelled {
+	if cancelled, err := r.concierge.NeverMind(context.Background(), "meeting-1", said); err != nil || !cancelled {
 		t.Fatalf("NeverMind = %v, %v; want the question asked before it cancelled", cancelled, err)
 	}
-	if task, _ := r.store.VoiceTask("later"); task.State != storage.VoiceTaskWorking {
+	if task, _ := r.store.VoiceTask("evt-2"); task.State != storage.VoiceTaskWorking {
 		t.Fatalf("the question asked after the never mind is %s, want working", task.State)
 	}
 	if task, _ := r.store.VoiceTask("evt-1"); task.State != storage.VoiceTaskCancelled {
 		t.Fatalf("evt-1 %s, want cancelled", task.State)
+	}
+}
+
+// steppedClock is a wall clock a test sets, as one that steps back.
+type steppedClock struct {
+	mu  sync.Mutex
+	now time.Time
+}
+
+func (c *steppedClock) Now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.now
+}
+
+func (c *steppedClock) set(t time.Time) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.now = t
+}
+
+// TestNeverMindsKeepTheirOrderWhenTheClockStepsBack fails if two never minds
+// said after one question, with the wall clock stepped back before a second
+// question is asked, cancel that second question: it was asked after both,
+// whatever its time says. The first cancels the earlier question; the second
+// finds none it may cancel.
+func TestNeverMindsKeepTheirOrderWhenTheClockStepsBack(t *testing.T) {
+	r := newRig(t)
+	clock := &steppedClock{now: testNow}
+	r.concierge.now = clock.Now
+	r.ask(t, "agent-7", "first question", "ABC-12")
+	first, second := r.concierge.QuestionsAsked(), r.concierge.QuestionsAsked() // two never minds said
+	clock.set(testNow.Add(-4 * time.Second))                                    // the wall clock steps back
+	r.ask(t, "agent-8", "second question", "")
+
+	if cancelled, err := r.concierge.NeverMind(context.Background(), "meeting-1", first); err != nil || !cancelled {
+		t.Fatalf("first NeverMind = %v, %v; want the first question cancelled", cancelled, err)
+	}
+	if cancelled, err := r.concierge.NeverMind(context.Background(), "meeting-1", second); err != nil || cancelled {
+		t.Fatalf("second NeverMind = %v, %v; want nothing it may cancel", cancelled, err)
+	}
+	if task, _ := r.store.VoiceTask("evt-1"); task.State != storage.VoiceTaskCancelled {
+		t.Fatalf("evt-1 %s, want cancelled", task.State)
+	}
+	if task, _ := r.store.VoiceTask("evt-2"); task.State != storage.VoiceTaskWorking {
+		t.Fatalf("the question asked after both never minds is %s, want working", task.State)
 	}
 }
 
@@ -127,7 +172,7 @@ func TestNeverMindWithAStoppedVoiceCancelsNothing(t *testing.T) {
 	r.ask(t, "agent-7", "first question", "ABC-12")
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	if cancelled, err := r.concierge.NeverMind(ctx, "meeting-1", testNow.Add(time.Minute)); err == nil || cancelled {
+	if cancelled, err := r.concierge.NeverMind(ctx, "meeting-1", r.concierge.QuestionsAsked()); err == nil || cancelled {
 		t.Fatalf("NeverMind with a cancelled context = %v, %v; want nothing cancelled and its error", cancelled, err)
 	}
 	if task, _ := r.store.VoiceTask("evt-1"); task.State != storage.VoiceTaskWorking {

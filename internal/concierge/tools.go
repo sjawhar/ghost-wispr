@@ -664,9 +664,16 @@ func (r *runner) askAgent(ctx context.Context, session, question, issueKey strin
 	if closed {
 		return nil, tell("This meeting has ended, so I ask no agent for it.")
 	}
+	// The task's place among the questions asked, before it is recorded: a
+	// never mind whose mark comes after this may cancel it.
+	place := questionsAsked.Add(1)
+	r.c.mu.Lock()
+	r.c.asked[localID] = place
+	r.c.mu.Unlock()
 	if err := r.c.store.CreateVoiceTask(&storage.VoiceTask{
 		ID: localID, SessionID: r.x.SessionID, AskedAt: now, IssueKey: issueKey, Holder: "session:" + session,
 	}); err != nil {
+		r.c.forgetPlace(localID)
 		return nil, fmt.Errorf("record the question: %w", err)
 	}
 	// While the question is on its way, a reply that names its event cannot
@@ -680,6 +687,7 @@ func (r *runner) askAgent(ctx context.Context, session, question, issueKey strin
 		if deleteErr := r.c.store.DeleteVoiceTask(localID); deleteErr != nil {
 			r.c.logger.Warn("concierge could not remove the task of a question it did not send", "task", localID, "error", deleteErr)
 		}
+		r.c.forgetPlace(localID)
 		r.c.tellChanged(r.x.SessionID)
 		return nil, err
 	}
@@ -702,6 +710,7 @@ func (r *runner) askAgent(ctx context.Context, session, question, issueKey strin
 		if deleteErr := r.c.store.DeleteVoiceTask(localID); deleteErr != nil {
 			r.c.logger.Warn("concierge could not remove the task of a question it did not send", "task", localID, "error", deleteErr)
 		}
+		r.c.forgetPlace(localID)
 		r.c.tellChanged(r.x.SessionID)
 		r.c.logger.Warn("concierge could not send a question", "session", session, "error", err)
 		// Envoy that answered and refused (4xx) is reachable: no error
@@ -739,6 +748,8 @@ func (r *runner) askAgent(ctx context.Context, session, question, issueKey strin
 			r.c.mu.Lock()
 			delete(r.c.sentAs, taskID)
 			delete(r.c.sessionOf, localID)
+			r.c.asked[taskID] = r.c.asked[localID]
+			delete(r.c.asked, localID)
 			r.c.mu.Unlock()
 		}
 	}

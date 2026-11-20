@@ -753,7 +753,9 @@ func (s *Supervisor) onTranscriptLocked(t *Transcript) {
 // when the Supervisor closes asks nothing.
 func (s *Supervisor) neverMindLocked(sessionID string) {
 	s.commands++
-	said, saidAt := s.commands, time.Now()
+	// The questions asked by now, which orders this never mind among them
+	// whatever the wall clock does.
+	said, asked := s.commands, s.cfg.Concierge.QuestionsAsked()
 	var candidates []*pendingAnswer
 	for _, p := range s.pending {
 		if p.SessionID == sessionID {
@@ -771,7 +773,7 @@ func (s *Supervisor) neverMindLocked(sessionID string) {
 		cancelled, err := false, s.ctx.Err()
 		if err == nil {
 			ctx, cancel := context.WithTimeout(s.ctx, 10*time.Second)
-			cancelled, err = s.cfg.Concierge.NeverMind(ctx, sessionID, saidAt)
+			cancelled, err = s.cfg.Concierge.NeverMind(ctx, sessionID, asked)
 			cancel()
 			if err != nil {
 				s.logf("voice: cancel the newest question: %v", err)

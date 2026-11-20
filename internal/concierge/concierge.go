@@ -22,6 +22,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"google.golang.org/genai"
@@ -122,6 +123,12 @@ type Config struct {
 	Logger  *slog.Logger
 }
 
+// questionsAsked counts the questions every Concierge of this process has
+// asked. A never mind's mark (QuestionsAsked) orders it among them whatever
+// the wall clock does, also against a Concierge started after it, as when the
+// voice is turned off and on.
+var questionsAsked atomic.Uint64
+
 // Concierge implements voice.Concierge.
 type Concierge struct {
 	model     string
@@ -147,6 +154,10 @@ type Concierge struct {
 
 	mu     sync.Mutex
 	agents Agents
+	// asked is each task's place among the questions asked (questionsAsked
+	// when it was asked), by task id; a task this Concierge did not ask, as
+	// one from before the unit started, has none and counts as asked first.
+	asked map[string]uint64
 	// lastAsk is the newest question each exchange sent each agent, by
 	// exchange (exchangeKey) and agent session, so a second question
 	// replaces the first, and the same one again sends nothing (R7).
@@ -246,6 +257,7 @@ func New(cfg *Config) (*Concierge, error) {
 		answers:      make(chan voice.PendingAnswer),
 		done:         make(chan struct{}),
 		lastAsk:      map[[2]string]sentAsk{},
+		asked:        map[string]uint64{},
 		unsent:       map[[2]string]unsentAsk{},
 		working:      map[string][]string{},
 		askedAgain:   map[string]string{},
