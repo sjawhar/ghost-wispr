@@ -135,9 +135,23 @@ type persistentControls struct {
 	gate            resumeGate
 	onStatusChanged func(bool)
 	mu              sync.Mutex
-	// The three-state machine's parts (useListener); without them every
-	// pause closes the microphone, and Close is Pause: today's two-state
-	// machine, as with voice.paused_listener off or a build with no listener.
+	// parts are the three-state machine's parts (useListener); without them
+	// every pause closes the microphone, and Close is Pause: today's
+	// two-state machine, as in a build with no listener. They are read with
+	// no lock, so a resume's light check never waits behind another
+	// control's save.
+	parts atomic.Pointer[listenerParts]
+	// resumes counts the resumes under way; the listener does not listen
+	// while one runs.
+	resumes atomic.Int32
+	// restoreListening is set while a saved listening state waits, closed,
+	// for the listener to be ready; any control clears it. Guarded by mu.
+	restoreListening bool
+}
+
+// listenerParts are the three-state machine's parts of the controls.
+type listenerParts struct {
+	// levels moves the gate between the three states.
 	levels micLevels
 	// wake wakes the recording light after a pause or a close.
 	wake func()
@@ -145,16 +159,10 @@ type persistentControls struct {
 	// started, and the Jabra's mute button, which closes the microphone, is
 	// attached. A pause goes to listening only while it can.
 	ready func() bool
-	// stopListener closes the listener's stream, and waits until it has,
-	// before a resume's light check: the recording microphone opens only
-	// after the listener's has closed.
-	stopListener func()
-	// resumes counts the resumes under way; the listener does not listen
-	// while one runs.
-	resumes atomic.Int32
-	// restoreListening is set while a saved listening state waits, closed,
-	// for the listener to be ready; any control clears it.
-	restoreListening bool
+	// stop closes the listener's stream, and waits until it has, before a
+	// resume's light check: the recording microphone opens only after the
+	// listener's has closed.
+	stop func()
 }
 
 // micLevels is the capture gate's side of the three states.
@@ -188,15 +196,13 @@ func newPersistentControls(store pauseStore, pause func(), gate resumeGate, onSt
 // between them, wake wakes the light after each pause or close, ready says
 // whether the listener can run, and stopListener closes its stream.
 func (c *persistentControls) useListener(levels micLevels, wake func(), ready func() bool, stopListener func()) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.levels, c.wake, c.ready, c.stopListener = levels, wake, ready, stopListener
+	c.parts.Store(&listenerParts{levels: levels, wake: wake, ready: ready, stop: stopListener})
 }
 
 // state reports the microphone's state.
 func (c *persistentControls) state() micState {
-	if c.levels != nil {
-		return c.levels.micState()
+	if p := c.parts.Load(); p != nil {
+		return p.levels.micState()
 	}
 	if c.gate.IsPaused() {
 		return micClosed
@@ -206,7 +212,8 @@ func (c *persistentControls) state() micState {
 
 // canListen reports whether a pause may go to listening.
 func (c *persistentControls) canListen() bool {
-	return c.levels != nil && c.ready != nil && c.ready()
+	p := c.parts.Load()
+	return p != nil && p.ready()
 }
 
 // Pause counts the pause on the gate before it takes the controls' lock,
@@ -220,9 +227,9 @@ func (c *persistentControls) Pause() error {
 	c.gate.pauseRequested()
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.canListen() {
-		c.levels.PauseListening()
-		c.wake()
+	if p := c.parts.Load(); p != nil && p.ready() {
+		p.levels.PauseListening()
+		p.wake()
 	} else {
 		c.pause()
 	}
@@ -236,9 +243,9 @@ func (c *persistentControls) Close() error {
 	c.gate.pauseRequested()
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.levels != nil {
-		c.levels.CloseMicrophone()
-		c.wake()
+	if p := c.parts.Load(); p != nil {
+		p.levels.CloseMicrophone()
+		p.wake()
 	} else {
 		c.pause()
 	}
@@ -269,11 +276,8 @@ func (c *persistentControls) savePause(what string) error {
 func (c *persistentControls) Resume() error {
 	c.resumes.Add(1)
 	defer c.resumes.Add(-1)
-	c.mu.Lock()
-	stop := c.stopListener
-	c.mu.Unlock()
-	if stop != nil {
-		stop()
+	if p := c.parts.Load(); p != nil {
+		p.stop()
 	}
 	ticket, err := c.gate.prepareResume()
 	c.mu.Lock()
@@ -339,10 +343,8 @@ func (c *persistentControls) RefuseResume() error {
 // microphone now: the unit is listening, the listener can run, and no resume
 // is under way.
 func (c *persistentControls) listenerWanted() bool {
-	c.mu.Lock()
-	levels, ready := c.levels, c.ready
-	c.mu.Unlock()
-	return levels != nil && ready != nil && levels.micState() == micListening && c.resumes.Load() == 0 && ready()
+	p := c.parts.Load()
+	return p != nil && p.levels.micState() == micListening && c.resumes.Load() == 0 && p.ready()
 }
 
 // armRestoredListening makes a saved listening state, restored as closed,
@@ -360,18 +362,19 @@ func (c *persistentControls) armRestoredListening() {
 func (c *persistentControls) listenerChanged() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.levels == nil {
+	p := c.parts.Load()
+	if p == nil {
 		return nil
 	}
-	ready := c.canListen()
+	ready := p.ready()
 	switch {
-	case !ready && c.levels.leaveListening():
-		c.wake()
+	case !ready && p.levels.leaveListening():
+		p.wake()
 		return c.savePause("persist the microphone closed for the listener")
-	case ready && c.restoreListening && c.levels.micState() == micClosed:
+	case ready && c.restoreListening && p.levels.micState() == micClosed:
 		c.restoreListening = false
-		c.levels.enterListening()
-		c.wake()
+		p.levels.enterListening()
+		p.wake()
 		if c.onStatusChanged != nil {
 			c.onStatusChanged(true)
 		}
@@ -385,10 +388,11 @@ func (c *persistentControls) listenerChanged() error {
 func (c *persistentControls) listenerFailed() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.levels == nil || !c.levels.leaveListening() {
+	p := c.parts.Load()
+	if p == nil || !p.levels.leaveListening() {
 		return nil
 	}
-	c.wake()
+	p.wake()
 	return c.savePause("persist the microphone closed for the listener")
 }
 

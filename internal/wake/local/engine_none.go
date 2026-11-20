@@ -14,3 +14,6 @@ var ErrNotBuilt = errors.New("this build has no paused listener (built without -
 
 // NewDetector fails: this build has no spotter.
 func NewDetector() (*Detector, error) { return nil, ErrNotBuilt }
+
+// NewDetectorWith fails: this build has no spotter.
+func NewDetectorWith(Options) (*Detector, error) { return nil, ErrNotBuilt }

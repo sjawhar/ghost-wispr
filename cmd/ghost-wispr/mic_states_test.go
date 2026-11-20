@@ -171,6 +171,7 @@ type micStatesRig struct {
 	warnings *warningsRegistry
 	power    *buttonToggle
 	jabra    *jabraFake
+	jabras   chan *jabraFake // the Jabras plugged in, one per connect
 	spotter  *phraseSpotter
 	cfgStore *config.Store
 
@@ -256,15 +257,18 @@ func startMicStatesRig(t *testing.T, opts statesOptions) *micStatesRig {
 	}
 	r.power = newButtonToggle(r.capture, r.hooks, "power-button")
 
+	r.jabras = make(chan *jabraFake, 4)
 	if opts.jabra {
 		r.jabra = newJabraFake()
+		r.jabras <- r.jabra
 		button := newJabraMuteButton(r.capture, r.device, r.hooks, r.warnings)
-		var connected atomic.Bool
 		button.connect = func() (io.ReadWriteCloser, error) {
-			if connected.Swap(true) {
+			select {
+			case device := <-r.jabras:
+				return device, nil
+			default:
 				return nil, jabra.ErrNoMuteButton
 			}
-			return r.jabra, nil
 		}
 		button.retryEvery, button.checkEvery = time.Millisecond, time.Millisecond
 		loops.Go(func() { button.run(ctx) })
@@ -307,6 +311,11 @@ func startMicStatesRig(t *testing.T, opts statesOptions) *micStatesRig {
 	if saved == micRecording {
 		r.requireState(t, micRecording, "at start")
 	}
+	if opts.listener && opts.jabra {
+		// The spotter loads in the background; until it has, every pause
+		// closes the microphone.
+		waitForStates(t, "the paused listener to start", r.controls.canListen)
+	}
 	return r
 }
 
@@ -335,7 +344,9 @@ func (o observed) String() string {
 }
 
 func (r *micStatesRig) observe() observed {
-	o := observed{state: r.capture.micState(), red: r.light.red(), micOpen: r.mic.open.Load(), listenerOpen: r.listenerOpen.Load()}
+	// A light that reads back off shows no red, whatever was written to it.
+	red := r.light.red() && !r.light.refuse.Load()
+	o := observed{state: r.capture.micState(), red: red, micOpen: r.mic.open.Load(), listenerOpen: r.listenerOpen.Load()}
 	o.muted = r.device.ringMuted()
 	if r.jabra != nil {
 		o.muted = r.jabra.shows()
@@ -367,7 +378,7 @@ func (r *micStatesRig) requireState(t *testing.T, state micState, after string) 
 			return
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("%s: %v; want %v", after, got, want(state))
+			t.Fatalf("%s: %v; want %v (warnings %q)", after, got, want(state), r.warnings.List())
 		}
 		r.hardware.Wake()
 		time.Sleep(2 * time.Millisecond)
@@ -494,10 +505,17 @@ func TestJabraDetachInListeningCloses(t *testing.T) {
 	r.moveTo(t, micListening)
 	r.jabra.unplug()
 	waitForStates(t, "the Jabra to detach", func() bool { return !r.device.jabraAttached() })
+	r.jabra = nil // gone: the ring is what it must show, ringMuted
 	r.requireState(t, micClosed, "the Jabra's detach while listening")
 	if got := r.saved(); got != savedClosed {
 		t.Fatalf("saved %q after the detach, want %q", got, savedClosed)
 	}
+	// It comes back: the unit stays closed, and its ring shows Muted.
+	r.jabra = newJabraFake()
+	r.jabras <- r.jabra
+	waitForStates(t, "the Jabra to attach again", r.device.jabraAttached)
+	time.Sleep(100 * time.Millisecond)
+	r.requireState(t, micClosed, "the Jabra attaching again after a detach while listening")
 }
 
 // TestCloseFromEveryState fails if POST /api/close leaves any state but

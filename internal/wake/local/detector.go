@@ -23,6 +23,29 @@ const (
 	startMark = "STAR"
 )
 
+// Thresholds are stage 1's boost and threshold for both phrases.
+type Thresholds struct{ Boost, Threshold float64 }
+
+// DefaultThresholds are the ones the listener runs with (gap-GapKWS.md §4
+// step 4).
+var DefaultThresholds = Thresholds{Boost: 1.0, Threshold: 0.25}
+
+// Options vary the detector for a measurement (cmd/measure-wake); the
+// listener runs with DefaultThresholds and nothing else.
+type Options struct {
+	Thresholds Thresholds
+	// Decoys are keyword lines after the two phrases; a hit on a line whose
+	// label starts with DECOY counts as no phrase.
+	Decoys string
+	// NoStageTwo counts every stage-1 hit, with no recognizer.
+	NoStageTwo bool
+}
+
+// StopDecoys are "Wispr, stop recording" and "Ghost Wispr, stop recording" as
+// decoy lines, for the comparison gap-GapKWS.md §3.2 measured.
+const StopDecoys = "▁W H IS PER ▁ST O P ▁RE C OR D ING :1.0 #0.25 @DECOY_STOP\n" +
+	"▁G HO S T ▁W H IS PER ▁ST O P ▁RE C OR D ING :1.0 #0.25 @DECOY_GHOST_STOP\n"
+
 // Spotter is stage 1: a streaming keyword spotter for the two start phrases.
 type Spotter interface {
 	// Accept feeds samples, 16 kHz mono in [-1, 1), and reports whether a
@@ -52,7 +75,13 @@ type Detector struct {
 	// scratch converts samples for either stage; it is as long as stage 2's
 	// input, the ring and its silence, and never grows.
 	scratch []float32
+	// hits counts stage-1 hits, confirmed or not, for a measurement.
+	hits int
 }
+
+// StageOneHits is how many stage-1 hits the detector has had, confirmed or
+// not: a measurement's count of what stage 2 refused.
+func (d *Detector) StageOneHits() int { return d.hits }
 
 // NewDetectorOf makes a detector of its two stages: the sherpa-onnx ones
 // (NewDetector), or a test's.
@@ -76,6 +105,7 @@ func (d *Detector) Write(pcm []int16) bool {
 			samples[i] = float32(s) / 32768
 		}
 		if d.spot.Accept(samples) {
+			d.hits++
 			heard = heard || d.confirm()
 			d.Reset()
 		}

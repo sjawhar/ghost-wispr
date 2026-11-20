@@ -37,37 +37,34 @@ const Built = true
 const keywords = "▁W H IS PER ▁START ▁RE C OR D ING :1.0 #0.25 @WISPR_START_RECORDING\n" +
 	"▁G HO S T ▁W H IS PER ▁START ▁RE C OR D ING :1.0 #0.25 @GHOST_WISPR_START_RECORDING\n"
 
-// Thresholds, for a measurement that sweeps the spotter (cmd/measure-wake):
-// Boost and Threshold replace the 1.0 and 0.25 of keywords.
-type Thresholds struct{ Boost, Threshold float64 }
-
-// DefaultThresholds are the ones the listener runs with.
-var DefaultThresholds = Thresholds{Boost: 1.0, Threshold: 0.25}
-
 // NewDetector loads the embedded model into memory-backed files, so nothing
 // reaches the disk, and builds both stages from it with one thread each.
 func NewDetector() (*Detector, error) {
-	return NewDetectorWith(DefaultThresholds, "")
+	return NewDetectorWith(Options{Thresholds: DefaultThresholds})
 }
 
-// NewDetectorWith is NewDetector with other thresholds, and extra keyword
-// lines (decoys) after the two phrases, for a measurement: a hit on a line
-// whose label starts with DECOY counts as no phrase.
-func NewDetectorWith(th Thresholds, decoys string) (*Detector, error) {
+// NewDetectorWith is NewDetector as a measurement varies it (Options).
+func NewDetectorWith(o Options) (*Detector, error) {
 	files, err := modelFiles()
 	if err != nil {
 		return nil, err
 	}
 	defer files.close()
+	if o.Thresholds == (Thresholds{}) {
+		o.Thresholds = DefaultThresholds
+	}
 	lines := keywords
-	if th != DefaultThresholds {
+	if o.Thresholds != DefaultThresholds {
 		lines = fmt.Sprintf("▁W H IS PER ▁START ▁RE C OR D ING :%g #%g @WISPR_START_RECORDING\n"+
 			"▁G HO S T ▁W H IS PER ▁START ▁RE C OR D ING :%g #%g @GHOST_WISPR_START_RECORDING\n",
-			th.Boost, th.Threshold, th.Boost, th.Threshold)
+			o.Thresholds.Boost, o.Thresholds.Threshold, o.Thresholds.Boost, o.Thresholds.Threshold)
 	}
-	spot, err := newSherpaSpotter(files, lines+decoys)
+	spot, err := newSherpaSpotter(files, lines+o.Decoys)
 	if err != nil {
 		return nil, err
+	}
+	if o.NoStageTwo {
+		return NewDetectorOf(spot, acceptAll{}), nil
 	}
 	verify, err := newSherpaVerifier(files)
 	if err != nil {
@@ -76,6 +73,12 @@ func NewDetectorWith(th Thresholds, decoys string) (*Detector, error) {
 	}
 	return NewDetectorOf(spot, verify), nil
 }
+
+// acceptAll is no stage 2: every stage-1 hit counts.
+type acceptAll struct{}
+
+func (acceptAll) Text([]float32) string { return startMark }
+func (acceptAll) Close()                {}
 
 // memModel is the model's files, each in a memory-backed file that
 // sherpa-onnx opens by its /proc/self/fd path.
