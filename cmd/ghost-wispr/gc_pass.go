@@ -257,15 +257,20 @@ func (s forgettingGCStore) DeleteEndedSessionAndSources(id, audioPath, audioDir 
 // deletionNoticeGCStore is the store the app's GC passes delete through:
 // once the age policy has deleted a session and those merged into it, it
 // tells every connected web client (Hub.BroadcastSessionDeleted), as
-// DELETE /api/sessions/{id} does.
+// DELETE /api/sessions/{id} does, and onDeleted, the meeting voice's
+// Concierge, with every deleted id.
 type deletionNoticeGCStore struct {
 	*storage.SQLiteStore
-	hub *server.Hub
+	hub       *server.Hub
+	onDeleted func(sessionIDs []string)
 }
 
 func (s deletionNoticeGCStore) DeleteEndedSessionAndSources(id, audioPath, audioDir string) ([]string, bool, error) {
 	deletedIDs, deleted, err := s.SQLiteStore.DeleteEndedSessionAndSources(id, audioPath, audioDir)
-	if err == nil && deleted && s.hub != nil {
+	if err != nil || !deleted {
+		return deletedIDs, deleted, err
+	}
+	if s.hub != nil {
 		sources := make([]string, 0, len(deletedIDs))
 		for _, deletedID := range deletedIDs {
 			if deletedID != id {
@@ -273,6 +278,9 @@ func (s deletionNoticeGCStore) DeleteEndedSessionAndSources(id, audioPath, audio
 			}
 		}
 		s.hub.BroadcastSessionDeleted(id, sources)
+	}
+	if s.onDeleted != nil {
+		s.onDeleted(deletedIDs)
 	}
 	return deletedIDs, deleted, err
 }

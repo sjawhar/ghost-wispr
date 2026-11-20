@@ -15,6 +15,8 @@ import (
 	version "github.com/deepgram/deepgram-go-sdk/v3/pkg/api/version"
 	interfaces "github.com/deepgram/deepgram-go-sdk/v3/pkg/client/interfaces"
 	"github.com/dvonthenen/websocket"
+
+	"github.com/sjawhar/ghost-wispr/internal/netdial"
 )
 
 // deepgramWriteTimeout bounds one write to a Deepgram socket, and is the
@@ -81,7 +83,7 @@ func dialDeepgramLive(ctx context.Context, apiKey string, cOptions *interfaces.C
 	}
 	header.Set("User-Agent", interfaces.DgAgent)
 	var raw net.Conn
-	tcp := &net.Dialer{Timeout: 15 * time.Second, Control: tcpUserTimeout(timeout)}
+	tcp := &net.Dialer{Timeout: 15 * time.Second, Control: netdial.TCPUserTimeout(timeout)}
 	dialer := websocket.Dialer{
 		HandshakeTimeout: 15 * time.Second,
 		NetDialContext: func(ctx context.Context, network, address string) (net.Conn, error) {

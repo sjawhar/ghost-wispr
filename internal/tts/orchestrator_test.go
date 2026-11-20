@@ -81,41 +81,43 @@ func (b *blockingMockProvider) Synthesize(ctx context.Context, req SpeechRequest
 func (b *blockingMockProvider) Name() string { return b.mockProvider.Name() }
 
 // ---------------------------------------------------------------------------
-// Test helper: create speaker with mock stream
+// Test helper: an Output on a stream that plays in no time
 // ---------------------------------------------------------------------------
 
-// mockOutputStream implements audio.outputStream for testing.
-type mockOutputStream struct {
-	started  bool
-	stopped  bool
-	closed   bool
-	writeErr error
-}
+// mockOutputStream is a speaker stream that takes each frame at once.
+type mockOutputStream struct{}
 
-func (m *mockOutputStream) Start() error { m.started = true; return nil }
-func (m *mockOutputStream) Stop() error  { m.stopped = true; return nil }
-func (m *mockOutputStream) Write() error { return m.writeErr }
-func (m *mockOutputStream) Close() error { m.closed = true; return nil }
+func (mockOutputStream) Write([]int16) error { return nil }
+func (mockOutputStream) Drop() (int, error)  { return 0, nil }
+func (mockOutputStream) Close() error        { return nil }
 
+// blockingOutputStream reports its first write on entered, then holds it
+// until release closes.
 type blockingOutputStream struct {
 	mockOutputStream
+	once    sync.Once
 	entered chan<- struct{}
 	release <-chan struct{}
 }
 
-func (s *blockingOutputStream) Write() error {
-	s.entered <- struct{}{}
+func (s *blockingOutputStream) Write([]int16) error {
+	s.once.Do(func() { s.entered <- struct{}{} })
 	<-s.release
 	return nil
 }
 
-func newTestSpeaker() *audio.Speaker {
-	s := audio.NewSpeaker("")
-	// Override openStream to avoid PortAudio dependency.
-	s.SetOpenStreamForTest(func(sampleRate, channels, framesPerBuffer int, buf []int16, deviceName string) (audio.OutputStream, error) {
-		return &mockOutputStream{}, nil
-	})
-	return s
+// newOutputOn makes a speaker Output on stream, closed when the test ends.
+func newOutputOn(t *testing.T, stream audio.PlaybackStream) *audio.Output {
+	t.Helper()
+	out := audio.NewOutput(audio.OutputConfig{Open: func(string) (audio.PlaybackStream, int, error) {
+		return stream, 48000, nil
+	}})
+	t.Cleanup(func() { _ = out.Close() })
+	return out
+}
+
+func newTestSpeaker(t *testing.T) *audio.Output {
+	return newOutputOn(t, mockOutputStream{})
 }
 
 // ---------------------------------------------------------------------------
@@ -128,7 +130,7 @@ func TestOrchestrator_SpeakAndStatus(t *testing.T) {
 		format:     audio.AudioFormat{SampleRate: 16000, Channels: 1, Encoding: audio.EncodingPCM16},
 		durationMs: 100,
 	}
-	speaker := newTestSpeaker()
+	speaker := newTestSpeaker(t)
 	o := NewOrchestrator(provider, speaker, OrchestratorOpts{
 		QueueDepth:        5,
 		MaxRequestsPerMin: 100, // high limit for test
@@ -168,6 +170,37 @@ func TestOrchestrator_SpeakAndStatus(t *testing.T) {
 	}
 }
 
+// TestOrchestratorReportsEveryBytePlayed fails if a speech that played all of
+// its audio reports fewer bytes than it had: 2401 frames at 24 kHz last a
+// duration that is no whole number of nanoseconds, and truncating it loses a
+// frame.
+func TestOrchestratorReportsEveryBytePlayed(t *testing.T) {
+	provider := &mockProvider{
+		audio:  make([]byte, 2*2401),
+		format: audio.AudioFormat{SampleRate: 24000, Channels: 1, Encoding: audio.EncodingPCM16},
+	}
+	o := NewOrchestrator(provider, newTestSpeaker(t), OrchestratorOpts{MaxRequestsPerMin: 100})
+	defer o.Stop()
+	id, err := o.Speak("hello", "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		status, _ := o.Status(id)
+		if status.Status == StatusCompleted {
+			if status.BytesWritten != 2*2401 {
+				t.Fatalf("bytes_written = %d, want all %d", status.BytesWritten, 2*2401)
+			}
+			return
+		}
+		if status.Status == StatusFailed || time.Now().After(deadline) {
+			t.Fatalf("status = %s (%s), want completed", status.Status, status.Error)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
 func TestOrchestratorWaitForSynthesisUsesProviderModelBeforePlaybackEnds(t *testing.T) {
 	provider := &mockProvider{
 		audio:  []byte{0x01, 0x00},
@@ -177,10 +210,7 @@ func TestOrchestratorWaitForSynthesisUsesProviderModelBeforePlaybackEnds(t *test
 	}
 	playEntered := make(chan struct{}, 1)
 	releasePlay := make(chan struct{})
-	speaker := audio.NewSpeaker("")
-	speaker.SetOpenStreamForTest(func(int, int, int, []int16, string) (audio.OutputStream, error) {
-		return &blockingOutputStream{entered: playEntered, release: releasePlay}, nil
-	})
+	speaker := newOutputOn(t, &blockingOutputStream{entered: playEntered, release: releasePlay})
 	o := NewOrchestrator(provider, speaker, OrchestratorOpts{MaxRequestsPerMin: 100})
 	defer o.Stop()
 
@@ -216,7 +246,7 @@ func TestOrchestratorWaitForSynthesisUsesProviderModelBeforePlaybackEnds(t *test
 
 func TestOrchestrator_SpeakEmptyText(t *testing.T) {
 	provider := &mockProvider{}
-	speaker := newTestSpeaker()
+	speaker := newTestSpeaker(t)
 	o := NewOrchestrator(provider, speaker, OrchestratorOpts{MaxRequestsPerMin: 100})
 	defer o.Stop()
 
@@ -237,7 +267,7 @@ func TestOrchestrator_QueueFull(t *testing.T) {
 	origSynth := provider.Synthesize
 	_ = origSynth // suppress unused
 	blockingProvider := &blockingMockProvider{gate: gate, mockProvider: provider}
-	speaker := newTestSpeaker()
+	speaker := newTestSpeaker(t)
 	o := NewOrchestrator(blockingProvider, speaker, OrchestratorOpts{
 		QueueDepth:        2,
 		MaxRequestsPerMin: 100,
@@ -276,7 +306,7 @@ func TestOrchestrator_RateLimit(t *testing.T) {
 		audio:  []byte{0x01, 0x02},
 		format: audio.AudioFormat{SampleRate: 16000, Channels: 1, Encoding: audio.EncodingPCM16},
 	}
-	speaker := newTestSpeaker()
+	speaker := newTestSpeaker(t)
 	o := NewOrchestrator(provider, speaker, OrchestratorOpts{
 		QueueDepth:        100,
 		MaxRequestsPerMin: 3,
@@ -301,7 +331,7 @@ func TestOrchestrator_RateLimit(t *testing.T) {
 
 func TestOrchestrator_SynthesisError(t *testing.T) {
 	provider := &mockProvider{err: fmt.Errorf("synthesis failed")}
-	speaker := newTestSpeaker()
+	speaker := newTestSpeaker(t)
 	o := NewOrchestrator(provider, speaker, OrchestratorOpts{
 		MaxRequestsPerMin: 100,
 		SynthesisTimeout:  5 * time.Second,
@@ -339,7 +369,7 @@ func TestOrchestrator_SynthesisTimeout(t *testing.T) {
 		format: audio.AudioFormat{SampleRate: 16000, Channels: 1, Encoding: audio.EncodingPCM16},
 		delay:  5 * time.Second,
 	}
-	speaker := newTestSpeaker()
+	speaker := newTestSpeaker(t)
 	o := NewOrchestrator(provider, speaker, OrchestratorOpts{
 		MaxRequestsPerMin: 100,
 		SynthesisTimeout:  50 * time.Millisecond,
@@ -370,7 +400,7 @@ func TestOrchestrator_SynthesisTimeout(t *testing.T) {
 
 func TestOrchestrator_StatusUnknownID(t *testing.T) {
 	provider := &mockProvider{}
-	speaker := newTestSpeaker()
+	speaker := newTestSpeaker(t)
 	o := NewOrchestrator(provider, speaker, OrchestratorOpts{MaxRequestsPerMin: 100})
 	defer o.Stop()
 
@@ -382,7 +412,7 @@ func TestOrchestrator_StatusUnknownID(t *testing.T) {
 
 func TestOrchestrator_HasProviderAndSpeaker(t *testing.T) {
 	provider := &mockProvider{}
-	speaker := newTestSpeaker()
+	speaker := newTestSpeaker(t)
 	o := NewOrchestrator(provider, speaker, OrchestratorOpts{})
 	defer o.Stop()
 
@@ -405,5 +435,89 @@ func TestOrchestrator_DefaultOpts(t *testing.T) {
 	}
 	if resolved.SynthesisTimeout != DefaultSynthesisTimeout {
 		t.Errorf("expected SynthesisTimeout %v, got %v", DefaultSynthesisTimeout, resolved.SynthesisTimeout)
+	}
+}
+
+// pacedOutputStream is a speaker stream that plays in real time at 48 kHz and
+// keeps what it played.
+type pacedOutputStream struct {
+	mockOutputStream
+	mu     sync.Mutex
+	played []int16
+}
+
+func (s *pacedOutputStream) Write(frame []int16) error {
+	s.mu.Lock()
+	s.played = append(s.played, frame...)
+	s.mu.Unlock()
+	time.Sleep(time.Duration(len(frame)) * time.Second / 48000)
+	return nil
+}
+
+// TestOrchestratorSpeechStopsOnACancelOfTheVoice fails if a speech does not
+// play on the speaker's voice input, or plays on after Cancel of the voice,
+// as a barge-in makes, or is then reported failed rather than completed with
+// the part that played.
+func TestOrchestratorSpeechStopsOnACancelOfTheVoice(t *testing.T) {
+	pcm := make([]byte, 2*48000*2) // 2 s at 48 kHz
+	for i := 0; i < len(pcm); i += 2 {
+		pcm[i] = 0xE8 // 1000
+		pcm[i+1] = 0x03
+	}
+	provider := &mockProvider{audio: pcm, format: audio.AudioFormat{SampleRate: 48000, Channels: 1, Encoding: audio.EncodingPCM16}}
+	stream := &pacedOutputStream{}
+	out := newOutputOn(t, stream)
+	started := make(chan struct{}, 1)
+	remove := out.OnSpeech(func(e audio.SpeechEvent) {
+		if e.Input == audio.InputVoice && e.Started {
+			select {
+			case started <- struct{}{}:
+			default:
+			}
+		}
+	})
+	defer remove()
+	o := NewOrchestrator(provider, out, OrchestratorOpts{MaxRequestsPerMin: 100})
+	defer o.Stop()
+
+	id, err := o.Speak("a long answer", "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-started:
+	case <-time.After(3 * time.Second):
+		t.Fatal("the speech did not start on the voice input")
+	}
+	time.Sleep(200 * time.Millisecond)
+	out.Cancel(audio.InputVoice)
+
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		status, _ := o.Status(id)
+		if status.Status == StatusCompleted {
+			if status.DurationMs <= 0 || status.DurationMs >= 1000 {
+				t.Fatalf("a speech cancelled after 200 ms reports %d ms played", status.DurationMs)
+			}
+			if want := status.DurationMs * 48 * 2; status.BytesWritten < want-96 || status.BytesWritten > want+96 {
+				t.Fatalf("bytes_written = %d for %d ms at 48 kHz mono, want about %d", status.BytesWritten, status.DurationMs, want)
+			}
+			break
+		}
+		if status.Status == StatusFailed || time.Now().After(deadline) {
+			t.Fatalf("status after Cancel of the voice = %s (%s), want completed", status.Status, status.Error)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	stream.mu.Lock()
+	heard := len(stream.played)
+	stream.mu.Unlock()
+	time.Sleep(50 * time.Millisecond)
+	stream.mu.Lock()
+	defer stream.mu.Unlock()
+	for _, s := range stream.played[heard:] {
+		if s != 0 {
+			t.Fatal("the speech played on after Cancel of the voice")
+		}
 	}
 }

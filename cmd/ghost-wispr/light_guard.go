@@ -31,7 +31,10 @@ type lightGuard struct {
 	checked chan struct{} // holds one signal: a check is waiting to be applied
 
 	lastRelease time.Time // used by run alone
-	pending     bool      // a check is recorded that run has not read, under mu
+	// onFault runs once per new fault, as the hold starts: the error sound
+	// of a failed red check.
+	onFault func()
+	pending bool // a check is recorded that run has not read, under mu
 }
 
 func newLightGuard(capture *captureGate, warnings *warningsRegistry, releaseEvery time.Duration) *lightGuard {
@@ -40,6 +43,7 @@ func newLightGuard(capture *captureGate, warnings *warningsRegistry, releaseEver
 		warnings:     warnings,
 		releaseEvery: releaseEvery,
 		checked:      make(chan struct{}, 1),
+		onFault:      capture.redCheckFailed,
 	}
 }
 
@@ -79,9 +83,13 @@ func (g *lightGuard) run(ctx context.Context) {
 
 func (g *lightGuard) apply(fault error) {
 	if fault != nil {
+		fresh := !g.capture.isLightHeld()
 		// The warning first: once capture is held, /api/status names the light.
 		g.warnings.Set("recording-light", recordingLightWarning(fault))
 		g.capture.HoldForLight()
+		if fresh && g.onFault != nil {
+			g.onFault()
+		}
 		return
 	}
 	// A check that passes ends a busy or unchecked light's warning: another

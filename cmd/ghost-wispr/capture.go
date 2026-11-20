@@ -112,6 +112,9 @@ type captureGate struct {
 	dropHeldAudio      func()        // drops the audio the recorder keeps for the next session's start; runs at every microphone close, before afterMicClose
 	onMicHeld          func(bool)    // true when a pause could not release the microphone, false once it is released; must not block
 	capturePresent     func() bool   // reports whether a capture device exists, without opening one; nil when it cannot tell
+	onClosed           func(int)     // runs once the gate has closed, with its closings count; must not block
+	onRecording        func()        // runs at the first audio that reaches the recording after each opening into recording; must not block
+	onRedCheckFailed   func()        // runs when an opening finds the light not red; must not block
 	audioStall         time.Duration // see audioStallAfter
 	stallAfter         time.Duration // see captureStallAfter
 	writeWait          time.Duration // see captureWriteWait
@@ -126,6 +129,7 @@ type captureGate struct {
 	starting           bool          // that Resume's start of the microphone has not finished (finishResume)
 	preparing          bool          // a start waits in beforeMicOpen (prepareMicOpen)
 	closed             bool          // no audio passes the gate
+	recordingDue       bool          // the gate opened into recording, and no audio has reached the recording since (onRecording)
 	closings           int           // counts closings, so a Resume left from an earlier one does nothing
 	resumed            chan struct{} // closed while the gate is open
 	closing            chan struct{} // closed while the gate is closed
@@ -278,6 +282,14 @@ func (g *captureGate) isLightHeld() bool {
 	return g.lightHeld
 }
 
+// voiceStamp reports the gate's closings count and whether it is open, for a
+// transcript as it arrives: the voice acts on no wake from before a closing.
+func (g *captureGate) voiceStamp() (closings int, open bool) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.closings, !g.closed
+}
+
 // closeGate runs onPause, closes the gate, then settles the closing in the
 // background. The caller holds control. Closing a closed gate does nothing.
 func (g *captureGate) closeGate() {
@@ -295,11 +307,15 @@ func (g *captureGate) closeGate() {
 	g.mu.Lock()
 	g.closed = true
 	g.closings++
+	closings := g.closings
 	g.resumed = make(chan struct{})
 	close(g.closing)
 	settled := make(chan struct{})
 	g.settled = settled
 	g.mu.Unlock()
+	if g.onClosed != nil {
+		g.onClosed(closings)
+	}
 
 	go func() {
 		defer close(settled)
@@ -509,8 +525,13 @@ func (g *captureGate) openAfter(closing int, settled <-chan struct{}, forLight b
 			g.mu.Unlock()
 			onResumeRefused := g.onResumeRefused
 			g.control.Unlock()
-			if onResumeRefused != nil && !forLight {
-				onResumeRefused(err)
+			if !forLight {
+				// A person's resume found the light not red. A light hold's
+				// retries do not sound again: its fault did once.
+				g.redCheckFailed()
+				if onResumeRefused != nil {
+					onResumeRefused(err)
+				}
 			}
 			return
 		}
@@ -526,6 +547,7 @@ func (g *captureGate) openAfter(closing int, settled <-chan struct{}, forLight b
 		return
 	}
 	g.closed = false
+	g.recordingDue = true
 	close(g.resumed)
 	g.closing = make(chan struct{})
 	g.mu.Unlock()
@@ -533,6 +555,13 @@ func (g *captureGate) openAfter(closing int, settled <-chan struct{}, forLight b
 	g.control.Unlock()
 	if checked && g.afterGateOpen != nil {
 		g.afterGateOpen()
+	}
+}
+
+// redCheckFailed reports a failed red check: the error sound (R10).
+func (g *captureGate) redCheckFailed() {
+	if g.onRedCheckFailed != nil {
+		g.onRedCheckFailed()
 	}
 }
 
@@ -887,6 +916,13 @@ type gatedWriter struct {
 	dst  io.Writer
 }
 
+// gateStampedWriter receives the gate closing count captured when its Write
+// passed the capture gate. It uses the same count to refuse side effects once
+// a later gate closing invalidates an in-flight write.
+type gateStampedWriter interface {
+	WriteWithGateStamp(p []byte, gate *captureGate, closings int) (int, error)
+}
+
 // Write records p, only while the light has stayed red, and the gate open,
 // since the microphone opened under a red confirmation. It reads the light
 // back first (checkLight), so a light that went off, also from outside Ghost
@@ -910,6 +946,7 @@ func (w *gatedWriter) Write(p []byte) (int, error) {
 		g.mu.Unlock()
 		return 0, errClosedSinceMicOpen
 	}
+	closings := g.closings
 	g.writing++
 	g.mu.Unlock()
 	defer g.finishWrite()
@@ -919,11 +956,47 @@ func (w *gatedWriter) Write(p []byte) (int, error) {
 	if g.lightWentOff() {
 		return 0, errLightWentOff
 	}
+	if writer, ok := w.dst.(gateStampedWriter); ok {
+		n, err := writer.WriteWithGateStamp(p, g, closings)
+		if err == nil {
+			g.audioAt.Store(time.Now().UnixNano())
+			g.noteRecording(closings)
+		}
+		return n, err
+	}
 	n, err := w.dst.Write(p)
 	if err == nil {
 		g.audioAt.Store(time.Now().UnixNano())
+		g.noteRecording(closings)
 	}
 	return n, err
+}
+
+// noteRecording runs onRecording at the first audio that reached the
+// recording since the gate opened into recording, unless the gate has closed
+// since that audio passed it.
+func (g *captureGate) noteRecording(closings int) {
+	g.mu.Lock()
+	due := g.recordingDue && !g.closed && g.closings == closings
+	if due {
+		g.recordingDue = false
+	}
+	g.mu.Unlock()
+	if due && g.onRecording != nil {
+		g.onRecording()
+	}
+}
+
+// writeTapIfCurrent gives p to tap only while the gate is still in the
+// closing generation in which the write began. Holding mu across the tap
+// write orders it before a closing's Tap.Reset, or drops it after one.
+func (g *captureGate) writeTapIfCurrent(tap io.Writer, p []byte, closings int) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.closed || g.closings != closings {
+		return
+	}
+	_, _ = tap.Write(p)
 }
 
 // captureReadiness is what /healthz/ready reads of capture: the gate's
@@ -960,13 +1033,14 @@ type deepgramFinalizer interface{ Finalize() error }
 
 // newSessionCaptureGate returns the capture gate the app uses. deepgram returns
 // the live Deepgram client, or nil when there is none.
-//   - Pause blocks new sessions, which only sets a flag, then closes the gate.
-//   - The pause then settles: it waits out a session start already under way,
-//     Deepgram is asked to finalize, the call and its reply get up to
+//   - Every gate closing, a pause or a light hold, blocks new sessions and
+//     closes the gate.
+//   - The closing then settles: it waits out a session start already under
+//     way, Deepgram is asked to finalize, the call and its reply get up to
 //     finalizeWait to reach the session that was recording, and that session
 //     ends (after any other end of it already under way), so its last words
 //     are kept and its recording is closed.
-//   - After that, a Resume drops preroll audio from before the pause and lets
+//   - After the next opening drops preroll audio from before the closing,
 //     sessions start again, all before audio flows.
 //   - Every close of the microphone, which turns the light off, drops the
 //     audio the recorder keeps for the next session's start too.

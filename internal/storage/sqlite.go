@@ -915,6 +915,28 @@ func (s *SQLiteStore) init(dbPath string) error {
 		return fmt.Errorf("create embeddings table: %w", err)
 	}
 
+	// voice_tasks: the ledger of questions the voice sent an agent
+	// (voice_tasks.go). It holds no words of the room: the asker's words went
+	// in the Envoy message only. The foreign key deletes a session's rows with
+	// it, in the delete's own transaction, so the write-ahead log erase that
+	// follows the delete covers them.
+	if _, err := s.db.Exec(`
+		CREATE TABLE IF NOT EXISTS voice_tasks (
+			id TEXT PRIMARY KEY,
+			session_id TEXT NOT NULL,
+			asked_at TEXT NOT NULL,
+			issue_key TEXT NOT NULL DEFAULT '',
+			holder TEXT NOT NULL DEFAULT '',
+			state TEXT NOT NULL DEFAULT 'working' CHECK (state IN ('working', 'done', 'cancelled', 'replaced')),
+			answer_written TEXT NOT NULL DEFAULT '',
+			spoken_at TEXT,
+			FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
+		);
+		CREATE INDEX IF NOT EXISTS idx_voice_tasks_session_id ON voice_tasks(session_id);
+	`); err != nil {
+		return fmt.Errorf("create voice_tasks table: %w", err)
+	}
+
 	if _, err := s.db.Exec("CREATE INDEX IF NOT EXISTS idx_sessions_started_at ON sessions(started_at)"); err != nil {
 		return fmt.Errorf("create sessions index: %w", err)
 	}

@@ -171,7 +171,7 @@ func TestMicLoopOrdersTheJabraLightAroundTheCaptureStream(t *testing.T) {
 }
 
 // TestAPlaybackThatPanicsOnCloseHoldsNothingBack fails if a playback stream
-// whose close panics (Speaker.Play recovers from it) stays counted open, or
+// whose close panics (the speaker's audio.Output recovers from it) stays counted open, or
 // its close stays an operation under way: every later resume would then wait
 // for that playback for good, with readiness reporting resuming, and every
 // Jabra tap that would resume would be taken for the Jabra's own report.

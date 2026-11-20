@@ -17,6 +17,7 @@ import (
 
 	"github.com/sjawhar/ghost-wispr/internal/audio"
 	"github.com/sjawhar/ghost-wispr/internal/llm"
+	"github.com/sjawhar/ghost-wispr/internal/spokentext"
 )
 
 const (
@@ -199,9 +200,9 @@ func (p *GeminiProvider) Synthesize(ctx context.Context, req SpeechRequest) (*Sp
 	if httpResp.StatusCode != http.StatusOK {
 		var apiErr geminiTTSErrorResponse
 		if json.Unmarshal(responseBody, &apiErr) == nil && apiErr.Error.Message != "" {
-			return nil, fmt.Errorf("gemini tts: api error (status %d): %s", httpResp.StatusCode, providerMessage(apiErr.Error.Message, req.Text))
+			return nil, fmt.Errorf("gemini tts: api error (status %d): %s", httpResp.StatusCode, spokentext.Withhold(apiErr.Error.Message, req.Text))
 		}
-		return nil, fmt.Errorf("gemini tts: api error (status %d): %s", httpResp.StatusCode, providerMessage(string(responseBody), req.Text))
+		return nil, fmt.Errorf("gemini tts: api error (status %d): %s", httpResp.StatusCode, spokentext.Withhold(string(responseBody), req.Text))
 	}
 
 	var ttsResponse geminiTTSResponse

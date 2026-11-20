@@ -42,6 +42,8 @@ type jabraMuteButton struct {
 	connect    func() (io.ReadWriteCloser, error)
 	retryEvery time.Duration
 	checkEvery time.Duration
+	// onPress runs at each press, before the toggle: the voice stops.
+	onPress func()
 }
 
 // newJabraMuteButton makes the Jabra's mute button, and makes device's ring
@@ -61,9 +63,13 @@ func newJabraMuteButton(capture *captureGate, device *captureDevice, controls *s
 	return b
 }
 
-func startJabraMuteButton(ctx context.Context, cfg *config.Config, capture *captureGate, device *captureDevice, controls *server.ControlHooks, warnings *warningsRegistry) {
+// startJabraMuteButton serves the Jabra's mute button when the config turns
+// it on; onPress runs at each press, before the toggle, and stops the voice.
+func startJabraMuteButton(ctx context.Context, cfg *config.Config, capture *captureGate, device *captureDevice, controls *server.ControlHooks, warnings *warningsRegistry, onPress func()) {
 	if cfg.JabraMuteButton {
-		go newJabraMuteButton(capture, device, controls, warnings).run(ctx)
+		button := newJabraMuteButton(capture, device, controls, warnings)
+		button.onPress = onPress
+		go button.run(ctx)
 	}
 }
 
@@ -188,8 +194,12 @@ func (b *jabraMuteButton) serve(ctx context.Context, device io.ReadWriteCloser) 
 // and capture stays paused. A press that would pause always pauses, and does
 // so at once; a press that resumes runs its light check in the background, so
 // the next press is taken meanwhile (buttonToggle). The light is written
-// again once the press has asked, and again when its resume ends.
+// again once the press has asked, and again when its resume ends. Every press
+// stops the voice first.
 func (b *jabraMuteButton) press(at time.Duration) {
+	if b.onPress != nil {
+		b.onPress()
+	}
 	done := b.toggle.press(
 		func() bool { return b.device.ownOperationAt(at) },
 		func() { b.device.refreshLight(at) },

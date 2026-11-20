@@ -34,6 +34,9 @@ Microphone → Deepgram WebSocket → Session Manager → SQLite
 - `internal/server/` — HTTP API, WebSocket event hub, SPA serving
 - `internal/summary/` — OpenAI summarization
 - `internal/gdrive/` — Google Drive sync (optional)
+- `internal/voice/` — the meeting voice: the Supervisor, the room-audio tap, the chimes; `internal/voice/tts/` is voice A
+- `internal/wake/transcript/` — the wake phrase on the live transcript
+- `internal/concierge/`, `internal/dispatch/`, `internal/envoy/` — the Concierge, its Dispatch client and the unit's Envoy session
 
 **Frontend** (Svelte 5):
 - PWA with offline support
@@ -148,7 +151,9 @@ whatever rate the card takes; unset, any capture device counts and the default i
 A unit that starts paused scans only at its first resume. The speaker does not need the scan: on
 Linux it plays through the ALSA playback device that `speaker_device` names (a PCM such as
 `plughw:CARD=J75,DEV=0`, or a sound card's id or name, as `Jabra`), opening no microphone and
-needing no red light, so it speaks while capture is paused.
+needing no red light, so it speaks while capture is paused. It opens one stream at the device's
+native rate when the first sound is queued, mixes the voice and the chimes into it, and closes it
+0.3 s after the last sound.
 
 The microphone is never open while the blink(1) is off. The light stays red while the microphone is
 open, and goes off only once the recorder has closed it: after a pause, once no audio has reached
@@ -224,6 +229,89 @@ Deepgram can give its words for the last seconds before a pause, or before a ses
 closed, only after the resume or the end, as when it lags after an outage; the recorder places each
 word in the audio it captured, and drops every word from before the pause or the close, so none
 reaches a later session, and none reaches the page or the voice during a pause.
+
+## Meeting voice
+
+With `voice.enabled`, people in the room can ask Wispr about the work tracked in Dispatch. They
+say the wake phrase at the start of a sentence: "Wispr, what is happening with the issue about
+the meeting voice?" ("Ghost Wispr" and "Hey Wispr" work too; "I will whisper it to you" does not).
+Wispr plays a short two-note sound, the Concierge reads Dispatch's record, and the voice speaks the
+answer. For 6 s after Wispr's answer, a follow-up that the transcript ends with a question mark needs no wake phrase, and so does a reply when Wispr asked ("Did you mean ABC-12, or
+ABC-13?"). Anything else said in those 6 s is side talk: no voice answers it, and nothing of it goes to Dispatch.
+"Thanks, Wispr" ends the exchange. When the record cannot answer, the Concierge asks the agent that holds the issue. When
+its answer lands, Wispr plays a three-note sound after a second in which nobody speaks, and speaks
+the answer on "Wispr, go ahead" ("Wispr, go ahead, ABC-12" picks one of several). It speaks by
+itself only when nobody has spoken since the question and the light still reads red. "Wispr, never
+mind" cancels the newest question to an agent. "Wispr, stop" stops it, and so does talking over it
+with real words; "mm-hm" or "yeah" alone does not. Other speech (`POST /api/tts/speak`) waits in
+its queue while the voice speaks. Two more sounds: a single high note when capture starts
+recording, and a falling two-note sound when Wispr cannot do what was asked (Dispatch or Envoy out
+of reach, a voice that fails, or a failed red check).
+
+The settings page turns the voice on or off and picks its engine, with no restart; the change
+applies from the next exchange. With the voice off, the unit reads no wake phrase and runs no
+Concierge, and plays only the start sound and the error sound of a failed red check.
+
+What the voice hears, and where the room's words go:
+
+- The voice hears the room only while the light reads red. Its wake phrase is read from the live
+  transcript, and its room audio is one more writer behind the same gate as the recording and
+  Deepgram. While capture is paused, nothing hears the room: no wake phrase is heard, and nothing is
+  sent.
+- Every pause, light hold, press of the Jabra's Mute button, "Wispr, stop" and shutdown stop the voice at once: its speech, its
+  chimes and the Concierge's calls end within 100 ms, and a question not yet sent to an agent is not
+  sent. Every gate closing, a pause or a light hold, ends the recording session, and an ended
+  session's answers are never spoken: they stay in writing on that session's page. A gate closing
+  also clears the two minutes of transcript the voice keeps.
+- Voice A sends no room audio anywhere. The asker's words after the wake phrase go to the
+  Concierge's model (Gemini on Vertex AI), with the last two minutes of the transcript. The text
+  Wispr speaks goes to the text-to-speech engine: Gemini TTS on Vertex AI, or Deepgram Aura-2 with
+  `mip_opt_out=true`.
+- With `voice.engine: dgagent` (voice C), during an exchange only, the unit streams the room's
+  audio and the last two minutes of the meeting's transcript to Deepgram's Voice Agent, with
+  `mip_opt_out` set so Deepgram does not use them to train its models. Deepgram's model keeps the
+  turn: Deepgram's own model, or the provider `voice.dgagent.think_model` names (such as Google);
+  when that model fails a turn, Deepgram hands the turn, with the same transcript, to OpenAI's gpt-4.1-mini.
+  Each question goes to the Concierge on the unit, whose own model (Gemini on Vertex AI) words the
+  answer, and Deepgram speaks it word for word. An exchange opens at the wake phrase; a held answer also opens voice C without one, but only on "Wispr, go ahead", or when nobody has
+  spoken since its question and the light reads red. Between exchanges nothing goes to the Voice Agent.
+- Dispatch gets a question's words only as a few search keywords (at most five), never the whole
+  sentence. Each search runs Dispatch's keyword search and its search by meaning at once, so those
+  keywords also reach its embedding model, Cohere Embed v4 on Microsoft Azure, even when the
+  keyword search answers first. An issue key the asker says
+  ("infra 4592") goes to Dispatch in the address of that issue's read, which Dispatch's access log
+  records. A number said after a word that is no project of Dispatch ("the last 30 days") is not
+  read as a key. "In for" reads as INFRA only before a number of three or more digits, as Deepgram
+  sometimes writes "infra 4592"; "in for thirty minutes" is no key.
+- When the record cannot answer, the Concierge asks the agent that holds the issue, over Envoy.
+  The message carries the asker's question, framed as a read-only question from someone the unit
+  cannot identify, with the recording session's id and time, not the transcript. A question sent to
+  an agent leaves the unit, and deleting the segment or the session cannot recall it: Envoy keeps
+  messages for 72 hours, and the agent keeps what it read. The agent reads the question with its
+  own model, so the question also reaches that model's vendor.
+- The unit stores none of the room's words for a question it sent: its `voice_tasks` ledger holds
+  the issue, the holder, the state and the agent's written answer, which the session's page shows
+  under "Questions to agents". Deleting a session erases its questions and the answers the agents
+  wrote. An agent's written answer may quote the asker, and only a session delete erases it: a segment delete does not.
+- The voice's `/ws` events (`voice_wake`, `voice_exchange_started`, `voice_answer_ready`,
+  `voice_spoken` and `voice_tasks_changed`; `agent_joined` and `agent_left` come with agents that
+  join a meeting, which this build does not have) carry the recording session's id and no words,
+  and none is stored.
+- A speech vendor's error message that quotes the text to speak is left out of the journal; the
+  unit logs the vendor's status, and a note that the message was left out.
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `voice.enabled` (`GHOST_WISPR_VOICE_ENABLED`) | `false` | Turn the meeting voice on; it needs `speaker_enabled` |
+| `voice.engine` | `tts` | The voice: `tts` (voice A, our own streaming speech). `gptlive` and `dgagent` are not in this build |
+| `voice.wake_phrases` | `[Wispr, Ghost Wispr]` | The phrases that call Wispr; the live Deepgram request carries them, and Dispatch's project keys, as Nova-3 keyterms |
+| `voice.tts_engine` | `gemini` | Voice A's engine: `gemini` (Vertex AI, `gcp_project`) or `aura` (the Deepgram key) |
+| `voice.tts_model`, `voice.tts_voice` | the engine's | Gemini: `gemini-3.8-flash-tts`, `Kore`; Aura: the voice `aura-2-harmonia-en` |
+| `voice.tts_location` | `us` | The Vertex AI location Gemini streams from; `us` is faster to first audio than `global` |
+| `voice.paused_listener` | `false` | The wake listener while paused; not built yet, so it is ignored |
+| `concierge.model` | `gemini-3.5-flash-lite` | The Concierge's Gemini model, on the unit's genai settings |
+| `concierge.dispatch_url`, `GHOST_WISPR_DISPATCH_TOKEN` | — | Dispatch and the unit's own token; without both, the voice says it cannot reach Dispatch yet |
+| `concierge.envoy_url` | — | The Envoy listener the unit registers its session with, to ask an issue's agent |
 
 ## Deployment
 

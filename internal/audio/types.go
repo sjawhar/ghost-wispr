@@ -21,15 +21,10 @@ func (e AudioEncoding) String() string {
 	}
 }
 
-// AudioFormat describes the format of audio data passed to Speaker.Play.
+// AudioFormat describes audio: a TTS provider's clip (DecodePCM16) or the
+// PCM16 frames a Playback writes.
 type AudioFormat struct {
 	SampleRate int
 	Channels   int
 	Encoding   AudioEncoding
-}
-
-// PlaybackResult contains information about a completed playback operation.
-type PlaybackResult struct {
-	BytesWritten int64
-	DurationMs   int64
 }

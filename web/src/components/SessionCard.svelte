@@ -1,6 +1,8 @@
 <script lang="ts">
   import Markdown from '@humanspeak/svelte-markdown'
   import AudioPlayer from './AudioPlayer.svelte'
+  import VoiceTasks from './VoiceTasks.svelte'
+  import type { SessionVoiceTasks } from '../lib/state.svelte'
   import {
     RefinementStatus,
     SummaryStatus,
@@ -23,6 +25,7 @@
   let {
     session,
     detail,
+    voiceTasks,
     expanded,
     presets,
     onToggle,
@@ -37,6 +40,8 @@
   }: {
     session: SessionSummary
     detail: SessionDetailResponse | undefined
+    // The session's questions to agents, undefined until they are read.
+    voiceTasks: SessionVoiceTasks | undefined
     expanded: boolean
     presets: PresetMap
     selected?: boolean
@@ -488,6 +493,7 @@
             </div>
           </div>
         {/if}
+        <VoiceTasks {voiceTasks} />
         <div class="session-actions">
           <button type="button" class="delete-btn" onclick={handleDelete}>
             {localRemovalLabel}

@@ -65,7 +65,7 @@ func TestLiveTranscriptionConnectsAfterATransientFirstDialFailure(t *testing.T) 
 		&interfaces.ClientOptions{Host: host, EnableKeepAlive: true},
 		&interfaces.LiveTranscriptionOptions{Model: "nova-3", Language: "en-US", Encoding: "linear16", SampleRate: 16000, Channels: 1},
 		transcribe.ResilientConfig{BufferSize: 1 << 16, InitialReconnectDelay: 200 * time.Millisecond, MaxReconnectBackoff: 200 * time.Millisecond},
-		nil, warnings, nil)
+		transcriptCallback{}, warnings, nil)
 	t.Cleanup(func() { _ = rc.Close() })
 	if rc.IsConnected() {
 		t.Fatal("live transcription says connected after its first dial got HTTP 503")
@@ -172,7 +172,7 @@ func TestDeepgramWarningFollowsLaterDisconnects(t *testing.T) {
 		&interfaces.ClientOptions{Host: host, EnableKeepAlive: true},
 		&interfaces.LiveTranscriptionOptions{Model: "nova-3", Language: "en-US", Encoding: "linear16", SampleRate: 16000, Channels: 1},
 		transcribe.ResilientConfig{BufferSize: 1 << 16, InitialReconnectDelay: 20 * time.Millisecond, MaxReconnectBackoff: 50 * time.Millisecond},
-		nil, warnings, nil)
+		transcriptCallback{}, warnings, nil)
 	t.Cleanup(func() { _ = rc.Close() })
 	// The first dial runs in the background.
 	waitForHardwareWithin(t, 3*time.Second, "the first dial to connect and clear the warning", func() bool {
@@ -227,7 +227,7 @@ func TestEveryLiveSocketOptsOutOfDeepgramModelImprovement(t *testing.T) {
 		&interfaces.ClientOptions{Host: host, EnableKeepAlive: true},
 		&interfaces.LiveTranscriptionOptions{Model: "nova-3", Language: "en-US", Encoding: "linear16", SampleRate: 16000, Channels: 1},
 		transcribe.ResilientConfig{BufferSize: 1 << 16, InitialReconnectDelay: 20 * time.Millisecond, MaxReconnectBackoff: 50 * time.Millisecond},
-		nil, newWarningsRegistry(), nil)
+		transcriptCallback{}, newWarningsRegistry(), nil)
 	t.Cleanup(func() { _ = rc.Close() })
 	// The peer keeps a connection only after its handshake reply, which can
 	// reach the client first: wait for both, so the drop closes it.

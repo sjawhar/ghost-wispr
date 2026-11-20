@@ -11,6 +11,7 @@ const config: ConfigResponse = {
   gc: { enabled: true, max_age_days: 30, max_audio_size_mb: 1024 },
   api_keys: {},
   recording_rules: [],
+  voice: { enabled: false, engine: 'tts', tts_engine: 'gemini' },
 }
 
 describe('IntegrationsSettings', () => {

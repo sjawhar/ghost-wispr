@@ -2,9 +2,9 @@ package server
 
 import "encoding/json"
 
-// configSchema documents the GC settings of GET and PATCH /api/config (a
-// JSON merge patch has the same shape) and the read-only models and recording
-// rules GET reports; the other settings are untyped.
+// configSchema documents the GC and voice settings of GET and PATCH
+// /api/config (a JSON merge patch has the same shape) and the read-only models
+// and recording rules GET reports; the other settings are untyped.
 var configSchema = map[string]any{
 	"type": "object",
 	"properties": map[string]any{
@@ -38,6 +38,26 @@ var configSchema = map[string]any{
 			"readOnly":    true,
 			"items":       map[string]any{"type": "string"},
 			"description": "GET only: the rules the web UI shows under Recording rules, each as written in recording_rules. GHOST_WISPR_RECORDING_RULES overrides it with a JSON list of strings, and a settings save (any PATCH /api/config) then writes the override's rules into the config file, where they stay after the variable is removed. Empty when none are set; the page then shows no Recording rules button. A PATCH cannot set it.",
+		},
+		"voice": map[string]any{
+			"type":        "object",
+			"description": "The meeting voice. A change applies from the next exchange, with no restart.",
+			"properties": map[string]any{
+				"enabled": map[string]any{
+					"type":        "boolean",
+					"description": "Turn the meeting voice on or off",
+				},
+				"engine": map[string]any{
+					"type":        "string",
+					"enum":        []string{"tts", "gptlive", "dgagent"},
+					"description": "The voice that answers: tts (voice A, our own voice), gptlive (voice B, GPT-Live) or dgagent (voice C, the Deepgram voice agent)",
+				},
+				"tts_engine": map[string]any{
+					"type":        "string",
+					"enum":        []string{"gemini", "aura"},
+					"description": "Voice A's text-to-speech engine: gemini or aura",
+				},
+			},
 		},
 	},
 }
@@ -656,6 +676,50 @@ func OpenAPISpec() map[string]any {
 						"200": map[string]any{
 							"description": "Context segments",
 						},
+					},
+				},
+			},
+			"/api/sessions/{id}/voice-tasks": map[string]any{
+				"get": map[string]any{
+					"summary":     "List the questions to agents",
+					"description": "The questions the meeting voice sent the agents that hold issues, in this session and in the sessions merged into it, oldest first: the issue, the agent it went to, where each question stands, when it was asked and when its answer was spoken, and the agent's answer as written. The written answer is the agent's own text and can quote the asker. The unit keeps it with the session, and only deleting the session erases it.",
+					"tags":        []string{"sessions"},
+					"security":    []map[string][]string{{"basicAuth": {}}},
+					"parameters": []map[string]any{
+						{
+							"name":        "id",
+							"in":          "path",
+							"description": "Session ID",
+							"required":    true,
+							"schema":      map[string]any{"type": "string"},
+						},
+					},
+					"responses": map[string]any{
+						"200": map[string]any{
+							"description": "The session's questions to agents, oldest first; an empty list when the voice asked none",
+							"content": map[string]any{
+								"application/json": map[string]any{
+									"schema": map[string]any{
+										"type": "array",
+										"items": map[string]any{
+											"type":     "object",
+											"required": []string{"id", "issue_key", "holder", "state", "asked_at", "answer_written"},
+											"properties": map[string]any{
+												"id":             map[string]any{"type": "string", "description": "The Envoy event id of the message that carried the question"},
+												"issue_key":      map[string]any{"type": "string", "description": "The issue the question is about"},
+												"holder":         map[string]any{"type": "string", "description": "The agent the question went to, as its Envoy address (session:<id>)"},
+												"state":          map[string]any{"type": "string", "enum": []string{"working", "done", "cancelled", "replaced"}, "description": "working: no answer yet; done: the agent answered; cancelled: the exchange that asked ended before an answer; replaced: a later question to the same agent took its place"},
+												"asked_at":       map[string]any{"type": "string", "format": "date-time"},
+												"spoken_at":      map[string]any{"type": "string", "format": "date-time", "description": "When the voice spoke the answer; absent until it does"},
+												"answer_written": map[string]any{"type": "string", "description": "The agent's answer as written, in plain text; empty until it answers. A cancelled or replaced question keeps an answer that came after"},
+											},
+										},
+									},
+								},
+							},
+						},
+						"403": map[string]any{"description": "Invalid session id"},
+						"404": map[string]any{"description": "No such session"},
 					},
 				},
 			},

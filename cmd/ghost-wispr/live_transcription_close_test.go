@@ -26,12 +26,19 @@ type gatedManager struct {
 }
 
 func (g *gatedManager) Message(mr *api.MessageResponse) error {
+	_, err := g.MessageKept(mr)
+	return err
+}
+
+// MessageKept is the path the transcript callback takes when the manager
+// reports what its transcript keeps (keptMessager), so the gate sits here.
+func (g *gatedManager) MessageKept(mr *api.MessageResponse) (*api.MessageResponse, error) {
 	if !g.waited && len(mr.Channel.Alternatives) > 0 && mr.Channel.Alternatives[0].Transcript != "" {
 		g.waited = true
 		close(g.entered)
 		<-g.gate
 	}
-	return g.Manager.Message(mr)
+	return g.Manager.MessageKept(mr)
 }
 
 // TestClosingLiveTranscriptionWhileItHandsOnAResultReturns fails if closing
@@ -55,7 +62,7 @@ func TestClosingLiveTranscriptionWhileItHandsOnAResultReturns(t *testing.T) {
 		&interfaces.ClientOptions{Host: host},
 		&interfaces.LiveTranscriptionOptions{Model: "nova-3", Language: "en-US", Encoding: "linear16", SampleRate: 16000, Channels: 1},
 		transcribe.ResilientConfig{SampleRate: 16000, InitialReconnectDelay: 20 * time.Millisecond, MaxReconnectBackoff: 50 * time.Millisecond},
-		gated, newWarningsRegistry(), nil)
+		transcriptCallback{manager: gated}, newWarningsRegistry(), nil)
 	waitUntil(t, "the first socket", func() bool { return rc.IsConnected() && peer.latest() != nil })
 	mic := recorder.Writer(rc)
 	_, _ = mic.Write(reconnectSecond(1))

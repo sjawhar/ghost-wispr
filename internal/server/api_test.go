@@ -49,6 +49,10 @@ type apiStoreStub struct {
 	deleteAudioDir string
 	// cleared is the deleted sessions whose audio records were cleared.
 	cleared []string
+	// sourceSessionIDs is, by merged session, the sessions merged into it.
+	sourceSessionIDs map[string][]string
+	// voiceTasks is, by session, the questions the voice sent agents.
+	voiceTasks map[string][]storage.VoiceTask
 }
 
 type embeddingClientStub struct {
@@ -196,8 +200,8 @@ func (*apiStoreStub) CancelRawSessionErase(string, string) error {
 	return nil
 }
 
-func (*apiStoreStub) SourceSessionIDs(string) ([]string, error) {
-	return nil, nil
+func (s *apiStoreStub) SourceSessionIDs(sessionID string) ([]string, error) {
+	return s.sourceSessionIDs[sessionID], nil
 }
 
 func (s *apiStoreStub) NamedAudio(audioDir string) ([]string, error) {
@@ -243,6 +247,10 @@ func (s *apiStoreStub) MergeSessions(newID string, sourceIDs []string, startedAt
 
 func (s *apiStoreStub) GetSessionsForBackfill() ([]string, error) {
 	return nil, nil
+}
+
+func (s *apiStoreStub) VoiceTasks(sessionID string) ([]storage.VoiceTask, error) {
+	return append([]storage.VoiceTask{}, s.voiceTasks[sessionID]...), nil
 }
 
 type healthCheckerStub struct{}

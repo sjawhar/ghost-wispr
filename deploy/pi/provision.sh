@@ -182,6 +182,8 @@ readonly required_entries=(
 for entry in "${archive_entries[@]}"; do
   case "$entry" in
     device.crt|google-credentials.json|certificate_config.json|tailscale-client-id|tailscale-subject|envoy-webhook-url|deepgram-key) ;;
+    # The unit's own no-scope Dispatch token, for the meeting voice's Concierge; optional.
+    dispatch-token) ;;
     *) fail "credential bundle contains unexpected path: $entry" ;;
   esac
 done
@@ -199,6 +201,12 @@ tailscale_subject=$(require_single_line_file tailscale-subject)
 readonly tailscale_subject
 deepgram_key=$(require_single_line_file deepgram-key)
 readonly deepgram_key
+dispatch_token=""
+if [[ -e "$staging_dir/dispatch-token" || -L "$staging_dir/dispatch-token" ]]; then
+  [[ -f "$staging_dir/dispatch-token" && ! -L "$staging_dir/dispatch-token" ]] || fail "dispatch-token must be a regular file"
+  dispatch_token=$(require_single_line_file dispatch-token)
+fi
+readonly dispatch_token
 valid_relay_url "$relay_url" || fail "envoy-webhook-url must be an HTTPS Ghost Wispr webhook URL"
 [[ -n "$tailscale_client_id" && "$tailscale_client_id" != null && "$tailscale_client_id" =~ ^[A-Za-z0-9._:-]+$ ]] || fail "tailscale-client-id is empty or invalid"
 [[ "$tailscale_subject" =~ ^[0-9]+$ ]] || fail "tailscale-subject must be the service account unique ID"
@@ -237,6 +245,9 @@ sudo install -o "$SERVICE_USER" -g "$SERVICE_USER" -m 0640 "$staging_dir/ghost-w
   printf '%s\n' 'GOOGLE_API_USE_CLIENT_CERTIFICATE=false'
   printf '%s\n' "$EMBEDDING_LOCATION_SETTING"
   printf 'GHOST_WISPR_DEEPGRAM_API_KEY=%s\n' "$deepgram_key"
+  if [[ -n "$dispatch_token" ]]; then
+    printf 'GHOST_WISPR_DISPATCH_TOKEN=%s\n' "$dispatch_token"
+  fi
 } | sudo install -o "$SERVICE_USER" -g "$SERVICE_USER" -m 0600 /dev/stdin "$DEPLOY_DIR/.env"
 
 sudo install -m 0644 "$repo_root/deploy/pi/files/99-ghost-wispr.rules" /etc/udev/rules.d/99-ghost-wispr.rules

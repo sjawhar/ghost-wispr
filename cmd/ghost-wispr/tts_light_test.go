@@ -13,9 +13,9 @@ import (
 	"github.com/sjawhar/ghost-wispr/internal/jabra"
 )
 
-// heldOutput is a TTS playback stream on the Jabra that stays open, writing,
-// until release closes. open is true from when the stream opens until it
-// closes.
+// heldOutput is the speaker's stream on the Jabra: it holds its first write
+// until release closes, so it stays open, writing. open is true from when the
+// stream opens until it closes.
 type heldOutput struct {
 	writing chan struct{}
 	release chan struct{}
@@ -23,39 +23,56 @@ type heldOutput struct {
 	open    atomic.Bool
 }
 
-func (h *heldOutput) Start() error { return nil }
-func (h *heldOutput) Stop() error  { return nil }
-func (h *heldOutput) Close() error { h.open.Store(false); return nil }
-func (h *heldOutput) Write() error {
+func (h *heldOutput) Write([]int16) error {
 	h.once.Do(func() { close(h.writing) })
 	<-h.release
 	return nil
 }
 
-// playThroughDevice starts a real audio.Speaker, wired to device as main
-// wires it, playing into a stream that stays open until the returned finish
-// runs. finish waits for Play to return.
+func (h *heldOutput) Drop() (int, error) { return 0, nil }
+func (h *heldOutput) Close() error       { h.open.Store(false); return nil }
+
+// playThroughDevice starts the speaker's real audio.Output, wired to device
+// as main wires it, playing speech into a stream that stays open until the
+// returned finish runs. finish waits for the Output to close the stream,
+// OutputIdleClose after the speech.
 func playThroughDevice(t *testing.T, device *captureDevice) (out *heldOutput, finish func()) {
 	t.Helper()
-	speaker := audio.NewSpeaker("Jabra")
-	speaker.SetOutputHooks(device.playbackOpening, device.playbackClosing)
 	out = &heldOutput{writing: make(chan struct{}), release: make(chan struct{})}
-	speaker.SetOpenStreamForTest(func(int, int, int, []int16, string) (audio.OutputStream, error) {
-		out.open.Store(true)
-		return out, nil
+	closed := make(chan struct{}, 1)
+	output := audio.NewOutput(audio.OutputConfig{
+		Device:  "Jabra",
+		Opening: device.playbackOpening,
+		Closing: func(closeStream func()) {
+			device.playbackClosing(closeStream)
+			closed <- struct{}{}
+		},
+		Open: func(string) (audio.PlaybackStream, int, error) {
+			out.open.Store(true)
+			return out, 16000, nil
+		},
 	})
-	played := make(chan struct{})
+	ctx, cancel := context.WithTimeout(context.Background(), testWait)
 	go func() {
-		defer close(played)
-		_, _ = speaker.Play(make([]byte, 64000), audio.AudioFormat{SampleRate: 16000, Channels: 1, Encoding: audio.EncodingPCM16})
+		_ = output.Begin(audio.InputVoice).WriteAll(ctx, make([]byte, 640), audio.AudioFormat{SampleRate: 16000, Channels: 1})
 	}()
 	<-out.writing
 	var once sync.Once
 	finish = func() {
-		once.Do(func() { close(out.release) })
-		<-played
+		once.Do(func() {
+			close(out.release)
+			select {
+			case <-closed:
+			case <-time.After(testWait):
+				t.Error("the speaker's stream did not close after the speech")
+			}
+		})
 	}
-	t.Cleanup(finish)
+	t.Cleanup(func() {
+		finish()
+		cancel()
+		_ = output.Close()
+	})
 	return out, finish
 }
 

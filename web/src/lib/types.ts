@@ -131,6 +131,21 @@ export interface SessionDeletedEvent extends BaseEvent {
   source_session_ids: string[]
 }
 
+// What the meeting voice did, in the recording session session_id: no words.
+// voice_answer_ready, voice_spoken and voice_tasks_changed change the session's
+// questions to agents.
+export interface VoiceEvent extends BaseEvent {
+  type:
+    | 'voice_wake'
+    | 'voice_exchange_started'
+    | 'voice_answer_ready'
+    | 'voice_spoken'
+    | 'voice_tasks_changed'
+    | 'agent_joined'
+    | 'agent_left'
+  session_id: string
+}
+
 export type WebSocketEvent =
   | LiveTranscriptEvent
   | LiveTranscriptInterimEvent
@@ -141,6 +156,7 @@ export type WebSocketEvent =
   | ConnectionEvent
   | ComponentStatusEvent
   | SessionDeletedEvent
+  | VoiceEvent
 
 export interface Segment {
   // Set only after the recorder persists the segment. Live segments cannot be deleted.
@@ -204,3 +220,24 @@ export interface SearchResult {
 }
 
 export type PresetMap = Record<string, string>
+
+// Where a question the voice sent an agent stands.
+export enum VoiceTaskState {
+  Working = 'working',
+  Done = 'done',
+  Cancelled = 'cancelled',
+  Replaced = 'replaced',
+}
+
+// One question the voice sent the agent that holds an issue, from GET
+// /api/sessions/{id}/voice-tasks. answer_written is the agent's own text.
+export interface VoiceTask {
+  id: string
+  issue_key: string
+  holder: string
+  state: VoiceTaskState
+  asked_at: string
+  // When the voice spoke the answer; absent until it does.
+  spoken_at?: string
+  answer_written: string
+}

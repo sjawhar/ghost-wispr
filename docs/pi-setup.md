@@ -345,7 +345,7 @@ through `GHOST_WISPR_EMBEDDING_LOCATION` in `/opt/ghost-wispr/.env`. Nothing set
 `GOOGLE_APPLICATION_CREDENTIALS`. Garbage collection keeps every session
 (`gc_max_age_days: 0`) and holds local audio to a 20000 MB budget
 (`gc_max_audio_size_mb: 20000`), removing only audio that Drive holds a copy of; the template
-ships GC off so it never runs before sync is on. It also holds the office's four recording rules
+ships GC off so it never runs before sync is on. It also holds the office's five recording rules
 (`recording_rules`), which the web UI shows under Recording rules; both the full provisioner and
 the models step install them with the rest of the template.
 
@@ -371,24 +371,27 @@ light as it last set it.
 
 The Jabra's mute light is on while recording is paused and off otherwise, whichever control
 paused it. Ghost Wispr never changes it while any of the Jabra's streams is open, its microphone
-or a speech playback: a Jabra Speak2 75 whose light changed while one of its streams was open
+or the speaker's stream: a Jabra Speak2 75 whose light changed while one of its streams was open
 sends Phone Mute by itself 12-15 ms after its microphone stream next closes, which reads as a tap.
-So a pause closes the microphone, then lights the Jabra, and a resume darkens the Jabra, then
-opens the microphone. Ghost Wispr also sets the light when the Jabra connects or is plugged in
-again, after each tap, and within a quarter of a second after any other pause or resume, each
-time only while no stream is open; a change during speech waits for the speech to end. A resume
-during speech waits for the speech to end, with capture shown as resuming and the blink(1) off,
-then darkens the Jabra, turns the blink(1) red and opens the microphone, so the ring never reads
-Muted while the unit records. A pause during that wait cancels the resume. If the ring may still
+The speaker's stream opens with the first sound and closes 0.3 s after the last one. So a pause
+closes the microphone, then lights the Jabra, and a resume darkens the Jabra, then opens the
+microphone. Ghost Wispr also sets the light when the Jabra connects or is plugged in again, after
+each tap, and within a quarter of a second after any other pause or resume, each time only while
+no stream is open; a change during speech waits for the speaker's stream to close. A resume
+during speech waits for the speaker's stream to close, 0.3 s after the last sound, with capture
+shown as resuming and the blink(1) off, then darkens the Jabra, turns the blink(1) red and opens
+the microphone, so the ring never reads Muted while the unit records. A pause during that wait
+cancels the resume. If the ring may still
 show Muted while recording is on, as when the Jabra is plugged in while the microphone is open,
 or when a pause and a resume come during one microphone open, no audio is recorded: Ghost Wispr
 closes the microphone, darkens the Jabra and opens the microphone again, and the log says
 `the Jabra's ring may show the pause while capture is on; reopening the microphone`. During
-speech that takes until the speech ends, with capture shown as resuming and the blink(1) off.
+speech that takes until the speaker's stream closes, with capture shown as resuming and the
+blink(1) off.
 
 A Mute press that would resume recording is ignored when the kernel stamped it during Ghost
-Wispr's own open, close or PortAudio device scan of the microphone, or the close of a speech
-playback, or within 100 ms after one: that is the Jabra's own report, and recording stays
+Wispr's own open, close or PortAudio device scan of the microphone, or the close of the speaker's
+stream, or within 100 ms after one: that is the Jabra's own report, and recording stays
 paused. Ghost Wispr has the kernel stamp the Jabra's events with the monotonic clock, so a change
 of the Pi's time does not move the stamps. The log says
 `Jabra mute report came with Ghost Wispr's own microphone operation; capture stays paused`.
@@ -409,9 +412,21 @@ seconds) and the reconnect (backing off to every 30 seconds) look again without 
 starts paused scans only at its first resume. The speaker does not wait for it: it plays through the
 ALSA playback PCM of the card `speaker_device: J75` names (`plughw:CARD=J75,DEV=0`, the Jabra's
 `pcmC0D0p` on the office Pi), opening no microphone and needing no red light, so a unit restarted
-paused still speaks. It needs no package beyond `libportaudio2`, whose dependency `libasound2t64`
-the Pi already has (`deploy/pi/baseline.txt`). A pause during an open keeps the blink(1) red until
-that open has finished.
+paused still speaks. It plays at the first of 48000, 44100, 32000, 24000 and 16000 Hz that the
+Jabra takes without resampling, with 10 ms periods and an 80 ms buffer. When a cancel stops the
+speech, as when someone talks over it, the speaker rewinds that buffer, so the stream plays on,
+and writes the rest of the mix (a chime, say) again without the speech. Audio the Jabra has
+already taken still plays. If that is more than a period, or the device cannot rewind, the speaker
+drops the buffer instead. Each time the speaker opens, the log says
+`speaker stream` with the rate, period and buffer the Jabra granted, and `rewind=true` if it can
+rewind. Each cancel logs `speaker cancel` with `way=rewind` or `way=drop`, so the log shows what
+the Jabra did. Each underrun, when the speaker runs out of audio and clicks, is logged as
+`speaker underrun` with the device, the count so far in that stream and the buffer the device
+granted, and the count again at the close as `speaker stream closed after underruns`. A check that
+counts underruns reads those lines: a reader of `/proc/asound` can miss a short one between its
+polls. The speaker needs no package beyond `libportaudio2`,
+whose dependency `libasound2t64` the Pi already has (`deploy/pi/baseline.txt`). A pause during an
+open keeps the blink(1) red until that open has finished.
 
 The microphone is never open while the blink(1) is off: the blink(1) stays red while the microphone
 is open, and goes off only once Ghost Wispr has closed it. A pause closes it at once, also while
@@ -609,7 +624,7 @@ that line stays as it is. The full provisioner rewrites `.env` without it, and t
    <merge commit>`, when the timer was first). During an active session it prints `active
    session; leaving the current binary in place` and changes nothing: run it again once the
    session has ended.
-4. Check that the new binary reads the key. For `recording_rules`, the template's four rules must
+4. Check that the new binary reads the key. For `recording_rules`, the template's five rules must
    come back; for `envoy_webhook_secret_name`, `/api/status` must hold no Envoy warning; for
    `mic_device`, the config must hold `mic_device: J75`, `/api/status` no `No microphone found`
    warning, and `capture_state` must be `capturing` or `paused`. The Jabra's Mute button must be on:
@@ -702,6 +717,68 @@ steps on the Pi as `ghost-wispr`, outside meetings, with no session active.
    and unload the loopback: `sudo modprobe -r snd-aloop`. Then `/api/status` must show
    `capture_state` `capturing` (or `paused`) with no `No microphone found` warning: the Jabra is
    the microphone again.
+
+## Turn on the meeting voice
+
+The template turns the meeting voice on (`voice.enabled: true`; README, "Meeting voice"): "Wispr,
+what is happening with …?" gets a chime, then voice A speaks the answer from Dispatch's record
+in Gemini TTS's Kore voice, streamed from Vertex AI's `us` multi-region with the Pi's own Google
+identity. The fifth recording rule tells the room that a question sent to an agent leaves the unit.
+
+1. Reach. The Concierge reads `concierge.dispatch_url` and registers with the Envoy listener at
+   `concierge.envoy_url`. The Pi reaches neither until the tailnet grant of dispatch://INFRA-4617
+   is applied; until then the voice answers "I cannot reach Dispatch yet", and the log warns every
+   minute that the Envoy session did not open, with no restart needed once it can.
+2. The Pi's Dispatch token: a no-scope agent token (`POST /api/v1/me/agent-tokens` with
+   `{"name":"ghost-wispr-office-pi","scopes":[]}`), never a person's. Put it, one line, in the
+   credential bundle as `dispatch-token`; the full provisioner writes it to `.env` as
+   `GHOST_WISPR_DISPATCH_TOKEN`. Without it the voice answers "I cannot reach Dispatch yet".
+3. After the deploy, `/api/status` must hold no `voice` warning, and the journal must say
+   `voice: on (voice A on gemini, ...)`.
+4. Time to first audio of the first sentence: the Gemini engine warms its connection when the voice
+   opens, at the wake. Measure it once on the Pi, with and without the warm-up, using the voice
+   package's live test (`GHOST_WISPR_LIVE_TTS=gemini ... TestLiveFirstSayTimeToFirstAudio`, built for
+   arm64); keep the warm-up only if it lowers the median of the first sentence.
+
+## Accept the meeting voice
+
+`deploy/pi/accept-voice.sh` runs slice 1 of the meeting voice on the loopback, so nothing plays in
+the room and nothing of the room is recorded. Run it on the Pi as `ghost-wispr`, outside meetings,
+with the unit paused and no session active:
+
+1. `sudo modprobe snd-aloop`, as in "Inject speech for acceptance".
+2. Make a WAV of the question, such as "Wispr, what is happening with the issue about the meeting
+   voice?", and optionally one of "Wispr, go ahead.", with any text-to-speech engine.
+3. `bash accept-voice.sh --question question.wav [--go-ahead go-ahead.wav]`. It switches `.env` to the
+   loopback (microphone `Loopback`, speaker `plughw:CARD=Loopback,DEV=0,SUBDEV=1`, voice on),
+   restarts the service, resumes, plays the question in, and records the speaker's side. It prints
+   one `PASS` or `FAIL` line for each of `voice_wake`, `voice_exchange_started` and `voice_spoken` on
+   `/ws` (session id only, no words), the chime after the wake (at most 400 ms) and the speech after
+   the question (at most 3000 ms), and with `--go-ahead`, `voice_answer_ready` and the held answer.
+   `UNKNOWN` means it read nothing.
+4. Whatever the result, and on Ctrl-C, it pauses capture, stops the service, writes `.env` back
+   byte for byte and the saved capture state it read, starts the service and checks it reads paused.
+   Then unload the loopback: `sudo modprobe -r snd-aloop`.
+5. The after-merge checks of slice 1 each run one step: `bash accept-voice.sh --step NAME ...`;
+   `--help` lists the steps and what each needs. They need more inputs than the question:
+   - spoken clips made with any speech synthesizer: `--second-question`, `--never-mind` and
+     `--stop-clip` WAVs, and the `--question-dir`, `--talkover-dir` and `--backchannel-dir`
+     directories of WAVs;
+   - for `wake-sound`, `scripted`, `barge-in` and `playback-cancel`, a USB microphone about 30 cm
+     from the Jabra, named by `--rig-mic` (such as `plughw:CARD=Mic,DEV=0`). These steps play
+     through the Jabra, so run them with the room empty. The step asks you to confirm that, measures
+     the room and sets its sound threshold 10 dB above the room's peak;
+   - for `holder-cases` and `ask-holder`, scratch issues in Dispatch: one claimed by a live agent
+     session (`--issue-live`), one by a stopped session (`--issue-stopped`), one by a person
+     (`--issue-person`) and one with no session (`--issue-none`). The steps only read them, and ask
+     the live agent one question.
+
+   `reach`, `holder-cases` and `tts-first-audio` change nothing on the unit; the others restore it as
+   in point 4. `holder-cases` runs `ghost-wispr issue-holder KEY`, which prints the Concierge's
+   answer for the issue's holder without opening an Envoy session; `tts-first-audio` runs
+   `ghost-wispr tts-first-audio --engine NAME`, which times each sentence to its first audio frame
+   and plays nothing. The windows and thresholds of the rig steps are not yet calibrated: the first
+   run on the Pi calibrates them.
 
 ## Accept slice 1
 

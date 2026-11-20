@@ -1,0 +1,184 @@
+package voice
+
+import (
+	"encoding/binary"
+	"runtime"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/sjawhar/ghost-wispr/internal/audio"
+)
+
+// pcmBytes is n samples of PCM16 LE, each sample its index plus base.
+func pcmBytes(n int, base int16) []byte {
+	b := make([]byte, 2*n)
+	for i := range n {
+		binary.LittleEndian.PutUint16(b[2*i:], uint16(base+int16(i%1000)))
+	}
+	return b
+}
+
+// TestTapPassesNothingWithoutAnExchange fails if the tap delivers audio
+// while no exchange has it open.
+func TestTapPassesNothingWithoutAnExchange(t *testing.T) {
+	tap := NewTap()
+	tap.SetRate(16000)
+	if _, err := tap.Write(pcmBytes(4000, 0)); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	frames := tap.Open(0)
+	if _, err := tap.Write(pcmBytes(4000, 0)); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	f := <-frames
+	if f.Rate != 16000 || f.Channels != 1 || len(f.PCM) != 4000 {
+		t.Fatalf("frame %d Hz, %d ch, %d samples; want 16000 Hz mono, 4000 samples", f.Rate, f.Channels, len(f.PCM))
+	}
+	select {
+	case extra := <-frames:
+		t.Fatalf("an extra frame of %d samples: audio from before Open passed", len(extra.PCM))
+	default:
+	}
+	tap.CloseOut()
+	if _, ok := <-frames; ok {
+		t.Fatal("frames still open after CloseOut")
+	}
+	if _, err := tap.Write(pcmBytes(4000, 0)); err != nil {
+		t.Fatalf("Write after CloseOut: %v", err)
+	}
+}
+
+// TestTapNeverBlocksTheGate fails if a full tap blocks the capture gate's
+// writer, or drops without counting.
+func TestTapNeverBlocksTheGate(t *testing.T) {
+	tap := NewTap()
+	tap.SetRate(16000)
+	tap.Open(0) // nobody reads
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for range 4 * tapQueue {
+			if _, err := tap.Write(pcmBytes(4000, 0)); err != nil {
+				t.Errorf("Write: %v", err)
+				return
+			}
+		}
+	}()
+	select {
+	case <-done:
+	case <-time.After(testWait):
+		t.Fatal("a full tap blocked its writer")
+	}
+	if got := tap.Dropped(); got != uint64(3*tapQueue) {
+		t.Fatalf("dropped %d frames, want %d", got, 3*tapQueue)
+	}
+}
+
+// TestTapFormat fails if room audio reaches a voice as anything but 16 kHz
+// mono PCM16 in the microphone's 250 ms buffers, from a microphone at a
+// fallback rate too.
+func TestTapFormat(t *testing.T) {
+	tap := NewTap()
+	tap.SetRate(48000)
+	frames := tap.Open(0)
+	if _, err := tap.Write(pcmBytes(12000, 0)); err != nil { // 250 ms
+		t.Fatal(err)
+	}
+	f := <-frames
+	if f.Rate != 16000 || f.Channels != 1 || len(f.PCM) != 4000 {
+		t.Fatalf("frame %d Hz, %d channels, %d samples; want 16000 Hz mono with 4000 (250 ms)", f.Rate, f.Channels, len(f.PCM))
+	}
+}
+
+// TestTapReplayStartsNoEarlierThanAsked fails if Open replays more of the
+// ring than asked, or more than 2 s.
+func TestTapReplayStartsNoEarlierThanAsked(t *testing.T) {
+	tap := NewTap()
+	tap.SetRate(16000)
+	for i := range 12 { // 3 s, each buffer marked by its first sample
+		if _, err := tap.Write(pcmBytes(4000, int16(i*1000))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	frames := tap.Open(1200 * time.Millisecond)
+	total := 0
+	var first int16
+	for len(frames) > 0 {
+		f := <-frames
+		if total == 0 {
+			first = f.PCM[0]
+		}
+		total += len(f.PCM)
+	}
+	if total != 19200 {
+		t.Fatalf("replayed %d samples, want 19200 (1.2 s)", total)
+	}
+	// 1.2 s back from the end of the last buffer (sample 48000) is sample
+	// 28800: buffer 7, 800 samples in.
+	if want := int16(7*1000 + 800); first != want {
+		t.Fatalf("replay starts at sample value %d, want %d", first, want)
+	}
+
+	tap.CloseOut()
+	frames = tap.Open(10 * time.Second)
+	total = 0
+	for len(frames) > 0 {
+		total += len((<-frames).PCM)
+	}
+	if total != 32000 {
+		t.Fatalf("replayed %d samples for 10 s asked, want the 2 s ring (32000)", total)
+	}
+}
+
+// TestTapResetEmptiesTheRing fails if audio from before a gate closing can
+// be replayed after it.
+func TestTapResetEmptiesTheRing(t *testing.T) {
+	tap := NewTap()
+	tap.SetRate(16000)
+	if _, err := tap.Write(pcmBytes(16000, 0)); err != nil {
+		t.Fatal(err)
+	}
+	tap.Reset()
+	frames := tap.Open(2 * time.Second)
+	if n := len(frames); n != 0 {
+		t.Fatalf("%d frames replayed after Reset, want none", n)
+	}
+}
+
+// TestSolTapCloseOutConcurrentReader exercises the real CloseOut against a
+// simultaneous vendor receive of its last queued frame.
+func TestSolTapCloseOutConcurrentReader(t *testing.T) {
+	was := runtime.GOMAXPROCS(4)
+	t.Cleanup(func() { runtime.GOMAXPROCS(was) })
+	done := make(chan struct{})
+	var completed atomic.Int32
+	go func() {
+		for range 5000 {
+			tap := NewTap()
+			out := tap.Open(0)
+			tap.out <- audio.Frame{PCM: []int16{123}}
+			ready := make(chan struct{})
+			readerDone := make(chan struct{})
+			go func() {
+				<-ready
+				for range out {
+				}
+				close(readerDone)
+			}()
+			close(ready)
+			tap.CloseOut()
+			<-readerDone
+			completed.Add(1)
+		}
+		close(done)
+	}()
+	select {
+	case <-done:
+		t.Logf("closed %d streams", completed.Load())
+	case <-time.After(3 * time.Second):
+		stack := make([]byte, 1<<20)
+		n := runtime.Stack(stack, true)
+		t.Fatalf("only %d closes completed; goroutine stacks:\n%s", completed.Load(), stack[:n])
+	}
+}

@@ -15,6 +15,12 @@ func (m *Manager) publishSessionStarted(sessionID string) {
 }
 
 func (m *Manager) publishSessionEnded(sessionID string) {
+	m.mu.Lock()
+	hook := m.sessionEnded
+	m.mu.Unlock()
+	if hook != nil {
+		go hook(sessionID)
+	}
 	m.publishLifecycle(sessionID, "session_ended", false, EventPublisher.PublishSessionEnded)
 }
 

@@ -27,7 +27,9 @@ import (
 	client "github.com/deepgram/deepgram-go-sdk/v3/pkg/client/listen"
 
 	"github.com/sjawhar/ghost-wispr/internal/audio"
+	"github.com/sjawhar/ghost-wispr/internal/concierge"
 	"github.com/sjawhar/ghost-wispr/internal/config"
+	"github.com/sjawhar/ghost-wispr/internal/dispatch"
 	"github.com/sjawhar/ghost-wispr/internal/embedding"
 	"github.com/sjawhar/ghost-wispr/internal/gc"
 	"github.com/sjawhar/ghost-wispr/internal/gdrive"
@@ -42,6 +44,7 @@ import (
 	"github.com/sjawhar/ghost-wispr/internal/summary"
 	"github.com/sjawhar/ghost-wispr/internal/transcribe"
 	"github.com/sjawhar/ghost-wispr/internal/tts"
+	"github.com/sjawhar/ghost-wispr/internal/voice"
 
 	"google.golang.org/genai"
 )
@@ -463,13 +466,85 @@ func startMicrophone(ctx context.Context, loops *sync.WaitGroup, capture *captur
 
 type transcriptCallback struct {
 	manager session.LifecycleManager
+	voice   voiceListener
+	stamp   func() (closings int, open bool)
 }
 
+// voiceListener is the voice as the transcript reader feeds it: the
+// voice.Supervisor.
+type voiceListener interface {
+	OnTranscript(t *voice.Transcript)
+	OnUtteranceEnd(closings int, gateOpen bool)
+}
+
+// keptMessager is a session manager that reports what of each result its
+// transcript keeps (session.Manager.MessageKept): words from before the latest
+// pause are dropped, and the voice reads exactly what is left.
+type keptMessager interface {
+	MessageKept(mr *api.MessageResponse) (*api.MessageResponse, error)
+}
+
+// The build fails if the session manager stops reporting what its transcript
+// keeps: the voice would then read every live result, a late wake from before
+// a pause included (contract 4, R4).
+var _ keptMessager = (*session.Manager)(nil)
+
+// Message hands a Deepgram result to the session manager, then what the
+// manager's transcript kept of it to the voice, with the capture gate's stamp
+// taken as the result arrived.
 func (c transcriptCallback) Message(mr *api.MessageResponse) error {
-	if c.manager == nil {
+	var closings int
+	open := true
+	if c.stamp != nil {
+		closings, open = c.stamp()
+	}
+	kept := mr
+	var err error
+	switch manager := c.manager.(type) {
+	case nil:
+	case keptMessager:
+		kept, err = manager.MessageKept(mr)
+	default:
+		err = manager.Message(mr)
+	}
+	if c.voice != nil && kept != nil {
+		if t := voiceTranscript(kept, func() (int, bool) { return closings, open }); t != nil {
+			c.voice.OnTranscript(t)
+		}
+	}
+	return err
+}
+
+// voiceTranscript is mr as the voice reads it, or nil when it holds no text.
+func voiceTranscript(mr *api.MessageResponse, stamp func() (int, bool)) *voice.Transcript {
+	if len(mr.Channel.Alternatives) == 0 || strings.TrimSpace(mr.Channel.Alternatives[0].Transcript) == "" {
 		return nil
 	}
-	return c.manager.Message(mr)
+	alt := &mr.Channel.Alternatives[0]
+	t := &voice.Transcript{
+		Text:         alt.Transcript,
+		Words:        make([]voice.Word, 0, len(alt.Words)),
+		IsFinal:      mr.IsFinal,
+		SpeechFinal:  mr.SpeechFinal,
+		FromFinalize: mr.FromFinalize,
+		At:           time.Now(),
+	}
+	if stamp != nil {
+		t.Closings, t.GateOpen = stamp()
+	}
+	for i := range alt.Words {
+		w := &alt.Words[i]
+		speaker := -1
+		if w.Speaker != nil {
+			speaker = *w.Speaker
+		}
+		text := w.PunctuatedWord
+		if text == "" {
+			text = w.Word
+		}
+		t.Words = append(t.Words, voice.Word{Text: text, Speaker: speaker, Start: w.Start, End: w.End})
+	}
+	return t
 }
 
 // Open logs the socket. It leaves the resilient client's state alone: the
@@ -486,10 +561,19 @@ func (c transcriptCallback) Metadata(*api.MetadataResponse) error { return nil }
 func (c transcriptCallback) SpeechStarted(*api.SpeechStartedResponse) error { return nil }
 
 func (c transcriptCallback) UtteranceEnd(ur *api.UtteranceEndResponse) error {
-	if c.manager == nil {
-		return nil
+	var closings int
+	open := true
+	if c.stamp != nil {
+		closings, open = c.stamp()
 	}
-	return c.manager.UtteranceEnd(ur)
+	var err error
+	if c.manager != nil {
+		err = c.manager.UtteranceEnd(ur)
+	}
+	if c.voice != nil {
+		c.voice.OnUtteranceEnd(closings, open)
+	}
+	return err
 }
 
 func (c transcriptCallback) Close(*api.CloseResponse) error {
@@ -528,12 +612,14 @@ func newSessionRecorder(audioDir string, store audio.SessionRates) *audio.Record
 // startMicMonitoring starts the mic loop. Live transcription, downstream,
 // gets each buffer just before the recorder, through a bounded queue
 // that never blocks the loop (transcribe.AsyncSender), so no Deepgram
-// trouble stops the recording. It returns that queue, whose Finalize the
-// capture pause uses, or nil without downstream.
+// trouble stops the recording. tap, the voice's room audio (voice.Tap), gets
+// each buffer after them, behind the capture gate like them; it must never
+// block. It returns the Deepgram queue, whose Finalize the capture pause
+// uses, or nil without downstream.
 func startMicMonitoring(ctx context.Context, loops *sync.WaitGroup, capture *captureGate, streamer micStreamer, recorder *audio.Recorder, downstream interface {
 	io.Writer
 	Finalize() error
-}, wait func(time.Duration), logf func(string, ...any), hub *server.Hub) *transcribe.AsyncSender {
+}, tap io.Writer, wait func(time.Duration), logf func(string, ...any), hub *server.Hub) *transcribe.AsyncSender {
 	if streamer == nil || recorder == nil {
 		return nil
 	}
@@ -543,8 +629,51 @@ func startMicMonitoring(ctx context.Context, loops *sync.WaitGroup, capture *cap
 		sender = transcribe.NewAsyncSender(ctx, downstream, deepgramSendChunks, logf)
 		send = sender
 	}
-	streamMicLoopStarter(ctx, loops, capture, streamer, recorder.Writer(send), wait, logf, hub)
+	writer := recorder.Writer(send)
+	if tap != nil {
+		writer = tappedWriter{dst: writer, tap: tap}
+	}
+	streamMicLoopStarter(ctx, loops, capture, streamer, writer, wait, logf, hub)
 	return sender
+}
+
+// tappedWriter writes each buffer to dst, then to tap, and reports dst's
+// result. When the capture gate stamps a Write, it drops the tap copy if a
+// later gate closing made that in-flight write old before dst returned.
+type tappedWriter struct {
+	dst, tap io.Writer
+}
+
+func (w tappedWriter) Write(p []byte) (int, error) {
+	n, err := w.dst.Write(p)
+	_, _ = w.tap.Write(p)
+	return n, err
+}
+
+func (w tappedWriter) WriteWithGateStamp(p []byte, gate *captureGate, closings int) (int, error) {
+	n, err := w.dst.Write(p)
+	gate.writeTapIfCurrent(w.tap, p, closings)
+	return n, err
+}
+
+// liveTranscriptionOptions are the live Deepgram request's options for a
+// microphone at sampleRate, with Dispatch's project keys as keyterms.
+func liveTranscriptionOptions(cfg *config.Config, sampleRate int, projects []string) *interfaces.LiveTranscriptionOptions {
+	return &interfaces.LiveTranscriptionOptions{
+		Model:          cfg.DeepgramModel,
+		Language:       "en-US",
+		Diarize:        true,
+		Punctuate:      true,
+		SmartFormat:    true,
+		Encoding:       "linear16",
+		SampleRate:     sampleRate,
+		Channels:       1,
+		Endpointing:    cfg.Transcription.Endpointing,
+		InterimResults: true,
+		UtteranceEndMs: cfg.Transcription.UtteranceEndMs,
+		Keyterm:        voiceKeyterms(cfg, projects),
+		VadEvents:      true,
+	}
 }
 
 // micShutdownWait is how long shutdown waits for the mic loops to end. Each
@@ -671,8 +800,9 @@ func ttsStatusResponse(status *tts.SpeakStatus) map[string]any {
 	}
 }
 
-// newTTSProvider builds the TTS provider cfg names.
-func newTTSProvider(ctx context.Context, cfg *config.Config) (tts.Provider, error) {
+// newTTSProvider builds the TTS provider cfg names. geminiOptions go to the
+// Gemini provider: ghost-wispr tts-first-audio's tests point it at a fake.
+func newTTSProvider(ctx context.Context, cfg *config.Config, geminiOptions ...tts.GeminiOption) (tts.Provider, error) {
 	switch cfg.TTSProvider {
 	case "elevenlabs":
 		if cfg.TTSAPIKey == "" {
@@ -693,7 +823,7 @@ func newTTSProvider(ctx context.Context, cfg *config.Config) (tts.Provider, erro
 		if err != nil {
 			return nil, fmt.Errorf("detect Google credentials: %w", err)
 		}
-		return tts.NewGeminiProvider(cfg.GCPProject, cfg.TTSModel, cfg.TTSVoice, tts.WithGeminiAuthCredentials(credentials))
+		return tts.NewGeminiProvider(cfg.GCPProject, cfg.TTSModel, cfg.TTSVoice, append([]tts.GeminiOption{tts.WithGeminiAuthCredentials(credentials)}, geminiOptions...)...)
 	default:
 		return nil, fmt.Errorf("unsupported TTS provider: %s", cfg.TTSProvider)
 	}
@@ -720,6 +850,15 @@ func main() {
 			log.Fatalf("seed-paused-state: %v", err)
 		}
 		return
+	}
+	if len(os.Args) > 1 && os.Args[1] == "tts-first-audio" {
+		os.Exit(runTTSFirstAudioCommand(context.Background(), os.Args[1:], configPath, nil, os.Stdin, os.Stdout, os.Stderr))
+	}
+	if len(os.Args) > 1 && os.Args[1] == "issue-holder" {
+		// Its stderr is for why it failed: the scratch ledger's start-up notes
+		// would crowd the cause out of the 300 bytes accept-voice.sh keeps.
+		slog.SetDefault(logging.New(os.Stderr, "warn"))
+		os.Exit(runIssueHolderCommand(context.Background(), os.Args[1:], configPath, os.Stdout, os.Stderr))
 	}
 	if len(os.Args) > 1 {
 		if exitCode := runLightCommand(os.Args[1:], os.Stdout, os.Stderr); exitCode != 0 {
@@ -766,6 +905,7 @@ func main() {
 		log.Printf("warning: failed to recover stale sessions: %v", err)
 	} else if len(recoveredIDs) > 0 {
 		log.Printf("recovered %d stale session(s): %v", len(recoveredIDs), recoveredIDs)
+		cancelRecoveredQuestions(store, recoveredIDs, log.Printf)
 	}
 	// A refinement left running by the previous run stopped with it.
 	if err := store.RecoverStaleRefinements(); err != nil {
@@ -902,6 +1042,12 @@ func main() {
 	if indexer != nil {
 		manager.SetIndexer(indexer)
 	}
+	// The meeting voice and its Concierge, once they run, drop what an ended
+	// session still waits on and forget a deleted session. The voice link is
+	// wired to the capture gate below, before anything can close it.
+	var conciergeSessionHooks conciergeHooks
+	var voiceHooks voiceLink
+	sessionsForgotten := wireVoiceSessionHooks(manager, &conciergeSessionHooks, &voiceHooks)
 
 	// Summarize recovered sessions (and any with pending/empty summaries).
 	// Launched after ctx is created so SIGTERM cancels in-flight LLM calls.
@@ -940,6 +1086,17 @@ func main() {
 		}
 		return nil
 	}, captureFinalizeWait, captureEndRetry, log.Printf)
+	// The meeting voice. Its link is wired now, so every gate closing reaches
+	// it, the one restorePause may make included; the voice itself starts
+	// once the speaker output exists, below. Its tap is one more writer
+	// behind the gate, while the unit has a speaker for a voice.
+	wireVoiceToCapture(capture, &voiceHooks, &conciergeSessionHooks)
+	var voiceTap *voice.Tap
+	var voiceAudio io.Writer // nil with no speaker: the mic writes nothing more
+	if cfg.SpeakerEnabled {
+		voiceTap = voice.NewTap()
+		voiceAudio = voiceTap
+	}
 
 	restoredPause, err := restorePause(store, capture)
 	var restorePauseErr error
@@ -959,6 +1116,16 @@ func main() {
 		log.Printf("warning: raw erase reservations: %v", err)
 	}
 	startCertificateExpiryChecks(ctx, cfgStore, warningRegistry, certificateExpiryCheckEvery, googleauth.CertExpiry)
+	// Dispatch's project keys: keyterms of the live transcript, and the
+	// projects whose spoken keys the voice writes as keys (R4).
+	var dispatchProjects projectKeys
+	if cfg.SpeakerEnabled && cfg.DispatchToken != "" && cfg.Concierge.DispatchURL != "" {
+		if client, err := dispatch.NewClient(cfg.Concierge.DispatchURL, cfg.DispatchToken, newDispatchHTTP(appLogger)); err != nil {
+			log.Printf("warning: Dispatch's project keys: %v", err)
+		} else {
+			watchProjectKeys(ctx, client.Projects, projectKeysEvery, &dispatchProjects, log.Printf)
+		}
+	}
 	if restorePauseErr != nil {
 		warningRegistry.Set(captureStateWarningKey, "Capture pause state could not be restored; the recorder started paused")
 	}
@@ -1126,7 +1293,10 @@ func main() {
 		ActiveSession: manager.ActiveSession,
 		// Warnings, DeleteSegment and DeleteSegmentText: wireSegmentDeletion,
 		// below.
-		OnSessionDeleted: sessionsDeletedHook(store, warningRegistry),
+		OnSessionDeleted: func(sessionIDs []string) {
+			sessionsDeletedHook(store, warningRegistry)(sessionIDs)
+			sessionsForgotten(sessionIDs)
+		},
 		OnSessionsMerged: func(sessionIDs []string) {
 			warningRegistry.WithRecordingMismatch(func() {
 				for _, sessionID := range sessionIDs {
@@ -1381,6 +1551,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 		},
 	}
 	wireSegmentDeletion(controlHooks, warningRegistry, refusedCuts, deletion)
+	wireVoiceSegmentDeletion(controlHooks, &voiceHooks)
 
 	// A refinement that cannot use the model a "Delete text" was recorded
 	// under publishes nothing and says so here, until the session refines.
@@ -1416,7 +1587,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 		log.Printf("warning: open the microphone through ALSA's plug layer: %v", err)
 	}
 	startPowerButton(ctx, &cfg, capture, controlHooks, warningRegistry)
-	startJabraMuteButton(ctx, &cfg, capture, micDevice, controlHooks, warningRegistry)
+	startJabraMuteButton(ctx, &cfg, capture, micDevice, controlHooks, warningRegistry, func() { voiceHooks.Stop("Jabra button") })
 
 	envoyEvents.configure(ctx, &cfg, appLogger)
 	envoyEvents.publishRecoveredEnds(recoveredIDs)
@@ -1661,6 +1832,9 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 			// only a raw kept after a stop would be saved at the old one.
 			log.Printf("warning: the session under way keeps its old sample rate in the database: %v", err)
 		}
+		if voiceTap != nil {
+			voiceTap.SetRate(sampleRate)
+		}
 		// micRef is published before the start so the controller, woken when
 		// the start clears the forced-red hold, already sees the open mic.
 		micRef.Store(mic)
@@ -1690,29 +1864,17 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 		}
 
 		if cfg.DeepgramAPIKey == "" {
-			startMicMonitoring(ctx, &micLoops, capture, ordered, audioRecorder, nil, micWait, log.Printf, hub)
+			startMicMonitoring(ctx, &micLoops, capture, ordered, audioRecorder, nil, voiceAudio, micWait, log.Printf, hub)
 			return nil
 		}
 
 		cOptions := &interfaces.ClientOptions{EnableKeepAlive: true}
-		tOptions := &interfaces.LiveTranscriptionOptions{
-			Model:          cfg.DeepgramModel,
-			Language:       "en-US",
-			Diarize:        true,
-			Punctuate:      true,
-			SmartFormat:    true,
-			Encoding:       "linear16",
-			SampleRate:     sampleRate,
-			Channels:       1,
-			Endpointing:    cfg.Transcription.Endpointing,
-			InterimResults: true,
-			UtteranceEndMs: cfg.Transcription.UtteranceEndMs,
-			VadEvents:      true,
-		}
+		tOptions := liveTranscriptionOptions(&cfg, sampleRate, dispatchProjects.Get())
 		resilientConfig := liveTranscriptionConfig(&cfg, sampleRate)
-		candidateResilient := newLiveTranscription(ctx, cfg.DeepgramAPIKey, cOptions, tOptions, resilientConfig, manager, warningRegistry, hub)
+		callback := transcriptCallback{manager: manager, voice: &voiceHooks, stamp: capture.voiceStamp}
+		candidateResilient := newLiveTranscription(ctx, cfg.DeepgramAPIKey, cOptions, tOptions, resilientConfig, callback, warningRegistry, hub)
 		resilientRef.Store(candidateResilient)
-		deepgramSendRef.Store(startMicMonitoring(ctx, &micLoops, capture, ordered, audioRecorder, candidateResilient, micWait, log.Printf, hub))
+		deepgramSendRef.Store(startMicMonitoring(ctx, &micLoops, capture, ordered, audioRecorder, candidateResilient, voiceAudio, micWait, log.Printf, hub))
 		return nil
 	}
 
@@ -1777,26 +1939,32 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 	case errors.Is(err, errNoCaptureDevice):
 		startupStatus.Mic = config.ComponentState{Name: "mic", Status: "unavailable", Message: "No microphone found"}
 	}
-	// Initialize the speaker. It plays through ALSA's playback device,
+	// Initialize the speaker's output. It plays through ALSA's playback device,
 	// opening no microphone and needing no red light, so it speaks while
-	// capture is paused. Its playback streams go through micDevice, so the
-	// Jabra's light never changes while one is open.
-	var speaker *audio.Speaker
+	// capture is paused. Its stream opens through micDevice and closes
+	// OutputIdleClose after the last sound, so the Jabra's light never changes
+	// while one is open.
+	var output *audio.Output
 	if cfg.SpeakerEnabled {
-		speaker = audio.NewSpeaker(cfg.SpeakerDevice)
-		speaker.SetOutputHooks(micDevice.playbackOpening, micDevice.playbackClosing)
+		output = audio.NewOutput(audio.OutputConfig{
+			Device:  cfg.SpeakerDevice,
+			Opening: micDevice.playbackOpening,
+			Closing: micDevice.playbackClosing,
+		})
 		log.Printf("speaker output enabled (device=%q)", cfg.SpeakerDevice)
 	}
 
 	// Initialize TTS orchestrator if both speaker and provider are configured.
 	var ttsOrchestrator *tts.Orchestrator
-	if speaker != nil && cfg.TTSProvider != "" {
+	if output != nil && cfg.TTSProvider != "" {
 		ttsProvider, ttsErr := newTTSProvider(ctx, &cfg)
 		if ttsErr != nil {
 			log.Printf("warning: TTS disabled: %v", ttsErr)
 			warningRegistry.Set("tts", fmt.Sprintf("TTS provider initialization failed: %v", ttsErr))
 		} else {
-			ttsOrchestrator = tts.NewOrchestrator(ttsProvider, speaker, tts.OrchestratorOpts{})
+			// POST /api/tts/speak waits in its queue while a voice exchange
+			// holds the speaker.
+			ttsOrchestrator = tts.NewOrchestrator(ttsProvider, output, tts.OrchestratorOpts{Floor: voiceHooks.WithFloor})
 			log.Printf("TTS orchestrator started (provider=%s)", cfg.TTSProvider)
 		}
 	}
@@ -1820,6 +1988,53 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 		}
 		controlHooks.TTSHasProvider = ttsOrchestrator.HasProvider
 		controlHooks.TTSHasSpeaker = ttsOrchestrator.HasSpeaker
+	}
+
+	// The meeting voice: the Supervisor over the speaker output, whenever the
+	// unit has a speaker, since a person turns the voice on and picks it on the
+	// settings page with no restart (R13). The voice for each call is built from
+	// the settings saved last; the Concierge runs only while the voice is on.
+	var conc *lazyConcierge
+	if output != nil {
+		var voices voiceSource
+		voices.apply(ctx, &cfg)
+		voices.warnBuild(cfg.Voice.Enabled, warningRegistry)
+		onConfigChange(cfgStore, func(newCfg *config.Config) {
+			voices.apply(ctx, newCfg)
+			voices.warnBuild(newCfg.Voice.Enabled, warningRegistry)
+		})
+		conc = newLazyConcierge(func() (*concierge.Concierge, func(), error) {
+			current := cfgStore.Get()
+			// The session page reads a session's questions again on each change.
+			return startConcierge(ctx, &current, store, appLogger, func(sessionID string) {
+				hub.BroadcastVoiceEvent("voice_tasks_changed", sessionID)
+			})
+		}, func(c *concierge.Concierge) {
+			if c == nil { // it stopped: the session hooks reach nothing
+				conciergeSessionHooks.set(nil)
+				return
+			}
+			conciergeSessionHooks.set(c)
+		}, appLogger)
+		conc.followEnabled(cfg.Voice.Enabled) // a failed start is logged; each call then answers unreachable
+		onConfigChange(cfgStore, followVoiceEnabled(&voiceHooks, conc))
+		if err := startVoice(&voiceDeps{
+			output:      output,
+			tap:         voiceTap,
+			concierge:   conc,
+			link:        &voiceHooks,
+			voices:      voices.Voice,
+			enabled:     func() bool { return cfgStore.Get().Voice.Enabled },
+			wakePhrases: cfg.Voice.WakePhrases,
+			timing:      voiceTiming(appLogger),
+			session:     func() string { id, _ := manager.ActiveSession(); return id },
+			red:         func() bool { return capture.capturing(micStatus) },
+			notify:      hub.BroadcastVoiceEvent,
+			projects:    dispatchProjects.Get,
+		}); err != nil {
+			log.Printf("warning: the meeting voice is off: %v", err)
+			warningRegistry.Set("voice", "The meeting voice is off: "+err.Error())
+		}
 	}
 
 	// Wire up the mic diagnostic hook. A paused instance opens the mic only on
@@ -1864,7 +2079,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 	// sessions above) are saved now, not at the first sweep.
 	go kept.run(ctx)
 	if cfg.GCEnabled {
-		go collectGarbage(ctx, cfgStore, deletionNoticeGCStore{SQLiteStore: store, hub: hub}, drive, gcHealthState, warningRegistry, appLogger, gcEvery)
+		go collectGarbage(ctx, cfgStore, deletionNoticeGCStore{SQLiteStore: store, hub: hub, onDeleted: sessionsForgotten}, drive, gcHealthState, warningRegistry, appLogger, gcEvery)
 	}
 
 	// Create health checker with actual component references. With no Deepgram
@@ -1910,6 +2125,8 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 	<-sig
 
 	log.Println("ghost-wispr: shutting down")
+	// The voice stops first: its session, its speech and the Concierge's calls.
+	voiceHooks.Close()
 	cancel()
 	manager.StopSessionStartPublishes()
 	// Each mic loop closes its microphone and ends, even if its device
@@ -1950,11 +2167,16 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 	if mic := micRef.Load(); mic != nil && micLoopsEnded {
 		_ = mic.Stop()
 	}
+	if conc != nil {
+		conc.Stop()
+	}
 	if ttsOrchestrator != nil {
 		ttsOrchestrator.Stop()
 	}
-	if speaker != nil {
-		_ = speaker.Close()
+	if output != nil {
+		if err := output.Close(); err != nil {
+			log.Printf("warning: speaker output close failed: %v", err)
+		}
 	}
 
 	if err := httpServer.Shutdown(shutdownCtx); err != nil {

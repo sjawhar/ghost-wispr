@@ -92,7 +92,7 @@ func TestAPauseDuringTheDeepgramDialLetsTheLightGoOff(t *testing.T) {
 			clients <- newLiveTranscription(ctx, "test-key",
 				&interfaces.ClientOptions{Host: host},
 				&interfaces.LiveTranscriptionOptions{Model: "nova-3", Language: "en-US", Encoding: "linear16", SampleRate: 16000, Channels: 1},
-				transcribe.ResilientConfig{}, nil, newWarningsRegistry(), nil)
+				transcribe.ResilientConfig{}, transcriptCallback{}, newWarningsRegistry(), nil)
 			return nil
 		})
 	})
