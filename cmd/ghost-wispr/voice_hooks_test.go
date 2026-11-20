@@ -10,13 +10,21 @@ import (
 	"github.com/sjawhar/ghost-wispr/internal/voice"
 )
 
-// forgetting is a voice that records what it is told to forget.
+// forgetting is a voice that records what it is told to forget, and the
+// sessions it is told started.
 type forgetting struct {
 	closingsHeard
 	mu       sync.Mutex
+	started  []string
 	ended    []string
 	deleted  []string
 	segments []string
+}
+
+func (f *forgetting) SessionStarted(id string, _ uint64) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.started = append(f.started, id)
 }
 
 func (f *forgetting) SessionEnded(id string) {
@@ -39,13 +47,19 @@ func (f *forgetting) SegmentsDeleted(id string) {
 
 var _ voiceControl = (*forgetting)(nil)
 
-type endedHookHolder struct{ hook func(string) }
+type sessionHookHolder struct {
+	started func(string, uint64)
+	ended   func(string)
+}
 
-func (h *endedHookHolder) SetSessionEndedHook(hook func(string)) { h.hook = hook }
+func (h *sessionHookHolder) SetSessionStartedHook(hook func(string, uint64)) { h.started = hook }
+
+func (h *sessionHookHolder) SetSessionEndedHook(hook func(string)) { h.ended = hook }
 
 // TestSessionAndSegmentChangesReachTheVoiceAndTheConcierge fails if a session
-// end, a session delete (the API's and the GC's) or a segment delete, wired as
-// main wires them, does not reach both the voice and the Concierge.
+// start does not reach the voice, or a session end, a session delete (the
+// API's and the GC's) or a segment delete, wired as main wires them, does not
+// reach both the voice and the Concierge.
 func TestSessionAndSegmentChangesReachTheVoiceAndTheConcierge(t *testing.T) {
 	var link voiceLink
 	v := &forgetting{}
@@ -53,13 +67,14 @@ func TestSessionAndSegmentChangesReachTheVoiceAndTheConcierge(t *testing.T) {
 	var hooks conciergeHooks
 	c := &recordedSessions{}
 	hooks.set(c)
-	manager := &endedHookHolder{}
+	manager := &sessionHookHolder{}
 
 	forgotten := wireVoiceSessionHooks(manager, &hooks, &link)
-	if manager.hook == nil {
-		t.Fatal("no session-ended hook on the manager")
+	if manager.started == nil || manager.ended == nil {
+		t.Fatal("no session-started or session-ended hook on the manager")
 	}
-	manager.hook("s1")
+	manager.started("s0", 1)
+	manager.ended("s1")
 	forgotten([]string{"s2"})
 
 	controls := &server.ControlHooks{
@@ -79,11 +94,11 @@ func TestSessionAndSegmentChangesReachTheVoiceAndTheConcierge(t *testing.T) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	for name, got := range map[string][]string{
-		"voice ended": v.ended, "voice deleted": v.deleted, "voice segments": v.segments,
+		"voice started": v.started, "voice ended": v.ended, "voice deleted": v.deleted, "voice segments": v.segments,
 		"concierge ended": c.ended, "concierge deleted": c.deleted,
 	} {
 		want := map[string][]string{
-			"voice ended": {"s1"}, "voice deleted": {"s2"}, "voice segments": {"s3", "s4"},
+			"voice started": {"s0"}, "voice ended": {"s1"}, "voice deleted": {"s2"}, "voice segments": {"s3", "s4"},
 			"concierge ended": {"s1"}, "concierge deleted": {"s2"},
 		}[name]
 		if !slices.Equal(got, want) {

@@ -25,6 +25,7 @@ import (
 // voiceControl is the voice as the rest of the unit drives it; the
 // voice.Supervisor is one.
 type voiceControl interface {
+	SessionStarted(sessionID string, seq uint64)
 	SessionEnded(sessionID string)
 	EnabledChanged()
 	SessionsDeleted(sessionIDs []string)
@@ -34,7 +35,7 @@ type voiceControl interface {
 	Started()
 	RedCheckFailed()
 	OnTranscript(t *voice.Transcript)
-	OnUtteranceEnd(closings int, gateOpen bool)
+	OnUtteranceEnd(closings int, gateOpen bool, at time.Time)
 	WithFloor(ctx context.Context, start func()) error
 	Close()
 }
@@ -99,9 +100,9 @@ func (l *voiceLink) OnTranscript(t *voice.Transcript) {
 	}
 }
 
-func (l *voiceLink) OnUtteranceEnd(closings int, gateOpen bool) {
+func (l *voiceLink) OnUtteranceEnd(closings int, gateOpen bool, at time.Time) {
 	if v := l.get(); v != nil {
-		v.OnUtteranceEnd(closings, gateOpen)
+		v.OnUtteranceEnd(closings, gateOpen, at)
 	}
 }
 
@@ -119,6 +120,14 @@ func (l *voiceLink) WithFloor(ctx context.Context, start func()) error {
 func (l *voiceLink) Close() {
 	if v := l.get(); v != nil {
 		v.Close()
+	}
+}
+
+// SessionStarted writes the timing lines the voice held for a session as it
+// starts; seq is the start's sequence number.
+func (l *voiceLink) SessionStarted(sessionID string, seq uint64) {
+	if v := l.get(); v != nil {
+		v.SessionStarted(sessionID, seq)
 	}
 }
 
@@ -193,8 +202,10 @@ type voiceDeps struct {
 	enabled     func() bool                 // voice.enabled, live
 	wakePhrases []string
 	timing      func(event, sessionID string, at time.Time, kv ...any)
-	session     func() string // the recording session now
-	red         func() bool   // the light reads red and audio passes the gate
+	session     func() string           // the recording session now, once its start is done ("" before)
+	mark        func() (string, uint64) // the settled session and the count of settled starts, together (SessionMark)
+	ofStart     func(uint64) string     // the id of the settled start with that sequence (SessionOfStart)
+	red         func() bool             // the light reads red and audio passes the gate
 	notify      func(kind, sessionID string)
 	projects    func() []string    // Dispatch's project keys, for spoken keys
 	waiting     voice.WaitingLight // shows that something waits for a person; nil shows nothing
@@ -218,19 +229,21 @@ func startVoice(deps *voiceDeps) error {
 		return errors.New("the voice has no Concierge")
 	}
 	sup := voice.NewSupervisor(&voice.SupervisorConfig{
-		Voice:        deps.voices,
-		Concierge:    deps.concierge,
-		Speaker:      voice.SpeakerOf(deps.output),
-		WakePhrases:  deps.wakePhrases,
-		Session:      deps.session,
-		Red:          deps.red,
-		Enabled:      deps.enabled,
-		Notify:       deps.notify,
-		ProjectKeys:  deps.projects,
-		WaitingLight: deps.waiting,
-		Tap:          deps.tap,
-		Timing:       deps.timing,
-		Logf:         log.Printf,
+		Voice:          deps.voices,
+		Concierge:      deps.concierge,
+		Speaker:        voice.SpeakerOf(deps.output),
+		WakePhrases:    deps.wakePhrases,
+		Session:        deps.session,
+		SessionMark:    deps.mark,
+		SessionOfStart: deps.ofStart,
+		Red:            deps.red,
+		Enabled:        deps.enabled,
+		Notify:         deps.notify,
+		ProjectKeys:    deps.projects,
+		WaitingLight:   deps.waiting,
+		Tap:            deps.tap,
+		Timing:         deps.timing,
+		Logf:           log.Printf,
 	})
 	deps.link.set(sup)
 	log.Printf("voice: ready (wake phrases %q; voice.enabled and voice.engine are read at each call)", deps.wakePhrases)
@@ -401,10 +414,14 @@ func voiceCConfig(cfg *config.Config) *dgagent.Config {
 	}
 }
 
-// wireVoiceSessionHooks makes every session end reach the Concierge and the
-// voice, and returns what a session delete (the API's and the GC's) calls to
-// make them forget it.
-func wireVoiceSessionHooks(manager interface{ SetSessionEndedHook(func(string)) }, concierge *conciergeHooks, link *voiceLink) func([]string) {
+// wireVoiceSessionHooks makes every session start reach the voice and every
+// session end reach the Concierge and the voice, and returns what a session
+// delete (the API's and the GC's) calls to make them forget it.
+func wireVoiceSessionHooks(manager interface {
+	SetSessionStartedHook(func(string, uint64))
+	SetSessionEndedHook(func(string))
+}, concierge *conciergeHooks, link *voiceLink) func([]string) {
+	manager.SetSessionStartedHook(link.SessionStarted)
 	manager.SetSessionEndedHook(func(sessionID string) {
 		concierge.SessionEnded(sessionID)
 		link.SessionEnded(sessionID)

@@ -21,7 +21,7 @@ func TestTheVoiceLinkIsInertUntilTheVoiceStarts(t *testing.T) {
 	link.GateClosed(1)
 	link.Stop("Jabra button")
 	link.OnTranscript(&voice.Transcript{Text: "Wispr, hello", GateOpen: true})
-	link.OnUtteranceEnd(0, true)
+	link.OnUtteranceEnd(0, true, time.Now())
 	if err := link.WithFloor(t.Context(), func() {}); err != nil {
 		t.Fatalf("WithFloor with no voice: %v", err)
 	}
@@ -96,9 +96,10 @@ func (c *closingsHeard) Stop(reason string) {
 	c.stops = append(c.stops, reason)
 }
 func (*closingsHeard) OnTranscript(*voice.Transcript)                  {}
-func (*closingsHeard) OnUtteranceEnd(int, bool)                        {}
+func (*closingsHeard) OnUtteranceEnd(int, bool, time.Time)             {}
 func (*closingsHeard) WithFloor(_ context.Context, start func()) error { start(); return nil }
 func (*closingsHeard) Close()                                          {}
+func (*closingsHeard) SessionStarted(string, uint64)                   {}
 func (*closingsHeard) SessionEnded(string)                             {}
 func (c *closingsHeard) EnabledChanged() {
 	c.mu.Lock()
