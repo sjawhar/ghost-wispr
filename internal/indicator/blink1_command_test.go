@@ -3,6 +3,7 @@
 package indicator
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
@@ -159,33 +160,33 @@ func TestACommandOpenDoesNotFailForAnotherCommand(t *testing.T) {
 	}
 }
 
-// TestAWaitingRecorderGoesBeforeLightState fails if the recorder's reads do
-// not get the light within their wait while light-state runs back to back in
-// four other processes. Such a read is unknown, and the gate drops that buffer
-// of audio. The lock serves no queue, and the recorder polled for it as often
-// as light-state did, so it lost the light to them: with 4 light-state loops
-// on a uhid blink(1), 18 buffers were dropped in 20 s (review of #79). A
-// waiting recorder must go first; light-state waits longer, and can.
-//
-// The recorder goes first only because the runtime wakes it every
-// recorderPoll and light-state only every commandPoll. On a loaded host the
-// runtime wakes sleeps late, and once a sleep of recorderPoll wakes later than
-// commandPoll, every waiter wakes at once and that order is gone: with the
-// host's load average at 40 to 60, 10 of 300 runs lost one read of about 70.
-// So a probe sleeps recorderPoll over and over, and a read during which the
-// probe woke later than commandPoll is not counted. The test reads until 40
-// reads are counted, and fails if the runtime woke late through too many reads
-// to count 40 in 10 s: it then measured nothing. A read is counted only once
-// the probe has woken after it ends, since a late sleep is recorded when the
-// probe wakes from it: counted earlier, a read that a late sleep then turned
-// out to cover ended the loop short of 40 (with the load average at 400 to
-// 2,000 on sami-devbox, 1 of 50 runs).
-func TestAWaitingRecorderGoesBeforeLightState(t *testing.T) {
+// lockOrderSeeds seed the lock simulations of the lock order tests: each gives
+// the loops other start instants, and the sleeps other lateness.
+var lockOrderSeeds = []uint64{1, 2, 3, 4, 5, 6, 7, 8}
+
+// lockOrderLateness is how late a sleep can end in a lock simulation: Go's
+// runtime waits for a timer in whole milliseconds (recorderPoll).
+const lockOrderLateness = time.Millisecond
+
+// lockOrderRun is what a recorder and light-state loops did on the lock
+// simulation's clock.
+type lockOrderRun struct {
+	reads, unknown int // the recorder's reads that got the light, and those that did not
+	held           int // the recorder's polls: times it found the node's lock held
+	lightState     int // light-state's reads
+}
+
+// runLockOrder runs, on a lock simulation from seed, a recorder that reads its
+// light reads times, 10 ms apart, while loops light-state loops, started at
+// instants in the first 5 ms, open the light with open, read it and close it,
+// back to back. Each transfer takes 2 ms, with the node's lock held.
+func runLockOrder(t *testing.T, seed uint64, reads, loops int, open func(sysfsRoot, devRoot string) (Light, error)) lockOrderRun {
+	t.Helper()
 	sysfsRoot, devRoot, _ := fakeBlink1Sysfs(t)
 	original := featureIOCTL
 	t.Cleanup(func() { featureIOCTL = original })
 	featureIOCTL = func(_ uintptr, request uintptr, report *[8]byte) error {
-		time.Sleep(2 * time.Millisecond) // a USB control transfer: the sender holds the lock meanwhile
+		lockClock.Sleep(2 * time.Millisecond) // a USB control transfer: the sender holds the lock meanwhile
 		if request == hidIOCGetFeature {
 			switch report[1] {
 			case 'v':
@@ -196,148 +197,89 @@ func TestAWaitingRecorderGoesBeforeLightState(t *testing.T) {
 		}
 		return nil
 	}
-	recorder, err := OpenBlink1(sysfsRoot, devRoot)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = recorder.Close() })
-
-	stop := make(chan struct{})
-	var loops sync.WaitGroup
-	var runs atomic.Int32
-	for range 4 {
-		loops.Add(1)
-		go func() {
-			defer loops.Done()
-			for {
-				select {
-				case <-stop:
-					return
-				default:
-				}
-				light, err := OpenBlink1ForCommand(sysfsRoot, devRoot)
+	sim := newLockSim(t, seed, lockOrderLateness)
+	var run lockOrderRun
+	var stopped atomic.Bool
+	var lightState atomic.Int32
+	recorderActor := sim.Go("recorder", true, 0, func() {
+		defer stopped.Store(true)
+		// Opened here, its exchanges run on the simulation's clock only.
+		recorder, err := OpenBlink1(sysfsRoot, devRoot)
+		if err != nil {
+			sim.fail("the recorder's open: %v", err)
+			return
+		}
+		defer func() { _ = recorder.Close() }()
+		for range reads {
+			switch _, _, _, err := recorder.ReadRGB(); {
+			case Contended(err):
+				run.unknown++
+			case err != nil:
+				sim.fail("the recorder's read: %v", err)
+				return
+			default:
+				run.reads++
+			}
+			lockClock.Sleep(10 * time.Millisecond)
+		}
+	})
+	for i := range loops {
+		sim.Go(fmt.Sprintf("light-state %d", i+1), false, sim.Offset(5*time.Millisecond), func() {
+			for !stopped.Load() {
+				light, err := open(sysfsRoot, devRoot)
 				if err != nil {
-					continue
+					sim.fail("light-state's open: %v", err)
+					return
 				}
 				if _, _, _, err := light.ReadRGB(); err == nil {
-					runs.Add(1)
+					lightState.Add(1)
+				} else if !Contended(err) {
+					sim.fail("light-state's read: %v", err)
 				}
 				_ = light.Close()
 			}
-		}()
+		})
 	}
-	late := watchLateTimers(stop, &loops)
+	sim.Run(30 * time.Second)
+	run.held, run.lightState = sim.Sleeps(recorderActor, recorderPoll), int(lightState.Load())
+	return run
+}
 
-	const counted = 40
-	type read struct {
-		from, to  time.Time
-		contended bool
-	}
-	var done []read
-	// cleanSettled counts the reads in done that the probe has woken after
-	// and found no late sleep during.
-	cleanSettled := func() int {
-		clean := 0
-		for _, r := range done {
-			if late.settled(r.to) && !late.during(r.from, r.to) {
-				clean++
+// TestAWaitingRecorderGoesBeforeLightState fails if the recorder's reads do
+// not get the light within their wait while light-state runs back to back in
+// four other handles. Such a read is unknown, and the gate drops that buffer
+// of audio. The lock serves no queue, and the recorder polled for it as often
+// as light-state did, so it lost the light to them: with 4 light-state loops
+// on a uhid blink(1), 18 buffers were dropped in 20 s (review of #79). A
+// waiting recorder must go first; light-state waits longer, and can.
+//
+// The recorder goes first because it tries the lock every recorderPoll and
+// light-state every commandPoll, after a gap of exchangeGap. Run on the real
+// clock, that order was only as good as the machine's timers: under load a
+// sleep of 1 ms ended after 5 ms, and the test failed with the order intact
+// (1 of 50 runs at load 680 to 2,240 on sami-devbox). So the handles run on a
+// lock simulation (lockSim), whose sleeps end up to 1 ms late as an idle
+// machine's do, and which wakes light-state first when two wake at the same
+// instant. Control: with light-state handles that wait and poll as the
+// recorder does (OpenBlink1), the recorder's reads lose the light.
+func TestAWaitingRecorderGoesBeforeLightState(t *testing.T) {
+	for _, seed := range lockOrderSeeds {
+		t.Run(fmt.Sprint("seed ", seed), func(t *testing.T) {
+			run := runLockOrder(t, seed, 100, 4, OpenBlink1ForCommand)
+			t.Logf("the recorder read the light %d times, found it held %d times; light-state read it %d times", run.reads, run.held, run.lightState)
+			if run.unknown > 0 {
+				t.Fatalf("the recorder's read got no light %d of %d times while light-state ran back to back in 4 handles, want 0", run.unknown, run.reads+run.unknown)
 			}
-		}
-		return clean
-	}
-	start := time.Now()
-	for deadline := start.Add(10 * time.Second); cleanSettled() < counted && time.Now().Before(deadline); time.Sleep(10 * time.Millisecond) {
-		from := time.Now()
-		_, _, _, err := recorder.ReadRGB()
-		r := read{from: from, to: time.Now(), contended: Contended(err)}
-		if err != nil && !r.contended {
-			t.Fatalf("the recorder's read: %v", err)
-		}
-		done = append(done, r)
-	}
-	took := time.Since(start)
-	close(stop)
-	loops.Wait()
-	clean, unknown, excused := 0, 0, 0
-	for _, r := range done {
-		lateDuring := late.during(r.from, r.to)
-		if !lateDuring {
-			clean++
-		}
-		switch {
-		case r.contended && lateDuring:
-			excused++
-		case r.contended:
-			unknown++
-		}
-	}
-	if n := runs.Load(); n < 20 {
-		t.Fatalf("control: light-state read the light %d times in %v, want at least 20", n, took.Round(time.Millisecond))
-	}
-	if clean < counted {
-		t.Fatalf("control: the runtime woke a %v sleep later than %v during %d of %d reads in %v, so only %d could be counted, want %d: this run measured nothing", recorderPoll, commandPoll, len(done)-clean, len(done), took.Round(time.Millisecond), clean, counted)
-	}
-	if unknown > 0 {
-		t.Fatalf("the recorder's read got no light %d of %d times while light-state ran back to back in 4 processes, want 0 (%d more reads got no light while the runtime woke late)", unknown, clean, excused)
-	}
-	t.Logf("the recorder read the light %d times, %d counted; %d reads that the runtime woke late through got no light; light-state read it %d times", len(done), clean, excused, runs.Load())
-}
-
-// lateTimers is the stretches in which the runtime woke a sleep of
-// recorderPoll later than commandPoll (watchLateTimers), and when the probe
-// last woke.
-type lateTimers struct {
-	mu    sync.Mutex
-	spans [][2]time.Time
-	woke  time.Time
-}
-
-// watchLateTimers sleeps recorderPoll over and over until stop closes, and
-// records each sleep that woke later than commandPoll. loops counts its
-// goroutine.
-func watchLateTimers(stop <-chan struct{}, loops *sync.WaitGroup) *lateTimers {
-	late := &lateTimers{}
-	loops.Add(1)
-	go func() {
-		defer loops.Done()
-		for {
-			select {
-			case <-stop:
-				return
-			default:
+			if run.held == 0 || run.lightState < 20 {
+				t.Fatalf("control: the recorder found the light held %d times and light-state read it %d times, want at least once and 20 times: the loops did not contend", run.held, run.lightState)
 			}
-			from := time.Now()
-			time.Sleep(recorderPoll)
-			to := time.Now()
-			late.mu.Lock()
-			if to.Sub(from) > commandPoll {
-				late.spans = append(late.spans, [2]time.Time{from, to})
+		})
+		t.Run(fmt.Sprint("control: light-state polling as the recorder does, seed ", seed), func(t *testing.T) {
+			run := runLockOrder(t, seed, 100, 4, OpenBlink1)
+			t.Logf("the recorder read the light %d times, %d unknown, found it held %d times; light-state read it %d times", run.reads, run.unknown, run.held, run.lightState)
+			if run.unknown == 0 {
+				t.Fatal("with light-state handles that poll as the recorder does, every read of the recorder got the light: the test cannot see a lost lock order")
 			}
-			late.woke = to
-			late.mu.Unlock()
-		}
-	}()
-	return late
-}
-
-// settled reports whether the probe has woken since to: every late sleep
-// that could overlap a stretch ending at to is recorded by then, as the
-// probe's next sleep starts after it wakes.
-func (l *lateTimers) settled(to time.Time) bool {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	return l.woke.After(to)
-}
-
-// during reports whether a late sleep overlapped the stretch from from to to.
-// A sleep still under way is not seen until the probe wakes from it.
-func (l *lateTimers) during(from, to time.Time) bool {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	for _, span := range l.spans {
-		if span[0].Before(to) && span[1].After(from) {
-			return true
-		}
+		})
 	}
-	return false
 }
