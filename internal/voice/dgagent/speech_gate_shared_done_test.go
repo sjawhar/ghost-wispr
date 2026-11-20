@@ -178,12 +178,12 @@ func everySharedDoneTrace(sentences int) [][]sharedEvent {
 func sharedTraceName(trace []sharedEvent, injected int) string {
 	parts := make([]string, len(trace))
 	for i, e := range trace {
-		switch {
-		case e.kind == replyDone:
+		switch e.kind {
+		case replyDone:
 			parts[i] = "D"
-		case e.kind == replyText:
+		case replyText:
 			parts[i] = fmt.Sprintf("T%d", e.sentence+1)
-		default:
+		case replyAudio:
 			parts[i] = fmt.Sprintf("A%d", e.sentence+1)
 		}
 		if e.sentence == injected && e.kind != replyDone {
