@@ -19,14 +19,18 @@ import (
 // Output resamples the sounds' 24 kHz to it, as on the Pi.
 const soundStreamRate = 48000
 
-// soundStream is the speaker's stream in play-sound's tests. It never makes a
-// write wait, so the Output keeps it to real time itself. It keeps every
-// sample written, the device it was opened on, how often it was opened, and
-// whether it closed. With failAfterSound, the fifth frame of silence after
-// the sound fails, as a device unplugged during the Output's idle frames
-// would: by then Drain has returned.
+// soundStream is the speaker's stream in play-sound's tests. Each write takes
+// as long as its frame lasts, as a device's does once its buffer is full, so
+// the mixer cannot run ahead of the writer: on a stream that never waits it
+// may run outputAhead ahead, and a writer the machine held back that long
+// leaves a gap inside the sound. It keeps every sample written, the device it
+// was opened on, how often it was opened, and whether it closed. With
+// failAfterSound, the fifth frame of silence after the sound fails, as a
+// device unplugged during the Output's idle frames would: by then Drain has
+// returned. With closeErr, Close fails with it and leaves the stream open.
 type soundStream struct {
 	failAfterSound bool
+	closeErr       error
 
 	mu      sync.Mutex
 	device  string
@@ -46,6 +50,7 @@ func (s *soundStream) open(device string) (audio.PlaybackStream, int, error) {
 }
 
 func (s *soundStream) Write(frame []int16) error {
+	time.Sleep(time.Duration(len(frame)) * time.Second / soundStreamRate)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.samples = append(s.samples, frame...)
@@ -69,6 +74,9 @@ func (s *soundStream) Drop() (int, error) { return 0, nil }
 func (s *soundStream) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.closeErr != nil {
+		return s.closeErr
+	}
 	s.closed = true
 	return nil
 }
@@ -211,5 +219,16 @@ func TestPlaySoundFailsWhenTheStreamFailsAfterTheSound(t *testing.T) {
 	run, _ := runPlaySound(t, playSoundUnit(t, "speaker_enabled: true\nspeaker_device: J75\n"), stream, "wake")
 	if run.code != 1 || !strings.Contains(run.stderr, "the device went away") || run.stdout != "" {
 		t.Fatalf("exit %d, stdout %q, stderr %q; want 1 and the stream's error", run.code, run.stdout, run.stderr)
+	}
+}
+
+// TestPlaySoundFailsWhenTheStreamFailsToClose fails if play-sound reports a
+// sound played when the speaker's stream, after the sound, did not close: the
+// rig would take a speaker left in a broken state for a good calibration.
+func TestPlaySoundFailsWhenTheStreamFailsToClose(t *testing.T) {
+	stream := &soundStream{closeErr: errors.New("speaker close failed")}
+	run, _ := runPlaySound(t, playSoundUnit(t, "speaker_enabled: true\nspeaker_device: J75\n"), stream, "wake")
+	if run.code != 1 || !strings.Contains(run.stderr, "speaker close failed") || run.stdout != "" {
+		t.Fatalf("exit %d, stdout %q, stderr %q; want 1 and the close's error", run.code, run.stdout, run.stderr)
 	}
 }

@@ -97,11 +97,12 @@ type OutputConfig struct {
 	Device string
 	// Opening and Closing bracket each stream: Opening runs just before the
 	// stream opens, and Closing once the Output is done with it, whether it
-	// opened or not, and must call closeStream, which closes it. The Jabra
-	// mute button uses them to keep the Jabra's light from changing while a
-	// stream is open on the Jabra.
+	// opened or not, and must call closeStream, which closes it and returns
+	// the stream's close error (nil when none opened). The Jabra mute button
+	// uses them to keep the Jabra's light from changing while a stream is open
+	// on the Jabra. With no Closing, a close that fails is logged.
 	Opening func()
-	Closing func(closeStream func())
+	Closing func(closeStream func() error)
 	// IdleClose is how long the stream stays open with nothing queued; 0 is
 	// OutputIdleClose.
 	IdleClose time.Duration
@@ -278,7 +279,11 @@ func NewOutput(cfg OutputConfig) *Output {
 		cfg.Opening = func() {}
 	}
 	if cfg.Closing == nil {
-		cfg.Closing = func(closeStream func()) { closeStream() }
+		cfg.Closing = func(closeStream func() error) {
+			if err := closeStream(); err != nil {
+				slog.Warn("speaker stream close failed", "error", err)
+			}
+		}
 	}
 	if cfg.IdleClose <= 0 {
 		cfg.IdleClose = OutputIdleClose
@@ -693,10 +698,11 @@ func (o *Output) play() {
 	// The output hooks bracket the stream, from before it opens until after
 	// it closes, on every path out of play.
 	o.cfg.Opening()
-	defer o.cfg.Closing(func() {
-		if stream != nil {
-			_ = stream.Close()
+	defer o.cfg.Closing(func() error {
+		if stream == nil {
+			return nil
 		}
+		return stream.Close()
 	})
 	// A panic while the stream is in use ends every playback before the
 	// stream closes (deferred last, so it runs first).

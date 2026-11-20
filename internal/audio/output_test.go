@@ -5,6 +5,8 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
+	"log/slog"
 	"math"
 	"runtime"
 	"slices"
@@ -32,8 +34,10 @@ type fakeStream struct {
 	// writing is closed at the first Write.
 	writing     chan struct{}
 	writingOnce sync.Once
-	// closePanics makes Close panic, as a PortAudio close that fails does.
+	// closePanics makes Close panic, as a PortAudio close that fails does;
+	// closeErr makes it return that error.
 	closePanics bool
+	closeErr    error
 
 	mu       sync.Mutex
 	frames   []playedFrame
@@ -66,7 +70,7 @@ func (f *fakeStream) Close() error {
 	if f.closePanics {
 		panic("output stream close failed")
 	}
-	return nil
+	return f.closeErr
 }
 
 // Drop has nothing to drop: the fake holds no frames once its Write returns.
@@ -634,52 +638,57 @@ func TestOutputKeepsOneStreamAcrossSpeechesAndClosesItWhenIdle(t *testing.T) {
 // TestOutputHooksBracketTheStream fails if the output hooks do not run around
 // the playback stream: opening before the stream opens, and closing once the
 // Output is done with it, with the stream still open until closing's
-// closeStream runs. The Jabra mute button counts a playback stream as open
-// from opening to closing, so it writes no light while one is open on the
-// Jabra.
+// closeStream runs, which returns the stream's close error. The Jabra mute
+// button counts a playback stream as open from opening to closing, so it
+// writes no light while one is open on the Jabra.
 func TestOutputHooksBracketTheStream(t *testing.T) {
-	stream := newFakeStream(48000)
-	var mu sync.Mutex
-	var calls []string
-	call := func(c string) {
-		mu.Lock()
-		defer mu.Unlock()
-		calls = append(calls, c)
-	}
-	opener := &fakeOpener{streams: []*fakeStream{stream}}
-	cfg := OutputConfig{
-		IdleClose: 10 * time.Millisecond,
-		Opening:   func() { call("opening") },
-		Closing: func(closeStream func()) {
-			call(fmt.Sprintf("closing (closed before closeStream: %t)", stream.isClosed()))
-			closeStream()
-			call(fmt.Sprintf("closed: %t", stream.isClosed()))
-		},
-	}
-	cfg.Open = func(device string) (PlaybackStream, int, error) {
-		call("open")
-		return opener.open(device)
-	}
-	out := NewOutput(cfg)
-	t.Cleanup(func() { _ = out.Close() })
-	ctx := testContext(t)
-	pb := out.Begin(InputVoice)
-	if err := pb.WriteAll(ctx, constant(48000, 20*time.Millisecond, 1000), mono48k); err != nil {
-		t.Fatal(err)
-	}
-	if err := pb.Drain(ctx); err != nil {
-		t.Fatal(err)
-	}
-	want := []string{"opening", "open", "closing (closed before closeStream: false)", "closed: true"}
-	waitFor(t, "the idle stream to close", func() bool {
-		mu.Lock()
-		defer mu.Unlock()
-		return len(calls) == len(want)
-	})
-	mu.Lock()
-	defer mu.Unlock()
-	if !slices.Equal(calls, want) {
-		t.Fatalf("calls = %q, want %q", calls, want)
+	for _, closeErr := range []error{nil, errors.New("speaker close failed")} {
+		t.Run(fmt.Sprintf("close error %v", closeErr), func(t *testing.T) {
+			stream := newFakeStream(48000)
+			stream.closeErr = closeErr
+			var mu sync.Mutex
+			var calls []string
+			call := func(c string) {
+				mu.Lock()
+				defer mu.Unlock()
+				calls = append(calls, c)
+			}
+			opener := &fakeOpener{streams: []*fakeStream{stream}}
+			cfg := OutputConfig{
+				IdleClose: 10 * time.Millisecond,
+				Opening:   func() { call("opening") },
+				Closing: func(closeStream func() error) {
+					call(fmt.Sprintf("closing (closed before closeStream: %t)", stream.isClosed()))
+					err := closeStream()
+					call(fmt.Sprintf("closed: %t, error %v", stream.isClosed(), err))
+				},
+			}
+			cfg.Open = func(device string) (PlaybackStream, int, error) {
+				call("open")
+				return opener.open(device)
+			}
+			out := NewOutput(cfg)
+			t.Cleanup(func() { _ = out.Close() })
+			ctx := testContext(t)
+			pb := out.Begin(InputVoice)
+			if err := pb.WriteAll(ctx, constant(48000, 20*time.Millisecond, 1000), mono48k); err != nil {
+				t.Fatal(err)
+			}
+			if err := pb.Drain(ctx); err != nil {
+				t.Fatal(err)
+			}
+			want := []string{"opening", "open", "closing (closed before closeStream: false)", fmt.Sprintf("closed: true, error %v", closeErr)}
+			waitFor(t, "the idle stream to close", func() bool {
+				mu.Lock()
+				defer mu.Unlock()
+				return len(calls) == len(want)
+			})
+			mu.Lock()
+			defer mu.Unlock()
+			if !slices.Equal(calls, want) {
+				t.Fatalf("calls = %q, want %q", calls, want)
+			}
+		})
 	}
 }
 
@@ -692,7 +701,14 @@ func TestOutputHooksRunWhenTheStreamDoesNotOpen(t *testing.T) {
 	opened, closed := 0, 0
 	out := newTestOutput(t, OutputConfig{
 		Opening: func() { mu.Lock(); opened++; mu.Unlock() },
-		Closing: func(closeStream func()) { mu.Lock(); closed++; mu.Unlock(); closeStream() },
+		Closing: func(closeStream func() error) {
+			mu.Lock()
+			closed++
+			mu.Unlock()
+			if err := closeStream(); err != nil {
+				t.Errorf("closeStream with no stream opened = %v, want nil", err)
+			}
+		},
 	}, &fakeOpener{err: errors.New("no output device")})
 	ctx := testContext(t)
 	pb := out.Begin(InputVoice)
@@ -712,6 +728,54 @@ func TestOutputHooksRunWhenTheStreamDoesNotOpen(t *testing.T) {
 
 func containsText(err error, text string) bool {
 	return err != nil && strings.Contains(err.Error(), text)
+}
+
+// TestOutputLogsAStreamThatFailsToClose fails if an Output with no closing
+// hook drops the error of a stream that did not close instead of logging it
+// at WARN.
+func TestOutputLogsAStreamThatFailsToClose(t *testing.T) {
+	var mu sync.Mutex
+	var logs strings.Builder
+	original := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(lockedWriter{&mu, &logs}, nil)))
+	defer slog.SetDefault(original)
+	stream := newFakeStream(48000)
+	stream.closeErr = errors.New("speaker close failed")
+	out := newTestOutput(t, OutputConfig{IdleClose: 10 * time.Millisecond}, &fakeOpener{streams: []*fakeStream{stream}})
+	ctx := testContext(t)
+	pb := out.Begin(InputVoice)
+	if err := pb.WriteAll(ctx, constant(48000, 20*time.Millisecond, 1000), mono48k); err != nil {
+		t.Fatal(err)
+	}
+	if err := pb.Drain(ctx); err != nil {
+		t.Fatal(err)
+	}
+	logged := func() string {
+		mu.Lock()
+		defer mu.Unlock()
+		return logs.String()
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for !stream.isClosed() || !strings.Contains(logged(), "speaker close failed") {
+		if time.Now().After(deadline) {
+			t.Fatalf("the stream closed: %t; the log holds %q; want a WARN line with the close's error", stream.isClosed(), logged())
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if line := logged(); !strings.Contains(line, "level=WARN") || !strings.Contains(line, `msg="speaker stream close failed"`) {
+		t.Fatalf("the log holds %q; want a WARN line, speaker stream close failed", line)
+	}
+}
+
+type lockedWriter struct {
+	mu *sync.Mutex
+	w  io.Writer
+}
+
+func (l lockedWriter) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.w.Write(p)
 }
 
 // TestOutputReportsAStreamFailureToTheWriter fails if a write the device

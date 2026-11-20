@@ -78,13 +78,19 @@ func runPlaySoundCommand(ctx context.Context, args []string, configPath string, 
 	length := time.Duration(frames) * time.Second / time.Duration(voice.ChimeFormat.SampleRate)
 	ctx, cancel := context.WithTimeout(ctx, length+playSoundCloseWait)
 	defer cancel()
+	// closed is closed once the Output has closed its stream; closeErr, set
+	// before, is that close's error.
 	closed := make(chan struct{})
+	var closeErr error
 	var once sync.Once
 	out := audio.NewOutput(audio.OutputConfig{
 		Device: cfg.SpeakerDevice,
-		Closing: func(closeStream func()) {
-			closeStream()
-			once.Do(func() { close(closed) })
+		Closing: func(closeStream func() error) {
+			err := closeStream()
+			once.Do(func() {
+				closeErr = err
+				close(closed)
+			})
 		},
 		Open: open,
 	})
@@ -104,6 +110,9 @@ func runPlaySoundCommand(ctx context.Context, args []string, configPath string, 
 	// A stream that failed closes too: then the playback ended with its error.
 	if err := pb.Drain(ctx); err != nil {
 		return fail(fmt.Errorf("the speaker's stream failed after the sound: %w", err))
+	}
+	if closeErr != nil {
+		return fail(fmt.Errorf("the speaker's stream did not close: %w", closeErr))
 	}
 	if err := out.Close(); err != nil {
 		return fail(err)

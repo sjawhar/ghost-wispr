@@ -4,7 +4,6 @@ package audio
 
 import (
 	"context"
-	"io"
 	"log/slog"
 	"math"
 	"runtime"
@@ -555,17 +554,6 @@ func TestALSAStreamLogsTheWayEachCancelTookBack(t *testing.T) {
 			t.Errorf("a cancel with %d frames in flight logged %q, want one speaker cancel line with %s", tc.inflight, got, tc.want)
 		}
 	}
-}
-
-type lockedWriter struct {
-	mu *sync.Mutex
-	w  io.Writer
-}
-
-func (l lockedWriter) Write(p []byte) (int, error) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	return l.w.Write(p)
 }
 
 // TestALSAOutputKeepsUpUnderLoad measures underruns on the ALSA path with
