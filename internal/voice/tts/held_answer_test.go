@@ -47,11 +47,13 @@ func (e burstEngine) Stream(ctx context.Context, _ string, emit func([]byte) err
 // does: Write blocks while 200 ms waits, Drain waits for what was written,
 // and Cancel ends the playbacks begun before it. It counts voice frames.
 type realtimeSpeaker struct {
-	mu          sync.Mutex
-	gen         map[string]int
-	cut         map[string]chan struct{}
-	playEnd     time.Time
-	voiceFrames atomic.Int64
+	mu           sync.Mutex
+	gen          map[string]int
+	cut          map[string]chan struct{}
+	playEnd      time.Time
+	voiceFrames  atomic.Int64
+	chimeSamples atomic.Int64
+	holdChime    chan struct{}
 }
 
 func newRealtimeSpeaker() *realtimeSpeaker {
@@ -90,6 +92,16 @@ func (p *rtPlayback) Write(ctx context.Context, frame []byte, f audio.AudioForma
 		return err
 	}
 	if p.input != audio.InputVoice {
+		if p.s.holdChime != nil {
+			select {
+			case <-p.s.holdChime:
+			case <-p.cut:
+				return audio.ErrCancelled
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+		p.s.chimeSamples.Add(int64(len(frame) / 2))
 		return nil // the chimes do not pace
 	}
 	d := time.Duration(len(frame)/2) * time.Second / time.Duration(f.SampleRate)

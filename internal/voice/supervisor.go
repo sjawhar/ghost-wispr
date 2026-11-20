@@ -833,7 +833,7 @@ func (s *Supervisor) readEvents(ex *exchange, sess Session) {
 				// sound begun before it would go with it.
 				s.endLocked(ex, true, "the voice failed")
 			}
-			if current {
+			if current && ex.answer == nil {
 				s.errorLocked(ex.x.SessionID)
 			}
 		}
@@ -1148,8 +1148,10 @@ func (s *Supervisor) finish(ex *exchange, sessionID string) bool {
 	}
 	if !spoken && said && ex.answer != nil && ex.ctx.Err() == nil {
 		// The engine or Output cut a held answer after Say queued its first
-		// frame. Apply R11's replay rule exactly as a stop does.
+		// frame. Apply R11's replay rule exactly as a stop does, then begin
+		// the error sound on the new chime input the cut just opened.
 		s.endLocked(ex, true, "the voice did not finish")
+		s.errorLocked(sessionID)
 		return false
 	}
 	s.endLocked(ex, false, "done")

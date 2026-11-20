@@ -108,3 +108,42 @@ func TestAHeldAnswerCutByAnEngineFailureStaysForAnInvitation(t *testing.T) {
 		})
 	}
 }
+
+// TestAHeldAnswerEngineFailurePlaysTheWholeErrorSound fails if recovering a
+// held answer by cutting its voice also cancels the error sound that explained
+// the engine failure to the room. The held chime makes the old error-then-cut
+// order deterministic: it reaches the old InputChime and is cancelled before
+// it can write.
+func TestAHeldAnswerEngineFailurePlaysTheWholeErrorSound(t *testing.T) {
+	speaker := newRealtimeSpeaker()
+	speaker.holdChime = make(chan struct{})
+	c := &heldOnly{answers: make(chan voice.PendingAnswer, 1), spoken: make(chan string, 1)}
+	engine := &failingEngine{first: 100 * time.Millisecond}
+	v := tts.New(engine)
+	s := voice.NewSupervisor(&voice.SupervisorConfig{
+		Voice:       func() (voice.Voice, error) { return v, nil },
+		Concierge:   c,
+		Speaker:     speaker,
+		WakePhrases: []string{"Wispr"},
+		Session:     func() string { return "sess-1" },
+		Red:         func() bool { return true },
+		SilenceWait: 40 * time.Millisecond,
+		SoundGap:    10 * time.Millisecond,
+		Logf:        func(string, ...any) {},
+	})
+	t.Cleanup(s.Close)
+	c.answers <- voice.PendingAnswer{TaskID: "t1", SessionID: "sess-1", Text: "It ships tomorrow.", AskedAt: time.Now().Add(-time.Second)}
+	deadline := time.Now().Add(2 * time.Second)
+	for engine.calls.Load() < 1 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	time.Sleep(700 * time.Millisecond) // the engine failure and cut landed
+	close(speaker.holdChime)
+	want := int64(len(voice.ErrorChime()) / 2)
+	for speaker.chimeSamples.Load() < want && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if got := speaker.chimeSamples.Load(); got != want {
+		t.Fatalf("error sound wrote %d samples, want all %d", got, want)
+	}
+}
