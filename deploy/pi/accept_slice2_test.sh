@@ -95,7 +95,9 @@ run_row_source=$(awk '/^run_row\(\) \{$/ { found = 1 } found { print } found && 
 run_row_output=$(
   row_failures=0
   eval "$run_row_source"
+  # shellcheck disable=SC2329 # run_row, eval'd above, calls the row function it is given.
   needs_person() { return 2; }
+  # shellcheck disable=SC2329 # run_row, eval'd above, calls the row function it is given.
   fails() { return 1; }
   run_row Person-row needs_person 2>&1
   run_row Failing-row fails 2>&1

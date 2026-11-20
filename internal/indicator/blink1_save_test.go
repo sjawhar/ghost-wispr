@@ -6,23 +6,19 @@ import (
 	"os"
 	"sync"
 	"testing"
-	"time"
 
 	"golang.org/x/sys/unix"
 )
 
 // flashBlink1 is a blink(1) whose pattern lines are in RAM, which 'P' writes
 // and 'R' reads, and in flash, which 'W' saves RAM to and a power-up loads RAM
-// from. Every line starts lit, as a factory pattern is. atLastP runs once
-// inside the SET of the 'P' for line 31.
+// from. Every line starts lit, as a factory pattern is.
 type flashBlink1 struct {
-	mu      sync.Mutex
-	buffer  [8]byte
-	ram     [32][3]byte
-	flash   [32][3]byte
-	saves   int
-	atLastP func()
-	ran     bool
+	mu     sync.Mutex
+	buffer [8]byte
+	ram    [32][3]byte
+	flash  [32][3]byte
+	saves  int
 }
 
 func newFlashBlink1() *flashBlink1 {
@@ -35,12 +31,11 @@ func newFlashBlink1() *flashBlink1 {
 
 func (d *flashBlink1) ioctl(_ uintptr, request uintptr, report *[8]byte) error {
 	d.mu.Lock()
+	defer d.mu.Unlock()
 	if request == hidIOCGetFeature {
 		*report = d.buffer
-		d.mu.Unlock()
 		return nil
 	}
-	var hook func()
 	switch report[1] {
 	case 'v':
 		d.buffer = [8]byte{0x01, 'v', 0, '3', '3'}
@@ -51,19 +46,12 @@ func (d *flashBlink1) ioctl(_ uintptr, request uintptr, report *[8]byte) error {
 		line := report[7] % 32
 		d.ram[line] = [3]byte{report[2], report[3], report[4]}
 		d.buffer = *report
-		if line == 31 && d.atLastP != nil && !d.ran {
-			d.ran, hook = true, d.atLastP
-		}
 	case 'W':
 		d.flash = d.ram
 		d.saves++
 		d.buffer = *report
 	default:
 		d.buffer = *report
-	}
-	d.mu.Unlock()
-	if hook != nil {
-		hook()
 	}
 	return nil
 }
@@ -77,6 +65,12 @@ func (d *flashBlink1) ioctl(_ uintptr, request uintptr, report *[8]byte) error {
 // check and a tickle, and its watchdog would play that lit pattern (red team,
 // review 5958478401 of #79). Control: with no other open at the save, the
 // unit is saved black and known.
+//
+// The test runs the check one command at a time (PatternCheck), so another
+// open holds the lock for exactly the save's step: it takes the free lock just
+// before that step and lets it go just after. No goroutine races the check for
+// the lock, and no sleep has to outlast one wait and fit inside another, so
+// the test does not depend on how fast a loaded machine runs it.
 func TestASaveThatMissedTheUnitDoesNotMarkItKnownBlack(t *testing.T) {
 	for _, tc := range []struct {
 		name       string
@@ -96,63 +90,75 @@ func TestASaveThatMissedTheUnitDoesNotMarkItKnownBlack(t *testing.T) {
 			sysfsRoot, devRoot, node := fakeBlink1Sysfs(t)
 			setBlink1Serial(t, sysfsRoot, serial)
 			device := newFlashBlink1()
-			original, originalWait := featureIOCTL, exchangeWait
-			t.Cleanup(func() { featureIOCTL, exchangeWait = original, originalWait })
+			original := featureIOCTL
+			t.Cleanup(func() { featureIOCTL = original })
 			featureIOCTL = device.ioctl
-			exchangeWait = 200 * time.Millisecond
 
 			holder, err := os.Open(node)
 			if err != nil {
 				t.Fatal(err)
 			}
 			t.Cleanup(func() { _ = holder.Close() })
-			released := make(chan error, 1)
-			if tc.holdAtSave {
-				device.atLastP = func() {
-					go func() {
-						// Takes the lock as soon as the last 'P' lets go, and holds
-						// it 300 ms: past the save's 200 ms wait, inside the next read's.
-						if err := unix.Flock(int(holder.Fd()), unix.LOCK_EX); err != nil {
-							released <- err
-							return
-						}
-						time.Sleep(300 * time.Millisecond)
-						released <- unix.Flock(int(holder.Fd()), unix.LOCK_UN)
-					}()
-					time.Sleep(20 * time.Millisecond) // the other open waits for the lock before this 'P' lets go
-				}
-			}
-
 			light, err := OpenBlink1(sysfsRoot, devRoot)
 			if err != nil {
 				t.Fatal(err)
 			}
 			t.Cleanup(func() { _ = light.Close() })
-			checkErr := light.BlackPattern()
-			if tc.holdAtSave {
-				select {
-				case err := <-released:
-					if err != nil {
-						t.Fatalf("control: the other open's lock: %v", err)
-					}
-				case <-time.After(3 * time.Second):
-					t.Fatal("control: the other open never let go")
+
+			check, ok := NewPatternCheck(light).(*blink1PatternCheck)
+			if !ok {
+				t.Fatalf("the blink(1)'s pattern check is %T, want *blink1PatternCheck", NewPatternCheck(light))
+			}
+			step := func() (done bool) {
+				t.Helper()
+				done, err := check.Step()
+				if err != nil {
+					t.Fatalf("the check, whose read-back of RAM is black: %v, want it to pass for this handle", err)
+				}
+				return done
+			}
+			// The pattern is lit, so the check writes it black ('P' per line),
+			// up to the save.
+			for steps := 0; check.phase != checkSave; steps++ {
+				if steps == 100 {
+					t.Fatal("control: the check never reached its save")
+				}
+				if step() {
+					t.Fatal("control: the check ended before it wrote the black pattern")
 				}
 			}
+			if tc.holdAtSave {
+				// The lock is free between two commands: another open takes it.
+				if err := unix.Flock(int(holder.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
+					t.Fatalf("control: another open could not take the free lock: %v", err)
+				}
+			}
+			step() // the save ('W'); in the held case its wait for the lock runs out
+			if tc.holdAtSave {
+				if err := unix.Flock(int(holder.Fd()), unix.LOCK_UN); err != nil {
+					t.Fatal(err)
+				}
+			}
+			for steps := 0; ; steps++ {
+				if steps == 100 {
+					t.Fatal("control: the check never ended")
+				}
+				if step() {
+					break
+				}
+			}
+
 			device.mu.Lock()
 			saves, flashBlack := device.saves, device.flash == [32][3]byte{}
 			device.mu.Unlock()
 			if !tc.holdAtSave {
-				if checkErr != nil || saves != 1 || !flashBlack || !KnownBlack(light) {
-					t.Fatalf("control: the check with no other open = %v, saves %d, flash black %t, known %t; want it passed, saved and known", checkErr, saves, flashBlack, KnownBlack(light))
+				if saves != 1 || !flashBlack || !KnownBlack(light) {
+					t.Fatalf("control: the check with no other open saved %d times, flash black %t, known %t; want it saved once, black, and known", saves, flashBlack, KnownBlack(light))
 				}
 				return
 			}
 			if saves != 0 {
-				t.Fatalf("control: the save reached the blink(1) (%d saves): the other open did not take the lock before it", saves)
-			}
-			if checkErr != nil {
-				t.Fatalf("the check, whose read-back of RAM is black: %v, want it to pass for this handle", checkErr)
+				t.Fatalf("control: the save reached the blink(1) (%d saves) while another open held the lock", saves)
 			}
 			device.mu.Lock()
 			device.ram = device.flash // plugged in again: RAM is loaded from flash
