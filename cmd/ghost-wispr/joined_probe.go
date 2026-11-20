@@ -174,9 +174,24 @@ func (p *joinedProbe) run(ctx context.Context, invitationFile, floor string) err
 		return fmt.Errorf("a pointer that names no meeting or time range: %s", pointer.Text)
 	}
 	p.emit("pointer", map[string]any{"recording_session": span[1], "from": span[2], "to": span[3], "text": pointer.Text})
-	read, err := p.readTranscript(ctx, inv.api, span[1], span[2], span[3])
-	if err != nil {
-		return fmt.Errorf("read the transcript at the pointer: %w", err)
+	// A segment is stored a moment after the words that made it reach the
+	// voice, so the read is made again for a few seconds.
+	var read map[string]any
+	deadline := time.Now().Add(15 * time.Second)
+	for {
+		read, err = p.readTranscript(ctx, inv.api, span[1], span[2], span[3])
+		if err == nil {
+			if count, ok := read["segments_in_range"].(int); ok && count > 0 {
+				break
+			}
+		}
+		if !time.Now().Before(deadline) {
+			if err != nil {
+				return fmt.Errorf("read the transcript at the pointer: %w", err)
+			}
+			break
+		}
+		time.Sleep(500 * time.Millisecond)
 	}
 	p.emit("transcript_read", read)
 
