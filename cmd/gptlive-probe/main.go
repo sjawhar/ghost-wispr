@@ -31,6 +31,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"net/http"
 	"os"
 	"os/signal"
 	"strings"
@@ -73,10 +74,12 @@ const inputFrame = 250 * time.Millisecond
 // much later, through the room's microphone and Deepgram.
 const wordLate = 300 * time.Millisecond
 
-// probeConfig is what one probe run needs.
 type probeConfig struct {
-	TokenURL           string // empty means gptlive.TokenEndpoint
-	LiveURL            string // empty means gptlive.DefaultURL
+	TokenURL string // empty means gptlive.TokenEndpoint
+	LiveURL  string // empty means gptlive.DefaultURL
+	// StatusURL is the local unit status endpoint. It is checked before
+	// tokens and again before the probe feeds any audio.
+	StatusURL          string
 	IdentityProviderID string
 	ServiceAccountID   string
 	// Subject mints the unit's Google ID token for an audience.
@@ -96,6 +99,11 @@ type probeConfig struct {
 	// question; 0 means delegateWait.
 	DelegateWait time.Duration
 }
+
+// defaultStatusURL is the unit's local status endpoint. The probe refuses to
+// run against a recording or active session, rather than ask a live vendor
+// to hear synthetic audio alongside a person.
+const defaultStatusURL = "http://localhost:8080/api/status"
 
 // delegateWait is how long the probe waits, after its question ends, for
 // GPT-Live to delegate it and for the answer to start playing.
@@ -122,8 +130,8 @@ func run() int {
 	wav := flag.String("wav", "", "write GPT-Live's speech to this WAV file")
 	turns := flag.Int("turns", probeTurns, "text turns to send; each speech's lead is measured")
 	ask := flag.String("ask", "", "a spoken question, a 16 kHz mono 16-bit WAV, for GPT-Live to delegate to the probe's backend")
+	statusURL := flag.String("status-url", defaultStatusURL, "the office unit's local /api/status endpoint; it must say paused and no active session")
 	timeout := flag.Duration("timeout", 3*time.Minute, "give up after this long")
-	flag.Parse()
 	clientCertificatesOff()
 	if *provider == "" || *account == "" {
 		printf(os.Stderr, "gptlive-probe needs --identity-provider-id and --service-account-id\n")
@@ -143,6 +151,7 @@ func run() int {
 		}
 	}
 	err := probe(ctx, &probeConfig{
+		StatusURL:          *statusURL,
 		IdentityProviderID: *provider,
 		ServiceAccountID:   *account,
 		Subject: func(ctx context.Context, audience string) (string, error) {
@@ -173,6 +182,42 @@ func clientCertificatesOff() {
 	}
 }
 
+// unitStatus is the local status values the safety guard needs. It keeps no
+// room words.
+type unitStatus struct {
+	Paused          bool   `json:"paused"`
+	ActiveSessionID string `json:"active_session_id"`
+}
+
+// checkSafeUnit refuses the probe unless no person session is active and the
+// unit is paused. It runs before any token or socket call, then again before
+// the feeder is released to send its first audio frame.
+func checkSafeUnit(ctx context.Context, url, when string) error {
+	if url == "" {
+		url = defaultStatusURL
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return fmt.Errorf("probe safety guard %s: status request: %w", when, err)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("probe safety guard %s: read status: %w", when, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("probe safety guard %s: status HTTP %d", when, resp.StatusCode)
+	}
+	var status unitStatus
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&status); err != nil {
+		return fmt.Errorf("probe safety guard %s: decode status: %w", when, err)
+	}
+	if !status.Paused || status.ActiveSessionID != "" {
+		return fmt.Errorf("probe safety guard %s: the unit is not paused and idle (paused=%t, active_session_id_empty=%t); refusing to send audio", when, status.Paused, status.ActiveSessionID == "")
+	}
+	return nil
+}
+
 // printf writes one report line; a report that cannot be written changes
 // nothing the probe does.
 func printf(out io.Writer, format string, args ...any) {
@@ -181,6 +226,9 @@ func printf(out io.Writer, format string, args ...any) {
 
 // probe runs one check and writes its report to out.
 func probe(ctx context.Context, cfg *probeConfig, out io.Writer) error {
+	if err := checkSafeUnit(ctx, cfg.StatusURL, "at start"); err != nil {
+		return err
+	}
 	if err := control(ctx, cfg); err != nil {
 		return err
 	}
@@ -205,13 +253,9 @@ func probe(ctx context.Context, cfg *probeConfig, out io.Writer) error {
 	if err != nil {
 		return err
 	}
-	// The lead-in waits in the tap and goes at once when the session
-	// starts, as the wake replay does; then silence follows in real time,
-	// and the question, if any, in its place when the probe asks it.
+	// The feeder waits. The second safety check below must pass before the
+	// lead-in is released, so Open cannot flush room-like frames before it.
 	tap := make(chan audio.Frame, leadIn+4)
-	for range leadIn {
-		tap <- audio.Frame{PCM: make([]int16, 4000), Rate: 16000, Channels: 1}
-	}
 	in := newFeeder()
 	go in.run(ctx, tap)
 	rec := &recording{}
@@ -223,6 +267,10 @@ func probe(ctx context.Context, cfg *probeConfig, out io.Writer) error {
 	}
 	defer func() { _ = s.Close() }()
 	printf(out, "session: started (%v)\n", time.Since(begin).Round(time.Millisecond))
+	if err := checkSafeUnit(ctx, cfg.StatusURL, "before audio"); err != nil {
+		return err
+	}
+	in.start <- make([]int16, leadIn*4000)
 	seen := watch(s.Events())
 
 	settle := cfg.Settle
@@ -428,19 +476,38 @@ func (e *events) factErrors() int {
 	return e.factErrs
 }
 
-// feeder feeds the session's tap 250 ms of audio every 250 ms, as the room's
-// microphone would: silence, or the question it was given. GPT-Live's
-// session runs on its input audio.
+// feeder waits for the safety guard before it feeds the tap. It sends the
+// lead-in at once, then 250 ms of silence or the question every 250 ms.
 type feeder struct {
+	start chan []int16 // lead-in, released after the second safety check
 	ask   chan []int16
 	ended chan time.Time // when the last of a question was sent
 }
 
 func newFeeder() *feeder {
-	return &feeder{ask: make(chan []int16, 1), ended: make(chan time.Time, 1)}
+	return &feeder{
+		start: make(chan []int16, 1),
+		ask:   make(chan []int16, 1),
+		ended: make(chan time.Time, 1),
+	}
 }
 
 func (f *feeder) run(ctx context.Context, tap chan<- audio.Frame) {
+	var lead []int16
+	select {
+	case <-ctx.Done():
+		return
+	case lead = <-f.start:
+	}
+	for len(lead) > 0 {
+		n := min(4000, len(lead))
+		select {
+		case tap <- audio.Frame{PCM: lead[:n], Rate: 16000, Channels: 1}:
+			lead = lead[n:]
+		case <-ctx.Done():
+			return
+		}
+	}
 	tick := time.NewTicker(inputFrame)
 	defer tick.Stop()
 	var question []int16
@@ -466,7 +533,8 @@ func (f *feeder) run(ctx context.Context, tap chan<- audio.Frame) {
 		}
 		select {
 		case tap <- audio.Frame{PCM: pcm, Rate: 16000, Channels: 1}:
-		default:
+		case <-ctx.Done():
+			return
 		}
 	}
 }

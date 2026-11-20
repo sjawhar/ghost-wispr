@@ -40,6 +40,8 @@ type standIns struct {
 	bearer      chan string
 	said        chan string
 	start       chan map[string]any
+	conns       chan struct{}
+	tokenCalls  atomic.Int32
 	heardAudio  atomic.Bool // the session sent input audio before its text turn
 	// leadIn counts the input samples received within 300 ms of
 	// session.started: the replayed lead-in.
@@ -47,6 +49,8 @@ type standIns struct {
 	inSamples atomic.Int64
 	lastInAt  atomic.Int64
 	startedAt atomic.Int64
+	// onStarted runs immediately after session.started is sent.
+	onStarted func()
 	// acceptAny makes the token endpoint take any subject token, so the
 	// wrong-audience control is not refused.
 	acceptAny bool
@@ -90,8 +94,15 @@ func (s *standIns) inputMs() int64 {
 
 func newStandIns(t *testing.T) *standIns {
 	t.Helper()
-	s := &standIns{bearer: make(chan string, 1), said: make(chan string, 8), start: make(chan map[string]any, 1), answered: make(chan string, 4)}
+	s := &standIns{
+		bearer:   make(chan string, 1),
+		said:     make(chan string, 8),
+		start:    make(chan map[string]any, 1),
+		conns:    make(chan struct{}, 2),
+		answered: make(chan string, 4),
+	}
 	s.token = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		s.tokenCalls.Add(1)
 		var req map[string]string
 		_ = json.NewDecoder(r.Body).Decode(&req)
 		switch {
@@ -111,6 +122,7 @@ func newStandIns(t *testing.T) *standIns {
 	upgrader := websocket.Upgrader{}
 	s.live = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		s.bearer <- r.Header.Get("Authorization")
+		s.conns <- struct{}{}
 		ws, err := upgrader.Upgrade(w, r, nil)
 		if err != nil {
 			return
@@ -139,6 +151,9 @@ func newStandIns(t *testing.T) *standIns {
 				s.start <- ev.Session
 				s.startedAt.Store(time.Now().UnixMilli())
 				send(map[string]any{"type": "session.started", "event_id": "e1", "session": map[string]any{"id": "sess_probe"}})
+				if s.onStarted != nil {
+					s.onStarted()
+				}
 			case "session.input_audio.append":
 				s.heardAudio.Store(true)
 				if b, err := base64.StdEncoding.DecodeString(ev.Audio); err == nil {
@@ -228,9 +243,11 @@ func speechDelta(d time.Duration) map[string]any {
 }
 
 func (s *standIns) config(t *testing.T) probeConfig {
+	status := newStatusServer(t, true, "")
 	return probeConfig{
 		TokenURL:           s.token.URL,
 		LiveURL:            "ws" + strings.TrimPrefix(s.live.URL, "http"),
+		StatusURL:          status.server.URL,
 		IdentityProviderID: "idp_probe",
 		ServiceAccountID:   "user-probe",
 		Subject: func(_ context.Context, audience string) (string, error) {
