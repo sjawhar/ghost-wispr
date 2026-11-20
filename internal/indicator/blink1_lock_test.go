@@ -272,13 +272,17 @@ func TestAReadDoesNotReturnAnotherProcesssRed(t *testing.T) {
 		if err := device.ioctl(fd, request, report); err != nil {
 			return err
 		}
-		// The other process's turn, right after this read's SET_FEATURE. A
-		// lock held across SET and GET makes it wait; give its two commands
-		// 300 ms to land, then turn the light off without a command.
+		if report[1] != 'r' {
+			return nil // the read's 'l' 0, which selects LED 1 first
+		}
+		// The other process's turn, right after this read's 'r' SET_FEATURE.
+		// A lock held across SET and GET makes it wait; give its three
+		// commands ('n', then its read's 'l' and 'r') 300 ms to land, then
+		// turn the light off without a command.
 		if _, err := io.WriteString(start, "go\n"); err != nil {
 			return err
 		}
-		for deadline := time.Now().Add(300 * time.Millisecond); device.read(t)[11]-setsBefore < 3 && time.Now().Before(deadline); {
+		for deadline := time.Now().Add(300 * time.Millisecond); device.read(t)[11]-setsBefore < 5 && time.Now().Before(deadline); {
 			time.Sleep(time.Millisecond)
 		}
 		device.setColour(t, [3]byte{})
@@ -290,8 +294,8 @@ func TestAReadDoesNotReturnAnotherProcesssRed(t *testing.T) {
 	if err := <-done; err != nil {
 		t.Fatalf("the other process: %v: %s", err, stderr)
 	}
-	if sets := device.read(t)[11] - setsBefore; sets != 3 {
-		t.Fatalf("SET_FEATUREs during the test = %d, want 3: the read's and the other process's two", sets)
+	if sets := device.read(t)[11] - setsBefore; sets != 5 {
+		t.Fatalf("SET_FEATUREs during the test = %d, want 5: the read's two and the other process's three", sets)
 	}
 	if err != nil {
 		t.Fatalf("ReadRGB: %v", err)
@@ -330,9 +334,7 @@ func TestAReadTakesOnlyTheReplyToItsOwnCommand(t *testing.T) {
 	device.mu.Unlock()
 
 	r, g, b, err := reader.ReadRGB()
-	device.mu.Lock()
-	led := device.colour
-	device.mu.Unlock()
+	led := device.led(0)
 	if led != [3]byte{} {
 		t.Fatalf("control: the LED is %v, want off", led)
 	}
@@ -567,6 +569,7 @@ func TestEveryBlink1CommandHoldsTheLock(t *testing.T) {
 				} else {
 					report[6] = 10
 				}
+				report[7] = 0 // the line's LED: every LED
 			}
 		} else {
 			if pending != 0 {

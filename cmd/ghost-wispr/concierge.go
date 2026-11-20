@@ -422,11 +422,19 @@ func (l *lazyConcierge) Spoken(ctx context.Context, taskID string) error {
 	return nil
 }
 
-func (l *lazyConcierge) NeverMind(ctx context.Context, sessionID string) error {
+// QuestionsAsked is the started Concierge's count, 0 before it started.
+func (l *lazyConcierge) QuestionsAsked() uint64 {
 	if c := l.started(); c != nil {
-		return c.NeverMind(ctx, sessionID)
+		return c.QuestionsAsked()
 	}
-	return nil
+	return 0
+}
+
+func (l *lazyConcierge) NeverMind(ctx context.Context, sessionID string, asked uint64) (bool, error) {
+	if c := l.started(); c != nil {
+		return c.NeverMind(ctx, sessionID, asked)
+	}
+	return false, nil
 }
 
 // unreachableTools answers every tool of a Concierge that did not start, as

@@ -14,13 +14,18 @@ import (
 
 // flashBlink1 is a blink(1) whose pattern lines are in RAM, which 'P' writes
 // and 'R' reads, and in flash, which 'W' saves RAM to and a power-up loads RAM
-// from. Every line starts lit, as a factory pattern is.
+// from. Every line starts lit, as a factory pattern is. Each line also keeps
+// the LED it plays on: the LED number 'l' last set when 'P' wrote it (0, every
+// LED), which 'R' answers in byte 7, as both firmwares do.
 type flashBlink1 struct {
-	mu     sync.Mutex
-	buffer [8]byte
-	ram    [32][3]byte
-	flash  [32][3]byte
-	saves  int
+	mu       sync.Mutex
+	buffer   [8]byte
+	ram      [32][3]byte
+	flash    [32][3]byte
+	ledn     byte
+	ramLED   [32]byte
+	flashLED [32]byte
+	saves    int
 	// saveErr, when set, fails each save's transfer: the save reaches no
 	// flash.
 	saveErr error
@@ -54,19 +59,24 @@ func (d *flashBlink1) ioctl(_ uintptr, request uintptr, report *[8]byte) error {
 	case 'v':
 		d.buffer = [8]byte{0x01, 'v', 0, '3', '3'}
 	case 'R':
-		c := d.ram[report[7]%32]
-		d.buffer = [8]byte{0x01, 'R', c[0], c[1], c[2], 0, 10, report[7]}
+		line := report[7] % 32
+		c := d.ram[line]
+		d.buffer = [8]byte{0x01, 'R', c[0], c[1], c[2], 0, 10, d.ramLED[line]}
+	case 'l':
+		d.ledn = report[2]
+		d.buffer = *report
 	case 'P':
 		if !d.dropWrites {
 			line := report[7] % 32
 			d.ram[line] = [3]byte{report[2], report[3], report[4]}
+			d.ramLED[line] = d.ledn
 		}
 		d.buffer = *report
 	case 'W':
 		if d.saveErr != nil {
 			return d.saveErr
 		}
-		d.flash = d.ram
+		d.flash, d.flashLED = d.ram, d.ramLED
 		d.saves++
 		d.buffer = *report
 	default:

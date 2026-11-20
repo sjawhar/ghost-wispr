@@ -77,7 +77,7 @@ func patternCheckProcess() int {
 			d.Buffer = [8]byte{0x01, 'v', 0, '3', '3'}
 		case 'R':
 			c := d.RAM[report[7]%32]
-			d.Buffer = [8]byte{0x01, 'R', c[0], c[1], c[2], 0, 10, report[7]}
+			d.Buffer = [8]byte{0x01, 'R', c[0], c[1], c[2], 0, 10, 0} // every line plays on every LED: Ghost Wispr writes them after 'l' 0
 		case 'P':
 			d.RAM[report[7]%32] = [3]byte{report[2], report[3], report[4]}
 			d.Buffer = *report

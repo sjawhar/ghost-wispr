@@ -151,11 +151,12 @@ func (s *sayingSession) Close() error {
 // quietConcierge answers nothing: the tests here ask it nothing.
 type quietConcierge struct{}
 
-func (quietConcierge) Tools(*voice.Exchange) voice.ToolRunner         { return nil }
-func (quietConcierge) Heard(context.Context, *voice.Exchange, string) {}
-func (quietConcierge) Answers() <-chan voice.PendingAnswer            { return nil }
-func (quietConcierge) Spoken(context.Context, string) error           { return nil }
-func (quietConcierge) NeverMind(context.Context, string) error        { return nil }
+func (quietConcierge) Tools(*voice.Exchange) voice.ToolRunner          { return nil }
+func (quietConcierge) Heard(context.Context, *voice.Exchange, string)  {}
+func (quietConcierge) Answers() <-chan voice.PendingAnswer             { return nil }
+func (quietConcierge) Spoken(context.Context, string) error            { return nil }
+func (quietConcierge) NeverMind(context.Context, string, uint64) error { return nil }
+func (quietConcierge) QuestionsAsked() uint64                          { return 0 }
 func (quietConcierge) Answer(context.Context, *voice.Exchange, string, voice.SayFunc) error {
 	return nil
 }

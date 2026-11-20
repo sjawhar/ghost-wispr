@@ -469,6 +469,12 @@ type fakeConcierge struct {
 	// answerErr is what each Answer returns once its lines are said.
 	answerErr  error
 	neverMinds []string
+	// working is how many working questions NeverMind has to cancel.
+	working int
+	// neverMindErr is what each NeverMind fails with; neverMindHold, when
+	// set, makes each NeverMind wait for a value on it before it answers.
+	neverMindErr  error
+	neverMindHold chan struct{}
 	// acks are said in Ack mode before the lines, which wait for afterAcks
 	// when it is set.
 	acks      []string
@@ -554,11 +560,30 @@ func (c *fakeConcierge) Spoken(ctx context.Context, taskID string) error {
 	return nil
 }
 
-func (c *fakeConcierge) NeverMind(ctx context.Context, sessionID string) error {
+func (c *fakeConcierge) QuestionsAsked() uint64 { return 0 }
+
+func (c *fakeConcierge) NeverMind(ctx context.Context, sessionID string, _ uint64) (bool, error) {
+	c.mu.Lock()
+	c.neverMinds = append(c.neverMinds, sessionID)
+	hold := c.neverMindHold
+	c.mu.Unlock()
+	if hold != nil {
+		select {
+		case <-hold:
+		case <-ctx.Done():
+			return false, ctx.Err()
+		}
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.neverMinds = append(c.neverMinds, sessionID)
-	return nil
+	if c.neverMindErr != nil {
+		return false, c.neverMindErr
+	}
+	if c.working == 0 {
+		return false, nil
+	}
+	c.working--
+	return true, nil
 }
 
 func (c *fakeConcierge) neverMindCalls() []string {

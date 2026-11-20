@@ -66,7 +66,7 @@ func TestATickleReachesAKnownBlackLightOpenedWhileHeld(t *testing.T) {
 					case 'v':
 						report[3] = '3'
 					case 'R':
-						report[6] = 10 // a black line with a duration
+						report[6], report[7] = 10, 0 // a black line with a duration, on every LED
 					}
 					return nil
 				}

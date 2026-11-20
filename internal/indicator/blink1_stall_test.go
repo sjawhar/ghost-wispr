@@ -68,7 +68,7 @@ func TestAStoppedHolderDoesNotStarveTheWatchdogTickle(t *testing.T) {
 			case 'r':
 				report[2], report[3], report[4] = colour[0], colour[1], colour[2]
 			case 'R':
-				report[6] = 10 // a black line with a duration: the stored pattern is black
+				report[6], report[7] = 10, 0 // a black line with a duration, on every LED: the stored pattern is black
 			}
 			return nil
 		}

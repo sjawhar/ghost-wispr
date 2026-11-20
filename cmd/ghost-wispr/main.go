@@ -2096,6 +2096,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 			projects:    dispatchProjects.Get,
 			segment:     joinedLink.OnSegment,
 			handDone:    joinedLink.HandDone,
+			waiting:     waitingLED{hardware},
 		}); err != nil {
 			slog.Warn("the meeting voice is off", "error", err)
 			warningRegistry.Set("voice", "The meeting voice is off: "+err.Error())
