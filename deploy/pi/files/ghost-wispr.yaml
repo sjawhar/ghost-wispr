@@ -46,10 +46,10 @@ power_button: true
 # Pi's .env can override this line with GHOST_WISPR_JABRA_MUTE_BUTTON; a full provisioner run
 # rewrites .env without it.
 jabra_mute_button: true
+# Envoy events go to the Envoy hub's listener over the tailnet, with no credential (README "Envoy
+# events"). The hub is the NATS server pi.env's PI_NATS_SERVER names; its listener answers on 9020.
 envoy_enabled: true
-envoy_webhook_url: __ENVOY_WEBHOOK_URL__
-# The Secret Manager version of Envoy's webhook signing key; Ghost Wispr has no default for it.
-envoy_webhook_secret_name: projects/theorem-agent-infra/secrets/envoy-ghostwispr-signing-secret/versions/latest
+envoy_hub_url: http://envoy-hub.tail12ec1c.ts.net:9020
 # The meeting voice (README "Meeting voice"): "Wispr, …" at the start of a sentence asks about the
 # work in Dispatch. Voice A speaks with the Pi's own Gemini TTS voice, streamed from Vertex AI's us
 # multi-region, which is faster to first audio than global.

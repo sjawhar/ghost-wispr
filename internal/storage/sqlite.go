@@ -1995,8 +1995,8 @@ func (s *SQLiteStore) UpdateEnvoyPublishStatusAtVersion(sessionID string, summar
 	return rows > 0, nil
 }
 
-// EnvoyLifecycleEvent is one session event awaiting a successful webhook
-// response. Its delivery ID is reconstructed from the immutable type and ID.
+// EnvoyLifecycleEvent is one session event awaiting a publish the Envoy hub
+// took. Its idempotency key is rebuilt from the immutable type and ID.
 type EnvoyLifecycleEvent struct {
 	Type      string
 	SessionID string

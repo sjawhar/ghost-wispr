@@ -1140,7 +1140,7 @@ func main() {
 
 	server.SetVersionInfo(server.VersionInfo{Version: Version, Commit: Commit, BuildTime: BuildTime})
 	drive := &driveSync{}
-	envoyEvents := &envoyPublishing{store: store, manager: manager, warnings: warningRegistry, openSecrets: openSecretManager}
+	envoyEvents := &envoyPublishing{store: store, manager: manager, warnings: warningRegistry}
 	publishSummaryReady := envoyEvents.publishSummaryReady
 	submitSummaryBatch := func(ctx context.Context, sessionIDs []string) (string, int, error) {
 		if summarizer == nil {

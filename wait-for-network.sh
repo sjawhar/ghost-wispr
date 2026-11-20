@@ -5,8 +5,8 @@
 # On a reboot the systemd user service can start before the network is ready.
 # Deepgram attempts its connection only once at startup, so a boot-time race
 # permanently disables live transcription until a manual restart. The Envoy
-# webhook client opens no connection at startup and retries failed posts, so a
-# relay outage must not delay recording.
+# client opens no connection at startup and sends a pending event again on the
+# next sweep, so an Envoy hub outage must not delay recording.
 set -u
 
 readonly TIMEOUT_SECONDS="${GHOST_WISPR_NETWAIT_TIMEOUT:-60}"

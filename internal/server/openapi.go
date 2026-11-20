@@ -62,23 +62,26 @@ var configSchema = map[string]any{
 	},
 }
 
-// envoyPayloadSchema is the payload of every event sent to Envoy: no text of
-// the session, only which session it is, when it ran, and where to read it.
+// envoyPayloadSchema is the payload of every event sent to Envoy, the JSON
+// object of strings Envoy's Ghost Wispr normalizer writes: no text of the
+// session, only which session it is, when it ran, and where to read it.
 var envoyPayloadSchema = map[string]any{
 	"type":                 "object",
 	"additionalProperties": false,
-	"required":             []string{"session_id", "type", "started_at", "duration"},
+	"required":             []string{"event_type", "session_id", "started_at", "duration", "created_at"},
 	"properties": map[string]any{
+		"event_type":       map[string]any{"type": "string", "enum": []string{"session_started", "session_ended", "summary_ready"}},
 		"session_id":       map[string]any{"type": "string"},
-		"type":             map[string]any{"type": "string", "enum": []string{"session_started", "session_ended", "summary_ready"}},
 		"started_at":       map[string]any{"type": "string", "format": "date-time"},
 		"ended_at":         map[string]any{"type": "string", "format": "date-time", "description": "Absent until the session ends"},
-		"duration":         map[string]any{"type": "integer", "description": "Seconds from start to end; 0 until the session ends"},
+		"duration":         map[string]any{"type": "string", "description": "Whole seconds from start to end; 0 until the session ends"},
+		"created_at":       map[string]any{"type": "string", "format": "date-time", "description": "When the event was sent"},
 		"drive_folder_url": map[string]any{"type": "string", "format": "uri", "description": "The session's Google Drive folder; absent until the session has one"},
 		"session_url":      map[string]any{"type": "string", "format": "uri", "description": "GET it for the session's current title, summary and transcript (public_url + /api/sessions/{id}); absent when public_url is not set"},
 		"summary_preset":   map[string]any{"type": "string", "description": "summary_ready only"},
 		"summary_model":    map[string]any{"type": "string", "description": "summary_ready only"},
-		"version":          map[string]any{"type": "integer", "description": "summary_ready only: the summary version this event announces"},
+		"version":          map[string]any{"type": "string", "description": "summary_ready only: the summary version this event announces"},
+		"payload_type":     map[string]any{"type": "string", "description": "summary_ready only: summary_ready"},
 	},
 }
 
@@ -1161,31 +1164,28 @@ func OpenAPISpec() map[string]any {
 		"webhooks": map[string]any{
 			"envoyEvent": map[string]any{
 				"post": map[string]any{
-					"summary":     "Session event sent to Envoy's Ghost Wispr webhook",
-					"description": "With envoy_enabled, Ghost Wispr posts session_started, session_ended and summary_ready to envoy_webhook_url, signed with Envoy's webhook signing key, which it reads from Secret Manager (envoy_webhook_secret_name) and reads again once on a 401. No event carries a session's title, summary or transcript: Envoy keeps every event for 72 hours and no deletion can recall it. An event says which session it is, when it ran, and where to read its current text: session_url on this unit, and the session's Drive folder.",
-					"parameters": []map[string]any{
-						{"name": "X-GhostWispr-Event", "in": "header", "required": true, "description": "session.started, session.ended or summary.ready", "schema": map[string]any{"type": "string"}},
-						{"name": "X-GhostWispr-Delivery", "in": "header", "required": true, "description": "Stable delivery id: <session>.<event>, and .<version> for summary_ready; a retry repeats it", "schema": map[string]any{"type": "string"}},
-						{"name": "X-GhostWispr-Signature", "in": "header", "required": true, "description": "sha256=<hex HMAC-SHA256 of the body>", "schema": map[string]any{"type": "string"}},
-					},
+					"summary":     "Session event published to the Envoy hub",
+					"description": "With envoy_enabled, Ghost Wispr publishes session_started, session_ended and summary_ready to the Envoy hub's listener at envoy_hub_url, POST /v1/messages/publish, over the tailnet with no credential. Envoy stores each under notifications.ghostwispr.<session>.{session.started,session.ended,summary.ready}. No event carries a session's title, summary or transcript: Envoy keeps every event for 72 hours and no deletion can recall it. An event says which session it is, when it ran, and where to read its current text: session_url on this unit, and the session's Drive folder. Every send of one event carries the same idempotency_key, so Envoy stores and delivers a resend once.",
 					"requestBody": map[string]any{
 						"required": true,
 						"content": map[string]any{
 							"application/json": map[string]any{
 								"schema": map[string]any{
 									"type":     "object",
-									"required": []string{"event_type", "created_at", "payload"},
+									"required": []string{"source", "topic", "message", "payload", "idempotency_key"},
 									"properties": map[string]any{
-										"event_type": map[string]any{"type": "string", "enum": []string{"session_started", "session_ended", "summary_ready"}},
-										"created_at": map[string]any{"type": "string", "format": "date-time"},
-										"payload":    envoyPayloadSchema,
+										"source":          map[string]any{"type": "string", "enum": []string{"ghostwispr"}},
+										"topic":           map[string]any{"type": "string", "description": "notifications.ghostwispr.<session>.<event>, the session id's . * > / and whitespace written as _"},
+										"message":         map[string]any{"type": "string", "description": "ghostwispr <event> for session <session>; Envoy's payload_summary"},
+										"payload":         map[string]any{"type": "string", "contentMediaType": "application/json", "contentSchema": envoyPayloadSchema},
+										"idempotency_key": map[string]any{"type": "string", "format": "uuid", "description": "The name-based UUID of the event's delivery id: <session>.<event>, and .<version> for summary_ready"},
 									},
 								},
 							},
 						},
 					},
 					"responses": map[string]any{
-						"200": map[string]any{"description": "Envoy accepted the event"},
+						"200": map[string]any{"description": "Envoy stored the event, or already held it"},
 					},
 				},
 			},

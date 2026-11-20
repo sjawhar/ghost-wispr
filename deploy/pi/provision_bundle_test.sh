@@ -3,13 +3,11 @@
 # provisioning call, read from the runbook between its provision_bundle_test.sh markers, against
 # fakes that answer only the sources the devbox identity can read: the device certificate's Secret
 # Manager secret, the service account's unique ID in the infrastructure repository's root stack
-# configuration on its main, the Tailscale client ID the seed workflow's root job printed when it
-# created the identity, and the URL of the relay's Cloud Run service. Pulumi answers 403, as the
-# infrastructure stacks' state buckets do for that identity. Provisioning reads no Envoy signing
-# key: the recorder reads it from Secret Manager itself. The slice 1 acceptance block reads it, for
-# its signed probe, only under a one-hour GCLOUD_SAMI broker grant (or a broker key), never to a
-# plain gcloud read. The runbook and the scripts read the neutral deployment settings in
-# deploy/pi/test-pi.env, not the office Pi's.
+# configuration on its main, and the Tailscale client ID the seed workflow's root job printed when
+# it created the identity. Pulumi answers 403, as the infrastructure stacks' state buckets do for
+# that identity. Nothing reads an Envoy credential: the recorder publishes to the Envoy hub with
+# none. The runbook and the scripts read the neutral deployment settings in deploy/pi/test-pi.env,
+# not the office Pi's.
 set -euo pipefail
 
 repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -50,12 +48,11 @@ accept="$work_dir/accept.sh"
 block accept | sed 's#^deploy/pi/accept-slice1\.sh$#"$TEST_ACCEPT_DRIVER"#' >"$accept"
 grep -q TEST_ACCEPT_DRIVER "$accept" || fail "the slice 1 block does not end by running deploy/pi/accept-slice1.sh"
 
-readonly WEBHOOK_SECRET=webhook-signing-secret-value-0123456789abcdef
 readonly DEEPGRAM_SECRET=deepgram-secret-value-0123456789abcdef
 readonly CLIENT_ID=k-test-client-id
 readonly SUBJECT=123456789012345678901
 deepgram_key_name="DEEPGRAM""_API_KEY"
-export WEBHOOK_SECRET DEEPGRAM_SECRET CLIENT_ID SUBJECT deepgram_key_name
+export DEEPGRAM_SECRET CLIENT_ID SUBJECT deepgram_key_name
 
 mkdir -p "$work_dir/bin"
 # A real certificate, so the runbook's openssl check runs for real.
@@ -192,10 +189,6 @@ if [[ $1 == iam && $2 == workload-identity-pools && $3 == create-cred-config && 
   exit 0
 fi
 case "$*" in
-  'run services list --project=example-project --filter=metadata.name ~ ^example-relay- --format=value(status.url)')
-    # gcloud lists no service and exits 0 when the filter matches none.
-    [[ -n ${TEST_RELAY_MISSING:-} ]] || printf 'https://relay.example.test\n'
-    ;;
   'secrets versions access latest --secret=example-device-certificate --project=example-project')
     if [[ -n ${TEST_CERT_READ_FAIL:-} ]]; then
       printf 'fake gcloud: PERMISSION_DENIED reading example-device-certificate\n' >&2
@@ -203,63 +196,12 @@ case "$*" in
     fi
     cat "$TEST_CERTIFICATE"
     ;;
-  'secrets versions access latest --secret=example-signing-secret --project=example-project')
-    if [[ -n ${CLOUDSDK_AUTH_ACCESS_TOKEN_FILE:-} && $(<"$CLOUDSDK_AUTH_ACCESS_TOKEN_FILE") == broker-minted-token ]]; then
-      printf '%s' "$WEBHOOK_SECRET"
-    else
-      printf 'fake gcloud: PERMISSION_DENIED: only a broker-granted login reads example-signing-secret\n' >&2
-      exit 1
-    fi
-    ;;
   *)
     printf 'fake gcloud: refused "%s"\n' "$*" >&2
     exit 1
     ;;
 esac
 EOF
-
-# gcloud-broker as the dotfiles script runs it inside secret-run: the minted GCLOUD_SAMI token
-# reaches gcloud through a token file.
-cat >"$work_dir/bin/gcloud-broker" <<'EOF'
-#!/usr/bin/env bash
-set -euo pipefail
-printf 'gcloud-broker %s\n' "$*" >>"$TEST_ARGV_LOG"
-[[ ${GCLOUD_BROKER_INNER:-} == 1 && -n ${GCLOUD_SAMI:-} ]] || { printf 'fake gcloud-broker: no GCLOUD_SAMI grant\n' >&2; exit 1; }
-[[ $1 == -- ]] && shift
-dir=$(mktemp -d)
-trap 'rm -rf -- "$dir"' EXIT
-printf '%s' "$GCLOUD_SAMI" >"$dir/token"
-unset GCLOUD_SAMI GCLOUD_BROKER_INNER
-CLOUDSDK_AUTH_ACCESS_TOKEN_FILE="$dir/token" "$@"
-EOF
-
-# secret-run as the secrets broker serves it: only a registered one-hour grant releases a key.
-cat >"$work_dir/bin/secret-run" <<'EOF'
-#!/usr/bin/env bash
-set -euo pipefail
-printf 'secret-run %s\n' "$*" >>"$TEST_ARGV_LOG"
-register=false ttl=
-while [[ $1 == --* ]]; do
-  case $1 in
-    --register) register=true; shift ;;
-    --ttl) ttl=$2; shift 2 ;;
-    --reason | --wait) shift 2 ;;
-    *) printf 'fake secret-run: unknown option %s\n' "$1" >&2; exit 2 ;;
-  esac
-done
-[[ $register == true && $ttl == 1h ]] || { printf 'fake secret-run: wants --register --ttl 1h\n' >&2; exit 1; }
-[[ -z ${TEST_SECRET_READ_FAIL:-} ]] || { printf 'fake secret-run: the grant was denied\n' >&2; exit 1; }
-key=$1
-[[ $2 == -- ]] || exit 2
-shift 2
-printf '%s\n' "$key" >>"$TEST_GRANTS"
-case $key in
-  GCLOUD_SAMI) exec env GCLOUD_SAMI=broker-minted-token "$@" ;;
-  ENVOY_GHOSTWISPR_SIGNING_SECRET) exec env "$key=$WEBHOOK_SECRET" "$@" ;;
-  *) printf 'fake secret-run: no broker key %s\n' "$key" >&2; exit 1 ;;
-esac
-EOF
-
 cat >"$work_dir/bin/secrets" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -269,16 +211,13 @@ shift 2
 env "$deepgram_key_name=$DEEPGRAM_SECRET" "$@"
 EOF
 
-# ssh reaches the fake Pi, or runs a broker host's command here.
+# ssh reaches the fake Pi.
 cat >"$work_dir/bin/ssh" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 printf 'ssh %s\n' "$*" >>"$TEST_ARGV_LOG"
 [[ $1 == -n ]] && shift
 host=$1 command=$2
-if [[ $host == broker.example ]]; then
-  exec bash -c "$command"
-fi
 [[ $host == ghost-wispr@ghost-wispr.example-tailnet.ts.net ]] || { printf 'fake ssh: unknown host %s\n' "$host" >&2; exit 255; }
 case "$command" in
   *'mktemp -d'*) printf '%s\n' "$TEST_PI/sources.abc123" ; mkdir -p "$TEST_PI/sources.abc123" ;;
@@ -324,11 +263,10 @@ run_runbook() {
   git -C "$case_dir/home/src/example-infra" reset --quiet --hard HEAD~1
   git -C "$case_dir/home/src/example-infra" update-ref refs/remotes/origin/main HEAD
   mkdir -m 700 "$case_dir/run"
-  : >"$case_dir/grants"
   (
     cd "$repo_root"
     HOME="$case_dir/home" TMPDIR="$case_dir/tmp" XDG_RUNTIME_DIR="$case_dir/run" TEST_PI="$case_dir/pi" \
-      TEST_GRANTS="$case_dir/grants" PATH="$work_dir/bin:$PATH" bash -euo pipefail "$runbook"
+      PATH="$work_dir/bin:$PATH" bash -euo pipefail "$runbook"
   )
 }
 
@@ -337,7 +275,7 @@ run_runbook() {
 check_case() {
   local case_dir=$1
   local received="$case_dir/pi/bundle"
-  printf '%s\n' certificate_config.json deepgram-key device.crt envoy-webhook-url \
+  printf '%s\n' certificate_config.json deepgram-key device.crt \
     google-credentials.json tailscale-client-id tailscale-subject >"$case_dir/expected.list"
   cmp -s "$case_dir/expected.list" "$case_dir/pi/bundle.list" \
     || fail "$case_dir: the Pi received $(tr '\n' ' ' <"$case_dir/pi/bundle.list")"
@@ -346,21 +284,15 @@ check_case() {
     || fail "tailscale-client-id is not the client ID of the identity's newest creation: $(<"$received/tailscale-client-id")"
   [[ $(<"$received/tailscale-subject") == "$SUBJECT" ]] \
     || fail "tailscale-subject is not the unique ID on the infrastructure repository's origin/main: $(<"$received/tailscale-subject")"
-  [[ $(<"$received/envoy-webhook-url") == https://relay.example.test/webhook/ghostwispr ]] \
-    || fail "envoy-webhook-url is not the relay service's URL: $(<"$received/envoy-webhook-url")"
   [[ $(<"$received/deepgram-key") == "$DEEPGRAM_SECRET" ]] || fail "deepgram-key is wrong"
   jq -e '.credential_source.certificate.certificate_config_location == "/opt/ghost-wispr/certificate_config.json"' \
     "$received/google-credentials.json" >/dev/null || fail "google-credentials.json does not name the Pi's certificate config"
-  [[ ! -s "$case_dir/grants" ]] || fail "provisioning asked for broker grants: $(tr '\n' ' ' <"$case_dir/grants")"
-  if grep -rqF "$WEBHOOK_SECRET" "$received"; then
-    fail "the Envoy signing key reached the Pi in the bundle"
-  fi
   [[ $(wc -l <"$case_dir/pi/stage.during") == 1 && $(cut -d' ' -f1 "$case_dir/pi/stage.during") == 700 ]] \
     || fail "while provision.sh ran, the secrets were not in one mode-0700 directory under XDG_RUNTIME_DIR: $(<"$case_dir/pi/stage.during")"
   [[ -z $(find "$case_dir/run" -mindepth 1 -print -quit) ]] || fail "the bundle directory is left in XDG_RUNTIME_DIR"
   grep -q "rm -rf -- '$case_dir/pi/sources.abc123'" "$case_dir/pi/removed" || fail "the sources directory on the Pi was not removed"
-  if grep -rlF -e "$WEBHOOK_SECRET" -e "$DEEPGRAM_SECRET" "$case_dir/home" "$case_dir/tmp" "$case_dir/run" >/dev/null 2>&1; then
-    fail "a secret is left on disk: $(grep -rlF -e "$WEBHOOK_SECRET" -e "$DEEPGRAM_SECRET" "$case_dir/home" "$case_dir/tmp" "$case_dir/run")"
+  if grep -rlF -e "$DEEPGRAM_SECRET" "$case_dir/home" "$case_dir/tmp" "$case_dir/run" >/dev/null 2>&1; then
+    fail "a secret is left on disk: $(grep -rlF -e "$DEEPGRAM_SECRET" "$case_dir/home" "$case_dir/tmp" "$case_dir/run")"
   fi
 }
 
@@ -428,53 +360,22 @@ for case_name in TEST_JOB_RUNNING TEST_LOG_READ_FAIL TEST_CREATION_EXPIRED; do
   [[ ! -e $work_dir/$case_name/pi/bundle.list ]] || fail "with $case_name the runbook provisioned the Pi"
 done
 
-# Slice 1 acceptance: the secret reaches the driver's environment alone, read under a grant.
+# Slice 1 acceptance: the block runs the driver with no Envoy credential, which the hub needs none
+# of.
 cat >"$work_dir/accept-driver" <<'EOF'
 #!/usr/bin/env bash
-[[ -z ${TEST_ACCEPT_INVOKED:-} ]] || touch "$TEST_ACCEPT_INVOKED"
-[[ $GHOST_WISPR_RELAY_URL == https://relay.example.test/webhook/ghostwispr ]] || exit 3
-[[ $GHOST_WISPR_ENVOY_WEBHOOK_SECRET == "$WEBHOOK_SECRET" ]] || exit 4
+[[ -z ${GHOST_WISPR_ENVOY_WEBHOOK_SECRET:-} && -z ${GHOST_WISPR_RELAY_URL:-} ]] || exit 4
 touch "$TEST_ACCEPT_RAN"
 EOF
 chmod +x "$work_dir/accept-driver"
-for broker_host in "" broker.example; do
-  accept_dir="$work_dir/accept${broker_host:+-host}"
-  mkdir -p "$accept_dir/home"
-  : >"$accept_dir/grants"
-  (
-    cd "$repo_root"
-    HOME="$accept_dir/home" TEST_GRANTS="$accept_dir/grants" TEST_ACCEPT_DRIVER="$work_dir/accept-driver" \
-      TEST_ACCEPT_RAN="$accept_dir/ran" PATH="$work_dir/bin:$PATH" broker_host="$broker_host" broker_key="" \
-      bash -euo pipefail "$accept"
-  ) || fail "the slice 1 block failed${broker_host:+ with --broker-host}"
-  [[ -e $accept_dir/ran && $(<"$accept_dir/grants") == GCLOUD_SAMI ]] \
-    || fail "the slice 1 driver did not run with the secret read under a GCLOUD_SAMI grant"
-done
-
-# A person pastes the block into a shell without set -e: a failed secret read must run no
-# acceptance, which would otherwise sign nothing and report the signed probe as skipped.
-accept_dir="$work_dir/accept-failed-read"
+accept_dir="$work_dir/accept"
 mkdir -p "$accept_dir/home"
-: >"$accept_dir/grants"
 (
   cd "$repo_root"
-  HOME="$accept_dir/home" TEST_GRANTS="$accept_dir/grants" TEST_ACCEPT_DRIVER="$work_dir/accept-driver" \
-    TEST_ACCEPT_RAN="$accept_dir/ran" TEST_ACCEPT_INVOKED="$accept_dir/invoked" TEST_SECRET_READ_FAIL=1 \
-    PATH="$work_dir/bin:$PATH" broker_host="" broker_key="" bash "$accept"
-) >/dev/null 2>&1 || true
-[[ ! -e $accept_dir/invoked ]] || fail "slice 1 acceptance ran although the secret read failed"
-
-# The same with no relay service found: gcloud prints nothing and exits 0.
-accept_dir="$work_dir/accept-no-relay"
-mkdir -p "$accept_dir/home"
-: >"$accept_dir/grants"
-(
-  cd "$repo_root"
-  HOME="$accept_dir/home" TEST_GRANTS="$accept_dir/grants" TEST_ACCEPT_DRIVER="$work_dir/accept-driver" \
-    TEST_ACCEPT_RAN="$accept_dir/ran" TEST_ACCEPT_INVOKED="$accept_dir/invoked" TEST_RELAY_MISSING=1 \
-    PATH="$work_dir/bin:$PATH" broker_host="" broker_key="" bash "$accept"
-) >/dev/null 2>&1 || true
-[[ ! -e $accept_dir/invoked ]] || fail "slice 1 acceptance ran although no relay service was found"
+  HOME="$accept_dir/home" TEST_ACCEPT_DRIVER="$work_dir/accept-driver" TEST_ACCEPT_RAN="$accept_dir/ran" \
+    PATH="$work_dir/bin:$PATH" bash -euo pipefail "$accept"
+) || fail "the slice 1 block failed"
+[[ -e $accept_dir/ran ]] || fail "the slice 1 block did not run the driver"
 
 # Certificate renewal, pasted the same way: the Pi gets the certificate Secret Manager holds,
 # and nothing at all when the read fails.
@@ -497,7 +398,7 @@ TEST_CERT_READ_FAIL=1 run_renew "$work_dir/renew-failed"
 [[ -z $(find "$work_dir/renew/tmp" "$work_dir/renew-failed/tmp" -mindepth 1 -print -quit) ]] \
   || fail "renewal left its certificate file behind"
 
-if grep -F -e "$WEBHOOK_SECRET" -e "$DEEPGRAM_SECRET" "$TEST_ARGV_LOG" >/dev/null; then
+if grep -F -e "$DEEPGRAM_SECRET" "$TEST_ARGV_LOG" >/dev/null; then
   fail "a secret was passed as a command argument"
 fi
 if grep -E 'ghostWisprCertificates|tailscaleIds|service-accounts describe' "$TEST_ARGV_LOG" >/dev/null; then

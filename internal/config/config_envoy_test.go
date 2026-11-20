@@ -7,57 +7,22 @@ import (
 	"testing"
 )
 
+// TestDefaults_EnvoyConfig fails if Envoy is on, or names a hub, by default:
+// the repository is public, and each deployment names its own hub.
 func TestDefaults_EnvoyConfig(t *testing.T) {
 	cfg := defaults()
 	if cfg.EnvoyEnabled {
 		t.Fatal("expected envoy disabled by default")
 	}
-	if cfg.EnvoyWebhookURL != "" {
-		t.Fatalf("expected no default webhook URL, got %q", cfg.EnvoyWebhookURL)
-	}
-	// The repository is public: no deployment's Secret Manager version is a
-	// default. The office Pi's config names its own.
-	if cfg.EnvoyWebhookSecretName != "" {
-		t.Fatalf("default signing key secret = %q, want none", cfg.EnvoyWebhookSecretName)
+	if cfg.EnvoyHubURL != "" {
+		t.Fatalf("expected no default hub URL, got %q", cfg.EnvoyHubURL)
 	}
 }
 
-// TestEnvoySigningKeySecretIsNamedNotHeld fails if the configuration takes
-// the signing key itself: the recorder reads it from Secret Manager, and the
-// configuration only names the secret version.
-func TestEnvoySigningKeySecretIsNamedNotHeld(t *testing.T) {
-	clearEnv(t)
-	t.Setenv(EnvPrefix+"ENVOY_ENABLED", "true")
-	t.Setenv(EnvPrefix+"ENVOY_WEBHOOK_URL", "https://relay.example.test/webhook/ghostwispr")
-	t.Setenv(EnvPrefix+"ENVOY_WEBHOOK_SECRET_NAME", " projects/p/secrets/s/versions/2 ")
-	cfg, warnings, err := Load("")
-	if err != nil {
-		t.Fatalf("Load failed: %v", err)
-	}
-	if !cfg.EnvoyEnabled || cfg.EnvoyWebhookURL != "https://relay.example.test/webhook/ghostwispr" {
-		t.Fatalf("Envoy settings = (%t, %q), want the environment's", cfg.EnvoyEnabled, cfg.EnvoyWebhookURL)
-	}
-	if cfg.EnvoyWebhookSecretName != "projects/p/secrets/s/versions/2" {
-		t.Fatalf("signing key secret = %q, want the environment's", cfg.EnvoyWebhookSecretName)
-	}
-	if text := strings.Join(warnings, "\n"); strings.Contains(text, "Envoy") || strings.Contains(text, "ENVOY") {
-		t.Fatalf("warnings = %q, want no Envoy warning: no key needs to be configured", warnings)
-	}
-
-	clearEnv(t)
-	cfg, _, err = Load(writeConfig(t, "envoy_webhook_secret_name: \" \"\n"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if cfg.EnvoyWebhookSecretName != "" {
-		t.Fatalf("a blank envoy_webhook_secret_name loaded as %q, want none", cfg.EnvoyWebhookSecretName)
-	}
-}
-
-// TestEnvoyHubURLNeedsNoWebhookSecret fails if a recorder configured to
-// publish on the tailnet hub still requires the public webhook's URL or its
-// signing key secret.
-func TestEnvoyHubURLNeedsNoWebhookSecret(t *testing.T) {
+// TestEnvoyHubURLNeedsNoCredential fails if a recorder configured to publish
+// on the tailnet hub is warned about a missing credential: the hub's listener
+// takes a tailnet client's publish with none.
+func TestEnvoyHubURLNeedsNoCredential(t *testing.T) {
 	clearEnv(t)
 	t.Setenv(EnvPrefix+"ENVOY_ENABLED", "true")
 	t.Setenv(EnvPrefix+"ENVOY_HUB_URL", " http://hub.example.test:9020 ")
@@ -72,10 +37,89 @@ func TestEnvoyHubURLNeedsNoWebhookSecret(t *testing.T) {
 	if text := strings.Join(warnings, "\n"); strings.Contains(text, "Envoy") || strings.Contains(text, "ENVOY") {
 		t.Fatalf("warnings = %q, want no Envoy warning for a hub URL", warnings)
 	}
+
+	clearEnv(t)
+	cfg, _, err = Load(writeConfig(t, "envoy_enabled: true\nenvoy_hub_url: \" http://hub.example.test:9020/ \"\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.EnvoyEnabled || cfg.EnvoyHubURL != "http://hub.example.test:9020/" {
+		t.Fatalf("Envoy settings = (%t, %q), want the file's, trimmed", cfg.EnvoyEnabled, cfg.EnvoyHubURL)
+	}
 }
 
-// TestALeftoverSigningKeyWarns fails if a signing key an earlier provisioner
-// put in the environment or in .env is taken, or left there unmentioned.
+func TestEnvoyEnabledWarnings(t *testing.T) {
+	t.Run("missing hub URL", func(t *testing.T) {
+		clearEnv(t)
+		t.Setenv(EnvPrefix+"ENVOY_ENABLED", "true")
+
+		_, warnings, err := Load("")
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if !strings.Contains(strings.Join(warnings, "\n"), EnvPrefix+"ENVOY_HUB_URL") {
+			t.Fatalf("warnings %q do not name the missing hub URL", warnings)
+		}
+	})
+
+	t.Run("hub URL that names no host", func(t *testing.T) {
+		clearEnv(t)
+		t.Setenv(EnvPrefix+"ENVOY_ENABLED", "true")
+		t.Setenv(EnvPrefix+"ENVOY_HUB_URL", "hub.example.test:9020")
+
+		_, warnings, err := Load("")
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if !strings.Contains(strings.Join(warnings, "\n"), "absolute URL") {
+			t.Fatalf("warnings %q do not require an absolute hub URL", warnings)
+		}
+	})
+
+	t.Run("control: Envoy off", func(t *testing.T) {
+		clearEnv(t)
+		_, warnings, err := Load("")
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if text := strings.Join(warnings, "\n"); strings.Contains(text, "ENVOY_HUB_URL") {
+			t.Fatalf("warnings %q name the hub URL with Envoy off", warnings)
+		}
+	})
+}
+
+// TestRemovedEnvoyKeysWarn fails if a setting of an Envoy path Ghost Wispr no
+// longer has is taken silently: a unit configured for NATS or the webhook
+// would send nothing and say nothing.
+func TestRemovedEnvoyKeysWarn(t *testing.T) {
+	clearEnv(t)
+	path := writeConfig(t, "nats_url: nats://broker.example.test:4222\nenvoy_topic: notifications.legacy\n"+
+		"envoy_webhook_url: https://relay.example.test/webhook/ghostwispr\nenvoy_webhook_secret_name: projects/p/secrets/s/versions/2\n")
+	for _, key := range []string{"NATS_URL", "ENVOY_TOPIC", "ENVOY_WEBHOOK_URL", "ENVOY_WEBHOOK_SECRET_NAME"} {
+		t.Setenv(EnvPrefix+key, "set")
+	}
+
+	_, warnings, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load failed: %v", err)
+	}
+	warningsText := strings.Join(warnings, "\n")
+	for _, want := range []string{
+		"nats_url has been removed", "envoy_topic has been removed", "envoy_webhook_url has been removed", "envoy_webhook_secret_name has been removed",
+		EnvPrefix + "NATS_URL has been removed", EnvPrefix + "ENVOY_TOPIC has been removed",
+		EnvPrefix + "ENVOY_WEBHOOK_URL has been removed", EnvPrefix + "ENVOY_WEBHOOK_SECRET_NAME has been removed",
+	} {
+		if !strings.Contains(warningsText, want) {
+			t.Errorf("warnings %q do not say %q", warningsText, want)
+		}
+	}
+	if got := strings.Count(warningsText, "envoy_hub_url"); got != 8 {
+		t.Errorf("warnings name envoy_hub_url %d times, want once for each of the 8 removed settings: %q", got, warningsText)
+	}
+}
+
+// TestALeftoverSigningKeyWarns fails if a webhook signing key an earlier
+// provisioner put in the environment or in .env is left there unmentioned.
 func TestALeftoverSigningKeyWarns(t *testing.T) {
 	clearEnv(t)
 	t.Setenv(EnvPrefix+"ENVOY_WEBHOOK_SECRET", "stale-key")
@@ -99,71 +143,5 @@ func TestALeftoverSigningKeyWarns(t *testing.T) {
 	}
 	if got := strings.Count(strings.Join(warnings, "\n"), EnvPrefix+"ENVOY_WEBHOOK_SECRET is no longer read"); got != 1 {
 		t.Fatalf("warnings %q name the leftover signing key in .env %d times, want once", warnings, got)
-	}
-}
-
-func TestEnvoyEnabledWarnings(t *testing.T) {
-	t.Run("missing URL", func(t *testing.T) {
-		clearEnv(t)
-		t.Setenv(EnvPrefix+"ENVOY_ENABLED", "true")
-
-		_, warnings, err := Load("")
-		if err != nil {
-			t.Fatalf("Load: %v", err)
-		}
-		if !strings.Contains(strings.Join(warnings, "\n"), EnvPrefix+"ENVOY_WEBHOOK_URL") {
-			t.Fatalf("warnings %q do not name the missing webhook URL", warnings)
-		}
-	})
-
-	t.Run("missing signing key secret", func(t *testing.T) {
-		clearEnv(t)
-		t.Setenv(EnvPrefix+"ENVOY_ENABLED", "true")
-		t.Setenv(EnvPrefix+"ENVOY_WEBHOOK_URL", "https://relay.example.test/webhook/ghostwispr")
-
-		_, warnings, err := Load("")
-		if err != nil {
-			t.Fatalf("Load: %v", err)
-		}
-		if !strings.Contains(strings.Join(warnings, "\n"), EnvPrefix+"ENVOY_WEBHOOK_SECRET_NAME") {
-			t.Fatalf("warnings %q do not name the missing signing key secret", warnings)
-		}
-	})
-
-	t.Run("non HTTPS URL", func(t *testing.T) {
-		clearEnv(t)
-		t.Setenv(EnvPrefix+"ENVOY_ENABLED", "true")
-		t.Setenv(EnvPrefix+"ENVOY_WEBHOOK_URL", "http://relay.example.test/webhook/ghostwispr")
-
-		_, warnings, err := Load("")
-		if err != nil {
-			t.Fatalf("Load: %v", err)
-		}
-		if !strings.Contains(strings.Join(warnings, "\n"), "HTTPS") {
-			t.Fatalf("warnings %q do not require an HTTPS webhook URL", warnings)
-		}
-	})
-}
-
-func TestOldEnvoyKeysWarn(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "ghost-wispr.yaml")
-	if err := os.WriteFile(path, []byte("nats_url: nats://broker.example.test:4222\nenvoy_topic: notifications.legacy\n"), 0o600); err != nil {
-		t.Fatalf("write config: %v", err)
-	}
-	t.Setenv(EnvPrefix+"NATS_URL", "nats://broker.example.test:4222")
-	t.Setenv(EnvPrefix+"ENVOY_TOPIC", "notifications.legacy")
-
-	_, warnings, err := Load(path)
-	if err != nil {
-		t.Fatalf("Load failed: %v", err)
-	}
-	warningsText := strings.Join(warnings, "\n")
-	for _, want := range []string{
-		"nats_url", "envoy_topic", "envoy_webhook_url",
-		EnvPrefix + "NATS_URL", EnvPrefix + "ENVOY_TOPIC", EnvPrefix + "ENVOY_WEBHOOK_URL",
-	} {
-		if !strings.Contains(warningsText, want) {
-			t.Fatalf("warnings %q do not name %s", warningsText, want)
-		}
 	}
 }

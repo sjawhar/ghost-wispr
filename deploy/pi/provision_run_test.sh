@@ -118,7 +118,6 @@ printf '{"type":"external_account","credential_source":{"certificate":{"certific
 printf '{}\n' >"$work_dir/bundle/certificate_config.json"
 printf '%s\n' "$CLIENT_ID" >"$work_dir/bundle/tailscale-client-id"
 printf '%s\n' "$SUBJECT" >"$work_dir/bundle/tailscale-subject"
-printf 'https://relay.example.test/webhook/ghostwispr\n' >"$work_dir/bundle/envoy-webhook-url"
 printf 'deepgram-key' >"$work_dir/bundle/deepgram-key"
 
 # run_provision runs provision.sh on a bundle of the named files, with neutral deployment settings.
@@ -129,30 +128,33 @@ run_provision() {
       bash "$repo_root/deploy/pi/provision.sh" >"$work_dir/out" 2>&1
 }
 readonly bundle_files=(device.crt google-credentials.json certificate_config.json tailscale-client-id
-  tailscale-subject envoy-webhook-url deepgram-key)
+  tailscale-subject deepgram-key)
 
-# The Envoy signing key is no longer a bundle file: the recorder reads it from Secret Manager with
-# its Google identity. A bundle that still carries one is refused before anything is installed.
-printf 'webhook-secret' >"$work_dir/bundle/envoy-webhook-secret"
-if run_provision "${bundle_files[@]}" envoy-webhook-secret; then
-  fail "provision.sh accepted a bundle with envoy-webhook-secret"
-fi
-grep -Fq 'credential bundle contains unexpected path: envoy-webhook-secret' "$work_dir/out" \
-  || fail "provision.sh did not name envoy-webhook-secret when it refused the bundle: $(<"$work_dir/out")"
-[[ ! -e $TEST_LOG ]] || fail "provision.sh ran commands for a refused bundle: $(<"$TEST_LOG")"
+# The bundle holds no Envoy file: the recorder publishes to the Envoy hub with no credential, and
+# its config names the hub. A bundle that still carries a webhook file is refused before anything
+# is installed.
+for webhook_file in envoy-webhook-secret envoy-webhook-url; do
+  printf 'webhook\n' >"$work_dir/bundle/$webhook_file"
+  if run_provision "${bundle_files[@]}" "$webhook_file"; then
+    fail "provision.sh accepted a bundle with $webhook_file"
+  fi
+  grep -Fq "credential bundle contains unexpected path: $webhook_file" "$work_dir/out" \
+    || fail "provision.sh did not name $webhook_file when it refused the bundle: $(<"$work_dir/out")"
+  [[ ! -e $TEST_LOG ]] || fail "provision.sh ran commands for a refused bundle: $(<"$TEST_LOG")"
+done
 
 run_provision "${bundle_files[@]}" || fail "provision.sh failed: $(<"$work_dir/out")"
-# A run that works says no bash error. On the office Pi (2026-11-16) every full run printed
-# "provision.sh: line 42: local: relay_url: readonly variable": render_base_config declares a local
-# relay_url while the main flow's relay_url is readonly, so the function renders the global value
-# and ignores the URL it is given.
+# A run that works says no bash error.
 if grep -E 'provision\.sh: line [0-9]+: ' "$work_dir/out" >&2; then
   fail "provision.sh printed a bash error (above)"
 fi
 assert_recording_rules 'installed'
 assert_office_pi_devices 'installed'
+# The full provisioner installs the template as it is: the Envoy hub it names, no placeholder.
+cmp -s "$repo_root/deploy/pi/files/ghost-wispr.yaml" "$TEST_LOG.installed-ghost-wispr.yaml" \
+  || fail "the installed configuration is not deploy/pi/files/ghost-wispr.yaml"
 
-# The .env the recorder runs with holds the Deepgram key and no Envoy signing key.
+# The .env the recorder runs with holds the Deepgram key and no Envoy webhook signing key.
 env_file="$TEST_LOG.installed-.env"
 deepgram_key_name="DEEPGRAM""_API_KEY"
 grep -Fxq "GHOST_WISPR_$deepgram_key_name=deepgram-key" "$env_file" || fail "the installed .env has no Deepgram key"
@@ -235,16 +237,16 @@ if TEST_UP_EXIT=1 run_join; then
 fi
 grep -q '^tailscale serve' "$TEST_LOG" && fail "the join set Serve although tailscale up failed"
 
-# A rerun on a Pi that has a shared drive renders through render_models_config, which takes the
-# webhook URL as an argument too: it must keep the drive and say no bash error either.
+# A rerun on a Pi that has a shared drive renders through render_models_config: it must keep the
+# drive and the template's Envoy hub, and say no bash error either.
 printf 'gdrive_folder_id: "drive-0123"\n' >"$work_dir/deploy/ghost-wispr.yaml"
 : >"$TEST_LOG"
 run_provision "${bundle_files[@]}" || fail "provision.sh failed on a rerun: $(<"$work_dir/out")"
 if grep -E 'provision\.sh: line [0-9]+: ' "$work_dir/out" >&2; then
   fail "provision.sh printed a bash error on a rerun with a shared drive (above)"
 fi
-for line in 'gdrive_folder_id: "drive-0123"' 'gdrive_sync_enabled: true' \
-  'envoy_webhook_url: https://relay.example.test/webhook/ghostwispr'; do
+hub_line=$(grep '^envoy_hub_url: ' "$repo_root/deploy/pi/files/ghost-wispr.yaml")
+for line in 'gdrive_folder_id: "drive-0123"' 'gdrive_sync_enabled: true' "$hub_line"; do
   grep -Fxq "$line" "$TEST_LOG.installed-ghost-wispr.yaml" \
     || fail "the rerun's configuration lacks '$line': $(<"$TEST_LOG.installed-ghost-wispr.yaml")"
 done
