@@ -106,6 +106,29 @@ func TestGeminiPlaysTheFirstAudioBeforeTheStreamEnds(t *testing.T) {
 	}
 }
 
+// TestGeminiRejectsNoAudioWithItsFinishReason fails if a streaming Gemini
+// response with no inline audio reaches voice A as a successful Say, or hides
+// the finish reason that explains why it supplied none.
+func TestGeminiRejectsNoAudioWithItsFinishReason(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !isStream(r) {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, `data: {"candidates":[{"finishReason":"SAFETY","content":{"parts":[]}}]}`+"\n\n")
+	}))
+	t.Cleanup(srv.Close)
+	g, err := NewGemini(&GeminiConfig{Project: "example-project", Credentials: testCredentials(), BaseURL: srv.URL})
+	if err != nil {
+		t.Fatalf("NewGemini: %v", err)
+	}
+	err = g.Stream(context.Background(), "A sentence.", func([]byte) error { return nil })
+	if err == nil || !strings.Contains(err.Error(), "the engine gave no audio") || !strings.Contains(err.Error(), "SAFETY") {
+		t.Fatalf("Stream error = %v, want no audio and SAFETY", err)
+	}
+}
+
 // TestGeminiRequestsStreamingSpeech fails if the Gemini engine does not ask
 // the Vertex AI host of its location (a multi-region's own host, the global
 // host, or a region's) for streamed audio in the voice it was given,
