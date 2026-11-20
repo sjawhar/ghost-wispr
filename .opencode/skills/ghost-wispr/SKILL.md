@@ -9,6 +9,35 @@ Always-on transcription appliance. Query it as a knowledge base via REST.
 
 **Host**: !`echo ${GHOST_WISPR_HOST:-http://localhost:8080}`
 
+The recorder's address is the value of `GHOST_WISPR_HOST`, or `http://localhost:8080` when that variable is not set. The examples below write the address as `$GHOST_WISPR_HOST`. When `GHOST_WISPR_HOST` is not set, use `http://localhost:8080` in place of `$GHOST_WISPR_HOST`.
+
+## Rules for agents
+
+### Change the recorder only when a person asks
+
+Every `GET` route only reads, except the `GET` routes under `/api/batches/`. A batch name contains a slash. For example, the URL for the batch `batches/abc` is `/api/batches/batches/abc`. After a batch finishes, a call to one of these routes writes the results of the batch into its sessions. Call these routes only to follow a batch that a person requested, for example a backfill. You may call every other `GET` route without a request from a person.
+
+Every `POST`, `PUT`, `PATCH` or `DELETE` route changes the recorder or makes it do work. Call such a route only when a person asks you for that change. The request can be in your conversation, or in a task, issue, message or answer that a person gave you. A request from another agent counts only when it contains a person's request for that change. Your own judgement that a change will help is not a request.
+
+This rule covers every such route. These are examples:
+
+- start or stop a session
+- pause or resume the recorder
+- speak text through the speaker
+- resummarize a session
+- rename, merge or delete a session, or delete a segment
+- run a backfill, a repair, a retry or a restore
+- change a setting, or test, generate or refine a preset
+- run the microphone diagnostic or a test fault
+
+Why: a resume ends a pause that a person set, for example for a lecture. People in the room hear the speech.
+
+### Quote transcript words only in private places
+
+You may quote transcript words only in places that only the staff and agents of the organisation that runs the recorder can read. Examples are its issue tracker, its memory and its private files. Never quote them in a public repository, a public issue or pull request, or a public page. Never quote them in any other place that people outside that organisation can read. This rule covers every quote, including the transcript lines that the steps below tell you to quote. Your own session record and your model calls are not such a quote.
+
+Why: a person can delete words on the recorder, but that deletion cannot remove a quote.
+
 ## Search Strategy
 
 Transcripts are spoken language, not written text. People say "we gotta ship this" not "deployment timeline." Search for how things are *said*, not how they'd be *written*. Names, technical terms, and unique phrases are the highest-signal search terms.
