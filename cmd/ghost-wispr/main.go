@@ -907,8 +907,11 @@ func main() {
 		log.Printf("recovered %d stale session(s): %v", len(recoveredIDs), recoveredIDs)
 		cancelRecoveredQuestions(store, recoveredIDs)
 	}
-	// A refinement left running by the previous run stopped with it.
-	if err := store.RecoverStaleRefinements(); err != nil {
+	// A refinement left running by the previous run stopped with it. Each runs
+	// again below, once the recording directories are cleaned up
+	// (resumeStoppedRefinements).
+	stoppedRefinements, err := store.RecoverStaleRefinements()
+	if err != nil {
 		slog.Warn("failed to recover stale refinements", "error", err)
 	}
 	// So did a Drive sync: retry it in the folder it had.
@@ -2078,6 +2081,9 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 	// The recordings a stop cut off (storage.RecoverStaleSessions ended their
 	// sessions above) are saved now, not at the first sweep.
 	go kept.run(ctx)
+	// The refinements a stop cut off (storage.RecoverStaleRefinements above)
+	// run again, after the cleanup above, since a retry may restore recordings.
+	go resumeStoppedRefinements(ctx, stoppedRefinements, deletion.retryRefinement, log.Printf)
 	if cfg.GCEnabled {
 		go collectGarbage(ctx, cfgStore, deletionNoticeGCStore{SQLiteStore: store, hub: hub, onDeleted: sessionsForgotten}, drive, gcHealthState, warningRegistry, appLogger, gcEvery)
 	}

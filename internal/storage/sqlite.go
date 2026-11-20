@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -2107,13 +2108,30 @@ func scanSessions(rows *sql.Rows) ([]Session, error) {
 
 // RecoverStaleRefinements marks failed every refinement left running by an
 // earlier run of the app, which stopped inside it: nothing is running when the
-// app starts. Failed offers a retry, and GC, which leaves a running
-// refinement's session and audio alone, is not held off for good.
-func (s *SQLiteStore) RecoverStaleRefinements() error {
-	if _, err := s.db.Exec(`UPDATE sessions SET refinement_status = ? WHERE refinement_status = ?`, RefinementFailed, RefinementRunning); err != nil {
-		return fmt.Errorf("recover stale refinements: %w", err)
+// app starts. It returns their sessions, oldest first, so the start runs each
+// again: a stop during a meeting's refinement must not leave it failed until a
+// person presses Retry. Failed holds until then, so GC, which leaves a running
+// refinement's session and audio alone, is not held off for good, and a
+// session whose run again fails is left as Retry offers it.
+func (s *SQLiteStore) RecoverStaleRefinements() ([]string, error) {
+	rows, err := s.db.Query(`UPDATE sessions SET refinement_status = ? WHERE refinement_status = ? RETURNING id`, RefinementFailed, RefinementRunning)
+	if err != nil {
+		return nil, fmt.Errorf("recover stale refinements: %w", err)
 	}
-	return nil
+	defer func() { _ = rows.Close() }()
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("recover stale refinements: %w", err)
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("recover stale refinements: %w", err)
+	}
+	slices.Sort(ids)
+	return ids, nil
 }
 
 // RecoverStaleSessions ends every session still marked active, which the app
