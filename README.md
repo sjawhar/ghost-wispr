@@ -282,7 +282,7 @@ What the voice hears, and where the room's words go:
   A measured limit of voice B: GPT-Live sends its words just before their audio, and their
   timestamps run on a clock the unit cannot follow, so the unit takes each word as it arrives. When
   someone talks over Wispr, the words GPT-Live had already sent count as spoken, though up to about
-  1.4 s of them never played. While Wispr speaks or its echo can still be heard, matching calls and commands can be ignored for up to 30 s.
+  1.4 s of them never played. In that time, matching calls and commands can be ignored for up to 30 s while Wispr speaks or its echo can still be heard.
   That is broader than barge-in: `Wispr, never mind` can be ignored too when its words match an unplayed cut answer.
 - With `voice.engine: dgagent` (voice C), during an exchange only, the unit streams the room's
   audio and the last two minutes of the meeting's transcript to Deepgram's Voice Agent, with
