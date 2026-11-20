@@ -167,14 +167,13 @@ func (c *Concierge) answer(parent context.Context, x *voice.Exchange, turn strin
 	// is known, before the rest of the record is read (R7).
 	asking := make(chan askResult, 1)
 
-	var askStarted, askFinished atomic.Bool
+	var askStarted atomic.Bool
 	var askingKey atomic.Pointer[string]
 	startAsk := func(session string, found *reading) {
 		if askStarted.CompareAndSwap(false, true) {
 			askingKey.Store(&found.key)
 			go func() {
 				result := c.ask(ctx, x, session, turn, found)
-				askFinished.Store(true)
 
 				asking <- result
 			}()
@@ -217,20 +216,24 @@ func (c *Concierge) answer(parent context.Context, x *voice.Exchange, turn strin
 	case parent.Err() != nil:
 		return parent.Err()
 	case ctx.Err() != nil && askStarted.Load():
-		// The record was slow, but the question went out: say so.
-		result := <-asking
-		if result.holderCase != "" {
-			if err := sp.sayText(parent, result.holderCase, voice.Fact); err != nil {
-				return err
+		// The record used its bound. An Envoy send keeps its own timeout and
+		// must not extend this answer. Say its result only when it is ready.
+		select {
+		case result := <-asking:
+			if result.holderCase != "" {
+				if err := sp.sayText(parent, result.holderCase, voice.Fact); err != nil {
+					return err
+				}
 			}
-		}
-		if result.line != "" {
-			if err := sp.sayText(parent, result.line, voice.Ack); err != nil {
-				return err
+			if result.line != "" {
+				if err := sp.sayText(parent, result.line, voice.Ack); err != nil {
+					return err
+				}
 			}
-		}
-		if result.unreachable {
-			return errOutOfReach
+			if result.unreachable {
+				return errOutOfReach
+			}
+		default:
 		}
 		return nil
 	case ctx.Err() != nil:
@@ -296,7 +299,7 @@ func (c *Concierge) answer(parent context.Context, x *voice.Exchange, turn strin
 				stopFacts()
 			}
 		})
-		err = c.facts(parent, factsCtx, tools, turn, found, askStarted.Load(), askStarted.Load() && !askFinished.Load(), sp)
+		err = c.facts(factsCtx, tools, turn, found, askStarted.Load(), sp)
 		knownTimer.Stop()
 		switch {
 		case parent.Err() != nil:
@@ -752,7 +755,7 @@ func direct(question string) string {
 // more, told why, and after a second failure the voice says R8's fixed
 // sentence, led by the question's key when the first fact had to name it.
 // R8's bounds hold across both tries.
-func (c *Concierge) facts(parent, ctx context.Context, tools *runner, turn string, found *reading, asking, askPending bool, sp *speaker) error {
+func (c *Concierge) facts(ctx context.Context, tools *runner, turn string, found *reading, asking bool, sp *speaker) error {
 	prompt := c.turnPrompt(transcriptOf(tools.x.Recent), turn)
 	switch {
 	case found.text == "":
@@ -777,11 +780,9 @@ func (c *Concierge) facts(parent, ctx context.Context, tools *runner, turn strin
 	source.WriteString(found.text)
 	questionKey := ""
 	if found.key != "" && slices.Contains(issueKeysIn(turn), found.key) &&
-		found.holder["holder"] == "session" && found.holder["live"] == true &&
-		(c.askPlan(turn, found, tools.x.FollowUpTurn) == "" || (saysAsk(turn) && askPending)) {
-		// A fresh status answer to a live holder has no routing or holder line
-		// that names the question's key. An ask whose send is still pending
-		// also has no asked line yet. Its first fact must name the key itself.
+		found.holder["holder"] == "session" && found.holder["live"] == true {
+		// An explicit key is in the first fact, before any later holder or
+		// routing line. Its presence never depends on the Envoy send.
 		questionKey = found.key
 		prompt += "\n\nBegin your first sentence with " + questionKey + ", as in \"" + questionKey + " is …\", so the room hears which issue it is."
 	}
@@ -808,21 +809,9 @@ func (c *Concierge) facts(parent, ctx context.Context, tools *runner, turn strin
 		if reason != "" {
 			note += "\n\nYour last answer failed R8's check: " + reason + ". Answer again from the record only, in the form asked."
 		}
-		attempt := ctx
-		cancel := func() {}
-		if askPending && reason != "" {
-			attempt, cancel = context.WithTimeout(parent, time.Second)
-		}
-		err := c.generate(attempt, tools, prompt+note, said, &budget)
+		err := c.generate(ctx, tools, prompt+note, said, &budget)
 		var invented *inventedError
-		cancel()
 		if !errors.As(err, &invented) {
-			if askPending && reason != "" {
-				if said.spoken > 0 {
-					return nil
-				}
-				return fixed()
-			}
 			return err
 		}
 		reason = invented.reason
