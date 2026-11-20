@@ -352,7 +352,9 @@ agent's session (`dispatch send-to-agent`). It names the unit's own Envoy sessio
 floor protocol, so an agent with an older copy of the Ghost Wispr skill can follow it. The agent
 joins, asks for the floor and leaves with Envoy messages to that session, each one line:
 `ghost-wispr join KEY`, `ghost-wispr floor` with its words on the lines after it, and
-`ghost-wispr leave`.
+`ghost-wispr leave`. A join is taken on trust from any session Envoy does not list as gone, with no
+check that a person invited it, since any agent on the tailnet can already ask the Concierge and
+read the API, a pointer holds no words, and a hand speaks only on a person's "go ahead".
 
 A joined agent follows the meeting through the unit's own API, and gets a pointer with no words
 when its issue comes up: a final segment that names its key, its number, or two words of its
@@ -361,7 +363,8 @@ meeting, and so does the session's page. Each joined agent's issue key becomes a
 live transcript from its join, with no redial. "Wispr, ask the ABC-12 agent …" goes to the agent
 that joined on ABC-12 before the issue's claim in Dispatch, and reaches it once.
 
-A floor request is at most 50 words, written for the ear, at most one in 5 minutes for an agent.
+A floor request is at most 50 words as the room hears them, the attribution the voice says first
+("ABC-12's agent says:") included, written for the ear, at most one in 5 minutes for an agent.
 The room hears a short two-tap sound at the next gap; the light does not change, since the agent's
 words are played, not heard. The voice says them, after the agent's issue key, only when a person
 says "Wispr, go ahead" ("Wispr, go ahead, ABC-12" picks one of several), and drops them after 60 s;

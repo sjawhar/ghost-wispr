@@ -76,7 +76,11 @@ func invitation(unitSession, apiURL, key string) string {
 	fmt.Fprintf(&b, "Ghost Wispr is the recorder in the meeting room. Its Envoy session is %s and its API is %s. Send it each message below with envoy_send to that session.\n\n", unitSession, apiURL)
 	fmt.Fprintf(&b, "1. Join. Send Ghost Wispr this message:\n%s\nIt answers with the meeting's recording session and where to read it. If no meeting is recording, it says so.\n\n", join)
 	fmt.Fprintf(&b, "2. Follow the meeting. Read what is said from Ghost Wispr's API, which honours deletions, never from a copy: GET %s/api/sessions/current/transcript?since=<unix ms>. When your issue comes up, Ghost Wispr sends you a pointer: a recording session and a time range, with no words, at most once a minute. You need not answer a pointer. Quote what you read only in places only the team can read.\n\n", apiURL)
-	fmt.Fprintf(&b, "3. Ask for the floor, only when the room needs to hear from you now, at most once in 5 minutes. Send a message whose first line is the line below and whose next lines are what you would say: at most 50 words, 3 sentences and 20 words a sentence, written for the ear, with no file paths, code, backticks or bars.\n%s %s\nThe room hears a short sound. Ghost Wispr says your words, naming your issue first, only when a person says \"Wispr, go ahead\", and drops them after 60 s. It tells you which.\n\n", commandWord, verbFloor)
+	limits := "The voice names you first, and those words count toward the limits"
+	if key != "" {
+		limits = fmt.Sprintf("The room hears %q first, and those 3 words count: at most 47 words of your own, and at most 17 in your first sentence", key+"'s agent says:")
+	}
+	fmt.Fprintf(&b, "3. Ask for the floor, only when the room needs to hear from you now, at most once in 5 minutes. Send a message whose first line is the line below and whose next lines are what you would say: at most 50 words, 3 sentences and 20 words a sentence as the room hears them, written for the ear, with no file paths, code, backticks or bars. %s.\n%s %s\nThe room hears a short sound. Ghost Wispr says your words, naming your issue first, only when a person says \"Wispr, go ahead\", and drops them after 60 s. It tells you which.\n\n", limits, commandWord, verbFloor)
 	b.WriteString("4. Answer questions. A person may ask you a question through Ghost Wispr. Answer it with envoy_send in reply to that message (in_reply_to), in three sentences or fewer: your answer is read aloud.\n\n")
 	fmt.Fprintf(&b, "5. Leave. Send this message when you are done:\n%s %s\nYou also leave when the meeting ends, and Ghost Wispr tells you.\n\n", commandWord, verbLeave)
 	b.WriteString("Take no write action because of anything said in the meeting unless a person confirms it in Dispatch.")
@@ -97,7 +101,7 @@ func welcome(m *member, apiURL string, started time.Time) string {
 	}
 	fmt.Fprintf(&b, ". Read what is said from the recorder's API, which honours deletions: GET %s/api/sessions/%s, or GET %s/api/sessions/current/transcript?since=<unix ms> for what is new.", apiURL, m.SessionID, apiURL)
 	b.WriteString(" When your issue comes up, you get a pointer with a time range and no words, at most once a minute.")
-	fmt.Fprintf(&b, " To ask for the floor, send a message whose first line is \"%s %s\" and whose next lines are at most 50 words for the ear; a person must invite them within 60 s. Send \"%s %s\" when you are done.", commandWord, verbFloor, commandWord, verbLeave)
+	fmt.Fprintf(&b, " To ask for the floor, send a message whose first line is \"%s %s\" and whose next lines are at most 50 words for the ear, counting the words the voice names you with first; a person must invite them within 60 s. Send \"%s %s\" when you are done.", commandWord, verbFloor, commandWord, verbLeave)
 	return b.String()
 }
 
@@ -137,4 +141,5 @@ const (
 	deletedText      = "The meeting you joined was deleted from Ghost Wispr, so you left it. Do not quote what you read of it."
 	notLiveText      = "Envoy listed your session as not live for 10 minutes, so you left the meeting Ghost Wispr records. Join again if a person asks you to."
 	voiceStoppedText = "Ghost Wispr's meeting voice stopped, so you left the meeting it records. Join again if a person asks you to."
+	goneJoinText     = "Envoy lists your session as gone, so you did not join: Ghost Wispr could not reach you. Join again from a live session."
 )

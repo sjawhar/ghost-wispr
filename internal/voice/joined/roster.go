@@ -112,6 +112,10 @@ type member struct {
 	Member
 	name  string   // how the voice names it
 	words []string // its title's words that count toward its issue coming up
+	// ctx ends when it leaves: a pointer still being prepared for it then is
+	// never sent.
+	ctx    context.Context
+	cancel context.CancelFunc
 	// lastPointer is when it was last sent a pointer; waiting holds the
 	// mentions since, waitFrom to waitTo, sent once PointerEvery passed.
 	lastPointer      time.Time
@@ -119,11 +123,12 @@ type member struct {
 	waitFrom, waitTo time.Time
 	lastFloor        time.Time
 	floorEvent       string    // the last floor request taken, so a redelivery is no second one
-	notLiveSince     time.Time // the first sweep that read it not live
+	notLiveSince     time.Time // the first sweep that read it not live; only Envoy reading it live clears it
 }
 
-// pointer is one pointer to send.
+// pointer is one pointer to send, for as long as its agent stays (ctx).
 type pointer struct {
+	ctx                   context.Context
 	agent, key, sessionID string
 	from, to, started     time.Time
 }
@@ -307,13 +312,22 @@ func (r *Roster) join(ctx context.Context, m *envoy.Message, key string) {
 			title = read
 		}
 	}
-	if title == "" {
-		if agents := r.currentAgents(); agents != nil {
-			if info, err := agents.Lookup(ctx, agent); err == nil {
-				title = info.Title
-			}
+	// One lookup: a session Envoy lists as gone cannot be reached, so it
+	// does not join; its Envoy title names an agent with no issue title.
+	var envoyTitle string
+	if agents := r.currentAgents(); agents != nil {
+		info, err := agents.Lookup(ctx, agent)
+		switch {
+		case err != nil:
+			r.logf("joined: read whether a joining agent is live: %v", err)
+		case info.State == envoy.StateGone:
+			r.reply(ctx, m, "refused", goneJoinText)
+			return
+		default:
+			envoyTitle = info.Title
 		}
 	}
+	title = cmp.Or(title, envoyTitle)
 	name := key
 	if name == "" {
 		name = cmp.Or(speakable(title), "An agent")
@@ -325,8 +339,15 @@ func (r *Roster) join(ctx context.Context, m *envoy.Message, key string) {
 	again := old != nil && old.SessionID == sessionID
 	if again {
 		// A join again, or its redelivery: the same meeting keeps its
-		// limits.
+		// limits and its time not live.
 		joined.JoinedAt, joined.lastPointer, joined.lastFloor, joined.floorEvent = old.JoinedAt, old.lastPointer, old.lastFloor, old.floorEvent
+		joined.notLiveSince = old.notLiveSince
+		joined.ctx, joined.cancel = old.ctx, old.cancel
+	} else {
+		if old != nil {
+			old.cancel() // its pointers for the meeting it left
+		}
+		joined.ctx, joined.cancel = context.WithCancel(r.ctx)
 	}
 	r.members[agent] = joined
 	r.keytermsLocked()
@@ -369,14 +390,17 @@ func (r *Roster) floor(ctx context.Context, m *envoy.Message, draft string) {
 		r.reply(ctx, m, "refused", "Your floor request holds no words, so it was not taken. Put what you would say on the lines after its first line.")
 		return
 	}
-	if reason := earcheck.Form(draft); reason != "" {
-		r.reply(ctx, m, "refused", fmt.Sprintf("Your words were not taken: they have %s. Say it in at most 50 words, 3 sentences and 20 words a sentence, written for the ear, with no file paths, code, backticks or bars.", reason))
-		return
-	}
+	// The room hears the attribution first, so the spoken-text check and its
+	// limits are for the whole text.
+	attribution := hand.Name + " says:"
 	if hand.IssueKey != "" {
-		hand.Text = hand.IssueKey + "'s agent says: " + draft
-	} else {
-		hand.Text = hand.Name + " says: " + draft
+		attribution = hand.IssueKey + "'s agent says:"
+	}
+	hand.Text = attribution + " " + draft
+	if reason := earcheck.Form(hand.Text); reason != "" {
+		named := len(strings.Fields(attribution))
+		r.reply(ctx, m, "refused", fmt.Sprintf("Your words were not taken: the room hears %q first, and with it they have %s. Say it in at most %d words of your own, so 50 in all, in 3 sentences of 20 words at most (%d in your first), written for the ear, with no file paths, code, backticks or bars.", attribution, reason, 50-named, 20-named))
+		return
 	}
 	raised := now
 	if !m.IssuedAt.IsZero() && m.IssuedAt.Before(now) {
@@ -417,6 +441,7 @@ func (r *Roster) leaveQuietly(agent string) bool {
 		return false
 	}
 	delete(r.members, agent)
+	joined.cancel() // a pointer still being prepared for it is not sent
 	r.keytermsLocked()
 	r.mu.Unlock()
 	if r.cfg.Floor != nil {
@@ -511,7 +536,7 @@ func (r *Roster) OnSegment(s *voice.Segment) {
 			continue
 		}
 		m.lastPointer = now
-		sends = append(sends, &pointer{agent: m.Agent, key: m.IssueKey, sessionID: m.SessionID, from: s.From, to: s.To})
+		sends = append(sends, &pointer{ctx: m.ctx, agent: m.Agent, key: m.IssueKey, sessionID: m.SessionID, from: s.From, to: s.To})
 	}
 	r.mu.Unlock()
 	r.sendPointers(sends)
@@ -525,18 +550,27 @@ func (r *Roster) Tick() {
 	for _, m := range r.members {
 		if m.waiting && now.Sub(m.lastPointer) >= r.cfg.PointerEvery {
 			m.waiting, m.lastPointer = false, now
-			sends = append(sends, &pointer{agent: m.Agent, key: m.IssueKey, sessionID: m.SessionID, from: m.waitFrom, to: m.waitTo})
+			sends = append(sends, &pointer{ctx: m.ctx, agent: m.Agent, key: m.IssueKey, sessionID: m.SessionID, from: m.waitFrom, to: m.waitTo})
 		}
 	}
 	r.mu.Unlock()
 	r.sendPointers(sends)
 }
 
+// sendPointers sends each pointer while its agent stays: one whose agent
+// left, or whose meeting ended or was deleted, meanwhile is dropped.
 func (r *Roster) sendPointers(sends []*pointer) {
 	for _, p := range sends {
 		p.started = r.started(p.sessionID)
+		if p.ctx.Err() != nil {
+			continue
+		}
 		text := pointerText(p, r.apiURL())
-		r.async(func(ctx context.Context) { r.send(ctx, p.agent, "", "pointer", text) })
+		r.async(func(context.Context) {
+			if p.ctx.Err() == nil {
+				r.send(p.ctx, p.agent, "", "pointer", text)
+			}
+		})
 	}
 }
 

@@ -197,12 +197,14 @@ func TestIssueComesUp(t *testing.T) {
 		{"INFRA-1027", "how is 1027 going", true},
 		{"INFRA-1027", "is the ghost recorder done", true},
 		{"ABC-12", "the agents in this meeting are quiet", true},
-		{"ABC-12", "which agent wants the floor", true},
+		{"ABC-12", "which agents want the floor", true},
+		{"ABC-12", "which agent wants the floor", false}, // "agent" is not the title's "agents"
 		{"ABC-12", "the floor is wet", false},
 		{"ABC-12", "the meeting about XYZ-9 ran long", false},
 		{"ABC-12", "we ship ABC-120 next", false},
 		{"ABC-12", "we were 12 people", false},
-		{"INFRA-1027", "they would rather keep their recorder", false},
+		{"INFRA-1027", "they would rather keep their recorder", true}, // "their" and "recorder" are 5 letters or more
+		{"INFRA-1027", "they would rather keep the recorder", false},
 	} {
 		t.Run(tc.said, func(t *testing.T) {
 			r := newRig(t, nil)
