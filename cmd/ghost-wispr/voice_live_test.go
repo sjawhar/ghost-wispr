@@ -302,7 +302,7 @@ func TestALazyConciergeThatCannotStartAnswersUnreachable(t *testing.T) {
 // service writes its journal with, as message "voice timing".
 func TestVoiceTimingIsLogged(t *testing.T) {
 	var buf bytes.Buffer
-	logger := logging.New(&buf, "info")
+	logger := logging.New(&buf, logging.ParseLevel("info"))
 	at := time.Date(2026, 11, 19, 9, 0, 0, 5, time.UTC)
 	voiceTiming(logger)("stop", "s1", at, "reason", "Jabra button")
 	var line map[string]any

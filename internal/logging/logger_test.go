@@ -4,9 +4,13 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -28,7 +32,7 @@ func decodeJSONLine(t *testing.T, raw string) map[string]any {
 
 func TestLogger_JSONOutputIncludesRequiredFields(t *testing.T) {
 	var out bytes.Buffer
-	logger := WithModule(New(&out, "debug"), "session")
+	logger := WithModule(New(&out, slog.LevelDebug), "session")
 
 	logger.Info("session ended", "session_id", "sess-123", "operation", "end_current_session")
 
@@ -59,7 +63,7 @@ func TestLogger_JSONOutputIncludesRequiredFields(t *testing.T) {
 
 func TestLogger_LevelFiltering(t *testing.T) {
 	var out bytes.Buffer
-	logger := WithModule(New(&out, "error"), "server")
+	logger := WithModule(New(&out, ParseLevel("error")), "server")
 
 	logger.Warn("warn should be filtered", "operation", "startup")
 	logger.Error("error should pass", "operation", "startup")
@@ -80,7 +84,7 @@ func TestLogger_LevelFiltering(t *testing.T) {
 
 func TestLogger_ContextFieldPropagation(t *testing.T) {
 	var out bytes.Buffer
-	base := WithModule(New(&out, "info"), "gdrive")
+	base := WithModule(New(&out, slog.LevelInfo), "gdrive")
 	ctx := ContextWithLogger(context.Background(), base.With("session_id", "sess-ctx"))
 
 	logger := FromContext(ctx, base)
@@ -98,9 +102,271 @@ func TestLogger_ContextFieldPropagation(t *testing.T) {
 	}
 }
 
+// WithModule on a logger that names a module names the new one in its place,
+// with what was added between kept: a record holds one "module" key.
+func TestWithModule_OnANamedLoggerReplacesTheModule(t *testing.T) {
+	var out bytes.Buffer
+	logger := WithModule(WithModule(New(&out, slog.LevelInfo), "server").With("request_id", "req-1"), "health")
+
+	logger.Info("readiness check failed", "operation", "ready")
+
+	if n := strings.Count(out.String(), `"module"`); n != 1 {
+		t.Fatalf("record holds %d module keys, want 1: %s", n, out.String())
+	}
+	payload := decodeJSONLine(t, out.String())
+	if payload["module"] != "health" {
+		t.Fatalf("expected module health, got %v", payload["module"])
+	}
+	if payload["request_id"] != "req-1" {
+		t.Fatalf("expected request_id req-1, got %v", payload["request_id"])
+	}
+	if payload["operation"] != "ready" {
+		t.Fatalf("expected operation ready, got %v", payload["operation"])
+	}
+}
+
+// A group opened on a logger that names a module leaves the module at the top
+// of each record, outside the group.
+func TestWithModule_ModuleStaysOutsideAGroup(t *testing.T) {
+	var out bytes.Buffer
+	logger := WithModule(New(&out, slog.LevelInfo), "server").WithGroup("request")
+
+	logger.Info("request handled", "path", "/api/status")
+
+	payload := decodeJSONLine(t, out.String())
+	if payload["module"] != "server" {
+		t.Fatalf("expected module server at the top level, got %v: %s", payload["module"], out.String())
+	}
+	group, _ := payload["request"].(map[string]any)
+	if group["path"] != "/api/status" {
+		t.Fatalf("expected request.path /api/status, got %v: %s", group["path"], out.String())
+	}
+	if _, ok := group["module"]; ok {
+		t.Fatalf("module is inside the group: %s", out.String())
+	}
+}
+
+// Naming another module on a logger with a group open keeps one "module" key
+// in each record, the new one, and each bound attribute in its group; the
+// logger it derived from keeps its own module.
+func TestWithModule_RenamedInAGroupHoldsOneModule(t *testing.T) {
+	var out bytes.Buffer
+	base := WithModule(New(&out, slog.LevelInfo).With("root_id", "root-1"), "server").
+		WithGroup("request").With("request_id", "req-1")
+	WithModule(base, "health").Info("renamed logger", "operation", "ready")
+	base.Info("original logger", "operation", "serve")
+
+	lines := strings.Split(strings.TrimSpace(out.String()), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("expected two records, got %d: %s", len(lines), out.String())
+	}
+	for i, want := range []struct{ module, operation string }{{"health", "ready"}, {"server", "serve"}} {
+		line := lines[i]
+		if n := strings.Count(line, `"module"`); n != 1 {
+			t.Errorf("record holds %d module keys, want 1: %s", n, line)
+		}
+		if !strings.Contains(line, `"module":"`+want.module+`"`) {
+			t.Errorf("record does not name module %q: %s", want.module, line)
+		}
+		payload := decodeJSONLine(t, line)
+		if payload["root_id"] != "root-1" {
+			t.Errorf("root attribute lost or grouped: %s", line)
+		}
+		request, _ := payload["request"].(map[string]any)
+		if request["request_id"] != "req-1" || request["operation"] != want.operation {
+			t.Errorf("grouped attributes lost or misplaced: %s", line)
+		}
+	}
+}
+
+// A bound value is rendered once, when it is bound, as a plain JSON logger
+// renders it: the logger and the one that renames its module log the same
+// value, a value's own MarshalJSON (also inside a map) and a LogValuer each run
+// once, and a map changed after it was bound shows as it was. So it is with a
+// group opened before the values are bound.
+func TestWithModule_RenamingKeepsBoundValuesAsBound(t *testing.T) {
+	for _, group := range []string{"", "request"} {
+		t.Run("group "+strconv.Quote(group), func(t *testing.T) {
+			var out bytes.Buffer
+			marshals, nestedMarshals, evaluations := 0, 0, 0
+			counter := map[string]int{"counter": 1}
+			logger := WithModule(New(&out, slog.LevelInfo), "server")
+			if group != "" {
+				logger = logger.WithGroup(group)
+			}
+			logger = logger.With("state", counter, "marshaled", countingMarshaler{&marshals},
+				"nested", map[string]any{"marshaled": countingMarshaler{&nestedMarshals}},
+				slog.Group("detail", slog.Any("value", logValueFunc(func() slog.Value {
+					evaluations++
+					return slog.IntValue(evaluations)
+				}))))
+			counter["counter"] = 2
+			logger.Info("original logger")
+			WithModule(logger, "health").Info("renamed logger")
+
+			if marshals != 1 || nestedMarshals != 1 || evaluations != 1 {
+				t.Errorf("binding ran MarshalJSON %d times (%d in a map) and LogValue %d times, want once each", marshals, nestedMarshals, evaluations)
+			}
+			lines := strings.Split(strings.TrimSpace(out.String()), "\n")
+			if len(lines) != 2 {
+				t.Fatalf("expected two records, got %d: %s", len(lines), out.String())
+			}
+			for _, line := range lines {
+				payload := decodeJSONLine(t, line)
+				if group != "" {
+					payload, _ = payload[group].(map[string]any)
+				}
+				state, _ := payload["state"].(map[string]any)
+				nested, _ := payload["nested"].(map[string]any)
+				detail, _ := payload["detail"].(map[string]any)
+				if state["counter"] != float64(1) || payload["marshaled"] != float64(1) || nested["marshaled"] != float64(1) || detail["value"] != float64(1) {
+					t.Errorf("a bound value is not as it was bound (state.counter 1, marshaled 1, nested.marshaled 1, detail.value 1): %s", line)
+				}
+			}
+		})
+	}
+}
+
+// A value bound after a group opened is written as a plain JSON logger writes
+// it: HTML characters unescaped, an error as its text, a struct, a nil, a
+// value whose JSON fails, a MarshalJSON that panics, a nil error pointer and
+// a source (an empty or nil one left out) each as that logger writes them,
+// and logging never panics.
+func TestWithModule_GroupedValuesRenderAsAPlainLogger(t *testing.T) {
+	values := func() []any { // fresh for each logger: a failing marshaler counts its calls
+		return []any{
+			"tag", map[string]string{"html": "<b>&</b>"},
+			"failure", errors.New("disk <full>"),
+			"point", struct{ X, Y int }{1, 2},
+			"none", nil,
+			"unrenderable", func() {},
+			"refused", failingMarshaler{new(int)},
+			"panicked", panickingMarshaler{},
+			"nil error", (*nilError)(nil),
+			"source", &slog.Source{File: "x.go"},
+			"empty source", &slog.Source{},
+			"nil source", (*slog.Source)(nil),
+		}
+	}
+	var plain, named bytes.Buffer
+	New(&plain, slog.LevelInfo).WithGroup("request").With(values()...).Info("bound")
+	WithModule(New(&named, slog.LevelInfo), "server").WithGroup("request").With(values()...).Info("bound")
+
+	want, _ := decodeJSONLine(t, plain.String())["request"].(map[string]any)
+	got, _ := decodeJSONLine(t, named.String())["request"].(map[string]any)
+	if len(want) != 9 || !reflect.DeepEqual(got, want) {
+		t.Fatalf("grouped values = %v, a plain logger writes %v\nplain: %snamed: %s", got, want, plain.String(), named.String())
+	}
+	if !strings.Contains(named.String(), `"html":"<b>&</b>"`) {
+		t.Fatalf("HTML characters were escaped: %s", named.String())
+	}
+}
+
+// A logger New did not build gets each grouped value as it was bound, for its
+// own handler to write: its ReplaceAttr sees the value's type, and a text
+// handler writes the value as text.
+func TestWithModule_AnotherHandlerGetsGroupedValuesAsBound(t *testing.T) {
+	var jsonOut, textOut bytes.Buffer
+	redact := &slog.HandlerOptions{ReplaceAttr: func(_ []string, attr slog.Attr) slog.Attr {
+		if _, ok := attr.Value.Any().(secretValue); ok {
+			attr.Value = slog.StringValue("REDACTED")
+		}
+		return attr
+	}}
+	WithModule(slog.New(slog.NewJSONHandler(&jsonOut, redact)), "server").WithGroup("request").With("v", secretValue{"private"}).Info("bound")
+	WithModule(slog.New(slog.NewTextHandler(&textOut, nil)), "server").WithGroup("g").With("v", map[string]int{"n": 1}).Info("bound")
+
+	if !strings.Contains(jsonOut.String(), `"v":"REDACTED"`) || strings.Contains(jsonOut.String(), "private") {
+		t.Errorf("the handler's ReplaceAttr did not see the bound value's type: %s", jsonOut.String())
+	}
+	if !strings.Contains(textOut.String(), "g.v=map[n:1]") {
+		t.Errorf("the text handler did not write the bound value as text: %s", textOut.String())
+	}
+}
+
+type secretValue struct{ Secret string }
+
+// On a handler New did not build, a value bound after a group opened is
+// rendered once, by that handler, and a module renamed after the group
+// opened is written inside the group, beside the module named before; a
+// second rename at the same depth repeats "module" inside the group.
+func TestWithModule_AForeignHandlerRendersAGroupedValueOnce(t *testing.T) {
+	var out bytes.Buffer
+	calls := 0
+	logger := WithModule(slog.New(slog.NewJSONHandler(&out, nil)), "server").WithGroup("request").With("value", countingMarshaler{&calls})
+	logger.Info("original")
+	WithModule(logger, "health").Info("renamed")
+	WithModule(WithModule(logger, "health"), "retry").Info("renamed twice")
+
+	if calls != 1 {
+		t.Fatalf("MarshalJSON ran %d times, want once: %s", calls, out.String())
+	}
+	lines := strings.Split(strings.TrimSpace(out.String()), "\n")
+	if len(lines) != 3 {
+		t.Fatalf("want three records: %s", out.String())
+	}
+	for i, want := range []string{
+		`"module":"server","request":{"value":1}`,
+		`"module":"server","request":{"value":1,"module":"health"}`,
+		`"module":"server","request":{"value":1,"module":"health","module":"retry"}`,
+	} {
+		if !strings.Contains(lines[i], want) {
+			t.Errorf("record %d = %s, want it to hold %s", i, lines[i], want)
+		}
+	}
+}
+
+// A grouped value whose MarshalJSON fails is rendered once, so the logger and
+// the one that renames its module write the same failure.
+func TestWithModule_AFailingGroupedValueIsRenderedOnce(t *testing.T) {
+	var out bytes.Buffer
+	calls := 0
+	logger := WithModule(New(&out, slog.LevelInfo), "server").WithGroup("request").With("refused", failingMarshaler{&calls})
+	logger.Info("original logger")
+	WithModule(logger, "health").Info("renamed logger")
+
+	lines := strings.Split(strings.TrimSpace(out.String()), "\n")
+	if calls != 1 || len(lines) != 2 {
+		t.Fatalf("MarshalJSON ran %d times for %d records, want once: %s", calls, len(lines), out.String())
+	}
+	first, _ := decodeJSONLine(t, lines[0])["request"].(map[string]any)
+	second, _ := decodeJSONLine(t, lines[1])["request"].(map[string]any)
+	if first["refused"] != second["refused"] {
+		t.Fatalf("the two loggers wrote %v and %v", first["refused"], second["refused"])
+	}
+}
+
+type logValueFunc func() slog.Value
+
+func (f logValueFunc) LogValue() slog.Value { return f() }
+
+// countingMarshaler renders as the number of times it was rendered.
+type countingMarshaler struct{ calls *int }
+
+func (m countingMarshaler) MarshalJSON() ([]byte, error) {
+	*m.calls++
+	return json.Marshal(*m.calls)
+}
+
+// failingMarshaler fails to render, naming how many times it was asked.
+type failingMarshaler struct{ calls *int }
+
+func (m failingMarshaler) MarshalJSON() ([]byte, error) {
+	*m.calls++
+	return nil, fmt.Errorf("refused %d", *m.calls)
+}
+
+type panickingMarshaler struct{}
+
+func (panickingMarshaler) MarshalJSON() ([]byte, error) { panic("marshal panicked") }
+
+type nilError struct{ text string }
+
+func (e *nilError) Error() string { return e.text }
+
 func TestRequestIDMiddleware_AddsRequestIDToContextHeaderAndLogs(t *testing.T) {
 	var out bytes.Buffer
-	base := WithModule(New(&out, "info"), "server")
+	base := WithModule(New(&out, slog.LevelInfo), "server")
 	mw := RequestIDMiddleware(base, func() string { return "req-abc-123" })
 
 	h := mw(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

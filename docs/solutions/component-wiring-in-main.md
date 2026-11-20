@@ -30,8 +30,8 @@ Task 2 created `DefaultHealthChecker` with methods like `IsDeepgramConnected()`.
 The fix was adding this to `main.go` AFTER all components are initialized:
 
 ```go
-healthChecker := server.NewDefaultHealthChecker(resilientClient, store, mic)
-handler, err := server.HandlerWithLogger(assets, hub, store, controlHooks, authToken, healthChecker, appLogger, cfgStore)
+healthChecker := server.NewDefaultHealthChecker(deepgramHealth, store, micStatus, captureReadiness{capture: capture, mic: micStatus}, llmTracker)
+handler, err := server.HandlerWithLogger(assets, hub, store, controlHooks, authToken, healthChecker, appLogger, embeddingClient, cfgStore)
 ```
 
 ## Initialization Order
@@ -39,17 +39,15 @@ handler, err := server.HandlerWithLogger(assets, hub, store, controlHooks, authT
 The order in `main.go` matters:
 
 1. **Config** (`cfgStore`) — loaded first, everything depends on it
-2. **Logger** (`appLogger`) — second, everything logs
+2. **Logger and LogSink** (`appLogger`, `logSink`, from `startAppLogger`) — second, everything logs. `startAppLogger` is the logger's one constructor: it writes to stdout and to the sink the UI log viewer reads (`GET /api/logs`)
 3. **SQLite store** (`store`) — third, most things need the DB
-4. **LogSink** (`logSink`) — captures logs for the UI log viewer
-5. **Hub** (`hub`) — WebSocket broadcast, needed by error propagation
-6. **PortAudio + Mic** (`mic`) — may fail (graceful degradation)
-7. **Deepgram client** (`resilientClient`) — may fail (graceful degradation)
-8. **Batch transcriber** — optional, depends on config
-9. **Session manager** (`manager`) — depends on store, summarizer, batch transcriber
-10. **Sync orchestrator** — optional, depends on Drive credentials
-11. **Health checker** — depends on resilientClient, store, mic (must be created AFTER all of these)
-12. **HTTP handler** — depends on everything above
+4. **Hub** (`hub`) — WebSocket broadcast, needed by error propagation
+5. **Session manager** (`manager`) — depends on store, recorder, summarizer, hub, detector
+6. **Batch transcriber** — optional, depends on config; set on the manager
+7. **Capture device** (`micDevice`) and **Drive sync orchestrator** — the orchestrator is optional, depends on Drive credentials
+8. **Mic and Deepgram client** — started together by the mic start; either may fail (graceful degradation)
+9. **Health checker** — depends on the Deepgram client, store, mic status, capture and LLM tracker (must be created AFTER all of these)
+10. **HTTP handler** — depends on everything above
 
 If you add a new component, you must:
 1. Initialize it in the correct position in this order
@@ -61,7 +59,7 @@ If you add a new component, you must:
 
 The `cfgStore.OnChange()` callback updates components when config is reloaded:
 - Silence timeout, summarizer, batch transcriber, Drive syncer
-- Logger level is updated
+- The log level is set on the one logger every component holds; nothing builds a new logger, so `GET /api/logs` keeps every line
 - New components are created atomically
 
 **Gotcha**: If config reload fails partway through, the system is partially updated. There's no rollback mechanism. This is a known limitation.

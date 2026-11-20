@@ -886,11 +886,11 @@ func main() {
 	if len(os.Args) > 1 && os.Args[1] == "issue-holder" {
 		// Its stderr is for why it failed: the scratch ledger's start-up notes
 		// would crowd the cause out of the 300 bytes accept-voice.sh keeps.
-		logging.SetDefault(logging.New(os.Stderr, "warn"))
+		logging.SetDefault(logging.New(os.Stderr, slog.LevelWarn))
 		os.Exit(runIssueHolderCommand(context.Background(), os.Args[1:], configPath, os.Stdout, os.Stderr))
 	}
 	if len(os.Args) > 1 && os.Args[1] == "joined-probe" {
-		logging.SetDefault(logging.New(os.Stderr, "warn"))
+		logging.SetDefault(logging.New(os.Stderr, slog.LevelWarn))
 		os.Exit(runJoinedProbeCommand(context.Background(), os.Args[1:], configPath, os.Stdout, os.Stderr))
 	}
 	if len(os.Args) > 1 {
@@ -907,9 +907,7 @@ func main() {
 		log.Fatalf("config: %v", err)
 	}
 	cfg := cfgStore.Get()
-	logSink := logging.NewLogSink(1000)
-	appLogger := logging.New(io.MultiWriter(os.Stdout, logSink), cfg.LogLevel)
-	logging.SetDefault(appLogger)
+	appLogger, logSink := startAppLogger(cfgStore, os.Stdout)
 	if googleSDKLogging {
 		slog.Warn("GOOGLE_SDK_GO_LOGGING_LEVEL is ignored: Google's SDK logging writes each request whole, which can hold a meeting's words")
 	}
@@ -1643,9 +1641,6 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 
 	// Register config change callback.
 	onConfigChange(cfgStore, func(newCfg *config.Config) {
-		appLogger = logging.New(os.Stdout, newCfg.LogLevel)
-		logging.SetDefault(appLogger)
-
 		detector.SetTimeout(newCfg.ParsedSilenceTimeout())
 		manager.SetMinSessionSegments(newCfg.MinSessionSegments)
 		log.Printf("config: reloaded (silence_timeout=%s)", newCfg.SilenceTimeout)

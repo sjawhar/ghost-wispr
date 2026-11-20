@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -545,7 +546,7 @@ func TestHealthzReadyJSONStructure(t *testing.T) {
 func TestHealthzLiveWithLogging(t *testing.T) {
 	// Test that health check works with structured logging
 	buf := &bytes.Buffer{}
-	logger := logging.New(buf, "info")
+	logger := logging.New(buf, slog.LevelInfo)
 
 	checker := &MockHealthChecker{}
 
@@ -567,7 +568,7 @@ func TestHealthzLiveWithLogging(t *testing.T) {
 func TestHealthzReadyWithLogging(t *testing.T) {
 	// Test that health check works with structured logging
 	buf := &bytes.Buffer{}
-	logger := logging.New(buf, "info")
+	logger := logging.New(buf, slog.LevelInfo)
 
 	checker := &MockHealthChecker{
 		deepgramConnected: true,

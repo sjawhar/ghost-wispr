@@ -2,6 +2,7 @@ package logging
 
 import (
 	"encoding/json"
+	"strings"
 	"sync"
 	"time"
 )
@@ -51,6 +52,9 @@ func (s *LogSink) Write(p []byte) (n int, err error) {
 	return len(p), nil
 }
 
+// GetLogs returns the stored lines, oldest first: those at level (debug, info,
+// warn or error, in any case; "" or ALL is every level), at or after since when
+// it is set, and at most the newest limit of them when limit is above 0.
 func (s *LogSink) GetLogs(level string, limit int, since time.Time) []LogEntry {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -66,7 +70,7 @@ func (s *LogSink) GetLogs(level string, limit int, since time.Time) []LogEntry {
 			continue
 		}
 
-		if level != "" && level != "ALL" && entry.Level != level {
+		if level != "" && !strings.EqualFold(level, "ALL") && !strings.EqualFold(entry.Level, level) {
 			continue
 		}
 
