@@ -257,26 +257,11 @@ func (q *speechQueue) rejectAllLocked() {
 func (q *speechQueue) interrupt() {
 	q.mu.Lock()
 	defer q.mu.Unlock()
-	for _, it := range q.items {
-		if it.say != nil {
-			it.say.finish(ErrInterrupted)
-		}
-	}
-	if q.current != nil && q.current.waiter != nil {
-		q.current.waiter.finish(ErrInterrupted)
-	}
-	for _, u := range q.awaitingEnd {
-		if u.waiter != nil {
-			u.waiter.finish(ErrInterrupted)
-		}
-	}
-	clear(q.items)
-	q.items = q.items[:0]
+	q.endWaitersLocked(ErrInterrupted)
 	for _, u := range q.awaitingText {
 		u.decision, u.audio = dropped, nil
 	}
 	q.awaitingText = nil
-	q.awaitingEnd = nil
 	if q.current == nil {
 		q.current = &utterance{decision: dropped}
 	} else {
@@ -291,12 +276,19 @@ func (q *speechQueue) interrupt() {
 
 // close clears every unfinished reply and ends a Say the player still held.
 func (q *speechQueue) close(reason error) {
-	q.finish(reason, false)
-}
-
-func (q *speechQueue) finish(reason error, interrupt bool) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
+	q.endWaitersLocked(reason)
+	q.rejectAllLocked()
+	if q.stop != nil {
+		q.stop()
+	}
+	q.signal()
+}
+
+// endWaitersLocked ends every Say whose audio Output has not accepted, and
+// drops the queued speech. q.mu is held.
+func (q *speechQueue) endWaitersLocked(reason error) {
 	for _, it := range q.items {
 		if it.say != nil {
 			it.say.finish(reason)
@@ -305,21 +297,16 @@ func (q *speechQueue) finish(reason error, interrupt bool) {
 	if q.current != nil && q.current.waiter != nil {
 		q.current.waiter.finish(reason)
 	}
-	for _, u := range q.awaitingText {
-		if u.waiter != nil {
-			u.waiter.finish(reason)
+	for _, pending := range [][]*utterance{q.awaitingEnd, q.awaitingText} {
+		for _, u := range pending {
+			if u.waiter != nil {
+				u.waiter.finish(reason)
+			}
 		}
 	}
+	q.awaitingEnd = nil
 	clear(q.items)
 	q.items = q.items[:0]
-	q.rejectAllLocked()
-	if interrupt {
-		q.interrupted = true
-	}
-	if q.stop != nil {
-		q.stop()
-	}
-	q.signal()
 }
 
 // next waits for the player's next item. With wait above zero it returns
