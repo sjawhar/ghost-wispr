@@ -163,6 +163,26 @@ func TestPointerHoldsNoWords(t *testing.T) {
 	}
 }
 
+// TestTheVoiceStoppingTellsJoinedAgents fails if the agents stay joined once
+// the unit's Envoy session closes, as the voice stops, or are not told so
+// before it closes.
+func TestTheVoiceStoppingTellsJoinedAgents(t *testing.T) {
+	r := newRig(t, nil)
+	r.join(t, "agent-1", "ABC-12")
+	before := len(r.agents.to("agent-1"))
+	r.roster.SetAgents(nil)
+	if got := r.roster.Joined(); len(got) != 0 {
+		t.Fatalf("roster %+v once the Envoy session closed, want none", got)
+	}
+	sent := r.agents.to("agent-1")
+	if len(sent) != before+1 || !strings.Contains(sent[before].Message, "voice stopped") {
+		t.Fatalf("the agent was sent %+v, want one notice that the voice stopped", sent[before:])
+	}
+	if got := r.notes.all(); got[len(got)-1] != "agent_left:sess-1" {
+		t.Fatalf("/ws events %q, want agent_left last", got)
+	}
+}
+
 // TestIssueComesUp fails if a segment that names the agent's key, in any form
 // people say it, or two words of its title of 5 letters or more, sends no
 // pointer, or if a segment with one such word, or with another key, does.

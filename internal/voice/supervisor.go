@@ -175,7 +175,7 @@ type SupervisorConfig struct {
 	// agents' pointers; nil drops them. It runs on the transcript reader,
 	// never under the Supervisor's lock, and must return at once.
 	Segment func(s Segment)
-	Logf   func(string, ...any)
+	Logf    func(string, ...any)
 }
 
 // Supervisor owns every exchange's lifetime: it opens one on the wake phrase,

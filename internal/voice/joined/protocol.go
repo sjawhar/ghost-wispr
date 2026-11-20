@@ -129,11 +129,12 @@ func clock(d time.Duration) string {
 
 // The roster's other messages to agents.
 const (
-	noMeetingText = "No meeting is recording now, so you did not join. Join again when a person asks you to during a meeting."
-	staleJoinText = "Your join was sent before the meeting now recording began, so you did not join it. Join again if a person asks you to."
-	notJoinedText = "You have not joined the meeting Ghost Wispr records, so it cannot take your request. Join first with a message whose first line is \"" + commandWord + " " + verbJoin + " KEY\", where KEY is your issue's key."
-	spokenText    = "Your words were spoken in the room."
-	endedText     = "The meeting ended, and with it the recording session you joined, so you left it. Join again if a person asks you to."
-	deletedText   = "The meeting you joined was deleted from Ghost Wispr, so you left it. Do not quote what you read of it."
-	notLiveText   = "Envoy listed your session as not live for 10 minutes, so you left the meeting Ghost Wispr records. Join again if a person asks you to."
+	noMeetingText    = "No meeting is recording now, so you did not join. Join again when a person asks you to during a meeting."
+	staleJoinText    = "Your join was sent before the meeting now recording began, so you did not join it. Join again if a person asks you to."
+	notJoinedText    = "You have not joined the meeting Ghost Wispr records, so it cannot take your request. Join first with a message whose first line is \"" + commandWord + " " + verbJoin + " KEY\", where KEY is your issue's key."
+	spokenText       = "Your words were spoken in the room."
+	endedText        = "The meeting ended, and with it the recording session you joined, so you left it. Join again if a person asks you to."
+	deletedText      = "The meeting you joined was deleted from Ghost Wispr, so you left it. Do not quote what you read of it."
+	notLiveText      = "Envoy listed your session as not live for 10 minutes, so you left the meeting Ghost Wispr records. Join again if a person asks you to."
+	voiceStoppedText = "Ghost Wispr's meeting voice stopped, so you left the meeting it records. Join again if a person asks you to."
 )

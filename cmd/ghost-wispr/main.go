@@ -1079,7 +1079,8 @@ func main() {
 	// wired to the capture gate below, before anything can close it.
 	var conciergeSessionHooks conciergeHooks
 	var voiceHooks voiceLink
-	sessionsForgotten := wireVoiceSessionHooks(manager, &conciergeSessionHooks, &voiceHooks)
+	var joinedLink joinedHooks // the joined agents' roster, once the voice has a speaker
+	sessionsForgotten := wireVoiceSessionHooks(manager, &conciergeSessionHooks, &voiceHooks, &joinedLink)
 
 	// Summarize recovered sessions (and any with pending/empty summaries).
 	// Launched after ctx is created so SIGTERM cancels in-flight LLM calls.
@@ -1158,6 +1159,9 @@ func main() {
 			watchProjectKeys(ctx, client.Projects, projectKeysEvery, &dispatchProjects)
 		}
 	}
+	// The live transcript's keyterms, which a join or a leave changes on the
+	// open Deepgram stream (R4, R17); nil when the voice cannot run.
+	liveKeyterms := newLiveKeyterms(&cfg, dispatchProjects.Get)
 	if restorePauseErr != nil {
 		warningRegistry.Set(captureStateWarningKey, "Capture pause state could not be restored; the recorder started paused")
 	}
@@ -1905,7 +1909,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 		cOptions := &interfaces.ClientOptions{EnableKeepAlive: true}
 		tOptions := liveTranscriptionOptions(&cfg, sampleRate, dispatchProjects.Get())
 		resilientConfig := liveTranscriptionConfig(&cfg, sampleRate)
-		callback := transcriptCallback{manager: manager, voice: &voiceHooks, stamp: capture.voiceStamp}
+		callback := transcriptCallback{manager: manager, voice: &voiceHooks, stamp: capture.voiceStamp, keyterms: liveKeyterms}
 		candidateResilient := newLiveTranscription(ctx, cfg.DeepgramAPIKey, cOptions, tOptions, resilientConfig, callback, warningRegistry, hub)
 		resilientRef.Store(candidateResilient)
 		deepgramSendRef.Store(startMicMonitoring(ctx, &micLoops, capture, ordered, audioRecorder, candidateResilient, voiceAudio, micWait, log.Printf, hub))
@@ -2037,12 +2041,32 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 			voices.apply(ctx, newCfg)
 			voices.warnBuild(newCfg.Voice.Enabled, warningRegistry)
 		})
+		// Agents a person tells, through Dispatch, to join the meeting (R17).
+		var issues *dispatch.Client
+		if cfg.DispatchToken != "" && cfg.Concierge.DispatchURL != "" {
+			if client, err := dispatch.NewClient(cfg.Concierge.DispatchURL, cfg.DispatchToken, newDispatchHTTP(appLogger)); err != nil {
+				slog.Warn("joined agents: the Dispatch client for issue titles", "error", err)
+			} else {
+				issues = client
+			}
+		}
+		roster := startJoinedAgents(ctx, &joinedDeps{
+			session:   func() string { id, _ := manager.ActiveSession(); return id },
+			store:     store,
+			floor:     &voiceHooks,
+			dispatch:  issues,
+			notify:    hub.BroadcastVoiceEvent,
+			keyterms:  liveKeyterms,
+			publicURL: cfg.PublicURL,
+		})
+		joinedLink.set(roster)
+		wireJoinedRoutes(controlHooks, roster)
 		conc = newLazyConcierge(func() (*concierge.Concierge, func(), error) {
 			current := cfgStore.Get()
 			// The session page reads a session's questions again on each change.
 			return startConcierge(ctx, &current, store, appLogger, func(sessionID string) {
 				hub.BroadcastVoiceEvent("voice_tasks_changed", sessionID)
-			}, nil)
+			}, roster)
 		}, func(c *concierge.Concierge) {
 			if c == nil { // it stopped: the session hooks reach nothing
 				conciergeSessionHooks.set(nil)
@@ -2065,6 +2089,8 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 			red:         func() bool { return capture.capturing(micStatus) },
 			notify:      hub.BroadcastVoiceEvent,
 			projects:    dispatchProjects.Get,
+			segment:     joinedLink.OnSegment,
+			handDone:    joinedLink.HandDone,
 		}); err != nil {
 			slog.Warn("the meeting voice is off", "error", err)
 			warningRegistry.Set("voice", "The meeting voice is off: "+err.Error())

@@ -159,21 +159,26 @@ func New(cfg *Config) *Roster {
 	return &Roster{cfg: c, logf: logf, ctx: ctx, cancel: cancel, members: map[string]*member{}}
 }
 
-// SetAgents gives the roster the unit's Envoy session once it opens; nil
-// when it closed, and every joined agent leaves, as it hears nothing more.
+// SetAgents gives the roster the unit's Envoy session once it opens; nil as
+// it closes, when every joined agent is told the voice stopped, while the
+// session can still send, and leaves.
 func (r *Roster) SetAgents(agents Agents) {
-	r.mu.Lock()
-	r.agents = agents
-	var gone []string
 	if agents == nil {
+		r.mu.Lock()
+		var gone []string
 		for agent := range r.members {
 			gone = append(gone, agent)
 		}
+		r.mu.Unlock()
+		for _, agent := range gone {
+			if r.leaveQuietly(agent) {
+				r.send(r.ctx, agent, "", "notice", voiceStoppedText)
+			}
+		}
 	}
+	r.mu.Lock()
+	r.agents = agents
 	r.mu.Unlock()
-	for _, agent := range gone {
-		r.leave(agent, "")
-	}
 }
 
 // Close stops Run and the sends still going.
@@ -397,11 +402,19 @@ func (r *Roster) floor(ctx context.Context, m *envoy.Message, draft string) {
 // leave takes agent off the roster and lowers its hands; a reason is sent to
 // it as a notice.
 func (r *Roster) leave(agent, reason string) {
+	if r.leaveQuietly(agent) && reason != "" {
+		r.async(func(ctx context.Context) { r.send(ctx, agent, "", "notice", reason) })
+	}
+}
+
+// leaveQuietly takes agent off the roster, lowers its hands and tells the
+// pages, and reports whether it was joined.
+func (r *Roster) leaveQuietly(agent string) bool {
 	r.mu.Lock()
 	joined := r.members[agent]
 	if joined == nil {
 		r.mu.Unlock()
-		return
+		return false
 	}
 	delete(r.members, agent)
 	r.keytermsLocked()
@@ -411,9 +424,7 @@ func (r *Roster) leave(agent, reason string) {
 	}
 	r.notify("agent_left", joined.SessionID)
 	r.logf("joined: an agent left meeting %s", joined.SessionID)
-	if reason != "" {
-		r.async(func(ctx context.Context) { r.send(ctx, agent, "", "notice", reason) })
-	}
+	return true
 }
 
 // SessionEnded makes the agents of recording session id leave, as its meeting

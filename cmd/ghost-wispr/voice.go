@@ -197,6 +197,10 @@ type voiceDeps struct {
 	red         func() bool   // the light reads red and audio passes the gate
 	notify      func(kind, sessionID string)
 	projects    func() []string // Dispatch's project keys, for spoken keys
+	// segment and handDone reach the joined agents' roster: the room's
+	// final segments, and how each raised hand came down.
+	segment  func(voice.Segment)
+	handDone func(voice.Hand, voice.HandOutcome)
 }
 
 // startVoice starts the Supervisor over the speaker output, and sets it on
@@ -220,6 +224,8 @@ func startVoice(deps *voiceDeps) error {
 		Notify:      deps.notify,
 		ProjectKeys: deps.projects,
 		Tap:         deps.tap,
+		Segment:     deps.segment,
+		HandDone:    deps.handDone,
 		Timing:      deps.timing,
 		Logf:        log.Printf,
 	})
@@ -392,17 +398,29 @@ func voiceCConfig(cfg *config.Config) *dgagent.Config {
 	}
 }
 
-// wireVoiceSessionHooks makes every session end reach the Concierge and the
-// voice, and returns what a session delete (the API's and the GC's) calls to
-// make them forget it.
-func wireVoiceSessionHooks(manager interface{ SetSessionEndedHook(func(string)) }, concierge *conciergeHooks, link *voiceLink) func([]string) {
+// sessionHooks is what follows a session's end and delete.
+type sessionHooks interface {
+	SessionEnded(sessionID string)
+	SessionsDeleted(sessionIDs []string)
+}
+
+// wireVoiceSessionHooks makes every session end reach the Concierge, the
+// voice and others, such as the joined agents' roster, and returns what a
+// session delete (the API's and the GC's) calls to make them forget it.
+func wireVoiceSessionHooks(manager interface{ SetSessionEndedHook(func(string)) }, concierge *conciergeHooks, link *voiceLink, others ...sessionHooks) func([]string) {
 	manager.SetSessionEndedHook(func(sessionID string) {
 		concierge.SessionEnded(sessionID)
 		link.SessionEnded(sessionID)
+		for _, other := range others {
+			other.SessionEnded(sessionID)
+		}
 	})
 	return func(sessionIDs []string) {
 		concierge.SessionsDeleted(sessionIDs)
 		link.SessionsDeleted(sessionIDs)
+		for _, other := range others {
+			other.SessionsDeleted(sessionIDs)
+		}
 	}
 }
 

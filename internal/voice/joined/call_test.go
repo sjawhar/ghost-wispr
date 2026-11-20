@@ -48,7 +48,7 @@ func TestCallGoesOnce(t *testing.T) {
 			}
 			return agents
 		},
-		Now:       r.clock.Now,
+		Now: r.clock.Now,
 	})
 	if err != nil {
 		t.Fatal(err)
