@@ -126,14 +126,16 @@ func TestPendingSendRetryProviderFailureReturnsError(t *testing.T) {
 		return nil
 	}
 	r.model.turns = [][]*genai.GenerateContentResponse{{chunk(text("ABC-12 is in progress. The change waits for Alex."))}}
-	r.model.errs = []error{nil, errors.New("provider failed")}
+	failure := errors.New("provider failed")
+	r.model.errs = []error{nil, failure}
 	var spoken []said
 	err := r.concierge.Answer(context.Background(), &r.exchange, "ask the agent on ABC-12 when it will be ready?", recorder(&spoken))
 	close(release)
 	if err == nil {
 		t.Fatal("the retry provider failed but Answer returned nil")
 	}
-	if !errors.Is(err, voice.ErrUnreachable) && !strings.Contains(err.Error(), "provider failed") {
+	// The error's text is withheld (providererr): it can quote the prompt.
+	if !errors.Is(err, voice.ErrUnreachable) && !errors.Is(err, failure) {
 		t.Fatalf("Answer = %v, want the provider failure", err)
 	}
 }

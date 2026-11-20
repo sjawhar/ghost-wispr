@@ -434,7 +434,8 @@ func TestTTSFirstAudioGivesNoEngineAnotherEnginesVoice(t *testing.T) {
 
 // TestTTSFirstAudioEngineErrorExitsNonzero fails if an engine that refuses
 // the unit leaves tts-first-audio exiting 0, or without the engine's error
-// on stderr.
+// on stderr: each Gemini engine names Vertex AI's status and not its
+// message, which can quote the text spoken.
 func TestTTSFirstAudioEngineErrorExitsNonzero(t *testing.T) {
 	t.Run("aura", func(t *testing.T) {
 		deepgram := startFakeAura(t, true)
@@ -447,8 +448,8 @@ func TestTTSFirstAudioEngineErrorExitsNonzero(t *testing.T) {
 		t.Run(engine, func(t *testing.T) {
 			vertex := startFakeVertex(t, &fakeVertex{status: http.StatusForbidden})
 			run := runFirstAudio(t, firstAudioUnit(t, ""), &voiceAOptions{vertexBaseURL: vertex.url}, "One fact.\n", "--engine", engine)
-			if run.code == 0 || !strings.Contains(run.stderr, "permission denied") || run.stdout != "" {
-				t.Fatalf("exit %d, stdout %q, stderr %q; want nonzero, nothing printed, and Vertex AI's refusal on stderr", run.code, run.stdout, run.stderr)
+			if run.code == 0 || !strings.Contains(run.stderr, "HTTP 403") || strings.Contains(run.stderr, "permission denied") || run.stdout != "" {
+				t.Fatalf("exit %d, stdout %q, stderr %q; want nonzero, nothing printed, and HTTP 403 without Vertex AI's message on stderr", run.code, run.stdout, run.stderr)
 			}
 		})
 	}

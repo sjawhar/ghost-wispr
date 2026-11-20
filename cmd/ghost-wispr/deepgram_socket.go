@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/http"
 	"sync"
@@ -17,6 +18,7 @@ import (
 	"github.com/dvonthenen/websocket"
 
 	"github.com/sjawhar/ghost-wispr/internal/netdial"
+	"github.com/sjawhar/ghost-wispr/internal/providererr"
 )
 
 // deepgramWriteTimeout bounds one write to a Deepgram socket, and is the
@@ -97,7 +99,12 @@ func dialDeepgramLive(ctx context.Context, apiKey string, cOptions *interfaces.C
 		_ = response.Body.Close()
 	}
 	if err != nil {
-		return nil, fmt.Errorf("deepgram connect: %w", err)
+		// A refused handshake keeps Deepgram's status; any other failure,
+		// such as an answer net/http could not read, can quote the answer.
+		if response != nil {
+			return nil, fmt.Errorf("deepgram connect: %w (HTTP %d)", err, response.StatusCode)
+		}
+		return nil, fmt.Errorf("deepgram connect: %w", providererr.From("deepgram", err))
 	}
 	s := &deepgramSocket{
 		conn:    conn,
@@ -171,19 +178,29 @@ func (s *deepgramSocket) abort() {
 	_ = s.conn.Close()
 }
 
+// logSocketEnd logs why Deepgram's socket ended: a close Deepgram sent by
+// its code alone (the reason a close carries is Deepgram's text), any other
+// read error reduced (providererr.From).
+func logSocketEnd(err error) {
+	var closed *websocket.CloseError
+	if errors.As(err, &closed) {
+		slog.Warn("deepgram error", "provider", "deepgram", "close_code", closed.Code)
+		return
+	}
+	slog.Warn("deepgram error", "error", providererr.From("deepgram", err))
+}
+
 // read hands Deepgram's messages to the router until the connection ends,
-// then reports the close.
+// then reports the close. The socket logs its own read error here, rather
+// than through the callback's Error, which logs only codes: an Error message
+// Deepgram sends can set any of its fields.
 func (s *deepgramSocket) read() {
 	defer close(s.done)
 	for {
 		messageType, message, err := s.conn.ReadMessage()
 		if err != nil {
 			if !s.closed.Load() && !websocket.IsCloseError(err, websocket.CloseNormalClosure) {
-				_ = s.router.Error(&msginterfaces.ErrorResponse{
-					Type:        string(msginterfaces.TypeErrorResponse),
-					ErrMsg:      "socket",
-					Description: err.Error(),
-				})
+				logSocketEnd(err)
 			}
 			s.abort()
 			_ = s.router.Close(&msginterfaces.CloseResponse{Type: string(msginterfaces.TypeCloseResponse)})

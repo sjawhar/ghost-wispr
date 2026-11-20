@@ -7,6 +7,9 @@ import (
 	"testing"
 	"time"
 
+	"google.golang.org/api/googleapi"
+
+	"github.com/sjawhar/ghost-wispr/internal/providererr"
 	"github.com/sjawhar/ghost-wispr/internal/storage"
 )
 
@@ -27,6 +30,19 @@ func TestR9RefinementWarningShowsInnermostCause(t *testing.T) {
 				t.Fatalf("refinementWarningText(%q) = %q, want %q", tc.err, got, want)
 			}
 		})
+	}
+}
+
+// The warning on GET /api/status names a provider's error as it was reduced
+// (providererr), never the provider's own error under it, whose message can
+// quote a session's title or transcript.
+func TestR9RefinementWarningShowsNoProviderMessage(t *testing.T) {
+	const planted = "quokkaplantedroomword"
+	drive := &googleapi.Error{Code: 400, Message: "Invalid value: 2026-11-20 " + planted, Errors: []googleapi.ErrorItem{{Reason: "badRequest", Message: planted}}}
+	err := fmt.Errorf("refine session: %w", fmt.Errorf("upload transcript.md: %w", providererr.From("drive", drive)))
+	want := "Refinement after segment deletion failed for session s: drive answered HTTP 400 (badRequest)"
+	if got := refinementWarningText("s", err); got != want {
+		t.Fatalf("refinementWarningText = %q, want %q", got, want)
 	}
 }
 

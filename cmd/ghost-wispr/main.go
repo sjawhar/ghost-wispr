@@ -38,6 +38,7 @@ import (
 	"github.com/sjawhar/ghost-wispr/internal/indicator"
 	"github.com/sjawhar/ghost-wispr/internal/llm"
 	"github.com/sjawhar/ghost-wispr/internal/logging"
+	"github.com/sjawhar/ghost-wispr/internal/providererr"
 	"github.com/sjawhar/ghost-wispr/internal/server"
 	"github.com/sjawhar/ghost-wispr/internal/session"
 	"github.com/sjawhar/ghost-wispr/internal/storage"
@@ -584,8 +585,11 @@ func (c transcriptCallback) Close(*api.CloseResponse) error {
 	return nil
 }
 
+// Error logs an Error message Deepgram sent: its code and variant, never its
+// text, which can quote what it heard. The socket logs its own read errors
+// itself (deepgramSocket.read).
 func (c transcriptCallback) Error(er *api.ErrorResponse) error {
-	log.Printf("deepgram error %s: %s", er.ErrCode, er.Description)
+	slog.Warn("deepgram error", "provider", "deepgram", "code", providererr.Token(er.ErrCode), "variant", providererr.Token(er.Variant))
 	return nil
 }
 
@@ -830,6 +834,9 @@ func newTTSProvider(ctx context.Context, cfg *config.Config, geminiOptions ...tt
 }
 
 func main() {
+	// Before any Google client is built: its own logger writes around the
+	// app's (logging.WithholdGoogleSDKLogging).
+	googleSDKLogging := logging.WithholdGoogleSDKLogging()
 	configPath := configPathFromEnvironment()
 	if len(os.Args) > 1 && os.Args[1] == "google-id-token" {
 		cfg, _, err := config.Load(configPath)
@@ -857,7 +864,7 @@ func main() {
 	if len(os.Args) > 1 && os.Args[1] == "issue-holder" {
 		// Its stderr is for why it failed: the scratch ledger's start-up notes
 		// would crowd the cause out of the 300 bytes accept-voice.sh keeps.
-		slog.SetDefault(logging.New(os.Stderr, "warn"))
+		logging.SetDefault(logging.New(os.Stderr, "warn"))
 		os.Exit(runIssueHolderCommand(context.Background(), os.Args[1:], configPath, os.Stdout, os.Stderr))
 	}
 	if len(os.Args) > 1 {
@@ -876,7 +883,10 @@ func main() {
 	cfg := cfgStore.Get()
 	logSink := logging.NewLogSink(1000)
 	appLogger := logging.New(io.MultiWriter(os.Stdout, logSink), cfg.LogLevel)
-	slog.SetDefault(appLogger)
+	logging.SetDefault(appLogger)
+	if googleSDKLogging {
+		slog.Warn("GOOGLE_SDK_GO_LOGGING_LEVEL is ignored: Google's SDK logging writes each request whole, which can hold a meeting's words")
+	}
 	for _, w := range cfgWarnings {
 		slog.Warn("config", "warning", w)
 	}
@@ -1185,7 +1195,7 @@ func main() {
 			InlinedRequests: requests,
 		}, nil)
 		if err != nil {
-			return "", 0, fmt.Errorf("create batch job: %w", err)
+			return "", 0, fmt.Errorf("create batch job: %w", providererr.From("gemini", err))
 		}
 		if err := store.RecordSummaryBatch(job.Name, generations); err != nil {
 			return "", 0, fmt.Errorf("persist summary batch %s: %w", job.Name, err)
@@ -1207,7 +1217,7 @@ func main() {
 
 		job, err := genaiClient.Batches.Get(ctx, batchName, nil)
 		if err != nil {
-			return nil, fmt.Errorf("get batch job: %w", err)
+			return nil, fmt.Errorf("get batch job: %w", providererr.From("gemini", err))
 		}
 
 		result := map[string]any{
@@ -1246,9 +1256,11 @@ func main() {
 		}
 
 		if job.State == genai.JobStateFailed {
+			// Gemini's message can quote the requests, the transcripts: the
+			// answer keeps the error's code's name.
 			errMsg := "unknown error"
-			if job.Error != nil {
-				errMsg = job.Error.Message
+			if job.Error != nil && job.Error.Code != nil {
+				errMsg = "the batch job failed: " + providererr.RPC("gemini", *job.Error.Code, job.Error.Message).Error()
 			}
 			_, failed, err := applySummaryBatchResults(store, hub, nil, batchName, nil)
 			if err != nil {
@@ -1602,7 +1614,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 	// Register config change callback.
 	onConfigChange(cfgStore, func(newCfg *config.Config) {
 		appLogger = logging.New(os.Stdout, newCfg.LogLevel)
-		slog.SetDefault(appLogger)
+		logging.SetDefault(appLogger)
 
 		detector.SetTimeout(newCfg.ParsedSilenceTimeout())
 		manager.SetMinSessionSegments(newCfg.MinSessionSegments)

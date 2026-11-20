@@ -17,7 +17,7 @@ import (
 	"cloud.google.com/go/auth"
 
 	"github.com/sjawhar/ghost-wispr/internal/audio"
-	"github.com/sjawhar/ghost-wispr/internal/spokentext"
+	"github.com/sjawhar/ghost-wispr/internal/providererr"
 )
 
 const (
@@ -246,7 +246,9 @@ func (g *Gemini) Stream(ctx context.Context, text string, emit func(pcm []byte) 
 	}
 	token, err := g.credentials.Token(ctx)
 	if err != nil {
-		return fmt.Errorf("gemini tts: get token: %w", err)
+		// Google's token answer can quote what it was sent; the error keeps
+		// its status and OAuth code (providererr).
+		return fmt.Errorf("gemini tts: get token: %w", providererr.From("google", err))
 	}
 	// The stall timer cancels the request; each byte that arrives restarts
 	// it, and it waits while emit does.
@@ -267,11 +269,11 @@ func (g *Gemini) Stream(ctx context.Context, text string, emit func(pcm []byte) 
 		if reqCtx.Err() != nil {
 			return context.Cause(reqCtx)
 		}
-		return fmt.Errorf("gemini tts: http request: %w", err)
+		return fmt.Errorf("gemini tts: http request: %w", providererr.From("gemini", err))
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
-		return geminiStatusError(resp, text)
+		return geminiStatusError(resp)
 	}
 
 	events := bufio.NewScanner(stallReader{r: resp.Body, stall: stall})
@@ -296,7 +298,7 @@ func (g *Gemini) Stream(ctx context.Context, text string, emit func(pcm []byte) 
 		// A blank line, or the end of the stream, ends an event.
 		if len(data) > 0 {
 			stall.Stop()
-			reason, err := g.emitEvent(data, text, func(pcm []byte) error {
+			reason, err := g.emitEvent(data, func(pcm []byte) error {
 				audioSeen = audioSeen || len(pcm) > 0
 				return emit(pcm)
 			})
@@ -317,11 +319,11 @@ func (g *Gemini) Stream(ctx context.Context, text string, emit func(pcm []byte) 
 		if reqCtx.Err() != nil {
 			return context.Cause(reqCtx)
 		}
-		return fmt.Errorf("gemini tts: read stream: %w", err)
+		return fmt.Errorf("gemini tts: read stream: %w", providererr.From("gemini", err))
 	}
 	if !audioSeen {
 		if finishReason != "" {
-			return fmt.Errorf("gemini tts: the engine gave no audio (finish reason: %s)", finishReason)
+			return fmt.Errorf("gemini tts: the engine gave no audio (finish reason: %s)", cmp.Or(providererr.Token(finishReason), "unnamed"))
 		}
 		return errors.New("gemini tts: the engine gave no audio")
 	}
@@ -343,14 +345,15 @@ func (s stallReader) Read(p []byte) (int, error) {
 }
 
 // emitEvent decodes one event of the stream, emits its audio and returns the
-// server's finish reason when the event supplied one.
-func (*Gemini) emitEvent(data []byte, text string, emit func(pcm []byte) error) (string, error) {
+// server's finish reason when the event supplied one. An error event keeps
+// Vertex AI's status and code: its message can quote the text spoken.
+func (*Gemini) emitEvent(data []byte, emit func(pcm []byte) error) (string, error) {
 	var event geminiEvent
 	if err := json.Unmarshal(data, &event); err != nil {
 		return "", fmt.Errorf("gemini tts: decode event: %w", err)
 	}
 	if e := event.Error; e != nil {
-		return "", fmt.Errorf("gemini tts: stream error %d %s: %s", e.Code, e.Status, spokentext.Withhold(e.Message, text))
+		return "", fmt.Errorf("gemini tts: stream error: %w", providererr.New("gemini", e.Code, e.Status, e.Message))
 	}
 	var finishReason string
 	for _, candidate := range event.Candidates {
@@ -370,18 +373,16 @@ func (*Gemini) emitEvent(data []byte, text string, emit func(pcm []byte) error) 
 }
 
 // geminiStatusError is the error of a refused request to speak text: Vertex
-// AI's message when the body carries one, else the body, either withheld
-// when it quotes text (spokentext.Withhold).
-func geminiStatusError(resp *http.Response, text string) error {
+// AI's status and, when the body carries one, its code. Its message and the
+// body can quote the text, so neither is kept.
+func geminiStatusError(resp *http.Response) error {
 	body, err := io.ReadAll(io.LimitReader(resp.Body, geminiMaxErrorBody))
 	if err != nil {
-		return fmt.Errorf("gemini tts: api error (status %d), body unreadable: %w", resp.StatusCode, err)
+		return fmt.Errorf("gemini tts: api error (status %d), body unreadable: %w", resp.StatusCode, providererr.From("gemini", err))
 	}
 	var refusal struct {
 		Error geminiError `json:"error"`
 	}
-	if json.Unmarshal(body, &refusal) == nil && refusal.Error.Message != "" {
-		return fmt.Errorf("gemini tts: api error (status %d): %s", resp.StatusCode, spokentext.Withhold(refusal.Error.Message, text))
-	}
-	return fmt.Errorf("gemini tts: api error (status %d): %s", resp.StatusCode, spokentext.Withhold(strings.TrimSpace(string(body)), text))
+	_ = json.Unmarshal(body, &refusal)
+	return fmt.Errorf("gemini tts: api error: %w", providererr.New("gemini", resp.StatusCode, refusal.Error.Status, refusal.Error.Message))
 }

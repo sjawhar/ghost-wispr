@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net/url"
 	"regexp"
 	"slices"
 	"strings"
@@ -18,6 +17,7 @@ import (
 	"google.golang.org/genai"
 
 	"github.com/sjawhar/ghost-wispr/internal/envoy"
+	"github.com/sjawhar/ghost-wispr/internal/providererr"
 	"github.com/sjawhar/ghost-wispr/internal/voice"
 )
 
@@ -873,7 +873,7 @@ func (c *Concierge) generate(ctx context.Context, tools *runner, prompt string, 
 		var calls []*genai.FunctionCall
 		for response, err := range c.generator.GenerateContentStream(ctx, c.model, contents, roundConfig) {
 			if err != nil {
-				return fmt.Errorf("concierge: the model: %w", quiet(err))
+				return fmt.Errorf("concierge: the model: %w", providererr.From("gemini", err))
 			}
 			if ctx.Err() != nil {
 				return ctx.Err()
@@ -1054,7 +1054,7 @@ func (c *Concierge) rewrite(ctx context.Context, written, issueKey string) EarRe
 		tries = try
 		text, err := c.rewriteForEar(ctx, written, issueKey, reason)
 		if err != nil {
-			c.logger.Warn("concierge could not rewrite an answer for the ear", "try", try, "error", quiet(err))
+			c.logger.Warn("concierge could not rewrite an answer for the ear", "try", try, "error", providererr.From("gemini", err))
 			reason = "the rewrite was empty or failed"
 			continue
 		}
@@ -1373,23 +1373,4 @@ func (s *sentences) speak(ctx context.Context, sentence string) error {
 	s.spoken++
 	s.words += words
 	return nil
-}
-
-// quiet is a model error without the server's message, which may quote the
-// prompt and so the room's words: an API error keeps its code and status, and
-// a transport error loses the URL.
-func quiet(err error) error {
-	var refused genai.APIError
-	var refusedPointer *genai.APIError
-	var transport *url.Error
-	switch {
-	case errors.As(err, &refused):
-		return fmt.Errorf("the model answered %d %s", refused.Code, refused.Status)
-	case errors.As(err, &refusedPointer):
-		return fmt.Errorf("the model answered %d %s", refusedPointer.Code, refusedPointer.Status)
-	case errors.As(err, &transport):
-		return transport.Err
-	default:
-		return err
-	}
 }

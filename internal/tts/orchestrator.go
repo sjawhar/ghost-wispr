@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"runtime/debug"
 	"sync"
 	"time"
 
@@ -208,12 +209,14 @@ func (o *Orchestrator) worker() {
 	}
 }
 
-// processRequest handles a single TTS request with panic recovery.
+// processRequest handles a single TTS request with panic recovery. A panic's
+// value can quote what the provider answered, so the log names its type, the
+// provider and the stack, and the request's status a fixed description.
 func (o *Orchestrator) processRequest(req *speakRequest) {
 	defer func() {
 		if r := recover(); r != nil {
-			slog.Error("tts orchestrator panic recovered", "request_id", req.id, "panic", r)
-			o.updateStatus(req.id, StatusFailed, 0, 0, fmt.Sprintf("internal error: %v", r))
+			slog.Error("tts orchestrator panic recovered", "request_id", req.id, "provider", o.ttsProvider.Name(), "panic_type", fmt.Sprintf("%T", r), "stack", string(debug.Stack()))
+			o.updateStatus(req.id, StatusFailed, 0, 0, "internal error: synthesis panicked")
 			o.finishSynthesis(req.id)
 		}
 	}()

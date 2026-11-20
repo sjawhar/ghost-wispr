@@ -396,34 +396,38 @@ func TestAuraSaysTheTextAgainWhenTheSocketDiesBeforeAnyAudio(t *testing.T) {
 }
 
 // TestAuraFailureFailsTheSay fails if a socket Deepgram ends with an error
-// does not fail the Say with Deepgram's reason and report it.
+// does not fail the Say and report it with Deepgram's close code, or keeps
+// Deepgram's reason, which can quote the text spoken.
 func TestAuraFailureFailsTheSay(t *testing.T) {
 	f := startSpeak(t, func(c *speakConn, typ, _ string) {
 		if typ == "Flush" {
-			c.closeWith(websocket.CloseInternalServerErr, "synthesis unavailable")
+			c.closeWith(websocket.CloseInternalServerErr, "synthesis unavailable for "+auraPlanted)
 		}
 	})
 	s := openSession(t, newTestAura(t, f), newFakeOutput())
 	err := s.Say(context.Background(), "hello", voice.Fact)
-	if err == nil || !strings.Contains(err.Error(), "synthesis unavailable") {
-		t.Fatalf("Say = %v, want Deepgram's reason", err)
+	if err == nil || !strings.Contains(err.Error(), "code 1011") || strings.Contains(err.Error(), "synthesis unavailable") {
+		t.Fatalf("Say = %v, want Deepgram's close code and not its reason", err)
 	}
 	got := expectEvents(t, s.Events(), voice.EventAgentText, voice.EventErr)
-	if got[1].Err == nil || !strings.Contains(got[1].Err.Error(), "synthesis unavailable") {
-		t.Fatalf("EventErr = %v, want Deepgram's reason", got[1].Err)
+	if got[1].Err == nil || !strings.Contains(got[1].Err.Error(), "code 1011") || strings.Contains(got[1].Err.Error(), auraPlanted) {
+		t.Fatalf("EventErr = %v, want Deepgram's close code and not its reason", got[1].Err)
 	}
 }
 
+// auraPlanted stands for a meeting's words in what Deepgram answers.
+const auraPlanted = "quokkaplantedroomword"
+
 // TestAuraStallFailsTheSayWithDeepgramsWarning fails if a Say waits for good
-// on a Flush Deepgram never answers, or its error hides the warning Deepgram
-// sent instead.
+// on a Flush Deepgram never answers, or its error does not name the warning's
+// code Deepgram sent instead, or keeps the warning's text.
 func TestAuraStallFailsTheSayWithDeepgramsWarning(t *testing.T) {
 	stall := auraStallTimeout
 	auraStallTimeout = 200 * time.Millisecond
 	t.Cleanup(func() { auraStallTimeout = stall })
 	f := startSpeak(t, func(c *speakConn, typ, _ string) {
 		if typ == "Flush" {
-			_ = c.send(`{"type":"Warning","description":"Too many Flush messages","code":"FLUSH_LIMIT"}`)
+			_ = c.send(`{"type":"Warning","description":"Too many Flush messages for ` + auraPlanted + `","code":"FLUSH_LIMIT"}`)
 		}
 	})
 	s := openSession(t, newTestAura(t, f), newFakeOutput())
@@ -431,11 +435,30 @@ func TestAuraStallFailsTheSayWithDeepgramsWarning(t *testing.T) {
 	go func() { said <- s.Say(context.Background(), "hello", voice.Fact) }()
 	select {
 	case err := <-said:
-		if err == nil || !strings.Contains(err.Error(), "Too many Flush messages") {
-			t.Fatalf("Say = %v, want an error naming Deepgram's warning", err)
+		if err == nil || !strings.Contains(err.Error(), "FLUSH_LIMIT") || strings.Contains(err.Error(), "Too many Flush") {
+			t.Fatalf("Say = %v, want an error naming Deepgram's warning code and not its text", err)
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("Say still waiting 3 s on a Flush Deepgram never answered")
+	}
+}
+
+// TestAuraRefusedHandshakeKeepsOnlyItsStatus fails if Deepgram's refusal of
+// the socket keeps its status text or its dg-error header, which can quote
+// the text asked for, instead of the status code alone.
+func TestAuraRefusedHandshakeKeepsOnlyItsStatus(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("dg-error", "Could not speak "+auraPlanted)
+		w.WriteHeader(http.StatusBadRequest)
+	}))
+	t.Cleanup(server.Close)
+	a, err := NewAura(AuraConfig{APIKey: fakeAuraKey, BaseURL: "ws" + strings.TrimPrefix(server.URL, "http")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = a.Stream(context.Background(), "hello", func([]byte) error { return nil })
+	if err == nil || !strings.Contains(err.Error(), "HTTP 400") || strings.Contains(err.Error(), auraPlanted) || strings.Contains(err.Error(), "Bad Request") {
+		t.Fatalf("Stream = %v, want the refusal's status code alone", err)
 	}
 }
 

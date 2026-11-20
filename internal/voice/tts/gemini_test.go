@@ -224,32 +224,45 @@ func TestGeminiRequestsStreamingSpeech(t *testing.T) {
 	}
 }
 
+// geminiPlanted stands for a meeting's words in what Vertex AI answers.
+const geminiPlanted = "quokkaplantedroomword"
+
 // TestGeminiFailsTheStreamOnAnAPIError fails if a refused request does not
-// fail the Stream with Vertex AI's reason.
+// fail the Stream with Vertex AI's status and code, or keeps its message,
+// which can quote the text asked for, or the body.
 func TestGeminiFailsTheStreamOnAnAPIError(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusForbidden)
-		_, _ = io.WriteString(w, `{"error":{"code":403,"message":"Permission denied on resource","status":"PERMISSION_DENIED"}}`)
-	}))
-	t.Cleanup(srv.Close)
-	g, err := NewGemini(&GeminiConfig{Project: "example-project", Credentials: testCredentials(), BaseURL: srv.URL})
-	if err != nil {
-		t.Fatalf("NewGemini: %v", err)
-	}
-	err = g.Stream(context.Background(), "hello", func([]byte) error { return nil })
-	if err == nil || !strings.Contains(err.Error(), "Permission denied on resource") {
-		t.Fatalf("Stream = %v, want Vertex AI's reason", err)
+	for _, body := range []string{
+		`{"error":{"code":403,"message":"Permission denied for ` + geminiPlanted + `","status":"PERMISSION_DENIED"}}`,
+		`not JSON: ` + geminiPlanted,
+	} {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusForbidden)
+			_, _ = io.WriteString(w, body)
+		}))
+		g, err := NewGemini(&GeminiConfig{Project: "example-project", Credentials: testCredentials(), BaseURL: srv.URL})
+		if err != nil {
+			t.Fatalf("NewGemini: %v", err)
+		}
+		err = g.Stream(context.Background(), "hello", func([]byte) error { return nil })
+		srv.Close()
+		if err == nil || !strings.Contains(err.Error(), "403") || strings.Contains(err.Error(), geminiPlanted) {
+			t.Errorf("Stream = %v, want Vertex AI's status and not its text, for body %s", err, body)
+		}
+		if strings.HasPrefix(body, "{") && (err == nil || !strings.Contains(err.Error(), "PERMISSION_DENIED")) {
+			t.Errorf("Stream = %v, want Vertex AI's code PERMISSION_DENIED", err)
+		}
 	}
 }
 
 // TestGeminiFailsTheStreamOnAnErrorEvent fails if an error Vertex AI sends
-// inside the stream, after its 200, does not fail the Stream with its reason.
+// inside the stream, after its 200, does not fail the Stream with its status
+// and code, or keeps its message.
 func TestGeminiFailsTheStreamOnAnErrorEvent(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		_, _ = io.WriteString(w, sseAudio(ramp(0, 960)))
-		_, _ = io.WriteString(w, `data: {"error":{"code":429,"message":"Resource exhausted","status":"RESOURCE_EXHAUSTED"}}`+"\r\n\r\n")
+		_, _ = io.WriteString(w, `data: {"error":{"code":429,"message":"Resource exhausted by `+geminiPlanted+`","status":"RESOURCE_EXHAUSTED"}}`+"\r\n\r\n")
 	}))
 	t.Cleanup(srv.Close)
 	g, err := NewGemini(&GeminiConfig{Project: "example-project", Credentials: testCredentials(), BaseURL: srv.URL})
@@ -261,8 +274,8 @@ func TestGeminiFailsTheStreamOnAnErrorEvent(t *testing.T) {
 		emitted += len(pcm)
 		return nil
 	})
-	if err == nil || !strings.Contains(err.Error(), "Resource exhausted") {
-		t.Fatalf("Stream = %v, want Vertex AI's reason", err)
+	if err == nil || !strings.Contains(err.Error(), "429") || !strings.Contains(err.Error(), "RESOURCE_EXHAUSTED") || strings.Contains(err.Error(), geminiPlanted) {
+		t.Fatalf("Stream = %v, want Vertex AI's status and code, not its message", err)
 	}
 	if emitted != 960 {
 		t.Fatalf("emitted %d bytes before the error, want the 960 sent before it", emitted)

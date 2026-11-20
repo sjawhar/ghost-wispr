@@ -17,6 +17,7 @@ import (
 	"github.com/sjawhar/ghost-wispr/internal/config"
 	"github.com/sjawhar/ghost-wispr/internal/llm"
 	"github.com/sjawhar/ghost-wispr/internal/logging"
+	"github.com/sjawhar/ghost-wispr/internal/providererr"
 	"github.com/sjawhar/ghost-wispr/internal/retry"
 )
 
@@ -436,9 +437,16 @@ func (s *Summarizer) completeSummaryWithRetry(ctx context.Context, client llm.Cl
 	return result, nil
 }
 
+// isContextOverflow reports whether err says the transcript is longer than
+// the model takes: a provider's error says so in TooLong (its message is not
+// kept), any other error in its text.
 func isContextOverflow(err error) bool {
 	if err == nil {
 		return false
+	}
+	var answered *providererr.Error
+	if errors.As(err, &answered) {
+		return answered.TooLong
 	}
 	msg := strings.ToLower(err.Error())
 	if !strings.Contains(msg, "context") && !strings.Contains(msg, "token") {

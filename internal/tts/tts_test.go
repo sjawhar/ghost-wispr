@@ -236,7 +236,8 @@ func TestElevenLabs_Synthesize_APIError(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error")
 	}
-	if !strings.Contains(err.Error(), "invalid voice_id") {
+	// The error keeps ElevenLabs's status and code, never its message.
+	if !strings.Contains(err.Error(), "HTTP 400 (bad_request)") || strings.Contains(err.Error(), "invalid voice_id") {
 		t.Errorf("unexpected error: %v", err)
 	}
 }
@@ -486,7 +487,8 @@ func TestGoogle_Synthesize_APIError(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error")
 	}
-	if !strings.Contains(err.Error(), "permission denied") {
+	// The error keeps Google's status and code, never its message.
+	if !strings.Contains(err.Error(), "HTTP 403 (PERMISSION_DENIED)") || strings.Contains(err.Error(), "permission denied") {
 		t.Errorf("unexpected error: %v", err)
 	}
 }

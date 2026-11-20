@@ -511,12 +511,12 @@ func (s *session) answerTurn(turn int, words string, heard <-chan struct{}) {
 		if err != nil {
 			// The Supervisor says the Concierge's own sorry line. Its error
 			// may quote the room's words, so it reaches no log level.
-			s.log.Warn("the answer failed", "call_id", id)
+			s.log.Warn("the answer failed", "call_id", plainID(id))
 			return
 		}
 		var answer voice.AnswerResult
 		if json.Unmarshal(result, &answer) != nil {
-			s.log.Warn("the answer is not an AnswerResult", "call_id", id)
+			s.log.Warn("the answer is not an AnswerResult", "call_id", plainID(id))
 			return
 		}
 		w, _ := s.inject(s.ctx, answer.Say, false, &held{say: answer.Say, turn: turn}, s.sayLimit)
@@ -836,24 +836,35 @@ func (s *session) handle(m *serverMessage) {
 	}
 }
 
-// logProblem logs a Deepgram error or warning by its code only. Its free-text
-// description can quote the room's words, and no deletion path reaches a
-// log, even when log_level is Debug.
+// logProblem logs a Deepgram error or warning by its code only, and that
+// only when it is a plain token (plain). Its free-text description can quote
+// the room's words, and no deletion path reaches a log, even when log_level
+// is Debug.
 func (s *session) logProblem(level slog.Level, msg string, m *serverMessage) {
-	s.log.Log(context.Background(), level, msg, "code", m.Code)
+	s.log.Log(context.Background(), level, msg, "code", plain(m.Code))
+}
+
+// latencyFields are the figures of a LatencyReport Deepgram documents
+// (/docs/voice-agent-latency-report), in seconds. A report's other fields are
+// not logged: a field's name is Deepgram's text too, and a room word can
+// stand before "_latency".
+var latencyFields = []string{
+	"stt_latency", "ttt_token_latency", "ttt_text_latency", "ttt_tool_latency",
+	"ttt_thinking_latency", "tts_latency", "total_latency",
 }
 
 // logLatency logs the figures of one of Deepgram's latency reports for a
-// turn (its model and speech times), and nothing that is not a number.
+// turn (its model and speech times): each documented figure (latencyFields)
+// that is a number, and nothing else.
 func (s *session) logLatency(data []byte) {
 	var report map[string]any
 	if json.Unmarshal(data, &report) != nil {
 		return
 	}
-	attrs := make([]any, 0, 2*len(report))
-	for k, v := range report {
-		if f, ok := v.(float64); ok {
-			attrs = append(attrs, k, f)
+	attrs := make([]any, 0, 2*len(latencyFields))
+	for _, name := range latencyFields {
+		if f, ok := report[name].(float64); ok {
+			attrs = append(attrs, name, f)
 		}
 	}
 	s.log.Debug("Voice Agent latency", attrs...)
@@ -888,7 +899,7 @@ func (s *session) lost(err error) {
 // never declared, reaches no tool.
 func (s *session) call(f functionCall) {
 	if f.Name != voice.AnswerTool {
-		s.log.Warn("Deepgram called a function voice C does not declare", "call_id", f.ID, "function", f.Name)
+		s.log.Warn("Deepgram called a function voice C does not declare", "call_id", plainID(f.ID), "function", plain(f.Name))
 		go func() { _ = s.respond(&f, errorContent("there is no function "+f.Name)) }()
 		return
 	}
@@ -897,7 +908,7 @@ func (s *session) call(f functionCall) {
 		args = json.RawMessage("{}")
 	}
 	if !json.Valid(args) {
-		s.log.Warn("function call arguments are not JSON", "call_id", f.ID, "function", f.Name)
+		s.log.Warn("function call arguments are not JSON", "call_id", plainID(f.ID), "function", plain(f.Name))
 		go func() { _ = s.respond(&f, errorContent("the arguments were not JSON")) }()
 		return
 	}
@@ -917,7 +928,7 @@ func (s *session) call(f functionCall) {
 		// phonellm called again up to nine times in three seconds.
 		s.mu.Unlock()
 		cancel()
-		s.log.Info("a second answer call for one turn is not run", "call_id", f.ID)
+		s.log.Info("a second answer call for one turn is not run", "call_id", plainID(f.ID))
 		go func() { _ = s.respond(&f, answered) }()
 		return
 	}
@@ -942,13 +953,13 @@ func (s *session) call(f functionCall) {
 		if err != nil {
 			// The error may quote the call's arguments, so it reaches no log
 			// level. The Supervisor says the Concierge's own sorry line.
-			s.log.Warn("the answer failed", "call_id", f.ID)
+			s.log.Warn("the answer failed", "call_id", plainID(f.ID))
 			_ = s.finish(call, notAnswered)
 			return
 		}
 		var answer voice.AnswerResult
 		if err := json.Unmarshal(result, &answer); err != nil {
-			s.log.Warn("the answer is not an AnswerResult", "call_id", f.ID)
+			s.log.Warn("the answer is not an AnswerResult", "call_id", plainID(f.ID))
 			_ = s.finish(call, notAnswered)
 			return
 		}
@@ -994,7 +1005,7 @@ func (s *session) answer(ctx context.Context, call *pendingCall, say string) err
 		// The call is answered and its context ended; the words still go.
 		w, err := s.inject(ctx, say, false, h, s.sayLimit)
 		if w == nil {
-			s.log.Info("the answer could not be handed to Deepgram", "call_id", call.fn.ID, "reason", err)
+			s.log.Info("the answer could not be handed to Deepgram", "call_id", plainID(call.fn.ID), "reason", err)
 			return nil
 		}
 		s.awaitAnswer(ctx, call, w)
@@ -1003,7 +1014,7 @@ func (s *session) answer(ctx context.Context, call *pendingCall, say string) err
 	w, err := s.inject(call.voided, say, false, h, s.sayLimit)
 	if w == nil {
 		if err != nil {
-			s.log.Info("the answer could not be handed to Deepgram", "call_id", call.fn.ID, "reason", err)
+			s.log.Info("the answer could not be handed to Deepgram", "call_id", plainID(call.fn.ID), "reason", err)
 		}
 		return s.finish(call, notAnswered)
 	}
@@ -1016,9 +1027,9 @@ func (s *session) answer(ctx context.Context, call *pendingCall, say string) err
 func (s *session) awaitAnswer(ctx context.Context, call *pendingCall, w *sayWait) {
 	switch err := s.await(ctx, w); {
 	case errors.Is(err, ErrRefused):
-		s.log.Info("Deepgram refused the answer; it is handed over again when the room is done", "call_id", call.fn.ID)
+		s.log.Info("Deepgram refused the answer; it is handed over again when the room is done", "call_id", plainID(call.fn.ID))
 	case err != nil:
-		s.log.Info("the answer was not spoken", "call_id", call.fn.ID, "reason", err)
+		s.log.Info("the answer was not spoken", "call_id", plainID(call.fn.ID), "reason", err)
 	}
 }
 

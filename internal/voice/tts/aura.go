@@ -19,7 +19,7 @@ import (
 
 	"github.com/sjawhar/ghost-wispr/internal/audio"
 	"github.com/sjawhar/ghost-wispr/internal/netdial"
-	"github.com/sjawhar/ghost-wispr/internal/spokentext"
+	"github.com/sjawhar/ghost-wispr/internal/providererr"
 )
 
 const (
@@ -221,10 +221,6 @@ type auraSocket struct {
 	msgs    chan auraMessage
 	done    chan struct{} // closed when the reader returns
 	err     error         // why the reader returned, when not closed by us; read after done
-	// lastText is the text the socket last spoke, for endErr's filter. Only
-	// the goroutine that streams touches it.
-	lastText string
-
 	// clearing is set when a Clear awaits its Cleared. Only the goroutine
 	// that streams touches it.
 	clearing bool
@@ -260,9 +256,11 @@ func (a *Aura) dial(ctx context.Context) (*auraSocket, error) {
 	}
 	if err != nil {
 		if response != nil {
-			return nil, fmt.Errorf("aura: connect: %w (%s %s)", err, response.Status, response.Header.Get("dg-error"))
+			// Deepgram's status text and dg-error header can quote the text
+			// asked for: the error keeps the status code.
+			return nil, fmt.Errorf("aura: connect: %w (HTTP %d)", err, response.StatusCode)
 		}
-		return nil, fmt.Errorf("aura: connect: %w", err)
+		return nil, fmt.Errorf("aura: connect: %w", providererr.From("deepgram", err))
 	}
 	if a.dialed != nil && response != nil && response.Request != nil {
 		a.dialed(response.Request.URL)
@@ -282,7 +280,6 @@ func (a *Aura) dial(ctx context.Context) (*auraSocket, error) {
 // until its Flushed. When ctx ends or emit fails, it sends Clear and returns
 // without waiting for the Cleared, which the next stream waits for.
 func (s *auraSocket) stream(ctx context.Context, text string, emit func(pcm []byte) error) error {
-	s.lastText = text
 	speak, err := json.Marshal(auraSpeak{Type: "Speak", Text: text})
 	if err != nil {
 		return fmt.Errorf("aura: %w", err)
@@ -328,7 +325,7 @@ func (s *auraSocket) stream(ctx context.Context, text string, emit func(pcm []by
 		case <-stall.C:
 			s.abort()
 			if warning != "" {
-				return fmt.Errorf("aura: no audio for %s after Deepgram warned: %s", auraStallTimeout, spokentext.Withhold(warning, text))
+				return fmt.Errorf("aura: no audio for %s after Deepgram warned (%s)", auraStallTimeout, warning)
 			}
 			return fmt.Errorf("aura: no audio for %s after a Flush", auraStallTimeout)
 		}
@@ -387,15 +384,14 @@ func (s *auraSocket) send(msg []byte) error {
 // ended reports whether the socket can no longer speak.
 func (s *auraSocket) ended() bool { return s.closed.Load() }
 
-// endErr is why the reader ended. Call it only after done. Deepgram's close
-// reason may quote the text the socket last spoke, which it withholds
-// (spokentext.Withhold).
+// endErr is why the reader ended. Call it only after done. A close Deepgram
+// sent keeps its code alone: its reason can quote the text spoken.
 func (s *auraSocket) endErr() error {
-	if s.err != nil {
-		msg := s.err.Error()
-		if withheld := spokentext.Withhold(msg, s.lastText); withheld != msg {
-			return fmt.Errorf("aura: %s", withheld)
-		}
+	var closed *websocket.CloseError
+	switch {
+	case errors.As(s.err, &closed):
+		return fmt.Errorf("aura: deepgram closed the socket with code %d", closed.Code)
+	case s.err != nil:
 		return fmt.Errorf("aura: %w", s.err)
 	}
 	return errAuraSocketClosed
@@ -454,7 +450,9 @@ func (s *auraSocket) read() {
 			}
 			m = auraMessage{kind: head.Type}
 			if head.Type == "Warning" {
-				m.warning = fmt.Sprintf("%s (%s)", head.Description, head.Code)
+				// Deepgram's description can quote the text spoken; its
+				// code, when it is a plain token, cannot.
+				m.warning = cmp.Or(providererr.Token(head.Code), "no code")
 			}
 		}
 		select {

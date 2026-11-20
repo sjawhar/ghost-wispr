@@ -6,15 +6,19 @@ import (
 	"crypto/x509"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
 	"cloud.google.com/go/auth"
 	"cloud.google.com/go/auth/credentials"
 	"cloud.google.com/go/auth/credentials/impersonate"
+
+	"github.com/sjawhar/ghost-wispr/internal/providererr"
 )
 
 // CloudPlatformScope is required to mint an ID token through IAM Credentials.
@@ -133,9 +137,26 @@ func IDToken(ctx context.Context, credPath, audience string) (string, error) {
 	}
 	token, err := idTokenCredentials.Token(ctx)
 	if err != nil {
-		return "", fmt.Errorf("mint ID token: %w", err)
+		return "", fmt.Errorf("mint ID token: %w", impersonationError(err))
 	}
 	return token.Value, nil
+}
+
+// impersonationError is err, the impersonation's failure, reduced: IAM's
+// answer, which the impersonation quotes ("impersonate: status code 403:
+// <answer>"), can hold what it was sent, so only the status that prefix
+// names is kept (providererr).
+func impersonationError(err error) error {
+	reduced := providererr.From("google", err)
+	var answered *providererr.Error
+	if errors.As(reduced, &answered) && answered.Withheld && answered.Status == 0 {
+		if rest, ok := strings.CutPrefix(err.Error(), "impersonate: status code "); ok && len(rest) > 3 && rest[3] == ':' {
+			if status, convErr := strconv.Atoi(rest[:3]); convErr == nil {
+				answered.Status = status
+			}
+		}
+	}
+	return reduced
 }
 
 func serviceAccountFromImpersonationURL(rawURL string) (string, error) {

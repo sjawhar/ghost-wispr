@@ -8,6 +8,8 @@ import (
 
 	"github.com/anthropics/anthropic-sdk-go"
 	"github.com/anthropics/anthropic-sdk-go/option"
+
+	"github.com/sjawhar/ghost-wispr/internal/providererr"
 )
 
 type anthropicClient struct {
@@ -64,7 +66,7 @@ func (c *anthropicClient) Complete(ctx context.Context, messages []Message) (str
 		Messages:  chatMessages,
 	})
 	if err != nil {
-		return "", fmt.Errorf("anthropic completion: %w", err)
+		return "", fmt.Errorf("anthropic completion: %w", providererr.From("anthropic", err))
 	}
 	return c.extractText(resp)
 }
@@ -83,7 +85,7 @@ func (c *anthropicClient) CompleteJSON(ctx context.Context, messages []Message, 
 		},
 	})
 	if err != nil {
-		return nil, fmt.Errorf("anthropic json completion: %w", err)
+		return nil, fmt.Errorf("anthropic json completion: %w", providererr.From("anthropic", err))
 	}
 	text, err := c.extractText(resp)
 	if err != nil {

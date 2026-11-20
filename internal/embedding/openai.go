@@ -6,6 +6,8 @@ import (
 	"sync"
 
 	openai "github.com/sashabaranov/go-openai"
+
+	"github.com/sjawhar/ghost-wispr/internal/providererr"
 )
 
 type openAIEmbedder interface {
@@ -43,7 +45,7 @@ func (c *openaiClient) Embed(ctx context.Context, texts []string, _ TaskType) ([
 		Model: openai.EmbeddingModel(c.model),
 	})
 	if err != nil {
-		return nil, fmt.Errorf("openai embedding: %w", err)
+		return nil, fmt.Errorf("openai embedding: %w", providererr.From("openai", err))
 	}
 	if len(resp.Data) == 0 {
 		return nil, fmt.Errorf("openai: no embeddings in response")

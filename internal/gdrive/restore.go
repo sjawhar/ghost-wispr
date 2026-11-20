@@ -15,6 +15,7 @@ import (
 
 	"google.golang.org/api/drive/v3"
 
+	"github.com/sjawhar/ghost-wispr/internal/providererr"
 	recordingname "github.com/sjawhar/ghost-wispr/internal/recording"
 	"github.com/sjawhar/ghost-wispr/internal/transcribe"
 )
@@ -66,7 +67,7 @@ func (s *Syncer) ListSessionFolders(ctx context.Context) ([]*drive.File, error) 
 
 		resp, err := call.Do()
 		if err != nil {
-			return nil, fmt.Errorf("list session folders: %w", err)
+			return nil, fmt.Errorf("list session folders: %w", driveError(err))
 		}
 		folders = append(folders, resp.Files...)
 		if resp.NextPageToken == "" {
@@ -86,7 +87,7 @@ func (s *Syncer) ListSessionFolders(ctx context.Context) ([]*drive.File, error) 
 			SupportsAllDrives(true).IncludeItemsFromAllDrives(true).
 			Fields("files(id)").Context(ctx).Do()
 		if err != nil {
-			return nil, fmt.Errorf("list session folders: none found, and shared drive %s could not be listed to check: %v", s.folderID, err)
+			return nil, fmt.Errorf("list session folders: none found, and shared drive %s could not be listed to check: %v", s.folderID, driveError(err))
 		}
 		if len(inDrive.Files) > 0 {
 			return nil, fmt.Errorf("list session folders: none found, though shared drive %s holds folder %s the app made: Drive's list of the drive's folders without corpora left it out, so a restore would miss sessions", s.folderID, inDrive.Files[0].Id)
@@ -113,7 +114,7 @@ func (s *Syncer) ListFolderFiles(ctx context.Context, folderID string) ([]*drive
 		}
 		resp, err := call.Do()
 		if err != nil {
-			return nil, fmt.Errorf("list folder files %s: %w", folderID, err)
+			return nil, fmt.Errorf("list folder files %s: %w", folderID, driveError(err))
 		}
 		files = append(files, resp.Files...)
 		if resp.NextPageToken == "" {
@@ -155,10 +156,10 @@ func (s *Syncer) DownloadRecording(ctx context.Context, folderID, name, destinat
 	response, err := s.service.Files.Get(recording.Id).SupportsAllDrives(true).Context(ctx).Download()
 	if err != nil {
 		_ = temp.Close()
-		return fmt.Errorf("download recording %s: %w", name, err)
+		return fmt.Errorf("download recording %s: %w", name, driveError(err))
 	}
 	defer func() { _ = response.Body.Close() }()
-	if _, err := io.Copy(temp, response.Body); err != nil {
+	if _, err := io.Copy(temp, providererr.Reader("drive", response.Body)); err != nil {
 		_ = temp.Close()
 		return fmt.Errorf("write downloaded recording %s: %w", destination, err)
 	}
@@ -188,13 +189,13 @@ func (s *Syncer) DownloadRecording(ctx context.Context, folderID, name, destinat
 func (s *Syncer) ExportGoogleDoc(ctx context.Context, fileID string) (string, error) {
 	resp, err := s.service.Files.Export(fileID, "text/plain").Context(ctx).Download()
 	if err != nil {
-		return "", fmt.Errorf("export doc %s: %w", fileID, err)
+		return "", fmt.Errorf("export doc %s: %w", fileID, driveError(err))
 	}
 	defer func() { _ = resp.Body.Close() }()
 
 	data, err := io.ReadAll(io.LimitReader(resp.Body, 10<<20))
 	if err != nil {
-		return "", fmt.Errorf("read export %s: %w", fileID, err)
+		return "", fmt.Errorf("read export %s: %w", fileID, driveError(err))
 	}
 
 	// Strip BOM if present.

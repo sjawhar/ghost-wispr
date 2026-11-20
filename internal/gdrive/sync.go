@@ -22,6 +22,7 @@ import (
 	"google.golang.org/api/option"
 
 	"github.com/sjawhar/ghost-wispr/internal/logging"
+	"github.com/sjawhar/ghost-wispr/internal/providererr"
 	recordingname "github.com/sjawhar/ghost-wispr/internal/recording"
 	"github.com/sjawhar/ghost-wispr/internal/transcribe"
 )
@@ -33,6 +34,12 @@ type Syncer struct {
 	// mu keeps one upload or replacement (Serialize) at a time.
 	mu sync.Mutex
 }
+
+// driveError is err, a Drive call's error, with Drive's message left out
+// (providererr.From): Drive can quote what it was sent, a folder's name,
+// which holds the session's title, or a document's content. Its status and
+// reason stay, and IsRemoteDeletedError still reads them.
+func driveError(err error) error { return providererr.From("drive", err) }
 
 const resumableUploadThresholdBytes int64 = 5 * 1024 * 1024
 
@@ -221,7 +228,7 @@ func (s *Syncer) upload(ctx context.Context, folderName string, files []SyncFile
 	if err != nil {
 		// folderName holds the session's title, which names its topic; this
 		// error is logged and kept as the session's sync error.
-		return "", fmt.Errorf("create a session folder in Drive folder %s: %w", s.folderID, err)
+		return "", fmt.Errorf("create a session folder in Drive folder %s: %w", s.folderID, driveError(err))
 	}
 	if record != nil {
 		if err := record(folder.Id); err != nil {
@@ -265,7 +272,7 @@ var ErrDriveDidNotAnswer = errors.New("drive did not answer")
 // 404.
 func (s *Syncer) CheckFolder(ctx context.Context, folderID string) error {
 	folder, err := s.service.Files.Get(folderID).SupportsAllDrives(true).Fields("id, trashed, explicitlyTrashed").Context(ctx).Do()
-	if err != nil {
+	if err = driveError(err); err != nil {
 		if !IsRemoteDeletedError(err) {
 			return fmt.Errorf("get folder %s: %w", folderID, err)
 		}
@@ -303,6 +310,7 @@ func (s *Syncer) CheckFolder(ctx context.Context, folderID string) error {
 // read the drive and get 404 for the folders the first one made.
 func (s *Syncer) rootReadable(ctx context.Context) (sharedDrive bool, err error) {
 	_, err = s.service.Files.Get(s.folderID).SupportsAllDrives(true).Fields("id").Context(ctx).Do()
+	err = driveError(err)
 	if err == nil || !IsRemoteDeletedError(err) {
 		return false, err
 	}
@@ -311,7 +319,7 @@ func (s *Syncer) rootReadable(ctx context.Context) (sharedDrive bool, err error)
 		SupportsAllDrives(true).IncludeItemsFromAllDrives(true).
 		Fields("files(id)").Context(ctx).Do()
 	if listErr != nil {
-		return false, fmt.Errorf("%v; nor does Drive list it as a shared drive the app is a member of: %v", err, listErr)
+		return false, fmt.Errorf("%v; nor does Drive list it as a shared drive the app is a member of: %v", err, driveError(listErr))
 	}
 	return true, nil
 }
@@ -359,7 +367,7 @@ func (s *Syncer) RecordingsMatch(ctx context.Context, folderID string, checksums
 			return nil
 		})
 	if err != nil {
-		return false, fmt.Errorf("list recordings in folder %s: %w", folderID, err)
+		return false, fmt.Errorf("list recordings in folder %s: %w", folderID, driveError(err))
 	}
 	return len(remaining) == 0, nil
 }
@@ -471,7 +479,7 @@ func (s *Syncer) UploadInto(ctx context.Context, folderID string, files []SyncFi
 			return nil
 		})
 	if err != nil {
-		return s.folderOr(ctx, folderID, fmt.Errorf("list folder %s: %w", folderID, err))
+		return s.folderOr(ctx, folderID, fmt.Errorf("list folder %s: %w", folderID, driveError(err)))
 	}
 	create, update := planUpload(existing, files)
 	for i := range create {
@@ -512,7 +520,7 @@ func (s *Syncer) updateDocument(ctx context.Context, u *docUpdate) error {
 		Media(bytes.NewReader(u.File.Content), googleapi.ContentType(u.File.ContentType)).
 		SupportsAllDrives(true).Context(ctx).Fields("id").Do()
 	if err != nil {
-		return fmt.Errorf("update %s: %w", u.File.Name, err)
+		return fmt.Errorf("update %s: %w", u.File.Name, driveError(err))
 	}
 	return nil
 }
@@ -581,7 +589,7 @@ func (s *Syncer) UploadFile(ctx context.Context, folderID string, f *SyncFile) (
 		_ = file.Close()
 	}
 	if err != nil {
-		return "", fmt.Errorf("upload %s: %w", f.Name, err)
+		return "", fmt.Errorf("upload %s: %w", f.Name, driveError(err))
 	}
 	if created.Id == "" {
 		return "", fmt.Errorf("upload %s: Drive returned no file id", f.Name)
