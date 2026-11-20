@@ -68,10 +68,10 @@ type options struct {
 	each        bool
 	// detector makes each detector the run uses: newDetector, the
 	// listener's own.
-	detector func(options) (*local.Detector, error)
+	detector func(*options) (*local.Detector, error)
 }
 
-func run(args []string, stdout, stderr io.Writer, detector func(options) (*local.Detector, error)) int {
+func run(args []string, stdout, stderr io.Writer, detector func(*options) (*local.Detector, error)) int {
 	o := options{detector: detector}
 	flags := flag.NewFlagSet("measure-wake", flag.ContinueOnError)
 	flags.SetOutput(stderr)
@@ -105,7 +105,7 @@ func run(args []string, stdout, stderr io.Writer, detector func(options) (*local
 		_, _ = fmt.Fprintf(stderr, "measure-wake: -parallel %d: at least 1\n", o.parallel)
 		return 2
 	}
-	verdict, err := measure(o, stdout)
+	verdict, err := measure(&o, stdout)
 	if err != nil {
 		_, _ = fmt.Fprintf(stderr, "measure-wake: %v\n", err)
 		return 1
@@ -117,7 +117,7 @@ func run(args []string, stdout, stderr io.Writer, detector func(options) (*local
 	return 0
 }
 
-func newDetector(o options) (*local.Detector, error) {
+func newDetector(o *options) (*local.Detector, error) {
 	opts := local.Options{Thresholds: local.Thresholds{Boost: o.boost, Threshold: o.threshold}, NoStageTwo: !o.stage2}
 	switch o.decoys {
 	case "":
@@ -131,7 +131,7 @@ func newDetector(o options) (*local.Detector, error) {
 
 // measure runs the listener's detector over the audio and the phrases and
 // returns the verdict.
-func measure(o options, out io.Writer) (string, error) {
+func measure(o *options, out io.Writer) (string, error) {
 	_, _ = fmt.Fprintf(out, "boost=%g threshold=%g stage2=%t decoys=%q parallel=%d\n", o.boost, o.threshold, o.stage2, o.decoys, o.parallel)
 	verdicts := []string{}
 	if o.audio != "" {
@@ -268,7 +268,7 @@ func countStreams(d *local.Detector, all [][]string, worker, workers int, splice
 	return c, nil
 }
 
-func measureFalseStarts(o options, out io.Writer) (string, error) {
+func measureFalseStarts(o *options, out io.Writer) (string, error) {
 	all, err := streams(o.audio)
 	if err != nil {
 		return "", err
@@ -293,12 +293,18 @@ func measureFalseStarts(o options, out io.Writer) (string, error) {
 	}
 	spliceEvery := int(o.spliceEvery.Seconds() * local.SampleRate)
 	detectors := make([]*local.Detector, o.parallel)
+	defer func() {
+		for _, d := range detectors {
+			if d != nil {
+				d.Close()
+			}
+		}
+	}()
 	for i := range detectors {
 		d, err := o.detector(o)
 		if err != nil {
 			return "", err
 		}
-		defer d.Close()
 		detectors[i] = d
 	}
 	started := cpuTime()
@@ -358,7 +364,7 @@ func measureFalseStarts(o options, out io.Writer) (string, error) {
 	}
 }
 
-func measurePhrases(o options, out io.Writer) (string, error) {
+func measurePhrases(o *options, out io.Writer) (string, error) {
 	d, err := o.detector(o)
 	if err != nil {
 		return "", err

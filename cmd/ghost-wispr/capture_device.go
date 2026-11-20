@@ -242,13 +242,6 @@ func (d *captureDevice) closeListenerStream(closeFn func() error) error {
 	return err
 }
 
-// listenerOpen reports whether the paused listener's stream is open.
-func (d *captureDevice) listenerOpen() bool {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	return d.listening
-}
-
 // playbackOpening counts a speaker playback stream as open, once any light
 // write under way has finished and settled (jabraLightSettle), so that no
 // light is written until the stream closes (playbackClosing). The speaker calls

@@ -1604,7 +1604,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 	}
 	startPowerButton(ctx, &cfg, capture, controlHooks, warningRegistry)
 	startJabraMuteButton(ctx, &cfg, capture, micDevice, controlHooks, warningRegistry, func() { voiceHooks.Stop("Jabra button") })
-	startPausedListener(ctx, cfgStore, pausedListenerUnit{
+	startPausedListener(ctx, cfgStore, &pausedListenerUnit{
 		capture: capture, controls: pauseControls, hooks: controlHooks, device: micDevice,
 		wake: hardware.Wake, warnings: warningRegistry, restored: restoredState, built: local.Built,
 	})

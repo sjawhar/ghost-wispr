@@ -41,8 +41,8 @@ func (textVerifier) Close()                  {}
 
 // fakeDetector is the tool's detector on the fake stages; stage 2 refuses
 // every hit when -stage2 is on and refuse is set.
-func fakeDetector(refuse bool) func(options) (*local.Detector, error) {
-	return func(o options) (*local.Detector, error) {
+func fakeDetector(refuse bool) func(*options) (*local.Detector, error) {
+	return func(o *options) (*local.Detector, error) {
 		text := textVerifier("WHISPER START RECORDING")
 		if refuse && o.stage2 {
 			text = "WHISPER STOP RECORDING"

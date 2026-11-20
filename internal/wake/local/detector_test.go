@@ -128,7 +128,7 @@ func TestEveryHitZeroesTheRing(t *testing.T) {
 // allZero reports whether every sample the detector holds, in its ring and in
 // its conversion buffer, is zero.
 func allZero(d *Detector) bool {
-	for _, s := range d.ring {
+	for _, s := range d.ring[:] {
 		if s != 0 {
 			return false
 		}

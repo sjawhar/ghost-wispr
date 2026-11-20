@@ -382,7 +382,7 @@ func startMicStatesRig(t *testing.T, opts statesOptions) *micStatesRig {
 		t.Fatal(err)
 	}
 	r.cfgStore = cfgStore
-	startPausedListener(ctx, cfgStore, pausedListenerUnit{
+	startPausedListener(ctx, cfgStore, &pausedListenerUnit{
 		capture: r.capture, controls: r.controls, hooks: r.hooks, device: r.device,
 		wake: r.hardware.Wake, warnings: r.warnings, restored: saved, built: !opts.notBuilt,
 		newDetector: func() (*local.Detector, error) { return local.NewDetectorOf(r.spotter, startVerifier{}), nil },

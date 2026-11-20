@@ -14,7 +14,6 @@ package local
 #cgo linux,arm64 LDFLAGS: -L${SRCDIR}/../../../third_party/sherpa-onnx/linux_arm64/lib
 #cgo LDFLAGS: -lsherpa-onnx-c-api -lsherpa-onnx-core -lkaldi-decoder-core -lsherpa-onnx-kaldifst-core -lsherpa-onnx-fstfar -lsherpa-onnx-fst -lkaldi-native-fbank-core -lkissfft-float -lssentencepiece_core -lutf8proc -lonnxruntime -lstdc++ -lm -ldl -lpthread -Wl,-z,noexecstack
 #include <stdlib.h>
-#include <string.h>
 #include "c-api.h"
 */
 import "C"
@@ -160,8 +159,10 @@ type sherpaSpotter struct {
 func newSherpaSpotter(m *memModel, lines string, threads int) (*sherpaSpotter, error) {
 	var s cStrings
 	defer s.free()
-	var c C.SherpaOnnxKeywordSpotterConfig
-	C.memset(unsafe.Pointer(&c), 0, C.sizeof_SherpaOnnxKeywordSpotterConfig)
+	// The config lives in C memory, zeroed, so cgo passes sherpa-onnx no Go
+	// pointer.
+	c := (*C.SherpaOnnxKeywordSpotterConfig)(C.calloc(1, C.sizeof_SherpaOnnxKeywordSpotterConfig))
+	defer C.free(unsafe.Pointer(c))
 	c.feat_config.sample_rate = SampleRate
 	c.feat_config.feature_dim = 80
 	s.modelConfig(&c.model_config, m, threads)
@@ -170,7 +171,7 @@ func newSherpaSpotter(m *memModel, lines string, threads int) (*sherpaSpotter, e
 	c.keywords_threshold = 0.25
 	c.keywords_buf = s.of(lines)
 	c.keywords_buf_size = C.int32_t(len(lines))
-	spotter := C.SherpaOnnxCreateKeywordSpotter(&c)
+	spotter := C.SherpaOnnxCreateKeywordSpotter(c)
 	if spotter == nil {
 		return nil, errors.New("paused listener: sherpa-onnx refused the keyword spotter's model or keywords")
 	}
@@ -233,14 +234,14 @@ type sherpaVerifier struct{ recognizer *C.SherpaOnnxOnlineRecognizer }
 func newSherpaVerifier(m *memModel, threads int) (*sherpaVerifier, error) {
 	var s cStrings
 	defer s.free()
-	var c C.SherpaOnnxOnlineRecognizerConfig
-	C.memset(unsafe.Pointer(&c), 0, C.sizeof_SherpaOnnxOnlineRecognizerConfig)
+	c := (*C.SherpaOnnxOnlineRecognizerConfig)(C.calloc(1, C.sizeof_SherpaOnnxOnlineRecognizerConfig))
+	defer C.free(unsafe.Pointer(c))
 	c.feat_config.sample_rate = SampleRate
 	c.feat_config.feature_dim = 80
 	s.modelConfig(&c.model_config, m, threads)
 	c.decoding_method = s.of("modified_beam_search")
 	c.max_active_paths = 4
-	recognizer := C.SherpaOnnxCreateOnlineRecognizer(&c)
+	recognizer := C.SherpaOnnxCreateOnlineRecognizer(c)
 	if recognizer == nil {
 		return nil, errors.New("paused listener: sherpa-onnx refused the recognizer's model")
 	}

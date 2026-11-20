@@ -52,7 +52,7 @@ func listenerOn(cfg *config.Config) bool { return cfg.Voice.Enabled && cfg.Voice
 // The listener is an ALSA capture in this process, opened and closed through
 // the capture device, which hands the microphone to and from the recording
 // microphone.
-func startPausedListener(ctx context.Context, cfgStore *config.Store, u pausedListenerUnit) {
+func startPausedListener(ctx context.Context, cfgStore *config.Store, u *pausedListenerUnit) {
 	cfg := cfgStore.Get()
 	if !u.built {
 		if listenerOn(&cfg) {
@@ -105,7 +105,7 @@ func startPausedListener(ctx context.Context, cfgStore *config.Store, u pausedLi
 // runPausedListener loads the spotter, then listens until ctx ends. The
 // model takes about a second to load, so main does not wait for it; until it
 // has, started is false and every pause closes the microphone.
-func runPausedListener(ctx context.Context, u pausedListenerUnit, started *atomic.Bool, changed func()) {
+func runPausedListener(ctx context.Context, u *pausedListenerUnit, started *atomic.Bool, changed func()) {
 	// The listener's ring holds up to 2 s of the room's audio in memory; a
 	// core dump would write it to disk. The service unit also sets
 	// LimitCORE=0 and MemorySwapMax=0.
