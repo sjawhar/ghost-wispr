@@ -1,6 +1,7 @@
 package dgagent
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -223,6 +224,39 @@ func TestAnInjectionKeepsItsSpacingThroughTheHold(t *testing.T) {
 				t.Errorf("the reply's frames reached Output over %v, want them together: the hold split the reply", spread)
 			}
 		})
+	}
+}
+
+// TestASayWhoseAudioWaitsPastItsLimitIsSpoken fails if a Say whose words and
+// audio came within its limit, but whose audio still waits out the hold when
+// the limit passes, returns ErrNotSpoken: the audio then plays anyway, and
+// the Supervisor, told it was not spoken, would say the answer again.
+func TestASayWhoseAudioWaitsPastItsLimitIsSpoken(t *testing.T) {
+	const limit = 200 * time.Millisecond
+	stand := startStandIn(t)
+	out := newFakeOutput()
+	clock := &heldClock{}
+	sess, c, _ := open(t, stand, Config{sayLimit: limit, speechGap: time.Minute, holdAfter: clock.after}, voice.Exchange{Out: out, Tools: tools(nil)})
+	defer func() { _ = sess.Close() }()
+	pcm := tone(OutputRate, 20*time.Millisecond, 150)
+	done := sayAsync(sess, "Held words.")
+	c.expect(t, "InjectAgentMessage")
+	c.send(map[string]any{"type": "ConversationText", "role": "assistant", "content": "Held words."})
+	c.sendAudio(pcm)
+	c.send(map[string]any{"type": "AgentAudioDone"})
+	c.send(map[string]any{"type": "ConversationText", "role": "user", "content": "read"})
+	waitEvent(t, sess, voice.EventUserTurn) // the session has the words and their audio
+	select {
+	case err := <-done:
+		t.Fatalf("Say = %v while its audio waited out the hold, want it to wait for the audio", err)
+	case <-time.After(2 * limit): // past the limit, the audio still waits
+	}
+	clock.release()
+	if err := returned(t, done); err != nil {
+		t.Fatalf("Say = %v, want nil: its audio came within the limit and played", err)
+	}
+	if got := out.nextPlayback(t).written(); !bytes.Equal(got, pcm) {
+		t.Fatalf("the Say played %d bytes, want its %d", len(got), len(pcm))
 	}
 }
 
