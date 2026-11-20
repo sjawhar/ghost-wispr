@@ -6,13 +6,47 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"sync"
 
-	"cloud.google.com/go/auth"
-
-	"github.com/sjawhar/ghost-wispr/internal/genaiconfig"
+	"github.com/sjawhar/ghost-wispr/internal/config"
+	"github.com/sjawhar/ghost-wispr/internal/providers"
 )
 
 const ModelNotReportedByProvider = "not reported by provider"
+
+// maxAnswerTokens caps the tokens of an answer the OpenAI and Anthropic
+// clients ask for; Anthropic's Messages API needs a cap, and its client has
+// always sent this one. Without a cap, claude-haiku-4-5 through the model
+// gateway's OpenAI API wrote one summary of 64,529 characters, ".jl"
+// repeated, for 6 min 42 s.
+const maxAnswerTokens = 8192
+
+// reported is the model a client's answers name, which a summary records
+// as its model.
+type reported struct {
+	mu    sync.RWMutex
+	model string
+}
+
+// ReportedModel returns the model the latest successful answer named,
+// ModelNotReportedByProvider when it named none, and "" before any answer.
+// The configured model never stands in for one: a gateway may serve a
+// request under another name.
+func (r *reported) ReportedModel() string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.model
+}
+
+func (r *reported) record(model string) {
+	model = strings.TrimSpace(model)
+	if model == "" {
+		model = ModelNotReportedByProvider
+	}
+	r.mu.Lock()
+	r.model = model
+	r.mu.Unlock()
+}
 
 type Message struct {
 	Role    string
@@ -24,58 +58,20 @@ type Client interface {
 	CompleteJSON(ctx context.Context, messages []Message, schema map[string]any) (json.RawMessage, error)
 }
 
-type Option func(*clientOptions)
-
-type GenAIConfig struct {
-	Backend     string
-	Project     string
-	Location    string
-	Credentials *auth.Credentials
-}
-
-type clientOptions struct {
-	baseURL string
-	genai   GenAIConfig
-}
-
-func WithBaseURL(url string) Option {
-	return func(o *clientOptions) {
-		o.baseURL = url
-	}
-}
-
-func WithGenAIConfig(cfg GenAIConfig) Option {
-	return func(o *clientOptions) {
-		o.genai = cfg
-	}
-}
-
-func ParseModel(model string) (provider, modelName string, err error) {
-	parts := strings.SplitN(model, "/", 2)
-	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
-		return "", "", fmt.Errorf("invalid model format %q: expected provider/model_name", model)
-	}
-	return parts[0], parts[1], nil
-}
-
-func NewClient(provider, apiKey, model string, opts ...Option) (Client, error) {
-	o := &clientOptions{}
-	for _, opt := range opts {
-		opt(o)
-	}
-
-	switch provider {
-	case "openai":
-		return newOpenAIClient(apiKey, model, o)
-	case "anthropic":
-		return newAnthropicClient(apiKey, model, o)
-	case "gemini":
-		if o.genai.Location == "" {
-			o.genai.Location = genaiconfig.DefaultLocation
-		}
-		return newGeminiClient(apiKey, model, o)
+// NewClient returns the client of model on provider p, by the wire API p
+// speaks: the OpenAI API's chat completions, Anthropic's Messages API, or
+// Gemini on Vertex AI or the Gemini API. Every request goes to p's base URL
+// and carries p's credential.
+func NewClient(p *providers.Provider, model string) (Client, error) {
+	switch p.API {
+	case config.APIOpenAI:
+		return newOpenAIClient(p, model), nil
+	case config.APIAnthropic:
+		return newAnthropicClient(p, model), nil
+	case config.APIVertex, config.APIGemini:
+		return newGeminiClient(p, model)
 	default:
-		return nil, fmt.Errorf("unknown LLM provider %q: supported providers are openai, anthropic, gemini", provider)
+		return nil, fmt.Errorf("provider %q speaks the %s API; a text client needs openai, anthropic, vertex or gemini", p.Name, p.API)
 	}
 }
 

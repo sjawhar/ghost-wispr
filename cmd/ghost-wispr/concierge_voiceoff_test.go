@@ -16,7 +16,7 @@ import (
 // counts its starts and stops.
 func countingLazyConcierge(t *testing.T) (lazy *lazyConcierge, counts func() (starts, stops int)) {
 	t.Helper()
-	cfg := config.Config{GenAIBackend: "gemini", GeminiAPIKey: strings.Repeat("k", 8)}
+	cfg := geminiKeyConfig(strings.Repeat("k", 8))
 	store := conciergeStore(t)
 	var mu sync.Mutex
 	starts, stops := 0, 0
@@ -90,7 +90,7 @@ func TestTheConciergeStopsWhenTheVoiceIsTurnedOff(t *testing.T) {
 // is on again), or if a shutdown cancels it (the unit's Envoy session is the
 // same after a restart, so its reply can still land).
 func TestTurningTheVoiceOffCancelsTheQuestionsAShutdownKeeps(t *testing.T) {
-	cfg := config.Config{GenAIBackend: "gemini", GeminiAPIKey: strings.Repeat("k", 8)}
+	cfg := geminiKeyConfig(strings.Repeat("k", 8))
 	store := conciergeStore(t)
 	at := time.Now()
 	if err := store.CreateSession("meeting", at); err != nil {

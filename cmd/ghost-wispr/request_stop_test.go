@@ -207,14 +207,14 @@ func TestNoRequestWritesTheStoreAfterTheStop(t *testing.T) {
 		store:                         store,
 		drive:                         drive,
 		deletion:                      deletion,
-		summarizer:                    held,
-		mergedSummarizer:              held,
+		summarizer:                    fixedSummarizerOf(held),
 		hub:                           &recordingBroadcaster{},
 		publishSummaryReady:           func(string) {},
 		recordMergedRefinementFailure: newMergedRefinementFailureRecorder(store),
 		restoreFromDrive: func(ctx context.Context) (*gdrive.RestoreResult, error) {
 			return nil, held.hold(ctx, "restore")
 		},
+		cfgStore: cfgStore,
 		submitSummaryBatch: func(ctx context.Context, _ []string) (string, int, error) {
 			return "", 0, held.hold(ctx, "submit")
 		},

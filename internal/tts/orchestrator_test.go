@@ -138,7 +138,7 @@ func TestOrchestrator_SpeakAndStatus(t *testing.T) {
 	})
 	defer o.Stop()
 
-	id, err := o.Speak("hello world", "default", "mock")
+	id, err := o.Speak("hello world", "default")
 	if err != nil {
 		t.Fatalf("Speak failed: %v", err)
 	}
@@ -181,7 +181,7 @@ func TestOrchestratorReportsEveryBytePlayed(t *testing.T) {
 	}
 	o := NewOrchestrator(provider, newTestSpeaker(t), OrchestratorOpts{MaxRequestsPerMin: 100})
 	defer o.Stop()
-	id, err := o.Speak("hello", "", "")
+	id, err := o.Speak("hello", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -214,7 +214,7 @@ func TestOrchestratorWaitForSynthesisUsesProviderModelBeforePlaybackEnds(t *test
 	o := NewOrchestrator(provider, speaker, OrchestratorOpts{MaxRequestsPerMin: 100})
 	defer o.Stop()
 
-	id, err := o.Speak("model acceptance", "", "gemini")
+	id, err := o.Speak("model acceptance", "")
 	if err != nil {
 		t.Fatalf("Speak: %v", err)
 	}
@@ -250,7 +250,7 @@ func TestOrchestrator_SpeakEmptyText(t *testing.T) {
 	o := NewOrchestrator(provider, speaker, OrchestratorOpts{MaxRequestsPerMin: 100})
 	defer o.Stop()
 
-	_, err := o.Speak("", "default", "mock")
+	_, err := o.Speak("", "default")
 	if err == nil {
 		t.Fatal("expected error for empty text")
 	}
@@ -276,7 +276,7 @@ func TestOrchestrator_QueueFull(t *testing.T) {
 	defer o.Stop()
 
 	// First Speak is picked up by the worker and blocks on gate.
-	_, err := o.Speak("text 0", "", "")
+	_, err := o.Speak("text 0", "")
 	if err != nil {
 		t.Fatalf("Speak 0 failed: %v", err)
 	}
@@ -285,14 +285,14 @@ func TestOrchestrator_QueueFull(t *testing.T) {
 
 	// Next 2 fill the channel buffer (depth=2).
 	for i := 1; i <= 2; i++ {
-		_, err := o.Speak(fmt.Sprintf("text %d", i), "", "")
+		_, err := o.Speak(fmt.Sprintf("text %d", i), "")
 		if err != nil {
 			t.Fatalf("Speak %d failed unexpectedly: %v", i, err)
 		}
 	}
 
 	// Next should fail with queue full.
-	_, err = o.Speak("overflow", "", "")
+	_, err = o.Speak("overflow", "")
 	if err != ErrQueueFull {
 		t.Fatalf("expected ErrQueueFull, got: %v", err)
 	}
@@ -316,14 +316,14 @@ func TestOrchestrator_RateLimit(t *testing.T) {
 
 	// Use up all rate limit slots.
 	for i := 0; i < 3; i++ {
-		_, err := o.Speak(fmt.Sprintf("text %d", i), "", "")
+		_, err := o.Speak(fmt.Sprintf("text %d", i), "")
 		if err != nil {
 			t.Fatalf("Speak %d failed: %v", i, err)
 		}
 	}
 
 	// Next should be rate limited.
-	_, err := o.Speak("rate limited", "", "")
+	_, err := o.Speak("rate limited", "")
 	if err != ErrRateLimited {
 		t.Fatalf("expected ErrRateLimited, got: %v", err)
 	}
@@ -338,7 +338,7 @@ func TestOrchestrator_SynthesisError(t *testing.T) {
 	})
 	defer o.Stop()
 
-	id, err := o.Speak("hello", "", "")
+	id, err := o.Speak("hello", "")
 	if err != nil {
 		t.Fatalf("Speak failed: %v", err)
 	}
@@ -376,7 +376,7 @@ func TestOrchestrator_SynthesisTimeout(t *testing.T) {
 	})
 	defer o.Stop()
 
-	id, err := o.Speak("hello", "", "")
+	id, err := o.Speak("hello", "")
 	if err != nil {
 		t.Fatalf("Speak failed: %v", err)
 	}
@@ -421,6 +421,33 @@ func TestOrchestrator_HasProviderAndSpeaker(t *testing.T) {
 	}
 	if !o.HasSpeaker() {
 		t.Error("expected HasSpeaker to be true")
+	}
+}
+
+// switchedProvider is a mockProvider that says whether it is configured, as
+// cmd's speechSource does by tts.model.
+type switchedProvider struct {
+	mockProvider
+	configured bool
+}
+
+func (p *switchedProvider) Configured() bool { return p.configured }
+
+// TestAnUnconfiguredProviderIsNoProvider fails if the Orchestrator counts a
+// provider whose Configured is false as a provider, or one whose Configured
+// is true as none: with text-to-speech off (tts.model ""), POST
+// /api/tts/speak would queue the request, spend a rate-limit slot and answer
+// 502, where it answers 501 for no provider.
+func TestAnUnconfiguredProviderIsNoProvider(t *testing.T) {
+	provider := &switchedProvider{}
+	o := NewOrchestrator(provider, newTestSpeaker(t), OrchestratorOpts{})
+	defer o.Stop()
+	if o.HasProvider() {
+		t.Error("HasProvider is true for a provider that is not configured")
+	}
+	provider.configured = true
+	if !o.HasProvider() {
+		t.Error("HasProvider is false for a configured provider")
 	}
 }
 
@@ -480,7 +507,7 @@ func TestOrchestratorSpeechStopsOnACancelOfTheVoice(t *testing.T) {
 	o := NewOrchestrator(provider, out, OrchestratorOpts{MaxRequestsPerMin: 100})
 	defer o.Stop()
 
-	id, err := o.Speak("a long answer", "", "")
+	id, err := o.Speak("a long answer", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -567,7 +594,7 @@ func TestOrchestratorReportsWhatPlayedOfASpeechCancelledInItsWrite(t *testing.T)
 			out := newOutputOn(t, stream)
 			o := NewOrchestrator(provider, out, OrchestratorOpts{MaxRequestsPerMin: 100})
 			defer o.Stop()
-			id, err := o.Speak("a long answer", "", "")
+			id, err := o.Speak("a long answer", "")
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -623,7 +650,7 @@ func TestAStoppedOrchestratorReportsNoPlayedBeforeTheTakeBack(t *testing.T) {
 			provider := &mockProvider{audio: pcm, format: audio.AudioFormat{SampleRate: 48000, Channels: 1, Encoding: audio.EncodingPCM16}}
 			o := NewOrchestrator(provider, out, OrchestratorOpts{MaxRequestsPerMin: 100})
 			defer o.Stop()
-			id, err := o.Speak("a long answer", "", "")
+			id, err := o.Speak("a long answer", "")
 			if err != nil {
 				t.Fatal(err)
 			}

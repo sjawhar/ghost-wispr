@@ -40,26 +40,25 @@ type errReader struct{ err error }
 
 func (e errReader) Read([]byte) (int, error) { return 0, e.err }
 
-// A Gemini stream that fails in transport, or whose stream or refusal cannot
-// be read, fails without quoting what Vertex AI sent: net/http's own errors
-// quote an answer it could not read, as an HTTP/2 GOAWAY's debug text does.
-func TestAGeminiTransportFailureQuotesNothing(t *testing.T) {
+// A stream of any HTTP engine that fails in transport, or whose answer or
+// refusal cannot be read, fails without quoting what the provider sent:
+// net/http's own errors quote an answer it could not read, as an HTTP/2
+// GOAWAY's debug text does.
+func TestAnHTTPTransportFailureQuotesNothing(t *testing.T) {
 	goaway := errors.New(`http2: server sent GOAWAY and closed the connection; debug="` + transportPlanted + `"`)
 	for name, transport := range map[string]brokenTransport{
 		"transport":    {err: errors.New(`malformed HTTP status code "` + transportPlanted + `400"`)},
 		"stream":       {status: http.StatusOK, body: sseAudio(ramp(0, 960)), bodyErr: goaway},
 		"refusal body": {status: http.StatusForbidden, bodyErr: goaway},
 	} {
-		t.Run(name, func(t *testing.T) {
-			g, err := NewGemini(&GeminiConfig{Project: "example-project", Credentials: testCredentials(), BaseURL: "http://vertex.example", HTTPClient: &http.Client{Transport: transport}})
-			if err != nil {
-				t.Fatal(err)
-			}
-			err = g.Stream(context.Background(), "hello", func([]byte) error { return nil })
-			if err == nil || strings.Contains(err.Error(), transportPlanted) {
-				t.Fatalf("Stream = %v, want a failure that quotes nothing Vertex AI sent", err)
-			}
-		})
+		for kind, e := range httpEngines(t, "http://tts.example", WithHTTPClient(&http.Client{Transport: transport})) {
+			t.Run(name+"/"+kind, func(t *testing.T) {
+				err := e.Stream(context.Background(), "hello", func([]byte) error { return nil })
+				if err == nil || strings.Contains(err.Error(), transportPlanted) {
+					t.Fatalf("Stream = %v, want a failure that quotes nothing the provider sent", err)
+				}
+			})
+		}
 	}
 }
 
@@ -77,11 +76,8 @@ func (refusedToken) Token(context.Context) (*auth.Token, error) {
 // A token Google refuses fails the stream with Google's status and OAuth
 // code, not its answer, which the auth error prints.
 func TestARefusedGoogleTokenQuotesNothing(t *testing.T) {
-	g, err := NewGemini(&GeminiConfig{Project: "example-project", Credentials: auth.NewCredentials(&auth.CredentialsOptions{TokenProvider: refusedToken{}}), BaseURL: "http://vertex.example"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	err = g.Stream(context.Background(), "hello", func([]byte) error { return nil })
+	g := newTestGemini(t, "http://vertex.example", auth.NewCredentials(&auth.CredentialsOptions{TokenProvider: refusedToken{}}))
+	err := g.Stream(context.Background(), "hello", func([]byte) error { return nil })
 	if err == nil || strings.Contains(err.Error(), transportPlanted) || !strings.Contains(err.Error(), "HTTP 403 (invalid_grant)") {
 		t.Fatalf("Stream = %v, want Google's 403 and its code, and nothing of its answer", err)
 	}
@@ -94,7 +90,7 @@ func TestAMalformedAuraHandshakeAnswerQuotesNothing(t *testing.T) {
 		"HTTP/1.1 " + transportPlanted + "400 Bad\r\n\r\n",
 		"HTTP/1.1 101 Switching Protocols\r\n" + transportPlanted + "\r\n\r\n",
 	} {
-		a, err := NewAura(AuraConfig{APIKey: fakeAuraKey, BaseURL: "ws://" + malformedHTTPServer(t, answer)})
+		a, err := NewEngine(testProvider(t, deepgramAt("http://"+malformedHTTPServer(t, answer)), nil), "aura-2-harmonia-en", "")
 		if err != nil {
 			t.Fatal(err)
 		}

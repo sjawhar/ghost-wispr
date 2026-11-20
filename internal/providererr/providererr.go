@@ -210,10 +210,20 @@ func openaiCode(e *openai.APIError) string {
 	return e.Type
 }
 
+// OwnFailure is a failure whose text holds nothing a provider sent, such as
+// a client's refusal of a redirect to another origin: From keeps its
+// ProviderFailure text.
+type OwnFailure interface {
+	error
+	ProviderFailure() string
+}
+
 // ownFailure is the text of err when it is a failure the provider sent no
-// text of: a cancel, a deadline, or a network error. It is "" otherwise.
+// text of: a cancel, a deadline, a network error, or an OwnFailure. It is ""
+// otherwise.
 func ownFailure(err error) string {
 	var network *net.OpError
+	var own OwnFailure
 	switch {
 	case errors.Is(err, context.Canceled):
 		return context.Canceled.Error()
@@ -221,6 +231,8 @@ func ownFailure(err error) string {
 		return context.DeadlineExceeded.Error()
 	case errors.As(err, &network):
 		return network.Error()
+	case errors.As(err, &own):
+		return own.ProviderFailure()
 	}
 	return ""
 }

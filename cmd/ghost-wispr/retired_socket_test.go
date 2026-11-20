@@ -344,7 +344,7 @@ func TestASlowRetiredResultHoldsTheNextSocketsAtMostItsWait(t *testing.T) {
 		}
 	}))
 	t.Cleanup(srv.Close)
-	rc := newLiveTranscription(context.Background(), "test-key",
+	rc := newLiveTranscription(context.Background(), fixedKey("test-key"),
 		&interfaces.ClientOptions{Host: "ws://" + srv.Listener.Addr().String()},
 		constOpts(&interfaces.LiveTranscriptionOptions{Model: "nova-3", Language: "en-US", Encoding: "linear16", SampleRate: 16000, Channels: 1}),
 		transcribe.ResilientConfig{InitialReconnectDelay: time.Millisecond},

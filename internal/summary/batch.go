@@ -137,7 +137,13 @@ func (s *Summarizer) ProcessBatchResults(job *genai.BatchJob, sessions []BatchSe
 			continue
 		}
 
-		parsed := summaryAnswer(json.RawMessage(text), sessionByID[result.SessionID].Transcript)
+		parsed, err := summaryAnswer(json.RawMessage(text), sessionByID[result.SessionID].Transcript)
+		if err != nil {
+			// It quotes none of the answer, which can quote the transcript.
+			result.Error = fmt.Errorf("%w for session %s", err, result.SessionID)
+			results[i] = result
+			continue
+		}
 		if !meaningfulText(parsed.Summary) {
 			// Safe to keep in the error: it holds no letter or digit, so
 			// none of the conversation's words.

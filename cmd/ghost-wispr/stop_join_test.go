@@ -12,7 +12,6 @@ import (
 	"time"
 
 	"github.com/sjawhar/ghost-wispr/internal/concierge"
-	"github.com/sjawhar/ghost-wispr/internal/config"
 	"github.com/sjawhar/ghost-wispr/internal/gdrive"
 	"github.com/sjawhar/ghost-wispr/internal/session"
 	"github.com/sjawhar/ghost-wispr/internal/stopping"
@@ -200,7 +199,7 @@ func TestTheStopWaitsForAMergedSessionsSummary(t *testing.T) {
 	endedSessionWithWords(t, store, id, storage.SummaryCompleted)
 	manager := session.NewManager(store, nil, nil, nil, session.NewDetector(time.Hour), 0)
 	summarizer := &heldSummarizer{entered: make(chan struct{}), stall: 100 * time.Millisecond}
-	hook := mergedSessionHook(manager, store, summarizer, &recordingBroadcaster{}, func(string) {},
+	hook := mergedSessionHook(manager, store, fixedSummarizerOf(summarizer), &recordingBroadcaster{}, func(string) {},
 		func(context.Context, string) error { return errors.New("no retry") }, newMergedRefinementFailureRecorder(store))
 	go hook(context.Background(), id) // as the API runs it
 	stopDuringSummary(t, store, manager, summarizer, id, nil)
@@ -249,7 +248,7 @@ func TestAMergedRefinementTheStopCutOffIsNotRecordedFailed(t *testing.T) {
 				return deletionRecordingSet{}, errors.New("drive refused the restore")
 			}, manager.RefineSession, newWarningsRegistry())
 			runner.background = manager
-			hook := mergedSessionHook(manager, store, fixedSummarizer{}, &recordingBroadcaster{}, func(string) {}, runner.retryRefinement, newMergedRefinementFailureRecorder(store))
+			hook := mergedSessionHook(manager, store, fixedSummarizerOf(fixedSummarizer{}), &recordingBroadcaster{}, func(string) {}, runner.retryRefinement, newMergedRefinementFailureRecorder(store))
 			done := make(chan struct{})
 			go func() {
 				defer close(done)
@@ -328,7 +327,7 @@ func TestAMergedRefinementTheStopCutOffIsNotRecordedFailed(t *testing.T) {
 // ended while it was off), and only then sees the shutdown and stops what it
 // started.
 func TestAShutdownWaitsForAConciergeStartUnderWay(t *testing.T) {
-	cfg := config.Config{GenAIBackend: "gemini", GeminiAPIKey: strings.Repeat("k", 8)}
+	cfg := geminiKeyConfig(strings.Repeat("k", 8))
 	store := conciergeStore(t)
 	at := time.Date(2026, 11, 21, 9, 0, 0, 0, time.UTC)
 	if err := store.CreateSession("ended", at); err != nil {
@@ -391,7 +390,7 @@ func TestAShutdownWaitsForATurnOffUnderWay(t *testing.T) {
 			if err := store.CreateVoiceTask(&storage.VoiceTask{ID: "q1", SessionID: "meeting", AskedAt: time.Now(), Holder: "session:agent-7"}); err != nil {
 				t.Fatal(err)
 			}
-			cfg := config.Config{GenAIBackend: "gemini", GeminiAPIKey: strings.Repeat("k", 8)}
+			cfg := geminiKeyConfig(strings.Repeat("k", 8))
 			detached, release, ended := make(chan struct{}), make(chan struct{}), make(chan struct{})
 			lazy := newLazyConcierge(func() (*concierge.Concierge, func(context.Context), error) {
 				return startConcierge(t.Context(), &cfg, store, discardLogger, nil, nil)
@@ -467,7 +466,7 @@ func TestATurnOffHeldInTheStoreDoesNotHoldTheShutdownPastItsDeadline(t *testing.
 			if err := store.CreateSession("meeting", time.Now()); err != nil {
 				t.Fatal(err)
 			}
-			cfg := config.Config{GenAIBackend: "gemini", GeminiAPIKey: strings.Repeat("k", 8)}
+			cfg := geminiKeyConfig(strings.Repeat("k", 8))
 			detached := make(chan struct{})
 			lazy := newLazyConcierge(func() (*concierge.Concierge, func(context.Context), error) {
 				return startConcierge(t.Context(), &cfg, store, discardLogger, nil, nil)
@@ -567,7 +566,7 @@ func TestARunningConciergeStopsWithinTheShutdownsDeadline(t *testing.T) {
 			if err := store.CreateSession("meeting", time.Now()); err != nil {
 				t.Fatal(err)
 			}
-			cfg := config.Config{GenAIBackend: "gemini", GeminiAPIKey: strings.Repeat("k", 8)}
+			cfg := geminiKeyConfig(strings.Repeat("k", 8))
 			lazy := newLazyConcierge(func() (*concierge.Concierge, func(context.Context), error) {
 				return startConcierge(t.Context(), &cfg, store, discardLogger, nil, nil)
 			}, nil, discardLogger)

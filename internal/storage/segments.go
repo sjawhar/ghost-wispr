@@ -297,6 +297,20 @@ func canonicalTranscript(segments []StoredSegment) string {
 	return builder.String()
 }
 
+// speakerTranscript is the transcript a summary reads: canonicalTranscript's
+// lines, each after its segment's speaker label (SpeakerLine).
+func speakerTranscript(segments []StoredSegment) string {
+	var builder strings.Builder
+	for i := range segments {
+		if strings.TrimSpace(segments[i].Text) == "" {
+			continue
+		}
+		builder.WriteString(segments[i].SpeakerLine())
+		builder.WriteByte('\n')
+	}
+	return builder.String()
+}
+
 func tableExists(tx *sql.Tx, name string) (bool, error) {
 	var found int
 	err := tx.QueryRow(`SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?`, name).Scan(&found)

@@ -40,11 +40,8 @@ func TestGeminiWithholdsAMessageThatQuotesTheText(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			srv := httptest.NewServer(handler)
 			t.Cleanup(srv.Close)
-			g, err := NewGemini(&GeminiConfig{Project: "example-project", Credentials: testCredentials(), BaseURL: srv.URL})
-			if err != nil {
-				t.Fatalf("NewGemini: %v", err)
-			}
-			err = g.Stream(context.Background(), spokenText, func([]byte) error { return nil })
+			g := newTestGemini(t, srv.URL, nil)
+			err := g.Stream(context.Background(), spokenText, func([]byte) error { return nil })
 			if err == nil {
 				t.Fatal("Stream succeeded on a refusal")
 			}

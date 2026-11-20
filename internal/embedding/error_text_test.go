@@ -8,6 +8,8 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/sjawhar/ghost-wispr/internal/config"
 )
 
 // plantedWord stands for a meeting's words in the texts these tests embed.
@@ -21,15 +23,15 @@ func TestAnEmbeddingErrorDoesNotQuoteTheText(t *testing.T) {
 	for _, tc := range []struct {
 		provider, code string
 		body           func(request string) string
-		client         func(url string) (Client, error)
+		client         func(t *testing.T, url string) (Client, error)
 	}{
 		{
 			provider: "openai", code: "bad_content",
 			body: func(request string) string {
 				return fmt.Sprintf(`{"error":{"message":%q,"type":"invalid_request_error","code":"bad_content"}}`, "Invalid input: "+request)
 			},
-			client: func(url string) (Client, error) {
-				return newOpenAIClient("test-key", "embed-test", &clientOptions{baseURL: url + "/v1"})
+			client: func(t *testing.T, url string) (Client, error) {
+				return NewClient(keyProvider(t, config.APIOpenAI, url+"/v1"), "embed-test")
 			},
 		},
 		{
@@ -37,8 +39,8 @@ func TestAnEmbeddingErrorDoesNotQuoteTheText(t *testing.T) {
 			body: func(request string) string {
 				return fmt.Sprintf(`{"error":{"code":400,"message":%q,"status":"INVALID_ARGUMENT"}}`, "Invalid input: "+request)
 			},
-			client: func(url string) (Client, error) {
-				return newGeminiClient("test-key", "embed-test", &clientOptions{baseURL: url})
+			client: func(t *testing.T, url string) (Client, error) {
+				return NewClient(keyProvider(t, config.APIGemini, url), "embed-test")
 			},
 		},
 	} {
@@ -52,7 +54,7 @@ func TestAnEmbeddingErrorDoesNotQuoteTheText(t *testing.T) {
 				_, _ = io.WriteString(w, tc.body(string(request)))
 			}))
 			t.Cleanup(server.Close)
-			client, err := tc.client(server.URL)
+			client, err := tc.client(t, server.URL)
 			if err != nil {
 				t.Fatal(err)
 			}

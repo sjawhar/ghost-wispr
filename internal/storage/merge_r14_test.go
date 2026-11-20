@@ -137,7 +137,7 @@ func TestMergeFencesSourcesAndKeepsTheirSegmentsHidden(t *testing.T) {
 	if _, claimed, err := store.ClaimRefinement("a", "/audio/a.mp3"); err != nil || claimed {
 		t.Fatalf("claim refinement for merged source = claimed:%t err:%v, want refused", claimed, err)
 	}
-	if err := store.StartSummary("a"); !errors.Is(err, sql.ErrNoRows) {
+	if _, err := store.StartSummary("a"); !errors.Is(err, sql.ErrNoRows) {
 		t.Fatalf("start summary for merged source = %v, want refusal", err)
 	}
 	if err := store.UpdateSummaryAtGeneration("a", "stale", "stale", SummaryCompleted, "default", "{}", "test", generation); !errors.Is(err, sql.ErrNoRows) {

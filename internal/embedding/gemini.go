@@ -7,37 +7,31 @@ import (
 
 	"google.golang.org/genai"
 
-	"github.com/sjawhar/ghost-wispr/internal/genaiconfig"
 	"github.com/sjawhar/ghost-wispr/internal/providererr"
+	"github.com/sjawhar/ghost-wispr/internal/providers"
 )
 
 type geminiClient struct {
-	client *genai.Client
-	model  string
+	client   *genai.Client
+	model    string
+	provider string // the provider's name, which its errors name
 
 	mu            sync.RWMutex
 	reportedModel string
 }
 
-func newGeminiClient(apiKey, model string, opts *clientOptions) (*geminiClient, error) {
-	config, err := genaiconfig.BuildClientConfig(&genaiconfig.Options{
-		Backend:     opts.genai.Backend,
-		Project:     opts.genai.Project,
-		Location:    opts.genai.Location,
-		APIKey:      apiKey,
-		BaseURL:     opts.baseURL,
-		Credentials: opts.genai.Credentials,
-	})
+// newGeminiClient returns the embedding client of model on a Vertex AI or
+// Gemini API provider.
+func newGeminiClient(p *providers.Provider, model string) (*geminiClient, error) {
+	config, err := p.GenAIConfig()
 	if err != nil {
 		return nil, err
 	}
-
 	client, err := genai.NewClient(context.Background(), config)
 	if err != nil {
 		return nil, fmt.Errorf("create gemini client: %w", err)
 	}
-
-	return &geminiClient{client: client, model: model}, nil
+	return &geminiClient{client: client, model: model, provider: p.Name}, nil
 }
 
 func (c *geminiClient) Embed(ctx context.Context, texts []string, taskType TaskType) ([][]float32, error) {
@@ -56,10 +50,10 @@ func (c *geminiClient) Embed(ctx context.Context, texts []string, taskType TaskT
 		content := genai.NewContentFromText(text, genai.RoleUser)
 		resp, err := c.client.Models.EmbedContent(ctx, c.model, []*genai.Content{content}, config)
 		if err != nil {
-			return nil, fmt.Errorf("gemini embedding: %w", providererr.From("gemini", err))
+			return nil, fmt.Errorf("%s embedding: %w", c.provider, providererr.From(c.provider, err))
 		}
 		if len(resp.Embeddings) == 0 {
-			return nil, fmt.Errorf("gemini: no embedding in response")
+			return nil, fmt.Errorf("%s: no embedding in response", c.provider)
 		}
 		result = append(result, resp.Embeddings[0].Values)
 		// Vertex EmbedContent does not echo a model version. Preserve that

@@ -29,6 +29,10 @@ const (
 	StatusFailed    = "failed"
 )
 
+// PlaybackFailed begins the error of a request whose speech was synthesized
+// and then did not play: the speaker failed, not the provider.
+const PlaybackFailed = "playback failed: "
+
 // SpeakStatus represents the current state of a TTS speak request.
 type SpeakStatus struct {
 	mu            sync.RWMutex `json:"-"`
@@ -77,10 +81,9 @@ func (o *OrchestratorOpts) withDefaults() OrchestratorOpts {
 }
 
 type speakRequest struct {
-	id       string
-	text     string
-	voice    string
-	provider string
+	id    string
+	text  string
+	voice string
 }
 
 // Orchestrator manages an async TTS pipeline: enqueue text → synthesize → play.
@@ -126,9 +129,10 @@ func (o *Orchestrator) Stop() {
 	o.cancel()
 }
 
-// Speak enqueues a text-to-speech request and returns a request ID.
-// It returns an error if the queue is full or rate limit is exceeded.
-func (o *Orchestrator) Speak(text, voice, provider string) (string, error) {
+// Speak enqueues a text-to-speech request in voice ("" for the provider's
+// own) and returns a request ID. It returns an error if the queue is full or
+// rate limit is exceeded.
+func (o *Orchestrator) Speak(text, voice string) (string, error) {
 	if text == "" {
 		return "", fmt.Errorf("text must not be empty")
 	}
@@ -144,10 +148,9 @@ func (o *Orchestrator) Speak(text, voice, provider string) (string, error) {
 	}
 
 	req := &speakRequest{
-		id:       id,
-		text:     text,
-		voice:    voice,
-		provider: provider,
+		id:    id,
+		text:  text,
+		voice: voice,
 	}
 
 	status := &SpeakStatus{ID: id, Status: StatusQueued, synthesisDone: make(chan struct{})}
@@ -187,9 +190,16 @@ func (o *Orchestrator) WaitForSynthesis(ctx context.Context, id string) (SpeakSt
 	}
 }
 
-// HasProvider reports whether a TTS provider is configured.
+// HasProvider reports whether a TTS provider is configured: there is one,
+// and when it is Configurable, it says it is configured.
 func (o *Orchestrator) HasProvider() bool {
-	return o.ttsProvider != nil
+	if o.ttsProvider == nil {
+		return false
+	}
+	if c, ok := o.ttsProvider.(Configurable); ok {
+		return c.Configured()
+	}
+	return true
 }
 
 // HasSpeaker reports whether a speaker is configured.
@@ -244,7 +254,7 @@ func (o *Orchestrator) processRequest(req *speakRequest) {
 
 	bytesWritten, durationMs, err := o.play(resp)
 	if err != nil {
-		o.updateStatus(req.id, StatusFailed, 0, 0, fmt.Sprintf("playback failed: %v", err))
+		o.updateStatus(req.id, StatusFailed, 0, 0, PlaybackFailed+err.Error())
 		return
 	}
 	o.updateStatus(req.id, StatusCompleted, bytesWritten, durationMs, "")

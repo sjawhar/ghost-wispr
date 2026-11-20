@@ -121,9 +121,11 @@
 </div>
 
 <style>
+  /* Wraps onto a second line on a narrow screen, not past its edge. */
   .system-status {
     display: flex;
-    gap: 1rem;
+    flex-wrap: wrap;
+    gap: 0.25rem 1rem;
     padding: 0.5rem 1rem;
     background: var(--surface);
     border-bottom: 1px solid var(--line);

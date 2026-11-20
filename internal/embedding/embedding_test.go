@@ -2,7 +2,6 @@ package embedding
 
 import (
 	"context"
-	"strings"
 	"testing"
 )
 
@@ -33,19 +32,6 @@ func TestEmbedReturnsVectors(t *testing.T) {
 	}
 	if len(vectors[0]) != 3 || len(vectors[1]) != 3 {
 		t.Fatalf("expected vectors to have dimension 3, got %d and %d", len(vectors[0]), len(vectors[1]))
-	}
-}
-
-func TestUnknownProvider(t *testing.T) {
-	client, err := NewClient("unknown/text-embedding-model")
-	if err == nil {
-		t.Fatalf("expected error for unknown provider, got nil")
-	}
-	if client != nil {
-		t.Fatalf("expected nil client, got %#v", client)
-	}
-	if !strings.Contains(err.Error(), "unknown embedding provider") {
-		t.Fatalf("unexpected error: %v", err)
 	}
 }
 

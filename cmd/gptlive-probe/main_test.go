@@ -18,6 +18,7 @@ import (
 
 	"github.com/gorilla/websocket"
 
+	"github.com/sjawhar/ghost-wispr/internal/openaiwif"
 	"github.com/sjawhar/ghost-wispr/internal/voice"
 	"github.com/sjawhar/ghost-wispr/internal/voice/gptlive"
 )
@@ -266,7 +267,7 @@ func (s *standIns) config(t *testing.T) probeConfig {
 		IdentityProviderID: "idp_probe",
 		ServiceAccountID:   "user-probe",
 		Subject: func(_ context.Context, audience string) (string, error) {
-			if audience == gptlive.Audience {
+			if audience == openaiwif.Audience {
 				return openAISubject, nil
 			}
 			return controlSubject, nil

@@ -6,6 +6,8 @@ import (
 	"encoding/hex"
 	"fmt"
 	"log/slog"
+	"maps"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -25,23 +27,28 @@ type StoredEmbedding = storage.StoredEmbedding
 type EmbeddingStore interface {
 	StoreEmbeddingAtGeneration(sessionID string, chunkIndex int, vector []float32, textHash, model string, generation int) error
 	DeleteEmbeddingChunksAtOrAfterGeneration(sessionID string, chunkIndex, generation int) error
+	// GetEmbeddings reads one session's stored chunks, for each index of it;
+	// GetAllEmbeddings reads every session's, once a backfill (unfinished).
+	GetEmbeddings(sessionID string) ([]StoredEmbedding, error)
 	GetAllEmbeddings() ([]StoredEmbedding, error)
 	GetSessionsWithoutEmbeddings() ([]string, error)
 	GetCanonicalTranscriptWithGeneration(sessionID string) (transcript, source string, generation int, err error)
 }
 
 type Indexer struct {
-	client    Client
-	store     EmbeddingStore
-	chunkSize int
-	model     string
+	client      Client
+	store       EmbeddingStore
+	chunkSize   int
+	model       string
+	retryPolicy retry.Policy
 }
 
 func NewIndexer(client Client, store EmbeddingStore, chunkSize int) *Indexer {
 	if chunkSize <= 0 {
 		chunkSize = defaultChunkSize
 	}
-	return &Indexer{client: client, store: store, chunkSize: chunkSize, model: defaultModelName}
+	return &Indexer{client: client, store: store, chunkSize: chunkSize, model: defaultModelName,
+		retryPolicy: retry.Policy{MaxRetries: retry.DefaultMaxRetries, RateLimitBudget: retry.DefaultRateLimitBudget}}
 }
 
 func (i *Indexer) SetModel(model string) {
@@ -91,73 +98,71 @@ func (i *Indexer) IndexSessionAtGeneration(ctx context.Context, sessionID, trans
 	return i.indexSession(ctx, sessionID, transcript, generation)
 }
 
+// indexSession embeds each chunk of transcript whose stored vector is
+// missing, of other text or of another model, one chunk a call, and stores
+// each vector as it comes: a call refused past the retry policy fails the
+// index with the chunks embedded before it kept, and the next index of the
+// session (BackfillMissing finds it) sends only the rest.
 func (i *Indexer) indexSession(ctx context.Context, sessionID, transcript string, generation int) error {
 	chunks := SplitIntoChunks(transcript, i.chunkSize)
 	if len(chunks) == 0 {
 		return nil
 	}
 
-	existing, err := i.store.GetAllEmbeddings()
+	// The session's own chunks only: a backfill indexes many sessions, and a
+	// read of every session's for each would read the corpus once a session.
+	existing, err := i.store.GetEmbeddings(sessionID)
 	if err != nil {
 		return fmt.Errorf("get embeddings: %w", err)
 	}
 
-	byChunk := make(map[int]StoredEmbedding, len(chunks))
+	byChunk := make(map[int]StoredEmbedding, len(existing))
 	for _, emb := range existing {
-		if emb.SessionID != sessionID {
-			continue
-		}
 		byChunk[emb.ChunkIndex] = emb
 	}
 
-	texts := make([]string, 0, len(chunks))
-	indexes := make([]int, 0, len(chunks))
-	hashes := make([]string, 0, len(chunks))
+	// Chunks past the transcript's end go first, so none outlives a failure.
+	if err := i.store.DeleteEmbeddingChunksAtOrAfterGeneration(sessionID, len(chunks), generation); err != nil {
+		return err
+	}
 	for idx, chunk := range chunks {
 		h := textHash(chunk)
 		if emb, ok := byChunk[idx]; ok && emb.TextHash == h && emb.Model == i.model {
 			continue
 		}
-		texts = append(texts, chunk)
-		indexes = append(indexes, idx)
-		hashes = append(hashes, h)
-	}
-
-	if len(texts) == 0 {
-		return i.store.DeleteEmbeddingChunksAtOrAfterGeneration(sessionID, len(chunks), generation)
-	}
-
-	var vectors [][]float32
-	if err := retry.Do(ctx, func() error {
-		var embedErr error
-		vectors, embedErr = i.client.Embed(ctx, texts, TaskTypeDocument)
-		return embedErr
-	}, retry.DefaultMaxRetries); err != nil {
-		return fmt.Errorf("embed chunks: %w", err)
-	}
-	if len(vectors) != len(texts) {
-		return fmt.Errorf("embed returned %d vectors for %d chunks", len(vectors), len(texts))
-	}
-
-	for idx := range indexes {
-		if err := i.store.StoreEmbeddingAtGeneration(sessionID, indexes[idx], vectors[idx], hashes[idx], i.model, generation); err != nil {
-			return fmt.Errorf("store embedding chunk %d: %w", indexes[idx], err)
+		var vectors [][]float32
+		if err := retry.DoWith(ctx, func() error {
+			var embedErr error
+			vectors, embedErr = i.client.Embed(ctx, []string{chunk}, TaskTypeDocument)
+			return embedErr
+		}, i.retryPolicy); err != nil {
+			return fmt.Errorf("embed chunk %d: %w", idx, err)
 		}
-	}
-	if err := i.store.DeleteEmbeddingChunksAtOrAfterGeneration(sessionID, len(chunks), generation); err != nil {
-		return err
+		if len(vectors) != 1 {
+			return fmt.Errorf("embed returned %d vectors for chunk %d", len(vectors), idx)
+		}
+		if err := i.store.StoreEmbeddingAtGeneration(sessionID, idx, vectors[0], h, i.model, generation); err != nil {
+			return fmt.Errorf("store embedding chunk %d: %w", idx, err)
+		}
 	}
 	return nil
 }
 
-// BackfillMissing indexes every session with no embeddings, two at a time.
-// It returns only once every worker it started has ended, also when ctx ends
-// first: a worker writes the store, which its caller may close next.
+// BackfillMissing indexes each ended session with no embeddings, and each
+// session whose stored chunks do not cover its transcript (unfinished), two
+// at a time. It returns only once every worker it started has ended, also
+// when ctx ends first: a worker writes the store, which its caller may close
+// next.
 func (i *Indexer) BackfillMissing(ctx context.Context) error {
 	ids, err := i.store.GetSessionsWithoutEmbeddings()
 	if err != nil {
 		return fmt.Errorf("get sessions without embeddings: %w", err)
 	}
+	unfinished, err := i.unfinished()
+	if err != nil {
+		return err
+	}
+	ids = append(ids, unfinished...)
 	if len(ids) == 0 {
 		return nil
 	}
@@ -199,6 +204,54 @@ func (i *Indexer) BackfillMissing(ctx context.Context) error {
 	}
 
 	return nil
+}
+
+// unfinished are the sessions with stored chunks that do not cover their
+// transcript: a chunk missing or of other text, or one past its end. An
+// index a refused call stopped part way leaves one, as does a re-index that
+// failed. The model is not compared: a session whose chunks a former model
+// embedded is embedded again when it is next indexed, as before.
+func (i *Indexer) unfinished() ([]string, error) {
+	all, err := i.store.GetAllEmbeddings()
+	if err != nil {
+		return nil, fmt.Errorf("get embeddings: %w", err)
+	}
+	hashes := map[string]map[int]string{} // session → chunk index → text hash
+	for _, emb := range all {
+		if hashes[emb.SessionID] == nil {
+			hashes[emb.SessionID] = map[int]string{}
+		}
+		hashes[emb.SessionID][emb.ChunkIndex] = emb.TextHash
+	}
+	var ids []string
+	for _, sessionID := range slices.Sorted(maps.Keys(hashes)) {
+		transcript, _, _, err := i.store.GetCanonicalTranscriptWithGeneration(sessionID)
+		if err != nil {
+			slog.Warn("embedding backfill cannot read a transcript to check its chunks", "session_id", sessionID, "error", err)
+			continue
+		}
+		if !covers(hashes[sessionID], SplitIntoChunks(transcript, i.chunkSize)) {
+			ids = append(ids, sessionID)
+		}
+	}
+	return ids, nil
+}
+
+// covers says whether stored, chunk index → text hash, holds chunks and no
+// more. An empty transcript has nothing to index.
+func covers(stored map[int]string, chunks []string) bool {
+	if len(chunks) == 0 {
+		return true
+	}
+	if len(stored) != len(chunks) {
+		return false
+	}
+	for idx, chunk := range chunks {
+		if stored[idx] != textHash(chunk) {
+			return false
+		}
+	}
+	return true
 }
 
 func setFirstErr(slot *atomic.Value, err error) {

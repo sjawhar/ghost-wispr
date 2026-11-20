@@ -42,8 +42,7 @@ import (
 
 	"github.com/sjawhar/ghost-wispr/internal/concierge"
 	"github.com/sjawhar/ghost-wispr/internal/config"
-	"github.com/sjawhar/ghost-wispr/internal/genaiconfig"
-	"github.com/sjawhar/ghost-wispr/internal/googleauth"
+	"github.com/sjawhar/ghost-wispr/internal/providers"
 	"github.com/sjawhar/ghost-wispr/internal/storage"
 )
 
@@ -71,7 +70,7 @@ type connectFunc func(ctx context.Context, cfg *config.Config) (concierge.Genera
 
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	code := run(ctx, os.Args[1:], os.Stdout, os.Stderr, connectGemini)
+	code := run(ctx, os.Args[1:], os.Stdout, os.Stderr, connectConcierge)
 	stop()
 	os.Exit(code)
 }
@@ -80,7 +79,7 @@ func main() {
 func run(ctx context.Context, args []string, stdout, stderr io.Writer, connect connectFunc) int {
 	flags := flag.NewFlagSet("ear-corpus", flag.ContinueOnError)
 	flags.SetOutput(stderr)
-	configPath := flags.String("config", configPathFromEnvironment(), "the unit's config file; by default $"+config.EnvPrefix+"CONFIG, else ghost-wispr.yaml, as the recorder reads it")
+	configPath := flags.String("config", config.PathFromEnvironment(), "the unit's config file; by default $"+config.EnvPrefix+"CONFIG, else ghost-wispr.yaml, as the recorder reads it")
 	repliesPath := flags.String("replies", "", `the agent replies to rewrite for the ear: a directory of .txt files named for their issue key, or a JSONL file of {"key": "ABC-12", "written": "..."} objects`)
 	judge := flags.Bool("judge", false, "ask a model judge whether each result puts its conclusion first")
 	judgeOnly := flags.String("judge-only", "", "judge the texts at this path as given, with no rewrite: the negative control")
@@ -115,31 +114,22 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer, connect c
 		return complain(stderr, exitUsage, "config: %v", err)
 	}
 	cfg := cfgStore.Get()
+	m, err := cfg.ResolveModel(config.RoleConcierge, cfg.Concierge.Model)
+	if err != nil {
+		return complain(stderr, exitUsage, "the model client: %v", err)
+	}
 	generator, err := connect(ctx, &cfg)
 	if err != nil {
 		return complain(stderr, exitUsage, "the model client: %v", err)
 	}
-	model := cfg.Concierge.Model
-	if model == "" {
-		model = concierge.DefaultModel
-	}
-	j := &judgeClient{generator: generator, model: model, stderr: stderr}
+	j := &judgeClient{generator: generator, model: m.Model, temperature: judgeTemperature(m.Config.API), stderr: stderr}
 	if *judgeOnly != "" {
 		return judgeTexts(ctx, stdout, stderr, j, texts)
 	}
 	if !*judge {
 		j = nil
 	}
-	return rewriteReplies(ctx, stdout, stderr, generator, model, j, texts)
-}
-
-// configPathFromEnvironment is the config file the recorder loads:
-// GHOST_WISPR_CONFIG, else ghost-wispr.yaml in the working directory.
-func configPathFromEnvironment() string {
-	if path := os.Getenv(config.EnvPrefix + "CONFIG"); path != "" {
-		return path
-	}
-	return "ghost-wispr.yaml"
+	return rewriteReplies(ctx, stdout, stderr, generator, m.Model, j, texts)
 }
 
 // rewriteReplies rewrites each reply for the ear with a Concierge on a
@@ -373,12 +363,25 @@ var judgeSchema = map[string]any{
 
 // judgeClient is the model judge, on the Concierge's model client and model.
 type judgeClient struct {
-	generator concierge.Generator
-	model     string
-	stderr    io.Writer
+	generator   concierge.Generator
+	model       string
+	temperature *float32 // judgeTemperature
+	stderr      io.Writer
 }
 
-// judge asks, at temperature 0, whether text puts its conclusion in its
+// judgeTemperature is the temperature the judge asks at on a provider of
+// api: 0, so a text gets the same verdict each run, but none on an OpenAI
+// API provider. There the model gateway's reasoning models (gpt-6.1-terra)
+// refuse any temperature but 1 (HTTP 400, "Only temperature=1 is
+// supported"), and with none each model answers at its own default.
+func judgeTemperature(api string) *float32 {
+	if api == config.APIOpenAI {
+		return nil
+	}
+	return genai.Ptr[float32](0)
+}
+
+// judge asks, at judgeTemperature, whether text puts its conclusion in its
 // first sentence, and returns "yes", "no", or, with the reason on stderr
 // under label, "error". It never prints the text or the judge's words.
 func (j *judgeClient) judge(ctx context.Context, label, text string) string {
@@ -393,7 +396,7 @@ func (j *judgeClient) judge(ctx context.Context, label, text string) string {
 func (j *judgeClient) ask(ctx context.Context, text string) (string, error) {
 	request := &genai.GenerateContentConfig{
 		SystemInstruction:  genai.NewContentFromText(judgePrompt, genai.RoleUser),
-		Temperature:        genai.Ptr[float32](0),
+		Temperature:        j.temperature,
 		ResponseMIMEType:   "application/json",
 		ResponseJsonSchema: judgeSchema,
 	}
@@ -468,23 +471,12 @@ func exitCode(pass bool) int {
 	return exitFail
 }
 
-// connectGemini builds the Concierge's Gemini client from the unit's genai
-// settings, with Vertex credentials, as the recorder's startConcierge does
-// (cmd/ghost-wispr's genAIOptions and addVertexCredentials, which package
-// main cannot export).
-func connectGemini(ctx context.Context, cfg *config.Config) (concierge.Generator, error) {
-	options := &genaiconfig.Options{
-		Backend:  cfg.GenAIBackend,
-		Project:  cfg.GCPProject,
-		Location: cfg.GCPLocation,
-		APIKey:   cfg.GeminiAPIKey,
+// connectConcierge builds the Concierge's model client on the provider
+// concierge.model names, as the recorder's newConcierge does.
+func connectConcierge(ctx context.Context, cfg *config.Config) (concierge.Generator, error) {
+	p, _, err := providers.New(cfg, providers.Options{}).Model(cfg, config.RoleConcierge, cfg.Concierge.Model)
+	if err != nil {
+		return nil, err
 	}
-	if genaiconfig.ResolveBackend(options.Backend, options.Project) == genaiconfig.BackendVertex {
-		credentials, err := googleauth.Detect(ctx, cfg.GoogleCredentialsFile, googleauth.CloudPlatformScope)
-		if err != nil {
-			return nil, fmt.Errorf("detect Google credentials: %w", err)
-		}
-		options.Credentials = credentials
-	}
-	return concierge.NewGenerator(ctx, options)
+	return concierge.NewGenerator(ctx, p)
 }

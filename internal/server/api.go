@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"math"
 	"net/http"
 	"os"
@@ -18,12 +19,12 @@ import (
 	"strings"
 	"time"
 
-	"golang.org/x/sync/semaphore"
-
 	"github.com/sjawhar/ghost-wispr/internal/config"
 	"github.com/sjawhar/ghost-wispr/internal/embedding"
+	"github.com/sjawhar/ghost-wispr/internal/providers"
 	recordingname "github.com/sjawhar/ghost-wispr/internal/recording"
 	"github.com/sjawhar/ghost-wispr/internal/session"
+	"github.com/sjawhar/ghost-wispr/internal/stopping"
 	"github.com/sjawhar/ghost-wispr/internal/storage"
 	"github.com/sjawhar/ghost-wispr/internal/transcribe"
 	"github.com/sjawhar/ghost-wispr/internal/tts"
@@ -1026,6 +1027,10 @@ func registerAPIRoutes(mux routeMux, store SessionStore, controls *ControlHooks,
 		})
 	})
 
+	// The sessions whose summary is missing, failed or never ended, each
+	// summarized online as the start's backlog does: only once it claims the
+	// summary, so a session another backlog claimed is summarized once. A
+	// session's own Resummarize stays unconditional.
 	mux.HandleFunc("POST /api/sessions/backfill", func(w http.ResponseWriter, r *http.Request) {
 		sessionIDs, err := store.GetSessionsForBackfill()
 		if err != nil {
@@ -1033,21 +1038,10 @@ func registerAPIRoutes(mux routeMux, store SessionStore, controls *ControlHooks,
 			return
 		}
 
-		queued := len(sessionIDs)
-		if controls.Resummarize != nil && queued > 0 {
-			go func(ids []string) {
-				const maxConcurrent = 5
-				sem := semaphore.NewWeighted(maxConcurrent)
-				for _, id := range ids {
-					if err := sem.Acquire(context.Background(), 1); err != nil {
-						return // context cancelled
-					}
-					go func(sid string) {
-						defer sem.Release(1)
-						_ = controls.Resummarize(context.Background(), sid, "")
-					}(id)
-				}
-			}(sessionIDs)
+		queued := 0
+		if controls.SummarizeBacklog != nil && len(sessionIDs) > 0 {
+			queued = len(sessionIDs)
+			go controls.SummarizeBacklog(sessionIDs)
 		}
 
 		writeJSON(w, http.StatusOK, map[string]any{
@@ -1101,6 +1095,10 @@ func registerAPIRoutes(mux routeMux, store SessionStore, controls *ControlHooks,
 			return
 		}
 		result, err := controls.BatchPoll(r.Context(), batchName)
+		if errors.Is(err, storage.ErrUnknownSummaryBatch) {
+			writeJSONError(w, http.StatusNotFound, fmt.Sprintf("batch job %s not found: this unit submitted no summary batch job of that name", batchName))
+			return
+		}
 		if err != nil {
 			writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("batch poll: %v", err))
 			return
@@ -1515,6 +1513,7 @@ func registerAPIRoutes(mux routeMux, store SessionStore, controls *ControlHooks,
 	if cfgStore != nil {
 		mux.HandleFunc("GET /api/config", handleGetConfig(cfgStore))
 		mux.HandleFunc("PATCH /api/config", handlePatchConfig(cfgStore))
+		mux.HandleFunc("GET /api/providers", handleGetProviders(cfgStore, controls))
 		if controls.TestPreset != nil {
 			mux.HandleFunc("POST /api/config/presets/{name}/test", handleTestPreset(cfgStore, controls.TestPreset))
 		}
@@ -1547,9 +1546,8 @@ func registerAPIRoutes(mux routeMux, store SessionStore, controls *ControlHooks,
 
 			r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 			var body struct {
-				Text     string `json:"text"`
-				Voice    string `json:"voice,omitempty"`
-				Provider string `json:"provider,omitempty"`
+				Text  string `json:"text"`
+				Voice string `json:"voice,omitempty"`
 			}
 			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 				writeJSONError(w, http.StatusBadRequest, "invalid request body")
@@ -1560,7 +1558,7 @@ func registerAPIRoutes(mux routeMux, store SessionStore, controls *ControlHooks,
 				return
 			}
 
-			id, err := controls.TTSSpeak(body.Text, body.Voice, body.Provider)
+			id, err := controls.TTSSpeak(body.Text, body.Voice)
 			if err != nil {
 				switch {
 				case errors.Is(err, tts.ErrQueueFull):
@@ -1585,8 +1583,15 @@ func registerAPIRoutes(mux routeMux, store SessionStore, controls *ControlHooks,
 				speechStatus, _ = controls.TTSStatus(id)
 			}
 			if state, _ := speechStatus["status"].(string); state == tts.StatusFailed {
+				// The status names the step that failed ("synthesis failed: …"). A
+				// speech that was synthesized and then did not play is the
+				// speaker's failure, as when there is none, not the provider's.
 				message, _ := speechStatus["error"].(string)
-				writeJSONError(w, http.StatusBadGateway, fmt.Sprintf("TTS synthesis failed: %s", message))
+				code := http.StatusBadGateway
+				if strings.HasPrefix(message, tts.PlaybackFailed) {
+					code = http.StatusServiceUnavailable
+				}
+				writeJSONError(w, code, "TTS "+message)
 				return
 			}
 			if model, ok := speechStatus["model"].(string); ok && model != "" {
@@ -1681,7 +1686,8 @@ func writeJSONError(w http.ResponseWriter, status int, msg string) {
 	writeJSON(w, status, map[string]string{"error": msg})
 }
 
-// configResponse is the shape returned by GET /api/config.
+// configResponse is the shape returned by GET /api/config. It holds no
+// secret: a provider's key stays in the environment or the .env file.
 type configResponse struct {
 	SilenceTimeout     string                      `json:"silence_timeout"`
 	MinSessionSegments int                         `json:"min_session_segments"`
@@ -1689,11 +1695,14 @@ type configResponse struct {
 	Transcription      configTranscriptionResponse `json:"transcription"`
 	GDrive             configGDriveResponse        `json:"gdrive"`
 	GC                 configGCResponse            `json:"gc"`
-	APIKeys            map[string]bool             `json:"api_keys"`
-	// Models is the model, provider or Google setting of each role as the
-	// running process resolved its configuration (environment overrides
-	// included). Read-only.
+	TTS                configTTSResponse           `json:"tts"`
+	// Models is the provider/model of each role, and the tts voice and
+	// voice C's provider, as the running process resolved its configuration
+	// (environment overrides included). Read-only.
 	Models map[string]string `json:"models"`
+	// Providers are the model providers the config names, each with its
+	// endpoint, wire API and sign-in. Read-only.
+	Providers map[string]config.Provider `json:"providers"`
 	// RecordingRules are the rules the page shows under Recording rules, each
 	// as written in recording_rules; empty when there are none. Read-only.
 	RecordingRules []string            `json:"recording_rules"`
@@ -1702,7 +1711,6 @@ type configResponse struct {
 
 type configSummarizationResponse struct {
 	Model   string                   `json:"model"`
-	BaseURL string                   `json:"base_url"`
 	Presets map[string]config.Preset `json:"presets"`
 }
 
@@ -1723,12 +1731,18 @@ type configGCResponse struct {
 	MaxAudioSizeMB int  `json:"max_audio_size_mb"`
 }
 
+// configTTSResponse is the text-to-speech role: the provider/model that voice
+// A and POST /api/tts/speak speak with, and its voice.
+type configTTSResponse struct {
+	Model string `json:"model"`
+	Voice string `json:"voice"`
+}
+
 // configVoiceResponse is the meeting voice as the settings page changes it:
-// whether it is on, which voice answers and voice A's text-to-speech provider.
+// whether it is on, and which voice answers.
 type configVoiceResponse struct {
-	Enabled   bool   `json:"enabled"`
-	Engine    string `json:"engine"`
-	TTSEngine string `json:"tts_engine"`
+	Enabled bool   `json:"enabled"`
+	Engine  string `json:"engine"`
 }
 
 func handleGetConfig(cfgStore *config.Store) http.HandlerFunc {
@@ -1739,7 +1753,6 @@ func handleGetConfig(cfgStore *config.Store) http.HandlerFunc {
 			MinSessionSegments: cfg.MinSessionSegments,
 			Summarization: configSummarizationResponse{
 				Model:   cfg.Summarization.Model,
-				BaseURL: cfg.Summarization.BaseURL,
 				Presets: cfg.Summarization.Presets,
 			},
 			Transcription: configTranscriptionResponse{
@@ -1756,30 +1769,23 @@ func handleGetConfig(cfgStore *config.Store) http.HandlerFunc {
 				MaxAgeDays:     cfg.GCMaxAgeDays,
 				MaxAudioSizeMB: cfg.GCMaxAudioSizeMB,
 			},
-			APIKeys: map[string]bool{
-				"deepgram":  cfg.DeepgramAPIKey != "",
-				"openai":    cfg.OpenAIAPIKey != "",
-				"anthropic": cfg.AnthropicAPIKey != "",
-				"gemini":    cfg.GeminiAPIKey != "",
-			},
+			TTS: configTTSResponse{Model: cfg.TTS.Model, Voice: cfg.TTS.Voice},
 			Models: map[string]string{
-				"live_transcription":           cfg.DeepgramModel,
-				"batch_transcription_provider": cfg.BatchTranscription.Provider,
-				"batch_transcription":          cfg.BatchTranscription.Model,
-				"summarization":                cfg.Summarization.Model,
-				"embedding":                    cfg.EmbeddingModel,
-				"genai_backend":                cfg.GenAIBackend,
-				"gcp_project":                  cfg.GCPProject,
-				"gcp_location":                 cfg.GCPLocation,
-				"tts_provider":                 cfg.TTSProvider,
-				"tts":                          cfg.TTSModel,
-				"tts_voice":                    cfg.TTSVoice,
+				"live_transcription":  cfg.Transcription.Model,
+				"batch_transcription": cfg.BatchTranscription.Model,
+				"summarization":       cfg.Summarization.Model,
+				"embedding":           cfg.Embedding.Model,
+				"concierge":           cfg.Concierge.Model,
+				"tts":                 cfg.TTS.Model,
+				"tts_voice":           cfg.TTS.Voice,
+				"gptlive":             cfg.Voice.GPTLive.Model,
+				"dgagent_provider":    cfg.Voice.DGAgent.Provider,
 			},
+			Providers:      cfg.Providers,
 			RecordingRules: cfg.RecordingRules,
 			Voice: configVoiceResponse{
-				Enabled:   cfg.Voice.Enabled,
-				Engine:    cfg.Voice.Engine,
-				TTSEngine: cfg.Voice.TTSEngine,
+				Enabled: cfg.Voice.Enabled,
+				Engine:  cfg.Voice.Engine,
 			},
 		}
 		if resp.Summarization.Presets == nil {
@@ -1787,6 +1793,9 @@ func handleGetConfig(cfgStore *config.Store) http.HandlerFunc {
 		}
 		if resp.RecordingRules == nil {
 			resp.RecordingRules = []string{}
+		}
+		if resp.Providers == nil {
+			resp.Providers = map[string]config.Provider{}
 		}
 		writeJSON(w, http.StatusOK, resp)
 	}
@@ -1798,21 +1807,27 @@ type configPatch struct {
 	MinSessionSegments *int                `json:"min_session_segments,omitempty"`
 	Summarization      *summarizationPatch `json:"summarization,omitempty"`
 	Transcription      *transcriptionPatch `json:"transcription,omitempty"`
-	APIKeys            map[string]string   `json:"api_keys,omitempty"`
-	GDrive             *gdrivePatch        `json:"gdrive,omitempty"`
-	GC                 *gcPatch            `json:"gc,omitempty"`
-	Voice              *voicePatch         `json:"voice,omitempty"`
+	// ProviderKeys sets the key of each named api_key provider.
+	ProviderKeys map[string]string `json:"provider_keys,omitempty"`
+	TTS          *ttsPatch         `json:"tts,omitempty"`
+	GDrive       *gdrivePatch      `json:"gdrive,omitempty"`
+	GC           *gcPatch          `json:"gc,omitempty"`
+	Voice        *voicePatch       `json:"voice,omitempty"`
 }
 
 type summarizationPatch struct {
 	Model   *string                   `json:"model,omitempty"`
-	BaseURL *string                   `json:"base_url,omitempty"`
 	Presets map[string]*config.Preset `json:"presets,omitempty"` // null value = delete
 }
 
 type transcriptionPatch struct {
 	Endpointing    *string `json:"endpointing,omitempty"`
 	UtteranceEndMs *string `json:"utterance_end_ms,omitempty"`
+}
+
+type ttsPatch struct {
+	Model *string `json:"model,omitempty"`
+	Voice *string `json:"voice,omitempty"`
 }
 
 type gdrivePatch struct {
@@ -1828,17 +1843,26 @@ type gcPatch struct {
 }
 
 type voicePatch struct {
-	Enabled   *bool   `json:"enabled,omitempty"`
-	Engine    *string `json:"engine,omitempty"`
-	TTSEngine *string `json:"tts_engine,omitempty"`
+	Enabled *bool   `json:"enabled,omitempty"`
+	Engine  *string `json:"engine,omitempty"`
 }
 
 func handlePatchConfig(cfgStore *config.Store) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 		var patch configPatch
-		if err := json.NewDecoder(r.Body).Decode(&patch); err != nil {
+		// A field the settings do not have is refused rather than ignored,
+		// so a page or script that sends one is told nothing was saved.
+		dec := json.NewDecoder(r.Body)
+		dec.DisallowUnknownFields()
+		if err := dec.Decode(&patch); err != nil {
 			writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("invalid request body: %v", err))
+			return
+		}
+		// One object and nothing after it: a second object would otherwise
+		// go unread while the first one is saved.
+		if _, err := dec.Token(); !errors.Is(err, io.EOF) {
+			writeJSONError(w, http.StatusBadRequest, "invalid request body: input after the JSON object")
 			return
 		}
 
@@ -1869,9 +1893,6 @@ func applyConfigPatch(c *config.Config, p *configPatch) error {
 	if p.Summarization != nil {
 		if p.Summarization.Model != nil {
 			c.Summarization.Model = *p.Summarization.Model
-		}
-		if p.Summarization.BaseURL != nil {
-			c.Summarization.BaseURL = *p.Summarization.BaseURL
 		}
 		if p.Summarization.Presets != nil {
 			if c.Summarization.Presets == nil {
@@ -1911,20 +1932,22 @@ func applyConfigPatch(c *config.Config, p *configPatch) error {
 		}
 	}
 
-	if p.APIKeys != nil {
-		for provider, key := range p.APIKeys {
-			switch provider {
-			case "deepgram":
-				c.DeepgramAPIKey = key
-			case "openai":
-				c.OpenAIAPIKey = key
-			case "anthropic":
-				c.AnthropicAPIKey = key
-			case "gemini":
-				c.GeminiAPIKey = key
-			default:
-				return fmt.Errorf("unknown API key provider %q", provider)
-			}
+	// Only a provider that signs in with a key takes one; the others sign
+	// in by a Google or OpenAI workload identity and hold none.
+	for _, name := range slices.Sorted(maps.Keys(p.ProviderKeys)) {
+		if err := c.SetAPIKey(name, p.ProviderKeys[name]); err != nil {
+			return fmt.Errorf("provider_keys: %w", err)
+		}
+	}
+
+	if p.TTS != nil {
+		// A voice belongs to its model (Aura's voice is its model): a new
+		// model speaks in its own default voice unless the patch names one.
+		if p.TTS.Model != nil && *p.TTS.Model != c.TTS.Model {
+			c.TTS.Model, c.TTS.Voice = *p.TTS.Model, ""
+		}
+		if p.TTS.Voice != nil {
+			c.TTS.Voice = *p.TTS.Voice
 		}
 	}
 
@@ -1969,16 +1992,64 @@ func applyConfigPatch(c *config.Config, p *configPatch) error {
 				return fmt.Errorf("invalid voice.engine %q: supported engines are tts, gptlive, dgagent", *p.Voice.Engine)
 			}
 		}
-		if p.Voice.TTSEngine != nil {
-			switch *p.Voice.TTSEngine {
-			case config.TTSEngineGemini, config.TTSEngineAura:
-				c.Voice.TTSEngine = *p.Voice.TTSEngine
-			default:
-				return fmt.Errorf("invalid voice.tts_engine %q: supported engines are gemini, aura", *p.Voice.TTSEngine)
-			}
-		}
 	}
 	return nil
+}
+
+// providerStatusMaxAge is how long GET /api/providers keeps a provider's
+// check: a check signs in, which can mint or exchange a token and ask the
+// provider, so a page that opens often does not do it each time.
+const providerStatusMaxAge = 5 * time.Minute
+
+// providerStatusResponse is one provider of GET /api/providers: its sign-in
+// and last check, and the roles in use that call it, by their config keys.
+type providerStatusResponse struct {
+	providers.Status
+	Roles []string `json:"roles"`
+}
+
+// providersResponse is the answer of GET /api/providers.
+type providersResponse struct {
+	Providers []providerStatusResponse `json:"providers"`
+}
+
+// handleGetProviders is GET /api/providers: each configured provider, how it
+// signs in and whether that worked, checked within providerStatusMaxAge, or
+// now with refresh=1.
+func handleGetProviders(cfgStore *config.Store, controls *ControlHooks) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if controls.ProviderStatuses == nil {
+			writeJSONError(w, http.StatusNotImplemented, "provider checks are not configured")
+			return
+		}
+		maxAge := providerStatusMaxAge
+		if r.URL.Query().Get("refresh") == "1" {
+			maxAge = 0
+		}
+		// The checks outlive the page that asked: one the page cut short
+		// would be kept for maxAge as a failure. The app's stop still cuts
+		// them off (stopping.ErrStopped), as it does each request's work: it
+		// waits for this request.
+		ctx, cancel := context.WithCancelCause(context.WithoutCancel(r.Context()))
+		defer cancel(nil)
+		defer context.AfterFunc(r.Context(), func() {
+			if stopping.CutOff(r.Context()) {
+				cancel(stopping.ErrStopped)
+			}
+		})()
+		statuses := controls.ProviderStatuses(ctx, maxAge)
+		cfg := cfgStore.Get()
+		roles := cfg.ProviderRoles()
+		out := make([]providerStatusResponse, len(statuses))
+		for i := range statuses {
+			out[i].Status = statuses[i]
+			out[i].Roles = roles[statuses[i].Name]
+			if out[i].Roles == nil {
+				out[i].Roles = []string{}
+			}
+		}
+		writeJSON(w, http.StatusOK, providersResponse{Providers: out})
+	}
 }
 
 func fileExists(path string) bool {

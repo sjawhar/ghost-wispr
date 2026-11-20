@@ -31,7 +31,7 @@ func TestAStaleSummaryRunDoesNotFailTheNewerRun(t *testing.T) {
 			go func() { manager.generateSummary(context.Background(), "r3", time.Now()); close(done) }()
 			waitR3(t, summarizer.entered, "the summarizer did not start")
 			deleteR3Session(t, store, segmentID)
-			if err := store.StartSummary("r3"); err != nil {
+			if _, err := store.StartSummary("r3"); err != nil {
 				t.Fatalf("start the deletion's summary run: %v", err)
 			}
 			close(summarizer.release)

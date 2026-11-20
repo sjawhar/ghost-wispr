@@ -123,21 +123,42 @@ func runLightState(stdout io.Writer) error {
 	return errLightOther
 }
 
+// commandsUsage is ghost-wispr's help: a line for each subcommand main runs,
+// saying what it does. With none, ghost-wispr runs the recorder.
+const commandsUsage = `usage: ghost-wispr [SUBCOMMAND]
+With no subcommand, ghost-wispr runs the recorder. Subcommands:
+  google-id-token    print a Google ID token for --audience AUDIENCE, signed in by google_credentials_file or --credentials FILE
+  seed-paused-state  save capture as paused in the recorder's database, and print the database's path
+  tts-first-audio    time each sentence on stdin to its first text-to-speech audio (--model, --voice, --clip)
+  issue-holder KEY   print the Concierge's issue_holder answer for Dispatch issue KEY
+  joined-probe       act as an agent session that joins a meeting, for the joined agents' acceptance (--invitation FILE or --wait-invitation)
+  play-sound NAME    play one of Wispr's sounds (wake, answer, start or error) once on the speaker
+  kws-selftest CLIP  check the paused listener's spotter hears the start phrase in each WAV clip (-tags kws builds)
+  speaker-trace      print the slow mixer cycles in each FILE the speaker trace saved, and what held each (-slow D)
+  light-off          turn the recording light off
+  light-state        print the recording light's colour: red, off, or other R,G,B
+  help               print this list (also -h and --help)`
+
+// runLightCommand runs a subcommand main does not run itself: light-off,
+// light-state and help. Any other prints commandsUsage and exits 2.
 func runLightCommand(args []string, stdout, stderr io.Writer) int {
 	if len(args) != 1 {
-		_, _ = fmt.Fprintln(stderr, "usage: ghost-wispr <light-off|light-state>")
+		_, _ = fmt.Fprintln(stderr, commandsUsage)
 		return 2
 	}
 
 	var err error
 	switch args[0] {
+	case "help", "-h", "--help":
+		_, _ = fmt.Fprintln(stdout, commandsUsage)
+		return 0
 	case "light-off":
 		err = runLightOff(stderr)
 	case "light-state":
 		err = runLightState(stdout)
 	default:
 		_, _ = fmt.Fprintf(stderr, "unknown subcommand %q\n", args[0])
-		_, _ = fmt.Fprintln(stderr, "usage: ghost-wispr <light-off|light-state>")
+		_, _ = fmt.Fprintln(stderr, commandsUsage)
 		return 2
 	}
 	if err != nil {

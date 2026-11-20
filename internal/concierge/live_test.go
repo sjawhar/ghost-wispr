@@ -15,9 +15,10 @@ import (
 
 	"google.golang.org/genai"
 
+	"github.com/sjawhar/ghost-wispr/internal/config"
 	"github.com/sjawhar/ghost-wispr/internal/dispatch"
 	"github.com/sjawhar/ghost-wispr/internal/envoy"
-	"github.com/sjawhar/ghost-wispr/internal/genaiconfig"
+	"github.com/sjawhar/ghost-wispr/internal/providers"
 	"github.com/sjawhar/ghost-wispr/internal/storage"
 	"github.com/sjawhar/ghost-wispr/internal/voice"
 )
@@ -30,6 +31,20 @@ func (noModel) GenerateContentStream(context.Context, string, []*genai.Content, 
 	return func(yield func(*genai.GenerateContentResponse, error) bool) {
 		yield(nil, errors.New("no model on this machine"))
 	}
+}
+
+// liveVertex is a Vertex AI provider of project in location, signed in by
+// Google's default credentials, for a live test.
+func liveVertex(t *testing.T, project, location string) *providers.Provider {
+	t.Helper()
+	cfg := &config.Config{Providers: map[string]config.Provider{
+		"vertex": {API: config.APIVertex, Project: project, Location: location, Auth: config.ProviderAuth{Kind: config.AuthGoogle}},
+	}}
+	p, err := providers.New(cfg, providers.Options{}).Get("vertex")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return p
 }
 
 // TestLiveConciergeRoundTrip drives the Concierge against a real Dispatch,
@@ -81,7 +96,7 @@ func TestLiveConciergeRoundTrip(t *testing.T) {
 			location = "global"
 		}
 		var err error
-		if generator, err = NewGenerator(ctx, &genaiconfig.Options{Backend: genaiconfig.BackendVertex, Project: project, Location: location}); err != nil {
+		if generator, err = NewGenerator(ctx, liveVertex(t, project, location)); err != nil {
 			t.Fatalf("build the Gemini client: %v", err)
 		}
 	}

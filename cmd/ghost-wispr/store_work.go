@@ -2,8 +2,8 @@ package main
 
 import (
 	"context"
-	"fmt"
 
+	"github.com/sjawhar/ghost-wispr/internal/config"
 	"github.com/sjawhar/ghost-wispr/internal/gdrive"
 	"github.com/sjawhar/ghost-wispr/internal/server"
 	"github.com/sjawhar/ghost-wispr/internal/session"
@@ -16,16 +16,17 @@ type storeWork struct {
 	store    *storage.SQLiteStore
 	drive    *driveSync
 	deletion *segmentDeleteRunner
-	// summarizer and mergedSummarizer are nil when no summarization is
-	// configured.
-	summarizer                    presetSummarizer
-	mergedSummarizer              session.ReportedSummarizer
+	// summarizer returns the summarizer of the settings saved last, nil
+	// while summaries are off (summarizers.summarizer).
+	summarizer                    func() unitSummarizer
 	hub                           summaryBroadcaster
 	publishSummaryReady           func(sessionID string)
 	recordMergedRefinementFailure func(context.Context, string, error)
 	restoreFromDrive              func(ctx context.Context) (*gdrive.RestoreResult, error)
-	submitSummaryBatch            func(ctx context.Context, sessionIDs []string) (batchName string, count int, err error)
-	pollSummaryBatch              func(ctx context.Context, batchName string) (map[string]any, error)
+	// cfgStore holds summarization.batch_jobs, read at each batch backfill.
+	cfgStore           interface{ Get() config.Config }
+	submitSummaryBatch func(ctx context.Context, sessionIDs []string) (batchName string, count int, err error)
+	pollSummaryBatch   func(ctx context.Context, batchName string) (map[string]any, error)
 }
 
 // wireStoreWork gives hooks the requests' work on the store. Each request
@@ -33,10 +34,10 @@ type storeWork struct {
 // session.Manager.Run), since a handler may write the store itself (a
 // title, a deletion), and the HTTP server's shutdown does not end a handler
 // whose connection it closed. Each piece that outlasts its request (a
-// delete's raw erase, a sync, a refinement, a summary, the merge hook, a
 // session's end), or that can outlast a moment (a summary repair, a restore
-// from Drive, a batch submit or poll), runs the same way (session.Manager.Go
-// and Run), so the store closes under none of it.
+// from Drive, a batch submit or poll, a backlog's online summaries), runs the
+// same way (session.Manager.Go and Run), so the store closes under none of
+// it.
 func wireStoreWork(hooks *server.ControlHooks, w *storeWork) {
 	hooks.AdmitRequest = admitRequestsThrough(w.manager)
 	hooks.GoStoreWork = w.manager.Go
@@ -56,13 +57,8 @@ func wireStoreWork(hooks *server.ControlHooks, w *storeWork) {
 		})
 		return repaired, err
 	}
-	hooks.Resummarize = func(ctx context.Context, sessionID, preset string) error {
-		if w.summarizer == nil {
-			return fmt.Errorf("summarization not configured")
-		}
-		return resummarizeUntilStop(w.manager, w.store, w.summarizer, w.hub, w.publishSummaryReady)(ctx, sessionID, preset)
-	}
-	hooks.OnSessionMerged = mergedSessionHook(w.manager, w.store, w.mergedSummarizer, w.hub, w.publishSummaryReady, w.deletion.retryRefinement, w.recordMergedRefinementFailure)
+	hooks.Resummarize = resummarizeUntilStop(w.manager, w.store, w.summarizer, w.hub, w.publishSummaryReady)
+	hooks.OnSessionMerged = mergedSessionHook(w.manager, w.store, w.summarizer, w.hub, w.publishSummaryReady, w.deletion.retryRefinement, w.recordMergedRefinementFailure)
 	hooks.EndSession = w.manager.ForceEndSession
 	hooks.StartSession = w.manager.ManualStartSession
 	hooks.StopSession = w.manager.StopSession
@@ -81,16 +77,15 @@ func wireStoreWork(hooks *server.ControlHooks, w *storeWork) {
 		})
 		return restored, err
 	}
+	// A backlog's online summaries outlive the request that asked for them
+	// (POST /api/sessions/backfill, and POST /api/sessions/batch-backfill
+	// with batch jobs off or not taken).
+	later := backlogUntilStop(w.manager, newOnlineSummaries(w.store, w.summarizer, w.hub, w.publishSummaryReady))
+	hooks.SummarizeBacklog = later
+	batchBackfill := newBatchBackfill(w.store, w.summarizer, w.cfgStore, w.submitSummaryBatch, later)
 	hooks.BatchBackfill = func(ctx context.Context) (batchName string, count int, err error) {
 		err = w.manager.Run(ctx, func(ctx context.Context) error {
-			sessionIDs, err := w.store.GetSessionsForBackfill()
-			if err != nil {
-				return fmt.Errorf("query sessions: %w", err)
-			}
-			if len(sessionIDs) == 0 {
-				return nil
-			}
-			batchName, count, err = w.submitSummaryBatch(ctx, sessionIDs)
+			batchName, count, err = batchBackfill(ctx)
 			return err
 		})
 		return batchName, count, err

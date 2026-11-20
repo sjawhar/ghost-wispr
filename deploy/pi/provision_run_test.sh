@@ -186,7 +186,7 @@ cat >"$work_dir/deploy/update.sh" <<'EOF'
 #!/usr/bin/env bash
 printf 'update.sh XDG_RUNTIME_DIR=%s\n' "${XDG_RUNTIME_DIR:-}" >>"$TEST_LOG"
 if grep -q 'systemctl --user try-restart ghost-wispr.service$' "$TEST_LOG"; then
-  printf 'ghost-wispr update: ghost-wispr is active but /api/status did not answer\n' >&2
+  printf 'ghost-wispr update: ghost-wispr is active but /api/status gave no status\n' >&2
   exit 1
 fi
 EOF
@@ -247,6 +247,11 @@ grep -Fxq "GHOST_WISPR_$deepgram_key_name=deepgram-key" "$env_file" || fail "the
 if grep -q 'ENVOY_WEBHOOK_SECRET' "$env_file"; then
   fail "the installed .env still holds an Envoy webhook secret"
 fi
+# The full provisioner writes .env anew, with only variables Ghost Wispr reads: no variable of a
+# setting that providers replaced, such as the Vertex embedding location, which a start warns about.
+env_names=$(cut -d= -f1 "$env_file" | LC_ALL=C sort | tr '\n' ' ')
+[[ $env_names == "GHOST_WISPR_ADDR GHOST_WISPR_$deepgram_key_name GOOGLE_API_USE_CLIENT_CERTIFICATE " ]] \
+  || fail "the installed .env sets $env_names, want GHOST_WISPR_ADDR, GHOST_WISPR_$deepgram_key_name and GOOGLE_API_USE_CLIENT_CERTIFICATE"
 # Without a dispatch-token in the bundle, the .env gives the meeting voice no Dispatch token.
 dispatch_token_name="DISPATCH""_TOKEN"
 if grep -q "^GHOST_WISPR_$dispatch_token_name=" "$env_file"; then

@@ -9,8 +9,9 @@ import (
 	"github.com/sjawhar/ghost-wispr/internal/storage"
 )
 
-// canonicalizeFailingStore is the real store, with a Canonicalize that runs
-// before (a segment deletion and its own summary run starting) and then fails.
+// canonicalizeFailingStore is the real store, with a Canonicalize (and the
+// summary's CanonicalizeForSummary) that runs before (a segment deletion and
+// its own summary run starting) and then fails.
 type canonicalizeFailingStore struct {
 	*storage.SQLiteStore
 	before func()
@@ -19,6 +20,11 @@ type canonicalizeFailingStore struct {
 func (s *canonicalizeFailingStore) Canonicalize(string) (string, int, error) {
 	s.before()
 	return "", 0, errors.New("canonicalize: disk I/O error")
+}
+
+func (s *canonicalizeFailingStore) CanonicalizeForSummary(string) (string, string, int, error) {
+	s.before()
+	return "", "", 0, errors.New("canonicalize: disk I/O error")
 }
 
 // A summary run whose transcript read fails after a segment deletion has
@@ -37,7 +43,7 @@ func TestACanonicalizeFailureAfterADeletionLeavesTheNewerRunRunning(t *testing.T
 			real, segmentID := r3SessionStore(t)
 			store := &canonicalizeFailingStore{SQLiteStore: real, before: func() {
 				deleteR3Session(t, real, segmentID)
-				if err := real.StartSummary("r3"); err != nil {
+				if _, err := real.StartSummary("r3"); err != nil {
 					t.Fatalf("start the deletion's summary run: %v", err)
 				}
 			}}

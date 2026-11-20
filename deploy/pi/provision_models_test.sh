@@ -65,17 +65,84 @@ hub_host=${hub_host%:4222}
 [[ $hub_host =~ ^[A-Za-z0-9.-]+$ ]] || fail "PI_NATS_SERVER names no hub host: $PI_NATS_SERVER"
 readonly hub_url="http://$hub_host:9020"
 
-# The committed template names the approved models and Google settings, and keeps sync and GC off.
+# config_paths FILE prints each setting of FILE, a YAML file written one setting a line, as its
+# dotted path and value ("providers.vertex.location: global"), at any depth and any indentation, so
+# a setting is checked under its own parents. A setting with settings under it prints as "path:".
+# Comments, blank lines and list items are left out.
+config_paths() {
+  awk '
+    /^[[:space:]]*(#|-|$)/ { next }
+    {
+      indent = match($0, /[^[:space:]]/) - 1
+      line = substr($0, indent + 1)
+      if (line !~ /^[^:]+:([[:space:]]|$)/) next
+      while (depth > 0 && indents[depth] >= indent) depth--
+      key = line; sub(/:.*/, "", key)
+      value = line; sub(/^[^:]*:[[:space:]]*/, "", value); sub(/[[:space:]]+#.*$/, "", value)
+      path = depth > 0 ? paths[depth] "." key : key
+      print (value == "" ? path ":" : path ": " value)
+      depth++; indents[depth] = indent; paths[depth] = path
+    }
+  ' "$1"
+}
+
+# The settings that providers replaced (internal/config, removedSettings): a start that finds one
+# warns, and the role it set is off.
+readonly removed_settings=(genai_backend gcp_project gcp_location embedding_model deepgram_model
+  tts_provider tts_model tts_voice tts_max_length summarization.base_url batch_transcription.provider
+  voice.tts_engine voice.tts_model voice.tts_voice voice.tts_location
+  voice.gptlive.openai_identity_provider_id voice.gptlive.openai_service_account_id)
+
+# assert_models FILE: FILE names the office Pi's providers, each in the Pi's Google project where it
+# is Vertex AI, and each role's provider/model; it sets no removed setting, and names no gateway
+# provider, which refuses the Pi until it admits it.
+assert_models() {
+  local file=$1 paths line path
+  paths=$(config_paths "$file")
+  for line in \
+    'providers.vertex.api: vertex' \
+    "providers.vertex.project: $PI_GCP_PROJECT" \
+    'providers.vertex.location: global' \
+    'providers.vertex.auth.kind: google' \
+    'providers.vertex-us.api: vertex' \
+    "providers.vertex-us.project: $PI_GCP_PROJECT" \
+    'providers.vertex-us.location: us' \
+    'providers.vertex-us.auth.kind: google' \
+    'providers.openai.api: openai' \
+    'providers.openai.auth.kind: openai_wif' \
+    'providers.deepgram.api: deepgram' \
+    'providers.deepgram.auth.kind: api_key' \
+    'providers.deepgram.auth.env: GHOST_WISPR_DEEPGRAM_API_KEY' \
+    'transcription.model: deepgram/nova-3' \
+    'batch_transcription.model: deepgram/nova-3' \
+    'summarization.model: vertex/gemini-4-carbon' \
+    'embedding.model: vertex/gemini-embedding-2' \
+    'concierge.model: vertex/gemini-3.5-flash-lite' \
+    'tts.model: vertex-us/gemini-3.8-flash-tts' \
+    'tts.voice: Kore' \
+    'voice.enabled: true' \
+    'voice.engine: tts' \
+    'voice.gptlive.model: openai/gpt-live-1' \
+    'voice.dgagent.provider: deepgram'; do
+    grep -Fqx -- "$line" <<<"$paths" || fail "$file does not set $line"
+  done
+  if grep -q '^providers[.]gateway[.:]' <<<"$paths"; then
+    fail "$file names the gateway provider, which refuses the Pi until it admits it"
+  fi
+  # OpenAI's workload identity ids are the office's own.
+  for path in providers.openai.auth.identity_provider_id providers.openai.auth.service_account_id; do
+    grep -Eq "^${path//./[.]}: [^[:space:]]+$" <<<"$paths" || fail "$file sets no $path"
+  done
+  for path in "${removed_settings[@]}"; do
+    if grep -q "^${path//./[.]}:" <<<"$paths"; then
+      fail "$file still sets $path, which providers replaced"
+    fi
+  done
+}
+
+# The committed template names the approved providers and models, and keeps sync and GC off.
+assert_models "$template"
 for line in \
-  'deepgram_model: nova-3' \
-  '  model: nova-3' \
-  '  model: gemini/gemini-4-carbon' \
-  'embedding_model: gemini/gemini-embedding-2' \
-  'tts_provider: gemini' \
-  'tts_voice: Kore' \
-  'genai_backend: vertex' \
-  "gcp_project: $PI_GCP_PROJECT" \
-  'gcp_location: global' \
   'google_credentials_file: /opt/ghost-wispr/google-credentials.json' \
   'gdrive_sync_enabled: false' \
   'gc_enabled: false' \
@@ -94,6 +161,28 @@ assert_count '^gdrive_folder_id:' 0 "$template"
 # The template's public_url is the Pi's tailnet name, which the tailnet join checks it has.
 assert_line "public_url: https://$PI_HOST" "$template"
 assert_count '^public_url:' 1 "$template"
+# The Deepgram provider reads its key from the variable the full provisioner writes the credential
+# bundle's deepgram-key into.
+grep -Fq "printf 'GHOST_WISPR_DEEPGRAM_API_KEY=%s\n' \"\$deepgram_key\"" "$provisioner" \
+  || fail 'the full provisioner does not write the Deepgram key into the variable providers.deepgram.auth.env names'
+
+# The check above sees a removed setting at any depth: each one planted in the template is refused,
+# for that setting.
+planted="$work_dir/planted.yaml"
+for path in "${removed_settings[@]}"; do
+  cp -- "$template" "$planted"
+  IFS=. read -r -a parts <<<"$path"
+  indent=''
+  for part in "${parts[@]:0:${#parts[@]}-1}"; do
+    printf '%s%s:\n' "$indent" "$part" >>"$planted"
+    indent+='  '
+  done
+  printf '%s%s: planted\n' "$indent" "${parts[-1]}" >>"$planted"
+  if refusal=$(assert_models "$planted" 2>&1); then
+    fail "the template check did not find $path planted in it"
+  fi
+  [[ $refusal == *"still sets $path,"* ]] || fail "the template check refused $path planted in it for another reason: $refusal"
+done
 
 # The template holds every setting the full provisioner installs: nothing is substituted, and no
 # Envoy webhook setting is left.
@@ -106,16 +195,8 @@ assert_count '__[A-Z_]*__' 0 "$template"
 models_config="$work_dir/models.yaml"
 provisioner_function render_models_config "$template" "$drive_id" >"$models_config" \
   || fail 'the models renderer rejected a valid shared-drive ID'
+assert_models "$models_config"
 for line in \
-  'deepgram_model: nova-3' \
-  '  model: nova-3' \
-  '  model: gemini/gemini-4-carbon' \
-  'embedding_model: gemini/gemini-embedding-2' \
-  'tts_provider: gemini' \
-  'tts_voice: Kore' \
-  'genai_backend: vertex' \
-  "gcp_project: $PI_GCP_PROJECT" \
-  'gcp_location: global' \
   'gc_max_age_days: 0' \
   'gc_max_audio_size_mb: 20000' \
   "envoy_hub_url: $hub_url" \
@@ -127,7 +208,7 @@ for line in \
   'speaker_device: J75'; do
   assert_line "$line" "$models_config"
 done
-for key in gdrive_folder_id gdrive_sync_enabled gc_enabled envoy_hub_url jabra_mute_button mic_device speaker_device; do
+for key in gdrive_folder_id gdrive_sync_enabled gc_enabled envoy_hub_url jabra_mute_button mic_device speaker_device providers; do
   assert_count "^$key:" 1 "$models_config"
 done
 
@@ -183,37 +264,35 @@ drive_on_empty=$(provisioner_function deployed_drive_id "$empty_drive") \
   || fail 'a configuration the config API saved without a shared drive was treated as invalid'
 [[ -z "$drive_on_empty" ]] || fail "a configuration with an empty shared drive returned '$drive_on_empty'"
 
-# --models keeps every .env line but the Envoy webhook signing key an earlier provisioner wrote,
-# which nothing reads now, and sets the Vertex embedding location exactly once. The office Pi
-# turns the Jabra's Mute button on in such a line too (docs/pi-setup.md, "Pause and resume at the
-# unit"): --models keeps it on, as it is, and writes no other.
+# --models keeps every .env line but those of settings Ghost Wispr no longer reads, each of which a
+# start warns about: the Envoy webhook signing key an earlier provisioner wrote, and each variable
+# that providers replaced (internal/config, removedEnvironment), such as the Vertex embedding
+# location an earlier provisioner wrote. It keeps the role overrides that providers kept, whose
+# names share words with removed ones, and writes no line of its own. The office Pi turns the
+# Jabra's Mute button on in such a line too (docs/pi-setup.md, "Pause and resume at the unit"):
+# --models keeps it on, as it is.
+readonly removed_variables=(GCP_PROJECT GCP_LOCATION GENAI_BACKEND EMBEDDING_BACKEND EMBEDDING_LOCATION
+  DEEPGRAM_MODEL BATCH_TRANSCRIPTION_PROVIDER TTS_PROVIDER TTS_API_KEY VOICE_TTS_ENGINE VOICE_TTS_MODEL
+  VOICE_TTS_VOICE VOICE_TTS_LOCATION ENVOY_WEBHOOK_SECRET)
+readonly kept_lines=(GHOST_WISPR_ADDR=127.0.0.1:8080 GHOST_WISPR_DEEPGRAM_API_KEY=test-key
+  GHOST_WISPR_JABRA_MUTE_BUTTON=true GHOST_WISPR_TTS_VOICE=Kore GHOST_WISPR_TTS_MODEL=vertex/tts-1
+  GHOST_WISPR_EMBEDDING_MODEL=vertex/embed-1 GHOST_WISPR_BATCH_TRANSCRIPTION_MODEL=deepgram/nova-3
+  GHOST_WISPR_VOICE_ENGINE=tts)
 deployed_env="$work_dir/env"
 models_env="$work_dir/models.env"
-cat >"$deployed_env" <<'EOF'
-GHOST_WISPR_ADDR=127.0.0.1:8080
-GHOST_WISPR_EMBEDDING_LOCATION=europe-west4
-GHOST_WISPR_DEEPGRAM_API_KEY=test-key
-GHOST_WISPR_ENVOY_WEBHOOK_SECRET=stale-signing-key
-GHOST_WISPR_JABRA_MUTE_BUTTON=true
-EOF
+for ((i = 0; i < ${#removed_variables[@]} || i < ${#kept_lines[@]}; i++)); do
+  ((i >= ${#kept_lines[@]})) || printf '%s\n' "${kept_lines[i]}"
+  ((i >= ${#removed_variables[@]})) || printf 'GHOST_WISPR_%s=removed-value\n' "${removed_variables[i]}"
+done >"$deployed_env"
 provisioner_function render_models_env "$deployed_env" >"$models_env" \
   || fail 'the .env renderer rejected a deployed .env'
-assert_line 'GHOST_WISPR_ADDR=127.0.0.1:8080' "$models_env"
-assert_line 'GHOST_WISPR_DEEPGRAM_API_KEY=test-key' "$models_env"
-assert_line 'GHOST_WISPR_JABRA_MUTE_BUTTON=true' "$models_env"
-assert_count '^GHOST_WISPR_JABRA_MUTE_BUTTON=' 1 "$models_env"
-assert_line 'GHOST_WISPR_EMBEDDING_LOCATION=global' "$models_env"
-assert_count '^GHOST_WISPR_EMBEDDING_LOCATION=' 1 "$models_env"
-assert_count 'stale-signing-key' 0 "$models_env"
+if ! diff <(printf '%s\n' "${kept_lines[@]}") "$models_env" >&2; then
+  fail "--models did not keep exactly the .env lines of settings Ghost Wispr reads, in order (diff above)"
+fi
+assert_count 'removed-value' 0 "$models_env"
 if provisioner_function render_models_env "$work_dir/missing.env" >/dev/null 2>&1; then
   fail 'the .env renderer succeeded without a deployed .env'
 fi
-# The full provisioner writes the same setting into a fresh .env. render_models_env has an identical
-# printf line, so read only the full provisioner's .env block.
-env_block=$(awk '/GHOST_WISPR_ADDR=127\.0\.0\.1:8080/,/\/dev\/stdin "\$DEPLOY_DIR\/\.env"/' "$provisioner")
-[[ -n "$env_block" ]] || fail 'could not find the full provisioner .env block'
-grep -Fqx "  printf '%s\n' \"\$EMBEDDING_LOCATION_SETTING\"" <<<"$env_block" \
-  || fail 'the full provisioner does not write the Vertex embedding location into .env'
 
 for file in "$provisioner" "$test_root/docs/pi-setup.md"; do
   grep -Fq -- 'replaces settings saved in the UI' "$file" \

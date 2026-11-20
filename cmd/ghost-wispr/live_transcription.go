@@ -54,7 +54,7 @@ type liveManager interface {
 // the voice. The client is the manager's live stream (SetLiveStream) when the
 // manager takes one, so a session's recording starts before the first words
 // Deepgram hears, even when it hears them late after a reconnect.
-func newLiveTranscription(ctx context.Context, apiKey string, cOptions *interfaces.ClientOptions, optsFor func() *interfaces.LiveTranscriptionOptions, config transcribe.ResilientConfig, callback transcriptCallback, warnings *warningsRegistry, hub *server.Hub) *transcribe.ResilientClient {
+func newLiveTranscription(ctx context.Context, key liveKey, cOptions *interfaces.ClientOptions, optsFor func() *interfaces.LiveTranscriptionOptions, config transcribe.ResilientConfig, callback transcriptCallback, warnings *warningsRegistry, hub *server.Hub) *transcribe.ResilientClient {
 	// The warning changes with the client's state, under the client's lock
 	// at the change itself (OnStateChangeLocked): it is local and quick, so
 	// it is never behind. The hub's "deepgram" status is broadcast from the
@@ -91,7 +91,7 @@ func newLiveTranscription(ctx context.Context, apiKey string, cOptions *interfac
 	}
 	// The voice times each word by when its audio was captured.
 	callback.heardAt = rc.CapturedAt
-	rc.Factory = makeDeepgramClientFactory(ctx, apiKey, cOptions, optsFor, callback, deepgramWriteTimeout)
+	rc.Factory = makeDeepgramClientFactory(ctx, key, cOptions, optsFor, callback, deepgramWriteTimeout)
 	if manager, ok := callback.manager.(liveManager); ok && manager != nil {
 		manager.SetLiveStream(rc)
 	}
@@ -100,4 +100,23 @@ func newLiveTranscription(ctx context.Context, apiKey string, cOptions *interfac
 	warnings.Set(deepgramWarningKey, deepgramNotConnected)
 	rc.ConnectInBackground()
 	return rc
+}
+
+// liveKey is the key a live-transcription dial signs in with, read at each
+// dial.
+type liveKey func(ctx context.Context) (string, error)
+
+// liveTranscriptionCredential is live transcription's key at each dial, the
+// first and every reconnect: the credential of transcription.model's
+// provider in the config saved last, so a key saved on the settings page
+// reaches the next reconnect without a restart.
+func liveTranscriptionCredential(store interface{ Get() config.Config }) liveKey {
+	return func(ctx context.Context) (string, error) {
+		cfg := store.Get()
+		p, _, err := unitProviders.of(&cfg).Model(&cfg, config.RoleTranscription, cfg.Transcription.Model)
+		if err != nil {
+			return "", err
+		}
+		return p.Credential(ctx)
+	}
 }

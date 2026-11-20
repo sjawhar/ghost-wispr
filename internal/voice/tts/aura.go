@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"net"
-	"net/http"
 	"net/url"
 	"strconv"
 	"strings"
@@ -20,14 +19,10 @@ import (
 	"github.com/sjawhar/ghost-wispr/internal/audio"
 	"github.com/sjawhar/ghost-wispr/internal/netdial"
 	"github.com/sjawhar/ghost-wispr/internal/providererr"
+	"github.com/sjawhar/ghost-wispr/internal/providers"
 )
 
 const (
-	auraDefaultBaseURL = "wss://api.deepgram.com"
-	// auraDefaultModel is Aura-2's Harmonia, whom Deepgram's voice list calls
-	// empathetic, clear, calm and confident, for customer service: a calm
-	// voice for answers in a meeting.
-	auraDefaultModel = "aura-2-harmonia-en"
 	// auraRate is the rate voice A asks Aura-2 for, the rate every voice
 	// speaks into the Output's mixer.
 	auraRate = 24000
@@ -53,49 +48,50 @@ var (
 	auraClose = []byte(`{"type":"Close"}`)
 )
 
-// AuraConfig configures the Deepgram Aura-2 engine.
-type AuraConfig struct {
-	APIKey string
-	// Model is an Aura-2 voice; "aura-2-harmonia-en" when empty.
-	Model string
-	// BaseURL replaces "wss://api.deepgram.com", for tests.
-	BaseURL string
-	// Dialed, when set, is told the URL of each socket's handshake request,
-	// as it went to Deepgram, once Deepgram accepted it: ghost-wispr
-	// tts-first-audio reads from it whether the request carried
-	// mip_opt_out=true.
-	Dialed func(*url.URL)
-}
-
 // Aura synthesises speech with Deepgram Aura-2 over its streaming WebSocket,
 // /v1/speak, which takes Speak and Flush messages and sends headerless PCM16
 // back as binary messages, then Flushed. Every socket asks Deepgram to keep
-// the text out of its model training (mip_opt_out=true).
+// the text out of its model training (mip_opt_out=true), and signs in with
+// the provider's header at its dial.
 //
 // Aura is a Connector: a Session holds one socket from Open to Close, so its
 // first Say does not wait for the dial, and an Interrupt sends Clear, which
 // drops the rest of the text in flight.
 type Aura struct {
-	apiKey string
+	p      *providers.Provider
 	url    string
+	voice  string
 	dialed func(*url.URL)
 }
 
-// NewAura returns an Aura-2 engine for cfg.
-func NewAura(cfg AuraConfig) (*Aura, error) {
-	key := strings.TrimSpace(cfg.APIKey)
-	if key == "" {
-		return nil, errors.New("aura: a Deepgram API key is required")
+// newAura is Aura-2 on a Deepgram provider, at the WebSocket of the
+// provider's url (providers.Provider.SocketURL). Each Aura-2 voice is a
+// model: the socket asks for voice, or the model when voice is "".
+func newAura(p *providers.Provider, model, voice string, o *options) (Voiced, error) {
+	u, err := url.Parse(p.SocketURL())
+	if err != nil {
+		return nil, fmt.Errorf("aura: provider %q: url: %w", p.Name, err)
 	}
-	query := url.Values{
-		"model":       {cmp.Or(strings.TrimSpace(cfg.Model), auraDefaultModel)},
+	if u.Scheme != "ws" && u.Scheme != "wss" {
+		return nil, fmt.Errorf("aura: provider %q: url scheme %q is not http, https, ws or wss", p.Name, u.Scheme)
+	}
+	voice = cmp.Or(voice, model)
+	u.Path = strings.TrimRight(u.Path, "/") + "/v1/speak"
+	u.RawQuery = url.Values{
+		"model":       {voice},
 		"encoding":    {"linear16"},
 		"sample_rate": {strconv.Itoa(auraRate)},
 		"mip_opt_out": {"true"},
-	}
-	base := strings.TrimRight(cmp.Or(strings.TrimSpace(cfg.BaseURL), auraDefaultBaseURL), "/")
-	return &Aura{apiKey: key, url: base + "/v1/speak?" + query.Encode(), dialed: cfg.Dialed}, nil
+	}.Encode()
+	return &Aura{p: p, url: u.String(), voice: voice, dialed: o.dialed}, nil
 }
+
+// Voice is the Aura-2 voice the engine speaks in.
+func (a *Aura) Voice() string { return a.voice }
+
+// Model is the model the socket asks for: the voice, since each Aura-2
+// voice is a model.
+func (a *Aura) Model() string { return a.voice }
 
 // Name names the engine.
 func (*Aura) Name() string { return "aura" }
@@ -250,17 +246,25 @@ func (a *Aura) dial(ctx context.Context) (*auraSocket, error) {
 			return conn, err
 		},
 	}
-	conn, response, err := dialer.DialContext(ctx, a.url, http.Header{"Authorization": {"Token " + a.apiKey}})
+	header, err := a.p.Header(ctx)
+	if err != nil {
+		if ctx.Err() != nil {
+			return nil, context.Cause(ctx)
+		}
+		return nil, fmt.Errorf("aura: sign in: %w", err)
+	}
+	conn, response, err := dialer.DialContext(ctx, a.url, header)
 	if response != nil && response.Body != nil {
 		_ = response.Body.Close()
 	}
 	if err != nil {
 		if response != nil {
 			// Deepgram's status text and dg-error header can quote the text
-			// asked for: the error keeps the status code.
-			return nil, fmt.Errorf("aura: connect: %w (HTTP %d)", err, response.StatusCode)
+			// asked for: the error keeps the status code, as the provider's
+			// answer (providererr), which the speak API's warning names.
+			return nil, fmt.Errorf("aura: connect: %w: %w", err, providererr.New(a.p.Name, response.StatusCode, "", ""))
 		}
-		return nil, fmt.Errorf("aura: connect: %w", providererr.From("deepgram", err))
+		return nil, fmt.Errorf("aura: connect: %w", providererr.From(a.p.Name, err))
 	}
 	if a.dialed != nil && response != nil && response.Request != nil {
 		a.dialed(response.Request.URL)

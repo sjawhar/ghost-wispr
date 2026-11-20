@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"github.com/sjawhar/ghost-wispr/internal/concierge"
-	"github.com/sjawhar/ghost-wispr/internal/config"
 	"github.com/sjawhar/ghost-wispr/internal/envoy"
 )
 
@@ -50,7 +49,8 @@ func TestTheEnvoySessionIsRetriedUntilItOpens(t *testing.T) {
 		return session, nil
 	}
 
-	cfg := config.Config{GenAIBackend: "gemini", GeminiAPIKey: "test", Concierge: config.Concierge{EnvoyURL: "http://127.0.0.1:1"}}
+	cfg := geminiKeyConfig("test")
+	cfg.Concierge.EnvoyURL = "http://127.0.0.1:1"
 	_, stop, err := startConcierge(t.Context(), &cfg, conciergeStore(t), discardLogger, nil, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -89,7 +89,8 @@ func TestAStopWaitsForTheEnvoySessionsOpeningOnlyWithinItsDeadline(t *testing.T)
 		<-release // it does not see the cancel, and then opens the session
 		return late, nil
 	}
-	cfg := config.Config{GenAIBackend: "gemini", GeminiAPIKey: "test", Concierge: config.Concierge{EnvoyURL: "http://127.0.0.1:1"}}
+	cfg := geminiKeyConfig("test")
+	cfg.Concierge.EnvoyURL = "http://127.0.0.1:1"
 	_, stop, err := startConcierge(t.Context(), &cfg, conciergeStore(t), discardLogger, nil, nil)
 	if err != nil {
 		t.Fatal(err)

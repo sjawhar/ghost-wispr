@@ -422,8 +422,8 @@ func TestTheStopWaitsForASessionEndsSummary(t *testing.T) {
 	if got.SummaryStatus != storage.SummaryRunning || got.SummaryError != "" {
 		t.Fatalf("summary status %q, error %q after the stop; want it left running, with no error, for the next start", got.SummaryStatus, got.SummaryError)
 	}
-	if ids, err := store.GetSessionsForBackfill(); err != nil || !slices.Contains(ids, id) {
-		t.Fatalf("the next start's backfill takes %v (%v), want session %s", ids, err, id)
+	if ids := nextStartsBackfill(t, store); !slices.Contains(ids, id) {
+		t.Fatalf("the next start's backfill takes %v, want session %s", ids, id)
 	}
 
 	if _, err := manager.ManualStartSession(t.Context(), ""); err != nil {
@@ -502,11 +502,39 @@ func stopDuringSummary(t *testing.T, store *storage.SQLiteStore, manager *sessio
 	if got.SummaryStatus != storage.SummaryRunning || got.SummaryError != "" {
 		t.Fatalf("summary status %q, error %q after the stop; want it left running, with no error, for the next start", got.SummaryStatus, got.SummaryError)
 	}
-	if ids, err := store.GetSessionsForBackfill(); err != nil || !slices.Contains(ids, id) {
-		t.Fatalf("the next start's backfill takes %v (%v), want session %s", ids, err, id)
-	}
 	time.Sleep(2 * summarizer.stall) // work the stop left would write now
 	guard.Check(t)
+	if ids := nextStartsBackfill(t, store); !slices.Contains(ids, id) {
+		t.Fatalf("the next start's backfill takes %v, want session %s", ids, id)
+	}
+}
+
+// nextStartsBackfill is what the next start's summary backfill takes from the
+// database store has open, read as that start reads it, on a store of its
+// own: the summaries this run left running are pending again
+// (storage.SQLiteStore.RecoverInterruptedSummaries, which main runs before
+// anything can start a summary), and the backfill lists them
+// (GetSessionsForBackfill, which leaves a summary running now to the run that
+// makes it).
+func nextStartsBackfill(t *testing.T, store *storage.SQLiteStore) []string {
+	t.Helper()
+	var path string
+	if err := store.DB().QueryRow(`SELECT file FROM pragma_database_list WHERE name = 'main'`).Scan(&path); err != nil {
+		t.Fatal(err)
+	}
+	next, err := storage.NewSQLiteStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = next.Close() }()
+	if _, err := next.RecoverInterruptedSummaries(); err != nil {
+		t.Fatal(err)
+	}
+	ids, err := next.GetSessionsForBackfill()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return ids
 }
 
 // TestTheStopWaitsForTheStartsSummaryBackfill fails if the stop returns while
@@ -525,14 +553,21 @@ func TestTheStopWaitsForTheStartsSummaryBackfill(t *testing.T) {
 
 // failingBatchBackfill is the start's summary backfill with summarizer, whose
 // batch job cannot be made, so it summarizes session by session.
-func failingBatchBackfill(store *storage.SQLiteStore, summarizer session.ReportedSummarizer, publish func(string)) summaryBackfill {
+func failingBatchBackfill(store *storage.SQLiteStore, summarizer unitSummarizer, publish func(string)) summaryBackfill {
 	return summaryBackfill{
-		store: store, summarizer: summarizer, publish: publish, pollEvery: time.Second,
+		store: store, batchJobs: true, pollEvery: time.Second,
 		submit: func(context.Context, []string) (string, int, error) {
 			return "", 0, errors.New("no batch for one session")
 		},
-		poll: func(context.Context, string) (map[string]any, error) { return nil, errors.New("no batch") },
+		poll:   func(context.Context, string) (map[string]any, error) { return nil, errors.New("no batch") },
+		online: newOnlineSummaries(store, fixedSummarizerOf(summarizer), &recordingBroadcaster{}, publish),
 	}
+}
+
+// fixedSummarizerOf is a summary path's summarizer that is summarizer at
+// every call (summarizers.summarizer, whose summarizer follows the settings).
+func fixedSummarizerOf(summarizer unitSummarizer) func() unitSummarizer {
+	return func() unitSummarizer { return summarizer }
 }
 
 // TestMainsShutdownLeavesTheBackfillsSummaryForTheNextStart fails if main's
@@ -583,7 +618,7 @@ func TestTheStopWaitsForTheSummarysEnvoyPublish(t *testing.T) {
 			startSummaryBackfill(context.Background(), manager, failingBatchBackfill(store, fixedSummarizer{}, publish))
 		}},
 		{"a requested summary", storage.SummaryCompleted, func(manager *session.Manager, store *storage.SQLiteStore, publish func(string), id string) {
-			hook := resummarizeUntilStop(manager, store, fixedSummarizer{}, &recordingBroadcaster{}, publish)
+			hook := resummarizeUntilStop(manager, store, fixedSummarizerOf(fixedSummarizer{}), &recordingBroadcaster{}, publish)
 			go func() { _ = hook(context.Background(), id, "") }() // as the API runs it
 		}},
 	} {
@@ -638,7 +673,7 @@ func TestTheStopWaitsForARequestedSummary(t *testing.T) {
 	endedSessionWithWords(t, store, id, storage.SummaryCompleted)
 	manager := session.NewManager(store, nil, nil, nil, session.NewDetector(time.Hour), 0)
 	summarizer := &heldSummarizer{entered: make(chan struct{}), stall: 100 * time.Millisecond}
-	hook := resummarizeUntilStop(manager, store, summarizer, &recordingBroadcaster{}, func(string) {})
+	hook := resummarizeUntilStop(manager, store, fixedSummarizerOf(summarizer), &recordingBroadcaster{}, func(string) {})
 	go func() { _ = hook(context.Background(), id, "minutes") }() // as the API runs it
 	stopDuringSummary(t, store, manager, summarizer, id, nil)
 	if err := hook(context.Background(), id, ""); !errors.Is(err, stopping.ErrStopped) {

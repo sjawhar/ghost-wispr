@@ -15,7 +15,11 @@ readonly script_dir
 repo_root="$(cd -- "$script_dir/../.." && pwd)"
 readonly repo_root
 readonly CONFIG_TEMPLATE="$repo_root/deploy/pi/files/ghost-wispr.yaml"
-readonly EMBEDDING_LOCATION_SETTING=GHOST_WISPR_EMBEDDING_LOCATION=global
+# The .env variables Ghost Wispr no longer reads, each of which a start warns about: the Envoy
+# webhook signing key an earlier provisioner wrote, and the variables of the settings that providers
+# replaced (internal/config, removedEnvironment), such as the Vertex embedding location an earlier
+# provisioner wrote.
+readonly REMOVED_ENV_VARIABLES='ENVOY_WEBHOOK_SECRET|GCP_PROJECT|GCP_LOCATION|GENAI_BACKEND|EMBEDDING_BACKEND|EMBEDDING_LOCATION|DEEPGRAM_MODEL|BATCH_TRANSCRIPTION_PROVIDER|TTS_PROVIDER|TTS_API_KEY|VOICE_TTS_ENGINE|VOICE_TTS_MODEL|VOICE_TTS_VOICE|VOICE_TTS_LOCATION'
 
 fail() {
   printf 'ghost-wispr provision: %s\n' "$*" >&2
@@ -64,12 +68,11 @@ deployed_drive_id() {
   return 1
 }
 
-# render_models_env keeps the deployed .env but the Envoy webhook signing key an earlier
-# provisioner wrote, which nothing reads now, so it is not left on disk.
+# render_models_env keeps the deployed .env but the lines of variables Ghost Wispr no longer reads,
+# so none is left on disk to warn at each start.
 render_models_env() {
   local env_file=$1
-  awk '!/^GHOST_WISPR_(EMBEDDING_LOCATION|ENVOY_WEBHOOK_SECRET)=/' "$env_file" || return 1
-  printf '%s\n' "$EMBEDDING_LOCATION_SETTING"
+  awk -v removed="^GHOST_WISPR_($REMOVED_ENV_VARIABLES)=" '$0 !~ removed' "$env_file"
 }
 
 # run_user_systemctl reads runtime_dir from its caller: the global, or provision_models' local.
@@ -302,7 +305,6 @@ sudo install -o "$SERVICE_USER" -g "$SERVICE_USER" -m 0640 "$staging_dir/ghost-w
 {
   printf '%s\n' 'GHOST_WISPR_ADDR=127.0.0.1:8080'
   printf '%s\n' 'GOOGLE_API_USE_CLIENT_CERTIFICATE=false'
-  printf '%s\n' "$EMBEDDING_LOCATION_SETTING"
   printf 'GHOST_WISPR_DEEPGRAM_API_KEY=%s\n' "$deepgram_key"
   if [[ -n "$dispatch_token" ]]; then
     printf 'GHOST_WISPR_DISPATCH_TOKEN=%s\n' "$dispatch_token"

@@ -49,7 +49,7 @@ func TestStartingASummaryKeepsTheLastOne(t *testing.T) {
 	const id = "20261106090000"
 	summarizedSyncedSession(t, store, id)
 
-	if err := store.StartSummary(id); err != nil {
+	if _, err := store.StartSummary(id); err != nil {
 		t.Fatalf("start summary: %v", err)
 	}
 
@@ -70,7 +70,7 @@ func TestAFailedSummaryKeepsTheLastGoodOneAndRecordsWhy(t *testing.T) {
 	store := newTestSQLiteStore(t)
 	const id = "20261106090000"
 	summarizedSyncedSession(t, store, id)
-	if err := store.StartSummary(id); err != nil {
+	if _, err := store.StartSummary(id); err != nil {
 		t.Fatalf("start summary: %v", err)
 	}
 
@@ -95,7 +95,7 @@ func TestAFailedSummaryKeepsTheLastGoodOneAndRecordsWhy(t *testing.T) {
 
 func TestStartAndFailSummaryOfAMissingSession(t *testing.T) {
 	store := newTestSQLiteStore(t)
-	if err := store.StartSummary("missing"); !errors.Is(err, sql.ErrNoRows) {
+	if _, err := store.StartSummary("missing"); !errors.Is(err, sql.ErrNoRows) {
 		t.Errorf("start summary: %v, want %v", err, sql.ErrNoRows)
 	}
 	if _, err := store.FailSummaryAtGeneration("missing", "why", 0); !errors.Is(err, sql.ErrNoRows) {

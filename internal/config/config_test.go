@@ -18,12 +18,12 @@ func clearEnv(t *testing.T) {
 		"DB_PATH", "AUDIO_DIR", "LOG_LEVEL", "SILENCE_TIMEOUT",
 		"MIC_SAMPLE_RATE", "MIC_SAMPLE_RATES", "MIC_DEVICE",
 		"SUMMARIZATION_MODEL", "GDRIVE_FOLDER_ID", "GOOGLE_CREDENTIALS_FILE",
-		"GCP_PROJECT", "GCP_LOCATION", "GENAI_BACKEND",
-		"BATCH_TRANSCRIPTION_PROVIDER", "BATCH_TRANSCRIPTION_MODEL",
+		"GCP_PROJECT", "GCP_LOCATION", "GENAI_BACKEND", "EMBEDDING_BACKEND", "EMBEDDING_LOCATION", "DEEPGRAM_MODEL",
+		"TRANSCRIPTION_MODEL", "BATCH_TRANSCRIPTION_PROVIDER", "BATCH_TRANSCRIPTION_MODEL", "EMBEDDING_MODEL",
 		"GDRIVE_SYNC_ENABLED", "GC_ENABLED", "GC_MAX_AGE_DAYS", "GC_MAX_AUDIO_SIZE_MB",
 		"INDICATOR_LIGHT", "POWER_BUTTON", "JABRA_MUTE_BUTTON", "PUBLIC_URL", "RECORDING_RULES",
 		"ENVOY_ENABLED", "ENVOY_HUB_URL", "ENVOY_WEBHOOK_URL", "ENVOY_WEBHOOK_SECRET", "ENVOY_WEBHOOK_SECRET_NAME",
-		"TTS_PROVIDER", "TTS_MODEL", "TTS_VOICE", "TTS_MAX_LENGTH",
+		"TTS_PROVIDER", "TTS_MODEL", "TTS_VOICE", "TTS_MAX_LENGTH", "TTS_API_KEY",
 		"DEEPGRAM_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "GEMINI_API_KEY", "CONFIG",
 	} {
 		t.Setenv(EnvPrefix+key, "")
@@ -38,25 +38,18 @@ func TestBatchRefinementConfigDefaultsAndOverrides(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load failed: %v", err)
 	}
-	if cfg.BatchTranscription.Provider != "deepgram" {
-		t.Fatalf("expected default batch provider deepgram, got %q", cfg.BatchTranscription.Provider)
-	}
-	if cfg.BatchTranscription.Model != "nova-3" {
-		t.Fatalf("expected default batch model nova-3, got %q", cfg.BatchTranscription.Model)
+	if cfg.BatchTranscription.Model != "deepgram/nova-3" {
+		t.Fatalf("expected the batch model to default to transcription.model deepgram/nova-3, got %q", cfg.BatchTranscription.Model)
 	}
 
-	t.Setenv(EnvPrefix+"BATCH_TRANSCRIPTION_PROVIDER", "openai")
-	t.Setenv(EnvPrefix+"BATCH_TRANSCRIPTION_MODEL", "gpt-4o-transcribe")
+	t.Setenv(EnvPrefix+"BATCH_TRANSCRIPTION_MODEL", "deepgram/nova-2")
 
 	cfg, _, err = Load("")
 	if err != nil {
 		t.Fatalf("Load with env overrides failed: %v", err)
 	}
-	if cfg.BatchTranscription.Provider != "openai" {
-		t.Fatalf("expected env batch provider openai, got %q", cfg.BatchTranscription.Provider)
-	}
-	if cfg.BatchTranscription.Model != "gpt-4o-transcribe" {
-		t.Fatalf("expected env batch model gpt-4o-transcribe, got %q", cfg.BatchTranscription.Model)
+	if cfg.BatchTranscription.Model != "deepgram/nova-2" {
+		t.Fatalf("expected env batch model deepgram/nova-2, got %q", cfg.BatchTranscription.Model)
 	}
 }
 
@@ -255,11 +248,11 @@ func TestDefaults(t *testing.T) {
 	if cfg.Transcription.UtteranceEndMs != "1000" {
 		t.Fatalf("expected default transcription.utterance_end_ms '1000', got %q", cfg.Transcription.UtteranceEndMs)
 	}
-	if cfg.GCPLocation != "us-central1" {
-		t.Fatalf("expected default gcp_location, got %q", cfg.GCPLocation)
+	if cfg.Transcription.Model != "deepgram/nova-3" {
+		t.Fatalf("expected default transcription.model deepgram/nova-3, got %q", cfg.Transcription.Model)
 	}
-	if cfg.GenAIBackend != "gemini" {
-		t.Fatalf("expected default genai_backend gemini, got %q", cfg.GenAIBackend)
+	if cfg.Embedding.Model != "" || cfg.TTS.Model != "" || cfg.Concierge.Model != "" {
+		t.Fatalf("embedding %q, tts %q, concierge %q by default; want each off", cfg.Embedding.Model, cfg.TTS.Model, cfg.Concierge.Model)
 	}
 }
 
@@ -276,7 +269,7 @@ silence_timeout: 45s
 mic_sample_rate: 48000
 mic_sample_rates: [44100, 32000]
 summarization:
-  model: anthropic/claude-3-5-sonnet-latest
+  model: claude/claude-3-5-sonnet-latest
   presets:
     default:
       description: Team sync summary
@@ -286,12 +279,12 @@ summarization:
       description: Short summary
       system_prompt: Return three bullets max
       user_template: "Meeting:\n{{transcript}}"
-      model: gemini/gemini-2.5-flash
+      model: vertex/gemini-2.5-flash
 gdrive_folder_id: my-folder
 google_credentials_file: /path/to/creds.json
-gcp_project: yaml-project
-gcp_location: europe-west4
-genai_backend: vertex
+providers:
+  claude: {api: anthropic, auth: {kind: api_key, env: EXAMPLE_ANTHROPIC_KEY}}
+  vertex: {api: vertex, project: yaml-project, location: europe-west4, auth: {kind: google}}
 `
 	if err := os.WriteFile(configPath, []byte(yamlContent), 0o644); err != nil {
 		t.Fatalf("write config: %v", err)
@@ -320,13 +313,13 @@ genai_backend: vertex
 	if !reflect.DeepEqual(cfg.MicSampleRates, []int{44100, 32000}) {
 		t.Fatalf("expected yaml mic_sample_rates, got %v", cfg.MicSampleRates)
 	}
-	if cfg.Summarization.Model != "anthropic/claude-3-5-sonnet-latest" {
+	if cfg.Summarization.Model != "claude/claude-3-5-sonnet-latest" {
 		t.Fatalf("expected yaml summarization.model, got %q", cfg.Summarization.Model)
 	}
 	if len(cfg.Summarization.Presets) != 2 {
 		t.Fatalf("expected yaml summarization presets, got %#v", cfg.Summarization.Presets)
 	}
-	if cfg.Summarization.Presets["concise"].Model != "gemini/gemini-2.5-flash" {
+	if cfg.Summarization.Presets["concise"].Model != "vertex/gemini-2.5-flash" {
 		t.Fatalf("expected yaml concise preset model, got %q", cfg.Summarization.Presets["concise"].Model)
 	}
 	if cfg.GDriveFolderID != "my-folder" {
@@ -335,14 +328,8 @@ genai_backend: vertex
 	if cfg.GoogleCredentialsFile != "/path/to/creds.json" {
 		t.Fatalf("expected yaml google_credentials_file, got %q", cfg.GoogleCredentialsFile)
 	}
-	if cfg.GCPProject != "yaml-project" {
-		t.Fatalf("expected yaml gcp_project, got %q", cfg.GCPProject)
-	}
-	if cfg.GCPLocation != "europe-west4" {
-		t.Fatalf("expected yaml gcp_location, got %q", cfg.GCPLocation)
-	}
-	if cfg.GenAIBackend != "vertex" {
-		t.Fatalf("expected yaml genai_backend, got %q", cfg.GenAIBackend)
+	if v := cfg.Providers["vertex"]; v.Project != "yaml-project" || v.Location != "europe-west4" {
+		t.Fatalf("expected the vertex provider's yaml project and location, got %+v", v)
 	}
 }
 
@@ -363,9 +350,6 @@ summarization:
 	t.Setenv(EnvPrefix+"SUMMARIZATION_MODEL", "openai/gpt-4.1-mini")
 	t.Setenv(EnvPrefix+"AUDIO_DIR", "/env/audio")
 	t.Setenv(EnvPrefix+"LOG_LEVEL", "error")
-	t.Setenv(EnvPrefix+"GCP_PROJECT", "env-project")
-	t.Setenv(EnvPrefix+"GCP_LOCATION", "us-east5")
-	t.Setenv(EnvPrefix+"GENAI_BACKEND", "vertex")
 
 	cfg, _, err := Load(configPath)
 	if err != nil {
@@ -384,75 +368,60 @@ summarization:
 	if cfg.LogLevel != "error" {
 		t.Fatalf("expected env override for log_level, got %q", cfg.LogLevel)
 	}
-	if cfg.GCPProject != "env-project" {
-		t.Fatalf("expected env override for gcp_project, got %q", cfg.GCPProject)
-	}
-	if cfg.GCPLocation != "us-east5" {
-		t.Fatalf("expected env override for gcp_location, got %q", cfg.GCPLocation)
-	}
-	if cfg.GenAIBackend != "vertex" {
-		t.Fatalf("expected env override for genai_backend, got %q", cfg.GenAIBackend)
-	}
 }
 
-func TestGeminiTTSConfigurationLoadsModelAndVoice(t *testing.T) {
+// TestTextToSpeechComesFromTheConfigFile fails if tts.model and tts.voice are
+// not read as written.
+func TestTextToSpeechComesFromTheConfigFile(t *testing.T) {
 	clearEnv(t)
 	configPath := writeConfig(t, `
-gcp_project: example-project
-tts_provider: gemini
-tts_model: gemini-3.8-flash-tts
-tts_voice: Kore
+providers:
+  vertex-us: {api: vertex, project: example-project, location: us, auth: {kind: google}}
+tts:
+  model: vertex-us/gemini-3.8-flash-tts
+  voice: Kore
 `)
 
-	cfg, _, err := Load(configPath)
+	cfg, warnings, err := Load(configPath)
 	if err != nil {
 		t.Fatalf("Load failed: %v", err)
 	}
-	if cfg.TTSProvider != "gemini" {
-		t.Fatalf("tts_provider = %q, want gemini", cfg.TTSProvider)
+	if cfg.TTS.Model != "vertex-us/gemini-3.8-flash-tts" || cfg.TTS.Voice != "Kore" || cfg.TTS.MaxLength != 5000 {
+		t.Fatalf("tts = %+v, want vertex-us/gemini-3.8-flash-tts, Kore and the 5000 default length", cfg.TTS)
 	}
-	if cfg.TTSModel != "gemini-3.8-flash-tts" {
-		t.Fatalf("tts_model = %q, want gemini-3.8-flash-tts", cfg.TTSModel)
-	}
-	if cfg.TTSVoice != "Kore" {
-		t.Fatalf("tts_voice = %q, want Kore", cfg.TTSVoice)
+	if len(warnings) > 0 {
+		t.Fatalf("unexpected warnings: %q", warnings)
 	}
 }
 
-func TestTTSModelEnvironmentOverride(t *testing.T) {
+// TestGoogleCloudTextToSpeechRemainsAProviderForChirp fails if a Chirp 3: HD
+// voice on Google Cloud Text-to-Speech, signed in by Google, warns.
+func TestGoogleCloudTextToSpeechRemainsAProviderForChirp(t *testing.T) {
 	clearEnv(t)
-	configPath := writeConfig(t, "tts_model: gemini-3.1-flash-tts-preview\n")
-	t.Setenv(EnvPrefix+"TTS_MODEL", "gemini-3.8-flash-tts")
-
-	cfg, _, err := Load(configPath)
+	cfg, warnings, err := Load(writeConfig(t, `
+providers:
+  cloud-tts: {api: google-tts, auth: {kind: google}}
+tts:
+  model: cloud-tts/chirp3-hd
+  voice: en-US-Chirp3-HD-Charon
+`))
 	if err != nil {
 		t.Fatalf("Load failed: %v", err)
 	}
-	if cfg.TTSModel != "gemini-3.8-flash-tts" {
-		t.Fatalf("tts_model = %q, want environment override", cfg.TTSModel)
-	}
-}
-
-func TestGoogleTTSProviderRemainsValidForChirpFallback(t *testing.T) {
-	clearEnv(t)
-	t.Setenv(EnvPrefix+"TTS_PROVIDER", "google")
-	t.Setenv(EnvPrefix+"TTS_VOICE", "en-US-Chirp3-HD-Charon")
-
-	cfg, warnings, err := Load("")
-	if err != nil {
-		t.Fatalf("Load failed: %v", err)
-	}
-	if cfg.TTSProvider != "google" || cfg.TTSVoice != "en-US-Chirp3-HD-Charon" {
-		t.Fatalf("Chirp fallback config = %#v", cfg)
+	if _, err := cfg.ResolveModel(RoleTTS, cfg.TTS.Model); err != nil {
+		t.Fatalf("Chirp on Google Cloud Text-to-Speech: %v", err)
 	}
 	for _, warning := range warnings {
-		if strings.Contains(warning, "Invalid tts_provider") || strings.Contains(warning, "TTS provider configured but API key") {
-			t.Fatalf("unexpected Chirp fallback warning: %q", warning)
+		if strings.Contains(warning, "tts") || strings.Contains(warning, "cloud-tts") {
+			t.Fatalf("unexpected Chirp warning: %q", warning)
 		}
 	}
 }
 
-func TestGenAIProjectDefaultFromServiceAccount(t *testing.T) {
+// TestAVertexProviderTakesAServiceAccountsProject fails if a Vertex AI
+// provider that names no project does not take the project of a
+// service-account credential file, or the global location.
+func TestAVertexProviderTakesAServiceAccountsProject(t *testing.T) {
 	clearEnv(t)
 	dir := t.TempDir()
 	credsPath := filepath.Join(dir, "service-account.json")
@@ -461,56 +430,56 @@ func TestGenAIProjectDefaultFromServiceAccount(t *testing.T) {
 	}
 	t.Setenv("GOOGLE_APPLICATION_CREDENTIALS", credsPath)
 
-	cfg, _, err := Load("")
+	cfg, _, err := Load(writeConfig(t, "providers:\n  vertex: {api: vertex, auth: {kind: google}}\n"))
 	if err != nil {
 		t.Fatalf("Load failed: %v", err)
 	}
-	if cfg.GCPProject != "sa-project" {
-		t.Fatalf("expected project discovered from service account, got %q", cfg.GCPProject)
-	}
-	if cfg.GenAIBackend != "vertex" {
-		t.Fatalf("expected Vertex backend when project is discovered, got %q", cfg.GenAIBackend)
+	if v := cfg.Providers["vertex"]; v.Project != "sa-project" || v.Location != "global" {
+		t.Fatalf("vertex = %+v, want the service account's project and the global location", v)
 	}
 }
 
-func TestConfigDoesNotNeedProjectIDInAnExternalAccountFile(t *testing.T) {
+// TestAVertexProviderWithNoProjectWarnsUnderAnExternalAccount fails if a
+// Vertex AI provider takes a project_id from an external-account file, which
+// names a pool's project and not the one to bill, or if it then does not warn.
+func TestAVertexProviderWithNoProjectWarnsUnderAnExternalAccount(t *testing.T) {
 	clearEnv(t)
 	credentialsPath := filepath.Join(t.TempDir(), "external-account.json")
 	if err := os.WriteFile(credentialsPath, []byte(`{"type":"external_account","project_id":"must-not-be-used"}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("GOOGLE_APPLICATION_CREDENTIALS", credentialsPath)
-	t.Setenv(EnvPrefix+"GENAI_BACKEND", "vertex")
-	t.Setenv(EnvPrefix+"GCP_PROJECT", "example-project")
 
-	_, warnings, err := Load("")
+	cfg, warnings, err := Load(writeConfig(t, "providers:\n  vertex: {api: vertex, auth: {kind: google}}\n"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if slices.Contains(warnings, "Set gcp_project: an external-account credential file names no project.") {
-		t.Fatalf("unexpected external-account project warning with gcp_project set: %v", warnings)
+	if cfg.Providers["vertex"].Project != "" {
+		t.Fatalf("vertex took project %q from an external-account file", cfg.Providers["vertex"].Project)
+	}
+	if !slices.ContainsFunc(warnings, func(w string) bool { return strings.Contains(w, "providers.vertex") && strings.Contains(w, "project") }) {
+		t.Fatalf("missing the vertex provider's project warning: %v", warnings)
 	}
 
-	t.Setenv(EnvPrefix+"GCP_PROJECT", "")
-	_, warnings, err = Load("")
+	_, warnings, err = Load(writeConfig(t, "providers:\n  vertex: {api: vertex, project: example-project, auth: {kind: google}}\n"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !slices.Contains(warnings, "Set gcp_project: an external-account credential file names no project.") {
-		t.Fatalf("missing external-account project warning: %v", warnings)
+	if slices.ContainsFunc(warnings, func(w string) bool { return strings.Contains(w, "providers.vertex") }) {
+		t.Fatalf("unexpected vertex warning with its project set: %v", warnings)
 	}
 }
 
 func TestEnvOverrideSummarizationModel(t *testing.T) {
 	clearEnv(t)
-	t.Setenv(EnvPrefix+"SUMMARIZATION_MODEL", "gemini/gemini-2.5-flash")
+	t.Setenv(EnvPrefix+"SUMMARIZATION_MODEL", "vertex/gemini-2.5-flash")
 
 	cfg, _, err := Load("")
 	if err != nil {
 		t.Fatalf("Load failed: %v", err)
 	}
 
-	if cfg.Summarization.Model != "gemini/gemini-2.5-flash" {
+	if cfg.Summarization.Model != "vertex/gemini-2.5-flash" {
 		t.Fatalf("expected env summarization.model override, got %q", cfg.Summarization.Model)
 	}
 }
@@ -519,25 +488,17 @@ func TestSecretsFromEnvOnly(t *testing.T) {
 	clearEnv(t)
 	t.Setenv(EnvPrefix+"DEEPGRAM_API_KEY", "dg-secret")
 	t.Setenv(EnvPrefix+"OPENAI_API_KEY", "oai-secret")
-	t.Setenv(EnvPrefix+"ANTHROPIC_API_KEY", "anth-secret")
-	t.Setenv(EnvPrefix+"GEMINI_API_KEY", "gem-secret")
 
 	cfg, _, err := Load("")
 	if err != nil {
 		t.Fatalf("Load failed: %v", err)
 	}
 
-	if cfg.DeepgramAPIKey != "dg-secret" {
-		t.Fatalf("expected deepgram key from env, got %q", cfg.DeepgramAPIKey)
+	if got := cfg.APIKey("deepgram"); got != "dg-secret" {
+		t.Fatalf("expected deepgram key from env, got %q", got)
 	}
-	if cfg.OpenAIAPIKey != "oai-secret" {
-		t.Fatalf("expected openai key from env, got %q", cfg.OpenAIAPIKey)
-	}
-	if cfg.AnthropicAPIKey != "anth-secret" {
-		t.Fatalf("expected anthropic key from env, got %q", cfg.AnthropicAPIKey)
-	}
-	if cfg.GeminiAPIKey != "gem-secret" {
-		t.Fatalf("expected gemini key from env, got %q", cfg.GeminiAPIKey)
+	if got := cfg.APIKey("openai"); got != "oai-secret" {
+		t.Fatalf("expected openai key from env, got %q", got)
 	}
 }
 
@@ -561,17 +522,8 @@ gemini_api_key: no
 		t.Fatalf("Load failed: %v", err)
 	}
 
-	if cfg.DeepgramAPIKey != "" {
-		t.Fatalf("expected empty deepgram key (yaml should be ignored), got %q", cfg.DeepgramAPIKey)
-	}
-	if cfg.OpenAIAPIKey != "" {
-		t.Fatalf("expected empty openai key (yaml should be ignored), got %q", cfg.OpenAIAPIKey)
-	}
-	if cfg.AnthropicAPIKey != "" {
-		t.Fatalf("expected empty anthropic key (yaml should be ignored), got %q", cfg.AnthropicAPIKey)
-	}
-	if cfg.GeminiAPIKey != "" {
-		t.Fatalf("expected empty gemini key (yaml should be ignored), got %q", cfg.GeminiAPIKey)
+	if len(cfg.ProviderKeys) != 0 {
+		t.Fatalf("expected no provider key (yaml should be ignored), got %d", len(cfg.ProviderKeys))
 	}
 }
 
@@ -585,19 +537,19 @@ func TestValidationWarnings(t *testing.T) {
 
 	var deepgramWarning, openaiWarning bool
 	for _, w := range warnings {
-		if strings.Contains(w, "Deepgram") {
+		if strings.Contains(w, `"deepgram"`) && strings.Contains(w, "transcription.model") {
 			deepgramWarning = true
 		}
-		if strings.Contains(w, "OpenAI") {
+		if strings.Contains(w, `"openai"`) && strings.Contains(w, "summarization.model") {
 			openaiWarning = true
 		}
 	}
 
 	if !deepgramWarning {
-		t.Fatalf("expected Deepgram warning when key is missing, got warnings: %v", warnings)
+		t.Fatalf("expected a deepgram provider warning when its key is missing, got warnings: %v", warnings)
 	}
 	if !openaiWarning {
-		t.Fatalf("expected OpenAI warning when key is missing, got warnings: %v", warnings)
+		t.Fatalf("expected an openai provider warning when its key is missing, got warnings: %v", warnings)
 	}
 }
 
@@ -618,42 +570,63 @@ func TestValidationNoWarningsWhenConfigured(t *testing.T) {
 
 func TestValidationWarningsWhenProviderAPIKeyMissing(t *testing.T) {
 	clearEnv(t)
-	t.Setenv(EnvPrefix+"DEEPGRAM_API_KEY", "key")
-	t.Setenv(EnvPrefix+"SUMMARIZATION_MODEL", "anthropic/claude-3-5-haiku-latest")
-
-	_, warnings, err := Load("")
+	t.Setenv(EnvPrefix+"ANTHROPIC_API_KEY", "")
+	_, warnings, err := Load(writeConfig(t, `
+providers:
+  anthropic: {api: anthropic, auth: {kind: api_key, env: GHOST_WISPR_ANTHROPIC_API_KEY}}
+summarization:
+  model: anthropic/claude-3-5-haiku-latest
+transcription:
+  model: ""
+`))
 	if err != nil {
 		t.Fatalf("Load failed: %v", err)
 	}
 
-	var anthropicWarning bool
-	for _, w := range warnings {
-		if strings.Contains(w, "Anthropic") {
-			anthropicWarning = true
-			break
-		}
+	if !slices.ContainsFunc(warnings, func(w string) bool {
+		return strings.Contains(w, `"anthropic"`) && strings.Contains(w, EnvPrefix+"ANTHROPIC_API_KEY")
+	}) {
+		t.Fatalf("expected an anthropic warning naming its key's variable, got warnings: %v", warnings)
 	}
 
-	if !anthropicWarning {
-		t.Fatalf("expected Anthropic warning when key is missing, got warnings: %v", warnings)
+	// A provider only a summarization preset calls needs its key too: the
+	// warning names the preset, whose summaries are off.
+	_, warnings, err = Load(writeConfig(t, `
+providers:
+  vertex: {api: vertex, project: vertex-project, auth: {kind: google}}
+  anthropic: {api: anthropic, auth: {kind: api_key, env: GHOST_WISPR_ANTHROPIC_API_KEY}}
+summarization:
+  model: vertex/gemini-example
+  presets:
+    brief: {model: anthropic/claude-example}
+transcription:
+  model: ""
+`))
+	if err != nil {
+		t.Fatalf("Load failed: %v", err)
+	}
+	if !slices.ContainsFunc(warnings, func(w string) bool {
+		return strings.Contains(w, `"anthropic"`) && strings.Contains(w, EnvPrefix+"ANTHROPIC_API_KEY") && strings.Contains(w, `summarization preset "brief" model`)
+	}) {
+		t.Fatalf("expected an anthropic warning naming its key's variable and the preset that calls it, got warnings: %v", warnings)
 	}
 }
 
-func TestValidationGeminiProviderAllowsVertexAI(t *testing.T) {
+func TestValidationVertexProviderNeedsNoKey(t *testing.T) {
 	clearEnv(t)
-	t.Setenv(EnvPrefix+"DEEPGRAM_API_KEY", "key")
-	t.Setenv(EnvPrefix+"SUMMARIZATION_MODEL", "gemini/gemini-3.1-pro-preview")
-	t.Setenv(EnvPrefix+"GCP_PROJECT", "vertex-project")
-	t.Setenv(EnvPrefix+"GENAI_BACKEND", "vertex")
-
-	_, warnings, err := Load("")
+	_, warnings, err := Load(writeConfig(t, `
+providers:
+  vertex: {api: vertex, project: vertex-project, auth: {kind: google}}
+summarization:
+  model: vertex/gemini-3.1-pro-preview
+transcription:
+  model: ""
+`))
 	if err != nil {
 		t.Fatalf("Load failed: %v", err)
 	}
-	for _, warning := range warnings {
-		if strings.Contains(warning, "Gemini backend") {
-			t.Fatalf("unexpected Gemini warning with Vertex AI configured: %v", warnings)
-		}
+	if len(warnings) > 0 {
+		t.Fatalf("unexpected warnings with Vertex AI configured: %v", warnings)
 	}
 }
 

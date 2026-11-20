@@ -1,6 +1,7 @@
 package tts
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"net/http"
@@ -11,8 +12,12 @@ import (
 	"testing"
 	"time"
 
+	"cloud.google.com/go/auth"
+
 	"github.com/sjawhar/ghost-wispr/internal/audio"
+	"github.com/sjawhar/ghost-wispr/internal/config"
 	"github.com/sjawhar/ghost-wispr/internal/googleauth"
+	"github.com/sjawhar/ghost-wispr/internal/providers"
 	"github.com/sjawhar/ghost-wispr/internal/voice"
 )
 
@@ -95,14 +100,14 @@ func (c *streamConns) describe() string {
 // It skips the test when no engine is named.
 func liveEngine(t *testing.T, logCredentials bool) (Engine, *streamConns) {
 	t.Helper()
+	model, voice := os.Getenv("GHOST_WISPR_LIVE_TTS_MODEL"), os.Getenv("GHOST_WISPR_LIVE_TTS_VOICE")
 	switch name := os.Getenv("GHOST_WISPR_LIVE_TTS"); name {
 	case "":
 		t.Skip("set GHOST_WISPR_LIVE_TTS=aura or gemini to measure time to first audio against the real service")
 	case "aura":
-		a, err := NewAura(AuraConfig{
-			APIKey: os.Getenv("GHOST_WISPR_DEEPGRAM_API_KEY"),
-			Model:  os.Getenv("GHOST_WISPR_LIVE_TTS_MODEL"),
-		})
+		const keyEnv = "GHOST_WISPR_DEEPGRAM_API_KEY"
+		p := liveProvider(t, &config.Provider{API: config.APIDeepgram, Auth: config.ProviderAuth{Kind: config.AuthAPIKey, Env: keyEnv}}, nil)
+		a, err := NewEngine(p, cmp.Or(model, "aura-2-harmonia-en"), voice)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -128,14 +133,13 @@ func liveEngine(t *testing.T, logCredentials bool) (Engine, *streamConns) {
 		transport := http.DefaultTransport.(*http.Transport).Clone()
 		t.Cleanup(transport.CloseIdleConnections)
 		conns := &streamConns{base: transport}
-		g, err := NewGemini(&GeminiConfig{
-			Project:     os.Getenv("GHOST_WISPR_GCP_PROJECT"),
-			Location:    os.Getenv("GHOST_WISPR_LIVE_TTS_LOCATION"),
-			Model:       os.Getenv("GHOST_WISPR_LIVE_TTS_MODEL"),
-			Voice:       os.Getenv("GHOST_WISPR_LIVE_TTS_VOICE"),
-			Credentials: credentials,
-			HTTPClient:  &http.Client{Transport: conns},
-		})
+		p := liveProvider(t, &config.Provider{
+			API:      config.APIVertex,
+			Project:  os.Getenv("GHOST_WISPR_LIVE_GCP_PROJECT"),
+			Location: cmp.Or(os.Getenv("GHOST_WISPR_LIVE_TTS_LOCATION"), "us"),
+			Auth:     config.ProviderAuth{Kind: config.AuthGoogle},
+		}, credentials)
+		g, err := NewEngine(p, cmp.Or(model, "gemini-3.8-flash-tts"), voice, WithHTTPClient(&http.Client{Transport: conns}))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -144,6 +148,23 @@ func liveEngine(t *testing.T, logCredentials bool) (Engine, *streamConns) {
 		t.Fatalf("GHOST_WISPR_LIVE_TTS=%q, want aura or gemini", name)
 	}
 	return nil, nil
+}
+
+// liveProvider is p, signed in with the key its auth.env names in the
+// environment, or with credentials.
+func liveProvider(t *testing.T, p *config.Provider, credentials *auth.Credentials) *providers.Provider {
+	t.Helper()
+	cfg := &config.Config{
+		Providers:    map[string]config.Provider{"live": *p},
+		ProviderKeys: map[string]string{p.Auth.Env: os.Getenv(p.Auth.Env)},
+	}
+	got, err := providers.New(cfg, providers.Options{
+		GoogleCredentials: func(context.Context, string, ...string) (*auth.Credentials, error) { return credentials, nil },
+	}).Get("live")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return got
 }
 
 // sayFirstFrame says text and returns the time from the call to its first
@@ -177,12 +198,13 @@ func logMedian(t *testing.T, name, what string, waits []time.Duration) {
 // and the median. It runs only when GHOST_WISPR_LIVE_TTS names an engine:
 //
 //	GHOST_WISPR_LIVE_TTS=aura GHOST_WISPR_DEEPGRAM_API_KEY=<key> go test -run TestLive -v ./internal/voice/tts
-//	GHOST_WISPR_LIVE_TTS=gemini GHOST_WISPR_GCP_PROJECT=<project> go test -run TestLive -v ./internal/voice/tts
+//	GHOST_WISPR_LIVE_TTS=gemini GHOST_WISPR_LIVE_GCP_PROJECT=<project> go test -run TestLive -v ./internal/voice/tts
 //
-// Gemini reads Application Default Credentials, or the file
+// Gemini, on Vertex AI, reads Application Default Credentials, or the file
 // GHOST_WISPR_GOOGLE_CREDENTIALS_FILE names; GHOST_WISPR_LIVE_TTS_LOCATION
 // chooses its location ("us" by default; "global" to compare). Each engine
-// takes GHOST_WISPR_LIVE_TTS_MODEL and, for Gemini, GHOST_WISPR_LIVE_TTS_VOICE.
+// takes GHOST_WISPR_LIVE_TTS_MODEL (aura-2-harmonia-en and
+// gemini-3.8-flash-tts by default) and GHOST_WISPR_LIVE_TTS_VOICE.
 func TestLiveTimeToFirstAudio(t *testing.T) {
 	engine, _ := liveEngine(t, true)
 	out := &firstFrameOutput{first: make(chan time.Time, 1)}

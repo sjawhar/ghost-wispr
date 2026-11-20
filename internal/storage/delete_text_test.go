@@ -337,7 +337,7 @@ func TestDeleteRefinedSegmentTextFencesStaleRefinementAndSummary(t *testing.T) {
 	store := newTestSQLiteStore(t)
 	_, _ = segmentTestSession(t, store, "text-fence")
 	revision, segments := publishRefinedSegmentTestSession(t, store, "text-fence", "recording.mp3", "recording-sha")
-	if err := store.StartSummary("text-fence"); err != nil {
+	if _, err := store.StartSummary("text-fence"); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.DeleteRefinedSegmentText("text-fence", segments[1].ID, revision); err != nil {

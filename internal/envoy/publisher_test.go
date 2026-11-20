@@ -681,7 +681,7 @@ func TestEmptySummaryIsNotPublished(t *testing.T) {
 	if err := store.EndSession("session-1", startedAt.Add(time.Minute), "", ""); err != nil {
 		t.Fatalf("EndSession: %v", err)
 	}
-	if err := store.StartSummary("session-1"); err != nil {
+	if _, err := store.StartSummary("session-1"); err != nil {
 		t.Fatalf("StartSummary: %v", err)
 	}
 	_, generation, err := store.Canonicalize("session-1")
@@ -713,7 +713,7 @@ func TestEmptySummaryIsNotPublished(t *testing.T) {
 		t.Fatalf("envoy_publish_status after the skip = %q, %v; want %q", sess.EnvoyPublishStatus, err, storage.EnvoyPublishSkipped)
 	}
 
-	if err := store.StartSummary("session-1"); err != nil {
+	if _, err := store.StartSummary("session-1"); err != nil {
 		t.Fatalf("StartSummary: %v", err)
 	}
 	if err := store.UpdateSummaryAtGeneration("session-1", "Title", "A real summary.", storage.SummaryCompleted, "default", "{}", "", generation); err != nil {

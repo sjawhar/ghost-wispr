@@ -987,6 +987,9 @@ func (m *Manager) generateSummary(ctx context.Context, sessionID string, started
 		return
 	}
 
+	// stored is set once the run's summary is stored: endSummaryAttempt then
+	// has nothing to release, and runs no statement.
+	stored := false
 	if summarizer == nil {
 		// Without a summarizer the summary completes empty, which keeps the
 		// session's summary as it is. StartEmptySummary binds it to the
@@ -994,8 +997,14 @@ func (m *Manager) generateSummary(ctx context.Context, sessionID string, started
 		// generation fence after a segment deletion, and leaves the summary
 		// version and Envoy delivery state alone, so a summary Envoy already
 		// has is not sent again.
-		if err := m.store.StartEmptySummary(sessionID); err != nil {
+		if attempt, err := m.store.StartEmptySummary(sessionID); err != nil {
 			m.logger.Error("failed to start empty summary", "operation", "generate_summary", "session_id", sessionID, "error", err)
+		} else {
+			defer func() {
+				if !stored {
+					m.endSummaryAttempt(ctx, sessionID, attempt)
+				}
+			}()
 		}
 		transcript, generation, err := m.store.Canonicalize(sessionID)
 		if err != nil {
@@ -1009,13 +1018,21 @@ func (m *Manager) generateSummary(ctx context.Context, sessionID string, started
 		}
 		if err := m.store.UpdateSummaryAtGeneration(sessionID, "", "", storage.SummaryCompleted, "", "{}", "", generation); err != nil {
 			m.logger.Error("failed to mark empty summary complete", "operation", "generate_summary", "session_id", sessionID, "error", err)
+		} else {
+			stored = true
 		}
 		m.triggerEmbeddingIndexAtGeneration(sessionID, transcript, generation)
 		m.triggerDriveSync(syncer, sessionID)
 		return
 	}
 
-	_ = m.store.StartSummary(sessionID)
+	if attempt, err := m.store.StartSummary(sessionID); err == nil {
+		defer func() {
+			if !stored {
+				m.endSummaryAttempt(ctx, sessionID, attempt)
+			}
+		}()
+	}
 
 	// Wait for batch refinement if configured, then canonicalize.
 	m.mu.Lock()
@@ -1025,8 +1042,10 @@ func (m *Manager) generateSummary(ctx context.Context, sessionID string, started
 		_ = m.waitForRefinedTranscript(ctx, sessionID)
 	}
 
-	// Canonicalize the transcript (picks refined if available, else assembles streaming).
-	transcript, generation, err := m.store.Canonicalize(sessionID)
+	// Canonicalize the transcript (picks refined if available, else assembles
+	// streaming). The summarizer reads it with each segment's speaker label;
+	// the title fallback and search read it without.
+	transcript, labeled, generation, err := m.store.CanonicalizeForSummary(sessionID)
 	if err != nil {
 		m.failSummary(sessionID, fmt.Sprintf("failed to canonicalize transcript: %v", err), startGeneration)
 		m.logger.Error("failed to canonicalize transcript", "operation", "generate_summary", "session_id", sessionID, "error", err)
@@ -1041,17 +1060,18 @@ func (m *Manager) generateSummary(ctx context.Context, sessionID string, started
 
 	var title, summaryText, preset, speakerNames, summaryModel string
 	if reporter, ok := summarizer.(ReportedSummarizer); ok {
-		title, summaryText, preset, speakerNames, summaryModel, err = reporter.SummarizeReported(ctx, sessionID, transcript)
+		title, summaryText, preset, speakerNames, summaryModel, err = reporter.SummarizeReported(ctx, sessionID, labeled)
 	} else {
-		title, summaryText, preset, speakerNames, err = summarizer.Summarize(ctx, sessionID, transcript)
+		title, summaryText, preset, speakerNames, err = summarizer.Summarize(ctx, sessionID, labeled)
 	}
 	// Safety net: ensure title is never empty using fallback chain.
 	if strings.TrimSpace(title) == "" {
 		title = summary.GenerateTitle("", transcript, segments, startedAt)
 	}
 	if err != nil && stopping.CutOff(ctx) {
-		// The stop cut it off: it stays running, and the next start's
-		// backfill makes it (storage.SQLiteStore.GetSessionsForBackfill).
+		// The stop cut it off: it stays running, the next start makes it
+		// pending again (storage.SQLiteStore.RecoverInterruptedSummaries),
+		// and that start's backfill makes it.
 		m.logger.Info("summary cut off by the stop; the next start makes it", "operation", "generate_summary", "session_id", sessionID)
 		return
 	}
@@ -1067,8 +1087,9 @@ func (m *Manager) generateSummary(ctx context.Context, sessionID string, started
 
 	storeErr := m.store.UpdateSummaryAtGeneration(sessionID, title, summaryText, storage.SummaryCompleted, preset, speakerNames, summaryModel, generation)
 	if errors.Is(storeErr, sql.ErrNoRows) {
-		// The text changed since it was read (a segment deletion): a newer
-		// run owns the summary, so this one records no failure.
+		// The text changed since it was read (a segment deletion): this run
+		// records no failure. A newer attempt owns the summary, or, with
+		// none, endSummaryAttempt puts it back to pending.
 		m.logger.Warn("discarded a stale summary: the session's transcript changed since it was read", "operation", "generate_summary", "session_id", sessionID)
 		return
 	}
@@ -1080,6 +1101,7 @@ func (m *Manager) generateSummary(ctx context.Context, sessionID string, started
 		}
 		return
 	}
+	stored = true
 
 	m.broadcastSummaryStatus(sessionID, title, summaryText, storage.SummaryCompleted, preset)
 	m.triggerEmbeddingIndexAtGeneration(sessionID, transcript, generation)
@@ -1092,6 +1114,27 @@ func (m *Manager) generateSummary(ctx context.Context, sessionID string, started
 				m.logger.Error("envoy publish failed", "operation", "publish_summary_ready", "session_id", sessionID, "error", err)
 			}
 		})
+	}
+}
+
+// endSummaryAttempt ends summary attempt attempt, which generateSummary
+// started on session sessionID, when it returns or panics. A running summary
+// is one a worker makes now, which no backfill takes, so a run that stored
+// neither its summary nor its failure (the store refused the write, or it
+// panicked) puts it back to pending (SessionStore.ReleaseSummary), and a
+// backlog of this run makes it. One the stop cut off stays running, for the
+// next start. A summary or failure stored, or a newer attempt, is left as it
+// is.
+func (m *Manager) endSummaryAttempt(ctx context.Context, sessionID string, attempt int) {
+	if stopping.CutOff(ctx) {
+		return
+	}
+	released, err := m.store.ReleaseSummary(sessionID, attempt)
+	switch {
+	case err != nil:
+		m.logger.Error("a summary ended with nothing stored, and could not be put back to pending; the next start takes it", "operation", "generate_summary", "session_id", sessionID, "error", err)
+	case released:
+		m.logger.Warn("a summary ended with nothing stored; it is pending again, for a backlog", "operation", "generate_summary", "session_id", sessionID)
 	}
 }
 

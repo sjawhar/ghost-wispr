@@ -1,8 +1,8 @@
 // Package tts is voice A: Wispr speaks the Concierge's words through a
-// streaming text-to-speech engine (Gemini TTS on Vertex AI, or Deepgram
-// Aura-2) into the speaker output's voice input. The Concierge drives the
-// turn and voice A only speaks, so a Session ignores the exchange's room
-// audio and tools.
+// streaming text-to-speech engine on the provider and model the tts role
+// names (NewEngine) into the speaker output's voice input. The Concierge
+// drives the turn and voice A only speaks, so a Session ignores the
+// exchange's room audio and tools.
 package tts
 
 import (
@@ -26,15 +26,17 @@ type Engine interface {
 	Format() audio.AudioFormat
 	// Stream synthesises text and calls emit with each PCM chunk as it
 	// arrives, so the first audio plays before the whole text is
-	// synthesised. A chunk may hold any number of bytes. Stream returns once
-	// the text is synthesised, emit fails, or ctx ends.
+	// synthesised. A chunk may hold any number of bytes, and is the
+	// engine's again once emit returns: emit copies what it keeps. Stream
+	// returns once the text is synthesised, emit fails, or ctx ends.
 	Stream(ctx context.Context, text string, emit func(pcm []byte) error) error
 }
 
-// Connector is an Engine that speaks over a connection it keeps open, as
-// Aura-2's WebSocket is. A Session connects when it opens, so its first Say
-// does not wait for the dial, streams every Say over that connection, and
-// closes it on Close.
+// Connector is an Engine that readies a Session's way to its provider when
+// the Session opens, so its first Say does not wait for the dial: Aura-2
+// keeps a WebSocket open, and an engine that speaks over HTTP warms its
+// sign-in and connection (httpEngine.connect). A Session streams every Say
+// over the Conn and closes it on Close.
 type Connector interface {
 	Engine
 	Connect(ctx context.Context) (Conn, error)
@@ -187,8 +189,13 @@ type sayRequest struct {
 	more     chan struct{} // signalled when chunks grow or synthesis ends
 }
 
+// ErrNoAudio is a synthesis that gave no audio: an engine whose answer held
+// none, or no whole sample. Every engine's such failure wraps it, so a caller
+// tells it from a refusal or a stall (errors.Is).
+var ErrNoAudio = errors.New("the engine gave no audio")
+
 // errNoAudio is a speech vendor that ended a non-empty text with no frame.
-var errNoAudio = errors.New("tts: the engine gave no audio")
+var errNoAudio = fmt.Errorf("tts: %w", ErrNoAudio)
 
 // errPlaybackEnded stops a Say's synthesis once play could not write it.
 var errPlaybackEnded = errors.New("tts: the playback ended")

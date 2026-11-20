@@ -27,11 +27,17 @@ type Store interface {
 	// generation.
 	UpdateSummaryAtGeneration(sessionID, title, summary, status, preset, speakerNames, model string, generation int) error
 	// StartSummary marks the summary running; the session keeps its title
-	// and its last good summary until a new one is stored.
-	StartSummary(sessionID string) error
+	// and its last good summary until a new one is stored. It returns the
+	// summary attempt it started.
+	StartSummary(sessionID string) (attempt int, err error)
 	// StartEmptySummary marks the summary running, with no summarizer to make
-	// one: the summary version and Envoy delivery state stay as they are.
-	StartEmptySummary(sessionID string) error
+	// one: the summary version and Envoy delivery state stay as they are. It
+	// returns the summary attempt it started.
+	StartEmptySummary(sessionID string) (attempt int, err error)
+	// ReleaseSummary puts the summary back to pending while attempt is still
+	// its own and running, for a run that ended with nothing stored, and
+	// reports whether it did.
+	ReleaseSummary(sessionID string, attempt int) (bool, error)
 	// FailSummaryAtGeneration records that the summary failed, and why,
 	// keeping the session's title and last good summary, and returns the
 	// session, only while generation is still the session's transcript
@@ -55,6 +61,10 @@ type Store interface {
 	TextDeletionSpans(recording string) ([]storage.TextDeletionSpan, error)
 	UpdateTitle(sessionID, title string) error
 	Canonicalize(sessionID string) (transcript string, generation int, err error)
+	// CanonicalizeForSummary is Canonicalize, and also returns, from the same
+	// transaction, the transcript a summary reads: each segment after its
+	// speaker's label.
+	CanonicalizeForSummary(sessionID string) (canonical, labeled string, generation int, err error)
 }
 
 type Recorder interface {
