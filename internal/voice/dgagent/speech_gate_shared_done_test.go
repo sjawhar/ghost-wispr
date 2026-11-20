@@ -107,7 +107,9 @@ func TestSpeechGateSharedDoneReplies(t *testing.T) {
 func testUserStartOverTheVoiceDropsHeldAudio(t *testing.T) {
 	stand := startStandIn(t)
 	out := newFakeOutput()
-	sess, c, _ := open(t, stand, Config{speechGap: time.Minute}, voice.Exchange{Out: out, Tools: silentConcierge()})
+	// The production speech gap ends speech that stops with no end, so a
+	// Say whose speech was not cut returns, and the check below reads it.
+	sess, c, _ := open(t, stand, Config{speechGap: speechGap}, voice.Exchange{Out: out, Tools: silentConcierge()})
 	defer func() { _ = sess.Close() }()
 	first := tone(OutputRate, 20*time.Millisecond, 810)
 	done := sayAsync(sess, "Cut words.")
@@ -143,7 +145,10 @@ func testUserStartOverTheVoiceDropsHeldAudio(t *testing.T) {
 func testUserStartOverPlayedSpeech(t *testing.T, userStart bool) {
 	stand := startStandIn(t)
 	out := newFakeOutput()
-	sess, c, _ := open(t, stand, Config{speechGap: time.Minute}, voice.Exchange{Out: out, Tools: silentConcierge()})
+	// The production speech gap ends speech that stops with no end, so the
+	// Say returns and the byte check below runs even when the model's audio
+	// plays and nothing else ends the reply.
+	sess, c, _ := open(t, stand, Config{speechGap: speechGap}, voice.Exchange{Out: out, Tools: silentConcierge()})
 	defer func() { _ = sess.Close() }()
 	approved := tone(OutputRate, 40*time.Millisecond, 800)
 	done := sayAsync(sess, "Approved words.")
