@@ -156,7 +156,10 @@ type SupervisorConfig struct {
 	Notify  func(kind, sessionID string)
 	// ProjectKeys are Dispatch's project keys, whose spoken keys the turn
 	// writes as keys; nil writes none. It must return at once.
-	ProjectKeys  func() []string
+	ProjectKeys func() []string
+	// WaitingLight is told On while something waits for a person, and Off
+	// once nothing does (Supervisor.waitingLocked); nil shows nothing.
+	WaitingLight WaitingLight
 	Tap          *Tap
 	TurnWait     time.Duration // 0: DefaultTurnWait
 	SilenceWait  time.Duration // 0: DefaultSilenceWait
@@ -198,7 +201,10 @@ type Supervisor struct {
 	lastStopAt    time.Time          // when the latest stop came
 	chimeCancel   context.CancelFunc // ends the answer chime playing or about to
 	chimeCtx      context.Context    // that chime's context, nil while none plays
+	chimeQueuedAt time.Time          // when that chime's last frame was queued
 	pending       []*pendingAnswer
+	arrivals      uint64    // answers taken so far; each held answer's arrived
+	lit           bool      // the waiting light was last told On (showWaitingLocked)
 	voiceSpeaking bool      // the voice input plays
 	voiceStarted  time.Time // when it last started
 	voiceEnded    time.Time // when it last stopped
@@ -210,6 +216,14 @@ type Supervisor struct {
 	chimedAt      time.Time
 	heard         []heardCall    // Heard calls OnTranscript makes once it unlocks
 	wg            sync.WaitGroup // the goroutines Close waits for
+
+	// commands counts a person's commands on held answers: each "Wispr,
+	// never mind" and each "Wispr, go ahead". neverMinds is how many never
+	// minds still wait for the Concierge, and lastNeverMind closes when the
+	// newest is done, so each decides after the one before it.
+	commands      uint64
+	neverMinds    int
+	lastNeverMind chan struct{}
 }
 
 // heardCall is one Concierge.Heard call, made outside the lock.
@@ -223,6 +237,12 @@ type pendingAnswer struct {
 	PendingAnswer
 	needsInvite bool // a stop or a room word came after its question: only "Wispr, go ahead" speaks it
 	chimed      bool
+	// arrived orders held answers by arrival: an answer cut early goes back
+	// to the front of pending, and keeps its place in time.
+	arrived uint64
+	// takenAt is commands when a "Wispr, go ahead" last picked it, 0 before:
+	// a never mind said before that no longer drops it.
+	takenAt uint64
 }
 
 type ownWords struct {
@@ -352,6 +372,7 @@ func (s *Supervisor) Close() {
 	}
 	s.stopLocked("shutdown")
 	s.closed = true
+	s.showWaitingLocked()
 	s.mu.Unlock()
 	s.unlisten()
 	s.cancel()
@@ -457,6 +478,7 @@ func (s *Supervisor) offLocked() bool {
 		s.off = true
 		s.stopLocked("voice turned off")
 		s.pending = nil
+		s.showWaitingLocked()
 		s.lastTimes = nil
 		s.recent = nil // the room's words from before the off go with it
 	}
@@ -499,6 +521,31 @@ func (s *Supervisor) SegmentsDeleted(string) {
 
 func (s *Supervisor) dropPendingLocked(of func(sessionID string) bool) {
 	s.pending = slices.DeleteFunc(s.pending, func(p *pendingAnswer) bool { return of(p.SessionID) })
+	s.showWaitingLocked()
+}
+
+// waitingLocked reports whether something waits for a person: a held answer
+// waits for "Wispr, go ahead", or to speak by itself. Nothing waits once the
+// Supervisor closed.
+func (s *Supervisor) waitingLocked() bool {
+	return !s.closed && len(s.pending) > 0
+}
+
+// showWaitingLocked tells the waiting light On or Off when waitingLocked
+// changed. Every change of what waits calls it.
+func (s *Supervisor) showWaitingLocked() {
+	waiting := s.waitingLocked()
+	if waiting == s.lit {
+		return
+	}
+	s.lit = waiting
+	switch light := s.cfg.WaitingLight; {
+	case light == nil:
+	case waiting:
+		light.On()
+	default:
+		light.Off()
+	}
 }
 
 // dropEndedLocked drops the held answers of every session but the one
@@ -613,14 +660,7 @@ func (s *Supervisor) onTranscriptLocked(t *Transcript) {
 			if ex != nil && ex.answer == nil {
 				s.endLocked(ex, true, "Wispr, never mind")
 			}
-			sessionID := s.cfg.Session()
-			s.spawn(func() {
-				ctx, cancel := context.WithTimeout(s.ctx, 10*time.Second)
-				defer cancel()
-				if err := s.cfg.Concierge.NeverMind(ctx, sessionID); err != nil {
-					s.logf("voice: cancel the newest question: %v", err)
-				}
-			})
+			s.neverMindLocked(s.cfg.Session())
 		case same && !ex.answering:
 			s.turnLocked(ex, t, m.Rest)
 		case same:
@@ -699,6 +739,89 @@ func (s *Supervisor) onTranscriptLocked(t *Transcript) {
 	}
 }
 
+// neverMindLocked answers "Wispr, never mind" (R7): the Concierge cancels the
+// session's newest working question; with none, the session's newest held
+// answer by arrival is dropped, and nothing of it plays: once no answer
+// waits, an answer sound queued or still playing stops. Never minds decide
+// one after another, each once the Concierge answered it, so two in a row
+// cancel and drop as if each waited for the last. The answer a never mind
+// drops is the newest of those held when it was said that no "Wispr, go
+// ahead" picked since: the later word wins. The Concierge cancels only a
+// question asked before it was said. While a never mind waits, no answer
+// sounds or speaks by itself (offer); when its Concierge call fails, the
+// answer it would have dropped waits for "Wispr, go ahead". One still queued
+// when the Supervisor closes asks nothing.
+func (s *Supervisor) neverMindLocked(sessionID string) {
+	s.commands++
+	// The questions asked by now, which orders this never mind among them
+	// whatever the wall clock does.
+	said, asked := s.commands, s.cfg.Concierge.QuestionsAsked()
+	var candidates []*pendingAnswer
+	for _, p := range s.pending {
+		if p.SessionID == sessionID {
+			candidates = append(candidates, p)
+		}
+	}
+	s.neverMinds++
+	before, done := s.lastNeverMind, make(chan struct{})
+	s.lastNeverMind = done
+	s.spawn(func() {
+		defer close(done)
+		if before != nil {
+			<-before
+		}
+		cancelled, err := false, s.ctx.Err()
+		if err == nil {
+			ctx, cancel := context.WithTimeout(s.ctx, 10*time.Second)
+			cancelled, err = s.cfg.Concierge.NeverMind(ctx, sessionID, asked)
+			cancel()
+			if err != nil {
+				s.logf("voice: cancel the newest question: %v", err)
+			}
+		}
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		s.neverMinds--
+		var held *pendingAnswer
+		for _, p := range candidates {
+			if p.takenAt < said && slices.Contains(s.pending, p) && (held == nil || p.arrived > held.arrived) {
+				held = p
+			}
+		}
+		switch {
+		case held == nil || cancelled:
+		case err != nil:
+			held.needsInvite = true
+		default:
+			s.pending = slices.DeleteFunc(s.pending, func(p *pendingAnswer) bool { return p == held })
+			s.logf("voice: never mind dropped a held answer (task %s)", held.TaskID)
+			if len(s.pending) == 0 {
+				s.cutAnswerSoundLocked()
+			}
+			s.showWaitingLocked()
+		}
+	})
+}
+
+// chimeQueueLasts is how long the answer sound may still play once its last
+// frame is queued: the speaker queues up to 200 ms of an input ahead, and the
+// device buffers about 80 ms more (internal/audio), with room for a device
+// that grants a larger buffer.
+const chimeQueueLasts = 400 * time.Millisecond
+
+// cutAnswerSoundLocked stops the answer sound queued or still playing: once
+// its last answer is dropped, nothing of it plays.
+func (s *Supervisor) cutAnswerSoundLocked() {
+	playing := s.chimeCancel != nil || time.Since(s.chimeQueuedAt) < chimeQueueLasts
+	if s.chimeCancel != nil {
+		s.chimeCancel() // even one whose playback has not begun
+		s.chimeCancel, s.chimeCtx = nil, nil
+	}
+	if playing {
+		s.cfg.Speaker.Cancel(audio.InputChime)
+	}
+}
+
 // cutDriverLocked stops the speech of ex's voice, which drives its own turn,
 // at once, and keeps it open: its vendor hears the interruption and answers
 // it.
@@ -770,6 +893,7 @@ func (s *Supervisor) open(ex *exchange, voice Voice, x *Exchange, chime bool) {
 			// Not heard: it waits for "Wispr, go ahead" again.
 			p.needsInvite = true
 			s.pending = append([]*pendingAnswer{p}, s.pending...)
+			s.showWaitingLocked()
 		}
 		s.endLocked(ex, false, "the voice did not open")
 		return
@@ -1190,6 +1314,8 @@ func (s *Supervisor) goAheadLocked(keys []string) {
 		}
 	}
 	p.needsInvite = false
+	s.commands++
+	p.takenAt = s.commands // the later word: a never mind said before no longer drops it
 	s.speakLocked(p)
 }
 
@@ -1203,6 +1329,7 @@ func (s *Supervisor) speakLocked(p *pendingAnswer) {
 		return
 	}
 	s.pending = slices.DeleteFunc(s.pending, func(q *pendingAnswer) bool { return q == p })
+	s.showWaitingLocked()
 	ctx, cancel := context.WithTimeout(s.ctx, exchangeMax)
 	ex := &exchange{ctx: ctx, cancel: cancel, opened: make(chan struct{}), answering: true, answer: p, wakeStart: -1, notified: map[string]bool{}, times: &exchangeTimes{}}
 	s.capExchange(ex)
@@ -1238,6 +1365,7 @@ func (s *Supervisor) speakLocked(p *pendingAnswer) {
 			if !ex.ended && ex.ctx.Err() == nil {
 				p.needsInvite = true
 				s.pending = append([]*pendingAnswer{p}, s.pending...)
+				s.showWaitingLocked()
 			}
 			s.mu.Unlock()
 		} else {
@@ -1285,7 +1413,10 @@ func (s *Supervisor) offerAnswers() {
 				continue
 			}
 			s.mu.Lock()
-			if !s.closed {
+			// An answer that lands with the voice off is dropped, as offLocked
+			// drops those held when it turns off: it stays in writing on its
+			// session's page.
+			if !s.closed && !s.offLocked() {
 				// It waits for "Wispr, go ahead" unless the floor stayed free
 				// since its question (R7): no stop and no room word since t0.
 				// t0 is the end of the last turn of the exchange that asked,
@@ -1298,7 +1429,9 @@ func (s *Supervisor) offerAnswers() {
 				}
 				stoppedSince := !s.lastStopAt.IsZero() && !s.lastStopAt.Before(a.AskedAt)
 				talkedSince := !s.lastRoomWord.IsZero() && s.lastRoomWord.After(t0)
-				s.pending = append(s.pending, &pendingAnswer{PendingAnswer: a, needsInvite: a.AskedAt.IsZero() || stoppedSince || talkedSince})
+				s.arrivals++
+				s.pending = append(s.pending, &pendingAnswer{PendingAnswer: a, arrived: s.arrivals, needsInvite: a.AskedAt.IsZero() || stoppedSince || talkedSince})
+				s.showWaitingLocked()
 				s.timing("answer_ready", a.SessionID, time.Now())
 				select {
 				case s.notes <- [2]string{EventAnswerReady, a.SessionID}:
@@ -1315,11 +1448,13 @@ func (s *Supervisor) offerAnswers() {
 
 // offer chimes each held answer once while the light reads red, and speaks by
 // itself the oldest one that needs no invitation, once the room is silent.
+// While a "Wispr, never mind" waits for the Concierge, it does neither: the
+// answer it may drop must not sound or speak first.
 func (s *Supervisor) offer() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.dropEndedLocked()
-	if s.closed || s.offLocked() || len(s.pending) == 0 || !s.cfg.Red() {
+	if s.closed || s.offLocked() || len(s.pending) == 0 || !s.cfg.Red() || s.neverMinds > 0 {
 		return
 	}
 	if ex := s.ex; ex != nil && !s.idleLocked(ex) {
@@ -1350,6 +1485,7 @@ func (s *Supervisor) offer() {
 				defer s.mu.Unlock()
 				if ctx == s.chimeCtx {
 					s.chimeCancel, s.chimeCtx = nil, nil
+					s.chimeQueuedAt = time.Now() // its last frames still play from the speaker's queue
 				}
 			})
 			s.chimeCtx = ctx
@@ -1406,6 +1542,7 @@ func (s *Supervisor) stopLocked(reason string) {
 		s.chimeCancel() // an answer chime, even one whose playback has not begun
 		s.chimeCancel, s.chimeCtx = nil, nil
 	}
+	s.chimeQueuedAt = time.Time{} // the chime input is cut below, or by endLocked
 	if ex := s.ex; ex != nil {
 		s.endLocked(ex, true, reason)
 		return
@@ -1438,6 +1575,7 @@ func (s *Supervisor) endLocked(ex *exchange, cut bool, reason string) {
 		if ex.spokeAt.IsZero() || time.Since(ex.spokeAt) < s.cfg.ReplayWindow {
 			ex.answer.needsInvite = true
 			s.pending = append([]*pendingAnswer{ex.answer}, s.pending...)
+			s.showWaitingLocked()
 		} else {
 			s.spawn(func() { s.spoken(ex.answer.TaskID) })
 		}
@@ -1476,6 +1614,7 @@ func (s *Supervisor) takeFloorLocked(ex *exchange) {
 		s.chimeCancel()
 		s.chimeCancel, s.chimeCtx = nil, nil
 	}
+	s.chimeQueuedAt = time.Time{} // and is cut on the chime input below
 	s.cfg.Speaker.Cancel(audio.InputVoice)
 	s.cfg.Speaker.Cancel(audio.InputChime)
 }

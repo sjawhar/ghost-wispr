@@ -525,8 +525,25 @@ its watchdog turned it off, Ghost Wispr drops what the microphone holds and open
 new check; the log says `the recording light was not red while the microphone was open; reopening
 the microphone`. At shutdown the blink(1) goes off once the microphone is closed.
 
-`/opt/ghost-wispr/ghost-wispr light-state` prints the blink(1)'s colour (`red`, `off`, or `other`
-and its values) and `light-off` turns it off; both may run while the recorder runs. The blink(1)
+The office Pi's blink(1) (USB `27b8:01ed`, an mk3: its version reply is `01760033 33000000`) has
+two LEDs. LED 1, the top one, is the recording light: every check above reads LED 1 alone, and
+only exact red counts. LED 2, the bottom one, is red with LED 1 while the unit records, and flashes
+green, half a second on and half a second off, while an agent's answer waits for "Wispr, go ahead".
+It goes back to red once the answer is spoken, "Wispr, never mind" drops it, or its session ends,
+and goes off with LED 1 at a pause, a light hold or shutdown; it never flashes while the unit does
+not record, and flashes only while room audio reaches the recording: while the microphone closes
+after a pause or reopens under a red check, LED 2 shows red. A check that finds LED 1 not red writes
+both LEDs red and stops the flash until a check finds LED 1 red again. A read selects LED 1 ('l' 0)
+and reads it ('r') in one hold of the lock below: the mk3 reads the LED selected last, whatever LED
+the read names. The flash writes LED 2 alone with a fade of one 10 ms tick ('c', LED 2): an 'n'
+write that names one LED writes the next one and starts the blink(1)'s pattern player, which fades
+both LEDs to the stored black pattern. That pattern counts as black only when each line is black on
+every LED (LED number 0, which 'l' 0 before the pattern's writes sets), since a black line on LED 1
+alone would leave LED 2 lit once the watchdog plays it.
+
+`/opt/ghost-wispr/ghost-wispr light-state` prints the colour of the blink(1)'s LED 1 (`red`, `off`,
+or `other` and its values) and `light-off` turns both LEDs off; both may run while the recorder
+runs. The blink(1)
 has one report buffer, and each read gets the reply to the last command that any program sent:
 on the office Pi a `light-state` run while the recorder recorded made the recorder read its red
 light as 0,51,51, the version reply, and drop its audio. So every command that Ghost Wispr sends,
@@ -924,8 +941,12 @@ with the unit paused and no session active:
    in point 4. `holder-cases` runs `ghost-wispr issue-holder KEY`, which prints the Concierge's
    answer for the issue's holder without opening an Envoy session; `tts-first-audio` runs
    `ghost-wispr tts-first-audio --engine NAME`, which times each sentence to its first audio frame
-   and plays nothing. The steps that read the service's log lines (the voice timing lines, the
-   speaker's stream and underrun lines, the Concierge's cancel line) read the system journal with
+   and plays nothing. `playback-cancel` starts with `ghost-wispr play-sound wake`, which plays the
+   wake sound once on the speaker as the voice plays it and returns once the speaker's stream has
+   closed: how long the rig hears that sound alone is the step's calibration, and a chime after a
+   stop may be heard at most 20 ms longer. The steps that read the service's log lines (the voice
+   timing lines, the speaker's stream and underrun lines, the Concierge's cancel line) read the
+   system journal with
    `sudo -n journalctl _SYSTEMD_USER_UNIT=ghost-wispr.service _PID=<MainPID> --boot=0`, the
    running process's lines in the current boot: the Pi keeps no user journal, and a process ID can
    recur after a reboot. The underrun check reports UNKNOWN if its journal read fails. The windows

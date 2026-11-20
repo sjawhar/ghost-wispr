@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"log/slog"
 	"sync"
 	"time"
 
@@ -258,9 +259,10 @@ func (d *captureDevice) playbackOpening() {
 // playbackClosing closes a speaker playback stream with closeStream, as an
 // operation ownOperationAt covers, then writes the light if it may not show
 // the pause and no stream is open. The speaker calls it once it is done with
-// the stream. A closeStream that panics still ends the operation and stops
+// the stream. A close that fails is logged, and the stream counted closed as
+// before. A closeStream that panics still ends the operation and stops
 // counting the stream, so nothing waits for that playback for good.
-func (d *captureDevice) playbackClosing(closeStream func()) {
+func (d *captureDevice) playbackClosing(closeStream func() error) {
 	func() {
 		d.begin()
 		defer func() {
@@ -271,7 +273,9 @@ func (d *captureDevice) playbackClosing(closeStream func()) {
 			d.mu.Unlock()
 			d.end()
 		}()
-		closeStream()
+		if err := closeStream(); err != nil {
+			slog.Warn("speaker stream close failed", "error", err)
+		}
 	}()
 	d.syncLight()
 }

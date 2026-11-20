@@ -637,7 +637,7 @@ func TestJabraOwnReportReadLateStaysCovered(t *testing.T) {
 			report := jabra.MonotonicNow() + 12*time.Millisecond
 			time.Sleep(150 * time.Millisecond) // the button loop is still busy with the tap
 			if speechEnds {
-				rig.device.playbackClosing(func() {})
+				rig.device.playbackClosing(func() error { return nil })
 			}
 			button.press(report)
 			if !rig.capture.IsPaused() {

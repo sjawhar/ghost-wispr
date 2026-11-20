@@ -196,8 +196,16 @@ type voiceDeps struct {
 	session     func() string // the recording session now
 	red         func() bool   // the light reads red and audio passes the gate
 	notify      func(kind, sessionID string)
-	projects    func() []string // Dispatch's project keys, for spoken keys
+	projects    func() []string    // Dispatch's project keys, for spoken keys
+	waiting     voice.WaitingLight // shows that something waits for a person; nil shows nothing
 }
+
+// waitingLED is the voice's waiting light on the blink(1)'s LED 2, which
+// flashes green while something waits for a person and the unit records.
+type waitingLED struct{ hardware *hardwareControl }
+
+func (l waitingLED) On()  { l.hardware.showWaiting(true) }
+func (l waitingLED) Off() { l.hardware.showWaiting(false) }
 
 // startVoice starts the Supervisor over the speaker output, and sets it on
 // deps.link. voice.enabled and the voice are read at each call, so it starts
@@ -210,18 +218,19 @@ func startVoice(deps *voiceDeps) error {
 		return errors.New("the voice has no Concierge")
 	}
 	sup := voice.NewSupervisor(&voice.SupervisorConfig{
-		Voice:       deps.voices,
-		Concierge:   deps.concierge,
-		Speaker:     voice.SpeakerOf(deps.output),
-		WakePhrases: deps.wakePhrases,
-		Session:     deps.session,
-		Red:         deps.red,
-		Enabled:     deps.enabled,
-		Notify:      deps.notify,
-		ProjectKeys: deps.projects,
-		Tap:         deps.tap,
-		Timing:      deps.timing,
-		Logf:        log.Printf,
+		Voice:        deps.voices,
+		Concierge:    deps.concierge,
+		Speaker:      voice.SpeakerOf(deps.output),
+		WakePhrases:  deps.wakePhrases,
+		Session:      deps.session,
+		Red:          deps.red,
+		Enabled:      deps.enabled,
+		Notify:       deps.notify,
+		ProjectKeys:  deps.projects,
+		WaitingLight: deps.waiting,
+		Tap:          deps.tap,
+		Timing:       deps.timing,
+		Logf:         log.Printf,
 	})
 	deps.link.set(sup)
 	log.Printf("voice: ready (wake phrases %q; voice.enabled and voice.engine are read at each call)", deps.wakePhrases)

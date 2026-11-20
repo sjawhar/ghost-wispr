@@ -44,14 +44,14 @@ readonly recording_times
 # room's own level (calibrate_rig).
 readonly loopback_threshold_db=-50
 readonly silence_seconds=0.15 silence_ms=150
-# The voice's sounds last at most 400 ms, so speech is a sound that starts at least that long after
-# the chime starts.
+# The sound after voice_wake, the wake sound, lasts at most 400 ms, so speech is a sound that starts
+# at least that long after the chime starts. (The answer sound lasts 660 ms; it plays only once an
+# agent's answer is ready.)
 readonly sound_max_ms=400
-# The wake chime lasts 240 ms (internal/voice/chime.go); at the rig, with the room's echo, a sound
-# longer than this is not the chime alone.
-readonly chime_max_ms=300
-# The same chime, played the same way into the same room, is heard for as long each time, give or
-# take this much; the step's first chime, before any stop, shows how long.
+# The same sound, played the same way into the same room, is heard for as long each time, give or
+# take this much. The playback-cancel step first plays the wake sound alone (ghost-wispr play-sound)
+# to learn how long the rig hears it there: a louder sound's echo stays above the threshold for
+# longer, so no fixed length fits every build.
 readonly chime_tolerance_ms=20
 # A sound may start this much before the event that names it: the voice can start the chime just
 # before it sends voice_wake, and logs a sentence just after its first frame is written.
@@ -138,7 +138,8 @@ Steps:
                       --backchannel-dir while the voice answers --question. Needs --rig-mic.
   playback-cancel     --stops N stops by --stop-clip during the answer to --question: when the
                       speech ends at the Jabra after each, and underruns over --playback-seconds of
-                      playback. Needs --rig-mic.
+                      playback. It first plays the wake sound alone (ghost-wispr play-sound), to
+                      learn how long the rig hears a chime. Needs --rig-mic.
   tts-first-audio     --sentences N sentences to each --engine (gemini, aura2 or aura,
                       gemini-clip) through ghost-wispr tts-first-audio. Changes nothing.
   states              the three capture states with the paused listener on: the page, POST
@@ -1698,12 +1699,16 @@ running_ms() {
 # cancel_heard_ms after the cancel, at the rig microphone: the last sound the rig hears from each
 # stop (the stop line of the timing log) until its next question's chime can start, at least
 # stop_silence_ms later, must end by then (cancel_heard), so that a word after a pause in the speech
-# does not pass. The chime must be the chime alone, heard no longer than the step's first chime,
-# before any stop, give or take chime_tolerance_ms; and nothing else may start after it before that
-# question's answer (its first_audio), since the next question plays into the microphone, not the
-# speaker. Nothing else plays after a stop: the voice has no stop sound. ALSA's queue is not the
-# measure: after a cancel the Output can keep the stream running and fill it with silence. Underruns
-# are the lines the speaker logs for each one; the poller's XRUN states cross-check them.
+# does not pass. The chime must be the chime alone, heard no longer than the calibration give or
+# take chime_tolerance_ms; and nothing else may start after it before that question's answer (its
+# first_audio), since the next question plays into the microphone, not the speaker. The calibration
+# is how long the rig hears the wake sound played alone, as the voice plays it, through ghost-wispr
+# play-sound at the step's start, before any question: in this room, at this threshold, with this
+# build's sound. Nothing else plays after a stop: the voice has no stop sound. ALSA's queue is not
+# the measure: after a cancel the Output can keep the stream running and fill it with silence.
+# Underruns are the lines the speaker logs for each one; the poller's XRUN states cross-check them;
+# the calibration plays before the poller starts, so that its stream, another process's, is not
+# counted.
 #
 # Known limits. A leak can hide only where it runs into the next question's chime, with less than
 # silence_ms between them: the part of it outside the chime must add at most chime_tolerance_ms to
@@ -1712,10 +1717,20 @@ running_ms() {
 # late by however late its best anchor was read, falls after first_audio, passes for that answer.
 step_playback_cancel() {
   local i q wake first spoken_count speech_at wait_ms stop_ats=() question_starts=() question_wakes=()
-  local question_firsts=() heard=() deadline max xruns streams ways next chime chime_len boundary_unknown
-  local underruns played
+  local question_firsts=() heard=() deadline max xruns streams ways next chime boundary_unknown
+  local underruns played rc calib_from calib_to calib calib_len calib_ms alone_until
   speaker_status
   start_rig_run
+  # The calibration: the wake sound alone, while the rig records, then quiet until the first question.
+  calib_from=$(now_ms)
+  unit_command play-sound wake >"$work_dir/play-sound.out" 2>"$work_dir/play-sound.err"
+  rc=$?
+  calib_to=$(now_ms)
+  subcommand_missing "$rc" "$work_dir/play-sound.err" \
+    && unknown 'playback-cancel: this build has no ghost-wispr play-sound, which plays the wake sound alone to calibrate the rig'
+  ((rc == 0)) \
+    || unknown "playback-cancel: ghost-wispr play-sound wake exited $rc, so the rig is not calibrated: $(head -c 300 "$work_dir/play-sound.err" | tr '\n' ' ')"
+  sleep "$idle_seconds"
   start_poller
   for ((i = 1; i <= stops; i++)); do
     play_clip "playback-cancel stop $i question" "$question"
@@ -1763,21 +1778,25 @@ step_playback_cancel() {
   played=$(running_ms)
   stop_poller
   analyse_rig
-  # The chime as the rig hears it: the step's first, before any stop.
-  [[ -n ${question_wakes[0]} ]] \
-    || unknown "playback-cancel: the timing log has no wake_heard for the first question, so how long the rig hears the chime is not known"
-  first_sound $((question_wakes[0] - lead_ms)) $((question_wakes[0] + wake_max_ms)) \
-    || unknown "playback-cancel: no sound at the rig microphone where the first question's chime belongs (up to $wake_max_ms ms after its wake_heard)"
-  chime_len=${sound_len[found_sound]}
-  ((chime_len <= chime_max_ms * 1000)) \
-    || unknown "playback-cancel: the first question's chime lasts $((chime_len / 1000)) ms at the rig microphone, more than $chime_max_ms ms, so how long the rig hears the chime alone is not known"
-  note "playback-cancel: the rig microphone hears the step's first chime for $((chime_len / 1000)) ms"
+  # The calibration is the first sound that starts while play-sound played. It must be alone: it ends,
+  # and no other sound starts, before the step's first question.
+  first_sound $((calib_from - lead_ms)) "$calib_to" \
+    || unknown 'playback-cancel: no sound at the rig microphone while ghost-wispr play-sound played the wake sound alone'
+  calib=$found_sound
+  calib_len=${sound_len[calib]}
+  calib_ms=$(((calib_len + 500) / 1000))
+  alone_until=${question_starts[0]:-$recording_end}
+  ((sound_off[calib] <= alone_until)) \
+    || unknown "playback-cancel: the sound at the rig microphone while ghost-wispr play-sound played the wake sound alone is heard for $calib_ms ms, into the step's first question, so how long the rig hears the wake sound alone is not known"
+  ((calib + 1 >= ${#sound_on[@]} || sound_on[calib + 1] >= alone_until)) \
+    || unknown "playback-cancel: another sound at the rig microphone starts $((sound_on[calib + 1] - sound_off[calib])) ms after the wake sound that ghost-wispr play-sound played alone, before the step's first question, so how long the rig hears the wake sound alone is not known"
+  note "playback-cancel: calibration: the wake sound played alone (ghost-wispr play-sound) is heard at the rig microphone for $calib_ms ms above $rig_threshold_db dB; a chime after a stop may be heard for up to $((calib_ms + chime_tolerance_ms)) ms (the calibration and $chime_tolerance_ms ms)"
   boundary_unknown=
   for i in "${!stop_ats[@]}"; do
     # Every sound that starts from the stop until the earliest the next question's chime can start
     # (its wake_heard, less lead_ms) is audio after the cancel. The first sound that starts where the
     # chime belongs (up to wake_max_ms after the wake) is taken for the chime: it must be heard no
-    # longer than the first chime and chime_tolerance_ms, and the next sound must not start before
+    # longer than the calibration and chime_tolerance_ms, and the next sound must not start before
     # the answer's first_audio. With no wake_heard or first_audio for that question, or no sound
     # where its chime belongs, the window is not known: UNKNOWN, unless what was heard fails.
     next=$recording_end
@@ -1794,8 +1813,8 @@ step_playback_cancel() {
         break
       fi
       chime=$found_sound
-      ((sound_len[chime] <= chime_len + chime_tolerance_ms * 1000)) \
-        || fail "playback-cancel stop $((i + 1)): the sound at the next question's chime is not the chime alone: it lasts $((sound_len[chime] / 1000)) ms, more than the step's first chime ($((chime_len / 1000)) ms) by over $chime_tolerance_ms ms"
+      ((sound_len[chime] <= calib_len + chime_tolerance_ms * 1000)) \
+        || fail "playback-cancel stop $((i + 1)): the sound at the next question's chime is not the chime alone: it lasts $((sound_len[chime] / 1000)) ms, more than the calibration, the wake sound played alone ($calib_ms ms), by over $chime_tolerance_ms ms"
       if [[ -z ${question_firsts[q]} ]]; then
         boundary_unknown=${boundary_unknown:-"playback-cancel stop $((i + 1)): the timing log has no first_audio for the next question's answer, so the quiet after its chime cannot be checked"}
       elif ((chime + 1 < ${#sound_on[@]} && sound_on[chime + 1] < question_firsts[q])); then

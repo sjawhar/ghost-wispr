@@ -4,8 +4,8 @@ package audio
 
 import (
 	"context"
-	"io"
 	"log/slog"
+	"math"
 	"runtime"
 	"strings"
 	"sync"
@@ -297,6 +297,9 @@ func streamOn(pcm *fakePCM) *alsaStream {
 //   - a PCM whose audio in flight would play on for more than the bound
 //     after a rewind is dropped too, which cuts what is in flight.
 //
+// The voice is positive and the chime negative, so that each sample tells
+// which plays in it, the voice ducked under the chime included.
+//
 // The device runs in lockstep and the Cancel comes from inside its write at
 // 200 ms of its clock, so the time is the stream's, counted in frames from
 // the Cancel to the last frame of the voice the room hears: a loaded machine
@@ -322,7 +325,7 @@ func TestALSAOutputCancelSilencesTheVoiceWithin20ms(t *testing.T) {
 			go func() { _ = voice.WriteAll(ctx, constant(48000, 2*time.Second, 1000), mono48k) }()
 			chimed := make(chan error, 1)
 			go func() {
-				err := chime.WriteAll(ctx, constant(48000, 500*time.Millisecond, 500), mono48k)
+				err := chime.WriteAll(ctx, constant(48000, 500*time.Millisecond, -500), mono48k)
 				if err == nil {
 					err = chime.Drain(ctx)
 				}
@@ -339,14 +342,14 @@ func TestALSAOutputCancelSilencesTheVoiceWithin20ms(t *testing.T) {
 			}
 			lastVoice, chimeFrames := -1, 0
 			pcm.heardInStreamTime(func(sample int16, clock int) {
-				switch sample {
-				case 1500: // voice and chime
+				switch {
+				case sample == duckedUnderChime: // voice and chime
 					lastVoice = clock
 					chimeFrames++
-				case 1000:
-					lastVoice = clock
-				case 500:
+				case sample == -500:
 					chimeFrames++
+				case sample > 0: // the voice, alone or going down
+					lastVoice = clock
 				}
 			})
 			if lastVoice < 0 {
@@ -454,7 +457,7 @@ func TestALSAOutputCancelKeepsAChimeLongerThanTheHistory(t *testing.T) {
 	go func() { _ = voice.WriteAll(ctx, constant(48000, 2*time.Second, 1000), mono48k) }()
 	chimed := make(chan error, 1)
 	go func() {
-		err := chime.WriteAll(ctx, constant(48000, 500*time.Millisecond, 500), mono48k)
+		err := chime.WriteAll(ctx, constant(48000, 500*time.Millisecond, -500), mono48k)
 		if err == nil {
 			err = chime.Drain(ctx)
 		}
@@ -468,7 +471,7 @@ func TestALSAOutputCancelKeepsAChimeLongerThanTheHistory(t *testing.T) {
 	waitFor(t, "the idle stream to close", pcm.isClosed)
 	chimeFrames := 0
 	pcm.heard(func(sample int16, _ time.Time) {
-		if sample == 1500 || sample == 500 {
+		if sample == duckedUnderChime || sample == -500 {
 			chimeFrames++
 		}
 	})
@@ -476,6 +479,10 @@ func TestALSAOutputCancelKeepsAChimeLongerThanTheHistory(t *testing.T) {
 		t.Fatalf("the room heard %d frames of the chime, want each of its 24000 (500 ms) once", chimeFrames)
 	}
 }
+
+// duckedUnderChime is a sample of the voice at 1000 ducked under the chime at
+// -500.
+var duckedUnderChime = int16(math.Round(1000*float64(duckGain))) - 500
 
 // TestALSAStreamLogsWhetherItRewinds fails unless a stream says once, when
 // its device first holds audio, whether a Cancel there rewinds or drops, so a
@@ -547,17 +554,6 @@ func TestALSAStreamLogsTheWayEachCancelTookBack(t *testing.T) {
 			t.Errorf("a cancel with %d frames in flight logged %q, want one speaker cancel line with %s", tc.inflight, got, tc.want)
 		}
 	}
-}
-
-type lockedWriter struct {
-	mu *sync.Mutex
-	w  io.Writer
-}
-
-func (l lockedWriter) Write(p []byte) (int, error) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	return l.w.Write(p)
 }
 
 // TestALSAOutputKeepsUpUnderLoad measures underruns on the ALSA path with

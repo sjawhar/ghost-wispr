@@ -15,10 +15,31 @@ import (
 // the last SET left in the buffer, whoever sent it. On the office Pi
 // (b606ab7, 2026-11-18, usbmon) a GET after the recorder's tickle ('D')
 // returned `01440101 2c01001f`, its echo, and a GET after a version query ('v')
-// returned `01760033 33000000`.
+// returned `01760033 33000000`: a blink(1) mk3.
+//
+// Its LEDs and colour commands are the mk3 firmware's (todbot/blink1mk3,
+// firmware/firmware-v30x/main.c, the same in tags firmware-v303 and
+// firmware-v304), or with mk2 the mk2 firmware's (todbot/blink1,
+// hardware/firmware_mk2/main.c):
+//
+//   - leds[0] is LED 1, leds[1] LED 2; the mk3 keeps 18, of which the rest
+//     drive nothing.
+//   - ledn is the firmware's global LED number. 'l' sets it, and so does each
+//     line the pattern player plays.
+//   - 'r' reads leds[ledn] on an mk3, whatever LED its request names; on an
+//     mk2 it reads the LED byte 7 names (0 and 1 both read LED 1).
+//   - 'n' with byte 7 = 0 writes every LED. With byte 7 = n > 0 it writes
+//     leds[n], one LED past the one n names, and starts the pattern player
+//     (playing = PLAY_DIRECTLED): the stored pattern, which Ghost Wispr keeps
+//     black, fades every LED to black, and its lines set ledn to 0.
+//   - 'c' with byte 7 = 0 fades every LED; with byte 7 = n > 0 it fades
+//     leds[n-1] only. The fade ends within two of the firmware's 10 ms ticks
+//     for the fade of 1 tick Ghost Wispr sends; this fake ends it at once.
 type sharedBlink1 struct {
 	mu     sync.Mutex
-	colour [3]byte
+	mk2    bool
+	leds   [18][3]byte
+	ledn   byte
 	buffer [8]byte
 	names  map[uintptr]string
 	// between runs once, outside the lock, right after the SET_FEATURE of
@@ -39,16 +60,37 @@ func (d *sharedBlink1) ioctl(fd uintptr, request uintptr, report *[8]byte) error
 		return nil
 	}
 	cmd := report[1]
+	colour := [3]byte{report[2], report[3], report[4]}
+	n := report[7]
+	d.buffer = *report
 	switch cmd {
 	case 'n':
-		copy(d.colour[:], report[2:5])
-		d.buffer = *report
+		if n == 0 {
+			for i := range d.leds {
+				d.leds[i] = colour
+			}
+			break
+		}
+		d.leds[n] = colour
+		d.leds, d.ledn = [18][3]byte{}, 0 // the black pattern plays
+	case 'c':
+		if n == 0 {
+			for i := range d.leds {
+				d.leds[i] = colour
+			}
+			break
+		}
+		d.leds[n-1] = colour
+	case 'l':
+		d.ledn = report[2]
 	case 'r':
-		d.buffer = [8]byte{0x01, 'r', d.colour[0], d.colour[1], d.colour[2]}
+		led := d.ledn
+		if d.mk2 {
+			led = max(n, 1) - 1
+		}
+		d.buffer = [8]byte{0x01, 'r', d.leds[led][0], d.leds[led][1], d.leds[led][2], 0, 0, max(n, 1) - 1}
 	case 'v':
 		d.buffer = [8]byte{0x01, 'v', 0, '3', '3'}
-	default:
-		d.buffer = *report
 	}
 	if ch := d.setFrom[who]; ch != nil {
 		select {
@@ -65,6 +107,13 @@ func (d *sharedBlink1) ioctl(fd uintptr, request uintptr, report *[8]byte) error
 		d.between()
 	}
 	return nil
+}
+
+// led returns LED i's colour: 0 is LED 1, 1 is LED 2.
+func (d *sharedBlink1) led(i int) [3]byte {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.leds[i]
 }
 
 // openTwice opens one fake hidraw node twice, as the recorder and a second

@@ -34,7 +34,7 @@ func TestOwnOperationCoversTheJabraReportWindow(t *testing.T) {
 		}},
 		{name: "TTS playback close", run: func(d *captureDevice, during func()) error {
 			d.playbackOpening()
-			d.playbackClosing(during)
+			d.playbackClosing(func() error { during(); return nil })
 			return nil
 		}},
 	} {
@@ -187,7 +187,7 @@ func TestAPlaybackThatPanicsOnCloseHoldsNothingBack(t *testing.T) {
 	}
 	func() {
 		defer func() { _ = recover() }()
-		d.playbackClosing(func() { panic("output stream close failed") })
+		d.playbackClosing(func() error { panic("output stream close failed") })
 	}()
 
 	ctx, cancel := context.WithTimeout(context.Background(), testWait)

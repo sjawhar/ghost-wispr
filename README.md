@@ -130,7 +130,8 @@ and does not use them to train its models.
 
 ## Recording light
 
-With `indicator_light: blink1` the recorder captures only while the blink(1) reads back red.
+With `indicator_light: blink1` the recorder captures only while the blink(1)'s LED 1 reads back
+red.
 With the light missing, or not reading back red, it starts no microphone and refuses a resume.
 While no capture device is present, a resume is accepted and lights nothing: no microphone can
 open, and the light is checked once one can;
@@ -139,6 +140,22 @@ pause. `/api/status` then names the cause in a warning and reports `capture_stat
 `light_unavailable`, and capture comes back once the light reads back red again, unless someone
 paused it meanwhile. Any other value of `indicator_light` stops the recorder from starting, so a
 typo cannot turn the light check off; leave it unset for a recorder with no light.
+
+The blink(1) has two LEDs. LED 1, the top one (`blink1-tool --led 1`), is the recording light: red
+means the unit records. Every check reads LED 1 alone back, and only exact red (255,0,0) lets audio
+through; a read that fails, or any other colour, stops capture as above. The recorder writes both
+LEDs red while it records and both off when it stops. LED 2, the bottom one, flashes green, half a
+second on and half a second off, while an agent's answer waits for "Wispr, go ahead" (see "Meeting
+voice"). It goes back to red once nothing waits: the answer is spoken, "Wispr, never mind" drops it,
+or its session ends. At a pause, a light hold or shutdown it goes off with LED 1, and it never
+flashes while the unit does not record. It flashes only while room audio reaches the recording:
+while LED 1 is red for another reason, as while the microphone closes after a pause or reopens,
+LED 2 shows red. A check that finds LED 1 not red writes both LEDs red, and LED 2 stays red until a
+check finds LED 1 red again. A flash writes LED 2 alone, holds the lock below as every command
+does, and never counts as a light fault: a flash write that fails is tried again at the next step.
+The black pattern the watchdog plays must turn both LEDs off, so a check takes a pattern as black
+only when each of its lines is black on every LED; a black line on LED 1 alone would leave LED 2 as
+it was.
 
 Every microphone open, and PortAudio's device scan, which opens the microphone too, waits for
 the blink(1) to read back red and keeps it red until the open has finished, so no microphone opens
@@ -154,7 +171,8 @@ Linux it plays through the ALSA playback device that `speaker_device` names (a P
 `plughw:CARD=J75,DEV=0`, or a sound card's id or name, as `Jabra`), opening no microphone and
 needing no red light, so it speaks while capture is paused. It opens one stream at the device's
 native rate when the first sound is queued, mixes the voice and the chimes into it, and closes it
-0.3 s after the last sound.
+0.3 s after the last sound. While a chime plays, the voice plays 15 dB down, so that the two never
+clip together; it goes down over 10 ms before the chime starts, and back up over 10 ms after.
 
 The microphone is never open while the blink(1) is off. The light stays red while the microphone is
 open, and goes off only once the recorder has closed it: after a pause, once no audio has reached
@@ -170,11 +188,13 @@ open, as when it went off outside Ghost Wispr (an unplug, its watchdog, another 
 light-off`), the recorder drops that audio and what the microphone holds, closes it and opens it
 again under a new red check.
 
-`ghost-wispr light-state` prints the blink(1)'s colour and `ghost-wispr light-off` turns it off,
-also while the recorder runs. The blink(1) has one report buffer: a read gets the reply to the
-last command any program sent. So every command Ghost Wispr sends, from the recorder or a
-subcommand, holds an exclusive `flock` on the blink(1)'s hidraw node from the command to its
-reply, and a read takes only a reply that names its own command. A recorder command that does not
+`ghost-wispr light-state` prints the colour of the blink(1)'s LED 1 and `ghost-wispr light-off`
+turns both LEDs off, also while the recorder runs. The blink(1) has one report buffer: a read gets
+the reply to the last command any program sent. So every command Ghost Wispr sends, from the
+recorder or a subcommand, holds an exclusive `flock` on the blink(1)'s hidraw node from the command
+to its reply, and a read takes only a reply that names its own command. A read selects LED 1 ('l'
+0) and reads it ('r') in one hold of the lock: a blink(1) mk3 reads the LED that was selected last,
+whatever LED the read names. A recorder command that does not
 get the lock within 50 ms, or a subcommand's within 2 s, sends nothing: the recorder counts such a
 read as the light not red, and `light-state` prints `unknown` and fails; `/api/status` warns that
 the recording light is busy until the recorder's next look at the light gets through. A waiting
@@ -295,10 +315,14 @@ Wispr plays a short two-note sound, the Concierge reads Dispatch's record, and t
 answer. For 6 s after Wispr's answer, a follow-up that the transcript ends with a question mark needs no wake phrase, and so does a reply when Wispr asked ("Did you mean ABC-12, or
 ABC-13?"). Anything else said in those 6 s is side talk: no voice answers it, and nothing of it goes to Dispatch.
 "Thanks, Wispr" ends the exchange. When the record cannot answer, the Concierge asks the agent that holds the issue. When
-its answer lands, Wispr plays a three-note sound after a second in which nobody speaks, and speaks
+its answer lands, Wispr plays a rising three-note sound twice after a second in which nobody speaks, the
+blink(1)'s LED 2 flashes green while the unit records (see "Recording light"), and Wispr speaks
 the answer on "Wispr, go ahead" ("Wispr, go ahead, ABC-12" picks one of several). It speaks by
 itself only when nobody has spoken since the question and the light still reads red. "Wispr, never
-mind" cancels the newest question to an agent. "Wispr, stop" stops it, and so does talking over it
+mind" cancels the newest question to an agent that has not answered yet; with no such question, it
+drops the meeting's newest answer still waiting, which then never sounds or speaks, and LED 2 stops
+flashing once no answer waits. The dropped answer stays in writing on the session's page.
+"Wispr, stop" stops it, and so does talking over it
 with real words; "mm-hm" or "yeah" alone does not. Other speech (`POST /api/tts/speak`) waits in
 its queue while the voice speaks. Two more sounds: a single high note when capture starts
 recording, and a falling two-note sound when Wispr cannot do what was asked (Dispatch or Envoy out

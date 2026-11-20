@@ -624,6 +624,13 @@ def speech(tag, start, length, session="session-1", fact=None):
     emit(kind="ws", due=start + length, tag=tag, event=dict(type="voice_spoken", **fields))
 
 
+def wake_heard_ms():
+    """How long the rig hears the 240 ms wake sound, as the voice plays it and as play-sound plays
+    it alone: 200 ms; with long-wake, a louder sound whose echo stays above the threshold for longer,
+    320 ms; with quiet-chime, a sound played or heard more quietly, 130 ms."""
+    return 320 if "long-wake" in SCENARIO else 130 if "quiet-chime" in SCENARIO else 200
+
+
 def react(kind, key, start, end):
     service = json.loads(read("service.json") or "{}")
     if not service.get("voice") or service.get("voice_off") or "sigint" in SCENARIO:
@@ -646,9 +653,7 @@ def react(kind, key, start, end):
             chime = 600
         if "wake-310" in SCENARIO:
             chime = 310
-        # The rig hears the 240 ms chime for 200 ms; with quiet-chime, a chime played or heard more
-        # quietly, for 130 ms.
-        chime_heard = 130 if "quiet-chime" in SCENARIO else 200
+        chime_heard = wake_heard_ms()
         emit(kind="ws", due=wake, event={"type": "voice_wake", "session_id": ""})
         if not ("no-wake-after-stop" in SCENARIO and read("stop-count")):
             emit(kind="timing", due=wake, event="wake_heard", session_id="")
@@ -1108,7 +1113,8 @@ def stream():
 def binary(args):
     log_to("binary.log", " ".join(args))
     command = args[0] if args else ""
-    if (command == "issue-holder" and "holder-missing" in SCENARIO) or (command == "tts-first-audio" and "tts-missing" in SCENARIO):
+    missing = {"issue-holder": "holder-missing", "tts-first-audio": "tts-missing", "play-sound": "sound-missing"}
+    if command in missing and missing[command] in SCENARIO:
         sys.stderr.write("usage: ghost-wispr <light-off|light-state>\n")
         return 2
     if command == "light-state":
@@ -1146,6 +1152,18 @@ def binary(args):
             if line.strip():
                 opt_out = None if engine != "aura" else (n != 1 if "aura-no-optout" in SCENARIO else True)
                 print(json.dumps({"ms_to_first_frame": ms + n % 3 + 0.4, "mip_opt_out": opt_out}))
+        return 0
+    if command == "play-sound":
+        # The wake sound, played once on the speaker as the voice plays it: the rig hears it from just
+        # after the command starts, and the command returns once the Output has closed its stream by
+        # itself, 300 ms after the sound's 240 ms.
+        if args[1:] != ["wake"]:
+            sys.stderr.write("fake binary: play-sound here plays only the wake sound, not %s\n" % " ".join(args[1:]))
+            return 1
+        start = now_ms() + 20
+        emit(kind="sound", start=start, end=start + wake_heard_ms(), tag="play-sound")
+        time.sleep(max(0, start + 240 + 300 - now_ms()) / 1000)
+        print(json.dumps({"sound": "wake", "ms": 240, "device": "J75"}))
         return 0
     sys.stderr.write("usage: ghost-wispr <light-off|light-state>\n")
     return 2
@@ -1544,10 +1562,12 @@ launch barge-journal-error long,journal-error-after-stop yes -- --step barge-in 
 # 150 ms on with the speech already quiet for 1 s at the stop, which the rig cannot time (UNKNOWN);
 # a word still playing as the next question goes in: well before its chime, just before it and
 # apart, running into it, and after it, before the answer's first audio; a quiet chime, which must
-# pass, and a word that runs into it; the rig's clock 200 ppm fast and slow, which must pass, and a
-# 21 ms tail on the fast clock, which must fail; a rig recording that ends before the step stops it,
-# no chime heard where the next question's belongs, and no wake_heard for it (each UNKNOWN); a
-# logged underrun; an XRUN the speaker did not log.
+# pass, and a word that runs into it; a louder wake sound whose echo the rig hears for 320 ms, which
+# must pass against its calibration (a fixed 300 ms bound returned UNKNOWN), and a word that runs
+# into it, which must still fail; a build without ghost-wispr play-sound (UNKNOWN); the rig's clock
+# 200 ppm fast and slow, which must pass, and a 21 ms tail on the fast clock, which must fail; a rig
+# recording that ends before the step stops it, no chime heard where the next question's belongs,
+# and no wake_heard for it (each UNKNOWN); a logged underrun; an XRUN the speaker did not log.
 readonly cancel_args="--step playback-cancel --stops 2 --playback-seconds 3 --question @question.wav --stop-clip @stop.wav --rig-mic $rig --event-timeout 15"
 # shellcheck disable=SC2086
 launch cancel long,asound yes -- $cancel_args
@@ -1575,6 +1595,12 @@ launch cancel-leak-after-chime long,asound,leak-after-chime yes -- $cancel_args
 launch cancel-quiet-chime long,asound,quiet-chime yes -- $cancel_args
 # shellcheck disable=SC2086
 launch cancel-leak-into-quiet-chime long,asound,quiet-chime,leak-into-quiet-chime yes -- $cancel_args
+# shellcheck disable=SC2086
+launch cancel-long-wake long,asound,long-wake yes -- $cancel_args
+# shellcheck disable=SC2086
+launch cancel-long-wake-leak long,asound,long-wake,leak-into-chime yes -- $cancel_args
+# shellcheck disable=SC2086
+launch cancel-sound-missing long,asound,sound-missing yes -- $cancel_args
 # shellcheck disable=SC2086
 launch cancel-clock-fast long,asound,clock-fast yes -- $cancel_args
 # shellcheck disable=SC2086
@@ -2034,6 +2060,7 @@ expect_restored barge-journal-error
 # playback-cancel.
 expect_rc cancel 0
 expect_line cancel 'PASS: playback-cancel: the poller sees the speaker'\''s stream run at '
+expect_line cancel 'NOTE: playback-cancel: calibration: the wake sound played alone (ghost-wispr play-sound) is heard at the rig microphone for 200 ms above -50 dB; a chime after a stop may be heard for up to 220 ms (the calibration and 20 ms)'
 expect_line cancel "PASS: playback-cancel: no stop's speech was heard at the rig microphone 20 ms after it"
 expect_line cancel 'NOTE: playback-cancel: the speaker logged 2 cancels: 0 by rewind, 2 by drop'
 expect_line cancel 'PASS: playback-cancel: 0 underruns over '
@@ -2081,11 +2108,29 @@ expect_line cancel-leak-after-chime "after the next question's chime ends, befor
 expect_restored cancel-leak-after-chime
 expect_rc cancel-quiet-chime 0
 expect_line cancel-quiet-chime "PASS: playback-cancel: no stop's speech was heard at the rig microphone 20 ms after it"
+expect_line cancel-quiet-chime 'NOTE: playback-cancel: calibration: the wake sound played alone (ghost-wispr play-sound) is heard at the rig microphone for 130 ms above -50 dB'
 expect_restored cancel-quiet-chime
 expect_rc cancel-leak-into-quiet-chime 1
 expect_line cancel-leak-into-quiet-chime "FAIL: playback-cancel stop 1: the sound at the next question's chime is not the chime alone: it lasts "
-expect_line cancel-leak-into-quiet-chime "than the step's first chime"
+expect_line cancel-leak-into-quiet-chime "than the calibration, the wake sound played alone (130 ms), by over 20 ms"
 expect_restored cancel-leak-into-quiet-chime
+# A louder wake sound, heard for 320 ms: the positive control of the calibration. A fixed bound of
+# 300 ms on the step's first chime returned UNKNOWN here.
+expect_rc cancel-long-wake 0
+expect_line cancel-long-wake 'NOTE: playback-cancel: calibration: the wake sound played alone (ghost-wispr play-sound) is heard at the rig microphone for 320 ms above -50 dB; a chime after a stop may be heard for up to 340 ms (the calibration and 20 ms)'
+expect_line cancel-long-wake "PASS: playback-cancel: no stop's speech was heard at the rig microphone 20 ms after it"
+expect_line cancel-long-wake 'PASS: playback-cancel: 0 underruns over '
+expect_no_line cancel-long-wake 'UNKNOWN: '
+expect_restored cancel-long-wake
+# The calibrated bound still catches a word that runs into the louder chime.
+expect_rc cancel-long-wake-leak 1
+expect_line cancel-long-wake-leak "FAIL: playback-cancel stop 1: the sound at the next question's chime is not the chime alone: it lasts "
+expect_line cancel-long-wake-leak "than the calibration, the wake sound played alone (320 ms), by over 20 ms"
+expect_restored cancel-long-wake-leak
+expect_rc cancel-sound-missing 2
+expect_line cancel-sound-missing 'UNKNOWN: playback-cancel: this build has no ghost-wispr play-sound, which plays the wake sound alone to calibrate the rig'
+expect_no_line cancel-sound-missing 'PASS: playback-cancel: the poller sees'
+expect_restored cancel-sound-missing
 expect_rc cancel-clock-fast 0
 expect_restored cancel-clock-fast
 expect_rc cancel-clock-slow 0

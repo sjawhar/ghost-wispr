@@ -120,19 +120,31 @@ func (o lightOp) String() string {
 	return fmt.Sprintf("%s %02x%02x%02x", verb, o.colour[0], o.colour[1], o.colour[2])
 }
 
-// opsLight is a blink(1) that records every colour write and read-back in
-// order.
+// opsLight is a blink(1) that records every colour write and read-back of
+// LED 1 in order. SetRGB writes both LEDs; SetLED2 writes LED 2 alone, and
+// led2Writes records each such write apart from ops.
 type opsLight struct {
-	mu     sync.Mutex
-	colour [3]uint8
-	ops    []lightOp
+	mu         sync.Mutex
+	colour     [3]uint8
+	ops        []lightOp
+	led2       [3]uint8
+	led2Writes [][3]uint8
 }
 
 func (l *opsLight) SetRGB(r, g, b uint8) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.colour = [3]uint8{r, g, b}
+	l.led2 = l.colour
 	l.ops = append(l.ops, lightOp{colour: l.colour})
+	return nil
+}
+
+func (l *opsLight) SetLED2(r, g, b uint8) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.led2 = [3]uint8{r, g, b}
+	l.led2Writes = append(l.led2Writes, l.led2)
 	return nil
 }
 
@@ -151,6 +163,13 @@ func (l *opsLight) snapshot() []lightOp {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	return append([]lightOp(nil), l.ops...)
+}
+
+// secondLED returns LED 2's colour now and each SetLED2 write so far.
+func (l *opsLight) secondLED() ([3]uint8, [][3]uint8) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.led2, append([][3]uint8(nil), l.led2Writes...)
 }
 
 // portAudioOpenTook is how long PortAudio took on the office Pi from the

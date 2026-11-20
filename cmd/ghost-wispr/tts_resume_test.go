@@ -255,7 +255,7 @@ func TestAResumeLightsTheJabraWhenSpeechStartsDuringItsWrite(t *testing.T) {
 				r.device.mu.Unlock()
 				r.device.lightMu.Unlock()
 				time.Sleep(100 * time.Millisecond) // the speech plays
-				r.device.playbackClosing(func() {})
+				r.device.playbackClosing(func() error { return nil })
 			}
 			mic.expectEvents(t, "open")
 			if r.ring.Load() {

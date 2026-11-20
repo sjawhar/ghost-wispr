@@ -928,7 +928,9 @@ func (s *SQLiteStore) init(dbPath string) error {
 	// (voice_tasks.go). It holds no words of the room: the asker's words went
 	// in the Envoy message only. The foreign key deletes a session's rows with
 	// it, in the delete's own transaction, so the write-ahead log erase that
-	// follows the delete covers them.
+	// follows the delete covers them. asked_number is the question's place
+	// among the questions asked, a number and no words; a row from before the
+	// column existed keeps 0, asked first.
 	if _, err := s.db.Exec(`
 		CREATE TABLE IF NOT EXISTS voice_tasks (
 			id TEXT PRIMARY KEY,
@@ -939,11 +941,15 @@ func (s *SQLiteStore) init(dbPath string) error {
 			state TEXT NOT NULL DEFAULT 'working' CHECK (state IN ('working', 'done', 'cancelled', 'replaced')),
 			answer_written TEXT NOT NULL DEFAULT '',
 			spoken_at TEXT,
+			asked_number INTEGER NOT NULL DEFAULT 0,
 			FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
 		);
 		CREATE INDEX IF NOT EXISTS idx_voice_tasks_session_id ON voice_tasks(session_id);
 	`); err != nil {
 		return fmt.Errorf("create voice_tasks table: %w", err)
+	}
+	if _, err := s.db.Exec(`ALTER TABLE voice_tasks ADD COLUMN asked_number INTEGER NOT NULL DEFAULT 0`); err != nil && !strings.Contains(err.Error(), "duplicate column") {
+		return fmt.Errorf("migrate voice_tasks asked number: %w", err)
 	}
 
 	if _, err := s.db.Exec("CREATE INDEX IF NOT EXISTS idx_sessions_started_at ON sessions(started_at)"); err != nil {

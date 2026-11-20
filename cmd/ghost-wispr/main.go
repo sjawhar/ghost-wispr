@@ -865,6 +865,12 @@ func main() {
 	if len(os.Args) > 1 && os.Args[1] == "tts-first-audio" {
 		os.Exit(runTTSFirstAudioCommand(context.Background(), os.Args[1:], configPath, nil, os.Stdin, os.Stdout, os.Stderr))
 	}
+	if len(os.Args) > 1 && os.Args[1] == "play-sound" {
+		// Its stderr is for why it failed: the speaker stream's notes would
+		// crowd the cause out of the 300 bytes accept-voice.sh keeps.
+		logging.SetDefault(logging.New(os.Stderr, slog.LevelWarn))
+		os.Exit(runPlaySoundCommand(context.Background(), os.Args[1:], configPath, nil, os.Stdout, os.Stderr))
+	}
 	if len(os.Args) > 1 && os.Args[1] == "issue-holder" {
 		// Its stderr is for why it failed: the scratch ledger's start-up notes
 		// would crowd the cause out of the 300 bytes accept-voice.sh keeps.
@@ -2048,6 +2054,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 			red:         func() bool { return capture.capturing(micStatus) },
 			notify:      hub.BroadcastVoiceEvent,
 			projects:    dispatchProjects.Get,
+			waiting:     waitingLED{hardware},
 		}); err != nil {
 			slog.Warn("the meeting voice is off", "error", err)
 			warningRegistry.Set("voice", "The meeting voice is off: "+err.Error())

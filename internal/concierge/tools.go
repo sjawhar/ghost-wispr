@@ -664,8 +664,11 @@ func (r *runner) askAgent(ctx context.Context, session, question, issueKey strin
 	if closed {
 		return nil, tell("This meeting has ended, so I ask no agent for it.")
 	}
+	// The task's place among the questions asked, in its own row: a never
+	// mind whose mark comes after this number may cancel it.
 	if err := r.c.store.CreateVoiceTask(&storage.VoiceTask{
 		ID: localID, SessionID: r.x.SessionID, AskedAt: now, IssueKey: issueKey, Holder: "session:" + session,
+		AskedNumber: questionsAsked.Add(1),
 	}); err != nil {
 		return nil, fmt.Errorf("record the question: %w", err)
 	}
