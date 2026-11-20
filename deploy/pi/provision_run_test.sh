@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
-# Runs the full deploy/pi/provision.sh on a credential bundle with fakes for sudo, id and
+# Runs the full deploy/pi/provision.sh on a credential bundle with fakes for sudo, id, ip and
 # tailscale, and checks what the Pi is told to do: the service user joins the audio group, the
-# update runs with the user's runtime directory, and the detached join sets Tailscale Serve again
-# once `tailscale up` has re-authenticated the node, and only then.
+# update runs with the user's runtime directory, and the detached join brings the node up with the
+# tailnet's subnet routes off, sets Tailscale Serve again, and accepts the routes only when the route
+# check that provision.sh installs beside the token finds that no peer's route overlaps a network of
+# the Pi, on a re-join too. It runs that check alone on the Pi's networks and on tailnet statuses of
+# each kind, and checks that a Pi already joined gets no join and no route check.
 set -euo pipefail
 
 repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -56,8 +59,10 @@ readonly uid runtime_dir="/run/user/$uid"
 [[ -d $runtime_dir ]] || fail "this test needs $runtime_dir, where provision.sh stages the bundle"
 
 readonly CLIENT_ID=k-test-client-id SUBJECT=123456789012345678901
-export CLIENT_ID SUBJECT TEST_LOG="$work_dir/log" TEST_UID="$uid"
-mkdir -p "$work_dir/bin" "$work_dir/deploy" "$work_dir/bundle"
+export CLIENT_ID SUBJECT TEST_LOG="$work_dir/log" TEST_UID="$uid" TEST_ROUTE_ALL="$work_dir/route-all"
+# The join's directory, where provision.sh installs the token and the route check: the fake sudo
+# creates nothing.
+mkdir -p "$work_dir/bin" "$work_dir/deploy" "$work_dir/bundle" "$work_dir/join"
 touch "$work_dir/key.pem"
 
 cat >"$work_dir/bin/id" <<'EOF'
@@ -70,8 +75,9 @@ case "$*" in
 esac
 EOF
 
-# sudo records each command and runs none, but systemd-run's command is kept to run below, and the
-# configuration provision.sh installs is kept to read.
+# sudo records each command and runs none, but systemd-run's command is kept to run below, with the
+# whole systemd-run line, and what provision.sh installs from stdin or as the configuration is kept
+# to read.
 cat >"$work_dir/bin/sudo" <<'EOF'
 #!/usr/bin/env bash
 printf 'sudo %s\n' "$*" >>"$TEST_LOG"
@@ -82,16 +88,95 @@ elif [[ $1 == install && ${!#} == */ghost-wispr.yaml ]]; then
 fi
 if [[ $1 == systemd-run ]]; then
   printf '%s' "${!#}" >"$TEST_LOG.join"
+  printf '%s\n' "$*" >"$TEST_LOG.systemd-run"
 fi
 EOF
 
+# tailscale logs each call and keeps the accept-routes setting, RouteAll, in $TEST_ROUTE_ALL (false
+# when that file is absent):
+# - `up` exits TEST_UP_EXIT (0 by default), and on 0 sets RouteAll as its --accept-routes flag says.
+#   Without the flag, while RouteAll is true, it refuses as up.go's check of settings left out does
+#   (Tailscale v1.104.1, cmd/tailscale/cli/up.go:1013-1105) and exits 1. It keeps its exit code in
+#   $TEST_LOG.up-exit;
+# - `set --accept-routes` exits TEST_SET_EXIT (0 by default), and on 0 sets RouteAll true;
+#   `set --accept-routes=false` sets it false;
+# - `status --self --json` prints the node's own reading, TEST_SELF_STATUS when it is set;
+# - `status --json` prints the status fixture $TEST_STATUS, or fails with TEST_STATUS_EXIT;
+# - `serve` exits TEST_SERVE_EXIT (0 by default), and `debug prefs` prints RouteAll.
 cat >"$work_dir/bin/tailscale" <<'EOF'
 #!/usr/bin/env bash
 printf 'tailscale %s\n' "$*" >>"$TEST_LOG"
+unexpected() {
+  printf 'fake tailscale: unexpected call: tailscale %s\n' "$*" >&2
+  exit 2
+}
+route_all=$(cat -- "$TEST_ROUTE_ALL" 2>/dev/null) || route_all=false
 case $1 in
-  status) printf '{"Self":{"Tags":null,"DNSName":"ghost-wispr.example-tailnet.ts.net."}}\n' ;;
-  up) exit "${TEST_UP_EXIT:-0}" ;;
+  up)
+    code=${TEST_UP_EXIT:-0} flag=
+    for argument in "${@:2}"; do
+      case $argument in
+        --accept-routes | --accept-routes=true) flag=true ;;
+        --accept-routes=false) flag=false ;;
+      esac
+    done
+    if [[ $code == 0 && -z $flag && $route_all == true ]]; then
+      printf "Error: changing settings via 'tailscale up' requires mentioning all\n" >&2
+      code=1
+    elif [[ $code == 0 && -n $flag ]]; then
+      printf '%s\n' "$flag" >"$TEST_ROUTE_ALL"
+    fi
+    printf '%s\n' "$code" >"$TEST_LOG.up-exit"
+    exit "$code"
+    ;;
+  set)
+    case ${*:2} in
+      --accept-routes | --accept-routes=true)
+        [[ ${TEST_SET_EXIT:-0} != 0 ]] || printf 'true\n' >"$TEST_ROUTE_ALL"
+        exit "${TEST_SET_EXIT:-0}"
+        ;;
+      --accept-routes=false) printf 'false\n' >"$TEST_ROUTE_ALL" ;;
+      *) unexpected "$@" ;;
+    esac
+    ;;
+  status)
+    case ${*:2} in
+      '--self --json')
+        if [[ -n ${TEST_SELF_STATUS:-} ]]; then
+          printf '%s\n' "$TEST_SELF_STATUS"
+        else
+          printf '{"Self":{"Tags":null,"DNSName":"ghost-wispr.example-tailnet.ts.net."}}\n'
+        fi
+        ;;
+      --json)
+        if [[ ${TEST_STATUS_EXIT:-0} != 0 ]]; then
+          printf 'failed to connect to the local Tailscale daemon\n' >&2
+          exit "$TEST_STATUS_EXIT"
+        fi
+        cat -- "$TEST_STATUS"
+        ;;
+      *) unexpected "$@" ;;
+    esac
+    ;;
+  serve) exit "${TEST_SERVE_EXIT:-0}" ;;
+  debug)
+    [[ $* == 'debug prefs' ]] || unexpected "$@"
+    printf '{"RouteAll":%s}\n' "$route_all"
+    ;;
+  *) unexpected "$@" ;;
 esac
+EOF
+
+# ip prints the case's networks, the fixture $TEST_NETWORKS, as `ip -4 -o addr` does, or fails with
+# TEST_IP_EXIT.
+cat >"$work_dir/bin/ip" <<'EOF'
+#!/usr/bin/env bash
+[[ $* == '-4 -o addr' ]] || { printf 'fake ip: unexpected call: ip %s\n' "$*" >&2; exit 2; }
+if [[ ${TEST_IP_EXIT:-0} != 0 ]]; then
+  printf 'Cannot open netlink socket: Permission denied\n' >&2
+  exit "$TEST_IP_EXIT"
+fi
+cat -- "$TEST_NETWORKS"
 EOF
 
 # The release's update.sh and binary, as provision.sh runs them from the deploy directory. The real
@@ -120,12 +205,13 @@ printf '%s\n' "$CLIENT_ID" >"$work_dir/bundle/tailscale-client-id"
 printf '%s\n' "$SUBJECT" >"$work_dir/bundle/tailscale-subject"
 printf 'deepgram-key' >"$work_dir/bundle/deepgram-key"
 
-# run_provision runs provision.sh on a bundle of the named files, with neutral deployment settings.
+# run_provision runs provision.sh on a bundle of the named files, with neutral deployment settings
+# and the join's directory in $work_dir/join.
 run_provision() {
   tar -C "$work_dir/bundle" -cf - "$@" \
     | env -u XDG_RUNTIME_DIR PATH="$work_dir/bin:$PATH" GHOST_WISPR_DEPLOY_DIR="$work_dir/deploy" \
       GHOST_WISPR_IDENTITY_KEY="$work_dir/key.pem" GHOST_WISPR_PI_ENV="$repo_root/deploy/pi/test-pi.env" \
-      bash "$repo_root/deploy/pi/provision.sh" >"$work_dir/out" 2>&1
+      GHOST_WISPR_JOIN_DIR="$work_dir/join" bash "$repo_root/deploy/pi/provision.sh" >"$work_dir/out" 2>&1
 }
 readonly bundle_files=(device.crt google-credentials.json certificate_config.json tailscale-client-id
   tailscale-subject deepgram-key)
@@ -223,19 +309,335 @@ esac
 ((start_limit >= network_wait + 5 + sync_wait + 30)) \
   || fail "ghost-wispr.service's TimeoutStartSec (${start_limit}s) does not cover the network wait (${network_wait}s) and the clock wait (${sync_wait}s)"
 
-# The join re-authenticates the node; Serve is set again after it, in the same unit.
-run_join() {
-  : >"$TEST_LOG"
-  PATH="$work_dir/bin:$PATH" /bin/sh -c "$(<"$TEST_LOG.join")"
+# The detached join re-authenticates the node with `tailscale up` and the tailnet's subnet routes
+# off, sets Serve again, and runs the route check that provision.sh installed beside the token. It
+# accepts the routes (`tailscale set --accept-routes`) only when the check passed. The check compares
+# each IPv4 network of the Pi, tailscale0's excepted, with each peer's PrimaryRoutes: an accepted
+# route that overlaps a network of the Pi would take the Pi's own traffic for that network.
+readonly fixtures="$work_dir/fixtures"
+mkdir -p "$fixtures"
+
+# The Pi's networks, as `ip -4 -o addr` prints them: field 2 is the interface, field 4 the address
+# and its prefix.
+# F-ip-pi-posted: the office Pi's `ip -4 -o addr`, captured on the Pi on 2026-11-20 at 06:2xZ and
+# posted on dispatch://INFRA-4587/comment/214b89f6-725d-4230-9e03-f94c8eae1187, with a neutral
+# tailscale0 address.
+cat >"$fixtures/F-ip-pi-posted" <<'EOF'
+1: lo    inet 127.0.0.1/8 scope host lo
+3: wlan0    inet 192.168.1.136/24 brd 192.168.1.255 scope global dynamic noprefixroute wlan0
+4: tailscale0    inet 100.64.0.2/32 scope global tailscale0
+EOF
+# F-ip-pi: the same lines in the form iproute2 prints with -o for a real kernel, which always sends
+# the address's lifetimes: the posted reading was cut at the `\` that comes before them (iproute2
+# 6.15.0, ip/ipaddress.c:1674-1684 and ip/ip.c:302).
+cat >"$fixtures/F-ip-pi" <<'EOF'
+1: lo    inet 127.0.0.1/8 scope host lo\       valid_lft forever preferred_lft forever
+3: wlan0    inet 192.168.1.136/24 brd 192.168.1.255 scope global dynamic noprefixroute wlan0\       valid_lft 85520sec preferred_lft 85520sec
+4: tailscale0    inet 100.64.0.2/32 scope global tailscale0\       valid_lft forever preferred_lft forever
+EOF
+# F-ip-pod: iproute2 6.15.0's `ip -4 -o addr` under gVisor, captured verbatim in INFRA-4599's pod on
+# 2026-11-20: no label and no lifetimes, and each line ends in one space.
+printf '%s \n' '1: lo    inet 127.0.0.1/8 scope global dynamic' '2: eth0    inet 10.1.50.246/32 scope global dynamic' \
+  >"$fixtures/F-ip-pod"
+# F-ip-secondary: F-ip-pi with a secondary address on wlan0, in the shape ip/ipaddress.c prints it:
+# the secondary flag, then the address's label.
+{
+  sed -n '1,2p' "$fixtures/F-ip-pi"
+  printf '%s\n' '3: wlan0    inet 10.20.0.5/24 brd 10.20.0.255 scope global secondary wlan0:1\       valid_lft forever preferred_lft forever'
+  sed -n '3p' "$fixtures/F-ip-pi"
+} >"$fixtures/F-ip-secondary"
+# F-ip-ptp: F-ip-pi with a point-to-point address, in the form ip/ipaddress.c prints when the local
+# address and the peer address differ: field 4 is the local address, with no prefix.
+{
+  cat -- "$fixtures/F-ip-pi"
+  printf '%s\n' '5: wg0    inet 10.0.0.1 peer 10.0.0.2/32 scope global wg0\       valid_lft forever preferred_lft forever'
+} >"$fixtures/F-ip-ptp"
+# F-ip-lo-only: only the lo and tailscale0 lines of F-ip-pi. F-ip-empty: no line.
+sed -n '1p;3p' "$fixtures/F-ip-pi" >"$fixtures/F-ip-lo-only"
+: >"$fixtures/F-ip-empty"
+
+# The tailnet's statuses, as `tailscale status --json` prints them.
+# F-status-router: a status in the shape of Tailscale v1.104.1's ipn/ipnstate/ipnstate.go, with
+# neutral names and addresses: BackendState and Self, then Peer keyed by node key (line 81), each
+# peer with its HostName and DNSName (lines 242 and 246), and PrimaryRoutes only when it routes
+# (line 266, omitempty). router-a routes 10.1.0.0/16, INFRA-3709's Pod range, the route that
+# INFRA-4587 adds. svc-frontdoor routes a service /32 and an IPv6 /128, the shape of the
+# office Pi's reading on dispatch://INFRA-4587/comment/214b89f6-725d-4230-9e03-f94c8eae1187. devbox
+# routes nothing.
+cat >"$fixtures/F-status-router" <<'EOF'
+{
+  "Version": "1.104.1",
+  "BackendState": "Running",
+  "TailscaleIPs": ["100.64.0.2", "fd7a:115c:a1e0::2"],
+  "Self": {
+    "ID": "n100",
+    "PublicKey": "nodekey:0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f",
+    "HostName": "ghost-wispr",
+    "DNSName": "ghost-wispr.example-tailnet.ts.net.",
+    "OS": "linux",
+    "TailscaleIPs": ["100.64.0.2", "fd7a:115c:a1e0::2"],
+    "Tags": ["tag:ghost-wispr"],
+    "Online": true
+  },
+  "MagicDNSSuffix": "example-tailnet.ts.net",
+  "Peer": {
+    "nodekey:1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a": {
+      "ID": "n101",
+      "PublicKey": "nodekey:1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a",
+      "HostName": "router-a",
+      "DNSName": "router-a.example-tailnet.ts.net.",
+      "OS": "linux",
+      "TailscaleIPs": ["100.64.0.3", "fd7a:115c:a1e0::3"],
+      "PrimaryRoutes": ["10.1.0.0/16"],
+      "Online": true
+    },
+    "nodekey:2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b": {
+      "ID": "n102",
+      "PublicKey": "nodekey:2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b",
+      "HostName": "svc-frontdoor",
+      "DNSName": "svc-frontdoor.example-tailnet.ts.net.",
+      "OS": "linux",
+      "TailscaleIPs": ["100.64.0.4", "fd7a:115c:a1e0::4"],
+      "PrimaryRoutes": ["100.64.10.1/32", "fd7a:115c:a1e0::a/128"],
+      "Online": true
+    },
+    "nodekey:3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c": {
+      "ID": "n103",
+      "PublicKey": "nodekey:3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c",
+      "HostName": "devbox",
+      "DNSName": "devbox.example-tailnet.ts.net.",
+      "OS": "linux",
+      "TailscaleIPs": ["100.64.0.5", "fd7a:115c:a1e0::5"],
+      "Online": true
+    }
+  }
 }
-run_join || fail "the join command failed with tailscale up succeeding"
+EOF
+# F-status-overlap: F-status-router with one more peer, office-router, which routes 192.168.0.0/16.
+jq '("nodekey:" + "4d" * 32) as $key | .Peer[$key] = {ID: "n104", PublicKey: $key, HostName: "office-router",
+    DNSName: "office-router.example-tailnet.ts.net.", OS: "linux", TailscaleIPs: ["100.64.0.6", "fd7a:115c:a1e0::6"],
+    PrimaryRoutes: ["192.168.0.0/16"], Online: true}' "$fixtures/F-status-router" >"$fixtures/F-status-overlap"
+# with_routes writes, into the fixture named first, the status fixture named third (F-status-router
+# by default) with router-a's PrimaryRoutes replaced by the JSON list given second.
+with_routes() {
+  jq --argjson routes "$2" '(.Peer[] | select(.HostName == "router-a") | .PrimaryRoutes) = $routes' \
+    "$fixtures/${3:-F-status-router}" >"$fixtures/$1"
+}
+# The other statuses change only the routes of F-status-router, but the last five:
+# F-status-two-overlaps gives router-a of F-status-overlap a route that overlaps lo;
+# F-status-peer-null has no peer yet (ipnstate.go:467-469 adds the map with the first peer);
+# F-status-needs-login is a node logged out; F-status-empty and F-status-not-json are no status.
+with_routes F-status-host-route '["192.168.1.10/32"]'
+with_routes F-status-adjacent '["192.168.2.0/24"]'
+with_routes F-status-tailscale-range '["100.64.0.0/10"]'
+with_routes F-status-loopback '["127.0.0.0/8"]'
+with_routes F-status-default-route '["0.0.0.0/0"]'
+with_routes F-status-secondary '["10.20.0.0/16"]'
+jq 'del(.Peer[].PrimaryRoutes)' "$fixtures/F-status-router" >"$fixtures/F-status-no-routes"
+with_routes F-status-two-overlaps '["127.0.0.0/8"]' F-status-overlap
+jq '.Peer = null' "$fixtures/F-status-router" >"$fixtures/F-status-peer-null"
+jq '.BackendState = "NeedsLogin"' "$fixtures/F-status-router" >"$fixtures/F-status-needs-login"
+: >"$fixtures/F-status-empty"
+printf 'not json\n' >"$fixtures/F-status-not-json"
+# F-status-large: F-status-router with its peers replaced by 1,000 peers, each with a long HostName
+# and one /32 route in Tailscale's 100.64.0.0/10. It is more than Linux's 128 KiB limit for one
+# argument, so the check reads it whole only when it does not pass the status as an argument.
+# F-status-large-overlap adds a peer, office-router, which routes 192.168.0.0/16.
+jq '.Peer = ([range(1000) | (10000 + . | tostring | .[1:]) as $n | {
+    key: ("nodekey:" + "e" * 60 + $n),
+    value: {ID: ("n2" + $n), PublicKey: ("nodekey:" + "e" * 60 + $n),
+      HostName: ("peer-with-a-long-host-name-in-a-large-tailnet-" + $n),
+      DNSName: ("peer-with-a-long-host-name-in-a-large-tailnet-" + $n + ".example-tailnet.ts.net."),
+      OS: "linux", PrimaryRoutes: ["100.\(64 + (. / 256 | floor)).\(. % 256).1/32"], Online: true}
+  }] | from_entries)' "$fixtures/F-status-router" >"$fixtures/F-status-large"
+jq '("nodekey:" + "f" * 64) as $key | .Peer[$key] = {ID: "n3000", PublicKey: $key, HostName: "office-router",
+    PrimaryRoutes: ["192.168.0.0/16"]}' "$fixtures/F-status-large" >"$fixtures/F-status-large-overlap"
+
+readonly accepted_prefix='ghost-wispr routes: no route of a peer overlaps a network of the Pi: '
+readonly not_accepting="ghost-wispr routes: not accepting the tailnet's subnet routes: an accepted route would take the Pi's own traffic for that network"
+readonly wlan0_overlap='wlan0 192.168.1.136/24 overlaps 192.168.0.0/16 of office-router'
+
+# manager_expansion prints the command given as the service manager runs a systemd-run command when
+# --expand-environment=no did not turn its expansion off (systemd v257, replace_env_full with no
+# flags): each ${NAME} becomes the value of NAME in the environment, empty when NAME is unset, and
+# each $$ becomes $. A ${ with a : before its }, and a ${ with no }, stay as written.
+manager_expansion() {
+  local text=$1 out='' word='' state=word char i
+  for ((i = 0; i < ${#text}; i++)); do
+    char=${text:i:1}
+    case $state in
+      word)
+        word+=$char
+        [[ $char != '$' ]] || state=dollar
+        ;;
+      dollar)
+        case $char in
+          '{') out+=${word%?} word='${' state=variable ;;
+          '$') out+=$word word='' state=word ;;
+          *) word+=$char state=word ;;
+        esac
+        ;;
+      variable)
+        case $char in
+          '}') out+=$(printenv -- "${word:2}" || true) word='' state=word ;;
+          :) word+=$char state=word ;;
+          *) word+=$char ;;
+        esac
+        ;;
+    esac
+  done
+  printf '%s' "$out$word"
+}
+
+# run_join runs the join's command as its unit does, on F-ip-pi and the status fixture given second,
+# with RouteAll set to the first argument beforehand. It starts a fresh log, and puts the route check
+# provision.sh installed back at the path the command names, because the command removes it. When
+# the systemd-run line lacks --expand-environment=no, the command first gets the service manager's
+# expansion. The exit status is kept in join_exit, stdout and stderr in $work_dir/join.out.
+run_join() {
+  local command options
+  printf '%s\n' "$1" >"$TEST_ROUTE_ALL"
+  [[ -f $TEST_LOG.installed-route-overlap-check ]] \
+    || fail "provision.sh installed no route check: $TEST_LOG.installed-route-overlap-check is missing"
+  cp -- "$TEST_LOG.installed-route-overlap-check" "$work_dir/join/route-overlap-check"
+  rm -f -- "$TEST_LOG.up-exit"
+  : >"$TEST_LOG"
+  command=$(<"$TEST_LOG.join")
+  options=$(<"$TEST_LOG.systemd-run")
+  options=${options%"$command"}
+  [[ " $options " == *' --expand-environment=no '* ]] || command=$(manager_expansion "$command")
+  join_exit=0
+  TEST_NETWORKS="$fixtures/F-ip-pi" TEST_STATUS=$2 PATH="$work_dir/bin:$PATH" \
+    /bin/sh -c "$command" >"$work_dir/join.out" 2>&1 || join_exit=$?
+}
+
+# J1: no route overlaps a network of the Pi, so the join accepts the routes once the check passed.
+run_join false "$fixtures/F-status-router"
+j1="the join did not accept the tailnet's subnet routes although no route overlaps the Pi's networks: $(<"$work_dir/join.out")"
 mapfile -t calls <"$TEST_LOG"
-[[ ${#calls[@]} == 2 && ${calls[0]} == 'tailscale up '* && ${calls[1]} == 'tailscale serve --bg --https 443 http://127.0.0.1:8080' ]] \
-  || fail "the join did not set Serve after tailscale up: ${calls[*]}"
-if TEST_UP_EXIT=1 run_join; then
-  fail "the join succeeded although tailscale up failed"
+[[ $join_exit == 0 && ${#calls[@]} == 4 && ${calls[0]} == 'tailscale up '* \
+  && ${calls[1]} == 'tailscale serve --bg --https 443 http://127.0.0.1:8080' \
+  && ${calls[2]} == 'tailscale status --json' && ${calls[3]} == 'tailscale set --accept-routes' ]] || fail "$j1"
+[[ $(<"$TEST_ROUTE_ALL") == true ]] || fail "$j1"
+accepted=$(grep -e "^$accepted_prefix" "$work_dir/join.out") || fail "$j1"
+[[ $accepted == *'wlan0 192.168.1.136/24'* && $accepted == *'10.1.0.0/16'* ]] || fail "$j1"
+[[ ! -e $work_dir/join/route-overlap-check ]] || fail "$j1"
+
+# J2: office-router's route holds wlan0's network, so the join refuses: it runs no `tailscale set`,
+# leaves RouteAll false, ends failed, and names the overlap.
+run_join false "$fixtures/F-status-overlap"
+j2="the join accepted the tailnet's subnet routes although 192.168.0.0/16 of office-router overlaps wlan0 192.168.1.136/24"
+if grep -q '^tailscale set' "$TEST_LOG" || [[ $(<"$TEST_ROUTE_ALL") != false ]]; then
+  fail "$j2"
 fi
-grep -q '^tailscale serve' "$TEST_LOG" && fail "the join set Serve although tailscale up failed"
+[[ $join_exit != 0 ]] || fail "$j2"
+grep -Fq "$wlan0_overlap" "$work_dir/join.out" || fail "the join's refusal does not name the overlap: $(<"$work_dir/join.out")"
+grep -Fq "$not_accepting" "$work_dir/join.out" || fail "the join's refusal does not name the overlap: $(<"$work_dir/join.out")"
+
+# J3: a re-join of a Pi that accepts the routes, while a route now overlaps wlan0. `tailscale up`
+# turns the routes off and so passes up.go's check of settings left out, and the check keeps them
+# off.
+run_join true "$fixtures/F-status-overlap"
+up_exit='not run'
+[[ ! -f $TEST_LOG.up-exit ]] || up_exit=$(<"$TEST_LOG.up-exit")
+j3="a re-join with an overlapping route left RouteAll $(<"$TEST_ROUTE_ALL") (tailscale up: $up_exit)"
+[[ $(<"$TEST_ROUTE_ALL") == false ]] || fail "$j3"
+[[ $up_exit == 0 ]] || fail "$j3"
+if grep -q '^tailscale set' "$TEST_LOG"; then
+  fail "$j3"
+fi
+grep -Fq "$wlan0_overlap" "$work_dir/join.out" || fail "$j3"
+
+# J4: a re-join of a Pi that accepts the routes, while no route overlaps: the check turns them on
+# again.
+run_join true "$fixtures/F-status-router"
+[[ $(<"$TEST_ROUTE_ALL") == true ]] || fail "a re-join with no overlapping route left RouteAll false"
+grep -Fxq 'tailscale set --accept-routes' "$TEST_LOG" || fail "a re-join with no overlapping route left RouteAll false"
+[[ $join_exit == 0 ]] || fail "a re-join with no overlapping route left RouteAll false"
+
+# J5: when `tailscale up` fails, the join stops there and ends failed.
+TEST_UP_EXIT=1 run_join false "$fixtures/F-status-router"
+if [[ $join_exit == 0 ]] || grep -q -e '^tailscale serve' -e '^tailscale status --json$' -e '^tailscale set' "$TEST_LOG"; then
+  fail "the join went on after tailscale up failed: $(<"$TEST_LOG")"
+fi
+
+# J6: accepting the routes does not depend on Serve, so a failed `tailscale serve` still runs the
+# check and accepts the routes, and the join ends failed.
+TEST_SERVE_EXIT=1 run_join false "$fixtures/F-status-router"
+if ! grep -Fxq 'tailscale set --accept-routes' "$TEST_LOG" || [[ $(<"$TEST_ROUTE_ALL") != true || $join_exit == 0 ]]; then
+  fail "a failed tailscale serve stopped the route check, or the join reported success: $(<"$TEST_LOG")"
+fi
+
+# J7: when the check cannot read the tailnet's status, it refuses, and the join says which read failed.
+TEST_STATUS_EXIT=1 run_join false "$fixtures/F-status-router"
+if [[ $join_exit == 0 ]] || grep -q '^tailscale set' "$TEST_LOG" || [[ $(<"$TEST_ROUTE_ALL") != false ]] \
+  || ! grep -Fq 'cannot compare' "$work_dir/join.out" || ! grep -Fq 'tailscale status' "$work_dir/join.out"; then
+  fail "the join accepted routes it could not compare: $(<"$work_dir/join.out")"
+fi
+
+# J8: a failed `tailscale set` ends the join failed.
+TEST_SET_EXIT=1 run_join false "$fixtures/F-status-router"
+[[ $join_exit != 0 ]] || fail "the join reported success although tailscale set failed"
+
+# route_row runs the route check provision.sh installed as the join unit runs it, /bin/sh on the
+# file, on the network fixture and the status fixture given third and fourth. It fails unless the
+# check exits with the code given second and its output names each text given after the fixtures.
+# The first argument names the row.
+route_row() {
+  local row=$1 want=$2 got=0 text
+  TEST_NETWORKS="$fixtures/$3" TEST_STATUS="$fixtures/$4" PATH="$work_dir/bin:$PATH" \
+    /bin/sh "$TEST_LOG.installed-route-overlap-check" >"$work_dir/check.out" 2>&1 || got=$?
+  [[ $got == "$want" ]] || fail "route check $row: exit $got, want $want: $(<"$work_dir/check.out")"
+  shift 4
+  for text in "$@"; do
+    grep -Fq -- "$text" "$work_dir/check.out" || fail "route check $row does not name $text: $(<"$work_dir/check.out")"
+  done
+}
+
+route_row 'G1 route holds the network' 1 F-ip-pi F-status-overlap 'wlan0 192.168.1.136/24 overlaps 192.168.0.0/16'
+route_row 'G2 network holds the route' 1 F-ip-pi F-status-host-route 'overlaps 192.168.1.10/32'
+route_row 'G3 adjacent' 0 F-ip-pi F-status-adjacent "$accepted_prefix"
+route_row "G4 the tree's route, a service /32, an IPv6 /128" 0 F-ip-pi F-status-router 'routes compared:' \
+  '10.1.0.0/16' '100.64.10.1/32'
+route_row "G5 Tailscale's range" 0 F-ip-pi F-status-tailscale-range "$accepted_prefix"
+accepted=$(grep -F -- "$accepted_prefix" "$work_dir/check.out")
+networks=${accepted#*"$accepted_prefix"}
+networks=${networks%%'; routes compared:'*}
+[[ $networks != *tailscale0* ]] \
+  || fail "route check G5 Tailscale's range names tailscale0 among the Pi's networks: $(<"$work_dir/check.out")"
+route_row 'G6 loopback' 1 F-ip-pi F-status-loopback 'lo 127.0.0.1/8 overlaps 127.0.0.0/8'
+route_row 'G7 no peers' 0 F-ip-pi F-status-peer-null 'routes compared: none'
+route_row 'G8 no route key' 0 F-ip-pi F-status-no-routes 'routes compared: none'
+route_row 'G9 the posted form' 1 F-ip-pi-posted F-status-overlap 'wlan0 192.168.1.136/24 overlaps 192.168.0.0/16'
+route_row 'G10 another interface, gVisor form' 1 F-ip-pod F-status-router 'eth0 10.1.50.246/32 overlaps 10.1.0.0/16'
+route_row 'G11 a secondary address' 1 F-ip-secondary F-status-secondary 'wlan0 10.20.0.5/24 overlaps 10.20.0.0/16'
+route_row 'G12 two overlaps' 1 F-ip-pi F-status-two-overlaps "$wlan0_overlap" 'lo 127.0.0.1/8 overlaps 127.0.0.0/8 of router-a'
+route_row 'G13 a default route' 1 F-ip-pi F-status-default-route 'overlaps 0.0.0.0/0'
+large_size=$(wc -c <"$fixtures/F-status-large")
+((large_size > 131072)) || fail "F-status-large is $large_size bytes, not more than 128 KiB"
+route_row 'G14 a large status' 0 F-ip-pi F-status-large "$accepted_prefix"
+route_row 'G14 a large status, with an overlap' 1 F-ip-pi F-status-large-overlap 'wlan0 192.168.1.136/24 overlaps 192.168.0.0/16'
+TEST_IP_EXIT=1 route_row 'G15 ip fails' 2 F-ip-pi F-status-router 'cannot compare'
+route_row 'G16 ip prints nothing' 2 F-ip-empty F-status-router 'cannot compare'
+route_row 'G17 only lo and tailscale0' 2 F-ip-lo-only F-status-router 'cannot compare'
+route_row 'G18 point-to-point line' 2 F-ip-ptp F-status-router 'cannot compare' 'wg0' '10.0.0.1 peer 10.0.0.2/32'
+TEST_STATUS_EXIT=1 route_row 'G19 status fails' 2 F-ip-pi F-status-router 'cannot compare'
+route_row 'G20 status prints nothing' 2 F-ip-pi F-status-empty 'cannot compare'
+route_row 'G21 status is not JSON' 2 F-ip-pi F-status-not-json 'cannot compare'
+route_row 'G22 Tailscale not running' 2 F-ip-pi F-status-needs-login 'cannot compare' 'NeedsLogin'
+
+# J0: provision.sh on a Pi already joined as tag:ghost-wispr at $PI_HOST. exits before the join, so
+# it installs no route check and leaves the accept-routes setting as it is.
+pi_host=$(sed -n 's/^PI_HOST=//p' "$repo_root/deploy/pi/test-pi.env")
+: >"$TEST_LOG"
+joined_exit=0
+TEST_SELF_STATUS=$(jq -nc --arg name "$pi_host." '{Self: {Tags: ["tag:ghost-wispr"], DNSName: $name}}') \
+  run_provision "${bundle_files[@]}" || joined_exit=$?
+if [[ $joined_exit != 0 ]] || ! grep -Fq 'already joined' "$work_dir/out" \
+  || grep -Eq 'systemd-run|route-overlap-check|tailscale set' "$TEST_LOG"; then
+  cat -- "$work_dir/out" >&2
+  fail "provision.sh on a Pi already joined started a join or a route check: $(<"$TEST_LOG")"
+fi
 
 # A rerun on a Pi that has a shared drive renders through render_models_config: it must keep the
 # drive and the template's Envoy hub, and say no bash error either.

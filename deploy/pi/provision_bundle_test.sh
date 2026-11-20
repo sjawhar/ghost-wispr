@@ -6,8 +6,9 @@
 # configuration on its main, and the Tailscale client ID the seed workflow's root job printed when
 # it created the identity. Pulumi answers 403, as the infrastructure stacks' state buckets do for
 # that identity. Nothing reads an Envoy credential: the recorder publishes to the Envoy hub with
-# none. The runbook and the scripts read the neutral deployment settings in deploy/pi/test-pi.env,
-# not the office Pi's.
+# none. It also runs the runbook's step that accepts the tailnet's subnet routes against a fake Pi.
+# The runbook and the scripts read the neutral deployment settings in deploy/pi/test-pi.env, not the
+# office Pi's.
 set -euo pipefail
 
 repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -35,7 +36,7 @@ block() {
   ' "$doc"
 }
 
-for name in credentials prepare dispatch-token provision accept renew; do
+for name in credentials prepare dispatch-token provision accept renew accept-routes; do
   [[ -n $(block "$name") ]] || fail "docs/pi-setup.md has no bash block after <!-- provision_bundle_test.sh: $name -->"
 done
 # compose prints the runbook's credential, prepare and provision blocks in order, with the lines
@@ -275,10 +276,121 @@ case "$command" in
     ;;
   *'rm -rf --'*) printf '%s\n' "$command" >>"$TEST_PI/removed" ;;
   *'/opt/ghost-wispr/device.crt'*) cat >"$TEST_PI/renewed.crt" ;;
+  # The runbook's route step: the route check's program on stdin, then the accepting of the routes,
+  # each logged in $TEST_PI/log.
+  'sh -s')
+    printf 'sh -s\n' >>"$TEST_PI/log"
+    if [[ -n ${TEST_PI_CUT_SHORT:-} ]]; then
+      cat >/dev/null
+    else
+      PATH="$TEST_PI_BIN:$PATH" /bin/sh -s
+    fi
+    ;;
+  'sudo tailscale set --accept-routes && tailscale debug prefs')
+    printf 'sudo tailscale set --accept-routes\n' >>"$TEST_PI/log"
+    [[ -z ${TEST_PI_SET_FAIL:-} ]] || exit 1
+    "$TEST_PI_BIN/tailscale" set --accept-routes && "$TEST_PI_BIN/tailscale" debug prefs
+    ;;
+  'tailscale debug prefs') "$TEST_PI_BIN/tailscale" debug prefs ;;
   *) printf 'fake ssh: unexpected command %s\n' "$command" >&2; exit 1 ;;
 esac
 EOF
 chmod +x "$work_dir/bin/"*
+
+# The fake Pi's own ip and tailscale, first on the PATH of the program `sh -s` runs on the Pi: ip
+# prints F-ip-pi, and tailscale keeps the accept-routes setting, RouteAll, in $TEST_PI/route-all
+# (false when that file is absent). Its `status --json` prints F-status-router, or fails under
+# TEST_PI_STATUS_EXIT.
+export TEST_PI_BIN="$work_dir/pi-bin" TEST_PI_FIXTURES="$work_dir/pi-fixtures"
+mkdir -p "$TEST_PI_BIN" "$TEST_PI_FIXTURES"
+cat >"$TEST_PI_BIN/ip" <<'EOF'
+#!/usr/bin/env bash
+[[ $* == '-4 -o addr' ]] || { printf 'fake Pi ip: unexpected call: ip %s\n' "$*" >&2; exit 2; }
+cat -- "$TEST_PI_FIXTURES/F-ip-pi"
+EOF
+cat >"$TEST_PI_BIN/tailscale" <<'EOF'
+#!/usr/bin/env bash
+route_all=$(cat -- "$TEST_PI/route-all" 2>/dev/null) || route_all=false
+case $* in
+  'status --json')
+    if [[ -n ${TEST_PI_STATUS_EXIT:-} ]]; then
+      printf 'failed to connect to the local Tailscale daemon\n' >&2
+      exit "$TEST_PI_STATUS_EXIT"
+    fi
+    cat -- "$TEST_PI_FIXTURES/F-status-router"
+    ;;
+  'set --accept-routes') printf 'true\n' >"$TEST_PI/route-all" ;;
+  'debug prefs') printf '{"RouteAll":%s}\n' "$route_all" ;;
+  *) printf 'fake Pi tailscale: unexpected call: tailscale %s\n' "$*" >&2; exit 2 ;;
+esac
+EOF
+chmod +x "$TEST_PI_BIN/"*
+# F-ip-pi: the office Pi's `ip -4 -o addr`, captured on the Pi on 2026-11-20 at 06:2xZ and posted on
+# dispatch://INFRA-4587/comment/214b89f6-725d-4230-9e03-f94c8eae1187, with a neutral tailscale0
+# address, in the form iproute2 prints with -o for a real kernel, which always sends the address's
+# lifetimes: the posted reading was cut at the `\` that comes before them (iproute2 6.15.0,
+# ip/ipaddress.c:1674-1684 and ip/ip.c:302).
+cat >"$TEST_PI_FIXTURES/F-ip-pi" <<'EOF'
+1: lo    inet 127.0.0.1/8 scope host lo\       valid_lft forever preferred_lft forever
+3: wlan0    inet 192.168.1.136/24 brd 192.168.1.255 scope global dynamic noprefixroute wlan0\       valid_lft 85520sec preferred_lft 85520sec
+4: tailscale0    inet 100.64.0.2/32 scope global tailscale0\       valid_lft forever preferred_lft forever
+EOF
+# F-status-router: a `tailscale status --json` in the shape of Tailscale v1.104.1's
+# ipn/ipnstate/ipnstate.go, with neutral names and addresses: BackendState and Self, then Peer keyed
+# by node key (line 81), each peer with its HostName and DNSName (lines 242 and 246), and
+# PrimaryRoutes only when it routes (line 266, omitempty). router-a routes 10.1.0.0/16, INFRA-3709's
+# Pod range, the route that INFRA-4587 adds. svc-frontdoor routes a service /32 and an IPv6
+# /128, the shape of the office Pi's reading on
+# dispatch://INFRA-4587/comment/214b89f6-725d-4230-9e03-f94c8eae1187. devbox routes nothing.
+cat >"$TEST_PI_FIXTURES/F-status-router" <<'EOF'
+{
+  "Version": "1.104.1",
+  "BackendState": "Running",
+  "TailscaleIPs": ["100.64.0.2", "fd7a:115c:a1e0::2"],
+  "Self": {
+    "ID": "n100",
+    "PublicKey": "nodekey:0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f",
+    "HostName": "ghost-wispr",
+    "DNSName": "ghost-wispr.example-tailnet.ts.net.",
+    "OS": "linux",
+    "TailscaleIPs": ["100.64.0.2", "fd7a:115c:a1e0::2"],
+    "Tags": ["tag:ghost-wispr"],
+    "Online": true
+  },
+  "MagicDNSSuffix": "example-tailnet.ts.net",
+  "Peer": {
+    "nodekey:1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a": {
+      "ID": "n101",
+      "PublicKey": "nodekey:1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a",
+      "HostName": "router-a",
+      "DNSName": "router-a.example-tailnet.ts.net.",
+      "OS": "linux",
+      "TailscaleIPs": ["100.64.0.3", "fd7a:115c:a1e0::3"],
+      "PrimaryRoutes": ["10.1.0.0/16"],
+      "Online": true
+    },
+    "nodekey:2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b": {
+      "ID": "n102",
+      "PublicKey": "nodekey:2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b",
+      "HostName": "svc-frontdoor",
+      "DNSName": "svc-frontdoor.example-tailnet.ts.net.",
+      "OS": "linux",
+      "TailscaleIPs": ["100.64.0.4", "fd7a:115c:a1e0::4"],
+      "PrimaryRoutes": ["100.64.10.1/32", "fd7a:115c:a1e0::a/128"],
+      "Online": true
+    },
+    "nodekey:3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c": {
+      "ID": "n103",
+      "PublicKey": "nodekey:3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c",
+      "HostName": "devbox",
+      "DNSName": "devbox.example-tailnet.ts.net.",
+      "OS": "linux",
+      "TailscaleIPs": ["100.64.0.5", "fd7a:115c:a1e0::5"],
+      "Online": true
+    }
+  }
+}
+EOF
 
 # The infrastructure repository as the runbook reads it: its origin's main holds root/stack.yaml
 # with the service account's unique id. The commit before it held another id, and each case's
@@ -470,6 +582,68 @@ TEST_CERT_READ_FAIL=1 run_renew "$work_dir/renew-failed"
 [[ ! -e $work_dir/renew-failed/pi/renewed.crt ]] || fail "renewal installed a certificate on the Pi although the read failed"
 [[ -z $(find "$work_dir/renew/tmp" "$work_dir/renew-failed/tmp" -mindepth 1 -print -quit) ]] \
   || fail "renewal left its certificate file behind"
+
+# The runbook's step that accepts the tailnet's subnet routes on a running Pi: it runs the route
+# check provision.sh prints on the Pi, and accepts the routes only when the check printed its
+# acceptance line. No row holds an overlap: the overlap cases are provision_run_test.sh's, which CI
+# runs after this test.
+accept_routes="$work_dir/accept-routes.sh"
+block accept-routes >"$accept_routes"
+readonly accepted_prefix='ghost-wispr routes: no route of a peer overlaps a network of the Pi: '
+# run_route_step runs the step as an operator pastes it, with plain bash (no -e, no pipefail), from
+# the directory given second (the repository root by default), against the fake Pi of the case
+# directory given first. It keeps the exit status in route_step_exit, stdout and stderr in
+# <case>/out, the ssh calls in <case>/argv.log, and what reached the fake Pi in <case>/pi/log.
+run_route_step() {
+  local case_dir=$1 root=${2:-$repo_root}
+  mkdir -p "$case_dir/pi"
+  : >"$case_dir/pi/log"
+  : >"$case_dir/argv.log"
+  route_step_exit=0
+  (
+    cd "$root"
+    TEST_PI="$case_dir/pi" TEST_ARGV_LOG="$case_dir/argv.log" PATH="$work_dir/bin:$PATH" bash "$accept_routes"
+  ) >"$case_dir/out" 2>&1 || route_step_exit=$?
+}
+
+# D1: no route overlaps a network of the Pi, so the step accepts the routes and ends by printing
+# RouteAll, true.
+run_route_step "$work_dir/routes-none"
+d1="the runbook's route step did not accept the routes on a Pi whose networks no route overlaps: $(<"$work_dir/routes-none/out")"
+[[ $route_step_exit == 0 ]] || fail "$d1"
+grep -Fxq 'sudo tailscale set --accept-routes' "$work_dir/routes-none/pi/log" || fail "$d1"
+grep -q -e "^$accepted_prefix" "$work_dir/routes-none/out" || fail "$d1"
+[[ $(tail -n 1 -- "$work_dir/routes-none/out") == true ]] || fail "$d1"
+
+# D2: the check cannot read the tailnet's status on the Pi, so the step does not accept the routes.
+TEST_PI_STATUS_EXIT=1 run_route_step "$work_dir/routes-unread"
+if grep -q 'tailscale set' "$work_dir/routes-unread/pi/log" "$work_dir/routes-unread/argv.log"; then
+  fail "the runbook's route step ran tailscale set although the check did not pass: $(<"$work_dir/routes-unread/pi/log") $(<"$work_dir/routes-unread/argv.log")"
+fi
+
+# D3: a checkout from before the route check, whose provision.sh defines no route_overlap_check_script,
+# reaches the Pi not at all.
+older_checkout="$work_dir/older-checkout"
+mkdir -p "$older_checkout/deploy/pi"
+sed 's/route_overlap_check_script/no_route_overlap_check_script/g' "$repo_root/deploy/pi/provision.sh" \
+  >"$older_checkout/deploy/pi/provision.sh"
+run_route_step "$work_dir/routes-older" "$older_checkout"
+if grep -q '^ssh ' "$work_dir/routes-older/argv.log" || grep -q 'tailscale set' "$work_dir/routes-older/pi/log"; then
+  fail "the runbook's route step ran tailscale set with no check to run: $(<"$work_dir/routes-older/argv.log")"
+fi
+
+# D4: a check program cut short defines its function and runs nothing, so it prints no acceptance
+# line: here the Pi's sh reads the program and runs none of it.
+TEST_PI_CUT_SHORT=1 run_route_step "$work_dir/routes-cut"
+if grep -q 'tailscale set' "$work_dir/routes-cut/pi/log" "$work_dir/routes-cut/argv.log"; then
+  fail "the runbook's route step ran tailscale set although the check printed no acceptance line: $(<"$work_dir/routes-cut/pi/log") $(<"$work_dir/routes-cut/argv.log")"
+fi
+
+# D5: a failed `tailscale set` on the Pi makes the step fail, and it prints no RouteAll.
+TEST_PI_SET_FAIL=1 run_route_step "$work_dir/routes-set-failed"
+if [[ $route_step_exit == 0 ]] || grep -qx true "$work_dir/routes-set-failed/out"; then
+  fail "the runbook's route step reported success although tailscale set failed: $(<"$work_dir/routes-set-failed/out")"
+fi
 
 if grep -F -e "$DEEPGRAM_SECRET" -e "$DISPATCH_SECRET" -e "$OPERATOR_DISPATCH_SECRET" "$TEST_ARGV_LOG" >/dev/null; then
   fail "a secret was passed as a command argument"
