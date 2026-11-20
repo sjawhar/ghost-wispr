@@ -42,11 +42,10 @@ func TestSpeechGateEveryReplyOrdering(t *testing.T) {
 
 	for _, replies := range []int{2, 3} {
 		for _, trace := range everyGateTrace(replies, orders) {
-			if !t.Run(gateTraceName(trace), func(t *testing.T) {
+			t.Run(gateTraceName(trace), func(t *testing.T) {
+				t.Parallel()
 				runGateTrace(t, trace)
-			}) {
-				return
-			}
+			})
 		}
 	}
 
@@ -121,13 +120,14 @@ func TestSpeechGateEventInterleavings(t *testing.T) {
 			} else {
 				name += fmt.Sprintf("/injected-%d", injected+1)
 			}
-			if !t.Run(name, func(t *testing.T) {
+			t.Run(name, func(t *testing.T) {
 				everyAudioDoneTextInterleaving(replies, func(trace []gateStreamEvent) {
-					runGateEventInterleaving(t, trace, injected)
+					t.Run(gateStreamName(trace), func(t *testing.T) {
+						t.Parallel()
+						runGateEventInterleaving(t, trace, injected)
+					})
 				})
-			}) {
-				return
-			}
+			})
 		}
 	}
 }
@@ -170,11 +170,12 @@ func everyAudioDoneTextInterleaving(replies int, yield func([]gateStreamEvent)) 
 
 func runGateEventInterleaving(t *testing.T, trace []gateStreamEvent, injected int) {
 	t.Helper()
-	setSpeechGap(t, time.Minute)
+	// Each trace has its own session and runs beside the others, so the
+	// speech gap goes in Config, not through setSpeechGap's shared value.
 	stand := startStandIn(t)
 	base := newFakeOutput()
 	out := newGateOrderingOutput(base)
-	sess, c, _ := open(t, stand, Config{}, voice.Exchange{Out: out, Tools: tools(nil)})
+	sess, c, _ := open(t, stand, Config{speechGap: time.Minute}, voice.Exchange{Out: out, Tools: tools(nil)})
 	defer func() { _ = sess.Close() }()
 
 	before := outputSamples(t, base)
@@ -283,11 +284,10 @@ func outputDelta(t *testing.T, before, after map[int16]int) map[int16]int {
 
 func runGateTrace(t *testing.T, trace []gateReply) {
 	t.Helper()
-	setSpeechGap(t, time.Minute)
 	stand := startStandIn(t)
 	base := newFakeOutput()
 	out := newGateOrderingOutput(base)
-	sess, c, _ := open(t, stand, Config{}, voice.Exchange{Out: out, Tools: tools(nil)})
+	sess, c, _ := open(t, stand, Config{speechGap: time.Minute}, voice.Exchange{Out: out, Tools: tools(nil)})
 	t.Cleanup(func() { _ = sess.Close() })
 
 	want := make(map[int16]int)
