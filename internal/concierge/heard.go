@@ -207,6 +207,13 @@ func (c *Concierge) readTarget(ctx context.Context, words string, wait bool) str
 			keys = append(keys, key)
 		}
 	}
+	if len(keys) == 0 {
+		// A number alone names the issue of the agent that joined on it
+		// ("ask the 1027 agent", R17).
+		if key := c.joinedNumber(words); key != "" {
+			keys = append(keys, key)
+		}
+	}
 	terms := searchTerms(words)
 	if len(keys) > 0 {
 		slices.Reverse(keys)

@@ -119,7 +119,7 @@ func (s *fakeSpeaker) soundsPlayed() []string {
 }
 
 func soundName(first []byte) string {
-	for name, pcm := range map[string][]byte{"wake": WakeChime(), "answer": AnswerChime(), "start": StartChime(), "error": ErrorChime()} {
+	for name, pcm := range map[string][]byte{"wake": WakeChime(), "answer": AnswerChime(), "hand": HandChime(), "start": StartChime(), "error": ErrorChime()} {
 		if len(pcm) >= len(first) && bytes.Equal(pcm[:len(first)], first) {
 			return name
 		}

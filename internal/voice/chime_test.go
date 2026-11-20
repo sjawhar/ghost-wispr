@@ -17,6 +17,7 @@ func TestChimesAreShortSoftAndDistinct(t *testing.T) {
 	}{
 		"wake":   {WakeChime(), 2},
 		"answer": {AnswerChime(), 3},
+		"hand":   {HandChime(), 2},
 		"start":  {StartChime(), 1},
 		"error":  {ErrorChime(), 2},
 	}

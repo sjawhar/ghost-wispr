@@ -61,6 +61,12 @@ func TestCommands(t *testing.T) {
 		"Never mind.":                  NeverMind,
 		"nevermind":                    NeverMind,
 		"forget it":                    NeverMind,
+		"who has a hand up?":           HandsUp,
+		"Who has their hand up?":       HandsUp,
+		"who's got a hand up":          HandsUp,
+		"any hands up?":                HandsUp,
+		"who handles the budget?":      Ask,
+		"who is on INFRA 1027?":        Ask,
 		"what is happening with this?": Ask,
 		"":                             Ask,
 	}
@@ -98,6 +104,68 @@ func TestKeyterms(t *testing.T) {
 			t.Fatalf("keyterm %q twice", k)
 		}
 		seen[k] = true
+	}
+}
+
+// fakeStream is a live Deepgram socket as LiveKeyterms reaches it: it records
+// each Configure message's keyterms.
+type fakeStream struct{ configured [][]string }
+
+func (f *fakeStream) Configure(keyterms []string) error {
+	f.configured = append(f.configured, slices.Clone(keyterms))
+	return nil
+}
+
+// TestKeytermsChangeOnJoin fails if a join or a leave does not change the
+// live stream's keyterms with one Configure message, if the joined agents'
+// keys do not come right after the wake phrases, if an unchanged list is sent
+// again, or if a socket dialled before a join misses it.
+func TestKeytermsChangeOnJoin(t *testing.T) {
+	k := NewLiveKeyterms([]string{"Wispr", "Ghost Wispr"}, func() []string { return []string{"INFRA", "OPS"} })
+	base := []string{"Wispr", "Ghost Wispr", "INFRA", "OPS"}
+	stream := &fakeStream{}
+	k.Attach(stream, k.List())
+	if !slices.Equal(k.List(), base) || len(stream.configured) != 0 {
+		t.Fatalf("before a join: list %q, %d Configure messages; want %q and none", k.List(), len(stream.configured), base)
+	}
+
+	k.SetJoined([]string{"ABC-12"})
+	joined := []string{"Wispr", "Ghost Wispr", "ABC-12", "INFRA", "OPS"}
+	if len(stream.configured) != 1 || !slices.Equal(stream.configured[0], joined) {
+		t.Fatalf("a join sent %q, want one Configure with %q", stream.configured, joined)
+	}
+	if !slices.Equal(k.List(), joined) {
+		t.Fatalf("after a join a dial reads %q, want %q", k.List(), joined)
+	}
+	k.SetJoined([]string{"ABC-12"})
+	if len(stream.configured) != 1 {
+		t.Fatalf("an unchanged list was sent again: %q", stream.configured)
+	}
+
+	k.SetJoined(nil)
+	if len(stream.configured) != 2 || !slices.Equal(stream.configured[1], base) {
+		t.Fatalf("a leave sent %q, want a second Configure with %q", stream.configured, base)
+	}
+
+	// A socket dialled with the list from before a join, and attached after
+	// it, is sent the list at once; the join itself went to the socket that
+	// still carried the meeting.
+	dialed := k.List()
+	k.SetJoined([]string{"XYZ-9"})
+	late := &fakeStream{}
+	k.Attach(late, dialed)
+	want := []string{"Wispr", "Ghost Wispr", "XYZ-9", "INFRA", "OPS"}
+	if len(late.configured) != 1 || !slices.Equal(late.configured[0], want) {
+		t.Fatalf("a socket dialled before the join got %q, want one Configure with %q", late.configured, want)
+	}
+	// From the attach on, a leave reaches the new socket only.
+	before := len(stream.configured)
+	k.SetJoined(nil)
+	if len(late.configured) != 2 || !slices.Equal(late.configured[1], base) {
+		t.Fatalf("a leave after the attach sent the new socket %q, want a second Configure with %q", late.configured, base)
+	}
+	if len(stream.configured) != before {
+		t.Fatalf("the socket the new one replaced was sent %q", stream.configured[before:])
 	}
 }
 

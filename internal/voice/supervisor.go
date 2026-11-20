@@ -167,6 +167,14 @@ type SupervisorConfig struct {
 	// Timing gets the timing events the acceptance driver reads; nil drops
 	// them.
 	Timing func(event, sessionID string, at time.Time, kv ...any)
+	// HandDone is told how each raised hand came down (RaiseHand); nil
+	// tells nobody. It runs on a goroutine of its own, never under the
+	// Supervisor's lock.
+	HandDone func(h Hand, outcome HandOutcome)
+	// Segment gets each final transcript segment of the room, for the joined
+	// agents' pointers; nil drops them. It runs on the transcript reader,
+	// never under the Supervisor's lock, and must return at once.
+	Segment func(s Segment)
 	Logf   func(string, ...any)
 }
 
@@ -196,8 +204,9 @@ type Supervisor struct {
 	ex            *exchange // the exchange holding the floor
 	floor         chan struct{}
 	lastStopAt    time.Time          // when the latest stop came
-	chimeCancel   context.CancelFunc // ends the answer chime playing or about to
-	chimeCtx      context.Context    // that chime's context, nil while none plays
+	chimeCancel   context.CancelFunc // ends the answer or hand sound playing or about to
+	chimeCtx      context.Context    // that sound's context, nil while none plays
+	chimeHands    bool               // that sound is the hand sound
 	pending       []*pendingAnswer
 	voiceSpeaking bool      // the voice input plays
 	voiceStarted  time.Time // when it last started
@@ -209,6 +218,7 @@ type Supervisor struct {
 	lastTimes     *exchangeTimes // the newest exchange a wake opened: its times, no words
 	chimedAt      time.Time
 	heard         []heardCall    // Heard calls OnTranscript makes once it unlocks
+	segments      []Segment      // Segment calls OnTranscript makes once it unlocks
 	wg            sync.WaitGroup // the goroutines Close waits for
 }
 
@@ -219,9 +229,14 @@ type heardCall struct {
 	words string
 }
 
+// pendingAnswer is a holder's answer or a joined agent's raised hand (hand)
+// that waits to be spoken, or a line said once in an exchange of its own
+// (line), such as who has a hand up, which is never held.
 type pendingAnswer struct {
 	PendingAnswer
-	needsInvite bool // a stop or a room word came after its question: only "Wispr, go ahead" speaks it
+	hand        *Hand
+	line        bool
+	needsInvite bool // a stop or a room word came after its question, or it is a hand: only "Wispr, go ahead" speaks it
 	chimed      bool
 }
 
@@ -456,7 +471,7 @@ func (s *Supervisor) offLocked() bool {
 	if !s.off {
 		s.off = true
 		s.stopLocked("voice turned off")
-		s.pending = nil
+		s.dropPendingLocked(func(string) bool { return true })
 		s.lastTimes = nil
 		s.recent = nil // the room's words from before the off go with it
 	}
@@ -497,8 +512,16 @@ func (s *Supervisor) SegmentsDeleted(string) {
 	s.recent = nil
 }
 
+// dropPendingLocked drops the held answers and raised hands of the meetings
+// that of names; a hand's agent is told it was withdrawn.
 func (s *Supervisor) dropPendingLocked(of func(sessionID string) bool) {
-	s.pending = slices.DeleteFunc(s.pending, func(p *pendingAnswer) bool { return of(p.SessionID) })
+	s.pending = slices.DeleteFunc(s.pending, func(p *pendingAnswer) bool {
+		if !of(p.SessionID) {
+			return false
+		}
+		s.handDoneLocked(p, HandWithdrawn)
+		return true
+	})
 }
 
 // dropEndedLocked drops the held answers of every session but the one
@@ -554,14 +577,17 @@ func (s *Supervisor) OnUtteranceEnd(closings int, gateOpen bool) {
 func (s *Supervisor) OnTranscript(t *Transcript) {
 	s.mu.Lock()
 	s.onTranscriptLocked(t)
-	heard := s.heard
-	s.heard = nil
+	heard, segments := s.heard, s.segments
+	s.heard, s.segments = nil, nil
 	s.mu.Unlock()
 	// The Concierge's Heard takes its own lock: never under the Supervisor's,
 	// so a stop never waits on it. One reader calls OnTranscript, so the calls
 	// keep their order.
 	for i := range heard {
 		s.cfg.Concierge.Heard(heard[i].ctx, &heard[i].x, heard[i].words)
+	}
+	for _, segment := range segments {
+		s.cfg.Segment(segment)
 	}
 }
 
@@ -584,6 +610,7 @@ func (s *Supervisor) onTranscriptLocked(t *Transcript) {
 	}
 	if t.IsFinal && !own {
 		s.keepRecentLocked(t, now)
+		s.segmentLocked(t)
 	}
 
 	if m, ok := s.wake.Find(t.Text); ok {
@@ -606,6 +633,19 @@ func (s *Supervisor) onTranscriptLocked(t *Transcript) {
 				s.endLocked(ex, true, "Wispr, go ahead")
 			}
 			s.goAheadLocked(transcript.IssueKeys(m.Rest))
+		case cmd == transcript.HandsUp:
+			if !t.IsFinal {
+				return // once, on the final: it says the hands up
+			}
+			if ex != nil && ex.answer != nil && ex.answer.line {
+				return // already said
+			}
+			if ex != nil {
+				// The wake its own interim opened, or any other exchange: a
+				// new call ends it.
+				s.endLocked(ex, true, "Wispr, who has a hand up")
+			}
+			s.handsUpLocked(s.cfg.Session())
 		case cmd == transcript.NeverMind:
 			if !t.IsFinal {
 				return // once, on the final: it cancels a question
@@ -766,7 +806,7 @@ func (s *Supervisor) open(ex *exchange, voice Voice, x *Exchange, chime bool) {
 		if ex.ctx.Err() == nil {
 			s.errorLocked(x.SessionID)
 		}
-		if p := ex.answer; p != nil && !ex.ended {
+		if p := ex.answer; p != nil && !p.line && !ex.ended {
 			// Not heard: it waits for "Wispr, go ahead" again.
 			p.needsInvite = true
 			s.pending = append([]*pendingAnswer{p}, s.pending...)
@@ -1179,6 +1219,7 @@ func (s *Supervisor) followUpLocked(ex *exchange) {
 // reads red: the one whose key the invitation names, else the oldest (R11).
 func (s *Supervisor) goAheadLocked(keys []string) {
 	s.dropEndedLocked()
+	s.dropExpiredLocked(time.Now())
 	if !s.cfg.Red() || s.ex != nil || len(s.pending) == 0 {
 		return
 	}
@@ -1193,7 +1234,8 @@ func (s *Supervisor) goAheadLocked(keys []string) {
 	s.speakLocked(p)
 }
 
-// speakLocked speaks a held answer in an exchange of its own.
+// speakLocked speaks a held answer, a raised hand or a line in an exchange of
+// its own.
 func (s *Supervisor) speakLocked(p *pendingAnswer) {
 	voice, err := s.cfg.Voice()
 	if err != nil || voice == nil {
@@ -1235,7 +1277,7 @@ func (s *Supervisor) speakLocked(p *pendingAnswer) {
 			// Not heard: it waits for "Wispr, go ahead" again, unless a stop
 			// already put it back.
 			s.mu.Lock()
-			if !ex.ended && ex.ctx.Err() == nil {
+			if !ex.ended && !p.line && ex.ctx.Err() == nil {
 				p.needsInvite = true
 				s.pending = append([]*pendingAnswer{p}, s.pending...)
 			}
@@ -1246,7 +1288,7 @@ func (s *Supervisor) speakLocked(p *pendingAnswer) {
 			s.mu.Unlock()
 		}
 		if s.finish(ex, p.SessionID) {
-			s.spoken(p.TaskID)
+			s.heardOut(p)
 		}
 	})
 }
@@ -1313,38 +1355,54 @@ func (s *Supervisor) offerAnswers() {
 	}
 }
 
-// offer chimes each held answer once while the light reads red, and speaks by
-// itself the oldest one that needs no invitation, once the room is silent.
+// offer chimes each held answer and raised hand once while the light reads
+// red, and speaks by itself the oldest answer that needs no invitation, once
+// the room is silent. It takes down the hands that expired.
 func (s *Supervisor) offer() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.dropEndedLocked()
-	if s.closed || s.offLocked() || len(s.pending) == 0 || !s.cfg.Red() {
+	if s.closed || s.offLocked() {
+		return
+	}
+	now := time.Now()
+	s.dropExpiredLocked(now)
+	if len(s.pending) == 0 || !s.cfg.Red() {
 		return
 	}
 	if ex := s.ex; ex != nil && !s.idleLocked(ex) {
 		return
 	}
-	now := time.Now()
-	unchimed := slices.ContainsFunc(s.pending, func(p *pendingAnswer) bool { return !p.chimed })
+	// The answer sound first, then the hand sound: each sounds for its own.
+	hands := !slices.ContainsFunc(s.pending, func(p *pendingAnswer) bool { return !p.chimed && p.hand == nil })
+	unchimed := slices.ContainsFunc(s.pending, func(p *pendingAnswer) bool { return !p.chimed && (p.hand != nil) == hands })
 	if unchimed {
-		// The answer sound waits for a gap with no transcript word (R10).
-		// One sound for every answer that has not had one: answers that land
-		// together, or while a sound plays, share it, so sounds never overlap
-		// on the one input.
+		// The sound waits for a gap with no transcript word (R10). One sound
+		// for every answer, or every hand, that has not had one: those that
+		// land together, or while their sound plays, share it, so sounds
+		// never overlap on the one input. The other sound plays first.
 		if s.voiceSpeaking || now.Sub(s.lastHeard) < s.cfg.SoundGap {
 			return
 		}
+		if s.chimeCancel != nil && s.chimeHands != hands {
+			return
+		}
 		for _, p := range s.pending {
-			p.chimed = true
+			if (p.hand != nil) == hands {
+				p.chimed = true
+			}
 		}
 		s.chimedAt = now
 		if s.chimeCancel == nil {
+			pcm, event := AnswerChime(), "answer_chime"
+			if hands {
+				pcm, event = HandChime(), "hand_chime"
+			}
 			ctx, cancel := context.WithCancel(s.ctx)
-			s.chimeCancel = cancel
+			s.chimeCancel, s.chimeHands = cancel, hands
 			sessionID := s.pending[len(s.pending)-1].SessionID
 			s.spawn(func() {
-				s.playChime(ctx, AnswerChime(), "answer_chime", sessionID)
+				s.playChime(ctx, pcm, event, sessionID)
 				cancel()
 				s.mu.Lock()
 				defer s.mu.Unlock()
@@ -1434,12 +1492,15 @@ func (s *Supervisor) endLocked(ex *exchange, cut bool, reason string) {
 	if dropped := s.cfg.Tap.Dropped() - ex.dropsAtOpen; dropped > 0 {
 		s.logf("voice: the tap dropped %d frames of room audio the voice read too slowly", dropped)
 	}
-	if cut && ex.answer != nil {
-		if ex.spokeAt.IsZero() || time.Since(ex.spokeAt) < s.cfg.ReplayWindow {
-			ex.answer.needsInvite = true
-			s.pending = append([]*pendingAnswer{ex.answer}, s.pending...)
-		} else {
-			s.spawn(func() { s.spoken(ex.answer.TaskID) })
+	if p := ex.answer; cut && p != nil && !p.line {
+		switch {
+		case ex.spokeAt.IsZero() || time.Since(ex.spokeAt) < s.cfg.ReplayWindow:
+			p.needsInvite = true
+			s.pending = append([]*pendingAnswer{p}, s.pending...)
+		case p.hand != nil:
+			s.handDoneLocked(p, HandSpoken)
+		default:
+			s.spawn(func() { s.spoken(p.TaskID) })
 		}
 	}
 	sess := ex.session

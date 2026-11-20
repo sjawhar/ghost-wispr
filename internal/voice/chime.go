@@ -21,13 +21,16 @@ type note struct {
 
 // chimeNotes are the sounds (R10). The wake sound rises a fifth over two
 // notes (E5, B5): "I heard you". The answer sound is three notes up a major
-// triad (G5, C6, E6): "an answer is ready". The start sound is one soft high
-// note (A5): "recording". The error sound falls a fourth over two notes from
-// A4, 7 semitones under the wake sound's start: "that did not work". Sounds
-// with as many notes start at least 4 semitones apart.
+// triad (G5, C6, E6): "an answer is ready". The hand sound is two short taps
+// on one high note (C6, 8 semitones over the wake sound's start): "may I?".
+// The start sound is one soft high note (A5): "recording". The error sound
+// falls a fourth over two notes from A4, 7 semitones under the wake sound's
+// start: "that did not work". Sounds with as many notes start at least 4
+// semitones apart.
 var chimeNotes = map[string][]note{
 	"wake":   {{659.25, 90, 0.30}, {987.77, 150, 0.26}},
 	"answer": {{783.99, 80, 0.26}, {1046.50, 80, 0.26}, {1318.51, 170, 0.22}},
+	"hand":   {{1046.50, 110, 0.24}, {1046.50, 170, 0.24}},
 	"start":  {{880.00, 220, 0.26}},
 	"error":  {{440.00, 130, 0.32}, {329.63, 200, 0.32}},
 }
@@ -35,6 +38,7 @@ var chimeNotes = map[string][]note{
 var (
 	wakeChime   = sync.OnceValue(func() []byte { return renderChime(chimeNotes["wake"]) })
 	answerChime = sync.OnceValue(func() []byte { return renderChime(chimeNotes["answer"]) })
+	handChime   = sync.OnceValue(func() []byte { return renderChime(chimeNotes["hand"]) })
 	startChime  = sync.OnceValue(func() []byte { return renderChime(chimeNotes["start"]) })
 	errorChime  = sync.OnceValue(func() []byte { return renderChime(chimeNotes["error"]) })
 )
@@ -46,6 +50,10 @@ func WakeChime() []byte { return wakeChime() }
 // AnswerChime is the sound Wispr plays when a holder's answer is ready,
 // PCM16 LE in ChimeFormat. Callers must not change it.
 func AnswerChime() []byte { return answerChime() }
+
+// HandChime is the sound Wispr plays when a joined agent asks for the floor,
+// PCM16 LE in ChimeFormat. Callers must not change it.
+func HandChime() []byte { return handChime() }
 
 // StartChime is the sound Wispr plays when capture moves into recording.
 func StartChime() []byte { return startChime() }

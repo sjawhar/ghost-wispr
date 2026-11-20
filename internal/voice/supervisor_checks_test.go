@@ -159,6 +159,9 @@ func TestSoundTriggersAndPitch(t *testing.T) {
 	triggers := map[string]func(r *rig){
 		"wake":               func(r *rig) { r.heard("Wispr,", false, false) },
 		"answer":             func(r *rig) { r.concierge.answers <- PendingAnswer{TaskID: "t1", SessionID: "sess-1", Text: "x"} },
+		"hand": func(r *rig) {
+			_ = r.s.RaiseHand(Hand{ID: "h1", SessionID: "sess-1", Agent: "a1", IssueKey: "ABC-12", Name: "ABC-12", Text: "x", Expires: time.Now().Add(time.Minute)})
+		},
 		"start":              func(r *rig) { r.s.Started() },
 		"error, a red check": func(r *rig) { r.s.RedCheckFailed() },
 		"error, no voice": func(r *rig) {
@@ -181,7 +184,7 @@ func TestSoundTriggersAndPitch(t *testing.T) {
 			eventually(t, "the "+want+" sound", func() bool { return slices.Contains(r.speaker.soundsPlayed(), want) })
 		})
 	}
-	sounds := map[string][]byte{"wake": WakeChime(), "answer": AnswerChime(), "start": StartChime(), "error": ErrorChime()}
+	sounds := map[string][]byte{"wake": WakeChime(), "answer": AnswerChime(), "hand": HandChime(), "start": StartChime(), "error": ErrorChime()}
 	for name, pcm := range sounds {
 		if d := time.Duration(len(pcm)/2) * time.Second / time.Duration(ChimeFormat.SampleRate); d > 400*time.Millisecond {
 			t.Errorf("the %s sound lasts %v, want at most 400 ms", name, d)

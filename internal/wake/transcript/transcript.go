@@ -10,6 +10,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"unicode"
 )
 
@@ -27,6 +28,7 @@ const (
 	Stop                     // stop speaking and end the exchange
 	GoAhead                  // speak the pending answer
 	NeverMind                // cancel the newest question to an agent
+	HandsUp                  // say which joined agents have a hand up
 )
 
 func (c Command) String() string {
@@ -37,6 +39,8 @@ func (c Command) String() string {
 		return "go ahead"
 	case NeverMind:
 		return "never mind"
+	case HandsUp:
+		return "hands up"
 	default:
 		return "ask"
 	}
@@ -246,8 +250,16 @@ func CommandOf(rest string) Command {
 		return GoAhead
 	case first == "nevermind", first == "never" && second == "mind", first == "forget" && second == "it":
 		return NeverMind
+	case (first == "who" || first == "who's" || first == "whos") && saysHand(words), first == "any" && (second == "hand" || second == "hands"):
+		return HandsUp
 	}
 	return Ask
+}
+
+// saysHand reports whether words hold "hand" or "hands": "who has a hand
+// up?", not "who handles the budget?".
+func saysHand(words []string) bool {
+	return slices.ContainsFunc(words, func(w string) bool { n := normalise(w); return n == "hand" || n == "hands" })
 }
 
 // IssueKeys returns the issue keys text names, in the forms people say them:
@@ -497,6 +509,79 @@ func Keyterms(phrases, issueKeys []string) []string {
 		}
 	}
 	return out
+}
+
+// Configurer is a live Deepgram socket as LiveKeyterms reaches it: Configure
+// replaces its keyterms mid-stream.
+type Configurer interface {
+	Configure(keyterms []string) error
+}
+
+// LiveKeyterms are the keyterms of the live Deepgram stream (R4): the wake
+// phrases, then the issue keys of the agents that joined the meeting, then
+// Dispatch's project keys, within Deepgram's limits (Keyterms). A dial reads
+// List. A join or a leave that changes the list sends it to the socket that
+// carries the meeting with Configure, so the stream hears an agent's key from
+// its join on, with no redial.
+type LiveKeyterms struct {
+	phrases  []string
+	projects func() []string
+
+	mu     sync.Mutex
+	joined []string
+	stream Configurer
+	sent   []string // the list stream has
+}
+
+// NewLiveKeyterms returns the live stream's keyterms for the wake phrases;
+// projects, nil for none, gives Dispatch's project keys at each read.
+func NewLiveKeyterms(phrases []string, projects func() []string) *LiveKeyterms {
+	return &LiveKeyterms{phrases: slices.Clone(phrases), projects: projects}
+}
+
+// List is the keyterms a dial sends now.
+func (k *LiveKeyterms) List() []string {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	return k.listLocked()
+}
+
+func (k *LiveKeyterms) listLocked() []string {
+	keys := slices.Clone(k.joined)
+	if k.projects != nil {
+		keys = append(keys, k.projects()...)
+	}
+	return Keyterms(k.phrases, keys)
+}
+
+// SetJoined makes keys the joined agents' issue keys, and sends the socket
+// the new list when it changed.
+func (k *LiveKeyterms) SetJoined(keys []string) {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	k.joined = slices.Clone(keys)
+	k.sendLocked()
+}
+
+// Attach makes stream, a socket dialled with the list dialed, the one that
+// carries the meeting; it is sent the list at once when a join or a leave
+// changed it since the dial. nil detaches the last one.
+func (k *LiveKeyterms) Attach(stream Configurer, dialed []string) {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	k.stream, k.sent = stream, slices.Clone(dialed)
+	k.sendLocked()
+}
+
+// sendLocked sends the stream the list when it does not have it. A send that
+// fails is not retried: the socket is closing, and the next dial reads List.
+func (k *LiveKeyterms) sendLocked() {
+	list := k.listLocked()
+	if k.stream == nil || slices.Equal(list, k.sent) {
+		return
+	}
+	k.sent = list
+	_ = k.stream.Configure(list)
 }
 
 // normalise lowercases w and strips the punctuation around it, keeping an
