@@ -62,7 +62,10 @@ func startPausedListener(ctx context.Context, cfgStore *config.Store, u pausedLi
 		return
 	}
 	if u.newDetector == nil {
-		u.newDetector = local.NewDetector
+		threads := cfg.Voice.PausedListenerThreads
+		u.newDetector = func() (*local.Detector, error) {
+			return local.NewDetectorWith(local.Options{Thresholds: local.DefaultThresholds, Threads: threads})
+		}
 	}
 	if u.openCapture == nil {
 		name := audio.CaptureDevice(cfg.MicDevice)

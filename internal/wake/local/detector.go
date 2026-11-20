@@ -39,6 +39,10 @@ type Options struct {
 	Decoys string
 	// NoStageTwo counts every stage-1 hit, with no recognizer.
 	NoStageTwo bool
+	// Threads is how many threads each stage runs on; 0 means 1. Only the
+	// control of the Pi's CPU check sets more (accept-voice.sh --step
+	// listener-cpu).
+	Threads int
 }
 
 // StopDecoys are "Wispr, stop recording" and "Ghost Wispr, stop recording" as

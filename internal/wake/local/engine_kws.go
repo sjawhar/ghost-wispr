@@ -59,14 +59,15 @@ func NewDetectorWith(o Options) (*Detector, error) {
 			"▁G HO S T ▁W H IS PER ▁START ▁RE C OR D ING :%g #%g @GHOST_WISPR_START_RECORDING\n",
 			o.Thresholds.Boost, o.Thresholds.Threshold, o.Thresholds.Boost, o.Thresholds.Threshold)
 	}
-	spot, err := newSherpaSpotter(files, lines+o.Decoys)
+	threads := max(o.Threads, 1)
+	spot, err := newSherpaSpotter(files, lines+o.Decoys, threads)
 	if err != nil {
 		return nil, err
 	}
 	if o.NoStageTwo {
 		return NewDetectorOf(spot, acceptAll{}), nil
 	}
-	verify, err := newSherpaVerifier(files)
+	verify, err := newSherpaVerifier(files, threads)
 	if err != nil {
 		spot.Close()
 		return nil, err
@@ -141,13 +142,13 @@ func (s *cStrings) free() {
 	}
 }
 
-// modelConfig fills c with the model's transducer, on the CPU, one thread.
-func (s *cStrings) modelConfig(c *C.SherpaOnnxOnlineModelConfig, m *memModel) {
+// modelConfig fills c with the model's transducer, on the CPU, on threads.
+func (s *cStrings) modelConfig(c *C.SherpaOnnxOnlineModelConfig, m *memModel, threads int) {
 	c.transducer.encoder = s.of(m.encoder)
 	c.transducer.decoder = s.of(m.decoder)
 	c.transducer.joiner = s.of(m.joiner)
 	c.tokens = s.of(m.tokens)
-	c.num_threads = 1
+	c.num_threads = C.int32_t(threads)
 	c.provider = s.of("cpu")
 }
 
@@ -156,14 +157,14 @@ type sherpaSpotter struct {
 	stream  *C.SherpaOnnxOnlineStream
 }
 
-func newSherpaSpotter(m *memModel, lines string) (*sherpaSpotter, error) {
+func newSherpaSpotter(m *memModel, lines string, threads int) (*sherpaSpotter, error) {
 	var s cStrings
 	defer s.free()
 	var c C.SherpaOnnxKeywordSpotterConfig
 	C.memset(unsafe.Pointer(&c), 0, C.sizeof_SherpaOnnxKeywordSpotterConfig)
 	c.feat_config.sample_rate = SampleRate
 	c.feat_config.feature_dim = 80
-	s.modelConfig(&c.model_config, m)
+	s.modelConfig(&c.model_config, m, threads)
 	c.max_active_paths = 4
 	c.keywords_score = 1.0
 	c.keywords_threshold = 0.25
@@ -229,14 +230,14 @@ func (s *sherpaSpotter) Close() {
 
 type sherpaVerifier struct{ recognizer *C.SherpaOnnxOnlineRecognizer }
 
-func newSherpaVerifier(m *memModel) (*sherpaVerifier, error) {
+func newSherpaVerifier(m *memModel, threads int) (*sherpaVerifier, error) {
 	var s cStrings
 	defer s.free()
 	var c C.SherpaOnnxOnlineRecognizerConfig
 	C.memset(unsafe.Pointer(&c), 0, C.sizeof_SherpaOnnxOnlineRecognizerConfig)
 	c.feat_config.sample_rate = SampleRate
 	c.feat_config.feature_dim = 80
-	s.modelConfig(&c.model_config, m)
+	s.modelConfig(&c.model_config, m, threads)
 	c.decoding_method = s.of("modified_beam_search")
 	c.max_active_paths = 4
 	recognizer := C.SherpaOnnxCreateOnlineRecognizer(&c)

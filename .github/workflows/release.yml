@@ -137,6 +137,7 @@ jobs:
           path: |
             ghost-wispr-linux-arm64
             ghost-wispr-linux-arm64.sha256
+            THIRD_PARTY_NOTICES.md
           if-no-files-found: error
 
   publish:
@@ -165,6 +166,7 @@ jobs:
           gh release create "$tag" \
             ghost-wispr-linux-arm64 \
             ghost-wispr-linux-arm64.sha256 \
+            THIRD_PARTY_NOTICES.md \
             --target "$BUILD_SHA" \
             --title "$tag" \
             --generate-notes

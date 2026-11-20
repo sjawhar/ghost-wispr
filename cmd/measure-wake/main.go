@@ -65,6 +65,7 @@ type options struct {
 	limit       float64
 	minHitRate  float64
 	minCell     int
+	each        bool
 	// detector makes each detector the run uses: newDetector, the
 	// listener's own.
 	detector func(options) (*local.Detector, error)
@@ -88,6 +89,7 @@ func run(args []string, stdout, stderr io.Writer, detector func(options) (*local
 	flags.Float64Var(&o.limit, "limit", 0.5, "false starts per hour the verdict allows, exclusive")
 	flags.Float64Var(&o.minHitRate, "min-hit-rate", 0.9, "the share of -phrases the verdict needs")
 	flags.IntVar(&o.minCell, "min-cell", 10, "the fewest clips a cell of -phrases may hold")
+	flags.BoolVar(&o.each, "each", false, "with -phrases, print each clip: whether stage 1 fired and whether the listener heard it")
 	if err := flags.Parse(args); err != nil {
 		return 2
 	}
@@ -387,10 +389,13 @@ func measurePhrases(o options, out io.Writer) (string, error) {
 				return "", err
 			}
 			d.Reset()
-			heard := false
+			heard, before := false, d.StageOneHits()
 			feed(d, slices.Concat(silence, pcm, silence), func(int) { heard = true })
 			if heard {
 				cellHits++
+			}
+			if o.each {
+				_, _ = fmt.Fprintf(out, "clip=%s/%s stage1=%d heard=%t\n", entry.Name(), filepath.Base(clip), d.StageOneHits()-before, heard)
 			}
 		}
 		total += len(clips)

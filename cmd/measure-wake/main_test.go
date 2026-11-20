@@ -172,3 +172,15 @@ func TestPhraseCellsAreCounted(t *testing.T) {
 	code, text := runTool(t, false, "-phrases", filepath.Join(root, "phrases"))
 	requireOutput(t, code, text, 1, "cell=heard clips=10 heard=10", "cell=missed clips=10 heard=0", "phrases=20 heard=10 hit_rate=0.500", "FAIL")
 }
+
+// TestEachClipIsListed fails if -each does not name every clip of -phrases
+// with whether stage 1 fired on it and whether the listener heard it: the
+// lines a person reads to see which phrases were missed, and which stage-2
+// refusals kept a near miss out.
+func TestEachClipIsListed(t *testing.T) {
+	root := t.TempDir()
+	writeWAV(t, filepath.Join(root, "phrases", "cell"), "a.wav", phraseSeconds, phraseSample)
+	writeWAV(t, filepath.Join(root, "phrases", "cell"), "b.wav", 0.5, 100)
+	code, text := runTool(t, true, "-phrases", filepath.Join(root, "phrases"), "-each", "-min-cell", "1", "-min-hit-rate", "0")
+	requireOutput(t, code, text, 0, "clip=cell/a.wav stage1=1 heard=false", "clip=cell/b.wav stage1=0 heard=false")
+}
