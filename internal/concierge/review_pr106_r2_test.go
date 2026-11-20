@@ -11,20 +11,53 @@ import (
 )
 
 // TestReview106R2HeardDoesNotSearchBareNumberWords: the read-ahead must not
-// send room words to Dispatch when the turn has a bare number and no key.
+// send a whole sentence to Dispatch when the turn has a bare number and
+// extra words: at most maxSearchTerms keywords, never the full question.
 func TestReview106R2HeardDoesNotSearchBareNumberWords(t *testing.T) {
-	r := newRig(t)
-	probe106Issue(r)
-	r.concierge.Heard(t.Context(), &r.exchange, "ask him for 4592 confidentialword")
-	r.records.mu.Lock()
-	queries := append(slices.Clone(r.records.queries), r.records.kwQueries...)
-	r.records.mu.Unlock()
+	const turn = "ask him for 4592 confidentialword"
+	t.Run("real", func(t *testing.T) {
+		r := newRig(t)
+		probe106Issue(r)
+		r.concierge.searchSettle = 0
+		r.concierge.Heard(t.Context(), &r.exchange, turn)
+		eventually(t, "the search query arrived", func() bool {
+			r.records.mu.Lock()
+			defer r.records.mu.Unlock()
+			return len(r.records.queries)+len(r.records.kwQueries) > 0
+		})
+		r.records.mu.Lock()
+		queries := append(slices.Clone(r.records.queries), r.records.kwQueries...)
+		r.records.mu.Unlock()
+		assertKeywordContract(t, queries, turn)
+	})
+	t.Run("planted_break", func(t *testing.T) {
+		ft := &fakeT{}
+		assertKeywordContract(ft, []string{turn}, turn)
+		if !ft.failed {
+			t.Fatal("the planted break was not caught: the test cannot detect a whole-sentence query")
+		}
+	})
+}
+
+func assertKeywordContract(t interface {
+	Helper()
+	Errorf(string, ...any)
+}, queries []string, turn string) {
 	for _, query := range queries {
-		if strings.Contains(query, "confidentialword") {
-			t.Fatalf("Heard sent room words to Dispatch: %q", queries)
+		words := strings.Fields(query)
+		if len(words) > maxSearchTerms {
+			t.Errorf("query has %d words (max %d): %q", len(words), maxSearchTerms, query)
+		}
+		if query == turn {
+			t.Errorf("the whole sentence was sent as the query: %q", query)
 		}
 	}
 }
+
+type fakeT struct{ failed bool }
+
+func (f *fakeT) Helper()               {}
+func (f *fakeT) Errorf(string, ...any) { f.failed = true }
 
 // TestReview106R2DescriptionWithoutIssueAbout: "what is happening with
 // realtime voice in room 4592?" has no "the issue about" phrasing but names
