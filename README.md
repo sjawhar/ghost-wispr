@@ -34,7 +34,7 @@ Microphone → Deepgram WebSocket → Session Manager → SQLite
 - `internal/server/` — HTTP API, WebSocket event hub, SPA serving
 - `internal/summary/` — OpenAI summarization
 - `internal/gdrive/` — Google Drive sync (optional)
-- `internal/voice/` — the meeting voice: the Supervisor, the room-audio tap, the chimes; `internal/voice/tts/` is voice A
+- `internal/voice/` — the meeting voice: the Supervisor, the room-audio tap, the chimes; `internal/voice/tts/` is voice A, `internal/voice/gptlive/` voice B, `internal/voice/dgagent/` voice C
 - `internal/wake/transcript/` — the wake phrase on the live transcript
 - `internal/concierge/`, `internal/dispatch/`, `internal/envoy/` — the Concierge, its Dispatch client and the unit's Envoy session
 
@@ -320,7 +320,8 @@ What the voice hears, and where the room's words go:
 | Setting | Default | Description |
 |---------|---------|-------------|
 | `voice.enabled` (`GHOST_WISPR_VOICE_ENABLED`) | `false` | Turn the meeting voice on; it needs `speaker_enabled` |
-| `voice.engine` | `tts` | The voice: `tts` (voice A, our own streaming speech). `gptlive` and `dgagent` are not in this build |
+| `voice.engine` | `tts` | The voice: `tts` (voice A, our own streaming speech), `gptlive` (voice B, OpenAI's GPT-Live) or `dgagent` (voice C, Deepgram's Voice Agent with the Deepgram key: it hears the room, keeps the turn and speaks the Concierge's answers word for word) |
+| `voice.dgagent.think_model` | Deepgram's `phonellm-mini-alpha-2-fp8` | Voice C: the model, as provider/model, that Deepgram runs to keep the turn, such as `google/gemini-3.1-flash-lite`; `open_ai/gpt-4.1-mini` stands behind it if it fails. `deepgram/think-fast` is refused: it needs Deepgram's model training, which voice C opts out of |
 | `voice.wake_phrases` | `[Wispr, Ghost Wispr]` | The phrases that call Wispr; the live Deepgram request carries them, and Dispatch's project keys, as Nova-3 keyterms |
 | `voice.tts_engine` | `gemini` | Voice A's engine: `gemini` (Vertex AI, `gcp_project`) or `aura` (the Deepgram key) |
 | `voice.tts_model`, `voice.tts_voice` | the engine's | Gemini: `gemini-3.8-flash-tts`, `Kore`; Aura: the voice `aura-2-harmonia-en` |

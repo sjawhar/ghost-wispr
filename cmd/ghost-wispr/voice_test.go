@@ -3,12 +3,14 @@ package main
 import (
 	"context"
 	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/sjawhar/ghost-wispr/internal/config"
 	"github.com/sjawhar/ghost-wispr/internal/voice"
+	"github.com/sjawhar/ghost-wispr/internal/wake/transcript"
 )
 
 // TestTheVoiceLinkIsInertUntilTheVoiceStarts fails if a gate closing, a
@@ -36,6 +38,28 @@ func (stubConcierge) Answer(context.Context, *voice.Exchange, string, voice.SayF
 func (c stubConcierge) Answers() <-chan voice.PendingAnswer   { return c.answers }
 func (stubConcierge) Spoken(context.Context, string) error    { return nil }
 func (stubConcierge) NeverMind(context.Context, string) error { return nil }
+
+// TestVoiceCTakesTheKeyTheWakePhrasesAndTheThinkModel fails if voice C is
+// not built with the unit's Deepgram key, the wake phrases as Flux keyterms,
+// so Deepgram hears the name the room calls it by, and the think model
+// voice.dgagent.think_model names.
+func TestVoiceCTakesTheKeyTheWakePhrasesAndTheThinkModel(t *testing.T) {
+	key := strings.Repeat("k", 8)
+	cfg := &config.Config{DeepgramAPIKey: key, Voice: config.Voice{
+		Enabled: true, Engine: config.VoiceEngineDGAgent, WakePhrases: []string{"Wispr", "Ghost Wispr"},
+		DGAgent: config.DGAgent{ThinkModel: "google/gemini-3.1-flash-lite"},
+	}}
+	c := voiceCConfig(cfg)
+	if c.APIKey != key {
+		t.Errorf("voice C's key = %q, want the unit's Deepgram key", c.APIKey)
+	}
+	if want := transcript.Keyterms(cfg.Voice.WakePhrases, nil); !slices.Equal(c.Keyterms, want) {
+		t.Errorf("voice C's keyterms = %q, want the wake phrases %q", c.Keyterms, want)
+	}
+	if c.ThinkModel != "google/gemini-3.1-flash-lite" {
+		t.Errorf("voice C's think model = %q, want voice.dgagent.think_model's", c.ThinkModel)
+	}
+}
 
 // TestKeytermsOnlyForNova3 fails if keyterms go to a Deepgram model that does
 // not take them.

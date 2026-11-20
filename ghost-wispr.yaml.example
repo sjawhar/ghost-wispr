@@ -69,13 +69,13 @@ summarization:
 # envoy_hub_url: http://hub.example.ts.net:9020
 
 # The meeting voice (README "Meeting voice"), off unless enabled. "Wispr, ..." at the start of a
-# sentence asks the Concierge about the work in Dispatch, and voice A speaks the answer through the
-# speaker (speaker_enabled). The voice hears the room only while the light reads red.
+# sentence asks the Concierge about the work in Dispatch, and the voice speaks the answer through
+# the speaker (speaker_enabled). The voice hears the room only while the light reads red.
 # voice:
 #   enabled: false
-#   engine: tts                       # tts (voice A) or gptlive (voice B); dgagent is not in this build
+#   engine: tts                       # tts (voice A), gptlive (voice B) or dgagent (voice C)
 #   wake_phrases: [Wispr, Ghost Wispr]
-#   tts_engine: gemini                # gemini (Vertex AI, gcp_project) or aura (the Deepgram key)
+#   tts_engine: gemini                # voice A: gemini (Vertex AI, gcp_project) or aura (the Deepgram key)
 #   tts_model: gemini-3.8-flash-tts
 #   tts_voice: Kore                   # aura: an Aura-2 voice such as aura-2-harmonia-en
 #   tts_location: us
@@ -83,6 +83,8 @@ summarization:
 #   gptlive:                          # voice B: the OpenAI workload identity ids, not secrets
 #     openai_identity_provider_id: idp_example
 #     openai_service_account_id: user-example
+#   dgagent:
+#     think_model: ""                 # voice C: provider/model that keeps the turn; "" is Deepgram's own
 # The Concierge: its Gemini model on the genai settings above, Dispatch with the unit's own token
 # (GHOST_WISPR_DISPATCH_TOKEN), and the Envoy listener that relays its questions to an issue's agent.
 # concierge:
