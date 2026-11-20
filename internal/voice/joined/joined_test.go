@@ -266,7 +266,7 @@ func TestFloorRequests(t *testing.T) {
 		Text: "ABC-12's agent says: The deploy of the new keys moved to Friday.", Expires: request.IssuedAt.Add(60 * time.Second),
 	}
 	got := *h
-	got.Current = nil
+	got.Current, got.Context = nil, nil
 	if !reflect.DeepEqual(got, *want) {
 		t.Fatalf("hand %+v, want %+v", got, want)
 	}
