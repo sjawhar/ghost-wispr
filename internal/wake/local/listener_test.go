@@ -21,24 +21,37 @@ import (
 const testWait = 5 * time.Second
 
 // fakeCapture is the microphone stream: each Read returns the next buffer a
-// test sends on reads, or blocks until Close.
+// test sends on reads, or a buffer of silence once a period passes. A
+// blocking capture never returns silence, and tells entered each time a Read
+// begins, so a test can change the unit's state while a read is under way.
 type fakeCapture struct {
-	reads  chan []int16
-	closed chan struct{}
-	once   sync.Once
+	reads    chan []int16
+	closed   chan struct{}
+	once     sync.Once
+	blocking bool
+	entered  chan struct{}
 }
 
-func newFakeCapture() *fakeCapture {
-	return &fakeCapture{reads: make(chan []int16), closed: make(chan struct{})}
+func newFakeCapture(blocking bool) *fakeCapture {
+	return &fakeCapture{reads: make(chan []int16), closed: make(chan struct{}), blocking: blocking, entered: make(chan struct{}, 1)}
 }
 
 func (c *fakeCapture) Read(pcm []int16) (int, error) {
+	var period <-chan time.Time
+	if c.blocking {
+		select {
+		case c.entered <- struct{}{}:
+		default:
+		}
+	} else {
+		period = time.After(20 * time.Millisecond)
+	}
 	select {
 	case buf := <-c.reads:
 		return copy(pcm, buf), nil
 	case <-c.closed:
 		return 0, errors.New("capture closed")
-	case <-time.After(20 * time.Millisecond):
+	case <-period:
 		return copy(pcm, make([]int16, len(pcm))), nil // a buffer of silence, as a period passes
 	}
 }
@@ -74,6 +87,8 @@ type listenerRig struct {
 	listener *Listener
 	// atHeard, when set by a setup, runs inside the listener's resume request.
 	atHeard func()
+	// blocking, when set by a setup, makes the captures blocking ones.
+	blocking bool
 }
 
 func startListenerRig(t *testing.T, hits []int, setup ...func(*listenerRig)) *listenerRig {
@@ -98,7 +113,7 @@ func startListenerRig(t *testing.T, hits []int, setup ...func(*listenerRig)) *li
 			if !r.want.Load() || r.stretch.Load() != stretch {
 				return nil, ErrNotNow
 			}
-			c := newFakeCapture()
+			c := newFakeCapture(r.blocking)
 			r.opens <- c
 			return c, nil
 		},
@@ -141,11 +156,20 @@ func startListenerRig(t *testing.T, hits []int, setup ...func(*listenerRig)) *li
 // one in the current stretch (review of #123).
 func TestAHitCarriesTheStretchItWasCapturedIn(t *testing.T) {
 	t.Run("a phrase", func(t *testing.T) {
-		r := startListenerRig(t, []int{SampleRate / 10}, func(r *listenerRig) { r.stretch.Store(7) })
+		r := startListenerRig(t, []int{SampleRate / 10}, func(r *listenerRig) { r.stretch.Store(7); r.blocking = true })
 		r.want.Store(true)
 		c := r.opened(t)
+		select {
+		case <-c.entered:
+		case <-time.After(testWait):
+			t.Fatal("control: the listener did not begin a read")
+		}
 		r.stretch.Store(8) // a new stretch while the read below is under way
-		c.reads <- samplesOf(1, SampleRate/10)
+		select {
+		case c.reads <- samplesOf(1, SampleRate/10):
+		case <-time.After(testWait):
+			t.Fatal("the listener's read under way did not take its buffer")
+		}
 		select {
 		case got := <-r.heardIn:
 			if got != 7 {
