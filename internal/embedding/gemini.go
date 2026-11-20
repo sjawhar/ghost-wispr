@@ -8,6 +8,7 @@ import (
 	"google.golang.org/genai"
 
 	"github.com/sjawhar/ghost-wispr/internal/genaiconfig"
+	"github.com/sjawhar/ghost-wispr/internal/providererr"
 )
 
 type geminiClient struct {
@@ -55,7 +56,7 @@ func (c *geminiClient) Embed(ctx context.Context, texts []string, taskType TaskT
 		content := genai.NewContentFromText(text, genai.RoleUser)
 		resp, err := c.client.Models.EmbedContent(ctx, c.model, []*genai.Content{content}, config)
 		if err != nil {
-			return nil, fmt.Errorf("gemini embedding: %w", err)
+			return nil, fmt.Errorf("gemini embedding: %w", providererr.From("gemini", err))
 		}
 		if len(resp.Embeddings) == 0 {
 			return nil, fmt.Errorf("gemini: no embedding in response")

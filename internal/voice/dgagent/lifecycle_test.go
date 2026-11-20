@@ -5,11 +5,15 @@ package dgagent
 // and failed on it.
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -590,18 +594,72 @@ func TestCloseIsQuickWhenNobodyReadsEvents(t *testing.T) {
 
 // TestLatencyReportsLogOnlyNumbers fails if a latency report is logged as
 // Deepgram sent it, so a field Deepgram adds with words in it would be
-// logged too.
+// logged too, in its value or its name: only the figures Deepgram documents
+// (latencyFields) are logged, each under its own name.
 func TestLatencyReportsLogOnlyNumbers(t *testing.T) {
 	s := startStandIn(t)
 	var logs lockedBuf
 	logger := slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	sess, c, _ := open(t, s, Config{Logger: logger}, voice.Exchange{Out: newFakeOutput(), Tools: tools(nil)})
-	c.send(map[string]any{"type": "LatencyReport", "total_latency": 0.5, "note": "ROOM-WORDS"})
+	documented := map[string]any{
+		"ttt_token_latency": 0.34, "ttt_text_latency": 0.36, "ttt_tool_latency": 0.41,
+		"ttt_thinking_latency": 0.29, "tts_latency": 0.18, "total_latency": 0.64,
+	}
+	report := map[string]any{
+		"type": "LatencyReport", "note": "ROOM-WORDS", "the room said quokkaplantedroomword": 7,
+		"quokkaplantedroomword": 3, "quokkaplantedroomword_latency": 7,
+	}
+	for name, value := range documented {
+		report[name] = value
+	}
+	c.send(report)
 	c.send(map[string]any{"type": "ConversationText", "role": "user", "content": "after"})
 	waitEvent(t, sess, voice.EventUserTurn)
 	_ = sess.Close()
-	if got := logs.String(); !strings.Contains(got, "total_latency=0.5") || strings.Contains(got, "ROOM-WORDS") {
-		t.Fatalf("the latency log = %s, want total_latency=0.5 and no text fields", got)
+	got := logs.String()
+	if strings.Contains(got, "ROOM-WORDS") || strings.Contains(got, "quokkaplantedroomword") {
+		t.Fatalf("the latency log = %s, want only the documented figures", got)
+	}
+	for name, value := range documented {
+		if !strings.Contains(got, fmt.Sprintf("%s=%v", name, value)) {
+			t.Errorf("the latency log = %s, want %s=%v", got, name, value)
+		}
+	}
+}
+
+// TestALatencyFieldDeepgramDoesNotDocumentIsNotLogged fails if a field named
+// like a latency, but not one Deepgram documents, reaches the log record:
+// its name is Deepgram's text, and a room word can stand before "_latency".
+func TestALatencyFieldDeepgramDoesNotDocumentIsNotLogged(t *testing.T) {
+	const planted = "quokkaplantedroomword"
+	var logs lockedBuf
+	srv := startStandIn(t)
+	sess, c, _ := open(t, srv, Config{Logger: slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))}, voice.Exchange{Out: newFakeOutput(), Tools: tools(nil)})
+	c.send(map[string]any{"type": "LatencyReport", "total_latency": 0.5, planted + "_latency": 7})
+	c.send(map[string]any{"type": "Error", "code": "CODE-0001"})
+	for seen := false; !seen; {
+		select {
+		case event := <-sess.Events():
+			seen = event.Kind == voice.EventErr
+		case <-time.After(3 * time.Second):
+			t.Fatal("no error event to wait for the latency record by")
+		}
+	}
+	found := false
+	for line := range strings.Lines(logs.String()) {
+		if !strings.Contains(line, `"msg":"Voice Agent latency"`) {
+			continue
+		}
+		found = true
+		if !strings.Contains(line, `"total_latency":0.5`) {
+			t.Fatalf("the latency record lost the documented figure, so the check read nothing of it: %s", line)
+		}
+		if strings.Contains(line, planted) {
+			t.Errorf("the latency record holds a field Deepgram does not document: %s", line)
+		}
+	}
+	if !found {
+		t.Fatalf("no latency record: %s", logs.String())
 	}
 }
 
@@ -773,5 +831,145 @@ func TestAHandshakeRefusalKeepsNoCloseText(t *testing.T) {
 	var closeErr *websocket.CloseError
 	if !errors.As(err, &closeErr) || closeErr.Code != websocket.ClosePolicyViolation {
 		t.Errorf("Open = %v, want it to keep the close code", err)
+	}
+}
+
+// TestARefusalKeepsNoDeepgramText fails if Open's error carries text
+// Deepgram sent: a refused handshake's reason phrase, an answer net/http
+// could not read, or an Error message's code that is no plain token. The
+// error reaches the voice's log.
+func TestARefusalKeepsNoDeepgramText(t *testing.T) {
+	const planted = "quokkaplantedroomword"
+	for name, answer := range map[string]string{
+		"reason phrase":    "HTTP/1.1 400 Rejected " + planted + "\r\nContent-Length: 0\r\n\r\n",
+		"malformed answer": "HTTP/1.1 " + planted + "400 Bad\r\n\r\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			agent, err := New(&Config{APIKey: "k", URL: "ws://" + rawAnswerServer(t, answer)})
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = agent.Open(context.Background(), &voice.Exchange{Out: newFakeOutput(), Tools: tools(nil)})
+			if err == nil || strings.Contains(err.Error(), planted) {
+				t.Fatalf("Open = %v, want a failure that quotes nothing Deepgram sent", err)
+			}
+			if name == "reason phrase" && !strings.Contains(err.Error(), "HTTP 400") {
+				t.Errorf("Open = %v, want it to name HTTP 400", err)
+			}
+		})
+	}
+	t.Run("error code", func(t *testing.T) {
+		s := startStandIn(t)
+		agent, err := New(&Config{APIKey: "k", URL: s.url})
+		if err != nil {
+			t.Fatal(err)
+		}
+		done := make(chan error, 1)
+		go func() {
+			_, err := agent.Open(context.Background(), &voice.Exchange{Out: newFakeOutput(), Tools: tools(nil)})
+			done <- err
+		}()
+		c := s.accept(t)
+		c.expect(t, "Settings")
+		c.send(map[string]any{"type": "Error", "code": "bad " + planted, "description": "Rejected " + planted})
+		if err := <-done; err == nil || strings.Contains(err.Error(), planted) {
+			t.Fatalf("Open = %v, want a failure that quotes nothing Deepgram sent", err)
+		}
+	})
+}
+
+// rawAnswerServer answers every connection's request with answer, then
+// closes it, and returns its address.
+func rawAnswerServer(t *testing.T, answer string) string {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer func() { _ = conn.Close() }()
+				_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+				reader := bufio.NewReader(conn)
+				for {
+					line, err := reader.ReadString('\n')
+					if err != nil || line == "\r\n" {
+						break
+					}
+				}
+				_, _ = io.WriteString(conn, answer)
+			}()
+		}
+	}()
+	return listener.Addr().String()
+}
+
+// TestDeepgramsMessagesPutNoTextInTheLog fails if a log record holds text a
+// Deepgram message carried: a Warning's or an Error's code that is no plain
+// token, or a function call's name or id. Deepgram's text can quote what the
+// session sent; a record keeps a code, a name or an id only when it is one
+// plain word.
+func TestDeepgramsMessagesPutNoTextInTheLog(t *testing.T) {
+	const planted = "quokkaplantedroomword"
+	var logs lockedBuf
+	srv := startStandIn(t)
+	sess, c, _ := open(t, srv, Config{Logger: slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))}, voice.Exchange{Out: newFakeOutput(), Tools: tools(nil)})
+	for _, kind := range []string{"Warning", "Error"} {
+		c.send(map[string]any{"type": kind, "code": "bad " + planted, "description": "Rejected " + planted})
+	}
+	for seen := false; !seen; {
+		select {
+		case event := <-sess.Events():
+			if event.Kind == voice.EventErr {
+				seen = true
+				if strings.Contains(event.Err.Error(), planted) {
+					t.Errorf("the error event holds Deepgram's text: %v", event.Err)
+				}
+			}
+		case <-time.After(3 * time.Second):
+			t.Fatal("no error event for Deepgram's Error message")
+		}
+	}
+	c.send(map[string]any{"type": "FunctionCallRequest", "functions": []any{map[string]any{"id": "call " + planted, "name": "unknown " + planted, "arguments": "{}", "client_side": true}}})
+	c.expect(t, "FunctionCallResponse")
+	c.send(map[string]any{"type": "Warning", "code": "INJECT_AGENT_MESSAGE_DURING_USER_SPEECH", "description": "Rejected " + planted})
+
+	want := []string{"Voice Agent warning", "Voice Agent error", "Deepgram called a function voice C does not declare"}
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		found := map[string]bool{}
+		plainCode := false
+		for line := range strings.Lines(logs.String()) {
+			var record struct {
+				Msg string `json:"msg"`
+			}
+			if err := json.Unmarshal([]byte(line), &record); err != nil {
+				t.Fatalf("a log line is not a JSON record: %s", line)
+			}
+			found[record.Msg] = true
+			if strings.Contains(line, planted) {
+				t.Fatalf("record %q holds Deepgram's text: %s", record.Msg, line)
+			}
+			plainCode = plainCode || strings.Contains(line, `"code":"INJECT_AGENT_MESSAGE_DURING_USER_SPEECH"`)
+		}
+		missing := ""
+		for _, message := range want {
+			if !found[message] {
+				missing = message
+			}
+		}
+		if missing == "" && plainCode {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the log holds no record %q, or no plain code (%v), so the check read nothing of it", missing, plainCode)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }

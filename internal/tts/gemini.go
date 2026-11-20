@@ -17,7 +17,7 @@ import (
 
 	"github.com/sjawhar/ghost-wispr/internal/audio"
 	"github.com/sjawhar/ghost-wispr/internal/llm"
-	"github.com/sjawhar/ghost-wispr/internal/spokentext"
+	"github.com/sjawhar/ghost-wispr/internal/providererr"
 )
 
 const (
@@ -145,8 +145,14 @@ type geminiTTSInlineData struct {
 type geminiTTSErrorResponse struct {
 	Error struct {
 		Message string `json:"message"`
+		Status  string `json:"status"`
 	} `json:"error"`
 }
+
+// geminiUnknownModel is the model kept for an answer whose modelVersion is no
+// plain token (providererr.Token): the answer's text can be anything, and the
+// model reaches the log and the request's status.
+const geminiUnknownModel = "unknown"
 
 func (p *GeminiProvider) Synthesize(ctx context.Context, req SpeechRequest) (*SpeechResponse, error) {
 	if err := validateText(req.Text, p.maxTextLen); err != nil {
@@ -182,27 +188,27 @@ func (p *GeminiProvider) Synthesize(ctx context.Context, req SpeechRequest) (*Sp
 		return nil, fmt.Errorf("gemini tts: create request: %w", err)
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
+	// Errors keep the provider's status and code, never its message
+	// (providererr): the message can quote the text to speak.
 	token, err := p.authCredentials.Token(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("gemini tts: get token: %w", err)
+		return nil, fmt.Errorf("gemini tts: get token: %w", providererr.From("google", err))
 	}
 	httpReq.Header.Set("Authorization", "Bearer "+token.Value)
 
 	httpResp, err := p.httpClient.Do(httpReq)
 	if err != nil {
-		return nil, fmt.Errorf("gemini tts: http request: %w", err)
+		return nil, fmt.Errorf("gemini tts: http request: %w", providererr.From("gemini", err))
 	}
 	defer func() { _ = httpResp.Body.Close() }()
 	responseBody, err := io.ReadAll(httpResp.Body)
 	if err != nil {
-		return nil, fmt.Errorf("gemini tts: read response body: %w", err)
+		return nil, fmt.Errorf("gemini tts: read response body: %w", providererr.From("gemini", err))
 	}
 	if httpResp.StatusCode != http.StatusOK {
 		var apiErr geminiTTSErrorResponse
-		if json.Unmarshal(responseBody, &apiErr) == nil && apiErr.Error.Message != "" {
-			return nil, fmt.Errorf("gemini tts: api error (status %d): %s", httpResp.StatusCode, spokentext.Withhold(apiErr.Error.Message, req.Text))
-		}
-		return nil, fmt.Errorf("gemini tts: api error (status %d): %s", httpResp.StatusCode, spokentext.Withhold(string(responseBody), req.Text))
+		_ = json.Unmarshal(responseBody, &apiErr)
+		return nil, fmt.Errorf("gemini tts: api error: %w", providererr.New("gemini", httpResp.StatusCode, apiErr.Error.Status, apiErr.Error.Message+" "+string(responseBody)))
 	}
 
 	var ttsResponse geminiTTSResponse
@@ -210,8 +216,11 @@ func (p *GeminiProvider) Synthesize(ctx context.Context, req SpeechRequest) (*Sp
 		return nil, fmt.Errorf("gemini tts: unmarshal response: %w", err)
 	}
 	model := strings.TrimSpace(ttsResponse.ModelVersion)
-	if model == "" {
+	switch {
+	case model == "":
 		model = llm.ModelNotReportedByProvider
+	case providererr.Token(model) == "":
+		model = geminiUnknownModel
 	}
 	for _, candidate := range ttsResponse.Candidates {
 		for _, part := range candidate.Content.Parts {

@@ -10,6 +10,7 @@ import (
 	"google.golang.org/genai"
 
 	"github.com/sjawhar/ghost-wispr/internal/genaiconfig"
+	"github.com/sjawhar/ghost-wispr/internal/providererr"
 )
 
 type geminiClient struct {
@@ -77,7 +78,7 @@ func (c *geminiClient) Complete(ctx context.Context, messages []Message) (string
 	config := &genai.GenerateContentConfig{SystemInstruction: systemInstruction}
 	result, err := c.client.Models.GenerateContent(ctx, c.model, contents, config)
 	if err != nil {
-		return "", fmt.Errorf("gemini completion: %w", err)
+		return "", fmt.Errorf("gemini completion: %w", providererr.From("gemini", err))
 	}
 
 	text := strings.TrimSpace(result.Text())
@@ -109,7 +110,7 @@ func (c *geminiClient) CompleteJSON(ctx context.Context, messages []Message, sch
 	}
 	result, err := c.client.Models.GenerateContent(ctx, c.model, contents, config)
 	if err != nil {
-		return nil, fmt.Errorf("gemini json completion: %w", err)
+		return nil, fmt.Errorf("gemini json completion: %w", providererr.From("gemini", err))
 	}
 
 	text := strings.TrimSpace(result.Text())

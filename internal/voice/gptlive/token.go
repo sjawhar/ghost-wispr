@@ -2,6 +2,7 @@ package gptlive
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -12,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/sjawhar/ghost-wispr/internal/providererr"
 	"github.com/sjawhar/ghost-wispr/internal/spokentext"
 )
 
@@ -167,12 +169,12 @@ func (s *TokenSource) exchange(ctx context.Context, now time.Time) (string, time
 	req.Header.Set("Accept", "application/json")
 	resp, err := s.cfg.Client.Do(req)
 	if err != nil {
-		return "", time.Time{}, fmt.Errorf("openai token: exchange: %w", err)
+		return "", time.Time{}, fmt.Errorf("openai token: exchange: %w", providererr.From("openai", err))
 	}
 	defer func() { _ = resp.Body.Close() }()
 	data, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
-		return "", time.Time{}, fmt.Errorf("openai token: read exchange answer: %w", err)
+		return "", time.Time{}, fmt.Errorf("openai token: read exchange answer: %w", providererr.From("openai", err))
 	}
 	if resp.StatusCode != http.StatusOK {
 		return "", time.Time{}, fmt.Errorf("openai token: exchange refused: HTTP %d: %s", resp.StatusCode, exchangeErrorCode(data, subject))
@@ -185,7 +187,8 @@ func (s *TokenSource) exchange(ctx context.Context, now time.Time) (string, time
 		return "", time.Time{}, errors.New("openai token: exchange answer has no access_token")
 	}
 	if answer.TokenType != "" && !strings.EqualFold(answer.TokenType, "bearer") {
-		return "", time.Time{}, fmt.Errorf("openai token: exchange answer has token_type %q, want Bearer", answer.TokenType)
+		// The type OpenAI returned is its text: the error names what it wants.
+		return "", time.Time{}, errors.New("openai token: exchange answer's token_type is not Bearer")
 	}
 	// expires_at is the token's exp claim, and expires_in counts from its
 	// issue; they should agree, and where they do not the earlier holds.
@@ -221,17 +224,11 @@ func exchangeErrorCode(data []byte, subject string) string {
 	}
 	if json.Unmarshal(body.Error, &apiErr) == nil {
 		_ = spokentext.Withhold(apiErr.Message, subject)
-		if apiErr.Code != "" {
-			return apiErr.Code
-		}
-		if apiErr.Type != "" {
-			return apiErr.Type
-		}
-		return "server_refusal"
+		return cmp.Or(providererr.Token(apiErr.Code), providererr.Token(apiErr.Type), "server_refusal")
 	}
 	var oauthCode string
-	if json.Unmarshal(body.Error, &oauthCode) == nil && oauthCode != "" {
-		return oauthCode
+	if json.Unmarshal(body.Error, &oauthCode) == nil {
+		return cmp.Or(providererr.Token(oauthCode), "server_refusal")
 	}
 	return "server_refusal"
 }

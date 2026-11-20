@@ -15,7 +15,7 @@ import (
 	"cloud.google.com/go/auth"
 
 	"github.com/sjawhar/ghost-wispr/internal/audio"
-	"github.com/sjawhar/ghost-wispr/internal/spokentext"
+	"github.com/sjawhar/ghost-wispr/internal/providererr"
 )
 
 const (
@@ -162,7 +162,7 @@ func (p *GoogleProvider) Synthesize(ctx context.Context, req SpeechRequest) (*Sp
 
 	url := fmt.Sprintf("%s/v1/text:synthesize", p.baseURL)
 
-	respBody, err := p.doWithRetry(ctx, url, bodyJSON, req.Text)
+	respBody, err := p.doWithRetry(ctx, url, bodyJSON)
 	if err != nil {
 		return nil, err
 	}
@@ -192,9 +192,10 @@ func (p *GoogleProvider) Synthesize(ctx context.Context, req SpeechRequest) (*Sp
 	}, nil
 }
 
-// doWithRetry executes the HTTP request, retrying once on 429. text is what
-// it asks to speak, which an error leaves out (spokentext.Withhold).
-func (p *GoogleProvider) doWithRetry(ctx context.Context, url string, bodyJSON []byte, text string) ([]byte, error) {
+// doWithRetry executes the HTTP request, retrying once on 429. Its errors
+// keep Google's status and code, never its message (providererr): the
+// message can quote the text it was asked to speak.
+func (p *GoogleProvider) doWithRetry(ctx context.Context, url string, bodyJSON []byte) ([]byte, error) {
 	const maxAttempts = 2
 
 	for attempt := range maxAttempts {
@@ -206,7 +207,7 @@ func (p *GoogleProvider) doWithRetry(ctx context.Context, url string, bodyJSON [
 		if p.apiKey == "" {
 			token, err := p.authCredentials.Token(ctx)
 			if err != nil {
-				return nil, fmt.Errorf("google tts: get token: %w", err)
+				return nil, fmt.Errorf("google tts: get token: %w", providererr.From("google", err))
 			}
 			httpReq.Header.Set("Authorization", "Bearer "+token.Value)
 		} else {
@@ -215,7 +216,7 @@ func (p *GoogleProvider) doWithRetry(ctx context.Context, url string, bodyJSON [
 
 		resp, err := p.httpClient.Do(httpReq)
 		if err != nil {
-			return nil, fmt.Errorf("google tts: http request: %w", err)
+			return nil, fmt.Errorf("google tts: http request: %w", providererr.From("google", err))
 		}
 
 		if resp.StatusCode == http.StatusTooManyRequests && attempt < maxAttempts-1 {
@@ -230,7 +231,7 @@ func (p *GoogleProvider) doWithRetry(ctx context.Context, url string, bodyJSON [
 		}
 
 		// Successful response or non-retryable error
-		result, err := p.processResponse(resp, text)
+		result, err := p.processResponse(resp)
 		_ = resp.Body.Close()
 		if err != nil {
 			return nil, err
@@ -242,18 +243,16 @@ func (p *GoogleProvider) doWithRetry(ctx context.Context, url string, bodyJSON [
 	return nil, fmt.Errorf("google tts: exhausted retries")
 }
 
-func (p *GoogleProvider) processResponse(resp *http.Response, text string) ([]byte, error) {
+func (p *GoogleProvider) processResponse(resp *http.Response) ([]byte, error) {
 	respBodyBytes, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, fmt.Errorf("google tts: read response body: %w", err)
+		return nil, fmt.Errorf("google tts: read response body: %w", providererr.From("google", err))
 	}
 
 	if resp.StatusCode != http.StatusOK {
 		var apiErr googleTTSErrorResponse
-		if json.Unmarshal(respBodyBytes, &apiErr) == nil && apiErr.Error.Message != "" {
-			return nil, fmt.Errorf("google tts: api error (status %d): %s", resp.StatusCode, spokentext.Withhold(apiErr.Error.Message, text))
-		}
-		return nil, fmt.Errorf("google tts: api error (status %d): %s", resp.StatusCode, spokentext.Withhold(string(respBodyBytes), text))
+		_ = json.Unmarshal(respBodyBytes, &apiErr)
+		return nil, fmt.Errorf("google tts: api error: %w", providererr.New("google", resp.StatusCode, apiErr.Error.Status, apiErr.Error.Message+" "+string(respBodyBytes)))
 	}
 
 	return respBodyBytes, nil

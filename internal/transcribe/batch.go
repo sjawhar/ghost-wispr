@@ -12,6 +12,8 @@ import (
 	"path"
 	"slices"
 	"strings"
+
+	"github.com/sjawhar/ghost-wispr/internal/providererr"
 )
 
 type deepgramModelInfo struct {
@@ -138,16 +140,16 @@ func (d *deepgramBatchTranscriber) transcribe(ctx context.Context, audioPath str
 
 	resp, err := d.httpClient.Do(req)
 	if err != nil {
-		return batchTranscriptionResult{}, fmt.Errorf("call deepgram batch api: %w", err)
+		return batchTranscriptionResult{}, fmt.Errorf("call deepgram batch api: %w", providererr.From("deepgram", err))
 	}
 	defer func() { _ = resp.Body.Close() }()
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return batchTranscriptionResult{}, fmt.Errorf("read deepgram response body: %w", err)
+		return batchTranscriptionResult{}, fmt.Errorf("read deepgram response body: %w", providererr.From("deepgram", err))
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return batchTranscriptionResult{}, fmt.Errorf("deepgram batch api status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+		return batchTranscriptionResult{}, fmt.Errorf("deepgram batch api: %w", providererr.Reduce("deepgram", resp.StatusCode, body, "err_code"))
 	}
 
 	var decoded struct {
@@ -180,29 +182,36 @@ func (d *deepgramBatchTranscriber) transcribe(ctx context.Context, audioPath str
 	}, nil
 }
 
+// deepgramResponseModel is the one transcription model a Deepgram answer
+// reports. Its errors name none of Deepgram's strings, and a model whose name
+// is no plain token (providererr.Token) is refused: the name goes into
+// errors and status warnings about a refinement's model.
 func deepgramResponseModel(models []string, modelInfo map[string]deepgramModelInfo) (string, error) {
 	if len(models) == 0 {
 		return "", fmt.Errorf("deepgram response missing metadata.models")
 	}
 	names := make([]string, 0, len(models))
-	for _, id := range models {
+	for i, id := range models {
 		info, ok := modelInfo[id]
 		if !ok {
-			return "", fmt.Errorf("deepgram response metadata.models references unknown model %q", id)
+			return "", fmt.Errorf("deepgram response metadata.models[%d] names no model in metadata.model_info", i)
 		}
 		name := strings.TrimSpace(info.Arch)
 		if name == "" {
 			name = strings.TrimSpace(info.Name)
 		}
 		if name == "" {
-			return "", fmt.Errorf("deepgram response metadata.model_info[%q] has no model identity", id)
+			return "", fmt.Errorf("deepgram response metadata.model_info for metadata.models[%d] has no model identity", i)
+		}
+		if providererr.Token(name) == "" {
+			return "", fmt.Errorf("deepgram response metadata.model_info for metadata.models[%d] names its model in no plain token", i)
 		}
 		names = append(names, name)
 	}
 	slices.Sort(names)
 	names = slices.Compact(names)
 	if len(names) != 1 {
-		return "", fmt.Errorf("deepgram response must report exactly one transcription model, got %q", names)
+		return "", fmt.Errorf("deepgram response must report exactly one transcription model, got %d", len(names))
 	}
 	return names[0], nil
 }

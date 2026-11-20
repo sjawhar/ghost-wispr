@@ -27,6 +27,7 @@ import (
 	"github.com/sjawhar/ghost-wispr/internal/config"
 	"github.com/sjawhar/ghost-wispr/internal/logging"
 	"github.com/sjawhar/ghost-wispr/internal/netdial"
+	"github.com/sjawhar/ghost-wispr/internal/providererr"
 	"github.com/sjawhar/ghost-wispr/internal/voice"
 )
 
@@ -277,10 +278,13 @@ func (a *Agent) Open(ctx context.Context, x *voice.Exchange) (voice.Session, err
 		_ = resp.Body.Close()
 	}
 	if err != nil {
+		// A refusal's reason phrase is Deepgram's text, and so is an answer
+		// net/http could not read: the error keeps the status alone
+		// (providererr).
 		if resp != nil {
-			return nil, fmt.Errorf("dgagent: connect: Deepgram answered %s: %w", resp.Status, err)
+			return nil, fmt.Errorf("dgagent: connect: Deepgram answered HTTP %d: %w", resp.StatusCode, err)
 		}
-		return nil, fmt.Errorf("dgagent: connect: %w", err)
+		return nil, fmt.Errorf("dgagent: connect: %w", providererr.From("deepgram", err))
 	}
 	// A read blocked on the handshake returns when ctx ends.
 	stop := context.AfterFunc(ctx, func() { _ = conn.Close() })

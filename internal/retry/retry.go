@@ -2,10 +2,13 @@ package retry
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"time"
 
 	"github.com/cenkalti/backoff/v5"
+
+	"github.com/sjawhar/ghost-wispr/internal/providererr"
 )
 
 // DefaultMaxRetries is the default number of retry attempts.
@@ -44,10 +47,16 @@ func Do(ctx context.Context, fn func() error, maxRetries int) error {
 }
 
 // isPermanent returns true for errors that should NOT be retried.
-// These are client errors (4xx except 429) that won't succeed on retry.
+// These are client errors (4xx except 429) that won't succeed on retry. A
+// provider's error (providererr) keeps no message, so its status and code
+// decide.
 func isPermanent(err error) bool {
 	if err == nil {
 		return false
+	}
+	var answered *providererr.Error
+	if errors.As(err, &answered) {
+		return !answered.Retryable()
 	}
 	msg := strings.ToLower(err.Error())
 

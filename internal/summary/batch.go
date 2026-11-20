@@ -9,6 +9,7 @@ import (
 	"google.golang.org/genai"
 
 	"github.com/sjawhar/ghost-wispr/internal/llm"
+	"github.com/sjawhar/ghost-wispr/internal/providererr"
 )
 
 // BatchSession holds the data needed to build a batch request for one session.
@@ -107,7 +108,13 @@ func (s *Summarizer) ProcessBatchResults(job *genai.BatchJob, sessions []BatchSe
 		}
 
 		if resp.Error != nil {
-			result.Error = fmt.Errorf("batch response error: %s", resp.Error.Message)
+			// Gemini's message can quote the request, the transcript: the
+			// error keeps its code's name (providererr).
+			code := int32(2) // UNKNOWN
+			if resp.Error.Code != nil {
+				code = *resp.Error.Code
+			}
+			result.Error = fmt.Errorf("batch response error: %w", providererr.RPC("gemini", code, resp.Error.Message))
 			results[i] = result
 			continue
 		}

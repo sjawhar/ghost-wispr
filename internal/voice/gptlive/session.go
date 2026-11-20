@@ -13,6 +13,7 @@
 package gptlive
 
 import (
+	"cmp"
 	"context"
 	"encoding/base64"
 	"encoding/binary"
@@ -33,6 +34,7 @@ import (
 
 	"github.com/sjawhar/ghost-wispr/internal/audio"
 	"github.com/sjawhar/ghost-wispr/internal/logging"
+	"github.com/sjawhar/ghost-wispr/internal/providererr"
 	"github.com/sjawhar/ghost-wispr/internal/voice"
 )
 
@@ -111,22 +113,22 @@ var sayStartTimeout = 15 * time.Second
 const sayQuiet = 1200 * time.Millisecond
 
 // APIError is an error event from the Live API. Its text is the structured
-// code or type only: message and param are free-form server text, and a
-// provider can echo what the session sent into either. Errors reach the
-// journal, which no delete path reaches.
+// code or type only, when it is a plain token (providererr.Token): message
+// and param are free-form server text, and a provider can echo what the
+// session sent into any of them. Errors reach the journal, which no delete
+// path reaches.
 type APIError struct {
 	Type, Code, Message, Param string
 }
 
 func (e *APIError) Error() string {
-	code := e.Code
-	if code == "" {
-		code = e.Type
-	}
-	if code == "" {
-		code = "server_error"
-	}
-	return "gpt-live error " + code
+	return "gpt-live error " + e.code()
+}
+
+// code is the error's code, else its type, when either is a plain token, and
+// "server_error" otherwise.
+func (e *APIError) code() string {
+	return cmp.Or(providererr.Token(e.Code), providererr.Token(e.Type), "server_error")
 }
 
 // Config configures voice B.
@@ -195,7 +197,7 @@ func (v *Voice) Open(ctx context.Context, x *voice.Exchange) (voice.Session, err
 		if resp != nil {
 			return nil, fmt.Errorf("gptlive: connect: HTTP %d%s: %w", resp.StatusCode, refusal(resp), err)
 		}
-		return nil, fmt.Errorf("gptlive: connect: %w", err)
+		return nil, fmt.Errorf("gptlive: connect: %w", providererr.From("openai", err))
 	}
 	if resp != nil && resp.Body != nil {
 		_ = resp.Body.Close()
@@ -774,7 +776,7 @@ func (s *session) onError(ev *serverEvent, started bool) {
 		s.startFailed(e)
 		return
 	}
-	s.log.Warn("gptlive: error event", "type", e.Type, "code", e.Code)
+	s.log.Warn("gptlive: error event", "code", e.code())
 	s.emit(&voice.Event{Kind: voice.EventErr, Err: e})
 }
 
@@ -886,7 +888,8 @@ func (s *session) flushTurn() {
 func (s *session) onDelegation(ev *serverEvent) {
 	id := ev.Delegation.ID
 	if ev.Delegation.Target != delegationTargetClient || id == "" {
-		s.log.Warn("gptlive: delegation not for the client", "target", ev.Delegation.Target)
+		// The target GPT-Live named is its text, so the record names none.
+		s.log.Warn("gptlive: delegation not for the client", "has_id", id != "")
 		return
 	}
 	s.mu.Lock()

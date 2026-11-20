@@ -492,7 +492,7 @@ func (s *Syncer) Serialize(fn func() error) error {
 
 // DeleteFile deletes Drive file fileID; one already gone is no error.
 func (s *Syncer) DeleteFile(ctx context.Context, fileID string) error {
-	err := s.service.Files.Delete(fileID).SupportsAllDrives(true).Context(ctx).Do()
+	err := driveError(s.service.Files.Delete(fileID).SupportsAllDrives(true).Context(ctx).Do())
 	if err != nil && !IsRemoteDeletedError(err) {
 		return err
 	}
@@ -500,15 +500,16 @@ func (s *Syncer) DeleteFile(ctx context.Context, fileID string) error {
 }
 
 // VerifyFile checks that Drive file fileID has expected's content hash and,
-// for a local file, its SHA-256 and size.
+// for a local file, its SHA-256 and size. A mismatch names what differs and
+// what was expected, never the values Drive returned: they are Drive's text.
 func (s *Syncer) VerifyFile(ctx context.Context, fileID string, expected *SyncFile) error {
 	file, err := s.service.Files.Get(fileID).SupportsAllDrives(true).Context(ctx).
 		Fields("id, appProperties, sha256Checksum, size").Do()
 	if err != nil {
-		return fmt.Errorf("read uploaded file %s: %w", fileID, err)
+		return fmt.Errorf("read uploaded file %s: %w", fileID, driveError(err))
 	}
-	if got, want := file.AppProperties[contentHashProperty], expected.SHA256; got != want {
-		return fmt.Errorf("uploaded file %s hash = %q, want %q", fileID, got, want)
+	if file.AppProperties[contentHashProperty] != expected.SHA256 {
+		return fmt.Errorf("uploaded file %s does not hold content hash %q", fileID, expected.SHA256)
 	}
 	if expected.LocalPath == "" {
 		return nil
@@ -517,9 +518,11 @@ func (s *Syncer) VerifyFile(ctx context.Context, fileID string, expected *SyncFi
 	if err != nil {
 		return fmt.Errorf("stat uploaded source %s: %w", expected.LocalPath, err)
 	}
-	if file.Sha256Checksum != expected.SHA256 || file.Size != info.Size() {
-		return fmt.Errorf("uploaded file %s content differs: sha256=%q size=%d, want sha256=%q size=%d",
-			fileID, file.Sha256Checksum, file.Size, expected.SHA256, info.Size())
+	if file.Sha256Checksum != expected.SHA256 {
+		return fmt.Errorf("uploaded file %s does not have sha256 %q", fileID, expected.SHA256)
+	}
+	if file.Size != info.Size() {
+		return fmt.Errorf("uploaded file %s is %d bytes, want %d", fileID, file.Size, info.Size())
 	}
 	return nil
 }
@@ -528,7 +531,7 @@ func (s *Syncer) VerifyFile(ctx context.Context, fileID string, expected *SyncFi
 // to its files stay.
 func (s *Syncer) RenameFolder(ctx context.Context, folderID, name string) error {
 	if _, err := s.service.Files.Update(folderID, &drive.File{Name: name}).SupportsAllDrives(true).Context(ctx).Fields("id").Do(); err != nil {
-		return fmt.Errorf("rename session folder %s: %w", folderID, err)
+		return fmt.Errorf("rename session folder %s: %w", folderID, driveError(err))
 	}
 	return nil
 }

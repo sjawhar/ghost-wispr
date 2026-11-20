@@ -405,7 +405,7 @@ func (o *Orchestrator) endFailedSync(sess *storage.Session, claim, driveFolderID
 	// failure does, and its retry into the folder it made finds out.
 	if sess.GDriveFolderID != "" && IsRemoteDeletedError(err) {
 		if o.endSync(sessionID, claim, storage.SyncStateRemoteDeleted, driveFolderID, sess.RetryCount, attemptedAt, err) {
-			o.logger.Warn("gdrive remote deletion soft-deleted session", "operation", "sync_session", "session_id", sessionID, "sync_state", storage.SyncStateRemoteDeleted, "error", err.Error())
+			o.logger.Warn("gdrive remote deletion soft-deleted session", "operation", "sync_session", "session_id", sessionID, "sync_state", storage.SyncStateRemoteDeleted, "error", err)
 		}
 		return fmt.Errorf("remote folder deleted for %s: %w", sessionID, err)
 	}
@@ -414,10 +414,10 @@ func (o *Orchestrator) endFailedSync(sess *storage.Session, claim, driveFolderID
 		return fmt.Errorf("upload %s: %w", sessionID, err)
 	}
 	if !plan.Exhausted {
-		o.logger.Warn("gdrive sync scheduled retry", "operation", "sync_session", "session_id", sessionID, "sync_state", storage.SyncStateRetryScheduled, "retry_count", plan.RetryCount, "next_attempt_at", plan.NextAttemptAt.Format(time.RFC3339), "error", err.Error())
+		o.logger.Warn("gdrive sync scheduled retry", "operation", "sync_session", "session_id", sessionID, "sync_state", storage.SyncStateRetryScheduled, "retry_count", plan.RetryCount, "next_attempt_at", plan.NextAttemptAt.Format(time.RFC3339), "error", err)
 		return fmt.Errorf("upload %s (retry scheduled): %w", sessionID, err)
 	}
-	o.logger.Error("gdrive sync permanently failed", "operation", "sync_session", "session_id", sessionID, "sync_state", storage.SyncStateFailed, "retry_count", sess.RetryCount, "error", err.Error())
+	o.logger.Error("gdrive sync permanently failed", "operation", "sync_session", "session_id", sessionID, "sync_state", storage.SyncStateFailed, "retry_count", sess.RetryCount, "error", err)
 	return fmt.Errorf("upload %s: %w", sessionID, err)
 }
 

@@ -7,6 +7,8 @@ import (
 	"strings"
 
 	openai "github.com/sashabaranov/go-openai"
+
+	"github.com/sjawhar/ghost-wispr/internal/providererr"
 )
 
 type openaiClient struct {
@@ -30,7 +32,7 @@ func (c *openaiClient) Complete(ctx context.Context, messages []Message) (string
 
 	resp, err := c.client.CreateChatCompletion(ctx, openai.ChatCompletionRequest{Model: c.model, Messages: msgs})
 	if err != nil {
-		return "", fmt.Errorf("openai completion: %w", err)
+		return "", fmt.Errorf("openai completion: %w", providererr.From("openai", err))
 	}
 	if len(resp.Choices) == 0 {
 		return "", fmt.Errorf("openai: no choices in response")
@@ -63,7 +65,7 @@ func (c *openaiClient) CompleteJSON(ctx context.Context, messages []Message, sch
 		},
 	})
 	if err != nil {
-		return nil, fmt.Errorf("openai json completion: %w", err)
+		return nil, fmt.Errorf("openai json completion: %w", providererr.From("openai", err))
 	}
 	if len(resp.Choices) == 0 {
 		return nil, fmt.Errorf("openai: no choices in response")

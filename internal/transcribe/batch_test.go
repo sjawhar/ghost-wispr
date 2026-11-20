@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"slices"
+	"strings"
 	"testing"
 )
 
@@ -234,6 +235,40 @@ func TestBatchRefinement_DeepgramNonOKFails(t *testing.T) {
 	}
 }
 
+// A Deepgram error keeps Deepgram's status and error code, never its message
+// or body: Deepgram's message is its own text, which can quote what it was
+// sent, and the error is logged and kept as the session's refinement error.
+func TestADeepgramErrorKeepsOnlyItsStatusAndCode(t *testing.T) {
+	const planted = "quokkaplantedroomword"
+	audioPath := filepath.Join(t.TempDir(), "session.mp3")
+	if err := os.WriteFile(audioPath, []byte("fake-audio"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, body := range []string{
+		`{"err_code":"INVALID_QUERY_PARAMETER","err_msg":"Could not use ` + planted + `","request_id":"r-1"}`,
+		`not JSON: ` + planted,
+	} {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(body))
+		}))
+		_, err := NewDeepgramBatchTranscriber(DeepgramBatchConfig{BaseURL: server.URL}).Transcribe(context.Background(), audioPath)
+		server.Close()
+		if err == nil {
+			t.Fatalf("no error from an answer of status 400 with body %s", body)
+		}
+		if strings.Contains(err.Error(), planted) {
+			t.Errorf("the error quotes Deepgram's answer: %v", err)
+		}
+		if !strings.Contains(err.Error(), "400") {
+			t.Errorf("the error %q does not name status 400", err)
+		}
+		if strings.HasPrefix(body, "{") && !strings.Contains(err.Error(), "INVALID_QUERY_PARAMETER") {
+			t.Errorf("the error %q does not name Deepgram's code", err)
+		}
+	}
+}
+
 func TestBatchRefinementReportsDeepgramResponseModel(t *testing.T) {
 	const (
 		configuredModel = "configured-refinement-model"
@@ -267,5 +302,33 @@ func TestBatchRefinementReportsDeepgramResponseModel(t *testing.T) {
 	}
 	if result.Model != providerModel {
 		t.Fatalf("reported model = %q, want provider value %q, not configured %q", result.Model, providerModel, configuredModel)
+	}
+}
+
+// The model a Deepgram answer reports is kept only when its name is a plain
+// token, and an error about the models names none of Deepgram's strings: the
+// error is logged, and kept on GET /api/status when a model pin fails.
+func TestADeepgramModelErrorQuotesNoName(t *testing.T) {
+	const planted = "quokka planted room word"
+	for _, tc := range []struct {
+		models []string
+		info   map[string]deepgramModelInfo
+	}{
+		{[]string{planted}, map[string]deepgramModelInfo{}},
+		{[]string{"id-1"}, map[string]deepgramModelInfo{"id-1": {Name: planted}}},
+		{[]string{"id-1", "id-2"}, map[string]deepgramModelInfo{"id-1": {Arch: "nova-3"}, "id-2": {Arch: "quokkaplantedroomword"}}},
+		{[]string{planted}, map[string]deepgramModelInfo{planted: {}}},
+	} {
+		model, err := deepgramResponseModel(tc.models, tc.info)
+		if err == nil {
+			t.Errorf("deepgramResponseModel(%q) = %q, want an error", tc.models, model)
+			continue
+		}
+		if strings.Contains(err.Error(), "quokka") {
+			t.Errorf("deepgramResponseModel(%q) error quotes Deepgram's strings: %v", tc.models, err)
+		}
+	}
+	if model, err := deepgramResponseModel([]string{"id-1"}, map[string]deepgramModelInfo{"id-1": {Arch: "nova-3"}}); err != nil || model != "nova-3" {
+		t.Errorf("deepgramResponseModel = %q, %v; want nova-3", model, err)
 	}
 }

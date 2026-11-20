@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 	"unicode/utf8"
@@ -156,6 +157,56 @@ func TestADelegationForAnotherTargetRunsNoTool(t *testing.T) {
 	if err := s.Deliver(context.Background(), "resp_1", result); !errors.Is(err, ErrUnknownCall) {
 		t.Fatalf("Deliver on a delegation not for the client = %v, want ErrUnknownCall", err)
 	}
+}
+
+// A delegation for another target is logged without the target GPT-Live
+// named: it is GPT-Live's text, and can be anything.
+func TestADelegationForAnotherTargetLogsNoTarget(t *testing.T) {
+	logs := &lockedLog{}
+	srv := newLiveServer(t)
+	v, err := New(Config{URL: srv.url(), Logger: slog.New(slog.NewTextHandler(logs, nil)), Token: func(context.Context) (string, error) { return "access-token", nil }})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	opened := make(chan voice.Session, 1)
+	go func() {
+		s, _ := v.Open(context.Background(), testExchange(newFakeOutput(), newFakeTools(voice.AnswerResult{Say: "x"})))
+		opened <- s
+	}()
+	c := srv.conn()
+	c.start()
+	s := <-opened
+	defer func() { _ = s.Close() }()
+
+	c.send(map[string]any{"type": evDelegationCreated, "event_id": "event_r", "offset_ms": 1, "delegation": map[string]any{"id": "resp_1", "type": "delegation", "target": "bad quokkaplantedroomword target"}})
+	deadline := time.Now().Add(time.Second)
+	for !strings.Contains(logs.String(), "delegation not for the client") {
+		if time.Now().After(deadline) {
+			t.Fatalf("the session logged no foreign delegation:\n%s", logs.String())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if strings.Contains(logs.String(), "quokkaplantedroomword") {
+		t.Fatalf("the log holds GPT-Live's target:\n%s", logs.String())
+	}
+}
+
+// lockedLog is a log writer a test can read while the session writes it.
+type lockedLog struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (l *lockedLog) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.buf.Write(p)
+}
+
+func (l *lockedLog) String() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.buf.String()
 }
 
 // When the answer tool fails, the Supervisor speaks the failure itself (its

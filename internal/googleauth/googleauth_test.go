@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
+	"io"
 	"math/big"
 	"net"
 	"net/http"
@@ -87,6 +88,25 @@ func TestIDTokenImpersonatesTheServiceAccount(t *testing.T) {
 	}
 	if fixture.iamRequests() != 1 {
 		t.Fatalf("generateIdToken requests = %d, want 1", fixture.iamRequests())
+	}
+}
+
+// An ID token IAM refuses fails with IAM's status and nothing of its answer,
+// which can quote what it was sent: the error reaches the voice's log.
+func TestARefusedIDTokenQuotesNothingIAMSent(t *testing.T) {
+	const planted = "quokkaplantedroomword"
+	fixture := newExternalAccountFixture(t)
+	fixture.routeIAMRequests(t)
+	fixture.mu.Lock()
+	fixture.refusal = `{"error":{"code":403,"status":"PERMISSION_DENIED","message":"cannot authenticate ` + planted + `"}}`
+	fixture.mu.Unlock()
+
+	_, err := IDToken(context.Background(), fixture.credentialPath, "https://tailscale.example.test")
+	if err == nil || strings.Contains(err.Error(), planted) || !strings.Contains(err.Error(), "HTTP 403") {
+		t.Fatalf("IDToken = %v, want IAM's 403 and nothing of its answer", err)
+	}
+	if fixture.iamRequests() != 1 {
+		t.Fatalf("generateIdToken requests = %d, want 1, so IAM was asked", fixture.iamRequests())
 	}
 }
 
@@ -178,6 +198,7 @@ type externalAccountFixture struct {
 	mu      sync.Mutex
 	cn      string
 	iamHits int
+	refusal string // when set, generateIdToken answers 403 with it
 }
 
 var sharedTestCertificateAuthority struct {
@@ -277,6 +298,18 @@ func newExternalAccountFixture(t *testing.T) *externalAccountFixture {
 			})
 			return
 		case accountPath + ":generateIdToken":
+			fixture.mu.Lock()
+			refusal := fixture.refusal
+			if refusal != "" {
+				fixture.iamHits++
+			}
+			fixture.mu.Unlock()
+			if refusal != "" {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusForbidden)
+				_, _ = io.WriteString(w, refusal)
+				return
+			}
 		default:
 			t.Errorf("unexpected IAM request path %q", r.URL.Path)
 			http.Error(w, "unexpected path", http.StatusNotFound)
