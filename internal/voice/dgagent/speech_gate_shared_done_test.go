@@ -1,11 +1,14 @@
 package dgagent
 
 import (
+	"context"
 	"fmt"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/sjawhar/ghost-wispr/internal/audio"
 	"github.com/sjawhar/ghost-wispr/internal/voice"
 )
 
@@ -60,6 +63,81 @@ func TestSpeechGateSharedDoneReplies(t *testing.T) {
 	t.Run("injection-plays-whole/audio-first", func(t *testing.T) {
 		runSharedDoneTrace(t, []sharedEvent{{0, replyAudio}, {0, replyText}, {-1, replyDone}}, 1, 0, true)
 	})
+}
+
+// TestAnInjectionKeepsItsSpacingThroughTheHold fails if the hold on an
+// injection's audio splits it: its first frame, which Deepgram sends just
+// before the text, playing at once and the rest holdTail later, so the room
+// hears a click and a gap. Deepgram sends a reply's audio in bursts faster
+// than it plays (the probe's frame log), so its frames reach Output close
+// together, after the hold, in both orders of the text and the first frame.
+func TestAnInjectionKeepsItsSpacingThroughTheHold(t *testing.T) {
+	for _, audioFirst := range []bool{true, false} {
+		name := "text-first"
+		if audioFirst {
+			name = "audio-first"
+		}
+		t.Run(name, func(t *testing.T) {
+			const hold = 200 * time.Millisecond
+			setSpeechGap(t, time.Minute)
+			stand := startStandIn(t)
+			out := &timedOutput{}
+			sess, c, _ := open(t, stand, Config{holdTail: hold}, voice.Exchange{Out: out, Tools: tools(nil)})
+			defer func() { _ = sess.Close() }()
+			done := sayAsync(sess, "Spaced reply.")
+			c.expect(t, "InjectAgentMessage")
+			frame := tone(OutputRate, 20*time.Millisecond, 700)
+			sent := time.Now()
+			if audioFirst {
+				c.sendAudio(frame)
+			}
+			c.send(map[string]any{"type": "ConversationText", "role": "assistant", "content": "Spaced reply."})
+			if !audioFirst {
+				c.sendAudio(frame)
+			}
+			for range 4 {
+				c.sendAudio(frame)
+			}
+			c.send(map[string]any{"type": "AgentAudioDone"})
+			if err := returned(t, done); err != nil {
+				t.Fatalf("Say = %v, want nil", err)
+			}
+			times := out.writeTimes()
+			if len(times) == 0 {
+				t.Fatal("UNKNOWN: nothing reached Output")
+			}
+			if first := times[0].Sub(sent); first < hold/2 {
+				t.Errorf("the first frame reached Output %v after it was sent, want about the hold, %v", first, hold)
+			}
+			if spread := times[len(times)-1].Sub(times[0]); spread > hold/2 {
+				t.Errorf("the reply's frames reached Output over %v, want them together: the hold split the reply", spread)
+			}
+		})
+	}
+}
+
+// timedOutput is an Output that takes every frame at once and records when
+// each came.
+type timedOutput struct {
+	mu    sync.Mutex
+	times []time.Time
+}
+
+func (o *timedOutput) Begin() voice.Playback { return o }
+
+func (o *timedOutput) Write(context.Context, []byte, audio.AudioFormat) error {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.times = append(o.times, time.Now())
+	return nil
+}
+
+func (o *timedOutput) Drain(context.Context) error { return nil }
+
+func (o *timedOutput) writeTimes() []time.Time {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return append([]time.Time(nil), o.times...)
 }
 
 // everySharedDoneTrace returns every order of one reply's sentences: each
