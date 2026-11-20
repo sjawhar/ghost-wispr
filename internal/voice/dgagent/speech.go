@@ -402,27 +402,27 @@ func (q *speechQueue) close(reason error) {
 	q.signal()
 }
 
-// endWaitersLocked ends every Say whose audio Output has not accepted, and
-// drops the queued speech. q.mu is held.
+// endWaitersLocked ends every Say whose marker is still queued, and drops the
+// queued speech. The player ends the Say it already took at the Interrupt
+// it is told of, and a Say ends at Close by itself. q.mu is held.
 func (q *speechQueue) endWaitersLocked(reason error) {
 	for _, it := range q.items {
 		if it.say != nil {
 			it.say.finish(reason)
 		}
 	}
-	if q.current != nil && q.current.waiter != nil {
-		q.current.waiter.finish(reason)
-	}
-	for _, pending := range [][]*utterance{q.awaitingEnd, q.awaitingText, {q.holder}} {
-		for _, u := range pending {
-			if u != nil && u.waiter != nil {
-				u.waiter.finish(reason)
-			}
-		}
-	}
 	q.awaitingEnd = nil
 	clear(q.items)
 	q.items = q.items[:0]
+}
+
+// holds says whether audio of w's words came and waits behind the hold on
+// audio after an injection's last text.
+func (q *speechQueue) holds(w *sayWait) bool {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	h := q.holder
+	return w != nil && h != nil && h.waiter == w && len(h.held) > 0
 }
 
 // next waits for the player's next item. With wait above zero it returns
@@ -540,6 +540,12 @@ func (s *session) play() {
 		case itemEnd, itemIdle:
 			if pb == nil {
 				if it.kind == itemIdle {
+					if s.speech.holds(said) {
+						// Its audio came in time and waits for model text:
+						// it plays within the hold, or is dropped with it.
+						said.deadline = time.Now().Add(s.speech.holdTail)
+						continue
+					}
 					endSaid(ErrNotSpoken) // the Say's deadline passed with no audio of it
 				}
 				continue

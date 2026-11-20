@@ -223,6 +223,26 @@ func TestInterruptStopsSpeechTheOutputHolds(t *testing.T) {
 	}
 }
 
+// TestInterruptEndsSpeechTheOutputHasTaken fails if an Interrupt that comes
+// while the Output has taken all the audio so far, and Deepgram has not said
+// the reply is done, leaves the voice speaking until the speech gap: the
+// player waits for more audio, and only the Interrupt can end that wait.
+func TestInterruptEndsSpeechTheOutputHasTaken(t *testing.T) {
+	setSpeechGap(t, time.Minute)
+	s := startStandIn(t)
+	out := newFakeOutput()
+	sess, c, _ := open(t, s, Config{}, voice.Exchange{Out: out, Tools: tools(nil)})
+	pcm := tone(OutputRate, 40*time.Millisecond, 100)
+	done := injectSpeech(t, sess, c, "First reply.", pcm, false)
+	waitEvent(t, sess, voice.EventSpeechStarted)
+	out.nextPlayback(t).waitBytes(t, len(pcm))
+	sess.Interrupt()
+	if err := returned(t, done); !errors.Is(err, ErrInterrupted) {
+		t.Fatalf("Say = %v, want ErrInterrupted", err)
+	}
+	waitEvent(t, sess, voice.EventSpeechEnded)
+}
+
 // slowOutput's Write takes 50 ms to see its context end, and counts every
 // call made to it after closedAt is set.
 type slowOutput struct {
