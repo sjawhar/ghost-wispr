@@ -726,6 +726,78 @@ func OpenAPISpec() map[string]any {
 					},
 				},
 			},
+			"/api/sessions/{id}/joined-agents": map[string]any{
+				"get": map[string]any{
+					"summary":     "List the agents that joined the meeting",
+					"description": "The agents that joined this recording session's meeting and have not left, in the order they joined. An agent joins, asks for the floor and leaves with Envoy messages to the unit's own Envoy session; it leaves when it says so, when the session ends, or when Envoy lists it as not live for 10 minutes. The list lives only while the session records: an ended session lists none.",
+					"tags":        []string{"sessions"},
+					"security":    []map[string][]string{{"basicAuth": {}}},
+					"parameters": []map[string]any{
+						{
+							"name":        "id",
+							"in":          "path",
+							"description": "Session ID",
+							"required":    true,
+							"schema":      map[string]any{"type": "string"},
+						},
+					},
+					"responses": map[string]any{
+						"200": map[string]any{
+							"description": "The joined agents; an empty list when none joined, or the meeting voice is off",
+							"content": map[string]any{
+								"application/json": map[string]any{
+									"schema": map[string]any{
+										"type": "array",
+										"items": map[string]any{
+											"type":     "object",
+											"required": []string{"agent", "issue_key", "title", "joined_at"},
+											"properties": map[string]any{
+												"agent":     map[string]any{"type": "string", "description": "The agent's Envoy session id"},
+												"issue_key": map[string]any{"type": "string", "description": "The issue it joined on; empty when it named none"},
+												"title":     map[string]any{"type": "string", "description": "The issue's title, else the agent's Envoy title"},
+												"joined_at": map[string]any{"type": "string", "format": "date-time"},
+											},
+										},
+									},
+								},
+							},
+						},
+						"403": map[string]any{"description": "Invalid session id"},
+					},
+				},
+			},
+			"/api/voice/join-message": map[string]any{
+				"get": map[string]any{
+					"summary":     "The message that tells an agent to join the meeting",
+					"description": "The message a person sends an agent through Dispatch (the Agents page, or dispatch send-to-agent) to have it join the meeting the unit records: the unit's Envoy session id and the whole floor protocol, so an agent with an older copy of the Ghost Wispr skill can follow it. It changes nothing.",
+					"tags":        []string{"voice"},
+					"security":    []map[string][]string{{"basicAuth": {}}},
+					"parameters": []map[string]any{
+						{
+							"name":        "issue",
+							"in":          "query",
+							"description": "The issue the agent joins on, such as ABC-12; its key becomes a keyterm of the live transcript and names the agent in the room",
+							"schema":      map[string]any{"type": "string"},
+						},
+					},
+					"responses": map[string]any{
+						"200": map[string]any{
+							"description": "The join message",
+							"content": map[string]any{
+								"application/json": map[string]any{
+									"schema": map[string]any{
+										"type":       "object",
+										"required":   []string{"message"},
+										"properties": map[string]any{"message": map[string]any{"type": "string"}},
+									},
+								},
+							},
+						},
+						"400": map[string]any{"description": "issue is not an issue key"},
+						"503": map[string]any{"description": "No agent can join now: the meeting voice is off, or the unit has no Envoy session"},
+					},
+				},
+			},
 
 			// Session actions
 			"/api/sessions/{id}/resummarize": map[string]any{

@@ -46,6 +46,7 @@ import (
 	"github.com/sjawhar/ghost-wispr/internal/transcribe"
 	"github.com/sjawhar/ghost-wispr/internal/tts"
 	"github.com/sjawhar/ghost-wispr/internal/voice"
+	"github.com/sjawhar/ghost-wispr/internal/wake/transcript"
 
 	"google.golang.org/genai"
 )
@@ -469,6 +470,10 @@ type transcriptCallback struct {
 	manager session.LifecycleManager
 	voice   voiceListener
 	stamp   func() (closings int, open bool)
+	// keyterms are the live stream's keyterms: each dial sends them, and a
+	// join or a leave changes them on the open socket. nil sends tOptions'
+	// own.
+	keyterms *transcript.LiveKeyterms
 }
 
 // voiceListener is the voice as the transcript reader feeds it: the
@@ -753,10 +758,27 @@ func refreshKeptRawRecordings(ctx context.Context, kept *keptRecordings, budgetM
 }
 
 // makeDeepgramClientFactory dials live-transcription sockets the app owns
-// (deepgramSocket), each write bounded by writeTimeout.
+// (deepgramSocket), each write bounded by writeTimeout. Each dial carries the
+// live keyterms as they are then, and is the socket a join's Configure goes
+// to until the next dial.
 func makeDeepgramClientFactory(_ context.Context, apiKey string, cOptions *interfaces.ClientOptions, tOptions *interfaces.LiveTranscriptionOptions, callback transcriptCallback, writeTimeout time.Duration) transcribe.ClientFactory {
 	return func(factoryCtx context.Context) (io.WriteCloser, error) {
-		return dialDeepgramLive(factoryCtx, apiKey, cOptions, tOptions, callback, writeTimeout)
+		options := tOptions
+		var keyterms []string
+		if callback.keyterms != nil {
+			keyterms = callback.keyterms.List()
+			withKeyterms := *tOptions
+			withKeyterms.Keyterm = keyterms
+			options = &withKeyterms
+		}
+		socket, err := dialDeepgramLive(factoryCtx, apiKey, cOptions, options, callback, writeTimeout)
+		if err != nil {
+			return nil, err // never a nil *deepgramSocket in the interface
+		}
+		if callback.keyterms != nil {
+			callback.keyterms.Attach(socket, keyterms)
+		}
+		return socket, nil
 	}
 }
 
