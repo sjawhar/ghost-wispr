@@ -1146,6 +1146,12 @@ func (s *Supervisor) finish(ex *exchange, sessionID string) bool {
 		s.followUpLocked(ex)
 		return spoken
 	}
+	if !spoken && said && ex.answer != nil && ex.ctx.Err() == nil {
+		// The engine or Output cut a held answer after Say queued its first
+		// frame. Apply R11's replay rule exactly as a stop does.
+		s.endLocked(ex, true, "the voice did not finish")
+		return false
+	}
 	s.endLocked(ex, false, "done")
 	return spoken
 }
