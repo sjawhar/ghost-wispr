@@ -74,7 +74,7 @@ func TestMainWiresTheStopsRecovery(t *testing.T) {
 	recovery := one(calls, "RecoverStaleRefinements", "calls")
 	cleanup := one(calls, "cleanupRecordingDirectories", "calls")
 	retries := one(goStmts, "resumeStoppedRefinements", "starts in a go statement")
-	if !(recovery < cleanup && cleanup < retries) {
+	if recovery >= cleanup || cleanup >= retries {
 		t.Fatalf("main() recovers at %v, cleans up at %v and starts the retries at %v: want the recovery, then the cleanup, then the retries",
 			fset.Position(recovery), fset.Position(cleanup), fset.Position(retries))
 	}
