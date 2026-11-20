@@ -161,10 +161,21 @@ type pointer struct {
 // begun, and an end never takes a membership that began since.
 //
 // No hook runs under r.mu: not the Supervisor's RaiseHand or LowerHands,
-// not Envoy, the store, Dispatch, the recording session's read, the /ws
-// notice nor the keyterms. Each path reads what it needs before it takes the
-// lock (the recording session now, the clock), decides under it, and calls
-// out after it; a step that called out checks again under the lock.
+// not Envoy, the store, Dispatch, the /ws notice nor the keyterms. The one
+// read under r.mu is the recorder's current session (Config.Session), at
+// each commit, which returns at once and calls nothing back. Each path
+// decides under the lock and calls out after it; a step that called out
+// checks again under the lock.
+//
+// Every effect on a membership runs under the membership's context, whose
+// parent is its meeting's: its welcome, its pointers, its hand's outcome, a
+// refusal to it while it is current, and its hand's words, which the
+// Supervisor says under a context derived from voice.Hand.Context. An end
+// cancels them wherever they have got to. Only three sends run under no
+// membership: a refusal to an agent with no current membership, under the
+// delivery's context; and the notice that a membership ended, which its end
+// sends once it has cancelled it, under the roster's context (through the
+// Envoy session it joined under when the voice stops).
 type Roster struct {
 	cfg    Config
 	logf   func(string, ...any)
