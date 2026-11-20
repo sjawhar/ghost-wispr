@@ -33,7 +33,7 @@ import (
 )
 
 func init() {
-	otherProcesses["light-state-loop"] = lightStateLoop
+	otherProcesses["light-state-sim"] = lightStateSim
 	otherProcesses["try-lock"] = tryLock
 }
 
@@ -81,11 +81,17 @@ type uhidBlink1 struct {
 
 func newUhidBlink1(t *testing.T) *uhidBlink1 {
 	t.Helper()
+	return newUhidBlink1Delay(t, 2*time.Millisecond)
+}
+
+// newUhidBlink1Delay makes a uhid blink(1) whose transfers each take delay.
+func newUhidBlink1Delay(t *testing.T, delay time.Duration) *uhidBlink1 {
+	t.Helper()
 	file, err := os.OpenFile("/dev/uhid", os.O_RDWR, 0)
 	if err != nil {
 		t.Fatalf("open /dev/uhid: %v (run as root with -tags uhid, as this file's comment says)", err)
 	}
-	d := &uhidBlink1{file: file, uniq: fmt.Sprintf("ghost-wispr-uhid-test-%d", os.Getpid()), delay: 2 * time.Millisecond, done: make(chan struct{})}
+	d := &uhidBlink1{file: file, uniq: fmt.Sprintf("ghost-wispr-uhid-test-%d", os.Getpid()), delay: delay, done: make(chan struct{})}
 	event := make([]byte, uhidEventSize)
 	binary.NativeEndian.PutUint32(event, uhidCreate2)
 	request := event[4:]
@@ -283,27 +289,149 @@ func TestUhidFlockOnAHidrawNodeExcludesItsOtherOpens(t *testing.T) {
 	}
 }
 
-// lightStateLoop is `ghost-wispr light-state` run again and again: it opens the
-// blink(1) (a version query), reads its colour and closes it, then waits 10 ms,
-// as the next light-state process takes to start (run back to back, the real
-// binary ran about once each 24 ms on the devbox, review of #79). Without
-// that wait, its next open takes the lock it has just let go of before any
-// other handle can, which no real light-state does. It prints how many reads
-// it made, how many were not red and how many could not read the light
-// (unknown: ErrBusy or ErrOtherReply), then waits for its input to end before
-// it exits, so its exit signals no process that is in a request.
-func lightStateLoop() int {
+// pipeClock is a lock simulation's clock (lockSim) in another process: Sleep
+// asks the simulation, on file 4, to let the process sleep, and waits on file
+// 3 until the simulation wakes it at an instant of its clock, which Now
+// returns until the next wake. A process on it runs only while the
+// simulation lets it, as an actor of the test's own process does.
+type pipeClock struct {
+	wakes    *bufio.Reader
+	requests *os.File
+	now      time.Time
+}
+
+// newPipeClock waits for the simulation to start this process.
+func newPipeClock() (*pipeClock, error) {
+	c := &pipeClock{wakes: bufio.NewReader(os.NewFile(3, "wakes")), requests: os.NewFile(4, "requests")}
+	if err := c.waitWake(); err != nil {
+		return nil, err
+	}
+	return c, nil
+}
+
+func (c *pipeClock) Now() time.Time { return c.now }
+
+func (c *pipeClock) Sleep(d time.Duration) {
+	if _, err := fmt.Fprintf(c.requests, "sleep %d\n", d); err != nil {
+		panic(err)
+	}
+	if err := c.waitWake(); err != nil {
+		panic(err)
+	}
+}
+
+func (c *pipeClock) waitWake() error {
+	line, err := c.wakes.ReadString('\n')
+	if err != nil {
+		return err
+	}
+	var nanos int64
+	if _, err := fmt.Sscanf(line, "wake %d\n", &nanos); err != nil {
+		return fmt.Errorf("wake %q: %w", line, err)
+	}
+	c.now = time.Unix(0, nanos)
+	return nil
+}
+
+// done tells the simulation the process has ended its part.
+func (c *pipeClock) done() {
+	_, _ = fmt.Fprintln(c.requests, "done")
+}
+
+// Remote starts command, which runs on a pipeClock, as an actor in another
+// process, offset after the clock's start, and returns the actor.
+func (s *lockSim) Remote(name string, loses bool, offset time.Duration, command *exec.Cmd) (*simActor, error) {
+	wakesRead, wakesWrite, err := os.Pipe()
+	if err != nil {
+		return nil, err
+	}
+	requestsRead, requestsWrite, err := os.Pipe()
+	if err != nil {
+		return nil, err
+	}
+	s.t.Cleanup(func() { _, _ = wakesWrite.Close(), requestsRead.Close() })
+	command.ExtraFiles = []*os.File{wakesRead, requestsWrite}
+	err = command.Start()
+	_, _ = wakesRead.Close(), requestsWrite.Close()
+	if err != nil {
+		return nil, err
+	}
+	a := s.add(name, loses, offset)
+	a.resume = func(now time.Time) error {
+		_, err := fmt.Fprintf(wakesWrite, "wake %d\n", now.UnixNano())
+		return err
+	}
+	go func() {
+		defer s.finish(a)
+		requests := bufio.NewScanner(requestsRead)
+		for requests.Scan() {
+			var nanos int64
+			switch _, err := fmt.Sscanf(requests.Text(), "sleep %d", &nanos); {
+			case requests.Text() == "done":
+				return
+			case err != nil:
+				s.fail("actor %s asked %q", name, requests.Text())
+				return
+			}
+			s.mu.Lock()
+			if s.running != a {
+				s.mu.Unlock()
+				s.fail("actor %s slept while it did not run", name)
+				return
+			}
+			s.sleep(a, time.Duration(nanos))
+			s.mu.Unlock()
+		}
+		s.fail("actor %s ended without saying it was done", name)
+	}()
+	return a, nil
+}
+
+// Ended reports whether every one of actors has ended.
+func (s *lockSim) Ended(actors []*simActor) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, a := range actors {
+		if !a.done {
+			return false
+		}
+	}
+	return true
+}
+
+// lightStateSim is `ghost-wispr light-state` run again and again on a lock
+// simulation's clock (pipeClock): it opens the blink(1) (a version query),
+// reads its colour and closes it, GHOST_WISPR_TEST_ITERATIONS times, back to
+// back. Each transfer takes 2 ms on the clock, with the node's lock held.
+// With GHOST_WISPR_TEST_AS_RECORDER set, it opens the light as the recorder
+// does (OpenBlink1). It prints how many reads it made, how many were not red
+// and how many could not read the light (unknown: ErrBusy or ErrOtherReply),
+// tells the simulation it is done, then waits for its input to end before it
+// exits, so its exit signals no process that is in a request.
+func lightStateSim() int {
 	iterations, err := strconv.Atoi(os.Getenv("GHOST_WISPR_TEST_ITERATIONS"))
 	if err != nil {
 		_, _ = fmt.Fprintln(os.Stderr, err)
 		return 1
 	}
+	clock, err := newPipeClock()
+	if err != nil {
+		_, _ = fmt.Fprintln(os.Stderr, "start:", err)
+		return 1
+	}
+	lockClock = clock
+	transfer := featureIOCTL
+	featureIOCTL = func(fd uintptr, request uintptr, report *[8]byte) error {
+		lockClock.Sleep(2 * time.Millisecond)
+		return transfer(fd, request, report)
+	}
+	open := OpenBlink1ForCommand
+	if os.Getenv("GHOST_WISPR_TEST_AS_RECORDER") != "" {
+		open = OpenBlink1
+	}
 	reads, notRed, unknown := 0, 0, 0
-	for i := range iterations {
-		if i > 0 {
-			time.Sleep(10 * time.Millisecond)
-		}
-		light, err := OpenBlink1ForCommand("/sys", os.Getenv("GHOST_WISPR_TEST_DEV_ROOT"))
+	for range iterations {
+		light, err := open("/sys", os.Getenv("GHOST_WISPR_TEST_DEV_ROOT"))
 		if Contended(err) {
 			unknown++
 			continue
@@ -329,53 +457,73 @@ func lightStateLoop() int {
 		}
 	}
 	fmt.Println(reads, notRed, unknown)
+	clock.done()
 	_, _ = io.Copy(io.Discard, os.Stdin)
 	return 0
 }
 
-// TestUhidARecorderReadIsNotAnsweredByLightState fails if the recorder's read
-// of its red light, or a `ghost-wispr light-state` run meanwhile, is answered
-// by the other's command on a real hidraw node: on the office Pi the recorder
-// read 0,51,51, light-state's version reply, and light-state read 1,1,44, the
-// recorder's watchdog tickle. Here the recorder tickles the watchdog and reads
-// the light back, over and over, while two other processes run light-state
-// 150 times each, back to back. A light-state read may then not get the light
-// within its wait: it reports unknown, which is allowed. A colour other than
-// red is not, and the recorder, which goes first, must get the light each time:
-// an unknown read drops a buffer of audio (review of #79).
-//
-// uhid fails a request with EIO when a signal ends its wait for the reply,
-// and Go's runtime preempts goroutines with signals, so the test needs
-// GODEBUG=asyncpreemptoff=1. A USB blink(1)'s requests do not wait on signals.
-func TestUhidARecorderReadIsNotAnsweredByLightState(t *testing.T) {
+// uhidLockOrderRun is what the recorder and light-state processes did on a
+// uhid blink(1), on a lock simulation's clock.
+type uhidLockOrderRun struct {
+	reads, notRed, unknown int    // the recorder's reads
+	first                  string // the recorder's first read that was not red
+	held                   int    // the recorder's polls: times it found the node's lock held
+	loops                  []string
+}
+
+// uhidLockOrderLoops is how many light-state processes a uhid lock order test
+// runs, and uhidLockOrderIterations how many times each runs light-state.
+const (
+	uhidLockOrderLoops      = 4
+	uhidLockOrderIterations = 30
+)
+
+// runUhidLockOrder runs, on a lock simulation from seed, a recorder that
+// tickles the watchdog of a uhid blink(1) and reads its red light back, over
+// and over, while uhidLockOrderLoops other processes run light-state
+// (lightStateSim) uhidLockOrderIterations times each, back to back, started
+// at instants in the first 5 ms. Each transfer takes 2 ms on the clock, with
+// the node's lock held; the uhid blink(1) answers at once.
+func runUhidLockOrder(t *testing.T, seed uint64, asRecorder bool) uhidLockOrderRun {
+	t.Helper()
 	if !strings.Contains(os.Getenv("GODEBUG"), "asyncpreemptoff=1") {
 		t.Fatal("run with GODEBUG=asyncpreemptoff=1: a preemption signal fails a uhid request with EIO")
 	}
-	device := newUhidBlink1(t)
+	device := newUhidBlink1Delay(t, 0)
+	// The light is red from the start, so a read that is not red can only be
+	// another command's reply.
+	device.mu.Lock()
+	device.colour = [3]byte{255, 0, 0}
+	device.mu.Unlock()
 	devRoot, _ := device.node(t)
-	opened, err := OpenBlink1("/sys", devRoot)
-	if err != nil {
-		t.Fatalf("open the uhid blink(1): %v", err)
+	transfer := featureIOCTL
+	t.Cleanup(func() { featureIOCTL = transfer })
+	featureIOCTL = func(fd uintptr, request uintptr, report *[8]byte) error {
+		lockClock.Sleep(2 * time.Millisecond) // a USB control transfer: the sender holds the lock meanwhile
+		return transfer(fd, request, report)
 	}
-	recorder := opened.(*blink1)
-	t.Cleanup(func() { _ = recorder.Close() })
-	if err := recorder.SetRGB(255, 0, 0); err != nil {
-		t.Fatal(err)
-	}
-	if r, g, b, err := recorder.ReadRGB(); err != nil || r != 255 || g != 0 || b != 0 {
-		t.Fatalf("control: the recorder reads its red light as %d,%d,%d, %v", r, g, b, err)
-	}
+	sim := newLockSim(t, seed, lockOrderLateness)
 
 	type loop struct {
 		command *exec.Cmd
 		stdin   io.Closer
+		stdout  *bufio.Reader
 		stderr  *strings.Builder
 	}
-	results := make(chan string, 2)
 	var loops []loop
-	for range 2 {
+	var actors []*simActor
+	t.Cleanup(func() {
+		for _, l := range loops {
+			_ = l.command.Process.Kill()
+			_ = l.command.Wait()
+		}
+	})
+	for i := range uhidLockOrderLoops {
 		command := exec.Command(os.Args[0], "-test.run=^$")
-		command.Env = append(os.Environ(), otherProcessEnv+"=light-state-loop", "GHOST_WISPR_TEST_DEV_ROOT="+devRoot, "GHOST_WISPR_TEST_ITERATIONS=150")
+		command.Env = append(os.Environ(), otherProcessEnv+"=light-state-sim", "GHOST_WISPR_TEST_DEV_ROOT="+devRoot, fmt.Sprint("GHOST_WISPR_TEST_ITERATIONS=", uhidLockOrderIterations))
+		if asRecorder {
+			command.Env = append(command.Env, "GHOST_WISPR_TEST_AS_RECORDER=1")
+		}
 		stdin, err := command.StdinPipe()
 		if err != nil {
 			t.Fatal(err)
@@ -386,75 +534,118 @@ func TestUhidARecorderReadIsNotAnsweredByLightState(t *testing.T) {
 		}
 		stderr := &strings.Builder{}
 		command.Stderr = stderr
-		if err := command.Start(); err != nil {
+		actor, err := sim.Remote(fmt.Sprintf("light-state %d", i+1), false, sim.Offset(5*time.Millisecond), command)
+		if err != nil {
 			t.Fatal(err)
 		}
-		loops = append(loops, loop{command, stdin, stderr})
-		go func() {
-			line, _ := bufio.NewReader(stdout).ReadString('\n')
-			results <- strings.TrimSpace(line)
-		}()
+		loops = append(loops, loop{command, stdin, bufio.NewReader(stdout), stderr})
+		actors = append(actors, actor)
 	}
-	t.Cleanup(func() {
-		for _, l := range loops {
-			_ = l.command.Process.Kill()
-			_ = l.command.Wait()
-		}
-	})
 
-	reads, notRed, unknown := 0, 0, 0
-	var first string
-	var outputs []string
-	for len(outputs) < 2 {
-		select {
-		case output := <-results:
-			outputs = append(outputs, output)
-			continue
-		default:
-		}
-		if err := recorder.ServerDown(3 * time.Second); err != nil {
-			t.Fatalf("tickle: %v", err)
-		}
-		r, g, b, err := recorder.ReadRGB()
-		if Contended(err) {
-			unknown++
-			continue
-		}
+	var run uhidLockOrderRun
+	recorderActor := sim.Go("recorder", true, 0, func() {
+		// Opened here, its exchanges run on the simulation's clock only.
+		opened, err := OpenBlink1("/sys", devRoot)
 		if err != nil {
-			t.Fatalf("recorder read: %v", err)
+			sim.fail("open the uhid blink(1): %v", err)
+			return
 		}
-		reads++
-		if r != 255 || g != 0 || b != 0 {
-			notRed++
-			if first == "" {
-				first = fmt.Sprintf("%d,%d,%d", r, g, b)
+		recorder := opened.(*blink1)
+		defer func() { _ = recorder.Close() }()
+		// The recorder lights red as it starts recording; a write that does
+		// not get the light is tried again.
+		for err := recorder.SetRGB(255, 0, 0); err != nil; err = recorder.SetRGB(255, 0, 0) {
+			if !Contended(err) {
+				sim.fail("the recorder's red write: %v", err)
+				return
 			}
 		}
-	}
+		for !sim.Ended(actors) {
+			if err := recorder.ServerDown(3 * time.Second); err != nil {
+				sim.fail("tickle: %v", err)
+				return
+			}
+			r, g, b, err := recorder.ReadRGB()
+			if Contended(err) {
+				run.unknown++
+				continue
+			}
+			if err != nil {
+				sim.fail("the recorder's read: %v", err)
+				return
+			}
+			run.reads++
+			if r != 255 || g != 0 || b != 0 {
+				if run.notRed++; run.first == "" {
+					run.first = fmt.Sprintf("%d,%d,%d", r, g, b)
+				}
+			}
+		}
+	})
+	sim.Run(time.Minute)
+	run.held = sim.Sleeps(recorderActor, recorderPoll)
 	for _, l := range loops {
+		line, _ := l.stdout.ReadString('\n')
 		_ = l.stdin.Close()
 		if err := l.command.Wait(); err != nil {
-			t.Fatalf("light-state loop: %v: %s", err, l.stderr)
+			t.Fatalf("light-state process: %v: %s", err, l.stderr)
 		}
+		run.loops = append(run.loops, strings.TrimSpace(line))
 	}
+	return run
+}
 
-	t.Logf("the recorder read its red light %d times, %d not red, %d unknown; light-state (reads, not red, unknown): %s", reads, notRed, unknown, strings.Join(outputs, "; "))
-	if reads < 20 {
-		t.Fatalf("the recorder read the light only %d times while light-state ran: too few to show anything", reads)
-	}
-	if notRed > 0 {
-		t.Errorf("the recorder read its red light as not red %d of %d times, first %s", notRed, reads, first)
-	}
-	if unknown > 0 {
-		t.Errorf("the recorder's read got no light %d of %d times while light-state ran, want 0", unknown, reads+unknown)
-	}
-	for _, output := range outputs {
-		var loopReads, loopNotRed, loopUnknown int
-		if _, err := fmt.Sscan(output, &loopReads, &loopNotRed, &loopUnknown); err != nil || loopReads+loopUnknown != 150 || loopReads < 20 {
-			t.Fatalf("light-state loop printed %q, want 150 runs, at least 20 of them reads", output)
-		}
-		if loopNotRed > 0 {
-			t.Errorf("light-state read the red light as not red %d of %d times", loopNotRed, loopReads)
-		}
+// TestUhidARecorderReadIsNotAnsweredByLightState fails if the recorder's read
+// of its red light, or a `ghost-wispr light-state` run meanwhile, is answered
+// by the other's command on a real hidraw node: on the office Pi the recorder
+// read 0,51,51, light-state's version reply, and light-state read 1,1,44, the
+// recorder's watchdog tickle. Here the recorder tickles the watchdog and reads
+// the light back, over and over, while four other processes run light-state
+// 30 times each, back to back. A light-state read may then not get the light
+// within its wait: it reports unknown, which is allowed. A colour other than
+// red is not, and the recorder, which goes first, must get the light each time:
+// an unknown read drops a buffer of audio (review of #79).
+//
+// Run on the real clock, the recorder's order was only as good as the
+// machine's timers: at load 690 to 2,240 on sami-devbox the recorder's read
+// got no light 4 of 383 times, as on main. So the recorder and the
+// light-state processes run on a lock simulation (lockSim, pipeClock), which
+// wakes them in the order their waits give; the flock and the transfers are
+// still the kernel's. Control: with light-state processes that wait and poll
+// as the recorder does (OpenBlink1), the recorder's reads lose the light.
+//
+// uhid fails a request with EIO when a signal ends its wait for the reply,
+// and Go's runtime preempts goroutines with signals, so the test needs
+// GODEBUG=asyncpreemptoff=1. A USB blink(1)'s requests do not wait on signals.
+func TestUhidARecorderReadIsNotAnsweredByLightState(t *testing.T) {
+	for _, seed := range lockOrderSeeds[:2] {
+		t.Run(fmt.Sprint("seed ", seed), func(t *testing.T) {
+			run := runUhidLockOrder(t, seed, false)
+			t.Logf("the recorder read its red light %d times, %d not red, %d unknown, found it held %d times; light-state (reads, not red, unknown): %s", run.reads, run.notRed, run.unknown, run.held, strings.Join(run.loops, "; "))
+			if run.notRed > 0 {
+				t.Errorf("the recorder read its red light as not red %d of %d times, first %s", run.notRed, run.reads, run.first)
+			}
+			if run.unknown > 0 {
+				t.Errorf("the recorder's read got no light %d of %d times while light-state ran, want 0", run.unknown, run.reads+run.unknown)
+			}
+			for _, output := range run.loops {
+				var reads, notRed, unknown int
+				if _, err := fmt.Sscan(output, &reads, &notRed, &unknown); err != nil || reads+unknown != uhidLockOrderIterations || reads < 20 {
+					t.Errorf("light-state process printed %q, want %d runs, at least 20 of them reads", output, uhidLockOrderIterations)
+				} else if notRed > 0 {
+					t.Errorf("light-state read the red light as not red %d of %d times", notRed, reads)
+				}
+			}
+			if !t.Failed() && (run.reads < 20 || run.held == 0) {
+				t.Fatalf("control: the recorder read the light %d times and found it held %d times while light-state ran, want at least 20 and once: too few to show anything", run.reads, run.held)
+			}
+		})
+		t.Run(fmt.Sprint("control: light-state polling as the recorder does, seed ", seed), func(t *testing.T) {
+			run := runUhidLockOrder(t, seed, true)
+			t.Logf("the recorder read its red light %d times, %d not red, %d unknown, found it held %d times; light-state (reads, not red, unknown): %s", run.reads, run.notRed, run.unknown, run.held, strings.Join(run.loops, "; "))
+			if run.unknown == 0 {
+				t.Fatal("with light-state processes that poll as the recorder does, every read of the recorder got the light: the test cannot see a lost lock order")
+			}
+		})
 	}
 }

@@ -67,6 +67,24 @@ const (
 	exchangeGap  = 3 * time.Millisecond
 )
 
+// lockClock is the clock of the exchange lock: a handle's gap before an
+// exchange, its deadline and its polls (exchange, flockUntil). The waiters'
+// order follows from these waits, and a test that swaps in a clock it drives
+// runs them in that order whatever the machine's load, instead of in the
+// order a loaded machine happens to end each sleep.
+var lockClock clock = systemClock{}
+
+// clock is what the exchange lock reads the time from and sleeps on.
+type clock interface {
+	Now() time.Time
+	Sleep(time.Duration)
+}
+
+type systemClock struct{}
+
+func (systemClock) Now() time.Time        { return time.Now() }
+func (systemClock) Sleep(d time.Duration) { time.Sleep(d) }
+
 var featureIOCTL = func(fd uintptr, request uintptr, report *[8]byte) error {
 	_, _, errno := unix.Syscall(unix.SYS_IOCTL, fd, request, uintptr(unsafe.Pointer(&report[0])))
 	if errno != 0 {
@@ -300,7 +318,7 @@ func openBlink1(sysfsRoot, devRoot string, command bool) (Light, error) {
 		}
 		light := &blink1{file: file, serial: uniq(string(uevent)), command: command}
 		if command {
-			light.released = time.Now()
+			light.released = lockClock.Now()
 		}
 		if light.serial != "" {
 			checkedMu.Lock()
@@ -393,14 +411,14 @@ func (b *blink1) exchange(report *[8]byte, reply, anyway bool) error {
 	if b.command {
 		wait, poll = commandWait, commandPoll
 	}
-	deadline := time.Now().Add(wait)
+	deadline := lockClock.Now().Add(wait)
 	b.mu.Lock()
 	defer func() {
-		b.released = time.Now()
+		b.released = lockClock.Now()
 		b.mu.Unlock()
 	}()
-	if free := exchangeGap - time.Since(b.released); free > 0 {
-		time.Sleep(free)
+	if free := exchangeGap - lockClock.Now().Sub(b.released); free > 0 {
+		lockClock.Sleep(free)
 	}
 	if err := flockUntil(fd, deadline, poll); err != nil {
 		if anyway && !reply && errors.Is(err, ErrBusy) {
@@ -431,10 +449,10 @@ func flockUntil(fd uintptr, deadline time.Time, poll time.Duration) error {
 		if !errors.Is(err, unix.EWOULDBLOCK) && !errors.Is(err, unix.EINTR) {
 			return fmt.Errorf("lock blink(1): %w", err)
 		}
-		if !time.Now().Before(deadline) {
+		if !lockClock.Now().Before(deadline) {
 			return ErrBusy
 		}
-		time.Sleep(poll)
+		lockClock.Sleep(poll)
 	}
 }
 
