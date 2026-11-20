@@ -100,7 +100,6 @@ func gateTraceName(trace []gateReply) string {
 	return strings.Join(parts, "__")
 }
 
-
 type gateStreamEvent struct {
 	reply int
 	kind  replyEvent
@@ -123,14 +122,8 @@ func TestSpeechGateEventInterleavings(t *testing.T) {
 				name += fmt.Sprintf("/injected-%d", injected+1)
 			}
 			if !t.Run(name, func(t *testing.T) {
-				setSpeechGap(t, time.Minute)
-				stand := startStandIn(t)
-				base := newFakeOutput()
-				out := newGateOrderingOutput(base)
-				sess, c, _ := open(t, stand, Config{}, voice.Exchange{Out: out, Tools: tools(nil)})
-				t.Cleanup(func() { _ = sess.Close() })
 				everyAudioDoneTextInterleaving(replies, func(trace []gateStreamEvent) {
-					runGateEventInterleaving(t, sess, c, out, base, trace, injected)
+					runGateEventInterleaving(t, trace, injected)
 				})
 			}) {
 				return
@@ -154,6 +147,17 @@ func everyAudioDoneTextInterleaving(replies int, yield func([]gateStreamEvent)) 
 			if next[reply] == eventsPerReply {
 				continue
 			}
+			// Binary audio frames have no reply ID, so Deepgram cannot start
+			// reply N+1's audio before it has ended reply N's audio. Text is
+			// separate and may arrive after that boundary.
+			if next[reply] == 0 && reply > 0 && next[reply-1] < 2 {
+				continue
+			}
+			// ConversationText also has no reply ID. It remains in reply order
+			// even when a reply's text trails the next reply's audio.
+			if next[reply] == 2 && reply > 0 && next[reply-1] < 3 {
+				continue
+			}
 			trace = append(trace, gateStreamEvent{reply: reply, kind: order[next[reply]]})
 			next[reply]++
 			visit()
@@ -164,8 +168,15 @@ func everyAudioDoneTextInterleaving(replies int, yield func([]gateStreamEvent)) 
 	visit()
 }
 
-func runGateEventInterleaving(t *testing.T, sess voice.Session, c *agentConn, out *gateOrderingOutput, base *fakeOutput, trace []gateStreamEvent, injected int) {
+func runGateEventInterleaving(t *testing.T, trace []gateStreamEvent, injected int) {
 	t.Helper()
+	setSpeechGap(t, time.Minute)
+	stand := startStandIn(t)
+	base := newFakeOutput()
+	out := newGateOrderingOutput(base)
+	sess, c, _ := open(t, stand, Config{}, voice.Exchange{Out: out, Tools: tools(nil)})
+	defer func() { _ = sess.Close() }()
+
 	before := outputSamples(t, base)
 	texts := make([]string, 0, 3)
 	samples := make([]int16, 0, 3)
@@ -214,8 +225,13 @@ func runGateEventInterleaving(t *testing.T, sess voice.Session, c *agentConn, ou
 	c.send(map[string]any{"type": "ConversationText", "role": "assistant", "content": barrierText})
 	c.sendAudio(barrierPCM)
 	c.send(map[string]any{"type": "AgentAudioDone"})
-	if err := returned(t, barrier); err != nil {
-		t.Fatalf("%s: ordering barrier = %v", gateStreamName(trace), err)
+	select {
+	case err := <-barrier:
+		if err != nil {
+			t.Fatalf("%s: ordering barrier = %v", gateStreamName(trace), err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatalf("%s: ordering barrier did not return", gateStreamName(trace))
 	}
 
 	got := outputDelta(t, before, outputSamples(t, base))
@@ -231,6 +247,7 @@ func runGateEventInterleaving(t *testing.T, sess voice.Session, c *agentConn, ou
 	if got[900] != len(barrierPCM) {
 		t.Fatalf("%s: barrier reached Output: %d bytes, want %d", gateStreamName(trace), got[900], len(barrierPCM))
 	}
+
 }
 
 func gateStreamName(trace []gateStreamEvent) string {
@@ -441,7 +458,7 @@ func testSolReviewCrossUtteranceState(t *testing.T) {
 		stand := startStandIn(t)
 		out := newFakeOutput()
 		sess, c, _ := open(t, stand, Config{}, voice.Exchange{Out: out, Tools: tools(nil)})
-		defer sess.Close()
+		defer func() { _ = sess.Close() }()
 
 		c.sendAudio(tone(OutputRate, 20*time.Millisecond, -111))
 		c.send(map[string]any{"type": "AgentAudioDone"})
@@ -468,17 +485,19 @@ func testSolReviewCrossUtteranceState(t *testing.T) {
 		base := newFakeOutput()
 		out := newGateOrderingOutput(base)
 		sess, c, _ := open(t, stand, Config{}, voice.Exchange{Out: out, Tools: tools(nil)})
-		defer sess.Close()
+		defer func() { _ = sess.Close() }()
 
 		injected := tone(OutputRate, 20*time.Millisecond, 666)
 		model := tone(OutputRate, 20*time.Millisecond, -777)
 		out.blockNextWrite()
 		done := sayAsync(sess, "Interleaved injected reply.")
 		c.expect(t, "InjectAgentMessage")
-		c.sendAudio(injected) // A1
-		c.send(map[string]any{"type": "AgentAudioDone"}) // D1
-		c.sendAudio(model) // A2
-		c.send(map[string]any{"type": "ConversationText", "role": "assistant", "content": "Interleaved injected reply."}) // T1
+		// A1, D1, A2, T1: injection one's completed audio is still pending
+		// when model reply two starts. T1 must release A1 and never A2.
+		c.sendAudio(injected)
+		c.send(map[string]any{"type": "AgentAudioDone"})
+		c.sendAudio(model)
+		c.send(map[string]any{"type": "ConversationText", "role": "assistant", "content": "Interleaved injected reply."})
 		out.waitForSayWrite(t, done, 1)
 		select {
 		case err := <-done:
@@ -486,8 +505,9 @@ func testSolReviewCrossUtteranceState(t *testing.T) {
 		case <-time.After(10 * time.Millisecond):
 		}
 		out.releaseWrite()
-		c.send(map[string]any{"type": "ConversationText", "role": "assistant", "content": "Rejected model reply."}) // T2
-		c.send(map[string]any{"type": "AgentAudioDone"}) // D2
+		// T2, D2
+		c.send(map[string]any{"type": "ConversationText", "role": "assistant", "content": "Rejected model reply."})
+		c.send(map[string]any{"type": "AgentAudioDone"})
 		if err := returned(t, done); err != nil {
 			t.Fatalf("interleaved Say = %v, want nil", err)
 		}
@@ -513,7 +533,7 @@ func testSolReviewCrossUtteranceState(t *testing.T) {
 		base := newFakeOutput()
 		out := newGateOrderingOutput(base)
 		sess, c, _ := open(t, stand, Config{}, voice.Exchange{Out: out, Tools: tools(nil)})
-		defer sess.Close()
+		defer func() { _ = sess.Close() }()
 
 		firstPCM := tone(OutputRate, 20*time.Millisecond, 333)
 		out.blockNextWrite()
@@ -551,7 +571,7 @@ func testSolReviewCrossUtteranceState(t *testing.T) {
 		setSpeechGap(t, time.Minute)
 		stand := startStandIn(t)
 		sess, c, _ := open(t, stand, Config{sayLimit: 50 * time.Millisecond}, voice.Exchange{Out: newFakeOutput(), Tools: tools(nil)})
-		defer sess.Close()
+		defer func() { _ = sess.Close() }()
 
 		done := sayAsync(sess, "No audio reply.")
 		c.expect(t, "InjectAgentMessage")

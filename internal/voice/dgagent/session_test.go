@@ -1795,6 +1795,14 @@ func TestFallbackToolErrorStaysOutOfDebugLog(t *testing.T) {
 	case <-time.After(3 * time.Second):
 		t.Fatal("the model's own answer did not reach the fallback tool")
 	}
+	// The failure is logged after the tool returns. Waiting for that line
+	// keeps a Close from ending the run before the log this test reads.
+	for deadline := time.Now().Add(3 * time.Second); !strings.Contains(logs.String(), "the answer failed"); {
+		if time.Now().After(deadline) {
+			t.Fatalf("UNKNOWN: the fallback failure was never logged:\n%s", logs.String())
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
 	_ = sess.Close()
 	if got := logs.String(); strings.Contains(got, words) {
 		t.Fatalf("fallback tool error reached Debug log:\n%s", got)

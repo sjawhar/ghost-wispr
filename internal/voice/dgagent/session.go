@@ -145,7 +145,7 @@ func start(cfg *Config, conn *websocket.Conn, x *voice.Exchange) *session {
 		cancel:     cancel,
 		done:       make(chan struct{}),
 		events:     make(chan voice.Event, eventBuffer),
-		speech:     newSpeechQueue(cfg.speechGap),
+		speech:     newSpeechQueue(),
 		speechGap:  cfg.speechGap,
 		keepAlive:  cfg.keepAlive,
 		sayLimit:   cfg.sayLimit,
@@ -383,10 +383,10 @@ func (s *session) refused(kind string) {
 // they are the waiting injection's. Deepgram echoes an injected text one
 // sentence at a time, and may first finish the reply it was speaking, so
 // the words are matched in order against what the injection has left, by
-// words alone: punctuation and capitals may differ. Once all are echoed, a
-// Say waits for the player to queue their audio; audioFirst says the audio
-// of these words came before them.
-func (s *session) spoken(content string, audioFirst bool) bool {
+// words alone: punctuation and capitals may differ. The reply object holds
+// its own authorization and waiter, so an earlier reply cannot complete this
+// Say or release its audio.
+func (s *session) spoken(content string, u *utterance) bool {
 	words := wordsOf(content)
 	if len(words) == 0 {
 		return false
@@ -397,32 +397,17 @@ func (s *session) spoken(content string, audioFirst bool) bool {
 	if w == nil || len(words) > len(w.remaining) || !slices.Equal(w.remaining[:len(words)], words) {
 		return false
 	}
+	u = s.speech.injection(u)
 	w.remaining = w.remaining[len(words):]
 	if len(w.remaining) > 0 {
-		s.speech.unmute() // the injection's next sentence may follow
+		s.speech.allow(u, nil)
 		return true
 	}
 	s.say = nil
 	close(w.echoed)
+	s.speech.allow(u, w)
 	if !w.untilAudio {
-		s.speech.unmute()
 		w.finish(nil)
-		return true
-	}
-	// An injection's audio may have arrived before its echo. It has not
-	// reached Output until the text authorizes it, whether or not
-	// AgentAudioDone already arrived. Mark before unmuting it, so Say ends
-	// only after its buffered audio queues.
-	switch {
-	case audioFirst && s.speech.waitingAudio():
-		s.speech.mark(w, false)
-		s.speech.unmute()
-	case audioFirst:
-		s.speech.mark(w, true)
-		s.speech.unmute()
-	default:
-		s.speech.unmute()
-		s.speech.mark(w, false)
 	}
 	return true
 }
@@ -439,16 +424,16 @@ func (s *session) spoken(content string, audioFirst bool) bool {
 // Each text's kind is logged at Debug, without its words, so a probe can
 // count the model's own words that played.
 func (s *session) agentSaid(m *serverMessage) bool {
-	audioFirst := s.speech.textCame()
+	u := s.speech.textCame()
 	// Words given up on come first: Deepgram speaks its queue in order, and
 	// the next injection may begin with the same words, such as an answer
 	// after the routing line that was given up on.
 	if s.abandonedSaid(m.Content) {
 		s.log.Info("words the session gave up on are not played")
-		s.speech.mute()
+		s.speech.reject(s.speech.foreign(u))
 		return false
 	}
-	if s.spoken(m.Content, audioFirst) {
+	if s.spoken(m.Content, u) {
 		s.log.Debug("agent words", "kind", "injected")
 		return true // an injection's words: spoken unmutes them
 	}
@@ -456,7 +441,7 @@ func (s *session) agentSaid(m *serverMessage) bool {
 		// Voice C asks for no Think Live; a filler that comes anyway is
 		// worded by Deepgram's model, and is not played.
 		s.log.Debug("agent words", "kind", "filler")
-		s.speech.mute()
+		s.speech.reject(s.speech.foreign(u))
 		return false
 	}
 	s.mu.Lock()
@@ -471,7 +456,8 @@ func (s *session) agentSaid(m *serverMessage) bool {
 		takeTurn = true
 		s.answeredTurn = turn
 		s.modelQuiet = true
-		s.speech.gate()
+		// This reply is decided below; a later reply starts with its own
+		// utterance object and needs no session-wide gate reset.
 		if s.heldAnswer.turn != turn {
 			s.heldAnswer = held{}
 		}
@@ -479,7 +465,7 @@ func (s *session) agentSaid(m *serverMessage) bool {
 	s.mu.Unlock()
 	if takeTurn {
 		s.log.Info("the model answered a turn in its own words; the Concierge answers it instead")
-		s.speech.mute()
+		s.speech.reject(s.speech.foreign(u))
 		s.answerTurn(turn, words, heard)
 		return false
 	}
@@ -491,7 +477,7 @@ func (s *session) agentSaid(m *serverMessage) bool {
 	// No model words play. An injected answer or allowed routing line is the
 	// only Deepgram speech that reaches Output, even before the first user
 	// turn or after a session that has delivered only a held answer.
-	s.speech.mute()
+	s.speech.reject(s.speech.foreign(u))
 	return false
 }
 
@@ -587,16 +573,8 @@ func (s *session) roomTurn(words string, heard bool) {
 	if stale != nil {
 		stale.finish(ErrNotSpoken)
 	}
-	switch {
-	case starts && heard:
-		// Words with no start before them: the reply to them is next.
-		s.speech.ungate()
-		s.speech.gate()
-	case starts:
-		// A start leaves what is queued playing (barge-in is the
-		// Supervisor's); the reply after it waits for its text.
-		s.speech.gate()
-	}
+	// Each reply starts and ends in speechQueue. The room turn changes no
+	// speech authorization: a later Deepgram reply always has its own object.
 }
 
 // armRetryLocked hands the held answer over again after retryGrace, unless
@@ -721,6 +699,7 @@ func (s *session) Close() error {
 	s.closeOnce.Do(func() {
 		close(s.done)
 		s.cancel()
+		s.speech.close(ErrClosed)
 		s.mu.Lock()
 		if s.retry != nil {
 			s.retry.Stop()
@@ -896,6 +875,7 @@ func (s *session) lost(err error) {
 		c.cancel()
 		c.void()
 	}
+	s.speech.close(reason)
 	s.endSay(reason)
 }
 
