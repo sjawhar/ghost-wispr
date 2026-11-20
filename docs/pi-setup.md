@@ -739,8 +739,12 @@ identity. The fifth recording rule tells the room that a question sent to an age
    provisioning rewrites `.env`, so give it `dispatch-token` each time: mint a new token, and revoke
    the old one (`DELETE /api/v1/me/agent-tokens/{id}`). Without it the voice answers "I cannot reach
    Dispatch yet".
-3. After the deploy, `/api/status` must hold no `voice` warning, and the journal must say
-   `voice: on (voice A on gemini, ...)`.
+3. After the deploy, `/api/status` must hold no `voice` warning, and the service's journal
+   (`sudo journalctl _SYSTEMD_USER_UNIT=ghost-wispr.service`) must say `voice: ready (wake phrases
+   ["Wispr" "Ghost Wispr"]; ...)` and `concierge: the Envoy session is open`. The voice reads
+   `voice.enabled` and `voice.engine` at each call, so the journal names no engine: `/api/config`
+   shows which voice speaks (`"voice":{"enabled":true,"engine":"tts","tts_engine":"gemini"}` is
+   voice A on Gemini).
 4. Time to first audio of the first sentence: the Gemini engine warms its connection when the voice
    opens, at the wake. Measure it once on the Pi, with and without the warm-up, using the voice
    package's live test (`GHOST_WISPR_LIVE_TTS=gemini ... TestLiveFirstSayTimeToFirstAudio`, built for
