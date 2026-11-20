@@ -11,8 +11,9 @@ import (
 // keeps text only in memory and emits a count, never words, when the speech
 // ends.
 type factAudit struct {
-	source string
-	actual strings.Builder
+	source      string
+	questionKey string
+	actual      strings.Builder
 }
 
 // beginFactAudit starts measuring a fact or an answer. Empty sources need no
@@ -23,7 +24,10 @@ func (s *session) beginFactAudit(source string) *factAudit {
 	if strings.TrimSpace(source) == "" {
 		return nil
 	}
-	a := &factAudit{source: source}
+	a := &factAudit{
+		source:      source,
+		questionKey: earcheck.Key.FindString(s.x.AskerTurn),
+	}
 	s.factMu.Lock()
 	s.facts = append(s.facts, a)
 	s.factMu.Unlock()
@@ -64,7 +68,7 @@ func (s *session) finishFactAudits() {
 	s.facts = nil
 	s.factMu.Unlock()
 	for _, a := range audits {
-		n := spokenFactErrors(a.source, a.actual.String())
+		n := spokenFactErrors(a.source, a.actual.String(), a.questionKey)
 		s.factErrors.Add(int64(n))
 		s.emit(&voice.Event{Kind: voice.EventFactCheck, Count: n})
 	}
@@ -75,10 +79,10 @@ func (s *session) finishFactAudits() {
 func (s *session) SpokenFactErrors() int { return int(s.factErrors.Load()) }
 
 // spokenFactErrors counts R8 verdicts: a valid spoken rewrite is zero and an
-// invented name, changed key/figure or failed ear form is one. The count has
-// no fact text, so the room test can record it safely.
-func spokenFactErrors(source, spoken string) int {
-	if earcheck.Check(spoken, source, "") != "" {
+// invented name, changed key/figure, missing question key or failed ear form
+// is one. The count has no fact text, so the room test can record it safely.
+func spokenFactErrors(source, spoken, questionKey string) int {
+	if earcheck.Check(spoken, source, questionKey) != "" {
 		return 1
 	}
 	return 0

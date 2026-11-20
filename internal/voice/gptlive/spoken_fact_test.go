@@ -104,8 +104,38 @@ func TestSpokenFactCheckUsesConciergeR8(t *testing.T) {
 		"changed figure": {"PR 3 is ready.", "PR 4 is ready.", 1},
 	} {
 		t.Run(name, func(t *testing.T) {
-			if got := spokenFactErrors(c.source, c.spoken); got != c.want {
+			if got := spokenFactErrors(c.source, c.spoken, ""); got != c.want {
 				t.Fatalf("spokenFactErrors(%q, %q) = %d, want %d", c.source, c.spoken, got, c.want)
+			}
+		})
+	}
+}
+
+// The asker named ABC-123, so R8 requires GPT-Live to retain it even though
+// it is also in the written source.
+func TestSolR4FactAuditMustRetainTheQuestionsKey(t *testing.T) {
+	for _, tc := range []struct {
+		name, spoken string
+		bad          bool
+	}{
+		{"unchanged key control", "ABC-123 is in review.", false},
+		{"question key silently omitted", "It is in review.", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			x := testExchange(newFakeOutput(), newFakeTools(voice.AnswerResult{}))
+			x.AskerTurn = "What is happening with ABC-123?"
+			srv := newLiveServer(t)
+			s, c, _ := openSession(t, srv, x)
+			done := make(chan error, 1)
+			go func() { done <- s.Say(context.Background(), "ABC-123 is in review.", voice.Fact) }()
+			c.expect(evCommentaryAppend)
+			c.speak(tc.spoken)
+			if err := <-done; err != nil {
+				t.Fatal(err)
+			}
+			n := waitFactCheck(t, s)
+			if (n > 0) != tc.bad {
+				t.Errorf("question explicitly named ABC-123; spoken=%q, fact failures=%d, expected invalid=%t", tc.spoken, n, tc.bad)
 			}
 		})
 	}
