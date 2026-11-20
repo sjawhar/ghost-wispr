@@ -182,25 +182,28 @@ def systemctl(args):
         sys.stderr.write("fake systemctl: unexpected call: %s\n" % " ".join(args))
         return 2
     verb = args[1]
+    if verb == "stop" and "sigint" in SCENARIO:
+        # The systemctl wrapper first checks it inherited the driver's INT
+        # ignore. CPython resets an inherited ignored SIGINT to its
+        # KeyboardInterrupt handler on start, so the wrapper passes its check
+        # here and this fake reapplies only the verified disposition.
+        if os.environ.get("GW_FAKE_SYSTEMCTL_SIGINT_IGNORED") != "1":
+            sys.stderr.write("fake systemctl: missing verified sigint disposition\n")
+            return 1
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+        # Hold until the controller sends the second Ctrl-C while restore stops
+        # the service; then stop normally.
+        log_to("systemctl.log", verb)
+        for _ in range(500):
+            if os.path.exists(spath("stop-go")):
+                break
+            time.sleep(0.02)
+        stop()
+        return 0
     log_to("systemctl.log", verb)
     if verb == "start":
         return start()
     if verb == "stop":
-        # In the sigint case a stop holds until the test says go, so that the test's second
-        # Ctrl-C lands while the restore is stopping the service, however loaded the machine is.
-        # The fake systemctl is not the service or the driver: while it holds the restore, it
-        # ignores that second signal. Otherwise Python turns it into KeyboardInterrupt before
-        # stop() runs, so the test reports the driver's restore failed rather than testing it.
-        restore_int = None
-        if "sigint" in SCENARIO:
-            restore_int = signal.signal(signal.SIGINT, signal.SIG_IGN)
-            try:
-                for _ in range(500):
-                    if os.path.exists(spath("stop-go")):
-                        break
-                    time.sleep(0.02)
-            finally:
-                signal.signal(signal.SIGINT, restore_int)
         stop()
         return 0
     if verb == "restart":
@@ -791,7 +794,22 @@ if __name__ == "__main__":
 EOF
 
 for tool in systemctl curl aplay arecord ffmpeg journalctl; do
-  printf '#!/usr/bin/env bash\nexec python3 %q %s "$@"\n' "$fakepi" "$tool" >"$root/bin/$tool"
+  if [[ $tool == systemctl ]]; then
+    cat >"$root/bin/$tool" <<EOF
+#!/usr/bin/env bash
+if [[ \${GW_FAKE_SCENARIO:-} == *sigint* && \${1:-} == --user && \${2:-} == stop && \${3:-} == ghost-wispr.service ]]; then
+  trap -p INT >"\$GW_FAKE_STATE/systemctl-sigint-trap"
+  grep -qx "trap -- '' SIGINT" "\$GW_FAKE_STATE/systemctl-sigint-trap" || { printf 'fake systemctl: the sigint restore did not ignore SIGINT\\n' >&2; exit 1; }
+  # Bash observed the driver's mask. Pass that observation to the Python fake,
+  # which must reapply it because CPython resets it at program startup.
+  trap '' INT
+  exec env GW_FAKE_SYSTEMCTL_SIGINT_IGNORED=1 python3 $(printf '%q' "$fakepi") systemctl "\$@"
+fi
+exec python3 $(printf '%q' "$fakepi") systemctl "\$@"
+EOF
+  else
+    printf '#!/usr/bin/env bash\nexec python3 %q %s "$@"\n' "$fakepi" "$tool" >"$root/bin/$tool"
+  fi
 done
 chmod +x "$root/bin/"*
 
@@ -1053,6 +1071,8 @@ for _ in $(seq 500); do
   sleep 0.02
 done
 grep -qx stop "$dir/state/systemctl.log" || check_failed 'sigint: the restore never stopped the service'
+grep -qx "trap -- '' SIGINT" "$dir/state/systemctl-sigint-trap" \
+  || check_failed 'sigint: fake systemctl did not observe the driver ignoring SIGINT before its restore stop'
 kill -INT -- "-$driver_pid" 2>/dev/null
 touch "$dir/state/stop-go"
 wait "$driver_pid"
@@ -1312,6 +1332,10 @@ expect_rc ask-no-trace 1
 expect_line ask-no-trace 'FAIL: ask-holder: the journal has no "concierge told an agent its question was cancelled"'
 expect_restored ask-no-trace
 
+# barge-in.
+expect_rc barge 0
+expect_line barge 'PASS: barge-in: 0 of 2 backchannels stopped the speech, at most 0'
+expect_line barge 'NOTE: barge-in round 2 (backchannel): the speech went on'
 # The fake Pi timestamps a clip when its fake aplay process runs, while the
 # driver measures the real wall clock. Under devbox load their process handoff
 # adds hundreds of milliseconds. The upper bound must be the driver's actual
