@@ -1,7 +1,9 @@
 package concierge
 
 import (
+	"cmp"
 	"context"
+	"slices"
 	"strings"
 
 	"github.com/google/uuid"
@@ -10,30 +12,52 @@ import (
 	"github.com/sjawhar/ghost-wispr/internal/storage"
 )
 
+// QuestionsAsked is the number of the last question the Concierges of this
+// process have asked: the mark the voice reads when "Wispr, never mind" is
+// said. It reads one counter and never waits.
+func (c *Concierge) QuestionsAsked() uint64 {
+	return questionsAsked.Load()
+}
+
 // NeverMind answers "Wispr, never mind": it cancels meeting sessionID's
-// newest working question and tells its holder (R7). With no working
-// question it does nothing.
-func (c *Concierge) NeverMind(ctx context.Context, sessionID string) error {
+// newest working question numbered at most asked (QuestionsAsked when it was
+// said), tells its holder (R7) and reports true. Newest and before go by
+// each task's asked number, kept in its row from the moment it is recorded,
+// never by its time: a question asked after the never mind, as while an
+// earlier never mind still told its holder, is not its to cancel, whatever
+// the wall clock says. A task with no number, from before numbers were kept,
+// counts as asked first. A question that stopped working before its cancel
+// landed, as when its answer arrived meanwhile, is passed over for the next
+// one. With no such question it does nothing and reports false: the voice
+// then drops its newest held answer.
+func (c *Concierge) NeverMind(ctx context.Context, sessionID string, asked uint64) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, err // the voice stopped: nothing to cancel for it
+	}
 	tasks, err := c.store.VoiceTasks(sessionID)
 	if err != nil {
-		return err
+		return false, err
 	}
+	slices.SortStableFunc(tasks, func(a, b storage.VoiceTask) int { return cmp.Compare(a.AskedNumber, b.AskedNumber) })
 	for i := len(tasks) - 1; i >= 0; i-- {
 		task := tasks[i]
-		if task.State != storage.VoiceTaskWorking {
+		if task.State != storage.VoiceTaskWorking || task.AskedNumber > asked {
 			continue
 		}
 		moved, err := c.store.EndVoiceTask(task.ID, storage.VoiceTaskCancelled)
-		if err != nil || !moved {
-			return err
+		if err != nil {
+			return false, err
+		}
+		if !moved {
+			continue
 		}
 		c.tellChanged(sessionID)
 		agent := strings.TrimPrefix(task.Holder, "session:")
 		c.forget(agent, task.ID)
 		c.tellHolderEnded(ctx, &task, agent, storage.VoiceTaskCancelled, "the room no longer needs it")
-		return nil
+		return true, nil
 	}
-	return nil
+	return false, nil
 }
 
 // tellHolderEnded sends agent a short notice, asking no reply, that task's

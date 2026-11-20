@@ -39,7 +39,7 @@ func (d *slowQueryBlink1) ioctl(_ uintptr, request uintptr, report *[8]byte) err
 	d.log = append(d.log, "SET "+string(report[1]))
 	switch report[1] {
 	case 'R':
-		d.buffer = [8]byte{0x01, 'R', 0, 0, 0, 0, 10, report[7]} // a black line with a duration
+		d.buffer = [8]byte{0x01, 'R', 0, 0, 0, 0, 10, 0} // a black line with a duration, on every LED
 	case 'r':
 		d.buffer = [8]byte{0x01, 'r', d.colour[0], d.colour[1], d.colour[2]}
 	case 'n':
@@ -212,6 +212,7 @@ func TestAPatternCheckStepSendsOneCommand(t *testing.T) {
 			} else {
 				report[6] = 10
 			}
+			report[7] = 0 // the line's LED: every LED
 		}
 		return nil
 	}

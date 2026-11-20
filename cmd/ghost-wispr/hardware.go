@@ -318,6 +318,15 @@ func (h *hardwareControl) Wake() {
 	}
 }
 
+// showWaiting tells the light controller whether something waits for a
+// person: LED 2 of the blink(1) then flashes green while the unit records
+// (indicator.Controller.SetWaiting). Without a light it does nothing.
+func (h *hardwareControl) showWaiting(waiting bool) {
+	if h.controller != nil {
+		h.controller.SetWaiting(waiting)
+	}
+}
+
 func (h *hardwareControl) holdsRed() bool {
 	return h.redHolds.Load() > 0
 }
@@ -513,6 +522,10 @@ func startHardware(ctx context.Context, cfg *config.Config, capture *captureGate
 		guard := newLightGuard(capture, warnings, lightRetryEvery)
 		hardware.reportLight = guard.report
 		hardware.controller = indicator.NewController(hardware.light, wantRed, lightCheckEvery, guard.report)
+		// LED 2 flashes only while room audio reaches the recording: not while
+		// the microphone closes after a pause, nor while a red hold keeps the
+		// light red for a microphone that reopens.
+		hardware.controller.FlashWhile(func() bool { return recordingSignal(capture, mic) })
 		go guard.run(ctx)
 		go func() {
 			defer close(done)
@@ -774,6 +787,30 @@ func (l *reconnectingLight) SetRGB(r, g, b uint8) error {
 		return l.failed(err)
 	}
 	return nil
+}
+
+// SetLED2 writes the light's LED 2, which shows that something waits for a
+// person, and leaves LED 1, the recording light, as it is. It writes only
+// while the light must be red (holdRed), so nothing lights LED 2 while the
+// unit does not record, and an off write decided after it lands after it; and
+// only to a light already open and checked: it opens none. Its failure is not
+// the recording light's, which its read-back of LED 1 alone shows: it counts
+// no time the light was not red and keeps the handle; a device that failed
+// fails that read next.
+func (l *reconnectingLight) SetLED2(r, g, b uint8) error {
+	l.deviceMu.Lock()
+	defer l.deviceMu.Unlock()
+	if l.holdRed != nil && !l.holdRed() {
+		return nil
+	}
+	l.mu.Lock()
+	light := l.light
+	l.mu.Unlock()
+	second, ok := light.(interface{ SetLED2(r, g, b uint8) error })
+	if !ok || l.patternUnchecked {
+		return nil
+	}
+	return second.SetLED2(r, g, b)
 }
 
 func (l *reconnectingLight) ReadRGB() (uint8, uint8, uint8, error) {

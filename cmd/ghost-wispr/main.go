@@ -2044,6 +2044,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 			red:         func() bool { return capture.capturing(micStatus) },
 			notify:      hub.BroadcastVoiceEvent,
 			projects:    dispatchProjects.Get,
+			waiting:     waitingLED{hardware},
 		}); err != nil {
 			slog.Warn("the meeting voice is off", "error", err)
 			warningRegistry.Set("voice", "The meeting voice is off: "+err.Error())
