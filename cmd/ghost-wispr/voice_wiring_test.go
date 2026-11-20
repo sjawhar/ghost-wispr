@@ -165,6 +165,203 @@ func TestVoiceAudioOnlyAfterTheGate(t *testing.T) {
 	}
 }
 
+// TestVoiceTapDropsAWriteThatPassedTheGateBeforeAPause fails if a recorder
+// write that began before a pause, but finishes after a resume, reaches the
+// voice tap after GateClosed emptied it. A new exchange must not receive room
+// audio from before the latest closing.
+func TestVoiceTapDropsAWriteThatPassedTheGateBeforeAPause(t *testing.T) {
+	capture := newCaptureGate(nil, nil, nil)
+	capture.writeWait = 10 * time.Millisecond
+	tap := voice.NewTap()
+	tap.SetRate(voice.TapRate)
+	capture.onClosed = func(int) { tap.Reset() }
+
+	dst := &blockingWriter{entered: make(chan struct{}, 1), release: make(chan struct{})}
+	writer := capture.Writer(tappedWriter{dst: dst, tap: tap})
+	pcm := make([]byte, 2*voice.TapRate/4)
+	written := make(chan error, 1)
+	go func() {
+		_, err := writer.Write(pcm)
+		written <- err
+	}()
+	<-dst.entered
+
+	capture.Pause()
+	capture.Resume()
+	waitOpen(t, capture)
+	close(dst.release)
+	if err := <-written; err != nil {
+		t.Fatalf("the in-flight write: %v", err)
+	}
+
+	frames := tap.Open(2 * time.Second)
+	select {
+	case f := <-frames:
+		t.Fatalf("a new exchange got %d samples from before the pause", len(f.PCM))
+	default:
+	}
+}
+
+type solBlockedWriter struct {
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (w solBlockedWriter) Write(p []byte) (int, error) {
+	close(w.entered)
+	<-w.release
+	return len(p), nil
+}
+
+// TestSolInflightTapCannotReplayBeforePause keeps the real capture gate,
+// wiring, Supervisor and Tap: a destination write held across a pause cannot
+// repopulate the reset tap before the next exchange opens it.
+func TestSolInflightTapCannotReplayBeforePause(t *testing.T) {
+	for _, inflight := range []bool{false, true} {
+		name := "control: write completed before pause"
+		if inflight {
+			name = "pause while recorder write in flight"
+		}
+		t.Run(name, func(t *testing.T) {
+			tap := voice.NewTap()
+			capture := newCaptureGate(nil, nil, nil)
+			out := audio.NewOutput(audio.OutputConfig{})
+			t.Cleanup(func() { _ = out.Close() })
+			sup := voice.NewSupervisor(&voice.SupervisorConfig{
+				Concierge: stubConcierge{},
+				Speaker:   voice.SpeakerOf(out),
+				Tap:       tap,
+				Red:       func() bool { return !capture.isClosed() },
+				Session:   func() string { return "meeting-1" },
+			})
+			t.Cleanup(sup.Close)
+			link := &voiceLink{}
+			link.set(sup)
+			wireVoiceToCapture(capture, link, nil)
+			blocked := solBlockedWriter{make(chan struct{}), make(chan struct{})}
+			writer := capture.Writer(tappedWriter{dst: blocked, tap: tap})
+			data := make([]byte, 8000)
+			for i := range len(data) / 2 {
+				data[2*i], data[2*i+1] = 0x34, 0x12
+			}
+			done := make(chan error, 1)
+			go func() {
+				_, err := writer.Write(data)
+				done <- err
+			}()
+			<-blocked.entered
+			if inflight {
+				capture.Pause()
+			}
+			close(blocked.release)
+			if err := <-done; err != nil {
+				t.Fatal(err)
+			}
+			if !inflight {
+				capture.Pause()
+			}
+			capture.Resume()
+			waitOpen(t, capture)
+			frames := tap.Open(time.Second)
+			select {
+			case frame := <-frames:
+				t.Fatalf("new exchange received %d pre-pause samples, first=%#x", len(frame.PCM), frame.PCM[0])
+			case <-time.After(25 * time.Millisecond):
+				t.Log("no pre-pause frame was replayed")
+			}
+			tap.CloseOut()
+		})
+	}
+}
+
+// unstampedTapWriter is the old tappedWriter: its tap write has no record of
+// the capture generation that admitted its destination write.
+type unstampedTapWriter struct{ dst, tap io.Writer }
+
+func (w unstampedTapWriter) Write(p []byte) (int, error) {
+	n, err := w.dst.Write(p)
+	_, _ = w.tap.Write(p)
+	return n, err
+}
+
+// TestVoiceTapDropsAFrameAdmittedBeforeALightCheckClosed puts the gate's
+// checkLight after admission. A closing and resume while that check blocks
+// must drop the old frame and preserve the new frame after the resume.
+func TestVoiceTapDropsAFrameAdmittedBeforeALightCheckClosed(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		new  func(io.Writer, io.Writer) io.Writer
+		want int16
+	}{
+		{"control: an unstamped tap leaks the old frame", func(dst, tap io.Writer) io.Writer {
+			return unstampedTapWriter{dst: dst, tap: tap}
+		}, 0x1234},
+		{"the stamped tap drops the old frame", func(dst, tap io.Writer) io.Writer {
+			return tappedWriter{dst: dst, tap: tap}
+		}, 0x5678},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tap := voice.NewTap()
+			capture := newCaptureGate(nil, nil, nil)
+			capture.writeWait = 10 * time.Millisecond
+			out := audio.NewOutput(audio.OutputConfig{})
+			t.Cleanup(func() { _ = out.Close() })
+			sup := voice.NewSupervisor(&voice.SupervisorConfig{
+				Concierge: stubConcierge{},
+				Speaker:   voice.SpeakerOf(out),
+				Tap:       tap,
+				Red:       func() bool { return !capture.isClosed() },
+				Session:   func() string { return "meeting-1" },
+			})
+			t.Cleanup(sup.Close)
+			link := &voiceLink{}
+			link.set(sup)
+			wireVoiceToCapture(capture, link, nil)
+
+			entered, release := make(chan struct{}), make(chan struct{})
+			var once sync.Once
+			capture.checkLight = func() {
+				once.Do(func() {
+					close(entered)
+					<-release
+				})
+			}
+			writer := capture.Writer(tc.new(io.Discard, tap))
+			old := make([]byte, 8000)
+			for i := range len(old) / 2 {
+				old[2*i], old[2*i+1] = 0x34, 0x12
+			}
+			wrote := make(chan error, 1)
+			go func() {
+				_, err := writer.Write(old)
+				wrote <- err
+			}()
+			<-entered
+			capture.Pause()
+			capture.Resume()
+			waitOpen(t, capture)
+			close(release)
+			if err := <-wrote; err != nil {
+				t.Fatalf("the admitted write: %v", err)
+			}
+
+			fresh := make([]byte, 8000)
+			for i := range len(fresh) / 2 {
+				fresh[2*i], fresh[2*i+1] = 0x78, 0x56
+			}
+			if _, err := writer.Write(fresh); err != nil {
+				t.Fatalf("the fresh write: %v", err)
+			}
+			frames := tap.Open(time.Second)
+			t.Cleanup(tap.CloseOut)
+			frame := <-frames
+			if got := frame.PCM[0]; got != tc.want {
+				t.Fatalf("the replay starts %#x, want %#x", got, tc.want)
+			}
+		})
+	}
+}
+
 // TestLiveOptionsCarryTheWakeKeyterms fails if the live Deepgram request
 // leaves out the wake phrases as keyterms while a voice can run (a speaker,
 // whatever voice.enabled says, since a person turns it on with no restart),

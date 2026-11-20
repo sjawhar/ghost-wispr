@@ -248,11 +248,9 @@ What the voice hears, and where the room's words go:
   sent.
 - Every pause, light hold, press of the Jabra's Mute button, "Wispr, stop" and shutdown stop the voice at once: its speech, its
   chimes and the Concierge's calls end within 100 ms, and a question not yet sent to an agent is not
-  sent. A pause ends the recording session, and an ended session's answers are never spoken: they
-  stay in writing on that session's page. During a light hold the session goes on, and an answer
-  stays silent until the light reads red and someone says "Wispr, go ahead"; so does an answer when
-  anyone spoke or a stop came after its question. A pause also clears the two minutes of transcript
-  the voice keeps.
+  sent. Every gate closing, a pause or a light hold, ends the recording session, and an ended
+  session's answers are never spoken: they stay in writing on that session's page. A gate closing
+  also clears the two minutes of transcript the voice keeps.
 - Voice A sends no room audio anywhere. The asker's words after the wake phrase go to the
   Concierge's model (Gemini on Vertex AI), with the last two minutes of the transcript. The text
   Wispr speaks goes to the text-to-speech engine: Gemini TTS on Vertex AI, or Deepgram Aura-2 with

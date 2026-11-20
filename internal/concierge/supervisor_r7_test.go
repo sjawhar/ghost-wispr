@@ -116,14 +116,12 @@ func TestAnswerSoundAndInvitation(t *testing.T) {
 	})
 }
 
-// TestAnswerWhilePausedStaysSilent (c-ask-holder, R7 with R10). A pause ends
-// the meeting's session, and an answer of an ended session is never spoken:
-// not by itself and not on "Wispr, go ahead", and no answer sound plays after
-// the resume; its written answer stays in the ledger, for the session's page.
-// During a light hold the session goes on: an answer stays silent until the
-// light is red again and a person invites it, whether it arrived during the
-// hold or before it.
-func TestAnswerWhilePausedStaysSilent(t *testing.T) {
+// TestAnswerWhileGateClosedStaysSilent (c-ask-holder, R7 with R10). Every
+// gate closing, a pause or light hold, ends the meeting's session. An answer
+// of that ended session is never spoken: not by itself and not on "Wispr, go
+// ahead", and no answer sound plays after the gate opens; its written answer
+// stays in the ledger, for the session's page.
+func TestAnswerWhileGateClosedStaysSilent(t *testing.T) {
 	t.Run("pause, the answer before it", func(t *testing.T) {
 		r := newR7Rig(t)
 		r.askHolder()
@@ -152,31 +150,31 @@ func TestAnswerWhilePausedStaysSilent(t *testing.T) {
 		r.expectEndedSilent(storage.VoiceTaskCancelled)
 	})
 
-	t.Run("light hold, the answer during it", func(t *testing.T) {
+	t.Run("light hold, then red and go ahead", func(t *testing.T) {
 		r := newR7Rig(t)
 		r.askHolder()
-		r.closeGate()
 		r.waitExchangeEnded()
+		// Room words keep the answer held until the gate closing ends its
+		// session. A later invitation must not bring it back.
+		stop := r.talk(r7SoundGap / 5)
 		r.reply()
-		r7Never(t, "an answer sound played during the light hold", 2*(r7SoundGap+r7SilenceWait), func() bool { return len(r.speaker.sounds(voice.AnswerChime())) > 0 })
+		stop()
+		r.closeGate()
+		r.endSession()
 		r.openGate()
-		r.expectSilentUntilInvited()
+		r.expectEndedSilent(storage.VoiceTaskDone)
 	})
 
 	t.Run("light hold, the answer before it", func(t *testing.T) {
 		r := newR7Rig(t)
 		r.askHolder()
 		r.waitExchangeEnded()
-		// No room word since t0: the answer would be spoken by itself once the
-		// room is silent for SilenceWait after its sound. The hold comes
-		// first.
+		// The hold comes before a silence interval can speak the answer.
 		r.reply()
 		r.closeGate()
-		if held := r.voice.heldAnswers(); len(held) != 0 {
-			t.Fatalf("the answer was spoken before the hold: %+v; the case needs it held", held)
-		}
+		r.endSession()
 		r.openGate()
-		r.expectSilentUntilInvited()
+		r.expectEndedSilent(storage.VoiceTaskDone)
 	})
 }
 
@@ -373,10 +371,10 @@ func (r *r7Rig) closeGate() {
 	r.s.GateClosed(closings)
 }
 
-// endSession ends meeting-1 as a pause's settling does (session.Manager's
-// end): the store marks it ended, no session records, and then the
-// session-ended hook tells the Concierge and the Supervisor, in that order
-// (wireVoiceSessionHooks, cmd/ghost-wispr/voice.go).
+// endSession ends meeting-1 as every gate closing's settling does
+// (session.Manager's end): the store marks it ended, no session records, and
+// then the session-ended hook tells the Concierge and the Supervisor, in that
+// order (wireVoiceSessionHooks, cmd/ghost-wispr/voice.go).
 func (r *r7Rig) endSession() {
 	r.t.Helper()
 	if err := r.store.EndSession("meeting-1", time.Now().UTC(), ""); err != nil {
@@ -477,17 +475,6 @@ func (r *r7Rig) expectSpoken() {
 		task, err := r.store.VoiceTask("evt-1")
 		return err == nil && task.SpokenAt != nil
 	})
-}
-
-// expectSilentUntilInvited checks, once the light is red again, that the
-// answer is not spoken through silence longer than SilenceWait, and that
-// "Wispr, go ahead" then speaks it.
-func (r *r7Rig) expectSilentUntilInvited() {
-	r.t.Helper()
-	r7Never(r.t, "the answer was spoken with no invitation after the light hold", r7SoundGap+3*r7SilenceWait, func() bool { return len(r.voice.heldAnswers()) > 0 })
-	r.hear(r7GoAhead)
-	r7Until(r.t, "the answer spoken after the invitation", func() bool { return len(r.voice.heldAnswers()) > 0 })
-	r.expectSpoken()
 }
 
 // expectEndedSilent resumes into a new session, meeting-2, and checks that

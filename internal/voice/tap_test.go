@@ -2,8 +2,12 @@ package voice
 
 import (
 	"encoding/binary"
+	"runtime"
+	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/sjawhar/ghost-wispr/internal/audio"
 )
 
 // pcmBytes is n samples of PCM16 LE, each sample its index plus base.
@@ -139,5 +143,42 @@ func TestTapResetEmptiesTheRing(t *testing.T) {
 	frames := tap.Open(2 * time.Second)
 	if n := len(frames); n != 0 {
 		t.Fatalf("%d frames replayed after Reset, want none", n)
+	}
+}
+
+// TestSolTapCloseOutConcurrentReader exercises the real CloseOut against a
+// simultaneous vendor receive of its last queued frame.
+func TestSolTapCloseOutConcurrentReader(t *testing.T) {
+	was := runtime.GOMAXPROCS(4)
+	t.Cleanup(func() { runtime.GOMAXPROCS(was) })
+	done := make(chan struct{})
+	var completed atomic.Int32
+	go func() {
+		for range 5000 {
+			tap := NewTap()
+			out := tap.Open(0)
+			tap.out <- audio.Frame{PCM: []int16{123}}
+			ready := make(chan struct{})
+			readerDone := make(chan struct{})
+			go func() {
+				<-ready
+				for range out {
+				}
+				close(readerDone)
+			}()
+			close(ready)
+			tap.CloseOut()
+			<-readerDone
+			completed.Add(1)
+		}
+		close(done)
+	}()
+	select {
+	case <-done:
+		t.Logf("closed %d streams", completed.Load())
+	case <-time.After(3 * time.Second):
+		stack := make([]byte, 1<<20)
+		n := runtime.Stack(stack, true)
+		t.Fatalf("only %d closes completed; goroutine stacks:\n%s", completed.Load(), stack[:n])
 	}
 }

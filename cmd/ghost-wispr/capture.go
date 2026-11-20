@@ -916,6 +916,13 @@ type gatedWriter struct {
 	dst  io.Writer
 }
 
+// gateStampedWriter receives the gate closing count captured when its Write
+// passed the capture gate. It uses the same count to refuse side effects once
+// a later gate closing invalidates an in-flight write.
+type gateStampedWriter interface {
+	WriteWithGateStamp(p []byte, gate *captureGate, closings int) (int, error)
+}
+
 // Write records p, only while the light has stayed red, and the gate open,
 // since the microphone opened under a red confirmation. It reads the light
 // back first (checkLight), so a light that went off, also from outside Ghost
@@ -949,6 +956,14 @@ func (w *gatedWriter) Write(p []byte) (int, error) {
 	if g.lightWentOff() {
 		return 0, errLightWentOff
 	}
+	if writer, ok := w.dst.(gateStampedWriter); ok {
+		n, err := writer.WriteWithGateStamp(p, g, closings)
+		if err == nil {
+			g.audioAt.Store(time.Now().UnixNano())
+			g.noteRecording(closings)
+		}
+		return n, err
+	}
 	n, err := w.dst.Write(p)
 	if err == nil {
 		g.audioAt.Store(time.Now().UnixNano())
@@ -970,6 +985,18 @@ func (g *captureGate) noteRecording(closings int) {
 	if due && g.onRecording != nil {
 		g.onRecording()
 	}
+}
+
+// writeTapIfCurrent gives p to tap only while the gate is still in the
+// closing generation in which the write began. Holding mu across the tap
+// write orders it before a closing's Tap.Reset, or drops it after one.
+func (g *captureGate) writeTapIfCurrent(tap io.Writer, p []byte, closings int) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.closed || g.closings != closings {
+		return
+	}
+	_, _ = tap.Write(p)
 }
 
 // captureReadiness is what /healthz/ready reads of capture: the gate's
@@ -1006,13 +1033,14 @@ type deepgramFinalizer interface{ Finalize() error }
 
 // newSessionCaptureGate returns the capture gate the app uses. deepgram returns
 // the live Deepgram client, or nil when there is none.
-//   - Pause blocks new sessions, which only sets a flag, then closes the gate.
-//   - The pause then settles: it waits out a session start already under way,
-//     Deepgram is asked to finalize, the call and its reply get up to
+//   - Every gate closing, a pause or a light hold, blocks new sessions and
+//     closes the gate.
+//   - The closing then settles: it waits out a session start already under
+//     way, Deepgram is asked to finalize, the call and its reply get up to
 //     finalizeWait to reach the session that was recording, and that session
 //     ends (after any other end of it already under way), so its last words
 //     are kept and its recording is closed.
-//   - After that, a Resume drops preroll audio from before the pause and lets
+//   - After the next opening drops preroll audio from before the closing,
 //     sessions start again, all before audio flows.
 //   - Every close of the microphone, which turns the light off, drops the
 //     audio the recorder keeps for the next session's start too.

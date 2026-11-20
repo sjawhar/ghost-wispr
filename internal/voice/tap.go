@@ -155,11 +155,16 @@ func (t *Tap) closeOutLocked() {
 	if t.out == nil {
 		return
 	}
-	for len(t.out) > 0 {
-		<-t.out
+	for {
+		select {
+		case <-t.out:
+			// Drop a frame the exchange did not take.
+		default:
+			close(t.out)
+			t.out = nil
+			return
+		}
 	}
-	close(t.out)
-	t.out = nil
 }
 
 // Reset empties the ring, at every gate closing: audio from before it is never

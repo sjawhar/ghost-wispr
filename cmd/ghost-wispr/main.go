@@ -636,7 +636,8 @@ func startMicMonitoring(ctx context.Context, loops *sync.WaitGroup, capture *cap
 }
 
 // tappedWriter writes each buffer to dst, then to tap, and reports dst's
-// result.
+// result. When the capture gate stamps a Write, it drops the tap copy if a
+// later gate closing made that in-flight write old before dst returned.
 type tappedWriter struct {
 	dst, tap io.Writer
 }
@@ -644,6 +645,12 @@ type tappedWriter struct {
 func (w tappedWriter) Write(p []byte) (int, error) {
 	n, err := w.dst.Write(p)
 	_, _ = w.tap.Write(p)
+	return n, err
+}
+
+func (w tappedWriter) WriteWithGateStamp(p []byte, gate *captureGate, closings int) (int, error) {
+	n, err := w.dst.Write(p)
+	gate.writeTapIfCurrent(w.tap, p, closings)
 	return n, err
 }
 
