@@ -907,11 +907,10 @@ func main() {
 		log.Printf("recovered %d stale session(s): %v", len(recoveredIDs), recoveredIDs)
 		cancelRecoveredQuestions(store, recoveredIDs)
 	}
-	// A refinement left running by the previous run stopped with it. Each runs
-	// again below, once the recording directories are cleaned up
-	// (resumeStoppedRefinements).
-	stoppedRefinements, err := store.RecoverStaleRefinements()
-	if err != nil {
+	// A refinement left running by the previous run stopped with it. The store
+	// owes each one automatic retry, which runs below, once the recording
+	// directories are cleaned up (resumeStoppedRefinements).
+	if err := store.RecoverStaleRefinements(); err != nil {
 		slog.Warn("failed to recover stale refinements", "error", err)
 	}
 	// So did a Drive sync: retry it in the folder it had.
@@ -2082,8 +2081,9 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 	// sessions above) are saved now, not at the first sweep.
 	go kept.run(ctx)
 	// The refinements a stop cut off (storage.RecoverStaleRefinements above)
-	// run again, after the cleanup above, since a retry may restore recordings.
-	go resumeStoppedRefinements(ctx, stoppedRefinements, deletion.retryRefinement, log.Printf)
+	// are retried, after the cleanup above, since a retry may restore
+	// recordings.
+	go resumeStoppedRefinements(ctx, store, warningRegistry, deletion.retryRefinement)
 	if cfg.GCEnabled {
 		go collectGarbage(ctx, cfgStore, deletionNoticeGCStore{SQLiteStore: store, hub: hub, onDeleted: sessionsForgotten}, drive, gcHealthState, warningRegistry, appLogger, gcEvery)
 	}
@@ -2158,14 +2158,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer shutdownCancel()
 
-	if err := manager.ForceEndSession(shutdownCtx); err != nil {
-		slog.Warn("force end session failed", "error", err)
-	}
-	lifecycleCtx, lifecycleCancel := context.WithTimeout(context.Background(), 5*time.Second)
-	if err := manager.WaitForLifecyclePublishes(lifecycleCtx); err != nil {
-		slog.Warn("lifecycle event publishing did not finish before shutdown", "error", err)
-	}
-	lifecycleCancel()
+	endSessionAtShutdown(shutdownCtx, manager, lifecyclePublishWait)
 
 	if dgStop != nil {
 		dgStop()

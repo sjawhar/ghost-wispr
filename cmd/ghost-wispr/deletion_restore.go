@@ -402,10 +402,17 @@ func retryRefinementWithFailureWarning(ctx context.Context, registry *warningsRe
 		registry.Clear(refinementRetryWarningKeyPrefix + sessionID)
 		return nil
 	}
+	recordRefinementRetryFailure(registry, sessionID, err)
+	return err
+}
+
+// recordRefinementRetryFailure keeps on /api/status, until a Retry of session
+// sessionID's refinement succeeds or the service restarts, why a retry of it
+// failed, or why the start did not retry it (resumeStoppedRefinements).
+func recordRefinementRetryFailure(registry *warningsRegistry, sessionID string, err error) {
 	warning := fmt.Sprintf("Retry refinement failed for session %s: %v", sessionID, err)
 	slog.Warn("retry refinement failed", "session_id", sessionID, "error", err)
 	registry.Set(refinementRetryWarningKeyPrefix+sessionID, warning)
-	return err
 }
 
 // retryRefinement is the "Retry refinement" action: it restores the

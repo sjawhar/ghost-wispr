@@ -1167,28 +1167,23 @@ func TestRestoreAudioRefusesAMergedSource(t *testing.T) {
 // A refinement left running by a stop of the app is not running: when the
 // app starts, it is marked failed (which offers a retry), so GC, which leaves
 // a running refinement's audio and session alone, is not held off for good,
-// and its session is returned, so the start runs it again. A refinement in
-// any other state is left as it is, and returned by no later start.
+// and the store records that the start owes it one automatic retry
+// (RefinementResumes). A refinement in any other state is left as it is, and
+// owed nothing; a second recovery owes the same retries, not more.
 func TestRecoverStaleRefinements(t *testing.T) {
 	store := newTestSQLiteStore(t)
 	endedWith(t, store, "20261106140200", "/audio/c.mp3", RefinementRunning)
 	endedWith(t, store, "20261106140000", "/audio/a.mp3", RefinementRunning)
 	endedWith(t, store, "20261106140100", "/audio/b.mp3", RefinementCompleted)
 	endedWith(t, store, "20261106140300", "/audio/d.mp3", RefinementFailed)
-	stopped, err := store.RecoverStaleRefinements()
-	if err != nil {
-		t.Fatalf("RecoverStaleRefinements: %v", err)
-	}
-	if want := []string{"20261106140000", "20261106140200"}; !slices.Equal(stopped, want) {
-		t.Fatalf("RecoverStaleRefinements returned %v, want the two left running, oldest first: %v", stopped, want)
-	}
+	recoverRefinements(t, store)
+	expectResumes(t, store, "after recovery", []string{"20261106140000", "20261106140200"}, nil)
 	expectAudio(t, store, "20261106140000", "/audio/a.mp3", "", RefinementFailed)
 	expectAudio(t, store, "20261106140200", "/audio/c.mp3", "", RefinementFailed)
 	expectAudio(t, store, "20261106140100", "/audio/b.mp3", "", RefinementCompleted)
 	expectAudio(t, store, "20261106140300", "/audio/d.mp3", "", RefinementFailed)
-	if again, err := store.RecoverStaleRefinements(); err != nil || len(again) != 0 {
-		t.Fatalf("a second recovery returned %v (%v), want none", again, err)
-	}
+	recoverRefinements(t, store)
+	expectResumes(t, store, "after a second recovery", []string{"20261106140000", "20261106140200"}, nil)
 }
 
 // Drive sync used to upload no audio for a merged session (it stat'ed the
