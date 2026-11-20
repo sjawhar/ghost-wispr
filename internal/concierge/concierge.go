@@ -92,6 +92,7 @@ type Store interface {
 	CancelWorkingVoiceTasks(sessionID string) ([]storage.VoiceTask, error)
 	CancelWorkingVoiceTasksOfEndedSessions() ([]storage.VoiceTask, error)
 	CancelAllWorkingVoiceTasks() ([]storage.VoiceTask, error)
+	MaxVoiceTaskNumber() (uint64, error)
 }
 
 // JoinedAgent is an agent that joined the meeting.
@@ -124,9 +125,10 @@ type Config struct {
 }
 
 // questionsAsked counts the questions every Concierge of this process has
-// asked. A never mind's mark (QuestionsAsked) orders it among them whatever
-// the wall clock does, also against a Concierge started after it, as when the
-// voice is turned off and on.
+// asked, past the highest number the ledger held when each started. Each
+// task keeps its number in its row (VoiceTask.AskedNumber), and a never
+// mind's mark (QuestionsAsked) orders it among them whatever the wall clock
+// does, also against a Concierge started after it.
 var questionsAsked atomic.Uint64
 
 // Concierge implements voice.Concierge.
@@ -154,10 +156,6 @@ type Concierge struct {
 
 	mu     sync.Mutex
 	agents Agents
-	// asked is each task's place among the questions asked (questionsAsked
-	// when it was asked), by task id; a task this Concierge did not ask, as
-	// one from before the unit started, has none and counts as asked first.
-	asked map[string]uint64
 	// lastAsk is the newest question each exchange sent each agent, by
 	// exchange (exchangeKey) and agent session, so a second question
 	// replaces the first, and the same one again sends nothing (R7).
@@ -257,7 +255,6 @@ func New(cfg *Config) (*Concierge, error) {
 		answers:      make(chan voice.PendingAnswer),
 		done:         make(chan struct{}),
 		lastAsk:      map[[2]string]sentAsk{},
-		asked:        map[string]uint64{},
 		unsent:       map[[2]string]unsentAsk{},
 		working:      map[string][]string{},
 		askedAgain:   map[string]string{},
@@ -290,6 +287,19 @@ func New(cfg *Config) (*Concierge, error) {
 		c.logger = slog.Default()
 	}
 	c.life, c.stop = context.WithCancel(context.Background())
+	// Numbers go on from the highest the ledger holds, so a question asked
+	// now is numbered after every one asked before, in this run or another.
+	highest, err := c.store.MaxVoiceTaskNumber()
+	if err != nil {
+		c.stop()
+		return nil, fmt.Errorf("concierge: %w", err)
+	}
+	for {
+		asked := questionsAsked.Load()
+		if asked >= highest || questionsAsked.CompareAndSwap(asked, highest) {
+			break
+		}
+	}
 	// A meeting that ended while no Concierge ran (the voice was off) was
 	// told nothing: its working questions are cancelled now, as its end
 	// would have, and its page told.

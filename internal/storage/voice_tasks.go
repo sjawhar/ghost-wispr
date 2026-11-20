@@ -26,7 +26,10 @@ const (
 // is the Envoy event id of that message once it is sent (RekeyVoiceTask), so
 // an answer that arrives after a restart still finds it by in_reply_to.
 // AnswerWritten is the agent's answer as written, which the session's page
-// shows; it is erased with its session.
+// shows; it is erased with its session. AskedNumber is the question's place
+// among the questions asked, which orders a never mind among them whatever
+// the wall clock does; 0 for a task from before the column existed, which
+// counts as asked first.
 type VoiceTask struct {
 	ID            string
 	SessionID     string
@@ -36,9 +39,10 @@ type VoiceTask struct {
 	State         VoiceTaskState
 	AnswerWritten string
 	SpokenAt      *time.Time
+	AskedNumber   uint64
 }
 
-const voiceTaskColumns = `id, session_id, asked_at, issue_key, holder, state, answer_written, spoken_at`
+const voiceTaskColumns = `id, session_id, asked_at, issue_key, holder, state, answer_written, spoken_at, asked_number`
 
 // CancelWorkingVoiceTasks cancels the tasks of session sessionID still
 // waiting for an answer, as its meeting ends, and returns them, so their
@@ -108,17 +112,27 @@ func (s *SQLiteStore) cancelWorkingVoiceTasksWhere(what, where string, args ...a
 // order is time order ("…00.500000000Z" before "…00.550000000Z").
 const voiceTaskTime = "2006-01-02T15:04:05.000000000Z07:00"
 
-// CreateVoiceTask records a working task. Its session must exist.
+// CreateVoiceTask records a working task, with its asked number, in one
+// statement. Its session must exist.
 func (s *SQLiteStore) CreateVoiceTask(task *VoiceTask) error {
-	if _, err := s.db.Exec(`INSERT INTO voice_tasks(id, session_id, asked_at, issue_key, holder, state) VALUES(?, ?, ?, ?, ?, ?)`,
-		task.ID, task.SessionID, task.AskedAt.UTC().Format(voiceTaskTime), task.IssueKey, task.Holder, VoiceTaskWorking); err != nil {
+	if _, err := s.db.Exec(`INSERT INTO voice_tasks(id, session_id, asked_at, issue_key, holder, state, asked_number) VALUES(?, ?, ?, ?, ?, ?, ?)`,
+		task.ID, task.SessionID, task.AskedAt.UTC().Format(voiceTaskTime), task.IssueKey, task.Holder, VoiceTaskWorking, int64(task.AskedNumber)); err != nil {
 		return fmt.Errorf("record voice task %s of session %s: %w", task.ID, task.SessionID, err)
 	}
 	return nil
 }
 
+// MaxVoiceTaskNumber is the highest asked number any task holds, 0 with none.
+func (s *SQLiteStore) MaxVoiceTaskNumber() (uint64, error) {
+	var highest int64
+	if err := s.db.QueryRow(`SELECT COALESCE(MAX(asked_number), 0) FROM voice_tasks`).Scan(&highest); err != nil {
+		return 0, fmt.Errorf("read the highest voice task number: %w", err)
+	}
+	return uint64(highest), nil
+}
+
 // RekeyVoiceTask gives task id its new id: the event id Envoy gave the
-// question it carried.
+// question it carried. The row keeps its asked number in the same statement.
 func (s *SQLiteStore) RekeyVoiceTask(id, newID string) error {
 	result, err := s.db.Exec(`UPDATE voice_tasks SET id = ? WHERE id = ?`, newID, id)
 	if err != nil {
@@ -225,12 +239,14 @@ func scanVoiceTask(row interface{ Scan(...any) error }) (VoiceTask, error) {
 	var task VoiceTask
 	var askedAt, state string
 	var spokenAt sql.NullString
-	if err := row.Scan(&task.ID, &task.SessionID, &askedAt, &task.IssueKey, &task.Holder, &state, &task.AnswerWritten, &spokenAt); err != nil {
+	var askedNumber int64
+	if err := row.Scan(&task.ID, &task.SessionID, &askedAt, &task.IssueKey, &task.Holder, &state, &task.AnswerWritten, &spokenAt, &askedNumber); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return VoiceTask{}, err
 		}
 		return VoiceTask{}, fmt.Errorf("read voice task: %w", err)
 	}
+	task.AskedNumber = uint64(askedNumber)
 	task.State = VoiceTaskState(state)
 	var err error
 	if task.AskedAt, err = time.Parse(time.RFC3339Nano, askedAt); err != nil {

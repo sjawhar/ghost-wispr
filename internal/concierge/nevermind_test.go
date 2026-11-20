@@ -179,3 +179,70 @@ func TestNeverMindWithAStoppedVoiceCancelsNothing(t *testing.T) {
 		t.Fatalf("evt-1 %s, want working", task.State)
 	}
 }
+
+// neverMindInRekey is the ledger that runs a never mind right after a
+// question's task takes its Envoy event id, before the Concierge goes on.
+type neverMindInRekey struct {
+	Store
+	run func()
+}
+
+func (s *neverMindInRekey) RekeyVoiceTask(id, newID string) error {
+	if err := s.Store.RekeyVoiceTask(id, newID); err != nil {
+		return err
+	}
+	if run := s.run; run != nil {
+		s.run = nil
+		run()
+	}
+	return nil
+}
+
+// TestANeverMindDuringAQuestionsRekeyLeavesThatQuestion fails if a never mind
+// said before a question, whose Concierge call runs just as that question's
+// task takes its Envoy event id, cancels that later question: the task's
+// place among the questions goes with its row, in the rekey's own statement.
+func TestANeverMindDuringAQuestionsRekeyLeavesThatQuestion(t *testing.T) {
+	r := newRig(t)
+	r.ask(t, "agent-7", "first question", "ABC-12")
+	said := r.concierge.QuestionsAsked() // the never mind is said
+	var cancelled bool
+	var neverMindErr error
+	r.concierge.store = &neverMindInRekey{Store: r.store, run: func() {
+		cancelled, neverMindErr = r.concierge.NeverMind(context.Background(), "meeting-1", said)
+	}}
+	r.ask(t, "agent-8", "later question", "")
+
+	if neverMindErr != nil || !cancelled {
+		t.Fatalf("NeverMind during the later question's rekey = %v, %v; want the first question cancelled", cancelled, neverMindErr)
+	}
+	if task, _ := r.store.VoiceTask("evt-2"); task.State != storage.VoiceTaskWorking {
+		t.Fatalf("the question asked after the never mind is %s, want working", task.State)
+	}
+	if task, _ := r.store.VoiceTask("evt-1"); task.State != storage.VoiceTaskCancelled {
+		t.Fatalf("evt-1 %s, want cancelled", task.State)
+	}
+}
+
+// TestNeverMindCancelsTheNewestQuestionWhenTheClockStepsBackBetweenThem fails
+// if a never mind cancels the older of two working questions because the
+// wall clock stepped back between them, which gives the newer one the
+// earlier time: the newest question is the one asked last, by its place.
+func TestNeverMindCancelsTheNewestQuestionWhenTheClockStepsBackBetweenThem(t *testing.T) {
+	r := newRig(t)
+	clock := &steppedClock{now: testNow}
+	r.concierge.now = clock.Now
+	r.ask(t, "agent-7", "first question", "ABC-12")
+	clock.set(testNow.Add(-4 * time.Second)) // the wall clock steps back
+	r.ask(t, "agent-8", "second question", "")
+
+	if cancelled, err := r.concierge.NeverMind(context.Background(), "meeting-1", r.concierge.QuestionsAsked()); err != nil || !cancelled {
+		t.Fatalf("NeverMind = %v, %v; want the newest question cancelled", cancelled, err)
+	}
+	if task, _ := r.store.VoiceTask("evt-2"); task.State != storage.VoiceTaskCancelled {
+		t.Fatalf("evt-2, asked last, %s; want cancelled", task.State)
+	}
+	if task, _ := r.store.VoiceTask("evt-1"); task.State != storage.VoiceTaskWorking {
+		t.Fatalf("evt-1, asked first, %s; want working", task.State)
+	}
+}

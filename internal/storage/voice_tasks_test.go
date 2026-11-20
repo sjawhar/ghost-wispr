@@ -50,6 +50,59 @@ func voiceTaskIDs(t *testing.T, store *SQLiteStore) []string {
 	return ids
 }
 
+// TestVoiceTasksGainTheirAskedNumber fails if a database whose voice_tasks
+// table predates asked_number does not gain it, with 0 (asked first) on the
+// rows it holds; or if a new task does not keep its number, through a rekey
+// too, or the highest number is not read back.
+func TestVoiceTasksGainTheirAskedNumber(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "unit.db")
+	store, err := NewSQLiteStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CreateSession("s1", time.Date(2026, 11, 19, 9, 0, 0, 0, time.UTC)); err != nil {
+		t.Fatal(err)
+	}
+	askVoiceTask(t, store, "old", "s1", "")
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	// The database as a build before asked_number left it.
+	old, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := old.Exec(`ALTER TABLE voice_tasks DROP COLUMN asked_number`); err != nil {
+		t.Fatal(err)
+	}
+	if err := old.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	store, err = NewSQLiteStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	task, err := store.VoiceTask("old")
+	if err != nil || task.AskedNumber != 0 {
+		t.Fatalf("a task from before asked_number = %+v, %v; want it read with number 0", task, err)
+	}
+	asked := time.Date(2026, 11, 19, 9, 31, 0, 0, time.UTC)
+	if err := store.CreateVoiceTask(&VoiceTask{ID: "local", SessionID: "s1", AskedAt: asked, Holder: "session:agent-2", AskedNumber: 7}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RekeyVoiceTask("local", "evt-7"); err != nil {
+		t.Fatal(err)
+	}
+	if task, err := store.VoiceTask("evt-7"); err != nil || task.AskedNumber != 7 {
+		t.Fatalf("the rekeyed task = %+v, %v; want number 7", task, err)
+	}
+	if highest, err := store.MaxVoiceTaskNumber(); err != nil || highest != 7 {
+		t.Fatalf("MaxVoiceTaskNumber = %d, %v; want 7", highest, err)
+	}
+}
+
 // TestVoiceTasksListInAskedOrderWithinASecond: two tasks asked 0.5 s and
 // 0.55 s into one second list in the order they were asked.
 func TestVoiceTasksListInAskedOrderWithinASecond(t *testing.T) {

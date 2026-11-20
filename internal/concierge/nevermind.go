@@ -1,7 +1,9 @@
 package concierge
 
 import (
+	"cmp"
 	"context"
+	"slices"
 	"strings"
 
 	"github.com/google/uuid"
@@ -10,38 +12,24 @@ import (
 	"github.com/sjawhar/ghost-wispr/internal/storage"
 )
 
-// QuestionsAsked is how many questions the Concierges of this process have
-// asked so far: the mark the voice reads when "Wispr, never mind" is said.
-// It reads one counter and never waits.
+// QuestionsAsked is the number of the last question the Concierges of this
+// process have asked: the mark the voice reads when "Wispr, never mind" is
+// said. It reads one counter and never waits.
 func (c *Concierge) QuestionsAsked() uint64 {
 	return questionsAsked.Load()
 }
 
-// placeOf is task id's place among the questions asked, 0 for a task this
-// Concierge did not ask, as one from before the unit started: it was asked
-// before any mark.
-func (c *Concierge) placeOf(id string) uint64 {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.asked[id]
-}
-
-// forgetPlace drops task id's place: its question was never sent.
-func (c *Concierge) forgetPlace(id string) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	delete(c.asked, id)
-}
-
 // NeverMind answers "Wispr, never mind": it cancels meeting sessionID's
-// newest working question among the first asked (QuestionsAsked when it was
-// said), tells its holder (R7) and reports true. A question asked after it,
-// as while an earlier never mind still told its holder, is not its to cancel,
-// whatever the wall clock says: the order is the count of questions, not
-// their times. A question that stopped working before its cancel landed, as
-// when its answer arrived meanwhile, is passed over for the next one. With no
-// such question it does nothing and reports false: the voice then drops its
-// newest held answer.
+// newest working question numbered at most asked (QuestionsAsked when it was
+// said), tells its holder (R7) and reports true. Newest and before go by
+// each task's asked number, kept in its row from the moment it is recorded,
+// never by its time: a question asked after the never mind, as while an
+// earlier never mind still told its holder, is not its to cancel, whatever
+// the wall clock says. A task with no number, from before numbers were kept,
+// counts as asked first. A question that stopped working before its cancel
+// landed, as when its answer arrived meanwhile, is passed over for the next
+// one. With no such question it does nothing and reports false: the voice
+// then drops its newest held answer.
 func (c *Concierge) NeverMind(ctx context.Context, sessionID string, asked uint64) (bool, error) {
 	if err := ctx.Err(); err != nil {
 		return false, err // the voice stopped: nothing to cancel for it
@@ -50,9 +38,10 @@ func (c *Concierge) NeverMind(ctx context.Context, sessionID string, asked uint6
 	if err != nil {
 		return false, err
 	}
+	slices.SortStableFunc(tasks, func(a, b storage.VoiceTask) int { return cmp.Compare(a.AskedNumber, b.AskedNumber) })
 	for i := len(tasks) - 1; i >= 0; i-- {
 		task := tasks[i]
-		if task.State != storage.VoiceTaskWorking || c.placeOf(task.ID) > asked {
+		if task.State != storage.VoiceTaskWorking || task.AskedNumber > asked {
 			continue
 		}
 		moved, err := c.store.EndVoiceTask(task.ID, storage.VoiceTaskCancelled)
