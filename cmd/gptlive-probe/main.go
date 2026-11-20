@@ -46,6 +46,10 @@ import (
 	"github.com/sjawhar/ghost-wispr/internal/voice/gptlive"
 )
 
+// buildCommit is set by `go build -ldflags "-X main.buildCommit=<sha>"`.
+// It is the first probe output so a run proves which binary it used.
+var buildCommit = "unknown"
+
 // controlAudience is the control's audience: one OpenAI's identity
 // provider does not accept.
 const controlAudience = "https://example.invalid/gptlive-probe-control"
@@ -138,6 +142,7 @@ func run() int {
 	timeout := flag.Duration("timeout", 3*time.Minute, "give up after this long")
 	flag.Parse()
 	clientCertificatesOff()
+	printf(os.Stdout, "build commit: %s\n", buildCommit)
 	if *provider == "" || *account == "" {
 		printf(os.Stderr, "gptlive-probe needs --identity-provider-id and --service-account-id\n")
 		return 2

@@ -128,6 +128,9 @@ func TestSolReviewCLIParsesSafetyGuardFlags(t *testing.T) {
 	if exit.ExitCode() != 1 {
 		t.Fatalf("run exit = %v, want 1; output:\n%s", err, out)
 	}
+	if !strings.HasPrefix(string(out), "build commit: ") {
+		t.Fatalf("run does not print its build commit first:\n%s", out)
+	}
 	if strings.Contains(string(out), "needs --identity-provider-id") || !strings.Contains(string(out), "probe safety guard at start") {
 		t.Fatalf("run did not parse flags into the safety guard:\n%s", out)
 	}
