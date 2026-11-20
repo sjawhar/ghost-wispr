@@ -305,12 +305,43 @@ func sharedTraceName(trace []sharedEvent, injected int) string {
 	return strings.Join(parts, "-")
 }
 
+// heldClock is the hold's timer for a trace: the hold runs out only when the
+// test says, once the session has read every event of the trace, so the
+// trace's events all come within the hold, as Deepgram sends one reply's,
+// however slow a loaded machine runs the test. After that it is real time.
+type heldClock struct {
+	mu   sync.Mutex
+	free bool
+	due  []func()
+}
+
+func (c *heldClock) after(d time.Duration, f func()) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.free {
+		time.AfterFunc(d, f)
+		return
+	}
+	c.due = append(c.due, f)
+}
+
+func (c *heldClock) release() {
+	c.mu.Lock()
+	due := c.due
+	c.due, c.free = nil, true
+	c.mu.Unlock()
+	for _, f := range due {
+		f()
+	}
+}
+
 func runSharedDoneTrace(t *testing.T, trace []sharedEvent, sentences, injected int, mustBeWhole bool) {
 	t.Helper()
 	stand := startStandIn(t)
 	base := newFakeOutput()
 	out := newGateOrderingOutput(base)
-	sess, c, _ := open(t, stand, Config{sayLimit: 2 * time.Second, speechGap: time.Minute}, voice.Exchange{Out: out, Tools: silentConcierge()})
+	clock := &heldClock{}
+	sess, c, _ := open(t, stand, Config{sayLimit: 2 * time.Second, speechGap: time.Minute, holdAfter: clock.after}, voice.Exchange{Out: out, Tools: silentConcierge()})
 	defer func() { _ = sess.Close() }()
 
 	texts := make([]string, sentences)
@@ -343,6 +374,15 @@ func runSharedDoneTrace(t *testing.T, trace []sharedEvent, sentences, injected i
 			c.send(map[string]any{"type": "UserStartedSpeaking"})
 		}
 	}
+	// The room's words after the trace show the session has read all of it;
+	// only then does the hold run out.
+	c.send(map[string]any{"type": "ConversationText", "role": "user", "content": "trace read"})
+	for {
+		if waitEvent(t, sess, voice.EventUserTurn).Text == "trace read" {
+			break
+		}
+	}
+	clock.release()
 
 	spoken := false
 	if injected >= 0 {

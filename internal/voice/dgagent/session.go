@@ -145,7 +145,7 @@ func start(cfg *Config, conn *websocket.Conn, x *voice.Exchange) *session {
 		cancel:     cancel,
 		done:       make(chan struct{}),
 		events:     make(chan voice.Event, eventBuffer),
-		speech:     newSpeechQueue(cfg.holdTail),
+		speech:     newSpeechQueue(cfg.holdTail, cfg.holdAfter),
 		speechGap:  cfg.speechGap,
 		keepAlive:  cfg.keepAlive,
 		sayLimit:   cfg.sayLimit,

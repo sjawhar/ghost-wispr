@@ -78,7 +78,8 @@ type speechQueue struct {
 	mu           sync.Mutex
 	items        []speechItem
 	ready        chan struct{} // signalled when items or interrupted change
-	holdTail     time.Duration // how long each frame of an injection waits
+	holdTail     time.Duration                    // how long each frame of an injection waits
+	after        func(d time.Duration, f func()) // runs f once d has passed
 	holder       *utterance    // the injection whose frames may still wait
 	current      *utterance    // the reply receiving audio now
 	awaitingText []*utterance  // completed audio-first replies, in wire order
@@ -87,8 +88,8 @@ type speechQueue struct {
 	stop         context.CancelFunc
 }
 
-func newSpeechQueue(holdTail time.Duration) speechQueue {
-	return speechQueue{ready: make(chan struct{}, 1), holdTail: holdTail}
+func newSpeechQueue(holdTail time.Duration, after func(time.Duration, func())) speechQueue {
+	return speechQueue{ready: make(chan struct{}, 1), holdTail: holdTail, after: after}
 }
 
 func (q *speechQueue) signal() {
@@ -126,7 +127,7 @@ func (q *speechQueue) queueAudioLocked(u *utterance, pcm []byte) {
 func (q *speechQueue) holdLocked(u *utterance, pcm []byte) {
 	u.held = append(u.held, pcm)
 	frame := u.heldBase + len(u.held) // this frame's number, from 1
-	time.AfterFunc(q.holdTail, func() { q.releaseHeld(u, frame) })
+	q.after(q.holdTail, func() { q.releaseHeld(u, frame) })
 }
 
 // releaseHeld plays u's held frames up to frame, once frame has waited

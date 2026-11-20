@@ -125,6 +125,9 @@ type Config struct {
 	keepAlive  time.Duration // how often the session tells Deepgram it is still there
 	retryGrace time.Duration // how long after a refusal or the room's turn a refused answer is handed over again
 	askerWait  time.Duration // how long after the session opens with no turn heard the asker's words go to Deepgram as text
+	// holdAfter runs f once d has passed, for the hold on an injection's
+	// frames; a test may run it when every event it sent has been read.
+	holdAfter func(d time.Duration, f func())
 }
 
 // Timings, as Config's defaults.
@@ -244,6 +247,9 @@ func New(cfg *Config) (*Agent, error) {
 	c.keepAlive = cmp.Or(c.keepAlive, keepAlive)
 	c.retryGrace = cmp.Or(c.retryGrace, retryGrace)
 	c.askerWait = cmp.Or(c.askerWait, askerWait)
+	if c.holdAfter == nil {
+		c.holdAfter = func(d time.Duration, f func()) { time.AfterFunc(d, f) }
+	}
 	return &Agent{cfg: c, think: think}, nil
 }
 
