@@ -123,6 +123,19 @@ func startWith(ctx context.Context, t *testing.T, store *storage.SQLiteStore, di
 	return a
 }
 
+// stopBeforeTheRetries is a start that a stop cuts off after its recovery
+// and before its retries begin, as main's start is between recoverAtStart and
+// recovery.retry: the store then owes session id its retry. A whole start
+// stopped at once cannot stand for it, since its retries may already have run
+// before the stop, and then nothing is owed.
+func stopBeforeTheRetries(t *testing.T, store *storage.SQLiteStore, id string) {
+	t.Helper()
+	recoverAtStart(store)
+	if pending, _, err := store.RefinementResumes(); err != nil || !slices.Equal(pending, []string{id}) {
+		t.Fatalf("after a start stopped before its retries, the store owes %v (%v), want the retry of %s", pending, err, id)
+	}
+}
+
 // settle waits until the start's retries have ended on their own.
 func (a *app) settle() {
 	a.t.Helper()
@@ -661,12 +674,7 @@ func TestADeletionWhileARetryIsOwedCancelsIt(t *testing.T) {
 			}
 			cutOffRefinement(t, store, "merged", path)
 			if mode == "deleted-while-owed" {
-				// A start found the refinement, and a stop came before it
-				// retried it.
-				start(t.Context(), t, store, dir, &transcriptions{}, nil).stop(time.Second, lifecyclePublishWait)
-				if pending, _, err := store.RefinementResumes(); err != nil || !slices.Equal(pending, []string{"merged"}) {
-					t.Fatalf("after a start stopped before its retry, the store owes %v (%v), want the merged session's retry", pending, err)
-				}
+				stopBeforeTheRetries(t, store, "merged")
 			}
 			if mode != "control-not-deleted" {
 				segments, err := store.GetSegments("merged")
@@ -712,8 +720,7 @@ func TestAnOwedRetryRunsAfterGCTookTheRecording(t *testing.T) {
 				t.Fatal(err)
 			}
 			cutOffRefinement(t, store, id, path)
-			// A start found the refinement, and a stop came before it retried it.
-			start(t.Context(), t, store, dir, &transcriptions{}, nil).stop(time.Second, lifecyclePublishWait)
+			stopBeforeTheRetries(t, store, id)
 			if collected {
 				if _, changed, err := store.MarkAudioRemoved(id, path, "", false, time.Now()); err != nil || !changed {
 					t.Fatalf("GC's mark: changed=%t, %v", changed, err)
