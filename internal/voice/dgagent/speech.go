@@ -49,22 +49,23 @@ const (
 // A completed audio-first utterance stays in awaitingText until its text
 // arrives; it never shares state with a later reply.
 //
-// Audio that comes after an injection's last text waits holdTail before it
-// plays: no message names the sentence a binary frame belongs to, so it may
-// be the injection's or the start of the model's own words after it, whose
-// text Deepgram can send a little after their audio. When model text comes,
-// the audio still waiting is dropped. The reply's end (AgentAudioDone,
-// UserStartedSpeaking, the next injection) plays what still waits. Model
-// audio that leads its own text by more than holdTail plays: that is the
-// gate's one bound, which the probe's frame log measures.
+// From an injection's first echoed words until its reply ends, each frame
+// of its audio waits holdTail before it plays: no message names the
+// sentence a binary frame belongs to, so a frame may be the injection's or
+// the start of the model's own words after it, whose text Deepgram sends a
+// little after their first audio. When model text comes, the frames still
+// waiting are dropped. The whole injection waits the same time, so its
+// audio keeps its spacing. Model audio that leads its own text by more than
+// holdTail plays: that is the gate's one bound, which the probe's frame log
+// measures.
 type utterance struct {
 	decision utteranceDecision
 	text     bool
 	done     bool
 	queued   bool
 	ended    bool
-	holding  bool     // its injection's last text came: later audio waits
-	held     [][]byte // audio after its injection's last text, oldest first
+	holding  bool     // an injection, its reply not ended: its audio waits
+	held     [][]byte // its frames that wait, oldest first
 	heldBase int      // the number of frames ever taken from held
 	audio    [][]byte // audio before its text, waiting for its decision
 	waiter   *sayWait
@@ -76,8 +77,8 @@ type speechQueue struct {
 	mu           sync.Mutex
 	items        []speechItem
 	ready        chan struct{} // signalled when items or interrupted change
-	holdTail     time.Duration // how long audio after an injection's last text waits
-	holder       *utterance    // the injection whose audio after its last text may still wait
+	holdTail     time.Duration // how long each frame of an injection waits
+	holder       *utterance    // the injection whose frames may still wait
 	current      *utterance    // the reply receiving audio now
 	awaitingText []*utterance  // completed audio-first replies, in wire order
 	awaitingEnd  []*utterance  // authorized replies superseded before their done
@@ -112,14 +113,19 @@ func (q *speechQueue) queueAudioLocked(u *utterance, pcm []byte) {
 	case u.decision == undecided:
 		u.audio = append(u.audio, pcm)
 	case u.decision == allowed && u.holding:
-		u.held = append(u.held, pcm)
-		frame := u.heldBase + len(u.held) // this frame's number, from 1
-		time.AfterFunc(q.holdTail, func() { q.releaseHeld(u, frame) })
+		q.holdLocked(u, pcm)
 	case u.decision == allowed:
 		u.queued = true
 		q.items = append(q.items, speechItem{kind: itemAudio, pcm: pcm})
 		q.signal()
 	}
+}
+
+// holdLocked makes pcm wait holdTail before it plays. q.mu is held.
+func (q *speechQueue) holdLocked(u *utterance, pcm []byte) {
+	u.held = append(u.held, pcm)
+	frame := u.heldBase + len(u.held) // this frame's number, from 1
+	time.AfterFunc(q.holdTail, func() { q.releaseHeld(u, frame) })
 }
 
 // releaseHeld plays u's held frames up to frame, once frame has waited
@@ -293,18 +299,25 @@ func (q *speechQueue) allow(u *utterance, w *sayWait) {
 		u.waiter = w
 		q.items = append(q.items, speechItem{kind: itemSaid, say: w, audioFirst: u.queued})
 	}
-	if !u.queued && len(u.audio) > 0 {
+	switch {
+	case !u.done && !u.holding:
+		// Its reply goes on, so model words can still follow it in the
+		// same reply: from here its audio waits, the audio before these
+		// words as well, so it keeps its spacing.
+		if q.holder != u {
+			q.releaseHolderLocked() // an earlier injection: no model text came after it
+		}
+		u.holding, q.holder = true, u
+		for _, pcm := range u.audio {
+			q.holdLocked(u, pcm)
+		}
+		u.audio = nil
+	case len(u.audio) > 0:
 		for _, pcm := range u.audio {
 			q.items = append(q.items, speechItem{kind: itemAudio, pcm: pcm})
 		}
 		u.audio = nil
 		u.queued = true
-	}
-	if w != nil && !u.done {
-		if q.holder != u {
-			q.releaseHolderLocked() // an earlier injection: no model text came after it
-		}
-		u.holding, q.holder = true, u // the injection's words are all echoed
 	}
 	q.endLocked(u)
 	if len(q.items) > 0 {
