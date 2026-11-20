@@ -44,7 +44,8 @@ func TestReadmeStatesVoiceConsent(t *testing.T) {
 		"Anything else said in those 6 s is side talk: no voice answers it, and nothing of it goes to Dispatch",
 		"the live Deepgram request carries them, and Dispatch's project keys, as Nova-3 keyterms",
 		"\"In for\" reads as INFRA only before a number of three or more digits",
-		"\"Wispr, never mind\" cancels the newest question to an agent",
+		"\"Wispr, never mind\" cancels the newest question to an agent that has not answered yet; with no such question, it drops the meeting's newest answer still waiting, which then never sounds or speaks",
+		"the blink(1)'s LED 2 flashes green while the unit records",
 		"a single high note when capture starts recording",
 		"a falling two-note sound when Wispr cannot do what was asked",
 		// R13: the settings page.

@@ -5,6 +5,7 @@ package indicator
 import (
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 	"time"
 )
@@ -48,7 +49,10 @@ func TestOpenBlink1FindsTheDeviceBySysfs(t *testing.T) {
 	}
 }
 
-func TestReadRGBSendsThenGets(t *testing.T) {
+// TestReadRGBSelectsLED1ThenReadsIt fails if a read does not select LED 1
+// ('l' 0) and then read it ('r', byte 7 = 1, LED 1 on an mk2), then get the
+// reply: an mk3 reads the LED that 'l' last selected (sharedBlink1).
+func TestReadRGBSelectsLED1ThenReadsIt(t *testing.T) {
 	file, err := os.CreateTemp(t.TempDir(), "hidraw")
 	if err != nil {
 		t.Fatal(err)
@@ -56,12 +60,15 @@ func TestReadRGBSendsThenGets(t *testing.T) {
 	t.Cleanup(func() { _ = file.Close() })
 	light := &blink1{file: file, patternLines: 32}
 	original := featureIOCTL
+	var sets [][8]byte
 	var requests []uintptr
 	featureIOCTL = func(_ uintptr, request uintptr, report *[8]byte) error {
 		requests = append(requests, request)
 		if request == hidIOCGetFeature {
 			report[2], report[3], report[4] = 255, 0, 0
+			return nil
 		}
+		sets = append(sets, *report)
 		return nil
 	}
 	t.Cleanup(func() { featureIOCTL = original })
@@ -73,8 +80,11 @@ func TestReadRGBSendsThenGets(t *testing.T) {
 	if got, want := [3]uint8{r, g, b}, [3]uint8{255, 0, 0}; got != want {
 		t.Fatalf("colour = %v, want %v", got, want)
 	}
-	if got, want := requests, []uintptr{hidIOCSetFeature, hidIOCGetFeature}; len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
+	if got, want := requests, []uintptr{hidIOCSetFeature, hidIOCSetFeature, hidIOCGetFeature}; !slices.Equal(got, want) {
 		t.Fatalf("ioctl requests = %v, want %v", got, want)
+	}
+	if got, want := sets, [][8]byte{Blink1Report('l', [6]byte{}), Blink1Report('r', [6]byte{5: 1})}; !slices.Equal(got, want) {
+		t.Fatalf("reports sent = % x, want % x", got, want)
 	}
 }
 

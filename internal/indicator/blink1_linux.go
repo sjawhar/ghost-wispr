@@ -366,7 +366,7 @@ func (b *blink1) loadVersion() error {
 
 // send sends a command report, holding the light while it does.
 func (b *blink1) send(report *[8]byte) error {
-	return b.exchange(report, false, false)
+	return b.exchange(nil, report, false, false)
 }
 
 // sendLone sends a lone SET that must reach the light whoever holds it: the
@@ -376,7 +376,7 @@ func (b *blink1) send(report *[8]byte) error {
 // whose reply check then refuses it. It never goes inside an exchange of its
 // own handle (exchange).
 func (b *blink1) sendLone(report *[8]byte) error {
-	return b.exchange(report, false, true)
+	return b.exchange(nil, report, false, true)
 }
 
 // query sends a command report and reads the device's reply into it, holding
@@ -386,8 +386,16 @@ func (b *blink1) sendLone(report *[8]byte) error {
 // another command came from a program that takes no lock, between this SET and
 // GET: query returns ErrOtherReply, and the reply is not used.
 func (b *blink1) query(report *[8]byte) error {
+	return b.queryAfter(nil, report)
+}
+
+// queryAfter is query with first, when not nil, sent before report in the
+// same hold of the light: a command whose state report's reply depends on,
+// which no other Ghost Wispr command can then change between them. A failed
+// first sends nothing more and fails the query.
+func (b *blink1) queryAfter(first, report *[8]byte) error {
 	command := report[1]
-	if err := b.exchange(report, true, false); err != nil {
+	if err := b.exchange(first, report, true, false); err != nil {
 		return err
 	}
 	if report[1] != command {
@@ -396,16 +404,16 @@ func (b *blink1) query(report *[8]byte) error {
 	return nil
 }
 
-// exchange sends report and, if reply, reads the reply into it, all under the
-// exchange lock. Every command to the blink(1) goes through here. A command
-// waits for the handle's own exchange in flight without a bound, since that
-// exchange is bounded: its wait for the node's lock, then two transfers. A
-// bound there made a command of the handle report another program (ErrBusy)
-// when only its own pattern check had the handle, and sent a lone SET inside
-// that check's query (review 5956273705 of #79). With anyway, a lone SET whose
-// wait for the node's lock ran out is sent without it, still under the
-// handle's mu.
-func (b *blink1) exchange(report *[8]byte, reply, anyway bool) error {
+// exchange sends first, when not nil, then report and, if reply, reads the
+// reply into report, all under the exchange lock. Every command to the
+// blink(1) goes through here. A command waits for the handle's own exchange
+// in flight without a bound, since that exchange is bounded: its wait for the
+// node's lock, then its transfers. A bound there made a command of the handle
+// report another program (ErrBusy) when only its own pattern check had the
+// handle, and sent a lone SET inside that check's query (review 5956273705 of
+// #79). With anyway, a lone SET (no first, no reply) whose wait for the node's
+// lock ran out is sent without it, still under the handle's mu.
+func (b *blink1) exchange(first, report *[8]byte, reply, anyway bool) error {
 	fd := b.file.Fd()
 	wait, poll := exchangeWait, recorderPoll
 	if b.command {
@@ -421,12 +429,18 @@ func (b *blink1) exchange(report *[8]byte, reply, anyway bool) error {
 		lockClock.Sleep(free)
 	}
 	if err := flockUntil(fd, deadline, poll); err != nil {
-		if anyway && !reply && errors.Is(err, ErrBusy) {
+		if anyway && first == nil && !reply && errors.Is(err, ErrBusy) {
 			return featureIOCTL(fd, hidIOCSetFeature, report)
 		}
 		return err
 	}
-	err := featureIOCTL(fd, hidIOCSetFeature, report)
+	var err error
+	if first != nil {
+		err = featureIOCTL(fd, hidIOCSetFeature, first)
+	}
+	if err == nil {
+		err = featureIOCTL(fd, hidIOCSetFeature, report)
+	}
 	if err == nil && reply {
 		err = featureIOCTL(fd, hidIOCGetFeature, report)
 	}
@@ -456,10 +470,11 @@ func flockUntil(fd uintptr, deadline time.Time, poll time.Duration) error {
 	}
 }
 
-// SetRGB writes the light's colour. An off write reaches the light whoever
-// holds it (sendLone), so a pause turns the light off; a red write waits for
-// the lock and otherwise sends nothing (ErrBusy). With the reply check, an
-// off write's echo, 01 6e 00 00 00, cannot read as red to another reader.
+// SetRGB writes every LED's colour ('n', LED 0). An off write reaches the
+// light whoever holds it (sendLone), so a pause turns the light off; a red
+// write waits for the lock and otherwise sends nothing (ErrBusy). With the
+// reply check, an off write's echo, 01 6e 00 00 00, cannot read as red to
+// another reader.
 func (b *blink1) SetRGB(r, g, blue uint8) error {
 	report := Blink1Report('n', [6]byte{r, g, blue})
 	if r == 0 && g == 0 && blue == 0 {
@@ -468,9 +483,30 @@ func (b *blink1) SetRGB(r, g, blue uint8) error {
 	return b.send(&report)
 }
 
+// SetLED2 writes LED 2's colour and leaves LED 1 as it is: a fade ('c') to
+// the colour over 1 tick of 10 ms, on LED 2 alone. Set at once ('n') with an
+// LED number, the firmware of an mk2 and of an mk3 writes the LED after the
+// one it names and starts its pattern player, which fades every LED to the
+// stored black pattern (todbot/blink1 hardware/firmware_mk2/main.c,
+// todbot/blink1mk3 firmware/firmware-v30x/main.c: the 'n' case sets playing
+// to PLAY_DIRECTLED). It waits for the lock as a red write does, and
+// otherwise sends nothing (ErrBusy).
+func (b *blink1) SetLED2(r, g, blue uint8) error {
+	report := Blink1Report('c', [6]byte{r, g, blue, 0, 1, 2})
+	return b.send(&report)
+}
+
+// ReadRGB reads LED 1's colour back. An mk3's colour read ('r') ignores the
+// LED its request names and reads the one the unit's global LED number names
+// (todbot/blink1mk3 firmware/firmware-v30x/main.c, tags firmware-v303 and
+// firmware-v304: leds[ledn]), which 'l' sets and the pattern player sets from
+// each line it plays; so the read first selects LED 1 ('l' 0), in the same
+// hold of the light. An mk2 reads the LED byte 7 names, LED 1 here. Any error,
+// the select's too, fails the read, and its colour counts as not red.
 func (b *blink1) ReadRGB() (r, g, blue uint8, err error) {
-	report := Blink1Report('r', [6]byte{})
-	if err := b.query(&report); err != nil {
+	selectLED1 := Blink1Report('l', [6]byte{})
+	report := Blink1Report('r', [6]byte{5: 1})
+	if err := b.queryAfter(&selectLED1, &report); err != nil {
 		return 0, 0, 0, err
 	}
 	return report[2], report[3], report[4], nil

@@ -216,8 +216,17 @@ type Concierge interface {
 	// Spoken records that a pending answer was spoken.
 	Spoken(ctx context.Context, taskID string) error
 	// NeverMind cancels the newest working question of sessionID, on "Wispr,
-	// never mind", and tells its holder so.
-	NeverMind(ctx context.Context, sessionID string) error
+	// never mind", and tells its holder so. cancelled reports that there was
+	// one; with none, the Supervisor drops its newest held answer instead.
+	NeverMind(ctx context.Context, sessionID string) (cancelled bool, err error)
+}
+
+// WaitingLight shows the room that something waits for a person: a held
+// answer waiting for "Wispr, go ahead" (the blink(1)'s LED 2, which flashes
+// green while the unit records). On and Off must return at once.
+type WaitingLight interface {
+	On()
+	Off()
 }
 
 // ErrUnreachable marks a Concierge answer that could not reach Dispatch or

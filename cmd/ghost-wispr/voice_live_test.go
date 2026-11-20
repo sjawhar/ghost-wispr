@@ -264,8 +264,8 @@ func TestTheConciergeStartsOnFirstUse(t *testing.T) {
 	if err := lazy.Spoken(t.Context(), "t1"); err != nil {
 		t.Fatalf("Spoken before any call: %v", err)
 	}
-	if err := lazy.NeverMind(t.Context(), "s1"); err != nil {
-		t.Fatalf("NeverMind before any call: %v", err)
+	if cancelled, err := lazy.NeverMind(t.Context(), "s1"); err != nil || cancelled {
+		t.Fatalf("NeverMind before any call = %v, %v; want nothing cancelled", cancelled, err)
 	}
 	if starts != 0 {
 		t.Fatalf("started %d times before any call", starts)

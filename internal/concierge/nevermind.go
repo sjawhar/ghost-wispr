@@ -11,12 +11,14 @@ import (
 )
 
 // NeverMind answers "Wispr, never mind": it cancels meeting sessionID's
-// newest working question and tells its holder (R7). With no working
-// question it does nothing.
-func (c *Concierge) NeverMind(ctx context.Context, sessionID string) error {
+// newest working question, tells its holder (R7) and reports true. A question
+// that stopped working before its cancel landed, as when its answer arrived
+// meanwhile, is passed over for the next one. With no working question it does
+// nothing and reports false: the voice then drops its newest held answer.
+func (c *Concierge) NeverMind(ctx context.Context, sessionID string) (bool, error) {
 	tasks, err := c.store.VoiceTasks(sessionID)
 	if err != nil {
-		return err
+		return false, err
 	}
 	for i := len(tasks) - 1; i >= 0; i-- {
 		task := tasks[i]
@@ -24,16 +26,19 @@ func (c *Concierge) NeverMind(ctx context.Context, sessionID string) error {
 			continue
 		}
 		moved, err := c.store.EndVoiceTask(task.ID, storage.VoiceTaskCancelled)
-		if err != nil || !moved {
-			return err
+		if err != nil {
+			return false, err
+		}
+		if !moved {
+			continue
 		}
 		c.tellChanged(sessionID)
 		agent := strings.TrimPrefix(task.Holder, "session:")
 		c.forget(agent, task.ID)
 		c.tellHolderEnded(ctx, &task, agent, storage.VoiceTaskCancelled, "the room no longer needs it")
-		return nil
+		return true, nil
 	}
-	return nil
+	return false, nil
 }
 
 // tellHolderEnded sends agent a short notice, asking no reply, that task's

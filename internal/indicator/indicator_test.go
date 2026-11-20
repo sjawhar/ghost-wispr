@@ -11,14 +11,20 @@ import (
 	"time"
 )
 
+// fakeLight is a two-LED light: SetRGB writes both LEDs, SetLED2 the second,
+// and ReadRGB reads the first. led1Seen is LED 1's colour at each read and
+// each LED 2 write; led2Writes is each LED 2 write.
 type fakeLight struct {
 	mu          sync.Mutex
 	colour      [3]uint8
+	led2        [3]uint8
 	calls       []string
 	setErr      error
 	readErr     error
 	stuckOff    bool // takes writes but always reads back off
 	serverDowns []time.Duration
+	led1Seen    [][3]uint8
+	led2Writes  [][3]uint8
 }
 
 func (l *fakeLight) SetRGB(r, g, b uint8) error {
@@ -29,6 +35,20 @@ func (l *fakeLight) SetRGB(r, g, b uint8) error {
 		return l.setErr
 	}
 	l.colour = [3]uint8{r, g, b}
+	l.led2 = l.colour
+	return nil
+}
+
+func (l *fakeLight) SetLED2(r, g, b uint8) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.calls = append(l.calls, "led2")
+	l.led1Seen = append(l.led1Seen, l.colour)
+	if l.setErr != nil {
+		return l.setErr
+	}
+	l.led2 = [3]uint8{r, g, b}
+	l.led2Writes = append(l.led2Writes, l.led2)
 	return nil
 }
 
@@ -42,6 +62,7 @@ func (l *fakeLight) ReadRGB() (uint8, uint8, uint8, error) {
 	if l.stuckOff {
 		return 0, 0, 0, nil
 	}
+	l.led1Seen = append(l.led1Seen, l.colour)
 	return l.colour[0], l.colour[1], l.colour[2], nil
 }
 

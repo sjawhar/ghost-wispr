@@ -151,7 +151,7 @@ type heldOnly struct {
 func (c *heldOnly) Tools(*voice.Exchange) voice.ToolRunner                               { return nil }
 func (c *heldOnly) Heard(context.Context, *voice.Exchange, string)                       {}
 func (c *heldOnly) Answers() <-chan voice.PendingAnswer                                  { return c.answers }
-func (c *heldOnly) NeverMind(context.Context, string) error                              { return nil }
+func (c *heldOnly) NeverMind(context.Context, string) (bool, error)                      { return false, nil }
 func (c *heldOnly) Spoken(_ context.Context, id string) error                            { c.spoken <- id; return nil }
 func (c *heldOnly) Answer(context.Context, *voice.Exchange, string, voice.SayFunc) error { return nil }
 

@@ -525,8 +525,20 @@ its watchdog turned it off, Ghost Wispr drops what the microphone holds and open
 new check; the log says `the recording light was not red while the microphone was open; reopening
 the microphone`. At shutdown the blink(1) goes off once the microphone is closed.
 
-`/opt/ghost-wispr/ghost-wispr light-state` prints the blink(1)'s colour (`red`, `off`, or `other`
-and its values) and `light-off` turns it off; both may run while the recorder runs. The blink(1)
+The office Pi's blink(1) (USB `27b8:01ed`, an mk3: its version reply is `01760033 33000000`) has
+two LEDs. LED 1, the top one, is the recording light: every check above reads LED 1 alone, and
+only exact red counts. LED 2, the bottom one, is red with LED 1 while the unit records, and flashes
+green, half a second on and half a second off, while an agent's answer waits for "Wispr, go ahead".
+It goes back to red once the answer is spoken, "Wispr, never mind" drops it, or its session ends,
+and goes off with LED 1 at a pause, a light hold or shutdown; it never flashes while the unit does
+not record. A read selects LED 1 ('l' 0) and reads it ('r') in one hold of the lock below: the mk3
+reads the LED selected last, whatever LED the read names. The flash writes LED 2 alone with a fade
+of one 10 ms tick ('c', LED 2): an 'n' write that names one LED writes the next one and starts the
+blink(1)'s pattern player, which fades both LEDs to the stored black pattern.
+
+`/opt/ghost-wispr/ghost-wispr light-state` prints the colour of the blink(1)'s LED 1 (`red`, `off`,
+or `other` and its values) and `light-off` turns both LEDs off; both may run while the recorder
+runs. The blink(1)
 has one report buffer, and each read gets the reply to the last command that any program sent:
 on the office Pi a `light-state` run while the recorder recorded made the recorder read its red
 light as 0,51,51, the version reply, and drop its audio. So every command that Ghost Wispr sends,

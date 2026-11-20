@@ -412,11 +412,11 @@ func (l *lazyConcierge) Spoken(ctx context.Context, taskID string) error {
 	return nil
 }
 
-func (l *lazyConcierge) NeverMind(ctx context.Context, sessionID string) error {
+func (l *lazyConcierge) NeverMind(ctx context.Context, sessionID string) (bool, error) {
 	if c := l.started(); c != nil {
 		return c.NeverMind(ctx, sessionID)
 	}
-	return nil
+	return false, nil
 }
 
 // unreachableTools answers every tool of a Concierge that did not start, as
