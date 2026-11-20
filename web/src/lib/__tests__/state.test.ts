@@ -5,6 +5,7 @@ import {
   applySegmentDeletion,
   applySummaryUpdate,
   beginSessionDetailRequest,
+  loadJoinedAgents,
   loadVoiceTasks,
   removeSession,
   resetState,
@@ -20,6 +21,7 @@ import {
   VoiceTaskState,
   type SessionDetailResponse,
   type SessionSummary,
+  type JoinedAgent,
   type VoiceTask,
 } from '../types'
 
@@ -528,6 +530,80 @@ describe('voice tasks', () => {
       tasks: [answered],
       error: 'list voice tasks: database is locked',
     })
+  })
+})
+
+describe('joined agents', () => {
+  const agent: JoinedAgent = {
+    agent: 'agent-1',
+    issue_key: 'ABC-12',
+    title: 'Agents join a meeting',
+    joined_at: '2026-11-19T10:05:00Z',
+  }
+  const url = '/api/sessions/s1/joined-agents'
+
+  function stubFetch(...answers: (JoinedAgent[] | Response)[]) {
+    const fetchMock = vi.fn<(input: RequestInfo | URL) => Promise<Response>>(() => {
+      const answer = answers.shift()
+      if (answer === undefined) {
+        return Promise.reject(new Error('unexpected request'))
+      }
+      return Promise.resolve(Array.isArray(answer) ? Response.json(answer) : answer)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    return fetchMock
+  }
+
+  const agentEvent = (type: string, sessionId: string) =>
+    applyEvent({
+      type,
+      version: 1,
+      timestamp: '2026-11-19T10:05:00Z',
+      session_id: sessionId,
+    } as never)
+
+  it("reads a session's joined agents", async () => {
+    const fetchMock = stubFetch([agent])
+
+    await loadJoinedAgents('s1')
+
+    expect(fetchMock.mock.calls.map(([input]) => String(input))).toEqual([url])
+    expect(appState.joinedAgents.get('s1')).toEqual({ agents: [agent], error: '' })
+  })
+
+  // A join or a leave reads the session's agents again; it failed while
+  // nothing listened for agent_joined and agent_left.
+  it.each(['agent_joined', 'agent_left'])(
+    "reads a read session's agents again on %s for it, and on nothing else",
+    async (type) => {
+      const fetchMock = stubFetch([], [agent])
+      await loadJoinedAgents('s1')
+
+      agentEvent(type, 'other')
+      agentEvent('voice_wake', 's1')
+      agentEvent(type, 's1')
+
+      await vi.waitFor(() => expect(appState.joinedAgents.get('s1')?.agents).toEqual([agent]))
+      expect(fetchMock.mock.calls.map(([input]) => String(input))).toEqual([url, url])
+    },
+  )
+
+  it("drops a deleted session's agents", async () => {
+    stubFetch([agent])
+    await loadJoinedAgents('s1')
+
+    removeSession('s1')
+
+    expect(appState.joinedAgents.has('s1')).toBe(false)
+  })
+
+  it('records why a read failed, and keeps the agents read before', async () => {
+    stubFetch([agent], Response.json({ error: 'no meeting voice' }, { status: 503 }))
+    await loadJoinedAgents('s1')
+
+    await loadJoinedAgents('s1')
+
+    expect(appState.joinedAgents.get('s1')).toEqual({ agents: [agent], error: 'no meeting voice' })
   })
 })
 
