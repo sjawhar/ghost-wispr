@@ -65,7 +65,7 @@ func startPausedListener(ctx context.Context, cfgStore *config.Store, u *pausedL
 	if u.newDetector == nil {
 		threads := cfg.Voice.PausedListenerThreads
 		u.newDetector = func() (*local.Detector, error) {
-			return local.NewDetectorWith(local.Options{Thresholds: local.DefaultThresholds, Threads: threads})
+			return local.NewDetectorWith(&local.Options{Thresholds: local.DefaultThresholds, Threads: threads})
 		}
 	}
 	if u.openCapture == nil {

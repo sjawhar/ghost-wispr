@@ -279,8 +279,9 @@ failure, belongs to the stretch of listening its audio was read in, and moves no
 stretch has ended: a close, a detach, a setting turned off or a new stretch wins over it. On the
 office Pi, `voice.paused_listener` stays off until a measurement on 10 h of speech counts fewer
 than 0.5 false starts an hour (`go run -tags kws ./cmd/measure-wake -mode listener`), with both its
-controls fired: the listener heard the start phrases spliced into that speech, and the spotter at
-its most permissive counted more false starts in it than the listener. Without them the run prints
+controls fired: the listener heard the start phrases spliced into that speech, and the same
+pipeline, listening for a keyword the speech says often ("and then") in place of the phrase,
+counted at least 10 hits in it. Without them the run prints
 UNKNOWN. `ghost-wispr kws-selftest CLIP.wav...` checks a build's spotter on stored clips and times
 it. The release ships `THIRD_PARTY_NOTICES.md`, which carries the licence and notice texts of the
 code and model the listener links, whole.

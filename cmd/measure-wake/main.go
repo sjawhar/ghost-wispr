@@ -19,11 +19,11 @@
 // spliced hit, not a false start, and the spliced audio is not counted in the
 // hours. With no -splice, the clips of -phrases are spliced in.
 //
-// The second control runs the spotter at its most permissive, stage 1 alone at
-// -control-boost and -control-threshold (the lowest), on the same speech
-// (check c-listener-accuracy). It must count more false starts than the
-// listener: else the speech holds too little that sounds like the phrase to
-// show that the listener rejects it.
+// The second control runs the same pipeline and counter on the same speech,
+// unspliced, with a keyword the speech says often, -control-keyword ("AND
+// THEN"), in place of the start phrase (check c-listener-accuracy). It must
+// count at least -control-min hits: else the counter is not shown to see
+// spontaneous hits in that speech, and 0 false starts proves nothing.
 //
 // -phrases is a directory whose subdirectories are cells (a person at a
 // distance), each holding WAV files of one start phrase each; each clip is
@@ -60,23 +60,26 @@ func main() {
 }
 
 type options struct {
-	mode             string
-	audio            string
-	phrases          string
-	splice           string
-	spliceEvery      time.Duration
-	boost            float64
-	threshold        float64
-	decoys           string
-	stage2           bool
-	controlBoost     float64
-	controlThreshold float64
-	parallel         int
-	minHours         float64
-	limit            float64
-	minHitRate       float64
-	minCell          int
-	each             bool
+	mode           string
+	audio          string
+	phrases        string
+	splice         string
+	spliceEvery    time.Duration
+	boost          float64
+	threshold      float64
+	decoys         string
+	stage2         bool
+	controlKeyword string
+	controlMin     int
+	// keyword, when set, is what the detector listens for in place of the
+	// start phrase, with stage 2 checking it: the control's (keywordLine).
+	keyword    string
+	parallel   int
+	minHours   float64
+	limit      float64
+	minHitRate float64
+	minCell    int
+	each       bool
 	// detector makes each detector the run uses: newDetector, the
 	// listener's own.
 	detector func(*options) (*local.Detector, error)
@@ -95,8 +98,8 @@ func run(args []string, stdout, stderr io.Writer, detector func(*options) (*loca
 	flags.Float64Var(&o.threshold, "threshold", local.DefaultThresholds.Threshold, "stage 1's threshold")
 	flags.StringVar(&o.decoys, "decoys", "", `"stop": add the stop-recording decoy lines to stage 1`)
 	flags.BoolVar(&o.stage2, "stage2", true, "confirm each stage-1 hit with the recognizer")
-	flags.Float64Var(&o.controlBoost, "control-boost", 3, "the control's stage-1 boost: the most permissive")
-	flags.Float64Var(&o.controlThreshold, "control-threshold", 0.01, "the control's stage-1 threshold: the lowest")
+	flags.StringVar(&o.controlKeyword, "control-keyword", "AND THEN", "the control's keyword, common in -audio: words that are each one of the model's tokens")
+	flags.IntVar(&o.controlMin, "control-min", 10, "the fewest hits the control must count in -audio")
 	flags.IntVar(&o.parallel, "parallel", 1, "detectors that share -audio's streams, each on its own CPU")
 	flags.Float64Var(&o.minHours, "min-hours", 10, "the least audio a verdict rests on")
 	flags.Float64Var(&o.limit, "limit", 0.5, "false starts per hour the verdict allows, exclusive")
@@ -132,6 +135,9 @@ func run(args []string, stdout, stderr io.Writer, detector func(*options) (*loca
 
 func newDetector(o *options) (*local.Detector, error) {
 	opts := local.Options{Thresholds: local.Thresholds{Boost: o.boost, Threshold: o.threshold}, NoStageTwo: !o.stage2}
+	if o.keyword != "" {
+		opts.Keywords, opts.Mark = keywordLine(o.keyword, o.boost, o.threshold), o.keyword
+	}
 	switch o.decoys {
 	case "":
 	case "stop":
@@ -139,7 +145,18 @@ func newDetector(o *options) (*local.Detector, error) {
 	default:
 		return nil, fmt.Errorf("-decoys %q: only stop", o.decoys)
 	}
-	return local.NewDetectorWith(opts)
+	return local.NewDetectorWith(&opts)
+}
+
+// keywordLine is the keyword spotter's line for words, each one of the
+// model's word tokens ("▁AND"), at boost and threshold. The detector refuses a
+// word the model has no token for.
+func keywordLine(words string, boost, threshold float64) string {
+	fields := strings.Fields(strings.ToUpper(words))
+	for i, w := range fields {
+		fields[i] = "▁" + w
+	}
+	return fmt.Sprintf("%s :%g #%g @CONTROL\n", strings.Join(fields, " "), boost, threshold)
 }
 
 // measure runs the listener's detector over the audio and the phrases and
@@ -366,8 +383,9 @@ func measureFalseStarts(o *options, out io.Writer) (string, error) {
 	}
 	used := cpuTime() - started
 	// The control runs after the listener, so the CPU above is the listener's.
+	// It is the same pipeline, listening for the common keyword instead.
 	control := *o
-	control.boost, control.threshold, control.stage2, control.decoys = o.controlBoost, o.controlThreshold, false, ""
+	control.keyword, control.decoys = strings.Join(strings.Fields(strings.ToUpper(o.controlKeyword)), " "), ""
 	controlCounts, err := countAll(&control, all, nil, 0)
 	if err != nil {
 		return "", err
@@ -388,7 +406,11 @@ func measureFalseStarts(o *options, out io.Writer) (string, error) {
 	_, _ = fmt.Fprintf(out, "stage1_hits_in_speech=%d stage1_hits_per_hour=%.3f\n", total.stageOneInSpeech, stageOnePerHour)
 	_, _ = fmt.Fprintf(out, "cpu_seconds_per_audio_second=%.4f\n", cpuShare)
 	_, _ = fmt.Fprintf(out, "spliced_clips=%d spliced_heard=%d\n", total.splicedClips, total.splicedHeard)
-	_, _ = fmt.Fprintf(out, "control_boost=%g control_threshold=%g control_false_starts=%d\n", o.controlBoost, o.controlThreshold, controlCounts.falseStarts)
+	controlPerHour := 0.0
+	if hours > 0 {
+		controlPerHour = float64(controlCounts.falseStarts) / hours
+	}
+	_, _ = fmt.Fprintf(out, "control_keyword=%q control_hits=%d control_hits_per_hour=%.3f\n", control.keyword, controlCounts.falseStarts, controlPerHour)
 	switch {
 	case total.files == 0:
 		_, _ = fmt.Fprintf(out, "UNKNOWN: no WAV file read under %s\n", o.audio)
@@ -404,11 +426,8 @@ func measureFalseStarts(o *options, out io.Writer) (string, error) {
 	case total.splicedHeard == 0:
 		_, _ = fmt.Fprintln(out, "UNKNOWN: the listener heard none of the spliced phrases, so a count of 0 false starts proves nothing")
 		return "UNKNOWN", nil
-	case controlCounts.falseStarts == 0:
-		_, _ = fmt.Fprintln(out, "UNKNOWN: the control counted no false start in this speech: it holds too little that sounds like the phrase to show that the listener rejects it")
-		return "UNKNOWN", nil
-	case controlCounts.falseStarts <= total.falseStarts:
-		_, _ = fmt.Fprintln(out, "UNKNOWN: the control counted no more false starts than the listener, so it does not show the listener rejects anything")
+	case controlCounts.falseStarts < o.controlMin || controlCounts.falseStarts == 0:
+		_, _ = fmt.Fprintf(out, "UNKNOWN: the common-keyword control heard %q %d times, fewer than %d: the counter is not shown to see spontaneous hits in this speech\n", control.keyword, controlCounts.falseStarts, max(o.controlMin, 1))
 		return "UNKNOWN", nil
 	default:
 		return "PASS", nil

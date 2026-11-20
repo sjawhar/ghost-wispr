@@ -43,6 +43,13 @@ type Options struct {
 	// control of the Pi's CPU check sets more (accept-voice.sh --step
 	// listener-cpu).
 	Threads int
+	// Keywords, when set, are keyword lines that replace the two start
+	// phrases, and Mark is what stage 2's text must then hold: the
+	// false-wake measurement's control, a keyword common in the speech,
+	// counted through the same pipeline (cmd/measure-wake -control-keyword).
+	// Each line's tokens must be the model's.
+	Keywords string
+	Mark     string
 }
 
 // StopDecoys are "Wispr, stop recording" and "Ghost Wispr, stop recording" as
@@ -81,6 +88,9 @@ type Detector struct {
 	scratch []float32
 	// hits counts stage-1 hits, confirmed or not, for a measurement.
 	hits int
+	// mark is what stage 2's text must hold: startMark, but for a
+	// measurement's control keyword (Options.Mark).
+	mark string
 }
 
 // StageOneHits is how many stage-1 hits the detector has had, confirmed or
@@ -90,7 +100,7 @@ func (d *Detector) StageOneHits() int { return d.hits }
 // NewDetectorOf makes a detector of its two stages: the sherpa-onnx ones
 // (NewDetector), or a test's.
 func NewDetectorOf(spot Spotter, verify Verifier) *Detector {
-	return &Detector{spot: spot, verify: verify, scratch: make([]float32, 0, RingSamples+tailSamples)}
+	return &Detector{spot: spot, verify: verify, mark: startMark, scratch: make([]float32, 0, RingSamples+tailSamples)}
 }
 
 // Write feeds one microphone buffer, 16 kHz mono PCM16, and reports whether
@@ -129,7 +139,7 @@ func (d *Detector) keep(chunk []int16) {
 }
 
 // confirm runs stage 2 on the ring, oldest sample first, then silence, and
-// reports whether its text holds startMark.
+// reports whether its text holds the detector's mark.
 func (d *Detector) confirm() bool {
 	samples := d.scratch[:d.filled+tailSamples]
 	start := (d.next - d.filled + RingSamples) % RingSamples
@@ -138,7 +148,7 @@ func (d *Detector) confirm() bool {
 	}
 	clear(samples[d.filled:])
 	text := d.verify.Text(samples)
-	return strings.Contains(text, startMark)
+	return strings.Contains(text, d.mark)
 }
 
 // Reset zeroes the ring and the conversion buffer, and resets the spotter's

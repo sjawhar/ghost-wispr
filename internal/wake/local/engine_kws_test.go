@@ -61,6 +61,59 @@ func TestTheKeywordsLoadAgainstTheModel(t *testing.T) {
 	d.Close()
 }
 
+// TestAControlKeywordReplacesThePhrase fails if Options.Keywords and
+// Options.Mark do not make the real detector listen for another keyword in
+// place of the start phrase, as the false-wake measurement's control does: a
+// detector for "start recording" alone, with stage 2 checking "START", hears
+// every stored start clip, and a detector for "and then", which no clip says,
+// hears none of them.
+func TestAControlKeywordReplacesThePhrase(t *testing.T) {
+	starts, _ := clips(t)
+	for _, tc := range []struct {
+		keywords, mark string
+		want           bool
+	}{
+		{"▁START ▁RE C OR D ING :1.0 #0.25 @CONTROL\n", "START", true},
+		{"▁AND ▁THEN :1.0 #0.25 @CONTROL\n", "AND THEN", false},
+	} {
+		d, err := NewDetectorWith(&Options{Keywords: tc.keywords, Mark: tc.mark})
+		if err != nil {
+			t.Fatalf("load the spotter with the control keyword %q: %v", tc.keywords, err)
+		}
+		for _, clip := range starts {
+			d.Reset()
+			if got := heardIn(t, d, clip); got != tc.want {
+				t.Errorf("a detector for %q, stage 2 checking %q: %s heard %t, want %t", strings.TrimSpace(tc.keywords), tc.mark, clip, got, tc.want)
+			}
+		}
+		d.Close()
+	}
+}
+
+// TestAnUnknownTokenIsRefused fails if a keyword line with a token the model
+// lacks reaches sherpa-onnx, which would end the whole process, instead of
+// being refused with an error that names the token.
+func TestAnUnknownTokenIsRefused(t *testing.T) {
+	for _, o := range []Options{
+		{Keywords: "▁AND ▁NOTATOKENGW :1.0 #0.25 @CONTROL\n"},
+		{Decoys: "▁W H IS PER ▁NOTATOKENGW :1.0 #0.25 @DECOY_X\n"},
+	} {
+		d, err := NewDetectorWith(&o)
+		if err == nil {
+			d.Close()
+			t.Fatalf("%+v loaded", o)
+		}
+		if !strings.Contains(err.Error(), "▁NOTATOKENGW") {
+			t.Errorf("%+v: the error %q does not name the token", o, err)
+		}
+	}
+	d, err := NewDetectorWith(&Options{Keywords: "▁AND ▁THEN :1.0 #0.25 @CONTROL\n", Mark: "AND THEN"})
+	if err != nil {
+		t.Fatalf("control: the measurement's default control keyword does not load: %v", err)
+	}
+	d.Close()
+}
+
 // TestTheSpotterHearsOnlyTheStartPhrase fails if the real detector misses
 // "Wispr, start recording" or "Ghost Wispr, start recording" in a stored
 // synthetic clip, in American and British voices, or takes a near miss for

@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/binary"
+	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
@@ -20,20 +21,25 @@ import (
 // buffer that holds it.
 const phraseSample = 4242
 
-// nearSample marks speech that sounds like the phrase: only a permissive
-// stage 1, the control's (boost 2 or more), hears it.
-const nearSample = 4243
+// commonSample marks the common keyword of the speech, "and then": only the
+// control's detector, built for -control-keyword, hears it.
+const commonSample = 4243
 
 // phraseSeconds is a test phrase's length: one 100 ms buffer, which the tool
 // feeds at a stream's own 100 ms steps, so that the fake spotter hears it
 // once.
 const phraseSeconds = 0.1
 
-type markSpotter struct{ permissive bool }
+// markSpotter is stage 1: the listener's hears phraseSample, and the
+// control's commonSample.
+type markSpotter struct{ control bool }
 
 func (s markSpotter) Accept(samples []float32) bool {
-	return slices.Contains(samples, float32(phraseSample)/32768) ||
-		(s.permissive && slices.Contains(samples, float32(nearSample)/32768))
+	mark := phraseSample
+	if s.control {
+		mark = commonSample
+	}
+	return slices.Contains(samples, float32(mark)/32768)
 }
 func (markSpotter) Reset() {}
 func (markSpotter) Close() {}
@@ -45,15 +51,15 @@ func (v textVerifier) Text([]float32) string { return string(v) }
 func (textVerifier) Close()                  {}
 
 // fakeDetector is the tool's detector on the fake stages; stage 2 refuses
-// every hit when -stage2 is on and refuse is set, and a boost of 2 or more
-// makes stage 1 hear near misses too.
+// every hit when -stage2 is on and refuse is set. A detector built for a
+// keyword, the control's, hears commonSample in place of the phrase.
 func fakeDetector(refuse bool) func(*options) (*local.Detector, error) {
 	return func(o *options) (*local.Detector, error) {
 		text := textVerifier("WHISPER START RECORDING")
 		if refuse && o.stage2 {
 			text = "WHISPER STOP RECORDING"
 		}
-		return local.NewDetectorOf(markSpotter{permissive: o.boost >= 2}, text), nil
+		return local.NewDetectorOf(markSpotter{control: o.keyword != ""}, text), nil
 	}
 }
 
@@ -105,13 +111,15 @@ func requireOutput(t *testing.T, code int, text string, wantCode int, want ...st
 	}
 }
 
-// speechWithNearMiss writes a stream of speech that holds one stretch which
-// sounds like the phrase: the control hears it, and the listener must not.
-func speechWithNearMiss(t *testing.T, dir string) {
+// speechWithCommonWord writes a stream of speech that says the common
+// keyword n times: the control hears it, and the listener must not.
+func speechWithCommonWord(t *testing.T, dir string, n int) {
 	t.Helper()
-	writeWAV(t, dir, "1-speech.wav", 2, 100)
-	writeWAV(t, dir, "2-near.wav", phraseSeconds, nearSample)
-	writeWAV(t, dir, "3-speech.wav", 1, 100)
+	writeWAV(t, dir, "0-speech.wav", 2, 100)
+	for i := range n {
+		writeWAV(t, dir, fmt.Sprintf("%d-and-then.wav", 2*i+1), phraseSeconds, commonSample)
+		writeWAV(t, dir, fmt.Sprintf("%d-speech.wav", 2*i+2), 1, 100)
+	}
 }
 
 // TestSplicedPhrasesAreNotFalseStarts fails if the run counts a phrase it
@@ -120,10 +128,10 @@ func speechWithNearMiss(t *testing.T, dir string) {
 // pass.
 func TestSplicedPhrasesAreNotFalseStarts(t *testing.T) {
 	root := t.TempDir()
-	speechWithNearMiss(t, filepath.Join(root, "audio", "chapter"))
+	speechWithCommonWord(t, filepath.Join(root, "audio", "chapter"), 1)
 	writeWAV(t, filepath.Join(root, "splice"), "start.wav", phraseSeconds, phraseSample)
-	code, text := runTool(t, false, "-audio", filepath.Join(root, "audio"), "-splice", filepath.Join(root, "splice"), "-splice-every", "1s", "-min-hours", "0")
-	requireOutput(t, code, text, 0, "false_starts=0 ", "spliced_clips=", "control_boost=3 control_threshold=0.01 control_false_starts=1", "PASS")
+	code, text := runTool(t, false, "-audio", filepath.Join(root, "audio"), "-splice", filepath.Join(root, "splice"), "-splice-every", "1s", "-min-hours", "0", "-control-min", "1")
+	requireOutput(t, code, text, 0, "false_starts=0 ", "spliced_clips=", `control_keyword="AND THEN" control_hits=1 `, "PASS")
 	if strings.Contains(text, "spliced_heard=0") {
 		t.Fatalf("the spliced phrases were not heard:\n%s", text)
 	}
@@ -158,20 +166,59 @@ func TestStageTwoRefusalsAreCountedApart(t *testing.T) {
 }
 
 // TestTheControlMustFireToPass fails if 0 false starts passes when the
-// control, the spotter at its most permissive on the same speech, also counts
-// 0, or no more than the listener: the speech then holds too little that sounds
-// like the phrase to show the listener rejects it (check c-listener-accuracy).
+// common-keyword control, the same pipeline listening for a keyword the
+// speech says often, counts fewer than -control-min hits on the same speech:
+// the counter then is not shown to see spontaneous hits in it (check
+// c-listener-accuracy).
 func TestTheControlMustFireToPass(t *testing.T) {
 	root := t.TempDir()
 	writeWAV(t, filepath.Join(root, "audio", "chapter"), "speech.wav", 3, 100)
 	writeWAV(t, filepath.Join(root, "splice"), "start.wav", phraseSeconds, phraseSample)
 	code, text := runTool(t, false, "-audio", filepath.Join(root, "audio"), "-splice", filepath.Join(root, "splice"), "-splice-every", "1s", "-min-hours", "0")
-	requireOutput(t, code, text, 1, "false_starts=0 ", "control_false_starts=0", "UNKNOWN: the control counted no false start in this speech")
+	requireOutput(t, code, text, 1, "false_starts=0 ", "control_hits=0 ", `UNKNOWN: the common-keyword control heard "AND THEN" 0 times, fewer than 10`)
 
-	writeWAV(t, filepath.Join(root, "audio2", "chapter"), "1-speech.wav", 2, 100)
-	writeWAV(t, filepath.Join(root, "audio2", "chapter"), "2-start.wav", phraseSeconds, phraseSample)
-	code, text = runTool(t, false, "-audio", filepath.Join(root, "audio2"), "-splice", filepath.Join(root, "splice"), "-splice-every", "1s", "-min-hours", "0", "-limit", "1e12")
-	requireOutput(t, code, text, 1, "false_starts=1 ", "control_false_starts=1", "UNKNOWN: the control counted no more false starts than the listener")
+	speechWithCommonWord(t, filepath.Join(root, "audio2", "chapter"), 2)
+	code, text = runTool(t, false, "-audio", filepath.Join(root, "audio2"), "-splice", filepath.Join(root, "splice"), "-splice-every", "1s", "-min-hours", "0", "-control-min", "3")
+	requireOutput(t, code, text, 1, "control_hits=2 ", `UNKNOWN: the common-keyword control heard "AND THEN" 2 times, fewer than 3`)
+	code, text = runTool(t, false, "-audio", filepath.Join(root, "audio2"), "-splice", filepath.Join(root, "splice"), "-splice-every", "1s", "-min-hours", "0", "-control-min", "2")
+	requireOutput(t, code, text, 0, "control_hits=2 ", "PASS")
+}
+
+// TestTheControlRunsTheSamePipeline fails if the control's detector is not
+// the listener's with the keyword in place of the start phrase: the same
+// boost, threshold and stage 2, and no decoys, so that its hits show what the
+// listener's counter can see in the speech.
+func TestTheControlRunsTheSamePipeline(t *testing.T) {
+	root := t.TempDir()
+	speechWithCommonWord(t, filepath.Join(root, "audio", "chapter"), 1)
+	writeWAV(t, filepath.Join(root, "splice"), "start.wav", phraseSeconds, phraseSample)
+	var built []options
+	var out bytes.Buffer
+	run([]string{"-audio", filepath.Join(root, "audio"), "-splice", filepath.Join(root, "splice"), "-splice-every", "1s", "-min-hours", "0",
+		"-boost", "1.5", "-threshold", "0.2", "-decoys", "stop", "-control-keyword", "the man"}, &out, &out, func(o *options) (*local.Detector, error) {
+		built = append(built, *o)
+		return fakeDetector(false)(o)
+	})
+	if len(built) != 2 {
+		t.Fatalf("built %d detectors, want the listener's and the control's:\n%s", len(built), out.String())
+	}
+	listener, control := built[0], built[1]
+	if listener.keyword != "" || listener.decoys != "stop" {
+		t.Fatalf("the listener's detector: keyword %q, decoys %q; want none and stop", listener.keyword, listener.decoys)
+	}
+	if control.keyword != "THE MAN" || control.boost != 1.5 || control.threshold != 0.2 || !control.stage2 || control.decoys != "" {
+		t.Fatalf("the control's detector: keyword %q, boost %g, threshold %g, stage 2 %t, decoys %q; want THE MAN, 1.5, 0.2, true, none",
+			control.keyword, control.boost, control.threshold, control.stage2, control.decoys)
+	}
+}
+
+// TestTheControlKeywordIsTheModelsTokens fails if a control keyword's words
+// do not become one keyword line of the model's word tokens, at the
+// listener's boost and threshold.
+func TestTheControlKeywordIsTheModelsTokens(t *testing.T) {
+	if got, want := keywordLine("AND  THEN", 1, 0.25), "▁AND ▁THEN :1 #0.25 @CONTROL\n"; got != want {
+		t.Fatalf("keywordLine = %q, want %q", got, want)
+	}
 }
 
 // TestThePhrasesAreTheSpliceByDefault fails if a run given -phrases and no
@@ -179,12 +226,12 @@ func TestTheControlMustFireToPass(t *testing.T) {
 // speech, and so can never pass.
 func TestThePhrasesAreTheSpliceByDefault(t *testing.T) {
 	root := t.TempDir()
-	speechWithNearMiss(t, filepath.Join(root, "audio", "chapter"))
+	speechWithCommonWord(t, filepath.Join(root, "audio", "chapter"), 1)
 	for i := range 10 {
 		writeWAV(t, filepath.Join(root, "phrases", "person1-1m"), "start"+string(rune('a'+i))+".wav", phraseSeconds, phraseSample)
 	}
-	code, text := runTool(t, false, "-audio", filepath.Join(root, "audio"), "-phrases", filepath.Join(root, "phrases"), "-splice-every", "1s", "-min-hours", "0")
-	requireOutput(t, code, text, 0, "spliced_clips=", "control_false_starts=1", "cell=person1-1m clips=10 heard=10", "PASS")
+	code, text := runTool(t, false, "-audio", filepath.Join(root, "audio"), "-phrases", filepath.Join(root, "phrases"), "-splice-every", "1s", "-min-hours", "0", "-control-min", "1")
+	requireOutput(t, code, text, 0, "spliced_clips=", "control_hits=1 ", "cell=person1-1m clips=10 heard=10", "PASS")
 	if strings.Contains(text, "spliced_heard=0") {
 		t.Fatalf("the phrases spliced in were not heard:\n%s", text)
 	}

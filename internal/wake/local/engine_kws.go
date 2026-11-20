@@ -21,6 +21,7 @@ import "C"
 import (
 	"errors"
 	"fmt"
+	"strings"
 	"unsafe"
 
 	"golang.org/x/sys/unix"
@@ -39,46 +40,88 @@ const keywords = "▁W H IS PER ▁START ▁RE C OR D ING :1.0 #0.25 @WISPR_STAR
 // NewDetector loads the embedded model into memory-backed files, so nothing
 // reaches the disk, and builds both stages from it with one thread each.
 func NewDetector() (*Detector, error) {
-	return NewDetectorWith(Options{Thresholds: DefaultThresholds})
+	return NewDetectorWith(&Options{Thresholds: DefaultThresholds})
 }
 
-// NewDetectorWith is NewDetector as a measurement varies it (Options).
-func NewDetectorWith(o Options) (*Detector, error) {
+// NewDetectorWith is NewDetector as a measurement varies it (Options). It
+// refuses a keyword line with a token the model lacks, which sherpa-onnx
+// would answer by ending the process.
+func NewDetectorWith(options *Options) (*Detector, error) {
+	o := *options
+	if o.Thresholds == (Thresholds{}) {
+		o.Thresholds = DefaultThresholds
+	}
+	lines := keywords
+	switch {
+	case o.Keywords != "":
+		lines = o.Keywords
+	case o.Thresholds != DefaultThresholds:
+		lines = fmt.Sprintf("▁W H IS PER ▁START ▁RE C OR D ING :%g #%g @WISPR_START_RECORDING\n"+
+			"▁G HO S T ▁W H IS PER ▁START ▁RE C OR D ING :%g #%g @GHOST_WISPR_START_RECORDING\n",
+			o.Thresholds.Boost, o.Thresholds.Threshold, o.Thresholds.Boost, o.Thresholds.Threshold)
+	}
+	lines += o.Decoys
+	tokensErr := checkTokens(lines)
+	if tokensErr != nil {
+		return nil, tokensErr
+	}
+	mark := startMark
+	if o.Mark != "" {
+		mark = o.Mark
+	}
 	files, err := modelFiles()
 	if err != nil {
 		return nil, err
 	}
 	defer files.close()
-	if o.Thresholds == (Thresholds{}) {
-		o.Thresholds = DefaultThresholds
-	}
-	lines := keywords
-	if o.Thresholds != DefaultThresholds {
-		lines = fmt.Sprintf("▁W H IS PER ▁START ▁RE C OR D ING :%g #%g @WISPR_START_RECORDING\n"+
-			"▁G HO S T ▁W H IS PER ▁START ▁RE C OR D ING :%g #%g @GHOST_WISPR_START_RECORDING\n",
-			o.Thresholds.Boost, o.Thresholds.Threshold, o.Thresholds.Boost, o.Thresholds.Threshold)
-	}
 	threads := max(o.Threads, 1)
-	spot, err := newSherpaSpotter(files, lines+o.Decoys, threads)
+	spot, err := newSherpaSpotter(files, lines, threads)
 	if err != nil {
 		return nil, err
 	}
+	var d *Detector
 	if o.NoStageTwo {
-		return NewDetectorOf(spot, acceptAll{}), nil
+		d = NewDetectorOf(spot, acceptAll{mark: mark})
+	} else {
+		verify, err := newSherpaVerifier(files, threads)
+		if err != nil {
+			spot.Close()
+			return nil, err
+		}
+		d = NewDetectorOf(spot, verify)
 	}
-	verify, err := newSherpaVerifier(files, threads)
-	if err != nil {
-		spot.Close()
-		return nil, err
+	d.mark = mark
+	return d, nil
+}
+
+// checkTokens refuses keyword lines with a token that is not one of the
+// model's: each line's tokens are its fields before the first that starts
+// with ':', '#' or '@'.
+func checkTokens(lines string) error {
+	known := map[string]bool{}
+	for _, line := range strings.Split(string(modelTokens), "\n") {
+		if fields := strings.Fields(line); len(fields) > 0 {
+			known[fields[0]] = true
+		}
 	}
-	return NewDetectorOf(spot, verify), nil
+	for _, line := range strings.Split(lines, "\n") {
+		for _, token := range strings.Fields(line) {
+			if strings.ContainsAny(token[:1], ":#@") {
+				break
+			}
+			if !known[token] {
+				return fmt.Errorf("paused listener: the keyword line %q has the token %q, which the model does not know", line, token)
+			}
+		}
+	}
+	return nil
 }
 
 // acceptAll is no stage 2: every stage-1 hit counts.
-type acceptAll struct{}
+type acceptAll struct{ mark string }
 
-func (acceptAll) Text([]float32) string { return startMark }
-func (acceptAll) Close()                {}
+func (a acceptAll) Text([]float32) string { return a.mark }
+func (acceptAll) Close()                  {}
 
 // memModel is the model's files, each in a memory-backed file that
 // sherpa-onnx opens by its /proc/self/fd path.

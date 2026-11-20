@@ -109,6 +109,30 @@ func TestStageTwoAcceptsOnlyStart(t *testing.T) {
 	}
 }
 
+// TestStageTwoChecksTheDetectorsMark fails if stage 2 checks "STAR" in a
+// detector built for another keyword, as the false-wake measurement's control
+// is (cmd/measure-wake -control-keyword): its hits must count when stage 2's
+// text holds that keyword, and only then.
+func TestStageTwoChecksTheDetectorsMark(t *testing.T) {
+	for _, tc := range []struct {
+		mark, text string
+		want       bool
+	}{
+		{"AND THEN", "SO AND THEN WE WENT", true},
+		{"AND THEN", "WHISPER START RECORDING", false},
+		{"", "WHISPER START RECORDING", true},
+		{"", "SO AND THEN WE WENT", false},
+	} {
+		d := NewDetectorOf(&fakeSpotter{hits: []int{SampleRate}}, &fakeVerifier{text: tc.text})
+		if tc.mark != "" {
+			d.mark = tc.mark
+		}
+		if got := d.Write(samplesOf(0, SampleRate)); got != tc.want {
+			t.Errorf("mark %q, stage 2 text %q: heard %t, want %t", tc.mark, tc.text, got, tc.want)
+		}
+	}
+}
+
 // TestEveryHitZeroesTheRing fails if a stage-1 hit, accepted or not, leaves
 // audio in the ring or the spotter's stream: the next hit must not re-read it.
 func TestEveryHitZeroesTheRing(t *testing.T) {
