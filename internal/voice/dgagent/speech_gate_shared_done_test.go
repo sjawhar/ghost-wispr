@@ -20,7 +20,7 @@ type sharedSentence struct {
 }
 
 type sharedEvent struct {
-	sentence int // -1 for AgentAudioDone
+	sentence int // -1 for AgentAudioDone and UserStartedSpeaking
 	kind     replyEvent
 }
 
@@ -30,12 +30,15 @@ type sharedEvent struct {
 // may come before or after its own audio, and the last sentence's text may
 // come after the AgentAudioDone. A sentence's text never comes after the
 // next sentence's audio: no message names its sentence, so nothing could
-// tell such audio apart. Sol's review of 65a0c06 found the model's audio
-// after an injection, before the model's text, playing.
+// tell such audio apart. Each order also runs with a UserStartedSpeaking
+// between any two of its events. Sol's review of 65a0c06 found the model's
+// audio after an injection, before the model's text, playing; its review
+// of 1bd9863 found a UserStartedSpeaking between them playing it.
 //
 // Whatever the order, no model byte reaches Output, and a Say returns nil
 // only once Output has accepted all of its bytes; else it returns an error.
-// An injection alone plays whole in every order.
+// An injection alone, with no UserStartedSpeaking, plays whole in every
+// order. Each order has its own session and runs beside the others.
 func TestSpeechGateSharedDoneReplies(t *testing.T) {
 	for sentences := 1; sentences <= 3; sentences++ {
 		for injected := -1; injected < sentences; injected++ {
@@ -44,10 +47,20 @@ func TestSpeechGateSharedDoneReplies(t *testing.T) {
 			}
 			for _, trace := range everySharedDoneTrace(sentences) {
 				name := fmt.Sprintf("%d-sentences/injected-%d/%s", sentences, injected+1, sharedTraceName(trace, injected))
-				if !t.Run(name, func(t *testing.T) {
+				t.Run(name, func(t *testing.T) {
+					t.Parallel()
 					runSharedDoneTrace(t, trace, sentences, injected, sentences == 1)
-				}) {
-					return
+				})
+				for at := 1; at < len(trace); at++ {
+					cut := make([]sharedEvent, 0, len(trace)+1)
+					cut = append(cut, trace[:at]...)
+					cut = append(cut, sharedEvent{-1, replyUserStart})
+					cut = append(cut, trace[at:]...)
+					name := fmt.Sprintf("%d-sentences/injected-%d/%s", sentences, injected+1, sharedTraceName(cut, injected))
+					t.Run(name, func(t *testing.T) {
+						t.Parallel()
+						runSharedDoneTrace(t, cut, sentences, injected, false)
+					})
 				}
 			}
 		}
@@ -63,6 +76,55 @@ func TestSpeechGateSharedDoneReplies(t *testing.T) {
 	t.Run("injection-plays-whole/audio-first", func(t *testing.T) {
 		runSharedDoneTrace(t, []sharedEvent{{0, replyAudio}, {0, replyText}, {-1, replyDone}}, 1, 0, true)
 	})
+	for _, userStart := range []bool{true, false} {
+		name := "sol-round-7/model-audio-then-its-text-over-played-speech"
+		if userStart {
+			name = "sol-round-7/user-start-between-model-audio-and-its-text-over-played-speech"
+		}
+		t.Run(name, func(t *testing.T) { testUserStartOverPlayedSpeech(t, userStart) })
+	}
+}
+
+// testUserStartOverPlayedSpeech is Sol's order from the review of 1bd9863:
+// an injection whose audio has passed the hold and plays, then the model's
+// audio, a UserStartedSpeaking, and 20 ms later the model's text. The model's
+// audio still waits when the room speaks over the voice, so it never plays,
+// and the injection's audio that played stays played. Without the
+// UserStartedSpeaking, the model's text drops the model's audio.
+func testUserStartOverPlayedSpeech(t *testing.T, userStart bool) {
+	stand := startStandIn(t)
+	out := newFakeOutput()
+	sess, c, _ := open(t, stand, Config{speechGap: time.Minute}, voice.Exchange{Out: out, Tools: tools(nil)})
+	defer func() { _ = sess.Close() }()
+	approved := tone(OutputRate, 40*time.Millisecond, 800)
+	done := sayAsync(sess, "Approved words.")
+	c.expect(t, "InjectAgentMessage")
+	c.send(map[string]any{"type": "ConversationText", "role": "assistant", "content": "Approved words."})
+	c.sendAudio(approved)
+	out.nextPlayback(t).waitBytes(t, len(approved)) // past the hold: the voice speaks
+	c.sendAudio(tone(OutputRate, 20*time.Millisecond, -800))
+	if userStart {
+		c.send(map[string]any{"type": "UserStartedSpeaking"})
+	}
+	time.Sleep(20 * time.Millisecond)
+	c.send(map[string]any{"type": "ConversationText", "role": "assistant", "content": "Model words."})
+	c.send(map[string]any{"type": "AgentAudioDone"})
+	err := returned(t, done)
+	if !userStart && err != nil {
+		t.Fatalf("Say = %v, want nil: its words played whole", err)
+	}
+	barrier := sayAsync(sess, "Ordering barrier.")
+	c.expect(t, "InjectAgentMessage")
+	c.send(map[string]any{"type": "ConversationText", "role": "assistant", "content": "Ordering barrier."})
+	c.sendAudio(tone(OutputRate, 20*time.Millisecond, 900))
+	c.send(map[string]any{"type": "AgentAudioDone"})
+	if err := returned(t, barrier); err != nil {
+		t.Fatalf("ordering barrier = %v", err)
+	}
+	got := outputSamples(t, out)
+	if got[-800] != 0 || got[800] != len(approved) {
+		t.Fatalf("model/approved bytes at Output = %d/%d, want 0/%d", got[-800], got[800], len(approved))
+	}
 }
 
 // TestAnInjectionKeepsItsSpacingThroughTheHold fails if the hold on an
@@ -181,12 +243,14 @@ func sharedTraceName(trace []sharedEvent, injected int) string {
 		switch e.kind {
 		case replyDone:
 			parts[i] = "D"
+		case replyUserStart:
+			parts[i] = "U"
 		case replyText:
 			parts[i] = fmt.Sprintf("T%d", e.sentence+1)
 		case replyAudio:
 			parts[i] = fmt.Sprintf("A%d", e.sentence+1)
 		}
-		if e.sentence == injected && e.kind != replyDone {
+		if e.sentence == injected && e.sentence >= 0 {
 			parts[i] += "i"
 		}
 	}
@@ -195,11 +259,10 @@ func sharedTraceName(trace []sharedEvent, injected int) string {
 
 func runSharedDoneTrace(t *testing.T, trace []sharedEvent, sentences, injected int, mustBeWhole bool) {
 	t.Helper()
-	setSpeechGap(t, time.Minute)
 	stand := startStandIn(t)
 	base := newFakeOutput()
 	out := newGateOrderingOutput(base)
-	sess, c, _ := open(t, stand, Config{sayLimit: 2 * time.Second}, voice.Exchange{Out: out, Tools: tools(nil)})
+	sess, c, _ := open(t, stand, Config{sayLimit: 2 * time.Second, speechGap: time.Minute}, voice.Exchange{Out: out, Tools: tools(nil)})
 	defer func() { _ = sess.Close() }()
 
 	texts := make([]string, sentences)
@@ -228,6 +291,8 @@ func runSharedDoneTrace(t *testing.T, trace []sharedEvent, sentences, injected i
 			c.sendAudio(tone(OutputRate, 20*time.Millisecond, samples[e.sentence]))
 		case replyDone:
 			c.send(map[string]any{"type": "AgentAudioDone"})
+		case replyUserStart:
+			c.send(map[string]any{"type": "UserStartedSpeaking"})
 		}
 	}
 

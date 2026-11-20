@@ -20,6 +20,7 @@ const (
 	replyText replyEvent = iota
 	replyAudio
 	replyDone
+	replyUserStart // UserStartedSpeaking: Deepgram heard the room start a turn
 )
 
 type gateReply struct {
