@@ -650,11 +650,9 @@ func TestARetriedQuestionKeepsItsFirstTime(t *testing.T) {
 	}
 }
 
-// TestAnAskedQuestionNeedsNoFallbackLine (R6, R7): when the question already
-// went to the holder and the model's facts fail R8's check twice, the voice
-// says the asked line alone: "I can only say what the record holds" would
-// only hold the holder's answer back.
-func TestAnAskedQuestionNeedsNoFallbackLine(t *testing.T) {
+// TestAnAskedQuestionUsesTheFixedSentence (R8): when the model fails R8's
+// check twice, the voice says the fixed sentence before the ask line.
+func TestAnAskedQuestionUsesTheFixedSentence(t *testing.T) {
 	r := newRig(t)
 	heldIssue(r, "session", false)
 	r.model.turns = [][]*genai.GenerateContentResponse{
@@ -663,8 +661,8 @@ func TestAnAskedQuestionNeedsNoFallbackLine(t *testing.T) {
 	}
 	var spoken []said
 	err := r.concierge.Answer(context.Background(), &r.exchange, "ask the agent on ABC-12 whether the tap is merged", recorder(&spoken))
-	if err != nil || len(spoken) != 1 || !strings.Contains(spoken[0].text, "asked the agent on ABC-12") {
-		t.Fatalf("Answer = %v, spoken %+v; want the asked line alone", err, spoken)
+	if err != nil || len(spoken) != 2 || spoken[0].text != fixedSentence || !strings.Contains(spoken[1].text, "asked the agent on ABC-12") {
+		t.Fatalf("Answer = %v, spoken %+v; want the fixed sentence then the asked line", err, spoken)
 	}
 }
 
@@ -1047,7 +1045,7 @@ func TestAFollowUpTurnIsAskedOnlyWhenItSaysAsk(t *testing.T) {
 		r := newRig(t)
 		heldIssue(r, "session", false)
 		r.exchange.FollowUpTurn = c.followUp
-		r.model.turns = [][]*genai.GenerateContentResponse{{chunk(text("PR 80 is in review."))}}
+		r.model.turns = [][]*genai.GenerateContentResponse{{chunk(text("ABC-12: PR 80 is in review."))}}
 		answerTurn(t, r, c.turn)
 		r.agents.mu.Lock()
 		asked := len(r.agents.sent) == 1

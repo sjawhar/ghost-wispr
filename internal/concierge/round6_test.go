@@ -100,8 +100,8 @@ func TestNoSearchResult(t *testing.T) {
 
 // TestFastAnswerFactsHaveSourcesAndAges (c-fast-answer, R6): read_issue
 // takes 10 events, each with its age, and a fact the record does not hold is
-// never spoken: the model writes once more, then the voice says it can only
-// say what the record holds.
+// never spoken: the model writes once more, then the voice says R8's fixed
+// sentence.
 func TestFastAnswerFactsHaveSourcesAndAges(t *testing.T) {
 	r := newRig(t)
 	heldIssue(r, "none", false)
@@ -115,8 +115,8 @@ func TestFastAnswerFactsHaveSourcesAndAges(t *testing.T) {
 			t.Fatalf("a pull request the record does not hold was spoken: %+v", spoken)
 		}
 	}
-	if spoken[0].text != notInRecord {
-		t.Fatalf("spoken = %+v, want the record-only sentence first", spoken)
+	if spoken[0].text != fixedSentence {
+		t.Fatalf("spoken = %+v, want the fixed sentence first", spoken)
 	}
 	if limits := r.records.eventLimits(); !slices.Contains(limits, recentEvents) || slices.ContainsFunc(limits, func(n int) bool { return n != recentEvents && n != holderEvents }) {
 		t.Errorf("event reads asked for %v, want read_issue's 10 (beside issue_holder's 50)", limits)
@@ -128,10 +128,10 @@ func TestFastAnswerFactsHaveSourcesAndAges(t *testing.T) {
 
 	r = newRig(t)
 	heldIssue(r, "none", false)
-	r.model.turns = [][]*genai.GenerateContentResponse{{chunk(text("PR 80 is in review, as of five minutes ago."))}}
+	r.model.turns = [][]*genai.GenerateContentResponse{{chunk(text("ABC-12: PR 80 is in review, as of five minutes ago."))}}
 	spoken = answerTurn(t, r, "what is happening with ABC-12")
-	if spoken[0].text != "PR 80 is in review, as of five minutes ago." {
-		t.Fatalf("a fact the record holds was not spoken first: %+v", spoken)
+	if spoken[0].text != "ABC-12: PR 80 is in review, as of five minutes ago." {
+		t.Fatalf("a fact that names the question's key was not spoken first: %+v", spoken)
 	}
 }
 
@@ -168,9 +168,13 @@ func TestHolderCaseOnlyWhenItChangesWhatHappensNext(t *testing.T) {
 		if holder == "unresponsive" {
 			r.agents.states["agent-7"] = envoy.SessionInfo{SessionID: "agent-7", State: envoy.StateUnresponsive}
 		}
-		r.model.turns = [][]*genai.GenerateContentResponse{{chunk(text("PR 80 is in review."))}}
+		fact := "PR 80 is in review."
+		if holder == "session" {
+			fact = "ABC-12: " + fact
+		}
+		r.model.turns = [][]*genai.GenerateContentResponse{{chunk(text(fact))}}
 		spoken := answerTurn(t, r, "what is happening with ABC-12")
-		if len(spoken) == 0 || spoken[0].text != "PR 80 is in review." {
+		if len(spoken) == 0 || spoken[0].text != fact {
 			t.Errorf("%s: spoken = %+v, want the fact first", holder, spoken)
 			continue
 		}
@@ -202,7 +206,7 @@ func TestTheRoutingLineSaysTheAsk(t *testing.T) {
 			time.Sleep(2200 * time.Millisecond)
 			close(r.model.block)
 		}()
-		r.model.turns = [][]*genai.GenerateContentResponse{{chunk(text("PR 80 is in review."))}}
+		r.model.turns = [][]*genai.GenerateContentResponse{{chunk(text("ABC-12: PR 80 is in review."))}}
 		spoken := answerTurn(t, r, c.turn)
 		if len(spoken) == 0 || spoken[0].text != c.want || spoken[0].mode != voice.Ack {
 			t.Errorf("%q: spoken = %+v, want the routing line %q first", c.turn, spoken, c.want)
@@ -319,7 +323,7 @@ func TestWhenToAskTheHolder(t *testing.T) {
 			r.records.hits = []dispatch.SearchHit{{Kind: "issue", IssueKey: "ABC-12", Title: "Realtime voice", Score: 0.007}, {Kind: "issue", IssueKey: "ABC-13", Score: 0.006}}
 			r.records.issues["ABC-13"] = &dispatch.Issue{Key: "ABC-13"}
 		}
-		r.model.turns = [][]*genai.GenerateContentResponse{{chunk(text("PR 80 is in review."))}}
+		r.model.turns = [][]*genai.GenerateContentResponse{{chunk(text("ABC-12: PR 80 is in review."))}}
 		spoken := answerTurn(t, r, c.turn)
 		if c.asked == "" {
 			if len(r.agents.sent) != 0 {

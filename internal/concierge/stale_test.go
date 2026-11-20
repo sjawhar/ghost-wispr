@@ -53,7 +53,7 @@ func TestAStaleRecordSpeaksItsAgeFirst(t *testing.T) {
 	// Control: a fresh record gets neither line, and no question.
 	r := newRig(t)
 	heldIssue(r, "session", false)
-	r.model.turns = [][]*genai.GenerateContentResponse{{chunk(text("PR 80 is in review."))}}
+	r.model.turns = [][]*genai.GenerateContentResponse{{chunk(text("ABC-12: PR 80 is in review."))}}
 	spoken := answerTurn(t, r, "what is happening with ABC-12")
 	if slices.ContainsFunc(spoken, func(s said) bool { return strings.Contains(s.text, " as of ") || strings.HasPrefix(s.text, "Asking ") }) {
 		t.Fatalf("a fresh record: spoken = %+v", spoken)

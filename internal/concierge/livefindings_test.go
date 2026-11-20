@@ -105,7 +105,7 @@ func TestNoWordsFromTheModelSaysWhatIsKnown(t *testing.T) {
 	var spoken []said
 	err := r.concierge.Answer(context.Background(), &r.exchange, "what is happening with ABC-12", recorder(&spoken))
 	if err != nil || len(spoken) == 0 || spoken[0] != (said{"ABC-12 is in progress, updated 5 minutes ago.", voice.Fact}) {
-		t.Fatalf("Answer = %v, spoken %+v; want the status, no error", err, spoken)
+		t.Fatalf("Answer = %v, spoken %+v; want the status and its age, no error", err, spoken)
 	}
 
 	r = newRig(t)
