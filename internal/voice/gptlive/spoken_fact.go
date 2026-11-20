@@ -24,9 +24,15 @@ func (s *session) beginFactAudit(source string) *factAudit {
 	if strings.TrimSpace(source) == "" {
 		return nil
 	}
+	s.mu.Lock()
+	question := s.currentQuestion
+	if question == "" {
+		question = s.x.AskerTurn
+	}
+	s.mu.Unlock()
 	a := &factAudit{
 		source:      source,
-		questionKey: earcheck.Key.FindString(s.x.AskerTurn),
+		questionKey: earcheck.QuestionKey(question),
 	}
 	s.factMu.Lock()
 	s.facts = append(s.facts, a)

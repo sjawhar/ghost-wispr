@@ -19,6 +19,7 @@ const (
 
 var (
 	earKey           = regexp.MustCompile(`\b[A-Z][A-Z0-9]*-[0-9]+\b`)
+	questionKey      = regexp.MustCompile(`(?i)\b[A-Z][A-Z0-9]*-[0-9]+\b`)
 	earPR            = regexp.MustCompile(`(?i)(?:\bPR\s*(?:number\s*)?#?|\bpull\s+request\s*(?:number\s*)?#?|#|/pull/)([0-9]+)\b`)
 	earSentenceEnd   = regexp.MustCompile(`[.!?]+(?:\s+|$)`)
 	earAbbreviations = set([]string{"e.g", "i.e", "vs", "cf", "dr", "mr", "mrs", "ms"})
@@ -42,6 +43,12 @@ var NumberUnits = numberUnits
 
 // FileName is the R8 matcher for a file name that is unsuitable to say.
 var FileName = earFileName
+
+// QuestionKey finds the key the asker named, case-insensitively, and returns
+// it as R8 writes it: `abc-123` becomes `ABC-123`.
+func QuestionKey(text string) string {
+	return strings.ToUpper(questionKey.FindString(text))
+}
 
 // Check reports why text fails the R8 ear contract against source, or "".
 func Check(text, source, questionKey string) string { return CheckAsked(text, source, "", questionKey) }
