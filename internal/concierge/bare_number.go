@@ -6,6 +6,7 @@ import (
 	"slices"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -13,14 +14,18 @@ import (
 // key, but carries no project name. Three digits avoid ordinary small counts.
 var bareIssueNumber = regexp.MustCompile(`\b\d{3,}\b`)
 
+// bareNumberLookupBound bounds the whole set of candidate-key reads.
+const bareNumberLookupBound = 2 * time.Second
+
 type numberedCandidate struct {
 	candidate
 	updated time.Time
 }
 
 // bareNumberCandidates reads the issues whose number is in turn, across the
-// known Dispatch projects. It returns the two most recently active, so the
-// person confirms a key rather than the Concierge guessing a project.
+// known Dispatch projects. It issues all reads in parallel under a shared
+// deadline and returns the two most recently active, so the person confirms
+// a key rather than the Concierge guessing a project.
 func (c *Concierge) bareNumberCandidates(ctx context.Context, turn string) []candidate {
 	if c.records == nil || strings.HasPrefix(c.readTarget(ctx, turn, true), "keys:") {
 		return nil
@@ -36,14 +41,34 @@ func (c *Concierge) bareNumberCandidates(ctx context.Context, turn string) []can
 	}
 	c.mu.Unlock()
 	sort.Strings(projects)
-	var found []numberedCandidate
+	lookupCtx, cancel := context.WithTimeout(ctx, bareNumberLookupBound)
+	defer cancel()
+	type result struct {
+		candidate numberedCandidate
+		ok        bool
+	}
+	results := make(chan result, len(projects)*len(numbers))
+	var wg sync.WaitGroup
 	for _, number := range numbers {
 		for _, project := range projects {
-			issue, err := c.records.Issue(ctx, project+"-"+number)
-			if err != nil || issue == nil {
-				continue
-			}
-			found = append(found, numberedCandidate{candidate: candidate{key: issue.Key, title: issue.Title}, updated: issue.UpdatedAt})
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				issue, err := c.records.Issue(lookupCtx, project+"-"+number)
+				if err != nil || issue == nil {
+					results <- result{}
+					return
+				}
+				results <- result{candidate: numberedCandidate{candidate: candidate{key: issue.Key, title: issue.Title}, updated: issue.UpdatedAt}, ok: true}
+			}()
+		}
+	}
+	wg.Wait()
+	close(results)
+	var found []numberedCandidate
+	for r := range results {
+		if r.ok {
+			found = append(found, r.candidate)
 		}
 	}
 	sort.Slice(found, func(i, j int) bool {

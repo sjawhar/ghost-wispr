@@ -317,13 +317,20 @@ func (r *read) heldBy(early *reading) {
 // search (searchBoth).
 func (c *Concierge) readFor(ctx context.Context, x *voice.Exchange, turn string, onHolder func(*reading), cut <-chan struct{}) *reading {
 	target := c.readTarget(ctx, turn, true)
+	hasBareNumber := len(bareIssueNumber.FindAllString(turn, -1)) > 0
 	if target == "" {
 		// A key-shaped word with no list of projects to tell it by: Dispatch
 		// did not answer (R10).
 		if len(issueKeysIn(turn)) > 0 && c.projectsDownNow() {
 			return &reading{unreachable: true}
 		}
-		return &reading{}
+		return &reading{noResult: hasBareNumber}
+	}
+	// A turn with a bare number and no described issue skips the description
+	// search, so other room words never reach Dispatch (finding #4). A
+	// described issue ("the issue about X") keeps its search (finding #3).
+	if hasBareNumber && !strings.HasPrefix(target, "keys:") && describedIssue.FindStringSubmatch(turn) == nil {
+		return &reading{noResult: true}
 	}
 	c.mu.Lock()
 	var pending *read

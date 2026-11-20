@@ -207,15 +207,16 @@ func (c *Concierge) answer(parent context.Context, x *voice.Exchange, turn strin
 	cutTimer := time.AfterFunc(c.fullWait-time.Since(start), func() { close(fullCut) })
 	defer cutTimer.Stop()
 	var found *reading
-	if target != "" {
+	switch {
+	case target != "":
 		found = c.readRecord(ctx, x, target, onHolder, fullCut)
-	} else {
+	default:
 		found = c.readFor(ctx, x, turn, onHolder, fullCut)
 	}
 	// R6: at most two searches an answer, the read-ahead's counted; the count
 	// is taken here, so an answer that ends early starts it over too.
 	aheadSearches := c.takeAheadSearches(x)
-	if found.key == "" && !found.unreachable {
+	if found.key == "" && !found.unreachable && len(found.candidates) == 0 {
 		if candidates := c.bareNumberCandidates(ctx, turn); len(candidates) > 0 {
 			c.offerPick(x, turn, candidates)
 			return sp.sayText(ctx, bareNumberConfirmation(candidates), voice.Ack)

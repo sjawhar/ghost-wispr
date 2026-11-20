@@ -148,13 +148,22 @@ func TestReview106SideTalkDoesNotAskTheHolder(t *testing.T) {
 	r := newR7Rig(t)
 	records := r.c.records.(*fakeRecords)
 	records.mu.Lock()
-	records.issues["ABC-4592"] = &dispatch.Issue{Key: "ABC-4592", Title: "Realtime voice", Status: "in_progress", UpdatedAt: time.Now(), Claim: &dispatch.Claim{Actor: actor("session", "agent-7", "Worker")}}
+	records.issues["ABC-4592"] = &dispatch.Issue{
+		Key: "ABC-4592", Title: "Realtime voice", Status: "in_progress",
+		UpdatedAt: time.Now(),
+		Claim:     &dispatch.Claim{Actor: actor("session", "agent-7", "Worker")},
+	}
 	records.mu.Unlock()
 	r.hear("Wispr, ask him for 4592")
-	r7Until(t, "confirmation spoken", func() bool { return slices.ContainsFunc(r.voice.said(), func(s r7Said) bool { return s.text == "Did you mean ABC-4592?" }) })
+	r7Until(t, "confirmation spoken", func() bool {
+		return slices.ContainsFunc(r.voice.said(), func(s r7Said) bool { return s.text == "Did you mean ABC-4592?" })
+	})
 	time.Sleep(20 * time.Millisecond)
 	r.hear("the first item in our budget is rent")
-	r7Until(t, "side-talk turn finished", func() bool { opened, closed := r.voice.counts(); return opened == 1 && closed == 1 })
+	r7Until(t, "side-talk turn finished", func() bool {
+		opened, closed := r.voice.counts()
+		return opened == 1 && closed == 1
+	})
 	r.agents.mu.Lock()
 	sent := slices.Clone(r.agents.sent)
 	r.agents.mu.Unlock()

@@ -57,14 +57,14 @@ func (c *Concierge) takePick(x *voice.Exchange, turn string) (asked, key string,
 		return "", "", false
 	}
 	if len(p.candidates) == 1 {
-		for _, word := range strings.FieldsFunc(strings.ToLower(turn), func(r rune) bool { return !strings.ContainsRune("abcdefghijklmnopqrstuvwxyz", r) }) {
-			switch word {
-			case "yes":
-				return p.turn, p.candidates[0].key, true
-			case "no":
-				return p.turn, "", true
-			}
+		words := strings.FieldsFunc(strings.ToLower(turn), func(r rune) bool { return !strings.ContainsRune("abcdefghijklmnopqrstuvwxyz", r) })
+		if len(words) == 1 && words[0] == "yes" {
+			return p.turn, p.candidates[0].key, true
 		}
+		if len(words) == 1 && words[0] == "no" {
+			return p.turn, "", true
+		}
+		return p.turn, "", false
 	}
 	for _, named := range issueKeysIn(turn) {
 		for _, candidate := range p.candidates {
