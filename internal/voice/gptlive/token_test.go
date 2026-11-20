@@ -254,13 +254,15 @@ func TestTokenSourceReportsAFailedExchangeWithoutEitherToken(t *testing.T) {
 		t.Fatal("Token with a refused exchange: nil error")
 	}
 	msg := err.Error()
-	for _, want := range []string{"401", "invalid_grant", "mapping does not match"} {
+	for _, want := range []string{"401", "invalid_grant"} {
 		if !strings.Contains(msg, want) {
 			t.Errorf("error %q does not name %q", msg, want)
 		}
 	}
-	if strings.Contains(msg, "secret-google-id-token") {
-		t.Errorf("error %q holds the Google ID token", msg)
+	for _, withheld := range []string{"mapping does not match", "secret-google-id-token"} {
+		if strings.Contains(msg, withheld) {
+			t.Errorf("error %q holds free-form server or token text %q", msg, withheld)
+		}
 	}
 }
 
@@ -396,8 +398,8 @@ func TestTokenSourceReadsAnOAuthErrorString(t *testing.T) {
 	e.status, e.body = http.StatusBadRequest, `{"error":"invalid_request","error_description":"subject_token is missing"}`
 	s := newTestTokenSource(t, e, clock, nil)
 	_, err := s.Token(context.Background())
-	if err == nil || !strings.Contains(err.Error(), "invalid_request") || !strings.Contains(err.Error(), "subject_token is missing") {
-		t.Fatalf("Token = %v, want the OAuth error and its description", err)
+	if err == nil || !strings.Contains(err.Error(), "invalid_request") || strings.Contains(err.Error(), "subject_token is missing") {
+		t.Fatalf("Token = %v, want the OAuth code without its description", err)
 	}
 }
 

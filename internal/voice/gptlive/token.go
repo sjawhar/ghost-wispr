@@ -11,6 +11,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/sjawhar/ghost-wispr/internal/spokentext"
 )
 
 // TokenEndpoint is OpenAI's token exchange for workload identity federation
@@ -173,7 +175,7 @@ func (s *TokenSource) exchange(ctx context.Context, now time.Time) (string, time
 		return "", time.Time{}, fmt.Errorf("openai token: read exchange answer: %w", err)
 	}
 	if resp.StatusCode != http.StatusOK {
-		return "", time.Time{}, fmt.Errorf("openai token: exchange refused: HTTP %d: %s", resp.StatusCode, exchangeErrorText(data))
+		return "", time.Time{}, fmt.Errorf("openai token: exchange refused: HTTP %d: %s", resp.StatusCode, exchangeErrorCode(data, subject))
 	}
 	var answer tokenExchangeResponse
 	if err := json.Unmarshal(data, &answer); err != nil {
@@ -202,12 +204,15 @@ func (s *TokenSource) exchange(ctx context.Context, now time.Time) (string, time
 	return answer.AccessToken, expireAt, nil
 }
 
-// exchangeErrorText names a refused exchange's error code and message, and
-// nothing else of the answer.
-func exchangeErrorText(data []byte) string {
+// exchangeErrorCode names a refused exchange's structured code only. A
+// provider's message can echo the Google ID token, the audio it received or
+// a room word; Open wraps this error and Supervisor logs it. It is therefore
+// never returned. spokentext.Withhold detects a direct echo of the subject
+// token before the stricter policy below withholds every free-form message.
+func exchangeErrorCode(data []byte, subject string) string {
 	var body tokenExchangeError
 	if json.Unmarshal(data, &body) != nil || len(body.Error) == 0 {
-		return "no error object"
+		return "server_refusal"
 	}
 	var apiErr struct {
 		Code    string `json:"code"`
@@ -215,19 +220,18 @@ func exchangeErrorText(data []byte) string {
 		Message string `json:"message"`
 	}
 	if json.Unmarshal(body.Error, &apiErr) == nil {
-		code := apiErr.Code
-		if code == "" {
-			code = apiErr.Type
+		_ = spokentext.Withhold(apiErr.Message, subject)
+		if apiErr.Code != "" {
+			return apiErr.Code
 		}
-		return fmt.Sprintf("%s: %s", code, apiErr.Message)
+		if apiErr.Type != "" {
+			return apiErr.Type
+		}
+		return "server_refusal"
 	}
 	var oauthCode string
-	if json.Unmarshal(body.Error, &oauthCode) == nil {
-		var oauth struct {
-			Description string `json:"error_description"`
-		}
-		_ = json.Unmarshal(data, &oauth)
-		return fmt.Sprintf("%s: %s", oauthCode, oauth.Description)
+	if json.Unmarshal(body.Error, &oauthCode) == nil && oauthCode != "" {
+		return oauthCode
 	}
-	return "unreadable error object"
+	return "server_refusal"
 }

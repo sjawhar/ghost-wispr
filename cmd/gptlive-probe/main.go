@@ -37,6 +37,7 @@ import (
 	"sync"
 	"syscall"
 	"time"
+	"unicode"
 
 	"github.com/sjawhar/ghost-wispr/internal/audio"
 	"github.com/sjawhar/ghost-wispr/internal/googleauth"
@@ -100,8 +101,14 @@ type probeConfig struct {
 // GPT-Live to delegate it and for the answer to start playing.
 const delegateWait = 20 * time.Second
 
+// delegationEvidence is the answer's code-like fact. GPT-Live's
+// instructions preserve keys and figures exactly, so the probe can require
+// evidence that it spoke the backend's answer rather than merely its own
+// acknowledgement.
+const delegationEvidence = "PROBE-42"
+
 // delegationAnswer is the probe's backend answer to a delegation.
-const delegationAnswer = "The probe's backend answered, so delegation works."
+const delegationAnswer = "The backend's verification key is PROBE-42."
 
 func main() { os.Exit(run()) }
 
@@ -241,7 +248,7 @@ func probe(ctx context.Context, cfg *probeConfig, out io.Writer) error {
 		}
 	}
 	if len(cfg.Ask) > 0 {
-		if err := delegation(ctx, cfg, in, tools, rec, out); err != nil {
+		if err := delegation(ctx, cfg, in, tools, rec, seen, out); err != nil {
 			return err
 		}
 	}
@@ -250,6 +257,7 @@ func probe(ctx context.Context, cfg *probeConfig, out io.Writer) error {
 	}
 	printf(out, "audio: %.2f s at %d Hz\n", rec.duration().Seconds(), gptlive.SampleRate)
 	printf(out, "words: %s\n", seen.words())
+	printf(out, "spoken fact errors: %d\n", seen.factErrors())
 	if rec.duration() < cfg.MinAudio {
 		return fmt.Errorf("GPT-Live spoke %v, want %v or more", rec.duration(), cfg.MinAudio)
 	}
@@ -347,12 +355,13 @@ func control(ctx context.Context, cfg *probeConfig) error {
 // that nothing waits on the probe: GPT-Live's words, its first error, and
 // each speech with when its first word reached the own-speech feed.
 type events struct {
-	mu      sync.Mutex
-	text    strings.Builder
-	first   error
-	spoken  []spoken
-	open    bool      // a speech is under way
-	pending time.Time // a word that came between speeches, for the next
+	mu       sync.Mutex
+	text     strings.Builder
+	first    error
+	spoken   []spoken
+	open     bool      // a speech is under way
+	pending  time.Time // a word that came between speeches, for the next
+	factErrs int
 }
 
 // spoken is one of GPT-Live's speeches as the probe saw it: when its audio
@@ -382,6 +391,8 @@ func watch(c <-chan voice.Event) *events {
 				e.open, e.pending = true, time.Time{}
 			case voice.EventSpeechEnded:
 				e.open = false
+			case voice.EventFactCheck:
+				e.factErrs += ev.Count
 			case voice.EventErr:
 				if e.first == nil {
 					e.first = ev.Err
@@ -409,6 +420,12 @@ func (e *events) speeches() []spoken {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	return append([]spoken(nil), e.spoken...)
+}
+
+func (e *events) factErrors() int {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.factErrs
 }
 
 // feeder feeds the session's tap 250 ms of audio every 250 ms, as the room's
@@ -455,8 +472,9 @@ func (f *feeder) run(ctx context.Context, tap chan<- audio.Frame) {
 }
 
 // delegation streams the question in and reports GPT-Live's delegation of
-// it: when it delegated, and when the backend's answer began to play.
-func delegation(ctx context.Context, cfg *probeConfig, in *feeder, tools *probeTools, rec *recording, out io.Writer) error {
+// it: when it delegated, when the backend's answer began to play, and proof
+// that GPT-Live actually spoke the backend's code-like fact.
+func delegation(ctx context.Context, cfg *probeConfig, in *feeder, tools *probeTools, rec *recording, seen *events, out io.Writer) error {
 	wait := cfg.DelegateWait
 	if wait <= 0 {
 		wait = delegateWait
@@ -492,19 +510,38 @@ func delegation(ctx context.Context, cfg *probeConfig, in *feeder, tools *probeT
 			return ctx.Err()
 		}
 	}
-	// Let the answer play to its end, for its words and lead.
+	// Let the answer play to its end, for its words and lead, and require the
+	// backend's code-like fact. An acknowledgement such as "One moment" is
+	// not a delegation round trip.
 	for last := rec.duration(); ; {
+		if evidence(seen.words(), delegationEvidence) {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("delegation: the backend answered, but GPT-Live did not speak its answer's %s", delegationEvidence)
+		}
 		select {
-		case <-time.After(2 * time.Second):
+		case <-time.After(50 * time.Millisecond):
 		case <-ctx.Done():
 			return ctx.Err()
 		}
-		if now := rec.duration(); now == last {
-			return nil
-		} else {
+		if now := rec.duration(); now != last {
 			last = now
 		}
 	}
+}
+
+// evidence reports whether text has all the code-like words in want, in
+// order, whatever case or punctuation GPT-Live used.
+func evidence(text, want string) bool {
+	text, want = strings.ToLower(text), strings.ToLower(want)
+	words := strings.FieldsFunc(want, func(r rune) bool { return !unicode.IsLetter(r) && !unicode.IsDigit(r) })
+	for _, word := range words {
+		if !strings.Contains(text, word) {
+			return false
+		}
+	}
+	return true
 }
 
 // readQuestion reads a spoken question from a WAV file: mono PCM16 at 16 kHz.

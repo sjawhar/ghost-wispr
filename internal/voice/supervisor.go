@@ -810,6 +810,8 @@ func (s *Supervisor) readEvents(ex *exchange, sess Session) {
 		switch e.Kind {
 		case EventAgentText:
 			s.addOwnLocked(e.Text, time.Now())
+		case EventFactCheck:
+			s.logf("voice: GPT-Live spoken fact errors %d", e.Count)
 		case EventSpeechStarted:
 			if ex.spokeAt.IsZero() {
 				ex.spokeAt = time.Now()

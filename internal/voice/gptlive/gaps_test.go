@@ -468,8 +468,8 @@ func TestOpenFailsAtOnceWhenTheSessionEndsBeforeTheStart(t *testing.T) {
 	c := srv.conn()
 	c.expect(evSessionStart)
 	c.send(map[string]any{"type": evSessionClosed, "event_id": "event_closed", "reason": "expired", "usage": map[string]any{"seconds": 0}})
-	if err := returns(t, done, time.Second, "Open"); err == nil || !strings.Contains(err.Error(), "expired") {
-		t.Fatalf("Open on a session that ended before the start = %v, want its reason", err)
+	if err := returns(t, done, time.Second, "Open"); !errors.Is(err, ErrDisconnected) {
+		t.Fatalf("Open on a session that ended before the start = %v, want ErrDisconnected without the server's reason", err)
 	}
 }
 

@@ -63,6 +63,16 @@ type standIns struct {
 	delegated bool
 	// answered gets the commentary returned on the delegation.
 	answered chan string
+	// delegationSpeak is the transcript GPT-Live sends after the probe's
+	// backend answers; empty means the backend answer's evidence.
+	delegationSpeak string
+}
+
+func (s *standIns) delegationText() string {
+	if s.delegationSpeak != "" {
+		return s.delegationSpeak
+	}
+	return delegationEvidence
 }
 
 // probeDelegation is the stand-in's delegation id.
@@ -160,7 +170,7 @@ func newStandIns(t *testing.T) *standIns {
 				send(map[string]any{"type": "session.commentary.appended", "event_id": "e2", "client_event_id": ev.EventID})
 				if ev.DelegationID != nil && *ev.DelegationID == probeDelegation {
 					s.answered <- ev.Content
-					send(transcript("The backend says delegation works.", s.inputMs()))
+					send(transcript(s.delegationText(), s.inputMs()))
 					send(speechDelta(time.Second))
 					continue
 				}
@@ -274,6 +284,7 @@ func TestTheProbeExchangesATokenAndHearsGPTLiveAnswerAText(t *testing.T) {
 		"control: a token for another audience was refused (invalid_subject_token)",
 		"token exchange: ok", "session: started", "audio: 3.60",
 		"words: Hello from the stand-in.",
+		"spoken fact errors: 0",
 		"speech lead: 3 speeches", "each within 300ms", "result: PASS",
 	} {
 		if !strings.Contains(report, want) {
@@ -553,5 +564,21 @@ func TestTheProbeReadsAQuestionWAV(t *testing.T) {
 	}
 	if _, err := readQuestion(bad); err == nil || !strings.Contains(err.Error(), "16000") {
 		t.Fatalf("readQuestion of a 24 kHz file = %v, want a refusal naming 16000 Hz", err)
+	}
+}
+
+// GPT-Live may acknowledge a delegation before it says the backend's
+// answer. That acknowledgement is not evidence that the backend answer was
+// spoken: the probe must fail it.
+func TestSolReviewProbeMustRejectUnspokenBackendAnswer(t *testing.T) {
+	s := newStandIns(t)
+	s.delegate = true
+	s.delegationSpeak = "Please wait while I check that."
+	cfg := s.config(t)
+	cfg.Settle, cfg.Turns = time.Second, 2
+	cfg.Ask = question(time.Second)
+	report, err := runProbe(t, s, &cfg)
+	if err == nil || !strings.Contains(err.Error(), "backend answer") {
+		t.Fatalf("probe returned PASS although backend answer was never spoken: %v\n%s", err, report)
 	}
 }

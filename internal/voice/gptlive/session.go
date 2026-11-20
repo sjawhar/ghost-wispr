@@ -110,9 +110,10 @@ var sayStartTimeout = 15 * time.Second
 // sentence. How long GPT-Live pauses between sentences is unmeasured.
 const sayQuiet = 1200 * time.Millisecond
 
-// APIError is an error event from the Live API. Its text is the code, type
-// and parameter only: the message can quote what the session sent, and the
-// error reaches the journal, which no delete path reaches.
+// APIError is an error event from the Live API. Its text is the structured
+// code or type only: message and param are free-form server text, and a
+// provider can echo what the session sent into either. Errors reach the
+// journal, which no delete path reaches.
 type APIError struct {
 	Type, Code, Message, Param string
 }
@@ -122,11 +123,10 @@ func (e *APIError) Error() string {
 	if code == "" {
 		code = e.Type
 	}
-	text := "gpt-live error " + code
-	if e.Param != "" {
-		text += " (" + e.Param + ")"
+	if code == "" {
+		code = "server_error"
 	}
-	return text
+	return "gpt-live error " + code
 }
 
 // Config configures voice B.
@@ -277,6 +277,10 @@ type session struct {
 
 	player *player
 
+	factMu     sync.Mutex
+	facts      []*factAudit
+	factErrors atomic.Int64
+
 	mu           sync.Mutex
 	closing      bool
 	release      func() bool // stops the close on the exchange's end
@@ -342,8 +346,15 @@ func (s *session) Say(ctx context.Context, text string, mode voice.SayMode) erro
 		items = append(items, appendItem{typ: evCommentaryAppend, content: c})
 	}
 	s.log.Debug("gptlive say", "mode", mode.String(), "appends", len(items))
+	var audit *factAudit
+	if mode == voice.Fact || mode == voice.Answer {
+		audit = s.beginFactAudit(text)
+	}
 	mark, _, _ := s.player.state()
 	if err := s.appendAll(ctx, nil, items); err != nil {
+		if audit != nil {
+			s.discardFactAudit(audit)
+		}
 		return err
 	}
 	return s.spoken(ctx, mark)
@@ -399,6 +410,10 @@ func (s *session) deliver(ctx context.Context, callID string, result json.RawMes
 	if err := json.Unmarshal(result, &r); err != nil {
 		return fmt.Errorf("gptlive: result for %q is not an answer result: %w", callID, err)
 	}
+	var audit *factAudit
+	if r.Say != "" {
+		audit = s.beginFactAudit(r.Say)
+	}
 	var items []appendItem
 	for _, c := range chunks(r.Context) {
 		items = append(items, appendItem{typ: evThinkingAppend, content: c})
@@ -411,7 +426,13 @@ func (s *session) deliver(ctx context.Context, callID string, result json.RawMes
 		// no result would leave it waiting.
 		items = append(items, appendItem{typ: evCommentaryAppend, content: nothingFound})
 	}
-	return s.appendAll(ctx, &callID, items)
+	if err := s.appendAll(ctx, &callID, items); err != nil {
+		if audit != nil {
+			s.discardFactAudit(audit)
+		}
+		return err
+	}
+	return nil
 }
 
 // Interrupt stops the model's speech now: nothing more of it plays, and
@@ -525,7 +546,8 @@ func (s *session) abort() {
 	}
 }
 
-// send writes one client event.
+// send writes one control event. Input audio uses sendAudio: it must stop
+// under the exchange's context before Close waits for finalization.
 func (s *session) send(event any) error {
 	data, err := json.Marshal(event)
 	if err != nil {
@@ -538,11 +560,11 @@ func (s *session) send(event any) error {
 	}
 	if err := s.conn.SetWriteDeadline(time.Now().Add(writeTimeout)); err != nil {
 		s.abort()
-		return fmt.Errorf("gptlive: write: %w", err)
+		return ErrDisconnected
 	}
 	if err := s.conn.WriteMessage(websocket.TextMessage, data); err != nil {
 		s.abort()
-		return fmt.Errorf("gptlive: write: %w", err)
+		return ErrDisconnected
 	}
 	return nil
 }
@@ -712,12 +734,14 @@ func (s *session) read() {
 	}
 }
 
-// lost handles the end of the connection.
-func (s *session) lost(err error, started bool) {
+// lost handles the end of the connection. A WebSocket close's text is
+// server-controlled and can quote room words, so it never reaches an error
+// or a log.
+func (s *session) lost(_ error, started bool) {
 	s.abort()
 	s.failPending(s.lostErr())
 	if !started {
-		s.startFailed(fmt.Errorf("%w before the session started: %v", ErrDisconnected, err))
+		s.startFailed(ErrDisconnected)
 		return
 	}
 	s.mu.Lock()
@@ -725,8 +749,8 @@ func (s *session) lost(err error, started bool) {
 	s.over = true
 	s.mu.Unlock()
 	if report {
-		s.log.Warn("gptlive: the Live connection ended", "error", err)
-		s.emit(&voice.Event{Kind: voice.EventErr, Err: fmt.Errorf("%w: %v", ErrDisconnected, err)})
+		s.log.Warn("gptlive: the Live connection ended")
+		s.emit(&voice.Event{Kind: voice.EventErr, Err: ErrDisconnected})
 	}
 }
 
@@ -750,11 +774,13 @@ func (s *session) onError(ev *serverEvent, started bool) {
 		s.startFailed(e)
 		return
 	}
-	s.log.Warn("gptlive: error event", "type", e.Type, "code", e.Code, "param", e.Param)
+	s.log.Warn("gptlive: error event", "type", e.Type, "code", e.Code)
 	s.emit(&voice.Event{Kind: voice.EventErr, Err: e})
 }
 
-func (s *session) onClosed(reason string, started bool) {
+// onClosed handles the server's final event. Its reason is free-form server
+// text, so it never reaches an error or a log.
+func (s *session) onClosed(_ string, started bool) {
 	select {
 	case <-s.serverClosed:
 		return
@@ -762,7 +788,7 @@ func (s *session) onClosed(reason string, started bool) {
 		close(s.serverClosed)
 	}
 	if !started {
-		s.startFailed(fmt.Errorf("the session closed before it started: %s", reason))
+		s.startFailed(ErrDisconnected)
 		return
 	}
 	s.mu.Lock()
@@ -770,8 +796,8 @@ func (s *session) onClosed(reason string, started bool) {
 	s.over = true
 	s.mu.Unlock()
 	if report {
-		s.log.Warn("gptlive: the server ended the session", "reason", reason)
-		s.emit(&voice.Event{Kind: voice.EventErr, Err: fmt.Errorf("gptlive: the server ended the session: %s", reason)})
+		s.log.Warn("gptlive: the server ended the session")
+		s.emit(&voice.Event{Kind: voice.EventErr, Err: ErrDisconnected})
 	}
 }
 
@@ -827,6 +853,7 @@ func (s *session) onSaid(delta string) {
 	s.mu.Lock()
 	s.noteLocked(true, delta)
 	s.mu.Unlock()
+	s.recordFactText(delta)
 	if strings.TrimSpace(delta) != "" {
 		s.emit(&voice.Event{Kind: voice.EventAgentText, Text: delta})
 	}
@@ -1054,8 +1081,35 @@ func (s *session) pumpTap() {
 	}
 }
 
+// sendAudio writes room audio only while the exchange remains open. It
+// rechecks closing and the exchange context after it owns the socket writer:
+// a frame waiting for writeMu cannot cross cancellation or session.close.
 func (s *session) sendAudio(pcm []int16) error {
-	return s.send(inputAudioAppend{Type: evInputAudioAppend, Audio: base64.StdEncoding.EncodeToString(pcm16Bytes(pcm))})
+	data := pcm16Bytes(pcm)
+	event, err := json.Marshal(inputAudioAppend{Type: evInputAudioAppend, Audio: base64.StdEncoding.EncodeToString(data)})
+	if err != nil {
+		return fmt.Errorf("gptlive: encode input audio: %w", err)
+	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	s.mu.Lock()
+	closing := s.closing
+	s.mu.Unlock()
+	if closing || s.ctx.Err() != nil {
+		return ErrClosed
+	}
+	if s.dead.Load() {
+		return s.lostErr()
+	}
+	if err := s.conn.SetWriteDeadline(time.Now().Add(writeTimeout)); err != nil {
+		s.abort()
+		return ErrDisconnected
+	}
+	if err := s.conn.WriteMessage(websocket.TextMessage, event); err != nil {
+		s.abort()
+		return ErrDisconnected
+	}
+	return nil
 }
 
 func pcm16Bytes(pcm []int16) []byte {
@@ -1202,6 +1256,7 @@ func (p *player) run() {
 	var speech voice.Playback
 	end := func() {
 		speech = nil
+		p.s.finishFactAudits()
 		p.count(false)
 		p.s.emit(&voice.Event{Kind: voice.EventSpeechEnded})
 	}
@@ -1268,20 +1323,16 @@ func (p *player) run() {
 	}
 }
 
-// refusal is the API's reason for a refused upgrade, read from the start of
-// its body: its error code and message, or nothing. The upgrade carries no
-// words of the room, so its message can be shown.
+// refusal is a structured code for a refused upgrade. The body can echo a
+// credential or room words and Open's caller logs its error, so it is never
+// returned.
 func refusal(resp *http.Response) string {
 	if resp.Body == nil {
 		return ""
 	}
 	data, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
 	_ = resp.Body.Close()
-	var body tokenExchangeError
-	if json.Unmarshal(data, &body) != nil || len(body.Error) == 0 {
-		return ""
-	}
-	return " (" + exchangeErrorText(data) + ")"
+	return " (" + exchangeErrorCode(data, "") + ")"
 }
 
 func signal(c chan struct{}) {

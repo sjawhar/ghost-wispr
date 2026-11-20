@@ -533,8 +533,8 @@ func TestASessionTheServerEndsReachesEvents(t *testing.T) {
 
 	c.send(map[string]any{"type": evSessionClosed, "event_id": "event_closed", "reason": "expired", "usage": map[string]any{"seconds": 1800}})
 	ev := waitEvent(t, s, voice.EventErr)
-	if ev.Err == nil || !strings.Contains(ev.Err.Error(), "expired") {
-		t.Fatalf("error event %v, want the session's end for expired", ev.Err)
+	if !errors.Is(ev.Err, ErrDisconnected) || strings.Contains(ev.Err.Error(), "expired") {
+		t.Fatalf("error event %v, want ErrDisconnected without the server's reason", ev.Err)
 	}
 }
 

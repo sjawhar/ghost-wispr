@@ -135,6 +135,10 @@ const (
 	EventToolCall  // Call holds the request
 	EventErr       // Err holds the failure
 	EventAgentText // Text holds words the voice speaks or is about to, for the own-speech filter
+	// EventFactCheck reports how many issue keys, pull request numbers and
+	// figures GPT-Live changed or dropped while speaking a written fact.
+	// Count holds no words, so the room test can record it safely.
+	EventFactCheck
 	// EventTextAudio: Text, one Say's text, begins to play (its first frame
 	// is queued to the Output). A voice that synthesises a Say while the one
 	// before plays (voice A) reports it, so the first fact's audio is timed
@@ -158,10 +162,11 @@ type SpeechWaiter interface {
 
 // Event is one thing a Session reports.
 type Event struct {
-	Kind EventKind
-	Text string
-	Call ToolCall
-	Err  error
+	Kind  EventKind
+	Text  string
+	Call  ToolCall
+	Err   error
+	Count int
 }
 
 // Output is the speaker output's "voice" input as a voice plays through it.
