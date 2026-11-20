@@ -628,7 +628,7 @@ route_row 'G22 Tailscale not running' 2 F-ip-pi F-status-needs-login 'cannot com
 
 # J0: provision.sh on a Pi already joined as tag:ghost-wispr at $PI_HOST. exits before the join, so
 # it installs no route check and leaves the accept-routes setting as it is.
-pi_host=$(sed -n 's/^PI_HOST=//p' "$repo_root/deploy/pi/test-pi.env")
+pi_host=$(source "$repo_root/deploy/pi/test-pi.env" && printf '%s' "$PI_HOST")
 : >"$TEST_LOG"
 joined_exit=0
 TEST_SELF_STATUS=$(jq -nc --arg name "$pi_host." '{Self: {Tags: ["tag:ghost-wispr"], DNSName: $name}}') \

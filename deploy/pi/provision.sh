@@ -125,22 +125,14 @@ route_overlap_check() {
   cannot='ghost-wispr routes: cannot compare the routes with the networks of the Pi'
   newline='
 '
-  networks=$(ip -4 -o addr) || {
-    printf '%s\n' "$cannot: ip -4 -o addr failed (exit $?)" "$not_accepting" >&2
-    exit 2
-  }
+  cannot_compare() { printf '%s\n' "$cannot: $1" "$not_accepting" >&2; exit 2; }
+  networks=$(ip -4 -o addr) || cannot_compare "ip -4 -o addr failed (exit $?)"
+  status=$(tailscale status --json) || cannot_compare "tailscale status --json failed (exit $?)"
+  [ -n "$status" ] || cannot_compare "tailscale status --json printed nothing"
   # The status of a large tailnet can pass the 128 KiB limit for one argument, so jq reads it on
   # stdin, from the printf builtin.
-  status=$(tailscale status --json) || {
-    printf '%s\n' "$cannot: tailscale status --json failed (exit $?)" "$not_accepting" >&2
-    exit 2
-  }
-  [ -n "$status" ] || {
-    printf '%s\n' "$cannot: tailscale status --json printed nothing" "$not_accepting" >&2
-    exit 2
-  }
   # jq prints the exit code on its first line, then the lines to print.
-  verdict=$(printf '%s\n' "$status" | jq -r -s --arg networks "$networks" --arg cannot "$cannot" '
+  verdict=$(printf '%s\n' "$status" | jq -r -s --arg ip_lines "$networks" --arg cannot "$cannot" '
     def prefix:
       if test("^[0-9]{1,3}([.][0-9]{1,3}){3}/[0-9]{1,2}$") then
         split("/") as [$address, $bits]
@@ -154,7 +146,7 @@ route_overlap_check() {
     def overlap($a; $b): size([$a.bits, $b.bits] | min) as $size
       | ($a.number / $size | floor) == ($b.number / $size | floor);
     def refuse($step): "2\n\($cannot): \($step)";
-    [$networks | split("\n")[] | select(test("[^ \t]"))
+    [$ip_lines | split("\n")[] | select(test("[^ \t]"))
       | {line: ., fields: [splits("[ \t]+") | select(. != "")]}
       | select(.fields[1] != "tailscale0")
       | . + {name: .fields[1], address: .fields[3], prefix: (.fields[3] // "" | prefix)}] as $networks
@@ -164,7 +156,7 @@ route_overlap_check() {
         refuse("ip -4 -o addr gives no network other than lo and tailscale0")
       elif length != 1 then refuse("tailscale status --json gave \(length) JSON values, not one")
       elif .[0].BackendState != "Running" then
-        refuse("BackendState is \(.[0].BackendState | if type == "string" then . else tojson end), not Running")
+        refuse("BackendState is \(.[0].BackendState), not Running")
       else
         [.[0].Peer // {} | .[] | (.HostName // "a peer with no HostName") as $host
           | .PrimaryRoutes // [] | .[] | select(contains(":") | not)
@@ -181,16 +173,10 @@ route_overlap_check() {
               end
           end
       end
-  ') || {
-    printf '%s\n' "$cannot: jq could not read tailscale status --json (exit $?)" "$not_accepting" >&2
-    exit 2
-  }
+  ') || cannot_compare "jq could not read tailscale status --json (exit $?)"
   case $verdict in
     [012]"$newline"?*) ;;
-    *)
-      printf '%s\n' "$cannot: jq gave no verdict" "$not_accepting" >&2
-      exit 2
-      ;;
+    *) cannot_compare "jq gave no verdict" ;;
   esac
   code=${verdict%%"$newline"*}
   lines=${verdict#*"$newline"}

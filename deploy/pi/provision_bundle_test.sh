@@ -291,7 +291,6 @@ case "$command" in
     [[ -z ${TEST_PI_SET_FAIL:-} ]] || exit 1
     "$TEST_PI_BIN/tailscale" set --accept-routes && "$TEST_PI_BIN/tailscale" debug prefs
     ;;
-  'tailscale debug prefs') "$TEST_PI_BIN/tailscale" debug prefs ;;
   *) printf 'fake ssh: unexpected command %s\n' "$command" >&2; exit 1 ;;
 esac
 EOF
