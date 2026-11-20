@@ -32,7 +32,7 @@ const moduleKey = "module"
 // a *slog.LevelVar whose level can change while the logger runs. An error
 // attribute that holds a provider's error (one with LogAttrs, as
 // providererr.Error has) is written as its text and those fields, and a line
-// a provider's SDK logs is withheld (sdkHandler).
+// a provider's SDK logs is withheld (appHandler).
 func New(output io.Writer, level slog.Leveler) *slog.Logger {
 	handlerOptions := &slog.HandlerOptions{
 		Level: level,
@@ -55,14 +55,14 @@ func New(output io.Writer, level slog.Leveler) *slog.Logger {
 		},
 	}
 
-	return slog.New(sdkHandler{slog.NewJSONHandler(output, handlerOptions)})
+	return slog.New(appHandler{slog.NewJSONHandler(output, handlerOptions)})
 }
 
 // SetDefault makes logger slog's default, and so the log package's. It first
 // sets the log package's flags to name each line's caller, so slog's bridge
 // records the function that wrote a line (it clears the flags itself), and a
 // line a provider's SDK writes with the log package is withheld too
-// (sdkHandler).
+// (appHandler).
 func SetDefault(logger *slog.Logger) {
 	log.SetFlags(log.Lshortfile)
 	slog.SetDefault(logger)
@@ -115,16 +115,20 @@ var providerSDKs = []string{
 // SDKLineWithheld is the message of a record a provider's SDK logged.
 const SDKLineWithheld = "a provider's SDK logged a line; its text is withheld: it can quote what the provider was sent or answered"
 
-// sdkHandler writes a record that a provider's SDK logged, found by the
-// function that logged it, as SDKLineWithheld and the SDK's path alone.
-type sdkHandler struct{ next slog.Handler }
+// appHandler is the handler New builds, and every handler derived from it.
+// It writes a record that a provider's SDK logged, found by the function
+// that logged it, as SDKLineWithheld and the SDK's path alone. And
+// moduleHandler knows by it that a value bound on it is written as slog's
+// JSON handler writes it, with no ReplaceAttr that reads a value's type
+// other than an error's.
+type appHandler struct{ next slog.Handler }
 
-func (h sdkHandler) Enabled(ctx context.Context, level slog.Level) bool {
+func (h appHandler) Enabled(ctx context.Context, level slog.Level) bool {
 	return h.next.Enabled(ctx, level)
 }
 
 //nolint:gocritic // slog.Handler's Handle takes the record by value.
-func (h sdkHandler) Handle(ctx context.Context, record slog.Record) error {
+func (h appHandler) Handle(ctx context.Context, record slog.Record) error {
 	if sdk := providerSDK(record.PC); sdk != "" {
 		withheld := slog.NewRecord(record.Time, record.Level, SDKLineWithheld, record.PC)
 		withheld.AddAttrs(slog.String("sdk", sdk))
@@ -133,12 +137,12 @@ func (h sdkHandler) Handle(ctx context.Context, record slog.Record) error {
 	return h.next.Handle(ctx, record)
 }
 
-func (h sdkHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
-	return sdkHandler{h.next.WithAttrs(attrs)}
+func (h appHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
+	return appHandler{h.next.WithAttrs(attrs)}
 }
 
-func (h sdkHandler) WithGroup(name string) slog.Handler {
-	return sdkHandler{h.next.WithGroup(name)}
+func (h appHandler) WithGroup(name string) slog.Handler {
+	return appHandler{h.next.WithGroup(name)}
 }
 
 // sdkOfPC caches providerSDK by program counter: a program logs from few
@@ -193,8 +197,10 @@ func WithModule(logger *slog.Logger, module string) *slog.Logger {
 // module binds that one on bare.
 //
 // Once a group opens, the module stays outside it: named then binds each
-// later attribute itself, as bare does. Such an attribute is rendered once
-// before either binds it (renderAttrs), so both hold the same text.
+// later attribute itself, as bare does. On New's handler, such an attribute
+// is rendered once before either binds it (renderAttrs), so both hold the
+// same text. Any other handler gets the value as it was bound, so its own
+// ReplaceAttr and format apply, and renders it on each.
 type moduleHandler struct {
 	bare    slog.Handler
 	module  string
@@ -222,7 +228,9 @@ func (h *moduleHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
 	if !h.grouped {
 		return newModuleHandler(h.bare.WithAttrs(attrs), h.module)
 	}
-	renderAttrs(attrs)
+	if _, own := h.bare.(appHandler); own {
+		renderAttrs(attrs)
+	}
 	return &moduleHandler{bare: h.bare.WithAttrs(slices.Clone(attrs)), module: h.module, named: h.named.WithAttrs(attrs), grouped: true}
 }
 
@@ -238,9 +246,10 @@ func (h *moduleHandler) WithGroup(name string) slog.Handler {
 // bind the result: a LogValuer is resolved, and a value of kind Any becomes
 // its JSON. A value whose JSON fails becomes slog's "!ERROR:" text, and one
 // that panics slog's "!PANIC:" text, or "<nil>" for a nil pointer. An error
-// that is no json.Marshaler stays an error, for each handler to write as its
-// text: Error has no effect a record can show, and a handler's ReplaceAttr
-// can still read the error.
+// that is no json.Marshaler stays an error, and a *slog.Source stays a
+// source, for each handler to write as it does: Error has no effect a record
+// can show, the handler writes a source's set fields only, and a handler's
+// ReplaceAttr can still read the error.
 func renderAttrs(attrs []slog.Attr) {
 	for i := range attrs {
 		value := attrs[i].Value.Resolve()
@@ -258,6 +267,9 @@ func renderAttrs(attrs []slog.Attr) {
 
 func renderAny(value slog.Value) (rendered slog.Value) {
 	v := value.Any()
+	if _, isSource := v.(*slog.Source); isSource {
+		return value
+	}
 	if _, isError := v.(error); isError {
 		if _, marshals := v.(json.Marshaler); !marshals {
 			return value

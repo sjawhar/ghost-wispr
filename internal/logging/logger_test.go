@@ -229,8 +229,9 @@ func TestWithModule_RenamingKeepsBoundValuesAsBound(t *testing.T) {
 
 // A value bound after a group opened is written as a plain JSON logger writes
 // it: HTML characters unescaped, an error as its text, a struct, a nil, a
-// value whose JSON fails, a MarshalJSON that panics and a nil error pointer
-// each as that logger writes them, and logging never panics.
+// value whose JSON fails, a MarshalJSON that panics, a nil error pointer and
+// a source (an empty or nil one left out) each as that logger writes them,
+// and logging never panics.
 func TestWithModule_GroupedValuesRenderAsAPlainLogger(t *testing.T) {
 	values := func() []any { // fresh for each logger: a failing marshaler counts its calls
 		return []any{
@@ -242,6 +243,9 @@ func TestWithModule_GroupedValuesRenderAsAPlainLogger(t *testing.T) {
 			"refused", failingMarshaler{new(int)},
 			"panicked", panickingMarshaler{},
 			"nil error", (*nilError)(nil),
+			"source", &slog.Source{File: "x.go"},
+			"empty source", &slog.Source{},
+			"nil source", (*slog.Source)(nil),
 		}
 	}
 	var plain, named bytes.Buffer
@@ -250,13 +254,37 @@ func TestWithModule_GroupedValuesRenderAsAPlainLogger(t *testing.T) {
 
 	want, _ := decodeJSONLine(t, plain.String())["request"].(map[string]any)
 	got, _ := decodeJSONLine(t, named.String())["request"].(map[string]any)
-	if len(want) != 8 || !reflect.DeepEqual(got, want) {
+	if len(want) != 9 || !reflect.DeepEqual(got, want) {
 		t.Fatalf("grouped values = %v, a plain logger writes %v\nplain: %snamed: %s", got, want, plain.String(), named.String())
 	}
 	if !strings.Contains(named.String(), `"html":"<b>&</b>"`) {
 		t.Fatalf("HTML characters were escaped: %s", named.String())
 	}
 }
+
+// A logger New did not build gets each grouped value as it was bound, for its
+// own handler to write: its ReplaceAttr sees the value's type, and a text
+// handler writes the value as text.
+func TestWithModule_AnotherHandlerGetsGroupedValuesAsBound(t *testing.T) {
+	var jsonOut, textOut bytes.Buffer
+	redact := &slog.HandlerOptions{ReplaceAttr: func(_ []string, attr slog.Attr) slog.Attr {
+		if _, ok := attr.Value.Any().(secretValue); ok {
+			attr.Value = slog.StringValue("REDACTED")
+		}
+		return attr
+	}}
+	WithModule(slog.New(slog.NewJSONHandler(&jsonOut, redact)), "server").WithGroup("request").With("v", secretValue{"private"}).Info("bound")
+	WithModule(slog.New(slog.NewTextHandler(&textOut, nil)), "server").WithGroup("g").With("v", map[string]int{"n": 1}).Info("bound")
+
+	if !strings.Contains(jsonOut.String(), `"v":"REDACTED"`) || strings.Contains(jsonOut.String(), "private") {
+		t.Errorf("the handler's ReplaceAttr did not see the bound value's type: %s", jsonOut.String())
+	}
+	if !strings.Contains(textOut.String(), "g.v=map[n:1]") {
+		t.Errorf("the text handler did not write the bound value as text: %s", textOut.String())
+	}
+}
+
+type secretValue struct{ Secret string }
 
 // A grouped value whose MarshalJSON fails is rendered once, so the logger and
 // the one that renames its module write the same failure.
