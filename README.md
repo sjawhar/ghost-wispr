@@ -195,11 +195,13 @@ time, lets the recorder's other commands in between, and runs before a resume or
 takes the pause switch, from the web page, the power button or the Jabra alike, so a pause during it
 is not held up and turns the light off at once; the resume, gate opening or microphone open it
 overtakes lights nothing and opens nothing. A press of the power button or the Jabra that resumes
-returns at once and checks the light in the background. Each press reads the pause switch, except
+returns at once and checks the light in the background. Each press reads the state, except
 while that button's own resume is still checking the light with no pause since: then the press
-counts the unit as resumed and pauses. The Jabra's mute light shows what its button counts: unmuted
-during that button's own resume, and the pause switch otherwise. A refused resume leaves the switch
-off and lights the Jabra's mute light again, so the next press resumes again. The check reads the
+counts the unit as resumed, and pauses (the power button) or closes the microphone (the Jabra).
+The Jabra's mute ring shows what its button counts: unmuted during that button's own resume, and
+otherwise Muted in the closed state only (see [The three states of the microphone](#the-three-states-of-the-microphone)).
+A refused resume returns the unit to the state it came from and lights the Jabra's ring again
+there, so the next press resumes again. The check reads the
 pattern the light plays, not the one it saves, so a unit is known black only once a save of the
 black pattern reached it: a check that finds the pattern black saves it once more first, and a save
 that does not reach the unit leaves it unknown, so it is checked again when it comes back, in this
@@ -231,6 +233,51 @@ closed, only after the resume or the end, as when it lags after an outage; the r
 word in the audio it captured, and drops every word from before the pause or the close, so none
 reaches a later session, and none reaches the page or the voice during a pause.
 
+## The three states of the microphone
+
+The microphone is in one of three states. The light shows red in recording only, and the Jabra's
+mute ring shows Muted in closed only.
+
+| State | Light | Jabra ring | Microphone | What the unit captures and sends |
+| --- | --- | --- | --- | --- |
+| recording | red | not muted | open | Audio passes the capture gate to the recording, Deepgram and, during an exchange, the voice |
+| listening | off | not muted | open, for the paused listener only | Only the paused listener hears the room, for "Wispr, start recording" or "Ghost Wispr, start recording". Its audio goes to a keyword spotter in Ghost Wispr's own process and a ring of at most 2 s, zeroed at every change of state. It stores, sends and logs nothing: no audio reaches the recording, Deepgram or a voice, and no event, message or row comes of it |
+| closed | off | muted | closed | Nothing |
+
+- The power button and the page's Pause move recording to listening while the paused listener can
+  run, and to closed otherwise; from listening or closed, they resume. A pause in listening or
+  closed changes nothing.
+- The Jabra's mute button closes the microphone from recording and from listening, and resumes from
+  closed: anyone at the table can close the microphone with one press. A report the Jabra sends by
+  itself as one of its streams closes is dropped only when it would move the unit to recording.
+- `POST /api/close` and the page's Close microphone close it from every state.
+- "Wispr, start recording" in listening resumes as `POST /api/resume` does: the light must read
+  back red before any audio passes the gate. In closed nothing hears it, and in recording it is not
+  a control.
+
+The paused listener can run only with `voice.paused_listener` on, in a build that has it (`go build
+-tags kws`, after `deploy/sherpa/fetch.sh`; the release binary has it), while the Jabra's mute button
+is attached, and once its spotter has loaded. Otherwise every pause closes the microphone, as
+before the listener. A pause saved before the listener comes back closed, so its first deploy
+opens no microphone. A saved listening comes back closed at start-up until the Jabra's button is
+attached and the listener has started, then listening. A listening unit goes to closed when the
+Jabra's button detaches, when `voice.paused_listener` turns off, and when the listener's capture
+fails, and stays closed until a person resumes. A resume the light refuses returns the unit to the
+state it came from.
+
+The listener is an ALSA capture in Ghost Wispr's own process, with no PortAudio and no other
+process, on the card `mic_device` names. It closes before the recording microphone opens, or
+waits to open, and before any PortAudio scan; it opens only once the recording microphone has
+closed, so the two are never open together. The service unit sets `LimitCORE=0` and
+`MemorySwapMax=0`, and the process turns its core dumps off as the listener starts, so the ring
+never reaches the disk. The spotter is sherpa-onnx's keyword spotter with its GigaSpeech model,
+linked into the binary: its weights are Apache-2.0, and GigaSpeech, the audio it was trained on, is
+licensed for research. When it hears the phrase, it decodes the ring once more as text and accepts
+only text that holds "STAR", so "Wispr, stop recording" does not resume. On the office Pi,
+`voice.paused_listener` stays off until a measurement on 10 h of speech counts fewer than 0.5
+false starts an hour (`go run -tags kws ./cmd/measure-wake -mode listener`). `ghost-wispr
+kws-selftest CLIP.wav...` checks a build's spotter on stored clips and times it.
+
 ## Meeting voice
 
 With `voice.enabled`, people in the room can ask Wispr about the work tracked in Dispatch. They
@@ -257,8 +304,9 @@ What the voice hears, and where the room's words go:
 
 - The voice hears the room only while the light reads red. Its wake phrase is read from the live
   transcript, and its room audio is one more writer behind the same gate as the recording and
-  Deepgram. While capture is paused, nothing hears the room: no wake phrase is heard, and nothing is
-  sent.
+  Deepgram. While capture is paused, nothing of the voice hears the room: no wake phrase is read,
+  and nothing is sent. In listening, only the paused listener hears it, on the unit, for the start
+  phrase alone.
 - Every pause, light hold, press of the Jabra's Mute button, "Wispr, stop" and shutdown stop the voice at once: its speech, its
   chimes and the Concierge's calls end within 100 ms, and a question not yet sent to an agent is not
   sent. Every gate closing, a pause or a light hold, ends the recording session, and an ended
@@ -333,7 +381,7 @@ What the voice hears, and where the room's words go:
 | `voice.tts_engine` | `gemini` | Voice A's text-to-speech provider: `gemini` (Vertex AI, `gcp_project`) or `aura` (the Deepgram key) |
 | `voice.tts_model`, `voice.tts_voice` | the provider's | Gemini: `gemini-3.8-flash-tts`, `Kore`; Aura: the voice `aura-2-harmonia-en` |
 | `voice.tts_location` | `us` | The Vertex AI location Gemini streams from; `us` is faster to first audio than `global` |
-| `voice.paused_listener` | `false` | The wake listener while paused; not built yet, so it is ignored |
+| `voice.paused_listener` | `false` | A pause from the power button or the page goes to listening, where the paused listener hears only "Wispr, start recording" ([The three states of the microphone](#the-three-states-of-the-microphone)); it needs a build with the listener and the Jabra's mute button. It does not need `voice.enabled`. Turned off, a listening unit closes its microphone at once |
 | `voice.gptlive.openai_identity_provider_id`, `voice.gptlive.openai_service_account_id` | — | Voice B's OpenAI workload identity, ids and not secrets: the unit exchanges its Google ID token (`google_credentials_file`) for an OpenAI access token of an hour at most. `gptlive-probe` (`cmd/gptlive-probe`) checks the route from the unit |
 | `concierge.model` | `gemini-3.5-flash-lite` | The Concierge's Gemini model, on the unit's genai settings |
 | `concierge.dispatch_url`, `GHOST_WISPR_DISPATCH_TOKEN` | — | Dispatch and the unit's own token; without both, the voice says it cannot reach Dispatch yet |
@@ -353,9 +401,10 @@ outputs, credential bundle, provisioning command, tailnet join, and acceptance c
 | `GET` | `/api/sessions?date=YYYY-MM-DD` | List sessions for a date (defaults to today) |
 | `GET` | `/api/sessions/{id}` | Get session details with transcript segments |
 | `GET` | `/api/sessions/{id}/audio` | Stream session audio (supports range requests) |
-| `POST` | `/api/pause` | Pause capture. The pause persists through restarts; the active session ends, the microphone closes at once, even while its read waits for a device that delivers nothing, and then the recording light goes off; nothing is recorded or sent to Deepgram until resume. If the microphone cannot be closed, the light stays red and `/api/status` warns until it closes. A unit that starts paused opens the microphone, and connects to Deepgram, only when it resumes. When enabled, the Pi power button and the Jabra's Mute button toggle the same control, and the Jabra's mute light is on while capture is paused. |
+| `POST` | `/api/pause` | Pause capture: to listening while the paused listener can run, else to closed (see [The three states of the microphone](#the-three-states-of-the-microphone)); a paused unit stays as it is. The state persists through restarts; the active session ends, the recording microphone closes at once, even while its read waits for a device that delivers nothing, and then the recording light goes off; nothing is recorded or sent to Deepgram until resume. If the microphone cannot be closed, the light stays red and `/api/status` warns until it closes. A unit that starts paused opens the recording microphone, and connects to Deepgram, only when it resumes. When enabled, the Pi power button toggles the same control; the Jabra's Mute button closes the microphone instead, and its ring shows Muted in the closed state only. |
+| `POST` | `/api/close` | Close the microphone from every state, as the Jabra's mute button does: the active session ends, the paused listener stops, the microphone closes and the Jabra's ring shows Muted. The state persists through restarts; only a resume opens the microphone again. It takes the caller rule of `POST /api/pause`. |
 | `POST` | `/api/resume` | Resume a persisted pause. With a configured light, it confirms red before returning, and a missing light refuses the resume; while no capture device is present, it is accepted without a light check, and the light stays off until a microphone can open. A `204` accepts the request, but a second gate-open check can still keep capture paused if the light fails while the session settles; the page receives `status_changed`. Returns `500` if red cannot be confirmed at request time or persistent state cannot be saved. Audio flows only after the paused session has ended and the microphone reopens; while the unit speaks through the Jabra, the microphone reopens once the speech ends, and a pause meanwhile cancels the resume. |
-| `GET` | `/api/status` | `paused` (the switch), `capturing` (audio is flowing), `capture_state` (`paused`, `light_unavailable` while the switch is on but the recording light is missing or does not read back red, `resuming` from a resume until the microphone has started, or the start failed, for at most 30 s, or for as long as the microphone waits for speech on the Jabra to end before it opens (Deepgram then connects in the background), `stalled`, `mic_unavailable`, `no_audio` once no audio has reached the recording for 2 s: the microphone is closed, and the light off, until it opens again, or `capturing`), `kept_raw_recordings` and `kept_raw_bytes` (every raw `.pcm` recording the app keeps: those of sessions that ended without a recording, which it tries again to save after every Drive sync sweep, those beside a saved recording, which it erases once Drive has it, and those it neither saves nor erases), `kept_raw_by_hand` (the sessions of those last ones, which wait for a person), `gc_hold` (null, or the last GC pass held back because Drive sync is off, has no folder, or cannot verify that Drive still has the session audio), `unverified_sessions` (sessions an earlier version synced that GC keeps until a sync re-checks their Drive documents), `unit_only_sessions` (sessions kept on this unit only, with their audio, because their Drive folder is gone or unreadable; with a warning while there are any), and the active session |
+| `GET` | `/api/status` | `paused` (the switch: on in listening and in closed), `capturing` (audio is flowing), `capture_state` (`paused` in closed, `listening` while only the paused listener holds the microphone, `light_unavailable` while the switch is on but the recording light is missing or does not read back red, `resuming` from a resume until the microphone has started, or the start failed, for at most 30 s, or for as long as the microphone waits for speech on the Jabra to end before it opens (Deepgram then connects in the background), `stalled`, `mic_unavailable`, `no_audio` once no audio has reached the recording for 2 s: the microphone is closed, and the light off, until it opens again, or `capturing`), `kept_raw_recordings` and `kept_raw_bytes` (every raw `.pcm` recording the app keeps: those of sessions that ended without a recording, which it tries again to save after every Drive sync sweep, those beside a saved recording, which it erases once Drive has it, and those it neither saves nor erases), `kept_raw_by_hand` (the sessions of those last ones, which wait for a person), `gc_hold` (null, or the last GC pass held back because Drive sync is off, has no folder, or cannot verify that Drive still has the session audio), `unverified_sessions` (sessions an earlier version synced that GC keeps until a sync re-checks their Drive documents), `unit_only_sessions` (sessions kept on this unit only, with their audio, because their Drive folder is gone or unreadable; with a warning while there are any), and the active session |
 | `WS` | `/ws` | Real-time events (transcripts, session state) |
 
 With no `GHOST_WISPR_AUTH_TOKEN`, as on the Pi, tailnet membership is the only access control. So that a page on another site,
@@ -392,6 +441,11 @@ gone, and a start that finds one, or a leftover `GHOST_WISPR_ENVOY_WEBHOOK_SECRE
 ```bash
 # Run backend tests (cmd/ghost-wispr embeds the web build, so run `make build` first)
 go test ./...
+
+# The build with the paused listener, as CI and the release build it: fetch sherpa-onnx's static
+# libraries and its model (checked against pinned sha256s), then build and test with -tags kws
+deploy/sherpa/fetch.sh
+go test -tags kws ./...
 
 # Run frontend tests
 cd web && npm test

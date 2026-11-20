@@ -7,8 +7,10 @@ function props(overrides: Record<string, unknown> = {}) {
     connected: true,
     paused: false,
     capturing: true,
+    captureState: 'capturing',
     activeSessionId: '',
     onToggle: vi.fn(),
+    onClose: vi.fn(),
     onEndSession: vi.fn(),
     onStartSession: vi.fn(),
     onStopSession: vi.fn(),
@@ -17,12 +19,37 @@ function props(overrides: Record<string, unknown> = {}) {
 }
 
 describe('Controls', () => {
-  it('renders connection and listening status', () => {
+  it('renders connection and recording status', () => {
     render(Controls, props())
 
     expect(screen.getByText('Connected')).toBeTruthy()
-    expect(screen.getByText('Listening')).toBeTruthy()
+    expect(screen.getByText('Recording')).toBeTruthy()
     expect(screen.getByRole('button', { name: 'Pause' })).toBeTruthy()
+  })
+
+  // The three states (INFRA-4592 R1): each shows what the microphone does, and
+  // Close microphone closes it from recording and from listening.
+  it('shows each of the three states, and closes the microphone from recording and listening', async () => {
+    for (const [state, label, closable] of [
+      [{ paused: false, capturing: true, captureState: 'capturing' }, 'Recording', true],
+      [
+        { paused: true, capturing: false, captureState: 'listening' },
+        'Paused: hears only “Wispr, start recording”',
+        true,
+      ],
+      [{ paused: true, capturing: false, captureState: 'paused' }, 'Microphone closed', false],
+    ] as const) {
+      const onClose = vi.fn().mockResolvedValue(undefined)
+      const { unmount } = render(Controls, props({ ...state, onClose }))
+      expect(screen.getByText(label)).toBeTruthy()
+      const close = screen.queryByRole('button', { name: 'Close microphone' })
+      expect(close !== null).toBe(closable)
+      if (close) {
+        await fireEvent.click(close)
+        expect(onClose).toHaveBeenCalledTimes(1)
+      }
+      unmount()
+    }
   })
 
   it('calls toggle callback on click', async () => {
@@ -47,9 +74,12 @@ describe('Controls', () => {
 
   it('disables Record while capture is paused', async () => {
     const onStartSession = vi.fn().mockResolvedValue(undefined)
-    render(Controls, props({ paused: true, capturing: false, onStartSession }))
+    render(
+      Controls,
+      props({ paused: true, capturing: false, captureState: 'paused', onStartSession }),
+    )
 
-    expect(screen.getByText('Paused')).toBeTruthy()
+    expect(screen.getByText('Microphone closed')).toBeTruthy()
     const record = screen.getByTestId('record-toggle') as HTMLButtonElement
     expect(record.disabled).toBe(true)
     expect(record.title).toMatch(/Resume/)
@@ -58,12 +88,12 @@ describe('Controls', () => {
   })
 
   // After a resume the switch is on before the microphone is back: the label
-  // must not claim it is listening, and Record must wait for capture.
+  // must not claim it records, and Record must wait for capture.
   it('shows Not capturing and disables Record until the microphone is capturing', async () => {
     const onStartSession = vi.fn().mockResolvedValue(undefined)
     render(Controls, props({ paused: false, capturing: false, onStartSession }))
 
-    expect(screen.queryByText('Listening')).toBeNull()
+    expect(screen.queryByText('Recording')).toBeNull()
     expect(screen.getByText('Not capturing')).toBeTruthy()
     const record = screen.getByTestId('record-toggle') as HTMLButtonElement
     expect(record.disabled).toBe(true)

@@ -36,6 +36,9 @@ type AppState = {
   // component_status events. After a resume it stays false until the
   // microphone is back.
   capturing: boolean
+  // GET /api/status's capture_state: "listening" while paused with only the
+  // paused listener holding the microphone, "paused" while it is closed.
+  captureState: string
   liveSegments: LiveTranscriptEvent[]
   liveSegmentsSessionId: string
   sessionsByDate: Map<string, SessionSummary[]>
@@ -57,6 +60,7 @@ export const appState = $state<AppState>({
   connected: false,
   paused: false,
   capturing: false,
+  captureState: '',
   liveSegments: [],
   liveSegmentsSessionId: '',
   sessionsByDate: new Map(),
@@ -104,6 +108,10 @@ export function setPaused(paused: boolean): void {
 
 export function setCapturing(capturing: boolean): void {
   appState.capturing = capturing
+}
+
+export function setCaptureState(captureState: string): void {
+  appState.captureState = captureState
 }
 
 export function setDates(dates: string[]): void {
@@ -403,6 +411,7 @@ export function resetState(): void {
   appState.connected = false
   appState.paused = false
   appState.capturing = false
+  appState.captureState = ''
   appState.liveSegments = []
   appState.liveSegmentsSessionId = ''
   detailRequestVersions.clear()

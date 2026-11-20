@@ -17,7 +17,18 @@ func TestReadmeStatesVoiceConsent(t *testing.T) {
 	readme := readmeText(t)
 	for _, words := range []string{
 		"The voice hears the room only while the light reads red",
-		"While capture is paused, nothing hears the room: no wake phrase is heard",
+		"While capture is paused, nothing of the voice hears the room: no wake phrase is read",
+		"In listening, only the paused listener hears it, on the unit, for the start",
+		// R1, R2 and R20: the three states, and what each captures and sends.
+		"| recording | red | not muted | open | Audio passes the capture gate to the recording, Deepgram and, during an exchange, the voice |",
+		"| listening | off | not muted | open, for the paused listener only | Only the paused listener hears the room",
+		"It stores, sends and logs nothing: no audio reaches the recording, Deepgram or a voice",
+		"| closed | off | muted | closed | Nothing |",
+		"The Jabra's mute button closes the microphone from recording and from listening",
+		"`POST /api/close` and the page's Close microphone close it from every state",
+		"A pause saved before the listener comes back closed",
+		"A saved listening comes back closed at start-up until the Jabra's button is",
+		"The service unit sets `LimitCORE=0` and\n`MemorySwapMax=0`",
 		"Voice A, text-to-speech (`voice.engine: tts`), sends no room audio anywhere",
 		"The asker's words after the wake phrase go to the Concierge's model",
 		"The text Wispr speaks goes to the text-to-speech provider",
