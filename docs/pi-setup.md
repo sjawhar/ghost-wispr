@@ -407,9 +407,9 @@ speech, as when someone talks over it, the speaker rewinds that buffer, so the s
 and writes the rest of the mix (a chime, say) again without the speech. Audio the Jabra has
 already taken still plays. If that is more than a period, or the device cannot rewind, the speaker
 drops the buffer instead. Each time the speaker opens, the log says
-`speaker stream` with the rate, period and buffer the Jabra granted, and `rewind=true` if it can
-rewind. Each cancel logs `speaker cancel` with `way=rewind` or `way=drop`, so the log shows what
-the Jabra did. Each underrun, when the speaker runs out of audio and clicks, is logged as
+`speaker stream` with the rate, period and buffer the Jabra granted, and `"rewind":true` if it
+can rewind. Each cancel logs `speaker cancel` with `"way":"rewind"` or `"way":"drop"`, so the log
+shows what the Jabra did. Each underrun, when the speaker runs out of audio and clicks, is logged as
 `speaker underrun` with the device, the count so far in that stream and the buffer the device
 granted, and the count again at the close as `speaker stream closed after underruns`. A check that
 counts underruns reads those lines: a reader of `/proc/asound` can miss a short one between its
@@ -739,8 +739,21 @@ identity. The fifth recording rule tells the room that a question sent to an age
    provisioning rewrites `.env`, so give it `dispatch-token` each time: mint a new token, and revoke
    the old one (`DELETE /api/v1/me/agent-tokens/{id}`). Without it the voice answers "I cannot reach
    Dispatch yet".
-3. After the deploy, `/api/status` must hold no `voice` warning, and the journal must say
-   `voice: on (voice A on gemini, ...)`.
+3. After the deploy, `/api/status` must hold no `voice` warning, and the running process must
+   have logged `voice: ready (wake phrases ["Wispr" "Ghost Wispr"]; ...)` and
+   `concierge: the Envoy session is open`. The service writes JSON records, so the journal holds
+   the first with its quotes escaped, `voice: ready (wake phrases [\"Wispr\" \"Ghost Wispr\"]; ...)`,
+   and it keeps the lines of the processes before the deploy. This prints the `message` of each
+   record the running process wrote, its quotes decoded:
+
+   ```bash
+   ssh ghost-wispr@ghost-wispr 'pid=$(XDG_RUNTIME_DIR=/run/user/$(id -u) systemctl --user show -p MainPID --value ghost-wispr.service) &&
+     sudo journalctl _SYSTEMD_USER_UNIT=ghost-wispr.service _PID="$pid" -o cat | jq -R -r "fromjson? | .message // empty"'
+   ```
+
+   The voice reads `voice.enabled` and `voice.engine` at each call, so the journal names no
+   engine: `/api/config` shows which voice speaks
+   (`"voice":{"enabled":true,"engine":"tts","tts_engine":"gemini"}` is voice A on Gemini).
 4. Time to first audio of the first sentence: the Gemini engine warms its connection when the voice
    opens, at the wake. Measure it once on the Pi, with and without the warm-up, using the voice
    package's live test (`GHOST_WISPR_LIVE_TTS=gemini ... TestLiveFirstSayTimeToFirstAudio`, built for
