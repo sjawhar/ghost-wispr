@@ -281,21 +281,22 @@ type session struct {
 	facts      []*factAudit
 	factErrors atomic.Int64
 
-	mu           sync.Mutex
-	closing      bool
-	release      func() bool // stops the close on the exchange's end
-	over         bool        // the session ended and said so on Events
-	nextID       int
-	pending      map[string]chan error // acknowledgements awaited, by client event id
-	pendingDone  bool
-	delegations  map[string]bool
-	asked        bool            // a delegation has taken the asker's words
-	lastQuestion string          // the last delegation's question
-	turn         strings.Builder // heard since the last EventUserTurn
-	sinceAsk     strings.Builder // heard since the last delegation
-	heardAt      time.Time       // when GPT-Live last heard the room say something
-	heardWake    chan struct{}   // signalled at each word GPT-Live hears
-	dialogue     []dialogueLine  // what was heard and said in this session
+	mu              sync.Mutex
+	closing         bool
+	release         func() bool // stops the close on the exchange's end
+	over            bool        // the session ended and said so on Events
+	nextID          int
+	pending         map[string]chan error // acknowledgements awaited, by client event id
+	pendingDone     bool
+	delegations     map[string]bool
+	asked           bool            // a delegation has taken the asker's words
+	lastQuestion    string          // the last delegation's question
+	currentQuestion string          // the question the current delegation resolves
+	turn            strings.Builder // heard since the last EventUserTurn
+	sinceAsk        strings.Builder // heard since the last delegation
+	heardAt         time.Time       // when GPT-Live last heard the room say something
+	heardWake       chan struct{}   // signalled at each word GPT-Live hears
+	dialogue        []dialogueLine  // what was heard and said in this session
 }
 
 type dialogueLine struct {
@@ -974,6 +975,7 @@ func (s *session) questionLocked() string {
 		question = strings.Join(strings.Fields(s.x.Recent[i].Text), " ")
 	}
 	s.lastQuestion = question
+	s.currentQuestion = question
 	return question
 }
 
