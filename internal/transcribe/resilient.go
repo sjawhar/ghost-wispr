@@ -115,9 +115,12 @@ func (rc *ResilientClient) write(p []byte, queued *atomic.Int64) (int, error) {
 // closes the underlying client. It closes the client without holding Mu: a
 // socket's close waits for its reader, which may be timing a result's words
 // (CapturedSince), and that takes Mu. It then waits for the state-change
-// goroutine to end, which takes at most stateCallbackStopWait: the callback
-// in progress gets the cancelled context, and one that ignores it is left
-// running, logged, rather than holding Close.
+// goroutine to end, which takes at most stateCallbackStopWait (1 s): the
+// callback in progress gets the cancelled context, and one that does not
+// return in time is left running, logged, rather than holding Close. The
+// Deepgram status callback stores its event in SQLite, and a store already
+// waiting on another connection's write lock does not heed the cancel; it
+// finishes or fails within SQLite's busy_timeout (5 s).
 func (rc *ResilientClient) Close() error {
 	rc.cancel()
 

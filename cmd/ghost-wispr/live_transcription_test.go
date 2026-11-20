@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
@@ -19,6 +20,7 @@ import (
 	"github.com/dvonthenen/websocket"
 
 	"github.com/sjawhar/ghost-wispr/internal/server"
+	"github.com/sjawhar/ghost-wispr/internal/storage"
 	"github.com/sjawhar/ghost-wispr/internal/transcribe"
 )
 
@@ -395,6 +397,86 @@ func TestCloseCancelsAStatusStoreItWaitsOn(t *testing.T) {
 	}
 	if took >= 500*time.Millisecond {
 		t.Fatalf("Close took %v: it waited on the store instead of cancelling it", took)
+	}
+}
+
+// firstStoreSignals is the real store, telling the test when its first store
+// starts and when it returns.
+type firstStoreSignals struct {
+	*storage.SQLiteStore
+	entered, returned chan struct{}
+	once              *sync.Once
+}
+
+func (s firstStoreSignals) StoreEvent(ctx context.Context, eventType, payload string) error {
+	first := false
+	s.once.Do(func() { first = true; close(s.entered) })
+	if first {
+		defer close(s.returned)
+	}
+	return s.SQLiteStore.StoreEvent(ctx, eventType, payload)
+}
+
+// TestCloseIsBoundedWhileAStoreWaitsOnAnotherConnectionsWriteLock fails if
+// Close, or the status store it leaves running, outlasts its bound while
+// another connection (the sqlite3 command, a backup) holds the real
+// database's write lock. SQLite's busy handler does not heed the driver's
+// interrupt, so the cancel does not end that store: Close returns within 1 s
+// (stateCallbackStopWait), and the store ends, stored or failed, within
+// busy_timeout (5 s) of its start, with the lock held throughout.
+func TestCloseIsBoundedWhileAStoreWaitsOnAnotherConnectionsWriteLock(t *testing.T) {
+	var storeStart time.Time
+	_, host := startSwitchableDeepgram(t)
+	path := filepath.Join(t.TempDir(), "busy.db")
+	locker, err := storage.NewSQLiteStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = locker.Close() }()
+	writer, err := storage.NewSQLiteStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = writer.Close() }()
+	tx, err := locker.DB().Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err := tx.Exec(`INSERT INTO mcp_events(event_type, payload) VALUES('lock', '{}')`); err != nil {
+		t.Fatal(err)
+	}
+	store := firstStoreSignals{SQLiteStore: writer, entered: make(chan struct{}), returned: make(chan struct{}), once: &sync.Once{}}
+	hub := server.NewHub()
+	hub.SetEventStore(store)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	rc := newLiveTranscription(ctx, "test-key",
+		&interfaces.ClientOptions{Host: host, EnableKeepAlive: true},
+		&interfaces.LiveTranscriptionOptions{Model: "nova-3", Language: "en-US", Encoding: "linear16", SampleRate: 16000, Channels: 1},
+		transcribe.ResilientConfig{BufferSize: 1 << 16, InitialReconnectDelay: time.Hour, MaxReconnectBackoff: time.Hour},
+		transcriptCallback{}, newWarningsRegistry(), hub)
+	select {
+	case <-store.entered:
+		storeStart = time.Now()
+	case <-time.After(3 * time.Second):
+		t.Fatal("the status callback never reached the store")
+	}
+	select {
+	case <-store.returned:
+		t.Fatal("the store did not wait for the other connection's write lock")
+	case <-time.After(100 * time.Millisecond):
+	}
+	start := time.Now()
+	_ = rc.Close()
+	if took := time.Since(start); took > 1500*time.Millisecond {
+		t.Fatalf("Close took %v while a store waited on the write lock; its bound is 1 s", took)
+	}
+	select {
+	case <-store.returned:
+		t.Logf("the store ended %v after it started", time.Since(storeStart))
+	case <-time.After(time.Until(storeStart.Add(5*time.Second + time.Second))):
+		t.Fatalf("the store still waited %v after it started, past busy_timeout (5 s)", time.Since(storeStart))
 	}
 }
 

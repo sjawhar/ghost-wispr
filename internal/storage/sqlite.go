@@ -205,7 +205,7 @@ func NewSQLiteStore(dbPath string) (*SQLiteStore, error) {
 	// the blocks it frees), foreign keys (the cascades that remove a session's
 	// rows) and the busy timeout. Set with PRAGMA once, they held for the first
 	// connection only.
-	db, err := sql.Open("sqlite", dbPath+"?_pragma=secure_delete(1)&_pragma=temp_store(2)&_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)")
+	db, err := sql.Open("sqlite", fmt.Sprintf("%s?_pragma=secure_delete(1)&_pragma=temp_store(2)&_pragma=foreign_keys(1)&_pragma=busy_timeout(%d)", dbPath, busyTimeoutMillis))
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite database: %w", err)
 	}
@@ -3103,13 +3103,21 @@ func (s *SQLiteStore) DeleteEmbeddings(sessionID string) error {
 	return nil
 }
 
+// busyTimeoutMillis is how long a write waits for another connection's write
+// lock (SQLite's busy_timeout), on every connection the store opens.
+const busyTimeoutMillis = 5000
+
 // StoreEvent inserts an event into the mcp_events table. An event that names
 // a session is stored only while that session exists, checked in the insert
 // itself: a summary is committed before the hub stores its event, and a
 // whole-conversation delete that commits between the two must not leave the
 // summary behind in an event (DeleteSession deletes the events it finds). An
-// event that names no session, or is not JSON, is stored. It gives up when
-// ctx ends.
+// event that names no session, or is not JSON, is stored.
+//
+// It gives up when ctx ends, except while another connection (the sqlite3
+// command, a backup) holds the write lock: SQLite's busy handler sleeps
+// without heeding the driver's interrupt, so such a wait ends, stored or
+// failed, within busy_timeout (busyTimeoutMillis).
 func (s *SQLiteStore) StoreEvent(ctx context.Context, eventType, payload string) error {
 	_, err := s.db.ExecContext(ctx,
 		`INSERT INTO mcp_events(event_type, payload) SELECT ?1, ?2
