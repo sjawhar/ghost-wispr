@@ -58,7 +58,9 @@ while :; do
         ((steps > 0)) || continue
         link="https://github.com/$PI_INFRA_REPO/actions/runs/$run/job/$job"
         [[ $status == completed ]] || fail "the root job $link is $status: run this again once it has finished"
-        log=$(gh api "$api/jobs/$job/logs") || fail "could not read the log of the root job $link"
+        # The runner colours a Pulumi log, and gh refuses to print a response with escape
+        # sequences unless it is told to; this log is read, never shown.
+        log=$(gh api "$api/jobs/$job/logs" --allow-escape-sequences) || fail "could not read the log of the root job $link"
         grep -Eq "FederatedIdentity $identity (created|replaced)" <<<"$log" || continue
         # A creation prints `+ OUTPUT : "ID"`, a replacement `~ OUTPUT : "OLD" => "ID"`.
         ids=$(sed -n "s/^.* [+~] $output *: \\(\".*\" => \\)\\{0,1\\}\"\\([A-Za-z0-9._:-]*\\)\"\$/\\2/p" <<<"$log" | LC_ALL=C sort -u)

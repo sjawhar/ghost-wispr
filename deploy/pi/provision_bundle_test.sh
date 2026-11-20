@@ -102,13 +102,23 @@ cat >"$work_dir/bin/gh" <<'EOF'
 set -euo pipefail
 printf 'gh %s\n' "$*" >>"$TEST_ARGV_LOG"
 jq_filter=
+escapes_allowed=false
 args=()
 while [[ $# -gt 0 ]]; do
   case $1 in
     --jq) jq_filter=$2; shift 2 ;;
+    --allow-escape-sequences) escapes_allowed=true; shift ;;
     *) args+=("$1"); shift ;;
   esac
 done
+# A job log carries the runner's colour codes, and gh refuses to print one without the flag.
+job_log() {
+  [[ $escapes_allowed == true ]] || {
+    printf 'fake gh: the response contains terminal escape sequences; pass --allow-escape-sequences to output it anyway\n' >&2
+    exit 1
+  }
+  printf '%s\n' "$@"
+}
 answer() {
   if [[ -n $jq_filter ]]; then jq -r "$jq_filter"; else cat; fi
 }
@@ -126,11 +136,11 @@ root_job() {
   printf '{"id":%s,"name":"root","status":"%s","conclusion":%s,"steps":[%s]}]}\n' "$1" "$2" "$3" "$4"
 }
 step=$(printf '{"started_at":"%s"}' "$recent")
-preview='2026-11-16T06:20:21.4658172Z   + exampleTailnetClientId                   : [unknown]'
-created='2026-11-16T06:25:09.3203883Z  +  tailscale:index:FederatedIdentity example-x509 created (1s) '
+preview=$'2026-11-16T06:20:21.4658172Z   + exampleTailnetClientId                   : [unknown]'
+created=$'2026-11-16T06:25:09.3203883Z \e[0;32m +  tailscale:index:FederatedIdentity example-x509 created (1s) \e[0m'
 created_id() { printf '2026-11-16T06:29:36.3829213Z   + exampleTailnetClientId                   : "%s"\n' "$1"; }
-preview_replace='2026-11-16T06:20:21.4658172Z   ~ exampleTailnetClientId                   : "k-stale-client-id" => [unknown]'
-replaced='2026-11-16T06:25:09.3203883Z  +-  tailscale:index:FederatedIdentity example-x509 replaced (1s) [diff: ~audience]'
+preview_replace=$'2026-11-16T06:20:21.4658172Z   ~ exampleTailnetClientId                   : "k-stale-client-id" => [unknown]'
+replaced=$'2026-11-16T06:25:09.3203883Z \e[0;33m +-  tailscale:index:FederatedIdentity example-x509 replaced (1s) [diff: ~audience]\e[0m'
 replaced_id='2026-11-16T06:29:36.3829213Z   ~ exampleTailnetClientId                   : "k-stale-client-id" => "'"$CLIENT_ID"'"'
 case "${args[*]}" in
   "api $api/workflows/seed.yaml/runs?per_page=100&page="*)
@@ -164,26 +174,26 @@ case "${args[*]}" in
       printf 'fake gh: HTTP 502: Server Error\n' >&2
       exit 1
     fi
-    printf '%s\n' "$preview"
+    job_log "$preview"
     ;;
-  "api $api/jobs/90331/logs") printf '%s\n' "$preview_replace" ;;
+  "api $api/jobs/90331/logs") job_log "$preview_replace" ;;
   "api $api/jobs/90321/logs")
     if [[ -n ${TEST_CREATION_EXPIRED:-} ]]; then
-      printf '%s\n' "$preview"
+      job_log "$preview"
     elif [[ ${TEST_CREATION_FORM:-} == create ]]; then
-      printf '%s\n' "$preview" "$created" "$(created_id "$CLIENT_ID")"
+      job_log "$preview" "$created" "$(created_id "$CLIENT_ID")"
     else
-      printf '%s\n' "$preview_replace" "$replaced" "$replaced_id"
+      job_log "$preview_replace" "$replaced" "$replaced_id"
     fi
     ;;
   "api $api/jobs/90311/logs" | "api $api/jobs/90211/logs")
     if [[ -n ${TEST_CREATION_EXPIRED:-} ]]; then
-      printf '%s\n' "$preview"
+      job_log "$preview"
     else
-      printf '%s\n' "$preview" "$created" "$(created_id k-stale-client-id)"
+      job_log "$preview" "$created" "$(created_id k-stale-client-id)"
     fi
     ;;
-  "api $api/jobs/90111/logs") printf '%s\n' "$preview" "$created" "$(created_id k-expired-client-id)" ;;
+  "api $api/jobs/90111/logs") job_log "$preview" "$created" "$(created_id k-expired-client-id)" ;;
   *) not_found ;;
 esac
 EOF
