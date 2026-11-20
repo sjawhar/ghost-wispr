@@ -515,12 +515,88 @@ func TestInterruptDoesNotWaitForTheEngine(t *testing.T) {
 	}
 }
 
-// TestInterruptCancelsQueuedSays fails if a Say queued behind the one
-// Interrupt stopped still speaks.
+// TestInterruptCancelsQueuedSays fails if the engine is asked to stream a Say
+// that was queued behind the one Interrupt stopped: no word of it may reach
+// the vendor once a person said "Wispr, stop".
+//
+// Interrupt ends the generation's context, and Go then cancels the contexts
+// derived from it one by one, so the Say in flight can end, and free the
+// synthesis stage, while the queued Say's own contexts are not cancelled yet.
+// The session's generation context here is one the test owns: Interrupt ends
+// it with only the in-flight Say's contexts cancelled, exactly that state.
 func TestInterruptCancelsQueuedSays(t *testing.T) {
 	var mu sync.Mutex
 	var streamed []string
-	out := newFakeOutput()
+	s := openSession(t, fakeEngine{stream: func(ctx context.Context, text string, emit func([]byte) error) error {
+		mu.Lock()
+		streamed = append(streamed, text)
+		mu.Unlock()
+		if err := emit(ramp(0, frame20ms)); err != nil {
+			return err
+		}
+		if text == "after" {
+			return nil
+		}
+		<-ctx.Done()
+		return ctx.Err()
+	}}, newFakeOutput())
+	streamedSoFar := func() []string {
+		mu.Lock()
+		defer mu.Unlock()
+		return slices.Clone(streamed)
+	}
+
+	// The generation the Says are called in. Interrupt calls the session's
+	// interrupt function under the session's lock, then moves the generation.
+	epoch := newSteppedContext()
+	t.Cleanup(func() { epoch.cancelDerived(0, epoch.derived()) })
+	inFlight := 0
+	ss := s.(*session)
+	ss.mu.Lock()
+	opened := ss.interrupt
+	ss.epoch, ss.interrupt = epoch, func(error) {
+		epoch.stop()
+		epoch.cancelDerived(0, inFlight)
+	}
+	ss.mu.Unlock()
+	opened(context.Canceled)
+
+	if err := s.Say(context.Background(), "first", voice.Fact); err != nil {
+		t.Fatalf("the Say in flight: %v", err)
+	}
+	inFlight = epoch.derived()
+	queued := make(chan error, 1)
+	go func() { queued <- s.Say(context.Background(), "queued", voice.Fact) }()
+	epoch.waitDerived(t, 2*inFlight)
+	s.Interrupt()
+	select {
+	case err := <-queued:
+		if !errors.Is(err, ErrInterrupted) {
+			t.Fatalf("queued Say = %v, want ErrInterrupted (streamed %q)", err, streamedSoFar())
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("queued Say still running 2 s after Interrupt (streamed %q)", streamedSoFar())
+	}
+	// The synthesis stage takes Says in order: once the next one has
+	// streamed, it is done with the queued one.
+	if err := s.Say(context.Background(), "after", voice.Fact); err != nil {
+		t.Fatalf("Say after Interrupt: %v", err)
+	}
+	if got := streamedSoFar(); !slices.Equal(got, []string{"first", "after"}) {
+		t.Fatalf("streamed %q, want the Say in flight and the Say after Interrupt", got)
+	}
+}
+
+// TestAStopCancelsQueuedSays fails if the engine is asked to stream, or the
+// Output given a frame of, a Say queued when the exchange's context ended.
+// The Supervisor's stop ends that context and calls Interrupt only later. Go
+// cancels a context's derived contexts one by one after its error is set, so
+// the Say in flight can end, and free the synthesis stage, while the queued
+// Say's own contexts are not cancelled yet. The exchange context here stops
+// in exactly that state.
+func TestAStopCancelsQueuedSays(t *testing.T) {
+	var mu sync.Mutex
+	var streamed []string
 	s := openSession(t, fakeEngine{stream: func(ctx context.Context, text string, emit func([]byte) error) error {
 		mu.Lock()
 		streamed = append(streamed, text)
@@ -530,32 +606,174 @@ func TestInterruptCancelsQueuedSays(t *testing.T) {
 		}
 		<-ctx.Done()
 		return ctx.Err()
-	}}, out)
+	}}, newFakeOutput())
 
-	// The Say in flight returned once its first frame was queued; the one
-	// queued behind it waits for the synthesis stage, and Interrupt ends it.
-	first, queued := make(chan error, 1), make(chan error, 1)
-	go func() { first <- s.Say(context.Background(), "first", voice.Fact) }()
-	out.waitFirstWrite(t)
-	if err := <-first; err != nil {
+	exchange := newSteppedContext()
+	if err := s.Say(exchange, "first", voice.Fact); err != nil {
 		t.Fatalf("the Say in flight: %v", err)
 	}
-	go func() { queued <- s.Say(context.Background(), "queued", voice.Fact) }()
-	time.Sleep(50 * time.Millisecond)
-	s.Interrupt()
+	inFlight := exchange.derived()
+	queued := make(chan error, 1)
+	go func() { queued <- s.Say(exchange, "queued", voice.Fact) }()
+	exchange.waitDerived(t, 2*inFlight)
+	// The stop: the exchange's error is set, and only the contexts of the
+	// Say in flight are cancelled yet.
+	exchange.stop()
+	exchange.cancelDerived(0, inFlight)
 	select {
 	case err := <-queued:
-		if !errors.Is(err, ErrInterrupted) {
-			t.Fatalf("queued Say = %v, want ErrInterrupted", err)
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("queued Say = %v, want the stop", err)
 		}
-	case <-time.After(time.Second):
-		t.Fatal("queued Say still running 1 s after Interrupt")
+	case <-time.After(2 * time.Second):
+		t.Fatal("queued Say still running 2 s after the stop")
 	}
-	time.Sleep(50 * time.Millisecond)
 	mu.Lock()
-	defer mu.Unlock()
-	if !slices.Equal(streamed, []string{"first"}) {
-		t.Fatalf("streamed %q, want only the Say in flight", streamed)
+	got := slices.Clone(streamed)
+	mu.Unlock()
+	if !slices.Equal(got, []string{"first"}) {
+		t.Fatalf("streamed %q, want only the Say in flight", got)
+	}
+}
+
+// TestAStoppedSayBeginsNoPlaybackBeforeItsContextsEnd exercises the write
+// gate independently of synthesis: a sentence synthesised ahead already has
+// audio when a stop comes. Its contexts stand for children the cancellation
+// has not reached yet. The queued-Say tests alone cannot catch a missing
+// write gate, because those texts never reach synthesis.
+func TestAStoppedSayBeginsNoPlaybackBeforeItsContextsEnd(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		stopCaller bool
+		interrupt  bool
+		want       error
+	}{
+		{name: "control: a live Say writes"},
+		{name: "stop before child cancellation", stopCaller: true, want: context.Canceled},
+		{name: "Interrupt before child cancellation", interrupt: true, want: ErrInterrupted},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			out := newFakeOutput()
+			s := openSession(t, speaks(nil), out).(*session)
+			caller, stop := context.WithCancel(context.Background())
+			t.Cleanup(stop)
+			r := &sayRequest{
+				ctx: context.Background(), wctx: context.Background(), caller: caller,
+				text: "already synthesised", gen: s.gen,
+				queued: make(chan struct{}),
+			}
+			if tc.stopCaller {
+				stop()
+			}
+			if tc.interrupt {
+				s.Interrupt()
+			}
+			first := true
+			frame := ramp(3, frame20ms)
+			err := s.writeFrame(r, frame, &first)
+			if !errors.Is(err, tc.want) {
+				t.Fatalf("writeFrame = %v, want %v", err, tc.want)
+			}
+			pbs := out.begun()
+			if tc.want == nil {
+				if len(pbs) != 1 || !bytes.Equal(pbs[0].audio(), frame) {
+					t.Fatal("the live Say did not write its frame")
+				}
+				return
+			}
+			if len(pbs) != 0 {
+				t.Fatalf("the stopped Say began %d playbacks, want none", len(pbs))
+			}
+			if !first {
+				t.Fatal("the stopped Say marked its first frame written")
+			}
+			select {
+			case e := <-s.Events():
+				t.Fatalf("the stopped Say emitted %+v, want no event", e)
+			default:
+			}
+		})
+	}
+}
+
+// steppedContext is an exchange or generation context whose stop cancels the
+// contexts derived from it one registration at a time, under the test's
+// control. Go's context package hands that cancellation to a parent with an
+// AfterFunc method.
+type steppedContext struct {
+	context.Context // Background: no deadline and no values
+	done            chan struct{}
+
+	mu      sync.Mutex
+	err     error
+	cancels []func() // the derived contexts' cancels, in registration order; nil once run or released
+}
+
+func newSteppedContext() *steppedContext {
+	return &steppedContext{Context: context.Background(), done: make(chan struct{})}
+}
+
+func (c *steppedContext) Done() <-chan struct{} { return c.done }
+
+func (c *steppedContext) Err() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.err
+}
+
+// AfterFunc keeps f, a derived context's cancel, for cancelDerived.
+func (c *steppedContext) AfterFunc(f func()) (stop func() bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	i := len(c.cancels)
+	c.cancels = append(c.cancels, f)
+	return func() bool {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		kept := c.cancels[i] != nil
+		c.cancels[i] = nil
+		return kept
+	}
+}
+
+// derived is how many derived contexts have registered.
+func (c *steppedContext) derived() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return len(c.cancels)
+}
+
+func (c *steppedContext) waitDerived(t *testing.T, n int) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for c.derived() < n {
+		if time.Now().After(deadline) {
+			t.Fatalf("%d contexts derived after 2 s, want %d", c.derived(), n)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// stop sets the error and closes Done; it cancels no derived context.
+func (c *steppedContext) stop() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.err = context.Canceled
+	close(c.done)
+}
+
+// cancelDerived cancels the derived contexts registered in [from, to).
+func (c *steppedContext) cancelDerived(from, to int) {
+	c.mu.Lock()
+	run := slices.Clone(c.cancels[from:to])
+	for i := from; i < to; i++ {
+		c.cancels[i] = nil
+	}
+	c.mu.Unlock()
+	for _, f := range run {
+		if f != nil {
+			f()
+		}
 	}
 }
 

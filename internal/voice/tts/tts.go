@@ -161,10 +161,15 @@ func (sp *speech) over() bool {
 type sayRequest struct {
 	ctx context.Context // synthesis: ends with the generation (an Interrupt) or the caller's ctx
 	// wctx is the context of the request's writes to the playback: a child
-	// of the caller's ctx, so a stop (the exchange's ctx ending) refuses the
-	// next write synchronously, with no frame of a sentence synthesised
-	// ahead reaching the Output; it also ends with the generation.
-	wctx   context.Context
+	// of the caller's ctx, so a stop (the exchange's ctx ending) ends a write
+	// that waits for the Output; it also ends with the generation.
+	wctx context.Context
+	// caller is the Say's own ctx, the exchange's. A stop sets its error
+	// before it cancels the contexts derived from it, one by one, so the
+	// stages read it, not ctx or wctx, to tell whether a stop came. That
+	// holds only when every Say of an exchange gets the exchange's ctx
+	// itself: a child per Say would be cancelled one by one again.
+	caller context.Context
 	cancel func(error) // ends ctx and wctx, and their ties, once play is done with the Say
 	text   string
 	gen    int
@@ -294,6 +299,22 @@ func (s *session) endSpeechLocked() {
 	}
 }
 
+// stoppedLocked is why r may no longer reach the engine or the Output, or
+// nil. It reads the sources of every stop: the generation, which Interrupt
+// moves under s.mu, and the caller's context, whose error is set before the
+// contexts derived from it are cancelled. r.ctx and r.wctx end only through
+// those two, or once play has released the Say, so neither is read here.
+// s.mu is held.
+func (s *session) stoppedLocked(r *sayRequest) error {
+	if r.gen != s.gen {
+		return ErrInterrupted
+	}
+	if r.caller.Err() != nil {
+		return context.Cause(r.caller)
+	}
+	return nil
+}
+
 // Say speaks text after every Say called before it, and returns once its
 // first frame is queued to the Output, or with the reason none will be. Its
 // text is synthesised while the Say before it plays, so the caller's next Say
@@ -336,7 +357,7 @@ func (s *session) Say(ctx context.Context, text string, _ voice.SayMode) error {
 		cancelW(err)
 	}
 
-	r := &sayRequest{ctx: rctx, wctx: wctx, cancel: release, text: text, gen: gen, done: make(chan error, 1), queued: make(chan struct{}), more: make(chan struct{}, 1)}
+	r := &sayRequest{ctx: rctx, wctx: wctx, caller: ctx, cancel: release, text: text, gen: gen, done: make(chan error, 1), queued: make(chan struct{}), more: make(chan struct{}, 1)}
 	select {
 	case s.says <- r:
 	case <-rctx.Done():
@@ -529,16 +550,19 @@ func (s *session) run() {
 // before it. A Say whose synthesis fails ends with that failure; one that
 // succeeds ends when its first frame is queued, or when play ends it.
 func (s *session) synthesise(r *sayRequest) {
-	if r.ctx.Err() != nil || r.wctx.Err() != nil {
-		err := context.Cause(r.ctx)
-		if err == nil {
-			err = context.Cause(r.wctx)
-		}
+	// The Say starts under s.mu, which Interrupt holds while it ends the
+	// generation: a Say that a stop or an Interrupt has ended never reaches
+	// the engine, though its own contexts are not cancelled yet. A Say that
+	// starts here is the one in flight.
+	s.mu.Lock()
+	if err := s.stoppedLocked(r); err != nil {
+		s.mu.Unlock()
 		r.end(err)
 		r.synthesised(err)
 		return
 	}
-	s.emit(&voice.Event{Kind: voice.EventAgentText, Text: r.text})
+	s.emitLocked(&voice.Event{Kind: voice.EventAgentText, Text: r.text})
+	s.mu.Unlock()
 	err := s.stream(r.ctx, r.text, func(pcm []byte) error {
 		return r.push(pcm)
 	})
@@ -589,7 +613,7 @@ func (s *session) speak(r *sayRequest) error {
 				}
 			}
 			s.carry = s.carry[:0]
-			if err != nil && !errors.Is(err, ErrInterrupted) && r.ctx.Err() == nil && r.wctx.Err() == nil && r.failWrite(err) {
+			if err != nil && !s.stopped(r) && r.failWrite(err) {
 				// The Output ended the playback: the next Say begins another.
 				s.mu.Lock()
 				s.pb = nil
@@ -600,7 +624,7 @@ func (s *session) speak(r *sayRequest) error {
 		}
 		if err := s.write(r, pcm, &first); err != nil {
 			s.carry = s.carry[:0]
-			if r.ctx.Err() == nil && r.wctx.Err() == nil && !errors.Is(err, ErrInterrupted) && r.failWrite(err) {
+			if !s.stopped(r) && r.failWrite(err) {
 				s.mu.Lock()
 				s.pb = nil
 				s.mu.Unlock()
@@ -609,6 +633,14 @@ func (s *session) speak(r *sayRequest) error {
 			return err
 		}
 	}
+}
+
+// stopped reports whether an Interrupt or a stop ended r: a write that failed
+// then failed because of the stop, not because the Output ended the playback.
+func (s *session) stopped(r *sayRequest) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.stoppedLocked(r) != nil
 }
 
 // finish ends a Say's playback stage and, when no Say follows it, drains its
@@ -678,14 +710,10 @@ func (s *session) write(r *sayRequest, pcm []byte, first *bool) error {
 // first frame; the first frame of a text reports EventTextAudio.
 func (s *session) writeFrame(r *sayRequest, frame []byte, first *bool) error {
 	s.mu.Lock()
-	if r.gen != s.gen {
+	if err := s.stoppedLocked(r); err != nil {
+		// An Interrupt or a stop ended the request: begin no playback for it.
 		s.mu.Unlock()
-		return ErrInterrupted
-	}
-	if err := r.wctx.Err(); err != nil {
-		// A stop ended the request: begin no playback for it.
-		s.mu.Unlock()
-		return context.Cause(r.wctx)
+		return err
 	}
 	if s.pb == nil {
 		s.pb, s.pbGen = s.out.Begin(), r.gen
