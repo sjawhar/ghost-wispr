@@ -10,9 +10,9 @@
   } = $props()
 
   const engines: { value: VoiceEngine; label: string }[] = [
-    { value: 'tts', label: 'Our own voice (tts)' },
-    { value: 'gptlive', label: 'GPT-Live (gptlive)' },
-    { value: 'dgagent', label: 'Deepgram voice agent (dgagent)' },
+    { value: 'tts', label: 'Text-to-speech (tts)' },
+    { value: 'gptlive', label: 'Speech-to-speech: OpenAI GPT-Live (gptlive)' },
+    { value: 'dgagent', label: 'Voice agent: Deepgram (dgagent)' },
   ]
   const ttsEngines: { value: TTSEngine; label: string }[] = [
     { value: 'gemini', label: 'Gemini' },
@@ -73,7 +73,7 @@
 
   {#if engine === 'tts'}
     <fieldset class="choices">
-      <legend>Our own voice's engine</legend>
+      <legend>Text-to-speech provider</legend>
       {#each ttsEngines as option (option.value)}
         <label class="choice">
           <input type="radio" name="voice-tts-engine" value={option.value} bind:group={ttsEngine} />
@@ -138,10 +138,16 @@
 
   .choice {
     display: flex;
-    align-items: center;
+    align-items: flex-start;
     gap: 0.5rem;
     font-size: 0.85rem;
     cursor: pointer;
+  }
+
+  /* Centres the radio, 13px tall, on the label's first line, so a label that
+     wraps keeps its radio beside its first words. */
+  .choice input {
+    margin-block: calc((1lh - 13px) / 2) 0;
   }
 
   .hint {

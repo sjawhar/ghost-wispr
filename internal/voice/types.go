@@ -3,8 +3,8 @@
 // it all on a pause, a light hold, the Jabra button, shutdown or barge-in.
 //
 // These types are the contract every voice engine builds on: voice A
-// (internal/voice/tts, our own streaming speech), voice B (internal/voice/gptlive)
-// and voice C (internal/voice/dgagent).
+// (internal/voice/tts, text-to-speech), voice B (internal/voice/gptlive,
+// speech-to-speech) and voice C (internal/voice/dgagent, a voice agent).
 package voice
 
 import (
