@@ -350,22 +350,38 @@ func (q *speechQueue) silenced() bool {
 	return q.current != nil && q.current.decision == dropped
 }
 
-// userSpoke ends the reply Deepgram stops for the room. What it held of an
-// injection plays, as no model text came; its late bytes and text cannot be
-// claimed later, and the next vendor event creates a new reply.
-func (q *speechQueue) userSpoke() {
+// userSpoke ends the reply Deepgram stops for the room: its late bytes and
+// text cannot be claimed later, and the next vendor event creates a new
+// reply. An injection's frames that still wait have not played, and may be
+// the model's words whose text has not come. Over the voice's speech, which
+// the Supervisor stops when someone talks over it, they are dropped, and the
+// Say they belong to is interrupted. With no speech to talk over, they keep
+// waiting for model text or the hold, as the end of a reply Deepgram stopped.
+func (q *speechQueue) userSpoke(overVoice bool) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
-	q.releaseHolderLocked()
+	if h := q.holder; h != nil && h.decision == allowed {
+		if overVoice {
+			q.holder = nil
+			if dropHeldLocked(h) && h.waiter != nil {
+				h.waiter.finish(ErrInterrupted)
+			}
+			h.holding = false
+		} else {
+			h.done = true
+			if q.current == h {
+				q.current = nil
+			}
+		}
+		q.endLocked(h)
+		q.signal()
+	}
 	q.rejectAllLocked()
 }
 
+// rejectAllLocked drops every reply that has not ended, other than an
+// injection whose frames wait. q.mu is held.
 func (q *speechQueue) rejectAllLocked() {
-	if h := q.holder; h != nil {
-		dropHeldLocked(h)
-		h.ended = true
-		q.holder = nil
-	}
 	if q.current != nil {
 		dropLocked(q.current)
 		q.current = nil
@@ -408,6 +424,10 @@ func (q *speechQueue) close(reason error) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	q.endWaitersLocked(reason)
+	if h := q.holder; h != nil {
+		dropLocked(h)
+		q.holder = nil
+	}
 	q.rejectAllLocked()
 	if q.stop != nil {
 		q.stop()

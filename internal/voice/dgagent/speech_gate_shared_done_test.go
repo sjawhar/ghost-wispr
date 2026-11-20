@@ -3,6 +3,7 @@ package dgagent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -93,6 +94,42 @@ func TestSpeechGateSharedDoneReplies(t *testing.T) {
 			name = "sol-round-7/user-start-between-model-audio-and-its-text-over-played-speech"
 		}
 		t.Run(name, func(t *testing.T) { testUserStartOverPlayedSpeech(t, userStart) })
+	}
+	t.Run("user-start-over-the-voice-drops-the-audio-that-waits", testUserStartOverTheVoiceDropsHeldAudio)
+}
+
+// testUserStartOverTheVoiceDropsHeldAudio fails if a UserStartedSpeaking
+// while the voice speaks plays the injection's frames that still wait, or
+// reports its Say spoken: someone talks over the voice, which the Supervisor
+// stops, and those frames have not played. No model text comes, so only
+// the hold could tell them from the model's own words.
+func testUserStartOverTheVoiceDropsHeldAudio(t *testing.T) {
+	stand := startStandIn(t)
+	out := newFakeOutput()
+	sess, c, _ := open(t, stand, Config{speechGap: time.Minute}, voice.Exchange{Out: out, Tools: silentConcierge()})
+	defer func() { _ = sess.Close() }()
+	first := tone(OutputRate, 20*time.Millisecond, 810)
+	done := sayAsync(sess, "Cut words.")
+	c.expect(t, "InjectAgentMessage")
+	c.send(map[string]any{"type": "ConversationText", "role": "assistant", "content": "Cut words."})
+	c.sendAudio(first)
+	out.nextPlayback(t).waitBytes(t, len(first)) // past the hold: the voice speaks
+	c.sendAudio(tone(OutputRate, 20*time.Millisecond, 811))
+	c.send(map[string]any{"type": "UserStartedSpeaking"})
+	c.send(map[string]any{"type": "AgentAudioDone"})
+	if err := returned(t, done); !errors.Is(err, ErrInterrupted) {
+		t.Fatalf("Say = %v, want ErrInterrupted: the room spoke over it before all of it played", err)
+	}
+	barrier := sayAsync(sess, "Ordering barrier.")
+	c.expect(t, "InjectAgentMessage")
+	c.send(map[string]any{"type": "ConversationText", "role": "assistant", "content": "Ordering barrier."})
+	c.sendAudio(tone(OutputRate, 20*time.Millisecond, 900))
+	c.send(map[string]any{"type": "AgentAudioDone"})
+	if err := returned(t, barrier); err != nil {
+		t.Fatalf("ordering barrier = %v", err)
+	}
+	if got := outputSamples(t, out); got[811] != 0 || got[810] != len(first) {
+		t.Fatalf("waiting/played bytes at Output = %d/%d, want 0/%d", got[811], got[810], len(first))
 	}
 }
 

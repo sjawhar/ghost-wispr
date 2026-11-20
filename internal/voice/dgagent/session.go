@@ -817,8 +817,11 @@ func (s *session) handle(m *serverMessage) {
 		s.speech.done()
 	case "UserStartedSpeaking":
 		// Deepgram stops its reply here: the reply ends before the turn
-		// gates the next one.
-		s.speech.userSpoke()
+		// gates the next one. Over the voice's speech it is a barge-in.
+		s.holdMu.Lock()
+		overVoice := s.speaking
+		s.holdMu.Unlock()
+		s.speech.userSpoke(overVoice)
 		s.roomTurn("", false)
 	case "InjectionRefused":
 		s.refused(m.Type)
