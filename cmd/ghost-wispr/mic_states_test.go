@@ -16,6 +16,7 @@ import (
 	"github.com/sjawhar/ghost-wispr/internal/indicator"
 	"github.com/sjawhar/ghost-wispr/internal/jabra"
 	"github.com/sjawhar/ghost-wispr/internal/server"
+	"github.com/sjawhar/ghost-wispr/internal/session"
 	"github.com/sjawhar/ghost-wispr/internal/storage"
 	"github.com/sjawhar/ghost-wispr/internal/wake/local"
 )
@@ -55,10 +56,13 @@ func (startVerifier) Close()                {}
 
 // statesLight is a blink(1) that records its operations, and that reads back
 // off while refuse is set, as a light whose LED failed: a red confirmation
-// then fails.
+// then fails. It also records LED 1's colour at each write of LED 2.
 type statesLight struct {
 	opsLight
 	refuse atomic.Bool
+	// led1AtLED2 is LED 1's colour at each SetLED2 write, in the order of
+	// led2Writes: a test sees whether LED 2 flashed while LED 1 was not red.
+	led1AtLED2 [][3]uint8
 }
 
 func (l *statesLight) ReadRGB() (uint8, uint8, uint8, error) {
@@ -67,6 +71,16 @@ func (l *statesLight) ReadRGB() (uint8, uint8, uint8, error) {
 		return 0, 0, 0, err
 	}
 	return r, g, b, err
+}
+
+// SetLED2 writes LED 2 alone, as opsLight does, and notes LED 1's colour then.
+func (l *statesLight) SetLED2(r, g, b uint8) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.led1AtLED2 = append(l.led1AtLED2, l.colour)
+	l.led2 = [3]uint8{r, g, b}
+	l.led2Writes = append(l.led2Writes, l.led2)
+	return nil
 }
 
 func (l *statesLight) red() bool {
@@ -230,6 +244,10 @@ type micStatesRig struct {
 	sent     *countingWriter
 	tapped   *countingWriter
 
+	// With the sessions option, the session manager whose recording session
+	// the capture gate ends at each pause, as newSessionCaptureGate does.
+	sessions *session.Manager
+
 	mu            sync.Mutex
 	events        []string
 	violations    []string
@@ -296,6 +314,7 @@ type statesOptions struct {
 	saved    string // the saved state at start, "" for none
 	noLight  bool   // no blink(1) is plugged in; give a saved pause
 	pipeline bool   // the mic loop writes to the gate's writers as main wires them
+	sessions bool   // the gate ends a recording session at each pause, as main wires it
 }
 
 // countingWriter counts the bytes written to it; with finalize, it is
@@ -327,12 +346,18 @@ func startMicStatesRig(t *testing.T, opts statesOptions) *micStatesRig {
 	}
 	lightCheckEvery = 20 * time.Millisecond
 	lightRetryEvery = 5 * time.Millisecond
-	r.capture = newCaptureGate(nil, nil, nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	if opts.sessions {
+		_, r.sessions = storeSessions(t)
+		r.capture = newSessionCaptureGate(ctx, r.sessions, fakePreroll{newCallLog()}, func() deepgramFinalizer { return nil }, time.Hour, testEndRetry, nopLogf)
+	} else {
+		r.capture = newCaptureGate(nil, nil, nil)
+	}
 	saved, err := restorePause(r.store, r.capture)
 	if err != nil {
+		cancel()
 		t.Fatal(err)
 	}
-	ctx, cancel := context.WithCancel(context.Background())
 	var loops sync.WaitGroup
 	t.Cleanup(func() {
 		cancel()

@@ -148,7 +148,9 @@ LEDs red while it records and both off when it stops. LED 2, the bottom one, fla
 second on and half a second off, while an agent's answer waits for "Wispr, go ahead" (see "Meeting
 voice"). It goes back to red once nothing waits: the answer is spoken, "Wispr, never mind" drops it,
 or its session ends. At a pause, a light hold or shutdown it goes off with LED 1, and it never
-flashes while the unit does not record. It flashes only while room audio reaches the recording:
+flashes while the unit does not record: in listening and in closed both LEDs are off, and a pause
+to either ends the session, which drops its waiting answers. "Wispr, start recording" in listening
+brings LED 1 to red before LED 2 flashes again. It flashes only while room audio reaches the recording:
 while LED 1 is red for another reason, as while the microphone closes after a pause or reopens,
 LED 2 shows red. A check that finds LED 1 not red writes both LEDs red, and LED 2 stays red until a
 check finds LED 1 red again. A flash writes LED 2 alone, holds the lock below as every command
