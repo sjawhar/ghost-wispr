@@ -714,6 +714,10 @@ func TestAGivenUpLineThatStartsTheNextIsNotTakenForIt(t *testing.T) {
 	c.send(map[string]any{"type": "ConversationText", "role": "assistant", "content": "Reading the record."})
 	c.sendAudio(tone(OutputRate, 20*time.Millisecond, 100))
 	c.send(map[string]any{"type": "AgentAudioDone"})
+	// The next injection's words come after the given-up line's audio has
+	// waited out the hold, as when Deepgram's next reply starts later: only
+	// the given-up check, not the next text, keeps that audio from playing.
+	time.Sleep(2 * holdTail)
 	answer := tone(OutputRate, 20*time.Millisecond, 200)
 	c.send(map[string]any{"type": "ConversationText", "role": "assistant", "content": "Reading the record."})
 	c.send(map[string]any{"type": "ConversationText", "role": "assistant", "content": "That issue is in progress."})
