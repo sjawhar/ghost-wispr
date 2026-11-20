@@ -59,12 +59,15 @@ func (a *watchedAgents) Send(ctx context.Context, m *envoy.SendRequest) (envoy.S
 
 // TestNoHookRunsUnderTheRosterLock fails if the roster calls any of its
 // hooks (the Supervisor's RaiseHand and LowerHands, Envoy's Lookup and Send,
-// the recording session, its start, Dispatch's title, the /ws notice, the
+// the recording session's start, Dispatch's title, the /ws notice, the
 // keyterms or the clock) while it holds its own lock, on any path: a join, a
 // repeated join, a floor request, a pointer and a queued one, a sweep, a
 // hand's outcome, a leave, a meeting's end and deletion, and the voice
 // stopping. A hook under the lock is a deadlock waiting for a hook that calls
-// back (HandDone, Segment).
+// back (HandDone, Segment). The one read the roster makes under its lock is
+// the recorder's current session (Config.Session), at each commit, which
+// returns at once and calls neither the roster nor the Supervisor; it must
+// still be read on these paths, and is reported.
 func TestNoHookRunsUnderTheRosterLock(t *testing.T) {
 	w := &lockWatch{calls: map[string]int{}, held: map[string]int{}}
 	r := newRig(t, func(cfg *Config) {
@@ -114,8 +117,10 @@ func TestNoHookRunsUnderTheRosterLock(t *testing.T) {
 		}
 	}
 	for hook, n := range w.held {
-		held = append(held, hook)
 		t.Logf("%s: %d of %d calls under the roster's lock", hook, n, w.calls[hook])
+		if hook != "Session" {
+			held = append(held, hook)
+		}
 	}
 	sort.Strings(held)
 	if len(missing) > 0 {
@@ -123,6 +128,9 @@ func TestNoHookRunsUnderTheRosterLock(t *testing.T) {
 	}
 	if len(held) > 0 {
 		t.Fatalf("hooks called with the roster's lock held: %s", strings.Join(held, ", "))
+	}
+	if w.held["Session"] == 0 {
+		t.Fatal("the roster never read the recorder's session under its lock: no commit is checked against the meeting held open at that moment")
 	}
 }
 

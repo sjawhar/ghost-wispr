@@ -114,7 +114,12 @@ func TestAStaleEndCannotOverwriteNewerKeyterms(t *testing.T) {
 			cur := session()
 			if hold.CompareAndSwap(true, false) {
 				close(entered)
-				<-release
+				// Bounded: the roster reads the session under its lock, so
+				// the next meeting's join waits on this hold.
+				select {
+				case <-release:
+				case <-time.After(200 * time.Millisecond):
+				}
 			}
 			return cur
 		}

@@ -75,7 +75,9 @@ type Floor interface {
 
 // Config configures a Roster.
 type Config struct {
-	// Session is the recording session now, "" while none records.
+	// Session is the recording session now, "" while none records. The
+	// roster reads it under its lock at each commit, so it must return at
+	// once and never call the roster or the Supervisor.
 	Session func() string
 	// Started is when recording session id started; zero when unknown.
 	Started func(id string) time.Time
@@ -199,18 +201,19 @@ type Roster struct {
 // a few meetings a day.
 const maxEnded = 64
 
-// meetingOpenLocked reports whether the meeting of recording session
-// sessionID has not ended, by the roster's own record, which every end
-// writes under r.mu as its first act.
+// meetingOpenLocked reports whether sessionID is the meeting the recorder
+// holds open now, read live, at the moment of the commit it guards. The
+// roster's record of ended meetings, which every end writes under r.mu as
+// its first act, only refuses sooner: it is bounded, so it is never the
+// authority.
 func (r *Roster) meetingOpenLocked(sessionID string) bool {
-	return sessionID != "" && !slices.Contains(r.ended, sessionID)
+	return sessionID != "" && !slices.Contains(r.ended, sessionID) && sessionID == r.cfg.Session()
 }
 
 // currentLocked reports whether m is still its agent's membership, its end
-// has not begun, and its meeting has not ended: the check, against the
-// roster's live state, that every step makes under r.mu at the moment it
-// acts for m. It reads no hook, so a snapshot a caller took earlier never
-// decides it.
+// has not begun, and its meeting is the one the recorder holds open now: the
+// check, against live state, that every step makes under r.mu at the moment
+// it acts for m.
 func (r *Roster) currentLocked(m *member) bool {
 	return m != nil && r.members[m.Agent] == m && m.ctx.Err() == nil && r.meetingOpenLocked(m.SessionID)
 }
@@ -485,10 +488,11 @@ func (r *Roster) join(ctx context.Context, m *envoy.Message, key string) {
 		r.notify("agent_joined", sessionID)
 	}
 	r.logf("joined: an agent joined meeting %s (issue %q)", sessionID, key)
-	// The welcome goes only to a membership that is still current as it goes:
-	// a leave that came meanwhile ended it.
+	// The welcome goes only to a membership that is still current as it goes,
+	// and under its context: an end that comes while it is on its way to the
+	// transport stops it there.
 	if r.isCurrent(joined) {
-		r.reply(ctx, m, "welcome", welcome(joined, r.apiURL(), started))
+		r.reply(joined.ctx, m, "welcome", welcome(joined, r.apiURL(), started))
 	}
 }
 
@@ -503,17 +507,19 @@ func (r *Roster) floor(ctx context.Context, m *envoy.Message, draft string) {
 		return
 	}
 	// The Supervisor asks Current at the moment it accepts an invitation for
-	// the hand and at the moment it says the words: a membership whose end
-	// began by then is withdrawn, never spoken.
+	// the hand and at the moment it says the words, and says them under the
+	// membership's context: a membership whose end began by then is
+	// withdrawn, never spoken, and an end while the words play stops them.
 	hand := &voice.Hand{
 		ID: m.EventID, SessionID: joined.SessionID, Agent: agent, Membership: joined.ID, IssueKey: joined.IssueKey, Name: joined.name,
 		Current: func() bool { return r.isCurrent(joined) },
+		Context: joined.ctx,
 	}
 	r.mu.Unlock()
 
 	draft = strings.Join(strings.Fields(draft), " ")
 	if draft == "" {
-		r.reply(ctx, m, "refused", "Your floor request holds no words, so it was not taken. Put what you would say on the lines after its first line.")
+		r.reply(joined.ctx, m, "refused", "Your floor request holds no words, so it was not taken. Put what you would say on the lines after its first line.")
 		return
 	}
 	// The room hears the attribution first, so the spoken-text check and its
@@ -525,7 +531,7 @@ func (r *Roster) floor(ctx context.Context, m *envoy.Message, draft string) {
 	hand.Text = attribution + " " + draft
 	if reason := earcheck.Form(hand.Text); reason != "" {
 		named := len(strings.Fields(attribution))
-		r.reply(ctx, m, "refused", fmt.Sprintf("Your words were not taken: the room hears %q first, and with it they have %s. Say it in at most %d words of your own, so 50 in all, in 3 sentences of 20 words at most (%d in your first), written for the ear, with no file paths, code, backticks or bars.", attribution, reason, 50-named, 20-named))
+		r.reply(joined.ctx, m, "refused", fmt.Sprintf("Your words were not taken: the room hears %q first, and with it they have %s. Say it in at most %d words of your own, so 50 in all, in 3 sentences of 20 words at most (%d in your first), written for the ear, with no file paths, code, backticks or bars.", attribution, reason, 50-named, 20-named))
 		return
 	}
 	raised := now
@@ -551,7 +557,7 @@ func (r *Roster) floor(ctx context.Context, m *envoy.Message, draft string) {
 	case !joined.lastFloor.IsZero() && now.Sub(joined.lastFloor) < r.cfg.FloorEvery:
 		next := joined.lastFloor.Add(r.cfg.FloorEvery)
 		r.mu.Unlock()
-		r.reply(ctx, m, "refused", fmt.Sprintf("You may ask for the floor at most once in %s, so this request was not taken. You may ask again from %s UTC.", every(r.cfg.FloorEvery), next.UTC().Format("15:04:05")))
+		r.reply(joined.ctx, m, "refused", fmt.Sprintf("You may ask for the floor at most once in %s, so this request was not taken. You may ask again from %s UTC.", every(r.cfg.FloorEvery), next.UTC().Format("15:04:05")))
 		return
 	}
 	priorFloor, priorEvent := joined.lastFloor, joined.floorEvent
@@ -571,7 +577,7 @@ func (r *Roster) floor(ctx context.Context, m *envoy.Message, draft string) {
 		if errors.Is(err, voice.ErrHandExpired) {
 			text = fmt.Sprintf("Your floor request reached the room more than %s after you sent it, so it was dropped. Ask again if the room still needs to hear it.", every(r.cfg.FloorExpiry))
 		}
-		r.reply(ctx, m, "refused", text)
+		r.reply(joined.ctx, m, "refused", text)
 		return
 	}
 	if !current {

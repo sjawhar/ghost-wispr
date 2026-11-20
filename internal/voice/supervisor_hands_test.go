@@ -1,6 +1,7 @@
 package voice
 
 import (
+	"context"
 	"slices"
 	"strings"
 	"sync"
@@ -144,6 +145,42 @@ func TestAGoAheadSkipsAWithdrawnHand(t *testing.T) {
 		t.Fatalf("said %q, want the next hand's words %q", got, second.Text)
 	}
 	eventually(t, "the first hand reported withdrawn", func() bool { return slices.Contains(outcomes.all(), "h1:withdrawn") })
+}
+
+// TestAHandsWordsStopWithItsMembership fails if a hand's words still reach
+// the speaker once its membership's context ended after the invitation was
+// accepted, or if that end plays the error sound or puts the hand back, as a
+// failed Say of a held answer would. The Supervisor says a hand's words under
+// a context derived from its membership's (Hand.Context).
+func TestAHandsWordsStopWithItsMembership(t *testing.T) {
+	r, outcomes := newHandsRig(t)
+	membership, end := context.WithCancel(context.Background())
+	defer end()
+	hand := testHand("h1", "ABC-12", time.Minute)
+	hand.Context = membership
+	if err := r.s.RaiseHand(hand); err != nil {
+		t.Fatalf("RaiseHand: %v", err)
+	}
+	eventually(t, "the hand sound", func() bool { return slices.Equal(r.speaker.soundsPlayed(), []string{"hand"}) })
+	r.voice.mu.Lock()
+	r.voice.onOpen = end // the membership ends as the voice opens to say the words
+	r.voice.mu.Unlock()
+	r.heard("Wispr, go ahead.", true, true)
+	eventually(t, "the hand reported withdrawn", func() bool { return slices.Equal(outcomes.all(), []string{"h1:withdrawn"}) })
+	never(t, "a voice frame of the ended membership's words", 300*time.Millisecond, func() bool {
+		r.speaker.mu.Lock()
+		defer r.speaker.mu.Unlock()
+		return r.speaker.writes["voice"] > 0
+	})
+	if got := r.speaker.soundsPlayed(); slices.Contains(got, "error") {
+		t.Fatalf("sounds %q: the membership's end played the error sound", got)
+	}
+	r.heard("Wispr, go ahead.", true, true)
+	never(t, "the withdrawn hand put back and spoken", 300*time.Millisecond, func() bool {
+		r.speaker.mu.Lock()
+		defer r.speaker.mu.Unlock()
+		return r.speaker.writes["voice"] > 0
+	})
 }
 
 // TestRaisedHandWaitsForAnInvitation fails if a raised hand plays no hand

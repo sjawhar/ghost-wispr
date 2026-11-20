@@ -7,6 +7,7 @@ package voice
 
 import (
 	"cmp"
+	"context"
 	"errors"
 	"slices"
 	"strings"
@@ -40,6 +41,11 @@ type Hand struct {
 	// A hand whose membership is not current is withdrawn, never spoken. It
 	// must return at once and never call the Supervisor.
 	Current func() bool
+	// Context is the membership's context; nil for none. The Supervisor says
+	// the hand's words under a context derived from it, so the membership's
+	// end stops them at once, before any frame reaches the speaker, and ends
+	// their exchange.
+	Context context.Context
 }
 
 // current reports whether h's membership is current (Current), asked now.

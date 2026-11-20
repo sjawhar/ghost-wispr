@@ -303,6 +303,10 @@ type exchange struct {
 	toolCalls     int  // answer tools still running: the exchange stays open
 	// dropsAtOpen is the tap's drop count when the exchange opened.
 	dropsAtOpen uint64
+	// sayCtx, when set, is the context of a hand's words, derived from its
+	// membership's: its end stops them, and exchangeOutput refuses any frame
+	// written once it ended.
+	sayCtx context.Context
 }
 
 // NewSupervisor starts a Supervisor; Close stops it.
@@ -1254,7 +1258,24 @@ func (s *Supervisor) speakLocked(p *pendingAnswer) {
 	ex.x = Exchange{SessionID: p.SessionID, WakeAt: time.Now(), IssueKey: p.IssueKey, Recent: s.recentLocked(), Tap: s.tapFor(voice, 0), Out: exchangeOutput{s: s, ex: ex}}
 	ex.x.Tools = exchangeTools{s: s, ex: ex}
 	x := ex.x
+	sayCtx, release := ex.ctx, func() {}
+	if p.hand != nil && p.hand.Context != nil {
+		// A hand's words run under its membership's context, so the
+		// membership's end cancels them at once, wherever they have got to,
+		// and ends their exchange; the exchange's own end ends them too.
+		var cancelSay context.CancelFunc
+		sayCtx, cancelSay = context.WithCancel(p.hand.Context)
+		stopEx := context.AfterFunc(ex.ctx, cancelSay)
+		stopHand := context.AfterFunc(p.hand.Context, func() {
+			s.mu.Lock()
+			defer s.mu.Unlock()
+			s.handEndedLocked(ex, p)
+		})
+		release = func() { stopEx(); stopHand(); cancelSay() }
+		ex.sayCtx = sayCtx
+	}
 	s.spawn(func() {
+		defer release()
 		s.open(ex, voice, &x, false)
 		select {
 		case <-ex.opened:
@@ -1263,11 +1284,9 @@ func (s *Supervisor) speakLocked(p *pendingAnswer) {
 		}
 		s.mu.Lock()
 		sess := ex.session
-		if p.hand != nil && !p.hand.current() {
+		if p.hand != nil && (!p.hand.current() || (p.hand.Context != nil && p.hand.Context.Err() != nil)) {
 			// Its membership ended after the invitation: withdrawn, not said.
-			s.handDoneLocked(p, HandWithdrawn)
-			ex.answer = nil
-			s.endLocked(ex, false, "a withdrawn hand")
+			s.handEndedLocked(ex, p)
 			s.mu.Unlock()
 			return
 		}
@@ -1276,9 +1295,15 @@ func (s *Supervisor) speakLocked(p *pendingAnswer) {
 		if sess == nil {
 			return
 		}
-		if err := sess.Say(ex.ctx, p.Text, Answer); err != nil {
+		if err := sess.Say(sayCtx, p.Text, Answer); err != nil {
 			s.logf("voice: speak a held answer: %v", err)
 			s.mu.Lock()
+			if p.hand != nil && p.hand.Context != nil && p.hand.Context.Err() != nil {
+				// Its membership ended while the words were on their way.
+				s.handEndedLocked(ex, p)
+				s.mu.Unlock()
+				return
+			}
 			if ex.ctx.Err() == nil {
 				s.errorLocked(p.SessionID)
 			}
@@ -1300,6 +1325,20 @@ func (s *Supervisor) speakLocked(p *pendingAnswer) {
 			s.heardOut(p)
 		}
 	})
+}
+
+// handEndedLocked ends ex, whose words are hand p's, as p's membership ended:
+// p is withdrawn, never spoken and never put back, and the words are cut.
+// It runs once for p, whichever of the membership's end and the failed Say
+// comes first.
+func (s *Supervisor) handEndedLocked(ex *exchange, p *pendingAnswer) {
+	if ex.answer != p {
+		return
+	}
+	ex.answer = nil
+	s.pending = slices.DeleteFunc(s.pending, func(q *pendingAnswer) bool { return q == p })
+	s.handDoneLocked(p, HandWithdrawn)
+	s.endLocked(ex, true, "its membership ended")
 }
 
 // tapFor opens the tap for voice when it drives its own turn and so hears the
@@ -1772,10 +1811,13 @@ type exchangeOutput struct {
 func (o exchangeOutput) Begin() Playback {
 	o.s.mu.Lock()
 	defer o.s.mu.Unlock()
-	if o.ex.ended {
+	if o.ex.ended || (o.ex.sayCtx != nil && o.ex.sayCtx.Err() != nil) {
 		return endedPlayback{}
 	}
-	pb := o.s.cfg.Speaker.Begin(audio.InputVoice)
+	var pb Playback = o.s.cfg.Speaker.Begin(audio.InputVoice)
+	if o.ex.sayCtx != nil {
+		pb = sayPlayback{Playback: pb, ctx: o.ex.sayCtx}
+	}
 	o.ex.last = pb
 	return pb
 }
@@ -1793,6 +1835,21 @@ func (endedPlayback) Write(context.Context, []byte, audio.AudioFormat) error {
 }
 
 func (endedPlayback) Drain(context.Context) error { return nil }
+
+// sayPlayback is a playback of a hand's words: it refuses every frame once
+// the words' context (exchange.sayCtx), derived from the membership's, ended,
+// whatever context the voice writes it with.
+type sayPlayback struct {
+	Playback
+	ctx context.Context
+}
+
+func (p sayPlayback) Write(ctx context.Context, frame []byte, format audio.AudioFormat) error {
+	if err := p.ctx.Err(); err != nil {
+		return err
+	}
+	return p.Playback.Write(ctx, frame, format)
+}
 
 // exchangeTools runs the Concierge's tools for ex, and the answer tool
 // through Concierge.Answer.
