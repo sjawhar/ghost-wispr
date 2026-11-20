@@ -276,7 +276,7 @@ func TestFailedMicStartClosesTheDevice(t *testing.T) {
 				mic.startErrs = []error{tc.startErr}
 			}
 			withdrawn := false
-			err := startOpenedMic(capture, mic, func() { withdrawn = true }, func(string, ...any) {})
+			err := startOpenedMic(capture, mic, func() { withdrawn = true })
 			if (err != nil) != tc.wantErr {
 				t.Fatalf("start = %v, want an error: %t", err, tc.wantErr)
 			}
@@ -317,7 +317,7 @@ func TestAPauseDuringAStartsOpenCancelsTheStart(t *testing.T) {
 	}
 	mic := newScriptedMic()
 	withdrawn := false
-	err := startOpenedMic(capture, mic, func() { withdrawn = true }, func(string, ...any) {})
+	err := startOpenedMic(capture, mic, func() { withdrawn = true })
 	if !errors.Is(err, errMicStartPaused) {
 		t.Fatalf("a start whose open a pause and a resume overlapped = %v, want errMicStartPaused", err)
 	}

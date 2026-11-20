@@ -1,15 +1,16 @@
 package main
 
 import (
-	"bytes"
 	"errors"
-	"log"
+	"log/slog"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/sjawhar/ghost-wispr/internal/erase"
+	"github.com/sjawhar/ghost-wispr/internal/logtest"
 	"github.com/sjawhar/ghost-wispr/internal/storage"
 )
 
@@ -71,10 +72,7 @@ func TestARawEraseLeftForADeletedSessionIsNotNamedByIt(t *testing.T) {
 func TestTheStartUpSpliceWarningsNameNoRecording(t *testing.T) {
 	const id = "20261116090000"
 	registry := newWarningsRegistry()
-	var output bytes.Buffer
-	previous := log.Writer()
-	log.SetOutput(&output)
-	t.Cleanup(func() { log.SetOutput(previous) })
+	logged := logtest.Capture(t)
 	recordPendingSpliceCleanupWarning(registry, errors.New("remove /audio/.splice-"+id+".mp3: permission denied"))
 	recordPendingSpliceRecoveryWarning(registry, errors.New("open /audio/"+id+".mp3: no such file or directory"))
 	warnings := statusWarnings(t, registry)
@@ -86,7 +84,17 @@ func TestTheStartUpSpliceWarningsNameNoRecording(t *testing.T) {
 			t.Errorf("a start-up splice warning names session %s: %q", id, warning)
 		}
 	}
-	if strings.Count(output.String(), id) != 2 {
-		t.Errorf("the log does not keep why each step failed: %q", output.String())
+	warned := logged.At(slog.LevelWarn)
+	var messages []string
+	for _, record := range warned {
+		messages = append(messages, record.Message)
+	}
+	if want := []string{"failed to clean leftover splice copies", "failed to recover pending segment splices"}; !slices.Equal(messages, want) {
+		t.Fatalf("the log's warnings are %q, want %q; all records: %+v", messages, want, logged.Records())
+	}
+	for _, record := range warned {
+		if cause, _ := record.Attrs["error"].(string); !strings.Contains(cause, id) {
+			t.Errorf("the warning %q does not keep why its step failed: %+v", record.Message, record.Attrs)
+		}
 	}
 }

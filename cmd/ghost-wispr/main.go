@@ -86,7 +86,7 @@ func newMergedRefinementFailureRecorder(store *storage.SQLiteStore) func(context
 			err = store.UpdateRefinementAtGeneration(sessionID, "", storage.RefinementFailed, "", generation)
 		}
 		if err != nil {
-			log.Printf("warning: record failed merged refinement %s after %v: %v", sessionID, cause, err)
+			slog.Warn("record failed merged refinement", "session_id", sessionID, "cause", cause, "error", err)
 		}
 	}
 }
@@ -763,14 +763,14 @@ type mergedSessionHookStore interface {
 func onSessionMerged(ctx context.Context, store mergedSessionHookStore, refine func(context.Context, string, string, time.Time) error, summarize func(context.Context, string, time.Time) error, retryRefinement func(context.Context, string) error, recordRefinementFailure func(context.Context, string, error), sessionID string) {
 	merged, err := store.GetSession(sessionID)
 	if err != nil {
-		log.Printf("warning: read merged session %s before refinement: %v", sessionID, err)
+		slog.Warn("read merged session before refinement", "session_id", sessionID, "error", err)
 		return
 	}
 	if merged.AudioRemovedAt != "" {
 		if err := retryRefinement(ctx, sessionID); err != nil {
 			recordRefinementFailure(ctx, sessionID, err)
 			if err := summarize(ctx, sessionID, merged.StartedAt); err != nil {
-				log.Printf("warning: summarize failed merged session %s: %v", sessionID, err)
+				slog.Warn("summarize failed merged session", "session_id", sessionID, "error", err)
 			}
 		}
 		return
@@ -779,11 +779,11 @@ func onSessionMerged(ctx context.Context, store mergedSessionHookStore, refine f
 		if err := refine(ctx, sessionID, merged.AudioPath, merged.StartedAt); err == nil {
 			return
 		} else {
-			log.Printf("warning: refine merged session %s: %v", sessionID, err)
+			slog.Warn("refine merged session", "session_id", sessionID, "error", err)
 		}
 	}
 	if err := summarize(ctx, sessionID, merged.StartedAt); err != nil {
-		log.Printf("warning: summarize merged session %s: %v", sessionID, err)
+		slog.Warn("summarize merged session", "session_id", sessionID, "error", err)
 	}
 }
 
@@ -878,7 +878,7 @@ func main() {
 	appLogger := logging.New(io.MultiWriter(os.Stdout, logSink), cfg.LogLevel)
 	slog.SetDefault(appLogger)
 	for _, w := range cfgWarnings {
-		log.Printf("config: %s", w)
+		slog.Warn("config", "warning", w)
 	}
 
 	// Startup validation: check component readiness from config.
@@ -902,18 +902,18 @@ func main() {
 	// each ends when its raw recording was last written.
 	recoveredIDs, err := store.RecoverStaleSessions(cfg.AudioDir)
 	if err != nil {
-		log.Printf("warning: failed to recover stale sessions: %v", err)
+		slog.Warn("failed to recover stale sessions", "error", err)
 	} else if len(recoveredIDs) > 0 {
 		log.Printf("recovered %d stale session(s): %v", len(recoveredIDs), recoveredIDs)
-		cancelRecoveredQuestions(store, recoveredIDs, log.Printf)
+		cancelRecoveredQuestions(store, recoveredIDs)
 	}
 	// A refinement left running by the previous run stopped with it.
 	if err := store.RecoverStaleRefinements(); err != nil {
-		log.Printf("warning: failed to recover stale refinements: %v", err)
+		slog.Warn("failed to recover stale refinements", "error", err)
 	}
 	// So did a Drive sync: retry it in the folder it had.
 	if ids, err := store.RecoverInterruptedSyncs(gdrive.MaxSyncRetries, time.Now().UTC()); err != nil {
-		log.Printf("warning: failed to recover interrupted Drive syncs: %v", err)
+		slog.Warn("failed to recover interrupted Drive syncs", "error", err)
 	} else if len(ids) > 0 {
 		log.Printf("recovered %d interrupted Drive sync(s): %v", len(ids), ids)
 	}
@@ -921,7 +921,7 @@ func main() {
 	// Backfill sessions with empty titles.
 	emptyTitleSessions, err := store.GetSessionsWithEmptyTitles()
 	if err != nil {
-		log.Printf("warning: failed to query sessions with empty titles: %v", err)
+		slog.Warn("failed to query sessions with empty titles", "error", err)
 	} else if len(emptyTitleSessions) > 0 {
 		for i := range emptyTitleSessions {
 			sess := &emptyTitleSessions[i]
@@ -934,7 +934,7 @@ func main() {
 			}
 			title := summary.GenerateTitle("", transcript, segments, sess.StartedAt)
 			if err := store.UpdateTitle(sess.ID, title); err != nil {
-				log.Printf("warning: failed to backfill title for session %s: %v", sess.ID, err)
+				slog.Warn("failed to backfill title", "session_id", sess.ID, "error", err)
 			}
 		}
 		log.Printf("backfilled %d session(s) with empty titles", len(emptyTitleSessions))
@@ -1024,14 +1024,14 @@ func main() {
 			embeddingOptions.Backend = os.Getenv("GHOST_WISPR_GENAI_BACKEND")
 		}
 		if err := addVertexCredentials(context.Background(), &cfg, embeddingOptions); err != nil {
-			log.Printf("warning: embedding indexer disabled: %v", err)
+			slog.Warn("embedding indexer disabled", "error", err)
 		} else if embeddingClient, err = embedding.NewClient(cfg.EmbeddingModel, embedding.WithGenAIConfig(embedding.GenAIConfig{
 			Backend:     embeddingOptions.Backend,
 			Project:     embeddingOptions.Project,
 			Location:    embeddingOptions.Location,
 			Credentials: embeddingOptions.Credentials,
 		})); err != nil {
-			log.Printf("warning: embedding indexer disabled: %v", err)
+			slog.Warn("embedding indexer disabled", "error", err)
 		} else {
 			indexer = embedding.NewIndexer(embeddingClient, store, 500)
 			indexer.SetModel(cfg.EmbeddingModel)
@@ -1104,7 +1104,7 @@ func main() {
 		// The recorder must not start capturing when it cannot establish the
 		// prior consent state.
 		restorePauseErr = err
-		log.Printf("warning: restore capture pause: %v; starting paused", err)
+		slog.Warn("restore capture pause failed; starting paused", "error", err)
 		capture.Pause()
 		restoredPause = true
 	}
@@ -1113,7 +1113,7 @@ func main() {
 		warningRegistry.Set(fmt.Sprintf("config-%03d", i), warning)
 	}
 	if err := refreshRawEraseReservationWarnings(store, warningRegistry); err != nil {
-		log.Printf("warning: raw erase reservations: %v", err)
+		slog.Warn("raw erase reservations", "error", err)
 	}
 	startCertificateExpiryChecks(ctx, cfgStore, warningRegistry, certificateExpiryCheckEvery, googleauth.CertExpiry)
 	// Dispatch's project keys: keyterms of the live transcript, and the
@@ -1121,16 +1121,16 @@ func main() {
 	var dispatchProjects projectKeys
 	if cfg.SpeakerEnabled && cfg.DispatchToken != "" && cfg.Concierge.DispatchURL != "" {
 		if client, err := dispatch.NewClient(cfg.Concierge.DispatchURL, cfg.DispatchToken, newDispatchHTTP(appLogger)); err != nil {
-			log.Printf("warning: Dispatch's project keys: %v", err)
+			slog.Warn("Dispatch's project keys", "error", err)
 		} else {
-			watchProjectKeys(ctx, client.Projects, projectKeysEvery, &dispatchProjects, log.Printf)
+			watchProjectKeys(ctx, client.Projects, projectKeysEvery, &dispatchProjects)
 		}
 	}
 	if restorePauseErr != nil {
 		warningRegistry.Set(captureStateWarningKey, "Capture pause state could not be restored; the recorder started paused")
 	}
 	if batchTranscriber, err := makeBatchTranscriber(&cfg); err != nil {
-		log.Printf("warning: batch transcription disabled: %v", err)
+		slog.Warn("batch transcription disabled", "error", err)
 		warningRegistry.Set("batch-transcription", "Batch transcription unavailable — using streaming transcript fallback")
 	} else {
 		manager.SetBatchTranscriber(batchTranscriber)
@@ -1234,7 +1234,7 @@ func main() {
 			}
 			batchResults := summarizer.ProcessBatchResults(job, sessions)
 			if len(batchResults) == 0 {
-				log.Printf("warning: summary batch %s completed without inline results; marking submitted sessions failed", batchName)
+				slog.Warn("summary batch completed without inline results; marking submitted sessions failed", "batch", batchName)
 			}
 			succeeded, failed, err := applySummaryBatchResults(store, hub, publishSummaryReady, batchName, batchResults)
 			if err != nil {
@@ -1286,7 +1286,7 @@ func main() {
 		IsCapturing: func() bool { return capture.capturing(micStatus) },
 		RefreshRawEraseWarnings: func() {
 			if err := refreshRawEraseReservationWarnings(store, warningRegistry); err != nil {
-				log.Printf("warning: raw erase reservations after delete failure: %v", err)
+				slog.Warn("raw erase reservations after delete failure", "error", err)
 			}
 		},
 		CaptureState:  func() string { return capture.captureState(micStatus) },
@@ -1584,7 +1584,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 	// at; the recorder and Deepgram take the rate it opened at. Set before any
 	// PortAudio initialization, all of which run in a microphone start, below.
 	if err := audio.UsePlugCapture(cfg.MicDevice); err != nil {
-		log.Printf("warning: open the microphone through ALSA's plug layer: %v", err)
+		slog.Warn("open the microphone through ALSA's plug layer", "error", err)
 	}
 	startPowerButton(ctx, &cfg, capture, controlHooks, warningRegistry)
 	startJabraMuteButton(ctx, &cfg, capture, micDevice, controlHooks, warningRegistry, func() { voiceHooks.Stop("Jabra button") })
@@ -1594,7 +1594,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 	if indexer != nil {
 		go func() {
 			if err := indexer.BackfillMissing(ctx); err != nil && ctx.Err() == nil {
-				log.Printf("warning: embedding backfill failed: %v", err)
+				slog.Warn("embedding backfill failed", "error", err)
 			}
 		}()
 	}
@@ -1622,7 +1622,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 
 		if batchTranscriber, err := makeBatchTranscriber(newCfg); err != nil {
 			manager.SetBatchTranscriber(nil)
-			log.Printf("config: batch transcriber disabled: %v", err)
+			slog.Warn("config: batch transcriber disabled", "error", err)
 		} else {
 			manager.SetBatchTranscriber(batchTranscriber)
 			log.Printf("config: batch transcriber updated for provider %s", newCfg.BatchTranscription.Provider)
@@ -1653,7 +1653,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 		go func() {
 			pendingIDs, err := store.GetSessionsForBackfill()
 			if err != nil {
-				log.Printf("warning: failed to query sessions needing summary: %v", err)
+				slog.Warn("failed to query sessions needing summary", "error", err)
 				return
 			}
 			if len(pendingIDs) == 0 {
@@ -1672,7 +1672,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 								if ctx.Err() != nil {
 									return
 								}
-								log.Printf("warning: startup batch job %s poll failed: %v", batchName, err)
+								slog.Warn("startup batch job poll failed", "batch", batchName, "error", err)
 							} else if state, _ := result["state"].(string); state != "" {
 								succeeded, _ := result["succeeded"].(int)
 								failed, _ := result["failed"].(int)
@@ -1698,7 +1698,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 					}(batchName)
 					return
 				}
-				log.Printf("warning: startup batch submission failed for %d sessions: %v; falling back to synchronous summarization", len(pendingIDs), err)
+				slog.Warn("startup batch submission failed; falling back to synchronous summarization", "sessions", len(pendingIDs), "error", err)
 			}
 			for _, id := range pendingIDs {
 				summarizeBackfillSession(ctx, store, startupSummarizer, publishSummaryReady, id)
@@ -1711,7 +1711,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 	if cfg.GDriveFolderID != "" && cfg.GDriveSyncEnabled {
 		syncer, syncErr := newDriveSyncer(ctx, &cfg, appLogger)
 		if syncErr != nil {
-			log.Printf("warning: gdrive sync disabled: %v", syncErr)
+			slog.Warn("gdrive sync disabled", "error", syncErr)
 			warningRegistry.Set("gdrive", "Google Drive sync failed to initialize — backups are disabled")
 		} else {
 			deletionDrive = syncer
@@ -1757,7 +1757,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 				return
 			}
 			if err := current.Close(); err != nil {
-				log.Printf("warning: close resilient deepgram client failed: %v", err)
+				slog.Warn("close resilient deepgram client failed", "error", err)
 			}
 		}
 	}
@@ -1780,7 +1780,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 		err := micDevice.probe(scan)
 		portAudioReady.Store(err == nil)
 		if err != nil {
-			log.Printf("warning: portaudio init failed: %v — microphone unavailable", err)
+			slog.Warn("portaudio init failed — microphone unavailable", "error", err)
 			warningRegistry.Set("microphone", "Microphone unavailable — recording and live transcription are disabled")
 			if updateStartupState {
 				startupStatus.Mic = config.ComponentState{Name: "mic", Status: "unavailable", Message: "Microphone unavailable"}
@@ -1810,7 +1810,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 				return err == nil, err
 			})
 			if openErr != nil {
-				log.Printf("warning: microphone open failed at %d Hz: %v", rate, openErr)
+				slog.Warn("microphone open failed", "rate", rate, "error", openErr)
 				continue
 			}
 			mic = candidate
@@ -1830,7 +1830,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 		if err := audioRecorder.SetSampleRate(sampleRate); err != nil {
 			// The session's recording still saves at this rate when it ends;
 			// only a raw kept after a stop would be saved at the old one.
-			log.Printf("warning: the session under way keeps its old sample rate in the database: %v", err)
+			slog.Warn("the session under way keeps its old sample rate in the database", "error", err)
 		}
 		if voiceTap != nil {
 			voiceTap.SetRate(sampleRate)
@@ -1838,7 +1838,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 		// micRef is published before the start so the controller, woken when
 		// the start clears the forced-red hold, already sees the open mic.
 		micRef.Store(mic)
-		if err := startOpenedMic(capture, ordered, func() { micRef.Store(nil) }, log.Printf); errors.Is(err, errMicStartPaused) {
+		if err := startOpenedMic(capture, ordered, func() { micRef.Store(nil) }); errors.Is(err, errMicStartPaused) {
 			// A pause came during the light's check: as during the scan, the
 			// next resume starts again (startMicrophone).
 			return err
@@ -1959,7 +1959,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 	if output != nil && cfg.TTSProvider != "" {
 		ttsProvider, ttsErr := newTTSProvider(ctx, &cfg)
 		if ttsErr != nil {
-			log.Printf("warning: TTS disabled: %v", ttsErr)
+			slog.Warn("TTS disabled", "error", ttsErr)
 			warningRegistry.Set("tts", fmt.Sprintf("TTS provider initialization failed: %v", ttsErr))
 		} else {
 			// POST /api/tts/speak waits in its queue while a voice exchange
@@ -2032,7 +2032,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 			notify:      hub.BroadcastVoiceEvent,
 			projects:    dispatchProjects.Get,
 		}); err != nil {
-			log.Printf("warning: the meeting voice is off: %v", err)
+			slog.Warn("the meeting voice is off", "error", err)
 			warningRegistry.Set("voice", "The meeting voice is off: "+err.Error())
 		}
 	}
@@ -2136,7 +2136,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 	// device then.
 	micLoopsEnded := joinMicLoops(&micLoops, micShutdownWait)
 	if !micLoopsEnded {
-		log.Printf("warning: microphone still reading %v after shutdown began; leaving the device and PortAudio to the process exit", micShutdownWait)
+		slog.Warn("microphone still reading after shutdown began; leaving the device and PortAudio to the process exit", "waited", micShutdownWait)
 	}
 	// Only now, with the microphones closed, does the light go off. Stop
 	// refuses any further red confirmation, and lets the off write through
@@ -2146,18 +2146,18 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 	select {
 	case <-lightOff:
 	case <-time.After(lightShutdownWait):
-		log.Printf("warning: recording light not turned off within %v; leaving it to its watchdog", lightShutdownWait)
+		slog.Warn("recording light not turned off in time; leaving it to its watchdog", "waited", lightShutdownWait)
 	}
 
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer shutdownCancel()
 
 	if err := manager.ForceEndSession(shutdownCtx); err != nil {
-		log.Printf("warning: force end session failed: %v", err)
+		slog.Warn("force end session failed", "error", err)
 	}
 	lifecycleCtx, lifecycleCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	if err := manager.WaitForLifecyclePublishes(lifecycleCtx); err != nil {
-		log.Printf("warning: lifecycle event publishing did not finish before shutdown: %v", err)
+		slog.Warn("lifecycle event publishing did not finish before shutdown", "error", err)
 	}
 	lifecycleCancel()
 
@@ -2175,12 +2175,12 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 	}
 	if output != nil {
 		if err := output.Close(); err != nil {
-			log.Printf("warning: speaker output close failed: %v", err)
+			slog.Warn("speaker output close failed", "error", err)
 		}
 	}
 
 	if err := httpServer.Shutdown(shutdownCtx); err != nil {
-		log.Printf("warning: http shutdown failed: %v", err)
+		slog.Warn("http shutdown failed", "error", err)
 	}
 	if micLoopsEnded {
 		_ = audio.TerminatePortAudio() // best-effort cleanup
@@ -2256,7 +2256,7 @@ func streamMicWithRetry(
 	// overtook handed an open microphone, nor one that has just opened it.
 	closeAtShutdown := func() {
 		if !released {
-			closeMic(capture, streamer, "at shutdown", logf)
+			closeMic(capture, streamer, "at shutdown")
 		}
 	}
 
@@ -2274,7 +2274,7 @@ func streamMicWithRetry(
 				why = "for capture pause"
 			}
 			if !released {
-				closeMic(capture, streamer, why, logf)
+				closeMic(capture, streamer, why)
 			}
 			if held {
 				held = false
@@ -2399,11 +2399,11 @@ func streamMicWithRetry(
 			if isOverflow(err) {
 				why = "after an overflow"
 			}
-			closeMic(capture, streamer, why, logf)
+			closeMic(capture, streamer, why)
 		}
 		released = true // the loop top, after a pause, closes nothing more
 		if isOverflow(err) {
-			logf("warning: mic input overflow, restarting stream")
+			slog.Warn("mic input overflow, restarting stream")
 			if hub != nil {
 				hub.BroadcastComponentStatus("mic", "warning", "Mic input overflow, restarting stream")
 			}
@@ -2510,11 +2510,11 @@ func streamUntilClosed(ctx context.Context, capture *captureGate, streamer micSt
 		}
 		switch err := streamer.Close(); {
 		case errors.Is(err, audio.ErrMicStillReading):
-			logf("warning: the microphone is still reading; it stays open, with the light red, until its read returns")
+			slog.Warn("the microphone is still reading; it stays open, with the light red, until its read returns")
 			capture.micHeld(true)
 			closed.held = true
 		case err != nil:
-			logf("warning: close microphone %s: %v", why, err)
+			slog.Warn("close microphone failed", "why", why, "error", err)
 			closed.released = true
 		default:
 			closed.released = true
@@ -2573,11 +2573,11 @@ func reopenMic(capture *captureGate, streamer micStreamer, logf func(string, ...
 	if err := capture.confirmMicOpen(); errors.Is(err, errMicStartPaused) {
 		// A pause came during the light's check: the loop top waits for the
 		// next resume, and opens the device under its own confirmation.
-		closeMic(capture, streamer, "for capture pause", logf)
+		closeMic(capture, streamer, "for capture pause")
 		return false, nil
 	} else if errors.Is(err, errNoCaptureDevice) {
 		logf("no capture device present; the microphone reconnects once one is")
-		closeMic(capture, streamer, "with no capture device present", logf)
+		closeMic(capture, streamer, "with no capture device present")
 		if hub != nil {
 			hub.BroadcastComponentStatus("mic", storage.ComponentStatusError, "No microphone found")
 		}
@@ -2585,7 +2585,7 @@ func reopenMic(capture *captureGate, streamer micStreamer, logf func(string, ...
 	} else if err != nil {
 		logf("recording light unavailable before microphone reconnect: %v", err)
 		capture.lightUnconfirmed(err)
-		closeMic(capture, streamer, "without a red recording light", logf)
+		closeMic(capture, streamer, "without a red recording light")
 		return false, nil
 	}
 	err := streamer.Reopen()
@@ -2609,9 +2609,9 @@ func reopenMic(capture *captureGate, streamer micStreamer, logf func(string, ...
 // the light, which stays red while the device is open: while capture is
 // paused, before the loop waits after a stream error, and when the light
 // cannot be confirmed red before a reconnect.
-func closeMic(capture *captureGate, streamer micStreamer, which string, logf func(string, ...any)) {
+func closeMic(capture *captureGate, streamer micStreamer, which string) {
 	if err := streamer.Close(); err != nil {
-		logf("warning: close microphone %s: %v", which, err)
+		slog.Warn("close microphone failed", "why", which, "error", err)
 	}
 	capture.micClosed()
 }
@@ -2619,7 +2619,7 @@ func closeMic(capture *captureGate, streamer micStreamer, which string, logf fun
 // holdMicWhilePaused closes the capture device, which releases it, and blocks
 // until capture resumes (waitWhilePaused). It reports false if ctx ends first.
 func holdMicWhilePaused(ctx context.Context, capture *captureGate, streamer micStreamer, logf func(string, ...any), hub *server.Hub) bool {
-	closeMic(capture, streamer, "for capture pause", logf)
+	closeMic(capture, streamer, "for capture pause")
 	return waitWhilePaused(ctx, capture, logf, hub)
 }
 

@@ -4,13 +4,14 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
-	"log"
+	"log/slog"
 	"os"
 	"slices"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/sjawhar/ghost-wispr/internal/logtest"
 	"github.com/sjawhar/ghost-wispr/internal/recording"
 )
 
@@ -155,18 +156,16 @@ func TestAShorterLookbackDuringAHoldAddsNoSilence(t *testing.T) {
 // drops its oldest audio, which can be the first words, without a warning in
 // the log, once per hold. The warning names no words.
 func TestAHoldThatDropsItsOldestAudioWarns(t *testing.T) {
-	var logged bytes.Buffer
-	previous := log.Writer()
-	log.SetOutput(&logged)
-	t.Cleanup(func() { log.SetOutput(previous) })
+	logged := logtest.Capture(t)
 	_, r := savingRecorder(t)
 	takeSeconds(t, r, 1)
 	r.HoldPreroll(0)
 	takeSeconds(t, r, secondsFrom(2, maxHeldSeconds+5)...)
-	if n := strings.Count(logged.String(), "warning: "); n != 1 {
-		t.Fatalf("the log holds %d warnings, want 1 for a hold past %d s:\n%s", n, maxHeldSeconds, logged.String())
+	warned := logged.At(slog.LevelWarn)
+	if len(warned) != 1 {
+		t.Fatalf("the log holds %d warnings, want 1 for a hold past %d s:\n%+v", len(warned), maxHeldSeconds, logged.Records())
 	}
-	if !strings.Contains(logged.String(), "first words") {
-		t.Fatalf("the warning does not say the first words can be lost: %s", logged.String())
+	if !strings.Contains(warned[0].Message, "first words") {
+		t.Fatalf("the warning does not say the first words can be lost: %+v", warned[0])
 	}
 }

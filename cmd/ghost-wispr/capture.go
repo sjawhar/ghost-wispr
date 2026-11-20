@@ -5,7 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -324,7 +324,7 @@ func (g *captureGate) closeGate() {
 			// the resume: it can reach Deepgram late, and if it reaches the
 			// recorder after the resume dropped the preroll, it opens the
 			// next session's recording.
-			log.Printf("warning: capture pause: an audio write was still running after %v; settling without it", g.writeWait)
+			slog.Warn("capture pause: an audio write was still running; settling without it", "waited", g.writeWait)
 		}
 		if g.settle != nil {
 			g.settle()
@@ -1098,7 +1098,7 @@ func settleCapturePause(ctx context.Context, sessions captureSessions, dg deepgr
 		select {
 		case err := <-called:
 			if err != nil {
-				logf("warning: finalize deepgram on capture pause: %v", err)
+				slog.Warn("finalize deepgram on capture pause", "error", err)
 			}
 			if finalized != nil {
 				select {
@@ -1108,7 +1108,7 @@ func settleCapturePause(ctx context.Context, sessions captureSessions, dg deepgr
 				}
 			}
 		case <-deadline.C:
-			logf("warning: capture pause: deepgram finalize did not return within %v", finalizeWait)
+			slog.Warn("capture pause: deepgram finalize did not return in time", "waited", finalizeWait)
 		}
 		deadline.Stop()
 	}
@@ -1125,7 +1125,7 @@ func settleCapturePause(ctx context.Context, sessions captureSessions, dg deepgr
 		if err == nil || errors.Is(err, session.ErrNoActiveSession) || ctx.Err() != nil {
 			return
 		}
-		logf("warning: end session on capture pause failed, retrying in %v: %v", wait, err)
+		slog.Warn("end session on capture pause failed; retrying", "retry_in", wait, "error", err)
 		retry := time.NewTimer(wait)
 		select {
 		case <-retry.C:

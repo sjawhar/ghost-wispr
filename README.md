@@ -97,6 +97,7 @@ Settings live in `ghost-wispr.yaml` (see `ghost-wispr.yaml.example`). Environmen
 | `GHOST_WISPR_DB_PATH` | No | `data/ghost-wispr.db` | SQLite database path |
 | `GHOST_WISPR_AUDIO_DIR` | No | `data/audio` | Directory for audio files |
 | `GHOST_WISPR_SILENCE_TIMEOUT` | No | `30s` | Silence duration to end a session |
+| `GHOST_WISPR_LOG_LEVEL` | No | `info` | Log level (`log_level`): `debug`, `info`, `warn` (or `warning`) or `error`, in any case. Another value logs at `info`, with a warning at start and in `GET /api/status`. The variable overrides the file for the run only: a settings save writes the file's `log_level` back, not the variable's |
 | `GHOST_WISPR_MIC_SAMPLE_RATE` | No | `16000` | Preferred microphone sample rate |
 | `GHOST_WISPR_MIC_SAMPLE_RATES` | No | `48000,44100,32000,24000` | Fallback sample rates to try |
 | `GHOST_WISPR_GDRIVE_FOLDER_ID` | No | — | Google Drive folder for audio sync |

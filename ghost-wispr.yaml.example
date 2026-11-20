@@ -17,6 +17,10 @@ db_path: data/ghost-wispr.db
 # Audio recording
 audio_dir: data/audio
 silence_timeout: 30s
+# debug, info, warn (or warning) or error, in any case; another value logs at info, with a
+# warning. GHOST_WISPR_LOG_LEVEL overrides it for the run only: a settings save in the web UI
+# writes this value back, not the variable's.
+log_level: info
 
 # The unit's own HTTPS address, such as the name tailscale serve publishes. The web UI accepts
 # requests from pages there as well as at the host a request came to, and Envoy events link to

@@ -2,7 +2,7 @@ package main
 
 import (
 	"fmt"
-	"log"
+	"log/slog"
 	"strings"
 )
 
@@ -107,7 +107,7 @@ func forgetWarningsOfGoneSessions(registry *warningsRegistry, sessions sessionLo
 		}
 		exists, err := sessions.HasSession(id)
 		if err != nil {
-			log.Printf("warning: could not check whether session %s of a status warning exists: %v", id, err)
+			slog.Warn("could not check whether the session of a status warning exists", "session_id", id, "error", err)
 			exists = true
 		}
 		gone[id] = !exists
@@ -125,7 +125,7 @@ func sessionsDeletedHook(store rawEraseReservationStore, registry *warningsRegis
 	return func(sessionIDs []string) {
 		forgetSessionWarnings(registry, sessionIDs)
 		if err := refreshRawEraseReservationWarnings(store, registry); err != nil {
-			log.Printf("warning: raw erase reservations after deleting sessions %s: %v", strings.Join(sessionIDs, ", "), err)
+			slog.Warn("raw erase reservations after deleting sessions", "session_ids", sessionIDs, "error", err)
 		}
 	}
 }

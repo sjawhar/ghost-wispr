@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"sync"
 
 	"github.com/sjawhar/ghost-wispr/internal/server"
@@ -267,11 +268,11 @@ func startMicIfUnpaused(capture *captureGate, start func() error) error {
 func startOpenedMic(capture *captureGate, mic interface {
 	Start() error
 	Close() error
-}, withdraw func(), logf func(string, ...any)) error {
+}, withdraw func()) error {
 	if err := startMicIfUnpaused(capture, mic.Start); err != nil {
 		withdraw()
 		if closeErr := mic.Close(); closeErr != nil {
-			logf("warning: close microphone after its start failed: %v", closeErr)
+			slog.Warn("close microphone after its start failed", "error", closeErr)
 		}
 		return err
 	}

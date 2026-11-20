@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount } from 'svelte'
   import { fetchLogs, type LogEntry } from '../lib/api'
+  import { logAttributes } from '../lib/logAttributes'
 
   let isOpen = $state(false)
   let logs = $state<LogEntry[]>([])
@@ -107,6 +108,7 @@
 
     <div class="log-content" bind:this={logContainer} onscroll={handleScroll}>
       {#each logs as log (log.raw)}
+        {@const attributes = logAttributes(log.raw)}
         <div class="log-entry" data-testid="log-entry">
           <span class="log-time">{new Date(log.timestamp).toLocaleTimeString()}</span>
           <span class="log-level" style="color: {getLevelColor(log.level)}">[{log.level}]</span>
@@ -114,6 +116,11 @@
             <span class="log-module">[{log.module}]</span>
           {/if}
           <span class="log-message">{log.message}</span>
+          {#if attributes.length > 0}
+            <span class="log-attributes" data-testid="log-attributes"
+              >{attributes.map(([key, value]) => `${key}=${value}`).join(' ')}</span
+            >
+          {/if}
         </div>
       {/each}
       {#if logs.length === 0}
@@ -218,6 +225,11 @@
 
   .log-message {
     color: #d4d4d4;
+  }
+
+  .log-attributes {
+    color: #9cdcfe;
+    margin-left: 0.5rem;
   }
 
   .no-logs {

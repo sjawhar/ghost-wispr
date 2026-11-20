@@ -4,7 +4,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"path/filepath"
 
 	"github.com/sjawhar/ghost-wispr/internal/server"
@@ -42,7 +42,7 @@ func (r *refusedCuts) Warnings() []string {
 	for _, cut := range cuts {
 		if !r.present(cut) {
 			if err := r.store.ForgetRefusedCut(cut); err != nil {
-				log.Printf("warning: %v", err)
+				slog.Warn("could not forget a refused cut whose words are gone", "session_id", cut.SessionID, "error", err)
 			}
 			continue
 		}

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"log/slog"
 	"strings"
 
 	"github.com/sjawhar/ghost-wispr/internal/session"
@@ -69,7 +70,7 @@ func resummarize(ctx context.Context, store *storage.SQLiteStore, summarizer pre
 		if errors.Is(err, sql.ErrNoRows) {
 			// The text changed since it was read; a newer run owns the
 			// summary, so this one records no failure.
-			log.Printf("warning: discarded stale summary for session %s: %v", sessionID, err)
+			slog.Warn("discarded stale summary", "session_id", sessionID, "error", err)
 			return err
 		}
 		failSummary(store, hub, sessionID, generation, err)
@@ -87,12 +88,12 @@ func resummarize(ctx context.Context, store *storage.SQLiteStore, summarizer pre
 func summarizeMergedSession(ctx context.Context, store *storage.SQLiteStore, summarizer session.ReportedSummarizer, hub summaryBroadcaster, publish func(sessionID string), sessionID string) {
 	transcript, generation, err := store.Canonicalize(sessionID)
 	if err != nil {
-		log.Printf("warning: failed to read the transcript of merged session %s: %v", sessionID, err)
+		slog.Warn("failed to read the transcript of merged session", "session_id", sessionID, "error", err)
 		return
 	}
 	if strings.TrimSpace(transcript) == "" {
 		if err := store.StartEmptySummaryAtGeneration(sessionID, generation); err != nil {
-			log.Printf("warning: failed to start empty summary for merged session %s: %v", sessionID, err)
+			slog.Warn("failed to start empty summary for merged session", "session_id", sessionID, "error", err)
 			return
 		}
 		_ = store.UpdateSummaryAtGeneration(sessionID, "", "", storage.SummaryCompleted, "", "{}", "", generation)
@@ -104,13 +105,13 @@ func summarizeMergedSession(ctx context.Context, store *storage.SQLiteStore, sum
 
 	title, summaryText, preset, speakerNames, model, err := summarizer.SummarizeReported(ctx, sessionID, transcript)
 	if err != nil {
-		log.Printf("warning: summarization failed for merged session %s: %v", sessionID, err)
+		slog.Warn("summarization failed for merged session", "session_id", sessionID, "error", err)
 		failSummary(store, hub, sessionID, generation, err)
 		return
 	}
 
 	if err := store.UpdateSummaryAtGeneration(sessionID, title, summaryText, storage.SummaryCompleted, preset, speakerNames, model, generation); err != nil {
-		log.Printf("warning: discarded stale merged summary for session %s: %v", sessionID, err)
+		slog.Warn("discarded stale merged summary", "session_id", sessionID, "error", err)
 		return
 	}
 	hub.BroadcastSummaryReady(sessionID, title, summaryText, storage.SummaryCompleted, preset)
@@ -125,13 +126,13 @@ func summarizeBackfillSession(ctx context.Context, store *storage.SQLiteStore, s
 	log.Printf("startup: summarizing session %s synchronously", id)
 	transcript, generation, err := store.Canonicalize(id)
 	if err != nil {
-		log.Printf("warning: failed to read the transcript of session %s: %v", id, err)
+		slog.Warn("failed to read the transcript of session", "session_id", id, "error", err)
 		return
 	}
 	transcript = strings.TrimSpace(transcript)
 	if transcript == "" {
 		if err := store.StartEmptySummaryAtGeneration(id, generation); err != nil {
-			log.Printf("warning: failed to start empty summary for session %s: %v", id, err)
+			slog.Warn("failed to start empty summary for session", "session_id", id, "error", err)
 			return
 		}
 		_ = store.UpdateSummaryAtGeneration(id, "", "", storage.SummaryCompleted, "", "{}", "", generation)
@@ -140,12 +141,12 @@ func summarizeBackfillSession(ctx context.Context, store *storage.SQLiteStore, s
 	_ = store.StartSummary(id)
 	title, summaryText, preset, speakerNames, model, err := summarizer.SummarizeReported(ctx, id, transcript)
 	if err != nil {
-		log.Printf("warning: summarization failed for %s: %v", id, err)
+		slog.Warn("summarization failed", "session_id", id, "error", err)
 		failSummary(store, nil, id, generation, err)
 		return
 	}
 	if err := store.UpdateSummaryAtGeneration(id, title, summaryText, storage.SummaryCompleted, preset, speakerNames, model, generation); err != nil {
-		log.Printf("warning: discarded stale summary for session %s: %v", id, err)
+		slog.Warn("discarded stale summary", "session_id", id, "error", err)
 		return
 	}
 	log.Printf("summarized session %s with preset %s", id, preset)
@@ -158,7 +159,7 @@ func summarizeBackfillSession(ctx context.Context, store *storage.SQLiteStore, s
 func loadSessionTranscript(store *storage.SQLiteStore, sessionID string) (string, bool) {
 	sess, err := store.GetSession(sessionID)
 	if err != nil {
-		log.Printf("warning: failed to get session %s: %v", sessionID, err)
+		slog.Warn("failed to get session", "session_id", sessionID, "error", err)
 		return "", false
 	}
 	transcript := strings.TrimSpace(sess.CanonicalTranscript)
@@ -167,7 +168,7 @@ func loadSessionTranscript(store *storage.SQLiteStore, sessionID string) (string
 	}
 	segments, err := store.GetSegments(sessionID)
 	if err != nil {
-		log.Printf("warning: failed to get segments for %s: %v", sessionID, err)
+		slog.Warn("failed to get segments", "session_id", sessionID, "error", err)
 		return "", false
 	}
 	return strings.TrimSpace(buildCanonicalTranscript(store, sessionID, segments)), true
@@ -238,7 +239,7 @@ func repairStructuredSummaries(ctx context.Context, store summaryRepairStore, pu
 
 			if err := store.UpdateSummaryAtGeneration(sess.ID, title, summaryText, sess.SummaryStatus, sess.SummaryPreset, speakerNames, sess.SummaryModel, generation); err != nil {
 				if errors.Is(err, sql.ErrNoRows) {
-					log.Printf("warning: discarded the repair of session %s's summary: its transcript changed since it was read", sess.ID)
+					slog.Warn("discarded the repair of a session's summary: its transcript changed since it was read", "session_id", sess.ID)
 					continue
 				}
 				return repaired, err
@@ -262,11 +263,11 @@ func repairStructuredSummaries(ctx context.Context, store summaryRepairStore, pu
 func failSummary(store *storage.SQLiteStore, hub summaryBroadcaster, sessionID string, generation int, cause error) {
 	kept, err := store.FailSummaryAtGeneration(sessionID, fmt.Sprintf("summarization failed: %v", cause), generation)
 	if errors.Is(err, sql.ErrNoRows) {
-		log.Printf("warning: discarded a stale failed summary of %s: its transcript changed since it was read: %v", sessionID, cause)
+		slog.Warn("discarded a stale failed summary: its transcript changed since it was read", "session_id", sessionID, "cause", cause)
 		return
 	}
 	if err != nil {
-		log.Printf("warning: could not record the failed summary of %s: %v", sessionID, err)
+		slog.Warn("could not record the failed summary", "session_id", sessionID, "error", err)
 		return
 	}
 	if hub != nil {

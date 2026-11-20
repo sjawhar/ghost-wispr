@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -197,14 +198,14 @@ func (k *keptRecordings) census() server.KeptRawRecordings {
 	deleted := map[string]bool{}
 	records, err := k.store.DeletedSessionAudio()
 	if err != nil {
-		log.Printf("warning: kept raw recordings: list deleted sessions: %v", err)
+		slog.Warn("kept raw recordings: list deleted sessions", "error", err)
 	}
 	for _, record := range records {
 		deleted[record.SessionID] = true
 	}
 	named, err := k.namedFiles()
 	if err != nil {
-		log.Printf("warning: kept raw recordings: %v", err)
+		slog.Warn("kept raw recordings", "error", err)
 	}
 	for _, id := range k.recorder.KeptRawSessions() {
 		_, action := k.decide(id, deleted, named)
@@ -252,7 +253,7 @@ func (k *keptRecordings) run(ctx context.Context) {
 	// act (save, adopt); this read sorts the raw recordings.
 	named, err := k.namedFiles()
 	if err != nil {
-		log.Printf("warning: no kept raw recording is saved or given this pass: %v", err)
+		slog.Warn("no kept raw recording is saved or given this pass", "error", err)
 	}
 	for _, id := range k.recorder.KeptRawSessions() {
 		if ctx.Err() != nil {
@@ -301,7 +302,7 @@ func (k *keptRecordings) eraseDeleted() map[string]bool {
 	left := map[string]bool{}
 	records, err := k.store.DeletedSessionAudio()
 	if err != nil {
-		log.Printf("warning: the audio of deleted sessions is not erased this pass: list them: %v", err)
+		slog.Warn("the audio of deleted sessions is not erased this pass: list them", "error", err)
 		return left
 	}
 	for _, record := range records {
@@ -312,7 +313,7 @@ func (k *keptRecordings) eraseDeleted() map[string]bool {
 		}
 		named, err := k.namedFiles()
 		if err != nil {
-			log.Printf("warning: the audio of deleted session %s is not erased this pass: %v", id, err)
+			slog.Warn("the audio of a deleted session is not erased this pass", "session_id", id, "error", err)
 			left[id] = true
 			continue
 		}
@@ -325,7 +326,7 @@ func (k *keptRecordings) eraseDeleted() map[string]bool {
 				continue
 			}
 			if err := erase.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
-				log.Printf("warning: %s of deleted session %s could not be erased; the next pass tries again: %v", path, id, err)
+				slog.Warn("a file of a deleted session could not be erased; the next pass tries again", "file", path, "session_id", id, "error", err)
 				remaining = true
 				continue
 			}
@@ -336,7 +337,7 @@ func (k *keptRecordings) eraseDeleted() map[string]bool {
 			continue
 		}
 		if err := k.store.ClearDeletedSessionAudio(id); err != nil {
-			log.Printf("warning: %v", err)
+			slog.Warn("could not clear the audio record of a deleted session", "session_id", id, "error", err)
 			left[id] = true
 		}
 	}
@@ -443,7 +444,7 @@ func (k *keptRecordings) eraseCutOffSaves() {
 // its blocks go; why says what it is, for the log.
 func (k *keptRecordings) eraseFile(path, why string) {
 	if err := erase.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
-		log.Printf("warning: %s, %s, could not be erased: %v", why, path, err)
+		slog.Warn("a file that holds audio could not be erased", "what", why, "file", path, "error", err)
 	}
 }
 
@@ -463,7 +464,7 @@ func (k *keptRecordings) lookup(id string) (storage.Session, rowState) {
 		return storage.Session{}, rowMissing
 	}
 	if err != nil {
-		log.Printf("warning: the audio kept for session %s is left this pass: read the session: %v", id, err)
+		slog.Warn("the audio kept for a session is left this pass: read the session", "session_id", id, "error", err)
 		return storage.Session{}, rowUnreadable
 	}
 	return sess, rowFound
@@ -507,7 +508,7 @@ func (k *keptRecordings) adopt(sess *storage.Session, saved string) {
 	}
 	recorded, err := k.store.RecordKeptRecording(sess.ID, saved, nil)
 	if err != nil {
-		log.Printf("warning: session %s ended without naming its saved recording %s, and it could not be given it; the next pass tries again: %v", sess.ID, saved, err)
+		slog.Warn("a session ended without naming its saved recording, and it could not be given it; the next pass tries again", "session_id", sess.ID, "recording", saved, "error", err)
 		return
 	}
 	if !recorded {
@@ -542,7 +543,7 @@ func (k *keptRecordings) save(parent context.Context, sess *storage.Session) boo
 		for _, path := range recordingname.KeptTempPaths(k.audioDir, sess.ID) {
 			k.eraseFile(path, "a save that did not finish")
 		}
-		log.Printf("warning: the raw recording kept for session %s was not saved; the next pass tries again: %v", sess.ID, err)
+		slog.Warn("the raw recording kept for a session was not saved; the next pass tries again", "session_id", sess.ID, "error", err)
 		return false
 	}
 	if named, err := k.namedFiles(); err != nil || k.claimedElsewhere(sess.ID, named) {
@@ -552,7 +553,7 @@ func (k *keptRecordings) save(parent context.Context, sess *storage.Session) boo
 	}
 	if err := syncKeptFile(temp); err != nil {
 		k.eraseFile(temp, "a recording that could not be flushed to the disk")
-		log.Printf("warning: the recording saved for session %s could not be flushed to the disk; the next pass tries again: %v", sess.ID, err)
+		slog.Warn("the recording saved for a session could not be flushed to the disk; the next pass tries again", "session_id", sess.ID, "error", err)
 		return false
 	}
 	saved := filepath.Join(k.audioDir, sess.ID+filepath.Ext(temp))
@@ -589,7 +590,7 @@ func (k *keptRecordings) eraseUnnamed(sessionID, saved string, recordErr error) 
 		return
 	}
 	if err := erase.Remove(saved); err != nil && !errors.Is(err, os.ErrNotExist) {
-		log.Printf("warning: session %s did not take the recording saved from its raw recording (%v), and %s could not be erased: %v", sessionID, recordErr, saved, err)
+		slog.Warn("a session did not take the recording saved from its raw recording, and the recording could not be erased", "session_id", sessionID, "record_error", recordErr, "recording", saved, "error", err)
 		return
 	}
 	log.Printf("session %s did not take the recording saved from its raw recording (%v); it is erased", sessionID, recordErr)
@@ -600,7 +601,7 @@ func (k *keptRecordings) eraseUnnamed(sessionID, saved string, recordErr error) 
 func (k *keptRecordings) eraseRaw(sessionID string) {
 	raw := recordingname.RawPath(k.audioDir, sessionID)
 	if err := erase.Remove(raw); err != nil && !errors.Is(err, os.ErrNotExist) {
-		log.Printf("warning: the raw recording of session %s could not be erased beside its saved recording: %v", sessionID, err)
+		slog.Warn("the raw recording of a session could not be erased beside its saved recording", "session_id", sessionID, "error", err)
 		return
 	}
 	log.Printf("erased the raw recording of session %s beside its saved recording", sessionID)

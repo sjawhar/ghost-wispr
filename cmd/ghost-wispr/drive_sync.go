@@ -103,7 +103,7 @@ func watchDriveSyncSettings(cfgStore *config.Store, drive *driveSync, start func
 		if cfg.GDriveSyncEnabled && cfg.GDriveFolderID != "" && drive.Get() == nil {
 			syncer, err := start(cfg)
 			if err != nil {
-				log.Printf("config: gdrive sync not started: %v", err)
+				slog.Warn("config: gdrive sync not started", "error", err)
 				return
 			}
 			drive.Set(syncer)
@@ -152,7 +152,7 @@ func sweepDriveSync(ctx context.Context, store syncSweepStore, drive *driveSync,
 			syncSweep(ctx, store, drive)
 			kept.run(ctx)
 			if err := store.RetryOwedErasure(); err != nil {
-				log.Printf("warning: a deleted segment's erase from the database log or backup is still owed: %v", err)
+				slog.Warn("a deleted segment's erase from the database log or backup is still owed", "error", err)
 			}
 			refreshWarnings()
 		}

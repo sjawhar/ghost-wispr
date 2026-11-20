@@ -4,7 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sort"
@@ -403,7 +403,7 @@ func retryRefinementWithFailureWarning(ctx context.Context, registry *warningsRe
 		return nil
 	}
 	warning := fmt.Sprintf("Retry refinement failed for session %s: %v", sessionID, err)
-	log.Printf("warning: %s", warning)
+	slog.Warn("retry refinement failed", "session_id", sessionID, "error", err)
 	registry.Set(refinementRetryWarningKeyPrefix+sessionID, warning)
 	return err
 }

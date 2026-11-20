@@ -17,23 +17,30 @@ import (
 
 // Store holds mutable config with thread-safe access and YAML write-back.
 type Store struct {
-	mu       sync.RWMutex
-	cfg      Config
-	path     string
-	envPath  string
-	onChange []func(Config)
+	mu  sync.RWMutex
+	cfg Config
+	// writtenLogLevel is the log_level a settings change writes back: the
+	// config file's, or the one a change set. GHOST_WISPR_LOG_LEVEL's override
+	// stays in memory, so a level set for one run does not stay in the file. A
+	// change counts as setting the level when it changes the running one, so a
+	// change to the level already running writes nothing new; no settings
+	// field sets the level today.
+	writtenLogLevel string
+	path            string
+	envPath         string
+	onChange        []func(Config)
 }
 
 // NewStore loads config from the given YAML path (if it exists),
 // applies env overrides, loads secrets, validates, and returns
 // a mutable store.
 func NewStore(path string) (*Store, []string, error) {
-	cfg, warnings, err := Load(path)
+	cfg, fileLogLevel, warnings, err := load(path)
 	if err != nil {
 		return nil, warnings, err
 	}
 
-	return &Store{cfg: cfg, path: path}, warnings, nil
+	return &Store{cfg: cfg, writtenLogLevel: fileLogLevel, path: path}, warnings, nil
 }
 
 // NewStoreWithEnv loads config from YAML, then secrets from .env file
@@ -41,7 +48,7 @@ func NewStore(path string) (*Store, []string, error) {
 func NewStoreWithEnv(yamlPath, envPath string) (*Store, []string, error) {
 	envSecrets := loadEnvFile(envPath)
 
-	cfg, warnings, err := Load(yamlPath)
+	cfg, fileLogLevel, warnings, err := load(yamlPath)
 	if err != nil {
 		return nil, warnings, err
 	}
@@ -53,7 +60,7 @@ func NewStoreWithEnv(yamlPath, envPath string) (*Store, []string, error) {
 		warnings = append(warnings, leftoverEnvoyWebhookSecretWarning)
 	}
 
-	return &Store{cfg: cfg, path: yamlPath, envPath: envPath}, warnings, nil
+	return &Store{cfg: cfg, writtenLogLevel: fileLogLevel, path: yamlPath, envPath: envPath}, warnings, nil
 }
 
 // Get returns a snapshot copy of the current config.
@@ -92,8 +99,12 @@ func (s *Store) TryUpdate(fn func(*Config) error) error {
 		return err
 	}
 
+	writtenLogLevel := s.writtenLogLevel
+	if s.cfg.LogLevel != prev.LogLevel {
+		writtenLogLevel = s.cfg.LogLevel
+	}
 	if s.path != "" {
-		if err := s.writeYAML(); err != nil {
+		if err := s.writeYAML(writtenLogLevel); err != nil {
 			s.cfg = prev
 			s.mu.Unlock()
 			return fmt.Errorf("write config: %w", err)
@@ -104,12 +115,13 @@ func (s *Store) TryUpdate(fn func(*Config) error) error {
 		if err := s.writeEnvFile(); err != nil {
 			s.cfg = prev
 			if s.path != "" {
-				_ = s.writeYAML() // best-effort rollback of YAML to prev values
+				_ = s.writeYAML(s.writtenLogLevel) // best-effort rollback of YAML to prev values
 			}
 			s.mu.Unlock()
 			return fmt.Errorf("write .env: %w", err)
 		}
 	}
+	s.writtenLogLevel = writtenLogLevel
 
 	current := s.copyConfig()
 	callbacks := make([]func(Config), len(s.onChange))
@@ -182,11 +194,14 @@ func (s *Store) validateForUpdate() error {
 	return nil
 }
 
-func (s *Store) writeYAML() error {
+// writeYAML writes the config to the file, with logLevel as its log_level.
+func (s *Store) writeYAML(logLevel string) error {
 	if err := os.MkdirAll(filepath.Dir(s.path), 0o755); err != nil {
 		return err
 	}
-	data, err := yaml.Marshal(&s.cfg)
+	written := s.cfg
+	written.LogLevel = logLevel
+	data, err := yaml.Marshal(&written)
 	if err != nil {
 		return err
 	}

@@ -7,7 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -400,7 +400,7 @@ func (r *Recorder) writePCM(data []byte) error {
 			r.held = r.held[over-back:]
 			if !r.trimWarned {
 				r.trimWarned = true
-				log.Printf("warning: the audio kept for the next session's start reached %d s with no session started; its oldest audio is dropped from now on, and with it maybe the first words", maxHeldSeconds)
+				slog.Warn("the audio kept for the next session's start reached its limit with no session started; its oldest audio is dropped from now on, and with it maybe the first words", "limit_seconds", maxHeldSeconds)
 			}
 		}
 		return nil

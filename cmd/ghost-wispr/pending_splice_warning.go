@@ -4,7 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"strings"
 	"time"
 
@@ -59,11 +59,11 @@ func applyPendingSpliceRecoveryWarnings(registry *warningsRegistry, outcomes []p
 		}
 		var refinementErr refinementAfterSegmentDeletionError
 		if errors.As(outcome.Err, &refinementErr) {
-			log.Printf("warning: %v recording=%s", outcome.Err, outcome.Span.AudioPath)
+			slog.Warn("refinement after segment deletion failed", "session_id", refinementErr.sessionID, "recording", outcome.Span.AudioPath, "error", refinementErr.err)
 			registry.Set(segmentDeletionWarningKey(pendingSpliceRefinementKeyPrefix, refinementErr.sessionID, ""), refinementWarningText(refinementErr.sessionID, refinementErr.err))
 			continue
 		}
-		log.Printf("warning: pending segment splice session=%s recording=%s: %v", outcome.Span.SessionID, outcome.Span.AudioPath, outcome.Err)
+		slog.Warn("pending segment splice failed", "session_id", outcome.Span.SessionID, "recording", outcome.Span.AudioPath, "error", outcome.Err)
 		setPendingSpliceWarning(registry, outcome.Span.SessionID, outcome.Span.AudioPath, outcome.Err)
 	}
 }
@@ -96,11 +96,11 @@ func retryRefinementWithWarningClear(ctx context.Context, registry *warningsRegi
 // clears, and err can name a recording, which is named for its session: the
 // warning says which step failed, and only the log line holds err.
 func recordPendingSpliceCleanupWarning(registry *warningsRegistry, err error) {
-	log.Printf("warning: failed to clean leftover splice copies: %v", err)
+	slog.Warn("failed to clean leftover splice copies", "error", err)
 	registry.Set(pendingSpliceCleanupWarningKey, "Leftover copies of a segment deletion's recording could not be cleaned up at startup; the app's log says why.")
 }
 
 func recordPendingSpliceRecoveryWarning(registry *warningsRegistry, err error) {
-	log.Printf("warning: failed to recover pending segment splices: %v", err)
+	slog.Warn("failed to recover pending segment splices", "error", err)
 	registry.Set(pendingSpliceRecoveryWarningKey, "A segment deletion's audio recovery failed at startup; the app's log says why.")
 }

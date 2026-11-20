@@ -83,15 +83,25 @@ func RequestIDMiddleware(base *slog.Logger, generateID func() string) func(http.
 }
 
 func parseLevel(level string) slog.Level {
+	parsed, _ := LevelNamed(level)
+	return parsed
+}
+
+// LevelNamed is the level a config names, "debug", "info", "warn" (or
+// "warning") or "error" in any case, and whether level is one of them. Any
+// other name is info, the level the app logs at for it.
+func LevelNamed(level string) (slog.Level, bool) {
 	switch strings.ToLower(strings.TrimSpace(level)) {
 	case "debug":
-		return slog.LevelDebug
+		return slog.LevelDebug, true
+	case "info":
+		return slog.LevelInfo, true
 	case "warn", "warning":
-		return slog.LevelWarn
+		return slog.LevelWarn, true
 	case "error":
-		return slog.LevelError
+		return slog.LevelError, true
 	default:
-		return slog.LevelInfo
+		return slog.LevelInfo, false
 	}
 }
 
