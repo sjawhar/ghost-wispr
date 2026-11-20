@@ -1814,7 +1814,7 @@ func (o exchangeOutput) Begin() Playback {
 	if o.ex.ended || (o.ex.sayCtx != nil && o.ex.sayCtx.Err() != nil) {
 		return endedPlayback{}
 	}
-	var pb Playback = o.s.cfg.Speaker.Begin(audio.InputVoice)
+	pb := o.s.cfg.Speaker.Begin(audio.InputVoice)
 	if o.ex.sayCtx != nil {
 		pb = sayPlayback{Playback: pb, ctx: o.ex.sayCtx}
 	}
