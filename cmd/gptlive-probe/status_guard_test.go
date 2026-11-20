@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"os/exec"
 	"strings"
 	"sync"
 	"testing"
@@ -13,10 +15,11 @@ import (
 // statusServer is the office unit's local status endpoint, under test
 // control. It holds no session text.
 type statusServer struct {
-	mu     sync.Mutex
-	paused bool
-	active string
-	server *httptest.Server
+	mu        sync.Mutex
+	paused    bool
+	capturing bool
+	active    string
+	server    *httptest.Server
 }
 
 func newStatusServer(t *testing.T, paused bool, active string) *statusServer {
@@ -27,6 +30,7 @@ func newStatusServer(t *testing.T, paused bool, active string) *statusServer {
 		defer s.mu.Unlock()
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"paused":            s.paused,
+			"capturing":         s.capturing,
 			"active_session_id": s.active,
 		})
 	}))
@@ -35,22 +39,29 @@ func newStatusServer(t *testing.T, paused bool, active string) *statusServer {
 }
 
 func (s *statusServer) set(paused bool, active string) {
+	s.setState(paused, false, active)
+}
+
+func (s *statusServer) setState(paused, capturing bool, active string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.paused, s.active = paused, active
+	s.paused, s.capturing, s.active = paused, capturing, active
 }
 
 func TestProbeRefusesBeforeTokensWhenTheUnitIsNotPausedAndIdle(t *testing.T) {
 	for name, state := range map[string]struct {
-		paused bool
-		active string
+		paused    bool
+		capturing bool
+		active    string
 	}{
-		"recording": {paused: false},
-		"active":    {paused: true, active: "recording-session"},
+		"recording":            {paused: false},
+		"capturing while idle": {paused: true, capturing: true},
+		"active":               {paused: true, active: "recording-session"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			live := newStandIns(t)
 			status := newStatusServer(t, state.paused, state.active)
+			status.setState(state.paused, state.capturing, state.active)
 			cfg := live.config(t)
 			cfg.StatusURL = status.server.URL
 			report, err := runProbe(t, live, &cfg)
@@ -82,5 +93,32 @@ func TestProbeChecksAgainBeforeItsFirstAudio(t *testing.T) {
 	}
 	if live.heardAudio.Load() {
 		t.Fatal("the probe sent lead-in audio after the second safety guard failed")
+	}
+}
+
+// The executable parses its flags before it enters the safety guard. This
+// subprocess is a fresh process like the arm64 probe on the Pi.
+func TestSolReviewCLIParsesSafetyGuardFlags(t *testing.T) {
+	status := newStatusServer(t, false, "")
+	if os.Getenv("GPTLIVE_CLI_HELPER") == "1" {
+		os.Args = []string{
+			"gptlive-probe",
+			"--identity-provider-id", "idp_synthetic",
+			"--service-account-id", "user-synthetic",
+			"--status-url", os.Getenv("GPTLIVE_STATUS_URL"),
+			"--timeout", "2s",
+		}
+		_ = os.Setenv("GOOGLE_API_USE_CLIENT_CERTIFICATE", "false")
+		os.Exit(run())
+	}
+	cmd := exec.Command(os.Args[0], "-test.run=TestSolReviewCLIParsesSafetyGuardFlags")
+	cmd.Env = append(os.Environ(), "GPTLIVE_CLI_HELPER=1", "GPTLIVE_STATUS_URL="+status.server.URL)
+	out, err := cmd.CombinedOutput()
+	exit, ok := err.(*exec.ExitError)
+	if !ok || exit.ExitCode() != 1 {
+		t.Fatalf("run exit = %v, want 1; output:\n%s", err, out)
+	}
+	if strings.Contains(string(out), "needs --identity-provider-id") || !strings.Contains(string(out), "probe safety guard at start") {
+		t.Fatalf("run did not parse flags into the safety guard:\n%s", out)
 	}
 }

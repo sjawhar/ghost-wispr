@@ -130,9 +130,9 @@ func run() int {
 	wav := flag.String("wav", "", "write GPT-Live's speech to this WAV file")
 	turns := flag.Int("turns", probeTurns, "text turns to send; each speech's lead is measured")
 	ask := flag.String("ask", "", "a spoken question, a 16 kHz mono 16-bit WAV, for GPT-Live to delegate to the probe's backend")
-	statusURL := flag.String("status-url", defaultStatusURL, "the office unit's local /api/status endpoint; it must say paused and no active session")
+	statusURL := flag.String("status-url", defaultStatusURL, "the office unit's local /api/status endpoint; it must say paused, not capturing and no active session")
 	timeout := flag.Duration("timeout", 3*time.Minute, "give up after this long")
-	clientCertificatesOff()
+	flag.Parse()
 	if *provider == "" || *account == "" {
 		printf(os.Stderr, "gptlive-probe needs --identity-provider-id and --service-account-id\n")
 		return 2
@@ -186,6 +186,7 @@ func clientCertificatesOff() {
 // room words.
 type unitStatus struct {
 	Paused          bool   `json:"paused"`
+	Capturing       bool   `json:"capturing"`
 	ActiveSessionID string `json:"active_session_id"`
 }
 
@@ -212,8 +213,8 @@ func checkSafeUnit(ctx context.Context, url, when string) error {
 	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&status); err != nil {
 		return fmt.Errorf("probe safety guard %s: decode status: %w", when, err)
 	}
-	if !status.Paused || status.ActiveSessionID != "" {
-		return fmt.Errorf("probe safety guard %s: the unit is not paused and idle (paused=%t, active_session_id_empty=%t); refusing to send audio", when, status.Paused, status.ActiveSessionID == "")
+	if !status.Paused || status.Capturing || status.ActiveSessionID != "" {
+		return fmt.Errorf("probe safety guard %s: the unit is not paused and idle (paused=%t, capturing=%t, active_session_id_empty=%t); refusing to send audio", when, status.Paused, status.Capturing, status.ActiveSessionID == "")
 	}
 	return nil
 }
@@ -599,17 +600,34 @@ func delegation(ctx context.Context, cfg *probeConfig, in *feeder, tools *probeT
 	}
 }
 
-// evidence reports whether text has all the code-like words in want, in
-// order, whatever case or punctuation GPT-Live used.
+// evidence reports whether want's ordered, whole code-like tokens appear in
+// text, whatever case or punctuation GPT-Live used. Searching substrings
+// would take PROBE-142, PROBE-420 or "42 … probe" for PROBE-42.
 func evidence(text, want string) bool {
-	text, want = strings.ToLower(text), strings.ToLower(want)
-	words := strings.FieldsFunc(want, func(r rune) bool { return !unicode.IsLetter(r) && !unicode.IsDigit(r) })
-	for _, word := range words {
-		if !strings.Contains(text, word) {
-			return false
+	actual := evidenceTokens(text)
+	expected := evidenceTokens(want)
+	if len(expected) == 0 {
+		return false
+	}
+	for i := 0; i+len(expected) <= len(actual); i++ {
+		matched := true
+		for j := range expected {
+			if actual[i+j] != expected[j] {
+				matched = false
+				break
+			}
+		}
+		if matched {
+			return true
 		}
 	}
-	return true
+	return false
+}
+
+func evidenceTokens(text string) []string {
+	return strings.FieldsFunc(strings.ToLower(text), func(r rune) bool {
+		return !unicode.IsLetter(r) && !unicode.IsDigit(r)
+	})
 }
 
 // readQuestion reads a spoken question from a WAV file: mono PCM16 at 16 kHz.
