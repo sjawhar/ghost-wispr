@@ -130,11 +130,12 @@ func (d *jabraFake) lightsItself(on bool) {
 }
 
 type jabraRig struct {
-	capture  *captureGate
-	device   *captureDevice
-	controls *server.ControlHooks
-	warnings *warningsRegistry
-	devices  chan *jabraFake
+	capture    *captureGate
+	device     *captureDevice
+	persistent *persistentControls
+	controls   *server.ControlHooks
+	warnings   *warningsRegistry
+	devices    chan *jabraFake
 	// connectErr, when set before start, fails every connection.
 	connectErr error
 	// checkEvery is how often the button compares the light with the pause.
@@ -143,7 +144,7 @@ type jabraRig struct {
 
 // newJabraRig builds the Jabra mute button's surroundings: capture, its
 // durable controls, the capture device and the warnings, paused if paused is
-// set.
+// set. With no listener, the unit is the two-state machine (useListening).
 func newJabraRig(paused bool) *jabraRig {
 	capture := newCaptureGate(nil, nil, nil)
 	if paused {
@@ -152,11 +153,36 @@ func newJabraRig(paused bool) *jabraRig {
 	controls := newPersistentControls(&pauseStoreFake{}, capture.Pause, capture, nil)
 	return &jabraRig{
 		capture:    capture,
-		device:     newCaptureDevice(capture.IsPaused),
+		device:     newCaptureDevice(capture.inClosedState),
+		persistent: controls,
 		controls:   &server.ControlHooks{Pause: controls.Pause, Close: controls.Close, Resume: controls.Resume},
 		warnings:   newWarningsRegistry(),
 		devices:    make(chan *jabraFake, 4),
 		checkEvery: time.Millisecond,
+	}
+}
+
+// useListening gives the rig's controls the three states, with a listener
+// that can always run: a pause goes to listening.
+func (r *jabraRig) useListening() {
+	r.persistent.useListener(r.capture, func() {}, func() bool { return true }, r.device.closeListener)
+}
+
+// openListener opens the paused listener's stream through the rig's capture
+// device, as the listener does in listening.
+func (r *jabraRig) openListener(t *testing.T) {
+	t.Helper()
+	if err := r.device.openListener(func() bool { return r.capture.micState() == micListening }, func() error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// closeListener closes the listener's stream, as the listener does when the
+// unit leaves listening.
+func (r *jabraRig) closeListener(t *testing.T) {
+	t.Helper()
+	if err := r.device.closeListenerStream(func() error { return nil }); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -241,23 +267,45 @@ func (r *jabraRig) warning() string {
 }
 
 // TestJabraPressTogglesCaptureAndTheLight fails if a press of the Jabra's
-// mute button does not pause and resume capture, or the light written after
-// a press is not the pause that press left. The light check runs too seldom
-// here to repair it.
+// mute button does not close the microphone, from recording and from
+// listening, and resume a closed unit, or the ring written after a press is
+// not ringMuted, true in closed only. The light check runs too seldom here to
+// repair it.
 func TestJabraPressTogglesCaptureAndTheLight(t *testing.T) {
-	rig := newJabraRig(false)
-	rig.checkEvery = time.Hour
-	rig.start(t)
-	device := rig.plugIn()
-	waitForHardware(t, "the Jabra connection to clear its warning", func() bool { return rig.warning() == "" && device.reportsSent() > 0 })
-	if device.shows() {
-		t.Fatal("the Jabra mute light is on while capture records")
-	}
+	for _, from := range []micState{micRecording, micListening} {
+		t.Run(from.String(), func(t *testing.T) {
+			rig := newJabraRig(false)
+			rig.checkEvery = time.Hour
+			rig.start(t)
+			device := rig.plugIn()
+			waitForHardware(t, "the Jabra connection to clear its warning", func() bool { return rig.warning() == "" && device.reportsSent() > 0 })
+			if from == micListening {
+				rig.useListening()
+				if err := rig.controls.Pause(); err != nil {
+					t.Fatal(err)
+				}
+				rig.openListener(t)
+			}
+			if device.shows() || rig.capture.micState() != from {
+				t.Fatalf("control: in %v, the ring shows Muted %t", rig.capture.micState(), device.shows())
+			}
 
-	device.press(t)
-	waitForHardware(t, "the first press to pause capture and light the Jabra", func() bool { return rig.capture.IsPaused() && device.shows() })
-	device.press(t)
-	waitForHardware(t, "the second press to resume capture and darken the Jabra", func() bool { return !rig.capture.IsPaused() && !device.shows() })
+			device.press(t)
+			if from == micListening {
+				waitForHardware(t, "the press to close the microphone", rig.capture.inClosedState)
+				if device.shows() {
+					t.Fatal("the ring changed while the listener's stream was open")
+				}
+				rig.closeListener(t) // the listener leaves at once
+			}
+			waitForHardware(t, "the first press to close the microphone and light the Jabra", func() bool { return rig.capture.inClosedState() && device.shows() })
+			// A person's second press, outside the listener close's cover: the
+			// Jabra's own report would come within jabraOwnMuteWindow of it.
+			time.Sleep(2 * jabraOwnMuteWindow)
+			device.press(t)
+			waitForHardware(t, "the second press to resume capture and darken the Jabra", func() bool { return !rig.capture.IsPaused() && !device.shows() })
+		})
+	}
 }
 
 // TestJabraLostDeviceEndsItsReader fails if the reader of a Jabra that failed
@@ -346,21 +394,39 @@ func TestTheJabraButtonEndsOnlyOnceItsPressesHave(t *testing.T) {
 	}
 }
 
-// TestJabraLightFollowsEveryPauseSource fails if a pause or resume from the
-// web page, the API or the power button leaves the Jabra's light behind.
+// TestJabraLightFollowsEveryPauseSource fails if a pause, close or resume from
+// the web page, the API or the power button leaves the Jabra's ring behind
+// ringMuted: Muted in closed only. With no listener every pause closes, so it
+// shows Muted; with one, a pause listens, and the ring stays unmuted.
 func TestJabraLightFollowsEveryPauseSource(t *testing.T) {
-	rig := startJabraRig(t, false)
-	device := rig.plugIn()
-	waitForHardware(t, "the Jabra to connect", func() bool { return device.reportsSent() > 0 })
+	for _, listener := range []bool{false, true} {
+		t.Run(fmt.Sprintf("listener %t", listener), func(t *testing.T) {
+			rig := startJabraRig(t, false)
+			if listener {
+				rig.useListening()
+			}
+			device := rig.plugIn()
+			waitForHardware(t, "the Jabra to connect", func() bool { return device.reportsSent() > 0 })
 
-	if err := rig.controls.Pause(); err != nil {
-		t.Fatal(err)
+			if err := rig.controls.Pause(); err != nil {
+				t.Fatal(err)
+			}
+			if listener {
+				time.Sleep(50 * time.Millisecond) // about fifty light checks
+				if device.shows() || rig.capture.micState() != micListening {
+					t.Fatalf("a web pause with the listener: %v, ring Muted %t; want listening, unmuted", rig.capture.micState(), device.shows())
+				}
+				if err := rig.controls.Close(); err != nil {
+					t.Fatal(err)
+				}
+			}
+			waitForHardware(t, "the Jabra light to follow a web pause or close", device.shows)
+			if err := rig.controls.Resume(); err != nil {
+				t.Fatal(err)
+			}
+			waitForHardware(t, "the Jabra light to follow a web resume", func() bool { return !device.shows() })
+		})
 	}
-	waitForHardware(t, "the Jabra light to follow a web pause", device.shows)
-	if err := rig.controls.Resume(); err != nil {
-		t.Fatal(err)
-	}
-	waitForHardware(t, "the Jabra light to follow a web resume", func() bool { return !device.shows() })
 }
 
 // TestJabraLightShowsAPauseAtConnect fails if a unit that starts paused, or
@@ -446,16 +512,35 @@ func TestJabraLightChangesOnlyWhileTheMicrophoneIsClosed(t *testing.T) {
 }
 
 // TestJabraOwnReportWindowNeverHoldsAPause fails if a press just after Ghost
-// Wispr closed the microphone is dropped while capture records: anyone may
-// pause at any time, and only a press that would resume is held back.
+// Wispr's own operation on the capture device is dropped when it would close
+// the microphone: anyone may close it at any time, from recording or from
+// listening, and only a press that would move the unit to recording is held
+// back.
 func TestJabraOwnReportWindowNeverHoldsAPause(t *testing.T) {
-	rig := startJabraRig(t, false)
-	device := rig.plugIn()
-	waitForHardware(t, "the Jabra to connect", rig.attached)
-	rig.openMic(t)
-	rig.closeMic(t) // a reconnect, with capture still on
-	device.press(t)
-	waitForHardware(t, "a press within the window to pause capture", rig.capture.IsPaused)
+	t.Run("recording", func(t *testing.T) {
+		rig := startJabraRig(t, false)
+		device := rig.plugIn()
+		waitForHardware(t, "the Jabra to connect", rig.attached)
+		rig.openMic(t)
+		rig.closeMic(t) // a reconnect, with capture still on
+		device.press(t)
+		waitForHardware(t, "a press within the window to close the microphone", rig.capture.inClosedState)
+	})
+	t.Run("listening", func(t *testing.T) {
+		rig := startJabraRig(t, false)
+		rig.useListening()
+		device := rig.plugIn()
+		waitForHardware(t, "the Jabra to connect", rig.attached)
+		if err := rig.controls.Pause(); err != nil {
+			t.Fatal(err)
+		}
+		rig.openListener(t) // the listener's open, an own operation
+		if !rig.device.ownOperationAt(jabra.MonotonicNow()) {
+			t.Fatal("control: the listener's open is not an own operation")
+		}
+		device.press(t)
+		waitForHardware(t, "a press within the window to close a listening microphone", rig.capture.inClosedState)
+	})
 }
 
 // TestJabraPermissionWarningNamesTheUdevRule fails if a Jabra node the

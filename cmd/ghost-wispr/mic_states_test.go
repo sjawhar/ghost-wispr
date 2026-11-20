@@ -76,15 +76,19 @@ func (l *statesLight) red() bool {
 }
 
 // statesMic is the recording microphone for the mic loop: the light reads it
-// open from each open until its close. Stream blocks until the close. With
-// stuck set, a close cannot release it, as one whose read still runs
-// (audio.ErrMicStillReading), until unstick.
+// open from each open until its close. Stream delivers audio until the close.
+// After stick, its read blocks, as one that does not return, and a close
+// while it blocks cannot release the device (audio.ErrMicStillReading), until
+// unstick ends the read.
 type statesMic struct {
-	r       *micStatesRig
-	mu      sync.Mutex
-	closed  chan struct{}
-	stuck   bool
+	r      *micStatesRig
+	mu     sync.Mutex
+	closed chan struct{}
+	// unstuck is set by stick, and closed by unstick; reading says a read
+	// blocks on it.
 	unstuck chan struct{}
+	reading bool
+	blocked chan struct{} // closed once a read blocks
 }
 
 func (m *statesMic) open() error {
@@ -102,38 +106,77 @@ func (m *statesMic) Start() error  { return nil }
 
 func (m *statesMic) Close() error {
 	m.mu.Lock()
-	stuck, unstuck := m.stuck, m.unstuck
-	m.mu.Unlock()
-	if stuck {
-		select {
-		case <-unstuck:
-		default:
-			return audio.ErrMicStillReading
-		}
-	}
-	m.r.mic.open.Store(false)
-	m.r.note("mic close")
-	m.mu.Lock()
 	defer m.mu.Unlock()
-	if m.closed != nil {
-		select {
-		case <-m.closed:
-		default:
-			close(m.closed)
-		}
+	if m.reading {
+		m.r.note("mic close: still reading")
+		return audio.ErrMicStillReading
 	}
+	if m.closed == nil {
+		return nil // never opened, or closed already
+	}
+	m.r.note("mic close")
+	m.r.mic.open.Store(false)
+	close(m.closed)
+	m.closed = nil
 	return nil
 }
 
-func (m *statesMic) Stream(io.Writer) error {
+// stick makes the next read block until unstick, and returns a channel that
+// closes once it does.
+func (m *statesMic) stick() <-chan struct{} {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.unstuck, m.blocked = make(chan struct{}), make(chan struct{})
+	return m.blocked
+}
+
+// unstick ends the blocked read, with an error, as a read that returns late.
+func (m *statesMic) unstick() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.unstuck != nil {
+		close(m.unstuck)
+		m.unstuck = nil
+	}
+}
+
+// Stream delivers a 250 ms buffer of audio every 10 ms to w, as the
+// microphone does, until the close; a write error ends it, as at a pause.
+func (m *statesMic) Stream(w io.Writer) error {
 	m.mu.Lock()
 	closed := m.closed
 	m.mu.Unlock()
 	if closed == nil {
 		return errors.New("stream before open")
 	}
-	<-closed
-	return errors.New("stream closed")
+	buf := make([]byte, 2*local.SampleRate/4)
+	for i := range buf {
+		buf[i] = 7
+	}
+	for {
+		select {
+		case <-closed:
+			return errors.New("stream closed")
+		case <-time.After(10 * time.Millisecond):
+		}
+		m.mu.Lock()
+		unstuck := m.unstuck
+		if unstuck != nil {
+			m.reading = true
+			close(m.blocked)
+		}
+		m.mu.Unlock()
+		if unstuck != nil {
+			<-unstuck
+			m.mu.Lock()
+			m.reading = false
+			m.mu.Unlock()
+			return errors.New("the read returned late")
+		}
+		if _, err := w.Write(buf); err != nil {
+			return err
+		}
+	}
 }
 
 // statesCapture is the listener's ALSA capture: each read takes 10 ms and
@@ -178,28 +221,61 @@ type micStatesRig struct {
 	listenerOpen atomic.Bool
 	speaking     atomic.Bool
 	openFails    atomic.Bool
+	noLight      bool
 
-	mu         sync.Mutex
-	events     []string
-	violations []string
+	// With the pipeline option, the capture gate's writers, as main wires
+	// them: the recorder and its preroll, Deepgram's send queue, and the
+	// voice's tap.
+	recorder *audio.Recorder
+	sent     *countingWriter
+	tapped   *countingWriter
+
+	mu            sync.Mutex
+	events        []string
+	violations    []string
+	micOpens      int
+	listenerOpens int
 }
 
-// note records a stream event in order, and the handover's rule: the
-// recording microphone opens only while the listener's stream is closed, and
-// the listener's opens only while the recording microphone's is closed.
+// note records a stream event in order, and the rules every stream keeps:
+// the recording microphone opens and closes only while the light is red, and
+// only while the listener's stream is closed; the listener's opens only while
+// the recording microphone's is closed, and only in listening.
 func (r *micStatesRig) note(event string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.events = append(r.events, event)
-	switch {
-	case event == "mic open" && r.listenerOpen.Load():
-		r.violations = append(r.violations, "the recording microphone opened with the listener's stream open")
-	case event == "listener open" && r.mic.open.Load():
-		r.violations = append(r.violations, "the listener's stream opened with the recording microphone open")
-	case event == "scan" && r.listenerOpen.Load():
-		r.violations = append(r.violations, "PortAudio scanned with the listener's stream open")
-	case event == "prepare" && r.listenerOpen.Load():
-		r.violations = append(r.violations, "the recording microphone prepared to open with the listener's stream open")
+	red := r.light.red() && !r.light.refuse.Load() && !r.noLight
+	switch event {
+	case "mic open":
+		if r.listenerOpen.Load() {
+			r.violations = append(r.violations, "the recording microphone opened with the listener's stream open")
+		}
+		if !red {
+			r.violations = append(r.violations, "the recording microphone opened with the light not red")
+		}
+	case "mic close":
+		if !red {
+			r.violations = append(r.violations, "the light went off before the recording microphone closed")
+		}
+	case "listener open":
+		r.device.mu.Lock()
+		recording := r.device.open
+		r.device.mu.Unlock()
+		if r.mic.open.Load() || recording {
+			r.violations = append(r.violations, "the listener's stream opened with the recording microphone open")
+		}
+		if state := r.capture.micState(); state != micListening {
+			r.violations = append(r.violations, "the listener's stream opened in "+state.String())
+		}
+		r.listenerOpens++
+	case "scan", "prepare":
+		if r.listenerOpen.Load() {
+			r.violations = append(r.violations, event+" ran with the listener's stream open")
+		}
+	}
+	if event == "mic open" {
+		r.micOpens++
 	}
 }
 
@@ -216,19 +292,37 @@ type statesOptions struct {
 	listener bool   // voice.paused_listener
 	jabra    bool   // a Jabra's mute button is attached
 	saved    string // the saved state at start, "" for none
+	noLight  bool   // no blink(1) is plugged in; give a saved pause
+	pipeline bool   // the mic loop writes to the gate's writers as main wires them
 }
+
+// countingWriter counts the bytes written to it; with finalize, it is
+// Deepgram's stand-in.
+type countingWriter struct{ n atomic.Int64 }
+
+func (w *countingWriter) Write(p []byte) (int, error) {
+	w.n.Add(int64(len(p)))
+	return len(p), nil
+}
+
+func (*countingWriter) Finalize() error { return nil }
 
 // startMicStatesRig starts the machine. With no saved state it starts
 // recording, with the light red and the recording microphone open.
 func startMicStatesRig(t *testing.T, opts statesOptions) *micStatesRig {
 	t.Helper()
-	r := &micStatesRig{light: &statesLight{}, mic: &openMicFake{}, warnings: newWarningsRegistry(), spotter: &phraseSpotter{}}
+	r := &micStatesRig{light: &statesLight{}, mic: &openMicFake{}, warnings: newWarningsRegistry(), spotter: &phraseSpotter{}, noLight: opts.noLight}
 	r.store = &lockedPauseStore{}
 	if opts.saved != "" {
 		r.store.values = map[string]string{storage.AppStateCapturePaused: opts.saved}
 	}
 	originalOpen, originalCheck, originalRetry := openBlink1, lightCheckEvery, lightRetryEvery
-	openBlink1 = func(string, string) (indicator.Light, error) { return r.light, nil }
+	openBlink1 = func(string, string) (indicator.Light, error) {
+		if opts.noLight {
+			return nil, indicator.ErrNoBlink1
+		}
+		return r.light, nil
+	}
 	lightCheckEvery = 20 * time.Millisecond
 	lightRetryEvery = 5 * time.Millisecond
 	r.capture = newCaptureGate(nil, nil, nil)
@@ -298,16 +392,29 @@ func startMicStatesRig(t *testing.T, opts statesOptions) *micStatesRig {
 	})
 
 	r.recMic = &statesMic{r: r}
+	streamer := orderedMic{micStreamer: r.recMic, device: r.device}
 	if saved == micRecording {
-		// As startMicrophone does: the microphone opens under a red
-		// confirmation, then the mic loop streams it.
-		if err := r.capture.openUnderRed(r.recMic.open); err != nil {
+		// As startMicrophone does: the microphone opens through the capture
+		// device under a red confirmation, then the mic loop streams it.
+		if err := r.capture.openUnderRed(streamer.Open); err != nil {
 			t.Fatal(err)
 		}
 	}
-	loops.Go(func() {
-		streamMicWithRetry(ctx, r.capture, orderedMic{micStreamer: r.recMic, device: r.device}, io.Discard, func(time.Duration) {}, nopLogf, nil)
-	})
+	if opts.pipeline {
+		r.recorder = audio.NewRecorder(t.TempDir())
+		if err := r.recorder.SetSampleRate(local.SampleRate); err != nil {
+			t.Fatal(err)
+		}
+		// As newSessionCaptureGate does: every microphone close drops the
+		// preroll.
+		r.capture.dropHeldAudio = r.recorder.DiscardPreroll
+		r.sent, r.tapped = &countingWriter{}, &countingWriter{}
+		startMicMonitoring(ctx, &loops, r.capture, streamer, r.recorder, r.sent, r.tapped, func(time.Duration) {}, nopLogf, nil)
+	} else {
+		loops.Go(func() {
+			streamMicWithRetry(ctx, r.capture, streamer, io.Discard, func(time.Duration) {}, nopLogf, nil)
+		})
+	}
 	if saved == micRecording {
 		r.requireState(t, micRecording, "at start")
 	}
@@ -317,6 +424,42 @@ func startMicStatesRig(t *testing.T, opts statesOptions) *micStatesRig {
 		waitForStates(t, "the paused listener to start", r.controls.canListen)
 	}
 	return r
+}
+
+// tour drives a recording rig through every transition of the control table
+// at least once, requiring each state as it goes.
+func (r *micStatesRig) tour(t *testing.T) {
+	t.Helper()
+	steps := []struct {
+		what string
+		do   func()
+		to   micState
+	}{
+		{"the page's pause", func() { _ = r.hooks.Pause() }, micListening},
+		{"the phrase", r.saidPhrase, micRecording},
+		{"the power button", func() { <-r.power.press(nil, nil) }, micListening},
+		{"the Jabra's button from listening", func() { r.pressJabra(t) }, micClosed},
+		{"the Jabra's button from closed", func() { r.pressJabra(t) }, micRecording},
+		{"the Jabra's button from recording", func() { r.pressJabra(t) }, micClosed},
+		{"the power button from closed", func() { <-r.power.press(nil, nil) }, micRecording},
+		{"POST /api/close from recording", func() { _ = r.hooks.Close() }, micClosed},
+		{"the page's resume from closed", func() { _ = r.hooks.Resume() }, micRecording},
+		{"the page's pause again", func() { _ = r.hooks.Pause() }, micListening},
+		{"POST /api/close from listening", func() { _ = r.hooks.Close() }, micClosed},
+		{"the page's resume", func() { _ = r.hooks.Resume() }, micRecording},
+	}
+	for _, step := range steps {
+		step.do()
+		r.requireState(t, step.to, step.what)
+	}
+}
+
+// opens reports how many times the recording microphone and the listener
+// opened.
+func (r *micStatesRig) opens() (mic, listener int) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.micOpens, r.listenerOpens
 }
 
 // waitForStates waits up to testWait for cond.
@@ -378,7 +521,10 @@ func (r *micStatesRig) requireState(t *testing.T, state micState, after string) 
 			return
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("%s: %v; want %v (warnings %q)", after, got, want(state), r.warnings.List())
+			r.mu.Lock()
+			events := slices.Clone(r.events[max(0, len(r.events)-12):])
+			r.mu.Unlock()
+			t.Fatalf("%s: %v; want %v (warnings %q; last stream events %v)", after, got, want(state), r.warnings.List(), events)
 		}
 		r.hardware.Wake()
 		time.Sleep(2 * time.Millisecond)
