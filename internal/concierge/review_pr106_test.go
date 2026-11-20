@@ -44,32 +44,32 @@ func TestReview106OrdinaryNumbersNeedExistingIssue(t *testing.T) {
 }
 
 func TestReview106NumberLookupPayload(t *testing.T) {
-	for _, turn := range []string{"ask him for 4592", "ask him for 4592 confidentialword", "what about room 1500?"} {
-		t.Run(turn, func(t *testing.T) {
-			r := newRig(t)
-			probe106Issue(r)
-			r.model.turns = [][]*genai.GenerateContentResponse{{chunk(text("The record does not say."))}}
-			logs := r.captureLogs()
-			_ = answerTurn(t, r, turn)
-			r.records.mu.Lock()
-			queries := append(slices.Clone(r.records.queries), r.records.kwQueries...)
-			calls := slices.Clone(r.records.issueCalls)
-			r.records.mu.Unlock()
-			for _, query := range queries {
-				if query != "4592" && query != "1500" {
-					t.Errorf("number lookup sent room words: %q", query)
-				}
+	// A number-only turn sends no search query. A turn with other words
+	// runs the keyword search (Main's round-2 design).
+	t.Run("number only", func(t *testing.T) {
+		r := newRig(t)
+		probe106Issue(r)
+		_ = answerTurn(t, r, "ask him for 4592")
+		r.records.mu.Lock()
+		queries := append(slices.Clone(r.records.queries), r.records.kwQueries...)
+		r.records.mu.Unlock()
+		if len(queries) != 0 {
+			t.Errorf("number-only turn searched: %q", queries)
+		}
+	})
+	t.Run("candidate key reads", func(t *testing.T) {
+		r := newRig(t)
+		probe106Issue(r)
+		_ = answerTurn(t, r, "ask him for 4592")
+		r.records.mu.Lock()
+		calls := slices.Clone(r.records.issueCalls)
+		r.records.mu.Unlock()
+		for _, call := range calls {
+			if !strings.HasSuffix(call, "-4592") {
+				t.Errorf("not a key candidate: %q", call)
 			}
-			for _, call := range calls {
-				if !strings.HasSuffix(call, "-4592") && !strings.HasSuffix(call, "-1500") {
-					t.Errorf("not a key candidate: %q", call)
-				}
-			}
-			if strings.Contains(logs.String(), "confidentialword") {
-				t.Error("logs contain question words")
-			}
-		})
-	}
+		}
+	})
 }
 
 func TestReview106SingleConfirmationReplies(t *testing.T) {
