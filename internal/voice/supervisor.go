@@ -785,7 +785,9 @@ func (s *Supervisor) onTranscriptLocked(t *Transcript) {
 // neverMindLocked answers "Wispr, never mind" (R7): the Concierge cancels the
 // session's newest working question; with none, the session's newest held
 // answer by arrival is dropped, and nothing of it plays: once no answer
-// waits, an answer sound queued or still playing stops. Never minds decide
+// waits, an answer sound queued or still playing stops. A raised hand is no
+// answer: never mind leaves it up, and its sound plays on; only its agent,
+// its expiry or its meeting takes it down. Never minds decide
 // one after another, each once the Concierge answered it, so two in a row
 // cancel and drop as if each waited for the last. The answer a never mind
 // drops is the newest of those held when it was said that no "Wispr, go
@@ -801,7 +803,7 @@ func (s *Supervisor) neverMindLocked(sessionID string) {
 	said, asked := s.commands, s.cfg.Concierge.QuestionsAsked()
 	var candidates []*pendingAnswer
 	for _, p := range s.pending {
-		if p.SessionID == sessionID {
+		if p.SessionID == sessionID && p.hand == nil {
 			candidates = append(candidates, p)
 		}
 	}
@@ -838,7 +840,7 @@ func (s *Supervisor) neverMindLocked(sessionID string) {
 		default:
 			s.pending = slices.DeleteFunc(s.pending, func(p *pendingAnswer) bool { return p == held })
 			s.logf("voice: never mind dropped a held answer (task %s)", held.TaskID)
-			if len(s.pending) == 0 {
+			if !slices.ContainsFunc(s.pending, func(p *pendingAnswer) bool { return p.hand == nil }) {
 				s.cutAnswerSoundLocked()
 			}
 			s.showWaitingLocked()
@@ -853,8 +855,12 @@ func (s *Supervisor) neverMindLocked(sessionID string) {
 const chimeQueueLasts = 400 * time.Millisecond
 
 // cutAnswerSoundLocked stops the answer sound queued or still playing: once
-// its last answer is dropped, nothing of it plays.
+// its last answer is dropped, nothing of it plays. The hand sound, which is
+// for the hands still up, plays on.
 func (s *Supervisor) cutAnswerSoundLocked() {
+	if s.chimeHands {
+		return // the sound playing, or the last one queued, is the hand sound
+	}
 	playing := s.chimeCancel != nil || time.Since(s.chimeQueuedAt) < chimeQueueLasts
 	if s.chimeCancel != nil {
 		s.chimeCancel() // even one whose playback has not begun
@@ -1464,6 +1470,7 @@ func (s *Supervisor) handEndedLocked(ex *exchange, p *pendingAnswer) {
 	}
 	ex.answer = nil
 	s.pending = slices.DeleteFunc(s.pending, func(q *pendingAnswer) bool { return q == p })
+	s.showWaitingLocked()
 	s.handDoneLocked(p, HandWithdrawn)
 	s.endLocked(ex, true, "its membership ended")
 }

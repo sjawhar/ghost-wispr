@@ -112,6 +112,7 @@ func (s *Supervisor) RaiseHand(h *Hand) error {
 		hand:          &hand,
 		needsInvite:   true,
 	})
+	s.showWaitingLocked() // a raised hand waits for a person, as a held answer does
 	return nil
 }
 
@@ -128,6 +129,7 @@ func (s *Supervisor) LowerHands(membership string) {
 		s.handDoneLocked(p, HandWithdrawn)
 		return true
 	})
+	s.showWaitingLocked()
 }
 
 // handDoneLocked tells HandDone how p, when it is a hand, came down.
@@ -148,6 +150,7 @@ func (s *Supervisor) dropExpiredLocked(now time.Time) {
 		s.handDoneLocked(p, HandExpired)
 		return true
 	})
+	s.showWaitingLocked()
 }
 
 // dropWithdrawnLocked takes down the hands whose membership is no longer
@@ -160,6 +163,7 @@ func (s *Supervisor) dropWithdrawnLocked() {
 		s.handDoneLocked(p, HandWithdrawn)
 		return true
 	})
+	s.showWaitingLocked()
 }
 
 // handsUpLocked says, in an exchange of its own, which agents of meeting

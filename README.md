@@ -145,10 +145,11 @@ The blink(1) has two LEDs. LED 1, the top one (`blink1-tool --led 1`), is the re
 means the unit records. Every check reads LED 1 alone back, and only exact red (255,0,0) lets audio
 through; a read that fails, or any other colour, stops capture as above. The recorder writes both
 LEDs red while it records and both off when it stops. LED 2, the bottom one, flashes green, half a
-second on and half a second off, while an agent's answer waits for "Wispr, go ahead" (see "Meeting
-voice"). It goes back to red once nothing waits: the answer is spoken, "Wispr, never mind" drops it,
-or its session ends. At a pause, a light hold or shutdown it goes off with LED 1, and it never
-flashes while the unit does not record. It flashes only while room audio reaches the recording:
+second on and half a second off, while an agent's answer or a joined agent's raised hand waits for
+"Wispr, go ahead" (see "Meeting voice"). It goes back to red once nothing waits: the answer or the
+hand is spoken, "Wispr, never mind" drops the answer, the hand comes down, or its session ends. At
+a pause, a light hold or shutdown it goes off with LED 1, and it never flashes while the unit does
+not record. It flashes only while room audio reaches the recording:
 while LED 1 is red for another reason, as while the microphone closes after a pause or reopens,
 LED 2 shows red. A check that finds LED 1 not red writes both LEDs red, and LED 2 stays red until a
 check finds LED 1 red again. A flash writes LED 2 alone, holds the lock below as every command
@@ -389,12 +390,13 @@ that joined on ABC-12 before the issue's claim in Dispatch, and reaches it once.
 
 A floor request is at most 50 words as the room hears them, the attribution the voice says first
 ("ABC-12's agent says:") included, written for the ear, at most one in 5 minutes for an agent.
-The room hears a short two-tap sound at the next gap; the light does not change, since the agent's
-words are played, not heard. The voice says them, after the agent's issue key, only when a person
-says "Wispr, go ahead" ("Wispr, go ahead, ABC-12" picks one of several), and drops them after 60 s;
-the agent is told which. "Wispr, who has a hand up?" names the agents waiting. An agent leaves when
-it says so, when the meeting ends or is deleted, when the voice stops, or when Envoy lists its
-session as not live for 10 minutes.
+The room hears a short two-tap sound at the next gap, and LED 2 flashes green while the hand is up,
+as it does for a waiting answer; LED 1 stays red. The voice says the words, after the agent's issue
+key, only when a person says "Wispr, go ahead" ("Wispr, go ahead, ABC-12" picks one of several),
+and drops them after 60 s; the agent is told which. "Wispr, never mind" leaves a hand up: it drops
+answers only. "Wispr, who has a hand up?" names the agents waiting. An agent leaves when it says
+so, when the meeting ends or is deleted, when the voice stops, or when Envoy lists its session as
+not live for 10 minutes.
 
 ## Deployment
 
