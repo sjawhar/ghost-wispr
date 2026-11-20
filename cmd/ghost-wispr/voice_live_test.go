@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
-	"log/slog"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -16,6 +15,7 @@ import (
 	"github.com/sjawhar/ghost-wispr/internal/audio"
 	"github.com/sjawhar/ghost-wispr/internal/concierge"
 	"github.com/sjawhar/ghost-wispr/internal/config"
+	"github.com/sjawhar/ghost-wispr/internal/logging"
 	"github.com/sjawhar/ghost-wispr/internal/voice"
 	"github.com/sjawhar/ghost-wispr/internal/voice/gptlive"
 )
@@ -285,17 +285,18 @@ func TestALazyConciergeThatCannotStartAnswersUnreachable(t *testing.T) {
 }
 
 // TestVoiceTimingIsLogged fails if a timing event does not reach the journal
-// as the acceptance driver reads it.
+// as the acceptance driver reads it: through logging.New, the logger the
+// service writes its journal with, as message "voice timing".
 func TestVoiceTimingIsLogged(t *testing.T) {
 	var buf bytes.Buffer
-	logger := slog.New(slog.NewJSONHandler(&buf, nil))
+	logger := logging.New(&buf, "info")
 	at := time.Date(2026, 11, 19, 9, 0, 0, 5, time.UTC)
 	voiceTiming(logger)("stop", "s1", at, "reason", "Jabra button")
 	var line map[string]any
 	if err := json.Unmarshal(buf.Bytes(), &line); err != nil {
 		t.Fatalf("%v: %s", err, buf.Bytes())
 	}
-	if line["msg"] != "voice timing" || line["event"] != "stop" || line["session_id"] != "s1" || line["reason"] != "Jabra button" || line["at_unix_ns"] != float64(at.UnixNano()) {
+	if line["message"] != "voice timing" || line["event"] != "stop" || line["session_id"] != "s1" || line["reason"] != "Jabra button" || line["at_unix_ns"] != float64(at.UnixNano()) {
 		t.Fatalf("logged %s", buf.Bytes())
 	}
 }

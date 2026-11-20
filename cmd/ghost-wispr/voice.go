@@ -287,8 +287,8 @@ func (v *voiceSource) warnBuild(enabled bool, warnings *warningsRegistry) {
 }
 
 // voiceTiming writes the Supervisor's timing events to the journal, as the
-// acceptance driver reads them: msg "voice timing", with event, session_id
-// and at_unix_ns.
+// acceptance driver reads them: message "voice timing" (the key logging.New
+// writes), with event, session_id and at_unix_ns.
 func voiceTiming(logger *slog.Logger) func(event, sessionID string, at time.Time, kv ...any) {
 	return func(event, sessionID string, at time.Time, kv ...any) {
 		attrs := append([]any{"event", event, "session_id", sessionID, "at_unix_ns", at.UnixNano()}, kv...)

@@ -100,9 +100,10 @@ usage() {
   cat <<EOF
 Usage: deploy/pi/accept-voice.sh [--step NAME] [options]
 
-Run on the Pi as the ghost-wispr user, outside meetings. The steps that play sound need the unit
-paused with no session active, and the ALSA loopback loaded (sudo modprobe snd-aloop;
-docs/pi-setup.md, "Inject speech for acceptance").
+Run on the Pi as the ghost-wispr user, outside meetings. The steps that read the service's journal
+use sudo -n, as the Pi keeps no user journal. The steps that play sound need the unit paused with
+no session active, and the ALSA loopback loaded (sudo modprobe snd-aloop; docs/pi-setup.md,
+"Inject speech for acceptance").
 
 Steps:
   exchange (default)  one question: voice_wake, voice_exchange_started and voice_spoken on /ws, a
@@ -513,15 +514,23 @@ check_voice_event() {
   whole_number "$event_at" || unknown "$name: cannot read its timestamp: $event"
 }
 
-# journal_lines: what ghost-wispr.service wrote to the user journal since this unit run's restart.
+# journal_lines: what the service's running process wrote to the journal. The Pi keeps no user
+# journal, so this reads the system journal as root, the user unit's lines from its main process,
+# in this boot and since this unit run's restart: a process ID recurs, within a boot and across
+# boots of a persistent journal.
 journal_lines() {
-  journalctl --user -u "$unit" -o cat --since "@$((restart_ms / 1000 - 1))" 2>/dev/null
+  sudo -n journalctl _SYSTEMD_USER_UNIT="$unit" _PID="$unit_pid" -o cat --boot=0 --since "@$((restart_ms / 1000 - 1))" 2>"$work_dir/journal.err"
 }
 
-# journal_records MSG: the service's JSON log records with that msg since the restart, compact,
-# one a line.
+# journal_error: what the last journal read printed on stderr, to say why a read failed.
+journal_error() {
+  [[ -s $work_dir/journal.err ]] && printf ': %s' "$(head -c 300 "$work_dir/journal.err" | paste -sd ' ' -)"
+}
+
+# journal_records MESSAGE: the service's JSON log records with that message, compact, one a line.
+# The service's logger (internal/logging, New) writes the message under the key "message".
 journal_records() {
-  journal_lines | jq -R -c --arg msg "$1" 'fromjson? | select(type == "object" and .msg == $msg)' 2>/dev/null
+  journal_lines | jq -R -c --arg message "$1" 'fromjson? | select(type == "object" and .message == $message)' 2>/dev/null
 }
 
 # timing_events: the voice timing log since the restart: {event, session_id, reason, at}, at in Unix
@@ -544,7 +553,8 @@ timing_at=
 wait_for_timing() {
   local found
   while :; do
-    found=$(timing_first "$1" "$2" 9999999999999)
+    found=$(timing_first "$1" "$2" 9999999999999) \
+      || unknown "voice timing log: cannot read the journal of $unit (process $unit_pid)$(journal_error)"
     if [[ -n $found ]]; then
       timing_at=$found
       return 0
@@ -557,7 +567,9 @@ wait_for_timing() {
 # timing_fail REASON: a timing line did not come. With no "voice timing" line at all since the
 # restart, the build does not write the log, and the step read nothing: UNKNOWN. Otherwise FAIL.
 timing_fail() {
-  [[ -n $(timing_events) ]] \
+  local events
+  events=$(timing_events) || unknown "voice timing log: cannot read the journal of $unit (process $unit_pid)$(journal_error)"
+  [[ -n $events ]] \
     || unknown "voice timing log: the journal of $unit holds no \"voice timing\" line since its restart; this build does not write the timing log"
   fail "$1"
 }
@@ -566,10 +578,14 @@ timing_fail() {
 # service writes "ghost-wispr: starting" there at each start. A blind read would make every missing
 # timing line look like a voice that did nothing.
 check_timing_log() {
-  local deadline=$(($(now_ms) + 10000))
-  until journal_lines | grep -Fq 'ghost-wispr: starting'; do
+  local deadline=$(($(now_ms) + 10000)) lines
+  while :; do
+    lines=$(journal_lines) || unknown "voice timing log: cannot read the journal of $unit (process $unit_pid)$(journal_error)"
+    # Read journalctl to completion before looking for the marker. With pipefail, grep -q
+    # closing a full pipe early would turn a readable journal into a failed read (SIGPIPE).
+    grep -Fq 'ghost-wispr: starting' <<<"$lines" && break
     (($(now_ms) < deadline)) \
-      || unknown "voice timing log: journalctl --user -u $unit shows nothing from the service since its restart, so its timing lines cannot be read"
+      || unknown "voice timing log: sudo journalctl _SYSTEMD_USER_UNIT=$unit _PID=$unit_pid shows nothing from the service since its restart, so its timing lines cannot be read"
     sleep 0.5
   done
   pass "voice timing log: the journal of $unit reads from its restart"
@@ -756,7 +772,7 @@ trap 'interrupted INT 130' INT
 trap 'interrupted TERM 143' TERM
 trap 'interrupted HUP 129' HUP
 
-for command in curl jq python3 systemctl journalctl; do
+for command in curl jq python3 systemctl journalctl sudo; do
   command -v "$command" >/dev/null || refuse "missing required command: $command"
 done
 work_dir=$(mktemp -d) || refuse 'cannot make a private directory'
@@ -764,6 +780,7 @@ work_dir=$(mktemp -d) || refuse 'cannot make a private directory'
 # ---- the unit's run: the service on the loopback, capturing ----
 
 unit_runs=0
+unit_pid=
 restart_ms=0
 voice_off_reason=
 
@@ -771,7 +788,7 @@ voice_off_reason=
 # .env in place of the .env's own KEY, then subscribe to /ws and resume capture, from the loopback.
 # It returns 3, with voice_off_reason set, when the service started with its meeting voice off.
 start_unit_run() {
-  local setting keys=() pattern status_json service_pid environment resume_sent deadline
+  local setting keys=() pattern status_json environment resume_sent deadline
   for setting in "$@"; do
     keys+=("${setting%%=*}")
   done
@@ -792,8 +809,8 @@ start_unit_run() {
   restart_ms=$(now_ms)
   service restart || fail "loopback: could not restart $unit"
   status_json=$(wait_for_status "$restart_seconds") || fail "loopback: $unit did not answer within $restart_seconds s of its restart"
-  service_pid=$(service show --property=MainPID --value 2>/dev/null)
-  environment=$(tr '\0' '\n' <"/proc/$service_pid/environ") || fail "loopback: cannot read the environment of $unit (process $service_pid)"
+  unit_pid=$(service show --property=MainPID --value 2>/dev/null)
+  environment=$(tr '\0' '\n' <"/proc/$unit_pid/environ") || fail "loopback: cannot read the environment of $unit (process $unit_pid)"
   for setting in "$@"; do
     grep -Fqx -- "$setting" <<<"$environment" || fail "loopback: $unit does not run with $setting"
   done
@@ -1200,7 +1217,9 @@ step_scripted() {
       wait_for_timing fact_audio "$clip_started" $((clip_ended + event_timeout * 1000)) \
         || timing_fail "scripted $engine question $((i + 1)) (${clip##*/}): no sentence marked fact_audio in the timing log within $event_timeout s"
       fact_at+=("$timing_at")
-      first_at+=("$(timing_first first_audio "$clip_started" "$timing_at")")
+      path=$(timing_first first_audio "$clip_started" "$timing_at") \
+        || unknown "voice timing log: cannot read the journal of $unit (process $unit_pid)$(journal_error)"
+      first_at+=("$path")
       wait_spoken $((i + 1)) $((clip_ended + event_timeout * 1000)) "scripted $engine question $((i + 1))"
       sleep "$idle_seconds"
     done
@@ -1407,7 +1426,12 @@ step_ask_holder() {
     || fail "ask-holder: no voice_answer_ready within $answer_timeout s of the question; the holder of $issue_live reads $holder_text, and no answer was spoken"
   check_voice_event voice_answer_ready "$ready" "$session"
   pass "ask-holder: voice_answer_ready on /ws, same session_id"
-  if whole_number "${asked:-}" && answer_at=$(timing_first answer_ready "$asked" 9999999999999) && [[ -n $answer_at ]]; then
+  answer_at=
+  if whole_number "${asked:-}"; then
+    answer_at=$(timing_first answer_ready "$asked" 9999999999999) \
+      || unknown "voice timing log: cannot read the journal of $unit (process $unit_pid)$(journal_error)"
+  fi
+  if [[ -n $answer_at ]]; then
     note "ask-holder: measurement 4: $((answer_at - asked)) ms from the send to the answer (answer_ready)"
   else
     note 'ask-holder: measurement 4: no answer_ready line in the timing log to time the reply by'
@@ -1442,8 +1466,11 @@ step_ask_holder() {
     || fail "ask-holder: question $second is not cancelled within $event_timeout s of \"never mind\""
   pass "ask-holder: question $second is cancelled"
   deadline=$(($(now_ms) + event_timeout * 1000))
-  until told=$(journal_records 'concierge told an agent its question was cancelled' \
-    | jq -r --arg id "$second" 'select(.task == $id) | .request // ""' | head -n 1) && [[ -n $told ]]; do
+  while :; do
+    told=$(journal_records 'concierge told an agent its question was cancelled' \
+      | jq -r -s --arg id "$second" 'map(select(.task == $id) | .request // "") | .[0] // ""') \
+      || unknown "ask-holder: cannot read the cancellation lines from the journal of $unit (process $unit_pid)$(journal_error)"
+    [[ -n $told ]] && break
     (($(now_ms) < deadline)) || fail "ask-holder: the journal has no \"concierge told an agent its question was cancelled\" for question $second"
     sleep 0.5
   done
@@ -1496,7 +1523,8 @@ step_barge_in() {
     limit=$((clip_started + stop_window_ms))
     # Wait out the window, then the end of the answer if it goes on.
     while (($(now_ms) < limit)); do sleep 0.2; done
-    stop_at=$(timing_first stop "$clip_started" 9999999999999)
+    stop_at=$(timing_first stop "$clip_started" 9999999999999) \
+      || unknown "voice timing log: cannot read the journal of $unit (process $unit_pid)$(journal_error)"
     if [[ -z $stop_at ]]; then
       wait_spoken $((spoken_count + 1)) $(($(now_ms) + event_timeout * 1000)) "barge-in round $((i + 1))"
     fi
@@ -1691,9 +1719,11 @@ step_playback_cancel() {
   ((max <= queue_max_ms)) || fail "playback-cancel: a stop left $max ms queued in ALSA, more than $queue_max_ms ms"
   pass "playback-cancel: every stop left at most $queue_max_ms ms queued in ALSA (the most $max ms, over $stops stops)"
   note "playback-cancel: the Jabra went quiet a median $(percentile 50 "${silences[@]}") ms after a stop, the longest $(maximum "${silences[@]}") ms"
-  streams=$(journal_records 'speaker stream' | grep -c .)
+  streams=$(journal_records 'speaker stream' | jq -s 'length') \
+    || unknown "playback-cancel: cannot read the speaker stream lines from the journal$(journal_error)"
   ((streams > 0)) || unknown "playback-cancel: the journal has no \"speaker stream\" line, so the speaker's underrun lines cannot be read"
-  underruns=$(journal_records 'speaker underrun' | grep -c .)
+  underruns=$(journal_records 'speaker underrun' | jq -s 'length') \
+    || unknown "playback-cancel: cannot read the speaker underrun lines from the journal$(journal_error)"
   xruns=$(awk '$1 != "rate" { if ($2 == "XRUN" && last != "XRUN") n++; last = $2 } END { print n + 0 }' "$poll_log")
   ((underruns == 0)) || fail "playback-cancel: the speaker logged $underruns underruns over $((played / 1000)) s of playback"
   ((xruns == 0)) || fail "playback-cancel: the speaker logged no underrun, but the poller saw its stream in XRUN $xruns times"
