@@ -28,7 +28,7 @@ func TestReadmeStatesVoiceConsent(t *testing.T) {
 		"`POST /api/close` and the page's Close microphone close it from every state",
 		"A pause saved before the listener comes back closed",
 		"A saved listening comes back closed at start-up until the Jabra's button is",
-		"The service unit sets `LimitCORE=0` and\n`MemorySwapMax=0`",
+		"The service unit sets `LimitCORE=0` and `MemorySwapMax=0`",
 		"Voice A, text-to-speech (`voice.engine: tts`), sends no room audio anywhere",
 		"The asker's words after the wake phrase go to the Concierge's model",
 		"The text Wispr speaks goes to the text-to-speech provider",

@@ -139,6 +139,8 @@ func TestPatchConfigChangesTheVoiceAndKeepsItsOtherFields(t *testing.T) {
 		TTSModel:    "aura-2-example-en",
 		TTSVoice:    "example",
 		TTSLocation: "europe-west4",
+		// The listener's threads are never in the file: the default, 1.
+		PausedListenerThreads: 1,
 		GPTLive: config.GPTLive{
 			OpenAIIdentityProviderID: "idp-example",
 			OpenAIServiceAccountID:   "sa-example",
