@@ -154,7 +154,8 @@ Linux it plays through the ALSA playback device that `speaker_device` names (a P
 `plughw:CARD=J75,DEV=0`, or a sound card's id or name, as `Jabra`), opening no microphone and
 needing no red light, so it speaks while capture is paused. It opens one stream at the device's
 native rate when the first sound is queued, mixes the voice and the chimes into it, and closes it
-0.3 s after the last sound.
+0.3 s after the last sound. While a chime plays, the voice plays 15 dB down, so that the two never
+clip together; it goes down over 10 ms before the chime starts, and back up over 10 ms after.
 
 The microphone is never open while the blink(1) is off. The light stays red while the microphone is
 open, and goes off only once the recorder has closed it: after a pause, once no audio has reached

@@ -11,11 +11,20 @@ import (
 	"time"
 )
 
-// Inputs the Output mixes. Any other name makes an input of its own.
+// Inputs the Output mixes. Any other name makes an input of its own. While
+// the chime input has a sound to play, the voice input is ducked (duckGain).
 const (
 	InputVoice = "voice"
 	InputChime = "chime"
 )
+
+// duckGain is the voice input's gain while a sound plays on the chime input:
+// 15 dB down. Wispr's speech reaches +0.9 dBTP and its loudest sound -3.9
+// dBTP, so ducked, the speech and the sound together stay 1.5 dB under full
+// scale; and each sound, 4.6 to 6.4 LU softer than the loudest of the speech,
+// is 8.8 LU or more louder than the speech under it (TestSoundsOverSpeech).
+// The sound itself keeps its level.
+const duckGain float32 = 0.17782794 // 10^(-15/20)
 
 // MaxWriteFrame is the longest frame Playback.Write takes.
 const MaxWriteFrame = 20 * time.Millisecond
@@ -125,9 +134,11 @@ type SpeechEvent struct {
 // passed with nothing queued on any; Opening and Closing bracket it. Each
 // input takes PCM16 at the rate its writer declares and resamples it to the
 // stream's, holds at most InputQueue, and reports its speech starting and
-// ending. Cancel silences an input before the next frame: it takes back what
-// the device holds (PlaybackStream.Drop) and plays the other inputs' part of
-// it again.
+// ending. While the chime input has a sound to play, the voice input plays
+// 15 dB down (duckGain), so that the two never clip together; its gain moves
+// over one frame, and down before the sound starts. Cancel silences an input
+// before the next frame: it takes back what the device holds
+// (PlaybackStream.Drop) and plays the other inputs' part of it again.
 //
 // On Linux the stream is the ALSA playback PCM the Device setting names, and
 // nothing else: no capture device, and no PortAudio, whose initialization
@@ -155,6 +166,11 @@ type Output struct {
 	// pos is how many samples the open stream has been given, the position
 	// of the next frame.
 	pos int64
+	// ducked is how far the voice input was ducked at the end of the last
+	// frame mixed: 0 at its full gain, 1 at duckGain; voicePlayed is whether
+	// it had audio in that frame.
+	ducked      float32
+	voicePlayed bool
 	// wake has a value once a Write queued audio, or on Close, for the mixer
 	// waiting without a stream.
 	wake chan struct{}
@@ -883,11 +899,17 @@ func (o *Output) wrote(seq uint64) {
 func (o *Output) mixFrame(frame []int16, sum []float32, rate, hist int, now time.Time) (active bool) {
 	clear(sum)
 	o.mixed++
+	voice, chime := o.inputs[InputVoice], o.inputs[InputChime]
+	from, to, hold := o.duck(voice, chime)
 	for _, in := range o.order {
 		if len(in.contrib) != len(frame) || len(in.history) != hist {
 			in.contrib, in.history, in.histPos = make([]float32, len(frame)), make([]float32, hist), 0
 		}
-		if in.idle() {
+		switch {
+		case in == chime && hold:
+			// The voice goes down over this frame; the sound starts on the next.
+			clear(in.contrib)
+		case in.idle():
 			clear(in.contrib)
 			if in.speaking {
 				if in.quietAt.IsZero() {
@@ -896,10 +918,13 @@ func (o *Output) mixFrame(frame []int16, sum []float32, rate, hist int, now time
 					o.endSpeech(in, now, false)
 				}
 			}
-		} else {
+		default:
 			queued := in.n > 0
 			in.seq = o.mixed
 			audioEnd := in.render(rate)
+			if in == voice {
+				duckVoice(in.contrib, from, to)
+			}
 			for i, c := range in.contrib {
 				sum[i] += c
 			}
@@ -925,6 +950,39 @@ func (o *Output) mixFrame(frame []int16, sum []float32, rate, hist int, now time
 	}
 	o.pos += int64(len(frame))
 	return active
+}
+
+// duck decides how the voice input is ducked over the next frame: from and
+// to are how far down it is at the frame's start and end (0 at its full gain,
+// 1 at duckGain), and hold keeps the chime input's sound back for the frame,
+// so that the voice is down before the sound starts. A voice that played
+// nothing in the last frame takes its gain at once: no one heard it change.
+// The caller holds mu.
+func (o *Output) duck(voice, chime *outputInput) (from, to float32, hold bool) {
+	if chime != nil && !chime.idle() {
+		to = 1
+	}
+	from = o.ducked
+	playing := voice != nil && !voice.idle()
+	if !playing || !o.voicePlayed {
+		from = to
+	}
+	o.ducked, o.voicePlayed = to, playing
+	return from, to, from < to
+}
+
+// duckVoice scales the voice's part of a frame from how far down it is at
+// the frame's start to how far at its end, linearly over the frame, so that
+// a change of gain does not click.
+func duckVoice(contrib []float32, from, to float32) {
+	if from == 0 && to == 0 {
+		return
+	}
+	n := float32(len(contrib))
+	for i := range contrib {
+		down := from + (to-from)*float32(i+1)/n
+		contrib[i] *= 1 - down*(1-duckGain)
+	}
 }
 
 // retake mixes again, into redo, the last len(redo) samples the stream took
