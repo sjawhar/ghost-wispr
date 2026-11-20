@@ -224,7 +224,10 @@ machine that reaches the Pi over SSH.
 the user services; verifies and installs the newest release; restarts a running recorder so it
 reads the configuration it installed; enables Tailscale Serve; and then starts the detached
 tagged-device join. The restart ends a conversation that is being recorded, so provision outside
-meetings.
+meetings. The detached join runs `tailscale up` with `--accept-routes=false`, so the Pi joins with
+the tailnet's subnet routes off. Then it runs the route check of "Accept the tailnet's subnet
+routes". It accepts the routes (`tailscale set --accept-routes`) only when no peer's
+`PrimaryRoutes` overlaps a network of the Pi.
 
 The Ghost Wispr user service starts only once the Pi's clock is synchronized. The Pi has no
 battery-backed clock, so at boot its clock is behind until a time server sets it, and a session
@@ -279,7 +282,8 @@ Then check the join and the name:
 
 ```bash
 ssh ghost-wispr@ghost-wispr 'tailscale status --self --json'
-ssh ghost-wispr@ghost-wispr 'journalctl -u "ghost-wispr-tailnet-join-*"'
+ssh ghost-wispr@ghost-wispr 'sudo journalctl -u "ghost-wispr-tailnet-join-*"'
+ssh ghost-wispr@ghost-wispr 'tailscale debug prefs' | jq .RouteAll
 curl -fsS https://ghost-wispr.tail12ec1c.ts.net/api/version
 ```
 
@@ -288,6 +292,10 @@ The status must show exactly `Tags: ["tag:ghost-wispr"]` and
 valid certificate. If the certificate check fails, set Serve again
 (`ssh ghost-wispr@ghost-wispr 'sudo tailscale serve --bg --https 443 http://127.0.0.1:8080'`) and
 run `curl` again.
+
+`jq` prints `RouteAll`, the Pi's Tailscale setting that `--accept-routes` controls. It must read
+`true` after the join's route check accepted the routes, and `false` after the check refused them.
+After a refusal, the journal says why. "Accept the tailnet's subnet routes" says how to fix it.
 
 Then reboot the Pi once and wait until `curl` above answers again:
 
@@ -300,6 +308,88 @@ keeps the listener it opened on the temporary device's tailnet address, `<old 10
 address>%tailscale0:443`, although that address is no longer on the interface. On the office Pi
 on 2026-11-16 this listener stayed until the reboot. The listener check of slice 1's A5 fails on
 it, because it is a listener outside loopback and Tailscale.
+
+## Accept the tailnet's subnet routes
+
+A Linux device uses a subnet route only when Tailscale runs with `--accept-routes`
+([Subnet routers](https://tailscale.com/docs/features/subnet-routers)). Legion pods reach the
+recorder at their own addresses, through subnet routers. The Pi needs those subnet routes to send
+its replies to the pods. But an accepted route takes the Pi's own traffic for that route's network.
+So the Pi accepts the routes only when the route check finds no overlap.
+
+The route check compares two lists:
+
+- the Pi's IPv4 networks, from `ip -4 -o addr`, except the network of `tailscale0`
+- the routes in each peer's `PrimaryRoutes`, from `tailscale status --json`
+
+It does not compare IPv6 routes. A route overlaps a network when one of the two holds the other.
+The check refuses when it cannot read one of its inputs. When it refuses, it prints one line for
+each overlap, or one line that names the step that failed.
+
+The detached join of "Provision" uses the check:
+
+1. It runs `tailscale up` with `--accept-routes=false`. This sets `RouteAll`, the Tailscale
+   setting that `--accept-routes` controls, to false.
+2. It runs the check.
+3. It runs `tailscale set --accept-routes` only when the check passed. This sets `RouteAll` to
+   true.
+
+When the check refuses, the join unit ends failed. The Pi stays in the tailnet, with `RouteAll`
+false. The check's lines are in the unit's journal. Read them on the Pi with
+`sudo journalctl -u 'ghost-wispr-tailnet-join-*'`. To fix an overlap, remove the route or change
+the office network's range. Then run the block below.
+
+A new run of `provision.sh` on a Pi already joined as `tag:ghost-wispr` exits before the join. So
+it does not run the check, and it does not change `RouteAll`.
+
+Run the block below in these cases:
+
+- on a Pi that joined the tailnet before the join had the route check
+- after you fix a refusal
+- when someone adds a subnet route to the tailnet
+- when the Pi's network changes
+
+Run it on a machine that reaches the Pi over SSH. Run it from the root of a Ghost Wispr checkout
+that has the route check:
+
+<!-- provision_bundle_test.sh: accept-routes -->
+```bash
+source "${GHOST_WISPR_PI_ENV:-deploy/pi/files/pi.env}" &&
+check=$(bash -c 'source deploy/pi/provision.sh && route_overlap_check_script') &&
+[ -n "$check" ] &&
+verdict=$(printf '%s\n' "$check" | ssh "ghost-wispr@$PI_HOST" 'sh -s') &&
+printf '%s\n' "$verdict" &&
+case $verdict in "ghost-wispr routes: no route of a peer overlaps"*) ;; *) false ;; esac &&
+ssh "ghost-wispr@$PI_HOST" 'sudo tailscale set --accept-routes && tailscale debug prefs' | jq -e .RouteAll
+```
+
+The block runs the route check on the Pi over SSH. On success, it prints the check's acceptance
+line, and then `true`. The acceptance line starts with
+`ghost-wispr routes: no route of a peer overlaps a network of the Pi:`, and it names the networks
+and the routes that the check compared. `true` is the value of `RouteAll` after `tailscale set`.
+
+The block stops before `tailscale set` in each of these cases:
+
+- the checkout's `deploy/pi/provision.sh` has no `route_overlap_check_script`
+- `route_overlap_check_script` prints nothing
+- the check refuses
+- the check prints no acceptance line, as when the program reaches the Pi incomplete
+
+It exits non-zero when `tailscale set` fails, or when `RouteAll` then reads `false`.
+
+These commands use the `PI_HOST` that the block read from `pi.env`. To read `RouteAll` on the Pi:
+
+```bash
+ssh "ghost-wispr@$PI_HOST" 'tailscale debug prefs' | jq .RouteAll
+```
+
+If the check finds an overlap while `RouteAll` reads `true`, disable the routes on the Pi:
+
+```bash
+ssh "ghost-wispr@$PI_HOST" 'sudo tailscale set --accept-routes=false'
+```
+
+Then fix the overlap, as above. Run the block again after the fix.
 
 ## Enable models and Drive sync
 
