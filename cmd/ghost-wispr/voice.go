@@ -16,6 +16,7 @@ import (
 	"github.com/sjawhar/ghost-wispr/internal/googleauth"
 	"github.com/sjawhar/ghost-wispr/internal/server"
 	"github.com/sjawhar/ghost-wispr/internal/voice"
+	"github.com/sjawhar/ghost-wispr/internal/voice/dgagent"
 	"github.com/sjawhar/ghost-wispr/internal/voice/gptlive"
 	voicetts "github.com/sjawhar/ghost-wispr/internal/voice/tts"
 	"github.com/sjawhar/ghost-wispr/internal/wake/transcript"
@@ -248,8 +249,11 @@ func (v *voiceSource) apply(ctx context.Context, cfg *config.Config) {
 	case config.VoiceEngineGPTLive:
 		key = strings.Join([]string{cfg.Voice.Engine, cfg.Voice.GPTLive.OpenAIIdentityProviderID, cfg.Voice.GPTLive.OpenAIServiceAccountID, cfg.GoogleCredentialsFile}, "\x00")
 		build = func() (voice.Voice, error) { return newVoiceB(cfg) }
+	case config.VoiceEngineDGAgent:
+		key = strings.Join(append([]string{cfg.Voice.Engine, cfg.DeepgramAPIKey, cfg.Voice.DGAgent.ThinkModel}, cfg.Voice.WakePhrases...), "\x00")
+		build = func() (voice.Voice, error) { return newVoiceC(cfg) }
 	default:
-		v.set("", nil, fmt.Errorf("voice.engine %q is not in this build; use %q or %q", cfg.Voice.Engine, config.VoiceEngineTTS, config.VoiceEngineGPTLive))
+		v.set("", nil, fmt.Errorf("voice.engine %q is not in this build; use %q, %q or %q", cfg.Voice.Engine, config.VoiceEngineTTS, config.VoiceEngineGPTLive, config.VoiceEngineDGAgent))
 		return
 	}
 	v.mu.Lock()
@@ -365,6 +369,26 @@ func voiceAEngine(ctx context.Context, cfg *config.Config, opts *voiceAOptions) 
 		return engine, nil
 	default:
 		return nil, fmt.Errorf("voice.tts_engine %q is not one of %q, %q", cfg.Voice.TTSEngine, config.TTSEngineGemini, config.TTSEngineAura)
+	}
+}
+
+// newVoiceC builds voice C on Deepgram's Voice Agent.
+func newVoiceC(cfg *config.Config) (voice.Voice, error) {
+	agent, err := dgagent.New(voiceCConfig(cfg))
+	if err != nil {
+		return nil, fmt.Errorf("voice C: %w", err)
+	}
+	return agent, nil
+}
+
+// voiceCConfig is voice C's configuration: the unit's Deepgram key, the
+// wake phrases as keyterms, so Flux hears the name the room calls the
+// voice by, and the model voice.dgagent.think_model names.
+func voiceCConfig(cfg *config.Config) *dgagent.Config {
+	return &dgagent.Config{
+		APIKey:     cfg.DeepgramAPIKey,
+		Keyterms:   transcript.Keyterms(cfg.Voice.WakePhrases, nil),
+		ThinkModel: cfg.Voice.DGAgent.ThinkModel,
 	}
 }
 

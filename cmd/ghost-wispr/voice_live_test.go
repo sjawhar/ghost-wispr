@@ -17,6 +17,7 @@ import (
 	"github.com/sjawhar/ghost-wispr/internal/config"
 	"github.com/sjawhar/ghost-wispr/internal/logging"
 	"github.com/sjawhar/ghost-wispr/internal/voice"
+	"github.com/sjawhar/ghost-wispr/internal/voice/dgagent"
 	"github.com/sjawhar/ghost-wispr/internal/voice/gptlive"
 )
 
@@ -116,8 +117,9 @@ func TestThePiConfigCanPickVoiceB(t *testing.T) {
 }
 
 // TestEachSettingBuildsItsVoice fails if the voice for a call does not follow
-// the settings saved last, rebuilds for settings that did not change, or
-// builds a voice this build does not have.
+// the settings saved last, rebuilds for settings that did not change, builds
+// a voice this build does not have, or does not build voice C on
+// voice.engine dgagent, and again for a new think model.
 func TestEachSettingBuildsItsVoice(t *testing.T) {
 	key := strings.Repeat("k", 8) // any non-empty key; no request leaves the test
 	cfg := config.Config{DeepgramAPIKey: key, Voice: config.Voice{Engine: config.VoiceEngineTTS, TTSEngine: config.TTSEngineAura}}
@@ -149,10 +151,21 @@ func TestEachSettingBuildsItsVoice(t *testing.T) {
 	}
 	cfg.Voice.Engine = config.VoiceEngineDGAgent
 	source.apply(t.Context(), &cfg)
-	if v, err := source.Voice(); v != nil || err == nil || !strings.Contains(err.Error(), "not in this build") {
-		t.Fatalf("voice C in this build: %v, %v", v, err)
+	voiceC, err := source.Voice()
+	if _, isC := voiceC.(*dgagent.Agent); err != nil || !isC {
+		t.Fatalf("voice C on dgagent: %T, %v", voiceC, err)
 	}
-	cfg.Voice.Engine, cfg.DeepgramAPIKey = config.VoiceEngineTTS, ""
+	cfg.Voice.DGAgent.ThinkModel = "open_ai/gpt-4o-mini"
+	source.apply(t.Context(), &cfg)
+	if changed, _ := source.Voice(); changed == voiceC || changed == nil {
+		t.Fatal("a new voice.dgagent.think_model kept the old voice C")
+	}
+	cfg.DeepgramAPIKey = ""
+	source.apply(t.Context(), &cfg)
+	if v, err := source.Voice(); v != nil || err == nil {
+		t.Fatalf("voice C with no key: %v, %v", v, err)
+	}
+	cfg.Voice.Engine = config.VoiceEngineTTS
 	source.apply(t.Context(), &cfg)
 	if v, err := source.Voice(); v != nil || err == nil {
 		t.Fatalf("voice A on Aura with no key: %v, %v", v, err)

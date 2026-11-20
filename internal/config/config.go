@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/sjawhar/ghost-wispr/internal/genaiconfig"
 	"github.com/sjawhar/ghost-wispr/internal/llm"
@@ -82,12 +83,40 @@ type Voice struct {
 	// GPTLive is voice B's OpenAI route: the workload identity ids its token
 	// exchange names. They are not secrets.
 	GPTLive GPTLive `yaml:"gptlive"`
+	// DGAgent is voice C's choice of the model that keeps its turns.
+	DGAgent DGAgent `yaml:"dgagent"`
 }
 
 // GPTLive configures voice B (voice.engine gptlive).
 type GPTLive struct {
 	OpenAIIdentityProviderID string `yaml:"openai_identity_provider_id"`
 	OpenAIServiceAccountID   string `yaml:"openai_service_account_id"`
+}
+
+// DGAgent configures voice C (voice.engine dgagent).
+type DGAgent struct {
+	// ThinkModel is the model Deepgram runs to keep the voice's turns, as
+	// provider/model, such as google/gemini-3.1-flash-lite; "" is the
+	// voice's default. The Concierge words every answer either way.
+	ThinkModel string `yaml:"think_model"`
+}
+
+// ParseThinkModel reads a voice.dgagent.think_model name, provider/model,
+// split at the first slash: the model may hold slashes. The config check
+// and voice C both read the name with it. It refuses a name that is not
+// provider/model, one with a space in it, and deepgram/think-fast, which
+// Deepgram refuses with INVALID_SETTINGS in a session opted out of its
+// model training, as every voice C session is.
+func ParseThinkModel(name string) (provider, model string, err error) {
+	name = strings.TrimSpace(name)
+	provider, model, _ = strings.Cut(name, "/")
+	if provider == "" || model == "" || strings.ContainsFunc(name, unicode.IsSpace) {
+		return "", "", fmt.Errorf("think model %q is not provider/model, such as google/gemini-3.1-flash-lite", name)
+	}
+	if strings.EqualFold(provider, "deepgram") && strings.EqualFold(model, "think-fast") {
+		return "", "", fmt.Errorf("think model %q needs Deepgram's model training, which voice C opts out of; use deepgram/phonellm-mini-alpha-2-fp8", name)
+	}
+	return provider, model, nil
 }
 
 // Concierge configures the agent loop that answers the voice from Dispatch
@@ -751,6 +780,12 @@ func validateVoice(cfg *Config) []string {
 	v.WakePhrases = phrases
 	if len(v.WakePhrases) == 0 {
 		warnings = append(warnings, "voice.wake_phrases is empty — nothing can call the voice.")
+	}
+	v.DGAgent.ThinkModel = strings.TrimSpace(v.DGAgent.ThinkModel)
+	if m := v.DGAgent.ThinkModel; m != "" {
+		if _, _, err := ParseThinkModel(m); err != nil {
+			warnings = append(warnings, fmt.Sprintf("voice.dgagent.think_model: %v — voice C cannot start.", err))
+		}
 	}
 	for name, raw := range map[string]string{"concierge.dispatch_url": cfg.Concierge.DispatchURL, "concierge.envoy_url": cfg.Concierge.EnvoyURL} {
 		if raw == "" {

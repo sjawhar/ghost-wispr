@@ -34,7 +34,7 @@ Microphone → Deepgram WebSocket → Session Manager → SQLite
 - `internal/server/` — HTTP API, WebSocket event hub, SPA serving
 - `internal/summary/` — OpenAI summarization
 - `internal/gdrive/` — Google Drive sync (optional)
-- `internal/voice/` — the meeting voice: the Supervisor, the room-audio tap, the chimes; `internal/voice/tts/` is voice A
+- `internal/voice/` — the meeting voice: the Supervisor, the room-audio tap, the chimes; `internal/voice/tts/` is voice A, `internal/voice/gptlive/` voice B, `internal/voice/dgagent/` voice C
 - `internal/wake/transcript/` — the wake phrase on the live transcript
 - `internal/concierge/`, `internal/dispatch/`, `internal/envoy/` — the Concierge, its Dispatch client and the unit's Envoy session
 
@@ -293,6 +293,12 @@ What the voice hears, and where the room's words go:
   Each question goes to the Concierge on the unit, whose own model (Gemini on Vertex AI) words the
   answer, and Deepgram speaks it word for word. An exchange opens at the wake phrase; a held answer also opens voice C without one, but only on "Wispr, go ahead", or when nobody has
   spoken since its question and the light reads red. Between exchanges nothing goes to the Voice Agent.
+- Voice C plays only the Concierge's words and routing lines. The words of Deepgram's own model
+  never play, within one bound. No message from Deepgram says which sentence an audio frame belongs
+  to, so each frame of an answer waits 250 ms before it plays. When the model's own text comes, or
+  Deepgram hears someone start to speak over the voice, the frames still waiting are dropped. Model
+  audio that comes more than 250 ms before its own text would play. The probe measured that lead at
+  24 ms at most, over 146 sentences in 28 real sessions. The wait makes each answer start 250 ms later.
 - Dispatch gets a question's words only as a few search keywords (at most five), never the whole
   sentence. Each search runs Dispatch's keyword search and its search by meaning at once, so those
   keywords also reach its embedding model, Cohere Embed v4 on Microsoft Azure, even when the
@@ -321,7 +327,8 @@ What the voice hears, and where the room's words go:
 | Setting | Default | Description |
 |---------|---------|-------------|
 | `voice.enabled` (`GHOST_WISPR_VOICE_ENABLED`) | `false` | Turn the meeting voice on; it needs `speaker_enabled` |
-| `voice.engine` | `tts` | The voice: `tts` (voice A, our own streaming speech). `gptlive` and `dgagent` are not in this build |
+| `voice.engine` | `tts` | The voice: `tts` (voice A, our own streaming speech), `gptlive` (voice B, OpenAI's GPT-Live) or `dgagent` (voice C, Deepgram's Voice Agent with the Deepgram key: it hears the room, keeps the turn and speaks the Concierge's answers word for word) |
+| `voice.dgagent.think_model` | Deepgram's `phonellm-mini-alpha-2-fp8` | Voice C: the model, as provider/model, that Deepgram runs to keep the turn, such as `google/gemini-3.1-flash-lite`; `open_ai/gpt-4.1-mini` stands behind it if it fails. `deepgram/think-fast` is refused: it needs Deepgram's model training, which voice C opts out of |
 | `voice.wake_phrases` | `[Wispr, Ghost Wispr]` | The phrases that call Wispr; the live Deepgram request carries them, and Dispatch's project keys, as Nova-3 keyterms |
 | `voice.tts_engine` | `gemini` | Voice A's engine: `gemini` (Vertex AI, `gcp_project`) or `aura` (the Deepgram key) |
 | `voice.tts_model`, `voice.tts_voice` | the engine's | Gemini: `gemini-3.8-flash-tts`, `Kore`; Aura: the voice `aura-2-harmonia-en` |

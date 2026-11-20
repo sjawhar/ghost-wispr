@@ -152,3 +152,66 @@ func TestVoiceBOpenAIIdentityComesFromTheConfig(t *testing.T) {
 		t.Fatalf("voice.gptlive = %+v, want the file's ids", got)
 	}
 }
+
+// TestVoiceCThinkModelComesFromTheConfig fails if voice C's think model is
+// not read from voice.dgagent.think_model, or is set when the file names
+// none, so the voice's own default would be overridden.
+func TestVoiceCThinkModelComesFromTheConfig(t *testing.T) {
+	clearVoiceEnv(t)
+	cfg, _, err := Load(writeConfig(t, "voice:\n  dgagent:\n    think_model: google/gemini-3.1-flash-lite\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := cfg.Voice.DGAgent.ThinkModel; got != "google/gemini-3.1-flash-lite" {
+		t.Fatalf("voice.dgagent.think_model = %q, want the file's", got)
+	}
+	cfg, _, err = Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := cfg.Voice.DGAgent.ThinkModel; got != "" {
+		t.Fatalf("voice.dgagent.think_model = %q by default, want empty, for the voice's own default", got)
+	}
+}
+
+// TestVoiceCThinkModelIsChecked fails if a voice.dgagent.think_model voice C
+// cannot start with passes without a warning naming the setting: one that
+// is not provider/model, or deepgram/think-fast, which Deepgram refuses in a
+// session opted out of its model training, as every voice C session is. It
+// also fails if a good name is warned about.
+func TestVoiceCThinkModelIsChecked(t *testing.T) {
+	clearVoiceEnv(t)
+	warned := func(model string) bool {
+		t.Helper()
+		_, warnings, err := Load(writeConfig(t, "speaker_enabled: true\nvoice:\n  enabled: true\n  engine: dgagent\n  dgagent:\n    think_model: \""+model+"\"\n"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, w := range warnings {
+			if strings.Contains(w, "voice.dgagent.think_model") {
+				return true
+			}
+		}
+		return false
+	}
+	for _, bad := range []string{"gemini-3.1-flash-lite", "google/", "/gemini", "google /gemini-3.1-flash-lite", "deepgram/think-fast", "Deepgram/Think-Fast"} {
+		if !warned(bad) {
+			t.Errorf("no warning names voice.dgagent.think_model for %q", bad)
+		}
+	}
+	for _, good := range []string{"google/gemini-3.1-flash-lite", "deepgram/phonellm-mini-alpha-2-fp8", "aws_bedrock/anthropic/claude-sonnet"} {
+		if warned(good) {
+			t.Errorf("a warning names voice.dgagent.think_model for %q, which voice C takes", good)
+		}
+	}
+}
+
+// TestParseThinkModelSplitsAtTheFirstSlash fails if the provider/model
+// parser that the config check and voice C share does not split at the
+// first slash, so a model name that holds slashes loses its provider.
+func TestParseThinkModelSplitsAtTheFirstSlash(t *testing.T) {
+	provider, model, err := ParseThinkModel(" aws_bedrock/anthropic/claude-sonnet ")
+	if err != nil || provider != "aws_bedrock" || model != "anthropic/claude-sonnet" {
+		t.Fatalf("ParseThinkModel = %q, %q, %v, want aws_bedrock, anthropic/claude-sonnet", provider, model, err)
+	}
+}
