@@ -324,7 +324,8 @@ The route check compares two lists:
 
 It does not compare IPv6 routes. A route overlaps a network when one of the two holds the other.
 The check refuses when it cannot read one of its inputs. When it refuses, it prints one line for
-each overlap, or one line that names the step that failed.
+each overlap, or one line that names the step that failed. Then it prints one more line, which
+starts with `ghost-wispr routes: not accepting the tailnet's subnet routes:`.
 
 The detached join of "Provision" uses the check:
 
