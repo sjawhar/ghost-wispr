@@ -3108,9 +3108,10 @@ func (s *SQLiteStore) DeleteEmbeddings(sessionID string) error {
 // itself: a summary is committed before the hub stores its event, and a
 // whole-conversation delete that commits between the two must not leave the
 // summary behind in an event (DeleteSession deletes the events it finds). An
-// event that names no session, or is not JSON, is stored.
-func (s *SQLiteStore) StoreEvent(eventType, payload string) error {
-	_, err := s.db.Exec(
+// event that names no session, or is not JSON, is stored. It gives up when
+// ctx ends.
+func (s *SQLiteStore) StoreEvent(ctx context.Context, eventType, payload string) error {
+	_, err := s.db.ExecContext(ctx,
 		`INSERT INTO mcp_events(event_type, payload) SELECT ?1, ?2
 		WHERE CASE WHEN json_valid(?2) THEN
 			COALESCE(json_extract(?2, '$.session_id'), '') = ''

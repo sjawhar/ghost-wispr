@@ -131,6 +131,12 @@ type ResilientClient struct {
 	// queued changes are dropped and the newest kept; Seq shows the gap.
 	OnStateChange ConnectionCallback
 
+	// OnStateChangeLocked, when set, is called at each change with Mu held,
+	// before the change is queued for OnStateChange: for state that must
+	// change at the same moment as the client's own, such as a warning that
+	// says it is not connected. It must be quick and must not call the client.
+	OnStateChangeLocked func(StateChange)
+
 	// ctx is the application context; cancellation stops the reconnect loop.
 	ctx context.Context
 	// cancel cancels ctx, stopping the reconnect goroutine on Close().

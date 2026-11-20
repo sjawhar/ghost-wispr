@@ -158,22 +158,27 @@ func (rc *ResilientClient) CurrentState() StateChange {
 	return StateChange{Seq: rc.stateSeq, State: rc.State}
 }
 
-// setStateLocked updates state, numbers the change, and queues it for
-// OnStateChange. Must be called with rc.Mu held. It never waits for the
-// callback: Write calls it on the capture path.
+// setStateLocked updates state, numbers the change, applies it to
+// OnStateChangeLocked, and queues it for OnStateChange. Must be called with
+// rc.Mu held. It never waits for OnStateChange: Write calls it on the capture
+// path.
 func (rc *ResilientClient) setStateLocked(newState ConnectionState) {
 	if rc.State == newState {
 		return
 	}
 	rc.State = newState
 	rc.stateSeq = stateSeqs.Add(1)
+	change := StateChange{Seq: rc.stateSeq, State: newState}
+	if rc.OnStateChangeLocked != nil {
+		rc.OnStateChangeLocked(change)
+	}
 	if rc.OnStateChange == nil || rc.ctx.Err() != nil {
 		return
 	}
 	if len(rc.stateChanges) == maxQueuedStateChanges {
 		rc.stateChanges = slices.Delete(rc.stateChanges, 0, 1)
 	}
-	rc.stateChanges = append(rc.stateChanges, StateChange{Seq: rc.stateSeq, State: newState})
+	rc.stateChanges = append(rc.stateChanges, change)
 	if !rc.notifying {
 		rc.notifying = true
 		rc.notifierDone = make(chan struct{})

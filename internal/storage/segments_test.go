@@ -160,7 +160,7 @@ func TestDeleteRefinedSegmentRemovesTextEverywhere(t *testing.T) {
 	if _, err := store.DB().Exec(`INSERT INTO embeddings(session_id, chunk_index, embedding, text_hash, model) VALUES(?, 0, X'01', 'hash', 'model')`, "delete-everywhere"); err != nil {
 		t.Fatalf("insert embedding: %v", err)
 	}
-	if err := store.StoreEvent("summary_ready", `{"type":"summary_ready","session_id":"delete-everywhere","title":"private deletion token title","summary":"summary names private deletion token"}`); err != nil {
+	if err := store.StoreEvent(t.Context(), "summary_ready", `{"type":"summary_ready","session_id":"delete-everywhere","title":"private deletion token title","summary":"summary names private deletion token"}`); err != nil {
 		t.Fatalf("store event: %v", err)
 	}
 
@@ -247,7 +247,7 @@ func TestDeleteRefinedSegmentClearsOverlappingLiveEvents(t *testing.T) {
 		{"live_transcript", `{"type":"live_transcript","session_id":"event-clear","start_time":4,"end_time":6,"text":"after bridge"}`},
 		{"live_transcript", `{"type":"live_transcript","session_id":"other-session","start_time":2,"end_time":4,"text":"other session"}`},
 	} {
-		if err := store.StoreEvent(event.eventType, event.payload); err != nil {
+		if err := store.StoreEvent(t.Context(), event.eventType, event.payload); err != nil {
 			t.Fatalf("store event: %v", err)
 		}
 	}

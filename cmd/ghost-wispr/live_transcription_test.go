@@ -278,7 +278,7 @@ type blockingStatusStore struct {
 
 func (blockingStatusStore) HasSession(string) (bool, error) { return true, nil }
 
-func (s blockingStatusStore) StoreEvent(_, payload string) error {
+func (s blockingStatusStore) StoreEvent(_ context.Context, _, payload string) error {
 	var event struct{ Component, Status string }
 	_ = json.Unmarshal([]byte(payload), &event)
 	switch {
@@ -289,6 +289,113 @@ func (s blockingStatusStore) StoreEvent(_, payload string) error {
 		s.onceConnected.Do(func() { close(s.connected); <-s.end })
 	}
 	return nil
+}
+
+// stuckStatusStore holds every Deepgram status it is asked to store: until
+// ctx ends if honours, else until end closes. entered closes at the first.
+type stuckStatusStore struct {
+	entered, end, cancelled chan struct{}
+	honours                 bool
+	once                    *sync.Once
+}
+
+func (stuckStatusStore) HasSession(string) (bool, error) { return true, nil }
+
+func (s stuckStatusStore) StoreEvent(ctx context.Context, _, payload string) error {
+	var event struct{ Component string }
+	_ = json.Unmarshal([]byte(payload), &event)
+	if event.Component != "deepgram" {
+		return nil
+	}
+	s.once.Do(func() { close(s.entered) })
+	if s.honours {
+		select {
+		case <-ctx.Done():
+			close(s.cancelled)
+			return ctx.Err()
+		case <-s.end:
+			return nil
+		}
+	}
+	<-s.end
+	return nil
+}
+
+// TestTheWarningChangesWithTheClientsStateAtOnce fails if the "Deepgram is
+// not connected" warning waits for the status callback, which can run behind
+// the client: a change heard of late left the warning wrong for as long as
+// the callback was behind. The callback here is stuck in the hub's store for
+// the whole test; the warning must still clear the moment the client reads
+// connected, and come back the moment it reads not connected.
+func TestTheWarningChangesWithTheClientsStateAtOnce(t *testing.T) {
+	peer, host := startSwitchableDeepgram(t)
+	store := stuckStatusStore{entered: make(chan struct{}), end: make(chan struct{}), cancelled: make(chan struct{}), once: &sync.Once{}}
+	hub := server.NewHub()
+	hub.SetEventStore(store)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	warnings := newWarningsRegistry()
+	rc := newLiveTranscription(ctx, "test-key",
+		&interfaces.ClientOptions{Host: host, EnableKeepAlive: true},
+		&interfaces.LiveTranscriptionOptions{Model: "nova-3", Language: "en-US", Encoding: "linear16", SampleRate: 16000, Channels: 1},
+		transcribe.ResilientConfig{BufferSize: 1 << 16, InitialReconnectDelay: time.Hour, MaxReconnectBackoff: time.Hour},
+		transcriptCallback{}, warnings, hub)
+	t.Cleanup(func() { close(store.end); _ = rc.Close() })
+
+	select {
+	case <-store.entered:
+	case <-time.After(3 * time.Second):
+		t.Fatal("the status callback never reached the store")
+	}
+	waitForHardwareWithin(t, 3*time.Second, "the client to connect", rc.IsConnected)
+	if notConnectedWarning(warnings) {
+		t.Fatal("the client reads connected, and the warning still says it is not: it waited for the stuck status callback")
+	}
+	peer.dropAll()
+	for deadline := time.Now().Add(3 * time.Second); rc.IsConnected(); {
+		if time.Now().After(deadline) {
+			t.Fatal("the client did not notice the drop")
+		}
+		_, _ = rc.Write(make([]byte, 3200))
+	}
+	if !notConnectedWarning(warnings) {
+		t.Fatal("the client reads not connected, and the warning is not shown: it waited for the stuck status callback")
+	}
+}
+
+// TestCloseCancelsAStatusStoreItWaitsOn fails if Close leaves the status
+// callback in the hub's store: the callback must pass its context down to the
+// store, so a close ends a store that waits, at once, rather than leave it
+// running after Close's bounded wait.
+func TestCloseCancelsAStatusStoreItWaitsOn(t *testing.T) {
+	_, host := startSwitchableDeepgram(t)
+	store := stuckStatusStore{entered: make(chan struct{}), end: make(chan struct{}), cancelled: make(chan struct{}), honours: true, once: &sync.Once{}}
+	defer close(store.end)
+	hub := server.NewHub()
+	hub.SetEventStore(store)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	rc := newLiveTranscription(ctx, "test-key",
+		&interfaces.ClientOptions{Host: host, EnableKeepAlive: true},
+		&interfaces.LiveTranscriptionOptions{Model: "nova-3", Language: "en-US", Encoding: "linear16", SampleRate: 16000, Channels: 1},
+		transcribe.ResilientConfig{BufferSize: 1 << 16, InitialReconnectDelay: time.Hour, MaxReconnectBackoff: time.Hour},
+		transcriptCallback{}, newWarningsRegistry(), hub)
+	select {
+	case <-store.entered:
+	case <-time.After(3 * time.Second):
+		t.Fatal("the status callback never reached the store")
+	}
+	start := time.Now()
+	_ = rc.Close()
+	took := time.Since(start)
+	select {
+	case <-store.cancelled:
+	default:
+		t.Fatalf("Close returned after %v and the store it waited on was never cancelled", took)
+	}
+	if took >= 500*time.Millisecond {
+		t.Fatalf("Close took %v: it waited on the store instead of cancelling it", took)
+	}
 }
 
 // TestALateConnectedNeverHidesACurrentOutage fails if a change heard of late

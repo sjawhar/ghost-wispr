@@ -40,10 +40,10 @@ func TestASlowSubscriberEndsOnEachComponentsLatestStatus(t *testing.T) {
 		hub.Broadcast([]byte(`{"type":"live_transcript_interim"}`))
 		<-fast
 	}
-	hub.BroadcastComponentStatusSeq("deepgram", "reconnecting", "Deepgram reconnecting", 1)
-	hub.BroadcastComponentStatusSeq("deepgram", "draining", "Deepgram draining", 2)
+	hub.BroadcastComponentStatusSeq(t.Context(), "deepgram", "reconnecting", "Deepgram reconnecting", 1)
+	hub.BroadcastComponentStatusSeq(t.Context(), "deepgram", "draining", "Deepgram draining", 2)
 	hub.BroadcastComponentStatus("mic", "connected", "Microphone open at 16000 Hz")
-	hub.BroadcastComponentStatusSeq("deepgram", "connected", "Deepgram connected", 3)
+	hub.BroadcastComponentStatusSeq(t.Context(), "deepgram", "connected", "Deepgram connected", 3)
 	hub.Broadcast([]byte(`{"type":"live_transcript_interim"}`)) // dropped for the slow one: it is full
 
 	read := func(ch chan []byte, name string) (last map[string]string) {
@@ -84,8 +84,8 @@ func TestANumberedStatusHeardOfLateIsDropped(t *testing.T) {
 	hub := NewHub()
 	ch := hub.Subscribe()
 	defer hub.Unsubscribe(ch)
-	hub.BroadcastComponentStatusSeq("deepgram", "connected", "Deepgram connected", 7)
-	hub.BroadcastComponentStatusSeq("deepgram", "draining", "Deepgram draining", 6)
+	hub.BroadcastComponentStatusSeq(t.Context(), "deepgram", "connected", "Deepgram connected", 7)
+	hub.BroadcastComponentStatusSeq(t.Context(), "deepgram", "draining", "Deepgram draining", 6)
 
 	first := <-ch
 	if _, status, seq, _ := statusOf(t, first); status != "connected" || seq != 7 {
@@ -104,7 +104,7 @@ func TestANumberedStatusHeardOfLateIsDropped(t *testing.T) {
 	// An unnumbered status (a pause's "paused") still applies, and the next
 	// numbered one after it.
 	hub.BroadcastComponentStatus("deepgram", "paused", "Deepgram connects when capture resumes")
-	hub.BroadcastComponentStatusSeq("deepgram", "reconnecting", "Deepgram reconnecting", 8)
+	hub.BroadcastComponentStatusSeq(t.Context(), "deepgram", "reconnecting", "Deepgram reconnecting", 8)
 	for _, want := range []string{"paused", "reconnecting"} {
 		if _, status, _, _ := statusOf(t, <-ch); status != want {
 			t.Fatalf("got %q, want %q", status, want)
@@ -121,7 +121,7 @@ func TestUnsubscribeStopsAWaitingStatus(t *testing.T) {
 	for range subscriberQueue {
 		hub.Broadcast([]byte(`{"type":"live_transcript_interim"}`))
 	}
-	hub.BroadcastComponentStatusSeq("deepgram", "connected", "Deepgram connected", 1) // waits: ch is full
+	hub.BroadcastComponentStatusSeq(t.Context(), "deepgram", "connected", "Deepgram connected", 1) // waits: ch is full
 	done := make(chan struct{})
 	go func() { hub.Unsubscribe(ch); close(done) }()
 	select {
@@ -129,7 +129,7 @@ func TestUnsubscribeStopsAWaitingStatus(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("Unsubscribe waited on a subscriber that does not read")
 	}
-	hub.BroadcastComponentStatusSeq("deepgram", "draining", "Deepgram draining", 2)
+	hub.BroadcastComponentStatusSeq(t.Context(), "deepgram", "draining", "Deepgram draining", 2)
 	n := 0
 	for range ch {
 		n++

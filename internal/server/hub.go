@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"log/slog"
 	"slices"
@@ -14,9 +15,10 @@ import (
 
 // EventStore persists broadcast events, and says whether a session still
 // exists (HasSession), so the hub sends no status about a deleted session to
-// a client that connects.
+// a client that connects. StoreEvent gives up when ctx ends: a numbered
+// status's store runs in the state callback of a client that may be closing.
 type EventStore interface {
-	StoreEvent(eventType, payload string) error
+	StoreEvent(ctx context.Context, eventType, payload string) error
 	HasSession(id string) (bool, error)
 }
 
@@ -212,15 +214,18 @@ func (h *Hub) BroadcastStatusChanged(paused bool) {
 // BroadcastComponentStatus announces the status of a part of the unit (the
 // microphone, Deepgram): a status about no session.
 func (h *Hub) BroadcastComponentStatus(component, status, message string) {
-	h.broadcastComponentStatus("", component, status, message, 0)
+	h.broadcastComponentStatus(context.Background(), "", component, status, message, 0)
 }
 
 // BroadcastComponentStatusSeq announces the status of a part of the unit
 // whose changes are numbered (seq, from 1): the event carries seq, and a
 // status older than the one the hub last announced for component is dropped,
-// so a status heard of late never replaces a newer one.
-func (h *Hub) BroadcastComponentStatusSeq(component, status, message string, seq uint64) {
-	h.broadcastComponentStatus("", component, status, message, seq)
+// so a status heard of late never replaces a newer one. Every subscriber ends
+// on the component's latest status, gets its statuses in order, and never an
+// older one after a newer one; one that falls behind may miss statuses in
+// between (hubClient). Storing the event gives up when ctx ends.
+func (h *Hub) BroadcastComponentStatusSeq(ctx context.Context, component, status, message string, seq uint64) {
+	h.broadcastComponentStatus(ctx, "", component, status, message, seq)
 }
 
 // BroadcastSessionComponentStatus announces a component's status about
@@ -240,7 +245,7 @@ func (h *Hub) BroadcastSessionComponentStatus(sessionID, component, status, mess
 			return
 		}
 	}
-	h.broadcastComponentStatus(sessionID, component, status, message, 0)
+	h.broadcastComponentStatus(context.Background(), sessionID, component, status, message, 0)
 }
 
 // broadcastComponentStatus records the status as the component's last, and
@@ -248,7 +253,7 @@ func (h *Hub) BroadcastSessionComponentStatus(sessionID, component, status, mess
 // under one lock, so the subscribers get a component's statuses in the order
 // the hub records them. A numbered status (seq > 0) older than the recorded
 // one is dropped.
-func (h *Hub) broadcastComponentStatus(sessionID, component, status, message string, seq uint64) {
+func (h *Hub) broadcastComponentStatus(ctx context.Context, sessionID, component, status, message string, seq uint64) {
 	event := ComponentStatusEvent{
 		Event:     newEvent("component_status", time.Now().UTC()),
 		SessionID: sessionID,
@@ -274,7 +279,7 @@ func (h *Hub) broadcastComponentStatus(sessionID, component, status, message str
 	}
 	h.mu.Unlock()
 
-	h.storeEvent(event, payload)
+	h.storeEvent(ctx, event, payload)
 }
 
 // BroadcastSessionDeleted tells every connected client that session
@@ -341,18 +346,18 @@ func (h *Hub) broadcastEvent(event any) {
 		return
 	}
 	h.Broadcast(payload)
-	h.storeEvent(event, payload)
+	h.storeEvent(context.Background(), event, payload)
 }
 
 // storeEvent persists an event of a stored type, after it was broadcast:
-// best effort, never holding the broadcast.
-func (h *Hub) storeEvent(event any, payload []byte) {
+// best effort, never holding the broadcast, and given up when ctx ends.
+func (h *Hub) storeEvent(ctx context.Context, event any, payload []byte) {
 	if h.eventStore == nil {
 		return
 	}
 	if evt, ok := event.(interface{ eventType() string }); ok {
 		if _, store := storedEventTypes[evt.eventType()]; store {
-			if err := h.eventStore.StoreEvent(evt.eventType(), string(payload)); err != nil {
+			if err := h.eventStore.StoreEvent(ctx, evt.eventType(), string(payload)); err != nil {
 				h.logger.Warn("failed to store event", "operation", "store_event", "event_type", evt.eventType(), "error", err)
 			}
 		}

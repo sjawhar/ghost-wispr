@@ -34,7 +34,7 @@ func openWithSecret(t *testing.T, path string) {
 	if err := store.UpdateSummaryAtGeneration("backed-up", "Title", "The summary of "+backupSecret+".", SummaryCompleted, "default", "{}", "", 0); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.StoreEvent("live_transcript", `{"type":"live_transcript","session_id":"backed-up","text":"`+backupSecret+`","start_time":2,"end_time":4}`); err != nil {
+	if err := store.StoreEvent(t.Context(), "live_transcript", `{"type":"live_transcript","session_id":"backed-up","text":"`+backupSecret+`","start_time":2,"end_time":4}`); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.Close(); err != nil {

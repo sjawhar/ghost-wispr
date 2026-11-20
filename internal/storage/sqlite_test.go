@@ -2688,13 +2688,13 @@ func TestStoreEvent(t *testing.T) {
 	}
 
 	// Store events
-	if err := store.StoreEvent("session_started", `{"session_id":"s1"}`); err != nil {
+	if err := store.StoreEvent(t.Context(), "session_started", `{"session_id":"s1"}`); err != nil {
 		t.Fatalf("StoreEvent session_started: %v", err)
 	}
-	if err := store.StoreEvent("session_ended", `{"session_id":"s1","duration":30}`); err != nil {
+	if err := store.StoreEvent(t.Context(), "session_ended", `{"session_id":"s1","duration":30}`); err != nil {
 		t.Fatalf("StoreEvent session_ended: %v", err)
 	}
-	if err := store.StoreEvent("summary_ready", `{"session_id":"s1","title":"Test"}`); err != nil {
+	if err := store.StoreEvent(t.Context(), "summary_ready", `{"session_id":"s1","title":"Test"}`); err != nil {
 		t.Fatalf("StoreEvent summary_ready: %v", err)
 	}
 
@@ -2737,7 +2737,7 @@ func TestPurgeOldEvents(t *testing.T) {
 	}
 
 	// Store an event
-	if err := store.StoreEvent("session_started", `{"session_id":"s1"}`); err != nil {
+	if err := store.StoreEvent(t.Context(), "session_started", `{"session_id":"s1"}`); err != nil {
 		t.Fatalf("StoreEvent: %v", err)
 	}
 
@@ -2748,7 +2748,7 @@ func TestPurgeOldEvents(t *testing.T) {
 	}
 
 	// Store a recent event
-	if err := store.StoreEvent("session_ended", `{"session_id":"s2"}`); err != nil {
+	if err := store.StoreEvent(t.Context(), "session_ended", `{"session_id":"s2"}`); err != nil {
 		t.Fatalf("StoreEvent: %v", err)
 	}
 
@@ -2775,7 +2775,7 @@ func TestGetEventsSince_Pagination(t *testing.T) {
 
 	// Store 5 events
 	for i := 0; i < 5; i++ {
-		if err := store.StoreEvent("status_changed", fmt.Sprintf(`{"index":%d}`, i)); err != nil {
+		if err := store.StoreEvent(t.Context(), "status_changed", fmt.Sprintf(`{"index":%d}`, i)); err != nil {
 			t.Fatalf("StoreEvent %d: %v", i, err)
 		}
 	}

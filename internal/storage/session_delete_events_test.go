@@ -31,7 +31,7 @@ func TestDeleteSessionRemovesItsStoredEvents(t *testing.T) {
 		{"summary_ready", `{"type":"summary_ready","session_id":"kept","summary":"Another conversation."}`},
 	}
 	for _, e := range events {
-		if err := store.StoreEvent(e.eventType, e.payload); err != nil {
+		if err := store.StoreEvent(t.Context(), e.eventType, e.payload); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -103,7 +103,7 @@ func storeSessionEvents(t *testing.T, store *SQLiteStore, ids ...string) {
 			{"live_transcript", `{"type":"live_transcript","session_id":"` + id + `","text":"words of ` + id + `"}`},
 			{"summary_ready", `{"type":"summary_ready","session_id":"` + id + `","summary":"summary of ` + id + `"}`},
 		} {
-			if err := store.StoreEvent(e.eventType, e.payload); err != nil {
+			if err := store.StoreEvent(t.Context(), e.eventType, e.payload); err != nil {
 				t.Fatal(err)
 			}
 		}
@@ -158,7 +158,7 @@ func TestDeleteSessionErasesItsTextFromTheWriteAheadLog(t *testing.T) {
 	started := time.Date(2026, 11, 16, 7, 50, 0, 0, time.UTC)
 	recordedSession(t, store, "gone", started, started.Add(time.Minute), map[float64]string{1: secret})
 	recordedSession(t, store, "kept", started.Add(time.Hour), started.Add(61*time.Minute), map[float64]string{1: "kept conversation text"})
-	if err := store.StoreEvent("live_transcript", `{"type":"live_transcript","session_id":"gone","text":"`+secret+`"}`); err != nil {
+	if err := store.StoreEvent(t.Context(), "live_transcript", `{"type":"live_transcript","session_id":"gone","text":"`+secret+`"}`); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := store.DeleteSession("gone", t.TempDir()); err != nil {
@@ -189,7 +189,7 @@ func TestDeleteSessionErasesItFromThePreMigrationBackup(t *testing.T) {
 				t.Fatal(err)
 			}
 			endedWith(t, store, "kept", "/audio/kept.mp3", RefinementCompleted)
-			if err := store.StoreEvent("summary_ready", `{"type":"summary_ready","session_id":"kept","summary":"`+kept+`"}`); err != nil {
+			if err := store.StoreEvent(t.Context(), "summary_ready", `{"type":"summary_ready","session_id":"kept","summary":"`+kept+`"}`); err != nil {
 				t.Fatal(err)
 			}
 			if err := store.Close(); err != nil {
@@ -265,7 +265,7 @@ func TestEveryStartRemovesEventsOfSessionsThatNoLongerExist(t *testing.T) {
 		{"live_transcript", `{"type":"live_transcript","session_id":"deleted-before","text":"` + secret + `"}`},
 		{"status_changed", `{"type":"status_changed","paused":true}`},
 	} {
-		if err := store.StoreEvent(e.eventType, e.payload); err != nil {
+		if err := store.StoreEvent(t.Context(), e.eventType, e.payload); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -325,7 +325,7 @@ func TestStoreEventKeepsNoEventOfASessionThatIsGone(t *testing.T) {
 		`{"type":"status_changed","paused":true}`,
 		`not valid JSON`,
 	} {
-		if err := store.StoreEvent("summary_ready", payload); err != nil {
+		if err := store.StoreEvent(t.Context(), "summary_ready", payload); err != nil {
 			t.Fatalf("StoreEvent(%s): %v", payload, err)
 		}
 	}
