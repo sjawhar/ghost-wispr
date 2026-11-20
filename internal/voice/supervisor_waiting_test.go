@@ -1,6 +1,7 @@
 package voice
 
 import (
+	"errors"
 	"slices"
 	"sync"
 	"testing"
@@ -160,4 +161,142 @@ func TestNeverMindWithAWorkingQuestionKeepsTheHeldAnswer(t *testing.T) {
 	if got := waitSaid(t, r.waitSession()); got != "It ships tomorrow." {
 		t.Fatalf("said %q, want the older held answer", got)
 	}
+}
+
+// pendingCount is how many answers the Supervisor holds.
+func pendingCount(r *rig) int {
+	r.s.mu.Lock()
+	defer r.s.mu.Unlock()
+	return len(r.s.pending)
+}
+
+// TestNeverMindTwiceDropsTwoAnswers fails if two "Wispr, never mind" in a
+// row, both answered by the Concierge after the second, drop only one of two
+// held answers: each must drop its own.
+func TestNeverMindTwiceDropsTwoAnswers(t *testing.T) {
+	c := newFakeConcierge()
+	c.neverMindHold = make(chan struct{})
+	r, light := newWaitingRig(t, c)
+	holdAnswer(t, r, light, "t1", "One.")
+	c.answers <- PendingAnswer{TaskID: "t2", SessionID: "sess-1", Text: "Two."}
+	r.waitEvent("voice_answer_ready:sess-1")
+
+	r.heard("Wispr, never mind.", true, true)
+	eventually(t, "the first cancel", func() bool { return len(c.neverMindCalls()) == 1 })
+	r.heard("Wispr, never mind.", true, true)
+	eventually(t, "the second cancel", func() bool { return len(c.neverMindCalls()) == 2 })
+	c.neverMindHold <- struct{}{}
+	c.neverMindHold <- struct{}{}
+	eventually(t, "the waiting light off: both answers dropped", func() bool { return !light.lit() })
+	if got := pendingCount(r); got != 0 {
+		t.Fatalf("%d answers still held after two never minds, want none", got)
+	}
+}
+
+// TestALaterGoAheadOutlivesAnOlderNeverMind fails if a "Wispr, never mind"
+// whose Concierge call is still running drops an answer that a later "Wispr,
+// go ahead" spoke and a stop then put back to wait: the later word wins.
+func TestALaterGoAheadOutlivesAnOlderNeverMind(t *testing.T) {
+	c := newFakeConcierge()
+	c.neverMindHold = make(chan struct{})
+	r, light := newWaitingRig(t, c)
+	holdAnswer(t, r, light, "t1", "It ships tomorrow.")
+
+	r.heard("Wispr, never mind.", true, true)
+	eventually(t, "the cancel asked of the Concierge", func() bool { return len(c.neverMindCalls()) == 1 })
+	r.heard("Wispr, go ahead.", true, true)
+	waitSaid(t, r.waitSession())
+	r.s.Stop("Jabra button") // within the replay window: it waits again
+	eventually(t, "the answer waiting again", func() bool { return pendingCount(r) == 1 && light.lit() })
+
+	c.neverMindHold <- struct{}{}
+	never(t, "the older never mind dropped the answer", 300*time.Millisecond, func() bool { return !light.lit() || pendingCount(r) == 0 })
+	r.heard("Wispr, go ahead.", true, true)
+	if got := waitSaid(t, r.waitSession()); got != "It ships tomorrow." {
+		t.Fatalf("said %q, want the answer the older never mind did not drop", got)
+	}
+}
+
+// TestNeverMindDropsTheNewestArrival fails if "Wispr, never mind" drops an
+// answer other than the session's newest by arrival: an answer cut early goes
+// back to the front of the queue, and stays the newest.
+func TestNeverMindDropsTheNewestArrival(t *testing.T) {
+	c := newFakeConcierge()
+	r, light := newWaitingRig(t, c)
+	c.answers <- PendingAnswer{TaskID: "t1", SessionID: "sess-1", IssueKey: "ABC-1", Text: "About ABC-1."}
+	r.waitEvent("voice_answer_ready:sess-1")
+	c.answers <- PendingAnswer{TaskID: "t2", SessionID: "sess-1", IssueKey: "ABC-2", Text: "About ABC-2."}
+	r.waitEvent("voice_answer_ready:sess-1")
+	eventually(t, "the waiting light on", light.lit)
+	r.heard("Wispr, go ahead, ABC two.", true, true)
+	if got := waitSaid(t, r.waitSession()); got != "About ABC-2." {
+		t.Fatalf("said %q, want ABC-2's answer", got)
+	}
+	r.s.Stop("Jabra button") // within the replay window: ABC-2 waits again, at the front
+	eventually(t, "both answers waiting", func() bool { return pendingCount(r) == 2 })
+
+	r.heard("Wispr, never mind.", true, true)
+	eventually(t, "one answer dropped", func() bool { return pendingCount(r) == 1 })
+	r.heard("Wispr, go ahead.", true, true)
+	if got := waitSaid(t, r.waitSession()); got != "About ABC-1." {
+		t.Fatalf("said %q after never mind, want ABC-1's answer: never mind must drop the newest arrival, ABC-2's", got)
+	}
+}
+
+// TestAFailedNeverMindLeavesTheAnswerWaitingForAnInvitation fails if an
+// answer that "Wispr, never mind" meant to drop, whose Concierge call failed,
+// speaks by itself: it waits for "Wispr, go ahead" instead.
+func TestAFailedNeverMindLeavesTheAnswerWaitingForAnInvitation(t *testing.T) {
+	c := newFakeConcierge()
+	c.neverMindErr = errors.New("database is locked")
+	r, light := newWaitingRig(t, c)
+	c.answers <- PendingAnswer{TaskID: "t1", SessionID: "sess-1", Text: "It ships tomorrow.", AskedAt: time.Now()} // needs no invitation
+	r.waitEvent("voice_answer_ready:sess-1")
+	r.heard("Wispr, never mind.", true, true)
+	eventually(t, "the cancel asked of the Concierge", func() bool { return len(c.neverMindCalls()) == 1 })
+	never(t, "the answer spoke by itself after a failed never mind", 800*time.Millisecond, func() bool { return len(r.voice.opened) > 0 })
+	if !light.lit() {
+		t.Fatal("the waiting light went off with the answer still waiting")
+	}
+	r.heard("Wispr, go ahead.", true, true)
+	if got := waitSaid(t, r.waitSession()); got != "It ships tomorrow." {
+		t.Fatalf("said %q on invitation", got)
+	}
+}
+
+// TestNeverMindStopsAQueuedAnswerSound fails if the answer sound of an answer
+// that "Wispr, never mind" dropped plays after the drop, when it was queued
+// before.
+func TestNeverMindStopsAQueuedAnswerSound(t *testing.T) {
+	c := newFakeConcierge()
+	r, light := newWaitingRig(t, c)
+	release := r.speaker.holdBegins(audio.InputChime)
+	holdAnswer(t, r, light, "t1", "It ships tomorrow.")
+	eventually(t, "the answer sound queued", func() bool {
+		r.s.mu.Lock()
+		defer r.s.mu.Unlock()
+		return r.s.chimeCancel != nil
+	})
+
+	r.heard("Wispr, never mind.", true, true)
+	eventually(t, "the waiting light off", func() bool { return !light.lit() })
+	release()
+	never(t, "the dropped answer's sound played", 400*time.Millisecond, func() bool { return r.speaker.written(audio.InputChime) > 0 })
+}
+
+// TestAnAnswerArrivingWhileTheVoiceIsOffNeitherFlashesNorSpeaks fails if an
+// answer that lands after the voice was turned off lights the waiting light,
+// or speaks once the voice is on again.
+func TestAnAnswerArrivingWhileTheVoiceIsOffNeitherFlashesNorSpeaks(t *testing.T) {
+	c := newFakeConcierge()
+	r, light := newWaitingRig(t, c)
+	r.setEnabled(false)
+	r.s.EnabledChanged()
+	c.answers <- PendingAnswer{TaskID: "t1", SessionID: "sess-1", Text: "It ships tomorrow.", AskedAt: time.Now()}
+	never(t, "the waiting light on for an answer while the voice is off", 400*time.Millisecond, light.lit)
+
+	r.setEnabled(true)
+	r.s.EnabledChanged()
+	r.heard("Wispr, go ahead.", true, true)
+	never(t, "an answer from while the voice was off spoke", 500*time.Millisecond, func() bool { return len(r.voice.opened) > 0 })
 }

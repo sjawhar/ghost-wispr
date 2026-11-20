@@ -110,6 +110,7 @@ func TestBlink1BlackPatternAndWatchdogReports(t *testing.T) {
 		if report[1] == 'R' {
 			line := report[7]
 			patternReads = append(patternReads, line)
+			report[7] = 0 // the line's LED: written after 'l' 0, every LED
 			pattern, ok := patterns[line]
 			if !ok || pattern[2] != 0 || pattern[3] != 0 || pattern[4] != 0 || (pattern[5] == 0 && pattern[6] == 0) {
 				report[2] = 1

@@ -148,9 +148,14 @@ LEDs red while it records and both off when it stops. LED 2, the bottom one, fla
 second on and half a second off, while an agent's answer waits for "Wispr, go ahead" (see "Meeting
 voice"). It goes back to red once nothing waits: the answer is spoken, "Wispr, never mind" drops it,
 or its session ends. At a pause, a light hold or shutdown it goes off with LED 1, and it never
-flashes while the unit does not record. A flash writes LED 2 alone, holds the lock below as every
-command does, and never counts as a light fault: a flash write that fails is tried again at the next
-step.
+flashes while the unit does not record. It flashes only while room audio reaches the recording:
+while LED 1 is red for another reason, as while the microphone closes after a pause or reopens,
+LED 2 shows red. A check that finds LED 1 not red writes both LEDs red, and LED 2 stays red until a
+check finds LED 1 red again. A flash writes LED 2 alone, holds the lock below as every command
+does, and never counts as a light fault: a flash write that fails is tried again at the next step.
+The black pattern the watchdog plays must turn both LEDs off, so a check takes a pattern as black
+only when each of its lines is black on every LED; a black line on LED 1 alone would leave LED 2 as
+it was.
 
 Every microphone open, and PortAudio's device scan, which opens the microphone too, waits for
 the blink(1) to read back red and keeps it red until the open has finished, so no microphone opens

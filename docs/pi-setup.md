@@ -531,10 +531,15 @@ only exact red counts. LED 2, the bottom one, is red with LED 1 while the unit r
 green, half a second on and half a second off, while an agent's answer waits for "Wispr, go ahead".
 It goes back to red once the answer is spoken, "Wispr, never mind" drops it, or its session ends,
 and goes off with LED 1 at a pause, a light hold or shutdown; it never flashes while the unit does
-not record. A read selects LED 1 ('l' 0) and reads it ('r') in one hold of the lock below: the mk3
-reads the LED selected last, whatever LED the read names. The flash writes LED 2 alone with a fade
-of one 10 ms tick ('c', LED 2): an 'n' write that names one LED writes the next one and starts the
-blink(1)'s pattern player, which fades both LEDs to the stored black pattern.
+not record, and flashes only while room audio reaches the recording: while the microphone closes
+after a pause or reopens under a red check, LED 2 shows red. A check that finds LED 1 not red writes
+both LEDs red and stops the flash until a check finds LED 1 red again. A read selects LED 1 ('l' 0)
+and reads it ('r') in one hold of the lock below: the mk3 reads the LED selected last, whatever LED
+the read names. The flash writes LED 2 alone with a fade of one 10 ms tick ('c', LED 2): an 'n'
+write that names one LED writes the next one and starts the blink(1)'s pattern player, which fades
+both LEDs to the stored black pattern. That pattern counts as black only when each line is black on
+every LED (LED number 0, which 'l' 0 before the pattern's writes sets), since a black line on LED 1
+alone would leave LED 2 lit once the watchdog plays it.
 
 `/opt/ghost-wispr/ghost-wispr light-state` prints the colour of the blink(1)'s LED 1 (`red`, `off`,
 or `other` and its values) and `light-off` turns both LEDs off; both may run while the recorder

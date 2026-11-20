@@ -569,6 +569,7 @@ func TestEveryBlink1CommandHoldsTheLock(t *testing.T) {
 				} else {
 					report[6] = 10
 				}
+				report[7] = 0 // the line's LED: every LED
 			}
 		} else {
 			if pending != 0 {

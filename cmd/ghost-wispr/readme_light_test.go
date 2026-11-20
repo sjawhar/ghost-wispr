@@ -65,6 +65,8 @@ func TestTheReadmeSaysLED1IsTheRecordingLight(t *testing.T) {
 		"LED 2, the bottom one, flashes green, half a second on and half a second off, while an agent's answer waits for \"Wispr, go ahead\"",
 		"it never flashes while the unit does not record",
 		"never counts as a light fault",
+		"It flashes only while room audio reaches the recording",
+		"a check takes a pattern as black only when each of its lines is black on every LED",
 	} {
 		if !strings.Contains(readme, words) {
 			t.Errorf("the README does not say %q", words)

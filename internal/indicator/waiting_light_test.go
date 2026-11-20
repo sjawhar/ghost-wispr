@@ -22,26 +22,37 @@ func flashEvery(t *testing.T, d time.Duration) {
 	t.Cleanup(func() { waitingFlashEvery = original })
 }
 
-// waitingRig runs a controller over a two-LED fakeLight, checking every 5 ms,
-// and keeps every check's result.
+// waitingRig runs a controller over a two-LED fakeLight and keeps every
+// check's result. capturing says whether audio records; it starts true.
 type waitingRig struct {
 	light      *fakeLight
 	controller *Controller
 	recording  atomic.Bool
+	capturing  atomic.Bool
 	mu         sync.Mutex
 	reports    []error
 }
 
+// startWaitingRig starts a waitingRig that checks the light every 5 ms.
 func startWaitingRig(t *testing.T, recording bool) *waitingRig {
+	t.Helper()
+	return startWaitingRigEvery(t, recording, 5*time.Millisecond)
+}
+
+// startWaitingRigEvery starts a waitingRig that checks the light every
+// interval, and on each Wake.
+func startWaitingRigEvery(t *testing.T, recording bool, interval time.Duration) *waitingRig {
 	t.Helper()
 	flashEvery(t, 10*time.Millisecond)
 	r := &waitingRig{light: &fakeLight{}}
 	r.recording.Store(recording)
-	r.controller = NewController(r.light, r.recording.Load, 5*time.Millisecond, func(err error) {
+	r.capturing.Store(true)
+	r.controller = NewController(r.light, r.recording.Load, interval, func(err error) {
 		r.mu.Lock()
 		defer r.mu.Unlock()
 		r.reports = append(r.reports, err)
 	})
+	r.controller.FlashWhile(r.capturing.Load)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() { r.controller.Run(ctx); close(done) }()
@@ -204,4 +215,87 @@ func TestControllerStopsTheFlashWhenItStops(t *testing.T) {
 	if light.colour != ([3]uint8{}) || light.led2 != ([3]uint8{}) {
 		t.Fatalf("LEDs after the controller ended = %v, %v; want both off", light.colour, light.led2)
 	}
+}
+
+// TestControllerFlashesOnlyWhileAudioRecords fails if LED 2 flashes while LED
+// 1 is red but no audio records (FlashWhile), as while the microphone closes
+// after a pause or reopens under a red hold; LED 2 must show red then, and
+// flash once audio records again.
+func TestControllerFlashesOnlyWhileAudioRecords(t *testing.T) {
+	r := startWaitingRig(t, true)
+	r.capturing.Store(false)
+	r.controller.SetWaiting(true)
+	time.Sleep(10 * waitingFlashEvery)
+	if writes, _ := r.led2Writes(); count(writes, colourGreen) != 0 {
+		t.Fatalf("LED 2 written %v while no audio recorded, want no green", writes)
+	}
+
+	r.capturing.Store(true)
+	waitFor(t, "the flash once audio records", func() bool { writes, _ := r.led2Writes(); return count(writes, colourGreen) >= 1 })
+
+	r.capturing.Store(false)
+	waitFor(t, "LED 2 red once audio stops", func() bool { _, led2 := r.leds(); return led2 == colourRed })
+	stopped, _ := r.led2Writes()
+	time.Sleep(10 * waitingFlashEvery)
+	if after, _ := r.led2Writes(); count(after[len(stopped):], colourGreen) != 0 {
+		t.Fatalf("LED 2 written %v after audio stopped, want no green", after[len(stopped):])
+	}
+}
+
+// TestControllerStopsTheFlashWhenLED1IsNotRed fails if a check that finds LED
+// 1 not red, a consent fault, leaves LED 2 flashing: the check writes both
+// LEDs red, and LED 2 stays red until a check finds LED 1 red as it was left.
+func TestControllerStopsTheFlashWhenLED1IsNotRed(t *testing.T) {
+	r := startWaitingRigEvery(t, true, time.Hour)
+	r.controller.SetWaiting(true)
+	waitFor(t, "the flash", func() bool { writes, _ := r.led2Writes(); return count(writes, colourGreen) >= 1 })
+
+	r.light.mu.Lock()
+	r.light.colour = colourGreen // LED 1 is not red
+	r.light.mu.Unlock()
+	r.controller.Wake()
+	waitFor(t, "both LEDs red again", func() bool { led1, led2 := r.leds(); return led1 == colourRed && led2 == colourRed })
+	stopped, _ := r.led2Writes()
+	time.Sleep(10 * waitingFlashEvery)
+	if after, _ := r.led2Writes(); len(after) != len(stopped) {
+		t.Fatalf("LED 2 written %v after a check found LED 1 not red, want nothing until a check finds it red", after[len(stopped):])
+	}
+
+	r.controller.Wake() // a check that finds LED 1 red
+	waitFor(t, "the flash again", func() bool {
+		writes, _ := r.led2Writes()
+		return count(writes[len(stopped):], colourGreen) >= 1
+	})
+}
+
+// TestControllerTurnsLED2OffWhenLED1IsAlreadyOff fails if a check while not
+// recording leaves LED 2 lit because LED 1 already reads off, as when a
+// program turned LED 1 alone off during the flash: it writes both LEDs off.
+func TestControllerTurnsLED2OffWhenLED1IsAlreadyOff(t *testing.T) {
+	flashEvery(t, time.Hour) // LED 2 stays green after the flash's first write
+	light := &fakeLight{}
+	var recording atomic.Bool
+	recording.Store(true)
+	controller := NewController(light, recording.Load, time.Hour, nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { controller.Run(ctx); close(done) }()
+	t.Cleanup(func() {
+		cancel()
+		<-done
+	})
+	controller.SetWaiting(true)
+	leds := func() ([3]uint8, [3]uint8) {
+		light.mu.Lock()
+		defer light.mu.Unlock()
+		return light.colour, light.led2
+	}
+	waitFor(t, "LED 1 red, LED 2 green", func() bool { led1, led2 := leds(); return led1 == colourRed && led2 == colourGreen })
+
+	light.mu.Lock()
+	light.colour = [3]uint8{} // LED 1 alone goes off
+	light.mu.Unlock()
+	recording.Store(false)
+	controller.Wake()
+	waitFor(t, "both LEDs off", func() bool { led1, led2 := leds(); return led1 == [3]uint8{} && led2 == [3]uint8{} })
 }

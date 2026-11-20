@@ -202,3 +202,30 @@ func TestAFlashNeverReadsAsLED1(t *testing.T) {
 		})
 	}
 }
+
+// TestBlackPatternRewritesAPatternThatPlaysOnOneLED fails if the black
+// pattern check takes a pattern whose lines are black but play on one LED
+// alone for black: once the recorder stops, the watchdog plays it, and the
+// other LED keeps what it showed, LED 2's green for one. Each line must play
+// on every LED (LED number 0), as the pattern Ghost Wispr writes does.
+func TestBlackPatternRewritesAPatternThatPlaysOnOneLED(t *testing.T) {
+	r := newSaveRig(t, "answer-led")
+	r.device.mu.Lock()
+	for i := range r.device.ram {
+		r.device.ram[i], r.device.flash[i] = [3]byte{}, [3]byte{}
+		r.device.ramLED[i], r.device.flashLED[i] = 1, 1 // black on LED 1 alone, as another program wrote it
+	}
+	r.device.mu.Unlock()
+
+	if err := r.open().BlackPattern(); err != nil {
+		t.Fatalf("BlackPattern: %v", err)
+	}
+	r.device.mu.Lock()
+	defer r.device.mu.Unlock()
+	if r.device.ramLED != [32]byte{} || r.device.flashLED != [32]byte{} {
+		t.Fatalf("pattern lines' LEDs after the check: RAM %v, flash %v; want every line on every LED (0)", r.device.ramLED, r.device.flashLED)
+	}
+	if r.device.ram != [32][3]byte{} || r.device.flash != [32][3]byte{} {
+		t.Fatal("the rewritten pattern is not black")
+	}
+}

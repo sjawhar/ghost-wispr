@@ -79,6 +79,49 @@ func TestTheWaitingLightNeverFlashesWhilePaused(t *testing.T) {
 	r.waitOff(t)
 }
 
+// TestTheWaitingLightStopsWhileNoAudioRecords fails if LED 2 flashes green
+// while LED 1 stays red but no audio records: after a pause, until the mic
+// loop has closed the microphone, and while a red hold keeps LED 1 red for a
+// microphone that reopens. LED 2 shows red then.
+func TestTheWaitingLightStopsWhileNoAudioRecords(t *testing.T) {
+	for name, stop := range map[string]func(t *testing.T, r *lightRig){
+		"a pause, before the microphone closes": func(_ *testing.T, r *lightRig) { r.capture.Pause() },
+		"a red hold while the microphone reopens": func(t *testing.T, r *lightRig) {
+			r.mic.open.Store(false)
+			if err := r.hardware.EnsureRed(); err != nil {
+				t.Fatalf("EnsureRed: %v", err)
+			}
+			t.Cleanup(r.hardware.ReleaseRedHold)
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			r := startLightRig(t, false)
+			openMicUnderRed(t, r)
+			waitingLED{r.hardware}.On()
+			waitForHardwareWithin(t, testWait, "the flash", func() bool {
+				led2, _ := r.device.secondLED()
+				return led2 == led2Green
+			})
+
+			stop(t, r)
+			r.hardware.Wake()
+			waitForHardwareWithin(t, testWait, "LED 2 red with LED 1 red", func() bool {
+				r.device.mu.Lock()
+				defer r.device.mu.Unlock()
+				return r.device.colour == led2Red && r.device.led2 == led2Red
+			})
+			_, stopped := r.device.secondLED()
+			time.Sleep(1200 * time.Millisecond) // past two of the flash's 500 ms steps
+			_, after := r.device.secondLED()
+			for _, colour := range after[len(stopped):] {
+				if colour != led2Red {
+					t.Fatalf("LED 2 written %v while no audio recorded, want red only", after[len(stopped):])
+				}
+			}
+		})
+	}
+}
+
 // led2Light is a two-LED light whose LED 2 writes fail with led2Err.
 type led2Light struct {
 	opsLight

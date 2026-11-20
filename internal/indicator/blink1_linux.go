@@ -548,11 +548,14 @@ func (b *blink1) BlackPattern() error {
 
 // PatternCheck returns the black pattern check of BlackPattern, which sends
 // one command per Step: the version query if the line count is not known,
-// then a query of each pattern line. At the first line that is not black, it
-// writes the black pattern ('l', a 'P' per line), saves it ('W') and reads
-// every line again; a pattern that does not read back black fails it. The
-// reads see the lines in RAM, which the watchdog plays; 'W' saves them to
-// flash, which a power-up loads.
+// then a query of each pattern line. At the first line that is not black on
+// every LED, it writes the black pattern ('l' 0, a 'P' per line), saves it
+// ('W') and reads every line again; a pattern that does not read back black
+// fails it. A line is black on every LED when its colour is black, its
+// duration is not zero and its LED number, byte 7 of the reply, is 0: a black
+// line on one LED leaves the other as it was, as LED 2's green. The reads see
+// the lines in RAM, which the watchdog plays; 'W' saves them to flash, which
+// a power-up loads.
 //
 // A read of RAM cannot show what flash holds, so a unit is made known black
 // (checkedUnits) only by a save of the black pattern seen to reach it: this
@@ -616,9 +619,9 @@ func (c *blink1PatternCheck) Step() (bool, error) {
 		if err := c.b.query(&report); err != nil {
 			return false, err
 		}
-		if report[2] != 0 || report[3] != 0 || report[4] != 0 || (report[5] == 0 && report[6] == 0) {
+		if report[2] != 0 || report[3] != 0 || report[4] != 0 || (report[5] == 0 && report[6] == 0) || report[7] != 0 {
 			if c.written {
-				return false, errors.New("saved blink(1) pattern is not black")
+				return false, errors.New("saved blink(1) pattern is not black on every LED")
 			}
 			c.phase, c.line = checkSelectLEDs, 0
 			return false, nil

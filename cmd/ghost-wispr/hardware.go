@@ -522,6 +522,10 @@ func startHardware(ctx context.Context, cfg *config.Config, capture *captureGate
 		guard := newLightGuard(capture, warnings, lightRetryEvery)
 		hardware.reportLight = guard.report
 		hardware.controller = indicator.NewController(hardware.light, wantRed, lightCheckEvery, guard.report)
+		// LED 2 flashes only while room audio reaches the recording: not while
+		// the microphone closes after a pause, nor while a red hold keeps the
+		// light red for a microphone that reopens.
+		hardware.controller.FlashWhile(func() bool { return recordingSignal(capture, mic) })
 		go guard.run(ctx)
 		go func() {
 			defer close(done)

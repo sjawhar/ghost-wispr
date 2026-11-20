@@ -114,10 +114,12 @@ func setLED2(light Light, colour [3]uint8) error {
 }
 
 // Controller keeps a light red only while its recording signal is true, and
-// flashes its LED 2 green while it is red and something waits for a person.
+// flashes its LED 2 green while LED 1 reads red, audio records (FlashWhile)
+// and something waits for a person.
 type Controller struct {
 	light     Light
 	recording func() bool
+	capturing func() bool // audio records (FlashWhile); nil: LED 1 red is enough
 	interval  time.Duration
 	checked   func(error)
 	wake      chan struct{}
@@ -132,6 +134,7 @@ type Controller struct {
 	flashGreen bool
 	led2       [3]uint8
 	led2Dirty  bool
+	leftRed    bool // the last check left LED 1 confirmed red
 }
 
 // NewController returns a controller for light. checked, when not nil, gets
@@ -164,6 +167,19 @@ func (c *Controller) Wake() {
 func (c *Controller) SetWaiting(waiting bool) {
 	c.waiting.Store(waiting)
 	c.Wake()
+}
+
+// FlashWhile sets what must hold, besides LED 1 reading red, for LED 2 to
+// flash: in the recorder, that room audio reaches the recording. The light
+// stays red longer, as while the microphone closes after a pause or reopens,
+// and LED 2 then shows red. Call it before Run.
+func (c *Controller) FlashWhile(capturing func() bool) {
+	c.capturing = capturing
+}
+
+// recordsAudio reports whether audio records, as FlashWhile says.
+func (c *Controller) recordsAudio() bool {
+	return c.capturing == nil || c.capturing()
 }
 
 // Run manages the light until ctx ends. The device's own watchdog restores its
@@ -217,19 +233,26 @@ func (c *Controller) update() {
 	if c.recording() {
 		wantRed = 255
 	}
-	err := c.apply(wantRed)
-	c.showWaiting(wantRed == 255 && err == nil)
+	steady, err := c.apply(wantRed)
+	red := wantRed == 255 && err == nil
+	// A check that finds LED 1 not red where the last check left it red is a
+	// consent fault, not a resume.
+	c.showWaiting(red, steady || !c.leftRed)
+	c.leftRed = red
 	if c.checked != nil {
 		c.checked(err)
 	}
 }
 
-// showWaiting starts or stops the flash, as something waits or not, and
-// writes LED 2. red says that LED 1 reads red while the unit records: without
-// it the flash stops and LED 2 is left alone, since the light's own check
-// failed or the off write turned every LED off.
-func (c *Controller) showWaiting(red bool) {
-	switch flashing := red && c.waiting.Load(); {
+// showWaiting starts or stops the flash, and writes LED 2. red says that LED
+// 1 reads red while the unit records: without it the flash stops and LED 2 is
+// left alone, since the light's own check failed or the off write turned
+// every LED off. The flash runs while something waits, audio records, and
+// LED 1 kept the red the last check left it (steady): a check that found it
+// otherwise, a consent fault, wrote both LEDs red, and LED 2 stays red until
+// a check finds LED 1 red again.
+func (c *Controller) showWaiting(red, steady bool) {
+	switch flashing := red && steady && c.waiting.Load() && c.recordsAudio(); {
 	case flashing && c.flash == nil:
 		c.flash = time.NewTicker(waitingFlashEvery)
 		c.flashGreen = true
@@ -243,12 +266,13 @@ func (c *Controller) showWaiting(red bool) {
 }
 
 // flashStep turns LED 2 from green to off or back. Once the unit no longer
-// records, it updates instead, which turns every LED off and stops the flash.
+// records, or audio no longer reaches the recording, it checks the light
+// instead, which stops the flash.
 func (c *Controller) flashStep() {
 	if c.flash == nil {
 		return
 	}
-	if !c.recording() {
+	if !c.recording() || !c.recordsAudio() {
 		c.update()
 		return
 	}
@@ -279,38 +303,39 @@ func (c *Controller) writeLED2() {
 	c.led2, c.led2Dirty = want, want != led2Red
 }
 
-// apply makes the light show wantRed. It fails when the light cannot be read
-// or written, or, while recording, does not read back red after a red write:
-// the recorder then may not capture. An off write that does not read back
-// off is not a failure, since a red confirmation can hold the light red.
-// While nothing records, a light it cannot read is written off anyway, as
-// when another open holds the blink(1)'s lock: a pause turns the light off
-// without waiting for the read to get through. Each write writes every LED,
-// LED 2 too.
-func (c *Controller) apply(wantRed uint8) error {
+// apply makes the light show wantRed, and reports whether LED 1 read so at
+// once (steady). It fails when the light cannot be read or written, or, while
+// recording, does not read back red after a red write: the recorder then may
+// not capture. An off write that does not read back off is not a failure,
+// since a red confirmation can hold the light red. While nothing records, a
+// light it cannot read is written off anyway, as when another open holds the
+// blink(1)'s lock: a pause turns the light off without waiting for the read
+// to get through; and so is one whose LED 1 reads off while the flash may
+// have left LED 2 lit. Each write writes every LED, LED 2 too.
+func (c *Controller) apply(wantRed uint8) (steady bool, err error) {
 	red, green, blue, err := c.light.ReadRGB()
 	if err != nil {
 		if wantRed == 0 && c.light.SetRGB(0, 0, 0) == nil {
 			c.led2Dirty = false
 		}
-		return err
+		return false, err
 	}
-	if red == wantRed && green == 0 && blue == 0 {
-		return nil
+	if red == wantRed && green == 0 && blue == 0 && (wantRed != 0 || !c.led2Dirty) {
+		return true, nil
 	}
 	if err := c.light.SetRGB(wantRed, 0, 0); err != nil {
-		return err
+		return false, err
 	}
 	c.led2Dirty = false
 	if wantRed == 0 {
-		return nil
+		return false, nil
 	}
 	red, green, blue, err = c.light.ReadRGB()
 	if err != nil {
-		return err
+		return false, err
 	}
 	if red != 255 || green != 0 || blue != 0 {
-		return fmt.Errorf("%w: it reads %d,%d,%d", ErrNotRed, red, green, blue)
+		return false, fmt.Errorf("%w: it reads %d,%d,%d", ErrNotRed, red, green, blue)
 	}
-	return nil
+	return false, nil
 }

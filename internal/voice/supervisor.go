@@ -202,6 +202,7 @@ type Supervisor struct {
 	chimeCancel   context.CancelFunc // ends the answer chime playing or about to
 	chimeCtx      context.Context    // that chime's context, nil while none plays
 	pending       []*pendingAnswer
+	arrivals      uint64    // answers taken so far; each held answer's arrived
 	lit           bool      // the waiting light was last told On (showWaitingLocked)
 	voiceSpeaking bool      // the voice input plays
 	voiceStarted  time.Time // when it last started
@@ -227,9 +228,13 @@ type pendingAnswer struct {
 	PendingAnswer
 	needsInvite bool // a stop or a room word came after its question: only "Wispr, go ahead" speaks it
 	chimed      bool
+	// arrived orders held answers by arrival: an answer cut early goes back
+	// to the front of pending, and keeps its place in time.
+	arrived uint64
 	// dismissing: a "Wispr, never mind" waits for the Concierge to say whether
 	// it cancelled a working question; until then this answer neither sounds
-	// nor speaks by itself, and with none cancelled it is dropped.
+	// nor speaks by itself, and with none cancelled it is dropped. A
+	// "Wispr, go ahead" clears it, and the never mind then leaves it.
 	dismissing bool
 }
 
@@ -729,15 +734,18 @@ func (s *Supervisor) onTranscriptLocked(t *Transcript) {
 
 // neverMindLocked answers "Wispr, never mind" (R7): the Concierge cancels the
 // session's newest working question; with none, the session's newest held
-// answer is dropped, and nothing of it plays. Until the Concierge says, that
-// answer neither sounds nor speaks by itself (dismissing); "Wispr, go ahead"
-// still speaks it, as the later word.
+// answer by arrival is dropped, and nothing of it plays: once no answer
+// waits, an answer sound queued or playing stops. Until the Concierge says,
+// that answer neither sounds nor speaks by itself (dismissing), and a second
+// never mind takes the next newest. A "Wispr, go ahead" meanwhile still
+// speaks it, as the later word, and takes it from this never mind
+// (speakLocked). When the Concierge call fails, the answer waits for
+// "Wispr, go ahead".
 func (s *Supervisor) neverMindLocked(sessionID string) {
 	var held *pendingAnswer
-	for _, p := range slices.Backward(s.pending) {
-		if p.SessionID == sessionID {
+	for _, p := range s.pending {
+		if p.SessionID == sessionID && !p.dismissing && (held == nil || p.arrived > held.arrived) {
 			held = p
-			break
 		}
 	}
 	if held != nil {
@@ -755,13 +763,24 @@ func (s *Supervisor) neverMindLocked(sessionID string) {
 		}
 		s.mu.Lock()
 		defer s.mu.Unlock()
-		held.dismissing = false
-		if err != nil || cancelled || !slices.Contains(s.pending, held) {
-			return
+		if !held.dismissing {
+			return // a go-ahead took it since
 		}
-		s.pending = slices.DeleteFunc(s.pending, func(p *pendingAnswer) bool { return p == held })
-		s.logf("voice: never mind dropped a held answer (task %s)", held.TaskID)
-		s.showWaitingLocked()
+		held.dismissing = false
+		switch {
+		case err != nil:
+			held.needsInvite = true
+		case cancelled || !slices.Contains(s.pending, held):
+		default:
+			s.pending = slices.DeleteFunc(s.pending, func(p *pendingAnswer) bool { return p == held })
+			s.logf("voice: never mind dropped a held answer (task %s)", held.TaskID)
+			if len(s.pending) == 0 && s.chimeCancel != nil {
+				s.chimeCancel() // the answer sound, even one whose playback has not begun
+				s.chimeCancel, s.chimeCtx = nil, nil
+				s.cfg.Speaker.Cancel(audio.InputChime)
+			}
+			s.showWaitingLocked()
+		}
 	})
 }
 
@@ -1269,6 +1288,7 @@ func (s *Supervisor) speakLocked(p *pendingAnswer) {
 		p.needsInvite = true
 		return
 	}
+	p.dismissing = false // the later word: an earlier never mind no longer drops it
 	s.pending = slices.DeleteFunc(s.pending, func(q *pendingAnswer) bool { return q == p })
 	s.showWaitingLocked()
 	ctx, cancel := context.WithTimeout(s.ctx, exchangeMax)
@@ -1354,7 +1374,10 @@ func (s *Supervisor) offerAnswers() {
 				continue
 			}
 			s.mu.Lock()
-			if !s.closed {
+			// An answer that lands with the voice off is dropped, as offLocked
+			// drops those held when it turns off: it stays in writing on its
+			// session's page.
+			if !s.closed && !s.offLocked() {
 				// It waits for "Wispr, go ahead" unless the floor stayed free
 				// since its question (R7): no stop and no room word since t0.
 				// t0 is the end of the last turn of the exchange that asked,
@@ -1367,7 +1390,8 @@ func (s *Supervisor) offerAnswers() {
 				}
 				stoppedSince := !s.lastStopAt.IsZero() && !s.lastStopAt.Before(a.AskedAt)
 				talkedSince := !s.lastRoomWord.IsZero() && s.lastRoomWord.After(t0)
-				s.pending = append(s.pending, &pendingAnswer{PendingAnswer: a, needsInvite: a.AskedAt.IsZero() || stoppedSince || talkedSince})
+				s.arrivals++
+				s.pending = append(s.pending, &pendingAnswer{PendingAnswer: a, arrived: s.arrivals, needsInvite: a.AskedAt.IsZero() || stoppedSince || talkedSince})
 				s.showWaitingLocked()
 				s.timing("answer_ready", a.SessionID, time.Now())
 				select {
