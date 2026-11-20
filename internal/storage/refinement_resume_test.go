@@ -4,6 +4,9 @@ import (
 	"path/filepath"
 	"slices"
 	"testing"
+	"time"
+
+	"github.com/sjawhar/ghost-wispr/internal/transcribe"
 )
 
 // resumes returns the sessions whose refinement the next start runs again,
@@ -150,5 +153,57 @@ func TestAnAutomaticRetryIsNotClaimedOverAPersonsRetry(t *testing.T) {
 	expectResumes(t, store, "once a pressed Retry claimed the refinement", nil, nil)
 	if claimResume(t, store, "20261120080131") {
 		t.Fatal("the automatic retry was claimed over a person's Retry")
+	}
+}
+
+// TestADeletionWhileARetryIsOwedCancelsIt fails if a "Delete text" of an
+// untimed segment, made after the start found the refinement a stop cut off
+// and before it retried it, leaves that retry owed. The same deletion made
+// while the refinement still ran fails it, so the start owes it nothing; one
+// made while its retry is owed must end the retry the same way. The control
+// session, not deleted from, keeps its retry.
+func TestADeletionWhileARetryIsOwedCancelsIt(t *testing.T) {
+	store := newTestSQLiteStore(t)
+	endedWith(t, store, "20261120080131", "/audio/a.mp3", RefinementRunning)
+	endedWith(t, store, "20261120081500", "/audio/b.mp3", RefinementRunning)
+	if err := store.AppendSegment("20261120080131", transcribe.Segment{Text: "untimed synthetic words", Timestamp: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.DB().Exec(`UPDATE segments SET untimed = 1 WHERE session_id = ?`, "20261120080131"); err != nil {
+		t.Fatal(err)
+	}
+	recoverRefinements(t, store)
+	segments, err := store.GetSegments("20261120080131")
+	if err != nil || len(segments) != 1 {
+		t.Fatalf("segments %v: %v", segments, err)
+	}
+	if err := store.DeleteRefinedSegmentText("20261120080131", segments[0].ID, 0); err != nil {
+		t.Fatal(err)
+	}
+	if claimResume(t, store, "20261120080131") {
+		t.Fatal("the automatic retry was claimed after a deletion made while it was owed")
+	}
+	if !claimResume(t, store, "20261120081500") {
+		t.Fatal("the control session's automatic retry was not claimed")
+	}
+	expectResumes(t, store, "after the deletion", nil, nil)
+}
+
+// TestAnOwedRetrySurvivesGC fails if GC, which may take an owed session's
+// synced recording before the start retries it, ends the retry: the
+// refinement becomes no_audio, and the Retry action restores the recording
+// from Drive and runs it.
+func TestAnOwedRetrySurvivesGC(t *testing.T) {
+	store := newTestSQLiteStore(t)
+	endedAndSynced(t, store, "20261120080131", "/audio/a.mp3", RefinementRunning)
+	recoverRefinements(t, store)
+	if _, changed, err := store.MarkAudioRemoved("20261120080131", "/audio/a.mp3", "", false, time.Now()); err != nil || !changed {
+		t.Fatalf("GC's mark: changed=%t, %v", changed, err)
+	}
+	if got, err := store.GetSession("20261120080131"); err != nil || got.RefinementStatus != RefinementNoAudio {
+		t.Fatalf("after GC's mark the refinement is %q (%v), want no_audio", got.RefinementStatus, err)
+	}
+	if !claimResume(t, store, "20261120080131") {
+		t.Fatal("the automatic retry of a refinement whose recording GC took was not claimed")
 	}
 }
