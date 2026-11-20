@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -201,5 +202,30 @@ func TestEnvoyWithNoHubURLSendsNothing(t *testing.T) {
 	}
 	if hub.posts() != 0 {
 		t.Fatalf("hub received %d publishes with nothing to send, want none", hub.posts())
+	}
+}
+
+// TestANonHTTPHubURLWarnsAndSendsNothing fails if a hub URL the listener's
+// HTTP publish route cannot answer, such as the hub's NATS address, builds a
+// publisher that reports itself enabled while every send fails, instead of a
+// /api/status warning.
+func TestANonHTTPHubURLWarnsAndSendsNothing(t *testing.T) {
+	publishing, warnings := testEnvoyPublishing(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	publishing.configure(ctx, envoyConfig("nats://hub.example.test:4222"), discardLogger)
+	if publishing.current.Load() != nil {
+		t.Fatal("a NATS hub URL built an Envoy publisher")
+	}
+	list := warnings.List()
+	if len(list) != 1 || !strings.Contains(list[0], "nats://hub.example.test:4222") {
+		t.Fatalf("warnings = %q, want one naming the URL", list)
+	}
+
+	hub := newEnvoyHub(t)
+	publishing.configure(ctx, envoyConfig(hub.URL), discardLogger)
+	if publishing.current.Load() == nil || len(warnings.List()) != 0 {
+		t.Fatalf("control: an HTTP hub URL left publisher %v and warnings %q", publishing.current.Load(), warnings.List())
 	}
 }

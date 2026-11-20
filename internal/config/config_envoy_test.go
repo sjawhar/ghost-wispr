@@ -76,6 +76,22 @@ func TestEnvoyEnabledWarnings(t *testing.T) {
 		}
 	})
 
+	// The listener's publish route is HTTP: a NATS address, the hub's other
+	// port, would pass a check for a scheme and a host and fail every send.
+	t.Run("hub URL that is not HTTP", func(t *testing.T) {
+		clearEnv(t)
+		t.Setenv(EnvPrefix+"ENVOY_ENABLED", "true")
+		t.Setenv(EnvPrefix+"ENVOY_HUB_URL", "nats://hub.example.test:4222")
+
+		_, warnings, err := Load("")
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if !strings.Contains(strings.Join(warnings, "\n"), "Invalid envoy_hub_url") {
+			t.Fatalf("warnings %q do not refuse a NATS hub URL", warnings)
+		}
+	})
+
 	t.Run("control: Envoy off", func(t *testing.T) {
 		clearEnv(t)
 		_, warnings, err := Load("")

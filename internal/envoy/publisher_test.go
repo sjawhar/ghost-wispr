@@ -410,6 +410,22 @@ func TestHubListenerRefusesWhatTheListenerRefuses(t *testing.T) {
 	}
 }
 
+// TestNewClientRefusesANonHTTPURL fails if a client is built for a URL the
+// listener's HTTP publish route cannot answer, such as the hub's NATS
+// address: every send would fail while the unit reports Envoy enabled.
+func TestNewClientRefusesANonHTTPURL(t *testing.T) {
+	for _, url := range []string{"nats://hub.example.test:4222", "hub.example.test:9020", "http://"} {
+		if _, err := NewClient(url); err == nil {
+			t.Errorf("NewClient(%q) succeeded, want an error", url)
+		}
+	}
+	for _, url := range []string{"http://hub.example.test:9020", "https://hub.example.test"} {
+		if _, err := NewClient(url); err != nil {
+			t.Errorf("control: NewClient(%q) = %v, want a client", url, err)
+		}
+	}
+}
+
 func TestPublishSummaryReadyUsesSummaryVersionAndMarksStatus(t *testing.T) {
 	listener := newHubListener(t)
 	store := completedSession(3)

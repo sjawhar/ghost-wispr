@@ -144,12 +144,18 @@ type Client struct {
 }
 
 // NewClient returns a client of the hub's listener at listenerURL, such as
-// http://hub.example:9020. It does not contact the listener until Send.
+// http://hub.example:9020. It does not contact the listener until Send. A URL
+// that is not http or https, such as the hub's NATS address, is refused: the
+// listener's publish route is HTTP, and every send to it would fail.
 func NewClient(listenerURL string, opts ...Option) (*Client, error) {
 	return newClient(listenerURL, collectOptions(opts))
 }
 
 func newClient(listenerURL string, opts options) (*Client, error) {
+	parsed, err := url.Parse(strings.TrimSpace(listenerURL))
+	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" {
+		return nil, fmt.Errorf("envoy: the hub URL %q is not an http or https URL of the hub's listener", listenerURL)
+	}
 	listener, err := NewListener(listenerURL, opts.httpClient)
 	if err != nil {
 		return nil, err

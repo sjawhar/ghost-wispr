@@ -1166,6 +1166,8 @@ func OpenAPISpec() map[string]any {
 				"post": map[string]any{
 					"summary":     "Session event published to the Envoy hub",
 					"description": "With envoy_enabled, Ghost Wispr publishes session_started, session_ended and summary_ready to the Envoy hub's listener at envoy_hub_url, POST /v1/messages/publish, over the tailnet with no credential. Envoy stores each under notifications.ghostwispr.<session>.{session.started,session.ended,summary.ready}. No event carries a session's title, summary or transcript: Envoy keeps every event for 72 hours and no deletion can recall it. An event says which session it is, when it ran, and where to read its current text: session_url on this unit, and the session's Drive folder. Every send of one event carries the same idempotency_key, so Envoy stores and delivers a resend once.",
+					// The publish carries no credential: the hub's listener takes it over the tailnet.
+					"security": []map[string][]string{},
 					"requestBody": map[string]any{
 						"required": true,
 						"content": map[string]any{

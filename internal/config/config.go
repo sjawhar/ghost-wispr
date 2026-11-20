@@ -636,8 +636,8 @@ func validate(cfg *Config, hasExternalAccount bool) []string {
 		switch {
 		case cfg.EnvoyHubURL == "":
 			warnings = append(warnings, "Envoy enabled but its hub is not configured — set envoy_hub_url ("+EnvPrefix+"ENVOY_HUB_URL) to the hub listener's URL, or disable Envoy publishing.")
-		case err != nil || parsedURL.Scheme == "" || parsedURL.Host == "":
-			warnings = append(warnings, fmt.Sprintf("Invalid envoy_hub_url %q — it must be an absolute URL, such as http://hub.example.ts.net:9020; Envoy events are not sent.", cfg.EnvoyHubURL))
+		case err != nil || (parsedURL.Scheme != "http" && parsedURL.Scheme != "https") || parsedURL.Host == "":
+			warnings = append(warnings, fmt.Sprintf("Invalid envoy_hub_url %q — it must be the absolute URL of the hub's listener, http or https, such as http://hub.example.ts.net:9020; Envoy events are not sent.", cfg.EnvoyHubURL))
 		}
 	}
 	if publicURL := strings.TrimSpace(cfg.PublicURL); publicURL != "" {
