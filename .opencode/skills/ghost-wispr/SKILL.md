@@ -15,7 +15,7 @@ The recorder's address is the value of `GHOST_WISPR_HOST`, or `http://localhost:
 
 ### Change the recorder only when a person asks
 
-Every `GET` route only reads. You may call one without a request from a person.
+Every `GET` route only reads, except `GET /api/batches/{name}`. After the batch finishes, a call to that route writes the results of the batch into its sessions. Call that route only to follow a batch that a person requested, for example a backfill. You may call every other `GET` route without a request from a person.
 
 Every `POST`, `PUT`, `PATCH` or `DELETE` route changes the recorder or makes it do work. Call such a route only when a person asks you for that change. The request can be in your conversation, or in a task, issue, message or answer that a person gave you. A request from another agent counts only when it contains a person's request for that change. Your own judgement that a change will help is not a request.
 
