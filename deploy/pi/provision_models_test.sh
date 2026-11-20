@@ -55,8 +55,8 @@ for bad_id in '' 'drive id' 'drive/id' 'drive"id' "drive'id" 'drive:id' $'drive\
 done
 provisioner_function valid_drive_id "$drive_id" || fail 'the shared-drive ID check rejected a valid ID'
 
-# The office Pi's deployment settings, which the template's Google project, Envoy hub and
-# public_url must agree with.
+# The office Pi's deployment settings, which the template's Google project, Envoy hub, Dispatch
+# server and public_url must agree with.
 # shellcheck source=files/pi.env
 source "$test_root/deploy/pi/files/pi.env"
 # The hub's NATS server and its listener are one host: the listener answers on 9020.
@@ -84,6 +84,7 @@ for line in \
   'envoy_enabled: true' \
   "envoy_hub_url: $hub_url" \
   "  envoy_url: $hub_url" \
+  "  dispatch_url: $PI_DISPATCH_URL" \
   'jabra_mute_button: true' \
   'mic_device: J75' \
   'speaker_device: J75'; do

@@ -147,7 +147,7 @@ configuration for a normal certificate renewal.
 
 ## Prepare the bundle's public files
 
-The credential bundle holds five public files and one secret:
+The credential bundle holds five public files and one or two secrets:
 
 | File | Source |
 | --- | --- |
@@ -156,6 +156,7 @@ The credential bundle holds five public files and one secret:
 | `tailscale-client-id` | `ghostWisprTailnetClientId`, which `agent-infra`'s `seed` workflow printed in the log of the `root` job that created the Tailscale identity `ghost-wispr-x509` |
 | `tailscale-subject` | `ghostWisprAccountUniqueId` in `root/Pulumi.prod.yaml` on `agent-infra` `main` |
 | `deepgram-key` | `DEEPGRAM_API_KEY` from the operator's `secrets` store |
+| `dispatch-token` | the unit's own no-scope Dispatch token, for the meeting voice; optional, put in `$prepared` as "Turn on the meeting voice" says |
 
 The bundle holds no Envoy file: Ghost Wispr publishes to the Envoy hub over the tailnet with no
 credential, and `provision.sh` refuses a bundle that holds an `envoy-webhook-url` or
@@ -200,18 +201,20 @@ rm -rf -- "$d"
 
 `openssl` must print `subject=CN=ghost-wispr`, and `head` one line for each of the two files:
 the subject is digits and the client ID one token. `provision-pi.sh` refuses an empty file, and
-`provision.sh` a file of another form. None of these files is a secret: if another machine
-provisions the Pi, copy `$prepared` there.
+`provision.sh` a file of another form. None of these five files is a secret: if another machine
+provisions the Pi, copy `$prepared` there before you add `dispatch-token`, which is one.
 
 ## Provision
 
-`deploy/pi/provision-pi.sh` reads the Deepgram key, makes the bundle and runs
+`deploy/pi/provision-pi.sh` reads the secrets, makes the bundle and runs
 `deploy/pi/provision.sh` on the Pi. Run it from a checkout of the release's commit, on the
 machine that reaches the Pi over SSH.
 
-- It reads `DEEPGRAM_API_KEY` with `secrets` on the provisioning machine.
-- The key reaches disk only in a mode-0700 directory under `$XDG_RUNTIME_DIR` while it makes
-  the tar stream. It removes that directory as soon as `provision.sh` returns, also when
+- It reads `DEEPGRAM_API_KEY` with `secrets` on the provisioning machine, and the unit's Dispatch
+  token from `$prepared/dispatch-token` when that file exists. It refuses a `dispatch-token` that
+  is a link or empty, before it reaches the Pi.
+- The secrets reach the bundle only through a mode-0700 directory under `$XDG_RUNTIME_DIR` while
+  it makes the tar stream. It removes that directory as soon as `provision.sh` returns, also when
   `provision.sh` fails, and on any exit. No secret goes in an argument.
 - It copies only the provisioning sources to a temporary directory on the Pi and removes it
   afterwards, so the card keeps no source checkout.
@@ -715,10 +718,27 @@ identity. The fifth recording rule tells the room that a question sent to an age
    `concierge.envoy_url`. The Pi reaches neither until the tailnet grant of dispatch://INFRA-4617
    is applied; until then the voice answers "I cannot reach Dispatch yet", and the log warns every
    minute that the Envoy session did not open, with no restart needed once it can.
-2. The Pi's Dispatch token: a no-scope agent token (`POST /api/v1/me/agent-tokens` with
-   `{"name":"ghost-wispr-office-pi","scopes":[]}`), never a person's. Put it, one line, in the
-   credential bundle as `dispatch-token`; the full provisioner writes it to `.env` as
-   `GHOST_WISPR_DISPATCH_TOKEN`. Without it the voice answers "I cannot reach Dispatch yet".
+2. The Pi's Dispatch token: a no-scope agent token, never a person's. Before you run
+   `provision-pi.sh`, mint it into `$prepared/dispatch-token` with your own Dispatch token, which
+   must hold the `person` and `approve` scopes, in the file `DISPATCH_TOKEN_FILE` names:
+
+   <!-- provision_bundle_test.sh: dispatch-token -->
+   ```bash
+   (source "${GHOST_WISPR_PI_ENV:-deploy/pi/files/pi.env}" && umask 077 &&
+     trap 'rm -f -- "$prepared/mint.json"' EXIT &&
+     sed 's/^/Authorization: Bearer /' "${DISPATCH_TOKEN_FILE:?}" |
+     curl -fsS -H @- -H 'Content-Type: application/json' --data '{"name":"ghost-wispr-office-pi","scopes":[]}' \
+       "$PI_DISPATCH_URL/api/v1/me/agent-tokens" >"$prepared/mint.json" &&
+     jq -er .token "$prepared/mint.json" >"$prepared/dispatch-token" &&
+     jq -c '{id, name, scopes}' "$prepared/mint.json")
+   ```
+
+   It prints the new token's id, its name and `"scopes":[]`, never the token: Dispatch shows the
+   token only in the answer to the mint. `provision-pi.sh` carries the file in the credential
+   bundle, and the full provisioner writes it to `.env` as `GHOST_WISPR_DISPATCH_TOKEN`. Each full
+   provisioning rewrites `.env`, so give it `dispatch-token` each time: mint a new token, and revoke
+   the old one (`DELETE /api/v1/me/agent-tokens/{id}`). Without it the voice answers "I cannot reach
+   Dispatch yet".
 3. After the deploy, `/api/status` must hold no `voice` warning, and the journal must say
    `voice: on (voice A on gemini, ...)`.
 4. Time to first audio of the first sentence: the Gemini engine warms its connection when the voice
