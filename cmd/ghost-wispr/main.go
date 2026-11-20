@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -32,6 +33,7 @@ import (
 	"github.com/sjawhar/ghost-wispr/internal/gdrive"
 	"github.com/sjawhar/ghost-wispr/internal/genaiconfig"
 	"github.com/sjawhar/ghost-wispr/internal/googleauth"
+	"github.com/sjawhar/ghost-wispr/internal/indicator"
 	"github.com/sjawhar/ghost-wispr/internal/llm"
 	"github.com/sjawhar/ghost-wispr/internal/logging"
 	"github.com/sjawhar/ghost-wispr/internal/server"
@@ -751,6 +753,11 @@ func main() {
 	if err != nil {
 		log.Fatalf("storage init failed: %v", err)
 	}
+	// The recording light's pattern check saves the black pattern at each
+	// start unless a save recorded here is less than a day old, so a recorder
+	// restarted over and over does not wear the light's flash: the check
+	// records each save's attempt here before it sends it.
+	indicator.RecordSavesIn(filepath.Join(filepath.Dir(dbPath), "blink1-saves"))
 
 	// Recover any sessions left as 'active' from a previous crash/restart:
 	// each ends when its raw recording was last written.

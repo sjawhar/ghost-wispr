@@ -193,8 +193,20 @@ returns at once and checks the light in the background. Each press reads the pau
 while that button's own resume is still checking the light with no pause since: then the press
 counts the unit as resumed and pauses. The Jabra's mute light shows what its button counts: unmuted
 during that button's own resume, and the pause switch otherwise. A refused resume leaves the switch
-off and lights the Jabra's mute light again, so the next press resumes again. A save of the black pattern that does not reach
-the unit leaves it unknown, so it is checked again when it comes back. Programs that do not take the
+off and lights the Jabra's mute light again, so the next press resumes again. The check reads the
+pattern the light plays, not the one it saves, so a unit is known black only once a save of the
+black pattern reached it: a check that finds the pattern black saves it once more first, and a save
+that does not reach the unit leaves it unknown, so it is checked again when it comes back, in this
+process or the next. Two records per serial number in `blink1-saves/` next to the database bound
+the flash writes: each save's attempt is recorded before it is sent, and no save is sent for a day
+after one, nor when the attempt cannot be recorded; and a save seen to reach the unit is recorded
+after it, which for a day lets a check that finds that unit's pattern black know it black without
+a save. An attempt with no confirmed save after it, as after a crash or a failed transfer, leaves
+the unit unknown. So a recorder restarted over and over writes the blink(1)'s flash at most once a
+day. Ghost Wispr must be the only program that writes the blink(1)'s stored pattern, between
+recorder runs too: a confirmed save that an earlier run recorded counts for a day, and another
+program that writes the pattern in that time, even one that takes the lock, can leave the unit
+known black while its stored pattern is lit. Programs that do not take the
 lock, such as `blink1-tool`, must not run while the recorder runs: their own colour read can still
 answer the recorder's.
 

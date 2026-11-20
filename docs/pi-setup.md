@@ -446,10 +446,19 @@ do not make the recorder drop audio; one stopped while it holds the lock does, u
 continued. The watchdog tickle and an off write, which wait for no reply, are then sent without the
 lock, so the watchdog does not fire while the recorder runs, a pause turns the blink(1) off within
 500 ms whoever holds the lock, and `light-off` turns it off. A red write sends nothing. The recorder
-tickles only a blink(1) whose stored pattern it found black. After a device error it knows the same
-unit by its serial number and tickles it at once, whoever holds the lock; another unit, or one with
-no serial number, gets off writes only until a check finds its pattern black (the one before a red
-confirmation, or one a refused tickle or red write starts). That check runs before a resume
+tickles only a blink(1) whose stored pattern it knows is black: a save of the black pattern reached
+it, since a read shows the pattern the light plays, not the one it saves. After a device error it
+knows the same unit by its serial number and tickles it at once, whoever holds the lock; another
+unit, or one with no serial number, gets off writes only until a check finds its pattern black (the
+one before a red confirmation, or one a refused tickle or red write starts), and a check that finds
+it black saves it once more before it knows the unit. `/opt/ghost-wispr/data/blink1-saves/` holds
+two records per serial number: `<hex serial>.attempt`, written before each save is sent, after
+which no save is sent for a day (and none at all if the attempt cannot be written); and
+`<hex serial>.saved`, written once a save is seen to reach the unit, after which for a day a check
+that finds that unit's pattern black knows it without a save. A recorder that restarts every 10 s
+so writes the blink(1)'s flash at most once a day. An attempt with no `.saved` after it, as after a
+crash or a failed transfer, leaves the unit unknown, so the recorder checks it at each open and
+tickles it only once checked. Deleting the directory only allows one more save at the next start. That check runs before a resume
 takes the pause switch, from the web page, the power button or the Jabra alike, so a pause tapped
 during it is not held up, and the resume or microphone open it overtakes does not light the
 blink(1). A press of the power button or the Jabra that resumes checks the light in the background,
