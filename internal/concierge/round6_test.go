@@ -359,14 +359,14 @@ func TestTheAskRunsBesideTheFacts(t *testing.T) {
 			return errors.New("envoy: no answer in 3 s")
 		}
 	}
-	r.model.turns = [][]*genai.GenerateContentResponse{{chunk(text("PR 80 is in review."))}}
+	r.model.turns = [][]*genai.GenerateContentResponse{{chunk(text("ABC-12: PR 80 is in review."))}}
 	var mu sync.Mutex
 	var spoken []said
 	say := func(_ context.Context, text string, mode voice.SayMode) error {
 		mu.Lock()
 		spoken = append(spoken, said{text, mode})
 		mu.Unlock()
-		if text == "PR 80 is in review." {
+		if text == "ABC-12: PR 80 is in review." {
 			once.Do(func() { close(factSaid) })
 		}
 		return nil

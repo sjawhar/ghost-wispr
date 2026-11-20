@@ -284,7 +284,7 @@ func TestThePromptForbidsAGuessedWhen(t *testing.T) {
 	}
 	r := newRig(t)
 	heldIssue(r, "session", false)
-	r.model.turns = [][]*genai.GenerateContentResponse{{chunk(text("PR 80 is in review."))}}
+	r.model.turns = [][]*genai.GenerateContentResponse{{chunk(text("ABC-12: PR 80 is in review."))}}
 	answerTurn(t, r, "ask the agent on ABC-12 when slice one will be ready")
 	if len(r.model.requests) == 0 || !strings.Contains(r.model.requests[0][0].Parts[0].Text, "The recorder is asking the agent that holds ABC-12") {
 		t.Fatalf("the prompt of an asked question does not say the recorder asks the holder")
@@ -337,7 +337,7 @@ func TestARefusedQuestionIsNoOutage(t *testing.T) {
 	r := newRig(t)
 	heldIssue(r, "session", false)
 	r.agents.sendErr = &envoy.ListenerError{Path: "/v1/messages/send", Status: 403, Message: "refused"}
-	r.model.turns = [][]*genai.GenerateContentResponse{{chunk(text("PR 80 is in review."))}}
+	r.model.turns = [][]*genai.GenerateContentResponse{{chunk(text("ABC-12: PR 80 is in review."))}}
 	spoken := answerTurn(t, r, "ask the agent on ABC-12 whether the tap is merged")
 	if last := spoken[len(spoken)-1].text; last != "I could not ask the agent on ABC-12." {
 		t.Fatalf("spoken = %+v, want the could-not-ask line last", spoken)
@@ -562,7 +562,7 @@ func TestTheRoutingLineSaysAnAskNotAboutStatus(t *testing.T) {
 		time.Sleep(2200 * time.Millisecond)
 		close(r.records.docBlock)
 	}()
-	r.model.turns = [][]*genai.GenerateContentResponse{{chunk(text("PR 80 is in review."))}}
+	r.model.turns = [][]*genai.GenerateContentResponse{{chunk(text("ABC-12: PR 80 is in review."))}}
 	spoken := answerTurn(t, r, "is the tap on ABC-12 merged")
 	if len(spoken) == 0 || spoken[0].text != "Asking the agent on ABC-12." {
 		t.Fatalf("spoken = %+v, want the routing line to say the ask", spoken)
@@ -767,7 +767,7 @@ func TestTheHolderGetsAQuestionInTheAskersIntent(t *testing.T) {
 	}
 	r := newRig(t)
 	heldIssue(r, "session", false)
-	r.model.turns = [][]*genai.GenerateContentResponse{{chunk(text("PR 80 is in review."))}}
+	r.model.turns = [][]*genai.GenerateContentResponse{{chunk(text("ABC-12: PR 80 is in review."))}}
 	answerTurn(t, r, "please ask the agent on ABC-12 when SliceOne will be ready to try")
 	if len(r.agents.sent) != 1 || !strings.Contains(r.agents.sent[0].Message, "Question about ABC-12: When will slice one be ready to try?\n") {
 		t.Fatalf("sent %+v, want the clean question under the key", r.agents.sent)
@@ -960,7 +960,7 @@ func TestAnAskReadBeforeTheSessionExistedGoesOut(t *testing.T) {
 		}
 		r.concierge.Heard(context.Background(), &x, turn)
 		eventually(t, "the read-ahead of ABC-12", func() bool { return slices.Contains(r.records.calls(), "ABC-12") })
-		r.model.turns = [][]*genai.GenerateContentResponse{{chunk(text("PR 80 is in review."))}}
+		r.model.turns = [][]*genai.GenerateContentResponse{{chunk(text("ABC-12: PR 80 is in review."))}}
 		spoken := answerTurn(t, r, turn)
 		r.agents.mu.Lock()
 		sent := len(r.agents.sent)
@@ -1016,7 +1016,7 @@ func TestAnotherMeetingsEndKeepsAnEarlyAsk(t *testing.T) {
 	eventually(t, "the early read named the holder", func() bool { return r.concierge.wasNamed(&early, "agent-7") })
 	r.concierge.Heard(context.Background(), &r.exchange, turn)
 	r.concierge.SessionDeleted("an-older-meeting")
-	r.model.turns = [][]*genai.GenerateContentResponse{{chunk(text("PR 80 is in review."))}}
+	r.model.turns = [][]*genai.GenerateContentResponse{{chunk(text("ABC-12: PR 80 is in review."))}}
 	spoken := answerTurn(t, r, turn)
 	r.agents.mu.Lock()
 	sent := len(r.agents.sent)

@@ -112,7 +112,10 @@ func TestSolExplicitAskKeepsKeyWhenSendOutlastsAnswer(t *testing.T) {
 				}
 				return nil
 			}
-			r.model.turns = [][]*genai.GenerateContentResponse{{chunk(text("It is in progress, updated 2 hours ago."))}}
+			r.model.turns = [][]*genai.GenerateContentResponse{
+				{chunk(text("It is in progress, updated 2 hours ago."))},
+				{chunk(text("ABC-12 is in progress, updated 2 hours ago."))},
+			}
 			var got []said
 			err := r.concierge.Answer(context.Background(), &r.exchange, "ask the agent on ABC-12 when it will be ready?", recorder(&got))
 			close(release)
