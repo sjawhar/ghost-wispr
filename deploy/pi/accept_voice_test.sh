@@ -811,7 +811,9 @@ def arecord(args):
         # the chime is late, and then catch up, well before the step stops the recording;
         # arecord-overrun loses 250 ms of audio for good, as an arecord overrun does, so that every
         # later sound sits 250 ms earlier in the file (and the recordings log says so for ffmpeg);
-        # arecord-dies ends the recording 1 s later.
+        # arecord-dies ends the recording 1 s later. From the start, arecord-behind keeps the file
+        # 60 ms behind for the whole recording, as a loaded machine does, so that every anchor is
+        # read 60 ms late and no later anchor makes up for it.
         aplays, lag_until, skip = read("aplays", "0"), None, 0
         while True:
             time.sleep(0.005)
@@ -823,7 +825,7 @@ def arecord(args):
                     log_to("recordings", "%s %d" % (path, begun + skip))
             if "arecord-dies" in SCENARIO and lag_until is not None and t > lag_until + 1000:
                 return 1
-            lag = 1000 if lag_until is not None and t < lag_until else 0
+            lag = (1000 if lag_until is not None and t < lag_until else 0) + (60 if "arecord-behind" in SCENARIO else 0)
             # Whole 2-byte samples at 24 kHz of the rig's clock, CLOCK times the Pi's.
             target = 2 * int((t - lag - skip - begun) * CLOCK * 24)
             if target > written:
@@ -1242,6 +1244,16 @@ EOF
     printf '#!/usr/bin/env bash\nexec python3 %q %s "$@"\n' "$fakepi" "$tool" >"$root/bin/$tool"
   fi
 done
+# wc as a loaded machine runs it: with slow-wc, the size it prints is 200 ms old by the time it
+# exits, as a fork that waits for a CPU leaves it. The recording's anchors must not read their size
+# with it, or each would be 200 ms late.
+real_wc=$(type -P wc)
+cat >"$root/bin/wc" <<EOF
+#!/usr/bin/env bash
+out=\$($(printf '%q' "$real_wc") "\$@") || exit
+[[ \${GW_FAKE_SCENARIO:-} == *slow-wc* ]] && sleep 0.2
+printf '%s\n' "\$out"
+EOF
 # sudo as the Pi's ghost-wispr user has it: -n runs the command as root with no password. Unlike
 # sudo, it keeps the environment, which holds each fake command's state.
 cat >"$root/bin/sudo" <<'EOF'
@@ -1619,6 +1631,17 @@ launch cancel-drain long,asound,drain yes -- $cancel_args
 launch cancel-underrun long,asound,underrun yes -- $cancel_args
 # shellcheck disable=SC2086
 launch cancel-xrun long,asound,xrun yes -- $cancel_args
+# A recorder that writes 60 ms behind for the whole recording: a good cancel, whose true tail is
+# within the bound but whose measured tail is not, is UNKNOWN, not FAIL; a drain, whose tail is over
+# even at its early bound, is FAIL.
+# shellcheck disable=SC2086
+launch cancel-behind long,asound,arecord-behind yes -- $cancel_args
+# shellcheck disable=SC2086
+launch cancel-behind-drain long,asound,arecord-behind,drain yes -- $cancel_args
+# A wc whose sizes come 200 ms late: the recording's anchors read their size without it, so a good
+# cancel still passes.
+# shellcheck disable=SC2086
+launch cancel-slow-wc long,asound,slow-wc yes -- $cancel_args
 # shellcheck disable=SC2086
 launch cancel-journal-error long,asound,late-journal-error yes -- $cancel_args
 
@@ -2077,12 +2100,41 @@ expect_restored cancel-slow-status
 heard_after() {
   sed -n "s/^FAIL: playback-cancel: a stop's speech was heard at the rig microphone \([0-9]*\) ms after it.*/\1/p" "$root/$1/out"
 }
+# heard_up_to NAME: the milliseconds an UNKNOWN line says a stop's speech was heard up to after it.
+heard_up_to() {
+  sed -n "s/^UNKNOWN: playback-cancel: stop [0-9]*'s speech was heard at the rig microphone up to \([0-9]*\) ms after it.*/\1/p" "$root/$1/out"
+}
+# expect_not_passed NAME LOW HIGH: a tail over the bound whose early bound may or may not be over
+# it, by how late the recording's anchors were read: FAIL or UNKNOWN, never PASS, and the tail it
+# names, late bound, between LOW and HIGH.
+expect_not_passed() {
+  local got
+  got=$(cat "$root/$1/rc" 2>/dev/null)
+  case $got in
+    1) expect_between "$1: how long the tail is heard (FAIL)" "$(heard_after "$1")" "$2" "$3" ;;
+    2) expect_between "$1: how long the tail is heard up to (UNKNOWN)" "$(heard_up_to "$1")" "$2" "$3" ;;
+    *) check_failed "$1: exit status ${got:-none}, want 1 or 2; output: $(tr '\n' '|' <"$root/$1/out")" ;;
+  esac
+  expect_no_line "$1" "PASS: playback-cancel: no stop's speech was heard"
+}
+expect_rc cancel-behind 2
+expect_line cancel-behind "UNKNOWN: playback-cancel: stop "
+expect_line cancel-behind ", but no earlier than "
+expect_between 'cancel-behind: how long the good cancel is heard up to, 60 ms behind' "$(heard_up_to cancel-behind)" 60 120
+expect_line cancel-behind 'PASS: playback-cancel: 0 underruns'
+expect_no_line cancel-behind "FAIL: playback-cancel: a stop's speech was heard"
+expect_restored cancel-behind
+expect_rc cancel-behind-drain 1
+expect_between 'cancel-behind-drain: how long the negative control is heard, 60 ms behind' "$(heard_after cancel-behind-drain)" 450 1000
+expect_restored cancel-behind-drain
+expect_rc cancel-slow-wc 0
+expect_line cancel-slow-wc "PASS: playback-cancel: no stop's speech was heard at the rig microphone 20 ms after it"
+expect_restored cancel-slow-wc
 expect_rc cancel-drain 1
 expect_line cancel-drain "FAIL: playback-cancel: a stop's speech was heard at the rig microphone "
 expect_between 'cancel-drain: how long the negative control is heard' "$(heard_after cancel-drain)" 400 900
 expect_restored cancel-drain
-expect_rc cancel-tail 1
-expect_between 'cancel-tail: how long the 50 ms tail is heard' "$(heard_after cancel-tail)" 30 120
+expect_not_passed cancel-tail 30 120
 expect_restored cancel-tail
 expect_rc cancel-leak 1
 expect_between 'cancel-leak: how long the leaked word is heard' "$(heard_after cancel-leak)" 150 500
@@ -2135,8 +2187,11 @@ expect_rc cancel-clock-fast 0
 expect_restored cancel-clock-fast
 expect_rc cancel-clock-slow 0
 expect_restored cancel-clock-slow
-expect_rc cancel-tail-21-fast 1
-expect_between 'cancel-tail-21-fast: how long a 21 ms tail is heard with the rig clock 200 ppm fast' "$(heard_after cancel-tail-21-fast)" 21 40
+# A 21 ms tail with the rig clock 200 ppm fast: over the bound at its late bound, and never over it
+# at its early bound, which is early by at least the time arecord took to start.
+expect_rc cancel-tail-21-fast 2
+expect_between 'cancel-tail-21-fast: how long a 21 ms tail is heard up to with the rig clock 200 ppm fast' "$(heard_up_to cancel-tail-21-fast)" 21 40
+expect_no_line cancel-tail-21-fast "PASS: playback-cancel: no stop's speech was heard"
 expect_restored cancel-tail-21-fast
 expect_rc cancel-recorder-dies 2
 expect_line cancel-recorder-dies 'UNKNOWN: recording: arecord stopped before the step ended it'
