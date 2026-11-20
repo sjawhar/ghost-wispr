@@ -343,3 +343,52 @@ func TestAFastAnswerNamesTheQuestionsKey(t *testing.T) {
 		t.Fatalf("spoken = %+v, want the question's key", spoken)
 	}
 }
+
+// TestAFastAnswerWithALiveHolderRequiresTheQuestionsKey: a live holder adds
+// no holder line, so R8 itself must refuse a fast answer that drops the key
+// the person said. The model writes once more, then the fixed record sentence
+// is used. A fact that names the key remains a one-try control.
+func TestAFastAnswerWithALiveHolderRequiresTheQuestionsKey(t *testing.T) {
+	r := newRig(t)
+	heldIssue(r, "session", false)
+	r.model.turns = [][]*genai.GenerateContentResponse{
+		{chunk(text("It is in review."))},
+		{chunk(text("It is in review."))},
+	}
+	if spoken := answerTurn(t, r, "what is happening with ABC-12"); len(spoken) != 1 || spoken[0].text != "ABC-12: "+fixedSentence {
+		t.Fatalf("spoken = %+v, want only the fixed sentence with the key", spoken)
+	}
+	if len(r.model.requests) != 2 {
+		t.Fatalf("model calls = %d, want the first answer rejected and one rewrite", len(r.model.requests))
+	}
+
+	r = newRig(t)
+	heldIssue(r, "session", false)
+	r.model.turns = [][]*genai.GenerateContentResponse{{chunk(text("ABC-12 is in review."))}}
+	if spoken := answerTurn(t, r, "what is happening with ABC-12"); len(spoken) != 1 || spoken[0].text != "ABC-12 is in review." {
+		t.Fatalf("named-key control spoke %+v, want the fact", spoken)
+	}
+	if len(r.model.requests) != 1 {
+		t.Fatalf("named-key control made %d model calls, want 1", len(r.model.requests))
+	}
+}
+
+// TestAnExplicitAskQueuesForAnUnresponsiveHolder: Envoy stores an
+// unresponsive session's question. The Concierge sends it and says the agent
+// is not running now, instead of dropping the explicit ask.
+func TestAnExplicitAskQueuesForAnUnresponsiveHolder(t *testing.T) {
+	r := newRig(t)
+	heldIssue(r, "session", false)
+	r.agents.states["agent-7"] = envoy.SessionInfo{SessionID: "agent-7", State: envoy.StateUnresponsive}
+	r.model.turns = [][]*genai.GenerateContentResponse{{chunk(text("ABC-12 is in review."))}}
+	spoken := answerTurn(t, r, "ask the agent on ABC-12 whether the tap is merged")
+	r.agents.mu.Lock()
+	sent := slices.Clone(r.agents.sent)
+	r.agents.mu.Unlock()
+	if len(sent) != 1 || sent[0].Target != "agent-7" {
+		t.Fatalf("sent = %+v, want one question to the unresponsive holder", sent)
+	}
+	if !slices.ContainsFunc(spoken, func(s said) bool { return s.text == "ABC-12's agent is not running now." }) {
+		t.Fatalf("spoken = %+v, want the unresponsive-holder line", spoken)
+	}
+}

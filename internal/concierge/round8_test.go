@@ -8,6 +8,8 @@ import (
 	"time"
 
 	"google.golang.org/genai"
+
+	"github.com/sjawhar/ghost-wispr/internal/envoy"
 )
 
 // TestAReadBeforeTheSessionExistsIsUsed fails if the record read while the
@@ -32,41 +34,45 @@ func TestAReadBeforeTheSessionExistsIsUsed(t *testing.T) {
 	}
 }
 
-// TestAnAskTurnAsksOnceTheHolderIsKnown fails if a person's "ask the agent
-// on …" waits for the whole read of the record, which a slow spec read can
-// hold past the answer's bound, before the question goes to the holder: the
-// holder is known from issue_holder alone (R7).
+// TestAnAskTurnAsksOnceTheHolderIsKnown: an explicit ask goes out after the
+// holder read, even if the rest of the record is slow. An unresponsive holder
+// also hears that it is not running.
 func TestAnAskTurnAsksOnceTheHolderIsKnown(t *testing.T) {
-	r := newRig(t)
-	heldIssue(r, "session", false)
-	issue := r.records.issues["ABC-12"]
-	issue.PrimaryArtifactID = "spec-1"
-	issue.Artifacts = append(issue.Artifacts, struct {
-		ID   string `json:"id"`
-		Slug string `json:"slug"`
-	}{ID: "spec-1", Slug: "spec"})
-	r.records.docs["ABC-12/spec"] = "## Summary\n\nBuild a voice for meetings."
-	r.records.docBlock = make(chan struct{}) // the spec read never ends in time
-	t.Cleanup(func() { close(r.records.docBlock) })
-	r.concierge.fastBound = 2 * time.Second
-	r.model.turns = [][]*genai.GenerateContentResponse{{chunk(text("PR 80 is in review."))}}
-	var spoken []said
-	start := time.Now()
-	_ = r.concierge.Answer(context.Background(), &r.exchange, "ask the agent on ABC-12 whether the tap is merged", recorder(&spoken))
-	r.agents.mu.Lock()
-	sent := len(r.agents.sent)
-	r.agents.mu.Unlock()
-	if sent != 1 {
-		t.Fatalf("%d questions went to the holder in %v, want 1 though the record read was slow", sent, time.Since(start).Round(time.Millisecond))
-	}
-	asked := false
-	for _, s := range spoken {
-		if strings.HasPrefix(s.text, "I asked the agent on ABC-12.") {
-			asked = true
-		}
-	}
-	if !asked {
-		t.Fatalf("the voice did not say the question went out: %+v", spoken)
+	for _, c := range []struct {
+		state envoy.SessionState
+		want  string
+	}{
+		{envoy.StateLive, "I asked the agent on ABC-12."},
+		{envoy.StateUnresponsive, "ABC-12's agent is not running now."},
+	} {
+		t.Run(string(c.state), func(t *testing.T) {
+			r := newRig(t)
+			heldIssue(r, "session", false)
+			r.agents.states["agent-7"] = envoy.SessionInfo{SessionID: "agent-7", State: c.state}
+			issue := r.records.issues["ABC-12"]
+			issue.PrimaryArtifactID = "spec-1"
+			issue.Artifacts = append(issue.Artifacts, struct {
+				ID   string `json:"id"`
+				Slug string `json:"slug"`
+			}{ID: "spec-1", Slug: "spec"})
+			r.records.docs["ABC-12/spec"] = "## Summary\n\nBuild a voice for meetings."
+			r.records.docBlock = make(chan struct{})
+			t.Cleanup(func() { close(r.records.docBlock) })
+			r.concierge.fastBound = 2 * time.Second
+			r.model.turns = [][]*genai.GenerateContentResponse{{chunk(text("PR 80 is in review."))}}
+			var spoken []said
+			start := time.Now()
+			_ = r.concierge.Answer(context.Background(), &r.exchange, "ask the agent on ABC-12 whether the tap is merged", recorder(&spoken))
+			r.agents.mu.Lock()
+			sent := len(r.agents.sent)
+			r.agents.mu.Unlock()
+			if sent != 1 {
+				t.Fatalf("%d questions went to the holder in %v, want 1 though the record read was slow", sent, time.Since(start).Round(time.Millisecond))
+			}
+			if !slices.ContainsFunc(spoken, func(s said) bool { return strings.HasPrefix(s.text, c.want) }) {
+				t.Fatalf("the voice did not say %q: %+v", c.want, spoken)
+			}
+		})
 	}
 }
 
@@ -91,5 +97,22 @@ func TestTheHolderGetsACleanQuestion(t *testing.T) {
 func TestAHistoryQuestionIsAboutTheRecord(t *testing.T) {
 	if turn := "what is the full history of the issue about real time spoken conversation with its recent events?"; !aboutStatus(turn) {
 		t.Fatalf("aboutStatus(%q) = false, want the record to answer it", turn)
+	}
+}
+
+// TestAnUnresponsiveHolderIsAskedOnlyExplicitly: Envoy stores an explicit
+// question for an unresponsive session, but an automatic ask waits until the
+// holder runs.
+func TestAnUnresponsiveHolderIsAskedOnlyExplicitly(t *testing.T) {
+	r := newRig(t)
+	heldIssue(r, "session", false)
+	r.agents.states["agent-7"] = envoy.SessionInfo{SessionID: "agent-7", State: envoy.StateUnresponsive}
+	r.model.turns = [][]*genai.GenerateContentResponse{{chunk(text("PR 80 is in review."))}}
+	answerTurn(t, r, "is the tap on ABC-12 merged")
+	r.agents.mu.Lock()
+	sent := len(r.agents.sent)
+	r.agents.mu.Unlock()
+	if sent != 0 {
+		t.Fatalf("automatic ask sent %d questions to an unresponsive holder, want none", sent)
 	}
 }

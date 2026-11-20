@@ -198,14 +198,14 @@ func TestAnUnreachableEnvoySaysSoAndWrapsErrUnreachable(t *testing.T) {
 			r.agents.lookupErr, r.agents.lookupsBeforeErr = down, 1
 			r.model.turns = [][]*genai.GenerateContentResponse{
 				{chunk(call("c1", "issue_holder", map[string]any{"key": "XYZ-34"}, ""))},
-				{chunk(text("PR 80 is in review."))},
+				{chunk(text("ABC-12: PR 80 is in review."))},
 			}
 		}},
 		{"control: Envoy answers", ask, "", nil},
 	} {
 		r := newRig(t)
 		heldIssue(r, "session", false)
-		r.model.turns = [][]*genai.GenerateContentResponse{{chunk(text("PR 80 is in review."))}}
+		r.model.turns = [][]*genai.GenerateContentResponse{{chunk(text("ABC-12: PR 80 is in review."))}}
 		if c.cut != nil {
 			c.cut(r)
 		}
@@ -222,6 +222,9 @@ func TestAnUnreachableEnvoySaysSoAndWrapsErrUnreachable(t *testing.T) {
 		}
 		if c.line != "" && !slices.ContainsFunc(spoken, func(s said) bool { return s.text == c.line }) {
 			t.Errorf("%s: spoken = %+v, want %q", c.name, spoken, c.line)
+		}
+		if c.name == "a tool the model calls" && !slices.Contains(spoken, said{"ABC-12: PR 80 is in review.", voice.Fact}) {
+			t.Errorf("%s: spoken = %+v, want the keyed fact despite the other tool's outage", c.name, spoken)
 		}
 	}
 }
