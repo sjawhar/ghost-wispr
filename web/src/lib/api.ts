@@ -84,6 +84,12 @@ export function resumeRecording(): Promise<void> {
   return request<void>('/api/resume', { method: 'POST' })
 }
 
+// closeMicrophone moves the unit to closed from every state, as the Jabra's
+// mute button does: the paused listener stops too.
+export function closeMicrophone(): Promise<void> {
+  return request<void>('/api/close', { method: 'POST' })
+}
+
 export async function resummarize(sessionId: string, preset?: string): Promise<void> {
   const response = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/resummarize`, {
     method: 'POST',

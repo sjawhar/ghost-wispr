@@ -46,6 +46,7 @@ import (
 	"github.com/sjawhar/ghost-wispr/internal/transcribe"
 	"github.com/sjawhar/ghost-wispr/internal/tts"
 	"github.com/sjawhar/ghost-wispr/internal/voice"
+	"github.com/sjawhar/ghost-wispr/internal/wake/local"
 
 	"google.golang.org/genai"
 )
@@ -858,6 +859,9 @@ func main() {
 		}
 		return
 	}
+	if len(os.Args) > 1 && os.Args[1] == "kws-selftest" {
+		os.Exit(runKWSSelfTest(os.Args[2:], os.Stdout, os.Stderr))
+	}
 	if len(os.Args) > 1 && os.Args[1] == "tts-first-audio" {
 		os.Exit(runTTSFirstAudioCommand(context.Background(), os.Args[1:], configPath, nil, os.Stdin, os.Stdout, os.Stderr))
 	}
@@ -1112,7 +1116,7 @@ func main() {
 		voiceAudio = voiceTap
 	}
 
-	restoredPause, err := restorePause(store, capture)
+	restoredState, err := restorePause(store, capture)
 	var restorePauseErr error
 	if err != nil {
 		// The recorder must not start capturing when it cannot establish the
@@ -1120,8 +1124,9 @@ func main() {
 		restorePauseErr = err
 		slog.Warn("restore capture pause failed; starting paused", "error", err)
 		capture.Pause()
-		restoredPause = true
+		restoredState = micClosed
 	}
+	restoredPause := restoredState != micRecording
 	warningRegistry := newWarningsRegistry()
 	for i, warning := range cfgWarnings {
 		warningRegistry.Set(fmt.Sprintf("config-%03d", i), warning)
@@ -1298,7 +1303,8 @@ func main() {
 	recordMergedRefinementFailure := newMergedRefinementFailureRecorder(store)
 
 	controlHooks := &server.ControlHooks{
-		IsPaused:    capture.IsPaused,
+		IsPaused: capture.IsPaused,
+		// Pause, Close and Resume: wirePauseControls, below.
 		IsCapturing: func() bool { return capture.capturing(micStatus) },
 		RefreshRawEraseWarnings: func() {
 			if err := refreshRawEraseReservationWarnings(store, warningRegistry); err != nil {
@@ -1591,7 +1597,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 	// micDevice orders the Jabra's mute light against every open, close and
 	// probe of the capture device. A resume waits, before it confirms red,
 	// until the light can show it (prepareLightForOpen).
-	micDevice := newCaptureDevice(capture.IsPaused)
+	micDevice := newCaptureDevice(capture.inClosedState)
 	capture.beforeMicOpen = micDevice.prepareLightForOpen
 	capture.onMicHeld = micHeldWarning(warningRegistry)
 	capture.capturePresent = captureDevicePresent(warningRegistry, func() bool { return audio.CaptureDevicePresent(cfg.MicDevice) })
@@ -1604,6 +1610,10 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 	}
 	startPowerButton(ctx, &cfg, capture, controlHooks, warningRegistry)
 	startJabraMuteButton(ctx, &cfg, capture, micDevice, controlHooks, warningRegistry, func() { voiceHooks.Stop("Jabra button") })
+	startPausedListener(ctx, cfgStore, &pausedListenerUnit{
+		capture: capture, controls: pauseControls, hooks: controlHooks, device: micDevice,
+		wake: hardware.Wake, warnings: warningRegistry, restored: restoredState, built: local.Built,
+	})
 
 	envoyEvents.configure(ctx, &cfg, appLogger)
 	envoyEvents.publishRecoveredEnds(recoveredIDs)

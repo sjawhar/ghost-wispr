@@ -231,7 +231,7 @@ func TestAButtonPressDuringItsOwnResumesCheckPausesAtOnce(t *testing.T) {
 			rig := &jabraRig{
 				capture:    capture,
 				device:     newCaptureDevice(capture.IsPaused),
-				controls:   &server.ControlHooks{Pause: persistent.Pause, Resume: persistent.Resume},
+				controls:   &server.ControlHooks{Pause: persistent.Pause, Close: persistent.Close, Resume: persistent.Resume},
 				warnings:   newWarningsRegistry(),
 				devices:    make(chan *jabraFake, 4),
 				checkEvery: time.Hour,
@@ -602,7 +602,7 @@ func TestAJabraPressActsOnTheRingItIsPressedOn(t *testing.T) {
 			rig := &jabraRig{
 				capture:    capture,
 				device:     newCaptureDevice(capture.IsPaused),
-				controls:   &server.ControlHooks{Pause: persistent.Pause, Resume: persistent.Resume},
+				controls:   &server.ControlHooks{Pause: persistent.Pause, Close: persistent.Close, Resume: persistent.Resume},
 				warnings:   newWarningsRegistry(),
 				devices:    make(chan *jabraFake, 4),
 				checkEvery: time.Hour,

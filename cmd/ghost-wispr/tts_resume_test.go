@@ -27,7 +27,7 @@ func newSpeechResumeRig(t *testing.T) *speechResumeRig {
 	r.capture.Pause()
 	r.capture.stallAfter = 30 * time.Millisecond
 	r.capture.beforeMicStart = func() error { r.reds.Add(1); return nil }
-	r.device = newCaptureDevice(r.capture.IsPaused)
+	r.device = newCaptureDevice(r.capture.inClosedState)
 	r.capture.beforeMicOpen = r.device.prepareLightForOpen
 	detach := r.device.attach(func(on bool) error { r.ring.Store(on); return nil })
 	t.Cleanup(detach)
@@ -166,23 +166,35 @@ func TestAResumeDuringSpeechWaitsForPlaybackToClose(t *testing.T) {
 
 // TestAPauseDuringTheSpeechWaitCancelsTheResume fails if a resume that waits
 // for speech to end opens the microphone after a pause came during the wait:
-// the pause wins, the microphone stays closed and the ring shows Muted.
+// the pause wins and the microphone stays closed. The ring then shows
+// ringMuted: Muted for a pause to closed, and not for a pause to listening,
+// where the paused listener holds the microphone.
 func TestAPauseDuringTheSpeechWaitCancelsTheResume(t *testing.T) {
-	t.Run("mic loop", func(t *testing.T) {
-		r := newSpeechResumeRig(t)
-		mic := r.startMicLoop(t)
-		r.speak(t)
+	for _, tc := range []struct {
+		name      string
+		pause     func(*captureGate)
+		state     micState
+		ringMuted bool
+	}{
+		{"mic loop", (*captureGate).Pause, micClosed, true},
+		{"mic loop, a pause to listening", (*captureGate).PauseListening, micListening, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := newSpeechResumeRig(t)
+			mic := r.startMicLoop(t)
+			r.speak(t)
 
-		r.capture.Resume()
-		waitOpen(t, r.capture)
-		time.Sleep(30 * time.Millisecond)
-		r.capture.Pause()
-		r.finish()
-		opensDuring(t, mic, 200*time.Millisecond, "after a pause during the wait for the speech")
-		if !r.capture.IsPaused() || !r.ring.Load() {
-			t.Fatalf("after the pause: paused %t, ring shows Muted %t, want both", r.capture.IsPaused(), r.ring.Load())
-		}
-	})
+			r.capture.Resume()
+			waitOpen(t, r.capture)
+			time.Sleep(30 * time.Millisecond)
+			tc.pause(r.capture)
+			r.finish()
+			opensDuring(t, mic, 200*time.Millisecond, "after a pause during the wait for the speech")
+			if got := r.capture.micState(); got != tc.state || r.ring.Load() != tc.ringMuted {
+				t.Fatalf("after the pause: %v, ring shows Muted %t; want %v, %t", got, r.ring.Load(), tc.state, tc.ringMuted)
+			}
+		})
+	}
 	t.Run("first resume after a paused start", func(t *testing.T) {
 		r := newSpeechResumeRig(t)
 		var starts atomic.Int32

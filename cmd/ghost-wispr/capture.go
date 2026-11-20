@@ -39,7 +39,8 @@ const (
 
 // Capture states, as GET /api/status reports them.
 const (
-	capturePaused           = storage.ComponentStatusPaused   // the switch is off
+	capturePaused           = storage.ComponentStatusPaused   // the switch is off, and the microphone closed (micClosed)
+	captureListening        = "listening"                     // the switch is off, and only the paused listener holds the microphone (micListening)
 	captureResuming         = storage.ComponentStatusResuming // switch on, gate still closed
 	captureStalled          = storage.ComponentStatusStalled  // as resuming, past captureStallAfter
 	captureLightUnavailable = "light_unavailable"             // switch on, gate held closed until the light is confirmed red
@@ -47,6 +48,31 @@ const (
 	captureNoAudio          = "no_audio"                      // gate open, microphone open, no audio reaches the recording
 	captureCapturing        = "capturing"                     // gate open, microphone capturing
 )
+
+// micState is the microphone's state, one of three (INFRA-4592 R1):
+// recording, with the light red and audio through the gate; listening, a
+// pause of the first level, where the light is off and only the paused
+// listener holds the microphone, for its spotter; and closed, a pause of the
+// second level, where the microphone is closed and the Jabra's ring shows
+// Muted. The gate's switch is off in both pauses; its level says which.
+type micState int
+
+const (
+	micRecording micState = iota
+	micListening
+	micClosed
+)
+
+func (s micState) String() string {
+	switch s {
+	case micRecording:
+		return "recording"
+	case micListening:
+		return "listening"
+	default:
+		return "closed"
+	}
+}
 
 // errGateClosed is what a captureGate writer returns while capture is paused.
 // It ends Mic.Stream, so streamMicWithRetry can close the device.
@@ -121,21 +147,30 @@ type captureGate struct {
 	control            sync.Mutex    // serializes closing and opening the gate, with their steps
 	mu                 sync.Mutex    // guards the fields below
 	switchOff          bool          // Pause was called and Resume has not been since
-	pauses             int           // counts pauses asked for, so a resume whose light check a pause came during does nothing
-	pendingPauses      int           // Pause calls that wait for control: a resume then counts the unit as paused
-	requestedPauses    int           // pauses asked for (pauseRequested) that Pause has not taken yet
-	lightHeld          bool          // HoldForLight was called and ReleaseLightHold, or a resume that confirmed red, has not been since
-	resumedAt          time.Time     // when Resume last moved the switch on
-	starting           bool          // that Resume's start of the microphone has not finished (finishResume)
-	preparing          bool          // a start waits in beforeMicOpen (prepareMicOpen)
-	closed             bool          // no audio passes the gate
-	recordingDue       bool          // the gate opened into recording, and no audio has reached the recording since (onRecording)
-	closings           int           // counts closings, so a Resume left from an earlier one does nothing
-	resumed            chan struct{} // closed while the gate is open
-	closing            chan struct{} // closed while the gate is closed
-	settled            chan struct{} // closed once the latest closing has settled
-	writing            int           // writes that passed the gate and are still running
-	writesDone         *sync.Cond    // signalled (with mu) when a write finishes
+	// listening is the pause's level while the switch is off: the first level
+	// (micListening) when set, else the second (micClosed). A refused resume
+	// leaves it, so the unit returns to the state it came from.
+	listening bool
+	// stretch numbers the stretches of listening: each entry into listening
+	// starts a new one. The paused listener's audio belongs to the stretch it
+	// was captured in, and a phrase or a failure from an ended stretch moves
+	// nothing (listeningStretch, prepareResumeIn, leaveListeningIn).
+	stretch         uint64
+	pauses          int           // counts pauses asked for, so a resume whose light check a pause came during does nothing
+	pendingPauses   int           // Pause calls that wait for control: a resume then counts the unit as paused
+	requestedPauses int           // pauses asked for (pauseRequested) that Pause has not taken yet
+	lightHeld       bool          // HoldForLight was called and ReleaseLightHold, or a resume that confirmed red, has not been since
+	resumedAt       time.Time     // when Resume last moved the switch on
+	starting        bool          // that Resume's start of the microphone has not finished (finishResume)
+	preparing       bool          // a start waits in beforeMicOpen (prepareMicOpen)
+	closed          bool          // no audio passes the gate
+	recordingDue    bool          // the gate opened into recording, and no audio has reached the recording since (onRecording)
+	closings        int           // counts closings, so a Resume left from an earlier one does nothing
+	resumed         chan struct{} // closed while the gate is open
+	closing         chan struct{} // closed while the gate is closed
+	settled         chan struct{} // closed once the latest closing has settled
+	writing         int           // writes that passed the gate and are still running
+	writesDone      *sync.Cond    // signalled (with mu) when a write finishes
 	// audioAt is when audio last reached the recording through the gate, or
 	// when a start or gate opening gave it audioStall to begin (armAudio), in
 	// Unix nanoseconds; 0 before the first. While it is older than audioStall,
@@ -203,7 +238,32 @@ func newCaptureGate(onPause, settle, beforeResume func()) *captureGate {
 // pending Resume. It counts itself (pauses) when called, before it waits for
 // control, so a resume called after it is the later call; a pause already
 // counted when it was asked for (pauseRequested) is not counted again.
-func (g *captureGate) Pause() {
+//
+// A Pause of a unit that records closes the microphone (micClosed); a paused
+// unit keeps its state, listening or closed: a pause control does nothing in
+// either (INFRA-4592, the control table).
+func (g *captureGate) Pause() { g.pauseTo(pauseKeepOrClose) }
+
+// PauseListening is Pause, except that a unit that records goes to the first
+// level, listening (micListening), where the paused listener may hold the
+// microphone. The persistent controls call it only while the listener can run.
+func (g *captureGate) PauseListening() { g.pauseTo(pauseKeepOrListen) }
+
+// CloseMicrophone is Pause to the second level, closed (micClosed), from
+// every state: POST /api/close, the Jabra button, and a listener that can no
+// longer run.
+func (g *captureGate) CloseMicrophone() { g.pauseTo(pauseClose) }
+
+// pauseKind is what a pause does to the state.
+type pauseKind int
+
+const (
+	pauseKeepOrClose  pauseKind = iota // recording to closed; a paused unit keeps its state
+	pauseKeepOrListen                  // recording to listening; a paused unit keeps its state
+	pauseClose                         // every state to closed
+)
+
+func (g *captureGate) pauseTo(kind pauseKind) {
 	g.mu.Lock()
 	if g.requestedPauses > 0 {
 		g.requestedPauses--
@@ -216,10 +276,82 @@ func (g *captureGate) Pause() {
 	defer g.control.Unlock()
 
 	g.mu.Lock()
+	switch {
+	case kind == pauseClose:
+		g.listening = false
+	case !g.switchOff:
+		g.listening = kind == pauseKeepOrListen
+		if g.listening {
+			g.stretch++
+		}
+	}
 	g.switchOff = true
 	g.pendingPauses--
 	g.mu.Unlock()
 	g.closeGate()
+}
+
+// micState reports the microphone's state: recording while the switch is on,
+// whatever the gate is doing, else the pause's level.
+func (g *captureGate) micState() micState {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	switch {
+	case !g.switchOff:
+		return micRecording
+	case g.listening:
+		return micListening
+	default:
+		return micClosed
+	}
+}
+
+// inClosedState reports whether the microphone is in the closed state: the
+// Jabra's ring shows Muted then, and only then (ringMuted).
+func (g *captureGate) inClosedState() bool { return g.micState() == micClosed }
+
+// leaveListening moves a listening unit to closed, as when the listener can no
+// longer run; it reports whether it did. The gate is closed already.
+func (g *captureGate) leaveListening() bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	moved := g.switchOff && g.listening
+	g.listening = false
+	return moved
+}
+
+// leaveListeningIn is leaveListening for the listener's failure in stretch: it
+// moves the unit only if it still listens in that stretch.
+func (g *captureGate) leaveListeningIn(stretch uint64) bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	moved := g.switchOff && g.listening && g.stretch == stretch
+	if moved {
+		g.listening = false
+	}
+	return moved
+}
+
+// enterListening moves a closed unit to listening, as when a saved listening
+// state restores once its listener can run; it reports whether it did. Each
+// entry starts a new stretch of listening.
+func (g *captureGate) enterListening() bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	moved := g.switchOff && !g.listening
+	if moved {
+		g.listening = true
+		g.stretch++
+	}
+	return moved
+}
+
+// listeningStretch reports the current stretch of listening, and whether the
+// unit listens: the switch is off at the first level.
+func (g *captureGate) listeningStretch() (uint64, bool) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.stretch, g.switchOff && g.listening
 }
 
 // pauseRequested counts a pause a person asked for, before the persistent
@@ -359,12 +491,24 @@ func (g *captureGate) RequestResume() error {
 }
 
 // resumeTicket is what a resume's light check (prepareResume) leaves for the
-// resume itself (resumeWith): the pause count before the check.
-type resumeTicket struct{ pauses int }
+// resume itself (resumeWith): the pause count before the check, and, for the
+// paused listener's resume (prepareResumeIn), the stretch of listening it
+// came from.
+type resumeTicket struct {
+	pauses       int
+	stretch      uint64
+	fromListener bool
+}
 
 // errResumeOvertaken reports a resume that a Pause called during its light
 // check overtook: the later call, the pause, wins, and the resume did nothing.
 var errResumeOvertaken = errors.New("resume overtaken by a later pause")
+
+// errStaleListening refuses the paused listener's resume for a phrase from a
+// stretch of listening that had ended when the resume asked: the change of
+// state since, a close, a detach, a setting turned off or a new stretch, is
+// the later act and wins (review 5998292452 of #123).
+var errStaleListening = errors.New("the phrase came from a stretch of listening that has ended")
 
 // prepareResume is the part of a resume that can take seconds, so it runs
 // before control, and before the persistent controls' lock: it reads the
@@ -378,12 +522,32 @@ func (g *captureGate) prepareResume() (resumeTicket, error) {
 	t := resumeTicket{pauses: g.pauses}
 	paused := g.switchOff || g.pendingPauses > 0 || g.requestedPauses > 0
 	g.mu.Unlock()
-	if paused && g.beforeResumeRequest != nil && g.checkLightPattern != nil && !g.captureMissing() {
-		if err := g.checkLightPattern(); err != nil {
-			return t, err
-		}
+	return t, g.checkBeforeResume(paused)
+}
+
+// prepareResumeIn is prepareResume for the paused listener's phrase, heard in
+// stretch. It takes the ticket only if the unit still listens in that
+// stretch, with no pause asked for, in the same critical section as the
+// check, and returns errStaleListening otherwise. resumeWith then refuses the
+// ticket unless the unit still listens in that stretch, so any change of
+// state between the check and the resume also wins.
+func (g *captureGate) prepareResumeIn(stretch uint64) (resumeTicket, error) {
+	g.mu.Lock()
+	current := g.switchOff && g.listening && g.stretch == stretch && g.pendingPauses == 0 && g.requestedPauses == 0
+	t := resumeTicket{pauses: g.pauses, stretch: stretch, fromListener: true}
+	g.mu.Unlock()
+	if !current {
+		return t, errStaleListening
 	}
-	return t, nil
+	return t, g.checkBeforeResume(true)
+}
+
+// checkBeforeResume checks the light's stored pattern for a paused unit.
+func (g *captureGate) checkBeforeResume(paused bool) error {
+	if paused && g.beforeResumeRequest != nil && g.checkLightPattern != nil && !g.captureMissing() {
+		return g.checkLightPattern()
+	}
+	return nil
 }
 
 // resumeWith resumes once prepareResume has checked the light. Under control,
@@ -396,7 +560,8 @@ func (g *captureGate) resumeWith(t resumeTicket, persist func() error) error {
 	defer g.control.Unlock()
 
 	g.mu.Lock()
-	overtaken := g.pauses != t.pauses
+	overtaken := g.pauses != t.pauses ||
+		(t.fromListener && (!g.switchOff || !g.listening || g.stretch != t.stretch))
 	g.mu.Unlock()
 	if overtaken {
 		return errResumeOvertaken
@@ -435,17 +600,21 @@ func (g *captureGate) resumeWith(t resumeTicket, persist func() error) error {
 	return nil
 }
 
-// captureState reports what capture is doing: paused, light_unavailable,
-// resuming or stalled while the gate is closed, resuming until the resume's
-// start has finished (MicHold), then capturing, no_audio while no audio
-// reaches the recording (the mic loop then holds the microphone closed for a
-// while), or mic_unavailable.
+// captureState reports what capture is doing: paused (closed) or listening,
+// light_unavailable, resuming or stalled while the gate is closed, resuming
+// until the resume's start has finished (MicHold), then capturing, no_audio
+// while no audio reaches the recording (the mic loop then holds the
+// microphone closed for a while), or mic_unavailable.
 func (g *captureGate) captureState(mic interface{ IsOpen() bool }) string {
-	if hold := g.MicHold(); hold != "" {
-		return hold
+	hold := g.MicHold()
+	if hold == "" && g.IsPaused() {
+		hold = capturePaused // the moment between Pause starting and the gate closing
 	}
-	if g.IsPaused() {
-		return capturePaused // the moment between Pause starting and the gate closing
+	if hold == capturePaused && g.micState() == micListening {
+		return captureListening
+	}
+	if hold != "" {
+		return hold
 	}
 	if !mic.IsOpen() {
 		if g.stalled.Load() {

@@ -12,6 +12,7 @@ func clearVoiceEnv(t *testing.T) {
 	clearEnv(t)
 	for _, key := range []string{
 		"VOICE_ENABLED", "VOICE_ENGINE", "VOICE_TTS_ENGINE", "VOICE_TTS_MODEL", "VOICE_TTS_VOICE", "VOICE_TTS_LOCATION",
+		"VOICE_PAUSED_LISTENER", "VOICE_PAUSED_LISTENER_THREADS",
 		"CONCIERGE_MODEL", "CONCIERGE_DISPATCH_URL", "CONCIERGE_ENVOY_URL", "DISPATCH_TOKEN",
 	} {
 		t.Setenv(EnvPrefix+key, "")
@@ -109,6 +110,60 @@ dispatch_token: from-the-file
 	}
 }
 
+// TestThePausedListenerComesFromTheEnvironmentForAnAcceptanceRun fails if
+// GHOST_WISPR_VOICE_PAUSED_LISTENER does not override voice.paused_listener,
+// as an acceptance run on the Pi turns the listener on (accept-voice.sh
+// --step states), or if GHOST_WISPR_VOICE_PAUSED_LISTENER_THREADS, the
+// listener-cpu step's control, sets other than 1 to 8 threads, or reaches the
+// file at a settings save.
+func TestThePausedListenerComesFromTheEnvironmentForAnAcceptanceRun(t *testing.T) {
+	clearVoiceEnv(t)
+	path := writeConfig(t, "voice:\n  enabled: true\n  paused_listener: false\n")
+	cfg, _, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Voice.PausedListener || cfg.Voice.PausedListenerThreads != 1 {
+		t.Fatalf("paused listener %t with %d threads from the file, want off with 1", cfg.Voice.PausedListener, cfg.Voice.PausedListenerThreads)
+	}
+	for _, tc := range []struct {
+		on, threads string
+		want        bool
+		wantThreads int
+	}{
+		{"true", "4", true, 4},
+		{"false", "", false, 1},
+		{"true", "0", true, 1},
+		{"true", "9", true, 1},
+		{"true", "many", true, 1},
+	} {
+		t.Setenv(EnvPrefix+"VOICE_PAUSED_LISTENER", tc.on)
+		t.Setenv(EnvPrefix+"VOICE_PAUSED_LISTENER_THREADS", tc.threads)
+		cfg, _, err := Load(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.Voice.PausedListener != tc.want || cfg.Voice.PausedListenerThreads != tc.wantThreads {
+			t.Errorf("GHOST_WISPR_VOICE_PAUSED_LISTENER=%s, _THREADS=%s: listener %t with %d threads, want %t with %d",
+				tc.on, tc.threads, cfg.Voice.PausedListener, cfg.Voice.PausedListenerThreads, tc.want, tc.wantThreads)
+		}
+	}
+	store, _, err := NewStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Update(func(c *Config) { c.LogLevel = "debug" }); err != nil {
+		t.Fatal(err)
+	}
+	saved, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(saved), "thread") {
+		t.Errorf("a settings save wrote the listener's threads:\n%s", saved)
+	}
+}
+
 // TestVoiceConfigWarnings fails if a voice that cannot speak or a Concierge
 // URL that is not absolute passes without a warning.
 func TestVoiceConfigWarnings(t *testing.T) {
@@ -121,7 +176,6 @@ func TestVoiceConfigWarnings(t *testing.T) {
 		"gemini, no project": "speaker_enabled: true\nvoice:\n  enabled: true\n",
 		"relative dispatch":  "speaker_enabled: true\ngcp_project: p\nvoice:\n  enabled: true\nconcierge:\n  dispatch_url: dispatch.example.test\n",
 		"no wake phrase":     "speaker_enabled: true\ngcp_project: p\nvoice:\n  enabled: true\n  wake_phrases: []\n",
-		"listener not built": "speaker_enabled: true\ngcp_project: p\nvoice:\n  enabled: true\n  paused_listener: true\n",
 	}
 	for name, yaml := range cases {
 		_, warnings, err := Load(writeConfig(t, yaml))

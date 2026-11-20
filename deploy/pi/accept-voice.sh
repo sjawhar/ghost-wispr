@@ -104,6 +104,11 @@ answer_timeout=300
 chime_ms=400
 speech_ms=3000
 playback_seconds=600
+phrase=
+speech=
+cpu_seconds=600
+hub_seconds=20
+threads=1
 
 usage() {
   cat <<EOF
@@ -137,7 +142,16 @@ Steps:
                       learn how long the rig hears a chime. Needs --rig-mic.
   tts-first-audio     --sentences N sentences to each --engine (gemini, aura2 or aura,
                       gemini-clip) through ghost-wispr tts-first-audio. Changes nothing.
-  states, listener-cpu, pause-closes-vendors, vendor-probe, joined, room-test, measure-echo:
+  states              the three capture states with the paused listener on: the page, POST
+                      /api/close, --phrase into the loopback, and a person's presses of the power
+                      and Jabra buttons, each read by /api/status, the light, the saved state, the
+                      microphone's capture device and the person's look at the Jabra ring. In
+                      listening, no socket to Deepgram or OpenAI, and the Envoy hub's sockets grow
+                      by at most 2048 bytes over --hub-seconds of --speech. Needs a person.
+  listener-cpu        the whole process's CPU in listening against closed, --cpu-seconds each,
+                      quiet and with --speech played; the difference at most 25 % of one core.
+                      --threads N runs the spotter on N threads: the check's control.
+  pause-closes-vendors, vendor-probe, joined, room-test, measure-echo:
                       not in this build; each prints UNKNOWN.
 
 Options:
@@ -162,6 +176,11 @@ Options:
   --speech-ms MS      exchange: the latest speech may start after the question (default $speech_ms)
   --playback-seconds S
                       playback-cancel: the playback that the underrun check needs (default $playback_seconds)
+  --phrase WAV        states: "Wispr, start recording", spoken
+  --speech WAV        states, listener-cpu: speech that is not the phrase
+  --cpu-seconds S     listener-cpu: each of its four windows (default $cpu_seconds)
+  --hub-seconds S     states: the window of speech in listening for the Envoy hub check (default $hub_seconds)
+  --threads N         states, listener-cpu: the spotter's threads, 1 to 8 (default $threads)
   --rounds N --sessions N --script FILE
                       accepted for the other slices' steps
 
@@ -206,7 +225,8 @@ while (($#)); do
       --talkover-dir | --backchannel-dir | --sentences-file | --calls | --questions | --talkovers | \
       --backchannels | --stops | --sentences | --engine | --rig-mic | --issue-live | --issue-stopped | \
       --issue-person | --issue-none | --event-timeout | --answer-timeout | --chime-ms | --speech-ms | \
-      --playback-seconds | --rounds | --sessions | --script)
+      --playback-seconds | --phrase | --speech | --cpu-seconds | --hub-seconds | --threads | --rounds | \
+      --sessions | --script)
       (($# >= 2)) || usage_error "$1 needs a value"
       case $1 in
         --step) step=$2 ;;
@@ -236,6 +256,11 @@ while (($#)); do
         --chime-ms) chime_ms=$2 ;;
         --speech-ms) speech_ms=$2 ;;
         --playback-seconds) playback_seconds=$2 ;;
+        --phrase) phrase=$2 ;;
+        --speech) speech=$2 ;;
+        --cpu-seconds) cpu_seconds=$2 ;;
+        --hub-seconds) hub_seconds=$2 ;;
+        --threads) threads=$2 ;;
       esac
       shift 2
       ;;
@@ -251,20 +276,18 @@ while (($#)); do
   esac
 done
 for value in "$calls" "$questions" "$talkovers" "$backchannels" "$stops" "$sentences" "$event_timeout" \
-  "$answer_timeout" "$chime_ms" "$speech_ms" "$playback_seconds"; do
+  "$answer_timeout" "$chime_ms" "$speech_ms" "$playback_seconds" "$cpu_seconds" "$hub_seconds" "$threads"; do
   whole_number "$value" || usage_error "not a whole number: $value"
 done
 
 # The checks of the voice's other slices: each step names why this build cannot run it.
 case $step in
-  states) unknown 'states: not in this build: the three-state pause and the paused listener are slice 4' ;;
-  listener-cpu) unknown 'listener-cpu: not in this build: the paused listener is slice 4' ;;
   pause-closes-vendors) unknown 'pause-closes-vendors: not in this build: voices B and C (gptlive, dgagent) are slices 2 and 3' ;;
   vendor-probe) unknown 'vendor-probe: not in this build: voices B and C (gptlive, dgagent) are slices 2 and 3' ;;
   joined) unknown 'joined: not in this build: joined agents are slice 5' ;;
   room-test) unknown 'room-test: not in this build: measurement 3 runs last, with the people in the room' ;;
   measure-echo) unknown 'measure-echo: not in this build: measurement 1 runs on the main branch before the voice, with a person present' ;;
-  exchange | wake-sound | scripted | ask-holder | barge-in | playback-cancel) changes_unit=true ;;
+  exchange | wake-sound | scripted | ask-holder | barge-in | playback-cancel | states | listener-cpu) changes_unit=true ;;
   reach | holder-cases | tts-first-audio) changes_unit=false ;;
   *) usage_error "unknown step: $step" ;;
 esac
@@ -328,6 +351,16 @@ case $step in
     need --rig-mic "$rig_mic" "$rig_need"
     ;;
   tts-first-audio) ((${#engines[@]} > 0)) || engines=(gemini aura) ;;
+  states)
+    need --phrase "$phrase" '"Wispr, start recording", spoken'
+    need --speech "$speech" 'speech that is not the phrase, such as "Wispr, stop recording"'
+    ((threads >= 1 && threads <= 8)) || usage_error "--threads takes 1 to 8"
+    ;;
+  listener-cpu)
+    need --speech "$speech" 'recorded speech that is not the phrase, several seconds long'
+    ((threads >= 1 && threads <= 8)) || usage_error "--threads takes 1 to 8"
+    ((cpu_seconds >= 1)) || usage_error '--cpu-seconds takes at least 1'
+    ;;
 esac
 ((${#missing[@]} == 0)) || unknown "$step needs: $(printf '%s; ' "${missing[@]}" | sed 's/; $//')"
 
@@ -1915,6 +1948,275 @@ step_tts_first_audio() {
   fi
 }
 
+# ---- the three states and the paused listener (slice 4) ----
+
+# The settings of a run with the paused listener: it needs the voice on (voice.enabled), and the
+# spotter runs on --threads threads.
+listener_settings() {
+  printf '%s\n' "$voice_on" "GHOST_WISPR_VOICE_PAUSED_LISTENER=$1" "GHOST_WISPR_VOICE_PAUSED_LISTENER_THREADS=$threads"
+}
+
+# start_listener_run on|off: the service on the loopback, capturing, with the listener on or off. A
+# build without the listener warns so on /api/status, and the step cannot run: UNKNOWN.
+start_listener_run() {
+  local settings
+  mapfile -t settings < <(listener_settings "$([[ $1 == on ]] && echo true || echo false)")
+  start_voice_run "$loopback_mic" "${settings[@]}"
+  status_json=$(api_status) || fail "$step: cannot read $api/api/status"
+  if [[ $1 == on ]] && jq -e '[.warnings[]? | strings | select(contains("no paused listener"))] | length > 0' >/dev/null <<<"$status_json"; then
+    unknown "$step: this build has no paused listener (built without -tags kws)"
+  fi
+}
+
+person_answer=
+# ask_person TEXT: ask the person at the Pi, one line, and read their answer.
+ask_person() {
+  printf 'PERSON: %s\n' "$1"
+  read -r -t 600 person_answer || unknown "$step: no person answered on the terminal; this step needs one at the Pi"
+}
+
+# mic_open: whether a capture substream of the loopback's device 0 is open: the device the unit's
+# microphone, the recording one or the paused listener, captures from in an acceptance run.
+mic_open() {
+  local index status
+  index=$(awk '$2 == "[Loopback" { print $1; exit }' "$asound_root/cards")
+  [[ -n $index ]] || unknown "$step: $asound_root/cards lists no Loopback card"
+  for status in "$asound_root/card$index"/pcm0c/sub*/status; do
+    [[ -r $status ]] || unknown "$step: cannot read $status"
+    [[ $(head -n 1 "$status") == closed ]] || return 0
+  done
+  return 1
+}
+
+# wait_capture_state STATE NAME: wait for /api/status's capture_state to be STATE.
+wait_capture_state() {
+  local deadline=$(($(now_ms) + event_timeout * 1000))
+  until status_json=$(api_status 2>/dev/null) && jq -e --arg c "$1" '.capture_state == $c' >/dev/null <<<"$status_json"; do
+    (($(now_ms) < deadline)) \
+      || fail "$step: $2: /api/status reads capture_state $(jq -r '.capture_state // "nothing"' <<<"${status_json:-null}" 2>/dev/null), want $1 within $event_timeout s"
+    sleep 0.2
+  done
+}
+
+# check_state NAME STATE: after NAME, the unit is in STATE (recording, listening or closed): its
+# /api/status, its light read back, its saved state, its microphone's capture device and, as the
+# person sees it, its Jabra ring all say so (the meeting voice's control table of the three states).
+check_state() {
+  local name=$1 want=$2 capture light want_light saved want_saved open=closed want_open=open muted want_muted=no
+  case $want in
+    recording) capture=capturing want_light=red want_saved=0 ;;
+    listening) capture=listening want_light=off want_saved=2 ;;
+    closed) capture=paused want_light=off want_saved=1 want_open=closed want_muted=yes ;;
+  esac
+  wait_capture_state "$capture" "$name"
+  light=$(unit_command light-state 2>"$work_dir/light.err") \
+    || fail "$step: $name: ghost-wispr light-state failed: $(tr '\n' ' ' <"$work_dir/light.err")"
+  [[ $light == "$want_light" ]] || fail "$step: $name: the light reads $light in $want, want $want_light"
+  saved=$(app_state "$database" capture_paused) || unknown "$step: cannot read the saved capture state in $database"
+  [[ $saved == "$want_saved" ]] || fail "$step: $name: the saved capture state is $saved in $want, want $want_saved"
+  mic_open && open=open
+  [[ $open == "$want_open" ]] || fail "$step: $name: the microphone's capture device is $open in $want, want $want_open"
+  ask_person "Does the Jabra's ring show Muted now? Type yes or no."
+  muted=${person_answer,,}
+  [[ $muted == yes || $muted == no ]] || unknown "$step: $name: the person answered \"$person_answer\", not yes or no"
+  [[ $muted == "$want_muted" ]] || fail "$step: $name: the person sees the Jabra ring Muted: $muted, in $want; want $want_muted"
+  pass "$step: $name: $want: capture_state $capture, light $light, saved $saved, microphone $open, Jabra ring Muted $muted"
+}
+
+# press BUTTON: the person presses BUTTON once.
+press() {
+  ask_person "Press the $1 once, then type done."
+}
+
+# unit_sockets: the service's TCP sockets as `ss -tinpH` shows them, "LOCAL PEER BYTES_SENT" each.
+unit_sockets() {
+  ss -tinpH | awk -v pid="$unit_pid" '
+    function flush() { if (mine && bytes != "") print local_address, peer, bytes }
+    /^[[:upper:]][[:upper:][:digit:]-]*[[:space:]]/ {
+      flush()
+      mine = index($0, "pid=" pid ",") > 0
+      local_address = $4; peer = $5; bytes = ""
+    }
+    mine && match($0, /bytes_sent:[0-9]+/) { bytes = substr($0, RSTART + 11, RLENGTH - 11) }
+    END { flush() }
+  '
+}
+
+# serves PEER HOST: whether PEER, an address:443, serves a valid certificate for HOST. The request
+# carries no key and no audio.
+serves() {
+  curl --silent --output /dev/null --max-time 10 --connect-to "$2:443:$1" "https://$2/"
+}
+
+# hub_bytes ADDRESSES: the bytes the service has sent on its sockets to the Envoy hub's ADDRESSES.
+hub_bytes() {
+  unit_sockets | awk -v addresses="$1" '
+    BEGIN { n = split(addresses, list, " "); for (i = 1; i <= n; i++) hub[list[i]] }
+    { peer = $2; sub(/:[0-9]+$/, "", peer); gsub(/^\[|\]$/, "", peer); if (peer in hub) total += $3 }
+    END { print total + 0 }
+  '
+}
+
+# check_listening_sends_nothing: in listening, the service holds no socket to Deepgram or OpenAI,
+# and its sockets to the Envoy hub grow by at most 2048 bytes over --hub-seconds of speech that is not
+# the phrase: registration and keepalives, never a message. Every other socket, such as Google's for
+# Drive and Vertex, is listed and not counted.
+check_listening_sends_nothing() {
+  local sockets peer address kind vendors=0 envoy_url host addresses before after deadline
+  envoy_url=$(setting GHOST_WISPR_CONCIERGE_ENVOY_URL concierge envoy_url) \
+    || unknown "$step: the unit names no Envoy hub (concierge.envoy_url)"
+  host=${envoy_url#*://}
+  host=${host%%/*}
+  host=${host%:*}
+  addresses=$(getent ahosts "$host" | awk '{ print $1 }' | LC_ALL=C sort -u | paste -sd ' ' -)
+  [[ -n $addresses ]] || unknown "$step: $host, the Envoy hub, resolves to no address"
+  sockets=$(unit_sockets) || unknown "$step: cannot read the service's sockets with ss"
+  while read -r _ peer _; do
+    [[ -n $peer ]] || continue
+    address=${peer%:*}
+    address=${address#[}
+    address=${address%]}
+    kind=other
+    if [[ " $addresses " == *" $address "* ]]; then
+      kind=hub
+    elif [[ $peer == *:443 ]]; then
+      if serves "$peer" api.deepgram.com; then
+        kind=Deepgram
+      elif serves "$peer" api.openai.com; then
+        kind=OpenAI
+      fi
+    fi
+    case $kind in
+      hub) note "$step: listening: a socket to the Envoy hub at $peer, read by its bytes below" ;;
+      other) note "$step: listening: a socket to $peer, not counted" ;;
+      *)
+        printf 'FAIL: %s: listening: the service holds a socket to %s at %s\n' "$step" "$kind" "$peer"
+        vendors=$((vendors + 1))
+        ;;
+    esac
+  done <<<"$sockets"
+  ((vendors == 0)) || fail "$step: listening: $vendors socket(s) to a voice vendor"
+  pass "$step: listening: no socket to Deepgram or OpenAI"
+
+  before=$(hub_bytes "$addresses")
+  deadline=$(($(now_ms) + hub_seconds * 1000))
+  while (($(now_ms) < deadline)); do
+    play_clip "$step" "$speech"
+  done
+  after=$(hub_bytes "$addresses")
+  wait_capture_state listening 'speech that is not the phrase'
+  if ((after - before > 2048)); then
+    fail "$step: listening: the service sent $((after - before)) bytes to the Envoy hub ($host) during $hub_seconds s of speech, over 2048"
+  fi
+  pass "$step: listening: $((after - before)) bytes to the Envoy hub ($host) during $hub_seconds s of speech, at most 2048"
+}
+
+# step_states: the control table on the Pi, with the paused listener on and the loopback as the
+# microphone, so that no room audio is captured; a person presses the buttons and reads the ring.
+step_states() {
+  local limit value
+  ask_person 'This step needs you at the Pi: you press the power button and the Jabra mute button when asked, and say whether the Jabra ring shows Muted. Type yes to go on.'
+  [[ ${person_answer,,} == yes ]] || unknown "$step: no person confirmed on the terminal"
+  start_listener_run on
+  for limit in LimitCORE MemorySwapMax; do
+    value=$(service show --property="$limit" --value 2>/dev/null)
+    [[ $value == 0 ]] || fail "$step: $unit's $limit is ${value:-unset}, want 0: the listener's ring could reach the disk"
+  done
+  pass "$step: $unit runs with LimitCORE=0 and MemorySwapMax=0"
+  check_state 'the start' recording
+
+  api_post /api/pause >/dev/null || fail "$step: POST /api/pause failed"
+  check_state 'the page pause from recording' listening
+  check_listening_sends_nothing
+  play_clip "$step" "$phrase"
+  check_state '"Wispr, start recording" in listening' recording
+  press 'power button'
+  check_state 'the power button from recording' listening
+  press 'power button'
+  check_state 'the power button from listening' recording
+  press 'Jabra mute button'
+  check_state 'the Jabra button from recording' closed
+  play_clip "$step" "$phrase"
+  sleep 3
+  check_state '"Wispr, start recording" in closed, not heard' closed
+  press 'power button'
+  check_state 'the power button from closed' recording
+  api_post /api/close >/dev/null || fail "$step: POST /api/close failed"
+  check_state 'POST /api/close from recording' closed
+  press 'Jabra mute button'
+  check_state 'the Jabra button from closed' recording
+  api_post /api/pause >/dev/null || fail "$step: POST /api/pause failed"
+  check_state 'the page pause' listening
+  press 'Jabra mute button'
+  check_state 'the Jabra button from listening' closed
+  api_post /api/close >/dev/null || fail "$step: POST /api/close failed"
+  check_state 'POST /api/close from closed' closed
+  api_post /api/resume >/dev/null || fail "$step: POST /api/resume failed"
+  check_state 'the page resume from closed' recording
+  api_post /api/pause >/dev/null || fail "$step: POST /api/pause failed"
+  check_state 'the page pause' listening
+  api_post /api/resume >/dev/null || fail "$step: POST /api/resume failed"
+  check_state 'the page resume from listening' recording
+  api_post /api/pause >/dev/null || fail "$step: POST /api/pause failed"
+  check_state 'the page pause' listening
+  api_post /api/close >/dev/null || fail "$step: POST /api/close failed"
+  check_state 'POST /api/close from listening' closed
+}
+
+# process_ticks: the service's user and system CPU time, in clock ticks (/proc/PID/stat).
+process_ticks() {
+  awk '{ sub(/^.*\) /, ""); print $12 + $13 }' "/proc/$unit_pid/stat" 2>/dev/null
+}
+
+cpu_share=
+# cpu_window KIND: the service's CPU share of one core, in percent, over --cpu-seconds, quiet or
+# with --speech played into the loopback again and again.
+cpu_window() {
+  local before after deadline hz
+  hz=$(getconf CLK_TCK) || unknown "$step: getconf CLK_TCK failed"
+  before=$(process_ticks) || unknown "$step: cannot read /proc/$unit_pid/stat"
+  deadline=$(($(now_ms) + cpu_seconds * 1000))
+  if [[ $1 == speech ]]; then
+    while (($(now_ms) < deadline)); do play_clip "$step" "$speech"; done
+  fi
+  while (($(now_ms) < deadline)); do sleep 0.5; done
+  after=$(process_ticks) || unknown "$step: cannot read /proc/$unit_pid/stat"
+  cpu_share=$(awk -v t="$((after - before))" -v hz="$hz" -v s="$cpu_seconds" 'BEGIN { printf "%.1f", 100 * t / hz / s }')
+}
+
+# step_listener_cpu: the listener's CPU, as the whole process's in listening less its own in closed,
+# quiet and with speech; each difference at most 25 % of one core.
+step_listener_cpu() {
+  local on_quiet on_speech off_quiet off_speech kind on off diff
+  start_listener_run on
+  api_post /api/pause >/dev/null || fail "$step: POST /api/pause failed"
+  wait_capture_state listening 'the page pause with the listener on'
+  cpu_window quiet
+  on_quiet=$cpu_share
+  cpu_window speech
+  on_speech=$cpu_share
+  wait_capture_state listening 'speech that is not the phrase'
+  start_listener_run off
+  api_post /api/pause >/dev/null || fail "$step: POST /api/pause failed"
+  wait_capture_state paused 'the page pause with the listener off'
+  cpu_window quiet
+  off_quiet=$cpu_share
+  cpu_window speech
+  off_speech=$cpu_share
+  for kind in quiet speech; do
+    if [[ $kind == quiet ]]; then on=$on_quiet off=$off_quiet; else on=$on_speech off=$off_speech; fi
+    diff=$(awk -v a="$on" -v b="$off" 'BEGIN { printf "%.1f", a - b }')
+    if awk -v d="$diff" 'BEGIN { exit !(d <= 25) }'; then
+      pass "$step: $kind: the listener takes $diff % of one core ($on % listening, $off % closed, $cpu_seconds s each, $threads thread(s))"
+    else
+      printf 'FAIL: %s: %s: the listener takes %s %% of one core (%s %% listening, %s %% closed, %s s each, %s thread(s)), over 25 %%\n' \
+        "$step" "$kind" "$diff" "$on" "$off" "$cpu_seconds" "$threads"
+      step_failed=true
+    fi
+  done
+  [[ $step_failed == false ]] || exit 1
+}
+
 # ---- the run ----
 
 if [[ $changes_unit == false ]]; then
@@ -1933,7 +2235,7 @@ for command in aplay arecord ffmpeg cmp; do
   command -v "$command" >/dev/null || refuse "missing required command: $command"
 done
 grep -Eq '^Protocols:.* ws( |$)' <<<"$(curl --version)" || refuse 'this curl cannot subscribe to /ws: its Protocols line has no ws'
-for clip in "$question" "$go_ahead" "$second_question" "$never_mind" "$stop_clip"; do
+for clip in "$question" "$go_ahead" "$second_question" "$never_mind" "$stop_clip" "$phrase" "$speech"; do
   [[ -z $clip || -r $clip ]] || refuse "cannot read $clip"
 done
 grep -q '^card [0-9]*: Loopback ' <<<"$(arecord -l 2>/dev/null)" \
@@ -1950,8 +2252,9 @@ if leftover=$(grep -E '^[[:space:]]*(export[[:space:]]+)?GHOST_WISPR_(MIC|SPEAKE
 fi
 database=$(service_database) || refuse "$unit is not running for this user, or holds no single database open: run as the ghost-wispr user"
 saved_state=$(app_state "$database" capture_paused) || refuse "cannot read the saved capture state in $database"
-[[ $saved_state == 1 ]] \
-  || refuse "the saved capture state is $saved_state, not 1: a restart would resume recording, so the run could not end paused"
+# 1 is closed, 2 listening: both restart paused (listening comes back closed until the listener runs).
+[[ $saved_state == 1 || $saved_state == 2 ]] \
+  || refuse "the saved capture state is $saved_state, not 1 or 2: a restart would resume recording, so the run could not end paused"
 pass 'precondition: the unit is paused with no active session'
 case $step in
   wake-sound | scripted | barge-in | playback-cancel) confirm_rig ;;
@@ -1972,6 +2275,8 @@ case $step in
   ask-holder) step_ask_holder ;;
   barge-in) step_barge_in ;;
   playback-cancel) step_playback_cancel ;;
+  states) step_states ;;
+  listener-cpu) step_listener_cpu ;;
 esac
 [[ $step_unknown == false ]] || exit 2
 exit 0

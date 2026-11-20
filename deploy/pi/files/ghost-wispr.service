@@ -18,6 +18,10 @@ ExecStopPost=/opt/ghost-wispr/ghost-wispr light-off
 EnvironmentFile=/opt/ghost-wispr/.env
 Restart=always
 RestartSec=10
+# The paused listener holds up to 2 s of the room's audio in memory, which
+# neither a core dump nor swap may write to disk.
+LimitCORE=0
+MemorySwapMax=0
 
 [Install]
 WantedBy=default.target

@@ -31,6 +31,27 @@ import (
 //	resume of a running mic loop           streamMicWithRetry, Open       TestEveryMicLoopOpenOpensOnlyWhileTheLightReadsRed
 //	reconnect after an error or overflow   reopenMic, Reopen              the same
 //	reopen after the light was not red     streamMicWithRetry, Open       TestNoAudioPassesOnceTheLightWasNotRedWhileTheMicrophoneWasOpen
+//	pausedListener, in listening only      captureDevice.openListener     TestMicLightCensus
+//
+// The paused listener is the one path that opens a capture device with the
+// light off (INFRA-4592 R2): only in listening, only once the recording
+// microphone has closed, and its frames reach no writer behind the capture
+// gate (TestListeningFrameReachesNoGateWriter).
+
+// TestMicLightCensus fails if the pausedListener row does not hold: through
+// every transition of the three states, the listener opens only in listening
+// and only once the recording microphone's stream has closed, and every
+// recording microphone open, from each state and by each control, comes with
+// the light red and the listener closed. Control: both opened.
+func TestMicLightCensus(t *testing.T) {
+	r := startMicStatesRig(t, statesOptions{listener: true, jabra: true})
+	r.tour(t)
+	r.requireHandoverKept(t)
+	mic, listener := r.opens()
+	if mic == 0 || listener == 0 {
+		t.Fatalf("control: the tour opened the recording microphone %d times and the listener %d times", mic, listener)
+	}
+}
 
 // lightRig is the recorder's recording-light stack (startHardware,
 // wireLightConsent) on a blink(1) that records its operations, with the

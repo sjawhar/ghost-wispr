@@ -296,6 +296,10 @@ want_steps=(ExecStartPre=/opt/ghost-wispr/wait-for-network.sh ExecStartPre=/opt/
   ExecStart=/opt/ghost-wispr/ghost-wispr)
 [[ "${start_steps[*]}" == "${want_steps[*]}" ]] \
   || fail "ghost-wispr.service starts with [${start_steps[*]}], want [${want_steps[*]}]"
+# The paused listener's ring of room audio must not reach disk through a core dump or swap.
+for limit in LimitCORE=0 MemorySwapMax=0; do
+  grep -qx -- "$limit" "$unit" || fail "ghost-wispr.service does not set $limit"
+done
 network_wait=$(sed -n 's/.*GHOST_WISPR_NETWAIT_TIMEOUT:-\([0-9][0-9]*\).*/\1/p' "$repo_root/wait-for-network.sh")
 sync_wait=$(sed -n 's/.*GHOST_WISPR_TIMESYNC_TIMEOUT:-\([0-9][0-9]*\).*/\1/p' "$repo_root/deploy/pi/files/wait-for-time-sync.sh")
 [[ -n $network_wait && -n $sync_wait ]] || fail "cannot read the network wait ($network_wait) or the clock wait ($sync_wait)"

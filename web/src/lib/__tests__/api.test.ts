@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
+  closeMicrophone,
   fetchDates,
   fetchSession,
   fetchSessions,
@@ -83,7 +84,7 @@ describe('api client', () => {
     await expect(fetchStatus()).resolves.toEqual({ paused: false })
   })
 
-  it('sends pause and resume commands', async () => {
+  it('sends pause, close and resume commands', async () => {
     const fetchMock = vi.fn().mockResolvedValue({
       ok: true,
       status: 204,
@@ -92,10 +93,12 @@ describe('api client', () => {
     vi.stubGlobal('fetch', fetchMock)
 
     await pauseRecording()
+    await closeMicrophone()
     await resumeRecording()
 
     expect(fetchMock).toHaveBeenNthCalledWith(1, '/api/pause', { method: 'POST' })
-    expect(fetchMock).toHaveBeenNthCalledWith(2, '/api/resume', { method: 'POST' })
+    expect(fetchMock).toHaveBeenNthCalledWith(2, '/api/close', { method: 'POST' })
+    expect(fetchMock).toHaveBeenNthCalledWith(3, '/api/resume', { method: 'POST' })
   })
 
   it('resummarize resolves on 202', async () => {

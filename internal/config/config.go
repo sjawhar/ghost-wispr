@@ -73,13 +73,21 @@ type Voice struct {
 	Enabled     bool     `yaml:"enabled"`
 	Engine      string   `yaml:"engine"`       // tts, gptlive or dgagent
 	WakePhrases []string `yaml:"wake_phrases"` // said at the start of a sentence
-	// PausedListener is the wake listener that holds the microphone while
-	// paused (slice 4). It is not built yet; true is ignored, with a warning.
-	PausedListener bool   `yaml:"paused_listener"`
-	TTSEngine      string `yaml:"tts_engine"`   // voice A's text-to-speech provider: gemini or aura
-	TTSModel       string `yaml:"tts_model"`    // "" is the provider's default
-	TTSVoice       string `yaml:"tts_voice"`    // "" is the provider's default
-	TTSLocation    string `yaml:"tts_location"` // the Vertex AI location Gemini streams from
+	// PausedListener makes a pause from the power button or the page go to
+	// listening, where a listener in the process holds the microphone for
+	// "Wispr, start recording" alone, in a build that has it (-tags kws) and
+	// while the Jabra's mute button is attached; off, every pause closes the
+	// microphone. It needs Enabled: with the voice off, nothing hears the room
+	// for a wake phrase.
+	PausedListener bool `yaml:"paused_listener"`
+	// PausedListenerThreads is the spotter's threads, 1 but for the control
+	// of the acceptance run's CPU check (GHOST_WISPR_VOICE_PAUSED_LISTENER_THREADS,
+	// 1 to 8); never in the file.
+	PausedListenerThreads int    `yaml:"-"`
+	TTSEngine             string `yaml:"tts_engine"`   // voice A's text-to-speech provider: gemini or aura
+	TTSModel              string `yaml:"tts_model"`    // "" is the provider's default
+	TTSVoice              string `yaml:"tts_voice"`    // "" is the provider's default
+	TTSLocation           string `yaml:"tts_location"` // the Vertex AI location Gemini streams from
 	// GPTLive is voice B's OpenAI route: the workload identity ids its token
 	// exchange names. They are not secrets.
 	GPTLive GPTLive `yaml:"gptlive"`
@@ -222,7 +230,8 @@ func defaults() Config {
 			TTSEngine:   TTSEngineGemini,
 			// Google: the us multi-region gives a lower time to first audio
 			// than global.
-			TTSLocation: "us",
+			TTSLocation:           "us",
+			PausedListenerThreads: 1,
 		},
 	}
 }
@@ -512,6 +521,14 @@ func applyEnvOverrides(cfg *Config) []string {
 	if v := os.Getenv(EnvPrefix + "VOICE_ENABLED"); v != "" {
 		cfg.Voice.Enabled = strings.EqualFold(v, "true") || v == "1"
 	}
+	// An acceptance run turns the paused listener on, and its CPU check's
+	// control runs the spotter on more threads (deploy/pi/accept-voice.sh).
+	if v := os.Getenv(EnvPrefix + "VOICE_PAUSED_LISTENER"); v != "" {
+		cfg.Voice.PausedListener = strings.EqualFold(v, "true") || v == "1"
+	}
+	if n, err := strconv.Atoi(strings.TrimSpace(os.Getenv(EnvPrefix + "VOICE_PAUSED_LISTENER_THREADS"))); err == nil && n >= 1 && n <= 8 {
+		cfg.Voice.PausedListenerThreads = n
+	}
 	for key, field := range map[string]*string{
 		"VOICE_ENGINE":           &cfg.Voice.Engine,
 		"VOICE_TTS_ENGINE":       &cfg.Voice.TTSEngine,
@@ -745,9 +762,6 @@ func validateVoice(cfg *Config) []string {
 	v.Engine = strings.ToLower(strings.TrimSpace(v.Engine))
 	v.TTSEngine = strings.ToLower(strings.TrimSpace(v.TTSEngine))
 	var warnings []string
-	if v.PausedListener {
-		warnings = append(warnings, "voice.paused_listener is not built yet; it is ignored, and a pause closes the microphone.")
-	}
 	if !v.Enabled {
 		return warnings
 	}

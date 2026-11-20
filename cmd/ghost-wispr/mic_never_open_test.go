@@ -223,3 +223,18 @@ func TestAudioStopsAtOnceWhenTheLightGoesOffFromOutside(t *testing.T) {
 		t.Fatalf("%d bytes recorded, want 4: audio passed after the light went off from outside", got)
 	}
 }
+
+// TestMicNeverOpenWithLightOff fails if, through every transition of the
+// three states, the recording microphone opens, or closes, while the light
+// does not show red, or any microphone is open in the closed state. The
+// paused listener alone may hold the microphone with the light off, and only
+// in listening. Control: both microphones opened during the tour.
+func TestMicNeverOpenWithLightOff(t *testing.T) {
+	r := startMicStatesRig(t, statesOptions{listener: true, jabra: true})
+	r.tour(t)
+	r.requireHandoverKept(t) // checks the light at each recording microphone open and close
+	mic, listener := r.opens()
+	if mic < 5 || listener < 3 {
+		t.Fatalf("control: the tour opened the recording microphone %d times and the listener %d times, want at least 5 and 3", mic, listener)
+	}
+}

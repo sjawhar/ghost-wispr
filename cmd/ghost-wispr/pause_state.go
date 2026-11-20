@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 
 	"github.com/sjawhar/ghost-wispr/internal/server"
 	"github.com/sjawhar/ghost-wispr/internal/storage"
@@ -17,34 +18,61 @@ type pauseStore interface {
 	SetAppState(key, value string) error
 }
 
-// restorePause applies the last persisted capture switch before any microphone
-// capture begins. It returns true when the switch was paused.
-func restorePause(store pauseStore, gate interface{ Pause() }) (bool, error) {
-	value, ok, err := store.GetAppState(storage.AppStateCapturePaused)
-	if err != nil {
-		return false, fmt.Errorf("read persisted capture pause: %w", err)
+// The saved state's values (storage.AppStateCapturePaused). "1" is today's
+// pause, and every pause saved before the paused listener: it is closed, so
+// the first deploy of the listener never opens the room's microphone.
+const (
+	savedRecording = "0"
+	savedClosed    = "1"
+	savedListening = "2"
+)
+
+// savedValue is what the store holds for state.
+func savedValue(state micState) string {
+	switch state {
+	case micRecording:
+		return savedRecording
+	case micListening:
+		return savedListening
+	default:
+		return savedClosed
 	}
-	if !ok || value == "0" {
-		return false, nil
-	}
-	if value != "1" {
-		return false, fmt.Errorf("invalid persisted capture pause value %q", value)
-	}
-	gate.Pause()
-	return true, nil
 }
 
-// wirePauseControls serves the API's Pause and Resume with controls, and the
-// light's consent check with them: each keeps the warning that the saved
-// pause switch is not what a restart would restore (captureStateWarningKey)
-// while that is so.
+// restorePause applies the last persisted capture state before any
+// microphone capture begins, and returns that state. A saved pause, of either
+// level, restores as closed: a saved listening comes back closed until the
+// Jabra button is attached and the listener has started, which the controls
+// see to (restoreListening), and with no listener it stays closed.
+func restorePause(store pauseStore, gate interface{ Pause() }) (micState, error) {
+	value, ok, err := store.GetAppState(storage.AppStateCapturePaused)
+	if err != nil {
+		return micRecording, fmt.Errorf("read persisted capture pause: %w", err)
+	}
+	switch {
+	case !ok || value == savedRecording:
+		return micRecording, nil
+	case value == savedClosed:
+		gate.Pause()
+		return micClosed, nil
+	case value == savedListening:
+		gate.Pause()
+		return micListening, nil
+	default:
+		return micRecording, fmt.Errorf("invalid persisted capture pause value %q", value)
+	}
+}
+
+// wirePauseControls serves the API's Pause, Close and Resume with controls,
+// and the light's consent check with them: each keeps the warning that the
+// saved pause switch is not what a restart would restore
+// (captureStateWarningKey) while that is so.
 func wirePauseControls(hooks *server.ControlHooks, controls *persistentControls, capture *captureGate, hardware *hardwareControl, warnings *warningsRegistry) {
 	// pauseNotSaved warns that the durable pause switch could not be saved.
 	pauseNotSaved := func() {
 		warnings.Set(captureStateWarningKey, "Pause not saved; a restart will resume recording")
 	}
-	hooks.Pause = func() error {
-		err := controls.Pause()
+	saved := func(err error) error {
 		if err != nil {
 			pauseNotSaved()
 		} else {
@@ -52,22 +80,28 @@ func wirePauseControls(hooks *server.ControlHooks, controls *persistentControls,
 		}
 		return err
 	}
-	hooks.Resume = func() error {
-		err := controls.Resume()
-		if err != nil {
-			if errors.Is(err, errRefusedResumeNotPersisted) {
-				pauseNotSaved()
-			}
-		} else {
-			warnings.Clear(captureStateWarningKey)
-		}
-		return err
-	}
+	hooks.Pause = func() error { return saved(controls.Pause()) }
+	hooks.Close = func() error { return saved(controls.Close()) }
+	hooks.Resume = func() error { return noteResume(warnings, controls.Resume()) }
 	wireLightConsent(capture, hardware, warnings, func(error) {
 		if err := controls.RefuseResume(); err != nil {
 			pauseNotSaved()
 		}
 	})
+}
+
+// noteResume keeps the warning that the saved pause switch is not what a
+// restart would restore after a resume's err: set when a refused resume
+// could not save the state it returned to, cleared when the resume worked.
+// It returns err.
+func noteResume(warnings *warningsRegistry, err error) error {
+	switch {
+	case err == nil:
+		warnings.Clear(captureStateWarningKey)
+	case errors.Is(err, errRefusedResumeNotPersisted):
+		warnings.Set(captureStateWarningKey, "Pause not saved; a restart will resume recording")
+	}
+	return err
 }
 
 // seedPausedState writes the durable pause before a test instance starts, so
@@ -88,7 +122,7 @@ func seedPausedState(configPath string, out io.Writer) (string, error) {
 		return "", fmt.Errorf("open database: %w", err)
 	}
 	defer func() { _ = store.Close() }()
-	if err := store.SetAppState(storage.AppStateCapturePaused, "1"); err != nil {
+	if err := store.SetAppState(storage.AppStateCapturePaused, savedClosed); err != nil {
 		return "", fmt.Errorf("set capture pause: %w", err)
 	}
 	if _, err := fmt.Fprintf(out, "seed-paused-state: capture pause written to %s\n", dbPath); err != nil {
@@ -105,6 +139,45 @@ type persistentControls struct {
 	gate            resumeGate
 	onStatusChanged func(bool)
 	mu              sync.Mutex
+	// parts are the three-state machine's parts (useListener); without them
+	// every pause closes the microphone, and Close is Pause: today's
+	// two-state machine, as in a build with no listener. They are read with
+	// no lock, so a resume's light check never waits behind another
+	// control's save.
+	parts atomic.Pointer[listenerParts]
+	// resumes counts the resumes under way; the listener does not listen
+	// while one runs.
+	resumes atomic.Int32
+	// restoreListening is set while a saved listening state waits, closed,
+	// for the listener to be ready; any control clears it. Guarded by mu.
+	restoreListening bool
+}
+
+// listenerParts are the three-state machine's parts of the controls.
+type listenerParts struct {
+	// levels moves the gate between the three states.
+	levels micLevels
+	// wake wakes the recording light after a pause or a close.
+	wake func()
+	// ready reports whether the paused listener can run: it is on, built and
+	// started, and the Jabra's mute button, which closes the microphone, is
+	// attached. A pause goes to listening only while it can.
+	ready func() bool
+	// stop closes the listener's stream, and waits until it has, before a
+	// resume's light check: the recording microphone opens only after the
+	// listener's has closed.
+	stop func()
+}
+
+// micLevels is the capture gate's side of the three states.
+type micLevels interface {
+	micState() micState
+	listeningStretch() (uint64, bool)
+	PauseListening()
+	CloseMicrophone()
+	leaveListening() bool
+	leaveListeningIn(stretch uint64) bool
+	enterListening() bool
 }
 
 // resumeGate is the capture gate's resume in its two steps (captureGate):
@@ -114,6 +187,7 @@ type persistentControls struct {
 // controls' lock, and IsPaused is the gate's switch.
 type resumeGate interface {
 	prepareResume() (resumeTicket, error)
+	prepareResumeIn(stretch uint64) (resumeTicket, error)
 	resumeWith(t resumeTicket, persist func() error) error
 	pauseRequested()
 	IsPaused() bool
@@ -125,35 +199,113 @@ func newPersistentControls(store pauseStore, pause func(), gate resumeGate, onSt
 	return &persistentControls{store: store, pause: pause, gate: gate, onStatusChanged: onStatusChanged}
 }
 
+// useListener gives the controls the three states: levels moves the gate
+// between them, wake wakes the light after each pause or close, ready says
+// whether the listener can run, and stopListener closes its stream.
+func (c *persistentControls) useListener(levels micLevels, wake func(), ready func() bool, stopListener func()) {
+	c.parts.Store(&listenerParts{levels: levels, wake: wake, ready: ready, stop: stopListener})
+}
+
+// state reports the microphone's state.
+func (c *persistentControls) state() micState {
+	if p := c.parts.Load(); p != nil {
+		return p.levels.micState()
+	}
+	if c.gate.IsPaused() {
+		return micClosed
+	}
+	return micRecording
+}
+
+// canListen reports whether a pause may go to listening.
+func (c *persistentControls) canListen() bool {
+	p := c.parts.Load()
+	return p != nil && p.ready()
+}
+
 // Pause counts the pause on the gate before it takes the controls' lock,
 // which another resume's save may hold: a resume called after this pause then
 // carries it and is not overtaken by it, and a resume whose light check it
 // came during is overtaken (review 5963682292 of #79). The Pause it then
-// makes takes that count rather than counting again.
+// makes takes that count rather than counting again. A unit that records goes
+// to listening while the listener can run, and to closed otherwise; a paused
+// unit stays as it is.
 func (c *persistentControls) Pause() error {
 	c.gate.pauseRequested()
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.pause()
-	err := c.store.SetAppState(storage.AppStateCapturePaused, "1")
+	if p := c.parts.Load(); p != nil && p.ready() {
+		p.levels.PauseListening()
+		p.wake()
+	} else {
+		c.pause()
+	}
+	return c.savePause("persist capture pause")
+}
+
+// Close moves every state to closed: POST /api/close, the page's "Close
+// microphone", and the Jabra's mute button. It counts as a pause, so it
+// overtakes a resume whose light check runs.
+func (c *persistentControls) Close() error {
+	c.gate.pauseRequested()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if p := c.parts.Load(); p != nil {
+		p.levels.CloseMicrophone()
+		p.wake()
+	} else {
+		c.pause()
+	}
+	return c.savePause("persist microphone close")
+}
+
+// savePause saves the paused state the unit is in, clears a saved listening
+// state's wait (a person acted), and tells the clients. The caller holds mu.
+func (c *persistentControls) savePause(what string) error {
+	c.restoreListening = false
+	err := c.store.SetAppState(storage.AppStateCapturePaused, savedValue(c.state()))
 	if c.onStatusChanged != nil {
 		c.onStatusChanged(true)
 	}
 	if err != nil {
-		return fmt.Errorf("persist capture pause: %w", err)
+		return fmt.Errorf("%s: %w", what, err)
 	}
 	return nil
 }
 
-// Resume runs the light's check before it takes the controls' lock, so a
-// person's Pause meanwhile is not held up behind it, and that Pause, the later
-// call, wins: the resume then saves nothing and returns nil (review
-// 5961636823 of #79). The resume saves the switch on just before it confirms
-// the light red, and saves it off again if the light refuses it.
-func (c *persistentControls) Resume() error {
-	ticket, err := c.gate.prepareResume()
+// Resume closes the listener's stream first, and keeps the listener from
+// listening until it returns. It runs the light's check before it takes the
+// controls' lock, so a person's Pause meanwhile is not held up behind it, and
+// that Pause, the later call, wins: the resume then saves nothing and returns
+// nil (review 5961636823 of #79). The resume saves the switch on just before
+// it confirms the light red, and, if the light refuses it, saves the state it
+// came from again: the unit goes back to it.
+func (c *persistentControls) Resume() error { return c.resume(c.gate.prepareResume) }
+
+// resumeFromListening is the paused listener's resume, for the phrase heard
+// in stretch: Resume, except that it returns errStaleListening, having
+// changed nothing, unless the unit still listens in that stretch when the
+// resume takes its ticket, and does nothing unless it still does when the
+// resume moves the switch (prepareResumeIn). A close, a detach, a setting
+// turned off or a new stretch of listening after the phrase's audio was read
+// wins over it (review 5998292452 of #123).
+func (c *persistentControls) resumeFromListening(stretch uint64) error {
+	return c.resume(func() (resumeTicket, error) { return c.gate.prepareResumeIn(stretch) })
+}
+
+func (c *persistentControls) resume(prepare func() (resumeTicket, error)) error {
+	c.resumes.Add(1)
+	defer c.resumes.Add(-1)
+	if p := c.parts.Load(); p != nil {
+		p.stop()
+	}
+	ticket, err := prepare()
+	if errors.Is(err, errStaleListening) {
+		return err // nothing changed, and nothing is announced
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	c.restoreListening = false
 	if err != nil {
 		// Nothing changed. The clients hear the gate's switch as it is: a
 		// resume that overtook this one may have moved it on, and the unit
@@ -169,16 +321,20 @@ func (c *persistentControls) Resume() error {
 	}
 	var persistErr error
 	err = c.gate.resumeWith(ticket, func() error {
-		persistErr = c.store.SetAppState(storage.AppStateCapturePaused, "0")
+		persistErr = c.store.SetAppState(storage.AppStateCapturePaused, savedRecording)
 		return persistErr
 	})
 	switch {
 	case persistErr != nil:
 		return fmt.Errorf("persist capture resume: %w", persistErr)
+	case errors.Is(err, errResumeOvertaken) && ticket.fromListener:
+		// Its stretch ended during the light check: nothing resumed, so the
+		// listener must not announce a resume.
+		return errStaleListening
 	case errors.Is(err, errResumeOvertaken):
 		return nil // the later pause saved and announced the switch off
 	case err != nil:
-		if storeErr := c.store.SetAppState(storage.AppStateCapturePaused, "1"); storeErr != nil {
+		if storeErr := c.store.SetAppState(storage.AppStateCapturePaused, savedValue(c.state())); storeErr != nil {
 			if c.onStatusChanged != nil {
 				c.onStatusChanged(true)
 			}
@@ -195,10 +351,12 @@ func (c *persistentControls) Resume() error {
 	return nil
 }
 
+// RefuseResume saves the state a resume the light refused at the gate's
+// opening returned the unit to: the one it came from.
 func (c *persistentControls) RefuseResume() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	err := c.store.SetAppState(storage.AppStateCapturePaused, "1")
+	err := c.store.SetAppState(storage.AppStateCapturePaused, savedValue(c.state()))
 	if c.onStatusChanged != nil {
 		c.onStatusChanged(true)
 	}
@@ -206,6 +364,68 @@ func (c *persistentControls) RefuseResume() error {
 		return fmt.Errorf("persist refused capture resume: %w", err)
 	}
 	return nil
+}
+
+// listenerWanted reports the current stretch of listening, and whether the
+// paused listener should hold the microphone in it now: the unit is
+// listening, the listener can run, and no resume is under way.
+func (c *persistentControls) listenerWanted() (uint64, bool) {
+	p := c.parts.Load()
+	if p == nil {
+		return 0, false
+	}
+	stretch, listening := p.levels.listeningStretch()
+	return stretch, listening && c.resumes.Load() == 0 && p.ready()
+}
+
+// armRestoredListening makes a saved listening state, restored as closed,
+// come back once the listener is ready (listenerChanged).
+func (c *persistentControls) armRestoredListening() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.restoreListening = true
+}
+
+// listenerChanged follows a change in whether the listener can run: a unit
+// that listens goes to closed once it cannot, as when the Jabra's button
+// detaches or the listener is turned off, and a saved listening state that
+// waits comes back once it can.
+func (c *persistentControls) listenerChanged() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	p := c.parts.Load()
+	if p == nil {
+		return nil
+	}
+	ready := p.ready()
+	switch {
+	case !ready && p.levels.leaveListening():
+		p.wake()
+		return c.savePause("persist the microphone closed for the listener")
+	case ready && c.restoreListening && p.levels.micState() == micClosed:
+		c.restoreListening = false
+		p.levels.enterListening()
+		p.wake()
+		if c.onStatusChanged != nil {
+			c.onStatusChanged(true)
+		}
+	}
+	return nil
+}
+
+// listenerFailed moves a unit that listens in stretch to closed: its
+// listener's capture failed, so nothing listens, and the ring must show that
+// the microphone is closed. It reports whether it moved the unit: a failure
+// from a stretch that has ended moves nothing.
+func (c *persistentControls) listenerFailed(stretch uint64) (bool, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	p := c.parts.Load()
+	if p == nil || !p.levels.leaveListeningIn(stretch) {
+		return false, nil
+	}
+	p.wake()
+	return true, c.savePause("persist the microphone closed for the listener")
 }
 
 // micStartFailureMessages returns the microphone warning and the start-up
