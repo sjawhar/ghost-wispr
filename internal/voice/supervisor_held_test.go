@@ -50,3 +50,21 @@ func TestAHeldAnswerWhoseSpeechFailsStaysPending(t *testing.T) {
 	r.speaker.finish(audio.InputVoice)
 	eventually(t, "the answer recorded as spoken", func() bool { return len(c.spokenIDs()) == 1 })
 }
+
+// A held answer has no wake turn. Its canonical pending key must reach the
+// exchange that opens to speak it, so voice B's fact audit can require it.
+func TestHeldAnswerExchangeCarriesItsCanonicalIssueKey(t *testing.T) {
+	c := newFakeConcierge()
+	r := newRig(t, c)
+	c.answers <- PendingAnswer{
+		TaskID:    "t1",
+		SessionID: "sess-1",
+		IssueKey:  "INFRA-1027",
+		Text:      "INFRA-1027 is in review.",
+		AskedAt:   time.Now(),
+	}
+	sess := r.waitSession()
+	if got := sess.x.IssueKey; got != "INFRA-1027" {
+		t.Fatalf("held exchange IssueKey = %q, want canonical INFRA-1027", got)
+	}
+}
