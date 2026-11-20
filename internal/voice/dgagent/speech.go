@@ -77,14 +77,14 @@ type utterance struct {
 type speechQueue struct {
 	mu           sync.Mutex
 	items        []speechItem
-	ready        chan struct{} // signalled when items or interrupted change
-	holdTail     time.Duration                    // how long each frame of an injection waits
+	ready        chan struct{}                   // signalled when items or interrupted change
+	holdTail     time.Duration                   // how long each frame of an injection waits
 	after        func(d time.Duration, f func()) // runs f once d has passed
-	holder       *utterance    // the injection whose frames may still wait
-	current      *utterance    // the reply receiving audio now
-	awaitingText []*utterance  // completed audio-first replies, in wire order
-	awaitingEnd  []*utterance  // authorized replies superseded before their done
-	interrupted  bool          // the player has not seen the last Interrupt
+	holder       *utterance                      // the injection whose frames may still wait
+	current      *utterance                      // the reply receiving audio now
+	awaitingText []*utterance                    // completed audio-first replies, in wire order
+	awaitingEnd  []*utterance                    // authorized replies superseded before their done
+	interrupted  bool                            // the player has not seen the last Interrupt
 	stop         context.CancelFunc
 }
 
