@@ -41,8 +41,28 @@ func newHandsRig(t *testing.T) (*rig, *handOutcomes) {
 
 func testHand(id, key string, expires time.Duration) *Hand {
 	return &Hand{
-		ID: id, SessionID: "sess-1", Agent: "agent-" + id, IssueKey: key, Name: key,
+		ID: id, SessionID: "sess-1", Agent: "agent-" + id, Membership: "m-" + id, IssueKey: key, Name: key,
 		Text: key + "'s agent says: the deploy moved to Friday.", Expires: time.Now().Add(expires),
+	}
+}
+
+// TestALowerTakesOnlyItsMembershipsHands fails if lowering one membership's
+// hands takes down a hand of another membership of the same agent session,
+// as a late leave of the agent's earlier membership would.
+func TestALowerTakesOnlyItsMembershipsHands(t *testing.T) {
+	r, outcomes := newHandsRig(t)
+	earlier, later := testHand("h1", "ABC-12", time.Minute), testHand("h2", "ABC-12", time.Minute)
+	later.Agent = earlier.Agent // one Envoy session, two memberships
+	for _, h := range []*Hand{earlier, later} {
+		if err := r.s.RaiseHand(h); err != nil {
+			t.Fatalf("RaiseHand: %v", err)
+		}
+	}
+	r.s.LowerHands(earlier.Membership)
+	eventually(t, "the earlier membership's hand withdrawn", func() bool { return slices.Equal(outcomes.all(), []string{"h1:withdrawn"}) })
+	r.heard("Wispr, go ahead.", true, true)
+	if got := waitSaid(t, r.waitSession()); got != later.Text {
+		t.Fatalf("said %q, want the later membership's words %q", got, later.Text)
 	}
 }
 
@@ -127,7 +147,7 @@ func TestWhoHasAHandUp(t *testing.T) {
 		if err := r.s.RaiseHand(testHand("h1", "ABC-12", time.Minute)); err != nil {
 			t.Fatalf("RaiseHand: %v", err)
 		}
-		r.s.LowerHands("agent-h1")
+		r.s.LowerHands("m-h1")
 		r.heard("Wispr, who has a hand up?", true, true)
 		if got, want := waitSaid(t, r.waitSession()), "Nobody has a hand up."; got != want {
 			t.Fatalf("said %q, want %q", got, want)
@@ -144,7 +164,7 @@ func TestHandsComeDownWithTheirMeeting(t *testing.T) {
 			t.Fatalf("RaiseHand: %v", err)
 		}
 	}
-	r.s.LowerHands("agent-h1")
+	r.s.LowerHands("m-h1")
 	r.s.SessionEnded("sess-1")
 	eventually(t, "both hands withdrawn", func() bool {
 		got := outcomes.all()

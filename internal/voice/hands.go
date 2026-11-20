@@ -19,8 +19,11 @@ type Hand struct {
 	ID string
 	// SessionID is the recording session it was raised in.
 	SessionID string
-	// Agent is the agent's Envoy session; LowerHands lowers its hands.
+	// Agent is the agent's Envoy session, which its outcome is told to.
 	Agent string
+	// Membership names the joined agent's membership the hand belongs to:
+	// LowerHands takes down that membership's hands and no other.
+	Membership string
 	// IssueKey is the agent's issue, which "Wispr, go ahead, KEY" names.
 	IssueKey string
 	// Name is how "Wispr, who has a hand up?" names the agent: its issue
@@ -96,12 +99,14 @@ func (s *Supervisor) RaiseHand(h *Hand) error {
 	return nil
 }
 
-// LowerHands takes down the hands agent raised, as it leaves.
-func (s *Supervisor) LowerHands(agent string) {
+// LowerHands takes down the hands of one membership of a joined agent, as
+// it ends; another membership's hands, the same agent session's included,
+// stay up.
+func (s *Supervisor) LowerHands(membership string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.pending = slices.DeleteFunc(s.pending, func(p *pendingAnswer) bool {
-		if p.hand == nil || p.hand.Agent != agent {
+		if p.hand == nil || p.hand.Membership != membership {
 			return false
 		}
 		s.handDoneLocked(p, HandWithdrawn)

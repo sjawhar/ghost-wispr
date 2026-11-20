@@ -25,9 +25,10 @@ func TestJoinAndLeaveMessages(t *testing.T) {
 	// A join: listed, told where to read, its key a keyterm.
 	r.join(t, "agent-1", "ABC-12")
 	members := r.roster.Joined()
-	if len(members) != 1 || members[0].IssueKey != "ABC-12" || members[0].Title != titles["ABC-12"] || members[0].SessionID != "sess-1" {
-		t.Fatalf("roster %+v, want agent-1 on ABC-12, titled from Dispatch, in sess-1", members)
+	if len(members) != 1 || members[0].IssueKey != "ABC-12" || members[0].Title != titles["ABC-12"] || members[0].SessionID != "sess-1" || members[0].ID == "" {
+		t.Fatalf("roster %+v, want agent-1 on ABC-12, titled from Dispatch, in sess-1, with a membership id", members)
 	}
+	membership := members[0].ID
 	welcome := r.agents.to("agent-1")[0]
 	if !welcome.NoReply || welcome.InReplyTo == "" {
 		t.Fatalf("the join's answer %+v, want a notice in reply to the join", welcome)
@@ -49,8 +50,8 @@ func TestJoinAndLeaveMessages(t *testing.T) {
 	if got := r.notes.lastKeyterms(); len(got) != 0 {
 		t.Fatalf("keyterms after the leave %q, want none", got)
 	}
-	if !slices.Contains(r.floor.loweredFor(), "agent-1") {
-		t.Fatal("the leave did not lower the agent's hand")
+	if !slices.Contains(r.floor.loweredFor(), membership) {
+		t.Fatalf("the leave lowered %q, want its membership %s", r.floor.loweredFor(), membership)
 	}
 
 	// The end of the recorder session.
@@ -260,7 +261,7 @@ func TestFloorRequests(t *testing.T) {
 	}
 	h := hands[0]
 	want := &voice.Hand{
-		ID: request.EventID, SessionID: "sess-1", Agent: "agent-1", IssueKey: "ABC-12", Name: "ABC-12",
+		ID: request.EventID, SessionID: "sess-1", Agent: "agent-1", Membership: r.roster.Joined()[0].ID, IssueKey: "ABC-12", Name: "ABC-12",
 		Text: "ABC-12's agent says: The deploy of the new keys moved to Friday.", Expires: request.IssuedAt.Add(60 * time.Second),
 	}
 	if *h != *want {

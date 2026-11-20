@@ -169,7 +169,7 @@ func (h *joinedHooks) HandDone(hand *voice.Hand, outcome voice.HandOutcome) {
 // voice.Supervisor is one.
 type handRaiser interface {
 	RaiseHand(h *voice.Hand) error
-	LowerHands(agent string)
+	LowerHands(membership string)
 }
 
 // RaiseHand raises a joined agent's hand on the voice; with no voice, or the
@@ -181,10 +181,10 @@ func (l *voiceLink) RaiseHand(h *voice.Hand) error {
 	return voice.ErrHandVoiceOff
 }
 
-// LowerHands lowers a leaving agent's hands.
-func (l *voiceLink) LowerHands(agent string) {
+// LowerHands lowers the hands of a joined agent's membership as it ends.
+func (l *voiceLink) LowerHands(membership string) {
 	if v, ok := l.get().(handRaiser); ok {
-		v.LowerHands(agent)
+		v.LowerHands(membership)
 	}
 }
 

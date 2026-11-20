@@ -53,10 +53,10 @@ func (v *raisingVoice) RaiseHand(h *voice.Hand) error {
 	return nil
 }
 
-func (v *raisingVoice) LowerHands(agent string) {
+func (v *raisingVoice) LowerHands(membership string) {
 	v.mu.Lock()
 	defer v.mu.Unlock()
-	v.lowered = append(v.lowered, agent)
+	v.lowered = append(v.lowered, membership)
 }
 
 func testRoster(t *testing.T, link *voiceLink) *joined.Roster {
@@ -149,10 +149,10 @@ func TestAJoinedAgentsHandReachesTheVoice(t *testing.T) {
 	if err := link.RaiseHand(&voice.Hand{ID: "h1"}); err != nil {
 		t.Fatal(err)
 	}
-	link.LowerHands("agent-1")
+	link.LowerHands("agent-1#1")
 	v.mu.Lock()
 	defer v.mu.Unlock()
-	if len(v.raised) != 1 || v.raised[0].ID != "h1" || !slices.Equal(v.lowered, []string{"agent-1"}) {
+	if len(v.raised) != 1 || v.raised[0].ID != "h1" || !slices.Equal(v.lowered, []string{"agent-1#1"}) {
 		t.Fatalf("raised %+v, lowered %q; want h1 and agent-1", v.raised, v.lowered)
 	}
 }

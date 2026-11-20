@@ -1,6 +1,7 @@
 package joined
 
 import (
+	"cmp"
 	"context"
 	"fmt"
 	"slices"
@@ -71,17 +72,32 @@ func (f *fakeAgents) to(agent string) []envoy.SendRequest {
 	return out
 }
 
-// fakeFloor is the Supervisor as the roster raises hands on it. events holds
-// each raise and lower in order, "raise:<agent>" and "lower:<agent>".
+// fakeFloor is the Supervisor as the roster raises hands on it. As the
+// Supervisor does, it lowers a membership's hands and no other: up maps each
+// membership with a hand up to its agent. events holds each raise and lower
+// in order, "raise:<membership>" and "lower:<membership>".
 type fakeFloor struct {
 	mu      sync.Mutex
 	raised  []*voice.Hand
 	lowered []string
 	events  []string
+	up      map[string]string
 	err     error
-	// beforeRaise and beforeLower, when set, run first, outside mu.
+	// beforeRaise, when set, runs first, outside mu. beforeLower does too,
+	// given the agent session whose membership is lowered.
 	beforeRaise func(h *voice.Hand)
 	beforeLower func(agent string)
+}
+
+// handKey is the key a hand is raised and lowered by: its membership, or its
+// agent for a hand that names none.
+func handKey(h *voice.Hand) string { return cmp.Or(h.Membership, h.Agent) }
+
+// membershipAgent is the agent session a membership id names: the roster
+// writes a membership as <agent>#<n>.
+func membershipAgent(membership string) string {
+	agent, _, _ := strings.Cut(membership, "#")
+	return agent
 }
 
 func (f *fakeFloor) RaiseHand(h *voice.Hand) error {
@@ -96,38 +112,39 @@ func (f *fakeFloor) RaiseHand(h *voice.Hand) error {
 	if f.err != nil {
 		return f.err
 	}
+	if f.up == nil {
+		f.up = map[string]string{}
+	}
 	f.raised = append(f.raised, h)
-	f.events = append(f.events, "raise:"+h.Agent)
+	f.up[handKey(h)] = h.Agent
+	f.events = append(f.events, "raise:"+handKey(h))
 	return nil
 }
 
-func (f *fakeFloor) LowerHands(agent string) {
+func (f *fakeFloor) LowerHands(membership string) {
 	f.mu.Lock()
 	hook := f.beforeLower
 	f.mu.Unlock()
 	if hook != nil {
-		hook(agent)
+		hook(membershipAgent(membership))
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.lowered = append(f.lowered, agent)
-	f.events = append(f.events, "lower:"+agent)
+	f.lowered = append(f.lowered, membership)
+	delete(f.up, membership)
+	f.events = append(f.events, "lower:"+membership)
 }
 
-// handUp reports whether agent's last raise came after its last lower.
+// handUp reports whether a hand of agent, of any of its memberships, is up.
 func (f *fakeFloor) handUp(agent string) bool {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	up := false
-	for _, e := range f.events {
-		switch e {
-		case "raise:" + agent:
-			up = true
-		case "lower:" + agent:
-			up = false
+	for _, a := range f.up {
+		if a == agent {
+			return true
 		}
 	}
-	return up
+	return false
 }
 
 func (f *fakeFloor) hands() []*voice.Hand {
