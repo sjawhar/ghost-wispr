@@ -48,13 +48,23 @@ const (
 // its audio, including the Say that waits for the reply's accepted bytes.
 // A completed audio-first utterance stays in awaitingText until its text
 // arrives; it never shares state with a later reply.
+//
+// Audio that comes after an injection's last text is held: no message names
+// the sentence a binary frame belongs to, so it may be the injection's last
+// sentence or the start of the model's own words after it. It plays when the
+// reply ends with no model text (AgentAudioDone, UserStartedSpeaking, the
+// next injection, or no audio for the speech gap), and is dropped when model
+// text comes first.
 type utterance struct {
 	decision utteranceDecision
 	text     bool
 	done     bool
 	queued   bool
 	ended    bool
-	audio    [][]byte
+	holding  bool     // its injection's last text came: later audio is held
+	heldSeen int      // frames ever held, so a quiet timer knows it is the last
+	audio    [][]byte // audio before its text, waiting for its decision
+	held     [][]byte // audio after its injection's last text
 	waiter   *sayWait
 }
 
@@ -64,6 +74,7 @@ type speechQueue struct {
 	mu           sync.Mutex
 	items        []speechItem
 	ready        chan struct{} // signalled when items or interrupted change
+	gap          time.Duration // a reply has ended when no audio came for this long
 	current      *utterance    // the reply receiving audio now
 	awaitingText []*utterance  // completed audio-first replies, in wire order
 	awaitingEnd  []*utterance  // authorized replies superseded before their done
@@ -71,8 +82,8 @@ type speechQueue struct {
 	stop         context.CancelFunc
 }
 
-func newSpeechQueue() speechQueue {
-	return speechQueue{ready: make(chan struct{}, 1)}
+func newSpeechQueue(gap time.Duration) speechQueue {
+	return speechQueue{ready: make(chan struct{}, 1), gap: gap}
 }
 
 func (q *speechQueue) signal() {
@@ -94,14 +105,46 @@ func (q *speechQueue) audio(pcm []byte) {
 }
 
 func (q *speechQueue) queueAudioLocked(u *utterance, pcm []byte) {
-	switch u.decision {
-	case undecided:
+	switch {
+	case u.decision == undecided:
 		u.audio = append(u.audio, pcm)
-	case allowed:
+	case u.decision == allowed && u.holding:
+		u.held = append(u.held, pcm)
+		u.heldSeen++
+		n := u.heldSeen
+		time.AfterFunc(q.gap, func() { q.releaseIfQuiet(u, n) })
+	case u.decision == allowed:
 		u.queued = true
 		q.items = append(q.items, speechItem{kind: itemAudio, pcm: pcm})
 		q.signal()
 	}
+}
+
+// releaseIfQuiet plays u's held audio when no audio came for the speech gap
+// after its n-th held frame and u is still the reply receiving audio: the
+// reply stopped with no model text and no AgentAudioDone.
+func (q *speechQueue) releaseIfQuiet(u *utterance, n int) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if q.current != u || u.decision != allowed || u.heldSeen != n || len(u.held) == 0 {
+		return
+	}
+	q.releaseHeldLocked(u)
+	q.signal()
+}
+
+// releaseHeldLocked queues u's held audio. q.mu is held.
+func (q *speechQueue) releaseHeldLocked(u *utterance) {
+	for _, pcm := range u.held {
+		q.items = append(q.items, speechItem{kind: itemAudio, pcm: pcm})
+		u.queued = true
+	}
+	u.held = nil
+}
+
+// dropLocked rejects u and everything it buffered or held. q.mu is held.
+func dropLocked(u *utterance) {
+	u.decision, u.audio, u.held = dropped, nil, nil
 }
 
 // textCame returns the reply its text belongs to. An audio-first reply that
@@ -126,8 +169,9 @@ func (q *speechQueue) textCame() *utterance {
 
 // injection starts a new reply when Deepgram begins an authorized injection
 // after an unfinished dropped model reply, or after an earlier completed Say
-// whose audio stopped without AgentAudioDone. A partial multi-sentence Say
-// has no waiter yet, so it stays on its current reply.
+// whose audio stopped without AgentAudioDone. That earlier Say's held audio
+// plays: no model text came after it. A partial multi-sentence Say has no
+// waiter yet, so it stays on its current reply.
 func (q *speechQueue) injection(u *utterance) *utterance {
 	q.mu.Lock()
 	defer q.mu.Unlock()
@@ -135,19 +179,30 @@ func (q *speechQueue) injection(u *utterance) *utterance {
 		return u
 	}
 	if u.decision == allowed {
+		q.releaseHeldLocked(u)
 		q.awaitingEnd = append(q.awaitingEnd, u)
+		q.signal()
 	}
 	q.current = &utterance{text: true}
 	return q.current
 }
 
 // foreign starts a new dropped reply when Deepgram resumes its own speech
-// after an authorized injection. The authorized reply still gets the shared
-// AgentAudioDone, while every following model byte stays with the new object.
+// after an authorized injection. The audio held since the injection's last
+// text may be these model words, so all of it is dropped, and the Say whose
+// words it may hold is not spoken. The authorized reply still gets the
+// shared AgentAudioDone, to end what of it played.
 func (q *speechQueue) foreign(u *utterance) *utterance {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	if q.current == u && u.decision == allowed {
+		if len(u.held) > 0 {
+			u.held = nil
+			if u.waiter != nil {
+				u.waiter.finish(ErrNotSpoken)
+			}
+		}
+		u.holding = false
 		q.awaitingEnd = append(q.awaitingEnd, u)
 		q.current = &utterance{text: true}
 		return q.current
@@ -203,6 +258,9 @@ func (q *speechQueue) allow(u *utterance, w *sayWait) {
 		u.audio = nil
 		u.queued = true
 	}
+	if w != nil && !u.done {
+		u.holding = true // the injection's words are all echoed
+	}
 	q.endLocked(u)
 	if len(q.items) > 0 {
 		q.signal()
@@ -213,6 +271,7 @@ func (q *speechQueue) endLocked(u *utterance) {
 	if u.decision != allowed || !u.done || u.ended {
 		return
 	}
+	q.releaseHeldLocked(u)
 	u.ended = true
 	q.items = append(q.items, speechItem{kind: itemEnd})
 }
@@ -221,7 +280,7 @@ func (q *speechQueue) endLocked(u *utterance) {
 func (q *speechQueue) reject(u *utterance) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
-	u.decision, u.audio = dropped, nil
+	dropLocked(u)
 }
 
 // silenced says whether Deepgram is actively sending a reply that cannot
@@ -232,21 +291,26 @@ func (q *speechQueue) silenced() bool {
 	return q.current != nil && q.current.decision == dropped
 }
 
-// userSpoke ends the reply Deepgram stops for the room. Its late bytes and
-// text cannot be claimed later; the next vendor event creates a new reply.
+// userSpoke ends the reply Deepgram stops for the room. What it held of an
+// injection plays, as no model text came; its late bytes and text cannot be
+// claimed later, and the next vendor event creates a new reply.
 func (q *speechQueue) userSpoke() {
 	q.mu.Lock()
 	defer q.mu.Unlock()
+	if u := q.current; u != nil && u.decision == allowed {
+		q.releaseHeldLocked(u)
+		q.signal()
+	}
 	q.rejectAllLocked()
 }
 
 func (q *speechQueue) rejectAllLocked() {
 	if q.current != nil {
-		q.current.decision, q.current.audio = dropped, nil
+		dropLocked(q.current)
 		q.current = nil
 	}
 	for _, u := range q.awaitingText {
-		u.decision, u.audio = dropped, nil
+		dropLocked(u)
 	}
 	q.awaitingText = nil
 	q.awaitingEnd = nil
@@ -259,13 +323,13 @@ func (q *speechQueue) interrupt() {
 	defer q.mu.Unlock()
 	q.endWaitersLocked(ErrInterrupted)
 	for _, u := range q.awaitingText {
-		u.decision, u.audio = dropped, nil
+		dropLocked(u)
 	}
 	q.awaitingText = nil
 	if q.current == nil {
 		q.current = &utterance{decision: dropped}
 	} else {
-		q.current.decision, q.current.audio = dropped, nil
+		dropLocked(q.current)
 	}
 	q.interrupted = true
 	if q.stop != nil {
