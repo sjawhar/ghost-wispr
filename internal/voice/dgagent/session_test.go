@@ -2114,6 +2114,10 @@ func TestTheModelsOwnWordsAfterAnAnswerAreNotPlayed(t *testing.T) {
 	c.send(map[string]any{"type": "ConversationText", "role": "assistant", "content": say, "conversational_behavior": "default"})
 	c.sendAudio(answer)
 	c.expect(t, "FunctionCallResponse")
+	// Deepgram streams the answer in real time, so the model's own text
+	// comes once the answer's audio has played, past the hold on audio after
+	// an injection's last text (the end-to-end proof at ea62fdd: 6.9 s).
+	waitEvent(t, sess, voice.EventSpeechStarted)
 	c.send(map[string]any{"type": "ConversationText", "role": "assistant", "content": "It was last changed 40 minutes ago.", "conversational_behavior": "default"})
 	c.sendAudio(tone(OutputRate, 40*time.Millisecond, 200))
 	c.send(map[string]any{"type": "AgentAudioDone"})

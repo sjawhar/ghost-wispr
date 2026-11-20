@@ -77,6 +77,7 @@ type speechQueue struct {
 	items        []speechItem
 	ready        chan struct{} // signalled when items or interrupted change
 	holdTail     time.Duration // how long audio after an injection's last text waits
+	holder       *utterance    // the injection whose audio after its last text may still wait
 	current      *utterance    // the reply receiving audio now
 	awaitingText []*utterance  // completed audio-first replies, in wire order
 	awaitingEnd  []*utterance  // authorized replies superseded before their done
@@ -122,7 +123,7 @@ func (q *speechQueue) queueAudioLocked(u *utterance, pcm []byte) {
 }
 
 // releaseHeld plays u's held frames up to frame, once frame has waited
-// holdTail with no model text after it.
+// holdTail with no model text after it, and ends u if Deepgram already did.
 func (q *speechQueue) releaseHeld(u *utterance, frame int) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
@@ -130,6 +131,7 @@ func (q *speechQueue) releaseHeld(u *utterance, frame int) {
 		return
 	}
 	if q.queueHeldLocked(u, frame-u.heldBase) {
+		q.endLocked(u)
 		q.signal()
 	}
 }
@@ -150,9 +152,21 @@ func (q *speechQueue) queueHeldLocked(u *utterance, n int) bool {
 	return true
 }
 
-// releaseHeldLocked plays all u holds: its reply ended with no model text.
-func (q *speechQueue) releaseHeldLocked(u *utterance) {
-	q.queueHeldLocked(u, len(u.held))
+// releaseHolderLocked plays all the holder still holds, and ends it if its
+// reply has ended: no model text came after it. q.mu is held.
+func (q *speechQueue) releaseHolderLocked() {
+	h := q.holder
+	if h == nil {
+		return
+	}
+	q.holder = nil
+	if h.decision != allowed {
+		return
+	}
+	q.queueHeldLocked(h, len(h.held))
+	h.holding = false
+	q.endLocked(h)
+	q.signal()
 }
 
 // dropHeldLocked drops what u still holds and says whether it held any.
@@ -201,27 +215,36 @@ func (q *speechQueue) injection(u *utterance) *utterance {
 		return u
 	}
 	if u.decision == allowed {
-		q.releaseHeldLocked(u)
+		if q.holder == u {
+			q.releaseHolderLocked()
+		}
 		q.awaitingEnd = append(q.awaitingEnd, u)
-		q.signal()
 	}
 	q.current = &utterance{text: true}
 	return q.current
 }
 
-// foreign starts a new dropped reply when Deepgram resumes its own speech
-// after an authorized injection. The audio that still waits since the
-// injection's last text may be these model words, so it is dropped. A Say
-// none of whose audio played is not spoken. The authorized reply still gets
-// the shared AgentAudioDone, to end what of it played.
+// foreign notes model text. The audio still waiting since an injection's
+// last text may be these model words, whether or not that injection's
+// AgentAudioDone came, so it is dropped; a Say none of whose audio played is
+// not spoken. When Deepgram resumes its own speech before the injection's
+// AgentAudioDone, a new dropped reply takes the audio that follows, and the
+// injection still gets the shared AgentAudioDone to end what of it played.
 func (q *speechQueue) foreign(u *utterance) *utterance {
 	q.mu.Lock()
 	defer q.mu.Unlock()
-	if q.current == u && u.decision == allowed {
-		if dropHeldLocked(u) && !u.queued && u.waiter != nil {
-			u.waiter.finish(ErrNotSpoken)
+	if h := q.holder; h != nil {
+		q.holder = nil
+		if h.decision == allowed {
+			if dropHeldLocked(h) && !h.queued && h.waiter != nil {
+				h.waiter.finish(ErrNotSpoken)
+			}
+			h.holding = false
+			q.endLocked(h)
+			q.signal()
 		}
-		u.holding = false
+	}
+	if q.current == u && u.decision == allowed {
 		q.awaitingEnd = append(q.awaitingEnd, u)
 		q.current = &utterance{text: true}
 		return q.current
@@ -278,7 +301,10 @@ func (q *speechQueue) allow(u *utterance, w *sayWait) {
 		u.queued = true
 	}
 	if w != nil && !u.done {
-		u.holding = true // the injection's words are all echoed
+		if q.holder != u {
+			q.releaseHolderLocked() // an earlier injection: no model text came after it
+		}
+		u.holding, q.holder = true, u // the injection's words are all echoed
 	}
 	q.endLocked(u)
 	if len(q.items) > 0 {
@@ -286,11 +312,12 @@ func (q *speechQueue) allow(u *utterance, w *sayWait) {
 	}
 }
 
+// endLocked ends u's playback once its reply ended and no audio of it still
+// waits. q.mu is held.
 func (q *speechQueue) endLocked(u *utterance) {
-	if u.decision != allowed || !u.done || u.ended {
+	if u.decision != allowed || !u.done || u.ended || len(u.held) > 0 {
 		return
 	}
-	q.releaseHeldLocked(u)
 	u.ended = true
 	q.items = append(q.items, speechItem{kind: itemEnd})
 }
@@ -316,14 +343,16 @@ func (q *speechQueue) silenced() bool {
 func (q *speechQueue) userSpoke() {
 	q.mu.Lock()
 	defer q.mu.Unlock()
-	if u := q.current; u != nil && u.decision == allowed {
-		q.releaseHeldLocked(u)
-		q.signal()
-	}
+	q.releaseHolderLocked()
 	q.rejectAllLocked()
 }
 
 func (q *speechQueue) rejectAllLocked() {
+	if h := q.holder; h != nil {
+		dropHeldLocked(h)
+		h.ended = true
+		q.holder = nil
+	}
 	if q.current != nil {
 		dropLocked(q.current)
 		q.current = nil
@@ -341,6 +370,10 @@ func (q *speechQueue) interrupt() {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	q.endWaitersLocked(ErrInterrupted)
+	if h := q.holder; h != nil {
+		dropLocked(h)
+		q.holder = nil
+	}
 	for _, u := range q.awaitingText {
 		dropLocked(u)
 	}
@@ -380,9 +413,9 @@ func (q *speechQueue) endWaitersLocked(reason error) {
 	if q.current != nil && q.current.waiter != nil {
 		q.current.waiter.finish(reason)
 	}
-	for _, pending := range [][]*utterance{q.awaitingEnd, q.awaitingText} {
+	for _, pending := range [][]*utterance{q.awaitingEnd, q.awaitingText, {q.holder}} {
 		for _, u := range pending {
-			if u.waiter != nil {
+			if u != nil && u.waiter != nil {
 				u.waiter.finish(reason)
 			}
 		}
