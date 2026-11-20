@@ -123,6 +123,7 @@ func TestSolR4FactAuditMustRetainTheQuestionsKey(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			x := testExchange(newFakeOutput(), newFakeTools(voice.AnswerResult{}))
+			x.IssueKey = "ABC-123"
 			x.AskerTurn = "What is happening with ABC-123?"
 			srv := newLiveServer(t)
 			s, c, _ := openSession(t, srv, x)
