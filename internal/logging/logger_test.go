@@ -4,9 +4,12 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -177,35 +180,74 @@ func TestWithModule_RenamedInAGroupHoldsOneModule(t *testing.T) {
 
 // A bound value is rendered once, when it is bound, as a plain JSON logger
 // renders it: the logger and the one that renames its module log the same
-// value, a value's own MarshalJSON and a LogValuer each run once, and a map
-// changed after it was bound shows as it was.
+// value, a value's own MarshalJSON (also inside a map) and a LogValuer each run
+// once, and a map changed after it was bound shows as it was. So it is with a
+// group opened before the values are bound.
 func TestWithModule_RenamingKeepsBoundValuesAsBound(t *testing.T) {
-	var out bytes.Buffer
-	marshals, evaluations := 0, 0
-	counter := map[string]int{"counter": 1}
-	logger := WithModule(New(&out, slog.LevelInfo), "server").
-		With("state", counter, "marshaled", countingMarshaler{&marshals}, slog.Group("detail", slog.Any("value", logValueFunc(func() slog.Value {
-			evaluations++
-			return slog.IntValue(evaluations)
-		}))))
-	counter["counter"] = 2
-	logger.Info("original logger")
-	WithModule(logger, "health").Info("renamed logger")
+	for _, group := range []string{"", "request"} {
+		t.Run("group "+strconv.Quote(group), func(t *testing.T) {
+			var out bytes.Buffer
+			marshals, nestedMarshals, evaluations := 0, 0, 0
+			counter := map[string]int{"counter": 1}
+			logger := WithModule(New(&out, slog.LevelInfo), "server")
+			if group != "" {
+				logger = logger.WithGroup(group)
+			}
+			logger = logger.With("state", counter, "marshaled", countingMarshaler{&marshals},
+				"nested", map[string]any{"marshaled": countingMarshaler{&nestedMarshals}},
+				slog.Group("detail", slog.Any("value", logValueFunc(func() slog.Value {
+					evaluations++
+					return slog.IntValue(evaluations)
+				}))))
+			counter["counter"] = 2
+			logger.Info("original logger")
+			WithModule(logger, "health").Info("renamed logger")
 
-	if marshals != 1 || evaluations != 1 {
-		t.Errorf("binding ran MarshalJSON %d times and LogValue %d times, want once each", marshals, evaluations)
+			if marshals != 1 || nestedMarshals != 1 || evaluations != 1 {
+				t.Errorf("binding ran MarshalJSON %d times (%d in a map) and LogValue %d times, want once each", marshals, nestedMarshals, evaluations)
+			}
+			lines := strings.Split(strings.TrimSpace(out.String()), "\n")
+			if len(lines) != 2 {
+				t.Fatalf("expected two records, got %d: %s", len(lines), out.String())
+			}
+			for _, line := range lines {
+				payload := decodeJSONLine(t, line)
+				if group != "" {
+					payload, _ = payload[group].(map[string]any)
+				}
+				state, _ := payload["state"].(map[string]any)
+				nested, _ := payload["nested"].(map[string]any)
+				detail, _ := payload["detail"].(map[string]any)
+				if state["counter"] != float64(1) || payload["marshaled"] != float64(1) || nested["marshaled"] != float64(1) || detail["value"] != float64(1) {
+					t.Errorf("a bound value is not as it was bound (state.counter 1, marshaled 1, nested.marshaled 1, detail.value 1): %s", line)
+				}
+			}
+		})
 	}
-	lines := strings.Split(strings.TrimSpace(out.String()), "\n")
-	if len(lines) != 2 {
-		t.Fatalf("expected two records, got %d: %s", len(lines), out.String())
+}
+
+// A value bound after a group opened is written as a plain JSON logger writes
+// it: HTML characters unescaped, an error as its text, a struct, a nil and a
+// value whose JSON fails each as that logger writes them.
+func TestWithModule_GroupedValuesRenderAsAPlainLogger(t *testing.T) {
+	values := []any{
+		"tag", map[string]string{"html": "<b>&</b>"},
+		"failure", errors.New("disk <full>"),
+		"point", struct{ X, Y int }{1, 2},
+		"none", nil,
+		"unrenderable", func() {},
 	}
-	for _, line := range lines {
-		payload := decodeJSONLine(t, line)
-		state, _ := payload["state"].(map[string]any)
-		detail, _ := payload["detail"].(map[string]any)
-		if state["counter"] != float64(1) || payload["marshaled"] != float64(1) || detail["value"] != float64(1) {
-			t.Errorf("a bound value is not as it was bound (state.counter 1, marshaled 1, detail.value 1): %s", line)
-		}
+	var plain, named bytes.Buffer
+	New(&plain, slog.LevelInfo).WithGroup("request").With(values...).Info("bound")
+	WithModule(New(&named, slog.LevelInfo), "server").WithGroup("request").With(values...).Info("bound")
+
+	want, _ := decodeJSONLine(t, plain.String())["request"].(map[string]any)
+	got, _ := decodeJSONLine(t, named.String())["request"].(map[string]any)
+	if len(want) != 5 || !reflect.DeepEqual(got, want) {
+		t.Fatalf("grouped values = %v, a plain logger writes %v\nplain: %snamed: %s", got, want, plain.String(), named.String())
+	}
+	if !strings.Contains(named.String(), `"html":"<b>&</b>"`) {
+		t.Fatalf("HTML characters were escaped: %s", named.String())
 	}
 }
 

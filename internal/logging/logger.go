@@ -1,9 +1,11 @@
 package logging
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"io"
 	"log"
@@ -189,8 +191,8 @@ func WithModule(logger *slog.Logger, module string) *slog.Logger {
 // module binds that one on bare.
 //
 // Once a group opens, the module stays outside it: named then binds each
-// later attribute itself, as bare does, so such an attribute is rendered on
-// both.
+// later attribute itself, as bare does. Such an attribute is rendered once
+// before either binds it (renderAttrs), so both hold the same text.
 type moduleHandler struct {
 	bare    slog.Handler
 	module  string
@@ -218,8 +220,7 @@ func (h *moduleHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
 	if !h.grouped {
 		return newModuleHandler(h.bare.WithAttrs(attrs), h.module)
 	}
-	// Resolved once here, a LogValuer bound on both handlers is evaluated once.
-	resolveAttrs(attrs)
+	renderAttrs(attrs)
 	return &moduleHandler{bare: h.bare.WithAttrs(slices.Clone(attrs)), module: h.module, named: h.named.WithAttrs(attrs), grouped: true}
 }
 
@@ -230,16 +231,40 @@ func (h *moduleHandler) WithGroup(name string) slog.Handler {
 	return &moduleHandler{bare: h.bare.WithGroup(name), module: h.module, named: h.named.WithGroup(name), grouped: true}
 }
 
-// resolveAttrs resolves each LogValuer in attrs, in groups too, in place.
-func resolveAttrs(attrs []slog.Attr) {
+// renderAttrs renders each value of attrs, in groups too, in place, as
+// slog's JSON handler renders it: a LogValuer is resolved, an error that is no
+// json.Marshaler becomes its text, and any other value of kind Any becomes its
+// JSON, so each runs once however many handlers bind the result. A value whose
+// JSON fails stays, and each handler writes the same failure.
+func renderAttrs(attrs []slog.Attr) {
 	for i := range attrs {
-		attrs[i].Value = attrs[i].Value.Resolve()
-		if attrs[i].Value.Kind() == slog.KindGroup {
-			group := slices.Clone(attrs[i].Value.Group())
-			resolveAttrs(group)
-			attrs[i].Value = slog.GroupValue(group...)
+		value := attrs[i].Value.Resolve()
+		switch value.Kind() {
+		case slog.KindGroup:
+			group := slices.Clone(value.Group())
+			renderAttrs(group)
+			value = slog.GroupValue(group...)
+		case slog.KindAny:
+			value = renderAny(value)
+		}
+		attrs[i].Value = value
+	}
+}
+
+func renderAny(value slog.Value) slog.Value {
+	v := value.Any()
+	if err, ok := v.(error); ok {
+		if _, marshals := v.(json.Marshaler); !marshals {
+			return slog.StringValue(err.Error())
 		}
 	}
+	var rendered bytes.Buffer
+	encoder := json.NewEncoder(&rendered)
+	encoder.SetEscapeHTML(false)
+	if err := encoder.Encode(v); err != nil {
+		return value
+	}
+	return slog.AnyValue(json.RawMessage(bytes.TrimSuffix(rendered.Bytes(), []byte("\n"))))
 }
 
 func ContextWithLogger(ctx context.Context, logger *slog.Logger) context.Context {
