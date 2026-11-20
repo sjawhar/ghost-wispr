@@ -17,7 +17,10 @@
 # (deploy/pi/journalrecords), so a driver that reads another journal, another process's lines or
 # another key reads nothing. Each step runs once as it should pass and once against its
 # verification check's negative control. Cases run in parallel; each records its failures, and the
-# run goes on, so that one run shows every assertion that fails.
+# run goes on, so that one run shows every assertion that fails. On 2 CPUs a whole run takes about
+# 8 minutes (488 s and 507 s on sami-devbox, 2026-11-20), so give it a timeout of 15 minutes or
+# more. Killed early, it leaves nothing for long: its fake services end within 5 s of it, and a
+# driver still restoring its case within 150 s.
 set -uo pipefail
 
 repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
