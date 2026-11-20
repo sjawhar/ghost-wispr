@@ -21,7 +21,6 @@ const (
 
 var (
 	earKey           = regexp.MustCompile(`\b[A-Z][A-Z0-9]*-[0-9]+\b`)
-	questionKey      = regexp.MustCompile(`(?i)\b[A-Z][A-Z0-9]*-[0-9]+\b`)
 	earPR            = regexp.MustCompile(`(?i)(?:\bPR\s*(?:number\s*)?#?|\bpull\s+request\s*(?:number\s*)?#?|#|/pull/)([0-9]+)\b`)
 	earSentenceEnd   = regexp.MustCompile(`[.!?]+(?:\s+|$)`)
 	earAbbreviations = set([]string{"e.g", "i.e", "vs", "cf", "dr", "mr", "mrs", "ms"})
