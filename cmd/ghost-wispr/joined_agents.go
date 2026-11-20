@@ -152,14 +152,14 @@ func (h *joinedHooks) SessionsDeleted(sessionIDs []string) {
 }
 
 // OnSegment hands the roster a final segment of the room's words.
-func (h *joinedHooks) OnSegment(s voice.Segment) {
+func (h *joinedHooks) OnSegment(s *voice.Segment) {
 	if roster := h.get(); roster != nil {
 		roster.OnSegment(s)
 	}
 }
 
 // HandDone tells the roster how a raised hand came down.
-func (h *joinedHooks) HandDone(hand voice.Hand, outcome voice.HandOutcome) {
+func (h *joinedHooks) HandDone(hand *voice.Hand, outcome voice.HandOutcome) {
 	if roster := h.get(); roster != nil {
 		roster.HandDone(hand, outcome)
 	}
@@ -168,13 +168,13 @@ func (h *joinedHooks) HandDone(hand voice.Hand, outcome voice.HandOutcome) {
 // handRaiser is the voice as joined agents raise hands on it; the
 // voice.Supervisor is one.
 type handRaiser interface {
-	RaiseHand(h voice.Hand) error
+	RaiseHand(h *voice.Hand) error
 	LowerHands(agent string)
 }
 
 // RaiseHand raises a joined agent's hand on the voice; with no voice, or the
 // voice off, it is refused.
-func (l *voiceLink) RaiseHand(h voice.Hand) error {
+func (l *voiceLink) RaiseHand(h *voice.Hand) error {
 	if v, ok := l.get().(handRaiser); ok {
 		return v.RaiseHand(h)
 	}

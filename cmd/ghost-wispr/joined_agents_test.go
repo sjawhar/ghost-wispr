@@ -38,21 +38,15 @@ func (a *recordingAgents) Send(_ context.Context, r *envoy.SendRequest) (envoy.S
 	return envoy.SendResult{EventID: fmt.Sprintf("evt-%d", len(a.sent)), RecipientState: envoy.StateLive}, nil
 }
 
-func (a *recordingAgents) count() int {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	return len(a.sent)
-}
-
 // raisingVoice is a voice that records the hands raised and lowered on it.
 type raisingVoice struct {
 	closingsHeard
 	mu      sync.Mutex
-	raised  []voice.Hand
+	raised  []*voice.Hand
 	lowered []string
 }
 
-func (v *raisingVoice) RaiseHand(h voice.Hand) error {
+func (v *raisingVoice) RaiseHand(h *voice.Hand) error {
 	v.mu.Lock()
 	defer v.mu.Unlock()
 	v.raised = append(v.raised, h)
@@ -147,12 +141,12 @@ func TestTheEnvoySessionCarriesJoinsToTheRoster(t *testing.T) {
 // not reach the voice, or is taken with no voice running.
 func TestAJoinedAgentsHandReachesTheVoice(t *testing.T) {
 	var link voiceLink
-	if err := link.RaiseHand(voice.Hand{ID: "h"}); !errors.Is(err, voice.ErrHandVoiceOff) {
+	if err := link.RaiseHand(&voice.Hand{ID: "h"}); !errors.Is(err, voice.ErrHandVoiceOff) {
 		t.Fatalf("RaiseHand with no voice = %v, want ErrHandVoiceOff", err)
 	}
 	v := &raisingVoice{}
 	link.set(v)
-	if err := link.RaiseHand(voice.Hand{ID: "h1"}); err != nil {
+	if err := link.RaiseHand(&voice.Hand{ID: "h1"}); err != nil {
 		t.Fatal(err)
 	}
 	link.LowerHands("agent-1")

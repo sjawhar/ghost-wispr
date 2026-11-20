@@ -76,7 +76,7 @@ var (
 // invitation until h.Expires. It refuses a hand with the voice off, for a
 // meeting that is not the one recording, or that has expired. HandDone is
 // told how the hand came down.
-func (s *Supervisor) RaiseHand(h Hand) error {
+func (s *Supervisor) RaiseHand(h *Hand) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	switch {
@@ -87,7 +87,7 @@ func (s *Supervisor) RaiseHand(h Hand) error {
 	case !time.Now().Before(h.Expires):
 		return ErrHandExpired
 	}
-	hand := h
+	hand := *h // the Supervisor keeps its own copy
 	s.pending = append(s.pending, &pendingAnswer{
 		PendingAnswer: PendingAnswer{SessionID: h.SessionID, IssueKey: h.IssueKey, Text: h.Text},
 		hand:          &hand,
@@ -114,8 +114,8 @@ func (s *Supervisor) handDoneLocked(p *pendingAnswer, outcome HandOutcome) {
 	if p.hand == nil || s.cfg.HandDone == nil {
 		return
 	}
-	h, done := *p.hand, s.cfg.HandDone
-	s.spawn(func() { done(h, outcome) })
+	hand, done := *p.hand, s.cfg.HandDone
+	s.spawn(func() { done(&hand, outcome) })
 }
 
 // dropExpiredLocked takes down the hands that expired by now.

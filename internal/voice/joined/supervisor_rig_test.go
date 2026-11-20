@@ -23,7 +23,7 @@ type supervisorRig struct {
 	says    chan string
 
 	mu       sync.Mutex
-	handDone func(voice.Hand, voice.HandOutcome)
+	handDone func(*voice.Hand, voice.HandOutcome)
 	start    float64
 }
 
@@ -39,7 +39,7 @@ func newSupervisorRig(t *testing.T) *supervisorRig {
 		Red:         func() bool { return true },
 		SoundGap:    50 * time.Millisecond,
 		SilenceWait: 100 * time.Millisecond,
-		HandDone: func(h voice.Hand, o voice.HandOutcome) {
+		HandDone: func(h *voice.Hand, o voice.HandOutcome) {
 			r.mu.Lock()
 			done := r.handDone
 			r.mu.Unlock()

@@ -317,10 +317,15 @@ What the voice hears, and where the room's words go:
   the issue, the holder, the state and the agent's written answer, which the session's page shows
   under "Questions to agents". Deleting a session erases its questions and the answers the agents
   wrote. An agent's written answer may quote the asker, and only a session delete erases it: a segment delete does not.
+- An agent a person invites through Dispatch can join the meeting (below). It reads the words from
+  the unit's own API, which honours deletions, never from a copy the unit sends it: the unit sends
+  a joined agent a pointer, a recording session and a time range with no words, when its issue
+  comes up, at most once a minute. What the agent read before a deletion stays in its session, and
+  the unit cannot recall it. A joined agent's floor request holds the agent's own words, which the
+  voice speaks after its issue key, and the unit keeps them only until they are spoken or dropped.
 - The voice's `/ws` events (`voice_wake`, `voice_exchange_started`, `voice_answer_ready`,
-  `voice_spoken` and `voice_tasks_changed`; `agent_joined` and `agent_left` come with agents that
-  join a meeting, which this build does not have) carry the recording session's id and no words,
-  and none is stored.
+  `voice_spoken`, `voice_tasks_changed`, `agent_joined` and `agent_left`) carry the recording
+  session's id and no words, and none is stored.
 - A speech vendor's error message that quotes the text to speak is left out of the journal; the
   unit logs the vendor's status, and a note that the message was left out.
 
@@ -338,6 +343,31 @@ What the voice hears, and where the room's words go:
 | `concierge.model` | `gemini-3.5-flash-lite` | The Concierge's Gemini model, on the unit's genai settings |
 | `concierge.dispatch_url`, `GHOST_WISPR_DISPATCH_TOKEN` | — | Dispatch and the unit's own token; without both, the voice says it cannot reach Dispatch yet |
 | `concierge.envoy_url` | — | The Envoy listener the unit registers its session with, to ask an issue's agent |
+
+### Agents in a meeting
+
+A person can tell an agent, through Dispatch, to join the meeting the unit records. The unit
+writes the join message (`GET /api/voice/join-message?issue=KEY`), and the person sends it to the
+agent's session (`dispatch send-to-agent`). It names the unit's own Envoy session and the whole
+floor protocol, so an agent with an older copy of the Ghost Wispr skill can follow it. The agent
+joins, asks for the floor and leaves with Envoy messages to that session, each one line:
+`ghost-wispr join KEY`, `ghost-wispr floor` with its words on the lines after it, and
+`ghost-wispr leave`.
+
+A joined agent follows the meeting through the unit's own API, and gets a pointer with no words
+when its issue comes up: a final segment that names its key, its number, or two words of its
+issue's title, at most once in 60 s. `GET /api/sessions/{id}/joined-agents` lists the agents in a
+meeting, and so does the session's page. Each joined agent's issue key becomes a keyterm of the
+live transcript from its join, with no redial. "Wispr, ask the ABC-12 agent …" goes to the agent
+that joined on ABC-12 before the issue's claim in Dispatch, and reaches it once.
+
+A floor request is at most 50 words, written for the ear, at most one in 5 minutes for an agent.
+The room hears a short two-tap sound at the next gap; the light does not change, since the agent's
+words are played, not heard. The voice says them, after the agent's issue key, only when a person
+says "Wispr, go ahead" ("Wispr, go ahead, ABC-12" picks one of several), and drops them after 60 s;
+the agent is told which. "Wispr, who has a hand up?" names the agents waiting. An agent leaves when
+it says so, when the meeting ends or is deleted, when the voice stops, or when Envoy lists its
+session as not live for 10 minutes.
 
 ## Deployment
 

@@ -257,11 +257,11 @@ func TestFloorRequests(t *testing.T) {
 		t.Fatalf("raised %d hands, want 1", len(hands))
 	}
 	h := hands[0]
-	want := voice.Hand{
+	want := &voice.Hand{
 		ID: request.EventID, SessionID: "sess-1", Agent: "agent-1", IssueKey: "ABC-12", Name: "ABC-12",
 		Text: "ABC-12's agent says: The deploy of the new keys moved to Friday.", Expires: request.IssuedAt.Add(60 * time.Second),
 	}
-	if h != want {
+	if *h != *want {
 		t.Fatalf("hand %+v, want %+v", h, want)
 	}
 

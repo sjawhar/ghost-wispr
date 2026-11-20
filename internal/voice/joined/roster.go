@@ -55,7 +55,7 @@ const (
 
 // ErrNoSuchIssue is Config.Title's answer for a key Dispatch has no issue
 // of: a join on it is refused.
-var ErrNoSuchIssue = errors.New("Dispatch has no such issue")
+var ErrNoSuchIssue = errors.New("no such issue in Dispatch")
 
 // Agents is the unit's Envoy session as the roster uses it; *envoy.Session is
 // one.
@@ -68,7 +68,7 @@ type Agents interface {
 // Floor is the voice as the roster raises hands on it; *voice.Supervisor is
 // one.
 type Floor interface {
-	RaiseHand(h voice.Hand) error
+	RaiseHand(h *voice.Hand) error
 	LowerHands(agent string)
 }
 
@@ -361,7 +361,7 @@ func (r *Roster) floor(ctx context.Context, m *envoy.Message, draft string) {
 		r.reply(ctx, m, "refused", fmt.Sprintf("You may ask for the floor at most once in %s, so this request was not taken. You may ask again from %s UTC.", every(r.cfg.FloorEvery), next.UTC().Format("15:04:05")))
 		return
 	}
-	hand := voice.Hand{ID: m.EventID, SessionID: joined.SessionID, Agent: agent, IssueKey: joined.IssueKey, Name: joined.name}
+	hand := &voice.Hand{ID: m.EventID, SessionID: joined.SessionID, Agent: agent, IssueKey: joined.IssueKey, Name: joined.name}
 	r.mu.Unlock()
 
 	draft = strings.Join(strings.Fields(draft), " ")
@@ -492,7 +492,7 @@ func (r *Roster) Sweep(ctx context.Context) {
 // meeting whose issue it names gets a pointer, at most one in PointerEvery;
 // a mention inside that time goes in the next pointer. A call to Wispr sends
 // no pointer: it reaches an agent through ask_agent alone.
-func (r *Roster) OnSegment(s voice.Segment) {
+func (r *Roster) OnSegment(s *voice.Segment) {
 	if s.Call || s.SessionID == "" {
 		return
 	}
@@ -543,7 +543,7 @@ func (r *Roster) sendPointers(sends []*pointer) {
 // HandDone tells an agent how its floor request came down: spoken, or
 // dropped as nobody invited it. A hand withdrawn as its agent left or its
 // meeting ended says nothing more.
-func (r *Roster) HandDone(h voice.Hand, outcome voice.HandOutcome) {
+func (r *Roster) HandDone(h *voice.Hand, outcome voice.HandOutcome) {
 	var text string
 	switch outcome {
 	case voice.HandSpoken:

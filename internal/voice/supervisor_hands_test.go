@@ -19,7 +19,7 @@ type handOutcomes struct {
 	done []string // hand id:outcome
 }
 
-func (h *handOutcomes) record(hand Hand, outcome HandOutcome) {
+func (h *handOutcomes) record(hand *Hand, outcome HandOutcome) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.done = append(h.done, hand.ID+":"+outcome.String())
@@ -39,8 +39,8 @@ func newHandsRig(t *testing.T) (*rig, *handOutcomes) {
 	return r, outcomes
 }
 
-func testHand(id, key string, expires time.Duration) Hand {
-	return Hand{
+func testHand(id, key string, expires time.Duration) *Hand {
+	return &Hand{
 		ID: id, SessionID: "sess-1", Agent: "agent-" + id, IssueKey: key, Name: key,
 		Text: key + "'s agent says: the deploy moved to Friday.", Expires: time.Now().Add(expires),
 	}
@@ -85,7 +85,7 @@ func TestRaisedHandExpires(t *testing.T) {
 func TestGoAheadPicksAHandByItsKey(t *testing.T) {
 	r, _ := newHandsRig(t)
 	first, second := testHand("h1", "ABC-12", time.Minute), testHand("h2", "XYZ-9", time.Minute)
-	for _, h := range []Hand{first, second} {
+	for _, h := range []*Hand{first, second} {
 		if err := r.s.RaiseHand(h); err != nil {
 			t.Fatalf("RaiseHand: %v", err)
 		}
@@ -101,7 +101,7 @@ func TestGoAheadPicksAHandByItsKey(t *testing.T) {
 func TestWhoHasAHandUp(t *testing.T) {
 	t.Run("two hands", func(t *testing.T) {
 		r, _ := newHandsRig(t)
-		for _, h := range []Hand{testHand("h1", "ABC-12", time.Minute), testHand("h2", "XYZ-9", time.Minute), testHand("h3", "OLD-1", 100*time.Millisecond)} {
+		for _, h := range []*Hand{testHand("h1", "ABC-12", time.Minute), testHand("h2", "XYZ-9", time.Minute), testHand("h3", "OLD-1", 100*time.Millisecond)} {
 			if err := r.s.RaiseHand(h); err != nil {
 				t.Fatalf("RaiseHand: %v", err)
 			}
@@ -139,7 +139,7 @@ func TestWhoHasAHandUp(t *testing.T) {
 // left or its meeting ended, or its agent is told it was spoken or expired.
 func TestHandsComeDownWithTheirMeeting(t *testing.T) {
 	r, outcomes := newHandsRig(t)
-	for _, h := range []Hand{testHand("h1", "ABC-12", time.Minute), testHand("h2", "XYZ-9", time.Minute)} {
+	for _, h := range []*Hand{testHand("h1", "ABC-12", time.Minute), testHand("h2", "XYZ-9", time.Minute)} {
 		if err := r.s.RaiseHand(h); err != nil {
 			t.Fatalf("RaiseHand: %v", err)
 		}
@@ -180,10 +180,10 @@ func TestSegmentsReachTheRoster(t *testing.T) {
 	c := newFakeConcierge("The voice issue is in review.")
 	c.hold = true
 	r := newRigWith(t, c, func(cfg *SupervisorConfig, _ *rig) {
-		cfg.Segment = func(s Segment) {
+		cfg.Segment = func(s *Segment) {
 			mu.Lock()
 			defer mu.Unlock()
-			got = append(got, s)
+			got = append(got, *s)
 		}
 	})
 	segments := func() []Segment {

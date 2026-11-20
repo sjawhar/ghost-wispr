@@ -199,8 +199,8 @@ type voiceDeps struct {
 	projects    func() []string // Dispatch's project keys, for spoken keys
 	// segment and handDone reach the joined agents' roster: the room's
 	// final segments, and how each raised hand came down.
-	segment  func(voice.Segment)
-	handDone func(voice.Hand, voice.HandOutcome)
+	segment  func(*voice.Segment)
+	handDone func(*voice.Hand, voice.HandOutcome)
 }
 
 // startVoice starts the Supervisor over the speaker output, and sets it on

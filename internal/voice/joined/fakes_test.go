@@ -66,12 +66,12 @@ func (f *fakeAgents) to(agent string) []envoy.SendRequest {
 // fakeFloor is the Supervisor as the roster raises hands on it.
 type fakeFloor struct {
 	mu      sync.Mutex
-	raised  []voice.Hand
+	raised  []*voice.Hand
 	lowered []string
 	err     error
 }
 
-func (f *fakeFloor) RaiseHand(h voice.Hand) error {
+func (f *fakeFloor) RaiseHand(h *voice.Hand) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.err != nil {
@@ -87,7 +87,7 @@ func (f *fakeFloor) LowerHands(agent string) {
 	f.lowered = append(f.lowered, agent)
 }
 
-func (f *fakeFloor) hands() []voice.Hand {
+func (f *fakeFloor) hands() []*voice.Hand {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return slices.Clone(f.raised)
@@ -275,7 +275,7 @@ func (r *rig) pointers(agent string) []envoy.SendRequest {
 
 // segment is a final segment of the room's in meeting sess-1, said over the
 // 3 s before the roster's now.
-func (r *rig) segment(text string, call bool) voice.Segment {
+func (r *rig) segment(text string, call bool) *voice.Segment {
 	now := r.clock.Now()
-	return voice.Segment{SessionID: "sess-1", Text: text, Call: call, From: now.Add(-3 * time.Second), To: now}
+	return &voice.Segment{SessionID: "sess-1", Text: text, Call: call, From: now.Add(-3 * time.Second), To: now}
 }

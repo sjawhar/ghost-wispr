@@ -170,11 +170,11 @@ type SupervisorConfig struct {
 	// HandDone is told how each raised hand came down (RaiseHand); nil
 	// tells nobody. It runs on a goroutine of its own, never under the
 	// Supervisor's lock.
-	HandDone func(h Hand, outcome HandOutcome)
+	HandDone func(h *Hand, outcome HandOutcome)
 	// Segment gets each final transcript segment of the room, for the joined
 	// agents' pointers; nil drops them. It runs on the transcript reader,
 	// never under the Supervisor's lock, and must return at once.
-	Segment func(s Segment)
+	Segment func(s *Segment)
 	Logf    func(string, ...any)
 }
 
@@ -586,8 +586,8 @@ func (s *Supervisor) OnTranscript(t *Transcript) {
 	for i := range heard {
 		s.cfg.Concierge.Heard(heard[i].ctx, &heard[i].x, heard[i].words)
 	}
-	for _, segment := range segments {
-		s.cfg.Segment(segment)
+	for i := range segments {
+		s.cfg.Segment(&segments[i])
 	}
 }
 
