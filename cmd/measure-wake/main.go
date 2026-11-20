@@ -134,6 +134,17 @@ func run(args []string, stdout, stderr io.Writer, detector func(*options) (*loca
 }
 
 func newDetector(o *options) (*local.Detector, error) {
+	opts, err := detectorOptions(o)
+	if err != nil {
+		return nil, err
+	}
+	return local.NewDetectorWith(&opts)
+}
+
+// detectorOptions is the real detector's configuration for o: the listener's
+// start phrase, or, for the control, its keyword in place of the phrase with
+// stage 2 checking that keyword.
+func detectorOptions(o *options) (local.Options, error) {
 	opts := local.Options{Thresholds: local.Thresholds{Boost: o.boost, Threshold: o.threshold}, NoStageTwo: !o.stage2}
 	if o.keyword != "" {
 		opts.Keywords, opts.Mark = keywordLine(o.keyword, o.boost, o.threshold), o.keyword
@@ -143,9 +154,9 @@ func newDetector(o *options) (*local.Detector, error) {
 	case "stop":
 		opts.Decoys = local.StopDecoys
 	default:
-		return nil, fmt.Errorf("-decoys %q: only stop", o.decoys)
+		return local.Options{}, fmt.Errorf("-decoys %q: only stop", o.decoys)
 	}
-	return local.NewDetectorWith(&opts)
+	return opts, nil
 }
 
 // keywordLine is the keyword spotter's line for words, each one of the

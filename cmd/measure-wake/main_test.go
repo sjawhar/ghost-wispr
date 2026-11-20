@@ -186,18 +186,22 @@ func TestTheControlMustFireToPass(t *testing.T) {
 
 // TestTheControlRunsTheSamePipeline fails if the control's detector is not
 // the listener's with the keyword in place of the start phrase: the same
-// boost, threshold and stage 2, and no decoys, so that its hits show what the
-// listener's counter can see in the speech.
+// boost, threshold and stage 2, and no decoys, on the same speech with no
+// phrase spliced in, so that its hits show what the listener's counter can
+// see in the speech.
 func TestTheControlRunsTheSamePipeline(t *testing.T) {
 	root := t.TempDir()
 	speechWithCommonWord(t, filepath.Join(root, "audio", "chapter"), 1)
 	writeWAV(t, filepath.Join(root, "splice"), "start.wav", phraseSeconds, phraseSample)
 	var built []options
+	var fedSplice []*bool
 	var out bytes.Buffer
 	run([]string{"-audio", filepath.Join(root, "audio"), "-splice", filepath.Join(root, "splice"), "-splice-every", "1s", "-min-hours", "0",
 		"-boost", "1.5", "-threshold", "0.2", "-decoys", "stop", "-control-keyword", "the man"}, &out, &out, func(o *options) (*local.Detector, error) {
 		built = append(built, *o)
-		return fakeDetector(false)(o)
+		fed := new(bool)
+		fedSplice = append(fedSplice, fed)
+		return local.NewDetectorOf(spliceSpotter{markSpotter{control: o.keyword != ""}, fed}, textVerifier("WHISPER START RECORDING")), nil
 	})
 	if len(built) != 2 {
 		t.Fatalf("built %d detectors, want the listener's and the control's:\n%s", len(built), out.String())
@@ -210,6 +214,23 @@ func TestTheControlRunsTheSamePipeline(t *testing.T) {
 		t.Fatalf("the control's detector: keyword %q, boost %g, threshold %g, stage 2 %t, decoys %q; want THE MAN, 1.5, 0.2, true, none",
 			control.keyword, control.boost, control.threshold, control.stage2, control.decoys)
 	}
+	if !*fedSplice[0] || *fedSplice[1] {
+		t.Fatalf("a spliced phrase was fed to the listener %t and to the control %t; want the listener only:\n%s", *fedSplice[0], *fedSplice[1], out.String())
+	}
+}
+
+// spliceSpotter is a markSpotter that notes in fed whether it was given a
+// spliced phrase.
+type spliceSpotter struct {
+	markSpotter
+	fed *bool
+}
+
+func (s spliceSpotter) Accept(samples []float32) bool {
+	if slices.Contains(samples, float32(phraseSample)/32768) {
+		*s.fed = true
+	}
+	return s.markSpotter.Accept(samples)
 }
 
 // TestTheControlKeywordIsTheModelsTokens fails if a control keyword's words
@@ -218,6 +239,39 @@ func TestTheControlRunsTheSamePipeline(t *testing.T) {
 func TestTheControlKeywordIsTheModelsTokens(t *testing.T) {
 	if got, want := keywordLine("AND  THEN", 1, 0.25), "▁AND ▁THEN :1 #0.25 @CONTROL\n"; got != want {
 		t.Fatalf("keywordLine = %q, want %q", got, want)
+	}
+}
+
+// TestTheControlsDetectorListensForItsKeyword fails if the real detector the
+// tool builds for the control does not listen for the control's keyword in
+// place of the start phrase, with stage 2 checking that keyword, or if the
+// listener's own detector does: the tests above run on a fake detector, and
+// internal/wake/local's TestAControlKeywordReplacesThePhrase shows what these
+// options make the real one hear.
+func TestTheControlsDetectorListensForItsKeyword(t *testing.T) {
+	thresholds := local.Thresholds{Boost: 1.5, Threshold: 0.2}
+	for _, tc := range []struct {
+		name string
+		o    options
+		want local.Options
+	}{
+		{"the control", options{boost: 1.5, threshold: 0.2, stage2: true, keyword: "AND THEN"},
+			local.Options{Thresholds: thresholds, Keywords: "▁AND ▁THEN :1.5 #0.2 @CONTROL\n", Mark: "AND THEN"}},
+		{"the listener", options{boost: 1.5, threshold: 0.2, stage2: true, decoys: "stop"},
+			local.Options{Thresholds: thresholds, Decoys: local.StopDecoys}},
+		{"the listener without stage 2", options{boost: 1.5, threshold: 0.2},
+			local.Options{Thresholds: thresholds, NoStageTwo: true}},
+	} {
+		got, err := detectorOptions(&tc.o)
+		if err != nil {
+			t.Fatalf("%s: %v", tc.name, err)
+		}
+		if got != tc.want {
+			t.Errorf("%s: detector options %+v, want %+v", tc.name, got, tc.want)
+		}
+	}
+	if _, err := detectorOptions(&options{decoys: "start"}); err == nil {
+		t.Error("-decoys start: no error, want only stop accepted")
 	}
 }
 

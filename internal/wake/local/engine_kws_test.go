@@ -66,24 +66,31 @@ func TestTheKeywordsLoadAgainstTheModel(t *testing.T) {
 // place of the start phrase, as the false-wake measurement's control does: a
 // detector for "start recording" alone, with stage 2 checking "START", hears
 // every stored start clip, and a detector for "and then", which no clip says,
-// hears none of them.
+// hears none of them, with stage 2 or stage 1 alone. It also fails if stage 2
+// checks "STAR" in place of the mark: a detector for "start recording" whose
+// stage 2 checks "AND THEN" hears none of them.
 func TestAControlKeywordReplacesThePhrase(t *testing.T) {
 	starts, _ := clips(t)
 	for _, tc := range []struct {
 		keywords, mark string
+		noStageTwo     bool
 		want           bool
 	}{
-		{"▁START ▁RE C OR D ING :1.0 #0.25 @CONTROL\n", "START", true},
-		{"▁AND ▁THEN :1.0 #0.25 @CONTROL\n", "AND THEN", false},
+		{"▁START ▁RE C OR D ING :1.0 #0.25 @CONTROL\n", "START", false, true},
+		{"▁START ▁RE C OR D ING :1.0 #0.25 @CONTROL\n", "START", true, true},
+		{"▁AND ▁THEN :1.0 #0.25 @CONTROL\n", "AND THEN", false, false},
+		{"▁AND ▁THEN :1.0 #0.25 @CONTROL\n", "AND THEN", true, false},
+		{"▁START ▁RE C OR D ING :1.0 #0.25 @CONTROL\n", "AND THEN", false, false},
 	} {
-		d, err := NewDetectorWith(&Options{Keywords: tc.keywords, Mark: tc.mark})
+		d, err := NewDetectorWith(&Options{Keywords: tc.keywords, Mark: tc.mark, NoStageTwo: tc.noStageTwo})
 		if err != nil {
 			t.Fatalf("load the spotter with the control keyword %q: %v", tc.keywords, err)
 		}
 		for _, clip := range starts {
 			d.Reset()
 			if got := heardIn(t, d, clip); got != tc.want {
-				t.Errorf("a detector for %q, stage 2 checking %q: %s heard %t, want %t", strings.TrimSpace(tc.keywords), tc.mark, clip, got, tc.want)
+				t.Errorf("a detector for %q, stage 2 checking %q (stage 1 alone %t): %s heard %t, want %t",
+					strings.TrimSpace(tc.keywords), tc.mark, tc.noStageTwo, clip, got, tc.want)
 			}
 		}
 		d.Close()
