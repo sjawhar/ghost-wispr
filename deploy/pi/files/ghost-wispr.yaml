@@ -62,7 +62,8 @@ voice:
   tts_voice: Kore
   tts_location: us
   # The paused listener ("Wispr, start recording" while paused) stays off until its false starts
-  # are measured below 0.5 an hour on 10 h of speech (dispatch://INFRA-4627).
+  # are measured below 0.5 an hour on 10 h of speech, with both of the measurement's controls fired
+  # (dispatch://INFRA-4627).
   paused_listener: false
   # Voice B's OpenAI workload identity: ids, not secrets. The Pi exchanges its Google ID token
   # for an OpenAI access token with them. Pick gptlive on the settings page to use voice B.

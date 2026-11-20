@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -88,20 +89,28 @@ type staleRig struct {
 	opens             atomic.Int32
 	done              chan struct{}
 	cancel            context.CancelFunc
+	// ready is whether the listener can run (the Jabra attached, the setting
+	// on); a test turns it off to end the stretch as a detach does.
+	ready atomic.Bool
 }
 
 // startStaleRig runs the real listener wiring (runPausedListener) with the
 // real capture gate, persistent controls and capture device, in listening.
-func startStaleRig(t *testing.T, holdRead, holdHit, failRead bool) *staleRig {
+// Each setup runs on the gate before the listener starts.
+func startStaleRig(t *testing.T, holdRead, holdHit, failRead bool, setup ...func(*staleRig)) *staleRig {
 	t.Helper()
 	r := &staleRig{holdRead: holdRead, holdHit: holdHit, failRead: failRead,
 		reading: make(chan struct{}), release: make(chan struct{}), done: make(chan struct{})}
+	r.ready.Store(true)
 	r.gate = newCaptureGate(nil, nil, nil)
+	for _, s := range setup {
+		s(r)
+	}
 	r.store = &lockedPauseStore{}
 	device := newCaptureDevice(r.gate.inClosedState)
 	device.attach(func(bool) error { return nil })
 	r.controls = newPersistentControls(r.store, r.gate.Pause, r.gate, nil)
-	r.controls.useListener(r.gate, func() {}, func() bool { return true }, device.closeListener)
+	r.controls.useListener(r.gate, func() {}, r.ready.Load, device.closeListener)
 	if err := r.controls.Pause(); err != nil {
 		t.Fatal(err)
 	}
@@ -272,4 +281,50 @@ func TestAFailureFromAnEndedStretchClosesNothing(t *testing.T) {
 		r.releaseOnce()
 		r.reaches(t, micClosed, "a read failure in the current stretch")
 	})
+}
+
+// TestAStretchThatEndsDuringTheLightCheckWins fails if the phrase's resume,
+// whose light check runs, goes on once its stretch of listening has ended
+// during the check by a change that asks for no pause, as the Jabra's button
+// detaching does: the resume took its ticket in listening, so only the resume
+// itself can see that the stretch ended. Control: with no change during the
+// check, the same resume records.
+func TestAStretchThatEndsDuringTheLightCheckWins(t *testing.T) {
+	for _, detach := range []bool{true, false} {
+		t.Run(fmt.Sprintf("detach during the check %t", detach), func(t *testing.T) {
+			inCheck, releaseCheck := make(chan struct{}), make(chan struct{})
+			var once sync.Once
+			r := startStaleRig(t, false, false, false, func(r *staleRig) {
+				r.gate.beforeResumeRequest = func() error { return nil }
+				r.gate.checkLightPattern = func() error {
+					once.Do(func() { close(inCheck) })
+					<-releaseCheck
+					return nil
+				}
+			})
+			select {
+			case <-inCheck:
+			case <-time.After(testWait):
+				t.Fatal("control: the phrase's resume did not reach its light check")
+			}
+			if detach {
+				r.ready.Store(false)
+				if err := r.controls.listenerChanged(); err != nil {
+					t.Fatal(err)
+				}
+				if got := r.gate.micState(); got != micClosed {
+					t.Fatalf("control: the detach left the unit %v, want closed", got)
+				}
+			}
+			close(releaseCheck)
+			if !detach {
+				r.reaches(t, micRecording, "the phrase's resume with no change during its check")
+				return
+			}
+			r.stays(t, micClosed, 300*time.Millisecond, "the phrase's resume after a detach during its light check")
+			if got := r.saved(); got != savedClosed {
+				t.Fatalf("saved %q after the detach, want %q", got, savedClosed)
+			}
+		})
+	}
 }

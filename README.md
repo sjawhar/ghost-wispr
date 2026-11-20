@@ -274,10 +274,16 @@ closed, so the two are never open together. The service unit sets `LimitCORE=0` 
 never reaches the disk. The spotter is sherpa-onnx's keyword spotter with its GigaSpeech model,
 linked into the binary: its weights are Apache-2.0, and GigaSpeech, the audio it was trained on, is
 licensed for research. When it hears the phrase, it decodes the ring once more as text and accepts
-only text that holds "STAR", so "Wispr, stop recording" does not resume. On the office Pi,
-`voice.paused_listener` stays off until a measurement on 10 h of speech counts fewer than 0.5
-false starts an hour (`go run -tags kws ./cmd/measure-wake -mode listener`). `ghost-wispr
-kws-selftest CLIP.wav...` checks a build's spotter on stored clips and times it.
+only text that holds "STAR", so "Wispr, stop recording" does not resume. A phrase, or a capture
+failure, belongs to the stretch of listening its audio was read in, and moves nothing once that
+stretch has ended: a close, a detach, a setting turned off or a new stretch wins over it. On the
+office Pi, `voice.paused_listener` stays off until a measurement on 10 h of speech counts fewer
+than 0.5 false starts an hour (`go run -tags kws ./cmd/measure-wake -mode listener`), with both its
+controls fired: the listener heard the start phrases spliced into that speech, and the spotter at
+its most permissive counted more false starts in it than the listener. Without them the run prints
+UNKNOWN. `ghost-wispr kws-selftest CLIP.wav...` checks a build's spotter on stored clips and times
+it. The release ships `THIRD_PARTY_NOTICES.md`, which carries the licence and notice texts of the
+code and model the listener links, whole.
 
 ## Meeting voice
 
