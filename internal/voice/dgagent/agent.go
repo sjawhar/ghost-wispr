@@ -159,9 +159,10 @@ const (
 	// be the model's own words after the injection, whose text Deepgram
 	// sends just after their first audio frame; model text drops the frames
 	// that still wait. Model audio that leads its own text by more than this
-	// plays. The probe's frame log measured that lead at 11 ms at most (the
-	// report has the runs). Every frame waits the same time, so an answer
-	// starts this much later and keeps its spacing.
+	// plays. The probe's frame log measured that lead at 24 ms at most, over
+	// 146 sentences in 28 real sessions (the report has the runs). Every
+	// frame waits the same time, so an answer starts this much later and
+	// keeps its spacing.
 	holdTail = 250 * time.Millisecond
 	// keepAlive is how often the session tells Deepgram it is still there,
 	// so a stretch with no room audio, such as a closed gate, does not end
