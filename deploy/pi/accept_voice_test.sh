@@ -246,6 +246,20 @@ def systemctl(args):
     if verb == "start":
         return start()
     if verb == "stop":
+        if "slow-exit" in SCENARIO:
+            # The service's shutdown hangs from this stop on: it takes SIGTERM and goes on running.
+            write("hold-exit", "1\n")
+        if "stopped-at-stop" in SCENARIO and running():
+            # The service is stopped (SIGSTOP) when the stop comes: a SIGTERM alone stays pending.
+            # SIGSTOP takes effect when the kernel next runs the process, so wait until it shows as
+            # stopped: a SIGTERM sent before that would end it without needing the SIGCONT.
+            pid = service_pid()
+            os.kill(pid, signal.SIGSTOP)
+            deadline = time.time() + 60
+            while not process_state(pid).startswith("state T") and time.time() < deadline:
+                time.sleep(0.01)
+            if not process_state(pid).startswith("state T"):
+                write("fake-error", "the service process %d was not stopped 60 s after SIGSTOP: %s\n" % (pid, process_state(pid)))
         stop()
         return 0
     if verb == "restart":
@@ -316,16 +330,62 @@ def start():
     return 1
 
 
+# systemd's stop timeout for the unit, which sets none: the user manager's default.
+STOP_TIMEOUT = 90
+
+
+def signal_mask(pid, field):
+    """The signals in /proc/PID/status's FIELD (SigIgn, SigBlk), as a bit mask; 0 if it is gone."""
+    try:
+        with open("/proc/%d/status" % pid) as f:
+            for line in f:
+                if line.startswith(field + ":"):
+                    return int(line.split()[1], 16)
+    except OSError:
+        pass
+    return 0
+
+
+def process_state(pid):
+    """PID's state and the kernel function it sleeps in, for a report of a process that would not go."""
+    try:
+        with open("/proc/%d/stat" % pid) as f:
+            state = f.read().rsplit(")", 1)[1].split()[0]
+        with open("/proc/%d/wchan" % pid) as f:
+            return "state %s, in %s" % (state, f.read().strip() or "-")
+    except (OSError, IndexError):
+        return "gone"
+
+
 def stop():
+    """As systemd stops the unit (systemd.kill(5)): SIGTERM and right after it SIGCONT, so that a
+    stopped process can end too; SIGKILL once STOP_TIMEOUT has passed; then wait until the process
+    is gone. A service that ignores or blocks SIGTERM is a fault of this fake, since systemd starts
+    the real one with default signals and none blocked. One that takes SIGTERM and is slow to go (a
+    shutdown that hangs, or a process the kernel holds in uninterruptible sleep until its call
+    returns) is only noted, in stop-killed, as systemd does not fail a stop it ends with SIGKILL."""
     pid = service_pid()
     if pid and alive(pid):
+        term = 1 << (signal.SIGTERM - 1)
+        for field, what in (("SigIgn", "ignores"), ("SigBlk", "blocks")):
+            if signal_mask(pid, field) & term:
+                write("fake-error", "the service process %d %s SIGTERM\n" % (pid, what))
         os.kill(pid, signal.SIGTERM)
-        deadline = time.time() + 60
+        try:
+            os.kill(pid, signal.SIGCONT)
+        except ProcessLookupError:
+            pass
+        deadline = time.time() + STOP_TIMEOUT
         while alive(pid) and time.time() < deadline:
             time.sleep(0.01)
         if alive(pid):
-            write("fake-error", "the service process %d outlived SIGTERM for 60 s\n" % pid)
+            log_to("stop-killed", "%d %s, %d s after SIGTERM" % (pid, process_state(pid), STOP_TIMEOUT))
             os.kill(pid, signal.SIGKILL)
+            deadline = time.time() + 120
+            while alive(pid) and time.time() < deadline:
+                time.sleep(0.01)
+            if alive(pid):
+                write("fake-error", "the service process %d was still there 120 s after SIGKILL: %s\n" % (pid, process_state(pid)))
     try:
         os.remove(spath("main.pid"))
     except FileNotFoundError:
@@ -336,11 +396,22 @@ STATUS_RUNNING = "state: RUNNING\nowner_pid   : 1\ntrigger_time: 1.0\ntstamp    
 STATUS_XRUN = "state: XRUN\nowner_pid   : 1\ndelay       : 0\n"
 
 
+def hold_exit(number, frame):
+    """With slow-exit, the service's SIGTERM handler: its shutdown hangs once the restore's stop
+    has begun, and ends the process before that."""
+    if not os.path.exists(spath("hold-exit")):
+        os._exit(0)
+
+
 def service():
-    # systemd starts a service with default signal handling, so the fake does too: a start from the
-    # driver's restore, which ignores INT, TERM and HUP, must not leave a service that ignores them.
+    # systemd starts a service with default signal handling and no signal blocked, so the fake does
+    # too: a start from the driver's restore, which ignores INT, TERM and HUP, must not leave a
+    # service that ignores or blocks them.
     for number in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM):
         signal.signal(number, signal.SIG_DFL)
+    signal.pthread_sigmask(signal.SIG_SETMASK, [])
+    if "slow-exit" in SCENARIO:
+        signal.signal(signal.SIGTERM, hold_exit)
     connection = sqlite3.connect(os.environ["GW_FAKE_DB"])
     connection.execute("SELECT count(*) FROM app_state").fetchall()
     if not ASOUND:
@@ -1184,6 +1255,13 @@ readonly rig=plughw:CARD=Rigmic,DEV=0
 
 # The exchange step (the default): a full pass, --go-ahead with --keep, and its failures.
 launch pass pass '' -- --question @question.wav --event-timeout 10
+# The restore's stop finds a service whose shutdown hangs: it takes SIGTERM (and SIGCONT) but goes
+# on running, as does a process the kernel holds in uninterruptible sleep. systemd sends SIGKILL
+# after its stop timeout (90 s, the unit's default) and the stop succeeds: the run must pass.
+launch pass-slow-exit pass,slow-exit '' -- --question @question.wav --event-timeout 10
+# The restore's stop finds the service stopped (SIGSTOP): the SIGCONT systemd sends right after
+# SIGTERM lets it end at once, with no SIGKILL.
+launch pass-stopped-at-stop pass,stopped-at-stop '' -- --question @question.wav --event-timeout 10
 launch go-ahead go-ahead '' -- --question @question.wav --go-ahead @go-ahead.wav --keep --event-timeout 10
 launch no-spoken no-spoken '' -- --question @question.wav --event-timeout 2
 launch spoken-words spoken-words '' -- --question @question.wav --event-timeout 10
@@ -1402,6 +1480,10 @@ done
 for error in "$root"/*/state/fake-error; do
   [[ -e $error ]] && check_failed "${error%/state/fake-error}: the fake Pi: $(<"$error")"
 done
+for killed in "$root"/*/state/stop-killed; do
+  [[ -e $killed ]] && printf 'NOTE: %s: the fake systemctl sent SIGKILL after its stop timeout: %s\n' \
+    "${killed%/state/stop-killed}" "$(tr '\n' ' ' <"$killed")"
+done
 
 # ---- the checks ----
 
@@ -1422,6 +1504,14 @@ expect_no_line pass 'FAIL'
 expect_between 'pass: wake to chime' "$(measured pass chime)" 60 300
 expect_between 'pass: end of the question to speech' "$(measured pass speech)" 450 1000
 expect_restored pass
+expect_rc pass-slow-exit 0
+expect_restored pass-slow-exit
+[[ -s $root/pass-slow-exit/state/stop-killed ]] \
+  || check_failed 'pass-slow-exit: the fake systemctl did not send SIGKILL after its stop timeout'
+expect_rc pass-stopped-at-stop 0
+expect_restored pass-stopped-at-stop
+[[ -e $root/pass-stopped-at-stop/state/stop-killed ]] \
+  && check_failed "pass-stopped-at-stop: a stopped service needed SIGKILL: $(<"$root/pass-stopped-at-stop/state/stop-killed")"
 expect_no_leftovers pass
 # The run's start read the original .env with the voice on and both sides of the loopback.
 key_line=$(grep -m1 DEEPGRAM <<<"$original_env")
