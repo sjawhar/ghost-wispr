@@ -17,6 +17,7 @@ import (
 	"github.com/sjawhar/ghost-wispr/internal/concierge"
 	"github.com/sjawhar/ghost-wispr/internal/config"
 	"github.com/sjawhar/ghost-wispr/internal/voice"
+	"github.com/sjawhar/ghost-wispr/internal/voice/gptlive"
 )
 
 // soundsHeard is a voice that records the start and error sounds it is asked
@@ -137,8 +138,19 @@ func TestEachSettingBuildsItsVoice(t *testing.T) {
 	}
 	cfg.Voice.Engine = config.VoiceEngineGPTLive
 	source.apply(t.Context(), &cfg)
+	if v, err := source.Voice(); v != nil || err == nil || !strings.Contains(err.Error(), "openai_identity_provider_id") {
+		t.Fatalf("voice B without its OpenAI ids: %v, %v", v, err)
+	}
+	cfg.Voice.GPTLive = config.GPTLive{OpenAIIdentityProviderID: "idp_example", OpenAIServiceAccountID: "user-example"}
+	source.apply(t.Context(), &cfg)
+	voiceB, err := source.Voice()
+	if _, ok := voiceB.(*gptlive.Voice); !ok || err != nil {
+		t.Fatalf("voice B with its OpenAI ids: %v, %v", voiceB, err)
+	}
+	cfg.Voice.Engine = config.VoiceEngineDGAgent
+	source.apply(t.Context(), &cfg)
 	if v, err := source.Voice(); v != nil || err == nil || !strings.Contains(err.Error(), "not in this build") {
-		t.Fatalf("voice B in this build: %v, %v", v, err)
+		t.Fatalf("voice C in this build: %v, %v", v, err)
 	}
 	cfg.Voice.Engine, cfg.DeepgramAPIKey = config.VoiceEngineTTS, ""
 	source.apply(t.Context(), &cfg)
