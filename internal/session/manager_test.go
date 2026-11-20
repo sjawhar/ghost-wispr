@@ -288,6 +288,29 @@ func (s *storeMock) Canonicalize(sessionID string) (string, int, error) {
 	return s.canonicalTranscript[sessionID], s.canonicalizeGeneration[sessionID], nil
 }
 
+// CanonicalizeForSummary is Canonicalize, with the transcript a summary
+// reads: the refined text, or each live segment after its speaker's label.
+func (s *storeMock) CanonicalizeForSummary(sessionID string) (string, string, int, error) {
+	canonical, generation, err := s.Canonicalize(sessionID)
+	if err != nil {
+		return "", "", 0, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.transcriptSource[sessionID] == "refined" {
+		return canonical, canonical, generation, nil
+	}
+	var b strings.Builder
+	for i := range s.segments[sessionID] {
+		if strings.TrimSpace(s.segments[sessionID][i].Text) == "" {
+			continue
+		}
+		b.WriteString(s.segments[sessionID][i].SpeakerLine())
+		b.WriteByte('\n')
+	}
+	return canonical, b.String(), generation, nil
+}
+
 type recorderMock struct {
 	mu       sync.Mutex
 	started  []string

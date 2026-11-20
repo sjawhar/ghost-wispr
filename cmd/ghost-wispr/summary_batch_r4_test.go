@@ -30,6 +30,7 @@ func r4BatchStore(t *testing.T, ids ...string) (*storage.SQLiteStore, string, st
 	t.Cleanup(func() { _ = store.Close() })
 	started := time.Date(2026, 11, 11, 10, 0, 0, 0, time.UTC)
 	generations := make(map[string]int, len(ids))
+	claims := make(map[string]storage.SummaryClaim, len(ids))
 	for i, id := range ids {
 		if err := store.CreateSession(id, started.Add(time.Duration(i)*time.Minute)); err != nil {
 			t.Fatal(err)
@@ -45,12 +46,14 @@ func r4BatchStore(t *testing.T, ids ...string) (*storage.SQLiteStore, string, st
 			t.Fatal(err)
 		}
 		generations[id] = generation
-		if err := store.StartSummary(id); err != nil {
+		attempt, err := store.StartBatchSummary(id)
+		if err != nil {
 			t.Fatal(err)
 		}
+		claims[id] = storage.SummaryClaim{Generation: generation, Attempt: attempt}
 	}
 	batchName := "batches/r4"
-	if err := store.RecordSummaryBatch(batchName, generations); err != nil {
+	if err := store.RecordSummaryBatch(batchName, "gemini", claims); err != nil {
 		t.Fatal(err)
 	}
 	return store, path, batchName, generations

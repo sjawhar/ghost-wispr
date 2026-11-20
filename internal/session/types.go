@@ -50,6 +50,10 @@ type Store interface {
 	TextDeletionSpans(recording string) ([]storage.TextDeletionSpan, error)
 	UpdateTitle(sessionID, title string) error
 	Canonicalize(sessionID string) (transcript string, generation int, err error)
+	// CanonicalizeForSummary is Canonicalize, and also returns, from the same
+	// transaction, the transcript a summary reads: each segment after its
+	// speaker's label.
+	CanonicalizeForSummary(sessionID string) (canonical, labeled string, generation int, err error)
 }
 
 type Recorder interface {

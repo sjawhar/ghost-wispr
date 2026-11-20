@@ -1,10 +1,45 @@
 package server
 
-import "encoding/json"
+import (
+	"encoding/json"
 
-// configSchema documents the GC and voice settings of GET and PATCH
-// /api/config (a JSON merge patch has the same shape) and the read-only models
-// and recording rules GET reports; the other settings are untyped.
+	"github.com/sjawhar/ghost-wispr/internal/config"
+)
+
+// providerSchema is one model provider of GET /api/config's providers: an
+// endpoint, the wire API it speaks and how the unit signs in to it. It names
+// no secret.
+var providerSchema = map[string]any{
+	"type": "object",
+	"properties": map[string]any{
+		"api": map[string]any{
+			"type":        "string",
+			"enum":        config.APIs,
+			"description": "The wire API the provider speaks: openai (the OpenAI API), anthropic (the Anthropic API), vertex (Vertex AI), gemini (the Gemini API), deepgram, elevenlabs or google-tts (Google Cloud Text-to-Speech)",
+		},
+		"url":      map[string]any{"type": "string", "description": "The API's base URL, such as a model gateway's; absent is the API's public address"},
+		"project":  map[string]any{"type": "string", "description": "Vertex AI: the Google Cloud project"},
+		"location": map[string]any{"type": "string", "description": "Vertex AI: the location, such as global or us"},
+		"auth": map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"kind": map[string]any{
+					"type":        "string",
+					"enum":        config.AuthKinds,
+					"description": "How the unit signs in: api_key (a key from the variable env names), google (a Google access token, by workload identity or Application Default Credentials), google_id_token (a Google ID token for audience) or openai_wif (an OpenAI access token in exchange for the unit's Google ID token)",
+				},
+				"env":                  map[string]any{"type": "string", "description": "api_key: the environment variable that holds the key; the key itself is never served"},
+				"audience":             map[string]any{"type": "string", "description": "google_id_token: the ID token's audience"},
+				"identity_provider_id": map[string]any{"type": "string", "description": "openai_wif: OpenAI's identity provider id, not a secret"},
+				"service_account_id":   map[string]any{"type": "string", "description": "openai_wif: OpenAI's service account id, not a secret"},
+			},
+		},
+	},
+}
+
+// configSchema documents the settings of GET and PATCH /api/config (a JSON
+// merge patch has the same shape) that the settings page reads and changes,
+// and the read-only fields GET reports; the other settings are untyped.
 var configSchema = map[string]any{
 	"type": "object",
 	"properties": map[string]any{
@@ -30,8 +65,35 @@ var configSchema = map[string]any{
 		"models": map[string]any{
 			"type":                 "object",
 			"readOnly":             true,
-			"description":          "GET only: the model, provider or Google setting of each role as the running process resolved its configuration, environment overrides included: live_transcription, batch_transcription_provider, batch_transcription, summarization, embedding, genai_backend, gcp_project, gcp_location, tts_provider, tts and tts_voice. A PATCH cannot set it.",
+			"description":          "GET only: what each role calls as the running process resolved its configuration, environment overrides included: the provider/model of live_transcription, batch_transcription, summarization, embedding, concierge and tts; tts_voice, the tts role's voice; gptlive, voice B's provider/model; and dgagent_provider, voice C's provider. An empty value is a role the configuration does not set. A PATCH cannot set it.",
 			"additionalProperties": map[string]any{"type": "string"},
+		},
+		"providers": map[string]any{
+			"type":                 "object",
+			"readOnly":             true,
+			"description":          "GET only: the model providers the configuration names (providers:), by name. Each role's provider/model names one. No secret: an api_key provider names the variable that holds its key. A PATCH cannot set it; GET /api/providers says whether each one signs in.",
+			"additionalProperties": providerSchema,
+		},
+		"provider_keys": map[string]any{
+			"type":                 "object",
+			"writeOnly":            true,
+			"description":          "PATCH only: the key of each named provider that signs in with one (auth.kind api_key), saved under the variable its auth.env names, in the unit's .env file. A provider that signs in another way takes no key: the PATCH is refused with 400. GET never serves a key.",
+			"additionalProperties": map[string]any{"type": "string"},
+		},
+		"summarization": map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"model":   map[string]any{"type": "string", "description": "Summaries and titles: the provider/model, such as vertex/gemini-3.5-flash-lite"},
+				"presets": map[string]any{"type": "object", "description": "The summary presets, by name; in a PATCH, null deletes one"},
+			},
+		},
+		"tts": map[string]any{
+			"type":        "object",
+			"description": "Text-to-speech: what voice A and POST /api/tts/speak speak with. A change applies from the next speech, with no restart.",
+			"properties": map[string]any{
+				"model": map[string]any{"type": "string", "description": "The provider/model, such as vertex-us/gemini-3.8-flash-tts; empty turns text-to-speech off. A model no provider serves is refused with 400. A new model speaks in its own default voice (voice becomes empty) unless the same patch names a voice."},
+				"voice": map[string]any{"type": "string", "description": "The model's voice, such as Kore; empty is the model's default"},
+			},
 		},
 		"recording_rules": map[string]any{
 			"type":        "array",
@@ -50,12 +112,7 @@ var configSchema = map[string]any{
 				"engine": map[string]any{
 					"type":        "string",
 					"enum":        []string{"tts", "gptlive", "dgagent"},
-					"description": "The voice that answers: tts (voice A, text-to-speech), gptlive (voice B, speech-to-speech: OpenAI GPT-Live) or dgagent (voice C, voice agent: Deepgram)",
-				},
-				"tts_engine": map[string]any{
-					"type":        "string",
-					"enum":        []string{"gemini", "aura"},
-					"description": "Voice A's text-to-speech provider: gemini or aura",
+					"description": "The voice that answers: tts (voice A, text-to-speech, with the tts role), gptlive (voice B, speech-to-speech: OpenAI GPT-Live) or dgagent (voice C, voice agent: Deepgram)",
 				},
 			},
 		},
@@ -986,8 +1043,101 @@ func OpenAPISpec() map[string]any {
 							},
 						},
 						"400": map[string]any{
-							"description": "An invalid setting, such as a negative GC limit; nothing is changed",
+							"description": "An invalid setting, such as a negative GC limit, a key for a provider that does not sign in with one, a model no provider serves, or a field the settings do not have; nothing is changed",
 						},
+					},
+				},
+			},
+			"/api/providers": map[string]any{
+				"get": map[string]any{
+					"summary":     "Check the model providers",
+					"description": "Each provider the configuration names: how the unit signs in to it and whether that worked, and the roles in use that call it. A check signs in (a key is set, a Google token is minted, an OpenAI token is exchanged) and, where the API has a cheap read the credential must pass, makes it. Checks are kept for 5 minutes; refresh=1 checks every provider now. No key or token is served.",
+					"tags":        []string{"config"},
+					"security":    []map[string][]string{{"basicAuth": {}}},
+					"parameters": []map[string]any{
+						{
+							"name":        "refresh",
+							"in":          "query",
+							"required":    false,
+							"schema":      map[string]any{"type": "string", "enum": []string{"1"}},
+							"description": "1 checks every provider now instead of keeping a check younger than 5 minutes",
+						},
+					},
+					"responses": map[string]any{
+						"200": map[string]any{
+							"description": "The providers, by name",
+							"content": map[string]any{
+								"application/json": map[string]any{"schema": map[string]any{
+									"type": "object",
+									"properties": map[string]any{
+										"providers": map[string]any{
+											"type": "array",
+											"items": map[string]any{
+												"type": "object",
+												"properties": map[string]any{
+													"name":       map[string]any{"type": "string"},
+													"api":        map[string]any{"type": "string", "enum": config.APIs},
+													"url":        map[string]any{"type": "string", "description": "The base URL the unit calls"},
+													"auth":       map[string]any{"type": "string", "enum": config.AuthKinds, "description": "The sign-in kind"},
+													"sign_in":    map[string]any{"type": "string", "description": "How the provider signs in, in words"},
+													"key_env":    map[string]any{"type": "string", "description": "api_key: the variable that holds the key"},
+													"key_set":    map[string]any{"type": "boolean", "description": "api_key: whether the variable holds a key"},
+													"checked":    map[string]any{"type": "boolean", "description": "A check ran"},
+													"asked":      map[string]any{"type": "boolean", "description": "The provider's answers proved every model its roles call, or refused one; false when a minted or exchanged token is the check's only proof, when a Vertex AI provider cannot count one of its models (an embedding model's), when the check reads only the provider's account (Deepgram's projects, the ElevenLabs user, Cloud Text-to-Speech's voices) while a role calls a model on it, or when a role's model has no cheap call (a speech model), even after the provider answered other reads"},
+													"ok":         map[string]any{"type": "boolean", "description": "The check signed in and, when asked, the provider took the credential; a provider whose read is its model list also lists, and answers a cheap call of, each model its roles call"},
+													"message":    map[string]any{"type": "string", "description": "What the check found, or why it failed"},
+													"checked_at": map[string]any{"type": "string", "format": "date-time"},
+													"roles": map[string]any{
+														"type":        "array",
+														"items":       map[string]any{"type": "string"},
+														"description": "The roles in use that call the provider, by their config keys, such as transcription.model or voice.dgagent.provider; empty when none does",
+													},
+												},
+											},
+										},
+									},
+								}},
+							},
+						},
+						"501": map[string]any{
+							"description": "This build checks no providers",
+						},
+					},
+				},
+			},
+			"/api/tts/speak": map[string]any{
+				"post": map[string]any{
+					"summary":     "Speak text through the speaker",
+					"description": "Speaks text with the text-to-speech role (tts.model), in voice or tts.voice. It waits in its queue while a voice exchange holds the speaker, and answers once the speech is synthesized, with the model and voice that spoke in the X-Ghost-Wispr-TTS-Model and X-Ghost-Wispr-TTS-Voice headers.",
+					"tags":        []string{"tts"},
+					"security":    []map[string][]string{{"basicAuth": {}}},
+					"requestBody": map[string]any{
+						"required": true,
+						"content": map[string]any{
+							"application/json": map[string]any{"schema": map[string]any{
+								"type":     "object",
+								"required": []string{"text"},
+								"properties": map[string]any{
+									"text":  map[string]any{"type": "string", "description": "What to say"},
+									"voice": map[string]any{"type": "string", "description": "The voice, as the tts model names it; absent is tts.voice"},
+								},
+							}},
+						},
+					},
+					"responses": map[string]any{
+						"202": map[string]any{
+							"description": "Synthesized and queued: {id, status}; GET /api/tts/status/{id} follows it",
+							"headers": map[string]any{
+								"X-Ghost-Wispr-TTS-Model": map[string]any{"schema": map[string]any{"type": "string"}, "description": "The model that spoke"},
+								"X-Ghost-Wispr-TTS-Voice": map[string]any{"schema": map[string]any{"type": "string"}, "description": "The voice that spoke"},
+							},
+						},
+						"400": map[string]any{"description": "No text, or a body that is not JSON"},
+						"429": map[string]any{"description": "The queue is full, or too many requests"},
+						"500": map[string]any{"description": "The speech could not be queued, or its synthesis could not be waited for"},
+						"501": map[string]any{"description": "Text-to-speech is not configured: no tts.model"},
+						"502": map[string]any{"description": "The provider failed to synthesize the speech"},
+						"503": map[string]any{"description": "No speaker, or the speaker did not play the synthesized speech"},
 					},
 				},
 			},

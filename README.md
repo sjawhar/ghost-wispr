@@ -8,7 +8,7 @@ Always-on transcription appliance. Listens to your microphone, detects speech, a
 
 Ghost Wispr runs as a background service on a machine with a microphone (e.g. a Raspberry Pi in a meeting room). It captures audio continuously, detects silence gaps to split recordings into sessions, sends audio to Deepgram for real-time transcription, and stores everything locally in SQLite.
 
-When a session ends, it optionally generates a summary via OpenAI and can sync audio files to Google Drive.
+When a session ends, it optionally generates a summary with a language model of any provider it is configured for ([Model providers](#model-providers)) and can sync audio files to Google Drive.
 
 The web UI shows live transcription on the left and session history on the right. Click any past session to expand its full transcript and play back audio.
 
@@ -32,7 +32,8 @@ Microphone → Deepgram WebSocket → Session Manager → SQLite
 - `internal/audio/` — PCM recording with MP3 encoding
 - `internal/storage/` — SQLite persistence (WAL mode)
 - `internal/server/` — HTTP API, WebSocket event hub, SPA serving
-- `internal/summary/` — OpenAI summarization
+- `internal/summary/` — session summaries
+- `internal/config/` — settings, and the model providers each role names; `internal/providers/` — how Ghost Wispr signs in to each provider, and its check
 - `internal/gdrive/` — Google Drive sync (optional)
 - `internal/voice/` — the meeting voice: the Supervisor, the room-audio tap, the chimes; `internal/voice/tts/` is voice A, `internal/voice/gptlive/` voice B, `internal/voice/dgagent/` voice C
 - `internal/wake/transcript/` — the wake phrase on the live transcript
@@ -49,8 +50,8 @@ Microphone → Deepgram WebSocket → Session Manager → SQLite
 - Go 1.25+
 - Node.js 22+
 - A USB or built-in microphone (PortAudio)
-- Deepgram API key (required for transcription)
-- OpenAI API key (optional, for summaries)
+- A key or sign-in for each model provider you use ([Model providers](#model-providers)): with
+  `ghost-wispr.yaml.example`, a Deepgram API key (for transcription) and an OpenAI API key (for summaries)
 
 ### System dependencies
 
@@ -87,13 +88,12 @@ The web UI is available at `http://localhost:8080`.
 
 ## Configuration
 
-Settings live in `ghost-wispr.yaml` (see `ghost-wispr.yaml.example`). Environment variables with the `GHOST_WISPR_` prefix override them, and API keys are read only from the environment. See `.env.example` for the full list.
+Settings live in `ghost-wispr.yaml` (see `ghost-wispr.yaml.example`). Environment variables with the `GHOST_WISPR_` prefix override them, and a model provider's key is read only from the environment variable its `auth.env` names ([Model providers](#model-providers)). See `.env.example` for the full list.
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
-| `GHOST_WISPR_DEEPGRAM_API_KEY` | Yes | — | Deepgram API key for transcription |
-| `GHOST_WISPR_OPENAI_API_KEY` | No | — | OpenAI key for session summaries |
-| `GHOST_WISPR_SUMMARIZATION_MODEL` | No | `openai/gpt-4o-mini` | Summary model, as `provider/model` |
+| `GHOST_WISPR_DEEPGRAM_API_KEY`, `GHOST_WISPR_OPENAI_API_KEY` | For the roles that use them | — | The keys of the `deepgram` and `openai` providers that a config with no `providers` section gets: transcription and summaries |
+| `GHOST_WISPR_SUMMARIZATION_MODEL`, `GHOST_WISPR_TRANSCRIPTION_MODEL` and each other role's variable | No | the file's | A role's provider/model ([Model providers](#model-providers)) |
 | `GHOST_WISPR_DB_PATH` | No | `data/ghost-wispr.db` | SQLite database path |
 | `GHOST_WISPR_AUDIO_DIR` | No | `data/audio` | Directory for audio files |
 | `GHOST_WISPR_SILENCE_TIMEOUT` | No | `30s` | Silence duration to end a session |
@@ -103,9 +103,271 @@ Settings live in `ghost-wispr.yaml` (see `ghost-wispr.yaml.example`). Environmen
 | `GHOST_WISPR_GDRIVE_FOLDER_ID` | No | — | Google Drive folder for audio sync |
 | `GHOST_WISPR_PUBLIC_URL` | No | — | The unit's own HTTPS address (`public_url`), such as its tailnet name: pages there may use the API, and Envoy events link to sessions under it |
 | `GHOST_WISPR_RECORDING_RULES` | No | — | The rules the web UI shows under Recording rules (`recording_rules`), as a JSON list of strings. A settings save writes them into `ghost-wispr.yaml`, where they stay after the variable is removed |
-| `google_credentials_file` | No | — | Authoritative Google credential file; when empty, Application Default Credentials are used |
+| `GHOST_WISPR_ENVOY_ENABLED`, `GHOST_WISPR_ENVOY_HUB_URL` | No | `false`, — | Publish session events to the Envoy hub's listener (`envoy_enabled`, `envoy_hub_url`; [Envoy events](#envoy-events)). It turns only the events on or off: the meeting voice's own Envoy session follows `concierge.envoy_url` alone |
+| `google_credentials_file` | No | — | Authoritative Google credential file, for Google Drive and each provider that signs in with Google; when empty, Application Default Credentials are used |
 
-`ghost-wispr google-id-token --audience URL` mints an ID token from this credential file. Use `--credentials PATH` to override it for one command.
+`ghost-wispr google-id-token --audience URL` mints an ID token from this credential file. Use `--credentials PATH` to override it for one command. `ghost-wispr --help` lists every subcommand.
+
+## Model providers
+
+`providers` in `ghost-wispr.yaml` names each model provider once: the wire API it speaks (`api`),
+its address (`url`) and how Ghost Wispr signs in to it (`auth`). Every role names a provider and a
+model as `provider/model`, split at the first slash, so a model may hold slashes of its own:
+`gateway/openai/gpt-x` is the model `openai/gpt-x` at the provider `gateway`. No provider holds a
+secret in the file.
+
+```yaml
+google_credentials_file: /etc/ghost-wispr/google-credentials.json
+providers:
+  gateway:                  # a model gateway that speaks the OpenAI API
+    api: openai
+    url: https://gateway.example.test/v1
+    auth:
+      kind: google_id_token
+      audience: example-gateway
+  vertex:
+    api: vertex
+    project: example-project
+    location: global
+    auth:
+      kind: google
+  vertex-us:                # the same project in Vertex AI's us multi-region
+    api: vertex
+    project: example-project
+    location: us
+    auth:
+      kind: google
+  openai:
+    api: openai
+    auth:
+      kind: openai_wif
+      identity_provider_id: idp-example
+      service_account_id: user-example
+  deepgram:
+    api: deepgram
+    auth:
+      kind: api_key
+      env: GHOST_WISPR_DEEPGRAM_API_KEY
+transcription:
+  model: deepgram/nova-3
+summarization:
+  model: vertex/gemini-4-carbon
+embedding:
+  model: gateway/gemini-embedding-2
+concierge:
+  model: vertex/gemini-3.5-flash-lite
+tts:
+  model: vertex-us/gemini-3.8-flash-tts
+  voice: Kore
+voice:
+  gptlive:
+    model: openai/gpt-live-1
+  dgagent:
+    provider: deepgram
+```
+
+A config file with no `providers` section gets two: `deepgram` and `openai`, with API keys from
+`GHOST_WISPR_DEEPGRAM_API_KEY` and `GHOST_WISPR_OPENAI_API_KEY`, and the role defaults in the
+table below, so a Deepgram key alone transcribes. A file with a `providers` section has only its own
+providers and names each role's model. An empty section (`providers: {}` or `providers: null`)
+has no providers.
+
+| Provider field | Meaning |
+|----------------|---------|
+| `api` | The wire API: `openai` (the OpenAI API), `anthropic` (Anthropic's Messages API), `vertex` (Google Vertex AI), `gemini` (Google's Gemini API), `deepgram`, `elevenlabs` or `google-tts` (Google Cloud Text-to-Speech) |
+| `url` | The API's base URL. Empty is its public address: `https://api.openai.com/v1`, `https://api.anthropic.com`, `https://generativelanguage.googleapis.com`, `https://api.deepgram.com`, `https://api.elevenlabs.io`, `https://texttospeech.googleapis.com`, and for Vertex AI the host of its location. An OpenAI API URL ends in `/v1` |
+| `project`, `location` | Vertex AI only: the Google Cloud project (by default the project of a service-account credential file), and the location: `global` (the default), `us`, `eu` or a region such as `us-central1` |
+| `auth.kind` | How Ghost Wispr signs in, one of the kinds below |
+
+| `auth.kind` | What Ghost Wispr sends | Its settings |
+|-------------|------------------------|--------------|
+| `api_key` | The key in the environment variable `auth.env`, or in `.env`, where the settings page saves it | `env` |
+| `google` | A Google access token from `google_credentials_file` (workload identity federation or a service-account file), else from Application Default Credentials. Vertex AI and Cloud Text-to-Speech only | — |
+| `google_id_token` | A Google ID token for `auth.audience`, minted from `google_credentials_file`, else from Application Default Credentials: an external-account credential (workload identity federation) by impersonating the service account it names, a service-account key file, or on a Compute Engine VM with neither, the VM's service account from its metadata server. For an endpoint that admits Google ID tokens, such as a model gateway, at its `url` | `audience` |
+| `openai_wif` | An OpenAI access token that OpenAI's workload identity federation gives in exchange for a Google ID token, minted as for `google_id_token`. The OpenAI API only | `identity_provider_id`, `service_account_id` (ids, not secrets) |
+
+A request signed in by `google`, `google_id_token` or `openai_wif` that gets a 401 is sent once
+more with a new token when its body can be replayed. Otherwise it fails, but the next request gets
+a new token.
+
+| Role | Variable | APIs it can call | Default with no `providers` | What it does |
+|------|----------|------------------|-----------------------------|--------------|
+| `transcription.model` | `GHOST_WISPR_TRANSCRIPTION_MODEL` | `deepgram` | `deepgram/nova-3` | Live transcription |
+| `batch_transcription.model` | `GHOST_WISPR_BATCH_TRANSCRIPTION_MODEL` | `deepgram` | `transcription.model` | Transcribes a session's recording again after it ends |
+| `summarization.model`, a preset's `model` | `GHOST_WISPR_SUMMARIZATION_MODEL` | `openai`, `anthropic`, `vertex`, `gemini` | `openai/gpt-4o-mini` | Summaries, titles and speaker names |
+| `embedding.model` | `GHOST_WISPR_EMBEDDING_MODEL` | `openai`, `vertex`, `gemini` | off | Semantic search |
+| `concierge.model` | `GHOST_WISPR_CONCIERGE_MODEL` | `vertex`, `gemini`, `openai` | — | The meeting voice's Concierge. On an `openai` provider it streams chat completions with tool calls, so a model gateway's OpenAI API serves it, with Claude, OpenAI or Gemini models |
+| `tts.model`, `tts.voice`, `tts.max_length` | `GHOST_WISPR_TTS_MODEL`, `GHOST_WISPR_TTS_VOICE`, `GHOST_WISPR_TTS_MAX_LENGTH` | `vertex`, `gemini`, `openai`, `deepgram`, `elevenlabs`, `google-tts` | off; the model's default voice; 5000 characters | Text-to-speech: voice A, and `POST /api/tts/speak` |
+| `voice.gptlive.model` | — | `openai` | `openai/gpt-live-1` | Voice B: speech-to-speech, OpenAI GPT-Live |
+| `voice.dgagent.provider` | — | `deepgram` | `deepgram` | Voice C: Deepgram's Voice Agent. It names a provider alone: `voice.dgagent.think_model` uses Deepgram's own model names |
+
+A role whose provider/model names no provider, or a provider whose API the role cannot call, is
+off, and so is a role whose `api_key` provider has no key; the start warns about each, and
+`GET /api/status` shows the warning.
+
+A backlog of sessions to summarize (at start, four or more; or `POST /api/sessions/batch-backfill`)
+goes as one batch job when `summarization.batch_jobs` is on, as it is by default, and
+`summarization.model`'s provider is the Gemini API: batch jobs run on the Gemini API only. A Vertex
+AI provider summarizes each session online, one call a session, whatever `batch_jobs` says: genai
+sends Vertex AI no batch of inlined requests. With `summarization.batch_jobs: false` every backlog
+is summarized online. A batch job the provider refuses goes online too, with a log line saying
+why, and leaves no session summarizing. A batch job that ends failed, cancelled or expired leaves
+none either: each of its sessions fails, with the job's end as the reason, and goes back to the
+backlog. A batch job is polled with the provider that took it, whatever `summarization.model`
+names later; once that provider is gone from the settings, speaks another API or has no key, the
+unit gives the job up, and each of its sessions fails, saying why, and goes back to the backlog. A
+batch job's result or failure applies to a session only while the job's claim is still the
+session's summary attempt: a summary started since, as by the start's backlog after a restart
+(which polls only the batch job it submits itself), keeps the session, and the old job's result
+is dropped with a log line. `GET /api/batches/{name}` polls a job this unit submitted, and answers
+404 for any other. A backlog takes each session whose summary is pending, failed, or empty, and
+one the last run left running (the start makes it pending again), but never one whose summary is
+being made now: `POST /api/sessions/batch-backfill` or `POST /api/sessions/backfill` (always
+online) during the start's backlog summarizes each session once. A backlog's summaries reach the
+page as they start, end and fail, as a Resummarize's do. Each model call of a summary has 3 minutes,
+and an OpenAI or Anthropic API answer at most 8192 tokens; an answer that begins as a JSON object
+but does not parse, such as one cut off at that limit, is asked again and never stored as the
+summary.
+
+### Text-to-speech
+
+`tts.model` names a model at any of these providers, and `tts.voice` a voice by that provider's own
+name; an empty voice is the provider's default:
+
+- Gemini TTS, on Vertex AI (`vertex`) or Google's Gemini API (`gemini`), such as
+  `gemini-3.8-flash-tts`: a prebuilt voice, such as `Kore` (the default). Streamed.
+- OpenAI (`openai`), such as `gpt-4o-mini-tts`: a built-in voice, such as `alloy`, `coral` or
+  `marin` (the default). Streamed.
+- Deepgram Aura (`deepgram`): the model is the voice, such as `aura-2-harmonia-en`, and `tts.voice`
+  names another Aura voice in its place. Streamed, with `mip_opt_out=true`.
+- ElevenLabs (`elevenlabs`), such as `eleven_multilingual_v2`: a voice id; the default is Rachel's.
+  Streamed.
+- Google Cloud Text-to-Speech (`google-tts`): the model is a voice name, such as
+  `en-US-Chirp3-HD-Charon`, whose start gives the language, and `tts.voice` names another voice in
+  its place. Each text is one whole clip: Cloud Text-to-Speech's `text:synthesize` does not stream.
+
+A streamed voice speaks a sentence's first audio before the provider has made the rest. Each HTTP
+provider is asked once more 2 s after a 429, and a stream that sends nothing for 5 s fails.
+
+A voice belongs to its model, so a settings change of `tts.model` that names no `tts.voice` sets
+the voice to `""`, the new model's default. The settings page checks only that the provider serves
+the model's API, not that the model speaks: when a provider refuses a `POST /api/tts/speak`,
+`/api/status` warns, with `tts.model` and the provider's status and code, until a speech works; it
+warns the same way, naming `tts.model`, when the provider returns no audio (the speak answers 502).
+Search does the same, with a warning for its index and one for its questions. When the provider
+refuses to index a session (at its end, or in a backfill), `/api/status` warns with
+`embedding.model` and the provider's status and code until a backfill of the sessions missing from
+search works. An index that works while that warning is up, and a settings save that changes the
+key of `embedding.model`'s provider, start that backfill in the background, one at a time, so the
+sessions the provider refused are indexed with no restart. A question to `GET /api/search/semantic`
+that the provider refuses (it answers 500 and logs the refusal) warns the same way until a question
+works; a question that works leaves the index warning up. A 401 asks to check the provider's
+sign-in; a 403 says the provider refused this model to a sign-in that worked, as a gateway answers
+`team_model_access_denied`.
+
+### Route a role through a model gateway
+
+A model gateway is one more provider. A role can call it when the gateway speaks one of the role's
+APIs, in the table above:
+
+1. Name it under `providers` with the API it speaks and its `url`: `api: openai` and a URL that ends
+   in `/v1` for an OpenAI-compatible gateway. A gateway that also speaks Anthropic's API is a second
+   provider, with `api: anthropic` and the URL without `/v1`; one that serves Google's
+   `generateContent` routes is a provider with `api: gemini` and the gateway's root URL: Ghost
+   Wispr calls `<url>/v1beta/models/<model>:generateContent` and `:streamGenerateContent`, the voice
+   too, with `google_id_token`'s token in `Authorization` and no key header.
+2. Sign in: `google_id_token`, with the audience the gateway checks, when it admits Google ID
+   tokens and lists the unit's service account; or `api_key`, with the gateway's key in `auth.env`.
+3. Name the gateway in the role, with the model as the gateway names it:
+   `embedding.model: gateway/gemini-embedding-2`, `summarization.model: gateway/<model>`,
+   `concierge.model: gateway/claude-haiku-4-5` or `gateway/openai/gpt-5-mini`.
+4. Check that it signs in: the settings page lists it, or `GET /api/providers?refresh=1`. The check
+   of an `api: gemini` provider lists its models (`GET <url>/v1beta/models`) and counts a short
+   text's tokens on each. When that list answers 404, as a gateway's Google routes do, it makes one
+   `generateContent` of each chat model instead, with at most one output token: the provider
+   works once each answers, fails naming a model it refuses, and a speech model, which no cheap
+   call proves, leaves it at Signed in.
+
+Moving the role back to a direct provider is the same change.
+
+### The settings page and the API
+
+The settings page lists each provider: its API, address and sign-in, the roles that use it, and
+whether it signed in when last checked; an `api_key` provider also has a field for its key. The
+check signs in, and where the API has a cheap read the credential must pass (a model list,
+Deepgram's projects, the ElevenLabs user, Cloud Text-to-Speech's voices, or for Vertex AI a count
+of a short text's tokens on each model the roles call there, which costs nothing and needs only the
+predict permission), makes it; a Vertex AI refusal or 404 (no such model or location) of any of
+those models fails, naming the model. For `openai_wif`, and for a Vertex AI provider none of whose
+models can be counted (an embedding model's), the exchanged or minted token is the check. An
+OpenAI, Anthropic or Gemini API provider, such as a model gateway, must also list each model its
+roles call and answer one cheap call of each: an embedding of one word for an embedding model, and
+for a chat model a completion of one token (OpenAI API; for a summarization model it asks for a
+JSON schema of the summary's shape, as summaries do) or a count of a short text's tokens (Anthropic
+and Gemini APIs). A gateway that admits the sign-in but refuses the model, as with
+`team_model_access_denied`, so reads as failing. A vendor's own API lists dated models and not
+their aliases, so there an unlisted model is decided by its call. Summaries on an OpenAI API
+provider ask for strict structured output when the schema allows it, as the summary's does: its
+`speakers` is a list of `{id, name, confidence}`, which the summary stores as `speaker_names`,
+keyed by speaker id. A provider's status says Works when its answers proved every model its roles
+call, and Fails, with the reason, when the sign-in, the read or a call failed. It says Signed in
+(`"asked": false`) when the check proved the sign-in and not every model: signing in was the whole
+check; a Vertex AI provider counted some of its models and cannot count another (an embedding
+model's); the read was of the account alone (Deepgram's projects, the ElevenLabs user, Cloud
+Text-to-Speech's voices), which proves no model, while a role calls a model on the provider; or a
+role's use of a model has no cheap call (a speech model). The message names each model the check
+did not prove, and the settings page shows it under Signed in, as it shows why a provider fails;
+Works says no more. A provider no role calls works once its read accepts the credential. A provider's
+credential goes only to its own `url`'s scheme and host: a redirect elsewhere stops the call.
+Errors name the provider as `providers` names it, such as `gateway answered HTTP 403`. A check that
+began with a key a save has since replaced is not kept as the provider's last check.
+
+- `GET /api/providers` returns `{"providers": [...]}`: each provider's `name`, `api`, `url`, `auth`,
+  `sign_in` (in words), `key_env` and `key_set` for an `api_key` provider, `checked`, `asked`, `ok`,
+  `message`, `checked_at`, and `roles`, the config keys that name it. A provider checked in the last
+  5 minutes keeps its last check; `?refresh=1` checks every provider now. No answer holds a
+  credential.
+- `GET /api/config` returns `tts` (`model`, `voice`) among its settings and, read-only, `providers` (each
+  provider's settings, with no secret) and `models`: each role's provider/model as the running
+  process resolved it, environment overrides included, under `live_transcription`,
+  `batch_transcription`, `summarization`, `embedding`, `concierge`, `tts`, `tts_voice`, `gptlive`
+  and `dgagent_provider`.
+- `PATCH /api/config` takes `provider_keys: {"<provider>": "<key>"}` for `api_key` providers and
+  writes each key into `.env` under the provider's `auth.env`; any other provider or a key containing
+  control characters is a 400. It also takes `tts: {model, voice}`, `summarization: {model, presets}`
+  and `voice: {enabled, engine}` among its other fields, refuses a summarization or text-to-speech
+  model that no provider serves, and answers 400 to a field it does not know. A saved key reaches
+  every client that signs in with it with no restart: search, the next live-transcription
+  reconnect, speech and summaries. A check of the providers that read the settings before the save
+  never gives them the key it replaced.
+- `POST /api/tts/speak` takes `{text, voice?}` and speaks with `tts.model`. Its headers
+  `X-Ghost-Wispr-TTS-Model` and `X-Ghost-Wispr-TTS-Voice` name the model and voice the provider
+  used. A provider that fails to synthesize the speech answers 502 (`TTS synthesis failed: …`); a
+  speaker that fails to play it, 503 (`TTS playback failed: …`), as when there is none.
+
+### Removed settings
+
+These settings are gone, and setting one does nothing: a start that finds one in the config file,
+the environment or the `.env` file beside the config warns and names what replaced it. The last
+two rows are fields of the HTTP API; a `PATCH /api/config` that sends one answers 400.
+
+| Removed | What replaced it |
+|---------|------------------|
+| `genai_backend` | A provider with `api: vertex` (and its `project` and `location`) or `api: gemini` |
+| `gcp_project`, `gcp_location` | A Vertex AI provider's `project` and `location` |
+| `deepgram_model`, `batch_transcription.provider` | `transcription.model`, `batch_transcription.model` |
+| `embedding_model` | `embedding.model` |
+| `summarization.base_url` | The `url` of the provider `summarization.model` names |
+| `tts_provider`, `tts_model`, `voice.tts_engine`, `voice.tts_model` | `tts.model` |
+| `tts_voice`, `voice.tts_voice`, `tts_max_length` | `tts.voice`, `tts.max_length` |
+| `voice.tts_location` | The `location` of the Vertex AI provider `tts.model` names |
+| `voice.gptlive.openai_identity_provider_id`, `voice.gptlive.openai_service_account_id` | The `auth` of the provider `voice.gptlive.model` names, with `kind: openai_wif` |
+| `GHOST_WISPR_GCP_PROJECT`, `GHOST_WISPR_GCP_LOCATION`, `GHOST_WISPR_GENAI_BACKEND`, `GHOST_WISPR_EMBEDDING_BACKEND`, `GHOST_WISPR_EMBEDDING_LOCATION`, `GHOST_WISPR_VOICE_TTS_LOCATION` | The settings of the provider the role names |
+| `GHOST_WISPR_DEEPGRAM_MODEL`, `GHOST_WISPR_BATCH_TRANSCRIPTION_PROVIDER` | `GHOST_WISPR_TRANSCRIPTION_MODEL`, `GHOST_WISPR_BATCH_TRANSCRIPTION_MODEL` |
+| `GHOST_WISPR_TTS_PROVIDER`, `GHOST_WISPR_VOICE_TTS_ENGINE`, `GHOST_WISPR_VOICE_TTS_MODEL`, `GHOST_WISPR_VOICE_TTS_VOICE` | `GHOST_WISPR_TTS_MODEL`, `GHOST_WISPR_TTS_VOICE` |
+| `GHOST_WISPR_TTS_API_KEY`, and any `GHOST_WISPR_..._API_KEY` that no provider's `auth.env` names | The variable a provider's `auth.env` names |
+| `api_keys` in `GET` and `PATCH /api/config` | `providers` and `provider_keys` |
+| `summarization.base_url` and `voice.tts_engine` in `/api/config`, `provider` in `POST /api/tts/speak` | `tts` in `/api/config`; the speech uses `tts.model` |
 
 ## Recording rules
 
@@ -347,9 +609,9 @@ What the voice hears, and where the room's words go:
   session's answers are never spoken: they stay in writing on that session's page. A gate closing
   also clears the two minutes of transcript the voice keeps.
 - Voice A, text-to-speech (`voice.engine: tts`), sends no room audio anywhere. The asker's words after the wake phrase go to the
-  Concierge's model (Gemini on Vertex AI), with the last two minutes of the transcript. The text
-  Wispr speaks goes to the text-to-speech provider: Gemini TTS on Vertex AI, or Deepgram Aura-2 with
-  `mip_opt_out=true`.
+  Concierge's model (`concierge.model`), with the last two minutes of the transcript. The text
+  Wispr speaks goes to the text-to-speech provider `tts.model` names; a Deepgram Aura request
+  carries `mip_opt_out=true`.
 - Voice B, speech-to-speech (`voice.engine: gptlive`), sends room audio to OpenAI's GPT-Live, only while the light reads
   red, from the wake phrase to the end of the exchange: nothing said before the wake phrase goes. The
   audio held for the wake starts inside the phrase itself, about 0.3 s into it in our tests.
@@ -360,8 +622,9 @@ What the voice hears, and where the room's words go:
   nothing goes to OpenAI. With the audio go the last two
   minutes of the transcript as text, and the Concierge's answers for GPT-Live to say in its own
   words. The session starts with `store: false`, so OpenAI stores no recording of it to fork later.
-  The question and the transcript still go to the Concierge's model, as with voice A. The unit signs
-  in to OpenAI with its own Google identity and holds no OpenAI key.
+  The question and the transcript still go to the Concierge's model, as with voice A. With an
+  `openai_wif` provider, the unit signs in to OpenAI with its own Google identity and holds no
+  OpenAI key.
   A measured limit of voice B: GPT-Live sends its words just before their audio, and their
   timestamps run on a clock the unit cannot follow, so the unit takes each word as it arrives. When
   someone talks over Wispr, the words GPT-Live had already sent count as spoken, though up to about
@@ -372,7 +635,7 @@ What the voice hears, and where the room's words go:
   `mip_opt_out` set so Deepgram does not use them to train its models. Deepgram's model keeps the
   turn: Deepgram's own model, or the provider `voice.dgagent.think_model` names (such as Google);
   when that model fails a turn, Deepgram hands the turn, with the same transcript, to OpenAI's gpt-4.1-mini.
-  Each question goes to the Concierge on the unit, whose own model (Gemini on Vertex AI) words the
+  Each question goes to the Concierge on the unit, whose own model (`concierge.model`) words the
   answer, and Deepgram speaks it word for word. An exchange opens at the wake phrase; a held answer also opens voice C without one, but only on "Wispr, go ahead", or when nobody has
   spoken since its question and the light reads red. Between exchanges nothing goes to the Voice Agent.
 - Voice C plays only the Concierge's words and routing lines. The words of Deepgram's own model
@@ -409,17 +672,16 @@ What the voice hears, and where the room's words go:
 | Setting | Default | Description |
 |---------|---------|-------------|
 | `voice.enabled` (`GHOST_WISPR_VOICE_ENABLED`) | `false` | Turn the meeting voice on; it needs `speaker_enabled` |
-| `voice.engine` | `tts` | The voice: `tts` (voice A, text-to-speech: the `voice.tts_engine` provider reads the Concierge's answers), `gptlive` (voice B, speech-to-speech: OpenAI's GPT-Live) or `dgagent` (voice C, a voice agent: Deepgram's Voice Agent with the Deepgram key; it hears the room, keeps the turn and speaks the Concierge's answers word for word) |
+| `voice.engine` (`GHOST_WISPR_VOICE_ENGINE`) | `tts` | The voice: `tts` (voice A, text-to-speech: the `tts.model` provider reads the Concierge's answers), `gptlive` (voice B, speech-to-speech: OpenAI's GPT-Live) or `dgagent` (voice C, a voice agent: Deepgram's Voice Agent with the Deepgram key; it hears the room, keeps the turn and speaks the Concierge's answers word for word) |
 | `voice.dgagent.think_model` | Deepgram's `phonellm-mini-alpha-2-fp8` | Voice C: the model, as provider/model, that Deepgram runs to keep the turn, such as `google/gemini-3.1-flash-lite`; `open_ai/gpt-4.1-mini` stands behind it if it fails. `deepgram/think-fast` is refused: it needs Deepgram's model training, which voice C opts out of |
 | `voice.wake_phrases` | `[Wispr, Ghost Wispr]` | The phrases that call Wispr; the live Deepgram request carries them, and Dispatch's project keys, as Nova-3 keyterms |
-| `voice.tts_engine` | `gemini` | Voice A's text-to-speech provider: `gemini` (Vertex AI, `gcp_project`) or `aura` (the Deepgram key) |
-| `voice.tts_model`, `voice.tts_voice` | the provider's | Gemini: `gemini-3.8-flash-tts`, `Kore`; Aura: the voice `aura-2-harmonia-en` |
-| `voice.tts_location` | `us` | The Vertex AI location Gemini streams from; `us` is faster to first audio than `global` |
+| `tts.model`, `tts.voice` | — | Voice A's text-to-speech provider/model and voice ([Text-to-speech](#text-to-speech)) |
 | `voice.paused_listener` | `false` | A pause from the power button or the page goes to listening, where the paused listener hears only "Wispr, start recording" ([The three states of the microphone](#the-three-states-of-the-microphone)); it needs `voice.enabled`, a build with the listener and the Jabra's mute button. Turned off, a listening unit closes its microphone at once |
-| `voice.gptlive.openai_identity_provider_id`, `voice.gptlive.openai_service_account_id` | — | Voice B's OpenAI workload identity, ids and not secrets: the unit exchanges its Google ID token (`google_credentials_file`) for an OpenAI access token of an hour at most. `gptlive-probe` (`cmd/gptlive-probe`) checks the route from the unit |
-| `concierge.model` | `gemini-3.5-flash-lite` | The Concierge's Gemini model, on the unit's genai settings |
+| `voice.gptlive.model` | `openai/gpt-live-1` with no `providers` | Voice B's provider/model, on an `openai` provider. With `openai_wif`, the unit exchanges its Google ID token (`google_credentials_file`) for an OpenAI access token of an hour at most. `gptlive-probe` (`cmd/gptlive-probe`) checks the route from the unit |
+| `voice.dgagent.provider` | `deepgram` with no `providers` | Voice C's provider, a `deepgram` one, whose key opens the Voice Agent |
+| `concierge.model` (`GHOST_WISPR_CONCIERGE_MODEL`) | — | The Concierge's provider/model, on a `vertex`, `gemini` or `openai` provider, such as `vertex/gemini-3.5-flash-lite`, or a model gateway's `gateway/claude-haiku-4-5` or `gateway/openai/gpt-5-mini`; without it the voice cannot answer |
 | `concierge.dispatch_url`, `GHOST_WISPR_DISPATCH_TOKEN` | — | Dispatch and the unit's own token; without both, the voice says it cannot reach Dispatch yet |
-| `concierge.envoy_url` | — | The Envoy listener the unit registers its session with, to ask an issue's agent |
+| `concierge.envoy_url` | — | The Envoy listener the unit registers its session with, to ask an issue's agent. `envoy_enabled` does not turn this session off: it is for the events alone; without `concierge.envoy_url` the unit opens no Envoy session |
 
 ## Deployment
 

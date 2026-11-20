@@ -65,7 +65,7 @@ func TestLiveTranscriptionConnectsAfterATransientFirstDialFailure(t *testing.T) 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	warnings := newWarningsRegistry()
-	rc := newLiveTranscription(ctx, "test-key",
+	rc := newLiveTranscription(ctx, fixedKey("test-key"),
 		&interfaces.ClientOptions{Host: host, EnableKeepAlive: true},
 		&interfaces.LiveTranscriptionOptions{Model: "nova-3", Language: "en-US", Encoding: "linear16", SampleRate: 16000, Channels: 1},
 		transcribe.ResilientConfig{BufferSize: 1 << 16, InitialReconnectDelay: 200 * time.Millisecond, MaxReconnectBackoff: 200 * time.Millisecond},
@@ -172,7 +172,7 @@ func TestDeepgramWarningFollowsLaterDisconnects(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	warnings := newWarningsRegistry()
-	rc := newLiveTranscription(ctx, "test-key",
+	rc := newLiveTranscription(ctx, fixedKey("test-key"),
 		&interfaces.ClientOptions{Host: host, EnableKeepAlive: true},
 		&interfaces.LiveTranscriptionOptions{Model: "nova-3", Language: "en-US", Encoding: "linear16", SampleRate: 16000, Channels: 1},
 		transcribe.ResilientConfig{BufferSize: 1 << 16, InitialReconnectDelay: 20 * time.Millisecond, MaxReconnectBackoff: 50 * time.Millisecond},
@@ -238,7 +238,7 @@ func TestTheHubsDeepgramStatusEndsAtTheClientsState(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	hub := server.NewHub()
-	rc := newLiveTranscription(ctx, "test-key",
+	rc := newLiveTranscription(ctx, fixedKey("test-key"),
 		&interfaces.ClientOptions{Host: host, EnableKeepAlive: true},
 		&interfaces.LiveTranscriptionOptions{Model: "nova-3", Language: "en-US", Encoding: "linear16", SampleRate: 16000, Channels: 1},
 		transcribe.ResilientConfig{BufferSize: 1 << 16, InitialReconnectDelay: 20 * time.Millisecond, MaxReconnectBackoff: 50 * time.Millisecond},
@@ -337,7 +337,7 @@ func TestTheWarningChangesWithTheClientsStateAtOnce(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	warnings := newWarningsRegistry()
-	rc := newLiveTranscription(ctx, "test-key",
+	rc := newLiveTranscription(ctx, fixedKey("test-key"),
 		&interfaces.ClientOptions{Host: host, EnableKeepAlive: true},
 		&interfaces.LiveTranscriptionOptions{Model: "nova-3", Language: "en-US", Encoding: "linear16", SampleRate: 16000, Channels: 1},
 		transcribe.ResilientConfig{BufferSize: 1 << 16, InitialReconnectDelay: time.Hour, MaxReconnectBackoff: time.Hour},
@@ -377,7 +377,7 @@ func TestCloseCancelsAStatusStoreItWaitsOn(t *testing.T) {
 	hub.SetEventStore(store)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	rc := newLiveTranscription(ctx, "test-key",
+	rc := newLiveTranscription(ctx, fixedKey("test-key"),
 		&interfaces.ClientOptions{Host: host, EnableKeepAlive: true},
 		&interfaces.LiveTranscriptionOptions{Model: "nova-3", Language: "en-US", Encoding: "linear16", SampleRate: 16000, Channels: 1},
 		transcribe.ResilientConfig{BufferSize: 1 << 16, InitialReconnectDelay: time.Hour, MaxReconnectBackoff: time.Hour},
@@ -451,7 +451,7 @@ func TestCloseIsBoundedWhileAStoreWaitsOnAnotherConnectionsWriteLock(t *testing.
 	hub.SetEventStore(store)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	rc := newLiveTranscription(ctx, "test-key",
+	rc := newLiveTranscription(ctx, fixedKey("test-key"),
 		&interfaces.ClientOptions{Host: host, EnableKeepAlive: true},
 		&interfaces.LiveTranscriptionOptions{Model: "nova-3", Language: "en-US", Encoding: "linear16", SampleRate: 16000, Channels: 1},
 		transcribe.ResilientConfig{BufferSize: 1 << 16, InitialReconnectDelay: time.Hour, MaxReconnectBackoff: time.Hour},
@@ -501,7 +501,7 @@ func TestALateConnectedNeverHidesACurrentOutage(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	warnings := newWarningsRegistry()
-	rc := newLiveTranscription(ctx, "test-key",
+	rc := newLiveTranscription(ctx, fixedKey("test-key"),
 		&interfaces.ClientOptions{Host: host, EnableKeepAlive: true},
 		&interfaces.LiveTranscriptionOptions{Model: "nova-3", Language: "en-US", Encoding: "linear16", SampleRate: 16000, Channels: 1},
 		// No reconnect during the test: the outage lasts.
@@ -553,7 +553,7 @@ func TestEveryLiveSocketOptsOutOfDeepgramModelImprovement(t *testing.T) {
 	peer, host := startSwitchableDeepgram(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	rc := newLiveTranscription(ctx, "test-key",
+	rc := newLiveTranscription(ctx, fixedKey("test-key"),
 		&interfaces.ClientOptions{Host: host, EnableKeepAlive: true},
 		&interfaces.LiveTranscriptionOptions{Model: "nova-3", Language: "en-US", Encoding: "linear16", SampleRate: 16000, Channels: 1},
 		transcribe.ResilientConfig{BufferSize: 1 << 16, InitialReconnectDelay: 20 * time.Millisecond, MaxReconnectBackoff: 50 * time.Millisecond},

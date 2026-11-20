@@ -9,8 +9,11 @@ import (
 	"log/slog"
 	"strings"
 
+	"github.com/sjawhar/ghost-wispr/internal/config"
+	"github.com/sjawhar/ghost-wispr/internal/llm"
 	"github.com/sjawhar/ghost-wispr/internal/session"
 	"github.com/sjawhar/ghost-wispr/internal/storage"
+	"github.com/sjawhar/ghost-wispr/internal/summary"
 )
 
 // presetSummarizer makes the summary of a transcript, with the preset named
@@ -38,8 +41,10 @@ type summaryBroadcaster interface {
 // title and its last good summary (failSummary). The summary is stored only
 // while the session has the transcript generation read with the text it
 // summarizes, so a summary of the text before a segment deletion is refused.
+// The summarizer reads the transcript with each segment's speaker label
+// (storage's CanonicalizeForSummary), as every summary does.
 func resummarize(ctx context.Context, store *storage.SQLiteStore, summarizer presetSummarizer, hub summaryBroadcaster, publish func(sessionID string), sessionID, preset string) error {
-	transcript, generation, err := store.Canonicalize(sessionID)
+	_, transcript, generation, err := store.CanonicalizeForSummary(sessionID)
 	if err != nil {
 		return err
 	}
@@ -86,7 +91,7 @@ func resummarize(ctx context.Context, store *storage.SQLiteStore, summarizer pre
 // words gets an empty completed summary. Each is stored only at the
 // transcript generation read with the text.
 func summarizeMergedSession(ctx context.Context, store *storage.SQLiteStore, summarizer session.ReportedSummarizer, hub summaryBroadcaster, publish func(sessionID string), sessionID string) {
-	transcript, generation, err := store.Canonicalize(sessionID)
+	transcript, labeled, generation, err := store.CanonicalizeForSummary(sessionID)
 	if err != nil {
 		slog.Warn("failed to read the transcript of merged session", "session_id", sessionID, "error", err)
 		return
@@ -103,7 +108,7 @@ func summarizeMergedSession(ctx context.Context, store *storage.SQLiteStore, sum
 	_ = store.StartSummary(sessionID)
 	hub.BroadcastSummaryReady(sessionID, "", "", storage.SummaryRunning, "")
 
-	title, summaryText, preset, speakerNames, model, err := summarizer.SummarizeReported(ctx, sessionID, transcript)
+	title, summaryText, preset, speakerNames, model, err := summarizer.SummarizeReported(ctx, sessionID, labeled)
 	if err != nil {
 		slog.Warn("summarization failed for merged session", "session_id", sessionID, "error", err)
 		failSummary(store, hub, sessionID, generation, err)
@@ -118,19 +123,25 @@ func summarizeMergedSession(ctx context.Context, store *storage.SQLiteStore, sum
 	publish(sessionID)
 }
 
-// summarizeBackfillSession makes, at startup, the summary of session id, one
-// whose summary is missing, failed or never ended, and publishes it once
-// stored (publish). A session with no words gets an empty completed summary.
-// Each is stored only at the transcript generation read with the text.
-func summarizeBackfillSession(ctx context.Context, store *storage.SQLiteStore, summarizer session.ReportedSummarizer, publish func(sessionID string), id string) {
-	log.Printf("startup: summarizing session %s synchronously", id)
-	transcript, generation, err := store.Canonicalize(id)
+// summarizeBackfillSession makes the summary of session id online, one whose
+// summary is missing, failed or never ended (a start's backlog, or POST
+// /api/sessions/batch-backfill gone online), and publishes it once stored
+// (publish). It announces on hub, as the other summary paths do, that the
+// summary runs, then the summary stored, or the title and summary the
+// session keeps with why it failed (failSummary), so the page shows each
+// with no reload. A session with no words gets an empty completed summary.
+// Each is stored only at the transcript generation read with the text. A
+// session whose summary is being made now, or was made since its backlog
+// listed it (storage's StartBackfillSummary refuses it), is left to that
+// summary: two backlogs that list one session summarize it once.
+func summarizeBackfillSession(ctx context.Context, store *storage.SQLiteStore, summarizer session.ReportedSummarizer, hub summaryBroadcaster, publish func(sessionID string), id string) {
+	log.Printf("summarizing session %s online", id)
+	transcript, labeled, generation, err := store.CanonicalizeForSummary(id)
 	if err != nil {
 		slog.Warn("failed to read the transcript of session", "session_id", id, "error", err)
 		return
 	}
-	transcript = strings.TrimSpace(transcript)
-	if transcript == "" {
+	if strings.TrimSpace(transcript) == "" {
 		if err := store.StartEmptySummaryAtGeneration(id, generation); err != nil {
 			slog.Warn("failed to start empty summary for session", "session_id", id, "error", err)
 			return
@@ -138,11 +149,18 @@ func summarizeBackfillSession(ctx context.Context, store *storage.SQLiteStore, s
 		_ = store.UpdateSummaryAtGeneration(id, "", "", storage.SummaryCompleted, "", "{}", "", generation)
 		return
 	}
-	_ = store.StartSummary(id)
-	title, summaryText, preset, speakerNames, model, err := summarizer.SummarizeReported(ctx, id, transcript)
+	if err := store.StartBackfillSummary(id); errors.Is(err, sql.ErrNoRows) {
+		log.Printf("session %s: its summary is being made now, or was made since the backlog listed it; skipping", id)
+		return
+	} else if err != nil {
+		slog.Warn("failed to start the summary of session", "session_id", id, "error", err)
+		return
+	}
+	hub.BroadcastSummaryReady(id, "", "", storage.SummaryRunning, "")
+	title, summaryText, preset, speakerNames, model, err := summarizer.SummarizeReported(ctx, id, strings.TrimSpace(labeled))
 	if err != nil {
 		slog.Warn("summarization failed", "session_id", id, "error", err)
-		failSummary(store, nil, id, generation, err)
+		failSummary(store, hub, id, generation, err)
 		return
 	}
 	if err := store.UpdateSummaryAtGeneration(id, title, summaryText, storage.SummaryCompleted, preset, speakerNames, model, generation); err != nil {
@@ -150,6 +168,7 @@ func summarizeBackfillSession(ctx context.Context, store *storage.SQLiteStore, s
 		return
 	}
 	log.Printf("summarized session %s with preset %s", id, preset)
+	hub.BroadcastSummaryReady(id, title, summaryText, storage.SummaryCompleted, preset)
 	publish(id)
 }
 
@@ -172,6 +191,49 @@ func loadSessionTranscript(store *storage.SQLiteStore, sessionID string) (string
 		return "", false
 	}
 	return strings.TrimSpace(buildCanonicalTranscript(store, sessionID, segments)), true
+}
+
+// presetTester is the settings page's test of a summary preset: the answer
+// of the preset's model, or summarization.model's, to the preset's prompt
+// over session sessionID's transcript, as the config saved last has them.
+// The model reads the transcript as a summary does, each segment after its
+// speaker's label.
+func presetTester(cfgStore interface{ Get() config.Config }, store *storage.SQLiteStore, clients summary.ClientFactory) func(ctx context.Context, presetName, sessionID string) (string, error) {
+	return func(ctx context.Context, presetName, sessionID string) (string, error) {
+		latestCfg := cfgStore.Get()
+		preset, ok := latestCfg.Summarization.Presets[presetName]
+		if !ok {
+			return "", fmt.Errorf("preset %q not found", presetName)
+		}
+
+		_, transcript, _, err := store.CanonicalizeForSummary(sessionID)
+		if err != nil {
+			return "", err
+		}
+
+		modelStr := preset.Model
+		if modelStr == "" {
+			modelStr = latestCfg.Summarization.Model
+		}
+
+		provider, model, err := config.ParseModelRef(modelStr)
+		if err != nil {
+			return "", err
+		}
+
+		client, err := clients(provider, model)
+		if err != nil {
+			return "", err
+		}
+
+		userContent := strings.ReplaceAll(preset.UserTemplate, "{{transcript}}", transcript)
+		msgs := []llm.Message{
+			{Role: "system", Content: preset.SystemPrompt},
+			{Role: "user", Content: userContent},
+		}
+
+		return client.Complete(ctx, msgs)
+	}
 }
 
 // summaryRepairStore is what repairing stored summaries reads and writes.

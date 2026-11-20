@@ -58,8 +58,8 @@ func ValidateStartup(cfg *Config) StartupStatus {
 		LogLevel: cfg.LogLevel,
 	}
 
-	// Deepgram API key
-	if cfg.DeepgramAPIKey == "" {
+	// Live transcription: its provider's key
+	if cfg.LiveTranscriptionKey() == "" {
 		status.Deepgram = ComponentState{
 			Name:    "deepgram",
 			Status:  "unavailable",

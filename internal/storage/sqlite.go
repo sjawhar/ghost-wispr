@@ -551,6 +551,11 @@ func (s *SQLiteStore) init(dbPath string) error {
 		// the start found it: its owed retry is for that transcript, and a
 		// deletion since ends it (ClaimRefinementResume).
 		`ALTER TABLE sessions ADD COLUMN refinement_resume_generation INTEGER NOT NULL DEFAULT 0`,
+		// Counts the starts of the session's summary, each an attempt: a
+		// summary batch job's claim (summary_batches.attempt) stores its
+		// result only while it is the session's attempt (StartSummary,
+		// UpdateSummaryAtClaim). 0 for a session from before it was kept.
+		`ALTER TABLE sessions ADD COLUMN summary_attempt INTEGER NOT NULL DEFAULT 0`,
 	} {
 		if _, err := s.db.Exec(stmt); err != nil && !strings.Contains(err.Error(), "duplicate column") {
 			return fmt.Errorf("migration failed: %w", err)
@@ -902,11 +907,25 @@ func (s *SQLiteStore) init(dbPath string) error {
 			session_id TEXT NOT NULL,
 			generation INTEGER NOT NULL,
 			state TEXT NOT NULL DEFAULT 'pending',
+			provider TEXT NOT NULL DEFAULT '',
+			attempt INTEGER NOT NULL DEFAULT 0,
 			PRIMARY KEY (batch_name, session_id),
 			FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
 		);
 	`); err != nil {
 		return fmt.Errorf("create summary_batches table: %w", err)
+	}
+	// The provider that took each batch job, which polls it (RecordSummaryBatch);
+	// '' for a job recorded before it was kept.
+	if _, err := s.db.Exec(`ALTER TABLE summary_batches ADD COLUMN provider TEXT NOT NULL DEFAULT ''`); err != nil && !strings.Contains(err.Error(), "duplicate column") {
+		return fmt.Errorf("migrate summary batches provider: %w", err)
+	}
+	// The summary attempt each claim started (StartBatchSummary): its result
+	// stores only while that is the session's attempt. 0 for a claim recorded
+	// before it was kept, as every session's attempt then is, until its next
+	// start.
+	if _, err := s.db.Exec(`ALTER TABLE summary_batches ADD COLUMN attempt INTEGER NOT NULL DEFAULT 0`); err != nil && !strings.Contains(err.Error(), "duplicate column") {
+		return fmt.Errorf("migrate summary batches attempt: %w", err)
 	}
 
 	if _, err := s.db.Exec(`
@@ -922,6 +941,15 @@ func (s *SQLiteStore) init(dbPath string) error {
 		);
 	`); err != nil {
 		return fmt.Errorf("create embeddings table: %w", err)
+	}
+	// A build before named providers stored each vector's model as
+	// gemini/<model> or openai/<model>; the indexer now names it as its
+	// provider does (gemini-embedding-2), whichever provider serves it, and
+	// would embed each such chunk again at its session's next index. The
+	// vectors are the model's, so only the name changes. Run once: a gateway
+	// model written afterwards may itself start with openai/ or gemini/.
+	if err := s.runOnce("embedding-model-provider-names", `UPDATE embeddings SET model = substr(model, instr(model, '/') + 1) WHERE model LIKE 'gemini/%' OR model LIKE 'openai/%'`); err != nil {
+		return fmt.Errorf("migrate embedding model names: %w", err)
 	}
 
 	// voice_tasks: the ledger of questions the voice sent an agent
@@ -1645,6 +1673,23 @@ func getSession(q querier, id string) (Session, error) {
 // gets a new summary version when the session's current version may already
 // have been sent to Envoy, so Envoy does not drop it as a duplicate delivery.
 func (s *SQLiteStore) UpdateSummaryAtGeneration(sessionID, title, summary, status, preset, speakerNames, model string, generation int) error {
+	return s.updateSummary(sessionID, title, summary, status, preset, speakerNames, model, generation, "")
+}
+
+// UpdateSummaryAtClaim is UpdateSummaryAtGeneration for a summary batch
+// job's result: it stores it only while claim, the job's claim of the
+// session's summary (StartBatchSummary), is still the session's summary
+// attempt, at the generation the job read. A summary started since (the
+// start's backlog after a restart, a Resummarize) is the session's: the
+// result stores nothing and returns sql.ErrNoRows.
+func (s *SQLiteStore) UpdateSummaryAtClaim(sessionID, title, summary, status, preset, speakerNames, model string, claim SummaryClaim) error {
+	return s.updateSummary(sessionID, title, summary, status, preset, speakerNames, model, claim.Generation, ` AND summary_attempt = ?`, claim.Attempt)
+}
+
+// updateSummary is UpdateSummaryAtGeneration of a session that also meets
+// the SQL condition extra ("" for none, else " AND <condition>"), with its
+// arguments.
+func (s *SQLiteStore) updateSummary(sessionID, title, summary, status, preset, speakerNames, model string, generation int, extra string, extraArgs ...any) error {
 	tx, err := s.db.Begin()
 	if err != nil {
 		return fmt.Errorf("begin summary update for session %s: %w", sessionID, err)
@@ -1659,18 +1704,7 @@ func (s *SQLiteStore) UpdateSummaryAtGeneration(sessionID, title, summary, statu
 		return sql.ErrNoRows
 	}
 	bumpVersion := summaryVersionChanges(&current, title, summary, status, preset, speakerNames, model)
-	res, err := tx.Exec(
-		`UPDATE sessions
-		 SET title = CASE WHEN ? != '' THEN ? ELSE title END,
-		     summary_preset = CASE WHEN ? != '' THEN ? ELSE summary_preset END,
-		     speaker_names = CASE WHEN ? != '' THEN ? ELSE speaker_names END,
-		     summary = CASE WHEN ? != '' THEN ? ELSE summary END,
-		     summary_model = CASE WHEN ? != '' AND ? != '' THEN ? ELSE summary_model END,
-		     summary_version = CASE WHEN ? THEN summary_version + 1 ELSE summary_version END,
-		     envoy_publish_status = CASE WHEN ? THEN ? ELSE envoy_publish_status END,
-		     summary_status = ?,
-		     summary_error = CASE WHEN ? = ? THEN '' ELSE summary_error END
-		 WHERE id = ? AND summary_generation = deletion_generation AND deletion_generation = ? AND status != ?`,
+	args := append([]any{
 		title, title,
 		summary, preset,
 		summary, speakerNames,
@@ -1683,6 +1717,20 @@ func (s *SQLiteStore) UpdateSummaryAtGeneration(sessionID, title, summary, statu
 		sessionID,
 		generation,
 		SessionMerged,
+	}, extraArgs...)
+	res, err := tx.Exec(
+		`UPDATE sessions
+		 SET title = CASE WHEN ? != '' THEN ? ELSE title END,
+		     summary_preset = CASE WHEN ? != '' THEN ? ELSE summary_preset END,
+		     speaker_names = CASE WHEN ? != '' THEN ? ELSE speaker_names END,
+		     summary = CASE WHEN ? != '' THEN ? ELSE summary END,
+		     summary_model = CASE WHEN ? != '' AND ? != '' THEN ? ELSE summary_model END,
+		     summary_version = CASE WHEN ? THEN summary_version + 1 ELSE summary_version END,
+		     envoy_publish_status = CASE WHEN ? THEN ? ELSE envoy_publish_status END,
+		     summary_status = ?,
+		     summary_error = CASE WHEN ? = ? THEN '' ELSE summary_error END
+		 WHERE id = ? AND summary_generation = deletion_generation AND deletion_generation = ? AND status != ?`+extra,
+		args...,
 	)
 	if err != nil {
 		return fmt.Errorf("update summary for session %s: %w", sessionID, err)
@@ -1754,21 +1802,28 @@ func summaryVersionChanges(current *Session, title, summary, status, preset, spe
 // takes nothing away. The session gets a new summary version when its
 // current one may already have been sent to Envoy: it is or was completed,
 // or Envoy publishing
-// of it was attempted.
+// of it was attempted. Each start is a new summary attempt
+// (summary_attempt): a batch job's claim of an earlier one stores nothing
+// (UpdateSummaryAtClaim, FailSummaryAtClaim).
 func (s *SQLiteStore) StartSummary(id string) error {
-	res, err := s.db.Exec(`UPDATE sessions SET summary_status = ?, envoy_publish_status = ?, summary_generation = deletion_generation, summary_version = CASE WHEN summary_status = ? OR summary != '' OR envoy_publish_status != ? THEN summary_version + 1 ELSE summary_version END WHERE id = ? AND status != ?`,
-		SummaryRunning, EnvoyPublishPending, SummaryCompleted, EnvoyPublishPending, id, SessionMerged)
+	_, err := s.startSummary(id, "")
+	return err
+}
+
+// startSummary is StartSummary of a session that also meets the SQL
+// condition extra ("" for none, else " AND <condition>"), and returns the
+// summary attempt it started; sql.ErrNoRows when it started none.
+func (s *SQLiteStore) startSummary(id, extra string) (int, error) {
+	var attempt int
+	err := s.db.QueryRow(`UPDATE sessions SET summary_status = ?, envoy_publish_status = ?, summary_generation = deletion_generation, summary_attempt = summary_attempt + 1, summary_version = CASE WHEN summary_status = ? OR summary != '' OR envoy_publish_status != ? THEN summary_version + 1 ELSE summary_version END WHERE id = ? AND status != ?`+extra+` RETURNING summary_attempt`,
+		SummaryRunning, EnvoyPublishPending, SummaryCompleted, EnvoyPublishPending, id, SessionMerged).Scan(&attempt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, sql.ErrNoRows
+	}
 	if err != nil {
-		return fmt.Errorf("start summary of session %s: %w", id, err)
+		return 0, fmt.Errorf("start summary of session %s: %w", id, err)
 	}
-	rows, err := res.RowsAffected()
-	if err != nil {
-		return fmt.Errorf("start summary rows affected: %w", err)
-	}
-	if rows == 0 {
-		return sql.ErrNoRows
-	}
-	return nil
+	return attempt, nil
 }
 
 // StartEmptySummary marks session id's summary running for the current
@@ -1776,9 +1831,9 @@ func (s *SQLiteStore) StartSummary(id string) error {
 // the summary it then completes is empty, which keeps the session's summary
 // as it is. So it neither moves the summary version nor queues the session
 // for Envoy again, and a summary Envoy already has is not sent at a new
-// version.
+// version. It is a new summary attempt, as StartSummary's.
 func (s *SQLiteStore) StartEmptySummary(id string) error {
-	res, err := s.db.Exec(`UPDATE sessions SET summary_status = ?, summary_generation = deletion_generation WHERE id = ? AND status != ?`, SummaryRunning, id, SessionMerged)
+	res, err := s.db.Exec(`UPDATE sessions SET summary_status = ?, summary_generation = deletion_generation, summary_attempt = summary_attempt + 1 WHERE id = ? AND status != ?`, SummaryRunning, id, SessionMerged)
 	if err != nil {
 		return fmt.Errorf("start empty summary of session %s: %w", id, err)
 	}
@@ -1794,10 +1849,11 @@ func (s *SQLiteStore) StartEmptySummary(id string) error {
 
 // StartEmptySummaryAtGeneration marks session id's empty summary running only
 // while generation is still current and no completed summary owns it. A stale
-// empty writer must leave a newer completion alone.
+// empty writer must leave a newer completion alone. It is a new summary
+// attempt, as StartSummary's.
 func (s *SQLiteStore) StartEmptySummaryAtGeneration(id string, generation int) error {
 	res, err := s.db.Exec(`UPDATE sessions
-		SET summary_status = ?, summary_generation = deletion_generation
+		SET summary_status = ?, summary_generation = deletion_generation, summary_attempt = summary_attempt + 1
 		WHERE id = ? AND deletion_generation = ? AND summary_status IN (?, ?, ?) AND status != ?`,
 		SummaryRunning, id, generation, SummaryPending, SummaryFailed, SummaryRunning, SessionMerged)
 	if err != nil {
@@ -1821,12 +1877,29 @@ func (s *SQLiteStore) StartEmptySummaryAtGeneration(id string, generation int) e
 // The session keeps its title and its last good summary (with its preset and
 // speaker names), the ones Drive holds: a failed summary takes nothing away.
 func (s *SQLiteStore) FailSummaryAtGeneration(id, errMsg string, generation int) (Session, error) {
+	return s.failSummary(id, errMsg, generation, "")
+}
+
+// FailSummaryAtClaim is FailSummaryAtGeneration for a summary batch job: it
+// records the failure only while claim, the job's claim of the session's
+// summary (StartBatchSummary), is still the session's summary attempt. A
+// summary started since is the session's: a failure of the job, or its
+// giving up, leaves it as it is and returns sql.ErrNoRows.
+func (s *SQLiteStore) FailSummaryAtClaim(id, errMsg string, claim SummaryClaim) (Session, error) {
+	return s.failSummary(id, errMsg, claim.Generation, ` AND summary_attempt = ?`, claim.Attempt)
+}
+
+// failSummary is FailSummaryAtGeneration of a session that also meets the
+// SQL condition extra ("" for none, else " AND <condition>"), with its
+// arguments.
+func (s *SQLiteStore) failSummary(id, errMsg string, generation int, extra string, extraArgs ...any) (Session, error) {
 	tx, err := s.db.Begin()
 	if err != nil {
 		return Session{}, fmt.Errorf("fail summary of session %s: %w", id, err)
 	}
 	defer func() { _ = tx.Rollback() }()
-	res, err := tx.Exec(`UPDATE sessions SET summary_status = ?, summary_error = ? WHERE id = ? AND summary_generation = deletion_generation AND deletion_generation = ? AND status != ?`, SummaryFailed, errMsg, id, generation, SessionMerged)
+	args := append([]any{SummaryFailed, errMsg, id, generation, SessionMerged}, extraArgs...)
+	res, err := tx.Exec(`UPDATE sessions SET summary_status = ?, summary_error = ? WHERE id = ? AND summary_generation = deletion_generation AND deletion_generation = ? AND status != ?`+extra, args...)
 	if err != nil {
 		return Session{}, fmt.Errorf("fail summary of session %s: %w", id, err)
 	}
@@ -1921,36 +1994,63 @@ func (s *SQLiteStore) GetRefinement(sessionID string) (string, string, error) {
 // that writes it. With the store's single connection, refined deletion cannot
 // interleave, so this does not retry a deletion.
 func (s *SQLiteStore) Canonicalize(sessionID string) (string, int, error) {
-	return s.canonicalize(sessionID, nil)
+	transcript, _, generation, err := s.canonicalize(sessionID, false, nil)
+	return transcript, generation, err
 }
 
-// canonicalize accepts beforeWrite for deterministic storage tests. It runs
-// with the sole database connection held, so the hook must not use the store.
-func (s *SQLiteStore) canonicalize(sessionID string, beforeWrite func()) (string, int, error) {
+// CanonicalizeForSummary is Canonicalize, and also returns, read in the same
+// transaction, the transcript a summary reads: each segment on a line of its
+// own after its speaker's label (transcribe.Segment.SpeakerLine), so the
+// model names a speaker by the id the session stores the name under. The
+// canonical transcript, the one stored and the one search indexes, has no
+// labels. A refinement published before refinements kept their words
+// (refined_revision 0) left the live segments, which are not its text: such
+// a session is summarized from its refined text, unlabelled.
+func (s *SQLiteStore) CanonicalizeForSummary(sessionID string) (canonical, labeled string, generation int, err error) {
+	return s.canonicalize(sessionID, true, nil)
+}
+
+// canonicalize is Canonicalize, and with labels CanonicalizeForSummary. It
+// accepts beforeWrite for deterministic storage tests. It runs with the sole
+// database connection held, so the hook must not use the store.
+func (s *SQLiteStore) canonicalize(sessionID string, labels bool, beforeWrite func()) (canonical, labeled string, generation int, err error) {
 	tx, err := s.db.Begin()
 	if err != nil {
-		return "", 0, fmt.Errorf("begin canonicalize %s: %w", sessionID, err)
+		return "", "", 0, fmt.Errorf("begin canonicalize %s: %w", sessionID, err)
 	}
 
 	var refinedTranscript, refinementStatus string
-	var generation int
-	if err := tx.QueryRow(`SELECT refined_transcript, refinement_status, deletion_generation FROM sessions WHERE id = ?`, sessionID).Scan(&refinedTranscript, &refinementStatus, &generation); err != nil {
+	var refinedRevision int
+	if err := tx.QueryRow(`SELECT refined_transcript, refinement_status, deletion_generation, refined_revision FROM sessions WHERE id = ?`, sessionID).Scan(&refinedTranscript, &refinementStatus, &generation, &refinedRevision); err != nil {
 		_ = tx.Rollback()
-		return "", 0, fmt.Errorf("query refinement for canonicalize %s: %w", sessionID, err)
+		return "", "", 0, fmt.Errorf("query refinement for canonicalize %s: %w", sessionID, err)
 	}
 
-	var canonical, source string
-	if refinementStatus == RefinementCompleted && strings.TrimSpace(refinedTranscript) != "" {
+	refined := refinementStatus == RefinementCompleted && strings.TrimSpace(refinedTranscript) != ""
+	// The segments hold the canonical text's words: the live ones, or the
+	// refinement's once it kept its words (refined_revision).
+	labelSegments := labels && (!refined || refinedRevision > 0)
+	var segs []StoredSegment
+	if !refined || labelSegments {
+		segs, err = getSegments(tx, sessionID)
+		if err != nil {
+			_ = tx.Rollback()
+			return "", "", 0, fmt.Errorf("get segments for canonicalize %s: %w", sessionID, err)
+		}
+	}
+	var source string
+	if refined {
 		canonical = strings.TrimSpace(refinedTranscript)
 		source = TranscriptSourceRefined
 	} else {
-		segs, err := getSegments(tx, sessionID)
-		if err != nil {
-			_ = tx.Rollback()
-			return "", 0, fmt.Errorf("get segments for canonicalize %s: %w", sessionID, err)
-		}
 		canonical = canonicalTranscript(segs)
 		source = TranscriptSourceStreaming
+	}
+	switch {
+	case labelSegments:
+		labeled = speakerTranscript(segs)
+	case labels:
+		labeled = canonical
 	}
 	if beforeWrite != nil {
 		beforeWrite()
@@ -1958,12 +2058,12 @@ func (s *SQLiteStore) canonicalize(sessionID string, beforeWrite func()) (string
 
 	if _, err := tx.Exec(`UPDATE sessions SET canonical_transcript = ?, transcript_source = ? WHERE id = ?`, canonical, source, sessionID); err != nil {
 		_ = tx.Rollback()
-		return "", 0, fmt.Errorf("update canonical transcript for session %s: %w", sessionID, err)
+		return "", "", 0, fmt.Errorf("update canonical transcript for session %s: %w", sessionID, err)
 	}
 	if err := tx.Commit(); err != nil {
-		return "", 0, fmt.Errorf("commit canonical transcript for session %s: %w", sessionID, err)
+		return "", "", 0, fmt.Errorf("commit canonical transcript for session %s: %w", sessionID, err)
 	}
-	return canonical, generation, nil
+	return canonical, labeled, generation, nil
 }
 
 // GetCanonicalTranscriptWithGeneration reads the canonical transcript and the
@@ -2313,38 +2413,20 @@ func lastRawWrite(audioDir, sessionID string) (time.Time, bool) {
 	return info.ModTime().UTC(), true
 }
 
-// GetSessionsNeedingSummary returns IDs of ended sessions with pending or empty summaries.
-func (s *SQLiteStore) GetSessionsNeedingSummary() ([]string, error) {
-	rows, err := s.db.Query(
-		`SELECT id FROM sessions WHERE status = 'ended' AND (summary_status IN ('pending', 'running') OR (summary_status = 'completed' AND (summary IS NULL OR summary = '')))`,
-	)
-	if err != nil {
-		return nil, fmt.Errorf("query sessions needing summary: %w", err)
-	}
-	defer func() { _ = rows.Close() }()
+// backfillable is the SQL condition of a session whose summary a backfill
+// makes: an ended session whose summary is pending, failed, or completed
+// with no text. A running summary is being made now, by this run of the
+// app (one the last run left running is pending again from the start,
+// RecoverInterruptedSummaries), so a backfill leaves it to that run.
+const backfillable = `status = 'ended'
+	AND (summary_status IN ('failed', 'pending')
+	     OR (summary_status = 'completed' AND (summary IS NULL OR summary = '')))`
 
-	var ids []string
-	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
-			return nil, fmt.Errorf("scan session: %w", err)
-		}
-		ids = append(ids, id)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterate sessions: %w", err)
-	}
-	return ids, nil
-}
-
+// GetSessionsForBackfill returns the sessions whose summary a backfill
+// makes (backfillable), oldest first: the start's backlog, and POST
+// /api/sessions/backfill and /api/sessions/batch-backfill.
 func (s *SQLiteStore) GetSessionsForBackfill() ([]string, error) {
-	rows, err := s.db.Query(`
-		SELECT id FROM sessions
-		WHERE status = 'ended'
-		AND (summary_status IN ('failed', 'pending', 'running')
-		     OR (summary_status = 'completed' AND (summary IS NULL OR summary = '')))
-		ORDER BY started_at ASC
-	`)
+	rows, err := s.db.Query(`SELECT id FROM sessions WHERE ` + backfillable + ` ORDER BY started_at ASC`)
 	if err != nil {
 		return nil, fmt.Errorf("query sessions for backfill: %w", err)
 	}
@@ -2362,6 +2444,56 @@ func (s *SQLiteStore) GetSessionsForBackfill() ([]string, error) {
 		return nil, fmt.Errorf("iterate sessions: %w", err)
 	}
 	return ids, nil
+}
+
+// RecoverInterruptedSummaries makes every summary an earlier run of the app
+// left running (it stopped during it, so no run makes it now) pending again,
+// and returns their sessions. The app calls it as it starts, before any
+// summary, and its backlog then takes them (GetSessionsForBackfill); after
+// it, a running summary is one this run makes now.
+func (s *SQLiteStore) RecoverInterruptedSummaries() ([]string, error) {
+	rows, err := s.db.Query(`UPDATE sessions SET summary_status = ? WHERE summary_status = ? RETURNING id`, SummaryPending, SummaryRunning)
+	if err != nil {
+		return nil, fmt.Errorf("recover interrupted summaries: %w", err)
+	}
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			_ = rows.Close()
+			return nil, fmt.Errorf("scan recovered summary: %w", err)
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return nil, fmt.Errorf("recover interrupted summaries: %w", err)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, fmt.Errorf("close recovered summaries: %w", err)
+	}
+	return ids, nil
+}
+
+// StartBackfillSummary starts session id's summary as StartSummary does, for
+// a backfill, only while a backfill makes it (backfillable); otherwise it
+// starts nothing and returns sql.ErrNoRows: the summary is being made now,
+// or was made since the backlog listed the session. A backlog starts each
+// session through it, so two backlogs that list one session (the start's and
+// POST /api/sessions/batch-backfill) make its summary once.
+func (s *SQLiteStore) StartBackfillSummary(id string) error {
+	_, err := s.StartBatchSummary(id)
+	return err
+}
+
+// StartBatchSummary is StartBackfillSummary for a summary batch job, and
+// returns the summary attempt it started: the job's claim of the session's
+// summary, which it keeps with the job (RecordSummaryBatch). The job's
+// result or failure applies only while that is still the session's attempt
+// (UpdateSummaryAtClaim, FailSummaryAtClaim): a summary started since, as by
+// the start's backlog after a restart, is the session's.
+func (s *SQLiteStore) StartBatchSummary(id string) (int, error) {
+	return s.startSummary(id, ` AND `+backfillable)
 }
 
 // GetSessionsNeedingSync returns the sessions the sync sweep syncs now: the

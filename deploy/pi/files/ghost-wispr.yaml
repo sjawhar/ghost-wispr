@@ -11,17 +11,75 @@ recording_rules:
   - Transcripts are readable by Theorem staff only.
   - A person can ask for a segment to be deleted.
   - Saying "Wispr" asks the voice about our work; a question it sends to an agent leaves the unit, and deleting the segment cannot recall it.
-deepgram_model: nova-3
-batch_transcription:
-  provider: deepgram
-  model: nova-3
-summarization:
-  model: gemini/gemini-4-carbon
-embedding_model: gemini/gemini-embedding-2
-genai_backend: vertex
-gcp_project: theorem-agent-infra
-gcp_location: global
+# The Pi's Google identity: workload identity federation for its device certificate. Every provider
+# below but Deepgram signs in with it, so the Pi holds no model key but Deepgram's.
 google_credentials_file: /opt/ghost-wispr/google-credentials.json
+# Each model provider, named once (README "Model providers"); each role below names one as
+# provider/model. Moving a role to another provider, such as the gateway, is a change to its
+# provider/model here, once that provider serves the model to the Pi.
+providers:
+  # Theorem's model gateway admits a caller by a Google ID token for its audience whose account is
+  # on its list, so the Pi signs in with a token minted from its own identity and needs no gateway
+  # key (docs/pi-setup.md, "The model gateway"). It would serve the Pi embeddings only: it has no
+  # Gemini chat or speech model, and no route for streaming audio. It refuses the Pi until
+  # theorem-labs/agent-infra#5187 is merged and applied, and a provider that refuses reads Fails on
+  # the settings page, so the entry stays commented out until then. The switch, then: this entry
+  # uncommented, and embedding.model below set to gateway/gemini-embedding-2.
+  # gateway:
+  #   api: openai
+  #   url: https://model-gateway.tail12ec1c.ts.net/v1
+  #   auth:
+  #     kind: google_id_token
+  #     audience: model-gateway-gce
+  # Vertex AI in the Pi's Google project, signed in with a Google access token. The Concierge,
+  # summaries and search call Gemini here directly.
+  vertex:
+    api: vertex
+    project: theorem-agent-infra
+    location: global
+    auth:
+      kind: google
+  # Vertex AI's us multi-region, for text-to-speech: Gemini TTS streams its first audio sooner there
+  # than from global.
+  vertex-us:
+    api: vertex
+    project: theorem-agent-infra
+    location: us
+    auth:
+      kind: google
+  # OpenAI, for voice B's GPT-Live, which no gateway route carries: the Pi exchanges its Google ID
+  # token for an OpenAI access token with these workload identity ids, which are not secrets.
+  openai:
+    api: openai
+    auth:
+      kind: openai_wif
+      identity_provider_id: idp_b2d6c7c4ac719ef0764eba89
+      service_account_id: user-cd72c7d9a1bb41594ed3c6e7
+  # Deepgram streams live transcription and runs voice C. Deepgram has no workload identity, so it
+  # takes a key: provision.sh writes the credential bundle's deepgram-key into .env under this name.
+  deepgram:
+    api: deepgram
+    auth:
+      kind: api_key
+      env: GHOST_WISPR_DEEPGRAM_API_KEY
+transcription:
+  model: deepgram/nova-3
+batch_transcription:
+  model: deepgram/nova-3
+summarization:
+  model: vertex/gemini-4-carbon
+  # A backlog of sessions is summarized online, one call a session, instead of as a batch job,
+  # for two reasons: theorem-agent-infra's deny policy vertex-jobs-fence (agent-infra
+  # root/vertexjobfence.go, dispatch://INFRA-3614) refuses every Vertex AI batch job create to
+  # every principal, and genai sends Vertex AI no batch of inlined requests anyway.
+  batch_jobs: false
+embedding:
+  # gemini-embedding-2 on Vertex AI at global: the model and location of the vectors the Pi
+  # already holds, which search labels gemini-embedding-2 whichever provider serves it, so the
+  # deploy embeds no session again. Once theorem-labs/agent-infra#5187 applies, the one-line switch
+  # to the gateway is `model: gateway/gemini-embedding-2`, with the gateway entry under providers
+  # uncommented (docs/pi-setup.md, "The model gateway").
+  model: vertex/gemini-embedding-2
 # provision.sh --models <shared-drive-id> adds gdrive_folder_id and turns gdrive_sync_enabled
 # and gc_enabled on; GC removes only local audio that Drive holds a copy of.
 gdrive_sync_enabled: false
@@ -36,9 +94,11 @@ speaker_enabled: true
 # never lit.
 speaker_device: J75
 mic_device: J75
-tts_provider: gemini
-tts_model: gemini-3.8-flash-tts
-tts_voice: Kore
+# Text-to-speech, for voice A and POST /api/tts/speak: Gemini TTS's Kore voice, streamed from
+# Vertex AI's us multi-region.
+tts:
+  model: vertex-us/gemini-3.8-flash-tts
+  voice: Kore
 indicator_light: blink1
 power_button: true
 # The Jabra's Mute button pauses and resumes, as the power button does (docs/pi-setup.md, "Pause
@@ -51,27 +111,25 @@ jabra_mute_button: true
 envoy_enabled: true
 envoy_hub_url: http://envoy-hub.tail12ec1c.ts.net:9020
 # The meeting voice (README "Meeting voice"): "Wispr, …" at the start of a sentence asks about the
-# work in Dispatch. Voice A, text-to-speech, speaks with Gemini TTS through the Pi's own Google
-# identity, streamed from Vertex AI's us multi-region, which is faster to first audio than global.
+# work in Dispatch. Voice A, text-to-speech, speaks with the provider and model of tts above.
 voice:
   enabled: true
   engine: tts
   wake_phrases: [Wispr, Ghost Wispr]
-  tts_engine: gemini
-  tts_model: gemini-3.8-flash-tts
-  tts_voice: Kore
-  tts_location: us
   # The paused listener ("Wispr, start recording" while paused) stays off until its false starts
   # are measured below 0.5 an hour on 10 h of speech, with both of the measurement's controls fired
   # (dispatch://INFRA-4627).
   paused_listener: false
-  # Voice B's OpenAI workload identity: ids, not secrets. The Pi exchanges its Google ID token
-  # for an OpenAI access token with them. Pick gptlive on the settings page to use voice B.
+  # Voice B, picked on the settings page: OpenAI's GPT-Live, signed in by OpenAI workload identity.
   gptlive:
-    openai_identity_provider_id: idp_b2d6c7c4ac719ef0764eba89
-    openai_service_account_id: user-cd72c7d9a1bb41594ed3c6e7
-# The Concierge reads Dispatch with the Pi's own no-scope token (GHOST_WISPR_DISPATCH_TOKEN, the
-# credential bundle's dispatch-token) and asks an issue's agent through the Envoy listener.
+    model: openai/gpt-live-1
+  # Voice C, a voice agent, picked on the settings page: Deepgram's Voice Agent, with the Deepgram key.
+  dgagent:
+    provider: deepgram
+# The Concierge answers on Gemini on Vertex AI. It reads Dispatch with the Pi's own no-scope token
+# (GHOST_WISPR_DISPATCH_TOKEN, the credential bundle's dispatch-token) and asks an issue's agent
+# through the Envoy listener.
 concierge:
+  model: vertex/gemini-3.5-flash-lite
   dispatch_url: https://dispatch.tail12ec1c.ts.net
   envoy_url: http://envoy-hub.tail12ec1c.ts.net:9020

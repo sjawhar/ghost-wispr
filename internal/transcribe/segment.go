@@ -2,6 +2,8 @@ package transcribe
 
 import (
 	"fmt"
+	"regexp"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -78,4 +80,29 @@ func GroupWordsBySpeaker(words []Word) []Segment {
 func (s *Segment) FormatMarkdown() string {
 	ts := s.Timestamp.Format("15:04:05")
 	return fmt.Sprintf("**[%s] Speaker %d:** %s", ts, s.Speaker, strings.TrimSpace(s.Text))
+}
+
+// SpeakerLine is the segment as a transcript a model reads writes it: its
+// text after its speaker's label, "Speaker 0: …", whose number is the id a
+// summary names the speaker by; "Unknown speaker: …" for a segment Deepgram
+// gave no speaker (-1).
+func (s *Segment) SpeakerLine() string {
+	text := strings.TrimSpace(s.Text)
+	if s.Speaker < 0 {
+		return "Unknown speaker: " + text
+	}
+	return "Speaker " + strconv.Itoa(s.Speaker) + ": " + text
+}
+
+// speakerLabel is the label SpeakerLine begins a line with.
+var speakerLabel = regexp.MustCompile(`(?m)^(?:Speaker \d+|Unknown speaker): `)
+
+// WithoutSpeakerLabels is transcript without the speaker label SpeakerLine
+// begins each line with: its words alone, as a title made from it or a count
+// of its words reads them. A transcript with no label is returned as it is.
+func WithoutSpeakerLabels(transcript string) string {
+	if !speakerLabel.MatchString(transcript) {
+		return transcript
+	}
+	return speakerLabel.ReplaceAllString(transcript, "")
 }

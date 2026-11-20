@@ -392,13 +392,72 @@ ssh "ghost-wispr@$PI_HOST" 'sudo tailscale set --accept-routes=false'
 
 Then fix the overlap, as above. Run the block again after the fix.
 
+## The model gateway
+
+The Pi's search embeddings move to Theorem's model gateway, the LiteLLM proxy at
+`https://model-gateway.tail12ec1c.ts.net`, which speaks the OpenAI API under `/v1`, once it admits
+the Pi. Its `gateway` provider, commented out in `deploy/pi/files/ghost-wispr.yaml`, signs in with
+a Google ID token for the audience `model-gateway-gce`, which Ghost Wispr mints from
+`google_credentials_file` by impersonating `ghost-wispr@theorem-agent-infra.iam.gserviceaccount.com`
+with its email in the token. The gateway admits a token whose email is on its account list, so the
+Pi holds no gateway key.
+
+Until theorem-labs/agent-infra#5187 is merged and applied, the gateway refuses the Pi, and a
+provider that refuses reads Fails on the settings page. So the template names no gateway provider
+and sends search to `vertex/gemini-embedding-2`: the model and location (`global`) of the vectors
+the Pi already holds. Search labels a vector `gemini-embedding-2` whichever provider serves the
+model, so the move to the gateway embeds no session again either.
+
+The gateway serves the Pi `gemini-embedding-2` and no Gemini chat, text-to-speech or streaming
+audio model. So the Concierge and summaries call Gemini on Vertex AI directly, text-to-speech
+streams from Vertex AI's `us` multi-region, Deepgram takes its key, and GPT-Live signs in by OpenAI
+workload identity. Each of them is a named provider: moving a role to the gateway, once the gateway
+serves its model to the Pi, is a change of that role's provider/model in the template, rolled out
+by the models step.
+
+The admission is one agent-infra change, theorem-labs/agent-infra#5187:
+
+- `shared/boxaccounts` lists the Pi's account as a `Fleet` entry in team `legion-infra`, with no
+  project or instance, since a token from `generateIdToken` carries no Compute Engine claim; the
+  gateway's rendered account lists carry it.
+- `model-gateway/main.go` gives team `legion-infra` `gemini-embedding-2`, under the one
+  inputs-a-minute bound all its embedding teams share. `model-gateway/` applies on merge, by CI.
+- `root/tailnetpolicy.go` lets `tag:ghost-wispr` reach `tag:model-gateway` on tcp:443. `root/`
+  applies by the seed workflow's `root` job, behind an approval of a member of the theorem-labs
+  team `infrastructure`.
+
+Check it from the Pi once both apply. Before `root/` applies, the name does not resolve; before
+`model-gateway/` applies, the embedding answers 401. After both, the first prints `200` and the
+second the length of a vector, 3072:
+
+```bash
+ssh ghost-wispr@ghost-wispr "curl -sS -o /dev/null -w '%{http_code}\n' https://model-gateway.tail12ec1c.ts.net/health/liveliness"
+ssh ghost-wispr@ghost-wispr 'GOOGLE_API_USE_CLIENT_CERTIFICATE=false /opt/ghost-wispr/ghost-wispr google-id-token \
+    --credentials /opt/ghost-wispr/google-credentials.json --audience model-gateway-gce |
+  { IFS= read -r t; printf "Authorization: Bearer %s\n" "$t"; } |
+  curl -sS -H @- -H "content-type: application/json" \
+    -d "{\"model\":\"gemini-embedding-2\",\"input\":\"office search probe\",\"encoding_format\":\"float\",\"task_type\":\"RETRIEVAL_QUERY\"}" \
+    https://model-gateway.tail12ec1c.ts.net/v1/embeddings | jq ".data[0].embedding | length"'
+```
+
+Then move search to the gateway in one pull request. In `deploy/pi/files/ghost-wispr.yaml`, the
+switch is the line `model: gateway/gemini-embedding-2` under `embedding`, with the commented-out
+`gateway` entry under `providers` uncommented. The checks that pin the Pi's plan move with it:
+`embedding_model` and a `gateway` row in `expected_running_providers` (its `url` and
+`auth.audience` compared with the template's) in `deploy/pi/accept-slice2.sh`, the embedding line
+and the gateway check in `deploy/pi/provision_models_test.sh`, and `internal/config`'s
+`TestThePiConfigSearchesOnVertexAIUntilTheGatewayAdmitsThePi`. Roll it out by the models step
+("Enable models and Drive sync"); the binary does not change.
+
 ## Enable models and Drive sync
 
 Run the models step after the shared drive exists and its members are added. It takes the
 shared-drive ID and rejects an absent or malformed one. It replaces settings saved in the UI
 with `deploy/pi/files/ghost-wispr.yaml` rendered with that ID,
 `gdrive_sync_enabled: true` and `gc_enabled: true`, installs the result over
-`/opt/ghost-wispr/ghost-wispr.yaml`, and
+`/opt/ghost-wispr/ghost-wispr.yaml`, removes from `/opt/ghost-wispr/.env` each variable Ghost Wispr
+no longer reads (an old Envoy webhook signing key, and those of the settings that providers
+replaced: README, "Removed settings"), and
 restarts Ghost Wispr. The credential files from the full provisioner stay as they are. A later
 full-provisioner run keeps the drive ID and both enablements.
 
@@ -416,13 +475,20 @@ ssh ghost-wispr@ghost-wispr.tail12ec1c.ts.net "rm -rf -- '$remote_dir'"
 )
 ```
 
-That YAML names Deepgram `nova-3` for live and batch transcription, Gemini 4 Carbon for
-summaries, Gemini Embedding 2 for search, and Gemini 3.8 Flash TTS with voice `Kore` for
-speech. Chirp 3: HD stays available as another setting (`tts_provider: google` with a Chirp 3: HD
-voice); Ghost Wispr does not switch to it by itself. Gemini calls use Vertex
-AI in `theorem-agent-infra`, location `global`; embeddings use the documented global endpoint
-through `GHOST_WISPR_EMBEDDING_LOCATION` in `/opt/ghost-wispr/.env`. Nothing sets
-`GOOGLE_APPLICATION_CREDENTIALS`. Garbage collection keeps every session
+That YAML names the Pi's providers (README, "Model providers"): `vertex` and `vertex-us`, Vertex AI
+in `theorem-agent-infra` at `global` and at the `us` multi-region, signed in with the Pi's Google
+workload identity; `openai`, by OpenAI workload identity; and `deepgram`, by the key the full
+provisioner writes into `.env` as `GHOST_WISPR_DEEPGRAM_API_KEY`. The model gateway's `gateway`
+entry is there commented out, until the gateway admits the Pi ("The model gateway"). Its roles:
+`deepgram/nova-3` for live and batch transcription,
+`vertex/gemini-4-carbon` for summaries (each session online: `summarization.batch_jobs: false`,
+because `theorem-agent-infra`'s IAM deny policy `vertex-jobs-fence`, dispatch://INFRA-3614, refuses
+every Vertex AI batch job create, and genai sends Vertex AI no batch of inlined requests anyway),
+`vertex/gemini-embedding-2` for search,
+`vertex/gemini-3.5-flash-lite` for the Concierge, and `vertex-us/gemini-3.8-flash-tts` with voice
+`Kore` for speech. Another text-to-speech provider is a config change (README, "Text-to-speech"):
+Chirp 3: HD voices, for one, need a `google-tts` provider; Ghost Wispr does not switch by itself.
+Nothing sets `GOOGLE_APPLICATION_CREDENTIALS`. Garbage collection keeps every session
 (`gc_max_age_days: 0`) and holds local audio to a 20000 MB budget
 (`gc_max_audio_size_mb: 20000`), removing only audio that Drive holds a copy of; the template
 ships GC off so it never runs before sync is on. It also holds the office's five recording rules
@@ -661,9 +727,12 @@ Reconnect over Tailscale SSH once more after it succeeds.
 ## Update and inspect
 
 The user timer runs `/opt/ghost-wispr/update.sh` every day at 03:30 local time. It does
-nothing while `/api/status` reports an active session. It verifies the GitHub release checksum,
-keeps `/opt/ghost-wispr/ghost-wispr.prev`, and restores that binary if the new process or
-`/api/version` check fails.
+nothing while `/api/status` reports an active session, and checks that again after the download,
+just before it replaces the binary. With `GHOST_WISPR_UPDATE_PAUSED_ONLY=1`, as
+`deploy/pi/rollout.sh` runs it, it also does nothing unless the recorder is paused. It verifies the
+GitHub release checksum, keeps `/opt/ghost-wispr/ghost-wispr.prev`, and restores that binary if the
+new process or `/api/version` check fails, unless the new process answers that it records a
+session (or, paused-only, that it is not paused): then it leaves it running and fails.
 
 Run an update manually:
 
@@ -696,9 +765,8 @@ outside meetings. Save no settings in the web UI from step 1 until step 4 passes
 A setting the Pi holds in `/opt/ghost-wispr/.env` overrides its YAML, and the steps treat the two
 files differently. The office Pi can set the Jabra's Mute button there, with
 `GHOST_WISPR_JABRA_MUTE_BUTTON` ("Pause and resume at the unit"). The models step keeps every
-`.env` line but an old Envoy webhook signing key and the embedding location, which it writes again, so
-that line stays as it is. The full provisioner rewrites `.env` without it, and the template's
-`jabra_mute_button: true` applies.
+`.env` line but those of variables Ghost Wispr no longer reads, so that line stays as it is. The
+full provisioner rewrites `.env` without it, and the template's `jabra_mute_button: true` applies.
 
 1. Just before you merge, run the models step ("Enable models and Drive sync") from a checkout of
    the pull request's head (`provision.sh --models <shared-drive-id>`). The shared-drive ID is the
@@ -737,6 +805,90 @@ that line stays as it is. The full provisioner rewrites `.env` without it, and t
    When they do not, the config lacks the key: step 1 was skipped, or a settings save dropped the
    key before step 3. Run the models step again (or the full provisioner, as in step 1), from the
    merge commit; the new binary keeps the key on a save. Then run A2 of "Accept slice 1".
+
+## Roll out a release that replaces config keys
+
+A release that removes config keys and reads others in their place, as the model providers did
+(README, "Removed settings"), needs the new binary and the new config together, so neither order
+of "Roll out a release that adds a config key" works. The old binary ignores the new keys. The new
+binary on the old config warns about each removed key and turns off the role it set: with the
+providers release, live transcription still runs (a config with no `providers` section gets a
+`deepgram` provider with the Deepgram key), while batch refinement, summaries, search, the
+Concierge and the voice are off. The nightly update (`ghost-wispr-update.timer`) installs
+`releases/latest` and never writes the config, so it must not run between the merge and the
+models step, nor install the release again on the old config after a rollback.
+
+`deploy/pi/rollout.sh` runs the rollout from a tailnet member, in the steps below. Each step works
+on the Pi as `ghost-wispr` over ssh, with its user systemd (`XDG_RUNTIME_DIR` set). It refuses to
+start unless the Pi reads paused, with no session and no GPT-Live probe running (pause it outside a
+meeting), and checks that again before each restart. It checks the sha256 of each protected
+recording, `PI_PROTECTED_RECORDINGS` in `deploy/pi/files/pi.env`, before it changes anything and
+again at its end. It stops at the first check that fails. Save no settings in the web UI from
+`hold` until `check` passes.
+
+1. Before you merge, stop the nightly update. `hold` stops `ghost-wispr-update.timer`, then waits
+   until an update the timer already started has ended (`ghost-wispr-update.service` inactive or
+   failed): stopping the timer does not stop that update, and it can still swap or roll back the
+   binary.
+
+   ```bash
+   deploy/pi/rollout.sh hold
+   ```
+
+2. Merge the pull request. Once the release workflow publishes the merge commit's release, run
+   `install` from a clean checkout of the merge commit; it refuses while the latest release is
+   another commit's. It stops the nightly update again, and keeps the Pi's binary, config, `.env`,
+   `update.sh` and the commit it runs in `~/.local/share/ghost-wispr-rollback/<merge commit>` on
+   the Pi, mode 0700 (a second run keeps the first copy). It installs the merge commit's
+   `update.sh` (only the full provisioner installs it otherwise) and runs it paused-only ("Update
+   and inspect"), so a resume during the download leaves the binary in place; it must print
+   `installed commit <merge commit>` or `already on commit <merge commit>`. Then, at once, it runs
+   the models step ("Enable models and Drive sync") with the shared drive the Pi's config names:
+   that installs the new config, removes from `.env` the variables of removed settings (such as
+   the `GHOST_WISPR_EMBEDDING_LOCATION` an earlier provisioner wrote), and restarts the recorder on
+   both. When the Pi's config names no shared drive, it stops before it installs anything: run the
+   full provisioner ("Provision") from the merge commit instead.
+
+   ```bash
+   git checkout --detach "$merge" # merge: the merge commit's SHA
+   deploy/pi/rollout.sh install
+   ```
+
+   When it stops after `update.sh` installed the release, the Pi runs the new binary on its old
+   config, with the roles above off: run `install` again, or roll back.
+
+3. Check the result. `check` requires the merge commit in `/api/version`, no warning in
+   `/api/status`, each role's provider/model in `/api/config` as the template names it, and every
+   provider the template names, and no other, signed in (`GET /api/providers?refresh=1`). Only when
+   all of that holds does it start the nightly update again. Then run A8 of "Accept slice 2".
+
+   ```bash
+   deploy/pi/rollout.sh check
+   ```
+
+To roll back, run `rollback` from the same checkout. It stops the nightly update (`check` may have
+started it), puts back the kept binary, config, `.env` and `update.sh`, each by a rename (a copy
+over the binary the running process executes fails with "Text file busy"), restarts the recorder,
+and waits until `/api/version` names the kept commit. It runs when the recorder is paused and idle,
+or not running at all. The nightly update stays stopped until the release is reverted, or it would
+install the release again on the old config. The old binary reads the relabelled search vectors
+(the database relabels `gemini/<model>` to `<model>` once) as another model's, so it embeds a
+session again the next time it indexes it.
+
+```bash
+deploy/pi/rollout.sh rollback
+```
+
+## The settings page's providers
+
+The web UI's settings page lists the Pi's four providers, each with its API, how it signs in, the
+roles that use it and whether it signed in when last checked (README, "The settings page and the
+API"): `vertex` and `vertex-us` with the Pi's Google workload identity, `openai` with OpenAI
+workload identity, and `deepgram` with its key from `GHOST_WISPR_DEEPGRAM_API_KEY`. Every provider
+must show that it signed in. A check is kept for 5 minutes; `GET /api/providers?refresh=1` checks
+every provider at once. Only `deepgram` has a key field: a key saved there goes into
+`/opt/ghost-wispr/.env`, and the next full provisioner run writes the credential bundle's
+`deepgram-key` over it.
 
 ## Recover a pending segment deletion
 
@@ -819,8 +971,10 @@ steps on the Pi as `ghost-wispr`, outside meetings, with no session active.
 
 The template turns the meeting voice on (`voice.enabled: true`; README, "Meeting voice"): "Wispr,
 what is happening with …?" gets a chime, then voice A (text-to-speech) speaks the answer from Dispatch's record
-in Gemini TTS's Kore voice, streamed from Vertex AI's `us` multi-region with the Pi's own Google
-identity. The fifth recording rule tells the room that a question sent to an agent leaves the unit.
+with the template's text-to-speech, `tts.model: vertex-us/gemini-3.8-flash-tts` and `tts.voice:
+Kore`: Gemini TTS's Kore voice, streamed from Vertex AI's `us` multi-region with the Pi's own
+Google identity. The fifth recording rule tells the room that a question sent to an agent leaves
+the unit.
 
 1. Reach. The Concierge reads `concierge.dispatch_url` and registers with the Envoy listener at
    `concierge.envoy_url`. The Pi reaches neither until the tailnet grant of dispatch://INFRA-4617
@@ -860,9 +1014,9 @@ identity. The fifth recording rule tells the room that a question sent to an age
    ```
 
    The voice reads `voice.enabled` and `voice.engine` at each call, so the journal names no
-   engine: `/api/config` shows which voice speaks
-   (`"voice":{"enabled":true,"engine":"tts","tts_engine":"gemini"}` is voice A, text-to-speech, on Gemini).
-4. Time to first audio of the first sentence: the Gemini engine warms its connection when the voice
+   voice: `/api/config` shows which one speaks (`"voice":{"enabled":true,"engine":"tts"}` with
+   `"tts":{"model":"vertex-us/gemini-3.8-flash-tts","voice":"Kore"}` is voice A, text-to-speech, on Gemini TTS).
+4. Time to first audio of the first sentence: the Gemini TTS engine warms its connection when the voice
    opens, at the wake. Measure it once on the Pi, with and without the warm-up, using the voice
    package's live test (`GHOST_WISPR_LIVE_TTS=gemini ... TestLiveFirstSayTimeToFirstAudio`, built for
    arm64); keep the warm-up only if it lowers the median of the first sentence.
@@ -889,7 +1043,8 @@ reaching a meeting.
 
 Build the arm64 binary on `sami-devbox`, copy the binary and a 16 kHz mono
 question WAV into a private `mktemp -d` on the Pi, and run it as
-`ghost-wispr`:
+`ghost-wispr`, with the workload identity ids of the `openai` provider in
+`deploy/pi/files/ghost-wispr.yaml`:
 
 ```bash
 sudo -u ghost-wispr ./gptlive-probe \
@@ -940,8 +1095,16 @@ with the unit paused and no session active:
    `reach`, `holder-cases` and `tts-first-audio` change nothing on the unit; the others restore it as
    in point 4. `holder-cases` runs `ghost-wispr issue-holder KEY`, which prints the Concierge's
    answer for the issue's holder without opening an Envoy session; `tts-first-audio` runs
-   `ghost-wispr tts-first-audio --engine NAME`, which times each sentence to its first audio frame
-   and plays nothing. `playback-cancel` starts with `ghost-wispr play-sound wake`, which plays the
+   `ghost-wispr tts-first-audio --model PROVIDER/MODEL` for each `--model` (by default the unit's
+   `tts.model`), which times each sentence to its first audio frame and plays nothing. To compare
+   Vertex AI's locations and Aura, and run the whole-clip control:
+
+   ```bash
+   bash accept-voice.sh --step tts-first-audio --model vertex-us/gemini-3.8-flash-tts \
+     --model vertex/gemini-3.8-flash-tts --model deepgram/aura-2-harmonia-en --clip
+   ```
+
+   `playback-cancel` starts with `ghost-wispr play-sound wake`, which plays the
    wake sound once on the speaker as the voice plays it and returns once the speaker's stream has
    closed: how long the rig hears that sound alone is the step's calibration, and a chime after a
    stop may be heard at most 20 ms longer. The steps that read the service's log lines (the voice
@@ -1045,11 +1208,15 @@ a DERP relay count too. The second ping must then say `no matching peer`.
 
 Run both from a tailnet member after the models step. The self-test plants a
 service-account key, a key body inside binary data, a sweep that missed its control, Drive
-sync disabled, a missing Drive folder, a status warning, a superseded model, swapped batch
-and summarization models, a provider-model mismatch, a running model that differs from the
-YAML, an environment override of a model setting, an unapproved Drive writer, and a status
-with no certificate warning; each planted condition must be rejected before the live driver
-runs.
+sync disabled, a missing Drive folder, a status warning, a superseded model, the embedding model
+on another provider, swapped batch and summarization models, deployed providers that differ from
+the plan's, a removed setting at any depth of
+the YAML, a provider-model mismatch, a running model that differs from the YAML, a running
+provider that signs in otherwise than the plan or that the plan does not name, an environment
+override of a model setting, a removed variable in the service environment, an unapproved Drive
+writer, and a status with no
+certificate warning; each planted condition must be rejected before the live driver runs. The
+self-test also checks `deploy/pi/files/ghost-wispr.yaml` itself.
 
 ```bash
 deploy/pi/accept-slice2.sh --self-test
@@ -1109,17 +1276,21 @@ The live driver reports `RAN`, `FAILED`, or `NEEDS-PERSON` for each slice 2 row.
 - A6 requires `/api/config` to show Drive sync on, a folder ID, credentials present, and GC
   enabled with no age limit and the 20000 MB audio budget. After the real session ends, it
   requires `summary.ready`, a synced Drive folder, and a keyword-search result for that session.
-- A8 requires `/api/status` to report no warnings, and the running process's `/api/config`
-  `models` to name the plan's model for every role (live and batch transcription, summaries,
-  embeddings, the voice and its Google settings): a YAML edited after the service started does
-  not change what runs. It also requires the deployed YAML to name them and no environment
-  variable to override them, which is what the next start runs. It then starts one real session
-  and calls summary, semantic search, speech, and batch refinement, and compares the summary's
-  `summary_model`, semantic-search `model`, speech response headers and status model/voice, and
-  refinement `refinement_model` with the configured roles. A provider that does not report its
-  model produces `not reported by provider` (Vertex AI's embeddings never report one). The spec
-  asks that the unit run the plan's models, so A8 passes that role on the model the running
-  process reports for it.
+- A8 requires `/api/status` to report no warnings, and the running process's `/api/config` to
+  name the plan's provider/model for every role under `models` (live and batch transcription,
+  summaries, embeddings, the Concierge, text-to-speech and its voice, voices B and C), and under
+  `providers` to sign in to each provider as the plan says (Vertex AI in the Pi's project at
+  `global` and `us`, OpenAI by workload identity, Deepgram with its key) and to name no other: a
+  YAML edited after the service started does not change what runs. It also requires
+  the deployed YAML to name the roles and exactly the plan's providers, each as the template sets
+  it, and to set no removed setting, and the service environment to
+  override none of them and set no removed variable, which is what the next start runs. It then
+  starts one real session and calls summary, semantic search, speech, and batch refinement, and
+  compares the summary's `summary_model`, semantic-search `model`, speech response headers and
+  status model/voice, and refinement `refinement_model` with the model of each role's
+  provider/model. A provider that does not report its model produces `not reported by provider`.
+  The spec asks that the unit run the plan's models, so A8 passes that role on the model the
+  running process reports for it.
 - A10 checks the member list: the only organizers are the service account and Sami, and the
   approved readers group is the only reader.
 

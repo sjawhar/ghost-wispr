@@ -9,7 +9,7 @@ import (
 
 func TestValidateStartup_AllConfigured(t *testing.T) {
 	cfg := defaults()
-	cfg.DeepgramAPIKey = "dg-test-key"
+	cfg.ProviderKeys = map[string]string{EnvPrefix + "DEEPGRAM_API_KEY": "dg-1"}
 	cfg.GDriveSyncEnabled = true
 	cfg.GDriveFolderID = "folder-123"
 
@@ -28,7 +28,7 @@ func TestValidateStartup_AllConfigured(t *testing.T) {
 
 func TestValidateStartup_MissingDeepgramKey(t *testing.T) {
 	cfg := defaults()
-	cfg.DeepgramAPIKey = ""
+	cfg.ProviderKeys = nil
 
 	status := ValidateStartup(&cfg)
 
@@ -42,7 +42,7 @@ func TestValidateStartup_MissingDeepgramKey(t *testing.T) {
 
 func TestValidateStartup_DriveSyncDisabled(t *testing.T) {
 	cfg := defaults()
-	cfg.DeepgramAPIKey = "key"
+	cfg.ProviderKeys = map[string]string{EnvPrefix + "DEEPGRAM_API_KEY": "key"}
 	cfg.GDriveSyncEnabled = false
 
 	status := ValidateStartup(&cfg)
@@ -54,7 +54,7 @@ func TestValidateStartup_DriveSyncDisabled(t *testing.T) {
 
 func TestValidateStartup_DriveSyncEnabledNoFolderID(t *testing.T) {
 	cfg := defaults()
-	cfg.DeepgramAPIKey = "key"
+	cfg.ProviderKeys = map[string]string{EnvPrefix + "DEEPGRAM_API_KEY": "key"}
 	cfg.GDriveSyncEnabled = true
 	cfg.GDriveFolderID = ""
 
@@ -70,7 +70,7 @@ func TestValidateStartup_DriveSyncEnabledNoFolderID(t *testing.T) {
 
 func TestValidateStartup_DriveSyncFullyConfigured(t *testing.T) {
 	cfg := defaults()
-	cfg.DeepgramAPIKey = "key"
+	cfg.ProviderKeys = map[string]string{EnvPrefix + "DEEPGRAM_API_KEY": "key"}
 	cfg.GDriveSyncEnabled = true
 	cfg.GDriveFolderID = "folder-abc"
 
@@ -83,7 +83,7 @@ func TestValidateStartup_DriveSyncFullyConfigured(t *testing.T) {
 
 func TestValidateStartup_EnabledDisabledLists(t *testing.T) {
 	cfg := defaults()
-	cfg.DeepgramAPIKey = ""
+	cfg.ProviderKeys = nil
 	cfg.GDriveSyncEnabled = false
 
 	status := ValidateStartup(&cfg)

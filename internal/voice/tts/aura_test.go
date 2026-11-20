@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"maps"
 	"net/http"
@@ -17,12 +18,15 @@ import (
 
 	"github.com/gorilla/websocket"
 
+	"github.com/sjawhar/ghost-wispr/internal/config"
+	"github.com/sjawhar/ghost-wispr/internal/providererr"
 	"github.com/sjawhar/ghost-wispr/internal/voice"
 )
 
 // fakeSpeak is Deepgram's /v1/speak WebSocket as a test sees it: it keeps each
 // connection's query and Authorization header and every message the client
-// sent, and answers through onMessage.
+// sent, and answers through onMessage. Its url is the http:// URL a provider
+// names, which the engine dials as ws://.
 type fakeSpeak struct {
 	url       string
 	onMessage func(c *speakConn, typ, text string)
@@ -100,7 +104,7 @@ func startSpeak(t *testing.T, onMessage func(c *speakConn, typ, text string)) *f
 		}
 	}))
 	t.Cleanup(srv.Close)
-	f.url = "ws" + strings.TrimPrefix(srv.URL, "http")
+	f.url = srv.URL
 	return f
 }
 
@@ -151,14 +155,18 @@ func speakBack(audioOf map[string][]byte) func(c *speakConn, typ, text string) {
 	}
 }
 
-// fakeAuraKey is any non-empty key: the fake Deepgram takes it.
-var fakeAuraKey = strings.Repeat("k", 8)
+// deepgramAt is a Deepgram provider at url, signed in with testKey.
+func deepgramAt(url string) *config.Provider {
+	return &config.Provider{API: config.APIDeepgram, URL: url, Auth: keyAuth()}
+}
 
-func newTestAura(t *testing.T, f *fakeSpeak) *Aura {
+// newTestAura is the Aura-2 engine of the fake's Deepgram, in Harmonia's
+// voice.
+func newTestAura(t *testing.T, f *fakeSpeak, opts ...Option) Engine {
 	t.Helper()
-	a, err := NewAura(AuraConfig{APIKey: fakeAuraKey, BaseURL: f.url})
+	a, err := NewEngine(testProvider(t, deepgramAt(f.url), nil), "aura-2-harmonia-en", "", opts...)
 	if err != nil {
-		t.Fatalf("NewAura: %v", err)
+		t.Fatalf("NewEngine: %v", err)
 	}
 	return a
 }
@@ -197,9 +205,9 @@ func TestAuraConnectsWhenTheSessionOpens(t *testing.T) {
 }
 
 // TestAuraAsksForLinear16At24kHzOptedOutWithTheKey fails if the socket does
-// not ask for headerless PCM16 at 24 kHz in the configured voice, does not
+// not ask for headerless PCM16 at 24 kHz in the model's voice, does not
 // keep the text out of Deepgram's model training (mip_opt_out=true), or does
-// not present the key.
+// not present the provider's key as a Deepgram token.
 func TestAuraAsksForLinear16At24kHzOptedOutWithTheKey(t *testing.T) {
 	f := startSpeak(t, speakBack(nil))
 	a := newTestAura(t, f)
@@ -223,8 +231,24 @@ func TestAuraAsksForLinear16At24kHzOptedOutWithTheKey(t *testing.T) {
 			t.Errorf("query %s = %q, want %q", key, got, want)
 		}
 	}
-	if f.auths[0] != "Token "+fakeAuraKey {
-		t.Errorf("Authorization = %q, want the key as a Deepgram token", f.auths[0])
+	if f.auths[0] != "Token "+testKey {
+		t.Errorf("Authorization = %q, want the provider's key as a Deepgram token", f.auths[0])
+	}
+}
+
+// TestAuraSpeaksInTheVoiceItIsGiven fails if a voice given to an Aura engine
+// does not replace the model on the socket: each Aura-2 voice is a model.
+func TestAuraSpeaksInTheVoiceItIsGiven(t *testing.T) {
+	f := startSpeak(t, speakBack(nil))
+	a, err := NewEngine(testProvider(t, deepgramAt(f.url), nil), "aura-2-harmonia-en", "aura-2-thalia-en")
+	if err != nil {
+		t.Fatalf("NewEngine: %v", err)
+	}
+	openSession(t, a, newFakeOutput())
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(f.queries) != 1 || f.queries[0].Get("model") != "aura-2-thalia-en" {
+		t.Fatalf("queries %v, want one socket asking for model aura-2-thalia-en", f.queries)
 	}
 }
 
@@ -445,20 +469,26 @@ func TestAuraStallFailsTheSayWithDeepgramsWarning(t *testing.T) {
 
 // TestAuraRefusedHandshakeKeepsOnlyItsStatus fails if Deepgram's refusal of
 // the socket keeps its status text or its dg-error header, which can quote
-// the text asked for, instead of the status code alone.
+// the text asked for, instead of the status code alone; or is no
+// providererr.Error of the provider's answer, named as the config names the
+// provider, which the speak API's tts warning reads.
 func TestAuraRefusedHandshakeKeepsOnlyItsStatus(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("dg-error", "Could not speak "+auraPlanted)
 		w.WriteHeader(http.StatusBadRequest)
 	}))
 	t.Cleanup(server.Close)
-	a, err := NewAura(AuraConfig{APIKey: fakeAuraKey, BaseURL: "ws" + strings.TrimPrefix(server.URL, "http")})
+	a, err := NewEngine(testProvider(t, deepgramAt(server.URL), nil), "aura-2-harmonia-en", "")
 	if err != nil {
 		t.Fatal(err)
 	}
 	err = a.Stream(context.Background(), "hello", func([]byte) error { return nil })
 	if err == nil || !strings.Contains(err.Error(), "HTTP 400") || strings.Contains(err.Error(), auraPlanted) || strings.Contains(err.Error(), "Bad Request") {
 		t.Fatalf("Stream = %v, want the refusal's status code alone", err)
+	}
+	var refusal *providererr.Error
+	if !errors.As(err, &refusal) || refusal.Provider != "tts" || refusal.Status != http.StatusBadRequest {
+		t.Fatalf("Stream = %v (%#v), want a providererr.Error of the provider tts's HTTP 400", err, refusal)
 	}
 }
 
@@ -491,14 +521,11 @@ func TestAuraTellsDialedTheURLOfEachSocket(t *testing.T) {
 	f := startSpeak(t, speakBack(map[string][]byte{"hello": ramp(0, 1000)}))
 	var mu sync.Mutex
 	var dialed []*url.URL
-	a, err := NewAura(AuraConfig{APIKey: fakeAuraKey, BaseURL: f.url, Dialed: func(u *url.URL) {
+	a := newTestAura(t, f, WithDialed(func(u *url.URL) {
 		mu.Lock()
 		defer mu.Unlock()
 		dialed = append(dialed, u)
-	}})
-	if err != nil {
-		t.Fatalf("NewAura: %v", err)
-	}
+	}))
 	openSession(t, a, newFakeOutput())
 	if err := a.Stream(context.Background(), "hello", func([]byte) error { return nil }); err != nil {
 		t.Fatalf("Stream: %v", err)
@@ -517,9 +544,20 @@ func TestAuraTellsDialedTheURLOfEachSocket(t *testing.T) {
 	}
 }
 
-// TestNewAuraRequiresAKey fails if an Aura engine can be made without a key.
-func TestNewAuraRequiresAKey(t *testing.T) {
-	if _, err := NewAura(AuraConfig{}); err == nil {
-		t.Fatal("NewAura without a key succeeded")
+// TestAuraWithoutItsKeyDoesNotOpen fails if a Session opens on a Deepgram
+// provider whose key is not set, or the failure does not say so.
+func TestAuraWithoutItsKeyDoesNotOpen(t *testing.T) {
+	f := startSpeak(t, speakBack(nil))
+	p := deepgramAt(f.url)
+	p.Auth.Env = "EXAMPLE_UNSET_KEY"
+	a, err := NewEngine(testProvider(t, p, nil), "aura-2-harmonia-en", "")
+	if err != nil {
+		t.Fatalf("NewEngine: %v", err)
+	}
+	if _, err := New(a).Open(context.Background(), &voice.Exchange{Out: newFakeOutput()}); err == nil || !strings.Contains(err.Error(), "not set") {
+		t.Fatalf("Open = %v, want a failure saying the key is not set", err)
+	}
+	if n := f.connections(); n != 0 {
+		t.Fatalf("Deepgram had %d connections, want none without a key", n)
 	}
 }

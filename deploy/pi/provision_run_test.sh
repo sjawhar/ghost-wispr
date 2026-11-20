@@ -247,6 +247,11 @@ grep -Fxq "GHOST_WISPR_$deepgram_key_name=deepgram-key" "$env_file" || fail "the
 if grep -q 'ENVOY_WEBHOOK_SECRET' "$env_file"; then
   fail "the installed .env still holds an Envoy webhook secret"
 fi
+# The full provisioner writes .env anew, with only variables Ghost Wispr reads: no variable of a
+# setting that providers replaced, such as the Vertex embedding location, which a start warns about.
+env_names=$(cut -d= -f1 "$env_file" | LC_ALL=C sort | tr '\n' ' ')
+[[ $env_names == "GHOST_WISPR_ADDR GHOST_WISPR_$deepgram_key_name GOOGLE_API_USE_CLIENT_CERTIFICATE " ]] \
+  || fail "the installed .env sets $env_names, want GHOST_WISPR_ADDR, GHOST_WISPR_$deepgram_key_name and GOOGLE_API_USE_CLIENT_CERTIFICATE"
 # Without a dispatch-token in the bundle, the .env gives the meeting voice no Dispatch token.
 dispatch_token_name="DISPATCH""_TOKEN"
 if grep -q "^GHOST_WISPR_$dispatch_token_name=" "$env_file"; then

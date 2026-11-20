@@ -2,23 +2,10 @@ package main
 
 import (
 	"fmt"
-	"os"
 	"path/filepath"
 
 	"github.com/sjawhar/ghost-wispr/internal/config"
 )
-
-const defaultConfigPath = "ghost-wispr.yaml"
-
-// configPathFromEnvironment returns the configuration file the recorder and
-// its subcommands load: GHOST_WISPR_CONFIG, else ghost-wispr.yaml in the
-// working directory.
-func configPathFromEnvironment() string {
-	if configPath := os.Getenv(config.EnvPrefix + "CONFIG"); configPath != "" {
-		return configPath
-	}
-	return defaultConfigPath
-}
 
 // loadRuntimeConfig loads configPath and the .env file beside it, as the
 // recorder runs with them.

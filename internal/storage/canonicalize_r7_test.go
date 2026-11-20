@@ -25,7 +25,7 @@ func TestR7CanonicalizeKeepsTheDeleteOutUntilItWrites(t *testing.T) {
 	}
 	canonicalizedResult := make(chan canonicalized, 1)
 	go func() {
-		transcript, generation, err := store.canonicalize("s", func() {
+		transcript, _, generation, err := store.canonicalize("s", false, func() {
 			close(read)
 			<-allowWrite
 		})

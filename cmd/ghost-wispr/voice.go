@@ -13,7 +13,7 @@ import (
 
 	"github.com/sjawhar/ghost-wispr/internal/audio"
 	"github.com/sjawhar/ghost-wispr/internal/config"
-	"github.com/sjawhar/ghost-wispr/internal/googleauth"
+	"github.com/sjawhar/ghost-wispr/internal/providers"
 	"github.com/sjawhar/ghost-wispr/internal/server"
 	"github.com/sjawhar/ghost-wispr/internal/voice"
 	"github.com/sjawhar/ghost-wispr/internal/voice/dgagent"
@@ -177,7 +177,7 @@ func wireVoiceToCapture(capture *captureGate, link *voiceLink, conc *conciergeHo
 // They are the wake phrases, then Dispatch's project keys, so "infra" is
 // not heard as "in for" (R4). Only Nova-3 takes keyterms.
 func voiceKeyterms(cfg *config.Config, projects []string) []string {
-	if !cfg.SpeakerEnabled || !strings.HasPrefix(cfg.DeepgramModel, "nova-3") {
+	if !cfg.SpeakerEnabled || !strings.HasPrefix(liveTranscriptionModel(cfg), "nova-3") {
 		return nil
 	}
 	return transcript.Keyterms(cfg.Voice.WakePhrases, projects)
@@ -253,13 +253,13 @@ func (v *voiceSource) apply(ctx context.Context, cfg *config.Config) {
 	var build func() (voice.Voice, error)
 	switch cfg.Voice.Engine {
 	case config.VoiceEngineTTS:
-		key = strings.Join([]string{cfg.Voice.Engine, cfg.Voice.TTSEngine, cfg.Voice.TTSModel, cfg.Voice.TTSVoice, cfg.Voice.TTSLocation, cfg.GCPProject, cfg.GoogleCredentialsFile, cfg.DeepgramAPIKey}, "\x00")
-		build = func() (voice.Voice, error) { return newVoiceA(ctx, cfg) }
+		key = strings.Join([]string{cfg.Voice.Engine, cfg.TTS.Model, cfg.TTS.Voice, providersKey(cfg)}, "\x00")
+		build = func() (voice.Voice, error) { return newVoiceA(cfg) }
 	case config.VoiceEngineGPTLive:
-		key = strings.Join([]string{cfg.Voice.Engine, cfg.Voice.GPTLive.OpenAIIdentityProviderID, cfg.Voice.GPTLive.OpenAIServiceAccountID, cfg.GoogleCredentialsFile}, "\x00")
+		key = strings.Join([]string{cfg.Voice.Engine, cfg.Voice.GPTLive.Model, providersKey(cfg)}, "\x00")
 		build = func() (voice.Voice, error) { return newVoiceB(cfg) }
 	case config.VoiceEngineDGAgent:
-		key = strings.Join(append([]string{cfg.Voice.Engine, cfg.DeepgramAPIKey, cfg.Voice.DGAgent.ThinkModel}, cfg.Voice.WakePhrases...), "\x00")
+		key = strings.Join(append([]string{cfg.Voice.Engine, cfg.Voice.DGAgent.Provider, cfg.Voice.DGAgent.ThinkModel, providersKey(cfg)}, cfg.Voice.WakePhrases...), "\x00")
 		build = func() (voice.Voice, error) { return newVoiceC(cfg) }
 	default:
 		v.set("", nil, fmt.Errorf("voice.engine %q is not in this build; use %q, %q or %q", cfg.Voice.Engine, config.VoiceEngineTTS, config.VoiceEngineGPTLive, config.VoiceEngineDGAgent))
@@ -309,26 +309,33 @@ func voiceTiming(logger *slog.Logger) func(event, sessionID string, at time.Time
 	}
 }
 
-// newVoiceB builds voice B: GPT-Live with the unit's own OpenAI identity,
-// an access token exchanged for its Google ID token (voice.gptlive).
+// newVoiceB builds voice B: GPT-Live on the OpenAI provider
+// voice.gptlive.model names, signed in as that provider signs in (by OpenAI
+// workload identity on the office Pi).
 func newVoiceB(cfg *config.Config) (voice.Voice, error) {
-	credentials := cfg.GoogleCredentialsFile
-	tokens, err := gptlive.NewTokenSource(&gptlive.TokenConfig{
-		IdentityProviderID: cfg.Voice.GPTLive.OpenAIIdentityProviderID,
-		ServiceAccountID:   cfg.Voice.GPTLive.OpenAIServiceAccountID,
-		Subject: func(ctx context.Context, audience string) (string, error) {
-			return googleauth.IDToken(ctx, credentials, audience)
-		},
-	})
+	p, model, err := unitProviders.of(cfg).Model(cfg, config.RoleGPTLive, cfg.Voice.GPTLive.Model)
 	if err != nil {
-		return nil, fmt.Errorf("voice B: %w (set voice.gptlive.openai_identity_provider_id and openai_service_account_id)", err)
+		return nil, fmt.Errorf("voice B: %w", err)
 	}
-	return gptlive.New(gptlive.Config{Token: tokens.Token})
+	if err := p.Ready(); err != nil {
+		return nil, fmt.Errorf("voice B: %w", err)
+	}
+	return gptlive.New(gptlive.Config{URL: socketURL(p, "/live/sessions"), Model: model, Token: p.Credential})
 }
 
-// newVoiceA builds voice A on the text-to-speech engine cfg names.
-func newVoiceA(ctx context.Context, cfg *config.Config) (voice.Voice, error) {
-	engine, err := voiceAEngine(ctx, cfg, nil)
+// socketURL is the WebSocket URL of path on a provider that names a url
+// (providers.Provider.SocketURL); "" when it names none, for the client's
+// default.
+func socketURL(p *providers.Provider, path string) string {
+	if p.URL == "" {
+		return ""
+	}
+	return p.SocketURL() + path
+}
+
+// newVoiceA builds voice A on the text-to-speech model tts.model names.
+func newVoiceA(cfg *config.Config) (voice.Voice, error) {
+	engine, err := voiceAEngine(cfg, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -338,67 +345,67 @@ func newVoiceA(ctx context.Context, cfg *config.Config) (voice.Voice, error) {
 // voiceAOptions is what ghost-wispr tts-first-audio adds to voice A's engine.
 // The unit's voice adds nothing (nil).
 type voiceAOptions struct {
-	deepgramBaseURL string         // replaces Deepgram's address, for tests
-	vertexBaseURL   string         // replaces Vertex AI's host, for tests
-	auraDialed      func(*url.URL) // told the URL of each Aura socket
+	auraDialed func(*url.URL) // told the URL of each Aura socket
 }
 
-// voiceAEngine builds the text-to-speech engine of voice A that cfg names.
-func voiceAEngine(ctx context.Context, cfg *config.Config, opts *voiceAOptions) (voicetts.Engine, error) {
+// voiceAEngine builds the text-to-speech engine of tts.model and tts.voice.
+func voiceAEngine(cfg *config.Config, opts *voiceAOptions) (voicetts.Engine, error) {
 	if opts == nil {
 		opts = &voiceAOptions{}
 	}
-	switch cfg.Voice.TTSEngine {
-	case config.TTSEngineAura:
-		model := cfg.Voice.TTSVoice
-		if model == "" {
-			model = cfg.Voice.TTSModel
-		}
-		engine, err := voicetts.NewAura(voicetts.AuraConfig{APIKey: cfg.DeepgramAPIKey, Model: model, BaseURL: opts.deepgramBaseURL, Dialed: opts.auraDialed})
-		if err != nil {
-			return nil, fmt.Errorf("voice A on Aura: %w", err)
-		}
-		return engine, nil
-	case config.TTSEngineGemini:
-		credentials, err := googleauth.Detect(ctx, cfg.GoogleCredentialsFile, googleauth.CloudPlatformScope)
-		if err != nil {
-			return nil, fmt.Errorf("voice A on Gemini: detect Google credentials: %w", err)
-		}
-		engine, err := voicetts.NewGemini(&voicetts.GeminiConfig{
-			Project:     cfg.GCPProject,
-			Location:    cfg.Voice.TTSLocation,
-			Model:       cfg.Voice.TTSModel,
-			Voice:       cfg.Voice.TTSVoice,
-			Credentials: credentials,
-			BaseURL:     opts.vertexBaseURL,
-		})
-		if err != nil {
-			return nil, fmt.Errorf("voice A on Gemini: %w", err)
-		}
-		return engine, nil
-	default:
-		return nil, fmt.Errorf("voice.tts_engine %q is not one of %q, %q", cfg.Voice.TTSEngine, config.TTSEngineGemini, config.TTSEngineAura)
+	if strings.TrimSpace(cfg.TTS.Model) == "" {
+		return nil, errors.New("voice A: set tts.model to the provider/model it speaks with")
 	}
+	p, model, err := unitProviders.of(cfg).Model(cfg, config.RoleTTS, cfg.TTS.Model)
+	if err == nil {
+		err = p.Ready()
+	}
+	if err != nil {
+		return nil, fmt.Errorf("voice A: %w", err)
+	}
+	engine, err := voicetts.NewEngine(p, model, cfg.TTS.Voice, voicetts.WithDialed(opts.auraDialed))
+	if err != nil {
+		return nil, fmt.Errorf("voice A on %s: %w", cfg.TTS.Model, err)
+	}
+	return engine, nil
 }
 
 // newVoiceC builds voice C on Deepgram's Voice Agent.
 func newVoiceC(cfg *config.Config) (voice.Voice, error) {
-	agent, err := dgagent.New(voiceCConfig(cfg))
+	c, err := voiceCConfig(cfg)
+	if err != nil {
+		return nil, fmt.Errorf("voice C: %w", err)
+	}
+	agent, err := dgagent.New(c)
 	if err != nil {
 		return nil, fmt.Errorf("voice C: %w", err)
 	}
 	return agent, nil
 }
 
-// voiceCConfig is voice C's configuration: the unit's Deepgram key, the
-// wake phrases as keyterms, so Flux hears the name the room calls the
-// voice by, and the model voice.dgagent.think_model names.
-func voiceCConfig(cfg *config.Config) *dgagent.Config {
+// voiceCConfig is voice C's configuration: the key of the Deepgram provider
+// voice.dgagent.provider names (Deepgram has no workload identity), the wake
+// phrases as keyterms, so Flux hears the name the room calls the voice by,
+// and the model voice.dgagent.think_model names.
+func voiceCConfig(cfg *config.Config) (*dgagent.Config, error) {
+	m, err := cfg.ResolveProvider(config.RoleVoiceAgent, cfg.Voice.DGAgent.Provider)
+	if err != nil {
+		return nil, err
+	}
+	p, err := unitProviders.of(cfg).Get(m.Provider)
+	if err != nil {
+		return nil, err
+	}
+	key, err := p.Credential(context.Background())
+	if err != nil {
+		return nil, err
+	}
 	return &dgagent.Config{
-		APIKey:     cfg.DeepgramAPIKey,
+		APIKey:     key,
+		URL:        socketURL(p, "/v1/agent/converse"),
 		Keyterms:   transcript.Keyterms(cfg.Voice.WakePhrases, nil),
 		ThinkModel: cfg.Voice.DGAgent.ThinkModel,
-	}
+	}, nil
 }
 
 // wireVoiceSessionHooks makes every session end reach the Concierge and the

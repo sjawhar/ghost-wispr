@@ -247,31 +247,6 @@ func TestStore_ConcurrentAccess(t *testing.T) {
 	wg.Wait()
 }
 
-func TestValidateModelFormat(t *testing.T) {
-	tests := []struct {
-		model string
-		valid bool
-	}{
-		{"openai/gpt-4o", true},
-		{"anthropic/claude-3-5-sonnet-latest", true},
-		{"gemini/gemini-2.5-flash", true},
-		{"no-slash", false},
-		{"/no-provider", false},
-		{"no-model/", false},
-		{"", false},
-	}
-
-	for _, tt := range tests {
-		err := validateModelFormat(tt.model)
-		if tt.valid && err != nil {
-			t.Errorf("expected %q to be valid, got error: %v", tt.model, err)
-		}
-		if !tt.valid && err == nil {
-			t.Errorf("expected %q to be invalid, got nil error", tt.model)
-		}
-	}
-}
-
 func TestNewStoreWithEnv_LoadsSecretsFromEnvFile(t *testing.T) {
 	clearEnv(t)
 	dir := t.TempDir()
@@ -292,11 +267,11 @@ func TestNewStoreWithEnv_LoadsSecretsFromEnvFile(t *testing.T) {
 	}
 
 	cfg := store.Get()
-	if cfg.OpenAIAPIKey != "sk-from-env-file" {
-		t.Fatalf("expected key from .env file, got %q", cfg.OpenAIAPIKey)
+	if got := cfg.APIKey("openai"); got != "sk-from-env-file" {
+		t.Fatalf("expected key from .env file, got %q", got)
 	}
-	if cfg.DeepgramAPIKey != "dg-key" {
-		t.Fatalf("expected deepgram key from .env file, got %q", cfg.DeepgramAPIKey)
+	if got := cfg.APIKey("deepgram"); got != "dg-key" {
+		t.Fatalf("expected deepgram key from .env file, got %q", got)
 	}
 }
 
@@ -321,8 +296,8 @@ func TestNewStoreWithEnv_EnvVarOverridesEnvFile(t *testing.T) {
 	}
 
 	cfg := store.Get()
-	if cfg.OpenAIAPIKey != "from-env-var" {
-		t.Fatalf("env var should override .env file, got %q", cfg.OpenAIAPIKey)
+	if got := cfg.APIKey("openai"); got != "from-env-var" {
+		t.Fatalf("env var should override .env file, got %q", got)
 	}
 }
 
@@ -341,7 +316,7 @@ func TestStore_Update_WritesSecretsToEnvFile(t *testing.T) {
 	}
 
 	if err := store.Update(func(c *Config) {
-		c.OpenAIAPIKey = "sk-test-key"
+		_ = c.SetAPIKey("openai", "sk-test-key")
 	}); err != nil {
 		t.Fatalf("Update failed: %v", err)
 	}
@@ -375,7 +350,7 @@ func TestStore_Update_PreservesExistingEnvEntries(t *testing.T) {
 	}
 
 	if err := store.Update(func(c *Config) {
-		c.OpenAIAPIKey = "sk-new"
+		_ = c.SetAPIKey("openai", "sk-new")
 	}); err != nil {
 		t.Fatalf("Update failed: %v", err)
 	}
@@ -455,7 +430,7 @@ func TestWriteEnvFile_SortsKeysAlphabetically(t *testing.T) {
 	}
 
 	if err := store.Update(func(c *Config) {
-		c.OpenAIAPIKey = "sk-sorted"
+		_ = c.SetAPIKey("openai", "sk-sorted")
 	}); err != nil {
 		t.Fatalf("Update failed: %v", err)
 	}

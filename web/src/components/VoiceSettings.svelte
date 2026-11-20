@@ -1,5 +1,5 @@
 <script lang="ts">
-  import type { ConfigResponse, TTSEngine, VoiceEngine } from '../lib/config-api'
+  import type { ConfigPatch, ConfigResponse, VoiceEngine } from '../lib/config-api'
   import { patchConfig } from '../lib/config-api'
   import { setConfig } from '../lib/config.svelte'
 
@@ -14,29 +14,42 @@
     { value: 'gptlive', label: 'Speech-to-speech: OpenAI GPT-Live (gptlive)' },
     { value: 'dgagent', label: 'Voice agent: Deepgram (dgagent)' },
   ]
-  const ttsEngines: { value: TTSEngine; label: string }[] = [
-    { value: 'gemini', label: 'Gemini' },
-    { value: 'aura', label: 'Aura' },
-  ]
 
+  // answered is what the unit answered the last save: a save sends the fields
+  // that differ from it (from config before the first), and after a save the
+  // fields show what the unit answered (a new model's voice is its default).
+  let answered: ConfigResponse | undefined
   let enabled = $state(config.voice.enabled)
   let engine = $state(config.voice.engine)
-  let ttsEngine = $state(config.voice.tts_engine)
+  let ttsModel = $state(config.tts.model)
+  let ttsVoice = $state(config.tts.voice)
   let saving = $state(false)
   let feedback = $state('')
 
   async function save(): Promise<void> {
-    const voice: Partial<ConfigResponse['voice']> = {}
-    if (enabled !== config.voice.enabled) {
+    const saved = answered ?? config
+    const voice: NonNullable<ConfigPatch['voice']> = {}
+    if (enabled !== saved.voice.enabled) {
       voice.enabled = enabled
     }
-    if (engine !== config.voice.engine) {
+    if (engine !== saved.voice.engine) {
       voice.engine = engine
     }
-    if (ttsEngine !== config.voice.tts_engine) {
-      voice.tts_engine = ttsEngine
+    const tts: NonNullable<ConfigPatch['tts']> = {}
+    if (ttsModel.trim() !== saved.tts.model) {
+      tts.model = ttsModel.trim()
     }
-    if (Object.keys(voice).length === 0) {
+    if (ttsVoice.trim() !== saved.tts.voice) {
+      tts.voice = ttsVoice.trim()
+    }
+    const patch: ConfigPatch = {}
+    if (Object.keys(voice).length > 0) {
+      patch.voice = voice
+    }
+    if (Object.keys(tts).length > 0) {
+      patch.tts = tts
+    }
+    if (!patch.voice && !patch.tts) {
       feedback = 'No changes to save.'
       return
     }
@@ -44,8 +57,13 @@
     saving = true
     feedback = ''
     try {
-      const updated = await patchConfig({ voice })
+      const updated = await patchConfig(patch)
       setConfig(updated)
+      answered = updated
+      enabled = updated.voice.enabled
+      engine = updated.voice.engine
+      ttsModel = updated.tts.model
+      ttsVoice = updated.tts.voice
       feedback = 'Saved!'
     } catch (error) {
       feedback = error instanceof Error ? error.message : 'Save failed'
@@ -72,15 +90,28 @@
   </fieldset>
 
   {#if engine === 'tts'}
-    <fieldset class="choices">
-      <legend>Text-to-speech provider</legend>
-      {#each ttsEngines as option (option.value)}
-        <label class="choice">
-          <input type="radio" name="voice-tts-engine" value={option.value} bind:group={ttsEngine} />
-          {option.label}
-        </label>
-      {/each}
-    </fieldset>
+    <div class="field">
+      <label for="tts-model">Text-to-speech model</label>
+      <input
+        id="tts-model"
+        type="text"
+        bind:value={ttsModel}
+        placeholder="provider/model, such as vertex/gemini-3.8-flash-tts"
+      />
+      <p class="hint">
+        As provider/model: the provider is one of the Model providers under Integrations. Empty
+        turns text-to-speech off.
+      </p>
+    </div>
+    <div class="field">
+      <label for="tts-voice">Text-to-speech voice</label>
+      <input
+        id="tts-voice"
+        type="text"
+        bind:value={ttsVoice}
+        placeholder="The model's default voice"
+      />
+    </div>
   {/if}
 
   <p class="hint">Changes apply from the next call; no restart.</p>
@@ -148,6 +179,26 @@
      wraps keeps its radio beside its first words. */
   .choice input {
     margin-block: calc((1lh - 13px) / 2) 0;
+  }
+
+  .field {
+    display: flex;
+    flex-direction: column;
+    gap: 0.25rem;
+  }
+
+  .field label {
+    font-weight: 600;
+    font-size: 0.85rem;
+  }
+
+  .field input {
+    padding: 0.5rem;
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    font-family: var(--font-mono);
+    font-size: 0.85rem;
+    background: var(--panel);
   }
 
   .hint {

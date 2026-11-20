@@ -7,6 +7,8 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/sjawhar/ghost-wispr/internal/config"
 )
 
 func TestAnthropicCompleteSeparatesSystemPrompt(t *testing.T) {
@@ -70,9 +72,9 @@ func TestAnthropicCompleteSeparatesSystemPrompt(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client, err := newAnthropicClient("test-key", "claude-3-5-sonnet-20240620", &clientOptions{baseURL: server.URL})
+	client, err := NewClient(keyProvider(t, config.APIAnthropic, server.URL), "claude-3-5-sonnet-20240620")
 	if err != nil {
-		t.Fatalf("newAnthropicClient failed: %v", err)
+		t.Fatalf("NewClient failed: %v", err)
 	}
 
 	got, err := client.Complete(context.Background(), []Message{
@@ -107,9 +109,9 @@ func TestAnthropic_Complete_EmptyContent(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client, err := newAnthropicClient("test-key", "claude-3-5-sonnet-20240620", &clientOptions{baseURL: server.URL})
+	client, err := NewClient(keyProvider(t, config.APIAnthropic, server.URL), "claude-3-5-sonnet-20240620")
 	if err != nil {
-		t.Fatalf("newAnthropicClient failed: %v", err)
+		t.Fatalf("NewClient failed: %v", err)
 	}
 
 	_, err = client.Complete(context.Background(), []Message{{Role: "user", Content: "hello"}})
@@ -151,9 +153,9 @@ func TestAnthropic_MaxTokens(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client, err := newAnthropicClient("test-key", "claude-3-5-sonnet-20240620", &clientOptions{baseURL: server.URL})
+	client, err := NewClient(keyProvider(t, config.APIAnthropic, server.URL), "claude-3-5-sonnet-20240620")
 	if err != nil {
-		t.Fatalf("newAnthropicClient failed: %v", err)
+		t.Fatalf("NewClient failed: %v", err)
 	}
 
 	_, err = client.Complete(context.Background(), []Message{{Role: "user", Content: "hello"}})

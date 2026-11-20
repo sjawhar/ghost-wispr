@@ -22,42 +22,58 @@ readonly deployed_config=/opt/ghost-wispr/ghost-wispr.yaml
 readonly service_account=$PI_SERVICE_ACCOUNT
 readonly drive_owner=$PI_DRIVE_OWNER
 readonly cert_test_port=8081
-readonly summarization_model=gemini/gemini-4-carbon
-readonly summary_provider_model=gemini-4-carbon
-readonly embedding_model=gemini-embedding-2
-readonly batch_refinement_model=nova-3
-readonly tts_model=gemini-3.8-flash-tts
+# Each role's provider/model in the plan, as deploy/pi/files/ghost-wispr.yaml and GET /api/config
+# name it.
+readonly transcription_model=deepgram/nova-3
+readonly summarization_model=vertex/gemini-4-carbon
+readonly embedding_model=vertex/gemini-embedding-2
+readonly concierge_model=vertex/gemini-3.5-flash-lite
+readonly tts_model=vertex-us/gemini-3.8-flash-tts
 readonly tts_voice=Kore
+readonly gptlive_model=openai/gpt-live-1
+readonly dgagent_provider=deepgram
+# The model each provider reports for its role: the model part of the role's provider/model.
+readonly summary_provider_model=${summarization_model#*/}
+readonly search_provider_model=${embedding_model#*/}
+readonly speech_provider_model=${tts_model#*/}
+readonly refinement_provider_model=${transcription_model#*/}
 readonly model_not_reported='not reported by provider'
 expected_config_lines=(
-  "deepgram_model: $batch_refinement_model"
-  'batch_transcription.provider: deepgram'
-  "batch_transcription.model: $batch_refinement_model"
+  "transcription.model: $transcription_model"
+  "batch_transcription.model: $transcription_model"
   "summarization.model: $summarization_model"
-  "embedding_model: gemini/$embedding_model"
-  'genai_backend: vertex'
-  "gcp_project: $PI_GCP_PROJECT"
-  'gcp_location: global'
-  'tts_provider: gemini'
-  "tts_model: $tts_model"
-  "tts_voice: $tts_voice"
+  "embedding.model: $embedding_model"
+  "concierge.model: $concierge_model"
+  "tts.model: $tts_model"
+  "tts.voice: $tts_voice"
+)
+# The settings that providers replaced (internal/config, removedSettings): a start that finds one
+# warns, and the role it set is off.
+removed_settings=(
+  genai_backend gcp_project gcp_location embedding_model deepgram_model tts_provider tts_model tts_voice
+  tts_max_length summarization.base_url batch_transcription.provider voice.tts_engine voice.tts_model
+  voice.tts_voice voice.tts_location voice.gptlive.openai_identity_provider_id
+  voice.gptlive.openai_service_account_id
 )
 # Environment variables that override the YAML settings above (internal/config/config.go applyEnvOverrides).
 config_override_variables=(
-  GHOST_WISPR_DEEPGRAM_MODEL
-  GHOST_WISPR_BATCH_TRANSCRIPTION_PROVIDER
+  GHOST_WISPR_TRANSCRIPTION_MODEL
   GHOST_WISPR_BATCH_TRANSCRIPTION_MODEL
   GHOST_WISPR_SUMMARIZATION_MODEL
   GHOST_WISPR_EMBEDDING_MODEL
-  GHOST_WISPR_EMBEDDING_BACKEND
-  GHOST_WISPR_GENAI_BACKEND
-  GHOST_WISPR_GCP_PROJECT
-  GHOST_WISPR_GCP_LOCATION
+  GHOST_WISPR_CONCIERGE_MODEL
   GHOST_WISPR_GDRIVE_FOLDER_ID
   GHOST_WISPR_GOOGLE_CREDENTIALS_FILE
-  GHOST_WISPR_TTS_PROVIDER
   GHOST_WISPR_TTS_MODEL
   GHOST_WISPR_TTS_VOICE
+)
+# The variables of the settings that providers replaced (internal/config, removedEnvironment), which
+# provision.sh --models removes from .env: a start that finds one warns.
+removed_variables=(
+  GHOST_WISPR_GCP_PROJECT GHOST_WISPR_GCP_LOCATION GHOST_WISPR_GENAI_BACKEND GHOST_WISPR_EMBEDDING_BACKEND
+  GHOST_WISPR_EMBEDDING_LOCATION GHOST_WISPR_DEEPGRAM_MODEL GHOST_WISPR_BATCH_TRANSCRIPTION_PROVIDER
+  GHOST_WISPR_TTS_PROVIDER GHOST_WISPR_TTS_API_KEY GHOST_WISPR_VOICE_TTS_ENGINE GHOST_WISPR_VOICE_TTS_MODEL
+  GHOST_WISPR_VOICE_TTS_VOICE GHOST_WISPR_VOICE_TTS_LOCATION
 )
 
 usage() {
@@ -186,15 +202,30 @@ assert_no_warnings() {
   jq -e 'has("warnings") and (.warnings | type == "array" and length == 0)' >/dev/null <<<"$1"
 }
 
-# flatten_yaml prints top-level lines as they are and indented lines as
-# "parent.key: value", so a nested model is checked under its own parent.
+# flatten_yaml prints each setting of a YAML file written one setting a line as its dotted path and
+# value ("tts.model: vertex-us/gemini-3.8-flash-tts"), at any depth and any indentation, as yaml.v3
+# writes it too, so a setting is checked under its own parents. A setting with settings under it
+# prints as "path:". Comments, blank lines and list items are left out.
 flatten_yaml() {
   awk '
-    /^[^[:space:]#][^:]*:/ { parent = $0; sub(/:.*/, "", parent); print; next }
-    /^[[:space:]]+[^[:space:]#][^:]*:/ { line = $0; sub(/^[[:space:]]+/, "", line); print parent "." line }
+    /^[[:space:]]*(#|-|$)/ { next }
+    {
+      indent = match($0, /[^[:space:]]/) - 1
+      line = substr($0, indent + 1)
+      if (line !~ /^[^:]+:([[:space:]]|$)/) next
+      while (depth > 0 && indents[depth] >= indent) depth--
+      key = line; sub(/:.*/, "", key)
+      value = line; sub(/^[^:]*:[[:space:]]*/, "", value); sub(/[[:space:]]+#.*$/, "", value)
+      path = depth > 0 ? paths[depth] "." key : key
+      print (value == "" ? path ":" : path ": " value)
+      depth++; indents[depth] = indent; paths[depth] = path
+    }
   '
 }
 
+# assert_expected_config YAML: the deployed YAML, which the next start runs, names the plan's
+# provider/model for every role and the plan's providers, and sets no setting that providers
+# replaced.
 assert_expected_config() {
   local flattened line
   flattened=$(flatten_yaml <<<"$1")
@@ -204,29 +235,58 @@ assert_expected_config() {
       return 1
     fi
   done
+  assert_expected_providers "$flattened" || return 1
+  assert_no_removed_settings "$flattened"
 }
 
-# The model, provider or Google setting of each role that /api/config reports under "models", as
-# the running process resolved its configuration, and the value the plan names.
+# assert_expected_providers FLATTENED: a flattened deployed YAML names exactly the providers the
+# plan (the template the models step installs) names, each with the plan's settings, whatever their
+# order and indentation: the next start signs in to each as the plan says.
+assert_expected_providers() {
+  local flattened=$1 planned deployed
+  planned=$(flatten_yaml <"$plan_yaml" | grep '^providers[.:]' | LC_ALL=C sort) || true
+  if [[ -z $planned ]]; then
+    printf 'cannot read the providers of %s, the plan to compare the configuration with\n' "$plan_yaml" >&2
+    return 1
+  fi
+  deployed=$(grep '^providers[.:]' <<<"$flattened" | LC_ALL=C sort) || true
+  if [[ $deployed != "$planned" ]]; then
+    printf 'configuration providers differ from the plan (< plan, > configuration):\n%s\n' \
+      "$(diff <(printf '%s\n' "$planned") <(printf '%s\n' "$deployed") | grep '^[<>]')" >&2
+    return 1
+  fi
+}
+
+# assert_no_removed_settings FLATTENED: a flattened YAML sets no setting that providers replaced.
+assert_no_removed_settings() {
+  local flattened=$1 path
+  for path in "${removed_settings[@]}"; do
+    if grep -q "^${path//./[.]}:" <<<"$flattened"; then
+      printf 'configuration still sets %s, which providers replaced\n' "$path" >&2
+      return 1
+    fi
+  done
+}
+
+# Each role's provider/model that /api/config reports under "models", as the running process
+# resolved its configuration, and the value the plan names. It reports exactly these roles.
 expected_running_models=(
-  "live_transcription=$batch_refinement_model"
-  'batch_transcription_provider=deepgram'
-  "batch_transcription=$batch_refinement_model"
+  "live_transcription=$transcription_model"
+  "batch_transcription=$transcription_model"
   "summarization=$summarization_model"
-  "embedding=gemini/$embedding_model"
-  'genai_backend=vertex'
-  "gcp_project=$PI_GCP_PROJECT"
-  'gcp_location=global'
-  'tts_provider=gemini'
+  "embedding=$embedding_model"
+  "concierge=$concierge_model"
   "tts=$tts_model"
   "tts_voice=$tts_voice"
+  "gptlive=$gptlive_model"
+  "dgagent_provider=$dgagent_provider"
 )
 
 # assert_running_models CONFIG: the running process (its /api/config response, CONFIG) runs the
-# plan's model for every role. The deployed YAML says what the next start runs; a YAML edited
-# after the service started does not change what runs now.
+# plan's provider/model for every role. The deployed YAML says what the next start runs; a YAML
+# edited after the service started does not change what runs now.
 assert_running_models() {
-  local config=$1 entry role want got
+  local config=$1 entry role want got roles want_roles
   for entry in "${expected_running_models[@]}"; do
     role=${entry%%=*}
     want=${entry#*=}
@@ -236,6 +296,78 @@ assert_running_models() {
       return 1
     fi
   done
+  roles=$(jq -r '.models | keys[]' <<<"$config" 2>/dev/null | LC_ALL=C sort | tr '\n' ' ')
+  want_roles=$(printf '%s\n' "${expected_running_models[@]%%=*}" | LC_ALL=C sort | tr '\n' ' ')
+  if [[ "$roles" != "$want_roles" ]]; then
+    printf 'the running process reports the roles %s, want %s\n' "$roles" "$want_roles" >&2
+    return 1
+  fi
+}
+
+# How the running process signs in to each provider the plan's roles name, as /api/config reports
+# it under "providers": the provider's name, then a jq test of its entry, with $plan the template's
+# own settings (plan_provider_settings). OpenAI's workload identity ids are the office's own, which
+# only the template names; each Vertex AI provider runs in the Pi's Google project. The plan names
+# no other provider: the model gateway refuses the Pi until it admits it, so the template keeps the
+# gateway's entry commented out (deploy/pi/files/ghost-wispr.yaml).
+# shellcheck disable=SC2016 # $project and $plan are jq variables, which assert_running_providers passes.
+expected_running_providers=(
+  'vertex|.api == "vertex" and .project == $project and .location == "global" and .auth.kind == "google"'
+  'vertex-us|.api == "vertex" and .project == $project and .location == "us" and .auth.kind == "google"'
+  'openai|.api == "openai" and .auth.kind == "openai_wif" and .auth.identity_provider_id == $plan["providers.openai.auth.identity_provider_id"] and .auth.service_account_id == $plan["providers.openai.auth.service_account_id"]'
+  'deepgram|.api == "deepgram" and .auth.kind == "api_key" and .auth.env == "GHOST_WISPR_DEEPGRAM_API_KEY"'
+)
+
+# The template the models step installs (provision.sh --models), beside this script.
+readonly plan_yaml=$script_dir/files/ghost-wispr.yaml
+# The template's settings that expected_running_providers compares with as $plan["<path>"].
+readonly plan_provider_paths=(
+  providers.openai.auth.identity_provider_id providers.openai.auth.service_account_id
+)
+
+# plan_provider_settings < YAML: prints as one JSON object each setting of plan_provider_paths that
+# YAML sets, by its path. It fails, naming the setting, when YAML sets one of them to nothing or not
+# at all: a check with no value to compare with has checked nothing.
+plan_provider_settings() {
+  local flattened path value plan='{}'
+  flattened=$(flatten_yaml)
+  for path in "${plan_provider_paths[@]}"; do
+    value=$(awk -v prefix="$path: " 'index($0, prefix) == 1 { print substr($0, length(prefix) + 1); exit }' <<<"$flattened")
+    if [[ -z "$value" ]]; then
+      printf 'the plan sets no %s to compare the running process with\n' "$path" >&2
+      return 1
+    fi
+    plan=$(jq -c --arg path "$path" --arg value "$value" '. + {($path): $value}' <<<"$plan") || return 1
+  done
+  printf '%s\n' "$plan"
+}
+
+# assert_running_providers CONFIG: the running process (its /api/config response, CONFIG) signs in
+# to each provider as the plan says, and names no provider the plan does not name: such a provider,
+# as the gateway is until it admits the Pi, can read Fails on the settings page.
+assert_running_providers() {
+  local config=$1 entry name test plan names want_names
+  if [[ ! -r "$plan_yaml" ]]; then
+    printf 'cannot read %s, the plan of how the running process signs in to each provider\n' "$plan_yaml" >&2
+    return 1
+  fi
+  plan=$(plan_provider_settings <"$plan_yaml") || return 1
+  for entry in "${expected_running_providers[@]}"; do
+    name=${entry%%|*}
+    test=${entry#*|}
+    if ! jq -e --arg name "$name" --arg project "$PI_GCP_PROJECT" --argjson plan "$plan" \
+      ".providers[\$name] | objects | $test" >/dev/null 2>&1 <<<"$config"; then
+      printf 'the running process signs in to provider %s otherwise than the plan: %s\n' \
+        "$name" "$(jq -c --arg name "$name" '.providers[$name]' <<<"$config" 2>/dev/null)" >&2
+      return 1
+    fi
+  done
+  names=$(jq -r '.providers | keys[]' <<<"$config" 2>/dev/null | LC_ALL=C sort | tr '\n' ' ')
+  want_names=$(printf '%s\n' "${expected_running_providers[@]%%|*}" | LC_ALL=C sort | tr '\n' ' ')
+  if [[ "$names" != "$want_names" ]]; then
+    printf 'the running process names the providers %s, want %s\n' "$names" "$want_names" >&2
+    return 1
+  fi
 }
 
 assert_no_config_overrides() {
@@ -252,8 +384,16 @@ assert_no_config_overrides() {
   done
 }
 
-assert_embedding_location() {
-  [[ $1 == GHOST_WISPR_EMBEDDING_LOCATION=global ]]
+# assert_no_removed_variables NAMES: the service environment (its variable names, NAMES) sets no
+# variable of a setting that providers replaced.
+assert_no_removed_variables() {
+  local names=$1 variable
+  for variable in "${removed_variables[@]}"; do
+    if grep -Fqx -- "$variable" <<<"$names"; then
+      printf '%s is set, but providers replaced its setting; provision.sh --models removes it from .env\n' "$variable" >&2
+      return 1
+    fi
+  done
 }
 
 # assert_provider_model ROLE ACTUAL EXPECTED: the model the provider reported for ROLE is the
@@ -493,7 +633,7 @@ speak() {
   local headers=$1
   curl --fail --silent --show-error --dump-header "$headers" \
     --request POST --header 'Content-Type: application/json' \
-    --data '{"text":"Slice two model acceptance speech test.","provider":"gemini"}' \
+    --data '{"text":"Slice two model acceptance speech test."}' \
     "$unit_url/api/tts/speak"
 }
 
@@ -506,11 +646,6 @@ response_header() {
 service_environment_names() {
   # shellcheck disable=SC2016 # The remote shell expands the service runtime path.
   remote_run 'pid=$(XDG_RUNTIME_DIR="/run/user/$(id -u)" systemctl --user show --property=MainPID --value ghost-wispr.service) && [ "$pid" -gt 0 ] && tr "\000" "\n" <"/proc/$pid/environ" | sed "s/=.*//"'
-}
-
-service_embedding_location() {
-  # shellcheck disable=SC2016 # The remote shell expands the service runtime path.
-  remote_run 'pid=$(XDG_RUNTIME_DIR="/run/user/$(id -u)" systemctl --user show --property=MainPID --value ghost-wispr.service) && [ "$pid" -gt 0 ] && tr "\000" "\n" <"/proc/$pid/environ" | grep "^GHOST_WISPR_EMBEDDING_LOCATION="'
 }
 
 start_nats_subscriber() {
@@ -589,7 +724,7 @@ wait_for_tts() {
       if jq -e '.status == "completed" and (.bytes_written | type == "number" and . > 0)' >/dev/null <<<"$speech_status"; then
         model=$(jq -r '.model // ""' <<<"$speech_status")
         voice=$(jq -r '.voice // ""' <<<"$speech_status")
-        assert_provider_model speech "$model" "$tts_model" || return 1
+        assert_provider_model speech "$model" "$speech_provider_model" || return 1
         [[ "$voice" == "$tts_voice" ]] || {
           printf 'speech provider voice mismatch: got %q, want %q\n' "$voice" "$tts_voice" >&2
           return 1
@@ -616,7 +751,7 @@ wait_for_refinement() {
         completed)
           if [[ "$saw_running" == true ]]; then
             model=$(jq -r '.session.refinement_model // ""' <<<"$detail")
-            assert_provider_model refinement "$model" "$batch_refinement_model"
+            assert_provider_model refinement "$model" "$refinement_provider_model"
             return
           fi
           ;;
@@ -711,7 +846,7 @@ run_a6() {
 }
 
 run_a8() {
-  local current_status current_config deployed_yaml environment_names embedding_location before_summary_version
+  local current_status current_config deployed_yaml environment_names before_summary_version
   local summary_response semantic_response semantic_model speech_response speech_headers speech_model speech_voice speech_request_id refinement_response
   printf 'A8 PRECHECK: read status, running configuration, deployed YAML, and service environment before provider calls.\n'
   current_status=$(status) || {
@@ -731,11 +866,15 @@ run_a8() {
     return 1
   }
   assert_expected_config "$deployed_yaml" || {
-    printf 'A8 FAILED: the Pi configuration does not name the accepted models\n' >&2
+    printf 'A8 FAILED: the Pi configuration does not name the accepted models and providers, or sets a removed setting\n' >&2
     return 1
   }
   assert_running_models "$current_config" || {
     printf 'A8 FAILED: the running process does not run the accepted model for every role\n' >&2
+    return 1
+  }
+  assert_running_providers "$current_config" || {
+    printf 'A8 FAILED: the running process does not sign in to every provider as the plan says\n' >&2
     return 1
   }
   environment_names=$(service_environment_names) || {
@@ -746,12 +885,8 @@ run_a8() {
     printf 'A8 FAILED: the service environment overrides a configured model or Google setting\n' >&2
     return 1
   }
-  embedding_location=$(service_embedding_location) || {
-    printf 'A8 FAILED: could not read the embedding location from the service environment\n' >&2
-    return 1
-  }
-  assert_embedding_location "$embedding_location" || {
-    printf 'A8 FAILED: the embedding location is not global\n' >&2
+  assert_no_removed_variables "$environment_names" || {
+    printf 'A8 FAILED: the service environment sets a variable of a removed setting\n' >&2
     return 1
   }
   [[ -n "$acceptance_session_id" ]] || {
@@ -783,16 +918,16 @@ run_a8() {
     return 1
   }
   semantic_model=$(jq -r '.model // ""' <<<"$semantic_response")
-  assert_provider_model search "$semantic_model" "$embedding_model" || return 1
+  assert_provider_model search "$semantic_model" "$search_provider_model" || return 1
 
   speech_headers="$scratch_dir/a8-tts.headers"
   speech_response=$(speak "$speech_headers") || {
-    printf 'A8 FAILED: speech route did not accept the Gemini TTS request\n' >&2
+    printf 'A8 FAILED: speech route did not accept the text-to-speech request\n' >&2
     return 1
   }
   speech_model=$(response_header "$speech_headers" X-Ghost-Wispr-TTS-Model)
   speech_voice=$(response_header "$speech_headers" X-Ghost-Wispr-TTS-Voice)
-  assert_provider_model speech "$speech_model" "$tts_model" || return 1
+  assert_provider_model speech "$speech_model" "$speech_provider_model" || return 1
   [[ "$speech_voice" == "$tts_voice" ]] || {
     printf 'speech provider voice mismatch: got %q, want %q\n' "$speech_voice" "$tts_voice" >&2
     return 1
@@ -812,8 +947,8 @@ run_a8() {
     return 1
   }
   wait_for_refinement "$acceptance_session_id" || return 1
-  printf 'A8 RAN: summary, semantic-search, speech, and batch-refinement routes completed for real session %s with the planned models: %s, %s, %s, and %s/%s.\n' \
-    "$acceptance_session_id" "$batch_refinement_model" "$summarization_model" "$embedding_model" "$tts_model" "$tts_voice"
+  printf 'A8 RAN: summary, semantic-search, speech, and batch-refinement routes completed for real session %s with the planned models: %s, %s, %s, and %s (voice %s).\n' \
+    "$acceptance_session_id" "$transcription_model" "$summarization_model" "$embedding_model" "$tts_model" "$tts_voice"
 }
 
 run_a10() {
@@ -914,7 +1049,7 @@ run_row() {
 }
 
 run_self_test() (
-  local controls_dir key_root nested_dev_key report good_config marshaled_config swapped_config
+  local controls_dir key_root nested_dev_key report good_config marshaled_config
   controls_dir=$(mktemp -d)
   trap 'rm -rf -- "$controls_dir"' EXIT
 
@@ -975,46 +1110,129 @@ run_self_test() (
     fail 'A8 self-test accepted warnings that are not an array'
   fi
   assert_no_warnings '{"warnings":[]}' || fail 'A8 self-test rejected a warning-free status'
-  good_config=$(cat <<EOF
-deepgram_model: nova-3
+  # self_test_config BATCH SUMMARY prints a configuration in the plan's shape, with the plan's own
+  # providers (the template's), whose batch transcription and summaries run BATCH and SUMMARY.
+  local plan_providers
+  plan_providers=$(awk '/^providers:/ { found = 1; print; next } found && /^[^[:space:]#]/ { exit } found { print }' "$plan_yaml")
+  [[ $plan_providers == *$'\n  vertex:'* ]] || fail "A8 self-test could not read the plan's providers from $plan_yaml"
+  self_test_config() {
+    printf '%s\n' "$plan_providers"
+    cat <<EOF
+transcription:
+  model: deepgram/nova-3
 batch_transcription:
-  provider: deepgram
-  model: nova-3
+  model: $1
 summarization:
-  model: gemini/gemini-4-carbon
-embedding_model: gemini/gemini-embedding-2
-genai_backend: vertex
-gcp_project: $PI_GCP_PROJECT
-gcp_location: global
-tts_provider: gemini
-tts_model: gemini-3.8-flash-tts
-tts_voice: Kore
+  model: $2
+embedding:
+  model: vertex/gemini-embedding-2
+tts:
+  model: vertex-us/gemini-3.8-flash-tts
+  voice: Kore
+voice:
+  enabled: true
+  gptlive:
+    model: openai/gpt-live-1
+concierge:
+  model: vertex/gemini-3.5-flash-lite
+  dispatch_url: https://dispatch.example.test
 EOF
-)
+  }
+  good_config=$(self_test_config deepgram/nova-3 vertex/gemini-4-carbon)
   assert_expected_config "$good_config" || fail 'A8 self-test rejected the accepted model configuration'
+  assert_expected_config "$(<"$script_dir/files/ghost-wispr.yaml")" \
+    || fail 'A8 self-test rejected deploy/pi/files/ghost-wispr.yaml, the configuration the models step installs'
   marshaled_config=${good_config//$'\n  '/$'\n    '}
   assert_expected_config "$marshaled_config" || fail 'A8 self-test rejected yaml.v3 indentation'
-  if assert_expected_config "${good_config/deepgram_model: nova-3/deepgram_model: nova-2}" 2>/dev/null; then
+  if assert_expected_config "${good_config/model: deepgram\/nova-3/model: deepgram/nova-2}" 2>/dev/null; then
     fail 'A8 self-test accepted a superseded transcription model'
   fi
-  swapped_config=${good_config/  model: nova-3/  model: swapped}
-  swapped_config=${swapped_config/  model: gemini\/gemini-4-carbon/  model: nova-3}
-  swapped_config=${swapped_config/  model: swapped/  model: gemini/gemini-4-carbon}
-  if assert_expected_config "$swapped_config" 2>/dev/null; then
+  if assert_expected_config "${good_config/model: vertex\/gemini-embedding-2/model: gateway/gemini-embedding-2}" 2>/dev/null; then
+    fail 'A8 self-test accepted the embedding model on another provider'
+  fi
+  if assert_expected_config "$(self_test_config vertex/gemini-4-carbon deepgram/nova-3)" 2>/dev/null; then
     fail 'A8 self-test accepted swapped batch and summarization models'
   fi
-  local good_running_config
-  good_running_config=$(jq -cn --arg project "$PI_GCP_PROJECT" '{"summarization":{"model":"gemini/gemini-4-carbon"},"models":{"live_transcription":"nova-3","batch_transcription_provider":"deepgram","batch_transcription":"nova-3","summarization":"gemini/gemini-4-carbon","embedding":"gemini/gemini-embedding-2","genai_backend":"vertex","gcp_project":$project,"gcp_location":"global","tts_provider":"gemini","tts":"gemini-3.8-flash-tts","tts_voice":"Kore"}}')
+  # The deployed YAML names exactly the plan's providers, each as the plan sets it: the next start
+  # signs in with them, whatever the running process does now.
+  local empty_providers='providers: {}' gateway_entry planted removed
+  gateway_entry=$'\n  gateway:\n    api: openai\n    url: https://gateway.example.test/v1\n    auth:\n      kind: google_id_token\n      audience: example-gateway'
+  for planted in "${good_config/"$plan_providers"/"$empty_providers"}" \
+    "${good_config/"$plan_providers"/"$plan_providers$gateway_entry"}" \
+    "${good_config/location: us/location: global}" "${good_config/kind: openai_wif/kind: api_key}"; do
+    if removed=$(assert_expected_config "$planted" 2>&1); then
+      fail "A8 self-test accepted a deployed configuration whose providers are not the plan's: $planted"
+    fi
+    [[ $removed == *'configuration providers differ from the plan'* ]] \
+      || fail "A8 self-test rejected a deployed configuration whose providers are not the plan's, but not for them: $removed"
+  done
+  printf "A8 self-test RAN: the deployed YAML's providers are compared with the plan's\n"
+  local path parts indent part
+  for path in "${removed_settings[@]}"; do
+    IFS=. read -r -a parts <<<"$path"
+    planted=$good_config indent=''
+    for part in "${parts[@]:0:${#parts[@]}-1}"; do
+      planted+=$'\n'"$indent$part:"
+      indent+='  '
+    done
+    planted+=$'\n'"$indent${parts[-1]}: planted"
+    if removed=$(assert_expected_config "$planted" 2>&1); then
+      fail "A8 self-test accepted a configuration that still sets $path"
+    fi
+    [[ $removed == *"configuration still sets $path,"* ]] \
+      || fail "A8 self-test rejected a configuration that sets $path, but not for that setting: $removed"
+  done
+  printf 'A8 self-test RAN: every removed setting is rejected wherever it is nested\n'
+  local good_running_config plan unread
+  plan=$(plan_provider_settings <"$plan_yaml") || fail "A8 self-test could not read the plan's providers from $plan_yaml"
+  good_running_config=$(jq -cn --arg project "$PI_GCP_PROJECT" --argjson plan "$plan" '{
+    "summarization": {"model": "vertex/gemini-4-carbon"},
+    "models": {"live_transcription": "deepgram/nova-3", "batch_transcription": "deepgram/nova-3",
+      "summarization": "vertex/gemini-4-carbon", "embedding": "vertex/gemini-embedding-2",
+      "concierge": "vertex/gemini-3.5-flash-lite", "tts": "vertex-us/gemini-3.8-flash-tts", "tts_voice": "Kore",
+      "gptlive": "openai/gpt-live-1", "dgagent_provider": "deepgram"},
+    "providers": {
+      "vertex": {"api": "vertex", "project": $project, "location": "global", "auth": {"kind": "google"}},
+      "vertex-us": {"api": "vertex", "project": $project, "location": "us", "auth": {"kind": "google"}},
+      "openai": {"api": "openai", "auth": {"kind": "openai_wif",
+        "identity_provider_id": $plan["providers.openai.auth.identity_provider_id"],
+        "service_account_id": $plan["providers.openai.auth.service_account_id"]}},
+      "deepgram": {"api": "deepgram", "auth": {"kind": "api_key", "env": "GHOST_WISPR_DEEPGRAM_API_KEY"}}}}')
   assert_running_models "$good_running_config" || fail 'A8 self-test rejected the running models of the plan'
-  for drift in '.models.summarization = "gemini/gemini-2.5-flash"' '.models.embedding = "gemini/gemini-embedding-001"' \
-    '.models.live_transcription = "nova-2"' '.models.batch_transcription = "whisper-1"' '.models.tts_voice = "Charon"' \
-    '.models.gcp_location = "us-central1"' 'del(.models.tts)' 'del(.models)'; do
+  for drift in '.models.summarization = "vertex/gemini-2.5-flash"' '.models.embedding = "gateway/gemini-embedding-2"' \
+    '.models.live_transcription = "deepgram/nova-2"' '.models.batch_transcription = "deepgram/whisper"' \
+    '.models.tts_voice = "Charon"' '.models.tts = "vertex/gemini-3.8-flash-tts"' \
+    '.models.concierge = "gateway/gemini-3.5-flash-lite"' '.models.gptlive = "gateway/gpt-live-1"' \
+    '.models.dgagent_provider = "gateway"' '.models.genai_backend = "vertex"' 'del(.models.tts)' 'del(.models)'; do
     if assert_running_models "$(jq -c "$drift" <<<"$good_running_config")" 2>/dev/null; then
       fail "A8 self-test accepted a running process with $drift"
     fi
   done
+  assert_running_providers "$good_running_config" || fail 'A8 self-test rejected the running providers of the plan'
+  # Each id below is well formed and not the template's: OpenAI's ids of another workload identity.
+  # A provider the plan does not name, the gateway the template keeps commented out, fails as well.
+  for drift in '.providers.vertex.project = "other-project"' '.providers["vertex-us"].location = "global"' \
+    '.providers.gateway = {"api": "openai", "url": "https://gateway.example.test/v1", "auth": {"kind": "google_id_token", "audience": "example-gateway"}}' \
+    '.providers.openai.auth.kind = "api_key"' 'del(.providers.openai.auth.service_account_id)' \
+    '.providers.openai.auth.identity_provider_id = "idp-other"' '.providers.openai.auth.service_account_id = "sa-other"' \
+    '.providers.deepgram.auth.env = "DEEPGRAM_KEY"' 'del(.providers.deepgram)' 'del(.providers)'; do
+    if assert_running_providers "$(jq -c "$drift" <<<"$good_running_config")" 2>/dev/null; then
+      fail "A8 self-test accepted a running process with $drift"
+    fi
+  done
+  # A plan that does not set a value to compare with fails the check, naming the setting, rather
+  # than passing on nothing: this plan names no OpenAI provider.
+  if unread=$(plan_provider_settings <<<$'providers:\n  vertex:\n    api: vertex\n    auth:\n      kind: google' 2>&1); then
+    fail 'A8 self-test read OpenAI'"'"'s workload identity from a plan that does not set it'
+  fi
+  [[ $unread == *'the plan sets no providers.openai.auth.identity_provider_id to compare'* ]] \
+    || fail "A8 self-test rejected a plan without OpenAI's workload identity, but not for it: $unread"
+  printf 'A8 self-test RAN: every provider is compared with how the running process signs in to it\n'
   if assert_no_config_overrides $'GHOST_WISPR_ADDR\nGHOST_WISPR_TTS_VOICE' 2>/dev/null; then
     fail 'A8 self-test accepted an environment override of the TTS voice'
+  fi
+  if assert_no_config_overrides $'GHOST_WISPR_ADDR\nGHOST_WISPR_EMBEDDING_MODEL' 2>/dev/null; then
+    fail 'A8 self-test accepted an environment override of the embedding model'
   fi
   if assert_no_config_overrides $'GHOST_WISPR_ADDR\nGHOST_WISPR_GOOGLE_CREDENTIALS_FILE' 2>/dev/null; then
     fail 'A8 self-test accepted a Google credential override'
@@ -1022,40 +1240,44 @@ EOF
   if assert_no_config_overrides '' 2>/dev/null; then
     fail 'A8 self-test accepted an unread service environment'
   fi
-  assert_no_config_overrides $'GHOST_WISPR_ADDR\nGHOST_WISPR_EMBEDDING_LOCATION' \
+  assert_no_config_overrides $'GHOST_WISPR_ADDR\nGHOST_WISPR_DEEPGRAM_API_KEY' \
     || fail 'A8 self-test rejected an environment without overrides'
-  if assert_embedding_location 'GHOST_WISPR_EMBEDDING_LOCATION=us' 2>/dev/null; then
-    fail 'A8 self-test accepted an embedding location outside global'
-  fi
-  assert_embedding_location 'GHOST_WISPR_EMBEDDING_LOCATION=global' \
-    || fail 'A8 self-test rejected the required embedding location'
+  assert_no_removed_variables $'GHOST_WISPR_ADDR\nGHOST_WISPR_DEEPGRAM_API_KEY\nGHOST_WISPR_TTS_MODEL\nGHOST_WISPR_EMBEDDING_MODEL' \
+    || fail 'A8 self-test rejected an environment that sets no removed variable'
+  local variable
+  for variable in "${removed_variables[@]}"; do
+    if assert_no_removed_variables $'GHOST_WISPR_ADDR\n'"$variable" 2>/dev/null; then
+      fail "A8 self-test accepted a service environment that sets $variable"
+    fi
+  done
+  printf 'A8 self-test RAN: every removed variable in the service environment is rejected\n'
   if assert_provider_model summary configured-summary-model "$summary_provider_model" 2>/dev/null; then
     fail 'A8 self-test accepted a provider model mismatch for summary'
   fi
-  if assert_provider_model search configured-embedding-model "$embedding_model" 2>/dev/null; then
+  if assert_provider_model search configured-embedding-model "$search_provider_model" 2>/dev/null; then
     fail 'A8 self-test accepted a provider model mismatch for search'
   fi
-  if assert_provider_model speech configured-tts-model "$tts_model" 2>/dev/null; then
+  if assert_provider_model speech configured-tts-model "$speech_provider_model" 2>/dev/null; then
     fail 'A8 self-test accepted a provider model mismatch for speech'
   fi
-  if assert_provider_model refinement configured-refinement-model "$batch_refinement_model" 2>/dev/null; then
+  if assert_provider_model refinement configured-refinement-model "$refinement_provider_model" 2>/dev/null; then
     fail 'A8 self-test accepted a provider model mismatch for refinement'
   fi
-  assert_provider_model summary "$summary_provider_model" "$summary_provider_model" \
+  assert_provider_model summary gemini-4-carbon "$summary_provider_model" \
     || fail 'A8 self-test rejected the provider summary model'
-  assert_provider_model search "$embedding_model" "$embedding_model" \
+  assert_provider_model search gemini-embedding-2 "$search_provider_model" \
     || fail 'A8 self-test rejected the provider embedding model'
-  assert_provider_model speech "$tts_model" "$tts_model" \
+  assert_provider_model speech gemini-3.8-flash-tts "$speech_provider_model" \
     || fail 'A8 self-test rejected the provider speech model'
-  assert_provider_model refinement "$batch_refinement_model" "$batch_refinement_model" \
+  assert_provider_model refinement nova-3 "$refinement_provider_model" \
     || fail 'A8 self-test rejected the provider refinement model'
   assert_provider_model summary "$model_not_reported" "$summary_provider_model" \
     || fail 'A8 self-test rejected a summary model the provider did not report'
-  assert_provider_model search "$model_not_reported" "$embedding_model" \
+  assert_provider_model search "$model_not_reported" "$search_provider_model" \
     || fail 'A8 self-test rejected a search model the provider did not report'
-  assert_provider_model speech "$model_not_reported" "$tts_model" \
+  assert_provider_model speech "$model_not_reported" "$speech_provider_model" \
     || fail 'A8 self-test rejected a speech model the provider did not report'
-  assert_provider_model refinement "$model_not_reported" "$batch_refinement_model" \
+  assert_provider_model refinement "$model_not_reported" "$refinement_provider_model" \
     || fail 'A8 self-test rejected a refinement model the provider did not report'
   printf 'A8 self-test RAN: planted failure rejected\n'
 
@@ -1095,13 +1317,12 @@ EOF
   local refinement_requested="$controls_dir/refinement-requested"
   local refinement_seen_running="$controls_dir/refinement-seen-running"
   # The model each fake provider reports.
-  local summary_reported=$summary_provider_model refinement_reported=$batch_refinement_model
-  local search_reported=$embedding_model speech_reported=$tts_model
+  local summary_reported=$summary_provider_model refinement_reported=$refinement_provider_model
+  local search_reported=$search_provider_model speech_reported=$speech_provider_model
   status() { printf '%s\n' '{"warnings":[]}'; }
   running_config() { printf '%s\n' "$good_running_config"; }
   remote_run() { printf '%s\n' "$good_config"; }
-  service_environment_names() { printf '%s\n' $'GHOST_WISPR_ADDR\nGHOST_WISPR_EMBEDDING_LOCATION'; }
-  service_embedding_location() { printf '%s\n' 'GHOST_WISPR_EMBEDDING_LOCATION=global'; }
+  service_environment_names() { printf '%s\n' $'GHOST_WISPR_ADDR\nGHOST_WISPR_DEEPGRAM_API_KEY'; }
   session_detail() {
     if [[ -e "$refinement_requested" ]]; then
       if [[ ! -e "$refinement_seen_running" ]]; then
@@ -1159,22 +1380,38 @@ EOF
   # fails for any other reason fails the self-test and prints why.
   local a8_output
   # shellcheck disable=SC2329 # run_a8, called next, reads the deployed YAML through remote_run.
-  remote_run() { printf '%s\n' "${good_config/embedding_model: gemini\/gemini-embedding-2/embedding_model: gemini/gemini-embedding-001}"; }
+  remote_run() { printf '%s\n' "${good_config/model: vertex\/gemini-embedding-2/model: vertex/gemini-embedding-001}"; }
   if a8_output=$(run_a8 2>&1); then
     fail 'A8 self-test accepted an unreported search model when the configuration names another'
   fi
-  [[ "$a8_output" == *"configuration lacks: embedding_model: gemini/$embedding_model"* ]] \
+  [[ "$a8_output" == *"configuration lacks: embedding.model: $embedding_model"* ]] \
     || fail "A8 self-test rejected a configuration that names another search model, but not for that model: $a8_output"
   # shellcheck disable=SC2329 # The run_a8 of the next check reads the deployed YAML through remote_run.
   remote_run() { printf '%s\n' "$good_config"; }
   rm -f -- "$summary_called" "$speech_called" "$refinement_called" "$summary_requested" "$refinement_requested" "$refinement_seen_running"
   # shellcheck disable=SC2329 # run_a8, called next, reads the running models through running_config.
-  running_config() { jq -c '.models.embedding = "gemini/gemini-embedding-001"' <<<"$good_running_config"; }
+  running_config() { jq -c '.models.embedding = "vertex/gemini-embedding-001"' <<<"$good_running_config"; }
   if a8_output=$(run_a8 2>&1); then
     fail 'A8 self-test accepted a running process whose embedding model is not the plan'"'"'s while the YAML names it'
   fi
-  [[ "$a8_output" == *"the running process reports embedding gemini/gemini-embedding-001, want gemini/$embedding_model"* ]] \
+  [[ "$a8_output" == *"the running process reports embedding vertex/gemini-embedding-001, want $embedding_model"* ]] \
     || fail "A8 self-test rejected a running process with another embedding model, but not for that model: $a8_output"
+  # shellcheck disable=SC2329 # run_a8, called next, reads the running providers through running_config.
+  running_config() { jq -c '.providers.vertex.project = "other-project"' <<<"$good_running_config"; }
+  if a8_output=$(run_a8 2>&1); then
+    fail 'A8 self-test accepted a running process whose Vertex AI provider is in another project'
+  fi
+  [[ "$a8_output" == *'the running process signs in to provider vertex otherwise than the plan'* ]] \
+    || fail "A8 self-test rejected a running process with a provider in another project, but not for that provider: $a8_output"
+  # shellcheck disable=SC2329 # The run_a8 of the next check reads the running configuration through running_config.
+  running_config() { printf '%s\n' "$good_running_config"; }
+  # shellcheck disable=SC2329 # run_a8, called next, reads the service environment through service_environment_names.
+  service_environment_names() { printf '%s\n' $'GHOST_WISPR_ADDR\nGHOST_WISPR_EMBEDDING_LOCATION'; }
+  if a8_output=$(run_a8 2>&1); then
+    fail 'A8 self-test accepted a service environment that still sets GHOST_WISPR_EMBEDDING_LOCATION'
+  fi
+  [[ "$a8_output" == *'GHOST_WISPR_EMBEDDING_LOCATION is set, but providers replaced its setting'* ]] \
+    || fail "A8 self-test rejected a service environment with a removed variable, but not for that variable: $a8_output"
   printf 'A8 self-test RAN: every role is compared with the model the running process reports\n'
   printf 'A8 self-test RAN: every role passes on a model the provider did not report, and later roles still run\n'
 

@@ -807,8 +807,10 @@ func (m *Manager) generateSummary(ctx context.Context, sessionID string, started
 		_ = m.waitForRefinedTranscript(ctx, sessionID)
 	}
 
-	// Canonicalize the transcript (picks refined if available, else assembles streaming).
-	transcript, generation, err := m.store.Canonicalize(sessionID)
+	// Canonicalize the transcript (picks refined if available, else assembles
+	// streaming). The summarizer reads it with each segment's speaker label;
+	// the title fallback and search read it without.
+	transcript, labeled, generation, err := m.store.CanonicalizeForSummary(sessionID)
 	if err != nil {
 		m.failSummary(sessionID, fmt.Sprintf("failed to canonicalize transcript: %v", err), startGeneration)
 		m.logger.Error("failed to canonicalize transcript", "operation", "generate_summary", "session_id", sessionID, "error", err)
@@ -823,9 +825,9 @@ func (m *Manager) generateSummary(ctx context.Context, sessionID string, started
 
 	var title, summaryText, preset, speakerNames, summaryModel string
 	if reporter, ok := summarizer.(ReportedSummarizer); ok {
-		title, summaryText, preset, speakerNames, summaryModel, err = reporter.SummarizeReported(ctx, sessionID, transcript)
+		title, summaryText, preset, speakerNames, summaryModel, err = reporter.SummarizeReported(ctx, sessionID, labeled)
 	} else {
-		title, summaryText, preset, speakerNames, err = summarizer.Summarize(ctx, sessionID, transcript)
+		title, summaryText, preset, speakerNames, err = summarizer.Summarize(ctx, sessionID, labeled)
 	}
 	// Safety net: ensure title is never empty using fallback chain.
 	if strings.TrimSpace(title) == "" {

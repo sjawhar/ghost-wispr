@@ -19,6 +19,8 @@ import (
 
 	"cloud.google.com/go/auth"
 
+	"github.com/sjawhar/ghost-wispr/internal/config"
+	"github.com/sjawhar/ghost-wispr/internal/providers"
 	"github.com/sjawhar/ghost-wispr/internal/voice"
 )
 
@@ -88,10 +90,7 @@ func TestGeminiPlaysTheFirstAudioBeforeTheStreamEnds(t *testing.T) {
 		_, _ = io.WriteString(w, sseAudio(rest))
 	}))
 	t.Cleanup(srv.Close)
-	g, err := NewGemini(&GeminiConfig{Project: "example-project", Credentials: testCredentials(), BaseURL: srv.URL})
-	if err != nil {
-		t.Fatalf("NewGemini: %v", err)
-	}
+	g := newTestGemini(t, srv.URL, nil)
 	s := openSession(t, g, out)
 
 	if err := s.Say(context.Background(), "Twelve open issues, three blocked.", voice.Fact); err != nil {
@@ -119,55 +118,50 @@ func TestGeminiRejectsNoAudioWithItsFinishReason(t *testing.T) {
 		_, _ = io.WriteString(w, `data: {"candidates":[{"finishReason":"SAFETY","content":{"parts":[]}}]}`+"\n\n")
 	}))
 	t.Cleanup(srv.Close)
-	g, err := NewGemini(&GeminiConfig{Project: "example-project", Credentials: testCredentials(), BaseURL: srv.URL})
-	if err != nil {
-		t.Fatalf("NewGemini: %v", err)
-	}
-	err = g.Stream(context.Background(), "A sentence.", func([]byte) error { return nil })
+	g := newTestGemini(t, srv.URL, nil)
+	err := g.Stream(context.Background(), "A sentence.", func([]byte) error { return nil })
 	if err == nil || !strings.Contains(err.Error(), "the engine gave no audio") || !strings.Contains(err.Error(), "SAFETY") {
 		t.Fatalf("Stream error = %v, want no audio and SAFETY", err)
 	}
 }
 
-// TestGeminiRequestsStreamingSpeech fails if the Gemini engine does not ask
-// the Vertex AI host of its location (a multi-region's own host, the global
-// host, or a region's) for streamed audio in the voice it was given,
-// authorised with the credentials' token, or does not emit the audio it
-// streams back.
+// TestGeminiRequestsStreamingSpeech fails if the engine of a Vertex AI
+// provider does not ask the Vertex AI host of the provider's location (a
+// multi-region's own host, the global host, or a region's) for the model's
+// streamed audio in the voice it was given ("Kore" when none), signed in with
+// the provider's Google token, or does not emit the audio it streams back.
 func TestGeminiRequestsStreamingSpeech(t *testing.T) {
 	for _, tc := range []struct {
-		name    string
-		cfg     GeminiConfig
-		wantURL string
-		voice   string
+		name, location, model, voice string
+		wantURL, wantVoice           string
 	}{{
-		name:    "defaults",
-		cfg:     GeminiConfig{Project: "example-project"},
-		wantURL: "https://aiplatform.us.rep.googleapis.com/v1/projects/example-project/locations/us/publishers/google/models/gemini-3.8-flash-tts:streamGenerateContent?alt=sse",
-		voice:   "Kore",
+		name: "us", location: "us", model: "gemini-3.8-flash-tts",
+		wantURL:   "https://aiplatform.us.rep.googleapis.com/v1/projects/example-project/locations/us/publishers/google/models/gemini-3.8-flash-tts:streamGenerateContent?alt=sse",
+		wantVoice: "Kore",
 	}, {
-		name:    "named",
-		cfg:     GeminiConfig{Project: "example-project", Location: "eu", Model: "gemini-3.8-flash-lite-tts", Voice: "Puck"},
-		wantURL: "https://aiplatform.eu.rep.googleapis.com/v1/projects/example-project/locations/eu/publishers/google/models/gemini-3.8-flash-lite-tts:streamGenerateContent?alt=sse",
-		voice:   "Puck",
+		name: "named", location: "eu", model: "gemini-3.8-flash-lite-tts", voice: "Puck",
+		wantURL:   "https://aiplatform.eu.rep.googleapis.com/v1/projects/example-project/locations/eu/publishers/google/models/gemini-3.8-flash-lite-tts:streamGenerateContent?alt=sse",
+		wantVoice: "Puck",
 	}, {
-		name:    "global",
-		cfg:     GeminiConfig{Project: "example-project", Location: "global"},
-		wantURL: "https://aiplatform.googleapis.com/v1/projects/example-project/locations/global/publishers/google/models/gemini-3.8-flash-tts:streamGenerateContent?alt=sse",
-		voice:   "Kore",
+		name: "global", location: "global", model: "gemini-3.8-flash-tts",
+		wantURL:   "https://aiplatform.googleapis.com/v1/projects/example-project/locations/global/publishers/google/models/gemini-3.8-flash-tts:streamGenerateContent?alt=sse",
+		wantVoice: "Kore",
 	}, {
-		name:    "region",
-		cfg:     GeminiConfig{Project: "example-project", Location: "us-central1"},
-		wantURL: "https://us-central1-aiplatform.googleapis.com/v1/projects/example-project/locations/us-central1/publishers/google/models/gemini-3.8-flash-tts:streamGenerateContent?alt=sse",
-		voice:   "Kore",
+		name: "no location is global", model: "gemini-3.8-flash-tts",
+		wantURL:   "https://aiplatform.googleapis.com/v1/projects/example-project/locations/global/publishers/google/models/gemini-3.8-flash-tts:streamGenerateContent?alt=sse",
+		wantVoice: "Kore",
+	}, {
+		name: "region", location: "us-central1", model: "gemini-3.8-flash-tts",
+		wantURL:   "https://us-central1-aiplatform.googleapis.com/v1/projects/example-project/locations/us-central1/publishers/google/models/gemini-3.8-flash-tts:streamGenerateContent?alt=sse",
+		wantVoice: "Kore",
 	}} {
 		t.Run(tc.name, func(t *testing.T) {
 			rt := &recordingTransport{pcm: ramp(0, 2400)}
-			tc.cfg.Credentials = testCredentials()
-			tc.cfg.HTTPClient = &http.Client{Transport: rt}
-			g, err := NewGemini(&tc.cfg)
+			p := vertexAt("")
+			p.Location = tc.location
+			g, err := NewEngine(testProvider(t, p, nil), tc.model, tc.voice, WithHTTPClient(&http.Client{Transport: rt}))
 			if err != nil {
-				t.Fatalf("NewGemini: %v", err)
+				t.Fatalf("NewEngine: %v", err)
 			}
 			if g.Format() != mono24k {
 				t.Fatalf("Format = %+v, want PCM16 mono at 24 kHz", g.Format())
@@ -191,41 +185,219 @@ func TestGeminiRequestsStreamingSpeech(t *testing.T) {
 				t.Errorf("request URL = %s, want %s", got, tc.wantURL)
 			}
 			if got := rt.req.Header.Get("Authorization"); got != "Bearer test-token" {
-				t.Errorf("Authorization = %q, want the credentials' bearer token", got)
+				t.Errorf("Authorization = %q, want the provider's Google token", got)
 			}
-			var body struct {
-				Contents []struct {
-					Parts []struct {
-						Text string `json:"text"`
-					} `json:"parts"`
-				} `json:"contents"`
-				GenerationConfig struct {
-					ResponseModalities []string `json:"responseModalities"`
-					SpeechConfig       struct {
-						VoiceConfig struct {
-							Voice string `json:"voice"`
-						} `json:"voiceConfig"`
-					} `json:"speechConfig"`
-				} `json:"generationConfig"`
+			text, voice := geminiRequestTextAndVoice(t, rt.body)
+			if text != "Twelve open issues." {
+				t.Errorf("request text = %q, want the text as one part", text)
 			}
-			if err := json.Unmarshal(rt.body, &body); err != nil {
-				t.Fatalf("request body %s: %v", rt.body, err)
-			}
-			if len(body.Contents) != 1 || len(body.Contents[0].Parts) != 1 || body.Contents[0].Parts[0].Text != "Twelve open issues." {
-				t.Errorf("request contents = %s, want the text as one part", rt.body)
-			}
-			if m := body.GenerationConfig.ResponseModalities; len(m) != 1 || m[0] != "AUDIO" {
-				t.Errorf("responseModalities = %q, want [AUDIO]", m)
-			}
-			if v := body.GenerationConfig.SpeechConfig.VoiceConfig.Voice; v != tc.voice {
-				t.Errorf("speechConfig.voiceConfig.voice = %q, want %q", v, tc.voice)
+			if voice != tc.wantVoice {
+				t.Errorf("speechConfig.voiceConfig.voice = %q, want %q", voice, tc.wantVoice)
 			}
 		})
 	}
 }
 
+// geminiRequestTextAndVoice reads a streamGenerateContent request: its one
+// text part and its voice. It fails the test unless the request asks for
+// audio alone.
+func geminiRequestTextAndVoice(t *testing.T, raw []byte) (text, voice string) {
+	t.Helper()
+	var body struct {
+		Contents []struct {
+			Parts []struct {
+				Text string `json:"text"`
+			} `json:"parts"`
+		} `json:"contents"`
+		GenerationConfig struct {
+			ResponseModalities []string `json:"responseModalities"`
+			SpeechConfig       struct {
+				VoiceConfig struct {
+					Voice string `json:"voice"`
+				} `json:"voiceConfig"`
+			} `json:"speechConfig"`
+		} `json:"generationConfig"`
+	}
+	if err := json.Unmarshal(raw, &body); err != nil {
+		t.Fatalf("request body %s: %v", raw, err)
+	}
+	if m := body.GenerationConfig.ResponseModalities; len(m) != 1 || m[0] != "AUDIO" {
+		t.Errorf("responseModalities = %q, want [AUDIO]", m)
+	}
+	if len(body.Contents) != 1 || len(body.Contents[0].Parts) != 1 {
+		t.Errorf("request contents = %s, want one part", raw)
+		return "", body.GenerationConfig.SpeechConfig.VoiceConfig.Voice
+	}
+	return body.Contents[0].Parts[0].Text, body.GenerationConfig.SpeechConfig.VoiceConfig.Voice
+}
+
+// TestGeminiAPIEngineStreamsFromGooglesGeminiAPI fails if the engine of a
+// Gemini API provider does not ask {url}/v1beta/models/{model} for streamed
+// audio, signed in with the provider's key in X-Goog-Api-Key, in the same
+// request shape as Vertex AI's, or does not emit the audio streamed back.
+func TestGeminiAPIEngineStreamsFromGooglesGeminiAPI(t *testing.T) {
+	pcm := ramp(3, 1920)
+	var gotPath, gotQuery, gotKey string
+	var gotBody []byte
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !isStream(r) {
+			http.NotFound(w, r)
+			return
+		}
+		gotPath, gotQuery, gotKey = r.URL.Path, r.URL.RawQuery, r.Header.Get("X-Goog-Api-Key")
+		gotBody, _ = io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, sseAudio(pcm))
+	}))
+	t.Cleanup(srv.Close)
+	p := testProvider(t, &config.Provider{API: config.APIGemini, URL: srv.URL, Auth: keyAuth()}, nil)
+	g, err := NewEngine(p, "gemini-3.8-flash-tts", "Puck")
+	if err != nil {
+		t.Fatalf("NewEngine: %v", err)
+	}
+	var got []byte
+	if err := g.Stream(context.Background(), "Three are blocked.", func(b []byte) error {
+		got = append(got, b...)
+		return nil
+	}); err != nil {
+		t.Fatalf("Stream: %v", err)
+	}
+	if gotPath != "/v1beta/models/gemini-3.8-flash-tts:streamGenerateContent" || gotQuery != "alt=sse" {
+		t.Errorf("request %s?%s, want /v1beta/models/gemini-3.8-flash-tts:streamGenerateContent?alt=sse", gotPath, gotQuery)
+	}
+	if gotKey != testKey {
+		t.Errorf("X-Goog-Api-Key = %q, want the provider's key", gotKey)
+	}
+	if text, voice := geminiRequestTextAndVoice(t, gotBody); text != "Three are blocked." || voice != "Puck" {
+		t.Errorf("request text %q in voice %q, want the text in Puck", text, voice)
+	}
+	if !bytes.Equal(got, pcm) {
+		t.Fatalf("emitted %d bytes, want the streamed %d", len(got), len(pcm))
+	}
+}
+
+// TestGeminiAPIEngineSpeaksThroughAGateway fails if the engine of a Gemini
+// API provider at a model gateway, signed in with a Google ID token
+// (google_id_token), does not ask {url}/v1beta/models/{model} for streamed
+// audio with Authorization: Bearer <the ID token>, sends any key header
+// beside it, or does not emit the audio streamed back.
+func TestGeminiAPIEngineSpeaksThroughAGateway(t *testing.T) {
+	const idToken = "eyJhbGciOiJub25lIn0.eyJleHAiOjQxMDI0NDQ4MDB9.sig"
+	pcm := ramp(3, 1920)
+	var gotPath, gotQuery, gotAuth, gotKey string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !isStream(r) {
+			http.NotFound(w, r)
+			return
+		}
+		gotPath, gotQuery = r.URL.Path, r.URL.RawQuery
+		gotAuth, gotKey = r.Header.Get("Authorization"), r.Header.Get("X-Goog-Api-Key")
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, sseAudio(pcm))
+	}))
+	t.Cleanup(srv.Close)
+	set := providers.New(&config.Config{Providers: map[string]config.Provider{
+		"gateway-gemini": {API: config.APIGemini, URL: srv.URL, Auth: config.ProviderAuth{Kind: config.AuthGoogleIDToken, Audience: "model-gateway-example"}},
+	}}, providers.Options{IDToken: func(context.Context, string, string) (string, error) { return idToken, nil }})
+	p, err := set.Get("gateway-gemini")
+	if err != nil {
+		t.Fatal(err)
+	}
+	g, err := NewEngine(p, "gemini-3.8-flash-tts", "Kore")
+	if err != nil {
+		t.Fatalf("NewEngine: %v", err)
+	}
+	var got []byte
+	if err := g.Stream(context.Background(), "Three are blocked.", func(b []byte) error {
+		got = append(got, b...)
+		return nil
+	}); err != nil {
+		t.Fatalf("Stream: %v", err)
+	}
+	if gotPath != "/v1beta/models/gemini-3.8-flash-tts:streamGenerateContent" || gotQuery != "alt=sse" {
+		t.Errorf("request %s?%s, want /v1beta/models/gemini-3.8-flash-tts:streamGenerateContent?alt=sse", gotPath, gotQuery)
+	}
+	if gotAuth != "Bearer "+idToken || gotKey != "" {
+		t.Errorf("Authorization %q, X-Goog-Api-Key %q; want the ID token as a bearer token and no key", gotAuth, gotKey)
+	}
+	if !bytes.Equal(got, pcm) {
+		t.Fatalf("emitted %d bytes, want the streamed %d", len(got), len(pcm))
+	}
+}
+
 // geminiPlanted stands for a meeting's words in what Vertex AI answers.
 const geminiPlanted = "quokkaplantedroomword"
+
+// sseAudioNaming is sseAudio's event naming modelVersion ("" names none), as
+// each event of Vertex AI's and the Gemini API's stream does.
+func sseAudioNaming(t *testing.T, pcm []byte, modelVersion string) string {
+	t.Helper()
+	inline := map[string]any{"mimeType": "audio/L16;codec=pcm;rate=24000", "data": pcm}
+	event := map[string]any{"candidates": []any{map[string]any{"content": map[string]any{"role": "model", "parts": []any{map[string]any{"inlineData": inline}}}}}}
+	if modelVersion != "" {
+		event["modelVersion"] = modelVersion
+	}
+	data, err := json.Marshal(event)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return "data: " + string(data) + "\r\n\r\n"
+}
+
+// TestGeminiReturnsTheModelItsAnswerNames fails if the engine of a Vertex AI
+// or Gemini API provider does not return the model its answer names in
+// modelVersion, which can differ from the model it asked for, or returns a
+// modelVersion that is no plain token as anything but "unknown": the
+// answer's text can be anything, and the model reaches the log and POST
+// /api/tts/speak's status.
+func TestGeminiReturnsTheModelItsAnswerNames(t *testing.T) {
+	pcm := ramp(0, 960)
+	for modelVersion, want := range map[string]string{
+		"gemini-3.8-flash-tts-001":       "gemini-3.8-flash-tts-001",
+		"":                               "",
+		"the room said " + geminiPlanted: "unknown",
+		geminiPlanted + "\nsecond line":  "unknown",
+		strings.Repeat("x", 80):          "unknown",
+	} {
+		stream := sseAudioNaming(t, pcm[:480], modelVersion) + sseAudioNaming(t, pcm[480:], modelVersion)
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if !isStream(r) {
+				http.NotFound(w, r)
+				return
+			}
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = io.WriteString(w, stream)
+		}))
+		for api, p := range map[string]*config.Provider{
+			config.APIVertex: vertexAt(srv.URL),
+			config.APIGemini: {API: config.APIGemini, URL: srv.URL, Auth: keyAuth()},
+		} {
+			e, err := NewEngine(testProvider(t, p, nil), "gemini-3.8-flash-tts", "")
+			if err != nil {
+				t.Fatalf("%s: NewEngine: %v", api, err)
+			}
+			reporter, ok := e.(ModelReporter)
+			if !ok {
+				t.Fatalf("%s: the engine %T does not report the model its answer names", api, e)
+			}
+			var got []byte
+			model, err := reporter.StreamModel(context.Background(), "hello", func(b []byte) error {
+				got = append(got, b...)
+				return nil
+			})
+			if err != nil {
+				t.Fatalf("%s, modelVersion %q: StreamModel: %v", api, modelVersion, err)
+			}
+			if model != want {
+				t.Errorf("%s, modelVersion %q: model %q, want %q", api, modelVersion, model, want)
+			}
+			if !bytes.Equal(got, pcm) {
+				t.Errorf("%s: emitted %d bytes, want the streamed %d", api, len(got), len(pcm))
+			}
+		}
+		srv.Close()
+	}
+}
 
 // TestGeminiFailsTheStreamOnAnAPIError fails if a refused request does not
 // fail the Stream with Vertex AI's status and code, or keeps its message,
@@ -240,11 +412,8 @@ func TestGeminiFailsTheStreamOnAnAPIError(t *testing.T) {
 			w.WriteHeader(http.StatusForbidden)
 			_, _ = io.WriteString(w, body)
 		}))
-		g, err := NewGemini(&GeminiConfig{Project: "example-project", Credentials: testCredentials(), BaseURL: srv.URL})
-		if err != nil {
-			t.Fatalf("NewGemini: %v", err)
-		}
-		err = g.Stream(context.Background(), "hello", func([]byte) error { return nil })
+		g := newTestGemini(t, srv.URL, nil)
+		err := g.Stream(context.Background(), "hello", func([]byte) error { return nil })
 		srv.Close()
 		if err == nil || !strings.Contains(err.Error(), "403") || strings.Contains(err.Error(), geminiPlanted) {
 			t.Errorf("Stream = %v, want Vertex AI's status and not its text, for body %s", err, body)
@@ -265,12 +434,9 @@ func TestGeminiFailsTheStreamOnAnErrorEvent(t *testing.T) {
 		_, _ = io.WriteString(w, `data: {"error":{"code":429,"message":"Resource exhausted by `+geminiPlanted+`","status":"RESOURCE_EXHAUSTED"}}`+"\r\n\r\n")
 	}))
 	t.Cleanup(srv.Close)
-	g, err := NewGemini(&GeminiConfig{Project: "example-project", Credentials: testCredentials(), BaseURL: srv.URL})
-	if err != nil {
-		t.Fatalf("NewGemini: %v", err)
-	}
+	g := newTestGemini(t, srv.URL, nil)
 	emitted := 0
-	err = g.Stream(context.Background(), "hello", func(pcm []byte) error {
+	err := g.Stream(context.Background(), "hello", func(pcm []byte) error {
 		emitted += len(pcm)
 		return nil
 	})
@@ -297,13 +463,10 @@ func TestGeminiLogsNothingWhenInterrupted(t *testing.T) {
 		<-r.Context().Done()
 	}))
 	t.Cleanup(srv.Close)
-	g, err := NewGemini(&GeminiConfig{Project: "example-project", Credentials: testCredentials(), BaseURL: srv.URL})
-	if err != nil {
-		t.Fatalf("NewGemini: %v", err)
-	}
+	g := newTestGemini(t, srv.URL, nil)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	err = g.Stream(ctx, "hello", func([]byte) error {
+	err := g.Stream(ctx, "hello", func([]byte) error {
 		cancel() // the barge-in, while the stream waits for its next event
 		return nil
 	})
@@ -353,11 +516,8 @@ func BenchmarkGeminiStream(b *testing.B) {
 	for range 50 {
 		body.WriteString(sseAudio(ramp(0, 4800)))
 	}
-	g, err := NewGemini(&GeminiConfig{
-		Project:     "example-project",
-		Credentials: testCredentials(),
-		HTTPClient:  &http.Client{Transport: cannedTransport{body: body.String()}},
-	})
+	g, err := NewEngine(testProvider(b, vertexAt(""), nil), "gemini-3.8-flash-tts", "",
+		WithHTTPClient(&http.Client{Transport: cannedTransport{body: body.String()}}))
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -414,15 +574,7 @@ func TestGeminiWarmsItsConnectionWhenTheSessionOpens(t *testing.T) {
 	srv.StartTLS()
 	t.Cleanup(srv.Close)
 	tokens := &countingToken{}
-	g, err := NewGemini(&GeminiConfig{
-		Project:     "example-project",
-		Credentials: auth.NewCredentials(&auth.CredentialsOptions{TokenProvider: tokens}),
-		BaseURL:     srv.URL,
-		HTTPClient:  srv.Client(),
-	})
-	if err != nil {
-		t.Fatalf("NewGemini: %v", err)
-	}
+	g := newTestGemini(t, srv.URL, auth.NewCredentials(&auth.CredentialsOptions{TokenProvider: tokens}), WithHTTPClient(srv.Client()))
 	s := openSession(t, g, newFakeOutput())
 	select {
 	case <-warmed:
@@ -453,14 +605,7 @@ func TestGeminiOpensWhenTheWarmUpFails(t *testing.T) {
 	}
 	gone := "http://" + ln.Addr().String()
 	_ = ln.Close()
-	g, err := NewGemini(&GeminiConfig{
-		Project:     "example-project",
-		Credentials: auth.NewCredentials(&auth.CredentialsOptions{TokenProvider: failingToken{}}),
-		BaseURL:     gone,
-	})
-	if err != nil {
-		t.Fatalf("NewGemini: %v", err)
-	}
+	g := newTestGemini(t, gone, auth.NewCredentials(&auth.CredentialsOptions{TokenProvider: failingToken{}}))
 	s, err := New(g).Open(context.Background(), &voice.Exchange{Out: newFakeOutput()})
 	if err != nil {
 		t.Fatalf("Open = %v, want the Session even though its warm-up fails", err)
@@ -487,10 +632,7 @@ func TestGeminiCloseStopsTheWarmUp(t *testing.T) {
 		}
 	}))
 	t.Cleanup(srv.Close)
-	g, err := NewGemini(&GeminiConfig{Project: "example-project", Credentials: testCredentials(), BaseURL: srv.URL})
-	if err != nil {
-		t.Fatalf("NewGemini: %v", err)
-	}
+	g := newTestGemini(t, srv.URL, nil)
 	s, err := New(g).Open(context.Background(), &voice.Exchange{Out: newFakeOutput()})
 	if err != nil {
 		t.Fatalf("Open: %v", err)
@@ -514,12 +656,12 @@ func TestGeminiCloseStopsTheWarmUp(t *testing.T) {
 	}
 }
 
-// shortGeminiStall shortens the stall timeout for one test.
-func shortGeminiStall(t *testing.T) {
+// shortStall shortens the stall timeout for one test.
+func shortStall(t *testing.T) {
 	t.Helper()
-	stall := geminiStallTimeout
-	geminiStallTimeout = 200 * time.Millisecond
-	t.Cleanup(func() { geminiStallTimeout = stall })
+	stall := stallTimeout
+	stallTimeout = 200 * time.Millisecond
+	t.Cleanup(func() { stallTimeout = stall })
 }
 
 // TestGeminiStallFailsTheStream fails if a Gemini stream that sends nothing
@@ -527,7 +669,7 @@ func shortGeminiStall(t *testing.T) {
 // two, holds the Say, and with it the exchange's floor, instead of failing
 // it with an error that says the stream stalled.
 func TestGeminiStallFailsTheStream(t *testing.T) {
-	shortGeminiStall(t)
+	shortStall(t)
 	for _, tc := range []struct {
 		name          string
 		answer, event bool
@@ -557,10 +699,7 @@ func TestGeminiStallFailsTheStream(t *testing.T) {
 				}
 			}))
 			t.Cleanup(srv.Close)
-			g, err := NewGemini(&GeminiConfig{Project: "example-project", Credentials: testCredentials(), BaseURL: srv.URL})
-			if err != nil {
-				t.Fatalf("NewGemini: %v", err)
-			}
+			g := newTestGemini(t, srv.URL, nil)
 			emitted := 0
 			done := make(chan error, 1)
 			go func() {
@@ -588,26 +727,23 @@ func TestGeminiStallFailsTheStream(t *testing.T) {
 // Output, which holds a voice that synthesises faster than real time back,
 // counts toward the stall timeout.
 func TestGeminiSlowPlaybackIsNoStall(t *testing.T) {
-	shortGeminiStall(t)
+	shortStall(t)
 	// The second event comes while the Stream still waits on the Output for
 	// the first, and the stream stays open past both waits.
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		_, _ = io.WriteString(w, sseAudio(ramp(0, 960)))
 		w.(http.Flusher).Flush()
-		time.Sleep(geminiStallTimeout / 2)
+		time.Sleep(stallTimeout / 2)
 		_, _ = io.WriteString(w, sseAudio(ramp(5, 960)))
 		w.(http.Flusher).Flush()
-		time.Sleep(3 * geminiStallTimeout)
+		time.Sleep(3 * stallTimeout)
 	}))
 	t.Cleanup(srv.Close)
-	g, err := NewGemini(&GeminiConfig{Project: "example-project", Credentials: testCredentials(), BaseURL: srv.URL})
-	if err != nil {
-		t.Fatalf("NewGemini: %v", err)
-	}
+	g := newTestGemini(t, srv.URL, nil)
 	emitted := 0
 	if err := g.Stream(context.Background(), "hello", func(pcm []byte) error {
-		time.Sleep(3 * geminiStallTimeout) // the Output holds 200 ms and plays on
+		time.Sleep(3 * stallTimeout) // the Output holds 200 ms and plays on
 		emitted += len(pcm)
 		return nil
 	}); err != nil {
@@ -618,13 +754,12 @@ func TestGeminiSlowPlaybackIsNoStall(t *testing.T) {
 	}
 }
 
-// TestNewGeminiRequiresAProjectAndCredentials fails if a Gemini engine can be
-// made that cannot reach Vertex AI.
-func TestNewGeminiRequiresAProjectAndCredentials(t *testing.T) {
-	if _, err := NewGemini(&GeminiConfig{Credentials: testCredentials()}); err == nil {
-		t.Error("NewGemini without a project succeeded")
-	}
-	if _, err := NewGemini(&GeminiConfig{Project: "example-project"}); err == nil {
-		t.Error("NewGemini without credentials succeeded")
+// TestNewEngineRequiresAVertexProject fails if an engine can be made for a
+// Vertex AI provider that names no project, which no request can reach.
+func TestNewEngineRequiresAVertexProject(t *testing.T) {
+	p := vertexAt("")
+	p.Project = ""
+	if _, err := NewEngine(testProvider(t, p, nil), "gemini-3.8-flash-tts", ""); err == nil || !strings.Contains(err.Error(), "project") {
+		t.Fatalf("NewEngine without a project = %v, want an error naming the project", err)
 	}
 }

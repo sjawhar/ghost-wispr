@@ -1,9 +1,9 @@
 // Package concierge is Wispr's meeting helper: the agent loop that answers a
 // spoken question from Dispatch's record, finds the agent that holds an issue,
 // and asks it a read-only question over Envoy. It has its own streaming,
-// tool-calling model client (Gemini through go-genai, on Vertex with the
-// unit's own Google identity), separate from internal/llm, which makes
-// summaries.
+// tool-calling model client (NewGenerator: genai's on Vertex AI or the Gemini
+// API, or chat completions on an OpenAI API provider, such as a model
+// gateway), separate from internal/llm, which makes summaries.
 //
 // Voice A leaves the turn to it (Answer). Voices B and C drive their own turn
 // and call its tools (Tools, ToolSpecs). Every question an agent is asked is
@@ -27,9 +27,11 @@ import (
 
 	"google.golang.org/genai"
 
+	"github.com/sjawhar/ghost-wispr/internal/config"
 	"github.com/sjawhar/ghost-wispr/internal/dispatch"
 	"github.com/sjawhar/ghost-wispr/internal/envoy"
-	"github.com/sjawhar/ghost-wispr/internal/genaiconfig"
+	"github.com/sjawhar/ghost-wispr/internal/providererr"
+	"github.com/sjawhar/ghost-wispr/internal/providers"
 	"github.com/sjawhar/ghost-wispr/internal/storage"
 	"github.com/sjawhar/ghost-wispr/internal/voice"
 )
@@ -39,23 +41,49 @@ import (
 // function calling, built for low-latency agentic work.
 const DefaultModel = "gemini-3.5-flash-lite"
 
-// Generator streams a model's answer; *genai.Models is one.
+// Generator streams a model's answer. NewGenerator's return their provider's
+// errors as *providererr.Error, which keeps none of the provider's words.
 type Generator interface {
 	GenerateContentStream(ctx context.Context, model string, contents []*genai.Content, config *genai.GenerateContentConfig) iter.Seq2[*genai.GenerateContentResponse, error]
 }
 
-// NewGenerator returns the Gemini client the Concierge streams from, built
-// from the unit's genai options, as the summarizer's is.
-func NewGenerator(ctx context.Context, options *genaiconfig.Options) (Generator, error) {
-	config, err := genaiconfig.BuildClientConfig(options)
-	if err != nil {
-		return nil, err
+// NewGenerator returns the model client the Concierge streams from, on
+// provider p, whose requests carry p's credential: genai's on a Vertex AI or
+// Gemini API provider, and chat completions on an OpenAI API provider, such
+// as a model gateway (openaiGenerator). It refuses a provider of another API.
+func NewGenerator(ctx context.Context, p *providers.Provider) (Generator, error) {
+	switch p.API {
+	case config.APIVertex, config.APIGemini:
+		clientConfig, err := p.GenAIConfig()
+		if err != nil {
+			return nil, fmt.Errorf("concierge: %w", err)
+		}
+		client, err := genai.NewClient(ctx, clientConfig)
+		if err != nil {
+			return nil, fmt.Errorf("concierge: create the Gemini client: %w", err)
+		}
+		return genaiGenerator{models: client.Models, provider: p.Name}, nil
+	case config.APIOpenAI:
+		return newOpenAIGenerator(p), nil
 	}
-	client, err := genai.NewClient(ctx, config)
-	if err != nil {
-		return nil, fmt.Errorf("concierge: create the Gemini client: %w", err)
+	return nil, fmt.Errorf("concierge: provider %q speaks the %s API, which the Concierge has no client for (it calls %s)", p.Name, p.API, strings.Join(config.RoleConcierge.APIs, ", "))
+}
+
+// genaiGenerator is genai's client, whose errors it reduces as the
+// provider's (providererr): genai's own text quotes the provider's message.
+type genaiGenerator struct {
+	models   *genai.Models
+	provider string // the provider's name, which its errors name
+}
+
+func (g genaiGenerator) GenerateContentStream(ctx context.Context, model string, contents []*genai.Content, cfg *genai.GenerateContentConfig) iter.Seq2[*genai.GenerateContentResponse, error] {
+	return func(yield func(*genai.GenerateContentResponse, error) bool) {
+		for response, err := range g.models.GenerateContentStream(ctx, model, contents, cfg) {
+			if !yield(response, providererr.From(g.provider, err)) {
+				return
+			}
+		}
 	}
-	return client.Models, nil
 }
 
 // Records is Dispatch's record as the tools read it; *dispatch.Client is one.
@@ -104,7 +132,8 @@ type JoinedAgent struct {
 
 // Config configures a Concierge.
 type Config struct {
-	// Model is the Gemini model; empty is DefaultModel.
+	// Model is the model, as Generator's provider names it; empty is
+	// DefaultModel, a Gemini model.
 	Model     string
 	Generator Generator
 	// Records is nil while the unit has no Dispatch token or no reach: the

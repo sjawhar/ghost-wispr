@@ -111,10 +111,12 @@ func TestIndexerOnSessionEnd(t *testing.T) {
 		t.Fatalf("expected 2 embeddings (700 words, 500 chunk size, 50 overlap), got %d", len(embeddings))
 	}
 
-	if len(client.calls) != 1 {
-		t.Fatalf("expected one embed API call due to idempotency, got %d", len(client.calls))
+	// One call a chunk, each of one text, all made by the first run: the
+	// second finds every chunk stored.
+	if len(client.calls) != 2 || len(client.calls[0]) != 1 || len(client.calls[1]) != 1 {
+		t.Fatalf("expected one embed call of one text for each of the 2 chunks, all from the first run; got %v", client.calls)
 	}
-	if len(client.taskTypes) != 1 || client.taskTypes[0] != TaskTypeDocument {
+	if len(client.taskTypes) != 2 || client.taskTypes[0] != TaskTypeDocument || client.taskTypes[1] != TaskTypeDocument {
 		t.Fatalf("expected document task type, got %#v", client.taskTypes)
 	}
 }

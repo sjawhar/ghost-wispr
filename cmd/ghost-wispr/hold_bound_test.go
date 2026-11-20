@@ -89,7 +89,7 @@ func TestAPauseDuringTheDeepgramDialLetsTheLightGoOff(t *testing.T) {
 			// starts before the start returns.
 			r.mic.open.Store(true)
 			close(opened)
-			clients <- newLiveTranscription(ctx, "test-key",
+			clients <- newLiveTranscription(ctx, fixedKey("test-key"),
 				&interfaces.ClientOptions{Host: host},
 				&interfaces.LiveTranscriptionOptions{Model: "nova-3", Language: "en-US", Encoding: "linear16", SampleRate: 16000, Channels: 1},
 				transcribe.ResilientConfig{}, transcriptCallback{}, newWarningsRegistry(), nil)

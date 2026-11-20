@@ -12,7 +12,6 @@ import (
 	api "github.com/deepgram/deepgram-go-sdk/v3/pkg/api/listen/v1/websocket/interfaces"
 
 	"github.com/sjawhar/ghost-wispr/internal/audio"
-	"github.com/sjawhar/ghost-wispr/internal/config"
 	"github.com/sjawhar/ghost-wispr/internal/server"
 	"github.com/sjawhar/ghost-wispr/internal/voice"
 )
@@ -367,7 +366,8 @@ func TestVoiceTapDropsAFrameAdmittedBeforeALightCheckClosed(t *testing.T) {
 // whatever voice.enabled says, since a person turns it on with no restart),
 // or sends them with no speaker.
 func TestLiveOptionsCarryTheWakeKeyterms(t *testing.T) {
-	cfg := config.Config{DeepgramModel: "nova-3", SpeakerEnabled: true, Voice: config.Voice{WakePhrases: []string{"Wispr", "Ghost Wispr"}}}
+	cfg := deepgramKeyConfig("")
+	cfg.SpeakerEnabled, cfg.Voice.WakePhrases = true, []string{"Wispr", "Ghost Wispr"}
 	if got := liveTranscriptionOptions(&cfg, 16000, nil).Keyterm; !slices.Equal(got, []string{"Wispr", "Ghost Wispr"}) {
 		t.Errorf("keyterms %q with a speaker and the voice off, want the wake phrases", got)
 	}
