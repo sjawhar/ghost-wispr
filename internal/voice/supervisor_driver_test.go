@@ -83,6 +83,13 @@ func TestADriverVoiceThatFailsPlaysTheWholeErrorSound(t *testing.T) {
 // exchange ends in the gap between its answer tool returning and the voice
 // speaking the answer, because a follow-up window the routing line opened ran
 // out then (voice C's follow_up_race: 3 of 3 runs lost the answer).
+//
+// The tool is called once the exchange holds its session (the exchange's
+// start event), as a vendor calls it over the open session. The fake voice
+// hands the test its session from inside Open, before the Supervisor holds
+// it, and a tool called then finds no session to speak the routing line
+// through: the line then leads the answer instead, and the test, waiting for
+// it to be spoken at once, would time out.
 func TestAnAnswerReturningAsTheFollowUpWindowCloses(t *testing.T) {
 	c := newFakeConcierge("The issue is in review.")
 	c.acks = []string{"Reading ABC-12."}
@@ -90,6 +97,7 @@ func TestAnAnswerReturningAsTheFollowUpWindowCloses(t *testing.T) {
 	r := newDrivingRigWith(t, time.Minute, c)
 	r.heard("Wispr, what is happening with ABC-12?", true, true)
 	sess := r.waitSession()
+	r.waitEvent(EventExchangeStarted + ":sess-1")
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
