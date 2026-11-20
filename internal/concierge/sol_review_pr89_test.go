@@ -138,3 +138,58 @@ func TestSolExplicitAskKeepsKeyWhenSendOutlastsAnswer(t *testing.T) {
 		})
 	}
 }
+
+func TestSolPendingAskRetriesBeforeFixedSentence(t *testing.T) {
+	for _, keyless := range []bool{false, true} {
+		name := "control_keyed_first_attempt"
+		if keyless {
+			name = "keyless_first_then_valid_second"
+		}
+		t.Run(name, func(t *testing.T) {
+			r := newRig(t)
+			heldIssue(r, "session", false)
+			r.concierge.fastBound = time.Second
+			r.concierge.knownBound = 2 * time.Second
+			release, finished := make(chan struct{}), make(chan struct{})
+			r.agents.onSend = func(context.Context, string) error {
+				defer close(finished)
+				<-release
+				return nil
+			}
+			first := "ABC-12 is in progress, updated 2 hours ago."
+			if keyless {
+				first = "It is in progress, updated 2 hours ago."
+			}
+			r.model.turns = [][]*genai.GenerateContentResponse{
+				{chunk(text(first))},
+				{chunk(text("ABC-12 is in progress, updated 2 hours ago."))},
+			}
+			var got []said
+			err := r.concierge.Answer(context.Background(), &r.exchange, "ask the agent on ABC-12 when it will be ready?", recorder(&got))
+			close(release)
+			select {
+			case <-finished:
+			case <-time.After(time.Second):
+				t.Fatal("the probe did not reach the held send")
+			}
+			var texts []string
+			for _, s := range got {
+				texts = append(texts, s.text)
+			}
+			spoken := strings.Join(texts, " ")
+			wantCalls := 1
+			if keyless {
+				wantCalls = 2
+			}
+			if err != nil {
+				t.Fatalf("Answer = %v, model calls = %d, spoken %q", err, len(r.model.requests), spoken)
+			}
+			if len(r.model.requests) != wantCalls {
+				t.Fatalf("model calls = %d, want %d before a fixed fallback", len(r.model.requests), wantCalls)
+			}
+			if strings.Contains(spoken, fixedSentence) {
+				t.Fatalf("the fixed fallback replaced an available valid answer: %q", spoken)
+			}
+		})
+	}
+}

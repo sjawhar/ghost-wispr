@@ -661,8 +661,8 @@ func TestAnAskedQuestionUsesTheFixedSentence(t *testing.T) {
 	}
 	var spoken []said
 	err := r.concierge.Answer(context.Background(), &r.exchange, "ask the agent on ABC-12 whether the tap is merged", recorder(&spoken))
-	if err != nil || len(spoken) != 2 || spoken[0].text != fixedSentence || !strings.Contains(spoken[1].text, "asked the agent on ABC-12") {
-		t.Fatalf("Answer = %v, spoken %+v; want the fixed sentence then the asked line", err, spoken)
+	if err != nil || len(spoken) != 2 || spoken[0].text != "ABC-12: "+fixedSentence || !strings.Contains(spoken[1].text, "asked the agent on ABC-12") {
+		t.Fatalf("Answer = %v, spoken %+v; want the keyed fixed sentence then the asked line", err, spoken)
 	}
 }
 
@@ -787,10 +787,10 @@ func TestTheQuestionsOwnWordsAreNoInvention(t *testing.T) {
 	}
 	r := newRig(t)
 	heldIssue(r, "session", false)
-	r.model.turns = [][]*genai.GenerateContentResponse{{chunk(text("The record does not say when SliceOne will be ready to try."))}}
+	r.model.turns = [][]*genai.GenerateContentResponse{{chunk(text("ABC-12: The record does not say when SliceOne will be ready to try."))}}
 	spoken := answerTurn(t, r, "please ask the agent on ABC-12 when SliceOne will be ready to try")
-	if len(spoken) == 0 || spoken[0].text != "The record does not say when SliceOne will be ready to try." {
-		t.Fatalf("spoken = %+v, want the sentence that says the question's name back", spoken)
+	if len(spoken) == 0 || spoken[0].text != "ABC-12: The record does not say when SliceOne will be ready to try." {
+		t.Fatalf("spoken = %+v, want the keyed sentence that says the question's name back", spoken)
 	}
 }
 
