@@ -2,6 +2,8 @@ package transcribe
 
 import (
 	"context"
+	"errors"
+	"io"
 	"slices"
 	"sync/atomic"
 	"time"
@@ -38,6 +40,9 @@ func NewResilientClient(
 	}
 	if config.MaxReconnectBackoff <= 0 {
 		config.MaxReconnectBackoff = 30 * time.Second
+	}
+	if config.GracefulCloseWait <= 0 {
+		config.GracefulCloseWait = DefaultGracefulCloseWait
 	}
 
 	if logger == nil {
@@ -95,20 +100,36 @@ func (rc *ResilientClient) write(p []byte, queued *atomic.Int64) (int, error) {
 	}
 	rc.Mu.Unlock()
 
-	if _, err := client.Write(p); err == nil {
-		return len(p), nil
+	for {
+		if _, err := client.Write(p); err == nil {
+			return len(p), nil
+		}
+
+		rc.Mu.Lock()
+		if rc.Client == client {
+			// The socket that failed is the client's: it is broken.
+			if _, writeErr := rc.Buffer.Write(p); writeErr != nil {
+				rc.log("failed to buffer audio after write error: %v", writeErr)
+			}
+			rc.setStateLocked(StateDisconnected)
+			rc.Mu.Unlock()
+			rc.startReconnect()
+			return len(p), nil
+		}
+		// The socket was replaced while p was on its way, as after an options
+		// change: the failure is the old socket's, not the client's. p goes
+		// where the client sends audio now: the buffer, which the reconnect
+		// owner still drains, or the successor, once it is connected.
+		if rc.State != StateConnected || rc.Client == nil {
+			if _, writeErr := rc.Buffer.Write(p); writeErr != nil {
+				rc.log("failed to buffer audio after write error: %v", writeErr)
+			}
+			rc.Mu.Unlock()
+			return len(p), nil
+		}
+		client = rc.Client
+		rc.Mu.Unlock()
 	}
-
-	rc.Mu.Lock()
-	if _, writeErr := rc.Buffer.Write(p); writeErr != nil {
-		rc.log("failed to buffer audio after write error: %v", writeErr)
-	}
-	rc.setStateLocked(StateDisconnected)
-	rc.Mu.Unlock()
-
-	rc.startReconnect()
-
-	return len(p), nil
 }
 
 // Close stops reconnection attempts and the hand-over of state changes, and
@@ -237,43 +258,106 @@ func (rc *ResilientClient) notifyStateChanges(done chan struct{}) {
 // one is, and a failed dial is retried with backoff, as after a disconnect.
 func (rc *ResilientClient) ConnectInBackground() {
 	rc.Mu.Lock()
+	rc.owning = true
 	rc.setStateLocked(StateReconnecting)
 	rc.Mu.Unlock()
 	go rc.reconnect(0)
 }
 
-// startReconnect starts a background reconnect goroutine (safe to call multiple times).
+// OptionsChanged tells the client its factory's options changed, such as the
+// meeting voice turned on or off changing no_delay. It only marks the change:
+// the one reconnect owner redials once with the new options at its next safe
+// point, losing no audio. A dial or a drain under way finishes first, and the
+// owner redials after it if its dial predates the change. With no owner
+// running, the client is connected, and the change starts one, which rotates
+// the socket: the audio written from now on is buffered, the old socket ends
+// its stream gracefully and returns its final results (GracefulCloser), then
+// a new socket is dialled with the current options and the buffer drained
+// into it.
+func (rc *ResilientClient) OptionsChanged() {
+	rc.Mu.Lock()
+	defer rc.Mu.Unlock()
+	rc.optionsGen++
+	if rc.owning || rc.ctx.Err() != nil {
+		return // the owner redials at its next safe point
+	}
+	rc.owning = true
+	rc.setStateLocked(StateReconnecting) // the audio written from here is buffered
+	go rc.rotate()
+}
+
+// startReconnect starts the reconnect owner after a socket failed, unless one
+// runs already: there is only ever one (owning).
 func (rc *ResilientClient) startReconnect() {
 	rc.Mu.Lock()
-	if rc.State == StateReconnecting {
+	if rc.owning || rc.ctx.Err() != nil {
 		rc.Mu.Unlock()
 		return
 	}
+	rc.owning = true
 	rc.setStateLocked(StateReconnecting)
 	rc.Mu.Unlock()
 
 	go rc.reconnect(rc.Config.InitialReconnectDelay)
 }
 
-// reconnect dials after wait, then again with exponential backoff, until a
-// socket is connected and the buffered audio sent. Stops when rc.ctx is
-// cancelled. It first closes the socket that failed, which returns once that
-// socket has handed on its last result: no result timed in the old socket's
-// stream is then read against the new one's (CapturedSince).
+// reconnect is the owner after a socket failed: it closes that socket, which
+// returns once the socket has handed on its last result, so no result timed in
+// the old socket's stream is read against the new one's (CapturedSince), then
+// dials until a socket is connected and the buffered audio sent.
 func (rc *ResilientClient) reconnect(wait time.Duration) {
+	rc.Mu.Lock()
+	rc.owning = true
+	failed := rc.Client
+	rc.Mu.Unlock()
+	if failed != nil {
+		_ = failed.Close()
+	}
+	rc.dialUntilConnected(wait)
+}
+
+// rotate is the owner after an options change replaced a healthy socket: the
+// old socket ends its stream gracefully and returns its final results before
+// the new one is dialled, so the audio it accepted is transcribed, and the
+// audio written since the change, buffered, goes to the new socket.
+func (rc *ResilientClient) rotate() {
+	rc.Mu.Lock()
+	old := rc.Client
+	rc.Mu.Unlock()
+	if old != nil {
+		rc.closeGracefully(old)
+	}
+	rc.dialUntilConnected(0)
+}
+
+// closeGracefully ends c's stream gracefully when it can (GracefulCloser),
+// within GracefulCloseWait, and closes it at once otherwise.
+func (rc *ResilientClient) closeGracefully(c io.WriteCloser) {
+	if graceful, ok := c.(GracefulCloser); ok {
+		_ = graceful.CloseGracefully(rc.Config.GracefulCloseWait)
+		return
+	}
+	_ = c.Close()
+}
+
+// errOptionsChanged is what a drain reports when it emptied the buffer into a
+// socket whose dial predates an options change: the owner then rotates.
+var errOptionsChanged = errors.New("the options changed since the socket was dialled")
+
+// dialUntilConnected dials after wait, then again with exponential backoff,
+// until a socket is connected and the buffered audio sent; it stops when rc.ctx
+// is cancelled. Each dial reads the options the factory builds then, and the
+// generation of the options it saw: right after the handshake, and when the
+// drain empties the buffer, a later options change makes the owner end that
+// socket and dial once more, so the client never stays on stale options. No
+// audio is lost to it: the buffer keeps everything not yet sent.
+func (rc *ResilientClient) dialUntilConnected(wait time.Duration) {
 	next := rc.Config.InitialReconnectDelay
 	if wait > 0 {
 		next = min(2*wait, rc.Config.MaxReconnectBackoff)
 	}
 	backOff := func() {
 		wait, next = next, min(2*next, rc.Config.MaxReconnectBackoff)
-	}
-
-	rc.Mu.Lock()
-	failed := rc.Client
-	rc.Mu.Unlock()
-	if failed != nil {
-		_ = failed.Close()
 	}
 
 	for {
@@ -285,6 +369,11 @@ func (rc *ResilientClient) reconnect(wait time.Duration) {
 		case <-timer.C:
 		}
 
+		// The generation is read before the factory reads the options, so a
+		// change between them makes one extra redial, never a missed one.
+		rc.Mu.Lock()
+		gen := rc.optionsGen
+		rc.Mu.Unlock()
 		newClient, err := rc.Factory(rc.ctx)
 		if err != nil {
 			rc.log("deepgram reconnect failed (retrying in %v): %v", next, err)
@@ -299,7 +388,17 @@ func (rc *ResilientClient) reconnect(wait time.Duration) {
 			_ = newClient.Close()
 			return
 		}
+		if rc.optionsGen != gen {
+			// The options changed during the handshake: this socket has had
+			// no audio, so it ends at once and the owner dials again.
+			rc.Mu.Unlock()
+			rc.log("deepgram: the options changed during the dial; dialling again with them")
+			_ = newClient.Close()
+			wait = 0
+			continue
+		}
 		rc.Client = newClient
+		rc.dialedGen = gen
 		// The new socket's stream starts at the oldest buffered byte.
 		rc.origin = rc.accepted - int64(rc.Buffer.Len())
 		rc.keepDropsAfterLocked(rc.origin)
@@ -307,12 +406,21 @@ func (rc *ResilientClient) reconnect(wait time.Duration) {
 		rc.Mu.Unlock()
 
 		if err := rc.drainBuffer(); err != nil {
-			// The new socket is dead too: keep the rest of the buffer for
-			// the next one rather than throwing it into this one.
-			rc.log("deepgram socket failed while draining buffered audio (redialling in %v): %v", next, err)
 			rc.Mu.Lock()
 			rc.setStateLocked(StateReconnecting)
 			rc.Mu.Unlock()
+			if errors.Is(err, errOptionsChanged) {
+				// The buffer went to this socket, which the change made
+				// stale: it returns its final results, then the owner dials
+				// again for the audio buffered since.
+				rc.log("deepgram: the options changed during the drain; redialling with them")
+				rc.closeGracefully(newClient)
+				wait = 0
+				continue
+			}
+			// The new socket is dead too: keep the rest of the buffer for
+			// the next one rather than throwing it into this one.
+			rc.log("deepgram socket failed while draining buffered audio (redialling in %v): %v", next, err)
 			_ = newClient.Close()
 			backOff()
 			continue
@@ -343,9 +451,13 @@ func (rc *ResilientClient) drainBuffer() error {
 }
 
 // drainChunk writes one buffered chunk and reports whether to drain another.
-// It makes the client connected under the lock that finds the buffer empty:
-// a write before that is buffered for this drain and a write after it goes
-// to the socket, so no audio is left in a buffer nothing drains.
+// It makes the client connected, and ends the owner's run, under the lock that
+// finds the buffer empty: a write before that is buffered for this drain and a
+// write after it goes to the socket, so no audio is left in a buffer nothing
+// drains. If the options changed since this socket's dial, it leaves the
+// client buffering and reports errOptionsChanged instead, so the owner, still
+// the only one, rotates: the check and the hand-over to connected are one step,
+// so no change is lost between them.
 func (rc *ResilientClient) drainChunk(buf []byte) (bool, error) {
 	rc.drainMu.Lock()
 	defer rc.drainMu.Unlock()
@@ -354,7 +466,12 @@ func (rc *ResilientClient) drainChunk(buf []byte) (bool, error) {
 	n, _ := rc.Buffer.Read(buf)
 	client := rc.Client
 	if n == 0 || client == nil {
+		if client != nil && rc.optionsGen != rc.dialedGen && rc.ctx.Err() == nil {
+			rc.Mu.Unlock()
+			return false, errOptionsChanged
+		}
 		rc.setStateLocked(StateConnected)
+		rc.owning = false
 	}
 	rc.Mu.Unlock()
 

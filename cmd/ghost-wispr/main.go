@@ -493,10 +493,12 @@ var _ keptMessager = (*session.Manager)(nil)
 
 // Message hands a Deepgram result to the session manager, then what the
 // manager's transcript kept of it to the voice, with the capture gate's stamp
-// and the time taken as the result arrived: the manager's work comes first,
-// and on the first words of a recording session it starts the session.
+// and the time this callback began handling it, before the manager's work: the
+// SDK runs the callbacks in turn off its one receive loop, so this is
+// callback-entry time, not Deepgram's transport time. On the first words of a
+// recording session the manager's work starts the session.
 func (c transcriptCallback) Message(mr *api.MessageResponse) error {
-	arrived := time.Now()
+	entered := time.Now()
 	var closings int
 	open := true
 	if c.stamp != nil {
@@ -512,7 +514,7 @@ func (c transcriptCallback) Message(mr *api.MessageResponse) error {
 		err = manager.Message(mr)
 	}
 	if c.voice != nil && kept != nil {
-		if t := voiceTranscript(kept, arrived, func() (int, bool) { return closings, open }); t != nil {
+		if t := voiceTranscript(kept, entered, func() (int, bool) { return closings, open }); t != nil {
 			c.voice.OnTranscript(t)
 		}
 	}
@@ -566,9 +568,11 @@ func (c transcriptCallback) Metadata(*api.MetadataResponse) error { return nil }
 func (c transcriptCallback) SpeechStarted(*api.SpeechStartedResponse) error { return nil }
 
 // UtteranceEnd hands Deepgram's UtteranceEnd to the session manager, then to
-// the voice with the gate's stamp and the time taken as it arrived.
+// the voice with the gate's stamp and the time this callback began handling it,
+// before the manager's work: callback-entry time, not Deepgram's transport time
+// (Message).
 func (c transcriptCallback) UtteranceEnd(ur *api.UtteranceEndResponse) error {
-	arrived := time.Now()
+	entered := time.Now()
 	var closings int
 	open := true
 	if c.stamp != nil {
@@ -579,7 +583,7 @@ func (c transcriptCallback) UtteranceEnd(ur *api.UtteranceEndResponse) error {
 		err = c.manager.UtteranceEnd(ur)
 	}
 	if c.voice != nil {
-		c.voice.OnUtteranceEnd(closings, open, arrived)
+		c.voice.OnUtteranceEnd(closings, open, entered)
 	}
 	return err
 }
@@ -669,6 +673,16 @@ func (w tappedWriter) WriteWithGateStamp(p []byte, gate *captureGate, closings i
 
 // liveTranscriptionOptions are the live Deepgram request's options for a
 // microphone at sampleRate, with Dispatch's project keys as keyterms.
+// NoDelay is on only while the meeting voice is enabled, where a fast turn
+// end matters: with smart formatting Deepgram holds a final whose last words
+// look like an unfinished number until 3 s of silence, and a question to the
+// voice often ends in an issue key ("INFRA ten twenty-seven"). It trades some
+// of Deepgram's number and entity formatting for that speed (Deepgram's
+// "Streaming finalization behavior"); the voice reads a spoken key either way.
+// A unit recording with the voice off keeps Deepgram's full formatting, as
+// nothing waits for the turn's end. A change of voice.enabled marks the
+// stream's options changed (ResilientClient.OptionsChanged), so the socket
+// follows the setting.
 func liveTranscriptionOptions(cfg *config.Config, sampleRate int, projects []string) *interfaces.LiveTranscriptionOptions {
 	return &interfaces.LiveTranscriptionOptions{
 		Model:          cfg.DeepgramModel,
@@ -676,6 +690,7 @@ func liveTranscriptionOptions(cfg *config.Config, sampleRate int, projects []str
 		Diarize:        true,
 		Punctuate:      true,
 		SmartFormat:    true,
+		NoDelay:        cfg.Voice.Enabled,
 		Encoding:       "linear16",
 		SampleRate:     sampleRate,
 		Channels:       1,
@@ -760,10 +775,13 @@ func refreshKeptRawRecordings(ctx context.Context, kept *keptRecordings, budgetM
 }
 
 // makeDeepgramClientFactory dials live-transcription sockets the app owns
-// (deepgramSocket), each write bounded by writeTimeout.
-func makeDeepgramClientFactory(_ context.Context, apiKey string, cOptions *interfaces.ClientOptions, tOptions *interfaces.LiveTranscriptionOptions, callback transcriptCallback, writeTimeout time.Duration) transcribe.ClientFactory {
+// (deepgramSocket), each write bounded by writeTimeout. optsFor builds the
+// request options fresh for each dial, so a reconnect (after a disconnect or a
+// forced one) carries the settings as they stand, such as no_delay following
+// voice.enabled.
+func makeDeepgramClientFactory(_ context.Context, apiKey string, cOptions *interfaces.ClientOptions, optsFor func() *interfaces.LiveTranscriptionOptions, callback transcriptCallback, writeTimeout time.Duration) transcribe.ClientFactory {
 	return func(factoryCtx context.Context) (io.WriteCloser, error) {
-		return dialDeepgramLive(factoryCtx, apiKey, cOptions, tOptions, callback, writeTimeout)
+		return dialDeepgramLive(factoryCtx, apiKey, cOptions, optsFor(), callback, writeTimeout)
 	}
 }
 
@@ -1898,10 +1916,15 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 		}
 
 		cOptions := &interfaces.ClientOptions{EnableKeepAlive: true}
-		tOptions := liveTranscriptionOptions(&cfg, sampleRate, dispatchProjects.Get())
+		// Fresh options per dial, so a redial follows the live settings: a
+		// change of voice.enabled changes no_delay (OptionsChanged, below).
+		optsFor := func() *interfaces.LiveTranscriptionOptions {
+			current := cfgStore.Get()
+			return liveTranscriptionOptions(&current, sampleRate, dispatchProjects.Get())
+		}
 		resilientConfig := liveTranscriptionConfig(&cfg, sampleRate)
 		callback := transcriptCallback{manager: manager, voice: &voiceHooks, stamp: capture.voiceStamp}
-		candidateResilient := newLiveTranscription(ctx, cfg.DeepgramAPIKey, cOptions, tOptions, resilientConfig, callback, warningRegistry, hub)
+		candidateResilient := newLiveTranscription(ctx, cfg.DeepgramAPIKey, cOptions, optsFor, resilientConfig, callback, warningRegistry, hub)
 		resilientRef.Store(candidateResilient)
 		deepgramSendRef.Store(startMicMonitoring(ctx, &micLoops, capture, ordered, audioRecorder, candidateResilient, voiceAudio, micWait, log.Printf, hub))
 		return nil
@@ -2047,6 +2070,21 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 		}, appLogger)
 		conc.followEnabled(cfg.Voice.Enabled) // a failed start is logged; each call then answers unreachable
 		onConfigChange(cfgStore, followVoiceEnabled(&voiceHooks, conc))
+		// The live transcription asks for no_delay only while the meeting voice
+		// is enabled (liveTranscriptionOptions). A change of that setting marks
+		// the stream's options changed; its one reconnect owner redials once
+		// with them at the next safe point, ending the old socket gracefully,
+		// and losing no audio. The factory builds the options fresh each dial.
+		voiceEnabledDialled := &atomic.Bool{}
+		voiceEnabledDialled.Store(cfg.Voice.Enabled)
+		onConfigChange(cfgStore, func(newCfg *config.Config) {
+			if voiceEnabledDialled.Swap(newCfg.Voice.Enabled) == newCfg.Voice.Enabled {
+				return
+			}
+			if rc := resilientRef.Load(); rc != nil {
+				rc.OptionsChanged()
+			}
+		})
 		if err := startVoice(&voiceDeps{
 			output:      output,
 			tap:         voiceTap,
