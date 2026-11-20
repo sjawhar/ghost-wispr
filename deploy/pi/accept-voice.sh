@@ -2013,7 +2013,7 @@ press() {
 unit_sockets() {
   ss -tinpH | awk -v pid="$unit_pid" '
     function flush() { if (mine && bytes != "") print local_address, peer, bytes }
-    /^[A-Z][A-Z0-9-]*[[:space:]]/ {
+    /^[[:upper:]][[:upper:][:digit:]-]*[[:space:]]/ {
       flush()
       mine = index($0, "pid=" pid ",") > 0
       local_address = $4; peer = $5; bytes = ""
