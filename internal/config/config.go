@@ -208,23 +208,32 @@ const oldDefaultDeepgramBufferSize = 1920000
 // It returns the config, any validation warnings, and an error if the file
 // exists but cannot be read or parsed.
 func Load(path string) (Config, []string, error) {
-	cfg := defaults()
-	warnings := deprecatedEnvoyEnvironmentWarnings()
+	cfg, _, warnings, err := load(path)
+	return cfg, warnings, err
+}
+
+// load is Load that also returns the log_level the config file names, or the
+// default: GHOST_WISPR_LOG_LEVEL overrides it in memory only, so a settings
+// change writes this one back.
+func load(path string) (cfg Config, fileLogLevel string, warnings []string, err error) {
+	cfg = defaults()
+	warnings = deprecatedEnvoyEnvironmentWarnings()
 
 	if path != "" {
 		data, err := os.ReadFile(path)
 		if err != nil {
 			if !os.IsNotExist(err) {
-				return cfg, nil, fmt.Errorf("read config file: %w", err)
+				return cfg, "", nil, fmt.Errorf("read config file: %w", err)
 			}
 		} else {
 			if err := yaml.Unmarshal(data, &cfg); err != nil {
-				return cfg, nil, fmt.Errorf("parse config file: %w", err)
+				return cfg, "", nil, fmt.Errorf("parse config file: %w", err)
 			}
 			warnings = append(warnings, deprecatedEnvoyConfigWarnings(data)...)
 		}
 	}
 
+	fileLogLevel = cfg.LogLevel
 	warnings = append(warnings, applyEnvOverrides(&cfg)...)
 	// A settings save under a build before the default followed the
 	// microphone's rate wrote its default, 60 s at 16000 Hz, into the file;
@@ -236,7 +245,7 @@ func Load(path string) (Config, []string, error) {
 	// check off and let the recorder capture with no light on.
 	cfg.IndicatorLight = strings.ToLower(strings.TrimSpace(cfg.IndicatorLight))
 	if cfg.IndicatorLight != "" && cfg.IndicatorLight != IndicatorLightBlink1 {
-		return cfg, warnings, fmt.Errorf("indicator_light %q is not a known light: set it to %q, or leave it unset for a recorder with no light", cfg.IndicatorLight, IndicatorLightBlink1)
+		return cfg, "", warnings, fmt.Errorf("indicator_light %q is not a known light: set it to %q, or leave it unset for a recorder with no light", cfg.IndicatorLight, IndicatorLightBlink1)
 	}
 	credentialPath := cfg.GoogleCredentialsFile
 	if credentialPath == "" {
@@ -247,7 +256,7 @@ func Load(path string) (Config, []string, error) {
 	loadSecrets(&cfg)
 
 	warnings = append(warnings, validate(&cfg, googleCredentialInfo.hasExternalAccount)...)
-	return cfg, warnings, nil
+	return cfg, fileLogLevel, warnings, nil
 }
 
 // removedEnvoyKeys are the settings of the Envoy paths Ghost Wispr no longer
