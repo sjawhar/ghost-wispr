@@ -166,7 +166,7 @@ func (c *Concierge) answer(parent context.Context, x *voice.Exchange, turn strin
 	// person's "ask" needs only the holder, so it goes out once the holder
 	// is known, before the rest of the record is read (R7).
 	asking := make(chan askResult, 1)
-	askReady := make(chan struct{})
+
 	var askStarted, askFinished atomic.Bool
 	var askingKey atomic.Pointer[string]
 	startAsk := func(session string, found *reading) {
@@ -175,7 +175,7 @@ func (c *Concierge) answer(parent context.Context, x *voice.Exchange, turn strin
 			go func() {
 				result := c.ask(ctx, x, session, turn, found)
 				askFinished.Store(true)
-				close(askReady)
+
 				asking <- result
 			}()
 		}
@@ -296,13 +296,7 @@ func (c *Concierge) answer(parent context.Context, x *voice.Exchange, turn strin
 				stopFacts()
 			}
 		})
-		if askStarted.Load() && !askFinished.Load() {
-			select {
-			case <-askReady:
-			case <-time.After(100 * time.Millisecond):
-			}
-		}
-		err = c.facts(factsCtx, tools, turn, found, askStarted.Load(), askStarted.Load() && !askFinished.Load(), sp)
+		err = c.facts(parent, factsCtx, tools, turn, found, askStarted.Load(), askStarted.Load() && !askFinished.Load(), sp)
 		knownTimer.Stop()
 		switch {
 		case parent.Err() != nil:
@@ -758,7 +752,7 @@ func direct(question string) string {
 // more, told why, and after a second failure the voice says R8's fixed
 // sentence, led by the question's key when the first fact had to name it.
 // R8's bounds hold across both tries.
-func (c *Concierge) facts(ctx context.Context, tools *runner, turn string, found *reading, asking, askPending bool, sp *speaker) error {
+func (c *Concierge) facts(parent, ctx context.Context, tools *runner, turn string, found *reading, asking, askPending bool, sp *speaker) error {
 	prompt := c.turnPrompt(transcriptOf(tools.x.Recent), turn)
 	switch {
 	case found.text == "":
@@ -798,6 +792,13 @@ func (c *Concierge) facts(ctx context.Context, tools *runner, turn string, found
 		// it was given, with no tool (R6, R7).
 		budget = 0
 	}
+	fixed := func() error {
+		fallback := fixedSentence
+		if questionKey != "" {
+			fallback = questionKey + ": " + fallback
+		}
+		return sp.sayText(ctx, fallback, voice.Fact)
+	}
 	reason := ""
 	for try := 1; try <= earTries; try++ {
 		note := ""
@@ -807,27 +808,28 @@ func (c *Concierge) facts(ctx context.Context, tools *runner, turn string, found
 		if reason != "" {
 			note += "\n\nYour last answer failed R8's check: " + reason + ". Answer again from the record only, in the form asked."
 		}
-		err := c.generate(ctx, tools, prompt+note, said, &budget)
+		attempt := ctx
+		cancel := func() {}
+		if askPending && reason != "" {
+			attempt, cancel = context.WithTimeout(parent, time.Second)
+		}
+		err := c.generate(attempt, tools, prompt+note, said, &budget)
 		var invented *inventedError
+		cancel()
 		if !errors.As(err, &invented) {
+			if askPending && reason != "" {
+				if said.spoken > 0 {
+					return nil
+				}
+				return fixed()
+			}
 			return err
 		}
 		reason = invented.reason
 		c.logger.Info("concierge's fast answer failed R8's check", "try", try, "reason", reason)
-		if askPending {
-			fallback := fixedSentence
-			if questionKey != "" {
-				fallback = questionKey + ": " + fallback
-			}
-			return sp.sayText(ctx, fallback, voice.Fact)
-		}
 	}
 	c.logger.Warn("concierge speaks R8's fixed sentence: no fast answer passed R8's check", "reason", reason)
-	fallback := fixedSentence
-	if questionKey != "" {
-		fallback = questionKey + ": " + fallback
-	}
-	return sp.sayText(ctx, fallback, voice.Fact)
+	return fixed()
 }
 
 var (

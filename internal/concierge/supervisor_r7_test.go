@@ -230,8 +230,8 @@ func newR7Rig(t *testing.T) *r7Rig {
 		projects: []string{"ABC"},
 	}
 	model := &scriptedModel{turns: [][]*genai.GenerateContentResponse{
-		{chunk(text("PR 80 is in review."))}, // the fast answer's facts
-		{chunk(text(r7Answer))},              // the holder's answer, for the ear
+		{chunk(text("ABC-12: PR 80 is in review."))},
+		{chunk(text(r7Answer))},
 	}}
 	r := &r7Rig{
 		t:       t,
