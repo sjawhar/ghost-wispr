@@ -98,6 +98,8 @@ issue_live=
 issue_stopped=
 issue_person=
 issue_none=
+mention=
+join_issue=
 keep=false
 event_timeout=60
 answer_timeout=300
@@ -122,6 +124,11 @@ Steps:
                       --rig-mic.
   reach               the Pi reaches Dispatch, the Envoy hub and its NATS port, and its own Envoy
                       session is live. Changes nothing.
+  joined              a test agent session (ghost-wispr joined-probe, an Envoy session of its own)
+                      takes the join message for --join-issue, joins, gets a pointer when --mention
+                      names the issue, reads that part of the transcript, asks for the floor, is
+                      spoken on --go-ahead and leaves; agent_joined and agent_left on /ws, and the
+                      hand sound at the Jabra. Needs --rig-mic.
   holder-cases        ghost-wispr issue-holder on four scratch issues. Needs --issue-live,
                       --issue-stopped, --issue-person, --issue-none. Changes nothing.
   scripted            --questions N questions from --question-dir for each --engine (voice.engine:
@@ -136,11 +143,11 @@ Steps:
                       playback. Needs --rig-mic.
   tts-first-audio     --sentences N sentences to each --engine (gemini, aura2 or aura,
                       gemini-clip) through ghost-wispr tts-first-audio. Changes nothing.
-  states, listener-cpu, pause-closes-vendors, vendor-probe, joined, room-test, measure-echo:
+  states, listener-cpu, pause-closes-vendors, vendor-probe, room-test, measure-echo:
                       not in this build; each prints UNKNOWN.
 
 Options:
-  --question WAV --go-ahead WAV --second-question WAV --never-mind WAV --stop-clip WAV
+  --question WAV --go-ahead WAV --second-question WAV --never-mind WAV --stop-clip WAV --mention WAV
                       spoken clips, made with any speech synthesizer; each goes into the
                       microphone's side of the loopback
   --question-dir DIR --talkover-dir DIR --backchannel-dir DIR
@@ -151,7 +158,7 @@ Options:
                       counts (defaults $calls, $questions, $talkovers, $backchannels, $stops, $sentences)
   --engine NAME       repeatable
   --rig-mic PCM       the USB microphone about 30 cm from the Jabra, such as plughw:CARD=Mic,DEV=0
-  --issue-live KEY --issue-stopped KEY --issue-person KEY --issue-none KEY
+  --issue-live KEY --issue-stopped KEY --issue-person KEY --issue-none KEY --join-issue KEY
                       scratch issues: claimed by a live agent session, by a stopped one, by a
                       person, and by nobody with no session in its events. The steps only read them.
   --keep              keep the recordings and captures, and print where
@@ -205,7 +212,7 @@ while (($#)); do
       --talkover-dir | --backchannel-dir | --sentences-file | --calls | --questions | --talkovers | \
       --backchannels | --stops | --sentences | --engine | --rig-mic | --issue-live | --issue-stopped | \
       --issue-person | --issue-none | --event-timeout | --answer-timeout | --chime-ms | --speech-ms | \
-      --playback-seconds | --rounds | --sessions | --script)
+      --playback-seconds | --rounds | --sessions | --script | --mention | --join-issue)
       (($# >= 2)) || usage_error "$1 needs a value"
       case $1 in
         --step) step=$2 ;;
@@ -231,6 +238,8 @@ while (($#)); do
         --issue-person) issue_person=$2 ;;
         --issue-none) issue_none=$2 ;;
         --event-timeout) event_timeout=$2 ;;
+        --mention) mention=$2 ;;
+        --join-issue) join_issue=$2 ;;
         --answer-timeout) answer_timeout=$2 ;;
         --chime-ms) chime_ms=$2 ;;
         --speech-ms) speech_ms=$2 ;;
@@ -260,7 +269,7 @@ case $step in
   listener-cpu) unknown 'listener-cpu: not in this build: the paused listener is slice 4' ;;
   pause-closes-vendors) unknown 'pause-closes-vendors: not in this build: voices B and C (gptlive, dgagent) are slices 2 and 3' ;;
   vendor-probe) unknown 'vendor-probe: not in this build: voices B and C (gptlive, dgagent) are slices 2 and 3' ;;
-  joined) unknown 'joined: not in this build: joined agents are slice 5' ;;
+  joined) changes_unit=true ;;
   room-test) unknown 'room-test: not in this build: measurement 3 runs last, with the people in the room' ;;
   measure-echo) unknown 'measure-echo: not in this build: measurement 1 runs on the main branch before the voice, with a person present' ;;
   exchange | wake-sound | scripted | ask-holder | barge-in | playback-cancel) changes_unit=true ;;
@@ -293,6 +302,12 @@ need_clips() {
 readonly rig_need='the USB microphone about 30 cm from the Jabra'
 case $step in
   exchange) need --question "$question" 'the spoken question' ;;
+  joined)
+    need --join-issue "$join_issue" 'an issue a test agent joins on, such as a scratch issue'
+    need --mention "$mention" "words that name --join-issue's key and are no call to Wispr"
+    need --go-ahead "$go_ahead" '"Wispr, go ahead"'
+    need --rig-mic "$rig_mic" "$rig_need"
+    ;;
   wake-sound)
     need --question "$question" 'a spoken call: "Wispr, what is happening with ..."'
     need --rig-mic "$rig_mic" "$rig_need"
@@ -1504,6 +1519,113 @@ step_ask_holder() {
   pass "ask-holder: no answer spoken for the cancelled question in $((answer_timeout < 30 ? answer_timeout : 30)) s"
 }
 
+# The test agent of the joined step (ghost-wispr joined-probe): its output, one JSON line a step,
+# and its process.
+probe_out=
+probe_pid=
+probe_json=
+
+# probe_step STEP DEADLINE_MS: wait for the test agent's first line of STEP, in probe_json. It
+# fails once the agent has exited without it, or at the deadline.
+probe_step() {
+  local alive
+  while :; do
+    alive=true
+    kill -0 "$probe_pid" 2>/dev/null || alive=false
+    probe_json=$(jq -c --arg s "$1" 'select(.step == $s)' "$probe_out" 2>/dev/null | head -n 1)
+    [[ -n $probe_json ]] && return 0
+    [[ $alive == true ]] || return 1
+    (($(now_ms) < $2)) || return 1
+    sleep 0.2
+  done
+}
+
+# probe_says: the test agent's last lines, to say why a step failed.
+probe_says() {
+  tail -n 3 "$probe_out" "$work_dir/probe.err" 2>/dev/null | tr '\n' ' ' | head -c 600
+}
+
+# step_joined: verification c-joined-live. The test agent is ghost-wispr joined-probe, an Envoy
+# session of its own beside the unit. It stands for an agent a person invites through Dispatch: it
+# takes the join message the unit gives for --join-issue, as the person would send it, and follows
+# it. The end-to-end run from the devbox sends the same message through Dispatch itself.
+step_joined() {
+  local envoy_url auth session mention_ended floor_at hand_at spoken_count deadline
+  envoy_url=$(setting GHOST_WISPR_CONCIERGE_ENVOY_URL concierge envoy_url) \
+    || unknown 'joined: the unit names no Envoy URL (concierge.envoy_url or GHOST_WISPR_CONCIERGE_ENVOY_URL)'
+  start_rig_run
+  # An agent joins the meeting now recording: the mention opens one.
+  play_clip mention "$mention"
+  deadline=$(($(now_ms) + event_timeout * 1000))
+  session=
+  until [[ -n $session ]]; do
+    session=$(api_status 2>/dev/null | jq -r '.active_session_id // empty')
+    [[ -n $session ]] && break
+    (($(now_ms) < deadline)) || fail "joined: no recording session within $event_timeout s of the mention"
+    sleep 0.5
+  done
+  pass "joined: recording session $session"
+  api_get "/api/voice/join-message?issue=$join_issue" | jq -er '.message' >"$work_dir/join.txt" \
+    || fail "joined: GET /api/voice/join-message?issue=$join_issue gave no join message"
+  grep -q "^ghost-wispr join $join_issue\$" "$work_dir/join.txt" \
+    || fail "joined: the join message teaches no join line for $join_issue"
+  pass "joined: the join message names the unit's Envoy session and teaches the floor protocol"
+
+  probe_out="$work_dir/probe.out"
+  auth=$(env_value GHOST_WISPR_AUTH_TOKEN 2>/dev/null) || auth=
+  GHOST_WISPR_AUTH_TOKEN=$auth timeout $((answer_timeout + 4 * event_timeout)) "$binary" joined-probe \
+    --envoy "$envoy_url" --invitation "$work_dir/join.txt" --timeout "$answer_timeout" \
+    >"$probe_out" 2>"$work_dir/probe.err" &
+  probe_pid=$!
+  probe_step joined $(($(now_ms) + event_timeout * 1000)) || fail "joined: the test agent did not join: $(probe_says)"
+  [[ $(jq -r '.recording_session' <<<"$probe_json") == "$session" ]] \
+    || fail "joined: the test agent joined $(jq -r '.recording_session' <<<"$probe_json"), not $session"
+  pass "joined: the test agent joined $session and was told where to read it"
+  wait_for_event agent_joined 1 $(($(now_ms) + event_timeout * 1000)) \
+    || fail "joined: no agent_joined on /ws within $event_timeout s of the join$(ws_ended)"
+  check_voice_event agent_joined "$event_json" "$session"
+  pass 'joined: agent_joined on /ws, with the session id and no words'
+
+  play_clip mention "$mention"
+  mention_ended=$clip_ended
+  probe_step pointer $((mention_ended + event_timeout * 1000)) \
+    || fail "joined: no pointer within $event_timeout s of the mention of $join_issue: $(probe_says)"
+  pass "joined: the pointer names session $(jq -r '.recording_session' <<<"$probe_json"), $(jq -r '.from' <<<"$probe_json") to $(jq -r '.to' <<<"$probe_json") UTC"
+  probe_step transcript_read $(($(now_ms) + event_timeout * 1000)) || fail "joined: the test agent did not read the transcript: $(probe_says)"
+  (($(jq -r '.segments_in_range' <<<"$probe_json") > 0)) \
+    || fail "joined: the test agent read no segment in the pointer's time range from the recorder's API"
+  pass "joined: the test agent read $(jq -r '.segments_in_range' <<<"$probe_json") segments in the pointer's time range from the recorder's API"
+
+  probe_step floor_sent $(($(now_ms) + event_timeout * 1000)) || fail "joined: the test agent sent no floor request: $(probe_says)"
+  floor_at=$(time_ms "$(jq -r '.at' <<<"$probe_json")")
+  whole_number "$floor_at" || unknown "joined: cannot read the floor request's time: $probe_json"
+  wait_for_timing hand_chime $((floor_at - 1000)) $((floor_at + event_timeout * 1000)) \
+    || timing_fail "joined: no hand_chime in the voice timing log within $event_timeout s of the floor request"
+  hand_at=$timing_at
+  ((hand_at - mention_ended >= 1000)) \
+    || fail "joined: the hand sound began $((hand_at - mention_ended)) ms after the mention ended, before a gap of 1000 ms"
+  pass "joined: the hand sound began $((hand_at - floor_at)) ms after the floor request, $((hand_at - mention_ended)) ms after the last words"
+
+  spoken_count=$(ws_count voice_spoken)
+  play_clip go-ahead "$go_ahead"
+  wait_spoken $((spoken_count + 1)) $((clip_ended + event_timeout * 1000)) 'joined go-ahead'
+  probe_step hand $(($(now_ms) + event_timeout * 1000)) || fail "joined: the test agent was not told how its hand came down: $(probe_says)"
+  [[ $(jq -r '.outcome' <<<"$probe_json") == spoken ]] || fail "joined: the hand came down $(jq -r '.outcome' <<<"$probe_json"), not spoken"
+  pass 'joined: the agent'"'"'s words were spoken on "Wispr, go ahead", and it was told so'
+
+  probe_step leave_sent $(($(now_ms) + event_timeout * 1000)) || fail "joined: the test agent did not leave: $(probe_says)"
+  wait_for_event agent_left 1 $(($(now_ms) + event_timeout * 1000)) \
+    || fail "joined: no agent_left on /ws within $event_timeout s of the leave$(ws_ended)"
+  check_voice_event agent_left "$event_json" "$session"
+  pass 'joined: agent_left on /ws, with the session id and no words'
+  wait "$probe_pid" 2>/dev/null
+
+  analyse_rig
+  first_sound $((hand_at - lead_ms)) $((hand_at + sound_max_ms)) \
+    || fail 'joined: no sound at the rig microphone within 400 ms of hand_chime'
+  pass "joined: the hand sound reached the Jabra $((sound_on[found_sound] - hand_at)) ms after hand_chime"
+}
+
 # step_barge_in: verification c-stop-pi. The run's microphone is the loopback, so each clip goes
 # into it, timed from aplay's start, and the rig microphone hears only the Jabra. Stops are read at
 # the Jabra: speech that went quiet for at least stop_silence_ms within stop_window_ms of the clip's
@@ -1935,7 +2057,7 @@ saved_state=$(app_state "$database" capture_paused) || refuse "cannot read the s
   || refuse "the saved capture state is $saved_state, not 1: a restart would resume recording, so the run could not end paused"
 pass 'precondition: the unit is paused with no active session'
 case $step in
-  wake-sound | scripted | barge-in | playback-cancel) confirm_rig ;;
+  wake-sound | scripted | barge-in | playback-cancel | joined) confirm_rig ;;
 esac
 
 # Private copies: the saved .env holds the unit's secrets.
@@ -1948,6 +2070,7 @@ changed=true
 
 case $step in
   exchange) step_exchange ;;
+  joined) step_joined ;;
   wake-sound) step_wake_sound ;;
   scripted) step_scripted ;;
   ask-holder) step_ask_holder ;;

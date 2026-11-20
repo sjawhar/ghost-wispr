@@ -1278,10 +1278,11 @@ launch leftover pass '' "$original_env"$'\nGHOST_WISPR_MIC_DEVICE=Loopback' -- -
 launch no-loopback no-loopback '' -- --question @question.wav
 
 # The other slices' steps, and a step that lacks what it needs.
-for other in states listener-cpu pause-closes-vendors vendor-probe joined room-test measure-echo; do
+for other in states listener-cpu pause-closes-vendors vendor-probe room-test measure-echo; do
   launch "other-$other" pass '' -- --step "$other" --engine gptlive --rounds 20 --sessions 40 --script x
 done
 launch wake-needs pass '' -- --step wake-sound --calls 2
+launch joined-needs pass '' -- --step joined
 
 # wake-sound: a pass; a pass while the rig recording runs 1 s behind for a while, which the driver's
 # clock must not take for a late chime; the chime 310 ms after wake_heard (the verification's
@@ -1609,7 +1610,7 @@ expect_line no-loopback 'REFUSED: the ALSA loopback is not loaded'
 expect_untouched no-loopback
 
 # The other slices' steps are UNKNOWN and touch nothing; a step that lacks what it needs names it.
-for other in states listener-cpu pause-closes-vendors vendor-probe joined room-test measure-echo; do
+for other in states listener-cpu pause-closes-vendors vendor-probe room-test measure-echo; do
   expect_rc "other-$other" 2
   expect_line "other-$other" "UNKNOWN: $other: not in this build: "
   expect_untouched "other-$other"
@@ -1619,6 +1620,12 @@ expect_rc wake-needs 2
 expect_line wake-needs 'UNKNOWN: wake-sound needs: --question ('
 expect_line wake-needs '--rig-mic (the USB microphone about 30 cm from the Jabra)'
 expect_untouched wake-needs
+expect_rc joined-needs 2
+expect_line joined-needs 'UNKNOWN: joined needs: --join-issue (an issue a test agent joins on'
+expect_line joined-needs '--mention (words that name --join-issue'"'"'s key and are no call to Wispr)'
+expect_line joined-needs '--go-ahead ("Wispr, go ahead")'
+expect_line joined-needs '--rig-mic (the USB microphone about 30 cm from the Jabra)'
+expect_untouched joined-needs
 
 # wake-sound.
 expect_rc wake 0
