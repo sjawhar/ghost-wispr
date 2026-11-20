@@ -157,6 +157,12 @@ type pointer struct {
 // memberships it ends under r.mu as its first act, before any slow cleanup
 // such as lowering hands. So nothing acts for a membership whose end has
 // begun, and an end never takes a membership that began since.
+//
+// No hook runs under r.mu: not the Supervisor's RaiseHand or LowerHands,
+// not Envoy, the store, Dispatch, the recording session's read, the /ws
+// notice nor the keyterms. Each path reads what it needs before it takes the
+// lock (the recording session now, the clock), decides under it, and calls
+// out after it; a step that called out checks again under the lock.
 type Roster struct {
 	cfg    Config
 	logf   func(string, ...any)
@@ -168,7 +174,8 @@ type Roster struct {
 	agents Agents
 	// open is the gate a join commits through: open while the unit has an
 	// Envoy session. epoch counts SetAgents calls, so a join that began
-	// under one Envoy session never commits under the next.
+	// under one Envoy session never commits under the next, and a stop
+	// whose epoch has passed changes nothing.
 	open  bool
 	epoch int
 	seq   int // the last membership number
@@ -180,23 +187,29 @@ type Roster struct {
 	// last, at most maxEnded: a decision made from a slow read commits
 	// nothing for one of them.
 	ended []string
+	// keySeq numbers the keyterm lists decided under r.mu, in order;
+	// keyMu orders their delivery to Keyterms, after r.mu is released, so an
+	// older list never lands after a newer one.
+	keySeq     int
+	keyMu      sync.Mutex
+	keyApplied int
 }
 
 // maxEnded bounds the ended sessions the roster remembers; a unit records
 // a few meetings a day.
 const maxEnded = 64
 
-// meetingOpenLocked reports whether sessionID is the recording session now
-// and has not ended.
-func (r *Roster) meetingOpenLocked(sessionID string) bool {
-	return sessionID != "" && sessionID == r.cfg.Session() && !slices.Contains(r.ended, sessionID)
+// meetingOpenLocked reports whether sessionID is cur, the recording session
+// now as read before r.mu was taken, and has not ended.
+func (r *Roster) meetingOpenLocked(sessionID, cur string) bool {
+	return sessionID != "" && sessionID == cur && !slices.Contains(r.ended, sessionID)
 }
 
 // currentLocked reports whether m is still its agent's membership, its end
-// has not begun, and its meeting is open: the check every step makes under
-// r.mu before it acts for m.
-func (r *Roster) currentLocked(m *member) bool {
-	return m != nil && r.members[m.Agent] == m && m.ctx.Err() == nil && r.meetingOpenLocked(m.SessionID)
+// has not begun, and its meeting is open (cur is the recording session now):
+// the check every step makes under r.mu before it acts for m.
+func (r *Roster) currentLocked(m *member, cur string) bool {
+	return m != nil && r.members[m.Agent] == m && m.ctx.Err() == nil && r.meetingOpenLocked(m.SessionID, cur)
 }
 
 // meetingLocked is sessionID's meeting, made at its first join.
@@ -243,11 +256,14 @@ func New(cfg *Config) *Roster {
 // SetAgents gives the roster the unit's Envoy session once it opens, which
 // opens the gate joins commit through. nil, as it closes, shuts the gate
 // first, so no join still in its reads commits, then ends every
-// membership, telling each agent the voice stopped while the session can
-// still send.
+// membership, telling each agent the voice stopped through the session it
+// joined under, while that session can still send. A stop whose epoch a
+// later SetAgents passed while it cleaned up changes nothing more.
 func (r *Roster) SetAgents(agents Agents) {
+	cur := r.cfg.Session()
 	r.mu.Lock()
 	r.epoch++
+	epoch, closing := r.epoch, r.agents
 	r.open = agents != nil
 	if agents != nil {
 		r.agents = agents
@@ -261,14 +277,17 @@ func (r *Roster) SetAgents(agents Agents) {
 			gone = append(gone, m)
 		}
 	}
-	r.keytermsLocked()
+	keys := r.keytermsLocked(cur)
 	r.mu.Unlock()
+	r.applyKeyterms(keys)
 	for _, m := range gone {
 		r.finishLeave(m)
-		r.send(r.ctx, m.Agent, "", "notice", voiceStoppedText)
+		r.sendVia(r.ctx, closing, m.Agent, "", "notice", voiceStoppedText)
 	}
 	r.mu.Lock()
-	r.agents = nil
+	if r.epoch == epoch {
+		r.agents = nil
+	}
 	r.mu.Unlock()
 }
 
@@ -301,11 +320,12 @@ func (r *Roster) Run(ctx context.Context) {
 // Joined lists the current memberships of the meeting now recording, in the
 // order they joined.
 func (r *Roster) Joined() []Member {
+	cur := r.cfg.Session()
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	var out []Member
 	for _, m := range r.members {
-		if r.currentLocked(m) {
+		if r.currentLocked(m, cur) {
 			out = append(out, m.Member)
 		}
 	}
@@ -421,6 +441,7 @@ func (r *Roster) join(ctx context.Context, m *envoy.Message, key string) {
 		name = cmp.Or(speakable(title), "An agent")
 	}
 	now := r.cfg.Now()
+	cur := r.cfg.Session()
 	r.mu.Lock()
 	// The reads above are slow: the voice may have stopped, and the meeting
 	// may have ended or been deleted, while they ran.
@@ -429,7 +450,7 @@ func (r *Roster) join(ctx context.Context, m *envoy.Message, key string) {
 		r.reply(ctx, m, "refused", joinStoppedText)
 		return
 	}
-	if !r.meetingOpenLocked(sessionID) {
+	if !r.meetingOpenLocked(sessionID, cur) {
 		r.mu.Unlock()
 		r.reply(ctx, m, "refused", meetingWentText)
 		return
@@ -437,7 +458,7 @@ func (r *Roster) join(ctx context.Context, m *envoy.Message, key string) {
 	old := r.members[agent]
 	joined := old
 	var ended *member // a membership of the agent's this join ends
-	again := r.currentLocked(old)
+	again := r.currentLocked(old, cur)
 	if again {
 		// A join again, or its redelivery: the same membership keeps its id,
 		// its limits, its pointers and its time not live.
@@ -455,8 +476,9 @@ func (r *Roster) join(ctx context.Context, m *envoy.Message, key string) {
 		joined.ctx, joined.cancel = context.WithCancel(r.meetingLocked(sessionID).ctx)
 		r.members[agent] = joined
 	}
-	r.keytermsLocked()
+	keys := r.keytermsLocked(cur)
 	r.mu.Unlock()
+	r.applyKeyterms(keys)
 	if ended != nil {
 		r.finishLeave(ended)
 	}
@@ -470,9 +492,10 @@ func (r *Roster) join(ctx context.Context, m *envoy.Message, key string) {
 func (r *Roster) floor(ctx context.Context, m *envoy.Message, draft string) {
 	agent := m.SourceSession
 	now := r.cfg.Now()
+	cur := r.cfg.Session()
 	r.mu.Lock()
 	joined := r.members[agent]
-	if !r.currentLocked(joined) {
+	if !r.currentLocked(joined, cur) {
 		r.mu.Unlock()
 		r.reply(ctx, m, "refused", notJoinedText)
 		return
@@ -503,14 +526,15 @@ func (r *Roster) floor(ctx context.Context, m *envoy.Message, draft string) {
 	}
 	hand.Expires = raised.Add(r.cfg.FloorExpiry)
 
-	// The hand is raised under r.mu, on the membership read above while it is
-	// current: an end that began meanwhile takes the request with it, and
-	// one after lowers this membership's hand. The Supervisor never calls
-	// the roster under its own lock, so holding r.mu across RaiseHand cannot
-	// deadlock.
+	// Decided under r.mu on the membership read above while it is current,
+	// with the request's place reserved (its event and time, so a
+	// redelivery or a second request waits out the rate); raised with r.mu
+	// released; then checked again: a membership whose end began meanwhile
+	// has its hand lowered by its own id, which touches no other's.
+	cur = r.cfg.Session()
 	r.mu.Lock()
 	switch {
-	case !r.currentLocked(joined):
+	case !r.currentLocked(joined, cur):
 		r.mu.Unlock()
 		r.reply(ctx, m, "refused", notJoinedText)
 		return
@@ -523,9 +547,17 @@ func (r *Roster) floor(ctx context.Context, m *envoy.Message, draft string) {
 		r.reply(ctx, m, "refused", fmt.Sprintf("You may ask for the floor at most once in %s, so this request was not taken. You may ask again from %s UTC.", every(r.cfg.FloorEvery), next.UTC().Format("15:04:05")))
 		return
 	}
+	priorFloor, priorEvent := joined.lastFloor, joined.floorEvent
+	joined.lastFloor, joined.floorEvent = now, m.EventID
+	r.mu.Unlock()
+
 	err := r.cfg.Floor.RaiseHand(hand)
-	if err == nil {
-		joined.lastFloor, joined.floorEvent = now, m.EventID
+
+	cur = r.cfg.Session()
+	r.mu.Lock()
+	current := r.currentLocked(joined, cur)
+	if err != nil && joined.floorEvent == m.EventID {
+		joined.lastFloor, joined.floorEvent = priorFloor, priorEvent // not taken: the reservation is undone
 	}
 	r.mu.Unlock()
 	if err != nil {
@@ -534,6 +566,10 @@ func (r *Roster) floor(ctx context.Context, m *envoy.Message, draft string) {
 			text = fmt.Sprintf("Your floor request reached the room more than %s after you sent it, so it was dropped. Ask again if the room still needs to hear it.", every(r.cfg.FloorExpiry))
 		}
 		r.reply(ctx, m, "refused", text)
+		return
+	}
+	if !current {
+		r.cfg.Floor.LowerHands(joined.ID) // its end began while the hand went up
 		return
 	}
 	r.logf("joined: an agent of meeting %s asked for the floor", hand.SessionID)
@@ -547,6 +583,7 @@ func (r *Roster) leave(agent, reason string) { r.leaveMember(agent, nil, reason)
 // that began since. The membership is cancelled under r.mu first, then its
 // hands are lowered.
 func (r *Roster) leaveMember(agent string, want *member, reason string) {
+	cur := r.cfg.Session()
 	r.mu.Lock()
 	m := r.members[agent]
 	if m == nil || m.ctx.Err() != nil || (want != nil && m != want) {
@@ -554,8 +591,9 @@ func (r *Roster) leaveMember(agent string, want *member, reason string) {
 		return
 	}
 	m.cancel()
-	r.keytermsLocked()
+	keys := r.keytermsLocked(cur)
 	r.mu.Unlock()
+	r.applyKeyterms(keys)
 	r.finishLeave(m)
 	if reason != "" {
 		r.async(func(ctx context.Context) { r.send(ctx, agent, "", "notice", reason) })
@@ -591,6 +629,7 @@ func (r *Roster) SessionsDeleted(ids []string) { r.leaveMeetings(ids, deletedTex
 // and cancels each meeting and the memberships it ends; only then does it
 // lower their hands, one membership at a time.
 func (r *Roster) leaveMeetings(ids []string, reason string) {
+	cur := r.cfg.Session()
 	r.mu.Lock()
 	r.endLocked(ids)
 	var gone []*member
@@ -605,8 +644,9 @@ func (r *Roster) leaveMeetings(ids []string, reason string) {
 			delete(r.meetings, id)
 		}
 	}
-	r.keytermsLocked()
+	keys := r.keytermsLocked(cur)
 	r.mu.Unlock()
+	r.applyKeyterms(keys)
 	for _, m := range gone {
 		r.finishLeave(m)
 		r.async(func(ctx context.Context) { r.send(ctx, m.Agent, "", "notice", reason) })
@@ -620,10 +660,11 @@ func (r *Roster) Sweep(ctx context.Context) {
 	if agents == nil {
 		return
 	}
+	cur := r.cfg.Session()
 	r.mu.Lock()
 	read := make(map[string]*member, len(r.members))
 	for agent, m := range r.members {
-		if r.currentLocked(m) {
+		if r.currentLocked(m, cur) {
 			read[agent] = m
 		}
 	}
@@ -635,12 +676,13 @@ func (r *Roster) Sweep(ctx context.Context) {
 			continue
 		}
 		now := r.cfg.Now()
+		cur := r.cfg.Session()
 		r.mu.Lock()
 		// The lookup is slow: it counts only toward the membership it was
 		// made for, while that membership is current.
 		gone := false
 		switch {
-		case !r.currentLocked(target):
+		case !r.currentLocked(target, cur):
 		case info.State == envoy.StateLive:
 			target.notLiveSince = time.Time{}
 		case target.notLiveSince.IsZero():
@@ -664,14 +706,15 @@ func (r *Roster) OnSegment(s *voice.Segment) {
 		return
 	}
 	now := r.cfg.Now()
+	cur := r.cfg.Session()
 	var sends []*pointer
 	r.mu.Lock()
-	if !r.meetingOpenLocked(s.SessionID) {
+	if !r.meetingOpenLocked(s.SessionID, cur) {
 		r.mu.Unlock()
 		return // its meeting ended while the segment was on its way
 	}
 	for _, m := range r.members {
-		if !r.currentLocked(m) || m.SessionID != s.SessionID || !m.comesUp(s.Text) {
+		if !r.currentLocked(m, cur) || m.SessionID != s.SessionID || !m.comesUp(s.Text) {
 			continue
 		}
 		if m.waiting || (!m.lastPointer.IsZero() && now.Sub(m.lastPointer) < r.cfg.PointerEvery) {
@@ -691,10 +734,11 @@ func (r *Roster) OnSegment(s *voice.Segment) {
 // Tick sends each pointer that waited for its agent's PointerEvery to pass.
 func (r *Roster) Tick() {
 	now := r.cfg.Now()
+	cur := r.cfg.Session()
 	var sends []*pointer
 	r.mu.Lock()
 	for _, m := range r.members {
-		if r.currentLocked(m) && m.waiting && now.Sub(m.lastPointer) >= r.cfg.PointerEvery {
+		if r.currentLocked(m, cur) && m.waiting && now.Sub(m.lastPointer) >= r.cfg.PointerEvery {
 			m.waiting, m.lastPointer = false, now
 			sends = append(sends, &pointer{member: m, key: m.IssueKey, sessionID: m.SessionID, from: m.waitFrom, to: m.waitTo})
 		}
@@ -724,9 +768,10 @@ func (r *Roster) sendPointers(sends []*pointer) {
 
 // isCurrent is currentLocked for a caller that does not hold r.mu.
 func (r *Roster) isCurrent(m *member) bool {
+	cur := r.cfg.Session()
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return r.currentLocked(m)
+	return r.currentLocked(m, cur)
 }
 
 // HandDone tells an agent how its floor request came down: spoken, or
@@ -744,9 +789,10 @@ func (r *Roster) HandDone(h *voice.Hand, outcome voice.HandOutcome) {
 	}
 	// Only the membership the hand belongs to is told, while it is current:
 	// an agent that left, or joined again since, hears nothing of it.
+	cur := r.cfg.Session()
 	r.mu.Lock()
 	m := r.members[h.Agent]
-	current := m != nil && m.ID == h.Membership && r.currentLocked(m)
+	current := m != nil && m.ID == h.Membership && r.currentLocked(m, cur)
 	r.mu.Unlock()
 	if !current {
 		return
@@ -761,9 +807,15 @@ func (r *Roster) reply(ctx context.Context, m *envoy.Message, kind, text string)
 	r.send(ctx, m.SourceSession, m.EventID, kind, text)
 }
 
-// send sends agent text as a notice, in reply to inReplyTo when set.
+// send sends agent text as a notice, in reply to inReplyTo when set, through
+// the unit's Envoy session now.
 func (r *Roster) send(ctx context.Context, agent, inReplyTo, kind, text string) {
-	agents := r.currentAgents()
+	r.sendVia(ctx, r.currentAgents(), agent, inReplyTo, kind, text)
+}
+
+// sendVia sends as send does, through agents: a stop tells its agents through
+// the session they joined under, never one opened since.
+func (r *Roster) sendVia(ctx context.Context, agents Agents, agent, inReplyTo, kind, text string) {
 	if agents == nil {
 		r.logf("joined: no Envoy session to send a joined agent its %s", kind)
 		return
@@ -807,17 +859,23 @@ func (r *Roster) notify(kind, sessionID string) {
 	}
 }
 
-// keytermsLocked gives Keyterms the issue keys of the agents of the meeting
-// now recording, in the order they joined. r.mu is held: the keyterms
-// follow the joins in their order.
-func (r *Roster) keytermsLocked() {
+// keyUpdate is a keyterm list decided under r.mu, numbered in the order it
+// was decided.
+type keyUpdate struct {
+	seq  int
+	keys []string
+}
+
+// keytermsLocked decides the issue keys of the current memberships of cur,
+// the meeting now recording (read before r.mu was taken), in the order they
+// joined. r.mu is held; applyKeyterms delivers the list once it is released.
+func (r *Roster) keytermsLocked(cur string) keyUpdate {
 	if r.cfg.Keyterms == nil {
-		return
+		return keyUpdate{}
 	}
-	session := r.cfg.Session()
 	members := make([]*member, 0, len(r.members))
 	for _, m := range r.members {
-		if m.ctx.Err() == nil && m.SessionID == session && m.IssueKey != "" {
+		if m.ctx.Err() == nil && m.SessionID == cur && m.IssueKey != "" {
 			members = append(members, m)
 		}
 	}
@@ -828,7 +886,24 @@ func (r *Roster) keytermsLocked() {
 			keys = append(keys, m.IssueKey)
 		}
 	}
-	r.cfg.Keyterms(keys)
+	r.keySeq++
+	return keyUpdate{seq: r.keySeq, keys: keys}
+}
+
+// applyKeyterms gives Keyterms a list keytermsLocked decided, with r.mu
+// released: a list decided before one already given is dropped, so the
+// keyterms follow the joins and leaves in their order.
+func (r *Roster) applyKeyterms(u keyUpdate) {
+	if u.seq == 0 {
+		return
+	}
+	r.keyMu.Lock()
+	defer r.keyMu.Unlock()
+	if u.seq <= r.keyApplied {
+		return
+	}
+	r.keyApplied = u.seq
+	r.cfg.Keyterms(u.keys)
 }
 
 // every writes d for a message: "60 s", "5 minutes".
