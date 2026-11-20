@@ -161,8 +161,11 @@ func TestSayGivesUpWithItsContext(t *testing.T) {
 // TestAReplyAfterUserSpeechPlaysAfterAnInterrupt fails if, after an
 // Interrupt, the audio of the next reply is dropped as the rest of the
 // interrupted one when Deepgram's UserStartedSpeaking came between them and
-// no AgentAudioDone did. The next reply's audio comes before its text, as
-// Deepgram may send it, so only UserStartedSpeaking can end the drop.
+// no AgentAudioDone did: the next reply's text starts it. The audio that
+// comes before that text is dropped with the stopped reply's tail, since it
+// may be that reply's late audio, whose text came before the user start. So
+// the next reply loses the audio Deepgram sends before its text: at most
+// 24 ms before it in the probe's frame log, a frame or two.
 func TestAReplyAfterUserSpeechPlaysAfterAnInterrupt(t *testing.T) {
 	setSpeechGap(t, time.Minute)
 	s := startStandIn(t)
@@ -181,16 +184,36 @@ func TestAReplyAfterUserSpeechPlaysAfterAnInterrupt(t *testing.T) {
 	waitEvent(t, sess, voice.EventSpeechEnded)
 	c.sendAudio(tone(OutputRate, 40*time.Millisecond, 300))
 	c.send(map[string]any{"type": "UserStartedSpeaking"})
-	next := tone(OutputRate, 20*time.Millisecond, 400)
-	// The next reply: the voice's own words, their audio before their echo.
+	// The next reply: the voice's own words, their first frame before their
+	// echo, as Deepgram sends it, and the rest after.
 	_ = sayAsync(sess, "Next words.")
 	c.expect(t, "InjectAgentMessage")
-	c.sendAudio(next)
+	c.sendAudio(tone(OutputRate, 20*time.Millisecond, 400))
 	c.send(map[string]any{"type": "ConversationText", "role": "assistant", "content": "Next words."})
+	next := tone(OutputRate, 40*time.Millisecond, 401)
+	c.sendAudio(next)
 	p2 := out.nextPlayback(t)
 	p2.waitBytes(t, len(next))
 	if got := p2.written(); !bytes.Equal(got, next) {
-		t.Fatalf("the reply after UserStartedSpeaking played %d bytes, want its %d", len(got), len(next))
+		t.Fatalf("the reply after UserStartedSpeaking played %d bytes, want the %d after its text", len(got), len(next))
+	}
+}
+
+// TestAModelReplyAfterAUserStartIsCut fails if the model's own reply to the
+// room after a user start keeps the stopped reply's tail mark, so the next
+// injection queues behind that reply, which does not play, instead of
+// cutting it.
+func TestAModelReplyAfterAUserStartIsCut(t *testing.T) {
+	setSpeechGap(t, time.Minute)
+	s := startStandIn(t)
+	sess, c, _ := open(t, s, Config{}, voice.Exchange{Out: newFakeOutput(), Tools: silentConcierge()})
+	c.send(map[string]any{"type": "UserStartedSpeaking"})
+	c.send(map[string]any{"type": "ConversationText", "role": "assistant", "content": "I am not sure."})
+	c.sendAudio(tone(OutputRate, 20*time.Millisecond, 130))
+	waitEvent(t, sess, voice.EventToolCall) // the Concierge answers the turn instead
+	_ = sayAsync(sess, "Ada holds it.")
+	if msg := c.expect(t, "InjectAgentMessage"); msg["behavior"] != "interrupt" {
+		t.Fatalf("with the model's own reply coming after a user start the session sent %v, want behavior interrupt", msg)
 	}
 }
 

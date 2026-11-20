@@ -69,7 +69,7 @@ type utterance struct {
 	heldBase int      // the number of frames ever taken from held
 	audio    [][]byte // audio before its text, waiting for its decision
 	waiter   *sayWait
-	cut      bool // the tail of a reply a user start stopped; the next injection ends it
+	cut      bool // the tail of a reply a user start stopped, until the next text or AgentAudioDone
 }
 
 // speechQueue carries the agent's speech from the reader, which must never
@@ -336,11 +336,13 @@ func (q *speechQueue) endLocked(u *utterance) {
 	q.items = append(q.items, speechItem{kind: itemEnd})
 }
 
-// reject drops precisely the reply whose text Deepgram just sent.
+// reject drops precisely the reply whose text Deepgram just sent. A stopped
+// reply's tail that model text claims is the model's own reply from here.
 func (q *speechQueue) reject(u *utterance) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	dropLocked(u)
+	u.cut = false
 }
 
 // silenced says whether Deepgram is actively sending a reply that cannot
@@ -352,14 +354,15 @@ func (q *speechQueue) silenced() bool {
 }
 
 // userSpoke ends the reply Deepgram stops for the room. Audio that still
-// comes, until the session's next injection or AgentAudioDone, is that
-// reply's tail and is dropped: its text came before the user start, so no
-// later text may claim it. An injection's frames that still wait have not
-// played, and may be the model's words whose text has not come. Over the
-// voice's speech, which the Supervisor stops when someone talks over it,
-// they are dropped, and the Say they belong to is interrupted. With no
-// speech to talk over, they keep waiting for model text or the hold, as the
-// end of a reply Deepgram stopped.
+// comes, until the next text or AgentAudioDone, is taken as that reply's
+// tail and dropped: its text came before the user start, so no later text
+// may claim it. The next reply's audio that comes before its own text is
+// dropped with it; the next text starts that reply. An injection's frames
+// that still wait have not played, and may be the model's words whose text
+// has not come. Over the voice's speech, which the Supervisor stops when
+// someone talks over it, they are dropped, and the Say they belong to is
+// interrupted. With no speech to talk over, they keep waiting for model
+// text or the hold, as the end of a reply Deepgram stopped.
 func (q *speechQueue) userSpoke(overVoice bool) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
@@ -381,16 +384,6 @@ func (q *speechQueue) userSpoke(overVoice bool) {
 	}
 	q.rejectAllLocked()
 	q.current = &utterance{decision: dropped, cut: true}
-}
-
-// injected notes that the session sent an injection: the audio that comes
-// next may be its own, so the tail of a reply a user start stopped ends.
-func (q *speechQueue) injected() {
-	q.mu.Lock()
-	defer q.mu.Unlock()
-	if q.current != nil && q.current.cut {
-		q.current = nil
-	}
 }
 
 // rejectAllLocked drops every reply that has not ended, other than an
