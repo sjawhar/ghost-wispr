@@ -52,5 +52,8 @@
   ],
   "tests": [
     "schema-migration-safety.md"
+  ],
+  "internal/voice/tts": [
+    "stop-gates-read-the-source-context.md"
   ]
 }
