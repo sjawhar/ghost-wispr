@@ -1,17 +1,20 @@
 #!/usr/bin/env bash
 # Runs every step of deploy/pi/accept-voice.sh against a fake Pi, with no root, no sound card and no
 # network. One Python module, fakepi.py, is every fake command on PATH (systemctl, curl, aplay,
-# arecord, ffmpeg, journalctl) and the unit's binary; a real SQLite database holds the saved capture
-# state; and a fake service process holds that database open with the .env's variables in its
-# environment, as ghost-wispr.service does.
+# arecord, ffmpeg, journalctl) and the unit's binary; a fake sudo runs a command as root; a real
+# SQLite database holds the saved capture state; and a fake service process holds that database open
+# with the .env's variables in its environment, as ghost-wispr.service does.
 #
 # The fake voice reacts to each injected clip by writing a timeline: /ws events, voice timing lines,
 # log lines, the sounds the speaker plays, and the questions to agents. A stop cuts a sound and the
 # events it would still have caused. The fake curl streams /ws from the timeline, the fake journalctl
 # prints its journal, the fake ffmpeg reports its sounds in a recording, and the fake service writes
-# the speaker's /proc status from it. Each step runs once as it should pass and once against its
-# verification check's negative control. Cases run in parallel; each records its failures, and the
-# run goes on, so that one run shows every assertion that fails.
+# the speaker's /proc status from it. The fake journalctl is the Pi's: it has no user journal, the
+# system journal needs root, and each record goes through logging.New, the logger the service writes
+# its journal with (deploy/pi/journalrecords), so a driver that reads another journal, another
+# process's lines or another key reads nothing. Each step runs once as it should pass and once
+# against its verification check's negative control. Cases run in parallel; each records its
+# failures, and the run goes on, so that one run shows every assertion that fails.
 set -uo pipefail
 
 repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -39,6 +42,8 @@ cleanup() {
 trap cleanup EXIT
 mkdir -p "$root/bin"
 readonly fakepi="$root/bin/fakepi.py"
+(cd -- "$repo_root" && go build -o "$root/bin/journal-records" ./deploy/pi/journalrecords) \
+  || { printf 'voice acceptance test: cannot build deploy/pi/journalrecords, which needs Go\n'; exit 1; }
 
 # The .env each case starts with: a comment, two secrets (one quoted), a voice setting the run
 # overrides, a value with a tab and two spaces, and no newline at the end, so that a restore that is
@@ -141,7 +146,14 @@ def set_row(key, value):
 def emit(**item):
     if item["kind"] == "timing" and "no-timing" in SCENARIO:
         return
+    append(item)
+
+
+def append(item):
+    """Add an item to the timeline; a journal line is the running service process's own."""
     item["id"] = os.urandom(6).hex()
+    item.setdefault("pid", service_pid())
+    item.setdefault("boot", "current")
     with open(spath("timeline.jsonl"), "a") as f:
         f.write(json.dumps(item) + "\n")
 
@@ -207,6 +219,10 @@ def systemctl(args):
         stop()
         return 0
     if verb == "restart":
+        if "earlier-timing" in SCENARIO and running():
+            # The process before the restart, a build that writes the timing log, logs a line as
+            # it stops: not a line of the process the run reads.
+            append(dict(kind="timing", due=now_ms(), event="wake_heard", session_id=""))
         stop()
         return start()
     if verb == "is-active":
@@ -236,7 +252,6 @@ def start():
     voice_off = "" if engine == "tts" else 'voice.engine "%s" is not in this build; use "tts"' % engine
     write("service.json", json.dumps({"voice": variables.get("GHOST_WISPR_VOICE_ENABLED") == "true", "voice_off": voice_off}))
     write("voice.json", "{}")
-    emit(kind="raw", due=now_ms(), text="2026/11/19 10:00:00 ghost-wispr: starting")
     environment = {k: v for k, v in os.environ.items() if k == "PATH" or k.startswith("GW_FAKE_") or k == "GHOST_WISPR_DEPLOY_DIR"}
     environment.update(variables)
     process = subprocess.Popen(
@@ -248,6 +263,17 @@ def start():
         start_new_session=True,
     )
     write("main.pid", "%d\n" % process.pid)
+    emit(kind="raw", due=now_ms(), text="2026/11/19 10:00:00 ghost-wispr: starting", pid=process.pid)
+    if "earlier-boot" in SCENARIO:
+        # A persistent journal can hold the same service PID from another boot, whose clock ran
+        # ahead of this one's.
+        append(dict(kind="timing", due=now_ms(), event="wake_heard", session_id="", boot="previous"))
+    if "earlier-run" in SCENARIO:
+        # Or from an earlier run of the service in this boot, as process IDs are reused.
+        append(dict(kind="timing", due=now_ms() - 60_000, event="wake_heard", session_id=""))
+    if "verbose-journal" in SCENARIO:
+        # More than a pipe buffer after the startup marker: a reader must drain journalctl.
+        emit(kind="raw", due=now_ms(), text="startup detail " + "x" * 200_000)
     for _ in range(500):
         try:
             if any(os.readlink("/proc/%d/fd/%s" % (process.pid, fd)).endswith("-shm") for fd in os.listdir("/proc/%d/fd" % process.pid)):
@@ -338,7 +364,9 @@ def speech(tag, start, length, session="session-1", fact=None):
     the end of its speech and voice_spoken."""
     emit(kind="timing", due=start, tag=tag, event="first_audio", session_id=session)
     emit(kind="timing", due=start if fact is None else fact, tag=tag, event="fact_audio", session_id=session)
-    emit(kind="log", due=start, tag=tag, level="INFO", msg="speaker stream", fields={"device": "plughw:CARD=J75,DEV=0", "rate": 48000})
+    # As internal/audio's alsaStream logs it for the hw_params new_case writes (480 and 1920 frames
+    # at 48 kHz): period and buffer are time.Durations, which the journal holds in nanoseconds.
+    emit(kind="log", due=start, tag=tag, level="INFO", msg="speaker stream", fields={"device": "plughw:CARD=J75,DEV=0", "rate": 48000, "channels": 2, "period": 10_000_000, "buffer": 40_000_000, "rewind": True})
     emit(kind="sound", start=start, end=start + length, tag=tag)
     emit(kind="timing", due=start + length, tag=tag, event="speech_end", session_id=session)
     if "no-spoken" in SCENARIO:
@@ -434,7 +462,7 @@ def react(kind, key, start, end):
     if kind in ("question", "ask", "second") and n == 1:
         first = end + 700
         if "underrun" in SCENARIO:
-            emit(kind="log", due=first + 500, level="WARN", msg="speaker underrun", fields={"device": "plughw:CARD=J75,DEV=0", "underruns": 1, "buffer": 1920})
+            emit(kind="log", due=first + 500, level="WARN", msg="speaker underrun", fields={"device": "plughw:CARD=J75,DEV=0", "underruns": 1, "buffer": 40_000_000})
         if "xrun" in SCENARIO:
             emit(kind="xrun", start=first + 500, end=first + 540)
 
@@ -486,8 +514,11 @@ def arecord(args):
         with open(path, "wb") as f:
             f.write(bytes(44 + seconds * 48000))
         return 0
-    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
-    signal.signal(signal.SIGINT, lambda *_: sys.exit(0))
+    def stopped(*_):
+        write("recording-stopped", "1")
+        sys.exit(0)
+    signal.signal(signal.SIGTERM, stopped)
+    signal.signal(signal.SIGINT, stopped)
     with open(path, "wb") as f:
         f.write(bytes(44))
         f.flush()
@@ -553,13 +584,38 @@ def ffmpeg(args):
 
 
 def journalctl(args):
+    # The Pi keeps no user journal, and only root reads the system journal.
+    if "--user" in args:
+        sys.stderr.write("No journal files were found.\n")
+        return 1
+    if os.environ.get("GW_FAKE_ROOT") != "1":
+        sys.stderr.write("No journal files were opened due to insufficient permissions.\n")
+        return 1
+    if "_SYSTEMD_USER_UNIT=ghost-wispr.service" not in args:
+        sys.stderr.write("fake journalctl: unexpected call, not for ghost-wispr.service: %s\n" % " ".join(args))
+        return 2
+    if not any(args[i:i + 2] == ["-o", "cat"] for i in range(len(args))) and "--output=cat" not in args:
+        sys.stderr.write("fake journalctl: only -o cat is supported\n")
+        return 2
+    pids = {a.partition("=")[2] for a in args if a.startswith("_PID=")}
+    current_boot = "-b" in args or "--boot" in args or "--boot=0" in args or "-b0" in args
     since = 0
-    if "--since" in args:
-        since = int(args[args.index("--since") + 1].lstrip("@")) * 1000
+    if "--since" in args and args[args.index("--since") + 1].startswith("@"):
+        since = int(args[args.index("--since") + 1][1:]) * 1000
     if "journal-blind" in SCENARIO:
         return 0
     t = now_ms()
-    lines = []
+    for event in ("stop", "answer_ready"):
+        # journal-error-after-EVENT: the journal cannot be read once EVENT's timing line is logged.
+        if "journal-error-after-" + event in SCENARIO and any(i["kind"] == "timing" and i["event"] == event and i["due"] <= t for i in timeline()):
+            sys.stderr.write("Failed to read journal: Input/output error\n")
+            return 1
+    if "late-journal-error" in SCENARIO and read("recording-stopped"):
+        # The stream probe succeeds; the following underrun read loses journal access.
+        if read("journal-end-read"):
+            sys.stderr.write("Failed to read journal: Input/output error\n")
+            return 1
+        write("journal-end-read", "1")
     # The kernel's /proc status is current when it is read; the fake's is a file its writer
     # rewrites, which a loaded machine can hold back. So a stop line shows only once the status
     # writer has applied the timeline that holds it, with its cut just before it: a reading after
@@ -575,27 +631,34 @@ def journalctl(args):
                 continue
             if item.get("kind") == "timing" and item.get("event") == "stop" and offset > applied:
                 gated.add(item["id"])
-    for item in timeline():
-        if item["id"] in gated:
-            continue
+    records = []
+    for item in sorted(timeline(), key=lambda item: item.get("due", 0)):
         due = item.get("due", 0)
-        if not (since <= due <= t):
+        if item["id"] in gated or not since <= due <= t:
+            continue
+        if pids and str(item.get("pid")) not in pids:
+            continue
+        if current_boot and item.get("boot") != "current":
             continue
         if item["kind"] == "raw":
-            lines.append((due, item["text"]))
+            records.append({"raw": item["text"]})
         elif item["kind"] == "timing":
-            record = {"time": iso(due), "level": "INFO", "msg": "voice timing", "event": item["event"], "session_id": item["session_id"], "at_unix_ns": due * 1_000_000}
+            # As cmd/ghost-wispr/voice.go's voiceTiming logs it.
+            fields = {"event": item["event"], "session_id": item["session_id"], "at_unix_ns": due * 1_000_000}
             if item.get("reason"):
-                record["reason"] = item["reason"]
-            lines.append((due, json.dumps(record)))
+                fields["reason"] = item["reason"]
+            records.append(journal_record(due, "INFO", "voice timing", fields))
         elif item["kind"] == "log":
-            record = {"time": iso(due), "level": item["level"], "msg": item["msg"]}
-            record.update(item["fields"])
-            lines.append((due, json.dumps(record)))
-    lines.sort(key=lambda pair: pair[0])
-    for _, line in lines:
-        print(line)
-    return 0
+            records.append(journal_record(due, item["level"], item["msg"], item["fields"]))
+    sys.stdout.flush()
+    helper = os.path.join(os.path.dirname(os.path.abspath(__file__)), "journal-records")
+    return subprocess.run([helper], input="".join(json.dumps(record) + "\n" for record in records), text=True).returncode
+
+
+def journal_record(due, level, msg, fields):
+    """One record for journal-records (deploy/pi/journalrecords), its attributes in the order the
+    service logs them."""
+    return {"time_ns": due * 1_000_000, "level": level, "msg": msg, "attrs": [list(pair) for pair in fields.items()]}
 
 
 # ---- curl: the unit's API, /ws, Dispatch, the Envoy hub and its NATS port ----
@@ -811,6 +874,14 @@ EOF
     printf '#!/usr/bin/env bash\nexec python3 %q %s "$@"\n' "$fakepi" "$tool" >"$root/bin/$tool"
   fi
 done
+# sudo as the Pi's ghost-wispr user has it: -n runs the command as root with no password. Unlike
+# sudo, it keeps the environment, which holds each fake command's state.
+cat >"$root/bin/sudo" <<'EOF'
+#!/usr/bin/env bash
+[[ ${1:-} == -n ]] || { printf 'sudo: a terminal is required to read the password\n' >&2; exit 1; }
+shift
+exec env GW_FAKE_ROOT=1 "$@"
+EOF
 chmod +x "$root/bin/"*
 
 # new_case NAME [ENV]: a fake Pi for one case, paused with no session, its .env ENV (the original
@@ -991,8 +1062,12 @@ launch wake-no-person pass '' -- --step wake-sound --calls 2 --question @questio
 launch wake-blind journal-blind yes -- --step wake-sound --calls 2 --question @question.wav --rig-mic "$rig" --event-timeout 10
 launch wake-loud loud-room yes -- --step wake-sound --calls 2 --question @question.wav --rig-mic "$rig" --event-timeout 10
 launch wake-no-rig no-rig yes -- --step wake-sound --calls 2 --question @question.wav --rig-mic "$rig"
-# A build that writes no voice timing line: the timing steps read nothing, which is UNKNOWN.
-launch wake-no-timing no-timing yes -- --step wake-sound --calls 1 --question @question.wav --rig-mic "$rig" --event-timeout 3
+# A build that writes no voice timing line, restarted from one that did: the timing steps read
+# nothing from the process they run against, which is UNKNOWN.
+launch wake-no-timing no-timing,earlier-timing yes -- --step wake-sound --calls 1 --question @question.wav --rig-mic "$rig" --event-timeout 3
+launch wake-earlier-boot no-timing,earlier-boot yes -- --step wake-sound --calls 1 --question @question.wav --rig-mic "$rig" --event-timeout 3
+launch wake-earlier-run no-timing,earlier-run yes -- --step wake-sound --calls 1 --question @question.wav --rig-mic "$rig" --event-timeout 3
+launch wake-verbose verbose-journal yes -- --step wake-sound --calls 1 --question @question.wav --rig-mic "$rig" --event-timeout 10
 
 # scripted: tts passes and gptlive is refused; a filler early and the fact at 5 s (the negative
 # control); a fact sentence with no gap before it.
@@ -1022,6 +1097,9 @@ launch ask pass '' -- $ask_args
 launch ask-stopped holder-stopped '' -- $ask_args
 # shellcheck disable=SC2086
 launch ask-no-trace no-cancel-trace '' -- $ask_args
+# A journal that cannot be read once the answer is ready: UNKNOWN, not an answer with no timing line.
+# shellcheck disable=SC2086
+launch ask-journal-error journal-error-after-answer_ready '' -- $ask_args
 
 # barge-in: a pass; the stop rule off (the negative control); answers too short to count; a
 # backchannel that stops speech.
@@ -1029,6 +1107,8 @@ launch barge long yes -- --step barge-in --talkovers 2 --backchannels 2 --questi
 launch barge-off long,stop-off yes -- --step barge-in --talkovers 1 --backchannels 0 --question @question.wav --talkover-dir @talkovers --backchannel-dir @backchannels --rig-mic "$rig" --event-timeout 15
 launch barge-short short yes -- --step barge-in --talkovers 1 --backchannels 0 --question @question.wav --talkover-dir @talkovers --backchannel-dir @backchannels --rig-mic "$rig" --event-timeout 15
 launch barge-backchannel long,backchannel-stops yes -- --step barge-in --talkovers 1 --backchannels 1 --question @question.wav --talkover-dir @talkovers --backchannel-dir @backchannels --rig-mic "$rig" --event-timeout 15
+# A journal that cannot be read once the voice stops: UNKNOWN, not a talk-over with no stop.
+launch barge-journal-error long,journal-error-after-stop yes -- --step barge-in --talkovers 1 --backchannels 0 --question @question.wav --talkover-dir @talkovers --backchannel-dir @backchannels --rig-mic "$rig" --event-timeout 15
 
 # playback-cancel: a pass; today's draining path (the negative control); a logged underrun; an XRUN
 # the speaker did not log.
@@ -1041,6 +1121,8 @@ launch cancel-drain long,asound,drain yes -- $cancel_args
 launch cancel-underrun long,asound,underrun yes -- $cancel_args
 # shellcheck disable=SC2086
 launch cancel-xrun long,asound,xrun yes -- $cancel_args
+# shellcheck disable=SC2086
+launch cancel-journal-error long,asound,late-journal-error yes -- $cancel_args
 
 # tts-first-audio: a pass with the gemini-clip control; a control too close to tell (the negative
 # control); Aura without mip_opt_out; a build without the subcommand.
@@ -1247,7 +1329,7 @@ expect_rc wake-no-person 2
 expect_line wake-no-person 'UNKNOWN: wake-sound: no person confirmed the rig microphone'
 expect_untouched wake-no-person
 expect_rc wake-blind 2
-expect_line wake-blind 'UNKNOWN: voice timing log: journalctl --user -u ghost-wispr.service shows nothing'
+expect_line wake-blind 'UNKNOWN: voice timing log: sudo journalctl _SYSTEMD_USER_UNIT=ghost-wispr.service _PID='
 expect_restored wake-blind
 expect_rc wake-loud 2
 expect_line wake-loud 'too loud to tell the Jabra from the room'
@@ -1258,6 +1340,15 @@ expect_untouched wake-no-rig
 expect_rc wake-no-timing 2
 expect_line wake-no-timing 'UNKNOWN: voice timing log: the journal of ghost-wispr.service holds no "voice timing" line since its restart'
 expect_restored wake-no-timing
+expect_rc wake-earlier-boot 2
+expect_line wake-earlier-boot 'UNKNOWN: voice timing log: the journal of ghost-wispr.service holds no "voice timing" line since its restart'
+expect_restored wake-earlier-boot
+expect_rc wake-earlier-run 2
+expect_line wake-earlier-run 'UNKNOWN: voice timing log: the journal of ghost-wispr.service holds no "voice timing" line since its restart'
+expect_restored wake-earlier-run
+expect_rc wake-verbose 0
+expect_line wake-verbose 'PASS: voice timing log: the journal of ghost-wispr.service reads from its restart'
+expect_restored wake-verbose
 
 # scripted.
 expect_rc scripted 2
@@ -1331,6 +1422,11 @@ expect_restored ask-stopped
 expect_rc ask-no-trace 1
 expect_line ask-no-trace 'FAIL: ask-holder: the journal has no "concierge told an agent its question was cancelled"'
 expect_restored ask-no-trace
+expect_rc ask-journal-error 2
+expect_line ask-journal-error 'UNKNOWN: voice timing log: cannot read the journal of ghost-wispr.service (process '
+expect_line ask-journal-error ': Failed to read journal: Input/output error'
+expect_no_line ask-journal-error 'no answer_ready line'
+expect_restored ask-journal-error
 
 # barge-in.
 expect_rc barge 0
@@ -1355,6 +1451,10 @@ expect_restored barge-short
 expect_rc barge-backchannel 1
 expect_line barge-backchannel 'FAIL: barge-in: 1 of 1 backchannels stopped the speech, more than 0'
 expect_restored barge-backchannel
+expect_rc barge-journal-error 2
+expect_line barge-journal-error 'UNKNOWN: voice timing log: cannot read the journal of ghost-wispr.service (process '
+expect_line barge-journal-error ': Failed to read journal: Input/output error'
+expect_restored barge-journal-error
 
 # playback-cancel.
 expect_rc cancel 0
@@ -1374,6 +1474,10 @@ expect_restored cancel-underrun
 expect_rc cancel-xrun 1
 expect_line cancel-xrun 'FAIL: playback-cancel: the speaker logged no underrun, but the poller saw its stream in XRUN 1 times'
 expect_restored cancel-xrun
+expect_rc cancel-journal-error 2
+expect_line cancel-journal-error 'UNKNOWN: playback-cancel: cannot read the speaker underrun lines from the journal: Failed to read journal: Input/output error'
+expect_no_line cancel-journal-error 'PASS: playback-cancel: 0 underruns'
+expect_restored cancel-journal-error
 
 # tts-first-audio.
 expect_rc first-audio 0
