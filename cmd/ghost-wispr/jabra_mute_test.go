@@ -267,24 +267,31 @@ func TestJabraLostDeviceEndsItsReader(t *testing.T) {
 	rig := newJabraRig(false)
 	rig.checkEvery = time.Hour
 	entered, release := make(chan struct{}), make(chan struct{})
-	pause := rig.controls.Pause
-	rig.controls.Pause = func() error {
+	// A press on a recording unit closes the microphone (the Jabra's off).
+	closeMic := rig.controls.Close
+	rig.controls.Close = func() error {
 		close(entered)
 		<-release
-		return pause()
+		return closeMic()
 	}
 	rig.start(t)
+	freeClose := sync.OnceFunc(func() { close(release) })
+	t.Cleanup(freeClose) // before the rig's cleanup, which waits for the press
 	device := rig.plugIn()
 	waitForHardware(t, "the Jabra to connect", func() bool { return device.reportsSent() > 0 })
 
 	device.press(t)
-	<-entered
-	// The reader takes this press while the first one's pause runs, and holds it.
+	select {
+	case <-entered:
+	case <-time.After(testWait):
+		t.Fatal("the press on a recording unit did not close the microphone")
+	}
+	// The reader takes this press while the first one's close runs, and holds it.
 	device.key(t, 1)
 	device.mu.Lock()
 	device.writeErr = errors.New("no such device")
 	device.mu.Unlock()
-	close(release)
+	freeClose()
 	waitForHardware(t, "the button to report the lost Jabra", func() bool { return strings.Contains(rig.warning(), "Jabra mute button not found") })
 }
 

@@ -80,10 +80,10 @@ func (l *statesLight) red() bool {
 // stuck set, a close cannot release it, as one whose read still runs
 // (audio.ErrMicStillReading), until unstick.
 type statesMic struct {
-	r      *micStatesRig
-	mu     sync.Mutex
-	closed chan struct{}
-	stuck  bool
+	r       *micStatesRig
+	mu      sync.Mutex
+	closed  chan struct{}
+	stuck   bool
 	unstuck chan struct{}
 }
 
