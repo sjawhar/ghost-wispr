@@ -889,6 +889,10 @@ func main() {
 		logging.SetDefault(logging.New(os.Stderr, "warn"))
 		os.Exit(runIssueHolderCommand(context.Background(), os.Args[1:], configPath, os.Stdout, os.Stderr))
 	}
+	if len(os.Args) > 1 && os.Args[1] == "joined-probe" {
+		logging.SetDefault(logging.New(os.Stderr, "warn"))
+		os.Exit(runJoinedProbeCommand(context.Background(), os.Args[1:], configPath, os.Stdout, os.Stderr))
+	}
 	if len(os.Args) > 1 {
 		if exitCode := runLightCommand(os.Args[1:], os.Stdout, os.Stderr); exitCode != 0 {
 			os.Exit(exitCode)
