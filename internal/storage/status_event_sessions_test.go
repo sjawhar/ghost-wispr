@@ -61,7 +61,7 @@ func storeLegacyStatusEvents(t *testing.T, store *SQLiteStore) (gone, kept []str
 		`{"type":"component_status","version":1,"timestamp":"2026-11-16T14:06:00Z","component":"sync","status":"connected","message":"Google Drive synced for session `+statusKept+`","session_id":"`+statusKept+`"}`,
 	)
 	for _, payload := range append(slices.Clone(gone), kept...) {
-		if err := store.StoreEvent("component_status", payload); err != nil {
+		if err := store.StoreEvent(t.Context(), "component_status", payload); err != nil {
 			t.Fatal(err)
 		}
 	}

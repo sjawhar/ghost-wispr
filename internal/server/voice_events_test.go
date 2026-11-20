@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"maps"
 	"slices"
@@ -14,7 +15,7 @@ type recordingEventStore struct {
 	stored []string
 }
 
-func (s *recordingEventStore) StoreEvent(eventType, _ string) error {
+func (s *recordingEventStore) StoreEvent(_ context.Context, eventType, _ string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.stored = append(s.stored, eventType)

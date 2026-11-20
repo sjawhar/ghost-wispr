@@ -37,14 +37,14 @@ func deletionEventMerge(t *testing.T, store *SQLiteStore) int64 {
 		{"live_transcript", `{"type":"live_transcript","session_id":"n","text":"` + deletionEventPhrase + `","start_time":1,"end_time":2}`},
 		{"live_transcript", `{"type":"live_transcript","session_id":"s","text":"sierra words","start_time":1,"end_time":2}`},
 	} {
-		if err := store.StoreEvent(event.eventType, event.payload); err != nil {
+		if err := store.StoreEvent(t.Context(), event.eventType, event.payload); err != nil {
 			t.Fatal(err)
 		}
 	}
 	if err := store.MergeSessions("merged", []string{"n", "s"}, start, start.Add(time.Hour)); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.StoreEvent("session_ended", deletionEventEndedPayload); err != nil {
+	if err := store.StoreEvent(t.Context(), "session_ended", deletionEventEndedPayload); err != nil {
 		t.Fatal(err)
 	}
 	segments, err := store.GetSegments("merged")

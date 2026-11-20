@@ -55,32 +55,46 @@ type liveManager interface {
 // manager takes one, so a session's recording starts before the first words
 // Deepgram hears, even when it hears them late after a reconnect.
 func newLiveTranscription(ctx context.Context, apiKey string, cOptions *interfaces.ClientOptions, tOptions *interfaces.LiveTranscriptionOptions, config transcribe.ResilientConfig, callback transcriptCallback, warnings *warningsRegistry, hub *server.Hub) *transcribe.ResilientClient {
-	var rc *transcribe.ResilientClient
-	// syncWarning sets the warning from the client's state as it is now. The
-	// client reports each change on a goroutine of its own, so reports can
-	// arrive out of order; reading the state under one lock still leaves the
-	// warning matching the last state.
-	var warningMu sync.Mutex
-	syncWarning := func() {
-		warningMu.Lock()
-		defer warningMu.Unlock()
-		if rc.IsConnected() {
+	// The warning changes with the client's state, under the client's lock
+	// at the change itself (OnStateChangeLocked): it is local and quick, so
+	// it is never behind. The hub's "deepgram" status is broadcast from the
+	// state callback, which can run behind the client; each call broadcasts
+	// the client's current state, and only one newer than the last it
+	// broadcast (by Seq), so the pages never get an older state after a newer
+	// one and end on the latest. The callback's context ends at Close, which
+	// ends a store the broadcast waits on.
+	var (
+		rc        *transcribe.ResilientClient
+		onChange  transcribe.ConnectionCallback
+		appliedMu sync.Mutex
+		applied   uint64
+	)
+	if hub != nil {
+		onChange = func(changeCtx context.Context, _ transcribe.StateChange) {
+			appliedMu.Lock()
+			defer appliedMu.Unlock()
+			current := rc.CurrentState()
+			if current.Seq <= applied {
+				return
+			}
+			applied = current.Seq
+			hub.BroadcastComponentStatusSeq(changeCtx, "deepgram", current.State.String(), fmt.Sprintf("Deepgram %s", current.State.String()), current.Seq)
+		}
+	}
+	rc = transcribe.NewResilientClient(ctx, nil, config, log.Printf, onChange)
+	rc.OnStateChangeLocked = func(change transcribe.StateChange) {
+		if change.State == transcribe.StateConnected {
 			warnings.Clear(deepgramWarningKey)
 		} else {
 			warnings.Set(deepgramWarningKey, deepgramNotConnected)
 		}
 	}
-	rc = transcribe.NewResilientClient(ctx, nil, config, log.Printf, func(state transcribe.ConnectionState) {
-		syncWarning()
-		if hub != nil {
-			hub.BroadcastComponentStatus("deepgram", state.String(), fmt.Sprintf("Deepgram %s", state.String()))
-		}
-	})
 	rc.Factory = makeDeepgramClientFactory(ctx, apiKey, cOptions, tOptions, callback, deepgramWriteTimeout)
 	if manager, ok := callback.manager.(liveManager); ok && manager != nil {
 		manager.SetLiveStream(rc)
 	}
-	// Set before the dial, so a dial that connects first clears it.
+	// Set before the dial: the client reads connected until its first dial
+	// starts, with no socket yet.
 	warnings.Set(deepgramWarningKey, deepgramNotConnected)
 	rc.ConnectInBackground()
 	return rc

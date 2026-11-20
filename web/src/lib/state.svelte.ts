@@ -17,6 +17,9 @@ export type ComponentStatus = {
   timestamp: string
   // The session the status is about, from the event's session_id.
   sessionId?: string
+  // The number of the change, for a component whose changes are numbered
+  // (Deepgram's): a status with a lower one is older and is not applied.
+  seq?: number
 }
 
 // A session's questions to agents as last read, and why the last read
@@ -83,6 +86,16 @@ export function getTodaysSessions(): SessionSummary[] {
 
 export function setConnected(connected: boolean): void {
   appState.connected = connected
+  if (connected) {
+    // A new connection can be to a restarted unit, which numbers its changes
+    // from 1 again: the statuses it sends replace the ones this page holds.
+    appState.componentStatuses = Object.fromEntries(
+      Object.entries(appState.componentStatuses).map(([component, held]) => [
+        component,
+        { ...held, seq: undefined },
+      ]),
+    )
+  }
 }
 
 export function setPaused(paused: boolean): void {
@@ -363,6 +376,12 @@ export function applyComponentStatus(event: ComponentStatusEvent): void {
   if (event.session_id && removedSessions.has(event.session_id)) {
     return
   }
+  // A page can get a component's status twice, older after newer: from the
+  // snapshot it is sent on connecting and from the events queued meanwhile.
+  const held = appState.componentStatuses[event.component]
+  if (event.seq && held?.seq && event.seq < held.seq) {
+    return
+  }
   appState.componentStatuses = {
     ...appState.componentStatuses,
     [event.component]: {
@@ -370,6 +389,7 @@ export function applyComponentStatus(event: ComponentStatusEvent): void {
       message: event.message,
       timestamp: event.timestamp,
       sessionId: event.session_id,
+      seq: event.seq,
     },
   }
   if (event.component === 'mic') {

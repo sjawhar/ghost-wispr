@@ -37,7 +37,7 @@ func TestDeleteRefinedSegmentClearsEveryTextStore(t *testing.T) {
 	if err := store.StoreEmbedding("s", 0, []float32{1}, "hash", "model"); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.StoreEvent("live_transcript", `{"session_id":"s","type":"live_transcript","text":"crossstoresentinel","start_time":2,"end_time":3}`); err != nil {
+	if err := store.StoreEvent(t.Context(), "live_transcript", `{"session_id":"s","type":"live_transcript","text":"crossstoresentinel","start_time":2,"end_time":3}`); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.Close(); err != nil {

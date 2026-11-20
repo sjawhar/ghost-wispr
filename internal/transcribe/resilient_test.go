@@ -439,10 +439,10 @@ func TestResilientClient_OnStateChange(t *testing.T) {
 	stateChanges := []ConnectionState{}
 	mu := sync.Mutex{}
 
-	callback := func(state ConnectionState) {
+	callback := func(_ context.Context, change StateChange) {
 		mu.Lock()
 		defer mu.Unlock()
-		stateChanges = append(stateChanges, state)
+		stateChanges = append(stateChanges, change.State)
 	}
 
 	factory := func(ctx context.Context) (io.WriteCloser, error) {
@@ -486,6 +486,266 @@ func TestResilientClient_OnStateChange(t *testing.T) {
 	}
 	if !hasConnected {
 		t.Error("expected StateConnected callback")
+	}
+}
+
+// TestResilientClient_StateChangesArriveInOrder fails if two quick changes can
+// reach OnStateChange reversed. On the office Pi on 2026-11-20 a resume's
+// draining and connected reached the web clients 25 µs apart in the wrong
+// order, so every client held "draining" while Deepgram was connected. The
+// callback for the first change here waits until the second has been handed
+// over, or 1 s: a client that hands each change over on a goroutine of its own
+// hands the second over first, and the pair is recorded reversed.
+func TestResilientClient_StateChangesArriveInOrder(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var mu sync.Mutex
+	var got []StateChange
+	secondHandedOver := make(chan struct{})
+	both := make(chan struct{})
+	record := func(change StateChange) {
+		mu.Lock()
+		defer mu.Unlock()
+		got = append(got, change)
+		switch len(got) {
+		case 1:
+			if change.State == StateConnected {
+				close(secondHandedOver)
+			}
+		case 2:
+			close(both)
+		}
+	}
+	rc := NewResilientClient(ctx, nil, ResilientConfig{BufferSize: 1024}, nil, func(_ context.Context, change StateChange) {
+		if change.State == StateDraining {
+			select {
+			case <-secondHandedOver:
+			case <-time.After(time.Second):
+			}
+		}
+		record(change)
+	})
+	defer func() { _ = rc.Close() }()
+	rc.Mu.Lock()
+	rc.State = StateReconnecting
+	rc.setStateLocked(StateDraining)
+	rc.Mu.Unlock()
+	rc.Mu.Lock()
+	rc.setStateLocked(StateConnected)
+	rc.Mu.Unlock()
+
+	select {
+	case <-both:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the two state changes did not both reach OnStateChange within 5 s")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	states := []ConnectionState{got[0].State, got[1].State}
+	if want := []ConnectionState{StateDraining, StateConnected}; !slices.Equal(states, want) {
+		t.Fatalf("OnStateChange got %v, want %v: the client's last state is connected, but a listener that keeps the last change it got holds %v", states, want, states[1])
+	}
+	if got[1].Seq <= got[0].Seq {
+		t.Fatalf("the later change has Seq %d, not more than the earlier's %d", got[1].Seq, got[0].Seq)
+	}
+	if current := rc.CurrentState(); current != got[1] {
+		t.Fatalf("CurrentState() = %+v, want the last change handed over, %+v", current, got[1])
+	}
+}
+
+// TestResilientClient_AStuckStateCallbackNeverHoldsTheAudio fails if a state
+// change waits for OnStateChange: Write changes the state on the capture path
+// (a socket that refuses a write), and the microphone's audio must keep going
+// in while a callback is stuck. It also fails if the changes made meanwhile
+// are lost or reordered once the callback is free again.
+func TestResilientClient_AStuckStateCallbackNeverHoldsTheAudio(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	release := make(chan struct{})
+	var mu sync.Mutex
+	var got []ConnectionState
+	rc := NewResilientClient(ctx, nil, ResilientConfig{BufferSize: 1 << 16, InitialReconnectDelay: time.Hour, MaxReconnectBackoff: time.Hour}, nil, func(_ context.Context, change StateChange) {
+		<-release
+		mu.Lock()
+		defer mu.Unlock()
+		got = append(got, change.State)
+	})
+	rc.State = StateConnected
+	rc.Client = &mockWriter{writeErr: errors.New("socket closed")}
+
+	wrote := make(chan struct{})
+	go func() {
+		defer close(wrote)
+		// The first write fails on the socket: disconnected, then reconnecting,
+		// with the callback stuck on the first. The rest are buffered.
+		for range 50 {
+			_, _ = rc.Write(make([]byte, 320))
+		}
+	}()
+	select {
+	case <-wrote:
+	case <-time.After(2 * time.Second):
+		close(release)
+		t.Fatal("50 writes did not return within 2 s while OnStateChange was stuck: a state change held the capture path")
+	}
+	if rc.IsConnected() {
+		t.Fatal("the client reads connected after its socket refused a write")
+	}
+
+	close(release)
+	waitFor := time.Now().Add(5 * time.Second)
+	for {
+		mu.Lock()
+		n := len(got)
+		mu.Unlock()
+		if n >= 2 || time.Now().After(waitFor) {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if want := []ConnectionState{StateDisconnected, StateReconnecting}; !slices.Equal(got, want) {
+		t.Fatalf("once the callback was free it got %v, want %v", got, want)
+	}
+}
+
+// TestResilientClient_CloseStopsTheStateCallbacks fails if Close leaves the
+// goroutine that hands state changes over running, or waits on a callback
+// without a bound. A callback that honours its context returns at the close,
+// before Close does, and nothing is left; one that ignores it holds Close for
+// stateCallbackStopWait at most, and the hand-over ends all the same. No change
+// queued behind the stuck one is handed over after the close.
+func TestResilientClient_CloseStopsTheStateCallbacks(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		honours bool
+	}{{"a callback that honours the close", true}, {"a callback that ignores the close", false}} {
+		t.Run(tc.name, func(t *testing.T) {
+			entered, release, returned := make(chan struct{}), make(chan struct{}), make(chan struct{})
+			defer close(release)
+			var calls atomic.Int32
+			rc := NewResilientClient(context.Background(), nil, ResilientConfig{}, nil, func(ctx context.Context, _ StateChange) {
+				if calls.Add(1) > 1 {
+					return
+				}
+				close(entered)
+				defer close(returned)
+				if tc.honours {
+					select {
+					case <-ctx.Done():
+					case <-release:
+					}
+					return
+				}
+				<-release
+			})
+			rc.Mu.Lock()
+			rc.setStateLocked(StateDisconnected)
+			rc.setStateLocked(StateReconnecting) // queued behind the stuck callback
+			rc.Mu.Unlock()
+			select {
+			case <-entered:
+			case <-time.After(time.Second):
+				t.Fatal("the callback was not called")
+			}
+
+			start := time.Now()
+			closed := make(chan struct{})
+			go func() { _ = rc.Close(); close(closed) }()
+			select {
+			case <-closed:
+			case <-time.After(stateCallbackStopWait + time.Second):
+				t.Fatalf("Close did not return within %v of a stuck state callback", stateCallbackStopWait+time.Second)
+			}
+			took := time.Since(start)
+			if tc.honours {
+				select {
+				case <-returned:
+				default:
+					t.Fatal("Close returned before the callback that honours its context did")
+				}
+				if took >= stateCallbackStopWait {
+					t.Fatalf("Close took %v for a callback that returns at the close", took)
+				}
+			}
+			rc.Mu.Lock()
+			notifying, queued, done := rc.notifying, len(rc.stateChanges), rc.notifierDone
+			rc.Mu.Unlock()
+			select {
+			case <-done:
+			default:
+				t.Fatal("the state-change goroutine is still running after Close returned")
+			}
+			if notifying || queued != 0 {
+				t.Fatalf("after Close: notifying=%t with %d changes queued, want neither", notifying, queued)
+			}
+			rc.Mu.Lock()
+			rc.setStateLocked(StateConnected)
+			rc.Mu.Unlock()
+			time.Sleep(50 * time.Millisecond)
+			if n := calls.Load(); n != 1 {
+				t.Fatalf("OnStateChange was called %d times; after the close no change may be handed over", n)
+			}
+		})
+	}
+}
+
+// TestResilientClient_ABehindCallbackKeepsTheNewestChanges fails if the
+// queue of changes grows without a bound while the callback is stuck, or if
+// the bound drops the newest change rather than the oldest.
+func TestResilientClient_ABehindCallbackKeepsTheNewestChanges(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	release := make(chan struct{})
+	var mu sync.Mutex
+	var got []StateChange
+	rc := NewResilientClient(ctx, nil, ResilientConfig{}, nil, func(_ context.Context, change StateChange) {
+		<-release
+		mu.Lock()
+		defer mu.Unlock()
+		got = append(got, change)
+	})
+	defer func() { _ = rc.Close() }()
+	states := []ConnectionState{StateDisconnected, StateReconnecting}
+	rc.Mu.Lock()
+	for i := range 3 * maxQueuedStateChanges {
+		rc.setStateLocked(states[i%2])
+	}
+	queued := len(rc.stateChanges)
+	rc.setStateLocked(StateConnected)
+	last := rc.stateSeq
+	rc.Mu.Unlock()
+	if queued > maxQueuedStateChanges {
+		t.Fatalf("%d changes queued behind a stuck callback, more than the bound %d", queued, maxQueuedStateChanges)
+	}
+	close(release)
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		mu.Lock()
+		n := len(got)
+		var tail StateChange
+		if n > 0 {
+			tail = got[n-1]
+		}
+		mu.Unlock()
+		if tail.Seq == last {
+			if tail.State != StateConnected {
+				t.Fatalf("the last change handed over is %+v, want connected", tail)
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the newest change (Seq %d, connected) was not handed over; the last was %+v", last, tail)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	for i := 1; i < len(got); i++ {
+		if got[i].Seq <= got[i-1].Seq {
+			t.Fatalf("changes handed over out of order: %+v then %+v", got[i-1], got[i])
+		}
 	}
 }
 

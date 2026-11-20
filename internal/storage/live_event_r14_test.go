@@ -11,10 +11,10 @@ func TestDropLiveTranscriptEventsLeavesUnparseableEventsOfOtherSessions(t *testi
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = store.Close() })
-	if err := store.StoreEvent("live_transcript", "not valid JSON"); err != nil {
+	if err := store.StoreEvent(t.Context(), "live_transcript", "not valid JSON"); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.StoreEvent("live_transcript", `{"session_id":"target","text":"delete me"}`); err != nil {
+	if err := store.StoreEvent(t.Context(), "live_transcript", `{"session_id":"target","text":"delete me"}`); err != nil {
 		t.Fatal(err)
 	}
 	tx, err := store.DB().Begin()

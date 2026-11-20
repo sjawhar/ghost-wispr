@@ -2,10 +2,12 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
@@ -17,6 +19,8 @@ import (
 	interfaces "github.com/deepgram/deepgram-go-sdk/v3/pkg/client/interfaces"
 	"github.com/dvonthenen/websocket"
 
+	"github.com/sjawhar/ghost-wispr/internal/server"
+	"github.com/sjawhar/ghost-wispr/internal/storage"
 	"github.com/sjawhar/ghost-wispr/internal/transcribe"
 )
 
@@ -210,6 +214,332 @@ func TestDeepgramWarningFollowsLaterDisconnects(t *testing.T) {
 	time.Sleep(300 * time.Millisecond)
 	if !rc.IsConnected() || notConnectedWarning(warnings) {
 		t.Fatalf("300 ms after reconnecting: connected=%t, warnings %q; want connected and no warning", rc.IsConnected(), warnings.List())
+	}
+}
+
+// hubDeepgramStatus is the "deepgram" status the hub hands a web client that
+// connects now: the last one it broadcast.
+func hubDeepgramStatus(hub *server.Hub) string {
+	for _, event := range hub.SnapshotComponentStatuses() {
+		if event.Component == "deepgram" {
+			return event.Status
+		}
+	}
+	return ""
+}
+
+// TestTheHubsDeepgramStatusEndsAtTheClientsState fails if the "deepgram"
+// status the web clients hold is not the client's own state once it settles,
+// after the first dial and after each reconnect. On the office Pi on
+// 2026-11-20 the hub sent connected and then draining, so the page and the
+// acceptance driver read "draining" for as long as Deepgram stayed connected.
+func TestTheHubsDeepgramStatusEndsAtTheClientsState(t *testing.T) {
+	peer, host := startSwitchableDeepgram(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	hub := server.NewHub()
+	rc := newLiveTranscription(ctx, "test-key",
+		&interfaces.ClientOptions{Host: host, EnableKeepAlive: true},
+		&interfaces.LiveTranscriptionOptions{Model: "nova-3", Language: "en-US", Encoding: "linear16", SampleRate: 16000, Channels: 1},
+		transcribe.ResilientConfig{BufferSize: 1 << 16, InitialReconnectDelay: 20 * time.Millisecond, MaxReconnectBackoff: 50 * time.Millisecond},
+		transcriptCallback{}, newWarningsRegistry(), hub)
+	t.Cleanup(func() { _ = rc.Close() })
+
+	settled := func(what string) {
+		t.Helper()
+		waitForHardwareWithin(t, 5*time.Second, what, func() bool {
+			return rc.IsConnected() && hubDeepgramStatus(hub) == "connected"
+		})
+		time.Sleep(100 * time.Millisecond)
+		if got := hubDeepgramStatus(hub); !rc.IsConnected() || got != "connected" {
+			t.Fatalf("%s: 100 ms later the client is connected=%t and the hub's deepgram status is %q, want connected", what, rc.IsConnected(), got)
+		}
+	}
+	settled("the first dial: client connected and the hub's status connected")
+	for round := 1; round <= 5; round++ {
+		peer.dropAll()
+		waitForHardwareWithin(t, 3*time.Second, "the client to notice the drop", func() bool {
+			_, _ = rc.Write(make([]byte, 3200))
+			return !rc.IsConnected()
+		})
+		settled("a reconnect: client connected and the hub's status connected")
+	}
+}
+
+// blockingStatusStore is an event store that holds two Deepgram statuses
+// while it stores them: the first "reconnecting", until release closes, so
+// the hub's status callback runs behind the client's changes, as a slow disk
+// makes it; and the first "connected", until the test ends, so a connected
+// announced late stays visible to the test instead of passing in microseconds.
+type blockingStatusStore struct {
+	reconnecting, connected chan struct{}
+	release, end            chan struct{}
+	onceReconnecting        *sync.Once
+	onceConnected           *sync.Once
+}
+
+func (blockingStatusStore) HasSession(string) (bool, error) { return true, nil }
+
+func (s blockingStatusStore) StoreEvent(_ context.Context, _, payload string) error {
+	var event struct{ Component, Status string }
+	_ = json.Unmarshal([]byte(payload), &event)
+	switch {
+	case event.Component != "deepgram":
+	case event.Status == "reconnecting":
+		s.onceReconnecting.Do(func() { close(s.reconnecting); <-s.release })
+	case event.Status == "connected":
+		s.onceConnected.Do(func() { close(s.connected); <-s.end })
+	}
+	return nil
+}
+
+// stuckStatusStore holds every Deepgram status it is asked to store: until
+// ctx ends if honours, else until end closes. entered closes at the first.
+type stuckStatusStore struct {
+	entered, end, cancelled chan struct{}
+	honours                 bool
+	once                    *sync.Once
+}
+
+func (stuckStatusStore) HasSession(string) (bool, error) { return true, nil }
+
+func (s stuckStatusStore) StoreEvent(ctx context.Context, _, payload string) error {
+	var event struct{ Component string }
+	_ = json.Unmarshal([]byte(payload), &event)
+	if event.Component != "deepgram" {
+		return nil
+	}
+	s.once.Do(func() { close(s.entered) })
+	if s.honours {
+		select {
+		case <-ctx.Done():
+			close(s.cancelled)
+			return ctx.Err()
+		case <-s.end:
+			return nil
+		}
+	}
+	<-s.end
+	return nil
+}
+
+// TestTheWarningChangesWithTheClientsStateAtOnce fails if the "Deepgram is
+// not connected" warning waits for the status callback, which can run behind
+// the client: a change heard of late left the warning wrong for as long as
+// the callback was behind. The callback here is stuck in the hub's store for
+// the whole test; the warning must still clear the moment the client reads
+// connected, and come back the moment it reads not connected.
+func TestTheWarningChangesWithTheClientsStateAtOnce(t *testing.T) {
+	peer, host := startSwitchableDeepgram(t)
+	store := stuckStatusStore{entered: make(chan struct{}), end: make(chan struct{}), cancelled: make(chan struct{}), once: &sync.Once{}}
+	hub := server.NewHub()
+	hub.SetEventStore(store)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	warnings := newWarningsRegistry()
+	rc := newLiveTranscription(ctx, "test-key",
+		&interfaces.ClientOptions{Host: host, EnableKeepAlive: true},
+		&interfaces.LiveTranscriptionOptions{Model: "nova-3", Language: "en-US", Encoding: "linear16", SampleRate: 16000, Channels: 1},
+		transcribe.ResilientConfig{BufferSize: 1 << 16, InitialReconnectDelay: time.Hour, MaxReconnectBackoff: time.Hour},
+		transcriptCallback{}, warnings, hub)
+	t.Cleanup(func() { close(store.end); _ = rc.Close() })
+
+	select {
+	case <-store.entered:
+	case <-time.After(3 * time.Second):
+		t.Fatal("the status callback never reached the store")
+	}
+	waitForHardwareWithin(t, 3*time.Second, "the client to connect", rc.IsConnected)
+	if notConnectedWarning(warnings) {
+		t.Fatal("the client reads connected, and the warning still says it is not: it waited for the stuck status callback")
+	}
+	peer.dropAll()
+	for deadline := time.Now().Add(3 * time.Second); rc.IsConnected(); {
+		if time.Now().After(deadline) {
+			t.Fatal("the client did not notice the drop")
+		}
+		_, _ = rc.Write(make([]byte, 3200))
+	}
+	if !notConnectedWarning(warnings) {
+		t.Fatal("the client reads not connected, and the warning is not shown: it waited for the stuck status callback")
+	}
+}
+
+// TestCloseCancelsAStatusStoreItWaitsOn fails if Close leaves the status
+// callback in the hub's store: the callback must pass its context down to the
+// store, so a close ends a store that waits, at once, rather than leave it
+// running after Close's bounded wait.
+func TestCloseCancelsAStatusStoreItWaitsOn(t *testing.T) {
+	_, host := startSwitchableDeepgram(t)
+	store := stuckStatusStore{entered: make(chan struct{}), end: make(chan struct{}), cancelled: make(chan struct{}), honours: true, once: &sync.Once{}}
+	defer close(store.end)
+	hub := server.NewHub()
+	hub.SetEventStore(store)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	rc := newLiveTranscription(ctx, "test-key",
+		&interfaces.ClientOptions{Host: host, EnableKeepAlive: true},
+		&interfaces.LiveTranscriptionOptions{Model: "nova-3", Language: "en-US", Encoding: "linear16", SampleRate: 16000, Channels: 1},
+		transcribe.ResilientConfig{BufferSize: 1 << 16, InitialReconnectDelay: time.Hour, MaxReconnectBackoff: time.Hour},
+		transcriptCallback{}, newWarningsRegistry(), hub)
+	select {
+	case <-store.entered:
+	case <-time.After(3 * time.Second):
+		t.Fatal("the status callback never reached the store")
+	}
+	start := time.Now()
+	_ = rc.Close()
+	took := time.Since(start)
+	select {
+	case <-store.cancelled:
+	default:
+		t.Fatalf("Close returned after %v and the store it waited on was never cancelled", took)
+	}
+	if took >= 500*time.Millisecond {
+		t.Fatalf("Close took %v: it waited on the store instead of cancelling it", took)
+	}
+}
+
+// firstStoreSignals is the real store, telling the test when its first store
+// starts and when it returns.
+type firstStoreSignals struct {
+	*storage.SQLiteStore
+	entered, returned chan struct{}
+	once              *sync.Once
+}
+
+func (s firstStoreSignals) StoreEvent(ctx context.Context, eventType, payload string) error {
+	first := false
+	s.once.Do(func() { first = true; close(s.entered) })
+	if first {
+		defer close(s.returned)
+	}
+	return s.SQLiteStore.StoreEvent(ctx, eventType, payload)
+}
+
+// TestCloseIsBoundedWhileAStoreWaitsOnAnotherConnectionsWriteLock fails if
+// Close, or the status store it leaves running, outlasts its bound while
+// another connection (the sqlite3 command, a backup) holds the real
+// database's write lock. SQLite's busy handler does not heed the driver's
+// interrupt, so the cancel does not end that store: Close returns within 1 s
+// (stateCallbackStopWait), and the store ends, stored or failed, within
+// busy_timeout (5 s) of its start, with the lock held throughout.
+func TestCloseIsBoundedWhileAStoreWaitsOnAnotherConnectionsWriteLock(t *testing.T) {
+	var storeStart time.Time
+	_, host := startSwitchableDeepgram(t)
+	path := filepath.Join(t.TempDir(), "busy.db")
+	locker, err := storage.NewSQLiteStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = locker.Close() }()
+	writer, err := storage.NewSQLiteStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = writer.Close() }()
+	tx, err := locker.DB().Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err := tx.Exec(`INSERT INTO mcp_events(event_type, payload) VALUES('lock', '{}')`); err != nil {
+		t.Fatal(err)
+	}
+	store := firstStoreSignals{SQLiteStore: writer, entered: make(chan struct{}), returned: make(chan struct{}), once: &sync.Once{}}
+	hub := server.NewHub()
+	hub.SetEventStore(store)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	rc := newLiveTranscription(ctx, "test-key",
+		&interfaces.ClientOptions{Host: host, EnableKeepAlive: true},
+		&interfaces.LiveTranscriptionOptions{Model: "nova-3", Language: "en-US", Encoding: "linear16", SampleRate: 16000, Channels: 1},
+		transcribe.ResilientConfig{BufferSize: 1 << 16, InitialReconnectDelay: time.Hour, MaxReconnectBackoff: time.Hour},
+		transcriptCallback{}, newWarningsRegistry(), hub)
+	select {
+	case <-store.entered:
+		storeStart = time.Now()
+	case <-time.After(3 * time.Second):
+		t.Fatal("the status callback never reached the store")
+	}
+	select {
+	case <-store.returned:
+		t.Fatal("the store did not wait for the other connection's write lock")
+	case <-time.After(100 * time.Millisecond):
+	}
+	start := time.Now()
+	_ = rc.Close()
+	if took := time.Since(start); took > 1500*time.Millisecond {
+		t.Fatalf("Close took %v while a store waited on the write lock; its bound is 1 s", took)
+	}
+	select {
+	case <-store.returned:
+		t.Logf("the store ended %v after it started", time.Since(storeStart))
+	case <-time.After(time.Until(storeStart.Add(5*time.Second + time.Second))):
+		t.Fatalf("the store still waited %v after it started, past busy_timeout (5 s)", time.Since(storeStart))
+	}
+}
+
+// TestALateConnectedNeverHidesACurrentOutage fails if a change heard of late
+// clears the "Deepgram is not connected" warning, or tells the pages
+// connected, while Deepgram is down now. The status callback is held on the
+// first dial's "reconnecting" while the socket connects and is dropped; once
+// it runs again, it hears of "draining" and "connected" after the outage
+// began. In #109's first version they cleared the warning and told the pages
+// connected; on main the warning stayed but the pages were told connected.
+func TestALateConnectedNeverHidesACurrentOutage(t *testing.T) {
+	peer, host := startSwitchableDeepgram(t)
+	store := blockingStatusStore{
+		reconnecting: make(chan struct{}), connected: make(chan struct{}),
+		release: make(chan struct{}), end: make(chan struct{}),
+		onceReconnecting: &sync.Once{}, onceConnected: &sync.Once{},
+	}
+	var released sync.Once
+	free := func() { released.Do(func() { close(store.release) }) }
+	hub := server.NewHub()
+	hub.SetEventStore(store)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	warnings := newWarningsRegistry()
+	rc := newLiveTranscription(ctx, "test-key",
+		&interfaces.ClientOptions{Host: host, EnableKeepAlive: true},
+		&interfaces.LiveTranscriptionOptions{Model: "nova-3", Language: "en-US", Encoding: "linear16", SampleRate: 16000, Channels: 1},
+		// No reconnect during the test: the outage lasts.
+		transcribe.ResilientConfig{BufferSize: 1 << 16, InitialReconnectDelay: time.Hour, MaxReconnectBackoff: time.Hour},
+		transcriptCallback{}, warnings, hub)
+	t.Cleanup(func() { free(); close(store.end); _ = rc.Close() })
+
+	select {
+	case <-store.reconnecting:
+	case <-time.After(3 * time.Second):
+		t.Fatal("the first dial's reconnecting status was not stored")
+	}
+	waitForHardwareWithin(t, 3*time.Second, "the socket to connect while the status callback is held", func() bool {
+		return rc.IsConnected() && peer.held() == 1
+	})
+	peer.dropAll()
+	waitForHardwareWithin(t, 3*time.Second, "the outage", func() bool {
+		_, _ = rc.Write(make([]byte, 3200))
+		return !rc.IsConnected()
+	})
+	free()
+
+	// The held callback and every change behind it run now. A "connected"
+	// announced from here on is one heard of late: the client stays down.
+	select {
+	case <-store.connected:
+		t.Fatalf("during the outage (connected=%t) the pages were told Deepgram is connected; the warning is shown: %t",
+			rc.IsConnected(), notConnectedWarning(warnings))
+	case <-time.After(500 * time.Millisecond):
+	}
+	if rc.IsConnected() {
+		t.Fatal("the client reconnected, though its reconnect delay is an hour")
+	}
+	if !notConnectedWarning(warnings) {
+		t.Fatalf("during the outage the warning is gone (hub status %q): a change heard of late cleared it", hubDeepgramStatus(hub))
+	}
+	if status := hubDeepgramStatus(hub); status == "connected" || status == "" {
+		t.Fatalf("during the outage the hub's deepgram status is %q", status)
 	}
 }
 

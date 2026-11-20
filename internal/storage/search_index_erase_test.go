@@ -143,7 +143,7 @@ func TestAgeDeleteErasesTheSessionFromTheIndexTheLogAndTheBackup(t *testing.T) {
 func TestEveryStartErasesDeletedSessionsFromTheSearchIndex(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "ghost-wispr.db")
 	store := openWithIndexedSecret(t, path, func(store *SQLiteStore, id string) {
-		if err := store.StoreEvent("summary_ready", `{"type":"summary_ready","session_id":"`+id+`","summary":"summary of `+id+`"}`); err != nil {
+		if err := store.StoreEvent(t.Context(), "summary_ready", `{"type":"summary_ready","session_id":"`+id+`","summary":"summary of `+id+`"}`); err != nil {
 			t.Fatal(err)
 		}
 	})

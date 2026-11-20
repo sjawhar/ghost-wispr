@@ -2,6 +2,7 @@ package transcribe
 
 import (
 	"context"
+	"slices"
 	"sync/atomic"
 	"time"
 )
@@ -110,31 +111,121 @@ func (rc *ResilientClient) write(p []byte, queued *atomic.Int64) (int, error) {
 	return len(p), nil
 }
 
-// Close stops reconnection attempts and closes the underlying client. It
-// closes the client without holding Mu: a socket's close waits for its
-// reader, which may be timing a result's words (CapturedSince), and that
-// takes Mu.
+// Close stops reconnection attempts and the hand-over of state changes, and
+// closes the underlying client. It closes the client without holding Mu: a
+// socket's close waits for its reader, which may be timing a result's words
+// (CapturedSince), and that takes Mu. It then waits for the state-change
+// goroutine to end, which takes at most stateCallbackStopWait (1 s): the
+// callback in progress gets the cancelled context, and one that does not
+// return in time is left running, logged, rather than holding Close. The
+// Deepgram status callback stores its event in SQLite, and a store already
+// waiting on another connection's write lock does not heed the cancel; it
+// finishes or fails within SQLite's busy_timeout (5 s).
 func (rc *ResilientClient) Close() error {
 	rc.cancel()
 
 	rc.Mu.Lock()
 	client := rc.Client
+	notifierDone := rc.notifierDone
 	rc.Mu.Unlock()
 
+	var err error
 	if client != nil {
-		return client.Close()
+		err = client.Close()
 	}
-	return nil
+	if notifierDone != nil {
+		<-notifierDone
+	}
+	return err
 }
 
-// setStateLocked updates state and invokes callback. Must be called with rc.Mu held.
+// maxQueuedStateChanges bounds the changes queued for OnStateChange while it
+// is behind: a stuck callback must not grow the queue without end.
+const maxQueuedStateChanges = 64
+
+// stateCallbackStopWait is how long a closed client waits for the state
+// callback in progress to return.
+const stateCallbackStopWait = time.Second
+
+// stateSeqs numbers the state changes of every client in the process, so a
+// listener that outlives one client (the hub, across a new microphone start)
+// never reads a new client's change as older than an old client's.
+var stateSeqs atomic.Uint64
+
+// CurrentState returns the client's state with the number of the change that
+// made it: what a listener showing the current state applies, rather than the
+// older change it may be hearing of.
+func (rc *ResilientClient) CurrentState() StateChange {
+	rc.Mu.Lock()
+	defer rc.Mu.Unlock()
+	return StateChange{Seq: rc.stateSeq, State: rc.State}
+}
+
+// setStateLocked updates state, numbers the change, applies it to
+// OnStateChangeLocked, and queues it for OnStateChange. Must be called with
+// rc.Mu held. It never waits for OnStateChange: Write calls it on the capture
+// path.
 func (rc *ResilientClient) setStateLocked(newState ConnectionState) {
 	if rc.State == newState {
 		return
 	}
 	rc.State = newState
-	if rc.OnStateChange != nil {
-		go rc.OnStateChange(newState)
+	rc.stateSeq = stateSeqs.Add(1)
+	change := StateChange{Seq: rc.stateSeq, State: newState}
+	if rc.OnStateChangeLocked != nil {
+		rc.OnStateChangeLocked(change)
+	}
+	if rc.OnStateChange == nil || rc.ctx.Err() != nil {
+		return
+	}
+	if len(rc.stateChanges) == maxQueuedStateChanges {
+		rc.stateChanges = slices.Delete(rc.stateChanges, 0, 1)
+	}
+	rc.stateChanges = append(rc.stateChanges, change)
+	if !rc.notifying {
+		rc.notifying = true
+		rc.notifierDone = make(chan struct{})
+		go rc.notifyStateChanges(rc.notifierDone)
+	}
+}
+
+// notifyStateChanges hands the queued changes to OnStateChange one at a time,
+// oldest first, with Mu released during each call, and ends, closing done,
+// once none is left or the client closes. Each change used to get a goroutine
+// of its own, so two quick changes could reach the callback reversed: on the
+// office Pi on 2026-11-20 a resume's draining and connected reached the web
+// clients in the wrong order, and every client held "draining" while Deepgram
+// was connected. Each call runs on a goroutine of its own, which this one
+// waits for, so that a close can end this one while a callback ignores the
+// context.
+func (rc *ResilientClient) notifyStateChanges(done chan struct{}) {
+	defer close(done)
+	for {
+		rc.Mu.Lock()
+		if len(rc.stateChanges) == 0 || rc.ctx.Err() != nil {
+			rc.stateChanges = nil
+			rc.notifying = false
+			rc.Mu.Unlock()
+			return
+		}
+		change := rc.stateChanges[0]
+		rc.stateChanges = slices.Delete(rc.stateChanges, 0, 1)
+		rc.Mu.Unlock()
+
+		returned := make(chan struct{})
+		go func() {
+			defer close(returned)
+			rc.OnStateChange(rc.ctx, change)
+		}()
+		select {
+		case <-returned:
+		case <-rc.ctx.Done():
+			select {
+			case <-returned:
+			case <-time.After(stateCallbackStopWait):
+				rc.log("deepgram: the state callback for change %d (%s) did not return within %v of the close; it is left running", change.Seq, change.State, stateCallbackStopWait)
+			}
+		}
 	}
 }
 

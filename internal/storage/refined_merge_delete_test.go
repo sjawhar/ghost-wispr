@@ -39,7 +39,7 @@ func TestDeleteRefinedSegmentScrubsMergedSourcesByRecording(t *testing.T) {
 	if _, err := store.PublishRefinementAtGeneration("b", RefinedTranscript(wordsB), "nova-3", wordsB, BuildRefinedSegments(wordsB), 0); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.StoreEvent("live_transcript", `{"session_id":"a","type":"live_transcript","text":"Secret.","start_time":2,"end_time":3}`); err != nil {
+	if err := store.StoreEvent(t.Context(), "live_transcript", `{"session_id":"a","type":"live_transcript","text":"Secret.","start_time":2,"end_time":3}`); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.MergeSessions("merged", []string{"a", "b"}, started, started.Add(time.Hour+time.Minute)); err != nil {

@@ -122,6 +122,9 @@ export interface ComponentStatusEvent extends BaseEvent {
   // The session the status is about (its refinement, summary or sync);
   // absent for a status of the whole unit.
   session_id?: string
+  // Numbers the component's changes in the order they happened, for a
+  // component that numbers them (Deepgram): the highest is the latest.
+  seq?: number
 }
 
 // A session was deleted, with the sessions merged into it: their ids only.

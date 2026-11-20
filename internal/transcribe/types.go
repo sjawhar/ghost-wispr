@@ -58,9 +58,20 @@ type ResilientConfig struct {
 // It decouples the ResilientClient from SDK specifics and enables testing with mock factories.
 type ClientFactory func(ctx context.Context) (io.WriteCloser, error)
 
-// ConnectionCallback is a function type for state change notifications.
-// It's called whenever the connection state changes (e.g., for logging or metrics).
-type ConnectionCallback func(state ConnectionState)
+// StateChange is one change of a ResilientClient's state. Seq numbers the
+// changes of every client in the process, in the order they happened, so a
+// listener that may hear of a change late can tell it from a newer one: a
+// listener that shows the current state applies a change only when no newer
+// one has been applied (ResilientClient.CurrentState).
+type StateChange struct {
+	Seq   uint64
+	State ConnectionState
+}
+
+// ConnectionCallback hears of each change of the client's state. ctx is
+// cancelled when the client closes; a callback that waits must give up then,
+// since Close waits for it only a bounded time (stateCallbackStopWait).
+type ConnectionCallback func(ctx context.Context, change StateChange)
 
 // BatchResult is a recording's batch transcription: its transcript, the
 // model the provider reported, and its words with their times when the
@@ -112,8 +123,19 @@ type ResilientClient struct {
 	// Client is the current underlying io.WriteCloser (Deepgram SDK client).
 	Client io.WriteCloser
 
-	// OnStateChange is an optional callback for state transitions.
+	// OnStateChange is an optional callback for state transitions. It gets
+	// every change in the order the changes happened, numbered, one at a
+	// time, on a goroutine that holds no lock of the client's
+	// (notifyStateChanges), so a slow callback delays later callbacks, never
+	// the audio. When it falls maxQueuedStateChanges behind, the oldest
+	// queued changes are dropped and the newest kept; Seq shows the gap.
 	OnStateChange ConnectionCallback
+
+	// OnStateChangeLocked, when set, is called at each change with Mu held,
+	// before the change is queued for OnStateChange: for state that must
+	// change at the same moment as the client's own, such as a warning that
+	// says it is not connected. It must be quick and must not call the client.
+	OnStateChangeLocked func(StateChange)
 
 	// ctx is the application context; cancellation stops the reconnect loop.
 	ctx context.Context
@@ -142,4 +164,12 @@ type ResilientClient struct {
 	queuedAhead    func() int64
 	drops          []streamDrop
 	forgottenDrops int64
+	// stateSeq numbers the changes of State (StateChange.Seq). stateChanges
+	// are the changes not yet handed to OnStateChange, oldest first;
+	// notifying says a goroutine is handing them over, and notifierDone is
+	// closed when that goroutine ends. All guarded by Mu.
+	stateSeq     uint64
+	stateChanges []StateChange
+	notifying    bool
+	notifierDone chan struct{}
 }

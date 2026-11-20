@@ -25,7 +25,7 @@ func TestUntimedDeleteOwesMergedSourceDriveDocuments(t *testing.T) {
 	if err := store.EndSession("a", started.Add(time.Minute), ""); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.StoreEvent("live_transcript", `{"type":"live_transcript","session_id":"a","text":"private untimed words","start_time":0,"end_time":1}`); err != nil {
+	if err := store.StoreEvent(t.Context(), "live_transcript", `{"type":"live_transcript","session_id":"a","text":"private untimed words","start_time":0,"end_time":1}`); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := store.DB().Exec(`INSERT INTO embeddings(session_id, chunk_index, embedding, text_hash, model) VALUES('a', 0, X'00', 'hash', 'test')`); err != nil {

@@ -20,7 +20,7 @@ func preMigrationBackupPath(dbPath string) string {
 // memory, so a sort or the search index rebuild over the backup's transcripts
 // leaves no text in the blocks a temporary file frees.
 func backupDSN(backupPath string) string {
-	return backupPath + "?_pragma=secure_delete(1)&_pragma=temp_store(2)&_pragma=busy_timeout(5000)"
+	return fmt.Sprintf("%s?_pragma=secure_delete(1)&_pragma=temp_store(2)&_pragma=busy_timeout(%d)", backupPath, busyTimeoutMillis)
 }
 
 // eraseFromBackup removes a committed deletion from the pre-migration backup

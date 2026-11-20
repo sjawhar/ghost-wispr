@@ -64,7 +64,7 @@ func nestedMerge(t *testing.T, store *SQLiteStore) refinedSegmentSelection {
 		`{"type":"live_transcript","session_id":"s1","text":"s1 ` + ledgerSecret + `","start_time":2,"end_time":4}`,
 		`{"type":"live_transcript","session_id":"s3","text":"s3 sibling words","start_time":2,"end_time":4}`,
 	} {
-		if err := store.StoreEvent("live_transcript", event); err != nil {
+		if err := store.StoreEvent(t.Context(), "live_transcript", event); err != nil {
 			t.Fatal(err)
 		}
 	}

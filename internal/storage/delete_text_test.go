@@ -41,7 +41,7 @@ func TestDeleteRefinedSegmentTextRemovesTextEverywhere(t *testing.T) {
 	if _, err := store.DB().Exec(`INSERT INTO embeddings(session_id, chunk_index, embedding, text_hash, model) VALUES(?, 0, X'01', 'hash', 'model')`, "text-everywhere"); err != nil {
 		t.Fatalf("insert embedding: %v", err)
 	}
-	if err := store.StoreEvent("summary_ready", `{"type":"summary_ready","session_id":"text-everywhere","title":"private deletion token title","summary":"summary names private deletion token"}`); err != nil {
+	if err := store.StoreEvent(t.Context(), "summary_ready", `{"type":"summary_ready","session_id":"text-everywhere","title":"private deletion token title","summary":"summary names private deletion token"}`); err != nil {
 		t.Fatalf("store event: %v", err)
 	}
 	before := storeSession(t, store, "text-everywhere")
@@ -296,7 +296,7 @@ func mergedSessionWithSecretAfter(t *testing.T, store *SQLiteStore, beforeMerge 
 	if _, err := store.DB().Exec(`INSERT INTO embeddings(session_id, chunk_index, embedding, text_hash, model) VALUES('source-a', 0, X'01', 'hash', 'model')`); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.StoreEvent("summary_ready", `{"type":"summary_ready","session_id":"source-a","summary":"The summary of `+mergedSourceSecret+`."}`); err != nil {
+	if err := store.StoreEvent(t.Context(), "summary_ready", `{"type":"summary_ready","session_id":"source-a","summary":"The summary of `+mergedSourceSecret+`."}`); err != nil {
 		t.Fatal(err)
 	}
 	beforeMerge()
