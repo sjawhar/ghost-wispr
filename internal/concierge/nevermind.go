@@ -3,6 +3,7 @@ package concierge
 import (
 	"context"
 	"strings"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -10,19 +11,21 @@ import (
 	"github.com/sjawhar/ghost-wispr/internal/storage"
 )
 
-// NeverMind answers "Wispr, never mind": it cancels meeting sessionID's
-// newest working question, tells its holder (R7) and reports true. A question
-// that stopped working before its cancel landed, as when its answer arrived
-// meanwhile, is passed over for the next one. With no working question it does
-// nothing and reports false: the voice then drops its newest held answer.
-func (c *Concierge) NeverMind(ctx context.Context, sessionID string) (bool, error) {
+// NeverMind answers "Wispr, never mind", said at said: it cancels meeting
+// sessionID's newest working question asked by then, tells its holder (R7)
+// and reports true. A question asked after it, as while an earlier never mind
+// still told its holder, is not its to cancel. A question that stopped
+// working before its cancel landed, as when its answer arrived meanwhile, is
+// passed over for the next one. With no such question it does nothing and
+// reports false: the voice then drops its newest held answer.
+func (c *Concierge) NeverMind(ctx context.Context, sessionID string, said time.Time) (bool, error) {
 	tasks, err := c.store.VoiceTasks(sessionID)
 	if err != nil {
 		return false, err
 	}
 	for i := len(tasks) - 1; i >= 0; i-- {
 		task := tasks[i]
-		if task.State != storage.VoiceTaskWorking {
+		if task.State != storage.VoiceTaskWorking || task.AskedAt.After(said) {
 			continue
 		}
 		moved, err := c.store.EndVoiceTask(task.ID, storage.VoiceTaskCancelled)

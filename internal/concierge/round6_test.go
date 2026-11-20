@@ -622,7 +622,7 @@ func TestLedgerStates(t *testing.T) {
 		t.Fatalf("a question of another exchange replaced the earlier exchange's: evt-3 %s", task.State)
 	}
 
-	if cancelled, err := r.concierge.NeverMind(context.Background(), "meeting-1"); err != nil || !cancelled {
+	if cancelled, err := r.concierge.NeverMind(context.Background(), "meeting-1", testNow.Add(time.Minute)); err != nil || !cancelled {
 		t.Fatalf("NeverMind = %v, %v; want the newest task cancelled", cancelled, err)
 	}
 	if task, _ := r.store.VoiceTask("evt-5"); task.State != storage.VoiceTaskCancelled {

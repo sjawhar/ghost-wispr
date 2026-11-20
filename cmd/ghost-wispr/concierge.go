@@ -412,9 +412,9 @@ func (l *lazyConcierge) Spoken(ctx context.Context, taskID string) error {
 	return nil
 }
 
-func (l *lazyConcierge) NeverMind(ctx context.Context, sessionID string) (bool, error) {
+func (l *lazyConcierge) NeverMind(ctx context.Context, sessionID string, said time.Time) (bool, error) {
 	if c := l.started(); c != nil {
-		return c.NeverMind(ctx, sessionID)
+		return c.NeverMind(ctx, sessionID, said)
 	}
 	return false, nil
 }

@@ -201,6 +201,7 @@ type Supervisor struct {
 	lastStopAt    time.Time          // when the latest stop came
 	chimeCancel   context.CancelFunc // ends the answer chime playing or about to
 	chimeCtx      context.Context    // that chime's context, nil while none plays
+	chimeQueuedAt time.Time          // when that chime's last frame was queued
 	pending       []*pendingAnswer
 	arrivals      uint64    // answers taken so far; each held answer's arrived
 	lit           bool      // the waiting light was last told On (showWaitingLocked)
@@ -745,12 +746,20 @@ func (s *Supervisor) onTranscriptLocked(t *Transcript) {
 // one after another, each once the Concierge answered it, so two in a row
 // cancel and drop as if each waited for the last. The answer a never mind
 // drops is the newest of those held when it was said that no "Wispr, go
-// ahead" picked since: the later word wins. While a never mind waits, no
-// answer sounds or speaks by itself (offer); when its Concierge call fails,
-// the answer it would have dropped waits for "Wispr, go ahead".
+// ahead" picked since: the later word wins. The Concierge cancels only a
+// question asked before it was said. While a never mind waits, no answer
+// sounds or speaks by itself (offer); when its Concierge call fails, the
+// answer it would have dropped waits for "Wispr, go ahead". One still queued
+// when the Supervisor closes asks nothing.
 func (s *Supervisor) neverMindLocked(sessionID string) {
 	s.commands++
-	said, arrivedBy := s.commands, s.arrivals
+	said, saidAt := s.commands, time.Now()
+	var candidates []*pendingAnswer
+	for _, p := range s.pending {
+		if p.SessionID == sessionID {
+			candidates = append(candidates, p)
+		}
+	}
 	s.neverMinds++
 	before, done := s.lastNeverMind, make(chan struct{})
 	s.lastNeverMind = done
@@ -759,18 +768,21 @@ func (s *Supervisor) neverMindLocked(sessionID string) {
 		if before != nil {
 			<-before
 		}
-		ctx, cancel := context.WithTimeout(s.ctx, 10*time.Second)
-		defer cancel()
-		cancelled, err := s.cfg.Concierge.NeverMind(ctx, sessionID)
-		if err != nil {
-			s.logf("voice: cancel the newest question: %v", err)
+		cancelled, err := false, s.ctx.Err()
+		if err == nil {
+			ctx, cancel := context.WithTimeout(s.ctx, 10*time.Second)
+			cancelled, err = s.cfg.Concierge.NeverMind(ctx, sessionID, saidAt)
+			cancel()
+			if err != nil {
+				s.logf("voice: cancel the newest question: %v", err)
+			}
 		}
 		s.mu.Lock()
 		defer s.mu.Unlock()
 		s.neverMinds--
 		var held *pendingAnswer
-		for _, p := range s.pending {
-			if p.SessionID == sessionID && p.arrived <= arrivedBy && p.takenAt < said && (held == nil || p.arrived > held.arrived) {
+		for _, p := range candidates {
+			if p.takenAt < said && slices.Contains(s.pending, p) && (held == nil || p.arrived > held.arrived) {
 				held = p
 			}
 		}
@@ -789,10 +801,14 @@ func (s *Supervisor) neverMindLocked(sessionID string) {
 	})
 }
 
-// cutAnswerSoundLocked stops the answer sound queued, playing, or played
-// within its length: once its last answer is dropped, nothing of it plays.
+// chimeQueueLasts is how long the answer sound may still play once its last
+// frame is queued: the speaker queues up to 200 ms of an input ahead.
+const chimeQueueLasts = 250 * time.Millisecond
+
+// cutAnswerSoundLocked stops the answer sound queued or still playing: once
+// its last answer is dropped, nothing of it plays.
 func (s *Supervisor) cutAnswerSoundLocked() {
-	playing := s.chimeCancel != nil || time.Since(s.chimedAt) < answerChimeLasts()
+	playing := s.chimeCancel != nil || time.Since(s.chimeQueuedAt) < chimeQueueLasts
 	if s.chimeCancel != nil {
 		s.chimeCancel() // even one whose playback has not begun
 		s.chimeCancel, s.chimeCtx = nil, nil
@@ -800,14 +816,6 @@ func (s *Supervisor) cutAnswerSoundLocked() {
 	if playing {
 		s.cfg.Speaker.Cancel(audio.InputChime)
 	}
-}
-
-// answerChimeLasts is how long after it is scheduled the answer sound may
-// still play: its length, and the speaker's queue of up to 200 ms that its
-// last frames wait in.
-func answerChimeLasts() time.Duration {
-	samples := len(AnswerChime()) / 2 // PCM16 mono
-	return time.Duration(samples)*time.Second/time.Duration(ChimeFormat.SampleRate) + 250*time.Millisecond
 }
 
 // cutDriverLocked stops the speech of ex's voice, which drives its own turn,
@@ -1473,6 +1481,7 @@ func (s *Supervisor) offer() {
 				defer s.mu.Unlock()
 				if ctx == s.chimeCtx {
 					s.chimeCancel, s.chimeCtx = nil, nil
+					s.chimeQueuedAt = time.Now() // its last frames still play from the speaker's queue
 				}
 			})
 			s.chimeCtx = ctx

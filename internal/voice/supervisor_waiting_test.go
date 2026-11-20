@@ -266,6 +266,80 @@ func TestNeverMindCutsAnAnswerSoundStillPlaying(t *testing.T) {
 	})
 }
 
+// TestNeverMindCutsAnAnswerSoundThatStartedLate fails if the answer sound
+// goes on after "Wispr, never mind" drops the last answer when the speaker
+// took long to open: its last frames were queued long after it was
+// scheduled, and still play.
+func TestNeverMindCutsAnAnswerSoundThatStartedLate(t *testing.T) {
+	c := newFakeConcierge()
+	r, light := newWaitingRig(t, c)
+	release := r.speaker.holdBegins(audio.InputChime) // the speaker opens late
+	holdAnswer(t, r, light, "t1", "It ships tomorrow.")
+	eventually(t, "the answer sound scheduled", func() bool {
+		r.s.mu.Lock()
+		defer r.s.mu.Unlock()
+		return r.s.chimeCancel != nil
+	})
+	time.Sleep(time.Second)
+	release()
+	eventually(t, "the answer sound queued in full", func() bool {
+		r.s.mu.Lock()
+		defer r.s.mu.Unlock()
+		return r.speaker.written(audio.InputChime) > 0 && r.s.chimeCancel == nil
+	})
+	before := time.Now()
+	r.heard("Wispr, never mind.", true, true)
+	eventually(t, "the waiting light off", func() bool { return !light.lit() })
+	eventually(t, "the answer sound cut", func() bool {
+		at, ok := r.speaker.cancelledAt(audio.InputChime)
+		return ok && at.After(before)
+	})
+}
+
+// TestNeverMindDropsOnlyAnAnswerHeldWhenItWasSaid fails if a never mind drops
+// an answer that was speaking when it was said and that a stop put back to
+// wait before the Concierge answered: it drops the newest answer held when
+// it was said.
+func TestNeverMindDropsOnlyAnAnswerHeldWhenItWasSaid(t *testing.T) {
+	c := newFakeConcierge()
+	c.neverMindHold = make(chan struct{})
+	r, light := newWaitingRig(t, c)
+	c.answers <- PendingAnswer{TaskID: "t1", SessionID: "sess-1", IssueKey: "ABC-1", Text: "About ABC-1."}
+	r.waitEvent("voice_answer_ready:sess-1")
+	c.answers <- PendingAnswer{TaskID: "t2", SessionID: "sess-1", IssueKey: "ABC-2", Text: "About ABC-2."}
+	r.waitEvent("voice_answer_ready:sess-1")
+	eventually(t, "the waiting light on", light.lit)
+	r.heard("Wispr, go ahead, ABC two.", true, true)
+	if got := waitSaid(t, r.waitSession()); got != "About ABC-2." {
+		t.Fatalf("said %q, want ABC-2's answer", got)
+	}
+
+	r.heard("Wispr, never mind.", true, true) // ABC-2 speaks; ABC-1 is the newest held
+	eventually(t, "the cancel asked of the Concierge", func() bool { return len(c.neverMindCalls()) == 1 })
+	r.s.Stop("Jabra button") // within the replay window: ABC-2 waits again
+	eventually(t, "both answers waiting", func() bool { return pendingCount(r) == 2 })
+	c.neverMindHold <- struct{}{}
+	eventually(t, "one answer dropped", func() bool { return pendingCount(r) == 1 })
+	r.heard("Wispr, go ahead.", true, true)
+	if got := waitSaid(t, r.waitSession()); got != "About ABC-2." {
+		t.Fatalf("said %q, want ABC-2's answer: the never mind must drop ABC-1, held when it was said", got)
+	}
+}
+
+// TestNoNeverMindStartsAfterClose fails if a never mind still queued behind
+// another when the Supervisor closes asks the Concierge anything afterwards.
+func TestNoNeverMindStartsAfterClose(t *testing.T) {
+	c := newFakeConcierge()
+	c.neverMindHold = make(chan struct{})
+	r, light := newWaitingRig(t, c)
+	holdAnswer(t, r, light, "t1", "One.")
+	r.heard("Wispr, never mind.", true, true)
+	eventually(t, "the first cancel", func() bool { return len(c.neverMindCalls()) == 1 })
+	r.heard("Wispr, never mind.", true, true)
+	r.s.Close() // the first call returns with the closed context
+	never(t, "a queued never mind asked the Concierge after Close", 300*time.Millisecond, func() bool { return len(c.neverMindCalls()) > 1 })
+}
+
 // TestALaterGoAheadOutlivesAnOlderNeverMind fails if a "Wispr, never mind"
 // whose Concierge call is still running drops an answer that a later "Wispr,
 // go ahead" spoke and a stop then put back to wait: the later word wins.

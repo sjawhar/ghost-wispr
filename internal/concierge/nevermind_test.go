@@ -4,6 +4,7 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/sjawhar/ghost-wispr/internal/storage"
 )
@@ -19,7 +20,7 @@ func TestNeverMindCancelsTheNewestWorkingTask(t *testing.T) {
 	r.ask(t, "agent-7", "first question", "ABC-12")
 	r.ask(t, "agent-8", "second question", "")
 
-	if cancelled, err := r.concierge.NeverMind(context.Background(), "meeting-1"); err != nil || !cancelled {
+	if cancelled, err := r.concierge.NeverMind(context.Background(), "meeting-1", testNow.Add(time.Minute)); err != nil || !cancelled {
 		t.Fatalf("NeverMind = %v, %v; want a working question cancelled", cancelled, err)
 	}
 	newest, _ := r.store.VoiceTask("evt-2")
@@ -41,13 +42,13 @@ func TestNeverMindCancelsTheNewestWorkingTask(t *testing.T) {
 		t.Fatalf("the log lacks the cancel line:\n%s", logs)
 	}
 
-	if cancelled, err := r.concierge.NeverMind(context.Background(), "meeting-1"); err != nil || !cancelled {
+	if cancelled, err := r.concierge.NeverMind(context.Background(), "meeting-1", testNow.Add(time.Minute)); err != nil || !cancelled {
 		t.Fatalf("second NeverMind = %v, %v; want the older question cancelled", cancelled, err)
 	}
 	if older, _ := r.store.VoiceTask("evt-1"); older.State != storage.VoiceTaskCancelled {
 		t.Fatalf("after a second never mind: evt-1 %s, want cancelled", older.State)
 	}
-	if cancelled, err := r.concierge.NeverMind(context.Background(), "meeting-1"); err != nil || cancelled {
+	if cancelled, err := r.concierge.NeverMind(context.Background(), "meeting-1", testNow.Add(time.Minute)); err != nil || cancelled {
 		t.Fatalf("NeverMind with no working question = %v, %v; want none cancelled", cancelled, err)
 	}
 	if len(r.agents.sent) != 4 {
@@ -84,7 +85,7 @@ func TestNeverMindCancelsTheNextWorkingTaskWhenTheNewestIsAnsweredMeanwhile(t *t
 	r.ask(t, "agent-8", "second question", "")
 	r.concierge.store = &answeredMeanwhile{Store: r.store}
 
-	if cancelled, err := r.concierge.NeverMind(context.Background(), "meeting-1"); err != nil || !cancelled {
+	if cancelled, err := r.concierge.NeverMind(context.Background(), "meeting-1", testNow.Add(time.Minute)); err != nil || !cancelled {
 		t.Fatalf("NeverMind = %v, %v; want the older working question cancelled", cancelled, err)
 	}
 	if newest, _ := r.store.VoiceTask("evt-2"); newest.State != storage.VoiceTaskDone {
@@ -92,5 +93,28 @@ func TestNeverMindCancelsTheNextWorkingTaskWhenTheNewestIsAnsweredMeanwhile(t *t
 	}
 	if older, _ := r.store.VoiceTask("evt-1"); older.State != storage.VoiceTaskCancelled {
 		t.Fatalf("evt-1 %s, want cancelled", older.State)
+	}
+}
+
+// TestNeverMindCancelsOnlyAQuestionAskedBeforeIt fails if a never mind
+// cancels a question asked after it was said, as one asked while an earlier
+// never mind still told its holder: it cancels the newest working question
+// asked before it.
+func TestNeverMindCancelsOnlyAQuestionAskedBeforeIt(t *testing.T) {
+	r := newRig(t)
+	r.ask(t, "agent-7", "first question", "ABC-12")
+	later := storage.VoiceTask{ID: "later", SessionID: "meeting-1", AskedAt: testNow.Add(2 * time.Second), Holder: "session:agent-8"}
+	if err := r.store.CreateVoiceTask(&later); err != nil {
+		t.Fatal(err)
+	}
+
+	if cancelled, err := r.concierge.NeverMind(context.Background(), "meeting-1", testNow.Add(time.Second)); err != nil || !cancelled {
+		t.Fatalf("NeverMind = %v, %v; want the question asked before it cancelled", cancelled, err)
+	}
+	if task, _ := r.store.VoiceTask("later"); task.State != storage.VoiceTaskWorking {
+		t.Fatalf("the question asked after the never mind is %s, want working", task.State)
+	}
+	if task, _ := r.store.VoiceTask("evt-1"); task.State != storage.VoiceTaskCancelled {
+		t.Fatalf("evt-1 %s, want cancelled", task.State)
 	}
 }
