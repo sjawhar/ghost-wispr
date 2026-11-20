@@ -227,7 +227,7 @@ type SessionConfig struct {
 	// Capabilities are what the session advertises, such as the delivery
 	// modes Dispatch sends a person's message with ("btw"); nil is none.
 	Capabilities []string
-	Resume                                  *ResumePoint
+	Resume       *ResumePoint
 	// SaveResume keeps the resume point where the unit keeps its state.
 	SaveResume func(ResumePoint) error
 	// Deliver takes one message. It runs for each frame in stream order; an
