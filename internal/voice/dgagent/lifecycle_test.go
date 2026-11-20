@@ -237,8 +237,11 @@ func TestAnInjectionAfterAStoppedReplyIsSpoken(t *testing.T) {
 		t.Fatalf("the injection played %d bytes, want its %d", len(got), len(pcm))
 	}
 	// A stopped reply sends nothing more: the next injection queues rather
-	// than cut a reply that is not there.
+	// than cut a reply that is not there. The room's words after the user
+	// start show the reader has handled it.
 	c.send(map[string]any{"type": "UserStartedSpeaking"})
+	c.send(map[string]any{"type": "ConversationText", "role": "user", "content": "go on"})
+	waitEvent(t, sess, voice.EventUserTurn)
 	_ = sayAsync(sess, "Queued words.")
 	if msg := c.expect(t, "InjectAgentMessage"); msg["behavior"] != "queue" {
 		t.Fatalf("after a user start the session sent %v, want behavior queue", msg)
@@ -292,6 +295,35 @@ func TestInterruptEndsSpeechTheOutputHasTaken(t *testing.T) {
 		t.Fatalf("Say = %v, want ErrInterrupted", err)
 	}
 	waitEvent(t, sess, voice.EventSpeechEnded)
+}
+
+// TestAnInterruptedReplyWithNoTextIsNotPlayedLater fails if an Interrupt
+// leaves the reply whose audio came before its text undecided: Deepgram's
+// AgentAudioDone then leaves it waiting for a text, and the next
+// injection's text plays the interrupted audio as its own.
+func TestAnInterruptedReplyWithNoTextIsNotPlayedLater(t *testing.T) {
+	setSpeechGap(t, time.Minute)
+	s := startStandIn(t)
+	out := newFakeOutput()
+	sess, c, _ := open(t, s, Config{}, voice.Exchange{Out: out, Tools: tools(nil)})
+	first := sayAsync(sess, "First words.")
+	c.expect(t, "InjectAgentMessage")
+	c.sendAudio(tone(OutputRate, 20*time.Millisecond, 140)) // its audio, before its text
+	c.send(map[string]any{"type": "ConversationText", "role": "user", "content": "wait"})
+	waitEvent(t, sess, voice.EventUserTurn) // the reader has the audio
+	sess.Interrupt()
+	if err := returned(t, first); !errors.Is(err, ErrInterrupted) {
+		t.Fatalf("Say = %v, want ErrInterrupted", err)
+	}
+	c.send(map[string]any{"type": "AgentAudioDone"})
+	second := tone(OutputRate, 20*time.Millisecond, 141)
+	done := injectSpeech(t, sess, c, "Second words.", second, true)
+	if err := returned(t, done); err != nil {
+		t.Fatalf("second Say = %v, want nil", err)
+	}
+	if got := outputSamples(t, out); got[140] != 0 || got[141] != len(second) {
+		t.Fatalf("interrupted/second bytes at Output = %d/%d, want 0/%d", got[140], got[141], len(second))
+	}
 }
 
 // slowOutput's Write takes 50 ms to see its context end, and counts every
