@@ -32,7 +32,7 @@ func keepTheDefaultLogger(t *testing.T) {
 func TestALineAProviderSDKLogsIsWithheld(t *testing.T) {
 	keepTheDefaultLogger(t)
 	var out bytes.Buffer
-	SetDefault(New(&out, "info"))
+	SetDefault(New(&out, slog.LevelInfo))
 
 	answer := &genai.GenerateContentResponse{Candidates: []*genai.Candidate{
 		{Content: &genai.Content{Parts: []*genai.Part{{Text: "first answer"}}}},
@@ -69,7 +69,7 @@ func (providerError) LogAttrs() []slog.Attr {
 // its fields, bound or not, wrapped or not; any other error as its text.
 func TestAProviderErrorIsWrittenWithItsFields(t *testing.T) {
 	var out bytes.Buffer
-	logger := New(&out, "info")
+	logger := New(&out, slog.LevelInfo)
 	logger.Warn("summarization failed", "error", fmt.Errorf("openai completion: %w", providerError{}))
 	logger.With("error", providerError{}).Warn("bound")
 	logger.Warn("plain", "error", fmt.Errorf("disk full"))

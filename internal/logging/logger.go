@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 )
@@ -21,13 +22,16 @@ type contextKey string
 
 const loggerContextKey contextKey = "ghost_wispr_logger"
 
-// New returns a JSON logger that writes to output at level. An error
+const moduleKey = "module"
+
+// New returns a JSON logger that writes to output at level: a slog.Level, or
+// a *slog.LevelVar whose level can change while the logger runs. An error
 // attribute that holds a provider's error (one with LogAttrs, as
 // providererr.Error has) is written as its text and those fields, and a line
 // a provider's SDK logs is withheld (sdkHandler).
-func New(output io.Writer, level string) *slog.Logger {
+func New(output io.Writer, level slog.Leveler) *slog.Logger {
 	handlerOptions := &slog.HandlerOptions{
-		Level: parseLevel(level),
+		Level: level,
 		ReplaceAttr: func(_ []string, attr slog.Attr) slog.Attr {
 			switch attr.Key {
 			case slog.TimeKey:
@@ -157,6 +161,11 @@ func providerSDK(pc uintptr) string {
 	return sdk
 }
 
+// WithModule returns logger with each record naming module in its "module"
+// attribute, after the attributes the logger binds. On a logger that names a
+// module already, it names module in that one's place, so a record holds one
+// "module" key: with two, a reader keeps whichever its JSON library picks. A
+// module named after a group opened is in that group.
 func WithModule(logger *slog.Logger, module string) *slog.Logger {
 	if logger == nil {
 		logger = slog.Default()
@@ -166,7 +175,71 @@ func WithModule(logger *slog.Logger, module string) *slog.Logger {
 		return logger
 	}
 
-	return logger.With("module", module)
+	bare := logger.Handler()
+	if named, ok := bare.(*moduleHandler); ok {
+		bare = named.bare
+	}
+	return slog.New(newModuleHandler(bare, module))
+}
+
+// moduleHandler writes records through named: bare, which holds every
+// attribute but the module, with the module bound last. Each attribute is
+// bound once, on bare, and named is bare with the module bound again, so a
+// value is rendered once, as it was when it was bound, and naming another
+// module binds that one on bare.
+//
+// Once a group opens, the module stays outside it: named then binds each
+// later attribute itself, as bare does, so such an attribute is rendered on
+// both.
+type moduleHandler struct {
+	bare    slog.Handler
+	module  string
+	named   slog.Handler
+	grouped bool // a group opened since the module was bound on named
+}
+
+func newModuleHandler(bare slog.Handler, module string) *moduleHandler {
+	return &moduleHandler{bare: bare, module: module, named: bare.WithAttrs([]slog.Attr{slog.String(moduleKey, module)})}
+}
+
+func (h *moduleHandler) Enabled(ctx context.Context, level slog.Level) bool {
+	return h.named.Enabled(ctx, level)
+}
+
+//nolint:gocritic // slog.Handler's Handle takes the record by value.
+func (h *moduleHandler) Handle(ctx context.Context, record slog.Record) error {
+	return h.named.Handle(ctx, record)
+}
+
+func (h *moduleHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
+	if len(attrs) == 0 {
+		return h
+	}
+	if !h.grouped {
+		return newModuleHandler(h.bare.WithAttrs(attrs), h.module)
+	}
+	// Resolved once here, a LogValuer bound on both handlers is evaluated once.
+	resolveAttrs(attrs)
+	return &moduleHandler{bare: h.bare.WithAttrs(slices.Clone(attrs)), module: h.module, named: h.named.WithAttrs(attrs), grouped: true}
+}
+
+func (h *moduleHandler) WithGroup(name string) slog.Handler {
+	if name == "" {
+		return h
+	}
+	return &moduleHandler{bare: h.bare.WithGroup(name), module: h.module, named: h.named.WithGroup(name), grouped: true}
+}
+
+// resolveAttrs resolves each LogValuer in attrs, in groups too, in place.
+func resolveAttrs(attrs []slog.Attr) {
+	for i := range attrs {
+		attrs[i].Value = attrs[i].Value.Resolve()
+		if attrs[i].Value.Kind() == slog.KindGroup {
+			group := slices.Clone(attrs[i].Value.Group())
+			resolveAttrs(group)
+			attrs[i].Value = slog.GroupValue(group...)
+		}
+	}
 }
 
 func ContextWithLogger(ctx context.Context, logger *slog.Logger) context.Context {
@@ -206,7 +279,9 @@ func RequestIDMiddleware(base *slog.Logger, generateID func() string) func(http.
 	}
 }
 
-func parseLevel(level string) slog.Level {
+// ParseLevel is the level a config names: "debug", "info", "warn" (or
+// "warning") or "error", in any case. Any other name is info.
+func ParseLevel(level string) slog.Level {
 	parsed, _ := LevelNamed(level)
 	return parsed
 }

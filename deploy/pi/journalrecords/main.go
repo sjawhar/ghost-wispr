@@ -43,7 +43,7 @@ func main() {
 
 func write(in io.Reader, out io.Writer) error {
 	// The service logs at log_level "info", its default (internal/config), which the Pi keeps.
-	handler := logging.New(out, "info").Handler()
+	handler := logging.New(out, logging.ParseLevel("info")).Handler()
 	decoder := json.NewDecoder(in)
 	decoder.DisallowUnknownFields()
 	// A number stays a json.Number, which the handler writes with the digits it was read with; a

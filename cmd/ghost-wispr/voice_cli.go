@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"log/slog"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -341,7 +342,7 @@ func runIssueHolderCommand(ctx context.Context, args []string, configPath string
 		return fail(fmt.Errorf("open a scratch ledger: %w", err))
 	}
 	defer func() { _ = ledger.Close() }()
-	logger := logging.New(stderr, "warn")
+	logger := logging.New(stderr, slog.LevelWarn)
 	c, err := newConcierge(ctx, &cfg, ledger, logger, nil)
 	if err != nil {
 		return fail(err)
