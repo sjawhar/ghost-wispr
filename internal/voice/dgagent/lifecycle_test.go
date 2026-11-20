@@ -194,6 +194,34 @@ func TestAReplyAfterUserSpeechPlaysAfterAnInterrupt(t *testing.T) {
 	}
 }
 
+// TestAnInjectionAfterAStoppedReplyIsSpoken fails if the tail of a reply a
+// user start stopped, which AgentAudioDone ends with no text, waits for a
+// text and takes the next injection's: that injection's audio then has no
+// text to claim it, and never plays.
+func TestAnInjectionAfterAStoppedReplyIsSpoken(t *testing.T) {
+	setSpeechGap(t, time.Minute)
+	s := startStandIn(t)
+	out := newFakeOutput()
+	sess, c, _ := open(t, s, Config{}, voice.Exchange{Out: out, Tools: tools(nil)})
+	c.send(map[string]any{"type": "UserStartedSpeaking"})
+	c.send(map[string]any{"type": "AgentAudioDone"})
+	pcm := tone(OutputRate, 20*time.Millisecond, 120)
+	done := injectSpeech(t, sess, c, "Next words.", pcm, true)
+	if err := returned(t, done); err != nil {
+		t.Fatalf("Say = %v, want nil", err)
+	}
+	if got := out.nextPlayback(t).written(); !bytes.Equal(got, pcm) {
+		t.Fatalf("the injection played %d bytes, want its %d", len(got), len(pcm))
+	}
+	// A stopped reply sends nothing more: the next injection queues rather
+	// than cut a reply that is not there.
+	c.send(map[string]any{"type": "UserStartedSpeaking"})
+	_ = sayAsync(sess, "Queued words.")
+	if msg := c.expect(t, "InjectAgentMessage"); msg["behavior"] != "queue" {
+		t.Fatalf("after a user start the session sent %v, want behavior queue", msg)
+	}
+}
+
 // TestInterruptStopsSpeechTheOutputHolds fails if an Interrupt while the
 // Output is full, the usual case live (Deepgram sends speech faster than it
 // plays), leaves the voice speaking or plays the queued rest of the reply.

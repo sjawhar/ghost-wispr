@@ -250,6 +250,7 @@ func (s *session) inject(ctx context.Context, text string, untilAudio bool, answ
 		behavior = "interrupt"
 		s.log.Debug("the injection cuts a reply that does not play")
 	}
+	s.speech.injected()
 	if err := s.writeJSON(injectAgentMessage{Type: "InjectAgentMessage", Message: text, Behavior: behavior}); err != nil {
 		s.release(w)
 		return nil, err

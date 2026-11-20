@@ -69,6 +69,7 @@ type utterance struct {
 	heldBase int      // the number of frames ever taken from held
 	audio    [][]byte // audio before its text, waiting for its decision
 	waiter   *sayWait
+	cut      bool // the tail of a reply a user start stopped; the next injection ends it
 }
 
 // speechQueue carries the agent's speech from the reader, which must never
@@ -277,7 +278,7 @@ func (q *speechQueue) done() {
 	}
 	u.done = true
 	q.current = nil
-	if !u.text {
+	if !u.text && u.decision != dropped {
 		q.awaitingText = append(q.awaitingText, u)
 		q.signal()
 		return
@@ -347,16 +348,18 @@ func (q *speechQueue) reject(u *utterance) {
 func (q *speechQueue) silenced() bool {
 	q.mu.Lock()
 	defer q.mu.Unlock()
-	return q.current != nil && q.current.decision == dropped
+	return q.current != nil && q.current.decision == dropped && !q.current.cut
 }
 
-// userSpoke ends the reply Deepgram stops for the room: its late bytes and
-// text cannot be claimed later, and the next vendor event creates a new
-// reply. An injection's frames that still wait have not played, and may be
-// the model's words whose text has not come. Over the voice's speech, which
-// the Supervisor stops when someone talks over it, they are dropped, and the
-// Say they belong to is interrupted. With no speech to talk over, they keep
-// waiting for model text or the hold, as the end of a reply Deepgram stopped.
+// userSpoke ends the reply Deepgram stops for the room. Audio that still
+// comes, until the session's next injection or AgentAudioDone, is that
+// reply's tail and is dropped: its text came before the user start, so no
+// later text may claim it. An injection's frames that still wait have not
+// played, and may be the model's words whose text has not come. Over the
+// voice's speech, which the Supervisor stops when someone talks over it,
+// they are dropped, and the Say they belong to is interrupted. With no
+// speech to talk over, they keep waiting for model text or the hold, as the
+// end of a reply Deepgram stopped.
 func (q *speechQueue) userSpoke(overVoice bool) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
@@ -377,6 +380,17 @@ func (q *speechQueue) userSpoke(overVoice bool) {
 		q.signal()
 	}
 	q.rejectAllLocked()
+	q.current = &utterance{decision: dropped, cut: true}
+}
+
+// injected notes that the session sent an injection: the audio that comes
+// next may be its own, so the tail of a reply a user start stopped ends.
+func (q *speechQueue) injected() {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if q.current != nil && q.current.cut {
+		q.current = nil
+	}
 }
 
 // rejectAllLocked drops every reply that has not ended, other than an
