@@ -102,12 +102,14 @@ func probeConcierge(log func(string, ...any), questions chan<- string, route fun
 	}
 }
 
-// recordingOutput records every frame written to it, and when each
-// playback's first frame came, playing at real time as the speaker would.
+// recordingOutput records every frame written to it, when each playback's
+// first frame came, and when each frame was written, playing at real time as
+// the speaker would.
 type recordingOutput struct {
 	mu     sync.Mutex
 	pcm    []byte
 	begins []time.Time
+	writes []time.Time
 }
 
 func (o *recordingOutput) Begin() voice.Playback { return &recordingPlayback{out: o} }
@@ -123,6 +125,18 @@ func (o *recordingOutput) firstAfter(t time.Time) time.Time {
 	return time.Time{}
 }
 
+// firstWriteAfter is when the first frame after t was written.
+func (o *recordingOutput) firstWriteAfter(t time.Time) time.Time {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	for _, w := range o.writes {
+		if w.After(t) {
+			return w
+		}
+	}
+	return time.Time{}
+}
+
 type recordingPlayback struct {
 	out     *recordingOutput
 	started bool
@@ -133,10 +147,12 @@ func (p *recordingPlayback) Write(ctx context.Context, frame []byte, format audi
 		return fmt.Errorf("probe output takes %d Hz mono, got %+v", OutputRate, format)
 	}
 	p.out.mu.Lock()
+	now := time.Now()
 	if !p.started {
 		p.started = true
-		p.out.begins = append(p.out.begins, time.Now())
+		p.out.begins = append(p.out.begins, now)
 	}
+	p.out.writes = append(p.out.writes, now)
 	p.out.pcm = append(p.out.pcm, frame...)
 	p.out.mu.Unlock()
 	select {
@@ -415,7 +431,7 @@ func probeOnce(t *testing.T, key, dir string, r probeRun, question, interject []
 		answers                   int
 		speaking, sayDone         bool
 		lastEnd, sayAt            time.Time
-		answerStart               time.Time
+		answerStart, answerEnd    time.Time
 		interjectAt, interjectEnd time.Time
 		interruptAt, stoppedAt    time.Time
 		followUpAt                time.Time
@@ -468,6 +484,9 @@ loop:
 				log("speech started")
 			case voice.EventSpeechEnded:
 				speaking, lastEnd = false, time.Now()
+				if !answerStart.IsZero() && answerEnd.IsZero() {
+					answerEnd = lastEnd // the answer's whole audio played
+				}
 				if !interruptAt.IsZero() && stoppedAt.IsZero() {
 					stoppedAt = lastEnd
 				}
@@ -540,6 +559,8 @@ loop:
 		"run": r.name, "think": agent.think, "wav": wav, "failed": failed,
 		"question_end_to_first_audio_ms":  between(questionEnd, out.firstAfter(questionEnd)),
 		"question_end_to_answer_words_ms": between(questionEnd, answerStart),
+		"question_end_to_answer_audio_ms": between(questionEnd, out.firstWriteAfter(answerStart)),
+		"question_end_to_answer_end_ms":   between(questionEnd, answerEnd),
 		"answer_calls":                    answers,
 		"agent_texts":                     agentTexts,
 		"model_own_texts_played":          modelPlayed,
@@ -607,8 +628,8 @@ loop:
 			t.Error("after the Interrupt the voice did not ask for the answer to the question that interrupted it")
 		}
 	}
-	t.Logf("question end to first audio: %v ms, to the answer's words: %v ms; model's own texts played %d, Deepgram fillers dropped %d; WAV %s",
-		summary["question_end_to_first_audio_ms"], summary["question_end_to_answer_words_ms"], modelPlayed, fillersDropped, wav)
+	t.Logf("question end to first audio: %v ms, to the answer's words: %v ms, to the answer's audio: %v ms, to the answer's end: %v ms; model's own texts played %d, Deepgram fillers dropped %d; WAV %s",
+		summary["question_end_to_first_audio_ms"], summary["question_end_to_answer_words_ms"], summary["question_end_to_answer_audio_ms"], summary["question_end_to_answer_end_ms"], modelPlayed, fillersDropped, wav)
 }
 
 // logWriter is an io.Writer that hands each write to a function.
