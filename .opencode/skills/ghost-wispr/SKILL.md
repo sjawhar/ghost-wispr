@@ -9,7 +9,7 @@ Always-on transcription appliance. Query it as a knowledge base via REST.
 
 **Host**: !`echo ${GHOST_WISPR_HOST:-http://localhost:8080}`
 
-The recorder's address is the value of `GHOST_WISPR_HOST`, or `http://localhost:8080` when `GHOST_WISPR_HOST` is not set. The examples below use `$GHOST_WISPR_HOST` as that address.
+The recorder's address is the value of `GHOST_WISPR_HOST`, or `http://localhost:8080` when that variable is not set. The examples below write the address as `$GHOST_WISPR_HOST`. When `GHOST_WISPR_HOST` is not set, use `http://localhost:8080` in place of `$GHOST_WISPR_HOST`.
 
 ## Rules for agents
 
