@@ -907,10 +907,10 @@ func main() {
 		log.Printf("recovered %d stale session(s): %v", len(recoveredIDs), recoveredIDs)
 		cancelRecoveredQuestions(store, recoveredIDs)
 	}
-	// A refinement left running by the previous run stopped with it.
-	if err := store.RecoverStaleRefinements(); err != nil {
-		slog.Warn("failed to recover stale refinements", "error", err)
-	}
+	// A refinement left running by the previous run stopped with it. The store
+	// owes each one automatic retry, which runs below, once the recording
+	// directories are cleaned up; the stop ends with it (stopRecovery).
+	recovery := recoverAtStart(store)
 	// So did a Drive sync: retry it in the folder it had.
 	if ids, err := store.RecoverInterruptedSyncs(gdrive.MaxSyncRetries, time.Now().UTC()); err != nil {
 		slog.Warn("failed to recover interrupted Drive syncs", "error", err)
@@ -2078,6 +2078,9 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 	// The recordings a stop cut off (storage.RecoverStaleSessions ended their
 	// sessions above) are saved now, not at the first sweep.
 	go kept.run(ctx)
+	// The refinements a stop cut off (recoverAtStart above) are retried, after
+	// the cleanup above, since a retry may restore recordings.
+	recovery.retry(ctx, warningRegistry, deletion.retryRefinement)
 	if cfg.GCEnabled {
 		go collectGarbage(ctx, cfgStore, deletionNoticeGCStore{SQLiteStore: store, hub: hub, onDeleted: sessionsForgotten}, drive, gcHealthState, warningRegistry, appLogger, gcEvery)
 	}
@@ -2152,14 +2155,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer shutdownCancel()
 
-	if err := manager.ForceEndSession(shutdownCtx); err != nil {
-		slog.Warn("force end session failed", "error", err)
-	}
-	lifecycleCtx, lifecycleCancel := context.WithTimeout(context.Background(), 5*time.Second)
-	if err := manager.WaitForLifecyclePublishes(lifecycleCtx); err != nil {
-		slog.Warn("lifecycle event publishing did not finish before shutdown", "error", err)
-	}
-	lifecycleCancel()
+	recovery.stop(shutdownCtx, manager, lifecyclePublishWait)
 
 	if dgStop != nil {
 		dgStop()

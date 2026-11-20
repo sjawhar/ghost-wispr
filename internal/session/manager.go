@@ -46,7 +46,8 @@ type Manager struct {
 	sessionStarts                  int           // session starts under way
 	startsDone                     *sync.Cond    // signalled (with mu) when a session start finishes
 	endingSession                  bool          // an end of the current session is under way
-	endsDone                       *sync.Cond    // signalled (with mu) when an end of the session finishes
+	endsDone                       *sync.Cond    // signalled (with mu) when an end of the session finishes, and when endsRunning falls
+	endsRunning                    int           // session ends under way, from their claim until they return (WaitForLifecyclePublishes)
 	failedEnd                      sessionEnd    // how far an end of the current session that failed got
 	finalizeWaiter                 chan struct{} // closed by Deepgram's next Finalize reply; see AwaitFinalize
 	lastIDTime                     time.Time     // the start second the latest session ID names
@@ -569,9 +570,19 @@ func (m *Manager) endSession(ctx context.Context, want string) error {
 		end = sessionEnd{sessionID: sessionID, endedAt: time.Now().UTC()}
 	}
 	// Claim the end, so a second caller cannot end the same session again and
-	// overwrite its saved audio path.
+	// overwrite its saved audio path. The end counts as under way until it
+	// returns, past the point where it clears the session and before it
+	// registers its session_ended send, so a shutdown waits for it
+	// (WaitForLifecyclePublishes).
 	m.endingSession = true
+	m.endsRunning++
 	m.mu.Unlock()
+	defer func() {
+		m.mu.Lock()
+		m.endsRunning--
+		m.endsDone.Broadcast()
+		m.mu.Unlock()
+	}()
 	ended := false
 	defer func() {
 		if !ended {

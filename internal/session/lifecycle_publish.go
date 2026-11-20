@@ -49,8 +49,28 @@ func (m *Manager) publishLifecycle(sessionID, eventType string, isStart bool, se
 }
 
 // WaitForLifecyclePublishes waits for in-flight session-started and
-// session-ended sends, stopping when ctx is cancelled.
+// session-ended sends, stopping when ctx is cancelled. It first waits for every
+// session end under way: an end clears the session before it registers its
+// session_ended send, so a shutdown whose own end found no session (a pause's
+// end had it) would otherwise find no send to wait for, close the database,
+// and leave that send unable to mark itself delivered.
 func (m *Manager) WaitForLifecyclePublishes(ctx context.Context) error {
+	m.mu.Lock()
+	stop := context.AfterFunc(ctx, func() {
+		m.mu.Lock()
+		defer m.mu.Unlock()
+		m.endsDone.Broadcast()
+	})
+	defer stop()
+	for m.endsRunning > 0 {
+		if err := ctx.Err(); err != nil {
+			m.mu.Unlock()
+			return err
+		}
+		m.endsDone.Wait()
+	}
+	m.mu.Unlock()
+
 	done := make(chan struct{})
 	go func() {
 		m.lifecyclePublishes.Wait()

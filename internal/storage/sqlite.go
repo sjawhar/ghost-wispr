@@ -542,6 +542,15 @@ func (s *SQLiteStore) init(dbPath string) error {
 		// (SetSessionSampleRate); 0 for a session from before it was kept,
 		// which was captured at 16000 Hz.
 		`ALTER TABLE sessions ADD COLUMN sample_rate INTEGER NOT NULL DEFAULT 0`,
+		// The automatic retry of a refinement a stop cut off: 'pending' while
+		// the next start owes it, 'attempted' from its claim until it ends,
+		// 'exhausted' once a stop cut that retry off too, '' otherwise
+		// (RecoverStaleRefinements, ClaimRefinementResume).
+		`ALTER TABLE sessions ADD COLUMN refinement_resume TEXT NOT NULL DEFAULT ''`,
+		// The deletion generation the refinement a stop cut off was at when
+		// the start found it: its owed retry is for that transcript, and a
+		// deletion since ends it (ClaimRefinementResume).
+		`ALTER TABLE sessions ADD COLUMN refinement_resume_generation INTEGER NOT NULL DEFAULT 0`,
 	} {
 		if _, err := s.db.Exec(stmt); err != nil && !strings.Contains(err.Error(), "duplicate column") {
 			return fmt.Errorf("migration failed: %w", err)
@@ -1872,11 +1881,16 @@ func (s *SQLiteStore) UpdateRefinementAtGeneration(sessionID, transcript, status
 // taken the recording this reports false and the refinement must not start;
 // and GC takes nothing from a session whose refinement is running. It returns
 // the transcript generation it claimed at, the one the refinement stores its
-// result at (UpdateRefinementAtGeneration).
+// result at (UpdateRefinementAtGeneration). A claim by anything but the
+// start's automatic retry ends an owed or exhausted automatic retry: the
+// refinement runs now. The automatic retry's own claim keeps it attempted, so
+// a stop that cuts it off is seen at the next start (RecoverStaleRefinements).
 func (s *SQLiteStore) ClaimRefinement(id, audioPath string) (generation int, claimed bool, err error) {
 	err = s.db.QueryRow(
-		`UPDATE sessions SET refined_transcript = '', refinement_status = ?, refinement_model = '', refinement_generation = deletion_generation WHERE id = ? AND audio_path = ? AND audio_path != '' AND status != ? RETURNING refinement_generation`,
-		RefinementRunning, id, audioPath, SessionMerged,
+		`UPDATE sessions SET refined_transcript = '', refinement_status = ?, refinement_model = '', refinement_generation = deletion_generation,
+			refinement_resume = CASE WHEN refinement_resume = ? THEN refinement_resume ELSE '' END
+		WHERE id = ? AND audio_path = ? AND audio_path != '' AND status != ? RETURNING refinement_generation`,
+		RefinementRunning, refinementResumeAttempted, id, audioPath, SessionMerged,
 	).Scan(&generation)
 	if errors.Is(err, sql.ErrNoRows) {
 		return 0, false, nil
@@ -2105,13 +2119,116 @@ func scanSessions(rows *sql.Rows) ([]Session, error) {
 	return sessions, nil
 }
 
+// The states of a session's automatic refinement retry (refinement_resume).
+const (
+	refinementResumePending   = "pending"   // the next start owes the refinement a stop cut off one automatic retry
+	refinementResumeAttempted = "attempted" // that retry is claimed, and has not ended
+	refinementResumeExhausted = "exhausted" // a stop cut that retry off too: only a person's Retry runs it now
+)
+
 // RecoverStaleRefinements marks failed every refinement left running by an
 // earlier run of the app, which stopped inside it: nothing is running when the
-// app starts. Failed offers a retry, and GC, which leaves a running
-// refinement's session and audio alone, is not held off for good.
+// app starts. Failed lets GC, which leaves a running refinement's session and
+// audio alone, go on, and offers a Retry. So a stop during a meeting's
+// refinement does not leave it failed until a person presses Retry, the store
+// records that the start owes each such refinement one automatic retry
+// (RefinementResumes, ClaimRefinementResume); an owed retry the start has not
+// reached stays owed at the next. A refinement whose automatic retry was
+// itself cut off, by a crash or a hang in it or by another stop, is owed no
+// more: it is exhausted, so a refinement that crashes the process is not run
+// again at every restart.
 func (s *SQLiteStore) RecoverStaleRefinements() error {
-	if _, err := s.db.Exec(`UPDATE sessions SET refinement_status = ? WHERE refinement_status = ?`, RefinementFailed, RefinementRunning); err != nil {
+	tx, err := s.db.Begin()
+	if err != nil {
 		return fmt.Errorf("recover stale refinements: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	for _, stmt := range []struct {
+		query string
+		args  []any
+	}{
+		// An automatic retry that had not ended: a stop cut it off.
+		{`UPDATE sessions SET refinement_status = CASE WHEN refinement_status = ? THEN ? ELSE refinement_status END, refinement_resume = ?
+			WHERE refinement_resume = ? AND refinement_status IN (?, ?)`,
+			[]any{RefinementRunning, RefinementFailed, refinementResumeExhausted, refinementResumeAttempted, RefinementRunning, RefinementFailed}},
+		// One that completed, before the stop recorded its end.
+		{`UPDATE sessions SET refinement_resume = '' WHERE refinement_resume = ?`, []any{refinementResumeAttempted}},
+		// Every other refinement the stop cut off is owed one, for its
+		// transcript as it is now.
+		{`UPDATE sessions SET refinement_status = ?, refinement_resume = ?, refinement_resume_generation = deletion_generation WHERE refinement_status = ?`,
+			[]any{RefinementFailed, refinementResumePending, RefinementRunning}},
+	} {
+		if _, err := tx.Exec(stmt.query, stmt.args...); err != nil {
+			return fmt.Errorf("recover stale refinements: %w", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("recover stale refinements: %w", err)
+	}
+	return nil
+}
+
+// RefinementResumes returns, oldest first, the sessions whose refinement a
+// stop cut off and the start owes one automatic retry (pending), and those
+// whose automatic retry a stop cut off too (exhausted), which a person's Retry
+// alone runs again.
+func (s *SQLiteStore) RefinementResumes() (pending, exhausted []string, err error) {
+	rows, err := s.db.Query(`SELECT id, refinement_resume FROM sessions WHERE refinement_resume IN (?, ?) AND status != ? ORDER BY id`,
+		refinementResumePending, refinementResumeExhausted, SessionMerged)
+	if err != nil {
+		return nil, nil, fmt.Errorf("list refinement retries a stop owes: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	for rows.Next() {
+		var id, resume string
+		if err := rows.Scan(&id, &resume); err != nil {
+			return nil, nil, fmt.Errorf("list refinement retries a stop owes: %w", err)
+		}
+		if resume == refinementResumePending {
+			pending = append(pending, id)
+		} else {
+			exhausted = append(exhausted, id)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, nil, fmt.Errorf("list refinement retries a stop owes: %w", err)
+	}
+	return pending, exhausted, nil
+}
+
+// ClaimRefinementResume records that the start's automatic retry of session
+// id's refinement begins, before it does, and reports whether it may: only
+// once, and only while the refinement is still the one a stop cut off, failed,
+// or no_audio once GC took its synced recording, which the Retry action
+// restores. A deletion from the session since the start found it ends the
+// retry, as the same deletion made while the refinement ran fails it. A
+// session that cannot take its owed retry (a deletion since, a person's Retry
+// ran it, or it was merged) owes it no more.
+func (s *SQLiteStore) ClaimRefinementResume(id string) (bool, error) {
+	res, err := s.db.Exec(`UPDATE sessions SET refinement_resume = ?
+		WHERE id = ? AND refinement_resume = ? AND refinement_status IN (?, ?) AND deletion_generation = refinement_resume_generation AND status != ?`,
+		refinementResumeAttempted, id, refinementResumePending, RefinementFailed, RefinementNoAudio, SessionMerged)
+	if err != nil {
+		return false, fmt.Errorf("claim the automatic refinement retry of session %s: %w", id, err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("claim the automatic refinement retry of session %s: %w", id, err)
+	}
+	if n == 1 {
+		return true, nil
+	}
+	if _, err := s.db.Exec(`UPDATE sessions SET refinement_resume = '' WHERE id = ? AND refinement_resume = ?`, id, refinementResumePending); err != nil {
+		return false, fmt.Errorf("drop the automatic refinement retry of session %s: %w", id, err)
+	}
+	return false, nil
+}
+
+// FinishRefinementResume records that session id's automatic refinement retry
+// ended, whatever its result: the session owes nothing more.
+func (s *SQLiteStore) FinishRefinementResume(id string) error {
+	if _, err := s.db.Exec(`UPDATE sessions SET refinement_resume = '' WHERE id = ? AND refinement_resume = ?`, id, refinementResumeAttempted); err != nil {
+		return fmt.Errorf("finish the automatic refinement retry of session %s: %w", id, err)
 	}
 	return nil
 }
