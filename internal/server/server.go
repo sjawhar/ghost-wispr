@@ -146,6 +146,10 @@ type ControlHooks struct {
 	// Pause stops capture. A non-nil error means capture stopped but the
 	// stopped state was not persisted.
 	Pause func() error
+	// Close closes the microphone from every state (POST /api/close). As
+	// with Pause, a non-nil error means the microphone closed but its state
+	// was not persisted.
+	Close func() error
 	// Resume restarts capture. A non-nil error means capture stayed paused.
 	Resume            func() error
 	IsPaused          func() bool

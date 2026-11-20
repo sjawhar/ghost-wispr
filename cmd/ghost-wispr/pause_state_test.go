@@ -66,34 +66,37 @@ func (f resumeFunc) resumeWith(_ resumeTicket, persist func() error) error {
 	return f()
 }
 
-// TestRestorePausePausesWhenStored fails if a persisted pause is not restored
-// before capture begins.
+// TestRestorePausePausesWhenStored fails if a persisted pause, of either
+// level, is not restored as a pause before capture begins, or restorePause
+// does not say which state was saved: a saved listening must come back
+// closed, and only the controls may move it to listening later.
 func TestRestorePausePausesWhenStored(t *testing.T) {
 	for _, tc := range []struct {
-		name       string
-		values     map[string]string
-		wantPaused bool
-		wantErr    bool
+		name      string
+		values    map[string]string
+		wantSaved micState
+		wantErr   bool
 	}{
-		{name: "paused", values: map[string]string{storage.AppStateCapturePaused: "1"}, wantPaused: true},
-		{name: "resumed", values: map[string]string{storage.AppStateCapturePaused: "0"}},
-		{name: "missing", values: map[string]string{}},
+		{name: "today's pause", values: map[string]string{storage.AppStateCapturePaused: "1"}, wantSaved: micClosed},
+		{name: "listening", values: map[string]string{storage.AppStateCapturePaused: "2"}, wantSaved: micListening},
+		{name: "resumed", values: map[string]string{storage.AppStateCapturePaused: "0"}, wantSaved: micRecording},
+		{name: "missing", values: map[string]string{}, wantSaved: micRecording},
 		{name: "invalid", values: map[string]string{storage.AppStateCapturePaused: "invalid"}, wantErr: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			gate := &pauseGateFake{}
-			paused, err := restorePause(&pauseStoreFake{values: tc.values}, gate)
+			saved, err := restorePause(&pauseStoreFake{values: tc.values}, gate)
 			if (err != nil) != tc.wantErr {
 				t.Fatalf("restore pause error = %v, want error=%t", err, tc.wantErr)
 			}
 			if err != nil {
 				return
 			}
-			if paused != tc.wantPaused {
-				t.Fatalf("restore paused = %t, want %t", paused, tc.wantPaused)
+			if saved != tc.wantSaved {
+				t.Fatalf("restored saved state = %v, want %v", saved, tc.wantSaved)
 			}
-			if got := gate.calls; got != map[bool]int{true: 1, false: 0}[tc.wantPaused] {
-				t.Fatalf("Pause calls = %d, want %d", got, map[bool]int{true: 1, false: 0}[tc.wantPaused])
+			if want := map[bool]int{true: 1, false: 0}[tc.wantSaved != micRecording]; gate.calls != want {
+				t.Fatalf("Pause calls = %d, want %d", gate.calls, want)
 			}
 		})
 	}
@@ -192,9 +195,9 @@ func TestPauseHTTPPersists(t *testing.T) {
 // capture before a person explicitly resumes it.
 func TestRestoredPauseOpensNoMicrophone(t *testing.T) {
 	capture := newCaptureGate(nil, nil, nil)
-	paused, err := restorePause(&pauseStoreFake{values: map[string]string{storage.AppStateCapturePaused: "1"}}, capture)
-	if err != nil || !paused {
-		t.Fatalf("restore pause = (%t, %v), want (true, nil)", paused, err)
+	saved, err := restorePause(&pauseStoreFake{values: map[string]string{storage.AppStateCapturePaused: "1"}}, capture)
+	if err != nil || saved != micClosed {
+		t.Fatalf("restore pause = (%v, %v), want (closed, nil)", saved, err)
 	}
 	mic := newScriptedMic()
 	if err := startMicIfUnpaused(capture, mic.Start); err != nil {

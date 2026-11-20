@@ -39,7 +39,8 @@ const (
 
 // Capture states, as GET /api/status reports them.
 const (
-	capturePaused           = storage.ComponentStatusPaused   // the switch is off
+	capturePaused           = storage.ComponentStatusPaused   // the switch is off, and the microphone closed (micClosed)
+	captureListening        = "listening"                     // the switch is off, and only the paused listener holds the microphone (micListening)
 	captureResuming         = storage.ComponentStatusResuming // switch on, gate still closed
 	captureStalled          = storage.ComponentStatusStalled  // as resuming, past captureStallAfter
 	captureLightUnavailable = "light_unavailable"             // switch on, gate held closed until the light is confirmed red
@@ -47,6 +48,31 @@ const (
 	captureNoAudio          = "no_audio"                      // gate open, microphone open, no audio reaches the recording
 	captureCapturing        = "capturing"                     // gate open, microphone capturing
 )
+
+// micState is the microphone's state, one of three (INFRA-4592 R1):
+// recording, with the light red and audio through the gate; listening, a
+// pause of the first level, where the light is off and only the paused
+// listener holds the microphone, for its spotter; and closed, a pause of the
+// second level, where the microphone is closed and the Jabra's ring shows
+// Muted. The gate's switch is off in both pauses; its level says which.
+type micState int
+
+const (
+	micRecording micState = iota
+	micListening
+	micClosed
+)
+
+func (s micState) String() string {
+	switch s {
+	case micRecording:
+		return "recording"
+	case micListening:
+		return "listening"
+	default:
+		return "closed"
+	}
+}
 
 // errGateClosed is what a captureGate writer returns while capture is paused.
 // It ends Mic.Stream, so streamMicWithRetry can close the device.
@@ -121,21 +147,25 @@ type captureGate struct {
 	control            sync.Mutex    // serializes closing and opening the gate, with their steps
 	mu                 sync.Mutex    // guards the fields below
 	switchOff          bool          // Pause was called and Resume has not been since
-	pauses             int           // counts pauses asked for, so a resume whose light check a pause came during does nothing
-	pendingPauses      int           // Pause calls that wait for control: a resume then counts the unit as paused
-	requestedPauses    int           // pauses asked for (pauseRequested) that Pause has not taken yet
-	lightHeld          bool          // HoldForLight was called and ReleaseLightHold, or a resume that confirmed red, has not been since
-	resumedAt          time.Time     // when Resume last moved the switch on
-	starting           bool          // that Resume's start of the microphone has not finished (finishResume)
-	preparing          bool          // a start waits in beforeMicOpen (prepareMicOpen)
-	closed             bool          // no audio passes the gate
-	recordingDue       bool          // the gate opened into recording, and no audio has reached the recording since (onRecording)
-	closings           int           // counts closings, so a Resume left from an earlier one does nothing
-	resumed            chan struct{} // closed while the gate is open
-	closing            chan struct{} // closed while the gate is closed
-	settled            chan struct{} // closed once the latest closing has settled
-	writing            int           // writes that passed the gate and are still running
-	writesDone         *sync.Cond    // signalled (with mu) when a write finishes
+	// listening is the pause's level while the switch is off: the first level
+	// (micListening) when set, else the second (micClosed). A refused resume
+	// leaves it, so the unit returns to the state it came from.
+	listening       bool
+	pauses          int           // counts pauses asked for, so a resume whose light check a pause came during does nothing
+	pendingPauses   int           // Pause calls that wait for control: a resume then counts the unit as paused
+	requestedPauses int           // pauses asked for (pauseRequested) that Pause has not taken yet
+	lightHeld       bool          // HoldForLight was called and ReleaseLightHold, or a resume that confirmed red, has not been since
+	resumedAt       time.Time     // when Resume last moved the switch on
+	starting        bool          // that Resume's start of the microphone has not finished (finishResume)
+	preparing       bool          // a start waits in beforeMicOpen (prepareMicOpen)
+	closed          bool          // no audio passes the gate
+	recordingDue    bool          // the gate opened into recording, and no audio has reached the recording since (onRecording)
+	closings        int           // counts closings, so a Resume left from an earlier one does nothing
+	resumed         chan struct{} // closed while the gate is open
+	closing         chan struct{} // closed while the gate is closed
+	settled         chan struct{} // closed once the latest closing has settled
+	writing         int           // writes that passed the gate and are still running
+	writesDone      *sync.Cond    // signalled (with mu) when a write finishes
 	// audioAt is when audio last reached the recording through the gate, or
 	// when a start or gate opening gave it audioStall to begin (armAudio), in
 	// Unix nanoseconds; 0 before the first. While it is older than audioStall,
@@ -203,7 +233,32 @@ func newCaptureGate(onPause, settle, beforeResume func()) *captureGate {
 // pending Resume. It counts itself (pauses) when called, before it waits for
 // control, so a resume called after it is the later call; a pause already
 // counted when it was asked for (pauseRequested) is not counted again.
-func (g *captureGate) Pause() {
+//
+// A Pause of a unit that records closes the microphone (micClosed); a paused
+// unit keeps its state, listening or closed: a pause control does nothing in
+// either (INFRA-4592, the control table).
+func (g *captureGate) Pause() { g.pauseTo(pauseKeepOrClose) }
+
+// PauseListening is Pause, except that a unit that records goes to the first
+// level, listening (micListening), where the paused listener may hold the
+// microphone. The persistent controls call it only while the listener can run.
+func (g *captureGate) PauseListening() { g.pauseTo(pauseKeepOrListen) }
+
+// CloseMicrophone is Pause to the second level, closed (micClosed), from
+// every state: POST /api/close, the Jabra button, and a listener that can no
+// longer run.
+func (g *captureGate) CloseMicrophone() { g.pauseTo(pauseClose) }
+
+// pauseKind is what a pause does to the state.
+type pauseKind int
+
+const (
+	pauseKeepOrClose  pauseKind = iota // recording to closed; a paused unit keeps its state
+	pauseKeepOrListen                  // recording to listening; a paused unit keeps its state
+	pauseClose                         // every state to closed
+)
+
+func (g *captureGate) pauseTo(kind pauseKind) {
 	g.mu.Lock()
 	if g.requestedPauses > 0 {
 		g.requestedPauses--
@@ -216,10 +271,57 @@ func (g *captureGate) Pause() {
 	defer g.control.Unlock()
 
 	g.mu.Lock()
+	switch {
+	case kind == pauseClose:
+		g.listening = false
+	case !g.switchOff:
+		g.listening = kind == pauseKeepOrListen
+	}
 	g.switchOff = true
 	g.pendingPauses--
 	g.mu.Unlock()
 	g.closeGate()
+}
+
+// micState reports the microphone's state: recording while the switch is on,
+// whatever the gate is doing, else the pause's level.
+func (g *captureGate) micState() micState {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	switch {
+	case !g.switchOff:
+		return micRecording
+	case g.listening:
+		return micListening
+	default:
+		return micClosed
+	}
+}
+
+// inClosedState reports whether the microphone is in the closed state: the
+// Jabra's ring shows Muted then, and only then (ringMuted).
+func (g *captureGate) inClosedState() bool { return g.micState() == micClosed }
+
+// leaveListening moves a listening unit to closed, as when the listener can no
+// longer run; it reports whether it did. The gate is closed already.
+func (g *captureGate) leaveListening() bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	moved := g.switchOff && g.listening
+	g.listening = false
+	return moved
+}
+
+// enterListening moves a closed unit to listening, as when a saved listening
+// state restores once its listener can run; it reports whether it did.
+func (g *captureGate) enterListening() bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	moved := g.switchOff && !g.listening
+	if g.switchOff {
+		g.listening = true
+	}
+	return moved
 }
 
 // pauseRequested counts a pause a person asked for, before the persistent
@@ -435,17 +537,21 @@ func (g *captureGate) resumeWith(t resumeTicket, persist func() error) error {
 	return nil
 }
 
-// captureState reports what capture is doing: paused, light_unavailable,
-// resuming or stalled while the gate is closed, resuming until the resume's
-// start has finished (MicHold), then capturing, no_audio while no audio
-// reaches the recording (the mic loop then holds the microphone closed for a
-// while), or mic_unavailable.
+// captureState reports what capture is doing: paused (closed) or listening,
+// light_unavailable, resuming or stalled while the gate is closed, resuming
+// until the resume's start has finished (MicHold), then capturing, no_audio
+// while no audio reaches the recording (the mic loop then holds the
+// microphone closed for a while), or mic_unavailable.
 func (g *captureGate) captureState(mic interface{ IsOpen() bool }) string {
-	if hold := g.MicHold(); hold != "" {
-		return hold
+	hold := g.MicHold()
+	if hold == "" && g.IsPaused() {
+		hold = capturePaused // the moment between Pause starting and the gate closing
 	}
-	if g.IsPaused() {
-		return capturePaused // the moment between Pause starting and the gate closing
+	if hold == capturePaused && g.micState() == micListening {
+		return captureListening
+	}
+	if hold != "" {
+		return hold
 	}
 	if !mic.IsOpen() {
 		if g.stalled.Load() {

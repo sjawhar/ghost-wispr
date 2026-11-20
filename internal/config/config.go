@@ -73,8 +73,11 @@ type Voice struct {
 	Enabled     bool     `yaml:"enabled"`
 	Engine      string   `yaml:"engine"`       // tts, gptlive or dgagent
 	WakePhrases []string `yaml:"wake_phrases"` // said at the start of a sentence
-	// PausedListener is the wake listener that holds the microphone while
-	// paused (slice 4). It is not built yet; true is ignored, with a warning.
+	// PausedListener makes a pause from the power button or the page go to
+	// listening, where a listener in the process holds the microphone for
+	// "Wispr, start recording" alone, in a build that has it (-tags kws) and
+	// while the Jabra's mute button is attached; off, every pause closes the
+	// microphone. It does not need Enabled: the listener only resumes.
 	PausedListener bool   `yaml:"paused_listener"`
 	TTSEngine      string `yaml:"tts_engine"`   // voice A's text-to-speech provider: gemini or aura
 	TTSModel       string `yaml:"tts_model"`    // "" is the provider's default
@@ -745,9 +748,6 @@ func validateVoice(cfg *Config) []string {
 	v.Engine = strings.ToLower(strings.TrimSpace(v.Engine))
 	v.TTSEngine = strings.ToLower(strings.TrimSpace(v.TTSEngine))
 	var warnings []string
-	if v.PausedListener {
-		warnings = append(warnings, "voice.paused_listener is not built yet; it is ignored, and a pause closes the microphone.")
-	}
 	if !v.Enabled {
 		return warnings
 	}

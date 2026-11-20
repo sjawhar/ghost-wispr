@@ -1261,6 +1261,24 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 		w.WriteHeader(http.StatusNoContent)
 	})
 
+	mux.HandleFunc("POST /api/close", func(w http.ResponseWriter, r *http.Request) {
+		if controls.Close == nil {
+			writeJSONError(w, http.StatusServiceUnavailable, "closing the microphone is not available")
+			return
+		}
+		closeErr := controls.Close()
+		// A Close error still leaves the microphone closed, so clients must
+		// hear of it.
+		if controls.OnStatusChanged != nil {
+			controls.OnStatusChanged(true)
+		}
+		if closeErr != nil {
+			writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("close the microphone: %v", closeErr))
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	})
+
 	mux.HandleFunc("POST /api/resume", func(w http.ResponseWriter, r *http.Request) {
 		if controls.Resume != nil {
 			if err := controls.Resume(); err != nil {

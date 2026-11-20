@@ -860,7 +860,7 @@ func OpenAPISpec() map[string]any {
 			"/api/pause": map[string]any{
 				"post": map[string]any{
 					"summary":     "Pause recording",
-					"description": "Stop microphone capture: no audio reaches the recording or Deepgram, the microphone closes, the active session ends, and no session starts until resume",
+					"description": "Stop microphone capture: no audio reaches the recording or Deepgram, the active session ends, and no session starts until resume. A recording unit goes to listening while the paused listener can run (voice.paused_listener on, in a build that has it, with the Jabra's mute button attached): the light goes off and only the listener holds the microphone, for the start phrase alone. Otherwise, and always without the listener, it goes to closed: the microphone closes. A paused unit stays as it is.",
 					"tags":        []string{"control"},
 					"security":    []map[string][]string{{"basicAuth": {}}},
 					"responses": map[string]any{
@@ -889,6 +889,25 @@ func OpenAPISpec() map[string]any {
 					},
 				},
 			},
+			"/api/close": map[string]any{
+				"post": map[string]any{
+					"summary":     "Close the microphone",
+					"description": "Move the unit to closed from every state, as the Jabra's mute button does: no audio reaches the recording or Deepgram, the active session ends, the paused listener stops, the microphone closes, and the Jabra's ring shows Muted. Only a resume opens it again.",
+					"tags":        []string{"control"},
+					"security":    []map[string][]string{{"basicAuth": {}}},
+					"responses": map[string]any{
+						"204": map[string]any{
+							"description": "Closed",
+						},
+						"500": map[string]any{
+							"description": "The microphone closed but its persistent state could not be saved",
+						},
+						"503": map[string]any{
+							"description": "This unit has no capture controls",
+						},
+					},
+				},
+			},
 			"/api/session/end": map[string]any{
 				"post": map[string]any{
 					"summary":     "End current session",
@@ -907,7 +926,7 @@ func OpenAPISpec() map[string]any {
 			"/api/status": map[string]any{
 				"get": map[string]any{
 					"summary":     "Get system status",
-					"description": "Get current system status: paused (the pause switch), capturing (the microphone is capturing and audio is flowing), capture_state (paused, light_unavailable while the switch is on but the recording light is missing or does not read back red, so nothing is captured until it does, resuming from a resume until the microphone has started, or the start failed, for at most 30 seconds, or for as long as the microphone waits for speech on the Jabra to end before it opens, stalled, mic_unavailable, no_audio once no audio has reached the recording for 2 seconds: the microphone is closed, and the recording light off, until it opens again, or capturing), kept_raw_recordings and kept_raw_bytes (every raw recording the app keeps in the audio directory: those of sessions that ended without a recording, which it tries again to save after every Drive sync sweep, those beside a saved recording, which it erases once Drive has it, and those it neither saves nor erases; a warning that tells these apart once they take more than a tenth of the audio budget, or as soon as there is one when the budget is 0, no limit), kept_raw_by_hand (the sessions of the raw recordings the app neither saves nor erases, which wait for a person to recover or delete them), gc_hold (null, or the last GC pass held back because it could not check that Drive still has the sessions: reason, since, disk_used_bytes and disk_total_bytes of the audio directory's filesystem; with a warning), unverified_sessions (sessions synced by an earlier version that GC keeps until a sync re-checks their documents on Drive; with a warning while there are any), unit_only_sessions (sessions marked REMOTE_DELETED whose audio is still on this unit: their Drive folder is gone or unreadable, so the unit holds the only copy; with a warning while there are any, until a retry syncs them), and the active session",
+					"description": "Get current system status: paused (the pause switch, on in both listening and closed), capturing (the microphone is capturing and audio is flowing), capture_state (paused while the microphone is closed, listening while the switch is off and only the paused listener holds the microphone, for the start phrase alone, with the light off, light_unavailable while the switch is on but the recording light is missing or does not read back red, so nothing is captured until it does, resuming from a resume until the microphone has started, or the start failed, for at most 30 seconds, or for as long as the microphone waits for speech on the Jabra to end before it opens, stalled, mic_unavailable, no_audio once no audio has reached the recording for 2 seconds: the microphone is closed, and the recording light off, until it opens again, or capturing), kept_raw_recordings and kept_raw_bytes (every raw recording the app keeps in the audio directory: those of sessions that ended without a recording, which it tries again to save after every Drive sync sweep, those beside a saved recording, which it erases once Drive has it, and those it neither saves nor erases; a warning that tells these apart once they take more than a tenth of the audio budget, or as soon as there is one when the budget is 0, no limit), kept_raw_by_hand (the sessions of the raw recordings the app neither saves nor erases, which wait for a person to recover or delete them), gc_hold (null, or the last GC pass held back because it could not check that Drive still has the sessions: reason, since, disk_used_bytes and disk_total_bytes of the audio directory's filesystem; with a warning), unverified_sessions (sessions synced by an earlier version that GC keeps until a sync re-checks their documents on Drive; with a warning while there are any), unit_only_sessions (sessions marked REMOTE_DELETED whose audio is still on this unit: their Drive folder is gone or unreadable, so the unit holds the only copy; with a warning while there are any, until a retry syncs them), and the active session",
 					"tags":        []string{"system"},
 					"security":    []map[string][]string{{"basicAuth": {}}},
 					"responses": map[string]any{

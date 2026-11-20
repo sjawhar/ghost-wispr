@@ -170,19 +170,26 @@ func toggleCapture(isPaused func() bool, pause, resume func() error, onStatusCha
 }
 
 // buttonToggle is a hardware button's presses: the power button's taps and
-// the Jabra's mute presses. A press reads the gate's switch, except while this
-// button's latest resume still runs and no pause has come since: the switch
-// moves only once that resume's light check has passed, so the press then
-// counts the unit as resumed and pauses. A press that pauses pauses at once;
-// a press that resumes runs in the background, so the button takes the next
-// press while the resume's light check runs (review 5963682292 of #79). It
-// remembers nothing else: a resume that was refused, an own Jabra report, or a
-// pause or resume from anywhere else leaves the next press reading the switch
-// (review 5967147417 of #79).
+// the Jabra's mute presses. A press reads whether the unit is off for this
+// button (isOff), except while this button's latest resume still runs and no
+// pause has come since: the switch moves only once that resume's light check
+// has passed, so the press then counts the unit as resumed and turns it off.
+// A press that turns the unit off does so at once; a press that resumes runs
+// in the background, so the button takes the next press while the resume's
+// light check runs (review 5963682292 of #79). It remembers nothing else: a
+// resume that was refused, an own Jabra report, or a pause or resume from
+// anywhere else leaves the next press reading the unit (review 5967147417 of
+// #79).
+//
+// The power button's off is a pause, and a listening unit is off for it; the
+// Jabra's off is a close, and only a closed unit is off for it (the control
+// table of INFRA-4592).
 type buttonToggle struct {
 	capture  *captureGate
 	controls *server.ControlHooks
 	name     string
+	isOff    func() bool
+	off      func() error
 
 	mu sync.Mutex
 	// resuming is set while the resume this button last started runs and no
@@ -195,15 +202,27 @@ type buttonToggle struct {
 	running    sync.WaitGroup
 }
 
+// newButtonToggle is the power button's toggle: a press pauses a recording
+// unit, and resumes a paused one, listening or closed.
 func newButtonToggle(capture *captureGate, controls *server.ControlHooks, name string) *buttonToggle {
-	return &buttonToggle{capture: capture, controls: controls, name: name}
+	t := &buttonToggle{capture: capture, controls: controls, name: name, isOff: capture.IsPaused}
+	t.off = func() error { return t.controls.Pause() }
+	return t
+}
+
+// newCloseToggle is the Jabra's toggle: a press closes the microphone from
+// recording or listening, and resumes a closed unit.
+func newCloseToggle(capture *captureGate, controls *server.ControlHooks, name string) *buttonToggle {
+	t := &buttonToggle{capture: capture, controls: controls, name: name, isOff: capture.inClosedState}
+	t.off = func() error { return t.controls.Close() }
+	return t
 }
 
 // press toggles capture for one press. keepPaused, when set and true, keeps a
-// paused unit paused: the Jabra's guard for its own mute report. after runs
-// once the press has paused or has started its resume, before the resume
-// ends. The returned channel closes once the press, its resume included, is
-// over.
+// unit that is off as it is: the Jabra's guard for its own mute report, which
+// can only move the unit to recording. after runs once the press has turned
+// the unit off or has started its resume, before the resume ends. The
+// returned channel closes once the press, its resume included, is over.
 func (t *buttonToggle) press(keepPaused func() bool, after func()) <-chan struct{} {
 	paused := t.counted()
 	done := make(chan struct{})
@@ -228,8 +247,8 @@ func (t *buttonToggle) press(keepPaused func() bool, after func()) <-chan struct
 		}()
 	default:
 		t.stopResume()
-		err := t.controls.Pause()
-		// A Pause error still leaves capture paused, so clients must hear of it.
+		err := t.off()
+		// An error still leaves capture paused, so clients must hear of it.
 		if t.controls.OnStatusChanged != nil {
 			t.controls.OnStatusChanged(true)
 		}
@@ -244,17 +263,17 @@ func (t *buttonToggle) press(keepPaused func() bool, after func()) <-chan struct
 	return done
 }
 
-// counted reports the unit as paused or not for a press: resumed while this
-// button's own resume runs with no pause since, else the gate's switch. The
-// Jabra's ring shows the Jabra button's count (captureDevice.showPaused), so
-// a press does what the ring it is pressed on shows.
+// counted reports the unit as off or not for a press: on while this button's
+// own resume runs with no pause since, else isOff. The Jabra's ring shows the
+// Jabra button's count (captureDevice.showPaused), so a press does what the
+// ring it is pressed on shows.
 func (t *buttonToggle) counted() bool {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	if t.resuming && t.capture.pauseCount() == t.pausesAt {
 		return false
 	}
-	return t.capture.IsPaused()
+	return t.isOff()
 }
 
 // startResume records that this button's resume runs from now, and returns

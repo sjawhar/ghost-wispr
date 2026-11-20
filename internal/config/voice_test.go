@@ -121,7 +121,6 @@ func TestVoiceConfigWarnings(t *testing.T) {
 		"gemini, no project": "speaker_enabled: true\nvoice:\n  enabled: true\n",
 		"relative dispatch":  "speaker_enabled: true\ngcp_project: p\nvoice:\n  enabled: true\nconcierge:\n  dispatch_url: dispatch.example.test\n",
 		"no wake phrase":     "speaker_enabled: true\ngcp_project: p\nvoice:\n  enabled: true\n  wake_phrases: []\n",
-		"listener not built": "speaker_enabled: true\ngcp_project: p\nvoice:\n  enabled: true\n  paused_listener: true\n",
 	}
 	for name, yaml := range cases {
 		_, warnings, err := Load(writeConfig(t, yaml))
