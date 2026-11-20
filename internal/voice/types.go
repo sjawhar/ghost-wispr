@@ -21,6 +21,10 @@ type Exchange struct {
 	SessionID string
 	WakeAt    time.Time
 	AskerTurn string // the asker's words after the wake phrase, so far
+	// IssueKey is the canonical resolved Dispatch key for the answer this
+	// exchange speaks, or empty when no issue was resolved. Held answers set
+	// it directly; voices never reconstruct it from speech.
+	IssueKey string
 	// FollowUpTurn: AskerTurn was said in the follow-up window with no wake
 	// phrase (a question; R10). The Concierge asks an agent about it only
 	// when it says "ask".
@@ -69,8 +73,9 @@ type AnswerArgs struct {
 // AnswerResult is AnswerTool's result, and the shape Deliver takes for a
 // holder's late answer.
 type AnswerResult struct {
-	Say     string `json:"say"`               // for the ear
-	Context string `json:"context,omitempty"` // silent facts for the voice's model
+	Say      string `json:"say"`                 // for the ear
+	Context  string `json:"context,omitempty"`   // silent facts for the voice's model
+	IssueKey string `json:"issue_key,omitempty"` // canonical resolved key; no speech parsing
 }
 
 // Voice opens a Session for an Exchange. Each call gets an Exchange of its own,
@@ -135,6 +140,10 @@ const (
 	EventToolCall  // Call holds the request
 	EventErr       // Err holds the failure
 	EventAgentText // Text holds words the voice speaks or is about to, for the own-speech filter
+	// EventFactCheck reports how many issue keys, pull request numbers and
+	// figures GPT-Live changed or dropped while speaking a written fact.
+	// Count holds no words, so the room test can record it safely.
+	EventFactCheck
 	// EventTextAudio: Text, one Say's text, begins to play (its first frame
 	// is queued to the Output). A voice that synthesises a Say while the one
 	// before plays (voice A) reports it, so the first fact's audio is timed
@@ -158,10 +167,11 @@ type SpeechWaiter interface {
 
 // Event is one thing a Session reports.
 type Event struct {
-	Kind EventKind
-	Text string
-	Call ToolCall
-	Err  error
+	Kind  EventKind
+	Text  string
+	Call  ToolCall
+	Err   error
+	Count int
 }
 
 // Output is the speaker output's "voice" input as a voice plays through it.

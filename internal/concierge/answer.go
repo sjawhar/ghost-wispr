@@ -251,9 +251,9 @@ func (c *Concierge) answer(parent context.Context, x *voice.Exchange, turn strin
 		c.offerPick(x, turn, found.candidates)
 		return sp.sayText(ctx, didYouMean(found.candidates), voice.Ack)
 	}
-	// R5, R6: the issue a search chose, then the facts. Its line is held
-	// until the first fact or the routing mark (speaker.holdLead), as a Lead:
-	// it always leads, and names the issue with no fact of it to time.
+	// The canonical key the Concierge resolved belongs to this answer result.
+	// The voice audits it directly; no transcript or spoken text is reparsed.
+	x.IssueKey = found.key
 	lead := found.lead()
 	for _, line := range lead {
 		if err := sp.holdLead(ctx, found.key, line); err != nil {

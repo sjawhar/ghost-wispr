@@ -16,6 +16,7 @@ import (
 	"github.com/sjawhar/ghost-wispr/internal/googleauth"
 	"github.com/sjawhar/ghost-wispr/internal/server"
 	"github.com/sjawhar/ghost-wispr/internal/voice"
+	"github.com/sjawhar/ghost-wispr/internal/voice/gptlive"
 	voicetts "github.com/sjawhar/ghost-wispr/internal/voice/tts"
 	"github.com/sjawhar/ghost-wispr/internal/wake/transcript"
 )
@@ -238,18 +239,26 @@ type voiceSource struct {
 
 // apply builds the voice cfg names, unless the voice settings did not change.
 func (v *voiceSource) apply(ctx context.Context, cfg *config.Config) {
-	if cfg.Voice.Engine != config.VoiceEngineTTS {
-		v.set("", nil, fmt.Errorf("voice.engine %q is not in this build; use %q", cfg.Voice.Engine, config.VoiceEngineTTS))
+	var key string
+	var build func() (voice.Voice, error)
+	switch cfg.Voice.Engine {
+	case config.VoiceEngineTTS:
+		key = strings.Join([]string{cfg.Voice.Engine, cfg.Voice.TTSEngine, cfg.Voice.TTSModel, cfg.Voice.TTSVoice, cfg.Voice.TTSLocation, cfg.GCPProject, cfg.GoogleCredentialsFile, cfg.DeepgramAPIKey}, "\x00")
+		build = func() (voice.Voice, error) { return newVoiceA(ctx, cfg) }
+	case config.VoiceEngineGPTLive:
+		key = strings.Join([]string{cfg.Voice.Engine, cfg.Voice.GPTLive.OpenAIIdentityProviderID, cfg.Voice.GPTLive.OpenAIServiceAccountID, cfg.GoogleCredentialsFile}, "\x00")
+		build = func() (voice.Voice, error) { return newVoiceB(cfg) }
+	default:
+		v.set("", nil, fmt.Errorf("voice.engine %q is not in this build; use %q or %q", cfg.Voice.Engine, config.VoiceEngineTTS, config.VoiceEngineGPTLive))
 		return
 	}
-	key := strings.Join([]string{cfg.Voice.TTSEngine, cfg.Voice.TTSModel, cfg.Voice.TTSVoice, cfg.Voice.TTSLocation, cfg.GCPProject, cfg.GoogleCredentialsFile, cfg.DeepgramAPIKey}, "\x00")
 	v.mu.Lock()
 	same := v.key == key && (v.built != nil || v.err != nil)
 	v.mu.Unlock()
 	if same {
 		return
 	}
-	built, err := newVoiceA(ctx, cfg)
+	built, err := build()
 	v.set(key, built, err)
 }
 
@@ -285,6 +294,23 @@ func voiceTiming(logger *slog.Logger) func(event, sessionID string, at time.Time
 		attrs := append([]any{"event", event, "session_id", sessionID, "at_unix_ns", at.UnixNano()}, kv...)
 		logger.Info("voice timing", attrs...)
 	}
+}
+
+// newVoiceB builds voice B: GPT-Live with the unit's own OpenAI identity,
+// an access token exchanged for its Google ID token (voice.gptlive).
+func newVoiceB(cfg *config.Config) (voice.Voice, error) {
+	credentials := cfg.GoogleCredentialsFile
+	tokens, err := gptlive.NewTokenSource(&gptlive.TokenConfig{
+		IdentityProviderID: cfg.Voice.GPTLive.OpenAIIdentityProviderID,
+		ServiceAccountID:   cfg.Voice.GPTLive.OpenAIServiceAccountID,
+		Subject: func(ctx context.Context, audience string) (string, error) {
+			return googleauth.IDToken(ctx, credentials, audience)
+		},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("voice B: %w (set voice.gptlive.openai_identity_provider_id and openai_service_account_id)", err)
+	}
+	return gptlive.New(gptlive.Config{Token: tokens.Token})
 }
 
 // newVoiceA builds voice A on the text-to-speech engine cfg names.

@@ -30,6 +30,12 @@ func TestReadmeStatesVoiceConsent(t *testing.T) {
 		"hands the turn, with the same transcript, to OpenAI's gpt-4.1-mini",
 		"a held answer also opens voice C without one",
 		"Between exchanges nothing goes to the Voice Agent",
+		"Voice B (`voice.engine: gptlive`) sends room audio to OpenAI's GPT-Live",
+		"from the wake phrase to the end of the exchange: nothing said before the wake phrase goes",
+		"a held answer also opens voice B without one",
+		"Between exchanges nothing goes to OpenAI",
+		"up to about 1.4 s of them never played",
+		"matching calls and commands can be ignored for up to 30 s while Wispr speaks or its echo can still be heard",
 		// R7 and R10: when an answer may speak, and the sounds.
 		"It speaks by itself only when nobody has spoken since the question and the light still reads red",
 		"Every gate closing, a pause or a light hold, ends the recording session, and an ended session's answers are never spoken: they stay in writing on that session's page",

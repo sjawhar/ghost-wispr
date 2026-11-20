@@ -267,6 +267,23 @@ What the voice hears, and where the room's words go:
   Concierge's model (Gemini on Vertex AI), with the last two minutes of the transcript. The text
   Wispr speaks goes to the text-to-speech engine: Gemini TTS on Vertex AI, or Deepgram Aura-2 with
   `mip_opt_out=true`.
+- Voice B (`voice.engine: gptlive`) sends room audio to OpenAI's GPT-Live, only while the light reads
+  red, from the wake phrase to the end of the exchange: nothing said before the wake phrase goes. The
+  audio held for the wake starts inside the phrase itself, about 0.3 s into it in our tests.
+  An exchange opens at the wake phrase; a held answer also opens voice B without one, but only on
+  "Wispr, go ahead", or when nobody has spoken since its question and the light reads red, and its
+  room audio goes from that moment. An exchange ends 6 s after Wispr's speech unless a person speaks,
+  after 10 s in which nobody and nothing speaks, and after 5 minutes at most. Between exchanges
+  nothing goes to OpenAI. With the audio go the last two
+  minutes of the transcript as text, and the Concierge's answers for GPT-Live to say in its own
+  words. The session starts with `store: false`, so OpenAI stores no recording of it to fork later.
+  The question and the transcript still go to the Concierge's model, as with voice A. The unit signs
+  in to OpenAI with its own Google identity and holds no OpenAI key.
+  A measured limit of voice B: GPT-Live sends its words just before their audio, and their
+  timestamps run on a clock the unit cannot follow, so the unit takes each word as it arrives. When
+  someone talks over Wispr, the words GPT-Live had already sent count as spoken, though up to about
+  1.4 s of them never played. In that time, matching calls and commands can be ignored for up to 30 s while Wispr speaks or its echo can still be heard.
+  That is broader than barge-in: `Wispr, never mind` can be ignored too when its words match an unplayed cut answer.
 - With `voice.engine: dgagent` (voice C), during an exchange only, the unit streams the room's
   audio and the last two minutes of the meeting's transcript to Deepgram's Voice Agent, with
   `mip_opt_out` set so Deepgram does not use them to train its models. Deepgram's model keeps the
@@ -309,6 +326,7 @@ What the voice hears, and where the room's words go:
 | `voice.tts_model`, `voice.tts_voice` | the engine's | Gemini: `gemini-3.8-flash-tts`, `Kore`; Aura: the voice `aura-2-harmonia-en` |
 | `voice.tts_location` | `us` | The Vertex AI location Gemini streams from; `us` is faster to first audio than `global` |
 | `voice.paused_listener` | `false` | The wake listener while paused; not built yet, so it is ignored |
+| `voice.gptlive.openai_identity_provider_id`, `voice.gptlive.openai_service_account_id` | — | Voice B's OpenAI workload identity, ids and not secrets: the unit exchanges its Google ID token (`google_credentials_file`) for an OpenAI access token of an hour at most. `gptlive-probe` (`cmd/gptlive-probe`) checks the route from the unit |
 | `concierge.model` | `gemini-3.5-flash-lite` | The Concierge's Gemini model, on the unit's genai settings |
 | `concierge.dispatch_url`, `GHOST_WISPR_DISPATCH_TOKEN` | — | Dispatch and the unit's own token; without both, the voice says it cannot reach Dispatch yet |
 | `concierge.envoy_url` | — | The Envoy listener the unit registers its session with, to ask an issue's agent |

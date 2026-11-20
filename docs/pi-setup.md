@@ -726,6 +726,43 @@ identity. The fifth recording rule tells the room that a question sent to an age
    package's live test (`GHOST_WISPR_LIVE_TTS=gemini ... TestLiveFirstSayTimeToFirstAudio`, built for
    arm64); keep the warm-up only if it lowers the median of the first sentence.
 
+## Probe voice B (GPT-Live)
+
+`gptlive-probe` sends only silence and its own question WAV over its
+WebSocket. It opens no microphone or speaker. It still must never run while
+the Pi records or a session is active.
+
+From the laptop or devbox, check the unit **before you copy or run
+anything**:
+
+```bash
+PI='ssh -o BatchMode=yes -o IdentityAgent=/run/user/1000/gcr/ssh ghost-wispr@ghost-wispr.tail12ec1c.ts.net'
+$PI 'curl -fsS localhost:8080/api/status | jq -e ".paused == true and .capturing == false and .active_session_id == \"\"" >/dev/null' ||
+  { echo 'the unit is not paused, not idle or still captures; do not copy or run the probe' >&2; exit 1; }
+```
+
+The program reads the same endpoint at its start, and again after
+`session.started` before it feeds its first audio frame. Those checks are
+the final guard; the pre-copy check prevents an accidental probe file from
+reaching a meeting.
+
+Build the arm64 binary on `sami-devbox`, copy the binary and a 16 kHz mono
+question WAV into a private `mktemp -d` on the Pi, and run it as
+`ghost-wispr`:
+
+```bash
+sudo -u ghost-wispr ./gptlive-probe \
+  --identity-provider-id idp_b2d6c7c4ac719ef0764eba89 \
+  --service-account-id user-cd72c7d9a1bb41594ed3c6e7 \
+  --ask question.wav
+```
+
+It first runs a wrong-audience control, then checks the token exchange,
+session, three spoken turns, the delegated question and the backend answer.
+It exits nonzero if the unit stops being paused and idle, the backend answer
+is not spoken, or a speech's first word reaches the own-speech filter more
+than 300 ms after its audio starts. Remove the private directory afterwards.
+
 ## Accept the meeting voice
 
 `deploy/pi/accept-voice.sh` runs slice 1 of the meeting voice on the loopback, so nothing plays in

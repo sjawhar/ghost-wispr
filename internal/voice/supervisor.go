@@ -810,6 +810,8 @@ func (s *Supervisor) readEvents(ex *exchange, sess Session) {
 		switch e.Kind {
 		case EventAgentText:
 			s.addOwnLocked(e.Text, time.Now())
+		case EventFactCheck:
+			s.logf("voice: GPT-Live spoken fact errors %d", e.Count)
 		case EventSpeechStarted:
 			if ex.spokeAt.IsZero() {
 				ex.spokeAt = time.Now()
@@ -1206,7 +1208,7 @@ func (s *Supervisor) speakLocked(p *pendingAnswer) {
 	s.capExchange(ex)
 	ex.dropsAtOpen = s.cfg.Tap.Dropped()
 	s.takeFloorLocked(ex)
-	ex.x = Exchange{SessionID: p.SessionID, WakeAt: time.Now(), Recent: s.recentLocked(), Tap: s.tapFor(voice, 0), Out: exchangeOutput{s: s, ex: ex}}
+	ex.x = Exchange{SessionID: p.SessionID, WakeAt: time.Now(), IssueKey: p.IssueKey, Recent: s.recentLocked(), Tap: s.tapFor(voice, 0), Out: exchangeOutput{s: s, ex: ex}}
 	ex.x.Tools = exchangeTools{s: s, ex: ex}
 	x := ex.x
 	s.spawn(func() {
@@ -1865,7 +1867,7 @@ func (t exchangeTools) Run(ctx context.Context, c ToolCall) (json.RawMessage, er
 		t.ex.unspokenAnswer = true // until the voice's speech starts
 		s.mu.Unlock()
 	}
-	return json.Marshal(AnswerResult{Say: strings.Join(lines, " ")})
+	return json.Marshal(AnswerResult{Say: strings.Join(lines, " "), IssueKey: x.IssueKey})
 }
 
 // leadLine is the first line an answer tool speaks at once, in the
