@@ -61,19 +61,27 @@ func TestSolR5AuditUsesTheCurrentFollowUpKey(t *testing.T) {
 	}
 }
 
-func TestSolR5QuestionKeyExtractionIsCaseInsensitive(t *testing.T) {
-	x := testExchange(newFakeOutput(), newFakeTools(voice.AnswerResult{}))
-	x.AskerTurn = "What is happening with abc-123?"
-	srv := newLiveServer(t)
-	s, c, _ := openSession(t, srv, x)
-	done := make(chan error, 1)
-	go func() { done <- s.Say(context.Background(), "ABC-123 is in review.", voice.Fact) }()
-	c.expect(evCommentaryAppend)
-	c.speak("It is in review.")
-	if err := <-done; err != nil {
-		t.Fatal(err)
-	}
-	if n := waitFactCheck(t, s); n == 0 {
-		t.Fatal("lowercase question key abc-123 was omitted but reported zero failures")
+func TestSolR5SpokenQuestionKeyFormsRetainTheirKey(t *testing.T) {
+	for _, question := range []string{
+		"What is happening with INFRA-1027?",
+		"What is happening with infra 1027?",
+		"What is happening with infra ten twenty-seven?",
+	} {
+		t.Run(question, func(t *testing.T) {
+			x := testExchange(newFakeOutput(), newFakeTools(voice.AnswerResult{}))
+			x.AskerTurn = question
+			srv := newLiveServer(t)
+			s, c, _ := openSession(t, srv, x)
+			done := make(chan error, 1)
+			go func() { done <- s.Say(context.Background(), "INFRA-1027 is in review.", voice.Fact) }()
+			c.expect(evCommentaryAppend)
+			c.speak("It is in review.")
+			if err := <-done; err != nil {
+				t.Fatal(err)
+			}
+			if n := waitFactCheck(t, s); n == 0 {
+				t.Error("a supported spoken key form disabled required-key retention")
+			}
+		})
 	}
 }

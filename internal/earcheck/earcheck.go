@@ -1,12 +1,13 @@
 // Package earcheck verifies text intended for the ear against written source.
 package earcheck
-
 import (
 	"regexp"
 	"strconv"
 	"strings"
 	"unicode"
 	"unicode/utf8"
+
+	"github.com/sjawhar/ghost-wispr/internal/wake/transcript"
 )
 
 const (
@@ -44,10 +45,15 @@ var NumberUnits = numberUnits
 // FileName is the R8 matcher for a file name that is unsuitable to say.
 var FileName = earFileName
 
-// QuestionKey finds the key the asker named, case-insensitively, and returns
-// it as R8 writes it: `abc-123` becomes `ABC-123`.
+// QuestionKey finds the last key the asker named, using the same spoken-key
+// forms as the Supervisor: `infra 1027` and `infra ten twenty-seven` both
+// become `INFRA-1027`.
 func QuestionKey(text string) string {
-	return strings.ToUpper(questionKey.FindString(text))
+	keys := transcript.IssueKeys(text)
+	if len(keys) == 0 {
+		return ""
+	}
+	return keys[len(keys)-1]
 }
 
 // Check reports why text fails the R8 ear contract against source, or "".
