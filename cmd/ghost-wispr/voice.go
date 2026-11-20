@@ -257,7 +257,7 @@ func (v *voiceSource) apply(ctx context.Context, cfg *config.Config) {
 		return
 	}
 	v.mu.Lock()
-	same := v.key == joined && (v.built != nil || v.err != nil)
+	same := v.key == key && (v.built != nil || v.err != nil)
 	v.mu.Unlock()
 	if same {
 		return
