@@ -2042,7 +2042,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 			// The session page reads a session's questions again on each change.
 			return startConcierge(ctx, &current, store, appLogger, func(sessionID string) {
 				hub.BroadcastVoiceEvent("voice_tasks_changed", sessionID)
-			})
+			}, nil)
 		}, func(c *concierge.Concierge) {
 			if c == nil { // it stopped: the session hooks reach nothing
 				conciergeSessionHooks.set(nil)
