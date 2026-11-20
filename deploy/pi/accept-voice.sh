@@ -287,6 +287,7 @@ case $step in
   room-test) unknown 'room-test: not in this build: measurement 3 runs last, with the people in the room' ;;
   measure-echo) unknown 'measure-echo: not in this build: measurement 1 runs on the main branch before the voice, with a person present' ;;
   exchange | wake-sound | scripted | ask-holder | barge-in | playback-cancel | states | listener-cpu) changes_unit=true ;;
+  reach | holder-cases | tts-first-audio) changes_unit=false ;;
   *) usage_error "unknown step: $step" ;;
 esac
 
@@ -1980,7 +1981,7 @@ wait_capture_state() {
 
 # check_state NAME STATE: after NAME, the unit is in STATE (recording, listening or closed): its
 # /api/status, its light read back, its saved state, its microphone's capture device and, as the
-# person sees it, its Jabra ring all say so (INFRA-4592, the control table).
+# person sees it, its Jabra ring all say so (the meeting voice's control table of the three states).
 check_state() {
   local name=$1 want=$2 capture light want_light saved want_saved open=closed want_open=open muted want_muted=no
   case $want in

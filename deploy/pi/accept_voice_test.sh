@@ -145,7 +145,7 @@ def running():
 
 
 def level():
-    """The unit's microphone state: recording, listening or closed (INFRA-4592, the three states)."""
+    """The unit's microphone state: recording, listening or closed (the three capture states)."""
     if read("paused").strip() != "1":
         return "recording"
     return read("level", "closed").strip() or "closed"
