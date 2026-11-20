@@ -75,6 +75,11 @@ func runJoinedProbeCommand(ctx context.Context, args []string, configPath string
 		// advertises its delivery mode.
 		Capabilities: []string{"btw"},
 		Deliver: func(_ context.Context, m *envoy.Message) error {
+			// A person's Dispatch message arrives as a delivery frame; the
+			// unit's own messages arrive as their text.
+			if body, fromDispatch := deliveredText(m.Text); fromDispatch {
+				m.Text = body
+			}
 			p.messages <- m
 			return nil
 		},
@@ -290,4 +295,24 @@ func parseInvitation(text string) (invitationParts, error) {
 		return inv, errors.New("the join message names no Envoy session, API or join line")
 	}
 	return inv, nil
+}
+
+// deliveredText is what a delivered message says: a Dispatch delivery frame's
+// message body ({event: {payload: {body}}, delivery}, how Dispatch hands a
+// person's message to a session through Envoy), with true, or any other text
+// as it is.
+func deliveredText(text string) (string, bool) {
+	var frame struct {
+		Event struct {
+			Payload struct {
+				Body *string `json:"body"`
+			} `json:"payload"`
+		} `json:"event"`
+		Delivery json.RawMessage `json:"delivery"`
+	}
+	if !strings.HasPrefix(strings.TrimSpace(text), "{") || json.Unmarshal([]byte(text), &frame) != nil ||
+		frame.Event.Payload.Body == nil || len(frame.Delivery) == 0 {
+		return text, false
+	}
+	return *frame.Event.Payload.Body, true
 }
