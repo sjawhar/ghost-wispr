@@ -430,17 +430,20 @@ def stop():
         for field, what in (("SigIgn", "ignores"), ("SigBlk", "blocks")):
             if signal_mask(pid, field) & term:
                 write("fake-error", "the service process %d %s SIGTERM\n" % (pid, what))
-        os.kill(pid, signal.SIGTERM)
         try:
+            os.kill(pid, signal.SIGTERM)
             os.kill(pid, signal.SIGCONT)
         except ProcessLookupError:
-            pass
+            pass  # it ended, and a reaping PID 1 took it, after the check
         deadline = time.time() + STOP_TIMEOUT
         while alive(pid) and time.time() < deadline:
             time.sleep(0.01)
         if alive(pid):
             log_to("stop-killed", "%d %s, %d s after SIGTERM" % (pid, process_state(pid), STOP_TIMEOUT))
-            os.kill(pid, signal.SIGKILL)
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass  # it ended, and a reaping PID 1 took it, between the check and the kill
             deadline = time.time() + 120
             while alive(pid) and time.time() < deadline:
                 time.sleep(0.01)
@@ -614,6 +617,11 @@ def speech(tag, start, length, session="session-1", fact=None):
     emit(kind="log", due=start, tag=tag, level="INFO", msg="speaker stream", fields={"device": "plughw:CARD=J75,DEV=0", "rate": 48000, "channels": 2, "period": 10_000_000, "buffer": 40_000_000, "rewind": True})
     emit(kind="sound", start=start, end=start + length, tag=tag)
     emit(kind="timing", due=start + length, tag=tag, event="speech_end", session_id=session)
+    spoken(tag, start + length, session)
+
+
+def spoken(tag, at, session):
+    """The end of the voice's speech on /ws: voice_spoken at AT."""
     if "no-spoken" in SCENARIO:
         return
     fields = {"session_id": session}
@@ -621,7 +629,30 @@ def speech(tag, start, length, session="session-1", fact=None):
         fields["text"] = "the answer"
     if "other-session" in SCENARIO:
         fields["session_id"] = "session-2"
-    emit(kind="ws", due=start + length, tag=tag, event=dict(type="voice_spoken", **fields))
+    emit(kind="ws", due=at, tag=tag, event=dict(type="voice_spoken", **fields))
+
+
+# answer-until-clip: barge-in's answers end from the step's own clips, not from the clock, so that a
+# driver its machine holds up still plays each clip into speech. An answer lasts ANSWER_CEILING_MS at
+# most, so that a clip that never comes still ends the case; a talk-over or backchannel clip that
+# does not stop it ends it ANSWER_AFTER_CLIP_MS after the clip ends. The clip ends 300 ms after it
+# begins and the driver's stop window (stop_window_ms) runs 4 s from its start, so the answer ends
+# 2 s after that window, well inside the driver's 15 s wait (--event-timeout) for voice_spoken.
+ANSWER_CEILING_MS = 60_000
+ANSWER_AFTER_CLIP_MS = 5700
+
+
+def end_answer_after(clip_start, clip_end):
+    """End the answer playing when a clip that does not stop it began (answer-until-clip)."""
+    at = clip_end + ANSWER_AFTER_CLIP_MS
+    for item in timeline():
+        if item["kind"] == "sound" and item["tag"].startswith("speech-") and item["start"] <= clip_start < item["end"] and item["end"] > at:
+            # A cut whose sound plays out to its end (drain) at the moment it is cut: the speech's own
+            # end, then speech_end and voice_spoken at that moment.
+            emit(kind="cut", tag=item["tag"], at=at, sound_end=at, drain=True)
+            emit(kind="timing", due=at, tag=item["tag"], event="speech_end", session_id="session-1")
+            spoken(item["tag"], at, "session-1")
+            break
 
 
 def wake_heard_ms():
@@ -677,7 +708,7 @@ def react(kind, key, start, end):
             # The fact sentence follows the first one with no gap: one sound from the first frame.
             speech(tag, end + 700, 2300, fact=end + 1900)
         else:
-            length = 7000 if "long" in SCENARIO else 1500 if "short" in SCENARIO else 600
+            length = ANSWER_CEILING_MS if "answer-until-clip" in SCENARIO else 7000 if "long" in SCENARIO else 1500 if "short" in SCENARIO else 600
             speech(tag, end + 700, length)
         if "go-ahead" in SCENARIO:
             emit(kind="ws", due=end + 1500, event={"type": "voice_answer_ready", "session_id": "session-1"})
@@ -711,9 +742,10 @@ def react(kind, key, start, end):
             if "no-cancel-trace" not in SCENARIO:
                 emit(kind="log", due=end + 350, level="INFO", msg="concierge told an agent its question was cancelled", fields={"task": task, "request": "event-cancel"})
     elif kind in ("stop", "talkover", "backchannel"):
-        if kind == "talkover" and "stop-off" in SCENARIO:
-            return
-        if kind == "backchannel" and "backchannel-stops" not in SCENARIO:
+        if (kind == "talkover" and "stop-off" in SCENARIO) or (kind == "backchannel" and "backchannel-stops" not in SCENARIO):
+            # A clip the voice does not stop for: with answer-until-clip, the answer ends from it.
+            if "answer-until-clip" in SCENARIO:
+                end_answer_after(start, end)
             return
         stop_at = start + 700
         for item in timeline():
@@ -937,6 +969,17 @@ def journalctl(args):
             records.append(journal_record(due, "INFO", "voice timing", fields))
         elif item["kind"] == "log":
             records.append(journal_record(due, item["level"], item["msg"], item["fields"]))
+    if "late-clip" in SCENARIO:
+        # late-clip: the read that first holds an answer's first_audio returns 7 s late. The driver
+        # plays its next clip 1 s after first_audio, so it plays it 6 s late, as a driver that its
+        # machine's load holds up does. Each delay is logged in late-clip.log.
+        seen = read("late-clip-seen").split()
+        new = [i["id"] for i in timeline() if i["kind"] == "timing" and i["event"] == "first_audio" and i["due"] <= t and i["id"] not in seen]
+        if new:
+            for item_id in new:
+                log_to("late-clip-seen", item_id)
+            log_to("late-clip.log", "%d: held a read with first_audio for 7 s" % t)
+            time.sleep(7)
     sys.stdout.flush()
     helper = os.path.join(os.path.dirname(os.path.abspath(__file__)), "journal-records")
     return subprocess.run([helper], input="".join(json.dumps(record) + "\n" for record in records), text=True).returncode
@@ -1558,13 +1601,18 @@ launch ask-no-trace no-cancel-trace '' -- $ask_args
 launch ask-journal-error journal-error-after-answer_ready '' -- $ask_args
 
 # barge-in: a pass; the stop rule off (the negative control); answers too short to count; a
-# backchannel that stops speech.
-launch barge long yes -- --step barge-in --talkovers 2 --backchannels 2 --question @question.wav --talkover-dir @talkovers --backchannel-dir @backchannels --rig-mic "$rig" --event-timeout 15
-launch barge-off long,stop-off yes -- --step barge-in --talkovers 1 --backchannels 0 --question @question.wav --talkover-dir @talkovers --backchannel-dir @backchannels --rig-mic "$rig" --event-timeout 15
+# backchannel that stops speech. Each answer but barge-short's ends from the step's clips
+# (answer-until-clip), so a driver that plays a clip late still plays it into speech.
+launch barge answer-until-clip yes -- --step barge-in --talkovers 2 --backchannels 2 --question @question.wav --talkover-dir @talkovers --backchannel-dir @backchannels --rig-mic "$rig" --event-timeout 15
+launch barge-off answer-until-clip,stop-off yes -- --step barge-in --talkovers 1 --backchannels 0 --question @question.wav --talkover-dir @talkovers --backchannel-dir @backchannels --rig-mic "$rig" --event-timeout 15
 launch barge-short short yes -- --step barge-in --talkovers 1 --backchannels 0 --question @question.wav --talkover-dir @talkovers --backchannel-dir @backchannels --rig-mic "$rig" --event-timeout 15
-launch barge-backchannel long,backchannel-stops yes -- --step barge-in --talkovers 1 --backchannels 1 --question @question.wav --talkover-dir @talkovers --backchannel-dir @backchannels --rig-mic "$rig" --event-timeout 15
+launch barge-backchannel answer-until-clip,backchannel-stops yes -- --step barge-in --talkovers 1 --backchannels 1 --question @question.wav --talkover-dir @talkovers --backchannel-dir @backchannels --rig-mic "$rig" --event-timeout 15
 # A journal that cannot be read once the voice stops: UNKNOWN, not a talk-over with no stop.
-launch barge-journal-error long,journal-error-after-stop yes -- --step barge-in --talkovers 1 --backchannels 0 --question @question.wav --talkover-dir @talkovers --backchannel-dir @backchannels --rig-mic "$rig" --event-timeout 15
+launch barge-journal-error answer-until-clip,journal-error-after-stop yes -- --step barge-in --talkovers 1 --backchannels 0 --question @question.wav --talkover-dir @talkovers --backchannel-dir @backchannels --rig-mic "$rig" --event-timeout 15
+# The same pass and backchannel stop with every clip played 6 s late (late-clip): the verdicts must
+# not change.
+launch barge-late answer-until-clip,late-clip yes -- --step barge-in --talkovers 2 --backchannels 2 --question @question.wav --talkover-dir @talkovers --backchannel-dir @backchannels --rig-mic "$rig" --event-timeout 15
+launch barge-backchannel-late answer-until-clip,backchannel-stops,late-clip yes -- --step barge-in --talkovers 1 --backchannels 1 --question @question.wav --talkover-dir @talkovers --backchannel-dir @backchannels --rig-mic "$rig" --event-timeout 15
 
 # playback-cancel, timed by the end of the cancelled speech at the rig microphone: a pass; a correct
 # cancel that keeps the stream running with 80 ms of silence queued, which must pass; a status that
@@ -2079,6 +2127,24 @@ expect_rc barge-journal-error 2
 expect_line barge-journal-error 'UNKNOWN: voice timing log: cannot read the journal of ghost-wispr.service (process '
 expect_line barge-journal-error ': Failed to read journal: Input/output error'
 expect_restored barge-journal-error
+# Every clip 6 s late (late-clip): the verdicts of barge and barge-backchannel, each round counted.
+# expect_held NAME N: late-clip.log shows that the fake held up the clip of each of NAME's N rounds.
+expect_held() {
+  local held
+  held=$(cat "$root/$1/state/late-clip.log" 2>/dev/null | grep -c .)
+  [[ $held == "$2" ]] || check_failed "$1: the fake held up the clips of $held of the $2 rounds"
+}
+expect_rc barge-late 0
+expect_line barge-late 'PASS: barge-in: 0 of 2 backchannels stopped the speech, at most 0'
+expect_line barge-late 'NOTE: barge-in round 2 (backchannel): the speech went on'
+expect_no_line barge-late 'not counted'
+expect_held barge-late 4
+expect_restored barge-late
+expect_rc barge-backchannel-late 1
+expect_line barge-backchannel-late 'FAIL: barge-in: 1 of 1 backchannels stopped the speech, more than 0'
+expect_no_line barge-backchannel-late 'not counted'
+expect_held barge-backchannel-late 2
+expect_restored barge-backchannel-late
 
 # playback-cancel.
 expect_rc cancel 0
