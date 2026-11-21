@@ -7,17 +7,19 @@ import (
 	"testing"
 
 	api "github.com/deepgram/deepgram-go-sdk/v3/pkg/api/listen/v1/websocket/interfaces"
+
+	"github.com/sjawhar/ghost-wispr/internal/session"
 )
 
 // resumeFilter is a session manager that keeps, of each result, only the words
-// at or after resumedAt on the stream, as session.Manager.MessageKept does
+// at or after resumedAt on the stream, as session.Manager.MessageKeptOn does
 // after a pause: a late result from before the pause is dropped whole.
 type resumeFilter struct {
 	resumedAt float64
 	messages  int
 }
 
-func (f *resumeFilter) MessageKept(mr *api.MessageResponse) (*api.MessageResponse, error) {
+func (f *resumeFilter) MessageKeptOn(_ session.LiveStream, mr *api.MessageResponse) (*api.MessageResponse, error) {
 	f.messages++
 	alt := mr.Channel.Alternatives[0]
 	var kept []api.Word
@@ -43,7 +45,7 @@ func (f *resumeFilter) MessageKept(mr *api.MessageResponse) (*api.MessageRespons
 }
 
 func (f *resumeFilter) Message(mr *api.MessageResponse) error {
-	_, err := f.MessageKept(mr)
+	_, err := f.MessageKeptOn(nil, mr)
 	return err
 }
 func (*resumeFilter) UtteranceEnd(*api.UtteranceEndResponse) error { return nil }
