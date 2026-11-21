@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"io"
@@ -797,5 +798,112 @@ func TestAnOptionsChangeKeepsTheOldSocketsFinalResult(t *testing.T) {
 	defer heard.mu.Unlock()
 	if !slices.ContainsFunc(heard.got, func(tr voice.Transcript) bool { return tr.Text == final }) {
 		t.Errorf("the voice heard %d results and not the old socket's final %q: the rotation cut it off before Deepgram returned it", len(heard.got), final)
+	}
+}
+
+// heldSocket is the app's Deepgram socket with its first write held until
+// release, after it says, by entered, that the write is under way.
+type heldSocket struct {
+	*deepgramSocket
+	entered, release chan struct{}
+	once             sync.Once
+}
+
+func (s *heldSocket) Write(p []byte) (int, error) {
+	s.once.Do(func() { close(s.entered); <-s.release })
+	return s.deepgramSocket.Write(p)
+}
+
+// TestADeepgramErrorDuringADrainLosesNoAudio fails if audio the client
+// buffered is lost when Deepgram ends the stream while the client drains that
+// audio into a new socket: the app's socket refuses the chunk it was writing
+// (it returns no bytes taken), and the drain had already taken that chunk out
+// of the buffer. The next socket gets every buffered byte, once and in order,
+// the refused chunk first; here with an options change pending too.
+func TestADeepgramErrorDuringADrainLosesNoAudio(t *testing.T) {
+	sendError := make(chan struct{})
+	var handshakes atomic.Int32
+	var mu sync.Mutex
+	var got []byte
+	upgrader := websocket.Upgrader{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		first := handshakes.Add(1) == 1
+		c, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer func() { _ = c.Close() }()
+		if first { // Deepgram ends the stream with an error
+			<-sendError
+			_ = c.WriteMessage(websocket.TextMessage, []byte(`{"type":"Error","err_code":"NET0000","err_msg":"the stream failed"}`))
+			_ = c.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseInternalServerErr, ""))
+			return
+		}
+		for {
+			kind, p, err := c.ReadMessage()
+			if err != nil {
+				return
+			}
+			if kind == websocket.BinaryMessage {
+				mu.Lock()
+				got = append(got, p...)
+				mu.Unlock()
+			}
+		}
+	}))
+	t.Cleanup(srv.Close)
+	opts := &interfaces.LiveTranscriptionOptions{Model: "nova-3", Language: "en-US", Encoding: "linear16", SampleRate: 16000, Channels: 1}
+	held := make(chan *heldSocket, 1) // the first socket, once dialled
+	var dials atomic.Int32
+	factory := func(ctx context.Context) (io.WriteCloser, error) {
+		s, err := dialDeepgramLive(ctx, "test-key", &interfaces.ClientOptions{Host: "ws://" + srv.Listener.Addr().String()}, opts, transcriptCallback{}, time.Second)
+		if err != nil || dials.Add(1) != 1 {
+			return s, err
+		}
+		h := &heldSocket{deepgramSocket: s, entered: make(chan struct{}), release: make(chan struct{})}
+		held <- h
+		return h, nil
+	}
+	rc := transcribe.NewResilientClient(context.Background(), factory, transcribe.ResilientConfig{BufferSize: 1 << 16, InitialReconnectDelay: time.Millisecond, MaxReconnectBackoff: time.Millisecond}, nil, nil)
+	t.Cleanup(func() { _ = rc.Close() })
+
+	audio := make([]byte, 6144)
+	for i := range audio {
+		audio[i] = byte(i*7 + i/251)
+	}
+	_, _ = rc.Write(audio) // buffered: no socket yet
+	rc.ConnectInBackground()
+	var first *heldSocket
+	select {
+	case first = <-held:
+	case <-time.After(3 * time.Second):
+		t.Fatal("the first socket was never dialled")
+	}
+	select {
+	case <-first.entered:
+	case <-time.After(3 * time.Second):
+		t.Fatal("the drain never wrote to the first socket")
+	}
+	rc.OptionsChanged()
+	close(sendError)
+	select {
+	case <-first.done: // the socket's reader saw Deepgram end the stream
+	case <-time.After(3 * time.Second):
+		t.Fatal("the first socket never ended")
+	}
+	close(first.release) // the held write now meets the ended socket
+	waitForHardwareWithin(t, 3*time.Second, "the next socket", rc.IsConnected)
+	// A marker frame after the drain says the peer has read all of it.
+	marker := []byte("END-OF-DRAIN")
+	_, _ = rc.Write(marker)
+	waitForHardwareWithin(t, 3*time.Second, "the marker at the peer", func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return bytes.HasSuffix(got, marker)
+	})
+	mu.Lock()
+	defer mu.Unlock()
+	if drained := got[:len(got)-len(marker)]; !bytes.Equal(drained, audio) {
+		t.Errorf("the next socket got %d of the %d buffered bytes (%d handshakes), want every one once and in order: the chunk Deepgram's error refused was lost", len(drained), len(audio), handshakes.Load())
 	}
 }

@@ -168,6 +168,24 @@ type ResilientClient struct {
 	// drainMu is held across each chunk drainBuffer reads and writes, and by
 	// Finalize, so a finalize never overtakes buffered audio already in flight.
 	drainMu sync.Mutex
+	// pending is the chunk the drain took out of Buffer and has not yet sent
+	// whole: what a failed or partial write left unsent. It is older than
+	// everything in Buffer, so the next drain sends it first. The audio kept,
+	// pending and Buffer together, is bounded by Buffer's size and is one tail
+	// of the capture (bufferLocked). Guarded by Mu, and refilled only with
+	// drainMu held.
+	pending []byte
+	// The current socket's stream during a drain, all guarded by Mu: took is
+	// the audio it took; inFlight says a drain write is under way, and
+	// droppedInFlight counts the kept audio an overflow dropped meanwhile; gap
+	// says an overflow dropped audio the socket had not taken, after audio it
+	// had, so its stream would jump and it ends at its next chunk
+	// (errStreamGap). Only an overflow sets it: audio a replaced socket
+	// refused goes back to the buffer's end, as the replaced socket's own.
+	took            int64
+	inFlight        bool
+	droppedInFlight int64
+	gap             bool
 
 	// accepted counts the bytes Write has taken, and origin is the count at
 	// the first byte the current Client was sent: the stream Deepgram times
