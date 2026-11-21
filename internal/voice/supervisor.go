@@ -966,8 +966,12 @@ func (s *Supervisor) cutDriverLocked(ex *exchange) {
 }
 
 // startLocked opens an exchange on a wake: the wake chime, the voice, and a
-// tap of room audio from the wake word on.
+// tap of room audio from the wake word on. A notification sound gives way to
+// the wake first, and sounds again after it, whether or not the exchange then
+// starts: a wake with the light not red starts none, and one whose voice
+// cannot be built plays the error sound, which must not play over it.
 func (s *Supervisor) startLocked(t *Transcript, m transcript.Match) {
+	s.cutChimeLocked(true)
 	if !s.cfg.Red() {
 		return
 	}
@@ -1920,7 +1924,8 @@ func (s *Supervisor) endLocked(ex *exchange, cut bool, reason string) {
 
 // takeFloorLocked makes ex the exchange holding the floor, and cuts other
 // speech on the voice input, such as POST /api/tts/speak, whether or not it
-// has sounded yet. Speech begun after this waits for the floor (WithFloor).
+// has sounded yet, and the answer sound. Speech begun after this waits for
+// the floor (WithFloor).
 func (s *Supervisor) takeFloorLocked(ex *exchange) {
 	s.ex = ex
 	s.floor = make(chan struct{})
