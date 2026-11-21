@@ -12,12 +12,13 @@ package joined
 
 import (
 	"cmp"
+	"container/heap"
 	"context"
 	"crypto/sha256"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"log"
-	"maps"
 	"math"
 	"slices"
 	"strings"
@@ -160,26 +161,173 @@ type agentHistory struct {
 	lastPointer time.Time
 }
 
-// commandKey is a command's fixed-size record: the first 16 bytes of the
+// commandKey is a command's fixed-size record: the first 8 bytes of the
 // SHA-256 of its agent session and Envoy event id, so a command costs the
-// history the same however long its id.
-type commandKey [16]byte
+// history the same however long its id. Keys are compared only within one
+// session: two of its commands share a key by chance one time in 2^64, so
+// with 4,096 held, a new command is mistaken for one held about once in 2^52.
+type commandKey uint64
 
 func commandKeyOf(agent, eventID string) commandKey {
 	sum := sha256.Sum256([]byte(agent + "\x00" + eventID))
-	return commandKey(sum[:16])
+	return commandKey(binary.BigEndian.Uint64(sum[:8]))
+}
+
+// commandRecord is one command taken: its key, and the second it was taken,
+// counted from the history's base and rounded up, so that it is kept at least
+// replayWindow.
+type commandRecord struct {
+	key commandKey
+	at  uint32
+}
+
+// sessionCommands is the commands one sending Envoy session had taken, oldest
+// first, in a ring that grows to perSessionCommands, found through table: an
+// open-addressing table, twice the ring's length, of ring places plus one (0
+// for none), so a command is found at once, whatever the session holds.
+type sessionCommands struct {
+	agent string
+	ring  []commandRecord
+	head  int
+	n     int
+	table []uint16
+	index int  // its place in commandHistory.largest
+	full  bool // it reached perSessionCommands, and its oldest went for its newest; logged once a filling
+}
+
+func (s *sessionCommands) at(i int) *commandRecord { return &s.ring[(s.head+i)%len(s.ring)] }
+
+// home is key's first slot in table; the key's bits are a hash already.
+func (s *sessionCommands) home(key commandKey) int { return int(uint32(key)) & (len(s.table) - 1) }
+
+// find is the slot of table that holds key's place, or -1.
+func (s *sessionCommands) find(key commandKey) int {
+	if len(s.table) == 0 {
+		return -1
+	}
+	for i := s.home(key); ; i = (i + 1) & (len(s.table) - 1) {
+		switch p := s.table[i]; {
+		case p == 0:
+			return -1
+		case s.ring[p-1].key == key:
+			return i
+		}
+	}
+}
+
+func (s *sessionCommands) has(key commandKey) bool { return s.find(key) >= 0 }
+
+// place enters ring place p, holding key, in table.
+func (s *sessionCommands) place(key commandKey, p int) {
+	i := s.home(key)
+	for s.table[i] != 0 {
+		i = (i + 1) & (len(s.table) - 1)
+	}
+	s.table[i] = uint16(p + 1)
+}
+
+// unplace empties slot i of table, and moves back each entry after it that
+// would no longer be found from its home past the empty slot.
+func (s *sessionCommands) unplace(i int) {
+	mask := len(s.table) - 1
+	for {
+		s.table[i] = 0
+		j := i
+		for {
+			j = (j + 1) & mask
+			if s.table[j] == 0 {
+				return
+			}
+			k := s.home(s.ring[s.table[j]-1].key)
+			// An entry whose home lies cyclically in (i, j] is found without
+			// slot i; any other must move into it.
+			if (i <= j && i < k && k <= j) || (i > j && (i < k || k <= j)) {
+				continue
+			}
+			break
+		}
+		s.table[i] = s.table[j]
+		i = j
+	}
+}
+
+// push keeps rec as the newest; the caller made room below perSessionCommands.
+func (s *sessionCommands) push(rec commandRecord) {
+	if s.n == len(s.ring) {
+		s.resize(min(max(8, 2*len(s.ring)), perSessionCommands))
+	}
+	p := (s.head + s.n) % len(s.ring)
+	s.ring[p] = rec
+	s.place(rec.key, p)
+	s.n++
+}
+
+// dropOldest forgets the oldest record, and gives the ring's room back once a
+// quarter of it is used.
+func (s *sessionCommands) dropOldest() {
+	s.unplace(s.find(s.ring[s.head].key))
+	s.head = (s.head + 1) % len(s.ring)
+	s.n--
+	if len(s.ring) > 8 && s.n <= len(s.ring)/4 {
+		s.resize(max(8, len(s.ring)/2))
+	}
+}
+
+// resize makes the ring size long, its records in order from its start, and
+// its table again.
+func (s *sessionCommands) resize(size int) {
+	ring := make([]commandRecord, size)
+	for i := range s.n {
+		ring[i] = *s.at(i)
+	}
+	s.ring, s.head, s.table = ring, 0, make([]uint16, 2*size)
+	for p := range s.n {
+		s.place(ring[p].key, p)
+	}
+}
+
+// sessionsBySize orders the sending sessions most commands first, for the
+// backstop (container/heap).
+type sessionsBySize []*sessionCommands
+
+func (q sessionsBySize) Len() int           { return len(q) }
+func (q sessionsBySize) Less(i, j int) bool { return q[i].n > q[j].n }
+func (q sessionsBySize) Swap(i, j int) {
+	q[i], q[j] = q[j], q[i]
+	q[i].index, q[j].index = i, j
+}
+func (q *sessionsBySize) Push(x any) {
+	s := x.(*sessionCommands)
+	s.index = len(*q)
+	*q = append(*q, s)
+}
+func (q *sessionsBySize) Pop() any {
+	old := *q
+	s := old[len(old)-1]
+	old[len(old)-1] = nil
+	*q = old[:len(old)-1]
+	return s
 }
 
 // commandHistory is the commands the roster took, each kept for replayWindow
-// from when it took it, so a command Envoy delivers again acts once. A command
-// is its key and the second it was taken, counted from base and rounded up,
-// so it is kept at least the window. At most maxCommands are kept.
+// from when it took it, so a command Envoy delivers again acts once. It keeps
+// them by sending Envoy session, at most perSessionCommands each: a session
+// at its cap forgets its own oldest for its newest, so a session that floods
+// makes only its own commands replayable, never another's refused or
+// forgotten. maxCommands bounds them all, as a backstop against many
+// sessions: at it the history forgets the oldest of the session holding the
+// most. It refuses no command, so none Envoy delivers is lost.
 type commandHistory struct {
-	base   time.Time
-	taken  map[commandKey]uint32
-	oldest uint32 // no command held was taken earlier, so a prune before its expiry finds nothing
-	peak   int    // the most commands held since taken was made, for its rebuild
-	full   bool   // the latest new command found the history full; logged once a filling
+	base      time.Time
+	sessions  map[string]*sessionCommands
+	largest   sessionsBySize
+	total     int
+	full      bool   // the latest new command found the history at maxCommands; logged once a filling
+	lastPrune uint32 // the second of the last whole prune: commands expire by the second
+}
+
+func newCommandHistory(base time.Time) commandHistory {
+	return commandHistory{base: base, sessions: map[string]*sessionCommands{}}
 }
 
 // stamp is now as a second counted from base, rounded up.
@@ -197,37 +345,88 @@ func (h *commandHistory) expired(at uint32, now time.Time) bool {
 	return now.Sub(h.base.Add(time.Duration(at)*time.Second)) >= replayWindow
 }
 
-// add keeps key, taken at now.
-func (h *commandHistory) add(key commandKey, now time.Time) {
-	at := h.stamp(now)
-	if len(h.taken) == 0 || at < h.oldest {
-		h.oldest = at
-	}
-	h.taken[key] = at
-	h.peak = max(h.peak, len(h.taken))
+// has reports whether agent's command key was taken.
+func (h *commandHistory) has(agent string, key commandKey) bool {
+	s := h.sessions[agent]
+	return s != nil && s.has(key)
 }
 
-// prune forgets the commands kept the window. A map does not give back the
-// room of what it deletes, and maps.Clone keeps its size, so once a prune
-// leaves a quarter of the most it held, the map is made again at its new
-// size and filled.
-func (h *commandHistory) prune(now time.Time) {
-	if len(h.taken) == 0 || !h.expired(h.oldest, now) {
+// size is the commands kept, sessionSize those of agent.
+func (h *commandHistory) size() int { return h.total }
+
+func (h *commandHistory) sessionSize(agent string) int {
+	if s := h.sessions[agent]; s != nil {
+		return s.n
+	}
+	return 0
+}
+
+// add keeps agent's command key, taken at now, and reports whether that made
+// room by forgetting agent's own oldest (its cap) or, for the first time
+// since the history last had room, another session's (the backstop).
+func (h *commandHistory) add(agent string, key commandKey, now time.Time) (ownCap, backstop bool) {
+	s := h.sessions[agent]
+	if s == nil {
+		s = &sessionCommands{agent: agent}
+		h.sessions[agent] = s
+		heap.Push(&h.largest, s)
+	}
+	h.pruneSession(s, now)
+	switch {
+	case s.n >= perSessionCommands:
+		ownCap = !s.full
+		s.full = true
+		h.forgetOldest(s)
+	case h.total >= maxCommands:
+		if h.stamp(now) != h.lastPrune {
+			h.prune(now)
+		}
+		if h.total >= maxCommands {
+			backstop = !h.full
+			h.full = true
+			h.forgetOldest(h.largest[0])
+		}
+	default:
+		h.full = false
+	}
+	if h.sessions[agent] == nil { // the backstop emptied it
+		h.sessions[agent] = s
+		heap.Push(&h.largest, s)
+	}
+	s.push(commandRecord{key: key, at: h.stamp(now)})
+	h.total++
+	heap.Fix(&h.largest, s.index)
+	return ownCap, backstop
+}
+
+// forgetOldest forgets s's oldest command, and s itself once it holds none.
+func (h *commandHistory) forgetOldest(s *sessionCommands) {
+	s.dropOldest()
+	h.total--
+	if s.n < perSessionCommands/2 {
+		s.full = false
+	}
+	if s.n == 0 {
+		heap.Remove(&h.largest, s.index)
+		delete(h.sessions, s.agent)
 		return
 	}
-	oldest := uint32(math.MaxUint32)
-	for key, at := range h.taken {
-		if h.expired(at, now) {
-			delete(h.taken, key)
-		} else {
-			oldest = min(oldest, at)
-		}
+	heap.Fix(&h.largest, s.index)
+}
+
+// pruneSession forgets s's commands kept the window: its oldest first, which
+// were taken first.
+func (h *commandHistory) pruneSession(s *sessionCommands, now time.Time) {
+	for s.n > 0 && h.sessions[s.agent] == s && h.expired(s.at(0).at, now) {
+		h.forgetOldest(s)
 	}
-	h.oldest = oldest
-	if len(h.taken) <= h.peak/4 {
-		taken := make(map[commandKey]uint32, len(h.taken))
-		maps.Copy(taken, h.taken)
-		h.taken, h.peak = taken, len(taken)
+}
+
+// prune forgets every command kept the window.
+func (h *commandHistory) prune(now time.Time) {
+	h.lastPrune = h.stamp(now)
+	for _, s := range h.sessions { // forgetOldest may delete s: allowed while ranging
+		h.pruneSession(s, now)
 	}
 }
 
@@ -345,12 +544,21 @@ const maxEnded = 64
 // it took it by its own clock, which is no earlier than when Envoy stored it.
 const replayWindow = 72 * time.Hour
 
-// maxCommands bounds the commands the roster keeps: twice one a second over
-// replayWindow, about 21 MiB of history at the bound (43 bytes a command,
-// TestTheCommandHistoryStaysCompact).
-// Past it the roster forgets none Envoy could still deliver again: it takes
-// no new command (ErrCommandsFull) until older ones expire.
-const maxCommands = 1 << 19
+// perSessionCommands bounds the commands the roster keeps for one sending
+// Envoy session: nearly one a minute for all of Envoy's 72 h window, where an
+// agent's joins, leaves and floor requests come a few an hour. A session past
+// it replaces its own oldest, which Envoy could then deliver again.
+const perSessionCommands = 4096
+
+// historySessions is how many sending sessions at their cap the history is
+// sized for; maxCommands, their product, bounds all the commands it keeps,
+// about 20 MiB at the bound (20 bytes a command,
+// TestTheCommandHistoryStaysCompact). Past it the roster replaces the oldest
+// of the session holding the most.
+const (
+	historySessions = 256
+	maxCommands     = perSessionCommands * historySessions
+)
 
 // notReadyWait is how long a command that comes while the roster has no
 // Envoy session waits for one before it is refused (ErrNotReady): the unit's
@@ -371,13 +579,6 @@ const notReadyWait = 2 * time.Second
 // MaxDeliver is -1), and notReadyWait spaces them at least 2 s whatever the
 // relay does.
 var ErrNotReady = errors.New("joined: the roster has no Envoy session to take the command with")
-
-// ErrCommandsFull is Deliver's answer to a new command while the roster
-// keeps maxCommands taken within Envoy's window. It forgets none Envoy could
-// still deliver again, so it does not take this one, and does not acknowledge
-// it: Envoy delivers it again, as for ErrNotReady, and it is taken once older
-// commands expire.
-var ErrCommandsFull = errors.New("joined: the roster keeps the most commands it holds; this one comes again once older ones expire")
 
 // historyLocked is agent's history, made at its first rate limit.
 func (r *Roster) historyLocked(agent string) *agentHistory {
@@ -469,7 +670,7 @@ func New(cfg *Config) *Roster {
 	return &Roster{
 		cfg: c, logf: logf, ctx: ctx, cancel: cancel,
 		members: map[string]*member{}, meetings: map[string]*meeting{}, history: map[string]*agentHistory{},
-		commands: commandHistory{base: c.Now(), taken: map[commandKey]uint32{}},
+		commands: newCommandHistory(c.Now()),
 	}
 }
 
@@ -614,29 +815,23 @@ func (r *Roster) Deliver(ctx context.Context, m *envoy.Message) (bool, error) {
 	}
 	// A command Envoy delivers again was taken: it acts once, whatever the
 	// agent's membership is now, for as long as Envoy can bring it back.
+	var ownCap, backstop bool
 	if m.EventID != "" {
 		key := commandKeyOf(m.SourceSession, m.EventID)
-		if _, taken := r.commands.taken[key]; taken {
+		if r.commands.has(m.SourceSession, key) {
 			r.mu.Unlock()
 			r.logf("joined: a %s message already taken was delivered again", c.verb)
 			return true, nil
 		}
-		if len(r.commands.taken) >= maxCommands {
-			r.commands.prune(now)
-		}
-		if len(r.commands.taken) >= maxCommands {
-			first := !r.commands.full
-			r.commands.full = true
-			r.mu.Unlock()
-			if first {
-				r.logf("joined: the roster keeps %d commands taken within Envoy's window; new commands come again once older ones expire", maxCommands)
-			}
-			return true, ErrCommandsFull
-		}
-		r.commands.full = false
-		r.commands.add(key, now)
+		ownCap, backstop = r.commands.add(m.SourceSession, key, now)
 	}
 	r.mu.Unlock()
+	if ownCap {
+		r.logf("joined: session %s sent %d commands within Envoy's window; each new one replaces its oldest, which Envoy could then deliver again", m.SourceSession, perSessionCommands)
+	}
+	if backstop {
+		r.logf("joined: the roster keeps %d commands from all sessions; each new one replaces the oldest of the session holding the most", maxCommands)
+	}
 	switch c.verb {
 	case verbJoin:
 		r.join(ctx, m, c.key)

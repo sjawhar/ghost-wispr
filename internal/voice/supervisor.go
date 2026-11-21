@@ -224,6 +224,10 @@ type Supervisor struct {
 	chimeHands    bool
 	chimeOwners   []*pendingAnswer
 	chimeDraining bool
+	// chimeCuts counts the Supervisor's cuts of the chime input
+	// (cancelChimeLocked): a sound begun before the latest has been cut, and
+	// one begun after is newer, which a cut on an older sound's behalf spares.
+	chimeCuts     uint64
 	pending       []*pendingAnswer
 	arrivals      uint64    // answers taken so far; each held answer's arrived
 	lit           bool      // the waiting light was last told On (showWaitingLocked)
@@ -472,9 +476,12 @@ func (s *Supervisor) errorLocked(sessionID string) {
 }
 
 // soundLocked plays pcm on the chime input at once, unless the Supervisor is
-// closed. A sound for a meeting (sessionID) is written under that meeting's
-// context (SupervisorConfig.Meeting), read at each frame, so none of it plays
-// once the recorder ended the meeting, wherever the sound had got to.
+// closed. A sound for a meeting (sessionID) is that meeting's until the
+// speaker has played its last frame: it is written and drained under the
+// meeting's context (SupervisorConfig.Meeting), read at each frame, so none
+// of it is written once the recorder ended the meeting, and its producer then
+// cuts what is still queued of it, unless a cut of the chime input since it
+// began already did, after which a sound on that input is a newer one.
 func (s *Supervisor) soundLocked(pcm []byte, event, sessionID string) {
 	if s.closed {
 		return
@@ -484,9 +491,21 @@ func (s *Supervisor) soundLocked(pcm []byte, event, sessionID string) {
 		meeting = s.cfg.Meeting(sessionID)
 	}
 	ctx := newSoundContext(s.ctx, meeting, nil)
+	cuts := s.chimeCuts
 	s.spawn(func() {
 		defer ctx.cancel()
-		_, _ = s.playChime(ctx, pcm, event, sessionID)
+		pb, err := s.playChime(ctx, pcm, event, sessionID)
+		if err == nil {
+			err = pb.Drain(ctx)
+		}
+		if err == nil || ctx.Err() == nil {
+			return // played out, or a cut of the chime input ended it
+		}
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		if !s.closed && s.chimeCuts == cuts {
+			s.cutChimeLocked(true)
+		}
 	})
 }
 
@@ -636,6 +655,13 @@ func (s *Supervisor) cutChimeLocked(rearm bool) {
 		}
 		s.chimeCancel, s.chimeCtx, s.chimeOwners, s.chimeDraining = nil, nil, nil, false
 	}
+	s.cancelChimeLocked()
+}
+
+// cancelChimeLocked cancels the chime input, every playback begun on it, and
+// counts the cut (chimeCuts).
+func (s *Supervisor) cancelChimeLocked() {
+	s.chimeCuts++
 	s.cfg.Speaker.Cancel(audio.InputChime)
 }
 
@@ -1764,7 +1790,7 @@ func (s *Supervisor) offer() {
 			if err != nil {
 				// Its own authority ended it (its meeting, or the membership of
 				// its last hand): what is still queued of it plays no further.
-				s.cfg.Speaker.Cancel(audio.InputChime)
+				s.cancelChimeLocked()
 			}
 		})
 		return

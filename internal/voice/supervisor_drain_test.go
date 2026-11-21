@@ -118,3 +118,85 @@ func TestAMeetingErrorSoundReadsItsMeeting(t *testing.T) {
 		})
 	}
 }
+
+// chimeGen is the fake speaker's generation of the chime input: a Cancel of
+// that input moves it on.
+func chimeGen(r *rig) int {
+	r.speaker.mu.Lock()
+	defer r.speaker.mu.Unlock()
+	return r.speaker.gen[audio.InputChime]
+}
+
+// TestAQueuedErrorSoundEndsWithItsMeeting fails if an error sound for a
+// meeting, every frame of it queued and still playing from the speaker, plays
+// on once the recorder ended that meeting: its producer keeps it until it has
+// played out and cuts what is still queued of it when the meeting ends. A
+// live meeting's error sound plays out: the control.
+func TestAQueuedErrorSoundEndsWithItsMeeting(t *testing.T) {
+	for _, ended := range []bool{false, true} {
+		t.Run(map[bool]string{false: "the meeting records on", true: "the recorder ended the meeting"}[ended], func(t *testing.T) {
+			meeting, end := context.WithCancel(context.Background())
+			defer end()
+			r := newRigWith(t, newFakeConcierge(), func(cfg *SupervisorConfig, _ *rig) {
+				cfg.Meeting = func(string) context.Context { return meeting }
+			})
+			r.speaker.holdDrain(audio.InputChime)
+			r.s.mu.Lock()
+			r.s.errorLocked("sess-1")
+			r.s.mu.Unlock()
+			eventually(t, "every frame of the error sound queued", func() bool {
+				return r.speaker.written(audio.InputChime) >= chimeFrames(ErrorChime())
+			})
+			gen := chimeGen(r)
+			cut := func() bool { return chimeGen(r) != gen }
+			if !ended {
+				never(t, "control: the live meeting's error sound was cut", 300*time.Millisecond, cut)
+				return
+			}
+			end()
+			eventually(t, "the queued error sound cut once the recorder ended its meeting", cut)
+		})
+	}
+}
+
+// TestAnErrorSoundsCutSparesANewerSound fails if an ended meeting's error
+// sound, whose playback a cut of the chime input already ended, cuts that
+// input again once its producer learns the meeting ended: a sound begun after
+// the first cut is a newer one, and plays on.
+func TestAnErrorSoundsCutSparesANewerSound(t *testing.T) {
+	old, endOld := context.WithCancel(context.Background())
+	defer endOld()
+	recording, endRecording := context.WithCancel(context.Background())
+	defer endRecording()
+	r := newRigWith(t, newFakeConcierge(), func(cfg *SupervisorConfig, _ *rig) {
+		cfg.Meeting = func(id string) context.Context {
+			if id == "sess-1" {
+				return old
+			}
+			return recording
+		}
+	})
+	r.speaker.holdDrain(audio.InputChime)
+	r.s.mu.Lock()
+	r.s.errorLocked("sess-1")
+	r.s.mu.Unlock()
+	eventually(t, "every frame of the old meeting's error sound queued", func() bool {
+		return r.speaker.written(audio.InputChime) >= chimeFrames(ErrorChime())
+	})
+	before := chimeGen(r)
+	// Under the Supervisor's lock, so the old sound's producer learns of none
+	// of it until all of it has happened: a cut ends the old sound's playback,
+	// the recorder ends its meeting, and a newer sound begins.
+	r.s.mu.Lock()
+	r.s.cutChimeLocked(true)
+	endOld()
+	r.s.errorLocked("sess-2")
+	r.s.mu.Unlock()
+	eventually(t, "every frame of the newer sound queued", func() bool {
+		return r.speaker.written(audio.InputChime) >= 2*chimeFrames(ErrorChime())
+	})
+	time.Sleep(300 * time.Millisecond)
+	if got := chimeGen(r); got != before+1 {
+		t.Fatalf("the chime input was cut %d times, want once: the old meeting's error sound cut the newer sound", got-before)
+	}
+}

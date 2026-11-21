@@ -29,9 +29,10 @@ func mib(b uint64) float64 { return float64(b) / (1 << 20) }
 
 // TestTheCommandHistoryStaysCompact fails if one command a second over
 // Envoy's 72 h window (259,200 commands from 256 agents) holds more than
-// 12 MiB, if the history grows past its bound, if a command past the bound is
-// taken rather than refused with a retryable error, if a command already
-// taken is no longer recognised at the bound, or if the memory stays held once
+// 12 MiB, if the history at its bound (every one of the 256 at its cap) holds
+// more than 24 MiB, if a command past the bound is refused rather than taken
+// in place of its own session's oldest, if the history then grows past its
+// bound or forgets a command it should keep, or if the memory stays held once
 // every command has expired.
 func TestTheCommandHistoryStaysCompact(t *testing.T) {
 	r := newRig(t, func(cfg *Config) { cfg.Logf = func(string, ...any) {} })
@@ -61,7 +62,8 @@ func TestTheCommandHistoryStaysCompact(t *testing.T) {
 		t.Fatalf("the history of %d commands holds %.1f MiB, want at most 12 MiB", perSecond, mib(atRate))
 	}
 	// The rest of the bound, in the per-second run's last second, so every
-	// command is still within Envoy's window.
+	// command is still within Envoy's window: each of the 256 agents reaches
+	// its cap.
 	last := start.Add((perSecond - 1) * time.Second)
 	for i := perSecond; i < maxCommands; i++ {
 		if err := deliver(i, last); err != nil {
@@ -73,11 +75,23 @@ func TestTheCommandHistoryStaysCompact(t *testing.T) {
 	if atBound > 24<<20 {
 		t.Fatalf("the history at its bound of %d commands holds %.1f MiB, want at most 24 MiB", maxCommands, mib(atBound))
 	}
-	if err := deliver(maxCommands, last); !errors.Is(err, ErrCommandsFull) {
-		t.Fatalf("a command past the bound returned %v, want ErrCommandsFull so that Envoy delivers it again", err)
+	if err := deliver(maxCommands, last); err != nil {
+		t.Fatalf("a command past the bound returned %v, want it taken in place of its session's oldest", err)
 	}
-	if err := deliver(0, last); err != nil {
-		t.Fatalf("control: a command already taken, delivered again at the bound, returned %v, want it recognised", err)
+	key := func(i int) commandKey {
+		return commandKeyOf(fmt.Sprintf("agent-%03d", i%256), fmt.Sprintf("00000000-0000-4000-8000-%012d", i))
+	}
+	r.roster.mu.Lock()
+	size, newest, second, first := r.roster.commands.size(), r.roster.commands.has("agent-000", key(maxCommands)),
+		r.roster.commands.has("agent-000", key(256)), r.roster.commands.has("agent-000", key(0))
+	r.roster.mu.Unlock()
+	switch {
+	case size != maxCommands:
+		t.Fatalf("past its bound the history holds %d commands, want %d", size, maxCommands)
+	case !newest || !second:
+		t.Fatalf("past its bound the history forgot a command it should keep: the newest kept %v, agent-000's second kept %v", newest, second)
+	case first:
+		t.Fatal("past its bound the history kept agent-000's oldest command, in place of which it took the newest")
 	}
 	r.clock.set(last.Add(replayWindow))
 	r.roster.Sweep(ctx)
@@ -89,8 +103,8 @@ func TestTheCommandHistoryStaysCompact(t *testing.T) {
 	if after > 1<<20 {
 		t.Fatalf("once every command expired the history still holds %.1f MiB", mib(after))
 	}
-	if err := deliver(maxCommands, r.clock.Now()); err != nil {
-		t.Fatalf("control: the command refused at the bound was refused again once the bound had room: %v", err)
+	if err := deliver(maxCommands+1, r.clock.Now()); err != nil {
+		t.Fatalf("control: a command once every one expired was refused: %v", err)
 	}
 }
 

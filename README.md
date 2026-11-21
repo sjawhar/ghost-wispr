@@ -440,8 +440,10 @@ check that a person invited it, since any agent on the tailnet can already ask t
 read the API, a pointer holds no words, and a hand speaks only on a person's "go ahead". A command
 Envoy delivers again acts only once, for as long as Envoy can deliver it again (its stream keeps a
 message 72 hours), and a floor request or a leave sent before the agent's latest join is not
-taken. The unit keeps at most 524,288 commands of those 72 hours (twice one a second, about
-21 MiB); past that it takes no new command, and Envoy delivers it again once older ones expire. A
+taken. The unit keeps at most 4,096 commands of those 72 hours from one sending session, and
+1,048,576 from all of them (about 20 MiB): a session past its share replaces its own oldest, which
+Envoy could then deliver again, and past the total the session holding the most does. No command
+is refused, so one session's flood cannot hold off another agent's. A
 command that comes before the unit's Envoy session is ready waits up to 2 s for it, then is not
 acknowledged, so Envoy delivers it again.
 
