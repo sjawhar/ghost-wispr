@@ -323,12 +323,15 @@ func (m *Mic) SampleRate() int {
 	return m.sampleRate
 }
 
-// Each PortAudio call openInputStream makes for a named device; tests replace
-// them.
+// Each PortAudio call openInputStream makes; tests replace them, so no test
+// opens a real input device.
 var (
 	paInputDevices = portaudio.Devices
 	paOpenInput    = func(params portaudio.StreamParameters, window *[]int16) (inputStream, error) {
 		return portaudio.OpenStream(params, window)
+	}
+	paOpenDefaultInput = func(sampleRate, framesPerBuffer int, window *[]int16) (inputStream, error) {
+		return portaudio.OpenDefaultStream(1, 0, float64(sampleRate), framesPerBuffer, window)
 	}
 )
 
@@ -340,7 +343,7 @@ func openInputStream(device string, sampleRate, framesPerBuffer int, window *[]i
 	if device != "" {
 		return openNamedInput(device, sampleRate, framesPerBuffer, window)
 	}
-	stream, err := portaudio.OpenDefaultStream(1, 0, float64(sampleRate), framesPerBuffer, window)
+	stream, err := paOpenDefaultInput(sampleRate, framesPerBuffer, window)
 	if err == nil {
 		return stream, nil
 	}

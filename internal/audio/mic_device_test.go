@@ -76,8 +76,14 @@ func TestCaptureDevicePresentLooksOnlyAtTheNamedCard(t *testing.T) {
 // 5). It also fails if the named card's input is not the one opened, through
 // PortAudio's device for its ALSA card and device numbers.
 func TestANamedMicrophoneOpensOnlyThatCardsInput(t *testing.T) {
-	originalDevices, originalOpen := paInputDevices, paOpenInput
-	t.Cleanup(func() { paInputDevices, paOpenInput = originalDevices, originalOpen })
+	originalDevices, originalOpen, originalDefault := paInputDevices, paOpenInput, paOpenDefaultInput
+	t.Cleanup(func() { paInputDevices, paOpenInput, paOpenDefaultInput = originalDevices, originalOpen, originalDefault })
+	// No case may reach a real input device: the default input is a stub too.
+	defaultOpened := 0
+	paOpenDefaultInput = func(int, int, *[]int16) (inputStream, error) {
+		defaultOpened++
+		return newHeldStream(), nil
+	}
 	// PortAudio's ALSA names with the plug layer (UsePlugCapture):
 	// "<card name>: <device name> (plughw:<card>,<device>)".
 	loopback := &portaudio.DeviceInfo{Name: "Loopback: PCM (plughw:3,0)", MaxInputChannels: 32}
@@ -116,12 +122,15 @@ func TestANamedMicrophoneOpensOnlyThatCardsInput(t *testing.T) {
 		})
 	}
 
-	// Unset, the default input opens as before; here PortAudio is not
-	// initialized, so it fails without reaching the named-device path.
+	if defaultOpened != 0 {
+		t.Fatalf("mic_device Jabra opened the default input %d times", defaultOpened)
+	}
+
+	// Unset, the default input opens as before, and not the named-device path.
 	paOpenInput = func(portaudio.StreamParameters, *[]int16) (inputStream, error) {
 		return nil, errors.New("the named-device path ran for an unset mic_device")
 	}
-	if _, err := openInputStream("", 16000, 4000, new([]int16)); err != nil && strings.Contains(err.Error(), "named-device path") {
-		t.Fatal(err)
+	if stream, err := openInputStream("", 16000, 4000, new([]int16)); err != nil || stream == nil || defaultOpened != 1 {
+		t.Fatalf("unset mic_device = %v, %v, the default input opened %d times; want it opened once", stream, err, defaultOpened)
 	}
 }
