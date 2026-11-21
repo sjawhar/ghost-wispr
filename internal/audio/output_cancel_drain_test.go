@@ -3,6 +3,7 @@ package audio
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -283,6 +284,57 @@ func TestDrainWaitsForTheResamplersTail(t *testing.T) {
 	}
 }
 
+// TestDrainWaitsForItsTailWhenAnotherPlaybackFollows fails if Drain returns
+// while the frame that holds its resampler's tail is not yet taken by the
+// stream, when a later playback on the same input queued audio that shares
+// that frame: the frame was counted for the later playback only (Sol's review
+// of #142 at ef951b3). The later playback is silence, so every audio sample
+// of the held frame is the first's tail. The control has no later playback.
+func TestDrainWaitsForItsTailWhenAnotherPlaybackFollows(t *testing.T) {
+	for _, next := range []bool{false, true} {
+		t.Run(fmt.Sprintf("a later playback queued %v", next), func(t *testing.T) {
+			stream := &probeStream{fakeStream: newFakeStream(48000)}
+			out, start, _ := probeOutput(t, stream)
+			barrier := newProbeBarrier()
+			t.Cleanup(barrier.unblock)
+			ctx := testContext(t)
+			format := AudioFormat{SampleRate: 24000, Channels: 1, Encoding: EncodingPCM16}
+			first := out.Begin(InputVoice)
+			if err := first.WriteAll(ctx, constant(24000, 10*time.Millisecond, 10000), format); err != nil {
+				t.Fatal(err)
+			}
+			if next {
+				if err := out.Begin(InputVoice).WriteAll(ctx, constant(24000, 10*time.Millisecond, 0), format); err != nil {
+					t.Fatal(err)
+				}
+			}
+			tail := make(chan int, 1)
+			stream.before = func(n int, frame []int16) {
+				if n == 2 {
+					tail <- probeNonzero(frame)
+					barrier.hold()
+				}
+			}
+			start()
+			probeWait(t, barrier.entered, "the second write, which holds the first playback's tail")
+			samples := <-tail
+			if samples == 0 {
+				t.Fatal("fixture: the held second write holds none of the first playback's audio")
+			}
+			stopped, cancel := context.WithCancel(context.Background())
+			cancel()
+			whileHeld := first.Drain(stopped)
+			barrier.unblock()
+			if err := first.Drain(ctx); err != nil {
+				t.Fatalf("Drain once the tail was taken = %v", err)
+			}
+			if !errors.Is(whileHeld, context.Canceled) {
+				t.Fatalf("Drain returned %v while %d samples of its tail waited in the held write; want context.Canceled while it waits", whileHeld, samples)
+			}
+		})
+	}
+}
+
 // TestATakeBackCountsOnlyTheSpeechsAudio fails if a Cancel's take-back
 // subtracts silence from what a speech played: on main it took the whole span
 // from the speech's first audio to its last as audio, gaps included. The
@@ -338,7 +390,7 @@ func TestATakeBackCountsOnlyTheSpeechsAudio(t *testing.T) {
 					return 0, nil
 				}
 				const back = 3 * 480
-				all := stream.fakeStream.samples()
+				all := stream.samples()
 				if len(all) < back {
 					dropped <- dropResult{droppedFrames: back, survivingAudio: -1}
 					return 0, nil

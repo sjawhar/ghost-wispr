@@ -598,8 +598,10 @@ func (in *outputInput) push(p *Playback, pcm []byte, channels, frames int) {
 }
 
 // pull takes the next queued sample for the stream, counted as played for
-// its playback, or silence to flush the resampler once none is queued.
-func (in *outputInput) pull() float32 {
+// its playback, or silence to flush the resampler once none is queued. seq is
+// the frame in which the sample reaches the stream, after the resampler's
+// delay: a Drain of its playback waits for that frame.
+func (in *outputInput) pull(seq uint64) float32 {
 	if in.n == 0 {
 		in.flush = max(0, in.flush-1)
 		return 0
@@ -611,7 +613,7 @@ func (in *outputInput) pull() float32 {
 	seg := &in.segments[0]
 	seg.pb.pending--
 	seg.pb.played.add(in.rate, 1)
-	seg.pb.seq = in.seq
+	seg.pb.seq = max(seg.pb.seq, seq)
 	in.spoken.add(in.rate, 1)
 	in.last = seg.pb
 	if seg.n--; seg.n == 0 {
@@ -626,7 +628,10 @@ func (in *outputInput) pull() float32 {
 
 // render fills the input's part of the next frame at the stream's rate, and
 // reports where in the frame its queued audio ends: the index past its last
-// sample that came from the queue, or -1 if none did.
+// sample that came from the queue, or -1 if none did. Each sample it takes
+// is marked for the frame its output reaches, which for a resampled sample
+// can be the next one: a playback's resampler tail is its own, also when the
+// next playback's audio shares that frame.
 func (in *outputInput) render(rate int) (audioEnd int) {
 	if in.rs.from != in.rate || in.rs.to != rate {
 		in.rs.configure(in.rate, rate)
@@ -637,7 +642,7 @@ func (in *outputInput) render(rate int) (audioEnd int) {
 			if in.n > 0 {
 				audioEnd = i + 1
 			}
-			in.contrib[i] = in.pull()
+			in.contrib[i] = in.pull(in.seq)
 		}
 		return audioEnd
 	}
@@ -648,7 +653,7 @@ func (in *outputInput) render(rate int) (audioEnd int) {
 			if in.n > 0 {
 				audioEnd = i + 1 + lag
 			}
-			in.rs.push(in.pull())
+			in.rs.push(in.pull(in.seq + uint64((i+lag)/len(in.contrib))))
 		}
 	}
 	if in.idle() {
@@ -995,12 +1000,6 @@ func (o *Output) mixFrame(frame []int16, sum []float32, rate, hist int, now time
 			} else if in.audioTo > o.pos {
 				// The resampler's tail of the audio queued last frame.
 				held = int(in.audioTo - o.pos)
-			}
-			if in.audioTo > o.pos && in.last != nil {
-				// The frame holds audio of the playback taken last: a
-				// Drain of it waits for this frame, the resampler's tail
-				// included.
-				in.last.seq = max(in.last.seq, o.mixed)
 			}
 			in.lastAudio, in.quietAt = now, time.Time{}
 			active = true
