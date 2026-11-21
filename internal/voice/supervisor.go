@@ -1162,9 +1162,7 @@ func (s *Supervisor) readEvents(ex *exchange, sess Session) {
 				s.timing("fact_audio", ex.x.SessionID, time.Now())
 			}
 		case EventSpeechEnded:
-			if ex.drives && !ex.spokeAt.IsZero() && !ex.ended {
-				s.noteLocked(ex, EventSpoken, ex.x.SessionID)
-			}
+			// voice_spoken comes from the speaker (driverSpeechLocked).
 			s.touchLocked(ex)
 		case EventErr:
 			s.logf("voice: %v", e.Err)
@@ -1211,7 +1209,6 @@ func (s *Supervisor) idleWaited(ex *exchange) {
 		return
 	}
 	unspoken := ex.unspokenAnswer
-	s.spokenAtQuietEndLocked(ex)
 	s.endLocked(ex, false, "idle")
 	if unspoken {
 		// The voice got an answer to speak and never began it: the room
@@ -1222,9 +1219,14 @@ func (s *Supervisor) idleWaited(ex *exchange) {
 }
 
 // driverSpeechLocked follows the speech of ex's voice, which drives its own
-// turn: the room's next words are a new turn, and once its speech ends by
-// itself, the follow-up window opens (R10).
-func (s *Supervisor) driverSpeechLocked(ex *exchange, started bool) {
+// turn, as the speaker reports it: the room's next words are a new turn, and
+// once its speech ends by itself, it was spoken (EventSpoken, once for the
+// exchange) and the follow-up window opens (R10). A speech a barge-in or a
+// cancel cut was not spoken. voice_spoken comes from the speaker, not from
+// the voice's own report that its speech ended, which can trail it: every
+// end of an exchange that follows a speech, quiet or not, comes after the
+// speaker's report, since each waits for the voice to be silent or cuts it.
+func (s *Supervisor) driverSpeechLocked(ex *exchange, started, cancelled bool) {
 	s.disarmFollowUpLocked(ex)
 	ex.newTurn = true
 	if started {
@@ -1236,6 +1238,9 @@ func (s *Supervisor) driverSpeechLocked(ex *exchange, started bool) {
 	if ex.cutSpeech { // a barge-in: the person speaks now
 		ex.cutSpeech = false
 		return
+	}
+	if !cancelled {
+		s.noteLocked(ex, EventSpoken, ex.x.SessionID)
 	}
 	gen := ex.followUpGen
 	ex.followUpTimer = time.AfterFunc(s.cfg.FollowUpWait, func() { s.driverFollowUpWaited(ex, gen) })
@@ -1257,20 +1262,7 @@ func (s *Supervisor) driverFollowUpWaited(ex *exchange, gen int) {
 	if s.ex != ex || ex.ended || ex.followUpGen != gen || s.voiceSpeaking || ex.toolCalls > 0 {
 		return
 	}
-	s.spokenAtQuietEndLocked(ex)
 	s.endLocked(ex, false, "no follow-up")
-}
-
-// spokenAtQuietEndLocked reports that ex's voice, which drives its own turn,
-// spoke (EventSpoken, once for the exchange) as ex ends with nobody and
-// nothing speaking, if it spoke. The speaker has played the speech then, but
-// the voice's own report that it ended (EventSpeechEnded, which readEvents
-// reports spoken on) can trail the speaker's, and the end closes the session,
-// which drops that report.
-func (s *Supervisor) spokenAtQuietEndLocked(ex *exchange) {
-	if ex.drives && !ex.spokeAt.IsZero() {
-		s.noteLocked(ex, EventSpoken, ex.x.SessionID)
-	}
 }
 
 // turnLocked adds words of the asker's turn, and hands the turn to the
@@ -1996,7 +1988,7 @@ func (s *Supervisor) onSpeech(e audio.SpeechEvent) {
 	}
 	s.touchLocked(ex)
 	if ex.drives {
-		s.driverSpeechLocked(ex, e.Started)
+		s.driverSpeechLocked(ex, e.Started, e.Cancelled)
 	}
 	if !e.Started {
 		return

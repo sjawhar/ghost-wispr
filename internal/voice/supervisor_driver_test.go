@@ -199,42 +199,6 @@ func TestAnIdleDriverExchangeEnds(t *testing.T) {
 	r.waitEvent("voice_spoken:sess-1")
 }
 
-// TestADriverExchangeThatEndsAsItsSpeechEndsReportsItSpoken fails if an
-// exchange whose voice drives its own turn, and whose speech the speaker has
-// played, ends with nobody speaking (its follow-up window, or IdleWait)
-// before the voice reports the speech ended, and so never sends
-// voice_spoken: the end closes the session, which drops the voice's late
-// report. The voice's report trailed the speaker's by a few milliseconds in
-// CI (TestAnIdleDriverExchangeEnds failed 2 runs in 30 on main); here it
-// trails by more than either wait, so the end always comes first.
-func TestADriverExchangeThatEndsAsItsSpeechEndsReportsItSpoken(t *testing.T) {
-	for _, tc := range []struct {
-		name             string
-		idle, followUpTo time.Duration
-	}{
-		{"its follow-up window ends it", 300 * time.Millisecond, 200 * time.Millisecond},
-		{"IdleWait ends it", 300 * time.Millisecond, time.Minute},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			r := newRigWith(t, newFakeConcierge(), func(cfg *SupervisorConfig, r *rig) {
-				v := drivingVoice{r.voice}
-				cfg.Voice = func() (Voice, error) { return v, nil }
-				cfg.IdleWait, cfg.FollowUpWait = tc.idle, tc.followUpTo
-			})
-			r.heard("Wispr, what is happening?", true, true)
-			sess := r.waitSession()
-			sess.mu.Lock()
-			sess.endLate = 500 * time.Millisecond
-			sess.mu.Unlock()
-			speakAs(t, sess, "The issue is in review since this morning.")
-			r.waitSpeaking()
-			r.speaker.finish(audio.InputVoice)
-			eventually(t, "the exchange ended", func() bool { _, _, closed := sess.state(); return closed })
-			r.waitEvent("voice_spoken:sess-1")
-		})
-	}
-}
-
 // TestADriverExchangeEndsAFollowUpWaitAfterItsSpeech fails if an exchange
 // with a voice that drives its own turn stays open longer than FollowUpWait
 // after the voice's last word when nobody speaks (R10): the room's side talk
