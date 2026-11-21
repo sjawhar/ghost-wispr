@@ -2956,6 +2956,10 @@ expect_not_passed() {
   esac
   expect_no_line "$1" "PASS: playback-cancel: no stop's speech was heard"
 }
+# cancel-behind guards the buffer in the residency only where the anchors' bound timed it: a loaded
+# machine that holds the fake 11 ms past its 50 ms makes it overrun, and the case reads the
+# start-only bounds, which no residency moves. floor_decided says so in the run's output.
+floor_decided cancel-behind || true
 expect_rc cancel-behind 2
 expect_line cancel-behind "UNKNOWN: playback-cancel: stop "
 expect_line cancel-behind ", but no earlier than "
