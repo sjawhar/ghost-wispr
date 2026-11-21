@@ -1051,7 +1051,7 @@ func (c *exchangeContext) Err() error {
 func (s *Supervisor) open(ex *exchange, voice Voice, x *Exchange, chime bool) {
 	if chime {
 		sessionID := x.SessionID
-		s.spawn(func() { s.playChime(ex.ctx, WakeChime(), "wake_chime_queued", sessionID) })
+		s.spawn(func() { _, _ = s.playChime(ex.ctx, WakeChime(), "wake_chime_queued", sessionID) })
 	}
 	sess, err := voice.Open(ex.ctx, x)
 	s.mu.Lock()
