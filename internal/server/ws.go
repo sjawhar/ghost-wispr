@@ -28,6 +28,12 @@ func registerWSRoute(mux *http.ServeMux, hub *Hub, logger *slog.Logger) {
 		}
 		defer func() { _ = conn.Close() }()
 
+		// The socket hears the hub's events before it says it is connected:
+		// the page reads its joined agents and questions again on that frame,
+		// and an event published after that read must reach it.
+		ch := hub.Subscribe()
+		defer hub.Unsubscribe(ch)
+
 		connectionEvent := ConnectionEvent{
 			Event:     newEvent("connection", time.Now().UTC()),
 			Connected: true,
@@ -36,9 +42,6 @@ func registerWSRoute(mux *http.ServeMux, hub *Hub, logger *slog.Logger) {
 		if err == nil {
 			_ = conn.WriteMessage(websocket.TextMessage, payload)
 		}
-
-		ch := hub.Subscribe()
-		defer hub.Unsubscribe(ch)
 
 		for _, statusEvent := range hub.SnapshotComponentStatuses() {
 			payload, err := json.Marshal(statusEvent)

@@ -111,6 +111,17 @@ export function setConnected(connected: boolean): void {
         { ...held, seq: undefined },
       ]),
     )
+    // A join, a leave or an answer sent while this page was not connected
+    // never reached it: every session whose agents or questions this tab
+    // read reads them again. The socket's open and the server's connection
+    // frame, which it sends once it hears the unit's events, both come here,
+    // and only the later read is shown.
+    for (const sessionID of joinedAgentReads.keys()) {
+      void loadJoinedAgents(sessionID)
+    }
+    for (const sessionID of voiceTaskReads.keys()) {
+      void loadVoiceTasks(sessionID)
+    }
   }
 }
 
