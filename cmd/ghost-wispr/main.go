@@ -10,6 +10,7 @@ import (
 	"io/fs"
 	"log"
 	"log/slog"
+	"math"
 	"net/http"
 	"os"
 	"os/signal"
@@ -482,6 +483,10 @@ type transcriptCallback struct {
 	// join or a leave changes them on the open socket. nil sends tOptions'
 	// own.
 	keyterms *transcript.LiveKeyterms
+	// heardAt times a word for the voice: when the audio at a point of the
+	// live stream was captured (transcribe.ResilientClient.CapturedAt). nil,
+	// or a point it cannot time, leaves the word untimed.
+	heardAt func(at time.Duration) (time.Time, bool)
 }
 
 // voiceListener is the voice as the transcript reader feeds it: the
@@ -522,7 +527,7 @@ func (c transcriptCallback) Message(mr *api.MessageResponse) error {
 		err = manager.Message(mr)
 	}
 	if c.voice != nil && kept != nil {
-		if t := voiceTranscript(kept, func() (int, bool) { return closings, open }); t != nil {
+		if t := voiceTranscript(kept, func() (int, bool) { return closings, open }, c.heardAt); t != nil {
 			c.voice.OnTranscript(t)
 		}
 	}
@@ -530,7 +535,9 @@ func (c transcriptCallback) Message(mr *api.MessageResponse) error {
 }
 
 // voiceTranscript is mr as the voice reads it, or nil when it holds no text.
-func voiceTranscript(mr *api.MessageResponse, stamp func() (int, bool)) *voice.Transcript {
+// heardAt, when set, times each word by when its start was captured, which
+// the voice's barge-in reads: a result can come seconds after its words.
+func voiceTranscript(mr *api.MessageResponse, stamp func() (int, bool), heardAt func(time.Duration) (time.Time, bool)) *voice.Transcript {
 	if len(mr.Channel.Alternatives) == 0 || strings.TrimSpace(mr.Channel.Alternatives[0].Transcript) == "" {
 		return nil
 	}
@@ -556,7 +563,15 @@ func voiceTranscript(mr *api.MessageResponse, stamp func() (int, bool)) *voice.T
 		if text == "" {
 			text = w.Word
 		}
-		t.Words = append(t.Words, voice.Word{Text: text, Speaker: speaker, Start: w.Start, End: w.End})
+		word := voice.Word{Text: text, Speaker: speaker, Start: w.Start, End: w.End}
+		if heardAt != nil {
+			// Rounded, not truncated: 1.001 s is 1.000999999… in binary, and
+			// truncated would place the word a sample early.
+			if at, ok := heardAt(time.Duration(math.Round(w.Start * float64(time.Second)))); ok {
+				word.At = at
+			}
+		}
+		t.Words = append(t.Words, word)
 	}
 	return t
 }
@@ -650,8 +665,37 @@ func startMicMonitoring(ctx context.Context, loops *sync.WaitGroup, capture *cap
 	if tap != nil {
 		writer = tappedWriter{dst: writer, tap: tap}
 	}
+	if sender != nil {
+		writer = readTimedWriter{dst: writer, sender: sender}
+	}
 	streamMicLoopStarter(ctx, loops, capture, streamer, writer, wait, logf, hub)
 	return sender
+}
+
+// readMarker is a writer behind the capture gate that takes the time the
+// microphone read each buffer: the gate marks it as the buffer comes, before
+// it reads the light back, which can hold the buffer for a while.
+type readMarker interface {
+	markRead(at time.Time)
+}
+
+// readTimedWriter writes each buffer to dst, and gives the live
+// transcription's send queue the time the microphone read it, by which the
+// voice times each word (transcribe.ResilientClient.CapturedAt).
+type readTimedWriter struct {
+	dst    io.Writer
+	sender *transcribe.AsyncSender
+}
+
+func (w readTimedWriter) markRead(at time.Time) { w.sender.MarkRead(at) }
+
+func (w readTimedWriter) Write(p []byte) (int, error) { return w.dst.Write(p) }
+
+func (w readTimedWriter) WriteWithGateStamp(p []byte, gate *captureGate, closings int) (int, error) {
+	if stamped, ok := w.dst.(gateStampedWriter); ok {
+		return stamped.WriteWithGateStamp(p, gate, closings)
+	}
+	return w.dst.Write(p)
 }
 
 // tappedWriter writes each buffer to dst, then to tap, and reports dst's

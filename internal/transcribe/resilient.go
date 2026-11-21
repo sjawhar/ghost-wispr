@@ -3,6 +3,7 @@ package transcribe
 import (
 	"context"
 	"slices"
+	"sort"
 	"sync/atomic"
 	"time"
 )
@@ -59,6 +60,8 @@ func NewResilientClient(
 }
 
 // Write always returns (len(p), nil) — error absorption is the whole point.
+// Its audio is the latest captured, so its time marks the stream's clock
+// (CapturedAt).
 func (rc *ResilientClient) Write(p []byte) (int, error) {
 	return rc.write(p, nil)
 }
@@ -67,6 +70,7 @@ func (rc *ResilientClient) Write(p []byte) (int, error) {
 // holds, and takes it out of queued, the queue's count, as it counts it, under
 // the same lock: Captured and CapturedSince then count the chunk once, never
 // twice while a socket write stalls, and never not at all (sendQueueWatcher).
+// The queue marked when p was captured as it took it (captured).
 func (rc *ResilientClient) writeFromQueue(p []byte, queued *atomic.Int64) (int, error) {
 	return rc.write(p, queued)
 }
@@ -80,6 +84,8 @@ func (rc *ResilientClient) write(p []byte, queued *atomic.Int64) (int, error) {
 	rc.accepted += int64(len(p))
 	if queued != nil {
 		queued.Add(-int64(len(p)))
+	} else {
+		rc.markCapturedLocked(time.Now(), int64(len(p)))
 	}
 	client := rc.Client
 	if rc.State != StateConnected || client == nil {
@@ -87,7 +93,7 @@ func (rc *ResilientClient) write(p []byte, queued *atomic.Int64) (int, error) {
 		// reconnect in between would start its socket's stream len(p) too
 		// late (CapturedSince), and a drain that ended in between would
 		// leave p in the buffer, behind the audio sent after it.
-		if _, writeErr := rc.Buffer.Write(p); writeErr != nil {
+		if writeErr := rc.bufferLocked(p); writeErr != nil {
 			rc.log("failed to buffer audio while disconnected: %v", writeErr)
 		}
 		rc.Mu.Unlock()
@@ -100,7 +106,7 @@ func (rc *ResilientClient) write(p []byte, queued *atomic.Int64) (int, error) {
 	}
 
 	rc.Mu.Lock()
-	if _, writeErr := rc.Buffer.Write(p); writeErr != nil {
+	if writeErr := rc.bufferLocked(p); writeErr != nil {
 		rc.log("failed to buffer audio after write error: %v", writeErr)
 	}
 	rc.setStateLocked(StateDisconnected)
@@ -303,6 +309,7 @@ func (rc *ResilientClient) reconnect(wait time.Duration) {
 		// The new socket's stream starts at the oldest buffered byte.
 		rc.origin = rc.accepted - int64(rc.Buffer.Len())
 		rc.keepDropsAfterLocked(rc.origin)
+		rc.holes = rc.holes[:0]
 		rc.setStateLocked(StateDraining)
 		rc.Mu.Unlock()
 
@@ -379,20 +386,16 @@ func (rc *ResilientClient) IsConnected() bool {
 // the audio sent to that socket since, the audio buffered for it or for the
 // next, the audio queued in front of the client (AsyncSender), and the audio
 // that queue dropped after that point, which never reached the socket.
-// Audio Finalize drops from the buffer is taken out of the stream, as it
-// never reaches the socket.
+// Audio the stream skips, as Finalize or a full buffer dropped it unsent
+// (holes), lies after the points before it and before the points after it.
 func (rc *ResilientClient) CapturedSince(at time.Duration) time.Duration {
 	rc.Mu.Lock()
-	point := rc.origin + rc.streamBytes(at)
+	point := rc.pointLocked(at)
 	since := rc.accepted - point
 	if rc.queuedAhead != nil {
 		since += rc.queuedAhead()
 	}
-	for _, drop := range rc.drops {
-		if drop.at > point {
-			since += drop.n
-		}
-	}
+	since += rc.droppedLocked() - rc.droppedUpToLocked(point)
 	rc.Mu.Unlock()
 	if since <= 0 {
 		return 0
@@ -406,15 +409,19 @@ func (rc *ResilientClient) CapturedSince(at time.Duration) time.Duration {
 // the same count, which no reconnect, Finalize or drop moves.
 func (rc *ResilientClient) Captured() time.Duration {
 	rc.Mu.Lock()
+	total := rc.capturedLocked()
+	rc.Mu.Unlock()
+	return rc.streamDuration(total)
+}
+
+// capturedLocked is Captured in bytes. It must be called with Mu held.
+func (rc *ResilientClient) capturedLocked() int64 {
 	total := rc.accepted + rc.forgottenDrops
 	if rc.queuedAhead != nil {
 		total += rc.queuedAhead()
 	}
-	for _, drop := range rc.drops {
-		total += drop.n
-	}
-	rc.Mu.Unlock()
-	return rc.streamDuration(total)
+	total += rc.droppedLocked()
+	return total
 }
 
 // CapturedBefore returns how much audio had been captured before the point
@@ -423,27 +430,140 @@ func (rc *ResilientClient) Captured() time.Duration {
 // the send queue dropped before it.
 func (rc *ResilientClient) CapturedBefore(at time.Duration) time.Duration {
 	rc.Mu.Lock()
-	point := rc.origin + rc.streamBytes(at)
-	before := point + rc.forgottenDrops
-	for _, drop := range rc.drops {
-		if drop.at <= point {
-			before += drop.n
-		}
-	}
+	before := rc.capturedBeforeLocked(at)
 	rc.Mu.Unlock()
 	return rc.streamDuration(max(before, 0))
 }
 
-// streamDrop is audio a send queue in front of the client dropped: n bytes
-// that would have come at, in the count of the bytes Write takes.
-type streamDrop struct{ at, n int64 }
+// capturedBeforeLocked is CapturedBefore in bytes. It must be called with Mu
+// held.
+func (rc *ResilientClient) capturedBeforeLocked(at time.Duration) int64 {
+	point := rc.pointLocked(at)
+	before := point + rc.forgottenDrops + rc.droppedUpToLocked(point)
+	return before
+}
 
-// maxStreamDrops bounds the drops the client remembers: past it, the oldest
-// two merge into one at the later place, which counts the earlier one's
-// bytes after a few more words than it should. That only lengthens a
-// recording's lead, and can only place a word between them earlier than it
-// was captured.
-const maxStreamDrops = 1024
+// CapturedAt returns when the audio at the point at into the current
+// socket's stream was captured, on the system clock: the time of the buffer
+// that holds it, less the audio of that buffer after the point. Each Write,
+// and each chunk the send queue in front of the client takes or drops, is
+// stamped with when the microphone read it (AsyncSender.MarkRead), else when
+// it came, on the count Captured gives. So a capture pause, which leaves a
+// gap in time but none in the count, moves no word, nor does a check that
+// held a buffer back after the microphone read it, nor when the time is
+// asked, as when Deepgram's result for the point comes late. It reports false
+// for a point no stamp holds: before the oldest kept (captureStamps), or
+// after the latest.
+func (rc *ResilientClient) CapturedAt(at time.Duration) (time.Time, bool) {
+	rc.Mu.Lock()
+	defer rc.Mu.Unlock()
+	point := rc.capturedBeforeLocked(at)
+	oldest := (rc.stampNext - rc.stampsN + captureStamps) % captureStamps
+	stamp := func(i int) captureStamp { return rc.stamps[(oldest+i)%captureStamps] }
+	// The stamps hold consecutive spans of the count, oldest first: the first
+	// that ends after the point holds it, if any does.
+	i := sort.Search(rc.stampsN, func(i int) bool { return stamp(i).to > point })
+	if i == rc.stampsN || stamp(i).from > point {
+		return time.Time{}, false
+	}
+	s := stamp(i)
+	return s.at.Add(-rc.streamDuration(s.to - point)), true
+}
+
+// captureStamps is how many buffers CapturedAt can time: about 8.5 minutes
+// of the microphone's 250 ms buffers. That is more than the default buffer
+// (DefaultBufferSeconds) lets the live stream fall behind, but a buffer set
+// larger can outrun it: an older word is untimed.
+const captureStamps = 2048
+
+// captureStamp is when a buffer was captured, and the span of the count
+// Captured gives that it holds, in bytes.
+type captureStamp struct {
+	at       time.Time
+	from, to int64
+}
+
+// markCapturedLocked stamps the latest n bytes Captured counts as captured
+// by at (CapturedAt). It must be called with Mu held.
+func (rc *ResilientClient) markCapturedLocked(at time.Time, n int64) {
+	to := rc.capturedLocked()
+	rc.stamps[rc.stampNext] = captureStamp{at: at, from: to - n, to: to}
+	rc.stampNext = (rc.stampNext + 1) % captureStamps
+	rc.stampsN = min(rc.stampsN+1, captureStamps)
+}
+
+// captured stamps the n bytes the send queue in front of the client just
+// took or dropped, the latest audio counted, as captured by at
+// (sendQueueWatcher).
+func (rc *ResilientClient) captured(at time.Time, n int64) {
+	rc.Mu.Lock()
+	defer rc.Mu.Unlock()
+	rc.markCapturedLocked(at, n)
+}
+
+// pointLocked is where the point at into the current socket's stream lies in
+// the count of the bytes Write takes: past each hole the stream skipped
+// before it. It must be called with Mu held.
+func (rc *ResilientClient) pointLocked(at time.Duration) int64 {
+	p := rc.origin + rc.streamBytes(at)
+	for _, h := range rc.holes { // oldest first, in the order the stream meets them
+		if h.at >= rc.origin && h.at <= p {
+			p += h.n
+		}
+	}
+	return p
+}
+
+// bufferLocked buffers p for the next socket, or for the one draining. A
+// full buffer drops its oldest audio, and the oldest of p itself when p is
+// larger than the buffer, which no socket will be sent: a hole in the stream
+// (holeLocked). It must be called with Mu held, after p was counted.
+func (rc *ResilientClient) bufferLocked(p []byte) error {
+	held := int64(rc.Buffer.Len())
+	if lost := held + int64(len(p)) - int64(rc.Buffer.Cap()); lost > 0 {
+		rc.holeLocked(rc.accepted-int64(len(p))-held, lost)
+	}
+	_, err := rc.Buffer.Write(p)
+	return err
+}
+
+// holeLocked records that the current socket's stream skips the n bytes the
+// client took from at, in the count Write takes: they were never sent. The
+// holes last as long as the socket, so a point's place never moves. It must
+// be called with Mu held.
+func (rc *ResilientClient) holeLocked(at, n int64) {
+	if last := len(rc.holes) - 1; last >= 0 && rc.holes[last].at+rc.holes[last].n == at {
+		rc.holes[last].n += n
+		return
+	}
+	rc.holes = append(rc.holes, streamDrop{at: at, n: n})
+}
+
+// streamDrop is audio a send queue in front of the client dropped, or a hole
+// in the stream: n bytes that would have come at, in the count of the bytes
+// Write takes. For a drop, sum is every drop's bytes up to and with it since
+// the client began, which droppedUpToLocked reads.
+type streamDrop struct{ at, n, sum int64 }
+
+// droppedUpToLocked returns the bytes the send queue dropped at or before
+// point that the current socket's stream still counts, in the count Write
+// takes. It must be called with Mu held.
+func (rc *ResilientClient) droppedUpToLocked(point int64) int64 {
+	i := sort.Search(len(rc.drops), func(i int) bool { return rc.drops[i].at > point })
+	if i == 0 {
+		return 0
+	}
+	return rc.drops[i-1].sum - rc.dropsBase
+}
+
+// droppedLocked returns every drop the current socket's stream still counts.
+// It must be called with Mu held.
+func (rc *ResilientClient) droppedLocked() int64 {
+	if len(rc.drops) == 0 {
+		return 0
+	}
+	return rc.drops[len(rc.drops)-1].sum - rc.dropsBase
+}
 
 // watchSendQueue makes CapturedSince count the audio an AsyncSender in
 // front of the client holds (sendQueueWatcher).
@@ -455,7 +575,8 @@ func (rc *ResilientClient) watchSendQueue(queued func() int64) {
 
 // sendQueueDropped records n bytes the send queue in front of the client
 // dropped: they come after every byte taken or queued so far
-// (sendQueueWatcher).
+// (sendQueueWatcher). Every drop is kept while the socket lasts, so a
+// point's count never moves.
 func (rc *ResilientClient) sendQueueDropped(n int64) {
 	rc.Mu.Lock()
 	defer rc.Mu.Unlock()
@@ -463,15 +584,16 @@ func (rc *ResilientClient) sendQueueDropped(n int64) {
 	if rc.queuedAhead != nil {
 		at += rc.queuedAhead()
 	}
-	if last := len(rc.drops) - 1; last >= 0 && rc.drops[last].at == at {
-		rc.drops[last].n += n
-		return
+	sum := rc.dropsBase + n
+	if last := len(rc.drops) - 1; last >= 0 {
+		if rc.drops[last].at == at {
+			rc.drops[last].n += n
+			rc.drops[last].sum += n
+			return
+		}
+		sum = rc.drops[last].sum + n
 	}
-	if len(rc.drops) == maxStreamDrops {
-		rc.drops[1].n += rc.drops[0].n
-		rc.drops = rc.drops[1:]
-	}
-	rc.drops = append(rc.drops, streamDrop{at: at, n: n})
+	rc.drops = append(rc.drops, streamDrop{at: at, n: n, sum: sum})
 }
 
 // keepDropsAfterLocked forgets the drops at or before from, the start of a
@@ -479,15 +601,13 @@ func (rc *ResilientClient) sendQueueDropped(n int64) {
 // bytes still count in Captured and CapturedBefore. It must be called with Mu
 // held.
 func (rc *ResilientClient) keepDropsAfterLocked(from int64) {
-	kept := rc.drops[:0]
-	for _, drop := range rc.drops {
-		if drop.at > from {
-			kept = append(kept, drop)
-		} else {
-			rc.forgottenDrops += drop.n
-		}
+	i := sort.Search(len(rc.drops), func(i int) bool { return rc.drops[i].at > from })
+	if i == 0 {
+		return
 	}
-	rc.drops = kept
+	rc.forgottenDrops += rc.drops[i-1].sum - rc.dropsBase
+	rc.dropsBase = rc.drops[i-1].sum
+	rc.drops = append([]streamDrop(nil), rc.drops[i:]...)
 }
 
 // MaxBehind returns how far the stream Deepgram hears can fall behind the
@@ -522,8 +642,11 @@ func (rc *ResilientClient) streamDuration(n int64) time.Duration {
 // the pause comes back before the pause ends, not after it.
 func (rc *ResilientClient) Finalize() error {
 	rc.Mu.Lock()
-	// The live socket, still draining, would have been sent these next.
-	rc.origin += int64(rc.Buffer.Len())
+	// The live socket, still draining, would have been sent these next: its
+	// stream skips them, after the audio already sent.
+	if n := int64(rc.Buffer.Len()); n > 0 {
+		rc.holeLocked(rc.accepted-n, n)
+	}
 	rc.Buffer.Reset()
 	rc.Mu.Unlock()
 

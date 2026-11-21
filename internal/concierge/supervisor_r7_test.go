@@ -611,6 +611,7 @@ func (s *r7Speaker) Cancel(input string) {
 }
 
 func (*r7Speaker) OnSpeech(func(audio.SpeechEvent)) func() { return func() {} }
+func (*r7Speaker) FlushSpeech()                            {}
 
 // sounds returns when each sound began on the chime input whose first frame
 // opens pcm.
