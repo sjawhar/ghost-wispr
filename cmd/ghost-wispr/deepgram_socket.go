@@ -75,6 +75,9 @@ type deepgramSocket struct {
 	configWant    []string
 	configSent    []string
 	configAnswer  func(keyterms []string, taken bool)
+	// relay hands each message on (transcribe.ResultRelay), once the
+	// resilient client set it; until then, a message is handed on directly.
+	relay atomic.Pointer[func(handOn func())]
 }
 
 // dialDeepgramLive opens a live-transcription socket to Deepgram with
@@ -258,11 +261,12 @@ func isConfigureAnswer(message []byte) bool {
 	return json.Unmarshal(message, &head) == nil && (head.Type == "ConfigureSuccess" || head.Type == "ConfigureFailure")
 }
 
-// Close tells Deepgram the stream ends, unless a write is in progress, which
-// can be one stuck on a stalled peer, and closes the connection.
+// Close tells Deepgram the stream ends, unless it was told already or a write
+// is in progress, which can be one stuck on a stalled peer, and closes the
+// connection.
 func (s *deepgramSocket) Close() error {
 	if s.writeMu.TryLock() {
-		if !s.closed.Load() {
+		if !s.closed.Load() && !s.ended.Load() {
 			_ = s.conn.SetWriteDeadline(time.Now().Add(time.Second))
 			_ = s.conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"CloseStream"}`))
 		}
@@ -275,23 +279,38 @@ func (s *deepgramSocket) Close() error {
 
 // CloseGracefully ends the stream as Deepgram documents it (Close Stream):
 // CloseStream makes Deepgram process the audio it has, return its final
-// results, and close the connection. It waits for that close, or wait, before
-// closing the connection itself, and the final results reach the callback
-// meanwhile, so the audio this socket accepted is transcribed. A write in
-// progress is sent first (the write lock). It replaces a healthy socket after
-// an options change (transcribe.GracefulCloser); Close ends a failed one.
+// results, and close the connection. It waits for that close before closing
+// the connection itself, and the final results reach the callback meanwhile,
+// so the audio this socket accepted is transcribed. A write in progress is
+// sent first (the write lock). All of it takes at most wait: then the
+// connection is closed whatever is under way, so a stalled peer, or a write
+// stuck on one, never holds it longer. It replaces a healthy socket after an
+// options change, or after the capture outran it (transcribe.GracefulCloser);
+// Close ends a failed one.
 func (s *deepgramSocket) CloseGracefully(wait time.Duration) error {
+	bound := time.AfterFunc(wait, s.abort)
+	defer bound.Stop()
 	if s.endStream() {
-		timer := time.NewTimer(wait)
-		select {
-		case <-s.done:
-		case <-timer.C:
-		}
-		timer.Stop()
+		<-s.done
 	}
 	s.abort()
 	<-s.done
 	return nil
+}
+
+// RelayResultsThrough makes the socket hand each message on through relay
+// (transcribe.ResultRelay).
+func (s *deepgramSocket) RelayResultsThrough(relay func(handOn func())) {
+	s.relay.Store(&relay)
+}
+
+// handOn hands one message on, through the relay once there is one.
+func (s *deepgramSocket) handOn(deliver func()) {
+	if relay := s.relay.Load(); relay != nil {
+		(*relay)(deliver)
+		return
+	}
+	deliver()
 }
 
 // endStream sends CloseStream and makes every later write fail, under the
@@ -370,7 +389,9 @@ func (s *deepgramSocket) read() {
 				logSocketEnd(err)
 			}
 			s.abort()
-			_ = s.router.Close(&msginterfaces.CloseResponse{Type: string(msginterfaces.TypeCloseResponse)})
+			s.handOn(func() {
+				_ = s.router.Close(&msginterfaces.CloseResponse{Type: string(msginterfaces.TypeCloseResponse)})
+			})
 			return
 		}
 		if messageType == websocket.TextMessage {
@@ -378,7 +399,7 @@ func (s *deepgramSocket) read() {
 				s.configured(message)
 				continue
 			}
-			_ = s.router.Message(message)
+			s.handOn(func() { _ = s.router.Message(message) })
 		}
 	}
 }

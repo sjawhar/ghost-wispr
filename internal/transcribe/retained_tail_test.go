@@ -115,9 +115,10 @@ func TestABufferOverflowDropsTheOldestAudioFirstWhileAChunkIsPending(t *testing.
 // that took the chunk the drain was writing, while the buffer overflowed past
 // that chunk, goes on to take the newest audio: its stream would jump over the
 // audio the overflow dropped, and the words after the jump would be read as
-// captured earlier than they were. The socket ends there, at once, as one the
-// capture outran by a whole buffer, with its stream whole; the next socket's
-// stream starts at the kept tail.
+// captured earlier than they were. The socket ends its stream there, as one
+// the capture outran by a whole buffer, gracefully, so Deepgram returns the
+// results of the audio it took; the next socket's stream starts at the kept
+// tail.
 func TestAnOverflowPastTheChunkInFlightEndsThatSocketsStream(t *testing.T) {
 	first := &optionsSocket{held: make(chan struct{}), release: make(chan struct{})}
 	second := &optionsSocket{}
@@ -138,11 +139,17 @@ func TestAnOverflowPastTheChunkInFlightEndsThatSocketsStream(t *testing.T) {
 	if got := first.got(); !bytes.Equal(got, audio[:4096]) {
 		t.Errorf("the first socket got %d bytes, want the 4096 of the chunk it took and nothing after the gap", len(got))
 	}
-	first.mu.Lock()
-	closed, graceful := first.closed, first.graceful
-	first.mu.Unlock()
-	if !closed || graceful {
-		t.Errorf("the first socket closed %t, gracefully %t, want closed at once: it fell a whole buffer behind", closed, graceful)
+	var closed, graceful bool
+	for deadline := time.Now().Add(3 * time.Second); ; time.Sleep(time.Millisecond) {
+		first.mu.Lock()
+		closed, graceful = first.closed, first.graceful
+		first.mu.Unlock()
+		if closed || time.Now().After(deadline) {
+			break
+		}
+	}
+	if !closed || !graceful {
+		t.Errorf("the first socket closed %t, gracefully %t, want closed gracefully: Deepgram owes the results of the audio it took", closed, graceful)
 	}
 	if got := second.got(); !bytes.Equal(got, audio[8192:]) {
 		t.Errorf("the second socket got %d bytes, want the kept tail, the newest %d, whole and in order", len(got), len(audio)-8192)

@@ -180,8 +180,10 @@ func (rc *ResilientClient) keptFromLocked() int64 {
 }
 
 // Close stops reconnection attempts and the hand-over of state changes, and
-// closes the underlying client. It closes the client without holding Mu: a
-// socket's close waits for its reader, which may be timing a result's words
+// closes at once any socket still returning its last results after a gap
+// (retire), then the underlying client, whose results wait for those
+// sockets' (relayFor). It closes them without holding Mu: a socket's close
+// waits for its reader, which may be timing a result's words
 // (CapturedSince), and that takes Mu. It then waits for the state-change
 // goroutine to end, which takes at most stateCallbackStopWait (1 s): the
 // callback in progress gets the cancelled context, and one that does not
@@ -194,9 +196,14 @@ func (rc *ResilientClient) Close() error {
 
 	rc.Mu.Lock()
 	client := rc.Client
+	retired := slices.Clone(rc.retired)
 	notifierDone := rc.notifierDone
 	rc.Mu.Unlock()
 
+	for _, r := range retired {
+		_ = r.client.Close()
+		<-r.done
+	}
 	var err error
 	if client != nil {
 		err = client.Close()
@@ -372,19 +379,140 @@ func (rc *ResilientClient) rotate() {
 	old := rc.Client
 	rc.Mu.Unlock()
 	if old != nil {
-		rc.closeGracefully(old)
+		rc.closeGracefully(old, rc.Config.GracefulCloseWait)
 	}
 	rc.dialUntilConnected(0)
 }
 
 // closeGracefully ends c's stream gracefully when it can (GracefulCloser),
-// within GracefulCloseWait, and closes it at once otherwise.
-func (rc *ResilientClient) closeGracefully(c io.WriteCloser) {
+// within wait, and closes it at once otherwise.
+func (rc *ResilientClient) closeGracefully(c io.WriteCloser, wait time.Duration) {
 	if graceful, ok := c.(GracefulCloser); ok {
-		_ = graceful.CloseGracefully(rc.Config.GracefulCloseWait)
+		_ = graceful.CloseGracefully(wait)
 		return
 	}
 	_ = c.Close()
+}
+
+// retiredSocketWait bounds how long a socket that ended after a gap may take
+// to return its last results (retire).
+const retiredSocketWait = time.Second
+
+// socketStream is the stream of one socket the owner dialled. Once the socket
+// retires, origin is where its stream starts, in the count of the bytes Write
+// takes, and holes the audio its stream skips (holeLocked); until then, the
+// client's are, which a pause or an overflow still adds to. Guarded by Mu.
+type socketStream struct {
+	origin int64
+	holes  []streamDrop
+}
+
+// retiredSocket is a socket that ended after a gap (retire): done is closed
+// once its close returned, and abandoned says it was told to close at once.
+type retiredSocket struct {
+	client    io.WriteCloser
+	stream    *socketStream
+	done      chan struct{}
+	abandoned bool
+}
+
+// relayFor is the relay a socket with stream s hands its results on through
+// (ResultRelay): each runs with CapturedSince and CapturedBefore timing
+// points of s, one result of any socket at a time. A point read meanwhile
+// from elsewhere, as a session's end placing the words it buffered, is timed
+// on s too: buffered words do not say which socket heard them. The results
+// come in the order the streams did: a socket's wait until every socket that
+// retired before its stream began has closed, which takes at most
+// retiredSocketWait and the result each is handing on, so the last words of
+// a retired socket never reach the session after the next socket's first.
+func (rc *ResilientClient) relayFor(s *socketStream) func(handOn func()) {
+	return func(handOn func()) {
+		for _, done := range rc.retiredBefore(s) {
+			<-done
+		}
+		rc.relayMu.Lock()
+		defer rc.relayMu.Unlock()
+		rc.Mu.Lock()
+		rc.relaying = s
+		rc.Mu.Unlock()
+		defer func() {
+			rc.Mu.Lock()
+			rc.relaying = nil
+			rc.Mu.Unlock()
+		}()
+		handOn()
+	}
+}
+
+// retiredBefore returns when each socket closes that retired before the
+// stream s began and may still hand on results: all that retired, for the
+// current socket's stream, and those before it, for a retired one's.
+func (rc *ResilientClient) retiredBefore(s *socketStream) []chan struct{} {
+	rc.Mu.Lock()
+	defer rc.Mu.Unlock()
+	var waits []chan struct{}
+	for _, r := range rc.retired {
+		if r.stream == s {
+			break
+		}
+		waits = append(waits, r.done)
+	}
+	return waits
+}
+
+// streamLocked is where the stream starts whose points CapturedSince and
+// CapturedBefore time, and the holes it skips: those of the socket whose
+// result is being handed on, else the current socket's. Called with Mu held.
+func (rc *ResilientClient) streamLocked() (origin int64, holes []streamDrop) {
+	if s := rc.relaying; s != nil && s != rc.current {
+		return s.origin, s.holes
+	}
+	return rc.origin, rc.holes
+}
+
+// retire ends the stream of c, the socket being drained into, after a gap
+// (errStreamGap): the socket did not fail, and Deepgram still owes the final
+// results of the audio it took. c ends its stream gracefully and hands those
+// results on, timed in its own stream (ResultRelay), on a goroutine of its
+// own while the owner dials the next socket, and is closed once it returned
+// them or after retiredSocketWait: a stalled peer never holds up the next
+// socket, nor keeps its own past the wait. One socket retires at a time: one
+// still waiting when the next retires is closed at once, so a path the
+// capture outruns again and again keeps at most one waiting. Called by the
+// owner, which then dials.
+func (rc *ResilientClient) retire(c io.WriteCloser) {
+	r := &retiredSocket{client: c, done: make(chan struct{})}
+	rc.Mu.Lock()
+	if rc.ctx.Err() != nil {
+		// Close ran, and may have missed this socket: no results are wanted.
+		rc.Mu.Unlock()
+		_ = c.Close()
+		return
+	}
+	r.stream = rc.current // the dial that made c current gave it its stream
+	r.stream.origin, r.stream.holes = rc.origin, slices.Clone(rc.holes)
+	rc.current = nil
+	var abandon []io.WriteCloser
+	for _, older := range rc.retired {
+		if !older.abandoned {
+			older.abandoned = true
+			abandon = append(abandon, older.client)
+		}
+	}
+	rc.retired = append(rc.retired, r)
+	rc.Mu.Unlock()
+
+	for _, older := range abandon {
+		go func() { _ = older.Close() }()
+	}
+	go func() {
+		defer close(r.done)
+		rc.closeGracefully(c, retiredSocketWait)
+		rc.Mu.Lock()
+		rc.retired = slices.DeleteFunc(rc.retired, func(o *retiredSocket) bool { return o == r })
+		rc.keepDropsAfterLocked(rc.origin)
+		rc.Mu.Unlock()
+	}()
 }
 
 // errOptionsChanged is what a drain reports when it emptied the buffer into a
@@ -393,7 +521,8 @@ var errOptionsChanged = errors.New("the options changed since the socket was dia
 
 // errStreamGap is what a drain reports when an overflow dropped audio the
 // socket had not taken, after audio it had: one start of its stream can no
-// longer map both to the times they were captured, so the owner rotates.
+// longer map both to the times they were captured, so the owner retires the
+// socket and dials the next.
 var errStreamGap = errors.New("the buffer overflowed past the audio the socket took")
 
 // dialUntilConnected dials after wait, then again with exponential backoff,
@@ -457,6 +586,10 @@ func (rc *ResilientClient) dialUntilConnected(wait time.Duration) {
 		rc.keepDropsAfterLocked(rc.origin)
 		rc.holes = rc.holes[:0]
 		rc.took, rc.inFlight, rc.droppedInFlight, rc.gap = 0, false, 0, false
+		rc.current = &socketStream{}
+		if relay, ok := newClient.(ResultRelay); ok {
+			relay.RelayResultsThrough(rc.relayFor(rc.current))
+		}
 		rc.setStateLocked(StateDraining)
 		rc.Mu.Unlock()
 
@@ -469,14 +602,22 @@ func (rc *ResilientClient) dialUntilConnected(wait time.Duration) {
 				// stale: it returns its final results, then the owner dials
 				// again for the audio buffered since.
 				rc.log("deepgram: the options changed during the drain; redialling with them")
-				rc.closeGracefully(newClient)
+				rc.closeGracefully(newClient, rc.Config.GracefulCloseWait)
 				wait = 0
 				continue
 			}
-			// The new socket is dead too, or the capture outran it by a whole
-			// buffer, so an overflow dropped audio it had not taken
-			// (errStreamGap): it ends at once, as a socket that fell behind
-			// would not return its last results in time, and the next one
+			if errors.Is(err, errStreamGap) {
+				// The capture outran the socket by a whole buffer, so an
+				// overflow dropped audio it had not taken: its stream ends
+				// there, and it returns the final results of the audio it
+				// took while the next socket, which starts at the audio
+				// kept, is dialled.
+				rc.log("deepgram: the capture outran the socket by a whole buffer; it returns its last results while the next socket is dialled in %v", next)
+				rc.retire(newClient)
+				backOff()
+				continue
+			}
+			// The new socket is dead too: it ends at once, and the next one
 			// starts at the audio kept.
 			rc.log("deepgram socket failed while draining buffered audio (redialling in %v): %v", next, err)
 			_ = newClient.Close()
@@ -595,6 +736,7 @@ func (rc *ResilientClient) IsConnected() bool {
 // that queue dropped after that point, which never reached the socket.
 // Audio the stream skips, as Finalize or a full buffer dropped it unsent
 // (holes), lies after the points before it and before the points after it.
+// While a socket hands on a result (ResultRelay), the stream is that socket's.
 func (rc *ResilientClient) CapturedSince(at time.Duration) time.Duration {
 	rc.Mu.Lock()
 	point := rc.pointLocked(at)
@@ -634,7 +776,8 @@ func (rc *ResilientClient) capturedLocked() int64 {
 // CapturedBefore returns how much audio had been captured before the point
 // at into the current socket's stream, on the count Captured gives: the audio
 // the client took before it, Finalize's dropped audio included, and the audio
-// the send queue dropped before it.
+// the send queue dropped before it. While a socket hands on a result
+// (ResultRelay), the stream is that socket's.
 func (rc *ResilientClient) CapturedBefore(at time.Duration) time.Duration {
 	rc.Mu.Lock()
 	before := rc.capturedBeforeLocked(at)
@@ -715,13 +858,15 @@ func (rc *ResilientClient) captured(at time.Time, n int64) {
 	rc.markCapturedLocked(at, n)
 }
 
-// pointLocked is where the point at into the current socket's stream lies in
-// the count of the bytes Write takes: past each hole the stream skipped
-// before it. It must be called with Mu held.
+// pointLocked is where the point at into the stream lies in the count of the
+// bytes Write takes, past each hole the stream skipped before it: the current
+// socket's stream, or the one whose result is being handed on
+// (streamLocked). It must be called with Mu held.
 func (rc *ResilientClient) pointLocked(at time.Duration) int64 {
-	p := rc.origin + rc.streamBytes(at)
-	for _, h := range rc.holes { // oldest first, in the order the stream meets them
-		if h.at >= rc.origin && h.at <= p {
+	origin, holes := rc.streamLocked()
+	p := origin + rc.streamBytes(at)
+	for _, h := range holes { // oldest first, in the order the stream meets them
+		if h.at >= origin && h.at <= p {
 			p += h.n
 		}
 	}
@@ -805,10 +950,14 @@ func (rc *ResilientClient) sendQueueDropped(n int64) {
 }
 
 // keepDropsAfterLocked forgets the drops at or before from, the start of a
-// new socket's stream: no word Deepgram hears on it comes before them. Their
-// bytes still count in Captured and CapturedBefore. It must be called with Mu
-// held.
+// new socket's stream: no word Deepgram hears on it comes before them. A
+// socket that retired and may still hand on results keeps those after the
+// start of its own stream (retire). Their bytes still count in Captured and
+// CapturedBefore. It must be called with Mu held.
 func (rc *ResilientClient) keepDropsAfterLocked(from int64) {
+	for _, r := range rc.retired {
+		from = min(from, r.stream.origin)
+	}
 	i := sort.Search(len(rc.drops), func(i int) bool { return rc.drops[i].at > from })
 	if i == 0 {
 		return
