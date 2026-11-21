@@ -710,6 +710,10 @@ def wake_heard_ms():
 def react(kind, key, start, end):
     service = json.loads(read("service.json") or "{}")
     if not service.get("voice") or service.get("voice_off") or "sigint" in SCENARIO:
+        if kind in ("stop", "talkover", "backchannel"):
+            # stops.log says why a stop-like clip got no reaction, so that an expected stop line
+            # missing from the timing log shows its cause.
+            log_to("stops.log", "%d: a %s clip began at %d, and the service reads %s, so nothing reacts" % (now_ms(), kind, start, json.dumps(service)))
         return
     n = voice_state(lambda s: s.__setitem__("n", s.get("n", 0) + 1) or s["n"])
     if kind in ("question", "ask", "second"):
