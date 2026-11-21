@@ -260,7 +260,7 @@ func TestTheConciergeStartsOnFirstUse(t *testing.T) {
 		started = c
 		return c, stop, err
 	}, nil, discardLogger)
-	t.Cleanup(lazy.Stop)
+	t.Cleanup(func() { lazy.Stop(context.Background()) })
 	if err := lazy.Spoken(t.Context(), "t1"); err != nil {
 		t.Fatalf("Spoken before any call: %v", err)
 	}
@@ -287,7 +287,7 @@ func TestALazyConciergeThatCannotStartAnswersUnreachable(t *testing.T) {
 	lazy := newLazyConcierge(func() (*concierge.Concierge, func(), error) {
 		return nil, nil, errors.New("no model credentials")
 	}, nil, discardLogger)
-	t.Cleanup(lazy.Stop)
+	t.Cleanup(func() { lazy.Stop(context.Background()) })
 	err := lazy.Answer(t.Context(), &voice.Exchange{}, "what is happening", func(context.Context, string, voice.SayMode) error { return nil })
 	if !errors.Is(err, voice.ErrUnreachable) {
 		t.Fatalf("Answer = %v, want an error that wraps voice.ErrUnreachable", err)

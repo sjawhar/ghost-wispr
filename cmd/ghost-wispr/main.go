@@ -1698,7 +1698,14 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 			pollEvery:  30 * time.Second,
 		})
 	}
-	defer func() { _ = store.Close() }()
+	// The shutdown closes the store within its deadline (closeStore); a
+	// return before it closes it here.
+	storeClosing := false
+	defer func() {
+		if !storeClosing {
+			_ = store.Close()
+		}
+	}()
 
 	var deletionDrive deletionRecordingSource
 	if cfg.GDriveFolderID != "" && cfg.GDriveSyncEnabled {
@@ -2203,7 +2210,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 		_ = mic.Stop()
 	}
 	if conc != nil {
-		conc.Stop()
+		conc.Stop(shutdownCtx)
 	}
 	if ttsOrchestrator != nil {
 		ttsOrchestrator.Stop()
@@ -2217,6 +2224,8 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 	if micLoopsEnded {
 		_ = audio.TerminatePortAudio() // best-effort cleanup
 	}
+	storeClosing = true
+	closeStore(shutdownCtx, store)
 }
 
 // micStreamer is the capture device the mic loop drives. Open opens a fresh

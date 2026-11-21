@@ -157,14 +157,25 @@ func TestAFailedOpenJoinsItsReconnectRegistration(t *testing.T) {
 		t.Fatal("OpenSession did not return: it does not cancel the reconnect's registration it waits for")
 	}
 	guard.Close(t) // as the unit closes its store once the open failed
+	// OpenSession returned only after its reconnect's registration ended, so
+	// the listener sees that request cancelled. Release only after that, or
+	// after it did not come, so the release cannot race the cancellation.
+	select {
+	case <-cancelled:
+	case <-time.After(5 * time.Second):
+		release() // let a registration the failed open left running end
+		select {
+		case err := <-saved:
+			t.Fatalf("the reconnect's registration ran on after OpenSession failed, and saved its resume point (%v)", err)
+		case <-time.After(5 * time.Second):
+			t.Fatal("the reconnect's registration was neither cancelled nor ended")
+		}
+	}
 	release()
 	select {
 	case err := <-saved:
 		t.Errorf("the reconnect's registration saved its resume point after OpenSession failed (%v)", err)
-	case <-cancelled:
-	case <-time.After(5 * time.Second):
-		t.Fatal("the reconnect's registration was neither cancelled nor ended")
+	default:
 	}
-	time.Sleep(50 * time.Millisecond)
 	guard.Check(t)
 }

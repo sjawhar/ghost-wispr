@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"path/filepath"
 	"slices"
@@ -358,7 +359,7 @@ func TestAShutdownWaitsForAConciergeStartUnderWay(t *testing.T) {
 		t.Fatal("control: turning the voice on started no Concierge")
 	}
 	time.AfterFunc(200*time.Millisecond, func() { close(release) })
-	lazy.Stop()
+	lazy.Stop(t.Context())
 	guard.Close(t)
 	if !stopped.Load() {
 		t.Error("the shutdown returned before the start under way had ended and stopped what it started")
@@ -422,7 +423,7 @@ func TestAShutdownWaitsForATurnOffUnderWay(t *testing.T) {
 			stopped := make(chan struct{})
 			go func() {
 				defer close(stopped)
-				lazy.Stop()
+				lazy.Stop(t.Context())
 			}()
 			select {
 			case <-stopped:
@@ -439,6 +440,108 @@ func TestAShutdownWaitsForATurnOffUnderWay(t *testing.T) {
 			guard.Check(t)
 			if task, err := store.VoiceTask("q1"); err != nil || task.State != storage.VoiceTaskCancelled {
 				t.Errorf("control: the turn-off did not cancel the working question before the shutdown returned: %+v, %v", task, err)
+			}
+		})
+	}
+}
+
+// TestATurnOffHeldInTheStoreDoesNotHoldTheShutdownPastItsDeadline fails if
+// the Concierge's shutdown waits past the shutdown's deadline for a turn-off
+// whose store write waits for the store's one connection, or if that write
+// lands once main has closed the store (closeStore): the shutdown gives up
+// at the deadline, and the closed store refuses the write. From review
+// 6004998055 of #132; the control is the same turn-off with the connection
+// free, which cancels the question before the shutdown returns.
+func TestATurnOffHeldInTheStoreDoesNotHoldTheShutdownPastItsDeadline(t *testing.T) {
+	for _, held := range []bool{false, true} {
+		name := "control: the store's connection is free"
+		if held {
+			name = "the turn-off waits for the store's connection past the deadline"
+		}
+		t.Run(name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "state.db")
+			store := openResumeStore(t, path)
+			if got := store.DB().Stats().MaxOpenConnections; got != 1 {
+				t.Fatalf("control: the store allows %d connections, want its one", got)
+			}
+			if err := store.CreateSession("meeting", time.Now()); err != nil {
+				t.Fatal(err)
+			}
+			cfg := config.Config{GenAIBackend: "gemini", GeminiAPIKey: strings.Repeat("k", 8)}
+			detached := make(chan struct{})
+			lazy := newLazyConcierge(func() (*concierge.Concierge, func(), error) {
+				return startConcierge(t.Context(), &cfg, store, discardLogger, nil)
+			}, func(c *concierge.Concierge) {
+				if c == nil {
+					close(detached)
+				}
+			}, discardLogger)
+			if _, err := lazy.start(); err != nil {
+				t.Fatal(err)
+			}
+			if err := store.CreateVoiceTask(&storage.VoiceTask{ID: "q1", SessionID: "meeting", AskedAt: time.Now(), Holder: "session:agent-7"}); err != nil {
+				t.Fatal(err)
+			}
+			recovery := recoverAtStart(store) // as main runs it at the start, before the connection is reserved
+			var conn *sql.Conn
+			if held {
+				var err error
+				if conn, err = store.DB().Conn(context.Background()); err != nil {
+					t.Fatal(err)
+				}
+				defer func() { _ = conn.Close() }()
+			}
+			waitsBefore := store.DB().Stats().WaitCount
+			manager := session.NewManager(store, nil, nil, nil, session.NewDetector(time.Hour), 0)
+			turnedOff := make(chan struct{})
+			go func() {
+				defer close(turnedOff)
+				_ = manager.Run(context.Background(), func(context.Context) error {
+					lazy.followEnabled(false)
+					return nil
+				})
+			}()
+			select {
+			case <-detached:
+			case <-time.After(5 * time.Second):
+				t.Fatal("control: the turn-off did not detach its Concierge")
+			}
+			if held {
+				waitUntil(t, "the turn-off's write waiting for the store's connection", func() bool {
+					return store.DB().Stats().WaitCount > waitsBefore
+				})
+			}
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+			defer cancel()
+			recovery.stop(shutdownCtx, manager, lifecyclePublishWait)
+			stopped := make(chan struct{})
+			go func() {
+				defer close(stopped)
+				lazy.Stop(shutdownCtx)
+			}()
+			select {
+			case <-stopped:
+			case <-time.After(time.Second):
+				t.Fatal("the Concierge's shutdown waited past the shutdown's deadline for the turn-off")
+			}
+			if !closeStore(shutdownCtx, store) {
+				t.Fatal("closeStore left the store open, though no statement ran on it")
+			}
+			if conn != nil {
+				_ = conn.Close() // the turn-off's write gets the connection now
+			}
+			select {
+			case <-turnedOff:
+			case <-time.After(5 * time.Second):
+				t.Fatal("the turn-off did not end")
+			}
+			reopened := openResumeStore(t, path)
+			task, err := reopened.VoiceTask("q1")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if want := map[bool]storage.VoiceTaskState{false: storage.VoiceTaskCancelled, true: storage.VoiceTaskWorking}[held]; task.State != want {
+				t.Errorf("the question after the shutdown is %q, want %q", task.State, want)
 			}
 		})
 	}

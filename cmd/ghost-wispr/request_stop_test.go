@@ -20,6 +20,7 @@ import (
 	"github.com/sjawhar/ghost-wispr/internal/gdrive"
 	"github.com/sjawhar/ghost-wispr/internal/server"
 	"github.com/sjawhar/ghost-wispr/internal/session"
+	"github.com/sjawhar/ghost-wispr/internal/stopping"
 	"github.com/sjawhar/ghost-wispr/internal/storage"
 	"github.com/sjawhar/ghost-wispr/internal/storeguard"
 	"github.com/sjawhar/ghost-wispr/internal/transcribe"
@@ -196,6 +197,11 @@ func TestNoRequestWritesTheStoreAfterTheStop(t *testing.T) {
 	hooks := &server.ControlHooks{}
 	recorder := newRouteRecorder()
 	hooks.RouteHandler = recorder.handler
+	// The preset routes main enables (review 6004998055 of #132): main's hooks
+	// read the store and call a model; these answer at once.
+	hooks.TestPreset = func(context.Context, string, string) (string, error) { return "", nil }
+	hooks.GeneratePreset = func(context.Context, string) (config.Preset, error) { return config.Preset{}, nil }
+	hooks.RefinePreset = func(context.Context, config.Preset, string) (config.Preset, error) { return config.Preset{}, nil }
 	wireStoreWork(hooks, &storeWork{
 		manager:                       manager,
 		store:                         store,
@@ -378,16 +384,22 @@ func TestStopServingClosesARequestThatOutlastsItsWait(t *testing.T) {
 }
 
 // heldTitleStore holds UpdateTitle, which the PATCH handler calls itself,
-// until release closes.
+// until release closes, and records what the store answered (wrote, when
+// set).
 type heldTitleStore struct {
 	*storage.SQLiteStore
 	entered, release chan struct{}
+	wrote            chan error
 }
 
 func (s *heldTitleStore) UpdateTitle(id, title string) error {
 	close(s.entered)
 	<-s.release
-	return s.SQLiteStore.UpdateTitle(id, title)
+	err := s.SQLiteStore.UpdateTitle(id, title)
+	if s.wrote != nil {
+		s.wrote <- err
+	}
+	return err
 }
 
 // TestTheStopWaitsForAHandlerThatOutlastsTheHTTPWait fails if the stop, as
@@ -469,5 +481,69 @@ func TestTheStopWaitsForAHandlerThatOutlastsTheHTTPWait(t *testing.T) {
 				t.Errorf("control: the handler's write did not land before the stop returned: %q, %v", got.Title, err)
 			}
 		})
+	}
+}
+
+// TestAHandlerPastTheShutdownsDeadlineNeverWritesTheClosedStore fails if a
+// request's handler, admitted before the stop and held past the shutdown's
+// whole deadline, writes the store once main has closed it (closeStore): the
+// stop gives up waiting at the deadline, and the store refuses the handler's
+// late write itself (stopping.ErrStopped), so the title stays as it was. From
+// review 6004998055 of #132.
+func TestAHandlerPastTheShutdownsDeadlineNeverWritesTheClosedStore(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "deadline.db")
+	db := openResumeStore(t, path)
+	const id = "20261120090000"
+	if err := db.CreateSession(id, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.EndSession(id, time.Now(), ""); err != nil {
+		t.Fatal(err)
+	}
+	store := &heldTitleStore{SQLiteStore: db, entered: make(chan struct{}), release: make(chan struct{}), wrote: make(chan error, 1)}
+	manager := session.NewManager(db, nil, nil, nil, session.NewDetector(time.Hour), 0)
+	handler, err := server.Handler(fstest.MapFS{"index.html": {Data: []byte("ok")}}, server.NewHub(), store, &server.ControlHooks{AdmitRequest: admitRequestsThrough(manager)}, "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	httpServer := &http.Server{Handler: handler, ReadHeaderTimeout: time.Second}
+	go func() { _ = httpServer.Serve(listener) }()
+	go func() {
+		request := mustRequest(t, http.MethodPatch, "http://"+listener.Addr().String()+"/api/sessions/"+id, `{"title":"set past the deadline"}`)
+		if response, err := http.DefaultClient.Do(request); err == nil {
+			_ = response.Body.Close()
+		}
+	}()
+	select {
+	case <-store.entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("control: the PATCH handler did not reach UpdateTitle")
+	}
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 350*time.Millisecond)
+	defer cancel()
+	stopServing(shutdownCtx, httpServer, 100*time.Millisecond)
+	recoverAtStart(db).stop(shutdownCtx, manager, lifecyclePublishWait)
+	if shutdownCtx.Err() == nil {
+		t.Fatal("control: the stop returned before the shutdown's deadline, with the handler held")
+	}
+	if !closeStore(shutdownCtx, db) {
+		t.Fatal("closeStore left the store open, though no statement ran on it")
+	}
+	close(store.release)
+	select {
+	case err := <-store.wrote:
+		if !errors.Is(err, stopping.ErrStopped) {
+			t.Errorf("the handler's write after the store closed = %v, want stopping.ErrStopped", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the handler did not end once released")
+	}
+	reopened := openResumeStore(t, path)
+	if got, err := reopened.GetSession(id); err != nil || got.Title != "" {
+		t.Errorf("the title after the late write was refused = %q, %v; want none", got.Title, err)
 	}
 }

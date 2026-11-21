@@ -34,6 +34,26 @@ func stopServing(ctx context.Context, server *http.Server, wait time.Duration) {
 	}
 }
 
+// closingStore is the store as the shutdown closes it.
+type closingStore interface {
+	CloseWithin(ctx context.Context) error
+}
+
+// closeStore closes the store at the end of the shutdown, waiting within ctx
+// for the statements still under way. The store refuses every other
+// statement from the moment it starts closing (storage), so nothing writes it
+// after it closed. When a statement outlasts ctx, the store is left open
+// under it and closeStore reports false: main then returns, and the process
+// exits with SQLite left to the operating system, which the write-ahead log
+// makes safe. It never closes the database under a writer.
+func closeStore(ctx context.Context, store closingStore) bool {
+	if err := store.CloseWithin(ctx); err != nil {
+		slog.Error("store work still runs at the shutdown's deadline; exiting without closing the database under it", "error", err)
+		return false
+	}
+	return true
+}
+
 // newAppContext is the app's context. stop ends it at shutdown with the cause
 // stopping.ErrStopped, so work it cuts off reads, as work the session
 // manager's stop cuts off does, as stopped and not as failed: the start's

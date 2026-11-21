@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"strings"
 	"sync"
 	"testing"
@@ -31,7 +32,7 @@ func countingLazyConcierge(t *testing.T) (lazy *lazyConcierge, counts func() (st
 			stop()
 		}, err
 	}, nil, discardLogger)
-	t.Cleanup(lazy.Stop)
+	t.Cleanup(func() { lazy.Stop(context.Background()) })
 	return lazy, func() (int, int) {
 		mu.Lock()
 		defer mu.Unlock()
@@ -102,13 +103,13 @@ func TestTurningTheVoiceOffCancelsTheQuestionsAShutdownKeeps(t *testing.T) {
 		lazy := newLazyConcierge(func() (*concierge.Concierge, func(), error) {
 			return startConcierge(t.Context(), &cfg, store, discardLogger, nil, nil)
 		}, nil, discardLogger)
-		t.Cleanup(lazy.Stop)
+		t.Cleanup(func() { lazy.Stop(context.Background()) })
 		if _, err := lazy.start(); err != nil {
 			t.Fatalf("start: %v", err)
 		}
 		return lazy
 	}
-	newLazy().Stop()
+	newLazy().Stop(context.Background())
 	if task, err := store.VoiceTask("q1"); err != nil || task.State != storage.VoiceTaskWorking {
 		t.Fatalf("after a shutdown the question = %+v, %v; want working", task, err)
 	}

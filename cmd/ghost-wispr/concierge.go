@@ -333,7 +333,7 @@ func (l *lazyConcierge) started() *concierge.Concierge {
 // off, the running one stops.
 func (l *lazyConcierge) followEnabled(on bool) {
 	if !on {
-		l.halt(false)
+		l.halt(context.Background(), false)
 		return
 	}
 	l.mu.Lock()
@@ -345,12 +345,13 @@ func (l *lazyConcierge) followEnabled(on bool) {
 // halt stops the running Concierge, for a turn-off or, with shutdown, for
 // good. A turn-off first cancels the questions still working and tells their
 // holders (VoiceOff), while the Envoy session is open; a shutdown keeps them
-// for the next start. A shutdown also waits for a start under way, which
-// writes the store as it starts (concierge.New) and then sees the shutdown
-// and stops what it started (start), and for a turn-off under way, which has
-// detached its Concierge and writes the store as it turns it off, so the store
-// closes under none of it.
-func (l *lazyConcierge) halt(shutdown bool) {
+// for the next start. A shutdown also waits, within ctx, for a start under
+// way, which writes the store as it starts (concierge.New) and then sees the
+// shutdown and stops what it started (start), and for a turn-off under way,
+// which has detached its Concierge and writes the store as it turns it off.
+// At ctx's end it waits no longer: the store refuses what they write once it
+// closes, and is never closed under a statement they run (storage).
+func (l *lazyConcierge) halt(ctx context.Context, shutdown bool) {
 	l.mu.Lock()
 	if l.closed {
 		l.mu.Unlock()
@@ -367,26 +368,38 @@ func (l *lazyConcierge) halt(shutdown bool) {
 		defer l.turningOff.Done()
 	}
 	l.mu.Unlock()
+	if c != nil {
+		if l.onStart != nil {
+			l.onStart(nil)
+		}
+		close(fwd)
+		if !shutdown {
+			c.VoiceOff()
+		}
+		stop()
+	}
 	if shutdown {
-		// A start under way holds starting until it has seen the shutdown
-		// and stopped what it started; no later start takes it (current).
-		// A turn-off under way was counted before closed was set, and no
-		// later one starts (closed).
+		l.waitForStartsAndTurnOffs(ctx)
+	}
+}
+
+// waitForStartsAndTurnOffs waits, within ctx, for a start under way, which
+// holds starting until it has seen the shutdown and stopped what it started
+// (no later start takes it: current), and for each turn-off under way, which
+// was counted before closed was set (no later one starts: closed).
+func (l *lazyConcierge) waitForStartsAndTurnOffs(ctx context.Context) {
+	ended := make(chan struct{})
+	go func() {
+		defer close(ended)
 		l.starting.Lock()
 		defer l.starting.Unlock()
-		defer l.turningOff.Wait()
+		l.turningOff.Wait()
+	}()
+	select {
+	case <-ended:
+	case <-ctx.Done():
+		l.logger.Warn("concierge: a start or turn-off still runs at the shutdown's deadline; the store refuses what it writes once it closes", "error", context.Cause(ctx))
 	}
-	if c == nil {
-		return
-	}
-	if l.onStart != nil {
-		l.onStart(nil)
-	}
-	close(fwd)
-	if !shutdown {
-		c.VoiceOff()
-	}
-	stop()
 }
 
 func (l *lazyConcierge) forward(in <-chan voice.PendingAnswer, done <-chan struct{}) {
@@ -407,8 +420,9 @@ func (l *lazyConcierge) forward(in <-chan voice.PendingAnswer, done <-chan struc
 	}
 }
 
-// Stop stops the Concierge if it runs, at shutdown.
-func (l *lazyConcierge) Stop() { l.halt(true) }
+// Stop stops the Concierge if it runs, at shutdown, waiting within ctx for a
+// start or turn-off under way (halt).
+func (l *lazyConcierge) Stop(ctx context.Context) { l.halt(ctx, true) }
 
 func (l *lazyConcierge) Tools(x *voice.Exchange) voice.ToolRunner {
 	c, err := l.start()
