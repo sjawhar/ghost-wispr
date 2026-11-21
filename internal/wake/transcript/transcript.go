@@ -101,12 +101,25 @@ type phrase struct {
 var openers = map[string]bool{"hey": true, "hi": true, "ok": true, "okay": true, "so": true, "um": true, "uh": true, "and": true}
 
 // soundsLike lists the spellings Deepgram gives the name when it does not
-// write it as configured. They count only when the word ends in a comma or
-// the text ends, or a question or request word follows, since "whisper" is
-// also an ordinary word.
+// write it as configured, "Lispr" among them on 2026-11-21. They count only
+// when the word ends in a comma or the text ends, or a question or request
+// word follows, since "whisper" is also an ordinary word. "Mister" and the
+// like, which Deepgram also wrote for the name, are a person's address and
+// never count.
 var soundsLike = map[string][]string{
-	"wispr": {"whisper", "wisper", "whispr", "wispa", "whispa"},
+	"wispr": {"whisper", "wisper", "whispr", "wispa", "whispa", "lispr"},
 }
+
+// commaOnly are the spellings of soundsLike that count only before a comma
+// or at the end of the text, not before a call word: "Lispr, go ahead" is a
+// call, but "Lispr is what the transcript printed" talks about the word.
+var commaOnly = map[string]bool{"lispr": true}
+
+// keytermsLike are the words a wake phrase is sent with as Deepgram
+// keyterms, right after it, in room the phrases and keys leave (Keyterms):
+// Nova-3 knows how "Whisper" sounds, and not the spelling "Wispr", which it
+// heard as "Mister", "Miss Burr" and "Lispr".
+var keytermsLike = map[string]string{"wispr": "Whisper"}
 
 // callWords may follow a sound-alike spelling of the name in a call.
 var callWords = map[string]bool{
@@ -164,7 +177,7 @@ func (d *Detector) matchAt(tokens []string, at int) (Match, bool) {
 		if at+len(p.words) > len(tokens) {
 			continue
 		}
-		exact, ok := true, true
+		exact, ok, strict := true, true, false
 		for k, want := range p.words {
 			got := normalise(tokens[at+k])
 			if got == want {
@@ -174,14 +187,18 @@ func (d *Detector) matchAt(tokens []string, at int) (Match, bool) {
 				ok = false
 				break
 			}
-			exact = false
+			exact, strict = false, strict || commaOnly[got]
 		}
 		if !ok {
 			continue
 		}
 		last := at + len(p.words) - 1
 		rest := tokens[last+1:]
-		if !exact && !callFollows(tokens[last], rest) {
+		switch {
+		case exact:
+		case strict && !strings.HasSuffix(tokens[last], ",") && len(rest) > 0:
+			continue
+		case !callFollows(tokens[last], rest):
 			continue
 		}
 		return Match{Phrase: p.text, Rest: strings.Join(rest, " ")}, true
@@ -526,9 +543,11 @@ func digitsOnly(w string) bool {
 }
 
 // Keyterms returns the keyterms for Deepgram's live options: the wake
-// phrases first, then issue keys, each once, within Deepgram's limits.
+// phrases first, then issue keys, each once, within Deepgram's limits, as
+// before; each wake phrase's keyterm-like word (keytermsLike) goes right
+// after it when the list has room left, so it never displaces one of them.
 func Keyterms(phrases, issueKeys []string) []string {
-	out := make([]string, 0, len(phrases)+len(issueKeys))
+	out := make([]string, 0, len(phrases)+len(issueKeys)+len(keytermsLike))
 	seen := make(map[string]bool, cap(out))
 	tokens := 0
 	for _, list := range [][]string{phrases, issueKeys} {
@@ -542,6 +561,18 @@ func Keyterms(phrases, issueKeys []string) []string {
 			tokens += n
 			out = append(out, k)
 		}
+	}
+	// Each wake phrase's keyterm-like word goes right after it, in the room
+	// the list has left: it never displaces a phrase or a key.
+	for i := 0; i < len(out); i++ {
+		like, ok := keytermsLike[normalise(out[i])]
+		if !ok || seen[like] || len(out) == MaxKeyterms || tokens+len(strings.Fields(like)) > MaxKeytermTokens {
+			continue
+		}
+		seen[like] = true
+		tokens += len(strings.Fields(like))
+		out = slices.Insert(out, i+1, like)
+		i++
 	}
 	return out
 }

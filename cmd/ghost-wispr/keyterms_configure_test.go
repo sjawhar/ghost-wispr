@@ -125,12 +125,12 @@ func TestAJoinConfiguresTheLiveStream(t *testing.T) {
 	fake.mu.Lock()
 	dialed := fake.query["keyterm"]
 	fake.mu.Unlock()
-	if want := []string{"Wispr", "Ghost Wispr", "INFRA"}; !slices.Equal(dialed, want) {
+	if want := []string{"Wispr", "Whisper", "Ghost Wispr", "INFRA"}; !slices.Equal(dialed, want) {
 		t.Fatalf("the dial carried keyterms %q, want %q", dialed, want)
 	}
 
 	keyterms.SetJoined([]string{"ABC-12"})
-	if got, want := waitConfigures(t, fake, 1)[0], []string{"Wispr", "Ghost Wispr", "ABC-12", "INFRA"}; !slices.Equal(got, want) {
+	if got, want := waitConfigures(t, fake, 1)[0], []string{"Wispr", "Whisper", "Ghost Wispr", "ABC-12", "INFRA"}; !slices.Equal(got, want) {
 		t.Fatalf("the join sent Configure %q, want %q", got, want)
 	}
 
@@ -143,7 +143,7 @@ func TestAJoinConfiguresTheLiveStream(t *testing.T) {
 		t.Fatalf("Deepgram got %q before it answered the first Configure, want it to wait", got)
 	}
 	fake.answer <- "ConfigureSuccess"
-	if got, want := waitConfigures(t, fake, 2)[1], []string{"Wispr", "Ghost Wispr", "XYZ-9", "INFRA"}; !slices.Equal(got, want) {
+	if got, want := waitConfigures(t, fake, 2)[1], []string{"Wispr", "Whisper", "Ghost Wispr", "XYZ-9", "INFRA"}; !slices.Equal(got, want) {
 		t.Fatalf("after the answer Deepgram got %q, want the newest list %q", got, want)
 	}
 
@@ -151,7 +151,7 @@ func TestAJoinConfiguresTheLiveStream(t *testing.T) {
 	fake.answer <- "ConfigureFailure"
 	time.Sleep(50 * time.Millisecond)
 	keyterms.SetJoined(nil)
-	if got, want := waitConfigures(t, fake, 3)[2], []string{"Wispr", "Ghost Wispr", "INFRA"}; !slices.Equal(got, want) {
+	if got, want := waitConfigures(t, fake, 3)[2], []string{"Wispr", "Whisper", "Ghost Wispr", "INFRA"}; !slices.Equal(got, want) {
 		t.Fatalf("after a refusal the leave sent %q, want %q", got, want)
 	}
 	time.Sleep(100 * time.Millisecond)
@@ -166,7 +166,7 @@ func TestAJoinConfiguresTheLiveStream(t *testing.T) {
 // stream's once Deepgram takes it, and then not go again for the same join.
 func TestARefusedConfigureIsSentAgain(t *testing.T) {
 	fake, keyterms := dialConfigureEndpoint(t)
-	joined := []string{"Wispr", "Ghost Wispr", "ABC-12", "INFRA"}
+	joined := []string{"Wispr", "Whisper", "Ghost Wispr", "ABC-12", "INFRA"}
 	keyterms.SetJoined([]string{"ABC-12"})
 	waitConfigures(t, fake, 1)
 	fake.answer <- "ConfigureFailure"
@@ -188,7 +188,7 @@ func TestARefusedConfigureIsSentAgain(t *testing.T) {
 // because it was sent before.
 func TestASecondRefusalWaitsForTheNextChange(t *testing.T) {
 	fake, keyterms := dialConfigureEndpoint(t)
-	joined := []string{"Wispr", "Ghost Wispr", "ABC-12", "INFRA"}
+	joined := []string{"Wispr", "Whisper", "Ghost Wispr", "ABC-12", "INFRA"}
 	keyterms.SetJoined([]string{"ABC-12"})
 	waitConfigures(t, fake, 1)
 	fake.answer <- "ConfigureFailure"

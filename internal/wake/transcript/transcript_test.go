@@ -1,6 +1,7 @@
 package transcript
 
 import (
+	"fmt"
 	"slices"
 	"strings"
 	"sync"
@@ -26,11 +27,21 @@ func TestWakePhrasePosition(t *testing.T) {
 		{"Whisper, what is happening?", true, "Wispr", "what is happening?"},
 		{"Whisper what is the status?", true, "Wispr", "what is the status?"},
 		{"Wispr", true, "Wispr", ""},
+		// The office run of 2026-11-21 heard the name as "Lispr".
+		{"Lispr, what's the status of INFRA ten twenty seven?", true, "Wispr", "what's the status of INFRA ten twenty seven?"},
+		{"Lispr, go ahead.", true, "Wispr", "go ahead."},
 		// Not calls.
 		{"I will whisper it to you", false, "", ""},
 		{"Whisper it to me later.", false, "", ""},
 		{"We asked Wispr yesterday.", false, "", ""},
 		{"The ghost whisper film was good.", false, "", ""},
+		// "Lispr" counts only before a comma or at the end: before a call
+		// word it is talk about the word (Sol's review of #135 at 21bbef7).
+		{"Lispr is what the transcript printed.", false, "", ""},
+		{"Lispr what is the status?", false, "", ""},
+		// "Mister" and the like are a person's address, not the name.
+		{"Mister, what's the status of info 10/27?", false, "", ""},
+		{"Miss Murray, what's the status?", false, "", ""},
 		{"", false, "", ""},
 	}
 	for _, c := range cases {
@@ -80,7 +91,9 @@ func TestCommands(t *testing.T) {
 }
 
 // TestKeyterms fails if the keyterms do not start with the wake phrases, once
-// each, or pass Deepgram's limits.
+// each, with "Whisper" right after "Wispr", or pass Deepgram's limits. Nova-3
+// knows how "Whisper" sounds, not "Wispr", which it heard as "Mister", "Miss
+// Burr" and "Lispr" on 2026-11-21.
 func TestKeyterms(t *testing.T) {
 	keys := make([]string, 0, 400)
 	for i := range 400 {
@@ -90,8 +103,8 @@ func TestKeyterms(t *testing.T) {
 	if len(got) > MaxKeyterms {
 		t.Fatalf("%d keyterms, want at most %d", len(got), MaxKeyterms)
 	}
-	if !slices.Equal(got[:2], []string{"Wispr", "Ghost Wispr"}) {
-		t.Fatalf("keyterms start %q, want the wake phrases first, once each", got[:2])
+	if !slices.Equal(got[:3], []string{"Wispr", "Whisper", "Ghost Wispr"}) {
+		t.Fatalf("keyterms start %q, want the wake phrases first, once each, with Whisper after Wispr", got[:3])
 	}
 	tokens := 0
 	for _, k := range got {
@@ -106,6 +119,36 @@ func TestKeyterms(t *testing.T) {
 			t.Fatalf("keyterm %q twice", k)
 		}
 		seen[k] = true
+	}
+}
+
+// TestWhisperNeverDisplacesAKeyterm fails if "Whisper" takes the place of a
+// wake phrase or an issue key main sends when the list is full: with 98 keys
+// after the two wake phrases, main sends all 98 and no room is left (Sol's
+// review of #135 at 21bbef7: ABC-98 was dropped). With 97 keys there is
+// room, and "Whisper" goes right after "Wispr".
+func TestWhisperNeverDisplacesAKeyterm(t *testing.T) {
+	for _, n := range []int{97, 98} {
+		keys := make([]string, n)
+		for i := range keys {
+			keys[i] = fmt.Sprintf("ABC-%d", i+1)
+		}
+		got := Keyterms([]string{"Wispr", "Ghost Wispr"}, keys)
+		if len(got) > MaxKeyterms {
+			t.Fatalf("%d keys: %d keyterms, want at most %d", n, len(got), MaxKeyterms)
+		}
+		for _, k := range append([]string{"Wispr", "Ghost Wispr"}, keys...) {
+			if !slices.Contains(got, k) {
+				t.Fatalf("%d keys: keyterm %q dropped from %q", n, k, got)
+			}
+		}
+		whisper := slices.Contains(got, "Whisper")
+		if n == 97 && (!whisper || got[1] != "Whisper") {
+			t.Fatalf("97 keys: keyterms start %q, want Whisper right after Wispr in the room left", got[:3])
+		}
+		if n == 98 && whisper {
+			t.Fatalf("98 keys: Whisper sent in a full list %q", got)
+		}
 	}
 }
 
@@ -177,7 +220,7 @@ func quickKeyterms() (*LiveKeyterms, *fakeStream) {
 // it answered.
 func TestKeytermsChangeOnJoin(t *testing.T) {
 	k := NewLiveKeyterms([]string{"Wispr", "Ghost Wispr"}, func() []string { return []string{"INFRA", "OPS"} })
-	base := []string{"Wispr", "Ghost Wispr", "INFRA", "OPS"}
+	base := []string{"Wispr", "Whisper", "Ghost Wispr", "INFRA", "OPS"}
 	stream := &fakeStream{}
 	k.Attach(stream, k.List())
 	if !slices.Equal(k.List(), base) || len(stream.configured) != 0 {
@@ -185,7 +228,7 @@ func TestKeytermsChangeOnJoin(t *testing.T) {
 	}
 
 	k.SetJoined([]string{"ABC-12"})
-	joined := []string{"Wispr", "Ghost Wispr", "ABC-12", "INFRA", "OPS"}
+	joined := []string{"Wispr", "Whisper", "Ghost Wispr", "ABC-12", "INFRA", "OPS"}
 	if len(stream.configured) != 1 || !slices.Equal(stream.configured[0], joined) {
 		t.Fatalf("a join sent %q, want one Configure with %q", stream.configured, joined)
 	}
@@ -211,7 +254,7 @@ func TestKeytermsChangeOnJoin(t *testing.T) {
 	k.SetJoined([]string{"XYZ-9"})
 	late := &fakeStream{}
 	k.Attach(late, dialed)
-	want := []string{"Wispr", "Ghost Wispr", "XYZ-9", "INFRA", "OPS"}
+	want := []string{"Wispr", "Whisper", "Ghost Wispr", "XYZ-9", "INFRA", "OPS"}
 	if len(late.configured) != 1 || !slices.Equal(late.configured[0], want) {
 		t.Fatalf("a socket dialled before the join got %q, want one Configure with %q", late.configured, want)
 	}
@@ -246,12 +289,12 @@ func TestOneConfigureWaitsForItsAnswer(t *testing.T) {
 		t.Fatalf("the stream got %q before it answered the first Configure, want one", got)
 	}
 	stream.answer(true)
-	if got, want := stream.sent(), []string{"Wispr", "XYZ-9", "INFRA"}; len(got) != 2 || !slices.Equal(got[1], want) {
+	if got, want := stream.sent(), []string{"Wispr", "Whisper", "XYZ-9", "INFRA"}; len(got) != 2 || !slices.Equal(got[1], want) {
 		t.Fatalf("after the answer the stream got %q, want the newest list %q second", got, want)
 	}
 	k.SetJoined([]string{"XYZ-9", "DEF-3"})
 	stream.answer(false)
-	want := []string{"Wispr", "XYZ-9", "DEF-3", "INFRA"}
+	want := []string{"Wispr", "Whisper", "XYZ-9", "DEF-3", "INFRA"}
 	if got := stream.sent(); len(got) != 3 || !slices.Equal(got[2], want) {
 		t.Fatalf("after a refusal with a newer list wanted the stream got %q, want %q third, at once", got, want)
 	}
@@ -270,7 +313,7 @@ func TestARefusedListIsNotTheStreams(t *testing.T) {
 	k, stream := quickKeyterms()
 	refused := false
 	k.SetRefusalHook(func(r bool) { refused = r })
-	joined := []string{"Wispr", "ABC-12", "INFRA"}
+	joined := []string{"Wispr", "Whisper", "ABC-12", "INFRA"}
 	k.SetJoined([]string{"ABC-12"})
 	stream.answer(false)
 	if !refused {
@@ -295,7 +338,7 @@ func TestARefusedListIsNotTheStreams(t *testing.T) {
 // it again, with a resend of its own.
 func TestASecondRefusalWaitsForTheNextChange(t *testing.T) {
 	k, stream := quickKeyterms()
-	joined := []string{"Wispr", "ABC-12", "INFRA"}
+	joined := []string{"Wispr", "Whisper", "ABC-12", "INFRA"}
 	k.SetJoined([]string{"ABC-12"})
 	stream.answer(false)
 	waitSent(t, stream, 2)
@@ -446,8 +489,8 @@ func TestKeytermsRefusalLastsWhileTheWantedListIsMissing(t *testing.T) {
 func TestIsName(t *testing.T) {
 	d := New([]string{"Wispr", "Ghost Wispr"})
 	for word, want := range map[string]bool{
-		"Wispr,": true, "wispr": true, "Whisper.": true, "Ghost": true,
-		"Tell": false, "whiskey": false, "": false,
+		"Wispr,": true, "wispr": true, "Whisper.": true, "Ghost": true, "Lispr,": true,
+		"Tell": false, "whiskey": false, "Mister,": false, "": false,
 	} {
 		if got := d.IsName(word); got != want {
 			t.Errorf("IsName(%q) = %v, want %v", word, got, want)
