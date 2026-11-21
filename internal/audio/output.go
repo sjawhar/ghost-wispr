@@ -124,11 +124,13 @@ type OutputConfig struct {
 type SpeechEvent struct {
 	Input   string
 	Started bool // false: the speech ended
-	// At is when the stream took the frame with the speech's first audio,
-	// once its write returned, or when the speech's last audio was mixed, on
-	// the system clock: the room hears it later, by as much as the device
-	// holds (up to alsaBuffer on Linux). A speech the stream took no audio
-	// of, as one cut before its first frame was written, has no events.
+	// At is when the stream took the frame with the speech's first audio, on
+	// a start, or, on an end, the frame with its last audio, replayed after
+	// a Drop included: in each case once the stream's write returned, on the
+	// system clock. A cancelled end's At is when the mixer took the Cancel
+	// in. The room hears the audio later, by as much as the device holds (up
+	// to alsaBuffer on Linux). A speech the stream took no audio of, as one
+	// cut before its first frame was written, has no events.
 	At time.Time
 	// Played, on an end, is how much of the input's audio the stream took in
 	// the speech, less what a Cancel took back from the device.

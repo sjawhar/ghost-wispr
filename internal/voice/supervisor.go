@@ -147,8 +147,10 @@ type Transcript struct {
 // Word is one word of a Transcript, with Deepgram's speaker label and its
 // times on the socket, in seconds. At is when its start was captured, on the
 // system clock, as the live stream times it (main.go's voiceTranscript); a
-// word with no At is taken as captured when its result arrived (Transcript.At),
-// as the session manager takes the words of a result with no live stream.
+// word older than the stream's clock history is timed by the oldest audio
+// that history keeps, the latest it can have been said. A word with no At is
+// taken as captured when its result arrived (Transcript.At), as the session
+// manager takes the words of a result with no live stream.
 type Word struct {
 	Text       string
 	Speaker    int

@@ -465,6 +465,36 @@ func TestAnOldPointKeepsItsTime(t *testing.T) {
 	}
 }
 
+// TestAWordOlderThanTheClocksHistoryIsTimedByItsOldestAudio fails if a point
+// of the stream older than every buffer the clock still times is untimed:
+// the voice then takes its word as said when its result arrived, so a
+// question whose result comes more than captureStamps buffers late stops
+// its own answer (Sol's review of #133 at e6484db). It was captured before
+// the oldest audio kept, so it is timed by that audio, the latest it can
+// have been. The control: a point inside the oldest buffer kept is timed
+// exactly, by its place in that buffer.
+func TestAWordOlderThanTheClocksHistoryIsTimedByItsOldestAudio(t *testing.T) {
+	socket := &mockWriter{}
+	rc := NewResilientClient(t.Context(), func(context.Context) (io.WriteCloser, error) { return socket, nil }, ResilientConfig{SampleRate: 16000}, nil, nil)
+	rc.reconnect(0)
+	const quarter = secondOfAudio / 4
+	for range captureStamps + 8 { // the first 8 quarter seconds are no longer kept
+		_, _ = rc.Write(make([]byte, quarter))
+	}
+	oldest, ok := rc.CapturedAt(2 * time.Second)
+	if !ok {
+		t.Fatal("control: the clock no longer times the oldest buffer it keeps")
+	}
+	if at, ok := rc.CapturedAt(2125 * time.Millisecond); !ok || !at.Equal(oldest.Add(125*time.Millisecond)) {
+		t.Fatalf("control: CapturedAt(2.125s) = %v (%v), want %v, 125 ms into the oldest buffer kept", at.Format(time.StampMicro), ok, oldest.Add(125*time.Millisecond).Format(time.StampMicro))
+	}
+	for _, point := range []time.Duration{0, 1900 * time.Millisecond} {
+		if at, ok := rc.CapturedAt(point); !ok || !at.Equal(oldest) {
+			t.Errorf("CapturedAt(%v) = %v (%v), older than the clock's history; want %v, when its oldest audio was captured", point, at.Format(time.StampMicro), ok, oldest.Format(time.StampMicro))
+		}
+	}
+}
+
 // stampOrder is a live client that records, as the send queue stamps a
 // chunk, whether the chunk is already on the queue for the client to take:
 // no client goroutine runs, so the check needs no timing.
