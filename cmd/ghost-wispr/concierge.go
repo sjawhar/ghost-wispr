@@ -86,23 +86,32 @@ func startConcierge(ctx context.Context, cfg *config.Config, store *storage.SQLi
 			wait = nextEnvoyRetry(wait)
 		}
 	}()
+	closeSession := func(ctx context.Context, session envoySession) {
+		if roster != nil {
+			roster.SetAgents(nil) // the joined agents hear nothing more
+		}
+		closeCtx, done := context.WithTimeout(ctx, 5*time.Second)
+		defer done()
+		if err := session.Close(closeCtx); err != nil {
+			logger.Warn("concierge: close the Envoy session", "error", err)
+		}
+	}
 	stop := func(ctx context.Context) {
 		cancel()
-		var session envoySession
 		select {
-		case session = <-sessions:
+		case session := <-sessions:
+			if session != nil {
+				closeSession(ctx, session)
+			}
 		case <-ctx.Done():
-			logger.Warn("concierge: the Envoy session's opening did not end by the shutdown's deadline", "error", context.Cause(ctx))
-		}
-		if session != nil {
-			if roster != nil {
-				roster.SetAgents(nil) // the joined agents hear nothing more
-			}
-			closeCtx, done := context.WithTimeout(ctx, 5*time.Second)
-			defer done()
-			if err := session.Close(closeCtx); err != nil {
-				logger.Warn("concierge: close the Envoy session", "error", err)
-			}
+			logger.Warn("concierge: the Envoy session's opening did not end by the shutdown's deadline; a session it still opens is closed when it does", "error", context.Cause(ctx))
+			// Nothing else would close a session that opening completes
+			// later, nor remove its registration from Envoy.
+			go func() {
+				if session := <-sessions; session != nil {
+					closeSession(context.Background(), session)
+				}
+			}()
 		}
 		stopConcierge(ctx)
 	}
@@ -265,7 +274,7 @@ type lazyConcierge struct {
 	turningOff sync.WaitGroup
 	mu         sync.Mutex
 	c          *concierge.Concierge
-	stop       func(context.Context) // stops c within its context (startConcierge)
+	stop       func(context.Context)
 	fwd        chan struct{} // closed to end c's forward
 	err        error         // why the last start failed
 	gen        int           // each turn-off and the shutdown change it

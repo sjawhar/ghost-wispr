@@ -74,19 +74,21 @@ func TestTheEnvoySessionIsRetriedUntilItOpens(t *testing.T) {
 // Concierge's stop waits past its context's end for an Envoy session's
 // opening that does not see the cancel, as a resume point's store write
 // waiting for the store's one connection does not: the unit's shutdown would
-// hang there and never close its store. The control is
-// TestTheEnvoySessionIsRetriedUntilItOpens, where the opening ends and the
-// stop closes the session it opened.
+// hang there and never close its store. It also fails if a session that
+// opening completes after the stop gave up is never closed, which would leave
+// its registration at Envoy. The control is
+// TestTheEnvoySessionIsRetriedUntilItOpens, where the opening ends before the
+// stop and the stop closes the session it opened.
 func TestAStopWaitsForTheEnvoySessionsOpeningOnlyWithinItsDeadline(t *testing.T) {
 	opening, release := make(chan struct{}), make(chan struct{})
+	late := &fakeEnvoySession{}
 	original := openEnvoySession
 	t.Cleanup(func() { openEnvoySession = original })
 	openEnvoySession = func(context.Context, *envoy.Listener, *envoy.SessionConfig) (envoySession, error) {
 		close(opening)
-		<-release // it does not see the cancel
-		return nil, errors.New("cancelled")
+		<-release // it does not see the cancel, and then opens the session
+		return late, nil
 	}
-	defer close(release)
 	cfg := config.Config{GenAIBackend: "gemini", GeminiAPIKey: "test", Concierge: config.Concierge{EnvoyURL: "http://127.0.0.1:1"}}
 	_, stop, err := startConcierge(t.Context(), &cfg, conciergeStore(t), discardLogger, nil, nil)
 	if err != nil {
@@ -109,6 +111,12 @@ func TestAStopWaitsForTheEnvoySessionsOpeningOnlyWithinItsDeadline(t *testing.T)
 	case <-time.After(2 * time.Second):
 		t.Fatal("the stop waited past its deadline for the Envoy session's opening")
 	}
+	close(release)
+	waitUntil(t, "the session the opening completed after the stop closed", func() bool {
+		late.mu.Lock()
+		defer late.mu.Unlock()
+		return late.closed
+	})
 }
 
 // TestEnvoyRetriesBackOffToAMinute fails if the waits between attempts do not
