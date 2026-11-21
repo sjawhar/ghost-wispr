@@ -215,7 +215,7 @@ type outputInput struct {
 	// Cancel: what Cancel takes back from the device comes off what it played.
 	silenced *Playback
 	// audioFrom and audioTo are the stream positions the speech's audio
-	// spans, so that a Cancel takes off only the audio it took back.
+	// spans.
 	audioFrom, audioTo int64
 	lastAudio          time.Time
 	quietAt            time.Time // when it ran out of audio; zero while it has some
@@ -223,6 +223,10 @@ type outputInput struct {
 	contrib            []float32 // its part in the frame being mixed
 	history            []float32 // its part in the stream's last outputHistory: a ring that ends at histPos
 	histPos            int
+	// held marks, along history, each stream position that held its queued
+	// audio, not silence: a Cancel takes off what it played only the audio
+	// it took back, though the speech had gaps.
+	held []bool
 }
 
 type segment struct {
@@ -476,7 +480,12 @@ func (o *Output) Cancel(input string) {
 	last, cut := in.last, !in.idle()
 	in.end(ErrCancelled)
 	if in.speaking {
-		in.cancelled, in.cut, in.silenced = true, cut, last
+		// A second Cancel before the mixer takes the first in finds nothing
+		// queued: it keeps the first one's cut and playback.
+		in.cancelled, in.cut = true, in.cut || cut
+		if in.silenced == nil {
+			in.silenced = last
+		}
 		o.dropNow = true
 	}
 	o.changed()
@@ -793,21 +802,36 @@ func (o *Output) mix(stream PlaybackStream, rate int) error {
 				return nil
 			}
 		case stepDrop:
-			back, err := stream.Drop()
-			if err != nil {
-				return fmt.Errorf("take back speaker stream: %w", err)
-			}
-			if back > hist {
-				slog.Warn("speaker stream took back more than the Output keeps; the rest of the other inputs is lost", "frames", back, "kept", hist)
-				back = hist
-			}
-			o.retake(redo[:max(back, 0)], sum, rate)
-			// What the stream took back plays again: the stream time written
-			// is as before, so the pacer is not touched.
-			for off := 0; off < back; off += n {
-				if err := stream.Write(redo[off:min(off+n, back)]); err != nil {
-					return fmt.Errorf("write speaker stream: %w", err)
+			// unwritten is how much of the stream's time, up to the
+			// mixer's position, a Cancel that came during the replay left
+			// unwritten: it plays again with what the device gives back.
+			unwritten := 0
+			for {
+				got, err := stream.Drop()
+				if err != nil {
+					return fmt.Errorf("take back speaker stream: %w", err)
 				}
+				back := max(got, 0) + unwritten
+				if back > hist {
+					slog.Warn("speaker stream took back more than the Output keeps; the rest of the other inputs is lost", "frames", back, "kept", hist)
+					back = hist
+				}
+				o.retake(redo[:back], sum, rate)
+				// What the stream took back plays again: the stream time
+				// written is as before, so the pacer is not touched. A
+				// Cancel during it takes back the device's audio again.
+				off, again := 0, false
+				for off < back && !again {
+					end := min(off+n, back)
+					if err := stream.Write(redo[off:end]); err != nil {
+						return fmt.Errorf("write speaker stream: %w", err)
+					}
+					off, again = end, end < back && o.takeDrop()
+				}
+				if !again {
+					break
+				}
+				unwritten = back - off
 			}
 			continue
 		}
@@ -907,6 +931,16 @@ func (o *Output) closeIdle() {
 	o.endSpeeches(time.Now(), false)
 }
 
+// takeDrop reports whether a Cancel asked, since the mixer last looked, to
+// take back the device's audio, and takes the request.
+func (o *Output) takeDrop() bool {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	drop := o.dropNow
+	o.dropNow = false
+	return drop
+}
+
 // wrote records that the stream has taken frame seq, and wakes every Write
 // and Drain that waits.
 func (o *Output) wrote(seq uint64) {
@@ -925,8 +959,9 @@ func (o *Output) mixFrame(frame []int16, sum []float32, rate, hist int, now time
 	from, to, hold := o.duck(voice, chime)
 	for _, in := range o.order {
 		if len(in.contrib) != len(frame) || len(in.history) != hist {
-			in.contrib, in.history, in.histPos = make([]float32, len(frame)), make([]float32, hist), 0
+			in.contrib, in.history, in.held, in.histPos = make([]float32, len(frame)), make([]float32, hist), make([]bool, hist), 0
 		}
+		held := 0 // how much of the frame holds the input's queued audio
 		switch {
 		case in == chime && hold:
 			// The voice goes down over this frame; the sound starts on the next.
@@ -956,12 +991,22 @@ func (o *Output) mixFrame(frame []int16, sum []float32, rate, hist int, now time
 			}
 			if audioEnd >= 0 {
 				in.audioTo = o.pos + int64(audioEnd)
+				held = audioEnd
+			} else if in.audioTo > o.pos {
+				// The resampler's tail of the audio queued last frame.
+				held = int(in.audioTo - o.pos)
+			}
+			if in.audioTo > o.pos && in.last != nil {
+				// The frame holds audio of the playback taken last: a
+				// Drain of it waits for this frame, the resampler's tail
+				// included.
+				in.last.seq = max(in.last.seq, o.mixed)
 			}
 			in.lastAudio, in.quietAt = now, time.Time{}
 			active = true
 		}
-		for _, c := range in.contrib {
-			in.history[in.histPos] = c
+		for i, c := range in.contrib {
+			in.history[in.histPos], in.held[in.histPos] = c, i < held
 			if in.histPos++; in.histPos == hist {
 				in.histPos = 0
 			}
@@ -1014,16 +1059,23 @@ func duckVoice(contrib []float32, from, to float32) {
 func (o *Output) retake(redo []int16, sum []float32, rate int) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
-	back := int64(len(redo))
+	back := len(redo)
 	now := time.Now()
 	for _, in := range o.order {
 		if !in.cancelled {
 			continue
 		}
-		clear(in.history)
 		// The stream took back [pos-back, pos); of the speech's audio, the
-		// room will not hear what lies there.
-		lost := max(0, min(o.pos, in.audioTo)-max(o.pos-back, in.audioFrom))
+		// room will not hear what lies there, and only its audio: a gap in
+		// the speech was silence.
+		lost, h := 0, len(in.held)
+		for i := range min(back, h) {
+			if in.held[(in.histPos-back+i+2*h)%h] {
+				lost++
+			}
+		}
+		clear(in.history)
+		clear(in.held)
 		unheard := time.Duration(lost) * time.Second / time.Duration(rate)
 		in.spoken.sub(unheard)
 		if in.silenced != nil {
