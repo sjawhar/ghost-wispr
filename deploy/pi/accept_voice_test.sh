@@ -17,10 +17,10 @@
 # (deploy/pi/journalrecords), so a driver that reads another journal, another process's lines or
 # another key reads nothing. Each step runs once as it should pass and once against its
 # verification check's negative control. Cases run in parallel; each records its failures, and the
-# run goes on, so that one run shows every assertion that fails. On 2 CPUs a whole run takes about
-# 8 minutes (488 s and 507 s on sami-devbox, 2026-11-20), so give it a timeout of 15 minutes or
-# more. Killed early, it leaves nothing for long: its fake services end within 5 s of it, and a
-# driver still restoring its case within 150 s.
+# run goes on, so that one run shows every assertion that fails. On 2 CPUs a whole run takes 8 to 11
+# minutes (488 s and 507 s on 2026-11-20; 627 s on 2026-11-21, on a machine at a load average of
+# about 400), so give it a timeout of 15 minutes or more. Killed early, it leaves nothing for long:
+# its fake services end within 5 s of it, and a driver still restoring its case within 150 s.
 set -uo pipefail
 
 repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -129,6 +129,23 @@ def alive(pid):
             return f.read().rsplit(")", 1)[1].split()[0] != "Z"
     except (OSError, IndexError):
         return False
+
+
+def process_start_ms():
+    """When this process began, on now_ms's clock, never early. The fake tools exec python3, so
+    this is the fork of the process that ran the tool. /proc/self/stat gives its start in whole
+    clock ticks since boot, rounded down, so one tick more; and boot is placed on the wall clock by
+    reading the boot clock first, so that the time between the two reads makes it later, and the
+    least of three such placings is taken, so that a preemption between two reads costs nothing."""
+    with open("/proc/self/stat") as f:
+        ticks = int(f.read().rsplit(")", 1)[1].split()[19])
+    boot = None
+    for _ in range(3):
+        since_boot = time.clock_gettime_ns(time.CLOCK_BOOTTIME)
+        placed = time.time_ns() - since_boot
+        boot = placed if boot is None else min(boot, placed)
+    start = boot + (ticks + 1) * 1_000_000_000 // os.sysconf("SC_CLK_TCK")
+    return (start + 999_999) // 1_000_000
 
 
 def test_running():
@@ -869,7 +886,18 @@ def arecord(args):
     with open(path, "wb") as f:
         f.write(bytes(44))
         f.flush()
-        begun = now_ms()
+        # The file's first sample: by default, when the fake has started, which on a loaded machine
+        # can be long after the driver started arecord, so that an early bound, which counts from
+        # then, is early by that long too. arecord-prompt captures it as the process began, as an
+        # arecord that opens its device at once does, so that an early bound is early only by the
+        # driver's fork and a clock tick, however late the fake runs; arecord-slow-start captures it
+        # 0.5 s after the fake has started, as an arecord slow to open its device does, so that every
+        # early bound is more than 0.5 s early. With both, the prompt stamp stands. The process
+        # start is rounded up a tick, so the stamp is also kept no later than now: the first sample
+        # is never stamped after it is written.
+        if "arecord-slow-start" in SCENARIO:
+            time.sleep(0.5)
+        begun = min(process_start_ms(), now_ms()) if "arecord-prompt" in SCENARIO else now_ms()
         log_to("recordings", "%s %d" % (path, begun))
         written = 0
         # From the first clip played after the recording began: arecord-lag makes the file run 1 s
@@ -1663,9 +1691,14 @@ launch barge-backchannel-late answer-until-clip,backchannel-stops,late-clip yes 
 # pass, and a word that runs into it; a louder wake sound whose echo the rig hears for 320 ms, which
 # must pass against its calibration (a fixed 300 ms bound returned UNKNOWN), and a word that runs
 # into it, which must still fail; a build without ghost-wispr play-sound (UNKNOWN); the rig's clock
-# 200 ppm fast and slow, which must pass, and a 21 ms tail on the fast clock, which must fail; a rig
-# recording that ends before the step stops it, no chime heard where the next question's belongs,
-# and no wake_heard for it (each UNKNOWN); a logged underrun; an XRUN the speaker did not log.
+# 200 ppm fast and slow, which must pass, and a 21 ms tail on the fast clock, over the bound only at
+# its late bound (UNKNOWN); a rig recording that ends before the step stops it, no chime heard where
+# the next question's belongs, and no wake_heard for it (each UNKNOWN); a logged underrun; an XRUN
+# the speaker did not log. Each case whose FAIL rests on a tail's early bound (the drain, alone and
+# 60 ms behind, the words 150 ms and 1.1 s on, and the word well before the chime) records with an
+# arecord whose first sample is stamped at its fork (arecord-prompt): the early bound counts from
+# before the driver starts arecord, so a fake stamped once a loaded machine got round to starting
+# it would turn its FAIL into UNKNOWN.
 readonly cancel_args="--step playback-cancel --stops 2 --playback-seconds 3 --question @question.wav --stop-clip @stop.wav --rig-mic $rig --event-timeout 15"
 # shellcheck disable=SC2086
 launch cancel long,asound yes -- $cancel_args
@@ -1675,14 +1708,22 @@ launch cancel-rewind long,asound,rewind yes -- $cancel_args
 launch cancel-slow-status long,asound,slow-status yes -- $cancel_args
 # shellcheck disable=SC2086
 launch cancel-tail long,asound,tail-50 yes -- $cancel_args
+# The word 150 ms on, recorded by an arecord stamped at its fork: FAIL, even at its early bound; by
+# one that starts late: UNKNOWN, never FAIL or PASS; and by one stamped at its fork though the fake
+# runs late: FAIL still, so a stamp that slips back to the fake's own start fails here on a machine
+# with no load, not only on a loaded one.
 # shellcheck disable=SC2086
-launch cancel-leak long,asound,leak-150 yes -- $cancel_args
+launch cancel-leak long,asound,leak-150,arecord-prompt yes -- $cancel_args
 # shellcheck disable=SC2086
-launch cancel-leak-late long,asound,leak-1100 yes -- $cancel_args
+launch cancel-leak-unsure long,asound,leak-150,arecord-slow-start yes -- $cancel_args
+# shellcheck disable=SC2086
+launch cancel-leak-stalled long,asound,leak-150,arecord-prompt,arecord-slow-start yes -- $cancel_args
+# shellcheck disable=SC2086
+launch cancel-leak-late long,asound,leak-1100,arecord-prompt yes -- $cancel_args
 # shellcheck disable=SC2086
 launch cancel-leak-quiet long,asound,leak-after-quiet yes -- $cancel_args
 # shellcheck disable=SC2086
-launch cancel-leak-chime long,asound,leak-before-chime yes -- $cancel_args
+launch cancel-leak-chime long,asound,leak-before-chime,arecord-prompt yes -- $cancel_args
 # shellcheck disable=SC2086
 launch cancel-leak-apart-chime long,asound,leak-apart-chime yes -- $cancel_args
 # shellcheck disable=SC2086
@@ -1712,7 +1753,7 @@ launch cancel-no-chime long,asound,no-chime-after-stop yes -- $cancel_args
 # shellcheck disable=SC2086
 launch cancel-no-wake long,asound,no-wake-after-stop yes -- $cancel_args
 # shellcheck disable=SC2086
-launch cancel-drain long,asound,drain yes -- $cancel_args
+launch cancel-drain long,asound,drain,arecord-prompt yes -- $cancel_args
 # shellcheck disable=SC2086
 launch cancel-underrun long,asound,underrun yes -- $cancel_args
 # shellcheck disable=SC2086
@@ -1723,7 +1764,7 @@ launch cancel-xrun long,asound,xrun yes -- $cancel_args
 # shellcheck disable=SC2086
 launch cancel-behind long,asound,arecord-behind yes -- $cancel_args
 # shellcheck disable=SC2086
-launch cancel-behind-drain long,asound,arecord-behind,drain yes -- $cancel_args
+launch cancel-behind-drain long,asound,arecord-behind,drain,arecord-prompt yes -- $cancel_args
 # A wc whose sizes come 200 ms late: the recording's anchors read their size without it, so a good
 # cancel still passes.
 # shellcheck disable=SC2086
@@ -2205,13 +2246,21 @@ expect_restored cancel-rewind
 expect_rc cancel-slow-status 0
 expect_line cancel-slow-status "PASS: playback-cancel: no stop's speech was heard at the rig microphone 20 ms after it"
 expect_restored cancel-slow-status
-# heard_after NAME: the milliseconds a FAIL line says a stop's speech was heard after it.
+# heard_after NAME: the milliseconds a FAIL line says a stop's speech was heard after it, or, from an
+# UNKNOWN line, the late bound: an expected FAIL that comes back UNKNOWN fails on its exit status
+# with both bounds printed, and its tail is still measured, never "nothing".
 heard_after() {
-  sed -n "s/^FAIL: playback-cancel: a stop's speech was heard at the rig microphone \([0-9]*\) ms after it.*/\1/p" "$root/$1/out"
+  sed -n -e "s/^FAIL: playback-cancel: a stop's speech was heard at the rig microphone \([0-9]*\) ms after it.*/\1/p" \
+    -e "s/^UNKNOWN: playback-cancel: stop [0-9]*'s speech was heard at the rig microphone up to \([0-9]*\) ms after it.*/\1/p" "$root/$1/out"
 }
 # heard_up_to NAME: the milliseconds an UNKNOWN line says a stop's speech was heard up to after it.
 heard_up_to() {
   sed -n "s/^UNKNOWN: playback-cancel: stop [0-9]*'s speech was heard at the rig microphone up to \([0-9]*\) ms after it.*/\1/p" "$root/$1/out"
+}
+# heard_no_earlier NAME: the milliseconds a FAIL or UNKNOWN line says a stop's speech was heard no
+# earlier than after it: the early bound of the tail it names.
+heard_no_earlier() {
+  sed -n "s/^\(FAIL\|UNKNOWN\): playback-cancel: .*no earlier than \([0-9]*\) ms after it.*/\2/p" "$root/$1/out"
 }
 # expect_not_passed NAME LOW HIGH: a tail over the bound whose early bound may or may not be over
 # it, by how late the recording's anchors were read: FAIL or UNKNOWN, never PASS, and the tail it
@@ -2245,9 +2294,23 @@ expect_between 'cancel-drain: how long the negative control is heard' "$(heard_a
 expect_restored cancel-drain
 expect_not_passed cancel-tail 30 120
 expect_restored cancel-tail
+# The word 150 ms after the stop, 250 ms long, so its end is 400 ms after the stop. Recorded by an
+# arecord that starts at once, its early bound is over the 20 ms bound too, and never over 400, as a
+# stamp that is never early keeps it: FAIL. Recorded by one slow to start, its early bound is 0.5 s
+# early, under the bound, and its late bound over it: UNKNOWN, never FAIL or PASS.
 expect_rc cancel-leak 1
 expect_between 'cancel-leak: how long the leaked word is heard' "$(heard_after cancel-leak)" 150 500
+expect_between 'cancel-leak: how long the leaked word is heard, at the least' "$(heard_no_earlier cancel-leak)" 21 400
 expect_restored cancel-leak
+expect_rc cancel-leak-stalled 1
+expect_between 'cancel-leak-stalled: how long the leaked word is heard, at the least, with the fake 0.5 s late' "$(heard_no_earlier cancel-leak-stalled)" 21 400
+expect_restored cancel-leak-stalled
+expect_rc cancel-leak-unsure 2
+expect_between 'cancel-leak-unsure: how long the leaked word is heard up to' "$(heard_up_to cancel-leak-unsure)" 150 500
+expect_between 'cancel-leak-unsure: how long the leaked word is heard, at the least' "$(heard_no_earlier cancel-leak-unsure)" 0 20
+expect_no_line cancel-leak-unsure "FAIL: playback-cancel: a stop's speech was heard"
+expect_no_line cancel-leak-unsure "PASS: playback-cancel: no stop's speech was heard"
+expect_restored cancel-leak-unsure
 expect_rc cancel-leak-late 1
 expect_between 'cancel-leak-late: how long the word after a long silence is heard' "$(heard_after cancel-leak-late)" 1300 1500
 expect_restored cancel-leak-late
