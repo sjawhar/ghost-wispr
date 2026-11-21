@@ -136,7 +136,8 @@ def process_start_ms():
     this is the fork of the process that ran the tool. /proc/self/stat gives its start in whole
     clock ticks since boot, rounded down, so one tick more; and boot is placed on the wall clock by
     reading the boot clock first, so that the time between the two reads makes it later, and the
-    least of three such placings is taken, so that a preemption between two reads costs nothing."""
+    least of three such placings is taken, so that a preemption between two of the reads costs
+    nothing unless every placing is preempted, and then only in the late direction."""
     with open("/proc/self/stat") as f:
         ticks = int(f.read().rsplit(")", 1)[1].split()[19])
     boot = None
@@ -2283,6 +2284,7 @@ expect_line cancel-behind 'PASS: playback-cancel: 0 underruns'
 expect_no_line cancel-behind "FAIL: playback-cancel: a stop's speech was heard"
 expect_restored cancel-behind
 expect_rc cancel-behind-drain 1
+expect_line cancel-behind-drain "FAIL: playback-cancel: a stop's speech was heard at the rig microphone "
 expect_between 'cancel-behind-drain: how long the negative control is heard, 60 ms behind' "$(heard_after cancel-behind-drain)" 450 1000
 expect_restored cancel-behind-drain
 expect_rc cancel-slow-wc 0
@@ -2296,8 +2298,9 @@ expect_not_passed cancel-tail 30 120
 expect_restored cancel-tail
 # The word 150 ms after the stop, 250 ms long, so its end is 400 ms after the stop. Recorded by an
 # arecord that starts at once, its early bound is over the 20 ms bound too, and never over 400, as a
-# stamp that is never early keeps it: FAIL. Recorded by one slow to start, its early bound is 0.5 s
-# early, under the bound, and its late bound over it: UNKNOWN, never FAIL or PASS.
+# stamp that is never early keeps it: FAIL. Recorded by one slow to start, its early bound is more
+# than 0.5 s early, under the bound, and its late bound over it: UNKNOWN, never FAIL or PASS; and by
+# one stamped at its fork though the fake runs late, FAIL again.
 expect_rc cancel-leak 1
 expect_between 'cancel-leak: how long the leaked word is heard' "$(heard_after cancel-leak)" 150 500
 expect_between 'cancel-leak: how long the leaked word is heard, at the least' "$(heard_no_earlier cancel-leak)" 21 400
@@ -2306,18 +2309,21 @@ expect_rc cancel-leak-stalled 1
 expect_between 'cancel-leak-stalled: how long the leaked word is heard, at the least, with the fake 0.5 s late' "$(heard_no_earlier cancel-leak-stalled)" 21 400
 expect_restored cancel-leak-stalled
 expect_rc cancel-leak-unsure 2
+expect_line cancel-leak-unsure "UNKNOWN: playback-cancel: stop "
 expect_between 'cancel-leak-unsure: how long the leaked word is heard up to' "$(heard_up_to cancel-leak-unsure)" 150 500
 expect_between 'cancel-leak-unsure: how long the leaked word is heard, at the least' "$(heard_no_earlier cancel-leak-unsure)" 0 20
 expect_no_line cancel-leak-unsure "FAIL: playback-cancel: a stop's speech was heard"
 expect_no_line cancel-leak-unsure "PASS: playback-cancel: no stop's speech was heard"
 expect_restored cancel-leak-unsure
 expect_rc cancel-leak-late 1
+expect_line cancel-leak-late "FAIL: playback-cancel: a stop's speech was heard at the rig microphone "
 expect_between 'cancel-leak-late: how long the word after a long silence is heard' "$(heard_after cancel-leak-late)" 1300 1500
 expect_restored cancel-leak-late
 expect_rc cancel-leak-quiet 2
 expect_line cancel-leak-quiet 'UNKNOWN: playback-cancel stop 1: the rig microphone did not hear the speech up to the stop'
 expect_restored cancel-leak-quiet
 expect_rc cancel-leak-chime 1
+expect_line cancel-leak-chime "FAIL: playback-cancel: a stop's speech was heard at the rig microphone "
 expect_between 'cancel-leak-chime: how long the word before the next chime is heard' "$(heard_after cancel-leak-chime)" 1500 6000
 expect_restored cancel-leak-chime
 expect_rc cancel-leak-apart-chime 1
