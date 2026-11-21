@@ -96,12 +96,19 @@ type phrase struct {
 var openers = map[string]bool{"hey": true, "hi": true, "ok": true, "okay": true, "so": true, "um": true, "uh": true, "and": true}
 
 // soundsLike lists the spellings Deepgram gives the name when it does not
-// write it as configured. They count only when the word ends in a comma or
-// the text ends, or a question or request word follows, since "whisper" is
-// also an ordinary word.
+// write it as configured, "Lispr" among them on 2026-11-21. They count only
+// when the word ends in a comma or the text ends, or a question or request
+// word follows, since "whisper" is also an ordinary word. "Mister" and the
+// like, which Deepgram also wrote for the name, are a person's address and
+// never count.
 var soundsLike = map[string][]string{
-	"wispr": {"whisper", "wisper", "whispr", "wispa", "whispa"},
+	"wispr": {"whisper", "wisper", "whispr", "wispa", "whispa", "lispr"},
 }
+
+// keytermsLike are the words a wake phrase is sent with as Deepgram
+// keyterms, right after it: Nova-3 knows how "Whisper" sounds, and not the
+// spelling "Wispr", which it heard as "Mister", "Miss Burr" and "Lispr".
+var keytermsLike = map[string]string{"wispr": "Whisper"}
 
 // callWords may follow a sound-alike spelling of the name in a call.
 var callWords = map[string]bool{
@@ -479,12 +486,20 @@ func digitsOnly(w string) bool {
 }
 
 // Keyterms returns the keyterms for Deepgram's live options: the wake
-// phrases first, then issue keys, each once, within Deepgram's limits.
+// phrases first, each followed by its keyterm-like word (keytermsLike), then
+// issue keys, each once, within Deepgram's limits.
 func Keyterms(phrases, issueKeys []string) []string {
-	out := make([]string, 0, len(phrases)+len(issueKeys))
+	withLike := make([]string, 0, 2*len(phrases))
+	for _, p := range phrases {
+		withLike = append(withLike, p)
+		if like, ok := keytermsLike[normalise(strings.TrimSpace(p))]; ok {
+			withLike = append(withLike, like)
+		}
+	}
+	out := make([]string, 0, len(withLike)+len(issueKeys))
 	seen := make(map[string]bool, cap(out))
 	tokens := 0
-	for _, list := range [][]string{phrases, issueKeys} {
+	for _, list := range [][]string{withLike, issueKeys} {
 		for _, k := range list {
 			k = strings.Join(strings.Fields(k), " ")
 			n := len(strings.Fields(k))
