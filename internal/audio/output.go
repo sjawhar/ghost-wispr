@@ -240,9 +240,11 @@ type outputInput struct {
 // owners is who the queued samples a stream position holds came from: last,
 // and, when an earlier playback's samples share the position, as one
 // position of a downsampled input can hold the end of one playback and the
-// start of the next, first and how many of them were its. A third playback
-// in one position, one shorter than a resampling step, has its samples
-// counted as first's.
+// start of the next, first and how many of them were its. The samples of a
+// playback between those two, one shorter than a resampling step, are
+// counted as last's: a take-back of the position takes all of last, whose
+// later audio follows it, so last loses all it played either way, and the
+// playback between keeps them as played, as on main.
 type owners struct {
 	last, first *Playback
 	firstN      int
@@ -775,11 +777,8 @@ func (in *outputInput) render(rate int) {
 func (in *outputInput) land(j int, pb *Playback) {
 	n := int(in.landed[j] >> 24)
 	if o := &in.landedBy[j]; o.last != pb {
-		if o.last != nil {
-			if o.first == nil {
-				o.first = o.last
-			}
-			o.firstN = n
+		if o.last != nil && o.first == nil {
+			o.first, o.firstN = o.last, n
 		}
 		o.last = pb
 	}
