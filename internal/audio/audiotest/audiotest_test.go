@@ -7,7 +7,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"slices"
 	"strings"
 	"testing"
@@ -22,12 +21,14 @@ const (
 	audioPkg = module + "/internal/audio"
 )
 
-// goTool is the go command: the one on PATH, else this toolchain's.
-func goTool() string {
-	if path, err := exec.LookPath("go"); err == nil {
-		return path
+// goTool is the go command on PATH, which `go test` runs with.
+func goTool(t *testing.T) string {
+	t.Helper()
+	path, err := exec.LookPath("go")
+	if err != nil {
+		t.Fatalf("UNKNOWN: no go command on PATH, so the test binaries cannot be listed: %v", err)
 	}
-	return filepath.Join(runtime.GOROOT(), "bin", "go")
+	return path
 }
 
 // TestEveryTestBinaryThatLinksAudioRefusesRealDevices fails if the tests of a
@@ -36,11 +37,11 @@ func goTool() string {
 // internal/audio itself): those tests could open a real microphone or
 // speaker. It lists the module's test binaries with `go list -test`.
 func TestEveryTestBinaryThatLinksAudioRefusesRealDevices(t *testing.T) {
-	gomod, err := exec.Command(goTool(), "env", "GOMOD").Output()
+	gomod, err := exec.Command(goTool(t), "env", "GOMOD").Output()
 	if err != nil {
 		t.Fatalf("UNKNOWN: go env GOMOD: %v", err)
 	}
-	list := exec.Command(goTool(), "list", "-e", "-test", "-f", "{{.ImportPath}}\t{{.Dir}}\t{{join .Deps \",\"}}", "./...")
+	list := exec.Command(goTool(t), "list", "-e", "-test", "-f", "{{.ImportPath}}\t{{.Dir}}\t{{join .Deps \",\"}}", "./...")
 	list.Dir = filepath.Dir(strings.TrimSpace(string(gomod)))
 	out, err := list.Output()
 	if err != nil {

@@ -87,8 +87,9 @@ const ALSACapturePeriod = 100 * time.Millisecond
 // is no device (realDevice).
 func OpenALSACapture(device string, rate int) (*ALSACapture, error) {
 	if device != alsaNullPCM {
-		if err := realDevice("ALSA capture " + device); err != nil {
-			return nil, err
+		refused := realDevice("ALSA capture " + device)
+		if refused != nil {
+			return nil, refused
 		}
 	}
 	name := C.CString(device)

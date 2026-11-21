@@ -77,7 +77,9 @@ func TestCaptureDevicePresentLooksOnlyAtTheNamedCard(t *testing.T) {
 // PortAudio's device for its ALSA card and device numbers.
 func TestANamedMicrophoneOpensOnlyThatCardsInput(t *testing.T) {
 	originalDevices, originalOpen, originalDefault := paInputDevices, paOpenInput, paOpenDefaultInput
-	t.Cleanup(func() { paInputDevices, paOpenInput, paOpenDefaultInput = originalDevices, originalOpen, originalDefault })
+	t.Cleanup(func() {
+		paInputDevices, paOpenInput, paOpenDefaultInput = originalDevices, originalOpen, originalDefault
+	})
 	// No case may reach a real input device: the default input is a stub too.
 	defaultOpened := 0
 	paOpenDefaultInput = func(int, int, *[]int16) (inputStream, error) {
