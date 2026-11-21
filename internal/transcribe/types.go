@@ -52,17 +52,7 @@ type ResilientConfig struct {
 	// InitialReconnectDelay is the initial delay before the first reconnection attempt.
 	// Default: 500 milliseconds
 	InitialReconnectDelay time.Duration
-
-	// GracefulCloseWait bounds how long a healthy socket replaced after an
-	// options change may take to return its final results (GracefulCloser).
-	// Zero is DefaultGracefulCloseWait.
-	GracefulCloseWait time.Duration
 }
-
-// DefaultGracefulCloseWait is how long a healthy socket replaced after an
-// options change may take to return its final results, when ResilientConfig
-// sets none.
-const DefaultGracefulCloseWait = 3 * time.Second
 
 // GracefulCloser is a client that can end its stream gracefully: it tells the
 // peer the stream ends, so the peer processes the audio it has and returns its
@@ -75,9 +65,9 @@ type GracefulCloser interface {
 // ResultRelay is a socket that hands its results on through relay, which the
 // client gives it once the socket is dialled: relay runs handOn, the handing
 // on of one result, with CapturedSince and CapturedBefore timing points of
-// that socket's own stream. A socket that ended after a gap returns its last
-// results while the next socket is live (retire), and the words in them are
-// times into its own stream, not its successor's.
+// that socket's own stream. A socket that retired, replaced though healthy,
+// returns its last results while the next socket is live (retire), and the
+// words in them are times into its own stream, not its successor's.
 type ResultRelay interface {
 	RelayResultsThrough(relay func(handOn func()))
 }
@@ -202,13 +192,13 @@ type ResilientClient struct {
 	// its results in starts there (CapturedSince). Both are guarded by Mu.
 	accepted int64
 	origin   int64
-	// current is the stream of the socket dialled last, until it retires,
-	// and relaying the stream of the socket whose result is being handed on
+	// current is the stream of the current Client, until it retires, and
+	// relaying the stream of the socket whose result is being handed on
 	// (relayFor), if any: CapturedSince and CapturedBefore time points of
 	// relaying's stream while it is set. relayMu hands on one result at a
-	// time, so relaying names one socket. retired are the sockets that ended
-	// after a gap and may still return their last results (retire). Guarded
-	// by Mu, but relayMu.
+	// time, so relaying names one socket. retired are the sockets that
+	// retired and may still return their last results (retire). Guarded by
+	// Mu, but relayMu.
 	current  *socketStream
 	relaying *socketStream
 	retired  []*retiredSocket
