@@ -14,6 +14,7 @@ require (
 	github.com/hajimehoshi/go-mp3 v0.3.4
 	github.com/nats-io/nats.go v1.53.1
 	github.com/sashabaranov/go-openai v1.41.2
+	golang.org/x/exp v0.0.0-20250620022241-b7579e27df2b
 	golang.org/x/sync v0.22.0
 	golang.org/x/sys v0.47.0
 	google.golang.org/api v0.287.1
@@ -55,7 +56,6 @@ require (
 	go.opentelemetry.io/otel/metric v1.44.0 // indirect
 	go.opentelemetry.io/otel/trace v1.44.0 // indirect
 	golang.org/x/crypto v0.55.0 // indirect
-	golang.org/x/exp v0.0.0-20250620022241-b7579e27df2b // indirect
 	golang.org/x/net v0.58.0 // indirect
 	golang.org/x/oauth2 v0.36.0 // indirect
 	golang.org/x/text v0.41.0 // indirect

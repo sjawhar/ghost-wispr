@@ -508,6 +508,18 @@ polls. The speaker needs no package beyond `libportaudio2`,
 whose dependency `libasound2t64` the Pi already has (`deploy/pi/baseline.txt`). A pause during an
 open keeps the blink(1) red until that open has finished.
 
+To find what keeps the speaker's mixer from the Jabra when it underruns, set the debug setting
+`speaker_trace_dir` (or `GHOST_WISPR_SPEAKER_TRACE_DIR`) to a directory and restart the service; it
+is off by default. The process then keeps its last 3 seconds of Go execution trace in memory, at most
+16 MiB, and on an underrun writes them to `speaker-underrun-<time>.trace` there, at most once every
+10 seconds, keeping the newest 20; the log says `speaker trace: saved the capture of an underrun`.
+`/opt/ghost-wispr/ghost-wispr speaker-trace FILE` prints each turn of the mixer longer than 40 ms
+in the capture (`-slow` changes the bound), longest first, with what it spent the time on: running,
+runnable (Go had no processor free), in a system call (ALSA's write), or waiting on the pacer's
+sleep, the speaker's lock (naming the goroutine that held it) or something else. "Running" covers
+both computing and a thread Linux took off its processor, which a Go trace cannot tell apart.
+Remove the setting once the captures are taken: the trace costs CPU and memory while it runs.
+
 The microphone is never open while the blink(1) is off: the blink(1) stays red while the microphone
 is open, and goes off only once Ghost Wispr has closed it. A pause closes it at once, also while
 its read waits on a device that delivers no frame or its audio waits on a stuck recording file;

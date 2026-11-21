@@ -862,6 +862,9 @@ func main() {
 	if len(os.Args) > 1 && os.Args[1] == "kws-selftest" {
 		os.Exit(runKWSSelfTest(os.Args[2:], os.Stdout, os.Stderr))
 	}
+	if len(os.Args) > 1 && os.Args[1] == "speaker-trace" {
+		os.Exit(runSpeakerTraceCommand(os.Args[2:], os.Stdout, os.Stderr))
+	}
 	if len(os.Args) > 1 && os.Args[1] == "tts-first-audio" {
 		os.Exit(runTTSFirstAudioCommand(context.Background(), os.Args[1:], configPath, nil, os.Stdin, os.Stdout, os.Stderr))
 	}
@@ -1969,11 +1972,23 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 	// while one is open.
 	var output *audio.Output
 	if cfg.SpeakerEnabled {
-		output = audio.NewOutput(audio.OutputConfig{
+		outputCfg := audio.OutputConfig{
 			Device:  cfg.SpeakerDevice,
 			Opening: micDevice.playbackOpening,
 			Closing: micDevice.playbackClosing,
-		})
+		}
+		// speaker_trace_dir, a debug setting: keep the last seconds of the
+		// execution trace and save them on each underrun.
+		if dir := strings.TrimSpace(cfg.SpeakerTraceDir); dir != "" {
+			if speakerTrace, err := audio.StartSpeakerTrace(dir); err != nil {
+				slog.Warn("speaker trace off", "error", err)
+			} else {
+				defer speakerTrace.Stop()
+				outputCfg.Underrun = speakerTrace.Underrun
+				log.Printf("speaker trace on: each underrun saves the last seconds of the execution trace in %s", dir)
+			}
+		}
+		output = audio.NewOutput(outputCfg)
 		log.Printf("speaker output enabled (device=%q)", cfg.SpeakerDevice)
 	}
 
