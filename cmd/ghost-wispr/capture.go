@@ -120,6 +120,11 @@ type captureGate struct {
 	beforeResumeRequest func() error
 	beforeGateOpen      func() error
 	onResumeRefused     func(error)
+	// background runs the gate's opening after a resume or a light hold
+	// (openAfter) as work the stop waits for, since a refused resume saves
+	// the pause state (onResumeRefused); main sets it to the session manager.
+	// Nil runs it on a goroutine of its own.
+	background backgroundWork
 	beforeMicStart      func() error
 	// checkLightPattern readies the light for a red confirmation: it checks
 	// the stored pattern of a unit not yet checked (hardwareControl.CheckLight).
@@ -403,7 +408,7 @@ func (g *captureGate) ReleaseLightHold() {
 	if g.closed && !g.switchOff {
 		g.resumedAt = time.Now()
 		g.starting = true
-		go g.openAfter(g.closings, g.settled, true)
+		g.startOpening(g.closings, g.settled, true)
 	}
 }
 
@@ -596,7 +601,7 @@ func (g *captureGate) resumeWith(t resumeTicket, persist func() error) error {
 	}
 	g.resumedAt = time.Now()
 	g.starting = true
-	go g.openAfter(g.closings, g.settled, false)
+	g.startOpening(g.closings, g.settled, false)
 	return nil
 }
 
@@ -653,6 +658,17 @@ func (g *captureGate) MicHold() string {
 	default:
 		return captureResuming
 	}
+}
+
+// startOpening runs openAfter in the background: as work the stop waits for
+// (background), or on a goroutine of its own with none. Once the stop has run
+// it does not run, and the gate stays closed. g.mu may be held.
+func (g *captureGate) startOpening(closing int, settled <-chan struct{}, forLight bool) {
+	if g.background == nil {
+		go g.openAfter(closing, settled, forLight)
+		return
+	}
+	g.background.Go(func(context.Context) { g.openAfter(closing, settled, forLight) })
 }
 
 // openAfter opens the gate once closing number closing has settled, if the

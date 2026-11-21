@@ -35,6 +35,10 @@ type pausedListenerUnit struct {
 	newDetector func() (*local.Detector, error)
 	// openCapture opens the ALSA capture; tests replace it.
 	openCapture func() (local.Capture, error)
+	// background runs the listener as work the stop waits for: a phrase it
+	// hears resumes, which saves the pause state. main sets it to the session
+	// manager; nil runs the listener on a goroutine of its own.
+	background backgroundWork
 }
 
 // listenerOn reports whether the settings turn the paused listener on: both
@@ -87,7 +91,9 @@ func startPausedListener(ctx context.Context, cfgStore *config.Store, u *pausedL
 	u.device.onAttachChanged(changed)
 	var start sync.Once
 	startListener := func() {
-		start.Do(func() { go runPausedListener(ctx, u, &started, changed) })
+		start.Do(func() {
+			goUntilStop(ctx, u.background, func(ctx context.Context) { runPausedListener(ctx, u, &started, changed) })
+		})
 	}
 	onConfigChange(cfgStore, func(cfg *config.Config) {
 		on := listenerOn(cfg)

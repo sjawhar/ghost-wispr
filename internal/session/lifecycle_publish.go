@@ -1,6 +1,10 @@
 package session
 
-import "context"
+import (
+	"context"
+
+	"github.com/sjawhar/ghost-wispr/internal/stopping"
+)
 
 // StopSessionStartPublishes prevents a shutdown from registering a new
 // session-started send while WaitForLifecyclePublishes is waiting.
@@ -27,6 +31,11 @@ func (m *Manager) publishSessionEnded(sessionID string) {
 	m.publishLifecycle(sessionID, "session_ended", false, EventPublisher.PublishSessionEnded)
 }
 
+// publishLifecycle sends one lifecycle event in the background. The send
+// writes the event's delivery state to the store, so it is work StopBackground
+// waits for: the stop's lifecycle wait gives it its time first, and
+// StopBackground then cuts it off (an event cut off stays pending, for the
+// next start's sweep). Once StopBackground has run, no send starts.
 func (m *Manager) publishLifecycle(sessionID, eventType string, isStart bool, send func(EventPublisher, context.Context, string) error) {
 	m.mu.Lock()
 	if isStart && m.lifecycleStartPublishesStopped {
@@ -38,14 +47,27 @@ func (m *Manager) publishLifecycle(sessionID, eventType string, isStart bool, se
 		m.mu.Unlock()
 		return
 	}
+	if m.backgroundStopped {
+		m.mu.Unlock()
+		m.logger.Info("envoy lifecycle event not sent: the app is stopping", "operation", "publish_"+eventType, "session_id", sessionID)
+		return
+	}
 	// Shutdown first prevents new start sends, then waits. Register the send
-	// while holding mu so that sequence cannot race with this Add.
+	// while holding mu so that sequence cannot race with this Add; it is
+	// counted as background work (beginBackground) under the same lock.
 	m.lifecyclePublishes.Add(1)
+	m.backgroundWork.Add(1)
+	m.backgroundRunning++
 	m.mu.Unlock()
 
 	go func() {
+		defer m.endBackground()
 		defer m.lifecyclePublishes.Done()
-		if err := send(publisher, context.Background(), sessionID); err != nil {
+		if err := send(publisher, m.background, sessionID); err != nil {
+			if stopping.CutOff(m.background) {
+				m.logger.Info("envoy lifecycle publish cut off by the stop; the next start's sweep sends it", "operation", "publish_"+eventType, "session_id", sessionID)
+				return
+			}
 			m.logger.Error("envoy lifecycle publish failed", "operation", "publish_"+eventType, "session_id", sessionID, "error", err)
 		}
 	}()

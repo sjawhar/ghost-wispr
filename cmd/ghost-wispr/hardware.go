@@ -557,9 +557,11 @@ func startHardware(ctx context.Context, cfg *config.Config, capture *captureGate
 	return hardware
 }
 
-func startPowerButton(ctx context.Context, cfg *config.Config, capture *captureGate, controls *server.ControlHooks, warnings *warningsRegistry) {
+// startPowerButton serves the power button when the config turns it on, as
+// work the stop waits for (background): a press saves the pause state.
+func startPowerButton(ctx context.Context, cfg *config.Config, capture *captureGate, controls *server.ControlHooks, warnings *warningsRegistry, background backgroundWork) {
 	if cfg.PowerButton {
-		go runPowerButton(ctx, capture, controls, warnings)
+		goUntilStop(ctx, background, func(ctx context.Context) { runPowerButton(ctx, capture, controls, warnings) })
 	}
 }
 
