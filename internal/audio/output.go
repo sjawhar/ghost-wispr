@@ -849,7 +849,17 @@ func (o *Output) mix(stream PlaybackStream, rate int) error {
 	sum := make([]float32, n)
 	hist := rate * int(outputHistory/time.Millisecond) / 1000
 	if b, ok := stream.(interface{ bufferFrames() int }); ok {
-		hist = max(hist, b.bufferFrames()+n) // what a granted buffer holds, and more
+		// What a granted buffer holds, what may be in flight to a USB
+		// speaker past it, which a drop also cuts (bounded here by the
+		// buffer again), and a frame.
+		hist = max(hist, 2*b.bufferFrames()+n)
+	}
+	// again, when the stream has it, reports how many of the last frames it
+	// was given it discarded by itself, as in a suspend it could not resume
+	// from: they play again, as what a Drop takes back does.
+	again := func() int { return 0 }
+	if a, ok := stream.(interface{ takeAgain() int }); ok {
+		again = a.takeAgain
 	}
 	redo := make([]int16, hist)
 	o.startStream()
@@ -874,36 +884,12 @@ func (o *Output) mix(stream PlaybackStream, rate int) error {
 				return nil
 			}
 		case stepDrop:
-			// unwritten is how much of the stream's time, up to the
-			// mixer's position, a Cancel that came during the replay left
-			// unwritten: it plays again with what the device gives back.
-			unwritten := 0
-			for {
-				got, err := stream.Drop()
-				if err != nil {
-					return fmt.Errorf("take back speaker stream: %w", err)
-				}
-				back := max(got, 0) + unwritten
-				if back > hist {
-					slog.Warn("speaker stream took back more than the Output keeps; the rest of the other inputs is lost", "frames", back, "kept", hist)
-					back = hist
-				}
-				o.retake(redo[:back], sum)
-				// What the stream took back plays again: the stream time
-				// written is as before, so the pacer is not touched. A
-				// Cancel during it takes back the device's audio again.
-				off, again := 0, false
-				for off < back && !again {
-					end := min(off+n, back)
-					if err := stream.Write(redo[off:end]); err != nil {
-						return fmt.Errorf("write speaker stream: %w", err)
-					}
-					off, again = end, end < back && o.takeDrop()
-				}
-				if !again {
-					break
-				}
-				unwritten = back - off
+			got, err := stream.Drop()
+			if err != nil {
+				return fmt.Errorf("take back speaker stream: %w", err)
+			}
+			if err := o.replay(stream, redo, sum, n, max(got, 0), again); err != nil {
+				return err
 			}
 			continue
 		}
@@ -911,6 +897,13 @@ func (o *Output) mix(stream PlaybackStream, rate int) error {
 		err := writeFrame(stream, frame)
 		if err != nil {
 			return fmt.Errorf("write speaker stream: %w", err)
+		}
+		if lost := again(); lost > 0 {
+			// The frame and some before it the device discarded: they play
+			// again before the frame counts as taken.
+			if err := o.replay(stream, redo, sum, n, lost, again); err != nil {
+				return err
+			}
 		}
 		if counter != nil && o.cfg.Underrun != nil {
 			if n := counter.underruns(); n > underruns {
@@ -924,6 +917,44 @@ func (o *Output) mix(stream PlaybackStream, rate int) error {
 			quiet = 0
 		} else {
 			quiet += n
+		}
+	}
+}
+
+// replay writes the stream again the last back frames it was given, which a
+// Drop took back or the stream discarded by itself (again), mixed again
+// without the inputs a Cancel silenced: the stream time written is as
+// before, so the pacer is not touched. A Cancel during it takes back the
+// device's audio again, and a discard during it is written again too, with
+// what of the replay was left unwritten.
+func (o *Output) replay(stream PlaybackStream, redo []int16, sum []float32, n, back int, again func() int) error {
+	for {
+		if back > len(redo) {
+			slog.Warn("speaker stream took back more than the Output keeps; the rest of the other inputs is lost", "frames", back, "kept", len(redo))
+			back = len(redo)
+		}
+		o.retake(redo[:back], sum)
+		off, drop, lost := 0, false, 0
+		for off < back && !drop && lost == 0 {
+			end := min(off+n, back)
+			if err := stream.Write(redo[off:end]); err != nil {
+				return fmt.Errorf("write speaker stream: %w", err)
+			}
+			off, lost = end, again()
+			drop = lost == 0 && end < back && o.takeDrop()
+		}
+		unwritten := back - off
+		switch {
+		case lost > 0:
+			back = lost + unwritten
+		case drop:
+			got, err := stream.Drop()
+			if err != nil {
+				return fmt.Errorf("take back speaker stream: %w", err)
+			}
+			back = max(got, 0) + unwritten
+		default:
+			return nil
 		}
 	}
 }

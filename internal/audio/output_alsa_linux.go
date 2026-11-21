@@ -38,6 +38,8 @@ var alsaRates = []int{48000, 44100, 32000, 24000, 16000}
 type alsaPCM interface {
 	writei(interleaved []int16, frames int) int // snd_pcm_writei
 	recover(rc int) int                         // snd_pcm_recover, silently
+	resume() int                                // snd_pcm_resume
+	statusAvail() int                           // snd_pcm_status's avail, in any state
 	avail() int                                 // snd_pcm_avail
 	delay() (frames, rc int)                    // snd_pcm_delay
 	rewindable() int                            // snd_pcm_rewindable
@@ -56,6 +58,10 @@ type alsaStream struct {
 	wide   []int16 // a frame copied to every channel
 	xruns  int
 	told   bool // the stream has logged what it is
+	// again is how many of the last frames the Output gave it that the PCM
+	// discarded by itself, in a suspend it could not resume from, and the
+	// Output is to write again (takeAgain).
+	again int
 }
 
 func newALSAStream(pcm alsaPCM, device string, params alsaParams) *alsaStream {
@@ -75,7 +81,10 @@ func (s *alsaStream) queuedFrames() int {
 
 // Write plays frame, waiting while the PCM is full. After an underrun, when
 // the PCM ran out of audio and stopped, it prepares the PCM and plays on, and
-// counts and logs the underrun.
+// counts and logs the underrun. After a suspend, as of the system, it resumes
+// the PCM, which loses nothing; if it cannot, it prepares the PCM, which
+// discards what the PCM held, and leaves the rest of frame unwritten: the
+// Output writes both again (takeAgain).
 func (s *alsaStream) Write(frame []int16) error {
 	channels := s.params.channels
 	samples := frame
@@ -96,6 +105,17 @@ func (s *alsaStream) Write(frame []int16) error {
 			samples, frames = samples[rc*channels:], frames-rc
 			continue
 		}
+		if rc == -int(syscall.ESTRPIPE) {
+			lost, err := s.resume()
+			if err != nil {
+				return err
+			}
+			if lost >= 0 {
+				s.again += lost + frames
+				return nil
+			}
+			continue
+		}
 		if rc == -int(syscall.EPIPE) {
 			// Every underrun is a click in the room, and the Pi's playback
 			// check counts them from these lines: a reader of /proc/asound
@@ -112,6 +132,41 @@ func (s *alsaStream) Write(frame []int16) error {
 		s.tell()
 	}
 	return nil
+}
+
+// resume brings a suspended PCM back. A resume loses nothing, and it reports
+// -1. A PCM that cannot resume it prepares, as snd_pcm_recover would, which
+// discards what the PCM held, and it reports how many frames that was, from
+// the PCM's status: what is already in flight to a USB speaker, which the
+// status does not count, is not among them.
+func (s *alsaStream) resume() (lost int, err error) {
+	held := 0
+	if avail := s.pcm.statusAvail(); avail >= 0 {
+		held = max(0, s.params.buffer-avail)
+	}
+	rc := s.pcm.resume()
+	for rc == -int(syscall.EAGAIN) {
+		time.Sleep(alsaPeriod)
+		rc = s.pcm.resume()
+	}
+	if rc >= 0 {
+		slog.Info("speaker resumed after a suspend", "device", s.device)
+		return -1, nil
+	}
+	if rc := s.pcm.prepare(); rc < 0 {
+		return 0, alsaErr("prepare after a suspend", rc)
+	}
+	slog.Warn("speaker could not resume after a suspend; its queue plays again", "device", s.device, "discarded", frameTime(held, s.params.rate))
+	return held, nil
+}
+
+// takeAgain reports how many of the last frames the Output gave the stream
+// the PCM discarded by itself, for the Output to write again, and forgets
+// them.
+func (s *alsaStream) takeAgain() int {
+	n := s.again
+	s.again = 0
+	return n
 }
 
 // tell logs, once, what the device granted and whether a Cancel there
@@ -134,8 +189,10 @@ func (s *alsaStream) tell() {
 // back. What the device has already taken, as what is in flight to a USB
 // speaker, it cannot take back, and the room hears it; when that is more than
 // a period, or the PCM does not rewind, it drops the PCM instead, which also
-// cuts what is in flight, and prepares it for the next write. It logs which
-// it did: the stream's open line says only whether the PCM can rewind.
+// cuts what is in flight, and prepares it for the next write: then it reports
+// what is in flight among the frames to write again, since the room will not
+// hear them otherwise. It logs which it did: the stream's open line says
+// only whether the PCM can rewind.
 func (s *alsaStream) Drop() (int, error) {
 	held := s.held()
 	if held == 0 {
@@ -150,7 +207,11 @@ func (s *alsaStream) Drop() (int, error) {
 		s.logCancel("rewind", back, tail)
 		return back, nil
 	}
-	back += s.held()
+	if rc >= 0 {
+		back += max(0, tail) // what the drop cuts: held, and in flight
+	} else {
+		back += s.held()
+	}
 	if rc := s.pcm.drop(); rc < 0 {
 		return 0, alsaErr("drop", rc)
 	}

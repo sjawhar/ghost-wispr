@@ -81,6 +81,17 @@ fail:
 	r.pcm = NULL;
 	return r;
 }
+
+// gw_status_avail is how many frames the PCM's buffer has free, from its
+// status, which ALSA reports in every state, a suspended one included; or
+// snd_pcm_status's error.
+static long gw_status_avail(snd_pcm_t *pcm) {
+	snd_pcm_status_t *st;
+	int rc;
+	snd_pcm_status_alloca(&st);
+	if ((rc = snd_pcm_status(pcm, st)) < 0) return rc;
+	return (long)snd_pcm_status_get_avail(st);
+}
 */
 import "C"
 
@@ -98,6 +109,8 @@ func (p *cgoPCM) writei(interleaved []int16, frames int) int {
 }
 
 func (p *cgoPCM) recover(rc int) int { return int(C.snd_pcm_recover(p.pcm, C.int(rc), 1)) }
+func (p *cgoPCM) resume() int        { return int(C.snd_pcm_resume(p.pcm)) }
+func (p *cgoPCM) statusAvail() int   { return int(C.gw_status_avail(p.pcm)) }
 func (p *cgoPCM) avail() int         { return int(C.snd_pcm_avail(p.pcm)) }
 func (p *cgoPCM) drop() int          { return int(C.snd_pcm_drop(p.pcm)) }
 func (p *cgoPCM) prepare() int       { return int(C.snd_pcm_prepare(p.pcm)) }
