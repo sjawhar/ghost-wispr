@@ -288,22 +288,47 @@ func TestDrainWaitsForTheResamplersTail(t *testing.T) {
 // while the frame that holds its resampler's tail is not yet taken by the
 // stream, when a later playback on the same input queued audio that shares
 // that frame: the frame was counted for the later playback only (Sol's review
-// of #142 at ef951b3). The later playback is silence, so every audio sample
-// of the held frame is the first's tail. The control has no later playback.
+// of #142 at ef951b3), or, with the first playback ending so that its last
+// sample's delayed output falls on a frame's last position, for the frame
+// that sample reaches, though the filter's response to it runs into the next
+// one (Sol's review at 7da737b: 224 samples at 24 kHz). The later playback is
+// silence, so every audio sample of the held frame is the first's tail. The
+// control has no later playback. The device runs at 48 kHz, and at 44.1 kHz.
 func TestDrainWaitsForItsTailWhenAnotherPlaybackFollows(t *testing.T) {
-	for _, next := range []bool{false, true} {
-		t.Run(fmt.Sprintf("a later playback queued %v", next), func(t *testing.T) {
-			stream := &probeStream{fakeStream: newFakeStream(48000)}
-			out, start, _ := probeOutput(t, stream)
+	for _, tc := range []struct {
+		device, samples int
+		next            bool
+	}{
+		{48000, 240, false},
+		{48000, 240, true},
+		{48000, 224, true},
+		{44100, 224, true},
+	} {
+		t.Run(fmt.Sprintf("device %d Hz, %d samples, a later playback queued %v", tc.device, tc.samples, tc.next), func(t *testing.T) {
+			stream := &probeStream{fakeStream: newFakeStream(tc.device)}
+			gate := make(chan struct{})
+			out := NewOutput(OutputConfig{Open: func(string) (PlaybackStream, int, error) {
+				<-gate
+				return stream, tc.device, nil
+			}})
+			open := sync.OnceFunc(func() { close(gate) })
 			barrier := newProbeBarrier()
-			t.Cleanup(barrier.unblock)
+			t.Cleanup(func() {
+				barrier.unblock()
+				open()
+				_ = out.Close()
+			})
 			ctx := testContext(t)
 			format := AudioFormat{SampleRate: 24000, Channels: 1, Encoding: EncodingPCM16}
+			signal := make([]int16, tc.samples)
+			for i := range signal {
+				signal[i] = 10000
+			}
 			first := out.Begin(InputVoice)
-			if err := first.WriteAll(ctx, constant(24000, 10*time.Millisecond, 10000), format); err != nil {
+			if err := first.WriteAll(ctx, pcm16Bytes(signal), format); err != nil {
 				t.Fatal(err)
 			}
-			if next {
+			if tc.next {
 				if err := out.Begin(InputVoice).WriteAll(ctx, constant(24000, 10*time.Millisecond, 0), format); err != nil {
 					t.Fatal(err)
 				}
@@ -315,7 +340,7 @@ func TestDrainWaitsForItsTailWhenAnotherPlaybackFollows(t *testing.T) {
 					barrier.hold()
 				}
 			}
-			start()
+			open()
 			probeWait(t, barrier.entered, "the second write, which holds the first playback's tail")
 			samples := <-tail
 			if samples == 0 {
@@ -330,6 +355,115 @@ func TestDrainWaitsForItsTailWhenAnotherPlaybackFollows(t *testing.T) {
 			}
 			if !errors.Is(whileHeld, context.Canceled) {
 				t.Fatalf("Drain returned %v while %d samples of its tail waited in the held write; want context.Canceled while it waits", whileHeld, samples)
+			}
+		})
+	}
+}
+
+// TestAPlaybacksFrameIsTheLastItsAudioReaches fails if the frame a playback's
+// Drain waits for comes before the last frame that holds its audio, at any of
+// ten input rates on six device rates, ending at several positions in a
+// frame, with a later playback that keeps the resampler running and without:
+// Drain returned while its audio waited (Sol's review of #142 at 7da737b
+// found 350 such cases). The frame may come one frame after the last that
+// holds audio a sample rounds to: the far edge of the filter's response to
+// the last sample is below one step of a sample.
+func TestAPlaybacksFrameIsTheLastItsAudioReaches(t *testing.T) {
+	early, total := 0, 0
+	for _, from := range []int{8000, 16000, 22050, 24000, 32000, 44100, 48000, 96000, 192000, 384000} {
+		for _, to := range []int{8000, 16000, 24000, 44100, 48000, 96000} {
+			for _, next := range []bool{false, true} {
+				for delta := -33; delta <= 1; delta++ {
+					m := from/100 + delta
+					in := &outputInput{gen: &playGen{}, tails: make([]tail, 0, 4)}
+					in.setRate(from)
+					in.contrib, in.landed = make([]float32, to/100), make([]uint32, 2*to/100)
+					a, b := &Playback{}, &Playback{}
+					signal := make([]int16, m)
+					for i := range signal {
+						signal[i] = 10000
+					}
+					in.push(a, pcm16Bytes(signal), 1, m)
+					if next {
+						n := from/100 + 100
+						in.push(b, make([]byte, 2*n), 1, n)
+					}
+					last := uint64(0)
+					for seq := uint64(1); !in.idle(); seq++ {
+						if seq > 20 {
+							t.Fatal("fixture: the input never ran out")
+						}
+						in.seq = seq
+						in.render(to)
+						clear(in.landed) // the mixer moves these on
+						for _, v := range in.contrib {
+							if clip(v) != 0 {
+								last = seq
+							}
+						}
+					}
+					total++
+					if a.seq < last {
+						early++
+						if early <= 5 {
+							t.Errorf("%d Hz on %d Hz, %d samples, a later playback %v: the playback's frame is %d, its audio reaches frame %d", from, to, m, next, a.seq, last)
+						}
+					}
+					if a.seq > last+1 {
+						t.Errorf("%d Hz on %d Hz, %d samples, a later playback %v: the playback's frame is %d, its audio ends in frame %d", from, to, m, next, a.seq, last)
+					}
+				}
+			}
+		}
+	}
+	if early > 0 {
+		t.Errorf("%d of %d playbacks had a frame before the last that holds their audio", early, total)
+	}
+}
+
+// TestATakeBackOfResampledAudioCountsItsQueuedTime fails if a Cancel's
+// take-back of a resampled burst subtracts more than the burst's own time
+// from what its playback played: it counted the stream positions its output
+// spans, the resampler's delay included, at the device's rate, and took part
+// of an earlier burst that was heard off (Sol's review of #142 at 7da737b:
+// 9.333334 ms left of 10 ms). A 10 ms burst plays in the first two writes;
+// after a gap in the same speech, another plays in writes 6 and 7, and a
+// Cancel during write 7 takes back writes 5 to 7. The control's audio is at
+// the device's rate.
+func TestATakeBackOfResampledAudioCountsItsQueuedTime(t *testing.T) {
+	for _, rate := range []int{48000, 24000} {
+		t.Run(fmt.Sprintf("input %d Hz", rate), func(t *testing.T) {
+			stream := &probeStream{fakeStream: newFakeStream(48000)}
+			out, start, events := probeOutput(t, stream)
+			ctx := testContext(t)
+			p := out.Begin(InputVoice)
+			format := AudioFormat{SampleRate: rate, Channels: 1, Encoding: EncodingPCM16}
+			burst := constant(rate, 10*time.Millisecond, 10000)
+			if err := p.WriteAll(ctx, burst, format); err != nil {
+				t.Fatal(err)
+			}
+			before := make(chan time.Duration, 1)
+			stream.before = func(n int, _ []int16) {
+				switch n {
+				case 5:
+					before <- p.Played()
+					if err := p.Write(ctx, burst, format); err != nil {
+						t.Error(err)
+					}
+				case 7:
+					out.Cancel(InputVoice)
+				}
+			}
+			stream.drop = func() (int, error) { return 3 * 480, nil }
+			start()
+			probeVoiceEvent(t, events, true)
+			ended := probeVoiceEvent(t, events, false)
+			first := <-before
+			if first != 10*time.Millisecond {
+				t.Fatalf("control: the first burst played %v, want 10ms", first)
+			}
+			if got := p.Played(); got != first || ended.Played != first {
+				t.Fatalf("after the second burst was taken back, the playback played %v and its speech %v; want the first burst's %v", got, ended.Played, first)
 			}
 		})
 	}

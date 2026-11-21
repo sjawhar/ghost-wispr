@@ -207,26 +207,52 @@ type outputInput struct {
 	// last is the playback whose audio the stream took last.
 	last *Playback
 	seq  uint64 // the frame being mixed
+	// tails are the playbacks whose samples the resampler's filter still
+	// holds, each with the count of pushes (pushes) at its last: a later
+	// playback keeps the filter running, and a Drain of an earlier one waits
+	// for every frame its filter response reaches (render).
+	tails  []tail
+	pushes uint64
 
 	speaking  bool
 	cancelled bool // Cancel silenced its speech: the mixer takes it back and ends it
 	cut       bool // Cancel dropped audio of the speech still queued
 	// silenced is the playback whose audio the stream took last before
 	// Cancel: what Cancel takes back from the device comes off what it played.
-	silenced *Playback
-	// audioFrom and audioTo are the stream positions the speech's audio
-	// spans.
-	audioFrom, audioTo int64
-	lastAudio          time.Time
-	quietAt            time.Time // when it ran out of audio; zero while it has some
-	spoken             playedTime
-	contrib            []float32 // its part in the frame being mixed
-	history            []float32 // its part in the stream's last outputHistory: a ring that ends at histPos
-	histPos            int
-	// held marks, along history, each stream position that held its queued
-	// audio, not silence: a Cancel takes off what it played only the audio
-	// it took back, though the speech had gaps.
-	held []bool
+	silenced  *Playback
+	lastAudio time.Time
+	quietAt   time.Time // when it ran out of audio; zero while it has some
+	spoken    playedTime
+	contrib   []float32 // its part in the frame being mixed
+	history   []float32 // its part in the stream's last outputHistory: a ring that ends at histPos
+	histPos   int
+	// held counts, along history, the queued samples whose output each
+	// stream position holds, with the rate they were queued at (heldCount):
+	// a Cancel takes off what it played only the audio it took back, as long
+	// as it was queued, though the speech had gaps and the resampler delays
+	// it. landed counts the same for the frame being mixed and, after it,
+	// the positions the resampler's delay reaches: landed[j] is the stream
+	// position pos+j. unlanded is what of the queued audio the resampler held
+	// when Cancel dropped it: it never reaches the stream.
+	held, landed []uint32
+	unlanded     playedTime
+}
+
+// tail is a playback whose last sample the resampler took at push last.
+type tail struct {
+	pb   *Playback
+	last uint64
+}
+
+// heldCount packs n queued samples at rate, the samples whose output one
+// stream position holds (outputInput.held); addHeld unpacks them.
+func heldCount(n, rate int) uint32 { return uint32(n)<<24 | uint32(rate) }
+
+// addHeld adds the samples packed in v (heldCount).
+func (p *playedTime) addHeld(v uint32) {
+	if v != 0 {
+		p.add(int(v&(1<<24-1)), int(v>>24))
+	}
 }
 
 type segment struct {
@@ -318,7 +344,7 @@ func (o *Output) Begin(input string) *Playback {
 	defer o.mu.Unlock()
 	in := o.inputs[input]
 	if in == nil {
-		in = &outputInput{name: input, gen: &playGen{}}
+		in = &outputInput{name: input, gen: &playGen{}, tails: make([]tail, 0, 4)}
 		o.inputs[input] = in
 		o.order = append(o.order, in)
 	}
@@ -553,8 +579,9 @@ func signal(c chan struct{}) {
 }
 
 // end drops what the input holds and ends each of its playbacks with err: the
-// generation they share ends, and a new one begins. The caller holds the
-// Output's mu.
+// generation they share ends, and a new one begins. The audio the resampler
+// held, which will not reach the stream, is kept in unlanded for a Cancel's
+// take-back. The caller holds the Output's mu.
 func (in *outputInput) end(err error) {
 	in.gen.err = err
 	in.gen = &playGen{}
@@ -563,6 +590,12 @@ func (in *outputInput) end(err error) {
 	in.segments = in.segments[:0]
 	in.last = nil
 	in.rs.reset()
+	clear(in.tails)
+	in.tails = in.tails[:0]
+	for _, v := range in.landed {
+		in.unlanded.addHeld(v)
+	}
+	clear(in.landed)
 }
 
 // idle reports whether the input has nothing left to play.
@@ -598,68 +631,97 @@ func (in *outputInput) push(p *Playback, pcm []byte, channels, frames int) {
 }
 
 // pull takes the next queued sample for the stream, counted as played for
-// its playback, or silence to flush the resampler once none is queued. seq is
-// the frame in which the sample reaches the stream, after the resampler's
-// delay: a Drain of its playback waits for that frame.
-func (in *outputInput) pull(seq uint64) float32 {
+// its playback, which it returns; or silence, and nil, to flush the
+// resampler once none is queued.
+func (in *outputInput) pull() (float32, *Playback) {
 	if in.n == 0 {
 		in.flush = max(0, in.flush-1)
-		return 0
+		return 0, nil
 	}
 	s := in.ring[in.head]
 	in.head = (in.head + 1) % len(in.ring)
 	in.n--
 	in.flush = in.rs.lag()
-	seg := &in.segments[0]
-	seg.pb.pending--
-	seg.pb.played.add(in.rate, 1)
-	seg.pb.seq = max(seg.pb.seq, seq)
+	pb := in.segments[0].pb
+	pb.pending--
+	pb.played.add(in.rate, 1)
 	in.spoken.add(in.rate, 1)
-	in.last = seg.pb
-	if seg.n--; seg.n == 0 {
+	in.last = pb
+	if in.segments[0].n--; in.segments[0].n == 0 {
 		// Shift the rest down, so that the array keeps no finished playback
 		// and appends reuse it.
 		k := copy(in.segments, in.segments[1:])
 		in.segments[k] = segment{}
 		in.segments = in.segments[:k]
 	}
-	return float32(s)
+	return float32(s), pb
 }
 
-// render fills the input's part of the next frame at the stream's rate, and
-// reports where in the frame its queued audio ends: the index past its last
-// sample that came from the queue, or -1 if none did. Each sample it takes
-// is marked for the frame its output reaches, which for a resampled sample
-// can be the next one: a playback's resampler tail is its own, also when the
-// next playback's audio shares that frame.
-func (in *outputInput) render(rate int) (audioEnd int) {
+// render fills the input's part of the next frame at the stream's rate. It
+// counts each sample it takes at the stream position its output reaches,
+// after the resampler's delay (landed), and marks the frame for the
+// sample's playback, whose Drain waits for it. A playback whose samples the
+// resampler's filter still holds, as when a later playback keeps it running,
+// has audio in every frame until the last of them leaves the filter (tails).
+func (in *outputInput) render(rate int) {
 	if in.rs.from != in.rate || in.rs.to != rate {
 		in.rs.configure(in.rate, rate)
 	}
-	audioEnd = -1
 	if in.rs.bypass() {
 		for i := range in.contrib {
-			if in.n > 0 {
-				audioEnd = i + 1
+			s, pb := in.pull()
+			if pb != nil {
+				in.land(i)
+				pb.seq = max(pb.seq, in.seq)
 			}
-			in.contrib[i] = in.pull(in.seq)
+			in.contrib[i] = s
 		}
-		return audioEnd
+		return
 	}
 	lag := in.rs.lag() * rate / in.rate // output samples a pushed sample takes to reach the output
+	if need := len(in.contrib) + lag + 1; len(in.landed) < need {
+		grown := make([]uint32, need)
+		copy(grown, in.landed)
+		in.landed = grown
+	}
+	// A playback whose last sample has left the filter has no audio here.
+	taps, kept := uint64(in.rs.taps), in.tails[:0]
+	for _, t := range in.tails {
+		if in.pushes-t.last < taps {
+			t.pb.seq = max(t.pb.seq, in.seq)
+			kept = append(kept, t)
+		}
+	}
+	clear(in.tails[len(kept):])
+	in.tails = kept
 	for i := range in.contrib {
 		in.contrib[i] = in.rs.output()
 		for range in.rs.step() {
-			if in.n > 0 {
-				audioEnd = i + 1 + lag
+			s, pb := in.pull()
+			in.rs.push(s)
+			in.pushes++
+			if pb == nil {
+				continue
 			}
-			in.rs.push(in.pull(in.seq + uint64((i+lag)/len(in.contrib))))
+			in.land(i + lag)
+			pb.seq = max(pb.seq, in.seq)
+			if k := len(in.tails); k > 0 && in.tails[k-1].pb == pb {
+				in.tails[k-1].last = in.pushes
+			} else {
+				in.tails = append(in.tails, tail{pb: pb, last: in.pushes})
+			}
 		}
 	}
 	if in.idle() {
 		in.rs.reset()
+		clear(in.tails)
+		in.tails = in.tails[:0]
 	}
-	return audioEnd
+}
+
+// land counts one queued sample, at the input's rate, at landed[j].
+func (in *outputInput) land(j int) {
+	in.landed[j] = heldCount(int(in.landed[j]>>24)+1, in.rate)
 }
 
 // run is the Output's mixer: it waits for audio, then plays a stream until
@@ -821,7 +883,7 @@ func (o *Output) mix(stream PlaybackStream, rate int) error {
 					slog.Warn("speaker stream took back more than the Output keeps; the rest of the other inputs is lost", "frames", back, "kept", hist)
 					back = hist
 				}
-				o.retake(redo[:back], sum, rate)
+				o.retake(redo[:back], sum)
 				// What the stream took back plays again: the stream time
 				// written is as before, so the pacer is not touched. A
 				// Cancel during it takes back the device's audio again.
@@ -964,9 +1026,9 @@ func (o *Output) mixFrame(frame []int16, sum []float32, rate, hist int, now time
 	from, to, hold := o.duck(voice, chime)
 	for _, in := range o.order {
 		if len(in.contrib) != len(frame) || len(in.history) != hist {
-			in.contrib, in.history, in.held, in.histPos = make([]float32, len(frame)), make([]float32, hist), make([]bool, hist), 0
+			in.contrib, in.history, in.held, in.histPos = make([]float32, len(frame)), make([]float32, hist), make([]uint32, hist), 0
+			in.landed = make([]uint32, 2*len(frame))
 		}
-		held := 0 // how much of the frame holds the input's queued audio
 		switch {
 		case in == chime && hold:
 			// The voice goes down over this frame; the sound starts on the next.
@@ -983,7 +1045,7 @@ func (o *Output) mixFrame(frame []int16, sum []float32, rate, hist int, now time
 		default:
 			queued := in.n > 0
 			in.seq = o.mixed
-			audioEnd := in.render(rate)
+			in.render(rate)
 			if in == voice {
 				duckVoice(in.contrib, from, to)
 			}
@@ -991,25 +1053,21 @@ func (o *Output) mixFrame(frame []int16, sum []float32, rate, hist int, now time
 				sum[i] += c
 			}
 			if queued && !in.speaking {
-				in.speaking, in.audioFrom = true, o.pos
+				in.speaking, in.unlanded = true, playedTime{}
 				o.emit(SpeechEvent{Input: in.name, Started: true, At: now})
-			}
-			if audioEnd >= 0 {
-				in.audioTo = o.pos + int64(audioEnd)
-				held = audioEnd
-			} else if in.audioTo > o.pos {
-				// The resampler's tail of the audio queued last frame.
-				held = int(in.audioTo - o.pos)
 			}
 			in.lastAudio, in.quietAt = now, time.Time{}
 			active = true
 		}
 		for i, c := range in.contrib {
-			in.history[in.histPos], in.held[in.histPos] = c, i < held
+			in.history[in.histPos], in.held[in.histPos] = c, in.landed[i]
 			if in.histPos++; in.histPos == hist {
 				in.histPos = 0
 			}
 		}
+		// The counts past the frame, the resampler's delay, move to its start.
+		k := copy(in.landed, in.landed[len(frame):])
+		clear(in.landed[k:])
 	}
 	for i, s := range sum {
 		frame[i] = clip(s)
@@ -1055,7 +1113,7 @@ func duckVoice(contrib []float32, from, to float32) {
 // back, without the inputs Cancel silenced: it forgets their part, takes the
 // part of their audio the room will not hear off what they played, and ends
 // their speeches. sum is scratch of at least a frame.
-func (o *Output) retake(redo []int16, sum []float32, rate int) {
+func (o *Output) retake(redo []int16, sum []float32) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	back := len(redo)
@@ -1065,22 +1123,23 @@ func (o *Output) retake(redo []int16, sum []float32, rate int) {
 			continue
 		}
 		// The stream took back [pos-back, pos); of the speech's audio, the
-		// room will not hear what lies there, and only its audio: a gap in
-		// the speech was silence.
-		lost, h := 0, len(in.held)
+		// room will not hear the queued samples whose output lies there, nor
+		// those the resampler held when Cancel dropped them (unlanded): as
+		// long as they were queued, at their rate, and only them, since a
+		// gap in the speech was silence.
+		lost, h := in.unlanded, len(in.held)
 		for i := range min(back, h) {
-			if in.held[(in.histPos-back+i+2*h)%h] {
-				lost++
-			}
+			lost.addHeld(in.held[(in.histPos-back+i+2*h)%h])
 		}
+		in.unlanded = playedTime{}
 		clear(in.history)
 		clear(in.held)
-		unheard := time.Duration(lost) * time.Second / time.Duration(rate)
+		unheard := lost.total()
 		in.spoken.sub(unheard)
 		if in.silenced != nil {
 			in.silenced.played.sub(unheard)
 		}
-		o.endSpeech(in, now, in.cut || lost > 0)
+		o.endSpeech(in, now, in.cut || unheard > 0)
 	}
 	for start := 0; start < len(redo); start += len(sum) {
 		part := redo[start:min(start+len(sum), len(redo))]
