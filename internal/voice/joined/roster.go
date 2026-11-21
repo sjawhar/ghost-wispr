@@ -221,6 +221,10 @@ type Roster struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
+	// asyncMu orders async's wg.Add against Close: closing, set under it,
+	// stops async from starting anything once Close waits.
+	asyncMu sync.Mutex
+	closing bool
 
 	mu     sync.Mutex
 	agents Agents
@@ -408,9 +412,14 @@ func (r *Roster) SetAgents(agents Agents) {
 	r.mu.Unlock()
 }
 
-// Close stops Run and the sends still going.
+// Close stops Run and the sends still going. Nothing async starts once it
+// began: a hand's outcome the Supervisor reports during it is dropped, not
+// raced with the wait.
 func (r *Roster) Close() {
+	r.asyncMu.Lock()
+	r.closing = true
 	r.cancel()
+	r.asyncMu.Unlock()
 	r.wg.Wait()
 }
 
@@ -1007,8 +1016,14 @@ func (r *Roster) sendVia(ctx context.Context, agents Agents, agent, inReplyTo, k
 	}
 }
 
-// async runs f on a goroutine Close waits for, with a context Close ends.
+// async runs f on a goroutine Close waits for, with a context Close ends;
+// once Close began, it runs nothing.
 func (r *Roster) async(f func(ctx context.Context)) {
+	r.asyncMu.Lock()
+	defer r.asyncMu.Unlock()
+	if r.closing {
+		return
+	}
 	r.wg.Add(1)
 	go func() {
 		defer r.wg.Done()

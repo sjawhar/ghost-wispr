@@ -438,8 +438,10 @@ joins, asks for the floor and leaves with Envoy messages to that session, each o
 `ghost-wispr leave`. A join is taken on trust from any session Envoy does not list as gone, with no
 check that a person invited it, since any agent on the tailnet can already ask the Concierge and
 read the API, a pointer holds no words, and a hand speaks only on a person's "go ahead". A command
-Envoy delivers again acts only once, and a floor request or a leave sent before the agent's latest
-join is not taken.
+Envoy delivers again acts only once, for as long as Envoy can deliver it again (its stream keeps a
+message 72 hours), and a floor request or a leave sent before the agent's latest join is not
+taken. A command that comes before the unit's Envoy session is ready is not acknowledged, so Envoy
+delivers it again.
 
 A joined agent follows the meeting through the unit's own API, and gets a pointer with no words
 when its issue comes up: a final segment that names its key, its number, or two words of its
@@ -458,8 +460,10 @@ picks one of several), and drops them after 60 s; the agent is told which. "Wisp
 leaves a hand up: it drops answers only, and a hand still sounds while one waits. "Wispr, who has a
 hand up?" names the agents waiting. An agent leaves when it says so, when the meeting ends or is
 deleted, when the voice stops, or when Envoy lists its session as not live for 10 minutes. The
-moment the recorder ends a meeting, nothing more is sent or spoken for it: not a pointer on its
-way, a hand's sound or words, nor an exchange of the voice.
+moment the recorder ends a meeting, or leaves recording for listening or closed, nothing more is
+sent or spoken for it: not a pointer on its way, a hand's sound or words, nor an exchange of the
+voice. A hand's sound stops with the membership of the last hand it sounds for, and a sound cut
+before it played out (by an exchange, or by a never mind holding answers back) sounds again.
 
 ## Deployment
 
