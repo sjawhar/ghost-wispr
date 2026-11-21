@@ -379,7 +379,12 @@ func TestALSAOutputCancelSilencesTheVoiceWithin20ms(t *testing.T) {
 // The device runs in lockstep, the speech is queued before the stream opens,
 // and the Cancel comes from inside the device's write at a point of its
 // clock, so where the Cancel lands in the speech is the stream's, not the
-// machine's.
+// machine's. The idle close counts wall time, but it cannot come before the
+// Cancel either: the stream closes only once the device holds nothing of the
+// speech (Output.mix, quiet against queuedFrames), and that is first true in
+// the write that takes the clock to the speech's end, inside which the first
+// case's Cancel comes. A Cancel at a later clock would race the idle close,
+// and a mixer a few milliseconds late would close the stream first.
 func TestALSAOutputReportsWhatTheRoomHeardOfACancelledSpeech(t *testing.T) {
 	for _, tc := range []struct {
 		name      string
@@ -388,8 +393,9 @@ func TestALSAOutputReportsWhatTheRoomHeardOfACancelledSpeech(t *testing.T) {
 		cancelled bool
 	}{
 		// The 100 ms speech is frames 0-4799; the device holds 3840, so it
-		// has taken 960 when the speech's last frame is written.
-		{name: "cancel after the speech played out", at: 5280, heard: 100 * time.Millisecond},
+		// has taken 960 when the speech's last frame is written, and 4800
+		// once it has taken the speech's last frame.
+		{name: "cancel after the speech played out", at: 4800, heard: 100 * time.Millisecond},
 		{name: "cancel while the device holds its end", at: 1440, heard: 30 * time.Millisecond, cancelled: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -520,6 +526,12 @@ func TestALSAStreamLogsWhetherItRewinds(t *testing.T) {
 // back says whether it rewound or dropped: a device that rewinds, as the
 // stream logs at open, can still leave more in flight than a period, and then
 // the cancel drops, so only this line shows what the Jabra does.
+//
+// The device runs in lockstep: it takes frames only as the writes need room,
+// so at the Cancel it has taken 960 frames and holds 960 however late the
+// test's writes come. A device that plays in real time runs dry when a loaded
+// machine wakes the test late, and a device restarted after the underrun holds
+// only frames it has not played, which a Cancel rewinds.
 func TestALSAStreamLogsTheWayEachCancelTookBack(t *testing.T) {
 	for _, tc := range []struct {
 		inflight int
@@ -533,7 +545,7 @@ func TestALSAStreamLogsTheWayEachCancelTookBack(t *testing.T) {
 		original := slog.Default()
 		slog.SetDefault(slog.New(slog.NewTextHandler(lockedWriter{&mu, &logs}, nil)))
 		pcm := newFakePCM(48000, 960)
-		pcm.inflight = tc.inflight
+		pcm.inflight, pcm.lockstep = tc.inflight, true
 		stream := streamOn(pcm)
 		frame := make([]int16, 480)
 		for range 4 {
