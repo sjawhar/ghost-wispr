@@ -368,15 +368,13 @@ func TestADrivingVoiceThatDidNotFinishIsNotReportedSpoken(t *testing.T) {
 			})
 			r.heard("Wispr, what is happening?", true, true)
 			sess := r.waitSession()
+			r.waitEvent("voice_exchange_started:sess-1") // control: the exchange started
 			tc.speak(t, r, sess, reports)
 			r.s.Stop("the test ends the exchange")
 			eventually(t, "the exchange ended", func() bool { _, _, closed := sess.state(); return closed })
 			time.Sleep(50 * time.Millisecond)
 			if n := spokenCount(r); n != tc.want {
 				t.Fatalf("voice_spoken %d times, want %d; events %v", n, tc.want, r.events.all())
-			}
-			if !slices.Contains(r.events.all(), "voice_exchange_started:sess-1") {
-				t.Fatal("control: no exchange started")
 			}
 		})
 	}
