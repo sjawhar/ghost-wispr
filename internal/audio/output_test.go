@@ -1040,14 +1040,16 @@ func TestOutputKeepsToRealTimeOnAStreamThatNeverWaits(t *testing.T) {
 }
 
 // TestOutputKeepsNoFinishedPlayback fails if the Output keeps a playback that
-// has played all its audio once the next one has played, so that a process
-// that speaks for weeks grows by one playback per speech.
+// has played all its audio once the next one has played past the history a
+// Drop can give back, so that a process that speaks for weeks grows by one
+// playback per speech. Until then the history must name it: a Cancel can
+// still take its audio back from the device, off what it played.
 func TestOutputKeepsNoFinishedPlayback(t *testing.T) {
 	out := newTestOutput(t, OutputConfig{}, &fakeOpener{streams: []*fakeStream{newFakeStream(48000)}})
 	ctx := testContext(t)
-	play := func() *Playback {
+	play := func(d time.Duration) *Playback {
 		pb := out.Begin(InputVoice)
-		if err := pb.WriteAll(ctx, constant(48000, outputFrame, 1000), mono48k); err != nil {
+		if err := pb.WriteAll(ctx, constant(48000, d, 1000), mono48k); err != nil {
 			t.Fatal(err)
 		}
 		if err := pb.Drain(ctx); err != nil {
@@ -1055,12 +1057,12 @@ func TestOutputKeepsNoFinishedPlayback(t *testing.T) {
 		}
 		return pb
 	}
-	first := weak.Make(play())
-	play()
+	first := weak.Make(play(outputFrame))
+	play(outputHistory + 2*outputFrame)
 	for range 5 {
 		runtime.GC()
 	}
 	if first.Value() != nil {
-		t.Fatal("the Output still holds a playback that played all its audio, after the next one played")
+		t.Fatal("the Output still holds a playback that played all its audio, after the next one played past the history")
 	}
 }

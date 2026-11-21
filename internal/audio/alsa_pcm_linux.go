@@ -5,6 +5,7 @@ package audio
 /*
 #cgo LDFLAGS: -lasound
 #include <stdlib.h>
+#include <time.h>
 #include <alsa/asoundlib.h>
 
 // gw_playback is a playback PCM gw_open_playback opened, with the parameters
@@ -92,6 +93,32 @@ static long gw_status_avail(snd_pcm_t *pcm) {
 	if ((rc = snd_pcm_status(pcm, st)) < 0) return rc;
 	return (long)snd_pcm_status_get_avail(st);
 }
+
+// gw_drop is what gw_drop_counted read and did.
+typedef struct {
+	long delay;
+	long long between_ns;
+	int status_rc, drop_rc;
+} gw_drop;
+
+// gw_drop_counted reads the PCM's delay from its status, which counts what
+// is in flight to a USB speaker as well as what the PCM holds, then drops the
+// PCM, and reports the delay, the time between the status call's return and
+// the drop's call, during which the device played on, and each call's
+// result. A status that fails leaves the PCM not dropped.
+static gw_drop gw_drop_counted(snd_pcm_t *pcm) {
+	gw_drop d = {0};
+	snd_pcm_status_t *st;
+	struct timespec a, b;
+	snd_pcm_status_alloca(&st);
+	if ((d.status_rc = snd_pcm_status(pcm, st)) < 0) return d;
+	clock_gettime(CLOCK_MONOTONIC, &a);
+	d.delay = (long)snd_pcm_status_get_delay(st);
+	clock_gettime(CLOCK_MONOTONIC, &b);
+	d.drop_rc = snd_pcm_drop(pcm);
+	d.between_ns = (long long)(b.tv_sec - a.tv_sec) * 1000000000LL + (b.tv_nsec - a.tv_nsec);
+	return d;
+}
 */
 import "C"
 
@@ -112,9 +139,13 @@ func (p *cgoPCM) recover(rc int) int { return int(C.snd_pcm_recover(p.pcm, C.int
 func (p *cgoPCM) resume() int        { return int(C.snd_pcm_resume(p.pcm)) }
 func (p *cgoPCM) statusAvail() int   { return int(C.gw_status_avail(p.pcm)) }
 func (p *cgoPCM) avail() int         { return int(C.snd_pcm_avail(p.pcm)) }
-func (p *cgoPCM) drop() int          { return int(C.snd_pcm_drop(p.pcm)) }
-func (p *cgoPCM) prepare() int       { return int(C.snd_pcm_prepare(p.pcm)) }
-func (p *cgoPCM) rewindable() int    { return int(C.snd_pcm_rewindable(p.pcm)) }
+
+func (p *cgoPCM) dropCounted() (delay int, between time.Duration, statusRC, dropRC int) {
+	d := C.gw_drop_counted(p.pcm)
+	return int(d.delay), time.Duration(d.between_ns), int(d.status_rc), int(d.drop_rc)
+}
+func (p *cgoPCM) prepare() int    { return int(C.snd_pcm_prepare(p.pcm)) }
+func (p *cgoPCM) rewindable() int { return int(C.snd_pcm_rewindable(p.pcm)) }
 
 func (p *cgoPCM) rewind(frames int) int {
 	return int(C.snd_pcm_rewind(p.pcm, C.snd_pcm_uframes_t(frames)))

@@ -383,7 +383,7 @@ func TestAPlaybacksFrameIsTheLastItsAudioReaches(t *testing.T) {
 	render := func(from, to, m int, next bool) run {
 		in := &outputInput{gen: &playGen{}, tails: make([]tail, 0, 4)}
 		in.setRate(from)
-		in.contrib, in.landed = make([]float32, to/100), make([]uint32, 2*to/100)
+		in.contrib, in.landed, in.landedBy = make([]float32, to/100), make([]uint32, 2*to/100), make([]*Playback, 2*to/100)
 		a := &Playback{}
 		signal := make([]int16, m)
 		for i := range signal {
@@ -754,6 +754,59 @@ func TestASecondCancelKeepsTheFirstCut(t *testing.T) {
 			}
 			if !ended.Cancelled {
 				t.Fatalf("second Cancel erased the first queued cut: cancels=%d queued-samples-discarded=%d first-cut=%t final-cut=%t end=%+v", tc.cancels, queuedBefore, firstCut, finalCut, ended)
+			}
+		})
+	}
+}
+
+// TestATakeBackComesOffEachPlaybackItTook fails if a Cancel whose Drop takes
+// back audio of two playbacks of one input takes it off only the one the
+// stream took last: the first still reported 10 ms played, though the room
+// heard none of it (Sol's review of #133 at aaa8e0f). Played sizes what the
+// text-to-speech voice reports it spoke. The control is one playback of the
+// same 20 ms.
+func TestATakeBackComesOffEachPlaybackItTook(t *testing.T) {
+	for _, split := range []bool{false, true} {
+		t.Run(fmt.Sprintf("two playbacks %v", split), func(t *testing.T) {
+			stream := &probeStream{fakeStream: newFakeStream(48000)}
+			out, start, events := probeOutput(t, stream)
+			barrier := newProbeBarrier()
+			t.Cleanup(barrier.unblock)
+			ctx := testContext(t)
+			first := out.Begin(InputVoice)
+			second := first
+			if err := first.Write(ctx, constant(48000, 10*time.Millisecond, 1000), mono48k); err != nil {
+				t.Fatal(err)
+			}
+			if split {
+				second = out.Begin(InputVoice)
+			}
+			if err := second.Write(ctx, constant(48000, 10*time.Millisecond, 1000), mono48k); err != nil {
+				t.Fatal(err)
+			}
+			stream.before = func(n int, _ []int16) {
+				if n == 3 { // the first silent write after both
+					barrier.hold()
+				}
+			}
+			drops := 0
+			stream.drop = func() (int, error) {
+				if drops++; drops == 1 {
+					return 3 * 480, nil // all of both, and the silence after
+				}
+				return 0, nil
+			}
+			start()
+			probeWait(t, barrier.entered, "the first silent write after both playbacks")
+			probeVoiceEvent(t, events, true)
+			out.Cancel(InputVoice)
+			barrier.unblock()
+			end := probeVoiceEvent(t, events, false)
+			if end.Played != 0 {
+				t.Fatalf("fixture: the speech played %v, though its audio was all taken back", end.Played)
+			}
+			if a, b := first.Played(), second.Played(); a != 0 || b != 0 {
+				t.Fatalf("taken-back audio still counts as played: the first playback %v, the second %v", a, b)
 			}
 		})
 	}

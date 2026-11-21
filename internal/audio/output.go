@@ -217,9 +217,6 @@ type outputInput struct {
 	speaking  bool
 	cancelled bool // Cancel silenced its speech: the mixer takes it back and ends it
 	cut       bool // Cancel dropped audio of the speech still queued
-	// silenced is the playback whose audio the stream took last before
-	// Cancel: what Cancel takes back from the device comes off what it played.
-	silenced  *Playback
 	lastAudio time.Time
 	quietAt   time.Time // when it ran out of audio; zero while it has some
 	spoken    playedTime
@@ -227,15 +224,17 @@ type outputInput struct {
 	history   []float32 // its part in the stream's last outputHistory: a ring that ends at histPos
 	histPos   int
 	// held counts, along history, the queued samples whose output each
-	// stream position holds, with the rate they were queued at (heldCount):
-	// a Cancel takes off what it played only the audio it took back, as long
-	// as it was queued, though the speech had gaps and the resampler delays
-	// it. landed counts the same for the frame being mixed and, after it,
-	// the positions the resampler's delay reaches: landed[j] is the stream
+	// stream position holds, with the rate they were queued at (heldCount),
+	// and heldBy is the playback they came from: a Cancel takes off what each
+	// playback played only its audio it took back, as long as it was queued,
+	// though the speech had gaps and the resampler delays it. landed and
+	// landedBy are the same for the frame being mixed and, after it, the
+	// positions the resampler's delay reaches: landed[j] is the stream
 	// position pos+j. unlanded is what of the queued audio the resampler held
 	// when Cancel dropped it: it never reaches the stream.
-	held, landed []uint32
-	unlanded     playedTime
+	held, landed     []uint32
+	heldBy, landedBy []*Playback
+	unlanded         playedTime
 }
 
 // tail is a playback whose last sample the resampler took at push last.
@@ -503,15 +502,12 @@ func (o *Output) Cancel(input string) {
 	if in == nil {
 		return
 	}
-	last, cut := in.last, !in.idle()
+	cut := !in.idle()
 	in.end(ErrCancelled)
 	if in.speaking {
 		// A second Cancel before the mixer takes the first in finds nothing
-		// queued: it keeps the first one's cut and playback.
+		// queued: it keeps the first one's cut.
 		in.cancelled, in.cut = true, in.cut || cut
-		if in.silenced == nil {
-			in.silenced = last
-		}
 		o.dropNow = true
 	}
 	o.changed()
@@ -580,8 +576,9 @@ func signal(c chan struct{}) {
 
 // end drops what the input holds and ends each of its playbacks with err: the
 // generation they share ends, and a new one begins. The audio the resampler
-// held, which will not reach the stream, is kept in unlanded for a Cancel's
-// take-back. The caller holds the Output's mu.
+// held, which will not reach the stream, comes off what its playbacks played,
+// and is kept in unlanded for a Cancel's take-back of the speech. The caller
+// holds the Output's mu.
 func (in *outputInput) end(err error) {
 	in.gen.err = err
 	in.gen = &playGen{}
@@ -592,10 +589,38 @@ func (in *outputInput) end(err error) {
 	in.rs.reset()
 	clear(in.tails)
 	in.tails = in.tails[:0]
-	for _, v := range in.landed {
-		in.unlanded.addHeld(v)
-	}
+	takeBack(in.landed, in.landedBy, &in.unlanded)
 	clear(in.landed)
+	clear(in.landedBy)
+}
+
+// takeBack adds the queued samples counted in held to lost, and takes each
+// playback's share of them off what it played (heldBy). The caller holds the
+// Output's mu.
+func takeBack(held []uint32, heldBy []*Playback, lost *playedTime) {
+	type share struct {
+		pb *Playback
+		t  playedTime
+	}
+	var shares []share
+	for i, v := range held {
+		if v == 0 {
+			continue
+		}
+		lost.addHeld(v)
+		pb := heldBy[i]
+		if pb == nil {
+			continue
+		}
+		k := slices.IndexFunc(shares, func(s share) bool { return s.pb == pb })
+		if k < 0 {
+			shares, k = append(shares, share{pb: pb}), len(shares)
+		}
+		shares[k].t.addHeld(v)
+	}
+	for _, s := range shares {
+		s.pb.played.sub(s.t.total())
+	}
 }
 
 // idle reports whether the input has nothing left to play.
@@ -674,7 +699,7 @@ func (in *outputInput) render(rate int) {
 		for i := range in.contrib {
 			s, pb := in.pull()
 			if pb != nil {
-				in.land(i)
+				in.land(i, pb)
 				pb.seq = max(pb.seq, in.seq)
 			}
 			in.contrib[i] = s
@@ -683,9 +708,10 @@ func (in *outputInput) render(rate int) {
 	}
 	lag := in.rs.lag() * rate / in.rate // output samples a pushed sample takes to reach the output
 	if need := len(in.contrib) + lag + 1; len(in.landed) < need {
-		grown := make([]uint32, need)
+		grown, grownBy := make([]uint32, need), make([]*Playback, need)
 		copy(grown, in.landed)
-		in.landed = grown
+		copy(grownBy, in.landedBy)
+		in.landed, in.landedBy = grown, grownBy
 	}
 	for i := range in.contrib {
 		in.contrib[i] = in.rs.output()
@@ -696,7 +722,7 @@ func (in *outputInput) render(rate int) {
 			if pb == nil {
 				continue
 			}
-			in.land(i + lag)
+			in.land(i+lag, pb)
 			pb.seq = max(pb.seq, in.seq)
 			if k := len(in.tails); k > 0 && in.tails[k-1].pb == pb {
 				in.tails[k-1].last = in.pushes
@@ -724,9 +750,10 @@ func (in *outputInput) render(rate int) {
 	}
 }
 
-// land counts one queued sample, at the input's rate, at landed[j].
-func (in *outputInput) land(j int) {
+// land counts one queued sample of pb, at the input's rate, at landed[j].
+func (in *outputInput) land(j int, pb *Playback) {
 	in.landed[j] = heldCount(int(in.landed[j]>>24)+1, in.rate)
+	in.landedBy[j] = pb
 }
 
 // run is the Output's mixer: it waits for audio, then plays a stream until
@@ -1063,7 +1090,8 @@ func (o *Output) mixFrame(frame []int16, sum []float32, rate, hist int, now time
 	for _, in := range o.order {
 		if len(in.contrib) != len(frame) || len(in.history) != hist {
 			in.contrib, in.history, in.held, in.histPos = make([]float32, len(frame)), make([]float32, hist), make([]uint32, hist), 0
-			in.landed = make([]uint32, 2*len(frame))
+			in.heldBy = make([]*Playback, hist)
+			in.landed, in.landedBy = make([]uint32, 2*len(frame)), make([]*Playback, 2*len(frame))
 		}
 		switch {
 		case in == chime && hold:
@@ -1096,7 +1124,7 @@ func (o *Output) mixFrame(frame []int16, sum []float32, rate, hist int, now time
 			active = true
 		}
 		for i, c := range in.contrib {
-			in.history[in.histPos], in.held[in.histPos] = c, in.landed[i]
+			in.history[in.histPos], in.held[in.histPos], in.heldBy[in.histPos] = c, in.landed[i], in.landedBy[i]
 			if in.histPos++; in.histPos == hist {
 				in.histPos = 0
 			}
@@ -1104,6 +1132,8 @@ func (o *Output) mixFrame(frame []int16, sum []float32, rate, hist int, now time
 		// The counts past the frame, the resampler's delay, move to its start.
 		k := copy(in.landed, in.landed[len(frame):])
 		clear(in.landed[k:])
+		copy(in.landedBy, in.landedBy[len(frame):])
+		clear(in.landedBy[k:])
 	}
 	for i, s := range sum {
 		frame[i] = clip(s)
@@ -1164,17 +1194,21 @@ func (o *Output) retake(redo []int16, sum []float32) {
 		// long as they were queued, at their rate, and only them, since a
 		// gap in the speech was silence.
 		lost, h := in.unlanded, len(in.held)
-		for i := range min(back, h) {
-			lost.addHeld(in.held[(in.histPos-back+i+2*h)%h])
+		if n := min(back, h); n > 0 {
+			from := (in.histPos - n + h) % h
+			if from+n <= h {
+				takeBack(in.held[from:from+n], in.heldBy[from:from+n], &lost)
+			} else {
+				takeBack(in.held[from:], in.heldBy[from:], &lost)
+				takeBack(in.held[:from+n-h], in.heldBy[:from+n-h], &lost)
+			}
 		}
 		in.unlanded = playedTime{}
 		clear(in.history)
 		clear(in.held)
+		clear(in.heldBy)
 		unheard := lost.total()
 		in.spoken.sub(unheard)
-		if in.silenced != nil {
-			in.silenced.played.sub(unheard)
-		}
 		o.endSpeech(in, now, in.cut || unheard > 0)
 	}
 	for start := 0; start < len(redo); start += len(sum) {
@@ -1182,6 +1216,9 @@ func (o *Output) retake(redo []int16, sum []float32) {
 		clear(sum)
 		for _, in := range o.order {
 			h := len(in.history)
+			if h == 0 {
+				continue // begun since the mixer last ran: it played nothing here
+			}
 			for i := range part {
 				sum[i] += in.history[(in.histPos-len(redo)+start+i+2*h)%h]
 			}
@@ -1212,7 +1249,7 @@ func (o *Output) endSpeech(in *outputInput, now time.Time, cancelled bool) {
 		at = now
 	}
 	o.emit(SpeechEvent{Input: in.name, At: at, Played: in.spoken.total(), Cancelled: cancelled})
-	in.speaking, in.cancelled, in.cut, in.silenced, in.spoken, in.quietAt = false, false, false, nil, playedTime{}, time.Time{}
+	in.speaking, in.cancelled, in.cut, in.spoken, in.quietAt = false, false, false, playedTime{}, time.Time{}
 }
 
 func clip(s float32) int16 {
