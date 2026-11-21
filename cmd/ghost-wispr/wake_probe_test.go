@@ -140,9 +140,9 @@ func TestProbeWakeKeyterm(t *testing.T) {
 					errs <- fmt.Errorf("%s %q: %w", results[i].Voice, results[i].Text, err)
 					return
 				}
-				results[i].Heard = heard
 				for _, h := range heard {
-					if _, ok := detector.Find(h); ok {
+					results[i].Heard = append(results[i].Heard, h.Text)
+					if _, ok := detector.Find(h.Text); ok {
 						results[i].Woke = true
 					}
 				}
@@ -206,17 +206,24 @@ func probeSpeak(ctx context.Context, key, voice, text string) ([]byte, error) {
 	return pcm, nil
 }
 
-// probeResults collects the text of every result a live socket hands on.
+// probeResult is one result a live socket handed on: its text, and whether
+// it was final.
+type probeResult struct {
+	Text  string `json:"text"`
+	Final bool   `json:"final"`
+}
+
+// probeResults collects every result with text a live socket hands on.
 type probeResults struct {
 	transcriptCallback
 	mu    sync.Mutex
-	heard []string
+	heard []probeResult
 }
 
 func (p *probeResults) Message(mr *api.MessageResponse) error {
 	if len(mr.Channel.Alternatives) > 0 && strings.TrimSpace(mr.Channel.Alternatives[0].Transcript) != "" {
 		p.mu.Lock()
-		p.heard = append(p.heard, mr.Channel.Alternatives[0].Transcript)
+		p.heard = append(p.heard, probeResult{Text: mr.Channel.Alternatives[0].Transcript, Final: mr.IsFinal})
 		p.mu.Unlock()
 	}
 	return nil
@@ -224,8 +231,8 @@ func (p *probeResults) Message(mr *api.MessageResponse) error {
 
 // probeTranscribe streams pcm to Deepgram's live endpoint with opts, as the
 // microphone does, in 100 ms buffers at the rate they are captured, then 1.5 s
-// of silence, and returns the text of every result.
-func probeTranscribe(ctx context.Context, key string, opts *interfaces.LiveTranscriptionOptions, pcm []byte) ([]string, error) {
+// of silence, and returns every result with text.
+func probeTranscribe(ctx context.Context, key string, opts *interfaces.LiveTranscriptionOptions, pcm []byte) ([]probeResult, error) {
 	results := &probeResults{}
 	socket, err := dialDeepgramLive(ctx, key, &interfaces.ClientOptions{}, opts, results, deepgramWriteTimeout)
 	if err != nil {
@@ -240,7 +247,11 @@ func probeTranscribe(ctx context.Context, key string, opts *interfaces.LiveTrans
 		if _, err := socket.Write(stream[off:min(off+buffer, len(stream))]); err != nil {
 			return nil, fmt.Errorf("write: %w", err)
 		}
-		<-tick.C
+		select {
+		case <-tick.C:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
 	}
 	if err := socket.Finalize(); err != nil {
 		return nil, fmt.Errorf("finalize: %w", err)
