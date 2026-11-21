@@ -98,9 +98,7 @@ func (rc *ResilientClient) write(p []byte, queued *atomic.Int64) (int, error) {
 		// reconnect in between would start its socket's stream len(p) too
 		// late (CapturedSince), and a drain that ended in between would
 		// leave p in the buffer, behind the audio sent after it.
-		if writeErr := rc.bufferLocked(p); writeErr != nil {
-			rc.log("failed to buffer audio while disconnected: %v", writeErr)
-		}
+		rc.bufferLocked(p)
 		rc.Mu.Unlock()
 		return len(p), nil
 	}
@@ -114,9 +112,7 @@ func (rc *ResilientClient) write(p []byte, queued *atomic.Int64) (int, error) {
 		rc.Mu.Lock()
 		if rc.Client == client {
 			// The socket that failed is the client's: it is broken.
-			if writeErr := rc.bufferLocked(p); writeErr != nil {
-				rc.log("failed to buffer audio after write error: %v", writeErr)
-			}
+			rc.bufferLocked(p)
 			rc.setStateLocked(StateDisconnected)
 			rc.Mu.Unlock()
 			rc.startReconnect()
@@ -127,15 +123,60 @@ func (rc *ResilientClient) write(p []byte, queued *atomic.Int64) (int, error) {
 		// where the client sends audio now: the buffer, which the reconnect
 		// owner still drains, or the successor, once it is connected.
 		if rc.State != StateConnected || rc.Client == nil {
-			if writeErr := rc.bufferLocked(p); writeErr != nil {
-				rc.log("failed to buffer audio after write error: %v", writeErr)
-			}
+			rc.bufferLocked(p)
 			rc.Mu.Unlock()
 			return len(p), nil
 		}
 		client = rc.Client
 		rc.Mu.Unlock()
 	}
+}
+
+// bufferLocked keeps p for the next socket, behind the audio kept already: the
+// chunk a drain write has pending, then the buffer. What is kept is bounded by
+// the buffer's size and is always one tail of the capture: when p does not
+// fit, the oldest audio goes first, the pending chunk's front before the
+// buffer's, so one start of a socket's stream maps all of it to the times it
+// was captured. Called with Mu held, after p was counted.
+func (rc *ResilientClient) bufferLocked(p []byte) {
+	if over := len(rc.pending) + rc.Buffer.Len() + len(p) - rc.Buffer.Cap(); over > 0 {
+		from := rc.accepted - int64(len(p)) - int64(rc.Buffer.Len()) - int64(len(rc.pending))
+		fromPending := min(over, len(rc.pending))
+		rc.pending = rc.pending[fromPending:]
+		// When p alone is longer than the buffer, the buffer's write drops
+		// p's front: the rest of over.
+		rc.Buffer.Discard(over - fromPending)
+		rc.evictedLocked(from, int64(over))
+	}
+	_, _ = rc.Buffer.Write(p)
+}
+
+// evictedLocked notes that an overflow dropped the d oldest bytes of the kept
+// audio, from at in the count of the bytes Write takes, while the client may
+// be draining it into a socket, whose stream must not jump over them. During
+// a drain write the count waits for the write's end, as the socket may take
+// some of the bytes dropped (drainChunk). Before the socket took any audio,
+// its stream skips them (holeLocked). After, its stream would jump, so it
+// ends at its next chunk. Called with Mu held.
+func (rc *ResilientClient) evictedLocked(at, d int64) {
+	if rc.State != StateDraining {
+		return // no socket's stream holds them: the next dial starts at the tail
+	}
+	switch {
+	case rc.inFlight:
+		rc.droppedInFlight += d
+	case rc.took == 0:
+		rc.holeLocked(at, d)
+	default:
+		rc.gap = true
+	}
+}
+
+// keptFromLocked is where the audio kept starts, in the count of the bytes
+// Write takes: the pending chunk, then the buffer, are the last bytes taken.
+// Called with Mu held.
+func (rc *ResilientClient) keptFromLocked() int64 {
+	return rc.accepted - int64(rc.Buffer.Len()) - int64(len(rc.pending))
 }
 
 // Close stops reconnection attempts and the hand-over of state changes, and
@@ -350,6 +391,11 @@ func (rc *ResilientClient) closeGracefully(c io.WriteCloser) {
 // socket whose dial predates an options change: the owner then rotates.
 var errOptionsChanged = errors.New("the options changed since the socket was dialled")
 
+// errStreamGap is what a drain reports when an overflow dropped audio the
+// socket had not taken, after audio it had: one start of its stream can no
+// longer map both to the times they were captured, so the owner rotates.
+var errStreamGap = errors.New("the buffer overflowed past the audio the socket took")
+
 // dialUntilConnected dials after wait, then again with exponential backoff,
 // until a socket is connected and the buffered audio sent; it stops when rc.ctx
 // is cancelled. Each dial reads the options the factory builds then, and the
@@ -405,10 +451,12 @@ func (rc *ResilientClient) dialUntilConnected(wait time.Duration) {
 		}
 		rc.Client = newClient
 		rc.dialedGen = gen
-		// The new socket's stream starts at the oldest buffered byte.
-		rc.origin = rc.accepted - int64(rc.Buffer.Len())
+		// The new socket's stream starts at the oldest byte kept: the chunk a
+		// failed drain kept, then the buffer, one tail of the capture.
+		rc.origin = rc.keptFromLocked()
 		rc.keepDropsAfterLocked(rc.origin)
 		rc.holes = rc.holes[:0]
+		rc.took, rc.inFlight, rc.droppedInFlight, rc.gap = 0, false, 0, false
 		rc.setStateLocked(StateDraining)
 		rc.Mu.Unlock()
 
@@ -425,8 +473,11 @@ func (rc *ResilientClient) dialUntilConnected(wait time.Duration) {
 				wait = 0
 				continue
 			}
-			// The new socket is dead too: keep the rest of the buffer for
-			// the next one rather than throwing it into this one.
+			// The new socket is dead too, or the capture outran it by a whole
+			// buffer, so an overflow dropped audio it had not taken
+			// (errStreamGap): it ends at once, as a socket that fell behind
+			// would not return its last results in time, and the next one
+			// starts at the audio kept.
 			rc.log("deepgram socket failed while draining buffered audio (redialling in %v): %v", next, err)
 			_ = newClient.Close()
 			backOff()
@@ -443,10 +494,11 @@ func (rc *ResilientClient) dialUntilConnected(wait time.Duration) {
 }
 
 // drainBuffer writes all buffered audio to the current client, and stops at
-// the first chunk the client fails to take, whose error it returns; that chunk
-// is lost. Does NOT hold rc.Mu during external writes to avoid deadlock;
-// drainMu covers the read and the write of each chunk, so Finalize waits for a
-// chunk already read and no chunk is read after it.
+// the first chunk the client fails to take, whose error it returns; the bytes
+// of that chunk the client did not take stay pending, and the next socket's
+// drain sends them first. Does NOT hold rc.Mu during external writes to avoid
+// deadlock; drainMu covers the read and the write of each chunk, so Finalize
+// waits for a chunk already read and no chunk is read after it.
 func (rc *ResilientClient) drainBuffer() error {
 	buf := make([]byte, 4096)
 	for {
@@ -458,34 +510,72 @@ func (rc *ResilientClient) drainBuffer() error {
 }
 
 // drainChunk writes one buffered chunk and reports whether to drain another.
-// It makes the client connected, and ends the owner's run, under the lock that
-// finds the buffer empty: a write before that is buffered for this drain and a
-// write after it goes to the socket, so no audio is left in a buffer nothing
-// drains. If the options changed since this socket's dial, it leaves the
-// client buffering and reports errOptionsChanged instead, so the owner, still
-// the only one, rotates: the check and the hand-over to connected are one step,
-// so no change is lost between them.
+// The chunk is the one a failed write left pending, if any, else the next out
+// of the buffer, and it stays pending until the client took all of it: a write
+// that fails, wholly or in part, leaves the bytes it did not send for the next
+// socket, before any later audio. It makes the client connected, and ends the
+// owner's run, under the lock that finds nothing left to send: a write before
+// that is buffered for this drain and a write after it goes to the socket, so
+// no audio is left in a buffer nothing drains. If the options changed since
+// this socket's dial, it leaves the client buffering and reports
+// errOptionsChanged instead, so the owner, still the only one, rotates: the
+// check and the hand-over to connected are one step, so no change is lost
+// between them. If an overflow dropped audio this socket had not taken, after
+// audio it had, it reports errStreamGap: its stream ends whole there, and the
+// next socket's starts at the audio kept.
 func (rc *ResilientClient) drainChunk(buf []byte) (bool, error) {
 	rc.drainMu.Lock()
 	defer rc.drainMu.Unlock()
 
 	rc.Mu.Lock()
-	n, _ := rc.Buffer.Read(buf)
+	if rc.gap && rc.ctx.Err() == nil {
+		// An overflow dropped audio this socket had not taken, after audio it
+		// had: its stream would jump over it.
+		rc.Mu.Unlock()
+		return false, errStreamGap
+	}
+	if len(rc.pending) == 0 {
+		n, _ := rc.Buffer.Read(buf)
+		rc.pending = append(rc.pending[:0], buf[:n]...)
+	}
+	chunk := rc.pending
 	client := rc.Client
-	if n == 0 || client == nil {
+	if len(chunk) == 0 || client == nil {
 		if client != nil && rc.optionsGen != rc.dialedGen && rc.ctx.Err() == nil {
 			rc.Mu.Unlock()
 			return false, errOptionsChanged
 		}
 		rc.setStateLocked(StateConnected)
 		rc.owning = false
+	} else {
+		rc.inFlight, rc.droppedInFlight = true, 0
 	}
 	rc.Mu.Unlock()
 
-	if n == 0 || client == nil {
+	if len(chunk) == 0 || client == nil {
 		return false, nil
 	}
-	if _, err := client.Write(buf[:n]); err != nil {
+	n, err := client.Write(chunk)
+	n = max(0, min(n, len(chunk)))
+	rc.Mu.Lock()
+	rc.inFlight = false
+	rc.took += int64(n)
+	// An overflow during the write dropped the oldest kept bytes, the chunk's
+	// front first. If the socket took at least as many, it took them all: the
+	// chunk's bytes it took beyond them are sent, and its stream goes on with
+	// no gap. Else it skipped audio the overflow dropped, and it ends at its
+	// next chunk.
+	if dropped := rc.droppedInFlight; dropped <= int64(n) {
+		rc.pending = rc.pending[n-int(dropped):]
+	} else {
+		rc.gap = true
+	}
+	rc.droppedInFlight = 0
+	rc.Mu.Unlock()
+	if err == nil && n < len(chunk) {
+		err = io.ErrShortWrite
+	}
+	if err != nil {
 		return false, err
 	}
 	return true, nil
@@ -638,29 +728,23 @@ func (rc *ResilientClient) pointLocked(at time.Duration) int64 {
 	return p
 }
 
-// bufferLocked buffers p for the next socket, or for the one draining. A
-// full buffer drops its oldest audio, and the oldest of p itself when p is
-// larger than the buffer, which no socket will be sent: a hole in the stream
-// (holeLocked). It must be called with Mu held, after p was counted.
-func (rc *ResilientClient) bufferLocked(p []byte) error {
-	held := int64(rc.Buffer.Len())
-	if lost := held + int64(len(p)) - int64(rc.Buffer.Cap()); lost > 0 {
-		rc.holeLocked(rc.accepted-int64(len(p))-held, lost)
-	}
-	_, err := rc.Buffer.Write(p)
-	return err
-}
-
 // holeLocked records that the current socket's stream skips the n bytes the
 // client took from at, in the count Write takes: they were never sent. The
-// holes last as long as the socket, so a point's place never moves. It must
-// be called with Mu held.
+// holes last as long as the socket, so a point's place never moves; they are
+// kept in the order the stream meets them, and holes that touch are one. It
+// must be called with Mu held.
 func (rc *ResilientClient) holeLocked(at, n int64) {
-	if last := len(rc.holes) - 1; last >= 0 && rc.holes[last].at+rc.holes[last].n == at {
-		rc.holes[last].n += n
-		return
+	i := sort.Search(len(rc.holes), func(i int) bool { return rc.holes[i].at > at })
+	if i > 0 && rc.holes[i-1].at+rc.holes[i-1].n == at {
+		i--
+		rc.holes[i].n += n
+	} else {
+		rc.holes = slices.Insert(rc.holes, i, streamDrop{at: at, n: n})
 	}
-	rc.holes = append(rc.holes, streamDrop{at: at, n: n})
+	if next := i + 1; next < len(rc.holes) && rc.holes[i].at+rc.holes[i].n == rc.holes[next].at {
+		rc.holes[i].n += rc.holes[next].n
+		rc.holes = slices.Delete(rc.holes, next, next+1)
+	}
 }
 
 // streamDrop is audio a send queue in front of the client dropped, or a hole
@@ -760,16 +844,19 @@ func (rc *ResilientClient) streamDuration(n int64) time.Duration {
 
 // Finalize ends the current stretch of audio. It drops the audio buffered
 // during a disconnect, which a reconnect would otherwise send, waits for a
-// buffered chunk the reconnect is already writing, then asks Deepgram to
-// return final results for the audio the live socket has. A capture pause
-// calls it, so no audio reaches Deepgram while paused and audio from before
-// the pause comes back before the pause ends, not after it.
+// buffered chunk the reconnect is already writing, drops what of a chunk a
+// failed write left pending, then asks Deepgram to return final results for
+// the audio the live socket has. A capture pause calls it, so no audio reaches
+// Deepgram while paused and audio from before the pause comes back before the
+// pause ends, not after it.
 func (rc *ResilientClient) Finalize() error {
 	rc.Mu.Lock()
 	// The live socket, still draining, would have been sent these next: its
-	// stream skips them, after the audio already sent.
+	// stream skips them, after the audio already sent. The pending chunk, if
+	// any, ends where they start.
+	pendingEnd := rc.accepted - int64(rc.Buffer.Len())
 	if n := int64(rc.Buffer.Len()); n > 0 {
-		rc.holeLocked(rc.accepted-n, n)
+		rc.holeLocked(pendingEnd, n)
 	}
 	rc.Buffer.Reset()
 	rc.Mu.Unlock()
@@ -777,13 +864,20 @@ func (rc *ResilientClient) Finalize() error {
 	rc.drainMu.Lock()
 	defer rc.drainMu.Unlock()
 	rc.Mu.Lock()
+	// The pending chunk is older than the buffer, and as much from before the
+	// pause: the live socket would have been sent it first, and its stream
+	// skips it too. A write since the buffer's reset took only its front.
+	if n := int64(len(rc.pending)); n > 0 {
+		rc.holeLocked(pendingEnd-n, n)
+	}
+	rc.pending = rc.pending[:0]
 	state := rc.State
 	client := rc.Client
 	rc.Mu.Unlock()
 
 	// Connected or draining, Client is the live socket. Disconnected or
 	// reconnecting, it is the one that failed, which the SDK would redial; the
-	// reset above already keeps its audio from the next socket.
+	// resets above already keep its audio from the next socket.
 	if state != StateConnected && state != StateDraining {
 		return nil
 	}

@@ -222,8 +222,10 @@ func TestResilientClient_ReconnectDrainsBuffer(t *testing.T) {
 // TestResilientClient_ReconnectsWhenTheNewSocketFailsWhileDraining fails if
 // a reconnect whose new socket fails while it drains the buffer keeps that
 // dead socket as connected, throwing the rest of the buffer into it, rather
-// than dialling again and draining the rest into the next socket. With audio
-// arriving faster than the dead socket refuses it, the drain never ended.
+// than dialling again and draining the rest into the next socket, or if the
+// chunk the dead socket refused is lost: the next socket gets every buffered
+// byte, once and in order. With audio arriving faster than the dead socket
+// refuses it, the drain never ended.
 func TestResilientClient_ReconnectsWhenTheNewSocketFailsWhileDraining(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -243,7 +245,7 @@ func TestResilientClient_ReconnectsWhenTheNewSocketFailsWhileDraining(t *testing
 		MaxReconnectBackoff:   10 * time.Millisecond,
 	}, nil, nil)
 	rc.State = StateDisconnected
-	buffered := bytes.Repeat([]byte{7}, 3*4096)
+	buffered := audioBytes(3 * 4096)
 	if _, err := rc.Buffer.Write(buffered); err != nil {
 		t.Fatal(err)
 	}
@@ -259,8 +261,8 @@ func TestResilientClient_ReconnectsWhenTheNewSocketFailsWhileDraining(t *testing
 	if client != live || !rc.IsConnected() {
 		t.Fatalf("after the new socket failed while draining: connected=%t, client is the live one=%t, dials=%d; want a new socket", rc.IsConnected(), client == live, dials.Load())
 	}
-	if got := len(live.getData()); got != 2*4096 {
-		t.Fatalf("the next socket got %d bytes of buffered audio, want the %d the dead one did not take", got, 2*4096)
+	if got := live.getData(); !bytes.Equal(got, buffered) {
+		t.Fatalf("the next socket got %d bytes of buffered audio, want all %d, once and in order: the dead socket took none", len(got), len(buffered))
 	}
 	if !dead.isClosed() {
 		t.Fatal("the socket that failed while draining was not closed")
@@ -932,7 +934,9 @@ func TestResilientClient_FinalizeWaitsForTheChunkBeingDrained(t *testing.T) {
 	rc := NewResilientClient(ctx, nil, ResilientConfig{BufferSize: 3 * 4096}, nil, nil)
 	rc.State = StateDraining
 	rc.Client = client
-	if _, err := rc.Buffer.Write(make([]byte, 3*4096)); err != nil {
+	// Through Write, as the client buffers audio while draining: it counts the
+	// audio it takes, which the drain's stream start and end are read against.
+	if _, err := rc.Write(make([]byte, 3*4096)); err != nil {
 		t.Fatalf("fill buffer: %v", err)
 	}
 
