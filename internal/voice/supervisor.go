@@ -244,6 +244,14 @@ type Supervisor struct {
 	heard         []heardCall    // Heard calls OnTranscript makes once it unlocks
 	segments      []Segment      // Segment calls OnTranscript makes once it unlocks
 	wg            sync.WaitGroup // the goroutines Close waits for
+	// speechEx is the exchange whose voice's speech plays now: the one
+	// holding the floor when the speech started, by the speech's own start
+	// time, not when its event came, nil for other speech. The speech's end
+	// is that exchange's, though another exchange may have taken the floor,
+	// and cut it, since. floorAt is when the exchange holding the floor took
+	// it.
+	speechEx *exchange
+	floorAt  time.Time
 
 	// commands counts a person's commands on held answers: each "Wispr,
 	// never mind" and each "Wispr, go ahead". neverMinds is how many never
@@ -1221,26 +1229,29 @@ func (s *Supervisor) idleWaited(ex *exchange) {
 // driverSpeechLocked follows the speech of ex's voice, which drives its own
 // turn, as the speaker reports it: the room's next words are a new turn, and
 // once its speech ends by itself, it was spoken (EventSpoken, once for the
-// exchange) and the follow-up window opens (R10). A speech a barge-in or a
-// cancel cut was not spoken. voice_spoken comes from the speaker, not from
-// the voice's own report that its speech ended, which can trail it: every
-// end of an exchange that follows a speech, quiet or not, comes after the
-// speaker's report, since each waits for the voice to be silent or cuts it.
+// exchange) and the follow-up window opens (R10). A speech a cancel cut, a
+// barge-in's included, was not spoken: the speaker reports it cancelled.
+// voice_spoken comes from the speaker's report, not from the voice's own,
+// which can trail it, and it is ex's, the exchange that held the floor when
+// the speech started (speechEx): the report is made even when ex has ended
+// since, before the speaker's callback came, and a barge-in after the speech
+// had played to its end does not take it back.
 func (s *Supervisor) driverSpeechLocked(ex *exchange, started, cancelled bool) {
+	if !started && !cancelled {
+		s.noteLocked(ex, EventSpoken, ex.x.SessionID)
+	}
+	if ex.ended {
+		return
+	}
 	s.disarmFollowUpLocked(ex)
 	ex.newTurn = true
 	if started {
 		ex.unspokenAnswer = false
-	}
-	if started || ex.ended {
 		return
 	}
 	if ex.cutSpeech { // a barge-in: the person speaks now
 		ex.cutSpeech = false
 		return
-	}
-	if !cancelled {
-		s.noteLocked(ex, EventSpoken, ex.x.SessionID)
 	}
 	gen := ex.followUpGen
 	ex.followUpTimer = time.AfterFunc(s.cfg.FollowUpWait, func() { s.driverFollowUpWaited(ex, gen) })
@@ -1933,7 +1944,7 @@ func (s *Supervisor) endLocked(ex *exchange, cut bool, reason string) {
 // has sounded yet, and the answer sound. Speech begun after this waits for
 // the floor (WithFloor).
 func (s *Supervisor) takeFloorLocked(ex *exchange) {
-	s.ex = ex
+	s.ex, s.floorAt = ex, time.Now()
 	s.floor = make(chan struct{})
 	s.cfg.Speaker.Cancel(audio.InputVoice)
 	s.cutChimeLocked(true) // a notification sound gives way to the exchange, and sounds again after it
@@ -1964,7 +1975,9 @@ func (s *Supervisor) sendNotes() {
 }
 
 // onSpeech follows the voice input's speech, for barge-in and the own-speech
-// filter.
+// filter. A speech belongs to the exchange that held the floor when it
+// started, and its end to that exchange too (speechEx): an exchange that
+// takes the floor cuts the speech playing, whose end then comes after.
 func (s *Supervisor) onSpeech(e audio.SpeechEvent) {
 	if e.Input != audio.InputVoice {
 		return
@@ -1972,14 +1985,21 @@ func (s *Supervisor) onSpeech(e audio.SpeechEvent) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.voiceSpeaking = e.Started
-	ex := s.ex
 	sessionID := ""
-	if ex != nil {
-		sessionID = ex.x.SessionID
+	if s.ex != nil {
+		sessionID = s.ex.x.SessionID
 	}
+	var ex *exchange
 	if e.Started {
+		// A speech that started before the exchange took the floor, whose
+		// start came only after, is not its voice's: the floor's cut ends it.
+		ex, s.speechEx = nil, nil
+		if s.ex != nil && !e.At.Before(s.floorAt) {
+			ex, s.speechEx = s.ex, s.ex
+		}
 		s.voiceStarted = e.At
 	} else {
+		ex, s.speechEx = s.speechEx, nil
 		s.voiceEnded = time.Now()
 		s.timing("speech_end", sessionID, e.At)
 	}
