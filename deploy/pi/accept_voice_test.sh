@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 # Runs every step of deploy/pi/accept-voice.sh against a fake Pi, with no root, no sound card and no
 # network. One Python module, fakepi.py, is every fake command on PATH (systemctl, curl, aplay,
-# arecord, ffmpeg, journalctl) and the unit's binary; a fake sudo runs a command as root; a real
+# arecord, journalctl) and the unit's binary; a fake sudo runs a command as root; a real
 # SQLite database holds the saved capture state; and a fake service process holds that database open
 # with the .env's variables in its environment, as ghost-wispr.service does.
 #
 # The fake voice reacts to each injected clip by writing a timeline: /ws events, voice timing lines,
 # log lines, the sounds the speaker plays, and the questions to agents. A stop cuts a sound and the
 # events it would still have caused. The fake curl streams /ws from the timeline, the fake journalctl
-# prints its journal, the fake ffmpeg reports its sounds in a recording, and the fake service writes
+# prints its journal, the fake arecord writes its sounds into a recording, and the fake service writes
 # the speaker's /proc status from it. With that status, the service applies the voice's stops and
 # XRUNs itself, so that what the driver reads does not hang on how soon a loaded machine runs a fake:
 # a stop line comes only once the status shows the drop, and an XRUN lasts exactly one read of the
@@ -71,6 +71,7 @@ readonly config_yaml=$'db_path: data/ghost-wispr.db\nspeaker_device: J75\nmic_de
 
 cat >"$fakepi" <<'EOF'
 """The fake Pi of accept_voice_test.sh: every fake command, chosen by its first argument."""
+import array
 import errno
 import fcntl
 import json
@@ -78,6 +79,7 @@ import os
 import signal
 import re
 import sqlite3
+import struct
 import subprocess
 import sys
 import time
@@ -687,6 +689,17 @@ def voice_state(fn):
 # written (internal/audio, Output.next), is heard 30 ms later. A cancel drops the queue, so a
 # speech's sound ends where its cut puts it.
 SPEAKER_QUEUE_MS = 30
+# The service's "audible" line for each speech on the chime or the voice input is when its first
+# sample left ALSA's buffer for the speaker; the rig hears it DEVICE_LATENCY_MS later, the same for
+# both inputs: 8 ms, or 25 ms with device-latency-25. With no-audible the service logs no such lines,
+# as a build before them.
+DEVICE_LATENCY_MS = 25 if "device-latency-25" in SCENARIO else 8
+
+
+def audible(input_name, heard, session, tag=None):
+    """The service's audible line for a sound on INPUT_NAME the rig hears at HEARD."""
+    if "no-audible" not in SCENARIO:
+        emit(kind="timing", due=heard - DEVICE_LATENCY_MS, event="audible", input=input_name, session_id=session, **({"tag": tag} if tag else {}))
 
 
 def speech(tag, start, length, session="session-1", fact=None):
@@ -698,6 +711,7 @@ def speech(tag, start, length, session="session-1", fact=None):
     # at 48 kHz): period and buffer are time.Durations, which the journal holds in nanoseconds.
     emit(kind="log", due=start, tag=tag, level="INFO", msg="speaker stream", fields={"device": "plughw:CARD=J75,DEV=0", "rate": 48000, "channels": 2, "period": 10_000_000, "buffer": 40_000_000, "rewind": True})
     emit(kind="sound", start=start + SPEAKER_QUEUE_MS, end=start + length, tag=tag)
+    audible("voice", start + SPEAKER_QUEUE_MS, session, tag)
     emit(kind="timing", due=start + length, tag=tag, event="speech_end", session_id=session)
     spoken(tag, start + length, session)
 
@@ -773,6 +787,11 @@ def react(kind, key, start, end):
             # and here runs into it, less than silence_ms apart, as one sound.
             if "leak-before-first" in SCENARIO:
                 emit(kind="sound", start=end + 700 - 80, end=end + 700 - 60, tag="leaked-word")
+            # leak-in-queue: a 12 ms word from 15 to 27 ms after the answer's first_audio, ending 3 ms
+            # before the answer is heard: within the speaker's queue, so after first_audio, and
+            # running into the answer as one sound. Only timing the answer against the chime sees it.
+            if "leak-in-queue" in SCENARIO:
+                emit(kind="sound", start=end + 700 + 15, end=end + 700 + 27, tag="leaked-word")
         wake = start + 150
         chime = 120
         if "late-chime" in SCENARIO:
@@ -789,6 +808,7 @@ def react(kind, key, start, end):
         emit(kind="ws", due=wake + 20, event={"type": "transcript", "session_id": "session-1", "speaker": 0, "text": "the injected question", "start_time": 0})
         if not ("no-chime-after-stop" in SCENARIO and read("stop-count")):
             emit(kind="sound", start=wake + chime, end=wake + chime + chime_heard, tag="chime-%d" % n)
+            audible("chime", wake + chime, "")
         emit(kind="ws", due=end + 200, event={"type": "voice_exchange_started", "session_id": "session-1"})
         emit(kind="timing", due=end + 200, event="turn_end", session_id="session-1")
         tag = "speech-%d" % n
@@ -1077,6 +1097,55 @@ def joined_probe(args):
 # ---- recordings ----
 
 
+def wav_header(data_bytes):
+    """A WAV header as arecord writes one, for mono PCM16 at 24 kHz: 0x7fffffff bytes of data while it
+    records, and its true size once it ends."""
+    return b"RIFF" + struct.pack("<I", min(data_bytes + 36, 0xFFFFFFFF)) + b"WAVEfmt " + \
+        struct.pack("<IHHIIHH", 16, 1, 1, 24000, 48000, 2, 16) + b"data" + struct.pack("<I", data_bytes)
+
+
+# The fake rig hears a sound as a square wave of this amplitude, about -12 dBFS, over every threshold
+# the driver uses; silence is digital zeros.
+SOUND_AMPLITUDE = 8000
+
+
+def render(path):
+    """Write into the recording at PATH, in place, the sounds the timeline put in it: zeros elsewhere.
+    A sound's place in the file is its time since the recording began (the recordings log's last
+    entry for PATH, which an overrun moves on), in ms of the rig's clock; a quiet stretch is a pause in
+    whatever plays then. The size of the file does not change, so the anchors the driver read stand."""
+    if not os.path.exists(path):
+        return
+    size = os.path.getsize(path)
+    count = max(0, (size - 44) // 2)
+    samples = array.array("h", bytes(2 * count))
+    begun = None
+    for line in read("recordings").splitlines():
+        name, _, at = line.rpartition(" ")
+        if name == path:
+            begun = int(at)
+    if begun is not None and "silent" not in SCENARIO:
+        duration = count / 24
+        sounds, quiets = [], []
+        for item in timeline():
+            if item["kind"] in ("sound", "quiet"):
+                a, b = max((item["start"] - begun) * CLOCK, 0), min((item["end"] - begun) * CLOCK, duration)
+                if b > a:
+                    (sounds if item["kind"] == "sound" else quiets).append([a, b])
+        for qa, qb in quiets:
+            sounds = [piece for a, b in sounds for piece in ([[a, b]] if qb <= a or qa >= b else [p for p in ([a, qa], [qb, b]) if p[1] > p[0]])]
+        for a, b in sounds:
+            first, last = round(a * 24), min(round(b * 24), count)
+            if last > first:
+                tone = array.array("h", [SOUND_AMPLITUDE, -SOUND_AMPLITUDE]) * ((last - first + 1) // 2)
+                samples[first:last] = tone[:last - first]
+    if sys.byteorder == "big":
+        samples.byteswap()
+    with open(path, "r+b") as f:
+        f.write(wav_header(2 * count))
+        f.write(samples.tobytes())
+
+
 def arecord(args):
     if args[:1] == ["-l"]:
         print("card 2: Loopback [Loopback], device 0: Loopback PCM [Loopback PCM]" if "no-loopback" not in SCENARIO else "")
@@ -1087,9 +1156,12 @@ def arecord(args):
     log_to("arecord.log", " ".join(args))
     path = args[-1]
     if "-d" in args:
+        # The room, for so many seconds: a hum that peaks at -62 dBFS, or -5 dBFS with loud-room.
         seconds = int(args[args.index("-d") + 1])
+        level = round(32768 * 10 ** ((-5.0 if "loud-room" in SCENARIO else -62.0) / 20))
         with open(path, "wb") as f:
-            f.write(bytes(44 + seconds * 48000))
+            f.write(wav_header(seconds * 48000))
+            f.write((array.array("h", [level, -level]) * (seconds * 12000)).tobytes())
         return 0
     # The capture substream arecord holds, in the case's /proc/asound: its status names arecord as
     # owner_pid, with the trigger_time the kernel sets at every start, stop (an overrun's included),
@@ -1176,7 +1248,7 @@ def arecord(args):
         else:
             f.write(data)
             f.flush()
-    put(bytes(44), "wb")
+    put(wav_header(0x7FFFFFFF), "wb")
     # The file's first sample is captured once its whole header is written, as arecord's first
     # read starts its capture only then, and stamped in whole milliseconds rounded up, so never
     # before the header. arecord-slow-start reads 1.5 s after the header, as an arecord its
@@ -1230,7 +1302,7 @@ def arecord(args):
         # behind for 2 s, as an arecord the machine holds back writes late, so that the anchor after
         # the chime is late, and then catch up, well before the step stops the recording;
         # arecord-overrun loses 250 ms of audio for good, as an arecord overrun does, so that every
-        # later sound sits 250 ms earlier in the file (and the recordings log says so for ffmpeg);
+        # later sound sits 250 ms earlier in the file (and the recordings log says so for render);
         # arecord-dies ends the recording 1 s later. From the start, arecord-behind keeps the file
         # 50 ms behind for the whole recording, as a loaded machine does, so that every anchor is
         # read 50 ms late and no later anchor makes up for it; 50 ms and the loop's 5 ms stay within
@@ -1312,6 +1384,7 @@ def arecord(args):
                     os.kill(pid, signal.SIGCONT)
                 frozen = []
     finally:
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
         # arecord-final-rewrite: as arecord ends, it seeks back to write the data chunk's size into
         # the header (alsa-utils aplay.c, end_wave) and holds 800 ms before it closes: its offset in
         # the file is then 44, though the file holds the whole recording.
@@ -1325,58 +1398,9 @@ def arecord(args):
         for pid in frozen:
             os.kill(pid, signal.SIGCONT)
         close_substream()
-
-
-def ffmpeg(args):
-    path = args[args.index("-i") + 1]
-    if not os.path.exists(path):
-        sys.stderr.write("%s: No such file or directory\n" % path)
-        return 1
-    duration = (os.path.getsize(path) - 44) / 48
-    sys.stderr.write("Input #0, wav, from '%s':\n  Duration: %02d:%02d:%02d.%02d, bitrate: 384 kb/s\n" % (path, duration // 3600000, duration // 60000 % 60, duration // 1000 % 60, duration % 1000 // 10))
-    filters = args[args.index("-af") + 1]
-    if filters.startswith("volumedetect"):
-        sys.stderr.write("[Parsed_volumedetect_0 @ 0x1] max_volume: %s dB\n" % ("-5.0" if "loud-room" in SCENARIO else "-62.0"))
-        return 0
-    minimum = float(filters.split("d=")[1]) * 1000
-    begun = None
-    for line in read("recordings").splitlines():
-        name, _, at = line.rpartition(" ")
-        if name == path:
-            begun = int(at)
-    sounds = []
-    quiets = []
-    if begun is not None and "silent" not in SCENARIO:
-        for item in timeline():
-            if item["kind"] in ("sound", "quiet"):
-                # A sound's place in the file, in ms of the rig's clock; a quiet stretch is a pause
-                # in whatever plays then.
-                a, b = max((item["start"] - begun) * CLOCK, 0), min((item["end"] - begun) * CLOCK, duration)
-                if b > a:
-                    (sounds if item["kind"] == "sound" else quiets).append([a, b])
-    for qa, qb in quiets:
-        sounds = [piece for a, b in sounds for piece in ([[a, b]] if qb <= a or qa >= b else [p for p in ([a, qa], [qb, b]) if p[1] > p[0]])]
-    sounds.sort()
-    merged = []
-    for a, b in sounds:
-        if merged and a <= merged[-1][1] + minimum:
-            merged[-1][1] = max(merged[-1][1], b)
-        else:
-            merged.append([a, b])
-    # As ffmpeg prints them: %.6g, six significant digits.
-    out = []
-    cursor = 0
-    for a, b in merged:
-        if a - cursor >= minimum or (cursor == 0 and a > 0 and a >= minimum):
-            out.append("[silencedetect @ 0x1] silence_start: %.6g" % (cursor / 1000))
-            out.append("[silencedetect @ 0x1] silence_end: %.6g | silence_duration: %.6g" % (a / 1000, (a - cursor) / 1000))
-        cursor = b
-    if duration - cursor >= minimum:
-        out.append("[silencedetect @ 0x1] silence_start: %.6g" % (cursor / 1000))
-        out.append("[silencedetect @ 0x1] silence_end: %.6g | silence_duration: %.6g" % (duration / 1000, (duration - cursor) / 1000))
-    out.append("size=N/A time=00:00:01.00 bitrate=N/A speed= 500x")
-    sys.stderr.write("\n".join(out) + "\n")
-    return 0
+        if f is not None:
+            f.close()
+        render(path)
 
 
 # ---- the journal ----
@@ -1429,8 +1453,9 @@ def journalctl(args):
         elif item["kind"] == "timing":
             # As cmd/ghost-wispr/voice.go's voiceTiming logs it.
             fields = {"event": item["event"], "session_id": item["session_id"], "at_unix_ns": wall_ms(due) * 1_000_000, "at_mono_ns": due * 1_000_000}
-            if item.get("reason"):
-                fields["reason"] = item["reason"]
+            for extra in ("reason", "input"):
+                if item.get(extra):
+                    fields[extra] = item[extra]
             records.append(journal_record(due, "INFO", "voice timing", fields))
         elif item["kind"] == "log":
             records.append(journal_record(due, item["level"], item["msg"], item["fields"]))
@@ -1736,7 +1761,7 @@ def person(args):
 
 if __name__ == "__main__":
     tool = sys.argv[1]
-    handlers = {"systemctl": systemctl, "curl": curl, "aplay": aplay, "arecord": arecord, "ffmpeg": ffmpeg, "journalctl": journalctl, "binary": binary,
+    handlers = {"systemctl": systemctl, "curl": curl, "aplay": aplay, "arecord": arecord, "journalctl": journalctl, "binary": binary,
                 "ss": ss, "getent": getent, "person": person}
     if tool == "service":
         service()
@@ -1744,7 +1769,7 @@ if __name__ == "__main__":
     sys.exit(handlers[tool](sys.argv[2:]) or 0)
 EOF
 
-for tool in systemctl curl aplay arecord ffmpeg journalctl ss getent; do
+for tool in systemctl curl aplay arecord journalctl ss getent; do
   if [[ $tool == systemctl ]]; then
     cat >"$root/bin/$tool" <<EOF
 #!/usr/bin/env bash
@@ -2366,6 +2391,24 @@ launch cancel-leak-after-chime long,asound,stop-rounds-2,leak-after-chime yes --
 # before the answer can be heard, so FAIL, never the PASS of an allowance before first_audio.
 # shellcheck disable=SC2086
 launch cancel-leak-before-first long,asound,stop-rounds-2,leak-before-first yes -- $cancel_args
+# The answer timed against its chime (the service's audible lines): a 12 ms word that ends 3 ms before
+# the answer is heard, inside the speaker's queue and after first_audio, FAIL, as it is with the
+# speaker 25 ms behind ALSA's account (device-latency-25), which cancels; a good cancel with that
+# latency, PASS. Without audible lines (no-audible), first_audio is the threshold: a good cancel,
+# PASS with a NOTE of the limit; the word inside the queue is not seen there, PASS or UNKNOWN;
+# the word before first_audio, FAIL.
+# shellcheck disable=SC2086
+launch cancel-leak-in-queue long,asound,stop-rounds-2,leak-in-queue yes -- $cancel_args
+# shellcheck disable=SC2086
+launch cancel-leak-in-queue-latency long,asound,stop-rounds-2,leak-in-queue,device-latency-25 yes -- $cancel_args
+# shellcheck disable=SC2086
+launch cancel-latency long,asound,stop-rounds-2,device-latency-25 yes -- $cancel_args
+# shellcheck disable=SC2086
+launch cancel-no-audible long,asound,stop-rounds-2,no-audible yes -- $cancel_args
+# shellcheck disable=SC2086
+launch cancel-leak-in-queue-no-audible long,asound,stop-rounds-2,leak-in-queue,no-audible yes -- $cancel_args
+# shellcheck disable=SC2086
+launch cancel-leak-before-first-no-audible long,asound,stop-rounds-2,leak-before-first,no-audible yes -- $cancel_args
 # shellcheck disable=SC2086
 launch cancel-quiet-chime long,asound,stop-rounds-2,quiet-chime yes -- $cancel_args
 # shellcheck disable=SC2086
@@ -3192,13 +3235,35 @@ expect_line cancel-leak-into-chime "FAIL: playback-cancel stop 1: the sound at t
 expect_restored cancel-leak-into-chime
 expect_rc cancel-leak-after-chime 1
 expect_line cancel-leak-after-chime "FAIL: playback-cancel stop 1: a sound at the rig microphone starts "
-expect_line cancel-leak-after-chime "after the next question's chime ends, before its answer's first audio"
+expect_line cancel-leak-after-chime "before the next question's answer can be heard there (timed against its chime in the same recording)"
 expect_restored cancel-leak-after-chime
 expect_rc cancel-leak-before-first 1
 expect_line cancel-leak-before-first "FAIL: playback-cancel stop 1: a sound at the rig microphone starts "
-expect_line cancel-leak-before-first "after the next question's chime ends, before its answer's first audio"
+expect_line cancel-leak-before-first "before the next question's answer can be heard there (timed against its chime in the same recording)"
 expect_no_line cancel-leak-before-first "PASS: playback-cancel: no stop's speech was heard"
 expect_restored cancel-leak-before-first
+expect_rc cancel-leak-in-queue 1
+expect_line cancel-leak-in-queue "before the next question's answer can be heard there (timed against its chime in the same recording)"
+expect_no_line cancel-leak-in-queue "PASS: playback-cancel: no stop's speech was heard"
+expect_restored cancel-leak-in-queue
+expect_rc cancel-leak-in-queue-latency 1
+expect_line cancel-leak-in-queue-latency "before the next question's answer can be heard there (timed against its chime in the same recording)"
+expect_restored cancel-leak-in-queue-latency
+expect_rc cancel-latency 0
+expect_line cancel-latency "PASS: playback-cancel: no stop's speech was heard at the rig microphone 20 ms after it"
+expect_no_line cancel-latency 'NOTE: playback-cancel: the timing log gives no audible times'
+expect_restored cancel-latency
+expect_rc cancel-no-audible 0
+expect_line cancel-no-audible "PASS: playback-cancel: no stop's speech was heard at the rig microphone 20 ms after it"
+expect_line cancel-no-audible 'NOTE: playback-cancel: the timing log gives no audible times for the chime and the answer'
+expect_restored cancel-no-audible
+expect_rc cancel-leak-in-queue-no-audible 0 2
+expect_line cancel-leak-in-queue-no-audible 'NOTE: playback-cancel: the timing log gives no audible times for the chime and the answer'
+expect_no_line cancel-leak-in-queue-no-audible "FAIL: playback-cancel"
+expect_restored cancel-leak-in-queue-no-audible
+expect_rc cancel-leak-before-first-no-audible 1
+expect_line cancel-leak-before-first-no-audible "after the next question's chime ends, before its answer's first audio"
+expect_restored cancel-leak-before-first-no-audible
 expect_rc cancel-quiet-chime 0
 expect_line cancel-quiet-chime "PASS: playback-cancel: no stop's speech was heard at the rig microphone 20 ms after it"
 expect_line cancel-quiet-chime 'NOTE: playback-cancel: calibration: the wake sound played alone (ghost-wispr play-sound) is heard at the rig microphone for 130 ms above -50 dB'

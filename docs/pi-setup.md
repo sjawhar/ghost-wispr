@@ -980,6 +980,8 @@ with the unit paused and no session active:
    running process's lines in the current boot: the Pi keeps no user journal, and a process ID can
    recur after a reboot. The underrun check reports UNKNOWN if its journal read fails. The windows
    and thresholds of the rig steps are not yet calibrated: the first run on the Pi calibrates them.
+   The driver reads each recording itself, with Python's `wave` module, in exact sample indices at
+   any length; it needs no ffmpeg, whose printed times are good only to 10 ms past 1000 s.
    Every time the rig steps take from a recording lies between two bounds. The late bound comes
    from the anchors that tie the file to the Pi's clock, and is late by however late the driver
    read them. The early bound comes from the recording's start: the driver's last read of the
@@ -1038,6 +1040,16 @@ with the unit paused and no session active:
    playback-cancel tail that may be 18 to 20 ms is not a FAIL. The 2 ms is an assumption about the
    rig, not a measured bound. A microphone slower than that can make an early bound late by the
    difference.
+   `playback-cancel` also checks that nothing starts after the next question's chime before its
+   answer can be heard. The service logs an `audible` timing line as each sound on the chime or the
+   voice starts: when its first sample left ALSA's buffer for the speaker, by ALSA's own account of
+   the stream. The rig hears both sounds a latency after that, the same for both, so the earliest the
+   answer can be heard is the chime's onset in the same recording plus the time between their audible
+   lines, counted in samples. A leak that starts within about 8 ms of the answer is not told apart
+   from it: 6 ms for the chime's 5 ms attack, 1 ms for each audible line, and 200 ppm. The 1 ms is an
+   assumption about the USB speaker, which moves audio in 1 ms frames, not a measured bound. A build
+   without the audible lines is checked against the answer's `first_audio` instead, with a NOTE: a
+   leak within the speaker's queue before it, about 40 ms, is then not seen.
 6. Slice 4's two steps check the three capture states and the paused listener, with the
    listener turned on for the run only (`GHOST_WISPR_VOICE_PAUSED_LISTENER=true`, beside the
    voice). Both keep the microphone on the loopback, so the listener hears only what the step plays
