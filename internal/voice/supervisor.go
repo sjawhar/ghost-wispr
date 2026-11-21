@@ -1211,6 +1211,7 @@ func (s *Supervisor) idleWaited(ex *exchange) {
 		return
 	}
 	unspoken := ex.unspokenAnswer
+	s.spokenAtQuietEndLocked(ex)
 	s.endLocked(ex, false, "idle")
 	if unspoken {
 		// The voice got an answer to speak and never began it: the room
@@ -1256,7 +1257,20 @@ func (s *Supervisor) driverFollowUpWaited(ex *exchange, gen int) {
 	if s.ex != ex || ex.ended || ex.followUpGen != gen || s.voiceSpeaking || ex.toolCalls > 0 {
 		return
 	}
+	s.spokenAtQuietEndLocked(ex)
 	s.endLocked(ex, false, "no follow-up")
+}
+
+// spokenAtQuietEndLocked reports that ex's voice, which drives its own turn,
+// spoke (EventSpoken, once for the exchange) as ex ends with nobody and
+// nothing speaking, if it spoke. The speaker has played the speech then, but
+// the voice's own report that it ended (EventSpeechEnded, which readEvents
+// reports spoken on) can trail the speaker's, and the end closes the session,
+// which drops that report.
+func (s *Supervisor) spokenAtQuietEndLocked(ex *exchange) {
+	if ex.drives && !ex.spokeAt.IsZero() {
+		s.noteLocked(ex, EventSpoken, ex.x.SessionID)
+	}
 }
 
 // turnLocked adds words of the asker's turn, and hands the turn to the
