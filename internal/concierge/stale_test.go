@@ -1,6 +1,7 @@
 package concierge
 
 import (
+	"context"
 	"slices"
 	"strings"
 	"testing"
@@ -9,6 +10,7 @@ import (
 
 	"github.com/sjawhar/ghost-wispr/internal/dispatch"
 	"github.com/sjawhar/ghost-wispr/internal/voice"
+	"github.com/sjawhar/ghost-wispr/internal/wake/transcript"
 )
 
 // TestAStaleRecordSpeaksItsAgeFirst (R6; run 8j): on a status question whose
@@ -75,8 +77,9 @@ func TestTheAskingNoteKeepsTheAskToTheRecorder(t *testing.T) {
 
 // TestASpokenKeyIsReadInTheFormsDeepgramWrites (R5; live at 08d3b8b): Deepgram
 // writes a project that is a keyterm in capitals, and its number after a
-// pause, with a thousands comma, or in words; each is the key. A lowercase
-// word before a number in words is no key.
+// pause, with a thousands comma, in words, or, with smart formatting, as a
+// date ("INFRA 10/27", office run of 2026-11-21); each is the key. A
+// lowercase word before a number in words is no key.
 func TestASpokenKeyIsReadInTheFormsDeepgramWrites(t *testing.T) {
 	for words, want := range map[string][]string{
 		"When is happening with INFRA? 4592.":                                    {"INFRA-4592"},
@@ -86,6 +89,9 @@ func TestASpokenKeyIsReadInTheFormsDeepgramWrites(t *testing.T) {
 		"what about INFRA four five nine two":                                    {"INFRA-4592"},
 		"What is the progress on INFRA 4592?":                                    {"INFRA-4592"},
 		"what about ABC-12 and xyz 34":                                           {"ABC-12", "XYZ-34"},
+		"What's the status of INFRA ten twenty seven?":                           {"INFRA-1027"},
+		"What's the status of INFRA 10/27?":                                      {"INFRA-1027"},
+		"Miss Burr, what's the status of infra 10/27?":                           {"INFRA-1027"},
 		"I counted forty two people":                                             nil,
 		"is INFRA one ready":                                                     nil,
 	} {
@@ -96,5 +102,48 @@ func TestASpokenKeyIsReadInTheFormsDeepgramWrites(t *testing.T) {
 	// The key so written is no search word.
 	if got := searchTerms("what changed on INFRA four thousand five hundred and ninety two today"); got != "" {
 		t.Errorf("searchTerms = %q, want none", got)
+	}
+}
+
+// TestEveryFormOfAKeyReadsAsTheKey fails if a spoken or formatted form of an
+// issue key reaches the Concierge's read as another issue, or as none: on
+// 2026-11-21 "infra 10/27", smart formatting's date for "infra ten twenty
+// seven", was read as INFRA-10. Each form goes the way a turn does: the
+// Supervisor writes the spoken keys of Dispatch's projects as keys
+// (transcript.WriteKeys), and the Concierge reads the record the turn names
+// (readTarget).
+func TestEveryFormOfAKeyReadsAsTheKey(t *testing.T) {
+	r := newRig(t)
+	projects := r.records.projects
+	for _, tc := range []struct {
+		said string
+		want string // the keys readTarget reads, none for no key
+	}{
+		{"What's the status of INFRA-1027?", "INFRA-1027"},
+		{"What's the status of INFRA 1027?", "INFRA-1027"},
+		{"what's the status of infra 1027?", "INFRA-1027"},
+		{"What's the status of INFRA 1,027?", "INFRA-1027"},
+		{"What's the status of INFRA ten twenty seven?", "INFRA-1027"},
+		{"what's the status of infra ten twenty seven?", "INFRA-1027"},
+		{"what's the status of infra ten twenty-seven?", "INFRA-1027"},
+		{"what's the status of infra one oh two seven?", "INFRA-1027"},
+		{"What's the status of INFRA 10/27?", "INFRA-1027"},
+		{"Wispr, what is happening with infra 10/27?", "INFRA-1027"},
+		{"Miss Burr, what's the status of infra 10/27?", "INFRA-1027"},
+		{"what's the status of in for 10/27?", "INFRA-1027"},
+		{"what's the status of INFRA fifteen?", "INFRA-15"},
+		{"what's the status of infra one thousand and twenty seven?", "INFRA-1027"},
+		{"what's the status of INFRA four thousand five hundred and ninety two?", "INFRA-4592"},
+		{"The review is on 10/27.", ""},
+	} {
+		turn := transcript.WriteKeys(tc.said, projects)
+		target := r.concierge.readTarget(context.Background(), turn, true)
+		got := ""
+		if keys, ok := strings.CutPrefix(target, "keys:"); ok {
+			got, _, _ = strings.Cut(keys, "|")
+		}
+		if got != tc.want {
+			t.Errorf("%q read as %q (turn %q, target %q), want %q", tc.said, got, turn, target, tc.want)
+		}
 	}
 }
