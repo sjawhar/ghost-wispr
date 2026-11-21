@@ -361,7 +361,9 @@ func TestAFollowUpTheVoiceAnswersAtOnceIsNoTalkOver(t *testing.T) {
 // TestTheCallsInterruptionStartsANewTurn fails if talk-over that Deepgram
 // sent in one result with the call cuts the driving voice but leaves the turn
 // where it was: the interruption's own late final, after the voice answered
-// it, was then taken as a new turn, and closed the follow-up window.
+// it, was then taken as a new turn, and closed the follow-up window. It also
+// fails if the interruption's words are not the turn once it cut the voice
+// (Sol's review of #133 at aaa8e0f found the window alone checked).
 func TestTheCallsInterruptionStartsANewTurn(t *testing.T) {
 	const call = "Wispr, what's the status of INFRA-1027?"
 	r := newDrivingRig(t, time.Minute) // FollowUpWait 200 ms
@@ -381,6 +383,12 @@ func TestTheCallsInterruptionStartsANewTurn(t *testing.T) {
 	}
 	r.s.OnTranscript(&tr)
 	eventually(t, "the interruption to cut the voice", func() bool { return voiceCutAfter(r, first) })
+	r.s.mu.Lock()
+	turn := r.s.turnOf(r.s.ex)
+	r.s.mu.Unlock()
+	if turn != "what's the status of INFRA-1027? Wait, who signed off?" {
+		t.Fatalf("the turn is %q, want the call with its interruption", turn)
+	}
 	speakAs(t, sess, "Ada did.") // the voice answers the interruption
 	waitSpeechAfter(t, r, first)
 	r.speaker.finish(audio.InputVoice) // the follow-up window opens
@@ -429,12 +437,13 @@ func TestASpeechThatStartedBeforeTheCallIsNotItsVoices(t *testing.T) {
 
 // TestATalkOverReadInAPauseDoesNotStopTheVoice fails if two words said over a
 // driving voice, whose final comes only once its audio has paused, stop the
-// vendor, or leave its next answer without its follow-up window. The
-// Supervisor stops a voice only while it plays: a talk-over recognized after
-// the voice went quiet does not interrupt the vendor's turn, the limit this
-// change states. An earlier rule that stopped it in the pause left the next
-// answer without its follow-up window (Sol's review of #133 at ab139c8). The
-// control reads the same words while the voice plays, and they stop it.
+// vendor or cancel the speaker, or leave its next answer without its
+// follow-up window. The Supervisor stops a voice only while it plays: a
+// talk-over recognized after the voice went quiet does not interrupt the
+// vendor's turn, the limit this change states. An earlier rule that stopped
+// it in the pause left the next answer without its follow-up window (Sol's
+// review of #133 at ab139c8). The control reads the same words while the
+// voice plays, and they stop it both ways.
 func TestATalkOverReadInAPauseDoesNotStopTheVoice(t *testing.T) {
 	for _, pause := range []bool{false, true} {
 		t.Run(fmt.Sprintf("read in a pause %v", pause), func(t *testing.T) {
@@ -453,9 +462,12 @@ func TestATalkOverReadInAPauseDoesNotStopTheVoice(t *testing.T) {
 			interrupted := func() bool { i, _, _ := sess.state(); return !i.IsZero() }
 			if !pause {
 				eventually(t, "the talk-over to stop the voice", interrupted)
+				if !voiceCutAfter(r, first) {
+					t.Fatal("control: the talk-over did not cancel the speaker")
+				}
 				return
 			}
-			never(t, "a talk-over read in the pause stopped the voice", 200*time.Millisecond, interrupted)
+			never(t, "a talk-over read in the pause stopped the voice", 200*time.Millisecond, func() bool { return interrupted() || voiceCutAfter(r, first) })
 			speakAs(t, sess, "Ada has signed off.") // the vendor goes on
 			waitSpeechAfter(t, r, first)
 			r.speaker.finish(audio.InputVoice)
@@ -502,6 +514,45 @@ func TestANewCallSaidOverTheVoiceIsACallWhenReadInAPause(t *testing.T) {
 			if turn != "who holds it?" || follow || window {
 				t.Fatalf("the turn is %q (a follow-up: %v, the window open: %v), want the new call's %q", turn, follow, window, "who holds it?")
 			}
+		})
+	}
+}
+
+// TestAnOldEchoDoesNotStopTheVoicesNextSpeech fails if the voice's own words,
+// heard back during one speech and read only during its next, after
+// ownWordsKept, stop that next speech: starting the next line forgot the
+// earlier line's words while the exchange still kept the earlier speech's
+// span, so the echo passed as talk-over (Sol's review of #133 at aaa8e0f).
+// The control reads other words said at the same moment, which do talk over
+// the earlier speech, and they stop the voice.
+func TestAnOldEchoDoesNotStopTheVoicesNextSpeech(t *testing.T) {
+	for _, own := range []bool{true, false} {
+		t.Run(fmt.Sprintf("its own words %v", own), func(t *testing.T) {
+			kept := ownWordsKept
+			ownWordsKept = 300 * time.Millisecond
+			t.Cleanup(func() { ownWordsKept = kept }) // after the rig has stopped
+			r := newLongFollowUpDrivingRig(t)
+			r.heard("Wispr, what is the status?", true, true)
+			sess := r.waitSession()
+			speakAs(t, sess, "Release progress.")
+			first := waitSpeechAfter(t, r, time.Time{})
+			said := from(first.Add(30 * time.Millisecond))
+			time.Sleep(time.Until(said(1)) + 30*time.Millisecond)
+			r.speaker.finish(audio.InputVoice)
+			r.speaker.FlushSpeech()
+			time.Sleep(ownWordsKept + 100*time.Millisecond)
+			speakAs(t, sess, "Ada holds it.")
+			second := waitSpeechAfter(t, r, first)
+			text := "Release progress."
+			if !own {
+				text = "Hold on."
+			}
+			r.s.OnTranscript(timedResult(text, 200, true, said))
+			if !own {
+				eventually(t, "control: words said over the earlier speech to stop the voice", func() bool { return voiceCutAfter(r, second) })
+				return
+			}
+			never(t, "the voice's old echo stopped its next speech", 250*time.Millisecond, func() bool { return voiceCutAfter(r, second) })
 		})
 	}
 }

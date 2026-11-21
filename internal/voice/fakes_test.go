@@ -49,6 +49,16 @@ type fakeSpeaker struct {
 	// default, so a sound ends with its writes unless a test holds its tail
 	// (holdDrain). Any other input drains at finish or Cancel.
 	drainsAtOnce map[string]bool
+	// barrier, set by a test, stops the speaker's own delivery once, as it
+	// begins: before it takes deliverMu, reads the hold or takes the events.
+	barrier *deliveryBarrier
+}
+
+// deliveryBarrier stops one delivery of the speaker's own: it closes entered,
+// waits until release closes, and closes returned once that delivery has
+// returned.
+type deliveryBarrier struct {
+	entered, release, returned chan struct{}
 }
 
 func newFakeSpeaker() *fakeSpeaker {
@@ -91,6 +101,17 @@ func (s *fakeSpeaker) FlushSpeech() { s.deliver(false) }
 // holdEvents holds the events: the hold is read in the same step that takes
 // the events, so none queued after holdEvents returned slips through.
 func (s *fakeSpeaker) deliver(auto bool) bool {
+	if auto {
+		s.mu.Lock()
+		b := s.barrier
+		s.barrier = nil
+		s.mu.Unlock()
+		if b != nil {
+			close(b.entered)
+			<-b.release
+			defer close(b.returned)
+		}
+	}
 	s.deliverMu.Lock()
 	defer s.deliverMu.Unlock()
 	s.mu.Lock()
@@ -991,9 +1012,11 @@ func never(t *testing.T, what string, d time.Duration, cond func() bool) {
 // own delivery hands out an event queued after holdEvents returned, when that
 // delivery had begun just before: it read the hold, found none, and was then
 // held up before it took the events (Sol's review of #133 at 4b7f919). Tests
-// that hold events to stand for a slow delivery then lost that state. Here
-// the delivery is held up on deliverMu, which a FlushSpeech in progress
-// holds; a FlushSpeech still delivers the held event.
+// that hold events to stand for a slow delivery then lost that state. The
+// delivery is stopped by a barrier as it begins, which the test observes, so
+// the order needs no sleep (Sol's review of #133 at aaa8e0f found a sleep
+// that let a late delivery pass); a FlushSpeech still delivers the held
+// event.
 func TestHoldEventsStopsTheFakeSpeakersOwnDelivery(t *testing.T) {
 	s := newFakeSpeaker()
 	var mu sync.Mutex
@@ -1008,14 +1031,30 @@ func TestHoldEventsStopsTheFakeSpeakersOwnDelivery(t *testing.T) {
 		defer mu.Unlock()
 		return slices.Contains(got, input)
 	}
-	s.deliverMu.Lock() // a delivery in progress
+	b := &deliveryBarrier{entered: make(chan struct{}), release: make(chan struct{}), returned: make(chan struct{})}
+	letGo := sync.OnceFunc(func() { close(b.release) })
+	t.Cleanup(letGo)
+	s.mu.Lock()
+	s.barrier = b
+	s.mu.Unlock()
 	s.emit(audio.SpeechEvent{Input: "before", Started: true})
-	time.Sleep(100 * time.Millisecond) // the speaker's own delivery has begun, and waits
+	select {
+	case <-b.entered: // the speaker's own delivery has begun
+	case <-time.After(testWait):
+		t.Fatal("control: the speaker's own delivery never began")
+	}
 	release := s.holdEvents()
 	defer release()
 	s.emit(audio.SpeechEvent{Input: "after", Started: true})
-	s.deliverMu.Unlock()
-	never(t, "the speaker's own delivery handed out an event queued during the hold", 200*time.Millisecond, func() bool { return delivered("after") })
+	letGo()
+	select {
+	case <-b.returned:
+	case <-time.After(testWait):
+		t.Fatal("control: the speaker's own delivery never returned")
+	}
+	if delivered("after") {
+		t.Fatal("the speaker's own delivery handed out an event queued during the hold")
+	}
 	s.FlushSpeech()
 	if !delivered("after") {
 		t.Fatal("control: FlushSpeech did not deliver the held event")

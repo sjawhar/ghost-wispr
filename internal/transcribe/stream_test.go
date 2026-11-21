@@ -465,53 +465,47 @@ func TestAnOldPointKeepsItsTime(t *testing.T) {
 	}
 }
 
-// stampOrder is a live client that records whether the send queue handed it
-// a chunk before the chunk's stamp was done: its stamp takes a while, as a
-// busy machine can make it, so a hand-off before or during it shows.
+// stampOrder is a live client that records, as the send queue stamps a
+// chunk, whether the chunk is already on the queue for the client to take:
+// no client goroutine runs, so the check needs no timing.
 type stampOrder struct {
-	mu          sync.Mutex
-	stamped     int // stamps done
-	handedEarly bool
-	took        chan struct{}
+	s             *AsyncSender
+	stamps        int
+	queuedAtStamp int
 }
 
 func (*stampOrder) watchSendQueue(func() int64) {}
 func (*stampOrder) sendQueueDropped(int64)      {}
-func (*stampOrder) Write(p []byte) (int, error) { return len(p), nil }
-func (*stampOrder) Finalize() error             { return nil }
 
-func (o *stampOrder) captured(time.Time, int64) {
-	time.Sleep(50 * time.Millisecond)
-	o.mu.Lock()
-	defer o.mu.Unlock()
-	o.stamped++
+func (*stampOrder) writeFromQueue([]byte, *atomic.Int64) (int, error) {
+	panic("no client takes from the queue in this test")
 }
 
-func (o *stampOrder) writeFromQueue(p []byte, queued *atomic.Int64) (int, error) {
-	o.mu.Lock()
-	o.handedEarly = o.handedEarly || o.stamped == 0 // the client has the chunk: its stamp must be done
-	o.mu.Unlock()
-	queued.Add(-int64(len(p)))
-	o.took <- struct{}{}
-	return len(p), nil
+func (o *stampOrder) captured(time.Time, int64) {
+	o.stamps++
+	o.queuedAtStamp += len(o.s.queue)
 }
 
 // TestTheSendQueueStampsAChunkBeforeItHandsItOn fails if the send queue
 // hands a chunk to the live client before it has stamped when the chunk was
 // captured: a result for the chunk's words could then be timed from the
-// stamp before it, which a capture pause can place long before.
+// stamp before it, which a capture pause can place long before. It reads
+// the queue from inside the stamp, with no client goroutine, so it fails
+// whenever the hand-off comes first, however a machine schedules it (Sol's
+// review of #133 at aaa8e0f found the earlier check, a 50 ms stamp, passing
+// when the client was run later still).
 func TestTheSendQueueStampsAChunkBeforeItHandsItOn(t *testing.T) {
-	client := &stampOrder{took: make(chan struct{}, 1)}
-	sender := NewAsyncSender(t.Context(), client, 4, nil)
-	_, _ = sender.Write(make([]byte, secondOfAudio/4))
-	select {
-	case <-client.took:
-	case <-time.After(5 * time.Second):
-		t.Fatal("the send queue did not hand the chunk on")
+	client := &stampOrder{}
+	s := &AsyncSender{slots: make([][]byte, 1), free: make(chan int, 1), queue: make(chan sendItem, 1), watcher: client}
+	client.s = s
+	s.free <- 0
+	if n, err := s.Write(make([]byte, secondOfAudio/4)); n != secondOfAudio/4 || err != nil {
+		t.Fatalf("Write = %d, %v", n, err)
 	}
-	client.mu.Lock()
-	defer client.mu.Unlock()
-	if client.handedEarly {
+	if client.stamps != 1 || len(s.queue) != 1 {
+		t.Fatalf("control: %d stamps and %d queued chunks, want one of each", client.stamps, len(s.queue))
+	}
+	if client.queuedAtStamp != 0 {
 		t.Fatal("the send queue handed the chunk on before it stamped its capture")
 	}
 }
