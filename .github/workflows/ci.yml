@@ -35,7 +35,7 @@ jobs:
       - name: Name the apt package cache
         id: apt-key
         run: |
-          echo "image=apt-$ImageOS-$ImageVersion-ffmpeg-portaudio19-dev-pulseaudio" >>"$GITHUB_OUTPUT"
+          echo "image=apt-$ImageOS-$ImageVersion-ffmpeg-portaudio19-dev" >>"$GITHUB_OUTPUT"
           echo "os=apt-$ImageOS-" >>"$GITHUB_OUTPUT"
 
       - name: Restore the apt package cache
@@ -66,7 +66,7 @@ jobs:
           # name.
           for try in 1 2 3; do
             "${apt_get[@]}" update &&
-              "${apt_get[@]}" install -y --no-install-recommends ffmpeg portaudio19-dev pulseaudio &&
+              "${apt_get[@]}" install -y --no-install-recommends ffmpeg portaudio19-dev &&
               break
             if ((try == 3 || SECONDS > 360)); then
               exit 1
@@ -103,14 +103,6 @@ jobs:
         with:
           path: ~/apt-archives
           key: ${{ steps.apt-contents.outputs.key }}
-
-      # PortAudio's PulseAudio host API fails to initialize without a sound server, and then
-      # internal/audio's mic reopen test fails before it reaches the open failure it checks.
-      - name: Start PulseAudio with a null sink
-        run: |
-          pulseaudio --start --exit-idle-time=-1
-          pactl load-module module-null-sink sink_name=ci_null
-          pactl info
 
       - name: Create embed placeholder
         run: mkdir -p cmd/ghost-wispr/static && touch cmd/ghost-wispr/static/.gitkeep

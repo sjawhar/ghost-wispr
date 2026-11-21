@@ -323,17 +323,31 @@ func (m *Mic) SampleRate() int {
 	return m.sampleRate
 }
 
-// Each PortAudio call openInputStream makes; tests replace them, so no test
-// opens a real input device.
+// Each PortAudio call openInputStream makes; tests replace them. A real open
+// of an input is a microphone, so a test binary refuses it (realDevice).
 var (
 	paInputDevices = portaudio.Devices
 	paOpenInput    = func(params portaudio.StreamParameters, window *[]int16) (inputStream, error) {
+		if err := realDevice("PortAudio input " + inputName(params)); err != nil {
+			return nil, err
+		}
 		return portaudio.OpenStream(params, window)
 	}
 	paOpenDefaultInput = func(sampleRate, framesPerBuffer int, window *[]int16) (inputStream, error) {
+		if err := realDevice("PortAudio's default input"); err != nil {
+			return nil, err
+		}
 		return portaudio.OpenDefaultStream(1, 0, float64(sampleRate), framesPerBuffer, window)
 	}
 )
+
+// inputName is the name of the input device params open.
+func inputName(params portaudio.StreamParameters) string {
+	if params.Input.Device == nil {
+		return "(none)"
+	}
+	return params.Input.Device.Name
+}
 
 // openInputStream opens a capture stream. With device set, the mic_device
 // setting, it opens the input of the sound card device names, and no other
@@ -348,7 +362,7 @@ func openInputStream(device string, sampleRate, framesPerBuffer int, window *[]i
 		return stream, nil
 	}
 
-	devices, devErr := portaudio.Devices()
+	devices, devErr := paInputDevices()
 	if devErr != nil {
 		return nil, err
 	}
@@ -363,7 +377,7 @@ func openInputStream(device string, sampleRate, framesPerBuffer int, window *[]i
 		params.SampleRate = float64(sampleRate)
 		params.FramesPerBuffer = framesPerBuffer
 
-		candidate, openErr := portaudio.OpenStream(params, window)
+		candidate, openErr := paOpenInput(params, window)
 		if openErr == nil {
 			return candidate, nil
 		}

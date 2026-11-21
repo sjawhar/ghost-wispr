@@ -83,8 +83,14 @@ type ALSACapture struct{ pcm *C.snd_pcm_t }
 const ALSACapturePeriod = 100 * time.Millisecond
 
 // OpenALSACapture opens device, an ALSA PCM name (CaptureDevice), for 16-bit
-// mono capture at rate.
+// mono capture at rate. In a test binary it opens only ALSA's null PCM, which
+// is no device (realDevice).
 func OpenALSACapture(device string, rate int) (*ALSACapture, error) {
+	if device != alsaNullPCM {
+		if err := realDevice("ALSA capture " + device); err != nil {
+			return nil, err
+		}
+	}
 	name := C.CString(device)
 	defer C.free(unsafe.Pointer(name))
 	r := C.gw_open_capture(name, C.uint(rate), C.uint(ALSACapturePeriod/time.Microsecond))

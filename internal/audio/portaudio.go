@@ -12,9 +12,17 @@ import (
 
 var paMu sync.Mutex
 
+// PortAudio's terminate and initialize; tests replace them. A real
+// initialization connects to the sound server ALSA's default PCM names and
+// lists its devices, so a test binary refuses it (realDevice).
 var (
 	paTerminate  = portaudio.Terminate
-	paInitialize = portaudio.Initialize
+	paInitialize = func() error {
+		if err := realDevice("PortAudio's initialization, which lists the sound server's devices"); err != nil {
+			return err
+		}
+		return portaudio.Initialize()
+	}
 )
 
 // UsePlugCapture makes every later PortAudio initialization list each ALSA
