@@ -14,7 +14,7 @@ require (
 	github.com/hajimehoshi/go-mp3 v0.3.4
 	github.com/nats-io/nats.go v1.53.1
 	github.com/sashabaranov/go-openai v1.41.2
-	golang.org/x/exp v0.0.0-20250620022241-b7579e27df2b
+	golang.org/x/exp v0.0.0-20260709172345-9ea1abe57597
 	golang.org/x/sync v0.22.0
 	golang.org/x/sys v0.47.0
 	google.golang.org/api v0.287.1
