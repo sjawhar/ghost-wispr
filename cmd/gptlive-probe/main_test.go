@@ -49,8 +49,9 @@ type standIns struct {
 	inSamples atomic.Int64
 	lastInAt  atomic.Int64
 	startedAt atomic.Int64
-	// onStarted runs immediately after session.started is sent.
-	onStarted func()
+	// onStarting runs just before session.started is sent, so what it sets
+	// is in place when the probe hears that the session started.
+	onStarting func()
 	// acceptAny makes the token endpoint take any subject token, so the
 	// wrong-audience control is not refused.
 	acceptAny bool
@@ -155,10 +156,10 @@ func newStandIns(t *testing.T) *standIns {
 			case "session.start":
 				s.start <- ev.Session
 				s.startedAt.Store(time.Now().UnixMilli())
-				send(map[string]any{"type": "session.started", "event_id": "e1", "session": map[string]any{"id": "sess_probe"}})
-				if s.onStarted != nil {
-					s.onStarted()
+				if s.onStarting != nil {
+					s.onStarting()
 				}
+				send(map[string]any{"type": "session.started", "event_id": "e1", "session": map[string]any{"id": "sess_probe"}})
 			case "session.input_audio.append":
 				s.heardAudio.Store(true)
 				if b, err := base64.StdEncoding.DecodeString(ev.Audio); err == nil {
