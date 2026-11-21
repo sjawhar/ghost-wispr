@@ -882,6 +882,29 @@ def react(kind, key, start, end):
             emit(kind="xrun", due=first + 500)
 
 
+def clip(path):
+    """The self-test's clip at PATH: its words, from its "gwfk" chunk, and its length in whole ms, from
+    its fmt and data chunks, as the driver reads it."""
+    with open(path, "rb") as f:
+        data = f.read()
+    if data[:4] != b"RIFF" or data[8:12] != b"WAVE":
+        raise ValueError("not a WAV file")
+    pos, words, rate, frame, size = 12, None, None, None, None
+    while pos + 8 <= len(data):
+        cid, n = data[pos:pos + 4], int.from_bytes(data[pos + 4:pos + 8], "little")
+        body = data[pos + 8:pos + 8 + n]
+        if cid == b"fmt ":
+            rate, frame = int.from_bytes(body[4:8], "little"), int.from_bytes(body[12:14], "little")
+        elif cid == b"gwfk":
+            words = body.decode().split()
+        elif cid == b"data":
+            size = n
+        pos += 8 + n + (n & 1)
+    if not words or not rate or not frame or size is None:
+        raise ValueError("no gwfk, fmt or data chunk")
+    return words, size * 1000 // (rate * frame)
+
+
 def aplay(args):
     device, path = "", ""
     i = 0
@@ -895,21 +918,26 @@ def aplay(args):
             path = args[i]
             i += 1
     try:
-        with open(path) as f:
-            words = f.read().split()
-    except OSError:
-        sys.stderr.write("aplay: cannot open %s\n" % path)
+        words, length = clip(path)
+    except (OSError, ValueError) as e:
+        sys.stderr.write("aplay: cannot play %s: %s\n" % (path, e))
         return 1
     n = int(read("aplays", "0").strip() or 0) + 1
     write("aplays", "%d\n" % n)
     log_to("aplay.log", "%s %s" % (device, path))
     write("aplay-pid.%d" % n, "%d\n" % os.getpid())
+    # slow-aplay-WORD starts the clip whose first word is WORD 2 s after aplay began, and slow-exit-WORD
+    # returns 1.8 s after it ended, as aplay's start and exit on a loaded machine: the driver knows only
+    # that the clip began after it started aplay and ended before aplay returned.
+    if "slow-aplay-" + words[0] in SCENARIO:
+        time.sleep(2.0)
     start = now_ms()
     write("aplay-start.%d" % n, "%d\n" % start)
-    # The voice's reaction is worked out while the 300 ms clip plays, so that aplay ends at the end
-    # the reaction counts from whenever that work fits in the clip: the driver times its clip's end
-    # when aplay exits, and the fake's own work would otherwise sit between the two.
-    end = start + 300
+    # The voice's reaction is worked out while the clip plays (for its WAV length, 300 ms), so that
+    # aplay ends at the end the reaction counts from whenever that work fits in the clip: the driver
+    # times its clip's end when aplay exits, and the fake's own work would otherwise sit between the
+    # two.
+    end = start + length
     if words[0] in ("phrase", "speech"):
         # The paused listener's clips: "Wispr, start recording" resumes a listening unit; speech
         # that is not the phrase does nothing.
@@ -918,6 +946,8 @@ def aplay(args):
     else:
         react(words[0], words[1] if len(words) > 1 else "", start, end)
     time.sleep(max(0, end - now_ms()) / 1000)
+    if "slow-exit-" + words[0] in SCENARIO:
+        time.sleep(1.8)
     write("aplay-end.%d" % n, "%d\n" % now_ms())
     return 0
 
@@ -931,9 +961,10 @@ JOINED_SESSION = "session-1"
 def joined_mention(end):
     """A mention of the joined issue, which ended at END. The first opens the recording session; one
     after the test agent joined brings its pointer, its read of the transcript and its floor
-    request, then the hand sound 1.6 s after the mention ended, as the voice waits for a gap in the
-    room's words. joined-other-meeting's pointer names another meeting; joined-early-spoken tells
-    the agent its words were spoken before anyone invited them."""
+    request, then the hand sound 2.5 s after the mention ended, as the voice waits for a gap in the
+    room's words: 1.5 s over the 1 s gap the driver checks, as a loaded machine can return the
+    driver from aplay that much after the clip ended. joined-other-meeting's pointer names another
+    meeting; joined-early-spoken tells the agent its words were spoken before anyone invited them."""
     if not read("active-session"):
         write("active-session", JOINED_SESSION + "\n")
         return
@@ -946,7 +977,7 @@ def joined_mention(end):
     emit(kind="probe", due=end + 300, step="pointer", fields=dict(span, recording_session=pointed, text=text))
     emit(kind="probe", due=end + 500, step="transcript_read", fields={"status": 200, "segments": 3, "segments_in_range": 2})
     emit(kind="probe", due=end + 700, step="floor_sent", fields={"event": "event-floor", "recipient_state": "live"})
-    hand = end + 1600
+    hand = end + 2500
     emit(kind="timing", due=hand, event="hand_chime", session_id=JOINED_SESSION)
     emit(kind="sound", start=hand + 20, end=hand + 320, tag="hand-sound")
     if "joined-early-spoken" in SCENARIO:
@@ -955,20 +986,23 @@ def joined_mention(end):
 
 def joined_go_ahead(start, end):
     """"Wispr, go ahead" with the test agent's hand up, played from START to END: the wake sound, the
-    agent's words for 2 s, voice_spoken, and the agent told its words were spoken; then it leaves.
-    joined-other-spoken's voice_spoken names another session; joined-spoken-during-clip's only
-    voice_spoken comes while the go-ahead still plays; joined-words-silent plays no words, only the
-    wake sound."""
+    agent's words for 2 s from 1.3 s after the go-ahead ended, voice_spoken, and the agent told its
+    words were spoken; then it leaves. joined-other-spoken's voice_spoken names another session;
+    joined-spoken-during-clip's only voice_spoken comes as the go-ahead starts playing;
+    joined-told-during-clip tells the agent as it starts; joined-words-silent plays no words, only
+    the wake sound."""
     emit(kind="sound", start=end + 150, end=end + 350, tag="go-ahead-wake")
-    words = end + 1000
+    words = end + 1300
     if "joined-words-silent" not in SCENARIO:
         emit(kind="sound", start=words, end=words + 2000, tag="joined-words")
     if "joined-spoken-during-clip" in SCENARIO:
-        emit(kind="ws", due=start + 150, event={"type": "voice_spoken", "session_id": JOINED_SESSION})
+        emit(kind="ws", due=start, event={"type": "voice_spoken", "session_id": JOINED_SESSION})
     else:
         session = "session-2" if "joined-other-spoken" in SCENARIO else JOINED_SESSION
         emit(kind="ws", due=words + 2100, event={"type": "voice_spoken", "session_id": session})
-    if "joined-early-spoken" not in SCENARIO:
+    if "joined-told-during-clip" in SCENARIO:
+        told(start)
+    elif "joined-early-spoken" not in SCENARIO:
         told(words + 2200)
     emit(kind="probe", due=words + 2400, step="leave_sent", fields={"event": "event-leave", "recipient_state": "live"})
     emit(kind="ws", due=words + 2500, event={"type": "agent_left", "session_id": JOINED_SESSION})
@@ -1608,6 +1642,27 @@ exec $(printf '%q' "$(type -P sleep)") "\$@"
 EOF
 chmod +x "$root/sigint-bin/sleep"
 
+# The clips the cases play: WAV files of 300 ms of silence at 16 kHz, mono, each with a "gwfk" chunk
+# of the words that name it for the fake aplay, which plays it for its WAV length; the driver reads
+# that length too (play_clip).
+mkdir -p "$root/clips"
+python3 - "$root/clips" <<'EOF'
+import os
+import struct
+import sys
+
+for name, words in (("question", "question"), ("go-ahead", "go-ahead"), ("mention", "mention join-5"),
+                    ("ask", "ask live-1"), ("second", "second live-1"), ("never-mind", "never-mind"), ("stop", "stop"),
+                    ("phrase", "phrase"), ("speech", "speech"), ("talkover", "talkover"), ("backchannel", "backchannel")):
+    tag = words.encode()
+    data = bytes(2 * 16000 * 300 // 1000)
+    body = (b"WAVE" + b"fmt " + struct.pack("<IHHIIHH", 16, 1, 1, 16000, 32000, 2, 16)
+            + b"gwfk" + struct.pack("<I", len(tag)) + tag + (b"\0" if len(tag) % 2 else b"")
+            + b"data" + struct.pack("<I", len(data)) + data)
+    with open(os.path.join(sys.argv[1], name + ".wav"), "wb") as f:
+        f.write(b"RIFF" + struct.pack("<I", len(body)) + body)
+EOF
+
 # new_case NAME [ENV]: a fake Pi for one case, paused with no session, its .env ENV (the original
 # by default), its saved capture state 1 and its Envoy session id, with the service running.
 # Prints its directory.
@@ -1624,18 +1679,12 @@ new_case() {
   printf 'access: RW_INTERLEAVED\nformat: S16_LE\nchannels: 2\nrate: 48000 (48000/1)\nperiod_size: 480\nbuffer_size: 1920\n' \
     >"$dir/asound/card3/pcm0p/sub0/hw_params"
   printf 'closed\n' >"$dir/asound/card3/pcm0p/sub0/status"
-  printf 'question\n' >"$dir/question.wav"
-  printf 'go-ahead\n' >"$dir/go-ahead.wav"
-  printf 'mention join-5\n' >"$dir/mention.wav"
-  printf 'ask live-1\n' >"$dir/ask.wav"
-  printf 'second live-1\n' >"$dir/second.wav"
-  printf 'never-mind\n' >"$dir/never-mind.wav"
-  printf 'stop\n' >"$dir/stop.wav"
-  printf 'phrase\n' >"$dir/phrase.wav"
-  printf 'speech\n' >"$dir/speech.wav"
-  for name in q1 q2 q3; do printf 'question\n' >"$dir/questions/$name.wav"; done
-  for name in t1 t2; do printf 'talkover\n' >"$dir/talkovers/$name.wav"; done
-  for name in b1 b2; do printf 'backchannel\n' >"$dir/backchannels/$name.wav"; done
+  for name in question go-ahead mention ask second never-mind stop phrase speech; do
+    cp -- "$root/clips/$name.wav" "$dir/$name.wav"
+  done
+  for name in q1 q2 q3; do cp -- "$root/clips/question.wav" "$dir/questions/$name.wav"; done
+  for name in t1 t2; do cp -- "$root/clips/talkover.wav" "$dir/talkovers/$name.wav"; done
+  for name in b1 b2; do cp -- "$root/clips/backchannel.wav" "$dir/backchannels/$name.wav"; done
   python3 -c 'import sqlite3, sys
 connection = sqlite3.connect(sys.argv[1])
 connection.execute("PRAGMA journal_mode=WAL")
@@ -1824,6 +1873,12 @@ launch ws-silent ws-silent '' -- --question @question.wav --event-timeout 2
 launch silent silent '' -- --question @question.wav --event-timeout 10
 launch late-chime late-chime '' -- --question @question.wav --event-timeout 10
 launch slow-speech pass '' -- --question @question.wav --event-timeout 10 --speech-ms 300
+# The pass with the question's aplay starting the clip 2 s after the driver started it
+# (slow-aplay-question), against a 1 s speech bound: the speech came 0.7 s after the question ended,
+# but the driver knows only that the question ended between 0.3 s after it started aplay and when
+# aplay returned, so the delay may be over 2 s: UNKNOWN, never the PASS of a delay from aplay's
+# return alone.
+launch slow-start-speech pass,slow-aplay-question '' -- --question @question.wav --event-timeout 10 --speech-ms 1000
 # The late chime with an arecord that reads 1.5 s after its header (arecord-slow-start): every early
 # bound is 1.5 s early, so the recording cannot show that the chime came over 400 ms after voice_wake,
 # nor which sound it is: UNKNOWN, never the FAIL of the late bound alone.
@@ -1892,6 +1947,10 @@ launch scripted pass yes -- --step scripted --engine tts --engine gptlive --ques
 # The pass with an arecord that reads 1.5 s after its header: no fact's sound certainly starts in its
 # window: UNKNOWN, never PASS.
 launch scripted-unsure pass,arecord-slow-start yes -- --step scripted --engine tts --questions 2 --question-dir @questions --rig-mic "$rig" --event-timeout 10
+# The pass with each question's aplay starting the clip 2 s late (slow-aplay-question): each first
+# fact came 0.7 s after its question ended, but may have come 3 s after, over the 2.5 s median bound:
+# UNKNOWN, never PASS.
+launch scripted-slow-start pass,slow-aplay-question yes -- --step scripted --engine tts --questions 2 --question-dir @questions --rig-mic "$rig" --event-timeout 10
 launch scripted-filler filler yes -- --step scripted --engine tts --questions 2 --question-dir @questions --rig-mic "$rig" --event-timeout 10
 launch scripted-joined fact-joined yes -- --step scripted --questions 1 --question-dir @questions --rig-mic "$rig" --event-timeout 10
 launch scripted-few pass yes -- --step scripted --questions 5 --question-dir @questions --rig-mic "$rig"
@@ -1927,6 +1986,11 @@ launch ask-journal-error journal-error-after-answer_ready '' -- $ask_args
 launch barge answer-until-clip yes -- --step barge-in --talkovers 2 --backchannels 2 --question @question.wav --talkover-dir @talkovers --backchannel-dir @backchannels --rig-mic "$rig" --event-timeout 15
 launch barge-off answer-until-clip,stop-off yes -- --step barge-in --talkovers 1 --backchannels 0 --question @question.wav --talkover-dir @talkovers --backchannel-dir @backchannels --rig-mic "$rig" --event-timeout 15
 launch barge-short short yes -- --step barge-in --talkovers 1 --backchannels 0 --question @question.wav --talkover-dir @talkovers --backchannel-dir @backchannels --rig-mic "$rig" --event-timeout 15
+# The pass with the talk-over's aplay starting the clip 2 s late (slow-aplay-talkover): the speech
+# stopped 0.7 s after the clip began, but the driver knows only that the clip began between when it
+# started aplay and 0.3 s before aplay returned, so the delay may be 2.7 s, over the 1.5 s median
+# bound: UNKNOWN, never the FAIL of a delay from aplay's start alone.
+launch barge-slow-start answer-until-clip,slow-aplay-talkover yes -- --step barge-in --talkovers 1 --backchannels 0 --question @question.wav --talkover-dir @talkovers --backchannel-dir @backchannels --rig-mic "$rig" --event-timeout 15
 launch barge-backchannel answer-until-clip,backchannel-stops yes -- --step barge-in --talkovers 1 --backchannels 1 --question @question.wav --talkover-dir @talkovers --backchannel-dir @backchannels --rig-mic "$rig" --event-timeout 15
 # A journal that cannot be read once the voice stops: UNKNOWN, not a talk-over with no stop.
 launch barge-journal-error answer-until-clip,journal-error-after-stop yes -- --step barge-in --talkovers 1 --backchannels 0 --question @question.wav --talkover-dir @talkovers --backchannel-dir @backchannels --rig-mic "$rig" --event-timeout 15
@@ -2097,6 +2161,17 @@ for scenario in other-meeting early-spoken other-spoken spoken-during-clip words
 done
 # shellcheck disable=SC2086
 launch joined-words-unsure joined,arecord-slow-start yes -- $joined_args
+# The mention's aplay returning 1.8 s after the clip ended (slow-exit-mention): the hand sound came
+# 2.5 s after the mention ended, but only 0.7 s after aplay returned: UNKNOWN, never the FAIL of a gap
+# from aplay's return alone. The go-ahead's aplay starting the clip 2 s late (slow-aplay-go-ahead),
+# with the only voice_spoken, or the agent told, as the clip starts: each may be after the earliest
+# the clip can end, so UNKNOWN, never the FAIL of a time from aplay's return alone.
+# shellcheck disable=SC2086
+launch joined-slow-exit joined,slow-exit-mention yes -- $joined_args
+# shellcheck disable=SC2086
+launch joined-spoken-slow-start joined,joined-spoken-during-clip,slow-aplay-go-ahead yes -- $joined_args
+# shellcheck disable=SC2086
+launch joined-told-slow-start joined,joined-told-during-clip,slow-aplay-go-ahead yes -- $joined_args
 wait
 
 # Ctrl-C while the driver waits for voice_wake, then Ctrl-C again while the restore stops the
@@ -2261,6 +2336,10 @@ expect_restored late-chime
 expect_rc slow-speech 1
 expect_line slow-speech 'ms after the end of the question, more than 300 ms'
 expect_restored slow-speech
+expect_rc slow-start-speech 2
+expect_line slow-start-speech 'UNKNOWN: speech: its delay after the end of the question: between '
+expect_no_line slow-start-speech 'PASS: speech '
+expect_restored slow-start-speech
 expect_rc late-chime-unsure 2
 expect_line late-chime-unsure 'UNKNOWN: chime: its delay after voice_wake: '
 expect_no_line late-chime-unsure 'FAIL: chime: '
@@ -2452,6 +2531,10 @@ expect_rc scripted-unsure 2
 expect_line scripted-unsure 'UNKNOWN: scripted tts: the median from t0 to the first fact at the Jabra: '
 expect_no_line scripted-unsure 'PASS: scripted tts: median '
 expect_restored scripted-unsure
+expect_rc scripted-slow-start 2
+expect_line scripted-slow-start 'UNKNOWN: scripted tts: the median from t0 to the first fact at the Jabra: between '
+expect_no_line scripted-slow-start 'PASS: scripted tts: median '
+expect_restored scripted-slow-start
 expect_rc scripted-filler 1
 expect_line scripted-filler 'more than 2500 ms; this voice is past the bound'
 expect_between 'scripted-filler: the median the negative control reports' "$(measured scripted-filler 'scripted tts: median')" 4500 5600
@@ -2542,6 +2625,10 @@ expect_rc barge-short 2
 expect_line barge-short 'NOTE: barge-in round 1 (talk-over): the answer ended by itself inside the window; not counted'
 expect_line barge-short 'UNKNOWN: barge-in: only 0 of 1 talk-over rounds counted'
 expect_restored barge-short
+expect_rc barge-slow-start 2
+expect_line barge-slow-start "UNKNOWN: barge-in: the median from a talk-over clip's start to silence at the Jabra: between "
+expect_no_line barge-slow-start 'FAIL: barge-in'
+expect_restored barge-slow-start
 expect_rc barge-backchannel 1
 expect_line barge-backchannel 'FAIL: barge-in: 1 of 1 backchannels stopped the speech, more than 0'
 expect_restored barge-backchannel
@@ -2813,10 +2900,10 @@ for line in 'PASS: joined: recording session session-1' 'PASS: joined: the test 
   "PASS: joined: the agent's words reached the Jabra "; do
   expect_line joined-pass "$line"
 done
-# The words start 1 s after the go-ahead's clip ends: their onset's early bound is at or after the
-# go-ahead's end, as the driver timed it, and never later than 1 s after it.
+# The words start 1.3 s after the go-ahead's clip ends: their onset's early bound is at or after the
+# go-ahead's end, as the driver timed it, and never later than 1.3 s after it.
 read -r onset_early onset_late <<<"$(joined_onset joined-pass)"
-expect_between "joined-pass: the early bound of the words' onset, from the end of the go-ahead" "$onset_early" 0 1000
+expect_between "joined-pass: the early bound of the words' onset, from the end of the go-ahead" "$onset_early" 0 1300
 expect_between "joined-pass: the late bound of the words' onset, from the end of the go-ahead" "$onset_late" "${onset_early:-0}" 5000
 expect_restored joined-pass
 expect_rc joined-other-meeting 1
@@ -2826,11 +2913,20 @@ expect_rc joined-early-spoken 1
 expect_line joined-early-spoken 'FAIL: joined: the test agent was told its hand came down spoken '
 expect_line joined-early-spoken 'before the go-ahead'
 expect_restored joined-early-spoken
-for name in other-spoken spoken-during-clip; do
-  expect_rc "joined-$name" 1
-  expect_line "joined-$name" 'FAIL: joined: no voice_spoken for recording session session-1 within 10 s of the end of the go-ahead'
-  expect_restored "joined-$name"
-done
+expect_rc joined-other-spoken 1
+expect_line joined-other-spoken 'FAIL: joined: no voice_spoken for recording session session-1 within 10 s of the end of the go-ahead'
+expect_restored joined-other-spoken
+# The only voice_spoken comes as the go-ahead starts: before the earliest the clip can end, it is
+# not one after the go-ahead, FAIL; where a loaded machine starts the fake aplay late enough that it
+# may be after that earliest end, UNKNOWN. Never a PASS of a voice_spoken after the go-ahead.
+expect_rc joined-spoken-during-clip 1 2
+expect_no_line joined-spoken-during-clip 'PASS: joined: voice_spoken for recording session session-1 '
+if [[ $(cat "$root/joined-spoken-during-clip/rc" 2>/dev/null) == 1 ]]; then
+  expect_line joined-spoken-during-clip 'FAIL: joined: no voice_spoken for recording session session-1 within 10 s of the end of the go-ahead'
+else
+  expect_line joined-spoken-during-clip 'UNKNOWN: joined: the only voice_spoken for recording session session-1 came '
+fi
+expect_restored joined-spoken-during-clip
 expect_rc joined-words-silent 1
 expect_line joined-words-silent 'PASS: joined: the hand sound reached the Jabra'
 expect_line joined-words-silent 'FAIL: joined: no words at the rig microphone between the end of the go-ahead and voice_spoken'
@@ -2847,6 +2943,17 @@ read -r onset_early onset_late <<<"$(joined_onset joined-words-unsure)"
 expect_between "joined-words-unsure: the early bound of the words' onset, from the end of the go-ahead" "$onset_early" -10000 -1
 expect_between "joined-words-unsure: the late bound of the words' onset, from the end of the go-ahead" "$onset_late" 0 5000
 expect_restored joined-words-unsure
+expect_rc joined-slow-exit 2
+expect_line joined-slow-exit 'UNKNOWN: joined: the hand sound began between '
+expect_no_line joined-slow-exit 'FAIL: joined: the hand sound began'
+expect_restored joined-slow-exit
+expect_rc joined-spoken-slow-start 2
+expect_line joined-spoken-slow-start 'UNKNOWN: joined: the only voice_spoken for recording session session-1 came '
+expect_restored joined-spoken-slow-start
+expect_rc joined-told-slow-start 2
+expect_line joined-told-slow-start 'UNKNOWN: joined: the test agent was told its hand came down spoken between '
+expect_no_line joined-told-slow-start 'FAIL: joined: the test agent was told'
+expect_restored joined-told-slow-start
 
 # The driver compares times on the monotonic clock only: bash's wall clock serves journalctl's
 # --since alone, so a step of the wall clock can move no time it compares.

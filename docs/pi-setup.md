@@ -1001,6 +1001,14 @@ with the unit paused and no session active:
    longer than the wake sound can start between them, and otherwise reports UNKNOWN.
    So an arecord slow to open its device makes no time early, but one held back between its header
    and its first read can make these steps UNKNOWN.
+   The clips the driver plays are timed the same way. A clip begins no earlier than when the
+   driver starts `aplay`, and ends no later than when `aplay` returns, since `aplay` returns only
+   after it drains the clip. Its WAV length gives the other bound of each: the clip begins no later
+   than its length before `aplay` returned, and ends no earlier than its length after `aplay` began.
+   So the clips must be WAV files. A delay from a clip's end, such as the exchange step's speech,
+   `scripted`'s first fact and `joined`'s 1 s gap before the hand sound, and a delay from a clip's
+   start, such as `barge-in`'s talk-over median, lies between the two. `aplay`'s own start and exit
+   on a loaded Pi widen the bounds and can make these checks UNKNOWN.
    Every time the driver compares is on the Pi's monotonic clock (`CLOCK_MONOTONIC`): its own,
    read by a Python process, and the voice's, which each timing line, `/ws` voice event and test
    agent step carries as `at_mono_ns`. A step of the system clock (an NTP step, `settimeofday`)
