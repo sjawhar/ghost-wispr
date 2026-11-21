@@ -199,7 +199,7 @@ func (c *relayConn) answer(t *testing.T) string {
 // done.
 func TestAJoinDuringRegistrationIsNotAcknowledgedUntilTaken(t *testing.T) {
 	r := newRig(t, nil)
-	r.roster.SetAgents(nil)
+	r.roster.CloseAgents(context.Background())
 	relay := newRelayFake(t)
 	var conn *relayConn
 	early := make(chan string, 1)

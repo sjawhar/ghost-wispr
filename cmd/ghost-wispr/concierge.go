@@ -88,7 +88,8 @@ func startConcierge(ctx context.Context, cfg *config.Config, store *storage.SQLi
 	}()
 	closeSession := func(ctx context.Context, session envoySession) {
 		if roster != nil {
-			roster.SetAgents(nil) // the joined agents hear nothing more
+			// The joined agents hear nothing more, and are told so within ctx.
+			roster.CloseAgents(ctx)
 		}
 		closeCtx, done := context.WithTimeout(ctx, 5*time.Second)
 		defer done()

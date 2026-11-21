@@ -106,7 +106,7 @@ func TestNoHookRunsUnderTheRosterLock(t *testing.T) {
 	step(func() { r.setSession("sess-2"); r.join(t, "agent-1", "ABC-12") })
 	step(func() { r.roster.SessionsDeleted([]string{"sess-2"}) })
 	step(func() { r.setSession("sess-3"); r.join(t, "agent-1", "ABC-12") })
-	step(func() { r.roster.SetAgents(nil) })
+	step(func() { r.roster.CloseAgents(context.Background()) })
 
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -134,8 +134,8 @@ func TestNoHookRunsUnderTheRosterLock(t *testing.T) {
 	}
 }
 
-// TestAnOldStopCannotClearANewEnvoySession fails if a SetAgents(nil) still
-// in its cleanup when SetAgents(new) opens a new Envoy session, and a member
+// TestAnOldStopCannotClearANewEnvoySession fails if a CloseAgents still in
+// its cleanup when SetAgents(new) opens a new Envoy session, and a member
 // joins under it, then takes the new session or the new member when it
 // finishes; or if its notices go out through the new session. (ReviewPR122b's
 // TestReviewEOldStopCannotClearNewEnvoyEpoch.)
@@ -154,7 +154,7 @@ func TestAnOldStopCannotClearANewEnvoySession(t *testing.T) {
 	stopped := make(chan struct{})
 	go func() {
 		defer close(stopped)
-		r.roster.SetAgents(nil)
+		r.roster.CloseAgents(context.Background())
 	}()
 	<-entered
 	next := newFakeAgents()
