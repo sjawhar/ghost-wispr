@@ -1,6 +1,7 @@
 package voice
 
 import (
+	"context"
 	"fmt"
 	"testing"
 	"time"
@@ -8,32 +9,111 @@ import (
 	"github.com/sjawhar/ghost-wispr/internal/audio"
 )
 
-// TestALaterLineDoesNotHideAnEarlierTalkOver fails if words said over the
-// voice's first speech, read only during its next, are taken as its echo
-// because the next line has those words: a line said after the speech the
-// words were heard in ended cannot have been heard in it (Sol's review of
-// #133 at 4238ad3). The control's next line shares no word with them; both
-// must stop the voice.
-func TestALaterLineDoesNotHideAnEarlierTalkOver(t *testing.T) {
-	for _, later := range []string{"Ada holds it.", "Hold on while I check."} {
-		t.Run(later, func(t *testing.T) {
-			r := newLongFollowUpDrivingRig(t)
-			r.heard("Wispr, what is the status?", true, true)
-			sess := r.waitSession()
-			speakAs(t, sess, "The issue is in review.")
-			first := waitSpeechAfter(t, r, time.Time{})
-			said := from(first.Add(30 * time.Millisecond))
-			time.Sleep(time.Until(said(1)) + 20*time.Millisecond)
-			r.speaker.finish(audio.InputVoice)
-			r.speaker.FlushSpeech()
-			speakAs(t, sess, later)
-			second := waitSpeechAfter(t, r, first)
-			if !said(1).Before(second) {
-				t.Fatal("control: the words were said after the next speech began")
-			}
-			r.s.OnTranscript(timedResult("Hold on.", 200, true, said))
-			eventually(t, "the earlier talk-over to stop the voice", func() bool { return voiceCutAfter(r, second) })
-		})
+// textGateVoice opens the rig's fake sessions, as a voice that drives its
+// own turn, whose events the Supervisor reads only once release closes,
+// having closed entered: a voice's text can be read after its audio played.
+type textGateVoice struct {
+	voice            *fakeVoice
+	entered, release chan struct{}
+}
+
+func (*textGateVoice) DrivesTurn() bool { return true }
+
+func (v *textGateVoice) Open(ctx context.Context, x *Exchange) (Session, error) {
+	s, err := v.voice.Open(ctx, x)
+	if err != nil {
+		return nil, err
+	}
+	return &textGateSession{Session: s, entered: v.entered, release: v.release}, nil
+}
+
+type textGateSession struct {
+	Session
+	entered, release chan struct{}
+}
+
+func (s *textGateSession) Events() <-chan Event {
+	close(s.entered)
+	<-s.release
+	return s.Session.Events()
+}
+
+// TestALineReadAfterItsSpeechStillMatchesItsEcho fails if the voice's own
+// words, heard back during its first speech and read during its next, stop
+// that next speech when the Supervisor read the first line's text only after
+// the first speech ended: a match of a word against the lines said before
+// its speech ended left that line out, where main finds the echo (Sol's
+// review of #133 at e6484db). The controls read the text in time, and read
+// other words said at the same moment, which stop the voice.
+func TestALineReadAfterItsSpeechStillMatchesItsEcho(t *testing.T) {
+	for _, late := range []bool{false, true} {
+		for _, own := range []bool{false, true} {
+			t.Run(fmt.Sprintf("read after the speech %v, its own words %v", late, own), func(t *testing.T) {
+				entered, gate := make(chan struct{}), make(chan struct{})
+				letRead := func() {
+					select {
+					case <-gate:
+					default:
+						close(gate)
+					}
+				}
+				t.Cleanup(letRead)
+				r := newRigWith(t, newFakeConcierge(), func(cfg *SupervisorConfig, r *rig) {
+					cfg.Voice = func() (Voice, error) { return &textGateVoice{voice: r.voice, entered: entered, release: gate}, nil }
+					cfg.IdleWait, cfg.FollowUpWait = time.Minute, time.Minute
+				})
+				r.heard("Wispr, what is the status?", true, true)
+				sess := r.waitSession()
+				select {
+				case <-entered:
+				case <-time.After(testWait):
+					t.Fatal("fixture: the Supervisor never asked for the session's events")
+				}
+				if err := sess.Say(t.Context(), "Release progress.", Answer); err != nil {
+					t.Fatal(err)
+				}
+				waitSaid(t, sess)
+				first := waitSpeechAfter(t, r, time.Time{})
+				registered := func() bool {
+					r.s.mu.Lock()
+					defer r.s.mu.Unlock()
+					for _, o := range r.s.own {
+						if o.words["release"] && o.words["progress"] {
+							return true
+						}
+					}
+					return false
+				}
+				if !late {
+					letRead()
+					eventually(t, "the first line's text read", registered)
+				}
+				said := from(first.Add(30 * time.Millisecond))
+				time.Sleep(time.Until(said(1)) + 20*time.Millisecond)
+				r.speaker.finish(audio.InputVoice)
+				r.speaker.FlushSpeech()
+				if late {
+					if registered() {
+						t.Fatal("fixture: the held text was read before the speech ended")
+					}
+					letRead()
+					eventually(t, "the first line's text read late", registered)
+				}
+				if err := sess.Say(t.Context(), "Ada holds it.", Answer); err != nil {
+					t.Fatal(err)
+				}
+				waitSaid(t, sess)
+				second := waitSpeechAfter(t, r, first)
+				text := "Hold on."
+				if own {
+					text = "Release progress."
+				}
+				r.s.OnTranscript(timedResult(text, 200, true, said))
+				if cut := voiceCutAfter(r, second); cut == own {
+					t.Fatalf("the voice was cut %v, want %v: the first line's text read late %v, the words its own %v", cut, !own, late, own)
+				}
+			})
+		}
 	}
 }
 

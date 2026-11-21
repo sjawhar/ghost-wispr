@@ -2320,23 +2320,26 @@ func (s *Supervisor) addOwnLocked(text string, now time.Time) {
 // by when they were captured (Transcript.saidBy), could be heard back from:
 // if it was speaking, or had stopped less than echoHold before; else nil. A
 // word said in, or just after, a speech of the exchange holding the floor
-// matches the lines said from ownWordsKept before that speech began until
-// it ended, however long it played: a line said after it ended was not in
-// it. A word said where no span is kept, as after a cut, matches the lines
-// said up to ownWordsKept before it.
+// matches the lines said from ownWordsKept before that speech began,
+// however long it played. A word said where no span is kept, as after a
+// cut, matches the lines said up to ownWordsKept before it. A line the
+// Supervisor read after the speech ended still matches: a voice's text can
+// be read late, after its audio played, so the line is kept by when it was
+// read, which can hide a talk-over by a later line with the same words, as
+// on main.
 func (s *Supervisor) ownSetLocked(said time.Time) map[string]bool {
 	if !s.voiceSpeaking && said.Sub(s.voiceEnded) >= echoHold {
 		return nil
 	}
-	from, until := said.Add(-ownWordsKept), time.Time{}
+	from := said.Add(-ownWordsKept)
 	if s.ex != nil {
 		if sp, ok := s.ex.spanBefore(said); ok {
-			from, until = sp.from.Add(-ownWordsKept), sp.to
+			from = sp.from.Add(-ownWordsKept)
 		}
 	}
 	set := map[string]bool{}
 	for _, o := range s.own {
-		if o.at.After(from) && (until.IsZero() || o.at.Before(until)) {
+		if o.at.After(from) {
 			for w := range o.words {
 				set[w] = true
 			}
