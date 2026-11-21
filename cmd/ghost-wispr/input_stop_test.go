@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -41,24 +42,17 @@ func TestTheButtonsAndTheListenerRunAsWorkTheStopWaitsFor(t *testing.T) {
 			if err := cfgStore.Update(func(c *config.Config) { c.Voice.Enabled, c.Voice.PausedListener = true, true }); err != nil {
 				t.Fatal(err)
 			}
-			loaded := make(chan bool, 1)
+			var loadedInside atomic.Bool // the spotter loaded inside the work the stop waits for
 			persistent := newPersistentControls(&pauseStoreFake{}, capture.Pause, capture, nil)
 			startPausedListener(ctx, cfgStore, &pausedListenerUnit{
 				capture: capture, controls: persistent, hooks: &server.ControlHooks{}, device: newCaptureDevice(capture.inClosedState),
 				wake: func() {}, warnings: newWarningsRegistry(), built: true, background: bg,
 				newDetector: func() (*local.Detector, error) {
-					loaded <- bg.inside()
+					loadedInside.Store(bg.inside())
 					return nil, errors.New("no spotter in this test")
 				},
 			})
-			return func() bool {
-				select {
-				case in := <-loaded:
-					return in
-				case <-ctx.Done():
-					return false
-				}
-			}
+			return loadedInside.Load
 		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
