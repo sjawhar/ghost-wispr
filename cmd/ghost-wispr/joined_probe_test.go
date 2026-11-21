@@ -14,10 +14,42 @@ import (
 	"testing"
 	"time"
 
+	"golang.org/x/sys/unix"
+
 	"github.com/sjawhar/ghost-wispr/internal/envoy"
 	"github.com/sjawhar/ghost-wispr/internal/transcribe"
 	"github.com/sjawhar/ghost-wispr/internal/voice/joined"
 )
+
+// TestTheProbesStepsCarryTheMonotonicClock fails if a step line has no
+// at_mono_ns on CLOCK_MONOTONIC: the acceptance driver compares when the test
+// agent sent its floor request and was told how its hand came down with its
+// own reads of that clock, which a step of the wall clock does not move.
+func TestTheProbesStepsCarryTheMonotonicClock(t *testing.T) {
+	var ts unix.Timespec
+	monotonic := func() int64 {
+		if err := unix.ClockGettime(unix.CLOCK_MONOTONIC, &ts); err != nil {
+			t.Fatal(err)
+		}
+		return ts.Nano()
+	}
+	var out bytes.Buffer
+	p := &joinedProbe{out: &out}
+	before := monotonic()
+	p.emit("floor_sent", map[string]any{"event": "e1"})
+	after := monotonic()
+	var line map[string]any
+	if err := json.Unmarshal(out.Bytes(), &line); err != nil {
+		t.Fatalf("%v: %s", err, out.Bytes())
+	}
+	mono, ok := line["at_mono_ns"].(float64)
+	if !ok || int64(mono) < before-1_000_000 || int64(mono) > after+1_000_000 {
+		t.Fatalf("at_mono_ns %v, want CLOCK_MONOTONIC between %d and %d: %s", line["at_mono_ns"], before, after, out.Bytes())
+	}
+	if _, err := time.Parse(time.RFC3339Nano, fmt.Sprint(line["at"])); err != nil || line["step"] != "floor_sent" {
+		t.Fatalf("the step line lost its step or its wall time: %s", out.Bytes())
+	}
+}
 
 // TestTheProbeReadsTheJoinMessage fails if the acceptance probe cannot read
 // the unit's Envoy session, its API and the join line from the join message

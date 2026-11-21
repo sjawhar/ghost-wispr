@@ -397,8 +397,196 @@ api_post() {
   curl --fail --silent --show-error --max-time 30 --request POST "$api$1"
 }
 
+# The driver's clock is CLOCK_MONOTONIC, the clock the voice also writes each event's at_mono_ns on
+# (internal/monoclock): a step of the wall clock (settimeofday, an NTP step) moves neither, so the
+# driver compares its times with the voice's across one. Bash reads only the wall clock, so mono_py
+# reads the monotonic one: as the coprocess mono_clock, which answers each line with the time
+# (start_mono_clock), as the recording's sampler (start_recording) and as the playback poller
+# (start_poller). Every time the driver compares is on this clock; the wall clock serves only
+# journalctl's --since, which takes a wall time.
+read -r -d '' mono_py <<'EOF'
+import os
+import re
+import signal
+import sys
+import time
+
+HEADER = 44
+
+
+def us():
+    return time.monotonic_ns() // 1000
+
+
+def alive(pid):
+    try:
+        with open("/proc/%d/stat" % pid) as f:
+            return f.read().rsplit(")", 1)[1].split()[0] != "Z"
+    except (OSError, IndexError):
+        return False
+
+
+class Stop(Exception):
+    pass
+
+
+def stop(*_):
+    raise Stop
+
+
+def clock():
+    """One line out, the time in microseconds, for each line in. Ctrl-C reaches the driver's whole
+    process group, and the driver needs its clock to restore the unit after one: it is ignored here,
+    and the clock ends when the driver closes its end."""
+    for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, signal.SIG_IGN)
+    for _ in sys.stdin:
+        sys.stdout.write("%d\n" % us())
+        sys.stdout.flush()
+
+
+def size_reader(path):
+    """A read of the bytes arecord has written: from its fdinfo's pos while /proc shows the file open
+    in it (pid, once known), else from a stat of the file. It gives 0 while there is no file and
+    none was seen, and None when the read fails, or the file is gone once seen: arecord never
+    removes it."""
+    fd, seen = None, False
+
+    def find(pid):
+        for name in os.listdir("/proc/%d/fd" % pid):
+            try:
+                if os.path.samefile("/proc/%d/fd/%s" % (pid, name), path):
+                    return name
+            except OSError:
+                pass
+        return None
+
+    def read(pid):
+        nonlocal fd, seen
+        if pid is not None:
+            try:
+                if fd is None:
+                    fd = find(pid)
+                if fd is not None:
+                    with open("/proc/%d/fdinfo/%s" % (pid, fd)) as f:
+                        pos = next((int(line.split(":", 1)[1]) for line in f if line.startswith("pos:")), None)
+                    # The fd still names the file after the read: a number arecord closed and
+                    # reused for another file gives no size.
+                    if pos is not None and os.path.samefile("/proc/%d/fd/%s" % (pid, fd), path):
+                        seen = True
+                        return pos
+                    fd = None
+            except (OSError, ValueError):
+                fd = None
+        try:
+            size = os.stat(path).st_size
+        except FileNotFoundError:
+            return None if seen else 0
+        except OSError:
+            return None
+        seen = True
+        return size
+
+    return read
+
+
+def record(path, anchors, pidfile):
+    """The recording's sampler, started before arecord: every 10 ms until arecord has written a
+    sample, then every 0.5 s, and once more at SIGTERM, after arecord has ended, it writes an anchor,
+    "US BYTES", the time read after the size. It prints "ready" after its first read, before which
+    arecord does not start, and learns arecord's pid from PIDFILE. Before the first sample, a read
+    that found less than the header, or no file yet, came before the capture began: the last such
+    read's time, read before the size, is the start. It prints "started US" once arecord has written
+    a sample, "stopped" if arecord ends before, and "timeout" if it has written none within 5 s of
+    its pid; a sample counts even when found after the 5 s."""
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    signal.signal(signal.SIGTERM, stop)
+    read = size_reader(path)
+    out = open(anchors, "a", buffering=1)
+    pid, deadline, started, ready = None, None, None, False
+    try:
+        while True:
+            if pid is None:
+                try:
+                    with open(pidfile) as f:
+                        pid = int(f.read())
+                    deadline = us() + 5_000_000
+                except (OSError, ValueError):
+                    pass
+            before = us()
+            size = read(pid)
+            seen = us()
+            if size is not None and size > HEADER:
+                out.write("%d %d\n" % (seen, size))
+                break
+            if size is not None and size < HEADER:
+                started = before
+            if not ready:
+                print("ready", flush=True)
+                ready = True
+            if pid is not None and not alive(pid):
+                print("stopped", flush=True)
+                return
+            if deadline is not None and seen >= deadline:
+                print("timeout", flush=True)
+                return
+            time.sleep(0.01)
+        if started is None:
+            print("no read came before the capture", flush=True)
+            return
+        print("started %d" % started, flush=True)
+        while alive(pid):
+            time.sleep(0.5)
+            size = read(pid)
+            seen = us()
+            if size is not None:
+                out.write("%d %d\n" % (seen, size))
+    except Stop:
+        pass
+    # arecord has ended: the file is whole.
+    try:
+        size = os.stat(path).st_size
+    except OSError:
+        return
+    out.write("%d %d\n" % (us(), size))
+
+
+def poll(status, log):
+    """The playback poller: every 5 ms, the speaker substream's state, "MS STATE", the time read
+    after the status."""
+    out = open(log, "a", buffering=1)
+    while True:
+        try:
+            with open(status) as f:
+                content = f.read()
+        except OSError:
+            content = ""
+        now = us() // 1000
+        match = re.search(r"state: ([A-Z_]+)", content)
+        out.write("%d %s\n" % (now, match.group(1) if match else "CLOSED"))
+        time.sleep(0.005)
+
+
+mode = sys.argv[1]
+if mode == "clock":
+    clock()
+elif mode == "record":
+    record(sys.argv[2], sys.argv[3], sys.argv[4])
+elif mode == "poll":
+    poll(sys.argv[2], sys.argv[3])
+EOF
+readonly mono_py
+
+# start_mono_clock: the driver's clock coprocess, mono_clock.
+start_mono_clock() {
+  coproc mono_clock { exec python3 -c "$mono_py" clock 2>/dev/null; }
+}
+
+# now_ms: the driver's clock, CLOCK_MONOTONIC, in milliseconds.
 now_ms() {
-  local now=${EPOCHREALTIME//[!0-9]/}
+  local now
+  printf '\n' >&"${mono_clock[1]}" && IFS= read -r now <&"${mono_clock[0]}" && [[ $now =~ ^[0-9]+$ ]] \
+    || unknown "the driver's clock (python3, CLOCK_MONOTONIC) gave no time"
   printf '%s\n' "$((now / 1000))"
 }
 
@@ -550,38 +738,45 @@ deepgram_connected() {
     "$ws_capture" >/dev/null 2>&1
 }
 
-# time_ms RFC3339: the time (UTC, as Go writes it) in Unix milliseconds, on the same clock as now_ms:
-# the driver runs on the Pi.
+# time_ms RFC3339: the time (UTC, as Go writes it) in Unix milliseconds, on the wall clock: only for
+# a time the service gives on the wall clock alone, compared with another of its wall times.
 time_ms() {
   jq -r -n --arg t "$1" '$t
     | capture("^(?<s>[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2})(\\.(?<f>[0-9]+))?Z$")
     | ((.s + "Z") | fromdateiso8601) * 1000 + (((.f // "") + "000")[0:3] | tonumber)' 2>/dev/null
 }
 
-# check_voice_event NAME EVENT [SESSION]: a voice event carries session_id and nothing else of its
-# own, never words; given SESSION, its session_id is that one. It sets event_at to the event's
-# time, and fails the run when a check fails, so it runs in the main shell, not in $(...).
+# mono_ms JSON: the at_mono_ns of a voice event, a timing line or a test agent's step, on now_ms's
+# clock (CLOCK_MONOTONIC), in milliseconds; nothing when it has none.
+mono_ms() {
+  jq -r '(.at_mono_ns | numbers) / 1000000 | floor' <<<"$1" 2>/dev/null
+}
+
+# check_voice_event NAME EVENT [SESSION]: a voice event carries session_id, its time and nothing
+# else of its own, never words; given SESSION, its session_id is that one. It sets event_at to the
+# event's time on now_ms's clock, at_mono_ns, and fails the run when a check fails, so it runs in the
+# main shell, not in $(...).
 event_at=
 check_voice_event() {
   local name=$1 event=$2 want=${3:-} extra got
-  extra=$(jq -r '(keys - ["session_id", "timestamp", "type", "version"]) | join(", ")' <<<"$event") \
+  extra=$(jq -r '(keys - ["session_id", "timestamp", "at_mono_ns", "type", "version"]) | join(", ")' <<<"$event") \
     || unknown "$name: cannot read the event: $event"
-  [[ -z $extra ]] || fail "$name: carries a field other than type, version, timestamp and session_id: $extra"
+  [[ -z $extra ]] || fail "$name: carries a field other than type, version, timestamp, at_mono_ns and session_id: $extra"
   jq -e 'has("session_id") and (.session_id | type == "string")' >/dev/null <<<"$event" || fail "$name: has no session_id: $event"
   got=$(jq -r '.session_id' <<<"$event")
   if [[ -n $want && $got != "$want" ]]; then
     fail "$name: session_id \"$got\", want \"$want\" from voice_exchange_started"
   fi
-  event_at=$(time_ms "$(jq -r '.timestamp' <<<"$event")")
-  whole_number "$event_at" || unknown "$name: cannot read its timestamp: $event"
+  event_at=$(mono_ms "$event")
+  whole_number "$event_at" || unknown "$name: no at_mono_ns, its time on the monotonic clock, so it cannot be compared with the driver's: this build does not give it: $event"
 }
 
 # journal_lines: what the service's running process wrote to the journal. The Pi keeps no user
 # journal, so this reads the system journal as root, the user unit's lines from its main process,
 # in this boot and since this unit run's restart: a process ID recurs, within a boot and across
-# boots of a persistent journal.
+# boots of a persistent journal. --since takes a wall time, the one use of the wall clock here.
 journal_lines() {
-  sudo -n journalctl _SYSTEMD_USER_UNIT="$unit" _PID="$unit_pid" -o cat --boot=0 --since "@$((restart_ms / 1000 - 1))" 2>"$work_dir/journal.err"
+  sudo -n journalctl _SYSTEMD_USER_UNIT="$unit" _PID="$unit_pid" -o cat --boot=0 --since "@$((restart_wall_s - 1))" 2>"$work_dir/journal.err"
 }
 
 # journal_error: what the last journal read printed on stderr, to say why a read failed.
@@ -595,18 +790,20 @@ journal_records() {
   journal_lines | jq -R -c --arg message "$1" 'fromjson? | select(type == "object" and .message == $message)' 2>/dev/null
 }
 
-# timing_events: the voice timing log since the restart: {event, session_id, reason, at}, at in Unix
-# milliseconds.
+# timing_events: the voice timing log since the restart: {event, session_id, reason, at, wall}: at
+# on now_ms's clock (at_mono_ns), -1 for a line without one, and wall on the wall clock (at_unix_ns),
+# in milliseconds.
 timing_events() {
   journal_records 'voice timing' | jq -c '{event: (.event // ""), session_id: (.session_id // ""),
-    reason: (.reason // ""), at: ((((.at_unix_ns | tonumber?) // 0) / 1000000) | floor)}' 2>/dev/null
+    reason: (.reason // ""), at: ((((.at_mono_ns | tonumber?) // -1000000) / 1000000) | floor),
+    wall: ((((.at_unix_ns | tonumber?) // 0) / 1000000) | floor)}' 2>/dev/null
 }
 
-# timing_first EVENT FROM_MS TO_MS: the time of the first EVENT in the timing log in [FROM, TO], or
-# nothing.
+# timing_first EVENT FROM_MS TO_MS [FIELD]: the time of the first EVENT in the timing log in
+# [FROM, TO], or nothing; FIELD at (now_ms's clock) by default, or wall.
 timing_first() {
-  timing_events | jq -r -n --arg e "$1" --argjson from "$2" --argjson to "$3" \
-    '[inputs | select(.event == $e and .at >= $from and .at <= $to) | .at] | min // empty'
+  timing_events | jq -r -n --arg e "$1" --argjson from "$2" --argjson to "$3" --arg f "${4:-at}" \
+    '[inputs | select(.event == $e and .[$f] >= $from and .[$f] <= $to) | .[$f]] | min // empty'
 }
 
 # wait_for_timing EVENT AFTER_MS DEADLINE_MS: wait until the timing log holds EVENT at or after
@@ -627,12 +824,16 @@ wait_for_timing() {
 }
 
 # timing_fail REASON: a timing line did not come. With no "voice timing" line at all since the
-# restart, the build does not write the log, and the step read nothing: UNKNOWN. Otherwise FAIL.
+# restart, the build does not write the log, and the step read nothing: UNKNOWN. With lines that
+# have no at_mono_ns, the build gives no time the driver can compare with its own: UNKNOWN.
+# Otherwise FAIL.
 timing_fail() {
   local events
   events=$(timing_events) || unknown "voice timing log: cannot read the journal of $unit (process $unit_pid)$(journal_error)"
   [[ -n $events ]] \
     || unknown "voice timing log: the journal of $unit holds no \"voice timing\" line since its restart; this build does not write the timing log"
+  jq -e -s 'all(.at >= 0)' >/dev/null <<<"$events" \
+    || unknown "voice timing log: a \"voice timing\" line has no at_mono_ns, its time on the monotonic clock; this build does not give it, so its times cannot be compared with the driver's"
   fail "$1"
 }
 
@@ -837,13 +1038,14 @@ trap 'interrupted HUP 129' HUP
 for command in curl jq python3 systemctl journalctl sudo; do
   command -v "$command" >/dev/null || refuse "missing required command: $command"
 done
+start_mono_clock
 work_dir=$(mktemp -d) || refuse 'cannot make a private directory'
 
 # ---- the unit's run: the service on the loopback, capturing ----
 
 unit_runs=0
 unit_pid=
-restart_ms=0
+restart_wall_s=0
 voice_off_reason=
 
 # start_unit_run SETTING...: put the service on the run's settings, each KEY=VALUE written into the
@@ -868,7 +1070,7 @@ start_unit_run() {
     awk -v pattern="^[[:space:]]*(export[[:space:]]+)?($pattern)=" '$0 !~ pattern' "$saved_env"
     printf '%s\n' "$@"
   } >"$env_file" || fail "loopback: could not write $env_file"
-  restart_ms=$(now_ms)
+  restart_wall_s=$EPOCHSECONDS
   service restart || fail "loopback: could not restart $unit"
   wait_for_status "$restart_seconds" || fail "loopback: $unit did not answer within $restart_seconds s of its restart"
   unit_pid=$(service show --property=MainPID --value 2>/dev/null)
@@ -945,22 +1147,23 @@ wait_spoken() {
 # missing bound of a time that has none.
 readonly never_ms=9999999999999
 
-# start_recording DEVICE FILE: record DEVICE to FILE with arecord, until stop_recording. A background
-# loop writes anchors, "US BYTES" lines: by the driver's clock US (microseconds, read just after the
-# size), BYTES of the file were written. recording-times.awk bounds each sound's time with the
-# anchors after it, late only by how late its best anchor was read (analyse_recording). The size
-# comes from arecord's own fdinfo, whose pos is the bytes it has written, read by the shell with no
-# fork: a fork between the size and the clock, on a loaded machine, makes every anchor late by as
-# long as the fork takes, and no later anchor then makes up for it. Where /proc does not show that
-# fd, the size comes from wc.
+# start_recording DEVICE FILE: record DEVICE to FILE with arecord, until stop_recording. A sampler
+# (mono_py record) writes anchors, "US BYTES" lines: by the driver's clock US (CLOCK_MONOTONIC, in
+# microseconds, read just after the size), BYTES of the file were written. recording-times.awk
+# bounds each sound's time with the anchors after it, late only by how late its best anchor was read
+# (analyse_recording). The sampler reads the size from arecord's own fdinfo, whose pos is the bytes
+# it has written, or with a stat of the file where /proc does not show that fd, and the clock in the
+# same process: no fork comes between the size and the clock.
 #
 # The recording starts between two times. recording_started is the earlier: arecord opens its
 # device, then creates the file and writes its whole 44-byte header, and only then reads, which
 # starts the capture (alsa-utils aplay.c capture(): set_params, then the file, begin_wave, then
 # pcm_read; for arecord the start threshold is one frame). So a read of the file's size that found
-# less than the header, or no file, came before the capture began, and the last such read is
-# recording_started; with none, the clock just before arecord started. A read that fails finds
-# nothing and moves nothing. The later time is the first read that finds a sample, the first anchor:
+# less than the header, or no file yet, came before the capture began, and the last such read is
+# recording_started. The sampler starts first, and arecord only once it has read, so that some read
+# comes before arecord and the last comes as late as the polls can make it. A read that fails finds
+# nothing and moves nothing; so does a file missing once the sampler has seen it, as arecord never
+# removes its file. The later time is the first read that finds a sample, the first anchor:
 # recording-times.awk bounds the file's first sample from above with it. An arecord slow to open
 # its device makes no time late; one held back between its header and its first read makes every
 # time counted from recording_started early by as long, and a check that needs that time to be
@@ -969,189 +1172,68 @@ recording=
 anchors_file=
 recording_cut=false
 recording_started=
-recording_fdinfo=
+sampler_said=
 start_recording() {
-  local deadline size seen before link tick
   recording=$2
   anchors_file="$recording.anchors"
   recording_cut=false
-  recording_fdinfo=
   : >"$anchors_file"
-  start_clock_watch
-  # arecord captures nothing before it starts: the earliest the file's first sample can be.
-  recording_started=${EPOCHREALTIME//[!0-9]/}
+  : >"$recording.sampler"
+  rm -f -- "$recording.pid"
+  python3 -c "$mono_py" record "$recording" "$anchors_file" "$recording.pid" \
+    >"$recording.sampler" 2>"$work_dir/sampler.err" &
+  anchor_pid=$!
+  sampler_line 1
+  [[ $sampler_said == ready ]] || unknown "recording: the sampler of $recording said: $sampler_said"
   arecord -q -D "$1" -f S16_LE -r "$sample_rate" -c 1 -t wav --buffer-time=40000 --period-time=10000 \
     "$recording" 2>"$work_dir/arecord.err" &
   arecord_pid=$!
-  deadline=$(($(now_ms) + 5000))
-  # The poll for the first sample forks nothing: before the file exists the size is 0, and once
-  # arecord has it open the size comes from arecord's fdinfo (recording_size, which reads it with wc
-  # only in the moment between); the 10 ms wait is a read that times out on a pipe this shell holds
-  # both ends of. A fork per poll, on a loaded machine, would leave the last read before the header
-  # far before the capture, and every time counted from it early by as much.
-  exec {tick}<> <(:)
-  while :; do
-    before=${EPOCHREALTIME//[!0-9]/}
-    if [[ -z $recording_fdinfo ]]; then
-      for link in /proc/"$arecord_pid"/fd/*; do
-        if [[ $link -ef $recording ]]; then
-          recording_fdinfo=/proc/$arecord_pid/fdinfo/${link##*/}
-          break
-        fi
-      done
-    fi
-    if [[ -n $recording_fdinfo || -e $recording ]]; then
-      recording_size || size=
-    else
-      size=0
-    fi
-    seen=${EPOCHREALTIME//[!0-9]/}
-    if [[ -n $size ]] && ((size > wav_header_bytes)); then
-      printf '%s %s\n' "$seen" "$size" >>"$anchors_file"
-      break
-    fi
-    # Less than the header when its size was read, after before: the capture began later. A read
-    # that failed (size empty) shows nothing, so the start stays where the last read put it.
-    [[ -n $size ]] && ((size < wav_header_bytes && before > recording_started)) && recording_started=$before
-    kill -0 "$arecord_pid" 2>/dev/null || unknown "recording: arecord stopped: $(tr '\n' ' ' <"$work_dir/arecord.err")"
-    ((seen / 1000 < deadline)) || unknown "recording: arecord wrote no audio from $1 within 5 s"
-    read -r -t 0.01 -u "$tick" _ || true
-  done
-  exec {tick}>&-
-  (
-    while kill -0 "$arecord_pid" 2>/dev/null; do
-      sleep 0.5
-      recording_size || continue
-      seen=${EPOCHREALTIME//[!0-9]/}
-      printf '%s %s\n' "$seen" "$size" >>"$anchors_file"
-    done
-  ) &
-  anchor_pid=$!
+  if ! { printf '%s\n' "$arecord_pid" >"$recording.pid.tmp" && mv -- "$recording.pid.tmp" "$recording.pid"; }; then
+    unknown "recording: cannot give the sampler arecord's process id"
+  fi
+  sampler_line 2
+  case $sampler_said in
+    started\ *) recording_started=${sampler_said#started } ;;
+    stopped) unknown "recording: arecord stopped: $(tr '\n' ' ' <"$work_dir/arecord.err")" ;;
+    timeout) unknown "recording: arecord wrote no audio from $1 within 5 s" ;;
+    *) unknown "recording: the sampler of $recording said: $sampler_said" ;;
+  esac
+  whole_number "$recording_started" || unknown "recording: the sampler of $recording gave no start: $sampler_said"
   note "recording: from $1"
 }
 
-# recording_size: set size to the bytes arecord has written to the recording: from its fdinfo, read
-# by the shell itself, when start_recording found it, else with wc. It fails, with size empty, when
-# neither reads a size.
-recording_size() {
-  local key value
-  if [[ -n $recording_fdinfo ]] && read -r key value 2>/dev/null <"$recording_fdinfo" && [[ $key == pos: && $value =~ ^[0-9]+$ ]]; then
-    size=$value
-    return 0
-  fi
-  value=$(wc -c 2>/dev/null <"$recording") || value=
-  value=${value//[[:space:]]/}
-  if whole_number "$value"; then
-    size=$value
-    return 0
-  fi
-  size=
-  return 1
-}
-
-# start_clock_watch: while the recording runs, a python3 process compares CLOCK_REALTIME with
-# CLOCK_MONOTONIC every 50 ms, and once more when stop_recording ends it, after the last anchor. The
-# two run at the same slewed rate, so they differ by a constant until something steps the system
-# clock: settimeofday, an NTP step or a leap second. The driver's times, the anchors and the voice's
-# own times (at_unix_ns, the /ws events, the test agent's) are all on the realtime clock, so they
-# agree with each other unless a step falls between them; a monotonic timeline for the driver alone
-# would not help, as the voice's times would still need the steps to be compared with it. Each
-# reading brackets the difference between two monotonic reads, and the watch keeps the intersection
-# of its brackets: a step makes it empty. So a step larger than the intersection's width, a few
-# microseconds, is seen, and makes the recording's verdicts UNKNOWN (analyse_recording). The watch
-# writes "ready" once it has its first reading, "step NS" at a step and "end WIDTH_NS" at its end.
-clock_watch_pid=
-clock_log=
-start_clock_watch() {
-  local deadline
-  clock_log="$recording.clock"
-  : >"$clock_log"
-  python3 - clock-watch "$clock_log" 2>"$work_dir/clock-watch.err" <<'EOF' &
-import signal
-import sys
-import time
-
-log = open(sys.argv[2], "a", buffering=1)
-low = high = None
-stepped = False
-
-
-class Stop(Exception):
-    pass
-
-
-def stop(*_):
-    raise Stop
-
-
-def check():
-    """One reading: the realtime clock read between two monotonic reads."""
-    global low, high, stepped
-    before = time.monotonic_ns()
-    real = time.time_ns()
-    after = time.monotonic_ns()
-    a, b = real - after, real - before
-    if low is None:
-        low, high = a, b
-    elif not stepped and (a > high or b < low):
-        log.write("step %d\n" % ((a + b) // 2 - (low + high) // 2))
-        stepped = True
-    elif not stepped:
-        low, high = max(low, a), min(high, b)
-
-
-signal.signal(signal.SIGTERM, stop)
-try:
-    check()
-    log.write("ready\n")
-    while True:
-        time.sleep(0.05)
-        check()
-except Stop:
-    pass
-check()
-log.write("end %d\n" % (high - low))
-EOF
-  clock_watch_pid=$!
-  deadline=$(($(now_ms) + 10000))
-  until [[ -s $clock_log ]]; do
-    kill -0 "$clock_watch_pid" 2>/dev/null \
-      || unknown "recording: the clock watch did not start: $(head -c 300 "$work_dir/clock-watch.err" | tr '\n' ' ')"
-    (($(now_ms) < deadline)) || unknown 'recording: the clock watch did not start within 10 s'
-    sleep 0.01
+# sampler_line N: set sampler_said to the sampler's Nth line, once it has written it. The sampler
+# gives up 5 s after arecord's start on the monotonic clock; this wait only bounds a sampler that
+# never answers.
+sampler_line() {
+  local deadline tick
+  deadline=$(($(now_ms) + 60000))
+  exec {tick}<> <(:)
+  until sampler_said=$(sed -n "$1p" "$recording.sampler" 2>/dev/null) && [[ -n $sampler_said ]]; do
+    kill -0 "$anchor_pid" 2>/dev/null \
+      || unknown "recording: the sampler of $recording ended without its line $1: $(head -c 300 "$work_dir/sampler.err" | tr '\n' ' ')"
+    (($(now_ms) < deadline)) || unknown "recording: the sampler of $recording did not answer within 60 s"
+    read -r -t 0.01 -u "$tick" _ || true
   done
-}
-
-# stop_clock_watch: the watch's last reading, then its end.
-stop_clock_watch() {
-  [[ -n $clock_watch_pid ]] || return 0
-  kill -TERM "$clock_watch_pid" 2>/dev/null
-  wait "$clock_watch_pid" 2>/dev/null
-  clock_watch_pid=
+  exec {tick}>&-
 }
 
 # stop_recording: end the recording. On SIGTERM arecord finishes the file's header and drops what it
 # had captured but not yet written. Every sample in the file was captured before arecord ended, so a
-# last anchor, taken once it has, bounds the end of the file too. An arecord that already ended on
-# its own cut the recording short, which analyse_recording reports.
+# last anchor, which the sampler takes once arecord has ended and it gets SIGTERM, bounds the end of
+# the file too. An arecord that already ended on its own cut the recording short, which
+# analyse_recording reports.
 stop_recording() {
-  local size seen stopped=false
   if [[ -n $arecord_pid ]]; then
     kill -TERM "$arecord_pid" 2>/dev/null || recording_cut=true
     wait "$arecord_pid" 2>/dev/null
     arecord_pid=
-    stopped=true
   fi
   if [[ -n $anchor_pid ]]; then
-    kill "$anchor_pid" 2>/dev/null
+    kill -TERM "$anchor_pid" 2>/dev/null
     wait "$anchor_pid" 2>/dev/null
     anchor_pid=
   fi
-  if [[ $stopped == true ]] && size=$(wc -c 2>/dev/null <"$recording"); then
-    seen=${EPOCHREALTIME//[!0-9]/}
-    printf '%s %s\n' "$seen" "$size" >>"$anchors_file"
-  fi
-  stop_clock_watch
 }
 
 # analyse_recording THRESHOLD_DB: read the sounds in the recording. sound_on and sound_off hold each
@@ -1183,16 +1265,11 @@ recording_end_early=
 recording_end_late=
 recording_trail_min=
 analyse_recording() {
-  local analysis bytes kind rest on off len on_early off_early gap watch
+  local analysis bytes kind rest on off len on_early off_early gap
   analysis=$(ffmpeg -hide_banner -nostats -i "$recording" -af "silencedetect=noise=${1}dB:d=$silence_seconds" -f null - 2>&1) \
     || unknown "recording: ffmpeg could not read $recording: $(tail -n 3 <<<"$analysis" | tr '\n' ' ')"
   [[ $recording_cut == false ]] \
     || unknown "recording: arecord stopped before the step ended it, so the recording does not cover the step: $(tr '\n' ' ' <"$work_dir/arecord.err")"
-  watch=$(<"$clock_log") || unknown "recording: cannot read the clock watch's log $clock_log"
-  [[ $watch =~ (^|$'\n')step\ (-?[0-9]+) ]] \
-    && unknown "recording: the system clock stepped by $((BASH_REMATCH[2] / 1000)) us while the rig recorded, so the recording's times cannot be compared with the voice's"
-  [[ $watch =~ (^|$'\n')end\ [0-9]+ ]] \
-    || unknown "recording: the clock watch ended without its last reading, so a step of the system clock while the rig recorded cannot be ruled out: $(head -c 300 "$work_dir/clock-watch.err" | tr '\n' ' ')"
   bytes=$(wc -c <"$recording") || unknown "recording: cannot read the size of $recording"
   sound_on=()
   sound_off=()
@@ -1816,7 +1893,8 @@ step_ask_holder() {
   pass "ask-holder: voice_answer_ready on /ws, same session_id"
   answer_at=
   if whole_number "${asked:-}"; then
-    answer_at=$(timing_first answer_ready "$asked" 9999999999999) \
+    # asked_at is a wall time only, so the answer's is too.
+    answer_at=$(timing_first answer_ready "$asked" "$never_ms" wall) \
       || unknown "voice timing log: cannot read the journal of $unit (process $unit_pid)$(journal_error)"
   fi
   if [[ -n $answer_at ]]; then
@@ -1902,12 +1980,13 @@ probe_says() {
 }
 
 # spoken_after SESSION FROM_MS DEADLINE_MS: wait for the first voice_spoken of SESSION timed at FROM
-# or later; set event_json to it. A voice_spoken of another meeting, or one before FROM, is not it.
+# or later on now_ms's clock; set event_json to it. A voice_spoken of another meeting, or one before
+# FROM, is not it.
 spoken_after() {
   local event at
   while :; do
     while IFS= read -r event; do
-      at=$(time_ms "$(jq -r '.timestamp' <<<"$event")")
+      at=$(mono_ms "$event")
       if whole_number "$at" && ((at >= $2)); then
         event_json=$event
         return 0
@@ -1997,8 +2076,8 @@ step_joined() {
   pass "joined: the test agent read $(jq -r '.segments_in_range' <<<"$probe_json") segments in the pointer's time range from the recorder's API"
 
   probe_step floor_sent $(($(now_ms) + event_timeout * 1000)) || fail "joined: the test agent sent no floor request: $(probe_says)"
-  floor_at=$(time_ms "$(jq -r '.at' <<<"$probe_json")")
-  whole_number "$floor_at" || unknown "joined: cannot read the floor request's time: $probe_json"
+  floor_at=$(mono_ms "$probe_json")
+  whole_number "$floor_at" || unknown "joined: no at_mono_ns for the floor request, so its time cannot be compared with the driver's: $probe_json"
   wait_for_timing hand_chime $((floor_at - 1000)) $((floor_at + event_timeout * 1000)) \
     || timing_fail "joined: no hand_chime in the voice timing log within $event_timeout s of the floor request"
   hand_at=$timing_at
@@ -2020,8 +2099,8 @@ step_joined() {
   probe_step hand $(($(now_ms) + event_timeout * 1000)) || fail "joined: the test agent was not told how its hand came down: $(probe_says)"
   outcome=$(jq -r '.outcome' <<<"$probe_json")
   [[ $outcome == spoken ]] || fail "joined: the hand came down $outcome, not spoken"
-  told_at=$(time_ms "$(jq -r '.at' <<<"$probe_json")")
-  whole_number "$told_at" || unknown "joined: cannot read when the test agent was told how its hand came down: $probe_json"
+  told_at=$(mono_ms "$probe_json")
+  whole_number "$told_at" || unknown "joined: no at_mono_ns for when the test agent was told how its hand came down, so it cannot be compared with the driver's: $probe_json"
   ((told_at >= go_ahead_ended)) \
     || fail "joined: the test agent was told its hand came down spoken $((go_ahead_ended - told_at)) ms before the go-ahead ended"
   pass "joined: the agent's words were spoken on \"Wispr, go ahead\", and it was told so $((told_at - go_ahead_ended)) ms after the go-ahead ended"
@@ -2218,24 +2297,13 @@ speaker_status() {
   [[ -r $status_path ]] || unknown "playback-cancel: cannot read $status_path"
 }
 
-# start_poller: read the speaker substream's status every 5 ms into poll_log, "MS STATE".
+# start_poller: read the speaker substream's status every 5 ms into poll_log, "MS STATE", on now_ms's
+# clock (mono_py poll).
 poll_log=
 start_poller() {
   poll_log="$work_dir/playback.poll"
   : >"$poll_log"
-  mkfifo "$work_dir/never" || unknown 'playback-cancel: cannot make the poller its fifo'
-  (
-    exec 3<>"$work_dir/never"
-    while :; do
-      content=
-      IFS= read -r -d '' content <"$status_path"
-      now=${EPOCHREALTIME//[!0-9]/}
-      state=CLOSED
-      [[ $content =~ state:\ ([A-Z_]+) ]] && state=${BASH_REMATCH[1]}
-      printf '%s %s\n' "$((now / 1000))" "$state" >>"$poll_log"
-      read -r -t 0.005 -u 3 _
-    done
-  ) &
+  python3 -c "$mono_py" poll "$status_path" "$poll_log" 2>"$work_dir/poller.err" &
   poller_pid=$!
 }
 
@@ -2270,8 +2338,8 @@ running_ms() {
 # Known limits. A leak can hide only where it runs into the next question's chime, with less than
 # silence_ms between them: the part of it outside the chime must add at most chime_tolerance_ms to
 # the chime as the rig hears it, and any of it that plays during the chime is not told apart. And a
-# leak that certainly starts no earlier than lead_ms before the next answer's first_audio, where the
-# answer itself may start, is not told apart from that answer; one that may start earlier reads UNKNOWN.
+# leak that certainly starts at or after the next answer's first_audio is not told apart from that
+# answer; one that may start before it reads UNKNOWN.
 step_playback_cancel() {
   local i q wake first spoken_count speech_at wait_ms stop_ats=() question_starts=() question_wakes=()
   local question_firsts=() heard=() heard_early=() deadline max xruns streams ways next chime boundary_unknown
@@ -2403,15 +2471,16 @@ step_playback_cancel() {
         ((sound_len[chime] <= calib_len + chime_tolerance_ms * 1000)) \
           || fail "playback-cancel stop $((i + 1)): the sound at the next question's chime is not the chime alone: it lasts $((sound_len[chime] / 1000)) ms, more than the calibration, the wake sound played alone ($calib_ms ms), by over $chime_tolerance_ms ms"
       fi
-      # The answer's own sound may start lead_ms before its first_audio, which is logged just after
-      # its first frame is written: a sound after the chime is audio of the cancelled answer only
-      # where it starts before that.
+      # first_audio is when the answer's first frame was handed to the speaker (internal/audio,
+      # Output.next reads the clock before it writes the frame), so the answer is heard at it or
+      # later: a sound after the chime that starts before it is audio of the cancelled answer, and
+      # one that may start before it may be.
       if [[ -z ${question_firsts[q]} ]]; then
         boundary_unknown=${boundary_unknown:-"playback-cancel stop $((i + 1)): the timing log has no first_audio for the next question's answer, so the quiet after its chime cannot be checked"}
-      elif ((chime + 1 < ${#sound_on[@]} && sound_on[chime + 1] < question_firsts[q] - lead_ms)); then
+      elif ((chime + 1 < ${#sound_on[@]} && sound_on[chime + 1] < question_firsts[q])); then
         fail "playback-cancel stop $((i + 1)): a sound at the rig microphone starts $((sound_on[chime + 1] - sound_off[chime])) ms after the next question's chime ends, before its answer's first audio ($((question_firsts[q] - sound_on[chime + 1])) ms later): audio of the cancelled answer"
-      elif ((chime + 1 < ${#sound_on[@]} && sound_on_early[chime + 1] < question_firsts[q] - lead_ms)); then
-        boundary_unknown=${boundary_unknown:-"playback-cancel stop $((i + 1)): a sound at the rig microphone starts between $((sound_on_early[chime + 1] - question_firsts[q])) and $((sound_on[chime + 1] - question_firsts[q])) ms from the next answer's first audio, after the chime, so whether it is audio of the cancelled answer, or the answer, which may start $lead_ms ms before its first audio, is not known"}
+      elif ((chime + 1 < ${#sound_on[@]} && sound_on_early[chime + 1] < question_firsts[q])); then
+        boundary_unknown=${boundary_unknown:-"playback-cancel stop $((i + 1)): a sound at the rig microphone starts between $((sound_on_early[chime + 1] - question_firsts[q])) and $((sound_on[chime + 1] - question_firsts[q])) ms from the next answer's first audio, after the chime, so whether it is audio of the cancelled answer is not known"}
       fi
       break
     done

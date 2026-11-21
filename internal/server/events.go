@@ -89,9 +89,12 @@ type SessionDeletedEvent struct {
 // voice_exchange_started, voice_answer_ready, voice_spoken, agent_joined,
 // agent_left) or that a session's questions to agents changed
 // (voice_tasks_changed): a session id and no words. It is never stored.
+// AtMonoNs is its time on CLOCK_MONOTONIC, which the acceptance driver
+// compares with its own reads of that clock (monoclock).
 type VoiceEvent struct {
 	Event
 	SessionID string `json:"session_id"`
+	AtMonoNs  int64  `json:"at_mono_ns,omitempty"`
 }
 
 func newEvent(eventType string, now time.Time) Event {

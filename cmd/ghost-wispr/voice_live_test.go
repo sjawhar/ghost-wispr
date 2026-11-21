@@ -12,6 +12,8 @@ import (
 	"testing"
 	"time"
 
+	"golang.org/x/sys/unix"
+
 	"github.com/sjawhar/ghost-wispr/internal/audio"
 	"github.com/sjawhar/ghost-wispr/internal/concierge"
 	"github.com/sjawhar/ghost-wispr/internal/config"
@@ -299,18 +301,45 @@ func TestALazyConciergeThatCannotStartAnswersUnreachable(t *testing.T) {
 
 // TestVoiceTimingIsLogged fails if a timing event does not reach the journal
 // as the acceptance driver reads it: through logging.New, the logger the
-// service writes its journal with, as message "voice timing".
+// service writes its journal with, as message "voice timing", with its time on
+// the wall clock and on CLOCK_MONOTONIC (at_mono_ns), which the driver compares
+// with its own reads of that clock. A time with no monotonic reading has no
+// at_mono_ns, rather than one its wall clock would place.
 func TestVoiceTimingIsLogged(t *testing.T) {
-	var buf bytes.Buffer
-	logger := logging.New(&buf, logging.ParseLevel("info"))
-	at := time.Date(2026, 11, 19, 9, 0, 0, 5, time.UTC)
-	voiceTiming(logger)("stop", "s1", at, "reason", "Jabra button")
-	var line map[string]any
-	if err := json.Unmarshal(buf.Bytes(), &line); err != nil {
-		t.Fatalf("%v: %s", err, buf.Bytes())
+	var ts unix.Timespec
+	monotonic := func() int64 {
+		if err := unix.ClockGettime(unix.CLOCK_MONOTONIC, &ts); err != nil {
+			t.Fatal(err)
+		}
+		return ts.Nano()
 	}
-	if line["message"] != "voice timing" || line["event"] != "stop" || line["session_id"] != "s1" || line["reason"] != "Jabra button" || line["at_unix_ns"] != float64(at.UnixNano()) {
-		t.Fatalf("logged %s", buf.Bytes())
+	before := monotonic()
+	now := time.Now()
+	after := monotonic()
+	for name, tc := range map[string]struct {
+		at   time.Time
+		mono bool
+	}{
+		"time.Now": {now, true},
+		"built":    {time.Date(2026, 11, 19, 9, 0, 0, 5, time.UTC), false},
+	} {
+		var buf bytes.Buffer
+		logger := logging.New(&buf, logging.ParseLevel("info"))
+		voiceTiming(logger)("stop", "s1", tc.at, "reason", "Jabra button")
+		var line map[string]any
+		if err := json.Unmarshal(buf.Bytes(), &line); err != nil {
+			t.Fatalf("%s: %v: %s", name, err, buf.Bytes())
+		}
+		if line["message"] != "voice timing" || line["event"] != "stop" || line["session_id"] != "s1" || line["reason"] != "Jabra button" || line["at_unix_ns"] != float64(tc.at.UnixNano()) {
+			t.Fatalf("%s: logged %s", name, buf.Bytes())
+		}
+		mono, has := line["at_mono_ns"].(float64)
+		if has != tc.mono {
+			t.Fatalf("%s: at_mono_ns %v, want one: %v; logged %s", name, line["at_mono_ns"], tc.mono, buf.Bytes())
+		}
+		if has && (int64(mono) < before-1_000_000 || int64(mono) > after+1_000_000) {
+			t.Fatalf("%s: at_mono_ns %d, want CLOCK_MONOTONIC between %d and %d", name, int64(mono), before, after)
+		}
 	}
 }
 

@@ -93,7 +93,21 @@ CLOCK = 1.0002 if "clock-fast" in SCENARIO else 0.9998 if "clock-slow" in SCENAR
 
 
 def now_ms():
-    return time.time_ns() // 1_000_000
+    """The Pi's CLOCK_MONOTONIC in milliseconds, which the driver times its recordings and the
+    voice's events on: every time in the timeline is on it."""
+    return time.monotonic_ns() // 1_000_000
+
+
+def wall_ms(ms):
+    """MS, a time on now_ms's clock, on the wall clock, as the service also writes its times. With
+    realtime-step the wall clock steps 1 s forward once the case's first clip has begun, as an NTP
+    step does: the service's wall times from then on are 1 s later, its CLOCK_MONOTONIC times not."""
+    offset = (time.time_ns() - time.monotonic_ns()) // 1_000_000
+    if "realtime-step" in SCENARIO:
+        step = read("realtime-step-at")
+        if step and ms >= int(step):
+            offset += 1000
+    return ms + offset
 
 
 def spath(name):
@@ -121,12 +135,14 @@ def log_to(name, line):
 
 
 def iso(ms):
+    """MS, on now_ms's clock, as the service writes a time: RFC 3339 on the wall clock."""
+    ms = wall_ms(ms)
     return datetime.fromtimestamp(ms // 1000, timezone.utc).strftime("%Y-%m-%dT%H:%M:%S") + ".%03d000000Z" % (ms % 1000)
 
 
 def clock(ms):
-    """The time of day at MS, as a pointer gives it (HH:MM:SS UTC)."""
-    return datetime.fromtimestamp(ms // 1000, timezone.utc).strftime("%H:%M:%S")
+    """The time of day at MS, on now_ms's clock, as a pointer gives it (HH:MM:SS UTC)."""
+    return datetime.fromtimestamp(wall_ms(ms) // 1000, timezone.utc).strftime("%H:%M:%S")
 
 
 def alive(pid):
@@ -140,16 +156,16 @@ def alive(pid):
 def process_start_ms():
     """When this process began, on now_ms's clock, never early. The fake tools exec python3, so
     this is the fork of the process that ran the tool. /proc/self/stat gives its start in whole
-    clock ticks since boot, rounded down, so one tick more; and boot is placed on the wall clock by
-    reading the boot clock first, so that the time between the two reads makes it later, and the
-    least of three such placings is taken, so that a preemption between two of the reads costs
-    nothing unless every placing is preempted, and then only in the late direction."""
+    clock ticks since boot, rounded down, so one tick more; and boot is placed on the monotonic
+    clock by reading the boot clock first, so that the time between the two reads makes it later,
+    and the least of three such placings is taken, so that a preemption between two of the reads
+    costs nothing unless every placing is preempted, and then only in the late direction."""
     with open("/proc/self/stat") as f:
         ticks = int(f.read().rsplit(")", 1)[1].split()[19])
     boot = None
     for _ in range(3):
         since_boot = time.clock_gettime_ns(time.CLOCK_BOOTTIME)
-        placed = time.time_ns() - since_boot
+        placed = time.monotonic_ns() - since_boot
         boot = placed if boot is None else min(boot, placed)
     start = boot + (ticks + 1) * 1_000_000_000 // os.sysconf("SC_CLK_TCK")
     return (start + 999_999) // 1_000_000
@@ -657,6 +673,13 @@ def voice_state(fn):
         return result
 
 
+# The speaker plays a frame after the audio queued before it: the Output keeps about 30 ms queued
+# (status_text's RUNNING delay), so the voice's first frame, logged as first_audio when it is
+# written (internal/audio, Output.next), is heard 30 ms later. A cancel drops the queue, so a
+# speech's sound ends where its cut puts it.
+SPEAKER_QUEUE_MS = 30
+
+
 def speech(tag, start, length, session="session-1", fact=None):
     """The voice speaks: its first frame, the fact sentence, the sound, the speaker's stream line,
     the end of its speech and voice_spoken."""
@@ -665,7 +688,7 @@ def speech(tag, start, length, session="session-1", fact=None):
     # As internal/audio's alsaStream logs it for the hw_params new_case writes (480 and 1920 frames
     # at 48 kHz): period and buffer are time.Durations, which the journal holds in nanoseconds.
     emit(kind="log", due=start, tag=tag, level="INFO", msg="speaker stream", fields={"device": "plughw:CARD=J75,DEV=0", "rate": 48000, "channels": 2, "period": 10_000_000, "buffer": 40_000_000, "rewind": True})
-    emit(kind="sound", start=start, end=start + length, tag=tag)
+    emit(kind="sound", start=start + SPEAKER_QUEUE_MS, end=start + length, tag=tag)
     emit(kind="timing", due=start + length, tag=tag, event="speech_end", session_id=session)
     spoken(tag, start + length, session)
 
@@ -714,6 +737,9 @@ def wake_heard_ms():
 
 
 def react(kind, key, start, end):
+    if "realtime-step" in SCENARIO and not read("realtime-step-at"):
+        # The wall clock steps as the case's first clip begins (wall_ms).
+        write("realtime-step-at", str(start))
     service = json.loads(read("service.json") or "{}")
     if not service.get("voice") or service.get("voice_off") or "sigint" in SCENARIO:
         if kind in ("stop", "talkover", "backchannel"):
@@ -728,11 +754,16 @@ def react(kind, key, start, end):
             # chime (leak-before-chime); just before it, apart (leak-apart-chime); running into it
             # (leak-into-chime; leak-into-quiet-chime adds 70 ms to a quiet chime); or after the
             # chime and before the answer's first audio, apart from both (leak-after-chime).
-            leaks = (("leak-before-chime", 30, 200), ("leak-apart-chime", 60, 100), ("leak-into-chime", 100, 250),
+            leaks = (("leak-before-chime", 30, 200), ("leak-apart-chime", 80, 110), ("leak-into-chime", 100, 250),
                      ("leak-into-quiet-chime", 200, 260), ("leak-after-chime", 700, 800))
             for scenario, leak_start, leak_end in leaks:
                 if scenario in SCENARIO:
                     emit(kind="sound", start=start + leak_start, end=start + leak_end, tag="leaked-word")
+            # leak-before-first: a 20 ms word after the chime, from 80 to 60 ms before the answer's
+            # first_audio, as #146's second review planted it: it ends before the answer can be heard,
+            # and here runs into it, less than silence_ms apart, as one sound.
+            if "leak-before-first" in SCENARIO:
+                emit(kind="sound", start=end + 700 - 80, end=end + 700 - 60, tag="leaked-word")
         wake = start + 150
         chime = 120
         if "late-chime" in SCENARIO:
@@ -959,7 +990,8 @@ def joined_probe(args):
     deadline = time.time() + int(args[args.index("--timeout") + 1]) + 60
 
     def say(step, at, **fields):
-        print(json.dumps(dict(step=step, at=iso(at), **fields)), flush=True)
+        # As cmd/ghost-wispr/joined_probe.go's emit: the wall time and CLOCK_MONOTONIC's.
+        print(json.dumps(dict(step=step, at=iso(at), at_mono_ns=at * 1_000_000, **fields)), flush=True)
 
     t = now_ms()
     say("registered", t, session="probe-session")
@@ -1013,7 +1045,7 @@ def arecord(args):
     if "arecord-start-3s" in SCENARIO:
         time.sleep(max(0, process_start_ms() + 3000 - now_ms()) / 1000)
     # arecord-reopen opens the file for each write and closes it again, so that /proc seldom shows
-    # the driver an open fd and it reads the size with wc.
+    # the driver an open fd and it reads the size with a stat of the file.
     reopen = "arecord-reopen" in SCENARIO
     f = None if reopen else open(path, "wb")
 
@@ -1031,24 +1063,46 @@ def arecord(args):
     # machine holds back between its header and its first read does: the driver's start, read
     # before the header, is then 1.5 s early, and so is every early bound (joined-words-unsure
     # needs over 1 s: its words begin 1 s after the go-ahead). arecord-freeze-8s does the same for
-    # 8 s, and stops the driver for as long, as a machine that holds both back does: a driver
-    # that polls on would give up after 5 s. arecord-hold-200 holds the first sample, and what
-    # follows it, 200 ms before writing any, longer than a real arecord can without an overrun,
-    # so that a start taken from the first sample's landing fails at any load: the driver's start
-    # still comes no later than the sample.
-    frozen = None
+    # 8 s, and stops the driver and its sampler (the process that names this arecord and its file)
+    # for as long, as a machine that holds them all back does: a sampler that polls on would give
+    # up after 5 s. arecord-hold-200 holds the first sample, and what follows it, 200 ms before
+    # writing any, longer than a real arecord can without an overrun, so that a start taken from the
+    # first sample's landing fails at any load: the driver's start still comes no later than the
+    # sample. arecord-locked takes the search right off the file's directory for that hold, so that
+    # every read of its size fails there: a failed read taken for no file yet moves the start into
+    # the hold.
+    frozen = []
     try:
         if "arecord-slow-start" in SCENARIO:
             time.sleep(1.5)
         if "arecord-freeze-8s" in SCENARIO:
-            frozen = os.getppid()
-            os.kill(frozen, signal.SIGSTOP)
-            log_to("arecord-froze", "%d" % frozen)
+            frozen = [os.getppid()]
+            for pid in os.listdir("/proc"):
+                try:
+                    with open("/proc/%s/cmdline" % pid, "rb") as c:
+                        argv = c.read().split(b"\0")
+                except OSError:
+                    continue
+                if pid.isdigit() and int(pid) != os.getpid() and b"record" in argv and path.encode() in argv:
+                    frozen.append(int(pid))
+            for pid in frozen:
+                os.kill(pid, signal.SIGSTOP)
+            log_to("arecord-froze", " ".join(map(str, frozen)))
             time.sleep(8)
-        begun = -(-time.time_ns() // 1_000_000)
+        begun = -(-time.monotonic_ns() // 1_000_000)
         log_to("recordings", "%s %d" % (path, begun))
         if "arecord-hold-200" in SCENARIO:
-            time.sleep(0.2)
+            folder = mode = None
+            if "arecord-locked" in SCENARIO:
+                folder = os.path.dirname(os.path.abspath(path))
+                mode = os.stat(folder).st_mode & 0o7777
+                os.chmod(folder, mode & ~0o111)
+                log_to("arecord-locked", folder)
+            try:
+                time.sleep(0.2)
+            finally:
+                if folder is not None:
+                    os.chmod(folder, mode)
         written = 0
         # From the first clip played after the recording began: arecord-lag makes the file run 1 s
         # behind for 2 s, as an arecord the machine holds back writes late, so that the anchor after
@@ -1075,12 +1129,12 @@ def arecord(args):
             if target > written:
                 put(bytes(target - written))
                 written = target
-                if frozen is not None:
-                    os.kill(frozen, signal.SIGCONT)
-                    frozen = None
+                for pid in frozen:
+                    os.kill(pid, signal.SIGCONT)
+                frozen = []
     finally:
-        if frozen is not None:
-            os.kill(frozen, signal.SIGCONT)
+        for pid in frozen:
+            os.kill(pid, signal.SIGCONT)
 
 
 def ffmpeg(args):
@@ -1174,7 +1228,7 @@ def journalctl(args):
     records = []
     for item in sorted(timeline(), key=lambda item: item.get("due", 0)):
         due = item.get("due", 0)
-        if not since <= due <= t:
+        if not since <= wall_ms(due) <= wall_ms(t):
             continue
         if pids and str(item.get("pid")) not in pids:
             continue
@@ -1184,7 +1238,7 @@ def journalctl(args):
             records.append({"raw": item["text"]})
         elif item["kind"] == "timing":
             # As cmd/ghost-wispr/voice.go's voiceTiming logs it.
-            fields = {"event": item["event"], "session_id": item["session_id"], "at_unix_ns": due * 1_000_000}
+            fields = {"event": item["event"], "session_id": item["session_id"], "at_unix_ns": wall_ms(due) * 1_000_000, "at_mono_ns": due * 1_000_000}
             if item.get("reason"):
                 fields["reason"] = item["reason"]
             records.append(journal_record(due, "INFO", "voice timing", fields))
@@ -1209,7 +1263,7 @@ def journalctl(args):
 def journal_record(due, level, msg, fields):
     """One record for journal-records (deploy/pi/journalrecords), its attributes in the order the
     service logs them."""
-    return {"time_ns": due * 1_000_000, "level": level, "msg": msg, "attrs": [list(pair) for pair in fields.items()]}
+    return {"time_ns": wall_ms(due) * 1_000_000, "level": level, "msg": msg, "attrs": [list(pair) for pair in fields.items()]}
 
 
 # ---- curl: the unit's API, /ws, Dispatch, the Envoy hub and its NATS port ----
@@ -1371,6 +1425,9 @@ def stream():
         for item in due:
             sent.add(item["id"])
             event = {"type": item["event"]["type"], "version": 1, "timestamp": iso(item["due"])}
+            # As internal/server's VoiceEvent: a voice event's time on CLOCK_MONOTONIC too.
+            if event["type"].startswith(("voice_", "agent_")):
+                event["at_mono_ns"] = item["due"] * 1_000_000
             event.update({k: v for k, v in item["event"].items() if k != "type"})
             sys.stdout.write(json.dumps(event))
         sys.stdout.flush()
@@ -1517,56 +1574,14 @@ EOF
 done
 # wc as a loaded machine runs it: with slow-wc, the size it prints is 200 ms old by the time it
 # exits, as a fork that waits for a CPU leaves it. The recording's anchors must not read their size
-# with it, or each would be 200 ms late. With wc-fails-header, a read that would find only the 44-byte
-# header fails instead, as a read that fails while arecord has begun its capture but not yet
-# written a sample; each failure is counted in wc-failed.
+# with it, or each would be 200 ms late.
 real_wc=$(type -P wc)
 cat >"$root/bin/wc" <<EOF
 #!/usr/bin/env bash
 out=\$($(printf '%q' "$real_wc") "\$@") || exit
-if [[ \${GW_FAKE_SCENARIO:-} == *wc-fails-header* && \${out//[[:space:]]/} == 44 ]]; then
-  printf 'x\n' >>"\$GW_FAKE_STATE/wc-failed"
-  printf 'wc: read error\n' >&2
-  exit 1
-fi
 [[ \${GW_FAKE_SCENARIO:-} == *slow-wc* ]] && sleep 0.2
 printf '%s\n' "\$out"
 EOF
-
-# The clock-step cases' python3: to the driver's clock watch (python3 - clock-watch FILE) alone, the
-# system clock steps 1 s forward after its first two readings, as an NTP step shows: its realtime
-# clock jumps and its monotonic clock does not. clock-stepped in the case's state records that it
-# did. Every other python3, the fake's own included, is the real one.
-mkdir -p "$root/clock-step-bin" "$root/clock-step-site"
-cat >"$root/clock-step-site/sitecustomize.py" <<'EOF'
-import os
-import time
-
-_real = time.time_ns
-_calls = 0
-
-
-def _stepped():
-    global _calls
-    _calls += 1
-    if _calls <= 2:
-        return _real()
-    if _calls == 3:
-        with open(os.path.join(os.environ["GW_FAKE_STATE"], "clock-stepped"), "a") as f:
-            f.write("1\n")
-    return _real() + 1_000_000_000
-
-
-time.time_ns = _stepped
-EOF
-cat >"$root/clock-step-bin/python3" <<EOF
-#!/usr/bin/env bash
-if [[ \${1:-} == - && \${2:-} == clock-watch ]]; then
-  PYTHONPATH=$(printf '%q' "$root/clock-step-site")\${PYTHONPATH:+:\$PYTHONPATH} exec $(printf '%q' "$(type -P python3)") "\$@"
-fi
-exec $(printf '%q' "$(type -P python3)") "\$@"
-EOF
-chmod +x "$root/clock-step-bin/python3"
 # sudo as the Pi's ghost-wispr user has it: -n runs the command as root with no password. Unlike
 # sudo, it keeps the environment, which holds each fake command's state.
 cat >"$root/bin/sudo" <<'EOF'
@@ -1636,7 +1651,6 @@ connection.commit()' "$dir/ghost-wispr.db"
 # driver_env DIR SCENARIO: the environment the driver runs in for that case.
 driver_env() {
   local path="$root/bin:$PATH"
-  [[ $2 != *clock-step* ]] || path="$root/clock-step-bin:$path"
   printf '%s\n' "PATH=$path" "GW_FAKE_STATE=$1/state" "GW_FAKE_DB=$1/ghost-wispr.db" "GW_FAKE_TEST_PID=$$" \
     "GW_FAKE_SCENARIO=$2" "GHOST_WISPR_DEPLOY_DIR=$1/deploy" "GHOST_WISPR_ASOUND_ROOT=$1/asound" "TMPDIR=$1/tmp"
   [[ $2 != *asound* ]] || printf '%s\n' "GW_FAKE_ASOUND=$1/asound"
@@ -1709,14 +1723,18 @@ row = sqlite3.connect(sys.argv[1]).execute("SELECT value FROM app_state WHERE ke
 print("missing" if row is None else row[0])' "$1/ghost-wispr.db"
 }
 
-# expect_rc NAME STATUS: the case's driver exited with STATUS. When it did not, the message also
-# gives the fake's stops.log, each stop request and apply with the speech's own times, so that a
-# timing verdict that went wrong shows when each happened.
+# expect_rc NAME STATUS...: the case's driver exited with one of the STATUSes. When it did not, the
+# message also gives the fake's stops.log, each stop request and apply with the speech's own times,
+# so that a timing verdict that went wrong shows when each happened.
 expect_rc() {
-  local got stops=
-  got=$(cat "$root/$1/rc" 2>/dev/null)
-  [[ -s $root/$1/state/stops.log ]] && stops=" the fake's stops: $(tr '\n' '|' <"$root/$1/state/stops.log");"
-  [[ $got == "$2" ]] || check_failed "$1: exit status ${got:-none}, want $2;$stops output: $(tr '\n' '|' <"$root/$1/out")"
+  local name=$1 got stops='' want
+  shift
+  got=$(cat "$root/$name/rc" 2>/dev/null)
+  [[ -s $root/$name/state/stops.log ]] && stops=" the fake's stops: $(tr '\n' '|' <"$root/$name/state/stops.log");"
+  for want in "$@"; do
+    [[ $got == "$want" ]] && return
+  done
+  check_failed "$name: exit status ${got:-none}, want $(printf '%s or ' "$@" | sed 's/ or $//');$stops output: $(tr '\n' '|' <"$root/$name/out")"
 }
 
 expect_line() {
@@ -1850,10 +1868,12 @@ launch wake-lag arecord-lag yes -- --step wake-sound --calls 1 --question @quest
 launch wake-overrun arecord-overrun yes -- --step wake-sound --calls 1 --question @question.wav --rig-mic "$rig" --event-timeout 10
 launch wake-median wake-380 yes -- --step wake-sound --calls 3 --question @question.wav --rig-mic "$rig" --event-timeout 10
 # The median control with an arecord that reads 1.5 s after its header: a median over 300 ms at the
-# late bounds may be under it at the early ones: UNKNOWN, never FAIL. A step of the system clock while
-# the rig records (clock-step, which only the driver's clock watch sees): UNKNOWN.
+# late bounds may be under it at the early ones: UNKNOWN, never FAIL. The pass with the service's
+# wall clock stepped 1 s forward as the call begins (realtime-step): every time the driver compares
+# is on the monotonic clock, so still a pass; timed by the service's wall times, the wake sound
+# came about 1 s before wake_heard.
 launch wake-median-unsure wake-380,arecord-slow-start yes -- --step wake-sound --calls 3 --question @question.wav --rig-mic "$rig" --event-timeout 10
-launch wake-clock-step pass,clock-step yes -- --step wake-sound --calls 1 --question @question.wav --rig-mic "$rig" --event-timeout 10
+launch wake-realtime-step pass,realtime-step yes -- --step wake-sound --calls 1 --question @question.wav --rig-mic "$rig" --event-timeout 10
 launch wake-max late-chime yes -- --step wake-sound --calls 2 --question @question.wav --rig-mic "$rig" --event-timeout 10
 launch wake-no-person pass '' -- --step wake-sound --calls 2 --question @question.wav --rig-mic "$rig"
 launch wake-blind journal-blind yes -- --step wake-sound --calls 2 --question @question.wav --rig-mic "$rig" --event-timeout 10
@@ -1915,9 +1935,10 @@ launch barge-journal-error answer-until-clip,journal-error-after-stop yes -- --s
 launch barge-late answer-until-clip,late-clip yes -- --step barge-in --talkovers 2 --backchannels 2 --question @question.wav --talkover-dir @talkovers --backchannel-dir @backchannels --rig-mic "$rig" --event-timeout 15
 launch barge-backchannel-late answer-until-clip,backchannel-stops,late-clip yes -- --step barge-in --talkovers 1 --backchannels 1 --question @question.wav --talkover-dir @talkovers --backchannel-dir @backchannels --rig-mic "$rig" --event-timeout 15
 # A backchannel that stops the speech, recorded by an arecord that reads 8 s after its header with the
-# driver held up as long (arecord-freeze-8s), as #146's review showed it: every early bound is 8 s
-# early, so the recording cannot show that the silence after the stop came after the clip began:
-# UNKNOWN, never the PASS of a recording end counted from that start.
+# driver and its sampler held up as long (arecord-freeze-8s), as #146's review showed it: every
+# early bound is 8 s early, so the recording cannot show whether the silence after the stop came
+# after the clip began: UNKNOWN, or FAIL where the times still show the stop; never the PASS of a
+# recording end counted from that start.
 launch barge-backchannel-frozen answer-until-clip,backchannel-stops,arecord-freeze-8s yes -- --step barge-in --talkovers 1 --backchannels 1 --question @question.wav --talkover-dir @talkovers --backchannel-dir @backchannels --rig-mic "$rig" --event-timeout 15
 # A 500 ms pause in the speech 1 s into a backchannel (backchannel-pause-500): the speech went on, a
 # pass; with an arecord that reads 1.5 s after its header, the pause may have been a stop's 1 s of
@@ -1960,11 +1981,12 @@ launch cancel-late-stop long,asound,stop-rounds-2,late-clip yes -- $cancel_args
 # shellcheck disable=SC2086
 launch cancel-held-start long,asound,stop-rounds-2,arecord-hold-200 yes -- $cancel_args
 # The same, with an arecord whose fd /proc seldom shows (arecord-reopen), so the driver reads the
-# size with wc, and whose reads fail while only the header is written (wc-fails-header): a failed
-# read moves the start nowhere, so it stays before the header: PASS. A failed read taken for an
-# empty file put the start inside the 200 ms hold: a clean stop read as a leak, FAIL (#146's review).
+# size with a stat of the file, and whose file's directory refuses every read for the hold
+# (arecord-locked): a failed read moves the start nowhere, so it stays before the header: PASS. A
+# failed read taken for no file yet put the start inside the 200 ms hold: a clean stop read as a
+# leak, FAIL (#146's review).
 # shellcheck disable=SC2086
-launch cancel-failed-reads long,asound,stop-rounds-2,arecord-hold-200,arecord-reopen,wc-fails-header yes -- $cancel_args
+launch cancel-locked long,asound,stop-rounds-2,arecord-hold-200,arecord-reopen,arecord-locked yes -- $cancel_args
 # A good cancel with an arecord that reads 1.5 s after its header: the recording cannot show that the
 # rig heard the speech up to the stop: UNKNOWN, never PASS.
 # shellcheck disable=SC2086
@@ -2001,6 +2023,10 @@ launch cancel-leak-apart-chime long,asound,stop-rounds-2,leak-apart-chime yes --
 launch cancel-leak-into-chime long,asound,stop-rounds-2,leak-into-chime yes -- $cancel_args
 # shellcheck disable=SC2086
 launch cancel-leak-after-chime long,asound,stop-rounds-2,leak-after-chime yes -- $cancel_args
+# The word #146's second review planted, 80 to 60 ms before the next answer's first_audio: it starts
+# before the answer can be heard, so FAIL, never the PASS of an allowance before first_audio.
+# shellcheck disable=SC2086
+launch cancel-leak-before-first long,asound,stop-rounds-2,leak-before-first yes -- $cancel_args
 # shellcheck disable=SC2086
 launch cancel-quiet-chime long,asound,stop-rounds-2,quiet-chime yes -- $cancel_args
 # shellcheck disable=SC2086
@@ -2210,7 +2236,7 @@ expect_no_leftovers no-spoken
 
 # A voice event that carries words, or another session's id, fails.
 expect_rc spoken-words 1
-expect_line spoken-words 'FAIL: voice_spoken: carries a field other than type, version, timestamp and session_id: text'
+expect_line spoken-words 'FAIL: voice_spoken: carries a field other than type, version, timestamp, at_mono_ns and session_id: text'
 expect_restored spoken-words
 expect_rc other-session 1
 expect_line other-session 'FAIL: voice_spoken: session_id "session-2", want "session-1" from voice_exchange_started'
@@ -2380,11 +2406,11 @@ expect_rc wake-median-unsure 2
 expect_line wake-median-unsure 'UNKNOWN: wake-sound: the '
 expect_no_line wake-median-unsure 'FAIL: wake-sound: '
 expect_restored wake-median-unsure
-expect_rc wake-clock-step 2
-expect_line wake-clock-step 'UNKNOWN: recording: the system clock stepped by '
-expect_no_line wake-clock-step 'PASS: wake-sound: '
-[[ -s $root/wake-clock-step/state/clock-stepped ]] || check_failed 'wake-clock-step: the clock watch never read the stepped clock'
-expect_restored wake-clock-step
+expect_rc wake-realtime-step 0
+expect_line wake-realtime-step 'PASS: wake-sound: no call passed 400 ms'
+expect_between 'wake-realtime-step: median' "$(measured wake-realtime-step 'wake-sound: median')" 60 280
+[[ -s $root/wake-realtime-step/state/realtime-step-at ]] || check_failed 'wake-realtime-step: the fake service never stepped its wall clock'
+expect_restored wake-realtime-step
 expect_rc wake-max 1
 expect_line wake-max 'FAIL: wake-sound: a call took '
 expect_line wake-max 'more than 400 ms'
@@ -2541,8 +2567,8 @@ expect_line barge-backchannel-late 'FAIL: barge-in: 1 of 1 backchannels stopped 
 expect_no_line barge-backchannel-late 'not counted'
 expect_held barge-backchannel-late 2
 expect_restored barge-backchannel-late
-expect_rc barge-backchannel-frozen 2
-expect_line barge-backchannel-frozen 'UNKNOWN: barge-in: 0 of 1 backchannels stopped the speech, and backchannel rounds 2 may have'
+# FAIL or UNKNOWN, never PASS: how much of the hold the recording's times can see depends on load.
+expect_rc barge-backchannel-frozen 1 2
 expect_no_line barge-backchannel-frozen 'PASS: barge-in: '
 [[ -s $root/barge-backchannel-frozen/state/arecord-froze ]] || check_failed 'barge-backchannel-frozen: the fake arecord did not hold the driver up'
 expect_restored barge-backchannel-frozen
@@ -2576,10 +2602,10 @@ expect_restored cancel-late-stop
 expect_rc cancel-held-start 0
 expect_line cancel-held-start "PASS: playback-cancel: no stop's speech was heard at the rig microphone 20 ms after it"
 expect_restored cancel-held-start
-expect_rc cancel-failed-reads 0
-expect_line cancel-failed-reads "PASS: playback-cancel: no stop's speech was heard at the rig microphone 20 ms after it"
-[[ -s $root/cancel-failed-reads/state/wc-failed ]] || check_failed 'cancel-failed-reads: no read of the size failed, so the case tested none'
-expect_restored cancel-failed-reads
+expect_rc cancel-locked 0
+expect_line cancel-locked "PASS: playback-cancel: no stop's speech was heard at the rig microphone 20 ms after it"
+[[ -s $root/cancel-locked/state/arecord-locked ]] || check_failed 'cancel-locked: the fake arecord never locked its file away, so the case tested no failed read'
+expect_restored cancel-locked
 expect_rc cancel-unsure 2
 expect_line cancel-unsure 'UNKNOWN: playback-cancel stop 1: the rig microphone did not hear the speech up to the stop'
 expect_no_line cancel-unsure "PASS: playback-cancel: no stop's speech was heard"
@@ -2682,6 +2708,11 @@ expect_rc cancel-leak-after-chime 1
 expect_line cancel-leak-after-chime "FAIL: playback-cancel stop 1: a sound at the rig microphone starts "
 expect_line cancel-leak-after-chime "after the next question's chime ends, before its answer's first audio"
 expect_restored cancel-leak-after-chime
+expect_rc cancel-leak-before-first 1
+expect_line cancel-leak-before-first "FAIL: playback-cancel stop 1: a sound at the rig microphone starts "
+expect_line cancel-leak-before-first "after the next question's chime ends, before its answer's first audio"
+expect_no_line cancel-leak-before-first "PASS: playback-cancel: no stop's speech was heard"
+expect_restored cancel-leak-before-first
 expect_rc cancel-quiet-chime 0
 expect_line cancel-quiet-chime "PASS: playback-cancel: no stop's speech was heard at the rig microphone 20 ms after it"
 expect_line cancel-quiet-chime 'NOTE: playback-cancel: calibration: the wake sound played alone (ghost-wispr play-sound) is heard at the rig microphone for 130 ms above -50 dB'
@@ -2816,6 +2847,12 @@ read -r onset_early onset_late <<<"$(joined_onset joined-words-unsure)"
 expect_between "joined-words-unsure: the early bound of the words' onset, from the end of the go-ahead" "$onset_early" -10000 -1
 expect_between "joined-words-unsure: the late bound of the words' onset, from the end of the go-ahead" "$onset_late" 0 5000
 expect_restored joined-words-unsure
+
+# The driver compares times on the monotonic clock only: bash's wall clock serves journalctl's
+# --since alone, so a step of the wall clock can move no time it compares.
+# shellcheck disable=SC2016 # The $ is the driver's, matched literally.
+realtime=$(grep -n 'EPOCHREALTIME\|EPOCHSECONDS\|date +%s' "$driver" | grep -v 'restart_wall_s=\$EPOCHSECONDS$')
+[[ -z $realtime ]] || check_failed "the driver reads the wall clock beyond journalctl's --since: $realtime"
 
 # Neither file names the company (tests/public_literals_test.go's list) or holds an issue key.
 literals=$(awk '

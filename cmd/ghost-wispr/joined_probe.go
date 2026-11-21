@@ -17,6 +17,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/sjawhar/ghost-wispr/internal/envoy"
+	"github.com/sjawhar/ghost-wispr/internal/monoclock"
 	"github.com/sjawhar/ghost-wispr/internal/transcribe"
 )
 
@@ -122,8 +123,15 @@ type probeSender interface {
 	Send(ctx context.Context, request *envoy.SendRequest) (envoy.SendResult, error)
 }
 
+// emit writes one step line: its step, its time on the wall clock (at) and on
+// CLOCK_MONOTONIC (at_mono_ns, which the acceptance driver compares with its
+// own reads of that clock), and fields.
 func (p *joinedProbe) emit(step string, fields map[string]any) {
-	line := map[string]any{"step": step, "at": time.Now().UTC().Format(time.RFC3339Nano)}
+	now := time.Now()
+	line := map[string]any{"step": step, "at": now.UTC().Format(time.RFC3339Nano)}
+	if mono, ok := monoclock.Nanos(now); ok {
+		line["at_mono_ns"] = mono
+	}
 	for k, v := range fields {
 		line[k] = v
 	}

@@ -14,6 +14,7 @@ import (
 	"github.com/sjawhar/ghost-wispr/internal/audio"
 	"github.com/sjawhar/ghost-wispr/internal/config"
 	"github.com/sjawhar/ghost-wispr/internal/googleauth"
+	"github.com/sjawhar/ghost-wispr/internal/monoclock"
 	"github.com/sjawhar/ghost-wispr/internal/server"
 	"github.com/sjawhar/ghost-wispr/internal/voice"
 	"github.com/sjawhar/ghost-wispr/internal/voice/dgagent"
@@ -322,11 +323,16 @@ func (v *voiceSource) warnBuild(enabled bool, warnings *warningsRegistry) {
 
 // voiceTiming writes the Supervisor's timing events to the journal, as the
 // acceptance driver reads them: message "voice timing" (the key logging.New
-// writes), with event, session_id and at_unix_ns.
+// writes), with event, session_id, at_unix_ns, and at_mono_ns, the time on
+// CLOCK_MONOTONIC, which the driver compares with its own reads of that clock
+// (monoclock). A time with no monotonic reading has no at_mono_ns.
 func voiceTiming(logger *slog.Logger) func(event, sessionID string, at time.Time, kv ...any) {
 	return func(event, sessionID string, at time.Time, kv ...any) {
-		attrs := append([]any{"event", event, "session_id", sessionID, "at_unix_ns", at.UnixNano()}, kv...)
-		logger.Info("voice timing", attrs...)
+		attrs := []any{"event", event, "session_id", sessionID, "at_unix_ns", at.UnixNano()}
+		if mono, ok := monoclock.Nanos(at); ok {
+			attrs = append(attrs, "at_mono_ns", mono)
+		}
+		logger.Info("voice timing", append(attrs, kv...)...)
 	}
 }
 

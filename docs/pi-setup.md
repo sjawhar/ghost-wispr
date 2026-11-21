@@ -1001,9 +1001,11 @@ with the unit paused and no session active:
    longer than the wake sound can start between them, and otherwise reports UNKNOWN.
    So an arecord slow to open its device makes no time early, but one held back between its header
    and its first read can make these steps UNKNOWN.
-   A Python process compares the realtime clock with the monotonic clock while each recording runs.
-   The voice writes its own times on the realtime clock. A step of the system clock during a
-   recording makes the step UNKNOWN.
+   Every time the driver compares is on the Pi's monotonic clock (`CLOCK_MONOTONIC`): its own,
+   read by a Python process, and the voice's, which each timing line, `/ws` voice event and test
+   agent step carries as `at_mono_ns`. A step of the system clock (an NTP step, `settimeofday`)
+   moves none of them, so it changes no verdict. The driver uses the wall clock only for
+   journalctl's `--since`. A build whose events lack `at_mono_ns` reads UNKNOWN.
    The rig's times are when each sound reached the rig microphone. A USB microphone captures a
    sound about 1 to 2 ms after it arrives: its converter's filter and the USB audio class transfer,
    which moves audio in 1 ms frames. The driver allows 2 ms for that delay: every early bound comes
