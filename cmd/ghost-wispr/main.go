@@ -470,6 +470,33 @@ type transcriptCallback struct {
 	manager session.LifecycleManager
 	voice   voiceListener
 	stamp   func() (closings int, open bool)
+	// stream is the stream of the socket whose messages this copy hands on,
+	// set once the resilient client gave it one (forStream); nil before.
+	stream *transcribe.Stream
+}
+
+// forStream is c for the messages of the socket with stream
+// (streamedCallback).
+func (c transcriptCallback) forStream(stream *transcribe.Stream) api.LiveMessageCallback {
+	c.stream = stream
+	return c
+}
+
+// admit reports whether a message of c's socket may be handed on, after any
+// wait for a retired socket's last results (transcribe.Stream.Admit). A
+// retired socket's message past its wait is dropped, with the session it
+// would have reached and its time into that socket's stream in the log:
+// handed on, it would reach the session after the next socket's.
+func (c transcriptCallback) admit(kind string, streamSeconds float64) bool {
+	if c.stream == nil || c.stream.Admit() {
+		return true
+	}
+	var sessionID string
+	if active, ok := c.manager.(interface{ ActiveSession() (string, time.Time) }); ok {
+		sessionID, _ = active.ActiveSession()
+	}
+	slog.Warn("deepgram: a replaced socket's message came after its wait for its last results; dropped", "kind", kind, "session_id", sessionID, "stream_seconds", streamSeconds)
+	return false
 }
 
 // voiceListener is the voice as the transcript reader feeds it: the
@@ -479,11 +506,12 @@ type voiceListener interface {
 	OnUtteranceEnd(closings int, gateOpen bool, at time.Time)
 }
 
-// keptMessager is a session manager that reports what of each result its
-// transcript keeps (session.Manager.MessageKept): words from before the latest
-// pause are dropped, and the voice reads exactly what is left.
+// keptMessager is a session manager that takes each result with the stream
+// of the socket that heard it and reports what of it its transcript keeps
+// (session.Manager.MessageKeptOn): words from before the latest pause are
+// dropped, and the voice reads exactly what is left.
 type keptMessager interface {
-	MessageKept(mr *api.MessageResponse) (*api.MessageResponse, error)
+	MessageKeptOn(stream session.LiveStream, mr *api.MessageResponse) (*api.MessageResponse, error)
 }
 
 // The build fails if the session manager stops reporting what its transcript
@@ -491,13 +519,17 @@ type keptMessager interface {
 // a pause included (contract 4, R4).
 var _ keptMessager = (*session.Manager)(nil)
 
-// Message hands a Deepgram result to the session manager, then what the
-// manager's transcript kept of it to the voice, with the capture gate's stamp
-// and the time this callback began handling it, before the manager's work: the
-// SDK runs the callbacks in turn off its one receive loop, so this is
-// callback-entry time, not Deepgram's transport time. On the first words of a
-// recording session the manager's work starts the session.
+// Message hands a Deepgram result to the session manager, with the stream of
+// the socket that heard it, then what the manager's transcript kept of it to
+// the voice, with the capture gate's stamp and the time this callback began
+// handing it on, before the manager's work: the SDK runs the callbacks in
+// turn off the socket's one receive loop, so this is callback time, not
+// Deepgram's transport time. On the first words of a recording session the
+// manager's work starts the session.
 func (c transcriptCallback) Message(mr *api.MessageResponse) error {
+	if !c.admit("result", mr.Start) {
+		return nil
+	}
 	entered := time.Now()
 	var closings int
 	open := true
@@ -509,7 +541,11 @@ func (c transcriptCallback) Message(mr *api.MessageResponse) error {
 	switch manager := c.manager.(type) {
 	case nil:
 	case keptMessager:
-		kept, err = manager.MessageKept(mr)
+		var stream session.LiveStream // nil: the live stream's current socket
+		if c.stream != nil {
+			stream = c.stream
+		}
+		kept, err = manager.MessageKeptOn(stream, mr)
 	default:
 		err = manager.Message(mr)
 	}
@@ -572,6 +608,9 @@ func (c transcriptCallback) SpeechStarted(*api.SpeechStartedResponse) error { re
 // before the manager's work: callback-entry time, not Deepgram's transport time
 // (Message).
 func (c transcriptCallback) UtteranceEnd(ur *api.UtteranceEndResponse) error {
+	if !c.admit("utterance_end", ur.LastWordEnd) {
+		return nil
+	}
 	entered := time.Now()
 	var closings int
 	open := true
@@ -588,8 +627,14 @@ func (c transcriptCallback) UtteranceEnd(ur *api.UtteranceEndResponse) error {
 	return err
 }
 
+// Close logs the socket's end and has the session save the words it holds.
+// A retired socket that ends after its wait for its last results changes
+// nothing: the next socket's results already reach the session.
 func (c transcriptCallback) Close(*api.CloseResponse) error {
 	log.Println("disconnected from Deepgram")
+	if c.stream != nil && !c.stream.Admit() {
+		return nil
+	}
 	if mgr, ok := c.manager.(*session.Manager); ok {
 		mgr.OnTranscriptionDisconnect()
 	}

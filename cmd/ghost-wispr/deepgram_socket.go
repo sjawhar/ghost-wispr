@@ -19,6 +19,7 @@ import (
 
 	"github.com/sjawhar/ghost-wispr/internal/netdial"
 	"github.com/sjawhar/ghost-wispr/internal/providererr"
+	"github.com/sjawhar/ghost-wispr/internal/transcribe"
 )
 
 // deepgramWriteTimeout bounds one write to a Deepgram socket, and is the
@@ -48,21 +49,26 @@ var deepgramOptOut = map[string][]string{"mip_opt_out": {"true"}}
 // has a deadline, the connection has TCP_USER_TIMEOUT so the kernel gives up
 // on unacknowledged data in the same time, and a failed write resets and
 // closes the connection, which ends the socket's reader and keepalive.
-// Messages reach the callback through the SDK's own router.
+// Messages reach the callback through the SDK's own router, rebuilt with the
+// socket's stream once the resilient client gives it one (UseStream).
 type deepgramSocket struct {
-	conn    *websocket.Conn
-	raw     net.Conn
-	router  *websocketv1api.CallbackRouter
-	timeout time.Duration
-	writeMu sync.Mutex
-	closed  atomic.Bool
+	conn     *websocket.Conn
+	raw      net.Conn
+	callback msginterfaces.LiveMessageCallback
+	router   atomic.Pointer[websocketv1api.CallbackRouter]
+	timeout  time.Duration
+	writeMu  sync.Mutex
+	closed   atomic.Bool
 	// ended says CloseStream went out on a graceful close: every write after
 	// it fails, so audio sent after it goes to the next socket (CloseGracefully).
 	ended atomic.Bool
 	done  chan struct{}
-	// relay hands each message on (transcribe.ResultRelay), once the
-	// resilient client set it; until then, a message is handed on directly.
-	relay atomic.Pointer[func(handOn func())]
+}
+
+// streamedCallback is a socket callback that can take its socket's stream:
+// the transcript callback, which hands each result to the session with it.
+type streamedCallback interface {
+	forStream(stream *transcribe.Stream) msginterfaces.LiveMessageCallback
 }
 
 // dialDeepgramLive opens a live-transcription socket to Deepgram with
@@ -113,13 +119,14 @@ func dialDeepgramLive(ctx context.Context, apiKey string, cOptions *interfaces.C
 		return nil, fmt.Errorf("deepgram connect: %w", providererr.From("deepgram", err))
 	}
 	s := &deepgramSocket{
-		conn:    conn,
-		raw:     raw,
-		router:  websocketv1api.NewCallbackRouter(callback),
-		timeout: timeout,
-		done:    make(chan struct{}),
+		conn:     conn,
+		raw:      raw,
+		callback: callback,
+		timeout:  timeout,
+		done:     make(chan struct{}),
 	}
-	_ = s.router.Open(&msginterfaces.OpenResponse{Type: string(msginterfaces.TypeOpenResponse)})
+	s.router.Store(websocketv1api.NewCallbackRouter(callback))
+	_ = s.router.Load().Open(&msginterfaces.OpenResponse{Type: string(msginterfaces.TypeOpenResponse)})
 	go s.read()
 	if cOptions.EnableKeepAlive {
 		go s.keepAlive()
@@ -177,19 +184,13 @@ func (s *deepgramSocket) CloseGracefully(wait time.Duration) error {
 	return nil
 }
 
-// RelayResultsThrough makes the socket hand each message on through relay
-// (transcribe.ResultRelay).
-func (s *deepgramSocket) RelayResultsThrough(relay func(handOn func())) {
-	s.relay.Store(&relay)
-}
-
-// handOn hands one message on, through the relay once there is one.
-func (s *deepgramSocket) handOn(deliver func()) {
-	if relay := s.relay.Load(); relay != nil {
-		(*relay)(deliver)
-		return
+// UseStream hands the socket's messages on with stream, the stream its
+// results are timed in (transcribe.StreamedSocket), when its callback takes
+// one.
+func (s *deepgramSocket) UseStream(stream *transcribe.Stream) {
+	if callback, ok := s.callback.(streamedCallback); ok {
+		s.router.Store(websocketv1api.NewCallbackRouter(callback.forStream(stream)))
 	}
-	deliver()
 }
 
 // endStream sends CloseStream and makes every later write fail, under the
@@ -268,13 +269,11 @@ func (s *deepgramSocket) read() {
 				logSocketEnd(err)
 			}
 			s.abort()
-			s.handOn(func() {
-				_ = s.router.Close(&msginterfaces.CloseResponse{Type: string(msginterfaces.TypeCloseResponse)})
-			})
+			_ = s.router.Load().Close(&msginterfaces.CloseResponse{Type: string(msginterfaces.TypeCloseResponse)})
 			return
 		}
 		if messageType == websocket.TextMessage {
-			s.handOn(func() { _ = s.router.Message(message) })
+			_ = s.router.Load().Message(message)
 		}
 	}
 }

@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"context"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -22,15 +24,17 @@ import (
 )
 
 // namedWord is the first word of a result with the capture clocks read for
-// it while its result was handed on: when it was captured, how far behind
-// the capture it is, and all the audio captured then.
+// it as the session took it: when it was captured, how far behind the
+// capture it is, and all the audio captured then.
 type namedWord struct {
 	text                 string
 	before, since, total time.Duration
+	at                   time.Time
 }
 
 // namedWordClock is a session manager that reads the capture clocks for the
-// first word of each result, as the session manager does.
+// first word of each result on the stream it comes with, as the session
+// manager does (keptMessager).
 type namedWordClock struct {
 	session.LifecycleManager
 	rc    *transcribe.ResilientClient
@@ -38,13 +42,21 @@ type namedWordClock struct {
 }
 
 func (m *namedWordClock) Message(mr *api.MessageResponse) error {
+	_, err := m.MessageKeptOn(nil, mr)
+	return err
+}
+
+func (m *namedWordClock) MessageKeptOn(stream session.LiveStream, mr *api.MessageResponse) (*api.MessageResponse, error) {
 	if len(mr.Channel.Alternatives) == 0 || len(mr.Channel.Alternatives[0].Words) == 0 {
-		return nil
+		return mr, nil
+	}
+	if stream == nil {
+		stream = m.rc
 	}
 	w := mr.Channel.Alternatives[0].Words[0]
 	at := time.Duration(w.Start * float64(time.Second))
-	m.words <- namedWord{w.Word, m.rc.CapturedBefore(at), m.rc.CapturedSince(at), m.rc.Captured()}
-	return nil
+	m.words <- namedWord{w.Word, stream.CapturedBefore(at), stream.CapturedSince(at), stream.Captured(), time.Now()}
+	return mr, nil
 }
 
 // oneWordResult is a final result whose one word is at 10 ms into its
@@ -319,6 +331,182 @@ func retiredSocketNeverAnswered(t *testing.T, trigger retireTrigger) {
 	}
 	port := srv.Listener.Addr().(*net.TCPAddr).Port
 	waitForHardwareWithin(t, time.Second, "one socket to the peer", func() bool { return establishedTo(t, port) == 1 })
+}
+
+// slowOldManager is a session manager that takes the result "old" slowly,
+// until release, and records when each result reached it.
+type slowOldManager struct {
+	session.LifecycleManager
+	entered, release chan struct{}
+	once             sync.Once
+	mu               sync.Mutex
+	words            []string
+	nextAt           time.Time
+}
+
+func (m *slowOldManager) Message(mr *api.MessageResponse) error {
+	if len(mr.Channel.Alternatives) == 0 || len(mr.Channel.Alternatives[0].Words) == 0 {
+		return nil
+	}
+	word := mr.Channel.Alternatives[0].Words[0].Word
+	m.mu.Lock()
+	m.words = append(m.words, word)
+	if word == "next" && m.nextAt.IsZero() {
+		m.nextAt = time.Now()
+	}
+	m.mu.Unlock()
+	if word == "old" {
+		m.once.Do(func() { close(m.entered) })
+		<-m.release
+	}
+	return nil
+}
+
+func (m *slowOldManager) heard() ([]string, time.Time) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return slices.Clone(m.words), m.nextAt
+}
+
+// TestASlowRetiredResultHoldsTheNextSocketsAtMostItsWait fails if the next
+// socket's results wait past the retired socket's 1 s wait, from its
+// retirement, while the session takes a result of the retired socket slowly,
+// as a busy database makes it; or if a retired socket's result reaches the
+// session after the next socket's. It is the sixth review's probe: the old
+// socket answers CloseStream with "old", which the session holds, and "late";
+// the next socket's peer answers its audio with "next".
+func TestASlowRetiredResultHoldsTheNextSocketsAtMostItsWait(t *testing.T) {
+	manager := &slowOldManager{entered: make(chan struct{}), release: make(chan struct{})}
+	release := sync.OnceFunc(func() { close(manager.release) })
+	var handshakes atomic.Int32
+	upgrader := websocket.Upgrader{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		i := handshakes.Add(1)
+		c, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer func() { _ = c.Close() }()
+		for {
+			kind, p, err := c.ReadMessage()
+			if err != nil {
+				return
+			}
+			if i == 1 && kind == websocket.TextMessage && strings.Contains(string(p), "CloseStream") {
+				_ = c.WriteMessage(websocket.TextMessage, oneWordResult("old"))
+				_ = c.WriteMessage(websocket.TextMessage, oneWordResult("late"))
+			}
+			if i == 2 && kind == websocket.BinaryMessage {
+				_ = c.WriteMessage(websocket.TextMessage, oneWordResult("next"))
+			}
+		}
+	}))
+	t.Cleanup(srv.Close)
+	rc := newLiveTranscription(context.Background(), "test-key",
+		&interfaces.ClientOptions{Host: "ws://" + srv.Listener.Addr().String()},
+		constOpts(&interfaces.LiveTranscriptionOptions{Model: "nova-3", Language: "en-US", Encoding: "linear16", SampleRate: 16000, Channels: 1}),
+		transcribe.ResilientConfig{InitialReconnectDelay: time.Millisecond},
+		transcriptCallback{manager: manager}, newWarningsRegistry(), nil)
+	t.Cleanup(func() { _ = rc.Close() })
+	t.Cleanup(release) // before the client's close joins the readers
+	waitForHardwareWithin(t, 3*time.Second, "the first socket", rc.IsConnected)
+	retiredAt := time.Now()
+	rc.OptionsChanged()
+	awaitClosedWithin(t, manager.entered, "the old socket's result never reached the session")
+	waitForHardwareWithin(t, 3*time.Second, "the next socket", func() bool { return handshakes.Load() == 2 && rc.IsConnected() })
+	_, _ = rc.Write(make([]byte, 320))
+	bound := retiredSocketWaitForTest + 300*time.Millisecond
+	waitForHardwareWithin(t, bound+time.Second, "the next socket's result", func() bool { _, at := manager.heard(); return !at.IsZero() })
+	_, nextAt := manager.heard()
+	if waited := nextAt.Sub(retiredAt); waited > bound {
+		t.Errorf("the next socket's result reached the session %v after the retirement, want within the old socket's 1s wait and 300ms: the slow old result held it", waited)
+	}
+	release()
+	time.Sleep(300 * time.Millisecond) // a late retired result would come by now
+	if words, _ := manager.heard(); !slices.Equal(words, []string{"old", "next"}) {
+		t.Errorf("the session heard %q, want the old socket's result, then the next socket's, and no later retired result", words)
+	}
+}
+
+// retiredSocketWaitForTest is the resilient client's wait for a retired
+// socket's last results, which its results hand over within.
+const retiredSocketWaitForTest = time.Second
+
+// stuckRetiree is a socket whose graceful close returns only when it is
+// closed at once, as one whose reader is stuck in the session, and which
+// keeps the stream the client gives it.
+type stuckRetiree struct {
+	stream atomic.Pointer[transcribe.Stream]
+	closed chan struct{}
+	once   sync.Once
+}
+
+func newStuckRetiree() *stuckRetiree { return &stuckRetiree{closed: make(chan struct{})} }
+
+func (s *stuckRetiree) Write(p []byte) (int, error)         { return len(p), nil }
+func (s *stuckRetiree) Close() error                        { s.once.Do(func() { close(s.closed) }); return nil }
+func (s *stuckRetiree) CloseGracefully(time.Duration) error { <-s.closed; return nil }
+func (s *stuckRetiree) UseStream(stream *transcribe.Stream) { s.stream.Store(stream) }
+
+// sessionOf is a session manager in session id that counts the results it
+// takes.
+type sessionOf struct {
+	id       string
+	messages atomic.Int32
+}
+
+func (m *sessionOf) ActiveSession() (string, time.Time)         { return m.id, time.Time{} }
+func (m *sessionOf) Message(*api.MessageResponse) error         { m.messages.Add(1); return nil }
+func (*sessionOf) UtteranceEnd(*api.UtteranceEndResponse) error { return nil }
+func (*sessionOf) ForceEndSession(context.Context) error        { return nil }
+
+// TestARetiredResultAfterItsWaitIsDroppedAndLogged fails if a result of a
+// retired socket, handed over after its wait ran out, still reaches the
+// session, where it would come after the next socket's results; or if the
+// drop leaves no log line with the session and the result's time into its
+// socket's stream.
+func TestARetiredResultAfterItsWaitIsDroppedAndLogged(t *testing.T) {
+	old, next := newStuckRetiree(), newStuckRetiree()
+	sockets := []io.WriteCloser{old, next}
+	var dials atomic.Int32
+	factory := func(context.Context) (io.WriteCloser, error) { return sockets[dials.Add(1)-1], nil }
+	rc := transcribe.NewResilientClient(context.Background(), factory, transcribe.ResilientConfig{InitialReconnectDelay: time.Millisecond, MaxReconnectBackoff: time.Millisecond}, nil, nil)
+	t.Cleanup(func() { _ = rc.Close() })
+	rc.ConnectInBackground()
+	waitForHardwareWithin(t, 3*time.Second, "the first socket", func() bool { return dials.Load() == 1 && rc.IsConnected() })
+	rc.OptionsChanged() // the old socket retires; its close never returns
+	waitForHardwareWithin(t, 3*time.Second, "the next socket", func() bool { return dials.Load() == 2 && rc.IsConnected() })
+	retired := old.stream.Load()
+	if retired == nil {
+		t.Fatal("the client gave the old socket no stream")
+	}
+	time.Sleep(retiredSocketWaitForTest + 200*time.Millisecond) // the old socket's wait runs out
+
+	var logged bytes.Buffer
+	original := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logged, nil)))
+	t.Cleanup(func() { slog.SetDefault(original) })
+	manager := &sessionOf{id: "20261121090000"}
+	callback := transcriptCallback{manager: manager, stream: retired}
+	late := deepgramResult(t, `{"type":"Results","is_final":true,"start":2.5,"duration":1,"channel":{"alternatives":[{"transcript":"Late.","words":[{"word":"late","start":2.6,"end":2.9}]}]}}`)
+	if err := callback.Message(late); err != nil {
+		t.Fatal(err)
+	}
+	if n := manager.messages.Load(); n != 0 {
+		t.Errorf("the session took %d results of the retired socket after its wait, want none", n)
+	}
+	line := logged.String()
+	for _, want := range []string{"dropped", "session_id=20261121090000", "stream_seconds=2.5"} {
+		if !strings.Contains(line, want) {
+			t.Errorf("the log %q does not say %q", line, want)
+		}
+	}
+
+	// Control: the next socket's result reaches the session.
+	callback.stream = next.stream.Load()
+	if err := callback.Message(late); err != nil || manager.messages.Load() != 1 {
+		t.Errorf("control: the next socket's result reached the session %d times (%v), want once", manager.messages.Load(), err)
+	}
 }
 
 // TestAGracefulCloseEndsWithinItsWaitWhileAWriteIsStuck fails if a socket's

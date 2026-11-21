@@ -62,14 +62,14 @@ type GracefulCloser interface {
 	CloseGracefully(wait time.Duration) error
 }
 
-// ResultRelay is a socket that hands its results on through relay, which the
-// client gives it once the socket is dialled: relay runs handOn, the handing
-// on of one result, with CapturedSince and CapturedBefore timing points of
-// that socket's own stream. A socket that retired, replaced though healthy,
-// returns its last results while the next socket is live (retire), and the
-// words in them are times into its own stream, not its successor's.
-type ResultRelay interface {
-	RelayResultsThrough(relay func(handOn func()))
+// StreamedSocket is a socket whose results are timed in its own stream: once
+// the client dialled it, it gives the socket that Stream (UseStream), and the
+// socket hands each result on with it, once Stream.Admit lets it. A socket
+// that retired, replaced though healthy, returns its last results while the
+// next socket is live (retire), and the words in them are times into its own
+// stream, not its successor's.
+type StreamedSocket interface {
+	UseStream(stream *Stream)
 }
 
 // ClientFactory is a function type that creates a new Deepgram client.
@@ -193,16 +193,10 @@ type ResilientClient struct {
 	accepted int64
 	origin   int64
 	// current is the stream of the current Client, until it retires, and
-	// relaying the stream of the socket whose result is being handed on
-	// (relayFor), if any: CapturedSince and CapturedBefore time points of
-	// relaying's stream while it is set. relayMu hands on one result at a
-	// time, so relaying names one socket. retired are the sockets that
-	// retired and may still return their last results (retire). Guarded by
-	// Mu, but relayMu.
-	current  *socketStream
-	relaying *socketStream
-	retired  []*retiredSocket
-	relayMu  sync.Mutex
+	// retired are the sockets that retired and may still return their last
+	// results (retire). Guarded by Mu.
+	current *Stream
+	retired []*retiredSocket
 	// queuedAhead reports the bytes an AsyncSender in front of the client
 	// holds (watchSendQueue), nil without one; drops the audio it dropped that
 	// a word on the current socket can still come before (sendQueueDropped);

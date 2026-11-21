@@ -26,19 +26,19 @@ type gatedManager struct {
 }
 
 func (g *gatedManager) Message(mr *api.MessageResponse) error {
-	_, err := g.MessageKept(mr)
+	_, err := g.MessageKeptOn(nil, mr)
 	return err
 }
 
-// MessageKept is the path the transcript callback takes when the manager
+// MessageKeptOn is the path the transcript callback takes when the manager
 // reports what its transcript keeps (keptMessager), so the gate sits here.
-func (g *gatedManager) MessageKept(mr *api.MessageResponse) (*api.MessageResponse, error) {
+func (g *gatedManager) MessageKeptOn(stream session.LiveStream, mr *api.MessageResponse) (*api.MessageResponse, error) {
 	if !g.waited && len(mr.Channel.Alternatives) > 0 && mr.Channel.Alternatives[0].Transcript != "" {
 		g.waited = true
 		close(g.entered)
 		<-g.gate
 	}
-	return g.Manager.MessageKept(mr)
+	return g.Manager.MessageKeptOn(stream, mr)
 }
 
 // TestClosingLiveTranscriptionWhileItHandsOnAResultReturns fails if closing

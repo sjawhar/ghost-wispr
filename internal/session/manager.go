@@ -130,17 +130,25 @@ func (m *Manager) Message(mr *api.MessageResponse) error {
 	return err
 }
 
-// MessageKept takes a Deepgram live result into the live transcript, and
-// returns the part of it the transcript keeps: mr itself; a copy without its
-// leading words from before the floor (afterFloorLocked), whose Transcript is
-// rebuilt from the words kept, whose Words is a subslice of mr's, and whose
-// other fields are mr's, to be read only; or nil when it keeps nothing. It
-// also returns nil, and shows the page nothing, when capture was paused or
-// resumed while it took mr: such words are from before the pause, and go at
-// most to the session the pause ends, never to a later one. The voice reads
-// the result it returns, so no word from before a pause, or from an ended
-// recording, can wake it.
+// MessageKept is MessageKeptOn for a result of the live stream's current
+// socket (SetLiveStream).
 func (m *Manager) MessageKept(mr *api.MessageResponse) (*api.MessageResponse, error) {
+	return m.MessageKeptOn(nil, mr)
+}
+
+// MessageKeptOn takes a Deepgram live result, timed in stream, the stream of
+// the socket that heard it, into the live transcript; a nil stream is the
+// live stream's (SetLiveStream). It returns the part of the result the
+// transcript keeps: mr itself; a copy without its leading words from before
+// the floor (afterFloorLocked), whose Transcript is rebuilt from the words
+// kept, whose Words is a subslice of mr's, and whose other fields are mr's,
+// to be read only; or nil when it keeps nothing. It also returns nil, and
+// shows the page nothing, when capture was paused or resumed while it took
+// mr: such words are from before the pause, and go at most to the session
+// the pause ends, never to a later one. The voice reads the result it
+// returns, so no word from before a pause, or from an ended recording, can
+// wake it.
+func (m *Manager) MessageKeptOn(stream LiveStream, mr *api.MessageResponse) (*api.MessageResponse, error) {
 	if mr.FromFinalize {
 		// After the words below are buffered or saved, so a waiter ending the
 		// session on this signal saves them too.
@@ -153,7 +161,10 @@ func (m *Manager) MessageKept(mr *api.MessageResponse) (*api.MessageResponse, er
 		return nil, nil
 	}
 	m.mu.Lock()
-	kept := m.afterFloorLocked(mr)
+	if stream == nil {
+		stream = m.stream
+	}
+	kept := m.afterFloorLocked(stream, mr)
 	m.mu.Unlock()
 	if kept == nil {
 		if mr.IsFinal {
@@ -161,13 +172,13 @@ func (m *Manager) MessageKept(mr *api.MessageResponse) (*api.MessageResponse, er
 		}
 		return nil, nil
 	}
-	m.holdPreroll(heardFrom(kept, liveWords(kept)))
+	m.holdPreroll(stream, heardFrom(kept, liveWords(kept)))
 
 	// Take the words: place them again, as a resume or the end of a session
 	// may have moved the floor since, and buffer a final's, in one step under
 	// m.mu, which ResumeCapture and the end also hold.
 	m.mu.Lock()
-	kept = m.afterFloorLocked(kept)
+	kept = m.afterFloorLocked(stream, kept)
 	resumes := m.resumes
 	if kept != nil && mr.IsFinal {
 		words := liveWords(kept)
@@ -175,7 +186,7 @@ func (m *Manager) MessageKept(mr *api.MessageResponse) (*api.MessageResponse, er
 			// No word timings: one word for the whole sentence (Fix #7).
 			words = []transcribe.Word{{PunctuatedWord: strings.TrimSpace(kept.Channel.Alternatives[0].Transcript)}}
 		}
-		m.timeCapturedLocked(words)
+		m.timeCapturedLocked(stream, words)
 		m.buffer.AddWords(words)
 	}
 	m.mu.Unlock()
@@ -254,19 +265,19 @@ func liveWords(mr *api.MessageResponse) []transcribe.Word {
 }
 
 // timeCapturedLocked sets when each word was captured (Word.CapturedStart,
-// Word.CapturedMid) from its times into the live stream, while the session
-// takes its result: the stream is then that of the socket that heard it, so
-// a reconnect before the word is placed (splitAtCloseLocked,
-// raiseFloorToCloseLocked) cannot read it against another socket's stream.
-// It must be called with m.mu held; the live stream never takes m.mu.
-func (m *Manager) timeCapturedLocked(words []transcribe.Word) {
-	if m.stream == nil {
+// Word.CapturedMid) from its times into stream, the stream of the socket
+// that heard it, while the session takes its result, so a reconnect before
+// the word is placed (splitAtCloseLocked, raiseFloorToCloseLocked) cannot
+// read it against another socket's stream. It must be called with m.mu held;
+// the stream never takes m.mu.
+func (m *Manager) timeCapturedLocked(stream LiveStream, words []transcribe.Word) {
+	if stream == nil {
 		return
 	}
 	for i := range words {
 		word := &words[i]
-		word.CapturedStart = m.stream.CapturedBefore(time.Duration(word.Start * float64(time.Second)))
-		word.CapturedMid = m.stream.CapturedBefore(time.Duration((word.Start + word.End) / 2 * float64(time.Second)))
+		word.CapturedStart = stream.CapturedBefore(time.Duration(word.Start * float64(time.Second)))
+		word.CapturedMid = stream.CapturedBefore(time.Duration((word.Start + word.End) / 2 * float64(time.Second)))
 	}
 }
 
@@ -282,22 +293,21 @@ func heardFrom(mr *api.MessageResponse, words []transcribe.Word) time.Duration {
 }
 
 // holdPreroll makes the next session's recording start before the words
-// Deepgram heard from at into the live stream, while no session is open or
-// the current one is ending: the words open a session only at the end of
-// their speech (flushBuffer), or once the ending session has ended,
-// Deepgram can hear them late, as after a reconnect, and the recording must
-// hold them from the first, as the live transcript does. The live stream
-// (SetLiveStream) says how long ago they were captured; without one, they are
+// Deepgram heard from at into stream, the stream of the socket that heard
+// them, while no session is open or the current one is ending: the words open
+// a session only at the end of their speech (flushBuffer), or once the ending
+// session has ended, Deepgram can hear them late, as after a reconnect, and
+// the recording must hold them from the first, as the live transcript does.
+// The stream says how long ago they were captured; without one, they are
 // taken as captured now. The recorder holds nothing while a recording is
 // open, and keeps no audio of one that closed. While capture is paused it
 // holds nothing: the resume drops that audio.
-func (m *Manager) holdPreroll(at time.Duration) {
+func (m *Manager) holdPreroll(stream LiveStream, at time.Duration) {
 	if m.recorder == nil {
 		return
 	}
 	m.mu.Lock()
 	idle := (m.currentSessionID == "" || m.endingSession) && !m.capturePaused
-	stream := m.stream
 	m.mu.Unlock()
 	if !idle {
 		return
@@ -1379,39 +1389,39 @@ func (m *Manager) raiseFloorToCloseLocked() {
 	m.buffer.PutBack(kept)
 }
 
-// beforeFloorLocked reports whether the point at seconds into the live
-// stream was captured before the floor. It must be called with m.mu held.
-func (m *Manager) beforeFloorLocked(at float64) bool {
-	if m.stream == nil || m.floor <= 0 {
+// beforeFloorLocked reports whether the point at seconds into stream was
+// captured before the floor. It must be called with m.mu held.
+func (m *Manager) beforeFloorLocked(stream LiveStream, at float64) bool {
+	if stream == nil || m.floor <= 0 {
 		return false
 	}
-	return m.stream.CapturedBefore(time.Duration(at*float64(time.Second))) < m.floor
+	return stream.CapturedBefore(time.Duration(at*float64(time.Second))) < m.floor
 }
 
-// afterFloorLocked returns result mr without its words captured before the
-// floor: mr itself when it has none, nil when it has nothing else, and else a
-// copy that keeps only the later words, with its Transcript rebuilt from them
-// (MessageKept). The floor is the latest capture resume, or the close of the
-// last recording whose session has ended, whichever is later. Deepgram lags
-// the microphone after an outage, so a pause's Finalize finalizes only what it
-// has reached, and its results for the last words before a pause or a close
-// can come after it, even in one result with the first words after it. A word
-// is placed by its middle. A result without word times cannot be split, so it
-// is dropped whole when its audio starts before the floor; that can drop a
-// few words spoken after it. With no live stream, or no floor yet, it keeps
-// every word. mr must have an alternative. It must be called with m.mu held;
-// the live stream never takes m.mu.
-func (m *Manager) afterFloorLocked(mr *api.MessageResponse) *api.MessageResponse {
+// afterFloorLocked returns result mr, timed in stream, without its words
+// captured before the floor: mr itself when it has none, nil when it has
+// nothing else, and else a copy that keeps only the later words, with its
+// Transcript rebuilt from them (MessageKeptOn). The floor is the latest
+// capture resume, or the close of the last recording whose session has
+// ended, whichever is later. Deepgram lags the microphone after an outage, so
+// a pause's Finalize finalizes only what it has reached, and its results for
+// the last words before a pause or a close can come after it, even in one
+// result with the first words after it. A word is placed by its middle. A
+// result without word times cannot be split, so it is dropped whole when its
+// audio starts before the floor; that can drop a few words spoken after it.
+// With no stream, or no floor yet, it keeps every word. mr must have an
+// alternative. It must be called with m.mu held; the stream never takes m.mu.
+func (m *Manager) afterFloorLocked(stream LiveStream, mr *api.MessageResponse) *api.MessageResponse {
 	words := mr.Channel.Alternatives[0].Words
 	if len(words) == 0 {
-		if m.beforeFloorLocked(mr.Start) {
+		if m.beforeFloorLocked(stream, mr.Start) {
 			return nil
 		}
 		return mr
 	}
 	// Deepgram gives a result's words in the order they were spoken.
 	dropped := 0
-	for dropped < len(words) && m.beforeFloorLocked((words[dropped].Start+words[dropped].End)/2) {
+	for dropped < len(words) && m.beforeFloorLocked(stream, (words[dropped].Start+words[dropped].End)/2) {
 		dropped++
 	}
 	if dropped == 0 {
