@@ -723,6 +723,96 @@ func TestPausedMicIsNotReopenedAfterOverflow(t *testing.T) {
 	}
 }
 
+// TestARestartRaceOpensTheMicOnlyUnderRed fails if, when a pause and a
+// resume both come during the mic loop's wait after an input overflow, the
+// microphone opens, or audio reaches the gate, without the light confirmed
+// red: a confirmation the light refuses must leave the microphone closed and
+// no audio passing, however often the loop tries again. The converse, red
+// confirmed, opens the microphone once, after the confirmation, and its audio
+// passes. The red confirmation is the gate's own (beforeMicStart, the unit's
+// recording light); each one is a "red" event among the device's calls.
+func TestARestartRaceOpensTheMicOnlyUnderRed(t *testing.T) {
+	for _, refused := range []bool{true, false} {
+		t.Run(fmt.Sprintf("red refused %v", refused), func(t *testing.T) {
+			capture := newCaptureGate(nil, nil, nil)
+			mic := newScriptedMic()
+			mic.streamErrs = []error{errors.New("Input overflowed")}
+			var refuse atomic.Bool
+			var refusals atomic.Int64
+			capture.beforeMicStart = func() error {
+				if refuse.Load() {
+					refusals.Add(1)
+					return errors.New("the light did not read back red")
+				}
+				mic.events <- "red"
+				return nil
+			}
+			var waits atomic.Int64
+			wait := func(time.Duration) {
+				if waits.Add(1) > 1 {
+					time.Sleep(5 * time.Millisecond) // a later backoff
+					return
+				}
+				// The overflow wait: the light stops confirming red, and a
+				// pause and a resume both come before the loop looks.
+				refuse.Store(refused)
+				pauseThenResume(capture, true)()
+			}
+			gate := &lockedBuffer{}
+			capture.Pause()
+			runMicLoop(t, capture, mic, gate, wait, nil)
+			mic.expectEvents(t, "close")
+			capture.Resume()
+			mic.expectEvents(t, "red", "open", "stream", "close") // opened under red; the overflow
+
+			if refused {
+				// The loop tries again and again; read every device call it
+				// makes meanwhile.
+				for window := time.After(300 * time.Millisecond); ; {
+					select {
+					case got := <-mic.events:
+						if got != "close" {
+							t.Fatalf("device call %q with the light refusing red, want none but closes", got)
+						}
+						continue
+					case <-window:
+					}
+					break
+				}
+				if n := refusals.Load(); n < 3 {
+					t.Fatalf("control: %d refused confirmations after the race, want the loop to have tried at least 3 times", n)
+				}
+				if n := gate.Len(); n != 0 {
+					t.Fatalf("%d bytes reached the gate with the light refusing red, want none", n)
+				}
+				return
+			}
+			select {
+			case got := <-mic.events:
+				if got != "red" {
+					t.Fatalf("device call %q before the red confirmation", got)
+				}
+			case <-time.After(testWait):
+				t.Fatal("no red confirmation after the race")
+			}
+			select {
+			case got := <-mic.events:
+				if got != "open" && got != "reopen" {
+					t.Fatalf("device call %q after the red confirmation, want the microphone's one open", got)
+				}
+			case <-time.After(testWait):
+				t.Fatal("the microphone did not open after the red confirmation")
+			}
+			mic.expectEvents(t, "stream")
+			mic.capture(t, []byte{1, 2, 3})
+			if n := gate.Len(); n != 3 {
+				t.Fatalf("%d bytes reached the gate, want the 3 captured under red", n)
+			}
+			mic.expectNoEvents(t)
+		})
+	}
+}
+
 // If the device cannot open on resume (unplugged during the pause), the mic
 // loop holds no input device through the backoff, and falls back to the
 // reconnect path, which re-initializes PortAudio.
