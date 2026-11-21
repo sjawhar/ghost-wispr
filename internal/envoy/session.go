@@ -329,6 +329,10 @@ func OpenSession(ctx context.Context, listener *Listener, cfg *SessionConfig) (*
 		nats.Name("ghost-wispr "+cfg.SessionID),
 		nats.MaxReconnects(-1),
 		nats.ReconnectWait(2*time.Second),
+		// Every write and flush to NATS gives up after natsWriteTimeout, so a
+		// peer that stops reading holds no publish, flush or close for the
+		// client's default minute.
+		nats.FlusherTimeout(natsWriteTimeout),
 		nats.ReconnectHandler(func(*nats.Conn) { session.reconnected() }),
 		nats.DisconnectErrHandler(func(_ *nats.Conn, err error) {
 			if err != nil {
@@ -392,6 +396,10 @@ func (s *Session) abandon(conn *nats.Conn) {
 // first registration.
 const openTimeout = 15 * time.Second
 
+// natsWriteTimeout bounds each write and flush to the NATS connection
+// (nats.FlusherTimeout).
+const natsWriteTimeout = 5 * time.Second
+
 // ID is the session's id.
 func (s *Session) ID() string { return s.cfg.SessionID }
 
@@ -411,8 +419,9 @@ func (s *Session) enter() bool {
 // listener relays to it; Close waits for that registration. After Close it
 // registers nothing.
 func (s *Session) reconnected() {
+	epoch := randomID() // read from the operating system, without s.mu
 	s.mu.Lock()
-	s.epoch = randomID()
+	s.epoch = epoch
 	s.mu.Unlock()
 	if !s.enter() {
 		return
@@ -543,18 +552,21 @@ func (s *Session) flushResume() {
 		return
 	}
 	s.saveMu.Lock()
-	defer s.saveMu.Unlock()
 	s.mu.Lock()
 	point := s.resume
 	s.mu.Unlock()
 	if point == nil || (s.saved != nil && *s.saved == *point) {
+		s.saveMu.Unlock()
 		return
 	}
-	if err := s.cfg.SaveResume(*point); err != nil {
+	err := s.cfg.SaveResume(*point)
+	if err == nil {
+		s.saved = point
+	}
+	s.saveMu.Unlock()
+	if err != nil { // logged without saveMu: a log write can wait
 		s.logger.Warn("envoy session could not save its resume point", "error", err)
-		return
 	}
-	s.saved = point
 }
 
 // handle answers one relay message: a probe done at once, a frame that does
@@ -730,10 +742,12 @@ func (s *Session) Send(ctx context.Context, request *SendRequest) (SendResult, e
 // Close stops the heartbeat, cancels and waits within ctx for each
 // registration and relay frame under way, which may save the resume point
 // (an interrupted frame is answered nak and comes again), removes this
-// process's registration and closes the NATS connection. At ctx's end it
-// closes the connection and returns ctx's cause without removing the
-// registration: the work still under way ends behind it, and a store write
-// it makes after the unit closed its store is refused there (storage).
+// process's registration and closes the NATS connection, all within ctx. At
+// ctx's end it returns ctx's cause: the work still under way ends behind it,
+// and a store write it makes after the unit closed its store is refused
+// there (storage); the registration is not removed; and the connection's
+// close, which flushes to a peer that may have stopped reading, goes on
+// behind it too, each of its writes bounded by natsWriteTimeout (closeConn).
 func (s *Session) Close(ctx context.Context) error {
 	s.mu.Lock()
 	if s.closed {
@@ -745,11 +759,7 @@ func (s *Session) Close(ctx context.Context) error {
 	conn := s.conn
 	s.mu.Unlock()
 	s.endLife()
-	defer func() {
-		if conn != nil {
-			conn.Close()
-		}
-	}()
+	defer s.closeConn(ctx, conn)
 	ended := make(chan struct{})
 	go func() {
 		s.stopped.Wait()
@@ -761,6 +771,27 @@ func (s *Session) Close(ctx context.Context) error {
 		return fmt.Errorf("envoy: the session's work still runs at its close's deadline: %w", context.Cause(ctx))
 	}
 	return s.do(ctx, http.MethodDelete, "/v1/sessions/"+s.cfg.SessionID, url.Values{"client_instance_id": {s.clientInstanceID}}, nil, nil)
+}
+
+// closeConn closes conn, which may be nil, and waits for the close within
+// ctx. NATS's Close flushes what is queued, under the connection's lock,
+// which a write to a peer that stopped reading also holds; at ctx's end the
+// close goes on behind it, and the process's exit ends it if it is still
+// waiting.
+func (s *Session) closeConn(ctx context.Context, conn *nats.Conn) {
+	if conn == nil {
+		return
+	}
+	closed := make(chan struct{})
+	go func() {
+		defer close(closed)
+		conn.Close()
+	}()
+	select {
+	case <-closed:
+	case <-ctx.Done():
+		s.logger.Warn("envoy session's NATS connection still closing at its close's deadline; it closes behind it", "error", context.Cause(ctx))
+	}
 }
 
 func randomID() string {

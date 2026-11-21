@@ -34,6 +34,26 @@ func stopServing(ctx context.Context, server *http.Server, wait time.Duration) {
 	}
 }
 
+// closeWithin runs closeConn, a network close in the shutdown, on a
+// goroutine of its own and waits for it within ctx, and reports whether it
+// ended. A close can wait on its peer, as a websocket's close frame waits for
+// a peer that stopped reading; at ctx's end the shutdown waits no longer,
+// and the close goes on behind it until the process exits.
+func closeWithin(ctx context.Context, what string, closeConn func()) bool {
+	closed := make(chan struct{})
+	go func() {
+		defer close(closed)
+		closeConn()
+	}()
+	select {
+	case <-closed:
+		return true
+	case <-ctx.Done():
+		slog.Warn(what+" still closing at the shutdown's deadline; the process exit ends it", "error", context.Cause(ctx))
+		return false
+	}
+}
+
 // closingStore is the store as the shutdown closes it.
 type closingStore interface {
 	CloseWithin(ctx context.Context) error

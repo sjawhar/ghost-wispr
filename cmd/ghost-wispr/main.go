@@ -2204,7 +2204,8 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 	recovery.stop(shutdownCtx, manager, lifecyclePublishWait)
 
 	if dgStop != nil {
-		dgStop()
+		// Its websocket's close can wait on Deepgram: within the deadline.
+		closeWithin(shutdownCtx, "the Deepgram connection", dgStop)
 	}
 	if mic := micRef.Load(); mic != nil && micLoopsEnded {
 		_ = mic.Stop()
