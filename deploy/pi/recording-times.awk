@@ -9,9 +9,12 @@
 # before it started arecord. ANCHORS holds "US BYTES" lines: by the driver's clock US, read just after
 # the file's size, BYTES of the file were written. SILENCEDETECT is ffmpeg's silencedetect report.
 #
-# It prints a line for each sound, "sound ON_MS OFF_MS LENGTH_US" (its onset and end on the driver's
-# clock, and its length in the file), then "end END_MS", the latest driver's time before which the
-# recording shows every sound that starts. When a time cannot be bounded it prints "error REASON".
+# It prints a line for each sound, "sound ON_MS OFF_MS LENGTH_US ON_EARLY_MS OFF_EARLY_MS" (its onset
+# and end on the driver's clock, never early; its length in the file; and its onset and end again,
+# never late), then "end END_MS", the latest driver's time before which the recording shows every
+# sound that starts. When a time cannot be bounded it prints "error REASON". The true time of an
+# onset or an end lies between its two bounds: the late one minus the early one is how late the
+# anchors that bound it may have been read, which a check that decides on the time must allow for.
 #
 # A sample in the file was captured before any anchor whose bytes hold it was read. Between a place p
 # in the file and an anchor's place P after it, the sound card's clock, within 200 ppm of the driver's
@@ -22,6 +25,13 @@
 # division and every printed value is rounded in the late direction: up for a time, and up by the
 # printed precision for a place ffmpeg reports. The end is bounded from below the same way, from
 # started_us: the place the analysis still sees a sound start, less 200 ppm.
+#
+# The early bound of a place p comes from started_us alone: the file's first sample was captured no
+# earlier, and the card took at least p * (1 - 1/5000) of the driver's time to reach p, longer if an
+# overrun lost audio. An anchor bounds nothing from below: a sample can sit captured in arecord's
+# buffer before it reaches the file. So the early bound is early by the time arecord took to start
+# and by up to 200 ppm of the time into the recording; it is rounded in the early direction: the
+# place down by its printed precision, and the time down to the millisecond.
 
 function ceil_div(a, b) { return int((a + b - 1) / b) }
 
@@ -59,6 +69,12 @@ function late_us(p,    j, k, d, u, best) {
   return best
 }
 
+# early_ms PLACE_US UNIT: the time of the place PLACE_US, printed to UNIT microseconds, never late.
+function early_ms(p, u,    q) {
+  q = p - u
+  if (q < 0) q = 0
+  return int((started_us + q - ceil_div(q, ppm_div)) / 1000)
+}
 BEGIN {
   if (ppm_div == "") ppm_div = 5000
   samples = int((bytes - header) / frame)
@@ -83,6 +99,7 @@ FILENAME == ARGV[1] {
   sub(/[^-0-9.eE+].*/, "", value)
   starts++
   start_raw[starts] = place_us(value)
+  start_unit[starts] = unit
   start_late[starts] = start_raw[starts] + unit
   if (unit > max_unit) max_unit = unit
 }
@@ -93,11 +110,14 @@ FILENAME == ARGV[1] {
   sub(/[^-0-9.eE+].*/, "", value)
   ends++
   end_raw[ends] = place_us(value)
+  end_unit[ends] = unit
   end_late[ends] = end_raw[ends] + unit
   if (unit > max_unit) max_unit = unit
 }
 
-function sound(on, off,    a, b, both) {
+# sound ON OFF ON_RAW ON_UNIT OFF_RAW OFF_UNIT: print the sound from ON to OFF, places never early,
+# and their early bounds from the places as printed (RAW) and their precision (UNIT).
+function sound(on, off, on_raw, on_unit, off_raw, off_unit,    a, b, both) {
   a = late_us(on)
   both = bounded
   b = late_us(off)
@@ -107,7 +127,8 @@ function sound(on, off,    a, b, both) {
     return
   }
   # %.0f, not print: an awk such as mawk prints a large number in %.6g.
-  printf "sound %.0f %.0f %.0f\n", ceil_div(a, 1000), ceil_div(b, 1000), off - on
+  printf "sound %.0f %.0f %.0f %.0f %.0f\n", ceil_div(a, 1000), ceil_div(b, 1000), off - on, \
+    early_ms(on_raw, on_unit), early_ms(off_raw, off_unit)
 }
 
 END {
@@ -116,9 +137,12 @@ END {
   # A sound runs from where a silence ends (or from the start) to where the next silence starts (or
   # to the end). A silence that starts within 0.5 ms of the start is ffmpeg's own, as is the end it
   # gives a silence at the end of the file: neither starts a sound.
-  if (starts == 0 || start_raw[1] > 500) sound(0, starts > 0 ? start_late[1] : end_us)
+  if (starts == 0 || start_raw[1] > 500)
+    sound(0, starts > 0 ? start_late[1] : end_us, 0, 0, starts > 0 ? start_raw[1] : duration_us, starts > 0 ? start_unit[1] : 0)
   for (i = 1; i <= ends && !failed; i++)
-    if (end_raw[i] < duration_us - 20000) sound(end_late[i], i < starts ? start_late[i + 1] : end_us)
+    if (end_raw[i] < duration_us - 20000)
+      sound(end_late[i], i < starts ? start_late[i + 1] : end_us, end_raw[i], end_unit[i], \
+        i < starts ? start_raw[i + 1] : duration_us, i < starts ? start_unit[i + 1] : 0)
   if (failed) exit
   # Every sound that truly starts before seen_us is reported: a printed place errs by less than its
   # unit, and the report leaves out the last 20 ms.

@@ -144,7 +144,10 @@ for speed in (1.0002, 0.9998, 1.0):
                         s += 5
                     return s
                 for (on, off), fields in zip(sounds, got):
-                    for place, ms in ((on, int(fields[1])), (off, int(fields[2]))):
+                    if len(fields) != 6:
+                        failures.append("%s: a sound line %s, want sound ON OFF LENGTH ON_EARLY OFF_EARLY" % (case, " ".join(fields)))
+                        continue
+                    for place, ms, early in ((on, int(fields[1]), int(fields[4])), (off, int(fields[2]), int(fields[5]))):
                         checked += 1
                         want = true_ms(place)
                         slack = slack_for(place)
@@ -152,6 +155,13 @@ for speed in (1.0002, 0.9998, 1.0):
                             failures.append("%s: the place %.3f ms into the file is at %.3f ms, given %d ms: early" % (case, place, want, ms))
                         elif ms > want + slack:
                             failures.append("%s: the place %.3f ms into the file is at %.3f ms, given %d ms: more than %.1f ms late" % (case, place, want, ms, slack))
+                        # The early bound: never late, and early only by the 200 ppm over the
+                        # whole file, the 1 ms the start was read before the first sample, and
+                        # rounding.
+                        if early > want:
+                            failures.append("%s: the place %.3f ms into the file is at %.3f ms, its early bound %d ms: late" % (case, place, want, early))
+                        elif early < want - (place * 0.0004 + (lost if overrun and place >= 5000 else 0) + 3):
+                            failures.append("%s: the place %.3f ms into the file is at %.3f ms, its early bound %d ms: far early" % (case, place, want, early))
                 end = [line.split() for line in out if line.startswith("end ")]
                 if not end or int(end[0][1]) > true_ms(length - 20):
                     failures.append("%s: the end %s is later than %.3f ms, the time of the last place the report shows" % (case, end, true_ms(length - 20)))

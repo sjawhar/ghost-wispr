@@ -940,18 +940,23 @@ wait_spoken() {
 # ---- recordings ----
 
 # start_recording DEVICE FILE: record DEVICE to FILE. A background loop writes anchors, "US BYTES"
-# lines: by the driver's clock US (microseconds, read just after the size, with no fork between
-# them), BYTES of the file were written. recording-times.awk bounds each sound's time with the
-# anchors after it, late only by how late its best anchor was read (analyse_recording).
+# lines: by the driver's clock US (microseconds, read just after the size), BYTES of the file were
+# written. recording-times.awk bounds each sound's time with the anchors after it, late only by how
+# late its best anchor was read (analyse_recording). The size comes from arecord's own fdinfo, whose
+# pos is the bytes it has written, read by the shell with no fork: a fork between the size and the
+# clock, on a loaded machine, makes every anchor late by as long as the fork takes, and no later
+# anchor then makes up for it. Where /proc does not show that fd, the size comes from wc.
 recording=
 anchors_file=
 recording_cut=false
 recording_started=
+recording_fdinfo=
 start_recording() {
-  local deadline size seen
+  local deadline size seen link
   recording=$2
   anchors_file="$recording.anchors"
   recording_cut=false
+  recording_fdinfo=
   : >"$anchors_file"
   # arecord captures nothing before it starts: the earliest the file's first sample can be.
   recording_started=${EPOCHREALTIME//[!0-9]/}
@@ -970,16 +975,33 @@ start_recording() {
     ((seen / 1000 < deadline)) || unknown "recording: arecord wrote no audio from $1 within 5 s"
     sleep 0.01
   done
+  for link in /proc/"$arecord_pid"/fd/*; do
+    if [[ $link -ef $recording ]]; then
+      recording_fdinfo=/proc/$arecord_pid/fdinfo/${link##*/}
+      break
+    fi
+  done
   (
     while kill -0 "$arecord_pid" 2>/dev/null; do
       sleep 0.5
-      size=$(wc -c 2>/dev/null <"$recording") || break
+      recording_size || break
       seen=${EPOCHREALTIME//[!0-9]/}
       printf '%s %s\n' "$seen" "$size" >>"$anchors_file"
     done
   ) &
   anchor_pid=$!
   note "recording: from $1"
+}
+
+# recording_size: set size to the bytes arecord has written to the recording: from its fdinfo, read
+# by the shell itself, when start_recording found it, else with wc.
+recording_size() {
+  local key value
+  if [[ -n $recording_fdinfo ]] && read -r key value 2>/dev/null <"$recording_fdinfo" && [[ $key == pos: && $value =~ ^[0-9]+$ ]]; then
+    size=$value
+    return 0
+  fi
+  size=$(wc -c 2>/dev/null <"$recording")
 }
 
 # stop_recording: end the recording. On SIGTERM arecord finishes the file's header and drops what it
@@ -1006,15 +1028,18 @@ stop_recording() {
 }
 
 # analyse_recording THRESHOLD_DB: read the sounds in the recording. sound_on and sound_off hold each
-# sound's onset and end on the driver's clock, never early; sound_len its length in the file, in
-# microseconds; recording_end the driver's time, never late, before which the recording shows every
-# sound that starts (recording-times.awk).
+# sound's onset and end on the driver's clock, never early; sound_on_early and sound_off_early the
+# same times, never late; sound_len its length in the file, in microseconds; recording_end the
+# driver's time, never late, before which the recording shows every sound that starts
+# (recording-times.awk). A true time lies between its two bounds.
 sound_on=()
 sound_off=()
+sound_on_early=()
+sound_off_early=()
 sound_len=()
 recording_end=
 analyse_recording() {
-  local analysis bytes kind rest on off len
+  local analysis bytes kind rest on off len on_early off_early
   analysis=$(ffmpeg -hide_banner -nostats -i "$recording" -af "silencedetect=noise=${1}dB:d=$silence_seconds" -f null - 2>&1) \
     || unknown "recording: ffmpeg could not read $recording: $(tail -n 3 <<<"$analysis" | tr '\n' ' ')"
   [[ $recording_cut == false ]] \
@@ -1022,14 +1047,18 @@ analyse_recording() {
   bytes=$(wc -c <"$recording") || unknown "recording: cannot read the size of $recording"
   sound_on=()
   sound_off=()
+  sound_on_early=()
+  sound_off_early=()
   sound_len=()
   recording_end=
   while read -r kind rest; do
     case $kind in
       sound)
-        read -r on off len <<<"$rest"
+        read -r on off len on_early off_early <<<"$rest"
         sound_on+=("$on")
         sound_off+=("$off")
+        sound_on_early+=("$on_early")
+        sound_off_early+=("$off_early")
         sound_len+=("$len")
         ;;
       end) recording_end=$rest ;;
@@ -1072,17 +1101,21 @@ silence_from() {
 
 # cancel_heard STOP_MS NEXT_MS: set heard_ms to how long after STOP the rig still heard sound before
 # NEXT, the next sound the step expects: the end of the last sound that spans STOP or starts after
-# it, so a word after any pause or silence counts; 0 when the rig was quiet from STOP. It fails when
-# the rig did not hear sound up to STOP (within a pause of silence_ms), which leaves the cancel
-# untimed.
+# it, so a word after any pause or silence counts; 0 when the rig was quiet from STOP. heard_ms is
+# from the sounds' ends never early, so the true time is no longer; heard_early_ms is the same from
+# their ends never late, so the true time is no shorter. It fails when the rig did not hear sound up
+# to STOP (within a pause of silence_ms), which leaves the cancel untimed.
 heard_ms=
+heard_early_ms=
 cancel_heard() {
   local i heard_up_to=false
   heard_ms=0
+  heard_early_ms=0
   for i in "${!sound_on[@]}"; do
     ((sound_on[i] < $2)) || continue
     ((sound_on[i] <= $1 && sound_off[i] >= $1 - silence_ms)) && heard_up_to=true
     ((sound_off[i] > $1 + heard_ms)) && heard_ms=$((sound_off[i] - $1))
+    ((sound_off_early[i] > $1 + heard_early_ms)) && heard_early_ms=$((sound_off_early[i] - $1))
   done
   [[ $heard_up_to == true ]]
 }
@@ -1839,8 +1872,8 @@ running_ms() {
 # late by however late its best anchor was read, falls after first_audio, passes for that answer.
 step_playback_cancel() {
   local i q wake first spoken_count speech_at wait_ms stop_ats=() question_starts=() question_wakes=()
-  local question_firsts=() heard=() deadline max xruns streams ways next chime boundary_unknown
-  local underruns played rc calib_from calib_to calib calib_len calib_ms alone_until
+  local question_firsts=() heard=() heard_early=() deadline max xruns streams ways next chime boundary_unknown
+  local underruns played worst rc calib_from calib_to calib calib_len calib_ms alone_until
   speaker_status
   start_rig_run
   # The calibration: the wake sound alone, while the rig records, then quiet until the first question.
@@ -1951,12 +1984,10 @@ step_playback_cancel() {
     cancel_heard "${stop_ats[i]}" "$next" \
       || unknown "playback-cancel stop $((i + 1)): the rig microphone did not hear the speech up to the stop, so it cannot time the cancel"
     heard+=("$heard_ms")
-    note "playback-cancel stop $((i + 1)): the rig microphone heard sound until ${heard_ms} ms after the stop, then nothing until the step's next sound could start, $((next - stop_ats[i])) ms after it"
+    heard_early+=("$heard_early_ms")
+    note "playback-cancel stop $((i + 1)): the rig microphone heard sound until ${heard_ms} ms after the stop (no earlier than ${heard_early_ms} ms: the recording's times for it may be up to $((heard_ms - heard_early_ms)) ms late), then nothing until the step's next sound could start, $((next - stop_ats[i])) ms after it"
   done
-  max=$(maximum "${heard[@]}")
-  ((max <= cancel_heard_ms)) || fail "playback-cancel: a stop's speech was heard at the rig microphone $max ms after it, more than $cancel_heard_ms ms"
-  [[ -z $boundary_unknown ]] || unknown "$boundary_unknown"
-  pass "playback-cancel: no stop's speech was heard at the rig microphone $cancel_heard_ms ms after it, and the rig stayed quiet until the step's next sound (the longest $max ms, over $stops stops)"
+  # The underruns first: a timing that cannot be decided must not hide them.
   streams=$(journal_records 'speaker stream' | jq -s 'length') \
     || unknown "playback-cancel: cannot read the speaker stream lines from the journal$(journal_error)"
   ((streams > 0)) || unknown "playback-cancel: the journal has no \"speaker stream\" line, so the speaker's underrun lines cannot be read"
@@ -1966,6 +1997,25 @@ step_playback_cancel() {
   ((underruns == 0)) || fail "playback-cancel: the speaker logged $underruns underruns over $((played / 1000)) s of playback"
   ((xruns == 0)) || fail "playback-cancel: the speaker logged no underrun, but the poller saw its stream in XRUN $xruns times"
   pass "playback-cancel: 0 underruns over $((played / 1000)) s of playback ($streams speaker streams opened; the poller, which reads every 5 ms and can miss a short underrun, saw no XRUN)"
+  # Each stop's true tail lies between its two bounds. PASS when even the late one is within
+  # cancel_heard_ms; FAIL when even the early one is over; UNKNOWN otherwise, since the anchors that
+  # timed the recording may have been read that late. A FAIL is proven, so it comes before an
+  # unknown window's end, and that before an undecided tail, which the window bounds.
+  max=$(maximum "${heard[@]}")
+  worst=
+  for i in "${!heard_early[@]}"; do
+    ((heard_early[i] > cancel_heard_ms)) || continue
+    [[ -n $worst ]] && ((heard[i] <= heard[worst])) || worst=$i
+  done
+  [[ -z $worst ]] \
+    || fail "playback-cancel: a stop's speech was heard at the rig microphone ${heard[worst]} ms after it, more than $cancel_heard_ms ms (no earlier than ${heard_early[worst]} ms after it)"
+  [[ -z $boundary_unknown ]] || unknown "$boundary_unknown"
+  if ((max > cancel_heard_ms)); then
+    worst=0
+    for i in "${!heard[@]}"; do ((heard[i] > heard[worst])) && worst=$i; done
+    unknown "playback-cancel: stop $((worst + 1))'s speech was heard at the rig microphone up to ${heard[worst]} ms after it, more than $cancel_heard_ms ms, but no earlier than ${heard_early[worst]} ms after it: the recording's times may be up to $((heard[worst] - heard_early[worst])) ms late, so whether it ended within $cancel_heard_ms ms is not known"
+  fi
+  pass "playback-cancel: no stop's speech was heard at the rig microphone $cancel_heard_ms ms after it, and the rig stayed quiet until the step's next sound (the longest $max ms, over $stops stops)"
   ways=$(journal_records 'speaker cancel' | jq -r '.way // ""') \
     || unknown "playback-cancel: cannot read the speaker cancel lines from the journal$(journal_error)"
   note "playback-cancel: the speaker logged $(grep -c . <<<"$ways") cancels: $(grep -cx rewind <<<"$ways") by rewind, $(grep -cx drop <<<"$ways") by drop"
