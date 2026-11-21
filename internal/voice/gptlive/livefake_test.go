@@ -104,6 +104,7 @@ type clientEvent struct {
 	Audio        string        `json:"audio"`
 	Session      sessionConfig `json:"session"`
 	raw          []byte
+	decodedAt    time.Time // when the stand-in server decoded it
 }
 
 // liveConn is the server's side of one session's socket.
@@ -156,6 +157,7 @@ func (c *liveConn) read() {
 			continue
 		}
 		ev.raw = data
+		ev.decodedAt = time.Now() // as the server decodes it, not when a test reads it
 		if ev.Type == evInputAudioAppend {
 			if b, err := base64.StdEncoding.DecodeString(ev.Audio); err == nil {
 				c.inSamples.Add(int64(len(b) / 2))
