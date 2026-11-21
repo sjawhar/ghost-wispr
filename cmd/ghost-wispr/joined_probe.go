@@ -31,7 +31,8 @@ const joinedProbeFloor = "This is the acceptance check of joined agents. Nothing
 // it. It registers an Envoy session of its own, takes a join message (from a
 // file, or delivered to it, as a person's Dispatch message is), and follows
 // it as an agent would: it joins, waits for the pointer of its issue coming
-// up, reads that part of the transcript from the recorder's API, asks for the
+// up in the meeting it joined (a pointer to another meeting fails the run),
+// reads that part of the transcript from the recorder's API, asks for the
 // floor, waits for how its hand came down, and leaves. Each step is one JSON
 // line on stdout. A message that may quote the room, a question the voice
 // asks, is reported with no text; the roster's messages hold no words of the
@@ -108,11 +109,17 @@ type joinedProbe struct {
 	out      io.Writer
 	outMu    sync.Mutex
 	wait     time.Duration
-	session  *envoy.Session
+	session  probeSender
 	messages chan *envoy.Message
 	unit     string
 	// api replaces the join message's API when it is set.
 	api string
+}
+
+// probeSender is what the probe needs of its Envoy session: a send to the
+// unit. An *envoy.Session is one.
+type probeSender interface {
+	Send(ctx context.Context, request *envoy.SendRequest) (envoy.SendResult, error)
 }
 
 func (p *joinedProbe) emit(step string, fields map[string]any) {
@@ -174,6 +181,9 @@ func (p *joinedProbe) run(ctx context.Context, invitationFile, floor string) err
 		return fmt.Errorf("a pointer that names no meeting or time range: %s", pointer.Text)
 	}
 	p.emit("pointer", map[string]any{"recording_session": span[1], "from": span[2], "to": span[3], "text": pointer.Text})
+	if span[1] != meeting[1] {
+		return fmt.Errorf("the pointer names recording session %s, not %s, the meeting the probe joined", span[1], meeting[1])
+	}
 	// A segment is stored a moment after the words that made it reach the
 	// voice, so the read is made again for a few seconds.
 	var read map[string]any
@@ -257,14 +267,16 @@ func (p *joinedProbe) send(ctx context.Context, text, step string) (string, erro
 	return sent.EventID, nil
 }
 
+// segmentSlack is how far outside a pointer's range a segment's stamp may
+// fall and still count: the range is in whole seconds.
+const segmentSlack = 5 * time.Second
+
 // readTranscript reads the meeting's segments from the recorder's API, and
-// reports how many fall in the pointer's time range (today, UTC), with no
-// words.
+// reports how many fall in the pointer's time range (pointerInterval), with
+// no words.
 func (p *joinedProbe) readTranscript(ctx context.Context, api, sessionID, from, to string) (map[string]any, error) {
-	day := time.Now().UTC().Format("2006-01-02")
-	start, err1 := time.Parse(time.RFC3339, day+"T"+from+"Z")
-	end, err2 := time.Parse(time.RFC3339, day+"T"+to+"Z")
-	if err := errors.Join(err1, err2); err != nil {
+	start, end, err := pointerInterval(sessionID, from, to, time.Now())
+	if err != nil {
 		return nil, err
 	}
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(api, "/")+"/api/sessions/"+sessionID+"/segments", nil)
@@ -289,11 +301,51 @@ func (p *joinedProbe) readTranscript(ctx context.Context, api, sessionID, from, 
 	inRange := 0
 	for i := range segments {
 		at := segments[i].Timestamp
-		if !at.Before(start.Add(-5*time.Second)) && !at.After(end.Add(5*time.Second)) {
+		if !at.Before(start.Add(-segmentSlack)) && !at.After(end.Add(segmentSlack)) {
 			inRange++
 		}
 	}
 	return map[string]any{"status": response.StatusCode, "segments": len(segments), "segments_in_range": inRange}, nil
+}
+
+// pointerInterval dates a pointer's range, which gives clocks only (HH:MM:SS
+// UTC). The recorder's id for a recording session is its start
+// (YYYYMMDDhhmmss, UTC): from is then the first instant on from's clock at or
+// after that start, less segmentSlack, as a segment can begin a moment before
+// its session's id, and to the first instant on to's clock at or after from.
+// Any other id dates the range by now: to is on now's day (UTC), and from the
+// last instant on from's clock at or before to.
+func pointerInterval(sessionID, from, to string, now time.Time) (time.Time, time.Time, error) {
+	fromClock, err1 := time.Parse(time.TimeOnly, from)
+	toClock, err2 := time.Parse(time.TimeOnly, to)
+	if err := errors.Join(err1, err2); err != nil {
+		return time.Time{}, time.Time{}, err
+	}
+	if started, err := time.Parse("20060102150405", sessionID); err == nil {
+		start := clockAtOrAfter(started.Add(-segmentSlack), fromClock)
+		return start, clockAtOrAfter(start, toClock), nil
+	}
+	end := onDayOf(now.UTC(), toClock)
+	start := onDayOf(end, fromClock)
+	if start.After(end) {
+		start = start.AddDate(0, 0, -1)
+	}
+	return start, end, nil
+}
+
+// clockAtOrAfter is the first instant on clock's time of day at or after t,
+// in UTC.
+func clockAtOrAfter(t, clock time.Time) time.Time {
+	at := onDayOf(t.UTC(), clock)
+	if at.Before(t) {
+		at = at.AddDate(0, 0, 1)
+	}
+	return at
+}
+
+// onDayOf is clock's time of day on day's date, in UTC.
+func onDayOf(day, clock time.Time) time.Time {
+	return time.Date(day.Year(), day.Month(), day.Day(), clock.Hour(), clock.Minute(), clock.Second(), 0, time.UTC)
 }
 
 // invitationParts are what a join message gives an agent.

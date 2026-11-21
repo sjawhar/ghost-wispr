@@ -117,7 +117,7 @@ func newRelayFake(t *testing.T) *relayFake {
 
 func (f *relayFake) serve(raw net.Conn) {
 	c := &relayConn{Conn: raw, answers: make(chan string, 64)}
-	defer raw.Close()
+	defer func() { _ = raw.Close() }()
 	if c.send("INFO {\"server_id\":\"relay-fake\",\"version\":\"2.10.0\",\"proto\":1,\"max_payload\":1048576,\"headers\":true}\r\n") != nil {
 		return
 	}
@@ -239,7 +239,7 @@ func TestAJoinDuringRegistrationIsNotAcknowledgedUntilTaken(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer s.Close(context.Background())
+	defer func() { _ = s.Close(context.Background()) }()
 	if got := <-early; got != "nak" {
 		t.Fatalf("the join that came while the roster had no Envoy session was answered %q, want nak so that it comes again", got)
 	}

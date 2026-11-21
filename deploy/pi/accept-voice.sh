@@ -130,10 +130,11 @@ Steps:
   reach               the Pi reaches Dispatch, the Envoy hub and its NATS port, and its own Envoy
                       session is live. Changes nothing.
   joined              a test agent session (ghost-wispr joined-probe, an Envoy session of its own)
-                      takes the join message for --join-issue, joins, gets a pointer when --mention
-                      names the issue, reads that part of the transcript, asks for the floor, is
-                      spoken on --go-ahead and leaves; agent_joined and agent_left on /ws, and the
-                      hand sound at the Jabra. Needs --rig-mic.
+                      takes the join message for --join-issue, joins, gets a pointer to that
+                      meeting when --mention names the issue, reads that part of the transcript,
+                      asks for the floor, is spoken on --go-ahead and leaves; agent_joined,
+                      voice_spoken and agent_left on /ws, the hand sound and, after the go-ahead,
+                      the agent's words at the Jabra. Needs --rig-mic.
   holder-cases        ghost-wispr issue-holder on four scratch issues. Needs --issue-live,
                       --issue-stopped, --issue-person, --issue-none. Changes nothing.
   scripted            --questions N questions from --question-dir for each --engine (voice.engine:
@@ -1612,12 +1613,47 @@ probe_says() {
   tail -n 3 "$probe_out" "$work_dir/probe.err" 2>/dev/null | tr '\n' ' ' | head -c 600
 }
 
+# spoken_after SESSION FROM_MS DEADLINE_MS: wait for the first voice_spoken of SESSION timed at FROM
+# or later; set event_json to it. A voice_spoken of another meeting, or one before FROM, is not it.
+spoken_after() {
+  local event at
+  while :; do
+    while IFS= read -r event; do
+      at=$(time_ms "$(jq -r '.timestamp' <<<"$event")")
+      if whole_number "$at" && ((at >= $2)); then
+        event_json=$event
+        return 0
+      fi
+    done < <(jq -c -n --arg s "$1" 'inputs | select(type == "object" and .type == "voice_spoken" and .session_id == $s)' "$ws_capture" 2>/dev/null)
+    (($(now_ms) < $3)) || return 1
+    sleep 0.1
+  done
+}
+
+# words_heard FROM_MS TO_MS: set found_sound to the first sound at the rig that starts in [FROM, TO)
+# and lasts longer than the wake sound can (sound_max_ms): speech, not the wake sound that "Wispr,
+# go ahead" itself brings. It fails when none does.
+words_heard() {
+  local i
+  for i in "${!sound_on[@]}"; do
+    if ((sound_on[i] >= $1 && sound_on[i] < $2 && sound_len[i] > sound_max_ms * 1000)); then
+      found_sound=$i
+      return 0
+    fi
+  done
+  return 1
+}
+
 # step_joined: verification c-joined-live. The test agent is ghost-wispr joined-probe, an Envoy
 # session of its own beside the unit. It stands for an agent a person invites through Dispatch: it
 # takes the join message the unit gives for --join-issue, as the person would send it, and follows
-# it. The end-to-end run from the devbox sends the same message through Dispatch itself.
+# it. The end-to-end run from the devbox sends the same message through Dispatch itself. The checks
+# hold to this run's recording session and to the go-ahead: the pointer names the meeting the
+# agent joined; the agent is told its words were spoken only after the go-ahead ended, with a
+# voice_spoken of that meeting after it; and the rig microphone hears the words after the go-ahead,
+# a sound longer than the wake sound, besides the hand sound.
 step_joined() {
-  local envoy_url auth session mention_ended floor_at hand_at spoken_count deadline
+  local envoy_url auth session mention_ended floor_at hand_at deadline pointed go_ahead_ended spoken_at outcome told_at
   envoy_url=$(setting GHOST_WISPR_CONCIERGE_ENVOY_URL concierge envoy_url) \
     || unknown 'joined: the unit names no Envoy URL (concierge.envoy_url or GHOST_WISPR_CONCIERGE_ENVOY_URL)'
   start_rig_run
@@ -1657,7 +1693,10 @@ step_joined() {
   mention_ended=$clip_ended
   probe_step pointer $((mention_ended + event_timeout * 1000)) \
     || fail "joined: no pointer within $event_timeout s of the mention of $join_issue: $(probe_says)"
-  pass "joined: the pointer names session $(jq -r '.recording_session' <<<"$probe_json"), $(jq -r '.from' <<<"$probe_json") to $(jq -r '.to' <<<"$probe_json") UTC"
+  pointed=$(jq -r '.recording_session' <<<"$probe_json")
+  [[ $pointed == "$session" ]] \
+    || fail "joined: the pointer names recording session $pointed, not $session, the meeting the test agent joined"
+  pass "joined: the pointer names recording session $session, the meeting the test agent joined, $(jq -r '.from' <<<"$probe_json") to $(jq -r '.to' <<<"$probe_json") UTC"
   probe_step transcript_read $(($(now_ms) + event_timeout * 1000)) || fail "joined: the test agent did not read the transcript: $(probe_says)"
   (($(jq -r '.segments_in_range' <<<"$probe_json") > 0)) \
     || fail "joined: the test agent read no segment in the pointer's time range from the recorder's API"
@@ -1673,12 +1712,25 @@ step_joined() {
     || fail "joined: the hand sound began $((hand_at - mention_ended)) ms after the mention ended, before a gap of 1000 ms"
   pass "joined: the hand sound began $((hand_at - floor_at)) ms after the floor request, $((hand_at - mention_ended)) ms after the last words"
 
-  spoken_count=$(ws_count voice_spoken)
+  # The hand comes down on the go-ahead: an outcome the test agent already has was not invited.
+  if probe_step hand "$(now_ms)"; then
+    fail "joined: the test agent was told its hand came down $(jq -r '.outcome' <<<"$probe_json") before the go-ahead was played"
+  fi
   play_clip go-ahead "$go_ahead"
-  wait_spoken $((spoken_count + 1)) $((clip_ended + event_timeout * 1000)) 'joined go-ahead'
+  go_ahead_ended=$clip_ended
+  spoken_after "$session" "$go_ahead_ended" $((go_ahead_ended + event_timeout * 1000)) \
+    || fail "joined: no voice_spoken for recording session $session within $event_timeout s of the end of the go-ahead$(ws_ended)"
+  check_voice_event 'joined: voice_spoken' "$event_json" "$session"
+  spoken_at=$event_at
+  pass "joined: voice_spoken for recording session $session $((spoken_at - go_ahead_ended)) ms after the go-ahead ended"
   probe_step hand $(($(now_ms) + event_timeout * 1000)) || fail "joined: the test agent was not told how its hand came down: $(probe_says)"
-  [[ $(jq -r '.outcome' <<<"$probe_json") == spoken ]] || fail "joined: the hand came down $(jq -r '.outcome' <<<"$probe_json"), not spoken"
-  pass 'joined: the agent'"'"'s words were spoken on "Wispr, go ahead", and it was told so'
+  outcome=$(jq -r '.outcome' <<<"$probe_json")
+  [[ $outcome == spoken ]] || fail "joined: the hand came down $outcome, not spoken"
+  told_at=$(time_ms "$(jq -r '.at' <<<"$probe_json")")
+  whole_number "$told_at" || unknown "joined: cannot read when the test agent was told how its hand came down: $probe_json"
+  ((told_at >= go_ahead_ended)) \
+    || fail "joined: the test agent was told its hand came down spoken $((go_ahead_ended - told_at)) ms before the go-ahead ended"
+  pass "joined: the agent's words were spoken on \"Wispr, go ahead\", and it was told so $((told_at - go_ahead_ended)) ms after the go-ahead ended"
 
   probe_step leave_sent $(($(now_ms) + event_timeout * 1000)) || fail "joined: the test agent did not leave: $(probe_says)"
   wait_for_event agent_left 1 $(($(now_ms) + event_timeout * 1000)) \
@@ -1691,6 +1743,9 @@ step_joined() {
   first_sound $((hand_at - lead_ms)) $((hand_at + sound_max_ms)) \
     || fail 'joined: no sound at the rig microphone within 400 ms of hand_chime'
   pass "joined: the hand sound reached the Jabra $((sound_on[found_sound] - hand_at)) ms after hand_chime"
+  words_heard "$go_ahead_ended" "$spoken_at" \
+    || fail "joined: no words at the rig microphone between the end of the go-ahead and voice_spoken: no sound there lasted longer than the wake sound's $sound_max_ms ms"
+  pass "joined: the agent's words reached the Jabra $((sound_on[found_sound] - go_ahead_ended)) ms after the go-ahead ended, for $((sound_len[found_sound] / 1000)) ms"
 }
 
 # step_barge_in: verification c-stop-pi. The run's microphone is the loopback, so each clip goes
