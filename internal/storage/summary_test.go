@@ -15,7 +15,7 @@ func summarizedSyncedSession(t *testing.T, store *SQLiteStore, id string) {
 	if err := store.CreateSession(id, started); err != nil {
 		t.Fatalf("create session: %v", err)
 	}
-	if err := store.EndSession(id, started.Add(time.Minute), ""); err != nil {
+	if err := store.EndSession(id, started.Add(time.Minute), "", ""); err != nil {
 		t.Fatalf("end session: %v", err)
 	}
 	if err := store.UpdateSummaryAtGeneration(id, "Launch planning", "The last good summary.", SummaryCompleted, "default", `{"0":{"name":"Sam"}}`, "", 0); err != nil {

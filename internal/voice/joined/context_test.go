@@ -84,7 +84,7 @@ func TestAJoinOrPointerCommitsOnlyToTheCurrentMeeting(t *testing.T) {
 		r.roster.OnSegment(&voice.Segment{SessionID: "sess-1", Text: "ABC-12 is late", From: meetingStart.Add(297 * time.Second), To: meetingStart.Add(300 * time.Second)})
 	}()
 	<-segmentEntered
-	if err := store.EndSession("sess-1", r.clock.Now(), ""); err != nil {
+	if err := store.EndSession("sess-1", r.clock.Now(), "", ""); err != nil {
 		t.Fatal(err)
 	}
 	r.setSession("sess-2")

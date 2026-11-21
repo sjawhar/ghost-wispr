@@ -975,14 +975,9 @@ func main() {
 	indicator.RecordSavesIn(filepath.Join(filepath.Dir(dbPath), "blink1-saves"))
 
 	// Recover any sessions left as 'active' from a previous crash/restart:
-	// each ends when its raw recording was last written.
-	recoveredIDs, err := store.RecoverStaleSessions(cfg.AudioDir)
-	if err != nil {
-		slog.Warn("failed to recover stale sessions", "error", err)
-	} else if len(recoveredIDs) > 0 {
-		log.Printf("recovered %d stale session(s): %v", len(recoveredIDs), recoveredIDs)
-		cancelRecoveredQuestions(store, recoveredIDs)
-	}
+	// each ends when its raw recording was last written, with its
+	// session_ended event queued in the same write.
+	recoveredIDs := recoverStaleSessions(store, &cfg)
 	// A refinement left running by the previous run stopped with it. The store
 	// owes each one automatic retry, which runs below, once the recording
 	// directories are cleaned up; the stop ends with it (stopRecovery).
@@ -1164,6 +1159,9 @@ func main() {
 		}
 		return nil
 	}, captureFinalizeWait, captureEndRetry, log.Printf)
+	// A refused resume saves the pause state from the gate's opening, which
+	// runs as work the stop waits for.
+	capture.background = manager
 	// The meeting voice. Its link is wired now, so every gate closing reaches
 	// it, the one restorePause may make included; the voice itself starts
 	// once the speaker output exists, below. Its tap is one more writer
@@ -1627,11 +1625,14 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 	if err := audio.UsePlugCapture(cfg.MicDevice); err != nil {
 		slog.Warn("open the microphone through ALSA's plug layer", "error", err)
 	}
-	startPowerButton(ctx, &cfg, capture, controlHooks, warningRegistry)
-	startJabraMuteButton(ctx, &cfg, capture, micDevice, controlHooks, warningRegistry, func() { voiceHooks.Stop("Jabra button") })
+	// The buttons and the paused listener save the pause state: each runs as
+	// work the stop waits for, and ends with the app's context.
+	startPowerButton(ctx, &cfg, capture, controlHooks, warningRegistry, manager)
+	startJabraMuteButton(ctx, &cfg, capture, micDevice, controlHooks, warningRegistry, func() { voiceHooks.Stop("Jabra button") }, manager)
 	startPausedListener(ctx, cfgStore, &pausedListenerUnit{
 		capture: capture, controls: pauseControls, hooks: controlHooks, device: micDevice,
 		wake: hardware.Wake, warnings: warningRegistry, restored: restoredState, built: local.Built,
+		background: manager,
 	})
 
 	envoyEvents.configure(ctx, &cfg, appLogger)
@@ -2170,63 +2171,69 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 	<-sig
 
 	log.Println("ghost-wispr: shutting down")
-	// The voice stops first: its session, its speech and the Concierge's calls.
-	voiceHooks.Close()
-	stopApp()
-	manager.StopSessionStartPublishes()
-	// Each mic loop closes its microphone and ends, even if its device
-	// delivers no frame. Stopping the device or terminating PortAudio while a
-	// Stream still runs crashes inside PortAudio, so neither happens before
-	// they end, nor at all if one is stuck: the process exit releases the
-	// device then.
-	micLoopsEnded := joinMicLoops(&micLoops, micShutdownWait)
-	if !micLoopsEnded {
-		slog.Warn("microphone still reading after shutdown began; leaving the device and PortAudio to the process exit", "waited", micShutdownWait)
+	steps := shutdownSteps{
+		closeVoice:         voiceHooks.Close,
+		stopCapture:        capture.Stop,
+		stopApp:            stopApp,
+		stopStartPublishes: manager.StopSessionStartPublishes,
+		// Each mic loop closes its microphone and ends, even if its device
+		// delivers no frame. Stopping the device or terminating PortAudio
+		// while a Stream still runs crashes inside PortAudio, so neither
+		// happens before they end, nor at all if one is stuck: the process
+		// exit releases the device then.
+		joinMicLoops: func() bool {
+			ended := joinMicLoops(&micLoops, micShutdownWait)
+			if !ended {
+				slog.Warn("microphone still reading after shutdown began; leaving the device and PortAudio to the process exit", "waited", micShutdownWait)
+			}
+			return ended
+		},
+		// With the microphones closed, the light goes off. Stop refuses any
+		// further red confirmation, and lets the off write through even if a
+		// microphone is stuck open, since the process is exiting.
+		lightOff: func() {
+			hardware.Stop()
+			stopLight()
+			select {
+			case <-lightOff:
+			case <-time.After(lightShutdownWait):
+				slog.Warn("recording light not turned off in time; leaving it to its watchdog", "waited", lightShutdownWait)
+			}
+		},
+		// No request runs once the stop waits for the store's work: a request
+		// after it (a manual start or end, a merge, a delete) would start
+		// work the stop has already refused or no longer waits for.
+		stopServing:   func(ctx context.Context) { stopServing(ctx, httpServer, httpShutdownWait) },
+		stopStoreWork: func(ctx context.Context) { recovery.stop(ctx, manager, lifecyclePublishWait) },
+		stopDevices: func(ctx context.Context, micLoopsEnded bool) {
+			if dgStop != nil {
+				// Its websocket's close can wait on Deepgram: within the deadline.
+				closeWithin(ctx, "the Deepgram connection", dgStop)
+			}
+			if mic := micRef.Load(); mic != nil && micLoopsEnded {
+				_ = mic.Stop()
+			}
+			if conc != nil {
+				conc.Stop(ctx)
+			}
+			if ttsOrchestrator != nil {
+				ttsOrchestrator.Stop()
+			}
+			if output != nil {
+				if err := output.Close(); err != nil {
+					slog.Warn("speaker output close failed", "error", err)
+				}
+			}
+			if micLoopsEnded {
+				_ = audio.TerminatePortAudio() // best-effort cleanup
+			}
+		},
+		closeStore: func(ctx context.Context) {
+			storeClosing = true
+			closeStore(ctx, store)
+		},
 	}
-	// Only now, with the microphones closed, does the light go off. Stop
-	// refuses any further red confirmation, and lets the off write through
-	// even if a microphone is stuck open, since the process is exiting.
-	hardware.Stop()
-	stopLight()
-	select {
-	case <-lightOff:
-	case <-time.After(lightShutdownWait):
-		slog.Warn("recording light not turned off in time; leaving it to its watchdog", "waited", lightShutdownWait)
-	}
-
-	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer shutdownCancel()
-
-	// No request runs once the stop waits for the store's work: a request
-	// after it (a manual start or end, a merge, a delete) would start work
-	// the stop has already refused or no longer waits for.
-	stopServing(shutdownCtx, httpServer, httpShutdownWait)
-	recovery.stop(shutdownCtx, manager, lifecyclePublishWait)
-
-	if dgStop != nil {
-		// Its websocket's close can wait on Deepgram: within the deadline.
-		closeWithin(shutdownCtx, "the Deepgram connection", dgStop)
-	}
-	if mic := micRef.Load(); mic != nil && micLoopsEnded {
-		_ = mic.Stop()
-	}
-	if conc != nil {
-		conc.Stop(shutdownCtx)
-	}
-	if ttsOrchestrator != nil {
-		ttsOrchestrator.Stop()
-	}
-	if output != nil {
-		if err := output.Close(); err != nil {
-			slog.Warn("speaker output close failed", "error", err)
-		}
-	}
-
-	if micLoopsEnded {
-		_ = audio.TerminatePortAudio() // best-effort cleanup
-	}
-	storeClosing = true
-	closeStore(shutdownCtx, store)
+	steps.run(shutdownWait)
 }
 
 // micStreamer is the capture device the mic loop drives. Open opens a fresh

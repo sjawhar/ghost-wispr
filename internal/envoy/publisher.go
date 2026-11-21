@@ -48,6 +48,12 @@ const (
 	eventSummaryReady   EventType = "summary_ready"
 )
 
+// SessionEndedEvent is the session_ended event's type in the store's
+// lifecycle queue, which a session's end queues it under in the same write
+// (storage.SQLiteStore.EndSession, RecoverStaleSessions), and the sweep
+// sends (PublishPendingLifecycleEvents).
+const SessionEndedEvent = string(eventSessionEnded)
+
 const ghostWisprTopicPrefix = "notifications.ghostwispr."
 
 // publishPath is the hub listener's route for a publish to a topic.

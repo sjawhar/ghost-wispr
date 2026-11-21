@@ -19,6 +19,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"maps"
 	"math"
 	"slices"
 	"strings"
@@ -572,7 +573,7 @@ const notReadyWait = 2 * time.Second
 
 // ErrNotReady is Deliver's answer to a command that comes while the roster
 // has no Envoy session and none is given within notReadyWait: before
-// SetAgents gives it one, or once SetAgents(nil) took it away. The roster can
+// SetAgents gives it one, or once CloseAgents took it away. The roster can
 // neither take nor answer the command then, so it does not acknowledge it:
 // the unit's Envoy session answers the frame nak, and Envoy delivers it again
 // for as long as its stream keeps it. legion's relay spaces those deliveries
@@ -677,25 +678,34 @@ func New(cfg *Config) *Roster {
 }
 
 // SetAgents gives the roster the unit's Envoy session once it opens, which
-// opens the gate joins commit through. nil, as it closes, shuts the gate
-// first, so no join still in its reads commits, then ends every
-// membership, telling each agent the voice stopped through the session it
-// joined under, while that session can still send. A stop whose epoch a
-// later SetAgents passed while it cleaned up changes nothing more.
+// opens the gate joins commit through. agents is never nil: CloseAgents ends
+// the session.
 func (r *Roster) SetAgents(agents Agents) {
+	if agents == nil {
+		panic("joined: SetAgents(nil); CloseAgents ends the Envoy session")
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.epoch++
+	r.open = true
+	r.agents = agents
+	if r.ready != nil {
+		close(r.ready)
+		r.ready = nil
+	}
+}
+
+// CloseAgents ends the unit's Envoy session for the roster, as it closes. It
+// shuts the gate first, so no join still in its reads commits, then ends
+// every membership, and tells each agent the voice stopped through the
+// session it joined under, while that session can still send
+// (tellStopped): all at once, within ctx. A close whose epoch a later
+// SetAgents passed while it cleaned up changes nothing more.
+func (r *Roster) CloseAgents(ctx context.Context) {
 	r.mu.Lock()
 	r.epoch++
 	epoch, closing := r.epoch, r.agents
-	r.open = agents != nil
-	if agents != nil {
-		r.agents = agents
-		if r.ready != nil {
-			close(r.ready)
-			r.ready = nil
-		}
-		r.mu.Unlock()
-		return
-	}
+	r.open = false
 	var gone []*member
 	for _, m := range r.members {
 		if !m.ending {
@@ -709,13 +719,62 @@ func (r *Roster) SetAgents(agents Agents) {
 	r.applyKeyterms(keys)
 	for _, m := range gone {
 		r.finishLeave(m)
-		r.sendVia(r.ctx, closing, m.Agent, "", "notice", voiceStoppedText)
 	}
+	r.tellStopped(ctx, closing, gone)
 	r.mu.Lock()
 	if r.epoch == epoch {
 		r.agents = nil
 	}
 	r.mu.Unlock()
+}
+
+// tellStopped sends each of gone's agents the notice that the voice stopped,
+// through agents, each on a goroutine of its own, so the notices go out
+// together. Each send runs within ctx, Close's end and sendTimeout. It waits
+// for them within ctx; at ctx's end it waits no longer, and logs the agents
+// not told. A send still under way then sees ctx's end too.
+func (r *Roster) tellStopped(ctx context.Context, agents Agents, gone []*member) {
+	if len(gone) == 0 {
+		return
+	}
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	defer context.AfterFunc(r.ctx, cancel)()
+	var mu sync.Mutex
+	untold := make(map[string]bool, len(gone))
+	for _, m := range gone {
+		untold[m.Agent] = true
+	}
+	var sends sync.WaitGroup
+	for _, m := range gone {
+		sends.Add(1)
+		go func() {
+			defer sends.Done()
+			if r.sendVia(ctx, agents, m.Agent, "", "notice", voiceStoppedText) {
+				mu.Lock()
+				delete(untold, m.Agent)
+				mu.Unlock()
+			}
+		}()
+	}
+	sent := make(chan struct{})
+	go func() {
+		sends.Wait()
+		close(sent)
+	}()
+	select {
+	case <-sent:
+	case <-ctx.Done():
+	}
+	if ctx.Err() == nil {
+		return // every send ended in time; sendVia logged any that failed
+	}
+	mu.Lock()
+	names := slices.Sorted(maps.Keys(untold))
+	mu.Unlock()
+	if len(names) > 0 {
+		r.logf("joined: the stop ended before these agents were told the voice stopped: %s (%v)", strings.Join(names, ", "), context.Cause(ctx))
+	}
 }
 
 // Close stops Run and the sends still going. Nothing async starts once it
@@ -1342,12 +1401,13 @@ func (r *Roster) send(ctx context.Context, agent, inReplyTo, kind, text string) 
 	r.sendVia(ctx, r.currentAgents(), agent, inReplyTo, kind, text)
 }
 
-// sendVia sends as send does, through agents: a stop tells its agents through
-// the session they joined under, never one opened since.
-func (r *Roster) sendVia(ctx context.Context, agents Agents, agent, inReplyTo, kind, text string) {
+// sendVia sends as send does, through agents, and reports whether the send
+// was made: a stop tells its agents through the session they joined under,
+// never one opened since.
+func (r *Roster) sendVia(ctx context.Context, agents Agents, agent, inReplyTo, kind, text string) bool {
 	if agents == nil {
 		r.logf("joined: no Envoy session to send a joined agent its %s", kind)
-		return
+		return false
 	}
 	key := uuid.NewString()
 	if inReplyTo != "" {
@@ -1361,7 +1421,9 @@ func (r *Roster) sendVia(ctx context.Context, agents Agents, agent, inReplyTo, k
 	sendCtx := &liveContext{Context: timed, cancel: cancel, alive: func() bool { return parent.Err() == nil }}
 	if _, err := agents.Send(sendCtx, &envoy.SendRequest{Target: agent, Message: text, NoReply: true, IdempotencyKey: key, InReplyTo: inReplyTo}); err != nil {
 		r.logf("joined: send a joined agent its %s: %v", kind, err)
+		return false
 	}
+	return true
 }
 
 // async runs f on a goroutine Close waits for, with a context Close ends;

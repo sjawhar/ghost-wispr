@@ -1150,8 +1150,17 @@ func (s *SQLiteStore) CreateSession(id string, startedAt time.Time) error {
 // EndSession ends a session with its saved recording. A session that ends
 // without one (it could not be saved, or none was made) can never be refined,
 // so its refinement status becomes the terminal no_audio in the same write.
-func (s *SQLiteStore) EndSession(id string, endedAt time.Time, audioPath string) error {
-	res, err := s.db.Exec(
+// queueEvent, unless "", is a lifecycle event the same transaction queues
+// for the session (EnqueueEnvoyLifecycleEvent): the end and its event are
+// saved together, so an event whose send the stop refuses stays queued for
+// the next start's sweep.
+func (s *SQLiteStore) EndSession(id string, endedAt time.Time, audioPath, queueEvent string) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return fmt.Errorf("end session %s: %w", id, err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	res, err := tx.Exec(
 		`UPDATE sessions SET ended_at = ?, status = 'ended', audio_path = ?,
 			refinement_status = CASE WHEN ? = '' THEN ? ELSE refinement_status END
 		 WHERE id = ? AND status != ?`,
@@ -1172,7 +1181,7 @@ func (s *SQLiteStore) EndSession(id string, endedAt time.Time, audioPath string)
 	}
 	if rows == 0 {
 		var status, mergedInto string
-		if err := s.db.QueryRow(`SELECT status, merged_into FROM sessions WHERE id = ?`, id).Scan(&status, &mergedInto); err != nil {
+		if err := tx.QueryRow(`SELECT status, merged_into FROM sessions WHERE id = ?`, id).Scan(&status, &mergedInto); err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
 				return sql.ErrNoRows
 			}
@@ -1182,6 +1191,14 @@ func (s *SQLiteStore) EndSession(id string, endedAt time.Time, audioPath string)
 			return &sessionRefusal{action: "end", sessionID: id, reason: "it was already merged into " + mergedInto, sentinel: ErrSessionMerged}
 		}
 		return sql.ErrNoRows
+	}
+	if queueEvent != "" {
+		if _, err := tx.Exec(`INSERT OR IGNORE INTO envoy_lifecycle_events(event_type, session_id) VALUES(?, ?)`, queueEvent, id); err != nil {
+			return fmt.Errorf("queue %s event for session %s: %w", queueEvent, id, err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("end session %s: %w", id, err)
 	}
 	return nil
 }
@@ -2271,8 +2288,11 @@ func (s *SQLiteStore) FinishRefinementResume(id string) error {
 // now, the restart, since a clock set back or ahead while it recorded can
 // stamp the file outside them. A session with no raw recording ends now. Each
 // ends with no saved recording, so it cannot be refined (no_audio) until the
-// app saves its raw recording as its recording.
-func (s *SQLiteStore) RecoverStaleSessions(audioDir string) ([]string, error) {
+// app saves its raw recording as its recording. queueEvent, unless "", is a
+// lifecycle event each session's end queues in the same transaction (as
+// EndSession does): a recovered end is never saved without its event, so a
+// stop before the event is sent leaves it for the next start's sweep.
+func (s *SQLiteStore) RecoverStaleSessions(audioDir, queueEvent string) ([]string, error) {
 	now := time.Now().UTC()
 
 	rows, err := s.db.Query(`SELECT id, started_at FROM sessions WHERE status = 'active'`)
@@ -2312,17 +2332,41 @@ func (s *SQLiteStore) RecoverStaleSessions(audioDir string) ([]string, error) {
 				endedAt = now
 			}
 		}
-		_, err := s.db.Exec(
-			`UPDATE sessions SET ended_at = ?, status = 'ended', refinement_status = ? WHERE id = ? AND status = 'active'`,
-			endedAt.Format(time.RFC3339Nano), RefinementNoAudio, sess.id,
-		)
-		if err != nil {
-			return nil, fmt.Errorf("end stale session %s: %w", sess.id, err)
+		if err := s.endStaleSession(sess.id, endedAt, queueEvent); err != nil {
+			return nil, err
 		}
 		ids = append(ids, sess.id)
 	}
 
 	return ids, nil
+}
+
+// endStaleSession ends active session id at endedAt with no recording, and
+// queues queueEvent for it, unless "", in the same transaction.
+func (s *SQLiteStore) endStaleSession(id string, endedAt time.Time, queueEvent string) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return fmt.Errorf("end stale session %s: %w", id, err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	res, err := tx.Exec(
+		`UPDATE sessions SET ended_at = ?, status = 'ended', refinement_status = ? WHERE id = ? AND status = 'active'`,
+		endedAt.Format(time.RFC3339Nano), RefinementNoAudio, id,
+	)
+	if err != nil {
+		return fmt.Errorf("end stale session %s: %w", id, err)
+	}
+	if ended, err := res.RowsAffected(); err != nil {
+		return fmt.Errorf("end stale session %s: %w", id, err)
+	} else if ended > 0 && queueEvent != "" {
+		if _, err := tx.Exec(`INSERT OR IGNORE INTO envoy_lifecycle_events(event_type, session_id) VALUES(?, ?)`, queueEvent, id); err != nil {
+			return fmt.Errorf("queue %s event for stale session %s: %w", queueEvent, id, err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("end stale session %s: %w", id, err)
+	}
+	return nil
 }
 
 // lastRawWrite returns when session sessionID's raw recording in audioDir was

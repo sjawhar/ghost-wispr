@@ -16,7 +16,7 @@ func TestMarkSpliceCompleteAdvancesRevisionAndMatchesOnlyItsRecording(t *testing
 	if err := store.CreateSession("s", started); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.EndSession("s", started.Add(time.Minute), "/audio/recording.mp3,/audio/not-recording.mp3"); err != nil {
+	if err := store.EndSession("s", started.Add(time.Minute), "/audio/recording.mp3,/audio/not-recording.mp3", ""); err != nil {
 		t.Fatal(err)
 	}
 	words := []RefinedWord{

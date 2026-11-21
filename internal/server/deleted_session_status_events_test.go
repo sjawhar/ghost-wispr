@@ -51,7 +51,7 @@ func TestADeletedSessionLeavesNoStatusEventNamingIt(t *testing.T) {
 	if err := store.AppendSegment(id, transcribe.Segment{Text: "We named the warehouse robot project.", StartTime: 0, EndTime: 3, Timestamp: started}); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.EndSession(id, started.Add(time.Minute), recording); err != nil {
+	if err := store.EndSession(id, started.Add(time.Minute), recording, ""); err != nil {
 		t.Fatal(err)
 	}
 	hub := NewHub()

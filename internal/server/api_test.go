@@ -1388,7 +1388,7 @@ func TestMergeSession_RefusesASessionThatOwesADriveReplacement(t *testing.T) {
 		if err := store.CreateSession(id, at); err != nil {
 			t.Fatal(err)
 		}
-		if err := store.EndSession(id, at.Add(time.Minute), ""); err != nil {
+		if err := store.EndSession(id, at.Add(time.Minute), "", ""); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -1428,7 +1428,7 @@ func TestDeleteSession_RefusesASessionThatOwesADriveReplacement(t *testing.T) {
 	if err := store.CreateSession(id, started); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.EndSession(id, started.Add(time.Minute), ""); err != nil {
+	if err := store.EndSession(id, started.Add(time.Minute), "", ""); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := store.DB().Exec(`UPDATE sessions SET drive_replace_pending = 1 WHERE id = ?`, id); err != nil {
@@ -4640,7 +4640,7 @@ func newMergedDeleteStore(t *testing.T) (*storage.SQLiteStore, string, map[strin
 		if err := store.CreateSession(id, at); err != nil {
 			t.Fatal(err)
 		}
-		if err := store.EndSession(id, at.Add(time.Minute), id+".mp3"); err != nil {
+		if err := store.EndSession(id, at.Add(time.Minute), id+".mp3", ""); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -4770,7 +4770,7 @@ func TestDeleteSessionRefusesNestedMergeTarget(t *testing.T) {
 		if err := store.CreateSession(id, at); err != nil {
 			t.Fatal(err)
 		}
-		if err := store.EndSession(id, at.Add(time.Minute), ""); err != nil {
+		if err := store.EndSession(id, at.Add(time.Minute), "", ""); err != nil {
 			t.Fatal(err)
 		}
 	}

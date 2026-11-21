@@ -68,7 +68,7 @@ func TestAFailedResummarizeKeepsTheLastGoodSummaryAndTitle(t *testing.T) {
 			if err := store.AppendSegment(id, transcribe.Segment{Text: "We agreed to move the launch to Friday.", StartTime: 0, EndTime: 3, Timestamp: started}); err != nil {
 				t.Fatalf("append segment: %v", err)
 			}
-			if err := store.EndSession(id, started.Add(time.Minute), ""); err != nil {
+			if err := store.EndSession(id, started.Add(time.Minute), "", ""); err != nil {
 				t.Fatalf("end session: %v", err)
 			}
 			if _, _, err := store.Canonicalize(id); err != nil {

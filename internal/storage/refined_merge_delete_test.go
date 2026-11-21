@@ -27,7 +27,7 @@ func TestDeleteRefinedSegmentScrubsMergedSourcesByRecording(t *testing.T) {
 		if err := store.CreateSession(session.id, session.at); err != nil {
 			t.Fatal(err)
 		}
-		if err := store.EndSession(session.id, session.at.Add(time.Minute), session.recording); err != nil {
+		if err := store.EndSession(session.id, session.at.Add(time.Minute), session.recording, ""); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -104,7 +104,7 @@ func TestRefinedDeleteKeepsAnAudiolessSourceText(t *testing.T) {
 	if err := store.CreateSession("a", startA); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.EndSession("a", startA.Add(time.Minute), "a.mp3"); err != nil {
+	if err := store.EndSession("a", startA.Add(time.Minute), "a.mp3", ""); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.CreateSession("b", startB); err != nil {
@@ -113,7 +113,7 @@ func TestRefinedDeleteKeepsAnAudiolessSourceText(t *testing.T) {
 	if err := store.AppendSegment("b", transcribe.Segment{Text: "bravo only live words", StartTime: 0, EndTime: 1, Timestamp: startB}); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.EndSession("b", startB.Add(time.Minute), ""); err != nil {
+	if err := store.EndSession("b", startB.Add(time.Minute), "", ""); err != nil {
 		t.Fatal(err)
 	}
 	if _, _, err := store.Canonicalize("b"); err != nil {

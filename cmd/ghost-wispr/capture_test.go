@@ -1912,11 +1912,11 @@ type refusingStore struct {
 	refuse atomic.Bool
 }
 
-func (s *refusingStore) EndSession(id string, endedAt time.Time, audioPath string) error {
+func (s *refusingStore) EndSession(id string, endedAt time.Time, audioPath, queueEvent string) error {
 	if s.refuse.Load() {
 		return errors.New("disk I/O error")
 	}
-	return s.SQLiteStore.EndSession(id, endedAt, audioPath)
+	return s.SQLiteStore.EndSession(id, endedAt, audioPath, queueEvent)
 }
 
 // blockRecordingFiles puts a directory where each file the recording of

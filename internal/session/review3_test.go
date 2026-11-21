@@ -28,7 +28,7 @@ func TestReview3NoSummarizerCompletesSummaryAfterDelete(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if err := store.EndSession("s", started.Add(3*time.Second), "recording.mp3"); err != nil {
+	if err := store.EndSession("s", started.Add(3*time.Second), "recording.mp3", ""); err != nil {
 		t.Fatal(err)
 	}
 	manager := NewManager(store, nil, nil, nil, nil, 0)
@@ -70,7 +70,7 @@ func noSummarizerStore(t *testing.T) *storage.SQLiteStore {
 			t.Fatal(err)
 		}
 	}
-	if err := store.EndSession("s", started.Add(2*time.Second), "recording.mp3"); err != nil {
+	if err := store.EndSession("s", started.Add(2*time.Second), "recording.mp3", ""); err != nil {
 		t.Fatal(err)
 	}
 	return store

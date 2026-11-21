@@ -251,7 +251,7 @@ func TestRefusedCutWarningFollowsAMerge(t *testing.T) {
 	if err := store.CreateSession("o", started); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.EndSession("o", started.Add(time.Minute), other); err != nil {
+	if err := store.EndSession("o", started.Add(time.Minute), other, ""); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.MergeSessions("m", []string{"s", "o"}, started.Add(-time.Hour), started.Add(time.Minute)); err != nil {

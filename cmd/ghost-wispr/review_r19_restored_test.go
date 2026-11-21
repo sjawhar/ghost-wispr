@@ -57,7 +57,7 @@ func reviewR19RestoredThenMergedDelete(t *testing.T, throughRestore bool) string
 	if err := store.CreateSession(tID, start.Add(time.Hour)); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.EndSession(tID, start.Add(61*time.Minute), tPath); err != nil {
+	if err := store.EndSession(tID, start.Add(61*time.Minute), tPath, ""); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.MergeSessions("merged", []string{rID, tID}, start, start.Add(2*time.Hour)); err != nil {
@@ -148,7 +148,7 @@ func TestReviewR19RestoredMergeThenMergedAgain(t *testing.T) {
 	if err := store.CreateSession(tID, start.Add(3*time.Hour)); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.EndSession(tID, start.Add(181*time.Minute), path(tID)); err != nil {
+	if err := store.EndSession(tID, start.Add(181*time.Minute), path(tID), ""); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.MergeSessions("top", []string{rs.ID, tID}, start, start.Add(4*time.Hour)); err != nil {

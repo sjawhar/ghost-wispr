@@ -332,7 +332,7 @@ func TestADeletedMeetingsReplyIsDropped(t *testing.T) {
 	r := newRig(t)
 	r.agents.states["agent-7"] = envoy.SessionInfo{SessionID: "agent-7", State: envoy.StateLive}
 	r.ask(t, "agent-7", "q", "")
-	if err := r.store.EndSession("meeting-1", testNow, ""); err != nil {
+	if err := r.store.EndSession("meeting-1", testNow, "", ""); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := r.store.DeleteSession("meeting-1", t.TempDir()); err != nil {

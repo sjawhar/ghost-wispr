@@ -250,7 +250,7 @@ func TestOlderSchemaBackupScrubsRefinedWords(t *testing.T) {
 	if err := store.CreateSession("s1", started); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.EndSession("s1", started.Add(time.Minute), "recording.mp3"); err != nil {
+	if err := store.EndSession("s1", started.Add(time.Minute), "recording.mp3", ""); err != nil {
 		t.Fatal(err)
 	}
 	words := []RefinedWord{

@@ -14,7 +14,7 @@ func syncedSessionInFolder(t *testing.T, store *SQLiteStore, id string) {
 	if err := store.CreateSession(id, started); err != nil {
 		t.Fatalf("create: %v", err)
 	}
-	if err := store.EndSession(id, started.Add(time.Minute), ""); err != nil {
+	if err := store.EndSession(id, started.Add(time.Minute), "", ""); err != nil {
 		t.Fatalf("end: %v", err)
 	}
 	if err := store.UpdateSummaryAtGeneration(id, "Standup", "A summary.", SummaryCompleted, "default", "{}", "", 0); err != nil {
@@ -123,7 +123,7 @@ func TestCountUnitOnlySessionsCountsOnlyRemoteDeletedSessionsWithAudio(t *testin
 		if err := store.CreateSession(id, started); err != nil {
 			t.Fatalf("create: %v", err)
 		}
-		if err := store.EndSession(id, started.Add(time.Minute), "/audio/"+id+".mp3"); err != nil {
+		if err := store.EndSession(id, started.Add(time.Minute), "/audio/"+id+".mp3", ""); err != nil {
 			t.Fatalf("end: %v", err)
 		}
 		syncTo(t, store, id, SyncStateSynced, "folder-1", 0, "")

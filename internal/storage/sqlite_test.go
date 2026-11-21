@@ -224,7 +224,7 @@ func TestSQLiteCRUD(t *testing.T) {
 		t.Fatalf("UpdateSummaryAtGeneration failed: %v", err)
 	}
 
-	if err := store.EndSession(sessionID, startedAt.Add(30*time.Second), "data/audio/20260226100000.mp3"); err != nil {
+	if err := store.EndSession(sessionID, startedAt.Add(30*time.Second), "data/audio/20260226100000.mp3", ""); err != nil {
 		t.Fatalf("EndSession failed: %v", err)
 	}
 
@@ -299,7 +299,7 @@ func TestSummaryVersionIncrements(t *testing.T) {
 	if err := store.CreateSession(sessionID, time.Date(2026, 11, 10, 12, 30, 45, 0, time.UTC)); err != nil {
 		t.Fatalf("CreateSession: %v", err)
 	}
-	if err := store.EndSession(sessionID, time.Date(2026, 11, 10, 12, 31, 45, 0, time.UTC), ""); err != nil {
+	if err := store.EndSession(sessionID, time.Date(2026, 11, 10, 12, 31, 45, 0, time.UTC), "", ""); err != nil {
 		t.Fatalf("EndSession: %v", err)
 	}
 	version := func(step string) int {
@@ -424,7 +424,7 @@ func TestSummaryVersionMigratesExistingSessions(t *testing.T) {
 	if err := store.CreateSession("existing", startedAt); err != nil {
 		t.Fatalf("CreateSession: %v", err)
 	}
-	if err := store.EndSession("existing", startedAt.Add(time.Minute), ""); err != nil {
+	if err := store.EndSession("existing", startedAt.Add(time.Minute), "", ""); err != nil {
 		t.Fatalf("EndSession: %v", err)
 	}
 	if err := store.UpdateSummaryAtGeneration("existing", "Existing", "Existing summary", SummaryCompleted, "default", "{}", "", 0); err != nil {
@@ -585,7 +585,7 @@ func TestEndSessionWithoutRecordingMarksRefinementNoAudio(t *testing.T) {
 		if err := store.CreateSession(id, started); err != nil {
 			t.Fatalf("CreateSession %s: %v", id, err)
 		}
-		if err := store.EndSession(id, started.Add(time.Minute), audioPath); err != nil {
+		if err := store.EndSession(id, started.Add(time.Minute), audioPath, ""); err != nil {
 			t.Fatalf("EndSession %s: %v", id, err)
 		}
 		want := RefinementPending
@@ -609,7 +609,7 @@ func TestRecoverStaleSessionsMarksRefinementNoAudio(t *testing.T) {
 	if err := store.CreateSession("20261106140930", time.Date(2026, 11, 6, 14, 9, 30, 0, time.UTC)); err != nil {
 		t.Fatalf("CreateSession: %v", err)
 	}
-	if _, err := store.RecoverStaleSessions(t.TempDir()); err != nil {
+	if _, err := store.RecoverStaleSessions(t.TempDir(), ""); err != nil {
 		t.Fatalf("RecoverStaleSessions: %v", err)
 	}
 	session, err := store.GetSession("20261106140930")
@@ -653,7 +653,7 @@ func TestRecoverStaleSessionsEndsASessionAtItsLastAudio(t *testing.T) {
 	}
 
 	restartFrom := time.Now().UTC()
-	if _, err := store.RecoverStaleSessions(audioDir); err != nil {
+	if _, err := store.RecoverStaleSessions(audioDir, ""); err != nil {
 		t.Fatalf("RecoverStaleSessions: %v", err)
 	}
 	restartTo := time.Now().UTC()
@@ -697,7 +697,7 @@ func TestOpeningTheStoreMarksEarlierSessionsWithoutRecordingNoAudio(t *testing.T
 		if err := store.CreateSession(id, started); err != nil {
 			t.Fatalf("CreateSession %s: %v", id, err)
 		}
-		if err := store.EndSession(id, started.Add(time.Minute), audioPath); err != nil {
+		if err := store.EndSession(id, started.Add(time.Minute), audioPath, ""); err != nil {
 			t.Fatalf("EndSession %s: %v", id, err)
 		}
 	}
@@ -753,7 +753,7 @@ func TestRecordings(t *testing.T) {
 		if err := store.CreateSession(id, started.Add(at)); err != nil {
 			t.Fatalf("CreateSession %s: %v", id, err)
 		}
-		if err := store.EndSession(id, started.Add(at+time.Minute), audioPath); err != nil {
+		if err := store.EndSession(id, started.Add(at+time.Minute), audioPath, ""); err != nil {
 			t.Fatalf("EndSession %s: %v", id, err)
 		}
 		if syncState != "" {
@@ -802,7 +802,7 @@ func endedWith(t *testing.T, store *SQLiteStore, id, audioPath, refinement strin
 	if err := store.CreateSession(id, started); err != nil {
 		t.Fatalf("CreateSession %s: %v", id, err)
 	}
-	if err := store.EndSession(id, started.Add(time.Minute), audioPath); err != nil {
+	if err := store.EndSession(id, started.Add(time.Minute), audioPath, ""); err != nil {
 		t.Fatalf("EndSession %s: %v", id, err)
 	}
 	if err := store.UpdateRefinementAtGeneration(id, "", refinement, "", 0); err != nil {
@@ -1204,7 +1204,7 @@ func TestOpeningTheStoreResyncsMergedSessionsOnce(t *testing.T) {
 		if err := store.CreateSession(id, at); err != nil {
 			t.Fatalf("CreateSession %s: %v", id, err)
 		}
-		if err := store.EndSession(id, at.Add(time.Minute), "/audio/"+id+".mp3"); err != nil {
+		if err := store.EndSession(id, at.Add(time.Minute), "/audio/"+id+".mp3", ""); err != nil {
 			t.Fatalf("EndSession %s: %v", id, err)
 		}
 	}
@@ -1282,7 +1282,7 @@ func TestSyncStatusTracking(t *testing.T) {
 	if err := store.CreateSession(sessionID, started); err != nil {
 		t.Fatalf("create session: %v", err)
 	}
-	if err := store.EndSession(sessionID, started.Add(30*time.Second), "data/audio/sync-test-1.mp3"); err != nil {
+	if err := store.EndSession(sessionID, started.Add(30*time.Second), "data/audio/sync-test-1.mp3", ""); err != nil {
 		t.Fatalf("end session: %v", err)
 	}
 	if err := store.UpdateSummaryAtGeneration(sessionID, "Test Title", "Test summary", SummaryCompleted, "default", "{}", "", 0); err != nil {
@@ -1327,7 +1327,7 @@ func TestEnvoyPublishStatusTracking(t *testing.T) {
 	if err := store.CreateSession(sessionID, started); err != nil {
 		t.Fatalf("create session: %v", err)
 	}
-	if err := store.EndSession(sessionID, started.Add(30*time.Second), "data/audio/envoy-test-1.mp3"); err != nil {
+	if err := store.EndSession(sessionID, started.Add(30*time.Second), "data/audio/envoy-test-1.mp3", ""); err != nil {
 		t.Fatalf("end session: %v", err)
 	}
 	if err := store.UpdateSummaryAtGeneration(sessionID, "Test Title", "Test summary", SummaryCompleted, "default", "{}", "", 0); err != nil {
@@ -1381,7 +1381,7 @@ func TestEnvoyPublishStatusIsVersionAware(t *testing.T) {
 	if err := store.CreateSession(sessionID, started); err != nil {
 		t.Fatalf("CreateSession: %v", err)
 	}
-	if err := store.EndSession(sessionID, started.Add(time.Minute), ""); err != nil {
+	if err := store.EndSession(sessionID, started.Add(time.Minute), "", ""); err != nil {
 		t.Fatalf("EndSession: %v", err)
 	}
 	if err := store.UpdateSummaryAtGeneration(sessionID, "Title", "Summary", SummaryCompleted, "default", "{}", "", 0); err != nil {
@@ -1412,7 +1412,7 @@ func TestStartSummaryResetsEnvoyPublishStatus(t *testing.T) {
 	if err := store.CreateSession(sessionID, started); err != nil {
 		t.Fatalf("create session: %v", err)
 	}
-	if err := store.EndSession(sessionID, started.Add(30*time.Second), "data/audio/envoy-reset-1.mp3"); err != nil {
+	if err := store.EndSession(sessionID, started.Add(30*time.Second), "data/audio/envoy-reset-1.mp3", ""); err != nil {
 		t.Fatalf("end session: %v", err)
 	}
 	if err := store.UpdateSummaryAtGeneration(sessionID, "Published Title", "Published summary", SummaryCompleted, "default", "{}", "", 0); err != nil {
@@ -1443,7 +1443,7 @@ func TestGetGCEligibleSessions(t *testing.T) {
 	if err := store.CreateSession("gc-eligible", old); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.EndSession("gc-eligible", old.Add(time.Minute), "data/audio/gc-eligible.mp3"); err != nil {
+	if err := store.EndSession("gc-eligible", old.Add(time.Minute), "data/audio/gc-eligible.mp3", ""); err != nil {
 		t.Fatal(err)
 	}
 	// Summarized, then synced, as the app does it: a summary changed after
@@ -1456,7 +1456,7 @@ func TestGetGCEligibleSessions(t *testing.T) {
 	if err := store.CreateSession("gc-unsynced", old); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.EndSession("gc-unsynced", old.Add(time.Minute), "data/audio/gc-unsynced.mp3"); err != nil {
+	if err := store.EndSession("gc-unsynced", old.Add(time.Minute), "data/audio/gc-unsynced.mp3", ""); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.UpdateSummaryAtGeneration("gc-unsynced", "", "test summary", "completed", "default", "{}", "", 0); err != nil {
@@ -1466,7 +1466,7 @@ func TestGetGCEligibleSessions(t *testing.T) {
 	if err := store.CreateSession("gc-recent", now.Add(-time.Hour)); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.EndSession("gc-recent", now.Add(-30*time.Minute), "data/audio/gc-recent.mp3"); err != nil {
+	if err := store.EndSession("gc-recent", now.Add(-30*time.Minute), "data/audio/gc-recent.mp3", ""); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.UpdateSummaryAtGeneration("gc-recent", "", "test summary", "completed", "default", "{}", "", 0); err != nil {
@@ -1492,7 +1492,7 @@ func summarizedSession(t *testing.T, store *SQLiteStore, id string, startedAt ti
 	if err := store.CreateSession(id, startedAt); err != nil {
 		t.Fatalf("CreateSession %s: %v", id, err)
 	}
-	if err := store.EndSession(id, startedAt.Add(time.Minute), ""); err != nil {
+	if err := store.EndSession(id, startedAt.Add(time.Minute), "", ""); err != nil {
 		t.Fatalf("EndSession %s: %v", id, err)
 	}
 	if err := store.UpdateSummaryAtGeneration(id, "", "A summary.", SummaryCompleted, "default", "{}", "", 0); err != nil {
@@ -1598,7 +1598,7 @@ func TestMergeSessionsMovesTheRecordingsToTheMergedSession(t *testing.T) {
 		if err := store.CreateSession(id, at); err != nil {
 			t.Fatalf("CreateSession %s: %v", id, err)
 		}
-		if err := store.EndSession(id, at.Add(time.Minute), "data/audio/"+id+".mp3"); err != nil {
+		if err := store.EndSession(id, at.Add(time.Minute), "data/audio/"+id+".mp3", ""); err != nil {
 			t.Fatalf("EndSession %s: %v", id, err)
 		}
 	}
@@ -1634,7 +1634,7 @@ func TestOpeningTheStoreMovesRecordingsOffMergedSources(t *testing.T) {
 	if err := store.CreateSession("20261106100000", started); err != nil {
 		t.Fatalf("CreateSession: %v", err)
 	}
-	if err := store.EndSession("20261106100000", started.Add(time.Minute), "data/audio/20261106100000.mp3"); err != nil {
+	if err := store.EndSession("20261106100000", started.Add(time.Minute), "data/audio/20261106100000.mp3", ""); err != nil {
 		t.Fatalf("EndSession: %v", err)
 	}
 	if err := store.MergeSessions("20261106100000-merged", []string{"20261106100000"}, started, started.Add(time.Minute)); err != nil {
@@ -1673,7 +1673,7 @@ func TestDeleteSession(t *testing.T) {
 	if err := store.CreateSession(sessionID, started); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.EndSession(sessionID, started.Add(time.Minute), ""); err != nil {
+	if err := store.EndSession(sessionID, started.Add(time.Minute), "", ""); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1760,10 +1760,10 @@ func TestMergeSessions(t *testing.T) {
 		t.Fatalf("AppendSegment source-b failed: %v", err)
 	}
 
-	if err := store.EndSession("source-a", startA.Add(90*time.Second), "data/audio/a.mp3"); err != nil {
+	if err := store.EndSession("source-a", startA.Add(90*time.Second), "data/audio/a.mp3", ""); err != nil {
 		t.Fatalf("EndSession source-a failed: %v", err)
 	}
-	if err := store.EndSession("source-b", startB.Add(90*time.Second), "data/audio/b.mp3"); err != nil {
+	if err := store.EndSession("source-b", startB.Add(90*time.Second), "data/audio/b.mp3", ""); err != nil {
 		t.Fatalf("EndSession source-b failed: %v", err)
 	}
 
@@ -1825,10 +1825,10 @@ func TestGetSessionsByDate_ExcludesMerged(t *testing.T) {
 	if err := store.CreateSession("source-2", base.Add(30*time.Minute)); err != nil {
 		t.Fatalf("CreateSession source-2 failed: %v", err)
 	}
-	if err := store.EndSession("source-1", base.Add(10*time.Minute), ""); err != nil {
+	if err := store.EndSession("source-1", base.Add(10*time.Minute), "", ""); err != nil {
 		t.Fatalf("EndSession source-1 failed: %v", err)
 	}
-	if err := store.EndSession("source-2", base.Add(40*time.Minute), ""); err != nil {
+	if err := store.EndSession("source-2", base.Add(40*time.Minute), "", ""); err != nil {
 		t.Fatalf("EndSession source-2 failed: %v", err)
 	}
 
@@ -1855,7 +1855,7 @@ func TestSyncStateMetadataAndRetryQuery(t *testing.T) {
 	if err := store.CreateSession(sessionID, started); err != nil {
 		t.Fatalf("create session: %v", err)
 	}
-	if err := store.EndSession(sessionID, started.Add(5*time.Minute), "data/audio/sync-state-retry-1.mp3"); err != nil {
+	if err := store.EndSession(sessionID, started.Add(5*time.Minute), "data/audio/sync-state-retry-1.mp3", ""); err != nil {
 		t.Fatalf("end session: %v", err)
 	}
 
@@ -1896,7 +1896,7 @@ func TestRemoteDeletedIsSoftDelete(t *testing.T) {
 	if err := store.CreateSession(sessionID, started); err != nil {
 		t.Fatalf("create session: %v", err)
 	}
-	if err := store.EndSession(sessionID, started.Add(4*time.Minute), "data/audio/sync-state-remote-deleted-1.mp3"); err != nil {
+	if err := store.EndSession(sessionID, started.Add(4*time.Minute), "data/audio/sync-state-remote-deleted-1.mp3", ""); err != nil {
 		t.Fatalf("end session: %v", err)
 	}
 
@@ -1926,7 +1926,7 @@ func TestCanonicalize_FromRefinedTranscript(t *testing.T) {
 	if err := store.CreateSession(sessionID, started); err != nil {
 		t.Fatalf("create session: %v", err)
 	}
-	if err := store.EndSession(sessionID, started.Add(5*time.Minute), ""); err != nil {
+	if err := store.EndSession(sessionID, started.Add(5*time.Minute), "", ""); err != nil {
 		t.Fatalf("end session: %v", err)
 	}
 
@@ -1979,7 +1979,7 @@ func TestCanonicalize_FallbackToStreaming(t *testing.T) {
 	if err := store.CreateSession(sessionID, started); err != nil {
 		t.Fatalf("create session: %v", err)
 	}
-	if err := store.EndSession(sessionID, started.Add(5*time.Minute), ""); err != nil {
+	if err := store.EndSession(sessionID, started.Add(5*time.Minute), "", ""); err != nil {
 		t.Fatalf("end session: %v", err)
 	}
 
@@ -2015,7 +2015,7 @@ func TestCanonicalize_RefinementFailed_FallsBackToStreaming(t *testing.T) {
 	if err := store.CreateSession(sessionID, started); err != nil {
 		t.Fatalf("create session: %v", err)
 	}
-	if err := store.EndSession(sessionID, started.Add(5*time.Minute), ""); err != nil {
+	if err := store.EndSession(sessionID, started.Add(5*time.Minute), "", ""); err != nil {
 		t.Fatalf("end session: %v", err)
 	}
 
@@ -2049,7 +2049,7 @@ func TestCanonicalize_RecanonicalizeAfterLateRefinement(t *testing.T) {
 	if err := store.CreateSession(sessionID, started); err != nil {
 		t.Fatalf("create session: %v", err)
 	}
-	if err := store.EndSession(sessionID, started.Add(5*time.Minute), ""); err != nil {
+	if err := store.EndSession(sessionID, started.Add(5*time.Minute), "", ""); err != nil {
 		t.Fatalf("end session: %v", err)
 	}
 
@@ -2166,7 +2166,7 @@ func TestFTS5TriggersStayInSyncOnUpdateAndDelete(t *testing.T) {
 	if err := store.CreateSession("fts-sync", started); err != nil {
 		t.Fatalf("create session: %v", err)
 	}
-	if err := store.EndSession("fts-sync", started.Add(time.Minute), ""); err != nil {
+	if err := store.EndSession("fts-sync", started.Add(time.Minute), "", ""); err != nil {
 		t.Fatalf("end session: %v", err)
 	}
 	if err := store.UpdateSummaryAtGeneration("fts-sync", "Initial title", "Initial summary", SummaryCompleted, "default", "{}", "", 0); err != nil {
@@ -2370,7 +2370,7 @@ func TestSegmentsInTimeRange(t *testing.T) {
 	if err := store.CreateSession(sessionID, startedAt); err != nil {
 		t.Fatalf("CreateSession failed: %v", err)
 	}
-	if err := store.EndSession(sessionID, startedAt.Add(30*time.Minute), ""); err != nil {
+	if err := store.EndSession(sessionID, startedAt.Add(30*time.Minute), "", ""); err != nil {
 		t.Fatalf("EndSession failed: %v", err)
 	}
 
@@ -2452,7 +2452,7 @@ func TestAggregateSessions(t *testing.T) {
 		if err := store.CreateSession(s.id, s.date); err != nil {
 			t.Fatalf("create session %s: %v", s.id, err)
 		}
-		if err := store.EndSession(s.id, s.date.Add(30*time.Minute), ""); err != nil {
+		if err := store.EndSession(s.id, s.date.Add(30*time.Minute), "", ""); err != nil {
 			t.Fatalf("end session %s: %v", s.id, err)
 		}
 		if err := store.UpdateSummaryAtGeneration(s.id, "Title "+s.id, "Summary", SummaryCompleted, s.preset, "{}", "", 0); err != nil {

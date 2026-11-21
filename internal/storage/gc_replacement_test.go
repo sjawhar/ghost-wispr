@@ -18,7 +18,7 @@ func TestGCKeepsASessionThatOwesADriveReplacement(t *testing.T) {
 	if err := store.CreateSession(id, started); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.EndSession(id, started.Add(time.Minute), "/audio/recording.mp3"); err != nil {
+	if err := store.EndSession(id, started.Add(time.Minute), "/audio/recording.mp3", ""); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := store.DB().Exec(`UPDATE sessions SET summary_status = ?, sync_status = ?, sync_state = ?, drive_replace_pending = 1 WHERE id = ?`, SummaryCompleted, SyncSynced, SyncStateSynced, id); err != nil {

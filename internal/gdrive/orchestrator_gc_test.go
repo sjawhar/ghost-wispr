@@ -75,7 +75,7 @@ func TestOrchestratorDoesNotMarkSyncedARecordingThatCameBackDuringTheUpload(t *t
 	if err := store.CreateSession(id, started); err != nil {
 		t.Fatalf("create session: %v", err)
 	}
-	if err := store.EndSession(id, started.Add(time.Minute), recording); err != nil {
+	if err := store.EndSession(id, started.Add(time.Minute), recording, ""); err != nil {
 		t.Fatalf("end session: %v", err)
 	}
 	if err := store.UpdateSummaryAtGeneration(id, "", "A summary.", storage.SummaryCompleted, "default", "{}", "", 0); err != nil {
@@ -143,7 +143,7 @@ func TestGCNeverRemovesARecordingDriveSkippedOnARetry(t *testing.T) {
 	if err := store.CreateSession(id, started); err != nil {
 		t.Fatalf("create session: %v", err)
 	}
-	if err := store.EndSession(id, started.Add(time.Minute), strings.Join(paths, ",")); err != nil {
+	if err := store.EndSession(id, started.Add(time.Minute), strings.Join(paths, ","), ""); err != nil {
 		t.Fatalf("end session: %v", err)
 	}
 	if err := store.UpdateSummaryAtGeneration(id, "", "A summary.", storage.SummaryCompleted, "default", "{}", "", 0); err != nil {
@@ -223,7 +223,7 @@ func TestOrchestratorRetryReplacesAChangedSummary(t *testing.T) {
 	if err := store.CreateSession(id, started); err != nil {
 		t.Fatalf("create session: %v", err)
 	}
-	if err := store.EndSession(id, started.Add(time.Minute), recording); err != nil {
+	if err := store.EndSession(id, started.Add(time.Minute), recording, ""); err != nil {
 		t.Fatalf("end session: %v", err)
 	}
 	if err := store.UpdateSummaryAtGeneration(id, "", "The first summary.", storage.SummaryCompleted, "default", "{}", "", 0); err != nil {
@@ -320,7 +320,7 @@ func gcRestoreRace(t *testing.T) (*storage.SQLiteStore, string, string, []byte, 
 	if err := store.CreateSession(id, started); err != nil {
 		t.Fatalf("create session: %v", err)
 	}
-	if err := store.EndSession(id, started.Add(time.Minute), removable+","+stuck); err != nil {
+	if err := store.EndSession(id, started.Add(time.Minute), removable+","+stuck, ""); err != nil {
 		t.Fatalf("end session: %v", err)
 	}
 	if err := store.UpdateSummaryAtGeneration(id, "", "A summary.", storage.SummaryCompleted, "default", "{}", "", 0); err != nil {

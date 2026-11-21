@@ -28,7 +28,7 @@ func TestDriveReplacementWarningsComeFromTheStore(t *testing.T) {
 		if err := store.CreateSession(id, now.Add(-2*time.Hour)); err != nil {
 			t.Fatal(err)
 		}
-		if err := store.EndSession(id, now.Add(-2*time.Hour+time.Minute), ""); err != nil {
+		if err := store.EndSession(id, now.Add(-2*time.Hour+time.Minute), "", ""); err != nil {
 			t.Fatal(err)
 		}
 	}

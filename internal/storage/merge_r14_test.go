@@ -22,13 +22,13 @@ func TestMergeRefinementKeepsAndDeletesAnUntimedSourceSegment(t *testing.T) {
 	if err := store.AppendSegment("without-recording", transcribeSegment("alpha words without a recording", 0, started)); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.EndSession("without-recording", started.Add(time.Minute), ""); err != nil {
+	if err := store.EndSession("without-recording", started.Add(time.Minute), "", ""); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.CreateSession("with-recording", started.Add(time.Hour)); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.EndSession("with-recording", started.Add(61*time.Minute), "/audio/with-recording.mp3"); err != nil {
+	if err := store.EndSession("with-recording", started.Add(61*time.Minute), "/audio/with-recording.mp3", ""); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.MergeSessions("merged", []string{"without-recording", "with-recording"}, started, started.Add(2*time.Hour)); err != nil {
@@ -110,7 +110,7 @@ func TestMergeFencesSourcesAndKeepsTheirSegmentsHidden(t *testing.T) {
 		if err := store.CreateSession(id, at); err != nil {
 			t.Fatal(err)
 		}
-		if err := store.EndSession(id, at.Add(time.Minute), "/audio/"+id+".mp3"); err != nil {
+		if err := store.EndSession(id, at.Add(time.Minute), "/audio/"+id+".mp3", ""); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -164,7 +164,7 @@ func TestMergeWithoutRecordingsIsNoAudio(t *testing.T) {
 	if err := store.CreateSession("source", started); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.EndSession("source", started.Add(time.Minute), ""); err != nil {
+	if err := store.EndSession("source", started.Add(time.Minute), "", ""); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.MergeSessions("merged", []string{"source"}, started, started.Add(time.Minute)); err != nil {
@@ -185,7 +185,7 @@ func TestMergeCarriesAudioRemovalFromAGarbageCollectedSource(t *testing.T) {
 	if err := store.CreateSession("gc-removed", started); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.EndSession("gc-removed", started.Add(time.Minute), "/audio/gc-removed.mp3"); err != nil {
+	if err := store.EndSession("gc-removed", started.Add(time.Minute), "/audio/gc-removed.mp3", ""); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := store.DB().Exec(`UPDATE sessions SET audio_path = '', audio_removed_at = ? WHERE id = 'gc-removed'`, started.Add(time.Hour).UTC().Format(time.RFC3339Nano)); err != nil {
@@ -211,7 +211,7 @@ func TestLateRefinementPublicationAfterRemergeIsRefused(t *testing.T) {
 		if err := store.CreateSession(id, at); err != nil {
 			t.Fatal(err)
 		}
-		if err := store.EndSession(id, at.Add(time.Minute), "/audio/"+id+".mp3"); err != nil {
+		if err := store.EndSession(id, at.Add(time.Minute), "/audio/"+id+".mp3", ""); err != nil {
 			t.Fatal(err)
 		}
 	}

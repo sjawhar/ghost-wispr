@@ -817,7 +817,7 @@ func TestRefreshKeptRawRecordings(t *testing.T) {
 		if err := store.CreateSession(id, started); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := store.RecoverStaleSessions(dir); err != nil {
+		if _, err := store.RecoverStaleSessions(dir, ""); err != nil {
 			t.Fatal(err)
 		}
 		if err := os.WriteFile(filepath.Join(dir, id+".pcm"), make([]byte, size), 0o644); err != nil {

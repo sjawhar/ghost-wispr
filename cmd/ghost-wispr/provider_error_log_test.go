@@ -145,7 +145,7 @@ func summaryStore(t *testing.T, text string) *storage.SQLiteStore {
 	if err := store.AppendSegment(summarySessionID, transcribe.Segment{Text: text, StartTime: 0, EndTime: 3, Timestamp: started}); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.EndSession(summarySessionID, started.Add(time.Minute), ""); err != nil {
+	if err := store.EndSession(summarySessionID, started.Add(time.Minute), "", ""); err != nil {
 		t.Fatal(err)
 	}
 	return store

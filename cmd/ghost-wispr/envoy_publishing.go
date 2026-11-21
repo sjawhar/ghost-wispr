@@ -32,11 +32,40 @@ type envoyPublishing struct {
 	current atomic.Pointer[envoy.Publisher]
 }
 
+// envoyPublishingOn reports whether cfg asks for Envoy events: Envoy on, and
+// an envoy_hub_url to send them to.
+func envoyPublishingOn(cfg *config.Config) bool {
+	return cfg.EnvoyEnabled && strings.TrimSpace(cfg.EnvoyHubURL) != ""
+}
+
+// recoverStaleSessions ends the sessions a previous run left active
+// (storage.SQLiteStore.RecoverStaleSessions), and cancels their questions.
+// With Envoy events on, each end queues its session_ended event in the same
+// write: a stop before publishRecoveredEnds sends it leaves it for the next
+// start's sweep, which would otherwise never learn of the end, since the
+// session is no longer active then.
+func recoverStaleSessions(store *storage.SQLiteStore, cfg *config.Config) []string {
+	queue := ""
+	if envoyPublishingOn(cfg) {
+		queue = envoy.SessionEndedEvent
+	}
+	ids, err := store.RecoverStaleSessions(cfg.AudioDir, queue)
+	if err != nil {
+		slog.Warn("failed to recover stale sessions", "error", err)
+		return nil
+	}
+	if len(ids) > 0 {
+		log.Printf("recovered %d stale session(s): %v", len(ids), ids)
+		cancelRecoveredQuestions(store, ids)
+	}
+	return ids
+}
+
 // configure builds the publisher cfg asks for, or turns Envoy off. A config
 // with Envoy off or no envoy_hub_url sends nothing; the startup warning names
 // a missing URL.
 func (e *envoyPublishing) configure(ctx context.Context, cfg *config.Config, logger *slog.Logger) {
-	if !cfg.EnvoyEnabled || strings.TrimSpace(cfg.EnvoyHubURL) == "" {
+	if !envoyPublishingOn(cfg) {
 		e.warnings.Clear(envoyWarningKey)
 		e.set(nil)
 		return

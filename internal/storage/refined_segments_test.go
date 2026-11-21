@@ -23,7 +23,7 @@ func TestPublishRefinementReplacesLiveSegmentsWithTimedWords(t *testing.T) {
 	if err := store.AppendSegment("s1", transcribe.Segment{Text: "live segment", StartTime: 0, EndTime: 1, Timestamp: started}); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.EndSession("s1", started.Add(time.Minute), "recording.mp3"); err != nil {
+	if err := store.EndSession("s1", started.Add(time.Minute), "recording.mp3", ""); err != nil {
 		t.Fatal(err)
 	}
 
@@ -79,7 +79,7 @@ func TestDeleteRefinedSegmentTextDeletesOnlyTheSelectedRepeatedWords(t *testing.
 	if err := store.CreateSession("s1", started); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.EndSession("s1", started.Add(time.Minute), "recording.mp3"); err != nil {
+	if err := store.EndSession("s1", started.Add(time.Minute), "recording.mp3", ""); err != nil {
 		t.Fatal(err)
 	}
 	words := []RefinedWord{
@@ -151,7 +151,7 @@ func TestAudioCutShiftsLaterRefinedWords(t *testing.T) {
 	if err := store.CreateSession("s1", started); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.EndSession("s1", started.Add(time.Minute), "recording.mp3"); err != nil {
+	if err := store.EndSession("s1", started.Add(time.Minute), "recording.mp3", ""); err != nil {
 		t.Fatal(err)
 	}
 	words := []RefinedWord{
@@ -203,7 +203,7 @@ func TestDeleteRefinedSegmentRefusesStaleRevision(t *testing.T) {
 	if err := store.CreateSession("s1", started); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.EndSession("s1", started.Add(time.Minute), "recording.mp3"); err != nil {
+	if err := store.EndSession("s1", started.Add(time.Minute), "recording.mp3", ""); err != nil {
 		t.Fatal(err)
 	}
 	words := []RefinedWord{{RecordingPath: "recording.mp3", RecordingSHA256: "hash", Ordinal: 0, Text: "Keep.", Start: 0, End: 0.5}}

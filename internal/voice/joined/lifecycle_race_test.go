@@ -47,7 +47,7 @@ func TestATickCannotSendForAMeetingBeingDeleted(t *testing.T) {
 	r.clock.advance(15 * time.Second)
 	r.roster.OnSegment(r.segment("ABC-12 and XYZ-9 are late", false)) // queued for both
 	r.clock.advance(45 * time.Second)
-	if err := store.EndSession("sess-1", r.clock.Now(), ""); err != nil {
+	if err := store.EndSession("sess-1", r.clock.Now(), "", ""); err != nil {
 		t.Fatal(err)
 	}
 	r.setSession("")
@@ -81,7 +81,7 @@ func TestATickCannotSendForAMeetingBeingDeleted(t *testing.T) {
 }
 
 // TestAJoinInFlightCannotOutliveTheVoiceStopping fails if a join still in
-// its reads when the voice stops (SetAgents(nil)) commits after the stop
+// its reads when the voice stops (CloseAgents) commits after the stop
 // returned, even once another Envoy session opens. (ReviewPR122b's
 // TestReviewDPendingJoinCannotOutliveVoiceStop.)
 func TestAJoinInFlightCannotOutliveTheVoiceStopping(t *testing.T) {
@@ -99,7 +99,7 @@ func TestAJoinInFlightCannotOutliveTheVoiceStopping(t *testing.T) {
 		_, _ = r.roster.Deliver(context.Background(), &envoy.Message{EventID: "join-in-flight", SourceSession: "agent-1", Text: "ghost-wispr join ABC-12", IssuedAt: r.clock.Now()})
 	}()
 	<-entered
-	r.roster.SetAgents(nil)
+	r.roster.CloseAgents(context.Background())
 	r.roster.SetAgents(r.agents) // the next Envoy session, which the join did not begin under
 	close(release)
 	<-done

@@ -200,7 +200,7 @@ func TestNoAnnouncementForASessionDeletedDuringTheRewrite(t *testing.T) {
 	deleted := make(chan error, 1)
 	r.model.turns = [][]*genai.GenerateContentResponse{{chunk(text("Done."))}}
 	r.model.onCall = func(int) {
-		if err := r.store.EndSession("meeting-1", testNow, ""); err != nil {
+		if err := r.store.EndSession("meeting-1", testNow, "", ""); err != nil {
 			deleted <- err
 			return
 		}

@@ -81,7 +81,7 @@ func measureOne(recording string, words []storage.RefinedWord, segments []storag
 	if err := store.CreateSession("measurement", started); err != nil {
 		return "create session"
 	}
-	if err := store.EndSession("measurement", started.Add(time.Hour), recording); err != nil {
+	if err := store.EndSession("measurement", started.Add(time.Hour), recording, ""); err != nil {
 		return "end session"
 	}
 	generation, claimed, err := store.ClaimRefinement("measurement", recording)

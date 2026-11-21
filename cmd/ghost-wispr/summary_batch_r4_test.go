@@ -37,7 +37,7 @@ func r4BatchStore(t *testing.T, ids ...string) (*storage.SQLiteStore, string, st
 		if err := store.AppendSegment(id, transcribe.Segment{Text: "before private " + id, StartTime: 0, EndTime: 1, Timestamp: started}); err != nil {
 			t.Fatal(err)
 		}
-		if err := store.EndSession(id, started.Add(time.Minute), "recording.mp3"); err != nil {
+		if err := store.EndSession(id, started.Add(time.Minute), "recording.mp3", ""); err != nil {
 			t.Fatal(err)
 		}
 		_, generation, err := store.Canonicalize(id)

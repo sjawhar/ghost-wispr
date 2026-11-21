@@ -234,7 +234,7 @@ func TestARedeliveredCommandIsANoOp(t *testing.T) {
 // taken once and delivered again is the control: it joins once.
 func TestACommandTheRosterCouldNotTakeActsWhenDeliveredAgain(t *testing.T) {
 	r := newRig(t, nil)
-	r.roster.SetAgents(nil)
+	r.roster.CloseAgents(context.Background())
 	join := &envoy.Message{EventID: "e-early", SourceSession: "agent-1", Text: "ghost-wispr join ABC-12", IssuedAt: r.clock.Now()}
 	if _, err := r.roster.Deliver(context.Background(), join); !errors.Is(err, ErrNotReady) {
 		t.Fatalf("a join with no Envoy session returned %v, want ErrNotReady so that Envoy delivers it again", err)

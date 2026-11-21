@@ -247,7 +247,7 @@ func TestSessionDeleteRemovesVoiceTasks(t *testing.T) {
 		if err := store.CreateSession(id, at); err != nil {
 			t.Fatal(err)
 		}
-		if err := store.EndSession(id, at.Add(time.Minute), ""); err != nil {
+		if err := store.EndSession(id, at.Add(time.Minute), "", ""); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -300,7 +300,7 @@ func TestWALEraseCoversVoiceTasks(t *testing.T) {
 		if err := store.CreateSession(id, started); err != nil {
 			t.Fatal(err)
 		}
-		if err := store.EndSession(id, started.Add(time.Minute), ""); err != nil {
+		if err := store.EndSession(id, started.Add(time.Minute), "", ""); err != nil {
 			t.Fatal(err)
 		}
 	}
