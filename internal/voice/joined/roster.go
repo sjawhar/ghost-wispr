@@ -551,10 +551,12 @@ const replayWindow = 72 * time.Hour
 const perSessionCommands = 4096
 
 // historySessions is how many sending sessions at their cap the history is
-// sized for; maxCommands, their product, bounds all the commands it keeps,
-// about 20 MiB at the bound (20 bytes a command,
-// TestTheCommandHistoryStaysCompact). Past it the roster replaces the oldest
-// of the session holding the most.
+// sized for; maxCommands, their product, bounds all the commands it keeps:
+// about 20 MiB with every one of 256 sessions at its cap (20 bytes a command,
+// TestTheCommandHistoryStaysCompact). Many sessions holding a command or two
+// each cost more a command: each has a ring of at least 8 records, its table
+// and its map entry. Past the bound the roster replaces the oldest of the
+// session holding the most.
 const (
 	historySessions = 256
 	maxCommands     = perSessionCommands * historySessions

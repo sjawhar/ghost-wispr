@@ -441,9 +441,11 @@ read the API, a pointer holds no words, and a hand speaks only on a person's "go
 Envoy delivers again acts only once, for as long as Envoy can deliver it again (its stream keeps a
 message 72 hours), and a floor request or a leave sent before the agent's latest join is not
 taken. The unit keeps at most 4,096 commands of those 72 hours from one sending session, and
-1,048,576 from all of them (about 20 MiB): a session past its share replaces its own oldest, which
-Envoy could then deliver again, and past the total the session holding the most does. No command
-is refused, so one session's flood cannot hold off another agent's. A
+1,048,576 from all of them: a session past its share replaces its own oldest, which Envoy could then
+deliver again, and past the total the session holding the most does. No command is refused, so one
+session's flood cannot hold off another agent's. With 256 sessions at their share, the record holds
+about 20 MiB; many sessions holding a command or two each cost more a command (131,072 sessions of
+one command each, about 46 MiB, and about 8 MiB after they expire). A
 command that comes before the unit's Envoy session is ready waits up to 2 s for it, then is not
 acknowledged, so Envoy delivers it again.
 

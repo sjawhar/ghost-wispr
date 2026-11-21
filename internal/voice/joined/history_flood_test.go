@@ -37,15 +37,18 @@ func isJoined(r *rig, agent string) bool {
 // join refused, rather than taken at once (a refused join that Envoy keeps
 // bringing back is lost once Envoy's window ends), forgets another agent's
 // command taken before the flood, grows the flooding session's history past
-// its cap, or gets the flood's own commands refused. The flood forgets only
-// its own oldest commands: its first join, delivered again, joins it again.
+// its cap, or gets the flood's own commands refused. Whether a join taken
+// before the flood is still remembered is read after its agent leaves: a
+// join delivered again to a member keeps its membership whether or not it
+// acts, but delivered again after a leave it would join again. The flood
+// forgets only its own oldest commands: its first join, delivered again,
+// joins it again.
 func TestAFloodingSessionCannotBlockAnotherAgent(t *testing.T) {
 	r := newRig(t, func(cfg *Config) { cfg.Logf = func(string, ...any) {} })
 	ctx := context.Background()
 	before := r.deliver(t, "agent-b", "ghost-wispr join ABC-12")
-	joinedB := r.roster.Joined()
-	if len(joinedB) != 1 {
-		t.Fatalf("control: agent-b did not join: %+v", joinedB)
+	if !isJoined(r, "agent-b") {
+		t.Fatalf("control: agent-b did not join: %+v", r.roster.Joined())
 	}
 	flooderJoin := r.deliver(t, "flooder", "ghost-wispr join XYZ-9")
 	sendLeave(t, r, "flooder", "flood-leave")
@@ -66,13 +69,15 @@ func TestAFloodingSessionCannotBlockAnotherAgent(t *testing.T) {
 	if refused > 0 {
 		t.Fatalf("%d of the flood's own commands were refused: each would come back until Envoy's window ended, and be lost", refused)
 	}
+	sendLeave(t, r, "agent-b", "agent-b-leave")
+	if isJoined(r, "agent-b") {
+		t.Fatal("control: agent-b's leave did not end its membership")
+	}
 	if _, err := r.roster.Deliver(ctx, before); err != nil {
 		t.Fatal(err)
 	}
-	for _, m := range r.roster.Joined() {
-		if m.Agent == "agent-b" && m.ID != joinedB[0].ID {
-			t.Fatalf("agent-b's join, taken before the flood, acted again when delivered after it: membership %s, was %s", m.ID, joinedB[0].ID)
-		}
+	if isJoined(r, "agent-b") {
+		t.Fatal("agent-b's join, taken before the flood, acted again when delivered after its leave: the flood made it forget another agent's command")
 	}
 	r.roster.mu.Lock()
 	kept := r.roster.commands.sessionSize("flooder")

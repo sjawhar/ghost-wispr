@@ -3,6 +3,7 @@ package voice
 import (
 	"context"
 	"slices"
+	"sync"
 	"testing"
 	"time"
 
@@ -198,5 +199,71 @@ func TestAnErrorSoundsCutSparesANewerSound(t *testing.T) {
 	time.Sleep(300 * time.Millisecond)
 	if got := chimeGen(r); got != before+1 {
 		t.Fatalf("the chime input was cut %d times, want once: the old meeting's error sound cut the newer sound", got-before)
+	}
+}
+
+// beginGate is the fake speaker with its first Begin of the chime input held
+// until release, entered closed once it is held.
+type beginGate struct {
+	*fakeSpeaker
+	entered, release chan struct{}
+	once             sync.Once
+}
+
+func (g *beginGate) Begin(input string) Playback {
+	if input == audio.InputChime {
+		g.once.Do(func() {
+			close(g.entered)
+			<-g.release
+		})
+	}
+	return g.fakeSpeaker.Begin(input)
+}
+
+// TestAnErrorSoundBegunAfterACutEndsWithItsMeeting fails if an error sound for
+// a meeting, scheduled before a stop cut the chime input but begun only after
+// it, leaves frames queued once the recorder ended the meeting: the stop did
+// not cut a playback that had not begun, so it must not excuse the sound from
+// its meeting's end. With no stop before it, the sound is cut at the meeting's
+// end: the control.
+func TestAnErrorSoundBegunAfterACutEndsWithItsMeeting(t *testing.T) {
+	for _, stopFirst := range []bool{false, true} {
+		t.Run(map[bool]string{false: "no stop before it begins", true: "a stop before it begins"}[stopFirst], func(t *testing.T) {
+			meeting, end := context.WithCancel(context.Background())
+			defer end()
+			var gate *beginGate
+			r := newRigWith(t, newFakeConcierge(), func(cfg *SupervisorConfig, r *rig) {
+				gate = &beginGate{fakeSpeaker: r.speaker, entered: make(chan struct{}), release: make(chan struct{})}
+				cfg.Speaker = gate
+				cfg.Meeting = func(string) context.Context { return meeting }
+			})
+			var released sync.Once
+			release := func() { released.Do(func() { close(gate.release) }) }
+			defer release()
+			r.speaker.holdDrain(audio.InputChime)
+			r.s.mu.Lock()
+			r.s.errorLocked("sess-1")
+			r.s.mu.Unlock()
+			select {
+			case <-gate.entered:
+			case <-time.After(3 * time.Second):
+				t.Fatal("UNKNOWN: the error sound's producer never reached Begin")
+			}
+			if stopFirst {
+				r.s.Stop("a stop before the error sound begins")
+			}
+			before := chimeGen(r)
+			release()
+			time.Sleep(300 * time.Millisecond) // the producer writes what it may
+			written := r.speaker.written(audio.InputChime)
+			if !stopFirst && written < chimeFrames(ErrorChime()) {
+				t.Fatalf("control: the error sound queued %d frames of %d", written, chimeFrames(ErrorChime()))
+			}
+			end()
+			time.Sleep(300 * time.Millisecond)
+			if written > 0 && chimeGen(r) == before {
+				t.Fatalf("%d frames of the error sound stayed queued after the recorder ended its meeting", written)
+			}
+		})
 	}
 }
