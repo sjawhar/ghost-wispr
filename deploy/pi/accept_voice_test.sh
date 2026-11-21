@@ -2361,7 +2361,8 @@ launch cancel-unsure long,asound,stop-rounds-2,arecord-slow-start,no-capture-par
 # The same with the capture substream known: the anchors' bound may still be up to 61 ms early, more
 # than the 30 ms the fake's answer is heard after its first_audio. The answer is timed against its
 # chime in the same recording, where that slack cancels, so a good cancel is a PASS at any load
-# (on #149's driver, which timed it against first_audio, it was UNKNOWN).
+# (on #149's driver, which timed it against first_audio, it was UNKNOWN). Where a loaded machine
+# makes the fake overrun, the case is cancel-unsure's start-only case: UNKNOWN, never PASS.
 # shellcheck disable=SC2086
 launch cancel-slow-read long,asound,stop-rounds-2,arecord-slow-start yes -- $cancel_args
 # shellcheck disable=SC2086
@@ -3139,9 +3140,16 @@ expect_rc cancel-unsure 2
 expect_line cancel-unsure 'UNKNOWN: playback-cancel stop 1: the rig microphone did not hear the speech up to the stop'
 expect_no_line cancel-unsure "PASS: playback-cancel: no stop's speech was heard"
 expect_restored cancel-unsure
-floor_decided cancel-slow-read || true
-expect_rc cancel-slow-read 0
-expect_line cancel-slow-read "PASS: playback-cancel: no stop's speech was heard at the rig microphone 20 ms after it"
+if floor_decided cancel-slow-read; then
+  expect_rc cancel-slow-read 0
+  expect_line cancel-slow-read "PASS: playback-cancel: no stop's speech was heard at the rig microphone 20 ms after it"
+else
+  # An overrun leaves the start-only bounds, 1.5 s early here: cancel-unsure's case, which the
+  # answer's timing does not reach.
+  expect_rc cancel-slow-read 2
+  expect_line cancel-slow-read 'the rig microphone did not hear the speech up to the stop'
+  expect_no_line cancel-slow-read "PASS: playback-cancel: no stop's speech was heard"
+fi
 expect_timed_against_chime cancel-slow-read
 expect_no_line cancel-slow-read 'NOTE: recording: no capture substream'
 expect_restored cancel-slow-read
