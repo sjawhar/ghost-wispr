@@ -3,6 +3,7 @@ package speakertrace
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"runtime"
 	"runtime/trace"
 	"strings"
@@ -23,9 +24,13 @@ func traced(t *testing.T, f func()) *bytes.Buffer {
 	return &buf
 }
 
+// regionFault marks the injected stall, so the test finds its cycle among the
+// slow ones a loaded machine makes on its own.
+const regionFault = "speaker.fault"
+
 // fakeMixer writes frames as the speaker's mixer marks them: each write a
 // speaker.write region of a 5 ms sleep, each turn a take of mu inside
-// speaker.lock; its turn after write 10 also runs stall.
+// speaker.lock; its turn after write 10 also runs stall, inside regionFault.
 func fakeMixer(mu *sync.Mutex, stall func()) {
 	ctx := context.Background()
 	for i := range 20 {
@@ -36,7 +41,7 @@ func fakeMixer(mu *sync.Mutex, stall func()) {
 		w := trace.StartRegion(ctx, RegionWrite)
 		time.Sleep(5 * time.Millisecond)
 		if i == 10 {
-			stall()
+			trace.WithRegion(ctx, regionFault, stall)
 		}
 		w.End()
 	}
@@ -48,6 +53,13 @@ func holdIt(mu *sync.Mutex, d time.Duration, locked chan<- struct{}) {
 	close(locked)
 	time.Sleep(d)
 	mu.Unlock()
+}
+
+// passIt waits for mu and lets it go at once: a waiter queued ahead of the
+// mixer, through which the lock passes to it.
+func passIt(mu *sync.Mutex) {
+	mu.Lock()
+	mu.Unlock() //nolint:staticcheck // the empty critical section is the point
 }
 
 // crowd keeps the mixer runnable but not run for about d: one processor for
@@ -71,10 +83,11 @@ func crowd(d time.Duration) {
 
 // TestReadNamesWhatHeldTheMixer fails if the stalled turn of the mixer is not
 // found and named for what held it: the speaker's lock held by another
-// goroutine, which it names, a sleep inside the write, and Go running other
-// goroutines while the mixer could run; or if a turn no longer than the bound
-// is returned as slow. On a loaded machine an unstalled turn can be slow too,
-// so the stall's turn is the longest, not the only one.
+// goroutine, which it names, also when the lock reaches the mixer through a
+// waiter queued ahead of it; a sleep inside the write; and Go running other
+// goroutines while the mixer could run. It also fails if a turn no longer
+// than the bound is returned as slow. On a loaded machine an unstalled turn
+// can be slow too, so the stall's turn is found by its region and its cause.
 func TestReadNamesWhatHeldTheMixer(t *testing.T) {
 	const slow = 40 * time.Millisecond
 	for _, tc := range []struct {
@@ -87,8 +100,15 @@ func TestReadNamesWhatHeldTheMixer(t *testing.T) {
 			go holdIt(mu, 150*time.Millisecond, locked)
 			<-locked // the next turn's take of the lock waits
 		}, []string{"the Output's lock", "holdIt"}},
-		{"a sleep in the write", func(*sync.Mutex) { time.Sleep(150 * time.Millisecond) }, []string{"a sleep inside speaker.write"}},
-		{"no processor free", func(*sync.Mutex) { crowd(150 * time.Millisecond) }, []string{"runnable but not run"}},
+		{"the lock held, passed on by a waiter", func(mu *sync.Mutex) {
+			locked := make(chan struct{})
+			go holdIt(mu, 150*time.Millisecond, locked)
+			<-locked
+			go passIt(mu)
+			time.Sleep(20 * time.Millisecond) // passIt queues for the lock before the mixer does
+		}, []string{"the Output's lock", "passIt", "holdIt"}},
+		{"a sleep in the write", func(*sync.Mutex) { time.Sleep(150 * time.Millisecond) }, []string{"a sleep inside " + regionFault}},
+		{"no processor free", func(*sync.Mutex) { crowd(150 * time.Millisecond) }, []string{"runnable but not run", "inside " + regionFault}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var mu sync.Mutex
@@ -97,29 +117,33 @@ func TestReadNamesWhatHeldTheMixer(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if len(cycles) == 0 {
-				t.Fatal("no slow cycle, want the one the stall made")
-			}
-			var c *Cycle
+			var found []string
+			stalled := false
 			for i := range cycles {
-				if cycles[i].Length() <= slow {
-					t.Fatalf("a cycle of %v returned as longer than %v", cycles[i].Length(), slow)
+				c := &cycles[i]
+				if c.Length() <= slow {
+					t.Fatalf("a cycle of %v returned as longer than %v", c.Length(), slow)
 				}
-				if c == nil || cycles[i].Length() > c.Length() {
-					c = &cycles[i]
+				got := c.Classify()
+				found = append(found, fmt.Sprintf("%v: %s %v", c.Length().Round(time.Millisecond), got, c.Spent))
+				if c.Length() >= 120*time.Millisecond && containsAll(got, tc.want) { // four fifths of the stall: a stall that ends a turn early
+					stalled = true
 				}
 			}
-			got := c.Classify()
-			if c.Length() < 140*time.Millisecond {
-				t.Fatalf("the longest slow cycle took %v, want the 150 ms stall in it", c.Length())
-			}
-			for _, w := range tc.want {
-				if !strings.Contains(got, w) {
-					t.Fatalf("the longest cycle reads %q (%v), want it to name %q", got, c.Spent, w)
-				}
+			if !stalled {
+				t.Fatalf("no slow cycle of at least 120ms names %q; the slow cycles: %q", tc.want, found)
 			}
 		})
 	}
+}
+
+func containsAll(s string, subs []string) bool {
+	for _, sub := range subs {
+		if !strings.Contains(s, sub) {
+			return false
+		}
+	}
+	return true
 }
 
 // TestATraceWithNoWriteSaysSo fails if a trace taken while the speaker did

@@ -3,8 +3,10 @@
 package audio
 
 import (
+	"fmt"
 	"os"
 	"runtime"
+	"runtime/trace"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -72,13 +74,20 @@ func TestTheMixersRegionsAreTheReadersRegions(t *testing.T) {
 	}
 }
 
+// regionFault marks an injected fault in the trace, so the test finds the
+// fault's cycle among the slow ones a loaded machine makes on its own. Its
+// name starts with "speaker.", so the reader counts time in it as time in it.
+const regionFault = "speaker.fault"
+
 // TestTheSpeakerTraceSaysWhatKeptTheMixerFromTheDevice fails unless the speaker
 // trace, saved on the underrun that a fault in the mixer's path causes on a
 // device that plays in real time from an 80 ms buffer, names that fault as
 // what kept the mixer from the device: a sleep inside the stream's write,
-// computing inside it, and the Output's lock held by another goroutine, which
-// it names. These are the instrument's controls: a capture of a real underrun
-// is read only as far as these are named right.
+// computing inside it, the Output's lock held by another goroutine, which it
+// names, and Go running other goroutines while the mixer could run. These are
+// the instrument's controls: a capture of a real underrun is read only as far
+// as these are named right. The fault runs inside regionFault, so a slow
+// cycle the machine makes on its own, which can be longer, is not taken for it.
 func TestTheSpeakerTraceSaysWhatKeptTheMixerFromTheDevice(t *testing.T) {
 	const stall = 150 * time.Millisecond
 	for _, tc := range []struct {
@@ -86,14 +95,14 @@ func TestTheSpeakerTraceSaysWhatKeptTheMixerFromTheDevice(t *testing.T) {
 		fault func(out *Output)
 		want  []string
 	}{
-		{"a sleep in the write", func(*Output) { time.Sleep(stall) }, []string{"a sleep inside speaker.write"}},
-		{"computing in the write", func(*Output) { spin(stall) }, []string{"running", "inside speaker.write"}},
+		{"a sleep in the write", func(*Output) { time.Sleep(stall) }, []string{"a sleep inside " + regionFault}},
+		{"computing in the write", func(*Output) { spin(stall) }, []string{"running", "inside " + regionFault}},
 		{"the Output's lock held", func(out *Output) {
 			locked := make(chan struct{})
 			go holdTheLock(out, stall, locked)
 			<-locked // the write returns, and the mixer's next take of the lock waits
 		}, []string{"the Output's lock", "holdTheLock"}},
-		{"no processor free", func(*Output) { crowd(stall) }, []string{"runnable but not run"}},
+		{"no processor free", func(*Output) { crowd(stall) }, []string{"runnable but not run", "inside " + regionFault}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			st, err := StartSpeakerTrace(t.TempDir())
@@ -101,12 +110,12 @@ func TestTheSpeakerTraceSaysWhatKeptTheMixerFromTheDevice(t *testing.T) {
 				t.Fatal(err)
 			}
 			st.every = 0 // save on every underrun: a stray one must not take the fault's capture's place
-			saved := make(chan string, 16)
+			saved := make(chan string, 64)
 			st.saved = func(path string) { saved <- path }
 			pcm := newFakePCM(48000, 48000*int(alsaBuffer/time.Millisecond)/1000)
 			stream := &injectStream{alsaStream: streamOn(pcm), at: 50}
 			var out *Output
-			stream.fault = func() { tc.fault(out) }
+			stream.fault = func() { trace.WithRegion(traceRegions, regionFault, func() { tc.fault(out) }) }
 			out = NewOutput(OutputConfig{IdleClose: 100 * time.Millisecond, Underrun: st.Underrun, Open: func(string) (PlaybackStream, int, error) {
 				return stream, pcm.rate, nil
 			}})
@@ -124,8 +133,8 @@ func TestTheSpeakerTraceSaysWhatKeptTheMixerFromTheDevice(t *testing.T) {
 				t.Fatalf("control: the mixer wrote %d frames, fewer than the %d the fault needs", stream.writes.Load(), stream.at)
 			}
 			close(saved)
-			var best speakertrace.Cycle
 			files := 0
+			var slow []string
 			for path := range saved {
 				files++
 				f, err := os.Open(path)
@@ -137,26 +146,29 @@ func TestTheSpeakerTraceSaysWhatKeptTheMixerFromTheDevice(t *testing.T) {
 				if err != nil {
 					t.Fatalf("read %s: %v", path, err)
 				}
-				for _, c := range cycles {
-					if c.Length() > best.Length() {
-						best = c
+				for i := range cycles {
+					c := &cycles[i]
+					got := c.Classify()
+					slow = append(slow, fmt.Sprintf("%v: %s", c.Length().Round(time.Millisecond), got))
+					if c.Length() >= stall*4/5 && containsAll(got, tc.want) {
+						t.Logf("the fault's cycle: %v: %s; all: %v", c.Length(), got, c.Spent)
+						return
 					}
 				}
 			}
 			if files == 0 {
 				t.Fatal("control: the fault's underrun saved no capture")
 			}
-			bucket, spent := best.Dominant()
-			got := best.Classify()
-			t.Logf("the longest cycle in %d captures: %v; most of it %s (%v): %s; all: %v", files, best.Length(), bucket, spent, got, best.Spent)
-			if best.Length() < stall*4/5 {
-				t.Fatalf("the longest slow cycle took %v, want the %v the fault held the mixer", best.Length(), stall)
-			}
-			for _, want := range tc.want {
-				if !strings.Contains(got, want) {
-					t.Fatalf("the capture says %q, want it to name %q", got, want)
-				}
-			}
+			t.Fatalf("no slow cycle of at least %v in %d captures names %q; the slow cycles: %q", stall*4/5, files, tc.want, slow)
 		})
 	}
+}
+
+func containsAll(s string, subs []string) bool {
+	for _, sub := range subs {
+		if !strings.Contains(s, sub) {
+			return false
+		}
+	}
+	return true
 }

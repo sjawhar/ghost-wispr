@@ -39,20 +39,21 @@ func mixerTrace(t *testing.T, stall time.Duration) string {
 }
 
 // TestSpeakerTraceCommandPrintsTheSlowCycles fails if `ghost-wispr
-// speaker-trace` does not print a capture's slow cycle and what held the
-// mixer, or exits 0 on a capture with no slow cycle, which shows nothing.
+// speaker-trace` does not print a capture's slow cycle, longest first, and
+// what held the mixer, or exits 0 on a capture with no slow cycle, which
+// shows nothing. The second capture is read with a bound no cycle reaches,
+// since a loaded machine can make a 5 ms turn slow.
 func TestSpeakerTraceCommandPrintsTheSlowCycles(t *testing.T) {
 	var out, errs bytes.Buffer
-	if code := runSpeakerTraceCommand([]string{mixerTrace(t, 100*time.Millisecond)}, &out, &errs); code != 0 {
+	if code := runSpeakerTraceCommand([]string{mixerTrace(t, 300*time.Millisecond)}, &out, &errs); code != 0 {
 		t.Fatalf("exit %d, want 0; stderr %q", code, errs.String())
 	}
-	for _, want := range []string{"1 cycles of the mixer longer than 40ms", "a sleep inside speaker.write"} {
-		if !strings.Contains(out.String(), want) {
-			t.Fatalf("output lacks %q:\n%s", want, out.String())
-		}
+	lines := strings.Split(out.String(), "\n")
+	if len(lines) < 2 || !strings.Contains(lines[0], "cycles of the mixer longer than 40ms") || !strings.Contains(lines[1], "a sleep inside speaker.write") {
+		t.Fatalf("output does not start with the count and the 300 ms turn, a sleep inside speaker.write:\n%s", out.String())
 	}
 	out.Reset()
-	if code := runSpeakerTraceCommand([]string{mixerTrace(t, 0)}, &out, &errs); code != 2 || !strings.Contains(out.String(), "UNKNOWN") {
+	if code := runSpeakerTraceCommand([]string{"-slow", "10s", mixerTrace(t, 0)}, &out, &errs); code != 2 || !strings.Contains(out.String(), "UNKNOWN") {
 		t.Fatalf("a capture with no slow cycle: exit %d, output %q; want exit 2 and UNKNOWN", code, out.String())
 	}
 }
