@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // clips lists the stored clips (testdata/README.md): the start phrases, which
@@ -35,12 +36,19 @@ func clips(t *testing.T) (starts, misses []string) {
 // the start phrase.
 func heardIn(t *testing.T, d *Detector, clip string) bool {
 	t.Helper()
+	return heardInAt(t, d, clip, 0)
+}
+
+// heardInAt is heardIn with the second of silence before the clip lengthened
+// by shift, which moves the clip against the spotter's 10 ms feature frames.
+func heardInAt(t *testing.T, d *Detector, clip string, shift time.Duration) bool {
+	t.Helper()
 	pcm, err := ReadWAV(filepath.Join("testdata", clip))
 	if err != nil {
 		t.Fatal(err)
 	}
-	silence := make([]int16, SampleRate)
-	audio := append(append(append([]int16{}, silence...), pcm...), silence...)
+	silence := make([]int16, SampleRate+int(shift*SampleRate/time.Second))
+	audio := append(append(append([]int16{}, silence...), pcm...), make([]int16, SampleRate)...)
 	heard := false
 	for len(audio) > 0 {
 		n := min(len(audio), SampleRate/10)
@@ -151,6 +159,12 @@ func TestTheSpotterHearsOnlyTheStartPhrase(t *testing.T) {
 // stored "stop recording" clips for the start phrase, so that they no longer
 // test stage 2, or if stage 2 then lets any of them through: stage 2 is what
 // keeps a spoken stop from starting a recording.
+//
+// Each clip is fed at four alignments against the spotter's 10 ms frames, and
+// stage 1 must fire at every one: a clip stage 1 takes at one alignment only
+// sits on its threshold, where the float rounding of another processor's
+// kernels decides, and fails the control here, on every machine, instead of
+// at random on the runners whose processors round it the other way.
 func TestStageTwoRefusesTheStopsStageOneHears(t *testing.T) {
 	d, err := NewDetector()
 	if err != nil {
@@ -164,14 +178,16 @@ func TestStageTwoRefusesTheStopsStageOneHears(t *testing.T) {
 			continue
 		}
 		stops++
-		d.Reset()
-		before := d.StageOneHits()
-		heard := heardIn(t, d, clip)
-		if d.StageOneHits() == before {
-			t.Errorf("control: stage 1 did not fire on %s, so it does not test stage 2", clip)
-		}
-		if heard {
-			t.Errorf("%s: stage 2 let the stop through", clip)
+		for _, shift := range []time.Duration{0, 4 * time.Millisecond, 8 * time.Millisecond, 12 * time.Millisecond} {
+			d.Reset()
+			before := d.StageOneHits()
+			heard := heardInAt(t, d, clip, shift)
+			if d.StageOneHits() == before {
+				t.Errorf("control: stage 1 did not fire on %s moved by %v, so it does not test stage 2 there", clip, shift)
+			}
+			if heard {
+				t.Errorf("%s moved by %v: stage 2 let the stop through", clip, shift)
+			}
 		}
 	}
 	if stops < 3 {
