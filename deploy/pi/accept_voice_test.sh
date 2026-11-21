@@ -231,9 +231,18 @@ def cut_item(item, cut):
     return None if item["due"] > cut["at"] else item
 
 
+def hold_item(item, hold):
+    """ITEM as HOLD leaves it: a stop request waits for the speech, so its sound plays on until the
+    stop's cut ends it (to HOLD's until at most), and its own end after HOLD's at (speech_end,
+    voice_spoken) does not come by itself."""
+    if item["kind"] == "sound":
+        return dict(item, end=max(item["end"], hold["until"]))
+    return None if item["due"] > hold["at"] else item
+
+
 def timeline():
-    """The timeline's items with every cut applied (cut_item)."""
-    items, cuts = [], {}
+    """The timeline's items with every hold, then every cut, applied (hold_item, cut_item)."""
+    items, cuts, holds = [], {}, {}
     for line in read("timeline.jsonl").splitlines():
         try:
             item = json.loads(line)
@@ -241,11 +250,15 @@ def timeline():
             continue
         if item["kind"] == "cut":
             cuts[item["tag"]] = item
+        elif item["kind"] == "hold":
+            holds[item["tag"]] = item
         else:
             items.append(item)
     out = []
     for item in items:
-        if item.get("tag") in cuts:
+        if item.get("tag") in holds:
+            item = hold_item(item, holds[item["tag"]])
+        if item and item.get("tag") in cuts:
             item = cut_item(item, cuts[item["tag"]])
         if item and (item["kind"] != "sound" or item["end"] > item["start"]):
             out.append(item)
@@ -502,7 +515,10 @@ def service():
             size = current
             items = timeline()
         t = now_ms()
-        due = [i for i in items if i["kind"] in ("stop-request", "xrun") and i["pid"] == os.getpid() and i["due"] <= t and i["id"] not in done]
+        # late-apply: the service gets to each stop request 7 s after it is due, as a service its
+        # machine's load holds up would.
+        held = 7000 if "late-apply" in SCENARIO else 0
+        due = [i for i in items if i["kind"] in ("stop-request", "xrun") and i["pid"] == os.getpid() and i["due"] + (held if i["kind"] == "stop-request" else 0) <= t and i["id"] not in done]
         if due:
             done.add(due[0]["id"])
             (show_xrun if due[0]["kind"] == "xrun" else drop)(status, items, due[0])
@@ -582,6 +598,7 @@ def drop(status, items, request):
     drain = request["drain"]
     end = -1000 if "leak-after-quiet" in SCENARIO else drain or 5
     at = now_ms()
+    log_to("stops.log", "%d: applied the stop of %s, due at %d (%d ms late); %s" % (at, request["speech"], request["due"], at - request["due"], speech_span(items, request["speech"], at)))
     cut = dict(kind="cut", tag=request["speech"], at=at, sound_end=at + end, drain=drain > 0)
     after = [cut_item(i, cut) if i.get("tag") == cut["tag"] else i for i in items]
     replace_status(status, status_text([i for i in after if i], at))
@@ -593,6 +610,15 @@ def drop(status, items, request):
     leak = 1100 if "leak-1100" in SCENARIO else 150 if SCENARIO & {"leak-150", "leak-after-quiet"} else None
     if leak is not None:
         emit(kind="sound", start=at + leak, end=at + leak + 250, tag="leaked-word")
+
+
+def speech_span(items, tag, at):
+    """Where the speech TAG's sound stands at AT, for stops.log: its start and end, and whether it
+    was still playing."""
+    for item in items:
+        if item["kind"] == "sound" and item.get("tag") == tag:
+            return "the speech runs %d to %d, %s at %d" % (item["start"], item["end"], "still playing" if item["start"] <= at < item["end"] else "over", at)
+    return "no sound of %s" % tag
 
 
 # ---- the voice ----
@@ -637,7 +663,8 @@ def spoken(tag, at, session):
 # most, so that a clip that never comes still ends the case; a talk-over or backchannel clip that
 # does not stop it ends it ANSWER_AFTER_CLIP_MS after the clip ends. The clip ends 300 ms after it
 # begins and the driver's stop window (stop_window_ms) runs 4 s from its start, so the answer ends
-# 2 s after that window, well inside the driver's 15 s wait (--event-timeout) for voice_spoken.
+# 2 s after that window, well inside the driver's 15 s wait (--event-timeout) for voice_spoken. An
+# answer a stop request waits for (hold_item) also plays on to ANSWER_CEILING_MS at most.
 ANSWER_CEILING_MS = 60_000
 ANSWER_AFTER_CLIP_MS = 5700
 
@@ -748,7 +775,10 @@ def react(kind, key, start, end):
                 end_answer_after(start, end)
             return
         stop_at = start + 700
-        for item in timeline():
+        items = timeline()
+        if not any(i["kind"] == "sound" and i["tag"].startswith("speech-") and i["start"] <= stop_at < i["end"] for i in items):
+            log_to("stops.log", "%d: a %s clip began at %d, and no speech plays at its stop, %d" % (now_ms(), kind, start, stop_at))
+        for item in items:
             if item["kind"] == "sound" and item["tag"].startswith("speech-") and item["start"] <= stop_at < item["end"]:
                 drain = "drain" in SCENARIO
                 reason = "talk-over" if kind != "stop" else "stop phrase"
@@ -757,6 +787,10 @@ def react(kind, key, start, end):
                     # audio's tail after it, in ms.
                     tail = 800 if drain else 50 if "tail-50" in SCENARIO else 21 if "tail-21" in SCENARIO else 0
                     emit(kind="stop-request", due=stop_at, speech=item["tag"], drain=tail, reason=reason)
+                    # The answer the request is for plays on until the service applies it, however
+                    # late: a stop on its way ends the answer, not the clock (hold_item).
+                    emit(kind="hold", tag=item["tag"], at=stop_at, until=item["start"] + ANSWER_CEILING_MS)
+                    log_to("stops.log", "%d: a %s clip began at %d; requested the stop of %s, due at %d; %s" % (now_ms(), kind, start, item["tag"], stop_at, speech_span(items, item["tag"], stop_at)))
                 else:
                     # The Output drops its queue within 5 ms; today's path drains 800 ms more.
                     emit(kind="cut", tag=item["tag"], at=stop_at, sound_end=stop_at + (800 if drain else 5), drain=drain)
@@ -1436,10 +1470,14 @@ row = sqlite3.connect(sys.argv[1]).execute("SELECT value FROM app_state WHERE ke
 print("missing" if row is None else row[0])' "$1/ghost-wispr.db"
 }
 
+# expect_rc NAME STATUS: the case's driver exited with STATUS. When it did not, the message also
+# gives the fake's stops.log, each stop request and apply with the speech's own times, so that a
+# timing verdict that went wrong shows when each happened.
 expect_rc() {
-  local got
+  local got stops=
   got=$(cat "$root/$1/rc" 2>/dev/null)
-  [[ $got == "$2" ]] || check_failed "$1: exit status ${got:-none}, want $2; output: $(tr '\n' '|' <"$root/$1/out")"
+  [[ -s $root/$1/state/stops.log ]] && stops=" the fake's stops: $(tr '\n' '|' <"$root/$1/state/stops.log");"
+  [[ $got == "$2" ]] || check_failed "$1: exit status ${got:-none}, want $2;$stops output: $(tr '\n' '|' <"$root/$1/out")"
 }
 
 expect_line() {
@@ -1692,6 +1730,11 @@ launch cancel-behind-drain long,asound,arecord-behind,drain yes -- $cancel_args
 launch cancel-slow-wc long,asound,slow-wc yes -- $cancel_args
 # shellcheck disable=SC2086
 launch cancel-journal-error long,asound,late-journal-error yes -- $cancel_args
+# A service that gets to each stop request 7 s after it is due (late-apply), as a loaded machine can
+# hold it: the stop comes 0.9 to 3.2 s into a 7 s answer, so the apply lands after the answer's
+# natural end. A good cancel still passes, since an answer with a stop waiting does not end by itself.
+# shellcheck disable=SC2086
+launch cancel-late-apply long,asound,late-apply yes -- $cancel_args
 
 # tts-first-audio: a pass with the gemini-clip control; a control too close to tell (the negative
 # control); Aura without mip_opt_out; a build without the subcommand.
@@ -2278,6 +2321,18 @@ expect_rc cancel-journal-error 2
 expect_line cancel-journal-error 'UNKNOWN: playback-cancel: cannot read the speaker underrun lines from the journal: Failed to read journal: Input/output error'
 expect_no_line cancel-journal-error 'PASS: playback-cancel: 0 underruns'
 expect_restored cancel-journal-error
+# expect_applied_late NAME N: stops.log shows N stops applied at least 7 s after they were due.
+expect_applied_late() {
+  local late
+  late=$(sed -n 's/.*applied the stop of .*, due at [0-9]* (\([0-9]*\) ms late).*/\1/p' "$root/$1/state/stops.log" 2>/dev/null | awk '$1 >= 7000' | grep -c .)
+  [[ $late == "$2" ]] || check_failed "$1: the fake applied $late of the $2 stops at least 7 s late"
+}
+expect_rc cancel-late-apply 0
+expect_line cancel-late-apply "PASS: playback-cancel: no stop's speech was heard at the rig microphone 20 ms after it"
+expect_line cancel-late-apply 'NOTE: playback-cancel: the speaker logged 2 cancels: 0 by rewind, 2 by drop'
+expect_line cancel-late-apply 'PASS: playback-cancel: 0 underruns over '
+expect_applied_late cancel-late-apply 2
+expect_restored cancel-late-apply
 
 # tts-first-audio.
 expect_rc first-audio 0
