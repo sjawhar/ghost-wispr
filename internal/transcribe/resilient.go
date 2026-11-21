@@ -451,9 +451,12 @@ func (rc *ResilientClient) capturedBeforeLocked(at time.Duration) int64 {
 // it came, on the count Captured gives. So a capture pause, which leaves a
 // gap in time but none in the count, moves no word, nor does a check that
 // held a buffer back after the microphone read it, nor when the time is
-// asked, as when Deepgram's result for the point comes late. It reports false
-// for a point no stamp holds: before the oldest kept (captureStamps), or
-// after the latest.
+// asked, as when Deepgram's result for the point comes late. A point before
+// the oldest stamp kept (captureStamps) was captured before the oldest audio
+// the stamps hold, so it returns when that audio was captured: the latest
+// the point can have been, never the arrival of its result. It reports
+// false before any audio was stamped, for a point between two stamps, and
+// for a point after the latest.
 func (rc *ResilientClient) CapturedAt(at time.Duration) (time.Time, bool) {
 	rc.Mu.Lock()
 	defer rc.Mu.Unlock()
@@ -463,17 +466,21 @@ func (rc *ResilientClient) CapturedAt(at time.Duration) (time.Time, bool) {
 	// The stamps hold consecutive spans of the count, oldest first: the first
 	// that ends after the point holds it, if any does.
 	i := sort.Search(rc.stampsN, func(i int) bool { return stamp(i).to > point })
-	if i == rc.stampsN || stamp(i).from > point {
+	if i == rc.stampsN || i > 0 && stamp(i).from > point {
 		return time.Time{}, false
 	}
 	s := stamp(i)
+	if s.from > point {
+		point = s.from // older than the stamps kept: timed by their oldest audio
+	}
 	return s.at.Add(-rc.streamDuration(s.to - point)), true
 }
 
-// captureStamps is how many buffers CapturedAt can time: about 8.5 minutes
-// of the microphone's 250 ms buffers. That is more than the default buffer
-// (DefaultBufferSeconds) lets the live stream fall behind, but a buffer set
-// larger can outrun it: an older word is untimed.
+// captureStamps is how many buffers CapturedAt times exactly: about 8.5
+// minutes of the microphone's 250 ms buffers. That is more than the default
+// buffer (DefaultBufferSeconds) lets the live stream fall behind, but a
+// buffer set larger can outrun it: an older word is timed by the oldest
+// audio kept, which it came before.
 const captureStamps = 2048
 
 // captureStamp is when a buffer was captured, and the span of the count

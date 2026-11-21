@@ -1151,3 +1151,33 @@ func TestAnUntimedWakeWordAFinalMovedAtTheEdgeIsNoNewCall(t *testing.T) {
 	r.s.OnTranscript(timedResult("Wispr.", 10.3, true, untimed))
 	never(t, "the call's own final, moved 0.3 s on the socket, cut the voice", 200*time.Millisecond, func() bool { return voiceCutAfter(r, started) })
 }
+
+// TestAQuestionOlderThanTheClocksHistoryDoesNotStopItsAnswer fails if the
+// words of a question whose result comes during its answer stop the voice
+// when the live clock times them all by the oldest audio it keeps, minutes
+// before the voice began, as it times words older than its history
+// (transcribe.ResilientClient.CapturedAt): such words were untimed, so taken
+// as said when their result arrived (Sol's review of #133 at e6484db). Each
+// word has the same time, which must not pair them over the voice. The
+// control's words, timed while the voice speaks, stop it.
+func TestAQuestionOlderThanTheClocksHistoryDoesNotStopItsAnswer(t *testing.T) {
+	for _, over := range []bool{false, true} {
+		t.Run(fmt.Sprintf("said over the voice %v", over), func(t *testing.T) {
+			r := newLongFollowUpDrivingRig(t)
+			r.heard("Wispr.", true, true)
+			sess := r.waitSession()
+			speakAs(t, sess, "Reading INFRA-1027.")
+			started := waitSpeechAfter(t, r, time.Time{})
+			if !over {
+				oldest := started.Add(-8 * time.Minute)
+				r.s.OnTranscript(timedResult(lateQuestion, 495, true, func(int) time.Time { return oldest }))
+				never(t, "the old question, timed by the clock's oldest audio, cut its answer", 200*time.Millisecond, func() bool { return voiceCutAfter(r, started) })
+				return
+			}
+			said := from(started.Add(30 * time.Millisecond))
+			time.Sleep(time.Until(said(1)) + 20*time.Millisecond)
+			r.s.OnTranscript(timedResult("Hold on.", 495, true, said))
+			eventually(t, "the talk-over to stop the voice", func() bool { return voiceCutAfter(r, started) })
+		})
+	}
+}
