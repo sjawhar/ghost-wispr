@@ -11,6 +11,59 @@ import (
 	"github.com/sjawhar/ghost-wispr/internal/jabra"
 )
 
+// TestALightCheckWhileTheDeviceIsBusyIsNotLost fails if a light check that
+// finds another check holding the device is dropped: that one may have read
+// the state before the change the second asks for, as when a press closes
+// the microphone while the light is being written for the state before it,
+// or the paused listener's stream closes just after a press's check read it
+// open (TestJabraPressTogglesCaptureAndTheLight, CI run 44871794869). The
+// ring then shows the old state until the next periodic check, 250 ms on the
+// unit. Here the first check's light write is held while the press closes
+// the microphone and asks for its check.
+func TestALightCheckWhileTheDeviceIsBusyIsNotLost(t *testing.T) {
+	var closed atomic.Bool // the microphone's closed state: the ring shows Muted
+	d := newCaptureDevice(closed.Load)
+	var (
+		mu      sync.Mutex
+		shown   bool
+		hold    chan struct{} // set: the next write waits for it to close
+		entered = make(chan struct{}, 1)
+	)
+	d.attach(func(on bool) error {
+		mu.Lock()
+		h := hold
+		hold = nil
+		mu.Unlock()
+		if h != nil {
+			entered <- struct{}{}
+			<-h
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		shown = on
+		return nil
+	})
+	release := make(chan struct{})
+	mu.Lock()
+	hold = release
+	mu.Unlock()
+	d.mu.Lock()
+	d.written = false // the light's state is not known, as after a Jabra report
+	d.mu.Unlock()
+	first := make(chan struct{})
+	go func() { defer close(first); d.syncLight() }() // a check writes the light for recording
+	<-entered
+	closed.Store(true) // a press closes the microphone meanwhile
+	d.syncLight()      // and asks for its check, which finds the device busy
+	close(release)
+	<-first
+	mu.Lock()
+	defer mu.Unlock()
+	if !shown {
+		t.Fatal("the ring shows unmuted in the closed state: the press's light check was dropped")
+	}
+}
+
 // TestOwnOperationCoversTheJabraReportWindow fails if a press the kernel
 // stamped during an operation on the capture device, or within
 // jabraOwnMuteWindow after it (the Jabra's own report came 12-15 ms after its

@@ -70,6 +70,9 @@ type captureDevice struct {
 	// ring, when set (showPaused), is what the Jabra's ring shows in place of
 	// muted: the Jabra button's count.
 	ring func() bool
+	// syncPending says a light check was asked for that the holder of op has
+	// not run yet (syncLight, unlockOp).
+	syncPending bool
 	// light writes the connected Jabra's light, on while the ring shows
 	// Muted (ringMuted); nil without a Jabra.
 	light   func(on bool) error
@@ -129,7 +132,7 @@ func (d *captureDevice) ringMuted() bool {
 // closes first.
 func (d *captureDevice) openStream(open func() (holds bool, err error)) error {
 	d.op.Lock()
-	defer d.op.Unlock()
+	defer d.unlockOp()
 	d.closeListener()
 	d.begin()
 	defer d.end()
@@ -147,7 +150,7 @@ func (d *captureDevice) openStream(open func() (holds bool, err error)) error {
 // listener does not open.
 func (d *captureDevice) closeStream(closeFn func() error) error {
 	d.op.Lock()
-	defer d.op.Unlock()
+	defer d.unlockOp()
 	d.begin()
 	defer d.end()
 	err := closeFn()
@@ -163,7 +166,7 @@ func (d *captureDevice) closeStream(closeFn func() error) error {
 // is open.
 func (d *captureDevice) probe(fn func() error) error {
 	d.op.Lock()
-	defer d.op.Unlock()
+	defer d.unlockOp()
 	d.closeListener()
 	d.begin()
 	defer d.end()
@@ -206,7 +209,7 @@ func (d *captureDevice) closeListener() {
 // open.
 func (d *captureDevice) openListener(want func() bool, open func() error) error {
 	d.op.Lock()
-	defer d.op.Unlock()
+	defer d.unlockOp()
 	d.mu.Lock()
 	recording := d.open
 	d.mu.Unlock()
@@ -307,13 +310,13 @@ func (d *captureDevice) prepareLightForOpen(ctx context.Context, cancel <-chan s
 		d.mu.Unlock()
 		if !stale || !playing {
 			if stale && d.writeLight() {
-				d.op.Unlock()
+				d.unlockOp()
 				continue // the next pass waits for that playback
 			}
-			d.op.Unlock()
+			d.unlockOp()
 			return true
 		}
-		d.op.Unlock()
+		d.unlockOp()
 		select {
 		case <-silent:
 		case <-cancel:
@@ -380,18 +383,46 @@ func (d *captureDevice) refreshLight(at time.Duration) {
 // syncLight writes the light if it may not show the state, unless a stream is
 // open or a capture operation runs. It never waits for either: each capture
 // operation, each listener close and each playback close writes the light
-// once no stream is open.
+// once no stream is open. A check that finds another operation holding the
+// device is not lost: that operation runs it as it ends (unlockOp), since the
+// operation may have read the streams before the change that asked for it, as
+// a press's light check reads the paused listener's stream still open just as
+// it closes.
 func (d *captureDevice) syncLight() {
+	d.mu.Lock()
+	d.syncPending = true
+	d.mu.Unlock()
 	if !d.op.TryLock() {
 		return
 	}
-	defer d.op.Unlock()
-	paused := d.ringMuted()
-	d.mu.Lock()
-	stale := !d.written || d.shown != paused
-	d.mu.Unlock()
-	if stale {
-		d.writeLight()
+	d.unlockOp()
+}
+
+// unlockOp releases op, first running each light check syncLight asked for
+// meanwhile. One asked for just as op is released finds it free, or finds the
+// next holder, which runs it in turn. The caller holds op.
+func (d *captureDevice) unlockOp() {
+	for {
+		d.mu.Lock()
+		pending := d.syncPending
+		d.syncPending = false
+		d.mu.Unlock()
+		if pending {
+			paused := d.ringMuted()
+			d.mu.Lock()
+			stale := !d.written || d.shown != paused
+			d.mu.Unlock()
+			if stale {
+				d.writeLight()
+			}
+		}
+		d.op.Unlock()
+		d.mu.Lock()
+		pending = d.syncPending
+		d.mu.Unlock()
+		if !pending || !d.op.TryLock() {
+			return
+		}
 	}
 }
 

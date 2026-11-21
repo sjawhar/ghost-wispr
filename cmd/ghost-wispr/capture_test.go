@@ -636,49 +636,181 @@ func TestDeviceErrorDuringPauseClosesMicWithoutBackoff(t *testing.T) {
 	}
 }
 
-// A device error near a pause (USB drop, reconnect backoff) must not reopen
-// the mic while capture is paused; resume brings it back.
-func TestPausedMicIsNotReopenedAfterDeviceError(t *testing.T) {
-	capture := newCaptureGate(nil, nil, nil)
-	mic := newScriptedMic()
-	mic.streamErrs = []error{errors.New("device disconnected")}
-	waits := &recordedWaits{then: capture.Pause} // the pause arrives during the reconnect backoff
-	deepgram := &lockedBuffer{}
-
-	runMicLoop(t, capture, mic, deepgram, waits.wait, nil)
-	mic.expectEvents(t, "stream", "close")
-	// The loop closes the mic before its wait, so the close can come before
-	// the pause the wait makes: resume only once the pause has landed.
-	waitForHardware(t, "the pause during the reconnect backoff", capture.isClosed)
-	mic.expectNoEvents(t)
-
-	capture.Resume()
-	mic.expectEvents(t, "open", "stream")
-	mic.capture(t, []byte{1, 2, 3})
-	if got := deepgram.Len(); got != 3 {
-		t.Fatalf("Deepgram got %d bytes after resume, want 3", got)
+// pauseThenResume is a wait's extra work: a pause, and, with resumeFirst, a
+// resume whose gate opens before the wait returns, as a busy machine can
+// order them before the mic loop looks at the gate after its wait.
+func pauseThenResume(capture *captureGate, resumeFirst bool) func() {
+	return func() {
+		capture.Pause()
+		if !resumeFirst {
+			return
+		}
+		capture.Resume()
+		for deadline := time.Now().Add(testWait); capture.isClosed() && time.Now().Before(deadline); {
+			time.Sleep(time.Millisecond)
+		}
 	}
-	if got := waits.get(); len(got) != 1 || got[0] != time.Second {
-		t.Fatalf("backoff waits = %v, want [1s]", got)
+}
+
+// openedUnderRed starts the mic loop on capture, paused, and resumes it, so
+// the loop opens the microphone under a red confirmation, as the unit's own
+// start-up does (startUnderRed): its first stream then fails with streamErr.
+func openedUnderRed(t *testing.T, capture *captureGate, writer io.Writer, streamErr error, wait func(time.Duration)) *scriptedMic {
+	t.Helper()
+	capture.Pause()
+	mic := newScriptedMic()
+	mic.streamErrs = []error{streamErr}
+	runMicLoop(t, capture, mic, writer, wait, nil)
+	mic.expectEvents(t, "close")
+	capture.Resume()
+	mic.expectEvents(t, "open", "stream", "close")
+	return mic
+}
+
+// A device error near a pause (USB drop, reconnect backoff) must not reopen
+// the mic while capture is paused; resume brings it back, by its own open
+// under its red confirmation, which ends its resuming state, also when the
+// resume comes before the mic loop sees the pause.
+func TestPausedMicIsNotReopenedAfterDeviceError(t *testing.T) {
+	for _, resumeFirst := range []bool{false, true} {
+		t.Run(fmt.Sprintf("resume before the loop looks %v", resumeFirst), func(t *testing.T) {
+			capture := newCaptureGate(nil, nil, nil)
+			waits := &recordedWaits{then: pauseThenResume(capture, resumeFirst)} // the pause arrives during the reconnect backoff
+			deepgram := &lockedBuffer{}
+			mic := openedUnderRed(t, capture, deepgram, errors.New("device disconnected"), waits.wait)
+			if !resumeFirst {
+				// The loop closes the mic before its wait, so the close can
+				// come before the pause the wait makes: resume only once the
+				// pause has landed.
+				waitForHardware(t, "the pause during the reconnect backoff", capture.isClosed)
+				mic.expectNoEvents(t)
+				capture.Resume()
+			}
+			mic.expectEvents(t, "open", "stream")
+			waitMicHold(t, capture, "")
+			mic.capture(t, []byte{1, 2, 3})
+			if got := deepgram.Len(); got != 3 {
+				t.Fatalf("Deepgram got %d bytes after resume, want 3", got)
+			}
+			if got := waits.get(); len(got) != 1 || got[0] != time.Second {
+				t.Fatalf("backoff waits = %v, want [1s]", got)
+			}
+		})
 	}
 }
 
 // The input-overflow restart must not reopen the mic either when a pause
-// arrives during its short wait.
+// arrives during its short wait, nor once a resume comes before the mic loop
+// sees the pause: that resume's own open, under its red confirmation, opens
+// the microphone and ends its resuming state (CI run 44869249046 saw a
+// reopen instead).
 func TestPausedMicIsNotReopenedAfterOverflow(t *testing.T) {
-	capture := newCaptureGate(nil, nil, nil)
-	mic := newScriptedMic()
-	mic.streamErrs = []error{errors.New("Input overflowed")}
-	waits := &recordedWaits{then: capture.Pause}
+	for _, resumeFirst := range []bool{false, true} {
+		t.Run(fmt.Sprintf("resume before the loop looks %v", resumeFirst), func(t *testing.T) {
+			capture := newCaptureGate(nil, nil, nil)
+			waits := &recordedWaits{then: pauseThenResume(capture, resumeFirst)}
+			mic := openedUnderRed(t, capture, io.Discard, errors.New("Input overflowed"), waits.wait)
+			if !resumeFirst {
+				// The loop closes the mic before its wait, so the close can
+				// come before the pause the wait makes: resume only once the
+				// pause has landed.
+				waitForHardware(t, "the pause during the overflow wait", capture.isClosed)
+				capture.Resume()
+			}
+			mic.expectEvents(t, "open", "stream")
+			waitMicHold(t, capture, "")
+		})
+	}
+}
 
-	runMicLoop(t, capture, mic, io.Discard, waits.wait, nil)
-	mic.expectEvents(t, "stream", "close")
-	// The loop closes the mic before its wait, so the close can come before
-	// the pause the wait makes: resume only once the pause has landed.
-	waitForHardware(t, "the pause during the overflow wait", capture.isClosed)
+// TestARestartRaceOpensTheMicOnlyUnderRed fails if, when a pause and a
+// resume both come during the mic loop's wait after an input overflow, the
+// microphone opens, or audio reaches the gate, without the light confirmed
+// red: a confirmation the light refuses must leave the microphone closed and
+// no audio passing, however often the loop tries again. The converse, red
+// confirmed, opens the microphone once, after the confirmation, and its audio
+// passes. The red confirmation is the gate's own (beforeMicStart, the unit's
+// recording light); each one is a "red" event among the device's calls.
+func TestARestartRaceOpensTheMicOnlyUnderRed(t *testing.T) {
+	for _, refused := range []bool{true, false} {
+		t.Run(fmt.Sprintf("red refused %v", refused), func(t *testing.T) {
+			capture := newCaptureGate(nil, nil, nil)
+			mic := newScriptedMic()
+			mic.streamErrs = []error{errors.New("Input overflowed")}
+			var refuse atomic.Bool
+			var refusals atomic.Int64
+			capture.beforeMicStart = func() error {
+				if refuse.Load() {
+					refusals.Add(1)
+					return errors.New("the light did not read back red")
+				}
+				mic.events <- "red"
+				return nil
+			}
+			var waits atomic.Int64
+			wait := func(time.Duration) {
+				if waits.Add(1) > 1 {
+					time.Sleep(5 * time.Millisecond) // a later backoff
+					return
+				}
+				// The overflow wait: the light stops confirming red, and a
+				// pause and a resume both come before the loop looks.
+				refuse.Store(refused)
+				pauseThenResume(capture, true)()
+			}
+			gate := &lockedBuffer{}
+			capture.Pause()
+			runMicLoop(t, capture, mic, gate, wait, nil)
+			mic.expectEvents(t, "close")
+			capture.Resume()
+			mic.expectEvents(t, "red", "open", "stream", "close") // opened under red; the overflow
 
-	capture.Resume()
-	mic.expectEvents(t, "open", "stream")
+			if refused {
+				// The loop tries again and again; read every device call it
+				// makes meanwhile.
+				for window := time.After(300 * time.Millisecond); ; {
+					select {
+					case got := <-mic.events:
+						if got != "close" {
+							t.Fatalf("device call %q with the light refusing red, want none but closes", got)
+						}
+						continue
+					case <-window:
+					}
+					break
+				}
+				if n := refusals.Load(); n < 3 {
+					t.Fatalf("control: %d refused confirmations after the race, want the loop to have tried at least 3 times", n)
+				}
+				if n := gate.Len(); n != 0 {
+					t.Fatalf("%d bytes reached the gate with the light refusing red, want none", n)
+				}
+				return
+			}
+			select {
+			case got := <-mic.events:
+				if got != "red" {
+					t.Fatalf("device call %q before the red confirmation", got)
+				}
+			case <-time.After(testWait):
+				t.Fatal("no red confirmation after the race")
+			}
+			select {
+			case got := <-mic.events:
+				if got != "open" && got != "reopen" {
+					t.Fatalf("device call %q after the red confirmation, want the microphone's one open", got)
+				}
+			case <-time.After(testWait):
+				t.Fatal("the microphone did not open after the red confirmation")
+			}
+			mic.expectEvents(t, "stream")
+			mic.capture(t, []byte{1, 2, 3})
+			if n := gate.Len(); n != 3 {
+				t.Fatalf("%d bytes reached the gate, want the 3 captured under red", n)
+			}
+			mic.expectNoEvents(t)
+		})
+	}
 }
 
 // If the device cannot open on resume (unplugged during the pause), the mic
