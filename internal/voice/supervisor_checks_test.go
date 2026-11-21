@@ -327,14 +327,18 @@ func TestStopRuleForEveryVoice(t *testing.T) {
 		for name, stop := range stops {
 			t.Run(v.name+"/"+name, func(t *testing.T) {
 				r, sess := v.start(t)
+				started := speechStart(r)
 				stop.do(r)
 				interrupted := func() bool { i, _, _ := sess.state(); return !i.IsZero() }
 				if !stop.stops {
-					never(t, "one word stopped the voice", 200*time.Millisecond, interrupted)
+					never(t, "one word stopped the voice", 200*time.Millisecond, func() bool { return interrupted() || voiceCutAfter(r, started) })
 					return
 				}
 				eventually(t, "the voice interrupted", interrupted)
-				if _, ok := r.speaker.cancelledAt(audio.InputVoice); !ok {
+				// The exchange cut the voice input as it took the floor, before
+				// its voice spoke: only a cancel after the speech started is the
+				// stop's.
+				if !voiceCutAfter(r, started) {
 					t.Error("the voice input was not cancelled")
 				}
 			})
@@ -342,24 +346,32 @@ func TestStopRuleForEveryVoice(t *testing.T) {
 	}
 }
 
-// TestBackchannelsDoNotStop fails if R11's backchannels stop the voice, or if
-// two other words do not.
+// TestBackchannelsDoNotStop fails if, for any voice, R11's backchannels stop
+// it, by its session or at the speaker, or if two other words do not stop it
+// both ways. A driving voice is stopped by another path than text to speech
+// (Sol's review of #133 at aaa8e0f found only text to speech tested).
 func TestBackchannelsDoNotStop(t *testing.T) {
 	cases := map[string]bool{
 		"mm-hm okay": false, "uh-huh yeah": false, "yeah right": false, "okay okay": false,
 		"yes sure": true,
 	}
-	for heard, stops := range cases {
-		t.Run(heard, func(t *testing.T) {
-			r, sess := everyVoice()[0].start(t)
-			r.heard(heard, false, false)
-			interrupted := func() bool { i, _, _ := sess.state(); return !i.IsZero() }
-			if stops {
-				eventually(t, "two real words stopped the voice", interrupted)
-				return
-			}
-			never(t, "backchannels stopped the voice", 200*time.Millisecond, interrupted)
-		})
+	for _, v := range everyVoice() {
+		for heard, stops := range cases {
+			t.Run(v.name+"/"+heard, func(t *testing.T) {
+				r, sess := v.start(t)
+				started := speechStart(r)
+				r.heard(heard, false, false)
+				interrupted := func() bool { i, _, _ := sess.state(); return !i.IsZero() }
+				if stops {
+					eventually(t, "two real words stopped the voice", interrupted)
+					if !voiceCutAfter(r, started) {
+						t.Error("control: two real words did not cancel the voice input")
+					}
+					return
+				}
+				never(t, "backchannels stopped the voice", 200*time.Millisecond, func() bool { return interrupted() || voiceCutAfter(r, started) })
+			})
+		}
 	}
 }
 
@@ -391,23 +403,27 @@ func TestReplayWindow(t *testing.T) {
 }
 
 // TestGoAheadOrder fails if "Wispr, go ahead" does not speak the oldest held
-// answer, or "Wispr, go ahead, <key>" does not pick the answer of that key.
+// answer, or "Wispr, go ahead, <key>" does not pick the answer of that key,
+// also a key said as "in for forty five hundred and two", which main picked
+// (Sol's review of #133 at 2949b83: the oldest answer spoke instead).
 func TestGoAheadOrder(t *testing.T) {
 	c := newFakeConcierge()
 	r := newRig(t, c)
-	for i, key := range []string{"ABC-1", "ABC-2", "ABC-3"} {
+	for i, key := range []string{"ABC-1", "ABC-2", "ABC-3", "INFRA-4502"} {
 		c.answers <- PendingAnswer{TaskID: fmt.Sprintf("t%d", i+1), SessionID: "sess-1", IssueKey: key, Text: "About " + key + "."}
 		r.waitEvent("voice_answer_ready:sess-1")
 	}
-	r.heard("Wispr, go ahead, ABC three.", true, true)
-	if got := waitSaid(t, r.waitSession()); got != "About ABC-3." {
-		t.Fatalf("said %q, want the answer of the key named", got)
-	}
-	r.speaker.finish(audio.InputVoice)
-	eventually(t, "the floor free", func() bool { r.s.mu.Lock(); defer r.s.mu.Unlock(); return r.s.ex == nil })
-	r.heard("Wispr, go ahead.", true, true)
-	if got := waitSaid(t, r.waitSession()); got != "About ABC-1." {
-		t.Fatalf("said %q, want the oldest", got)
+	for _, step := range []struct{ said, want string }{
+		{"Wispr, go ahead, ABC three.", "About ABC-3."},
+		{"Wispr, go ahead, in for forty five hundred and two.", "About INFRA-4502."},
+		{"Wispr, go ahead.", "About ABC-1."},
+	} {
+		r.heard(step.said, true, true)
+		if got := waitSaid(t, r.waitSession()); got != step.want {
+			t.Fatalf("%q said %q, want %q", step.said, got, step.want)
+		}
+		r.speaker.finish(audio.InputVoice)
+		eventually(t, "the floor free", func() bool { r.s.mu.Lock(); defer r.s.mu.Unlock(); return r.s.ex == nil })
 	}
 }
 
@@ -614,8 +630,9 @@ func waitTimings(t *testing.T, r *rig, want ...string) {
 
 // TestEachVoicePassesTheScriptedExchange fails if any voice, voice A or a
 // voice that drives its own turn with the Concierge's tools, misses a step of
-// one script: a call and its fast answer, a follow-up, a stop, a pause in the
-// middle of an answer, and a holder's answer on invitation.
+// one script: a call and its fast answer, a follow-up heard as the next turn,
+// a stop, a pause in the middle of an answer, and a holder's answer on
+// invitation.
 func TestEachVoicePassesTheScriptedExchange(t *testing.T) {
 	t.Run("tts", func(t *testing.T) {
 		c := newFakeConcierge("The voice issue is in review.")
@@ -663,6 +680,14 @@ func TestEachVoicePassesTheScriptedExchange(t *testing.T) {
 				speakAs(t, sess, res.Say)
 			}
 			vendorTurn("what is happening with the voice issue?")
+			r.speaker.finish(audio.InputVoice) // the answer plays to its end
+			r.heard("And who holds it?", true, true)
+			r.s.mu.Lock()
+			turn := r.s.turnOf(r.s.ex)
+			r.s.mu.Unlock()
+			if turn != "And who holds it?" {
+				t.Fatalf("the follow-up's turn is %q, want %q", turn, "And who holds it?")
+			}
 			vendorTurn("and who holds it?")
 			r.heard("Wispr, stop.", false, false)
 			eventually(t, "the stop", func() bool { _, _, closed := sess.state(); return closed })

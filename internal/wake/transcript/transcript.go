@@ -354,6 +354,11 @@ type keySpan struct {
 // more digits.
 var soundsLikeProject = map[[2]string]string{{"in", "for"}: "INFRA"}
 
+// beforeAName lists the words after which "in" cannot begin a phrase, so
+// "in for" there is a project's name heard as two words: "the status of in
+// for 10/27".
+var beforeAName = map[string]bool{"of": true, "about": true, "on": true, "with": true, "to": true, "for": true}
+
 func keySpans(tokens []token) []keySpan {
 	texts := make([]string, len(tokens))
 	for i, t := range tokens {
@@ -371,8 +376,15 @@ func keySpans(tokens []token) []keySpan {
 			if project, ok := soundsLikeProject[[2]string{word, normalise(texts[i+1])}]; ok {
 				// Only before a number of three or more digits, as issue
 				// numbers are, and no year: "in for thirty minutes" and "in
-				// for 2027" are no keys.
-				if digits, used := spokenNumber(texts[i+2:]); len(digits) >= 3 && !aYear(digits) {
+				// for 2027" are no keys. A date smart formatting wrote, or a
+				// number said with a thousand, forms main did not read as a
+				// number, reads as the project only after a word "in" cannot
+				// follow: "pencilled in for 10/27" is a date, and "in for
+				// five thousand dollars" an amount. A number said with a
+				// hundred reads as main read it: "go ahead, in for forty five
+				// hundred and two" is INFRA-4502.
+				digits, used := spokenNumber(texts[i+2:])
+				if len(digits) >= 3 && !aYear(digits) && (!amountLike(texts[i+2:i+2+used]) || i > 0 && beforeAName[normalise(texts[i-1])]) {
 					spans = append(spans, keySpan{key: project + "-" + digits, from: i, to: i + 2 + used})
 					i += 1 + used
 					continue
@@ -390,6 +402,20 @@ func keySpans(tokens []token) []keySpan {
 		i += used
 	}
 	return spans
+}
+
+// amountLike reports whether number, the tokens of one spoken or written
+// number, is in a form main did not read as a number and that reads as a
+// date or an amount more readily than as an issue number: a date smart
+// formatting wrote ("10/27"), or a number said with a thousand ("five
+// thousand").
+func amountLike(number []string) bool {
+	for _, w := range number {
+		if strings.Contains(w, "/") || normalise(w) == "thousand" {
+			return true
+		}
+	}
+	return false
 }
 
 // aYear reports whether digits read as a year of this era (1900 to 2099),
@@ -415,18 +441,22 @@ func numberWord(w string) bool {
 	_, o := ones[w]
 	_, te := teens[w]
 	_, tn := tens[w]
-	return o || te || tn || w == "hundred"
+	return o || te || tn || w == "hundred" || w == "thousand"
 }
+
+// writtenGroups joins the groups of a number smart formatting wrote split.
+var writtenGroups = strings.NewReplacer(",", "", "/", "")
 
 // spokenNumber reads the digits that tokens open with: written digits, or
 // number words read in groups ("ten twenty-seven" is 10 then 27, "one oh two
-// seven" is 1, 0, 2, 7, "eleven hundred five" is 1105). It reports the digits
-// and how many tokens it read.
+// seven" is 1, 0, 2, 7, "eleven hundred five" is 1105, "one thousand and
+// twenty seven" is 1027). It reports the digits and how many tokens it read.
 func spokenNumber(tokens []string) (string, int) {
 	if len(tokens) > 0 {
 		// Written digits, with the grouping commas smart formatting writes
-		// ("4,592").
-		if w := strings.ReplaceAll(strings.TrimSuffix(normalise(tokens[0]), "'s"), ",", ""); digitsOnly(w) {
+		// ("4,592"), or the slash of the date it writes for a number said
+		// in two groups ("10/27").
+		if w := writtenGroups.Replace(strings.TrimSuffix(normalise(tokens[0]), "'s")); digitsOnly(w) {
 			return w, 1
 		}
 	}
@@ -434,19 +464,20 @@ func spokenNumber(tokens []string) (string, int) {
 	used := 0
 	for used < len(tokens) {
 		w := normalise(tokens[used])
-		if w == "hundred" && b.Len() > 0 {
+		if places := scalePlaces[w]; places > 0 && b.Len() > 0 {
 			// "eleven hundred five": what follows fills the hundred's two
-			// places; "forty five hundred and two" says "and" first.
+			// places, a thousand's three; "forty five hundred and two" says
+			// "and" first.
 			after := tokens[used+1:]
 			skip := 0
 			if len(after) > 1 && normalise(after[0]) == "and" {
 				after, skip = after[1:], 1
 			}
 			rest, n := spokenNumber(after)
-			if len(rest) > 2 || n == 0 {
+			if len(rest) > places || n == 0 {
 				rest, n, skip = "", 0, 0
 			}
-			b.WriteString(strings.Repeat("0", 2-len(rest)) + rest)
+			b.WriteString(strings.Repeat("0", places-len(rest)) + rest)
 			return b.String(), used + 1 + skip + n
 		}
 		o, isOne := ones[w]
@@ -472,6 +503,9 @@ func spokenNumber(tokens []string) (string, int) {
 	}
 	return b.String(), used
 }
+
+// scalePlaces is how many digits follow a scale word of a spoken number.
+var scalePlaces = map[string]int{"hundred": 2, "thousand": 3}
 
 func lettersOnly(w string) bool {
 	for _, r := range w {

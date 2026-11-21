@@ -478,12 +478,19 @@ func TestIssueKeyForms(t *testing.T) {
 		// As Deepgram wrote Aura's "infra 4592" in end-to-end run 8c, and as
 		// people say it.
 		"ask the agent on in for forty five hundred and two": {"INFRA-4502"},
-		"infra forty-five ninety-two":                        {"INFRA-4592"},
-		"infra four five nine two":                           {"INFRA-4592"},
-		"in for forty five ninety two please":                {"INFRA-4592"},
-		"I am in for a minute":                               nil,
+		// A hundred after "in for" reads as main read it, after any word
+		// (Sol's review of #133 at 2949b83).
+		"go ahead, in for forty five hundred and two": {"INFRA-4502"},
+		"infra forty-five ninety-two":                 {"INFRA-4592"},
+		"infra four five nine two":                    {"INFRA-4592"},
+		"in for forty five ninety two please":         {"INFRA-4592"},
+		"I am in for a minute":                        nil,
 		// End-to-end run 8e: smart formatting writes "4,592".
 		"ask the agent on in For 4,592 when": {"INFRA-4592"},
+		// The office run of 2026-11-21: smart formatting wrote "ten
+		// twenty seven" as a date.
+		"what's the status of infra 10/27?": {"INFRA-1027"},
+		"What's the status of INFRA 10/27?": {"INFRA-1027"},
 	}
 	for text, want := range cases {
 		if got := IssueKeys(text); !slices.Equal(got, want) {
@@ -513,6 +520,10 @@ func TestSpokenKeysAreWritten(t *testing.T) {
 		"we're in for 2027":                "we're in for 2027",
 		"we're in for twenty twenty seven": "we're in for twenty twenty seven",
 		"what about infra 2027":            "what about INFRA-2027",
+		// The office run of 2026-11-21: smart formatting wrote "ten
+		// twenty seven" as a date.
+		"what's the status of infra 10/27?": "what's the status of INFRA-1027?",
+		"What's the status of INFRA 10/27?": "What's the status of INFRA-1027?",
 	} {
 		if got := WriteKeys(text, projects); got != want {
 			t.Errorf("WriteKeys(%q) = %q, want %q", text, got, want)
