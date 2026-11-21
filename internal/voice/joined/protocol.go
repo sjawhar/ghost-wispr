@@ -144,4 +144,5 @@ const (
 	goneJoinText     = "Envoy lists your session as gone, so you did not join: Ghost Wispr could not reach you. Join again from a live session."
 	meetingWentText  = "The meeting ended while your join was on its way, so you did not join it. Join again if a person asks you to during a meeting."
 	joinStoppedText  = "Ghost Wispr's meeting voice stopped while your join was on its way, so you did not join. Join again if a person asks you to."
+	staleCommandText = "Your floor request was sent before you last joined, so it was not taken. Send it again if the room still needs to hear it."
 )

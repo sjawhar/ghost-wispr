@@ -37,9 +37,15 @@ type Manager struct {
 	refinementWarning  func(sessionID, warning string)
 	sessionEnded       func(sessionID string)
 
-	mu                             sync.Mutex
-	currentSessionID               string
-	currentStartedAt               time.Time
+	mu               sync.Mutex
+	currentSessionID string
+	currentStartedAt time.Time
+	// meeting is the current session's meeting context, which ends in the
+	// same step that clears or replaces the session (moveSessionLocked),
+	// before any session-ended hook runs: what joined agents and the voice
+	// do for a meeting ends with it there (MeetingContext).
+	meeting                        context.Context
+	meetingCancel                  context.CancelFunc
 	manualSession                  bool
 	prevTimeout                    time.Duration
 	capturePaused                  bool          // no session may start while true
@@ -457,7 +463,7 @@ func (m *Manager) claimSessionLocked(now time.Time) (string, error) {
 
 	sessionID := m.newSessionIDLocked(now)
 	startedAt := m.recordingStart(now.UTC())
-	m.currentSessionID = sessionID
+	m.moveSessionLocked(sessionID)
 	m.currentStartedAt = startedAt
 	m.sessionStarts++
 	m.mu.Unlock()
@@ -466,7 +472,7 @@ func (m *Manager) claimSessionLocked(now time.Time) (string, error) {
 	sessionID, err := m.startSession(sessionID, startedAt)
 	if err != nil {
 		m.mu.Lock()
-		m.currentSessionID = ""
+		m.moveSessionLocked("")
 		m.currentStartedAt = time.Time{}
 		m.mu.Unlock()
 		return "", err
@@ -524,7 +530,7 @@ func (m *Manager) nextSessionID(taken string, startedAt time.Time) string {
 	defer m.mu.Unlock()
 	sessionID := m.newSessionIDLocked(startedAt)
 	if m.currentSessionID == taken {
-		m.currentSessionID = sessionID
+		m.moveSessionLocked(sessionID)
 	}
 	return sessionID
 }
@@ -615,7 +621,7 @@ func (m *Manager) endSession(ctx context.Context, want string) error {
 	}
 
 	m.mu.Lock()
-	m.currentSessionID = ""
+	m.moveSessionLocked("")
 	m.currentStartedAt = time.Time{}
 	m.failedEnd = sessionEnd{}
 	m.endManualLocked()
@@ -919,6 +925,40 @@ func (m *Manager) ActiveSession() (string, time.Time) {
 	return m.currentSessionID, m.currentStartedAt
 }
 
+// endedMeeting is the meeting context of every session that is not current:
+// it is done from the start.
+var endedMeeting = func() context.Context {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	return ctx
+}()
+
+// MeetingContext is the meeting context of recording session id: live while
+// id is the current session, and done in the same step that ends or replaces
+// it, before the session-ended hook. It is done at once for any other id. It
+// takes the manager's lock briefly and calls nothing.
+func (m *Manager) MeetingContext(id string) context.Context {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if id == "" || id != m.currentSessionID || m.meeting == nil {
+		return endedMeeting
+	}
+	return m.meeting
+}
+
+// moveSessionLocked makes id ("" for none) the current session: the last
+// session's meeting context ends here, and id's begins. m.mu is held.
+func (m *Manager) moveSessionLocked(id string) {
+	if m.meetingCancel != nil {
+		m.meetingCancel()
+	}
+	m.currentSessionID = id
+	m.meeting, m.meetingCancel = nil, nil
+	if id != "" {
+		m.meeting, m.meetingCancel = context.WithCancel(context.Background())
+	}
+}
+
 // SetSummarizer replaces the summarizer used for new sessions.
 // Safe to call concurrently.
 func (m *Manager) SetSummarizer(s Summarizer) {
@@ -1081,7 +1121,7 @@ func (m *Manager) ManualStartSession(ctx context.Context, titleHint string) (str
 	}
 
 	sessionID := m.newSessionIDLocked(now)
-	m.currentSessionID = sessionID
+	m.moveSessionLocked(sessionID)
 	startedAt := m.recordingStart(now)
 	m.currentStartedAt = startedAt
 	m.manualSession = true
@@ -1099,7 +1139,7 @@ func (m *Manager) ManualStartSession(ctx context.Context, titleHint string) (str
 	sessionID, err := m.startSession(sessionID, startedAt)
 	if err != nil {
 		m.mu.Lock()
-		m.currentSessionID = ""
+		m.moveSessionLocked("")
 		m.currentStartedAt = time.Time{}
 		m.endManualLocked()
 		m.mu.Unlock()

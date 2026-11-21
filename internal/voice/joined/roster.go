@@ -79,6 +79,11 @@ type Config struct {
 	// roster reads it under its lock at each commit, so it must return at
 	// once and never call the roster or the Supervisor.
 	Session func() string
+	// Meeting is the context of a recording session's meeting, which the
+	// recorder ends in the same step that clears the session, before any
+	// session-ended hook; nil leaves a membership's end to Session and the
+	// hook. It must return at once and never call the roster.
+	Meeting func(sessionID string) context.Context
 	// Started is when recording session id started; zero when unknown.
 	Started func(id string) time.Time
 	// Floor raises the agents' hands.
@@ -125,20 +130,55 @@ type member struct {
 	Member
 	name  string   // how the voice names it
 	words []string // its title's words that count toward its issue coming up
-	// ctx ends as the membership's end begins: its leave, its meeting's end
-	// or deletion, or the voice stopping, each of which cancels it under
-	// r.mu before any slow cleanup. A cancelled membership stays in
-	// r.members only until its cleanup removes it, and acts on nothing.
+	// ctx is the membership's context (liveContext): its Err reports it done
+	// the moment the recorder no longer holds its meeting open, and an end
+	// (its leave, its meeting's end or deletion, the voice stopping, a join
+	// that replaces it) cancels it under r.mu before any slow cleanup.
 	ctx    context.Context
 	cancel context.CancelFunc
-	// lastPointer is when it was last sent a pointer; waiting holds the
-	// mentions since, waitFrom to waitTo, sent once PointerEvery passed.
-	lastPointer      time.Time
+	// ending is set, under r.mu, as the roster begins the membership's end.
+	// Its context may be done first, with the recorder's meeting; the
+	// roster's cleanup then still runs, once.
+	ending bool
+	// issuedAt is when the join that made the membership was sent: a floor
+	// request or a leave sent before it was for an earlier membership.
+	issuedAt time.Time
+	// waiting holds the mentions of its issue since the agent's last
+	// pointer, waitFrom to waitTo, sent once PointerEvery passed.
 	waiting          bool
 	waitFrom, waitTo time.Time
-	lastFloor        time.Time
-	floorEvent       string    // the last floor request taken, so a redelivery is no second one
 	notLiveSince     time.Time // the first sweep that read it not live; only Envoy reading it live clears it
+}
+
+// agentHistory is what the roster keeps of one agent session across its
+// memberships: the commands it took, so that one delivered again is a no-op,
+// and the agent's rate limits, which a leave and a rejoin do not reset.
+type agentHistory struct {
+	events      []string // the EventIDs of its commands taken, newest last, at most maxEvents
+	lastFloor   time.Time
+	lastPointer time.Time
+	touched     uint64 // when it was last used, for eviction
+}
+
+// liveContext is a context whose Err also reports it done the moment alive
+// is false, and then cancels it: a membership's, whose alive reads whether
+// the recorder still holds its meeting open, so that a check made right
+// after the recorder ends the meeting sees it, before any hook runs.
+type liveContext struct {
+	context.Context
+	cancel context.CancelFunc
+	alive  func() bool
+}
+
+func (c *liveContext) Err() error {
+	if err := c.Context.Err(); err != nil {
+		return err
+	}
+	if !c.alive() {
+		c.cancel()
+		return context.Canceled
+	}
+	return nil
 }
 
 // pointer is one pointer to send for a membership, while it is current.
@@ -196,6 +236,10 @@ type Roster struct {
 	// one whose end has begun and whose cleanup has not finished.
 	members  map[string]*member
 	meetings map[string]*meeting // the open meetings agents joined, by recording session
+	// history is each agent session's history, across its memberships, for
+	// at most maxAgents agents (agentHistory).
+	history map[string]*agentHistory
+	touch   uint64
 	// ended are the recording sessions that ended or were deleted, newest
 	// last, at most maxEnded: a decision made from a slow read commits
 	// nothing for one of them.
@@ -212,6 +256,48 @@ type Roster struct {
 // a few meetings a day.
 const maxEnded = 64
 
+// maxEvents bounds the commands remembered of one agent, and maxAgents the
+// agents remembered with no membership: a meeting takes a few commands of
+// each of a few agents.
+const (
+	maxEvents = 64
+	maxAgents = 256
+)
+
+// historyLocked is agent's history, made at its first command.
+func (r *Roster) historyLocked(agent string) *agentHistory {
+	r.touch++
+	h := r.history[agent]
+	if h == nil {
+		h = &agentHistory{}
+		r.history[agent] = h
+	}
+	h.touched = r.touch
+	for len(r.history) > maxAgents {
+		oldest, found := "", false
+		var at uint64
+		for other, oh := range r.history {
+			if r.members[other] != nil || (found && oh.touched >= at) {
+				continue
+			}
+			oldest, at, found = other, oh.touched, true
+		}
+		if !found {
+			break
+		}
+		delete(r.history, oldest)
+	}
+	return h
+}
+
+// meeting is the recorder's context of session id's meeting.
+func (r *Roster) meeting(id string) context.Context {
+	if r.cfg.Meeting == nil {
+		return context.Background()
+	}
+	return r.cfg.Meeting(id)
+}
+
 // meetingOpenLocked reports whether sessionID is the meeting the recorder
 // holds open now, read live, at the moment of the commit it guards. The
 // roster's record of ended meetings, which every end writes under r.mu as
@@ -226,16 +312,18 @@ func (r *Roster) meetingOpenLocked(sessionID string) bool {
 // check, against live state, that every step makes under r.mu at the moment
 // it acts for m.
 func (r *Roster) currentLocked(m *member) bool {
-	return m != nil && r.members[m.Agent] == m && m.ctx.Err() == nil && r.meetingOpenLocked(m.SessionID)
+	return m != nil && r.members[m.Agent] == m && !m.ending && m.ctx.Err() == nil && r.meetingOpenLocked(m.SessionID)
 }
 
-// meetingLocked is sessionID's meeting, made at its first join.
-func (r *Roster) meetingLocked(sessionID string) *meeting {
+// meetingLocked is sessionID's meeting, made at its first join; its context
+// ends with the recorder's (recorder) and with the roster.
+func (r *Roster) meetingLocked(sessionID string, recorder context.Context) *meeting {
 	if mt := r.meetings[sessionID]; mt != nil {
 		return mt
 	}
 	mt := &meeting{id: sessionID}
 	mt.ctx, mt.cancel = context.WithCancel(r.ctx)
+	context.AfterFunc(recorder, mt.cancel)
 	r.meetings[sessionID] = mt
 	return mt
 }
@@ -267,7 +355,7 @@ func New(cfg *Config) *Roster {
 		logf = log.Printf
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	return &Roster{cfg: c, logf: logf, ctx: ctx, cancel: cancel, members: map[string]*member{}, meetings: map[string]*meeting{}}
+	return &Roster{cfg: c, logf: logf, ctx: ctx, cancel: cancel, members: map[string]*member{}, meetings: map[string]*meeting{}, history: map[string]*agentHistory{}}
 }
 
 // SetAgents gives the roster the unit's Envoy session once it opens, which
@@ -288,7 +376,8 @@ func (r *Roster) SetAgents(agents Agents) {
 	}
 	var gone []*member
 	for _, m := range r.members {
-		if m.ctx.Err() == nil {
+		if !m.ending {
+			m.ending = true
 			m.cancel()
 			gone = append(gone, m)
 		}
@@ -387,13 +476,31 @@ func (r *Roster) Deliver(ctx context.Context, m *envoy.Message) (bool, error) {
 		r.logf("joined: a %s message named no session it came from", c.verb)
 		return true, nil
 	}
+	// A command Envoy delivers again was taken: it acts once, whatever the
+	// agent's membership is now.
+	if m.EventID != "" {
+		r.mu.Lock()
+		h := r.historyLocked(m.SourceSession)
+		taken := slices.Contains(h.events, m.EventID)
+		if !taken {
+			h.events = append(h.events, m.EventID)
+			if extra := len(h.events) - maxEvents; extra > 0 {
+				h.events = slices.Delete(h.events, 0, extra)
+			}
+		}
+		r.mu.Unlock()
+		if taken {
+			r.logf("joined: a %s message already taken was delivered again", c.verb)
+			return true, nil
+		}
+	}
 	switch c.verb {
 	case verbJoin:
 		r.join(ctx, m, c.key)
 	case verbFloor:
 		r.floor(ctx, m, c.draft)
 	case verbLeave:
-		r.leave(m.SourceSession, "")
+		r.leaveCommand(m)
 	}
 	return true, nil
 }
@@ -408,6 +515,8 @@ func (r *Roster) join(ctx context.Context, m *envoy.Message, key string) {
 		r.reply(ctx, m, "refused", noMeetingText)
 		return
 	}
+	// The recorder's context of the meeting: a membership ends with it.
+	recorder := r.meeting(sessionID)
 	started := r.started(sessionID)
 	if !started.IsZero() && !m.IssuedAt.IsZero() && m.IssuedAt.Before(started) {
 		r.reply(ctx, m, "refused", staleJoinText)
@@ -463,7 +572,7 @@ func (r *Roster) join(ctx context.Context, m *envoy.Message, key string) {
 		r.reply(ctx, m, "refused", joinStoppedText)
 		return
 	}
-	if !r.meetingOpenLocked(sessionID) {
+	if !r.meetingOpenLocked(sessionID) || recorder.Err() != nil {
 		r.mu.Unlock()
 		r.reply(ctx, m, "refused", meetingWentText)
 		return
@@ -477,16 +586,23 @@ func (r *Roster) join(ctx context.Context, m *envoy.Message, key string) {
 		// its limits, its pointers and its time not live.
 		joined.IssueKey, joined.Title, joined.name, joined.words = key, title, name, titleWords(title)
 	} else {
-		if old != nil && old.ctx.Err() == nil {
+		if old != nil && !old.ending {
+			old.ending = true
 			old.cancel() // its membership of a meeting no longer recording ends
 			ended = old
 		}
 		r.seq++
 		joined = &member{
-			Member: Member{ID: fmt.Sprintf("%s#%d", agent, r.seq), Agent: agent, IssueKey: key, Title: title, SessionID: sessionID, JoinedAt: now},
-			name:   name, words: titleWords(title),
+			Member:   Member{ID: fmt.Sprintf("%s#%d", agent, r.seq), Agent: agent, IssueKey: key, Title: title, SessionID: sessionID, JoinedAt: now},
+			name:     name,
+			words:    titleWords(title),
+			issuedAt: m.IssuedAt,
 		}
-		joined.ctx, joined.cancel = context.WithCancel(r.meetingLocked(sessionID).ctx)
+		base, cancel := context.WithCancel(r.meetingLocked(sessionID, recorder).ctx)
+		joined.ctx = &liveContext{Context: base, cancel: cancel, alive: func() bool {
+			return recorder.Err() == nil && r.cfg.Session() == sessionID
+		}}
+		joined.cancel = cancel
 		r.members[agent] = joined
 	}
 	keys := r.keytermsLocked()
@@ -515,6 +631,13 @@ func (r *Roster) floor(ctx context.Context, m *envoy.Message, draft string) {
 	if !r.currentLocked(joined) {
 		r.mu.Unlock()
 		r.reply(ctx, m, "refused", notJoinedText)
+		return
+	}
+	if !m.IssuedAt.IsZero() && !joined.issuedAt.IsZero() && m.IssuedAt.Before(joined.issuedAt) {
+		// Sent before the join that made this membership: it was an earlier
+		// membership's, and never moves to this one.
+		r.mu.Unlock()
+		r.reply(joined.ctx, m, "refused", staleCommandText)
 		return
 	}
 	// The Supervisor asks Current at the moment it accepts an invitation for
@@ -552,35 +675,33 @@ func (r *Roster) floor(ctx context.Context, m *envoy.Message, draft string) {
 	hand.Expires = raised.Add(r.cfg.FloorExpiry)
 
 	// Decided under r.mu on the membership read above while it is current,
-	// with the request's place reserved (its event and time, so a
-	// redelivery or a second request waits out the rate); raised with r.mu
-	// released; then checked again: a membership whose end began meanwhile
-	// has its hand lowered by its own id, which touches no other's.
+	// with the agent's floor time reserved, so a second request waits out
+	// the rate, a rejoin included; raised with r.mu released; then checked
+	// again: a membership whose end began meanwhile has its hand lowered by
+	// its own id, which touches no other's.
 	r.mu.Lock()
+	h := r.historyLocked(agent)
 	switch {
 	case !r.currentLocked(joined):
 		r.mu.Unlock()
 		r.reply(ctx, m, "refused", notJoinedText)
 		return
-	case joined.floorEvent == m.EventID:
-		r.mu.Unlock()
-		return // a redelivery of the request already taken
-	case !joined.lastFloor.IsZero() && now.Sub(joined.lastFloor) < r.cfg.FloorEvery:
-		next := joined.lastFloor.Add(r.cfg.FloorEvery)
+	case !h.lastFloor.IsZero() && now.Sub(h.lastFloor) < r.cfg.FloorEvery:
+		next := h.lastFloor.Add(r.cfg.FloorEvery)
 		r.mu.Unlock()
 		r.reply(joined.ctx, m, "refused", fmt.Sprintf("You may ask for the floor at most once in %s, so this request was not taken. You may ask again from %s UTC.", every(r.cfg.FloorEvery), next.UTC().Format("15:04:05")))
 		return
 	}
-	priorFloor, priorEvent := joined.lastFloor, joined.floorEvent
-	joined.lastFloor, joined.floorEvent = now, m.EventID
+	prior := h.lastFloor
+	h.lastFloor = now
 	r.mu.Unlock()
 
 	err := r.cfg.Floor.RaiseHand(hand)
 
 	r.mu.Lock()
 	current := r.currentLocked(joined)
-	if err != nil && joined.floorEvent == m.EventID {
-		joined.lastFloor, joined.floorEvent = priorFloor, priorEvent // not taken: the reservation is undone
+	if err != nil && h.lastFloor.Equal(now) {
+		h.lastFloor = prior // not taken: the reservation is undone
 	}
 	r.mu.Unlock()
 	if err != nil {
@@ -601,17 +722,31 @@ func (r *Roster) floor(ctx context.Context, m *envoy.Message, draft string) {
 // leave ends agent's current membership; a reason is sent to it as a notice.
 func (r *Roster) leave(agent, reason string) { r.leaveMember(agent, nil, reason) }
 
-// leaveMember ends agent's membership when it is current and is want (any
-// for nil): a decision made from an earlier read never ends a membership
-// that began since. The membership is cancelled under r.mu first, then its
-// hands are lowered.
+// leaveCommand ends the membership a leave message is for: the agent's
+// current one, unless the leave was sent before the join that made it.
+func (r *Roster) leaveCommand(m *envoy.Message) {
+	r.mu.Lock()
+	current := r.members[m.SourceSession]
+	stale := current != nil && !m.IssuedAt.IsZero() && !current.issuedAt.IsZero() && m.IssuedAt.Before(current.issuedAt)
+	r.mu.Unlock()
+	if current == nil || stale {
+		return // nothing to leave, or a leave of an earlier membership
+	}
+	r.leaveMember(m.SourceSession, current, "")
+}
+
+// leaveMember ends agent's membership when its end has not begun and it is
+// want (any for nil): a decision made from an earlier read never ends a
+// membership that began since. The membership is cancelled under r.mu
+// first, then its hands are lowered.
 func (r *Roster) leaveMember(agent string, want *member, reason string) {
 	r.mu.Lock()
 	m := r.members[agent]
-	if m == nil || m.ctx.Err() != nil || (want != nil && m != want) {
+	if m == nil || m.ending || (want != nil && m != want) {
 		r.mu.Unlock()
 		return
 	}
+	m.ending = true
 	m.cancel()
 	keys := r.keytermsLocked()
 	r.mu.Unlock()
@@ -655,7 +790,9 @@ func (r *Roster) leaveMeetings(ids []string, reason string) {
 	r.endLocked(ids)
 	var gone []*member
 	for _, m := range r.members {
-		if m.ctx.Err() == nil && slices.Contains(ids, m.SessionID) {
+		if !m.ending && slices.Contains(ids, m.SessionID) {
+			m.ending = true
+			m.cancel()
 			gone = append(gone, m)
 		}
 	}
@@ -735,14 +872,15 @@ func (r *Roster) OnSegment(s *voice.Segment) {
 		if !r.currentLocked(m) || m.SessionID != s.SessionID || !m.comesUp(s.Text) {
 			continue
 		}
-		if m.waiting || (!m.lastPointer.IsZero() && now.Sub(m.lastPointer) < r.cfg.PointerEvery) {
+		h := r.historyLocked(m.Agent)
+		if m.waiting || (!h.lastPointer.IsZero() && now.Sub(h.lastPointer) < r.cfg.PointerEvery) {
 			if !m.waiting {
 				m.waiting, m.waitFrom, m.waitTo = true, s.From, s.To
 			}
 			m.waitFrom, m.waitTo = minTime(m.waitFrom, s.From), maxTime(m.waitTo, s.To)
 			continue
 		}
-		m.lastPointer = now
+		h.lastPointer = now
 		sends = append(sends, &pointer{member: m, key: m.IssueKey, sessionID: m.SessionID, from: s.From, to: s.To})
 	}
 	r.mu.Unlock()
@@ -755,8 +893,11 @@ func (r *Roster) Tick() {
 	var sends []*pointer
 	r.mu.Lock()
 	for _, m := range r.members {
-		if r.currentLocked(m) && m.waiting && now.Sub(m.lastPointer) >= r.cfg.PointerEvery {
-			m.waiting, m.lastPointer = false, now
+		if !r.currentLocked(m) || !m.waiting {
+			continue
+		}
+		if h := r.historyLocked(m.Agent); now.Sub(h.lastPointer) >= r.cfg.PointerEvery {
+			m.waiting, h.lastPointer = false, now
 			sends = append(sends, &pointer{member: m, key: m.IssueKey, sessionID: m.SessionID, from: m.waitFrom, to: m.waitTo})
 		}
 	}
@@ -841,9 +982,13 @@ func (r *Roster) sendVia(ctx context.Context, agents Agents, agent, inReplyTo, k
 	if inReplyTo != "" {
 		key = uuid.NewSHA1(uuid.NameSpaceOID, []byte("ghost-wispr joined "+inReplyTo+" "+kind)).String()
 	}
-	ctx, cancel := context.WithTimeout(ctx, sendTimeout)
+	// The send's context reads its parent's Err at each check, so a
+	// membership the recorder no longer holds open stops it at once.
+	parent := ctx
+	timed, cancel := context.WithTimeout(parent, sendTimeout)
 	defer cancel()
-	if _, err := agents.Send(ctx, &envoy.SendRequest{Target: agent, Message: text, NoReply: true, IdempotencyKey: key, InReplyTo: inReplyTo}); err != nil {
+	sendCtx := &liveContext{Context: timed, cancel: cancel, alive: func() bool { return parent.Err() == nil }}
+	if _, err := agents.Send(sendCtx, &envoy.SendRequest{Target: agent, Message: text, NoReply: true, IdempotencyKey: key, InReplyTo: inReplyTo}); err != nil {
 		r.logf("joined: send a joined agent its %s: %v", kind, err)
 	}
 }

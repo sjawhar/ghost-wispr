@@ -88,13 +88,15 @@ var (
 	ErrHandVoiceOff   = errors.New("the meeting voice is off")
 	ErrHandNotMeeting = errors.New("its meeting is not the one recording now")
 	ErrHandExpired    = errors.New("it expired before it reached the room")
+	ErrHandEnded      = errors.New("its membership of the meeting has ended")
 )
 
 // RaiseHand takes a joined agent's floor request: the hand sound plays at
 // the next gap with no transcript word, and the words wait for a person's
 // invitation until h.Expires. It refuses a hand with the voice off, for a
-// meeting that is not the one recording, or that has expired. HandDone is
-// told how the hand came down.
+// meeting that is not the one recording, that has expired, or whose
+// membership's Context has ended, before it shows anything. HandDone is told
+// how the hand came down.
 func (s *Supervisor) RaiseHand(h *Hand) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -105,6 +107,8 @@ func (s *Supervisor) RaiseHand(h *Hand) error {
 		return ErrHandNotMeeting
 	case !time.Now().Before(h.Expires):
 		return ErrHandExpired
+	case h.Context != nil && h.Context.Err() != nil:
+		return ErrHandEnded
 	}
 	hand := *h // the Supervisor keeps its own copy
 	s.pending = append(s.pending, &pendingAnswer{

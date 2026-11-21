@@ -34,7 +34,8 @@ func newLiveKeyterms(cfg *config.Config, projects func() []string) *transcript.L
 
 // joinedDeps is what the roster needs from the rest of the unit.
 type joinedDeps struct {
-	session   func() string // the recording session now
+	session   func() string                // the recording session now
+	meeting   func(string) context.Context // a session's meeting context, which the recorder ends with it
 	store     *storage.SQLiteStore
 	floor     joined.Floor
 	dispatch  *dispatch.Client // nil with no Dispatch token or URL
@@ -48,6 +49,7 @@ type joinedDeps struct {
 func startJoinedAgents(ctx context.Context, deps *joinedDeps) *joined.Roster {
 	roster := joined.New(&joined.Config{
 		Session: deps.session,
+		Meeting: deps.meeting,
 		Started: func(id string) time.Time {
 			session, err := deps.store.GetSession(id)
 			if err != nil {

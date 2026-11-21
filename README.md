@@ -379,24 +379,29 @@ joins, asks for the floor and leaves with Envoy messages to that session, each o
 `ghost-wispr join KEY`, `ghost-wispr floor` with its words on the lines after it, and
 `ghost-wispr leave`. A join is taken on trust from any session Envoy does not list as gone, with no
 check that a person invited it, since any agent on the tailnet can already ask the Concierge and
-read the API, a pointer holds no words, and a hand speaks only on a person's "go ahead".
+read the API, a pointer holds no words, and a hand speaks only on a person's "go ahead". A command
+Envoy delivers again acts only once, and a floor request or a leave sent before the agent's latest
+join is not taken.
 
 A joined agent follows the meeting through the unit's own API, and gets a pointer with no words
 when its issue comes up: a final segment that names its key, its number, or two words of its
-issue's title, at most once in 60 s. `GET /api/sessions/{id}/joined-agents` lists the agents in a
-meeting, and so does the session's page. Each joined agent's issue key becomes a keyterm of the
-live transcript from its join, with no redial. "Wispr, ask the ABC-12 agent …" goes to the agent
-that joined on ABC-12 before the issue's claim in Dispatch, and reaches it once.
+issue's title, at most once in 60 s for an agent, across its joins.
+`GET /api/sessions/{id}/joined-agents` lists the agents in a meeting, and so does the session's
+page. Each joined agent's issue key becomes a keyterm of the live transcript from its join, with no
+redial. "Wispr, ask the ABC-12 agent …" goes to the agent that joined on ABC-12 before the issue's
+claim in Dispatch, and reaches it once.
 
 A floor request is at most 50 words as the room hears them, the attribution the voice says first
-("ABC-12's agent says:") included, written for the ear, at most one in 5 minutes for an agent.
-The room hears a short two-tap sound at the next gap, and LED 2 flashes green while the hand is up,
-as it does for a waiting answer; LED 1 stays red. The voice says the words, after the agent's issue
-key, only when a person says "Wispr, go ahead" ("Wispr, go ahead, ABC-12" picks one of several),
-and drops them after 60 s; the agent is told which. "Wispr, never mind" leaves a hand up: it drops
-answers only. "Wispr, who has a hand up?" names the agents waiting. An agent leaves when it says
-so, when the meeting ends or is deleted, when the voice stops, or when Envoy lists its session as
-not live for 10 minutes.
+("ABC-12's agent says:") included, written for the ear, at most one in 5 minutes for an agent,
+across its joins. The room hears a short two-tap sound at the next gap, and LED 2 flashes green
+while the hand is up, as it does for a waiting answer; LED 1 stays red. The voice says the words,
+after the agent's issue key, only when a person says "Wispr, go ahead" ("Wispr, go ahead, ABC-12"
+picks one of several), and drops them after 60 s; the agent is told which. "Wispr, never mind"
+leaves a hand up: it drops answers only, and a hand still sounds while one waits. "Wispr, who has a
+hand up?" names the agents waiting. An agent leaves when it says so, when the meeting ends or is
+deleted, when the voice stops, or when Envoy lists its session as not live for 10 minutes. The
+moment the recorder ends a meeting, nothing more is sent or spoken for it: not a pointer on its
+way, a hand's sound or words, nor an exchange of the voice.
 
 ## Deployment
 

@@ -178,6 +178,12 @@ type SupervisorConfig struct {
 	// agents' pointers; nil drops them. It runs on the transcript reader,
 	// never under the Supervisor's lock, and must return at once.
 	Segment func(s *Segment)
+	// Meeting is the context of a recording session's meeting, which the
+	// recorder cancels in the same step that ends the session; an exchange
+	// ends with it. nil leaves an exchange to the session-ended hook. It runs
+	// under the Supervisor's lock, so it must return at once and never call
+	// the Supervisor.
+	Meeting func(sessionID string) context.Context
 	Logf    func(string, ...any)
 }
 
@@ -211,21 +217,25 @@ type Supervisor struct {
 	chimeCtx      context.Context    // that sound's context, nil while none plays
 	chimeHands    bool               // that sound is the hand sound
 	chimeQueuedAt time.Time          // when that sound's last frame was queued
-	pending       []*pendingAnswer
-	arrivals      uint64    // answers taken so far; each held answer's arrived
-	lit           bool      // the waiting light was last told On (showWaitingLocked)
-	voiceSpeaking bool      // the voice input plays
-	voiceStarted  time.Time // when it last started
-	voiceEnded    time.Time // when it last stopped
-	own           []ownWords
-	recent        []TurnText
-	lastHeard     time.Time      // the last word heard
-	lastRoomWord  time.Time      // the last word heard that was not Wispr's own
-	lastTimes     *exchangeTimes // the newest exchange a wake opened: its times, no words
-	chimedAt      time.Time
-	heard         []heardCall    // Heard calls OnTranscript makes once it unlocks
-	segments      []Segment      // Segment calls OnTranscript makes once it unlocks
-	wg            sync.WaitGroup // the goroutines Close waits for
+	// answerQueuedAt is when the last answer sound's last frame was queued:
+	// its tail may still play from the speaker's queue for chimeQueueLasts,
+	// whatever sound was chosen after it.
+	answerQueuedAt time.Time
+	pending        []*pendingAnswer
+	arrivals       uint64    // answers taken so far; each held answer's arrived
+	lit            bool      // the waiting light was last told On (showWaitingLocked)
+	voiceSpeaking  bool      // the voice input plays
+	voiceStarted   time.Time // when it last started
+	voiceEnded     time.Time // when it last stopped
+	own            []ownWords
+	recent         []TurnText
+	lastHeard      time.Time      // the last word heard
+	lastRoomWord   time.Time      // the last word heard that was not Wispr's own
+	lastTimes      *exchangeTimes // the newest exchange a wake opened: its times, no words
+	chimedAt       time.Time
+	heard          []heardCall    // Heard calls OnTranscript makes once it unlocks
+	segments       []Segment      // Segment calls OnTranscript makes once it unlocks
+	wg             sync.WaitGroup // the goroutines Close waits for
 
 	// commands counts a person's commands on held answers: each "Wispr,
 	// never mind" and each "Wispr, go ahead". neverMinds is how many never
@@ -558,8 +568,10 @@ func (s *Supervisor) waitingLocked() bool {
 }
 
 // showWaitingLocked tells the waiting light On or Off when waitingLocked
-// changed. Every change of what waits calls it.
+// changed, and ends a hand sound no hand is left for. Every change of what
+// waits calls it.
 func (s *Supervisor) showWaitingLocked() {
+	s.endOrphanHandSoundLocked()
 	waiting := s.waitingLocked()
 	if waiting == s.lit {
 		return
@@ -572,6 +584,17 @@ func (s *Supervisor) showWaitingLocked() {
 	default:
 		light.Off()
 	}
+}
+
+// endOrphanHandSoundLocked ends a hand sound under way once no hand it was
+// for is left: the live hands own it, so it does not begin, or plays no
+// further, after the last of them came down.
+func (s *Supervisor) endOrphanHandSoundLocked() {
+	if s.chimeCancel == nil || !s.chimeHands || slices.ContainsFunc(s.pending, func(p *pendingAnswer) bool { return p.hand != nil }) {
+		return
+	}
+	s.chimeCancel()
+	s.chimeCancel, s.chimeCtx = nil, nil
 }
 
 // dropEndedLocked drops the held answers of every session but the one
@@ -854,20 +877,31 @@ func (s *Supervisor) neverMindLocked(sessionID string) {
 // that grants a larger buffer.
 const chimeQueueLasts = 400 * time.Millisecond
 
-// cutAnswerSoundLocked stops the answer sound queued or still playing: once
-// its last answer is dropped, nothing of it plays. The hand sound, which is
-// for the hands still up, plays on.
+// cutAnswerSoundLocked stops the answer sound under way or still in the
+// speaker's queue: once its last answer is dropped, nothing of it plays. It
+// reads the answer sound's own state, so a hand sound chosen after it does
+// not hide it. The cut takes the whole chime input, a hand sound's frames
+// with it: a hand sound under way is ended too, and its hands sound again at
+// the next gap.
 func (s *Supervisor) cutAnswerSoundLocked() {
-	if s.chimeHands {
-		return // the sound playing, or the last one queued, is the hand sound
+	answerUnderWay := s.chimeCancel != nil && !s.chimeHands
+	if !answerUnderWay && time.Since(s.answerQueuedAt) >= chimeQueueLasts {
+		return
 	}
-	playing := s.chimeCancel != nil || time.Since(s.chimeQueuedAt) < chimeQueueLasts
-	if s.chimeCancel != nil {
+	if answerUnderWay {
 		s.chimeCancel() // even one whose playback has not begun
 		s.chimeCancel, s.chimeCtx = nil, nil
 	}
-	if playing {
-		s.cfg.Speaker.Cancel(audio.InputChime)
+	s.answerQueuedAt = time.Time{}
+	s.cfg.Speaker.Cancel(audio.InputChime)
+	if s.chimeCancel != nil && s.chimeHands {
+		s.chimeCancel()
+		s.chimeCancel, s.chimeCtx = nil, nil
+		for _, p := range s.pending {
+			if p.hand != nil {
+				p.chimed = false
+			}
+		}
 	}
 }
 
@@ -907,6 +941,7 @@ func (s *Supervisor) startLocked(t *Transcript, m transcript.Match) {
 	s.takeFloorLocked(ex)
 	s.lastTimes = ex.times
 	sessionID := s.cfg.Session()
+	s.bindMeetingLocked(ex, sessionID)
 	s.timing("wake_heard", sessionID, t.At)
 	ex.x = Exchange{
 		SessionID: sessionID,
@@ -921,6 +956,23 @@ func (s *Supervisor) startLocked(t *Transcript, m transcript.Match) {
 	s.turnLocked(ex, t, m.Rest)
 	x := ex.x
 	s.spawn(func() { s.open(ex, voice, &x, true) })
+}
+
+// bindMeetingLocked ends ex the moment the recorder ends the meeting of
+// sessionID (SupervisorConfig.Meeting), with no session-ended hook: an
+// exchange lives no longer than its meeting.
+func (s *Supervisor) bindMeetingLocked(ex *exchange, sessionID string) {
+	if s.cfg.Meeting == nil {
+		return
+	}
+	stop := context.AfterFunc(s.cfg.Meeting(sessionID), func() {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		if s.ex == ex && !ex.ended {
+			s.endLocked(ex, true, "its meeting ended")
+		}
+	})
+	context.AfterFunc(ex.ctx, func() { stop() })
 }
 
 // open opens ex's voice and, for a wake, plays the wake chime alongside.
@@ -1389,21 +1441,22 @@ func (s *Supervisor) speakLocked(p *pendingAnswer) {
 	s.takeFloorLocked(ex)
 	ex.x = Exchange{SessionID: p.SessionID, WakeAt: time.Now(), IssueKey: p.IssueKey, Recent: s.recentLocked(), Tap: s.tapFor(voice, 0), Out: exchangeOutput{s: s, ex: ex}}
 	ex.x.Tools = exchangeTools{s: s, ex: ex}
+	s.bindMeetingLocked(ex, p.SessionID)
 	x := ex.x
-	sayCtx, release := ex.ctx, func() {}
+	sayCtx, release := context.Context(ex.ctx), func() {}
 	if p.hand != nil && p.hand.Context != nil {
-		// A hand's words run under its membership's context, so the
-		// membership's end cancels them at once, wherever they have got to,
-		// and ends their exchange; the exchange's own end ends them too.
-		var cancelSay context.CancelFunc
-		sayCtx, cancelSay = context.WithCancel(p.hand.Context)
-		stopEx := context.AfterFunc(ex.ctx, cancelSay)
+		// A hand's words run under a context done once their exchange or the
+		// hand's membership is, the membership read at each check
+		// (joinContexts): its end stops them at once, wherever they have got
+		// to, and ends their exchange.
+		var stopJoin func()
+		sayCtx, stopJoin = joinContexts(ex.ctx, p.hand.Context)
 		stopHand := context.AfterFunc(p.hand.Context, func() {
 			s.mu.Lock()
 			defer s.mu.Unlock()
 			s.handEndedLocked(ex, p)
 		})
-		release = func() { stopEx(); stopHand(); cancelSay() }
+		release = func() { stopJoin(); stopHand() }
 		ex.sayCtx = sayCtx
 	}
 	s.spawn(func() {
@@ -1545,8 +1598,8 @@ func (s *Supervisor) offerAnswers() {
 // offer chimes each held answer and raised hand once while the light reads
 // red, and speaks by itself the oldest answer that needs no invitation, once
 // the room is silent. It takes down the hands that expired or were withdrawn.
-// While a "Wispr, never mind" waits for the Concierge, it does neither: the
-// answer it may drop must not sound or speak first.
+// While a "Wispr, never mind" waits for the Concierge, answers wait: the one
+// it may drop must not sound or speak first. Hands do not wait for it.
 func (s *Supervisor) offer() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -1557,14 +1610,15 @@ func (s *Supervisor) offer() {
 	now := time.Now()
 	s.dropExpiredLocked(now)
 	s.dropWithdrawnLocked()
-	if len(s.pending) == 0 || !s.cfg.Red() || s.neverMinds > 0 {
+	if len(s.pending) == 0 || !s.cfg.Red() {
 		return
 	}
+	holdAnswers := s.neverMinds > 0
 	if ex := s.ex; ex != nil && !s.idleLocked(ex) {
 		return
 	}
 	// The answer sound first, then the hand sound: each sounds for its own.
-	hands := !slices.ContainsFunc(s.pending, func(p *pendingAnswer) bool { return !p.chimed && p.hand == nil })
+	hands := holdAnswers || !slices.ContainsFunc(s.pending, func(p *pendingAnswer) bool { return !p.chimed && p.hand == nil })
 	unchimed := slices.ContainsFunc(s.pending, func(p *pendingAnswer) bool { return !p.chimed && (p.hand != nil) == hands })
 	if unchimed {
 		// The sound waits for a gap with no transcript word (R10). One sound
@@ -1599,11 +1653,17 @@ func (s *Supervisor) offer() {
 				if ctx == s.chimeCtx {
 					s.chimeCancel, s.chimeCtx = nil, nil
 					s.chimeQueuedAt = time.Now() // its last frames still play from the speaker's queue
+					if !hands {
+						s.answerQueuedAt = s.chimeQueuedAt
+					}
 				}
 			})
 			s.chimeCtx = ctx
 		}
 		return
+	}
+	if holdAnswers {
+		return // an answer speaks by itself only once no never mind waits
 	}
 	quietSince := s.lastHeard
 	for _, t := range []time.Time{s.voiceEnded, s.chimedAt} {
@@ -1655,7 +1715,7 @@ func (s *Supervisor) stopLocked(reason string) {
 		s.chimeCancel() // an answer chime, even one whose playback has not begun
 		s.chimeCancel, s.chimeCtx = nil, nil
 	}
-	s.chimeQueuedAt = time.Time{} // the chime input is cut below, or by endLocked
+	s.chimeQueuedAt, s.answerQueuedAt = time.Time{}, time.Time{} // the chime input is cut below, or by endLocked
 	if ex := s.ex; ex != nil {
 		s.endLocked(ex, true, reason)
 		return
@@ -1730,7 +1790,7 @@ func (s *Supervisor) takeFloorLocked(ex *exchange) {
 		s.chimeCancel()
 		s.chimeCancel, s.chimeCtx = nil, nil
 	}
-	s.chimeQueuedAt = time.Time{} // and is cut on the chime input below
+	s.chimeQueuedAt, s.answerQueuedAt = time.Time{}, time.Time{} // and is cut on the chime input below
 	s.cfg.Speaker.Cancel(audio.InputVoice)
 	s.cfg.Speaker.Cancel(audio.InputChime)
 }
@@ -1981,19 +2041,75 @@ func (endedPlayback) Write(context.Context, []byte, audio.AudioFormat) error {
 
 func (endedPlayback) Drain(context.Context) error { return nil }
 
-// sayPlayback is a playback of a hand's words: it refuses every frame once
-// the words' context (exchange.sayCtx), derived from the membership's, ended,
-// whatever context the voice writes it with.
+// sayPlayback is a playback of a hand's words: each Write and Drain runs
+// under both the voice's context and the words' (exchange.sayCtx), so the
+// membership's end, read at each check, stops a write even while it waits
+// for room in the speaker's queue, and commits nothing.
 type sayPlayback struct {
 	Playback
 	ctx context.Context
 }
 
 func (p sayPlayback) Write(ctx context.Context, frame []byte, format audio.AudioFormat) error {
-	if err := p.ctx.Err(); err != nil {
+	both, stop := joinContexts(ctx, p.ctx)
+	defer stop()
+	if err := both.Err(); err != nil {
 		return err
 	}
-	return p.Playback.Write(ctx, frame, format)
+	return p.Playback.Write(both, frame, format)
+}
+
+func (p sayPlayback) Drain(ctx context.Context) error {
+	both, stop := joinContexts(ctx, p.ctx)
+	defer stop()
+	if err := both.Err(); err != nil {
+		return err
+	}
+	return p.Playback.Drain(both)
+}
+
+// joinedContext is done when either of two contexts is. Its Err reads both
+// at once, so a context whose own Err reads live state (a joined agent's
+// membership, which ends the moment the recorder ends its meeting) stops a
+// check at that very moment; Done closes once either is done, or once Err
+// has seen it.
+type joinedContext struct {
+	context.Context // the first: its values, and its deadline with the other's
+	other           context.Context
+	done            chan struct{}
+	once            sync.Once
+}
+
+// joinContexts joins a and b; stop releases the join once it is no longer
+// used.
+func joinContexts(a, b context.Context) (joined context.Context, stop func()) {
+	c := &joinedContext{Context: a, other: b, done: make(chan struct{})}
+	stopA := context.AfterFunc(a, c.close)
+	stopB := context.AfterFunc(b, c.close)
+	return c, func() { stopA(); stopB() }
+}
+
+func (c *joinedContext) close() { c.once.Do(func() { close(c.done) }) }
+
+func (c *joinedContext) Done() <-chan struct{} { return c.done }
+
+func (c *joinedContext) Err() error {
+	err := c.other.Err()
+	if err == nil {
+		err = c.Context.Err()
+	}
+	if err != nil {
+		c.close()
+	}
+	return err
+}
+
+func (c *joinedContext) Deadline() (time.Time, bool) {
+	deadline, ok := c.Context.Deadline()
+	if other, otherOK := c.other.Deadline(); otherOK && (!ok || other.Before(deadline)) {
+		return other, true
+	}
+	return deadline, ok
 }
 
 // exchangeTools runs the Concierge's tools for ex, and the answer tool

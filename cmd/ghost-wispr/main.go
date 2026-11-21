@@ -2057,6 +2057,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 		}
 		roster := startJoinedAgents(ctx, &joinedDeps{
 			session:   func() string { id, _ := manager.ActiveSession(); return id },
+			meeting:   manager.MeetingContext,
 			store:     store,
 			floor:     &voiceHooks,
 			dispatch:  issues,
@@ -2091,6 +2092,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 			wakePhrases: cfg.Voice.WakePhrases,
 			timing:      voiceTiming(appLogger),
 			session:     func() string { id, _ := manager.ActiveSession(); return id },
+			meeting:     manager.MeetingContext,
 			red:         func() bool { return capture.capturing(micStatus) },
 			notify:      hub.BroadcastVoiceEvent,
 			projects:    dispatchProjects.Get,

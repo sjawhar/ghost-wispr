@@ -193,8 +193,9 @@ type voiceDeps struct {
 	enabled     func() bool                 // voice.enabled, live
 	wakePhrases []string
 	timing      func(event, sessionID string, at time.Time, kv ...any)
-	session     func() string // the recording session now
-	red         func() bool   // the light reads red and audio passes the gate
+	session     func() string                // the recording session now
+	meeting     func(string) context.Context // a session's meeting context, which the recorder ends with it
+	red         func() bool                  // the light reads red and audio passes the gate
 	notify      func(kind, sessionID string)
 	projects    func() []string    // Dispatch's project keys, for spoken keys
 	waiting     voice.WaitingLight // shows that something waits for a person; nil shows nothing
@@ -227,6 +228,7 @@ func startVoice(deps *voiceDeps) error {
 		Speaker:      voice.SpeakerOf(deps.output),
 		WakePhrases:  deps.wakePhrases,
 		Session:      deps.session,
+		Meeting:      deps.meeting,
 		Red:          deps.red,
 		Enabled:      deps.enabled,
 		Notify:       deps.notify,
