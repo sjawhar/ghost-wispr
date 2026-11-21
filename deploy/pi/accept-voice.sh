@@ -952,13 +952,15 @@ timing_events() {
 }
 
 # audible_us INPUT FROM_MS TO_MS: the time of the first "audible" line for the speaker's INPUT (chime
-# or voice) in the timing log from FROM to TO, in microseconds on now_ms's clock, or nothing. The
+# or voice) in audible_lines from FROM to TO, in microseconds on now_ms's clock, or nothing. The
 # service logs one as each speech on an input starts, at the time its first sample left ALSA's buffer
 # for the speaker device by ALSA's own account of the stream (internal/audio): the device plays it a
-# latency later, the same for every input.
+# latency later, the same for every input. audible_lines is the timing log's audible lines
+# (timing_events), read once, before the step stops its recording and reads the rest of the journal.
+audible_lines=
 audible_us() {
-  timing_events | jq -r -n --arg input "$1" --argjson from "$2" --argjson to "$3" \
-    '[inputs | select(.event == "audible" and .input == $input and .at >= $from and .at <= $to) | .at_us] | min // empty'
+  jq -r -n --arg input "$1" --argjson from "$2" --argjson to "$3" \
+    '[inputs | select(.event == "audible" and .input == $input and .at >= $from and .at <= $to) | .at_us] | min // empty' <<<"$audible_lines"
 }
 
 # timing_first EVENT FROM_MS TO_MS [FIELD]: the time of the first EVENT in the timing log in
@@ -2656,14 +2658,12 @@ readonly chime_attack_us=6000 audible_error_us=1000
 answer_from=
 answer_earliest() {
   local chime_at answer_at gap_us
-  chime_at=$(audible_us chime $(($1 - lead_ms)) $(($1 + wake_max_ms))) \
-    || unknown "voice timing log: cannot read the journal of $unit (process $unit_pid)$(journal_error)"
-  answer_at=$(audible_us voice "$2" $(($2 + 2000))) \
-    || unknown "voice timing log: cannot read the journal of $unit (process $unit_pid)$(journal_error)"
+  chime_at=$(audible_us chime $(($1 - lead_ms)) $(($1 + wake_max_ms)))
+  answer_at=$(audible_us voice "$2" $(($2 + 2000)))
   whole_number "$chime_at" && whole_number "$answer_at" || return 1
   gap_us=$((answer_at - chime_at - 2 * audible_error_us))
   ((gap_us >= 0)) || return 1
-  answer_from=$((sound_at[$3] - chime_attack_us * sample_rate / 1000000 + gap_us * sample_rate / 1000000 * 4999 / 5000 - 1))
+  answer_from=$((sound_at[$3] - chime_attack_us * sample_rate / 1000000 + gap_us * sample_rate * 4999 / (1000000 * 5000) - 1))
 }
 step_playback_cancel() {
   local i q wake first spoken_count speech_at wait_ms stop_ats=() question_starts=() question_wakes=()
@@ -2727,6 +2727,9 @@ step_playback_cancel() {
   done
   played=$(running_ms)
   stop_poller
+  # The audible lines, before the recording stops and the step reads the rest of the journal.
+  audible_lines=$(timing_events | jq -c 'select(.event == "audible")') \
+    || unknown "voice timing log: cannot read the journal of $unit (process $unit_pid)$(journal_error)"
   analyse_rig
   # The calibration is the first sound that starts while play-sound played. It must be alone: it ends,
   # and no other sound starts, before the step's first question. The calibration decides only whether
