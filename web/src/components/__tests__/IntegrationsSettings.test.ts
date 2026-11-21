@@ -1,25 +1,25 @@
-import { fireEvent, render, screen, within } from '@testing-library/svelte'
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/svelte'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import IntegrationsSettings from '../IntegrationsSettings.svelte'
-import type { ConfigResponse } from '../../lib/config-api'
-
-const config: ConfigResponse = {
-  silence_timeout: '30s',
-  summarization: { model: 'openai/gpt-4o-mini', base_url: '', presets: {} },
-  transcription: { endpointing: '400', utterance_end_ms: '1000' },
-  gdrive: { folder_id: '', has_credentials: false, sync_enabled: true },
-  gc: { enabled: true, max_age_days: 30, max_audio_size_mb: 1024 },
-  api_keys: {},
-  recording_rules: [],
-  voice: { enabled: false, engine: 'tts', tts_engine: 'gemini' },
-}
+import { sent, stubFetch, unitConfig as config } from './configFixture'
 
 describe('IntegrationsSettings', () => {
   afterEach(() => {
     vi.unstubAllGlobals()
   })
 
+  it('shows the model providers, not per-vendor key slots', async () => {
+    stubFetch()
+    render(IntegrationsSettings, { config })
+
+    expect(screen.getByRole('heading', { name: 'Model providers' })).toBeTruthy()
+    expect(screen.queryByRole('heading', { name: 'API Keys' })).toBeNull()
+    const vertex = await screen.findByRole('listitem', { name: 'vertex' })
+    expect(await within(vertex).findByText('Signed in')).toBeTruthy()
+  })
+
   it('says 0 means no limit for each GC limit, and allows it', () => {
+    stubFetch()
     render(IntegrationsSettings, { config })
 
     const maxAge = screen.getByLabelText('Delete sessions older than (days)')
@@ -31,8 +31,7 @@ describe('IntegrationsSettings', () => {
   })
 
   it('saves 0 as the limit', async () => {
-    const fetch = vi.fn().mockResolvedValue(new Response(JSON.stringify(config)))
-    vi.stubGlobal('fetch', fetch)
+    const fetch = stubFetch()
     const { container } = render(IntegrationsSettings, { config })
 
     await fireEvent.input(screen.getByLabelText('Delete sessions older than (days)'), {
@@ -42,7 +41,14 @@ describe('IntegrationsSettings', () => {
     const gcSection = container.querySelector('.gc-section') as HTMLElement
     await fireEvent.click(within(gcSection).getByRole('button', { name: 'Save' }))
 
-    const patches = fetch.mock.calls.map(([, init]) => JSON.parse(init.body as string))
-    expect(patches).toContainEqual({ gc: { enabled: true, max_age_days: 0, max_audio_size_mb: 0 } })
+    await waitFor(() =>
+      expect(sent(fetch).filter((r) => r.method === 'PATCH')).toEqual([
+        {
+          url: '/api/config',
+          method: 'PATCH',
+          body: { gc: { enabled: true, max_age_days: 0, max_audio_size_mb: 0 } },
+        },
+      ]),
+    )
   })
 })

@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"sort"
 	"strings"
 	"time"
 	"unicode"
@@ -19,6 +18,7 @@ import (
 	"github.com/sjawhar/ghost-wispr/internal/logging"
 	"github.com/sjawhar/ghost-wispr/internal/providererr"
 	"github.com/sjawhar/ghost-wispr/internal/retry"
+	"github.com/sjawhar/ghost-wispr/internal/transcribe"
 )
 
 type ClientFactory func(provider, model string) (llm.Client, error)
@@ -33,6 +33,7 @@ type Summarizer struct {
 	chunkTokenThreshold int
 	chunkSizeTokens     int
 	chunkOverlapTokens  int
+	callTimeout         time.Duration // bounds each model call (callTimeout)
 }
 
 const (
@@ -40,11 +41,30 @@ const (
 	tokenPerCharEstimate   = 4
 )
 
+// callTimeout bounds each model call a summary makes (the preset's choice,
+// a chunk's summary, the summary); the caller's context still ends a call
+// sooner. The OpenAI and Anthropic clients cap an answer at 8192 tokens,
+// which a model writing 46 tokens a second ends in three minutes, and the
+// summaries the unit makes take seconds; a call still out after three
+// minutes has stopped answering or is running away, as claude-haiku-4-5
+// through the model gateway did for 6 min 42 s on 2026-11-20 while the
+// backlog behind it waited. The attempt fails, and is asked again as any
+// transient failure is.
+const callTimeout = 3 * time.Minute
+
 // errNoSummaryText is a model's answer whose summary holds no letter or
 // digit: an empty summary, or "..." as Gemini once answered on the office Pi.
 // It is not a summary, so the summarizer asks again, and fails with it when
 // every attempt answers so.
 var errNoSummaryText = errors.New("the model answered with no summary text")
+
+// errBrokenJSONAnswer is a model's answer that begins as a JSON object but
+// does not parse: one cut off at its length limit, as the runaway answer of
+// 2026-11-20 was, or broken. It is no summary (the raw JSON would be stored
+// as one), so the summarizer asks again, and fails with it when every
+// attempt answers so. Its text names no limit or size: the retry and the
+// overflow check read an error's words.
+var errBrokenJSONAnswer = errors.New("the model's answer begins as a JSON object but does not parse")
 
 func New(cfg config.Summarization, factory ClientFactory) *Summarizer {
 	var router *Router
@@ -60,6 +80,7 @@ func New(cfg config.Summarization, factory ClientFactory) *Summarizer {
 		chunkTokenThreshold: 100_000,
 		chunkSizeTokens:     10_000,
 		chunkOverlapTokens:  500,
+		callTimeout:         callTimeout,
 	}
 }
 
@@ -124,8 +145,9 @@ func (s *Summarizer) SummarizeWithPresetResult(ctx context.Context, _ string, tr
 	if minWords <= 0 {
 		minWords = defaultMinSummaryWords
 	}
-	if len(strings.Fields(transcript)) < minWords {
-		return SummaryResult{Title: guaranteedTitle(transcript), SpeakerNames: "{}"}, nil
+	// The transcript's speaker labels are not words of the conversation.
+	if spoken := transcribe.WithoutSpeakerLabels(transcript); len(strings.Fields(spoken)) < minWords {
+		return SummaryResult{Title: guaranteedTitle(spoken), SpeakerNames: "{}"}, nil
 	}
 
 	preset, ok := s.cfg.Presets[presetName]
@@ -138,7 +160,7 @@ func (s *Summarizer) SummarizeWithPresetResult(ctx context.Context, _ string, tr
 		modelStr = s.cfg.Model
 	}
 
-	provider, modelName, err := llm.ParseModel(modelStr)
+	provider, modelName, err := config.ParseModelRef(modelStr)
 	if err != nil {
 		return SummaryResult{}, err
 	}
@@ -192,7 +214,16 @@ type parsedSummary struct {
 	Speakers map[string]speakerNameMetadata `json:"speakers,omitempty"`
 }
 
+// speakerNameMetadata is a speaker's name, as the session stores it under
+// the speaker's id.
 type speakerNameMetadata struct {
+	Name       string `json:"name"`
+	Confidence string `json:"confidence"`
+}
+
+// speakerEntry is one speaker of the schema's speakers list.
+type speakerEntry struct {
+	ID         string `json:"id"`
 	Name       string `json:"name"`
 	Confidence string `json:"confidence"`
 }
@@ -234,18 +265,24 @@ func parseStructuredSummary(raw json.RawMessage) (parsedSummary, error) {
 }
 
 // summaryAnswer reads a model's structured answer (raw) as a title, a summary
-// and speaker names. An answer that is not a JSON object is the summary as
-// written. In a JSON object, the title and the summary are its "title" and
-// "summary" strings, also when another field (such as "speakers") does not
-// have the schema's type; a field that is not a string reads as empty, so an
-// answer such as {"title":"...","summary":["..."]} has no summary text, and
-// the raw JSON, whose keys hold letters, is never taken for one. A title that
-// holds no word (meaningfulText), such as "...", is made from the transcript
-// instead (guaranteedTitle).
-func summaryAnswer(raw json.RawMessage, transcript string) parsedSummary {
+// and speaker names. An answer that is not JSON at all is the summary as
+// written; one that begins as a JSON object but does not parse, such as an
+// answer cut off at its length limit, is errBrokenJSONAnswer. In a JSON
+// object, the title and the summary are its "title" and "summary" strings,
+// also when another field (such as "speakers") does not have the schema's
+// type; a field that is not a string reads as empty, so an answer such as
+// {"title":"...","summary":["..."]} has no summary text, and the raw JSON,
+// whose keys hold letters, is never taken for one. A title that holds no
+// word (meaningfulText), such as "...", is made from the transcript instead
+// (guaranteedTitle).
+func summaryAnswer(raw json.RawMessage, transcript string) (parsedSummary, error) {
 	var fields map[string]json.RawMessage
 	if err := json.Unmarshal(raw, &fields); err != nil {
-		return parsedSummary{Title: guaranteedTitle(transcript), Summary: strings.TrimSpace(string(raw))}
+		text := strings.TrimSpace(string(raw))
+		if strings.HasPrefix(text, "{") {
+			return parsedSummary{}, errBrokenJSONAnswer
+		}
+		return parsedSummary{Title: guaranteedTitle(transcript), Summary: text}, nil
 	}
 	parsed, err := parseStructuredSummary(raw)
 	if err != nil {
@@ -256,7 +293,7 @@ func summaryAnswer(raw json.RawMessage, transcript string) parsedSummary {
 	if !meaningfulText(parsed.Title) {
 		parsed.Title = guaranteedTitle(transcript)
 	}
-	return parsed
+	return parsed, nil
 }
 
 // jsonString returns the JSON string raw holds, or "" when it holds another
@@ -274,14 +311,16 @@ func meaningfulText(text string) bool {
 	return strings.IndexFunc(text, func(r rune) bool { return unicode.IsLetter(r) || unicode.IsDigit(r) }) >= 0
 }
 
+// parseSpeakersField reads an answer's speakers, in any shape a model gave
+// them: the schema's list of {id, name, confidence} (decodeSpeakers), the map
+// keyed by speaker id the schema asked for before (which a batch job asked
+// before the change still answers in), or either as a JSON string.
 func parseSpeakersField(raw json.RawMessage) (map[string]speakerNameMetadata, error) {
 	trimmed := strings.TrimSpace(string(raw))
 	if trimmed == "" || trimmed == "null" {
 		return nil, nil
 	}
-
-	var speakers map[string]speakerNameMetadata
-	if err := json.Unmarshal(raw, &speakers); err == nil {
+	if speakers, err := decodeSpeakers(raw); err == nil {
 		return speakers, nil
 	}
 
@@ -293,8 +332,27 @@ func parseSpeakersField(raw json.RawMessage) (map[string]speakerNameMetadata, er
 	if encoded == "" || encoded == "null" {
 		return nil, nil
 	}
+	return decodeSpeakers([]byte(encoded))
+}
 
-	if err := json.Unmarshal([]byte(encoded), &speakers); err != nil {
+// decodeSpeakers reads speakers as the schema's list or as the map keyed by
+// speaker id, into that map, which the session stores and the API and the
+// page read. A list entry with no id or no name names no one.
+func decodeSpeakers(data []byte) (map[string]speakerNameMetadata, error) {
+	var list []speakerEntry
+	if err := json.Unmarshal(data, &list); err == nil {
+		speakers := make(map[string]speakerNameMetadata, len(list))
+		for _, entry := range list {
+			id := strings.TrimSpace(entry.ID)
+			if id == "" || strings.TrimSpace(entry.Name) == "" {
+				continue
+			}
+			speakers[id] = speakerNameMetadata{Name: entry.Name, Confidence: entry.Confidence}
+		}
+		return speakers, nil
+	}
+	var speakers map[string]speakerNameMetadata
+	if err := json.Unmarshal(data, &speakers); err != nil {
 		return nil, err
 	}
 	return speakers, nil
@@ -349,16 +407,16 @@ func (s *Summarizer) BuildPromptMessages(preset config.Preset, transcript string
 		"Output requirements:",
 		`- title: 4-10 words describing the topic, specific and non-empty`,
 		`- summary: markdown — for short content just a sentence or two; for substantial content start with a one-line bottom line, then use sections (## Decisions, ## Key Outcomes, ## Risks/Notes)`,
-		`- speakers: object keyed by speaker ID (e.g. "0", "1"), each with {"name":"<name>","confidence":"mentioned|inferred"}. Use 'mentioned' if the name was said, 'inferred' if guessed from context.`,
+		`- speakers: a list with one entry for each speaker whose name you know, each {"id":"<the number of the speaker's label in the transcript: 0 for Speaker 0>","name":"<name>","confidence":"mentioned|inferred"}; [] when you know no name. Use 'mentioned' if the name was said, 'inferred' if guessed from context.`,
 		"Respond as JSON only.",
 		"",
 		"Examples:",
 		"",
 		`Brief exchange:`,
-		`{"title":"Deploy moved to Friday","summary":"Quick decision to push the deploy from Thursday to Friday to give QA more time.","speakers":{}}`,
+		`{"title":"Deploy moved to Friday","summary":"Quick decision to push the deploy from Thursday to Friday to give QA more time.","speakers":[]}`,
 		"",
 		`Working session:`,
-		`{"title":"Q2 roadmap alignment","summary":"Team aligned on Q2 roadmap and sequencing.\n\n## Decisions\n- Ship feature flags before rollout.\n\n## Key Outcomes\n- Roadmap finalized and communicated.\n\n## Risks/Notes\n- API dependency may delay launch by one sprint.","speakers":{"0":{"name":"Ben","confidence":"mentioned"}}}`,
+		`{"title":"Q2 roadmap alignment","summary":"Team aligned on Q2 roadmap and sequencing.\n\n## Decisions\n- Ship feature flags before rollout.\n\n## Key Outcomes\n- Roadmap finalized and communicated.\n\n## Risks/Notes\n- API dependency may delay launch by one sprint.","speakers":[{"id":"0","name":"Ben","confidence":"mentioned"}]}`,
 
 		"",
 		"Transcript:",
@@ -371,9 +429,15 @@ func (s *Summarizer) BuildPromptMessages(preset config.Preset, transcript string
 	}
 }
 
+// StructuredSchema is the schema a summary is asked in. Strict structured
+// output takes it (jsonschema.Strict): every object lists each of its
+// properties as required and allows no other. So speakers is a list of
+// {id, name, confidence}, not a map keyed by speaker id, which strict mode
+// refuses and which Anthropic models through a model gateway answered as {}
+// every time; summaryAnswer reads the list into that map, which the session
+// stores. internal/providers' check asks a summarization model in a copy of
+// it (summaryShapedSchema).
 func StructuredSchema() map[string]any {
-	required := []string{"summary", "title"}
-	sort.Strings(required)
 	return map[string]any{
 		"type": "object",
 		"properties": map[string]any{
@@ -386,34 +450,55 @@ func StructuredSchema() map[string]any {
 				"description": "Markdown summary. Brief for short content. For substantial content: one-line bottom line first, then ## Decisions, ## Key Outcomes, ## Risks/Notes sections.",
 			},
 			"speakers": map[string]any{
-				"type": "object",
-				"additionalProperties": map[string]any{
+				"type":        "array",
+				"description": "One entry for each speaker whose name is known; empty when none is.",
+				"items": map[string]any{
 					"type": "object",
 					"properties": map[string]any{
+						"id":   map[string]any{"type": "string", "description": `The speaker's ID in the transcript, such as "0".`},
 						"name": map[string]any{"type": "string"},
 						"confidence": map[string]any{
 							"type": "string",
 							"enum": []string{"mentioned", "inferred"},
 						},
 					},
+					"required":             []string{"confidence", "id", "name"},
+					"additionalProperties": false,
 				},
 			},
 		},
-		"required":             required,
+		"required":             []string{"speakers", "summary", "title"},
 		"additionalProperties": false,
 	}
 }
 
+// withCallTimeout makes one model call (do) with a deadline of its own,
+// timeout, inside ctx, and says so when that deadline cut it off.
+func withCallTimeout(ctx context.Context, timeout time.Duration, do func(context.Context) error) error {
+	callCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	err := do(callCtx)
+	if err != nil && ctx.Err() == nil && errors.Is(callCtx.Err(), context.DeadlineExceeded) {
+		return fmt.Errorf("the model did not answer within %s: %w", timeout, err)
+	}
+	return err
+}
+
 // completeSummaryWithRetry asks client for the structured summary messages
-// ask for, retrying a transient failure, and reads the answer (summaryAnswer;
-// transcript gives the title an answer lacks). An answer whose summary holds
-// no word (errNoSummaryText) is asked again in the same way, and when every
-// attempt answers so the summary fails with that reason rather than storing
-// it.
+// ask for, each call within the call timeout, retrying a transient failure,
+// and reads the answer (summaryAnswer; transcript gives the title an answer
+// lacks). An answer whose summary holds no word (errNoSummaryText), or that
+// begins as a JSON object but does not parse (errBrokenJSONAnswer), is asked
+// again in the same way, and when every attempt answers so the summary fails
+// with that reason rather than storing it.
 func (s *Summarizer) completeSummaryWithRetry(ctx context.Context, client llm.Client, messages []llm.Message, transcript string, logger *slog.Logger) (parsedSummary, error) {
 	var result parsedSummary
 	err := retry.Do(ctx, func() error {
-		raw, callErr := client.CompleteJSON(ctx, messages, StructuredSchema())
+		var raw json.RawMessage
+		callErr := withCallTimeout(ctx, s.callTimeout, func(ctx context.Context) (err error) {
+			raw, err = client.CompleteJSON(ctx, messages, StructuredSchema())
+			return err
+		})
 		if callErr != nil {
 			if isContextOverflow(callErr) {
 				logger.Warn("structured summarize context overflow", "error", callErr)
@@ -421,7 +506,14 @@ func (s *Summarizer) completeSummaryWithRetry(ctx context.Context, client llm.Cl
 			}
 			return callErr
 		}
-		result = summaryAnswer(raw, transcript)
+		parsed, err := summaryAnswer(raw, transcript)
+		if err != nil {
+			// The answer can quote the conversation: the log keeps its
+			// length, never its text.
+			logger.Warn("the model's answer begins as a JSON object but does not parse; asking again", "answer_bytes", len(raw))
+			return err
+		}
+		result = parsed
 		if !meaningfulText(result.Summary) {
 			// Safe to log and keep in the error: a summary that holds no
 			// letter or digit (meaningfulText), such as "...", holds none
@@ -490,15 +582,18 @@ func (s *Summarizer) summarizeChunked(ctx context.Context, client llm.Client, pr
 }
 
 // completeTextWithRetry asks client for the summary of one chunk of a long
-// transcript, retrying a transient failure. An answer that holds no word
-// (errNoSummaryText) would drop that part of the conversation from the merged
-// summary without an error, so it is asked again in the same way, and when
-// every attempt answers so the summary fails with that reason.
+// transcript, each call within the call timeout, retrying a transient
+// failure. An answer that holds no word (errNoSummaryText) would drop that
+// part of the conversation from the merged summary without an error, so it
+// is asked again in the same way, and when every attempt answers so the
+// summary fails with that reason.
 func (s *Summarizer) completeTextWithRetry(ctx context.Context, client llm.Client, messages []llm.Message, logger *slog.Logger) (string, error) {
 	var result string
 	err := retry.Do(ctx, func() error {
-		var callErr error
-		result, callErr = client.Complete(ctx, messages)
+		callErr := withCallTimeout(ctx, s.callTimeout, func(ctx context.Context) (err error) {
+			result, err = client.Complete(ctx, messages)
+			return err
+		})
 		if callErr != nil {
 			return callErr
 		}

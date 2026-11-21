@@ -93,9 +93,10 @@ func substantiveTitle(transcript string) string {
 	return ""
 }
 
-// Falls back to any non-empty sentence, then "Meeting Summary".
+// Falls back to any non-empty sentence, then "Meeting Summary". A transcript
+// whose lines begin with speaker labels is titled by its words alone.
 func guaranteedTitle(transcript string) string {
-	sentences := splitSentences(transcript)
+	sentences := splitSentences(transcribe.WithoutSpeakerLabels(transcript))
 	for _, sentence := range sentences {
 		clean := strings.TrimSpace(sentence)
 		if clean == "" {

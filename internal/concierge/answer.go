@@ -873,7 +873,9 @@ func (c *Concierge) generate(ctx context.Context, tools *runner, prompt string, 
 		var calls []*genai.FunctionCall
 		for response, err := range c.generator.GenerateContentStream(ctx, c.model, contents, roundConfig) {
 			if err != nil {
-				return fmt.Errorf("concierge: the model: %w", providererr.From("gemini", err))
+				// NewGenerator's clients name their provider already
+				// (providererr); another client's error is withheld.
+				return fmt.Errorf("concierge: the model: %w", providererr.From("model", err))
 			}
 			if ctx.Err() != nil {
 				return ctx.Err()
@@ -1054,7 +1056,7 @@ func (c *Concierge) rewrite(ctx context.Context, written, issueKey string) EarRe
 		tries = try
 		text, err := c.rewriteForEar(ctx, written, issueKey, reason)
 		if err != nil {
-			c.logger.Warn("concierge could not rewrite an answer for the ear", "try", try, "error", providererr.From("gemini", err))
+			c.logger.Warn("concierge could not rewrite an answer for the ear", "try", try, "error", err)
 			reason = "the rewrite was empty or failed"
 			continue
 		}
@@ -1088,7 +1090,7 @@ func (c *Concierge) rewriteForEar(ctx context.Context, written, issueKey, reason
 	var b strings.Builder
 	for response, err := range c.generator.GenerateContentStream(ctx, c.model, []*genai.Content{genai.NewContentFromText(prompt, genai.RoleUser)}, c.generateConfig(earPrompt, nil)) {
 		if err != nil {
-			return "", err
+			return "", providererr.From("model", err)
 		}
 		for _, part := range responseParts(response) {
 			if !part.Thought && part.FunctionCall == nil {

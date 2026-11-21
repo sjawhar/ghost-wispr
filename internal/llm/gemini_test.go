@@ -7,6 +7,8 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/sjawhar/ghost-wispr/internal/config"
 )
 
 func TestConvertGeminiMessages(t *testing.T) {
@@ -58,7 +60,7 @@ func TestGemini_Complete_EmptyResult(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client, err := newGeminiClient("test-key", "gemini-test", &clientOptions{baseURL: server.URL})
+	client, err := newGeminiClient(keyProvider(t, config.APIGemini, server.URL), "gemini-test")
 	if err != nil {
 		t.Fatalf("newGeminiClient failed: %v", err)
 	}
@@ -93,7 +95,7 @@ func TestGeminiCompleteReportsProviderModelVersion(t *testing.T) {
 	}))
 	t.Cleanup(server.Close)
 
-	client, err := newGeminiClient("test-key", configuredModel, &clientOptions{baseURL: server.URL})
+	client, err := newGeminiClient(keyProvider(t, config.APIGemini, server.URL), configuredModel)
 	if err != nil {
 		t.Fatalf("newGeminiClient: %v", err)
 	}
@@ -120,7 +122,7 @@ func TestGeminiCompleteJSONMarksMissingModelVersion(t *testing.T) {
 		})
 	}))
 	t.Cleanup(server.Close)
-	client, err := newGeminiClient("test-key", "configured-summary-model", &clientOptions{baseURL: server.URL})
+	client, err := newGeminiClient(keyProvider(t, config.APIGemini, server.URL), "configured-summary-model")
 	if err != nil {
 		t.Fatalf("newGeminiClient: %v", err)
 	}

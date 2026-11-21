@@ -122,6 +122,37 @@ func TestSummarizeSinglePreset(t *testing.T) {
 	}
 }
 
+// TestAGatewayModelKeepsItsSlash fails if the summarizer splits a role's
+// provider/model anywhere but at the first slash: a model gateway names
+// models such as openai/gpt-test, and the factory must be asked for that
+// model on the provider gateway. A preset's model is split the same way.
+func TestAGatewayModelKeepsItsSlash(t *testing.T) {
+	for _, tc := range []struct{ name, model, presetModel string }{
+		{name: "summarization.model", model: "gateway/openai/gpt-test"},
+		{name: "preset model", model: "vertex/gemini-x", presetModel: "gateway/openai/gpt-test"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			client := &mockLLMClient{response: `{"title":"Auto title","summary":"## Summary"}`}
+			var asked []string
+			s := New(config.Summarization{
+				Model:   tc.model,
+				Presets: map[string]config.Preset{"default": {Model: tc.presetModel, SystemPrompt: "system", UserTemplate: "{{transcript}}"}},
+			}, func(provider, model string) (llm.Client, error) {
+				asked = append(asked, provider+" | "+model)
+				return client, nil
+			})
+			s.sleep = func(time.Duration) {}
+
+			if _, _, _, _, err := s.Summarize(context.Background(), "session-1", buildTranscript(25)); err != nil {
+				t.Fatalf("Summarize: %v", err)
+			}
+			if len(asked) != 1 || asked[0] != "gateway | openai/gpt-test" {
+				t.Fatalf("the factory was asked for %q, want provider gateway and model openai/gpt-test", asked)
+			}
+		})
+	}
+}
+
 func TestSummarizeSkipsShortTranscript(t *testing.T) {
 	client := &mockLLMClient{response: `{"title":"unused","summary":"should-not-be-used"}`}
 

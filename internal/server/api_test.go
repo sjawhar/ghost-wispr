@@ -82,6 +82,8 @@ func newTestConfigStore(t *testing.T) *config.Store {
 		"DB_PATH", "AUDIO_DIR", "SILENCE_TIMEOUT",
 		"MIC_SAMPLE_RATE", "MIC_SAMPLE_RATES",
 		"SUMMARIZATION_MODEL", "GDRIVE_FOLDER_ID", "GOOGLE_CREDENTIALS_FILE",
+		"TRANSCRIPTION_MODEL", "BATCH_TRANSCRIPTION_MODEL", "EMBEDDING_MODEL", "CONCIERGE_MODEL",
+		"TTS_MODEL", "TTS_VOICE", "TTS_MAX_LENGTH", "VOICE_ENABLED", "VOICE_ENGINE",
 		"DEEPGRAM_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "GEMINI_API_KEY", "CONFIG",
 	} {
 		t.Setenv(config.EnvPrefix+key, "")
@@ -4496,6 +4498,11 @@ func TestRepairSummariesEndpointUnavailableWithoutHook(t *testing.T) {
 	}
 }
 
+// TestTTSSpeakReportsProviderModelAndVoiceInHeaders fails if POST
+// /api/tts/speak does not pass the text and voice it was given to the tts
+// role, refuses a body that still names a provider (the tts role names it
+// now; decoding ignores the field), or does not report the model and voice
+// that spoke in its headers.
 func TestTTSSpeakReportsProviderModelAndVoiceInHeaders(t *testing.T) {
 	const (
 		configuredModel = "configured-tts-model"
@@ -4503,8 +4510,8 @@ func TestTTSSpeakReportsProviderModelAndVoiceInHeaders(t *testing.T) {
 		providerVoice   = "provider-tts-voice"
 	)
 	h, err := Handler(testStaticFS(t), NewHub(), &apiStoreStub{}, &ControlHooks{
-		TTSSpeak: func(text, voice, provider string) (string, error) {
-			if text == "" || voice != providerVoice || provider != "gemini" {
+		TTSSpeak: func(text, voice string) (string, error) {
+			if text == "" || voice != providerVoice {
 				return "", errors.New("unexpected speech request")
 			}
 			return "speech-request", nil
@@ -4580,7 +4587,7 @@ func TestSessionDetailReportsProviderModels(t *testing.T) {
 
 func TestTTSSpeakReturnsBadGatewayAfterSynthesisFailure(t *testing.T) {
 	h, err := Handler(testStaticFS(t), NewHub(), &apiStoreStub{}, &ControlHooks{
-		TTSSpeak: func(string, string, string) (string, error) { return "failed-request", nil },
+		TTSSpeak: func(string, string) (string, error) { return "failed-request", nil },
 		TTSWaitForSynthesis: func(context.Context, string) (map[string]any, error) {
 			return map[string]any{"status": tts.StatusFailed, "error": "provider refused synthesis"}, nil
 		},
@@ -4597,6 +4604,40 @@ func TestTTSSpeakReturnsBadGatewayAfterSynthesisFailure(t *testing.T) {
 	}
 	if !strings.Contains(rr.Body.String(), "provider refused synthesis") {
 		t.Fatalf("failure response %q omits synthesis error", rr.Body.String())
+	}
+}
+
+// TestTTSSpeakNamesTheStepThatFailed fails if POST /api/tts/speak calls
+// speech that was synthesized and then failed to play a synthesis failure, or
+// answers it 502 (the provider failed) rather than 503 (the speaker did, as
+// when there is none); or if it names a synthesis failure twice.
+func TestTTSSpeakNamesTheStepThatFailed(t *testing.T) {
+	for _, tc := range []struct {
+		status  string
+		code    int
+		message string
+	}{
+		{"playback failed: open speaker stream: example", http.StatusServiceUnavailable, "TTS playback failed: open speaker stream: example"},
+		{"synthesis failed: deepgram answered HTTP 400", http.StatusBadGateway, "TTS synthesis failed: deepgram answered HTTP 400"},
+	} {
+		h, err := Handler(testStaticFS(t), NewHub(), &apiStoreStub{}, &ControlHooks{
+			TTSSpeak: func(string, string) (string, error) { return "failed-request", nil },
+			TTSWaitForSynthesis: func(context.Context, string) (map[string]any, error) {
+				return map[string]any{"status": tts.StatusFailed, "model": "tts-example", "voice": "Kore", "error": tc.status}, nil
+			},
+		}, "", nil)
+		if err != nil {
+			t.Fatalf("Handler: %v", err)
+		}
+		req := httptest.NewRequest(http.MethodPost, "/api/tts/speak", strings.NewReader(`{"text":"test"}`))
+		req.Header.Set("Content-Type", "application/json")
+		rr := httptest.NewRecorder()
+		h.ServeHTTP(rr, req)
+		var body struct{ Error string }
+		_ = json.Unmarshal(rr.Body.Bytes(), &body)
+		if rr.Code != tc.code || body.Error != tc.message {
+			t.Errorf("a request whose status says %q: POST /api/tts/speak = %d %q, want %d %q", tc.status, rr.Code, body.Error, tc.code, tc.message)
+		}
 	}
 }
 

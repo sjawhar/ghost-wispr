@@ -12,15 +12,13 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
-	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
-
-	"cloud.google.com/go/auth"
 
 	api "github.com/deepgram/deepgram-go-sdk/v3/pkg/api/listen/v1/websocket/interfaces"
 	interfaces "github.com/deepgram/deepgram-go-sdk/v3/pkg/client/interfaces"
@@ -30,10 +28,8 @@ import (
 	"github.com/sjawhar/ghost-wispr/internal/concierge"
 	"github.com/sjawhar/ghost-wispr/internal/config"
 	"github.com/sjawhar/ghost-wispr/internal/dispatch"
-	"github.com/sjawhar/ghost-wispr/internal/embedding"
 	"github.com/sjawhar/ghost-wispr/internal/gc"
 	"github.com/sjawhar/ghost-wispr/internal/gdrive"
-	"github.com/sjawhar/ghost-wispr/internal/genaiconfig"
 	"github.com/sjawhar/ghost-wispr/internal/googleauth"
 	"github.com/sjawhar/ghost-wispr/internal/indicator"
 	"github.com/sjawhar/ghost-wispr/internal/llm"
@@ -46,9 +42,8 @@ import (
 	"github.com/sjawhar/ghost-wispr/internal/transcribe"
 	"github.com/sjawhar/ghost-wispr/internal/tts"
 	"github.com/sjawhar/ghost-wispr/internal/voice"
+	voicetts "github.com/sjawhar/ghost-wispr/internal/voice/tts"
 	"github.com/sjawhar/ghost-wispr/internal/wake/local"
-
-	"google.golang.org/genai"
 )
 
 var (
@@ -62,8 +57,6 @@ const defaultListenAddress = "127.0.0.1:8080"
 // captureStateWarningKey keys the /api/status warning that capture's saved
 // pause switch is not what a restart would restore.
 const captureStateWarningKey = "capture-state"
-
-var vertexCredentialCache sync.Map
 
 //go:embed static/*
 var staticFiles embed.FS
@@ -140,60 +133,6 @@ func buildCanonicalTranscript(store *storage.SQLiteStore, sessionID string, segm
 	}
 
 	return streamingTranscript
-}
-
-func genAIOptions(cfg *config.Config, apiKey string) *genaiconfig.Options {
-	return &genaiconfig.Options{
-		Backend:  cfg.GenAIBackend,
-		Project:  cfg.GCPProject,
-		Location: cfg.GCPLocation,
-		APIKey:   apiKey,
-	}
-}
-
-func addVertexCredentials(ctx context.Context, cfg *config.Config, options *genaiconfig.Options) error {
-	if genaiconfig.ResolveBackend(options.Backend, options.Project) != genaiconfig.BackendVertex {
-		return nil
-	}
-	credentialPath := cfg.GoogleCredentialsFile
-	if cached, ok := vertexCredentialCache.Load(credentialPath); ok {
-		options.Credentials = cached.(*auth.Credentials)
-		return nil
-	}
-	credentials, err := googleauth.Detect(ctx, credentialPath, googleauth.CloudPlatformScope)
-	if err != nil {
-		return fmt.Errorf("detect Google credentials: %w", err)
-	}
-	cached, _ := vertexCredentialCache.LoadOrStore(credentialPath, credentials)
-	options.Credentials = cached.(*auth.Credentials)
-	return nil
-}
-
-// batchClientConfig is the genai client configuration the summary batch
-// operations use: cfg's Gemini settings, with Vertex AI credentials.
-func batchClientConfig(ctx context.Context, cfg *config.Config) (*genai.ClientConfig, error) {
-	options := genAIOptions(cfg, cfg.GeminiAPIKey)
-	if err := addVertexCredentials(ctx, cfg, options); err != nil {
-		return nil, err
-	}
-	clientConfig, err := genaiconfig.BuildClientConfig(options)
-	if err != nil {
-		return nil, fmt.Errorf("genai backend not configured for batch operations: %w", err)
-	}
-	return clientConfig, nil
-}
-
-func providerConfigured(cfg *config.Config, provider string) bool {
-	switch provider {
-	case "openai":
-		return cfg.OpenAIAPIKey != ""
-	case "anthropic":
-		return cfg.AnthropicAPIKey != ""
-	case "gemini":
-		return genaiconfig.CanUse(genAIOptions(cfg, cfg.GeminiAPIKey))
-	default:
-		return false
-	}
 }
 
 type repairSpeakerMetadata struct {
@@ -273,27 +212,6 @@ func normalizeRepairSpeakers(speakers map[string]repairSpeakerMetadata) map[stri
 		return nil
 	}
 	return normalized
-}
-
-// errDeepgramKeyMissing is why the default batch transcription, Deepgram's,
-// cannot run: no Deepgram API key is configured.
-var errDeepgramKeyMissing = errors.New("deepgram API key not configured")
-
-func makeBatchTranscriber(cfg *config.Config) (transcribe.BatchTranscriber, error) {
-	switch strings.ToLower(strings.TrimSpace(cfg.BatchTranscription.Provider)) {
-	case "", "deepgram":
-		if strings.TrimSpace(cfg.DeepgramAPIKey) == "" {
-			return nil, errDeepgramKeyMissing
-		}
-		return transcribe.NewDeepgramBatchTranscriber(transcribe.DeepgramBatchConfig{
-			APIKey: cfg.DeepgramAPIKey,
-			Model:  cfg.BatchTranscription.Model,
-		}), nil
-	case "groq", "openai":
-		return nil, fmt.Errorf("batch transcription provider %q is not implemented yet", cfg.BatchTranscription.Provider)
-	default:
-		return nil, fmt.Errorf("unsupported batch transcription provider %q", cfg.BatchTranscription.Provider)
-	}
 }
 
 type micProxy struct{ ref *atomic.Pointer[audio.Mic] }
@@ -665,7 +583,7 @@ func (w tappedWriter) WriteWithGateStamp(p []byte, gate *captureGate, closings i
 // microphone at sampleRate, with Dispatch's project keys as keyterms.
 func liveTranscriptionOptions(cfg *config.Config, sampleRate int, projects []string) *interfaces.LiveTranscriptionOptions {
 	return &interfaces.LiveTranscriptionOptions{
-		Model:          cfg.DeepgramModel,
+		Model:          liveTranscriptionModel(cfg),
 		Language:       "en-US",
 		Diarize:        true,
 		Punctuate:      true,
@@ -754,9 +672,14 @@ func refreshKeptRawRecordings(ctx context.Context, kept *keptRecordings, budgetM
 }
 
 // makeDeepgramClientFactory dials live-transcription sockets the app owns
-// (deepgramSocket), each write bounded by writeTimeout.
-func makeDeepgramClientFactory(_ context.Context, apiKey string, cOptions *interfaces.ClientOptions, tOptions *interfaces.LiveTranscriptionOptions, callback transcriptCallback, writeTimeout time.Duration) transcribe.ClientFactory {
+// (deepgramSocket), each write bounded by writeTimeout, each dial signed in
+// with the key key gives then.
+func makeDeepgramClientFactory(_ context.Context, key liveKey, cOptions *interfaces.ClientOptions, tOptions *interfaces.LiveTranscriptionOptions, callback transcriptCallback, writeTimeout time.Duration) transcribe.ClientFactory {
 	return func(factoryCtx context.Context) (io.WriteCloser, error) {
+		apiKey, err := key(factoryCtx)
+		if err != nil {
+			return nil, fmt.Errorf("deepgram key: %w", err)
+		}
 		return dialDeepgramLive(factoryCtx, apiKey, cOptions, tOptions, callback, writeTimeout)
 	}
 }
@@ -805,40 +728,105 @@ func ttsStatusResponse(status *tts.SpeakStatus) map[string]any {
 	}
 }
 
-// newTTSProvider builds the TTS provider cfg names. geminiOptions go to the
-// Gemini provider: ghost-wispr tts-first-audio's tests point it at a fake.
-func newTTSProvider(ctx context.Context, cfg *config.Config, geminiOptions ...tts.GeminiOption) (tts.Provider, error) {
-	switch cfg.TTSProvider {
-	case "elevenlabs":
-		if cfg.TTSAPIKey == "" {
-			return nil, fmt.Errorf("ElevenLabs requires GHOST_WISPR_TTS_API_KEY")
-		}
-		return tts.NewElevenLabsProvider(cfg.TTSAPIKey, cfg.TTSVoice)
-	case "google":
-		if cfg.TTSAPIKey != "" {
-			return tts.NewGoogleProvider(cfg.TTSAPIKey, cfg.TTSVoice)
-		}
-		credentials, err := googleauth.Detect(ctx, cfg.GoogleCredentialsFile, googleauth.CloudPlatformScope)
-		if err != nil {
-			return nil, fmt.Errorf("detect Google credentials: %w", err)
-		}
-		return tts.NewGoogleProvider("", cfg.TTSVoice, tts.WithAuthCredentials(credentials))
-	case "gemini":
-		credentials, err := googleauth.Detect(ctx, cfg.GoogleCredentialsFile, googleauth.CloudPlatformScope)
-		if err != nil {
-			return nil, fmt.Errorf("detect Google credentials: %w", err)
-		}
-		return tts.NewGeminiProvider(cfg.GCPProject, cfg.TTSModel, cfg.TTSVoice, append([]tts.GeminiOption{tts.WithGeminiAuthCredentials(credentials)}, geminiOptions...)...)
-	default:
-		return nil, fmt.Errorf("unsupported TTS provider: %s", cfg.TTSProvider)
+// newSpeechProvider builds POST /api/tts/speak's provider: the tts role's
+// model, voice and length. opts go to its engines: ghost-wispr
+// tts-first-audio's tests are told the Aura sockets it dials.
+func newSpeechProvider(cfg *config.Config, opts ...voicetts.Option) (*tts.EngineProvider, error) {
+	p, model, err := unitProviders.of(cfg).Model(cfg, config.RoleTTS, cfg.TTS.Model)
+	if err != nil {
+		return nil, err
 	}
+	return tts.NewEngineProvider(p, model, cfg.TTS.Voice, cfg.TTS.MaxLength, opts...)
+}
+
+// speechSource is POST /api/tts/speak's provider of the settings saved last:
+// a settings change of the tts role or its provider reaches the next request,
+// as it reaches voice A's next call.
+type speechSource struct {
+	store interface{ Get() config.Config }
+	// warnings, when set, holds the tts warning of /api/status: a provider's
+	// refusal of a speech, or a speech that returned no audio, sets it, and
+	// the next speech that works clears it.
+	warnings *warningsRegistry
+
+	mu    sync.Mutex
+	key   string
+	model string // the tts.model built speaks
+	built *tts.EngineProvider
+	err   error
+}
+
+// ttsWarningKey is the warning of text-to-speech: it cannot start, or a
+// provider refused the last speech or returned no audio for it.
+const ttsWarningKey = "tts"
+
+func (s *speechSource) provider() (*tts.EngineProvider, string, error) {
+	cfg := s.store.Get()
+	key := strings.Join([]string{cfg.TTS.Model, cfg.TTS.Voice, strconv.Itoa(cfg.TTS.MaxLength), providersKey(&cfg)}, "\x00")
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.key != key || (s.built == nil && s.err == nil) {
+		s.key, s.model = key, cfg.TTS.Model
+		s.built, s.err = newSpeechProvider(&cfg)
+	}
+	return s.built, s.model, s.err
+}
+
+// Synthesize speaks with the tts role saved last.
+func (s *speechSource) Synthesize(ctx context.Context, req tts.SpeechRequest) (*tts.SpeechResponse, error) {
+	p, model, err := s.provider()
+	if err != nil {
+		return nil, err
+	}
+	resp, err := p.Synthesize(ctx, req)
+	s.warn(model, err)
+	return resp, err
+}
+
+// ttsModelCheck is what a tts warning tells the operator to check when the
+// provider took the sign-in but not the speech.
+const ttsModelCheck = "check that tts.model names a speech model and tts.voice one of its voices"
+
+// warn sets the tts warning when the provider refused a speech of model, a
+// refusal no retry mends, naming its status and code and none of its words,
+// or returned no audio for it (voicetts.ErrNoAudio), which POST
+// /api/tts/speak answers 502; a speech that worked clears it. A speech that
+// failed another way leaves it.
+func (s *speechSource) warn(model string, err error) {
+	if s.warnings == nil {
+		return
+	}
+	switch refusal, refused := providerRefusal(err); {
+	case err == nil:
+		s.warnings.Clear(ttsWarningKey)
+	case refused:
+		s.warnings.Set(ttsWarningKey, fmt.Sprintf("Text-to-speech with %s failed: %s", model, refusalWarning(refusal, ttsModelCheck)))
+	case errors.Is(err, voicetts.ErrNoAudio):
+		provider, _, _ := config.ParseModelRef(model)
+		s.warnings.Set(ttsWarningKey, fmt.Sprintf("Text-to-speech with %s failed: %s returned no audio; %s", model, provider, ttsModelCheck))
+	}
+}
+
+// Name names the tts role's provider.
+func (s *speechSource) Name() string {
+	if p, _, err := s.provider(); err == nil {
+		return p.Name()
+	}
+	return ""
+}
+
+// Configured reports whether the settings saved last turn text-to-speech on
+// (tts.model is set), as tts.Configurable asks: with it off, POST
+// /api/tts/speak answers 501 and queues nothing.
+func (s *speechSource) Configured() bool {
+	return strings.TrimSpace(s.store.Get().TTS.Model) != ""
 }
 
 func main() {
 	// Before any Google client is built: its own logger writes around the
 	// app's (logging.WithholdGoogleSDKLogging).
 	googleSDKLogging := logging.WithholdGoogleSDKLogging()
-	configPath := configPathFromEnvironment()
+	configPath := config.PathFromEnvironment()
 	if len(os.Args) > 1 && os.Args[1] == "google-id-token" {
 		cfg, _, err := config.Load(configPath)
 		if err != nil {
@@ -891,6 +879,9 @@ func main() {
 		log.Fatalf("config: %v", err)
 	}
 	cfg := cfgStore.Get()
+	// Every provider signs in with the keys saved last, whatever config a
+	// caller of the providers read before (providerSets.follow).
+	unitProviders.follow(cfgStore)
 	appLogger, logSink := startAppLogger(cfgStore, os.Stdout)
 	if googleSDKLogging {
 		slog.Warn("GOOGLE_SDK_GO_LOGGING_LEVEL is ignored: Google's SDK logging writes each request whole, which can hold a meeting's words")
@@ -935,6 +926,18 @@ func main() {
 	} else if len(ids) > 0 {
 		log.Printf("recovered %d interrupted Drive sync(s): %v", len(ids), ids)
 	}
+	// So did a summary: it is pending again, and the backlog below takes it.
+	// After this, a summary running is one this run makes now, which no
+	// backfill takes again. That includes one a batch job of the last run
+	// claimed: this run polls only the job it submits itself, so left to the
+	// old job the session would stay running with nothing to end it. The
+	// backlog's summary is a new summary attempt, and the old job's result,
+	// if it is polled later, is dropped (storage's UpdateSummaryAtClaim).
+	if ids, err := store.RecoverInterruptedSummaries(); err != nil {
+		slog.Warn("failed to recover interrupted summaries", "error", err)
+	} else if len(ids) > 0 {
+		log.Printf("recovered %d interrupted summary(ies): %v", len(ids), ids)
+	}
 
 	// Backfill sessions with empty titles.
 	emptyTitleSessions, err := store.GetSessionsWithEmptyTitles()
@@ -968,108 +971,8 @@ func main() {
 	detector := session.NewDetector(cfg.ParsedSilenceTimeout())
 	audioRecorder := newSessionRecorder(cfg.AudioDir, store)
 
-	clientFactory := func(provider, model string) (llm.Client, error) {
-		latestCfg := cfgStore.Get()
-		keys := map[string]string{
-			"openai":    latestCfg.OpenAIAPIKey,
-			"anthropic": latestCfg.AnthropicAPIKey,
-			"gemini":    latestCfg.GeminiAPIKey,
-		}
-		key := keys[provider]
-		if provider == "gemini" && !providerConfigured(&latestCfg, provider) {
-			return nil, fmt.Errorf("no Vertex AI project or Gemini API key for provider %q", provider)
-		}
-		if provider != "gemini" && key == "" {
-			return nil, fmt.Errorf("no API key for provider %q", provider)
-		}
-		var opts []llm.Option
-		if provider == "openai" && latestCfg.Summarization.BaseURL != "" {
-			opts = append(opts, llm.WithBaseURL(latestCfg.Summarization.BaseURL))
-		}
-		if provider == "gemini" {
-			genOptions := genAIOptions(&latestCfg, key)
-			if err := addVertexCredentials(context.Background(), &latestCfg, genOptions); err != nil {
-				return nil, err
-			}
-			opts = append(opts, llm.WithGenAIConfig(llm.GenAIConfig{
-				Backend:     genOptions.Backend,
-				Project:     genOptions.Project,
-				Location:    genOptions.Location,
-				Credentials: genOptions.Credentials,
-			}))
-		}
-		return llm.NewClient(provider, key, model, opts...)
-	}
+	clientFactory := summaryClients(cfgStore)
 	llmTracker := server.NewLLMHealthTracker()
-	var summarizer *summary.Summarizer
-	canSummarize := false
-	if provider, _, err := llm.ParseModel(cfg.Summarization.Model); err == nil {
-		if providerConfigured(&cfg, provider) {
-			canSummarize = true
-		}
-	}
-	if !canSummarize {
-		for _, preset := range cfg.Summarization.Presets {
-			if preset.Model == "" {
-				continue
-			}
-			if provider, _, err := llm.ParseModel(preset.Model); err == nil {
-				if providerConfigured(&cfg, provider) {
-					canSummarize = true
-					break
-				}
-			}
-		}
-	}
-	if canSummarize {
-		summarizer = summary.New(cfg.Summarization, clientFactory)
-	}
-
-	var sessionSummarizer session.Summarizer
-	if summarizer != nil {
-		sessionSummarizer = summarizer
-	}
-
-	var embeddingClient embedding.Client
-	var indexer *embedding.Indexer
-	if strings.TrimSpace(cfg.EmbeddingModel) != "" {
-		embeddingOptions := &genaiconfig.Options{
-			Backend:  os.Getenv("GHOST_WISPR_EMBEDDING_BACKEND"),
-			Project:  cfg.GCPProject,
-			Location: os.Getenv("GHOST_WISPR_EMBEDDING_LOCATION"),
-		}
-		if embeddingOptions.Backend == "" {
-			embeddingOptions.Backend = os.Getenv("GHOST_WISPR_GENAI_BACKEND")
-		}
-		if err := addVertexCredentials(context.Background(), &cfg, embeddingOptions); err != nil {
-			slog.Warn("embedding indexer disabled", "error", err)
-		} else if embeddingClient, err = embedding.NewClient(cfg.EmbeddingModel, embedding.WithGenAIConfig(embedding.GenAIConfig{
-			Backend:     embeddingOptions.Backend,
-			Project:     embeddingOptions.Project,
-			Location:    embeddingOptions.Location,
-			Credentials: embeddingOptions.Credentials,
-		})); err != nil {
-			slog.Warn("embedding indexer disabled", "error", err)
-		} else {
-			indexer = embedding.NewIndexer(embeddingClient, store, 500)
-			indexer.SetModel(cfg.EmbeddingModel)
-		}
-	}
-
-	manager := session.NewManager(store, audioRecorder, sessionSummarizer, hub, detector, cfg.MinSessionSegments, appLogger)
-	if indexer != nil {
-		manager.SetIndexer(indexer)
-	}
-	// The meeting voice and its Concierge, once they run, drop what an ended
-	// session still waits on and forget a deleted session. The voice link is
-	// wired to the capture gate below, before anything can close it.
-	var conciergeSessionHooks conciergeHooks
-	var voiceHooks voiceLink
-	sessionsForgotten := wireVoiceSessionHooks(manager, &conciergeSessionHooks, &voiceHooks)
-
-	// Summarize recovered sessions (and any with pending/empty summaries).
-	// Launched after ctx is created so SIGTERM cancels in-flight LLM calls.
-	var startupSummarizer = summarizer // capture for goroutine below
 	llmHealthOnResult := func(err error) {
 		if err != nil {
 			llmTracker.SetError(err.Error())
@@ -1077,16 +980,43 @@ func main() {
 		}
 		llmTracker.SetOK()
 	}
-	if summarizer != nil {
-		summarizer.OnResult = llmHealthOnResult
-	}
-	if startupSummarizer != nil {
-		startupSummarizer.OnResult = llmHealthOnResult
+	summaries := newSummarizers(clientFactory, llmHealthOnResult)
+	sessionSummarizer := summaries.apply(&cfg)
+
+	// The status page's warnings; the search indexer below already sets one.
+	warningRegistry := newWarningsRegistry()
+	embeddingClient, embeddingModel, err := newEmbeddingClient(&cfg)
+	if err != nil {
+		slog.Warn("embedding indexer disabled", "error", err)
 	}
 
+	manager := session.NewManager(store, audioRecorder, sessionSummarizer, hub, detector, cfg.MinSessionSegments, appLogger)
+	// The meeting voice and its Concierge, once they run, drop what an ended
+	// session still waits on and forget a deleted session. The voice link is
+	// wired to the capture gate below, before anything can close it.
+	var conciergeSessionHooks conciergeHooks
+	var voiceHooks voiceLink
+	sessionsForgotten := wireVoiceSessionHooks(manager, &conciergeSessionHooks, &voiceHooks)
+
+	// exitCode is the recorder's exit status, set when it stops on a fault
+	// (its web server failed), so systemd starts it again. Registered before
+	// every other deferred cleanup, it exits after all of them have run; no
+	// log.Fatal follows it.
+	exitCode := 0
+	defer func() {
+		if exitCode != 0 {
+			os.Exit(exitCode)
+		}
+	}()
 	// ctx ends at shutdown; the capture gate's pause and the mic loops stop with it.
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	// The search indexer's backfills run in the background until ctx ends.
+	var indexer *searchIndexer
+	if embeddingClient != nil {
+		indexer = newSearchIndexer(ctx, embeddingClient, embeddingModel, cfg.Embedding.Model, store, warningRegistry)
+		manager.SetIndexer(indexer)
+	}
 
 	var resilientRef atomic.Pointer[transcribe.ResilientClient]
 	var deepgramSendRef atomic.Pointer[transcribe.AsyncSender]
@@ -1127,7 +1057,6 @@ func main() {
 		restoredState = micClosed
 	}
 	restoredPause := restoredState != micRecording
-	warningRegistry := newWarningsRegistry()
 	for i, warning := range cfgWarnings {
 		warningRegistry.Set(fmt.Sprintf("config-%03d", i), warning)
 	}
@@ -1161,127 +1090,9 @@ func main() {
 	drive := &driveSync{}
 	envoyEvents := &envoyPublishing{store: store, manager: manager, warnings: warningRegistry}
 	publishSummaryReady := envoyEvents.publishSummaryReady
-	submitSummaryBatch := func(ctx context.Context, sessionIDs []string) (string, int, error) {
-		if summarizer == nil {
-			return "", 0, fmt.Errorf("summarization not configured")
-		}
-		latestCfg := cfgStore.Get()
-		clientConfig, err := batchClientConfig(ctx, &latestCfg)
-		if err != nil {
-			return "", 0, err
-		}
-
-		sessions, generations, emptyTranscripts, err := readBatchSummarySessions(store, sessionIDs)
-		if err != nil {
-			return "", 0, err
-		}
-		completeEmptySummaries(store, emptyTranscripts)
-		if len(sessions) == 0 {
-			return "", 0, fmt.Errorf("no sessions with transcripts found for backfill")
-		}
-		for _, session := range sessions {
-			if err := store.StartSummary(session.ID); err != nil {
-				return "", 0, fmt.Errorf("start batch summary for %s: %w", session.ID, err)
-			}
-		}
-
-		requests, err := summarizer.BuildBatchRequests(ctx, sessions)
-		if err != nil {
-			return "", 0, fmt.Errorf("build batch requests: %w", err)
-		}
-
-		genaiClient, err := genai.NewClient(ctx, clientConfig)
-		if err != nil {
-			return "", 0, fmt.Errorf("create genai client: %w", err)
-		}
-
-		_, model, err := llm.ParseModel(latestCfg.Summarization.Model)
-		if err != nil {
-			return "", 0, fmt.Errorf("parse model: %w", err)
-		}
-
-		job, err := genaiClient.Batches.Create(ctx, model, &genai.BatchJobSource{
-			InlinedRequests: requests,
-		}, nil)
-		if err != nil {
-			return "", 0, fmt.Errorf("create batch job: %w", providererr.From("gemini", err))
-		}
-		if err := store.RecordSummaryBatch(job.Name, generations); err != nil {
-			return "", 0, fmt.Errorf("persist summary batch %s: %w", job.Name, err)
-		}
-
-		return job.Name, len(sessions), nil
-	}
-	pollSummaryBatch := func(ctx context.Context, batchName string) (map[string]any, error) {
-		latestCfg := cfgStore.Get()
-		clientConfig, err := batchClientConfig(ctx, &latestCfg)
-		if err != nil {
-			return nil, err
-		}
-
-		genaiClient, err := genai.NewClient(ctx, clientConfig)
-		if err != nil {
-			return nil, fmt.Errorf("create genai client: %w", err)
-		}
-
-		job, err := genaiClient.Batches.Get(ctx, batchName, nil)
-		if err != nil {
-			return nil, fmt.Errorf("get batch job: %w", providererr.From("gemini", err))
-		}
-
-		result := map[string]any{
-			"name":  job.Name,
-			"state": string(job.State),
-		}
-
-		if job.State == genai.JobStateSucceeded || job.State == genai.JobStatePartiallySucceeded {
-			var sessions []summary.BatchSession
-			if job.Dest != nil {
-				for _, resp := range job.Dest.InlinedResponses {
-					id := ""
-					if resp.Metadata != nil {
-						id = resp.Metadata["session_id"]
-					}
-					transcript := ""
-					if id != "" {
-						if loaded, ok := loadSessionTranscript(store, id); ok {
-							transcript = loaded
-						}
-					}
-					sessions = append(sessions, summary.BatchSession{ID: id, Transcript: transcript})
-				}
-			}
-			batchResults := summarizer.ProcessBatchResults(job, sessions)
-			if len(batchResults) == 0 {
-				slog.Warn("summary batch completed without inline results; marking submitted sessions failed", "batch", batchName)
-			}
-			succeeded, failed, err := applySummaryBatchResults(store, hub, publishSummaryReady, batchName, batchResults)
-			if err != nil {
-				return nil, err
-			}
-			result["succeeded"] = succeeded
-			result["failed"] = failed
-			result["total"] = succeeded + failed
-		}
-
-		if job.State == genai.JobStateFailed {
-			// Gemini's message can quote the requests, the transcripts: the
-			// answer keeps the error's code's name.
-			errMsg := "unknown error"
-			if job.Error != nil && job.Error.Code != nil {
-				errMsg = "the batch job failed: " + providererr.RPC("gemini", *job.Error.Code, job.Error.Message).Error()
-			}
-			_, failed, err := applySummaryBatchResults(store, hub, nil, batchName, nil)
-			if err != nil {
-				return nil, err
-			}
-			result["failed"] = failed
-			result["total"] = failed
-			result["error"] = errMsg
-		}
-
-		return result, nil
-	}
+	submitSummaryBatch := newSummaryBatchSubmitter(store, hub, summaries, cfgStore)
+	summarizeBacklogOnline := newOnlineSummaries(ctx, store, summaries, hub, publishSummaryReady)
+	pollSummaryBatch := newSummaryBatchPoller(store, hub, summaries, cfgStore, publishSummaryReady)
 
 	// The kept recordings pass saves the raw recordings of sessions that
 	// ended without a recording, and erases a raw recording once Drive has
@@ -1303,7 +1114,8 @@ func main() {
 	recordMergedRefinementFailure := newMergedRefinementFailureRecorder(store)
 
 	controlHooks := &server.ControlHooks{
-		IsPaused: capture.IsPaused,
+		ProviderStatuses: providerStatuses(cfgStore),
+		IsPaused:         capture.IsPaused,
 		// Pause, Close and Resume: wirePauseControls, below.
 		IsCapturing: func() bool { return capture.capturing(micStatus) },
 		RefreshRawEraseWarnings: func() {
@@ -1348,17 +1160,9 @@ func main() {
 		RepairSummaries: func(ctx context.Context) (int, error) {
 			return repairStructuredSummaries(ctx, store, publishSummaryReady)
 		},
-		Presets: func() map[string]config.Preset {
-			if summarizer == nil {
-				return nil
-			}
-			return summarizer.Presets()
-		},
+		Presets: summaries.presets,
 		Resummarize: func(ctx context.Context, sessionID, preset string) error {
-			if summarizer == nil {
-				return fmt.Errorf("summarization not configured")
-			}
-			return resummarize(ctx, store, summarizer, hub, publishSummaryReady, sessionID, preset)
+			return summaries.resummarize(ctx, store, hub, publishSummaryReady, sessionID, preset)
 		},
 		OnSessionMerged: func(ctx context.Context, sessionID string) {
 			onSessionMerged(
@@ -1366,11 +1170,7 @@ func main() {
 				store,
 				manager.RefineSession,
 				func(ctx context.Context, sessionID string, startedAt time.Time) error {
-					if summarizer == nil {
-						return manager.SummarizeSession(ctx, sessionID, startedAt)
-					}
-					summarizeMergedSession(ctx, store, summarizer, hub, publishSummaryReady, sessionID)
-					return nil
+					return summaries.summarizeMerged(ctx, store, hub, publishSummaryReady, sessionID, startedAt, manager.SummarizeSession)
 				},
 				deletion.retryRefinement,
 				recordMergedRefinementFailure,
@@ -1386,47 +1186,11 @@ func main() {
 		StopSession: func(ctx context.Context, sessionID string) error {
 			return manager.StopSession(ctx, sessionID)
 		},
-		TestPreset: func(ctx context.Context, presetName, sessionID string) (string, error) {
-			latestCfg := cfgStore.Get()
-			preset, ok := latestCfg.Summarization.Presets[presetName]
-			if !ok {
-				return "", fmt.Errorf("preset %q not found", presetName)
-			}
-
-			segments, err := store.GetSegments(sessionID)
-			if err != nil {
-				return "", err
-			}
-
-			transcript := buildCanonicalTranscript(store, sessionID, segments)
-
-			modelStr := preset.Model
-			if modelStr == "" {
-				modelStr = latestCfg.Summarization.Model
-			}
-
-			provider, model, err := llm.ParseModel(modelStr)
-			if err != nil {
-				return "", err
-			}
-
-			client, err := clientFactory(provider, model)
-			if err != nil {
-				return "", err
-			}
-
-			userContent := strings.ReplaceAll(preset.UserTemplate, "{{transcript}}", transcript)
-			msgs := []llm.Message{
-				{Role: "system", Content: preset.SystemPrompt},
-				{Role: "user", Content: userContent},
-			}
-
-			return client.Complete(ctx, msgs)
-		},
+		TestPreset: presetTester(cfgStore, store, clientFactory),
 		GeneratePreset: func(ctx context.Context, description string) (config.Preset, error) {
 			latestCfg := cfgStore.Get()
 			modelStr := latestCfg.Summarization.Model
-			provider, model, err := llm.ParseModel(modelStr)
+			provider, model, err := config.ParseModelRef(modelStr)
 			if err != nil {
 				return config.Preset{}, fmt.Errorf("no summarization model configured")
 			}
@@ -1479,7 +1243,7 @@ Return ONLY valid JSON, no markdown fences, no explanation.`
 		RefinePreset: func(ctx context.Context, current config.Preset, feedback string) (config.Preset, error) {
 			latestCfg := cfgStore.Get()
 			modelStr := latestCfg.Summarization.Model
-			provider, model, err := llm.ParseModel(modelStr)
+			provider, model, err := config.ParseModelRef(modelStr)
 			if err != nil {
 				return config.Preset{}, fmt.Errorf("no summarization model configured")
 			}
@@ -1558,19 +1322,9 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 				"errors":   result.Errors,
 			}, nil
 		},
-		BatchBackfill: func(ctx context.Context) (string, int, error) {
-			sessionIDs, err := store.GetSessionsForBackfill()
-			if err != nil {
-				return "", 0, fmt.Errorf("query sessions: %w", err)
-			}
-			if len(sessionIDs) == 0 {
-				return "", 0, nil
-			}
-			return submitSummaryBatch(ctx, sessionIDs)
-		},
-		BatchPoll: func(ctx context.Context, batchName string) (map[string]any, error) {
-			return pollSummaryBatch(ctx, batchName)
-		},
+		BatchBackfill:    newBatchBackfill(store, summaries, cfgStore, submitSummaryBatch, summarizeBacklogOnline),
+		SummarizeBacklog: summarizeBacklogOnline,
+		BatchPoll:        pollSummaryBatch,
 	}
 	wireSegmentDeletion(controlHooks, warningRegistry, refusedCuts, deletion)
 	wireVoiceSegmentDeletion(controlHooks, &voiceHooks)
@@ -1618,41 +1372,33 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 	envoyEvents.configure(ctx, &cfg, appLogger)
 	envoyEvents.publishRecoveredEnds(recoveredIDs)
 	if indexer != nil {
-		go func() {
-			if err := indexer.BackfillMissing(ctx); err != nil && ctx.Err() == nil {
-				slog.Warn("embedding backfill failed", "error", err)
-			}
-		}()
+		indexer.requestBackfill()
 	}
 
 	// Register config change callback.
 	onConfigChange(cfgStore, func(newCfg *config.Config) {
+		// The providers first, so a key saved and checked at once is checked
+		// with the new Set (GET /api/providers reads the Set of the config
+		// saved last, which this builds).
+		unitProviders.of(newCfg)
 		detector.SetTimeout(newCfg.ParsedSilenceTimeout())
 		manager.SetMinSessionSegments(newCfg.MinSessionSegments)
 		log.Printf("config: reloaded (silence_timeout=%s)", newCfg.SilenceTimeout)
-
-		// Recreate summarizer if API keys or model changed.
-		newAPIKeys := map[string]string{
-			"openai":    newCfg.OpenAIAPIKey,
-			"anthropic": newCfg.AnthropicAPIKey,
-			"gemini":    newCfg.GeminiAPIKey,
-		}
-		if provider, _, err := llm.ParseModel(newCfg.Summarization.Model); err == nil && (provider != "gemini" && newAPIKeys[provider] != "" || provider == "gemini" && providerConfigured(newCfg, provider)) {
-			newSummarizer := summary.New(newCfg.Summarization, clientFactory)
-			manager.SetSummarizer(newSummarizer)
-			log.Printf("config: summarizer updated for provider %s", provider)
-		}
 
 		if batchTranscriber, err := makeBatchTranscriber(newCfg); err != nil {
 			manager.SetBatchTranscriber(nil)
 			slog.Warn("config: batch transcriber disabled", "error", err)
 		} else {
 			manager.SetBatchTranscriber(batchTranscriber)
-			log.Printf("config: batch transcriber updated for provider %s", newCfg.BatchTranscription.Provider)
+			log.Printf("config: batch transcriber updated for %s", newCfg.BatchTranscription.Model)
 		}
 
 		envoyEvents.configure(ctx, newCfg, appLogger)
 	})
+	summaries.follow(cfgStore, manager)
+	if indexer != nil {
+		indexer.followSignIn(cfgStore)
+	}
 	watchDriveSyncSettings(cfgStore, drive,
 		func(cfg *config.Config) (sessionSyncer, error) {
 			syncer, err := newDriveSyncer(ctx, cfg, appLogger)
@@ -1671,8 +1417,9 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 			manager.SetSyncer(syncer)
 		})
 
-	// Summarize recovered sessions (and any with pending/empty summaries).
-	if startupSummarizer != nil {
+	// Summarize recovered sessions (and any with pending/empty summaries),
+	// each with the summarizer of the settings saved last.
+	if summaries.get() != nil {
 		go func() {
 			pendingIDs, err := store.GetSessionsForBackfill()
 			if err != nil {
@@ -1682,50 +1429,12 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 			if len(pendingIDs) == 0 {
 				return
 			}
-			if len(pendingIDs) >= 4 {
-				batchName, count, err := submitSummaryBatch(ctx, pendingIDs)
-				if err == nil {
-					log.Printf("startup: submitting %d sessions to batch summarization", count)
-					go func(batchName string) {
-						ticker := time.NewTicker(30 * time.Second)
-						defer ticker.Stop()
-						for {
-							result, err := pollSummaryBatch(ctx, batchName)
-							if err != nil {
-								if ctx.Err() != nil {
-									return
-								}
-								slog.Warn("startup batch job poll failed", "batch", batchName, "error", err)
-							} else if state, _ := result["state"].(string); state != "" {
-								succeeded, _ := result["succeeded"].(int)
-								failed, _ := result["failed"].(int)
-								switch state {
-								case string(genai.JobStateSucceeded), string(genai.JobStatePartiallySucceeded):
-									log.Printf("startup: batch job %s complete: %d succeeded, %d failed", batchName, succeeded, failed)
-									return
-								case string(genai.JobStateFailed):
-									if errMsg, _ := result["error"].(string); errMsg != "" {
-										log.Printf("startup: batch job %s failed: %s", batchName, errMsg)
-									} else {
-										log.Printf("startup: batch job %s failed", batchName)
-									}
-									return
-								}
-							}
-							select {
-							case <-ctx.Done():
-								return
-							case <-ticker.C:
-							}
-						}
-					}(batchName)
-					return
-				}
-				slog.Warn("startup batch submission failed; falling back to synchronous summarization", "sessions", len(pendingIDs), "error", err)
+			batchName, count := summarizeBacklog(ctx, cfgStore.Get().Summarization.BatchJobs, pendingIDs, startupBatchMin, submitSummaryBatch, summarizeBacklogOnline)
+			if batchName == "" {
+				return // summarizeBacklog summarizes them online
 			}
-			for _, id := range pendingIDs {
-				summarizeBackfillSession(ctx, store, startupSummarizer, publishSummaryReady, id)
-			}
+			log.Printf("startup: submitting %d sessions to batch summarization", count)
+			pollStartupSummaryBatch(ctx, pollSummaryBatch, batchName, 30*time.Second)
 		}()
 	}
 	defer func() { _ = store.Close() }()
@@ -1766,7 +1475,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 	}()
 
 	var dgStop func()
-	if cfg.DeepgramAPIKey != "" {
+	if cfg.LiveTranscriptionKey() != "" {
 		controlHooks.FaultDeepgramDisconnect = func() error {
 			current := resilientRef.Load()
 			if current == nil {
@@ -1886,16 +1595,16 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 			hub.BroadcastComponentStatus("mic", storage.ComponentStatusConnected, message)
 		}
 
-		if cfg.DeepgramAPIKey == "" {
+		if cfg.LiveTranscriptionKey() == "" {
 			startMicMonitoring(ctx, &micLoops, capture, ordered, audioRecorder, nil, voiceAudio, micWait, log.Printf, hub)
 			return nil
 		}
 
-		cOptions := &interfaces.ClientOptions{EnableKeepAlive: true}
+		cOptions := liveTranscriptionClientOptions(&cfg)
 		tOptions := liveTranscriptionOptions(&cfg, sampleRate, dispatchProjects.Get())
 		resilientConfig := liveTranscriptionConfig(&cfg, sampleRate)
 		callback := transcriptCallback{manager: manager, voice: &voiceHooks, stamp: capture.voiceStamp}
-		candidateResilient := newLiveTranscription(ctx, cfg.DeepgramAPIKey, cOptions, tOptions, resilientConfig, callback, warningRegistry, hub)
+		candidateResilient := newLiveTranscription(ctx, liveTranscriptionCredential(cfgStore), cOptions, tOptions, resilientConfig, callback, warningRegistry, hub)
 		resilientRef.Store(candidateResilient)
 		deepgramSendRef.Store(startMicMonitoring(ctx, &micLoops, capture, ordered, audioRecorder, candidateResilient, voiceAudio, micWait, log.Printf, hub))
 		return nil
@@ -1948,12 +1657,12 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 	switch {
 	case deferred && capture.isLightHeld() && !capture.IsPaused():
 		startupStatus.Mic = config.ComponentState{Name: "mic", Status: captureLightUnavailable, Message: "Microphone closed: the recording light is not confirmed red"}
-		if cfg.DeepgramAPIKey != "" {
+		if cfg.LiveTranscriptionKey() != "" {
 			startupStatus.Deepgram = config.ComponentState{Name: "deepgram", Status: captureLightUnavailable, Message: "Deepgram connects once the recording light is confirmed red"}
 		}
 	case deferred:
 		startupStatus.Mic = config.ComponentState{Name: "mic", Status: storage.ComponentStatusPaused, Message: "Microphone closed while capture is paused"}
-		if cfg.DeepgramAPIKey != "" {
+		if cfg.LiveTranscriptionKey() != "" {
 			startupStatus.Deepgram = config.ComponentState{Name: "deepgram", Status: storage.ComponentStatusPaused, Message: "Deepgram connects when capture resumes"}
 		}
 	case errors.Is(err, errLightNotConfirmed):
@@ -1977,19 +1686,20 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 		log.Printf("speaker output enabled (device=%q)", cfg.SpeakerDevice)
 	}
 
-	// Initialize TTS orchestrator if both speaker and provider are configured.
+	// POST /api/tts/speak speaks with the tts role whenever there is a
+	// speaker, so a settings change can turn it on with no restart; a role it
+	// cannot build fails each request, and the status page says why.
 	var ttsOrchestrator *tts.Orchestrator
-	if output != nil && cfg.TTSProvider != "" {
-		ttsProvider, ttsErr := newTTSProvider(ctx, &cfg)
-		if ttsErr != nil {
-			slog.Warn("TTS disabled", "error", ttsErr)
-			warningRegistry.Set("tts", fmt.Sprintf("TTS provider initialization failed: %v", ttsErr))
-		} else {
-			// POST /api/tts/speak waits in its queue while a voice exchange
-			// holds the speaker.
-			ttsOrchestrator = tts.NewOrchestrator(ttsProvider, output, tts.OrchestratorOpts{Floor: voiceHooks.WithFloor})
-			log.Printf("TTS orchestrator started (provider=%s)", cfg.TTSProvider)
+	if output != nil {
+		speech := &speechSource{store: cfgStore, warnings: warningRegistry}
+		if _, _, err := speech.provider(); err != nil && strings.TrimSpace(cfg.TTS.Model) != "" {
+			slog.Warn("text-to-speech unavailable", "error", err)
+			warningRegistry.Set(ttsWarningKey, fmt.Sprintf("Text-to-speech cannot start: %v", err))
 		}
+		// POST /api/tts/speak waits in its queue while a voice exchange
+		// holds the speaker.
+		ttsOrchestrator = tts.NewOrchestrator(speech, output, tts.OrchestratorOpts{Floor: voiceHooks.WithFloor})
+		log.Printf("text-to-speech queue started (tts.model=%q)", cfg.TTS.Model)
 	}
 
 	// Wire up TTS hooks now that orchestrator is initialized.
@@ -2113,28 +1823,27 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 	// API key it gets no Deepgram client source, so readiness never excuses
 	// Deepgram, paused or not.
 	var deepgramHealth interface{ IsConnected() bool }
-	if cfg.DeepgramAPIKey != "" {
+	if cfg.LiveTranscriptionKey() != "" {
 		deepgramHealth = &resilientClientProxy{ref: &resilientRef}
 	}
 	healthChecker := server.NewDefaultHealthChecker(deepgramHealth, store, micStatus, captureReadiness{capture: capture, mic: micStatus}, llmTracker)
-	handler, err := server.HandlerWithLogger(assets, hub, store, controlHooks, authToken, healthChecker, appLogger, embeddingClient, cfgStore)
+	handler, err := server.HandlerWithLogger(assets, hub, store, controlHooks, authToken, healthChecker, appLogger, searchQueryClient(embeddingClient, cfg.Embedding.Model, warningRegistry), cfgStore)
 	if err != nil {
 		panic(fmt.Sprintf("build http handler failed: %v", err))
 	}
 
 	addr := listenAddress(os.Getenv("GHOST_WISPR_ADDR"))
 	httpServer := &http.Server{Addr: addr, Handler: handler}
-	go func() {
-		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Printf("http server error: %v", err)
-		}
-	}()
+	// The stop signals are caught from before the server serves: a SIGTERM
+	// while it starts then shuts the recorder down cleanly.
+	sig := make(chan os.Signal, 1)
+	served := serveHTTP(httpServer, sig, syscall.SIGINT, syscall.SIGTERM)
 
 	go deletion.recoverAtStart(ctx, deletionDrive, warningRegistry)
 
 	// Log structured startup banner.
 	config.LogStartupBanner(appLogger, &startupStatus, Version, Commit, BuildTime)
-	slog.Info("deepgram API key", "status", config.APIKeyStatus(cfg.DeepgramAPIKey))
+	slog.Info("deepgram API key", "status", config.APIKeyStatus(cfg.LiveTranscriptionKey()))
 	uiAddr := addr
 	if strings.HasPrefix(uiAddr, ":") {
 		uiAddr = "127.0.0.1" + uiAddr
@@ -2147,9 +1856,11 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 	}
 	close(booted)
 
-	sig := make(chan os.Signal, 1)
-	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
-	<-sig
+	// awaitStop returns on a stop signal, or on the web server's failure.
+	if err := awaitStop(sig, served); err != nil {
+		slog.Error("the web server stopped; shutting down so systemd starts the recorder again", "error", err)
+		exitCode = 1
+	}
 
 	log.Println("ghost-wispr: shutting down")
 	// The voice stops first: its session, its speech and the Concierge's calls.

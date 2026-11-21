@@ -8,28 +8,37 @@ import (
 )
 
 // DefaultMaxTextLength is the maximum number of characters allowed in a
-// single TTS request. Providers typically enforce their own limits, but
-// we check locally to fail fast and avoid unnecessary network round-trips.
+// single TTS request when tts.max_length names none. Providers enforce their
+// own limits too, but checking locally fails fast, before any request.
 const DefaultMaxTextLength = 5000
 
-// Provider is the interface implemented by all TTS backends.
+// Provider is what the Orchestrator speaks through: EngineProvider, the tts
+// role's model.
 type Provider interface {
-	// Synthesize converts text to speech and returns the raw audio bytes.
+	// Synthesize converts text to speech and returns the whole speech.
 	Synthesize(ctx context.Context, req SpeechRequest) (*SpeechResponse, error)
 
-	// Name returns the provider identifier (e.g. "elevenlabs", "google").
+	// Name names the provider in logs: the name the config gives it.
 	Name() string
 }
 
-// SpeechRequest carries the parameters for a single synthesis call.
-type SpeechRequest struct {
-	Text     string
-	Voice    string
-	Language string
+// Configurable is a Provider that can be off: cmd's speechSource speaks with
+// the tts role saved last, which a settings change turns off (tts.model "").
+// The Orchestrator counts a Provider that is not Configured as no provider,
+// so POST /api/tts/speak answers 501 and queues nothing.
+type Configurable interface {
+	Configured() bool
 }
 
-// SpeechResponse carries the synthesised audio, provider-reported model and
-// voice, and format metadata.
+// SpeechRequest carries the parameters for a single synthesis call. Voice
+// "" is the provider's own.
+type SpeechRequest struct {
+	Text  string
+	Voice string
+}
+
+// SpeechResponse carries the synthesised audio and its format, the model
+// that spoke it, as its provider names it, and the voice it spoke in.
 type SpeechResponse struct {
 	Audio      []byte
 	Format     audio.AudioFormat

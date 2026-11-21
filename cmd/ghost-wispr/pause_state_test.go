@@ -555,7 +555,7 @@ func TestSeedPausedStateWritesTheDatabaseTheRecorderOpens(t *testing.T) {
 	t.Setenv(config.EnvPrefix+"CONFIG", filepath.Join("conf", "ghost-wispr.yaml"))
 	t.Setenv(config.EnvPrefix+"DB_PATH", "")
 
-	recorderStore, _, err := loadRuntimeConfig(configPathFromEnvironment())
+	recorderStore, _, err := loadRuntimeConfig(config.PathFromEnvironment())
 	if err != nil {
 		t.Fatalf("load recorder configuration: %v", err)
 	}
@@ -565,7 +565,7 @@ func TestSeedPausedStateWritesTheDatabaseTheRecorderOpens(t *testing.T) {
 	}
 
 	var out bytes.Buffer
-	seededDB, err := seedPausedState(configPathFromEnvironment(), &out)
+	seededDB, err := seedPausedState(config.PathFromEnvironment(), &out)
 	if err != nil {
 		t.Fatalf("seed paused state: %v", err)
 	}

@@ -2,7 +2,7 @@
 // Concierge does the work through GPT-Live's client delegation.
 //
 // A session lives for one exchange. It opens the primary Live WebSocket with
-// an access token from the unit's own Google identity (TokenSource), starts
+// an access token from the unit's own OpenAI provider (Config.Token), starts
 // a session seeded with the meeting's transcript, streams the capture tap
 // in, and plays the model's speech on the speaker output's voice input. When
 // GPT-Live delegates, the session runs the Concierge's answer tool and
@@ -34,6 +34,7 @@ import (
 
 	"github.com/sjawhar/ghost-wispr/internal/audio"
 	"github.com/sjawhar/ghost-wispr/internal/logging"
+	"github.com/sjawhar/ghost-wispr/internal/openaiwif"
 	"github.com/sjawhar/ghost-wispr/internal/providererr"
 	"github.com/sjawhar/ghost-wispr/internal/voice"
 )
@@ -140,7 +141,8 @@ type Config struct {
 	// Voice is GPT-Live's voice, such as "marin"; empty means the API's
 	// default.
 	Voice string
-	// Token gives the bearer for each session: TokenSource.Token.
+	// Token gives the bearer for each session: the OpenAI provider's
+	// credential, such as openaiwif.TokenSource.Token.
 	Token func(ctx context.Context) (string, error)
 	// Logger logs without words of the room; nil means slog.Default().
 	Logger *slog.Logger
@@ -1335,7 +1337,7 @@ func refusal(resp *http.Response) string {
 	}
 	data, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
 	_ = resp.Body.Close()
-	return " (" + exchangeErrorCode(data, "") + ")"
+	return " (" + openaiwif.ErrorCode(data, "") + ")"
 }
 
 func signal(c chan struct{}) {

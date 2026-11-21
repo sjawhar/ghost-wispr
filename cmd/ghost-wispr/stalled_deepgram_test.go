@@ -171,7 +171,7 @@ func startMicRig(t *testing.T, peerReads bool, writeLimit time.Duration) *micRig
 
 	cOptions := &interfaces.ClientOptions{Host: "ws://" + srv.Listener.Addr().String(), EnableKeepAlive: true}
 	tOptions := &interfaces.LiveTranscriptionOptions{Model: "nova-3", Language: "en-US", Encoding: "linear16", SampleRate: 16000, Channels: 1}
-	factory := makeDeepgramClientFactory(ctx, "test-key", cOptions, tOptions, transcriptCallback{}, writeLimit)
+	factory := makeDeepgramClientFactory(ctx, fixedKey("test-key"), cOptions, tOptions, transcriptCallback{}, writeLimit)
 	initial, err := factory(ctx)
 	if err != nil {
 		t.Fatalf("connect the Deepgram client to the local peer: %v", err)

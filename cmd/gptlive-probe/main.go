@@ -42,6 +42,7 @@ import (
 
 	"github.com/sjawhar/ghost-wispr/internal/audio"
 	"github.com/sjawhar/ghost-wispr/internal/googleauth"
+	"github.com/sjawhar/ghost-wispr/internal/openaiwif"
 	"github.com/sjawhar/ghost-wispr/internal/voice"
 	"github.com/sjawhar/ghost-wispr/internal/voice/gptlive"
 )
@@ -79,7 +80,7 @@ const inputFrame = 250 * time.Millisecond
 const wordLate = 300 * time.Millisecond
 
 type probeConfig struct {
-	TokenURL string // empty means gptlive.TokenEndpoint
+	TokenURL string // empty means openaiwif.TokenEndpoint
 	LiveURL  string // empty means gptlive.DefaultURL
 	// StatusURL is the local unit status endpoint. It is checked before
 	// tokens and again before the probe feeds any audio.
@@ -245,7 +246,7 @@ func probe(ctx context.Context, cfg *probeConfig, out io.Writer) error {
 	}
 	printf(out, "control: a token for another audience was refused (invalid_subject_token)\n")
 
-	tokens, err := gptlive.NewTokenSource(&gptlive.TokenConfig{
+	tokens, err := openaiwif.NewTokenSource(&openaiwif.TokenConfig{
 		Endpoint:           cfg.TokenURL,
 		IdentityProviderID: cfg.IdentityProviderID,
 		ServiceAccountID:   cfg.ServiceAccountID,
@@ -390,7 +391,7 @@ func reportLead(out io.Writer, speeches []spoken) error {
 // must refuse as an invalid subject token: then a refusal of the real token
 // means the mapping, not the token.
 func control(ctx context.Context, cfg *probeConfig) error {
-	tokens, err := gptlive.NewTokenSource(&gptlive.TokenConfig{
+	tokens, err := openaiwif.NewTokenSource(&openaiwif.TokenConfig{
 		Endpoint:           cfg.TokenURL,
 		Audience:           controlAudience,
 		IdentityProviderID: cfg.IdentityProviderID,

@@ -30,26 +30,28 @@ import (
 	voicetts "github.com/sjawhar/ghost-wispr/internal/voice/tts"
 )
 
-const ttsFirstAudioUsage = "usage: ghost-wispr tts-first-audio --engine gemini|aura|aura2|gemini-clip [--location LOCATION]\n" +
+const ttsFirstAudioUsage = "usage: ghost-wispr tts-first-audio [--model PROVIDER/MODEL] [--voice VOICE] [--clip]\n" +
 	"  Reads sentences from stdin, one a line, and prints for each {\"ms_to_first_frame\":N,\"mip_opt_out\":true|false|null}.\n" +
-	"  --location is Gemini's Vertex AI location (default: voice.tts_location)."
+	"  --model is a text-to-speech provider/model (default: tts.model) and --voice its voice (default: tts.voice, or\n" +
+	"  the model's own default for another model). --clip times POST /api/tts/speak's whole clip."
 
 // runTTSFirstAudioCommand is ghost-wispr tts-first-audio: for each non-empty
-// line of stdin, the time from the start of an engine's request to the first
-// PCM frame it gives, printed as {"ms_to_first_frame":N,"mip_opt_out":...}.
-// gemini and aura (or aura2) are voice A's streaming engines, built and
-// spoken through as the voice does, in one Session; gemini-clip is today's
-// whole-clip Gemini provider, timed to its whole clip, which is its first
-// byte of audio. mip_opt_out says whether the Aura socket that carried the
-// sentence asked with mip_opt_out=true, as Aura dialled it; Gemini has none
-// (null). The audio goes to a sink that drops it: no microphone, speaker or
-// Jabra opens. vendors replaces the vendors' addresses, for tests; main
-// passes nil. Wrong arguments exit 2, a failure 1 with its error on stderr.
+// line of stdin, the time from the start of a text-to-speech request to the
+// first PCM frame it gives, printed as {"ms_to_first_frame":N,"mip_opt_out":...}.
+// It speaks through voice A's engine for the model, in one Session, as the
+// voice does; with --clip, through POST /api/tts/speak's provider, timed to
+// its whole clip, which is its first audio. mip_opt_out says whether the
+// Aura socket that carried the sentence asked with mip_opt_out=true, as Aura
+// dialled it; a model on any provider but Deepgram's has none (null). The
+// audio goes to a sink that drops it: no microphone, speaker or Jabra opens.
+// vendors adds what a test needs to the engines; main passes nil. Wrong
+// arguments exit 2, a failure 1 with its error on stderr.
 func runTTSFirstAudioCommand(ctx context.Context, args []string, configPath string, vendors *voiceAOptions, stdin io.Reader, stdout, stderr io.Writer) int {
 	flags := flag.NewFlagSet("tts-first-audio", flag.ContinueOnError)
 	flags.SetOutput(io.Discard)
-	engine := flags.String("engine", "", "")
-	location := flags.String("location", "", "")
+	model := flags.String("model", "", "")
+	voiceName := flags.String("voice", "", "")
+	clip := flags.Bool("clip", false, "")
 	usage := func(problem string) int {
 		_, _ = fmt.Fprintf(stderr, "tts-first-audio: %s\n%s\n", problem, ttsFirstAudioUsage)
 		return 2
@@ -57,37 +59,53 @@ func runTTSFirstAudioCommand(ctx context.Context, args []string, configPath stri
 	if err := flags.Parse(args[1:]); err != nil {
 		return usage(err.Error())
 	}
-	switch {
-	case flags.NArg() > 0:
+	if flags.NArg() > 0 {
 		return usage(fmt.Sprintf("unexpected arguments %q", flags.Args()))
-	case *engine == "":
-		return usage("--engine is required")
-	case !slices.Contains([]string{"gemini", "aura", "aura2", "gemini-clip"}, *engine):
-		return usage(fmt.Sprintf("no engine %q", *engine))
-	case *location != "" && *engine != "gemini":
-		return usage("--location is for --engine gemini")
-	}
-	fail := func(err error) int {
-		_, _ = fmt.Fprintf(stderr, "tts-first-audio %s: %v\n", *engine, err)
-		return 1
 	}
 	cfgStore, _, err := loadRuntimeConfig(configPath)
 	if err != nil {
-		return fail(fmt.Errorf("config: %w", err))
+		_, _ = fmt.Fprintf(stderr, "tts-first-audio: config: %v\n", err)
+		return 1
 	}
 	cfg := cfgStore.Get()
+	// The unit's voice belongs to its own model; another model speaks in its
+	// own default unless --voice names one.
+	if *model != "" && *model != cfg.TTS.Model {
+		cfg.TTS.Model, cfg.TTS.Voice = *model, ""
+	}
+	if *voiceName != "" {
+		cfg.TTS.Voice = *voiceName
+	}
+	if strings.TrimSpace(cfg.TTS.Model) == "" {
+		return usage("no --model, and the config sets no tts.model")
+	}
+	fail := func(err error) int {
+		_, _ = fmt.Fprintf(stderr, "tts-first-audio %s: %v\n", cfg.TTS.Model, err)
+		return 1
+	}
+	resolved, err := cfg.ResolveModel(config.RoleTTS, cfg.TTS.Model)
+	if err != nil {
+		return fail(err)
+	}
 	opts := voiceAOptions{}
 	if vendors != nil {
 		opts = *vendors
 	}
+	dialed := &dialedSockets{aura: resolved.Config.API == config.APIDeepgram}
+	if dialed.aura {
+		wrapped := opts.auraDialed
+		opts.auraDialed = func(u *url.URL) {
+			dialed.set(u)
+			if wrapped != nil {
+				wrapped(u)
+			}
+		}
+	}
 	var timer firstAudioTimer
-	switch *engine {
-	case "gemini-clip":
-		timer, err = newClipTimer(ctx, &cfg, &opts)
-	case "gemini":
-		timer, err = newVoiceATimer(ctx, &cfg, config.TTSEngineGemini, *location, &opts)
-	default:
-		timer, err = newVoiceATimer(ctx, &cfg, config.TTSEngineAura, "", &opts)
+	if *clip {
+		timer, err = newClipTimer(&cfg, &opts)
+	} else {
+		timer, err = newVoiceATimer(ctx, &cfg, &opts)
 	}
 	if err != nil {
 		return fail(err)
@@ -101,7 +119,11 @@ func runTTSFirstAudioCommand(ctx context.Context, args []string, configPath stri
 		if text == "" {
 			continue
 		}
-		took, optedOut, err := timer.firstFrame(ctx, text)
+		took, err := timer.firstFrame(ctx, text)
+		if err != nil {
+			return fail(err)
+		}
+		optedOut, err := dialed.optedOut()
 		if err != nil {
 			return fail(err)
 		}
@@ -125,15 +147,45 @@ func runTTSFirstAudioCommand(ctx context.Context, args []string, configPath stri
 // firstAudioLine is what tts-first-audio prints for one sentence.
 type firstAudioLine struct {
 	MS       float64 `json:"ms_to_first_frame"`
-	OptedOut *bool   `json:"mip_opt_out"` // null for an engine that has no such parameter
+	OptedOut *bool   `json:"mip_opt_out"` // null for a model off Deepgram, which has no such parameter
 }
 
-// firstAudioTimer times one engine's way to its first frame.
+// dialedSockets keeps the URL of the Aura socket dialled last, for whether
+// it asked with mip_opt_out=true.
+type dialedSockets struct {
+	aura bool
+
+	mu   sync.Mutex
+	last *url.URL
+}
+
+func (d *dialedSockets) set(u *url.URL) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.last = u
+}
+
+// optedOut is whether the socket that carried the last sentence asked with
+// mip_opt_out=true; nil off Deepgram.
+func (d *dialedSockets) optedOut() (*bool, error) {
+	if !d.aura {
+		return nil, nil
+	}
+	d.mu.Lock()
+	last := d.last
+	d.mu.Unlock()
+	if last == nil {
+		return nil, errors.New("aura spoke on no socket it reported dialling")
+	}
+	optedOut := slices.Equal(last.Query()["mip_opt_out"], []string{"true"})
+	return &optedOut, nil
+}
+
+// firstAudioTimer times one way to a model's first frame.
 type firstAudioTimer interface {
 	// firstFrame speaks text and returns the time from the start of its
-	// request to its first PCM frame and, for Aura, whether the socket that
-	// carried it asked with mip_opt_out=true (nil for Gemini).
-	firstFrame(ctx context.Context, text string) (time.Duration, *bool, error)
+	// request to its first PCM frame.
+	firstFrame(ctx context.Context, text string) (time.Duration, error)
 	close()
 }
 
@@ -142,32 +194,12 @@ type firstAudioTimer interface {
 type voiceATimer struct {
 	session voice.Session
 	sink    *firstFrameSink
-	aura    bool
-
-	mu     sync.Mutex
-	dialed *url.URL // the URL of the Aura socket dialled last
 }
 
-// newVoiceATimer opens voice A on engine, built from cfg as the unit builds
-// it. The model and voice the unit names belong to its own engine; the other
-// engine runs with its defaults. A location replaces voice.tts_location.
-func newVoiceATimer(ctx context.Context, cfg *config.Config, engine, location string, opts *voiceAOptions) (*voiceATimer, error) {
-	if cfg.Voice.TTSEngine != engine {
-		cfg.Voice.TTSModel, cfg.Voice.TTSVoice = "", ""
-	}
-	cfg.Voice.TTSEngine = engine
-	if location != "" {
-		cfg.Voice.TTSLocation = location
-	}
-	t := &voiceATimer{sink: &firstFrameSink{}, aura: engine == config.TTSEngineAura}
-	if t.aura {
-		opts.auraDialed = func(u *url.URL) {
-			t.mu.Lock()
-			defer t.mu.Unlock()
-			t.dialed = u
-		}
-	}
-	built, err := voiceAEngine(ctx, cfg, opts)
+// newVoiceATimer opens voice A on cfg's tts role, built as the unit builds it.
+func newVoiceATimer(ctx context.Context, cfg *config.Config, opts *voiceAOptions) (*voiceATimer, error) {
+	t := &voiceATimer{sink: &firstFrameSink{}}
+	built, err := voiceAEngine(cfg, opts)
 	if err != nil {
 		return nil, err
 	}
@@ -178,34 +210,24 @@ func newVoiceATimer(ctx context.Context, cfg *config.Config, engine, location st
 	return t, nil
 }
 
-func (t *voiceATimer) firstFrame(ctx context.Context, text string) (time.Duration, *bool, error) {
+func (t *voiceATimer) firstFrame(ctx context.Context, text string) (time.Duration, error) {
 	t.sink.arm()
 	start := time.Now()
 	if err := t.session.Say(ctx, text, voice.Fact); err != nil {
-		return 0, nil, err
+		return 0, err
 	}
 	// Voice A's Say returns once the text's first frame is queued, so the
 	// sink holds it, unless the text had no audio.
 	first := t.sink.firstAt()
 	if first.IsZero() {
-		return 0, nil, errors.New("the engine gave no audio")
+		return 0, errors.New("the engine gave no audio")
 	}
 	// The next sentence's request starts once this one has all played, so
 	// the first frame the sink takes after it is that sentence's own.
 	if err := t.waitSpoken(ctx); err != nil {
-		return 0, nil, err
+		return 0, err
 	}
-	if !t.aura {
-		return first.Sub(start), nil, nil
-	}
-	t.mu.Lock()
-	dialed := t.dialed
-	t.mu.Unlock()
-	if dialed == nil {
-		return 0, nil, errors.New("aura spoke on no socket it reported dialling")
-	}
-	optedOut := slices.Equal(dialed.Query()["mip_opt_out"], []string{"true"})
-	return first.Sub(start), &optedOut, nil
+	return first.Sub(start), nil
 }
 
 // waitSpoken waits for the speech of the sentence in flight to end: its
@@ -266,40 +288,30 @@ func (s *firstFrameSink) firstAt() time.Time {
 	return s.first
 }
 
-// clipTimer times today's whole-clip Gemini provider: its first byte of
-// audio comes with the whole clip.
+// clipTimer times POST /api/tts/speak's provider: its first byte of audio
+// comes with the whole clip.
 type clipTimer struct{ provider tts.Provider }
 
-// newClipTimer builds the Gemini provider as the unit builds its TTS
-// provider. The model and voice the unit names for another provider are not
-// Gemini's; Gemini then runs with its defaults.
-func newClipTimer(ctx context.Context, cfg *config.Config, opts *voiceAOptions) (clipTimer, error) {
-	if cfg.TTSProvider != "gemini" {
-		cfg.TTSModel, cfg.TTSVoice = "", ""
-	}
-	cfg.TTSProvider = "gemini"
-	var geminiOptions []tts.GeminiOption
-	if opts.vertexBaseURL != "" {
-		geminiOptions = append(geminiOptions, tts.WithGeminiBaseURL(opts.vertexBaseURL))
-	}
-	provider, err := newTTSProvider(ctx, cfg, geminiOptions...)
+// newClipTimer builds the speak API's provider as the unit builds it.
+func newClipTimer(cfg *config.Config, opts *voiceAOptions) (clipTimer, error) {
+	provider, err := newSpeechProvider(cfg, voicetts.WithDialed(opts.auraDialed))
 	if err != nil {
 		return clipTimer{}, err
 	}
 	return clipTimer{provider: provider}, nil
 }
 
-func (c clipTimer) firstFrame(ctx context.Context, text string) (time.Duration, *bool, error) {
+func (c clipTimer) firstFrame(ctx context.Context, text string) (time.Duration, error) {
 	start := time.Now()
 	speech, err := c.provider.Synthesize(ctx, tts.SpeechRequest{Text: text})
 	took := time.Since(start)
 	if err != nil {
-		return 0, nil, err
+		return 0, err
 	}
 	if len(speech.Audio) == 0 {
-		return 0, nil, errors.New("the engine gave no audio")
+		return 0, errors.New("the engine gave no audio")
 	}
-	return took, nil, nil
+	return took, nil
 }
 
 func (clipTimer) close() {}

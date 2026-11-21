@@ -168,7 +168,7 @@ func TestAChunkThatAlwaysAnswersWithNoTextFailsTheSummary(t *testing.T) {
 // for the title and the summary as the model wrote them, never for the raw
 // answer, whose JSON keys hold letters.
 var answersThatDoNotParse = []string{
-	`{"title":"...","summary":"...","speakers":[]}`,
+	`{"title":"...","summary":"...","speakers":7}`,
 	`{"title":"...","summary":["..."]}`,
 }
 
@@ -205,7 +205,7 @@ func TestABatchAnswerWhoseFieldsHoldNoTextFailsEvenWhenItDoesNotParse(t *testing
 // TestAnAnswerWithAMalformedSpeakersFieldKeepsItsTitleAndSummary: a speakers
 // field of the wrong type does not throw away a real title and summary.
 func TestAnAnswerWithAMalformedSpeakersFieldKeepsItsTitleAndSummary(t *testing.T) {
-	client := &mockLLMClient{response: `{"title":"Warehouse robot naming","summary":"The team named the project.","speakers":[]}`}
+	client := &mockLLMClient{response: `{"title":"Warehouse robot naming","summary":"The team named the project.","speakers":7}`}
 	title, summaryText, speakerNames, err := summarizerFor(client).SummarizeWithPreset(context.Background(), "session-1", buildTranscript(25), "default")
 	if err != nil {
 		t.Fatalf("SummarizeWithPreset: %v", err)

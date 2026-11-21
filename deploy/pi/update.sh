@@ -8,28 +8,70 @@ readonly PREVIOUS_BINARY="$DEPLOY_DIR/ghost-wispr.prev"
 readonly RELEASE_API="${GHOST_WISPR_RELEASE_API:-https://api.github.com/repos/sjawhar/ghost-wispr/releases/latest}"
 readonly STATUS_URL="${GHOST_WISPR_STATUS_URL:-http://127.0.0.1:8080/api/status}"
 readonly VERSION_URL="${GHOST_WISPR_VERSION_URL:-http://127.0.0.1:8080/api/version}"
+# 1 (deploy/pi/rollout.sh sets it): install only while the recorder is paused, not only while it
+# records no session.
+readonly PAUSED_ONLY="${GHOST_WISPR_UPDATE_PAUSED_ONLY:-}"
 
 fail() {
   printf 'ghost-wispr update: %s\n' "$*" >&2
   exit 1
 }
 
-rollback() {
-  [[ -f "$PREVIOUS_BINARY" ]] || fail "no previous binary is available for rollback"
-  cp --preserve=mode "$PREVIOUS_BINARY" "$BINARY"
-  if ! systemctl --user restart ghost-wispr.service; then
-    fail "restored the previous binary but could not restart ghost-wispr.service"
+# recorder_status prints the recorder's /api/status, or nothing when it does not answer.
+recorder_status() {
+  curl --connect-timeout 5 --max-time 10 --fail --silent --show-error "$STATUS_URL" 2>/dev/null || true
+}
+
+# busy_reason STATUS prints why a restart must wait, from the recorder's /api/status (STATUS): it
+# records a session, or, with GHOST_WISPR_UPDATE_PAUSED_ONLY=1, it is not paused. It prints nothing
+# when the recorder may restart, or when it did not answer.
+busy_reason() {
+  [[ -n $1 ]] || return 0
+  if jq -e '.active_session_id != null and .active_session_id != ""' >/dev/null 2>&1 <<<"$1"; then
+    printf 'active session'
+  elif [[ $PAUSED_ONLY == 1 ]] && ! jq -e '.paused == true and .capture_state == "paused"' >/dev/null 2>&1 <<<"$1"; then
+    printf 'not paused'
   fi
 }
 
-status_json=$(curl --connect-timeout 5 --max-time 10 --fail --silent --show-error "$STATUS_URL" 2>/dev/null || true)
-if [[ -n "$status_json" ]] && jq -e '.active_session_id != null and .active_session_id != ""' >/dev/null <<<"$status_json"; then
-  printf 'ghost-wispr update: active session; leaving the current binary in place\n'
-  exit 0
-fi
-if [[ -z "$status_json" ]] && systemctl --user is-active --quiet ghost-wispr.service; then
-  fail "ghost-wispr is active but /api/status did not answer"
-fi
+# hold_while_busy ends the update, leaving the binary in place, while the recorder may not restart,
+# and fails while it runs but does not answer. It runs before the download, and again just before
+# the swap: a meeting can start while the release downloads.
+hold_while_busy() {
+  local status reason
+  status=$(recorder_status)
+  reason=$(busy_reason "$status")
+  if [[ -n $reason ]]; then
+    printf 'ghost-wispr update: %s; leaving the current binary in place\n' "$reason"
+    exit 0
+  fi
+  if [[ -z $status ]] && systemctl --user is-active --quiet ghost-wispr.service; then
+    fail "ghost-wispr is active but /api/status did not answer"
+  fi
+}
+
+# rollback WHY puts the previous binary back and restarts the recorder, then fails with WHY. A new
+# binary that runs and answers that it may not restart (a session it records) is left running:
+# the restart would end that session.
+rollback() {
+  local why=$1 reason
+  [[ -f "$PREVIOUS_BINARY" ]] || fail "$why; no previous binary is available for rollback"
+  if systemctl --user is-active --quiet ghost-wispr.service; then
+    reason=$(busy_reason "$(recorder_status)")
+    [[ -z $reason ]] \
+      || fail "$why; the new binary runs and reports $reason, so it is left running; $PREVIOUS_BINARY holds the previous binary for a rollback once nothing records"
+  fi
+  # A copy over the binary fails with "Text file busy" while the new one still runs; a rename
+  # replaces it, and the running process keeps the file it opened until the restart.
+  cp --preserve=mode "$PREVIOUS_BINARY" "$BINARY.rollback"
+  mv -f "$BINARY.rollback" "$BINARY"
+  if ! systemctl --user restart ghost-wispr.service; then
+    fail "$why; restored the previous binary but could not restart ghost-wispr.service"
+  fi
+  fail "$why; restored the previous binary"
+}
+
+hold_while_busy
 
 release_json=$(curl --connect-timeout 5 --max-time 30 --fail --silent --show-error "$RELEASE_API")
 release_commit=$(jq -r '.target_commitish // empty' <<<"$release_json")
@@ -58,14 +100,14 @@ curl --connect-timeout 5 --max-time 60 --fail --silent --show-error --location "
 ) || fail "release checksum does not match the arm64 binary"
 chmod 0755 "$staging_dir/ghost-wispr-linux-arm64"
 
+hold_while_busy
 if [[ -f "$BINARY" ]]; then
   cp --preserve=mode "$BINARY" "$PREVIOUS_BINARY"
 fi
 mv "$staging_dir/ghost-wispr-linux-arm64" "$BINARY"
 
 if ! systemctl --user restart ghost-wispr.service; then
-  rollback
-  fail "new binary did not start; restored the previous binary"
+  rollback "new binary did not start"
 fi
 
 installed_commit=
@@ -82,8 +124,7 @@ while (( SECONDS < deadline )); do
 done
 
 if [[ "$installed_commit" != "$release_commit" ]]; then
-  rollback
-  fail "version verification timed out; restored the previous binary"
+  rollback "version verification timed out"
 fi
 
 printf 'ghost-wispr update: installed commit %s\n' "$installed_commit"

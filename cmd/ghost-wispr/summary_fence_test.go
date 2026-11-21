@@ -110,7 +110,7 @@ func TestASummaryOfTheTextBeforeADeletionIsNotStored(t *testing.T) {
 		}},
 		{"startup", func(t *testing.T, store *storage.SQLiteStore, segmentID int64, publish func(string)) {
 			summarizer := &racingSummarizer{during: func() { deleteAndStartNewerSummary(t, store, id, segmentID) }}
-			summarizeBackfillSession(context.Background(), store, summarizer, publish, id)
+			summarizeBackfillSession(context.Background(), store, summarizer, &recordingBroadcaster{}, publish, id)
 		}},
 		{"repair", func(t *testing.T, store *storage.SQLiteStore, segmentID int64, publish func(string)) {
 			raw := `{"title":"About ` + deletedWords + `","summary":"They said: ` + deletedWords + `"}`
@@ -159,8 +159,8 @@ func TestAStaleSummaryRunLeavesTheNewerRunRunning(t *testing.T) {
 		{"merged session", func(store *storage.SQLiteStore, summarizer *racingSummarizer, hub *recordingBroadcaster) {
 			summarizeMergedSession(context.Background(), store, summarizer, hub, func(string) {}, id)
 		}},
-		{"startup", func(store *storage.SQLiteStore, summarizer *racingSummarizer, _ *recordingBroadcaster) {
-			summarizeBackfillSession(context.Background(), store, summarizer, func(string) {}, id)
+		{"startup", func(store *storage.SQLiteStore, summarizer *racingSummarizer, hub *recordingBroadcaster) {
+			summarizeBackfillSession(context.Background(), store, summarizer, hub, func(string) {}, id)
 		}},
 	} {
 		for _, outcome := range []struct {
@@ -278,7 +278,7 @@ func TestEmptySummaryWritesStartAtTheDeletionGeneration(t *testing.T) {
 			summarizeMergedSession(context.Background(), store, &racingSummarizer{}, &recordingBroadcaster{}, func(string) {}, id)
 		}},
 		{"startup", func(store *storage.SQLiteStore) {
-			summarizeBackfillSession(context.Background(), store, &racingSummarizer{}, func(string) {}, id)
+			summarizeBackfillSession(context.Background(), store, &racingSummarizer{}, &recordingBroadcaster{}, func(string) {}, id)
 		}},
 		{"batch", func(store *storage.SQLiteStore) {
 			sessions, _, empty, err := readBatchSummarySessions(store, []string{id})
@@ -369,7 +369,7 @@ func TestStartupBackfillCompletesAnEmptySummaryLeftRunning(t *testing.T) {
 	if _, err := store.DB().Exec(`UPDATE sessions SET summary_status = ?, summary_generation = 0 WHERE id = ?`, storage.SummaryRunning, id); err != nil {
 		t.Fatal(err)
 	}
-	summarizeBackfillSession(context.Background(), store, &racingSummarizer{}, func(string) {}, id)
+	summarizeBackfillSession(context.Background(), store, &racingSummarizer{}, &recordingBroadcaster{}, func(string) {}, id)
 	session, err := store.GetSession(id)
 	if err != nil {
 		t.Fatal(err)

@@ -1,4 +1,5 @@
 <script lang="ts">
+  import type { ConfigPatch } from '../lib/config-api'
   import { patchConfig } from '../lib/config-api'
   import { configState, setConfig, setError } from '../lib/config.svelte'
 
@@ -25,7 +26,7 @@
     saving = true
     feedback = ''
     try {
-      const patch: Record<string, unknown> = {}
+      const patch: ConfigPatch = {}
 
       if (silenceTimeout !== config.silence_timeout) {
         patch.silence_timeout = silenceTimeout

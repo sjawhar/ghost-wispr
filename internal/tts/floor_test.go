@@ -37,7 +37,7 @@ func TestTheFloorHoldsTheSpeechUntilItIsFree(t *testing.T) {
 	})
 	defer o.Stop()
 
-	if _, err := o.Speak("an announcement", "", ""); err != nil {
+	if _, err := o.Speak("an announcement", ""); err != nil {
 		t.Fatalf("Speak: %v", err)
 	}
 	select {

@@ -17,6 +17,7 @@ import (
 	"github.com/sjawhar/ghost-wispr/internal/config"
 	"github.com/sjawhar/ghost-wispr/internal/llm"
 	"github.com/sjawhar/ghost-wispr/internal/logging"
+	"github.com/sjawhar/ghost-wispr/internal/providers"
 	"github.com/sjawhar/ghost-wispr/internal/server"
 	"github.com/sjawhar/ghost-wispr/internal/storage"
 	"github.com/sjawhar/ghost-wispr/internal/summary"
@@ -70,8 +71,16 @@ func TestAProviderErrorPutsNoRoomWordInTheLog(t *testing.T) {
 			if tc.provider == "openai" {
 				baseURL += "/v1"
 			}
+			set := providers.New(&config.Config{
+				Providers:    map[string]config.Provider{tc.provider: {API: tc.provider, URL: baseURL, Auth: config.ProviderAuth{Kind: config.AuthAPIKey, Env: "EXAMPLE_KEY"}}},
+				ProviderKeys: map[string]string{"EXAMPLE_KEY": "k-1"},
+			}, providers.Options{})
 			factory := func(name, model string) (llm.Client, error) {
-				return llm.NewClient(name, "test-key", model, llm.WithBaseURL(baseURL))
+				p, err := set.Get(name)
+				if err != nil {
+					return nil, err
+				}
+				return llm.NewClient(p, model)
 			}
 			cfg := config.Summarization{
 				Model: tc.provider + "/test-model",
@@ -85,7 +94,7 @@ func TestAProviderErrorPutsNoRoomWordInTheLog(t *testing.T) {
 				t.Fatalf("SelectPreset: %v", err)
 			}
 			store := summaryStore(t, transcript)
-			summarizeBackfillSession(context.Background(), store, summary.New(cfg, factory), func(string) {}, summarySessionID)
+			summarizeBackfillSession(context.Background(), store, summary.New(cfg, factory), &recordingBroadcaster{}, func(string) {}, summarySessionID)
 			if quoted < 2 {
 				t.Fatalf("the provider quoted the planted word in %d answers, want both the router's and the summary's", quoted)
 			}

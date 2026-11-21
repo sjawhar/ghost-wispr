@@ -31,7 +31,7 @@ The **canonical transcript** is the best available version:
 - If batch refinement completed: canonical = refined transcript
 - If batch refinement failed or pending: canonical = assembled streaming segments
 
-The summarizer, FTS5 search index, and Google Drive sync all use the canonical transcript — not raw segments.
+The summarizer, FTS5 search index, and Google Drive sync all use the canonical transcript — not raw segments. The summarizer reads its words with each segment's speaker label (`Speaker 0: …`), so the speaker ids it names are the segments' own, not guesses from turn order; the stored canonical transcript, search and Drive have no labels.
 
 ## The Flow
 
@@ -55,7 +55,7 @@ type BatchTranscriber interface {
 }
 ```
 
-Only Deepgram is implemented. Config supports `batch_transcription.provider` (deepgram/groq/openai) but groq/openai return errors. The interface is ready for future providers.
+Only Deepgram is implemented: `batch_transcription.model` names a provider/model whose provider speaks the Deepgram API (`config.RoleBatchTranscription`). The interface is ready for other providers.
 
 ### Canonicalization
 
@@ -69,6 +69,18 @@ deletion waits for the transaction; canonicalization does not retry after a
 deletion. Callers use the returned text and generation together rather than
 reading the canonical transcript again.
 
+`storage.CanonicalizeForSummary(sessionID)` is `Canonicalize` that also
+returns, from the same transaction, the transcript every summary path reads
+(the session's end, Resummarize, a merged session, the backlog online, a
+summary batch job, a preset's test): each segment on a line of its own after
+its speaker's label (`transcribe.Segment.SpeakerLine`). The segments hold the
+canonical words: the live ones, or the refinement's, which replace them when
+it is published. A session refined before refinements kept their words
+(`refined_revision` 0) still has its live segments, which are not the refined
+text, so it is summarized from the refined text without labels. The
+summarizer counts words and makes a title from the transcript without the
+labels (`transcribe.WithoutSpeakerLabels`).
+
 ### FTS5 Index
 
 FTS5 indexes `canonical_transcript`, not segments. Triggers keep it in sync. When canonicalization updates the canonical transcript, the UPDATE trigger automatically re-indexes.
@@ -81,7 +93,7 @@ FTS5 indexes `canonical_transcript`, not segments. Triggers keep it in sync. Whe
    WHERE refinement_status = 'pending' AND status IN ('ended', 'discarded');
    ```
 
-2. **Batch transcription is optional**: If `batch_transcription.provider` is empty or credentials are missing, the manager's `batchTranscriber` is nil. Summarization proceeds immediately with streaming segments. No error is raised.
+2. **Batch transcription is optional**: If `batch_transcription.model` (by default `transcription.model`) is empty, or its provider's key is not set, the manager's `batchTranscriber` is nil. Summarization proceeds immediately with streaming segments. No error is raised.
 
 3. **30-second timeout is hardcoded**: The wait for batch refinement before summarizing is 30 seconds. For very long recordings (>1 hour), batch refinement may take longer. The summarizer will use the streaming transcript, and re-canonicalization will happen later when batch completes.
 

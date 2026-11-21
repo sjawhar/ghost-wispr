@@ -58,7 +58,7 @@ func TestClosingLiveTranscriptionWhileItHandsOnAResultReturns(t *testing.T) {
 	gated := &gatedManager{Manager: manager, entered: make(chan struct{}), gate: make(chan struct{})}
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
-	rc := newLiveTranscription(ctx, "test-key",
+	rc := newLiveTranscription(ctx, fixedKey("test-key"),
 		&interfaces.ClientOptions{Host: host},
 		&interfaces.LiveTranscriptionOptions{Model: "nova-3", Language: "en-US", Encoding: "linear16", SampleRate: 16000, Channels: 1},
 		transcribe.ResilientConfig{SampleRate: 16000, InitialReconnectDelay: 20 * time.Millisecond, MaxReconnectBackoff: 50 * time.Millisecond},

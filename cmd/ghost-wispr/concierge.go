@@ -87,16 +87,19 @@ func startConcierge(ctx context.Context, cfg *config.Config, store *storage.SQLi
 	return c, stop, nil
 }
 
-// newConcierge builds the Concierge without its Envoy session: its Gemini
-// model client on the unit's genai settings, and Dispatch's record with the
-// unit's own token. With no token or no Dispatch URL the tools say they
+// newConcierge builds the Concierge without its Envoy session: its model
+// client on the provider concierge.model names, and Dispatch's record with
+// the unit's own token. With no token or no Dispatch URL the tools say they
 // cannot reach Dispatch yet.
 func newConcierge(ctx context.Context, cfg *config.Config, store *storage.SQLiteStore, logger *slog.Logger, changed func(sessionID string)) (*concierge.Concierge, error) {
-	options := genAIOptions(cfg, cfg.GeminiAPIKey)
-	if err := addVertexCredentials(ctx, cfg, options); err != nil {
+	p, model, err := unitProviders.of(cfg).Model(cfg, config.RoleConcierge, cfg.Concierge.Model)
+	if err != nil {
 		return nil, fmt.Errorf("concierge: %w", err)
 	}
-	generator, err := concierge.NewGenerator(ctx, options)
+	if err := p.Ready(); err != nil {
+		return nil, fmt.Errorf("concierge: %w", err)
+	}
+	generator, err := concierge.NewGenerator(ctx, p)
 	if err != nil {
 		return nil, fmt.Errorf("concierge: the model client: %w", err)
 	}
@@ -116,7 +119,7 @@ func newConcierge(ctx context.Context, cfg *config.Config, store *storage.SQLite
 		records = client
 	}
 	return concierge.New(&concierge.Config{
-		Model:     cfg.Concierge.Model,
+		Model:     model,
 		Generator: generator,
 		Records:   records,
 		Store:     store,

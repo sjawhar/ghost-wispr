@@ -104,7 +104,7 @@ func TestSampleTranscriptShortText(t *testing.T) {
 func TestRouter_FallbackUsesFirstPreset(t *testing.T) {
 	// No "default" preset — fallback should return first sorted key ("brief")
 	cfg := config.Summarization{
-		Model: "not/valid", // invalid model forces ParseModel error → fallback path
+		Model: "not/valid", // the factory below fails for it, which forces the fallback path
 		Presets: map[string]config.Preset{
 			"detailed": {Description: "detailed notes"},
 			"brief":    {Description: "quick summary"},

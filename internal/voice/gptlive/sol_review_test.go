@@ -2,8 +2,6 @@ package gptlive
 
 import (
 	"context"
-	"encoding/json"
-	"net/http"
 	"strings"
 	"testing"
 	"time"
@@ -13,39 +11,6 @@ import (
 	"github.com/sjawhar/ghost-wispr/internal/audio"
 	"github.com/sjawhar/ghost-wispr/internal/voice"
 )
-
-func TestSolReviewTokenErrorMustNotExposeSubject(t *testing.T) {
-	for _, echo := range []bool{false, true} {
-		name := "ordinary refusal control"
-		if echo {
-			name = "refusal echoes subject"
-		}
-		t.Run(name, func(t *testing.T) {
-			clock := &fakeClock{t: time.Unix(1_800_000_000, 0)}
-			e := newTokenEndpoint(t, clock.Now)
-			e.status = http.StatusUnauthorized
-			message := "Invalid subject token"
-			const secret = "sol-review-synthetic-subject-not-a-real-token"
-			if echo {
-				message += ": " + secret
-			}
-			body, _ := json.Marshal(map[string]any{"error": map[string]string{"code": "invalid_subject_token", "message": message}})
-			e.body = string(body)
-			tokens := newTestTokenSource(t, e, clock, func(context.Context, string) (string, error) { return secret, nil })
-			v, _ := New(Config{Token: tokens.Token})
-			_, err := v.Open(context.Background(), testExchange(newFakeOutput(), newFakeTools(voice.AnswerResult{})))
-			if err == nil {
-				t.Fatal("expected refusal")
-			}
-			if strings.Contains(err.Error(), secret) {
-				t.Fatal("subject token reaches the Open error that supervisor.go logs")
-			}
-			if !strings.Contains(err.Error(), "invalid_subject_token") {
-				t.Fatal("lost useful error code")
-			}
-		})
-	}
-}
 
 func TestSolReviewRoomAudioWhileCloseWaits(t *testing.T) {
 	tap := make(chan audio.Frame, 4)
