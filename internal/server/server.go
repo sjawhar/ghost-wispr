@@ -185,6 +185,19 @@ type ControlHooks struct {
 	// nothing, and the start's recovery finishes the erase. nil starts the
 	// work on a goroutine of its own, which nothing waits for (tests).
 	GoStoreWork             func(work func(ctx context.Context))
+	// AdmitRequest runs each request but the websocket's (serve) as work the
+	// app's stop cuts off and waits for (session.Manager.Run), since a
+	// handler may write the store, and refuses it once the stop has run: the
+	// request is then answered 503. Closing a connection does not end its
+	// handler, so the HTTP server's shutdown alone does not keep a handler
+	// from writing the store after it closed. nil serves each request as it
+	// comes (tests).
+	AdmitRequest            func(ctx context.Context, serve func(ctx context.Context)) error
+	// RouteHandler, when set, is given each route as it registers, with its
+	// handler, and its result serves the route: a test lists the routes the
+	// server registers, and which of them it reached. nil serves each route
+	// as registered.
+	RouteHandler            func(pattern string, handler http.Handler) http.Handler
 	OnSessionsMerged        func(sessionIDs []string)
 	OnSessionMerged         func(ctx context.Context, sessionID string)
 	EndSession              func(ctx context.Context) error
@@ -237,24 +250,77 @@ func HandlerWithLogger(staticFS fs.FS, hub *Hub, store SessionStore, controls *C
 		healthChecker = &DefaultHealthChecker{}
 	}
 	mux := http.NewServeMux()
+	var routes routeMux = mux
+	if controls != nil && controls.RouteHandler != nil {
+		routes = handledRoutes{mux: mux, handler: controls.RouteHandler}
+	}
 
 	var cs *config.Store
 	if len(cfgStore) > 0 {
 		cs = cfgStore[0]
 	}
 	origins := originPolicy{cfg: cs, logger: moduleLogger}
-	registerWSRoute(mux, hub, moduleLogger)
-	registerAPIRoutes(mux, store, controls, healthChecker, cs, embeddingClient)
-	registerSessionDeleteRoute(mux, store, controls, hub, configuredAudioDir(cs))
-	registerVoiceTasksRoute(mux, store)
-	registerJoinedAgentsRoutes(mux, controls)
+	registerWSRoute(routes, hub, moduleLogger)
+	registerAPIRoutes(routes, store, controls, healthChecker, cs, embeddingClient)
+	registerSessionDeleteRoute(routes, store, controls, hub, configuredAudioDir(cs))
+	registerVoiceTasksRoute(routes, store)
+	registerJoinedAgentsRoutes(routes, controls)
 
 	fileServer := http.FileServer(http.FS(staticFS))
-	mux.HandleFunc("/", serveSPA(staticFS, fileServer, moduleLogger))
+	routes.HandleFunc("/", serveSPA(staticFS, fileServer, moduleLogger))
 
-	withAuth := BasicAuthMiddleware(authToken)(mux)
+	withAuth := BasicAuthMiddleware(authToken)(admitRequests(controls, mux))
 	withRequestID := logging.RequestIDMiddleware(moduleLogger, nil)(noStoreAPI(origins.guard(withAuth)))
 	return withRequestID, nil
+}
+
+// routeMux is where a route registers: the server's *http.ServeMux, or
+// handledRoutes over it.
+type routeMux interface {
+	HandleFunc(pattern string, handler func(http.ResponseWriter, *http.Request))
+	Handle(pattern string, handler http.Handler)
+}
+
+// handledRoutes registers each route on mux through handler
+// (ControlHooks.RouteHandler).
+type handledRoutes struct {
+	mux     *http.ServeMux
+	handler func(pattern string, handler http.Handler) http.Handler
+}
+
+func (r handledRoutes) HandleFunc(pattern string, handler func(http.ResponseWriter, *http.Request)) {
+	r.mux.Handle(pattern, r.handler(pattern, http.HandlerFunc(handler)))
+}
+
+func (r handledRoutes) Handle(pattern string, handler http.Handler) {
+	r.mux.Handle(pattern, r.handler(pattern, handler))
+}
+
+// admitRequests serves each request but the websocket's through
+// controls.AdmitRequest, as work the app's stop waits for, and answers 503
+// to one it refuses because the app is stopping. The websocket's handler
+// writes no store and lasts as long as its client, which the stop would wait
+// for; the HTTP server's shutdown does not close it either. The hook is read
+// at each request, so hooks set after the handler was built still apply.
+func admitRequests(controls *ControlHooks, next http.Handler) http.Handler {
+	if controls == nil {
+		return next
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		admit := controls.AdmitRequest
+		if admit == nil || r.URL.Path == "/ws" {
+			next.ServeHTTP(w, r)
+			return
+		}
+		served := false
+		err := admit(r.Context(), func(ctx context.Context) {
+			served = true
+			next.ServeHTTP(w, r.WithContext(ctx))
+		})
+		if err != nil && !served {
+			writeJSONError(w, http.StatusServiceUnavailable, "the app is stopping")
+		}
+	})
 }
 
 // noStoreAPI keeps every API response out of the browser's caches

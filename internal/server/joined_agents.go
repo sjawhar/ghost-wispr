@@ -25,7 +25,7 @@ var ErrBadIssueKey = errors.New("that is not an issue key; an issue key looks li
 
 // registerJoinedAgentsRoutes serves the joined agents of a meeting, and the
 // message a person sends an agent through Dispatch to have it join.
-func registerJoinedAgentsRoutes(mux *http.ServeMux, controls *ControlHooks) {
+func registerJoinedAgentsRoutes(mux routeMux, controls *ControlHooks) {
 	mux.HandleFunc("GET /api/sessions/{id}/joined-agents", func(w http.ResponseWriter, r *http.Request) {
 		sessionID := r.PathValue("id")
 		if !storage.ValidSessionID(sessionID) {

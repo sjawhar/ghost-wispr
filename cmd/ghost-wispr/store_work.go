@@ -28,13 +28,17 @@ type storeWork struct {
 	pollSummaryBatch              func(ctx context.Context, batchName string) (map[string]any, error)
 }
 
-// wireStoreWork gives hooks the requests' work on the store: each piece that
-// outlasts its request (a delete's raw erase, a sync, a refinement, a
-// summary, the merge hook, a session's end), or that can outlast a moment
-// (a summary repair, a restore from Drive, a batch submit or poll), runs as
-// work the stop cuts off and waits for (session.Manager.Go and Run), so the
-// store closes under none of it.
+// wireStoreWork gives hooks the requests' work on the store. Each request
+// runs as work the stop cuts off and waits for (AdmitRequest, through
+// session.Manager.Run), since a handler may write the store itself (a
+// title, a deletion), and the HTTP server's shutdown does not end a handler
+// whose connection it closed. Each piece that outlasts its request (a
+// delete's raw erase, a sync, a refinement, a summary, the merge hook, a
+// session's end), or that can outlast a moment (a summary repair, a restore
+// from Drive, a batch submit or poll), runs the same way (session.Manager.Go
+// and Run), so the store closes under none of it.
 func wireStoreWork(hooks *server.ControlHooks, w *storeWork) {
+	hooks.AdmitRequest = admitRequestsThrough(w.manager)
 	hooks.GoStoreWork = w.manager.Go
 	// RetrySync starts a sync of the session in the background and says at
 	// once if none can start (for a session whose Drive folder was deleted,
@@ -97,5 +101,17 @@ func wireStoreWork(hooks *server.ControlHooks, w *storeWork) {
 			return err
 		})
 		return result, err
+	}
+}
+
+// admitRequestsThrough is the requests' admission (ControlHooks.AdmitRequest):
+// each request runs as work manager's stop cuts off and waits for, and none
+// runs once the stop has run.
+func admitRequestsThrough(manager *session.Manager) func(ctx context.Context, serve func(ctx context.Context)) error {
+	return func(ctx context.Context, serve func(ctx context.Context)) error {
+		return manager.Run(ctx, func(ctx context.Context) error {
+			serve(ctx)
+			return nil
+		})
 	}
 }

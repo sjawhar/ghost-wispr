@@ -21,7 +21,7 @@ import (
 // (deleteSessionErasingAudio), then tells every connected web client which
 // sessions are gone (Hub.BroadcastSessionDeleted) and runs
 // controls.OnSessionDeleted. It refuses an active session.
-func registerSessionDeleteRoute(mux *http.ServeMux, store SessionStore, controls *ControlHooks, hub *Hub, audioDir func() string) {
+func registerSessionDeleteRoute(mux routeMux, store SessionStore, controls *ControlHooks, hub *Hub, audioDir func() string) {
 	mux.HandleFunc("DELETE /api/sessions/{id}", func(w http.ResponseWriter, r *http.Request) {
 		sessionID := r.PathValue("id")
 		if !storage.ValidSessionID(sessionID) {

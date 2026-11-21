@@ -369,3 +369,77 @@ func TestAShutdownWaitsForAConciergeStartUnderWay(t *testing.T) {
 		t.Errorf("control: the start did not write the store before the shutdown returned: q1 = %+v, %v", task, err)
 	}
 }
+
+// TestAShutdownWaitsForATurnOffUnderWay fails if the Concierge's shutdown
+// (lazyConcierge.Stop) returns while a turn-off from a settings change is
+// under way: the turn-off has detached its Concierge, so the shutdown sees
+// none, and then cancels its working questions (VoiceOff), which writes the
+// store after main closed it (storeguard records it). From review 6004725672
+// of #132; the control, a turn-off that ended first, must stay clean too.
+func TestAShutdownWaitsForATurnOffUnderWay(t *testing.T) {
+	for _, held := range []bool{false, true} {
+		name := "control: the turn-off ended before the shutdown"
+		if held {
+			name = "the turn-off is under way at the shutdown"
+		}
+		t.Run(name, func(t *testing.T) {
+			store := conciergeStore(t)
+			if err := store.CreateSession("meeting", time.Now()); err != nil {
+				t.Fatal(err)
+			}
+			if err := store.CreateVoiceTask(&storage.VoiceTask{ID: "q1", SessionID: "meeting", AskedAt: time.Now(), Holder: "session:agent-7"}); err != nil {
+				t.Fatal(err)
+			}
+			cfg := config.Config{GenAIBackend: "gemini", GeminiAPIKey: strings.Repeat("k", 8)}
+			detached, release, ended := make(chan struct{}), make(chan struct{}), make(chan struct{})
+			lazy := newLazyConcierge(func() (*concierge.Concierge, func(), error) {
+				return startConcierge(t.Context(), &cfg, store, discardLogger, nil)
+			}, func(c *concierge.Concierge) {
+				if c == nil { // the turn-off has detached its Concierge
+					close(detached)
+					<-release
+				}
+			}, discardLogger)
+			if _, err := lazy.start(); err != nil {
+				t.Fatal(err)
+			}
+			guard := storeguard.New(t, store)
+			go func() {
+				defer close(ended)
+				lazy.followEnabled(false)
+			}()
+			select {
+			case <-detached:
+			case <-time.After(5 * time.Second):
+				t.Fatal("control: the turn-off did not detach its Concierge")
+			}
+			if !held {
+				close(release)
+				<-ended
+			} else {
+				time.AfterFunc(200*time.Millisecond, func() { close(release) })
+			}
+			stopped := make(chan struct{})
+			go func() {
+				defer close(stopped)
+				lazy.Stop()
+			}()
+			select {
+			case <-stopped:
+			case <-time.After(5 * time.Second):
+				t.Fatal("the shutdown did not end")
+			}
+			guard.Close(t)
+			select {
+			case <-ended:
+			case <-time.After(5 * time.Second):
+				t.Fatal("the turn-off did not end")
+			}
+			time.Sleep(50 * time.Millisecond)
+			guard.Check(t)
+			if task, err := store.VoiceTask("q1"); err != nil || task.State != storage.VoiceTaskCancelled {
+				t.Errorf("control: the turn-off did not cancel the working question before the shutdown returned: %+v, %v", task, err)
+			}
+		})
+	}
+}

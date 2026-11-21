@@ -303,7 +303,9 @@ func newSession(listener *Listener, cfg *SessionConfig) (*Session, error) {
 // OpenSession connects to NATS, subscribes to the session's relay subject,
 // registers, and keeps registering every HeartbeatEvery until Close. It
 // fails when the first registration fails: a session the listener refused
-// receives nothing.
+// receives nothing. When it fails, nothing it started runs on: a
+// registration a NATS reconnect began, or a relay frame being handled, is
+// cancelled and waited for (abandon).
 func OpenSession(ctx context.Context, listener *Listener, cfg *SessionConfig) (*Session, error) {
 	session, err := newSession(listener, cfg)
 	if err != nil {
@@ -312,6 +314,7 @@ func OpenSession(ctx context.Context, listener *Listener, cfg *SessionConfig) (*
 	natsURL := cfg.NATSURL
 	if natsURL == "" {
 		if natsURL, err = NATSURLFor(listener.base.String()); err != nil {
+			session.abandon(nil)
 			return nil, err
 		}
 	}
@@ -327,6 +330,7 @@ func OpenSession(ctx context.Context, listener *Listener, cfg *SessionConfig) (*
 		}),
 	)
 	if err != nil {
+		session.abandon(nil)
 		return nil, fmt.Errorf("envoy: connect to NATS at %s: %w", natsURL, err)
 	}
 	sub, err := conn.Subscribe(DeliverSubjectPrefix+cfg.SessionID, func(msg *nats.Msg) {
@@ -337,7 +341,7 @@ func OpenSession(ctx context.Context, listener *Listener, cfg *SessionConfig) (*
 		})
 	})
 	if err != nil {
-		conn.Close()
+		session.abandon(conn)
 		return nil, fmt.Errorf("envoy: subscribe to the relay subject: %w", err)
 	}
 	// The flush and the first registration bound themselves: NATS refuses a
@@ -345,19 +349,36 @@ func OpenSession(ctx context.Context, listener *Listener, cfg *SessionConfig) (*
 	openCtx, cancel := context.WithTimeout(ctx, openTimeout)
 	defer cancel()
 	if err := conn.FlushWithContext(openCtx); err != nil {
-		conn.Close()
+		session.abandon(conn)
 		return nil, fmt.Errorf("envoy: flush the relay subscription: %w", err)
 	}
 	session.mu.Lock()
 	session.conn, session.sub = conn, sub
 	session.mu.Unlock()
 	if err := session.register(openCtx); err != nil {
-		conn.Close()
+		session.abandon(conn)
 		return nil, err
 	}
 	session.stopped.Add(1)
 	go session.heartbeat()
 	return session, nil
+}
+
+// abandon ends a session OpenSession could not open, which no caller can
+// Close: it admits no more work (closed), cancels what runs (a registration
+// a NATS reconnect began, a relay frame being handled, each of which may save
+// the resume point), closes conn, which may be nil, and waits for that work.
+// It removes no registration, since the first one failed.
+func (s *Session) abandon(conn *nats.Conn) {
+	s.mu.Lock()
+	s.closed = true
+	close(s.stop)
+	s.mu.Unlock()
+	s.endLife()
+	if conn != nil {
+		conn.Close()
+	}
+	s.stopped.Wait()
 }
 
 // openTimeout bounds OpenSession's flush of the relay subscription and its

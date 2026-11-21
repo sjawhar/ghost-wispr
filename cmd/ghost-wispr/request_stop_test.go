@@ -4,16 +4,12 @@ import (
 	"bytes"
 	"context"
 	"errors"
-	"go/ast"
-	"go/parser"
-	"go/token"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"slices"
-	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -86,46 +82,45 @@ func (h *heldUntilStop) RecordingsMatch(context.Context, string, map[string]stri
 	return true, nil
 }
 
-// serverRoutes is every route internal/server registers, read from its
-// source: each mux.HandleFunc or mux.Handle call whose pattern is a string.
-func serverRoutes(t *testing.T) []string {
-	t.Helper()
-	dir := filepath.Join("..", "..", "internal", "server")
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	fset := token.NewFileSet()
-	var routes []string
-	for _, entry := range entries {
-		name := entry.Name()
-		if !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
-			continue
+// routeRecorder lists each route the server registers, as it registers it
+// (ControlHooks.RouteHandler), and which of them a request reached.
+type routeRecorder struct {
+	mu         sync.Mutex
+	registered []string
+	reached    map[string]bool
+}
+
+func newRouteRecorder() *routeRecorder { return &routeRecorder{reached: map[string]bool{}} }
+
+func (r *routeRecorder) handler(pattern string, handler http.Handler) http.Handler {
+	r.mu.Lock()
+	r.registered = append(r.registered, pattern)
+	r.mu.Unlock()
+	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		r.mu.Lock()
+		r.reached[pattern] = true
+		r.mu.Unlock()
+		handler.ServeHTTP(w, req)
+	})
+}
+
+func (r *routeRecorder) routes() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return slices.Sorted(slices.Values(r.registered))
+}
+
+// unreached is each registered route no request reached.
+func (r *routeRecorder) unreached() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var missed []string
+	for _, pattern := range r.registered {
+		if !r.reached[pattern] {
+			missed = append(missed, pattern)
 		}
-		file, err := parser.ParseFile(fset, filepath.Join(dir, name), nil, 0)
-		if err != nil {
-			t.Fatal(err)
-		}
-		ast.Inspect(file, func(n ast.Node) bool {
-			call, ok := n.(*ast.CallExpr)
-			if !ok || len(call.Args) == 0 {
-				return true
-			}
-			sel, ok := call.Fun.(*ast.SelectorExpr)
-			if !ok || (sel.Sel.Name != "HandleFunc" && sel.Sel.Name != "Handle") {
-				return true
-			}
-			if lit, ok := call.Args[0].(*ast.BasicLit); ok && lit.Kind == token.STRING {
-				pattern, err := strconv.Unquote(lit.Value)
-				if err == nil {
-					routes = append(routes, pattern)
-				}
-			}
-			return true
-		})
 	}
-	sort.Strings(routes)
-	return routes
+	return missed
 }
 
 // routeRequest is the request the test sends for one route.
@@ -138,15 +133,15 @@ type routeRequest struct {
 	held bool
 }
 
-// TestNoRequestWritesTheStoreAfterTheStop drives every route of the API, as
-// internal/server's source registers them (serverRoutes), so a new route is
-// driven too, with the store work main wires (wireStoreWork,
-// wireSegmentDeletion) and every slow dependency held until the stop
-// (heldUntilStop). It then stops as main does: no more requests
-// (stopServing), then the stop's wait (stopRecovery.stop). It fails if
-// anything writes the store once that has returned, when main closes the
-// store (storeguard records each write), or if the server takes a request
-// after it stopped serving.
+// TestNoRequestWritesTheStoreAfterTheStop drives every route the server
+// registers, as it registers them (routeRecorder), with the store work main
+// wires (wireStoreWork, wireSegmentDeletion) and every slow dependency held
+// until the stop (heldUntilStop). It then stops as main does: no more
+// requests (stopServing), then the stop's wait (stopRecovery.stop). It fails
+// if anything writes the store once that has returned, when main closes the
+// store (storeguard records each write), if the server takes a request after
+// it stopped serving, or if a registered route's handler was never reached,
+// so a new route is driven too.
 func TestNoRequestWritesTheStoreAfterTheStop(t *testing.T) {
 	dir := t.TempDir()
 	store := openResumeStore(t, filepath.Join(dir, "requests.db"))
@@ -199,6 +194,8 @@ func TestNoRequestWritesTheStoreAfterTheStop(t *testing.T) {
 	drive := &driveSync{}
 	drive.Set(held)
 	hooks := &server.ControlHooks{}
+	recorder := newRouteRecorder()
+	hooks.RouteHandler = recorder.handler
 	wireStoreWork(hooks, &storeWork{
 		manager:                       manager,
 		store:                         store,
@@ -246,14 +243,14 @@ func TestNoRequestWritesTheStoreAfterTheStop(t *testing.T) {
 		"POST /api/sessions/batch-backfill":              {held: true},
 		"GET /api/batches/{name...}":                     {path: "/api/batches/batches/held", held: true},
 	}
-	routes := serverRoutes(t)
+	routes := recorder.routes()
 	for _, want := range []string{"DELETE /api/sessions/{id}", "POST /api/sessions/merge", "POST /api/sessions/{id}/retry-refinement"} {
 		if !slices.Contains(routes, want) {
-			t.Fatalf("control: the route list read from internal/server lacks %q: %v", want, routes)
+			t.Fatalf("control: the routes the server registered lack %q: %v", want, routes)
 		}
 	}
 	if len(routes) < 40 {
-		t.Fatalf("control: UNKNOWN: %d routes read from internal/server, want every one (about 50)", len(routes))
+		t.Fatalf("control: UNKNOWN: the server registered %d routes, want every one (about 50)", len(routes))
 	}
 	client := &http.Client{Timeout: 5 * time.Second}
 	send := func(method, path, body string) (*http.Response, error) {
@@ -315,10 +312,20 @@ func TestNoRequestWritesTheStoreAfterTheStop(t *testing.T) {
 		_ = response.Body.Close()
 		t.Errorf("the server took a request after it stopped serving: %s", response.Status)
 	}
+	// A request a connection accepted before the stop reaches the handler
+	// after it: main's admission refuses it, so its handler writes nothing.
+	late := httptest.NewRecorder()
+	handler.ServeHTTP(late, mustRequest(t, http.MethodPatch, "/api/sessions/"+ids["read"], `{"title":"after the stop"}`))
+	if late.Code != http.StatusServiceUnavailable {
+		t.Errorf("a request that reached the handler after the stop = %d %s, want 503: main does not admit requests through the stop's work", late.Code, late.Body.String())
+	}
 	close(held.release)
 	heldRequests.Wait()
 	time.Sleep(200 * time.Millisecond) // work the stop left would write now
 	guard.Check(t)
+	for _, pattern := range recorder.unreached() {
+		t.Errorf("no request reached the handler of route %q: drive it, so its store work is checked", pattern)
+	}
 }
 
 func mustRequest(t *testing.T, method, url, body string) *http.Request {
@@ -367,5 +374,100 @@ func TestStopServingClosesARequestThatOutlastsItsWait(t *testing.T) {
 	if response, err := http.Get("http://" + listener.Addr().String()); err == nil {
 		_ = response.Body.Close()
 		t.Fatal("the server took a request after stopServing")
+	}
+}
+
+// heldTitleStore holds UpdateTitle, which the PATCH handler calls itself,
+// until release closes.
+type heldTitleStore struct {
+	*storage.SQLiteStore
+	entered, release chan struct{}
+}
+
+func (s *heldTitleStore) UpdateTitle(id, title string) error {
+	close(s.entered)
+	<-s.release
+	return s.SQLiteStore.UpdateTitle(id, title)
+}
+
+// TestTheStopWaitsForAHandlerThatOutlastsTheHTTPWait fails if the stop, as
+// main runs it (stopServing, then stopRecovery.stop), returns while an
+// admitted request's handler still runs past the HTTP server's wait, so the
+// handler writes the store after main closed it (storeguard records it): the
+// server's Close closes the connection but does not end its handler. The
+// handler is the PATCH of a title, which writes the store itself. From review
+// 6004725672 of #132; the control is a handler that ends within the wait.
+func TestTheStopWaitsForAHandlerThatOutlastsTheHTTPWait(t *testing.T) {
+	for _, past := range []bool{false, true} {
+		name := "control: the handler ends within the HTTP wait"
+		if past {
+			name = "the handler outlasts the HTTP wait"
+		}
+		t.Run(name, func(t *testing.T) {
+			db := openResumeStore(t, filepath.Join(t.TempDir(), "http.db"))
+			const id = "20261120090000"
+			if err := db.CreateSession(id, time.Now()); err != nil {
+				t.Fatal(err)
+			}
+			if err := db.EndSession(id, time.Now(), ""); err != nil {
+				t.Fatal(err)
+			}
+			store := &heldTitleStore{SQLiteStore: db, entered: make(chan struct{}), release: make(chan struct{})}
+			guard := storeguard.New(t, db)
+			manager := session.NewManager(db, nil, nil, nil, session.NewDetector(time.Hour), 0)
+			handler, err := server.Handler(fstest.MapFS{"index.html": {Data: []byte("ok")}}, server.NewHub(), store, &server.ControlHooks{AdmitRequest: admitRequestsThrough(manager)}, "", nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			listener, err := net.Listen("tcp", "127.0.0.1:0")
+			if err != nil {
+				t.Fatal(err)
+			}
+			httpServer := &http.Server{Handler: handler, ReadHeaderTimeout: time.Second}
+			go func() { _ = httpServer.Serve(listener) }()
+			go func() {
+				request := mustRequest(t, http.MethodPatch, "http://"+listener.Addr().String()+"/api/sessions/"+id, `{"title":"set while the app stops"}`)
+				if response, err := http.DefaultClient.Do(request); err == nil {
+					_ = response.Body.Close()
+				}
+			}()
+			select {
+			case <-store.entered:
+			case <-time.After(5 * time.Second):
+				t.Fatal("control: the PATCH handler did not reach UpdateTitle")
+			}
+			const httpWait = 100 * time.Millisecond
+			hold := 10 * time.Millisecond
+			if past {
+				hold = 3 * httpWait
+			}
+			released := make(chan time.Time, 1)
+			time.AfterFunc(hold, func() {
+				released <- time.Now()
+				close(store.release)
+			})
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			stopServing(shutdownCtx, httpServer, httpWait)
+			recoverAtStart(db).stop(shutdownCtx, manager, lifecyclePublishWait)
+			stopped := time.Now()
+			if shutdownCtx.Err() != nil {
+				t.Fatal("control: the stop's shared deadline ran out")
+			}
+			guard.Close(t)
+			select {
+			case at := <-released:
+				if stopped.Before(at) {
+					t.Errorf("the stop returned %v before the handler it admitted was released", at.Sub(stopped))
+				}
+			default:
+				t.Errorf("the stop returned before the handler it admitted was released (%v after the request)", hold)
+			}
+			time.Sleep(50 * time.Millisecond)
+			guard.Check(t)
+			if got, err := db.GetSession(id); err != nil || got.Title != "set while the app stops" {
+				t.Errorf("control: the handler's write did not land before the stop returned: %q, %v", got.Title, err)
+			}
+		})
 	}
 }

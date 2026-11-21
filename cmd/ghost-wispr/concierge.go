@@ -247,14 +247,17 @@ type lazyConcierge struct {
 	answers chan voice.PendingAnswer
 
 	starting sync.Mutex // one start at a time
-	mu       sync.Mutex
-	c        *concierge.Concierge
-	stop     func()
-	fwd      chan struct{} // closed to end c's forward
-	err      error         // why the last start failed
-	gen      int           // each turn-off and the shutdown change it
-	closed   bool
-	off      bool // the voice is turned off: no call starts a Concierge
+	// turningOff counts each turn-off under way, which writes the store
+	// (VoiceOff) after it detached its Concierge: the shutdown waits for it.
+	turningOff sync.WaitGroup
+	mu         sync.Mutex
+	c          *concierge.Concierge
+	stop       func()
+	fwd        chan struct{} // closed to end c's forward
+	err        error         // why the last start failed
+	gen        int           // each turn-off and the shutdown change it
+	closed     bool
+	off        bool // the voice is turned off: no call starts a Concierge
 }
 
 var errConciergeOff = errors.New("the voice was turned off")
@@ -344,7 +347,9 @@ func (l *lazyConcierge) followEnabled(on bool) {
 // holders (VoiceOff), while the Envoy session is open; a shutdown keeps them
 // for the next start. A shutdown also waits for a start under way, which
 // writes the store as it starts (concierge.New) and then sees the shutdown
-// and stops what it started (start), so the store closes under none of it.
+// and stops what it started (start), and for a turn-off under way, which has
+// detached its Concierge and writes the store as it turns it off, so the store
+// closes under none of it.
 func (l *lazyConcierge) halt(shutdown bool) {
 	l.mu.Lock()
 	if l.closed {
@@ -356,12 +361,20 @@ func (l *lazyConcierge) halt(shutdown bool) {
 	l.gen++
 	c, stop, fwd := l.c, l.stop, l.fwd
 	l.c, l.stop, l.fwd, l.err = nil, nil, nil, nil
+	if !shutdown && c != nil {
+		// Counted under mu: a shutdown that comes after it sees it.
+		l.turningOff.Add(1)
+		defer l.turningOff.Done()
+	}
 	l.mu.Unlock()
 	if shutdown {
 		// A start under way holds starting until it has seen the shutdown
 		// and stopped what it started; no later start takes it (current).
+		// A turn-off under way was counted before closed was set, and no
+		// later one starts (closed).
 		l.starting.Lock()
 		defer l.starting.Unlock()
+		defer l.turningOff.Wait()
 	}
 	if c == nil {
 		return
