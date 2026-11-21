@@ -4,12 +4,15 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/nats-io/nats.go"
+
+	"github.com/sjawhar/ghost-wispr/internal/storage"
 )
 
 // closeRecorder records each resume point saved after Close returned: the
@@ -199,5 +202,82 @@ func TestCloseWaitsForAReconnectsRegistration(t *testing.T) {
 	time.Sleep(50 * time.Millisecond)
 	if n := registrations.Load(); n != 1 {
 		t.Errorf("%d registrations, want only the reconnect's before Close", n)
+	}
+}
+
+// TestCloseStopsWaitingAtItsDeadlineWhileAResumeWriteWaits fails if Close
+// waits past its context's end while a reconnect's registration writes the
+// resume point to the real store, whose only connection another holds: the
+// write waits for the connection and sees no cancel, and a session lock held
+// across it would keep Close from reaching its deadline check. The control
+// frees the connection first. From review 6006047326 of #132.
+func TestCloseStopsWaitingAtItsDeadlineWhileAResumeWriteWaits(t *testing.T) {
+	for _, held := range []bool{false, true} {
+		name := "control: the store's connection is free"
+		if held {
+			name = "the resume write waits for the store's connection"
+		}
+		t.Run(name, func(t *testing.T) {
+			db, err := storage.NewSQLiteStore(filepath.Join(t.TempDir(), "state.db"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = db.Close() }()
+			fake, server := newFakeListener(t)
+			fake.answer("/v1/interests/subscribe", http.StatusOK, `{"delivery":{"stream_id":"stream-B","consumer_start":9}}`)
+			session := testSession(t, server, nil, nil)
+			saved := make(chan error, 1)
+			session.cfg.SaveResume = func(point ResumePoint) error {
+				err := db.SetAppState("envoy-resume", point.StreamID)
+				saved <- err
+				return err
+			}
+			conn, err := db.DB().Conn(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = conn.Close() }()
+			waitsBefore := db.DB().Stats().WaitCount
+			session.reconnected()
+			deadline := time.Now().Add(5 * time.Second)
+			for db.DB().Stats().WaitCount == waitsBefore {
+				if time.Now().After(deadline) {
+					t.Fatal("control: the resume write did not wait for the store's connection")
+				}
+				time.Sleep(time.Millisecond)
+			}
+			if !held {
+				_ = conn.Close()
+				select {
+				case err := <-saved:
+					if err != nil {
+						t.Fatal(err)
+					}
+				case <-time.After(5 * time.Second):
+					t.Fatal("control: the resume write did not end")
+				}
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+			defer cancel()
+			<-ctx.Done() // the shutdown's earlier steps took the whole deadline
+			closed := make(chan error, 1)
+			go func() { closed <- session.Close(ctx) }()
+			select {
+			case err := <-closed:
+				if held && !errors.Is(err, context.DeadlineExceeded) {
+					t.Errorf("Close at its deadline with the resume write waiting = %v, want its context's cause", err)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("Close waited past its deadline behind the resume write")
+			}
+			if held {
+				_ = conn.Close() // the resume write gets the connection now
+				select {
+				case <-saved:
+				case <-time.After(5 * time.Second):
+					t.Fatal("the resume write did not end")
+				}
+			}
+		})
 	}
 }

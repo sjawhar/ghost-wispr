@@ -748,6 +748,9 @@ func (c *Concierge) readProjects(ctx context.Context) map[string]bool {
 		keys, err = c.records.Projects(ctx)
 		return err
 	})
+	if err != nil { // logged without c.mu: a log write can wait
+		c.logger.Warn("concierge could not read Dispatch's projects", "error", err)
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.projectsBusy = false
@@ -756,7 +759,6 @@ func (c *Concierge) readProjects(ctx context.Context) map[string]bool {
 	// A stop is no failure of Dispatch's.
 	c.projectsDown = err != nil && ctx.Err() == nil
 	if err != nil {
-		c.logger.Warn("concierge could not read Dispatch's projects", "error", err)
 		if ctx.Err() == nil {
 			// A stop is no failure: the next read may come at once.
 			c.projectsRead = c.now().Add(time.Minute - projectsFor)

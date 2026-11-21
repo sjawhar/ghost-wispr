@@ -337,6 +337,8 @@ func (c *Concierge) readFor(ctx context.Context, x *voice.Exchange, turn string,
 	}
 	c.mu.Lock()
 	var pending *read
+	searchAgain := false
+	aheadWords, held := 0, 0
 	if p := c.prefetchLocked(x); p != nil {
 		pending = p.reads[target]
 		switch {
@@ -348,17 +350,19 @@ func (c *Concierge) readFor(ctx context.Context, x *voice.Exchange, turn string,
 		case strings.HasPrefix(p.current, "search:") && strings.HasPrefix(target, "search:"):
 			// Counts only, never the words: why the answer searches again.
 			ahead := strings.Fields(strings.TrimPrefix(p.current, "search:"))
-			held := set(strings.Fields(strings.TrimPrefix(target, "search:")))
-			n := 0
+			heldWords := set(strings.Fields(strings.TrimPrefix(target, "search:")))
 			for _, word := range ahead {
-				if held[word] {
-					n++
+				if heldWords[word] {
+					held++
 				}
 			}
-			c.logger.Info("concierge searches again: the turn holds not all of the read-ahead's words", "ahead_words", len(ahead), "held", n)
+			searchAgain, aheadWords = true, len(ahead)
 		}
 	}
 	c.mu.Unlock()
+	if searchAgain { // logged without c.mu: a log write can wait
+		c.logger.Info("concierge searches again: the turn holds not all of the read-ahead's words", "ahead_words", aheadWords, "held", held)
+	}
 	if pending != nil {
 		// The answer needs the read now: a search still settling starts, and
 		// stops waiting for its full search when the answer does.

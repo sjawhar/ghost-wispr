@@ -249,7 +249,7 @@ type Session struct {
 
 	mu    sync.Mutex
 	epoch string
-	// resume is the point last saved, which a registration sends. stream,
+	// resume is the newest resume point, which a registration sends. stream,
 	// written and held are the frames behind it: the stream the relay
 	// delivers, the highest sequence answered done (or the consumer's start
 	// less one), and the sequences answered nak, which come again.
@@ -265,6 +265,11 @@ type Session struct {
 	// save the resume point where the unit keeps its state (SaveResume).
 	stopped sync.WaitGroup
 	closed  bool
+	// saveMu orders the writes of the resume point, which run without mu
+	// (flushResume); saved is the point last written, guarded by saveMu.
+	// Close takes neither.
+	saveMu sync.Mutex
+	saved  *ResumePoint
 	// heartbeatEvery and progressEvery are HeartbeatEvery and progressEvery;
 	// a test shortens them.
 	heartbeatEvery time.Duration
@@ -295,6 +300,8 @@ func newSession(listener *Listener, cfg *SessionConfig) (*Session, error) {
 	if cfg.Resume != nil && cfg.Resume.StreamID != "" {
 		resume := *cfg.Resume
 		session.resume = &resume
+		saved := resume
+		session.saved = &saved
 		session.stream, session.written = resume.StreamID, resume.Seq
 	}
 	return session, nil
@@ -487,17 +494,19 @@ func (s *Session) register(ctx context.Context) error {
 		s.logger.Warn("envoy says messages sent to this session while it was away are gone")
 	}
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	// An answer with no consumer start, an older listener's, says nothing
 	// of where this session is in the stream, so it moves nothing.
 	if answer.Delivery.ConsumerStart == 0 {
+		s.mu.Unlock()
 		return nil
 	}
 	floor := answer.Delivery.ConsumerStart - 1
 	if s.switchStream(answer.Delivery.StreamID) || floor > s.written {
 		s.written = max(s.written, floor)
-		s.save()
+		s.noteResume()
 	}
+	s.mu.Unlock()
+	s.flushResume()
 	return nil
 }
 
@@ -511,23 +520,41 @@ func (s *Session) switchStream(id string) bool {
 	return true
 }
 
-// save keeps the resume point when it changed: below the lowest frame held,
-// else the highest written. s.mu is held.
-func (s *Session) save() {
+// noteResume keeps the resume point when it changed: below the lowest frame
+// held, else the highest written. s.mu is held. It writes nothing: the
+// caller writes it with flushResume once it has released s.mu.
+func (s *Session) noteResume() {
 	point := ResumePoint{StreamID: s.stream, Seq: s.written}
 	for seq := range s.held {
 		point.Seq = min(point.Seq, seq-1)
 	}
-	if s.resume != nil && *s.resume == point {
-		return
+	if s.resume == nil || *s.resume != point {
+		s.resume = &point
 	}
-	s.resume = &point
+}
+
+// flushResume writes the session's resume point where the unit keeps its
+// state (SaveResume), unless it is the one last written. The write, which
+// can wait for the store, runs without s.mu, so neither Close nor a frame's
+// handling waits behind it; saveMu orders the writes, and each writes the
+// point as it is then, so the store ends with the newest.
+func (s *Session) flushResume() {
 	if s.cfg.SaveResume == nil {
 		return
 	}
-	if err := s.cfg.SaveResume(point); err != nil {
-		s.logger.Warn("envoy session could not save its resume point", "error", err)
+	s.saveMu.Lock()
+	defer s.saveMu.Unlock()
+	s.mu.Lock()
+	point := s.resume
+	s.mu.Unlock()
+	if point == nil || (s.saved != nil && *s.saved == *point) {
+		return
 	}
+	if err := s.cfg.SaveResume(*point); err != nil {
+		s.logger.Warn("envoy session could not save its resume point", "error", err)
+		return
+	}
+	s.saved = point
 }
 
 // handle answers one relay message: a probe done at once, a frame that does
@@ -626,11 +653,12 @@ func (s *Session) hold(streamID string, seq uint64) {
 // wrote moves the resume point past a frame the session answered done.
 func (s *Session) wrote(streamID string, seq uint64) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	s.switchStream(streamID)
 	delete(s.held, seq)
 	s.written = max(s.written, seq)
-	s.save()
+	s.noteResume()
+	s.mu.Unlock()
+	s.flushResume()
 }
 
 // SendRequest is a message to one session that asks for a reply.
