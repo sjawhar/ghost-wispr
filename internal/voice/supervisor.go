@@ -2493,7 +2493,7 @@ func (s *Supervisor) onAudible(e audio.AudibleEvent) {
 	if s.ex != nil {
 		sessionID = s.ex.x.SessionID
 	}
-	s.timing("audible", sessionID, time.Now(), "input", e.Input, "audible_mono_ns", e.At, "audible_lead_ns", e.Lead,
+	s.timing("audible", sessionID, monoclock.Now(), "input", e.Input, "audible_mono_ns", e.At, "audible_lead_ns", e.Lead,
 		"audible_err_ns", e.Err, "disruptions", e.Disruptions)
 }
 

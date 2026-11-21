@@ -3,9 +3,9 @@ package voice
 import (
 	"sync"
 	"testing"
-	"time"
 
 	"github.com/sjawhar/ghost-wispr/internal/audio"
+	"github.com/sjawhar/ghost-wispr/internal/monoclock"
 )
 
 // hearingSpeaker is the fake speaker with the audible events audio.Output
@@ -58,7 +58,7 @@ func TestTheSpeakersAudibleTimesReachTheTimingLog(t *testing.T) {
 	r := newRigWith(t, newFakeConcierge("ok"), func(cfg *SupervisorConfig, r *rig) {
 		speaker = &hearingSpeaker{fakeSpeaker: r.speaker}
 		cfg.Speaker = speaker
-		cfg.Timing = func(event, sessionID string, at time.Time, kv ...any) {
+		cfg.Timing = func(event, sessionID string, at monoclock.Stamp, kv ...any) {
 			if event == "audible" {
 				mu.Lock()
 				lines = append(lines, kv)
