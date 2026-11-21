@@ -231,9 +231,18 @@ def cut_item(item, cut):
     return None if item["due"] > cut["at"] else item
 
 
+def hold_item(item, hold):
+    """ITEM as HOLD leaves it: a stop request waits for the speech, so its sound plays on until the
+    stop's cut ends it (to HOLD's until at most), and its own end after HOLD's at (speech_end,
+    voice_spoken) does not come by itself."""
+    if item["kind"] == "sound":
+        return dict(item, end=max(item["end"], hold["until"]))
+    return None if item["due"] > hold["at"] else item
+
+
 def timeline():
-    """The timeline's items with every cut applied (cut_item)."""
-    items, cuts = [], {}
+    """The timeline's items with every hold, then every cut, applied (hold_item, cut_item)."""
+    items, cuts, holds = [], {}, {}
     for line in read("timeline.jsonl").splitlines():
         try:
             item = json.loads(line)
@@ -241,11 +250,15 @@ def timeline():
             continue
         if item["kind"] == "cut":
             cuts[item["tag"]] = item
+        elif item["kind"] == "hold":
+            holds[item["tag"]] = item
         else:
             items.append(item)
     out = []
     for item in items:
-        if item.get("tag") in cuts:
+        if item.get("tag") in holds:
+            item = hold_item(item, holds[item["tag"]])
+        if item and item.get("tag") in cuts:
             item = cut_item(item, cuts[item["tag"]])
         if item and (item["kind"] != "sound" or item["end"] > item["start"]):
             out.append(item)
@@ -430,17 +443,20 @@ def stop():
         for field, what in (("SigIgn", "ignores"), ("SigBlk", "blocks")):
             if signal_mask(pid, field) & term:
                 write("fake-error", "the service process %d %s SIGTERM\n" % (pid, what))
-        os.kill(pid, signal.SIGTERM)
         try:
+            os.kill(pid, signal.SIGTERM)
             os.kill(pid, signal.SIGCONT)
         except ProcessLookupError:
-            pass
+            pass  # it ended, and a reaping PID 1 took it, after the check
         deadline = time.time() + STOP_TIMEOUT
         while alive(pid) and time.time() < deadline:
             time.sleep(0.01)
         if alive(pid):
             log_to("stop-killed", "%d %s, %d s after SIGTERM" % (pid, process_state(pid), STOP_TIMEOUT))
-            os.kill(pid, signal.SIGKILL)
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass  # it ended, and a reaping PID 1 took it, between the check and the kill
             deadline = time.time() + 120
             while alive(pid) and time.time() < deadline:
                 time.sleep(0.01)
@@ -499,7 +515,10 @@ def service():
             size = current
             items = timeline()
         t = now_ms()
-        due = [i for i in items if i["kind"] in ("stop-request", "xrun") and i["pid"] == os.getpid() and i["due"] <= t and i["id"] not in done]
+        # late-apply: the service gets to each stop request 7 s after it is due, as a service its
+        # machine's load holds up would.
+        held = 7000 if "late-apply" in SCENARIO else 0
+        due = [i for i in items if i["kind"] in ("stop-request", "xrun") and i["pid"] == os.getpid() and i["due"] + (held if i["kind"] == "stop-request" else 0) <= t and i["id"] not in done]
         if due:
             done.add(due[0]["id"])
             (show_xrun if due[0]["kind"] == "xrun" else drop)(status, items, due[0])
@@ -579,6 +598,7 @@ def drop(status, items, request):
     drain = request["drain"]
     end = -1000 if "leak-after-quiet" in SCENARIO else drain or 5
     at = now_ms()
+    log_to("stops.log", "%d: applied the stop of %s, due at %d (%d ms late); %s" % (at, request["speech"], request["due"], at - request["due"], speech_span(items, request["speech"], at)))
     cut = dict(kind="cut", tag=request["speech"], at=at, sound_end=at + end, drain=drain > 0)
     after = [cut_item(i, cut) if i.get("tag") == cut["tag"] else i for i in items]
     replace_status(status, status_text([i for i in after if i], at))
@@ -590,6 +610,15 @@ def drop(status, items, request):
     leak = 1100 if "leak-1100" in SCENARIO else 150 if SCENARIO & {"leak-150", "leak-after-quiet"} else None
     if leak is not None:
         emit(kind="sound", start=at + leak, end=at + leak + 250, tag="leaked-word")
+
+
+def speech_span(items, tag, at):
+    """Where the speech TAG's sound stands at AT, for stops.log: its start and end, and whether it
+    was still playing."""
+    for item in items:
+        if item["kind"] == "sound" and item.get("tag") == tag:
+            return "the speech runs %d to %d, %s at %d" % (item["start"], item["end"], "still playing" if item["start"] <= at < item["end"] else "over", at)
+    return "no sound of %s" % tag
 
 
 # ---- the voice ----
@@ -614,6 +643,11 @@ def speech(tag, start, length, session="session-1", fact=None):
     emit(kind="log", due=start, tag=tag, level="INFO", msg="speaker stream", fields={"device": "plughw:CARD=J75,DEV=0", "rate": 48000, "channels": 2, "period": 10_000_000, "buffer": 40_000_000, "rewind": True})
     emit(kind="sound", start=start, end=start + length, tag=tag)
     emit(kind="timing", due=start + length, tag=tag, event="speech_end", session_id=session)
+    spoken(tag, start + length, session)
+
+
+def spoken(tag, at, session):
+    """The end of the voice's speech on /ws: voice_spoken at AT."""
     if "no-spoken" in SCENARIO:
         return
     fields = {"session_id": session}
@@ -621,7 +655,31 @@ def speech(tag, start, length, session="session-1", fact=None):
         fields["text"] = "the answer"
     if "other-session" in SCENARIO:
         fields["session_id"] = "session-2"
-    emit(kind="ws", due=start + length, tag=tag, event=dict(type="voice_spoken", **fields))
+    emit(kind="ws", due=at, tag=tag, event=dict(type="voice_spoken", **fields))
+
+
+# answer-until-clip: barge-in's answers end from the step's own clips, not from the clock, so that a
+# driver its machine holds up still plays each clip into speech. An answer lasts ANSWER_CEILING_MS at
+# most, so that a clip that never comes still ends the case; a talk-over or backchannel clip that
+# does not stop it ends it ANSWER_AFTER_CLIP_MS after the clip ends. The clip ends 300 ms after it
+# begins and the driver's stop window (stop_window_ms) runs 4 s from its start, so the answer ends
+# 2 s after that window, well inside the driver's 15 s wait (--event-timeout) for voice_spoken. An
+# answer a stop request waits for (hold_item) also plays on to ANSWER_CEILING_MS at most.
+ANSWER_CEILING_MS = 60_000
+ANSWER_AFTER_CLIP_MS = 5700
+
+
+def end_answer_after(clip_start, clip_end):
+    """End the answer playing when a clip that does not stop it began (answer-until-clip)."""
+    at = clip_end + ANSWER_AFTER_CLIP_MS
+    for item in timeline():
+        if item["kind"] == "sound" and item["tag"].startswith("speech-") and item["start"] <= clip_start < item["end"] and item["end"] > at:
+            # A cut whose sound plays out to its end (drain) at the moment it is cut: the speech's own
+            # end, then speech_end and voice_spoken at that moment.
+            emit(kind="cut", tag=item["tag"], at=at, sound_end=at, drain=True)
+            emit(kind="timing", due=at, tag=item["tag"], event="speech_end", session_id="session-1")
+            spoken(item["tag"], at, "session-1")
+            break
 
 
 def wake_heard_ms():
@@ -677,7 +735,7 @@ def react(kind, key, start, end):
             # The fact sentence follows the first one with no gap: one sound from the first frame.
             speech(tag, end + 700, 2300, fact=end + 1900)
         else:
-            length = 7000 if "long" in SCENARIO else 1500 if "short" in SCENARIO else 600
+            length = ANSWER_CEILING_MS if "answer-until-clip" in SCENARIO else 7000 if "long" in SCENARIO else 1500 if "short" in SCENARIO else 600
             speech(tag, end + 700, length)
         if "go-ahead" in SCENARIO:
             emit(kind="ws", due=end + 1500, event={"type": "voice_answer_ready", "session_id": "session-1"})
@@ -711,12 +769,16 @@ def react(kind, key, start, end):
             if "no-cancel-trace" not in SCENARIO:
                 emit(kind="log", due=end + 350, level="INFO", msg="concierge told an agent its question was cancelled", fields={"task": task, "request": "event-cancel"})
     elif kind in ("stop", "talkover", "backchannel"):
-        if kind == "talkover" and "stop-off" in SCENARIO:
-            return
-        if kind == "backchannel" and "backchannel-stops" not in SCENARIO:
+        if (kind == "talkover" and "stop-off" in SCENARIO) or (kind == "backchannel" and "backchannel-stops" not in SCENARIO):
+            # A clip the voice does not stop for: with answer-until-clip, the answer ends from it.
+            if "answer-until-clip" in SCENARIO:
+                end_answer_after(start, end)
             return
         stop_at = start + 700
-        for item in timeline():
+        items = timeline()
+        if not any(i["kind"] == "sound" and i["tag"].startswith("speech-") and i["start"] <= stop_at < i["end"] for i in items):
+            log_to("stops.log", "%d: a %s clip began at %d, and no speech plays at its stop, %d" % (now_ms(), kind, start, stop_at))
+        for item in items:
             if item["kind"] == "sound" and item["tag"].startswith("speech-") and item["start"] <= stop_at < item["end"]:
                 drain = "drain" in SCENARIO
                 reason = "talk-over" if kind != "stop" else "stop phrase"
@@ -725,6 +787,10 @@ def react(kind, key, start, end):
                     # audio's tail after it, in ms.
                     tail = 800 if drain else 50 if "tail-50" in SCENARIO else 21 if "tail-21" in SCENARIO else 0
                     emit(kind="stop-request", due=stop_at, speech=item["tag"], drain=tail, reason=reason)
+                    # The answer the request is for plays on until the service applies it, however
+                    # late: a stop on its way ends the answer, not the clock (hold_item).
+                    emit(kind="hold", tag=item["tag"], at=stop_at, until=item["start"] + ANSWER_CEILING_MS)
+                    log_to("stops.log", "%d: a %s clip began at %d; requested the stop of %s, due at %d; %s" % (now_ms(), kind, start, item["tag"], stop_at, speech_span(items, item["tag"], stop_at)))
                 else:
                     # The Output drops its queue within 5 ms; today's path drains 800 ms more.
                     emit(kind="cut", tag=item["tag"], at=stop_at, sound_end=stop_at + (800 if drain else 5), drain=drain)
@@ -811,7 +877,9 @@ def arecord(args):
         # the chime is late, and then catch up, well before the step stops the recording;
         # arecord-overrun loses 250 ms of audio for good, as an arecord overrun does, so that every
         # later sound sits 250 ms earlier in the file (and the recordings log says so for ffmpeg);
-        # arecord-dies ends the recording 1 s later.
+        # arecord-dies ends the recording 1 s later. From the start, arecord-behind keeps the file
+        # 60 ms behind for the whole recording, as a loaded machine does, so that every anchor is
+        # read 60 ms late and no later anchor makes up for it.
         aplays, lag_until, skip = read("aplays", "0"), None, 0
         while True:
             time.sleep(0.005)
@@ -823,7 +891,7 @@ def arecord(args):
                     log_to("recordings", "%s %d" % (path, begun + skip))
             if "arecord-dies" in SCENARIO and lag_until is not None and t > lag_until + 1000:
                 return 1
-            lag = 1000 if lag_until is not None and t < lag_until else 0
+            lag = (1000 if lag_until is not None and t < lag_until else 0) + (60 if "arecord-behind" in SCENARIO else 0)
             # Whole 2-byte samples at 24 kHz of the rig's clock, CLOCK times the Pi's.
             target = 2 * int((t - lag - skip - begun) * CLOCK * 24)
             if target > written:
@@ -935,6 +1003,17 @@ def journalctl(args):
             records.append(journal_record(due, "INFO", "voice timing", fields))
         elif item["kind"] == "log":
             records.append(journal_record(due, item["level"], item["msg"], item["fields"]))
+    if "late-clip" in SCENARIO:
+        # late-clip: the read that first holds an answer's first_audio returns 7 s late. The driver
+        # plays its next clip 1 s after first_audio, so it plays it 6 s late, as a driver that its
+        # machine's load holds up does. Each delay is logged in late-clip.log.
+        seen = read("late-clip-seen").split()
+        new = [i["id"] for i in timeline() if i["kind"] == "timing" and i["event"] == "first_audio" and i["due"] <= t and i["id"] not in seen]
+        if new:
+            for item_id in new:
+                log_to("late-clip-seen", item_id)
+            log_to("late-clip.log", "%d: held a read with first_audio for 7 s" % t)
+            time.sleep(7)
     sys.stdout.flush()
     helper = os.path.join(os.path.dirname(os.path.abspath(__file__)), "journal-records")
     return subprocess.run([helper], input="".join(json.dumps(record) + "\n" for record in records), text=True).returncode
@@ -1242,6 +1321,16 @@ EOF
     printf '#!/usr/bin/env bash\nexec python3 %q %s "$@"\n' "$fakepi" "$tool" >"$root/bin/$tool"
   fi
 done
+# wc as a loaded machine runs it: with slow-wc, the size it prints is 200 ms old by the time it
+# exits, as a fork that waits for a CPU leaves it. The recording's anchors must not read their size
+# with it, or each would be 200 ms late.
+real_wc=$(type -P wc)
+cat >"$root/bin/wc" <<EOF
+#!/usr/bin/env bash
+out=\$($(printf '%q' "$real_wc") "\$@") || exit
+[[ \${GW_FAKE_SCENARIO:-} == *slow-wc* ]] && sleep 0.2
+printf '%s\n' "\$out"
+EOF
 # sudo as the Pi's ghost-wispr user has it: -n runs the command as root with no password. Unlike
 # sudo, it keeps the environment, which holds each fake command's state.
 cat >"$root/bin/sudo" <<'EOF'
@@ -1381,10 +1470,14 @@ row = sqlite3.connect(sys.argv[1]).execute("SELECT value FROM app_state WHERE ke
 print("missing" if row is None else row[0])' "$1/ghost-wispr.db"
 }
 
+# expect_rc NAME STATUS: the case's driver exited with STATUS. When it did not, the message also
+# gives the fake's stops.log, each stop request and apply with the speech's own times, so that a
+# timing verdict that went wrong shows when each happened.
 expect_rc() {
-  local got
+  local got stops=
   got=$(cat "$root/$1/rc" 2>/dev/null)
-  [[ $got == "$2" ]] || check_failed "$1: exit status ${got:-none}, want $2; output: $(tr '\n' '|' <"$root/$1/out")"
+  [[ -s $root/$1/state/stops.log ]] && stops=" the fake's stops: $(tr '\n' '|' <"$root/$1/state/stops.log");"
+  [[ $got == "$2" ]] || check_failed "$1: exit status ${got:-none}, want $2;$stops output: $(tr '\n' '|' <"$root/$1/out")"
 }
 
 expect_line() {
@@ -1546,13 +1639,18 @@ launch ask-no-trace no-cancel-trace '' -- $ask_args
 launch ask-journal-error journal-error-after-answer_ready '' -- $ask_args
 
 # barge-in: a pass; the stop rule off (the negative control); answers too short to count; a
-# backchannel that stops speech.
-launch barge long yes -- --step barge-in --talkovers 2 --backchannels 2 --question @question.wav --talkover-dir @talkovers --backchannel-dir @backchannels --rig-mic "$rig" --event-timeout 15
-launch barge-off long,stop-off yes -- --step barge-in --talkovers 1 --backchannels 0 --question @question.wav --talkover-dir @talkovers --backchannel-dir @backchannels --rig-mic "$rig" --event-timeout 15
+# backchannel that stops speech. Each answer but barge-short's ends from the step's clips
+# (answer-until-clip), so a driver that plays a clip late still plays it into speech.
+launch barge answer-until-clip yes -- --step barge-in --talkovers 2 --backchannels 2 --question @question.wav --talkover-dir @talkovers --backchannel-dir @backchannels --rig-mic "$rig" --event-timeout 15
+launch barge-off answer-until-clip,stop-off yes -- --step barge-in --talkovers 1 --backchannels 0 --question @question.wav --talkover-dir @talkovers --backchannel-dir @backchannels --rig-mic "$rig" --event-timeout 15
 launch barge-short short yes -- --step barge-in --talkovers 1 --backchannels 0 --question @question.wav --talkover-dir @talkovers --backchannel-dir @backchannels --rig-mic "$rig" --event-timeout 15
-launch barge-backchannel long,backchannel-stops yes -- --step barge-in --talkovers 1 --backchannels 1 --question @question.wav --talkover-dir @talkovers --backchannel-dir @backchannels --rig-mic "$rig" --event-timeout 15
+launch barge-backchannel answer-until-clip,backchannel-stops yes -- --step barge-in --talkovers 1 --backchannels 1 --question @question.wav --talkover-dir @talkovers --backchannel-dir @backchannels --rig-mic "$rig" --event-timeout 15
 # A journal that cannot be read once the voice stops: UNKNOWN, not a talk-over with no stop.
-launch barge-journal-error long,journal-error-after-stop yes -- --step barge-in --talkovers 1 --backchannels 0 --question @question.wav --talkover-dir @talkovers --backchannel-dir @backchannels --rig-mic "$rig" --event-timeout 15
+launch barge-journal-error answer-until-clip,journal-error-after-stop yes -- --step barge-in --talkovers 1 --backchannels 0 --question @question.wav --talkover-dir @talkovers --backchannel-dir @backchannels --rig-mic "$rig" --event-timeout 15
+# The same pass and backchannel stop with every clip played 6 s late (late-clip): the verdicts must
+# not change.
+launch barge-late answer-until-clip,late-clip yes -- --step barge-in --talkovers 2 --backchannels 2 --question @question.wav --talkover-dir @talkovers --backchannel-dir @backchannels --rig-mic "$rig" --event-timeout 15
+launch barge-backchannel-late answer-until-clip,backchannel-stops,late-clip yes -- --step barge-in --talkovers 1 --backchannels 1 --question @question.wav --talkover-dir @talkovers --backchannel-dir @backchannels --rig-mic "$rig" --event-timeout 15
 
 # playback-cancel, timed by the end of the cancelled speech at the rig microphone: a pass; a correct
 # cancel that keeps the stream running with 80 ms of silence queued, which must pass; a status that
@@ -1619,8 +1717,24 @@ launch cancel-drain long,asound,drain yes -- $cancel_args
 launch cancel-underrun long,asound,underrun yes -- $cancel_args
 # shellcheck disable=SC2086
 launch cancel-xrun long,asound,xrun yes -- $cancel_args
+# A recorder that writes 60 ms behind for the whole recording: a good cancel, whose true tail is
+# within the bound but whose measured tail is not, is UNKNOWN, not FAIL; a drain, whose tail is over
+# even at its early bound, is FAIL.
+# shellcheck disable=SC2086
+launch cancel-behind long,asound,arecord-behind yes -- $cancel_args
+# shellcheck disable=SC2086
+launch cancel-behind-drain long,asound,arecord-behind,drain yes -- $cancel_args
+# A wc whose sizes come 200 ms late: the recording's anchors read their size without it, so a good
+# cancel still passes.
+# shellcheck disable=SC2086
+launch cancel-slow-wc long,asound,slow-wc yes -- $cancel_args
 # shellcheck disable=SC2086
 launch cancel-journal-error long,asound,late-journal-error yes -- $cancel_args
+# A service that gets to each stop request 7 s after it is due (late-apply), as a loaded machine can
+# hold it: the stop comes 0.9 to 3.2 s into a 7 s answer, so the apply lands after the answer's
+# natural end. A good cancel still passes, since an answer with a stop waiting does not end by itself.
+# shellcheck disable=SC2086
+launch cancel-late-apply long,asound,late-apply yes -- $cancel_args
 
 # tts-first-audio: a pass with the gemini-clip control; a control too close to tell (the negative
 # control); Aura without mip_opt_out; a build without the subcommand.
@@ -2056,6 +2170,24 @@ expect_rc barge-journal-error 2
 expect_line barge-journal-error 'UNKNOWN: voice timing log: cannot read the journal of ghost-wispr.service (process '
 expect_line barge-journal-error ': Failed to read journal: Input/output error'
 expect_restored barge-journal-error
+# Every clip 6 s late (late-clip): the verdicts of barge and barge-backchannel, each round counted.
+# expect_held NAME N: late-clip.log shows that the fake held up the clip of each of NAME's N rounds.
+expect_held() {
+  local held
+  held=$(cat "$root/$1/state/late-clip.log" 2>/dev/null | grep -c .)
+  [[ $held == "$2" ]] || check_failed "$1: the fake held up the clips of $held of the $2 rounds"
+}
+expect_rc barge-late 0
+expect_line barge-late 'PASS: barge-in: 0 of 2 backchannels stopped the speech, at most 0'
+expect_line barge-late 'NOTE: barge-in round 2 (backchannel): the speech went on'
+expect_no_line barge-late 'not counted'
+expect_held barge-late 4
+expect_restored barge-late
+expect_rc barge-backchannel-late 1
+expect_line barge-backchannel-late 'FAIL: barge-in: 1 of 1 backchannels stopped the speech, more than 0'
+expect_no_line barge-backchannel-late 'not counted'
+expect_held barge-backchannel-late 2
+expect_restored barge-backchannel-late
 
 # playback-cancel.
 expect_rc cancel 0
@@ -2077,12 +2209,41 @@ expect_restored cancel-slow-status
 heard_after() {
   sed -n "s/^FAIL: playback-cancel: a stop's speech was heard at the rig microphone \([0-9]*\) ms after it.*/\1/p" "$root/$1/out"
 }
+# heard_up_to NAME: the milliseconds an UNKNOWN line says a stop's speech was heard up to after it.
+heard_up_to() {
+  sed -n "s/^UNKNOWN: playback-cancel: stop [0-9]*'s speech was heard at the rig microphone up to \([0-9]*\) ms after it.*/\1/p" "$root/$1/out"
+}
+# expect_not_passed NAME LOW HIGH: a tail over the bound whose early bound may or may not be over
+# it, by how late the recording's anchors were read: FAIL or UNKNOWN, never PASS, and the tail it
+# names, late bound, between LOW and HIGH.
+expect_not_passed() {
+  local got
+  got=$(cat "$root/$1/rc" 2>/dev/null)
+  case $got in
+    1) expect_between "$1: how long the tail is heard (FAIL)" "$(heard_after "$1")" "$2" "$3" ;;
+    2) expect_between "$1: how long the tail is heard up to (UNKNOWN)" "$(heard_up_to "$1")" "$2" "$3" ;;
+    *) check_failed "$1: exit status ${got:-none}, want 1 or 2; output: $(tr '\n' '|' <"$root/$1/out")" ;;
+  esac
+  expect_no_line "$1" "PASS: playback-cancel: no stop's speech was heard"
+}
+expect_rc cancel-behind 2
+expect_line cancel-behind "UNKNOWN: playback-cancel: stop "
+expect_line cancel-behind ", but no earlier than "
+expect_between 'cancel-behind: how long the good cancel is heard up to, 60 ms behind' "$(heard_up_to cancel-behind)" 60 120
+expect_line cancel-behind 'PASS: playback-cancel: 0 underruns'
+expect_no_line cancel-behind "FAIL: playback-cancel: a stop's speech was heard"
+expect_restored cancel-behind
+expect_rc cancel-behind-drain 1
+expect_between 'cancel-behind-drain: how long the negative control is heard, 60 ms behind' "$(heard_after cancel-behind-drain)" 450 1000
+expect_restored cancel-behind-drain
+expect_rc cancel-slow-wc 0
+expect_line cancel-slow-wc "PASS: playback-cancel: no stop's speech was heard at the rig microphone 20 ms after it"
+expect_restored cancel-slow-wc
 expect_rc cancel-drain 1
 expect_line cancel-drain "FAIL: playback-cancel: a stop's speech was heard at the rig microphone "
 expect_between 'cancel-drain: how long the negative control is heard' "$(heard_after cancel-drain)" 400 900
 expect_restored cancel-drain
-expect_rc cancel-tail 1
-expect_between 'cancel-tail: how long the 50 ms tail is heard' "$(heard_after cancel-tail)" 30 120
+expect_not_passed cancel-tail 30 120
 expect_restored cancel-tail
 expect_rc cancel-leak 1
 expect_between 'cancel-leak: how long the leaked word is heard' "$(heard_after cancel-leak)" 150 500
@@ -2135,8 +2296,11 @@ expect_rc cancel-clock-fast 0
 expect_restored cancel-clock-fast
 expect_rc cancel-clock-slow 0
 expect_restored cancel-clock-slow
-expect_rc cancel-tail-21-fast 1
-expect_between 'cancel-tail-21-fast: how long a 21 ms tail is heard with the rig clock 200 ppm fast' "$(heard_after cancel-tail-21-fast)" 21 40
+# A 21 ms tail with the rig clock 200 ppm fast: over the bound at its late bound, and never over it
+# at its early bound, which is early by at least the time arecord took to start.
+expect_rc cancel-tail-21-fast 2
+expect_between 'cancel-tail-21-fast: how long a 21 ms tail is heard up to with the rig clock 200 ppm fast' "$(heard_up_to cancel-tail-21-fast)" 21 40
+expect_no_line cancel-tail-21-fast "PASS: playback-cancel: no stop's speech was heard"
 expect_restored cancel-tail-21-fast
 expect_rc cancel-recorder-dies 2
 expect_line cancel-recorder-dies 'UNKNOWN: recording: arecord stopped before the step ended it'
@@ -2157,6 +2321,18 @@ expect_rc cancel-journal-error 2
 expect_line cancel-journal-error 'UNKNOWN: playback-cancel: cannot read the speaker underrun lines from the journal: Failed to read journal: Input/output error'
 expect_no_line cancel-journal-error 'PASS: playback-cancel: 0 underruns'
 expect_restored cancel-journal-error
+# expect_applied_late NAME N: stops.log shows N stops applied at least 7 s after they were due.
+expect_applied_late() {
+  local late
+  late=$(sed -n 's/.*applied the stop of .*, due at [0-9]* (\([0-9]*\) ms late).*/\1/p' "$root/$1/state/stops.log" 2>/dev/null | awk '$1 >= 7000' | grep -c .)
+  [[ $late == "$2" ]] || check_failed "$1: the fake applied $late of the $2 stops at least 7 s late"
+}
+expect_rc cancel-late-apply 0
+expect_line cancel-late-apply "PASS: playback-cancel: no stop's speech was heard at the rig microphone 20 ms after it"
+expect_line cancel-late-apply 'NOTE: playback-cancel: the speaker logged 2 cancels: 0 by rewind, 2 by drop'
+expect_line cancel-late-apply 'PASS: playback-cancel: 0 underruns over '
+expect_applied_late cancel-late-apply 2
+expect_restored cancel-late-apply
 
 # tts-first-audio.
 expect_rc first-audio 0
