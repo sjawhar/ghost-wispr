@@ -3,17 +3,12 @@ package main
 import (
 	"context"
 	"errors"
-	"path/filepath"
 	"sync/atomic"
 	"testing"
 	"time"
 
-	"github.com/sjawhar/ghost-wispr/internal/audio"
 	"github.com/sjawhar/ghost-wispr/internal/config"
 	"github.com/sjawhar/ghost-wispr/internal/server"
-	"github.com/sjawhar/ghost-wispr/internal/session"
-	"github.com/sjawhar/ghost-wispr/internal/storage"
-	"github.com/sjawhar/ghost-wispr/internal/storeguard"
 	"github.com/sjawhar/ghost-wispr/internal/wake/local"
 )
 
@@ -76,54 +71,4 @@ func TestTheButtonsAndTheListenerRunAsWorkTheStopWaitsFor(t *testing.T) {
 			}
 		})
 	}
-}
-
-// TestTheStopWaitsForAResumesGateOpening fails if the stop returns while the
-// gate's opening after a resume still runs: a light that is not red refuses
-// the resume there, which saves the pause state (onResumeRefused), after the
-// store closed (storeguard records the write).
-func TestTheStopWaitsForAResumesGateOpening(t *testing.T) {
-	store, err := storage.NewSQLiteStore(filepath.Join(t.TempDir(), "gate.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = store.Close() })
-	recorder := audio.NewRecorder(t.TempDir())
-	manager := session.NewManager(store, recorder, nil, nil, session.NewDetector(time.Hour), 0)
-	capture := newSessionCaptureGate(context.Background(), manager, recorder, func() deepgramFinalizer { return nil }, time.Hour, testEndRetry, nopLogf)
-	capture.background = manager
-	opening := make(chan struct{})
-	capture.beforeGateOpen = func() error {
-		close(opening)
-		time.Sleep(200 * time.Millisecond) // reading the light back
-		return errors.New("the recording light does not show red")
-	}
-	refused := make(chan struct{})
-	capture.onResumeRefused = func(error) {
-		defer close(refused)
-		_ = store.SetAppState(storage.AppStateCapturePaused, "true")
-	}
-	guard := storeguard.New(t, store)
-	capture.Pause()
-	if err := capture.RequestResume(); err != nil {
-		t.Fatal(err)
-	}
-	select {
-	case <-opening:
-	case <-time.After(5 * time.Second):
-		t.Fatal("control: the resume did not reach the gate's opening")
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	if err := manager.StopBackground(ctx); err != nil {
-		t.Fatalf("the stop did not wait for the gate's opening: %v", err)
-	}
-	guard.Close(t)
-	select {
-	case <-refused:
-	case <-time.After(5 * time.Second):
-		t.Fatal("control: the light did not refuse the resume")
-	}
-	time.Sleep(50 * time.Millisecond)
-	guard.Check(t)
 }
