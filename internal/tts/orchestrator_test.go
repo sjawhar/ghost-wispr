@@ -521,3 +521,78 @@ func TestOrchestratorSpeechStopsOnACancelOfTheVoice(t *testing.T) {
 		}
 	}
 }
+
+// heldDropStream holds the mixer's second write until release closes, having
+// closed entered, and gives back back frames on a Drop.
+type heldDropStream struct {
+	mockOutputStream
+	writes           int // only the mixer touches it
+	entered, release chan struct{}
+	back             int
+}
+
+func (s *heldDropStream) Write([]int16) error {
+	if s.writes++; s.writes == 2 {
+		close(s.entered)
+		<-s.release
+	}
+	return nil
+}
+
+func (s *heldDropStream) Drop() (int, error) { return s.back, nil }
+
+// TestOrchestratorReportsWhatPlayedOfASpeechCancelledInItsWrite fails if a
+// speech longer than the voice input queues, cancelled while its write
+// waits for room, reports what played before the Cancel's take-back was
+// counted: 20 ms reported, though the device gave both frames back unheard
+// (Sol's review of #153 at 4b9830e). The control's Drop gives nothing back,
+// and the 20 ms played stay.
+func TestOrchestratorReportsWhatPlayedOfASpeechCancelledInItsWrite(t *testing.T) {
+	for _, tc := range []struct{ back, wantMs int }{{0, 20}, {960, 0}} {
+		t.Run(fmt.Sprintf("the drop gives back %d frames", tc.back), func(t *testing.T) {
+			pcm := make([]byte, 2*48000*4/10) // 400 ms at 48 kHz, more than the input queues
+			for i := 0; i < len(pcm); i += 2 {
+				pcm[i], pcm[i+1] = 0xE8, 0x03 // 1000
+			}
+			provider := &mockProvider{audio: pcm, format: audio.AudioFormat{SampleRate: 48000, Channels: 1, Encoding: audio.EncodingPCM16}}
+			stream := &heldDropStream{entered: make(chan struct{}), release: make(chan struct{}), back: tc.back}
+			released := false
+			release := func() {
+				if !released {
+					released = true
+					close(stream.release)
+				}
+			}
+			t.Cleanup(release)
+			out := newOutputOn(t, stream)
+			o := NewOrchestrator(provider, out, OrchestratorOpts{MaxRequestsPerMin: 100})
+			defer o.Stop()
+			id, err := o.Speak("a long answer", "", "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case <-stream.entered:
+			case <-time.After(3 * time.Second):
+				t.Fatal("the mixer never reached its second write")
+			}
+			out.Cancel(audio.InputVoice)
+			time.Sleep(100 * time.Millisecond) // a play that does not wait reads Played now
+			release()
+			deadline := time.Now().Add(3 * time.Second)
+			for {
+				status, _ := o.Status(id)
+				if status.Status == StatusCompleted {
+					if status.DurationMs != int64(tc.wantMs) || status.BytesWritten != int64(tc.wantMs*48*2) {
+						t.Fatalf("the cancelled speech reports %d ms, %d bytes played, want %d ms, %d bytes", status.DurationMs, status.BytesWritten, tc.wantMs, tc.wantMs*48*2)
+					}
+					return
+				}
+				if status.Status == StatusFailed || time.Now().After(deadline) {
+					t.Fatalf("status after Cancel of the voice = %s (%s), want completed", status.Status, status.Error)
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+		})
+	}
+}

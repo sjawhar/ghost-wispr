@@ -215,8 +215,9 @@ type outputInput struct {
 	pushes uint64
 
 	speaking  bool
-	cancelled bool // Cancel silenced its speech: the mixer takes it back and ends it
-	cut       bool // Cancel dropped audio of the speech still queued
+	cancelled bool       // Cancel silenced its speech: the mixer takes it back and ends it
+	unsettled []*playGen // the generations Cancel ended in that speech, settling until it ends (endSpeech)
+	cut       bool       // Cancel dropped audio of the speech still queued
 	lastAudio time.Time
 	quietAt   time.Time // when it ran out of audio; zero while it has some
 	spoken    playedTime
@@ -292,8 +293,13 @@ type Playback struct {
 // playGen is how the playbacks begun on an input since its last end ended:
 // err is nil until Cancel (ErrCancelled), a stream failure or Close
 // (ErrOutputClosed) ends them all. An input that ends starts a new one, so it
-// keeps no list of its playbacks.
-type playGen struct{ err error }
+// keeps no list of its playbacks. settling is set while a Cancel that ended
+// it during a speech waits for the mixer to take it in, which takes off what
+// the device gives back unheard (endSpeech): their Drain waits until then.
+type playGen struct {
+	err      error
+	settling bool
+}
 
 // playedTime adds up audio from its sample count at each rate, exactly.
 type playedTime struct {
@@ -461,7 +467,7 @@ func (p *Playback) Drain(ctx context.Context) error {
 	defer o.mu.Unlock()
 	for {
 		if err := p.gen.err; err != nil {
-			if !in.cancelled || !errors.Is(err, ErrCancelled) {
+			if !p.gen.settling {
 				return err
 			}
 		} else if p.pending == 0 && (in.last != p || in.idle()) && o.written >= p.seq {
@@ -522,11 +528,13 @@ func (o *Output) Cancel(input string) {
 		return
 	}
 	cut := !in.idle()
+	gen := in.gen
 	in.end(ErrCancelled)
 	if in.speaking {
 		// A second Cancel before the mixer takes the first in finds nothing
 		// queued: it keeps the first one's cut.
 		in.cancelled, in.cut = true, in.cut || cut
+		gen.settling, in.unsettled = true, append(in.unsettled, gen)
 		o.dropNow = true
 	}
 	o.changed()
@@ -1285,6 +1293,17 @@ func (o *Output) endSpeech(in *outputInput, now time.Time, cancelled bool) {
 	}
 	o.emit(SpeechEvent{Input: in.name, At: at, Played: in.spoken.total(), Cancelled: cancelled})
 	in.speaking, in.cancelled, in.cut, in.spoken, in.quietAt = false, false, false, playedTime{}, time.Time{}
+	if len(in.unsettled) > 0 {
+		// The Cancels are taken in, or the stream is gone: their Drains
+		// return, whatever ended the speech (retake, an idle close, a
+		// failure, Close).
+		for _, g := range in.unsettled {
+			g.settling = false
+		}
+		clear(in.unsettled)
+		in.unsettled = in.unsettled[:0]
+		o.changed()
+	}
 }
 
 func clip(s float32) int16 {
