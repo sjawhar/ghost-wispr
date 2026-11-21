@@ -517,12 +517,15 @@ to `speaker-underrun-<time>.trace` there, at most once every 10 seconds. A captu
 keeps the newest 20 captures that fit 128 MiB together; the log says `speaker trace: saved the
 capture of an underrun`.
 `/opt/ghost-wispr/ghost-wispr speaker-trace FILE` prints each turn of the mixer longer than 40 ms
-in the capture (`-slow` changes the bound), longest first, with what it spent the time on: running,
-runnable (Go had no processor free), in a system call (ALSA's write), or waiting on the pacer's
-sleep, the garbage collector, the speaker's lock (naming the goroutine that held it) or something
-else, and how long the Go runtime stopped the world and the collector marked during the turn.
-"Running" covers both computing and a thread Linux took off its processor, which a Go trace cannot
-tell apart.
+in the capture (`-slow` changes the bound), longest first, with its start and end on the wall
+clock in UTC, from the capture's own clock snapshot, as `journalctl --utc -o short-iso-precise`
+prints the journal's lines, and with what it spent the time on: running, runnable (Go had no
+processor free), in a system call (ALSA's write), or waiting on the pacer's sleep, the garbage
+collector, the speaker's lock (naming the goroutine that held it) or something else, and how long
+the Go runtime stopped the world and the collector marked during the turn. The time it also gives
+into the capture counts from the capture's first event, not from the process's start. "Running"
+covers both computing and a thread Linux took off its processor, which a Go trace cannot tell
+apart.
 Remove the setting once the captures are taken: the trace costs CPU and memory while it runs.
 
 The microphone is never open while the blink(1) is off: the blink(1) stays red while the microphone

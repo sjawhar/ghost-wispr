@@ -31,9 +31,16 @@ const (
 
 // Cycle is one slow turn of the mixer.
 type Cycle struct {
-	// Start and End are the trace times, from the trace's first event, of
-	// the write that ended before the cycle and the one that ended it.
+	// Start and End are the trace times of the write that ended before the
+	// cycle and the one that ended it, counted from the capture's first
+	// retained event: not from the process's start, so they cannot be added
+	// to it.
 	Start, End time.Duration
+	// StartWall and EndWall are those times on the wall clock, from the
+	// clock snapshot the trace keeps beside its own clock (trace.Sync's
+	// ClockSnapshot, latest before the time): what the journal's timestamps
+	// can be matched against. They are zero for a trace without a snapshot.
+	StartWall, EndWall time.Time
 	// Spent is the cycle's time by what the mixer's goroutine did: its state
 	// ("running", "runnable", "syscall", or "waiting (reason)"), with " in
 	// REGION" while inside one of the speaker's regions. The reason is
@@ -205,6 +212,7 @@ func Read(r io.Reader, slow time.Duration) ([]Cycle, error) {
 	var first trace.Time
 	var cycles []Cycle
 	var stopped, marking spans
+	var clock wallClock
 	writes := 0
 	var now time.Duration
 	for {
@@ -220,6 +228,10 @@ func Read(r io.Reader, slow time.Duration) ([]Cycle, error) {
 		}
 		now = time.Duration(ev.Time() - first)
 		switch ev.Kind() {
+		case trace.EventSync:
+			if snap := ev.Sync().ClockSnapshot; snap != nil {
+				clock = wallClock{at: time.Duration(snap.Trace - first), wall: snap.Wall, known: true}
+			}
 		case trace.EventStateTransition:
 			st := ev.StateTransition()
 			if st.Resource.Kind != trace.ResourceGoroutine {
@@ -274,12 +286,12 @@ func Read(r io.Reader, slow time.Duration) ([]Cycle, error) {
 			}
 			writes++
 			if c := g.cycle; c != nil {
-				c.End = now
+				c.End, c.EndWall = now, clock.of(now)
 				if c.Length() > slow {
 					cycles = append(cycles, *c)
 				}
 			}
-			g.cycle = &Cycle{Start: now, Spent: map[string]time.Duration{}}
+			g.cycle = &Cycle{Start: now, StartWall: clock.of(now), Spent: map[string]time.Duration{}}
 		}
 	}
 	if writes == 0 {
@@ -293,6 +305,23 @@ func Read(r io.Reader, slow time.Duration) ([]Cycle, error) {
 	}
 	slices.SortFunc(cycles, func(a, b Cycle) int { return cmp.Compare(a.Start, b.Start) })
 	return cycles, nil
+}
+
+// wallClock maps the capture's trace times to the wall clock, from a clock
+// snapshot the trace keeps: at is the snapshot's trace time, counted from the
+// capture's first event, and wall the wall clock then.
+type wallClock struct {
+	at    time.Duration
+	wall  time.Time
+	known bool
+}
+
+// of is trace time t on the wall clock, or the zero time with no snapshot.
+func (c wallClock) of(t time.Duration) time.Time {
+	if !c.known {
+		return time.Time{}
+	}
+	return c.wall.Add(t - c.at)
 }
 
 // spans are the stretches of one of the runtime's ranges: the world stopped,

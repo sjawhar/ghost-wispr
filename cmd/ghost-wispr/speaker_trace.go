@@ -14,8 +14,12 @@ import (
 // runSpeakerTraceCommand is `ghost-wispr speaker-trace [-slow D] FILE...`: for
 // each capture the speaker trace saved on an underrun (speaker_trace_dir), it
 // prints the mixer's cycles slower than -slow and what kept the mixer from the
-// device in each, longest first. It exits 1 when a file cannot be read, and 2
-// when a capture holds no slow cycle, which shows nothing.
+// device in each, longest first. Each cycle's start and end are given on the
+// wall clock, in UTC with microseconds, as `journalctl --utc -o
+// short-iso-precise` prints, from the capture's own clock snapshot, and also
+// as time into the capture, which is not time since the process started. It
+// exits 1 when a file cannot be read, and 2 when a capture holds no slow
+// cycle, which shows nothing.
 func runSpeakerTraceCommand(args []string, stdout, stderr io.Writer) int {
 	flags := flag.NewFlagSet("speaker-trace", flag.ContinueOnError)
 	flags.SetOutput(stderr)
@@ -49,7 +53,7 @@ func runSpeakerTraceCommand(args []string, stdout, stderr io.Writer) int {
 		slices.SortStableFunc(cycles, func(a, b speakertrace.Cycle) int { return int(b.Length() - a.Length()) })
 		for i := range cycles {
 			c := &cycles[i]
-			_, _ = fmt.Fprintf(stdout, "  at %v, %v: %s\n", c.Start.Round(time.Millisecond), c.Length().Round(100*time.Microsecond), c.Classify())
+			_, _ = fmt.Fprintf(stdout, "  %s, %v: %s\n", cycleTimes(c), c.Length().Round(100*time.Microsecond), c.Classify())
 			buckets := make([]string, 0, len(c.Spent))
 			for b := range c.Spent {
 				buckets = append(buckets, b)
@@ -61,4 +65,18 @@ func runSpeakerTraceCommand(args []string, stdout, stderr io.Writer) int {
 		}
 	}
 	return code
+}
+
+// wallLayout is how the command prints a wall-clock time: UTC, to the
+// microsecond, as `journalctl --utc -o short-iso-precise` does.
+const wallLayout = "2006-01-02T15:04:05.000000Z07:00"
+
+// cycleTimes is a cycle's start and end on the wall clock, and its start into
+// the capture; a capture without a clock snapshot gives the latter only.
+func cycleTimes(c *speakertrace.Cycle) string {
+	into := fmt.Sprintf("%v into the capture", c.Start.Round(time.Millisecond))
+	if c.StartWall.IsZero() {
+		return "at " + into + " (no wall-clock time in this capture)"
+	}
+	return fmt.Sprintf("from %s to %s (%s)", c.StartWall.UTC().Format(wallLayout), c.EndWall.UTC().Format(wallLayout), into)
 }
