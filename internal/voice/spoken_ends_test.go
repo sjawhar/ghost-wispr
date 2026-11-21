@@ -155,43 +155,93 @@ var spokenEnds = map[string]afterSpeech{
 }
 
 // heldReports holds the speaker's report that a speech on the voice input
-// ended by itself (not cancelled) until release, as the speaker's callbacks,
-// delivered on a goroutine of their own, can come after the exchange has
-// moved on. Every other report passes at once.
+// ended by itself (not cancelled) until release, and every report after it,
+// in order, as the speaker's callbacks, delivered on a goroutine of their
+// own, can come after the exchange has moved on. It queues them, so whatever
+// emits a report (a Cancel the Supervisor makes under its lock) never waits;
+// release delivers them in order. Reports before the held one pass at once.
 type heldReports struct {
 	*fakeSpeaker
-	held, released, delivered chan struct{}
-	release                   func()
-	// first is the first report a speech ended by itself: the one held.
-	first          sync.Once
-	heldOnce, done sync.Once
+	// held closes when the first report a voice speech ended by itself comes
+	// before release, and is held; delivered, once that report, held or not,
+	// has been delivered.
+	held, delivered chan struct{}
+	deliveredOnce   sync.Once
+
+	mu       sync.Mutex
+	holding  bool // the held report came; release has not delivered the queue
+	released bool
+	queue    []heldReport
+}
+
+// heldReport is one report heldReports keeps, for the callback it is for.
+type heldReport struct {
+	fn func(audio.SpeechEvent)
+	e  audio.SpeechEvent
 }
 
 // holdReports makes r's speaker hold its next report that a voice speech
 // ended by itself, in a newRigWith configuration.
 func holdReports(t *testing.T, cfg *SupervisorConfig, r *rig) *heldReports {
-	h := &heldReports{fakeSpeaker: r.speaker, held: make(chan struct{}), released: make(chan struct{}), delivered: make(chan struct{})}
-	h.release = sync.OnceFunc(func() { close(h.released) })
+	h := &heldReports{fakeSpeaker: r.speaker, held: make(chan struct{}), delivered: make(chan struct{})}
 	t.Cleanup(h.release)
 	cfg.Speaker = h
 	return h
 }
 
+// endedByItself reports whether e is a voice speech's end that no cancel cut.
+func endedByItself(e audio.SpeechEvent) bool {
+	return e.Input == audio.InputVoice && !e.Started && !e.Cancelled
+}
+
+// deliver runs fn on e, and marks delivered once a speech ended by itself has
+// been.
+func (h *heldReports) deliver(fn func(audio.SpeechEvent), e audio.SpeechEvent) {
+	fn(e)
+	if endedByItself(e) {
+		h.deliveredOnce.Do(func() { close(h.delivered) })
+	}
+}
+
 func (h *heldReports) OnSpeech(fn func(audio.SpeechEvent)) func() {
 	return h.fakeSpeaker.OnSpeech(func(e audio.SpeechEvent) {
-		if e.Input == audio.InputVoice && !e.Started && !e.Cancelled {
-			isFirst := false
-			h.first.Do(func() { isFirst = true })
-			if isFirst {
-				h.heldOnce.Do(func() { close(h.held) })
-				<-h.released
-				fn(e)
-				h.done.Do(func() { close(h.delivered) })
-				return
-			}
+		h.mu.Lock()
+		switch {
+		case h.holding:
+			h.queue = append(h.queue, heldReport{fn: fn, e: e})
+			h.mu.Unlock()
+			return
+		case !h.released && endedByItself(e):
+			h.holding = true
+			h.queue = append(h.queue, heldReport{fn: fn, e: e})
+			h.mu.Unlock()
+			close(h.held)
+			return
 		}
-		fn(e)
+		h.mu.Unlock()
+		h.deliver(fn, e)
 	})
+}
+
+// release delivers the held report and the reports queued behind it, in
+// order, and lets every later report pass at once. A report that comes while
+// it delivers is queued behind the rest.
+func (h *heldReports) release() {
+	h.mu.Lock()
+	if h.released {
+		h.mu.Unlock()
+		return
+	}
+	h.released = true
+	for len(h.queue) > 0 {
+		q := h.queue[0]
+		h.queue = h.queue[1:]
+		h.mu.Unlock()
+		h.deliver(q.fn, q.e)
+		h.mu.Lock()
+	}
+	h.holding = false
+	h.mu.Unlock()
 }
 
 // waitFor fails t unless ch closes within testWait.
