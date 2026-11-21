@@ -981,14 +981,18 @@ with the unit paused and no session active:
    recur after a reboot. The underrun check reports UNKNOWN if its journal read fails. The windows
    and thresholds of the rig steps are not yet calibrated: the first run on the Pi calibrates them.
    `playback-cancel` times each stop's tail from the rig recording twice: never early, from the
-   anchors that tie the file to the Pi's clock, and never late, from when arecord started. It
-   passes when the late time is within 20 ms, fails when even the early time is over, and otherwise
-   reports UNKNOWN with how late the recording's times may be, since a loaded Pi reads its anchors
-   late. The early time is early by the time arecord took to start and by up to 400 ppm of the time
-   into the recording, so a tail a few tens of milliseconds over the bound can be UNKNOWN. `joined`
-   times the onset of the agent's words at the rig the same way: it passes when even the early time
-   is at or after the end of the go-ahead and the late time is before `voice_spoken`, fails when no
-   sound longer than the wake sound can start between them, and otherwise reports UNKNOWN.
+   anchors that tie the file to the Pi's clock, and never late, from the driver's last read of the
+   file's size before arecord wrote its header: arecord writes its whole header before the read that
+   starts its capture. It passes when the late time is within 20 ms, fails when even the early time
+   is over, and otherwise reports UNKNOWN with how late the recording's times may be, since a loaded
+   Pi reads its anchors late. The early time is early by up to the 10 ms between two reads, by the
+   time arecord took from its header to its first read, and by up to 400 ppm of the time into the
+   recording, so a tail a few milliseconds over the bound can be UNKNOWN. The recording's end, which
+   `barge-in`, `wake-sound` and `playback-cancel` read, counts from the same start, so an arecord slow
+   to open its device makes no time early. `joined` times the onset of the agent's words at the rig
+   the same way: it passes when even the early time is at or after the end of the go-ahead and the
+   late time is before `voice_spoken`, fails when no sound longer than the wake sound can start
+   between them, and otherwise reports UNKNOWN.
 6. Slice 4's two steps check the three capture states and the paused listener, with the
    listener turned on for the run only (`GHOST_WISPR_VOICE_PAUSED_LISTENER=true`, beside the
    voice). Both keep the microphone on the loopback, so the listener hears only what the step plays

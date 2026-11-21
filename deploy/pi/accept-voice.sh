@@ -953,8 +953,16 @@ anchors_file=
 recording_cut=false
 recording_started=
 recording_fdinfo=
+# start_recording DEVICE FILE: record DEVICE to FILE with arecord, until stop_recording.
+# recording_started is a time no later than the file's first sample: arecord opens its device, then
+# creates the file and writes its whole 44-byte header, and only then reads, which starts the
+# capture (alsa-utils aplay.c capture(): set_params, then the file, begin_wave, then pcm_read; for
+# arecord the start threshold is one frame). So a read of the file's size that found less than the
+# header, or no file, came before the capture began, and the last such read is the recording's
+# start; the clock just before arecord started bounds it when every read found the header. An
+# arecord slow to open its device, or held back before its first read, moves no time.
 start_recording() {
-  local deadline size seen link
+  local deadline size seen before link tick
   recording=$2
   anchors_file="$recording.anchors"
   recording_cut=false
@@ -966,23 +974,39 @@ start_recording() {
     "$recording" 2>"$work_dir/arecord.err" &
   arecord_pid=$!
   deadline=$(($(now_ms) + 5000))
+  # The poll for the first sample forks nothing: before the file exists the size is 0, and once
+  # arecord has it open the size comes from arecord's fdinfo (recording_size, which reads it with wc
+  # only in the moment between); the 10 ms wait is a read that times out on a pipe this shell holds
+  # both ends of. A fork per poll, on a loaded machine, would leave the last read before the header
+  # far before the capture, and every time counted from it early by as much.
+  exec {tick}<> <(:)
   while :; do
-    size=$(wc -c 2>/dev/null <"$recording" || printf 0)
+    before=${EPOCHREALTIME//[!0-9]/}
+    if [[ -z $recording_fdinfo ]]; then
+      for link in /proc/"$arecord_pid"/fd/*; do
+        if [[ $link -ef $recording ]]; then
+          recording_fdinfo=/proc/$arecord_pid/fdinfo/${link##*/}
+          break
+        fi
+      done
+    fi
+    if [[ -n $recording_fdinfo || -e $recording ]]; then
+      recording_size || size=0
+    else
+      size=0
+    fi
     seen=${EPOCHREALTIME//[!0-9]/}
     if ((size > wav_header_bytes)); then
       printf '%s %s\n' "$seen" "$size" >>"$anchors_file"
       break
     fi
+    # Less than the header when its size was read, after before: the capture began later.
+    ((size < wav_header_bytes && before > recording_started)) && recording_started=$before
     kill -0 "$arecord_pid" 2>/dev/null || unknown "recording: arecord stopped: $(tr '\n' ' ' <"$work_dir/arecord.err")"
     ((seen / 1000 < deadline)) || unknown "recording: arecord wrote no audio from $1 within 5 s"
-    sleep 0.01
+    read -r -t 0.01 -u "$tick" _ || true
   done
-  for link in /proc/"$arecord_pid"/fd/*; do
-    if [[ $link -ef $recording ]]; then
-      recording_fdinfo=/proc/$arecord_pid/fdinfo/${link##*/}
-      break
-    fi
-  done
+  exec {tick}>&-
   (
     while kill -0 "$arecord_pid" 2>/dev/null; do
       sleep 0.5
