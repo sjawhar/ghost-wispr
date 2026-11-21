@@ -2135,7 +2135,7 @@ func (o exchangeOutput) Begin() Playback {
 	if o.ex.ended || authority.Err() != nil {
 		return endedPlayback{}
 	}
-	pb := sayPlayback{Playback: o.s.cfg.Speaker.Begin(audio.InputVoice), ctx: authority}
+	pb := sayPlayback{Playback: o.s.cfg.Speaker.Begin(audio.InputVoice), ctx: authority, joins: &frameJoin{}}
 	o.ex.last = pb
 	return pb
 }
@@ -2158,15 +2158,52 @@ func (endedPlayback) Drain(context.Context) error { return nil }
 // runs under both the voice's context and the exchange's authority (its
 // context, with the recorder's meeting, or a hand's words' context, with its
 // membership), so the authority's end, read at each check, stops a write even
-// while it waits for room in the speaker's queue, and commits nothing.
+// while it waits for room in the speaker's queue, and commits nothing. With
+// joins set, as Begin sets it, the frames written under one context share
+// one join, so a frame allocates nothing: an allocating goroutine on the
+// audio path is drafted into the garbage collector's assist, and the speaker
+// underruns.
 type sayPlayback struct {
 	Playback
-	ctx context.Context
+	ctx   context.Context
+	joins *frameJoin
+}
+
+// frameJoin keeps the last context a playback was written under, joined with
+// its authority. Contexts are compared with ==, as every context the voices
+// pass is a pointer or an empty struct.
+type frameJoin struct {
+	mu     sync.Mutex
+	caller context.Context
+	joined context.Context
+	stop   func()
+}
+
+// keepJoin is the release of a join frameJoin keeps: it is released when the
+// next context replaces it, or ends with its contexts.
+var keepJoin = func() {}
+
+// under is ctx joined with the playback's authority, and its release.
+func (p sayPlayback) under(ctx context.Context) (context.Context, func()) {
+	j := p.joins
+	if j == nil {
+		return joinContexts(ctx, p.ctx)
+	}
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	if j.joined == nil || j.caller != ctx {
+		if j.stop != nil {
+			j.stop()
+		}
+		j.joined, j.stop = joinContexts(ctx, p.ctx)
+		j.caller = ctx
+	}
+	return j.joined, keepJoin
 }
 
 func (p sayPlayback) Write(ctx context.Context, frame []byte, format audio.AudioFormat) error {
-	both, stop := joinContexts(ctx, p.ctx)
-	defer stop()
+	both, release := p.under(ctx)
+	defer release()
 	if err := both.Err(); err != nil {
 		return err
 	}
@@ -2174,8 +2211,8 @@ func (p sayPlayback) Write(ctx context.Context, frame []byte, format audio.Audio
 }
 
 func (p sayPlayback) Drain(ctx context.Context) error {
-	both, stop := joinContexts(ctx, p.ctx)
-	defer stop()
+	both, release := p.under(ctx)
+	defer release()
 	if err := both.Err(); err != nil {
 		return err
 	}
