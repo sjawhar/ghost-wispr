@@ -960,6 +960,58 @@ func TestAPlaybackBackInAPositionLosesOnlyItsOwnSamples(t *testing.T) {
 	}
 }
 
+// TestACancelledDrainReturnsOnceItsTakeBackIsCounted fails if Drain of a
+// playback a Cancel ended returns before the mixer took the Cancel in: the
+// text-to-speech voice reads Played as soon as Drain returns, and the
+// take-back that comes after lowers it (Sol's review of #148 at 9b80022: 20
+// ms read, none of it kept). The mixer is held in its second write when the
+// Cancel comes, and Played is read the moment Drain returns. The control's
+// Drop takes nothing back, so Played does not change.
+func TestACancelledDrainReturnsOnceItsTakeBackIsCounted(t *testing.T) {
+	for _, back := range []int{0, 960} {
+		t.Run(fmt.Sprintf("the drop takes back %d frames", back), func(t *testing.T) {
+			stream := &probeStream{fakeStream: newFakeStream(48000)}
+			out, start, events := probeOutput(t, stream)
+			barrier := newProbeBarrier()
+			t.Cleanup(barrier.unblock)
+			ctx := testContext(t)
+			pb := out.Begin(InputVoice)
+			if err := pb.WriteAll(ctx, constant(48000, 40*time.Millisecond, 1000), mono48k); err != nil {
+				t.Fatal(err)
+			}
+			stream.before = func(n int, _ []int16) {
+				if n == 2 {
+					barrier.hold()
+				}
+			}
+			stream.drop = func() (int, error) { return back, nil }
+			start()
+			probeWait(t, barrier.entered, "the second write")
+			probeVoiceEvent(t, events, true)
+			out.Cancel(InputVoice)
+			type drained struct {
+				err    error
+				played time.Duration
+			}
+			done := make(chan drained, 1)
+			go func() {
+				err := pb.Drain(ctx)
+				done <- drained{err, pb.Played()} // as the text-to-speech voice reads it
+			}()
+			time.Sleep(50 * time.Millisecond) // a Drain that does not wait returns in this time
+			barrier.unblock()
+			got := <-done
+			if !errors.Is(got.err, ErrCancelled) {
+				t.Fatalf("Drain: %v, want ErrCancelled", got.err)
+			}
+			end := probeVoiceEvent(t, events, false)
+			if got.played != end.Played || got.played != pb.Played() {
+				t.Fatalf("Played read as Drain returned %v, but the speech kept %v and the playback %v", got.played, end.Played, pb.Played())
+			}
+		})
+	}
+}
+
 // TestAReplayOfAResampledTailStampsTheSpeechsEnd fails if a speech of 24 kHz
 // audio on a 48 kHz stream, whose filter tail a Drop of another input brings
 // back, keeps an end stamped before that replay is taken: the speech's audio

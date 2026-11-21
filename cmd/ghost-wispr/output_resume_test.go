@@ -3,7 +3,9 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -14,19 +16,25 @@ import (
 )
 
 // jabraStream is the speaker's playback stream on the Jabra, playing in real
-// time at 48 kHz. open is true from when it opens until it closes, and
-// closedAt is when it closed. With closeErr, Close fails with it and leaves
-// the stream open.
+// time at 48 kHz. open is true from when it opens until it closes, closedAt
+// is when it closed, and soundAt is when its last write with sound in it
+// returned. With closeErr, Close fails with it and leaves the stream open.
 type jabraStream struct {
 	open     atomic.Bool
 	closeErr error
 	mu       sync.Mutex
 	closedAt time.Time
+	soundAt  time.Time
 	closes   int
 }
 
 func (s *jabraStream) Write(frame []int16) error {
 	time.Sleep(time.Duration(len(frame)) * time.Second / 48000)
+	if slices.ContainsFunc(frame, func(v int16) bool { return v != 0 }) {
+		s.mu.Lock()
+		s.soundAt = time.Now()
+		s.mu.Unlock()
+	}
 	return nil
 }
 
@@ -54,6 +62,12 @@ func (s *jabraStream) closed() time.Time {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.closedAt
+}
+
+func (s *jabraStream) lastSound() time.Time {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.soundAt
 }
 
 // outputOnDevice makes the speaker's Output wired to device as main wires
@@ -129,28 +143,36 @@ func TestAResumeWhileTheOutputIsOpenWaitsForItsClose(t *testing.T) {
 // TestAnOutputIdle300msClosesAndTheResumeProceeds fails if the speaker's
 // Output keeps its stream open on the Jabra much past 300 ms with nothing to
 // play, or closes it sooner, or if a resume that waited for it does not
-// proceed once it has closed.
+// proceed once it has closed. The idle time runs from when the stream's last
+// write with sound returned, not from when the caller's Drain returned,
+// which a busy test process can delay: timed from the caller, a correct
+// close read 275 ms (Sol's review of #148 at dd6fe73). The control resumes
+// 25 ms late.
 func TestAnOutputIdle300msClosesAndTheResumeProceeds(t *testing.T) {
-	r := newSpeechResumeRig(t)
-	mic := r.startMicLoop(t)
-	out, stream := outputOnDevice(t, r.device)
-	speakOn(t, out, 40*time.Millisecond)
-	played := time.Now()
-	r.capture.Resume()
-	mic.expectEvents(t, "open")
-	opened := time.Now()
-	if stream.open.Load() {
-		t.Fatal("the microphone opened while the output's stream was open")
-	}
-	idle := stream.closed().Sub(played)
-	if idle < 300*time.Millisecond || idle > 400*time.Millisecond {
-		t.Fatalf("the output closed its stream %v after its last sound, want 300 ms", idle)
-	}
-	if opened.Before(stream.closed()) {
-		t.Fatal("the microphone opened before the output closed its stream")
-	}
-	if r.ring.Load() {
-		t.Fatal("the microphone opened while the Jabra's ring showed Muted")
+	for _, late := range []time.Duration{0, 25 * time.Millisecond} {
+		t.Run(fmt.Sprintf("resumed %v after the sound", late), func(t *testing.T) {
+			r := newSpeechResumeRig(t)
+			mic := r.startMicLoop(t)
+			out, stream := outputOnDevice(t, r.device)
+			speakOn(t, out, 40*time.Millisecond)
+			time.Sleep(late)
+			r.capture.Resume()
+			mic.expectEvents(t, "open")
+			opened := time.Now()
+			if stream.open.Load() {
+				t.Fatal("the microphone opened while the output's stream was open")
+			}
+			idle := stream.closed().Sub(stream.lastSound())
+			if idle < 300*time.Millisecond || idle > 400*time.Millisecond {
+				t.Fatalf("the output closed its stream %v after its last sound was written, want 300 ms", idle)
+			}
+			if opened.Before(stream.closed()) {
+				t.Fatal("the microphone opened before the output closed its stream")
+			}
+			if r.ring.Load() {
+				t.Fatal("the microphone opened while the Jabra's ring showed Muted")
+			}
+		})
 	}
 }
 

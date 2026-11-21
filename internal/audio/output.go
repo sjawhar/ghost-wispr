@@ -227,6 +227,7 @@ type outputInput struct {
 
 	speaking  bool
 	cancelled bool      // Cancel silenced its speech: the mixer takes it back and ends it
+	unsettled *playGen  // the generation the first Cancel ended in that speech, settling until it ends (endSpeech)
 	cancelAt  time.Time // when the first Cancel of the speech came
 	cut       bool      // Cancel dropped audio of the speech still queued
 	// startFrame is the frame that holds its speech's first audio, which the
@@ -328,8 +329,13 @@ type Playback struct {
 // playGen is how the playbacks begun on an input since its last end ended:
 // err is nil until Cancel (ErrCancelled), a stream failure or Close
 // (ErrOutputClosed) ends them all. An input that ends starts a new one, so it
-// keeps no list of its playbacks.
-type playGen struct{ err error }
+// keeps no list of its playbacks. settling is set while a Cancel that ended
+// it during a speech waits for the mixer to take it in, which takes off what
+// the device gives back unheard (endSpeech): their Drain waits until then.
+type playGen struct {
+	err      error
+	settling bool
+}
 
 // playedTime adds up audio from its sample count at each rate, exactly.
 type playedTime struct {
@@ -487,16 +493,22 @@ func wholeFrames(pcm []byte, format AudioFormat) (int, error) {
 }
 
 // Drain waits until the stream has taken all the playback queued, or the
-// playback ends, and then returns why it ended.
+// playback ends, and then returns why it ended. A playback a Cancel ended,
+// whose audio the mixer took in the speech the Cancel cut, returns once the
+// mixer has taken the Cancel in, which takes off what the device gives back
+// of it unheard: its Played is final then, as the text-to-speech voice reads
+// it. A playback the mixer took none of in that speech has nothing to take
+// back, and returns at once.
 func (p *Playback) Drain(ctx context.Context) error {
 	o, in := p.out, p.in
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	for {
-		if p.gen.err != nil {
-			return p.gen.err
-		}
-		if p.pending == 0 && (in.last != p || in.idle()) && o.written >= p.seq {
+		if err := p.gen.err; err != nil {
+			if !p.gen.settling || p.seq == 0 || p.seq < in.startFrame {
+				return err
+			}
+		} else if p.pending == 0 && (in.last != p || in.idle()) && o.written >= p.seq {
 			return nil
 		}
 		if err := o.waitRoom(ctx, p.wake); err != nil {
@@ -554,12 +566,16 @@ func (o *Output) Cancel(input string) {
 		return
 	}
 	cut := !in.idle()
+	gen := in.gen
 	in.end(ErrCancelled)
 	if in.speaking {
 		// A second Cancel before the mixer takes the first in finds nothing
-		// queued: it keeps the first one's cut and time.
+		// queued: it keeps the first one's cut and time. Its generation was
+		// begun after the first Cancel, so it played none of the speech,
+		// and its Drain does not wait for the take-back.
 		if !in.cancelled {
 			in.cancelAt = time.Now()
+			gen.settling, in.unsettled = true, gen
 		}
 		in.cancelled, in.cut = true, in.cut || cut
 		o.dropNow = true
@@ -1419,6 +1435,13 @@ func (o *Output) endSpeech(in *outputInput, now time.Time, cancelled bool) {
 		}
 	}
 	in.speaking, in.startPending, in.cancelled, in.cancelAt, in.cut, in.spoken, in.quietAt = false, false, false, time.Time{}, false, playedTime{}, time.Time{}
+	if in.unsettled != nil {
+		// The Cancel is taken in, or the stream is gone: its Drains return,
+		// whatever ended the speech (retake, an idle close, a failure,
+		// Close).
+		in.unsettled.settling, in.unsettled = false, nil
+		o.changed()
+	}
 }
 
 func clip(s float32) int16 {
