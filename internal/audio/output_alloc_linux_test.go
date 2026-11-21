@@ -81,7 +81,8 @@ func allocationsHere() map[string]int64 {
 	recs := make([]runtime.MemProfileRecord, n+64)
 	n, _ = runtime.MemProfile(recs, true)
 	counts := map[string]int64{}
-	for _, r := range recs[:n] {
+	for i := range recs[:n] {
+		r := &recs[i]
 		var stack []string
 		ours, sudog := false, false
 		frames := runtime.CallersFrames(r.Stack())
