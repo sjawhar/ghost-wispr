@@ -20,16 +20,16 @@ func countingLazyConcierge(t *testing.T) (lazy *lazyConcierge, counts func() (st
 	store := conciergeStore(t)
 	var mu sync.Mutex
 	starts, stops := 0, 0
-	lazy = newLazyConcierge(func() (*concierge.Concierge, func(), error) {
+	lazy = newLazyConcierge(func() (*concierge.Concierge, func(context.Context), error) {
 		c, stop, err := startConcierge(t.Context(), &cfg, store, discardLogger, nil, nil)
 		mu.Lock()
 		starts++
 		mu.Unlock()
-		return c, func() {
+		return c, func(ctx context.Context) {
 			mu.Lock()
 			stops++
 			mu.Unlock()
-			stop()
+			stop(ctx)
 		}, err
 	}, nil, discardLogger)
 	t.Cleanup(func() { lazy.Stop(context.Background()) })
@@ -100,7 +100,7 @@ func TestTurningTheVoiceOffCancelsTheQuestionsAShutdownKeeps(t *testing.T) {
 		t.Fatal(err)
 	}
 	newLazy := func() *lazyConcierge {
-		lazy := newLazyConcierge(func() (*concierge.Concierge, func(), error) {
+		lazy := newLazyConcierge(func() (*concierge.Concierge, func(context.Context), error) {
 			return startConcierge(t.Context(), &cfg, store, discardLogger, nil, nil)
 		}, nil, discardLogger)
 		t.Cleanup(func() { lazy.Stop(context.Background()) })

@@ -134,7 +134,7 @@ func TestTheEnvoySessionCarriesJoinsToTheRoster(t *testing.T) {
 	if err := json.Unmarshal(raw, &listed); err != nil || len(listed.Agents) != 1 || listed.Agents[0].Session != "agent-1" {
 		t.Fatalf("list_joined_agents = %s, want agent-1", raw)
 	}
-	stop()
+	stop(context.Background())
 	if got := roster.Joined(); len(got) != 0 {
 		t.Fatalf("roster %+v after the Envoy session closed, want none", got)
 	}

@@ -2036,7 +2036,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 		})
 		joinedLink.set(roster)
 		wireJoinedRoutes(controlHooks, roster)
-		conc = newLazyConcierge(func() (*concierge.Concierge, func(), error) {
+		conc = newLazyConcierge(func() (*concierge.Concierge, func(context.Context), error) {
 			current := cfgStore.Get()
 			// The session page reads a session's questions again on each change.
 			return startConcierge(ctx, &current, store, appLogger, func(sessionID string) {

@@ -343,12 +343,12 @@ func TestAShutdownWaitsForAConciergeStartUnderWay(t *testing.T) {
 	guard := storeguard.New(t, store)
 	entered, release := make(chan struct{}), make(chan struct{})
 	var stopped atomic.Bool
-	lazy := newLazyConcierge(func() (*concierge.Concierge, func(), error) {
+	lazy := newLazyConcierge(func() (*concierge.Concierge, func(context.Context), error) {
 		close(entered)
 		<-release
 		c, stop, err := startConcierge(t.Context(), &cfg, store, discardLogger, nil, nil)
-		return c, func() {
-			stop()
+		return c, func(ctx context.Context) {
+			stop(ctx)
 			stopped.Store(true)
 		}, err
 	}, nil, discardLogger)
@@ -393,7 +393,7 @@ func TestAShutdownWaitsForATurnOffUnderWay(t *testing.T) {
 			}
 			cfg := config.Config{GenAIBackend: "gemini", GeminiAPIKey: strings.Repeat("k", 8)}
 			detached, release, ended := make(chan struct{}), make(chan struct{}), make(chan struct{})
-			lazy := newLazyConcierge(func() (*concierge.Concierge, func(), error) {
+			lazy := newLazyConcierge(func() (*concierge.Concierge, func(context.Context), error) {
 				return startConcierge(t.Context(), &cfg, store, discardLogger, nil, nil)
 			}, func(c *concierge.Concierge) {
 				if c == nil { // the turn-off has detached its Concierge
@@ -469,7 +469,7 @@ func TestATurnOffHeldInTheStoreDoesNotHoldTheShutdownPastItsDeadline(t *testing.
 			}
 			cfg := config.Config{GenAIBackend: "gemini", GeminiAPIKey: strings.Repeat("k", 8)}
 			detached := make(chan struct{})
-			lazy := newLazyConcierge(func() (*concierge.Concierge, func(), error) {
+			lazy := newLazyConcierge(func() (*concierge.Concierge, func(context.Context), error) {
 				return startConcierge(t.Context(), &cfg, store, discardLogger, nil, nil)
 			}, func(c *concierge.Concierge) {
 				if c == nil {
@@ -542,6 +542,97 @@ func TestATurnOffHeldInTheStoreDoesNotHoldTheShutdownPastItsDeadline(t *testing.
 			}
 			if want := map[bool]storage.VoiceTaskState{false: storage.VoiceTaskCancelled, true: storage.VoiceTaskWorking}[held]; task.State != want {
 				t.Errorf("the question after the shutdown is %q, want %q", task.State, want)
+			}
+		})
+	}
+}
+
+// TestARunningConciergeStopsWithinTheShutdownsDeadline fails if the shutdown
+// of a running Concierge (lazyConcierge.Stop) waits past the shutdown's
+// deadline for a call of it whose store write waits for the store's one
+// connection, or if that write lands once main has closed the store: the
+// Concierge's stop gives up at the deadline (Concierge.StopWithin), and the
+// closed store refuses the write. From review 6005590173 of #132; the
+// control is the same call with the connection free, which lands before the
+// shutdown.
+func TestARunningConciergeStopsWithinTheShutdownsDeadline(t *testing.T) {
+	for _, held := range []bool{false, true} {
+		name := "control: the store's connection is free"
+		if held {
+			name = "a call's store write waits for the connection past the deadline"
+		}
+		t.Run(name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "state.db")
+			store := openResumeStore(t, path)
+			if err := store.CreateSession("meeting", time.Now()); err != nil {
+				t.Fatal(err)
+			}
+			cfg := config.Config{GenAIBackend: "gemini", GeminiAPIKey: strings.Repeat("k", 8)}
+			lazy := newLazyConcierge(func() (*concierge.Concierge, func(context.Context), error) {
+				return startConcierge(t.Context(), &cfg, store, discardLogger, nil, nil)
+			}, nil, discardLogger)
+			if _, err := lazy.start(); err != nil {
+				t.Fatal(err)
+			}
+			if err := store.CreateVoiceTask(&storage.VoiceTask{ID: "q1", SessionID: "meeting", AskedAt: time.Now(), Holder: "session:agent-7"}); err != nil {
+				t.Fatal(err)
+			}
+			conn, err := store.DB().Conn(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = conn.Close() }()
+			waitsBefore := store.DB().Stats().WaitCount
+			wrote := make(chan error, 1)
+			go func() { wrote <- lazy.Spoken(context.Background(), "q1") }()
+			waitUntil(t, "the call's write waiting for the store's connection", func() bool {
+				return store.DB().Stats().WaitCount > waitsBefore
+			})
+			if !held {
+				_ = conn.Close()
+				select {
+				case err := <-wrote:
+					if err != nil {
+						t.Fatalf("control: the call's write = %v", err)
+					}
+				case <-time.After(5 * time.Second):
+					t.Fatal("control: the call's write did not end")
+				}
+			}
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+			defer cancel()
+			<-shutdownCtx.Done() // the stop's earlier steps took the whole deadline
+			stopped := make(chan struct{})
+			go func() {
+				defer close(stopped)
+				lazy.Stop(shutdownCtx)
+			}()
+			select {
+			case <-stopped:
+			case <-time.After(time.Second):
+				t.Fatal("the Concierge's shutdown waited past the shutdown's deadline for its call's write")
+			}
+			if !closeStore(shutdownCtx, store) {
+				t.Fatal("closeStore left the store open, though no statement ran on it")
+			}
+			if held {
+				_ = conn.Close() // the call's write gets the connection now
+				select {
+				case err := <-wrote:
+					if !errors.Is(err, stopping.ErrStopped) {
+						t.Errorf("the call's write after the store closed = %v, want stopping.ErrStopped", err)
+					}
+				case <-time.After(5 * time.Second):
+					t.Fatal("the call's write did not end")
+				}
+			}
+			reopened := openResumeStore(t, path)
+			task, err := reopened.VoiceTask("q1")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if spoken := task.SpokenAt != nil; spoken == held {
+				t.Errorf("the question spoken after the shutdown: %t, want %t", spoken, !held)
 			}
 		})
 	}

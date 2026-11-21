@@ -148,11 +148,13 @@ type Concierge struct {
 	// answer for the ear, the read of the projects and the sends after a
 	// reply, runs under it, and work counts it, as it counts each call from
 	// outside that may write the store (enter). done closes when the
-	// goroutine that offers answers ends.
+	// goroutine that offers answers ends; stopped, once Stop has ended the
+	// life and everything it waits for has ended too.
 	life     context.Context
 	stop     context.CancelFunc
 	work     sync.WaitGroup
 	done     chan struct{}
+	stopped  chan struct{}
 	stopOnce sync.Once
 
 	mu     sync.Mutex
@@ -255,6 +257,7 @@ func New(cfg *Config) (*Concierge, error) {
 		logger:       cfg.Logger,
 		answers:      make(chan voice.PendingAnswer),
 		done:         make(chan struct{}),
+		stopped:      make(chan struct{}),
 		lastAsk:      map[[2]string]sentAsk{},
 		unsent:       map[[2]string]unsentAsk{},
 		working:      map[string][]string{},
@@ -369,18 +372,33 @@ func (c *Concierge) enter(parent context.Context) (ctx context.Context, leave fu
 // Stop ends the Concierge, when the unit stops (VoiceOff, when the voice is
 // turned off): the goroutine that offers answers, a rewrite of an answer for
 // the ear, every call that may write the store (enter), which it cancels,
-// and any other background work end, and Stop waits for them. A send to an
-// agent already begun keeps its own bound (sendTimeout). An answer that lands
-// after it is kept in the ledger, for its session's page, and not announced.
-// A second Stop does nothing.
-func (c *Concierge) Stop() {
+// and any other background work end, and Stop waits for them (StopWithin,
+// with no deadline). A send to an agent already begun keeps its own bound
+// (sendTimeout). An answer that lands after it is kept in the ledger, for
+// its session's page, and not announced. A second Stop does nothing.
+func (c *Concierge) Stop() { _ = c.StopWithin(context.Background()) }
+
+// StopWithin ends the Concierge as Stop does, and waits for its work within
+// ctx. At ctx's end it returns ctx's cause and waits no longer: the work it
+// cancelled ends behind it, and a store write that work still makes after
+// the unit closed its store is refused there (storage).
+func (c *Concierge) StopWithin(ctx context.Context) error {
 	c.stopOnce.Do(func() {
 		c.mu.Lock()
 		c.stop()
 		c.mu.Unlock()
-		<-c.done
-		c.work.Wait()
+		go func() {
+			<-c.done
+			c.work.Wait()
+			close(c.stopped)
+		}()
 	})
+	select {
+	case <-c.stopped:
+		return nil
+	case <-ctx.Done():
+		return fmt.Errorf("concierge: its work still runs at the stop's deadline: %w", context.Cause(ctx))
+	}
 }
 
 // VoiceOff ends the Concierge as Stop does, as the voice is turned off, then

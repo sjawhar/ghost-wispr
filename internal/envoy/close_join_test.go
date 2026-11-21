@@ -2,6 +2,7 @@ package envoy
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"sync"
 	"sync/atomic"
@@ -77,6 +78,10 @@ func TestCloseWaitsForTheRelayFrameBeingDelivered(t *testing.T) {
 	session := testSession(t, server, func(ctx context.Context, _ *Message) error {
 		delivered.Add(1)
 		close(delivering)
+		// Closed as the delivery returns, inside relay: relay's own return
+		// lets Close return (stopped), so a close after it could come after
+		// Close's.
+		defer close(ended)
 		select { // a delivery that takes its time
 		case <-ctx.Done():
 			return ctx.Err()
@@ -90,10 +95,7 @@ func TestCloseWaitsForTheRelayFrameBeingDelivered(t *testing.T) {
 	frame.Set("Envoy-Stream-Seq", "7")
 	frame.Set("Envoy-Subject", DeliverSubjectPrefix+"pi-session-1")
 	var answers []string
-	go func() {
-		defer close(ended)
-		session.relay(frame, []byte(`{"event_id":"evt-7","source_session":"agent-7","payload_summary":"merged"}`), func(body string) { answers = append(answers, body) })
-	}()
+	go session.relay(frame, []byte(`{"event_id":"evt-7","source_session":"agent-7","payload_summary":"merged"}`), func(body string) { answers = append(answers, body) })
 	select {
 	case <-delivering:
 	case <-time.After(5 * time.Second):
@@ -107,6 +109,53 @@ func TestCloseWaitsForTheRelayFrameBeingDelivered(t *testing.T) {
 	session.relay(frame, []byte(`{"event_id":"evt-8"}`), func(string) { t.Error("a frame after Close was answered") })
 	if n := delivered.Load(); n != 1 {
 		t.Errorf("%d deliveries, want only the frame before Close", n)
+	}
+}
+
+// TestCloseStopsWaitingAtItsDeadline fails if Close waits past its context's
+// end for a relay frame's delivery that does not see the cancel, as a store
+// write waiting for the store's connection does not: the unit's shutdown
+// would hang there and never close its store. The control is
+// TestCloseWaitsForTheRelayFrameBeingDelivered, where the delivery ends and
+// Close waits for it.
+func TestCloseStopsWaitingAtItsDeadline(t *testing.T) {
+	_, server := newFakeListener(t)
+	delivering, release, ended := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	session := testSession(t, server, func(context.Context, *Message) error {
+		close(delivering)
+		<-release // it does not see the cancel
+		return nil
+	}, nil)
+	defer close(release)
+	frame := nats.Header{}
+	frame.Set("Envoy-Stream-Id", "stream-A")
+	frame.Set("Envoy-Stream-Seq", "7")
+	frame.Set("Envoy-Subject", DeliverSubjectPrefix+"pi-session-1")
+	go func() {
+		defer close(ended)
+		session.relay(frame, []byte(`{"event_id":"evt-7"}`), func(string) {})
+	}()
+	select {
+	case <-delivering:
+	case <-time.After(5 * time.Second):
+		t.Fatal("control: the frame was not delivered")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	closed := make(chan error, 1)
+	go func() { closed <- session.Close(ctx) }()
+	select {
+	case err := <-closed:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Errorf("Close at its deadline = %v, want its context's cause", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Close waited past its deadline for a delivery that does not see the cancel")
+	}
+	select {
+	case <-ended:
+		t.Error("control: the held delivery ended before its release")
+	default:
 	}
 }
 

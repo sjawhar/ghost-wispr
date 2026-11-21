@@ -699,10 +699,13 @@ func (s *Session) Send(ctx context.Context, request *SendRequest) (SendResult, e
 	return SendResult{EventID: answer.EventID, RecipientState: SessionState(answer.RecipientState), State: answer.State, Duplicate: answer.Duplicate}, nil
 }
 
-// Close stops the heartbeat, cancels and waits for each registration and
-// relay frame under way, which may save the resume point (an interrupted
-// frame is answered nak and comes again), removes this process's
-// registration and closes the NATS connection.
+// Close stops the heartbeat, cancels and waits within ctx for each
+// registration and relay frame under way, which may save the resume point
+// (an interrupted frame is answered nak and comes again), removes this
+// process's registration and closes the NATS connection. At ctx's end it
+// closes the connection and returns ctx's cause without removing the
+// registration: the work still under way ends behind it, and a store write
+// it makes after the unit closed its store is refused there (storage).
 func (s *Session) Close(ctx context.Context) error {
 	s.mu.Lock()
 	if s.closed {
@@ -714,12 +717,22 @@ func (s *Session) Close(ctx context.Context) error {
 	conn := s.conn
 	s.mu.Unlock()
 	s.endLife()
-	s.stopped.Wait()
-	err := s.do(ctx, http.MethodDelete, "/v1/sessions/"+s.cfg.SessionID, url.Values{"client_instance_id": {s.clientInstanceID}}, nil, nil)
-	if conn != nil {
-		conn.Close()
+	defer func() {
+		if conn != nil {
+			conn.Close()
+		}
+	}()
+	ended := make(chan struct{})
+	go func() {
+		s.stopped.Wait()
+		close(ended)
+	}()
+	select {
+	case <-ended:
+	case <-ctx.Done():
+		return fmt.Errorf("envoy: the session's work still runs at its close's deadline: %w", context.Cause(ctx))
 	}
-	return err
+	return s.do(ctx, http.MethodDelete, "/v1/sessions/"+s.cfg.SessionID, url.Values{"client_instance_id": {s.clientInstanceID}}, nil, nil)
 }
 
 func randomID() string {
