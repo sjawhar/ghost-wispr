@@ -941,26 +941,35 @@ journal_records() {
 }
 
 # timing_events: the voice timing log since the restart: {event, session_id, reason, input, at, at_us,
-# wall}: at on now_ms's clock (at_mono_ns), -1 for a line without one, at_us the same in
-# microseconds, and wall on the wall clock (at_unix_ns), in milliseconds.
+# wall, audible_us, lead_us, err_us, disruptions}: at on now_ms's clock (at_mono_ns), -1 for a line
+# without one, at_us the same in microseconds, and wall on the wall clock (at_unix_ns), in
+# milliseconds. An "audible" line also gives, in microseconds on now_ms's clock, when its sound's
+# first sample left the speaker's buffer (audible_mono_ns, -1 without), how much earlier the sound
+# can be (audible_lead_ns) and how far off the time can be (audible_err_ns), each rounded outwards,
+# and the disruptions the speaker had had by then.
 timing_events() {
   journal_records 'voice timing' | jq -c '{event: (.event // ""), session_id: (.session_id // ""),
     reason: (.reason // ""), input: (.input // ""),
     at: ((((.at_mono_ns | tonumber?) // -1000000) / 1000000) | floor),
     at_us: ((((.at_mono_ns | tonumber?) // -1000) / 1000) | floor),
-    wall: ((((.at_unix_ns | tonumber?) // 0) / 1000000) | floor)}' 2>/dev/null
+    wall: ((((.at_unix_ns | tonumber?) // 0) / 1000000) | floor),
+    audible_us: ((((.audible_mono_ns | tonumber?) // -1000) / 1000) | floor),
+    lead_us: ((((.audible_lead_ns | tonumber?) // 0) / 1000) | ceil),
+    err_us: ((((.audible_err_ns | tonumber?) // 0) / 1000) | ceil),
+    disruptions: ((.disruptions | tonumber?) // -1)}' 2>/dev/null
 }
 
-# audible_us INPUT FROM_MS TO_MS: the time of the first "audible" line for the speaker's INPUT (chime
-# or voice) in audible_lines from FROM to TO, in microseconds on now_ms's clock, or nothing. The
-# service logs one as each speech on an input starts, at the time its first sample left ALSA's buffer
-# for the speaker device by ALSA's own account of the stream (internal/audio): the device plays it a
-# latency later, the same for every input. audible_lines is the timing log's audible lines
+# audible_of INPUT FROM_MS TO_MS: "AUDIBLE_US LEAD_US ERR_US DISRUPTIONS" of the first "audible"
+# line for the speaker's INPUT (chime or voice) in audible_lines whose sound left the speaker's
+# buffer from FROM to TO, or nothing. The service logs one as each speech on an input starts, timed
+# by the stream's own account of its playback (internal/audio, AudibleEvent): the device plays the
+# sample a latency later, the same for every input. audible_lines is the timing log's audible lines
 # (timing_events), read once, before the step stops its recording and reads the rest of the journal.
 audible_lines=
-audible_us() {
-  jq -r -n --arg input "$1" --argjson from "$2" --argjson to "$3" \
-    '[inputs | select(.event == "audible" and .input == $input and .at >= $from and .at <= $to) | .at_us] | min // empty' <<<"$audible_lines"
+audible_of() {
+  jq -r -n --arg input "$1" --argjson from "$(($2 * 1000))" --argjson to "$(($3 * 1000))" \
+    '[inputs | select(.event == "audible" and .input == $input and .audible_us >= $from and .audible_us <= $to)]
+     | min_by(.audible_us) // empty | "\(.audible_us) \(.lead_us) \(.err_us) \(.disruptions)"' <<<"$audible_lines"
 }
 
 # timing_first EVENT FROM_MS TO_MS [FIELD]: the time of the first EVENT in the timing log in
@@ -2631,10 +2640,12 @@ running_ms() {
 # Known limits. A leak can hide only where it runs into the next question's chime, with less than
 # silence_ms between them: the part of it outside the chime must add at most chime_tolerance_ms to
 # the chime as the rig hears it, and any of it that plays during the chime is not told apart. A leak
-# that starts less than chime_attack_us, two audible_error_us and the clock's 200 ppm before the next
-# answer is heard, about 8 ms, is not told apart from the answer. Without audible times, the window is
-# the speaker's whole queue before first_audio, about 40 ms on the Pi: a leak that starts at or after
-# first_audio is not told apart, and one that may start before it reads UNKNOWN.
+# that starts less than chime_attack_us, two audible_error_us, the voice's lead (its resampler's
+# filter, about 1.4 ms) and the clock's 200 ppm before the next answer is heard, about 9 ms, is not
+# told apart from the answer. Without audible times, or with a disruption between the chime's and the
+# answer's, the window is the speaker's whole queue before first_audio, about 40 ms on the Pi: a leak
+# that starts at or after first_audio is not told apart, and one that may start before it reads
+# UNKNOWN.
 #
 # chime_attack_us is how late the rig can first hear the chime past its true start: its first note
 # rises over 5 ms (internal/voice/chime.go) and is loud only at a peak of its 659 Hz sine, at most
@@ -2644,25 +2655,39 @@ readonly chime_attack_us=6000 audible_error_us=1000
 
 # answer_earliest WAKE_MS FIRST_MS CHIME: set answer_from to the earliest sample of the recording at
 # which the rig can hear the answer whose first_audio is FIRST_MS, after the chime that starts sound
-# CHIME, the question's wake sound (its wake_heard WAKE_MS). It fails, setting nothing, when the
-# timing log gives no audible time for that chime, from lead_ms before WAKE_MS to wake_max_ms after
-# it, or for that answer, from FIRST_MS to 2 s after it, or gives the answer's within two
-# audible_error_us of the chime's.
+# CHIME, the question's wake sound (its wake_heard WAKE_MS). It fails, setting nothing and answer_why
+# to why, when the timing log gives no audible time for that chime, from lead_ms before WAKE_MS to
+# wake_max_ms after it, or for that answer, from FIRST_MS to 2 s after it; when the speaker had a
+# disruption between the two (a replay, an underrun or a failure), which can make the chime play
+# later than its audible time; or when it gives the answer's no later than the chime's.
 #
 # Both sounds left the same Output for the same speaker, so the rig hears each a latency after its
-# audible time, the same for both. The rig hears the answer's first sample (the time between their
+# audible time, the same for both. The rig hears the answer's first sound (the time between their
 # audible times) after the chime's first sample, at the rig's rate of the driver's clock, less 200
-# ppm; the chime's first sample is no later than its onset in the recording, less chime_attack_us;
-# and each audible time can be off by audible_error_us. Every term is taken at its earliest, and
-# rounded down a sample, so answer_from is never late.
+# ppm; the chime's first sample is no later than its onset in the recording, less chime_attack_us.
+# Each term is taken at its earliest: the answer's time less its lead (its resampler's filter can
+# sound before its first sample lands) and its error, the chime's plus its error, each less
+# audible_error_us for the device's account, and rounded down a sample, so answer_from is never late.
 answer_from=
+answer_why=
 answer_earliest() {
-  local chime_at answer_at gap_us
-  chime_at=$(audible_us chime $(($1 - lead_ms)) $(($1 + wake_max_ms)))
-  answer_at=$(audible_us voice "$2" $(($2 + 2000)))
-  whole_number "$chime_at" && whole_number "$answer_at" || return 1
-  gap_us=$((answer_at - chime_at - 2 * audible_error_us))
-  ((gap_us >= 0)) || return 1
+  local chime answer chime_at chime_err chime_seen answer_at answer_lead answer_err answer_seen gap_us
+  answer_why='the timing log gives no audible times for the chime and the answer'
+  chime=$(audible_of chime $(($1 - lead_ms)) $(($1 + wake_max_ms)))
+  answer=$(audible_of voice "$2" $(($2 + 2000)))
+  read -r chime_at _ chime_err chime_seen <<<"$chime"
+  read -r answer_at answer_lead answer_err answer_seen <<<"$answer"
+  whole_number "$chime_at" && whole_number "$answer_at" && whole_number "$chime_err" && whole_number "$answer_lead" \
+    && whole_number "$answer_err" && whole_number "$chime_seen" && whole_number "$answer_seen" || return 1
+  if ((chime_seen != answer_seen)); then
+    answer_why="the speaker had $((answer_seen - chime_seen)) disruptions (replays, underruns or failures) between the chime's audible time and the answer's, which can make the chime play later than its audible time"
+    return 1
+  fi
+  gap_us=$(((answer_at - answer_lead - answer_err) - (chime_at + chime_err) - 2 * audible_error_us))
+  if ((gap_us < 0)); then
+    answer_why="the answer's audible time is within its error of the chime's"
+    return 1
+  fi
   answer_from=$((sound_at[$3] - chime_attack_us * sample_rate / 1000000 + gap_us * sample_rate * 4999 / (1000000 * 5000) - 1))
 }
 step_playback_cancel() {
@@ -2808,13 +2833,14 @@ step_playback_cancel() {
           fail "playback-cancel stop $((i + 1)): a sound at the rig microphone starts $(((answer_from - sound_at[chime + 1]) * 1000 / sample_rate)) ms or more before the next question's answer can be heard there (timed against its chime in the same recording): audio of the cancelled answer"
         fi
       else
-        # This build logs no audible times: first_audio is when the answer's first frame was handed
-        # to the speaker (internal/audio, Output.next reads the clock before it writes the frame), so
-        # the answer is heard at it or later: a sound after the chime that starts before it is audio
-        # of the cancelled answer, and one that may start before it may be.
-        if [[ -z $audible_noted ]]; then
-          note "playback-cancel: the timing log gives no audible times for the chime and the answer, so a sound after a chime is timed against the answer's first_audio, and a leak that starts within the speaker's queue before it is not seen"
-          audible_noted=yes
+        # No audible times this build, or none usable (answer_why): first_audio is when the
+        # answer's first frame was handed to the speaker (internal/audio, Output.next reads the
+        # clock before it writes the frame), so the answer is heard at it or later: a sound after
+        # the chime that starts before it is audio of the cancelled answer, and one that may start
+        # before it may be.
+        if [[ $audible_noted != *"[$answer_why]"* ]]; then
+          note "playback-cancel stop $((i + 1)): $answer_why, so a sound after its chime is timed against the answer's first_audio, and a leak that starts within the speaker's queue before it is not seen"
+          audible_noted+="[$answer_why]"
         fi
         if ((chime + 1 < ${#sound_on[@]} && sound_on[chime + 1] < question_firsts[q])); then
           fail "playback-cancel stop $((i + 1)): a sound at the rig microphone starts $((sound_on[chime + 1] - sound_off[chime])) ms after the next question's chime ends, before its answer's first audio ($((question_firsts[q] - sound_on[chime + 1])) ms later): audio of the cancelled answer"

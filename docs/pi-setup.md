@@ -1042,14 +1042,18 @@ with the unit paused and no session active:
    difference.
    `playback-cancel` also checks that nothing starts after the next question's chime before its
    answer can be heard. The service logs an `audible` timing line as each sound on the chime or the
-   voice starts: when its first sample left ALSA's buffer for the speaker, by ALSA's own account of
-   the stream. The rig hears both sounds a latency after that, the same for both, so the earliest the
-   answer can be heard is the chime's onset in the same recording plus the time between their audible
-   lines, counted in samples. A leak that starts within about 8 ms of the answer is not told apart
-   from it: 6 ms for the chime's 5 ms attack, 1 ms for each audible line, and 200 ppm. The 1 ms is an
-   assumption about the USB speaker, which moves audio in 1 ms frames, not a measured bound. A build
-   without the audible lines is checked against the answer's `first_audio` instead, with a NOTE: a
-   leak within the speaker's queue before it, about 40 ms, is then not seen.
+   voice starts: when its first sample left the speaker's buffer, by the stream's own account (its
+   delay, read while it runs, with the clock read around it), how much earlier a resampled voice can
+   sound (its filter's span), how far off the time can be, and the disruptions (replays, underruns,
+   failures) the speaker had had. The rig hears both sounds a latency after that, the same for both,
+   so the earliest the answer can be heard is the chime's onset in the same recording plus the time
+   between their audible lines, counted in samples. A leak that starts within about 9 ms of the
+   answer is not told apart from it: 6 ms for the chime's 5 ms attack, 1 ms for each audible line,
+   about 1.4 ms for the voice's filter, and 200 ppm. The 1 ms is an assumption about the USB speaker,
+   which moves audio in 1 ms frames, not a measured bound. A disruption between the two lines can
+   make the chime play later than its line says, so the check then falls back to the answer's
+   `first_audio`, with a NOTE, as it does for a build without the lines: a leak within the speaker's
+   queue before `first_audio`, about 40 ms, is then not seen.
 6. Slice 4's two steps check the three capture states and the paused listener, with the
    listener turned on for the run only (`GHOST_WISPR_VOICE_PAUSED_LISTENER=true`, beside the
    voice). Both keep the microphone on the loopback, so the listener hears only what the step plays

@@ -689,17 +689,24 @@ def voice_state(fn):
 # written (internal/audio, Output.next), is heard 30 ms later. A cancel drops the queue, so a
 # speech's sound ends where its cut puts it.
 SPEAKER_QUEUE_MS = 30
-# The service's "audible" line for each speech on the chime or the voice input is when its first
-# sample left ALSA's buffer for the speaker; the rig hears it DEVICE_LATENCY_MS later, the same for
-# both inputs: 8 ms, or 25 ms with device-latency-25. With no-audible the service logs no such lines,
-# as a build before them.
+# The service's "audible" line for each speech on the chime or the voice input gives when its first
+# sample left the speaker's buffer, by the stream's account (audible_mono_ns), logged as the frame is
+# written, a queue before; the rig hears it DEVICE_LATENCY_MS later, the same for both inputs: 8 ms,
+# or 25 ms with device-latency-25. The voice, at 24 kHz, leads by its resampler's filter (65 samples
+# at 48 kHz); each time is good to about 1 us. Every line counts no disruption, but with
+# audible-disrupted the voice's counts one, as after an underrun between the chime and the answer.
+# With no-audible the service logs no such lines, as a build before them.
 DEVICE_LATENCY_MS = 25 if "device-latency-25" in SCENARIO else 8
 
 
 def audible(input_name, heard, session, tag=None):
     """The service's audible line for a sound on INPUT_NAME the rig hears at HEARD."""
-    if "no-audible" not in SCENARIO:
-        emit(kind="timing", due=heard - DEVICE_LATENCY_MS, event="audible", input=input_name, session_id=session, **({"tag": tag} if tag else {}))
+    if "no-audible" in SCENARIO:
+        return
+    emit(kind="timing", due=heard - DEVICE_LATENCY_MS - SPEAKER_QUEUE_MS, event="audible", input=input_name, session_id=session,
+         audible_mono_ns=(heard - DEVICE_LATENCY_MS) * 1_000_000, audible_lead_ns=1_354_167 if input_name == "voice" else 0,
+         audible_err_ns=1001, disruptions=1 if input_name == "voice" and "audible-disrupted" in SCENARIO else 0,
+         **({"tag": tag} if tag else {}))
 
 
 def speech(tag, start, length, session="session-1", fact=None):
@@ -1453,8 +1460,8 @@ def journalctl(args):
         elif item["kind"] == "timing":
             # As cmd/ghost-wispr/voice.go's voiceTiming logs it.
             fields = {"event": item["event"], "session_id": item["session_id"], "at_unix_ns": wall_ms(due) * 1_000_000, "at_mono_ns": due * 1_000_000}
-            for extra in ("reason", "input"):
-                if item.get(extra):
+            for extra in ("reason", "input", "audible_mono_ns", "audible_lead_ns", "audible_err_ns", "disruptions"):
+                if extra in item and item[extra] != "":
                     fields[extra] = item[extra]
             records.append(journal_record(due, "INFO", "voice timing", fields))
         elif item["kind"] == "log":
@@ -2409,6 +2416,11 @@ launch cancel-no-audible long,asound,stop-rounds-2,no-audible yes -- $cancel_arg
 launch cancel-leak-in-queue-no-audible long,asound,stop-rounds-2,leak-in-queue,no-audible yes -- $cancel_args
 # shellcheck disable=SC2086
 launch cancel-leak-before-first-no-audible long,asound,stop-rounds-2,leak-before-first,no-audible yes -- $cancel_args
+# The word inside the queue with an underrun between the chime's audible line and the answer's
+# (audible-disrupted): the chime may have played later than its line says, so the check falls back
+# to first_audio, with a NOTE of why; never the FAIL of a chime-timed threshold that cannot hold.
+# shellcheck disable=SC2086
+launch cancel-leak-in-queue-disrupted long,asound,stop-rounds-2,leak-in-queue,audible-disrupted yes -- $cancel_args
 # shellcheck disable=SC2086
 launch cancel-quiet-chime long,asound,stop-rounds-2,quiet-chime yes -- $cancel_args
 # shellcheck disable=SC2086
@@ -3251,19 +3263,23 @@ expect_line cancel-leak-in-queue-latency "before the next question's answer can 
 expect_restored cancel-leak-in-queue-latency
 expect_rc cancel-latency 0
 expect_line cancel-latency "PASS: playback-cancel: no stop's speech was heard at the rig microphone 20 ms after it"
-expect_no_line cancel-latency 'NOTE: playback-cancel: the timing log gives no audible times'
+expect_no_line cancel-latency 'the timing log gives no audible times for the chime and the answer'
 expect_restored cancel-latency
 expect_rc cancel-no-audible 0
 expect_line cancel-no-audible "PASS: playback-cancel: no stop's speech was heard at the rig microphone 20 ms after it"
-expect_line cancel-no-audible 'NOTE: playback-cancel: the timing log gives no audible times for the chime and the answer'
+expect_line cancel-no-audible 'the timing log gives no audible times for the chime and the answer, so a sound after its chime is timed against the answer'
 expect_restored cancel-no-audible
 expect_rc cancel-leak-in-queue-no-audible 0 2
-expect_line cancel-leak-in-queue-no-audible 'NOTE: playback-cancel: the timing log gives no audible times for the chime and the answer'
+expect_line cancel-leak-in-queue-no-audible 'the timing log gives no audible times for the chime and the answer, so a sound after its chime is timed against the answer'
 expect_no_line cancel-leak-in-queue-no-audible "FAIL: playback-cancel"
 expect_restored cancel-leak-in-queue-no-audible
 expect_rc cancel-leak-before-first-no-audible 1
 expect_line cancel-leak-before-first-no-audible "after the next question's chime ends, before its answer's first audio"
 expect_restored cancel-leak-before-first-no-audible
+expect_rc cancel-leak-in-queue-disrupted 0 2
+expect_line cancel-leak-in-queue-disrupted "the speaker had 1 disruptions (replays, underruns or failures) between the chime's audible time and the answer's"
+expect_no_line cancel-leak-in-queue-disrupted "FAIL: playback-cancel"
+expect_restored cancel-leak-in-queue-disrupted
 expect_rc cancel-quiet-chime 0
 expect_line cancel-quiet-chime "PASS: playback-cancel: no stop's speech was heard at the rig microphone 20 ms after it"
 expect_line cancel-quiet-chime 'NOTE: playback-cancel: calibration: the wake sound played alone (ghost-wispr play-sound) is heard at the rig microphone for 130 ms above -50 dB'
