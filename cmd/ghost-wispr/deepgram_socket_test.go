@@ -179,6 +179,54 @@ func TestDeepgramSocketCloseSendsCloseStream(t *testing.T) {
 	}
 }
 
+// TestDeepgramSocketReportsEachConfiguresAnswer fails if Deepgram's answer to
+// a Configure, a refusal or a success, does not reach OnConfigured's hook
+// with the keyterms it answers, or if a list given while one waits goes
+// before that answer (Deepgram refuses it, CONFIGURE_ALREADY_PENDING).
+func TestDeepgramSocketReportsEachConfiguresAnswer(t *testing.T) {
+	fake, host := startConfigureEndpoint(t)
+	socket := dialDeepgramEndpoint(t, host, nil)
+	type answer struct {
+		keyterms []string
+		taken    bool
+	}
+	answers := make(chan answer, 2)
+	socket.OnConfigured(func(keyterms []string, taken bool) { answers <- answer{keyterms, taken} })
+	next := func() answer {
+		t.Helper()
+		select {
+		case a := <-answers:
+			return a
+		case <-time.After(2 * time.Second):
+			t.Fatal("Deepgram's answer to a Configure did not reach the hook")
+			return answer{}
+		}
+	}
+	first, second := []string{"Wispr", "ABC-12"}, []string{"Wispr", "XYZ-9"}
+	if err := socket.Configure(first); err != nil {
+		t.Fatalf("Configure: %v", err)
+	}
+	waitConfigures(t, fake, 1)
+	if err := socket.Configure(second); err != nil {
+		t.Fatalf("Configure while one waits: %v", err)
+	}
+	time.Sleep(100 * time.Millisecond)
+	if got := fake.configures(); len(got) != 1 {
+		t.Fatalf("Deepgram got %q before it answered the first Configure, want one", got)
+	}
+	fake.answer <- "ConfigureFailure"
+	if a := next(); a.taken || !slices.Equal(a.keyterms, first) {
+		t.Fatalf("the hook heard taken=%t for %q, want a refusal of %q", a.taken, a.keyterms, first)
+	}
+	if got := waitConfigures(t, fake, 2)[1]; !slices.Equal(got, second) {
+		t.Fatalf("Deepgram got %q second, want %q", got, second)
+	}
+	fake.answer <- "ConfigureSuccess"
+	if a := next(); !a.taken || !slices.Equal(a.keyterms, second) {
+		t.Fatalf("the hook heard taken=%t for %q, want %q taken", a.taken, a.keyterms, second)
+	}
+}
+
 // TestDeepgramTranscriptsReachTheSessionManager fails if Deepgram's results
 // and utterance ends do not reach the session manager, which starts sessions
 // from final transcripts, or if the socket does not ask Deepgram with the

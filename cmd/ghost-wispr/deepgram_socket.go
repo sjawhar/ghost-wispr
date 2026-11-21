@@ -63,11 +63,15 @@ type deepgramSocket struct {
 
 	// A Configure waits for Deepgram's answer before the next is sent
 	// (Deepgram refuses a second, CONFIGURE_ALREADY_PENDING): configWant is
-	// the newest keyterms not sent yet, when configWaiting.
+	// the newest keyterms not sent yet, when configWaiting; configSent is the
+	// keyterms of the one that waits for its answer, and configAnswer hears
+	// the answer (OnConfigured).
 	configMu      sync.Mutex
 	configPending bool
 	configWaiting bool
 	configWant    []string
+	configSent    []string
+	configAnswer  func(keyterms []string, taken bool)
 }
 
 // dialDeepgramLive opens a live-transcription socket to Deepgram with
@@ -164,6 +168,15 @@ func (s *deepgramSocket) Configure(keyterms []string) error {
 	return nil
 }
 
+// OnConfigured makes answer hear Deepgram's answer to each Configure, with
+// the keyterms it answers (transcript.Configurer). A socket that closes
+// first never answers: the next dial carries the keyterms.
+func (s *deepgramSocket) OnConfigured(answer func(keyterms []string, taken bool)) {
+	s.configMu.Lock()
+	defer s.configMu.Unlock()
+	s.configAnswer = answer
+}
+
 // sendConfigure sends the newest keyterms waiting, if any; configPending is
 // set.
 func (s *deepgramSocket) sendConfigure() {
@@ -174,7 +187,7 @@ func (s *deepgramSocket) sendConfigure() {
 		return
 	}
 	want := s.configWant
-	s.configWant, s.configWaiting = nil, false
+	s.configWant, s.configWaiting, s.configSent = nil, false, want
 	s.configMu.Unlock()
 	body, err := json.Marshal(struct {
 		Type     string   `json:"type"`
@@ -192,17 +205,42 @@ func (s *deepgramSocket) sendConfigure() {
 }
 
 // configured takes Deepgram's answer to a Configure: a refusal is logged by
-// its code, and the keyterms that waited meanwhile go next.
+// its code, the answer goes to OnConfigured's hook with the keyterms it
+// answers, and the keyterms that waited meanwhile go next.
 func (s *deepgramSocket) configured(message []byte) {
 	var answer struct {
 		Type string `json:"type"`
 		Code string `json:"code"`
 	}
 	_ = json.Unmarshal(message, &answer)
-	if answer.Type == "ConfigureFailure" {
+	taken := answer.Type == "ConfigureSuccess"
+	if !taken {
 		slog.Warn("deepgram refused the keyterms of a join or a leave", "provider", "deepgram", "code", providererr.Token(answer.Code))
 	}
+	s.configMu.Lock()
+	sent, answered := s.configSent, s.configAnswer
+	s.configSent = nil
+	s.configMu.Unlock()
+	if answered != nil && sent != nil {
+		answered(sent, taken)
+	}
 	s.sendConfigure()
+}
+
+// keytermsRefusedWarningKey is the warning GET /api/status shows while
+// Deepgram has refused the keyterms of a join or a leave.
+const keytermsRefusedWarningKey = "deepgram-keyterms"
+
+// keytermsRefusedWarning is the live keyterms' refusal hook for warnings
+// (transcript.LiveKeyterms.SetRefusalHook).
+func keytermsRefusedWarning(warnings *warningsRegistry) func(refused bool) {
+	return func(refused bool) {
+		if refused {
+			warnings.Set(keytermsRefusedWarningKey, "Deepgram refused the live transcript's keyterms after a join or a leave, so it may not hear a joined agent's issue key; they go again with the next join, leave or reconnect")
+			return
+		}
+		warnings.Clear(keytermsRefusedWarningKey)
+	}
 }
 
 // isConfigureAnswer reports whether message is Deepgram's answer to a

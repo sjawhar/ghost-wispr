@@ -1175,6 +1175,10 @@ func main() {
 	// The live transcript's keyterms, which a join or a leave changes on the
 	// open Deepgram stream (R4, R17); nil when the voice cannot run.
 	liveKeyterms := newLiveKeyterms(&cfg, dispatchProjects.Get)
+	if liveKeyterms != nil {
+		// A keyterm list Deepgram refused shows on /api/status until one is taken.
+		liveKeyterms.SetRefusalHook(keytermsRefusedWarning(warningRegistry))
+	}
 	if restorePauseErr != nil {
 		warningRegistry.Set(captureStateWarningKey, "Capture pause state could not be restored; the recorder started paused")
 	}

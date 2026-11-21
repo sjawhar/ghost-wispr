@@ -77,7 +77,7 @@ func (f *configureEndpoint) configures() [][]string {
 
 func waitConfigures(t *testing.T, f *configureEndpoint, n int) [][]string {
 	t.Helper()
-	deadline := time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(5 * time.Second)
 	for len(f.configures()) < n {
 		if time.Now().After(deadline) {
 			t.Fatalf("Deepgram got %d Configure messages %q, want %d", len(f.configures()), f.configures(), n)
@@ -85,6 +85,24 @@ func waitConfigures(t *testing.T, f *configureEndpoint, n int) [][]string {
 		time.Sleep(5 * time.Millisecond)
 	}
 	return f.configures()
+}
+
+// dialConfigureEndpoint dials a configureEndpoint as the unit does, with live
+// keyterms: the wake phrases, then the joined agents' keys, then INFRA.
+func dialConfigureEndpoint(t *testing.T) (*configureEndpoint, *transcript.LiveKeyterms) {
+	t.Helper()
+	fake, host := startConfigureEndpoint(t)
+	keyterms := transcript.NewLiveKeyterms([]string{"Wispr", "Ghost Wispr"}, func() []string { return []string{"INFRA"} })
+	factory := makeDeepgramClientFactory(context.Background(), "test-key",
+		&interfaces.ClientOptions{Host: host},
+		&interfaces.LiveTranscriptionOptions{Model: "nova-3", Language: "en-US", Encoding: "linear16", SampleRate: 16000, Channels: 1},
+		transcriptCallback{keyterms: keyterms}, time.Second)
+	socket, err := factory(context.Background())
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	t.Cleanup(func() { _ = socket.Close() })
+	return fake, keyterms
 }
 
 // TestAJoinConfiguresTheLiveStream fails if a dial does not carry the live
@@ -140,4 +158,66 @@ func TestAJoinConfiguresTheLiveStream(t *testing.T) {
 	if got := len(fake.configures()); got != 3 {
 		t.Fatalf("Deepgram got %d Configure messages, want 3", got)
 	}
+}
+
+// TestARefusedConfigureIsSentAgain fails if a list Deepgram refused, with no
+// join or leave since, counts as the stream's: the stream keeps its old
+// keyterms, so the list must go once more after a short wait, count as the
+// stream's once Deepgram takes it, and then not go again for the same join.
+func TestARefusedConfigureIsSentAgain(t *testing.T) {
+	fake, keyterms := dialConfigureEndpoint(t)
+	joined := []string{"Wispr", "Ghost Wispr", "ABC-12", "INFRA"}
+	keyterms.SetJoined([]string{"ABC-12"})
+	waitConfigures(t, fake, 1)
+	fake.answer <- "ConfigureFailure"
+	if got := waitConfigures(t, fake, 2)[1]; !slices.Equal(got, joined) {
+		t.Fatalf("after a refusal Deepgram got %q, want the refused list %q again", got, joined)
+	}
+	fake.answer <- "ConfigureSuccess"
+	time.Sleep(200 * time.Millisecond)
+	keyterms.SetJoined([]string{"ABC-12"})
+	time.Sleep(150 * time.Millisecond)
+	if got := fake.configures(); len(got) != 2 {
+		t.Fatalf("Deepgram got %q after it took the list, want no third Configure", got)
+	}
+}
+
+// TestASecondRefusalWaitsForTheNextChange fails if a list Deepgram refused
+// twice is sent again before a join or a leave (a loop against a Deepgram
+// that keeps refusing), or if the next join or leave does not send it again
+// because it was sent before.
+func TestASecondRefusalWaitsForTheNextChange(t *testing.T) {
+	fake, keyterms := dialConfigureEndpoint(t)
+	joined := []string{"Wispr", "Ghost Wispr", "ABC-12", "INFRA"}
+	keyterms.SetJoined([]string{"ABC-12"})
+	waitConfigures(t, fake, 1)
+	fake.answer <- "ConfigureFailure"
+	waitConfigures(t, fake, 2)
+	fake.answer <- "ConfigureFailure"
+	// Three times the second a resend waits.
+	time.Sleep(3 * time.Second)
+	if got := fake.configures(); len(got) != 2 {
+		t.Fatalf("after a second refusal Deepgram got %q, want no third Configure before the list changes", got)
+	}
+	keyterms.SetJoined([]string{"ABC-12"})
+	if got := waitConfigures(t, fake, 3)[2]; !slices.Equal(got, joined) {
+		t.Fatalf("the next join sent %q, want the refused list %q again", got, joined)
+	}
+	fake.answer <- "ConfigureSuccess"
+}
+
+// TestARefusedConfigureWarnsUntilOneIsTaken fails if GET /api/status does not
+// warn once Deepgram refused a join's keyterms, or still warns once Deepgram
+// took them.
+func TestARefusedConfigureWarnsUntilOneIsTaken(t *testing.T) {
+	fake, keyterms := dialConfigureEndpoint(t)
+	warnings := newWarningsRegistry()
+	keyterms.SetRefusalHook(keytermsRefusedWarning(warnings))
+	keyterms.SetJoined([]string{"ABC-12"})
+	waitConfigures(t, fake, 1)
+	fake.answer <- "ConfigureFailure"
+	waitUntil(t, "the refusal's warning", func() bool { return len(warnings.KeysWithPrefix(keytermsRefusedWarningKey)) == 1 })
+	waitConfigures(t, fake, 2)
+	fake.answer <- "ConfigureSuccess"
+	waitUntil(t, "the warning to clear", func() bool { return len(warnings.List()) == 0 })
 }

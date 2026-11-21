@@ -3,7 +3,9 @@ package transcript
 import (
 	"slices"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 )
 
 func TestWakePhrasePosition(t *testing.T) {
@@ -108,18 +110,71 @@ func TestKeyterms(t *testing.T) {
 }
 
 // fakeStream is a live Deepgram socket as LiveKeyterms reaches it: it records
-// each Configure message's keyterms.
-type fakeStream struct{ configured [][]string }
+// each Configure message's keyterms, and gives the hook OnConfigured set
+// Deepgram's answer when the test says (answer).
+type fakeStream struct {
+	mu         sync.Mutex
+	configured [][]string
+	answered   func(keyterms []string, taken bool)
+}
 
 func (f *fakeStream) Configure(keyterms []string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.configured = append(f.configured, slices.Clone(keyterms))
 	return nil
+}
+
+func (f *fakeStream) OnConfigured(answer func(keyterms []string, taken bool)) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.answered = answer
+}
+
+// sent returns the keyterms of each Configure so far.
+func (f *fakeStream) sent() [][]string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return slices.Clone(f.configured)
+}
+
+// answer gives Deepgram's answer to the newest Configure: taken, or refused.
+func (f *fakeStream) answer(taken bool) {
+	f.mu.Lock()
+	answered, keyterms := f.answered, f.configured[len(f.configured)-1]
+	f.mu.Unlock()
+	answered(keyterms, taken)
+}
+
+// waitSent waits for the stream's nth Configure and returns them all.
+func waitSent(t *testing.T, f *fakeStream, n int) [][]string {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for len(f.sent()) < n {
+		if time.Now().After(deadline) {
+			t.Fatalf("the stream got %q, want %d Configure messages", f.sent(), n)
+		}
+		time.Sleep(time.Millisecond)
+	}
+	return f.sent()
+}
+
+// quickKeyterms are live keyterms whose resend of a refused list waits only
+// 20 ms, attached to a stream dialled with them.
+func quickKeyterms() (*LiveKeyterms, *fakeStream) {
+	k := NewLiveKeyterms([]string{"Wispr"}, func() []string { return []string{"INFRA"} })
+	k.retryAfter = 20 * time.Millisecond
+	stream := &fakeStream{}
+	k.Attach(stream, k.List())
+	return k, stream
 }
 
 // TestKeytermsChangeOnJoin fails if a join or a leave does not change the
 // live stream's keyterms with one Configure message, if the joined agents'
 // keys do not come right after the wake phrases, if an unchanged list is sent
-// again, or if a socket dialled before a join misses it.
+// again, if a socket dialled before a join misses it, or if the answer of the
+// socket a new one replaced lets a second Configure go to the new one before
+// it answered.
 func TestKeytermsChangeOnJoin(t *testing.T) {
 	k := NewLiveKeyterms([]string{"Wispr", "Ghost Wispr"}, func() []string { return []string{"INFRA", "OPS"} })
 	base := []string{"Wispr", "Ghost Wispr", "INFRA", "OPS"}
@@ -134,6 +189,7 @@ func TestKeytermsChangeOnJoin(t *testing.T) {
 	if len(stream.configured) != 1 || !slices.Equal(stream.configured[0], joined) {
 		t.Fatalf("a join sent %q, want one Configure with %q", stream.configured, joined)
 	}
+	stream.answer(true)
 	if !slices.Equal(k.List(), joined) {
 		t.Fatalf("after a join a dial reads %q, want %q", k.List(), joined)
 	}
@@ -146,6 +202,7 @@ func TestKeytermsChangeOnJoin(t *testing.T) {
 	if len(stream.configured) != 2 || !slices.Equal(stream.configured[1], base) {
 		t.Fatalf("a leave sent %q, want a second Configure with %q", stream.configured, base)
 	}
+	stream.answer(true)
 
 	// A socket dialled with the list from before a join, and attached after
 	// it, is sent the list at once; the join itself went to the socket that
@@ -158,14 +215,102 @@ func TestKeytermsChangeOnJoin(t *testing.T) {
 	if len(late.configured) != 1 || !slices.Equal(late.configured[0], want) {
 		t.Fatalf("a socket dialled before the join got %q, want one Configure with %q", late.configured, want)
 	}
-	// From the attach on, a leave reaches the new socket only.
+	// From the attach on, a leave reaches the new socket only. The replaced
+	// socket's answer comes late: the new one still waits for its own before
+	// it is sent the leave.
+	stream.answer(true)
 	before := len(stream.configured)
 	k.SetJoined(nil)
+	if len(late.configured) != 1 {
+		t.Fatalf("a leave went before the new socket answered its first Configure: %q", late.configured)
+	}
+	late.answer(true)
 	if len(late.configured) != 2 || !slices.Equal(late.configured[1], base) {
 		t.Fatalf("a leave after the attach sent the new socket %q, want a second Configure with %q", late.configured, base)
 	}
 	if len(stream.configured) != before {
 		t.Fatalf("the socket the new one replaced was sent %q", stream.configured[before:])
+	}
+}
+
+// TestOneConfigureWaitsForItsAnswer fails if a list goes while the last
+// waits for Deepgram's answer (Deepgram refuses it, CONFIGURE_ALREADY_PENDING),
+// if the answer does not send the newest list, or if a refusal sends the
+// refused list again although a newer one is wanted, which goes at once.
+func TestOneConfigureWaitsForItsAnswer(t *testing.T) {
+	k, stream := quickKeyterms()
+	k.SetJoined([]string{"ABC-12"})
+	k.SetJoined([]string{"ABC-12", "XYZ-9"})
+	k.SetJoined([]string{"XYZ-9"})
+	if got := stream.sent(); len(got) != 1 {
+		t.Fatalf("the stream got %q before it answered the first Configure, want one", got)
+	}
+	stream.answer(true)
+	if got, want := stream.sent(), []string{"Wispr", "XYZ-9", "INFRA"}; len(got) != 2 || !slices.Equal(got[1], want) {
+		t.Fatalf("after the answer the stream got %q, want the newest list %q second", got, want)
+	}
+	k.SetJoined([]string{"XYZ-9", "DEF-3"})
+	stream.answer(false)
+	want := []string{"Wispr", "XYZ-9", "DEF-3", "INFRA"}
+	if got := stream.sent(); len(got) != 3 || !slices.Equal(got[2], want) {
+		t.Fatalf("after a refusal with a newer list wanted the stream got %q, want %q third, at once", got, want)
+	}
+	time.Sleep(5 * k.retryAfter)
+	if got := stream.sent(); len(got) != 3 {
+		t.Fatalf("the stream got %q, want the refused list not sent again once a newer one went", got)
+	}
+}
+
+// TestARefusedListIsNotTheStreams fails if a list Deepgram refused, with no
+// join or leave since, counts as the stream's list: it must go once more
+// after retryAfter, and only Deepgram taking it makes it the stream's, after
+// which the same join sends nothing. The refusal hook must say the refusal,
+// and that Deepgram took the list.
+func TestARefusedListIsNotTheStreams(t *testing.T) {
+	k, stream := quickKeyterms()
+	refused := false
+	k.SetRefusalHook(func(r bool) { refused = r })
+	joined := []string{"Wispr", "ABC-12", "INFRA"}
+	k.SetJoined([]string{"ABC-12"})
+	stream.answer(false)
+	if !refused {
+		t.Fatal("the refusal hook did not say Deepgram refused the list")
+	}
+	if got := waitSent(t, stream, 2); !slices.Equal(got[1], joined) {
+		t.Fatalf("after a refusal the stream got %q, want %q again", got, joined)
+	}
+	stream.answer(true)
+	if refused {
+		t.Fatal("the refusal hook still says a refusal after Deepgram took the list")
+	}
+	k.SetJoined([]string{"ABC-12"})
+	time.Sleep(5 * k.retryAfter)
+	if got := stream.sent(); len(got) != 2 {
+		t.Fatalf("the stream got %q after Deepgram took the list, want no third Configure", got)
+	}
+}
+
+// TestASecondRefusalWaitsForTheNextChange fails if a list Deepgram refused
+// twice goes again before a join or a leave, or if the next one does not send
+// it again, with a resend of its own.
+func TestASecondRefusalWaitsForTheNextChange(t *testing.T) {
+	k, stream := quickKeyterms()
+	joined := []string{"Wispr", "ABC-12", "INFRA"}
+	k.SetJoined([]string{"ABC-12"})
+	stream.answer(false)
+	waitSent(t, stream, 2)
+	stream.answer(false)
+	time.Sleep(5 * k.retryAfter)
+	if got := stream.sent(); len(got) != 2 {
+		t.Fatalf("after a second refusal the stream got %q, want no third Configure before the list changes", got)
+	}
+	k.SetJoined([]string{"ABC-12"})
+	if got := stream.sent(); len(got) != 3 || !slices.Equal(got[2], joined) {
+		t.Fatalf("the next join sent %q, want %q third, at once", got, joined)
+	}
+	stream.answer(false)
+	if got := waitSent(t, stream, 4); !slices.Equal(got[3], joined) {
+		t.Fatalf("after the next join's refusal the stream got %q, want %q again", got, joined)
 	}
 }
 
