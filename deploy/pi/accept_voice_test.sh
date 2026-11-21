@@ -783,6 +783,9 @@ def react(kind, key, start, end):
         emit(kind="ws", due=end + 200, event={"type": "voice_exchange_started", "session_id": "session-1"})
         emit(kind="timing", due=end + 200, event="turn_end", session_id="session-1")
         tag = "speech-%d" % n
+        # The clip's true times, by the fake's own clock, beside the answer's tag: the self-test
+        # checks the driver's intervals against them (true_fact_median).
+        log_to("questions.log", "%s %d %d" % (tag, start, end))
         if "filler" in SCENARIO:
             # A filler early, then the fact at 5 s: the verification's negative control (a filler at
             # 0.3 s). Here the filler starts at 0.5 s, so that 150 ms of silence part it from the
@@ -926,11 +929,14 @@ def aplay(args):
     write("aplays", "%d\n" % n)
     log_to("aplay.log", "%s %s" % (device, path))
     write("aplay-pid.%d" % n, "%d\n" % os.getpid())
-    # slow-aplay-WORD starts the clip whose first word is WORD 2 s after aplay began, and slow-exit-WORD
-    # returns 1.8 s after it ended, as aplay's start and exit on a loaded machine: the driver knows only
-    # that the clip began after it started aplay and ended before aplay returned.
+    # slow-aplay-WORD starts the clip whose first word is WORD 2 s after aplay began, aplay-late-WORD
+    # 700 ms after, and slow-exit-WORD returns 1.8 s after it ended, as aplay's start and exit on a
+    # loaded machine: the driver knows only that the clip began after it started aplay and ended
+    # before aplay returned.
     if "slow-aplay-" + words[0] in SCENARIO:
         time.sleep(2.0)
+    if "aplay-late-" + words[0] in SCENARIO:
+        time.sleep(0.7)
     start = now_ms()
     write("aplay-start.%d" % n, "%d\n" % start)
     # The voice's reaction is worked out while the clip plays (for its WAV length, 300 ms), so that
@@ -1836,6 +1842,51 @@ measured() {
   sed -n "s/^\(PASS\|FAIL\): $2 \(-\{0,1\}[0-9][0-9]*\) ms.*/\2/p" "$root/$1/out" | head -n 1
 }
 
+# true_fact_median NAME: by the fake's own clock, the nearest-rank median, over the questions the
+# fake answered (questions.log), of the time from each question clip's true end to when its first
+# fact truly reached the microphone: the fact_audio time, plus the speaker's queue that the fake's
+# sound starts after its first frame (the sound's start less first_audio). Empty with no question.
+true_fact_median() {
+  python3 - "$root/$1/state" <<'EOF'
+import json, math, os, sys
+state = sys.argv[1]
+items = [json.loads(line) for line in open(os.path.join(state, "timeline.jsonl")) if line.strip()]
+
+
+def first(kind, tag, key, event=None):
+    for item in items:
+        if item.get("kind") == kind and item.get("tag") == tag and event in (None, item.get("event")):
+            return item[key]
+    return None
+
+
+truths = []
+for line in open(os.path.join(state, "questions.log")):
+    tag, _, end = line.split()
+    first_audio, fact = first("timing", tag, "due", "first_audio"), first("timing", tag, "due", "fact_audio")
+    sound = first("sound", tag, "start")
+    if None not in (first_audio, fact, sound):
+        truths.append(fact + sound - first_audio - int(end))
+truths.sort()
+print(truths[math.ceil(len(truths) / 2) - 1] if truths else "")
+EOF
+}
+
+# expect_holds NAME PATTERN TRUTH: the PASS line after PATTERN gives an interval, its first number
+# (the late bound) and the one after "no earlier than" or "no less than" (the early bound), that
+# holds TRUTH, the fake's own time for what it measured. A driver's interval may be as wide as its
+# clips' timing allows; it must never leave out the truth.
+expect_holds() {
+  local got low high
+  got=$(sed -n "s/^PASS: $2 \([0-9][0-9]*\) ms.*(no \(earlier\|less\) than \(-\{0,1\}[0-9][0-9]*\) ms).*/\3 \1/p" "$root/$1/out" | head -n 1)
+  read -r low high <<<"$got"
+  if [[ -z $low || -z $high || -z $3 ]]; then
+    check_failed "$1: no interval in a line \"PASS: $2\", or no true time from the fake (interval '$got', truth '$3'); output: $(tr '\n' '|' <"$root/$1/out")"
+  elif ((low > $3 || $3 > high)); then
+    check_failed "$1: $2: the driver's interval, $low to $high ms, leaves out the fake's true $3 ms"
+  fi
+}
+
 # expect_between NAME GOT LOW HIGH: GOT is a number of milliseconds from LOW to HIGH. NAME starts
 # with its case's name; when GOT is missing or out of range, the message also gives that case's
 # output and the fake's stops.log, since a tail that was never measured can have any cause, and an
@@ -1858,6 +1909,10 @@ readonly rig=plughw:CARD=Rigmic,DEV=0
 
 # The exchange step (the default): a full pass, --go-ahead with --keep, and its failures.
 launch pass pass '' -- --question @question.wav --event-timeout 10
+# The pass with the question's aplay starting the clip 700 ms after the driver started it
+# (aplay-late-question): the delay's interval is at least that much wider, and still holds the
+# fake's true delay, under the 3 s bound: PASS.
+launch pass-aplay-late pass,aplay-late-question '' -- --question @question.wav --event-timeout 10
 # The restore's stop finds a service whose shutdown hangs: it takes SIGTERM (and SIGCONT) but goes
 # on running, as does a process the kernel holds in uninterruptible sleep. systemd sends SIGKILL
 # after its stop timeout (90 s, the unit's default) and the stop succeeds: the run must pass.
@@ -2261,11 +2316,21 @@ for line in 'PASS: precondition: the unit is paused with no active session' \
   expect_line pass "$line"
 done
 expect_no_line pass 'FAIL'
-# The fake speaks 700 ms after its own end of the clip; the driver's end comes later by aplay's exit,
-# which grows under load, so the lower bounds leave room for it.
+# The chime is timed from voice_wake, which the fake stamps 120 ms before it; no clip's timing comes
+# into it. The speech's delay is an interval as wide as the question clip's timing allows, which
+# grows with aplay's start and exit under load: it must hold the fake's true delay.
 expect_between 'pass: wake to chime' "$(measured pass chime)" 60 300
-expect_between 'pass: end of the question to speech' "$(measured pass speech)" 450 1000
+expect_holds pass speech "$(true_fact_median pass)"
 expect_restored pass
+expect_rc pass-aplay-late 0
+expect_line pass-aplay-late 'PASS: speech '
+expect_holds pass-aplay-late speech "$(true_fact_median pass-aplay-late)"
+late_interval=$(sed -n 's/^PASS: speech \([0-9]*\) ms after the end of the question (no earlier than \(-\{0,1\}[0-9]*\) ms).*/\2 \1/p' "$root/pass-aplay-late/out")
+read -r late_low late_high <<<"$late_interval"
+if [[ -z $late_low || -z $late_high ]] || ((late_high - late_low < 700)); then
+  check_failed "pass-aplay-late: the speech's interval, '$late_interval', is not at least the 700 ms aplay waited before the clip: the case did not delay it"
+fi
+expect_restored pass-aplay-late
 expect_rc pass-slow-exit 0
 expect_restored pass-slow-exit
 [[ -s $root/pass-slow-exit/state/stop-killed ]] \
@@ -2524,7 +2589,7 @@ expect_rc scripted 2
 expect_line scripted 'PASS: scripted tts: median '
 expect_line scripted 'PASS: scripted tts: 90th percentile '
 expect_line scripted 'UNKNOWN: scripted gptlive: this build refuses voice.engine gptlive: voice.engine "gptlive" is not in this build'
-expect_between 'scripted: tts median' "$(measured scripted 'scripted tts: median')" 450 1000
+expect_holds scripted 'scripted tts: median' "$(true_fact_median scripted)"
 grep -Fqx GHOST_WISPR_VOICE_ENGINE=gptlive "$root/scripted/state/started-env.3" || check_failed 'scripted: gptlive did not get its own start'
 expect_restored scripted
 expect_rc scripted-unsure 2
@@ -2537,11 +2602,17 @@ expect_no_line scripted-slow-start 'PASS: scripted tts: median '
 expect_restored scripted-slow-start
 expect_rc scripted-filler 1
 expect_line scripted-filler 'more than 2500 ms; this voice is past the bound'
-expect_between 'scripted-filler: the median the negative control reports' "$(measured scripted-filler 'scripted tts: median')" 4500 5600
+# The negative control: the fake's true median is past the 2.5 s bound, and the FAIL's early bound is
+# no later than it.
+filler_truth=$(true_fact_median scripted-filler)
+filler_low=$(measured scripted-filler 'scripted tts: median')
+if [[ -z $filler_truth || -z $filler_low ]] || ((filler_truth <= 2500 || filler_low > filler_truth)); then
+  check_failed "scripted-filler: the FAIL's early bound, '${filler_low}' ms, or the fake's true median, '${filler_truth}' ms, is not a median past the 2500 ms bound bounded from below"
+fi
 expect_restored scripted-filler
 expect_rc scripted-joined 0
 expect_line scripted-joined 'followed the sentence before it with no gap'
-expect_between 'scripted-joined: median' "$(measured scripted-joined 'scripted tts: median')" 1550 2150
+expect_holds scripted-joined 'scripted tts: median' "$(true_fact_median scripted-joined)"
 expect_restored scripted-joined
 expect_rc scripted-few 2
 expect_line scripted-few 'UNKNOWN: scripted needs: --question-dir with 5 clips'
