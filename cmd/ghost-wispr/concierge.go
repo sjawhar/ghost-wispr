@@ -98,6 +98,17 @@ func startConcierge(ctx context.Context, cfg *config.Config, store *storage.SQLi
 	}
 	stop := func(ctx context.Context) {
 		cancel()
+		defer stopConcierge(ctx)
+		// A session already open is closed now, even past the deadline:
+		// its Close gives up at ctx's end (envoy.Session.Close).
+		select {
+		case session := <-sessions:
+			if session != nil {
+				closeSession(ctx, session)
+			}
+			return
+		default:
+		}
 		select {
 		case session := <-sessions:
 			if session != nil {
@@ -113,7 +124,6 @@ func startConcierge(ctx context.Context, cfg *config.Config, store *storage.SQLi
 				}
 			}()
 		}
-		stopConcierge(ctx)
 	}
 	return c, stop, nil
 }

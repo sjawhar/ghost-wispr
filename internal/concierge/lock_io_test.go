@@ -50,9 +50,9 @@ func lockFreeWhileHeld(c *Concierge, h *heldLog, free chan<- bool) {
 	}
 	got := make(chan struct{})
 	go func() {
-		c.mu.Lock()
-		c.mu.Unlock() //nolint:staticcheck // taking the lock is the check
-		close(got)
+		defer close(got)
+		c.mu.Lock() // taking the lock is the check
+		defer c.mu.Unlock()
 	}()
 	select {
 	case <-got:
