@@ -384,8 +384,11 @@ type exchange struct {
 	// a result whose words were all said before it is that turn's, which
 	// Deepgram sent late (stale). turnFrom is turnEnd as it was when that
 	// turn began: a stale result none of whose words was said after it is an
-	// earlier turn's (ofTurn).
-	turnEnd, turnFrom time.Time
+	// earlier turn's (ofTurn). lastTurnEnd is turnEnd as it was before the
+	// voice's latest speech began: a stale result said after it, when the
+	// turn now heard began before it, is of a turn the voice answered before
+	// any result of it came (answeredUnheard).
+	turnEnd, turnFrom, lastTurnEnd time.Time
 	// played are the spans in which its voice played since its latest cut
 	// (cutAt), which the Supervisor records when it cancels the voice
 	// (cutDriverLocked): only words said in one talk over it (talksOver).
@@ -930,6 +933,9 @@ func (s *Supervisor) onTranscriptLocked(t *Transcript) {
 				s.bargeInLocked(ex, t, now)
 				break
 			}
+			if stale && ex.answeredUnheard(t) {
+				ex.turnFrom = ex.lastTurnEnd // the voice answered this call before its result came
+			}
 			ex.wakeStart, ex.wakeSaid = wakeStart(t, m), wakeSaidAt(t, m)
 			ex.turn, ex.interim, ex.turnFinal = nil, "", false
 			ex.followUpTurn = false // a call, with the wake phrase
@@ -1006,8 +1012,10 @@ func (s *Supervisor) onTranscriptLocked(t *Transcript) {
 // all said before the voice spoke after the turn it answers (stale) is that
 // turn's, which Deepgram sent late, if a word of it was said after that turn
 // began (ofTurn): it completes that turn, begins no new one, and the window
-// stays. Once a later turn has begun, or if it is an earlier turn's, it is
-// nothing.
+// stays. When the voice answered a turn before any result of it came, that
+// turn's late result begins it (answeredUnheard), as main begins a new turn,
+// and the turn heard before is dropped. Once a later turn has begun, or if
+// it is an earlier turn's, it is nothing.
 func (s *Supervisor) driverHeardLocked(ex *exchange, t *Transcript, words string) {
 	switch {
 	case !ex.stale(t):
@@ -1017,6 +1025,13 @@ func (s *Supervisor) driverHeardLocked(ex *exchange, t *Transcript, words string
 			ex.followUpTurn = ex.followUpTimer != nil && !ex.askedBack
 		}
 		s.disarmFollowUpLocked(ex)
+		s.turnLocked(ex, t, words)
+	case ex.newTurn && ex.answeredUnheard(t):
+		// The voice's latest speech answers it: the room's next words are
+		// still a new turn.
+		ex.turnFrom = ex.lastTurnEnd
+		ex.turn, ex.interim, ex.turnFinal = nil, "", false
+		ex.followUpTurn = ex.followUpTimer != nil && !ex.askedBack
 		s.turnLocked(ex, t, words)
 	case ex.newTurn && ex.ofTurn(t):
 		s.turnLocked(ex, t, words)
@@ -1066,6 +1081,14 @@ func (ex *exchange) stale(t *Transcript) bool {
 // voice answers it, is not.
 func (ex *exchange) ofTurn(t *Transcript) bool {
 	return t.saidAfter(ex.turnFrom)
+}
+
+// answeredUnheard reports whether t, a stale result, is of a turn ex's
+// driving voice answered before any result of it came: the turn heard now
+// began before the voice's latest speech answered what was said after its
+// speech before (lastTurnEnd), and a word of t was said after that.
+func (ex *exchange) answeredUnheard(t *Transcript) bool {
+	return ex.turnFrom.Before(ex.lastTurnEnd) && t.saidAfter(ex.lastTurnEnd)
 }
 
 // neverMindLocked answers "Wispr, never mind" (R7): the Concierge cancels the
@@ -1482,6 +1505,9 @@ func (s *Supervisor) driverSpeechLocked(ex *exchange, started bool, at time.Time
 	s.disarmFollowUpLocked(ex)
 	// Each speech the voice starts answers what was said before it; a turn
 	// begun while it spoke ends with the speech.
+	if started {
+		ex.lastTurnEnd = ex.turnEnd
+	}
 	if started || !ex.newTurn {
 		ex.turnEnd = at
 	}

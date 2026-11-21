@@ -2,6 +2,7 @@ package voice
 
 import (
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -625,7 +626,9 @@ func TestATalkOverBeforeItsStartEventIsDeliveredStopsTheVoice(t *testing.T) {
 // that the driving voice answered from its own audio of the room, before
 // Deepgram's result for it came, counts as a new turn once that result comes
 // after the answer: it closed the follow-up window, and the exchange stayed
-// open for IdleWait.
+// open for IdleWait. Nor may that result join the question before it: the
+// turn the voice answered is the follow-up alone, as on main (Sol's review
+// of #133 at 2044b4c: "what's the status of INFRA-1027? Who signed off?").
 func TestAFollowUpAnsweredBeforeItsTranscriptIsNoNewTurn(t *testing.T) {
 	// FollowUpWait outlasts the follow-up said in it, and is shorter than
 	// eventually's wait.
@@ -653,7 +656,54 @@ func TestAFollowUpAnsweredBeforeItsTranscriptIsNoNewTurn(t *testing.T) {
 	r.speaker.finish(audio.InputVoice)
 	eventually(t, "the second answer's follow-up window", window)
 	r.s.OnTranscript(timedResult("Who signed off?", 210, true, asked)) // its final, after the answer
+	r.s.mu.Lock()
+	turn, asker := r.s.turnOf(r.s.ex), r.s.ex.x.AskerTurn
+	r.s.mu.Unlock()
+	if turn != "Who signed off?" || asker != turn {
+		t.Errorf("the turn is %q, AskerTurn %q; want the follow-up alone", turn, asker)
+	}
 	eventually(t, "the exchange to end FollowUpWait after the second answer", func() bool { _, _, closed := sess.state(); return closed })
+}
+
+// TestAnOlderFinalDoesNotJoinAFollowUpAnsweredBeforeItsTranscript fails if
+// the question's final, which comes after the late final of a follow-up the
+// driving voice answered before any result of it came, joins that follow-up:
+// only an interim of the question came in time, so no result began the
+// follow-up's turn (Sol's review of #133 at 2044b4c; main joins them too).
+// The follow-up is asked without and with the wake phrase.
+func TestAnOlderFinalDoesNotJoinAFollowUpAnsweredBeforeItsTranscript(t *testing.T) {
+	for _, follow := range []string{"And who holds it?", "Wispr, who holds it?"} {
+		t.Run(follow, func(t *testing.T) {
+			r := newLongFollowUpDrivingRig(t)
+			woke := time.Now().Add(-4 * time.Second)
+			r.s.OnTranscript(timedResult("Wispr.", 10, true, from(woke)))
+			sess := r.waitSession()
+			asked := from(woke.Add(time.Second))
+			r.s.OnTranscript(timedResult("What is its status?", 11, false, asked))
+			speakAs(t, sess, "The issue is in review.")
+			first := waitSpeechAfter(t, r, time.Time{})
+			r.speaker.finish(audio.InputVoice)
+			r.speaker.FlushSpeech()
+			followAt := from(time.Now())
+			time.Sleep(time.Until(followAt(3)) + 20*time.Millisecond)
+			speakAs(t, sess, "Ada holds it.") // answered before any result of it came
+			waitSpeechAfter(t, r, first)
+			r.s.OnTranscript(timedResult(follow, 20, true, followAt))
+			want := strings.TrimPrefix(follow, "Wispr, ")
+			turn := func() string {
+				r.s.mu.Lock()
+				defer r.s.mu.Unlock()
+				return r.s.turnOf(r.s.ex)
+			}
+			if got := turn(); got != want {
+				t.Fatalf("control: the follow-up's late final made the turn %q, want %q", got, want)
+			}
+			r.s.OnTranscript(timedResult("What is its status?", 11, true, asked))
+			if got := turn(); got != want {
+				t.Errorf("the question's final made the turn %q, want the follow-up %q alone", got, want)
+			}
+		})
+	}
 }
 
 // TestAWakeWordAFinalMovedAtTheEdgeIsNoNewCall fails if a final that moved the
@@ -955,6 +1005,19 @@ func TestTheVoicesOwnEchoDoesNotStopIt(t *testing.T) {
 			sess := r.waitSession()
 			speakAs(t, sess, tc.said)
 			started := waitSpeechAfter(t, r, time.Time{})
+			// The voice's text reaches the Supervisor on its event goroutine,
+			// which may not have run yet: its echo comes later than that in
+			// the room.
+			eventually(t, "the Supervisor to have the voice's line", func() bool {
+				r.s.mu.Lock()
+				defer r.s.mu.Unlock()
+				for _, o := range r.s.own {
+					if o.words[normWord(strings.Fields(tc.said)[0])] {
+						return true
+					}
+				}
+				return false
+			})
 			r.s.OnTranscript(timedResult("is in review since this morning.", 200, false, from(started.Add(300*time.Millisecond))))
 			if tc.stops {
 				eventually(t, "the control's words to stop the voice", func() bool { return voiceCutAfter(r, started) })

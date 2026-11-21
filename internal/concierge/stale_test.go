@@ -108,10 +108,12 @@ func TestASpokenKeyIsReadInTheFormsDeepgramWrites(t *testing.T) {
 // TestEveryFormOfAKeyReadsAsTheKey fails if a spoken or formatted form of an
 // issue key reaches the Concierge's read as another issue, or as none: on
 // 2026-11-21 "infra 10/27", smart formatting's date for "infra ten twenty
-// seven", was read as INFRA-10. Each form goes the way a turn does: the
-// Supervisor writes the spoken keys of Dispatch's projects as keys
-// (transcript.WriteKeys), and the Concierge reads the record the turn names
-// (readTarget).
+// seven", was read as INFRA-10. Nor may a date read as a key: "pencilled in
+// for 10/27" read as INFRA-1027 once a date's slash was taken out (Sol's
+// review of #133 at 2044b4c), where main reads no key. Each form goes the
+// way a turn does: the Supervisor writes the spoken keys of Dispatch's
+// projects as keys (transcript.WriteKeys), and the Concierge reads the
+// record the turn names (readTarget).
 func TestEveryFormOfAKeyReadsAsTheKey(t *testing.T) {
 	r := newRig(t)
 	projects := r.records.projects
@@ -135,6 +137,8 @@ func TestEveryFormOfAKeyReadsAsTheKey(t *testing.T) {
 		{"what's the status of infra one thousand and twenty seven?", "INFRA-1027"},
 		{"what's the status of INFRA four thousand five hundred and ninety two?", "INFRA-4592"},
 		{"The review is on 10/27.", ""},
+		{"Are we pencilled in for 10/27?", ""},
+		{"Are we pencilled in for 1027?", "INFRA-1027"},
 	} {
 		turn := transcript.WriteKeys(tc.said, projects)
 		target := r.concierge.readTarget(context.Background(), turn, true)
