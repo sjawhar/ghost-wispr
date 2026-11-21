@@ -84,35 +84,55 @@ func TestADriverVoiceThatFailsPlaysTheWholeErrorSound(t *testing.T) {
 // speaking the answer, because a follow-up window the routing line opened ran
 // out then (voice C's follow_up_race: 3 of 3 runs lost the answer).
 //
-// The tool is called once the exchange holds its session (the exchange's
-// start event), as a vendor calls it over the open session. The fake voice
-// hands the test its session from inside Open, before the Supervisor holds
-// it, and a tool called then finds no session to speak the routing line
-// through: the line then leads the answer instead, and the test, waiting for
-// it to be spoken at once, would time out.
+// The window's expiry runs when the test says, just after the answer
+// returns, not on a timer: a test that wakes late, as 350 ms after the window
+// opened where the window is 200 ms, would otherwise let the timer fire while
+// the tool still runs, where it ends nothing and never fires again, and pass
+// with the window left open. The tool is called once the exchange holds its
+// session (the exchange's start event), as a vendor calls it over the open
+// session.
 func TestAnAnswerReturningAsTheFollowUpWindowCloses(t *testing.T) {
-	c := newFakeConcierge("The issue is in review.")
-	c.acks = []string{"Reading ABC-12."}
-	c.afterAcks = make(chan struct{})
-	r := newDrivingRigWith(t, time.Minute, c)
-	r.heard("Wispr, what is happening with ABC-12?", true, true)
-	sess := r.waitSession()
-	r.waitEvent(EventExchangeStarted + ":sess-1")
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		_, _ = sess.x.Tools.Run(t.Context(), ToolCall{ID: "d1", Name: AnswerTool, Args: json.RawMessage(`{"question":"q"}`)})
-	}()
-	if got := waitSaid(t, sess); got != "Reading ABC-12." {
-		t.Fatalf("said %q", got)
+	for _, late := range []time.Duration{0, 350 * time.Millisecond} {
+		t.Run(fmt.Sprintf("the test %v late", late), func(t *testing.T) {
+			c := newFakeConcierge("The issue is in review.")
+			c.acks = []string{"Reading ABC-12."}
+			c.afterAcks = make(chan struct{})
+			windows := make(chan func(), 8)
+			r := newRigWith(t, c, func(cfg *SupervisorConfig, r *rig) {
+				v := drivingVoice{r.voice}
+				cfg.Voice = func() (Voice, error) { return v, nil }
+				cfg.IdleWait = time.Minute
+				cfg.followUpAfter = func(_ time.Duration, expire func()) *time.Timer {
+					windows <- expire
+					return time.AfterFunc(time.Hour, func() {}) // runs only when the test says
+				}
+			})
+			r.heard("Wispr, what is happening with ABC-12?", true, true)
+			sess := r.waitSession()
+			r.waitEvent(EventExchangeStarted + ":sess-1")
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				_, _ = sess.x.Tools.Run(t.Context(), ToolCall{ID: "d1", Name: AnswerTool, Args: json.RawMessage(`{"question":"q"}`)})
+			}()
+			if got := waitSaid(t, sess); got != "Reading ABC-12." {
+				t.Fatalf("said %q", got)
+			}
+			r.waitSpeaking()
+			r.speaker.finish(audio.InputVoice) // the routing line ends: the window opens
+			var expire func()
+			select {
+			case expire = <-windows:
+			case <-time.After(testWait):
+				t.Fatal("control: the routing line's end opened no follow-up window")
+			}
+			time.Sleep(late)
+			close(c.afterAcks)
+			<-done
+			expire() // the window runs out just after the answer returned
+			never(t, "the exchange ended before the voice spoke the answer", 300*time.Millisecond, func() bool { _, _, closed := sess.state(); return closed })
+		})
 	}
-	r.waitSpeaking()
-	r.speaker.finish(audio.InputVoice) // the routing line ends: the window opens
-	// The answer returns just before the window (200 ms in the rig) closes.
-	time.Sleep(150 * time.Millisecond)
-	close(c.afterAcks)
-	<-done
-	never(t, "the exchange ended before the voice spoke the answer", 400*time.Millisecond, func() bool { _, _, closed := sess.state(); return closed })
 }
 
 // TestAnExchangeAtItsCapSaysSo fails if an exchange that reaches its
