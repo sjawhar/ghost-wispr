@@ -331,11 +331,23 @@ func TestNewMicUsesOpenInputStreamFn(t *testing.T) {
 	}
 }
 
+// stubPortAudioLifecycle makes PortAudio's terminate and initialize do
+// nothing for the rest of the test: a real initialization connects to the
+// sound server and lists its devices, which a test may not do (realDevice).
+func stubPortAudioLifecycle(t *testing.T) {
+	t.Helper()
+	originalInitialize, originalTerminate := paInitialize, paTerminate
+	t.Cleanup(func() { paInitialize, paTerminate = originalInitialize, originalTerminate })
+	paInitialize = func() error { return nil }
+	paTerminate = func() error { return nil }
+}
+
 func TestMicReopenFailureClearsStreamAndMarksInactive(t *testing.T) {
 	original := openInputStreamFn
 	t.Cleanup(func() {
 		openInputStreamFn = original
 	})
+	stubPortAudioLifecycle(t)
 
 	openInputStreamFn = func(string, int, int, *[]int16) (inputStream, error) {
 		return nil, errors.New("open failed")
@@ -413,6 +425,7 @@ func TestMicIsOpenIsSafeDuringReopen(t *testing.T) {
 	t.Cleanup(func() {
 		openInputStreamFn = original
 	})
+	stubPortAudioLifecycle(t)
 	// A stream that opens but cannot start: each Reopen opens and closes one.
 	openInputStreamFn = func(string, int, int, *[]int16) (inputStream, error) {
 		return &portaudio.Stream{}, nil

@@ -34,6 +34,9 @@ func openSpeakerStream(deviceName string) (PlaybackStream, int, error) {
 	params.Output.Channels = channels
 	params.SampleRate = float64(rate)
 	params.FramesPerBuffer = frames
+	if err := realDevice("PortAudio output " + dev.Name); err != nil {
+		return nil, 0, err
+	}
 	stream, err := portaudio.OpenStream(params, buf)
 	if err != nil {
 		return nil, 0, fmt.Errorf("open output stream on %s: %w", dev.Name, err)

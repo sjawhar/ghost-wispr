@@ -2,7 +2,10 @@
 
 package audio
 
-import "testing"
+import (
+	"errors"
+	"testing"
+)
 
 // TestALSACaptureReadsWholeBuffers fails if the paused listener's ALSA capture
 // cannot open a PCM for 16 kHz mono capture, returns less than a buffer from a
@@ -26,7 +29,12 @@ func TestALSACaptureReadsWholeBuffers(t *testing.T) {
 	if _, err := capture.Read(buf); err == nil {
 		t.Fatal("a closed capture still read")
 	}
-	if _, err := OpenALSACapture("no-such-pcm-gw", 16000); err == nil {
-		t.Fatal("control: a PCM ALSA does not define opened")
+	// Control: a PCM ALSA does not define fails in ALSA. It is no device, so
+	// the test binary lets the open through to ALSA.
+	restore := AllowRealDevices()
+	_, err = OpenALSACapture("no-such-pcm-gw", 16000)
+	restore()
+	if err == nil || errors.Is(err, ErrRealDeviceRefused) {
+		t.Fatalf("control: open of a PCM ALSA does not define = %v, want ALSA's error", err)
 	}
 }

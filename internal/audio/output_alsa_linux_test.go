@@ -13,8 +13,6 @@ import (
 	"syscall"
 	"testing"
 	"time"
-
-	"github.com/gordonklaus/portaudio"
 )
 
 // pcmRun is one stretch a fakePCM played without a stop: from start, the
@@ -662,11 +660,15 @@ func TestALSAStreamLogsEveryUnderrunItRecoversFrom(t *testing.T) {
 // Jabra's microphone included, so it runs only inside a microphone start,
 // under a red light: a unit restarted paused has none, and the speaker must
 // still speak (A8). It plays through ALSA's null PCM here, as it plays through
-// the Jabra's playback PCM on the unit, with PortAudio not initialized. The
-// null PCM never makes a write wait, so the Output must keep itself to real
-// time: it runs at most outputAhead ahead.
+// the Jabra's playback PCM on the unit, and counts PortAudio's
+// initializations, which must be none. The null PCM never makes a write wait,
+// so the Output must keep itself to real time: it runs at most outputAhead
+// ahead.
 func TestOutputPlaysThroughALSAWithoutPortAudio(t *testing.T) {
-	_ = TerminatePortAudio() // whatever an earlier test initialized
+	originalInitialize := paInitialize
+	t.Cleanup(func() { paInitialize = originalInitialize })
+	var initialized atomic.Int32
+	paInitialize = func() error { initialized.Add(1); return nil }
 	out := NewOutput(OutputConfig{Device: "null"})
 	t.Cleanup(func() { _ = out.Close() })
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -674,10 +676,10 @@ func TestOutputPlaysThroughALSAWithoutPortAudio(t *testing.T) {
 	began := time.Now()
 	pb := out.Begin(InputVoice)
 	if err := pb.WriteAll(ctx, constant(16000, 300*time.Millisecond, 1000), AudioFormat{SampleRate: 16000, Channels: 1}); err != nil {
-		t.Fatalf("WriteAll with PortAudio not initialized = %v, want it played through ALSA", err)
+		t.Fatalf("WriteAll through ALSA = %v, want it played", err)
 	}
 	if err := pb.Drain(ctx); err != nil {
-		t.Fatalf("Drain with PortAudio not initialized = %v, want it played through ALSA", err)
+		t.Fatalf("Drain through ALSA = %v, want it played", err)
 	}
 	if played := pb.Played(); played != 300*time.Millisecond {
 		t.Fatalf("played %v, want 300 ms", played)
@@ -685,15 +687,11 @@ func TestOutputPlaysThroughALSAWithoutPortAudio(t *testing.T) {
 	if took := time.Since(began); took < 300*time.Millisecond-outputAhead-outputFrame {
 		t.Fatalf("300 ms of audio played in %v: the Output ran ahead of real time", took)
 	}
-	if _, err := portaudio.DefaultOutputDevice(); err != portaudio.NotInitialized {
-		t.Fatalf("after the speech, PortAudio answers %v, want it not initialized: the speaker initialized PortAudio", err)
+	if n := initialized.Load(); n != 0 {
+		t.Fatalf("the speaker initialized PortAudio %d times to play, want none", n)
 	}
-	// Control: the probe tells an initialized PortAudio apart.
-	if err := InitializePortAudio(); err != nil {
-		t.Fatalf("control: initialize PortAudio: %v", err)
-	}
-	defer func() { _ = TerminatePortAudio() }()
-	if _, err := portaudio.DefaultOutputDevice(); err == portaudio.NotInitialized {
-		t.Fatal("control: an initialized PortAudio reads as not initialized")
+	// Control: the count sees an initialization.
+	if err := InitializePortAudio(); err != nil || initialized.Load() != 1 {
+		t.Fatalf("control: InitializePortAudio = %v, counted %d initializations, want 1", err, initialized.Load())
 	}
 }
