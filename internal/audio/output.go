@@ -1002,7 +1002,7 @@ func (o *Output) mix(stream PlaybackStream, rate int) error {
 			if err != nil {
 				return fmt.Errorf("take back speaker stream: %w", err)
 			}
-			if err := o.replay(stream, redo, sum, n, max(got, 0), again); err != nil {
+			if _, err := o.replay(stream, redo, sum, n, max(got, 0), again); err != nil {
 				return err
 			}
 			continue
@@ -1018,11 +1018,12 @@ func (o *Output) mix(stream PlaybackStream, rate int) error {
 		if lost := again(); lost > 0 {
 			// The frame and some before it the device discarded: they play
 			// again before the frame counts as taken, and the stream took
-			// it when that replay returned.
-			if err := o.replay(stream, redo, sum, n, lost, again); err != nil {
+			// it when the replay's last write returned.
+			at, err := o.replay(stream, redo, sum, n, lost, again)
+			if err != nil {
 				return err
 			}
-			took = time.Now()
+			took = at
 		}
 		if counter != nil && o.cfg.Underrun != nil {
 			if n := counter.underruns(); n > underruns {
@@ -1046,8 +1047,10 @@ func (o *Output) mix(stream PlaybackStream, rate int) error {
 // before, so the pacer is not touched. A Cancel during it takes back the
 // device's audio again, and a discard during it is written again too, with
 // what of the replay was left unwritten. A speech whose last audio is
-// replayed was taken, last, at that write (replayed).
-func (o *Output) replay(stream PlaybackStream, redo []int16, sum []float32, n, back int, again func() int) error {
+// replayed was taken, last, at that write (replayed). It returns when its
+// last write returned, read before anything that can wait.
+func (o *Output) replay(stream PlaybackStream, redo []int16, sum []float32, n, back int, again func() int) (time.Time, error) {
+	var last time.Time
 	for {
 		if back > len(redo) {
 			slog.Warn("speaker stream took back more than the Output keeps; the rest of the other inputs is lost", "frames", back, "kept", len(redo))
@@ -1058,9 +1061,10 @@ func (o *Output) replay(stream PlaybackStream, redo []int16, sum []float32, n, b
 		for off < back && !drop && lost == 0 {
 			end := min(off+n, back)
 			if err := stream.Write(redo[off:end]); err != nil {
-				return fmt.Errorf("write speaker stream: %w", err)
+				return last, fmt.Errorf("write speaker stream: %w", err)
 			}
-			o.replayed(back, off, end, time.Now())
+			last = time.Now()
+			o.replayed(back, off, end, last)
 			off, lost = end, again()
 			drop = lost == 0 && end < back && o.takeDrop()
 		}
@@ -1071,11 +1075,11 @@ func (o *Output) replay(stream PlaybackStream, redo []int16, sum []float32, n, b
 		case drop:
 			got, err := stream.Drop()
 			if err != nil {
-				return fmt.Errorf("take back speaker stream: %w", err)
+				return last, fmt.Errorf("take back speaker stream: %w", err)
 			}
 			back = max(got, 0) + unwritten
 		default:
-			return nil
+			return last, nil
 		}
 	}
 }
