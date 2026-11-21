@@ -10,9 +10,10 @@ import (
 	"strings"
 	"time"
 
+	"google.golang.org/genai"
+
 	"github.com/sjawhar/ghost-wispr/internal/session"
 	"github.com/sjawhar/ghost-wispr/internal/storage"
-	"google.golang.org/genai"
 )
 
 // presetSummarizer makes the summary of a transcript, with the preset named
