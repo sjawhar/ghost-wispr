@@ -941,6 +941,10 @@ wait_spoken() {
 
 # ---- recordings ----
 
+# A time no sound can reach: the open end of a window that runs to the end of a recording, and the
+# missing bound of a time that has none.
+readonly never_ms=9999999999999
+
 # start_recording DEVICE FILE: record DEVICE to FILE with arecord, until stop_recording. A background
 # loop writes anchors, "US BYTES" lines: by the driver's clock US (microseconds, read just after the
 # size), BYTES of the file were written. recording-times.awk bounds each sound's time with the
@@ -950,23 +954,22 @@ wait_spoken() {
 # long as the fork takes, and no later anchor then makes up for it. Where /proc does not show that
 # fd, the size comes from wc.
 #
-# recording_started is a time no later than the sound in the file's first sample: arecord opens its
+# The recording starts between two times. recording_started is the earlier: arecord opens its
 # device, then creates the file and writes its whole 44-byte header, and only then reads, which
 # starts the capture (alsa-utils aplay.c capture(): set_params, then the file, begin_wave, then
 # pcm_read; for arecord the start threshold is one frame). So a read of the file's size that found
-# less than the header, or no file, came before the capture began; the last such read, less
-# capture_latency_us, is the recording's start, or the clock just before arecord started, less the
-# same, when no read found less than the header. An arecord slow to open its device makes no time
-# late; one held back between its header and its first read makes the early times early by as long.
+# less than the header, or no file, came before the capture began, and the last such read is
+# recording_started; with none, the clock just before arecord started. A read that fails finds
+# nothing and moves nothing. The later time is the first read that finds a sample, the first anchor:
+# recording-times.awk bounds the file's first sample from above with it. An arecord slow to open
+# its device makes no time late; one held back between its header and its first read makes every
+# time counted from recording_started early by as long, and a check that needs that time to be
+# exact reads UNKNOWN (analyse_recording).
 recording=
 anchors_file=
 recording_cut=false
 recording_started=
 recording_fdinfo=
-# capture_latency_us is how long before the capture began the first sample's sound may have reached
-# the microphone: the device's converter filter, its own buffer and the USB transfer, a few
-# milliseconds for a plain USB microphone.
-readonly capture_latency_us=5000
 start_recording() {
   local deadline size seen before link tick
   recording=$2
@@ -974,8 +977,9 @@ start_recording() {
   recording_cut=false
   recording_fdinfo=
   : >"$anchors_file"
+  start_clock_watch
   # arecord captures nothing before it starts: the earliest the file's first sample can be.
-  recording_started=$((${EPOCHREALTIME//[!0-9]/} - capture_latency_us))
+  recording_started=${EPOCHREALTIME//[!0-9]/}
   arecord -q -D "$1" -f S16_LE -r "$sample_rate" -c 1 -t wav --buffer-time=40000 --period-time=10000 \
     "$recording" 2>"$work_dir/arecord.err" &
   arecord_pid=$!
@@ -997,17 +1001,18 @@ start_recording() {
       done
     fi
     if [[ -n $recording_fdinfo || -e $recording ]]; then
-      recording_size || size=0
+      recording_size || size=
     else
       size=0
     fi
     seen=${EPOCHREALTIME//[!0-9]/}
-    if ((size > wav_header_bytes)); then
+    if [[ -n $size ]] && ((size > wav_header_bytes)); then
       printf '%s %s\n' "$seen" "$size" >>"$anchors_file"
       break
     fi
-    # Less than the header when its size was read, after before: the capture began later.
-    ((size < wav_header_bytes && before - capture_latency_us > recording_started)) && recording_started=$((before - capture_latency_us))
+    # Less than the header when its size was read, after before: the capture began later. A read
+    # that failed (size empty) shows nothing, so the start stays where the last read put it.
+    [[ -n $size ]] && ((size < wav_header_bytes && before > recording_started)) && recording_started=$before
     kill -0 "$arecord_pid" 2>/dev/null || unknown "recording: arecord stopped: $(tr '\n' ' ' <"$work_dir/arecord.err")"
     ((seen / 1000 < deadline)) || unknown "recording: arecord wrote no audio from $1 within 5 s"
     read -r -t 0.01 -u "$tick" _ || true
@@ -1016,7 +1021,7 @@ start_recording() {
   (
     while kill -0 "$arecord_pid" 2>/dev/null; do
       sleep 0.5
-      recording_size || break
+      recording_size || continue
       seen=${EPOCHREALTIME//[!0-9]/}
       printf '%s %s\n' "$seen" "$size" >>"$anchors_file"
     done
@@ -1026,14 +1031,103 @@ start_recording() {
 }
 
 # recording_size: set size to the bytes arecord has written to the recording: from its fdinfo, read
-# by the shell itself, when start_recording found it, else with wc.
+# by the shell itself, when start_recording found it, else with wc. It fails, with size empty, when
+# neither reads a size.
 recording_size() {
   local key value
   if [[ -n $recording_fdinfo ]] && read -r key value 2>/dev/null <"$recording_fdinfo" && [[ $key == pos: && $value =~ ^[0-9]+$ ]]; then
     size=$value
     return 0
   fi
-  size=$(wc -c 2>/dev/null <"$recording")
+  value=$(wc -c 2>/dev/null <"$recording") || value=
+  value=${value//[[:space:]]/}
+  if whole_number "$value"; then
+    size=$value
+    return 0
+  fi
+  size=
+  return 1
+}
+
+# start_clock_watch: while the recording runs, a python3 process compares CLOCK_REALTIME with
+# CLOCK_MONOTONIC every 50 ms, and once more when stop_recording ends it, after the last anchor. The
+# two run at the same slewed rate, so they differ by a constant until something steps the system
+# clock: settimeofday, an NTP step or a leap second. The driver's times, the anchors and the voice's
+# own times (at_unix_ns, the /ws events, the test agent's) are all on the realtime clock, so they
+# agree with each other unless a step falls between them; a monotonic timeline for the driver alone
+# would not help, as the voice's times would still need the steps to be compared with it. Each
+# reading brackets the difference between two monotonic reads, and the watch keeps the intersection
+# of its brackets: a step makes it empty. So a step larger than the intersection's width, a few
+# microseconds, is seen, and makes the recording's verdicts UNKNOWN (analyse_recording). The watch
+# writes "ready" once it has its first reading, "step NS" at a step and "end WIDTH_NS" at its end.
+clock_watch_pid=
+clock_log=
+start_clock_watch() {
+  local deadline
+  clock_log="$recording.clock"
+  : >"$clock_log"
+  python3 - clock-watch "$clock_log" 2>"$work_dir/clock-watch.err" <<'EOF' &
+import signal
+import sys
+import time
+
+log = open(sys.argv[2], "a", buffering=1)
+low = high = None
+stepped = False
+
+
+class Stop(Exception):
+    pass
+
+
+def stop(*_):
+    raise Stop
+
+
+def check():
+    """One reading: the realtime clock read between two monotonic reads."""
+    global low, high, stepped
+    before = time.monotonic_ns()
+    real = time.time_ns()
+    after = time.monotonic_ns()
+    a, b = real - after, real - before
+    if low is None:
+        low, high = a, b
+    elif not stepped and (a > high or b < low):
+        log.write("step %d\n" % ((a + b) // 2 - (low + high) // 2))
+        stepped = True
+    elif not stepped:
+        low, high = max(low, a), min(high, b)
+
+
+signal.signal(signal.SIGTERM, stop)
+try:
+    check()
+    log.write("ready\n")
+    while True:
+        time.sleep(0.05)
+        check()
+except Stop:
+    pass
+check()
+log.write("end %d\n" % (high - low))
+EOF
+  clock_watch_pid=$!
+  deadline=$(($(now_ms) + 10000))
+  until [[ -s $clock_log ]]; do
+    kill -0 "$clock_watch_pid" 2>/dev/null \
+      || unknown "recording: the clock watch did not start: $(head -c 300 "$work_dir/clock-watch.err" | tr '\n' ' ')"
+    (($(now_ms) < deadline)) || unknown 'recording: the clock watch did not start within 10 s'
+    sleep 0.01
+  done
+}
+
+# stop_clock_watch: the watch's last reading, then its end.
+stop_clock_watch() {
+  [[ -n $clock_watch_pid ]] || return 0
+  kill -TERM "$clock_watch_pid" 2>/dev/null
+  wait "$clock_watch_pid" 2>/dev/null
+  clock_watch_pid=
 }
 
 # stop_recording: end the recording. On SIGTERM arecord finishes the file's header and drops what it
@@ -1057,97 +1151,177 @@ stop_recording() {
     seen=${EPOCHREALTIME//[!0-9]/}
     printf '%s %s\n' "$seen" "$size" >>"$anchors_file"
   fi
+  stop_clock_watch
 }
 
 # analyse_recording THRESHOLD_DB: read the sounds in the recording. sound_on and sound_off hold each
 # sound's onset and end on the driver's clock, never early; sound_on_early and sound_off_early the
-# same times, never late; sound_len its length in the file, in microseconds; recording_end the
-# driver's time, never late, before which the recording shows every sound that starts
-# (recording-times.awk). A true time lies between its two bounds.
+# same times, never late; sound_len its length in the file, in microseconds; sound_gap_min the
+# silence before it, from the end of the sound before it (or from the file's start), never long. The
+# recording shows every sound that starts before recording_end_early and nothing after
+# recording_end_late (never_ms when no anchor bounds it); recording_trail_min is the silence after
+# its last sound, to recording_end_early's place, never long (recording-times.awk). A true time lies
+# between its two bounds, and a check decides PASS or FAIL only where it holds for every time between
+# them, else UNKNOWN.
+#
+# Every time here is when the rig captured a sound. A USB microphone captures a sound a little after
+# it arrives: its converter's filter and its USB audio class transfer, which moves audio in 1 ms
+# frames, take about 1 to 2 ms. Nothing here allows for that delay: it is an assumption of the rig,
+# not a measured bound, and it can make an early bound late by as much. A late bound stays a bound.
 sound_on=()
 sound_off=()
 sound_on_early=()
 sound_off_early=()
 sound_len=()
-recording_end=
+sound_gap_min=()
+recording_end_early=
+recording_end_late=
+recording_trail_min=
 analyse_recording() {
-  local analysis bytes kind rest on off len on_early off_early
+  local analysis bytes kind rest on off len on_early off_early gap watch
   analysis=$(ffmpeg -hide_banner -nostats -i "$recording" -af "silencedetect=noise=${1}dB:d=$silence_seconds" -f null - 2>&1) \
     || unknown "recording: ffmpeg could not read $recording: $(tail -n 3 <<<"$analysis" | tr '\n' ' ')"
   [[ $recording_cut == false ]] \
     || unknown "recording: arecord stopped before the step ended it, so the recording does not cover the step: $(tr '\n' ' ' <"$work_dir/arecord.err")"
+  watch=$(<"$clock_log") || unknown "recording: cannot read the clock watch's log $clock_log"
+  [[ $watch =~ (^|$'\n')step\ (-?[0-9]+) ]] \
+    && unknown "recording: the system clock stepped by $((BASH_REMATCH[2] / 1000)) us while the rig recorded, so the recording's times cannot be compared with the voice's"
+  [[ $watch =~ (^|$'\n')end\ [0-9]+ ]] \
+    || unknown "recording: the clock watch ended without its last reading, so a step of the system clock while the rig recorded cannot be ruled out: $(head -c 300 "$work_dir/clock-watch.err" | tr '\n' ' ')"
   bytes=$(wc -c <"$recording") || unknown "recording: cannot read the size of $recording"
   sound_on=()
   sound_off=()
   sound_on_early=()
   sound_off_early=()
   sound_len=()
-  recording_end=
+  sound_gap_min=()
+  recording_end_early=
+  recording_end_late=
+  recording_trail_min=
   while read -r kind rest; do
     case $kind in
       sound)
-        read -r on off len on_early off_early <<<"$rest"
+        read -r on off len on_early off_early gap <<<"$rest"
         sound_on+=("$on")
         sound_off+=("$off")
         sound_on_early+=("$on_early")
         sound_off_early+=("$off_early")
         sound_len+=("$len")
+        sound_gap_min+=("$gap")
         ;;
-      end) recording_end=$rest ;;
+      end) read -r recording_end_early recording_end_late recording_trail_min <<<"$rest" ;;
       error) unknown "recording: $recording: $rest" ;;
     esac
   done < <(awk -v rate="$sample_rate" -v header="$wav_header_bytes" -v frame="$sample_bytes" -v bytes="$bytes" \
     -v started_us="$recording_started" -f "$recording_times" "$anchors_file" - <<<"$analysis")
-  whole_number "$recording_end" || unknown "recording: the times of $recording could not be read"
+  [[ $recording_end_late == none ]] && recording_end_late=$never_ms
+  [[ $recording_end_early =~ ^[0-9]+$ && $recording_end_late =~ ^[0-9]+$ && $recording_trail_min =~ ^[0-9]+$ ]] \
+    || unknown "recording: the times of $recording could not be read"
 }
 
-# first_sound FROM_MS TO_MS: set found_sound to the index of the first sound that starts in
-# [FROM, TO); it fails when none does.
+# onset_between FROM_LOW FROM_HIGH TO_MS: the first sound whose onset lies at or after FROM, a time
+# known to lie in [FROM_LOW, FROM_HIGH], and before TO. maybe_sound is the first sound whose onset
+# may lie there: its late bound at FROM_LOW or later and its early bound before TO. found_sound is
+# the first whose onset certainly does: its early bound at FROM_HIGH or later and its late bound
+# before TO. The first onset there lies in [onset_low, onset_high]: no earlier than FROM_LOW or
+# maybe_sound's early bound, and no later than found_sound's late bound. It returns 0 with
+# found_sound set; 2 with only maybe_sound set, as a sound may start there or none may; and 1 when
+# no sound may start there, which the recording shows only for a window that ends by
+# recording_end_early.
+maybe_sound=
 found_sound=
-first_sound() {
+onset_low=
+onset_high=
+onset_between() {
   local i
+  maybe_sound=
+  found_sound=
+  onset_low=
+  onset_high=
   for i in "${!sound_on[@]}"; do
-    if ((sound_on[i] >= $1 && sound_on[i] < $2)); then
+    ((sound_on[i] >= $1 && sound_on_early[i] < $3)) || continue
+    if [[ -z $maybe_sound ]]; then
+      maybe_sound=$i
+      onset_low=$((sound_on_early[i] > $1 ? sound_on_early[i] : $1))
+    fi
+    if ((sound_on_early[i] >= $2 && sound_on[i] < $3)); then
       found_sound=$i
+      onset_high=${sound_on[i]}
       return 0
     fi
   done
+  [[ -n $maybe_sound ]] && return 2
   return 1
 }
 
-# silence_from FROM_MS TO_MS: set silent_at to when the speaker went quiet for at least
-# stop_silence_ms at or after FROM and no later than TO; it fails when it did not.
-silent_at=
+# silence_from FROM_MS TO_MS: whether the speaker went quiet for at least stop_silence_ms in a gap
+# that ends after FROM and starts no later than TO; silent_at is when it went quiet, the gap's start
+# or FROM if later. A gap is timed twice: its start and end on the driver's clock, each between its
+# bounds, and its length, between its length in the file (sound_gap_min, never long) and its end's
+# late bound less its start's early bound (never short, even where the file lost audio). The gap
+# before the first sound may have begun before the recording, and the one after the last may go on
+# after it: neither length has an upper bound. It returns 0 when such a gap certainly holds, with
+# silent_at in [silent_low, silent_high]; 2 when one may, with silent_low the earliest silent_at can
+# be; and 1 when none can.
+silent_low=
+silent_high=
 silence_from() {
-  local i gap_start gap_end count=${#sound_on[@]}
+  local i count=${#sound_on[@]} start_low start_high end_low end_high len_low len_high
+  silent_low=
+  silent_high=
   for ((i = 0; i <= count; i++)); do
-    if ((i == 0)); then gap_start=0; else gap_start=${sound_off[i - 1]}; fi
-    if ((i == count)); then gap_end=$recording_end; else gap_end=${sound_on[i]}; fi
-    ((gap_end > $1 && gap_end - gap_start >= stop_silence_ms)) || continue
-    silent_at=$((gap_start > $1 ? gap_start : $1))
-    ((silent_at <= $2)) && return 0
-    return 1
+    if ((i == 0)); then
+      start_low=0
+      start_high=0
+    else
+      start_low=${sound_off_early[i - 1]}
+      start_high=${sound_off[i - 1]}
+    fi
+    if ((i == count)); then
+      end_low=$recording_end_early
+      end_high=$never_ms
+      len_low=$recording_trail_min
+      len_high=$never_ms
+    else
+      end_low=${sound_on_early[i]}
+      end_high=${sound_on[i]}
+      len_low=${sound_gap_min[i]}
+      if ((i == 0)); then len_high=$never_ms; else len_high=$((end_high - start_low)); fi
+    fi
+    # May hold: may end after FROM, may last long enough, may start by TO.
+    ((end_high > $1 && len_high >= stop_silence_ms && (start_low > $1 ? start_low : $1) <= $2)) || continue
+    [[ -n $silent_low ]] || silent_low=$((start_low > $1 ? start_low : $1))
+    # Holds: ends after FROM, lasts long enough and starts by TO, at every time between the bounds.
+    if ((end_low > $1 && len_low >= stop_silence_ms && (start_high > $1 ? start_high : $1) <= $2)); then
+      silent_high=$((start_high > $1 ? start_high : $1))
+      return 0
+    fi
   done
+  [[ -n $silent_low ]] && return 2
   return 1
 }
 
-# cancel_heard STOP_MS NEXT_MS: set heard_ms to how long after STOP the rig still heard sound before
-# NEXT, the next sound the step expects: the end of the last sound that spans STOP or starts after
-# it, so a word after any pause or silence counts; 0 when the rig was quiet from STOP. heard_ms is
-# from the sounds' ends never early, so the true time is no longer; heard_early_ms is the same from
-# their ends never late, so the true time is no shorter. It fails when the rig did not hear sound up
-# to STOP (within a pause of silence_ms), which leaves the cancel untimed.
+# cancel_heard STOP_MS NEXT_MS LIMIT: set heard_ms to how long after STOP the rig still heard sound
+# before NEXT, the next sound the step expects, from the sounds before the LIMITth (the next
+# question's chime, or all of them): the end of the last sound that spans STOP or starts after it,
+# so a word after any pause or silence counts; 0 when the rig was quiet from STOP. heard_ms counts
+# every sound that may start before NEXT, at its end's late bound, so the true time is no longer;
+# heard_early_ms only those that certainly do, at its end's early bound, so the true time is no
+# shorter. It fails when the recording does not show that the rig heard sound up to STOP (within a
+# pause of silence_ms): a sound that certainly began by STOP and certainly lasted to STOP less
+# silence_ms. Without one the cancel is untimed.
 heard_ms=
 heard_early_ms=
 cancel_heard() {
   local i heard_up_to=false
   heard_ms=0
   heard_early_ms=0
-  for i in "${!sound_on[@]}"; do
-    ((sound_on[i] < $2)) || continue
-    ((sound_on[i] <= $1 && sound_off[i] >= $1 - silence_ms)) && heard_up_to=true
+  for ((i = 0; i < $3; i++)); do
+    ((sound_on_early[i] < $2)) || continue
     ((sound_off[i] > $1 + heard_ms)) && heard_ms=$((sound_off[i] - $1))
+    ((sound_on[i] < $2)) || continue
     ((sound_off_early[i] > $1 + heard_early_ms)) && heard_early_ms=$((sound_off_early[i] - $1))
+    ((sound_on[i] <= $1 && sound_off_early[i] >= $1 - silence_ms)) && heard_up_to=true
   done
   [[ $heard_up_to == true ]]
 }
@@ -1210,11 +1384,19 @@ analyse_rig() {
     || unknown "rig microphone: no sound above $rig_threshold_db dB in the whole run: it could not hear the Jabra"
 }
 
+# undecided WHAT LOW HIGH LIMIT: UNKNOWN, as WHAT lies between LOW and HIGH ms (HIGH never_ms when
+# the recording sets no upper bound), and LIMIT lies between them too.
+undecided() {
+  (($3 < never_ms)) \
+    || unknown "$1: no less than $2 ms, but the recording cannot show that it is within $4 ms"
+  unknown "$1: between $2 and $3 ms, so whether it is within $4 ms is not known: the recording's times for it may be up to $(($3 - $2)) ms late"
+}
+
 # ---- steps ----
 
 step_exchange() {
   local wake exchange spoken ready spoken_again wake_ms exchange_ms spoken_ms session question_started question_ended
-  local chime_onset chime_end speech_onset measured i
+  local rc chime_low chime_high chime_len from_low from_high speech_low speech_high
   start_voice_run "$loopback_mic" "$loopback_speaker" "$voice_on"
   start_recording "$speaker_capture" "$work_dir/speaker.wav"
   play_clip question "$question"
@@ -1259,37 +1441,54 @@ step_exchange() {
   fi
 
   # A short tail, then the recording ends and is read: a chime soon after voice_wake, and speech
-  # after voice_exchange_started soon after the end of the question.
+  # after voice_exchange_started soon after the end of the question. Each is the first sound from its
+  # event on, and its delay lies between two bounds.
   sleep 0.3
   stop_recording
   analyse_recording "$loopback_threshold_db"
   ((${#sound_on[@]} > 0)) \
     || unknown "speaker recording: no sound at all, though voice_spoken came: it could not hear the speaker"
-  first_sound $((wake_ms - lead_ms)) 9999999999999 || fail 'chime: no sound in the speaker recording after voice_wake'
-  i=$found_sound
-  chime_onset=${sound_on[i]}
-  chime_end=${sound_off[i]}
-  measured=$((chime_onset - wake_ms))
-  ((measured <= chime_ms)) || fail "chime: $measured ms after voice_wake, more than $chime_ms ms"
-  pass "chime $measured ms after voice_wake; the sound lasts $((chime_end - chime_onset)) ms"
-  speech_onset=
-  for i in "${!sound_on[@]}"; do
-    if ((sound_on[i] >= chime_onset + sound_max_ms && sound_on[i] >= exchange_ms)); then
-      speech_onset=${sound_on[i]}
-      break
-    fi
-  done
-  [[ -n $speech_onset ]] || fail 'speech: no sound in the speaker recording after the chime and voice_exchange_started'
-  measured=$((speech_onset - question_ended))
-  ((measured <= speech_ms)) || fail "speech: $measured ms after the end of the question, more than $speech_ms ms"
-  pass "speech $measured ms after the end of the question"
+  onset_between $((wake_ms - lead_ms)) $((wake_ms - lead_ms)) "$never_ms"
+  rc=$?
+  if ((rc == 1)); then
+    ((wake_ms + chime_ms <= recording_end_early)) \
+      || unknown "chime: no sound in the speaker recording after voice_wake, which shows every sound only up to $((recording_end_early - wake_ms)) ms after it, less than $chime_ms ms"
+    fail 'chime: no sound in the speaker recording after voice_wake'
+  fi
+  chime_low=$onset_low
+  chime_high=$never_ms
+  ((rc == 0)) && chime_high=$onset_high
+  chime_len=${sound_len[${found_sound:-$maybe_sound}]}
+  ((chime_low - wake_ms <= chime_ms)) || fail "chime: no earlier than $((chime_low - wake_ms)) ms after voice_wake, more than $chime_ms ms"
+  # The speech starts at least sound_max_ms after the chime's onset, and at or after
+  # voice_exchange_started.
+  from_low=$((chime_low + sound_max_ms > exchange_ms ? chime_low + sound_max_ms : exchange_ms))
+  from_high=$never_ms
+  ((chime_high < never_ms)) && from_high=$((chime_high + sound_max_ms > exchange_ms ? chime_high + sound_max_ms : exchange_ms))
+  onset_between "$from_low" "$from_high" "$never_ms"
+  rc=$?
+  if ((rc == 1)); then
+    ((question_ended + speech_ms <= recording_end_early)) \
+      || unknown "speech: no sound in the speaker recording after the chime and voice_exchange_started, which shows every sound only up to $((recording_end_early - question_ended)) ms after the end of the question, less than $speech_ms ms"
+    fail 'speech: no sound in the speaker recording after the chime and voice_exchange_started'
+  fi
+  speech_low=$((onset_low - question_ended))
+  speech_high=$never_ms
+  ((rc == 0)) && speech_high=$((onset_high - question_ended))
+  chime_low=$((chime_low - wake_ms))
+  ((chime_high < never_ms)) && chime_high=$((chime_high - wake_ms))
+  ((speech_low <= speech_ms)) || fail "speech: no earlier than $speech_low ms after the end of the question, more than $speech_ms ms"
+  ((chime_high <= chime_ms)) || undecided 'chime: its delay after voice_wake' "$chime_low" "$chime_high" "$chime_ms"
+  ((speech_high <= speech_ms)) || undecided 'speech: its delay after the end of the question' "$speech_low" "$speech_high" "$speech_ms"
+  pass "chime $chime_high ms after voice_wake (no earlier than $chime_low ms); the sound lasts $((chime_len / 1000)) ms"
+  pass "speech $speech_high ms after the end of the question (no earlier than $speech_low ms)"
 }
 
 # step_wake_sound: verification c-wake-pi. Each call goes in with the Output closed (idle longer than
 # its 300 ms close); the wake sound's arrival at the Jabra, at the rig microphone, is timed from the
 # wake_heard line of the voice timing log.
 step_wake_sound() {
-  local i next latencies=() call_start=() call_wake=() median max
+  local i from to rc lows=() highs=() call_start=() call_wake=() median_low median_high max_low max_high
   start_rig_run
   for ((i = 1; i <= calls; i++)); do
     play_clip "call $i" "$question"
@@ -1301,27 +1500,49 @@ step_wake_sound() {
     sleep "$idle_seconds"
   done
   analyse_rig
+  # Each call's wake sound is the first sound from its wake_heard (less lead_ms) to the next call, and
+  # its delay lies between two bounds; so do the longest and the median.
   for ((i = 0; i < calls; i++)); do
-    if ((i + 1 < calls)); then next=${call_start[i + 1]}; else next=$recording_end; fi
-    first_sound $((call_wake[i] - lead_ms)) "$next" \
-      || fail "wake-sound call $((i + 1)): no sound at the rig microphone after its wake_heard"
-    latencies+=($((sound_on[found_sound] - call_wake[i])))
-    note "wake-sound call $((i + 1)): the wake sound reached the rig microphone ${latencies[i]} ms after wake_heard"
+    from=$((call_wake[i] - lead_ms))
+    to=$never_ms
+    ((i + 1 < calls)) && to=${call_start[i + 1]}
+    onset_between "$from" "$from" "$to"
+    rc=$?
+    if ((rc == 1)); then
+      ((to <= recording_end_early || call_wake[i] + wake_max_ms <= recording_end_early)) \
+        || unknown "wake-sound call $((i + 1)): no sound at the rig microphone after its wake_heard, and the rig recording shows every sound only up to $((recording_end_early - call_wake[i])) ms after it, less than $wake_max_ms ms"
+      fail "wake-sound call $((i + 1)): no sound at the rig microphone after its wake_heard"
+    fi
+    lows+=($((onset_low - call_wake[i])))
+    if ((rc == 0)); then
+      highs+=($((onset_high - call_wake[i])))
+      note "wake-sound call $((i + 1)): the wake sound reached the rig microphone ${highs[i]} ms after wake_heard (no earlier than ${lows[i]} ms)"
+    else
+      highs+=("$never_ms")
+      note "wake-sound call $((i + 1)): a sound may have reached the rig microphone ${lows[i]} ms after wake_heard, but the recording cannot show which sound is the wake sound"
+    fi
   done
-  max=$(maximum "${latencies[@]}")
-  median=$(percentile 50 "${latencies[@]}")
-  ((max <= wake_max_ms)) || fail "wake-sound: a call took $max ms from wake_heard to the wake sound at the Jabra, more than $wake_max_ms ms"
-  pass "wake-sound: no call passed $wake_max_ms ms (the longest took $max ms, over $calls calls)"
-  ((median <= wake_median_ms)) || fail "wake-sound: median $median ms from wake_heard to the wake sound at the Jabra, more than $wake_median_ms ms"
-  pass "wake-sound: median $median ms from wake_heard to the wake sound at the Jabra, at most $wake_median_ms ms"
+  max_low=$(maximum "${lows[@]}")
+  max_high=$(maximum "${highs[@]}")
+  median_low=$(percentile 50 "${lows[@]}")
+  median_high=$(percentile 50 "${highs[@]}")
+  ((max_low <= wake_max_ms)) || fail "wake-sound: a call took $max_low ms or more from wake_heard to the wake sound at the Jabra, more than $wake_max_ms ms"
+  ((median_low <= wake_median_ms)) || fail "wake-sound: median $median_low ms or more from wake_heard to the wake sound at the Jabra, more than $wake_median_ms ms"
+  ((max_high <= wake_max_ms)) || undecided 'wake-sound: the longest call from wake_heard to the wake sound at the Jabra' "$max_low" "$max_high" "$wake_max_ms"
+  ((median_high <= wake_median_ms)) || undecided 'wake-sound: the median from wake_heard to the wake sound at the Jabra' "$median_low" "$median_high" "$wake_median_ms"
+  pass "wake-sound: no call passed $wake_max_ms ms (the longest took $max_high ms, no less than $max_low ms, over $calls calls)"
+  pass "wake-sound: median $median_high ms from wake_heard to the wake sound at the Jabra (no less than $median_low ms), at most $wake_median_ms ms"
 }
 
 # step_scripted: verification c-fast-answer-pi. t0 is the end of the injected question on the
 # driver's clock; the first fact is the first sound at the rig microphone of the sentence the
 # timing log marks fact_audio. A fact sentence that follows the one before it with no gap is
-# placed by the path from the voice's first frame (first_audio) to its first sound at the rig.
+# placed by the path from the voice's first frame (first_audio) to its first sound at the rig. Each
+# question's time to the first fact lies between two bounds, and so do the median and the 90th
+# percentile.
 step_scripted() {
-  local engine clip files=() i t0s fact_at first_at latencies median p90 path
+  local engine clip files=() i t0s fact_at first_at path rc placed fact_low path_low path_high lows highs
+  local median_low median_high p90_low p90_high
   mapfile -t files < <(wav_files "$question_dir" | head -n "$questions")
   for engine in "${engines[@]}"; do
     if ! start_unit_run "$loopback_mic" "$voice_on" "GHOST_WISPR_VOICE_ENGINE=$engine"; then
@@ -1353,25 +1574,56 @@ step_scripted() {
       sleep "$idle_seconds"
     done
     analyse_rig
-    latencies=()
+    lows=()
+    highs=()
     for ((i = 0; i < questions; i++)); do
-      if first_sound $((fact_at[i] - lead_ms)) $((fact_at[i] + fact_window_ms)); then
-        latencies+=($((sound_on[found_sound] - t0s[i])))
-        note "scripted $engine question $((i + 1)): the first fact reached the rig microphone ${latencies[i]} ms after t0"
-      elif [[ -n ${first_at[i]} ]] && first_sound $((first_at[i] - lead_ms)) $((first_at[i] + fact_window_ms)); then
-        path=$((sound_on[found_sound] - first_at[i]))
-        latencies+=($((fact_at[i] + path - t0s[i])))
-        note "scripted $engine question $((i + 1)): the first fact followed the sentence before it with no gap; placed at fact_audio plus the $path ms path to the rig: ${latencies[i]} ms after t0"
+      onset_between $((fact_at[i] - lead_ms)) $((fact_at[i] - lead_ms)) $((fact_at[i] + fact_window_ms))
+      rc=$?
+      fact_low=$onset_low
+      if ((rc == 0)); then
+        lows+=($((fact_low - t0s[i])))
+        highs+=($((onset_high - t0s[i])))
+        note "scripted $engine question $((i + 1)): the first fact reached the rig microphone ${highs[i]} ms after t0 (no earlier than ${lows[i]} ms)"
+        continue
+      fi
+      # No sound certainly starts where the fact belongs: it may follow the sentence before it with
+      # no gap, placed by the path from first_audio.
+      placed=1
+      path_low=$never_ms
+      path_high=$never_ms
+      if [[ -n ${first_at[i]} ]]; then
+        onset_between $((first_at[i] - lead_ms)) $((first_at[i] - lead_ms)) $((first_at[i] + fact_window_ms))
+        placed=$?
+        ((placed != 1)) && path_low=$((fact_at[i] + onset_low - first_at[i] - t0s[i]))
+        ((placed == 0)) && path_high=$((fact_at[i] + onset_high - first_at[i] - t0s[i]))
+      fi
+      ((rc != 1 || placed != 1)) \
+        || unknown "scripted $engine question $((i + 1)): the rig microphone heard no sound within $fact_window_ms ms of the voice's first frame or of its first fact"
+      if ((rc == 1)); then
+        lows+=("$path_low")
+        highs+=("$path_high")
+        if ((path_high < never_ms)); then
+          note "scripted $engine question $((i + 1)): the first fact followed the sentence before it with no gap; placed at fact_audio plus the path from first_audio to the rig: ${highs[i]} ms after t0 (no earlier than ${lows[i]} ms)"
+        else
+          note "scripted $engine question $((i + 1)): the first fact followed the sentence before it with no gap; a sound may start where its first frame belongs, placing it no earlier than ${lows[i]} ms after t0, but the recording cannot show which sound is that frame's"
+        fi
       else
-        unknown "scripted $engine question $((i + 1)): the rig microphone heard no sound within $fact_window_ms ms of the voice's first frame or of its first fact"
+        # Either a sound in the fact's own window is the fact, or the path places it.
+        lows+=($((placed != 1 && path_low < fact_low - t0s[i] ? path_low : fact_low - t0s[i])))
+        highs+=("$never_ms")
+        note "scripted $engine question $((i + 1)): a sound may start where the first fact belongs, no earlier than ${lows[i]} ms after t0, but the recording cannot show whether it is the fact"
       fi
     done
-    median=$(percentile 50 "${latencies[@]}")
-    p90=$(percentile 90 "${latencies[@]}")
-    ((median <= fact_median_ms)) || fail "scripted $engine: median $median ms from t0 to the first fact at the Jabra, more than $fact_median_ms ms; this voice is past the bound"
-    pass "scripted $engine: median $median ms from t0 to the first fact at the Jabra, at most $fact_median_ms ms"
-    ((p90 <= fact_p90_ms)) || fail "scripted $engine: 90th percentile $p90 ms from t0 to the first fact at the Jabra, more than $fact_p90_ms ms; this voice is past the bound"
-    pass "scripted $engine: 90th percentile $p90 ms from t0 to the first fact at the Jabra, at most $fact_p90_ms ms"
+    median_low=$(percentile 50 "${lows[@]}")
+    median_high=$(percentile 50 "${highs[@]}")
+    p90_low=$(percentile 90 "${lows[@]}")
+    p90_high=$(percentile 90 "${highs[@]}")
+    ((median_low <= fact_median_ms)) || fail "scripted $engine: median $median_low ms or more from t0 to the first fact at the Jabra, more than $fact_median_ms ms; this voice is past the bound"
+    ((p90_low <= fact_p90_ms)) || fail "scripted $engine: 90th percentile $p90_low ms or more from t0 to the first fact at the Jabra, more than $fact_p90_ms ms; this voice is past the bound"
+    ((median_high <= fact_median_ms)) || undecided "scripted $engine: the median from t0 to the first fact at the Jabra" "$median_low" "$median_high" "$fact_median_ms"
+    ((p90_high <= fact_p90_ms)) || undecided "scripted $engine: the 90th percentile from t0 to the first fact at the Jabra" "$p90_low" "$p90_high" "$fact_p90_ms"
+    pass "scripted $engine: median $median_high ms from t0 to the first fact at the Jabra (no less than $median_low ms), at most $fact_median_ms ms"
+    pass "scripted $engine: 90th percentile $p90_high ms from t0 to the first fact at the Jabra (no less than $p90_low ms), at most $fact_p90_ms ms"
   done
 }
 
@@ -1777,26 +2029,45 @@ step_joined() {
   wait "$probe_pid" 2>/dev/null
 
   analyse_rig
-  first_sound $((hand_at - lead_ms)) $((hand_at + sound_max_ms)) \
-    || fail 'joined: no sound at the rig microphone within 400 ms of hand_chime'
-  pass "joined: the hand sound reached the Jabra $((sound_on[found_sound] - hand_at)) ms after hand_chime"
+  # The hand sound is the first sound from hand_chime (less lead_ms) to sound_max_ms after it; the
+  # words, words_heard. A FAIL of either comes before an UNKNOWN of either.
+  local hand hand_low hand_high hand_unknown=
+  onset_between $((hand_at - lead_ms)) $((hand_at - lead_ms)) $((hand_at + sound_max_ms))
+  hand=$?
+  hand_low=$onset_low
+  hand_high=$onset_high
+  case $hand in
+    0) pass "joined: the hand sound reached the Jabra $((hand_high - hand_at)) ms after hand_chime (no earlier than $((hand_low - hand_at)) ms after it)" ;;
+    1)
+      ((hand_at + sound_max_ms <= recording_end_early)) \
+        || unknown "joined: no sound at the rig microphone within $sound_max_ms ms of hand_chime, but the rig recording shows every sound only up to $((recording_end_early - hand_at)) ms after it"
+      fail "joined: no sound at the rig microphone within $sound_max_ms ms of hand_chime"
+      ;;
+    2) hand_unknown="joined: a sound at the rig microphone starts between $((sound_on_early[maybe_sound] - hand_at)) and $((sound_on[maybe_sound] - hand_at)) ms from hand_chime: the recording's times may be up to $((sound_on[maybe_sound] - sound_on_early[maybe_sound])) ms late, so whether the hand sound reached the Jabra within $sound_max_ms ms of hand_chime is not known" ;;
+  esac
   if ! words_heard "$go_ahead_ended" "$spoken_at"; then
-    [[ -n $found_sound ]] \
-      || fail "joined: no words at the rig microphone between the end of the go-ahead and voice_spoken: no sound there lasted longer than the wake sound's $sound_max_ms ms"
+    if [[ -z $found_sound ]]; then
+      ((spoken_at <= recording_end_early)) \
+        || unknown "joined: no words at the rig microphone after the end of the go-ahead, but the rig recording shows every sound only up to $((recording_end_early - go_ahead_ended)) ms after it, and voice_spoken came at $((spoken_at - go_ahead_ended)) ms"
+      fail "joined: no words at the rig microphone between the end of the go-ahead and voice_spoken: no sound there lasted longer than the wake sound's $sound_max_ms ms"
+    fi
     unknown "joined: a sound at the rig microphone longer than the wake sound starts between $((sound_on_early[found_sound] - go_ahead_ended)) and $((sound_on[found_sound] - go_ahead_ended)) ms from the end of the go-ahead, and voice_spoken came at $((spoken_at - go_ahead_ended)) ms: the recording's times may be up to $((sound_on[found_sound] - sound_on_early[found_sound])) ms late, so whether the agent's words began after the go-ahead and before voice_spoken is not known"
   fi
+  [[ -z $hand_unknown ]] || unknown "$hand_unknown"
   pass "joined: the agent's words reached the Jabra $((sound_on[found_sound] - go_ahead_ended)) ms after the go-ahead ended (no earlier than $((sound_on_early[found_sound] - go_ahead_ended)) ms after it), for $((sound_len[found_sound] / 1000)) ms"
 }
 
 # step_barge_in: verification c-stop-pi. The run's microphone is the loopback, so each clip goes
 # into it, timed from aplay's start, and the rig microphone hears only the Jabra. Stops are read at
 # the Jabra: speech that went quiet for at least stop_silence_ms within stop_window_ms of the clip's
-# start. A round in which the voice logged no stop and its answer ended by itself (voice_spoken) is
-# not counted.
+# start (silence_from). A round in which the voice logged no stop and its answer ended by itself
+# (voice_spoken) is not counted. A round the recording's times cannot decide counts against the
+# step: a backchannel that may have stopped the speech as one that did, until the allowance is
+# passed, and then UNKNOWN; a talk-over that may not have, UNKNOWN.
 step_barge_in() {
-  local kinds=() clips=() talkover_files=() backchannel_files=() i kind clip spoken_count speech_at
-  local starts=() ended_alone=() latencies=() stopped_backchannels=0 counted_backchannels=0 counted_talkovers=0
-  local no_stop=() allowed limit spoken_at stop_at
+  local kinds=() clips=() talkover_files=() backchannel_files=() i kind clip spoken_count speech_at rc
+  local starts=() ended_alone=() lows=() highs=() stopped_backchannels=0 counted_backchannels=0 counted_talkovers=0
+  local no_stop=() unsure_talkovers=() unsure_backchannels=() allowed limit spoken_at stop_at median_low median_high
   mapfile -t talkover_files < <(wav_files "$talkover_dir" | head -n "$talkovers")
   mapfile -t backchannel_files < <(wav_files "$backchannel_dir" | head -n "$backchannels")
   for ((i = 0; i < talkovers || i < backchannels; i++)); do
@@ -1845,37 +2116,68 @@ step_barge_in() {
       note "barge-in round $((i + 1)) ($kind): the answer ended by itself inside the window; not counted"
       continue
     fi
-    if silence_from "${starts[i]}" $((starts[i] + stop_window_ms)); then
-      if [[ $kind == talk-over ]]; then
-        latencies+=($((silent_at - starts[i])))
-        counted_talkovers=$((counted_talkovers + 1))
-        note "barge-in round $((i + 1)) (talk-over): the Jabra went quiet $((silent_at - starts[i])) ms after the clip began"
-      else
-        stopped_backchannels=$((stopped_backchannels + 1))
-        counted_backchannels=$((counted_backchannels + 1))
-        note "barge-in round $((i + 1)) (backchannel): it stopped the speech; the Jabra went quiet $((silent_at - starts[i])) ms after the clip began"
-      fi
-    elif [[ $kind == talk-over ]]; then
-      no_stop+=($((i + 1)))
+    silence_from "${starts[i]}" $((starts[i] + stop_window_ms))
+    rc=$?
+    if [[ $kind == talk-over ]]; then
       counted_talkovers=$((counted_talkovers + 1))
-      note "barge-in round $((i + 1)) (talk-over): no stop: the Jabra kept sounding for $stop_window_ms ms after the clip began"
+      case $rc in
+        0)
+          lows+=($((silent_low - starts[i])))
+          highs+=($((silent_high - starts[i])))
+          note "barge-in round $((i + 1)) (talk-over): the Jabra went quiet $((silent_high - starts[i])) ms after the clip began (no earlier than $((silent_low - starts[i])) ms)"
+          ;;
+        1)
+          no_stop+=($((i + 1)))
+          note "barge-in round $((i + 1)) (talk-over): no stop: the Jabra kept sounding for $stop_window_ms ms after the clip began"
+          ;;
+        2)
+          unsure_talkovers+=($((i + 1)))
+          lows+=($((silent_low - starts[i])))
+          highs+=("$never_ms")
+          note "barge-in round $((i + 1)) (talk-over): the Jabra may have gone quiet $((silent_low - starts[i])) ms after the clip began, but the recording's times cannot show that it did"
+          ;;
+      esac
     else
       counted_backchannels=$((counted_backchannels + 1))
-      note "barge-in round $((i + 1)) (backchannel): the speech went on"
+      case $rc in
+        0)
+          stopped_backchannels=$((stopped_backchannels + 1))
+          note "barge-in round $((i + 1)) (backchannel): it stopped the speech; the Jabra went quiet $((silent_high - starts[i])) ms after the clip began (no earlier than $((silent_low - starts[i])) ms)"
+          ;;
+        1) note "barge-in round $((i + 1)) (backchannel): the speech went on" ;;
+        2)
+          unsure_backchannels+=($((i + 1)))
+          note "barge-in round $((i + 1)) (backchannel): the speech may have stopped, the Jabra quiet from $((silent_low - starts[i])) ms after the clip began, but the recording's times cannot show whether it did"
+          ;;
+      esac
     fi
   done
+  allowed=$((backchannels / 10))
+  # A FAIL is proven, so it comes before any UNKNOWN.
   ((${#no_stop[@]} == 0)) || fail "barge-in: no stop on talk-over rounds ${no_stop[*]}: the Jabra kept sounding for $stop_window_ms ms after the clip began"
+  ((stopped_backchannels <= allowed)) || fail "barge-in: $stopped_backchannels of $backchannels backchannels stopped the speech, more than $allowed"
+  if ((${#lows[@]} > 0)); then
+    median_low=$(percentile 50 "${lows[@]}")
+    median_high=$(percentile 50 "${highs[@]}")
+    ((median_low <= talkover_median_ms)) || fail "barge-in: median $median_low ms or more from a talk-over clip's start to silence at the Jabra, more than $talkover_median_ms ms"
+  fi
   ((counted_talkovers == talkovers)) \
     || unknown "barge-in: only $counted_talkovers of $talkovers talk-over rounds counted, as the others' answers ended by themselves; use a question with a longer answer"
   ((counted_backchannels == backchannels)) \
     || unknown "barge-in: only $counted_backchannels of $backchannels backchannel rounds counted, as the others' answers ended by themselves; use a question with a longer answer"
-  allowed=$((backchannels / 10))
-  ((stopped_backchannels <= allowed)) || fail "barge-in: $stopped_backchannels of $backchannels backchannels stopped the speech, more than $allowed"
-  pass "barge-in: $stopped_backchannels of $backchannels backchannels stopped the speech, at most $allowed"
+  ((stopped_backchannels + ${#unsure_backchannels[@]} <= allowed)) \
+    || unknown "barge-in: $stopped_backchannels of $backchannels backchannels stopped the speech, and backchannel rounds ${unsure_backchannels[*]} may have: the recording's times cannot show whether the Jabra went quiet for $stop_silence_ms ms there, so whether more than $allowed stopped it is not known"
+  ((${#unsure_talkovers[@]} == 0)) \
+    || unknown "barge-in: the recording's times cannot show whether talk-over rounds ${unsure_talkovers[*]} stopped the speech within $stop_window_ms ms of the clip's start"
+  ((talkovers == 0 || median_high <= talkover_median_ms)) \
+    || undecided "barge-in: the median from a talk-over clip's start to silence at the Jabra" "$median_low" "$median_high" "$talkover_median_ms"
+  if ((${#unsure_backchannels[@]} == 0)); then
+    pass "barge-in: $stopped_backchannels of $backchannels backchannels stopped the speech, at most $allowed"
+  else
+    pass "barge-in: $stopped_backchannels of $backchannels backchannels stopped the speech, and ${#unsure_backchannels[@]} more may have, at most $allowed"
+  fi
   ((talkovers == 0)) && return
-  median=$(percentile 50 "${latencies[@]}")
-  ((median <= talkover_median_ms)) || fail "barge-in: median $median ms from a talk-over clip's start to silence at the Jabra, more than $talkover_median_ms ms"
-  pass "barge-in: median $median ms from a talk-over clip's start to silence at the Jabra, at most $talkover_median_ms ms"
+  pass "barge-in: median $median_high ms from a talk-over clip's start to silence at the Jabra (no less than $median_low ms), at most $talkover_median_ms ms"
 }
 
 # speaker_status: set status_path to the /proc status file of the speaker's playback
@@ -1963,12 +2265,12 @@ running_ms() {
 # Known limits. A leak can hide only where it runs into the next question's chime, with less than
 # silence_ms between them: the part of it outside the chime must add at most chime_tolerance_ms to
 # the chime as the rig hears it, and any of it that plays during the chime is not told apart. And a
-# leak that starts so shortly before the next answer's first_audio that the recording's time for it,
-# late by however late its best anchor was read, falls after first_audio, passes for that answer.
+# leak that certainly starts no earlier than lead_ms before the next answer's first_audio, where the
+# answer itself may start, is not told apart from that answer; one that may start earlier reads UNKNOWN.
 step_playback_cancel() {
   local i q wake first spoken_count speech_at wait_ms stop_ats=() question_starts=() question_wakes=()
   local question_firsts=() heard=() heard_early=() deadline max xruns streams ways next chime boundary_unknown
-  local underruns played worst rc calib_from calib_to calib calib_len calib_ms alone_until
+  local underruns played worst rc calib_from calib_to calib calib_len calib_ms calib_unknown alone_until
   speaker_status
   start_rig_run
   # The calibration: the wake sound alone, while the rig records, then quiet until the first question.
@@ -2029,27 +2331,45 @@ step_playback_cancel() {
   stop_poller
   analyse_rig
   # The calibration is the first sound that starts while play-sound played. It must be alone: it ends,
-  # and no other sound starts, before the step's first question.
-  first_sound $((calib_from - lead_ms)) "$calib_to" \
-    || unknown 'playback-cancel: no sound at the rig microphone while ghost-wispr play-sound played the wake sound alone'
-  calib=$found_sound
-  calib_len=${sound_len[calib]}
-  calib_ms=$(((calib_len + 500) / 1000))
-  alone_until=${question_starts[0]:-$recording_end}
-  ((sound_off[calib] <= alone_until)) \
-    || unknown "playback-cancel: the sound at the rig microphone while ghost-wispr play-sound played the wake sound alone is heard for $calib_ms ms, into the step's first question, so how long the rig hears the wake sound alone is not known"
-  ((calib + 1 >= ${#sound_on[@]} || sound_on[calib + 1] >= alone_until)) \
-    || unknown "playback-cancel: another sound at the rig microphone starts $((sound_on[calib + 1] - sound_off[calib])) ms after the wake sound that ghost-wispr play-sound played alone, before the step's first question, so how long the rig hears the wake sound alone is not known"
-  note "playback-cancel: calibration: the wake sound played alone (ghost-wispr play-sound) is heard at the rig microphone for $calib_ms ms above $rig_threshold_db dB; a chime after a stop may be heard for up to $((calib_ms + chime_tolerance_ms)) ms (the calibration and $chime_tolerance_ms ms)"
+  # and no other sound starts, before the step's first question. The calibration decides only whether
+  # a chime is the chime alone, so when the recording's times cannot tell, the step goes on and reads
+  # UNKNOWN only after any FAIL.
+  calib_unknown=
+  calib=
+  onset_between $((calib_from - lead_ms)) $((calib_from - lead_ms)) "$calib_to"
+  case $? in
+    1) calib_unknown='playback-cancel: no sound at the rig microphone while ghost-wispr play-sound played the wake sound alone' ;;
+    2) calib_unknown="playback-cancel: a sound at the rig microphone starts between $((sound_on_early[maybe_sound] - calib_from)) and $((sound_on[maybe_sound] - calib_from)) ms from when ghost-wispr play-sound played the wake sound alone, so whether it is the wake sound is not known" ;;
+    0)
+      if ((maybe_sound != found_sound)); then
+        calib_unknown="playback-cancel: a sound at the rig microphone may start before the one that starts while ghost-wispr play-sound played the wake sound alone, so which one is the wake sound is not known"
+      else
+        calib=$found_sound
+      fi
+      ;;
+  esac
+  if [[ -n $calib ]]; then
+    calib_len=${sound_len[calib]}
+    calib_ms=$(((calib_len + 500) / 1000))
+    alone_until=${question_starts[0]}
+    ((sound_off[calib] <= alone_until)) \
+      || calib_unknown="playback-cancel: the sound at the rig microphone while ghost-wispr play-sound played the wake sound alone is heard for $calib_ms ms, into the step's first question, so how long the rig hears the wake sound alone is not known"
+    ((calib + 1 >= ${#sound_on[@]} || sound_on_early[calib + 1] >= alone_until)) \
+      || calib_unknown=${calib_unknown:-"playback-cancel: another sound at the rig microphone may start $((sound_on_early[calib + 1] - sound_off[calib])) ms after the wake sound that ghost-wispr play-sound played alone, before the step's first question, so how long the rig hears the wake sound alone is not known"}
+    [[ -n $calib_unknown ]] \
+      || note "playback-cancel: calibration: the wake sound played alone (ghost-wispr play-sound) is heard at the rig microphone for $calib_ms ms above $rig_threshold_db dB; a chime after a stop may be heard for up to $((calib_ms + chime_tolerance_ms)) ms (the calibration and $chime_tolerance_ms ms)"
+  fi
   boundary_unknown=
   for i in "${!stop_ats[@]}"; do
     # Every sound that starts from the stop until the earliest the next question's chime can start
     # (its wake_heard, less lead_ms) is audio after the cancel. The first sound that starts where the
-    # chime belongs (up to wake_max_ms after the wake) is taken for the chime: it must be heard no
-    # longer than the calibration and chime_tolerance_ms, and the next sound must not start before
-    # the answer's first_audio. With no wake_heard or first_audio for that question, or no sound
-    # where its chime belongs, the window is not known: UNKNOWN, unless what was heard fails.
-    next=$recording_end
+    # chime belongs (up to wake_max_ms after the wake) is taken for the chime, when it certainly
+    # starts there and no sound before it may: it must be heard no longer than the calibration and
+    # chime_tolerance_ms, and the next sound must not start before the answer's first_audio. With no
+    # wake_heard or first_audio for that question, or no sound that is certainly the chime, the
+    # window is not known: UNKNOWN, unless what was heard fails.
+    next=$recording_end_early
+    chime=${#sound_on[@]}
     for q in "${!question_starts[@]}"; do
       ((question_starts[q] > stop_ats[i])) || continue
       next=${question_starts[q]}
@@ -2058,25 +2378,43 @@ step_playback_cancel() {
         break
       fi
       next=$((question_wakes[q] - lead_ms))
-      if ! first_sound "$next" $((question_wakes[q] + wake_max_ms)); then
-        boundary_unknown=${boundary_unknown:-"playback-cancel stop $((i + 1)): no sound at the rig microphone where the next question's chime belongs (up to $wake_max_ms ms after its wake_heard), so the window's end is not known"}
+      onset_between "$next" "$next" $((question_wakes[q] + wake_max_ms))
+      case $? in
+        1)
+          boundary_unknown=${boundary_unknown:-"playback-cancel stop $((i + 1)): no sound at the rig microphone where the next question's chime belongs (up to $wake_max_ms ms after its wake_heard), so the window's end is not known"}
+          break
+          ;;
+        2)
+          boundary_unknown=${boundary_unknown:-"playback-cancel stop $((i + 1)): a sound at the rig microphone starts between $((sound_on_early[maybe_sound] - question_wakes[q])) and $((sound_on[maybe_sound] - question_wakes[q])) ms from the next question's wake_heard, so whether it is the chime, or audio before it, is not known, nor the window's end"}
+          break
+          ;;
+      esac
+      if ((maybe_sound != found_sound)); then
+        boundary_unknown=${boundary_unknown:-"playback-cancel stop $((i + 1)): a sound at the rig microphone may start where the next question's chime belongs before the one that certainly does, so which one is the chime is not known, nor the window's end"}
         break
       fi
       chime=$found_sound
-      ((sound_len[chime] <= calib_len + chime_tolerance_ms * 1000)) \
-        || fail "playback-cancel stop $((i + 1)): the sound at the next question's chime is not the chime alone: it lasts $((sound_len[chime] / 1000)) ms, more than the calibration, the wake sound played alone ($calib_ms ms), by over $chime_tolerance_ms ms"
+      if [[ -n $calib && -z $calib_unknown ]]; then
+        ((sound_len[chime] <= calib_len + chime_tolerance_ms * 1000)) \
+          || fail "playback-cancel stop $((i + 1)): the sound at the next question's chime is not the chime alone: it lasts $((sound_len[chime] / 1000)) ms, more than the calibration, the wake sound played alone ($calib_ms ms), by over $chime_tolerance_ms ms"
+      fi
+      # The answer's own sound may start lead_ms before its first_audio, which is logged just after
+      # its first frame is written: a sound after the chime is audio of the cancelled answer only
+      # where it starts before that.
       if [[ -z ${question_firsts[q]} ]]; then
         boundary_unknown=${boundary_unknown:-"playback-cancel stop $((i + 1)): the timing log has no first_audio for the next question's answer, so the quiet after its chime cannot be checked"}
-      elif ((chime + 1 < ${#sound_on[@]} && sound_on[chime + 1] < question_firsts[q])); then
+      elif ((chime + 1 < ${#sound_on[@]} && sound_on[chime + 1] < question_firsts[q] - lead_ms)); then
         fail "playback-cancel stop $((i + 1)): a sound at the rig microphone starts $((sound_on[chime + 1] - sound_off[chime])) ms after the next question's chime ends, before its answer's first audio ($((question_firsts[q] - sound_on[chime + 1])) ms later): audio of the cancelled answer"
+      elif ((chime + 1 < ${#sound_on[@]} && sound_on_early[chime + 1] < question_firsts[q] - lead_ms)); then
+        boundary_unknown=${boundary_unknown:-"playback-cancel stop $((i + 1)): a sound at the rig microphone starts between $((sound_on_early[chime + 1] - question_firsts[q])) and $((sound_on[chime + 1] - question_firsts[q])) ms from the next answer's first audio, after the chime, so whether it is audio of the cancelled answer, or the answer, which may start $lead_ms ms before its first audio, is not known"}
       fi
       break
     done
-    ((next <= recording_end)) \
-      || unknown "playback-cancel stop $((i + 1)): the rig recording ends before the step's next sound after the stop"
+    ((next <= recording_end_early)) \
+      || boundary_unknown=${boundary_unknown:-"playback-cancel stop $((i + 1)): the rig recording shows every sound only up to $((recording_end_early - stop_ats[i])) ms after the stop, before the step's next sound after it"}
     ((next - stop_ats[i] >= stop_silence_ms)) \
       || unknown "playback-cancel stop $((i + 1)): the step's next sound came $((next - stop_ats[i])) ms after the stop, less than $stop_silence_ms ms"
-    cancel_heard "${stop_ats[i]}" "$next" \
+    cancel_heard "${stop_ats[i]}" "$next" "$chime" \
       || unknown "playback-cancel stop $((i + 1)): the rig microphone did not hear the speech up to the stop, so it cannot time the cancel"
     heard+=("$heard_ms")
     heard_early+=("$heard_early_ms")
@@ -2095,7 +2433,8 @@ step_playback_cancel() {
   # Each stop's true tail lies between its two bounds. PASS when even the late one is within
   # cancel_heard_ms; FAIL when even the early one is over; UNKNOWN otherwise, since the anchors that
   # timed the recording may have been read that late. A FAIL is proven, so it comes before an
-  # unknown window's end, and that before an undecided tail, which the window bounds.
+  # unknown window's end, and that before an undecided tail, which the window bounds. A calibration
+  # the recording cannot decide leaves only the chime checks undecided, so it comes last.
   max=$(maximum "${heard[@]}")
   worst=
   for i in "${!heard_early[@]}"; do
@@ -2110,6 +2449,7 @@ step_playback_cancel() {
     for i in "${!heard[@]}"; do ((heard[i] > heard[worst])) && worst=$i; done
     unknown "playback-cancel: stop $((worst + 1))'s speech was heard at the rig microphone up to ${heard[worst]} ms after it, more than $cancel_heard_ms ms, but no earlier than ${heard_early[worst]} ms after it: the recording's times may be up to $((heard[worst] - heard_early[worst])) ms late, so whether it ended within $cancel_heard_ms ms is not known"
   fi
+  [[ -z $calib_unknown ]] || unknown "$calib_unknown"
   pass "playback-cancel: no stop's speech was heard at the rig microphone $cancel_heard_ms ms after it, and the rig stayed quiet until the step's next sound (the longest $max ms, over $stops stops)"
   ways=$(journal_records 'speaker cancel' | jq -r '.way // ""') \
     || unknown "playback-cancel: cannot read the speaker cancel lines from the journal$(journal_error)"
