@@ -2314,10 +2314,12 @@ for scenario in other-meeting early-spoken other-spoken spoken-during-clip words
 done
 # shellcheck disable=SC2086
 launch joined-words-unsure joined,arecord-slow-start,no-capture-params yes -- $joined_args
-# The same with the capture substream known (a 250 ms buffer): the words' onset is certainly after
-# the go-ahead, 1 s on: PASS.
+# The same with the capture substream known, with the Pi's 40 ms buffer: the words' onset is
+# certainly after the go-ahead, 1 s on, and the hand sound, 22 ms after hand_chime, certainly after
+# the 100 ms it may lead it, within the 61 ms a sample can stay unwritten: PASS. A 250 ms buffer could
+# not place the hand sound.
 # shellcheck disable=SC2086
-launch joined-words-slow-read joined,arecord-slow-start,capture-buffer-250 yes -- $joined_args
+launch joined-words-slow-read joined,arecord-slow-start yes -- $joined_args
 # The mention's aplay returning 1.8 s after the clip ended (slow-exit-mention): the hand sound came
 # 2.5 s after the mention ended, but only 0.7 s after aplay returned: UNKNOWN, never the FAIL of a gap
 # from aplay's return alone. The go-ahead's aplay starting the clip 2 s late (slow-aplay-go-ahead),
