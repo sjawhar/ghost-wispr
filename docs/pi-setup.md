@@ -1004,14 +1004,14 @@ with the unit paused and no session active:
    A Python process compares the realtime clock with the monotonic clock while each recording runs.
    The voice writes its own times on the realtime clock. A step of the system clock during a
    recording makes the step UNKNOWN.
-   The rig's times are when the rig microphone captured each sound. A USB microphone captures a
+   The rig's times are when each sound reached the rig microphone. A USB microphone captures a
    sound about 1 to 2 ms after it arrives: its converter's filter and the USB audio class transfer,
-   which moves audio in 1 ms frames. The driver does not allow for that delay. It is an assumption
-   about the rig, not a measured bound, and it can make an early bound late by as much. Of the
-   bounds above, a verdict can be wrong only when the true time lies within 2 ms of its bound, and
-   only two bounds are tight enough for that to matter. A true playback-cancel tail of 18 to 20 ms
-   can read as a FAIL. `joined` has no margin at the go-ahead's end, so words that begin less than
-   2 ms before it can pass.
+   which moves audio in 1 ms frames. The driver allows 2 ms for that delay: every early bound comes
+   2 ms earlier, and every silence's lower bound 2 ms shorter. So a time within 2 ms of a bound reads
+   UNKNOWN: words that begin less than 2 ms after the end of the go-ahead do not pass `joined`, and a
+   playback-cancel tail that may be 18 to 20 ms is not a FAIL. The 2 ms is an assumption about the
+   rig, not a measured bound. A microphone slower than that can make an early bound late by the
+   difference.
 6. Slice 4's two steps check the three capture states and the paused listener, with the
    listener turned on for the run only (`GHOST_WISPR_VOICE_PAUSED_LISTENER=true`, beside the
    voice). Both keep the microphone on the loopback, so the listener hears only what the step plays

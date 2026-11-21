@@ -1164,10 +1164,15 @@ stop_recording() {
 # between its two bounds, and a check decides PASS or FAIL only where it holds for every time between
 # them, else UNKNOWN.
 #
-# Every time here is when the rig captured a sound. A USB microphone captures a sound a little after
-# it arrives: its converter's filter and its USB audio class transfer, which moves audio in 1 ms
-# frames, take about 1 to 2 ms. Nothing here allows for that delay: it is an assumption of the rig,
-# not a measured bound, and it can make an early bound late by as much. A late bound stays a bound.
+# Every time here is when a sound reached the rig microphone. A USB microphone captures a sound a
+# little after it arrives: its converter's filter and its USB audio class transfer, which moves audio
+# in 1 ms frames, take about 1 to 2 ms. mic_delay_us allows for 2 ms: every early bound and every
+# silence's lower bound is that much earlier or shorter (recording-times.awk), so a verdict on the
+# edge of a bound, such as words that begin less than 2 ms after the go-ahead, reads UNKNOWN. The
+# 2 ms is an assumption of the rig, not a measured bound: a microphone slower than that can make an
+# early bound late by the difference. A late bound needs no allowance: the sound came no later than
+# its capture.
+readonly mic_delay_us=2000
 sound_on=()
 sound_off=()
 sound_on_early=()
@@ -1213,7 +1218,7 @@ analyse_recording() {
       error) unknown "recording: $recording: $rest" ;;
     esac
   done < <(awk -v rate="$sample_rate" -v header="$wav_header_bytes" -v frame="$sample_bytes" -v bytes="$bytes" \
-    -v started_us="$recording_started" -f "$recording_times" "$anchors_file" - <<<"$analysis")
+    -v started_us="$recording_started" -v mic_delay_us="$mic_delay_us" -f "$recording_times" "$anchors_file" - <<<"$analysis")
   [[ $recording_end_late == none ]] && recording_end_late=$never_ms
   [[ $recording_end_early =~ ^[0-9]+$ && $recording_end_late =~ ^[0-9]+$ && $recording_trail_min =~ ^[0-9]+$ ]] \
     || unknown "recording: the times of $recording could not be read"

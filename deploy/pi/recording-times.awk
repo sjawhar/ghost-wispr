@@ -1,15 +1,20 @@
 # recording-times.awk: the times on the driver's clock of the sounds in a recording that
 # deploy/pi/accept-voice.sh made, each between two bounds, and the silences between them.
 #
-#   awk -v rate=HZ -v header=BYTES -v frame=BYTES -v bytes=BYTES -v started_us=US \
+#   awk -v rate=HZ -v header=BYTES -v frame=BYTES -v bytes=BYTES -v started_us=US [-v mic_delay_us=US] \
 #     -f recording-times.awk ANCHORS - <SILENCEDETECT
 #
 # rate, header and frame are the WAV file's sample rate, header size and bytes a sample; bytes is the
 # file's size. started_us is a time no later than the capture of the file's first sample: the
 # driver's last read of the file's size that found less than arecord's header, or its clock just
-# before it started arecord when no read did (accept-voice.sh, start_recording). ANCHORS holds
+# before it started arecord when no read did (accept-voice.sh, start_recording). mic_delay_us is how
+# long a sound may take from reaching the microphone to its capture (0 when not given). ANCHORS holds
 # "US BYTES" lines: by the driver's clock US, read just after the file's size, BYTES of the file
 # were written. SILENCEDETECT is ffmpeg's silencedetect report.
+#
+# The times are when each sound reached the microphone. A late bound on a capture is one on the
+# arrival, which came no later; an early bound on a capture is one on the arrival only less
+# mic_delay_us.
 #
 # It prints a line for each sound, "sound ON_MS OFF_MS LENGTH_US ON_EARLY_MS OFF_EARLY_MS GAP_MS"
 # (its onset and end on the driver's clock, never early; its length in the file; its onset and end
@@ -35,17 +40,19 @@
 #
 # The early bound of a place p comes from started_us alone: the file's first sample was captured no
 # earlier, and the card took at least p * (1 - 1/5000) of the driver's time to reach p, longer if an
-# overrun lost audio. An anchor bounds nothing from below: a sample can sit captured in arecord's
-# buffer before it reaches the file. So the early bound is early by up to the time between two reads
-# of the file's size (10 ms on an idle machine) and the time arecord took from its header to its
-# first read, and by up to 400 ppm of the time into the recording (it takes the card at 200 ppm
-# fast, and the card can be 200 ppm slow); it is rounded in the early direction: the place down by
-# its printed precision, and the time down to the millisecond.
+# overrun lost audio; less mic_delay_us, it bounds the sound's arrival. An anchor bounds nothing from
+# below: a sample can sit captured in arecord's buffer before it reaches the file. So the early bound
+# is early by up to the time between two reads of the file's size (10 ms on an idle machine), the
+# time arecord took from its header to its first read, and mic_delay_us less the true delay, and by
+# up to 400 ppm of the time into the recording (it takes the card at 200 ppm fast, and the card can
+# be 200 ppm slow); it is rounded in the early direction: the place down by its printed precision,
+# and the time down to the millisecond.
 #
 # A silence's length is its length in the file, the next sound's place less the last one's, each
-# moved by its printed precision to shorten it, less 200 ppm: the card took at least that long to
-# capture it, and a lost stretch of audio only adds to the true time. It is rounded down to the
-# millisecond.
+# moved by its printed precision to shorten it, less 200 ppm and mic_delay_us: the card took at least
+# that long to capture it, a lost stretch of audio only adds to the true time, and the microphone
+# may have delayed the sound before it by mic_delay_us more than the one after. It is rounded down to
+# the millisecond.
 
 function ceil_div(a, b) { return int((a + b - 1) / b) }
 
@@ -83,20 +90,25 @@ function late_us(p,    j, k, d, u, best) {
   return best
 }
 
-# early_ms PLACE_US UNIT: the time of the place PLACE_US, printed to UNIT microseconds, never late.
+# early_ms PLACE_US UNIT: the time of the place PLACE_US, printed to UNIT microseconds, never late:
+# when the sound there reached the microphone, mic_delay_us before the card captured it.
 function early_ms(p, u,    q) {
   q = p - u
   if (q < 0) q = 0
-  return int((started_us + q - ceil_div(q, ppm_div)) / 1000)
+  return int((started_us + q - ceil_div(q, ppm_div) - mic_delay_us) / 1000)
 }
 
-# short_ms US: the driver's time the card took to capture US microseconds of the file, never long.
+# short_ms US: the driver's time between the arrivals of the sounds US microseconds of the file
+# apart, never long: the card took at least US less 200 ppm to capture them, and the microphone may
+# have delayed the first by up to mic_delay_us more than the second.
 function short_ms(d) {
+  d = d - ceil_div(d, ppm_div) - mic_delay_us
   if (d <= 0) return 0
-  return int((d - ceil_div(d, ppm_div)) / 1000)
+  return int(d / 1000)
 }
 BEGIN {
   if (ppm_div == "") ppm_div = 5000
+  if (mic_delay_us == "") mic_delay_us = 0
   samples = int((bytes - header) / frame)
   duration_us = int(samples * 1000000 / rate)
   end_us = ceil_div(samples * 1000000, rate)
@@ -179,6 +191,8 @@ END {
     }
   if (failed) exit
   file_end = late_us(end_us)
-  printf "end %.0f %s %.0f\n", int((started_us + seen_us - ceil_div(seen_us, ppm_div)) / 1000), \
-    bounded ? sprintf("%.0f", ceil_div(file_end, 1000)) : "none", last_off < 0 ? 0 : short_ms(seen_us - last_off)
+  file_end_bounded = bounded
+  # A sound that reaches the microphone before early_ms(seen_us) is captured before seen_us.
+  printf "end %.0f %s %.0f\n", early_ms(seen_us, 0), \
+    file_end_bounded ? sprintf("%.0f", ceil_div(file_end, 1000)) : "none", last_off < 0 ? 0 : short_ms(seen_us - last_off)
 }

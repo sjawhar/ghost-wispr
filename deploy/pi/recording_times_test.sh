@@ -199,6 +199,83 @@ print("recording-times: checked %d places, %d failures" % (checked, len(failures
 sys.exit(1 if failures else 0)
 EOF
 
+# The microphone's delay: each sound reaches the microphone 0 to 2 ms before its capture. With
+# mic_delay_us=2000, every early bound must be no later than the arrival, every silence no longer
+# than the time between the arrivals, and the end early enough that a sound arriving before it is
+# captured before the last place the report shows. Without it, the same recordings must break the
+# first of these, or the check could not fail.
+python3 - "$work_dir" "$program" <<'EOF' || fail "a bound did not allow for the microphone's delay (above)"
+import math, os, random, subprocess, sys
+d, program = sys.argv[1], sys.argv[2]
+random.seed(2000)
+failures = []
+checked = 0
+late_without = 0
+for trial in range(6):
+    origin = 100000.0 + random.random()
+    length = 6000
+    def capture_ms(rel):
+        return origin + rel
+    with open(os.path.join(d, "ma"), "w") as f:
+        for rel in range(500, length + 1, 500):
+            f.write("%d %d\n" % (math.floor(capture_ms(rel) * 1000) + 1, 44 + rel * 48))
+    sounds = []
+    at = 300.0
+    while at < length - 600:
+        on = at + random.random() * 100
+        off = on + 50 + random.random() * 300
+        sounds.append((on, off))
+        at = off + 200
+    delay = {}
+    for on, off in sounds:
+        delay[on] = random.random() * 2.0
+        delay[off] = random.random() * 2.0
+    def arrival_ms(place):
+        return capture_ms(place) - delay[place]
+    lines = ["[silencedetect @ 0x1] silence_start: 0\n"]
+    for on, off in sounds:
+        lines.append("[silencedetect @ 0x1] silence_end: %.6f | x\n" % (on / 1000))
+        lines.append("[silencedetect @ 0x1] silence_start: %.6f\n" % (off / 1000))
+    lines.append("[silencedetect @ 0x1] silence_end: %.6f | x\n" % (length / 1000))
+    with open(os.path.join(d, "ms"), "w") as f:
+        f.writelines(lines)
+    for mic in ("2000", ""):
+        with open(os.path.join(d, "ms")) as report:
+            out = subprocess.run(["awk", "-v", "rate=24000", "-v", "header=44", "-v", "frame=2",
+                                  "-v", "bytes=%d" % (44 + length * 48), "-v", "started_us=%d" % math.floor(origin * 1000),
+                                  "-v", "mic_delay_us=" + mic, "-f", program, os.path.join(d, "ma"), "-"],
+                                 stdin=report, capture_output=True, text=True, check=True).stdout.split("\n")
+        got = [line.split() for line in out if line.startswith("sound ")]
+        end = [line.split() for line in out if line.startswith("end ")]
+        if len(got) != len(sounds) or not end:
+            failures.append("trial %d, mic_delay_us %r: %d sounds, want %d; end %s" % (trial, mic, len(got), len(sounds), end))
+            continue
+        prev_off = None
+        for (on, off), fields in zip(sounds, got):
+            for place, early in ((on, int(fields[4])), (off, int(fields[5]))):
+                if not mic:
+                    late_without += early > arrival_ms(place)
+                    continue
+                checked += 1
+                if early > arrival_ms(place):
+                    failures.append("trial %d: the sound %.3f ms in reached the microphone at %.3f ms, its early bound %d ms: late" % (trial, place, arrival_ms(place), early))
+            if mic and prev_off is not None:
+                checked += 1
+                if int(fields[6]) > arrival_ms(on) - arrival_ms(prev_off):
+                    failures.append("trial %d: the silence before %.3f ms in lasted %.3f ms between arrivals, given %s ms: long" % (trial, on, arrival_ms(on) - arrival_ms(prev_off), fields[6]))
+            prev_off = off
+        if mic:
+            checked += 1
+            if int(end[0][1]) > capture_ms(length - 20) - 2:
+                failures.append("trial %d: the end %s ms, later than %.3f ms, so a sound arriving 2 ms before its capture at the last place shown may be missing" % (trial, end[0][1], capture_ms(length - 20) - 2))
+if late_without == 0:
+    failures.append("without mic_delay_us no early bound came after an arrival, so this test cannot fail")
+for line in failures[:20]:
+    print(line)
+print("recording-times mic delay: checked %d bounds, %d failures; %d early bounds after the arrival without it" % (checked, len(failures), late_without))
+sys.exit(1 if failures else 0)
+EOF
+
 # ffmpeg's own silences: one it reports just before the start (a negative time) starts no sound, nor
 # does the one it ends at the end of the file; a sound still going at the end runs to the end.
 printf '2000000 %s\n' $((44 + 2000 * 48)) >"$work_dir/edge.anchors"
