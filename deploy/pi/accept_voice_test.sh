@@ -2083,6 +2083,14 @@ floor_decided() {
   floor_cases=$((floor_cases + 1))
 }
 
+# expect_timed_against_chime NAME: the case's answers were timed against their chimes in the same
+# recording, and none against first_audio, the threshold whose window the recording's early bounds
+# can cover on a loaded machine (#146's h3 and #149's g1 read UNKNOWN there).
+expect_timed_against_chime() {
+  expect_no_line "$1" "so a sound after its chime is timed against the answer's first_audio"
+  expect_no_line "$1" "from the next answer's first audio, after the chime"
+}
+
 # expect_between NAME GOT LOW HIGH: GOT is a number of milliseconds from LOW to HIGH. NAME starts
 # with its case's name; when GOT is missing or out of range, the message also gives that case's
 # output and the fake's stops.log, since a tail that was never measured can have any cause, and an
@@ -2351,10 +2359,9 @@ launch cancel-locked long,asound,stop-rounds-2,arecord-hold-200,arecord-reopen,a
 # shellcheck disable=SC2086
 launch cancel-unsure long,asound,stop-rounds-2,arecord-slow-start,no-capture-params yes -- $cancel_args
 # The same with the capture substream known: the anchors' bound may still be up to 61 ms early, more
-# than the 30 ms the fake's answer is heard after its first_audio, so whether the sound after each
-# chime starts before first_audio is not known: UNKNOWN, a limit of the bound (#146 reads first_audio
-# as the earliest the answer is heard). PASS only where a loaded machine left the answer's first
-# samples unwritten long enough to narrow the bound; never FAIL.
+# than the 30 ms the fake's answer is heard after its first_audio. The answer is timed against its
+# chime in the same recording, where that slack cancels, so a good cancel is a PASS at any load
+# (on #149's driver, which timed it against first_audio, it was UNKNOWN).
 # shellcheck disable=SC2086
 launch cancel-slow-read long,asound,stop-rounds-2,arecord-slow-start yes -- $cancel_args
 # shellcheck disable=SC2086
@@ -3107,6 +3114,7 @@ expect_rc cancel 0
 expect_line cancel 'PASS: playback-cancel: the poller sees the speaker'\''s stream run at '
 expect_line cancel 'NOTE: playback-cancel: calibration: the wake sound played alone (ghost-wispr play-sound) is heard at the rig microphone for 200 ms above -50 dB; a chime after a stop may be heard for up to 220 ms (the calibration and 20 ms)'
 expect_line cancel "PASS: playback-cancel: no stop's speech was heard at the rig microphone 20 ms after it"
+expect_timed_against_chime cancel
 expect_line cancel 'NOTE: playback-cancel: the speaker logged 2 cancels: 0 by rewind, 2 by drop'
 expect_line cancel 'PASS: playback-cancel: 0 underruns over '
 expect_line cancel 'can miss a short underrun'
@@ -3131,15 +3139,15 @@ expect_rc cancel-unsure 2
 expect_line cancel-unsure 'UNKNOWN: playback-cancel stop 1: the rig microphone did not hear the speech up to the stop'
 expect_no_line cancel-unsure "PASS: playback-cancel: no stop's speech was heard"
 expect_restored cancel-unsure
-expect_rc cancel-slow-read 2 0
-if floor_decided cancel-slow-read && [[ $(cat "$root/cancel-slow-read/rc" 2>/dev/null) == 2 ]]; then
-  expect_line cancel-slow-read "from the next answer's first audio, after the chime, so whether it is audio of the cancelled answer is not known"
-fi
-expect_no_line cancel-slow-read "FAIL: playback-cancel"
+floor_decided cancel-slow-read || true
+expect_rc cancel-slow-read 0
+expect_line cancel-slow-read "PASS: playback-cancel: no stop's speech was heard at the rig microphone 20 ms after it"
+expect_timed_against_chime cancel-slow-read
 expect_no_line cancel-slow-read 'NOTE: recording: no capture substream'
 expect_restored cancel-slow-read
 expect_rc cancel-slow-start 0
 expect_line cancel-slow-start "PASS: playback-cancel: no stop's speech was heard at the rig microphone 20 ms after it"
+expect_timed_against_chime cancel-slow-start
 expect_restored cancel-slow-start
 expect_rc cancel-rewind 0
 expect_line cancel-rewind "PASS: playback-cancel: no stop's speech was heard at the rig microphone 20 ms after it"
@@ -3194,6 +3202,7 @@ expect_between 'cancel-behind-drain: how long the negative control is heard, 50 
 expect_restored cancel-behind-drain
 expect_rc cancel-slow-wc 0
 expect_line cancel-slow-wc "PASS: playback-cancel: no stop's speech was heard at the rig microphone 20 ms after it"
+expect_timed_against_chime cancel-slow-wc
 expect_restored cancel-slow-wc
 expect_rc cancel-drain 1
 expect_line cancel-drain "FAIL: playback-cancel: a stop's speech was heard at the rig microphone "
@@ -3343,6 +3352,7 @@ expect_applied_late() {
 }
 expect_rc cancel-late-apply 0
 expect_line cancel-late-apply "PASS: playback-cancel: no stop's speech was heard at the rig microphone 20 ms after it"
+expect_timed_against_chime cancel-late-apply
 expect_line cancel-late-apply 'NOTE: playback-cancel: the speaker logged 2 cancels: 0 by rewind, 2 by drop'
 expect_line cancel-late-apply 'PASS: playback-cancel: 0 underruns over '
 expect_applied_late cancel-late-apply 2
