@@ -2,6 +2,7 @@ package audiotest_test
 
 import (
 	"encoding/json"
+	"fmt"
 	"go/ast"
 	"go/parser"
 	"go/token"
@@ -73,28 +74,59 @@ func plant(t *testing.T, root string, files map[string]string) *overlay {
 	return o
 }
 
-// buildTagSets is each set of build tags the check lists the test binaries
-// under: none, the kws tag CI tests with, and this test binary's own tags.
-func buildTagSets() []string {
-	sets := []string{"", "kws"}
+// buildSet is one set of build settings a test binary can be built with:
+// the race detector (whose race tag selects files too) and build tags.
+type buildSet struct {
+	race bool
+	tags string
+}
+
+func (b buildSet) String() string {
+	if b.race {
+		return fmt.Sprintf("-race -tags %q", b.tags)
+	}
+	return fmt.Sprintf("-tags %q", b.tags)
+}
+
+// buildSets is each set of build settings the check lists the test binaries
+// under: with and without the race detector, each with no tags and with the
+// kws tag CI tests with (CI runs go test -race -tags kws), and this test
+// binary's own.
+func buildSets() []buildSet {
+	var sets []buildSet
+	for _, race := range []bool{false, true} {
+		for _, tags := range []string{"", "kws"} {
+			sets = append(sets, buildSet{race: race, tags: tags})
+		}
+	}
 	if info, ok := debug.ReadBuildInfo(); ok {
+		own := buildSet{}
 		for _, s := range info.Settings {
-			if s.Key == "-tags" && !slices.Contains(sets, s.Value) {
-				sets = append(sets, s.Value)
+			switch s.Key {
+			case "-tags":
+				own.tags = s.Value
+			case "-race":
+				own.race = s.Value == "true"
 			}
+		}
+		if !slices.Contains(sets, own) {
+			sets = append(sets, own)
 		}
 	}
 	return sets
 }
 
-// uncovered lists, under tags, each package of pattern whose test binary
-// links internal/audio (linking), and those of them whose test files, as tags
-// select them, have no TestMain that calls the guard (missing). o, when not
+// uncovered lists, under set, each package of pattern whose test binary
+// links internal/audio (linking), and those of them whose test files, as set
+// selects them, have no TestMain that calls the guard (missing). o, when not
 // nil, is the overlay the go command reads.
-func uncovered(t *testing.T, root, tags, pattern string, o *overlay) (linking, missing []string) {
+func uncovered(t *testing.T, root string, set buildSet, pattern string, o *overlay) (linking, missing []string) {
 	t.Helper()
-	args := []string{"list", "-e", "-test", "-tags", tags, "-f",
-		"{{.ImportPath}}\t{{.Dir}}\t{{join .TestGoFiles \",\"}}\t{{join .XTestGoFiles \",\"}}\t{{join .Deps \",\"}}"}
+	args := []string{"list", "-e", "-test", "-tags", set.tags}
+	if set.race {
+		args = append(args, "-race")
+	}
+	args = append(args, "-f", "{{.ImportPath}}\t{{.Dir}}\t{{join .TestGoFiles \",\"}}\t{{join .XTestGoFiles \",\"}}\t{{join .Deps \",\"}}")
 	if o != nil {
 		args = append(args, "-overlay", o.path)
 	}
@@ -134,36 +166,32 @@ func uncovered(t *testing.T, root, tags, pattern string, o *overlay) (linking, m
 // TestEveryTestBinaryThatLinksAudioRefusesRealDevices fails if the tests of a
 // package that links internal/audio, directly or through another package, run
 // without audiotest.Main in their TestMain (audio.RunWithoutRealDevices in
-// internal/audio itself), under any set of build tags CI tests with: a refused
-// open would then not fail the binary. It lists the module's test binaries
-// with `go list -test` under each set (buildTagSets).
+// internal/audio itself), under any set of build settings CI tests with: a
+// refused open would then not fail the binary. It lists the module's test
+// binaries with `go list -test` under each set (buildSets).
 func TestEveryTestBinaryThatLinksAudioRefusesRealDevices(t *testing.T) {
 	root := moduleRoot(t)
-	for _, tags := range buildTagSets() {
-		linking, missing := uncovered(t, root, tags, "./...", nil)
+	for _, set := range buildSets() {
+		linking, missing := uncovered(t, root, set, "./...", nil)
 		// Control: the list holds the test binaries known to link internal/audio.
 		for _, want := range []string{audioPkg, module + "/cmd/ghost-wispr", module + "/internal/voice"} {
 			if !slices.Contains(linking, want) {
-				t.Fatalf("UNKNOWN: under tags %q, go list names %d test binaries that link internal/audio, and not %s: %v", tags, len(linking), want, linking)
+				t.Fatalf("UNKNOWN: under %v, go list names %d test binaries that link internal/audio, and not %s: %v", set, len(linking), want, linking)
 			}
 		}
 		for _, pkg := range missing {
-			t.Errorf("%s, under tags %q: its tests link internal/audio, but no TestMain there calls audiotest.Main, so a refused open would not fail it", pkg, tags)
+			t.Errorf("%s, under %v: its tests link internal/audio, but no TestMain there calls audiotest.Main, so a refused open would not fail it", pkg, set)
 		}
 	}
 }
 
-// TestTheCoverageCheckReadsTheTestFilesEachTagSetSelects fails if the check
-// misses a package whose only test file without a TestMain is built under the
-// kws tag, or counts a TestMain in a file the tags exclude. The package is
-// planted through an overlay; nothing is written to the module.
-func TestTheCoverageCheckReadsTheTestFilesEachTagSetSelects(t *testing.T) {
-	root := moduleRoot(t)
-	const probe = module + "/internal/audio/audiotest/kwsprobe"
-	o := plant(t, root, map[string]string{
-		"internal/audio/audiotest/kwsprobe/probe_test.go": `//go:build kws
+// probeFiles is a planted package whose only test file without a TestMain is
+// built under constraint, beside a file under its negation that has one.
+func probeFiles(dir, name, constraint string) map[string]string {
+	return map[string]string{
+		dir + "/probe_test.go": "//go:build " + constraint + `
 
-package kwsprobe
+package ` + name + `
 
 import (
 	"testing"
@@ -173,9 +201,9 @@ import (
 
 func TestLinksAudio(t *testing.T) { _ = audio.ErrRealDeviceRefused }
 `,
-		"internal/audio/audiotest/kwsprobe/main_test.go": `//go:build !kws
+		dir + "/main_test.go": "//go:build !" + constraint + `
 
-package kwsprobe
+package ` + name + `
 
 import (
 	"testing"
@@ -185,14 +213,36 @@ import (
 
 func TestMain(m *testing.M) { audiotest.Main(m) }
 `,
-	})
-	linking, missing := uncovered(t, root, "", "./internal/audio/audiotest/kwsprobe/", o)
-	if !slices.Contains(linking, probe) || slices.Contains(missing, probe) {
-		t.Errorf("without tags: linking %v, missing %v; want the planted package linking, with its TestMain", linking, missing)
 	}
-	linking, missing = uncovered(t, root, "kws", "./internal/audio/audiotest/kwsprobe/", o)
-	if !slices.Contains(linking, probe) || !slices.Contains(missing, probe) {
-		t.Errorf("under kws: linking %v, missing %v; want the planted package linking and missing a TestMain, since kws excludes the file that has one", linking, missing)
+}
+
+// TestTheCoverageCheckReadsTheTestFilesEachBuildSetSelects fails if the
+// check misses a package whose only test file without a TestMain is built
+// under the kws tag, or only with the race detector, or counts a TestMain in
+// a file the build set excludes. The packages are planted through an
+// overlay; nothing is written to the module.
+func TestTheCoverageCheckReadsTheTestFilesEachBuildSetSelects(t *testing.T) {
+	root := moduleRoot(t)
+	for _, tc := range []struct {
+		name, constraint string
+		without, with    buildSet
+	}{
+		{"kwsprobe", "kws", buildSet{}, buildSet{tags: "kws"}},
+		{"raceprobe", "race", buildSet{}, buildSet{race: true}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := "internal/audio/audiotest/" + tc.name
+			probe := module + "/" + dir
+			o := plant(t, root, probeFiles(dir, tc.name, tc.constraint))
+			linking, missing := uncovered(t, root, tc.without, "./"+dir+"/", o)
+			if !slices.Contains(linking, probe) || slices.Contains(missing, probe) {
+				t.Errorf("under %v: linking %v, missing %v; want the planted package linking, with its TestMain", tc.without, linking, missing)
+			}
+			linking, missing = uncovered(t, root, tc.with, "./"+dir+"/", o)
+			if !slices.Contains(linking, probe) || !slices.Contains(missing, probe) {
+				t.Errorf("under %v: linking %v, missing %v; want the planted package linking and missing a TestMain, since %s excludes the file that has one", tc.with, linking, missing, tc.constraint)
+			}
+		})
 	}
 }
 
