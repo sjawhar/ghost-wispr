@@ -17,6 +17,7 @@
     loadVoiceTasks,
     removeSession,
     setCapturing,
+    setCaptureState,
     setDates,
     setLiveSegmentsForSession,
     setPaused,
@@ -27,6 +28,7 @@
   } from './lib/state.svelte'
   import {
     RequestError,
+    closeMicrophone,
     endSession,
     fetchDates,
     fetchPresets,
@@ -84,12 +86,29 @@
       // The microphone comes back a moment later; its mic status event, or the
       // next status poll, sets capturing.
       setPaused(false)
+      setCaptureState('resuming')
       return
     }
 
     await pauseRecording()
     setPaused(true)
     setCapturing(false)
+    await refreshCaptureState()
+  }
+
+  // closeMicrophone closes the microphone from every state (POST /api/close).
+  async function closeMic(): Promise<void> {
+    await closeMicrophone()
+    setPaused(true)
+    setCapturing(false)
+    setCaptureState('paused')
+  }
+
+  // refreshCaptureState reads which pause the unit is in: listening or closed.
+  async function refreshCaptureState(): Promise<void> {
+    const status = await fetchStatus()
+    setPaused(status.paused)
+    setCaptureState(status.capture_state)
   }
 
   async function handleStartSession(): Promise<void> {
@@ -174,6 +193,7 @@
         }
 
         setPaused(status.paused)
+        setCaptureState(status.capture_state)
         setCapturing(status.capturing)
         setWarnings(status.warnings)
         setDates(dates)
@@ -227,6 +247,7 @@
       void fetchStatus()
         .then((status) => {
           setPaused(status.paused)
+          setCaptureState(status.capture_state)
           setCapturing(status.capturing)
           setWarnings(status.warnings)
         })
@@ -261,8 +282,10 @@
         connected={appState.connected}
         paused={appState.paused}
         capturing={appState.capturing}
+        captureState={appState.captureState}
         activeSessionId={appState.activeSessionId}
         onToggle={togglePause}
+        onClose={closeMic}
         onEndSession={endSession}
         onStartSession={handleStartSession}
         onStopSession={handleStopSession}

@@ -48,7 +48,9 @@ fi
 
 staging_dir=$(mktemp -d -p "$DEPLOY_DIR" .ghost-wispr-update.XXXXXX)
 trap 'rm -rf -- "$staging_dir"' EXIT
-curl --connect-timeout 5 --max-time 60 --fail --silent --show-error --location "$binary_url" --output "$staging_dir/ghost-wispr-linux-arm64"
+# The binary links the paused listener's spotter and embeds its model, about twice its old size:
+# 300 s needs about 0.3 MB/s.
+curl --connect-timeout 5 --max-time 300 --fail --silent --show-error --location "$binary_url" --output "$staging_dir/ghost-wispr-linux-arm64"
 curl --connect-timeout 5 --max-time 60 --fail --silent --show-error --location "$checksum_url" --output "$staging_dir/ghost-wispr-linux-arm64.sha256"
 (
   cd "$staging_dir"

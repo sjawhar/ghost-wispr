@@ -125,31 +125,36 @@ func warningAbout(warnings *warningsRegistry, words ...string) bool {
 	})
 }
 
-// TestNoLightStartsNoMicrophone fails if the recorder starts its microphone
-// with indicator_light: blink1 and no blink(1) plugged in.
+// TestNoLightStartsNoMicrophone fails if the recorder starts its recording
+// microphone with indicator_light: blink1 and no blink(1) plugged in. The
+// paused listener alone may hold the microphone with the light off, in
+// listening, and its phrase still opens no recording microphone.
 func TestNoLightStartsNoMicrophone(t *testing.T) {
-	device := &pluggableLight{}
-	capture := newCaptureGate(nil, nil, nil)
-	mic := &openMicFake{}
-	warnings := newWarningsRegistry()
-	startTestLight(t, device, time.Hour, capture, mic, warnings)
+	t.Run("the recording microphone", func(t *testing.T) {
+		device := &pluggableLight{}
+		capture := newCaptureGate(nil, nil, nil)
+		mic := &openMicFake{}
+		warnings := newWarningsRegistry()
+		startTestLight(t, device, time.Hour, capture, mic, warnings)
 
-	started := false
-	if err := startMicIfUnpaused(capture, func() error {
-		started = true
-		return nil
-	}); err == nil {
-		t.Error("microphone start reported success with no recording light")
-	}
-	if started {
-		t.Fatal("microphone started with no recording light")
-	}
-	waitForHardware(t, "a warning that the light is missing and the unit does not record", func() bool {
-		return warningAbout(warnings, "Recording light not found", "does not record")
+		started := false
+		if err := startMicIfUnpaused(capture, func() error {
+			started = true
+			return nil
+		}); err == nil {
+			t.Error("microphone start reported success with no recording light")
+		}
+		if started {
+			t.Fatal("microphone started with no recording light")
+		}
+		waitForHardware(t, "a warning that the light is missing and the unit does not record", func() bool {
+			return warningAbout(warnings, "Recording light not found", "does not record")
+		})
+		waitForHardware(t, "capture to be held for the light", func() bool {
+			return capture.isClosed() && !capture.IsPaused() && capture.captureState(mic) == "light_unavailable"
+		})
 	})
-	waitForHardware(t, "capture to be held for the light", func() bool {
-		return capture.isClosed() && !capture.IsPaused() && capture.captureState(mic) == "light_unavailable"
-	})
+	t.Run("the paused listener alone, in listening", requireTheListenerAloneWithNoLight)
 }
 
 // TestLightFailureWhileCapturingStopsCapture fails if capture goes on after

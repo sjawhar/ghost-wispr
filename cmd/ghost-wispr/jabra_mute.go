@@ -23,12 +23,14 @@ const (
 	jabraLightCheckEvery = 250 * time.Millisecond
 )
 
-// jabraMuteButton toggles capture on each press of the Jabra's mute button,
-// as the power button does, and keeps the Jabra's mute light on while capture
-// is paused, whichever control paused it, except while its own resume checks
-// the light: the light then shows what the button counts, unmuted (showPaused).
-// The light is written through device, so it never changes while a capture
-// stream is open.
+// jabraMuteButton closes the microphone on a press of the Jabra's mute
+// button, from recording or listening, and resumes a closed unit: anyone in
+// the room can close the microphone with one press (INFRA-4592, two levels).
+// The Jabra's ring shows Muted in the closed state and only then
+// (ringMuted), whichever control closed it, except while its own resume
+// checks the light: the ring then shows what the button counts, unmuted
+// (showPaused). The ring is written through device, so it never changes while
+// a capture stream is open.
 type jabraMuteButton struct {
 	capture  *captureGate
 	device   *captureDevice
@@ -54,7 +56,7 @@ func newJabraMuteButton(capture *captureGate, device *captureDevice, controls *s
 		device:     device,
 		controls:   controls,
 		warnings:   warnings,
-		toggle:     newButtonToggle(capture, controls, "Jabra mute"),
+		toggle:     newCloseToggle(capture, controls, "Jabra mute"),
 		connect:    func() (io.ReadWriteCloser, error) { return connectJabra(inputDevices, inputDevRoot) },
 		retryEvery: hardwareRetry,
 		checkEvery: jabraLightCheckEvery,
@@ -188,14 +190,15 @@ func (b *jabraMuteButton) serve(ctx context.Context, device io.ReadWriteCloser) 
 }
 
 // press toggles capture for a press of the mute button the kernel stamped at,
-// a CLOCK_MONOTONIC reading, except one that would resume capture and came
-// during an operation on the capture device or within jabraOwnMuteWindow after
-// one: the Jabra sends that report by itself as its microphone stream closes,
-// and capture stays paused. A press that would pause always pauses, and does
-// so at once; a press that resumes runs its light check in the background, so
-// the next press is taken meanwhile (buttonToggle). The light is written
-// again once the press has asked, and again when its resume ends. Every press
-// stops the voice first.
+// a CLOCK_MONOTONIC reading, except one that would move the unit to recording
+// and came during an operation on the capture device or within
+// jabraOwnMuteWindow after one: the Jabra sends that report by itself as its
+// microphone stream closes, and the unit stays closed. A press that would
+// close the microphone, from recording or listening, always closes it, and
+// does so at once; a press that resumes runs its light check in the
+// background, so the next press is taken meanwhile (buttonToggle). The light
+// is written again once the press has asked, and again when its resume ends.
+// Every press stops the voice first.
 func (b *jabraMuteButton) press(at time.Duration) {
 	if b.onPress != nil {
 		b.onPress()

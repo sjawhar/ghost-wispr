@@ -17,7 +17,10 @@
 # (deploy/pi/journalrecords), so a driver that reads another journal, another process's lines or
 # another key reads nothing. Each step runs once as it should pass and once against its
 # verification check's negative control. Cases run in parallel; each records its failures, and the
-# run goes on, so that one run shows every assertion that fails.
+# run goes on, so that one run shows every assertion that fails. On 2 CPUs a whole run takes about
+# 8 minutes (488 s and 507 s on sami-devbox, 2026-11-20), so give it a timeout of 15 minutes or
+# more. Killed early, it leaves nothing for long: its fake services end within 5 s of it, and a
+# driver still restoring its case within 150 s.
 set -uo pipefail
 
 repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -142,6 +145,42 @@ def service_pid():
 def running():
     pid = service_pid()
     return pid > 0 and alive(pid)
+
+
+def level():
+    """The unit's microphone state: recording, listening or closed (the three capture states)."""
+    if read("paused").strip() != "1":
+        return "recording"
+    return read("level", "closed").strip() or "closed"
+
+
+def listener_on():
+    return json.loads(read("service.json") or "{}").get("listener", False)
+
+
+def write_mic(state):
+    """The loopback's capture substream status, which the microphone holds open but in closed."""
+    mic = os.path.join(os.path.dirname(STATE), "asound", "card2", "pcm0c", "sub0")
+    os.makedirs(mic, exist_ok=True)
+    with open(os.path.join(mic, "status"), "w") as f:
+        f.write("closed\n" if state == "closed" else "state: RUNNING\nowner_pid   : 1\n")
+
+
+def set_level(state):
+    """Move the unit to STATE, and save it as the unit does (0, 1 closed, 2 listening)."""
+    if state == "recording":
+        set_row("capture_paused", "0")
+        write("paused", "0")
+    else:
+        set_row("capture_paused", "2" if state == "listening" else "1")
+        write("level", state + "\n")
+        write("paused", "1")
+    write_mic(state)
+
+
+def pause_to():
+    """Where a pause takes a recording unit: listening with the listener, closed without."""
+    return "listening" if listener_on() else "closed"
 
 
 def env_file():
@@ -272,7 +311,17 @@ def systemctl(args):
     if verb == "is-active":
         return 0 if running() else 3
     if verb == "show":
-        print(service_pid() if running() else 0)
+        # systemctl show --property=NAME --value: the unit's property as the real unit file sets it.
+        prop = next((a.split("=", 1)[1] for a in args if a.startswith("--property=")), "MainPID")
+        if prop == "MainPID":
+            print(service_pid() if running() else 0)
+        elif prop == "LimitCORE":
+            print("infinity" if "core-on" in SCENARIO else 0)
+        elif prop == "MemorySwapMax":
+            print(0)
+        else:
+            sys.stderr.write("fake systemctl: unexpected property: %s\n" % prop)
+            return 2
         return 0
     sys.stderr.write("fake systemctl: unexpected verb: %s\n" % verb)
     return 2
@@ -291,10 +340,21 @@ def start():
         name, sep, value = line.partition("=")
         if sep and name.replace("_", "a").isalnum() and not name[0].isdigit():
             variables[name] = value
-    write("paused", "1" if db_row("capture_paused") == "1" else "0")
     engine = variables.get("GHOST_WISPR_VOICE_ENGINE", "tts")
     voice_off = "" if engine == "tts" else 'voice.engine "%s" is not in this build; use "tts"' % engine
-    write("service.json", json.dumps({"voice": variables.get("GHOST_WISPR_VOICE_ENABLED") == "true", "voice_off": voice_off}))
+    voice = variables.get("GHOST_WISPR_VOICE_ENABLED") == "true"
+    wants_listener = voice and variables.get("GHOST_WISPR_VOICE_PAUSED_LISTENER") == "true"
+    write("service.json", json.dumps({
+        "voice": voice,
+        "voice_off": voice_off,
+        "listener": wants_listener and "no-listener-build" not in SCENARIO,
+        "no_listener_build": wants_listener and "no-listener-build" in SCENARIO,
+    }))
+    # A saved pause, 1 (closed) or 2 (listening), restores paused; listening only with the listener.
+    row = db_row("capture_paused")
+    write("paused", "1" if row in ("1", "2") else "0")
+    write("level", "listening\n" if row == "2" and listener_on() else "closed\n")
+    write_mic(level())
     write("voice.json", "{}")
     environment = {k: v for k, v in os.environ.items() if k == "PATH" or k.startswith("GW_FAKE_") or k == "GHOST_WISPR_DEPLOY_DIR"}
     environment.update(variables)
@@ -416,7 +476,14 @@ def service():
     connection.execute("SELECT count(*) FROM app_state").fetchall()
     if not ASOUND:
         while test_running():
-            time.sleep(0.5)
+            if "listener-hot" in SCENARIO and level() == "listening":
+                # A listener that takes 60 % of a core.
+                end = time.time() + 0.6
+                while time.time() < end:
+                    pass
+                time.sleep(0.4)
+            else:
+                time.sleep(0.5)
         return
     # The speaker's /proc status, which this loop rewrites from the timeline. The voice's stops and
     # the XRUNs are this process's own to apply (drop, show_xrun): each waits on what the status has
@@ -699,7 +766,13 @@ def aplay(args):
     # the reaction counts from whenever that work fits in the clip: the driver times its clip's end
     # when aplay exits, and the fake's own work would otherwise sit between the two.
     end = start + 300
-    react(words[0], words[1] if len(words) > 1 else "", start, end)
+    if words[0] in ("phrase", "speech"):
+        # The paused listener's clips: "Wispr, start recording" resumes a listening unit; speech
+        # that is not the phrase does nothing.
+        if words[0] == "phrase" and level() == "listening":
+            set_level("recording")
+    else:
+        react(words[0], words[1] if len(words) > 1 else "", start, end)
     time.sleep(max(0, end - now_ms()) / 1000)
     write("aplay-end.%d" % n, "%d\n" % now_ms())
     return 0
@@ -877,7 +950,7 @@ def journal_record(due, level, msg, fields):
 
 
 def curl(args):
-    method, url, output, write_out, config, headers, fail = "GET", "", None, None, None, [], False
+    method, url, output, write_out, config, headers, fail, connect_to = "GET", "", None, None, None, [], False, None
     i = 0
     while i < len(args):
         a = args[i]
@@ -901,6 +974,9 @@ def curl(args):
             i += 2
         elif a in ("--header", "-H"):
             headers.append(args[i + 1])
+            i += 2
+        elif a == "--connect-to":
+            connect_to = args[i + 1]
             i += 2
         elif a in ("--fail", "-f"):
             fail = True
@@ -936,6 +1012,11 @@ def curl(args):
             sys.stdout.write("%d" % code)
         return 0
 
+    if url in ("https://api.deepgram.com/", "https://api.openai.com/"):
+        # The certificate check of a peer: only the vendor-socket scenario's peer serves Deepgram's.
+        host = url.split("/")[2]
+        peer = (connect_to or "").split(":", 2)[2] if (connect_to or "").count(":") >= 2 else ""
+        return 0 if host == "api.deepgram.com" and peer == "203.0.113.5:443" and "vendor-socket" in SCENARIO else 60
     if url.startswith("telnet://"):
         if "no-reach" in SCENARIO:
             return refuse_connection()
@@ -969,20 +1050,27 @@ def curl(args):
         return refuse_connection()
     path = url.split("8080", 1)[1]
     if method == "GET" and path == "/api/status":
-        paused = read("paused").strip() == "1"
+        state = level()
+        paused = state != "recording"
         service = json.loads(read("service.json") or "{}")
         warnings = ["The meeting voice is off: " + service["voice_off"]] if service.get("voice_off") else []
-        return answer(200, {"paused": paused, "capturing": not paused, "capture_state": "paused" if paused else "capturing", "warnings": warnings, "active_session_id": "session-0" if "session-active" in SCENARIO else "", "active_session_started_at": ""})
+        if service.get("no_listener_build"):
+            warnings.append("voice.paused_listener is on, but this build has no paused listener: every pause closes the microphone")
+        capture = {"recording": "capturing", "listening": "listening", "closed": "paused"}[state]
+        return answer(200, {"paused": paused, "capturing": not paused, "capture_state": capture, "warnings": warnings, "active_session_id": "session-0" if "session-active" in SCENARIO else "", "active_session_started_at": ""})
     if method == "POST" and path == "/api/resume":
-        set_row("capture_paused", "0")
-        write("paused", "0")
+        set_level("recording")
         emit(kind="ws", due=now_ms() + 50, event={"type": "component_status", "component": "deepgram", "status": "connected", "message": "Deepgram connected"})
         return answer(204, "")
     if method == "POST" and path == "/api/pause":
         if "pause-fails" in SCENARIO:
             return answer(500, {"error": "pause not saved"})
-        set_row("capture_paused", "1")
-        write("paused", "1")
+        # A paused unit stays as it is.
+        if level() == "recording":
+            set_level(pause_to())
+        return answer(204, "")
+    if method == "POST" and path == "/api/close":
+        set_level("closed")
         return answer(204, "")
     if method == "GET" and path.startswith("/api/sessions/") and path.endswith("/voice-tasks"):
         tasks = {}
@@ -1029,6 +1117,14 @@ def binary(args):
     if command in missing and missing[command] in SCENARIO:
         sys.stderr.write("usage: ghost-wispr <light-off|light-state>\n")
         return 2
+    if command == "light-state":
+        # The blink(1) read back: red only while recording; light-dim is the c-states-pi negative
+        # control, a light someone set to (200, 0, 0) by hand.
+        if level() == "recording":
+            print("other 200,0,0" if "light-dim" in SCENARIO else "red")
+        else:
+            print("off")
+        return 0
     if command == "issue-holder":
         # The Concierge's issue_holder tool answer, as the subcommand prints it.
         if os.environ.get("GHOST_WISPR_DISPATCH_TOKEN") != "good-token":
@@ -1073,16 +1169,62 @@ def binary(args):
     return 2
 
 
+# ---- the three states: sockets, names, and the person at the Pi ----
+
+
+def ss(args):
+    """ss -tinpH: the service's sockets to the Envoy hub and to Google, another process's socket,
+    and with vendor-socket one to Deepgram. With hub-chatty the hub's bytes_sent grows by 5000 at each
+    read while the unit listens."""
+    pid = service_pid()
+    lines = []
+
+    def socket(local, peer, sent, owner='"ghost-wispr",pid=%d,fd=9' % pid):
+        lines.append("ESTAB 0      0      %s %s users:((%s))" % (local, peer, owner))
+        lines.append("\t cubic wscale:7,7 rto:204 bytes_sent:%d bytes_acked:%d" % (sent, sent))
+
+    hub = int(read("hub-bytes", "1000").strip() or 1000)
+    if "hub-chatty" in SCENARIO and level() == "listening":
+        hub += 5000
+    write("hub-bytes", "%d\n" % hub)
+    socket("192.168.1.5:40000", "192.0.2.10:4222", hub)
+    socket("192.168.1.5:40002", "198.51.100.7:443", 5000)
+    if "vendor-socket" in SCENARIO:
+        socket("192.168.1.5:40004", "203.0.113.5:443", 100)
+    socket("192.168.1.5:40010", "203.0.113.5:443", 99999, owner='"other",pid=1,fd=3')
+    print("\n".join(lines))
+    return 0
+
+
+def getent(args):
+    if args[:2] == ["ahosts", "envoy.example"]:
+        print("192.0.2.10      STREAM envoy.example\n192.0.2.10      DGRAM  \n192.0.2.10      RAW    ")
+        return 0
+    return 2
+
+
+def person(args):
+    """The person at the Pi: presses a button, or says whether the Jabra ring shows Muted."""
+    if args[0] == "ring":
+        print("yes" if level() == "closed" and "ring-stuck" not in SCENARIO else "no")
+    elif args[0] == "press-jabra":
+        set_level("recording" if level() == "closed" else "closed")
+    elif args[0] == "press-power":
+        set_level(pause_to() if level() == "recording" else "recording")
+    return 0
+
+
 if __name__ == "__main__":
     tool = sys.argv[1]
-    handlers = {"systemctl": systemctl, "curl": curl, "aplay": aplay, "arecord": arecord, "ffmpeg": ffmpeg, "journalctl": journalctl, "binary": binary}
+    handlers = {"systemctl": systemctl, "curl": curl, "aplay": aplay, "arecord": arecord, "ffmpeg": ffmpeg, "journalctl": journalctl, "binary": binary,
+                "ss": ss, "getent": getent, "person": person}
     if tool == "service":
         service()
         sys.exit(0)
     sys.exit(handlers[tool](sys.argv[2:]) or 0)
 EOF
 
-for tool in systemctl curl aplay arecord ffmpeg journalctl; do
+for tool in systemctl curl aplay arecord ffmpeg journalctl ss getent; do
   if [[ $tool == systemctl ]]; then
     cat >"$root/bin/$tool" <<EOF
 #!/usr/bin/env bash
@@ -1148,6 +1290,8 @@ new_case() {
   printf 'second live-1\n' >"$dir/second.wav"
   printf 'never-mind\n' >"$dir/never-mind.wav"
   printf 'stop\n' >"$dir/stop.wav"
+  printf 'phrase\n' >"$dir/phrase.wav"
+  printf 'speech\n' >"$dir/speech.wav"
   for name in q1 q2 q3; do printf 'question\n' >"$dir/questions/$name.wav"; done
   for name in t1 t2; do printf 'talkover\n' >"$dir/talkovers/$name.wav"; done
   for name in b1 b2; do printf 'backchannel\n' >"$dir/backchannels/$name.wav"; done
@@ -1194,6 +1338,40 @@ launch() {
       env "${vars[@]}" bash "$driver" "${args[@]}" </dev/null >"$dir/out" 2>&1
     fi
     printf '%s\n' "$?" >"$dir/rc"
+  ) &
+}
+
+# launch_person NAME SCENARIO -- ARGS...: launch, with a person at the Pi: a loop reads the driver's
+# PERSON: lines as it prints them and answers each on its stdin, pressing the fake Pi's buttons as
+# asked and saying what its Jabra ring shows.
+launch_person() {
+  local name=$1 scenario=$2 arg args=() vars=()
+  shift 3
+  while (($(jobs -rp | wc -l) >= max_jobs)); do wait -n; done
+  (
+    dir=$(new_case "$name")
+    for arg in "$@"; do
+      if [[ $arg == @* ]]; then args+=("$dir/${arg#@}"); else args+=("$arg"); fi
+    done
+    mapfile -t vars < <(driver_env "$dir" "$scenario")
+    mkfifo "$dir/person"
+    (
+      env "${vars[@]}" bash "$driver" "${args[@]}" <"$dir/person" >"$dir/out" 2>&1
+      printf '%s\n' "$?" >"$dir/rc"
+    ) &
+    driver_pid=$!
+    exec 9>"$dir/person"
+    fake=(env GW_FAKE_STATE="$dir/state" GW_FAKE_DB="$dir/ghost-wispr.db" GW_FAKE_SCENARIO="$scenario" python3 "$fakepi" person)
+    tail -n +1 -F --pid="$driver_pid" "$dir/out" 2>/dev/null | while IFS= read -r line; do
+      case $line in
+        'PERSON: Press the Jabra mute button'*) "${fake[@]}" press-jabra && printf 'done\n' >&9 ;;
+        'PERSON: Press the power button'*) "${fake[@]}" press-power && printf 'done\n' >&9 ;;
+        'PERSON: Does the Jabra'*) "${fake[@]}" ring >&9 ;;
+        'PERSON: '*) printf 'yes\n' >&9 ;;
+      esac
+    done
+    exec 9>&-
+    wait "$driver_pid"
   ) &
 }
 
@@ -1296,11 +1474,25 @@ launch leftover pass '' "$original_env"$'\nGHOST_WISPR_MIC_DEVICE=Loopback' -- -
 launch no-loopback no-loopback '' -- --question @question.wav
 
 # The other slices' steps, and a step that lacks what it needs.
-for other in states listener-cpu pause-closes-vendors vendor-probe room-test measure-echo; do
+for other in pause-closes-vendors vendor-probe room-test measure-echo; do
   launch "other-$other" pass '' -- --step "$other" --engine gptlive --rounds 20 --sessions 40 --script x
 done
 launch wake-needs pass '' -- --step wake-sound --calls 2
 launch joined-needs pass '' -- --step joined
+
+# states (c-states-pi): a pass; the light at (200, 0, 0) by hand while recording, the check's negative
+# control; a ring that stays unmuted in closed; a socket to Deepgram while listening; the Envoy hub's
+# sockets growing while listening; core dumps on; a build with no listener; and the step's needs.
+readonly states_args='--step states --phrase @phrase.wav --speech @speech.wav --hub-seconds 1 --event-timeout 10'
+for scenario in pass light-dim ring-stuck vendor-socket hub-chatty core-on no-listener-build; do
+  # shellcheck disable=SC2086 # The arguments are words.
+  launch_person "states-$scenario" "$scenario" -- $states_args
+done
+launch states-needs pass '' -- --step states
+# listener-cpu (c-listener-cpu): a pass on 4 threads, the check's control setting; and a listener
+# that takes 60 % of a core.
+launch listener-cpu pass '' -- --step listener-cpu --speech @speech.wav --cpu-seconds 2 --threads 4 --event-timeout 10
+launch listener-cpu-hot listener-hot '' -- --step listener-cpu --speech @speech.wav --cpu-seconds 2 --event-timeout 10
 
 # wake-sound: a pass; a pass while the rig recording runs 1 s behind for a while, which the driver's
 # clock must not take for a late chime; the chime 310 ms after wake_heard (the verification's
@@ -1636,7 +1828,7 @@ expect_line no-loopback 'REFUSED: the ALSA loopback is not loaded'
 expect_untouched no-loopback
 
 # The other slices' steps are UNKNOWN and touch nothing; a step that lacks what it needs names it.
-for other in states listener-cpu pause-closes-vendors vendor-probe room-test measure-echo; do
+for other in pause-closes-vendors vendor-probe room-test measure-echo; do
   expect_rc "other-$other" 2
   expect_line "other-$other" "UNKNOWN: $other: not in this build: "
   expect_untouched "other-$other"
@@ -1652,6 +1844,69 @@ expect_line joined-needs '--mention (words that name --join-issue'"'"'s key and 
 expect_line joined-needs '--go-ahead ("Wispr, go ahead")'
 expect_line joined-needs '--rig-mic (the USB microphone about 30 cm from the Jabra)'
 expect_untouched joined-needs
+
+# states.
+expect_rc states-pass 0
+for line in 'PASS: states: ghost-wispr.service runs with LimitCORE=0 and MemorySwapMax=0' \
+  'PASS: states: the start: recording: capture_state capturing, light red, saved 0, microphone open, Jabra ring Muted no' \
+  'PASS: states: the page pause from recording: listening: capture_state listening, light off, saved 2, microphone open, Jabra ring Muted no' \
+  'PASS: states: listening: no socket to Deepgram or OpenAI' \
+  'PASS: states: listening: 0 bytes to the Envoy hub (envoy.example)' \
+  'NOTE: states: listening: a socket to 198.51.100.7:443, not counted' \
+  'NOTE: states: listening: a socket to the Envoy hub at 192.0.2.10:4222, read by its bytes below' \
+  'PASS: states: "Wispr, start recording" in listening: recording' \
+  'PASS: states: the power button from recording: listening' \
+  'PASS: states: the power button from listening: recording' \
+  'PASS: states: the Jabra button from recording: closed: capture_state paused, light off, saved 1, microphone closed, Jabra ring Muted yes' \
+  'PASS: states: "Wispr, start recording" in closed, not heard: closed' \
+  'PASS: states: the power button from closed: recording' \
+  'PASS: states: POST /api/close from recording: closed' \
+  'PASS: states: the Jabra button from closed: recording' \
+  'PASS: states: the Jabra button from listening: closed' \
+  'PASS: states: POST /api/close from closed: closed' \
+  'PASS: states: the page resume from closed: recording' \
+  'PASS: states: the page resume from listening: recording' \
+  'PASS: states: POST /api/close from listening: closed'; do
+  expect_line states-pass "$line"
+done
+expect_no_line states-pass 'FAIL'
+expect_no_line states-pass '40010'
+expect_restored states-pass
+grep -Fqx GHOST_WISPR_VOICE_PAUSED_LISTENER=true "$root/states-pass/state/started-env.2" \
+  || check_failed 'states-pass: the run did not start the service with the paused listener on'
+expect_rc states-light-dim 1
+expect_line states-light-dim 'FAIL: states: the start: the light reads other 200,0,0 in recording, want red'
+expect_restored states-light-dim
+expect_rc states-ring-stuck 1
+expect_line states-ring-stuck 'FAIL: states: the Jabra button from recording: the person sees the Jabra ring Muted: no, in closed; want yes'
+expect_restored states-ring-stuck
+expect_rc states-vendor-socket 1
+expect_line states-vendor-socket 'FAIL: states: listening: the service holds a socket to Deepgram at 203.0.113.5:443'
+expect_restored states-vendor-socket
+expect_rc states-hub-chatty 1
+expect_line states-hub-chatty 'FAIL: states: listening: the service sent 5000 bytes to the Envoy hub (envoy.example)'
+expect_restored states-hub-chatty
+expect_rc states-core-on 1
+expect_line states-core-on "FAIL: states: ghost-wispr.service's LimitCORE is infinity, want 0"
+expect_restored states-core-on
+expect_rc states-no-listener-build 2
+expect_line states-no-listener-build 'UNKNOWN: states: this build has no paused listener (built without -tags kws)'
+expect_restored states-no-listener-build
+expect_rc states-needs 2
+expect_line states-needs 'UNKNOWN: states needs: --phrase ("Wispr, start recording", spoken); --speech ('
+expect_untouched states-needs
+
+# listener-cpu.
+expect_rc listener-cpu 0
+expect_line listener-cpu 'PASS: listener-cpu: quiet: the listener takes '
+expect_line listener-cpu 'PASS: listener-cpu: speech: the listener takes '
+expect_line listener-cpu '2 s each, 4 thread(s))'
+grep -Fqx GHOST_WISPR_VOICE_PAUSED_LISTENER_THREADS=4 "$root/listener-cpu/state/started-env.2" \
+  || check_failed 'listener-cpu: the run did not start the spotter on 4 threads'
+expect_restored listener-cpu
+expect_rc listener-cpu-hot 1
+expect_line listener-cpu-hot 'FAIL: listener-cpu: quiet: the listener takes '
+expect_restored listener-cpu-hot
 
 # wake-sound.
 expect_rc wake 0

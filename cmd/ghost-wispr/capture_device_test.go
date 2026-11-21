@@ -202,3 +202,69 @@ func TestAPlaybackThatPanicsOnCloseHoldsNothingBack(t *testing.T) {
 		t.Fatal("a tap a second from now is taken for the Jabra's own report: the panicked close is still under way")
 	}
 }
+
+// TestEveryCaptureOperationClosesTheListenerFirst fails if a recording
+// microphone open, the wait before one, or a PortAudio scan runs while the
+// paused listener's stream is open, or if the listener opens while the
+// recording microphone's stream is open: the capture device itself keeps the
+// two apart, whatever path reaches it. The listener closes its stream from its
+// own goroutine when asked (Interrupt), as the real one does.
+func TestEveryCaptureOperationClosesTheListenerFirst(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		run  func(d *captureDevice, during func()) error
+	}{
+		{name: "open", run: func(d *captureDevice, during func()) error {
+			return d.openStream(func() (bool, error) { during(); return false, nil })
+		}},
+		{name: "PortAudio probe", run: func(d *captureDevice, during func()) error {
+			return d.probe(func() error { during(); return nil })
+		}},
+		{name: "the wait before an open", run: func(d *captureDevice, during func()) error {
+			d.prepareLightForOpen(context.Background(), nil)
+			during()
+			return nil
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			d := newCaptureDevice(func() bool { return false })
+			var open atomic.Bool
+			d.setListener(func() {
+				go func() { _ = d.closeListenerStream(func() error { open.Store(false); return nil }) }()
+			})
+			if err := d.openListener(func() bool { return true }, func() error { open.Store(true); return nil }); err != nil {
+				t.Fatal(err)
+			}
+			ran := false
+			if err := tc.run(d, func() {
+				ran = true
+				if open.Load() {
+					t.Errorf("%s ran with the listener's stream open", tc.name)
+				}
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if !ran {
+				t.Fatalf("control: the %s did not run", tc.name)
+			}
+		})
+	}
+
+	t.Run("the listener's open while recording", func(t *testing.T) {
+		d := newCaptureDevice(func() bool { return false })
+		if err := d.openStream(func() (bool, error) { return true, nil }); err != nil {
+			t.Fatal(err)
+		}
+		opened := false
+		err := d.openListener(func() bool { return true }, func() error { opened = true; return nil })
+		if opened || err == nil {
+			t.Fatalf("the listener opened (%t, %v) with the recording microphone's stream open", opened, err)
+		}
+		if err := d.closeStream(func() error { return nil }); err != nil {
+			t.Fatal(err)
+		}
+		if err := d.openListener(func() bool { return true }, func() error { opened = true; return nil }); err != nil || !opened {
+			t.Fatalf("control: the listener did not open once the recording microphone closed (%v)", err)
+		}
+	})
+}

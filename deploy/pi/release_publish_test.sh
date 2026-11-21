@@ -14,11 +14,13 @@ set -euo pipefail
 [[ ${GH_REPO:?} == sjawhar/ghost-wispr ]]
 [[ $1 == release && $2 == create ]]
 [[ $4 == ghost-wispr-linux-arm64 && $5 == ghost-wispr-linux-arm64.sha256 ]]
+# The binary links third-party code statically (the paused listener's spotter), so its notices ship beside it.
+[[ $6 == THIRD_PARTY_NOTICES.md ]]
 [[ " $* " == *' --target 0123456789abcdef0123456789abcdef01234567 '* ]]
 EOF
 chmod +x "$work_dir/bin/gh"
 
-touch "$work_dir/ghost-wispr-linux-arm64" "$work_dir/ghost-wispr-linux-arm64.sha256"
+touch "$work_dir/ghost-wispr-linux-arm64" "$work_dir/ghost-wispr-linux-arm64.sha256" "$work_dir/THIRD_PARTY_NOTICES.md"
 awk '
   /release-publish-command:start/ { capture = 1; next }
   /release-publish-command:end/ { exit }

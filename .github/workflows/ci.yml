@@ -115,6 +115,21 @@ jobs:
       - name: Create embed placeholder
         run: mkdir -p cmd/ghost-wispr/static && touch cmd/ghost-wispr/static/.gitkeep
 
+      # The paused listener's spotter: sherpa-onnx's static libraries and its keyword model, which a
+      # build with -tags kws links and embeds (deploy/sherpa/fetch.sh, which checks each download's
+      # pinned sha256). Lint and the tests build with it, so it comes first; the cache keeps the
+      # downloads, keyed on the script that pins them.
+      - name: Restore the sherpa-onnx downloads
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/ghost-wispr-sherpa
+          key: sherpa-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('deploy/sherpa/fetch.sh') }}
+
+      - name: Fetch the paused listener's spotter
+        timeout-minutes: 10
+        run: bash deploy/sherpa/fetch.sh
+
+      # .golangci.yml lints the build with the listener (-tags kws), the one the Pi runs.
       - name: Lint
         uses: golangci/golangci-lint-action@9fae48acfc02a90574d7c304a1758ef9895495fa # v7.0.1
         with:
@@ -123,8 +138,12 @@ jobs:
       - name: Format
         run: golangci-lint fmt ./... --diff
 
+      # A build without the listener is the two-state machine, and must still build and vet.
+      - name: Vet the build without the listener
+        run: go vet ./...
+
       - name: Test
-        run: go test -race ./...
+        run: go test -race -tags kws ./...
 
   web:
     name: Web

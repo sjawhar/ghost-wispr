@@ -26,6 +26,7 @@ func originTestHandler(t *testing.T, called *[]string, cfgStore ...*config.Store
 	record := func(name string) { *called = append(*called, name) }
 	handler, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{
 		Pause:  func() error { record("pause"); return nil },
+		Close:  func() error { record("close"); return nil },
 		Resume: func() error { record("resume"); return nil },
 		EndSession: func(context.Context) error {
 			record("end")
@@ -62,6 +63,7 @@ var stateChangingRequests = []struct {
 }{
 	{http.MethodPost, "/api/resume", "resume"},
 	{http.MethodPost, "/api/pause", "pause"},
+	{http.MethodPost, "/api/close", "close"},
 	{http.MethodPost, "/api/session/end", "end"},
 	{http.MethodDelete, "/api/sessions/s1/segments/1?mode=text&revision=0", "delete text"},
 	{http.MethodPatch, "/api/sessions/s1", ""},
@@ -115,6 +117,36 @@ func TestOwnOriginCanChangeState(t *testing.T) {
 			if len(called) != 1 || called[0] != request.hook {
 				t.Errorf("%s %s from Origin %q ran %v, want [%s]", request.method, request.path, origin, called, request.hook)
 			}
+		}
+	}
+}
+
+// TestCloseTakesThePauseCallerRule fails if POST /api/close takes a caller
+// that POST /api/pause refuses, or refuses one it takes (R18): a page on
+// another site is refused with 403 before the hook runs, and the unit's own
+// page, or a client with no Origin, closes the microphone.
+func TestCloseTakesThePauseCallerRule(t *testing.T) {
+	for _, origin := range []string{"https://evil.example", "null", "http://example.com", ""} {
+		results := map[string]int{}
+		for _, path := range []string{"/api/pause", "/api/close"} {
+			var called []string
+			handler := originTestHandler(t, &called)
+			r := httptest.NewRequest(http.MethodPost, path, nil)
+			if origin != "" {
+				r.Header.Set("Origin", origin)
+			}
+			w := httptest.NewRecorder()
+			handler.ServeHTTP(w, r)
+			results[path] = w.Code
+			if refused := w.Code == http.StatusForbidden; refused != (len(called) == 0) {
+				t.Errorf("POST %s from Origin %q = %d and ran %v", path, origin, w.Code, called)
+			}
+		}
+		if results["/api/close"] != results["/api/pause"] {
+			t.Errorf("from Origin %q, POST /api/close = %d and POST /api/pause = %d: the close must take the pause's caller rule", origin, results["/api/close"], results["/api/pause"])
+		}
+		if want := origin == "" || origin == "http://example.com"; (results["/api/close"] == http.StatusNoContent) != want {
+			t.Errorf("POST /api/close from Origin %q = %d, want 204 %t", origin, results["/api/close"], want)
 		}
 	}
 }

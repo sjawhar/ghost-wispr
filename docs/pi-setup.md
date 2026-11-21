@@ -951,6 +951,24 @@ with the unit paused and no session active:
    running process's lines in the current boot: the Pi keeps no user journal, and a process ID can
    recur after a reboot. The underrun check reports UNKNOWN if its journal read fails. The windows
    and thresholds of the rig steps are not yet calibrated: the first run on the Pi calibrates them.
+6. Slice 4's two steps check the three capture states and the paused listener, with the
+   listener turned on for the run only (`GHOST_WISPR_VOICE_PAUSED_LISTENER=true`, beside the
+   voice). Both keep the microphone on the loopback, so the listener hears only what the step plays
+   in, and the room is never captured:
+   - `--step states --phrase start.wav --speech stop.wav` needs a person at the Pi. It moves the
+     unit through every cell of the control table with the page's controls, `POST /api/close`,
+     the phrase played in, and the person's presses of the power button and the Jabra's mute
+     button, which it asks for on the terminal. After each move it reads `/api/status`, the light
+     (`ghost-wispr light-state`), the saved state, whether the loopback's capture device is open,
+     and asks the person whether the Jabra's ring shows Muted. In listening it checks that the
+     service holds no socket to Deepgram or OpenAI, by the certificate each port-443 peer serves,
+     and that its sockets to the Envoy hub send at most 2048 bytes while `--speech` plays for
+     `--hub-seconds`. It also reads `LimitCORE=0` and `MemorySwapMax=0` from the unit.
+   - `--step listener-cpu --speech speech.wav` reads the whole process's CPU time from
+     `/proc/<MainPID>/stat` for `--cpu-seconds` (600 by default) in listening and again in closed,
+     each quiet and with `--speech` played in, and passes when the listener's share of one core is
+     at most 25 % in both. `--threads 4` runs the spotter on four threads: the check's control,
+     whose reading must be at least twice the one-thread reading.
 
 ## Accept slice 1
 

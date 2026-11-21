@@ -5,8 +5,10 @@
     connected,
     paused,
     capturing,
+    captureState,
     activeSessionId,
     onToggle,
+    onClose,
     onEndSession,
     onStartSession,
     onStopSession,
@@ -14,14 +16,19 @@
     connected: boolean
     paused: boolean
     capturing: boolean
+    // GET /api/status's capture_state: "listening" while paused with the
+    // paused listener holding the microphone.
+    captureState: string
     activeSessionId: string
     onToggle: () => Promise<void>
+    onClose: () => Promise<void>
     onEndSession: () => Promise<void>
     onStartSession: () => Promise<void>
     onStopSession: () => Promise<void>
   } = $props()
 
   let busy = $state(false)
+  let closeBusy = $state(false)
   let endBusy = $state(false)
   let recordBusy = $state(false)
   let recordError = $state('')
@@ -30,7 +37,19 @@
   // A session can only start while the microphone is capturing: not while
   // paused, and not after a resume until the microphone is back.
   const recordBlocked = $derived(!isRecording && (paused || !capturing))
-  const captureLabel = $derived(paused ? 'Paused' : capturing ? 'Listening' : 'Not capturing')
+  // The three states (INFRA-4592): recording, listening (paused, with only the
+  // paused listener holding the microphone) and closed.
+  const listening = $derived(paused && captureState === 'listening')
+  const closed = $derived(paused && !listening)
+  const captureLabel = $derived(
+    listening
+      ? 'Paused: hears only “Wispr, start recording”'
+      : closed
+        ? 'Microphone closed'
+        : capturing
+          ? 'Recording'
+          : 'Not capturing',
+  )
 
   // The API answers errors as {"error": "..."}; show that message.
   function errorText(err: unknown): string {
@@ -55,6 +74,18 @@
       console.error('Failed to toggle recording:', err)
     } finally {
       busy = false
+    }
+  }
+
+  async function handleClose() {
+    if (closeBusy) return
+    closeBusy = true
+    try {
+      await onClose()
+    } catch (err) {
+      console.error('Failed to close the microphone:', err)
+    } finally {
+      closeBusy = false
     }
   }
 
@@ -132,6 +163,18 @@
       Pause
     {/if}
   </button>
+
+  {#if !closed}
+    <button
+      class="toggle-btn"
+      type="button"
+      onclick={handleClose}
+      disabled={closeBusy}
+      title="Close the microphone, as the Jabra's mute button does: nothing listens until a resume"
+    >
+      Close microphone
+    </button>
+  {/if}
 
   {#if activeSessionId}
     <button class="end-btn" type="button" onclick={handleEndSession} disabled={endBusy}>

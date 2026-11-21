@@ -98,15 +98,36 @@ jobs:
       - name: Embed web assets
         run: make --silent embed-assets
 
+      # The paused listener's spotter for linux/arm64, linked statically into the binary with its
+      # model embedded, so the release stays one file (deploy/sherpa/fetch.sh checks each pinned
+      # sha256). The cache is CI's, keyed by architecture.
+      - name: Restore the sherpa-onnx downloads
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/ghost-wispr-sherpa
+          key: sherpa-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('deploy/sherpa/fetch.sh') }}
+
+      - name: Fetch the paused listener's spotter
+        timeout-minutes: 10
+        run: bash deploy/sherpa/fetch.sh arm64
+
       - name: Build arm64 binary
         env:
           BUILD_SHA: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}
         run: |
-          go build \
+          go build -tags kws \
             -ldflags "-X main.Commit=${BUILD_SHA} -X main.BuildTime=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
             -o ghost-wispr-linux-arm64 \
             ./cmd/ghost-wispr
           sha256sum ghost-wispr-linux-arm64 > ghost-wispr-linux-arm64.sha256
+
+      # The binary itself, on arm64: its spotter links, loads the embedded model, hears the stored
+      # start phrases and none of the stored near misses, and its CPU per second of audio, one thread.
+      - name: Self-test the paused listener
+        run: |
+          ls -l ghost-wispr-linux-arm64
+          ldd ghost-wispr-linux-arm64
+          ./ghost-wispr-linux-arm64 kws-selftest internal/wake/local/testdata/*.wav
 
       - name: Upload arm64 artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -115,6 +136,7 @@ jobs:
           path: |
             ghost-wispr-linux-arm64
             ghost-wispr-linux-arm64.sha256
+            THIRD_PARTY_NOTICES.md
           if-no-files-found: error
 
   publish:
@@ -143,6 +165,7 @@ jobs:
           gh release create "$tag" \
             ghost-wispr-linux-arm64 \
             ghost-wispr-linux-arm64.sha256 \
+            THIRD_PARTY_NOTICES.md \
             --target "$BUILD_SHA" \
             --title "$tag" \
             --generate-notes
