@@ -225,7 +225,7 @@ func TestSolInflightTapCannotReplayBeforePause(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			tap := voice.NewTap()
 			capture := newCaptureGate(nil, nil, nil)
-			out := audio.NewOutput(audio.OutputConfig{})
+			out := audio.NewOutput(audio.OutputConfig{Open: noSpeaker})
 			t.Cleanup(func() { _ = out.Close() })
 			sup := voice.NewSupervisor(&voice.SupervisorConfig{
 				Concierge: stubConcierge{},
@@ -304,7 +304,7 @@ func TestVoiceTapDropsAFrameAdmittedBeforeALightCheckClosed(t *testing.T) {
 			tap := voice.NewTap()
 			capture := newCaptureGate(nil, nil, nil)
 			capture.writeWait = 10 * time.Millisecond
-			out := audio.NewOutput(audio.OutputConfig{})
+			out := audio.NewOutput(audio.OutputConfig{Open: noSpeaker})
 			t.Cleanup(func() { _ = out.Close() })
 			sup := voice.NewSupervisor(&voice.SupervisorConfig{
 				Concierge: stubConcierge{},
@@ -375,4 +375,10 @@ func TestLiveOptionsCarryTheWakeKeyterms(t *testing.T) {
 	if got := liveTranscriptionOptions(&cfg, 16000, nil).Keyterm; len(got) != 0 {
 		t.Errorf("keyterms %q with no speaker, want none", got)
 	}
+}
+
+// noSpeaker is an Output's Open that opens no device: a test's Output never
+// reaches a real speaker (ALSA's "default" can be a sound server elsewhere).
+func noSpeaker(string) (audio.PlaybackStream, int, error) {
+	return nil, 0, context.Canceled
 }

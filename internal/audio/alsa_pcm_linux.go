@@ -125,11 +125,21 @@ func (p *cgoPCM) close() int {
 // alsaParams are the parameters a playback PCM opened with, in frames.
 type alsaParams struct{ rate, channels, period, buffer int }
 
+// alsaNullPCM is ALSA's null PCM, which discards what it plays and captures
+// silence: no device, so a test binary opens it (realDevice).
+const alsaNullPCM = "null"
+
 // openALSAPlayback opens the playback PCM device alone: no capture device,
 // and no PortAudio, whose initialization opens every capture PCM. It plays
 // at the first of rates the device takes without resampling, with interleaved
-// 16-bit channels, which ALSA converts to what the device takes.
+// 16-bit channels, which ALSA converts to what the device takes. In a test
+// binary it opens only ALSA's null PCM (realDevice).
 func openALSAPlayback(device string, rates []int, period, buffer time.Duration) (*cgoPCM, alsaParams, error) {
+	if device != alsaNullPCM {
+		if err := realDevice("ALSA playback " + device); err != nil {
+			return nil, alsaParams{}, err
+		}
+	}
 	name := C.CString(device)
 	defer C.free(unsafe.Pointer(name))
 	crates := make([]C.uint, len(rates))

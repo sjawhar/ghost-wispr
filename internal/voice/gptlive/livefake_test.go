@@ -104,6 +104,7 @@ type clientEvent struct {
 	Audio        string        `json:"audio"`
 	Session      sessionConfig `json:"session"`
 	raw          []byte
+	decodedAt    time.Time // when the stand-in server decoded it
 }
 
 // liveConn is the server's side of one session's socket.
@@ -156,6 +157,7 @@ func (c *liveConn) read() {
 			continue
 		}
 		ev.raw = data
+		ev.decodedAt = time.Now() // as the server decodes it, not when a test reads it
 		if ev.Type == evInputAudioAppend {
 			if b, err := base64.StdEncoding.DecodeString(ev.Audio); err == nil {
 				c.inSamples.Add(int64(len(b) / 2))
@@ -367,9 +369,26 @@ type fakePlayback struct {
 	drained   bool
 	wrote     chan struct{}
 	pace      bool
+	begins    []time.Time // when each Write began
+}
+
+// writesBegunAfter is how many of the speech's Writes began after at.
+func (p *fakePlayback) writesBegunAfter(at time.Time) int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	n := 0
+	for _, b := range p.begins {
+		if b.After(at) {
+			n++
+		}
+	}
+	return n
 }
 
 func (p *fakePlayback) Write(ctx context.Context, frame []byte, format audio.AudioFormat) error {
+	p.mu.Lock()
+	p.begins = append(p.begins, time.Now())
+	p.mu.Unlock()
 	if p.pace {
 		select {
 		case <-time.After(time.Duration(len(frame)/2) * time.Second / time.Duration(format.SampleRate)):

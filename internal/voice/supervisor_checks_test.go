@@ -197,11 +197,33 @@ func TestSoundTriggersAndPitch(t *testing.T) {
 	}
 }
 
+// answerSoundStops fails t if the answer sound, the first sound on the chime
+// input, plays another frame within 300 ms (15 of its paced frames) once
+// settle has passed, or if it played to its end.
+func answerSoundStops(t *testing.T, r *rig, settle time.Duration) {
+	t.Helper()
+	answerFrames := (len(AnswerChime()) + 959) / 960
+	time.Sleep(settle)
+	_, frames := r.speaker.chimePlaybacks()
+	before := frames[0]
+	time.Sleep(300 * time.Millisecond)
+	_, frames = r.speaker.chimePlaybacks()
+	if frames[0] != before || frames[0] >= answerFrames {
+		t.Fatalf("the answer sound played on after the wake: %d frames, then %d, of its %d", before, frames[0], answerFrames)
+	}
+}
+
 // TestAWakeCutsTheAnswerChime fails if the answer sound plays on over the
-// wake sound of a new call.
+// wake sound of a new call: once the wake sound has played, the answer sound
+// must play no more frames. The wake asks nothing, so the exchange ends after
+// TurnWait, and its end stops its wake sound: TurnWait is far longer than the
+// wake sound's 12 paced frames here, as DefaultTurnWait (4 s) is on the unit,
+// so the end cannot cut the sound the test waits for. (The rig's 300 ms left
+// 60 ms, which a loaded machine took: on main, 2 runs in 40 failed under
+// -race, and 6 in 20 without it.)
 func TestAWakeCutsTheAnswerChime(t *testing.T) {
 	c := newFakeConcierge()
-	r := newRig(t, c)
+	r := newRigWith(t, c, func(cfg *SupervisorConfig, _ *rig) { cfg.TurnWait = DefaultTurnWait })
 	r.speaker.paceWrites(audio.InputChime, 20*time.Millisecond)
 	c.answers <- PendingAnswer{TaskID: "t1", SessionID: "sess-1", Text: "x"}
 	eventually(t, "the answer sound begins", func() bool { return len(r.speaker.soundsPlayed()) == 1 })
@@ -209,14 +231,50 @@ func TestAWakeCutsTheAnswerChime(t *testing.T) {
 	r.heard("Wispr,", false, false)
 	r.waitSession()
 	wakeFrames := (len(WakeChime()) + 959) / 960
-	answerFrames := (len(AnswerChime()) + 959) / 960
 	eventually(t, "the whole wake sound", func() bool {
 		names, frames := r.speaker.chimePlaybacks()
 		return len(names) == 2 && names[1] == "wake" && frames[1] == wakeFrames
 	})
-	_, frames := r.speaker.chimePlaybacks()
-	if frames[0] >= answerFrames {
-		t.Fatalf("the answer sound played all %d frames over the wake", frames[0])
+	answerSoundStops(t, r, 0)
+}
+
+// TestAWakeThatStartsNoExchangeStillCutsTheAnswerChime fails if the answer
+// sound plays on after a wake whose exchange does not start: one whose voice
+// cannot be built, which plays the error sound instead, and one heard as the
+// light stops being red. From review 6004985046 of #144: the answer sound
+// played all its frames over the error sound.
+func TestAWakeThatStartsNoExchangeStillCutsTheAnswerChime(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		fail  func(r *rig)
+		sound string // the sound the wake plays instead, if any
+	}{
+		{"the voice cannot be built", func(r *rig) { r.voiceErr = errors.New("no voice configured") }, "error"},
+		{"the light is not red", func(r *rig) { r.red = false }, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := newFakeConcierge()
+			r := newRig(t, c)
+			r.speaker.paceWrites(audio.InputChime, 20*time.Millisecond)
+			c.answers <- PendingAnswer{TaskID: "t1", SessionID: "sess-1", Text: "x"}
+			eventually(t, "the answer sound begins", func() bool { return len(r.speaker.soundsPlayed()) == 1 })
+			time.Sleep(60 * time.Millisecond)
+			r.mu.Lock()
+			tc.fail(r)
+			r.mu.Unlock()
+			r.heard("Wispr,", false, false)
+			if tc.sound != "" {
+				eventually(t, "the "+tc.sound+" sound", func() bool {
+					return slices.Contains(r.speaker.soundsPlayed(), tc.sound)
+				})
+			}
+			answerSoundStops(t, r, 100*time.Millisecond)
+			select {
+			case <-r.voice.opened:
+				t.Fatal("control: the wake opened a voice")
+			default:
+			}
+		})
 	}
 }
 
