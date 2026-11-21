@@ -138,14 +138,15 @@ type routeRequest struct {
 	held bool
 }
 
-// TestNoRequestWritesTheStoreAfterTheStop drives every route of the API, with
-// the store work main wires (wireStoreWork, wireSegmentDeletion) and every
-// slow dependency held until the stop (heldUntilStop), then stops as main
-// does: no more requests (stopServing), then the stop's wait
-// (stopRecovery.stop). It fails if anything writes the store once that has
-// returned, when main closes the store (storeguard records each write), or if
-// the server takes a request after it stopped serving. It also fails if a
-// route of the API is not driven, so a new route is not left out.
+// TestNoRequestWritesTheStoreAfterTheStop drives every route of the API, as
+// internal/server's source registers them (serverRoutes), so a new route is
+// driven too, with the store work main wires (wireStoreWork,
+// wireSegmentDeletion) and every slow dependency held until the stop
+// (heldUntilStop). It then stops as main does: no more requests
+// (stopServing), then the stop's wait (stopRecovery.stop). It fails if
+// anything writes the store once that has returned, when main closes the
+// store (storeguard records each write), or if the server takes a request
+// after it stopped serving.
 func TestNoRequestWritesTheStoreAfterTheStop(t *testing.T) {
 	dir := t.TempDir()
 	store := openResumeStore(t, filepath.Join(dir, "requests.db"))
