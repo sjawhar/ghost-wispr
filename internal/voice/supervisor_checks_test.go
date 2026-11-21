@@ -198,10 +198,14 @@ func TestSoundTriggersAndPitch(t *testing.T) {
 }
 
 // TestAWakeCutsTheAnswerChime fails if the answer sound plays on over the
-// wake sound of a new call.
+// wake sound of a new call. The wake asks nothing, so the exchange ends after
+// TurnWait, and its end stops its wake sound: TurnWait is far longer than the
+// wake sound's 12 paced frames here, as DefaultTurnWait (4 s) is on the unit,
+// so the end cannot cut the sound the test waits for. (The rig's 300 ms left
+// 60 ms, which a loaded machine under -race took: 2 runs in 40 failed.)
 func TestAWakeCutsTheAnswerChime(t *testing.T) {
 	c := newFakeConcierge()
-	r := newRig(t, c)
+	r := newRigWith(t, c, func(cfg *SupervisorConfig, _ *rig) { cfg.TurnWait = DefaultTurnWait })
 	r.speaker.paceWrites(audio.InputChime, 20*time.Millisecond)
 	c.answers <- PendingAnswer{TaskID: "t1", SessionID: "sess-1", Text: "x"}
 	eventually(t, "the answer sound begins", func() bool { return len(r.speaker.soundsPlayed()) == 1 })
