@@ -687,7 +687,7 @@ func TestAnOptionsChangeRedialsWithTheCurrentOptions(t *testing.T) {
 	rc := newLiveTranscription(ctx, "test-key",
 		&interfaces.ClientOptions{Host: host, EnableKeepAlive: true},
 		optsFor,
-		transcribe.ResilientConfig{BufferSize: 1 << 16, InitialReconnectDelay: 20 * time.Millisecond, MaxReconnectBackoff: 50 * time.Millisecond, GracefulCloseWait: 100 * time.Millisecond},
+		transcribe.ResilientConfig{BufferSize: 1 << 16, InitialReconnectDelay: 20 * time.Millisecond, MaxReconnectBackoff: 50 * time.Millisecond},
 		transcriptCallback{}, newWarningsRegistry(), nil)
 	t.Cleanup(func() { _ = rc.Close() })
 	waitForHardwareWithin(t, 3*time.Second, "the first socket", func() bool { return rc.IsConnected() && len(peer.handshakes()) >= 1 })
@@ -775,8 +775,9 @@ func TestAGracefullyEndedSocketRefusesLaterAudio(t *testing.T) {
 // TestAnOptionsChangeKeepsTheOldSocketsFinalResult fails if replacing a
 // healthy socket after an options change cuts it off before Deepgram returns
 // the final result for the audio it accepted: the rotation ends the old
-// stream with CloseStream and waits for that result, and only then redials.
-// Closing it at once, as for a failed socket, loses the utterance in progress.
+// stream with CloseStream and keeps that result, which comes while the next
+// socket is dialled. Closing it at once, as for a failed socket, loses the
+// utterance in progress.
 func TestAnOptionsChangeKeepsTheOldSocketsFinalResult(t *testing.T) {
 	const final = "Finally."
 	peer := startCloseStreamPeer(t, final, 50*time.Millisecond)
@@ -787,16 +788,25 @@ func TestAnOptionsChangeKeepsTheOldSocketsFinalResult(t *testing.T) {
 	rc := newLiveTranscription(ctx, "test-key",
 		&interfaces.ClientOptions{Host: host, EnableKeepAlive: true},
 		constOpts(&interfaces.LiveTranscriptionOptions{Model: "nova-3", Language: "en-US", Encoding: "linear16", SampleRate: 16000, Channels: 1}),
-		transcribe.ResilientConfig{BufferSize: 1 << 16, InitialReconnectDelay: 20 * time.Millisecond, MaxReconnectBackoff: 50 * time.Millisecond, GracefulCloseWait: 2 * time.Second},
+		transcribe.ResilientConfig{BufferSize: 1 << 16, InitialReconnectDelay: 20 * time.Millisecond, MaxReconnectBackoff: 50 * time.Millisecond},
 		transcriptCallback{voice: heard}, newWarningsRegistry(), nil)
 	t.Cleanup(func() { _ = rc.Close() })
 	waitForHardwareWithin(t, 3*time.Second, "the first socket", rc.IsConnected)
 	_, _ = rc.Write(make([]byte, 3200)) // audio the old socket accepts
 	rc.OptionsChanged()
 	waitForHardwareWithin(t, 3*time.Second, "the redial", func() bool { return peer.handshakes.Load() >= 2 && rc.IsConnected() })
-	heard.mu.Lock()
-	defer heard.mu.Unlock()
-	if !slices.ContainsFunc(heard.got, func(tr voice.Transcript) bool { return tr.Text == final }) {
+	heardFinal := func() bool {
+		heard.mu.Lock()
+		defer heard.mu.Unlock()
+		return slices.ContainsFunc(heard.got, func(tr voice.Transcript) bool { return tr.Text == final })
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for !heardFinal() && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !heardFinal() {
+		heard.mu.Lock()
+		defer heard.mu.Unlock()
 		t.Errorf("the voice heard %d results and not the old socket's final %q: the rotation cut it off before Deepgram returned it", len(heard.got), final)
 	}
 }

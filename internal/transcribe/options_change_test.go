@@ -70,6 +70,19 @@ func (s *optionsSocket) got() []byte {
 	return append([]byte(nil), s.data...)
 }
 
+// waitClosed waits up to 3 s for s to be closed, as a socket that retires is
+// on a goroutine of its own, and reports whether it was, and gracefully.
+func (s *optionsSocket) waitClosed() (closed, graceful bool) {
+	for deadline := time.Now().Add(3 * time.Second); ; time.Sleep(time.Millisecond) {
+		s.mu.Lock()
+		closed, graceful = s.closed, s.graceful
+		s.mu.Unlock()
+		if closed || time.Now().After(deadline) {
+			return closed, graceful
+		}
+	}
+}
+
 // dialCounter counts a factory's dials and the most in progress at once.
 type dialCounter struct {
 	dials, inDial, maxInDial atomic.Int32
@@ -168,11 +181,11 @@ func TestAnOptionsChangeDuringADrainWaitsForItAndRedialsOnce(t *testing.T) {
 	if n := counter.dials.Load(); n != 2 {
 		t.Errorf("the factory dialled %d times, want 2: the redial, then once more for the new options", n)
 	}
+	if closed, graceful := first.waitClosed(); !closed || !graceful {
+		t.Errorf("the socket the change made stale closed %t, gracefully %t, want both", closed, graceful)
+	}
 	mu.Lock()
 	defer mu.Unlock()
-	if !first.closed || !first.graceful {
-		t.Errorf("the socket the change made stale closed %t, gracefully %t, want both", first.closed, first.graceful)
-	}
 	var sent []byte
 	for _, s := range sockets {
 		sent = append(sent, s.got()...)
@@ -245,8 +258,8 @@ func TestAnOptionsFlipDuringAHandshakeEndsOnTheLatestOptions(t *testing.T) {
 	if current == nil || current.noDelay {
 		t.Errorf("the client ended on a socket dialled with no_delay %t, want the latest options, no_delay false", current != nil && current.noDelay)
 	}
-	if !live.closed || !live.graceful {
-		t.Errorf("the healthy socket the change replaced closed %t, gracefully %t, want both", live.closed, live.graceful)
+	if closed, graceful := live.waitClosed(); !closed || !graceful {
+		t.Errorf("the healthy socket the change replaced closed %t, gracefully %t, want both", closed, graceful)
 	}
 	if len(sockets[0].got()) != 0 {
 		t.Errorf("the socket dialled with the intermediate options got %d bytes, want none", len(sockets[0].got()))
@@ -304,6 +317,9 @@ func TestAWriteThatFailsOnAReplacedSocketGoesToItsSuccessor(t *testing.T) {
 	}
 	rc.OptionsChanged() // the healthy socket is replaced while the write is held
 	waitConnected(t, rc)
+	if closed, _ := live.waitClosed(); !closed {
+		t.Fatal("the replaced socket was never closed")
+	}
 	close(live.release) // the held write now fails: its socket is closed
 	select {
 	case <-wrote:

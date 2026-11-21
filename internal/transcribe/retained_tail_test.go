@@ -139,16 +139,7 @@ func TestAnOverflowPastTheChunkInFlightEndsThatSocketsStream(t *testing.T) {
 	if got := first.got(); !bytes.Equal(got, audio[:4096]) {
 		t.Errorf("the first socket got %d bytes, want the 4096 of the chunk it took and nothing after the gap", len(got))
 	}
-	var closed, graceful bool
-	for deadline := time.Now().Add(3 * time.Second); ; time.Sleep(time.Millisecond) {
-		first.mu.Lock()
-		closed, graceful = first.closed, first.graceful
-		first.mu.Unlock()
-		if closed || time.Now().After(deadline) {
-			break
-		}
-	}
-	if !closed || !graceful {
+	if closed, graceful := first.waitClosed(); !closed || !graceful {
 		t.Errorf("the first socket closed %t, gracefully %t, want closed gracefully: Deepgram owes the results of the audio it took", closed, graceful)
 	}
 	if got := second.got(); !bytes.Equal(got, audio[8192:]) {
@@ -323,6 +314,9 @@ func TestARefusedWriteOnAReplacedSocketDoesNotEndItsSuccessor(t *testing.T) {
 	case <-successor.held: // the successor drains, its first chunk held
 	case <-time.After(3 * time.Second):
 		t.Fatal("the successor never drained")
+	}
+	if closed, _ := old.waitClosed(); !closed {
+		t.Fatal("the replaced socket was never closed")
 	}
 	close(old.release) // the old socket, closed meanwhile, refuses the write
 	select {
