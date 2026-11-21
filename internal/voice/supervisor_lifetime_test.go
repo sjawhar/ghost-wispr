@@ -182,33 +182,25 @@ func TestTheLastHandsEndCancelsItsSound(t *testing.T) {
 }
 
 // TestNeverMindCutsTheQueuedAnswerSoundBehindAPlannedHandSound fails if a
-// never mind that drops the last answer leaves that answer's sound in the
-// speaker's queue because a hand sound, planned but not begun, was the sound
-// chosen last; the hand's sound and its waiting light must survive.
+// never mind that drops the last answer leaves that answer's sound, still
+// playing from the speaker, in its queue because a hand waits to sound after
+// it; the hand's sound and its waiting light must survive.
 func TestNeverMindCutsTheQueuedAnswerSoundBehindAPlannedHandSound(t *testing.T) {
 	c := newFakeConcierge()
 	r, light := newWaitingRig(t, c)
+	r.speaker.holdDrain(audio.InputChime)
 	holdAnswer(t, r, light, "t1", "It ships tomorrow.")
 	eventually(t, "the answer sound queued", func() bool {
 		r.s.mu.Lock()
 		defer r.s.mu.Unlock()
-		return r.speaker.written(audio.InputChime) > 0 && r.s.chimeCancel == nil
+		return r.s.chimeDraining && !r.s.chimeHands
 	})
 	r.speaker.mu.Lock()
 	answerGen := r.speaker.chimes[0].gen
 	r.speaker.mu.Unlock()
-	release := r.speaker.holdBegins(audio.InputChime)
-	var once sync.Once
-	unblock := func() { once.Do(release) }
-	defer unblock()
 	if err := r.s.RaiseHand(testHand("h1", "ABC-12", time.Minute)); err != nil {
 		t.Fatal(err)
 	}
-	eventually(t, "the hand sound planned", func() bool {
-		r.s.mu.Lock()
-		defer r.s.mu.Unlock()
-		return r.s.chimeCancel != nil && r.s.chimeHands
-	})
 	r.heard("Wispr, never mind.", true, true)
 	eventually(t, "only the hand waiting", func() bool {
 		r.s.mu.Lock()
@@ -218,7 +210,6 @@ func TestNeverMindCutsTheQueuedAnswerSoundBehindAPlannedHandSound(t *testing.T) 
 	r.speaker.mu.Lock()
 	answerLive := r.speaker.gen[audio.InputChime] == answerGen
 	r.speaker.mu.Unlock()
-	unblock()
 	eventually(t, "control: the hand sound", func() bool { return slices.Contains(r.speaker.soundsPlayed(), "hand") })
 	if !light.lit() {
 		t.Fatal("control: the hand's waiting light went off")

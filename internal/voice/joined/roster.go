@@ -13,9 +13,12 @@ package joined
 import (
 	"cmp"
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"log"
+	"maps"
+	"math"
 	"slices"
 	"strings"
 	"sync"
@@ -151,12 +154,81 @@ type member struct {
 }
 
 // agentHistory is what the roster keeps of one agent session across its
-// memberships: the commands it took, so that one delivered again is a no-op,
-// and the agent's rate limits, which a leave and a rejoin do not reset.
+// memberships: its rate limits, which a leave and a rejoin do not reset.
 type agentHistory struct {
-	events      map[string]time.Time // the EventIDs of its commands taken, and when, kept for replayWindow
 	lastFloor   time.Time
 	lastPointer time.Time
+}
+
+// commandKey is a command's fixed-size record: the first 16 bytes of the
+// SHA-256 of its agent session and Envoy event id, so a command costs the
+// history the same however long its id.
+type commandKey [16]byte
+
+func commandKeyOf(agent, eventID string) commandKey {
+	sum := sha256.Sum256([]byte(agent + "\x00" + eventID))
+	return commandKey(sum[:16])
+}
+
+// commandHistory is the commands the roster took, each kept for replayWindow
+// from when it took it, so a command Envoy delivers again acts once. A command
+// is its key and the second it was taken, counted from base and rounded up,
+// so it is kept at least the window. At most maxCommands are kept.
+type commandHistory struct {
+	base   time.Time
+	taken  map[commandKey]uint32
+	oldest uint32 // no command held was taken earlier, so a prune before its expiry finds nothing
+	peak   int    // the most commands held since taken was made, for its rebuild
+	full   bool   // the latest new command found the history full; logged once a filling
+}
+
+// stamp is now as a second counted from base, rounded up.
+func (h *commandHistory) stamp(now time.Time) uint32 {
+	d := now.Sub(h.base)
+	if d <= 0 {
+		return 0
+	}
+	return uint32(min((d+time.Second-1)/time.Second, math.MaxUint32))
+}
+
+// expired reports whether a command taken at the second at has been kept the
+// window at now.
+func (h *commandHistory) expired(at uint32, now time.Time) bool {
+	return now.Sub(h.base.Add(time.Duration(at)*time.Second)) >= replayWindow
+}
+
+// add keeps key, taken at now.
+func (h *commandHistory) add(key commandKey, now time.Time) {
+	at := h.stamp(now)
+	if len(h.taken) == 0 || at < h.oldest {
+		h.oldest = at
+	}
+	h.taken[key] = at
+	h.peak = max(h.peak, len(h.taken))
+}
+
+// prune forgets the commands kept the window. A map does not give back the
+// room of what it deletes, and maps.Clone keeps its size, so once a prune
+// leaves a quarter of the most it held, the map is made again at its new
+// size and filled.
+func (h *commandHistory) prune(now time.Time) {
+	if len(h.taken) == 0 || !h.expired(h.oldest, now) {
+		return
+	}
+	oldest := uint32(math.MaxUint32)
+	for key, at := range h.taken {
+		if h.expired(at, now) {
+			delete(h.taken, key)
+		} else {
+			oldest = min(oldest, at)
+		}
+	}
+	h.oldest = oldest
+	if len(h.taken) <= h.peak/4 {
+		taken := make(map[commandKey]uint32, len(h.taken))
+		maps.Copy(taken, h.taken)
+		h.taken, h.peak = taken, len(taken)
+	}
 }
 
 // liveContext is a context whose Err also reports it done the moment alive
@@ -239,10 +311,15 @@ type Roster struct {
 	// one whose end has begun and whose cleanup has not finished.
 	members  map[string]*member
 	meetings map[string]*meeting // the open meetings agents joined, by recording session
-	// history is each agent session's history, across its memberships
-	// (agentHistory): kept while Envoy can deliver one of its commands again,
-	// while one of its limits runs, or while it is joined (pruneHistoryLocked).
+	// history is each agent session's rate limits, across its memberships
+	// (agentHistory): kept while one of them runs or while it is joined
+	// (pruneHistoryLocked).
 	history map[string]*agentHistory
+	// commands are the commands taken within Envoy's replay window.
+	commands commandHistory
+	// ready, made while the roster has no Envoy session, is closed by the
+	// SetAgents that gives it one: a command waits on it (notReadyWait).
+	ready chan struct{}
 	// ended are the recording sessions that ended or were deleted, newest
 	// last, at most maxEnded: a decision made from a slow read commits
 	// nothing for one of them.
@@ -266,40 +343,58 @@ const maxEnded = 64
 // re-registration's resume point included, reads what the stream no longer
 // keeps. The roster remembers each command it took for that long, from when
 // it took it by its own clock, which is no earlier than when Envoy stored it.
-// No count bounds it: a count would forget a command Envoy can still bring
-// back.
 const replayWindow = 72 * time.Hour
 
+// maxCommands bounds the commands the roster keeps: twice one a second over
+// replayWindow, about 21 MiB of history at the bound (43 bytes a command,
+// TestTheCommandHistoryStaysCompact).
+// Past it the roster forgets none Envoy could still deliver again: it takes
+// no new command (ErrCommandsFull) until older ones expire.
+const maxCommands = 1 << 19
+
+// notReadyWait is how long a command that comes while the roster has no
+// Envoy session waits for one before it is refused (ErrNotReady): the unit's
+// session can deliver a frame while it still registers, a moment before
+// SetAgents gives the roster the session, and such a command is taken rather
+// than refused. It also spaces Envoy's redeliveries of a command the roster
+// cannot take, whatever backoff Envoy itself applies.
+const notReadyWait = 2 * time.Second
+
 // ErrNotReady is Deliver's answer to a command that comes while the roster
-// has no Envoy session: before SetAgents gives it one (the unit's session can
-// deliver a frame while it still registers), or once SetAgents(nil) took it
-// away. The roster can neither take nor answer the command then, so it does
-// not acknowledge it: the unit's Envoy session answers the frame nak, and
-// Envoy delivers it again (legion's listener does so 30 s later, up to 20
-// times).
+// has no Envoy session and none is given within notReadyWait: before
+// SetAgents gives it one, or once SetAgents(nil) took it away. The roster can
+// neither take nor answer the command then, so it does not acknowledge it:
+// the unit's Envoy session answers the frame nak, and Envoy delivers it again
+// for as long as its stream keeps it. legion's relay spaces those deliveries
+// 1, 2, 4, 8 and 16 s and then 30 s apart (session_relay.go,
+// relayNakDelayFor), with no limit on their number (the session consumer's
+// MaxDeliver is -1), and notReadyWait spaces them at least 2 s whatever the
+// relay does.
 var ErrNotReady = errors.New("joined: the roster has no Envoy session to take the command with")
 
-// historyLocked is agent's history, made at its first command.
+// ErrCommandsFull is Deliver's answer to a new command while the roster
+// keeps maxCommands taken within Envoy's window. It forgets none Envoy could
+// still deliver again, so it does not take this one, and does not acknowledge
+// it: Envoy delivers it again, as for ErrNotReady, and it is taken once older
+// commands expire.
+var ErrCommandsFull = errors.New("joined: the roster keeps the most commands it holds; this one comes again once older ones expire")
+
+// historyLocked is agent's history, made at its first rate limit.
 func (r *Roster) historyLocked(agent string) *agentHistory {
 	h := r.history[agent]
 	if h == nil {
-		h = &agentHistory{events: map[string]time.Time{}}
+		h = &agentHistory{}
 		r.history[agent] = h
 	}
 	return h
 }
 
 // pruneHistoryLocked forgets the commands Envoy can no longer deliver again,
-// and the history of an agent with none left, no limit running and no
-// membership.
+// and the history of an agent with no limit running and no membership.
 func (r *Roster) pruneHistoryLocked(now time.Time) {
+	r.commands.prune(now)
 	for agent, h := range r.history {
-		for id, at := range h.events {
-			if now.Sub(at) >= replayWindow {
-				delete(h.events, id)
-			}
-		}
-		if len(h.events) == 0 && r.members[agent] == nil &&
+		if r.members[agent] == nil &&
 			now.Sub(h.lastFloor) >= r.cfg.FloorEvery && now.Sub(h.lastPointer) >= r.cfg.PointerEvery {
 			delete(r.history, agent)
 		}
@@ -371,7 +466,11 @@ func New(cfg *Config) *Roster {
 		logf = log.Printf
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	return &Roster{cfg: c, logf: logf, ctx: ctx, cancel: cancel, members: map[string]*member{}, meetings: map[string]*meeting{}, history: map[string]*agentHistory{}}
+	return &Roster{
+		cfg: c, logf: logf, ctx: ctx, cancel: cancel,
+		members: map[string]*member{}, meetings: map[string]*meeting{}, history: map[string]*agentHistory{},
+		commands: commandHistory{base: c.Now(), taken: map[commandKey]uint32{}},
+	}
 }
 
 // SetAgents gives the roster the unit's Envoy session once it opens, which
@@ -387,6 +486,10 @@ func (r *Roster) SetAgents(agents Agents) {
 	r.open = agents != nil
 	if agents != nil {
 		r.agents = agents
+		if r.ready != nil {
+			close(r.ready)
+			r.ready = nil
+		}
 		r.mu.Unlock()
 		return
 	}
@@ -497,22 +600,41 @@ func (r *Roster) Deliver(ctx context.Context, m *envoy.Message) (bool, error) {
 		r.logf("joined: a %s message named no session it came from", c.verb)
 		return true, nil
 	}
+	r.mu.Lock()
+	ready := r.open || r.waitReadyLocked(ctx)
+	r.mu.Unlock()
+	if !ready {
+		return true, ErrNotReady
+	}
 	now := r.cfg.Now() // no hook runs under r.mu
 	r.mu.Lock()
-	if !r.open {
+	if !r.open { // taken away meanwhile
 		r.mu.Unlock()
 		return true, ErrNotReady
 	}
 	// A command Envoy delivers again was taken: it acts once, whatever the
 	// agent's membership is now, for as long as Envoy can bring it back.
 	if m.EventID != "" {
-		h := r.historyLocked(m.SourceSession)
-		if _, taken := h.events[m.EventID]; taken {
+		key := commandKeyOf(m.SourceSession, m.EventID)
+		if _, taken := r.commands.taken[key]; taken {
 			r.mu.Unlock()
 			r.logf("joined: a %s message already taken was delivered again", c.verb)
 			return true, nil
 		}
-		h.events[m.EventID] = now
+		if len(r.commands.taken) >= maxCommands {
+			r.commands.prune(now)
+		}
+		if len(r.commands.taken) >= maxCommands {
+			first := !r.commands.full
+			r.commands.full = true
+			r.mu.Unlock()
+			if first {
+				r.logf("joined: the roster keeps %d commands taken within Envoy's window; new commands come again once older ones expire", maxCommands)
+			}
+			return true, ErrCommandsFull
+		}
+		r.commands.full = false
+		r.commands.add(key, now)
 	}
 	r.mu.Unlock()
 	switch c.verb {
@@ -524,6 +646,35 @@ func (r *Roster) Deliver(ctx context.Context, m *envoy.Message) (bool, error) {
 		r.leaveCommand(m)
 	}
 	return true, nil
+}
+
+// waitReadyLocked waits, without r.mu, up to notReadyWait for SetAgents to
+// give the roster its Envoy session, and reports whether it did; ctx's end
+// and Close end the wait too. r.mu is held on entry and on return.
+func (r *Roster) waitReadyLocked(ctx context.Context) bool {
+	timer := time.NewTimer(notReadyWait)
+	defer timer.Stop()
+	for !r.open {
+		if r.ready == nil {
+			r.ready = make(chan struct{})
+		}
+		ready := r.ready
+		r.mu.Unlock()
+		select {
+		case <-ready:
+		case <-timer.C:
+			r.mu.Lock()
+			return r.open
+		case <-ctx.Done():
+			r.mu.Lock()
+			return r.open
+		case <-r.ctx.Done():
+			r.mu.Lock()
+			return r.open
+		}
+		r.mu.Lock()
+	}
+	return true
 }
 
 func (r *Roster) join(ctx context.Context, m *envoy.Message, key string) {

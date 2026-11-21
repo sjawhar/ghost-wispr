@@ -186,12 +186,13 @@ func TestASessionsEndCutsItsAnswerSound(t *testing.T) {
 }
 
 // TestTheLastHandsEndCutsItsQueuedSound fails if a hand sound whose frames are
-// all queued stays in the speaker's queue once its last hand came down; a hand
-// still up keeps it.
+// all queued, still playing from the speaker, stays in the speaker's queue
+// once its last hand came down; a hand still up keeps it.
 func TestTheLastHandsEndCutsItsQueuedSound(t *testing.T) {
 	for _, lowered := range []bool{false, true} {
 		t.Run(map[bool]string{false: "the hand still up", true: "the last hand lowered"}[lowered], func(t *testing.T) {
 			r, _, _ := newHandsWaitingRig(t)
+			r.speaker.holdDrain(audio.InputChime)
 			h := testHand("h1", "ABC-12", time.Minute)
 			if err := r.s.RaiseHand(h); err != nil {
 				t.Fatal(err)
@@ -199,7 +200,7 @@ func TestTheLastHandsEndCutsItsQueuedSound(t *testing.T) {
 			eventually(t, "the hand sound queued", func() bool {
 				r.s.mu.Lock()
 				defer r.s.mu.Unlock()
-				return r.s.chimeCancel == nil && r.speaker.written(audio.InputChime) > 0
+				return r.s.chimeDraining
 			})
 			r.speaker.mu.Lock()
 			gen := r.speaker.chimes[0].gen
@@ -271,7 +272,9 @@ func TestACutNotificationSoundsAgain(t *testing.T) {
 		t.Run(map[bool]string{false: "cut before its first frame", true: "cut once queued"}[queued], func(t *testing.T) {
 			r, _, _ := newHandsWaitingRig(t)
 			var release func()
-			if !queued {
+			if queued {
+				r.speaker.holdDrain(audio.InputChime) // still playing when it is cut
+			} else {
 				release = r.speaker.holdBegins(audio.InputChime)
 			}
 			if err := r.s.RaiseHand(testHand("h1", "ABC-12", time.Minute)); err != nil {
@@ -281,7 +284,7 @@ func TestACutNotificationSoundsAgain(t *testing.T) {
 				r.s.mu.Lock()
 				defer r.s.mu.Unlock()
 				if queued {
-					return r.s.chimeCancel == nil && r.speaker.written(audio.InputChime) > 0
+					return r.s.chimeDraining
 				}
 				return r.s.chimeCancel != nil && r.s.chimeHands
 			})

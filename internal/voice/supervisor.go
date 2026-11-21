@@ -216,17 +216,14 @@ type Supervisor struct {
 	lastStopAt time.Time // when the latest stop came
 	// The notification sound being made, the answer sound or the hand
 	// sound: chimeCancel ends it, nil while none is; chimeOwners are the
-	// answers or hands it sounds for.
-	chimeCancel context.CancelFunc
-	chimeCtx    *soundContext
-	chimeHands  bool
-	chimeOwners []*pendingAnswer
-	// chimeQueuedAt is when the last notification sound's last frame was
-	// queued; queued are the notification sounds whose last frame was queued
-	// less than chimeQueueLasts ago, whose tail may still play from the
-	// speaker's queue, whatever sound was chosen after them.
-	chimeQueuedAt time.Time
-	queued        []queuedSound
+	// answers or hands it sounds for. It is theirs from its first frame
+	// until the speaker has played its last (chimeDraining once every frame
+	// is written), however late the speaker plays it.
+	chimeCancel   context.CancelFunc
+	chimeCtx      *soundContext
+	chimeHands    bool
+	chimeOwners   []*pendingAnswer
+	chimeDraining bool
 	pending       []*pendingAnswer
 	arrivals      uint64    // answers taken so far; each held answer's arrived
 	lit           bool      // the waiting light was last told On (showWaitingLocked)
@@ -475,12 +472,22 @@ func (s *Supervisor) errorLocked(sessionID string) {
 }
 
 // soundLocked plays pcm on the chime input at once, unless the Supervisor is
-// closed.
+// closed. A sound for a meeting (sessionID) is written under that meeting's
+// context (SupervisorConfig.Meeting), read at each frame, so none of it plays
+// once the recorder ended the meeting, wherever the sound had got to.
 func (s *Supervisor) soundLocked(pcm []byte, event, sessionID string) {
 	if s.closed {
 		return
 	}
-	s.spawn(func() { s.playChime(s.ctx, pcm, event, sessionID) })
+	var meeting context.Context
+	if s.cfg.Meeting != nil && sessionID != "" {
+		meeting = s.cfg.Meeting(sessionID)
+	}
+	ctx := newSoundContext(s.ctx, meeting, nil)
+	s.spawn(func() {
+		defer ctx.cancel()
+		_, _ = s.playChime(ctx, pcm, event, sessionID)
+	})
 }
 
 // timing reports a timing event, for the acceptance driver.
@@ -595,27 +602,14 @@ func (s *Supervisor) showWaitingLocked() {
 	}
 }
 
-// queuedSound is a notification sound whose last frame was queued at at: the
-// answers or hands it sounds for, its owners.
-type queuedSound struct {
-	hands  bool
-	owners []*pendingAnswer
-	at     time.Time
-}
-
-// endOrphanSoundsLocked cuts the chime input once a notification sound being
-// made, or still in the speaker's queue, has no owner left: its answers were
-// dropped, its hands came down, or their memberships ended. Its owners alone
-// own it, so it does not begin, or plays no further, after the last of them
-// is gone. Its producer reads its hands' memberships at each frame itself
-// (soundContext); this cuts what it already queued.
+// endOrphanSoundsLocked cuts the chime input once the notification sound
+// under way, being made or still playing from the speaker, has no owner
+// left: its answers were dropped, its hands came down, or their memberships
+// ended. Its owners alone own it, so it does not begin, or plays no further,
+// after the last of them is gone. Its producer reads its hands' memberships
+// at each frame itself (soundContext); this cuts what it already queued.
 func (s *Supervisor) endOrphanSoundsLocked() {
-	s.pruneQueuedLocked()
-	orphan := s.chimeCancel != nil && !s.ownedLocked(s.chimeOwners)
-	for _, q := range s.queued {
-		orphan = orphan || !s.ownedLocked(q.owners)
-	}
-	if orphan {
+	if s.chimeCancel != nil && !s.ownedLocked(s.chimeOwners) {
 		s.cutChimeLocked(true)
 	}
 }
@@ -628,34 +622,20 @@ func (s *Supervisor) ownedLocked(owners []*pendingAnswer) bool {
 	})
 }
 
-// pruneQueuedLocked forgets the queued notification sounds that have played
-// out.
-func (s *Supervisor) pruneQueuedLocked() {
-	s.queued = slices.DeleteFunc(s.queued, func(q queuedSound) bool { return time.Since(q.at) >= chimeQueueLasts })
-}
-
-// cutChimeLocked cuts the chime input: the notification sound being made, and
-// every one still in the speaker's queue, with whatever else plays there.
-// With rearm, each of their owners still waiting sounds again at the next
-// gap: a notification counts as given only once it played out.
+// cutChimeLocked cuts the chime input: the notification sound under way,
+// being made or still playing from the speaker, with whatever else plays
+// there. With rearm, each of its owners still waiting sounds again at the
+// next gap: a notification counts as given only once it played out.
 func (s *Supervisor) cutChimeLocked(rearm bool) {
-	s.pruneQueuedLocked()
-	again := func(owners []*pendingAnswer) {
-		for _, p := range owners {
+	if s.chimeCancel != nil {
+		s.chimeCancel() // even one whose playback has not begun
+		for _, p := range s.chimeOwners {
 			if rearm && slices.Contains(s.pending, p) {
 				p.chimed = false
 			}
 		}
+		s.chimeCancel, s.chimeCtx, s.chimeOwners, s.chimeDraining = nil, nil, nil, false
 	}
-	if s.chimeCancel != nil {
-		s.chimeCancel() // even one whose playback has not begun
-		again(s.chimeOwners)
-		s.chimeCancel, s.chimeCtx, s.chimeOwners = nil, nil, nil
-	}
-	for _, q := range s.queued {
-		again(q.owners)
-	}
-	s.queued, s.chimeQueuedAt = nil, time.Time{}
 	s.cfg.Speaker.Cancel(audio.InputChime)
 }
 
@@ -934,18 +914,11 @@ func (s *Supervisor) neverMindLocked(sessionID string) {
 	})
 }
 
-// answerSoundLocked reports whether an answer sound is being made or may
-// still play from the speaker's queue.
+// answerSoundLocked reports whether the sound under way, being made or still
+// playing from the speaker, is an answer sound.
 func (s *Supervisor) answerSoundLocked() bool {
-	s.pruneQueuedLocked()
-	return (s.chimeCancel != nil && !s.chimeHands) || slices.ContainsFunc(s.queued, func(q queuedSound) bool { return !q.hands })
+	return s.chimeCancel != nil && !s.chimeHands
 }
-
-// chimeQueueLasts is how long a notification sound may still play once its
-// last frame is queued: the speaker queues up to 200 ms of an input ahead,
-// and the device buffers about 80 ms more (internal/audio), with room for a
-// device that grants a larger buffer.
-const chimeQueueLasts = 400 * time.Millisecond
 
 // cutDriverLocked stops the speech of ex's voice, which drives its own turn,
 // at once, and keeps it open: its vendor hears the interruption and answers
@@ -1113,18 +1086,20 @@ func (s *Supervisor) open(ex *exchange, voice Voice, x *Exchange, chime bool) {
 // playChime plays pcm on the chime input, in 20 ms frames, and reports event
 // at its first frame. Each Write reads ctx and queues nothing once it is done
 // (audio.Playback.Write), so a sound whose owner is gone (soundContext) writes
-// no further frame.
-func (s *Supervisor) playChime(ctx context.Context, pcm []byte, event, sessionID string) {
+// no further frame. It returns the playback, and the error of a Write that
+// refused a frame.
+func (s *Supervisor) playChime(ctx context.Context, pcm []byte, event, sessionID string) (Playback, error) {
 	pb := s.cfg.Speaker.Begin(audio.InputChime)
 	const frame = 960 // 20 ms at 24 kHz mono PCM16
 	for off := 0; off < len(pcm); off += frame {
 		if err := pb.Write(ctx, pcm[off:min(off+frame, len(pcm))], ChimeFormat); err != nil {
-			return
+			return pb, err
 		}
 		if off == 0 {
 			s.timing(event, sessionID, time.Now())
 		}
 	}
+	return pb, nil
 }
 
 // readEvents follows a session's events until they end. A voice that drives
@@ -1732,12 +1707,14 @@ func (s *Supervisor) offer() {
 	if unchimed {
 		// The sound waits for a gap with no transcript word (R10). One sound
 		// for every answer, or every hand, that has not had one: those that
-		// land together, or while their sound plays, share it, so sounds
-		// never overlap on the one input. The other sound plays first.
+		// land together, or while their sound is being made, share it, so
+		// sounds never overlap on the one input. The other sound plays first,
+		// and a sound whose every frame is written plays out before the next
+		// begins: a hand raised then is not counted as sounded by it.
 		if s.voiceSpeaking || now.Sub(s.lastHeard) < s.cfg.SoundGap {
 			return
 		}
-		if s.chimeCancel != nil && s.chimeHands != hands {
+		if s.chimeCancel != nil && (s.chimeHands != hands || s.chimeDraining) {
 			return
 		}
 		var owners []*pendingAnswer
@@ -1765,16 +1742,29 @@ func (s *Supervisor) offer() {
 		ctx := newSoundContext(s.ctx, meeting, owners)
 		s.chimeCancel, s.chimeCtx, s.chimeHands, s.chimeOwners = ctx.cancel, ctx, hands, owners
 		s.spawn(func() {
-			s.playChime(ctx, pcm, event, sessionID)
+			pb, err := s.playChime(ctx, pcm, event, sessionID)
+			if err == nil {
+				s.mu.Lock()
+				if ctx == s.chimeCtx {
+					s.chimeDraining = true
+				}
+				s.mu.Unlock()
+				// Its owners keep it until the speaker has played its last
+				// frame, however late: only then has it sounded, and until then
+				// their going cuts it (endOrphanSoundsLocked).
+				err = pb.Drain(ctx)
+			}
 			ctx.cancel()
 			s.mu.Lock()
 			defer s.mu.Unlock()
-			if ctx == s.chimeCtx {
-				// Its last frames still play from the speaker's queue.
-				s.chimeQueuedAt = time.Now()
-				s.queued = append(s.queued, queuedSound{hands: hands, owners: s.chimeOwners, at: s.chimeQueuedAt})
-				s.chimeCancel, s.chimeCtx, s.chimeOwners = nil, nil, nil
-				s.endOrphanSoundsLocked() // an owner may have gone while it was made
+			if ctx != s.chimeCtx {
+				return // cut meanwhile
+			}
+			s.chimeCancel, s.chimeCtx, s.chimeOwners, s.chimeDraining = nil, nil, nil, false
+			if err != nil {
+				// Its own authority ended it (its meeting, or the membership of
+				// its last hand): what is still queued of it plays no further.
+				s.cfg.Speaker.Cancel(audio.InputChime)
 			}
 		})
 		return
