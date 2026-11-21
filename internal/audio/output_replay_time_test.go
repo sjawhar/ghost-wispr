@@ -5,6 +5,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/sjawhar/ghost-wispr/internal/monoclock"
 )
 
 // lockAfterSoundStream reports, with discard, that the device discarded its
@@ -55,7 +57,9 @@ func (s *lockAfterSoundStream) Close() error     { s.held.Wait(); return nil }
 // the replay's caller took the Output's lock, not when the replay's write
 // returned: another goroutine held the lock for 150 ms, and the speech's
 // times came 150 ms late, where main's are those of the write (Sol's review
-// of #148 at 6ec0b3c). The control's device discards nothing.
+// of #148 at 6ec0b3c). It fails too if an event's AtMono is not
+// CLOCK_MONOTONIC read with its At, as when the mixer keeps its reading from
+// before the replay. The control's device discards nothing.
 func TestAReplayedFrameIsTakenWhenItsWriteReturned(t *testing.T) {
 	for _, discard := range []bool{false, true} {
 		t.Run(fmt.Sprintf("the first frame discarded %v", discard), func(t *testing.T) {
@@ -65,6 +69,7 @@ func TestAReplayedFrameIsTakenWhenItsWriteReturned(t *testing.T) {
 			if err := out.Begin(InputVoice, nil).Write(testContext(t), constant(48000, 10*time.Millisecond, 1000), mono48k); err != nil {
 				t.Fatal(err)
 			}
+			base := monoclock.Now()
 			start()
 			began := probeVoiceEvent(t, events, true)
 			ended := probeVoiceEvent(t, events, false)
@@ -77,6 +82,10 @@ func TestAReplayedFrameIsTakenWhenItsWriteReturned(t *testing.T) {
 			for _, e := range []SpeechEvent{began, ended} {
 				if lag := e.At.Sub(sound); lag < 0 || lag >= 100*time.Millisecond {
 					t.Errorf("the speech's %s came %v after its write returned, want that write's time (started %v)", map[bool]string{true: "start", false: "end"}[e.Started], lag, e.Started)
+				}
+				wall, mono := e.At.Sub(base.Wall), time.Duration(e.AtMono-base.Mono)
+				if d := wall - mono; d > time.Millisecond || d < -time.Millisecond {
+					t.Errorf("the speech's %s came %v after the test's reading on the wall clock, %v on CLOCK_MONOTONIC: its AtMono was not read with its At", map[bool]string{true: "start", false: "end"}[e.Started], wall, mono)
 				}
 			}
 		})
