@@ -916,7 +916,9 @@ func (s *Supervisor) onTranscriptLocked(t *Transcript) {
 			s.neverMindLocked(s.cfg.Session())
 		case same && !ex.answering:
 			if ex.drives {
-				s.driverHeardLocked(ex, t, m.Rest, true)
+				// The wake is the call this exchange already took: a turn
+				// these words begin after the voice spoke does not follow it.
+				s.driverHeardLocked(ex, t, m.Rest)
 			} else if !ex.stale(t) { // else the answered call, sent late
 				s.turnLocked(ex, t, m.Rest)
 			}
@@ -1001,7 +1003,7 @@ func (s *Supervisor) onTranscriptLocked(t *Transcript) {
 		return
 	}
 	if ex.drives && ex.answer == nil {
-		s.driverHeardLocked(ex, t, t.Text, false)
+		s.driverHeardLocked(ex, t, t.Text)
 	}
 	if !ex.answering && !ex.drives {
 		if !ex.stale(t) { // else a late result of a turn answered already
@@ -1022,14 +1024,16 @@ func (s *Supervisor) onTranscriptLocked(t *Transcript) {
 // stays. When the voice answered a turn before any result of it came, in one
 // speech or several, that turn's late result begins it (answeredUnheard), as
 // main begins a new turn, and the turn heard before is dropped. Once a later
-// turn has begun, or if it is an earlier turn's, it is nothing. byName says
-// words follow the wake phrase, which a turn they begin keeps (turnByName).
-func (s *Supervisor) driverHeardLocked(ex *exchange, t *Transcript, words string, byName bool) {
+// turn has begun, or if it is an earlier turn's, it is nothing. A turn begun
+// here, after the voice spoke, does not follow the wake phrase (turnByName):
+// a wake in its result is the call the exchange already took, and a new call
+// begins its turn where the wake is read.
+func (s *Supervisor) driverHeardLocked(ex *exchange, t *Transcript, words string) {
 	if !ex.stale(t) {
 		if ex.newTurn {
 			ex.newTurn, ex.turnFrom = false, ex.turnEnd
 			ex.turn, ex.interim, ex.turnFinal = nil, "", false
-			ex.followUpTurn, ex.turnByName = ex.followUpTimer != nil && !ex.askedBack, byName
+			ex.followUpTurn, ex.turnByName = ex.followUpTimer != nil && !ex.askedBack, false
 		}
 		s.disarmFollowUpLocked(ex)
 		s.turnLocked(ex, t, words)
@@ -1043,7 +1047,7 @@ func (s *Supervisor) driverHeardLocked(ex *exchange, t *Transcript, words string
 		// still a new turn.
 		ex.turnFrom = from
 		ex.turn, ex.interim, ex.turnFinal = nil, "", false
-		ex.followUpTurn, ex.turnByName = ex.followUpTimer != nil && !ex.askedBack, byName
+		ex.followUpTurn, ex.turnByName = ex.followUpTimer != nil && !ex.askedBack, false
 		s.turnLocked(ex, t, words)
 	} else if ex.ofTurn(t) {
 		s.turnLocked(ex, t, words)

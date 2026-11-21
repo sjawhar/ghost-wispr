@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -56,18 +57,23 @@ func probeResultFrame(text string, final bool) string {
 // final result counts as one that heard nothing: the false-wake probe then
 // scored a socket that sent no results at all as hours of speech with no
 // false wake (Sol's review of #135 at 21bbef7: finals 0, false_wakes 0,
-// per_hour 0), and the short probe could keep an interim as the last thing
-// heard. A socket that sends no result, or only an interim, must fail; the
-// control sends a final, which comes back marked final.
+// per_hour 0). A socket that sends no result, or only an interim, must fail.
+// The controls send a final, which comes back marked final, and an empty
+// final, which comes back too, since it closes its interims' segment (Sol's
+// review of #155 at 1ce434e).
 func TestProbeTranscribeNeedsAFinal(t *testing.T) {
 	for _, tc := range []struct {
 		name    string
 		results []string
 		ok      bool
+		want    []probeResult
 	}{
-		{"no result", nil, false},
-		{"only an interim", []string{probeResultFrame("Whisper, what", false)}, false},
-		{"an interim and a final", []string{probeResultFrame("Whisper, what", false), probeResultFrame("Whisper, what's the status?", true)}, true},
+		{"no result", nil, false, nil},
+		{"only an interim", []string{probeResultFrame("Whisper, what", false)}, false, nil},
+		{"an interim and a final", []string{probeResultFrame("Whisper, what", false), probeResultFrame("Whisper, what's the status?", true)}, true,
+			[]probeResult{{"Whisper, what", false}, {"Whisper, what's the status?", true}}},
+		{"an interim and an empty final", []string{probeResultFrame("Whisper, what", false), probeResultFrame("", true)}, true,
+			[]probeResult{{"Whisper, what", false}, {"", true}}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			old := probeHost
@@ -84,8 +90,8 @@ func TestProbeTranscribeNeedsAFinal(t *testing.T) {
 			if err != nil {
 				t.Fatalf("control: %v", err)
 			}
-			if len(heard) != 2 || heard[0].Final || !heard[1].Final {
-				t.Fatalf("control: heard %+v, want the interim then the final, marked", heard)
+			if !slices.Equal(heard, tc.want) {
+				t.Fatalf("control: heard %+v, want %+v", heard, tc.want)
 			}
 		})
 	}
@@ -102,6 +108,56 @@ func TestProbeClipsKeepWhetherEachResultWasFinal(t *testing.T) {
 	}
 	if !bytes.Contains(raw, []byte(`"heard":[{"text":"Whisper, what","final":false},{"text":"Whisper, what's the status?","final":true}]`)) {
 		t.Fatalf("a clip saved as %s, want each result's text and whether it was final", raw)
+	}
+}
+
+// TestEmptyFinalsSeparateFalseWakeStretches fails if the false-wake probe
+// counts two waking interims as one stretch when each is closed by an empty
+// final: the empty finals were dropped before the stretches were cut (Sol's
+// review of #155 at 1ce434e: one stretch, for both keyterm runs). The
+// meeting is cached silence, and a local endpoint gives the results, so no
+// request goes out.
+func TestEmptyFinalsSeparateFalseWakeStretches(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Mkdir(filepath.Join(dir, "corpus"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "corpus", "m.pcm"), make([]byte, 32000), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "corpus", "m.pcm.inserted"), []byte("0"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GHOST_WISPR_DEEPGRAM_API_KEY", "test-key")
+	t.Setenv("GHOST_WISPR_WAKE_PROBE_DIR", dir)
+	t.Setenv("GHOST_WISPR_AMI_WORDS", dir)
+	t.Setenv("GHOST_WISPR_WAKE_PROBE_PROJECTS", "INFRA")
+	oldHost, oldMeetings := probeHost, probeMeetings
+	probeMeetings = []string{"m"}
+	probeHost = probeEndpoint(t,
+		probeResultFrame("Whisper, what?", false), probeResultFrame("", true),
+		probeResultFrame("Whisper, who?", false), probeResultFrame("", true))
+	t.Cleanup(func() { probeHost, probeMeetings = oldHost, oldMeetings })
+	TestProbeWakeFalseRate(t)
+	raw, err := os.ReadFile(filepath.Join(dir, "falserate-summary.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var summary map[string]json.RawMessage // the runs, and the corpus's own numbers
+	if err := json.Unmarshal(raw, &summary); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"without Whisper", "with Whisper"} {
+		var row struct {
+			Wakes  int `json:"false_wakes"`
+			Finals int `json:"finals"`
+		}
+		if err := json.Unmarshal(summary[name], &row); err != nil {
+			t.Fatalf("the %q run in %s: %v", name, raw, err)
+		}
+		if row.Wakes != 2 || row.Finals != 0 {
+			t.Errorf("%s: %d false-wake stretches and %d finals with text, want 2 and 0", name, row.Wakes, row.Finals)
+		}
 	}
 }
 

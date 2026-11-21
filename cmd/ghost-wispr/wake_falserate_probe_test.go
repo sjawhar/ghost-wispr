@@ -147,16 +147,22 @@ func TestProbeWakeFalseRate(t *testing.T) {
 				mu.Lock()
 				defer mu.Unlock()
 				for _, h := range heard {
-					stretch = append(stretch, h)
-					if _, ok := detector.Find(h.Text); ok {
-						woke = true
+					if h.Text != "" {
+						stretch = append(stretch, h)
+						if _, ok := detector.Find(h.Text); ok {
+							woke = true
+						}
 					}
 					if !h.Final {
 						continue
 					}
-					finals++
-					if mentions.MatchString(h.Text) {
-						mention++
+					// A final ends the stretch, with text or none: an empty
+					// final closes the segment its interims belonged to.
+					if h.Text != "" {
+						finals++
+						if mentions.MatchString(h.Text) {
+							mention++
+						}
 					}
 					if woke {
 						wakes = append(wakes, wake{Chunk: c, Results: stretch})
