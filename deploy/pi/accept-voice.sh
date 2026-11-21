@@ -941,26 +941,32 @@ wait_spoken() {
 
 # ---- recordings ----
 
-# start_recording DEVICE FILE: record DEVICE to FILE. A background loop writes anchors, "US BYTES"
-# lines: by the driver's clock US (microseconds, read just after the size), BYTES of the file were
-# written. recording-times.awk bounds each sound's time with the anchors after it, late only by how
-# late its best anchor was read (analyse_recording). The size comes from arecord's own fdinfo, whose
-# pos is the bytes it has written, read by the shell with no fork: a fork between the size and the
-# clock, on a loaded machine, makes every anchor late by as long as the fork takes, and no later
-# anchor then makes up for it. Where /proc does not show that fd, the size comes from wc.
+# start_recording DEVICE FILE: record DEVICE to FILE with arecord, until stop_recording. A background
+# loop writes anchors, "US BYTES" lines: by the driver's clock US (microseconds, read just after the
+# size), BYTES of the file were written. recording-times.awk bounds each sound's time with the
+# anchors after it, late only by how late its best anchor was read (analyse_recording). The size
+# comes from arecord's own fdinfo, whose pos is the bytes it has written, read by the shell with no
+# fork: a fork between the size and the clock, on a loaded machine, makes every anchor late by as
+# long as the fork takes, and no later anchor then makes up for it. Where /proc does not show that
+# fd, the size comes from wc.
+#
+# recording_started is a time no later than the sound in the file's first sample: arecord opens its
+# device, then creates the file and writes its whole 44-byte header, and only then reads, which
+# starts the capture (alsa-utils aplay.c capture(): set_params, then the file, begin_wave, then
+# pcm_read; for arecord the start threshold is one frame). So a read of the file's size that found
+# less than the header, or no file, came before the capture began; the last such read, less
+# capture_latency_us, is the recording's start, or the clock just before arecord started, less the
+# same, when no read found less than the header. An arecord slow to open its device makes no time
+# late; one held back between its header and its first read makes the early times early by as long.
 recording=
 anchors_file=
 recording_cut=false
 recording_started=
 recording_fdinfo=
-# start_recording DEVICE FILE: record DEVICE to FILE with arecord, until stop_recording.
-# recording_started is a time no later than the file's first sample: arecord opens its device, then
-# creates the file and writes its whole 44-byte header, and only then reads, which starts the
-# capture (alsa-utils aplay.c capture(): set_params, then the file, begin_wave, then pcm_read; for
-# arecord the start threshold is one frame). So a read of the file's size that found less than the
-# header, or no file, came before the capture began, and the last such read is the recording's
-# start; the clock just before arecord started bounds it when every read found the header. An
-# arecord slow to open its device, or held back before its first read, moves no time.
+# capture_latency_us is how long before the capture began the first sample's sound may have reached
+# the microphone: the device's converter filter, its own buffer and the USB transfer, a few
+# milliseconds for a plain USB microphone.
+readonly capture_latency_us=5000
 start_recording() {
   local deadline size seen before link tick
   recording=$2
@@ -969,7 +975,7 @@ start_recording() {
   recording_fdinfo=
   : >"$anchors_file"
   # arecord captures nothing before it starts: the earliest the file's first sample can be.
-  recording_started=${EPOCHREALTIME//[!0-9]/}
+  recording_started=$((${EPOCHREALTIME//[!0-9]/} - capture_latency_us))
   arecord -q -D "$1" -f S16_LE -r "$sample_rate" -c 1 -t wav --buffer-time=40000 --period-time=10000 \
     "$recording" 2>"$work_dir/arecord.err" &
   arecord_pid=$!
@@ -1001,7 +1007,7 @@ start_recording() {
       break
     fi
     # Less than the header when its size was read, after before: the capture began later.
-    ((size < wav_header_bytes && before > recording_started)) && recording_started=$before
+    ((size < wav_header_bytes && before - capture_latency_us > recording_started)) && recording_started=$((before - capture_latency_us))
     kill -0 "$arecord_pid" 2>/dev/null || unknown "recording: arecord stopped: $(tr '\n' ' ' <"$work_dir/arecord.err")"
     ((seen / 1000 < deadline)) || unknown "recording: arecord wrote no audio from $1 within 5 s"
     read -r -t 0.01 -u "$tick" _ || true

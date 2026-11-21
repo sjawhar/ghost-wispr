@@ -1010,16 +1010,17 @@ def arecord(args):
         f.write(bytes(44))
         f.flush()
         # The file's first sample is captured once its whole header is written, as arecord's first
-        # read starts its capture only then. arecord-slow-start reads 1.5 s after the header, as an
-        # arecord its machine holds back between its header and its first read does: the driver's
-        # start, read before the header, is then 1.5 s early, and so is every early bound
-        # (joined-words-unsure needs over 1 s: its words begin 1 s after the go-ahead).
-        # arecord-hold-200 holds the first sample, and what follows it, 200 ms before writing any,
-        # as a machine that holds arecord back between its read and its write does: the driver's
-        # start still comes no later than the sample.
+        # read starts its capture only then, and stamped in whole milliseconds rounded up, so never
+        # before the header. arecord-slow-start reads 1.5 s after the header, as an arecord its
+        # machine holds back between its header and its first read does: the driver's start, read
+        # before the header, is then 1.5 s early, and so is every early bound (joined-words-unsure
+        # needs over 1 s: its words begin 1 s after the go-ahead). arecord-hold-200 holds the first
+        # sample, and what follows it, 200 ms before writing any, longer than a real arecord can
+        # without an overrun, so that a start taken from the first sample's landing fails at any
+        # load: the driver's start still comes no later than the sample.
         if "arecord-slow-start" in SCENARIO:
             time.sleep(1.5)
-        begun = now_ms()
+        begun = -(-time.time_ns() // 1_000_000)
         log_to("recordings", "%s %d" % (path, begun))
         if "arecord-hold-200" in SCENARIO:
             time.sleep(0.2)
@@ -1826,9 +1827,9 @@ launch barge-backchannel-late answer-until-clip,backchannel-stops,late-clip yes 
 # shows the stream running only 3 s after it starts; today's draining path, heard 800 ms on (the
 # negative control); audio heard 50 ms on; a stop just before a pause in the speech whose next word
 # still plays 150 ms later, recorded by an arecord that starts at once (FAIL: even the early bound of
-# the word's end is over the bound) and by one slow to start (UNKNOWN: the early bound is not); a
-# word 1.1 s on, after a silence long enough to pass for the end; a word 150 ms on with the speech
-# already quiet for 1 s at the stop, which the rig cannot time (UNKNOWN);
+# the word's end is over the bound) and by one that reads 1.5 s after its header (UNKNOWN: the early
+# bound is not); a word 1.1 s on, after a silence long enough to pass for the end; a word 150 ms on
+# with the speech already quiet for 1 s at the stop, which the rig cannot time (UNKNOWN);
 # a word still playing as the next question goes in: well before its chime, just before it and
 # apart, running into it, and after it, before the answer's first audio; a quiet chime, which must
 # pass, and a word that runs into it; a louder wake sound whose echo the rig hears for 320 ms, which
@@ -1849,9 +1850,10 @@ readonly cancel_args="--step playback-cancel --stops 2 --playback-seconds 3 --qu
 launch cancel long,asound,stop-rounds-2 yes -- $cancel_args
 # shellcheck disable=SC2086
 launch cancel-late-stop long,asound,stop-rounds-2,late-clip yes -- $cancel_args
-# A good cancel recorded by an arecord that holds its first 200 ms before writing it (arecord-hold-200):
-# still a pass, as the start, read before the header, comes no later than the first sample. A start
-# taken from the first sample's landing would be 200 ms late, and so would every early bound: FAIL.
+# A good cancel recorded by an arecord that holds its first 200 ms before writing it (arecord-hold-200),
+# longer than a real arecord can: still a pass, as the start, read before the header, comes no later
+# than the first sample. A start taken from the first sample's landing would be 200 ms late, and so
+# would every early bound: FAIL.
 # shellcheck disable=SC2086
 launch cancel-held-start long,asound,stop-rounds-2,arecord-hold-200 yes -- $cancel_args
 # shellcheck disable=SC2086
@@ -2651,8 +2653,9 @@ expect_rc joined-words-silent 1
 expect_line joined-words-silent 'PASS: joined: the hand sound reached the Jabra'
 expect_line joined-words-silent 'FAIL: joined: no words at the rig microphone between the end of the go-ahead and voice_spoken'
 expect_restored joined-words-silent
-# An arecord slow to start: the words' onset is before the go-ahead's end at its early bound and
-# after it at its late bound, so whether they began after the go-ahead is UNKNOWN, never PASS.
+# An arecord that reads 1.5 s after its header: the words' onset is before the go-ahead's end at its
+# early bound and after it at its late bound, so whether they began after the go-ahead is UNKNOWN,
+# never PASS.
 expect_rc joined-words-unsure 2
 expect_line joined-words-unsure 'PASS: joined: the hand sound reached the Jabra'
 expect_line joined-words-unsure 'UNKNOWN: joined: a sound at the rig microphone longer than the wake sound starts between '
