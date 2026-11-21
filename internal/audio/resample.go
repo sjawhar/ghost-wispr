@@ -111,12 +111,22 @@ func (r *resampler) push(s float32) {
 }
 
 // lag is how many input samples the resampler holds that have not reached
-// its output: what the end of a stream has to flush with silence.
+// the centre of its output: how far a pushed sample's output is delayed.
 func (r *resampler) lag() int {
 	if r.bypass() {
 		return 0
 	}
 	return r.taps / 2
+}
+
+// reach is how many input samples a pushed sample stays in the filter: the
+// end of a stream pushes this many of silence, so that the whole of the
+// filter's response to its last sample plays.
+func (r *resampler) reach() int {
+	if r.bypass() {
+		return 0
+	}
+	return r.taps
 }
 
 func sinc(x float64) float64 {

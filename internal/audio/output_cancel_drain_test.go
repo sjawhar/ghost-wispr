@@ -360,64 +360,193 @@ func TestDrainWaitsForItsTailWhenAnotherPlaybackFollows(t *testing.T) {
 	}
 }
 
-// TestAPlaybacksFrameIsTheLastItsAudioReaches fails if the frame a playback's
-// Drain waits for comes before the last frame that holds its audio, at any of
-// ten input rates on six device rates, ending at several positions in a
-// frame, with a later playback that keeps the resampler running and without:
-// Drain returned while its audio waited (Sol's review of #142 at 7da737b
-// found 350 such cases). The frame may come one frame after the last that
-// holds audio a sample rounds to: the far edge of the filter's response to
-// the last sample is below one step of a sample.
+// TestAPlaybacksFrameIsTheLastItsAudioReaches fails, at any of ten input
+// rates on six device rates and ending at several positions in a frame, if
+// a playback's Drain could return once a frame is written while a later
+// frame still holds its audio, or if an input that runs out drops part of the
+// filter's response to its last audio. Sol's reviews of #142 found 350 such
+// playbacks at 7da737b, then, at dd08536, a Drain that returned between the
+// write of one frame and the mix of the next, and an input that ended 29
+// samples of response early. The answer comes from the same audio followed by
+// a later playback of silence, which keeps the filter running, so that a
+// truncated end cannot define it: the audio alone must sound the same, and at
+// each frame boundary Drain's own condition (Playback.Drain) is checked. A
+// playback's frame may come one frame after the last that holds audio a
+// sample rounds to: the filter's far edge is below one step of a sample.
 func TestAPlaybacksFrameIsTheLastItsAudioReaches(t *testing.T) {
-	early, total := 0, 0
+	type run struct {
+		pcm     []int16
+		frames  uint64
+		drainAt uint64 // the first frame whose write would let Drain return; 0 is none
+		seq     uint64
+	}
+	render := func(from, to, m int, next bool) run {
+		in := &outputInput{gen: &playGen{}, tails: make([]tail, 0, 4)}
+		in.setRate(from)
+		in.contrib, in.landed = make([]float32, to/100), make([]uint32, 2*to/100)
+		a := &Playback{}
+		signal := make([]int16, m)
+		for i := range signal {
+			signal[i] = 10000
+		}
+		in.push(a, pcm16Bytes(signal), 1, m)
+		if next {
+			n := from/100 + 100
+			in.push(&Playback{}, make([]byte, 2*n), 1, n)
+		}
+		var r run
+		for seq := uint64(1); !in.idle(); seq++ {
+			if seq > 40 {
+				t.Fatal("fixture: the input never ran out")
+			}
+			in.seq = seq
+			in.render(to)
+			clear(in.landed) // the mixer moves these on
+			for _, v := range in.contrib {
+				r.pcm = append(r.pcm, clip(v))
+			}
+			r.frames = seq
+			if r.drainAt == 0 && a.pending == 0 && (in.last != a || in.idle()) && a.seq <= seq {
+				r.drainAt = seq
+			}
+		}
+		r.seq = a.seq
+		return r
+	}
+	failures := 0
+	fail := func(format string, args ...any) {
+		if failures++; failures <= 8 {
+			t.Errorf(format, args...)
+		}
+	}
+	total := 0
 	for _, from := range []int{8000, 16000, 22050, 24000, 32000, 44100, 48000, 96000, 192000, 384000} {
 		for _, to := range []int{8000, 16000, 24000, 44100, 48000, 96000} {
-			for _, next := range []bool{false, true} {
-				for delta := -33; delta <= 1; delta++ {
-					m := from/100 + delta
-					in := &outputInput{gen: &playGen{}, tails: make([]tail, 0, 4)}
-					in.setRate(from)
-					in.contrib, in.landed = make([]float32, to/100), make([]uint32, 2*to/100)
-					a, b := &Playback{}, &Playback{}
-					signal := make([]int16, m)
-					for i := range signal {
-						signal[i] = 10000
+			for delta := -33; delta <= 1; delta++ {
+				m := from/100 + delta
+				ref := render(from, to, m, true)
+				lastAudio := uint64(0)
+				for i, v := range ref.pcm {
+					if v != 0 {
+						lastAudio = uint64(i/(to/100)) + 1
 					}
-					in.push(a, pcm16Bytes(signal), 1, m)
-					if next {
-						n := from/100 + 100
-						in.push(b, make([]byte, 2*n), 1, n)
-					}
-					last := uint64(0)
-					for seq := uint64(1); !in.idle(); seq++ {
-						if seq > 20 {
-							t.Fatal("fixture: the input never ran out")
-						}
-						in.seq = seq
-						in.render(to)
-						clear(in.landed) // the mixer moves these on
-						for _, v := range in.contrib {
-							if clip(v) != 0 {
-								last = seq
+				}
+				for _, next := range []bool{false, true} {
+					total++
+					r := ref
+					if !next {
+						r = render(from, to, m, false)
+						lost := 0
+						for i, v := range ref.pcm {
+							if i >= len(r.pcm) && v != 0 || i < len(r.pcm) && r.pcm[i] != v {
+								lost++
 							}
 						}
-					}
-					total++
-					if a.seq < last {
-						early++
-						if early <= 5 {
-							t.Errorf("%d Hz on %d Hz, %d samples, a later playback %v: the playback's frame is %d, its audio reaches frame %d", from, to, m, next, a.seq, last)
+						if lost > 0 {
+							fail("%d Hz on %d Hz, %d samples: alone, %d samples of its sound differ from the same audio with silence after it", from, to, m, lost)
 						}
 					}
-					if a.seq > last+1 {
-						t.Errorf("%d Hz on %d Hz, %d samples, a later playback %v: the playback's frame is %d, its audio ends in frame %d", from, to, m, next, a.seq, last)
+					if r.drainAt != 0 && r.drainAt < lastAudio {
+						fail("%d Hz on %d Hz, %d samples, a later playback %v: Drain could return once frame %d was written, and frame %d holds its audio", from, to, m, next, r.drainAt, lastAudio)
+					}
+					if r.seq > lastAudio+1 {
+						fail("%d Hz on %d Hz, %d samples, a later playback %v: the playback's frame is %d, its audio ends in frame %d", from, to, m, next, r.seq, lastAudio)
 					}
 				}
 			}
 		}
 	}
-	if early > 0 {
-		t.Errorf("%d of %d playbacks had a frame before the last that holds their audio", early, total)
+	if failures > 0 {
+		t.Errorf("%d failures in %d playbacks", failures, total)
+	}
+}
+
+// pacedHeldStream is a playback stream whose writes return at once, as
+// ALSA's null PCM does, so the mixer's pacer holds it to real time; its
+// twelfth write waits until release closes, having sent how many samples of
+// it hold audio on entered.
+type pacedHeldStream struct {
+	writes  int // only the mixer touches it
+	entered chan int
+	release chan struct{}
+}
+
+func (s *pacedHeldStream) Write(frame []int16) error {
+	if s.writes++; s.writes == 12 {
+		s.entered <- probeNonzero(frame)
+		<-s.release
+	}
+	return nil
+}
+
+func (*pacedHeldStream) Drop() (int, error) { return 0, nil }
+func (*pacedHeldStream) Close() error       { return nil }
+
+// TestDrainWaitsThroughThePacersWait fails if a playback's Drain returns
+// while the mixer's pacer waits between two frames, with the next frame,
+// which the stream holds, still holding the filter's response to its audio:
+// the playback was marked for that frame only once its mix began (Sol's
+// review of #142 at dd08536). A later playback of silence keeps the filter
+// running. The control's audio needs no resampler, and its Drain returns.
+func TestDrainWaitsThroughThePacersWait(t *testing.T) {
+	for _, tc := range []struct{ rate, ending int }{{48000, 240}, {24000, 224}, {24000, 239}} {
+		t.Run(fmt.Sprintf("%d Hz, ending %d samples into a frame", tc.rate, tc.ending), func(t *testing.T) {
+			stream := &pacedHeldStream{entered: make(chan int, 1), release: make(chan struct{})}
+			gate := make(chan struct{})
+			out := NewOutput(OutputConfig{Open: func(string) (PlaybackStream, int, error) {
+				<-gate
+				return stream, 48000, nil
+			}})
+			open, release := sync.OnceFunc(func() { close(gate) }), sync.OnceFunc(func() { close(stream.release) })
+			t.Cleanup(func() {
+				release()
+				open()
+				_ = out.Close()
+			})
+			ctx := testContext(t)
+			format := AudioFormat{SampleRate: tc.rate, Channels: 1, Encoding: EncodingPCM16}
+			signal := make([]int16, tc.rate/10+tc.ending)
+			for i := range signal {
+				signal[i] = 10000
+			}
+			a := out.Begin(InputVoice)
+			if err := a.WriteAll(ctx, pcm16Bytes(signal), format); err != nil {
+				t.Fatal(err)
+			}
+			if err := out.Begin(InputVoice).WriteAll(ctx, make([]byte, 480), format); err != nil {
+				t.Fatal(err)
+			}
+			done := make(chan error, 1)
+			go func() { done <- a.Drain(ctx) }()
+			for deadline := time.Now().Add(3 * time.Second); ; time.Sleep(time.Millisecond) {
+				out.mu.Lock()
+				waiting := len(out.waiting) > 0
+				out.mu.Unlock()
+				if waiting {
+					break
+				}
+				if time.Now().After(deadline) {
+					t.Fatal("control: Drain never waited")
+				}
+			}
+			open()
+			var held int
+			select {
+			case held = <-stream.entered:
+			case <-ctx.Done():
+				t.Fatal(ctx.Err())
+			}
+			select {
+			case err := <-done:
+				if held > 0 {
+					t.Fatalf("Drain returned %v while the held twelfth write holds %d samples of its audio", err, held)
+				}
+			case <-time.After(100 * time.Millisecond):
+				if held == 0 {
+					t.Fatal("control: Drain did not return, and the held write holds none of its audio")
+				}
+			}
+		})
 	}
 }
 

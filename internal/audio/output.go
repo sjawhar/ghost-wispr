@@ -202,7 +202,7 @@ type outputInput struct {
 
 	rs resampler
 	// flush is how many samples of silence the resampler still needs to play
-	// out the last queued audio.
+	// out the whole of its response to the last queued audio (reach).
 	flush int
 	// last is the playback whose audio the stream took last.
 	last *Playback
@@ -641,7 +641,7 @@ func (in *outputInput) pull() (float32, *Playback) {
 	s := in.ring[in.head]
 	in.head = (in.head + 1) % len(in.ring)
 	in.n--
-	in.flush = in.rs.lag()
+	in.flush = in.rs.reach()
 	pb := in.segments[0].pb
 	pb.pending--
 	pb.played.add(in.rate, 1)
@@ -661,8 +661,11 @@ func (in *outputInput) pull() (float32, *Playback) {
 // counts each sample it takes at the stream position its output reaches,
 // after the resampler's delay (landed), and marks the frame for the
 // sample's playback, whose Drain waits for it. A playback whose samples the
-// resampler's filter still holds, as when a later playback keeps it running,
-// has audio in every frame until the last of them leaves the filter (tails).
+// resampler's filter still holds when the frame is done, as when a later
+// playback keeps it running, has audio in the next frame too, which this
+// input renders, as it flushes the filter until they leave (reach): it is
+// marked for that frame now, before the stream takes this one and Drain can
+// wake (tails).
 func (in *outputInput) render(rate int) {
 	if in.rs.from != in.rate || in.rs.to != rate {
 		in.rs.configure(in.rate, rate)
@@ -684,16 +687,6 @@ func (in *outputInput) render(rate int) {
 		copy(grown, in.landed)
 		in.landed = grown
 	}
-	// A playback whose last sample has left the filter has no audio here.
-	taps, kept := uint64(in.rs.taps), in.tails[:0]
-	for _, t := range in.tails {
-		if in.pushes-t.last < taps {
-			t.pb.seq = max(t.pb.seq, in.seq)
-			kept = append(kept, t)
-		}
-	}
-	clear(in.tails[len(kept):])
-	in.tails = kept
 	for i := range in.contrib {
 		in.contrib[i] = in.rs.output()
 		for range in.rs.step() {
@@ -712,6 +705,18 @@ func (in *outputInput) render(rate int) {
 			}
 		}
 	}
+	// The next frame's first output reads the last taps samples pushed: a
+	// playback with one of them has audio there. One whose last sample has
+	// left the filter has none.
+	taps, kept := uint64(in.rs.taps), in.tails[:0]
+	for _, t := range in.tails {
+		if in.pushes-t.last < taps {
+			t.pb.seq = max(t.pb.seq, in.seq+1)
+			kept = append(kept, t)
+		}
+	}
+	clear(in.tails[len(kept):])
+	in.tails = kept
 	if in.idle() {
 		in.rs.reset()
 		clear(in.tails)
