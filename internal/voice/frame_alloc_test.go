@@ -18,11 +18,11 @@ func (nopPlayback) Drain(context.Context) error                            { ret
 // nopVoiceSpeaker is the fake speaker with every voice playback a nopPlayback.
 type nopVoiceSpeaker struct{ *fakeSpeaker }
 
-func (s nopVoiceSpeaker) Begin(input string) Playback {
+func (s nopVoiceSpeaker) Begin(input string, owner any) Playback {
 	if input == audio.InputVoice {
 		return nopPlayback{}
 	}
-	return s.fakeSpeaker.Begin(input)
+	return s.fakeSpeaker.Begin(input, owner)
 }
 
 // TestAnExchangeFrameAllocatesNothing fails if writing one frame of an

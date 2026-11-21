@@ -187,9 +187,9 @@ type frameSpeaker struct {
 	chime     soundSpeaker
 }
 
-func (s *frameSpeaker) Begin(input string) voice.Playback {
+func (s *frameSpeaker) Begin(input string, owner any) voice.Playback {
 	if input != audio.InputVoice {
-		return s.chime.Begin(input)
+		return s.chime.Begin(input, owner)
 	}
 	p := &framePlayback{s: s}
 	s.mu.Lock()

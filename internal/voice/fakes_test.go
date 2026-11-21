@@ -27,6 +27,7 @@ type fakeSpeaker struct {
 	writes    map[string]int       // frames written per input
 	cancels   map[string]time.Time // last Cancel per input
 	speaking  map[string]bool      // an input's speech is under way
+	owners    map[string]any       // the owner of the playback that started an input's speech
 	gen       map[string]int       // bumps on each Cancel, ending its playbacks
 	finished  map[string]chan struct{}
 	listeners map[int]func(audio.SpeechEvent)
@@ -67,6 +68,7 @@ func newFakeSpeaker() *fakeSpeaker {
 		writes:       map[string]int{},
 		cancels:      map[string]time.Time{},
 		speaking:     map[string]bool{},
+		owners:       map[string]any{},
 		gen:          map[string]int{},
 		finished:     map[string]chan struct{}{},
 		listeners:    map[int]func(audio.SpeechEvent){},
@@ -150,7 +152,7 @@ func (s *fakeSpeaker) holdEvents() (release func()) {
 	})
 }
 
-func (s *fakeSpeaker) Begin(input string) Playback {
+func (s *fakeSpeaker) Begin(input string, owner any) Playback {
 	s.mu.Lock()
 	hold := s.hold[input]
 	s.mu.Unlock()
@@ -166,7 +168,7 @@ func (s *fakeSpeaker) Begin(input string) Playback {
 	case s.began <- input:
 	default:
 	}
-	pb := &fakePlayback{s: s, input: input, gen: s.gen[input]}
+	pb := &fakePlayback{s: s, input: input, owner: owner, gen: s.gen[input]}
 	if input == audio.InputChime {
 		s.chimes = append(s.chimes, pb)
 	}
@@ -248,9 +250,10 @@ func (s *fakeSpeaker) Cancel(input string) {
 		s.finished[input] = nil
 	}
 	if s.speaking[input] {
-		s.queueLocked(audio.SpeechEvent{Input: input, Started: false, At: time.Now(), Cancelled: true})
+		s.queueLocked(audio.SpeechEvent{Input: input, Started: false, At: time.Now(), Cancelled: true, Owner: s.owners[input]})
 	}
 	s.speaking[input] = false
+	delete(s.owners, input)
 	s.mu.Unlock()
 	s.signal()
 }
@@ -319,9 +322,10 @@ func (s *fakeSpeaker) finish(input string) {
 		s.finished[input] = nil
 	}
 	if s.speaking[input] {
-		s.queueLocked(audio.SpeechEvent{Input: input, Started: false, At: time.Now()})
+		s.queueLocked(audio.SpeechEvent{Input: input, Started: false, At: time.Now(), Owner: s.owners[input]})
 	}
 	s.speaking[input] = false
+	delete(s.owners, input)
 	s.mu.Unlock()
 	s.signal()
 }
@@ -342,6 +346,7 @@ func (s *fakeSpeaker) written(input string) int {
 type fakePlayback struct {
 	s     *fakeSpeaker
 	input string
+	owner any // Begin's owner
 	gen   int
 	first []byte // its first frame written
 	n     int    // frames written
@@ -370,7 +375,8 @@ func (p *fakePlayback) Write(ctx context.Context, frame []byte, format audio.Aud
 		s.finished[p.input] = make(chan struct{})
 	}
 	if !s.speaking[p.input] {
-		s.queueLocked(audio.SpeechEvent{Input: p.input, Started: true, At: time.Now()})
+		s.owners[p.input] = p.owner // the speech is this playback's owner's, as audio.Output's is
+		s.queueLocked(audio.SpeechEvent{Input: p.input, Started: true, At: time.Now(), Owner: p.owner})
 	}
 	s.speaking[p.input] = true
 	s.mu.Unlock()
@@ -462,6 +468,10 @@ type fakeSession struct {
 	says        []string
 	modes       []SayMode
 	sayErr      error
+	// endLate is how long after the speaker has played a speech the
+	// session reports its end (EventSpeechEnded), as a vendor's own report
+	// can trail the speaker's.
+	endLate time.Duration
 }
 
 func (s *fakeSession) Say(ctx context.Context, text string, mode SayMode) error {
@@ -476,6 +486,7 @@ func (s *fakeSession) Say(ctx context.Context, text string, mode SayMode) error 
 	}
 	s.says = append(s.says, text)
 	s.modes = append(s.modes, mode)
+	endLate := s.endLate
 	s.mu.Unlock()
 	s.send(EventAgentText, text)
 	pb := s.x.Out.Begin()
@@ -486,6 +497,7 @@ func (s *fakeSession) Say(ctx context.Context, text string, mode SayMode) error 
 	s.said <- text
 	go func() {
 		_ = pb.Drain(context.Background())
+		time.Sleep(endLate)
 		s.send(EventSpeechEnded, "")
 	}()
 	return nil

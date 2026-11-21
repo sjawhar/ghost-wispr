@@ -124,6 +124,9 @@ type OutputConfig struct {
 type SpeechEvent struct {
 	Input   string
 	Started bool // false: the speech ended
+	// Cancelled is true when a Cancel cut the speech: it took back audio the
+	// room had not heard, or dropped audio still queued.
+	Cancelled bool
 	// At is when the stream took the frame with the speech's first audio, on
 	// a start, or, on an end, the frame with its last audio, replayed after
 	// a Drop included: in each case once the stream's write returned, on the
@@ -135,9 +138,13 @@ type SpeechEvent struct {
 	// Played, on an end, is how much of the input's audio the stream took in
 	// the speech, less what a Cancel took back from the device.
 	Played time.Duration
-	// Cancelled is true when a Cancel cut the speech: it took back audio the
-	// room had not heard, or dropped audio still queued.
-	Cancelled bool
+	// Owner is the owner of the playback whose audio started the speech
+	// (Begin), on its start and on its end, whatever ended it: a cut, its
+	// end, or the stream's close. A listener tells whose speech an event is
+	// from it, not from when the event comes. Nil for a playback begun with
+	// none. The two flags sit together so the event stays under 80 bytes,
+	// which the listeners take by value.
+	Owner any
 }
 
 // Output plays audio on the speaker device through one playback stream that
@@ -226,6 +233,7 @@ type outputInput struct {
 	pushes uint64
 
 	speaking  bool
+	owner     any       // the owner of the playback that started the speech under way (SpeechEvent.Owner)
 	cancelled bool      // Cancel silenced its speech: the mixer takes it back and ends it
 	unsettled *playGen  // the generation the first Cancel ended in that speech, settling until it ends (endSpeech)
 	cancelAt  time.Time // when the first Cancel of the speech came
@@ -316,9 +324,10 @@ type segment struct {
 // playbacks in the order it was queued, so give an input one writer at a
 // time.
 type Playback struct {
-	out  *Output
-	in   *outputInput
-	wake chan struct{} // signalled when a Write or Drain of it may go on
+	out   *Output
+	in    *outputInput
+	owner any           // whose speech it is (Begin); its events carry it (SpeechEvent.Owner)
+	wake  chan struct{} // signalled when a Write or Drain of it may go on
 	// Guarded by out.mu:
 	gen     *playGen
 	pending int    // samples queued and not yet taken by the stream
@@ -394,8 +403,11 @@ func NewOutput(cfg OutputConfig) *Output {
 	return o
 }
 
-// Begin starts a playback on input, such as InputVoice.
-func (o *Output) Begin(input string) *Playback {
+// Begin starts a playback on input, such as InputVoice. owner, which may be
+// nil, says whose speech it is: a speech its audio starts carries owner on
+// its start and on its end (SpeechEvent.Owner), however late they are
+// delivered.
+func (o *Output) Begin(input string, owner any) *Playback {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	in := o.inputs[input]
@@ -404,7 +416,7 @@ func (o *Output) Begin(input string) *Playback {
 		o.inputs[input] = in
 		o.order = append(o.order, in)
 	}
-	p := &Playback{out: o, in: in, wake: make(chan struct{}, 1), gen: in.gen}
+	p := &Playback{out: o, in: in, owner: owner, wake: make(chan struct{}, 1), gen: in.gen}
 	if o.closed {
 		p.gen = &playGen{err: ErrOutputClosed}
 	}
@@ -1170,11 +1182,29 @@ func (o *Output) next(frame []int16, sum []float32, rate, hist int, idleSince *t
 	return stepWrite, o.mixed, active
 }
 
-// closeIdle ends every speech as the stream closes for being idle.
+// closeIdle ends every speech as the stream closes for being idle, and lets
+// go of each idle input's playbacks: nothing queued, resampled or held by
+// the device needs them now, and a playback's owner (Begin), such as a
+// voice's exchange, would otherwise stay reachable through it for as long as
+// the Output lives. That is the last playback, the ones the resampler held,
+// and the record of whose queued samples each recent stream position held
+// (held, heldBy, landed, landedBy): a closed stream gives no audio back, so
+// no take-back reads them.
 func (o *Output) closeIdle() {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	o.endSpeeches(time.Now(), false)
+	for _, in := range o.order {
+		if in.idle() {
+			in.last = nil
+			clear(in.tails)
+			in.tails = in.tails[:0]
+			clear(in.held)
+			clear(in.heldBy)
+			clear(in.landed)
+			clear(in.landedBy)
+		}
+	}
 }
 
 // takeDrop reports whether a Cancel asked, since the mixer last looked, to
@@ -1212,7 +1242,7 @@ func (o *Output) wrote(seq uint64, at time.Time) {
 		// the stream held that audio never started.
 		if in.startPending && in.startFrame <= seq && (!in.cancelled || in.cancelAt.After(at)) {
 			in.startPending, in.startedAt = false, now
-			o.emit(SpeechEvent{Input: in.name, Started: true, At: now})
+			o.emit(SpeechEvent{Input: in.name, Started: true, At: now, Owner: in.owner})
 		}
 	}
 	o.changed()
@@ -1263,6 +1293,12 @@ func (o *Output) mixFrame(frame []int16, sum []float32, rate, hist int, now time
 			}
 		default:
 			queued := in.n > 0
+			// The playback whose sample is mixed first: a speech its sample
+			// starts is its owner's.
+			var started any
+			if queued && !in.speaking {
+				started = in.segments[0].pb.owner
+			}
 			in.seq = o.mixed
 			in.render(rate)
 			if in == voice {
@@ -1272,7 +1308,7 @@ func (o *Output) mixFrame(frame []int16, sum []float32, rate, hist int, now time
 				sum[i] += c
 			}
 			if queued && !in.speaking {
-				in.speaking, in.unlanded = true, playedTime{}
+				in.speaking, in.unlanded, in.owner = true, playedTime{}, started
 				in.startFrame, in.startPending = o.mixed, true
 			}
 			if in.landedTo > 0 {
@@ -1423,7 +1459,7 @@ func (o *Output) endSpeech(in *outputInput, now time.Time, cancelled bool) {
 	// A speech the stream never took audio of never started, and does not
 	// end either.
 	if !in.startPending {
-		in.endEvent = SpeechEvent{Input: in.name, Played: in.spoken.total(), Cancelled: cancelled}
+		in.endEvent = SpeechEvent{Input: in.name, Played: in.spoken.total(), Cancelled: cancelled, Owner: in.owner}
 		in.endPending = true
 		switch {
 		case cancelled:
@@ -1434,7 +1470,7 @@ func (o *Output) endSpeech(in *outputInput, now time.Time, cancelled bool) {
 			in.endFrame = in.lastFrame
 		}
 	}
-	in.speaking, in.startPending, in.cancelled, in.cancelAt, in.cut, in.spoken, in.quietAt = false, false, false, time.Time{}, false, playedTime{}, time.Time{}
+	in.speaking, in.startPending, in.cancelled, in.cancelAt, in.cut, in.spoken, in.quietAt, in.owner = false, false, false, time.Time{}, false, playedTime{}, time.Time{}, nil
 	if in.unsettled != nil {
 		// The Cancel is taken in, or the stream is gone: its Drains return,
 		// whatever ended the speech (retake, an idle close, a failure,

@@ -152,7 +152,7 @@ func TestACancelDuringAReplayStopsIt(t *testing.T) {
 			barrier := newProbeBarrier()
 			t.Cleanup(barrier.unblock)
 			ctx := testContext(t)
-			voice, chime := out.Begin(InputVoice), out.Begin(InputChime)
+			voice, chime := out.Begin(InputVoice, nil), out.Begin(InputChime, nil)
 			if err := voice.WriteAll(ctx, constant(48000, 200*time.Millisecond, 10000), mono48k); err != nil {
 				t.Fatal(err)
 			}
@@ -244,7 +244,7 @@ func TestDrainWaitsForTheResamplersTail(t *testing.T) {
 			barrier := newProbeBarrier()
 			t.Cleanup(barrier.unblock)
 			ctx := testContext(t)
-			pb := out.Begin(InputVoice)
+			pb := out.Begin(InputVoice, nil)
 			format := AudioFormat{SampleRate: tc.rate, Channels: 1, Encoding: EncodingPCM16}
 			if err := pb.WriteAll(ctx, constant(tc.rate, tc.d, 1000), format); err != nil {
 				t.Fatal(err)
@@ -330,12 +330,12 @@ func TestDrainWaitsForItsTailWhenAnotherPlaybackFollows(t *testing.T) {
 			for i := range signal {
 				signal[i] = 10000
 			}
-			first := out.Begin(InputVoice)
+			first := out.Begin(InputVoice, nil)
 			if err := first.WriteAll(ctx, pcm16Bytes(signal), format); err != nil {
 				t.Fatal(err)
 			}
 			if tc.next {
-				if err := out.Begin(InputVoice).WriteAll(ctx, constant(24000, 10*time.Millisecond, 0), format); err != nil {
+				if err := out.Begin(InputVoice, nil).WriteAll(ctx, constant(24000, 10*time.Millisecond, 0), format); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -515,11 +515,11 @@ func TestDrainWaitsThroughThePacersWait(t *testing.T) {
 			for i := range signal {
 				signal[i] = 10000
 			}
-			a := out.Begin(InputVoice)
+			a := out.Begin(InputVoice, nil)
 			if err := a.WriteAll(ctx, pcm16Bytes(signal), format); err != nil {
 				t.Fatal(err)
 			}
-			if err := out.Begin(InputVoice).WriteAll(ctx, make([]byte, 480), format); err != nil {
+			if err := out.Begin(InputVoice, nil).WriteAll(ctx, make([]byte, 480), format); err != nil {
 				t.Fatal(err)
 			}
 			done := make(chan error, 1)
@@ -571,7 +571,7 @@ func TestATakeBackOfResampledAudioCountsItsQueuedTime(t *testing.T) {
 			stream := &probeStream{fakeStream: newFakeStream(48000)}
 			out, start, events := probeOutput(t, stream)
 			ctx := testContext(t)
-			p := out.Begin(InputVoice)
+			p := out.Begin(InputVoice, nil)
 			format := AudioFormat{SampleRate: rate, Channels: 1, Encoding: EncodingPCM16}
 			burst := constant(rate, 10*time.Millisecond, 10000)
 			if err := p.WriteAll(ctx, burst, format); err != nil {
@@ -620,7 +620,7 @@ func TestATakeBackCountsOnlyTheSpeechsAudio(t *testing.T) {
 			stream := &probeStream{fakeStream: newFakeStream(48000)}
 			out, start, events := probeOutput(t, stream)
 			ctx := testContext(t)
-			pb := out.Begin(InputVoice)
+			pb := out.Begin(InputVoice, nil)
 			initial := 40 * time.Millisecond
 			cancelWrite := 4
 			if tc.gap {
@@ -718,7 +718,7 @@ func TestASecondCancelKeepsTheFirstCut(t *testing.T) {
 			barrier := newProbeBarrier()
 			t.Cleanup(barrier.unblock)
 			ctx := testContext(t)
-			pb := out.Begin(InputVoice)
+			pb := out.Begin(InputVoice, nil)
 			if err := pb.WriteAll(ctx, constant(48000, 80*time.Millisecond, 1000), mono48k); err != nil {
 				t.Fatal(err)
 			}
@@ -779,13 +779,13 @@ func TestATakeBackComesOffEachPlaybackItTook(t *testing.T) {
 			barrier := newProbeBarrier()
 			t.Cleanup(barrier.unblock)
 			ctx := testContext(t)
-			first := out.Begin(InputVoice)
+			first := out.Begin(InputVoice, nil)
 			second := first
 			if err := first.Write(ctx, constant(48000, 10*time.Millisecond, 1000), mono48k); err != nil {
 				t.Fatal(err)
 			}
 			if split {
-				second = out.Begin(InputVoice)
+				second = out.Begin(InputVoice, nil)
 			}
 			if err := second.Write(ctx, constant(48000, 10*time.Millisecond, 1000), mono48k); err != nil {
 				t.Fatal(err)
@@ -832,7 +832,7 @@ func TestATakeBackSplitsAPositionTwoPlaybacksShare(t *testing.T) {
 			barrier := newProbeBarrier()
 			t.Cleanup(barrier.unblock)
 			ctx := testContext(t)
-			first, second := out.Begin(InputVoice), out.Begin(InputVoice)
+			first, second := out.Begin(InputVoice, nil), out.Begin(InputVoice, nil)
 			format := AudioFormat{SampleRate: 96000, Channels: 1, Encoding: EncodingPCM16}
 			if err := first.Write(ctx, pcm16Bytes(make([]int16, firstFrames)), format); err != nil {
 				t.Fatal(err)
@@ -884,7 +884,7 @@ func TestAThirdPlaybackInAPositionTakesNothingOffTheFirst(t *testing.T) {
 				out, start, events := probeOutputAt(t, stream, tc.device)
 				ctx := testContext(t)
 				format := AudioFormat{SampleRate: tc.input, Channels: 1, Encoding: EncodingPCM16}
-				pbs := []*Playback{out.Begin(InputVoice), out.Begin(InputVoice), out.Begin(InputVoice)}
+				pbs := []*Playback{out.Begin(InputVoice, nil), out.Begin(InputVoice, nil), out.Begin(InputVoice, nil)}
 				for i, n := range []int{tc.first, middle, tc.rest - middle} {
 					pcm := make([]int16, n)
 					for j := range pcm {
@@ -928,7 +928,7 @@ func TestAPlaybackBackInAPositionLosesOnlyItsOwnSamples(t *testing.T) {
 			stream := &probeStream{fakeStream: newFakeStream(48000)}
 			out, start, events := probeOutput(t, stream)
 			ctx := testContext(t)
-			a, b, d := out.Begin(InputVoice), out.Begin(InputVoice), out.Begin(InputVoice)
+			a, b, d := out.Begin(InputVoice, nil), out.Begin(InputVoice, nil), out.Begin(InputVoice, nil)
 			format := AudioFormat{SampleRate: 384000, Channels: 1, Encoding: EncodingPCM16}
 			for _, part := range []struct {
 				pb *Playback
@@ -975,7 +975,7 @@ func TestACancelledDrainReturnsOnceItsTakeBackIsCounted(t *testing.T) {
 			barrier := newProbeBarrier()
 			t.Cleanup(barrier.unblock)
 			ctx := testContext(t)
-			pb := out.Begin(InputVoice)
+			pb := out.Begin(InputVoice, nil)
 			if err := pb.WriteAll(ctx, constant(48000, 40*time.Millisecond, 1000), mono48k); err != nil {
 				t.Fatal(err)
 			}
@@ -1028,7 +1028,7 @@ func TestAReplayOfAResampledTailStampsTheSpeechsEnd(t *testing.T) {
 			barrier := newProbeBarrier()
 			t.Cleanup(barrier.unblock)
 			ctx := testContext(t)
-			voice, chime := out.Begin(InputVoice), out.Begin(InputChime)
+			voice, chime := out.Begin(InputVoice, nil), out.Begin(InputChime, nil)
 			if err := voice.Write(ctx, constant(24000, 10*time.Millisecond, 10000), AudioFormat{SampleRate: 24000, Channels: 1}); err != nil {
 				t.Fatal(err)
 			}
@@ -1113,7 +1113,7 @@ func TestAStartTheStreamTookBeforeACancelIsReported(t *testing.T) {
 			t.Cleanup(barrier.unblock)
 			events := make(chan SpeechEvent, 16)
 			defer out.OnSpeech(func(e SpeechEvent) { events <- e })()
-			pb := out.Begin(InputVoice)
+			pb := out.Begin(InputVoice, nil)
 			// 100 ms, all queued before the stream takes the first frame, so a
 			// Cancel while the mixer is held cuts audio still queued.
 			ctx := testContext(t)
@@ -1173,7 +1173,7 @@ func TestAFilterFlushOfSilenceDoesNotMoveTheSpeechsEnd(t *testing.T) {
 				signal[i] = 10000
 			}
 			ctx := testContext(t)
-			if err := out.Begin(InputVoice).Write(ctx, pcm16Bytes(signal), AudioFormat{SampleRate: 24000, Channels: 1, Encoding: EncodingPCM16}); err != nil {
+			if err := out.Begin(InputVoice, nil).Write(ctx, pcm16Bytes(signal), AudioFormat{SampleRate: 24000, Channels: 1, Encoding: EncodingPCM16}); err != nil {
 				t.Fatal(err)
 			}
 			open()
@@ -1208,7 +1208,7 @@ func TestAPartialTakeBackCountsTheDelayedSampleCentres(t *testing.T) {
 	for _, rate := range []int{48000, 24000} {
 		t.Run(fmt.Sprintf("input %d Hz", rate), func(t *testing.T) {
 			o := &Output{inputs: map[string]*outputInput{}, wake: make(chan struct{}, 1), eventWake: make(chan struct{}, 1), listeners: map[int]func(SpeechEvent){}}
-			p := o.Begin(InputVoice)
+			p := o.Begin(InputVoice, nil)
 			ctx := testContext(t)
 			if err := p.Write(ctx, constant(rate, 10*time.Millisecond, 10000), AudioFormat{SampleRate: rate, Channels: 1}); err != nil {
 				t.Fatal(err)

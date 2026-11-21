@@ -227,7 +227,7 @@ func TestOutputCancelSilencesTheNextFrameWithin20ms(t *testing.T) {
 	ctx := testContext(t)
 	var longest time.Duration
 	for trial := range 5 {
-		pb := out.Begin(InputVoice)
+		pb := out.Begin(InputVoice, nil)
 		begun := time.Now()
 		written := make(chan error, 1)
 		go func() { written <- pb.WriteAll(ctx, constant(48000, 2*time.Second, 1000), mono48k) }()
@@ -299,7 +299,7 @@ func TestOutputMixesTwoInputs(t *testing.T) {
 			stream := newFakeStream(48000)
 			out := newTestOutput(t, OutputConfig{}, &fakeOpener{streams: []*fakeStream{stream}, gate: gate})
 			ctx := testContext(t)
-			voice, chime := out.Begin("other"), out.Begin(InputChime)
+			voice, chime := out.Begin("other", nil), out.Begin(InputChime, nil)
 			if err := voice.WriteAll(ctx, tc.voice, tc.voiceFormat); err != nil {
 				t.Fatal(err)
 			}
@@ -343,7 +343,7 @@ func TestOutputDucksTheVoiceUnderASound(t *testing.T) {
 		stream := newFakeStream(48000)
 		out := newTestOutput(t, OutputConfig{}, &fakeOpener{streams: []*fakeStream{stream}})
 		ctx := testContext(t)
-		voice, chime := out.Begin(InputVoice), out.Begin(InputChime)
+		voice, chime := out.Begin(InputVoice, nil), out.Begin(InputChime, nil)
 		spoken := make(chan error, 1)
 		go func() {
 			err := voice.WriteAll(ctx, constant(48000, 600*time.Millisecond, voiceLevel), mono48k)
@@ -401,7 +401,7 @@ func TestOutputDucksTheVoiceUnderASound(t *testing.T) {
 		stream := newFakeStream(48000)
 		out := newTestOutput(t, OutputConfig{}, &fakeOpener{streams: []*fakeStream{stream}, gate: gate})
 		ctx := testContext(t)
-		voice, chime := out.Begin(InputVoice), out.Begin(InputChime)
+		voice, chime := out.Begin(InputVoice, nil), out.Begin(InputChime, nil)
 		if err := chime.WriteAll(ctx, constant(48000, 50*time.Millisecond, soundLevel), mono48k); err != nil {
 			t.Fatal(err)
 		}
@@ -441,7 +441,7 @@ func TestOutputResamplesToTheStreamRate(t *testing.T) {
 			stream := newFakeStream(tc.to)
 			out := newTestOutput(t, OutputConfig{}, &fakeOpener{streams: []*fakeStream{stream}})
 			ctx := testContext(t)
-			pb := out.Begin(InputVoice)
+			pb := out.Begin(InputVoice, nil)
 			if err := pb.WriteAll(ctx, sine(tc.from, 500*time.Millisecond, tone, amp), AudioFormat{SampleRate: tc.from, Channels: 1}); err != nil {
 				t.Fatal(err)
 			}
@@ -505,7 +505,7 @@ func TestOutputHoldsAtMost200msPerInput(t *testing.T) {
 	stream := newFakeStream(48000)
 	out := newTestOutput(t, OutputConfig{}, &fakeOpener{streams: []*fakeStream{stream}, gate: gate})
 	ctx := testContext(t)
-	voice := out.Begin(InputVoice)
+	voice := out.Begin(InputVoice, nil)
 	frame := constant(48000, MaxWriteFrame, 1000)
 	for i := range 10 {
 		if err := voice.Write(ctx, frame, mono48k); err != nil {
@@ -517,7 +517,7 @@ func TestOutputHoldsAtMost200msPerInput(t *testing.T) {
 	if err := voice.Write(held, frame, mono48k); !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("an eleventh 20 ms frame while nothing played = %v, want it to wait (more than 200 ms queued)", err)
 	}
-	chime := out.Begin(InputChime)
+	chime := out.Begin(InputChime, nil)
 	if err := chime.WriteAll(ctx, constant(48000, InputQueue, 500), mono48k); err != nil {
 		t.Fatalf("the chime with the voice's queue full: %v", err)
 	}
@@ -550,7 +550,7 @@ func TestOutputReportsSpeechStartedAndEnded(t *testing.T) {
 	ctx := testContext(t)
 
 	began := time.Now()
-	pb := out.Begin(InputChime)
+	pb := out.Begin(InputChime, nil)
 	if err := pb.WriteAll(ctx, constant(48000, 100*time.Millisecond, 1000), mono48k); err != nil {
 		t.Fatal(err)
 	}
@@ -566,7 +566,7 @@ func TestOutputReportsSpeechStartedAndEnded(t *testing.T) {
 		t.Fatalf("the chime's end reports %v played, want 100 ms", ended.Played)
 	}
 
-	pb = out.Begin(InputVoice)
+	pb = out.Begin(InputVoice, nil)
 	go func() { _ = pb.WriteAll(ctx, constant(48000, 2*time.Second, 1000), mono48k) }()
 	if e := next("the voice's start"); e.Input != InputVoice || !e.Started {
 		t.Fatalf("event = %+v, want the voice started", e)
@@ -579,6 +579,74 @@ func TestOutputReportsSpeechStartedAndEnded(t *testing.T) {
 	}
 	if played := pb.Played(); played != e.Played {
 		t.Fatalf("the playback reports %v played, its end event %v", played, e.Played)
+	}
+}
+
+// TestASpeechEventCarriesItsStartingPlaybacksOwner fails if a speech's start
+// and end events do not carry the owner of the playback whose audio started
+// it (Begin's owner), so a listener can tell whose speech an event is
+// however late it comes: on an end of its own, on a Cancel, and for a speech
+// whose audio a second playback continues, still the first's. A playback
+// begun with no owner carries none. The owner is for the voice's exchanges
+// (#143).
+func TestASpeechEventCarriesItsStartingPlaybacksOwner(t *testing.T) {
+	stream := newFakeStream(48000)
+	out := newTestOutput(t, OutputConfig{}, &fakeOpener{streams: []*fakeStream{stream}})
+	events := make(chan SpeechEvent, 16)
+	remove := out.OnSpeech(func(e SpeechEvent) { events <- e })
+	defer remove()
+	next := func(what string) SpeechEvent {
+		t.Helper()
+		select {
+		case e := <-events:
+			return e
+		case <-time.After(2 * time.Second):
+			t.Fatalf("no event for %s", what)
+			return SpeechEvent{}
+		}
+	}
+	ctx := testContext(t)
+	type owner struct{ name string }
+	first, second := &owner{"first"}, &owner{"second"}
+
+	// Two playbacks in one speech: its end is still the first's.
+	a := out.Begin(InputVoice, first)
+	if err := a.WriteAll(ctx, constant(48000, 40*time.Millisecond, 1000), mono48k); err != nil {
+		t.Fatal(err)
+	}
+	b := out.Begin(InputVoice, second)
+	if err := b.WriteAll(ctx, constant(48000, 40*time.Millisecond, 1000), mono48k); err != nil {
+		t.Fatal(err)
+	}
+	if e := next("the first speech's start"); !e.Started || e.Owner != first {
+		t.Fatalf("start = %+v, want the first playback's owner", e)
+	}
+	if e := next("the first speech's end"); e.Started || e.Cancelled || e.Owner != first {
+		t.Fatalf("end = %+v, want the first playback's owner, not cancelled", e)
+	}
+
+	// A speech the second playback starts is its own; a Cancel's end too.
+	c := out.Begin(InputVoice, second)
+	go func() { _ = c.WriteAll(ctx, constant(48000, 2*time.Second, 1000), mono48k) }()
+	if e := next("the second speech's start"); !e.Started || e.Owner != second {
+		t.Fatalf("start = %+v, want the second playback's owner", e)
+	}
+	time.Sleep(50 * time.Millisecond)
+	out.Cancel(InputVoice)
+	if e := next("the second speech's cut"); e.Started || !e.Cancelled || e.Owner != second {
+		t.Fatalf("end after Cancel = %+v, want the second playback's owner, cancelled", e)
+	}
+
+	// No owner: none on either event.
+	d := out.Begin(InputVoice, nil)
+	if err := d.WriteAll(ctx, constant(48000, 40*time.Millisecond, 1000), mono48k); err != nil {
+		t.Fatal(err)
+	}
+	if e := next("the ownerless speech's start"); !e.Started || e.Owner != nil {
+		t.Fatalf("start = %+v, want no owner", e)
+	}
+	if e := next("the ownerless speech's end"); e.Started || e.Owner != nil {
+		t.Fatalf("end = %+v, want no owner", e)
 	}
 }
 
@@ -627,7 +695,7 @@ func TestASpeechStartsWhenTheStreamTakesItsFirstAudio(t *testing.T) {
 	t.Cleanup(func() { _ = out.Close() })
 	events := make(chan SpeechEvent, 16)
 	defer out.OnSpeech(func(e SpeechEvent) { events <- e })()
-	pb := out.Begin(InputVoice)
+	pb := out.Begin(InputVoice, nil)
 	go func() { _ = pb.WriteAll(testContext(t), constant(48000, time.Second, 1000), mono48k) }()
 	select {
 	case e := <-events:
@@ -655,7 +723,7 @@ func TestASpeechCutWhileItsFirstWriteIsHeldNeverStarts(t *testing.T) {
 			t.Cleanup(func() { _ = out.Close() })
 			events := make(chan SpeechEvent, 16)
 			defer out.OnSpeech(func(e SpeechEvent) { events <- e })()
-			pb := out.Begin(InputVoice)
+			pb := out.Begin(InputVoice, nil)
 			go func() { _ = pb.WriteAll(testContext(t), constant(48000, time.Second, 1000), mono48k) }()
 			<-stream.entered // the first write waits on the device
 			if cut {
@@ -723,7 +791,7 @@ func TestASpeechStartsWhenTheWriteReturnsNotWhenTheLockComes(t *testing.T) {
 			events := make(chan SpeechEvent, 16)
 			defer out.OnSpeech(func(e SpeechEvent) { events <- e })()
 			go func() {
-				_ = out.Begin(InputVoice).WriteAll(testContext(t), constant(48000, 100*time.Millisecond, 1000), mono48k)
+				_ = out.Begin(InputVoice, nil).WriteAll(testContext(t), constant(48000, 100*time.Millisecond, 1000), mono48k)
 			}()
 			select {
 			case e := <-events:
@@ -796,7 +864,7 @@ func TestASpeechEndsNoLaterThanTheStreamTookItsLastAudio(t *testing.T) {
 	})
 	events := make(chan SpeechEvent, 4)
 	defer out.OnSpeech(func(e SpeechEvent) { events <- e })()
-	if err := out.Begin(InputVoice).WriteAll(testContext(t), constant(48000, 20*time.Millisecond, 1000), mono48k); err != nil {
+	if err := out.Begin(InputVoice, nil).WriteAll(testContext(t), constant(48000, 20*time.Millisecond, 1000), mono48k); err != nil {
 		t.Fatal(err)
 	}
 	open()
@@ -836,7 +904,7 @@ func TestAShortSpeechEndsNoEarlierThanItStarts(t *testing.T) {
 	t.Cleanup(func() { _ = out.Close() })
 	events := make(chan SpeechEvent, 16)
 	defer out.OnSpeech(func(e SpeechEvent) { events <- e })()
-	pb := out.Begin(InputVoice)
+	pb := out.Begin(InputVoice, nil)
 	go func() { _ = pb.WriteAll(testContext(t), constant(48000, 10*time.Millisecond, 1000), mono48k) }()
 	var got []SpeechEvent
 	for len(got) < 2 {
@@ -892,7 +960,7 @@ func TestASpeechEndsWhenTheStreamTakesItsLastAudio(t *testing.T) {
 	t.Cleanup(func() { _ = out.Close() })
 	events := make(chan SpeechEvent, 16)
 	defer out.OnSpeech(func(e SpeechEvent) { events <- e })()
-	pb := out.Begin(InputVoice)
+	pb := out.Begin(InputVoice, nil)
 	go func() { _ = pb.WriteAll(testContext(t), constant(48000, 30*time.Millisecond, 1000), mono48k) }()
 	time.AfterFunc(300*time.Millisecond, func() { close(stream.release) }) // the device holds its last write
 	for {
@@ -976,10 +1044,10 @@ func TestASpeechWhoseLastAudioIsReplayedEndsAfterTheReplay(t *testing.T) {
 			events <- e
 		}
 	})()
-	chime := out.Begin(InputChime)
+	chime := out.Begin(InputChime, nil)
 	go func() { _ = chime.WriteAll(testContext(t), constant(rate, time.Second, 7), mono48k) }()
 	stream.waitWriting(t)
-	voice := out.Begin(InputVoice)
+	voice := out.Begin(InputVoice, nil)
 	go func() { _ = voice.WriteAll(testContext(t), constant(rate, 20*time.Millisecond, 1000), mono48k) }()
 	// Once the stream has the chime alone after the voice's audio, the
 	// voice's last audio is in the device's last 50 ms: cancel the chime.
@@ -1120,10 +1188,10 @@ func TestAReplayEndsAtTheVoicesLastReplayedAudio(t *testing.T) {
 			})()
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
-			if err := o.Begin(InputVoice).WriteAll(ctx, constant(48000, 20*time.Millisecond, 1000), mono48k); err != nil {
+			if err := o.Begin(InputVoice, nil).WriteAll(ctx, constant(48000, 20*time.Millisecond, 1000), mono48k); err != nil {
 				t.Fatal(err)
 			}
-			if err := o.Begin(InputChime).WriteAll(ctx, constant(48000, 100*time.Millisecond, 7), mono48k); err != nil {
+			if err := o.Begin(InputChime, nil).WriteAll(ctx, constant(48000, 100*time.Millisecond, 7), mono48k); err != nil {
 				t.Fatal(err)
 			}
 			openOnce.Do(func() { close(openGate) })
@@ -1172,7 +1240,7 @@ func TestOutputOpensTheConfiguredDevice(t *testing.T) {
 	opener := &fakeOpener{streams: []*fakeStream{newFakeStream(48000)}}
 	out := newTestOutput(t, OutputConfig{Device: "J75"}, opener)
 	ctx := testContext(t)
-	pb := out.Begin(InputVoice)
+	pb := out.Begin(InputVoice, nil)
 	if err := pb.WriteAll(ctx, constant(48000, 20*time.Millisecond, 1000), mono48k); err != nil {
 		t.Fatal(err)
 	}
@@ -1194,7 +1262,7 @@ func TestOutputKeepsOneStreamAcrossSpeechesAndClosesItWhenIdle(t *testing.T) {
 	out := newTestOutput(t, OutputConfig{IdleClose: 100 * time.Millisecond}, opener)
 	ctx := testContext(t)
 	for range 2 {
-		pb := out.Begin(InputVoice)
+		pb := out.Begin(InputVoice, nil)
 		if err := pb.WriteAll(ctx, constant(48000, 40*time.Millisecond, 1000), mono48k); err != nil {
 			t.Fatal(err)
 		}
@@ -1207,7 +1275,7 @@ func TestOutputKeepsOneStreamAcrossSpeechesAndClosesItWhenIdle(t *testing.T) {
 		t.Fatalf("two speeches 20 ms apart opened %d streams (first closed: %t), want one stream kept open", n, first.isClosed())
 	}
 	waitFor(t, "the idle stream to close", first.isClosed)
-	pb := out.Begin(InputVoice)
+	pb := out.Begin(InputVoice, nil)
 	if err := pb.WriteAll(ctx, constant(48000, 20*time.Millisecond, 1000), mono48k); err != nil {
 		t.Fatal(err)
 	}
@@ -1254,7 +1322,7 @@ func TestOutputHooksBracketTheStream(t *testing.T) {
 			out := NewOutput(cfg)
 			t.Cleanup(func() { _ = out.Close() })
 			ctx := testContext(t)
-			pb := out.Begin(InputVoice)
+			pb := out.Begin(InputVoice, nil)
 			if err := pb.WriteAll(ctx, constant(48000, 20*time.Millisecond, 1000), mono48k); err != nil {
 				t.Fatal(err)
 			}
@@ -1295,7 +1363,7 @@ func TestOutputHooksRunWhenTheStreamDoesNotOpen(t *testing.T) {
 		},
 	}, &fakeOpener{err: errors.New("no output device")})
 	ctx := testContext(t)
-	pb := out.Begin(InputVoice)
+	pb := out.Begin(InputVoice, nil)
 	err := pb.WriteAll(ctx, constant(48000, 20*time.Millisecond, 1000), mono48k)
 	if err == nil {
 		err = pb.Drain(ctx)
@@ -1327,7 +1395,7 @@ func TestOutputLogsAStreamThatFailsToClose(t *testing.T) {
 	stream.closeErr = errors.New("speaker close failed")
 	out := newTestOutput(t, OutputConfig{IdleClose: 10 * time.Millisecond}, &fakeOpener{streams: []*fakeStream{stream}})
 	ctx := testContext(t)
-	pb := out.Begin(InputVoice)
+	pb := out.Begin(InputVoice, nil)
 	if err := pb.WriteAll(ctx, constant(48000, 20*time.Millisecond, 1000), mono48k); err != nil {
 		t.Fatal(err)
 	}
@@ -1370,7 +1438,7 @@ func TestOutputReportsAStreamFailureToTheWriter(t *testing.T) {
 	stream.writeErr = errors.New("device disconnected")
 	out := newTestOutput(t, OutputConfig{}, &fakeOpener{streams: []*fakeStream{stream}})
 	ctx := testContext(t)
-	pb := out.Begin(InputVoice)
+	pb := out.Begin(InputVoice, nil)
 	err := pb.WriteAll(ctx, constant(48000, time.Second, 1000), mono48k)
 	if err == nil {
 		err = pb.Drain(ctx)
@@ -1390,7 +1458,7 @@ func TestOutputSurvivesAStreamWhoseClosePanics(t *testing.T) {
 	out := newTestOutput(t, OutputConfig{IdleClose: 10 * time.Millisecond}, &fakeOpener{streams: []*fakeStream{broken, next}})
 	ctx := testContext(t)
 	for _, stream := range []*fakeStream{broken, next} {
-		pb := out.Begin(InputVoice)
+		pb := out.Begin(InputVoice, nil)
 		if err := pb.WriteAll(ctx, constant(48000, 20*time.Millisecond, 1000), mono48k); err != nil {
 			t.Fatal(err)
 		}
@@ -1410,7 +1478,7 @@ func TestOutputSurvivesAStreamWhoseClosePanics(t *testing.T) {
 func TestPlaybackWriteTakesOnlyWholeFramesOf20msOrLess(t *testing.T) {
 	out := newTestOutput(t, OutputConfig{}, &fakeOpener{streams: []*fakeStream{newFakeStream(48000)}})
 	ctx := testContext(t)
-	pb := out.Begin(InputVoice)
+	pb := out.Begin(InputVoice, nil)
 	for _, tc := range []struct {
 		name   string
 		frame  []byte
@@ -1442,7 +1510,7 @@ func TestOutputCloseEndsPlayback(t *testing.T) {
 	stream := newFakeStream(48000)
 	out := NewOutput(OutputConfig{Open: (&fakeOpener{streams: []*fakeStream{stream}}).open})
 	ctx := testContext(t)
-	pb := out.Begin(InputVoice)
+	pb := out.Begin(InputVoice, nil)
 	written := make(chan error, 1)
 	go func() { written <- pb.WriteAll(ctx, constant(48000, 2*time.Second, 1000), mono48k) }()
 	stream.waitWriting(t)
@@ -1455,7 +1523,7 @@ func TestOutputCloseEndsPlayback(t *testing.T) {
 	if !stream.isClosed() {
 		t.Fatal("the stream is still open after Close returned")
 	}
-	if err := out.Begin(InputVoice).Write(ctx, constant(48000, 20*time.Millisecond, 1), mono48k); !errors.Is(err, ErrOutputClosed) {
+	if err := out.Begin(InputVoice, nil).Write(ctx, constant(48000, 20*time.Millisecond, 1), mono48k); !errors.Is(err, ErrOutputClosed) {
 		t.Fatalf("a write after Close = %v, want ErrOutputClosed", err)
 	}
 }
@@ -1469,7 +1537,7 @@ func TestPlaybackQueuesNothingUnderADoneContext(t *testing.T) {
 	out := newTestOutput(t, OutputConfig{}, &fakeOpener{streams: []*fakeStream{stream}})
 	stopped, stop := context.WithCancel(context.Background())
 	stop()
-	late := out.Begin(InputVoice)
+	late := out.Begin(InputVoice, nil)
 	if err := late.Write(stopped, constant(48000, MaxWriteFrame, 1000), mono48k); !errors.Is(err, context.Canceled) {
 		t.Errorf("Write under a done context = %v, want context.Canceled", err)
 	}
@@ -1478,7 +1546,7 @@ func TestPlaybackQueuesNothingUnderADoneContext(t *testing.T) {
 	}
 	// Control: a playback with a live context plays, and only its audio.
 	ctx := testContext(t)
-	next := out.Begin(InputVoice)
+	next := out.Begin(InputVoice, nil)
 	if err := next.WriteAll(ctx, constant(48000, MaxWriteFrame, 7), mono48k); err != nil {
 		t.Fatal(err)
 	}
@@ -1508,7 +1576,7 @@ func TestPlaybackDrainWaitsForTheStreamToTakeItsLastFrame(t *testing.T) {
 	stream.block = make(chan struct{})
 	out := newTestOutput(t, OutputConfig{}, &fakeOpener{streams: []*fakeStream{stream}})
 	ctx := testContext(t)
-	pb := out.Begin(InputVoice)
+	pb := out.Begin(InputVoice, nil)
 	if err := pb.Write(ctx, constant(48000, outputFrame, 1000), mono48k); err != nil {
 		t.Fatal(err)
 	}
@@ -1547,7 +1615,7 @@ func TestOutputMixesWithoutAllocating(t *testing.T) {
 	out := NewOutput(OutputConfig{Open: func(string) (PlaybackStream, int, error) { return stream, 48000, nil }})
 	t.Cleanup(func() { _ = out.Close() })
 	ctx := testContext(t)
-	pb := out.Begin(InputVoice)
+	pb := out.Begin(InputVoice, nil)
 	go func() { _ = pb.WriteAll(ctx, constant(48000, 3*time.Second, 1000), mono48k) }()
 	time.Sleep(300 * time.Millisecond) // the queue is full and the writer waits
 	var before, after runtime.MemStats
@@ -1608,7 +1676,7 @@ func TestOutputKeepsToRealTimeOnAStreamThatNeverWaits(t *testing.T) {
 	t.Cleanup(func() { _ = out.Close() })
 	ctx := testContext(t)
 	for range 3 {
-		pb := out.Begin(InputVoice)
+		pb := out.Begin(InputVoice, nil)
 		go func() { _ = pb.WriteAll(ctx, constant(48000, time.Second, 1000), mono48k) }()
 		time.Sleep(300 * time.Millisecond)
 		out.Cancel(InputVoice)
@@ -1632,7 +1700,7 @@ func TestOutputKeepsNoFinishedPlayback(t *testing.T) {
 	out := newTestOutput(t, OutputConfig{}, &fakeOpener{streams: []*fakeStream{newFakeStream(48000)}})
 	ctx := testContext(t)
 	play := func(d time.Duration) *Playback {
-		pb := out.Begin(InputVoice)
+		pb := out.Begin(InputVoice, nil)
 		if err := pb.WriteAll(ctx, constant(48000, d, 1000), mono48k); err != nil {
 			t.Fatal(err)
 		}

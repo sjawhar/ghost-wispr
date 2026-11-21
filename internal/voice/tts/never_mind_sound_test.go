@@ -146,7 +146,7 @@ func TestNeverMindCutsTheAnswerSoundOnTheRealSpeaker(t *testing.T) {
 				for i := 0; i < len(pcm); i += 2 {
 					binary.LittleEndian.PutUint16(pcm[i:], speechLevel)
 				}
-				pb := out.Begin(audio.InputVoice)
+				pb := out.Begin(audio.InputVoice, nil)
 				speechFrom = len(stream.played())
 				go func() {
 					err := pb.WriteAll(ctx, pcm, audio.AudioFormat{SampleRate: rate, Channels: 1, Encoding: audio.EncodingPCM16})

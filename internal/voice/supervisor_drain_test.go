@@ -210,14 +210,14 @@ type beginGate struct {
 	once             sync.Once
 }
 
-func (g *beginGate) Begin(input string) Playback {
+func (g *beginGate) Begin(input string, owner any) Playback {
 	if input == audio.InputChime {
 		g.once.Do(func() {
 			close(g.entered)
 			<-g.release
 		})
 	}
-	return g.fakeSpeaker.Begin(input)
+	return g.fakeSpeaker.Begin(input, owner)
 }
 
 // TestAnErrorSoundBegunAfterACutEndsWithItsMeeting fails if an error sound for

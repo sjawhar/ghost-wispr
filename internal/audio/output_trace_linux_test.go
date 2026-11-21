@@ -172,7 +172,7 @@ func TestTheSpeakerTraceSaysWhatKeptTheMixerFromTheDevice(t *testing.T) {
 				return stream, pcm.rate, nil
 			}})
 			ctx := testContext(t)
-			voice := out.Begin(InputVoice)
+			voice := out.Begin(InputVoice, nil)
 			if err := voice.WriteAll(ctx, sine(48000, 2*time.Second, 440, 8000), mono48k); err != nil {
 				t.Fatal(err)
 			}

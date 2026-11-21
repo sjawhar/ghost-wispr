@@ -86,8 +86,10 @@ type soundSpeaker struct {
 	sounds [][]byte
 }
 
-func (s *soundSpeaker) Begin(input string) voice.Playback { return &soundPlayback{s: s, input: input} }
-func (s *soundSpeaker) Cancel(string)                     {}
+func (s *soundSpeaker) Begin(input string, _ any) voice.Playback {
+	return &soundPlayback{s: s, input: input}
+}
+func (s *soundSpeaker) Cancel(string) {}
 func (s *soundSpeaker) OnSpeech(func(audio.SpeechEvent)) (remove func()) {
 	return func() {}
 }

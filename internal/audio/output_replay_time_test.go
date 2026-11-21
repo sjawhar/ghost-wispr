@@ -62,7 +62,7 @@ func TestAReplayedFrameIsTakenWhenItsWriteReturned(t *testing.T) {
 			stream := &lockAfterSoundStream{discard: discard}
 			out, start, events := probeOutput(t, stream)
 			stream.out = out
-			if err := out.Begin(InputVoice).Write(testContext(t), constant(48000, 10*time.Millisecond, 1000), mono48k); err != nil {
+			if err := out.Begin(InputVoice, nil).Write(testContext(t), constant(48000, 10*time.Millisecond, 1000), mono48k); err != nil {
 				t.Fatal(err)
 			}
 			start()

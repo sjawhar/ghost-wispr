@@ -349,7 +349,7 @@ func TestTheFloorQueuesOtherSpeech(t *testing.T) {
 // /api/tts/speak) playing on the voice input.
 func TestAWakePreemptsOtherSpeech(t *testing.T) {
 	r := newRig(t, newFakeConcierge("fact"))
-	pb := r.speaker.Begin(audio.InputVoice)
+	pb := r.speaker.Begin(audio.InputVoice, nil)
 	if err := pb.Write(t.Context(), make([]byte, 960), audio.AudioFormat{SampleRate: 24000, Channels: 1}); err != nil {
 		t.Fatal(err)
 	}

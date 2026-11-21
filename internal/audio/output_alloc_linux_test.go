@@ -30,7 +30,7 @@ func TestTheMixerAndWriteAllocateNothing(t *testing.T) {
 			return newALSAStream(&sinkPCM{buffer: 3840}, "sink", alsaParams{rate: 48000, channels: 1, period: 480, buffer: 3840}), 48000, nil
 		}})
 		ctx := context.Background()
-		voice, chime := out.Begin(InputVoice), out.Begin(InputChime)
+		voice, chime := out.Begin(InputVoice, nil), out.Begin(InputChime, nil)
 		speech := sine(24000, 20*time.Millisecond, 440, 8000)
 		ring := sine(48000, 20*time.Millisecond, 880, 4000)
 		turn := func() {

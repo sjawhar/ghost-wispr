@@ -40,7 +40,7 @@ func TestACancelledDrainReturnsWhenTheStreamClosesIdle(t *testing.T) {
 		_ = out.Close()
 	})
 	ctx := testContext(t)
-	pb := out.Begin(InputVoice)
+	pb := out.Begin(InputVoice, nil)
 	if err := pb.WriteAll(ctx, constant(48000, 20*time.Millisecond, 1000), mono48k); err != nil {
 		t.Fatal(err)
 	}
@@ -92,7 +92,7 @@ func TestADrainOfAnEarlierCancelDoesNotWaitForALaterOne(t *testing.T) {
 		}
 	}
 	ctx := testContext(t)
-	a := out.Begin(InputVoice)
+	a := out.Begin(InputVoice, nil)
 	if err := a.WriteAll(ctx, constant(48000, 40*time.Millisecond, 1000), mono48k); err != nil {
 		t.Fatal(err)
 	}
@@ -100,7 +100,7 @@ func TestADrainOfAnEarlierCancelDoesNotWaitForALaterOne(t *testing.T) {
 	probeWait(t, first.entered, "the first playback's second write")
 	probeVoiceEvent(t, events, true)
 	out.Cancel(InputVoice)
-	b := out.Begin(InputVoice) // before the mixer takes the first Cancel in
+	b := out.Begin(InputVoice, nil) // before the mixer takes the first Cancel in
 	if err := b.WriteAll(ctx, constant(48000, 40*time.Millisecond, 1000), mono48k); err != nil {
 		t.Fatal(err)
 	}
@@ -146,7 +146,7 @@ func TestALaterCancelsDrainDoesNotWaitForAnEarlierSpeech(t *testing.T) {
 						held.hold()
 					}
 				}
-				a := out.Begin(InputVoice)
+				a := out.Begin(InputVoice, nil)
 				if err := a.WriteAll(testContext(t), constant(48000, 40*time.Millisecond, 1000), mono48k); err != nil {
 					t.Fatal(err)
 				}
@@ -154,7 +154,7 @@ func TestALaterCancelsDrainDoesNotWaitForAnEarlierSpeech(t *testing.T) {
 				probeWait(t, held.entered, "the earlier speech's second write")
 				out.Cancel(InputVoice)
 			}
-			b := out.Begin(InputVoice)
+			b := out.Begin(InputVoice, nil)
 			if tc.queued > 0 {
 				if err := b.WriteAll(testContext(t), constant(48000, tc.queued, 1000), mono48k); err != nil {
 					t.Fatal(err)
@@ -194,13 +194,13 @@ func TestAPlaybackThatDidNotPlayDoesNotWaitForTheTakeBack(t *testing.T) {
 					held.hold()
 				}
 			}
-			a := out.Begin(InputVoice)
+			a := out.Begin(InputVoice, nil)
 			if err := a.WriteAll(testContext(t), constant(48000, 40*time.Millisecond, 1000), mono48k); err != nil {
 				t.Fatal(err)
 			}
 			start()
 			probeWait(t, held.entered, "the first playback's second write")
-			b := out.Begin(InputVoice)
+			b := out.Begin(InputVoice, nil)
 			if queued > 0 {
 				if err := b.WriteAll(testContext(t), constant(48000, queued, 1000), mono48k); err != nil {
 					t.Fatal(err)
