@@ -546,6 +546,7 @@ type LiveKeyterms struct {
 	asking  bool        // a Configure to stream waits for Deepgram's answer
 	retry   *time.Timer // the resend of a refused list, while it waits
 	retried bool        // a list refused since the last change had its resend
+	refused bool        // Deepgram refused a list, and stream lacks the one wanted since
 	refusal func(refused bool)
 }
 
@@ -555,9 +556,11 @@ func NewLiveKeyterms(phrases []string, projects func() []string) *LiveKeyterms {
 	return &LiveKeyterms{phrases: slices.Clone(phrases), projects: projects, retryAfter: configureRetryAfter}
 }
 
-// SetRefusalHook makes hook hear whether the stream lacks a list because
-// Deepgram refused it: true at each refusal, false once Deepgram takes a
-// list or a new dial attaches.
+// SetRefusalHook makes hook hear, each time it changes, whether the stream
+// lacks the wanted list because Deepgram refused one: true at a refusal that
+// leaves the stream without the wanted list, false once the stream has it
+// (Deepgram took it, or a join or a leave made it the list the stream has),
+// once Deepgram takes another list, or once a new dial attaches.
 func (k *LiveKeyterms) SetRefusalHook(hook func(refused bool)) {
 	k.mu.Lock()
 	defer k.mu.Unlock()
@@ -606,15 +609,20 @@ func (k *LiveKeyterms) Attach(stream Configurer, dialed []string) {
 }
 
 // sendLocked sends the stream the list when it does not have it, unless a
-// Configure waits for its answer, which sends the newest list then. A send
-// that fails is not retried: the socket is closing, and the next dial reads
-// List.
+// Configure waits for its answer, which sends the newest list then. A stream
+// that has the list no longer lacks it after a refusal, whether or not a
+// Configure waits. A send that fails is not retried: the socket is closing,
+// and the next dial reads List.
 func (k *LiveKeyterms) sendLocked() {
-	if k.stream == nil || k.asking {
+	if k.stream == nil {
 		return
 	}
 	list := k.listLocked()
 	if slices.Equal(list, k.taken) {
+		k.reportLocked(false)
+		return
+	}
+	if k.asking {
 		return
 	}
 	k.stopRetryLocked()
@@ -626,7 +634,9 @@ func (k *LiveKeyterms) sendLocked() {
 // answered takes Deepgram's answer to the Configure of list on stream. Taken,
 // list is the stream's. Refused, the stream keeps the list it had: a newer
 // list goes at once; the same list goes once more after retryAfter, and a
-// second refusal of it waits for the next join or leave, or the next dial.
+// second refusal of it waits for the next join or leave, or the next dial. A
+// refusal leaves the stream lacking the wanted list unless a join or a leave
+// since made it the list the stream has.
 func (k *LiveKeyterms) answered(stream Configurer, list []string, taken bool) {
 	k.mu.Lock()
 	defer k.mu.Unlock()
@@ -634,8 +644,12 @@ func (k *LiveKeyterms) answered(stream Configurer, list []string, taken bool) {
 		return
 	}
 	k.asking = false
-	k.reportLocked(!taken)
-	if !taken && slices.Equal(k.listLocked(), list) {
+	if taken {
+		k.taken = list
+	}
+	wanted := k.listLocked()
+	k.reportLocked(!taken && !slices.Equal(wanted, k.taken))
+	if !taken && slices.Equal(wanted, list) {
 		if !k.retried {
 			k.retried = true
 			var retry *time.Timer
@@ -651,9 +665,6 @@ func (k *LiveKeyterms) answered(stream Configurer, list []string, taken bool) {
 		}
 		return
 	}
-	if taken {
-		k.taken = list
-	}
 	k.retried = false
 	k.sendLocked()
 }
@@ -667,7 +678,13 @@ func (k *LiveKeyterms) stopRetryLocked() {
 	}
 }
 
+// reportLocked makes the stream lack the wanted list after a refusal, or not,
+// and tells the refusal hook when that changes.
 func (k *LiveKeyterms) reportLocked(refused bool) {
+	if refused == k.refused {
+		return
+	}
+	k.refused = refused
 	if k.refusal != nil {
 		k.refusal(refused)
 	}

@@ -314,6 +314,133 @@ func TestASecondRefusalWaitsForTheNextChange(t *testing.T) {
 	}
 }
 
+// refusalCalls records what each call of the refusal hook says.
+type refusalCalls struct {
+	mu    sync.Mutex
+	calls []bool
+}
+
+func (r *refusalCalls) hook(refused bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.calls = append(r.calls, refused)
+}
+
+// heard returns what the hook heard so far, in order.
+func (r *refusalCalls) heard() []bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return slices.Clone(r.calls)
+}
+
+// warns is whether the last call said a refusal.
+func (r *refusalCalls) warns() bool {
+	heard := r.heard()
+	return len(heard) > 0 && heard[len(heard)-1]
+}
+
+// TestKeytermsRefusalEndsWhenTheStreamHasTheWantedList fails if the refusal
+// hook still says a refusal once a leave makes the wanted list the one the
+// stream has, with no Configure to answer: a leave after the refusal, a leave
+// while the refused list's resend waits for its answer, and a leave while the
+// first Configure waits for an answer that then refuses it, which must not
+// warn at all. It also fails if such a leave sends a Configure.
+func TestKeytermsRefusalEndsWhenTheStreamHasTheWantedList(t *testing.T) {
+	t.Run("leave after the refusal", func(t *testing.T) {
+		k, stream := quickKeyterms()
+		k.retryAfter = time.Hour
+		t.Cleanup(func() { k.Attach(nil, nil) })
+		var hook refusalCalls
+		k.SetRefusalHook(hook.hook)
+		k.SetJoined([]string{"ABC-12"})
+		stream.answer(false)
+		if got := hook.heard(); !slices.Equal(got, []bool{true}) {
+			t.Fatalf("control: after a refusal the hook heard %v, want [true]", got)
+		}
+		k.SetJoined(nil)
+		if got := hook.heard(); !slices.Equal(got, []bool{true, false}) {
+			t.Fatalf("the leave made the wanted list the stream's, but the hook heard %v, want [true false]", got)
+		}
+		if got := stream.sent(); len(got) != 1 {
+			t.Fatalf("a leave to the list the stream has sent %q, want no second Configure", got)
+		}
+	})
+	t.Run("leave while the resend waits", func(t *testing.T) {
+		k, stream := quickKeyterms()
+		var hook refusalCalls
+		k.SetRefusalHook(hook.hook)
+		k.SetJoined([]string{"ABC-12"})
+		stream.answer(false)
+		waitSent(t, stream, 2)
+		k.SetJoined(nil)
+		if got := hook.heard(); !slices.Equal(got, []bool{true, false}) {
+			t.Fatalf("the leave made the wanted list the stream's while the resend waits, but the hook heard %v, want [true false]", got)
+		}
+		stream.answer(false)
+		time.Sleep(5 * k.retryAfter)
+		if got := hook.heard(); !slices.Equal(got, []bool{true, false}) {
+			t.Fatalf("the resend's refusal came after the leave, but the hook heard %v, want [true false]", got)
+		}
+		if got := stream.sent(); len(got) != 2 {
+			t.Fatalf("the stream got %q, want no third Configure for the list it has", got)
+		}
+	})
+	t.Run("leave while the first Configure waits", func(t *testing.T) {
+		k, stream := quickKeyterms()
+		var hook refusalCalls
+		k.SetRefusalHook(hook.hook)
+		k.SetJoined([]string{"ABC-12"})
+		k.SetJoined(nil)
+		stream.answer(false)
+		time.Sleep(5 * k.retryAfter)
+		if got := hook.heard(); len(got) != 0 {
+			t.Fatalf("Deepgram refused a list nobody wants any more and the stream has the wanted one, but the hook heard %v, want nothing", got)
+		}
+		if got := stream.sent(); len(got) != 1 {
+			t.Fatalf("the stream got %q, want no second Configure for the list it has", got)
+		}
+	})
+}
+
+// TestKeytermsRefusalLastsWhileTheWantedListIsMissing fails if the refusal
+// hook stops saying a refusal while the stream still lacks the wanted list: a
+// newer join's Configure waits, Deepgram refuses it too, or a leave leaves a
+// list the stream does not have. Only Deepgram taking the wanted list ends it.
+func TestKeytermsRefusalLastsWhileTheWantedListIsMissing(t *testing.T) {
+	k, stream := quickKeyterms()
+	k.retryAfter = time.Hour
+	t.Cleanup(func() { k.Attach(nil, nil) })
+	var hook refusalCalls
+	k.SetRefusalHook(hook.hook)
+	k.SetJoined([]string{"ABC-12"})
+	stream.answer(false)
+	if !hook.warns() {
+		t.Fatalf("control: after a refusal the hook heard %v, want a refusal last", hook.heard())
+	}
+	k.SetJoined([]string{"ABC-12", "XYZ-9"})
+	if got := stream.sent(); len(got) != 2 {
+		t.Fatalf("control: a newer join after a refusal sent %q, want a second Configure at once", got)
+	}
+	if !hook.warns() {
+		t.Fatalf("a newer join's Configure waits and the stream still lacks the wanted list, but the hook heard %v", hook.heard())
+	}
+	stream.answer(false)
+	if !hook.warns() {
+		t.Fatalf("Deepgram refused the newer list too, but the hook heard %v", hook.heard())
+	}
+	k.SetJoined([]string{"ABC-12"})
+	if got := stream.sent(); len(got) != 3 {
+		t.Fatalf("control: a leave to a list the stream lacks sent %q, want a third Configure at once", got)
+	}
+	if !hook.warns() {
+		t.Fatalf("a leave left a list the stream lacks, but the hook heard %v", hook.heard())
+	}
+	stream.answer(true)
+	if hook.warns() {
+		t.Fatalf("Deepgram took the wanted list, but the hook heard %v", hook.heard())
+	}
+}
+
 // TestIsName fails if a word Deepgram writes for the name, as configured or as
 // a sound-alike, is not recognised as the name, or another word is.
 func TestIsName(t *testing.T) {
