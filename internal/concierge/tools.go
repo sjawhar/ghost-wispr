@@ -158,11 +158,18 @@ func (c *Concierge) IssueHolder(ctx context.Context, key string) (json.RawMessag
 // (outOfReach) comes with an error that wraps voice.ErrUnreachable, for
 // R10's error sound; Run's other errors are an unknown tool or a stop, with
 // no answer. The Supervisor answers voice.AnswerTool itself, through Answer.
+// A run is work Stop waits for (enter), whichever voice called it; after
+// Stop, Run runs nothing.
 func (r *runner) Run(ctx context.Context, call voice.ToolCall) (json.RawMessage, error) {
 	var args map[string]any
 	if err := json.Unmarshal(orEmpty(call.Args), &args); err != nil {
 		return nil, fmt.Errorf("concierge: %s arguments: %w", call.Name, err)
 	}
+	ctx, leave, ok := r.c.enter(ctx)
+	if !ok {
+		return nil, errStopped
+	}
+	defer leave()
 	result, err := r.call(ctx, call.Name, args)
 	if err != nil {
 		return nil, err

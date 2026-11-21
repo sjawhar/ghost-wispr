@@ -146,7 +146,8 @@ type Concierge struct {
 	answers   chan voice.PendingAnswer
 	// life ends with Stop (stop): its background work, the rewrite of an
 	// answer for the ear, the read of the projects and the sends after a
-	// reply, runs under it, and work counts it. done closes when the
+	// reply, runs under it, and work counts it, as it counts each call from
+	// outside that may write the store (enter). done closes when the
 	// goroutine that offers answers ends.
 	life     context.Context
 	stop     context.CancelFunc
@@ -340,11 +341,38 @@ func (c *Concierge) background(work func(ctx context.Context)) {
 	}()
 }
 
+// errStopped is a call's error once Stop has run: the Concierge takes no
+// more.
+var errStopped = errors.New("concierge: stopped")
+
+// enter admits one call that may write the store (an answer, a tool call, an
+// ask an answer leaves running, a spoken mark, a never mind, a delivered
+// reply) as work Stop waits for, so the store closes under none of them. Its
+// context ends when parent does or when Stop runs; leave ends it and the
+// count. After Stop it admits nothing, and ok is false. c.mu must not be held.
+func (c *Concierge) enter(parent context.Context) (ctx context.Context, leave func(), ok bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.life.Err() != nil {
+		return nil, nil, false
+	}
+	c.work.Add(1)
+	ctx, cancel := context.WithCancelCause(parent)
+	stopped := context.AfterFunc(c.life, func() { cancel(errStopped) })
+	return ctx, func() {
+		stopped()
+		cancel(nil)
+		c.work.Done()
+	}, true
+}
+
 // Stop ends the Concierge, when the unit stops (VoiceOff, when the voice is
 // turned off): the goroutine that offers answers, a rewrite of an answer for
-// the ear, and any other background work end, and Stop waits for them. An
-// answer that lands after it is kept in the ledger, for its session's page,
-// and not announced. A second Stop does nothing.
+// the ear, every call that may write the store (enter), which it cancels,
+// and any other background work end, and Stop waits for them. A send to an
+// agent already begun keeps its own bound (sendTimeout). An answer that lands
+// after it is kept in the ledger, for its session's page, and not announced.
+// A second Stop does nothing.
 func (c *Concierge) Stop() {
 	c.stopOnce.Do(func() {
 		c.mu.Lock()
@@ -797,8 +825,14 @@ func (c *Concierge) SessionDeleted(sessionID string) {
 	}
 }
 
-// Spoken records that a pending answer was spoken.
-func (c *Concierge) Spoken(_ context.Context, taskID string) error {
+// Spoken records that a pending answer was spoken, as work Stop waits for;
+// after Stop it records nothing.
+func (c *Concierge) Spoken(ctx context.Context, taskID string) error {
+	_, leave, ok := c.enter(ctx)
+	if !ok {
+		return errStopped
+	}
+	defer leave()
 	if err := c.store.MarkVoiceTaskSpoken(taskID, c.now()); err != nil {
 		return err
 	}

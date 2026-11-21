@@ -342,7 +342,9 @@ func (l *lazyConcierge) followEnabled(on bool) {
 // halt stops the running Concierge, for a turn-off or, with shutdown, for
 // good. A turn-off first cancels the questions still working and tells their
 // holders (VoiceOff), while the Envoy session is open; a shutdown keeps them
-// for the next start.
+// for the next start. A shutdown also waits for a start under way, which
+// writes the store as it starts (concierge.New) and then sees the shutdown
+// and stops what it started (start), so the store closes under none of it.
 func (l *lazyConcierge) halt(shutdown bool) {
 	l.mu.Lock()
 	if l.closed {
@@ -355,6 +357,12 @@ func (l *lazyConcierge) halt(shutdown bool) {
 	c, stop, fwd := l.c, l.stop, l.fwd
 	l.c, l.stop, l.fwd, l.err = nil, nil, nil, nil
 	l.mu.Unlock()
+	if shutdown {
+		defer func() {
+			l.starting.Lock()
+			l.starting.Unlock() //nolint:staticcheck // waits for a start under way
+		}()
+	}
 	if c == nil {
 		return
 	}

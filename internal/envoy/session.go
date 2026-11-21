@@ -242,6 +242,10 @@ type Session struct {
 	cfg              SessionConfig
 	logger           *slog.Logger
 	clientInstanceID string
+	// life ends with Close: the registrations and deliveries it waits for
+	// (stopped) run under it.
+	life    context.Context
+	endLife context.CancelFunc
 
 	mu    sync.Mutex
 	epoch string
@@ -256,6 +260,9 @@ type Session struct {
 	conn    *nats.Conn
 	sub     *nats.Subscription
 	stop    chan struct{}
+	// stopped counts the heartbeat, each registration a reconnect starts and
+	// each relay frame being handled: Close waits for them, since each may
+	// save the resume point where the unit keeps its state (SaveResume).
 	stopped sync.WaitGroup
 	closed  bool
 	// heartbeatEvery and progressEvery are HeartbeatEvery and progressEvery;
@@ -272,11 +279,14 @@ func newSession(listener *Listener, cfg *SessionConfig) (*Session, error) {
 	if logger == nil {
 		logger = slog.Default()
 	}
+	life, endLife := context.WithCancel(context.Background())
 	session := &Session{
 		Listener:         listener,
 		cfg:              *cfg,
 		logger:           logger,
 		clientInstanceID: randomID(),
+		life:             life,
+		endLife:          endLife,
 		epoch:            randomID(),
 		stop:             make(chan struct{}),
 		heartbeatEvery:   HeartbeatEvery,
@@ -309,14 +319,7 @@ func OpenSession(ctx context.Context, listener *Listener, cfg *SessionConfig) (*
 		nats.Name("ghost-wispr "+cfg.SessionID),
 		nats.MaxReconnects(-1),
 		nats.ReconnectWait(2*time.Second),
-		nats.ReconnectHandler(func(*nats.Conn) {
-			// A new connection is a new epoch, registered at once so the
-			// listener relays to it.
-			session.mu.Lock()
-			session.epoch = randomID()
-			session.mu.Unlock()
-			go session.registerLogged()
-		}),
+		nats.ReconnectHandler(func(*nats.Conn) { session.reconnected() }),
 		nats.DisconnectErrHandler(func(_ *nats.Conn, err error) {
 			if err != nil {
 				session.logger.Warn("envoy session lost its NATS connection", "error", err)
@@ -327,7 +330,7 @@ func OpenSession(ctx context.Context, listener *Listener, cfg *SessionConfig) (*
 		return nil, fmt.Errorf("envoy: connect to NATS at %s: %w", natsURL, err)
 	}
 	sub, err := conn.Subscribe(DeliverSubjectPrefix+cfg.SessionID, func(msg *nats.Msg) {
-		session.handle(msg.Header, msg.Data, func(body string) {
+		session.relay(msg.Header, msg.Data, func(body string) {
 			if err := msg.Respond([]byte(body)); err != nil {
 				session.logger.Warn("envoy session could not answer a relay frame", "answer", body, "error", err)
 			}
@@ -364,6 +367,45 @@ const openTimeout = 15 * time.Second
 // ID is the session's id.
 func (s *Session) ID() string { return s.cfg.SessionID }
 
+// enter counts one piece of the session's work that Close waits for
+// (stopped), unless Close has run, and reports whether it may start.
+func (s *Session) enter() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return false
+	}
+	s.stopped.Add(1)
+	return true
+}
+
+// reconnected registers a new NATS connection at once, as a new epoch, so the
+// listener relays to it; Close waits for that registration. After Close it
+// registers nothing.
+func (s *Session) reconnected() {
+	s.mu.Lock()
+	s.epoch = randomID()
+	s.mu.Unlock()
+	if !s.enter() {
+		return
+	}
+	go func() {
+		defer s.stopped.Done()
+		s.registerLogged()
+	}()
+}
+
+// relay handles one relay frame (handle) as work Close waits for. After Close
+// it answers nothing: the listener delivers the frame again to the next
+// session.
+func (s *Session) relay(header nats.Header, data []byte, respond func(string)) {
+	if !s.enter() {
+		return
+	}
+	defer s.stopped.Done()
+	s.handle(header, data, respond)
+}
+
 func (s *Session) heartbeat() {
 	defer s.stopped.Done()
 	ticker := time.NewTicker(s.heartbeatEvery)
@@ -379,9 +421,9 @@ func (s *Session) heartbeat() {
 }
 
 func (s *Session) registerLogged() {
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	ctx, cancel := context.WithTimeout(s.life, 15*time.Second)
 	defer cancel()
-	if err := s.register(ctx); err != nil {
+	if err := s.register(ctx); err != nil && s.life.Err() == nil {
 		s.logger.Warn("envoy session registration failed; the next one is in a minute", "error", err)
 	}
 }
@@ -518,7 +560,7 @@ func (s *Session) handle(header nats.Header, data []byte, respond func(string)) 
 		message.IssuedAt = time.UnixMilli(envelope.IssuedAt)
 	}
 	if s.cfg.Deliver != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), deliverTimeout)
+		ctx, cancel := context.WithTimeout(s.life, deliverTimeout)
 		held, progressed := make(chan struct{}), make(chan struct{})
 		go func() {
 			defer close(progressed)
@@ -636,8 +678,10 @@ func (s *Session) Send(ctx context.Context, request *SendRequest) (SendResult, e
 	return SendResult{EventID: answer.EventID, RecipientState: SessionState(answer.RecipientState), State: answer.State, Duplicate: answer.Duplicate}, nil
 }
 
-// Close stops the heartbeat, removes this process's registration and closes
-// the NATS connection.
+// Close stops the heartbeat, cancels and waits for each registration and
+// relay frame under way, which may save the resume point (an interrupted
+// frame is answered nak and comes again), removes this process's
+// registration and closes the NATS connection.
 func (s *Session) Close(ctx context.Context) error {
 	s.mu.Lock()
 	if s.closed {
@@ -648,6 +692,7 @@ func (s *Session) Close(ctx context.Context) error {
 	close(s.stop)
 	conn := s.conn
 	s.mu.Unlock()
+	s.endLife()
 	s.stopped.Wait()
 	err := s.do(ctx, http.MethodDelete, "/v1/sessions/"+s.cfg.SessionID, url.Values{"client_instance_id": {s.clientInstanceID}}, nil, nil)
 	if conn != nil {

@@ -4,14 +4,19 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
+	"slices"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/sjawhar/ghost-wispr/internal/concierge"
+	"github.com/sjawhar/ghost-wispr/internal/config"
 	"github.com/sjawhar/ghost-wispr/internal/gdrive"
 	"github.com/sjawhar/ghost-wispr/internal/session"
 	"github.com/sjawhar/ghost-wispr/internal/stopping"
 	"github.com/sjawhar/ghost-wispr/internal/storage"
+	"github.com/sjawhar/ghost-wispr/internal/storeguard"
 )
 
 // watchedBackground admits work as the session manager does, with no stop,
@@ -200,25 +205,167 @@ func TestTheStopWaitsForAMergedSessionsSummary(t *testing.T) {
 	stopDuringSummary(t, store, manager, summarizer, id, nil)
 }
 
-// TestAMergedRefinementTheStopCutOffIsNotRecordedFailed fails if the merge
-// hook's failure recorder records a refinement the stop cut off as failed, or
-// does not record one that failed for another reason.
+// TestAMergedRefinementTheStopCutOffIsNotRecordedFailed fails if a merge's
+// refinement, cut off by the stop while it restores a recording removed from
+// this unit, is recorded failed by the stop, or is not retried by the next
+// start (after the store's close and reopen, and the start's recovery); and
+// if one whose restore failed for another reason is not recorded failed, with
+// the page's Retry. The merge is real (storage.SQLiteStore.MergeSessions): a
+// recording on this unit and one removed, so it starts pending, with a
+// recording and the removal marker, a state no recovery lists. A refinement a
+// stop cut off while it ran is the recovery's control.
 func TestAMergedRefinementTheStopCutOffIsNotRecordedFailed(t *testing.T) {
-	store := openResumeStore(t, filepath.Join(t.TempDir(), "refine.db"))
-	const id = "20261120090000"
-	endedSessionWithWords(t, store, id, storage.SummaryCompleted)
-	before := refinementOf(t, store, id).RefinementStatus
-	record := newMergedRefinementFailureRecorder(store)
+	for _, stopped := range []bool{true, false} {
+		t.Run(map[bool]string{true: "cut off by the stop", false: "the restore failed (control)"}[stopped], func(t *testing.T) {
+			dir := t.TempDir()
+			dbPath := filepath.Join(dir, "merge-restart.db")
+			store := openResumeStore(t, dbPath)
+			at := time.Date(2026, 11, 20, 9, 0, 0, 0, time.UTC)
+			endedResumeSession(t, store, dir, "local")
+			endedResumeSession(t, store, dir, "removed")
+			if _, err := store.DB().Exec(`UPDATE sessions SET audio_path = '', audio_removed_at = ?, gdrive_folder_id = 'source-folder' WHERE id = 'removed'`, at.Format(time.RFC3339Nano)); err != nil {
+				t.Fatal(err)
+			}
+			if err := store.MergeSessions("merged", []string{"local", "removed"}, at, at.Add(2*time.Hour)); err != nil {
+				t.Fatal(err)
+			}
+			if before := refinementOf(t, store, "merged"); before.RefinementStatus != storage.RefinementPending || before.AudioRemovedAt == "" || before.AudioPath == "" {
+				t.Fatalf("control: the merge left refinement %q, recording %q, removal marker %q; want pending, with both", before.RefinementStatus, before.AudioPath, before.AudioRemovedAt)
+			}
+			path := endedResumeSession(t, store, dir, "running-control")
+			cutOffRefinement(t, store, "running-control", path)
+			guard := storeguard.New(t, store)
+			manager := session.NewManager(store, nil, nil, nil, session.NewDetector(time.Hour), 0)
+			appCtx, stopApp := newAppContext()
+			defer stopApp()
+			restoring := make(chan struct{}, 1)
+			runner := retryRunner(store, func() string { return dir }, func(ctx context.Context, _ storage.Session) (deletionRecordingSet, error) {
+				restoring <- struct{}{}
+				if stopped {
+					<-ctx.Done()
+					return deletionRecordingSet{}, ctx.Err()
+				}
+				return deletionRecordingSet{}, errors.New("drive refused the restore")
+			}, manager.RefineSession, newWarningsRegistry())
+			runner.background = manager
+			hook := mergedSessionHook(manager, store, fixedSummarizer{}, &recordingBroadcaster{}, func(string) {}, runner.retryRefinement, newMergedRefinementFailureRecorder(store))
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				hook(appCtx, "merged") // as the API runs it
+			}()
+			select {
+			case <-restoring:
+			case <-time.After(5 * time.Second):
+				t.Fatal("control: the merge hook did not restore the removed recording")
+			}
+			if stopped {
+				stopApp()
+			} else {
+				// A failure no stop cut off is recorded before any stop:
+				// the hook ends on its own.
+				select {
+				case <-done:
+				case <-time.After(5 * time.Second):
+					t.Fatal("control: the merge hook did not end after its restore failed")
+				}
+			}
+			joinCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if err := manager.StopBackground(joinCtx); err != nil {
+				t.Fatal(err)
+			}
+			guard.Close(t) // as main closes the store after the stop
+			select {
+			case <-done:
+			case <-time.After(5 * time.Second):
+				t.Fatal("the merge hook did not end once the stop had run")
+			}
+			guard.Check(t)
+			atStop := refinementOf(t, store, "merged").RefinementStatus
+			if !stopped {
+				if atStop != storage.RefinementFailed {
+					t.Fatalf("a restore that failed left the refinement %q, want %q, which the page offers Retry for", atStop, storage.RefinementFailed)
+				}
+				return
+			}
+			if atStop == storage.RefinementFailed {
+				t.Fatalf("the stop was recorded as the refinement's failure (%q)", atStop)
+			}
 
-	stopped, stop := context.WithCancelCause(context.Background())
-	stop(stopping.ErrStopped)
-	record(stopped, id, context.Canceled)
-	if got := refinementOf(t, store, id).RefinementStatus; got != before {
-		t.Fatalf("a refinement the stop cut off: refinement status %q, want it left %q", got, before)
+			if err := store.Close(); err != nil {
+				t.Fatal(err)
+			}
+			restarted := openResumeStore(t, dbPath)
+			recoverAtStart(restarted)
+			pending, exhausted, err := restarted.RefinementResumes()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !slices.Contains(pending, "running-control") {
+				t.Fatalf("control: the start owes no retry to a refinement a stop cut off while it ran (owed %v, exhausted %v)", pending, exhausted)
+			}
+			if !slices.Contains(pending, "merged") {
+				t.Fatalf("after the restart the merge's refinement is %q and owed no retry (owed %v, exhausted %v), with the refinement %q when the stop ran", refinementOf(t, restarted, "merged").RefinementStatus, pending, exhausted, atStop)
+			}
+			var retried []string
+			resumeStoppedRefinements(context.Background(), restarted, newWarningsRegistry(), func(_ context.Context, id string) error {
+				retried = append(retried, id)
+				return nil
+			})
+			if !slices.Contains(retried, "merged") {
+				t.Fatalf("the start retried %v, want the merge's refinement among them", retried)
+			}
+		})
 	}
+}
 
-	record(context.Background(), id, errors.New("the recording is gone"))
-	if got := refinementOf(t, store, id).RefinementStatus; got != storage.RefinementFailed {
-		t.Fatalf("control: a refinement that failed: refinement status %q, want %q", got, storage.RefinementFailed)
+// TestAShutdownWaitsForAConciergeStartUnderWay fails if the Concierge's
+// shutdown (lazyConcierge.Stop, which main runs before the store closes)
+// returns while a start the voice's turn-on began still runs: the start
+// writes the store (concierge.New cancels the questions of meetings that
+// ended while it was off), and only then sees the shutdown and stops what it
+// started.
+func TestAShutdownWaitsForAConciergeStartUnderWay(t *testing.T) {
+	cfg := config.Config{GenAIBackend: "gemini", GeminiAPIKey: strings.Repeat("k", 8)}
+	store := conciergeStore(t)
+	at := time.Date(2026, 11, 21, 9, 0, 0, 0, time.UTC)
+	if err := store.CreateSession("ended", at); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.EndSession("ended", at.Add(time.Minute), ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CreateVoiceTask(&storage.VoiceTask{ID: "q1", SessionID: "ended", AskedAt: at, Holder: "session:agent-7"}); err != nil {
+		t.Fatal(err)
+	}
+	guard := storeguard.New(t, store)
+	entered, release := make(chan struct{}), make(chan struct{})
+	var stopped atomic.Bool
+	lazy := newLazyConcierge(func() (*concierge.Concierge, func(), error) {
+		close(entered)
+		<-release
+		c, stop, err := startConcierge(t.Context(), &cfg, store, discardLogger, nil)
+		return c, func() {
+			stop()
+			stopped.Store(true)
+		}, err
+	}, nil, discardLogger)
+	lazy.followEnabled(true)
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("control: turning the voice on started no Concierge")
+	}
+	time.AfterFunc(200*time.Millisecond, func() { close(release) })
+	lazy.Stop()
+	guard.Close(t)
+	if !stopped.Load() {
+		t.Error("the shutdown returned before the start under way had ended and stopped what it started")
+	}
+	time.Sleep(100 * time.Millisecond) // a write the start left would land now
+	guard.Check(t)
+	if task, err := store.VoiceTask("q1"); err != nil || task.State != storage.VoiceTaskCancelled {
+		t.Errorf("control: the start did not write the store before the shutdown returned: q1 = %+v, %v", task, err)
 	}
 }

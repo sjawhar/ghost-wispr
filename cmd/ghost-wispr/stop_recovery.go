@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"net/http"
 	"sync"
 	"time"
 
@@ -13,6 +14,25 @@ import (
 // lifecyclePublishWait bounds the stop's wait for the current session's
 // lifecycle events to reach the hub (session.Manager.WaitForLifecyclePublishes).
 const lifecyclePublishWait = 5 * time.Second
+
+// httpShutdownWait bounds the stop's wait for the requests under way to end
+// (stopServing): a long download must not use the time the store's work has
+// to end in.
+const httpShutdownWait = 5 * time.Second
+
+// stopServing stops server taking requests and waits, for wait at most and
+// within ctx, for those under way to end, then closes the connections still
+// open. The stop runs it before it waits for the store's work, so no request
+// starts store work once that wait has begun. The work a request admitted
+// through the session manager is waited for there.
+func stopServing(ctx context.Context, server *http.Server, wait time.Duration) {
+	waitCtx, cancel := context.WithTimeout(ctx, wait)
+	defer cancel()
+	if err := server.Shutdown(waitCtx); err != nil {
+		slog.Warn("requests under way did not end before shutdown; closing their connections", "error", err, "waited", wait)
+		_ = server.Close()
+	}
+}
 
 // newAppContext is the app's context. stop ends it at shutdown with the cause
 // stopping.ErrStopped, so work it cuts off reads, as work the session

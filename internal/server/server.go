@@ -177,7 +177,14 @@ type ControlHooks struct {
 	// sessionIDs (a session and those merged into it) until release is
 	// called: a session delete takes it before it hides any file, and
 	// releases it once the files have left their names.
-	HoldSessionAudio        func(sessionIDs []string) (release func())
+	HoldSessionAudio func(sessionIDs []string) (release func())
+	// GoStoreWork starts work that writes the store after a request has
+	// been answered, as work the app's stop cuts off and waits for
+	// (session.Manager.Go): a session delete's erase of its raw recordings,
+	// which then clears their reservations. Once the stop has run it starts
+	// nothing, and the start's recovery finishes the erase. nil starts the
+	// work on a goroutine of its own, which nothing waits for (tests).
+	GoStoreWork             func(work func(ctx context.Context))
 	OnSessionsMerged        func(sessionIDs []string)
 	OnSessionMerged         func(ctx context.Context, sessionID string)
 	EndSession              func(ctx context.Context) error

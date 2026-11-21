@@ -12,10 +12,16 @@ import (
 type mergedHookStore struct {
 	session storage.Session
 	err     error
+	claimed []string // the audio paths a refinement was claimed for
 }
 
 func (s *mergedHookStore) GetSession(string) (storage.Session, error) {
 	return s.session, s.err
+}
+
+func (s *mergedHookStore) ClaimRefinement(_, audioPath string) (int, bool, error) {
+	s.claimed = append(s.claimed, audioPath)
+	return 0, true, nil
 }
 
 func TestOnSessionMergedRefinesAudioAndSummarizesOnce(t *testing.T) {

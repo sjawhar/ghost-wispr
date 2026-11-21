@@ -772,9 +772,9 @@ func TestDeleteSession_ZeroesItsRawPCM(t *testing.T) {
 	rawFinish := finishRawErasing
 	t.Cleanup(func() { finishRawErasing = rawFinish })
 	rawFinished := make(chan struct{})
-	finishRawErasing = func(store SessionStore, reservations []rawEraseReservation) {
+	finishRawErasing = func(ctx context.Context, store SessionStore, reservations []rawEraseReservation) {
 		defer close(rawFinished)
-		rawFinish(store, reservations)
+		rawFinish(ctx, store, reservations)
 	}
 	store := &apiStoreStub{
 		sessionsByDate: map[string][]storage.Session{},
@@ -4673,10 +4673,10 @@ func TestDeleteSessionHidesEveryMergedSourceRawPCM(t *testing.T) {
 			close(release)
 		}
 	})
-	finishRawErasing = func(store SessionStore, reservations []rawEraseReservation) {
+	finishRawErasing = func(ctx context.Context, store SessionStore, reservations []rawEraseReservation) {
 		close(entered)
 		<-release
-		finish(store, reservations)
+		finish(ctx, store, reservations)
 	}
 
 	checkedStore := &sourceRawPredeleteStore{

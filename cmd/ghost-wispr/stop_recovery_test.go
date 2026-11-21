@@ -20,6 +20,7 @@ import (
 	"github.com/sjawhar/ghost-wispr/internal/session"
 	"github.com/sjawhar/ghost-wispr/internal/stopping"
 	"github.com/sjawhar/ghost-wispr/internal/storage"
+	"github.com/sjawhar/ghost-wispr/internal/storeguard"
 	"github.com/sjawhar/ghost-wispr/internal/transcribe"
 )
 
@@ -472,12 +473,14 @@ func endedSessionWithWords(t *testing.T, store *storage.SQLiteStore, id, summary
 }
 
 // stopDuringSummary runs the stop, as main runs it, once summarizer is inside
-// its call, and fails if the stop does not wait the summarizer's stall, or if
+// its call, and fails if the stop does not wait the summarizer's stall, if
 // session id's summary is not left running, with no error, for the next
-// start's backfill. before runs just before the stop, as main's other
-// shutdown steps do; nil runs nothing.
+// start's backfill, or if anything writes the store once the stop has
+// returned, when main closes the store (storeguard). before runs just before
+// the stop, as main's other shutdown steps do; nil runs nothing.
 func stopDuringSummary(t *testing.T, store *storage.SQLiteStore, manager *session.Manager, summarizer *heldSummarizer, id string, before func()) {
 	t.Helper()
+	guard := storeguard.New(t, store)
 	select {
 	case <-summarizer.entered:
 	case <-time.After(5 * time.Second):
@@ -490,7 +493,9 @@ func stopDuringSummary(t *testing.T, store *storage.SQLiteStore, manager *sessio
 		before()
 	}
 	recoverAtStart(store).stop(shutdownCtx, manager, lifecyclePublishWait)
-	if took := time.Since(began); took < summarizer.stall || took > time.Second {
+	took := time.Since(began)
+	guard.Close(t)
+	if took < summarizer.stall || took > time.Second {
 		t.Fatalf("the shutdown took %v, want it to wait the %v its cut-off summary takes, and no longer", took, summarizer.stall)
 	}
 	got := refinementOf(t, store, id)
@@ -500,6 +505,8 @@ func stopDuringSummary(t *testing.T, store *storage.SQLiteStore, manager *sessio
 	if ids, err := store.GetSessionsForBackfill(); err != nil || !slices.Contains(ids, id) {
 		t.Fatalf("the next start's backfill takes %v (%v), want session %s", ids, err, id)
 	}
+	time.Sleep(2 * summarizer.stall) // work the stop left would write now
+	guard.Check(t)
 }
 
 // TestTheStopWaitsForTheStartsSummaryBackfill fails if the stop returns while
