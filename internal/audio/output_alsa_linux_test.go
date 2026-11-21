@@ -4,6 +4,7 @@ package audio
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"math"
 	"runtime"
@@ -58,6 +59,13 @@ type fakePCM struct {
 	closed  bool
 	xruns   int
 	minHeld int // the fewest frames it held at a write once running: the headroom left
+	// suspended makes a write report -ESTRPIPE, as after a system suspend,
+	// until a resume or a prepare; resumes says a resume succeeds and loses
+	// nothing, else the suspend stopped the device and only a prepare, which
+	// discards what it held, brings it back. suspendHeld is what it held then,
+	// which its status reports.
+	suspended, resumes bool
+	suspendHeld        int
 }
 
 func newFakePCM(rate, buffer int) *fakePCM {
@@ -105,6 +113,12 @@ func (p *fakePCM) writei(interleaved []int16, frames int) int {
 	defer p.mu.Unlock()
 	written := 0
 	for {
+		if p.suspended {
+			if written > 0 {
+				return written
+			}
+			return -int(syscall.ESTRPIPE)
+		}
 		if p.xrun {
 			if written > 0 {
 				return written
@@ -152,11 +166,57 @@ func (p *fakePCM) writei(interleaved []int16, frames int) int {
 	}
 }
 
+// recover recovers as snd_pcm_recover does: an underrun by a prepare; a
+// suspend by a resume, else by a prepare, which discards what the PCM held
+// and still reports success.
 func (p *fakePCM) recover(rc int) int {
-	if rc != -int(syscall.EPIPE) {
-		return rc
+	switch rc {
+	case -int(syscall.EPIPE):
+		return p.prepare()
+	case -int(syscall.ESTRPIPE):
+		if p.resume() >= 0 {
+			return 0
+		}
+		return p.prepare()
 	}
-	return p.prepare()
+	return rc
+}
+
+// suspend suspends the PCM, as the system does: what the device has taken
+// plays out, and what it holds stays until a resume, or is lost to a
+// prepare.
+func (p *fakePCM) suspend() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	run := p.runs[len(p.runs)-1]
+	consumed := p.consumed(run, time.Now())
+	p.suspended, p.suspendHeld = true, len(run.samples)-consumed
+	if !p.resumes {
+		run.heard, run.stopped = consumed, true
+	}
+}
+
+func (p *fakePCM) resume() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if !p.suspended {
+		return 0
+	}
+	if !p.resumes {
+		return -int(syscall.ENOSYS)
+	}
+	p.suspended = false
+	return 0
+}
+
+func (p *fakePCM) statusAvail() int {
+	p.mu.Lock()
+	suspended, held := p.suspended, p.suspendHeld
+	p.mu.Unlock()
+	if suspended {
+		return p.buffer - held
+	}
+	return p.avail()
 }
 
 func (p *fakePCM) avail() int {
@@ -218,7 +278,7 @@ func (p *fakePCM) prepare() int {
 		run.heard, run.stopped = 0, true // a prepared PCM that never started played nothing
 	}
 	p.runs = append(p.runs, &pcmRun{})
-	p.xrun = false
+	p.xrun, p.suspended = false, false
 	return 0
 }
 
@@ -287,13 +347,14 @@ func streamOn(pcm *fakePCM) *alsaStream {
 // TestALSAOutputCancelSilencesTheVoiceWithin20ms fails if the room still
 // hears the voice more than 20 ms after Cancel on the ALSA path, where the
 // device holds alsaBuffer that it has not played, and a few milliseconds more
-// are in flight to the speaker, as on USB:
-//   - a PCM that rewinds takes back what the device holds, and the chime,
-//     which plays on, loses nothing and repeats nothing: exactly the frames
+// are in flight to the speaker, as on USB, or if the chime, which plays on,
+// loses or repeats a frame:
+//   - a PCM that rewinds takes back what the device holds: exactly the frames
 //     ALSA took back play again without the voice;
 //   - a PCM that cannot rewind drops what it holds instead;
 //   - a PCM whose audio in flight would play on for more than the bound
-//     after a rewind is dropped too, which cuts what is in flight.
+//     after a rewind is dropped too, which cuts what is in flight: that plays
+//     again too, without the voice, as the room would not hear it otherwise.
 //
 // The voice is positive and the chime negative, so that each sample tells
 // which plays in it, the voice ducked under the chime included.
@@ -304,12 +365,11 @@ func streamOn(pcm *fakePCM) *alsaStream {
 // slows the run but cannot stretch it.
 func TestALSAOutputCancelSilencesTheVoiceWithin20ms(t *testing.T) {
 	for _, tc := range []struct {
-		name       string
-		inflight   time.Duration
-		noRewind   bool
-		exactChime bool // the chime plays every frame once
+		name     string
+		inflight time.Duration
+		noRewind bool
 	}{
-		{name: "rewind", inflight: 3 * time.Millisecond, exactChime: true},
+		{name: "rewind", inflight: 3 * time.Millisecond},
 		{name: "no rewind, so drop", inflight: 3 * time.Millisecond, noRewind: true},
 		{name: "rewind leaves too long a tail, so drop", inflight: 30 * time.Millisecond},
 	} {
@@ -320,6 +380,12 @@ func TestALSAOutputCancelSilencesTheVoiceWithin20ms(t *testing.T) {
 			pcm.fireAt, pcm.fire = 48000/5, func() { out.Cancel(InputVoice) }
 			ctx := testContext(t)
 			voice, chime := out.Begin(InputVoice), out.Begin(InputChime)
+			// The voice's first audio is queued before anything else, so a
+			// goroutine a loaded machine runs late cannot leave the voice
+			// silent until the Cancel.
+			if err := voice.Write(ctx, constant(48000, 20*time.Millisecond, 1000), mono48k); err != nil {
+				t.Fatal(err)
+			}
 			go func() { _ = voice.WriteAll(ctx, constant(48000, 2*time.Second, 1000), mono48k) }()
 			chimed := make(chan error, 1)
 			go func() {
@@ -358,11 +424,8 @@ func TestALSAOutputCancelSilencesTheVoiceWithin20ms(t *testing.T) {
 			if heard > 20*time.Millisecond {
 				t.Fatalf("the room heard the voice for %v of stream time after Cancel, want silence within 20 ms", heard)
 			}
-			if tc.exactChime && chimeFrames != 24000 {
+			if chimeFrames != 24000 {
 				t.Fatalf("the room heard %d frames of the chime, want each of its 24000 (500 ms) once", chimeFrames)
-			}
-			if lost := 24000 - chimeFrames; !tc.exactChime && (lost < 0 || lost > pcm.inflight) {
-				t.Fatalf("the room heard %d frames of the chime: a drop may lose only the %d in flight", chimeFrames, pcm.inflight)
 			}
 		})
 	}
@@ -705,5 +768,97 @@ func TestOutputPlaysThroughALSAWithoutPortAudio(t *testing.T) {
 	// Control: the count sees an initialization.
 	if err := InitializePortAudio(); err != nil || initialized.Load() != 1 {
 		t.Fatalf("control: InitializePortAudio = %v, counted %d initializations, want 1", err, initialized.Load())
+	}
+}
+
+// voiceFramesHeard counts the frames the room heard of a 1000-level voice:
+// alone, going down under a chime, or ducked under a -500 chime.
+func voiceFramesHeard(pcm *fakePCM) int {
+	n := 0
+	pcm.heardInStreamTime(func(sample int16, _ int) {
+		if sample > 0 || sample == duckedUnderChime {
+			n++
+		}
+	})
+	return n
+}
+
+// TestACancelOfTheChimeLosesNoneOfTheVoiceInFlight fails if a Cancel of the
+// chime alone loses audio of the voice, which plays on: with 30 ms in flight
+// to the speaker, the stream drops the PCM, which also cuts what is in
+// flight, and the voice's 20 ms, in flight, were lost though nothing cut
+// them (Sol's review of #133 at 4b7f919: all 960 frames). The 3 ms control
+// rewinds, and the voice in flight plays out.
+func TestACancelOfTheChimeLosesNoneOfTheVoiceInFlight(t *testing.T) {
+	for _, inflight := range []time.Duration{3 * time.Millisecond, 30 * time.Millisecond} {
+		t.Run(fmt.Sprintf("%v in flight", inflight), func(t *testing.T) {
+			pcm := newFakePCM(48000, 48000*int(alsaBuffer/time.Millisecond)/1000)
+			pcm.inflight, pcm.lockstep = int(48*inflight/time.Millisecond), true
+			gate := make(chan struct{})
+			out := NewOutput(OutputConfig{IdleClose: 100 * time.Millisecond, Open: func(string) (PlaybackStream, int, error) {
+				<-gate
+				return streamOn(pcm), pcm.rate, nil
+			}})
+			t.Cleanup(func() { _ = out.Close() })
+			// The voice is the stream's first 960 frames: at the device's
+			// frame 1000, all of it is in flight with 30 ms, and the last of it
+			// with 3 ms.
+			pcm.fireAt, pcm.fire = 1000, func() { out.Cancel(InputChime) }
+			ctx := testContext(t)
+			if err := out.Begin(InputVoice).WriteAll(ctx, constant(48000, 20*time.Millisecond, 1000), mono48k); err != nil {
+				t.Fatal(err)
+			}
+			if err := out.Begin(InputChime).WriteAll(ctx, constant(48000, 200*time.Millisecond, -500), mono48k); err != nil {
+				t.Fatal(err)
+			}
+			close(gate)
+			waitFor(t, "the idle stream to close", pcm.isClosed)
+			if _, fired := pcm.cancelClock(); !fired {
+				t.Fatal("control: the device never reached the Cancel")
+			}
+			if got := voiceFramesHeard(pcm); got != 960 {
+				t.Fatalf("the room heard %d frames of the voice, want each of its 960 (20 ms) once", got)
+			}
+		})
+	}
+}
+
+// TestASuspendTheSpeakerCannotResumeFromLosesNoAudio fails if a suspend of
+// the PCM, as of the system, loses or repeats audio: a PCM that cannot resume
+// is prepared, which discards what it holds, and the stream went on as after
+// a lossless recovery (Sol's review of #133 at 4b7f919: the room heard 960 of
+// a speech's 4,800 frames). What it held plays again from the Output's
+// history. The control resumes, and loses nothing.
+func TestASuspendTheSpeakerCannotResumeFromLosesNoAudio(t *testing.T) {
+	for _, resumes := range []bool{true, false} {
+		t.Run(fmt.Sprintf("it resumes %v", resumes), func(t *testing.T) {
+			pcm := newFakePCM(48000, 48000*int(alsaBuffer/time.Millisecond)/1000)
+			pcm.lockstep, pcm.resumes = true, resumes
+			gate := make(chan struct{})
+			out := NewOutput(OutputConfig{IdleClose: 100 * time.Millisecond, Open: func(string) (PlaybackStream, int, error) {
+				<-gate
+				return streamOn(pcm), pcm.rate, nil
+			}})
+			t.Cleanup(func() { _ = out.Close() })
+			// The 100 ms speech is frames 0-4799; at the device's frame 1440
+			// it holds 3360 of them.
+			pcm.fireAt, pcm.fire = 1440, pcm.suspend
+			ctx := testContext(t)
+			pb := out.Begin(InputVoice)
+			if err := pb.WriteAll(ctx, constant(48000, 100*time.Millisecond, 1000), mono48k); err != nil {
+				t.Fatal(err)
+			}
+			close(gate)
+			if err := pb.Drain(ctx); err != nil {
+				t.Fatalf("the speech's Drain: %v", err)
+			}
+			waitFor(t, "the idle stream to close", pcm.isClosed)
+			if _, fired := pcm.cancelClock(); !fired {
+				t.Fatal("control: the device never reached the suspend")
+			}
+			if got := voiceFramesHeard(pcm); got != 4800 {
+				t.Fatalf("the room heard %d frames of the speech, want each of its 4800 (100 ms) once", got)
+			}
+		})
 	}
 }
