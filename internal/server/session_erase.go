@@ -172,7 +172,11 @@ func deleteSessionErasingAudio(store SessionStore, sessionID, recordingDir strin
 		}
 	}
 	if len(rawReservations) > 0 {
-		finish := func(ctx context.Context) { finishRawErasing(ctx, store, rawReservations) }
+		// The function is read here, as a go statement would read it, not
+		// in the goroutine: a test replaces it, and a late erase must not
+		// read it then.
+		erase := finishRawErasing
+		finish := func(ctx context.Context) { erase(ctx, store, rawReservations) }
 		if goStoreWork != nil {
 			goStoreWork(finish)
 		} else {
