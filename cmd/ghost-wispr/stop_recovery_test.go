@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -13,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/sjawhar/ghost-wispr/internal/envoy"
 	"github.com/sjawhar/ghost-wispr/internal/logtest"
 	recordingname "github.com/sjawhar/ghost-wispr/internal/recording"
 	"github.com/sjawhar/ghost-wispr/internal/session"
@@ -469,8 +471,9 @@ func endedSessionWithWords(t *testing.T, store *storage.SQLiteStore, id, summary
 // stopDuringSummary runs the stop, as main runs it, once summarizer is inside
 // its call, and fails if the stop does not wait the summarizer's stall, or if
 // session id's summary is not left running, with no error, for the next
-// start's backfill.
-func stopDuringSummary(t *testing.T, store *storage.SQLiteStore, manager *session.Manager, summarizer *heldSummarizer, id string) {
+// start's backfill. before runs just before the stop, as main's other
+// shutdown steps do; nil runs nothing.
+func stopDuringSummary(t *testing.T, store *storage.SQLiteStore, manager *session.Manager, summarizer *heldSummarizer, id string, before func()) {
 	t.Helper()
 	select {
 	case <-summarizer.entered:
@@ -480,9 +483,12 @@ func stopDuringSummary(t *testing.T, store *storage.SQLiteStore, manager *sessio
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	began := time.Now()
+	if before != nil {
+		before()
+	}
 	recoverAtStart(store).stop(shutdownCtx, manager, lifecyclePublishWait)
 	if took := time.Since(began); took < summarizer.stall || took > time.Second {
-		t.Fatalf("the stop took %v, want it to wait the %v its cut-off summary takes, and no longer", took, summarizer.stall)
+		t.Fatalf("the shutdown took %v, want it to wait the %v its cut-off summary takes, and no longer", took, summarizer.stall)
 	}
 	got := refinementOf(t, store, id)
 	if got.SummaryStatus != storage.SummaryRunning || got.SummaryError != "" {
@@ -503,14 +509,113 @@ func TestTheStopWaitsForTheStartsSummaryBackfill(t *testing.T) {
 	endedSessionWithWords(t, store, id, storage.SummaryFailed)
 	manager := session.NewManager(store, nil, nil, nil, session.NewDetector(time.Hour), 0)
 	summarizer := &heldSummarizer{entered: make(chan struct{}), stall: 100 * time.Millisecond}
-	startSummaryBackfill(t.Context(), manager, summaryBackfill{
-		store: store, summarizer: summarizer, publish: func(string) {}, pollEvery: time.Second,
+	startSummaryBackfill(t.Context(), manager, failingBatchBackfill(store, summarizer, func(string) {}))
+	stopDuringSummary(t, store, manager, summarizer, id, nil)
+}
+
+// failingBatchBackfill is the start's summary backfill with summarizer, whose
+// batch job cannot be made, so it summarizes session by session.
+func failingBatchBackfill(store *storage.SQLiteStore, summarizer session.ReportedSummarizer, publish func(string)) summaryBackfill {
+	return summaryBackfill{
+		store: store, summarizer: summarizer, publish: publish, pollEvery: time.Second,
 		submit: func(context.Context, []string) (string, int, error) {
 			return "", 0, errors.New("no batch for one session")
 		},
 		poll: func(context.Context, string) (map[string]any, error) { return nil, errors.New("no batch") },
-	})
-	stopDuringSummary(t, store, manager, summarizer, id)
+	}
+}
+
+// TestMainsShutdownLeavesTheBackfillsSummaryForTheNextStart fails if main's
+// shutdown, in main's order (the app's context ends first, then the stop),
+// records the summary the start's backfill was making as failed, instead of
+// leaving it running, with no error, for the next start: the backfill runs on
+// the app's context, whose end must say the stop cut it off.
+func TestMainsShutdownLeavesTheBackfillsSummaryForTheNextStart(t *testing.T) {
+	store := openResumeStore(t, filepath.Join(t.TempDir(), "backfill.db"))
+	const id = "20261120090000"
+	endedSessionWithWords(t, store, id, storage.SummaryFailed)
+	manager := session.NewManager(store, nil, nil, nil, session.NewDetector(time.Hour), 0)
+	summarizer := &heldSummarizer{entered: make(chan struct{}), stall: 100 * time.Millisecond}
+	appCtx, stopApp := newAppContext()
+	t.Cleanup(stopApp)
+	startSummaryBackfill(appCtx, manager, failingBatchBackfill(store, summarizer, func(string) {}))
+	stopDuringSummary(t, store, manager, summarizer, id, stopApp)
+}
+
+// fixedSummarizer makes the same summary of every transcript at once.
+type fixedSummarizer struct{}
+
+func (fixedSummarizer) Summarize(context.Context, string, string) (string, string, string, string, error) {
+	return "A title", "A summary.", "general", "{}", nil
+}
+
+func (fixedSummarizer) SummarizeWithPreset(context.Context, string, string, string) (string, string, string, error) {
+	return "A title", "A summary.", "{}", nil
+}
+
+func (fixedSummarizer) SummarizeReported(context.Context, string, string) (string, string, string, string, string, error) {
+	return "A title", "A summary.", "general", "{}", "test-model", nil
+}
+
+// TestTheStopWaitsForTheSummarysEnvoyPublish fails if the stop returns while
+// the Envoy publish of a summary the start's backfill or the API made, through
+// main's real publish (envoyPublishing.publishSummaryReady and the real
+// publisher), still waits on the hub: the store then closes under it, and its
+// delivery-status write after the hub answers fails with "sql: database is
+// closed". The hub holds the publish until the store has closed.
+func TestTheStopWaitsForTheSummarysEnvoyPublish(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		status  string // the summary status that brings the session to the path
+		summary func(manager *session.Manager, store *storage.SQLiteStore, publish func(string), id string)
+	}{
+		{"the start's backfill", storage.SummaryFailed, func(manager *session.Manager, store *storage.SQLiteStore, publish func(string), _ string) {
+			startSummaryBackfill(context.Background(), manager, failingBatchBackfill(store, fixedSummarizer{}, publish))
+		}},
+		{"a requested summary", storage.SummaryCompleted, func(manager *session.Manager, store *storage.SQLiteStore, publish func(string), id string) {
+			hook := resummarizeUntilStop(manager, store, fixedSummarizer{}, &recordingBroadcaster{}, publish)
+			go func() { _ = hook(context.Background(), id, "") }() // as the API runs it
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			hub := newEnvoyHub(t)
+			arrived, release := hub.holdFirstPost(t)
+			store, err := storage.NewSQLiteStore(filepath.Join(t.TempDir(), "publish.db"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			const id = "20261120090000"
+			endedSessionWithWords(t, store, id, tc.status)
+			manager := session.NewManager(store, nil, nil, nil, session.NewDetector(time.Hour), 0)
+			publishing := &envoyPublishing{store: store, manager: manager, warnings: newWarningsRegistry()}
+			pub, err := envoy.NewPublisher(hub.URL, store, envoy.WithLogger(discardLogger))
+			if err != nil {
+				t.Fatal(err)
+			}
+			publishing.set(pub) // no sweep: only the summary's publish reaches the hub
+			tc.summary(manager, store, publishing.publishSummaryReady, id)
+			select {
+			case <-arrived:
+			case <-time.After(testWait):
+				t.Fatal("control: the summary's publish never reached the hub")
+			}
+
+			logs := logtest.Capture(t)
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			recoverAtStart(store).stop(shutdownCtx, manager, lifecyclePublishWait)
+			if err := store.Close(); err != nil { // as main's deferred Close does
+				t.Fatal(err)
+			}
+			release()
+			time.Sleep(300 * time.Millisecond) // a publish the stop left would write now
+			for _, record := range logs.Records() {
+				if strings.Contains(fmt.Sprint(record.Attrs), "database is closed") || strings.Contains(record.Message, "database is closed") {
+					t.Fatalf("after the stop and the store's close, the publish wrote to the store: %s %v", record.Message, record.Attrs)
+				}
+			}
+		})
+	}
 }
 
 // TestTheStopWaitsForARequestedSummary fails if the stop returns while a
@@ -525,7 +630,7 @@ func TestTheStopWaitsForARequestedSummary(t *testing.T) {
 	summarizer := &heldSummarizer{entered: make(chan struct{}), stall: 100 * time.Millisecond}
 	hook := resummarizeUntilStop(manager, store, summarizer, &recordingBroadcaster{}, func(string) {})
 	go func() { _ = hook(context.Background(), id, "minutes") }() // as the API runs it
-	stopDuringSummary(t, store, manager, summarizer, id)
+	stopDuringSummary(t, store, manager, summarizer, id, nil)
 	if err := hook(context.Background(), id, ""); !errors.Is(err, session.ErrStopped) {
 		t.Fatalf("a requested summary after the stop = %v, want %v", err, session.ErrStopped)
 	}

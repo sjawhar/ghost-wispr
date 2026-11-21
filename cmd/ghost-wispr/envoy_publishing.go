@@ -50,7 +50,12 @@ func (e *envoyPublishing) configure(ctx context.Context, cfg *config.Config, log
 	e.warnings.Clear(envoyWarningKey)
 	e.set(pub)
 	log.Printf("envoy hub publishing enabled")
-	go e.sweepWith(ctx, pub)
+	go func() {
+		_ = e.manager.Run(ctx, func(ctx context.Context) error {
+			e.sweepWith(ctx, pub)
+			return nil
+		})
+	}()
 }
 
 func (e *envoyPublishing) set(pub *envoy.Publisher) {
@@ -64,10 +69,14 @@ func (e *envoyPublishing) set(pub *envoy.Publisher) {
 }
 
 // sweep sends what Envoy has not received: lifecycle events and completed
-// summaries, from before an outage.
+// summaries, from before an outage. It runs as work the stop cuts off and
+// waits for (session.Manager.Run), since it writes each delivery's status.
 func (e *envoyPublishing) sweep(ctx context.Context) {
 	if pub := e.current.Load(); pub != nil {
-		e.sweepWith(ctx, pub)
+		_ = e.manager.Run(ctx, func(ctx context.Context) error {
+			e.sweepWith(ctx, pub)
+			return nil
+		})
 	}
 }
 
@@ -87,32 +96,36 @@ func (e *envoyPublishing) sweepWith(ctx context.Context, pub *envoy.Publisher) {
 	}
 }
 
-// publishSummaryReady sends a session's summary_ready in the background.
+// publishSummaryReady sends a session's summary_ready in the background, as
+// work the stop cuts off and waits for (session.Manager.Go): the publish
+// writes its delivery status once the hub answers, and the store must not
+// close under it. One the stop cuts off stays pending for the next sweep.
 func (e *envoyPublishing) publishSummaryReady(sessionID string) {
 	pub := e.current.Load()
 	if pub == nil {
 		return
 	}
-	go func() {
-		if err := pub.PublishSummaryReady(context.Background(), sessionID); err != nil {
+	e.manager.Go(func(ctx context.Context) {
+		if err := pub.PublishSummaryReady(ctx, sessionID); err != nil {
 			slog.Warn("envoy publish failed", "session_id", sessionID, "error", err)
 		}
-	}()
+	})
 }
 
 // publishRecoveredEnds sends session_ended, in the background, for sessions a
-// restart found still active and ended.
+// restart found still active and ended, as work the stop cuts off and waits
+// for. An event the stop cuts off stays pending for the next sweep.
 func (e *envoyPublishing) publishRecoveredEnds(ids []string) {
 	pub := e.current.Load()
 	if pub == nil || len(ids) == 0 {
 		return
 	}
 	ids = slices.Clone(ids)
-	go func() {
+	e.manager.Go(func(ctx context.Context) {
 		for _, sessionID := range ids {
-			if err := pub.PublishSessionEnded(context.Background(), sessionID); err != nil {
+			if err := pub.PublishSessionEnded(ctx, sessionID); err != nil {
 				slog.Warn("failed to publish recovered session end", "session_id", sessionID, "error", err)
 			}
 		}
-	}()
+	})
 }

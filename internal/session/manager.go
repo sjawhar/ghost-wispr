@@ -65,7 +65,7 @@ type Manager struct {
 
 	// background is the context of the work a session's end leaves running:
 	// its refinement and its summary, and the sync, index and publish a
-	// summary starts (goBackground). StopBackground cancels it with
+	// summary starts (Go). StopBackground cancels it with
 	// ErrStopped and waits for that work, so the store closes under none of
 	// it; once stopped (backgroundStopped, under mu), no more starts.
 	// backgroundRunning, under mu, counts the work still running.
@@ -683,16 +683,19 @@ func (m *Manager) endSession(ctx context.Context, want string) error {
 	m.mu.Unlock()
 
 	if batchTranscriber != nil && strings.TrimSpace(end.audioPath) != "" {
-		m.goBackground(func(ctx context.Context) { m.runBatchRefinement(ctx, sessionID, end.audioPath) })
+		m.Go(func(ctx context.Context) { m.runBatchRefinement(ctx, sessionID, end.audioPath) })
 	}
 
-	m.goBackground(func(ctx context.Context) { m.generateSummary(ctx, sessionID, startedAt) })
+	m.Go(func(ctx context.Context) { m.generateSummary(ctx, sessionID, startedAt) })
 	return nil
 }
 
-// goBackground runs f in the background on the background context, unless
-// StopBackground has run: work it starts then is left to the next start.
-func (m *Manager) goBackground(f func(ctx context.Context)) {
+// Go runs f in the background on the background context, as work
+// StopBackground cancels and waits for, unless StopBackground has run: work
+// it starts then is left to the next start. The app runs through it what it
+// starts after a summary and must not outlive the store: the summary's Envoy
+// publish.
+func (m *Manager) Go(f func(ctx context.Context)) {
 	if !m.beginBackground() {
 		return
 	}
@@ -977,7 +980,7 @@ func (m *Manager) generateSummary(ctx context.Context, sessionID string, started
 	m.triggerDriveSync(syncer, sessionID)
 
 	if publisher != nil {
-		m.goBackground(func(ctx context.Context) {
+		m.Go(func(ctx context.Context) {
 			if err := publisher.PublishSummaryReady(ctx, sessionID); err != nil {
 				m.logger.Error("envoy publish failed", "operation", "publish_summary_ready", "session_id", sessionID, "error", err)
 			}
@@ -989,7 +992,7 @@ func (m *Manager) triggerDriveSync(syncer SessionSyncer, sessionID string) {
 	if syncer == nil {
 		return
 	}
-	m.goBackground(func(ctx context.Context) {
+	m.Go(func(ctx context.Context) {
 		if err := syncer.SyncSession(ctx, sessionID); err != nil {
 			m.logger.Error("gdrive sync failed", "operation", "sync_session", "session_id", sessionID, "error", err)
 			if m.hub != nil {
@@ -1188,7 +1191,7 @@ func (m *Manager) triggerEmbeddingIndexAtGeneration(sessionID, transcript string
 		return
 	}
 
-	m.goBackground(func(background context.Context) {
+	m.Go(func(background context.Context) {
 		ctx, cancel := context.WithTimeout(background, 45*time.Second)
 		defer cancel()
 		if err := indexer.IndexSessionAtGeneration(ctx, sessionID, transcript, generation); err != nil {

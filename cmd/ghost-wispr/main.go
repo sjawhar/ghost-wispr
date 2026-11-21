@@ -1114,9 +1114,10 @@ func main() {
 		startupSummarizer.OnResult = llmHealthOnResult
 	}
 
-	// ctx ends at shutdown; the capture gate's pause and the mic loops stop with it.
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	// ctx ends at shutdown; the capture gate's pause and the mic loops stop
+	// with it, and work it cuts off reads as stopped (newAppContext).
+	ctx, stopApp := newAppContext()
+	defer stopApp()
 
 	var resilientRef atomic.Pointer[transcribe.ResilientClient]
 	var deepgramSendRef atomic.Pointer[transcribe.AsyncSender]
@@ -2182,7 +2183,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 	log.Println("ghost-wispr: shutting down")
 	// The voice stops first: its session, its speech and the Concierge's calls.
 	voiceHooks.Close()
-	cancel()
+	stopApp()
 	manager.StopSessionStartPublishes()
 	// Each mic loop closes its microphone and ends, even if its device
 	// delivers no frame. Stopping the device or terminating PortAudio while a

@@ -6,11 +6,22 @@ import (
 	"log/slog"
 	"sync"
 	"time"
+
+	"github.com/sjawhar/ghost-wispr/internal/session"
 )
 
 // lifecyclePublishWait bounds the stop's wait for the current session's
 // lifecycle events to reach the hub (session.Manager.WaitForLifecyclePublishes).
 const lifecyclePublishWait = 5 * time.Second
+
+// newAppContext is the app's context. stop ends it at shutdown with the cause
+// session.ErrStopped, so work it cuts off reads, as work the session
+// manager's stop cuts off does, as stopped and not as failed: the start's
+// summary backfill leaves its summary running for the next start.
+func newAppContext() (ctx context.Context, stop func()) {
+	ctx, cancel := context.WithCancelCause(context.Background())
+	return ctx, func() { cancel(session.ErrStopped) }
+}
 
 // stopRecoveryStore is what the app keeps in the store about the
 // refinements a stop cuts off (storage.RecoverStaleRefinements).
