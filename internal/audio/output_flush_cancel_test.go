@@ -61,7 +61,7 @@ func TestASecondCancelKeepsTheFirstCancelsTime(t *testing.T) {
 			t.Cleanup(release)
 			events := make(chan SpeechEvent, 16)
 			defer out.OnSpeech(func(e SpeechEvent) { events <- e })()
-			pb := out.Begin(InputVoice)
+			pb := out.Begin(InputVoice, nil)
 			if err := pb.WriteAll(testContext(t), constant(48000, 100*time.Millisecond, 1000), mono48k); err != nil {
 				t.Fatal(err)
 			}

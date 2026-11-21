@@ -67,7 +67,7 @@ func TestAnEndedSessionsAnswerStopsWhileSpeaking(t *testing.T) {
 func TestExchangePreemptsTTSSpeak(t *testing.T) {
 	r := newRig(t, newFakeConcierge("fact"))
 	var pb Playback
-	if err := r.s.WithFloor(t.Context(), func() { pb = r.speaker.Begin(audio.InputVoice) }); err != nil {
+	if err := r.s.WithFloor(t.Context(), func() { pb = r.speaker.Begin(audio.InputVoice, nil) }); err != nil {
 		t.Fatal(err)
 	}
 	r.heard("Wispr,", false, false) // a wake takes the floor

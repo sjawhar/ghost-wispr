@@ -81,7 +81,7 @@ func TestPortAudioTeardownClosesThePlayingOutput(t *testing.T) {
 			t.Cleanup(func() { paTerminate, paInitialize = origTerminate, origInitialize })
 
 			ctx := testContext(t)
-			pb := out.Begin(InputVoice)
+			pb := out.Begin(InputVoice, nil)
 			written := make(chan error, 1)
 			go func() { written <- pb.WriteAll(ctx, constant(48000, time.Minute, 1000), mono48k) }()
 			playing.waitWriting(t)
@@ -120,7 +120,7 @@ func TestPortAudioTeardownClosesThePlayingOutput(t *testing.T) {
 			if streamOpen {
 				t.Fatal("PortAudio terminated while the speaker's output stream was still open")
 			}
-			pb = out.Begin(InputVoice)
+			pb = out.Begin(InputVoice, nil)
 			if err := pb.WriteAll(ctx, constant(48000, 20*time.Millisecond, 1000), mono48k); err != nil {
 				t.Fatal(err)
 			}
@@ -152,7 +152,7 @@ func TestPortAudioTeardownLeavesPortAudioUpUnderAStuckOutput(t *testing.T) {
 	t.Cleanup(func() { paTerminate, paInitialize, outputStopWait = origTerminate, origInitialize, origWait })
 
 	ctx := testContext(t)
-	go func() { _ = out.Begin(InputVoice).WriteAll(ctx, constant(48000, time.Second, 1000), mono48k) }()
+	go func() { _ = out.Begin(InputVoice, nil).WriteAll(ctx, constant(48000, time.Second, 1000), mono48k) }()
 	stuck.waitWriting(t)
 	if err := ReinitPortAudio(); err == nil {
 		t.Error("ReinitPortAudio succeeded with a speaker stream stuck open")
@@ -178,7 +178,7 @@ func TestPortAudioTeardownLeavesALSAOutputPlaying(t *testing.T) {
 	t.Cleanup(func() { paTerminate, paInitialize = origTerminate, origInitialize })
 
 	ctx := testContext(t)
-	pb := out.Begin(InputVoice)
+	pb := out.Begin(InputVoice, nil)
 	played := make(chan error, 1)
 	go func() {
 		err := pb.WriteAll(ctx, constant(48000, 300*time.Millisecond, 1000), mono48k)

@@ -262,7 +262,7 @@ func (o *Orchestrator) play(resp *SpeechResponse) (bytesWritten, durationMs int6
 		pcm = pcm[:len(pcm)-len(pcm)%(2*format.Channels)] // whole frames
 	}
 	var playback *audio.Playback
-	begin := func() { playback = o.output.Begin(audio.InputVoice) }
+	begin := func() { playback = o.output.Begin(audio.InputVoice, nil) } // speech of no exchange's
 	if o.opts.Floor != nil {
 		if err := o.opts.Floor(o.ctx, begin); err != nil {
 			return 0, 0, err

@@ -103,7 +103,7 @@ func TestAStopEndsTheAnswerChimeThatBeginsAfterIt(t *testing.T) {
 // speech that began but has not sounded yet free to play over the exchange.
 func TestAWakePreemptsSpeechThatHasNotStartedYet(t *testing.T) {
 	r := newRig(t, newFakeConcierge("fact"))
-	pb := r.speaker.Begin(audio.InputVoice) // POST /api/tts/speak, its first frame not written
+	pb := r.speaker.Begin(audio.InputVoice, nil) // POST /api/tts/speak, its first frame not written
 	r.heard("Wispr,", false, false)
 	r.waitSession()
 	eventually(t, "the wake cancelled the voice input", func() bool { _, ok := r.speaker.cancelledAt(audio.InputVoice); return ok })

@@ -428,7 +428,7 @@ func TestALSAOutputCancelSilencesTheVoiceWithin20ms(t *testing.T) {
 			out := outputOnPCM(t, pcm, 100*time.Millisecond)
 			pcm.fireAt, pcm.fire = 48000/5, func() { out.Cancel(InputVoice) }
 			ctx := testContext(t)
-			voice, chime := out.Begin(InputVoice), out.Begin(InputChime)
+			voice, chime := out.Begin(InputVoice, nil), out.Begin(InputChime, nil)
 			// The voice's first audio is queued before anything else, so a
 			// goroutine a loaded machine runs late cannot leave the voice
 			// silent until the Cancel.
@@ -527,7 +527,7 @@ func TestALSAOutputReportsWhatTheRoomHeardOfACancelledSpeech(t *testing.T) {
 				}
 			})()
 			ctx := testContext(t)
-			pb := out.Begin(InputVoice)
+			pb := out.Begin(InputVoice, nil)
 			if err := pb.WriteAll(ctx, constant(48000, 100*time.Millisecond, 1000), mono48k); err != nil {
 				t.Fatal(err)
 			}
@@ -569,7 +569,7 @@ func TestALSAOutputCancelKeepsAChimeLongerThanTheHistory(t *testing.T) {
 	pcm := newFakePCM(48000, 48000*150/1000) // 150 ms
 	out := outputOnPCM(t, pcm, 100*time.Millisecond)
 	ctx := testContext(t)
-	voice, chime := out.Begin(InputVoice), out.Begin(InputChime)
+	voice, chime := out.Begin(InputVoice, nil), out.Begin(InputChime, nil)
 	go func() { _ = voice.WriteAll(ctx, constant(48000, 2*time.Second, 1000), mono48k) }()
 	chimed := make(chan error, 1)
 	go func() {
@@ -705,7 +705,7 @@ func TestALSAOutputKeepsUpUnderLoad(t *testing.T) {
 	pcm := newFakePCM(48000, 48000*int(alsaBuffer/time.Millisecond)/1000)
 	out := outputOnPCM(t, pcm, 100*time.Millisecond)
 	ctx := testContext(t)
-	voice, chime := out.Begin(InputVoice), out.Begin(InputChime)
+	voice, chime := out.Begin(InputVoice, nil), out.Begin(InputChime, nil)
 	done := make(chan error, 2)
 	go func() {
 		done <- voice.WriteAll(ctx, sine(24000, 3*time.Second, 440, 8000), AudioFormat{SampleRate: 24000, Channels: 1})
@@ -798,7 +798,7 @@ func TestOutputPlaysThroughALSAWithoutPortAudio(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	began := time.Now()
-	pb := out.Begin(InputVoice)
+	pb := out.Begin(InputVoice, nil)
 	if err := pb.WriteAll(ctx, constant(16000, 300*time.Millisecond, 1000), AudioFormat{SampleRate: 16000, Channels: 1}); err != nil {
 		t.Fatalf("WriteAll through ALSA = %v, want it played", err)
 	}
@@ -1043,11 +1043,11 @@ func TestACancelLosesNoneOfAnotherInputsAudio(t *testing.T) {
 				pcm.fireAt, pcm.fire = 1000, cancel
 			}
 			ctx := testContext(t)
-			kept := out.Begin("kept")
+			kept := out.Begin("kept", nil)
 			if err := kept.WriteAll(ctx, rampPCM(max(tc.frames, 4800)), mono48k); err != nil {
 				t.Fatal(err)
 			}
-			if err := out.Begin("stopped").WriteAll(ctx, constant(48000, 200*time.Millisecond, stoppedLevel), mono48k); err != nil {
+			if err := out.Begin("stopped", nil).WriteAll(ctx, constant(48000, 200*time.Millisecond, stoppedLevel), mono48k); err != nil {
 				t.Fatal(err)
 			}
 			close(gate)
@@ -1139,12 +1139,12 @@ func TestASuspendTheSpeakerCannotResumeFromLosesNoAudio(t *testing.T) {
 					pcm.mu.Unlock()
 					pcm.suspend()
 					if tc.begin {
-						out.Begin("late")
+						out.Begin("late", nil)
 					}
 				}
 			}
 			ctx := testContext(t)
-			pb := out.Begin(InputVoice)
+			pb := out.Begin(InputVoice, nil)
 			frames := max(tc.frames, 4800)
 			if err := pb.WriteAll(ctx, rampPCM(frames), mono48k); err != nil {
 				t.Fatal(err)
@@ -1225,12 +1225,12 @@ func TestARewindAfterAnEarlierPrepareIsTakenOffWhatTheDeviceTook(t *testing.T) {
 	t.Cleanup(func() { _ = out.Close() })
 	pcm.fireAt, pcm.fire = 4320, func() { out.Cancel("stopped1") }
 	ctx := testContext(t)
-	kept := out.Begin("kept")
+	kept := out.Begin("kept", nil)
 	if err := kept.WriteAll(ctx, rampPCM(9600), mono48k); err != nil {
 		t.Fatal(err)
 	}
 	for _, name := range []string{"stopped1", "stopped2"} {
-		if err := out.Begin(name).WriteAll(ctx, constant(48000, 200*time.Millisecond, 0), mono48k); err != nil {
+		if err := out.Begin(name, nil).WriteAll(ctx, constant(48000, 200*time.Millisecond, 0), mono48k); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -1312,14 +1312,14 @@ func TestASpeechEndsOnlyOnceTheDeviceCannotGiveItBack(t *testing.T) {
 				})()
 				ctx, cancel := context.WithTimeout(t.Context(), 4*time.Second)
 				defer cancel()
-				chime := out.Begin(InputChime)
+				chime := out.Begin(InputChime, nil)
 				go func() { _ = chime.WriteAll(ctx, constant(48000, 2*time.Second, 7), mono48k) }()
 				waitFor(t, "the device to play the chime", func() bool {
 					pcm.mu.Lock()
 					defer pcm.mu.Unlock()
 					return pcm.runs[len(pcm.runs)-1].started
 				})
-				if err := out.Begin(InputVoice).WriteAll(ctx, constant(48000, 20*time.Millisecond, 1000), mono48k); err != nil {
+				if err := out.Begin(InputVoice, nil).WriteAll(ctx, constant(48000, 20*time.Millisecond, 1000), mono48k); err != nil {
 					t.Fatal(err)
 				}
 				var end SpeechEvent

@@ -95,7 +95,7 @@ func runPlaySoundCommand(ctx context.Context, args []string, configPath string, 
 		Open: open,
 	})
 	defer func() { _ = out.Close() }()
-	pb := out.Begin(audio.InputChime)
+	pb := out.Begin(audio.InputChime, nil)
 	if err := pb.WriteAll(ctx, pcm, voice.ChimeFormat); err != nil {
 		return fail(err)
 	}

@@ -98,7 +98,7 @@ func speakOn(t *testing.T, out *audio.Output, d time.Duration) {
 	for i := range samples {
 		samples[i] = byte(i)
 	}
-	pb := out.Begin(audio.InputVoice)
+	pb := out.Begin(audio.InputVoice, nil)
 	if err := pb.WriteAll(ctx, samples, audio.AudioFormat{SampleRate: 48000, Channels: 1}); err != nil {
 		t.Fatal(err)
 	}

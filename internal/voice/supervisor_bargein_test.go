@@ -410,7 +410,7 @@ func TestTheCallsInterruptionStartsANewTurn(t *testing.T) {
 func TestTheEndOfSpeechTheCallCutIsNotTheNewVoices(t *testing.T) {
 	r := newDrivingRig(t, time.Minute) // FollowUpWait 200 ms
 	if err := r.s.WithFloor(t.Context(), func() {
-		go func() { _ = r.speaker.Begin(audio.InputVoice).Write(t.Context(), make([]byte, 960), ChimeFormat) }()
+		go func() { _ = r.speaker.Begin(audio.InputVoice, nil).Write(t.Context(), make([]byte, 960), ChimeFormat) }()
 	}); err != nil {
 		t.Fatal(err)
 	}

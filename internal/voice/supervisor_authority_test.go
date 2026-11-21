@@ -112,11 +112,11 @@ type voiceBlockingSpeaker struct {
 	voice Playback
 }
 
-func (s *voiceBlockingSpeaker) Begin(input string) Playback {
+func (s *voiceBlockingSpeaker) Begin(input string, owner any) Playback {
 	if input == audio.InputVoice {
 		return s.voice
 	}
-	return s.fakeSpeaker.Begin(input)
+	return s.fakeSpeaker.Begin(input, owner)
 }
 
 // TestAHandSoundEndsWithItsLastMembership fails if a hand sound, chosen and

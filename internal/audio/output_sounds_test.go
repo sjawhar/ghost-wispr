@@ -35,7 +35,7 @@ type soundOverSpeech struct {
 func mixSoundOverSpeech(speech, sound []byte, starts []time.Duration) soundOverSpeech {
 	const rate = 48000
 	o := &Output{inputs: map[string]*outputInput{}, eventWake: make(chan struct{}, 1)}
-	voicePb, chimePb := o.Begin(InputVoice), o.Begin(InputChime)
+	voicePb, chimePb := o.Begin(InputVoice, nil), o.Begin(InputChime, nil)
 	voice, chime := o.inputs[InputVoice], o.inputs[InputChime]
 	voice.setRate(24000)
 	voice.ring = make([]int16, max(1, len(speech)/2))

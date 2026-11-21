@@ -592,7 +592,7 @@ type r7Playback struct {
 
 var errR7Cancelled = errors.New("r7 speaker: the playback was cancelled")
 
-func (s *r7Speaker) Begin(input string) voice.Playback {
+func (s *r7Speaker) Begin(input string, _ any) voice.Playback {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	p := &r7Playback{s: s, input: input}

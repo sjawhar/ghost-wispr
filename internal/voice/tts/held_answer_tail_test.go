@@ -58,7 +58,7 @@ func newTailSpeaker() *tailSpeaker {
 	return &tailSpeaker{cut: map[string]chan struct{}{audio.InputVoice: make(chan struct{}), audio.InputChime: make(chan struct{})}}
 }
 
-func (s *tailSpeaker) Begin(input string) voice.Playback {
+func (s *tailSpeaker) Begin(input string, _ any) voice.Playback {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return &tailPlayback{s: s, input: input, cut: s.cut[input]}

@@ -54,7 +54,7 @@ func playThroughDevice(t *testing.T, device *captureDevice) (out *heldOutput, fi
 	})
 	ctx, cancel := context.WithTimeout(context.Background(), testWait)
 	go func() {
-		_ = output.Begin(audio.InputVoice).WriteAll(ctx, make([]byte, 640), audio.AudioFormat{SampleRate: 16000, Channels: 1})
+		_ = output.Begin(audio.InputVoice, nil).WriteAll(ctx, make([]byte, 640), audio.AudioFormat{SampleRate: 16000, Channels: 1})
 	}()
 	<-out.writing
 	var once sync.Once
