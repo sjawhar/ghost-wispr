@@ -1,10 +1,11 @@
 // Package speakertrace reads an execution trace the speaker saved on an
 // underrun (audio.SpeakerTrace, the speaker_trace_dir setting) and says where
 // the speaker's mixer spent each of its slow cycles: running, waiting to run,
-// in a system call, or waiting on a timer, the Output's lock or anything else,
-// and inside which of the speaker's trace regions. A slow cycle is the time
-// from the end of one write of a frame to the device to the end of the next,
-// when it is longer than the bound given.
+// in a system call, or waiting on a timer, a lock, the garbage collector or
+// anything else, and inside which of the speaker's trace regions; and how much
+// of the cycle the collector spent marking or with the world stopped. A slow
+// cycle is the time from the end of one write of a frame to the device to the
+// end of the next, when it is longer than the bound given.
 package speakertrace
 
 import (
@@ -34,14 +35,29 @@ type Cycle struct {
 	// the write that ended before the cycle and the one that ended it.
 	Start, End time.Duration
 	// Spent is the cycle's time by what the mixer's goroutine did: its state
-	// ("running", "runnable", "syscall", or "waiting (reason)", the reason as
-	// the Go runtime names it), with " in REGION" while inside one of the
-	// speaker's regions.
+	// ("running", "runnable", "syscall", or "waiting (reason)"), with " in
+	// REGION" while inside one of the speaker's regions. The reason is
+	// waitCollector when the wait's stack is in the garbage collector,
+	// waitMutex when it is in a sync.Mutex, and otherwise as the Go runtime
+	// names it.
 	Spent map[string]time.Duration
 	// Woken names, for each wait that ended in the cycle, the goroutine that
 	// ended it and the function it was in, or "the runtime" for a timer.
 	Woken []string
+	// Stopped is how much of the cycle the Go runtime held the world
+	// stopped, when no goroutine runs; Marking how much of it was in the
+	// collector's concurrent mark phase (the trace's ranges).
+	Stopped, Marking time.Duration
 }
+
+// The reasons the reader gives a wait from its stack, in place of the Go
+// runtime's: the garbage collector, whether the mixer was made to help it
+// mark or waited for one of its phases, and a sync.Mutex, which the runtime
+// calls "sync" as it does its own semaphores.
+const (
+	waitCollector = "garbage collection"
+	waitMutex     = "mutex"
+)
 
 // Length is how long the cycle took.
 func (c *Cycle) Length() time.Duration { return c.End - c.Start }
@@ -56,28 +72,41 @@ func (c *Cycle) Dominant() (bucket string, d time.Duration) {
 	return bucket, d
 }
 
-// Classify names what kept the mixer from the device for most of the cycle.
+// Classify names what kept the mixer from the device for most of the cycle,
+// and how much of it the collector stopped the world or marked.
 func (c *Cycle) Classify() string {
+	var what string
 	bucket, _ := c.Dominant()
 	state, region, _ := strings.Cut(bucket, " in ")
 	switch {
-	case strings.HasPrefix(state, "waiting") && (region == RegionLock || strings.Contains(state, "sync")):
-		return "the Output's lock: the mixer waited for its holder (" + strings.Join(c.Woken, "; ") + ")"
+	case c.Stopped*2 >= c.Length():
+		what = "the Go runtime stopped the world"
+	case state == "waiting ("+waitCollector+")":
+		what = "garbage collection: the mixer was made to help it, or waited for its phase to end" + inRegion(region)
+	case state == "waiting ("+waitMutex+")" && region == RegionLock:
+		what = "the Output's lock: the mixer waited for its holder (" + strings.Join(c.Woken, "; ") + ")"
+	case state == "waiting ("+waitMutex+")":
+		what = "a lock: the mixer waited for its holder (" + strings.Join(c.Woken, "; ") + ")" + inRegion(region)
 	case strings.HasPrefix(state, "waiting") && region == RegionPacer:
-		return "the pacer's sleep"
+		what = "the pacer's sleep"
 	case strings.HasPrefix(state, "waiting") && strings.Contains(state, "sleep"):
-		return "a sleep" + inRegion(region)
+		what = "a sleep" + inRegion(region)
 	case strings.HasPrefix(state, "waiting"):
-		return "a wait, " + strings.TrimPrefix(state, "waiting ") + inRegion(region)
+		what = "a wait, " + strings.TrimPrefix(state, "waiting ") + inRegion(region)
 	case state == "runnable":
-		return "runnable but not run: Go had no processor free for the mixer" + inRegion(region)
+		what = "runnable but not run: Go had no processor free for the mixer" + inRegion(region)
 	case state == "running":
-		return "running: computing, or its thread descheduled by Linux, which Go cannot tell apart" + inRegion(region)
+		what = "running: computing, or its thread descheduled by Linux, which Go cannot tell apart" + inRegion(region)
 	case state == "syscall":
-		return "a system call or C code, such as ALSA's write" + inRegion(region)
+		what = "a system call or C code, such as ALSA's write" + inRegion(region)
 	default:
-		return bucket
+		what = bucket
 	}
+	if c.Stopped > 0 || c.Marking > 0 {
+		what += fmt.Sprintf("; the runtime stopped the world for %v, and the collector marked for %v, of the turn",
+			c.Stopped.Round(100*time.Microsecond), c.Marking.Round(100*time.Microsecond))
+	}
+	return what
 }
 
 func inRegion(region string) string {
@@ -117,7 +146,7 @@ func chain(gs map[trace.GoID]*goroutine, w wake) string {
 	cur := w
 	for range 8 {
 		g := gs[cur.by]
-		if g == nil || !strings.Contains(g.woke.reason, "sync") || g.woke.at < w.waitFrom || g.woke.at > cur.at || g.woke.by == cur.by {
+		if g == nil || g.woke.reason != waitMutex || g.woke.at < w.waitFrom || g.woke.at > cur.at || g.woke.by == cur.by {
 			break
 		}
 		names = append(names, g.woke.name)
@@ -175,7 +204,9 @@ func Read(r io.Reader, slow time.Duration) ([]Cycle, error) {
 	}
 	var first trace.Time
 	var cycles []Cycle
+	var stopped, marking spans
 	writes := 0
+	var now time.Duration
 	for {
 		ev, err := reader.ReadEvent()
 		if errors.Is(err, io.EOF) {
@@ -187,7 +218,7 @@ func Read(r io.Reader, slow time.Duration) ([]Cycle, error) {
 		if first == 0 {
 			first = ev.Time()
 		}
-		now := time.Duration(ev.Time() - first)
+		now = time.Duration(ev.Time() - first)
 		switch ev.Kind() {
 		case trace.EventStateTransition:
 			st := ev.StateTransition()
@@ -205,7 +236,20 @@ func Read(r io.Reader, slow time.Duration) ([]Cycle, error) {
 			}
 			g.state, g.reason = to, ""
 			if to == trace.GoWaiting {
-				g.reason, g.waited = st.Reason, now
+				g.reason, g.waited = waitReason(st.Reason, st.Stack), now
+			}
+		case trace.EventRangeBegin, trace.EventRangeActive, trace.EventRangeEnd:
+			s := &marking
+			switch name := ev.Range().Name; {
+			case strings.HasPrefix(name, "stop-the-world"):
+				s = &stopped
+			case name != "GC concurrent mark phase":
+				continue
+			}
+			if ev.Kind() == trace.EventRangeEnd {
+				s.end(now)
+			} else {
+				s.begin(now)
 			}
 		case trace.EventRegionBegin:
 			g := get(ev.Goroutine())
@@ -241,8 +285,63 @@ func Read(r io.Reader, slow time.Duration) ([]Cycle, error) {
 	if writes == 0 {
 		return nil, fmt.Errorf("the trace holds no %s region: it was not taken while the speaker played", RegionWrite)
 	}
+	stopped.end(now)
+	marking.end(now)
+	for i := range cycles {
+		c := &cycles[i]
+		c.Stopped, c.Marking = stopped.overlap(c.Start, c.End), marking.overlap(c.Start, c.End)
+	}
 	slices.SortFunc(cycles, func(a, b Cycle) int { return cmp.Compare(a.Start, b.Start) })
 	return cycles, nil
+}
+
+// spans are the stretches of one of the runtime's ranges: the world stopped,
+// or the collector's concurrent mark phase. One of each runs at a time.
+type spans struct {
+	open bool
+	from time.Duration
+	done [][2]time.Duration
+}
+
+func (s *spans) begin(at time.Duration) {
+	if !s.open {
+		s.open, s.from = true, at
+	}
+}
+
+func (s *spans) end(at time.Duration) {
+	if s.open {
+		s.open = false
+		s.done = append(s.done, [2]time.Duration{s.from, at})
+	}
+}
+
+// overlap is how much of [from, to] the spans cover.
+func (s *spans) overlap(from, to time.Duration) time.Duration {
+	var d time.Duration
+	for _, sp := range s.done {
+		if lo, hi := max(sp[0], from), min(sp[1], to); hi > lo {
+			d += hi - lo
+		}
+	}
+	return d
+}
+
+// waitReason is the reason a wait gets: waitCollector when its stack is in
+// the garbage collector, waitMutex when it is in a sync.Mutex, and otherwise
+// the Go runtime's own. The runtime calls both its collector's semaphores and
+// a sync.Mutex "sync".
+func waitReason(reason string, stack trace.Stack) string {
+	for frame := range stack.Frames() {
+		switch f := frame.Func; {
+		case strings.HasPrefix(f, "runtime.gc") || f == "runtime.GC":
+			return waitCollector
+		case strings.HasPrefix(f, "sync.(*Mutex).") || strings.HasPrefix(f, "internal/sync.(*Mutex).") ||
+			strings.HasPrefix(f, "sync.(*RWMutex)."):
+			return waitMutex
+		}
+	}
+	return reason
 }
 
 // waker names the goroutine that made a waiting goroutine runnable, and the

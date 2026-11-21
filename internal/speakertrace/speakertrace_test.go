@@ -63,14 +63,14 @@ func passIt(mu *sync.Mutex) {
 	mu.Unlock()
 }
 
-// crowd keeps the mixer runnable but not run for about d: one processor for
-// Go, 16 goroutines computing on it until d is up, and the mixer yielding to
-// them over and over, each time to the back of the queue.
+// crowd keeps the mixer runnable but not run for about d: sixteen goroutines
+// for each of Go's processors, computing until d is up, and the mixer
+// yielding to them over and over, each time to the back of the queue. It
+// leaves GOMAXPROCS alone: changing it stops the world under the trace.
 func crowd(d time.Duration) {
-	defer runtime.GOMAXPROCS(runtime.GOMAXPROCS(1))
 	deadline := time.Now().Add(d)
 	var spinning sync.WaitGroup
-	for range 16 {
+	for range 16 * runtime.GOMAXPROCS(0) {
 		spinning.Go(func() {
 			for time.Now().Before(deadline) {
 			}
@@ -82,11 +82,33 @@ func crowd(d time.Duration) {
 	spinning.Wait()
 }
 
+// liveHeap is a heap of a million small objects, so that each collection
+// takes a while to mark. It is built once, before any stall runs: building it
+// is computing, which is not what the collector control injects.
+var liveHeap = sync.OnceValue(func() []*[16]byte {
+	live := make([]*[16]byte, 1<<20)
+	for i := range live {
+		live[i] = new([16]byte)
+	}
+	return live
+})
+
+// collect keeps the mixer in the garbage collector for about d, asking for
+// one collection of liveHeap after another and waiting for each.
+func collect(d time.Duration) {
+	live := liveHeap()
+	for start := time.Now(); time.Since(start) < d; {
+		runtime.GC()
+	}
+	runtime.KeepAlive(live)
+}
+
 // TestReadNamesWhatHeldTheMixer fails if the stalled turn of the mixer is not
 // found and named for what held it: the speaker's lock held by another
 // goroutine, which it names, also when the lock reaches the mixer through a
-// waiter queued ahead of it; a sleep inside the write; and Go running other
-// goroutines while the mixer could run. It also fails if a turn no longer
+// waiter queued ahead of it; a sleep inside the write; Go running other
+// goroutines while the mixer could run; and the garbage collector, which the
+// runtime calls "sync" as it does a mutex. It also fails if a turn no longer
 // than the bound is returned as slow. On a loaded machine an unstalled turn
 // can be slow too, so the stall's turn is found by its region and its cause.
 func TestReadNamesWhatHeldTheMixer(t *testing.T) {
@@ -103,15 +125,17 @@ func TestReadNamesWhatHeldTheMixer(t *testing.T) {
 		}, []string{"the Output's lock", "holdIt"}},
 		{"the lock held, passed on by a waiter", func(mu *sync.Mutex) {
 			locked := make(chan struct{})
-			go holdIt(mu, 150*time.Millisecond, locked)
+			go holdIt(mu, 250*time.Millisecond, locked)
 			<-locked
 			go passIt(mu)
 			time.Sleep(20 * time.Millisecond) // passIt queues for the lock before the mixer does
 		}, []string{"the Output's lock", "passIt", "holdIt"}},
 		{"a sleep in the write", func(*sync.Mutex) { time.Sleep(150 * time.Millisecond) }, []string{"a sleep inside " + regionFault}},
 		{"no processor free", func(*sync.Mutex) { crowd(150 * time.Millisecond) }, []string{"runnable but not run", "inside " + regionFault}},
+		{"garbage collection", func(*sync.Mutex) { collect(150 * time.Millisecond) }, []string{"garbage collection", "inside " + regionFault, "the collector marked for"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			liveHeap() // built before the stall, not in it
 			var mu sync.Mutex
 			buf := traced(t, func() { fakeMixer(&mu, func() { tc.stall(&mu) }) })
 			cycles, err := Read(buf, slow)

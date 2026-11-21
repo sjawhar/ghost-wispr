@@ -39,14 +39,14 @@ func spin(d time.Duration) {
 	}
 }
 
-// crowd keeps the calling goroutine runnable but not run for about d: one
-// processor for Go, 16 goroutines computing on it until d is up, and the
+// crowd keeps the calling goroutine runnable but not run for about d: sixteen
+// goroutines for each of Go's processors, computing until d is up, and the
 // caller yielding to them over and over, each time to the back of the queue.
+// It leaves GOMAXPROCS alone: changing it stops the world under the trace.
 func crowd(d time.Duration) {
-	defer runtime.GOMAXPROCS(runtime.GOMAXPROCS(1))
 	deadline := time.Now().Add(d)
 	var spinning sync.WaitGroup
-	for range 16 {
+	for range 16 * runtime.GOMAXPROCS(0) {
 		spinning.Go(func() {
 			for time.Now().Before(deadline) {
 			}
@@ -56,6 +56,27 @@ func crowd(d time.Duration) {
 		runtime.Gosched()
 	}
 	spinning.Wait()
+}
+
+// liveHeap is a heap of a million small objects, so that each collection
+// takes a while to mark. It is built once, before any fault runs: building it
+// is computing, which is not what the collector control injects.
+var liveHeap = sync.OnceValue(func() []*[16]byte {
+	live := make([]*[16]byte, 1<<20)
+	for i := range live {
+		live[i] = new([16]byte)
+	}
+	return live
+})
+
+// collect keeps the calling goroutine in the garbage collector for about d,
+// asking for one collection of liveHeap after another and waiting for each.
+func collect(d time.Duration) {
+	live := liveHeap()
+	for start := time.Now(); time.Since(start) < d; {
+		runtime.GC()
+	}
+	runtime.KeepAlive(live)
 }
 
 // holdTheLock takes out's lock, says so on locked, and holds it for d.
@@ -112,7 +133,8 @@ const regionFault = "speaker.fault"
 // device that plays in real time from an 80 ms buffer, names that fault as
 // what kept the mixer from the device: a sleep inside the stream's write,
 // computing inside it, the Output's lock held by another goroutine, which it
-// names, and Go running other goroutines while the mixer could run. These are
+// names, Go running other goroutines while the mixer could run, and the
+// garbage collector, which the runtime calls "sync" as it does a lock. These are
 // the instrument's controls: a capture of a real underrun is read only as far
 // as these are named right. The fault runs inside regionFault, so a slow
 // cycle the machine makes on its own, which can be longer, is not taken for it.
@@ -131,8 +153,10 @@ func TestTheSpeakerTraceSaysWhatKeptTheMixerFromTheDevice(t *testing.T) {
 			<-locked // the write returns, and the mixer's next take of the lock waits
 		}, []string{"the Output's lock", "holdTheLock"}},
 		{"no processor free", func(*Output) { crowd(stall) }, []string{"runnable but not run", "inside " + regionFault}},
+		{"garbage collection", func(*Output) { collect(stall) }, []string{"garbage collection", "inside " + regionFault}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			liveHeap() // built before the fault, not in it
 			st, err := StartSpeakerTrace(t.TempDir())
 			if err != nil {
 				t.Fatal(err)
