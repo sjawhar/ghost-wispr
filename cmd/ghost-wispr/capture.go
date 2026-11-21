@@ -120,12 +120,12 @@ type captureGate struct {
 	beforeResumeRequest func() error
 	beforeGateOpen      func() error
 	onResumeRefused     func(error)
+	beforeMicStart      func() error
 	// background runs the gate's opening after a resume or a light hold
 	// (openAfter) as work the stop waits for, since a refused resume saves
 	// the pause state (onResumeRefused); main sets it to the session manager.
 	// Nil runs it on a goroutine of its own.
 	background backgroundWork
-	beforeMicStart      func() error
 	// checkLightPattern readies the light for a red confirmation: it checks
 	// the stored pattern of a unit not yet checked (hardwareControl.CheckLight).
 	// It can take seconds, so RequestResume and openAfter run it before they
