@@ -193,11 +193,16 @@ type voiceDeps struct {
 	enabled     func() bool                 // voice.enabled, live
 	wakePhrases []string
 	timing      func(event, sessionID string, at time.Time, kv ...any)
-	session     func() string // the recording session now
-	red         func() bool   // the light reads red and audio passes the gate
+	session     func() string                // the recording session now
+	meeting     func(string) context.Context // a session's meeting context, which the recorder ends with it
+	red         func() bool                  // the light reads red and audio passes the gate
 	notify      func(kind, sessionID string)
 	projects    func() []string    // Dispatch's project keys, for spoken keys
 	waiting     voice.WaitingLight // shows that something waits for a person; nil shows nothing
+	// segment and handDone reach the joined agents' roster: the room's
+	// final segments, and how each raised hand came down.
+	segment  func(*voice.Segment)
+	handDone func(*voice.Hand, voice.HandOutcome)
 }
 
 // waitingLED is the voice's waiting light on the blink(1)'s LED 2, which
@@ -223,12 +228,15 @@ func startVoice(deps *voiceDeps) error {
 		Speaker:      voice.SpeakerOf(deps.output),
 		WakePhrases:  deps.wakePhrases,
 		Session:      deps.session,
+		Meeting:      deps.meeting,
 		Red:          deps.red,
 		Enabled:      deps.enabled,
 		Notify:       deps.notify,
 		ProjectKeys:  deps.projects,
 		WaitingLight: deps.waiting,
 		Tap:          deps.tap,
+		Segment:      deps.segment,
+		HandDone:     deps.handDone,
 		Timing:       deps.timing,
 		Logf:         log.Printf,
 	})
@@ -401,17 +409,29 @@ func voiceCConfig(cfg *config.Config) *dgagent.Config {
 	}
 }
 
-// wireVoiceSessionHooks makes every session end reach the Concierge and the
-// voice, and returns what a session delete (the API's and the GC's) calls to
-// make them forget it.
-func wireVoiceSessionHooks(manager interface{ SetSessionEndedHook(func(string)) }, concierge *conciergeHooks, link *voiceLink) func([]string) {
+// sessionHooks is what follows a session's end and delete.
+type sessionHooks interface {
+	SessionEnded(sessionID string)
+	SessionsDeleted(sessionIDs []string)
+}
+
+// wireVoiceSessionHooks makes every session end reach the Concierge, the
+// voice and others, such as the joined agents' roster, and returns what a
+// session delete (the API's and the GC's) calls to make them forget it.
+func wireVoiceSessionHooks(manager interface{ SetSessionEndedHook(func(string)) }, concierge *conciergeHooks, link *voiceLink, others ...sessionHooks) func([]string) {
 	manager.SetSessionEndedHook(func(sessionID string) {
 		concierge.SessionEnded(sessionID)
 		link.SessionEnded(sessionID)
+		for _, other := range others {
+			other.SessionEnded(sessionID)
+		}
 	})
 	return func(sessionIDs []string) {
 		concierge.SessionsDeleted(sessionIDs)
 		link.SessionsDeleted(sessionIDs)
+		for _, other := range others {
+			other.SessionsDeleted(sessionIDs)
+		}
 	}
 }
 

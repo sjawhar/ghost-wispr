@@ -54,15 +54,16 @@ func TestTheDocsSayADeadMicrophoneLightsRedAtEachRetry(t *testing.T) {
 // TestTheReadmeSaysLED1IsTheRecordingLight fails if the README's
 // recording-light section does not say that LED 1 alone is the recording
 // light the consent check reads back, exactly red, and that LED 2 flashes
-// green while an answer waits, only while the unit records, and never counts
-// as a light fault (dispatch://INFRA-4623/ask/aef02ac7-90bf-48b9-88df-f42ba932c423).
+// green while an answer or a joined agent's raised hand waits, only while the
+// unit records, and never counts as a light fault
+// (dispatch://INFRA-4623/ask/aef02ac7-90bf-48b9-88df-f42ba932c423).
 func TestTheReadmeSaysLED1IsTheRecordingLight(t *testing.T) {
 	readme := readmeText(t)
 	for _, words := range []string{
 		"the recorder captures only while the blink(1)'s LED 1 reads back red",
 		"LED 1, the top one (`blink1-tool --led 1`), is the recording light: red means the unit records",
 		"Every check reads LED 1 alone back, and only exact red (255,0,0) lets audio through",
-		"LED 2, the bottom one, flashes green, half a second on and half a second off, while an agent's answer waits for \"Wispr, go ahead\"",
+		"LED 2, the bottom one, flashes green, half a second on and half a second off, while an agent's answer or a joined agent's raised hand waits for \"Wispr, go ahead\"",
 		"it never flashes while the unit does not record",
 		"never counts as a light fault",
 		"It flashes only while room audio reaches the recording",

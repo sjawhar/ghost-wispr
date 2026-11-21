@@ -224,7 +224,10 @@ type SessionConfig struct {
 	// port 4222 (NATSURLFor).
 	NATSURL                                 string
 	Title, Dir, Host, Plugin, PluginVersion string
-	Resume                                  *ResumePoint
+	// Capabilities are what the session advertises, such as the delivery
+	// modes Dispatch sends a person's message with ("btw"); nil is none.
+	Capabilities []string
+	Resume       *ResumePoint
 	// SaveResume keeps the resume point where the unit keeps its state.
 	SaveResume func(ResumePoint) error
 	// Deliver takes one message. It runs for each frame in stream order; an
@@ -397,7 +400,7 @@ func (s *Session) register(ctx context.Context) error {
 		"dir":                s.cfg.Dir,
 		"topics":             []string{},
 		"title":              s.cfg.Title,
-		"capabilities":       []string{},
+		"capabilities":       append([]string{}, s.cfg.Capabilities...),
 		"host":               s.cfg.Host,
 		"plugin":             s.cfg.Plugin,
 		"plugin_version":     s.cfg.PluginVersion,

@@ -343,7 +343,7 @@ func runIssueHolderCommand(ctx context.Context, args []string, configPath string
 	}
 	defer func() { _ = ledger.Close() }()
 	logger := logging.New(stderr, slog.LevelWarn)
-	c, err := newConcierge(ctx, &cfg, ledger, logger, nil)
+	c, err := newConcierge(ctx, &cfg, ledger, logger, nil, nil)
 	if err != nil {
 		return fail(err)
 	}

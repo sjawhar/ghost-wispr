@@ -244,3 +244,13 @@ export interface VoiceTask {
   spoken_at?: string
   answer_written: string
 }
+
+// An agent that joined the meeting of a recording session, from GET
+// /api/sessions/{id}/joined-agents: its Envoy session, its issue ('' when it
+// named none), the issue's title, and when it joined.
+export interface JoinedAgent {
+  agent: string
+  issue_key: string
+  title: string
+  joined_at: string
+}

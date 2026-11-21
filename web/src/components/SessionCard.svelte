@@ -2,6 +2,7 @@
   import Markdown from '@humanspeak/svelte-markdown'
   import AudioPlayer from './AudioPlayer.svelte'
   import VoiceTasks from './VoiceTasks.svelte'
+  import JoinedAgents from './JoinedAgents.svelte'
   import type { SessionVoiceTasks } from '../lib/state.svelte'
   import {
     RefinementStatus,
@@ -494,6 +495,7 @@
           </div>
         {/if}
         <VoiceTasks {voiceTasks} />
+        <JoinedAgents sessionId={session.id} />
         <div class="session-actions">
           <button type="button" class="delete-btn" onclick={handleDelete}>
             {localRemovalLabel}

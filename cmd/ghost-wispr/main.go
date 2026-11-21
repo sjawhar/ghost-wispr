@@ -47,6 +47,7 @@ import (
 	"github.com/sjawhar/ghost-wispr/internal/tts"
 	"github.com/sjawhar/ghost-wispr/internal/voice"
 	"github.com/sjawhar/ghost-wispr/internal/wake/local"
+	"github.com/sjawhar/ghost-wispr/internal/wake/transcript"
 
 	"google.golang.org/genai"
 )
@@ -470,6 +471,10 @@ type transcriptCallback struct {
 	manager session.LifecycleManager
 	voice   voiceListener
 	stamp   func() (closings int, open bool)
+	// keyterms are the live stream's keyterms: each dial sends them, and a
+	// join or a leave changes them on the open socket. nil sends tOptions'
+	// own.
+	keyterms *transcript.LiveKeyterms
 }
 
 // voiceListener is the voice as the transcript reader feeds it: the
@@ -754,10 +759,27 @@ func refreshKeptRawRecordings(ctx context.Context, kept *keptRecordings, budgetM
 }
 
 // makeDeepgramClientFactory dials live-transcription sockets the app owns
-// (deepgramSocket), each write bounded by writeTimeout.
+// (deepgramSocket), each write bounded by writeTimeout. Each dial carries the
+// live keyterms as they are then, and is the socket a join's Configure goes
+// to until the next dial.
 func makeDeepgramClientFactory(_ context.Context, apiKey string, cOptions *interfaces.ClientOptions, tOptions *interfaces.LiveTranscriptionOptions, callback transcriptCallback, writeTimeout time.Duration) transcribe.ClientFactory {
 	return func(factoryCtx context.Context) (io.WriteCloser, error) {
-		return dialDeepgramLive(factoryCtx, apiKey, cOptions, tOptions, callback, writeTimeout)
+		options := tOptions
+		var keyterms []string
+		if callback.keyterms != nil {
+			keyterms = callback.keyterms.List()
+			withKeyterms := *tOptions
+			withKeyterms.Keyterm = keyterms
+			options = &withKeyterms
+		}
+		socket, err := dialDeepgramLive(factoryCtx, apiKey, cOptions, options, callback, writeTimeout)
+		if err != nil {
+			return nil, err // never a nil *deepgramSocket in the interface
+		}
+		if callback.keyterms != nil {
+			callback.keyterms.Attach(socket, keyterms)
+		}
+		return socket, nil
 	}
 }
 
@@ -862,6 +884,9 @@ func main() {
 	if len(os.Args) > 1 && os.Args[1] == "kws-selftest" {
 		os.Exit(runKWSSelfTest(os.Args[2:], os.Stdout, os.Stderr))
 	}
+	if len(os.Args) > 1 && os.Args[1] == "speaker-trace" {
+		os.Exit(runSpeakerTraceCommand(os.Args[2:], os.Stdout, os.Stderr))
+	}
 	if len(os.Args) > 1 && os.Args[1] == "tts-first-audio" {
 		os.Exit(runTTSFirstAudioCommand(context.Background(), os.Args[1:], configPath, nil, os.Stdin, os.Stdout, os.Stderr))
 	}
@@ -876,6 +901,10 @@ func main() {
 		// would crowd the cause out of the 300 bytes accept-voice.sh keeps.
 		logging.SetDefault(logging.New(os.Stderr, slog.LevelWarn))
 		os.Exit(runIssueHolderCommand(context.Background(), os.Args[1:], configPath, os.Stdout, os.Stderr))
+	}
+	if len(os.Args) > 1 && os.Args[1] == "joined-probe" {
+		logging.SetDefault(logging.New(os.Stderr, slog.LevelWarn))
+		os.Exit(runJoinedProbeCommand(context.Background(), os.Args[1:], configPath, os.Stdout, os.Stderr))
 	}
 	if len(os.Args) > 1 {
 		if exitCode := runLightCommand(os.Args[1:], os.Stdout, os.Stderr); exitCode != 0 {
@@ -1065,7 +1094,8 @@ func main() {
 	// wired to the capture gate below, before anything can close it.
 	var conciergeSessionHooks conciergeHooks
 	var voiceHooks voiceLink
-	sessionsForgotten := wireVoiceSessionHooks(manager, &conciergeSessionHooks, &voiceHooks)
+	var joinedLink joinedHooks // the joined agents' roster, once the voice has a speaker
+	sessionsForgotten := wireVoiceSessionHooks(manager, &conciergeSessionHooks, &voiceHooks, &joinedLink)
 
 	// Summarize recovered sessions (and any with pending/empty summaries).
 	// Launched after ctx is created so SIGTERM cancels in-flight LLM calls.
@@ -1144,6 +1174,13 @@ func main() {
 		} else {
 			watchProjectKeys(ctx, client.Projects, projectKeysEvery, &dispatchProjects)
 		}
+	}
+	// The live transcript's keyterms, which a join or a leave changes on the
+	// open Deepgram stream (R4, R17); nil when the voice cannot run.
+	liveKeyterms := newLiveKeyterms(&cfg, dispatchProjects.Get)
+	if liveKeyterms != nil {
+		// A keyterm list Deepgram refused shows on /api/status until one is taken.
+		liveKeyterms.SetRefusalHook(keytermsRefusedWarning(warningRegistry))
 	}
 	if restorePauseErr != nil {
 		warningRegistry.Set(captureStateWarningKey, "Capture pause state could not be restored; the recorder started paused")
@@ -1894,7 +1931,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 		cOptions := &interfaces.ClientOptions{EnableKeepAlive: true}
 		tOptions := liveTranscriptionOptions(&cfg, sampleRate, dispatchProjects.Get())
 		resilientConfig := liveTranscriptionConfig(&cfg, sampleRate)
-		callback := transcriptCallback{manager: manager, voice: &voiceHooks, stamp: capture.voiceStamp}
+		callback := transcriptCallback{manager: manager, voice: &voiceHooks, stamp: capture.voiceStamp, keyterms: liveKeyterms}
 		candidateResilient := newLiveTranscription(ctx, cfg.DeepgramAPIKey, cOptions, tOptions, resilientConfig, callback, warningRegistry, hub)
 		resilientRef.Store(candidateResilient)
 		deepgramSendRef.Store(startMicMonitoring(ctx, &micLoops, capture, ordered, audioRecorder, candidateResilient, voiceAudio, micWait, log.Printf, hub))
@@ -1969,11 +2006,23 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 	// while one is open.
 	var output *audio.Output
 	if cfg.SpeakerEnabled {
-		output = audio.NewOutput(audio.OutputConfig{
+		outputCfg := audio.OutputConfig{
 			Device:  cfg.SpeakerDevice,
 			Opening: micDevice.playbackOpening,
 			Closing: micDevice.playbackClosing,
-		})
+		}
+		// speaker_trace_dir, a debug setting: keep the last seconds of the
+		// execution trace and save them on each underrun.
+		if dir := strings.TrimSpace(cfg.SpeakerTraceDir); dir != "" {
+			if speakerTrace, err := audio.StartSpeakerTrace(dir); err != nil {
+				slog.Warn("speaker trace off", "error", err)
+			} else {
+				defer speakerTrace.Stop()
+				outputCfg.Underrun = speakerTrace.Underrun
+				log.Printf("speaker trace on: each underrun saves the last seconds of the execution trace in %s", dir)
+			}
+		}
+		output = audio.NewOutput(outputCfg)
 		log.Printf("speaker output enabled (device=%q)", cfg.SpeakerDevice)
 	}
 
@@ -2026,12 +2075,33 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 			voices.apply(ctx, newCfg)
 			voices.warnBuild(newCfg.Voice.Enabled, warningRegistry)
 		})
+		// Agents a person tells, through Dispatch, to join the meeting (R17).
+		var issues *dispatch.Client
+		if cfg.DispatchToken != "" && cfg.Concierge.DispatchURL != "" {
+			if client, err := dispatch.NewClient(cfg.Concierge.DispatchURL, cfg.DispatchToken, newDispatchHTTP(appLogger)); err != nil {
+				slog.Warn("joined agents: the Dispatch client for issue titles", "error", err)
+			} else {
+				issues = client
+			}
+		}
+		roster := startJoinedAgents(ctx, &joinedDeps{
+			session:   func() string { id, _ := manager.ActiveSession(); return id },
+			meeting:   manager.MeetingContext,
+			store:     store,
+			floor:     &voiceHooks,
+			dispatch:  issues,
+			notify:    hub.BroadcastVoiceEvent,
+			keyterms:  liveKeyterms,
+			publicURL: cfg.PublicURL,
+		})
+		joinedLink.set(roster)
+		wireJoinedRoutes(controlHooks, roster)
 		conc = newLazyConcierge(func() (*concierge.Concierge, func(), error) {
 			current := cfgStore.Get()
 			// The session page reads a session's questions again on each change.
 			return startConcierge(ctx, &current, store, appLogger, func(sessionID string) {
 				hub.BroadcastVoiceEvent("voice_tasks_changed", sessionID)
-			})
+			}, roster)
 		}, func(c *concierge.Concierge) {
 			if c == nil { // it stopped: the session hooks reach nothing
 				conciergeSessionHooks.set(nil)
@@ -2051,9 +2121,12 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 			wakePhrases: cfg.Voice.WakePhrases,
 			timing:      voiceTiming(appLogger),
 			session:     func() string { id, _ := manager.ActiveSession(); return id },
+			meeting:     manager.MeetingContext,
 			red:         func() bool { return capture.capturing(micStatus) },
 			notify:      hub.BroadcastVoiceEvent,
 			projects:    dispatchProjects.Get,
+			segment:     joinedLink.OnSegment,
+			handDone:    joinedLink.HandDone,
 			waiting:     waitingLED{hardware},
 		}); err != nil {
 			slog.Warn("the meeting voice is off", "error", err)

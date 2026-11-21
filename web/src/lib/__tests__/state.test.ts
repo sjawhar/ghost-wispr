@@ -5,9 +5,11 @@ import {
   applySegmentDeletion,
   applySummaryUpdate,
   beginSessionDetailRequest,
+  loadJoinedAgents,
   loadVoiceTasks,
   removeSession,
   resetState,
+  setConnected,
   setDates,
   setSessionDetail,
   setSessionDetailIfCurrent,
@@ -20,6 +22,7 @@ import {
   VoiceTaskState,
   type SessionDetailResponse,
   type SessionSummary,
+  type JoinedAgent,
   type VoiceTask,
 } from '../types'
 
@@ -47,6 +50,22 @@ afterEach(() => {
   vi.unstubAllGlobals()
   resetState()
 })
+
+// The two calls that mark a connection to the unit: the socket's open and the
+// server's connection frame.
+const connections: [string, () => void][] = [
+  ['the socket opens', () => setConnected(true)],
+  [
+    "the server's connection frame arrives",
+    () =>
+      applyEvent({
+        type: 'connection',
+        version: 1,
+        timestamp: '2026-11-20T05:08:00Z',
+        connected: true,
+      }),
+  ],
+]
 
 describe('applySegmentDeletion', () => {
   it('scrubs deleted text from the list and detail while retaining other segments and sessions', () => {
@@ -528,6 +547,173 @@ describe('voice tasks', () => {
       tasks: [answered],
       error: 'list voice tasks: database is locked',
     })
+  })
+
+  // An answer sent while the page was not connected never reaches it, and
+  // the question showed as unanswered until the next answer.
+  it.each(connections)(
+    "reads a read session's questions again when %s after a disconnect",
+    async (_, connect) => {
+      const fetchMock = stubFetch([waiting], [answered])
+      await loadVoiceTasks('s1')
+      setConnected(false)
+
+      connect()
+
+      await vi.waitFor(() => expect(appState.voiceTasks.get('s1')?.tasks).toEqual([answered]))
+      expect(fetchMock.mock.calls.map(([input]) => String(input))).toEqual([url, url])
+    },
+  )
+
+  it('does not read on a connection the questions of a session the tab never read', () => {
+    const fetchMock = stubFetch()
+    setSessionDetail({ session: makeSession('s1'), segments: [] })
+
+    setConnected(true)
+
+    expect(fetchMock).not.toHaveBeenCalled()
+    expect(appState.voiceTasks.has('s1')).toBe(false)
+  })
+})
+
+describe('joined agents', () => {
+  const agent: JoinedAgent = {
+    agent: 'agent-1',
+    issue_key: 'ABC-12',
+    title: 'Agents join a meeting',
+    joined_at: '2026-11-19T10:05:00Z',
+  }
+  const other: JoinedAgent = {
+    agent: 'agent-2',
+    issue_key: 'ABC-13',
+    title: 'Agents ask for the floor',
+    joined_at: '2026-11-19T10:06:00Z',
+  }
+  const url = '/api/sessions/s1/joined-agents'
+
+  // The unit's answer to each request in turn: a list of agents, or a
+  // Response; a request whose answer is a promise waits for it.
+  function stubFetch(...answers: (JoinedAgent[] | Response | Promise<Response>)[]) {
+    const fetchMock = vi.fn<(input: RequestInfo | URL) => Promise<Response>>(() => {
+      const answer = answers.shift()
+      if (answer === undefined) {
+        return Promise.reject(new Error('unexpected request'))
+      }
+      return Array.isArray(answer)
+        ? Promise.resolve(Response.json(answer))
+        : Promise.resolve(answer)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    return fetchMock
+  }
+
+  function held(): { answer: Promise<Response>; release: (agents: JoinedAgent[]) => void } {
+    let release: (agents: JoinedAgent[]) => void = () => {}
+    const answer = new Promise<Response>((resolve) => {
+      release = (agents) => resolve(Response.json(agents))
+    })
+    return { answer, release }
+  }
+
+  const agentEvent = (type: string, sessionId: string) =>
+    applyEvent({
+      type,
+      version: 1,
+      timestamp: '2026-11-19T10:05:00Z',
+      session_id: sessionId,
+    } as never)
+
+  it("reads a session's joined agents", async () => {
+    const fetchMock = stubFetch([agent])
+
+    await loadJoinedAgents('s1')
+
+    expect(fetchMock.mock.calls.map(([input]) => String(input))).toEqual([url])
+    expect(appState.joinedAgents.get('s1')).toEqual({ agents: [agent], error: '' })
+  })
+
+  // A join or a leave reads the session's agents again; it failed while
+  // nothing listened for agent_joined and agent_left.
+  it.each(['agent_joined', 'agent_left'])(
+    "reads a read session's agents again on %s for it, and on nothing else",
+    async (type) => {
+      const fetchMock = stubFetch([], [agent])
+      await loadJoinedAgents('s1')
+
+      agentEvent(type, 'other')
+      agentEvent('voice_wake', 's1')
+      agentEvent(type, 's1')
+
+      await vi.waitFor(() => expect(appState.joinedAgents.get('s1')?.agents).toEqual([agent]))
+      expect(fetchMock.mock.calls.map(([input]) => String(input))).toEqual([url, url])
+    },
+  )
+
+  it("drops a deleted session's agents", async () => {
+    stubFetch([agent])
+    await loadJoinedAgents('s1')
+
+    removeSession('s1')
+
+    expect(appState.joinedAgents.has('s1')).toBe(false)
+  })
+
+  it('records why a read failed, and keeps the agents read before', async () => {
+    stubFetch([agent], Response.json({ error: 'no meeting voice' }, { status: 503 }))
+    await loadJoinedAgents('s1')
+
+    await loadJoinedAgents('s1')
+
+    expect(appState.joinedAgents.get('s1')).toEqual({ agents: [agent], error: 'no meeting voice' })
+  })
+
+  // A leave sent while the page was not connected never reaches it, and the
+  // agent that left stayed shown until the next join or leave.
+  it.each(connections)(
+    "reads a read session's agents again when %s after a disconnect, and on a later leave",
+    async (_, connect) => {
+      const fetchMock = stubFetch([agent, other], [other], [])
+      await loadJoinedAgents('s1')
+      setConnected(false)
+
+      connect()
+
+      await vi.waitFor(() => expect(appState.joinedAgents.get('s1')?.agents).toEqual([other]))
+
+      agentEvent('agent_left', 's1')
+
+      await vi.waitFor(() => expect(appState.joinedAgents.get('s1')?.agents).toEqual([]))
+      expect(fetchMock.mock.calls.map(([input]) => String(input))).toEqual([url, url, url])
+    },
+  )
+
+  it('does not read on a connection the agents of a session the tab never read or removed', async () => {
+    const fetchMock = stubFetch([agent])
+    setSessionDetail({ session: makeSession('s2'), segments: [] })
+    await loadJoinedAgents('s1')
+    removeSession('s1')
+
+    setConnected(false)
+    setConnected(true)
+
+    expect(fetchMock.mock.calls.map(([input]) => String(input))).toEqual([url])
+    expect(appState.joinedAgents.size).toBe(0)
+  })
+
+  // A read in flight while the page was not connected answers after the
+  // connection's newer read: it must not bring back the agent that left.
+  it("keeps a connection's read when an older one answers last", async () => {
+    const first = held()
+    stubFetch(first.answer, [])
+    const older = loadJoinedAgents('s1')
+    setConnected(false)
+
+    setConnected(true)
+
+    await vi.waitFor(() => expect(appState.joinedAgents.get('s1')?.agents).toEqual([]))
+    first.release([agent])
+    await older
+    expect(appState.joinedAgents.get('s1')?.agents).toEqual([])
   })
 })
 

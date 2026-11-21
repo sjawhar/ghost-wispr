@@ -25,7 +25,7 @@ const speechLoudness = -15.0
 
 // playedSounds are the sounds as Wispr plays them.
 func playedSounds() map[string][]byte {
-	return map[string][]byte{"wake": WakeChime(), "answer": AnswerChime(), "start": StartChime(), "error": ErrorChime()}
+	return map[string][]byte{"wake": WakeChime(), "answer": AnswerChime(), "hand": HandChime(), "start": StartChime(), "error": ErrorChime()}
 }
 
 // TestChimesAreShortAndDistinct fails if the answer sound lasts less than
@@ -41,6 +41,7 @@ func TestChimesAreShortAndDistinct(t *testing.T) {
 	}{
 		"wake":   {2, 0, 400 * time.Millisecond},
 		"answer": {6, 600 * time.Millisecond, 800 * time.Millisecond},
+		"hand":   {2, 0, 400 * time.Millisecond},
 		"start":  {1, 0, 400 * time.Millisecond},
 		"error":  {2, 0, 400 * time.Millisecond},
 	}

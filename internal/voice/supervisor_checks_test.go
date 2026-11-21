@@ -158,8 +158,11 @@ func TestSoundsWaitForAGap(t *testing.T) {
 // another sound (R10). TestChimesAreShortAndDistinct bounds their lengths.
 func TestSoundTriggersAndPitch(t *testing.T) {
 	triggers := map[string]func(r *rig){
-		"wake":               func(r *rig) { r.heard("Wispr,", false, false) },
-		"answer":             func(r *rig) { r.concierge.answers <- PendingAnswer{TaskID: "t1", SessionID: "sess-1", Text: "x"} },
+		"wake":   func(r *rig) { r.heard("Wispr,", false, false) },
+		"answer": func(r *rig) { r.concierge.answers <- PendingAnswer{TaskID: "t1", SessionID: "sess-1", Text: "x"} },
+		"hand": func(r *rig) {
+			_ = r.s.RaiseHand(&Hand{ID: "h1", SessionID: "sess-1", Agent: "a1", IssueKey: "ABC-12", Name: "ABC-12", Text: "x", Expires: time.Now().Add(time.Minute)})
+		},
 		"start":              func(r *rig) { r.s.Started() },
 		"error, a red check": func(r *rig) { r.s.RedCheckFailed() },
 		"error, no voice": func(r *rig) {

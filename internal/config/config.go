@@ -167,6 +167,7 @@ type Config struct {
 	DeepgramReconnectMaxBackoff   string             `yaml:"deepgram_reconnect_max_backoff"`
 	SpeakerEnabled                bool               `yaml:"speaker_enabled"`
 	SpeakerDevice                 string             `yaml:"speaker_device"`
+	SpeakerTraceDir               string             `yaml:"speaker_trace_dir,omitempty"` // a debug setting, off when empty: the speaker keeps the last seconds of the process's execution trace and saves them here on each underrun (audio.SpeakerTrace)
 	IndicatorLight                string             `yaml:"indicator_light"`
 	PowerButton                   bool               `yaml:"power_button"`
 	JabraMuteButton               bool               `yaml:"jabra_mute_button"`
@@ -491,6 +492,9 @@ func applyEnvOverrides(cfg *Config) []string {
 	}
 	if v := os.Getenv(EnvPrefix + "SPEAKER_DEVICE"); v != "" {
 		cfg.SpeakerDevice = v
+	}
+	if v := os.Getenv(EnvPrefix + "SPEAKER_TRACE_DIR"); v != "" {
+		cfg.SpeakerTraceDir = strings.TrimSpace(v)
 	}
 	if v := os.Getenv(EnvPrefix + "MIC_DEVICE"); v != "" {
 		cfg.MicDevice = strings.TrimSpace(v)

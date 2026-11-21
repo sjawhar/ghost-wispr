@@ -210,6 +210,14 @@ type ControlHooks struct {
 	TTSWaitForSynthesis func(ctx context.Context, id string) (map[string]any, error)
 	TTSHasProvider      func() bool
 	TTSHasSpeaker       func() bool
+	// JoinedAgents lists the agents that joined the meeting of a recording
+	// session (R17); nil while the meeting voice does not run.
+	JoinedAgents func(sessionID string) []JoinedAgent
+	// JoinMessage is the message a person sends an agent through Dispatch to
+	// have it join the meeting on an issue ("" for none): the unit's Envoy
+	// session and the floor protocol. It returns ErrBadIssueKey for a key
+	// that is not one, and another error when no agent can join now.
+	JoinMessage func(issueKey string) (string, error)
 }
 
 func Handler(staticFS fs.FS, hub *Hub, store SessionStore, controls *ControlHooks, authToken string, healthChecker HealthChecker, cfgStore ...*config.Store) (http.Handler, error) {
@@ -232,6 +240,7 @@ func HandlerWithLogger(staticFS fs.FS, hub *Hub, store SessionStore, controls *C
 	registerAPIRoutes(mux, store, controls, healthChecker, cs, embeddingClient)
 	registerSessionDeleteRoute(mux, store, controls, hub, configuredAudioDir(cs))
 	registerVoiceTasksRoute(mux, store)
+	registerJoinedAgentsRoutes(mux, controls)
 
 	fileServer := http.FileServer(http.FS(staticFS))
 	mux.HandleFunc("/", serveSPA(staticFS, fileServer, moduleLogger))

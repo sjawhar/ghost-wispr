@@ -508,6 +508,35 @@ polls. The speaker needs no package beyond `libportaudio2`,
 whose dependency `libasound2t64` the Pi already has (`deploy/pi/baseline.txt`). A pause during an
 open keeps the blink(1) red until that open has finished.
 
+To find what keeps the speaker's mixer from the Jabra when it underruns, set the debug setting
+`speaker_trace_dir` (or `GHOST_WISPR_SPEAKER_TRACE_DIR`) to a directory and restart the service; it
+is off by default. The process then keeps its last 3 seconds of Go execution trace in memory, aiming
+at 16 MiB, a target the Go runtime can pass during a burst of events, and on an underrun writes them
+to `speaker-underrun-<time>.trace` there, at most once every 10 seconds. A capture larger than
+32 MiB is not saved (the log says `speaker trace: the capture was not saved`), and the directory
+keeps the newest 20 captures that fit 128 MiB together; the log says `speaker trace: saved the
+capture of an underrun`.
+`/opt/ghost-wispr/ghost-wispr speaker-trace FILE` prints each turn of the mixer longer than 40 ms
+in the capture (`-slow` changes the bound), longest first, with its start and end on the wall
+clock in UTC, as `journalctl --utc -o short-iso-precise` prints the journal's lines, and with what
+it spent the time on: running, runnable (Go had no processor free), in a system call (ALSA's
+write), or waiting on the pacer's sleep, the garbage collector, the speaker's lock (naming the
+goroutine that held it) or something else, and how long the Go runtime stopped the world and the
+collector marked during the turn. The wall-clock times come from the clock snapshots the trace
+takes once each generation (about every second): each is projected from the latest snapshot before
+it, assuming the clock did not step since. A time the snapshots cannot pin is printed qualified,
+never as a plain time: `between A and B` when the next snapshot shows the clock stepped (an NTP
+correction), at a moment the trace does not show; and `no clock snapshot before it` when it comes
+before the capture's first snapshot. The time it also gives into the capture counts from the
+capture's first event, not from the process's start. "Running" covers both computing and a thread
+Linux took off its processor, which a Go trace cannot tell apart.
+
+Every capture ends with the turn-off: remove `speaker_trace_dir`, and anything else added for the
+capture (a systemd drop-in, a `GODEBUG=gctrace=1` in `/opt/ghost-wispr/.env`), then restart the
+service. The trace costs CPU and memory while it runs. Provisioning is not a turn-off: it installs
+the base unit only and keeps every drop-in under `ghost-wispr.service.d`, and `provision.sh
+--models` keeps a `GODEBUG` line in `.env`, so a forgotten setting stays on after a reprovision.
+
 The microphone is never open while the blink(1) is off: the blink(1) stays red while the microphone
 is open, and goes off only once Ghost Wispr has closed it. A pause closes it at once, also while
 its read waits on a device that delivers no frame or its audio waits on a stuck recording file;
@@ -928,10 +957,10 @@ with the unit paused and no session active:
    - spoken clips made with any speech synthesizer: `--second-question`, `--never-mind` and
      `--stop-clip` WAVs, and the `--question-dir`, `--talkover-dir` and `--backchannel-dir`
      directories of WAVs;
-   - for `wake-sound`, `scripted`, `barge-in` and `playback-cancel`, a USB microphone about 30 cm
-     from the Jabra, named by `--rig-mic` (such as `plughw:CARD=Mic,DEV=0`). These steps play
-     through the Jabra, so run them with the room empty. The step asks you to confirm that, measures
-     the room and sets its sound threshold 10 dB above the room's peak;
+   - for `wake-sound`, `scripted`, `barge-in`, `playback-cancel` and `joined`, a USB microphone
+     about 30 cm from the Jabra, named by `--rig-mic` (such as `plughw:CARD=Mic,DEV=0`). These
+     steps play through the Jabra, so run them with the room empty. The step asks you to confirm
+     that, measures the room and sets its sound threshold 10 dB above the room's peak;
    - for `holder-cases` and `ask-holder`, scratch issues in Dispatch: one claimed by a live agent
      session (`--issue-live`), one by a stopped session (`--issue-stopped`), one by a person
      (`--issue-person`) and one with no session (`--issue-none`). The steps only read them, and ask
@@ -955,8 +984,11 @@ with the unit paused and no session active:
    anchors that tie the file to the Pi's clock, and never late, from when arecord started. It
    passes when the late time is within 20 ms, fails when even the early time is over, and otherwise
    reports UNKNOWN with how late the recording's times may be, since a loaded Pi reads its anchors
-   late. The early time is early by the time arecord took to start and by up to 200 ppm of the time
-   into the recording, so a tail a few tens of milliseconds over the bound can be UNKNOWN.
+   late. The early time is early by the time arecord took to start and by up to 400 ppm of the time
+   into the recording, so a tail a few tens of milliseconds over the bound can be UNKNOWN. `joined`
+   times the onset of the agent's words at the rig the same way: it passes when even the early time
+   is at or after the end of the go-ahead and the late time is before `voice_spoken`, fails when no
+   sound longer than the wake sound can start between them, and otherwise reports UNKNOWN.
 6. Slice 4's two steps check the three capture states and the paused listener, with the
    listener turned on for the run only (`GHOST_WISPR_VOICE_PAUSED_LISTENER=true`, beside the
    voice). Both keep the microphone on the loopback, so the listener hears only what the step plays
