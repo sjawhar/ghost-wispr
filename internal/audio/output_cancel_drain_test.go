@@ -1198,11 +1198,12 @@ func TestAFilterFlushOfSilenceDoesNotMoveTheSpeechsEnd(t *testing.T) {
 // TestAPartialTakeBackCountsTheDelayedSampleCentres fails if a Cancel whose
 // take-back covers only the second of two frames takes off what that frame
 // held at no delay, not the queued samples whose output it holds after the
-// resampler's delay: at 24 kHz the second frame holds the last 224 of the
-// 240 samples' centres (Sol's review of #133 at 4238ad3 found the take-back
-// test giving back all of a speech, so it could not tell). The control's
-// audio is at the stream's rate, where the second frame holds the last
-// 10 ms.
+// resampler's delay: at 24 kHz the first frame holds the centres of 224 of
+// the 240 samples and the second the last 16, so the playback keeps 224
+// samples played (Sol's review of #133 at 4238ad3 found the take-back test
+// giving back all of a speech, so it could not tell). The control's audio
+// is at the stream's rate, where the first frame holds all its 10 ms and the
+// second none.
 func TestAPartialTakeBackCountsTheDelayedSampleCentres(t *testing.T) {
 	for _, rate := range []int{48000, 24000} {
 		t.Run(fmt.Sprintf("input %d Hz", rate), func(t *testing.T) {
