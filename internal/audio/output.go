@@ -109,6 +109,10 @@ type OutputConfig struct {
 	// Open opens a stream on the device and reports its rate; nil opens the
 	// speaker device (openSpeakerStream). Tests set it.
 	Open func(device string) (stream PlaybackStream, rate int, err error)
+	// Underrun, when set, runs on the mixer's goroutine after each write in
+	// which the stream found the device run dry, as the speaker trace saves
+	// its capture then (SpeakerTrace.Underrun). It must not block.
+	Underrun func()
 }
 
 // SpeechEvent reports that an input's audio started or ended on the stream,
@@ -773,6 +777,11 @@ func (o *Output) mix(stream PlaybackStream, rate int) error {
 	// quiet is how many frames of silence the stream has been given since
 	// the last audio: once it holds no more than that, it plays only silence.
 	quiet := 0
+	// counter is the stream's count of underruns, when it keeps one, and
+	// underruns the count at the last write: a write that raises it ran the
+	// device dry (OutputConfig.Underrun).
+	counter, _ := stream.(interface{ underruns() int })
+	underruns := 0
 	for {
 		step, seq, active := o.next(frame, sum, rate, hist, &idleSince)
 		switch step {
@@ -803,8 +812,15 @@ func (o *Output) mix(stream PlaybackStream, rate int) error {
 			continue
 		}
 		began := time.Now()
-		if err := stream.Write(frame); err != nil {
+		err := writeFrame(stream, frame)
+		if err != nil {
 			return fmt.Errorf("write speaker stream: %w", err)
+		}
+		if counter != nil && o.cfg.Underrun != nil {
+			if n := counter.underruns(); n > underruns {
+				underruns = n
+				o.cfg.Underrun()
+			}
 		}
 		o.wrote(seq)
 		p.wrote(time.Since(began), time.Now())
@@ -845,7 +861,7 @@ func (p *pacer) wrote(took time.Duration, now time.Time) {
 		return
 	}
 	if ahead := p.written - now.Sub(p.anchor); ahead > outputAhead {
-		time.Sleep(ahead - outputAhead)
+		pacerSleep(ahead - outputAhead)
 	}
 }
 
@@ -861,7 +877,7 @@ func (o *Output) startStream() {
 // any input had audio in it. It returns stepIdle, with a frame of silence to
 // write, once the inputs have been idle for IdleClose.
 func (o *Output) next(frame []int16, sum []float32, rate, hist int, idleSince *time.Time) (step mixStep, seq uint64, active bool) {
-	o.mu.Lock()
+	o.lockForMix()
 	defer o.mu.Unlock()
 	now := time.Now()
 	if o.closeNow {
@@ -894,7 +910,7 @@ func (o *Output) closeIdle() {
 // wrote records that the stream has taken frame seq, and wakes every Write
 // and Drain that waits.
 func (o *Output) wrote(seq uint64) {
-	o.mu.Lock()
+	o.lockForMix()
 	defer o.mu.Unlock()
 	o.written = seq
 	o.changed()
