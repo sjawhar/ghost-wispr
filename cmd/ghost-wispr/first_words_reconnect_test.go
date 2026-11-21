@@ -222,7 +222,7 @@ func outageRecording(t *testing.T, room, speech, latency int) []uint16 {
 	t.Cleanup(cancel)
 	rc := newLiveTranscription(ctx, "test-key",
 		&interfaces.ClientOptions{Host: host},
-		&interfaces.LiveTranscriptionOptions{Model: "nova-3", Language: "en-US", Encoding: "linear16", SampleRate: 16000, Channels: 1},
+		constOpts(&interfaces.LiveTranscriptionOptions{Model: "nova-3", Language: "en-US", Encoding: "linear16", SampleRate: 16000, Channels: 1}),
 		transcribe.ResilientConfig{SampleRate: 16000, InitialReconnectDelay: 20 * time.Millisecond, MaxReconnectBackoff: 50 * time.Millisecond},
 		transcriptCallback{manager: manager}, newWarningsRegistry(), nil)
 	t.Cleanup(func() { _ = rc.Close() })

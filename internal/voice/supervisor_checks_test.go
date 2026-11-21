@@ -195,10 +195,12 @@ func TestSoundTriggersAndPitch(t *testing.T) {
 }
 
 // TestAWakeCutsTheAnswerChime fails if the answer sound plays on over the
-// wake sound of a new call.
+// wake sound of a new call: it writes more frames once the wake sound played
+// whole. The turn wait is long, so that the exchange, with no question, does
+// not end and cut the wake sound before it played whole.
 func TestAWakeCutsTheAnswerChime(t *testing.T) {
 	c := newFakeConcierge()
-	r := newRig(t, c)
+	r := newRigWith(t, c, func(cfg *SupervisorConfig, _ *rig) { cfg.TurnWait = time.Minute })
 	r.speaker.paceWrites(audio.InputChime, 20*time.Millisecond)
 	c.answers <- PendingAnswer{TaskID: "t1", SessionID: "sess-1", Text: "x"}
 	eventually(t, "the answer sound begins", func() bool { return len(r.speaker.soundsPlayed()) == 1 })
@@ -212,8 +214,11 @@ func TestAWakeCutsTheAnswerChime(t *testing.T) {
 		return len(names) == 2 && names[1] == "wake" && frames[1] == wakeFrames
 	})
 	_, frames := r.speaker.chimePlaybacks()
-	if frames[0] >= answerFrames {
-		t.Fatalf("the answer sound played all %d frames over the wake", frames[0])
+	played := frames[0]
+	time.Sleep(200 * time.Millisecond) // ten frames of an answer sound that plays on
+	_, frames = r.speaker.chimePlaybacks()
+	if frames[0] != played || frames[0] >= answerFrames {
+		t.Fatalf("the answer sound had played %d of its %d frames when the wake sound ended, and %d 200 ms later: it plays on over the wake", played, answerFrames, frames[0])
 	}
 }
 

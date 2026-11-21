@@ -40,17 +40,13 @@ func TestTheConciergeHearsTheTurnAsItIsSpoken(t *testing.T) {
 func TestTheTurnTakesTheSessionOnceItStarts(t *testing.T) {
 	c := newFakeConcierge("fact")
 	r := newRig(t, c)
-	r.mu.Lock()
-	r.session = ""
-	r.mu.Unlock()
+	r.setSession("") // no session yet
 	r.heard("Wispr,", false, false)
 	sess := r.waitSession()
 	if sess.x.SessionID != "" {
 		t.Fatalf("session %q at open, want none yet", sess.x.SessionID)
 	}
-	r.mu.Lock()
-	r.session = "sess-2"
-	r.mu.Unlock()
+	r.setSession("sess-2") // the session starts, the one after the exchange opened
 	r.heard("Wispr, what is happening?", true, true)
 	r.waitTurn()
 	heard := c.heardCalls()
