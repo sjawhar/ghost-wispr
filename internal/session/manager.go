@@ -199,6 +199,7 @@ func (m *Manager) MessageKept(mr *api.MessageResponse) (*api.MessageResponse, er
 			// No word timings: one word for the whole sentence (Fix #7).
 			words = []transcribe.Word{{PunctuatedWord: strings.TrimSpace(kept.Channel.Alternatives[0].Transcript)}}
 		}
+		m.timeCapturedLocked(words)
 		m.buffer.AddWords(words)
 	}
 	m.mu.Unlock()
@@ -274,6 +275,23 @@ func liveWords(mr *api.MessageResponse) []transcribe.Word {
 		})
 	}
 	return words
+}
+
+// timeCapturedLocked sets when each word was captured (Word.CapturedStart,
+// Word.CapturedMid) from its times into the live stream, while the session
+// takes its result: the stream is then that of the socket that heard it, so
+// a reconnect before the word is placed (splitAtCloseLocked,
+// raiseFloorToCloseLocked) cannot read it against another socket's stream.
+// It must be called with m.mu held; the live stream never takes m.mu.
+func (m *Manager) timeCapturedLocked(words []transcribe.Word) {
+	if m.stream == nil {
+		return
+	}
+	for i := range words {
+		word := &words[i]
+		word.CapturedStart = m.stream.CapturedBefore(time.Duration(word.Start * float64(time.Second)))
+		word.CapturedMid = m.stream.CapturedBefore(time.Duration((word.Start + word.End) / 2 * float64(time.Second)))
+	}
 }
 
 // heardFrom returns where in the live stream the words of result mr begin:
@@ -416,11 +434,13 @@ func (m *Manager) flushBuffer() error {
 // splitAtCloseLocked splits words, in the order Deepgram heard them, into
 // those captured before the current recording closed, which its session
 // keeps (its recording holds their audio), and those captured after. A word
-// was captured before the close when the live stream says it was captured
-// longer ago than the audio the recorder has taken since the close; without
-// a live stream, words are taken as captured now. While the recording is
-// still open, every word is before the close. It must be called with m.mu
-// held; it reads the recorder and the live stream, which never take m.mu.
+// was captured before the close when it was captured longer ago than the
+// audio the recorder has taken since the close: the live stream's count of
+// all the audio captured, less the word's own place on it, read when its
+// result came (timeCapturedLocked). Without a live stream, words are taken as
+// captured now. While the recording is still open, every word is before the
+// close. It must be called with m.mu held; it reads the recorder and the live
+// stream, which never take m.mu.
 func (m *Manager) splitAtCloseLocked(words []transcribe.Word) (before, after []transcribe.Word) {
 	if m.recorder == nil {
 		return words, nil
@@ -429,10 +449,14 @@ func (m *Manager) splitAtCloseLocked(words []transcribe.Word) (before, after []t
 	if !closed {
 		return words, nil
 	}
+	var captured time.Duration
+	if m.stream != nil {
+		captured = m.stream.Captured()
+	}
 	for i, word := range words {
 		var ago time.Duration
 		if m.stream != nil {
-			ago = m.stream.CapturedSince(time.Duration(word.Start * float64(time.Second)))
+			ago = max(captured-word.CapturedStart, 0)
 		}
 		if ago <= since {
 			return words[:i], words[i:]
@@ -1508,8 +1532,9 @@ func (m *Manager) ResumeCapture() {
 // deliver them, or keep them buffered, past the end. The close is the
 // stream's count less the audio the recorder has taken since, read first; it
 // is never early, as live transcription gets each chunk before the recorder.
-// It must be called with m.mu held; the recorder and the live stream never
-// take m.mu.
+// A buffered word is placed by its middle, read when its result came
+// (timeCapturedLocked). It must be called with m.mu held; the recorder and
+// the live stream never take m.mu.
 func (m *Manager) raiseFloorToCloseLocked() {
 	if m.stream == nil || m.recorder == nil {
 		return
@@ -1522,7 +1547,7 @@ func (m *Manager) raiseFloorToCloseLocked() {
 	words := m.buffer.Flush()
 	kept := words[:0]
 	for _, word := range words {
-		if !m.beforeFloorLocked((word.Start + word.End) / 2) {
+		if word.CapturedMid >= m.floor {
 			kept = append(kept, word)
 		}
 	}
