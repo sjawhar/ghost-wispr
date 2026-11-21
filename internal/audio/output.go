@@ -237,17 +237,19 @@ type outputInput struct {
 	unlanded         playedTime
 }
 
-// owners is who the queued samples a stream position holds came from: last,
-// and, when an earlier playback's samples share the position, as one
-// position of a downsampled input can hold the end of one playback and the
-// start of the next, first and how many of them were its. The samples of a
-// playback between those two, one shorter than a resampling step, are
-// counted as last's: a take-back of the position takes all of last, whose
-// later audio follows it, so last loses all it played either way, and the
-// playback between keeps them as played, as on main.
+// owners is who the queued samples a stream position holds came from, as
+// one position of a downsampled input can hold the end of one playback and
+// the start of the next: first, the playback of its first samples, and
+// firstN of them, once another's sample landed there; and last, the
+// playback of its latest run of samples, and lastN of them. A take-back of
+// the position takes off each of those two exactly its own samples. Samples
+// of others between them, of a playback shorter than a resampling step or
+// of an earlier run of last's, are taken off no one: those playbacks keep
+// them as played, as main keeps every sample of a position but its last
+// playback's, and none loses audio the room heard.
 type owners struct {
-	last, first *Playback
-	firstN      int
+	last, first   *Playback
+	firstN, lastN int
 }
 
 // tail is a playback whose last sample the resampler took at push last.
@@ -637,7 +639,7 @@ func takeBack(held []uint32, heldBy []owners, lost *playedTime) {
 			first = min(o.firstN, n)
 			charge(o.first, rate, first)
 		}
-		charge(o.last, rate, n-first)
+		charge(o.last, rate, min(o.lastN, n-first))
 	}
 	for _, s := range shares {
 		s.pb.played.sub(s.t.total())
@@ -771,17 +773,17 @@ func (in *outputInput) render(rate int) {
 	}
 }
 
-// land counts one queued sample of pb, at the input's rate, at landed[j]. A
-// position whose samples so far came from another playback keeps that one as
-// its first owner (owners).
+// land counts one queued sample of pb, at the input's rate, at landed[j],
+// and who it came from (owners).
 func (in *outputInput) land(j int, pb *Playback) {
 	n := int(in.landed[j] >> 24)
 	if o := &in.landedBy[j]; o.last != pb {
 		if o.last != nil && o.first == nil {
 			o.first, o.firstN = o.last, n
 		}
-		o.last = pb
+		o.last, o.lastN = pb, 0
 	}
+	in.landedBy[j].lastN++
 	in.landed[j] = heldCount(n+1, in.rate)
 }
 

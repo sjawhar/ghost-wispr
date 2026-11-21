@@ -912,3 +912,50 @@ func TestAThirdPlaybackInAPositionTakesNothingOffTheFirst(t *testing.T) {
 		}
 	}
 }
+
+// TestAPlaybackBackInAPositionLosesOnlyItsOwnSamples fails if a stream
+// position that holds the end of a playback, all of a second shorter than a
+// resampling step, and one more sample of the first, written after the
+// second, takes the second's samples off the first when a Cancel takes the
+// position back: the first then lost part of its audio that played, 9.984
+// ms reported of its 10 ms heard, where main kept its 10 ms (Sol's review of
+// #148 at db8c2a0). The first keeps exactly the audio outside the take-back,
+// and the last, all of it taken back, none. The control writes the second
+// nothing.
+func TestAPlaybackBackInAPositionLosesOnlyItsOwnSamples(t *testing.T) {
+	for _, middle := range []int{0, 6} {
+		t.Run(fmt.Sprintf("%d samples between", middle), func(t *testing.T) {
+			stream := &probeStream{fakeStream: newFakeStream(48000)}
+			out, start, events := probeOutput(t, stream)
+			ctx := testContext(t)
+			a, b, d := out.Begin(InputVoice), out.Begin(InputVoice), out.Begin(InputVoice)
+			format := AudioFormat{SampleRate: 384000, Channels: 1, Encoding: EncodingPCM16}
+			for _, part := range []struct {
+				pb *Playback
+				n  int
+			}{{a, 3841}, {b, middle}, {a, 1}, {d, 3838 - middle}} {
+				pcm := make([]int16, part.n)
+				for i := range pcm {
+					pcm[i] = 1000
+				}
+				if err := part.pb.Write(ctx, pcm16Bytes(pcm), format); err != nil {
+					t.Fatal(err)
+				}
+			}
+			stream.before = func(n int, _ []int16) {
+				if n == 4 {
+					out.Cancel(InputVoice)
+				}
+			}
+			stream.drop = func() (int, error) { return 1424, nil }
+			start()
+			end := probeVoiceEvent(t, events, false)
+			if end.Played != 10*time.Millisecond {
+				t.Fatalf("fixture: the speech played %v, want the 10 ms before the take-back", end.Played)
+			}
+			if got, last := a.Played(), d.Played(); got != 10*time.Millisecond || last != 0 {
+				t.Fatalf("the first playback played %v, want the 10 ms outside the take-back; the last %v, want none (the one between %v)", got, last, b.Played())
+			}
+		})
+	}
+}
