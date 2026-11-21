@@ -1,6 +1,7 @@
 package voice
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"go/ast"
@@ -87,6 +88,9 @@ type afterSpeech struct {
 	// minute, so neither ends the exchange first. limit is exchangeMax; 0
 	// leaves it.
 	idle, followUp, limit time.Duration
+	// meeting ends the exchange's meeting (SupervisorConfig.Meeting) as the
+	// end, before end runs.
+	meeting bool
 }
 
 // spokenEnds is how a driving voice's exchange ends after its voice spoke,
@@ -115,7 +119,11 @@ var spokenEnds = map[string]afterSpeech{
 	"no follow-up": {end: func(*testing.T, *rig, *fakeConcierge, *fakeSession) {}, followUp: 300 * time.Millisecond,
 		afterReport: "the follow-up window opens on the speaker's report (driverSpeechLocked)"},
 	"it reached its limit of %v": {end: func(*testing.T, *rig, *fakeConcierge, *fakeSession) {},
-		limit: 2 * time.Second},
+		limit: time.Second},
+	"Wispr, who has a hand up": {end: func(t *testing.T, r *rig, _ *fakeConcierge, _ *fakeSession) {
+		r.heard("Wispr, who has a hand up?", true, true)
+	}},
+	"its meeting ended": {end: func(*testing.T, *rig, *fakeConcierge, *fakeSession) {}, meeting: true},
 	"side talk in the follow-up window": {end: func(t *testing.T, r *rig, _ *fakeConcierge, sess *fakeSession) {
 		r.heard(sideTalk, true, true)
 		out, err := sess.x.Tools.Run(t.Context(), ToolCall{ID: "side", Name: AnswerTool, Args: json.RawMessage(`{}`)})
@@ -135,6 +143,7 @@ var spokenEnds = map[string]afterSpeech{
 	}, afterReport: "a holder's answer takes the floor only while the voice is silent (offerAnswers)"},
 
 	"Wispr, go ahead":          {cannot: "it ends only an exchange whose voice does not drive its turn"},
+	"its membership ended":     {cannot: "it ends only an exchange speaking a hand's held answer (handEndedLocked)"},
 	"a new call":               {cannot: "a call in a driving voice's own exchange continues that exchange; it ends one that answers or speaks a held answer"},
 	"the wake was misheard":    {cannot: "it ends only an exchange whose voice does not drive its turn"},
 	"barge-in":                 {cannot: "a barge-in cuts a driving voice and keeps its exchange (cutDriverLocked)"},
@@ -247,10 +256,13 @@ func TestEveryEndAfterADrivingVoiceSpokeReportsItSpokenOnce(t *testing.T) {
 					t.Cleanup(func() { exchangeMax = was })
 				}
 				c := newFakeConcierge("It ships tomorrow.")
+				meeting, endMeeting := context.WithCancel(context.Background())
+				t.Cleanup(endMeeting)
 				var reports *heldReports
 				r := newRigWith(t, c, func(cfg *SupervisorConfig, r *rig) {
 					reports = holdReports(t, cfg, r)
 					cfg.Voice = func() (Voice, error) { return drivingVoice{r.voice}, nil }
+					cfg.Meeting = func(string) context.Context { return meeting }
 					cfg.IdleWait, cfg.FollowUpWait = time.Minute, time.Minute
 					if path.idle > 0 {
 						cfg.IdleWait = path.idle
@@ -259,8 +271,15 @@ func TestEveryEndAfterADrivingVoiceSpokeReportsItSpokenOnce(t *testing.T) {
 						cfg.FollowUpWait = path.followUp
 					}
 				})
+				var sess *fakeSession
+				end := func() {
+					if path.meeting {
+						endMeeting()
+					}
+					path.end(t, r, c, sess)
+				}
 				r.heard("Wispr, what is happening?", true, true)
-				sess := r.waitSession()
+				sess = r.waitSession()
 				sess.mu.Lock()
 				sess.endLate = time.Second
 				sess.mu.Unlock()
@@ -273,7 +292,7 @@ func TestEveryEndAfterADrivingVoiceSpokeReportsItSpokenOnce(t *testing.T) {
 				case !late:
 					reports.release()
 					waitFor(t, reports.delivered, "the speaker's report delivered")
-					path.end(t, r, c, sess)
+					end()
 				case path.afterReport != "":
 					time.Sleep(3 * max(path.idle, path.followUp, 300*time.Millisecond))
 					if closed() {
@@ -281,9 +300,9 @@ func TestEveryEndAfterADrivingVoiceSpokeReportsItSpokenOnce(t *testing.T) {
 					}
 					reports.release()
 					waitFor(t, reports.delivered, "the speaker's report delivered")
-					path.end(t, r, c, sess)
+					end()
 				default:
-					path.end(t, r, c, sess)
+					end()
 					eventually(t, "the exchange ended with the speaker's report held", closed)
 					reports.release()
 					waitFor(t, reports.delivered, "the speaker's report delivered")
