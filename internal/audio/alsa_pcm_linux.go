@@ -5,6 +5,7 @@ package audio
 /*
 #cgo LDFLAGS: -lasound
 #include <stdlib.h>
+#include <time.h>
 #include <alsa/asoundlib.h>
 
 // gw_playback is a playback PCM gw_open_playback opened, with the parameters
@@ -81,6 +82,56 @@ fail:
 	r.pcm = NULL;
 	return r;
 }
+
+// gw_status is one snapshot of a PCM's status: whether it is running (or
+// draining) or suspended, its delay, which counts what is in flight to a USB
+// speaker as well as what the PCM holds and which ALSA reports only while it
+// runs, and how many frames its buffer has free, which it reports in every
+// state, a suspended one included; or snd_pcm_status's error.
+typedef struct {
+	int running, suspended, rc;
+	long delay, avail;
+} gw_status;
+
+static gw_status gw_status_read(snd_pcm_t *pcm) {
+	gw_status s = {0};
+	snd_pcm_status_t *st;
+	snd_pcm_state_t state;
+	snd_pcm_status_alloca(&st);
+	if ((s.rc = snd_pcm_status(pcm, st)) < 0) return s;
+	state = snd_pcm_status_get_state(st);
+	s.running = state == SND_PCM_STATE_RUNNING || state == SND_PCM_STATE_DRAINING;
+	s.suspended = state == SND_PCM_STATE_SUSPENDED;
+	s.delay = (long)snd_pcm_status_get_delay(st);
+	s.avail = (long)snd_pcm_status_get_avail(st);
+	return s;
+}
+
+// gw_drop is what gw_drop_after_status read and did.
+typedef struct {
+	gw_status st;
+	long long between_ns;
+	int drop_rc;
+} gw_drop;
+
+// gw_drop_after_status reads the PCM's status, then drops the PCM, and
+// reports the status, the time between the status call's return and the
+// drop's call, during which a running device played on, and the drop's
+// result. A status that fails leaves the PCM not dropped. The OS can stop
+// the process between any two of these calls, inside the status call after
+// its snapshot or inside the drop before it stops the device too, and the
+// time measured does not see that.
+static gw_drop gw_drop_after_status(snd_pcm_t *pcm) {
+	gw_drop d = {0};
+	struct timespec a, b;
+	d.st = gw_status_read(pcm);
+	if (d.st.rc < 0) return d;
+	clock_gettime(CLOCK_MONOTONIC, &a);
+	clock_gettime(CLOCK_MONOTONIC, &b);
+	d.drop_rc = snd_pcm_drop(pcm);
+	d.between_ns = (long long)(b.tv_sec - a.tv_sec) * 1000000000LL + (b.tv_nsec - a.tv_nsec);
+	return d;
+}
 */
 import "C"
 
@@ -98,10 +149,21 @@ func (p *cgoPCM) writei(interleaved []int16, frames int) int {
 }
 
 func (p *cgoPCM) recover(rc int) int { return int(C.snd_pcm_recover(p.pcm, C.int(rc), 1)) }
+func (p *cgoPCM) resume() int        { return int(C.snd_pcm_resume(p.pcm)) }
 func (p *cgoPCM) avail() int         { return int(C.snd_pcm_avail(p.pcm)) }
-func (p *cgoPCM) drop() int          { return int(C.snd_pcm_drop(p.pcm)) }
-func (p *cgoPCM) prepare() int       { return int(C.snd_pcm_prepare(p.pcm)) }
-func (p *cgoPCM) rewindable() int    { return int(C.snd_pcm_rewindable(p.pcm)) }
+
+func (p *cgoPCM) status() pcmStatus { return statusOf(C.gw_status_read(p.pcm)) }
+
+func (p *cgoPCM) dropAfterStatus() (pcmStatus, time.Duration, int) {
+	d := C.gw_drop_after_status(p.pcm)
+	return statusOf(d.st), time.Duration(d.between_ns), int(d.drop_rc)
+}
+
+func statusOf(s C.gw_status) pcmStatus {
+	return pcmStatus{running: s.running != 0, suspended: s.suspended != 0, delay: int(s.delay), avail: int(s.avail), rc: int(s.rc)}
+}
+func (p *cgoPCM) prepare() int    { return int(C.snd_pcm_prepare(p.pcm)) }
+func (p *cgoPCM) rewindable() int { return int(C.snd_pcm_rewindable(p.pcm)) }
 
 func (p *cgoPCM) rewind(frames int) int {
 	return int(C.snd_pcm_rewind(p.pcm, C.snd_pcm_uframes_t(frames)))

@@ -3,6 +3,7 @@
 package audio
 
 import (
+	"cmp"
 	"context"
 	"fmt"
 	"log/slog"
@@ -59,6 +60,19 @@ type fakePCM struct {
 	closed  bool
 	xruns   int
 	minHeld int // the fewest frames it held at a write once running: the headroom left
+	// suspended makes a write report -ESTRPIPE, as after a system suspend,
+	// until a resume or a prepare; resumes says a resume succeeds and loses
+	// nothing, else the suspend stopped the device, cancelling what was in
+	// flight as a USB speaker's driver does, and only a prepare, which
+	// discards what it held, brings it back. suspendHeld is what it held
+	// then, which its status reports: not what was in flight.
+	suspended, resumes bool
+	suspendHeld        int
+	// delayFails and statusFails make those queries report -EIO;
+	// dropProgress is how many frames a lockstep device plays between the
+	// status a counted drop reads and the drop.
+	delayFails, statusFails bool
+	dropProgress            int
 }
 
 func newFakePCM(rate, buffer int) *fakePCM {
@@ -106,6 +120,12 @@ func (p *fakePCM) writei(interleaved []int16, frames int) int {
 	defer p.mu.Unlock()
 	written := 0
 	for {
+		if p.suspended {
+			if written > 0 {
+				return written
+			}
+			return -int(syscall.ESTRPIPE)
+		}
 		if p.xrun {
 			if written > 0 {
 				return written
@@ -153,11 +173,71 @@ func (p *fakePCM) writei(interleaved []int16, frames int) int {
 	}
 }
 
+// recover recovers as snd_pcm_recover does: an underrun by a prepare; a
+// suspend by a resume, else by a prepare, which discards what the PCM held
+// and still reports success.
 func (p *fakePCM) recover(rc int) int {
-	if rc != -int(syscall.EPIPE) {
-		return rc
+	switch rc {
+	case -int(syscall.EPIPE):
+		return p.prepare()
+	case -int(syscall.ESTRPIPE):
+		if p.resume() >= 0 {
+			return 0
+		}
+		return p.prepare()
 	}
-	return p.prepare()
+	return rc
+}
+
+// suspend suspends the PCM, as the system does: what it holds stays until a
+// resume, or is lost to a prepare. A PCM that resumes plays on; one that
+// cannot stopped, and what was in flight is lost with it.
+func (p *fakePCM) suspend() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	run := p.runs[len(p.runs)-1]
+	now := time.Now()
+	p.suspended, p.suspendHeld = true, len(run.samples)-p.consumed(run, now)
+	if !p.resumes {
+		run.heard, run.stopped = p.heardBy(run, now), true
+	}
+}
+
+func (p *fakePCM) resume() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if !p.suspended {
+		return 0
+	}
+	if !p.resumes {
+		return -int(syscall.ENOSYS)
+	}
+	p.suspended = false
+	return 0
+}
+
+// status is one snapshot as the kernel's status gives it: a delay only while
+// the PCM runs (zero before it starts, and when suspended or stopped), and
+// what its buffer has free in every state. statusFails makes it fail.
+func (p *fakePCM) status() pcmStatus {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.statusLocked(time.Now())
+}
+
+func (p *fakePCM) statusLocked(now time.Time) pcmStatus {
+	if p.statusFails {
+		return pcmStatus{rc: -int(syscall.EIO)}
+	}
+	run := p.runs[len(p.runs)-1]
+	if p.suspended {
+		return pcmStatus{suspended: true, avail: p.buffer - p.suspendHeld}
+	}
+	st := pcmStatus{avail: p.buffer - (len(run.samples) - p.consumed(run, now))}
+	if run.started && !run.stopped {
+		st.running, st.delay = true, len(run.samples)-p.heardBy(run, now)
+	}
+	return st
 }
 
 func (p *fakePCM) avail() int {
@@ -170,6 +250,9 @@ func (p *fakePCM) avail() int {
 func (p *fakePCM) delay() (int, int) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if p.delayFails {
+		return 0, -int(syscall.EIO)
+	}
 	run := p.runs[len(p.runs)-1]
 	now := time.Now()
 	return len(run.samples) - p.heardBy(run, now), 0
@@ -199,11 +282,32 @@ func (p *fakePCM) rewind(frames int) int {
 	return n
 }
 
-func (p *fakePCM) drop() int {
+// dropAfterStatus reads one status snapshot, lets a lockstep device play
+// dropProgress frames, and drops: it discards what it holds and what is in
+// flight, and reports the time those frames took as the time between the two
+// calls. In that time the room hears dropProgress more frames, of what was in
+// flight, while the device takes as many from what it holds, if it holds any:
+// a rewind may have taken all of that back.
+func (p *fakePCM) dropAfterStatus() (pcmStatus, time.Duration, int) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	p.stop(p.runs[len(p.runs)-1], time.Now())
-	return 0
+	now := time.Now()
+	st := p.statusLocked(now)
+	if st.rc < 0 {
+		return st, 0, 0
+	}
+	run := p.runs[len(p.runs)-1]
+	heard := p.heardBy(run, now)
+	var between time.Duration
+	if n := p.dropProgress; n > 0 && p.lockstep && run.started && !run.stopped {
+		take := min(n, len(run.samples)-run.taken)
+		run.taken += take
+		p.clock += take
+		run.heard, run.stopped = min(run.taken, heard+n), true
+		between = time.Duration(n) * time.Second / time.Duration(p.rate)
+	}
+	p.stop(run, now)
+	return st, between, 0
 }
 
 // prepare refuses a running PCM with -EBUSY, as the kernel does
@@ -219,7 +323,7 @@ func (p *fakePCM) prepare() int {
 		run.heard, run.stopped = 0, true // a prepared PCM that never started played nothing
 	}
 	p.runs = append(p.runs, &pcmRun{})
-	p.xrun = false
+	p.xrun, p.suspended = false, false
 	return 0
 }
 
@@ -288,16 +392,21 @@ func streamOn(pcm *fakePCM) *alsaStream {
 // TestALSAOutputCancelSilencesTheVoiceWithin20ms fails if the room still
 // hears the voice more than 20 ms after Cancel on the ALSA path, where the
 // device holds alsaBuffer that it has not played, and a few milliseconds more
-// are in flight to the speaker, as on USB:
-//   - a PCM that rewinds takes back what the device holds, and the chime,
-//     which plays on, loses nothing and repeats nothing: exactly the frames
+// are in flight to the speaker, as on USB, or if the chime, which plays on,
+// is heard for more or fewer frames than it has:
+//   - a PCM that rewinds takes back what the device holds: exactly the frames
 //     ALSA took back play again without the voice;
 //   - a PCM that cannot rewind drops what it holds instead;
 //   - a PCM whose audio in flight would play on for more than the bound
-//     after a rewind is dropped too, which cuts what is in flight.
+//     after a rewind is dropped too, which cuts what is in flight: that plays
+//     again too, without the voice, as the room would not hear it otherwise.
 //
 // The voice is positive and the chime negative, so that each sample tells
-// which plays in it, the voice ducked under the chime included.
+// which plays in it, the voice ducked under the chime included. The chime is
+// a constant, so this counts its frames, under the voice's duck: it cannot
+// tell a frame played twice from another lost, nor their order (Sol's review
+// of #148 at fd1d2b6). TestACancelLosesNoneOfAnotherInputsAudio plays a ramp,
+// and checks each frame once, in order, in the same cases.
 //
 // The device runs in lockstep and the Cancel comes from inside its write at
 // 200 ms of its clock, so the time is the stream's, counted in frames from
@@ -305,12 +414,11 @@ func streamOn(pcm *fakePCM) *alsaStream {
 // slows the run but cannot stretch it.
 func TestALSAOutputCancelSilencesTheVoiceWithin20ms(t *testing.T) {
 	for _, tc := range []struct {
-		name       string
-		inflight   time.Duration
-		noRewind   bool
-		exactChime bool // the chime plays every frame once
+		name     string
+		inflight time.Duration
+		noRewind bool
 	}{
-		{name: "rewind", inflight: 3 * time.Millisecond, exactChime: true},
+		{name: "rewind", inflight: 3 * time.Millisecond},
 		{name: "no rewind, so drop", inflight: 3 * time.Millisecond, noRewind: true},
 		{name: "rewind leaves too long a tail, so drop", inflight: 30 * time.Millisecond},
 	} {
@@ -321,6 +429,12 @@ func TestALSAOutputCancelSilencesTheVoiceWithin20ms(t *testing.T) {
 			pcm.fireAt, pcm.fire = 48000/5, func() { out.Cancel(InputVoice) }
 			ctx := testContext(t)
 			voice, chime := out.Begin(InputVoice), out.Begin(InputChime)
+			// The voice's first audio is queued before anything else, so a
+			// goroutine a loaded machine runs late cannot leave the voice
+			// silent until the Cancel.
+			if err := voice.Write(ctx, constant(48000, 20*time.Millisecond, 1000), mono48k); err != nil {
+				t.Fatal(err)
+			}
 			go func() { _ = voice.WriteAll(ctx, constant(48000, 2*time.Second, 1000), mono48k) }()
 			chimed := make(chan error, 1)
 			go func() {
@@ -359,11 +473,8 @@ func TestALSAOutputCancelSilencesTheVoiceWithin20ms(t *testing.T) {
 			if heard > 20*time.Millisecond {
 				t.Fatalf("the room heard the voice for %v of stream time after Cancel, want silence within 20 ms", heard)
 			}
-			if tc.exactChime && chimeFrames != 24000 {
-				t.Fatalf("the room heard %d frames of the chime, want each of its 24000 (500 ms) once", chimeFrames)
-			}
-			if lost := 24000 - chimeFrames; !tc.exactChime && (lost < 0 || lost > pcm.inflight) {
-				t.Fatalf("the room heard %d frames of the chime: a drop may lose only the %d in flight", chimeFrames, pcm.inflight)
+			if chimeFrames != 24000 {
+				t.Fatalf("the room heard %d frames of the chime, want its 24000 (500 ms)", chimeFrames)
 			}
 		})
 	}
@@ -706,6 +817,344 @@ func TestOutputPlaysThroughALSAWithoutPortAudio(t *testing.T) {
 	// Control: the count sees an initialization.
 	if err := InitializePortAudio(); err != nil || initialized.Load() != 1 {
 		t.Fatalf("control: InitializePortAudio = %v, counted %d initializations, want 1", err, initialized.Load())
+	}
+}
+
+// stoppedLevel is the level of the input a Cancel stops in the tests that
+// read which frames of another input the room heard: that input is a ramp,
+// 1, 2, 3 ..., below it, so each heard sample is the ramp's value, plus
+// stoppedLevel while the stopped input played with it.
+const stoppedLevel = 16384
+
+// rampPCM is n frames of the ramp 1, 2, ... n, 48 kHz mono PCM16.
+func rampPCM(n int) []byte {
+	s := make([]int16, n)
+	for i := range s {
+		s[i] = int16(i + 1)
+	}
+	return pcm16Bytes(s)
+}
+
+// rampHeard is the ramp's values the room heard, in order.
+func rampHeard(pcm *fakePCM) []int {
+	var got []int
+	pcm.heardInStreamTime(func(sample int16, _ int) {
+		v := int(sample)
+		if v >= stoppedLevel {
+			v -= stoppedLevel
+		}
+		if v > 0 {
+			got = append(got, v)
+		}
+	})
+	return got
+}
+
+// wantRamp fails t unless got is the ramp 1, 2, ... n: each frame once, in
+// order.
+func wantRamp(t *testing.T, got []int, n int) {
+	t.Helper()
+	for i, v := range got {
+		if v != i+1 {
+			t.Fatalf("the room's frame %d of the ramp is its %d, want %d: %d frames heard, want each of %d once, in order", i, v, i+1, len(got), n)
+		}
+	}
+	if len(got) != n {
+		t.Fatalf("the room heard %d frames of the ramp, want each of its %d once, in order", len(got), n)
+	}
+}
+
+// twistPCM is a fakePCM with what the plain one lacks: writes of at most
+// partial frames; a hook after its first write that takes audio; with
+// resuspend, a second suspend right after the first recovery's prepare, while
+// the Output replays; with split, a device that plays split frames between
+// a delay query and the next avail query, then suspends, as a pause of the
+// process between two queries would let it; with statusAt, a suspend just
+// before the first status read once the device's clock reaches statusAt,
+// after a write the PCM took whole; and with dropSuspend, a suspend just
+// before a drop's status read, after the delay a Cancel reads, which also
+// ends a status failure.
+type twistPCM struct {
+	*fakePCM
+	partial     int
+	afterFirst  func()
+	wrote       bool
+	resuspend   bool
+	rearmed     bool
+	split       int
+	splitArmed  bool
+	splitDone   bool
+	statusAt    int
+	dropSuspend bool
+}
+
+func (p *twistPCM) status() pcmStatus {
+	p.mu.Lock()
+	armed := p.statusAt > 0 && !p.fired && p.clock >= p.statusAt
+	if armed {
+		p.fired, p.firedAt = true, p.clock
+	}
+	p.mu.Unlock()
+	if armed {
+		p.suspend()
+	}
+	return p.fakePCM.status()
+}
+
+func (p *twistPCM) dropAfterStatus() (pcmStatus, time.Duration, int) {
+	if p.dropSuspend {
+		p.dropSuspend = false
+		p.mu.Lock()
+		p.statusFails = false
+		p.mu.Unlock()
+		p.suspend()
+	}
+	return p.fakePCM.dropAfterStatus()
+}
+
+func (p *twistPCM) writei(s []int16, n int) int {
+	if p.partial > 0 {
+		n = min(n, p.partial)
+	}
+	rc := p.fakePCM.writei(s, n)
+	if rc > 0 && !p.wrote {
+		p.wrote = true
+		if p.afterFirst != nil {
+			p.afterFirst()
+		}
+	}
+	return rc
+}
+
+func (p *twistPCM) prepare() int {
+	rc := p.fakePCM.prepare()
+	if rc >= 0 && p.resuspend && !p.rearmed {
+		p.mu.Lock()
+		p.fired, p.fireAt, p.rearmed = false, p.clock+1, true
+		p.mu.Unlock()
+	}
+	return rc
+}
+
+func (p *twistPCM) delay() (int, int) {
+	d, rc := p.fakePCM.delay()
+	p.mu.Lock()
+	p.splitArmed = p.split > 0 && !p.splitDone && p.clock >= 960 && !p.suspended
+	p.mu.Unlock()
+	return d, rc
+}
+
+func (p *twistPCM) avail() int {
+	p.mu.Lock()
+	armed := p.splitArmed
+	p.splitArmed = false
+	if armed {
+		run := p.runs[len(p.runs)-1]
+		n := min(p.split, len(run.samples)-run.taken)
+		run.taken += n
+		p.clock += n
+		p.splitDone = true
+	}
+	p.mu.Unlock()
+	avail := p.fakePCM.avail()
+	if armed {
+		p.suspend()
+		p.mu.Lock()
+		p.fired = true
+		p.mu.Unlock()
+	}
+	return avail
+}
+
+// TestACancelLosesNoneOfAnotherInputsAudio fails if a Cancel of one input
+// loses, repeats or reorders a frame of another input, which plays on, as a
+// Cancel of the chime alone must not touch the voice. With 30 ms in flight to
+// the speaker, or a PCM that cannot rewind, the stream drops the PCM, which
+// also cuts what is in flight: that plays again, from the drop's own count of
+// what it cut, less what the device played before the drop (Sol's reviews of
+// #133 at 4b7f919, all 960 frames of the voice lost, and of #148 at c96723a:
+// a delay read before the device played 96 more frames repeated them). Before
+// the PCM starts its status reports no delay, so the drop counts what its
+// buffer holds (Sol's review of #148 at fd1d2b6: 480 frames lost). When the
+// stream cannot read the delay or the status to count a drop by, it drops
+// nothing, and what it could not take back plays out, also when the stream
+// would close the moment it is quiet (Sol's review of #148 at fd1d2b6: the
+// idle close cut 960 frames). A system suspend after the delay was read and
+// before the drop's status cancelled what was in flight, which the drop and
+// its prepare hide from the next write's recovery, so the drop counts it too
+// (Sol's review of #148 at 9b80022: 1,440 frames lost); when that count is
+// unknown the stream fails, so the Drain reports an error, rather than play
+// on with audio gone. The 3 ms case rewinds.
+func TestACancelLosesNoneOfAnotherInputsAudio(t *testing.T) {
+	for _, tc := range []struct {
+		name                    string
+		inflight                time.Duration
+		noRewind                bool
+		progress                int
+		delayFails, statusFails bool
+		idle                    time.Duration // IdleClose: 100 ms if 0
+		prepared                bool          // the Cancel comes after the first write, before the PCM starts
+		dropSuspend             bool          // suspended before the drop's status, which a status failure ends
+		frames                  int           // the kept input's frames: 4800 if 0
+	}{
+		{name: "rewind, 3 ms in flight", inflight: 3 * time.Millisecond},
+		{name: "no rewind, so drop", inflight: 3 * time.Millisecond, noRewind: true},
+		{name: "30 ms in flight, so drop", inflight: 30 * time.Millisecond},
+		{name: "30 ms in flight, the device plays 96 frames before the drop", inflight: 30 * time.Millisecond, progress: 96},
+		{name: "30 ms in flight, the delay query fails", inflight: 30 * time.Millisecond, delayFails: true},
+		{name: "30 ms in flight, the delay query fails, and the stream closes once quiet", inflight: 30 * time.Millisecond, delayFails: true, idle: time.Nanosecond},
+		{name: "30 ms in flight, the status query fails", inflight: 30 * time.Millisecond, statusFails: true},
+		{name: "no rewind, cancelled before the PCM starts", noRewind: true, prepared: true},
+		{name: "30 ms in flight, suspended before the drop's status", inflight: 30 * time.Millisecond, dropSuspend: true},
+		// A 200 ms speech, the most the input queues: the mixer has taken
+		// 5280 of its frames at the Cancel, so it still plays when the drop
+		// fails the stream.
+		{name: "30 ms in flight, suspended before the drop's status, in flight not counted", inflight: 30 * time.Millisecond, statusFails: true, dropSuspend: true, frames: 9600},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			pcm := newFakePCM(48000, 48000*int(alsaBuffer/time.Millisecond)/1000)
+			pcm.inflight, pcm.lockstep, pcm.noRewind, pcm.dropProgress = int(48*tc.inflight/time.Millisecond), true, tc.noRewind, tc.progress
+			p := &twistPCM{fakePCM: pcm, dropSuspend: tc.dropSuspend}
+			gate := make(chan struct{})
+			out := NewOutput(OutputConfig{IdleClose: cmp.Or(tc.idle, 100*time.Millisecond), Open: func(string) (PlaybackStream, int, error) {
+				<-gate
+				return newALSAStream(p, "fake", alsaParams{rate: pcm.rate, channels: 1, period: pcm.rate / 100, buffer: pcm.buffer}), pcm.rate, nil
+			}})
+			t.Cleanup(func() { _ = out.Close() })
+			cancelled := make(chan struct{})
+			cancel := func() {
+				pcm.mu.Lock()
+				pcm.delayFails, pcm.statusFails = tc.delayFails, tc.statusFails
+				pcm.mu.Unlock()
+				out.Cancel("stopped")
+				close(cancelled)
+			}
+			if tc.prepared {
+				p.afterFirst = cancel
+			} else {
+				pcm.fireAt, pcm.fire = 1000, cancel
+			}
+			ctx := testContext(t)
+			kept := out.Begin("kept")
+			if err := kept.WriteAll(ctx, rampPCM(max(tc.frames, 4800)), mono48k); err != nil {
+				t.Fatal(err)
+			}
+			if err := out.Begin("stopped").WriteAll(ctx, constant(48000, 200*time.Millisecond, stoppedLevel), mono48k); err != nil {
+				t.Fatal(err)
+			}
+			close(gate)
+			probeWait(t, cancelled, "the Cancel")
+			err := kept.Drain(ctx)
+			if tc.dropSuspend && tc.statusFails {
+				if err == nil {
+					t.Fatal("the kept input drained with no error, though the loss of its audio could not be counted")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("the kept input's Drain: %v", err)
+			}
+			waitFor(t, "the idle stream to close", pcm.isClosed)
+			wantRamp(t, rampHeard(pcm), 4800)
+		})
+	}
+}
+
+// TestASuspendTheSpeakerCannotResumeFromLosesNoAudio fails if a suspend of
+// the PCM, as of the system, loses, repeats or reorders audio: a PCM that
+// cannot resume is prepared, which discards what it holds, and the stream
+// went on as after a lossless recovery (Sol's review of #133 at 4b7f919: the
+// room heard 1,440 of a speech's 4,800 frames). What it held, and what was
+// in flight to a USB speaker, which the suspend cancels and the status no
+// longer counts (Sol's review of #148 at c96723a: 144 frames lost), plays
+// again from the Output's history, also through writes the PCM takes in part
+// and a second suspend while it replays. What is in flight comes from one
+// status snapshot: a pause between a delay query and an avail query must not
+// count heard audio as in flight (Sol's review of #148 at fd1d2b6: 960 frames
+// repeated). An input begun during the suspend, which played nothing yet,
+// must not stop it (Sol's review of #148 at c96723a: a division by zero).
+// When the status, or the last in-flight count, could not be read, the loss
+// is unknown, and the stream fails, so the speech's Drain reports an error,
+// rather than play on with audio gone (Sol's review of #148 at fd1d2b6: 144
+// frames lost). A suspend after a write the PCM took whole, before the
+// stream reads what is in flight, leaves the last count, which the suspended
+// status no longer gives (Sol's review of #148 at 9b80022: 1,440 frames
+// lost). The controls resume, and lose nothing.
+func TestASuspendTheSpeakerCannotResumeFromLosesNoAudio(t *testing.T) {
+	for _, tc := range []struct {
+		name                 string
+		resumes, statusFails bool
+		inflightFails        bool // the status fails until the suspend
+		inflight             int
+		begin                bool
+		partial              int
+		resuspend            bool
+		split                int
+		frames               int  // the speech's frames: 4800 if 0
+		afterWrite           bool // suspended after a whole write, before its status
+	}{
+		{name: "it resumes", resumes: true},
+		{name: "it resumes, suspended after a whole write", resumes: true, inflight: 1440, afterWrite: true},
+		{name: "it cannot resume"},
+		{name: "it cannot resume, 144 frames in flight", inflight: 144},
+		{name: "it cannot resume, 144 frames in flight, 960 played between two queries", inflight: 144, split: 960},
+		{name: "it cannot resume, 1440 frames in flight, suspended after a whole write", inflight: 1440, afterWrite: true},
+		{name: "it cannot resume, an input begun during the suspend", begin: true},
+		{name: "it cannot resume, writes of 137 frames", partial: 137},
+		{name: "it cannot resume, and is suspended again while the Output replays", resuspend: true},
+		// A 200 ms speech, the most the input queues: the mixer has taken
+		// 5280 of its frames at the suspend, so the speech still plays.
+		{name: "it cannot resume, its status fails", statusFails: true, frames: 9600},
+		{name: "it cannot resume, 144 frames in flight, not counted", inflight: 144, inflightFails: true, frames: 9600},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			pcm := newFakePCM(48000, 48000*int(alsaBuffer/time.Millisecond)/1000)
+			pcm.lockstep, pcm.resumes, pcm.inflight, pcm.statusFails = true, tc.resumes, tc.inflight, tc.inflightFails
+			p := &twistPCM{fakePCM: pcm, partial: tc.partial, resuspend: tc.resuspend, split: tc.split}
+			gate := make(chan struct{})
+			out := NewOutput(OutputConfig{IdleClose: 100 * time.Millisecond, Open: func(string) (PlaybackStream, int, error) {
+				<-gate
+				return newALSAStream(p, "fake", alsaParams{rate: pcm.rate, channels: 1, period: pcm.rate / 100, buffer: pcm.buffer}), pcm.rate, nil
+			}})
+			t.Cleanup(func() { _ = out.Close() })
+			// The speech is frames 0, 1, ...; at the device's frame 1440 it
+			// holds the next 3840.
+			if tc.afterWrite {
+				p.statusAt = 1440
+			} else {
+				pcm.fireAt, pcm.fire = 1440, func() {
+					pcm.mu.Lock()
+					pcm.statusFails = tc.statusFails
+					pcm.mu.Unlock()
+					pcm.suspend()
+					if tc.begin {
+						out.Begin("late")
+					}
+				}
+			}
+			ctx := testContext(t)
+			pb := out.Begin(InputVoice)
+			frames := max(tc.frames, 4800)
+			if err := pb.WriteAll(ctx, rampPCM(frames), mono48k); err != nil {
+				t.Fatal(err)
+			}
+			close(gate)
+			err := pb.Drain(ctx)
+			if tc.statusFails || tc.inflightFails {
+				if err == nil {
+					t.Fatal("the speech drained with no error, though the loss of its audio could not be counted")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("the speech's Drain: %v", err)
+			}
+			waitFor(t, "the idle stream to close", pcm.isClosed)
+			if _, fired := pcm.cancelClock(); !fired {
+				t.Fatal("control: the device never reached the suspend")
+			}
+			wantRamp(t, rampHeard(pcm), frames)
+		})
 	}
 }
 

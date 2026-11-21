@@ -80,13 +80,19 @@ func probeWait(t *testing.T, ch <-chan struct{}, what string) {
 // the mixer runs. Cleanup opens every gate before waiting for Output.Close.
 func probeOutput(t *testing.T, stream PlaybackStream) (*Output, func(), <-chan SpeechEvent) {
 	t.Helper()
+	return probeOutputAt(t, stream, 48000)
+}
+
+// probeOutputAt is probeOutput with a stream that runs at rate.
+func probeOutputAt(t *testing.T, stream PlaybackStream, rate int) (*Output, func(), <-chan SpeechEvent) {
+	t.Helper()
 	open := make(chan struct{})
 	var once sync.Once
 	start := func() { once.Do(func() { close(open) }) }
 	out := NewOutput(OutputConfig{
 		Open: func(string) (PlaybackStream, int, error) {
 			<-open
-			return stream, 48000, nil
+			return stream, rate, nil
 		},
 	})
 	t.Cleanup(func() {
@@ -383,7 +389,7 @@ func TestAPlaybacksFrameIsTheLastItsAudioReaches(t *testing.T) {
 	render := func(from, to, m int, next bool) run {
 		in := &outputInput{gen: &playGen{}, tails: make([]tail, 0, 4)}
 		in.setRate(from)
-		in.contrib, in.landed = make([]float32, to/100), make([]uint32, 2*to/100)
+		in.contrib, in.landed, in.landedBy = make([]float32, to/100), make([]uint32, 2*to/100), make([]owners, 2*to/100)
 		a := &Playback{}
 		signal := make([]int16, m)
 		for i := range signal {
@@ -754,6 +760,201 @@ func TestASecondCancelKeepsTheFirstCut(t *testing.T) {
 			}
 			if !ended.Cancelled {
 				t.Fatalf("second Cancel erased the first queued cut: cancels=%d queued-samples-discarded=%d first-cut=%t final-cut=%t end=%+v", tc.cancels, queuedBefore, firstCut, finalCut, ended)
+			}
+		})
+	}
+}
+
+// TestATakeBackComesOffEachPlaybackItTook fails if a Cancel whose Drop takes
+// back audio of two playbacks of one input takes it off only the one the
+// stream took last: the first still reported 10 ms played, though the room
+// heard none of it (Sol's review of #133 at aaa8e0f). Played sizes what the
+// text-to-speech voice reports it spoke. The control is one playback of the
+// same 20 ms.
+func TestATakeBackComesOffEachPlaybackItTook(t *testing.T) {
+	for _, split := range []bool{false, true} {
+		t.Run(fmt.Sprintf("two playbacks %v", split), func(t *testing.T) {
+			stream := &probeStream{fakeStream: newFakeStream(48000)}
+			out, start, events := probeOutput(t, stream)
+			barrier := newProbeBarrier()
+			t.Cleanup(barrier.unblock)
+			ctx := testContext(t)
+			first := out.Begin(InputVoice)
+			second := first
+			if err := first.Write(ctx, constant(48000, 10*time.Millisecond, 1000), mono48k); err != nil {
+				t.Fatal(err)
+			}
+			if split {
+				second = out.Begin(InputVoice)
+			}
+			if err := second.Write(ctx, constant(48000, 10*time.Millisecond, 1000), mono48k); err != nil {
+				t.Fatal(err)
+			}
+			stream.before = func(n int, _ []int16) {
+				if n == 3 { // the first silent write after both
+					barrier.hold()
+				}
+			}
+			drops := 0
+			stream.drop = func() (int, error) {
+				if drops++; drops == 1 {
+					return 3 * 480, nil // all of both, and the silence after
+				}
+				return 0, nil
+			}
+			start()
+			probeWait(t, barrier.entered, "the first silent write after both playbacks")
+			probeVoiceEvent(t, events, true)
+			out.Cancel(InputVoice)
+			barrier.unblock()
+			end := probeVoiceEvent(t, events, false)
+			if end.Played != 0 {
+				t.Fatalf("fixture: the speech played %v, though its audio was all taken back", end.Played)
+			}
+			if a, b := first.Played(), second.Played(); a != 0 || b != 0 {
+				t.Fatalf("taken-back audio still counts as played: the first playback %v, the second %v", a, b)
+			}
+		})
+	}
+}
+
+// TestATakeBackSplitsAPositionTwoPlaybacksShare fails if a stream position
+// that holds samples of two playbacks, as one 48 kHz position of a 96 kHz
+// input can hold the end of one and the start of the next, charges the whole
+// take-back of it to the later one: the first, all of it taken back, still
+// reported 10.416 µs played (Sol's review of #148 at fd1d2b6). The control
+// puts the boundary on a resampling step, where no position is shared.
+func TestATakeBackSplitsAPositionTwoPlaybacksShare(t *testing.T) {
+	for _, firstFrames := range []int{2, 1} {
+		t.Run(fmt.Sprintf("the first playback %d samples at 96 kHz", firstFrames), func(t *testing.T) {
+			stream := &probeStream{fakeStream: newFakeStream(48000)}
+			out, start, events := probeOutput(t, stream)
+			barrier := newProbeBarrier()
+			t.Cleanup(barrier.unblock)
+			ctx := testContext(t)
+			first, second := out.Begin(InputVoice), out.Begin(InputVoice)
+			format := AudioFormat{SampleRate: 96000, Channels: 1, Encoding: EncodingPCM16}
+			if err := first.Write(ctx, pcm16Bytes(make([]int16, firstFrames)), format); err != nil {
+				t.Fatal(err)
+			}
+			if err := second.Write(ctx, pcm16Bytes(make([]int16, 960-firstFrames)), format); err != nil {
+				t.Fatal(err)
+			}
+			stream.before = func(n int, _ []int16) {
+				if n == 3 {
+					barrier.hold()
+				}
+			}
+			stream.drop = func() (int, error) { return 3 * 480, nil }
+			start()
+			probeWait(t, barrier.entered, "all the resampled output queued")
+			if first.Played() == 0 || second.Played() == 0 {
+				t.Fatalf("control: before the take-back the playbacks played %v and %v", first.Played(), second.Played())
+			}
+			out.Cancel(InputVoice)
+			barrier.unblock()
+			end := probeVoiceEvent(t, events, false)
+			if a, b := first.Played(), second.Played(); a != 0 || b != 0 {
+				t.Fatalf("all of it taken back, the first playback played %v and the second %v (the speech %v)", a, b, end.Played)
+			}
+		})
+	}
+}
+
+// TestAThirdPlaybackInAPositionTakesNothingOffTheFirst fails if a stream
+// position that holds the end of one playback, all of a second shorter than
+// a resampling step, and the start of a third charges the second's samples
+// to the first when a Cancel takes the position back: the first then lost
+// part of its audio that played, 9.984 ms reported of its 10 ms heard, where
+// main kept its 10 ms (Sol's review of #148 at 2e03d9d). The first keeps
+// exactly the audio outside the take-back, and the third, all of it taken
+// back, none; the second keeps its samples as played, as on main. The
+// control has no second playback. Two rates: 384 kHz on a 48 kHz device,
+// and 48 kHz on a 16 kHz one.
+func TestAThirdPlaybackInAPositionTakesNothingOffTheFirst(t *testing.T) {
+	for _, tc := range []struct {
+		input, device, first, middle, rest, back int
+	}{
+		{input: 384000, device: 48000, first: 3841, middle: 6, rest: 3839, back: 1424},
+		{input: 48000, device: 16000, first: 481, middle: 1, rest: 479, back: 464},
+	} {
+		for _, middle := range []int{0, tc.middle} {
+			t.Run(fmt.Sprintf("%d Hz on %d Hz, %d samples between", tc.input, tc.device, middle), func(t *testing.T) {
+				stream := &probeStream{fakeStream: newFakeStream(tc.device)}
+				out, start, events := probeOutputAt(t, stream, tc.device)
+				ctx := testContext(t)
+				format := AudioFormat{SampleRate: tc.input, Channels: 1, Encoding: EncodingPCM16}
+				pbs := []*Playback{out.Begin(InputVoice), out.Begin(InputVoice), out.Begin(InputVoice)}
+				for i, n := range []int{tc.first, middle, tc.rest - middle} {
+					pcm := make([]int16, n)
+					for j := range pcm {
+						pcm[j] = 1000
+					}
+					if err := pbs[i].Write(ctx, pcm16Bytes(pcm), format); err != nil {
+						t.Fatal(err)
+					}
+				}
+				stream.before = func(n int, _ []int16) {
+					if n == 4 {
+						out.Cancel(InputVoice)
+					}
+				}
+				stream.drop = func() (int, error) { return tc.back, nil }
+				start()
+				end := probeVoiceEvent(t, events, false)
+				if end.Played != 10*time.Millisecond {
+					t.Fatalf("fixture: the speech played %v, want the first playback's 10 ms", end.Played)
+				}
+				if a, c := pbs[0].Played(), pbs[2].Played(); a != 10*time.Millisecond || c != 0 {
+					t.Fatalf("the first playback played %v, want the 10 ms outside the take-back; the third %v, want none (the second %v)", a, c, pbs[1].Played())
+				}
+			})
+		}
+	}
+}
+
+// TestAPlaybackBackInAPositionLosesOnlyItsOwnSamples fails if a stream
+// position that holds the end of a playback, all of a second shorter than a
+// resampling step, and one more sample of the first, written after the
+// second, takes the second's samples off the first when a Cancel takes the
+// position back: the first then lost part of its audio that played, 9.984
+// ms reported of its 10 ms heard, where main kept its 10 ms (Sol's review of
+// #148 at db8c2a0). The first keeps exactly the audio outside the take-back,
+// and the last, all of it taken back, none. The control writes the second
+// nothing.
+func TestAPlaybackBackInAPositionLosesOnlyItsOwnSamples(t *testing.T) {
+	for _, middle := range []int{0, 6} {
+		t.Run(fmt.Sprintf("%d samples between", middle), func(t *testing.T) {
+			stream := &probeStream{fakeStream: newFakeStream(48000)}
+			out, start, events := probeOutput(t, stream)
+			ctx := testContext(t)
+			a, b, d := out.Begin(InputVoice), out.Begin(InputVoice), out.Begin(InputVoice)
+			format := AudioFormat{SampleRate: 384000, Channels: 1, Encoding: EncodingPCM16}
+			for _, part := range []struct {
+				pb *Playback
+				n  int
+			}{{a, 3841}, {b, middle}, {a, 1}, {d, 3838 - middle}} {
+				pcm := make([]int16, part.n)
+				for i := range pcm {
+					pcm[i] = 1000
+				}
+				if err := part.pb.Write(ctx, pcm16Bytes(pcm), format); err != nil {
+					t.Fatal(err)
+				}
+			}
+			stream.before = func(n int, _ []int16) {
+				if n == 4 {
+					out.Cancel(InputVoice)
+				}
+			}
+			stream.drop = func() (int, error) { return 1424, nil }
+			start()
+			end := probeVoiceEvent(t, events, false)
+			if end.Played != 10*time.Millisecond {
+				t.Fatalf("fixture: the speech played %v, want the 10 ms before the take-back", end.Played)
+			}
+			if got, last := a.Played(), d.Played(); got != 10*time.Millisecond || last != 0 {
+				t.Fatalf("the first playback played %v, want the 10 ms outside the take-back; the last %v, want none (the one between %v)", got, last, b.Played())
 			}
 		})
 	}
