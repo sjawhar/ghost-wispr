@@ -631,6 +631,11 @@ func validate(cfg *Config, hasExternalAccount bool) []string {
 	if cfg.GCPProject == "" && hasExternalAccount {
 		warnings = append(warnings, "Set gcp_project: an external-account credential file names no project.")
 	}
+	if raw := strings.TrimSpace(cfg.ModelGatewayURL); raw != "" {
+		if u, err := url.Parse(raw); err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" {
+			warnings = append(warnings, "model_gateway_url must be an absolute http or https URL — the Concierge and the Gemini voices cannot reach it.")
+		}
+	}
 
 	providers := make(map[string]struct{})
 	addModelProvider := func(scope, model string) {
@@ -746,7 +751,7 @@ func validate(cfg *Config, hasExternalAccount bool) []string {
 		default:
 			warnings = append(warnings, fmt.Sprintf("Invalid tts_provider %q — supported providers are elevenlabs, gemini, google.", cfg.TTSProvider))
 		}
-		if cfg.TTSProvider == "gemini" && strings.TrimSpace(cfg.GCPProject) == "" {
+		if cfg.TTSProvider == "gemini" && strings.TrimSpace(cfg.GCPProject) == "" && strings.TrimSpace(cfg.ModelGatewayURL) == "" {
 			warnings = append(warnings, "Gemini TTS provider requires gcp_project for Vertex AI.")
 		}
 		if cfg.TTSAPIKey == "" && cfg.TTSProvider != "google" && cfg.TTSProvider != "gemini" {
@@ -779,7 +784,7 @@ func validateVoice(cfg *Config) []string {
 	}
 	switch v.TTSEngine {
 	case TTSEngineGemini:
-		if v.Engine == VoiceEngineTTS && strings.TrimSpace(cfg.GCPProject) == "" {
+		if v.Engine == VoiceEngineTTS && strings.TrimSpace(cfg.GCPProject) == "" && strings.TrimSpace(cfg.ModelGatewayURL) == "" {
 			warnings = append(warnings, "voice.tts_engine gemini needs gcp_project for Vertex AI.")
 		}
 	case TTSEngineAura:

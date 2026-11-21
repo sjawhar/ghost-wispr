@@ -2,6 +2,7 @@ package genaiconfig
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -167,5 +168,51 @@ func TestBuildClientConfigGatewayNeedsCredentials(t *testing.T) {
 	}
 	if _, err := BuildClientConfig(opts); err == nil {
 		t.Error("BuildClientConfig made a gateway client with no credentials")
+	}
+}
+
+// TestTheGatewaysTokenGoesToTheGatewayAlone fails if a redirect from the
+// gateway carries the ID token, in x-goog-api-key or Authorization, to
+// another host: a different hostname, or the gateway's hostname at another
+// port.
+func TestTheGatewaysTokenGoesToTheGatewayAlone(t *testing.T) {
+	var mu sync.Mutex
+	var leaked []string
+	other := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		leaked = append(leaked, fmt.Sprintf("%s: goog key %q, auth %q", r.Host, r.Header.Get("x-goog-api-key"), r.Header.Get("Authorization")))
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"candidates":[{"content":{"role":"model","parts":[{"text":"ok"}]},"finishReason":"STOP"}]}`)
+	}))
+	defer other.Close()
+	_, port, _ := strings.Cut(strings.TrimPrefix(other.URL, "http://"), ":")
+	for _, target := range []string{"http://localhost:" + port, other.URL} {
+		t.Run(target, func(t *testing.T) {
+			gateway := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				http.Redirect(w, r, target+r.URL.RequestURI(), http.StatusTemporaryRedirect)
+			}))
+			defer gateway.Close()
+			cfg, err := BuildClientConfig(&Options{
+				GatewayURL:         gateway.URL,
+				GatewayCredentials: auth.NewCredentials(&auth.CredentialsOptions{TokenProvider: &rotatingToken{}}),
+			})
+			if err != nil {
+				t.Fatalf("BuildClientConfig: %v", err)
+			}
+			client, err := genai.NewClient(context.Background(), cfg)
+			if err != nil {
+				t.Fatalf("genai.NewClient: %v", err)
+			}
+			_, _ = client.Models.GenerateContent(context.Background(), "gemini-3.5-flash-lite", genai.Text("hi"), nil)
+			mu.Lock()
+			defer mu.Unlock()
+			for _, seen := range leaked {
+				if strings.Contains(seen, "tok-") {
+					t.Errorf("the redirect's host saw the gateway's token: %s", seen)
+				}
+			}
+			leaked = nil
+		})
 	}
 }

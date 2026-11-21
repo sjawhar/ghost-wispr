@@ -3,6 +3,7 @@ package genaiconfig
 import (
 	"fmt"
 	"net/http"
+	"net/url"
 	"strings"
 
 	"cloud.google.com/go/auth"
@@ -89,11 +90,17 @@ func BuildClientConfig(opts *Options) (*genai.ClientConfig, error) {
 		// replaces it on each request with the credentials' current token.
 		// The gateway serves Google's routes under /v1beta (and /models), not
 		// /v1, so the version is v1beta whatever the SDK's default.
+		origin, err := url.Parse(gateway)
+		if err != nil || origin.Scheme == "" || origin.Host == "" {
+			return nil, fmt.Errorf("the model gateway's URL %q is not absolute", gateway)
+		}
 		return &genai.ClientConfig{
 			APIKey:      gatewayPlaceholderKey,
 			Backend:     genai.BackendGeminiAPI,
 			HTTPOptions: genai.HTTPOptions{BaseURL: gateway, APIVersion: "v1beta"},
-			HTTPClient:  &http.Client{Transport: &gatewayKey{credentials: opts.GatewayCredentials, next: http.DefaultTransport}},
+			HTTPClient: &http.Client{Transport: &gatewayKey{
+				scheme: origin.Scheme, host: origin.Host, credentials: opts.GatewayCredentials, next: http.DefaultTransport,
+			}},
 		}, nil
 	}
 	project := strings.TrimSpace(opts.Project)
@@ -134,15 +141,24 @@ func BuildClientConfig(opts *Options) (*genai.ClientConfig, error) {
 	return cfg, nil
 }
 
-// gatewayKey puts the credentials' current token in each request's
-// x-goog-api-key, so a token renewed by the credentials' cache reaches the
-// next request. It never adds an Authorization header.
+// gatewayKey puts the credentials' current token in the x-goog-api-key of
+// each request to the gateway's own scheme and host, so a token renewed by
+// the credentials' cache reaches the next request. A request anywhere else,
+// as a redirect can make, carries no key at all. It never adds an
+// Authorization header.
 type gatewayKey struct {
-	credentials *auth.Credentials
-	next        http.RoundTripper
+	scheme, host string
+	credentials  *auth.Credentials
+	next         http.RoundTripper
 }
 
 func (k *gatewayKey) RoundTrip(r *http.Request) (*http.Response, error) {
+	r = r.Clone(r.Context())
+	r.Header.Del("x-goog-api-key")
+	r.Header.Del("Authorization")
+	if r.URL.Scheme != k.scheme || r.URL.Host != k.host {
+		return k.next.RoundTrip(r)
+	}
 	token, err := k.credentials.Token(r.Context())
 	if err != nil {
 		if r.Body != nil {
@@ -150,8 +166,6 @@ func (k *gatewayKey) RoundTrip(r *http.Request) (*http.Response, error) {
 		}
 		return nil, fmt.Errorf("the model gateway's ID token: %w", err)
 	}
-	r = r.Clone(r.Context())
 	r.Header.Set("x-goog-api-key", token.Value)
-	r.Header.Del("Authorization")
 	return k.next.RoundTrip(r)
 }

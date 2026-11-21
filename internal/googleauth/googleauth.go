@@ -8,6 +8,7 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/url"
 	"os"
 	"strconv"
@@ -28,6 +29,11 @@ const CloudPlatformScope = "https://www.googleapis.com/auth/cloud-platform"
 // ModelGatewayAudience is the audience of the ID token that the model gateway
 // (config's model_gateway_url) signs a caller in by.
 const ModelGatewayAudience = "model-gateway-gce"
+
+// sdkLogger is the logger every credential of this package gives Google's
+// SDK: it discards. At GOOGLE_SDK_GO_LOGGING_LEVEL=debug the SDK's own
+// logger writes each token response whole, the token in it, to stderr.
+var sdkLogger = slog.New(slog.DiscardHandler)
 
 type externalAccountFile struct {
 	Type                           string `json:"type"`
@@ -50,7 +56,7 @@ type certificateConfig struct {
 // Detect returns credentials from credPath when it is set, otherwise from
 // Application Default Credentials, with tokens scoped for scopes.
 func Detect(_ context.Context, credPath string, scopes ...string) (*auth.Credentials, error) {
-	options := &credentials.DetectOptions{Scopes: scopes}
+	options := &credentials.DetectOptions{Scopes: scopes, Logger: sdkLogger}
 	credPath = strings.TrimSpace(credPath)
 	if credPath == "" {
 		return credentials.DetectDefault(options)
@@ -118,7 +124,7 @@ func GatewayCredentials(ctx context.Context, credPath, audience string) (*auth.C
 	if strings.TrimSpace(credPath) != "" {
 		return impersonatedIDTokenCredentials(ctx, credPath, audience)
 	}
-	creds, err := idtoken.NewCredentials(&idtoken.Options{Audience: audience, ComputeTokenFormat: idtoken.ComputeTokenFormatFull})
+	creds, err := idtoken.NewCredentials(&idtoken.Options{Audience: audience, ComputeTokenFormat: idtoken.ComputeTokenFormatFull, Logger: sdkLogger})
 	if err != nil {
 		return nil, fmt.Errorf("the metadata server's ID token credentials: %w", err)
 	}
@@ -158,7 +164,7 @@ func impersonatedIDTokenCredentials(ctx context.Context, credPath, audience stri
 	baseCredentials, err := credentials.NewCredentialsFromJSON(
 		credentials.ExternalAccount,
 		baseCredentialData,
-		&credentials.DetectOptions{Scopes: []string{CloudPlatformScope}},
+		&credentials.DetectOptions{Scopes: []string{CloudPlatformScope}, Logger: sdkLogger},
 	)
 	if err != nil {
 		return nil, fmt.Errorf("detect federated credentials: %w", err)
@@ -168,6 +174,7 @@ func impersonatedIDTokenCredentials(ctx context.Context, credPath, audience stri
 		TargetPrincipal: principal,
 		IncludeEmail:    true,
 		Credentials:     baseCredentials,
+		Logger:          sdkLogger,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("create ID token credentials: %w", err)
