@@ -276,6 +276,88 @@ print("recording-times mic delay: checked %d bounds, %d failures; %d early bound
 sys.exit(1 if failures else 0)
 EOF
 
+# With floor_us, the longest a sample can stay captured and not yet in the file, every read of the
+# file's size bounds the places after it from below, the header-only reads of an arecord held 1.5 s
+# between its header and its first read among them. Each early bound must be never late, and early
+# only by floor_us less how long the samples truly stayed, the 10 ms between header-only reads, 400
+# ppm over the 0.5 s between anchors, and the rounding: for a clock 200 ppm fast, slow and right,
+# with samples that stay 0, 30 and 60 ms. Without floor_us, the same recording's early bounds are
+# the start's, 1.5 s early.
+python3 - "$work_dir" "$program" <<'EOF' || fail "an early bound from the anchors came out late or far early (above)"
+import math, os, random, subprocess, sys
+d, program = sys.argv[1], sys.argv[2]
+random.seed(146)
+floor_us = 61000
+failures = []
+checked = 0
+for speed in (1.0002, 0.9998, 1.0):
+    for stay in (0.0, 30.0, 60.0):
+        origin = 100000.0 + random.random()
+        def true_ms(rel):
+            """The driver's time the sample REL ms into the file was captured."""
+            return origin + rel / speed
+        length = 14000
+        lines = []
+        # Header-only reads every 10 ms from 1.5 s before the first capture until the first sample
+        # lands, stay ms after it; each read's BEFORE_US 0.1 ms before its size, US 0.1 ms after.
+        t = origin - 1500.0
+        while t < origin + stay:
+            lines.append("%d 44 %d\n" % (math.floor((t + 0.1) * 1000), math.floor((t - 0.1) * 1000)))
+            t += 10.0
+        for rel in range(500, length + 1, 500):
+            # At true_ms(rel) + stay the file holds the samples up to rel.
+            read = true_ms(rel) + stay
+            lines.append("%d %d %d\n" % (math.floor((read + 0.1) * 1000), 44 + rel * 48, math.floor((read - 0.1) * 1000)))
+        lines.append("%d %d\n" % (math.floor((true_ms(length) + stay + 5) * 1000), 44 + length * 48))
+        with open(os.path.join(d, "fa"), "w") as f:
+            f.writelines(lines)
+        sounds = []
+        at = 300.0
+        while at < length - 600:
+            on = at + random.random() * 100
+            off = on + 50 + random.random() * 300
+            sounds.append((on, off))
+            at = off + 200
+        report = ["[silencedetect @ 0x1] silence_start: 0\n"]
+        for on, off in sounds:
+            report.append("[silencedetect @ 0x1] silence_end: %.6f | x\n" % (on / 1000))
+            report.append("[silencedetect @ 0x1] silence_start: %.6f\n" % (off / 1000))
+        report.append("[silencedetect @ 0x1] silence_end: %.6f | x\n" % (length / 1000))
+        with open(os.path.join(d, "fs"), "w") as f:
+            f.writelines(report)
+        started = math.floor((origin - 1500.0) * 1000)
+        case = "speed %s, samples stay %d ms" % (speed, stay)
+        for floor in (str(floor_us), ""):
+            with open(os.path.join(d, "fs")) as rep:
+                out = subprocess.run(["awk", "-v", "rate=24000", "-v", "header=44", "-v", "frame=2",
+                                      "-v", "bytes=%d" % (44 + length * 48), "-v", "started_us=%d" % started,
+                                      "-v", "floor_us=" + floor, "-f", program, os.path.join(d, "fa"), "-"],
+                                     stdin=rep, capture_output=True, text=True, check=True).stdout.split("\n")
+            got = [line.split() for line in out if line.startswith("sound ")]
+            if len(got) != len(sounds):
+                failures.append("%s, floor %r: %d sounds, want %d" % (case, floor, len(got), len(sounds)))
+                continue
+            far = 0
+            for (on, off), fields in zip(sounds, got):
+                for place, early in ((on, int(fields[4])), (off, int(fields[5]))):
+                    checked += 1
+                    want = true_ms(place)
+                    if early > want:
+                        failures.append("%s, floor %r: the place %.3f ms in is at %.3f ms, its early bound %d ms: late" % (case, floor, place, want, early))
+                    elif floor and early < want - (floor_us / 1000.0 - stay + 10 + 500 * 0.0004 + 3):
+                        failures.append("%s, floor %r: the place %.3f ms in is at %.3f ms, its early bound %d ms: far early" % (case, floor, place, want, early))
+                    if early < want - 1400:
+                        far += 1
+            if not floor and far == 0:
+                failures.append("%s: without floor_us, no early bound is the start's, 1.5 s early" % case)
+if checked == 0:
+    failures.append("no place was checked")
+for line in failures[:20]:
+    print(line)
+print("recording-times floor: checked %d places, %d failures" % (checked, len(failures)))
+sys.exit(1 if failures else 0)
+EOF
+
 # ffmpeg's own silences: one it reports just before the start (a negative time) starts no sound, nor
 # does the one it ends at the end of the file; a sound still going at the end runs to the end.
 printf '2000000 %s\n' $((44 + 2000 * 48)) >"$work_dir/edge.anchors"

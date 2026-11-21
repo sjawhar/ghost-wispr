@@ -986,9 +986,13 @@ with the unit paused and no session active:
    file's size before arecord wrote its header, since arecord writes its whole header before the
    read that starts its capture. It is early by up to the time between two reads (10 ms on an idle
    Pi), the time arecord took from its header to its first read, and up to 400 ppm of the time into
-   the recording. A read of the size that fails moves the start nowhere. The recording's end lies
-   between the start plus its length and the last anchor, and a silence's length is never longer
-   than its length in the file.
+   the recording. A read of the size that fails moves the start nowhere. When `/proc/asound` shows
+   the capture substream arecord holds, and arecord reports no overrun, every read of the size also
+   bounds the times after it from below. A sample not yet in the file was captured at most two
+   periods and the buffer before (61 ms with arecord's 40 ms buffer and 10 ms periods). That
+   includes 1 ms for the interrupt that delivers a period, an assumption about the Pi, not a
+   measured bound. The recording's end lies between the start plus its length and the last anchor,
+   and a silence's length is never longer than its length in the file.
    Every check passes or fails only when its verdict holds for every time between the bounds, and
    otherwise reports UNKNOWN with how late the recording's times may be. `playback-cancel` passes a
    stop when the late time of its tail is within 20 ms, and fails it when even the early time is
@@ -999,8 +1003,9 @@ with the unit paused and no session active:
    makes the step UNKNOWN. `joined` passes when even the early time of the words' onset is at or
    after the end of the go-ahead and the late time is before `voice_spoken`. It fails when no sound
    longer than the wake sound can start between them, and otherwise reports UNKNOWN.
-   So an arecord slow to open its device makes no time early, but one held back between its header
-   and its first read can make these steps UNKNOWN.
+   So an arecord slow to open its device makes no time early, and one held back between its header
+   and its first read makes no time early by more than those 61 ms, unless it overran or the
+   substream is not shown: then these steps can read UNKNOWN.
    The clips the driver plays are timed the same way. A clip begins no earlier than when the
    driver starts `aplay`, and ends no later than when `aplay` returns, since `aplay` returns only
    after it drains the clip. Its WAV length gives the other bound of each: the clip begins no later

@@ -76,6 +76,7 @@ import fcntl
 import json
 import os
 import signal
+import re
 import sqlite3
 import subprocess
 import sys
@@ -1077,8 +1078,35 @@ def arecord(args):
         with open(path, "wb") as f:
             f.write(bytes(44 + seconds * 48000))
         return 0
+    # The capture substream arecord holds, in the case's /proc/asound: its status names arecord as
+    # owner_pid, and its hw_params give the 40 ms buffer and 10 ms period arecord asks for, at the
+    # card's 48 kHz. With no-capture-params no substream names it.
+    substream = None
+    if "no-capture-params" not in SCENARIO and os.environ.get("GHOST_WISPR_ASOUND_ROOT"):
+        device = args[args.index("-D") + 1]
+        card = {"Loopback": 2, "J75": 3, "Rigmic": 4}.get(re.search(r"CARD=([^,]+)", device).group(1), 9)
+        dev = re.search(r"DEV=(\d+)", device)
+        sub = re.search(r"SUBDEV=(\d+)", device)
+        substream = os.path.join(os.environ["GHOST_WISPR_ASOUND_ROOT"], "card%d" % card, "pcm%sc" % (dev.group(1) if dev else "0"), "sub%s" % (sub.group(1) if sub else "0"))
+        os.makedirs(substream, exist_ok=True)
+        with open(os.path.join(substream, "hw_params"), "w") as f:
+            f.write("access: RW_INTERLEAVED\nformat: S16_LE\nsubformat: STD\nchannels: 1\nrate: 48000 (48000/1)\nperiod_size: 480\nbuffer_size: 1920\n")
+        with open(os.path.join(substream, "status"), "w") as f:
+            f.write("state: RUNNING\nowner_pid   : %d\n" % os.getpid())
+
+    def close_substream():
+        if substream:
+            with open(os.path.join(substream, "status"), "w") as f:
+                f.write("closed\n")
+
+    def overrun(ms):
+        """arecord's own line for an overrun (alsa-utils aplay.c, xrun), which -q does not quiet."""
+        sys.stderr.write("overrun!!! (at least %.3f ms long)\n" % ms)
+        sys.stderr.flush()
+
     def stopped(*_):
         write("recording-stopped", "1")
+        close_substream()
         sys.exit(0)
     signal.signal(signal.SIGTERM, stopped)
     signal.signal(signal.SIGINT, stopped)
@@ -1134,6 +1162,8 @@ def arecord(args):
         begun = -(-time.monotonic_ns() // 1_000_000)
         log_to("recordings", "%s %d" % (path, begun))
         if "arecord-hold-200" in SCENARIO:
+            # Held longer than the buffer: a real arecord overruns.
+            overrun(200)
             folder = mode = None
             if "arecord-locked" in SCENARIO:
                 folder = os.path.dirname(os.path.abspath(path))
@@ -1154,14 +1184,25 @@ def arecord(args):
         # arecord-dies ends the recording 1 s later. From the start, arecord-behind keeps the file
         # 60 ms behind for the whole recording, as a loaded machine does, so that every anchor is
         # read 60 ms late and no later anchor makes up for it.
-        aplays, lag_until, skip = read("aplays", "0"), None, 0
+        # A real arecord overruns when a captured sample waits unwritten longer than its two periods
+        # and buffer (60 ms): the fake says so too when its own stall, with the lag it keeps, leaves
+        # a sample unwritten that long, as a loaded machine can hold the fake back.
+        aplays, lag_until, skip, last = read("aplays", "0"), None, 0, now_ms()
         while True:
             time.sleep(0.005)
             t = now_ms()
+            held = t - last + (60 if "arecord-behind" in SCENARIO else 0)
+            if held > 60 and not (lag_until is not None and t < lag_until):
+                overrun(held)
+            last = t
             if lag_until is None and SCENARIO & {"arecord-lag", "arecord-overrun", "arecord-dies"} and read("aplays", "0") != aplays:
                 lag_until = t + 2000 if "arecord-lag" in SCENARIO else t
+                # Behind by more than the buffer, or losing audio: a real arecord overruns.
+                if "arecord-lag" in SCENARIO:
+                    overrun(1000)
                 if "arecord-overrun" in SCENARIO:
                     skip = 250
+                    overrun(250)
                     log_to("recordings", "%s %d" % (path, begun + skip))
             if "arecord-dies" in SCENARIO and lag_until is not None and t > lag_until + 1000:
                 return 1
@@ -1177,6 +1218,7 @@ def arecord(args):
     finally:
         for pid in frozen:
             os.kill(pid, signal.SIGCONT)
+        close_substream()
 
 
 def ffmpeg(args):
@@ -1939,7 +1981,9 @@ launch slow-start-speech pass,slow-aplay-question '' -- --question @question.wav
 # The late chime with an arecord that reads 1.5 s after its header (arecord-slow-start): every early
 # bound is 1.5 s early, so the recording cannot show that the chime came over 400 ms after voice_wake,
 # nor which sound it is: UNKNOWN, never the FAIL of the late bound alone.
-launch late-chime-unsure late-chime,arecord-slow-start '' -- --question @question.wav --event-timeout 10
+# With no capture substream that names arecord (no-capture-params), so the early bounds come from the
+# start alone.
+launch late-chime-unsure late-chime,arecord-slow-start,no-capture-params '' -- --question @question.wav --event-timeout 10
 launch pause-fails pause-fails '' -- --question @question.wav --event-timeout 10
 
 # Refusals: each happens before any change.
@@ -1984,7 +2028,10 @@ launch wake-median wake-380 yes -- --step wake-sound --calls 3 --question @quest
 # wall clock stepped 1 s forward as the call begins (realtime-step): every time the driver compares
 # is on the monotonic clock, so still a pass; timed by the service's wall times, the wake sound
 # came about 1 s before wake_heard.
-launch wake-median-unsure wake-380,arecord-slow-start yes -- --step wake-sound --calls 3 --question @question.wav --rig-mic "$rig" --event-timeout 10
+launch wake-median-unsure wake-380,arecord-slow-start,no-capture-params yes -- --step wake-sound --calls 3 --question @question.wav --rig-mic "$rig" --event-timeout 10
+# The same with the capture substream known: the header-only reads bound the early times, within the
+# 61 ms a sample can stay unwritten, so the median control fails.
+launch wake-median-slow-read wake-380,arecord-slow-start yes -- --step wake-sound --calls 3 --question @question.wav --rig-mic "$rig" --event-timeout 10
 launch wake-realtime-step pass,realtime-step yes -- --step wake-sound --calls 1 --question @question.wav --rig-mic "$rig" --event-timeout 10
 launch wake-max late-chime yes -- --step wake-sound --calls 2 --question @question.wav --rig-mic "$rig" --event-timeout 10
 launch wake-no-person pass '' -- --step wake-sound --calls 2 --question @question.wav --rig-mic "$rig"
@@ -2003,7 +2050,7 @@ launch wake-verbose verbose-journal yes -- --step wake-sound --calls 1 --questio
 launch scripted pass yes -- --step scripted --engine tts --engine gptlive --questions 2 --question-dir @questions --rig-mic "$rig" --event-timeout 10
 # The pass with an arecord that reads 1.5 s after its header: no fact's sound certainly starts in its
 # window: UNKNOWN, never PASS.
-launch scripted-unsure pass,arecord-slow-start yes -- --step scripted --engine tts --questions 2 --question-dir @questions --rig-mic "$rig" --event-timeout 10
+launch scripted-unsure pass,arecord-slow-start,no-capture-params yes -- --step scripted --engine tts --questions 2 --question-dir @questions --rig-mic "$rig" --event-timeout 10
 # The pass with each question's aplay starting the clip 2 s late (slow-aplay-question): each first
 # fact came 0.7 s after its question ended, but may have come 3 s after, over the 2.5 s median bound:
 # UNKNOWN, never PASS.
@@ -2064,13 +2111,18 @@ launch barge-backchannel-late answer-until-clip,backchannel-stops,late-clip yes 
 # driver and its sampler held up as long (arecord-freeze-8s), as #146's review showed it: every
 # early bound is 8 s early, so the recording cannot show whether the silence after the stop came
 # after the clip began: UNKNOWN, or FAIL where the times still show the stop; never the PASS of a
-# recording end counted from that start.
-launch barge-backchannel-frozen answer-until-clip,backchannel-stops,arecord-freeze-8s yes -- --step barge-in --talkovers 1 --backchannels 1 --question @question.wav --talkover-dir @talkovers --backchannel-dir @backchannels --rig-mic "$rig" --event-timeout 15
+# recording end counted from that start. No capture substream names arecord here
+# (no-capture-params), so the early bounds come from the start alone.
+launch barge-backchannel-frozen answer-until-clip,backchannel-stops,arecord-freeze-8s,no-capture-params yes -- --step barge-in --talkovers 1 --backchannels 1 --question @question.wav --talkover-dir @talkovers --backchannel-dir @backchannels --rig-mic "$rig" --event-timeout 15
+# The same with the capture substream known: the anchors bound every later time within 61 ms, so the
+# stop is certain: FAIL.
+launch barge-backchannel-frozen-floor answer-until-clip,backchannel-stops,arecord-freeze-8s yes -- --step barge-in --talkovers 1 --backchannels 1 --question @question.wav --talkover-dir @talkovers --backchannel-dir @backchannels --rig-mic "$rig" --event-timeout 15
 # A 500 ms pause in the speech 1 s into a backchannel (backchannel-pause-500): the speech went on, a
 # pass; with an arecord that reads 1.5 s after its header, the pause may have been a stop's 1 s of
 # silence: UNKNOWN, never PASS.
 launch barge-pause answer-until-clip,backchannel-pause-500 yes -- --step barge-in --talkovers 1 --backchannels 1 --question @question.wav --talkover-dir @talkovers --backchannel-dir @backchannels --rig-mic "$rig" --event-timeout 15
-launch barge-pause-unsure answer-until-clip,backchannel-pause-500,arecord-slow-start yes -- --step barge-in --talkovers 1 --backchannels 1 --question @question.wav --talkover-dir @talkovers --backchannel-dir @backchannels --rig-mic "$rig" --event-timeout 15
+launch barge-pause-unsure answer-until-clip,backchannel-pause-500,arecord-slow-start,no-capture-params yes -- --step barge-in --talkovers 1 --backchannels 1 --question @question.wav --talkover-dir @talkovers --backchannel-dir @backchannels --rig-mic "$rig" --event-timeout 15
+launch barge-pause-slow-read answer-until-clip,backchannel-pause-500,arecord-slow-start yes -- --step barge-in --talkovers 1 --backchannels 1 --question @question.wav --talkover-dir @talkovers --backchannel-dir @backchannels --rig-mic "$rig" --event-timeout 15
 
 # playback-cancel, timed by the end of the cancelled speech at the rig microphone: a pass; a correct
 # cancel that keeps the stream running with 80 ms of silence queued, which must pass; a status that
@@ -2116,7 +2168,10 @@ launch cancel-locked long,asound,stop-rounds-2,arecord-hold-200,arecord-reopen,a
 # A good cancel with an arecord that reads 1.5 s after its header: the recording cannot show that the
 # rig heard the speech up to the stop: UNKNOWN, never PASS.
 # shellcheck disable=SC2086
-launch cancel-unsure long,asound,stop-rounds-2,arecord-slow-start yes -- $cancel_args
+launch cancel-unsure long,asound,stop-rounds-2,arecord-slow-start,no-capture-params yes -- $cancel_args
+# The same with the capture substream known: PASS.
+# shellcheck disable=SC2086
+launch cancel-slow-read long,asound,stop-rounds-2,arecord-slow-start yes -- $cancel_args
 # shellcheck disable=SC2086
 launch cancel-rewind long,asound,stop-rounds-2,rewind yes -- $cancel_args
 # shellcheck disable=SC2086
@@ -2134,7 +2189,10 @@ launch cancel-leak long,asound,stop-rounds-2,leak-150 yes -- $cancel_args
 # shellcheck disable=SC2086
 launch cancel-leak-slow-start long,asound,stop-rounds-2,leak-150,arecord-start-3s yes -- $cancel_args
 # shellcheck disable=SC2086
-launch cancel-leak-unsure long,asound,stop-rounds-2,leak-150,arecord-slow-start yes -- $cancel_args
+launch cancel-leak-unsure long,asound,stop-rounds-2,leak-150,arecord-slow-start,no-capture-params yes -- $cancel_args
+# The same with the capture substream known: FAIL, its early bound over 20 ms.
+# shellcheck disable=SC2086
+launch cancel-leak-slow-read long,asound,stop-rounds-2,leak-150,arecord-slow-start yes -- $cancel_args
 # shellcheck disable=SC2086
 launch cancel-slow-start long,asound,stop-rounds-2,arecord-start-3s yes -- $cancel_args
 # shellcheck disable=SC2086
@@ -2222,7 +2280,10 @@ for scenario in other-meeting early-spoken other-spoken spoken-during-clip words
   launch "joined-$scenario" "joined,joined-$scenario" yes -- $joined_args
 done
 # shellcheck disable=SC2086
-launch joined-words-unsure joined,arecord-slow-start yes -- $joined_args
+launch joined-words-unsure joined,arecord-slow-start,no-capture-params yes -- $joined_args
+# The same with the capture substream known: the words' onset is certainly after the go-ahead: PASS.
+# shellcheck disable=SC2086
+launch joined-words-slow-read joined,arecord-slow-start yes -- $joined_args
 # The mention's aplay returning 1.8 s after the clip ended (slow-exit-mention): the hand sound came
 # 2.5 s after the mention ended, but only 0.7 s after aplay returned: UNKNOWN, never the FAIL of a gap
 # from aplay's return alone. The go-ahead's aplay starting the clip 2 s late (slow-aplay-go-ahead),
@@ -2557,6 +2618,12 @@ expect_rc wake-median-unsure 2
 expect_line wake-median-unsure 'UNKNOWN: wake-sound: the '
 expect_no_line wake-median-unsure 'FAIL: wake-sound: '
 expect_restored wake-median-unsure
+expect_line wake-median-unsure 'NOTE: recording: no capture substream names arecord, so the recording'"'"'s early bounds come from its start alone'
+expect_rc wake-median-slow-read 1
+expect_line wake-median-slow-read 'FAIL: wake-sound: median '
+expect_line wake-median-slow-read 'more than 300 ms'
+expect_no_line wake-median-slow-read 'NOTE: recording: no capture substream'
+expect_restored wake-median-slow-read
 expect_rc wake-realtime-step 0
 expect_line wake-realtime-step 'PASS: wake-sound: no call passed 400 ms'
 expect_between 'wake-realtime-step: median' "$(measured wake-realtime-step 'wake-sound: median')" 60 280
@@ -2746,6 +2813,10 @@ expect_rc barge-backchannel-frozen 1 2
 expect_no_line barge-backchannel-frozen 'PASS: barge-in: '
 [[ -s $root/barge-backchannel-frozen/state/arecord-froze ]] || check_failed 'barge-backchannel-frozen: the fake arecord did not hold the driver up'
 expect_restored barge-backchannel-frozen
+expect_rc barge-backchannel-frozen-floor 1
+expect_line barge-backchannel-frozen-floor 'FAIL: barge-in: 1 of 1 backchannels stopped the speech, more than 0'
+[[ -s $root/barge-backchannel-frozen-floor/state/arecord-froze ]] || check_failed 'barge-backchannel-frozen-floor: the fake arecord did not hold the driver up'
+expect_restored barge-backchannel-frozen-floor
 expect_rc barge-pause 0
 expect_line barge-pause 'PASS: barge-in: 0 of 1 backchannels stopped the speech, at most 0'
 expect_line barge-pause 'NOTE: barge-in round 2 (backchannel): the speech went on'
@@ -2755,6 +2826,9 @@ expect_rc barge-pause-unsure 2
 expect_line barge-pause-unsure 'UNKNOWN: barge-in: 0 of 1 backchannels stopped the speech, and backchannel rounds 2 may have'
 expect_no_line barge-pause-unsure 'PASS: barge-in: 0 of 1'
 expect_restored barge-pause-unsure
+expect_rc barge-pause-slow-read 0
+expect_line barge-pause-slow-read 'PASS: barge-in: 0 of 1 backchannels stopped the speech, at most 0'
+expect_restored barge-pause-slow-read
 
 # playback-cancel.
 expect_rc cancel 0
@@ -2776,6 +2850,7 @@ expect_restored cancel-late-stop
 expect_rc cancel-held-start 0
 expect_line cancel-held-start "PASS: playback-cancel: no stop's speech was heard at the rig microphone 20 ms after it"
 expect_restored cancel-held-start
+expect_line cancel-held-start "NOTE: recording: arecord reported an overrun, so the recording's early bounds come from its start alone"
 expect_rc cancel-locked 0
 expect_line cancel-locked "PASS: playback-cancel: no stop's speech was heard at the rig microphone 20 ms after it"
 [[ -s $root/cancel-locked/state/arecord-locked ]] || check_failed 'cancel-locked: the fake arecord never locked its file away, so the case tested no failed read'
@@ -2784,6 +2859,11 @@ expect_rc cancel-unsure 2
 expect_line cancel-unsure 'UNKNOWN: playback-cancel stop 1: the rig microphone did not hear the speech up to the stop'
 expect_no_line cancel-unsure "PASS: playback-cancel: no stop's speech was heard"
 expect_restored cancel-unsure
+expect_rc cancel-slow-read 0
+expect_line cancel-slow-read "PASS: playback-cancel: no stop's speech was heard at the rig microphone 20 ms after it"
+expect_no_line cancel-slow-read 'NOTE: recording: no capture substream'
+expect_no_line cancel-slow-read 'NOTE: recording: arecord reported an overrun'
+expect_restored cancel-slow-read
 expect_rc cancel-slow-start 0
 expect_line cancel-slow-start "PASS: playback-cancel: no stop's speech was heard at the rig microphone 20 ms after it"
 expect_restored cancel-slow-start
@@ -2861,6 +2941,10 @@ expect_line cancel-leak-unsure 'UNKNOWN: playback-cancel stop 1: the rig microph
 expect_no_line cancel-leak-unsure "FAIL: playback-cancel: a stop's speech was heard"
 expect_no_line cancel-leak-unsure "PASS: playback-cancel: no stop's speech was heard"
 expect_restored cancel-leak-unsure
+expect_rc cancel-leak-slow-read 1
+expect_line cancel-leak-slow-read "FAIL: playback-cancel: a stop's speech was heard at the rig microphone "
+expect_between 'cancel-leak-slow-read: how long the leaked word is heard, at the least, with arecord held 1.5 s before its first read' "$(heard_no_earlier cancel-leak-slow-read)" 21 400
+expect_restored cancel-leak-slow-read
 expect_rc cancel-leak-late 1
 expect_line cancel-leak-late "FAIL: playback-cancel: a stop's speech was heard at the rig microphone "
 expect_between 'cancel-leak-late: how long the word after a long silence is heard' "$(heard_after cancel-leak-late)" 1300 1500
@@ -3041,6 +3125,10 @@ expect_rc joined-told-slow-start 2
 expect_line joined-told-slow-start 'UNKNOWN: joined: the test agent was told its hand came down spoken between '
 expect_no_line joined-told-slow-start 'FAIL: joined: the test agent was told'
 expect_restored joined-told-slow-start
+expect_rc joined-words-slow-read 0
+expect_line joined-words-slow-read 'PASS: joined: the hand sound reached the Jabra'
+expect_line joined-words-slow-read "PASS: joined: the agent's words reached the Jabra"
+expect_restored joined-words-slow-read
 
 # The driver compares times on the monotonic clock only: bash's wall clock serves journalctl's
 # --since alone, so a step of the wall clock can move no time it compares.
