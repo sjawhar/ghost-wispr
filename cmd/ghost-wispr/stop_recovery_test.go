@@ -353,13 +353,182 @@ func TestTheStopWaitsForTheEventsWithinItsLimit(t *testing.T) {
 	}
 }
 
-// stoppingManager ends at once, and its lifecycle events never finish.
+// stoppingManager ends at once, its lifecycle events never finish, and it
+// leaves no work running.
 type stoppingManager struct{}
 
 func (*stoppingManager) ForceEndSession(context.Context) error { return nil }
 func (*stoppingManager) WaitForLifecyclePublishes(ctx context.Context) error {
 	<-ctx.Done()
 	return ctx.Err()
+}
+func (*stoppingManager) StopBackground(context.Context) error { return nil }
+
+// heldSummarizer is a summarizer whose Summarize waits until its context
+// ends, as a model call does, then takes stall more to return, writing
+// nothing: the store's writes come after it.
+type heldSummarizer struct {
+	entered chan struct{}
+	once    sync.Once
+	stall   time.Duration
+}
+
+func (s *heldSummarizer) Summarize(ctx context.Context, _, _ string) (string, string, string, string, error) {
+	s.once.Do(func() { close(s.entered) })
+	<-ctx.Done()
+	time.Sleep(s.stall)
+	return "", "", "", "", ctx.Err()
+}
+
+// TestTheStopWaitsForASessionEndsSummary fails if the stop, as main runs it,
+// returns while the summary a session's end started is still running: main
+// closes the store after the stop, and the summary then writes to a closed
+// database ("sql: database is closed"). It also fails if the summary the stop
+// cut off is recorded failed, or not left for the next start's backfill, or if
+// a session end after the stop starts a summary.
+func TestTheStopWaitsForASessionEndsSummary(t *testing.T) {
+	dir := t.TempDir()
+	store := openResumeStore(t, filepath.Join(dir, "summary.db"))
+	summarizer := &heldSummarizer{entered: make(chan struct{}), stall: 100 * time.Millisecond}
+	manager := session.NewManager(store, nil, summarizer, nil, session.NewDetector(time.Hour), 0)
+	recovery := recoverAtStart(store)
+	id, err := manager.ManualStartSession(t.Context(), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.ForceEndSession(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-summarizer.entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("control: the session's end started no summary")
+	}
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	began := time.Now()
+	recovery.stop(shutdownCtx, manager, lifecyclePublishWait)
+	if took := time.Since(began); took < summarizer.stall || took > time.Second {
+		t.Fatalf("the stop took %v, want it to wait the %v its cut-off summary takes, and no longer", took, summarizer.stall)
+	}
+	got := refinementOf(t, store, id)
+	if got.SummaryStatus != storage.SummaryRunning || got.SummaryError != "" {
+		t.Fatalf("summary status %q, error %q after the stop; want it left running, with no error, for the next start", got.SummaryStatus, got.SummaryError)
+	}
+	if ids, err := store.GetSessionsForBackfill(); err != nil || !slices.Contains(ids, id) {
+		t.Fatalf("the next start's backfill takes %v (%v), want session %s", ids, err, id)
+	}
+
+	if _, err := manager.ManualStartSession(t.Context(), ""); err != nil {
+		t.Fatal(err)
+	}
+	summarizer.entered = make(chan struct{})
+	summarizer.once = sync.Once{}
+	if err := manager.ForceEndSession(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-summarizer.entered:
+		t.Fatal("a session end after the stop started a summary")
+	case <-time.After(300 * time.Millisecond):
+	}
+}
+
+// SummarizeReported is the backfill's summarizer (session.ReportedSummarizer).
+func (s *heldSummarizer) SummarizeReported(ctx context.Context, sessionID, transcript string) (string, string, string, string, string, error) {
+	title, summary, preset, speakers, err := s.Summarize(ctx, sessionID, transcript)
+	return title, summary, preset, speakers, "", err
+}
+
+// SummarizeWithPreset is a requested summary's summarizer (presetSummarizer).
+func (s *heldSummarizer) SummarizeWithPreset(ctx context.Context, sessionID, transcript, _ string) (string, string, string, error) {
+	title, summary, _, speakers, err := s.Summarize(ctx, sessionID, transcript)
+	return title, summary, speakers, err
+}
+
+// endedSessionWithWords is session id, ended, with one segment of words and
+// the summary status given.
+func endedSessionWithWords(t *testing.T, store *storage.SQLiteStore, id, summaryStatus string) {
+	t.Helper()
+	at := time.Date(2026, 11, 20, 9, 0, 0, 0, time.UTC)
+	if err := store.CreateSession(id, at); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.AppendSegment(id, transcribe.Segment{Text: "synthetic words, no room audio", StartTime: 0, EndTime: 1, Timestamp: at}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.EndSession(id, at.Add(time.Minute), ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.DB().Exec(`UPDATE sessions SET summary_status = ? WHERE id = ?`, summaryStatus, id); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// stopDuringSummary runs the stop, as main runs it, once summarizer is inside
+// its call, and fails if the stop does not wait the summarizer's stall, or if
+// session id's summary is not left running, with no error, for the next
+// start's backfill.
+func stopDuringSummary(t *testing.T, store *storage.SQLiteStore, manager *session.Manager, summarizer *heldSummarizer, id string) {
+	t.Helper()
+	select {
+	case <-summarizer.entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("control: no summary started")
+	}
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	began := time.Now()
+	recoverAtStart(store).stop(shutdownCtx, manager, lifecyclePublishWait)
+	if took := time.Since(began); took < summarizer.stall || took > time.Second {
+		t.Fatalf("the stop took %v, want it to wait the %v its cut-off summary takes, and no longer", took, summarizer.stall)
+	}
+	got := refinementOf(t, store, id)
+	if got.SummaryStatus != storage.SummaryRunning || got.SummaryError != "" {
+		t.Fatalf("summary status %q, error %q after the stop; want it left running, with no error, for the next start", got.SummaryStatus, got.SummaryError)
+	}
+	if ids, err := store.GetSessionsForBackfill(); err != nil || !slices.Contains(ids, id) {
+		t.Fatalf("the next start's backfill takes %v (%v), want session %s", ids, err, id)
+	}
+}
+
+// TestTheStopWaitsForTheStartsSummaryBackfill fails if the stop returns while
+// the start's summary backfill, wired as main wires it, still runs (the store
+// closes after the stop, under it), or if the summary it cut off is recorded
+// failed instead of left for the next start.
+func TestTheStopWaitsForTheStartsSummaryBackfill(t *testing.T) {
+	store := openResumeStore(t, filepath.Join(t.TempDir(), "backfill.db"))
+	const id = "20261120090000"
+	endedSessionWithWords(t, store, id, storage.SummaryFailed)
+	manager := session.NewManager(store, nil, nil, nil, session.NewDetector(time.Hour), 0)
+	summarizer := &heldSummarizer{entered: make(chan struct{}), stall: 100 * time.Millisecond}
+	startSummaryBackfill(t.Context(), manager, summaryBackfill{
+		store: store, summarizer: summarizer, publish: func(string) {}, pollEvery: time.Second,
+		submit: func(context.Context, []string) (string, int, error) {
+			return "", 0, errors.New("no batch for one session")
+		},
+		poll: func(context.Context, string) (map[string]any, error) { return nil, errors.New("no batch") },
+	})
+	stopDuringSummary(t, store, manager, summarizer, id)
+}
+
+// TestTheStopWaitsForARequestedSummary fails if the stop returns while a
+// summary the API asked for (its resummarize hook, as main wires it) still
+// runs, or if the summary it cut off is recorded failed instead of left for
+// the next start; and if a request after the stop summarizes anything.
+func TestTheStopWaitsForARequestedSummary(t *testing.T) {
+	store := openResumeStore(t, filepath.Join(t.TempDir(), "resummarize.db"))
+	const id = "20261120090000"
+	endedSessionWithWords(t, store, id, storage.SummaryCompleted)
+	manager := session.NewManager(store, nil, nil, nil, session.NewDetector(time.Hour), 0)
+	summarizer := &heldSummarizer{entered: make(chan struct{}), stall: 100 * time.Millisecond}
+	hook := resummarizeUntilStop(manager, store, summarizer, &recordingBroadcaster{}, func(string) {})
+	go func() { _ = hook(context.Background(), id, "minutes") }() // as the API runs it
+	stopDuringSummary(t, store, manager, summarizer, id)
+	if err := hook(context.Background(), id, ""); !errors.Is(err, session.ErrStopped) {
+		t.Fatalf("a requested summary after the stop = %v, want %v", err, session.ErrStopped)
+	}
 }
 
 // heldEndRecorder is a recorder whose first EndSession waits until release

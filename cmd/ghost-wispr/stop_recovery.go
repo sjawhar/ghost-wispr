@@ -25,6 +25,7 @@ type stopRecoveryStore interface {
 type shutdownSessionEnder interface {
 	ForceEndSession(ctx context.Context) error
 	WaitForLifecyclePublishes(ctx context.Context) error
+	StopBackground(ctx context.Context) error
 }
 
 // stopRecovery is what the app does about the work a stop cuts off: a
@@ -68,9 +69,11 @@ func (r *stopRecovery) retry(ctx context.Context, warnings *warningsRegistry, re
 
 // stop ends the current session and waits, within shutdownCtx's deadline, for
 // any session end under way (a pause's), for the session's lifecycle events
-// (for lifecycleWait at most), and for the start's retries, which the stop has
-// cancelled, so the database closes under none of them and the stop still
-// ends on time.
+// (for lifecycleWait at most), for the work the session ends left running
+// (their refinements and summaries), which the stop cuts off, and for the
+// start's retries, which the stop has cancelled, so the database closes under
+// none of them and the stop still ends on time. A refinement or summary cut
+// off stays running in the store, for the next start (session.ErrStopped).
 func (r *stopRecovery) stop(shutdownCtx context.Context, manager shutdownSessionEnder, lifecycleWait time.Duration) {
 	if err := manager.ForceEndSession(shutdownCtx); err != nil {
 		slog.Warn("force end session failed", "error", err)
@@ -79,6 +82,9 @@ func (r *stopRecovery) stop(shutdownCtx context.Context, manager shutdownSession
 	defer cancel()
 	if err := manager.WaitForLifecyclePublishes(lifecycleCtx); err != nil {
 		slog.Warn("lifecycle event publishing did not finish before shutdown", "error", err)
+	}
+	if err := manager.StopBackground(shutdownCtx); err != nil {
+		slog.Warn("the work the session ends left running did not end before shutdown", "error", err)
 	}
 	retried := make(chan struct{})
 	go func() {

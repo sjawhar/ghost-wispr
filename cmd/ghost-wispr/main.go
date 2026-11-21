@@ -1395,7 +1395,7 @@ func main() {
 			if summarizer == nil {
 				return fmt.Errorf("summarization not configured")
 			}
-			return resummarize(ctx, store, summarizer, hub, publishSummaryReady, sessionID, preset)
+			return resummarizeUntilStop(manager, store, summarizer, hub, publishSummaryReady)(ctx, sessionID, preset)
 		},
 		OnSessionMerged: func(ctx context.Context, sessionID string) {
 			onSessionMerged(
@@ -1708,62 +1708,17 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 			manager.SetSyncer(syncer)
 		})
 
-	// Summarize recovered sessions (and any with pending/empty summaries).
+	// Summarize recovered sessions (and any with pending/empty summaries), as
+	// work the stop cuts off and waits for.
 	if startupSummarizer != nil {
-		go func() {
-			pendingIDs, err := store.GetSessionsForBackfill()
-			if err != nil {
-				slog.Warn("failed to query sessions needing summary", "error", err)
-				return
-			}
-			if len(pendingIDs) == 0 {
-				return
-			}
-			if len(pendingIDs) >= 4 {
-				batchName, count, err := submitSummaryBatch(ctx, pendingIDs)
-				if err == nil {
-					log.Printf("startup: submitting %d sessions to batch summarization", count)
-					go func(batchName string) {
-						ticker := time.NewTicker(30 * time.Second)
-						defer ticker.Stop()
-						for {
-							result, err := pollSummaryBatch(ctx, batchName)
-							if err != nil {
-								if ctx.Err() != nil {
-									return
-								}
-								slog.Warn("startup batch job poll failed", "batch", batchName, "error", err)
-							} else if state, _ := result["state"].(string); state != "" {
-								succeeded, _ := result["succeeded"].(int)
-								failed, _ := result["failed"].(int)
-								switch state {
-								case string(genai.JobStateSucceeded), string(genai.JobStatePartiallySucceeded):
-									log.Printf("startup: batch job %s complete: %d succeeded, %d failed", batchName, succeeded, failed)
-									return
-								case string(genai.JobStateFailed):
-									if errMsg, _ := result["error"].(string); errMsg != "" {
-										log.Printf("startup: batch job %s failed: %s", batchName, errMsg)
-									} else {
-										log.Printf("startup: batch job %s failed", batchName)
-									}
-									return
-								}
-							}
-							select {
-							case <-ctx.Done():
-								return
-							case <-ticker.C:
-							}
-						}
-					}(batchName)
-					return
-				}
-				slog.Warn("startup batch submission failed; falling back to synchronous summarization", "sessions", len(pendingIDs), "error", err)
-			}
-			for _, id := range pendingIDs {
-				summarizeBackfillSession(ctx, store, startupSummarizer, publishSummaryReady, id)
-			}
-		}()
+		startSummaryBackfill(ctx, manager, summaryBackfill{
+			store:      store,
+			summarizer: startupSummarizer,
+			publish:    publishSummaryReady,
+			submit:     submitSummaryBatch,
+			poll:       pollSummaryBatch,
+			pollEvery:  30 * time.Second,
+		})
 	}
 	defer func() { _ = store.Close() }()
 

@@ -62,7 +62,26 @@ type Manager struct {
 	resumes                        int           // capture resumes so far
 	lifecyclePublishes             sync.WaitGroup
 	lifecycleStartPublishesStopped bool
+
+	// background is the context of the work a session's end leaves running:
+	// its refinement and its summary, and the sync, index and publish a
+	// summary starts (goBackground). StopBackground cancels it with
+	// ErrStopped and waits for that work, so the store closes under none of
+	// it; once stopped (backgroundStopped, under mu), no more starts.
+	// backgroundRunning, under mu, counts the work still running.
+	background        context.Context
+	stopBackground    context.CancelCauseFunc
+	backgroundWork    sync.WaitGroup
+	backgroundRunning int
+	backgroundStopped bool
 }
+
+// ErrStopped is the cause of the background work's context once
+// StopBackground has cancelled it: a stop cut the work off. A refinement or
+// summary cut off so is left running in the store, as a process that exits
+// inside it leaves it, for the next start to take up
+// (storage.RecoverStaleRefinements, the summary backfill).
+var ErrStopped = errors.New("session manager stopped")
 
 // sessionEnd is how far an end of a session got. An end that fails leaves it
 // behind, so retrying the end finishes it with the same end time and recording.
@@ -111,6 +130,7 @@ func NewManager(store Store, recorder Recorder, summarizer Summarizer, hub Event
 	}
 	m.startsDone = sync.NewCond(&m.mu)
 	m.endsDone = sync.NewCond(&m.mu)
+	m.background, m.stopBackground = context.WithCancelCause(context.Background())
 	detector.OnSessionEnd(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
@@ -663,11 +683,87 @@ func (m *Manager) endSession(ctx context.Context, want string) error {
 	m.mu.Unlock()
 
 	if batchTranscriber != nil && strings.TrimSpace(end.audioPath) != "" {
-		go m.runBatchRefinement(context.Background(), sessionID, end.audioPath)
+		m.goBackground(func(ctx context.Context) { m.runBatchRefinement(ctx, sessionID, end.audioPath) })
 	}
 
-	go m.generateSummary(context.Background(), sessionID, startedAt)
+	m.goBackground(func(ctx context.Context) { m.generateSummary(ctx, sessionID, startedAt) })
 	return nil
+}
+
+// goBackground runs f in the background on the background context, unless
+// StopBackground has run: work it starts then is left to the next start.
+func (m *Manager) goBackground(f func(ctx context.Context)) {
+	if !m.beginBackground() {
+		return
+	}
+	go func() {
+		defer m.endBackground()
+		f(m.background)
+	}()
+}
+
+// Run runs f now, as work StopBackground waits for, as it waits for the work
+// a session's end leaves running: f's context ends when ctx does, or with
+// ErrStopped when StopBackground runs. Once StopBackground has run, Run runs
+// nothing and returns ErrStopped. The app runs its own work on the store
+// through it: the start's summary backfill and a requested summary.
+func (m *Manager) Run(ctx context.Context, f func(ctx context.Context) error) error {
+	if !m.beginBackground() {
+		return ErrStopped
+	}
+	defer m.endBackground()
+	runCtx, cancel := context.WithCancelCause(ctx)
+	defer cancel(nil)
+	stop := context.AfterFunc(m.background, func() { cancel(context.Cause(m.background)) })
+	defer stop()
+	return f(runCtx)
+}
+
+// beginBackground counts a piece of background work that starts, unless
+// StopBackground has run, and reports whether it may start.
+func (m *Manager) beginBackground() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.backgroundStopped {
+		return false
+	}
+	m.backgroundWork.Add(1)
+	m.backgroundRunning++
+	return true
+}
+
+// endBackground counts a piece of background work that ended.
+func (m *Manager) endBackground() {
+	m.mu.Lock()
+	m.backgroundRunning--
+	m.mu.Unlock()
+	m.backgroundWork.Done()
+}
+
+// StopBackground cancels the work a session's end left running, with
+// ErrStopped, and waits until it has ended or ctx is done, so that the store
+// can close under none of it. With none running it returns nil at once, even
+// once ctx is done. No such work starts after it.
+func (m *Manager) StopBackground(ctx context.Context) error {
+	m.mu.Lock()
+	m.backgroundStopped = true
+	running := m.backgroundRunning
+	m.mu.Unlock()
+	m.stopBackground(ErrStopped)
+	if running == 0 {
+		return nil
+	}
+	done := make(chan struct{})
+	go func() {
+		m.backgroundWork.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 func (m *Manager) runBatchRefinement(ctx context.Context, sessionID, audioPath string) {
@@ -698,6 +794,12 @@ func (m *Manager) runBatchRefinement(ctx context.Context, sessionID, audioPath s
 	m.mu.Lock()
 	warn := m.refinementWarning
 	m.mu.Unlock()
+	if err != nil && errors.Is(context.Cause(ctx), ErrStopped) {
+		// The stop cut it off: it stays running, as a process that exits
+		// inside it leaves it, and the next start runs it again once.
+		m.batchLogger.Info("batch refinement cut off by the stop; the next start runs it again", "operation", "batch_refinement", "session_id", sessionID, "audio_path", audioPath)
+		return
+	}
 	if err != nil {
 		if updateErr := m.store.UpdateRefinementAtGeneration(sessionID, "", storage.RefinementFailed, "", generation); updateErr != nil {
 			m.batchLogger.Error("failed to mark refinement failed", "operation", "batch_refinement", "session_id", sessionID, "audio_path", audioPath, "error", updateErr)
@@ -837,6 +939,12 @@ func (m *Manager) generateSummary(ctx context.Context, sessionID string, started
 	if strings.TrimSpace(title) == "" {
 		title = summary.GenerateTitle("", transcript, segments, startedAt)
 	}
+	if err != nil && errors.Is(context.Cause(ctx), ErrStopped) {
+		// The stop cut it off: it stays running, and the next start's
+		// backfill makes it (storage.SQLiteStore.GetSessionsForBackfill).
+		m.logger.Info("summary cut off by the stop; the next start makes it", "operation", "generate_summary", "session_id", sessionID)
+		return
+	}
 	if err != nil {
 		m.logger.Error("summarization failed", "operation", "generate_summary", "session_id", sessionID, "error", err)
 		m.failSummary(sessionID, fmt.Sprintf("summarization failed: %v", err), generation)
@@ -869,11 +977,11 @@ func (m *Manager) generateSummary(ctx context.Context, sessionID string, started
 	m.triggerDriveSync(syncer, sessionID)
 
 	if publisher != nil {
-		go func() {
-			if err := publisher.PublishSummaryReady(context.Background(), sessionID); err != nil {
+		m.goBackground(func(ctx context.Context) {
+			if err := publisher.PublishSummaryReady(ctx, sessionID); err != nil {
 				m.logger.Error("envoy publish failed", "operation", "publish_summary_ready", "session_id", sessionID, "error", err)
 			}
-		}()
+		})
 	}
 }
 
@@ -881,8 +989,8 @@ func (m *Manager) triggerDriveSync(syncer SessionSyncer, sessionID string) {
 	if syncer == nil {
 		return
 	}
-	go func() {
-		if err := syncer.SyncSession(context.Background(), sessionID); err != nil {
+	m.goBackground(func(ctx context.Context) {
+		if err := syncer.SyncSession(ctx, sessionID); err != nil {
 			m.logger.Error("gdrive sync failed", "operation", "sync_session", "session_id", sessionID, "error", err)
 			if m.hub != nil {
 				m.hub.BroadcastSessionComponentStatus(sessionID, "sync", storage.ComponentStatusError, fmt.Sprintf("Google Drive sync failed for session %s", sessionID))
@@ -890,7 +998,7 @@ func (m *Manager) triggerDriveSync(syncer SessionSyncer, sessionID string) {
 		} else if m.hub != nil {
 			m.hub.BroadcastSessionComponentStatus(sessionID, "sync", storage.ComponentStatusConnected, fmt.Sprintf("Google Drive synced for session %s", sessionID))
 		}
-	}()
+	})
 }
 
 func (m *Manager) broadcastSummaryStatus(sessionID, title, summary, status, preset string) {
@@ -1080,13 +1188,13 @@ func (m *Manager) triggerEmbeddingIndexAtGeneration(sessionID, transcript string
 		return
 	}
 
-	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	m.goBackground(func(background context.Context) {
+		ctx, cancel := context.WithTimeout(background, 45*time.Second)
 		defer cancel()
 		if err := indexer.IndexSessionAtGeneration(ctx, sessionID, transcript, generation); err != nil {
 			m.logger.Error("embedding index failed", "operation", "generate_summary", "session_id", sessionID, "error", err)
 		}
-	}()
+	})
 }
 
 func (m *Manager) OnTranscriptionDisconnect() {

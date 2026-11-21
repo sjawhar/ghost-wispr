@@ -8,9 +8,11 @@ import (
 	"log"
 	"log/slog"
 	"strings"
+	"time"
 
 	"github.com/sjawhar/ghost-wispr/internal/session"
 	"github.com/sjawhar/ghost-wispr/internal/storage"
+	"google.golang.org/genai"
 )
 
 // presetSummarizer makes the summary of a transcript, with the preset named
@@ -61,6 +63,9 @@ func resummarize(ctx context.Context, store *storage.SQLiteStore, summarizer pre
 		title, summaryText, presetUsed, speakerNames, err = summarizer.Summarize(ctx, sessionID, transcript)
 	}
 	if err != nil {
+		if cutOffByTheStop(ctx) {
+			return err
+		}
 		failSummary(store, hub, sessionID, generation, err)
 		return err
 	}
@@ -141,6 +146,9 @@ func summarizeBackfillSession(ctx context.Context, store *storage.SQLiteStore, s
 	_ = store.StartSummary(id)
 	title, summaryText, preset, speakerNames, model, err := summarizer.SummarizeReported(ctx, id, transcript)
 	if err != nil {
+		if cutOffByTheStop(ctx) {
+			return
+		}
 		slog.Warn("summarization failed", "session_id", id, "error", err)
 		failSummary(store, nil, id, generation, err)
 		return
@@ -151,6 +159,115 @@ func summarizeBackfillSession(ctx context.Context, store *storage.SQLiteStore, s
 	}
 	log.Printf("summarized session %s with preset %s", id, preset)
 	publish(id)
+}
+
+// cutOffByTheStop reports whether the stop cut off the work ctx is for
+// (session.ErrStopped). A summary cut off so is left running, with the
+// session's last good one kept, and the next start's backfill makes it
+// (storage.SQLiteStore.GetSessionsForBackfill): it did not fail.
+func cutOffByTheStop(ctx context.Context) bool {
+	if errors.Is(context.Cause(ctx), session.ErrStopped) {
+		slog.Info("summary cut off by the stop; the next start makes it")
+		return true
+	}
+	return false
+}
+
+// startSummaryBackfill runs the start's summary backfill (summaryBackfill.run)
+// in the background, as work the stop cuts off and waits for
+// (session.Manager.Run), so the store closes under none of it.
+func startSummaryBackfill(ctx context.Context, manager *session.Manager, backfill summaryBackfill) {
+	go func() {
+		_ = manager.Run(ctx, func(ctx context.Context) error {
+			backfill.run(ctx)
+			return nil
+		})
+	}()
+}
+
+// summaryBackfill is the start's summary backfill: the sessions whose summary
+// is missing, failed or never ended (storage.SQLiteStore.GetSessionsForBackfill)
+// are summarized in one batch job when there are four or more and the job can
+// be made (submit, then poll every pollEvery until it ends), and else one by
+// one (summarizeBackfillSession).
+type summaryBackfill struct {
+	store      *storage.SQLiteStore
+	summarizer session.ReportedSummarizer
+	publish    func(sessionID string)
+	submit     func(ctx context.Context, sessionIDs []string) (batchName string, count int, err error)
+	poll       func(ctx context.Context, batchName string) (map[string]any, error)
+	pollEvery  time.Duration
+}
+
+func (b summaryBackfill) run(ctx context.Context) {
+	pendingIDs, err := b.store.GetSessionsForBackfill()
+	if err != nil {
+		slog.Warn("failed to query sessions needing summary", "error", err)
+		return
+	}
+	if len(pendingIDs) == 0 {
+		return
+	}
+	if len(pendingIDs) >= 4 {
+		batchName, count, err := b.submit(ctx, pendingIDs)
+		if err == nil {
+			log.Printf("startup: submitting %d sessions to batch summarization", count)
+			b.pollUntilDone(ctx, batchName)
+			return
+		}
+		slog.Warn("startup batch submission failed; falling back to synchronous summarization", "sessions", len(pendingIDs), "error", err)
+	}
+	for _, id := range pendingIDs {
+		if ctx.Err() != nil {
+			return
+		}
+		summarizeBackfillSession(ctx, b.store, b.summarizer, b.publish, id)
+	}
+}
+
+// pollUntilDone polls the batch job until it ends, or ctx does.
+func (b summaryBackfill) pollUntilDone(ctx context.Context, batchName string) {
+	ticker := time.NewTicker(b.pollEvery)
+	defer ticker.Stop()
+	for {
+		result, err := b.poll(ctx, batchName)
+		if err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			slog.Warn("startup batch job poll failed", "batch", batchName, "error", err)
+		} else if state, _ := result["state"].(string); state != "" {
+			succeeded, _ := result["succeeded"].(int)
+			failed, _ := result["failed"].(int)
+			switch state {
+			case string(genai.JobStateSucceeded), string(genai.JobStatePartiallySucceeded):
+				log.Printf("startup: batch job %s complete: %d succeeded, %d failed", batchName, succeeded, failed)
+				return
+			case string(genai.JobStateFailed):
+				if errMsg, _ := result["error"].(string); errMsg != "" {
+					log.Printf("startup: batch job %s failed: %s", batchName, errMsg)
+				} else {
+					log.Printf("startup: batch job %s failed", batchName)
+				}
+				return
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
+}
+
+// resummarizeUntilStop is the API's resummarize (resummarize), run as work the
+// stop cuts off and waits for (session.Manager.Run).
+func resummarizeUntilStop(manager *session.Manager, store *storage.SQLiteStore, summarizer presetSummarizer, hub summaryBroadcaster, publish func(sessionID string)) func(ctx context.Context, sessionID, preset string) error {
+	return func(ctx context.Context, sessionID, preset string) error {
+		return manager.Run(ctx, func(ctx context.Context) error {
+			return resummarize(ctx, store, summarizer, hub, publish, sessionID, preset)
+		})
+	}
 }
 
 // loadSessionTranscript returns session sessionID's canonical transcript, or,
