@@ -955,7 +955,7 @@ with the unit paused and no session active:
    anchors that tie the file to the Pi's clock, and never late, from when arecord started. It
    passes when the late time is within 20 ms, fails when even the early time is over, and otherwise
    reports UNKNOWN with how late the recording's times may be, since a loaded Pi reads its anchors
-   late. The early time is early by the time arecord took to start and by up to 200 ppm of the time
+   late. The early time is early by the time arecord took to start and by up to 400 ppm of the time
    into the recording, so a tail a few tens of milliseconds over the bound can be UNKNOWN.
 6. Slice 4's two steps check the three capture states and the paused listener, with the
    listener turned on for the run only (`GHOST_WISPR_VOICE_PAUSED_LISTENER=true`, beside the

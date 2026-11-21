@@ -30,7 +30,8 @@
 # earlier, and the card took at least p * (1 - 1/5000) of the driver's time to reach p, longer if an
 # overrun lost audio. An anchor bounds nothing from below: a sample can sit captured in arecord's
 # buffer before it reaches the file. So the early bound is early by the time arecord took to start
-# and by up to 200 ppm of the time into the recording; it is rounded in the early direction: the
+# and by up to 400 ppm of the time into the recording (it takes the card at 200 ppm fast, and the
+# card can be 200 ppm slow); it is rounded in the early direction: the
 # place down by its printed precision, and the time down to the millisecond.
 
 function ceil_div(a, b) { return int((a + b - 1) / b) }
