@@ -5,9 +5,11 @@
 #     -f recording-times.awk ANCHORS - <SILENCEDETECT
 #
 # rate, header and frame are the WAV file's sample rate, header size and bytes a sample; bytes is the
-# file's size. started_us is a time no later than the file's first sample: the driver's clock just
-# before it started arecord. ANCHORS holds "US BYTES" lines: by the driver's clock US, read just after
-# the file's size, BYTES of the file were written. SILENCEDETECT is ffmpeg's silencedetect report.
+# file's size. started_us is a time no later than the file's first sample: the driver's last read of
+# the file's size that found less than arecord's header, or its clock just before it started arecord
+# if that came later (accept-voice.sh, start_recording). ANCHORS holds "US BYTES" lines:
+# by the driver's clock US, read just after the file's size, BYTES of the file were written.
+# SILENCEDETECT is ffmpeg's silencedetect report.
 #
 # It prints a line for each sound, "sound ON_MS OFF_MS LENGTH_US ON_EARLY_MS OFF_EARLY_MS" (its onset
 # and end on the driver's clock, never early; its length in the file; and its onset and end again,
@@ -29,10 +31,11 @@
 # The early bound of a place p comes from started_us alone: the file's first sample was captured no
 # earlier, and the card took at least p * (1 - 1/5000) of the driver's time to reach p, longer if an
 # overrun lost audio. An anchor bounds nothing from below: a sample can sit captured in arecord's
-# buffer before it reaches the file. So the early bound is early by the time arecord took to start
-# and by up to 400 ppm of the time into the recording (it takes the card at 200 ppm fast, and the
-# card can be 200 ppm slow); it is rounded in the early direction: the
-# place down by its printed precision, and the time down to the millisecond.
+# buffer before it reaches the file. So the early bound is early by up to the time between two reads
+# of the file's size and the time arecord took from its header to its first read, and by up to 400 ppm
+# of the time into the recording (it takes the card at 200 ppm fast, and the card can be 200 ppm
+# slow); it is rounded in the early direction: the place down by its printed precision, and the time
+# down to the millisecond.
 
 function ceil_div(a, b) { return int((a + b - 1) / b) }
 
