@@ -59,12 +59,14 @@ const (
 	// echoHold is how long after the voice's speech ends its own words, heard
 	// back, still count as its own.
 	echoHold = 1500 * time.Millisecond
-	// ownWordsKept is how long Wispr's spoken words are kept for the own-speech
-	// match.
-	ownWordsKept = 30 * time.Second
 	// sorryLine is said for a failed answer when the Concierge said nothing.
 	sorryLine = "Sorry, I could not answer that."
 )
+
+// ownWordsKept is how long Wispr's spoken words are kept for the own-speech
+// match, unless a span they could echo in is kept longer (addOwnLocked); a
+// test shortens it.
+var ownWordsKept = 30 * time.Second
 
 // recentKept is how much of the transcript an exchange gets as Recent; a
 // test shortens it.
@@ -2209,7 +2211,12 @@ func (s *Supervisor) onSpeech(e audio.SpeechEvent) {
 }
 
 // addOwnLocked keeps the words of text, which Wispr speaks, for the own-speech
-// filter.
+// filter. It forgets the words of lines said more than ownWordsKept ago, but
+// not while the exchange holding the floor keeps a span its voice played in
+// that a word matched against them could have been said in: a word said in a
+// span is matched against the lines said up to ownWordsKept before it
+// (ownSetLocked), and an echo of an old speech, however late its result,
+// must still be found its own.
 func (s *Supervisor) addOwnLocked(text string, now time.Time) {
 	words := map[string]bool{}
 	for _, w := range strings.Fields(text) {
@@ -2217,9 +2224,15 @@ func (s *Supervisor) addOwnLocked(text string, now time.Time) {
 			words[n] = true
 		}
 	}
+	horizon := now.Add(-ownWordsKept)
+	if s.ex != nil && len(s.ex.played) > 0 {
+		if h := s.ex.played[0].from.Add(-ownWordsKept); h.Before(horizon) {
+			horizon = h
+		}
+	}
 	kept := s.own[:0]
 	for _, o := range s.own {
-		if now.Sub(o.at) < ownWordsKept {
+		if o.at.After(horizon) {
 			kept = append(kept, o)
 		}
 	}

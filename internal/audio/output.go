@@ -245,9 +245,12 @@ type outputInput struct {
 	// silenced is the playback whose audio the stream took last before
 	// Cancel: what Cancel takes back from the device comes off what it played.
 	silenced *Playback
-	// audioTo is the stream position just past the speech's last queued
-	// audio, once the resampler's delay is counted: a speech ends only once
-	// the stream has moved past it by the history a Drop can give back.
+	// audioTo is the stream position just past the speech's last audio: past
+	// where its last queued sample lands, after the resampler's delay, or
+	// past its last audible sample, the filter's response to that audio, if
+	// later. A speech ends only once the stream has moved past it by the
+	// history a Drop can give back, and a replay that brings it back stamps
+	// the speech's end (replayed).
 	audioTo   int64
 	landedTo  int       // past the last position of the frame being mixed that holds queued audio (land)
 	lastFrame uint64    // the frame that holds its speech's last audio
@@ -1154,6 +1157,15 @@ func (o *Output) mixFrame(frame []int16, sum []float32, rate, hist int, now time
 			}
 			if in.landedTo > 0 {
 				in.audioTo = o.pos + int64(in.landedTo)
+			}
+			// The filter's response to the last queued audio runs on past
+			// where that audio lands: the speech's audio ends with its last
+			// audible sample, which a replay may bring back alone.
+			for j := len(in.contrib) - 1; j >= 0; j-- {
+				if clip(in.contrib[j]) != 0 {
+					in.audioTo = max(in.audioTo, o.pos+int64(j+1))
+					break
+				}
 			}
 			in.lastFrame, in.quietAt = o.mixed, time.Time{}
 			active = true

@@ -346,25 +346,32 @@ func TestStopRuleForEveryVoice(t *testing.T) {
 	}
 }
 
-// TestBackchannelsDoNotStop fails if R11's backchannels stop the voice, by
-// its session or at the speaker, or if two other words do not stop it.
+// TestBackchannelsDoNotStop fails if, for any voice, R11's backchannels stop
+// it, by its session or at the speaker, or if two other words do not stop it
+// both ways. A driving voice is stopped by another path than text to speech
+// (Sol's review of #133 at aaa8e0f found only text to speech tested).
 func TestBackchannelsDoNotStop(t *testing.T) {
 	cases := map[string]bool{
 		"mm-hm okay": false, "uh-huh yeah": false, "yeah right": false, "okay okay": false,
 		"yes sure": true,
 	}
-	for heard, stops := range cases {
-		t.Run(heard, func(t *testing.T) {
-			r, sess := everyVoice()[0].start(t)
-			started := speechStart(r)
-			r.heard(heard, false, false)
-			interrupted := func() bool { i, _, _ := sess.state(); return !i.IsZero() }
-			if stops {
-				eventually(t, "two real words stopped the voice", interrupted)
-				return
-			}
-			never(t, "backchannels stopped the voice", 200*time.Millisecond, func() bool { return interrupted() || voiceCutAfter(r, started) })
-		})
+	for _, v := range everyVoice() {
+		for heard, stops := range cases {
+			t.Run(v.name+"/"+heard, func(t *testing.T) {
+				r, sess := v.start(t)
+				started := speechStart(r)
+				r.heard(heard, false, false)
+				interrupted := func() bool { i, _, _ := sess.state(); return !i.IsZero() }
+				if stops {
+					eventually(t, "two real words stopped the voice", interrupted)
+					if !voiceCutAfter(r, started) {
+						t.Error("control: two real words did not cancel the voice input")
+					}
+					return
+				}
+				never(t, "backchannels stopped the voice", 200*time.Millisecond, func() bool { return interrupted() || voiceCutAfter(r, started) })
+			})
+		}
 	}
 }
 
