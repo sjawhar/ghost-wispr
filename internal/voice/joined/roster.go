@@ -719,9 +719,6 @@ func (r *Roster) floor(ctx context.Context, m *envoy.Message, draft string) {
 	r.logf("joined: an agent of meeting %s asked for the floor", hand.SessionID)
 }
 
-// leave ends agent's current membership; a reason is sent to it as a notice.
-func (r *Roster) leave(agent, reason string) { r.leaveMember(agent, nil, reason) }
-
 // leaveCommand ends the membership a leave message is for: the agent's
 // current one, unless the leave was sent before the join that made it.
 func (r *Roster) leaveCommand(m *envoy.Message) {
