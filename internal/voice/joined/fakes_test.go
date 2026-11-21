@@ -220,6 +220,7 @@ func (c *testClock) set(at time.Time) {
 // rig is a roster on fakes, with meeting sess-1 recording since start.
 type rig struct {
 	roster  *Roster
+	opening *Opening // the latest opening of the unit's Envoy session (open)
 	agents  *fakeAgents
 	floor   *fakeFloor
 	notes   *notes
@@ -264,9 +265,17 @@ func newRig(t *testing.T, change func(*Config)) *rig {
 		change(cfg)
 	}
 	r.roster = New(cfg)
-	r.roster.SetAgents(r.agents)
+	r.open(r.agents)
 	t.Cleanup(r.roster.Close)
 	return r
+}
+
+// open makes an opening of the unit's Envoy session and gives the roster
+// agents through it, as a start of the voice does; r.opening is it.
+func (r *rig) open(agents Agents) *Opening {
+	r.opening = r.roster.Open()
+	r.opening.SetAgents(agents)
+	return r.opening
 }
 
 func (r *rig) setSession(id string) {

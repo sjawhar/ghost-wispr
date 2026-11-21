@@ -52,6 +52,13 @@ func startConcierge(ctx context.Context, cfg *config.Config, store *storage.SQLi
 	}
 	sessions := make(chan envoySession, 1)
 	sessionCtx, cancel := context.WithCancel(ctx)
+	// This start's opening of the roster: an earlier start's opening that
+	// completes, or closes, late touches no session or membership of it
+	// (joined.Opening).
+	var opening *joined.Opening
+	if roster != nil {
+		opening = roster.Open()
+	}
 	go func() {
 		defer close(sessions)
 		wait := envoyRetryFirst
@@ -70,8 +77,8 @@ func startConcierge(ctx context.Context, cfg *config.Config, store *storage.SQLi
 			})
 			if err == nil {
 				c.SetAgents(session)
-				if roster != nil {
-					roster.SetAgents(session)
+				if opening != nil {
+					opening.SetAgents(session)
 				}
 				logger.Info("concierge: the Envoy session is open")
 				sessions <- session
@@ -87,9 +94,9 @@ func startConcierge(ctx context.Context, cfg *config.Config, store *storage.SQLi
 		}
 	}()
 	closeSession := func(ctx context.Context, session envoySession) {
-		if roster != nil {
+		if opening != nil {
 			// The joined agents hear nothing more, and are told so within ctx.
-			roster.CloseAgents(ctx)
+			opening.Close(ctx)
 		}
 		closeCtx, done := context.WithTimeout(ctx, 5*time.Second)
 		defer done()

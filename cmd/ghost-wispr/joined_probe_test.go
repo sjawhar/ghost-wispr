@@ -25,7 +25,7 @@ import (
 func TestTheProbeReadsTheJoinMessage(t *testing.T) {
 	roster := joined.New(&joined.Config{Session: func() string { return "" }, PublicURL: "https://recorder.example:8443"})
 	t.Cleanup(roster.Close)
-	roster.SetAgents(&recordingAgents{})
+	roster.Open().SetAgents(&recordingAgents{})
 	text, err := roster.Invitation("ABC-12")
 	if err != nil {
 		t.Fatal(err)

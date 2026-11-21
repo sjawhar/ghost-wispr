@@ -84,12 +84,12 @@ func (l *logLines) with(part string) []string {
 	return out
 }
 
-// TestTheVoiceStoppedNoticesGoTogetherWithinTheStopsDeadline fails if
-// CloseAgents, its context's deadline 100 ms off, waits past that deadline
-// for the notices that tell each of three joined agents the voice stopped:
-// when the notices wait for their contexts, and so for the deadline, it
-// returns at once after it; when they ignore their contexts, it still
-// returns at the deadline, having sent all three at once, and logs the
+// TestTheVoiceStoppedNoticesGoTogetherWithinTheStopsDeadline fails if an
+// opening's Close, its context's deadline 100 ms off, waits past that
+// deadline for the notices that tell each of three joined agents the voice
+// stopped: when the notices wait for their contexts, and so for the
+// deadline, it returns at once after it; when they ignore their contexts, it
+// still returns at the deadline, having sent all three at once, and logs the
 // agents not told. Before, the notices went one at a time under the roster's
 // own context, ten seconds each, past the shutdown's deadline. The control's
 // notices go at once, and nothing is logged. From review 6006723807 of #138.
@@ -104,7 +104,7 @@ func TestTheVoiceStoppedNoticesGoTogetherWithinTheStopsDeadline(t *testing.T) {
 			r := newRig(t, func(cfg *Config) { cfg.Logf = logs.logf })
 			held := &heldNotices{fakeAgents: r.agents, mode: mode, release: make(chan struct{}), entered: map[string]bool{}, errs: map[string]error{}}
 			defer close(held.release)
-			r.roster.SetAgents(held)
+			r.open(held)
 			for i, agent := range agents {
 				r.join(t, agent, []string{"ABC-12", "XYZ-9", "INFRA-1027"}[i])
 			}
@@ -117,12 +117,12 @@ func TestTheVoiceStoppedNoticesGoTogetherWithinTheStopsDeadline(t *testing.T) {
 			began := time.Now()
 			go func() {
 				defer close(closed)
-				r.roster.CloseAgents(ctx)
+				r.opening.Close(ctx)
 			}()
 			select {
 			case <-closed:
 			case <-time.After(2 * time.Second):
-				t.Fatalf("CloseAgents waited past its deadline for the voice-stopped notices; under way: %v", held.underWay())
+				t.Fatalf("Close waited past its deadline for the voice-stopped notices; under way: %v", held.underWay())
 			}
 			took := time.Since(began)
 			if got := r.roster.Joined(); len(got) != 0 {
@@ -140,7 +140,7 @@ func TestTheVoiceStoppedNoticesGoTogetherWithinTheStopsDeadline(t *testing.T) {
 					t.Errorf("control: logged agents not told: %q", untold)
 				}
 				if took > time.Second {
-					t.Errorf("control: CloseAgents took %v", took)
+					t.Errorf("control: Close took %v", took)
 				}
 			default:
 				if got := held.underWay(); !slices.Equal(got, agents) {

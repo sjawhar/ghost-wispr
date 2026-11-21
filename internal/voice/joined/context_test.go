@@ -155,7 +155,7 @@ func TestAWelcomeRunsUnderItsMembership(t *testing.T) {
 	r := newRig(t, nil)
 	a := &heldWelcomeAgents{fakeAgents: r.agents, entered: make(chan struct{}), release: make(chan struct{})}
 	a.hold.Store(true)
-	r.roster.SetAgents(a)
+	r.open(a)
 	done := make(chan struct{})
 	go func() {
 		defer close(done)

@@ -199,7 +199,7 @@ func (c *relayConn) answer(t *testing.T) string {
 // done.
 func TestAJoinDuringRegistrationIsNotAcknowledgedUntilTaken(t *testing.T) {
 	r := newRig(t, nil)
-	r.roster.CloseAgents(context.Background())
+	r.opening.Close(context.Background())
 	relay := newRelayFake(t)
 	var conn *relayConn
 	early := make(chan string, 1)
@@ -250,7 +250,7 @@ func TestAJoinDuringRegistrationIsNotAcknowledgedUntilTaken(t *testing.T) {
 		}
 	}
 	mu.Unlock()
-	r.roster.SetAgents(s)
+	r.open(s)
 	conn.frame(t, 1, "join-early", "agent-1", "ghost-wispr join ABC-12", r.clock.Now()) // Envoy delivers it again
 	if got := conn.answer(t); got != "done" {
 		t.Fatalf("the join delivered again once the roster had its session was answered %q, want done", got)

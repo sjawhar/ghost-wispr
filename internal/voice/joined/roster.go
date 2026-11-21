@@ -153,6 +153,11 @@ type member struct {
 	waiting          bool
 	waitFrom, waitTo time.Time
 	notLiveSince     time.Time // the first sweep that read it not live; only Envoy reading it live clears it
+	// opening is the opening whose Envoy session the membership joined, or
+	// last joined again, under, and agents that session: the opening's Close
+	// ends it, and tells it through agents.
+	opening uint64
+	agents  Agents
 }
 
 // agentHistory is what the roster keeps of one agent session across its
@@ -501,12 +506,16 @@ type Roster struct {
 	mu     sync.Mutex
 	agents Agents
 	// open is the gate a join commits through: open while the unit has an
-	// Envoy session. epoch counts SetAgents calls, so a join that began
-	// under one Envoy session never commits under the next, and a stop
-	// whose epoch has passed changes nothing.
-	open  bool
-	epoch int
-	seq   int // the last membership number
+	// Envoy session. epoch counts the sessions installed and closed, so a
+	// join that began under one Envoy session never commits under the next,
+	// and a stop whose epoch has passed changes nothing. openings counts the
+	// openings made (Open), and agentsOpening is the one whose session is
+	// installed.
+	open          bool
+	epoch         int
+	openings      uint64
+	agentsOpening uint64
+	seq           int // the last membership number
 	// members are the memberships by agent session: the current one, or
 	// one whose end has begun and whose cleanup has not finished.
 	members  map[string]*member
@@ -518,7 +527,8 @@ type Roster struct {
 	// commands are the commands taken within Envoy's replay window.
 	commands commandHistory
 	// ready, made while the roster has no Envoy session, is closed by the
-	// SetAgents that gives it one: a command waits on it (notReadyWait).
+	// SetAgents (Opening) that gives it one: a command waits on it
+	// (notReadyWait).
 	ready chan struct{}
 	// ended are the recording sessions that ended or were deleted, newest
 	// last, at most maxEnded: a decision made from a slow read commits
@@ -565,22 +575,22 @@ const (
 
 // notReadyWait is how long a command that comes while the roster has no
 // Envoy session waits for one before it is refused (ErrNotReady): the unit's
-// session can deliver a frame while it still registers, a moment before
-// SetAgents gives the roster the session, and such a command is taken rather
-// than refused. It also spaces Envoy's redeliveries of a command the roster
-// cannot take, whatever backoff Envoy itself applies.
+// session can deliver a frame while it still registers, a moment before an
+// opening's SetAgents gives the roster the session, and such a command is
+// taken rather than refused. It also spaces Envoy's redeliveries of a
+// command the roster cannot take, whatever backoff Envoy itself applies.
 const notReadyWait = 2 * time.Second
 
 // ErrNotReady is Deliver's answer to a command that comes while the roster
-// has no Envoy session and none is given within notReadyWait: before
-// SetAgents gives it one, or once CloseAgents took it away. The roster can
-// neither take nor answer the command then, so it does not acknowledge it:
-// the unit's Envoy session answers the frame nak, and Envoy delivers it again
-// for as long as its stream keeps it. legion's relay spaces those deliveries
-// 1, 2, 4, 8 and 16 s and then 30 s apart (session_relay.go,
-// relayNakDelayFor), with no limit on their number (the session consumer's
-// MaxDeliver is -1), and notReadyWait spaces them at least 2 s whatever the
-// relay does.
+// has no Envoy session and none is given within notReadyWait: before an
+// opening's SetAgents gives it one, or once its Close took it away. The
+// roster can neither take nor answer the command then, so it does not
+// acknowledge it: the unit's Envoy session answers the frame nak, and Envoy
+// delivers it again for as long as its stream keeps it. legion's relay
+// spaces those deliveries 1, 2, 4, 8 and 16 s and then 30 s apart
+// (session_relay.go, relayNakDelayFor), with no limit on their number (the
+// session consumer's MaxDeliver is -1), and notReadyWait spaces them at
+// least 2 s whatever the relay does.
 var ErrNotReady = errors.New("joined: the roster has no Envoy session to take the command with")
 
 // historyLocked is agent's history, made at its first rate limit.
@@ -677,38 +687,70 @@ func New(cfg *Config) *Roster {
 	}
 }
 
-// SetAgents gives the roster the unit's Envoy session once it opens, which
-// opens the gate joins commit through. agents is never nil: CloseAgents ends
-// the session.
-func (r *Roster) SetAgents(agents Agents) {
-	if agents == nil {
-		panic("joined: SetAgents(nil); CloseAgents ends the Envoy session")
-	}
+// Opening is one opening of the unit's Envoy session for the roster, as one
+// start of the meeting voice opens it (Open). Its SetAgents installs the
+// session only while no later opening was made, and its Close ends only the
+// memberships that joined under its own session: an earlier opening that
+// completes, or closes, after a later one began touches no session or
+// membership of the later one.
+type Opening struct {
+	r *Roster
+	n uint64
+}
+
+// Open makes an opening of the unit's Envoy session, which supersedes every
+// earlier one: an earlier opening's SetAgents installs nothing from now on.
+func (r *Roster) Open() *Opening {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	r.openings++
+	return &Opening{r: r, n: r.openings}
+}
+
+// SetAgents gives the roster the opening's Envoy session once it opens,
+// which opens the gate joins commit through, unless a later opening was made
+// meanwhile: the session then belongs to no start of the voice, and is not
+// installed. agents is never nil: Close ends the session.
+func (o *Opening) SetAgents(agents Agents) {
+	if agents == nil {
+		panic("joined: SetAgents(nil); Close ends the Envoy session")
+	}
+	r := o.r
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if o.n != r.openings {
+		r.logf("joined: an Envoy session opened after a later start of the voice began; the roster does not take it")
+		return
+	}
 	r.epoch++
 	r.open = true
-	r.agents = agents
+	r.agents, r.agentsOpening = agents, o.n
 	if r.ready != nil {
 		close(r.ready)
 		r.ready = nil
 	}
 }
 
-// CloseAgents ends the unit's Envoy session for the roster, as it closes. It
-// shuts the gate first, so no join still in its reads commits, then ends
-// every membership, and tells each agent the voice stopped through the
-// session it joined under, while that session can still send
-// (tellStopped): all at once, within ctx. A close whose epoch a later
-// SetAgents passed while it cleaned up changes nothing more.
-func (r *Roster) CloseAgents(ctx context.Context) {
+// Close ends the opening's Envoy session for the roster, as it closes. While
+// its session is the one installed, it shuts the gate first, so no join
+// still in its reads commits. Then it ends every membership that joined
+// under its session, and none other, and tells each agent the voice stopped
+// through that session, while it can still send (tellStopped): all at once,
+// within ctx. A close whose epoch a later SetAgents passed while it cleaned
+// up changes nothing more.
+func (o *Opening) Close(ctx context.Context) {
+	r := o.r
 	r.mu.Lock()
-	r.epoch++
-	epoch, closing := r.epoch, r.agents
-	r.open = false
+	installed := r.agentsOpening == o.n && r.agents != nil
+	var epoch int
+	if installed {
+		r.epoch++
+		epoch = r.epoch
+		r.open = false
+	}
 	var gone []*member
 	for _, m := range r.members {
-		if !m.ending {
+		if !m.ending && m.opening == o.n {
 			m.ending = true
 			m.cancel()
 			gone = append(gone, m)
@@ -720,7 +762,10 @@ func (r *Roster) CloseAgents(ctx context.Context) {
 	for _, m := range gone {
 		r.finishLeave(m)
 	}
-	r.tellStopped(ctx, closing, gone)
+	r.tellStopped(ctx, gone)
+	if !installed {
+		return
+	}
 	r.mu.Lock()
 	if r.epoch == epoch {
 		r.agents = nil
@@ -729,11 +774,12 @@ func (r *Roster) CloseAgents(ctx context.Context) {
 }
 
 // tellStopped sends each of gone's agents the notice that the voice stopped,
-// through agents, each on a goroutine of its own, so the notices go out
-// together. Each send runs within ctx, Close's end and sendTimeout. It waits
-// for them within ctx; at ctx's end it waits no longer, and logs the agents
-// not told. A send still under way then sees ctx's end too.
-func (r *Roster) tellStopped(ctx context.Context, agents Agents, gone []*member) {
+// through the session it joined under (member.agents), each on a goroutine
+// of its own, so the notices go out together. Each send runs within ctx,
+// Close's end and sendTimeout. It waits for them within ctx; at ctx's end it
+// waits no longer, and logs the agents not told. A send still under way then
+// sees ctx's end too.
+func (r *Roster) tellStopped(ctx context.Context, gone []*member) {
 	if len(gone) == 0 {
 		return
 	}
@@ -750,7 +796,7 @@ func (r *Roster) tellStopped(ctx context.Context, agents Agents, gone []*member)
 		sends.Add(1)
 		go func() {
 			defer sends.Done()
-			if r.sendVia(ctx, agents, m.Agent, "", "notice", voiceStoppedText) {
+			if r.sendVia(ctx, m.agents, m.Agent, "", "notice", voiceStoppedText) {
 				mu.Lock()
 				delete(untold, m.Agent)
 				mu.Unlock()
@@ -904,9 +950,10 @@ func (r *Roster) Deliver(ctx context.Context, m *envoy.Message) (bool, error) {
 	return true, nil
 }
 
-// waitReadyLocked waits, without r.mu, up to notReadyWait for SetAgents to
-// give the roster its Envoy session, and reports whether it did; ctx's end
-// and Close end the wait too. r.mu is held on entry and on return.
+// waitReadyLocked waits, without r.mu, up to notReadyWait for an opening's
+// SetAgents to give the roster its Envoy session, and reports whether it
+// did; ctx's end and Close end the wait too. r.mu is held on entry and on
+// return.
 func (r *Roster) waitReadyLocked(ctx context.Context) bool {
 	timer := time.NewTimer(notReadyWait)
 	defer timer.Stop()
@@ -1013,6 +1060,7 @@ func (r *Roster) join(ctx context.Context, m *envoy.Message, key string) {
 		// A join again, or its redelivery: the same membership keeps its id,
 		// its limits, its pointers and its time not live.
 		joined.IssueKey, joined.Title, joined.name, joined.words = key, title, name, titleWords(title)
+		joined.opening, joined.agents = r.agentsOpening, r.agents
 	} else {
 		if old != nil && !old.ending {
 			old.ending = true
@@ -1025,6 +1073,8 @@ func (r *Roster) join(ctx context.Context, m *envoy.Message, key string) {
 			name:     name,
 			words:    titleWords(title),
 			issuedAt: m.IssuedAt,
+			opening:  r.agentsOpening,
+			agents:   r.agents,
 		}
 		base, cancel := context.WithCancel(r.meetingLocked(sessionID, recorder).ctx)
 		joined.ctx = &liveContext{Context: base, cancel: cancel, alive: func() bool {
