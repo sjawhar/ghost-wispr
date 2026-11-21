@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -32,6 +33,11 @@ type AsyncSender struct {
 	queued atomic.Int64
 	// watcher is dst when it counts this queue (ResilientClient), else nil.
 	watcher sendQueueWatcher
+	// readAt is when the microphone read the buffer the next Write takes
+	// (MarkRead); hasRead says it is set. Guarded by readMu.
+	readMu  sync.Mutex
+	readAt  time.Time
+	hasRead bool
 }
 
 // sendQueueWatcher is a destination that counts, in its stream's clock, the
@@ -42,6 +48,9 @@ type sendQueueWatcher interface {
 	// writeFromQueue writes p, a chunk the queue holds, and takes it out of
 	// queued as it counts it, in one step.
 	writeFromQueue(p []byte, queued *atomic.Int64) (int, error)
+	// captured stamps the n bytes the queue just took or dropped, the latest
+	// audio counted, as captured by at.
+	captured(at time.Time, n int64)
 }
 
 type sendItem struct {
@@ -79,16 +88,40 @@ func NewAsyncSender(ctx context.Context, dst interface {
 	return s
 }
 
-// Write queues a copy of p and never blocks.
+// MarkRead marks at as when the microphone read the buffer the next Write
+// takes. The mic loop marks each buffer as it reads it, before checks that
+// can hold it back, such as the read of the light; a Write with no mark
+// takes its own time.
+func (s *AsyncSender) MarkRead(at time.Time) {
+	s.readMu.Lock()
+	defer s.readMu.Unlock()
+	s.readAt, s.hasRead = at, true
+}
+
+// Write queues a copy of p and never blocks. It stamps p for the destination
+// as captured when the microphone read it (MarkRead), before it hands p on,
+// so no result for p's words is timed from an earlier stamp
+// (ResilientClient.CapturedAt).
 func (s *AsyncSender) Write(p []byte) (int, error) {
+	at := time.Now()
+	s.readMu.Lock()
+	if s.hasRead {
+		at, s.hasRead = s.readAt, false
+	}
+	s.readMu.Unlock()
+	n := int64(len(p))
 	select {
 	case i := <-s.free:
 		s.slots[i] = append(s.slots[i][:0], p...)
-		s.queued.Add(int64(len(p)))
+		s.queued.Add(n)
+		if s.watcher != nil {
+			s.watcher.captured(at, n)
+		}
 		s.queue <- sendItem{slot: i}
 	default:
 		if s.watcher != nil {
-			s.watcher.sendQueueDropped(int64(len(p)))
+			s.watcher.sendQueueDropped(n)
+			s.watcher.captured(at, n)
 		}
 		if s.dropped.Add(1) == 1 {
 			slog.Warn("live transcription is behind; dropping audio for it (the recording keeps it)")

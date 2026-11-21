@@ -582,6 +582,590 @@ func TestOutputReportsSpeechStartedAndEnded(t *testing.T) {
 	}
 }
 
+// heldAudioStream is a fakeStream whose first Write with audio in it waits
+// first, as a device's first write can, and records when it returned: for
+// hold, or, with release set, until release closes, having said on entered
+// that it waits.
+type heldAudioStream struct {
+	*fakeStream
+	hold     time.Duration
+	entered  chan struct{}
+	release  chan struct{}
+	mu       sync.Mutex
+	returned time.Time
+}
+
+func (s *heldAudioStream) Write(frame []int16) error {
+	s.mu.Lock()
+	first := s.returned.IsZero() && slices.ContainsFunc(frame, func(v int16) bool { return v != 0 })
+	s.mu.Unlock()
+	if first {
+		if s.release != nil {
+			s.entered <- struct{}{}
+			<-s.release
+		} else {
+			time.Sleep(s.hold)
+		}
+	}
+	err := s.fakeStream.Write(frame)
+	if first {
+		s.mu.Lock()
+		s.returned = time.Now()
+		s.mu.Unlock()
+	}
+	return err
+}
+
+// TestASpeechStartsWhenTheStreamTakesItsFirstAudio fails if an input's speech
+// is reported started before the stream took its first audio, as when the
+// device holds the first write back: the voice's barge-in counts words said
+// after that moment as talking over it, and words said while the write waited
+// talked over nothing the room could hear.
+func TestASpeechStartsWhenTheStreamTakesItsFirstAudio(t *testing.T) {
+	stream := &heldAudioStream{fakeStream: newFakeStream(48000), hold: 300 * time.Millisecond}
+	out := NewOutput(OutputConfig{Open: func(string) (PlaybackStream, int, error) { return stream, 48000, nil }})
+	t.Cleanup(func() { _ = out.Close() })
+	events := make(chan SpeechEvent, 16)
+	defer out.OnSpeech(func(e SpeechEvent) { events <- e })()
+	pb := out.Begin(InputVoice)
+	go func() { _ = pb.WriteAll(testContext(t), constant(48000, time.Second, 1000), mono48k) }()
+	select {
+	case e := <-events:
+		stream.mu.Lock()
+		returned := stream.returned
+		stream.mu.Unlock()
+		if !e.Started || returned.IsZero() || e.At.Before(returned) {
+			t.Fatalf("the voice started at %v, %v before the stream took its first audio at %v", e.At.Format(time.StampMicro), returned.Sub(e.At), returned.Format(time.StampMicro))
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("no speech event")
+	}
+}
+
+// TestASpeechCutWhileItsFirstWriteIsHeldNeverStarts fails if a speech that
+// Cancel cut while the device held its first write reports a start and an
+// end once the write returns: they came after whatever took the speaker over
+// and were taken for its speech (Sol's review of #133 at 55bdf53). The
+// control, the same speech with no cut, starts.
+func TestASpeechCutWhileItsFirstWriteIsHeldNeverStarts(t *testing.T) {
+	for _, cut := range []bool{true, false} {
+		t.Run(fmt.Sprintf("cut %v", cut), func(t *testing.T) {
+			stream := &heldAudioStream{fakeStream: newFakeStream(48000), entered: make(chan struct{}, 1), release: make(chan struct{})}
+			out := NewOutput(OutputConfig{Open: func(string) (PlaybackStream, int, error) { return stream, 48000, nil }})
+			t.Cleanup(func() { _ = out.Close() })
+			events := make(chan SpeechEvent, 16)
+			defer out.OnSpeech(func(e SpeechEvent) { events <- e })()
+			pb := out.Begin(InputVoice)
+			go func() { _ = pb.WriteAll(testContext(t), constant(48000, time.Second, 1000), mono48k) }()
+			<-stream.entered // the first write waits on the device
+			if cut {
+				out.Cancel(InputVoice)
+			}
+			close(stream.release)
+			select {
+			case e := <-events:
+				if cut {
+					t.Fatalf("the cut speech reported %+v", e)
+				}
+			case <-time.After(time.Second):
+				if !cut {
+					t.Fatal("control: the speech never started")
+				}
+			}
+		})
+	}
+}
+
+// lockedAfterWriteStream is a fakeStream that records when its first write
+// with audio in it returned, and, with hold set, has another goroutine take
+// the Output's lock just before that write returns and keep it for hold.
+type lockedAfterWriteStream struct {
+	*fakeStream
+	out      *Output
+	hold     time.Duration
+	once     sync.Once
+	returned time.Time // the mixer writes it before the speech's start is emitted
+}
+
+func (s *lockedAfterWriteStream) Write(frame []int16) error {
+	err := s.fakeStream.Write(frame)
+	if slices.ContainsFunc(frame, func(v int16) bool { return v != 0 }) {
+		s.once.Do(func() {
+			if s.hold > 0 {
+				locked := make(chan struct{})
+				go func() {
+					s.out.mu.Lock()
+					close(locked)
+					time.Sleep(s.hold)
+					s.out.mu.Unlock()
+				}()
+				<-locked
+			}
+			s.returned = time.Now()
+		})
+	}
+	return err
+}
+
+// TestASpeechStartsWhenTheWriteReturnsNotWhenTheLockComes fails if a
+// speech's start is stamped when the mixer took the Output's lock after the
+// stream accepted its first audio, not when the write returned: a wait for
+// the lock moved the start later, and words said over the voice in that time
+// fell outside its speech (Sol's review of #133 at b41b12b found 150 ms). The
+// control has no wait for the lock.
+func TestASpeechStartsWhenTheWriteReturnsNotWhenTheLockComes(t *testing.T) {
+	for _, hold := range []time.Duration{0, 150 * time.Millisecond} {
+		t.Run(fmt.Sprintf("the lock held %v", hold), func(t *testing.T) {
+			stream := &lockedAfterWriteStream{fakeStream: newFakeStream(48000), hold: hold}
+			out := NewOutput(OutputConfig{Open: func(string) (PlaybackStream, int, error) { return stream, 48000, nil }})
+			stream.out = out
+			t.Cleanup(func() { _ = out.Close() })
+			events := make(chan SpeechEvent, 16)
+			defer out.OnSpeech(func(e SpeechEvent) { events <- e })()
+			go func() {
+				_ = out.Begin(InputVoice).WriteAll(testContext(t), constant(48000, 100*time.Millisecond, 1000), mono48k)
+			}()
+			select {
+			case e := <-events:
+				if !e.Started {
+					t.Fatalf("control: the first event is %+v, want the start", e)
+				}
+				if late := e.At.Sub(stream.returned); late < 0 || late > 50*time.Millisecond {
+					t.Fatalf("the speech started %v after its first write returned, want at it", late.Round(time.Millisecond))
+				}
+			case <-time.After(3 * time.Second):
+				t.Fatal("the speech never started")
+			}
+		})
+	}
+}
+
+// ordinaryEndStream is a playback stream that plays in real time, records
+// when its last write with audio in it returned, and holds its first silent
+// write until release closes, having closed held.
+type ordinaryEndStream struct {
+	mu                     sync.Mutex
+	lastVoice, firstSilent time.Time
+	held, release          chan struct{}
+	holdOnce               sync.Once
+}
+
+func (s *ordinaryEndStream) Write(frame []int16) error {
+	voiced := slices.ContainsFunc(frame, func(v int16) bool { return v != 0 })
+	if !voiced {
+		s.holdOnce.Do(func() {
+			s.mu.Lock()
+			s.firstSilent = time.Now()
+			s.mu.Unlock()
+			close(s.held)
+			<-s.release
+		})
+	}
+	time.Sleep(time.Duration(len(frame)) * time.Second / 48000)
+	if voiced {
+		s.mu.Lock()
+		s.lastVoice = time.Now()
+		s.mu.Unlock()
+	}
+	return nil
+}
+
+func (*ordinaryEndStream) Drop() (int, error) { return 0, nil }
+func (*ordinaryEndStream) Close() error       { return nil }
+
+// TestASpeechEndsNoLaterThanTheStreamTookItsLastAudio fails if a speech that
+// ends by itself is stamped when its end was found rather than when the
+// stream took its last audio: the device held the silent write after it, so
+// the end was found late, and silence the room heard fell inside the speech.
+// TestASpeechEndsWhenTheStreamTakesItsLastAudio bounds the end from below
+// only (Sol's review of #133 at ab139c8).
+func TestASpeechEndsNoLaterThanTheStreamTookItsLastAudio(t *testing.T) {
+	s := &ordinaryEndStream{held: make(chan struct{}), release: make(chan struct{})}
+	gate := make(chan struct{})
+	out := NewOutput(OutputConfig{Open: func(string) (PlaybackStream, int, error) {
+		<-gate
+		return s, 48000, nil
+	}})
+	open, release := sync.OnceFunc(func() { close(gate) }), sync.OnceFunc(func() { close(s.release) })
+	t.Cleanup(func() {
+		release()
+		open()
+		if err := out.Close(); err != nil {
+			t.Errorf("close the Output: %v", err)
+		}
+	})
+	events := make(chan SpeechEvent, 4)
+	defer out.OnSpeech(func(e SpeechEvent) { events <- e })()
+	if err := out.Begin(InputVoice).WriteAll(testContext(t), constant(48000, 20*time.Millisecond, 1000), mono48k); err != nil {
+		t.Fatal(err)
+	}
+	open()
+	select {
+	case <-s.held:
+	case <-time.After(3 * time.Second):
+		t.Fatal("control: the first silent write was not held")
+	}
+	time.Sleep(150 * time.Millisecond) // the end is found only after this
+	release()
+	var got []SpeechEvent
+	for len(got) < 2 {
+		select {
+		case e := <-events:
+			got = append(got, e)
+		case <-time.After(3 * time.Second):
+			t.Fatalf("speech events %+v, want a start and an end", got)
+		}
+	}
+	s.mu.Lock()
+	lastVoice, firstSilent := s.lastVoice, s.firstSilent
+	s.mu.Unlock()
+	if lastVoice.IsZero() || !firstSilent.After(lastVoice) || !got[0].Started || got[1].Started || got[1].Cancelled {
+		t.Fatalf("control: the last voiced write returned at %v, the first silent one began at %v, events %+v", lastVoice, firstSilent, got)
+	}
+	if got[1].At.Before(lastVoice) || !got[1].At.Before(firstSilent) {
+		t.Fatalf("the speech ended at %v, want from the last voiced write's return at %v to before the first silent write at %v", got[1].At.Format(time.StampMicro), lastVoice.Format(time.StampMicro), firstSilent.Format(time.StampMicro))
+	}
+}
+
+// TestAShortSpeechEndsNoEarlierThanItStarts fails if a speech whose first
+// write the device held reports an end before its start: its last audio was
+// mixed before the write returned (Sol's review of #133 at 55bdf53).
+func TestAShortSpeechEndsNoEarlierThanItStarts(t *testing.T) {
+	stream := &heldAudioStream{fakeStream: newFakeStream(48000), hold: 300 * time.Millisecond}
+	out := NewOutput(OutputConfig{Open: func(string) (PlaybackStream, int, error) { return stream, 48000, nil }})
+	t.Cleanup(func() { _ = out.Close() })
+	events := make(chan SpeechEvent, 16)
+	defer out.OnSpeech(func(e SpeechEvent) { events <- e })()
+	pb := out.Begin(InputVoice)
+	go func() { _ = pb.WriteAll(testContext(t), constant(48000, 10*time.Millisecond, 1000), mono48k) }()
+	var got []SpeechEvent
+	for len(got) < 2 {
+		select {
+		case e := <-events:
+			got = append(got, e)
+		case <-time.After(3 * time.Second):
+			t.Fatalf("speech events %+v, want a start and an end", got)
+		}
+	}
+	if !got[0].Started || got[1].Started || got[1].At.Before(got[0].At) {
+		t.Fatalf("speech events %+v: the end comes %v before the start", got, got[0].At.Sub(got[1].At))
+	}
+}
+
+// lastWriteStream is a fakeStream whose write of the nth frame with audio
+// in it waits until release closes, and records when that write returned.
+type lastWriteStream struct {
+	*fakeStream
+	nth      int
+	release  chan struct{}
+	mu       sync.Mutex
+	audible  int
+	returned time.Time
+}
+
+func (s *lastWriteStream) Write(frame []int16) error {
+	s.mu.Lock()
+	if slices.ContainsFunc(frame, func(v int16) bool { return v != 0 }) {
+		s.audible++
+	}
+	held := s.audible == s.nth && s.returned.IsZero()
+	s.mu.Unlock()
+	if held {
+		<-s.release
+	}
+	err := s.fakeStream.Write(frame)
+	if held {
+		s.mu.Lock()
+		s.returned = time.Now()
+		s.mu.Unlock()
+	}
+	return err
+}
+
+// TestASpeechEndsWhenTheStreamTakesItsLastAudio fails if a speech's end is
+// stamped before the stream took its last audio, as when the device holds
+// that write back: words said over the voice while it played that audio fell
+// outside the speech (Sol's review of #133 at 795ad04).
+func TestASpeechEndsWhenTheStreamTakesItsLastAudio(t *testing.T) {
+	stream := &lastWriteStream{fakeStream: newFakeStream(48000), nth: 3, release: make(chan struct{})}
+	out := NewOutput(OutputConfig{Open: func(string) (PlaybackStream, int, error) { return stream, 48000, nil }})
+	t.Cleanup(func() { _ = out.Close() })
+	events := make(chan SpeechEvent, 16)
+	defer out.OnSpeech(func(e SpeechEvent) { events <- e })()
+	pb := out.Begin(InputVoice)
+	go func() { _ = pb.WriteAll(testContext(t), constant(48000, 30*time.Millisecond, 1000), mono48k) }()
+	time.AfterFunc(300*time.Millisecond, func() { close(stream.release) }) // the device holds its last write
+	for {
+		select {
+		case e := <-events:
+			if e.Started {
+				continue
+			}
+			stream.mu.Lock()
+			returned := stream.returned
+			stream.mu.Unlock()
+			if returned.IsZero() || e.At.Before(returned) {
+				t.Fatalf("the speech ended at %v, %v before the stream took its last audio at %v", e.At.Format(time.StampMicro), returned.Sub(e.At), returned.Format(time.StampMicro))
+			}
+			return
+		case <-time.After(3 * time.Second):
+			t.Fatal("the speech did not end")
+		}
+	}
+}
+
+// replayStream is a fakeStream that takes back back samples at its first
+// Drop, as a device's buffer does, and holds the first write after it, the
+// replay's, until release closes, recording when the replay's last write
+// with audio in it returned: once the other input is cancelled, the replay's
+// audio is the voice's.
+type replayStream struct {
+	*fakeStream
+	back     int
+	release  chan struct{}
+	mu       sync.Mutex
+	dropped  bool
+	held     bool
+	replayed time.Time
+	replay   int // samples of the replay still to write
+}
+
+func (s *replayStream) Drop() (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.dropped {
+		return 0, nil
+	}
+	s.dropped, s.replay = true, s.back
+	return s.back, nil
+}
+
+func (s *replayStream) Write(frame []int16) error {
+	s.mu.Lock()
+	inReplay := s.replay > 0
+	hold := inReplay && !s.held
+	s.held = s.held || hold
+	s.mu.Unlock()
+	if hold {
+		<-s.release
+	}
+	err := s.fakeStream.Write(frame)
+	if inReplay {
+		s.mu.Lock()
+		s.replay -= len(frame)
+		if slices.ContainsFunc(frame, func(v int16) bool { return v != 0 }) {
+			s.replayed = time.Now()
+		}
+		s.mu.Unlock()
+	}
+	return err
+}
+
+// TestASpeechWhoseLastAudioIsReplayedEndsAfterTheReplay fails if a speech
+// whose last audio a Cancel of another input took back from the device, and
+// the stream then took again, is stamped as ending before that replay's
+// write returned (Sol's review of #133 at b6eef5c).
+func TestASpeechWhoseLastAudioIsReplayedEndsAfterTheReplay(t *testing.T) {
+	const rate = 48000
+	stream := &replayStream{fakeStream: newFakeStream(rate), back: rate / 20, release: make(chan struct{})}
+	out := NewOutput(OutputConfig{Open: func(string) (PlaybackStream, int, error) { return stream, rate, nil }})
+	t.Cleanup(func() { _ = out.Close() })
+	events := make(chan SpeechEvent, 16)
+	defer out.OnSpeech(func(e SpeechEvent) {
+		if e.Input == InputVoice {
+			events <- e
+		}
+	})()
+	chime := out.Begin(InputChime)
+	go func() { _ = chime.WriteAll(testContext(t), constant(rate, time.Second, 7), mono48k) }()
+	stream.waitWriting(t)
+	voice := out.Begin(InputVoice)
+	go func() { _ = voice.WriteAll(testContext(t), constant(rate, 20*time.Millisecond, 1000), mono48k) }()
+	// Once the stream has the chime alone after the voice's audio, the
+	// voice's last audio is in the device's last 50 ms: cancel the chime.
+	for deadline := time.Now().Add(3 * time.Second); ; time.Sleep(time.Millisecond) {
+		stream.fakeStream.mu.Lock()
+		voiced, after := false, false
+		for _, f := range stream.frames {
+			loudest := slices.Max(f.samples)
+			switch {
+			case loudest > 100:
+				voiced = true
+			case voiced && loudest > 0:
+				after = true
+			}
+		}
+		stream.fakeStream.mu.Unlock()
+		if after {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the stream never had the chime alone after the voice")
+		}
+	}
+	out.Cancel(InputChime)
+	time.AfterFunc(200*time.Millisecond, func() { close(stream.release) }) // the replay's write waits on the device
+	for {
+		select {
+		case e := <-events:
+			if e.Started {
+				continue
+			}
+			stream.mu.Lock()
+			replayed := stream.replayed
+			stream.mu.Unlock()
+			if replayed.IsZero() || e.At.Before(replayed) {
+				t.Fatalf("the voice ended at %v, %v before the replay of its last audio was taken at %v", e.At.Format(time.StampMicro), replayed.Sub(e.At), replayed.Format(time.StampMicro))
+			}
+			return
+		case <-time.After(3 * time.Second):
+			t.Fatal("the voice did not end")
+		}
+	}
+}
+
+// boundaryStream takes five ordinary frames, holds the fifth until released
+// closes, then takes back those five at its Drop and replays
+// them, holding the holdReplay'th replay write until replayRelease closes. It
+// records when the replay's last write with audio returned. Each write takes
+// as long as its audio plays.
+type boundaryStream struct {
+	mu                   sync.Mutex
+	normalN, replayN     int
+	replayLeft           int
+	holdReplay           int
+	replayVoiceSamples   int
+	lastVoiceAccepted    time.Time
+	normalHeld, released chan struct{}
+	replayHeld, replayGo chan struct{}
+}
+
+func (s *boundaryStream) Write(frame []int16) error {
+	s.mu.Lock()
+	replaying := s.replayLeft > 0
+	var hold bool
+	if replaying {
+		s.replayN++
+		hold = s.replayN == s.holdReplay
+	} else {
+		s.normalN++
+		hold = s.normalN == 5
+	}
+	s.mu.Unlock()
+	if hold && replaying {
+		close(s.replayHeld)
+		<-s.replayGo
+	} else if hold {
+		close(s.normalHeld)
+		<-s.released
+	}
+	time.Sleep(time.Duration(len(frame)) * time.Second / 48000)
+	if replaying {
+		s.mu.Lock()
+		if slices.ContainsFunc(frame, func(v int16) bool { return v != 0 }) {
+			s.lastVoiceAccepted = time.Now()
+			s.replayVoiceSamples += len(frame)
+		}
+		s.replayLeft -= len(frame)
+		s.mu.Unlock()
+	}
+	return nil
+}
+
+func (s *boundaryStream) Drop() (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.replayLeft = 2400 // 50 ms at 48 kHz, the five frames taken
+	return s.replayLeft, nil
+}
+
+func (*boundaryStream) Close() error { return nil }
+
+// TestAReplayEndsAtTheVoicesLastReplayedAudio fails if a speech whose last
+// audio is replayed, followed in the replay by silence, is stamped as ending
+// after that silence was taken: silence counted as the voice playing, and
+// words said then could count as talk-over (Sol's review of #133 at
+// 99f652f). The control holds the replay's last write with voice: the end
+// cannot come before it.
+func TestAReplayEndsAtTheVoicesLastReplayedAudio(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		holdReplay int
+		silentTail bool
+	}{
+		{"control: the last voiced replay write held", 2, false},
+		{"a silent replay write after the voice held", 3, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := &boundaryStream{
+				holdReplay: tc.holdReplay,
+				normalHeld: make(chan struct{}), released: make(chan struct{}),
+				replayHeld: make(chan struct{}), replayGo: make(chan struct{}),
+			}
+			openGate := make(chan struct{})
+			o := NewOutput(OutputConfig{Open: func(string) (PlaybackStream, int, error) {
+				<-openGate
+				return s, 48000, nil
+			}})
+			t.Cleanup(func() { _ = o.Close() })
+			var openOnce, normalOnce, replayOnce sync.Once
+			t.Cleanup(func() { replayOnce.Do(func() { close(s.replayGo) }) })
+			t.Cleanup(func() { normalOnce.Do(func() { close(s.released) }) })
+			t.Cleanup(func() { openOnce.Do(func() { close(openGate) }) })
+			events := make(chan SpeechEvent, 16)
+			defer o.OnSpeech(func(e SpeechEvent) {
+				if e.Input == InputVoice {
+					events <- e
+				}
+			})()
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if err := o.Begin(InputVoice).WriteAll(ctx, constant(48000, 20*time.Millisecond, 1000), mono48k); err != nil {
+				t.Fatal(err)
+			}
+			if err := o.Begin(InputChime).WriteAll(ctx, constant(48000, 100*time.Millisecond, 7), mono48k); err != nil {
+				t.Fatal(err)
+			}
+			openOnce.Do(func() { close(openGate) })
+			select {
+			case <-s.normalHeld: // the fifth frame: 20 ms of voice, then chime alone
+			case <-time.After(3 * time.Second):
+				t.Fatal("never reached the fifth write")
+			}
+			o.Cancel(InputChime) // the only cancel: the replay holds the voice, then silence
+			normalOnce.Do(func() { close(s.released) })
+			select {
+			case <-s.replayHeld:
+			case <-time.After(3 * time.Second):
+				t.Fatal("never reached the held replay write")
+			}
+			heldAt := time.Now()
+			replayOnce.Do(func() { close(s.replayGo) })
+			var got []SpeechEvent
+			for len(got) < 2 {
+				select {
+				case e := <-events:
+					got = append(got, e)
+				case <-ctx.Done():
+					t.Fatalf("events %+v, want a start and an end", got)
+				}
+			}
+			s.mu.Lock()
+			lastVoice, samples := s.lastVoiceAccepted, s.replayVoiceSamples
+			s.mu.Unlock()
+			if !got[0].Started || got[1].Started || got[1].Cancelled || samples != 960 {
+				t.Fatalf("control: events %+v, %d voiced samples replayed, want 960", got, samples)
+			}
+			if got[1].At.Before(lastVoice) {
+				t.Fatalf("the voice ended at %v, before its last replayed audio was taken at %v", got[1].At.Format(time.StampMicro), lastVoice.Format(time.StampMicro))
+			}
+			if tc.silentTail && !got[1].At.Before(heldAt) {
+				t.Fatalf("the voice ended at %v, after the silent replay write began at %v: %v of silence counted as its speech", got[1].At.Format(time.StampMicro), heldAt.Format(time.StampMicro), got[1].At.Sub(lastVoice))
+			}
+		})
+	}
+}
+
 // TestOutputOpensTheConfiguredDevice fails if the Output opens any device but
 // the speaker_device setting.
 func TestOutputOpensTheConfiguredDevice(t *testing.T) {

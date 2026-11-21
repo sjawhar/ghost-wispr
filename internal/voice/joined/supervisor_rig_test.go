@@ -91,6 +91,7 @@ func (s *soundSpeaker) Cancel(string)                     {}
 func (s *soundSpeaker) OnSpeech(func(audio.SpeechEvent)) (remove func()) {
 	return func() {}
 }
+func (s *soundSpeaker) FlushSpeech() {}
 
 // played reports whether the named sound began.
 func (s *soundSpeaker) played(name string) bool {

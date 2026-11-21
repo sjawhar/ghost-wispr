@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math"
 	"slices"
 	"strings"
 	"sync"
@@ -52,15 +53,20 @@ const (
 	// bargeInGap is how close two words of someone else's must start to stop
 	// the voice: real words over it, not a cough and a word.
 	bargeInGap = 0.5
+	// finalMoves is how far, in seconds, Deepgram's final may move a word
+	// from where an interim put it, edge included.
+	finalMoves = 0.3
 	// echoHold is how long after the voice's speech ends its own words, heard
 	// back, still count as its own.
 	echoHold = 1500 * time.Millisecond
-	// ownWordsKept is how long Wispr's spoken words are kept for the own-speech
-	// match.
-	ownWordsKept = 30 * time.Second
 	// sorryLine is said for a failed answer when the Concierge said nothing.
 	sorryLine = "Sorry, I could not answer that."
 )
+
+// ownWordsKept is how long Wispr's spoken words are kept for the own-speech
+// match, unless a span they could echo in is kept longer (addOwnLocked); a
+// test shortens it.
+var ownWordsKept = 30 * time.Second
 
 // recentKept is how much of the transcript an exchange gets as Recent; a
 // test shortens it.
@@ -97,11 +103,14 @@ var backchannels = map[string]bool{
 }
 
 // Speaker is the speaker output as the Supervisor uses it; SpeakerOf adapts
-// *audio.Output.
+// *audio.Output. FlushSpeech delivers the speech events it has queued, on the
+// caller's goroutine, so a decision that reads the voice's speech sees every
+// start and end the speaker has had (audio.Output.FlushSpeech).
 type Speaker interface {
 	Begin(input string) Playback
 	Cancel(input string)
 	OnSpeech(fn func(audio.SpeechEvent)) (remove func())
+	FlushSpeech()
 }
 
 // SpeakerOf adapts the speaker output.
@@ -114,6 +123,7 @@ func (s outputSpeaker) Cancel(input string)         { s.o.Cancel(input) }
 func (s outputSpeaker) OnSpeech(fn func(audio.SpeechEvent)) func() {
 	return s.o.OnSpeech(fn)
 }
+func (s outputSpeaker) FlushSpeech() { s.o.FlushSpeech() }
 
 // TurnDriver is implemented by a Voice whose vendor drives the turn itself
 // (voices B and C): the Supervisor then hands the Concierge no turn, and the
@@ -135,11 +145,15 @@ type Transcript struct {
 }
 
 // Word is one word of a Transcript, with Deepgram's speaker label and its
-// times on the socket, in seconds.
+// times on the socket, in seconds. At is when its start was captured, on the
+// system clock, as the live stream times it (main.go's voiceTranscript); a
+// word with no At is taken as captured when its result arrived (Transcript.At),
+// as the session manager takes the words of a result with no live stream.
 type Word struct {
 	Text       string
 	Speaker    int
 	Start, End float64
+	At         time.Time
 }
 
 // SupervisorConfig wires a Supervisor.
@@ -258,6 +272,14 @@ type Supervisor struct {
 	closing  bool
 	idle     chan struct{}
 	idleDone bool // idle is closed
+	// speechEx is the exchange whose voice's speech plays now: the one
+	// holding the floor when the speech started, by the speech's own start
+	// time, not when its event came, nil for other speech. The speech's end
+	// is that exchange's, though another exchange may have taken the floor,
+	// and cut it, since. floorAt is when the exchange holding the floor took
+	// it.
+	speechEx *exchange
+	floorAt  time.Time
 
 	// commands counts a person's commands on held answers: each "Wispr,
 	// never mind" and each "Wispr, go ahead". neverMinds is how many never
@@ -349,6 +371,7 @@ type exchange struct {
 	turnAt         time.Time // when the turn was handed to the Concierge
 	notified       map[string]bool
 	idle           *time.Timer // a driving voice's idle wait
+	idleGen        int         // a superseded idle wait's callback finds it changed
 	// A driving voice's follow-up window: armed when its speech ends, unless
 	// a barge-in cut it; a person's word disarms it (R10).
 	followUpTimer *time.Timer
@@ -356,6 +379,41 @@ type exchange struct {
 	cutSpeech     bool // a barge-in cut the driving voice's speech
 	newTurn       bool // the driving voice spoke: the room's next words are a new turn
 	toolCalls     int  // answer tools still running: the exchange stays open
+	// turnEnd is when the driving voice first spoke after the turn it now
+	// answers began, or stopped speaking over a turn begun while it spoke:
+	// a result whose words were all said before it is that turn's, which
+	// Deepgram sent late (stale). turnFrom is turnEnd as it was when that
+	// turn began: a stale result none of whose words was said after it is an
+	// earlier turn's (ofTurn). starts are when each of its voice's speeches
+	// began: a stale result a word of which was said after a speech that
+	// began after the turn now heard began is of a turn the voice answered
+	// before any result of it came (answeredUnheard).
+	turnEnd, turnFrom time.Time
+	starts            []time.Time
+	// played are the spans in which its voice played since its latest cut
+	// (cutAt), which the Supervisor records when it cancels the voice
+	// (cutDriverLocked): only words said in one talk over it (talksOver).
+	// playedFrom is when its voice first played.
+	played     []span
+	cutAt      time.Time
+	playedFrom time.Time
+	// answerFrom is when a voice that does not drive its turn first spoke
+	// after the turn it answers was handed over (answerPending until then):
+	// in the follow-up window, a result whose words were all said before it
+	// is that turn's, or an earlier one's, which Deepgram sent late (stale).
+	answerFrom    time.Time
+	answerPending bool
+	// wakeSaid is when the call's wake word was captured, or zero when it
+	// was untimed: it tells the call from a new one on a new socket, whose
+	// stream restarts where wakeStart was (sameCall).
+	wakeSaid time.Time
+	// overLast is the last word of the latest final that talked over its
+	// voice, which pairs with the next result's first (bargesIn).
+	overLast *overWord
+	// turnSaidAt is when the asker said the last word of the turn a driving
+	// voice answers, by its capture time: the routing line's limit counts
+	// from it.
+	turnSaidAt time.Time
 	// dropsAtOpen is the tap's drop count when the exchange opened.
 	dropsAtOpen uint64
 	// sayCtx, when set, is the context of a hand's words, derived from its
@@ -767,8 +825,10 @@ func (s *Supervisor) OnUtteranceEnd(closings int, gateOpen bool) {
 }
 
 // OnTranscript reads one Deepgram result: the wake phrase, the asker's turn,
-// commands, and barge-in.
+// commands, and barge-in. It first takes in the speaker's queued speech
+// events: the result is read against every speech the speaker has had.
 func (s *Supervisor) OnTranscript(t *Transcript) {
+	s.cfg.Speaker.FlushSpeech()
 	s.mu.Lock()
 	s.onTranscriptLocked(t)
 	heard, segments := s.heard, s.segments
@@ -798,7 +858,7 @@ func (s *Supervisor) onTranscriptLocked(t *Transcript) {
 	}
 	now := time.Now()
 	s.lastHeard = now
-	own := s.ownLocked(t.Words, now)
+	own := s.ownLocked(t.Words, t.saidBy())
 	if !own {
 		s.lastRoomWord = now
 	}
@@ -818,7 +878,7 @@ func (s *Supervisor) onTranscriptLocked(t *Transcript) {
 			return
 		}
 		ex := s.ex
-		same := ex != nil && ex.answer == nil && sameStart(ex.wakeStart, wakeStart(t, m))
+		same := ex != nil && ex.answer == nil && ex.sameCall(t, m)
 		switch {
 		case cmd == transcript.GoAhead:
 			if ex != nil && ex.answer == nil && !ex.answering && !ex.drives {
@@ -849,26 +909,60 @@ func (s *Supervisor) onTranscriptLocked(t *Transcript) {
 			}
 			s.neverMindLocked(s.cfg.Session())
 		case same && !ex.answering:
-			s.turnLocked(ex, t, m.Rest)
+			if ex.drives {
+				s.driverHeardLocked(ex, t, m.Rest)
+			} else if !ex.stale(t) { // else the answered call, sent late
+				s.turnLocked(ex, t, m.Rest)
+			}
+			s.bargeInLocked(ex, t, now)
 		case same:
-			// More of the utterance the exchange already answers.
+			// More of the utterance the exchange already answers, and maybe
+			// words said over its answer.
+			s.bargeInLocked(ex, t, now)
 		case ex != nil && !ex.answering && ex.answer == nil:
 			// "Wispr." then "Wispr, what …", or a call in the follow-up
-			// window: the same exchange. Over a driving voice's speech, it is
-			// a barge-in with new words.
-			ex.wakeStart = wakeStart(t, m)
+			// window: the same exchange. Said while a driving voice played,
+			// it is a barge-in with new words. Said before the driving voice
+			// spoke, it is the turn the voice answers, which Deepgram sent
+			// late; once a later turn has begun, or if it was said before that
+			// turn began, it is nothing. A call closes the follow-up window
+			// (R10) when it is read at once, or was said over the voice and
+			// read once it went quiet; the call the voice answers, sent late,
+			// leaves the window.
+			stale := ex.stale(t)
+			if stale && (!ex.newTurn || !ex.ofTurn(t)) {
+				s.bargeInLocked(ex, t, now)
+				break
+			}
+			if from, ok := ex.answeredUnheard(t); stale && ok {
+				ex.turnFrom = from // the voice answered this call before its result came
+			}
+			ex.wakeStart, ex.wakeSaid = wakeStart(t, m), wakeSaidAt(t, m)
 			ex.turn, ex.interim, ex.turnFinal = nil, "", false
 			ex.followUpTurn = false // a call, with the wake phrase
+			cut := false
 			if ex.drives {
 				s.touchLocked(ex)
-				s.disarmFollowUpLocked(ex)
-				ex.newTurn = false
-				if s.voiceSpeaking {
-					s.logf("voice: barge-in with a call")
-					s.cutDriverLocked(ex)
+				if !stale || !ex.playedFrom.IsZero() && t.heardAt(wakeWord(t, m)).After(ex.playedFrom) {
+					s.disarmFollowUpLocked(ex)
+				}
+				if !stale {
+					ex.newTurn, ex.turnFrom = false, ex.turnEnd
+					if cut = s.voiceSpeaking && s.speechEx == ex && ex.talksOver(t.heardAt(wakeWord(t, m))); cut {
+						s.logf("voice: barge-in with a call")
+						s.cutDriverLocked(ex)
+					}
 				}
 			}
 			s.turnLocked(ex, t, m.Rest)
+			if !cut {
+				s.bargeInLocked(ex, t, now)
+			}
+		case ex != nil && !ex.playedFrom.IsZero() && !t.heardAt(wakeWord(t, m)).After(ex.playedFrom):
+			// A call said before the exchange's voice first played, which
+			// Deepgram sent late, is no new call over its answer: it is the
+			// call the voice answers, its final moved, or one said with it.
+			s.bargeInLocked(ex, t, now)
 		default:
 			if ex != nil {
 				s.endLocked(ex, true, "a new call")
@@ -901,29 +995,116 @@ func (s *Supervisor) onTranscriptLocked(t *Transcript) {
 		return
 	}
 	if ex.drives && ex.answer == nil {
-		// A person spoke: the follow-up window holds for the vendor's answer,
-		// and after the voice spoke, the words are the asker's next turn,
-		// a follow-up when the window was open (R10).
+		s.driverHeardLocked(ex, t, t.Text)
+	}
+	if !ex.answering && !ex.drives {
+		if !ex.stale(t) { // else a late result of a turn answered already
+			s.turnLocked(ex, t, t.Text)
+		}
+		return
+	}
+	s.bargeInLocked(ex, t, now)
+}
+
+// driverHeardLocked takes words, of t, into the turn of ex, whose voice
+// drives its own turn. A person spoke: the follow-up window holds for the
+// vendor's answer, and after the voice spoke, the words are the asker's next
+// turn, a follow-up when the window was open (R10). A result whose words were
+// all said before the voice spoke after the turn it answers (stale) is that
+// turn's, which Deepgram sent late, if a word of it was said after that turn
+// began (ofTurn): it completes that turn, begins no new one, and the window
+// stays. When the voice answered a turn before any result of it came, in one
+// speech or several, that turn's late result begins it (answeredUnheard), as
+// main begins a new turn, and the turn heard before is dropped. Once a later
+// turn has begun, or if it is an earlier turn's, it is nothing.
+func (s *Supervisor) driverHeardLocked(ex *exchange, t *Transcript, words string) {
+	if !ex.stale(t) {
 		if ex.newTurn {
-			ex.newTurn = false
+			ex.newTurn, ex.turnFrom = false, ex.turnEnd
 			ex.turn, ex.interim, ex.turnFinal = nil, "", false
 			ex.followUpTurn = ex.followUpTimer != nil && !ex.askedBack
 		}
 		s.disarmFollowUpLocked(ex)
-		s.turnLocked(ex, t, t.Text)
-	}
-	if !ex.answering && !ex.drives {
-		s.turnLocked(ex, t, t.Text)
+		s.turnLocked(ex, t, words)
 		return
 	}
-	if s.voiceSpeaking && bargesIn(t.Words, s.ownSetLocked(now)) {
-		s.logf("voice: barge-in")
-		if !ex.drives {
-			s.endLocked(ex, true, "barge-in")
-			return
-		}
-		s.cutDriverLocked(ex)
+	if !ex.newTurn {
+		return
 	}
+	if from, ok := ex.answeredUnheard(t); ok {
+		// The voice's speeches since answer it: the room's next words are
+		// still a new turn.
+		ex.turnFrom = from
+		ex.turn, ex.interim, ex.turnFinal = nil, "", false
+		ex.followUpTurn = ex.followUpTimer != nil && !ex.askedBack
+		s.turnLocked(ex, t, words)
+	} else if ex.ofTurn(t) {
+		s.turnLocked(ex, t, words)
+	}
+}
+
+// bargeInLocked stops ex's voice when t's words talk over its speech
+// (bargesIn), with the last such word of the final before t: a voice that
+// drives its own turn stays open to hear the interruption; any other voice's
+// exchange ends. It keeps that last word also while the voice is silent, as
+// in a pause between two of its speeches: a word said while it played pairs
+// with the next one said over it, whenever its result came. It stops the
+// voice only while its speech plays: a talk-over recognized once the voice
+// has gone quiet stops nothing.
+func (s *Supervisor) bargeInLocked(ex *exchange, t *Transcript, now time.Time) {
+	cut, last := bargesIn(t, s.ownSetLocked(t.saidBy()), ex, ex.overLast)
+	if t.IsFinal && last != nil {
+		ex.overLast = last
+	}
+	if !cut || !s.voiceSpeaking || s.speechEx != ex {
+		return // or other speech plays, or the voice that was talked over is quiet
+	}
+	s.logf("voice: barge-in")
+	if !ex.drives {
+		s.endLocked(ex, true, "barge-in")
+		return
+	}
+	s.cutDriverLocked(ex)
+}
+
+// stale reports whether t is a late result of a turn ex's voice answered,
+// which Deepgram sent late: for a voice that drives its turn, every word of
+// it was said before the voice spoke after that turn began (turnEnd); for
+// another voice, in the follow-up window after its answer, every word was
+// said before the voice first spoke after the turn was handed over
+// (answerFrom).
+func (ex *exchange) stale(t *Transcript) bool {
+	if !ex.drives {
+		return ex.followUp && !ex.answering && !ex.answerFrom.IsZero() && !t.saidAfter(ex.answerFrom)
+	}
+	return !ex.turnEnd.IsZero() && !t.saidAfter(ex.turnEnd)
+}
+
+// ofTurn reports whether t, a stale result, is the turn ex's driving voice
+// answers: a word of it was said after that turn began (turnFrom). The
+// original question's late final, read once a follow-up has begun and the
+// voice answers it, is not.
+func (ex *exchange) ofTurn(t *Transcript) bool {
+	return t.saidAfter(ex.turnFrom)
+}
+
+// answeredUnheard reports whether t, a stale result, is of a turn ex's
+// driving voice answered before any result of it came, and when that turn
+// began: a word of t was said after a speech that began after the turn now
+// heard began (turnFrom), as when the voice answered a follow-up, in one
+// speech or several, from its own audio of the room. The turn began with
+// the latest such speech, the one the room's words came after.
+func (ex *exchange) answeredUnheard(t *Transcript) (time.Time, bool) {
+	for i := len(ex.starts) - 1; i >= 0; i-- {
+		s := ex.starts[i]
+		if !s.After(ex.turnFrom) {
+			break
+		}
+		if t.saidAfter(s) {
+			return s, true
+		}
+	}
+	return time.Time{}, false
 }
 
 // neverMindLocked answers "Wispr, never mind" (R7): the Concierge cancels the
@@ -1001,13 +1182,73 @@ func (s *Supervisor) answerSoundLocked() bool {
 
 // cutDriverLocked stops the speech of ex's voice, which drives its own turn,
 // at once, and keeps it open: its vendor hears the interruption and answers
-// it.
+// it. Nothing said before the cut talks over its speech after it.
 func (s *Supervisor) cutDriverLocked(ex *exchange) {
 	ex.cutSpeech = true
+	ex.cutLocked(time.Now())
 	s.cfg.Speaker.Cancel(audio.InputVoice)
 	if sess := ex.session; sess != nil {
 		s.spawn(sess.Interrupt)
 	}
+}
+
+// span is a stretch in which an exchange's voice played: from its first
+// audio to its last, which is zero while it plays.
+type span struct{ from, to time.Time }
+
+// playLocked follows e, a speech of ex's voice: a start opens a span, an end
+// closes it. A cancelled end is no new cut: every Cancel of the voice is the
+// Supervisor's own, which records its cut when it makes it (cutDriverLocked),
+// while the speaker reports the end only once its mixer takes the Cancel in,
+// which can be after a later line was called.
+func (ex *exchange) playLocked(e audio.SpeechEvent) {
+	if e.Started {
+		if ex.playedFrom.IsZero() {
+			ex.playedFrom = e.At
+		}
+		if ex.answerPending {
+			ex.answerFrom, ex.answerPending = e.At, false
+		}
+		ex.played = append(ex.played, span{from: e.At})
+		return
+	}
+	if n := len(ex.played); n > 0 && ex.played[n-1].to.IsZero() {
+		ex.played[n-1].to = e.At
+	}
+}
+
+// cutLocked marks at as a cut of ex's voice: its spans up to then are over.
+func (ex *exchange) cutLocked(at time.Time) {
+	if at.After(ex.cutAt) {
+		ex.cutAt = at
+	}
+	ex.played = ex.played[:0]
+}
+
+// talksOver reports whether a word said at at talked over ex's voice: it
+// was said while the voice played, after its latest cut. A word said while
+// the voice was silent, as between two of its answers, talks over nothing.
+func (ex *exchange) talksOver(at time.Time) bool {
+	if !at.After(ex.cutAt) {
+		return false
+	}
+	for _, sp := range ex.played {
+		if at.After(sp.from) && (sp.to.IsZero() || !at.After(sp.to)) {
+			return true
+		}
+	}
+	return false
+}
+
+// spanBefore returns the last span of ex's voice that began before at: the
+// speech a word said at at was heard in, or heard just after.
+func (ex *exchange) spanBefore(at time.Time) (span, bool) {
+	for i := len(ex.played) - 1; i >= 0; i-- {
+		if at.After(ex.played[i].from) {
+			return ex.played[i], true
+		}
+	}
+	return span{}, false
 }
 
 // startLocked opens an exchange on a wake: the wake chime, the voice, and a
@@ -1030,7 +1271,7 @@ func (s *Supervisor) startLocked(t *Transcript, m transcript.Match) {
 		return
 	}
 	ctx := newExchangeContext(s.ctx)
-	ex := &exchange{ctx: ctx, cancel: ctx.cancel, authority: ctx, opened: make(chan struct{}), wakeStart: wakeStart(t, m), wakeAt: t.At, notified: map[string]bool{}, times: &exchangeTimes{wakeAt: t.At}}
+	ex := &exchange{ctx: ctx, cancel: ctx.cancel, authority: ctx, opened: make(chan struct{}), wakeStart: wakeStart(t, m), wakeSaid: wakeSaidAt(t, m), wakeAt: t.At, notified: map[string]bool{}, times: &exchangeTimes{wakeAt: t.At}}
 	s.capExchange(ex)
 	if d, ok := voice.(TurnDriver); ok && d.DrivesTurn() {
 		ex.drives = true
@@ -1241,14 +1482,21 @@ func (s *Supervisor) touchLocked(ex *exchange) {
 	if ex.idle != nil {
 		ex.idle.Stop()
 	}
-	ex.idle = time.AfterFunc(s.cfg.IdleWait, func() { s.idleWaited(ex) })
+	ex.idleGen++
+	gen := ex.idleGen
+	ex.idle = time.AfterFunc(s.cfg.IdleWait, func() { s.idleWaited(ex, gen) })
 }
 
-// idleWaited ends an exchange nobody and nothing spoke in for IdleWait.
-func (s *Supervisor) idleWaited(ex *exchange) {
+// idleWaited ends an exchange nobody and nothing spoke in for IdleWait, if
+// its idle wait gen is still the current one: a Stop cannot recall a
+// callback already under way when touchLocked began a new wait. It first
+// takes in the speaker's queued speech events, so a speech that began just
+// before counts though its delivery waits.
+func (s *Supervisor) idleWaited(ex *exchange, gen int) {
+	s.cfg.Speaker.FlushSpeech()
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.ex != ex || ex.ended {
+	if s.ex != ex || ex.ended || ex.idleGen != gen {
 		return
 	}
 	if s.voiceSpeaking || ex.toolCalls > 0 {
@@ -1267,9 +1515,18 @@ func (s *Supervisor) idleWaited(ex *exchange) {
 
 // driverSpeechLocked follows the speech of ex's voice, which drives its own
 // turn: the room's next words are a new turn, and once its speech ends by
-// itself, the follow-up window opens (R10).
-func (s *Supervisor) driverSpeechLocked(ex *exchange, started bool) {
+// itself, the follow-up window opens (R10). at is when the speech's first
+// audio, or on its end its last, went to the speaker.
+func (s *Supervisor) driverSpeechLocked(ex *exchange, started bool, at time.Time) {
 	s.disarmFollowUpLocked(ex)
+	// Each speech the voice starts answers what was said before it; a turn
+	// begun while it spoke ends with the speech.
+	if started {
+		ex.starts = append(ex.starts, at)
+	}
+	if started || !ex.newTurn {
+		ex.turnEnd = at
+	}
 	ex.newTurn = true
 	if started {
 		ex.unspokenAnswer = false
@@ -1294,8 +1551,11 @@ func (s *Supervisor) disarmFollowUpLocked(ex *exchange) {
 	}
 }
 
-// driverFollowUpWaited ends ex when nobody spoke in its follow-up window.
+// driverFollowUpWaited ends ex when nobody spoke in its follow-up window. It
+// first takes in the speaker's queued speech events, so a speech that began
+// just before counts though its delivery waits.
 func (s *Supervisor) driverFollowUpWaited(ex *exchange, gen int) {
+	s.cfg.Speaker.FlushSpeech()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.ex != ex || ex.ended || ex.followUpGen != gen || s.voiceSpeaking || ex.toolCalls > 0 {
@@ -1316,6 +1576,11 @@ func (s *Supervisor) turnLocked(ex *exchange, t *Transcript, words string) {
 		ex.turnFinal = true
 		if ex.drives {
 			ex.times.lastTurnEnd = time.Now()
+			ex.turnSaidAt = ex.times.lastTurnEnd
+			if n := len(t.Words); n > 0 {
+				last := &t.Words[n-1]
+				ex.turnSaidAt = t.heardAt(last).Add(time.Duration(math.Round((last.End - last.Start) * float64(time.Second))))
+			}
 		}
 	} else {
 		ex.interim = words
@@ -1422,6 +1687,7 @@ func (s *Supervisor) handTurnLocked(ex *exchange) {
 	ex.x.FollowUpTurn = ex.followUpTurn
 	ex.followUpTurn = false
 	ex.answering = true
+	ex.answerFrom, ex.answerPending = time.Time{}, true
 	ex.turnAt = time.Now()
 	ex.times.lastTurnEnd = ex.turnAt
 	ex.firstOutDone, ex.factPending, ex.factDone, ex.factText = false, false, false, ""
@@ -1972,7 +2238,7 @@ func (s *Supervisor) endLocked(ex *exchange, cut bool, reason string) {
 // has sounded yet, and the answer sound. Speech begun after this waits for
 // the floor (WithFloor).
 func (s *Supervisor) takeFloorLocked(ex *exchange) {
-	s.ex = ex
+	s.ex, s.floorAt = ex, time.Now()
 	s.floor = make(chan struct{})
 	s.cfg.Speaker.Cancel(audio.InputVoice)
 	s.cutChimeLocked(true) // a notification sound gives way to the exchange, and sounds again after it
@@ -2003,7 +2269,9 @@ func (s *Supervisor) sendNotes() {
 }
 
 // onSpeech follows the voice input's speech, for barge-in and the own-speech
-// filter.
+// filter. A speech belongs to the exchange that held the floor when it
+// started, and its end to that exchange too: an exchange that takes the floor
+// cuts the speech playing, whose end then comes after.
 func (s *Supervisor) onSpeech(e audio.SpeechEvent) {
 	if e.Input != audio.InputVoice {
 		return
@@ -2011,23 +2279,31 @@ func (s *Supervisor) onSpeech(e audio.SpeechEvent) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.voiceSpeaking = e.Started
-	ex := s.ex
 	sessionID := ""
-	if ex != nil {
-		sessionID = ex.x.SessionID
+	if s.ex != nil {
+		sessionID = s.ex.x.SessionID
 	}
+	var ex *exchange
 	if e.Started {
+		// A speech that started before the exchange took the floor, whose
+		// start came only after, is not its voice's: the floor's cut ends it.
+		ex, s.speechEx = nil, nil
+		if s.ex != nil && !e.At.Before(s.floorAt) {
+			ex, s.speechEx = s.ex, s.ex
+		}
 		s.voiceStarted = e.At
 	} else {
+		ex, s.speechEx = s.speechEx, nil
 		s.voiceEnded = time.Now()
 		s.timing("speech_end", sessionID, e.At)
 	}
 	if ex == nil {
 		return
 	}
+	ex.playLocked(e)
 	s.touchLocked(ex)
 	if ex.drives {
-		s.driverSpeechLocked(ex, e.Started)
+		s.driverSpeechLocked(ex, e.Started, e.At)
 	}
 	if !e.Started {
 		return
@@ -2044,7 +2320,13 @@ func (s *Supervisor) onSpeech(e audio.SpeechEvent) {
 }
 
 // addOwnLocked keeps the words of text, which Wispr speaks, for the own-speech
-// filter.
+// filter. It forgets the words of lines said more than ownWordsKept before
+// now, or before the exchange holding the floor began, or its latest cut, or
+// its oldest span, whichever is earliest: a word said in a span is matched
+// against the lines said up to ownWordsKept before that span began
+// (ownSetLocked), a span can begin with its start event still queued, and an
+// echo of an old speech, however late its result, must still be found its
+// own.
 func (s *Supervisor) addOwnLocked(text string, now time.Time) {
 	words := map[string]bool{}
 	for _, w := range strings.Fields(text) {
@@ -2052,9 +2334,23 @@ func (s *Supervisor) addOwnLocked(text string, now time.Time) {
 			words[n] = true
 		}
 	}
+	base := now
+	if ex := s.ex; ex != nil {
+		from := ex.wakeAt
+		if ex.cutAt.After(from) {
+			from = ex.cutAt
+		}
+		if len(ex.played) > 0 && ex.played[0].from.Before(from) {
+			from = ex.played[0].from
+		}
+		if !from.IsZero() && from.Before(base) {
+			base = from
+		}
+	}
+	horizon := base.Add(-ownWordsKept)
 	kept := s.own[:0]
 	for _, o := range s.own {
-		if now.Sub(o.at) < ownWordsKept {
+		if o.at.After(horizon) {
 			kept = append(kept, o)
 		}
 	}
@@ -2062,15 +2358,30 @@ func (s *Supervisor) addOwnLocked(text string, now time.Time) {
 	s.own = kept
 }
 
-// ownSetLocked returns Wispr's recent words while its speech can still be
-// heard back, else nil.
-func (s *Supervisor) ownSetLocked(now time.Time) map[string]bool {
-	if !s.voiceSpeaking && now.Sub(s.voiceEnded) >= echoHold {
+// ownSetLocked returns the words of Wispr's lines that words said at said,
+// by when they were captured (Transcript.saidBy), could be heard back from:
+// if it was speaking, or had stopped less than echoHold before; else nil. A
+// word said in, or just after, a speech of the exchange holding the floor
+// matches the lines said from ownWordsKept before that speech began,
+// however long it played. A word said where no span is kept, as after a
+// cut, matches the lines said up to ownWordsKept before it. A line the
+// Supervisor read after the speech ended still matches: a voice's text can
+// be read late, after its audio played, so the line is kept by when it was
+// read, which can hide a talk-over by a later line with the same words, as
+// on main.
+func (s *Supervisor) ownSetLocked(said time.Time) map[string]bool {
+	if !s.voiceSpeaking && said.Sub(s.voiceEnded) >= echoHold {
 		return nil
+	}
+	from := said.Add(-ownWordsKept)
+	if s.ex != nil {
+		if sp, ok := s.ex.spanBefore(said); ok {
+			from = sp.from.Add(-ownWordsKept)
+		}
 	}
 	set := map[string]bool{}
 	for _, o := range s.own {
-		if now.Sub(o.at) < ownWordsKept {
+		if o.at.After(from) {
 			for w := range o.words {
 				set[w] = true
 			}
@@ -2079,10 +2390,10 @@ func (s *Supervisor) ownSetLocked(now time.Time) map[string]bool {
 	return set
 }
 
-// ownLocked reports whether words are Wispr's own, heard back: most of them
-// are words it is speaking, or just spoke.
-func (s *Supervisor) ownLocked(words []Word, now time.Time) bool {
-	set := s.ownSetLocked(now)
+// ownLocked reports whether words, said at said, are Wispr's own, heard
+// back: most of them are words it is speaking, or just spoke.
+func (s *Supervisor) ownLocked(words []Word, said time.Time) bool {
+	set := s.ownSetLocked(said)
 	if len(set) == 0 || len(words) == 0 {
 		return false
 	}
@@ -2095,19 +2406,104 @@ func (s *Supervisor) ownLocked(words []Word, now time.Time) bool {
 	return matched*10 >= 6*len(words)
 }
 
+// overWord is a word said over the voice, by its start and end on the
+// capture clock (Word.At).
+type overWord struct {
+	at, endAt time.Time
+}
+
 // bargesIn reports two words, not backchannels and not Wispr's own, that
-// start within bargeInGap of each other.
-func bargesIn(words []Word, own map[string]bool) bool {
+// start within bargeInGap of each other, each said while ex's voice played
+// since its latest cut (talksOver): two of t, or carried, the last such word
+// of the final result before t, then one of t said after it ended. Words are
+// spaced by when they were captured, not by their places in Deepgram's
+// stream, which a drop of the send queue or a new socket moves; a word with
+// no capture time pairs only within its result, by its socket start. A word
+// of t that starts before the carried word ended, or with it, is that word's
+// audio again, however short, and no second word. It also returns t's last
+// such timed word, read to the end of t also once a pair is found: a final
+// read while the voice is quiet carries it to the voice's next speech. The
+// words of the question the voice answers were said before it played,
+// whenever their result comes: Deepgram can send it seconds after the voice
+// began, and they talk over nothing.
+func bargesIn(t *Transcript, own map[string]bool, ex *exchange, carried *overWord) (bool, *overWord) {
+	if carried != nil && !ex.talksOver(carried.at) {
+		carried = nil
+	}
+	cut := false
 	var prev *Word
-	for i := range words {
-		n := normWord(words[i].Text)
-		if n == "" || backchannels[n] || own[n] {
+	var last *overWord
+	for i := range t.Words {
+		w := &t.Words[i]
+		n := normWord(w.Text)
+		at := t.heardAt(w)
+		if n == "" || backchannels[n] || own[n] || !ex.talksOver(at) {
 			continue
 		}
-		if prev != nil && words[i].Start-prev.Start <= bargeInGap {
+		if !w.At.IsZero() {
+			cur := &overWord{at: w.At, endAt: w.At.Add(time.Duration(math.Round((w.End - w.Start) * float64(time.Second))))}
+			if carried != nil && cur.at.After(carried.at) && !cur.at.Before(carried.endAt) && cur.at.Sub(carried.at) <= bargeInGapDuration {
+				cut = true
+			}
+			last = cur
+		}
+		if prev != nil && startedNear(prev, w) {
+			cut = true
+		}
+		prev = w
+	}
+	return cut, last
+}
+
+// bargeInGapDuration is bargeInGap as a duration.
+const bargeInGapDuration = time.Duration(bargeInGap * float64(time.Second))
+
+// startedNear reports whether b, a word of the same result after a, started
+// within bargeInGap of it: by when each was captured when both were timed,
+// else by their socket starts, on the one socket a result comes from.
+func startedNear(a, b *Word) bool {
+	if !a.At.IsZero() && !b.At.IsZero() {
+		d := b.At.Sub(a.At)
+		return d >= 0 && d <= bargeInGapDuration
+	}
+	return b.Start-a.Start <= bargeInGap
+}
+
+// heardAt is when w, a word of t or nil, was said: when its start was
+// captured, or, untimed, when its result arrived.
+func (t *Transcript) heardAt(w *Word) time.Time {
+	if w == nil || w.At.IsZero() {
+		return t.At
+	}
+	return w.At
+}
+
+// saidBy is when t's last word was said, by its capture time (heardAt), or
+// when t came with no words: the own-speech filter asks whether the voice
+// could be heard back then, not when the result arrived, which can be
+// seconds later.
+func (t *Transcript) saidBy() time.Time {
+	if len(t.Words) == 0 {
+		return t.At
+	}
+	var by time.Time
+	for i := range t.Words {
+		if at := t.heardAt(&t.Words[i]); at.After(by) {
+			by = at
+		}
+	}
+	return by
+}
+
+// saidAfter reports whether a word of t was said after since.
+func (t *Transcript) saidAfter(since time.Time) bool {
+	if len(t.Words) == 0 {
+		return t.At.After(since)
+	}
+	for i := range t.Words {
+		if t.heardAt(&t.Words[i]).After(since) {
 			return true
 		}
-		prev = &words[i]
 	}
 	return false
 }
@@ -2142,16 +2538,25 @@ func (s *Supervisor) recentLocked() []TurnText {
 
 // wakeStart is the start on the socket of the wake phrase's first word in t.
 func wakeStart(t *Transcript, m transcript.Match) float64 {
+	if w := wakeWord(t, m); w != nil {
+		return w.Start
+	}
+	return 0
+}
+
+// wakeWord is the wake phrase's first word in t, or t's first word when the
+// words do not line up with the text; nil when t has no words.
+func wakeWord(t *Transcript, m transcript.Match) *Word {
+	if len(t.Words) == 0 {
+		return nil
+	}
 	rest := len(strings.Fields(m.Rest))
 	phrase := len(strings.Fields(m.Phrase))
 	i := len(t.Words) - rest - phrase
 	if i < 0 || i >= len(t.Words) {
-		if len(t.Words) > 0 {
-			return t.Words[0].Start
-		}
-		return 0
+		i = 0
 	}
-	return t.Words[i].Start
+	return &t.Words[i]
 }
 
 // wakeLag is how far back from the end of t's audio the wake word started:
@@ -2164,20 +2569,52 @@ func wakeLag(t *Transcript, m transcript.Match) time.Duration {
 	return max(0, time.Duration(lag*float64(time.Second)))
 }
 
-// nameAt reports whether words hold the name at stream time at, within the
-// 0.3 s Deepgram's finals may move a word from where an interim put it.
+// nameAt reports whether words hold the name at stream time at, within
+// finalMoves.
 func (s *Supervisor) nameAt(words []Word, at float64) bool {
 	for _, w := range words {
-		if w.Start >= at-0.3 && w.Start <= at+0.3 && s.wake.IsName(w.Text) {
+		if moved(w.Start, at) && s.wake.IsName(w.Text) {
 			return true
 		}
 	}
 	return false
 }
 
+// sameStart reports whether two results' wake words are one word: Deepgram's
+// final may move it by up to finalMoves, and a later call starts later still.
 func sameStart(a, b float64) bool {
-	d := a - b
-	return d > -0.05 && d < 0.05
+	return moved(a, b)
+}
+
+// sameCall reports whether the wake word of m in t is the call ex answers:
+// by when each was captured, within finalMoves, when both were timed, else by
+// their starts on the socket (sameStart). A new socket restarts the socket's
+// stream, so a new call there can start where the call did.
+func (ex *exchange) sameCall(t *Transcript, m transcript.Match) bool {
+	if said := wakeSaidAt(t, m); !said.IsZero() && !ex.wakeSaid.IsZero() {
+		return (said.Sub(ex.wakeSaid)).Abs() <= finalMovesDuration
+	}
+	return sameStart(ex.wakeStart, wakeStart(t, m))
+}
+
+// finalMovesDuration is finalMoves as a duration, with the slack moved
+// allows.
+const finalMovesDuration = time.Duration(finalMoves*float64(time.Second)) + time.Microsecond
+
+// wakeSaidAt is when the wake phrase's first word in t was captured, or zero
+// when it was untimed.
+func wakeSaidAt(t *Transcript, m transcript.Match) time.Time {
+	if w := wakeWord(t, m); w != nil {
+		return w.At
+	}
+	return time.Time{}
+}
+
+// moved reports whether two stream times are at most finalMoves apart, edge
+// included: the times are binary fractions, so 10.3 - 10 is a little over
+// 0.3, and a nanosecond's slack keeps the edge.
+func moved(a, b float64) bool {
+	return math.Abs(a-b) <= finalMoves+1e-9
 }
 
 func normWord(w string) string {
@@ -2467,10 +2904,10 @@ func (t exchangeTools) Run(ctx context.Context, c ToolCall) (json.RawMessage, er
 	x.FollowUpTurn = t.ex.followUpTurn
 	s.mu.Unlock()
 	var (
-		said     []string  // the result's lines, in order
-		spoken   bool      // a line was spoken at once
-		lead     *leadLine // that line, while its Say may not have played
-		factSaid bool      // a line of the result holds a fact
+		said   []string  // the result's lines, in order
+		spoken bool      // a line was spoken at once
+		lead   *leadLine // that line, while its Say may not have played
+		factAt time.Time // when the result's first fact was said
 	)
 	err := s.cfg.Concierge.Answer(ctx, &x, args.Question, func(sayCtx context.Context, text string, mode SayMode) error {
 		t.ex.saidMu.Lock()
@@ -2490,24 +2927,28 @@ func (t exchangeTools) Run(ctx context.Context, c ToolCall) (json.RawMessage, er
 		t.ex.saidMu.Lock()
 		defer t.ex.saidMu.Unlock()
 		said = append(said, text)
-		factSaid = factSaid || mode == Fact
+		if mode == Fact && factAt.IsZero() {
+			factAt = time.Now()
+		}
 		return nil
 	})
 	t.ex.saidMu.Lock()
-	lines, anySaid, l, fact := append([]string(nil), said...), spoken || len(said) > 0, lead, factSaid
+	lines, anySaid, l, firstFact := append([]string(nil), said...), spoken || len(said) > 0, lead, factAt
 	t.ex.saidMu.Unlock()
 	if l != nil && !t.played(l) {
 		// Main's rule on gap H: R5's line naming the issue a search chose
 		// (Lead) always leads; a routing line that never played is dropped
-		// when the answer is a fact ready within leadLineDropWithin of t0,
-		// the end of the asker's turn, and else leads the answer.
+		// when the answer's first fact was ready within leadLineDropWithin of
+		// t0, the end of the asker's turn as the asker said it, not as its
+		// result came, and else leads the answer. The fact's time counts, not
+		// the answer's return, which can wait on more, as an agent's send.
 		s.mu.Lock()
-		t0 := t.ex.times.lastTurnEnd
+		t0 := t.ex.turnSaidAt
 		s.mu.Unlock()
 		if t0.IsZero() {
 			t0 = l.called
 		}
-		if !l.named && err == nil && fact && time.Since(t0) <= leadLineDropWithin {
+		if !l.named && err == nil && !firstFact.IsZero() && firstFact.Sub(t0) <= leadLineDropWithin {
 			s.logf("voice: the routing line had not played, and the fact came in time: dropped")
 		} else {
 			s.logf("voice: the %s line had not played, so it leads the answer", l.mode)
@@ -2579,24 +3020,46 @@ func (t exchangeTools) speakLead(text string, mode SayMode) *leadLine {
 	return l
 }
 
-// played reports whether the line was heard: its Say returned with no
-// error, or the voice began to speak after it was called, within
-// leadLineWait. A Say still waiting with no speech then, as Deepgram's Voice
-// Agent holds a line behind the model's muted reply, is cancelled: the line
+// played reports whether the line was heard. A routing line was heard once
+// its Say returned with no error, or the voice began to speak after it was
+// called, also when a barge-in or a stop then cut it: said again, it would
+// lead the answer with words the room heard. R5's line naming the issue a
+// search chose was heard once its Say returned with no error, and, from the
+// line's call until the voice was quiet once the answer's fact was ready, the
+// Supervisor cut none of the exchange's speech (heard): a cut can end it
+// before the issue's name, which the room must hear. Every Cancel of the
+// voice input is the Supervisor's own (cutDriverLocked, and endLocked and
+// takeFloorLocked, which end the exchange), so it sees every cut without the
+// speaker's help. Three limits are accepted, and the answer still states the
+// facts: a voice that drops the line's end on its own, with no cut, counts as
+// having said it; audio the speaker or its device loses by itself, as a
+// stream that fails, counts as heard; and any cut in that time counts, also
+// one of a later speech of the exchange, which makes the line lead the
+// answer again: the room hears the issue's name twice. A line whose speech
+// did not begin within leadLineWait, with the voice silent, as Deepgram's
+// Voice Agent holds a line behind the model's muted reply, is cancelled, and
 // goes with the answer instead.
 func (t exchangeTools) played(l *leadLine) bool {
 	deadline := l.called.Add(leadLineWait) // a line held for long is cancelled at once
 	for {
 		select {
 		case <-l.done:
-			return l.ok
+			return t.heard(l)
 		default:
 		}
-		t.s.mu.Lock()
-		began := !t.s.voiceStarted.Before(l.called)
-		t.s.mu.Unlock()
-		if began {
+		began, speaking := t.speech(l)
+		if began && !l.named {
 			return true
+		}
+		if l.named && (began || speaking) {
+			// It plays, maybe as more of a speech already under way.
+			select {
+			case <-l.done:
+				return t.heard(l)
+			case <-time.After(leadLineHold):
+				l.cancel()
+				return false
+			}
 		}
 		if time.Now().After(deadline) {
 			break
@@ -2606,10 +3069,54 @@ func (t exchangeTools) played(l *leadLine) bool {
 	l.cancel()
 	select {
 	case <-l.done:
-		return l.ok
+		return t.heard(l)
 	case <-time.After(leadLineWait):
 		return false
 	}
+}
+
+// heard reports whether l, whose Say returned, was heard (played): a
+// routing line once its Say succeeded or the voice began to speak after it
+// was called; R5's line once its Say succeeded and no cut of the
+// Supervisor's came after its call by the time the voice is quiet, up to
+// leadLineHold. Each look first takes in the speaker's queued speech events
+// (speech), so a start or an end the speaker has had counts though its
+// delivery waits.
+func (t exchangeTools) heard(l *leadLine) bool {
+	if !l.named {
+		began, _ := t.speech(l)
+		return l.ok || began
+	}
+	if !l.ok {
+		return false
+	}
+	for deadline := time.Now().Add(leadLineHold); ; time.Sleep(10 * time.Millisecond) {
+		_, speaking := t.speech(l)
+		t.s.mu.Lock()
+		cut := t.ex.cutAt.After(l.called)
+		t.s.mu.Unlock()
+		switch {
+		case cut:
+			return false
+		case !speaking:
+			return true
+		case time.Now().After(deadline):
+			return false
+		}
+	}
+}
+
+// leadLineHold bounds how long played waits for R5's line, once it plays,
+// to end: a line takes a few seconds.
+const leadLineHold = 10 * time.Second
+
+// speech reports whether the voice began to speak after l was called, and
+// whether it speaks now, once the speaker's queued speech events are in.
+func (t exchangeTools) speech(l *leadLine) (began, speaking bool) {
+	t.s.cfg.Speaker.FlushSpeech()
+	t.s.mu.Lock()
+	defer t.s.mu.Unlock()
+	return !t.s.voiceStarted.Before(l.called), t.s.voiceSpeaking
 }
 
 // speak says text through the exchange's session at once, in mode.
