@@ -350,8 +350,10 @@ func restoreRawSessionErasures(store SessionStore, reservations []rawEraseReserv
 // finishRawErasing zeroes hidden raw files after their session rows are gone.
 // It also reaches a persisted hidden name that a retry reuses but Begin cannot
 // return because its original name is already gone. Once ctx ends (the app's
-// stop) it starts no other erase: what is left stays reserved, and the start's
-// recovery erases it.
+// stop) it starts no other erase. A file it leaves under its hidden name is
+// zeroed at the next start by the erase of leftovers, which skips only
+// reserved names (erase.LeftoversExcept), and the delete removed its
+// reservation with the session's row.
 var finishRawErasing = func(ctx context.Context, store SessionStore, reservations []rawEraseReservation) {
 	for _, reservation := range reservations {
 		if ctx.Err() != nil {
