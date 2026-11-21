@@ -327,10 +327,8 @@ func (h *Hub) BroadcastVoiceEvent(kind, sessionID string) {
 		h.logger.Warn("dropped an unknown voice event", "operation", "broadcast_voice_event", "event_type", kind)
 		return
 	}
-	// now keeps its monotonic reading for monoclock; UTC would strip it.
-	now := time.Now()
-	mono, _ := monoclock.Nanos(now)
-	h.broadcastEvent(VoiceEvent{Event: newEvent(kind, now.UTC()), SessionID: sessionID, AtMonoNs: mono})
+	now := monoclock.Now()
+	h.broadcastEvent(VoiceEvent{Event: newEvent(kind, now.Wall.UTC()), SessionID: sessionID, AtMonoNs: now.Mono})
 }
 
 // storedEventTypes is the set of event types persisted to the event queue.

@@ -1,7 +1,10 @@
-// Package monoclock gives a time on the system's CLOCK_MONOTONIC, the clock
-// the acceptance driver (deploy/pi/accept-voice.sh) times its rig recordings
-// on. A step of the wall clock (settimeofday, an NTP step) moves neither, so
-// the driver can compare the voice's times with its own across one.
+// Package monoclock reads CLOCK_MONOTONIC, the clock the acceptance driver
+// (deploy/pi/accept-voice.sh) times its rig recordings on. A step of the wall
+// clock (settimeofday, an NTP step) does not move it, so the driver can compare
+// the voice's times with its own across one. Each event the driver compares
+// reads it where the event's time is taken, right beside its time.Now, and
+// carries both readings: nothing converts a time.Time to this clock, so no
+// conversion can be off.
 package monoclock
 
 import (
@@ -10,34 +13,25 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// base and baseNs are one instant on Go's clock and on CLOCK_MONOTONIC: base
-// is the middle of two reads of time.Now around the read of baseNs.
-var (
-	base   time.Time
-	baseNs int64
-	ok     bool
-)
-
-func init() {
-	var ts unix.Timespec
-	before := time.Now()
-	if unix.ClockGettime(unix.CLOCK_MONOTONIC, &ts) != nil {
-		return
-	}
-	after := time.Now()
-	base, baseNs, ok = before.Add(after.Sub(before)/2), ts.Nano(), true
+// Stamp is one instant read on two clocks: Wall from time.Now, for the journal
+// and for people, and Mono, CLOCK_MONOTONIC in nanoseconds, read right after
+// it, the instant the driver compares; 0 when that clock could not be read.
+type Stamp struct {
+	Wall time.Time
+	Mono int64
 }
 
-// Nanos returns t on CLOCK_MONOTONIC, in nanoseconds, and whether it could:
-// t must carry Go's monotonic reading, which time.Now gives and Add and Sub
-// keep. A time built from parts, parsed, or passed through UTC, Local, In or
-// Round(0) has none, and only its wall clock, which a step moves, could place
-// it.
-func Nanos(t time.Time) (int64, bool) {
-	// Round(0) strips the monotonic reading, so it changes a time that has one;
-	// Equal would ignore that reading.
-	if !ok || t == t.Round(0) { //nolint:staticcheck // == compares the monotonic reading.
-		return 0, false
+// Now reads both clocks.
+func Now() Stamp {
+	wall := time.Now()
+	return Stamp{Wall: wall, Mono: Read()}
+}
+
+// Read returns CLOCK_MONOTONIC in nanoseconds, or 0 when it cannot be read.
+func Read() int64 {
+	var ts unix.Timespec
+	if unix.ClockGettime(unix.CLOCK_MONOTONIC, &ts) != nil {
+		return 0
 	}
-	return baseNs + int64(t.Sub(base)), true
+	return ts.Nano()
 }

@@ -1216,7 +1216,7 @@ func TestAPartialTakeBackCountsTheDelayedSampleCentres(t *testing.T) {
 			frame, sum := make([]int16, 480), make([]float32, 480)
 			for range 2 {
 				o.mixFrame(frame, sum, 48000, 4800, time.Now())
-				o.wrote(o.mixed, time.Now())
+				o.wrote(o.mixed, time.Now(), 0)
 			}
 			if got := p.Played(); got != 10*time.Millisecond {
 				t.Fatalf("control: before the take-back the playback played %v", got)

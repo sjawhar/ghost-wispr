@@ -39,6 +39,7 @@ import (
 	"github.com/sjawhar/ghost-wispr/internal/indicator"
 	"github.com/sjawhar/ghost-wispr/internal/llm"
 	"github.com/sjawhar/ghost-wispr/internal/logging"
+	"github.com/sjawhar/ghost-wispr/internal/monoclock"
 	"github.com/sjawhar/ghost-wispr/internal/providererr"
 	"github.com/sjawhar/ghost-wispr/internal/server"
 	"github.com/sjawhar/ghost-wispr/internal/session"
@@ -521,7 +522,7 @@ func (c transcriptCallback) admit(kind string, streamSeconds float64) bool {
 // voice.Supervisor.
 type voiceListener interface {
 	OnTranscript(t *voice.Transcript)
-	OnUtteranceEnd(closings int, gateOpen bool, at time.Time)
+	OnUtteranceEnd(closings int, gateOpen bool, at monoclock.Stamp)
 }
 
 // keptMessager is a session manager that takes each result with the stream
@@ -548,7 +549,7 @@ func (c transcriptCallback) Message(mr *api.MessageResponse) error {
 	if !c.admit("result", mr.Start) {
 		return nil
 	}
-	entered := time.Now()
+	entered := monoclock.Now()
 	var closings int
 	open := true
 	if c.stamp != nil {
@@ -579,11 +580,11 @@ func (c transcriptCallback) Message(mr *api.MessageResponse) error {
 	return err
 }
 
-// voiceTranscript is mr, which arrived at at, as the voice reads it, or nil
-// when it holds no text. heardAt, when set, times each word by when its start
-// was captured, which the voice's barge-in reads: a result can come seconds
-// after its words.
-func voiceTranscript(mr *api.MessageResponse, at time.Time, stamp func() (int, bool), heardAt func(time.Duration) (time.Time, bool)) *voice.Transcript {
+// voiceTranscript is mr, which arrived at at (on both clocks), as the voice
+// reads it, or nil when it holds no text. heardAt, when set, times each word
+// by when its start was captured, which the voice's barge-in reads: a result
+// can come seconds after its words.
+func voiceTranscript(mr *api.MessageResponse, at monoclock.Stamp, stamp func() (int, bool), heardAt func(time.Duration) (time.Time, bool)) *voice.Transcript {
 	if len(mr.Channel.Alternatives) == 0 || strings.TrimSpace(mr.Channel.Alternatives[0].Transcript) == "" {
 		return nil
 	}
@@ -594,7 +595,8 @@ func voiceTranscript(mr *api.MessageResponse, at time.Time, stamp func() (int, b
 		IsFinal:      mr.IsFinal,
 		SpeechFinal:  mr.SpeechFinal,
 		FromFinalize: mr.FromFinalize,
-		At:           at,
+		At:           at.Wall,
+		Mono:         at.Mono,
 	}
 	if stamp != nil {
 		t.Closings, t.GateOpen = stamp()
@@ -643,7 +645,7 @@ func (c transcriptCallback) UtteranceEnd(ur *api.UtteranceEndResponse) error {
 	if !c.admit("utterance_end", ur.LastWordEnd) {
 		return nil
 	}
-	entered := time.Now()
+	entered := monoclock.Now()
 	var closings int
 	open := true
 	if c.stamp != nil {

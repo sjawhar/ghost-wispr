@@ -16,48 +16,30 @@ func clockMonotonic(t *testing.T) int64 {
 	return ts.Nano()
 }
 
-// TestNanosIsTheMonotonicClock fails if a time read between two reads of
-// CLOCK_MONOTONIC is given outside them, so that the acceptance driver, which
-// reads CLOCK_MONOTONIC itself, could not compare its times with the voice's.
-func TestNanosIsTheMonotonicClock(t *testing.T) {
-	for range 100 {
+// TestNowReadsTheMonotonicClockAtTheCall fails if a Stamp's Mono is not
+// CLOCK_MONOTONIC read during the call to Now: it must lie between a read of
+// that clock before the call and one after, with no tolerance, as the
+// acceptance driver compares it with its own reads. A conversion from Go's
+// clock calibrated once at startup lands outside the bracket by as long as
+// that calibration was held up.
+func TestNowReadsTheMonotonicClockAtTheCall(t *testing.T) {
+	for range 1000 {
 		before := clockMonotonic(t)
-		now := time.Now()
+		got := Now()
 		after := clockMonotonic(t)
-		got, ok := Nanos(now)
-		if !ok {
-			t.Fatal("Nanos refused time.Now()")
-		}
-		// The base is read between two reads of the wall clock: 1 us covers it.
-		if got < before-1000 || got > after+1000 {
-			t.Fatalf("Nanos(time.Now()) = %d, outside [%d, %d]", got, before, after)
+		if got.Mono < before || got.Mono > after {
+			t.Fatalf("Now().Mono = %d, outside [%d, %d]", got.Mono, before, after)
 		}
 	}
 }
 
-// TestNanosFollowsGosMonotonicReading fails if a time later by d on Go's
-// monotonic reading is not later by d on CLOCK_MONOTONIC: Nanos must not read
-// the wall clock, which a step moves.
-func TestNanosFollowsGosMonotonicReading(t *testing.T) {
-	now := time.Now()
-	a, okA := Nanos(now)
-	b, okB := Nanos(now.Add(1500 * time.Millisecond))
-	if !okA || !okB || b-a != int64(1500*time.Millisecond) {
-		t.Fatalf("Nanos(now) = %d, %v; Nanos(now + 1.5 s) = %d, %v", a, okA, b, okB)
-	}
-}
-
-// TestNanosRefusesATimeWithNoMonotonicReading fails if a time with no
-// monotonic reading (built from parts, parsed, or stripped by UTC or Round) is
-// given a CLOCK_MONOTONIC time: only its wall clock could place it.
-func TestNanosRefusesATimeWithNoMonotonicReading(t *testing.T) {
-	for name, at := range map[string]time.Time{
-		"built":    time.Date(2026, 11, 21, 9, 0, 0, 0, time.UTC),
-		"UTC":      time.Now().UTC(),
-		"Round(0)": time.Now().Round(0),
-	} {
-		if got, ok := Nanos(at); ok {
-			t.Errorf("%s: Nanos = %d, true; want false", name, got)
-		}
+// TestNowReadsTheWallClockBesideIt fails if a Stamp's Wall is not time.Now
+// read during the same call: the journal selects lines by it.
+func TestNowReadsTheWallClockBesideIt(t *testing.T) {
+	before := time.Now()
+	got := Now()
+	after := time.Now()
+	if got.Wall.Before(before) || got.Wall.After(after) {
+		t.Fatalf("Now().Wall = %v, outside [%v, %v]", got.Wall, before, after)
 	}
 }

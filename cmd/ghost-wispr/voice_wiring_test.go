@@ -13,6 +13,7 @@ import (
 
 	"github.com/sjawhar/ghost-wispr/internal/audio"
 	"github.com/sjawhar/ghost-wispr/internal/config"
+	"github.com/sjawhar/ghost-wispr/internal/monoclock"
 	"github.com/sjawhar/ghost-wispr/internal/server"
 	"github.com/sjawhar/ghost-wispr/internal/session"
 	"github.com/sjawhar/ghost-wispr/internal/voice"
@@ -61,11 +62,11 @@ func (h *heardTranscripts) OnTranscript(t *voice.Transcript) {
 	h.got = append(h.got, *t)
 }
 
-func (h *heardTranscripts) OnUtteranceEnd(closings int, open bool, at time.Time) {
+func (h *heardTranscripts) OnUtteranceEnd(closings int, open bool, at monoclock.Stamp) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.ends = append(h.ends, open)
-	h.endAts = append(h.endAts, at)
+	h.endAts = append(h.endAts, at.Wall)
 }
 
 // slowManager is a session manager whose work on each result and each

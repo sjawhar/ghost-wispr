@@ -16,6 +16,8 @@ import (
 	"testing"
 	"time"
 	"weak"
+
+	"github.com/sjawhar/ghost-wispr/internal/monoclock"
 )
 
 // playedFrame is one frame a fakeStream played, with the time its Write began.
@@ -1032,9 +1034,11 @@ func (s *replayStream) Write(frame []int16) error {
 // TestASpeechWhoseLastAudioIsReplayedEndsAfterTheReplay fails if a speech
 // whose last audio a Cancel of another input took back from the device, and
 // the stream then took again, is stamped as ending before that replay's
-// write returned (Sol's review of #133 at b6eef5c).
+// write returned (Sol's review of #133 at b6eef5c), or if its end's AtMono is
+// not CLOCK_MONOTONIC read with that end's At: the replay stamps both.
 func TestASpeechWhoseLastAudioIsReplayedEndsAfterTheReplay(t *testing.T) {
 	const rate = 48000
+	wall0, mono0 := time.Now(), monoclock.Read()
 	stream := &replayStream{fakeStream: newFakeStream(rate), back: rate / 20, release: make(chan struct{})}
 	out := NewOutput(OutputConfig{Open: func(string) (PlaybackStream, int, error) { return stream, rate, nil }})
 	t.Cleanup(func() { _ = out.Close() })
@@ -1084,6 +1088,10 @@ func TestASpeechWhoseLastAudioIsReplayedEndsAfterTheReplay(t *testing.T) {
 			stream.mu.Unlock()
 			if replayed.IsZero() || e.At.Before(replayed) {
 				t.Fatalf("the voice ended at %v, %v before the replay of its last audio was taken at %v", e.At.Format(time.StampMicro), replayed.Sub(e.At), replayed.Format(time.StampMicro))
+			}
+			wall, mono := e.At.Sub(wall0), time.Duration(e.AtMono-mono0)
+			if d := wall - mono; d > time.Millisecond || d < -time.Millisecond {
+				t.Fatalf("the voice's end came %v after the test began on the wall clock, %v on CLOCK_MONOTONIC: its AtMono was not read with its At", wall, mono)
 			}
 			return
 		case <-time.After(3 * time.Second):
@@ -1232,6 +1240,71 @@ func TestAReplayEndsAtTheVoicesLastReplayedAudio(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestOutputSpeechEventsCarryTheMonotonicClockReadWithAt fails if a speech
+// event's AtMono is not CLOCK_MONOTONIC read with its At: it must lie between
+// a read of that clock before the audio was queued and one after the event
+// arrived, and the time between two events must be the same on both clocks,
+// for a start, a natural end and a cancelled end. The voice's timing log
+// carries AtMono to the acceptance driver, which compares it with its own
+// reads of CLOCK_MONOTONIC.
+func TestOutputSpeechEventsCarryTheMonotonicClockReadWithAt(t *testing.T) {
+	stream := newFakeStream(48000)
+	out := newTestOutput(t, OutputConfig{}, &fakeOpener{streams: []*fakeStream{stream}})
+	events := make(chan SpeechEvent, 16)
+	remove := out.OnSpeech(func(e SpeechEvent) { events <- e })
+	defer remove()
+	next := func(what string) (SpeechEvent, int64) {
+		t.Helper()
+		select {
+		case e := <-events:
+			return e, monoclock.Read()
+		case <-time.After(2 * time.Second):
+			t.Fatalf("no event for %s", what)
+			return SpeechEvent{}, 0
+		}
+	}
+	ctx := testContext(t)
+	check := func(what string, e SpeechEvent, before, after int64, since SpeechEvent) {
+		t.Helper()
+		if e.AtMono < before || e.AtMono > after {
+			t.Fatalf("%s: AtMono %d, outside the reads %d and %d around it", what, e.AtMono, before, after)
+		}
+		if since.AtMono == 0 {
+			return
+		}
+		// Each event's two readings are one instant: the gap between two
+		// events agrees on both clocks, give or take the reads between them.
+		gap, monoGap := e.At.Sub(since.At), time.Duration(e.AtMono-since.AtMono)
+		if d := gap - monoGap; d > time.Millisecond || d < -time.Millisecond {
+			t.Fatalf("%s: %v since the last event on the wall clock, %v on CLOCK_MONOTONIC", what, gap, monoGap)
+		}
+	}
+
+	before := monoclock.Read()
+	pb := out.Begin(InputChime)
+	if err := pb.WriteAll(ctx, constant(48000, 100*time.Millisecond, 1000), mono48k); err != nil {
+		t.Fatal(err)
+	}
+	started, after := next("the chime's start")
+	check("the chime's start", started, before, after, SpeechEvent{})
+	ended, after := next("the chime's end")
+	check("the chime's end", ended, started.AtMono, after, started)
+
+	before = monoclock.Read()
+	pb = out.Begin(InputVoice)
+	go func() { _ = pb.WriteAll(ctx, constant(48000, 2*time.Second, 1000), mono48k) }()
+	voiceStart, after := next("the voice's start")
+	check("the voice's start", voiceStart, before, after, ended)
+	time.Sleep(50 * time.Millisecond)
+	before = monoclock.Read()
+	out.Cancel(InputVoice)
+	cancelled, after := next("the voice's cancelled end")
+	if !cancelled.Cancelled {
+		t.Fatalf("event after Cancel = %+v, want the voice's end, cancelled", cancelled)
+	}
+	check("the voice's cancelled end", cancelled, before, after, voiceStart)
 }
 
 // TestOutputOpensTheConfiguredDevice fails if the Output opens any device but
