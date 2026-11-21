@@ -403,23 +403,27 @@ func TestReplayWindow(t *testing.T) {
 }
 
 // TestGoAheadOrder fails if "Wispr, go ahead" does not speak the oldest held
-// answer, or "Wispr, go ahead, <key>" does not pick the answer of that key.
+// answer, or "Wispr, go ahead, <key>" does not pick the answer of that key,
+// also a key said as "in for forty five hundred and two", which main picked
+// (Sol's review of #133 at 2949b83: the oldest answer spoke instead).
 func TestGoAheadOrder(t *testing.T) {
 	c := newFakeConcierge()
 	r := newRig(t, c)
-	for i, key := range []string{"ABC-1", "ABC-2", "ABC-3"} {
+	for i, key := range []string{"ABC-1", "ABC-2", "ABC-3", "INFRA-4502"} {
 		c.answers <- PendingAnswer{TaskID: fmt.Sprintf("t%d", i+1), SessionID: "sess-1", IssueKey: key, Text: "About " + key + "."}
 		r.waitEvent("voice_answer_ready:sess-1")
 	}
-	r.heard("Wispr, go ahead, ABC three.", true, true)
-	if got := waitSaid(t, r.waitSession()); got != "About ABC-3." {
-		t.Fatalf("said %q, want the answer of the key named", got)
-	}
-	r.speaker.finish(audio.InputVoice)
-	eventually(t, "the floor free", func() bool { r.s.mu.Lock(); defer r.s.mu.Unlock(); return r.s.ex == nil })
-	r.heard("Wispr, go ahead.", true, true)
-	if got := waitSaid(t, r.waitSession()); got != "About ABC-1." {
-		t.Fatalf("said %q, want the oldest", got)
+	for _, step := range []struct{ said, want string }{
+		{"Wispr, go ahead, ABC three.", "About ABC-3."},
+		{"Wispr, go ahead, in for forty five hundred and two.", "About INFRA-4502."},
+		{"Wispr, go ahead.", "About ABC-1."},
+	} {
+		r.heard(step.said, true, true)
+		if got := waitSaid(t, r.waitSession()); got != step.want {
+			t.Fatalf("%q said %q, want %q", step.said, got, step.want)
+		}
+		r.speaker.finish(audio.InputVoice)
+		eventually(t, "the floor free", func() bool { r.s.mu.Lock(); defer r.s.mu.Unlock(); return r.s.ex == nil })
 	}
 }
 

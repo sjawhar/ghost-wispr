@@ -478,10 +478,13 @@ func TestIssueKeyForms(t *testing.T) {
 		// As Deepgram wrote Aura's "infra 4592" in end-to-end run 8c, and as
 		// people say it.
 		"ask the agent on in for forty five hundred and two": {"INFRA-4502"},
-		"infra forty-five ninety-two":                        {"INFRA-4592"},
-		"infra four five nine two":                           {"INFRA-4592"},
-		"in for forty five ninety two please":                {"INFRA-4592"},
-		"I am in for a minute":                               nil,
+		// A hundred after "in for" reads as main read it, after any word
+		// (Sol's review of #133 at 2949b83).
+		"go ahead, in for forty five hundred and two": {"INFRA-4502"},
+		"infra forty-five ninety-two":                 {"INFRA-4592"},
+		"infra four five nine two":                    {"INFRA-4592"},
+		"in for forty five ninety two please":         {"INFRA-4592"},
+		"I am in for a minute":                        nil,
 		// End-to-end run 8e: smart formatting writes "4,592".
 		"ask the agent on in For 4,592 when": {"INFRA-4592"},
 		// The office run of 2026-11-21: smart formatting wrote "ten
