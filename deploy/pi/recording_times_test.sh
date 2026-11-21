@@ -98,6 +98,76 @@ for line in failures:
 sys.exit(1 if failures else 0)
 EOF
 
+# ---- mono_py record: the last anchor ----
+
+# The sampler writes a last anchor, the file's whole size, once arecord has ended, so that a sound
+# that runs to the file's end has a late bound. The driver sends it SIGTERM once arecord has ended.
+# A sampler that has already seen arecord end and left its loop may get that SIGTERM while it reads
+# the size for its last anchor: here os.stat sends it there on purpose, and the last anchor must
+# still be written, as it is with no SIGTERM at all.
+python3 - "$work_dir/mono.py" "$work_dir" <<'EOF' || fail "mono_py record lost its last anchor (above)"
+import contextlib, os, signal, subprocess, sys, time
+src, base = sys.argv[1], sys.argv[2]
+writer_code = (
+    "import sys, time\n"
+    "f = open(sys.argv[1], 'wb'); f.write(bytes(44)); f.flush()\n"
+    "for _ in range(60): f.write(b'\\1\\0' * 480); f.flush(); time.sleep(0.01)\n"
+    "f.write(b'\\1\\0' * 4800); f.flush()\n")
+failures = []
+for late_term in (False, True):
+    work = os.path.join(base, "record-late" if late_term else "record")
+    os.mkdir(work)
+    ns = {"__name__": "mono_py"}
+    argv, sys.argv = sys.argv, ["mono_py", "none"]
+    try:
+        exec(open(src).read(), ns)
+    except SystemExit:
+        pass
+    sys.argv = argv
+    path, anchors, pidfile = (os.path.join(work, name) for name in ("r.wav", "anchors", "pid"))
+    writer = subprocess.Popen([sys.executable, "-c", writer_code, path])
+    with open(pidfile, "w") as f:
+        f.write(str(writer.pid))
+    real_alive, real_stat = ns["alive"], os.stat
+    state = {"ended": False, "sent": False}
+
+    def alive(pid):
+        up = real_alive(pid)
+        state["ended"] = state["ended"] or not up
+        return up
+
+    def stat(p, *a, **k):
+        if late_term and state["ended"] and not state["sent"]:
+            state["sent"] = True
+            os.kill(os.getpid(), signal.SIGTERM)
+            time.sleep(0.05)
+        return real_stat(p, *a, **k)
+
+    ns["alive"], os.stat = alive, stat
+    raised = None
+    try:
+        with open(os.devnull, "w") as quiet, contextlib.redirect_stdout(quiet):
+            ns["record"](path, anchors, pidfile, work)  # no capture substream under WORK
+    except BaseException as error:  # the sampler must not raise out of record
+        raised = type(error).__name__
+    finally:
+        os.stat = real_stat
+        signal.signal(signal.SIGTERM, signal.SIG_DFL)
+    writer.wait()
+    what = "with the SIGTERM in the last read" if late_term else "with no SIGTERM"
+    if late_term and not state["sent"]:
+        failures.append("the probe sent no SIGTERM in the sampler's last read")
+    if raised:
+        failures.append("%s, record raised %s" % (what, raised))
+    last = open(anchors).read().splitlines()[-1].split()
+    size = real_stat(path).st_size
+    if len(last) != 2 or int(last[1]) != size:
+        failures.append("%s, the last anchor is %s, want the file's whole size, %d bytes, read once arecord ended" % (what, " ".join(last), size))
+for line in failures:
+    print(line)
+sys.exit(1 if failures else 0)
+EOF
+
 # ---- recording-times.awk ----
 
 # times ANCHORS SOUNDS STARTED_US [AWK_ARGS...]: the program's output for a 24 kHz mono recording.

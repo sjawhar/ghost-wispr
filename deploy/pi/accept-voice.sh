@@ -623,6 +623,9 @@ def record(path, anchors, pidfile, root):
             if size is not None and size > HEADER:
                 anchored(seen, size, before)
                 report()
+        # arecord ended before the SIGTERM came: the SIGTERM, still on its way, must not stop the
+        # last anchor, which is what bounds a sound that runs to the file's end.
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
     except Stop:
         pass
     # A discontinuity that the last read found, if SIGTERM came before it was printed.
