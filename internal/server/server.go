@@ -184,7 +184,7 @@ type ControlHooks struct {
 	// which then clears their reservations. Once the stop has run it starts
 	// nothing, and the start's recovery finishes the erase. nil starts the
 	// work on a goroutine of its own, which nothing waits for (tests).
-	GoStoreWork             func(work func(ctx context.Context))
+	GoStoreWork func(work func(ctx context.Context))
 	// AdmitRequest runs each request but the websocket's (serve) as work the
 	// app's stop cuts off and waits for (session.Manager.Run), since a
 	// handler may write the store, and refuses it once the stop has run: the
@@ -192,7 +192,7 @@ type ControlHooks struct {
 	// handler, so the HTTP server's shutdown alone does not keep a handler
 	// from writing the store after it closed. nil serves each request as it
 	// comes (tests).
-	AdmitRequest            func(ctx context.Context, serve func(ctx context.Context)) error
+	AdmitRequest func(ctx context.Context, serve func(ctx context.Context)) error
 	// RouteHandler, when set, is given each route as it registers, with its
 	// handler, and its result serves the route: a test lists the routes the
 	// server registers, and which of them it reached. nil serves each route
