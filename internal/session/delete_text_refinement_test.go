@@ -175,7 +175,7 @@ func deletedTextSessionWithModel(t *testing.T, id, audio, model string) (*storag
 			t.Fatal(err)
 		}
 	}
-	if err := store.EndSession(id, started.Add(time.Minute), recording); err != nil {
+	if err := store.EndSession(id, started.Add(time.Minute), recording, ""); err != nil {
 		t.Fatal(err)
 	}
 	segments, err := store.GetSegments(id)
@@ -314,7 +314,7 @@ func TestRefinementOfAMergedSessionDropsDeletedTextInItsRecordings(t *testing.T)
 				t.Fatal(err)
 			}
 		}
-		if err := store.EndSession(id, started.Add(time.Minute), recordings[id]); err != nil {
+		if err := store.EndSession(id, started.Add(time.Minute), recordings[id], ""); err != nil {
 			t.Fatal(err)
 		}
 	}

@@ -221,7 +221,7 @@ func TestVoiceTasksOnTheUnitsStoreGoWithTheSessionDelete(t *testing.T) {
 		if _, err := store.AnswerVoiceTask("evt-"+id, "Answer in "+id+": <b>x</b>"); err != nil {
 			t.Fatal(err)
 		}
-		if err := store.EndSession(id, at.Add(20*time.Minute), ""); err != nil {
+		if err := store.EndSession(id, at.Add(20*time.Minute), "", ""); err != nil {
 			t.Fatal(err)
 		}
 	}

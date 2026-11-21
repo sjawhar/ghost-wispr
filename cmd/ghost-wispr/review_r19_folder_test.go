@@ -31,7 +31,7 @@ func TestReviewR19FolderTwoLevelsUp(t *testing.T) {
 		if err := store.CreateSession(id, start.Add(time.Duration(i)*time.Hour)); err != nil {
 			t.Fatal(err)
 		}
-		if err := store.EndSession(id, start.Add(time.Duration(i)*time.Hour+time.Minute), path(id)); err != nil {
+		if err := store.EndSession(id, start.Add(time.Duration(i)*time.Hour+time.Minute), path(id), ""); err != nil {
 			t.Fatal(err)
 		}
 	}

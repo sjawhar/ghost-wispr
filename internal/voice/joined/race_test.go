@@ -74,7 +74,7 @@ func TestAJoinOrSegmentInFlightCannotReviveAnEndedMeeting(t *testing.T) {
 	}()
 	<-segmentEntered
 
-	if err := store.EndSession("sess-1", r.clock.Now(), ""); err != nil {
+	if err := store.EndSession("sess-1", r.clock.Now(), "", ""); err != nil {
 		t.Fatal(err)
 	}
 	r.setSession("")

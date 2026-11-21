@@ -30,7 +30,7 @@ func TestRetryRestoresAnUnrefinedRemovedSourceFromItsOwnFolder(t *testing.T) {
 	if err := store.CreateSession(sID, started); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.EndSession(sID, started.Add(time.Minute), sPath); err != nil {
+	if err := store.EndSession(sID, started.Add(time.Minute), sPath, ""); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := store.DB().Exec(`UPDATE sessions SET refinement_status = 'failed', audio_path = '', audio_removed_at = '2026-11-13T12:00:00Z', gdrive_folder_id = 'folder-s', sync_status = ?, sync_state = ? WHERE id = ?`, storage.SyncSynced, storage.SyncStateSynced, sID); err != nil {
@@ -39,7 +39,7 @@ func TestRetryRestoresAnUnrefinedRemovedSourceFromItsOwnFolder(t *testing.T) {
 	if err := store.CreateSession(tID, started.Add(time.Hour)); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.EndSession(tID, started.Add(61*time.Minute), tPath); err != nil {
+	if err := store.EndSession(tID, started.Add(61*time.Minute), tPath, ""); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.MergeSessions("merged", []string{sID, tID}, started, started.Add(2*time.Hour)); err != nil {
@@ -96,7 +96,7 @@ func TestRetryRestoresPartlyRemovedMergedSourceFromItsFolder(t *testing.T) {
 		if err := store.CreateSession(pair.id, pair.at); err != nil {
 			t.Fatal(err)
 		}
-		if err := store.EndSession(pair.id, pair.at.Add(time.Minute), pair.path); err != nil {
+		if err := store.EndSession(pair.id, pair.at.Add(time.Minute), pair.path, ""); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -109,7 +109,7 @@ func TestRetryRestoresPartlyRemovedMergedSourceFromItsFolder(t *testing.T) {
 	if err := store.CreateSession(uID, started.Add(2*time.Hour)); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.EndSession(uID, started.Add(121*time.Minute), uPath); err != nil {
+	if err := store.EndSession(uID, started.Add(121*time.Minute), uPath, ""); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.MergeSessions("m2", []string{"m1", uID}, started, started.Add(3*time.Hour)); err != nil {

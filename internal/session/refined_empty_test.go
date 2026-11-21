@@ -34,7 +34,7 @@ func TestEmptyBatchRefinementKeepsLiveSegments(t *testing.T) {
 	if err := store.AppendSegment("s", transcribe.Segment{Text: "Live text stays.", StartTime: 0, EndTime: 1, Timestamp: started}); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.EndSession("s", started.Add(time.Minute), recording); err != nil {
+	if err := store.EndSession("s", started.Add(time.Minute), recording, ""); err != nil {
 		t.Fatal(err)
 	}
 	manager := NewManager(store, nil, nil, nil, NewDetector(time.Hour), 0)

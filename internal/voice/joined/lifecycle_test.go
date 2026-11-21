@@ -28,14 +28,14 @@ func TestNoPointerOnceItsAgentLeftOrItsMeetingWent(t *testing.T) {
 			r.deliver(t, "agent-1", "ghost-wispr leave")
 		}},
 		{"the meeting ends", func(t *testing.T, r *rig, store *storage.SQLiteStore) {
-			if err := store.EndSession("sess-1", r.clock.Now(), ""); err != nil {
+			if err := store.EndSession("sess-1", r.clock.Now(), "", ""); err != nil {
 				t.Fatal(err)
 			}
 			r.setSession("")
 			r.roster.SessionEnded("sess-1")
 		}},
 		{"the recording session is deleted", func(t *testing.T, r *rig, store *storage.SQLiteStore) {
-			if err := store.EndSession("sess-1", r.clock.Now(), ""); err != nil {
+			if err := store.EndSession("sess-1", r.clock.Now(), "", ""); err != nil {
 				t.Fatal(err)
 			}
 			r.setSession("")

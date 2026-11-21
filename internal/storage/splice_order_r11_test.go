@@ -18,7 +18,7 @@ func TestR11SpliceQueriesUseInsertionOrder(t *testing.T) {
 	if err := store.CreateSession("session", started); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.EndSession("session", started.Add(time.Minute), ""); err != nil {
+	if err := store.EndSession("session", started.Add(time.Minute), "", ""); err != nil {
 		t.Fatal(err)
 	}
 	for _, row := range []struct {
@@ -64,7 +64,7 @@ func TestR12DriveReplacementInputUsesInsertionOrder(t *testing.T) {
 	if err := store.CreateSession("session", started); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.EndSession("session", started.Add(time.Minute), ""); err != nil {
+	if err := store.EndSession("session", started.Add(time.Minute), "", ""); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := store.DB().Exec(`UPDATE sessions SET drive_replace_pending = 1 WHERE id = 'session'`); err != nil {
@@ -99,7 +99,7 @@ func TestR12OldestPendingSpliceUsesInsertionOrder(t *testing.T) {
 	if err := store.CreateSession("session", started); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.EndSession("session", started.Add(time.Minute), ""); err != nil {
+	if err := store.EndSession("session", started.Add(time.Minute), "", ""); err != nil {
 		t.Fatal(err)
 	}
 	for _, deletedAt := range []string{"2026-11-13T12:00:00Z", "2026-11-13T12:00:00.1Z"} {
@@ -115,7 +115,7 @@ func TestR12OldestPendingSpliceUsesInsertionOrder(t *testing.T) {
 	if err := store.CreateSession("reverse-session", started); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.EndSession("reverse-session", started.Add(time.Minute), ""); err != nil {
+	if err := store.EndSession("reverse-session", started.Add(time.Minute), "", ""); err != nil {
 		t.Fatal(err)
 	}
 	for _, deletedAt := range []string{"2026-11-13T12:00:00.1Z", "2026-11-13T12:00:00Z"} {

@@ -35,13 +35,13 @@ func TestDeleteRouteNamesAnUntraceableMergeHistory(t *testing.T) {
 	if err := store.AppendSegment("n", segment("november delete")); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.EndSession("n", start.Add(time.Minute), ""); err != nil {
+	if err := store.EndSession("n", start.Add(time.Minute), "", ""); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.AppendSegment("s", segment("untraceable holder text")); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.EndSession("s", start.Add(time.Minute), "/audio/s.mp3"); err != nil {
+	if err := store.EndSession("s", start.Add(time.Minute), "/audio/s.mp3", ""); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.MergeSessions("m1", []string{"n", "s"}, start, start.Add(2*time.Hour)); err != nil {
@@ -50,7 +50,7 @@ func TestDeleteRouteNamesAnUntraceableMergeHistory(t *testing.T) {
 	if err := store.CreateSession("t", start.Add(3*time.Hour)); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.EndSession("t", start.Add(181*time.Minute), "/audio/t.mp3"); err != nil {
+	if err := store.EndSession("t", start.Add(181*time.Minute), "/audio/t.mp3", ""); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.MergeSessions("m2", []string{"m1", "t"}, start, start.Add(4*time.Hour)); err != nil {

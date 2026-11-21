@@ -52,7 +52,7 @@ func TestADeletesRawEraseRunsAsWorkTheStopWaitsFor(t *testing.T) {
 	if err := store.CreateSession(id, at); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.EndSession(id, at.Add(time.Minute), ""); err != nil {
+	if err := store.EndSession(id, at.Add(time.Minute), "", ""); err != nil {
 		t.Fatal(err)
 	}
 	raw := recordingname.RawPath(dir, id)

@@ -430,7 +430,7 @@ func endWithRecording(t *testing.T, store *storage.SQLiteStore, dir, id string, 
 	if err := os.WriteFile(saved, make([]byte, size), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.EndSession(id, startedAt.Add(time.Minute), saved); err != nil {
+	if err := store.EndSession(id, startedAt.Add(time.Minute), saved, ""); err != nil {
 		t.Fatalf("end session %s: %v", id, err)
 	}
 	return saved
@@ -552,7 +552,7 @@ func TestGCKeepsTheOnlyCopyOfARecordingUnderDiskPressure(t *testing.T) {
 	crashed := crashRecovered(t, store, dir, "20261106100000", started, 2*1024*1024)
 
 	createSession(t, store, "20261106101000", started.Add(10*time.Minute))
-	if err := store.EndSession("20261106101000", started.Add(11*time.Minute), ""); err != nil {
+	if err := store.EndSession("20261106101000", started.Add(11*time.Minute), "", ""); err != nil {
 		t.Fatalf("end rolled-back session: %v", err)
 	}
 	rolledBack := filepath.Join(dir, "20261106101000.pcm")
@@ -774,7 +774,7 @@ func TestGCNeverRemovesARawRecordingThatIsTheOnlyCopy(t *testing.T) {
 		store := newStore(t)
 		createSession(t, store, "20251001120000", daysAgo(400))
 		createSession(t, store, "20261001120000", daysAgo(40))
-		if err := store.EndSession("20261001120000", daysAgo(40).Add(time.Hour), ""); err != nil {
+		if err := store.EndSession("20261001120000", daysAgo(40).Add(time.Hour), "", ""); err != nil {
 			t.Fatalf("end session: %v", err)
 		}
 		if _, err := store.DB().Exec(`UPDATE sessions SET summary_status = 'completed' WHERE id = ?`, "20261001120000"); err != nil {
@@ -805,7 +805,7 @@ func TestGCNeverRemovesARawRecordingThatIsTheOnlyCopy(t *testing.T) {
 func summarized(t *testing.T, store *storage.SQLiteStore, id string, startedAt time.Time) {
 	t.Helper()
 	createSession(t, store, id, startedAt)
-	if err := store.EndSession(id, startedAt.Add(time.Minute), ""); err != nil {
+	if err := store.EndSession(id, startedAt.Add(time.Minute), "", ""); err != nil {
 		t.Fatalf("end session %s: %v", id, err)
 	}
 	if err := store.UpdateSummaryAtGeneration(id, "", "A summary.", storage.SummaryCompleted, "default", "{}", "", 0); err != nil {
@@ -1001,7 +1001,7 @@ func TestGCNeverRemovesAFileAnotherSessionNames(t *testing.T) {
 			started := time.Now().UTC().Add(-time.Hour)
 			saved := endWithRecording(t, store, dir, "20261106100000", started, 2*1024*1024)
 			createSession(t, store, "20261106101000", started.Add(10*time.Minute))
-			if err := store.EndSession("20261106101000", started.Add(11*time.Minute), saved); err != nil {
+			if err := store.EndSession("20261106101000", started.Add(11*time.Minute), saved, ""); err != nil {
 				t.Fatalf("end session: %v", err)
 			}
 			syncTo(t, store, "20261106100000", storage.SyncStateSynced, "folder", 0, "")
@@ -1034,7 +1034,7 @@ func TestGCMarksNoAudioWhenOnlyADeadEntryIsLeft(t *testing.T) {
 		t.Fatal(err)
 	}
 	dead := filepath.Join(dir, "20261106101000.mp3")
-	if err := store.EndSession(id, time.Now().UTC(), live+","+dead); err != nil {
+	if err := store.EndSession(id, time.Now().UTC(), live+","+dead, ""); err != nil {
 		t.Fatalf("end session: %v", err)
 	}
 
@@ -1073,7 +1073,7 @@ func TestGCKeepsAnEntryOnADiskUnmountedDuringThePass(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if err := store.EndSession(id, time.Now().UTC(), other+","+here); err != nil {
+	if err := store.EndSession(id, time.Now().UTC(), other+","+here, ""); err != nil {
 		t.Fatalf("end session: %v", err)
 	}
 
@@ -1127,7 +1127,7 @@ func TestGCSaysWhatIsLeftOfAPartlyRemovedRecording(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if err := store.EndSession(id, time.Now().UTC(), gone+","+stuck); err != nil {
+	if err := store.EndSession(id, time.Now().UTC(), gone+","+stuck, ""); err != nil {
 		t.Fatalf("end session: %v", err)
 	}
 	syncTo(t, store, id, storage.SyncStateSynced, "folder", 0, "")
@@ -1213,7 +1213,7 @@ func TestGCTreatsAPcmSavedRecordingAsTheRecording(t *testing.T) {
 		started := time.Now().UTC().Add(-time.Hour)
 		createSession(t, store, id, started)
 		pcm := writeRaw(t, dir, id, 3*1024*1024, started)
-		if err := store.EndSession(id, started.Add(time.Minute), pcm); err != nil {
+		if err := store.EndSession(id, started.Add(time.Minute), pcm, ""); err != nil {
 			t.Fatalf("end session: %v", err)
 		}
 		return store, dir, pcm
@@ -1442,7 +1442,7 @@ func TestGCLeavesASessionWhoseRecordingIsMissingAlone(t *testing.T) {
 	const id = "20261106100000"
 	createSession(t, store, id, time.Now().UTC().Add(-time.Hour))
 	missing := filepath.Join(dir, id+".mp3")
-	if err := store.EndSession(id, time.Now().UTC(), missing); err != nil {
+	if err := store.EndSession(id, time.Now().UTC(), missing, ""); err != nil {
 		t.Fatalf("end session: %v", err)
 	}
 	healthy := endWithRecording(t, store, dir, "20261106101000", time.Now().UTC().Add(-30*time.Minute), 2*1024*1024)
@@ -1481,7 +1481,7 @@ func TestGCReadsAnEntryWhereItPointsAfterAnAudioDirChange(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if err := store.EndSession(id, time.Now().UTC(), leftInPlace+","+current); err != nil {
+	if err := store.EndSession(id, time.Now().UTC(), leftInPlace+","+current, ""); err != nil {
 		t.Fatalf("end session: %v", err)
 	}
 
@@ -1516,7 +1516,7 @@ func TestGCAgeErasesTheRecordingLeftInPlaceAfterAnAudioDirChange(t *testing.T) {
 	if err := os.WriteFile(leftInPlace, []byte("audio"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.EndSession(id, daysAgo(40).Add(time.Minute), leftInPlace); err != nil {
+	if err := store.EndSession(id, daysAgo(40).Add(time.Minute), leftInPlace, ""); err != nil {
 		t.Fatalf("end session: %v", err)
 	}
 	if err := store.UpdateSummaryAtGeneration(id, "", "A summary.", storage.SummaryCompleted, "default", "{}", "", 0); err != nil {

@@ -377,7 +377,7 @@ func (r *r7Rig) closeGate() {
 // order (wireVoiceSessionHooks, cmd/ghost-wispr/voice.go).
 func (r *r7Rig) endSession() {
 	r.t.Helper()
-	if err := r.store.EndSession("meeting-1", time.Now().UTC(), ""); err != nil {
+	if err := r.store.EndSession("meeting-1", time.Now().UTC(), "", ""); err != nil {
 		r.t.Fatal(err)
 	}
 	r.setSession("")

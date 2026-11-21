@@ -155,7 +155,7 @@ func TestGCStaysDriveGatedWhenSyncIsNotRunning(t *testing.T) {
 			t.Fatal(err)
 		}
 		recordings = append(recordings, recording)
-		if err := store.EndSession(id, started.Add(time.Minute), recording); err != nil {
+		if err := store.EndSession(id, started.Add(time.Minute), recording, ""); err != nil {
 			t.Fatalf("end %s: %v", id, err)
 		}
 		if err := store.UpdateSummaryAtGeneration(id, "", "A summary.", storage.SummaryCompleted, "default", "{}", "", 0); err != nil {

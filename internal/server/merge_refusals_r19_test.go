@@ -27,7 +27,7 @@ func mergeRouteStore(t *testing.T, started time.Time, ended ...string) *storage.
 		if err := store.CreateSession(id, at); err != nil {
 			t.Fatal(err)
 		}
-		if err := store.EndSession(id, at.Add(time.Minute), "/audio/"+id+".mp3"); err != nil {
+		if err := store.EndSession(id, at.Add(time.Minute), "/audio/"+id+".mp3", ""); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -99,7 +99,7 @@ func TestMergeRouteRefusesAnIDWhoseDeleteIsPendingWith409(t *testing.T) {
 		if err := store.CreateSession(id, at); err != nil {
 			t.Fatal(err)
 		}
-		if err := store.EndSession(id, at.Add(time.Minute), "/audio/"+id+".mp3"); err != nil {
+		if err := store.EndSession(id, at.Add(time.Minute), "/audio/"+id+".mp3", ""); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -162,7 +162,7 @@ func TestAutoMergeSplitsAtARecordingSessionAndLogsTheSkip(t *testing.T) {
 		if i == recording {
 			continue
 		}
-		if err := store.EndSession(id, at.Add(time.Minute), "/audio/"+id+".mp3"); err != nil {
+		if err := store.EndSession(id, at.Add(time.Minute), "/audio/"+id+".mp3", ""); err != nil {
 			t.Fatal(err)
 		}
 	}

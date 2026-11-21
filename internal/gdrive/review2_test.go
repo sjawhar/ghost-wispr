@@ -27,7 +27,7 @@ func round2Session(t *testing.T, store *storage.SQLiteStore, id string, texts []
 			t.Fatal(err)
 		}
 	}
-	if err := store.EndSession(id, started.Add(time.Minute), recording); err != nil {
+	if err := store.EndSession(id, started.Add(time.Minute), recording, ""); err != nil {
 		t.Fatal(err)
 	}
 	if _, _, err := store.Canonicalize(id); err != nil {

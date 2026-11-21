@@ -73,6 +73,23 @@ type backgroundWork interface {
 	Run(ctx context.Context, f func(ctx context.Context) error) error
 }
 
+// goUntilStop runs loop on a goroutine of its own, inside background.Run, so
+// the stop waits for it: loop must end once its context does, which the
+// app's stop or the stop's wait ends. Nil background runs loop under ctx
+// alone (a test's loop, which the test joins).
+func goUntilStop(ctx context.Context, background backgroundWork, loop func(ctx context.Context)) {
+	go func() {
+		if background == nil {
+			loop(ctx)
+			return
+		}
+		_ = background.Run(ctx, func(ctx context.Context) error {
+			loop(ctx)
+			return nil
+		})
+	}()
+}
+
 // runPasses runs pass inside background.Run at once and then every interval,
 // until ctx ends or the stop refuses a pass.
 func runPasses(ctx context.Context, background backgroundWork, interval time.Duration, pass func(ctx context.Context)) {

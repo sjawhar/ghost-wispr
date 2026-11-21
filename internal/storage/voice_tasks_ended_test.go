@@ -17,7 +17,7 @@ func TestCancelWorkingVoiceTasksOfEndedSessions(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if err := store.EndSession("ended", at.Add(time.Hour), ""); err != nil {
+	if err := store.EndSession("ended", at.Add(time.Hour), "", ""); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.DiscardSession("discarded"); err != nil {

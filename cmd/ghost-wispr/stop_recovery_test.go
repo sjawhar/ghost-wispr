@@ -73,7 +73,7 @@ func endedResumeSession(t *testing.T, store *storage.SQLiteStore, dir, id string
 	if err := store.CreateSession(id, at); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.EndSession(id, at.Add(21*time.Second), path); err != nil {
+	if err := store.EndSession(id, at.Add(21*time.Second), path, ""); err != nil {
 		t.Fatal(err)
 	}
 	return path
@@ -464,7 +464,7 @@ func endedSessionWithWords(t *testing.T, store *storage.SQLiteStore, id, summary
 	if err := store.AppendSegment(id, transcribe.Segment{Text: "synthetic words, no room audio", StartTime: 0, EndTime: 1, Timestamp: at}); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.EndSession(id, at.Add(time.Minute), ""); err != nil {
+	if err := store.EndSession(id, at.Add(time.Minute), "", ""); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := store.DB().Exec(`UPDATE sessions SET summary_status = ? WHERE id = ?`, summaryStatus, id); err != nil {
@@ -949,7 +949,7 @@ func TestADeletionWhileARetryIsOwedCancelsIt(t *testing.T) {
 			if err := store.AppendSegment("without-recording", transcribe.Segment{Text: "untimed synthetic words to delete", Timestamp: at}); err != nil {
 				t.Fatal(err)
 			}
-			if err := store.EndSession("without-recording", at.Add(time.Minute), ""); err != nil {
+			if err := store.EndSession("without-recording", at.Add(time.Minute), "", ""); err != nil {
 				t.Fatal(err)
 			}
 			path := endedResumeSession(t, store, dir, "with-recording")

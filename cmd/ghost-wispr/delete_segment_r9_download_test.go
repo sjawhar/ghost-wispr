@@ -45,7 +45,7 @@ func newR9MergedCutFixture(t *testing.T) r9MergedCutFixture {
 		if err := store.CreateSession(source.id, at); err != nil {
 			t.Fatal(err)
 		}
-		if err := store.EndSession(source.id, at.Add(time.Minute), source.path); err != nil {
+		if err := store.EndSession(source.id, at.Add(time.Minute), source.path, ""); err != nil {
 			t.Fatal(err)
 		}
 	}

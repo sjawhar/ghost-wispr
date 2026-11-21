@@ -29,7 +29,7 @@ func segmentTestSession(t *testing.T, store *SQLiteStore, id string) (time.Time,
 			t.Fatalf("append segment: %v", err)
 		}
 	}
-	if err := store.EndSession(id, started.Add(6*time.Second), "recording.mp3"); err != nil {
+	if err := store.EndSession(id, started.Add(6*time.Second), "recording.mp3", ""); err != nil {
 		t.Fatalf("end session: %v", err)
 	}
 	return started, segments

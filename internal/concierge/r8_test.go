@@ -169,7 +169,7 @@ func TestAnEndedMeetingsAnswerGoesToNoModel(t *testing.T) {
 			if err := r.concierge.SessionEnded("meeting-1"); err != nil {
 				t.Fatal(err)
 			}
-		} else if err := r.store.EndSession("meeting-1", testNow, ""); err != nil {
+		} else if err := r.store.EndSession("meeting-1", testNow, "", ""); err != nil {
 			t.Fatal(err)
 		}
 		r.model.turns = [][]*genai.GenerateContentResponse{{chunk(text("Done."))}}

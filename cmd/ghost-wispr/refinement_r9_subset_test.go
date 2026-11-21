@@ -30,7 +30,7 @@ func r9MergedRestoreSession(t *testing.T, audioPath string) (*storage.SQLiteStor
 		if err := store.CreateSession(id, at); err != nil {
 			t.Fatal(err)
 		}
-		if err := store.EndSession(id, at.Add(time.Minute), filepath.Join(legacyDir, name)); err != nil {
+		if err := store.EndSession(id, at.Add(time.Minute), filepath.Join(legacyDir, name), ""); err != nil {
 			t.Fatal(err)
 		}
 	}

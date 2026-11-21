@@ -38,7 +38,7 @@ func refinementStatesRunner(t *testing.T) (*segmentDeleteRunner, <-chan string) 
 		if err := store.CreateSession(row.id, started); err != nil {
 			t.Fatal(err)
 		}
-		if err := store.EndSession(row.id, started.Add(time.Minute), filepath.Join(dir, row.id+".mp3")); err != nil {
+		if err := store.EndSession(row.id, started.Add(time.Minute), filepath.Join(dir, row.id+".mp3"), ""); err != nil {
 			t.Fatal(err)
 		}
 		if _, err := store.DB().Exec(`UPDATE sessions SET refinement_status = ?, refined_revision = ?, audio_removed_at = ?, gdrive_folder_id = ?, sync_status = ?, sync_state = ? WHERE id = ?`,

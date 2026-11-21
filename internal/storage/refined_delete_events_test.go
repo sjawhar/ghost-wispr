@@ -20,7 +20,7 @@ func TestDeleteRefinedSegmentDropsLiveTranscriptEvents(t *testing.T) {
 	if err := store.StoreEvent(t.Context(), "live_transcript", `{"type":"live_transcript","session_id":"s","text":"live secret words","start_time":2,"end_time":4}`); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.EndSession("s", started.Add(time.Minute), "recording.mp3"); err != nil {
+	if err := store.EndSession("s", started.Add(time.Minute), "recording.mp3", ""); err != nil {
 		t.Fatal(err)
 	}
 	words := []RefinedWord{

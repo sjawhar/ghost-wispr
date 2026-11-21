@@ -17,7 +17,7 @@ func TestDeleteSessionReturnsTheAudioPathItDeleted(t *testing.T) {
 	if err := store.CreateSession("gone", started); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.EndSession("gone", started.Add(time.Minute), "data/audio/gone.mp3"); err != nil {
+	if err := store.EndSession("gone", started.Add(time.Minute), "data/audio/gone.mp3", ""); err != nil {
 		t.Fatal(err)
 	}
 	audioPath, err := store.DeleteSession("gone", "")
@@ -43,7 +43,7 @@ func TestDeleteSessionRecordsWhereItsRecordingsAreErasedFirst(t *testing.T) {
 		if err := store.CreateSession(id, started); err != nil {
 			t.Fatal(err)
 		}
-		if err := store.EndSession(id, started.Add(time.Minute), audioPath); err != nil {
+		if err := store.EndSession(id, started.Add(time.Minute), audioPath, ""); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -94,7 +94,7 @@ func TestDeleteSessionRecordsTheRawPCMsDirectoryFirst(t *testing.T) {
 	if err := store.CreateSession("raw", started); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.EndSession("raw", started.Add(time.Minute), saved); err != nil {
+	if err := store.EndSession("raw", started.Add(time.Minute), saved, ""); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := store.DeleteSession("raw", audioDir); err != nil {
@@ -119,7 +119,7 @@ func TestRecordingDirectoriesListsWhereARelativeEntryPoints(t *testing.T) {
 	if err := store.CreateSession("left", started); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.EndSession("left", started.Add(time.Minute), filepath.Join("old-audio", "left.mp3")); err != nil {
+	if err := store.EndSession("left", started.Add(time.Minute), filepath.Join("old-audio", "left.mp3"), ""); err != nil {
 		t.Fatal(err)
 	}
 	dirs, err := store.RecordingDirectories()

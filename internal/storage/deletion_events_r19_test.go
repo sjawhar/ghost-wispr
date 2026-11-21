@@ -24,13 +24,13 @@ func deletionEventMerge(t *testing.T, store *SQLiteStore) int64 {
 	if err := store.AppendSegment("n", transcribeSegment(deletionEventPhrase, 0, start)); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.EndSession("n", start.Add(time.Minute), ""); err != nil {
+	if err := store.EndSession("n", start.Add(time.Minute), "", ""); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.AppendSegment("s", transcribeSegment("sierra words", 0, start)); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.EndSession("s", start.Add(time.Minute), "/audio/s.mp3"); err != nil {
+	if err := store.EndSession("s", start.Add(time.Minute), "/audio/s.mp3", ""); err != nil {
 		t.Fatal(err)
 	}
 	for _, event := range []struct{ eventType, payload string }{
