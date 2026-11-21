@@ -4,13 +4,94 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"net/http"
 	"sync"
 	"time"
+
+	"github.com/sjawhar/ghost-wispr/internal/stopping"
 )
 
 // lifecyclePublishWait bounds the stop's wait for the current session's
 // lifecycle events to reach the hub (session.Manager.WaitForLifecyclePublishes).
 const lifecyclePublishWait = 5 * time.Second
+
+// httpShutdownWait bounds the stop's wait for the requests under way to end
+// (stopServing): a long download must not use the time the store's work has
+// to end in.
+const httpShutdownWait = 5 * time.Second
+
+// stopServing stops server taking requests and waits, for wait at most and
+// within ctx, for those under way to end, then closes the connections still
+// open. The stop runs it before it waits for the store's work, so no request
+// starts store work once that wait has begun. The work a request admitted
+// through the session manager is waited for there.
+func stopServing(ctx context.Context, server *http.Server, wait time.Duration) {
+	waitCtx, cancel := context.WithTimeout(ctx, wait)
+	defer cancel()
+	if err := server.Shutdown(waitCtx); err != nil {
+		slog.Warn("requests under way did not end before shutdown; closing their connections", "error", err, "waited", wait)
+		_ = server.Close()
+	}
+}
+
+// closingStore is the store as the shutdown closes it.
+type closingStore interface {
+	CloseWithin(ctx context.Context) error
+}
+
+// closeStore closes the store at the end of the shutdown, waiting within ctx
+// for the statements still under way. The store refuses every other
+// statement from the moment it starts closing (storage), so nothing writes it
+// after it closed. When a statement outlasts ctx, the store is left open
+// under it and closeStore reports false: main then returns, and the process
+// exits with SQLite left to the operating system, which the write-ahead log
+// makes safe. It never closes the database under a writer.
+func closeStore(ctx context.Context, store closingStore) bool {
+	if err := store.CloseWithin(ctx); err != nil {
+		slog.Error("store work still runs at the shutdown's deadline; exiting without closing the database under it", "error", err)
+		return false
+	}
+	return true
+}
+
+// newAppContext is the app's context. stop ends it at shutdown with the cause
+// stopping.ErrStopped, so work it cuts off reads, as work the session
+// manager's stop cuts off does, as stopped and not as failed: the start's
+// summary backfill leaves its summary running for the next start.
+func newAppContext() (ctx context.Context, stop func()) {
+	ctx, cancel := context.WithCancelCause(context.Background())
+	return ctx, func() { cancel(stopping.ErrStopped) }
+}
+
+// backgroundWork admits work the stop cuts off and waits for: the session
+// manager's Go and Run (session.Manager). Every goroutine of the app that
+// writes the store, and that no caller waits for, starts through Go or runs
+// inside Run, so the store closes under none of it. A loop runs each pass
+// inside Run, and ends once Run refuses it (stopping.ErrStopped).
+type backgroundWork interface {
+	Go(f func(ctx context.Context))
+	Run(ctx context.Context, f func(ctx context.Context) error) error
+}
+
+// runPasses runs pass inside background.Run at once and then every interval,
+// until ctx ends or the stop refuses a pass.
+func runPasses(ctx context.Context, background backgroundWork, interval time.Duration, pass func(ctx context.Context)) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		if err := background.Run(ctx, func(ctx context.Context) error {
+			pass(ctx)
+			return nil
+		}); errors.Is(err, stopping.ErrStopped) {
+			return
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
+}
 
 // stopRecoveryStore is what the app keeps in the store about the
 // refinements a stop cuts off (storage.RecoverStaleRefinements).
@@ -25,6 +106,7 @@ type stopRecoveryStore interface {
 type shutdownSessionEnder interface {
 	ForceEndSession(ctx context.Context) error
 	WaitForLifecyclePublishes(ctx context.Context) error
+	StopBackground(ctx context.Context) error
 }
 
 // stopRecovery is what the app does about the work a stop cuts off: a
@@ -68,9 +150,12 @@ func (r *stopRecovery) retry(ctx context.Context, warnings *warningsRegistry, re
 
 // stop ends the current session and waits, within shutdownCtx's deadline, for
 // any session end under way (a pause's), for the session's lifecycle events
-// (for lifecycleWait at most), and for the start's retries, which the stop has
-// cancelled, so the database closes under none of them and the stop still
-// ends on time.
+// (for lifecycleWait at most), for the app's background work on the store
+// (backgroundWork: what a session's end leaves running, the merge hook, the
+// retries, the sweeps), which the stop cuts off, and for the start's
+// retries, which the stop has cancelled, so the database closes under none of
+// them and the stop still ends on time. A refinement or summary cut off stays
+// running in the store, for the next start (stopping.ErrStopped).
 func (r *stopRecovery) stop(shutdownCtx context.Context, manager shutdownSessionEnder, lifecycleWait time.Duration) {
 	if err := manager.ForceEndSession(shutdownCtx); err != nil {
 		slog.Warn("force end session failed", "error", err)
@@ -79,6 +164,9 @@ func (r *stopRecovery) stop(shutdownCtx context.Context, manager shutdownSession
 	defer cancel()
 	if err := manager.WaitForLifecyclePublishes(lifecycleCtx); err != nil {
 		slog.Warn("lifecycle event publishing did not finish before shutdown", "error", err)
+	}
+	if err := manager.StopBackground(shutdownCtx); err != nil {
+		slog.Warn("the app's background work on the store did not end before shutdown", "error", err)
 	}
 	retried := make(chan struct{})
 	go func() {

@@ -381,6 +381,12 @@ type rig struct {
 
 func newRig(t *testing.T) *rig {
 	t.Helper()
+	return newLoggedRig(t, nil)
+}
+
+// newLoggedRig is newRig with the Concierge's logger; nil is slog's default.
+func newLoggedRig(t *testing.T, logger *slog.Logger) *rig {
+	t.Helper()
 	store, err := storage.NewSQLiteStore(filepath.Join(t.TempDir(), "unit.db"))
 	if err != nil {
 		t.Fatal(err)
@@ -407,6 +413,7 @@ func newRig(t *testing.T) *rig {
 		Store:     store,
 		PublicURL: "https://unit.example",
 		Now:       func() time.Time { return testNow },
+		Logger:    logger,
 	})
 	if err != nil {
 		t.Fatal(err)

@@ -161,7 +161,7 @@ func configuredAudioDir(cfgStore *config.Store) func() string {
 	}
 }
 
-func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *ControlHooks, healthChecker HealthChecker, cfgStore *config.Store, embeddingClient embedding.Client) {
+func registerAPIRoutes(mux routeMux, store SessionStore, controls *ControlHooks, healthChecker HealthChecker, cfgStore *config.Store, embeddingClient embedding.Client) {
 	audioDir := configuredAudioDir(cfgStore)
 
 	// Health check endpoints
@@ -2095,7 +2095,7 @@ func handleRefinePreset(cfgStore *config.Store, refineFn func(ctx context.Contex
 	}
 }
 
-func registerRestoreRoutes(mux *http.ServeMux, controls *ControlHooks) {
+func registerRestoreRoutes(mux routeMux, controls *ControlHooks) {
 	mux.HandleFunc("POST /api/restore/gdrive", func(w http.ResponseWriter, r *http.Request) {
 		if controls.RestoreFromGDrive == nil {
 			writeJSONError(w, http.StatusServiceUnavailable, "Google Drive sync is not configured")

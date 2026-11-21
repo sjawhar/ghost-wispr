@@ -68,13 +68,14 @@ func (d *driveSync) Get() sessionSyncer {
 	return d.syncer
 }
 
-// retrySync starts a sync of session sessionID in the background with
-// syncer, the running Drive syncer (nil while sync is off), and says at once
-// if none can start (for a session whose Drive folder was deleted, while
-// Drive says it is not back), so the API does not report a retry that does
-// nothing. Drive not answering whether such a folder is back is
-// server.ErrDriveUnavailable: the retry may work once Drive answers.
-func retrySync(ctx context.Context, syncer sessionSyncer, sessionID string) error {
+// retrySync starts a sync of session sessionID in the background, as work the
+// stop cuts off and waits for (background.Go), with syncer, the running Drive
+// syncer (nil while sync is off), and says at once if none can start (for a
+// session whose Drive folder was deleted, while Drive says it is not back),
+// so the API does not report a retry that does nothing. Drive not answering
+// whether such a folder is back is server.ErrDriveUnavailable: the retry may
+// work once Drive answers.
+func retrySync(ctx context.Context, background backgroundWork, syncer sessionSyncer, sessionID string) error {
 	if syncer == nil {
 		return server.ErrSyncNotConfigured
 	}
@@ -84,11 +85,11 @@ func retrySync(ctx context.Context, syncer sessionSyncer, sessionID string) erro
 		}
 		return err
 	}
-	go func() {
-		if err := syncer.SyncSession(context.Background(), sessionID); err != nil {
+	background.Go(func(ctx context.Context) {
+		if err := syncer.SyncSession(ctx, sessionID); err != nil {
 			log.Printf("gdrive retry: session %s: %v", sessionID, err)
 		}
-	}()
+	})
 	return nil
 }
 
@@ -134,29 +135,27 @@ type syncSweepStore interface {
 // none), which erases the raw recordings the pass just synced and saves those
 // still kept, and it retries the erase a deletion still owes on the unit
 // (storage.RetryOwedErasure). As it starts and after every pass it brings the
-// status warnings of owed Drive replacements up to date from the store.
-func sweepDriveSync(ctx context.Context, store syncSweepStore, drive *driveSync, warnings *warningsRegistry, every time.Duration, kept *keptRecordings) {
+// status warnings of owed Drive replacements up to date from the store. Each
+// of these runs as work the stop cuts off and waits for (background.Run); the
+// sweep ends once the stop refuses a pass.
+func sweepDriveSync(ctx context.Context, background backgroundWork, store syncSweepStore, drive *driveSync, warnings *warningsRegistry, every time.Duration, kept *keptRecordings) {
 	refreshWarnings := func() {
 		if err := refreshDriveReplacementWarnings(store, warnings, time.Now().UTC()); err != nil {
 			log.Printf("gdrive replacement warnings: %v", err)
 		}
 	}
-	refreshWarnings()
-	ticker := time.NewTicker(every)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
+	first := true
+	runPasses(ctx, background, every, func(ctx context.Context) {
+		if !first {
 			syncSweep(ctx, store, drive)
 			kept.run(ctx)
 			if err := store.RetryOwedErasure(); err != nil {
 				slog.Warn("a deleted segment's erase from the database log or backup is still owed", "error", err)
 			}
-			refreshWarnings()
 		}
-	}
+		first = false
+		refreshWarnings()
+	})
 }
 
 // syncSweep is one pass of sweepDriveSync.

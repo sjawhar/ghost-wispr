@@ -242,10 +242,14 @@ type Session struct {
 	cfg              SessionConfig
 	logger           *slog.Logger
 	clientInstanceID string
+	// life ends with Close: the registrations and deliveries it waits for
+	// (stopped) run under it.
+	life    context.Context
+	endLife context.CancelFunc
 
 	mu    sync.Mutex
 	epoch string
-	// resume is the point last saved, which a registration sends. stream,
+	// resume is the newest resume point, which a registration sends. stream,
 	// written and held are the frames behind it: the stream the relay
 	// delivers, the highest sequence answered done (or the consumer's start
 	// less one), and the sequences answered nak, which come again.
@@ -256,8 +260,16 @@ type Session struct {
 	conn    *nats.Conn
 	sub     *nats.Subscription
 	stop    chan struct{}
+	// stopped counts the heartbeat, each registration a reconnect starts and
+	// each relay frame being handled: Close waits for them, since each may
+	// save the resume point where the unit keeps its state (SaveResume).
 	stopped sync.WaitGroup
 	closed  bool
+	// saveMu orders the writes of the resume point, which run without mu
+	// (flushResume); saved is the point last written, guarded by saveMu.
+	// Close takes neither.
+	saveMu sync.Mutex
+	saved  *ResumePoint
 	// heartbeatEvery and progressEvery are HeartbeatEvery and progressEvery;
 	// a test shortens them.
 	heartbeatEvery time.Duration
@@ -272,11 +284,14 @@ func newSession(listener *Listener, cfg *SessionConfig) (*Session, error) {
 	if logger == nil {
 		logger = slog.Default()
 	}
+	life, endLife := context.WithCancel(context.Background())
 	session := &Session{
 		Listener:         listener,
 		cfg:              *cfg,
 		logger:           logger,
 		clientInstanceID: randomID(),
+		life:             life,
+		endLife:          endLife,
 		epoch:            randomID(),
 		stop:             make(chan struct{}),
 		heartbeatEvery:   HeartbeatEvery,
@@ -285,6 +300,8 @@ func newSession(listener *Listener, cfg *SessionConfig) (*Session, error) {
 	if cfg.Resume != nil && cfg.Resume.StreamID != "" {
 		resume := *cfg.Resume
 		session.resume = &resume
+		saved := resume
+		session.saved = &saved
 		session.stream, session.written = resume.StreamID, resume.Seq
 	}
 	return session, nil
@@ -293,7 +310,9 @@ func newSession(listener *Listener, cfg *SessionConfig) (*Session, error) {
 // OpenSession connects to NATS, subscribes to the session's relay subject,
 // registers, and keeps registering every HeartbeatEvery until Close. It
 // fails when the first registration fails: a session the listener refused
-// receives nothing.
+// receives nothing. When it fails, nothing it started runs on: a
+// registration a NATS reconnect began, or a relay frame being handled, is
+// cancelled and waited for (abandon).
 func OpenSession(ctx context.Context, listener *Listener, cfg *SessionConfig) (*Session, error) {
 	session, err := newSession(listener, cfg)
 	if err != nil {
@@ -302,6 +321,7 @@ func OpenSession(ctx context.Context, listener *Listener, cfg *SessionConfig) (*
 	natsURL := cfg.NATSURL
 	if natsURL == "" {
 		if natsURL, err = NATSURLFor(listener.base.String()); err != nil {
+			session.abandon(nil)
 			return nil, err
 		}
 	}
@@ -309,14 +329,7 @@ func OpenSession(ctx context.Context, listener *Listener, cfg *SessionConfig) (*
 		nats.Name("ghost-wispr "+cfg.SessionID),
 		nats.MaxReconnects(-1),
 		nats.ReconnectWait(2*time.Second),
-		nats.ReconnectHandler(func(*nats.Conn) {
-			// A new connection is a new epoch, registered at once so the
-			// listener relays to it.
-			session.mu.Lock()
-			session.epoch = randomID()
-			session.mu.Unlock()
-			go session.registerLogged()
-		}),
+		nats.ReconnectHandler(func(*nats.Conn) { session.reconnected() }),
 		nats.DisconnectErrHandler(func(_ *nats.Conn, err error) {
 			if err != nil {
 				session.logger.Warn("envoy session lost its NATS connection", "error", err)
@@ -324,17 +337,18 @@ func OpenSession(ctx context.Context, listener *Listener, cfg *SessionConfig) (*
 		}),
 	)
 	if err != nil {
+		session.abandon(nil)
 		return nil, fmt.Errorf("envoy: connect to NATS at %s: %w", natsURL, err)
 	}
 	sub, err := conn.Subscribe(DeliverSubjectPrefix+cfg.SessionID, func(msg *nats.Msg) {
-		session.handle(msg.Header, msg.Data, func(body string) {
+		session.relay(msg.Header, msg.Data, func(body string) {
 			if err := msg.Respond([]byte(body)); err != nil {
 				session.logger.Warn("envoy session could not answer a relay frame", "answer", body, "error", err)
 			}
 		})
 	})
 	if err != nil {
-		conn.Close()
+		session.abandon(conn)
 		return nil, fmt.Errorf("envoy: subscribe to the relay subject: %w", err)
 	}
 	// The flush and the first registration bound themselves: NATS refuses a
@@ -342,19 +356,36 @@ func OpenSession(ctx context.Context, listener *Listener, cfg *SessionConfig) (*
 	openCtx, cancel := context.WithTimeout(ctx, openTimeout)
 	defer cancel()
 	if err := conn.FlushWithContext(openCtx); err != nil {
-		conn.Close()
+		session.abandon(conn)
 		return nil, fmt.Errorf("envoy: flush the relay subscription: %w", err)
 	}
 	session.mu.Lock()
 	session.conn, session.sub = conn, sub
 	session.mu.Unlock()
 	if err := session.register(openCtx); err != nil {
-		conn.Close()
+		session.abandon(conn)
 		return nil, err
 	}
 	session.stopped.Add(1)
 	go session.heartbeat()
 	return session, nil
+}
+
+// abandon ends a session OpenSession could not open, which no caller can
+// Close: it admits no more work (closed), cancels what runs (a registration
+// a NATS reconnect began, a relay frame being handled, each of which may save
+// the resume point), closes conn, which may be nil, and waits for that work.
+// It removes no registration, since the first one failed.
+func (s *Session) abandon(conn *nats.Conn) {
+	s.mu.Lock()
+	s.closed = true
+	close(s.stop)
+	s.mu.Unlock()
+	s.endLife()
+	if conn != nil {
+		conn.Close()
+	}
+	s.stopped.Wait()
 }
 
 // openTimeout bounds OpenSession's flush of the relay subscription and its
@@ -363,6 +394,45 @@ const openTimeout = 15 * time.Second
 
 // ID is the session's id.
 func (s *Session) ID() string { return s.cfg.SessionID }
+
+// enter counts one piece of the session's work that Close waits for
+// (stopped), unless Close has run, and reports whether it may start.
+func (s *Session) enter() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return false
+	}
+	s.stopped.Add(1)
+	return true
+}
+
+// reconnected registers a new NATS connection at once, as a new epoch, so the
+// listener relays to it; Close waits for that registration. After Close it
+// registers nothing.
+func (s *Session) reconnected() {
+	s.mu.Lock()
+	s.epoch = randomID()
+	s.mu.Unlock()
+	if !s.enter() {
+		return
+	}
+	go func() {
+		defer s.stopped.Done()
+		s.registerLogged()
+	}()
+}
+
+// relay handles one relay frame (handle) as work Close waits for. After Close
+// it answers nothing: the listener delivers the frame again to the next
+// session.
+func (s *Session) relay(header nats.Header, data []byte, respond func(string)) {
+	if !s.enter() {
+		return
+	}
+	defer s.stopped.Done()
+	s.handle(header, data, respond)
+}
 
 func (s *Session) heartbeat() {
 	defer s.stopped.Done()
@@ -379,9 +449,9 @@ func (s *Session) heartbeat() {
 }
 
 func (s *Session) registerLogged() {
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	ctx, cancel := context.WithTimeout(s.life, 15*time.Second)
 	defer cancel()
-	if err := s.register(ctx); err != nil {
+	if err := s.register(ctx); err != nil && s.life.Err() == nil {
 		s.logger.Warn("envoy session registration failed; the next one is in a minute", "error", err)
 	}
 }
@@ -424,17 +494,19 @@ func (s *Session) register(ctx context.Context) error {
 		s.logger.Warn("envoy says messages sent to this session while it was away are gone")
 	}
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	// An answer with no consumer start, an older listener's, says nothing
 	// of where this session is in the stream, so it moves nothing.
 	if answer.Delivery.ConsumerStart == 0 {
+		s.mu.Unlock()
 		return nil
 	}
 	floor := answer.Delivery.ConsumerStart - 1
 	if s.switchStream(answer.Delivery.StreamID) || floor > s.written {
 		s.written = max(s.written, floor)
-		s.save()
+		s.noteResume()
 	}
+	s.mu.Unlock()
+	s.flushResume()
 	return nil
 }
 
@@ -448,23 +520,41 @@ func (s *Session) switchStream(id string) bool {
 	return true
 }
 
-// save keeps the resume point when it changed: below the lowest frame held,
-// else the highest written. s.mu is held.
-func (s *Session) save() {
+// noteResume keeps the resume point when it changed: below the lowest frame
+// held, else the highest written. s.mu is held. It writes nothing: the
+// caller writes it with flushResume once it has released s.mu.
+func (s *Session) noteResume() {
 	point := ResumePoint{StreamID: s.stream, Seq: s.written}
 	for seq := range s.held {
 		point.Seq = min(point.Seq, seq-1)
 	}
-	if s.resume != nil && *s.resume == point {
-		return
+	if s.resume == nil || *s.resume != point {
+		s.resume = &point
 	}
-	s.resume = &point
+}
+
+// flushResume writes the session's resume point where the unit keeps its
+// state (SaveResume), unless it is the one last written. The write, which
+// can wait for the store, runs without s.mu, so neither Close nor a frame's
+// handling waits behind it; saveMu orders the writes, and each writes the
+// point as it is then, so the store ends with the newest.
+func (s *Session) flushResume() {
 	if s.cfg.SaveResume == nil {
 		return
 	}
-	if err := s.cfg.SaveResume(point); err != nil {
-		s.logger.Warn("envoy session could not save its resume point", "error", err)
+	s.saveMu.Lock()
+	defer s.saveMu.Unlock()
+	s.mu.Lock()
+	point := s.resume
+	s.mu.Unlock()
+	if point == nil || (s.saved != nil && *s.saved == *point) {
+		return
 	}
+	if err := s.cfg.SaveResume(*point); err != nil {
+		s.logger.Warn("envoy session could not save its resume point", "error", err)
+		return
+	}
+	s.saved = point
 }
 
 // handle answers one relay message: a probe done at once, a frame that does
@@ -518,7 +608,7 @@ func (s *Session) handle(header nats.Header, data []byte, respond func(string)) 
 		message.IssuedAt = time.UnixMilli(envelope.IssuedAt)
 	}
 	if s.cfg.Deliver != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), deliverTimeout)
+		ctx, cancel := context.WithTimeout(s.life, deliverTimeout)
 		held, progressed := make(chan struct{}), make(chan struct{})
 		go func() {
 			defer close(progressed)
@@ -563,11 +653,12 @@ func (s *Session) hold(streamID string, seq uint64) {
 // wrote moves the resume point past a frame the session answered done.
 func (s *Session) wrote(streamID string, seq uint64) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	s.switchStream(streamID)
 	delete(s.held, seq)
 	s.written = max(s.written, seq)
-	s.save()
+	s.noteResume()
+	s.mu.Unlock()
+	s.flushResume()
 }
 
 // SendRequest is a message to one session that asks for a reply.
@@ -636,8 +727,13 @@ func (s *Session) Send(ctx context.Context, request *SendRequest) (SendResult, e
 	return SendResult{EventID: answer.EventID, RecipientState: SessionState(answer.RecipientState), State: answer.State, Duplicate: answer.Duplicate}, nil
 }
 
-// Close stops the heartbeat, removes this process's registration and closes
-// the NATS connection.
+// Close stops the heartbeat, cancels and waits within ctx for each
+// registration and relay frame under way, which may save the resume point
+// (an interrupted frame is answered nak and comes again), removes this
+// process's registration and closes the NATS connection. At ctx's end it
+// closes the connection and returns ctx's cause without removing the
+// registration: the work still under way ends behind it, and a store write
+// it makes after the unit closed its store is refused there (storage).
 func (s *Session) Close(ctx context.Context) error {
 	s.mu.Lock()
 	if s.closed {
@@ -648,12 +744,23 @@ func (s *Session) Close(ctx context.Context) error {
 	close(s.stop)
 	conn := s.conn
 	s.mu.Unlock()
-	s.stopped.Wait()
-	err := s.do(ctx, http.MethodDelete, "/v1/sessions/"+s.cfg.SessionID, url.Values{"client_instance_id": {s.clientInstanceID}}, nil, nil)
-	if conn != nil {
-		conn.Close()
+	s.endLife()
+	defer func() {
+		if conn != nil {
+			conn.Close()
+		}
+	}()
+	ended := make(chan struct{})
+	go func() {
+		s.stopped.Wait()
+		close(ended)
+	}()
+	select {
+	case <-ended:
+	case <-ctx.Done():
+		return fmt.Errorf("envoy: the session's work still runs at its close's deadline: %w", context.Cause(ctx))
 	}
-	return err
+	return s.do(ctx, http.MethodDelete, "/v1/sessions/"+s.cfg.SessionID, url.Values{"client_instance_id": {s.clientInstanceID}}, nil, nil)
 }
 
 func randomID() string {

@@ -80,10 +80,16 @@ func TestProbeRefusesBeforeTokensWhenTheUnitIsNotPausedAndIdle(t *testing.T) {
 	}
 }
 
+// TestProbeChecksAgainBeforeItsFirstAudio fails if the probe sends audio
+// without asking the unit's status again once the session has started. The
+// unit turns active before the stand-in says the session started, so the
+// second ask sees it however late the test's goroutines run; a unit turned
+// active just after that message raced the probe's ask, and the probe could
+// ask first.
 func TestProbeChecksAgainBeforeItsFirstAudio(t *testing.T) {
 	live := newStandIns(t)
 	status := newStatusServer(t, true, "")
-	live.onStarted = func() { status.set(false, "someone-else") }
+	live.onStarting = func() { status.set(false, "someone-else") }
 	cfg := live.config(t)
 	cfg.StatusURL = status.server.URL
 	cfg.Settle = time.Second

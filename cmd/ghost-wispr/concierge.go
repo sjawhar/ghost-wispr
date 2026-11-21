@@ -23,15 +23,22 @@ import (
 // Envoy the Concierge answers from the record alone until the session opens.
 // The joined agents' roster, when set, takes the session's joins, floor
 // requests and leaves, and the Concierge the rest. stop closes the Envoy
-// session and stops the Concierge.
-func startConcierge(ctx context.Context, cfg *config.Config, store *storage.SQLiteStore, logger *slog.Logger, changed func(sessionID string), roster *joined.Roster) (*concierge.Concierge, func(), error) {
+// session and stops the Concierge, waiting for each within its context: at
+// the context's end it returns, and what still runs ends behind it, its
+// store writes refused once the unit closed the store (storage).
+func startConcierge(ctx context.Context, cfg *config.Config, store *storage.SQLiteStore, logger *slog.Logger, changed func(sessionID string), roster *joined.Roster) (*concierge.Concierge, func(context.Context), error) {
 	c, err := newConcierge(ctx, cfg, store, logger, changed, joinedAgentsOf(roster))
 	if err != nil {
 		return nil, nil, err
 	}
+	stopConcierge := func(ctx context.Context) {
+		if err := c.StopWithin(ctx); err != nil {
+			logger.Warn("concierge: stopped waiting for its work at the shutdown's deadline; the store refuses what it writes once it closes", "error", err)
+		}
+	}
 	if cfg.Concierge.EnvoyURL == "" {
 		logger.Warn("concierge: no concierge.envoy_url; the voice cannot ask an issue's agent")
-		return c, c.Stop, nil
+		return c, stopConcierge, nil
 	}
 	listener, err := envoy.NewListener(cfg.Concierge.EnvoyURL, newEnvoyHTTP(logger))
 	if err != nil {
@@ -79,19 +86,44 @@ func startConcierge(ctx context.Context, cfg *config.Config, store *storage.SQLi
 			wait = nextEnvoyRetry(wait)
 		}
 	}()
-	stop := func() {
-		cancel()
-		if session, ok := <-sessions; ok && session != nil {
-			if roster != nil {
-				roster.SetAgents(nil) // the joined agents hear nothing more
-			}
-			closeCtx, done := context.WithTimeout(context.Background(), 5*time.Second)
-			defer done()
-			if err := session.Close(closeCtx); err != nil {
-				logger.Warn("concierge: close the Envoy session", "error", err)
-			}
+	closeSession := func(ctx context.Context, session envoySession) {
+		if roster != nil {
+			roster.SetAgents(nil) // the joined agents hear nothing more
 		}
-		c.Stop()
+		closeCtx, done := context.WithTimeout(ctx, 5*time.Second)
+		defer done()
+		if err := session.Close(closeCtx); err != nil {
+			logger.Warn("concierge: close the Envoy session", "error", err)
+		}
+	}
+	stop := func(ctx context.Context) {
+		cancel()
+		defer stopConcierge(ctx)
+		// A session already open is closed now, even past the deadline:
+		// its Close gives up at ctx's end (envoy.Session.Close).
+		select {
+		case session := <-sessions:
+			if session != nil {
+				closeSession(ctx, session)
+			}
+			return
+		default:
+		}
+		select {
+		case session := <-sessions:
+			if session != nil {
+				closeSession(ctx, session)
+			}
+		case <-ctx.Done():
+			logger.Warn("concierge: the Envoy session's opening did not end by the shutdown's deadline; a session it still opens is closed when it does", "error", context.Cause(ctx))
+			// Nothing else would close a session that opening completes
+			// later, nor remove its registration from Envoy.
+			go func() {
+				if session := <-sessions; session != nil {
+					closeSession(context.Background(), session)
+				}
+			}()
+		}
 	}
 	return c, stop, nil
 }
@@ -241,25 +273,28 @@ func cancelRecoveredQuestions(store *storage.SQLiteStore, sessionIDs []string) {
 // so the voice says sorry and plays the error sound, until the next settings
 // change tries again.
 type lazyConcierge struct {
-	startFn func() (*concierge.Concierge, func(), error)
+	startFn func() (*concierge.Concierge, func(context.Context), error)
 	onStart func(*concierge.Concierge) // with nil when it stops
 	logger  *slog.Logger
 	answers chan voice.PendingAnswer
 
 	starting sync.Mutex // one start at a time
-	mu       sync.Mutex
-	c        *concierge.Concierge
-	stop     func()
-	fwd      chan struct{} // closed to end c's forward
-	err      error         // why the last start failed
-	gen      int           // each turn-off and the shutdown change it
-	closed   bool
-	off      bool // the voice is turned off: no call starts a Concierge
+	// turningOff counts each turn-off under way, which writes the store
+	// (VoiceOff) after it detached its Concierge: the shutdown waits for it.
+	turningOff sync.WaitGroup
+	mu         sync.Mutex
+	c          *concierge.Concierge
+	stop       func(context.Context)
+	fwd        chan struct{} // closed to end c's forward
+	err        error         // why the last start failed
+	gen        int           // each turn-off and the shutdown change it
+	closed     bool
+	off        bool // the voice is turned off: no call starts a Concierge
 }
 
 var errConciergeOff = errors.New("the voice was turned off")
 
-func newLazyConcierge(start func() (*concierge.Concierge, func(), error), onStart func(*concierge.Concierge), logger *slog.Logger) *lazyConcierge {
+func newLazyConcierge(start func() (*concierge.Concierge, func(context.Context), error), onStart func(*concierge.Concierge), logger *slog.Logger) *lazyConcierge {
 	return &lazyConcierge{startFn: start, onStart: onStart, logger: logger, answers: make(chan voice.PendingAnswer)}
 }
 
@@ -282,7 +317,8 @@ func (l *lazyConcierge) start() (*concierge.Concierge, error) {
 	if l.gen != gen || l.closed || l.off { // turned off or shut down meanwhile
 		l.mu.Unlock()
 		if err == nil {
-			stop()
+			// The shutdown waits for this start within its own deadline.
+			stop(context.Background())
 		}
 		return nil, errConciergeOff
 	}
@@ -330,7 +366,7 @@ func (l *lazyConcierge) started() *concierge.Concierge {
 // off, the running one stops.
 func (l *lazyConcierge) followEnabled(on bool) {
 	if !on {
-		l.halt(false)
+		l.halt(context.Background(), false)
 		return
 	}
 	l.mu.Lock()
@@ -342,8 +378,15 @@ func (l *lazyConcierge) followEnabled(on bool) {
 // halt stops the running Concierge, for a turn-off or, with shutdown, for
 // good. A turn-off first cancels the questions still working and tells their
 // holders (VoiceOff), while the Envoy session is open; a shutdown keeps them
-// for the next start.
-func (l *lazyConcierge) halt(shutdown bool) {
+// for the next start. A shutdown waits for the running Concierge's work and
+// Envoy session within ctx (startConcierge's stop), and also, within ctx,
+// for a start under way, which writes the store as it starts (concierge.New)
+// and then sees the shutdown and stops what it started (start), and for a
+// turn-off under way, which has detached its Concierge and writes the store
+// as it turns it off. At ctx's end it waits no longer: the store refuses what
+// they write once it closes, and is never closed under a statement they run
+// (storage).
+func (l *lazyConcierge) halt(ctx context.Context, shutdown bool) {
 	l.mu.Lock()
 	if l.closed {
 		l.mu.Unlock()
@@ -354,18 +397,44 @@ func (l *lazyConcierge) halt(shutdown bool) {
 	l.gen++
 	c, stop, fwd := l.c, l.stop, l.fwd
 	l.c, l.stop, l.fwd, l.err = nil, nil, nil, nil
+	if !shutdown && c != nil {
+		// Counted under mu: a shutdown that comes after it sees it.
+		l.turningOff.Add(1)
+		defer l.turningOff.Done()
+	}
 	l.mu.Unlock()
-	if c == nil {
-		return
+	if c != nil {
+		if l.onStart != nil {
+			l.onStart(nil)
+		}
+		close(fwd)
+		if !shutdown {
+			c.VoiceOff()
+		}
+		stop(ctx)
 	}
-	if l.onStart != nil {
-		l.onStart(nil)
+	if shutdown {
+		l.waitForStartsAndTurnOffs(ctx)
 	}
-	close(fwd)
-	if !shutdown {
-		c.VoiceOff()
+}
+
+// waitForStartsAndTurnOffs waits, within ctx, for a start under way, which
+// holds starting until it has seen the shutdown and stopped what it started
+// (no later start takes it: current), and for each turn-off under way, which
+// was counted before closed was set (no later one starts: closed).
+func (l *lazyConcierge) waitForStartsAndTurnOffs(ctx context.Context) {
+	ended := make(chan struct{})
+	go func() {
+		defer close(ended)
+		l.starting.Lock()
+		defer l.starting.Unlock()
+		l.turningOff.Wait()
+	}()
+	select {
+	case <-ended:
+	case <-ctx.Done():
+		l.logger.Warn("concierge: a start or turn-off still runs at the shutdown's deadline; the store refuses what it writes once it closes", "error", context.Cause(ctx))
 	}
-	stop()
 }
 
 func (l *lazyConcierge) forward(in <-chan voice.PendingAnswer, done <-chan struct{}) {
@@ -386,8 +455,9 @@ func (l *lazyConcierge) forward(in <-chan voice.PendingAnswer, done <-chan struc
 	}
 }
 
-// Stop stops the Concierge if it runs, at shutdown.
-func (l *lazyConcierge) Stop() { l.halt(true) }
+// Stop stops the Concierge if it runs, at shutdown, waiting within ctx for a
+// start or turn-off under way (halt).
+func (l *lazyConcierge) Stop(ctx context.Context) { l.halt(ctx, true) }
 
 func (l *lazyConcierge) Tools(x *voice.Exchange) voice.ToolRunner {
 	c, err := l.start()

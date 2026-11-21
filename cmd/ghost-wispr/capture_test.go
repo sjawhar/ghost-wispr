@@ -1702,7 +1702,9 @@ func TestResumingEndsAtTheStallLimit(t *testing.T) {
 }
 
 // storeSessions returns a session manager on a real SQLite store, which has
-// one database connection.
+// one database connection. At the test's end the manager's background work,
+// the summaries of the sessions it ended, stops before the store closes, as
+// main's stop does.
 func storeSessions(t *testing.T) (*storage.SQLiteStore, *session.Manager) {
 	t.Helper()
 	store, err := storage.NewSQLiteStore(filepath.Join(t.TempDir(), "ghost-wispr.db"))
@@ -1710,7 +1712,15 @@ func storeSessions(t *testing.T) (*storage.SQLiteStore, *session.Manager) {
 		t.Fatalf("open store: %v", err)
 	}
 	t.Cleanup(func() { _ = store.Close() })
-	return store, session.NewManager(store, nil, nil, nil, session.NewDetector(time.Hour), 0)
+	manager := session.NewManager(store, nil, nil, nil, session.NewDetector(time.Hour), 0)
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := manager.StopBackground(ctx); err != nil {
+			t.Errorf("the session manager's background work did not stop: %v", err)
+		}
+	})
+	return store, manager
 }
 
 // holdDatabase takes the store's one connection, as a long search query or an

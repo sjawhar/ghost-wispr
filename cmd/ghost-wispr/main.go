@@ -41,6 +41,7 @@ import (
 	"github.com/sjawhar/ghost-wispr/internal/providererr"
 	"github.com/sjawhar/ghost-wispr/internal/server"
 	"github.com/sjawhar/ghost-wispr/internal/session"
+	"github.com/sjawhar/ghost-wispr/internal/stopping"
 	"github.com/sjawhar/ghost-wispr/internal/storage"
 	"github.com/sjawhar/ghost-wispr/internal/summary"
 	"github.com/sjawhar/ghost-wispr/internal/transcribe"
@@ -81,9 +82,15 @@ func importRestoredDriveSession(store *storage.SQLiteStore, restoredAt func() ti
 
 // newMergedRefinementFailureRecorder returns the merge hook's failure
 // recorder: a merged session whose refinement could not run reads failed, so
-// the page offers Retry refinement rather than waiting forever.
+// the page offers Retry refinement rather than waiting forever. A refinement
+// the stop cut off did not fail: it is left as it is, for the next start
+// (stopping.ErrStopped).
 func newMergedRefinementFailureRecorder(store *storage.SQLiteStore) func(context.Context, string, error) {
-	return func(_ context.Context, sessionID string, cause error) {
+	return func(ctx context.Context, sessionID string, cause error) {
+		if stopping.CutOff(ctx) {
+			slog.Info("merged refinement cut off by the stop; the next start takes it up", "session_id", sessionID, "cause", cause)
+			return
+		}
 		generation, err := store.DeletionGeneration(sessionID)
 		if err == nil {
 			err = store.UpdateRefinementAtGeneration(sessionID, "", storage.RefinementFailed, "", generation)
@@ -736,26 +743,35 @@ func gcConfig(cfg *config.Config, drive sessionSyncer) gc.Config {
 const keptRawRefreshEvery = time.Minute
 
 // refreshKeptRawRecordings keeps cache up to date with the raw recordings the
-// app keeps (keptRecordings.census), every interval until ctx ends. GET
-// /api/status reads the cache, so a stuck disk or a hung recording write
-// cannot hang the status. The status warns once they take more than a tenth
-// of the audio budget, which they are not counted against, or as soon as
-// there is one when there is no budget (0): GC never removes them.
-func refreshKeptRawRecordings(ctx context.Context, kept *keptRecordings, budgetMB func() int, cache *atomic.Pointer[server.KeptRawRecordings], interval time.Duration) {
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-	for {
+// app keeps (keptRecordings.census), every interval until ctx ends or the stop
+// refuses a pass: each pass reads the store, as work the stop waits for
+// (runPasses). GET /api/status reads the cache, so a stuck disk or a hung
+// recording write cannot hang the status. The status warns once they take
+// more than a tenth of the audio budget, which they are not counted against,
+// or as soon as there is one when there is no budget (0): GC never removes
+// them.
+func refreshKeptRawRecordings(ctx context.Context, background backgroundWork, kept *keptRecordings, budgetMB func() int, cache *atomic.Pointer[server.KeptRawRecordings], interval time.Duration) {
+	runPasses(ctx, background, interval, func(context.Context) {
 		census := kept.census()
 		if budget, limited := gc.AudioBudgetBytes(budgetMB()); limited {
 			census.WarnBytes = budget / 10
 		}
 		cache.Store(&census)
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-		}
-	}
+	})
+}
+
+// startEmbeddingBackfill indexes, in the background and as work the stop cuts
+// off and waits for, the sessions with no embeddings
+// (embedding.Indexer.BackfillMissing).
+func startEmbeddingBackfill(ctx context.Context, background backgroundWork, indexer *embedding.Indexer) {
+	go func() {
+		_ = background.Run(ctx, func(ctx context.Context) error {
+			if err := indexer.BackfillMissing(ctx); err != nil && ctx.Err() == nil {
+				slog.Warn("embedding backfill failed", "error", err)
+			}
+			return nil
+		})
+	}()
 }
 
 // makeDeepgramClientFactory dials live-transcription sockets the app owns
@@ -785,8 +801,16 @@ func makeDeepgramClientFactory(_ context.Context, apiKey string, cOptions *inter
 
 type mergedSessionHookStore interface {
 	GetSession(string) (storage.Session, error)
+	ClaimRefinement(id, audioPath string) (generation int, claimed bool, err error)
 }
 
+// onSessionMerged refines the session a merge made, then summarizes it. A
+// merge that took a recording removed from this unit (audio_removed_at)
+// restores it first, through retryRefinement; the refinement is claimed
+// before that, so a stop during the restore leaves it running, which the next
+// start retries once (storage.SQLiteStore.RecoverStaleRefinements). Left
+// pending, nothing would: no recovery lists a pending refinement, and the
+// page offers no Retry for one.
 func onSessionMerged(ctx context.Context, store mergedSessionHookStore, refine func(context.Context, string, string, time.Time) error, summarize func(context.Context, string, time.Time) error, retryRefinement func(context.Context, string) error, recordRefinementFailure func(context.Context, string, error), sessionID string) {
 	merged, err := store.GetSession(sessionID)
 	if err != nil {
@@ -794,6 +818,11 @@ func onSessionMerged(ctx context.Context, store mergedSessionHookStore, refine f
 		return
 	}
 	if merged.AudioRemovedAt != "" {
+		if merged.AudioPath != "" {
+			if _, _, err := store.ClaimRefinement(sessionID, merged.AudioPath); err != nil {
+				slog.Warn("claim merged session's refinement before restoring its recordings", "session_id", sessionID, "error", err)
+			}
+		}
 		if err := retryRefinement(ctx, sessionID); err != nil {
 			recordRefinementFailure(ctx, sessionID, err)
 			if err := summarize(ctx, sessionID, merged.StartedAt); err != nil {
@@ -1114,9 +1143,10 @@ func main() {
 		startupSummarizer.OnResult = llmHealthOnResult
 	}
 
-	// ctx ends at shutdown; the capture gate's pause and the mic loops stop with it.
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	// ctx ends at shutdown; the capture gate's pause and the mic loops stop
+	// with it, and work it cuts off reads as stopped (newAppContext).
+	ctx, stopApp := newAppContext()
+	defer stopApp()
 
 	var resilientRef atomic.Pointer[transcribe.ResilientClient]
 	var deepgramSendRef atomic.Pointer[transcribe.AsyncSender]
@@ -1325,7 +1355,7 @@ func main() {
 	// its saved recording or cannot take it; its census feeds the status.
 	kept := newKeptRecordings(store, audioRecorder, cfg.AudioDir, drive, refineRecoveredRecording(manager))
 	var keptRaw atomic.Pointer[server.KeptRawRecordings]
-	go refreshKeptRawRecordings(ctx, kept, func() int { return cfgStore.Get().GCMaxAudioSizeMB }, &keptRaw, keptRawRefreshEvery)
+	go refreshKeptRawRecordings(ctx, manager, kept, func() int { return cfgStore.Get().GCMaxAudioSizeMB }, &keptRaw, keptRawRefreshEvery)
 	gcHealthState := &gcHealth{}
 	gcHealthState.countUnverified(store)
 
@@ -1333,11 +1363,15 @@ func main() {
 	// the store, while its segment is there, naming the session and the
 	// segment's time.
 	refusedCuts := newRefusedCuts(store)
-	deletion, err := newAppDeleteRunner(store, cfgStore, manager.RefineSession, manager.SummarizeSession, refusedCuts, warningRegistry, appLogger)
+	deletion, err := newAppDeleteRunner(store, cfgStore, manager, manager.RefineSession, manager.SummarizeSession, refusedCuts, warningRegistry, appLogger)
 	if err != nil {
 		panic(fmt.Sprintf("segment deletion: %v", err))
 	}
-	recordMergedRefinementFailure := newMergedRefinementFailureRecorder(store)
+	var presetSummaries presetSummarizer
+	var mergedSummarizer session.ReportedSummarizer
+	if summarizer != nil {
+		presetSummaries, mergedSummarizer = summarizer, summarizer
+	}
 
 	controlHooks := &server.ControlHooks{
 		IsPaused: capture.IsPaused,
@@ -1373,55 +1407,11 @@ func main() {
 			return server.KeptRawRecordings{}
 		},
 		GetLogs: logSink.GetLogs,
-		// RetrySync starts a sync of the session in the background and says
-		// at once if none can start (for a session whose Drive folder was
-		// deleted, while Drive says it is not back), so the API does not
-		// report a retry that does nothing.
-		RetrySync: func(ctx context.Context, sessionID string) error {
-			return retrySync(ctx, drive.Get(), sessionID)
-		},
-		RefinementRecordingAvailable: deletion.checkRefinementRecording,
-		RetryRefinement:              deletion.retryRefinement,
-		RepairSummaries: func(ctx context.Context) (int, error) {
-			return repairStructuredSummaries(ctx, store, publishSummaryReady)
-		},
 		Presets: func() map[string]config.Preset {
 			if summarizer == nil {
 				return nil
 			}
 			return summarizer.Presets()
-		},
-		Resummarize: func(ctx context.Context, sessionID, preset string) error {
-			if summarizer == nil {
-				return fmt.Errorf("summarization not configured")
-			}
-			return resummarize(ctx, store, summarizer, hub, publishSummaryReady, sessionID, preset)
-		},
-		OnSessionMerged: func(ctx context.Context, sessionID string) {
-			onSessionMerged(
-				ctx,
-				store,
-				manager.RefineSession,
-				func(ctx context.Context, sessionID string, startedAt time.Time) error {
-					if summarizer == nil {
-						return manager.SummarizeSession(ctx, sessionID, startedAt)
-					}
-					summarizeMergedSession(ctx, store, summarizer, hub, publishSummaryReady, sessionID)
-					return nil
-				},
-				deletion.retryRefinement,
-				recordMergedRefinementFailure,
-				sessionID,
-			)
-		},
-		EndSession: func(ctx context.Context) error {
-			return manager.ForceEndSession(ctx)
-		},
-		StartSession: func(ctx context.Context, titleHint string) (string, error) {
-			return manager.ManualStartSession(ctx, titleHint)
-		},
-		StopSession: func(ctx context.Context, sessionID string) error {
-			return manager.StopSession(ctx, sessionID)
 		},
 		TestPreset: func(ctx context.Context, presetName, sessionID string) (string, error) {
 			latestCfg := cfgStore.Get()
@@ -1576,7 +1566,18 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 				Model:        current.Model,
 			}, nil
 		},
-		RestoreFromGDrive: func(ctx context.Context) (map[string]any, error) {
+	}
+	wireStoreWork(controlHooks, &storeWork{
+		manager:                       manager,
+		store:                         store,
+		drive:                         drive,
+		deletion:                      deletion,
+		summarizer:                    presetSummaries,
+		mergedSummarizer:              mergedSummarizer,
+		hub:                           hub,
+		publishSummaryReady:           publishSummaryReady,
+		recordMergedRefinementFailure: newMergedRefinementFailureRecorder(store),
+		restoreFromDrive: func(ctx context.Context) (*gdrive.RestoreResult, error) {
 			latestCfg := cfgStore.Get()
 			if latestCfg.GDriveFolderID == "" {
 				return nil, fmt.Errorf("google drive folder ID not configured")
@@ -1585,30 +1586,11 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 			if err != nil {
 				return nil, err
 			}
-			result, err := syncer.RestoreFromDrive(ctx, importRestoredDriveSession(store, func() time.Time { return time.Now().UTC() }))
-			if err != nil {
-				return nil, err
-			}
-			return map[string]any{
-				"restored": result.Restored,
-				"skipped":  result.Skipped,
-				"errors":   result.Errors,
-			}, nil
+			return syncer.RestoreFromDrive(ctx, importRestoredDriveSession(store, func() time.Time { return time.Now().UTC() }))
 		},
-		BatchBackfill: func(ctx context.Context) (string, int, error) {
-			sessionIDs, err := store.GetSessionsForBackfill()
-			if err != nil {
-				return "", 0, fmt.Errorf("query sessions: %w", err)
-			}
-			if len(sessionIDs) == 0 {
-				return "", 0, nil
-			}
-			return submitSummaryBatch(ctx, sessionIDs)
-		},
-		BatchPoll: func(ctx context.Context, batchName string) (map[string]any, error) {
-			return pollSummaryBatch(ctx, batchName)
-		},
-	}
+		submitSummaryBatch: submitSummaryBatch,
+		pollSummaryBatch:   pollSummaryBatch,
+	})
 	wireSegmentDeletion(controlHooks, warningRegistry, refusedCuts, deletion)
 	wireVoiceSegmentDeletion(controlHooks, &voiceHooks)
 
@@ -1655,11 +1637,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 	envoyEvents.configure(ctx, &cfg, appLogger)
 	envoyEvents.publishRecoveredEnds(recoveredIDs)
 	if indexer != nil {
-		go func() {
-			if err := indexer.BackfillMissing(ctx); err != nil && ctx.Err() == nil {
-				slog.Warn("embedding backfill failed", "error", err)
-			}
-		}()
+		startEmbeddingBackfill(ctx, manager, indexer)
 	}
 
 	// Register config change callback.
@@ -1708,64 +1686,26 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 			manager.SetSyncer(syncer)
 		})
 
-	// Summarize recovered sessions (and any with pending/empty summaries).
+	// Summarize recovered sessions (and any with pending/empty summaries), as
+	// work the stop cuts off and waits for.
 	if startupSummarizer != nil {
-		go func() {
-			pendingIDs, err := store.GetSessionsForBackfill()
-			if err != nil {
-				slog.Warn("failed to query sessions needing summary", "error", err)
-				return
-			}
-			if len(pendingIDs) == 0 {
-				return
-			}
-			if len(pendingIDs) >= 4 {
-				batchName, count, err := submitSummaryBatch(ctx, pendingIDs)
-				if err == nil {
-					log.Printf("startup: submitting %d sessions to batch summarization", count)
-					go func(batchName string) {
-						ticker := time.NewTicker(30 * time.Second)
-						defer ticker.Stop()
-						for {
-							result, err := pollSummaryBatch(ctx, batchName)
-							if err != nil {
-								if ctx.Err() != nil {
-									return
-								}
-								slog.Warn("startup batch job poll failed", "batch", batchName, "error", err)
-							} else if state, _ := result["state"].(string); state != "" {
-								succeeded, _ := result["succeeded"].(int)
-								failed, _ := result["failed"].(int)
-								switch state {
-								case string(genai.JobStateSucceeded), string(genai.JobStatePartiallySucceeded):
-									log.Printf("startup: batch job %s complete: %d succeeded, %d failed", batchName, succeeded, failed)
-									return
-								case string(genai.JobStateFailed):
-									if errMsg, _ := result["error"].(string); errMsg != "" {
-										log.Printf("startup: batch job %s failed: %s", batchName, errMsg)
-									} else {
-										log.Printf("startup: batch job %s failed", batchName)
-									}
-									return
-								}
-							}
-							select {
-							case <-ctx.Done():
-								return
-							case <-ticker.C:
-							}
-						}
-					}(batchName)
-					return
-				}
-				slog.Warn("startup batch submission failed; falling back to synchronous summarization", "sessions", len(pendingIDs), "error", err)
-			}
-			for _, id := range pendingIDs {
-				summarizeBackfillSession(ctx, store, startupSummarizer, publishSummaryReady, id)
-			}
-		}()
+		startSummaryBackfill(ctx, manager, summaryBackfill{
+			store:      store,
+			summarizer: startupSummarizer,
+			publish:    publishSummaryReady,
+			submit:     submitSummaryBatch,
+			poll:       pollSummaryBatch,
+			pollEvery:  30 * time.Second,
+		})
 	}
-	defer func() { _ = store.Close() }()
+	// The shutdown closes the store within its deadline (closeStore); a
+	// return before it closes it here.
+	storeClosing := false
+	defer func() {
+		if !storeClosing {
+			_ = store.Close()
+		}
+	}()
 
 	var deletionDrive deletionRecordingSource
 	if cfg.GDriveFolderID != "" && cfg.GDriveSyncEnabled {
@@ -1787,7 +1727,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 	// A session delete stops a save of the session's kept raw recording
 	// before it erases the session's files.
 	controlHooks.HoldSessionAudio = kept.Hold
-	go sweepDriveSync(ctx, store, drive, warningRegistry, 5*time.Minute, kept)
+	go sweepDriveSync(ctx, manager, store, drive, warningRegistry, 5*time.Minute, kept)
 
 	go func() {
 		ticker := time.NewTicker(5 * time.Minute)
@@ -2096,7 +2036,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 		})
 		joinedLink.set(roster)
 		wireJoinedRoutes(controlHooks, roster)
-		conc = newLazyConcierge(func() (*concierge.Concierge, func(), error) {
+		conc = newLazyConcierge(func() (*concierge.Concierge, func(context.Context), error) {
 			current := cfgStore.Get()
 			// The session page reads a session's questions again on each change.
 			return startConcierge(ctx, &current, store, appLogger, func(sessionID string) {
@@ -2174,12 +2114,17 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 	}
 	// The recordings a stop cut off (storage.RecoverStaleSessions ended their
 	// sessions above) are saved now, not at the first sweep.
-	go kept.run(ctx)
+	go func() {
+		_ = manager.Run(ctx, func(ctx context.Context) error {
+			kept.run(ctx)
+			return nil
+		})
+	}()
 	// The refinements a stop cut off (recoverAtStart above) are retried, after
 	// the cleanup above, since a retry may restore recordings.
 	recovery.retry(ctx, warningRegistry, deletion.retryRefinement)
 	if cfg.GCEnabled {
-		go collectGarbage(ctx, cfgStore, deletionNoticeGCStore{SQLiteStore: store, hub: hub, onDeleted: sessionsForgotten}, drive, gcHealthState, warningRegistry, appLogger, gcEvery)
+		go collectGarbage(ctx, manager, cfgStore, deletionNoticeGCStore{SQLiteStore: store, hub: hub, onDeleted: sessionsForgotten}, drive, gcHealthState, warningRegistry, appLogger, gcEvery)
 	}
 
 	// Create health checker with actual component references. With no Deepgram
@@ -2227,7 +2172,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 	log.Println("ghost-wispr: shutting down")
 	// The voice stops first: its session, its speech and the Concierge's calls.
 	voiceHooks.Close()
-	cancel()
+	stopApp()
 	manager.StopSessionStartPublishes()
 	// Each mic loop closes its microphone and ends, even if its device
 	// delivers no frame. Stopping the device or terminating PortAudio while a
@@ -2252,6 +2197,10 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer shutdownCancel()
 
+	// No request runs once the stop waits for the store's work: a request
+	// after it (a manual start or end, a merge, a delete) would start work
+	// the stop has already refused or no longer waits for.
+	stopServing(shutdownCtx, httpServer, httpShutdownWait)
 	recovery.stop(shutdownCtx, manager, lifecyclePublishWait)
 
 	if dgStop != nil {
@@ -2261,7 +2210,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 		_ = mic.Stop()
 	}
 	if conc != nil {
-		conc.Stop()
+		conc.Stop(shutdownCtx)
 	}
 	if ttsOrchestrator != nil {
 		ttsOrchestrator.Stop()
@@ -2272,12 +2221,11 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 		}
 	}
 
-	if err := httpServer.Shutdown(shutdownCtx); err != nil {
-		slog.Warn("http shutdown failed", "error", err)
-	}
 	if micLoopsEnded {
 		_ = audio.TerminatePortAudio() // best-effort cleanup
 	}
+	storeClosing = true
+	closeStore(shutdownCtx, store)
 }
 
 // micStreamer is the capture device the mic loop drives. Open opens a fresh

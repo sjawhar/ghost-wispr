@@ -165,12 +165,18 @@ func refinementRecordingPaths(q querier, query string, args ...any) ([]string, e
 // RestoreAudioForRefinement records recordings restored from Drive so the
 // normal generation-fenced refinement path can claim and process them. It
 // writes only when audioPath remains the path read before the restoration.
+// The refinement becomes pending, unless it is running: a merge claims its
+// refinement before it restores a removed recording (onSessionMerged), so a
+// stop between the restore and the refinement leaves it running, which the
+// next start retries (RecoverStaleRefinements).
 func (s *SQLiteStore) RestoreAudioForRefinement(id, beforeAudioPath, restoredAudioPath string) (bool, error) {
 	if strings.TrimSpace(restoredAudioPath) == "" {
 		return false, errors.New("restored audio path is required")
 	}
-	res, err := s.db.Exec(`UPDATE sessions SET audio_path = ?, audio_removed_at = '', refinement_status = ? WHERE id = ? AND audio_path = ?`,
-		restoredAudioPath, RefinementPending, id, beforeAudioPath)
+	res, err := s.db.Exec(`UPDATE sessions SET audio_path = ?, audio_removed_at = '',
+			refinement_status = CASE WHEN refinement_status = ? THEN refinement_status ELSE ? END
+		WHERE id = ? AND audio_path = ?`,
+		restoredAudioPath, RefinementRunning, RefinementPending, id, beforeAudioPath)
 	if err != nil {
 		return false, fmt.Errorf("record restored audio for session %s: %w", id, err)
 	}

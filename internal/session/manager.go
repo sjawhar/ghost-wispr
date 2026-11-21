@@ -14,6 +14,7 @@ import (
 	api "github.com/deepgram/deepgram-go-sdk/v3/pkg/api/listen/v1/websocket/interfaces"
 
 	"github.com/sjawhar/ghost-wispr/internal/logging"
+	"github.com/sjawhar/ghost-wispr/internal/stopping"
 	"github.com/sjawhar/ghost-wispr/internal/storage"
 	"github.com/sjawhar/ghost-wispr/internal/summary"
 	"github.com/sjawhar/ghost-wispr/internal/transcribe"
@@ -62,6 +63,22 @@ type Manager struct {
 	resumes                        int           // capture resumes so far
 	lifecyclePublishes             sync.WaitGroup
 	lifecycleStartPublishesStopped bool
+
+	// background is the context of the work StopBackground cancels, with
+	// stopping.ErrStopped, and waits for, so the store closes under none of
+	// it: every goroutine that writes the store and that no caller waits for
+	// starts through Go, or runs inside Run. That is the work a session's end
+	// leaves running (its refinement and summary, and the sync, index and
+	// publish a summary starts), this manager's own entry points
+	// (RefineSession, SummarizeSession, the session-ended hook), and the app's
+	// background work on the store. Once stopped (backgroundStopped, under mu),
+	// nothing more starts. backgroundRunning, under mu, counts the work still
+	// running.
+	background        context.Context
+	stopBackground    context.CancelCauseFunc
+	backgroundWork    sync.WaitGroup
+	backgroundRunning int
+	backgroundStopped bool
 }
 
 // sessionEnd is how far an end of a session got. An end that fails leaves it
@@ -111,6 +128,7 @@ func NewManager(store Store, recorder Recorder, summarizer Summarizer, hub Event
 	}
 	m.startsDone = sync.NewCond(&m.mu)
 	m.endsDone = sync.NewCond(&m.mu)
+	m.background, m.stopBackground = context.WithCancelCause(context.Background())
 	detector.OnSessionEnd(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
@@ -663,11 +681,88 @@ func (m *Manager) endSession(ctx context.Context, want string) error {
 	m.mu.Unlock()
 
 	if batchTranscriber != nil && strings.TrimSpace(end.audioPath) != "" {
-		go m.runBatchRefinement(context.Background(), sessionID, end.audioPath)
+		m.Go(func(ctx context.Context) { m.runBatchRefinement(ctx, sessionID, end.audioPath) })
 	}
 
-	go m.generateSummary(context.Background(), sessionID, startedAt)
+	m.Go(func(ctx context.Context) { m.generateSummary(ctx, sessionID, startedAt) })
 	return nil
+}
+
+// Go runs f in the background on the background context, as work
+// StopBackground cancels and waits for, unless StopBackground has run: work
+// it starts then is left to the next start. Every goroutine that writes the
+// store, and that no caller waits for, starts through Go or runs inside Run.
+func (m *Manager) Go(f func(ctx context.Context)) {
+	if !m.beginBackground() {
+		return
+	}
+	go func() {
+		defer m.endBackground()
+		f(m.background)
+	}()
+}
+
+// Run runs f now, as work StopBackground waits for: f's context ends when ctx
+// does, or with stopping.ErrStopped when StopBackground runs. Once
+// StopBackground has run, Run runs nothing and returns stopping.ErrStopped.
+// Work admitted so may itself call Run or Go, which count it again.
+func (m *Manager) Run(ctx context.Context, f func(ctx context.Context) error) error {
+	if !m.beginBackground() {
+		return stopping.ErrStopped
+	}
+	defer m.endBackground()
+	runCtx, cancel := context.WithCancelCause(ctx)
+	defer cancel(nil)
+	stop := context.AfterFunc(m.background, func() { cancel(context.Cause(m.background)) })
+	defer stop()
+	return f(runCtx)
+}
+
+// beginBackground counts a piece of background work that starts, unless
+// StopBackground has run, and reports whether it may start.
+func (m *Manager) beginBackground() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.backgroundStopped {
+		return false
+	}
+	m.backgroundWork.Add(1)
+	m.backgroundRunning++
+	return true
+}
+
+// endBackground counts a piece of background work that ended.
+func (m *Manager) endBackground() {
+	m.mu.Lock()
+	m.backgroundRunning--
+	m.mu.Unlock()
+	m.backgroundWork.Done()
+}
+
+// StopBackground cancels the work admitted through Go and Run, with
+// stopping.ErrStopped, and waits until it has ended or ctx is done, so that
+// the store can close under none of it. With none running it returns nil at
+// once, even once ctx is done. No such work starts after it.
+func (m *Manager) StopBackground(ctx context.Context) error {
+	m.mu.Lock()
+	m.backgroundStopped = true
+	running := m.backgroundRunning
+	m.mu.Unlock()
+	m.stopBackground(stopping.ErrStopped)
+	if running == 0 {
+		return nil
+	}
+	done := make(chan struct{})
+	go func() {
+		m.backgroundWork.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 func (m *Manager) runBatchRefinement(ctx context.Context, sessionID, audioPath string) {
@@ -698,6 +793,12 @@ func (m *Manager) runBatchRefinement(ctx context.Context, sessionID, audioPath s
 	m.mu.Lock()
 	warn := m.refinementWarning
 	m.mu.Unlock()
+	if err != nil && stopping.CutOff(ctx) {
+		// The stop cut it off: it stays running, as a process that exits
+		// inside it leaves it, and the next start runs it again once.
+		m.batchLogger.Info("batch refinement cut off by the stop; the next start runs it again", "operation", "batch_refinement", "session_id", sessionID, "audio_path", audioPath)
+		return
+	}
 	if err != nil {
 		if updateErr := m.store.UpdateRefinementAtGeneration(sessionID, "", storage.RefinementFailed, "", generation); updateErr != nil {
 			m.batchLogger.Error("failed to mark refinement failed", "operation", "batch_refinement", "session_id", sessionID, "audio_path", audioPath, "error", updateErr)
@@ -730,7 +831,8 @@ func (m *Manager) runBatchRefinement(ctx context.Context, sessionID, audioPath s
 // recorded audio, then regenerates the summary from the refined transcript. It
 // recovers sessions that ended without a usable live transcript (e.g. when live
 // transcription was unavailable at capture time). Intended to run off the
-// request path.
+// request path. It runs as work StopBackground waits for (Run), whoever calls
+// it, and returns stopping.ErrStopped once the stop has run.
 func (m *Manager) RefineSession(ctx context.Context, sessionID, audioPath string, startedAt time.Time) error {
 	if strings.TrimSpace(audioPath) == "" {
 		return fmt.Errorf("session %s has no audio to refine", sessionID)
@@ -743,18 +845,23 @@ func (m *Manager) RefineSession(ctx context.Context, sessionID, audioPath string
 		return fmt.Errorf("batch transcription not configured")
 	}
 
-	m.runBatchRefinement(ctx, sessionID, audioPath)
-	m.generateSummary(ctx, sessionID, startedAt)
-	return nil
+	return m.Run(ctx, func(ctx context.Context) error {
+		m.runBatchRefinement(ctx, sessionID, audioPath)
+		m.generateSummary(ctx, sessionID, startedAt)
+		return nil
+	})
 }
 
 // SummarizeSession makes session sessionID's summary again from its
 // transcript as it is, without refining it, then indexes and syncs it as a
 // refinement's summary is: "Delete text" of a session whose audio is gone,
-// so there is nothing to refine.
+// so there is nothing to refine. It runs as work StopBackground waits for
+// (Run), and returns stopping.ErrStopped once the stop has run.
 func (m *Manager) SummarizeSession(ctx context.Context, sessionID string, startedAt time.Time) error {
-	m.generateSummary(ctx, sessionID, startedAt)
-	return nil
+	return m.Run(ctx, func(ctx context.Context) error {
+		m.generateSummary(ctx, sessionID, startedAt)
+		return nil
+	})
 }
 
 func (m *Manager) generateSummary(ctx context.Context, sessionID string, startedAt time.Time) {
@@ -837,6 +944,12 @@ func (m *Manager) generateSummary(ctx context.Context, sessionID string, started
 	if strings.TrimSpace(title) == "" {
 		title = summary.GenerateTitle("", transcript, segments, startedAt)
 	}
+	if err != nil && stopping.CutOff(ctx) {
+		// The stop cut it off: it stays running, and the next start's
+		// backfill makes it (storage.SQLiteStore.GetSessionsForBackfill).
+		m.logger.Info("summary cut off by the stop; the next start makes it", "operation", "generate_summary", "session_id", sessionID)
+		return
+	}
 	if err != nil {
 		m.logger.Error("summarization failed", "operation", "generate_summary", "session_id", sessionID, "error", err)
 		m.failSummary(sessionID, fmt.Sprintf("summarization failed: %v", err), generation)
@@ -869,11 +982,11 @@ func (m *Manager) generateSummary(ctx context.Context, sessionID string, started
 	m.triggerDriveSync(syncer, sessionID)
 
 	if publisher != nil {
-		go func() {
-			if err := publisher.PublishSummaryReady(context.Background(), sessionID); err != nil {
+		m.Go(func(ctx context.Context) {
+			if err := publisher.PublishSummaryReady(ctx, sessionID); err != nil {
 				m.logger.Error("envoy publish failed", "operation", "publish_summary_ready", "session_id", sessionID, "error", err)
 			}
-		}()
+		})
 	}
 }
 
@@ -881,8 +994,8 @@ func (m *Manager) triggerDriveSync(syncer SessionSyncer, sessionID string) {
 	if syncer == nil {
 		return
 	}
-	go func() {
-		if err := syncer.SyncSession(context.Background(), sessionID); err != nil {
+	m.Go(func(ctx context.Context) {
+		if err := syncer.SyncSession(ctx, sessionID); err != nil {
 			m.logger.Error("gdrive sync failed", "operation", "sync_session", "session_id", sessionID, "error", err)
 			if m.hub != nil {
 				m.hub.BroadcastSessionComponentStatus(sessionID, "sync", storage.ComponentStatusError, fmt.Sprintf("Google Drive sync failed for session %s", sessionID))
@@ -890,7 +1003,7 @@ func (m *Manager) triggerDriveSync(syncer SessionSyncer, sessionID string) {
 		} else if m.hub != nil {
 			m.hub.BroadcastSessionComponentStatus(sessionID, "sync", storage.ComponentStatusConnected, fmt.Sprintf("Google Drive synced for session %s", sessionID))
 		}
-	}()
+	})
 }
 
 func (m *Manager) broadcastSummaryStatus(sessionID, title, summary, status, preset string) {
@@ -1009,9 +1122,9 @@ func (m *Manager) SetRefinementWarningHook(hook func(sessionID, warning string))
 	m.refinementWarning = hook
 }
 
-// SetSessionEndedHook sets what runs, in its own goroutine, each time a
-// session ends, kept or discarded: the meeting voice cancels the questions
-// the ended meeting still waits on.
+// SetSessionEndedHook sets what runs, in its own goroutine and as work
+// StopBackground waits for (Go), each time a session ends, kept or discarded:
+// the meeting voice cancels the questions the ended meeting still waits on.
 func (m *Manager) SetSessionEndedHook(hook func(sessionID string)) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -1080,13 +1193,13 @@ func (m *Manager) triggerEmbeddingIndexAtGeneration(sessionID, transcript string
 		return
 	}
 
-	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	m.Go(func(background context.Context) {
+		ctx, cancel := context.WithTimeout(background, 45*time.Second)
 		defer cancel()
 		if err := indexer.IndexSessionAtGeneration(ctx, sessionID, transcript, generation); err != nil {
 			m.logger.Error("embedding index failed", "operation", "generate_summary", "session_id", sessionID, "error", err)
 		}
-	}()
+	})
 }
 
 func (m *Manager) OnTranscriptionDisconnect() {

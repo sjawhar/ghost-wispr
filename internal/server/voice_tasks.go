@@ -30,7 +30,7 @@ type voiceTaskView struct {
 // registerVoiceTasksRoute serves GET /api/sessions/{id}/voice-tasks: the
 // questions the voice sent agents in the session and in the sessions merged
 // into it, whose page it now is, oldest first.
-func registerVoiceTasksRoute(mux *http.ServeMux, store SessionStore) {
+func registerVoiceTasksRoute(mux routeMux, store SessionStore) {
 	mux.HandleFunc("GET /api/sessions/{id}/voice-tasks", func(w http.ResponseWriter, r *http.Request) {
 		sessionID := r.PathValue("id")
 		if !storage.ValidSessionID(sessionID) {

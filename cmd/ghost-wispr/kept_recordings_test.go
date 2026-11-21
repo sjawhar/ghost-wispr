@@ -187,7 +187,9 @@ func TestARecordingTheAppStoppedInsideIsSavedSyncedThenErased(t *testing.T) {
 
 	// The sync sweep uploads it; the raw recording goes only after that.
 	ctx, cancel := context.WithCancel(context.Background())
-	swept := goDone(func() { sweepDriveSync(ctx, store, syncer, newWarningsRegistry(), time.Millisecond, kept) })
+	swept := goDone(func() {
+		sweepDriveSync(ctx, directBackground{}, store, syncer, newWarningsRegistry(), time.Millisecond, kept)
+	})
 	defer func() {
 		cancel()
 		if !returnedWithin(swept, testWait) {

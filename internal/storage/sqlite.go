@@ -168,6 +168,9 @@ var ftsQueryTokenPattern = regexp.MustCompile(`[-+]?[\p{L}\p{N}_]+`)
 
 type SQLiteStore struct {
 	db *sql.DB
+	// gate refuses every statement once the store is closing, and Close
+	// waits for those under way (storeGate).
+	gate *storeGate
 	// path is the database file, beside which createPreMigrationBackup keeps
 	// its backup.
 	path string
@@ -205,17 +208,15 @@ func NewSQLiteStore(dbPath string) (*SQLiteStore, error) {
 	// the blocks it frees), foreign keys (the cascades that remove a session's
 	// rows) and the busy timeout. Set with PRAGMA once, they held for the first
 	// connection only.
-	db, err := sql.Open("sqlite", fmt.Sprintf("%s?_pragma=secure_delete(1)&_pragma=temp_store(2)&_pragma=foreign_keys(1)&_pragma=busy_timeout(%d)", dbPath, busyTimeoutMillis))
-	if err != nil {
-		return nil, fmt.Errorf("open sqlite database: %w", err)
-	}
+	gate := &storeGate{}
+	db := sql.OpenDB(&gatedConnector{dsn: fmt.Sprintf("%s?_pragma=secure_delete(1)&_pragma=temp_store(2)&_pragma=foreign_keys(1)&_pragma=busy_timeout(%d)", dbPath, busyTimeoutMillis), gate: gate})
 
 	// One connection keeps refined deletion out of Canonicalize's transaction.
 	// TestR7OpenTransactionExcludesRefinedDelete guards this invariant.
 	db.SetMaxOpenConns(1)
 	db.SetMaxIdleConns(1)
 
-	store := &SQLiteStore{db: db, path: dbPath}
+	store := &SQLiteStore{db: db, gate: gate, path: dbPath}
 
 	if err := store.init(dbPath); err != nil {
 		_ = db.Close()
@@ -1013,11 +1014,35 @@ func (s *SQLiteStore) init(dbPath string) error {
 	return nil
 }
 
+// Close closes the store: it refuses every statement from now on, waits for
+// those under way, then closes the database's connection. CloseWithin bounds
+// the wait.
 func (s *SQLiteStore) Close() error {
+	return s.CloseWithin(context.Background())
+}
+
+// CloseWithin closes the store as Close does, waiting within ctx for the
+// statements and transactions under way. When they outlast ctx, it leaves
+// the connection open under them and returns ctx's error: the store refuses
+// every other statement, and a process that exits then leaves SQLite to the
+// operating system, which its write-ahead log makes safe. It never closes
+// the database under a writer.
+//
+// It closes the connection, not the handle (sql.DB.Close): a statement after
+// it then fails with stopping.ErrStopped, from the gate, where on a closed
+// handle database/sql would answer that the database is closed. The handle's
+// one idle goroutine stays until the process exits.
+func (s *SQLiteStore) CloseWithin(ctx context.Context) error {
 	if s == nil || s.db == nil {
 		return nil
 	}
-	return s.db.Close()
+	if err := s.gate.close(ctx); err != nil {
+		return err
+	}
+	// No idle connection is kept, so the store's one closes now; the shut
+	// gate refuses to open another.
+	s.db.SetMaxIdleConns(0)
+	return nil
 }
 
 func (s *SQLiteStore) DB() *sql.DB {

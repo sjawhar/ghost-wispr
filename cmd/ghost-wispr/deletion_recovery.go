@@ -33,23 +33,27 @@ func (e refinementAfterSegmentDeletionError) Error() string {
 func (e refinementAfterSegmentDeletionError) Unwrap() error { return e.err }
 
 // recoverAtStart runs recoverPendingSplices as the app starts and keeps its
-// outcomes on /api/status.
+// outcomes on /api/status, as work the stop cuts off and waits for
+// (d.background.Run).
 func (d *segmentDeleteRunner) recoverAtStart(ctx context.Context, source deletionRecordingSource, registry *warningsRegistry) {
-	outcomes, err := d.recoverPendingSplices(ctx, source)
-	applyPendingSpliceRecoveryWarnings(registry, outcomes)
-	if err != nil {
-		recordPendingSpliceRecoveryWarning(registry, err)
-		return
-	}
-	recovered := 0
-	for i := range outcomes {
-		if outcomes[i].Recovered {
-			recovered++
+	_ = d.background.Run(ctx, func(ctx context.Context) error {
+		outcomes, err := d.recoverPendingSplices(ctx, source)
+		applyPendingSpliceRecoveryWarnings(registry, outcomes)
+		if err != nil {
+			recordPendingSpliceRecoveryWarning(registry, err)
+			return nil
 		}
-	}
-	if recovered > 0 {
-		log.Printf("recovered %d pending segment splices", recovered)
-	}
+		recovered := 0
+		for i := range outcomes {
+			if outcomes[i].Recovered {
+				recovered++
+			}
+		}
+		if recovered > 0 {
+			log.Printf("recovered %d pending segment splices", recovered)
+		}
+		return nil
+	})
 }
 
 // recoverPendingSplices completes, as the app starts, recordings whose

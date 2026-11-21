@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"path/filepath"
 	"testing"
 	"time"
@@ -42,7 +43,7 @@ func TestTheConciergeStartsWithoutReach(t *testing.T) {
 			if err != nil {
 				t.Fatalf("startConcierge: %v", err)
 			}
-			defer stop()
+			defer stop(context.Background())
 			if c == nil {
 				t.Fatal("no Concierge")
 			}
@@ -58,7 +59,7 @@ func TestTheConciergeStartsWithoutReach(t *testing.T) {
 func TestTheConciergeNeedsAModel(t *testing.T) {
 	cfg := config.Config{GenAIBackend: "gemini"}
 	if c, stop, err := startConcierge(t.Context(), &cfg, conciergeStore(t), discardLogger, nil, nil); err == nil {
-		stop()
+		stop(context.Background())
 		t.Fatalf("started a Concierge %v with no model credentials", c)
 	}
 }
@@ -82,7 +83,7 @@ func TestTheConciergeTellsTheSessionPageOfChanges(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer stop()
+	defer stop(context.Background())
 	if err := c.SessionEnded("meeting"); err != nil {
 		t.Fatal(err)
 	}

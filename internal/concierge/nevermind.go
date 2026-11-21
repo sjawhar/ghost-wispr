@@ -29,8 +29,14 @@ func (c *Concierge) QuestionsAsked() uint64 {
 // counts as asked first. A question that stopped working before its cancel
 // landed, as when its answer arrived meanwhile, is passed over for the next
 // one. With no such question it does nothing and reports false: the voice
-// then drops its newest held answer.
+// then drops its newest held answer. It is work Stop waits for; after Stop it
+// cancels nothing.
 func (c *Concierge) NeverMind(ctx context.Context, sessionID string, asked uint64) (bool, error) {
+	ctx, leave, ok := c.enter(ctx)
+	if !ok {
+		return false, errStopped
+	}
+	defer leave()
 	if err := ctx.Err(); err != nil {
 		return false, err // the voice stopped: nothing to cancel for it
 	}

@@ -12,6 +12,7 @@ import (
 	"google.golang.org/api/drive/v3"
 
 	"github.com/sjawhar/ghost-wispr/internal/logging"
+	"github.com/sjawhar/ghost-wispr/internal/stopping"
 	"github.com/sjawhar/ghost-wispr/internal/storage"
 	"github.com/sjawhar/ghost-wispr/internal/transcribe"
 )
@@ -333,6 +334,15 @@ func (o *Orchestrator) syncClaimed(ctx context.Context, sess *storage.Session, c
 		if done, err = o.markSynced(sess, claim, driveFolderID, &syncSess, segments); done {
 			return err
 		}
+	}
+	if err != nil && stopping.CutOff(ctx) {
+		// The app's stop cut the sync off. It stays SYNCING, its claim
+		// held, as an exit inside it leaves it, and the next start's
+		// recovery moves it on (storage.SQLiteStore.RecoverInterruptedSyncs):
+		// a sync claimed from REMOTE_DELETED goes back to it, its retry count
+		// as it was.
+		o.logger.Info("gdrive sync cut off by the stop; the next start recovers it", "operation", "sync_session", "session_id", sessionID, "error", err)
+		return fmt.Errorf("sync %s cut off by the stop: %w", sessionID, err)
 	}
 	return o.endFailedSync(sess, claim, driveFolderID, err)
 }

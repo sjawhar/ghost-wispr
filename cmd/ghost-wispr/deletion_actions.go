@@ -108,9 +108,10 @@ func (d *segmentDeleteRunner) refinedSegmentsAvailable(session *storage.Session)
 }
 
 // startRetryRefinement starts Retry refinement of session sessionID in the
-// background; a failure is kept on /api/status (retryRefinement).
+// background, as work the stop cuts off and waits for (d.background.Go); a
+// failure is kept on /api/status (retryRefinement).
 func (d *segmentDeleteRunner) startRetryRefinement(sessionID string) {
-	go func() { _ = d.retryRefinement(context.Background(), sessionID) }()
+	d.background.Go(func(ctx context.Context) { _ = d.retryRefinement(ctx, sessionID) })
 }
 
 // DeleteRefinedAudio removes the selected stored word span from its recording.

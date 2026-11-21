@@ -254,13 +254,13 @@ func TestTheConciergeStartsOnFirstUse(t *testing.T) {
 	store := conciergeStore(t)
 	starts := 0
 	var started *concierge.Concierge
-	lazy := newLazyConcierge(func() (*concierge.Concierge, func(), error) {
+	lazy := newLazyConcierge(func() (*concierge.Concierge, func(context.Context), error) {
 		starts++
 		c, stop, err := startConcierge(t.Context(), &cfg, store, discardLogger, nil, nil)
 		started = c
 		return c, stop, err
 	}, nil, discardLogger)
-	t.Cleanup(lazy.Stop)
+	t.Cleanup(func() { lazy.Stop(context.Background()) })
 	if err := lazy.Spoken(t.Context(), "t1"); err != nil {
 		t.Fatalf("Spoken before any call: %v", err)
 	}
@@ -284,10 +284,10 @@ func TestTheConciergeStartsOnFirstUse(t *testing.T) {
 // that cannot start leaves a call silent instead of failing it as
 // unreachable, so the voice says sorry and plays the error sound.
 func TestALazyConciergeThatCannotStartAnswersUnreachable(t *testing.T) {
-	lazy := newLazyConcierge(func() (*concierge.Concierge, func(), error) {
+	lazy := newLazyConcierge(func() (*concierge.Concierge, func(context.Context), error) {
 		return nil, nil, errors.New("no model credentials")
 	}, nil, discardLogger)
-	t.Cleanup(lazy.Stop)
+	t.Cleanup(func() { lazy.Stop(context.Background()) })
 	err := lazy.Answer(t.Context(), &voice.Exchange{}, "what is happening", func(context.Context, string, voice.SayMode) error { return nil })
 	if !errors.Is(err, voice.ErrUnreachable) {
 		t.Fatalf("Answer = %v, want an error that wraps voice.ErrUnreachable", err)

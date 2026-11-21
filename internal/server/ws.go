@@ -19,7 +19,7 @@ var upgrader = websocket.Upgrader{
 
 // registerWSRoute serves the live event stream; logger names the module
 // already.
-func registerWSRoute(mux *http.ServeMux, hub *Hub, logger *slog.Logger) {
+func registerWSRoute(mux routeMux, hub *Hub, logger *slog.Logger) {
 	mux.HandleFunc("GET /ws", func(w http.ResponseWriter, r *http.Request) {
 		conn, err := upgrader.Upgrade(w, r, nil)
 		if err != nil {

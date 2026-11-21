@@ -24,36 +24,69 @@ const gcEvery = time.Hour
 
 // collectGarbage runs a GC pass at once, so GET /api/status shows a hold as
 // the app starts and not an hour later, then every interval until ctx ends.
-// Each pass runs under the configuration and the Drive syncer current then.
-// A pass with GC turned off in the settings since removes nothing and clears
-// the hold: GC off holds nothing back. The app starts it only after the
-// start-up cleanup of the recording directories (cleanupRecordingDirectories),
-// since a pass erases audio files.
-func collectGarbage(ctx context.Context, cfgStore *config.Store, store gcStore, drive *driveSync, health *gcHealth, warnings *warningsRegistry, logger *slog.Logger, every time.Duration) {
-	ticker := time.NewTicker(every)
-	defer ticker.Stop()
-	for {
-		scheduledGCPass(cfgStore, store, drive, health, warnings, logger)
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-		}
-	}
+// Each pass runs under the configuration and the Drive syncer current then,
+// as work the stop cuts off and waits for (runPasses): a pass erases audio
+// files and deletes sessions. A pass with GC turned off in the settings since
+// removes nothing and clears the hold: GC off holds nothing back. The app
+// starts it only after the start-up cleanup of the recording directories
+// (cleanupRecordingDirectories), since a pass erases audio files.
+func collectGarbage(ctx context.Context, background backgroundWork, cfgStore *config.Store, store gcStore, drive *driveSync, health *gcHealth, warnings *warningsRegistry, logger *slog.Logger, every time.Duration) {
+	runPasses(ctx, background, every, func(ctx context.Context) {
+		scheduledGCPass(ctx, cfgStore, store, drive, health, warnings, logger)
+	})
 }
 
-// scheduledGCPass is one pass of collectGarbage.
-func scheduledGCPass(cfgStore *config.Store, store gcStore, drive *driveSync, health *gcHealth, warnings *warningsRegistry, logger *slog.Logger) {
+// scheduledGCPass is one pass of collectGarbage. Its Drive checks end when ctx
+// does (passDrive): the stop cuts them off, and a Drive that cannot say stops
+// the pass (gc.ErrDriveCannotSay).
+func scheduledGCPass(ctx context.Context, cfgStore *config.Store, store gcStore, drive *driveSync, health *gcHealth, warnings *warningsRegistry, logger *slog.Logger) {
 	latestCfg := cfgStore.Get()
 	if !latestCfg.GCEnabled {
 		health.record(nil, latestCfg.AudioDir, time.Now())
 		return
 	}
-	deleted, err := runGCPass(store, &latestCfg, drive.Get(), health, warnings, logger)
+	deleted, err := runGCPass(store, &latestCfg, passDrive(ctx, drive.Get()), health, warnings, logger)
 	if err != nil {
 		log.Printf("gc error: %v", err)
 	} else if len(deleted) > 0 {
 		log.Printf("gc: deleted %d sessions", len(deleted))
+	}
+}
+
+// passDrive is syncer with its Drive checks bound to pass as well as to their
+// own context: they end when pass does. A nil syncer stays nil, a GC with no
+// Drive.
+func passDrive(pass context.Context, syncer sessionSyncer) sessionSyncer {
+	if syncer == nil {
+		return nil
+	}
+	return passBoundSyncer{sessionSyncer: syncer, pass: pass}
+}
+
+type passBoundSyncer struct {
+	sessionSyncer
+	pass context.Context
+}
+
+func (s passBoundSyncer) FolderOnDrive(ctx context.Context, folderID string) (bool, error) {
+	ctx, stop := s.bound(ctx)
+	defer stop()
+	return s.sessionSyncer.FolderOnDrive(ctx, folderID)
+}
+
+func (s passBoundSyncer) RecordingsMatch(ctx context.Context, folderID string, checksums map[string]string) (bool, error) {
+	ctx, stop := s.bound(ctx)
+	defer stop()
+	return s.sessionSyncer.RecordingsMatch(ctx, folderID, checksums)
+}
+
+// bound is ctx, ended also when the pass's context ends, with its cause.
+func (s passBoundSyncer) bound(ctx context.Context) (context.Context, func()) {
+	ctx, cancel := context.WithCancelCause(ctx)
+	stop := context.AfterFunc(s.pass, func() { cancel(context.Cause(s.pass)) })
+	return ctx, func() {
+		stop()
+		cancel(nil)
 	}
 }
 

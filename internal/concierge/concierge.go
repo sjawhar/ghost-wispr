@@ -146,12 +146,15 @@ type Concierge struct {
 	answers   chan voice.PendingAnswer
 	// life ends with Stop (stop): its background work, the rewrite of an
 	// answer for the ear, the read of the projects and the sends after a
-	// reply, runs under it, and work counts it. done closes when the
-	// goroutine that offers answers ends.
+	// reply, runs under it, and work counts it, as it counts each call from
+	// outside that may write the store (enter). done closes when the
+	// goroutine that offers answers ends; stopped, once Stop has ended the
+	// life and everything it waits for has ended too.
 	life     context.Context
 	stop     context.CancelFunc
 	work     sync.WaitGroup
 	done     chan struct{}
+	stopped  chan struct{}
 	stopOnce sync.Once
 
 	mu     sync.Mutex
@@ -254,6 +257,7 @@ func New(cfg *Config) (*Concierge, error) {
 		logger:       cfg.Logger,
 		answers:      make(chan voice.PendingAnswer),
 		done:         make(chan struct{}),
+		stopped:      make(chan struct{}),
 		lastAsk:      map[[2]string]sentAsk{},
 		unsent:       map[[2]string]unsentAsk{},
 		working:      map[string][]string{},
@@ -340,19 +344,61 @@ func (c *Concierge) background(work func(ctx context.Context)) {
 	}()
 }
 
+// errStopped is a call's error once Stop has run: the Concierge takes no
+// more.
+var errStopped = errors.New("concierge: stopped")
+
+// enter admits one call that may write the store (an answer, a tool call, an
+// ask an answer leaves running, a spoken mark, a never mind, a delivered
+// reply) as work Stop waits for, so the store closes under none of them. Its
+// context ends when parent does or when Stop runs; leave ends it and the
+// count. After Stop it admits nothing, and ok is false. c.mu must not be held.
+func (c *Concierge) enter(parent context.Context) (ctx context.Context, leave func(), ok bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.life.Err() != nil {
+		return nil, nil, false
+	}
+	c.work.Add(1)
+	ctx, cancel := context.WithCancelCause(parent)
+	stopped := context.AfterFunc(c.life, func() { cancel(errStopped) })
+	return ctx, func() {
+		stopped()
+		cancel(nil)
+		c.work.Done()
+	}, true
+}
+
 // Stop ends the Concierge, when the unit stops (VoiceOff, when the voice is
 // turned off): the goroutine that offers answers, a rewrite of an answer for
-// the ear, and any other background work end, and Stop waits for them. An
-// answer that lands after it is kept in the ledger, for its session's page,
-// and not announced. A second Stop does nothing.
-func (c *Concierge) Stop() {
+// the ear, every call that may write the store (enter), which it cancels,
+// and any other background work end, and Stop waits for them (StopWithin,
+// with no deadline). A send to an agent already begun keeps its own bound
+// (sendTimeout). An answer that lands after it is kept in the ledger, for
+// its session's page, and not announced. A second Stop does nothing.
+func (c *Concierge) Stop() { _ = c.StopWithin(context.Background()) }
+
+// StopWithin ends the Concierge as Stop does, and waits for its work within
+// ctx. At ctx's end it returns ctx's cause and waits no longer: the work it
+// cancelled ends behind it, and a store write that work still makes after
+// the unit closed its store is refused there (storage).
+func (c *Concierge) StopWithin(ctx context.Context) error {
 	c.stopOnce.Do(func() {
 		c.mu.Lock()
 		c.stop()
 		c.mu.Unlock()
-		<-c.done
-		c.work.Wait()
+		go func() {
+			<-c.done
+			c.work.Wait()
+			close(c.stopped)
+		}()
 	})
+	select {
+	case <-c.stopped:
+		return nil
+	case <-ctx.Done():
+		return fmt.Errorf("concierge: its work still runs at the stop's deadline: %w", context.Cause(ctx))
+	}
 }
 
 // VoiceOff ends the Concierge as Stop does, as the voice is turned off, then
@@ -702,6 +748,9 @@ func (c *Concierge) readProjects(ctx context.Context) map[string]bool {
 		keys, err = c.records.Projects(ctx)
 		return err
 	})
+	if err != nil { // logged without c.mu: a log write can wait
+		c.logger.Warn("concierge could not read Dispatch's projects", "error", err)
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.projectsBusy = false
@@ -710,7 +759,6 @@ func (c *Concierge) readProjects(ctx context.Context) map[string]bool {
 	// A stop is no failure of Dispatch's.
 	c.projectsDown = err != nil && ctx.Err() == nil
 	if err != nil {
-		c.logger.Warn("concierge could not read Dispatch's projects", "error", err)
 		if ctx.Err() == nil {
 			// A stop is no failure: the next read may come at once.
 			c.projectsRead = c.now().Add(time.Minute - projectsFor)
@@ -797,8 +845,14 @@ func (c *Concierge) SessionDeleted(sessionID string) {
 	}
 }
 
-// Spoken records that a pending answer was spoken.
-func (c *Concierge) Spoken(_ context.Context, taskID string) error {
+// Spoken records that a pending answer was spoken, as work Stop waits for;
+// after Stop it records nothing.
+func (c *Concierge) Spoken(ctx context.Context, taskID string) error {
+	_, leave, ok := c.enter(ctx)
+	if !ok {
+		return errStopped
+	}
+	defer leave()
 	if err := c.store.MarkVoiceTaskSpoken(taskID, c.now()); err != nil {
 		return err
 	}

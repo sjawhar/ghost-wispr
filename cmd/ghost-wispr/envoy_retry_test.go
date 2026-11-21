@@ -62,12 +62,61 @@ func TestTheEnvoySessionIsRetriedUntilItOpens(t *testing.T) {
 		defer mu.Unlock()
 		t.Fatalf("%d attempts in 2 s, want the session open on the fourth", attempts)
 	}
-	stop()
+	stop(context.Background())
 	session.mu.Lock()
 	defer session.mu.Unlock()
 	if !session.closed {
 		t.Error("stop did not close the Envoy session")
 	}
+}
+
+// TestAStopWaitsForTheEnvoySessionsOpeningOnlyWithinItsDeadline fails if the
+// Concierge's stop waits past its context's end for an Envoy session's
+// opening that does not see the cancel, as a resume point's store write
+// waiting for the store's one connection does not: the unit's shutdown would
+// hang there and never close its store. It also fails if a session that
+// opening completes after the stop gave up is never closed, which would leave
+// its registration at Envoy. The control is
+// TestTheEnvoySessionIsRetriedUntilItOpens, where the opening ends before the
+// stop and the stop closes the session it opened.
+func TestAStopWaitsForTheEnvoySessionsOpeningOnlyWithinItsDeadline(t *testing.T) {
+	opening, release := make(chan struct{}), make(chan struct{})
+	late := &fakeEnvoySession{}
+	original := openEnvoySession
+	t.Cleanup(func() { openEnvoySession = original })
+	openEnvoySession = func(context.Context, *envoy.Listener, *envoy.SessionConfig) (envoySession, error) {
+		close(opening)
+		<-release // it does not see the cancel, and then opens the session
+		return late, nil
+	}
+	cfg := config.Config{GenAIBackend: "gemini", GeminiAPIKey: "test", Concierge: config.Concierge{EnvoyURL: "http://127.0.0.1:1"}}
+	_, stop, err := startConcierge(t.Context(), &cfg, conciergeStore(t), discardLogger, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-opening:
+	case <-time.After(2 * time.Second):
+		t.Fatal("control: the Envoy session's opening did not start")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	stopped := make(chan struct{})
+	go func() {
+		defer close(stopped)
+		stop(ctx)
+	}()
+	select {
+	case <-stopped:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the stop waited past its deadline for the Envoy session's opening")
+	}
+	close(release)
+	waitUntil(t, "the session the opening completed after the stop closed", func() bool {
+		late.mu.Lock()
+		defer late.mu.Unlock()
+		return late.closed
+	})
 }
 
 // TestEnvoyRetriesBackOffToAMinute fails if the waits between attempts do not

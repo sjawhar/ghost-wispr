@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"strings"
 	"sync"
 	"testing"
@@ -19,19 +20,19 @@ func countingLazyConcierge(t *testing.T) (lazy *lazyConcierge, counts func() (st
 	store := conciergeStore(t)
 	var mu sync.Mutex
 	starts, stops := 0, 0
-	lazy = newLazyConcierge(func() (*concierge.Concierge, func(), error) {
+	lazy = newLazyConcierge(func() (*concierge.Concierge, func(context.Context), error) {
 		c, stop, err := startConcierge(t.Context(), &cfg, store, discardLogger, nil, nil)
 		mu.Lock()
 		starts++
 		mu.Unlock()
-		return c, func() {
+		return c, func(ctx context.Context) {
 			mu.Lock()
 			stops++
 			mu.Unlock()
-			stop()
+			stop(ctx)
 		}, err
 	}, nil, discardLogger)
-	t.Cleanup(lazy.Stop)
+	t.Cleanup(func() { lazy.Stop(context.Background()) })
 	return lazy, func() (int, int) {
 		mu.Lock()
 		defer mu.Unlock()
@@ -99,16 +100,16 @@ func TestTurningTheVoiceOffCancelsTheQuestionsAShutdownKeeps(t *testing.T) {
 		t.Fatal(err)
 	}
 	newLazy := func() *lazyConcierge {
-		lazy := newLazyConcierge(func() (*concierge.Concierge, func(), error) {
+		lazy := newLazyConcierge(func() (*concierge.Concierge, func(context.Context), error) {
 			return startConcierge(t.Context(), &cfg, store, discardLogger, nil, nil)
 		}, nil, discardLogger)
-		t.Cleanup(lazy.Stop)
+		t.Cleanup(func() { lazy.Stop(context.Background()) })
 		if _, err := lazy.start(); err != nil {
 			t.Fatalf("start: %v", err)
 		}
 		return lazy
 	}
-	newLazy().Stop()
+	newLazy().Stop(context.Background())
 	if task, err := store.VoiceTask("q1"); err != nil || task.State != storage.VoiceTaskWorking {
 		t.Fatalf("after a shutdown the question = %+v, %v; want working", task, err)
 	}
