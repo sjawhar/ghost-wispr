@@ -202,7 +202,8 @@ func TestSoundTriggersAndPitch(t *testing.T) {
 // TurnWait, and its end stops its wake sound: TurnWait is far longer than the
 // wake sound's 12 paced frames here, as DefaultTurnWait (4 s) is on the unit,
 // so the end cannot cut the sound the test waits for. (The rig's 300 ms left
-// 60 ms, which a loaded machine under -race took: 2 runs in 40 failed.)
+// 60 ms, which a loaded machine took: on main, 2 runs in 40 failed under
+// -race, and 6 in 20 without it.)
 func TestAWakeCutsTheAnswerChime(t *testing.T) {
 	c := newFakeConcierge()
 	r := newRigWith(t, c, func(cfg *SupervisorConfig, _ *rig) { cfg.TurnWait = DefaultTurnWait })
