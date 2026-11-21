@@ -7,6 +7,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/sjawhar/ghost-wispr/internal/monoclock"
 )
 
 // Reproductions of four speaker defects that GPT-6.1 Sol found in review of
@@ -1216,7 +1218,8 @@ func TestAPartialTakeBackCountsTheDelayedSampleCentres(t *testing.T) {
 			frame, sum := make([]int16, 480), make([]float32, 480)
 			for range 2 {
 				o.mixFrame(frame, sum, 48000, 4800, time.Now())
-				o.wrote(o.mixed, time.Now(), 0)
+				at := monoclock.Now()
+				o.wrote(o.mixed, at.Wall, at.Mono)
 			}
 			if got := p.Played(); got != 10*time.Millisecond {
 				t.Fatalf("control: before the take-back the playback played %v", got)
