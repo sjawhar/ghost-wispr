@@ -346,7 +346,7 @@ func TestAShutdownWaitsForAConciergeStartUnderWay(t *testing.T) {
 	lazy := newLazyConcierge(func() (*concierge.Concierge, func(), error) {
 		close(entered)
 		<-release
-		c, stop, err := startConcierge(t.Context(), &cfg, store, discardLogger, nil)
+		c, stop, err := startConcierge(t.Context(), &cfg, store, discardLogger, nil, nil)
 		return c, func() {
 			stop()
 			stopped.Store(true)
@@ -394,7 +394,7 @@ func TestAShutdownWaitsForATurnOffUnderWay(t *testing.T) {
 			cfg := config.Config{GenAIBackend: "gemini", GeminiAPIKey: strings.Repeat("k", 8)}
 			detached, release, ended := make(chan struct{}), make(chan struct{}), make(chan struct{})
 			lazy := newLazyConcierge(func() (*concierge.Concierge, func(), error) {
-				return startConcierge(t.Context(), &cfg, store, discardLogger, nil)
+				return startConcierge(t.Context(), &cfg, store, discardLogger, nil, nil)
 			}, func(c *concierge.Concierge) {
 				if c == nil { // the turn-off has detached its Concierge
 					close(detached)
@@ -470,7 +470,7 @@ func TestATurnOffHeldInTheStoreDoesNotHoldTheShutdownPastItsDeadline(t *testing.
 			cfg := config.Config{GenAIBackend: "gemini", GeminiAPIKey: strings.Repeat("k", 8)}
 			detached := make(chan struct{})
 			lazy := newLazyConcierge(func() (*concierge.Concierge, func(), error) {
-				return startConcierge(t.Context(), &cfg, store, discardLogger, nil)
+				return startConcierge(t.Context(), &cfg, store, discardLogger, nil, nil)
 			}, func(c *concierge.Concierge) {
 				if c == nil {
 					close(detached)
