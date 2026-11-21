@@ -37,7 +37,7 @@ func newDeletionTestStore(t *testing.T, recording string) (*storage.SQLiteStore,
 			t.Fatalf("append segment: %v", err)
 		}
 	}
-	if err := store.EndSession("session", started.Add(3*time.Second), recording); err != nil {
+	if err := store.EndSession("session", started.Add(3*time.Second), recording, ""); err != nil {
 		t.Fatalf("end session: %v", err)
 	}
 	segments, err := store.GetSegments("session")

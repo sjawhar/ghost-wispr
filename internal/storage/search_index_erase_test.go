@@ -41,7 +41,7 @@ func indexedSummarySession(t *testing.T, store *SQLiteStore, id string, started 
 	if err := store.CreateSession(id, started); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.EndSession(id, started.Add(time.Minute), "/audio/"+id+".mp3"); err != nil {
+	if err := store.EndSession(id, started.Add(time.Minute), "/audio/"+id+".mp3", ""); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.UpdateRefinementAtGeneration(id, "", RefinementCompleted, "", 0); err != nil {

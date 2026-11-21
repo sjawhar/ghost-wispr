@@ -23,7 +23,7 @@ func TestOpeningStoreKeepsAReservationWhenRawRestoreFails(t *testing.T) {
 	if err := store.CreateSession("session", started); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.EndSession("session", started.Add(time.Minute), ""); err != nil {
+	if err := store.EndSession("session", started.Add(time.Minute), "", ""); err != nil {
 		t.Fatal(err)
 	}
 	raw := filepath.Join(audioDir, "session.pcm")
@@ -75,7 +75,7 @@ func TestDeleteSessionAllowsASourceWhoseMergeParentIsGone(t *testing.T) {
 	if err := store.CreateSession("source", started); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.EndSession("source", started.Add(time.Minute), ""); err != nil {
+	if err := store.EndSession("source", started.Add(time.Minute), "", ""); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.MergeSessions("merged", []string{"source"}, started, started.Add(time.Minute)); err != nil {
@@ -103,7 +103,7 @@ func TestRuntimeOrphansSkipsReservedRawErase(t *testing.T) {
 	if err := store.CreateSession("session", started); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.EndSession("session", started.Add(time.Minute), ""); err != nil {
+	if err := store.EndSession("session", started.Add(time.Minute), "", ""); err != nil {
 		t.Fatal(err)
 	}
 	raw := filepath.Join(dir, "session.pcm")

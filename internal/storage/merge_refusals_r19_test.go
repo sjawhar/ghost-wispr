@@ -21,7 +21,7 @@ func mergeRefusalStore(t *testing.T, ended ...string) (*SQLiteStore, time.Time) 
 		if err := store.CreateSession(id, at); err != nil {
 			t.Fatal(err)
 		}
-		if err := store.EndSession(id, at.Add(time.Minute), "/audio/"+id+".mp3"); err != nil {
+		if err := store.EndSession(id, at.Add(time.Minute), "/audio/"+id+".mp3", ""); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -102,7 +102,7 @@ func TestEndSessionOfAMergedSessionNamesItsMerge(t *testing.T) {
 	if err := store.MergeSessions("m", []string{"a", "b"}, started, started.Add(2*time.Hour)); err != nil {
 		t.Fatal(err)
 	}
-	err := store.EndSession("a", started.Add(3*time.Hour), "/audio/a.mp3")
+	err := store.EndSession("a", started.Add(3*time.Hour), "/audio/a.mp3", "")
 	if !errors.Is(err, ErrSessionMerged) {
 		t.Fatalf("end merged session = %v, want %v", err, ErrSessionMerged)
 	}

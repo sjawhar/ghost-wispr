@@ -38,7 +38,7 @@ func newRefinedRunnerFixture(t *testing.T) refinedRunnerFixture {
 	if err := store.CreateSession("s", started); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.EndSession("s", started.Add(time.Minute), recording); err != nil {
+	if err := store.EndSession("s", started.Add(time.Minute), recording, ""); err != nil {
 		t.Fatal(err)
 	}
 	words := []storage.RefinedWord{

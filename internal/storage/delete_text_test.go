@@ -280,7 +280,7 @@ func mergedSessionWithSecretAfter(t *testing.T, store *SQLiteStore, beforeMerge 
 				t.Fatal(err)
 			}
 		}
-		if err := store.EndSession(id, started.Add(time.Minute), "recording-"+id+".mp3"); err != nil {
+		if err := store.EndSession(id, started.Add(time.Minute), "recording-"+id+".mp3", ""); err != nil {
 			t.Fatal(err)
 		}
 		if _, _, err := store.Canonicalize(id); err != nil {

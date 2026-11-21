@@ -295,7 +295,7 @@ func refusedCutDatabaseThen(t *testing.T, then float64) (dbPath, recording strin
 	if err := store.CreateSession("s", started); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.EndSession("s", started.Add(time.Minute), recording); err != nil {
+	if err := store.EndSession("s", started.Add(time.Minute), recording, ""); err != nil {
 		t.Fatal(err)
 	}
 	word := func(ordinal, speaker int, text string, start, end float64) storage.RefinedWord {

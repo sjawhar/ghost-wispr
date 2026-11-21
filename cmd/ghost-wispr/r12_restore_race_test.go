@@ -57,7 +57,7 @@ func r12AllRemovedMerge(t *testing.T) (*storage.SQLiteStore, string, []string) {
 		if err := store.CreateSession(id, at); err != nil {
 			t.Fatal(err)
 		}
-		if err := store.EndSession(id, at.Add(time.Minute), filepath.Join(dir, id+".mp3")); err != nil {
+		if err := store.EndSession(id, at.Add(time.Minute), filepath.Join(dir, id+".mp3"), ""); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -130,7 +130,7 @@ func TestR12SamePathRestoreKeepsTheRecording(t *testing.T) {
 	if err := store.CreateSession(id, started); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.EndSession(id, started.Add(time.Minute), path); err != nil {
+	if err := store.EndSession(id, started.Add(time.Minute), path, ""); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := store.DB().Exec(`UPDATE sessions SET refinement_status = 'no_audio', gdrive_folder_id = 'folder', sync_status = ?, sync_state = ? WHERE id = ?`, storage.SyncSynced, storage.SyncStateSynced, id); err != nil {

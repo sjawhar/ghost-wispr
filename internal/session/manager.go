@@ -519,7 +519,9 @@ func (m *Manager) startSession(sessionID string, startedAt time.Time) (string, e
 		}
 		if err == nil && m.recorder != nil {
 			if err = m.recorder.StartSession(sessionID); err != nil && !errors.Is(err, os.ErrExist) {
-				_ = m.store.EndSession(sessionID, time.Now().UTC(), "")
+				// It never started: no session_started went out, so no
+				// session_ended is queued.
+				_ = m.store.EndSession(sessionID, time.Now().UTC(), "", "")
 				return "", fmt.Errorf("start audio recorder session: %w", err)
 			}
 			if err != nil {
@@ -634,7 +636,16 @@ func (m *Manager) endSession(ctx context.Context, want string) error {
 		end.audioPath, end.saved = path, true
 	}
 
-	if err := m.store.EndSession(sessionID, endedAt, end.audioPath); err != nil {
+	// With a publisher, the session_ended event is queued in the same write
+	// as the end: a stop that refuses its send (publishLifecycle) leaves it
+	// for the next start's sweep.
+	m.mu.Lock()
+	queue := ""
+	if m.publisher != nil {
+		queue = sessionEndedEvent
+	}
+	m.mu.Unlock()
+	if err := m.store.EndSession(sessionID, endedAt, end.audioPath, queue); err != nil {
 		return fmt.Errorf("end session: %w", err)
 	}
 

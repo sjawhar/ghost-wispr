@@ -43,7 +43,7 @@ func TestBackfillMissingWaitsForItsWorkersWhenCancelled(t *testing.T) {
 		if err := store.AppendSegment(id, transcribe.Segment{Text: "synthetic words of " + id, Timestamp: time.Now().UTC()}); err != nil {
 			t.Fatal(err)
 		}
-		if err := store.EndSession(id, time.Now().UTC(), ""); err != nil {
+		if err := store.EndSession(id, time.Now().UTC(), "", ""); err != nil {
 			t.Fatal(err)
 		}
 		if _, _, err := store.Canonicalize(id); err != nil {

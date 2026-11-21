@@ -18,6 +18,11 @@ func (m *Manager) publishSessionStarted(sessionID string) {
 	m.publishLifecycle(sessionID, "session_started", true, EventPublisher.PublishSessionStarted)
 }
 
+// sessionEndedEvent is the session_ended lifecycle event's type, as the Envoy
+// publisher names it, and sends it again from its queue
+// (envoy.Publisher.PublishPendingLifecycleEvents).
+const sessionEndedEvent = "session_ended"
+
 // publishSessionEnded runs the session-ended hook, as work StopBackground
 // waits for (Go): the Concierge's part of it writes the store. A session that
 // ends after the stop runs no hook.
@@ -28,14 +33,16 @@ func (m *Manager) publishSessionEnded(sessionID string) {
 	if hook != nil {
 		m.Go(func(context.Context) { hook(sessionID) })
 	}
-	m.publishLifecycle(sessionID, "session_ended", false, EventPublisher.PublishSessionEnded)
+	m.publishLifecycle(sessionID, sessionEndedEvent, false, EventPublisher.PublishSessionEnded)
 }
 
 // publishLifecycle sends one lifecycle event in the background. The send
 // writes the event's delivery state to the store, so it is work StopBackground
 // waits for: the stop's lifecycle wait gives it its time first, and
 // StopBackground then cuts it off (an event cut off stays pending, for the
-// next start's sweep). Once StopBackground has run, no send starts.
+// next start's sweep). Once StopBackground has run, no send starts: a
+// session_ended event is already queued with its session's end (endSession),
+// for that sweep.
 func (m *Manager) publishLifecycle(sessionID, eventType string, isStart bool, send func(EventPublisher, context.Context, string) error) {
 	m.mu.Lock()
 	if isStart && m.lifecycleStartPublishesStopped {
@@ -49,7 +56,7 @@ func (m *Manager) publishLifecycle(sessionID, eventType string, isStart bool, se
 	}
 	if m.backgroundStopped {
 		m.mu.Unlock()
-		m.logger.Info("envoy lifecycle event not sent: the app is stopping", "operation", "publish_"+eventType, "session_id", sessionID)
+		m.logger.Info("envoy lifecycle event not sent: the app is stopping; a queued event goes at the next start's sweep", "operation", "publish_"+eventType, "session_id", sessionID)
 		return
 	}
 	// Shutdown first prevents new start sends, then waits. Register the send

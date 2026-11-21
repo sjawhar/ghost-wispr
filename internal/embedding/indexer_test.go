@@ -131,7 +131,7 @@ func TestBackfillMissing(t *testing.T) {
 		if err := store.CreateSession(id, time.Now().UTC()); err != nil {
 			t.Fatalf("create session %s: %v", id, err)
 		}
-		if err := store.EndSession(id, time.Now().UTC(), ""); err != nil {
+		if err := store.EndSession(id, time.Now().UTC(), "", ""); err != nil {
 			t.Fatalf("end session %s: %v", id, err)
 		}
 		if err := store.AppendSegment(id, transcribe.Segment{Text: "hello world from " + id, Timestamp: time.Now().UTC()}); err != nil {

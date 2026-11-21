@@ -24,7 +24,7 @@ func TestNestedUntimedDeleteKeepsUnattributedSiblingText(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if err := store.EndSession("n", started.Add(time.Minute), ""); err != nil {
+	if err := store.EndSession("n", started.Add(time.Minute), "", ""); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.CreateSession("s", started.Add(time.Hour)); err != nil {
@@ -33,7 +33,7 @@ func TestNestedUntimedDeleteKeepsUnattributedSiblingText(t *testing.T) {
 	if err := store.AppendSegment("s", transcribeSegment("sierra live", 0, started.Add(time.Hour))); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.EndSession("s", started.Add(61*time.Minute), "/audio/s.mp3"); err != nil {
+	if err := store.EndSession("s", started.Add(61*time.Minute), "/audio/s.mp3", ""); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := store.DB().Exec(`UPDATE sessions SET canonical_transcript = 'sierra live' WHERE id = 's'`); err != nil {
@@ -48,7 +48,7 @@ func TestNestedUntimedDeleteKeepsUnattributedSiblingText(t *testing.T) {
 	if err := store.CreateSession("t", started.Add(3*time.Hour)); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.EndSession("t", started.Add(181*time.Minute), "/audio/t.mp3"); err != nil {
+	if err := store.EndSession("t", started.Add(181*time.Minute), "/audio/t.mp3", ""); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.MergeSessions("m2", []string{"m1", "t"}, started, started.Add(4*time.Hour)); err != nil {

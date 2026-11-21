@@ -19,13 +19,13 @@ func TestUntimedDeleteDoesNotLeaveFencedRefinementRunning(t *testing.T) {
 	if err := store.AppendSegment("a", transcribeSegment("untimed running text", 0, started)); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.EndSession("a", started.Add(time.Minute), ""); err != nil {
+	if err := store.EndSession("a", started.Add(time.Minute), "", ""); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.CreateSession("b", started.Add(time.Hour)); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.EndSession("b", started.Add(61*time.Minute), "/audio/b.mp3"); err != nil {
+	if err := store.EndSession("b", started.Add(61*time.Minute), "/audio/b.mp3", ""); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.MergeSessions("merged", []string{"a", "b"}, started, started.Add(2*time.Hour)); err != nil {

@@ -544,7 +544,7 @@ func TestLifecycleEventsSurviveRestart(t *testing.T) {
 	if err := publisher.PublishSessionStarted(context.Background(), "session-1"); err == nil {
 		t.Fatal("PublishSessionStarted succeeded while the hub was down")
 	}
-	if err := store.EndSession("session-1", startedAt.Add(time.Minute), ""); err != nil {
+	if err := store.EndSession("session-1", startedAt.Add(time.Minute), "", ""); err != nil {
 		t.Fatalf("EndSession: %v", err)
 	}
 	if err := publisher.PublishSessionEnded(context.Background(), "session-1"); err == nil {
@@ -596,7 +596,7 @@ func TestPendingLifecycleEventsContinueAfterFailure(t *testing.T) {
 	if err := store.CreateSession("session-1", startedAt); err != nil {
 		t.Fatalf("CreateSession: %v", err)
 	}
-	if err := store.EndSession("session-1", startedAt.Add(time.Minute), ""); err != nil {
+	if err := store.EndSession("session-1", startedAt.Add(time.Minute), "", ""); err != nil {
 		t.Fatalf("EndSession: %v", err)
 	}
 	if err := store.EnqueueEnvoyLifecycleEvent(string(eventSessionStarted), "session-1"); err != nil {
@@ -636,7 +636,7 @@ func TestAFailedSummaryIsSentAgainLater(t *testing.T) {
 	if err := store.CreateSession("session-1", startedAt); err != nil {
 		t.Fatalf("CreateSession: %v", err)
 	}
-	if err := store.EndSession("session-1", startedAt.Add(time.Minute), ""); err != nil {
+	if err := store.EndSession("session-1", startedAt.Add(time.Minute), "", ""); err != nil {
 		t.Fatalf("EndSession: %v", err)
 	}
 	if err := store.UpdateSummaryAtGeneration("session-1", "Title", "Summary", storage.SummaryCompleted, "default", "{}", "", 0); err != nil {
@@ -678,7 +678,7 @@ func TestEmptySummaryIsNotPublished(t *testing.T) {
 	if err := store.CreateSession("session-1", startedAt); err != nil {
 		t.Fatalf("CreateSession: %v", err)
 	}
-	if err := store.EndSession("session-1", startedAt.Add(time.Minute), ""); err != nil {
+	if err := store.EndSession("session-1", startedAt.Add(time.Minute), "", ""); err != nil {
 		t.Fatalf("EndSession: %v", err)
 	}
 	if err := store.StartSummary("session-1"); err != nil {

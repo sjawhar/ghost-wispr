@@ -82,7 +82,7 @@ func (s *storeMock) CreateSession(id string, startedAt time.Time) error {
 	return nil
 }
 
-func (s *storeMock) EndSession(id string, _ time.Time, audioPath string) error {
+func (s *storeMock) EndSession(id string, _ time.Time, audioPath, _ string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.endSessionCalls++
@@ -102,7 +102,7 @@ func TestStoreMockSeparatesSessionAndSummaryStatus(t *testing.T) {
 	if err := store.CreateSession("session", started); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.EndSession("session", started.Add(time.Minute), "session.mp3"); err != nil {
+	if err := store.EndSession("session", started.Add(time.Minute), "session.mp3", ""); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.UpdateSummaryAtGeneration("session", "title", "summary", storage.SummaryCompleted, "default", "{}", "model", 0); err != nil {
@@ -1729,7 +1729,7 @@ func TestManager_RefineSession_RefinesAndResummarizes(t *testing.T) {
 	if err := os.WriteFile(audioPath, []byte("recorded audio"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.EndSession("sess-refine", time.Now().UTC(), audioPath); err != nil {
+	if err := store.EndSession("sess-refine", time.Now().UTC(), audioPath, ""); err != nil {
 		t.Fatalf("EndSession failed: %v", err)
 	}
 	hub := &hubMock{}
@@ -1810,7 +1810,7 @@ func TestManager_RefinementDoesNotStartOnAudioGCRemoved(t *testing.T) {
 	if err := store.CreateSession(id, started); err != nil {
 		t.Fatalf("create session: %v", err)
 	}
-	if err := store.EndSession(id, started.Add(time.Minute), saved); err != nil {
+	if err := store.EndSession(id, started.Add(time.Minute), saved, ""); err != nil {
 		t.Fatalf("end session: %v", err)
 	}
 	// GC removes the recording to free space and records it.
@@ -2362,7 +2362,7 @@ func TestManagerStoresProviderReportedRefinementModel(t *testing.T) {
 	if err := store.CreateSession(sessionID, time.Now().UTC()); err != nil {
 		t.Fatalf("CreateSession: %v", err)
 	}
-	if err := store.EndSession(sessionID, time.Now().UTC(), audioPath); err != nil {
+	if err := store.EndSession(sessionID, time.Now().UTC(), audioPath, ""); err != nil {
 		t.Fatalf("EndSession: %v", err)
 	}
 	manager := NewManager(store, nil, nil, nil, NewDetector(time.Hour), 0)

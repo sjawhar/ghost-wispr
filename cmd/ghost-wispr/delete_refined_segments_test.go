@@ -31,7 +31,7 @@ func TestDeleteRefinedTextUsesStoredWordOccurrence(t *testing.T) {
 	if err := store.CreateSession("s1", started); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.EndSession("s1", started.Add(time.Minute), recording); err != nil {
+	if err := store.EndSession("s1", started.Add(time.Minute), recording, ""); err != nil {
 		t.Fatal(err)
 	}
 	words := []storage.RefinedWord{
@@ -94,7 +94,7 @@ func TestDeleteRefinedAudioSplicesWithFFmpegAndShiftsWords(t *testing.T) {
 	if err := store.CreateSession("s1", started); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.EndSession("s1", started.Add(2*time.Second), recording); err != nil {
+	if err := store.EndSession("s1", started.Add(2*time.Second), recording, ""); err != nil {
 		t.Fatal(err)
 	}
 	words := []storage.RefinedWord{

@@ -20,7 +20,7 @@ func TestRawEraseReservationWarningAppearsAndClears(t *testing.T) {
 	if err := store.CreateSession("session", started); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.EndSession("session", started.Add(time.Minute), ""); err != nil {
+	if err := store.EndSession("session", started.Add(time.Minute), "", ""); err != nil {
 		t.Fatal(err)
 	}
 	reservation, err := erase.Reserve(filepath.Join(t.TempDir(), "session.pcm"))

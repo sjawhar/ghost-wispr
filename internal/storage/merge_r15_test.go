@@ -19,13 +19,13 @@ func TestMergeMarksOnlyNeverRecordedSegmentsUntimedAndKeepsRemovedProvenance(t *
 	if err := store.AppendSegment("never", transcribeSegment("never recorded", 0, started)); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.EndSession("never", started.Add(time.Minute), ""); err != nil {
+	if err := store.EndSession("never", started.Add(time.Minute), "", ""); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.CreateSession("removed", started.Add(time.Hour)); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.EndSession("removed", started.Add(61*time.Minute), "/audio/removed.mp3"); err != nil {
+	if err := store.EndSession("removed", started.Add(61*time.Minute), "/audio/removed.mp3", ""); err != nil {
 		t.Fatal(err)
 	}
 	removedWords := []RefinedWord{{RecordingPath: "/audio/removed.mp3", RecordingSHA256: "removed", Ordinal: 0, Text: "recording was removed", Start: 0, End: 1}}
@@ -38,7 +38,7 @@ func TestMergeMarksOnlyNeverRecordedSegmentsUntimedAndKeepsRemovedProvenance(t *
 	if err := store.CreateSession("available", started.Add(2*time.Hour)); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.EndSession("available", started.Add(121*time.Minute), "/audio/available.mp3"); err != nil {
+	if err := store.EndSession("available", started.Add(121*time.Minute), "/audio/available.mp3", ""); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.MergeSessions("merged", []string{"never", "removed", "available"}, started, started.Add(3*time.Hour)); err != nil {

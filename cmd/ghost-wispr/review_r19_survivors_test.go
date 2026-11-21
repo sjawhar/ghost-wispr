@@ -34,7 +34,7 @@ func survivorRemovedSourceMerge(t *testing.T) (store *storage.SQLiteStore, dir, 
 	if err := store.CreateSession(sID, start); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.EndSession(sID, start.Add(time.Minute), sPath); err != nil {
+	if err := store.EndSession(sID, start.Add(time.Minute), sPath, ""); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := store.DB().Exec(`UPDATE sessions SET refinement_status = 'failed', audio_path = '', audio_removed_at = '2026-11-13T12:00:00Z', gdrive_folder_id = 'folder-s', sync_status = ?, sync_state = ? WHERE id = ?`, storage.SyncSynced, storage.SyncStateSynced, sID); err != nil {
@@ -43,7 +43,7 @@ func survivorRemovedSourceMerge(t *testing.T) (store *storage.SQLiteStore, dir, 
 	if err := store.CreateSession(tID, start.Add(time.Hour)); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.EndSession(tID, start.Add(61*time.Minute), tPath); err != nil {
+	if err := store.EndSession(tID, start.Add(61*time.Minute), tPath, ""); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.MergeSessions("merged", []string{sID, tID}, start, start.Add(2*time.Hour)); err != nil {

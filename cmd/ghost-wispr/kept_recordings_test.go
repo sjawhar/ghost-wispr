@@ -400,7 +400,7 @@ func TestASavedRecordingNoSessionNamesIsGivenToItsSession(t *testing.T) {
 			}
 		}
 	}
-	if err := store.EndSession(named, started.Add(time.Minute), filepath.Join(audioDir, "elsewhere.mp3")); err != nil {
+	if err := store.EndSession(named, started.Add(time.Minute), filepath.Join(audioDir, "elsewhere.mp3"), ""); err != nil {
 		t.Fatal(err)
 	}
 	// The stop: the next start ends every session still recording with no
@@ -617,7 +617,7 @@ func TestThePassErasesTheAudioOfARecordedDelete(t *testing.T) {
 		if err := store.CreateSession(id, started); err != nil {
 			t.Fatal(err)
 		}
-		if err := store.EndSession(id, started.Add(time.Minute), recording); err != nil {
+		if err := store.EndSession(id, started.Add(time.Minute), recording, ""); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -668,7 +668,7 @@ func TestThePassErasesOnlyTheFilesAnAgeDeleteListed(t *testing.T) {
 	if err := store.CreateSession(id, started); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.EndSession(id, started.Add(time.Hour), saved); err != nil {
+	if err := store.EndSession(id, started.Add(time.Hour), saved, ""); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := store.DB().Exec(`UPDATE sessions SET sync_state = ?, sync_status = ?, gdrive_folder_id = 'folder' WHERE id = ?`, storage.SyncStateSynced, storage.SyncSynced, id); err != nil {
@@ -733,7 +733,7 @@ func TestThePassReadsWhatSessionsNameJustBeforeItErases(t *testing.T) {
 		if err := store.CreateSession(id, started); err != nil {
 			t.Fatal(err)
 		}
-		if err := store.EndSession(id, started.Add(time.Minute), path); err != nil {
+		if err := store.EndSession(id, started.Add(time.Minute), path, ""); err != nil {
 			t.Fatal(err)
 		}
 		if _, err := store.DeleteSession(id, audioDir); err != nil {
@@ -785,7 +785,7 @@ func TestASaveOrAdoptionLeavesAFileAnotherSessionNames(t *testing.T) {
 	if err := store.CreateSession(merged, started); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.EndSession(merged, started.Add(time.Hour), strings.Join(shared, ",")); err != nil {
+	if err := store.EndSession(merged, started.Add(time.Hour), strings.Join(shared, ","), ""); err != nil {
 		t.Fatal(err)
 	}
 	kept := newKeptRecordings(store, audio.NewRecorder(audioDir), audioDir, nil, nil)
@@ -927,7 +927,7 @@ func TestARestoredBackupKeepsTheAudioRecordedSinceIt(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if err := store.EndSession(saved, started.Add(time.Hour), mp3); err != nil {
+	if err := store.EndSession(saved, started.Add(time.Hour), mp3, ""); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := store.RecoverStaleSessions(audioDir); err != nil {

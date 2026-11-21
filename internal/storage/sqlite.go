@@ -1150,8 +1150,17 @@ func (s *SQLiteStore) CreateSession(id string, startedAt time.Time) error {
 // EndSession ends a session with its saved recording. A session that ends
 // without one (it could not be saved, or none was made) can never be refined,
 // so its refinement status becomes the terminal no_audio in the same write.
-func (s *SQLiteStore) EndSession(id string, endedAt time.Time, audioPath string) error {
-	res, err := s.db.Exec(
+// queueEvent, unless "", is a lifecycle event the same transaction queues
+// for the session (EnqueueEnvoyLifecycleEvent): the end and its event are
+// saved together, so an event whose send the stop refuses stays queued for
+// the next start's sweep.
+func (s *SQLiteStore) EndSession(id string, endedAt time.Time, audioPath, queueEvent string) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return fmt.Errorf("end session %s: %w", id, err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	res, err := tx.Exec(
 		`UPDATE sessions SET ended_at = ?, status = 'ended', audio_path = ?,
 			refinement_status = CASE WHEN ? = '' THEN ? ELSE refinement_status END
 		 WHERE id = ? AND status != ?`,
@@ -1172,7 +1181,7 @@ func (s *SQLiteStore) EndSession(id string, endedAt time.Time, audioPath string)
 	}
 	if rows == 0 {
 		var status, mergedInto string
-		if err := s.db.QueryRow(`SELECT status, merged_into FROM sessions WHERE id = ?`, id).Scan(&status, &mergedInto); err != nil {
+		if err := tx.QueryRow(`SELECT status, merged_into FROM sessions WHERE id = ?`, id).Scan(&status, &mergedInto); err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
 				return sql.ErrNoRows
 			}
@@ -1182,6 +1191,14 @@ func (s *SQLiteStore) EndSession(id string, endedAt time.Time, audioPath string)
 			return &sessionRefusal{action: "end", sessionID: id, reason: "it was already merged into " + mergedInto, sentinel: ErrSessionMerged}
 		}
 		return sql.ErrNoRows
+	}
+	if queueEvent != "" {
+		if _, err := tx.Exec(`INSERT OR IGNORE INTO envoy_lifecycle_events(event_type, session_id) VALUES(?, ?)`, queueEvent, id); err != nil {
+			return fmt.Errorf("queue %s event for session %s: %w", queueEvent, id, err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("end session %s: %w", id, err)
 	}
 	return nil
 }

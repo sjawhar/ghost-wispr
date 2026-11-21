@@ -21,7 +21,7 @@ func TestUntimedDeleteLeavesOtherMergedSourcesAlone(t *testing.T) {
 	if err := store.AppendSegment("n", transcribeSegment("november private untimed", 0, started)); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.EndSession("n", started.Add(time.Minute), ""); err != nil {
+	if err := store.EndSession("n", started.Add(time.Minute), "", ""); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.CreateSession("s", started.Add(time.Hour)); err != nil {
@@ -30,7 +30,7 @@ func TestUntimedDeleteLeavesOtherMergedSourcesAlone(t *testing.T) {
 	if err := store.AppendSegment("s", transcribeSegment("sierra keeps its words", 0, started.Add(time.Hour))); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.EndSession("s", started.Add(61*time.Minute), "/audio/s.mp3"); err != nil {
+	if err := store.EndSession("s", started.Add(61*time.Minute), "/audio/s.mp3", ""); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := store.DB().Exec(`UPDATE sessions SET refinement_status = 'failed', canonical_transcript = 'sierra keeps its words', audio_path = '', audio_removed_at = '2026-11-13T12:00:00Z', gdrive_folder_id = 'folder-' || id, sync_status = ?, sync_state = ? WHERE id = 's'`, SyncSynced, SyncStateSynced); err != nil {

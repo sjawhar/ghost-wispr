@@ -16,7 +16,7 @@ func TestMergeRefusesASourceThatOwesADriveReplacement(t *testing.T) {
 		if err := store.CreateSession(id, started.Add(time.Duration(i)*time.Hour)); err != nil {
 			t.Fatal(err)
 		}
-		if err := store.EndSession(id, started.Add(time.Duration(i)*time.Hour+time.Minute), ""); err != nil {
+		if err := store.EndSession(id, started.Add(time.Duration(i)*time.Hour+time.Minute), "", ""); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -51,7 +51,7 @@ func TestAMergedSourceOwingADriveReplacementIsSwept(t *testing.T) {
 	if err := store.CreateSession("source", started); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.EndSession("source", started.Add(time.Minute), ""); err != nil {
+	if err := store.EndSession("source", started.Add(time.Minute), "", ""); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := store.DB().Exec(`UPDATE sessions SET status = 'merged', merged_into = 'elsewhere', drive_replace_pending = 1, sync_state = ? WHERE id = 'source'`, SyncStatePending); err != nil {

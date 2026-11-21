@@ -70,7 +70,7 @@ func recordingMismatchSession(t *testing.T, id string) (*storage.SQLiteStore, co
 	if err := store.CreateSession(id, started); err != nil {
 		t.Fatalf("create: %v", err)
 	}
-	if err := store.EndSession(id, started.Add(time.Minute), audioPath); err != nil {
+	if err := store.EndSession(id, started.Add(time.Minute), audioPath, ""); err != nil {
 		t.Fatalf("end: %v", err)
 	}
 	if err := store.UpdateSummaryAtGeneration(id, "", "A summary.", storage.SummaryCompleted, "default", "{}", "", 0); err != nil {
@@ -118,7 +118,7 @@ func TestAGCPassThatCannotCheckDriveIsRecordedWithTheDiskUse(t *testing.T) {
 	if err := store.CreateSession(id, started); err != nil {
 		t.Fatalf("create: %v", err)
 	}
-	if err := store.EndSession(id, started.Add(time.Minute), ""); err != nil {
+	if err := store.EndSession(id, started.Add(time.Minute), "", ""); err != nil {
 		t.Fatalf("end: %v", err)
 	}
 	if err := store.UpdateSummaryAtGeneration(id, "", "A summary.", storage.SummaryCompleted, "default", "{}", "", 0); err != nil {
@@ -318,7 +318,7 @@ func TestGCPassHoldsAudioWhenConfigAPIStopsDriveSync(t *testing.T) {
 				if err := store.CreateSession(id, started); err != nil {
 					t.Fatalf("create session: %v", err)
 				}
-				if err := store.EndSession(id, started.Add(time.Minute), path); err != nil {
+				if err := store.EndSession(id, started.Add(time.Minute), path, ""); err != nil {
 					t.Fatalf("end session: %v", err)
 				}
 				return path

@@ -19,11 +19,11 @@ func TestReviewR19NestedUntimedDeleteKeepsRepeatedPhrase(t *testing.T) {
 	start := time.Date(2026, 11, 13, 9, 0, 0, 0, time.UTC)
 	_ = store.CreateSession("n", start)
 	_ = store.AppendSegment("n", transcribeSegment("okay", 0, start))
-	_ = store.EndSession("n", start.Add(time.Minute), "")
+	_ = store.EndSession("n", start.Add(time.Minute), "", "")
 	_ = store.CreateSession("s", start.Add(time.Hour))
 	_ = store.AppendSegment("s", transcribeSegment("okay", 0, start.Add(time.Hour)))
 	_ = store.AppendSegment("s", transcribeSegment("sierra live", 1, start.Add(time.Hour)))
-	_ = store.EndSession("s", start.Add(61*time.Minute), "/audio/s.mp3")
+	_ = store.EndSession("s", start.Add(61*time.Minute), "/audio/s.mp3", "")
 	if err := store.MergeSessions("m1", []string{"n", "s"}, start, start.Add(2*time.Hour)); err != nil {
 		t.Fatal(err)
 	}
@@ -31,7 +31,7 @@ func TestReviewR19NestedUntimedDeleteKeepsRepeatedPhrase(t *testing.T) {
 		t.Fatal(err)
 	}
 	_ = store.CreateSession("t", start.Add(3*time.Hour))
-	_ = store.EndSession("t", start.Add(181*time.Minute), "/audio/t.mp3")
+	_ = store.EndSession("t", start.Add(181*time.Minute), "/audio/t.mp3", "")
 	if err := store.MergeSessions("m2", []string{"m1", "t"}, start, start.Add(4*time.Hour)); err != nil {
 		t.Fatal(err)
 	}
@@ -67,10 +67,10 @@ func TestReviewR19NestedUntimedDeleteKeepsAllOtherText(t *testing.T) {
 	_ = store.CreateSession("n", start)
 	_ = store.AppendSegment("n", transcribeSegment("november one "+reviewR19Secret, 0, start))
 	_ = store.AppendSegment("n", transcribeSegment("november two stays", 1, start))
-	_ = store.EndSession("n", start.Add(time.Minute), "")
+	_ = store.EndSession("n", start.Add(time.Minute), "", "")
 	_ = store.CreateSession("s", start.Add(time.Hour))
 	_ = store.AppendSegment("s", transcribeSegment("sierra live", 0, start.Add(time.Hour)))
-	_ = store.EndSession("s", start.Add(61*time.Minute), "/audio/s.mp3")
+	_ = store.EndSession("s", start.Add(61*time.Minute), "/audio/s.mp3", "")
 	if _, err := store.DB().Exec(`UPDATE sessions SET canonical_transcript = 'sierra live' WHERE id = 's'`); err != nil {
 		t.Fatal(err)
 	}
@@ -81,7 +81,7 @@ func TestReviewR19NestedUntimedDeleteKeepsAllOtherText(t *testing.T) {
 		t.Fatal(err)
 	}
 	_ = store.CreateSession("t", start.Add(3*time.Hour))
-	_ = store.EndSession("t", start.Add(181*time.Minute), "/audio/t.mp3")
+	_ = store.EndSession("t", start.Add(181*time.Minute), "/audio/t.mp3", "")
 	if err := store.MergeSessions("m2", []string{"m1", "t"}, start, start.Add(4*time.Hour)); err != nil {
 		t.Fatal(err)
 	}
@@ -143,13 +143,13 @@ func reviewR19RefusesUncreditableHolderRow(t *testing.T, provenance string) {
 	if err := store.AppendSegment("n", transcribeSegment("november delete", 0, start)); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.EndSession("n", start.Add(time.Minute), ""); err != nil {
+	if err := store.EndSession("n", start.Add(time.Minute), "", ""); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.AppendSegment("s", transcribeSegment("uncreditable holder text", 0, start)); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.EndSession("s", start.Add(time.Minute), "/audio/s.mp3"); err != nil {
+	if err := store.EndSession("s", start.Add(time.Minute), "/audio/s.mp3", ""); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.MergeSessions("m1", []string{"n", "s"}, start, start.Add(2*time.Hour)); err != nil {
@@ -158,7 +158,7 @@ func reviewR19RefusesUncreditableHolderRow(t *testing.T, provenance string) {
 	if err := store.CreateSession("t", start.Add(3*time.Hour)); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.EndSession("t", start.Add(181*time.Minute), "/audio/t.mp3"); err != nil {
+	if err := store.EndSession("t", start.Add(181*time.Minute), "/audio/t.mp3", ""); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.MergeSessions("m2", []string{"m1", "t"}, start, start.Add(4*time.Hour)); err != nil {
@@ -206,7 +206,7 @@ func TestNestedUntimedDeleteScrubsTheInnerSourceItself(t *testing.T) {
 		if err := store.AppendSegment(id, transcribeSegment(id+" two stays", 1, at)); err != nil {
 			t.Fatal(err)
 		}
-		if err := store.EndSession(id, at.Add(time.Minute), ""); err != nil {
+		if err := store.EndSession(id, at.Add(time.Minute), "", ""); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -219,7 +219,7 @@ func TestNestedUntimedDeleteScrubsTheInnerSourceItself(t *testing.T) {
 	if err := store.CreateSession("t", start.Add(3*time.Hour)); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.EndSession("t", start.Add(181*time.Minute), "/audio/t.mp3"); err != nil {
+	if err := store.EndSession("t", start.Add(181*time.Minute), "/audio/t.mp3", ""); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.MergeSessions("m2", []string{"m1", "t"}, start, start.Add(4*time.Hour)); err != nil {

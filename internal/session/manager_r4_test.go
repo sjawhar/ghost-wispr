@@ -53,7 +53,7 @@ func TestR4NoSummarizerRefusesEmbeddingAfterDelete(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if err := store.EndSession("s", started.Add(3*time.Second), "recording.mp3"); err != nil {
+	if err := store.EndSession("s", started.Add(3*time.Second), "recording.mp3", ""); err != nil {
 		t.Fatal(err)
 	}
 	segments, err := store.GetSegments("s")
@@ -93,7 +93,7 @@ func TestR4RealIndexerRunsAfterSummaryFailure(t *testing.T) {
 	if err := store.AppendSegment("s", transcribe.Segment{Text: "failure fallback transcript", StartTime: 0, EndTime: 1, Timestamp: started}); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.EndSession("s", started.Add(time.Second), "recording.mp3"); err != nil {
+	if err := store.EndSession("s", started.Add(time.Second), "recording.mp3", ""); err != nil {
 		t.Fatal(err)
 	}
 	client := &r4GateEmbeddingClient{entered: make(chan struct{}), release: make(chan struct{})}
