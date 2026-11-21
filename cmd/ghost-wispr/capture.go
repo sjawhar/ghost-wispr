@@ -454,8 +454,17 @@ func (g *captureGate) closeGate() {
 		g.onClosed(closings)
 	}
 
-	go func() {
-		defer close(settled)
+	g.startSettling(settled)
+}
+
+// startSettling settles closing's pause in the background, then closes
+// settled: the audio write still running ends, and settle ends the paused
+// session, which flushes its buffered words to the store. It runs as work the
+// stop waits for (background), so the store closes under none of it; once the
+// stop has run it does not run, and settled still closes. With no background
+// it runs on a goroutine of its own.
+func (g *captureGate) startSettling(settled chan struct{}) {
+	settle := func() {
 		if !g.waitForInflightWrites() {
 			// Its chunk is from before the pause. Nothing orders it before
 			// the resume: it can reach Deepgram late, and if it reaches the
@@ -466,6 +475,17 @@ func (g *captureGate) closeGate() {
 		if g.settle != nil {
 			g.settle()
 		}
+	}
+	go func() {
+		defer close(settled)
+		if g.background == nil {
+			settle()
+			return
+		}
+		_ = g.background.Run(context.Background(), func(context.Context) error {
+			settle()
+			return nil
+		})
 	}()
 }
 
@@ -660,15 +680,16 @@ func (g *captureGate) MicHold() string {
 	}
 }
 
-// startOpening runs openAfter in the background: as work the stop waits for
-// (background), or on a goroutine of its own with none. Once the stop has run
-// it does not run, and the gate stays closed. g.mu may be held.
+// startOpening runs openAfter in the background: as work the stop cuts off
+// and waits for (background), or on a goroutine of its own with none. Once
+// the stop has run it does not run, and the gate stays closed. g.mu may be
+// held.
 func (g *captureGate) startOpening(closing int, settled <-chan struct{}, forLight bool) {
 	if g.background == nil {
-		go g.openAfter(closing, settled, forLight)
+		go g.openAfter(context.Background(), closing, settled, forLight)
 		return
 	}
-	g.background.Go(func(context.Context) { g.openAfter(closing, settled, forLight) })
+	g.background.Go(func(ctx context.Context) { g.openAfter(ctx, closing, settled, forLight) })
 }
 
 // openAfter opens the gate once closing number closing has settled, if the
@@ -679,16 +700,21 @@ func (g *captureGate) startOpening(closing int, settled <-chan struct{}, forLigh
 // present, it takes no light check, and so releases no hold (afterGateOpen).
 // It checks the light's stored pattern (checkLightPattern) before it takes
 // control, so a pause meanwhile takes control at once; the switch it then
-// finds off stops the opening.
-func (g *captureGate) openAfter(closing int, settled <-chan struct{}, forLight bool) {
-	<-settled
+// finds off stops the opening. Once ctx ends (the stop) it stops where it is:
+// it opens nothing, and refuses nothing, which would save the pause state.
+func (g *captureGate) openAfter(ctx context.Context, closing int, settled <-chan struct{}, forLight bool) {
+	select {
+	case <-settled:
+	case <-ctx.Done():
+		return
+	}
 	var lightErr error
 	if g.beforeGateOpen != nil && g.checkLightPattern != nil && g.canOpen(closing) && !g.captureMissing() {
 		lightErr = g.checkLightPattern()
 	}
 	g.control.Lock()
 
-	if !g.canOpen(closing) {
+	if !g.canOpen(closing) || ctx.Err() != nil {
 		g.control.Unlock()
 		return
 	}
@@ -697,6 +723,12 @@ func (g *captureGate) openAfter(closing int, settled <-chan struct{}, forLight b
 		err := lightErr
 		if err == nil {
 			err = g.beforeGateOpen()
+		}
+		if err != nil && ctx.Err() != nil {
+			// The stop ran during the light check: the refusal is the
+			// stop's, not the light's, and saves nothing.
+			g.control.Unlock()
+			return
 		}
 		if err != nil {
 			g.mu.Lock()
