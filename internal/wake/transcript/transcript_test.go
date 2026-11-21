@@ -1,6 +1,7 @@
 package transcript
 
 import (
+	"fmt"
 	"slices"
 	"strings"
 	"sync"
@@ -28,11 +29,16 @@ func TestWakePhrasePosition(t *testing.T) {
 		{"Wispr", true, "Wispr", ""},
 		// The office run of 2026-11-21 heard the name as "Lispr".
 		{"Lispr, what's the status of INFRA ten twenty seven?", true, "Wispr", "what's the status of INFRA ten twenty seven?"},
+		{"Lispr, go ahead.", true, "Wispr", "go ahead."},
 		// Not calls.
 		{"I will whisper it to you", false, "", ""},
 		{"Whisper it to me later.", false, "", ""},
 		{"We asked Wispr yesterday.", false, "", ""},
 		{"The ghost whisper film was good.", false, "", ""},
+		// "Lispr" counts only before a comma or at the end: before a call
+		// word it is talk about the word (Sol's review of #135 at 21bbef7).
+		{"Lispr is what the transcript printed.", false, "", ""},
+		{"Lispr what is the status?", false, "", ""},
 		// "Mister" and the like are a person's address, not the name.
 		{"Mister, what's the status of info 10/27?", false, "", ""},
 		{"Miss Murray, what's the status?", false, "", ""},
@@ -113,6 +119,36 @@ func TestKeyterms(t *testing.T) {
 			t.Fatalf("keyterm %q twice", k)
 		}
 		seen[k] = true
+	}
+}
+
+// TestWhisperNeverDisplacesAKeyterm fails if "Whisper" takes the place of a
+// wake phrase or an issue key main sends when the list is full: with 98 keys
+// after the two wake phrases, main sends all 98 and no room is left (Sol's
+// review of #135 at 21bbef7: ABC-98 was dropped). With 97 keys there is
+// room, and "Whisper" goes right after "Wispr".
+func TestWhisperNeverDisplacesAKeyterm(t *testing.T) {
+	for _, n := range []int{97, 98} {
+		keys := make([]string, n)
+		for i := range keys {
+			keys[i] = fmt.Sprintf("ABC-%d", i+1)
+		}
+		got := Keyterms([]string{"Wispr", "Ghost Wispr"}, keys)
+		if len(got) > MaxKeyterms {
+			t.Fatalf("%d keys: %d keyterms, want at most %d", n, len(got), MaxKeyterms)
+		}
+		for _, k := range append([]string{"Wispr", "Ghost Wispr"}, keys...) {
+			if !slices.Contains(got, k) {
+				t.Fatalf("%d keys: keyterm %q dropped from %q", n, k, got)
+			}
+		}
+		whisper := slices.Contains(got, "Whisper")
+		if n == 97 && (!whisper || got[1] != "Whisper") {
+			t.Fatalf("97 keys: keyterms start %q, want Whisper right after Wispr in the room left", got[:3])
+		}
+		if n == 98 && whisper {
+			t.Fatalf("98 keys: Whisper sent in a full list %q", got)
+		}
 	}
 }
 
