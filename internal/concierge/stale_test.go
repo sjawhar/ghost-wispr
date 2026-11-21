@@ -108,9 +108,11 @@ func TestASpokenKeyIsReadInTheFormsDeepgramWrites(t *testing.T) {
 // TestEveryFormOfAKeyReadsAsTheKey fails if a spoken or formatted form of an
 // issue key reaches the Concierge's read as another issue, or as none: on
 // 2026-11-21 "infra 10/27", smart formatting's date for "infra ten twenty
-// seven", was read as INFRA-10. Nor may a date read as a key: "pencilled in
-// for 10/27" read as INFRA-1027 once a date's slash was taken out (Sol's
-// review of #133 at 2044b4c), where main reads no key. Each form goes the
+// seven", was read as INFRA-10. Nor may a date or an amount read as a key:
+// "pencilled in for 10/27" and "in for five thousand dollars" read as
+// INFRA-1027 and INFRA-5000 once a date's slash was taken out and a spoken
+// thousand read (Sol's reviews of #133 at 2044b4c and 51143e4), where main
+// reads no key. Each form goes the
 // way a turn does: the Supervisor writes the spoken keys of Dispatch's
 // projects as keys (transcript.WriteKeys), and the Concierge reads the
 // record the turn names (readTarget).
@@ -136,9 +138,11 @@ func TestEveryFormOfAKeyReadsAsTheKey(t *testing.T) {
 		{"what's the status of INFRA fifteen?", "INFRA-15"},
 		{"what's the status of infra one thousand and twenty seven?", "INFRA-1027"},
 		{"what's the status of INFRA four thousand five hundred and ninety two?", "INFRA-4592"},
+		{"what's the status of in for four thousand five hundred and ninety two?", "INFRA-4592"},
 		{"The review is on 10/27.", ""},
 		{"Are we pencilled in for 10/27?", ""},
 		{"Are we pencilled in for 1027?", "INFRA-1027"},
+		{"Are we in for five thousand dollars?", ""},
 	} {
 		turn := transcript.WriteKeys(tc.said, projects)
 		target := r.concierge.readTarget(context.Background(), turn, true)

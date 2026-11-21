@@ -627,42 +627,49 @@ func TestATalkOverBeforeItsStartEventIsDeliveredStopsTheVoice(t *testing.T) {
 // Deepgram's result for it came, counts as a new turn once that result comes
 // after the answer: it closed the follow-up window, and the exchange stayed
 // open for IdleWait. Nor may that result join the question before it: the
-// turn the voice answered is the follow-up alone, as on main (Sol's review
-// of #133 at 2044b4c: "what's the status of INFRA-1027? Who signed off?").
+// turn the voice answered is the follow-up alone, as on main, whether the
+// voice answered it in one speech or two (Sol's reviews of #133 at 2044b4c
+// and 51143e4: "what's the status of INFRA-1027? Who signed off?").
 func TestAFollowUpAnsweredBeforeItsTranscriptIsNoNewTurn(t *testing.T) {
-	// FollowUpWait outlasts the follow-up said in it, and is shorter than
-	// eventually's wait.
-	r := newRigWith(t, newFakeConcierge(), func(cfg *SupervisorConfig, r *rig) {
-		v := drivingVoice{r.voice}
-		cfg.Voice = func() (Voice, error) { return v, nil }
-		cfg.IdleWait = time.Minute
-		cfg.FollowUpWait = time.Second
-	})
-	r.heard("Wispr, what's the status of INFRA-1027?", true, true)
-	sess := r.waitSession()
-	window := func() bool {
-		r.s.mu.Lock()
-		defer r.s.mu.Unlock()
-		return r.s.ex != nil && r.s.ex.followUpTimer != nil
+	for _, answer := range [][]string{{"Ada did."}, {"I will check.", "Ada did."}} {
+		t.Run(fmt.Sprintf("in %d speeches", len(answer)), func(t *testing.T) {
+			// FollowUpWait outlasts the follow-up said in it, and is shorter
+			// than eventually's wait.
+			r := newRigWith(t, newFakeConcierge(), func(cfg *SupervisorConfig, r *rig) {
+				v := drivingVoice{r.voice}
+				cfg.Voice = func() (Voice, error) { return v, nil }
+				cfg.IdleWait = time.Minute
+				cfg.FollowUpWait = time.Second
+			})
+			r.heard("Wispr, what's the status of INFRA-1027?", true, true)
+			sess := r.waitSession()
+			window := func() bool {
+				r.s.mu.Lock()
+				defer r.s.mu.Unlock()
+				return r.s.ex != nil && r.s.ex.followUpTimer != nil
+			}
+			speakAs(t, sess, "INFRA-1027 is in review since this morning.")
+			prev := waitSpeechAfter(t, r, time.Time{})
+			r.speaker.finish(audio.InputVoice)
+			eventually(t, "the first answer's follow-up window", window)
+			asked := from(time.Now()) // "Who signed off?", in the window; Deepgram is slow
+			time.Sleep(time.Until(asked(2)) + 50*time.Millisecond)
+			for _, line := range answer { // the voice answers it from the room's audio
+				speakAs(t, sess, line)
+				prev = waitSpeechAfter(t, r, prev)
+				r.speaker.finish(audio.InputVoice)
+				eventually(t, "the answer's follow-up window", window)
+			}
+			r.s.OnTranscript(timedResult("Who signed off?", 210, true, asked)) // its final, after the answer
+			r.s.mu.Lock()
+			turn, asker := r.s.turnOf(r.s.ex), r.s.ex.x.AskerTurn
+			r.s.mu.Unlock()
+			if turn != "Who signed off?" || asker != turn {
+				t.Errorf("the turn is %q, AskerTurn %q; want the follow-up alone", turn, asker)
+			}
+			eventually(t, "the exchange to end FollowUpWait after the last answer", func() bool { _, _, closed := sess.state(); return closed })
+		})
 	}
-	speakAs(t, sess, "INFRA-1027 is in review since this morning.")
-	first := waitSpeechAfter(t, r, time.Time{})
-	r.speaker.finish(audio.InputVoice)
-	eventually(t, "the first answer's follow-up window", window)
-	asked := from(time.Now()) // "Who signed off?", in the window; Deepgram is slow
-	time.Sleep(time.Until(asked(2)) + 50*time.Millisecond)
-	speakAs(t, sess, "Ada did.") // the voice answers it from the room's audio
-	waitSpeechAfter(t, r, first)
-	r.speaker.finish(audio.InputVoice)
-	eventually(t, "the second answer's follow-up window", window)
-	r.s.OnTranscript(timedResult("Who signed off?", 210, true, asked)) // its final, after the answer
-	r.s.mu.Lock()
-	turn, asker := r.s.turnOf(r.s.ex), r.s.ex.x.AskerTurn
-	r.s.mu.Unlock()
-	if turn != "Who signed off?" || asker != turn {
-		t.Errorf("the turn is %q, AskerTurn %q; want the follow-up alone", turn, asker)
-	}
-	eventually(t, "the exchange to end FollowUpWait after the second answer", func() bool { _, _, closed := sess.state(); return closed })
 }
 
 // TestAnOlderFinalDoesNotJoinAFollowUpAnsweredBeforeItsTranscript fails if

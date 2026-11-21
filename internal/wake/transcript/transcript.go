@@ -376,12 +376,13 @@ func keySpans(tokens []token) []keySpan {
 			if project, ok := soundsLikeProject[[2]string{word, normalise(texts[i+1])}]; ok {
 				// Only before a number of three or more digits, as issue
 				// numbers are, and no year: "in for thirty minutes" and "in
-				// for 2027" are no keys. A date smart formatting wrote reads
-				// as the project only after a word "in" cannot follow:
-				// "pencilled in for 10/27" is a date.
+				// for 2027" are no keys. A date smart formatting wrote, or a
+				// number said with a hundred or a thousand, reads as the
+				// project only after a word "in" cannot follow: "pencilled in
+				// for 10/27" is a date, and "in for five thousand dollars" an
+				// amount; main read neither as a key.
 				digits, used := spokenNumber(texts[i+2:])
-				date := used == 1 && strings.Contains(texts[i+2], "/")
-				if len(digits) >= 3 && !aYear(digits) && (!date || i > 0 && beforeAName[normalise(texts[i-1])]) {
+				if len(digits) >= 3 && !aYear(digits) && (!amountLike(texts[i+2:i+2+used]) || i > 0 && beforeAName[normalise(texts[i-1])]) {
 					spans = append(spans, keySpan{key: project + "-" + digits, from: i, to: i + 2 + used})
 					i += 1 + used
 					continue
@@ -399,6 +400,19 @@ func keySpans(tokens []token) []keySpan {
 		i += used
 	}
 	return spans
+}
+
+// amountLike reports whether number, the tokens of one spoken or written
+// number, reads as a date or an amount more readily than as an issue number:
+// a date smart formatting wrote ("10/27"), or a number said with a hundred
+// or a thousand ("five thousand").
+func amountLike(number []string) bool {
+	for _, w := range number {
+		if strings.Contains(w, "/") || scalePlaces[normalise(w)] > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 // aYear reports whether digits read as a year of this era (1900 to 2099),
