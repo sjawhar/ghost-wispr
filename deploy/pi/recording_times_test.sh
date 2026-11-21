@@ -155,9 +155,9 @@ for speed in (1.0002, 0.9998, 1.0):
                             failures.append("%s: the place %.3f ms into the file is at %.3f ms, given %d ms: early" % (case, place, want, ms))
                         elif ms > want + slack:
                             failures.append("%s: the place %.3f ms into the file is at %.3f ms, given %d ms: more than %.1f ms late" % (case, place, want, ms, slack))
-                        # The early bound: never late, and early only by the 200 ppm over the
-                        # whole file, the 1 ms the start was read before the first sample, and
-                        # rounding.
+                        # The early bound: never late, and early only by up to 400 ppm over the
+                        # whole file (the bound takes the card at 200 ppm fast; it can be 200 ppm
+                        # slow), the 1 ms the start was read before the first sample, and rounding.
                         if early > want:
                             failures.append("%s: the place %.3f ms into the file is at %.3f ms, its early bound %d ms: late" % (case, place, want, early))
                         elif early < want - (place * 0.0004 + (lost if overrun and place >= 5000 else 0) + 3):

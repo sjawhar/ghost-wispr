@@ -517,6 +517,11 @@ func (r *runner) issueHolder(ctx context.Context, key string) (map[string]any, e
 	if err != nil {
 		return nil, err
 	}
+	// An agent that joined the meeting on the issue is the one to ask, before
+	// the issue's claim (R17).
+	if agent, ok := r.c.joinedOn(key); ok {
+		return r.sessionHolder(ctx, agent.SessionID, agent.Title), nil
+	}
 	issue, err := records.Issue(ctx, key)
 	if err != nil {
 		return nil, err
@@ -883,6 +888,40 @@ func (r *runner) listJoinedAgents() map[string]any {
 		}
 	}
 	return map[string]any{"agents": agents}
+}
+
+// joinedOn is the agent that joined the meeting on issue key, if one did.
+func (c *Concierge) joinedOn(key string) (JoinedAgent, bool) {
+	if c.joined == nil {
+		return JoinedAgent{}, false
+	}
+	for _, agent := range c.joined() {
+		if agent.IssueKey == key {
+			return agent, true
+		}
+	}
+	return JoinedAgent{}, false
+}
+
+// joinedNumber is the key of the one joined agent's issue whose number words
+// say with no project ("ask the 1027 agent"), or "".
+func (c *Concierge) joinedNumber(words string) string {
+	if c.joined == nil {
+		return ""
+	}
+	agents := c.joined()
+	found := ""
+	for _, number := range bareIssueNumber.FindAllString(words, -1) {
+		for _, agent := range agents {
+			if _, n, _ := strings.Cut(agent.IssueKey, "-"); n == number {
+				if found != "" && found != agent.IssueKey {
+					return "" // two agents' issues: the person picks
+				}
+				found = agent.IssueKey
+			}
+		}
+	}
+	return found
 }
 
 // namedFor is how long the sessions issue_holder named stay askable in an

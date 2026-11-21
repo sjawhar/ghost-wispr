@@ -38,7 +38,7 @@ func TestTheConciergeStartsWithoutReach(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			store := conciergeStore(t)
 			started := time.Now()
-			c, stop, err := startConcierge(t.Context(), &cfg, store, discardLogger, nil)
+			c, stop, err := startConcierge(t.Context(), &cfg, store, discardLogger, nil, nil)
 			if err != nil {
 				t.Fatalf("startConcierge: %v", err)
 			}
@@ -57,7 +57,7 @@ func TestTheConciergeStartsWithoutReach(t *testing.T) {
 // its model.
 func TestTheConciergeNeedsAModel(t *testing.T) {
 	cfg := config.Config{GenAIBackend: "gemini"}
-	if c, stop, err := startConcierge(t.Context(), &cfg, conciergeStore(t), discardLogger, nil); err == nil {
+	if c, stop, err := startConcierge(t.Context(), &cfg, conciergeStore(t), discardLogger, nil, nil); err == nil {
 		stop()
 		t.Fatalf("started a Concierge %v with no model credentials", c)
 	}
@@ -78,7 +78,7 @@ func TestTheConciergeTellsTheSessionPageOfChanges(t *testing.T) {
 		t.Fatal(err)
 	}
 	changed := make(chan string, 4)
-	c, stop, err := startConcierge(t.Context(), &cfg, store, discardLogger, func(id string) { changed <- id })
+	c, stop, err := startConcierge(t.Context(), &cfg, store, discardLogger, func(id string) { changed <- id }, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

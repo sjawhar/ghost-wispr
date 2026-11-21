@@ -10,6 +10,8 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 	"unicode"
 )
 
@@ -27,6 +29,7 @@ const (
 	Stop                     // stop speaking and end the exchange
 	GoAhead                  // speak the pending answer
 	NeverMind                // cancel the newest question to an agent
+	HandsUp                  // say which joined agents have a hand up
 )
 
 func (c Command) String() string {
@@ -37,6 +40,8 @@ func (c Command) String() string {
 		return "go ahead"
 	case NeverMind:
 		return "never mind"
+	case HandsUp:
+		return "hands up"
 	default:
 		return "ask"
 	}
@@ -246,8 +251,16 @@ func CommandOf(rest string) Command {
 		return GoAhead
 	case first == "nevermind", first == "never" && second == "mind", first == "forget" && second == "it":
 		return NeverMind
+	case (first == "who" || first == "who's" || first == "whos") && saysHand(words), first == "any" && (second == "hand" || second == "hands"):
+		return HandsUp
 	}
 	return Ask
+}
+
+// saysHand reports whether words hold "hand" or "hands": "who has a hand
+// up?", not "who handles the budget?".
+func saysHand(words []string) bool {
+	return slices.ContainsFunc(words, func(w string) bool { n := normalise(w); return n == "hand" || n == "hands" })
 }
 
 // IssueKeys returns the issue keys text names, in the forms people say them:
@@ -497,6 +510,184 @@ func Keyterms(phrases, issueKeys []string) []string {
 		}
 	}
 	return out
+}
+
+// Configurer is a live Deepgram socket as LiveKeyterms reaches it: Configure
+// asks it to replace its keyterms mid-stream and returns at once, and the
+// hook OnConfigured gives hears Deepgram's answer to each Configure, with the
+// keyterms it answers: taken or refused. A socket sends one Configure at a
+// time, as Deepgram takes them (CONFIGURE_ALREADY_PENDING), and one that
+// closes first never answers.
+type Configurer interface {
+	Configure(keyterms []string) error
+	OnConfigured(answer func(keyterms []string, taken bool))
+}
+
+// configureRetryAfter is how long a list Deepgram refused waits before it
+// goes once more.
+const configureRetryAfter = time.Second
+
+// LiveKeyterms are the keyterms of the live Deepgram stream (R4): the wake
+// phrases, then the issue keys of the agents that joined the meeting, then
+// Dispatch's project keys, within Deepgram's limits (Keyterms). A dial reads
+// List. A join or a leave that changes the list sends it to the socket that
+// carries the meeting with Configure, so the stream hears an agent's key from
+// its join on, with no redial. The list is the stream's only once Deepgram
+// takes it: a refused list stays wanted.
+type LiveKeyterms struct {
+	phrases    []string
+	projects   func() []string
+	retryAfter time.Duration
+
+	mu      sync.Mutex
+	joined  []string
+	stream  Configurer
+	taken   []string    // the list stream has: its dial's, or the last Deepgram took
+	asking  bool        // a Configure to stream waits for Deepgram's answer
+	retry   *time.Timer // the resend of a refused list, while it waits
+	retried bool        // a list refused since the last change had its resend
+	refused bool        // Deepgram refused a list, and stream lacks the one wanted since
+	refusal func(refused bool)
+}
+
+// NewLiveKeyterms returns the live stream's keyterms for the wake phrases;
+// projects, nil for none, gives Dispatch's project keys at each read.
+func NewLiveKeyterms(phrases []string, projects func() []string) *LiveKeyterms {
+	return &LiveKeyterms{phrases: slices.Clone(phrases), projects: projects, retryAfter: configureRetryAfter}
+}
+
+// SetRefusalHook makes hook hear, each time it changes, whether the stream
+// lacks the wanted list because Deepgram refused one: true at a refusal that
+// leaves the stream without the wanted list, false once the stream has it
+// (Deepgram took it, or a join or a leave made it the list the stream has),
+// once Deepgram takes another list, or once a new dial attaches.
+func (k *LiveKeyterms) SetRefusalHook(hook func(refused bool)) {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	k.refusal = hook
+}
+
+// List is the keyterms a dial sends now.
+func (k *LiveKeyterms) List() []string {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	return k.listLocked()
+}
+
+func (k *LiveKeyterms) listLocked() []string {
+	keys := slices.Clone(k.joined)
+	if k.projects != nil {
+		keys = append(keys, k.projects()...)
+	}
+	return Keyterms(k.phrases, keys)
+}
+
+// SetJoined makes keys the joined agents' issue keys, and sends the socket
+// the new list when it changed.
+func (k *LiveKeyterms) SetJoined(keys []string) {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	k.joined = slices.Clone(keys)
+	k.retried = false
+	k.sendLocked()
+}
+
+// Attach makes stream, a socket dialled with the list dialed, the one that
+// carries the meeting; it is sent the list at once when a join or a leave
+// changed it since the dial. nil detaches the last one. The answer of a
+// socket attached before is not heard.
+func (k *LiveKeyterms) Attach(stream Configurer, dialed []string) {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	k.stopRetryLocked()
+	k.stream, k.taken, k.asking, k.retried = stream, slices.Clone(dialed), false, false
+	if stream != nil {
+		stream.OnConfigured(func(list []string, taken bool) { k.answered(stream, list, taken) })
+	}
+	k.reportLocked(false)
+	k.sendLocked()
+}
+
+// sendLocked sends the stream the list when it does not have it, unless a
+// Configure waits for its answer, which sends the newest list then. A stream
+// that has the list no longer lacks it after a refusal, whether or not a
+// Configure waits. A send that fails is not retried: the socket is closing,
+// and the next dial reads List.
+func (k *LiveKeyterms) sendLocked() {
+	if k.stream == nil {
+		return
+	}
+	list := k.listLocked()
+	if slices.Equal(list, k.taken) {
+		k.reportLocked(false)
+		return
+	}
+	if k.asking {
+		return
+	}
+	k.stopRetryLocked()
+	if k.stream.Configure(list) == nil {
+		k.asking = true
+	}
+}
+
+// answered takes Deepgram's answer to the Configure of list on stream. Taken,
+// list is the stream's. Refused, the stream keeps the list it had: a newer
+// list goes at once; the same list goes once more after retryAfter, and a
+// second refusal of it waits for the next join or leave, or the next dial. A
+// refusal leaves the stream lacking the wanted list unless a join or a leave
+// since made it the list the stream has.
+func (k *LiveKeyterms) answered(stream Configurer, list []string, taken bool) {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	if stream != k.stream {
+		return
+	}
+	k.asking = false
+	if taken {
+		k.taken = list
+	}
+	wanted := k.listLocked()
+	k.reportLocked(!taken && !slices.Equal(wanted, k.taken))
+	if !taken && slices.Equal(wanted, list) {
+		if !k.retried {
+			k.retried = true
+			var retry *time.Timer
+			retry = time.AfterFunc(k.retryAfter, func() {
+				k.mu.Lock()
+				defer k.mu.Unlock()
+				if k.retry == retry {
+					k.retry = nil
+					k.sendLocked()
+				}
+			})
+			k.retry = retry
+		}
+		return
+	}
+	k.retried = false
+	k.sendLocked()
+}
+
+// stopRetryLocked drops the resend that waits, if any: a send or a new dial
+// takes its place.
+func (k *LiveKeyterms) stopRetryLocked() {
+	if k.retry != nil {
+		k.retry.Stop()
+		k.retry = nil
+	}
+}
+
+// reportLocked makes the stream lack the wanted list after a refusal, or not,
+// and tells the refusal hook when that changes.
+func (k *LiveKeyterms) reportLocked(refused bool) {
+	if refused == k.refused {
+		return
+	}
+	k.refused = refused
+	if k.refusal != nil {
+		k.refusal(refused)
+	}
 }
 
 // normalise lowercases w and strips the punctuation around it, keeping an

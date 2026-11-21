@@ -1,7 +1,8 @@
-import { fetchVoiceTasks, requestErrorMessage } from './api'
+import { fetchJoinedAgents, fetchVoiceTasks, requestErrorMessage } from './api'
 import { ComponentStatus as ComponentStatusValue, SummaryStatus } from './types'
 import type {
   ComponentStatusEvent,
+  JoinedAgent,
   LiveTranscriptEvent,
   PresetMap,
   SessionDetailResponse,
@@ -29,6 +30,12 @@ export type SessionVoiceTasks = {
   error: string
 }
 
+// A session's joined agents as last read, and why the last read failed.
+export type SessionJoinedAgents = {
+  agents: JoinedAgent[]
+  error: string
+}
+
 type AppState = {
   connected: boolean
   paused: boolean
@@ -45,6 +52,8 @@ type AppState = {
   sessionDetails: Map<string, SessionDetailResponse>
   // By session, its questions to agents, once the tab has read them.
   voiceTasks: Map<string, SessionVoiceTasks>
+  // By session, the agents that joined its meeting, once the tab read them.
+  joinedAgents: Map<string, SessionJoinedAgents>
   dates: string[]
   warnings: string[]
   presets: PresetMap
@@ -66,6 +75,7 @@ export const appState = $state<AppState>({
   sessionsByDate: new Map(),
   sessionDetails: new Map(),
   voiceTasks: new Map(),
+  joinedAgents: new Map(),
   dates: [],
   warnings: [],
   presets: {},
@@ -82,6 +92,8 @@ const summaryDeletionTimes = new Map<string, number>()
 // By session, the number of the latest read of its questions to agents: only
 // that read's answer is shown.
 const voiceTaskReads = new Map<string, number>()
+// By session, the number of the latest read of its joined agents.
+const joinedAgentReads = new Map<string, number>()
 
 export function getTodaysSessions(): SessionSummary[] {
   const today = new Date().toISOString().slice(0, 10)
@@ -99,6 +111,17 @@ export function setConnected(connected: boolean): void {
         { ...held, seq: undefined },
       ]),
     )
+    // A join, a leave or an answer sent while this page was not connected
+    // never reached it: every session whose agents or questions this tab
+    // read reads them again. The socket's open and the server's connection
+    // frame, which it sends once it hears the unit's events, both come here,
+    // and only the later read is shown.
+    for (const sessionID of joinedAgentReads.keys()) {
+      void loadJoinedAgents(sessionID)
+    }
+    for (const sessionID of voiceTaskReads.keys()) {
+      void loadVoiceTasks(sessionID)
+    }
   }
 }
 
@@ -196,6 +219,32 @@ export async function loadVoiceTasks(sessionID: string): Promise<void> {
   const voiceTasks = new Map(appState.voiceTasks)
   voiceTasks.set(sessionID, next)
   appState.voiceTasks = voiceTasks
+}
+
+// loadJoinedAgents reads the agents that joined the session's meeting. Only
+// the latest read is shown, and none of a session this tab removed. A failed
+// read keeps the agents shown and says why.
+export async function loadJoinedAgents(sessionID: string): Promise<void> {
+  if (removedSessions.has(sessionID)) {
+    return
+  }
+  const read = (joinedAgentReads.get(sessionID) ?? 0) + 1
+  joinedAgentReads.set(sessionID, read)
+  let next: SessionJoinedAgents
+  try {
+    next = { agents: await fetchJoinedAgents(sessionID), error: '' }
+  } catch (error) {
+    next = {
+      agents: appState.joinedAgents.get(sessionID)?.agents ?? [],
+      error: requestErrorMessage(error),
+    }
+  }
+  if (joinedAgentReads.get(sessionID) !== read || removedSessions.has(sessionID)) {
+    return
+  }
+  const joinedAgents = new Map(appState.joinedAgents)
+  joinedAgents.set(sessionID, next)
+  appState.joinedAgents = joinedAgents
 }
 
 // The server has removed the selected timed occurrence and queued a fresh
@@ -371,6 +420,14 @@ export function applyEvent(event: WebSocketEvent): void {
         void loadVoiceTasks(event.session_id)
       }
       return
+    // An agent joined or left: a session whose agents this tab read reads
+    // them again.
+    case 'agent_joined':
+    case 'agent_left':
+      if (joinedAgentReads.has(event.session_id)) {
+        void loadJoinedAgents(event.session_id)
+      }
+      return
     default:
       return
   }
@@ -417,10 +474,12 @@ export function resetState(): void {
   detailRequestVersions.clear()
   summaryDeletionTimes.clear()
   voiceTaskReads.clear()
+  joinedAgentReads.clear()
   removedSessions.clear()
   appState.sessionsByDate = new Map()
   appState.sessionDetails = new Map()
   appState.voiceTasks = new Map()
+  appState.joinedAgents = new Map()
   appState.dates = []
   appState.activeSessionId = ''
   appState.activeSessionStartedAt = 0
@@ -460,6 +519,11 @@ export function removeSession(sessionId: string): void {
     const nextVoiceTasks = new Map(appState.voiceTasks)
     nextVoiceTasks.delete(sessionId)
     appState.voiceTasks = nextVoiceTasks
+  }
+  if (appState.joinedAgents.has(sessionId)) {
+    const nextJoinedAgents = new Map(appState.joinedAgents)
+    nextJoinedAgents.delete(sessionId)
+    appState.joinedAgents = nextJoinedAgents
   }
   appState.componentStatuses = Object.fromEntries(
     Object.entries(appState.componentStatuses).filter(([, s]) => s.sessionId !== sessionId),

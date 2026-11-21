@@ -37,9 +37,15 @@ type Manager struct {
 	refinementWarning  func(sessionID, warning string)
 	sessionEnded       func(sessionID string)
 
-	mu                             sync.Mutex
-	currentSessionID               string
-	currentStartedAt               time.Time
+	mu               sync.Mutex
+	currentSessionID string
+	currentStartedAt time.Time
+	// meeting is the current session's meeting context, which ends in the
+	// same step that clears or replaces the session (moveSessionLocked),
+	// before any session-ended hook runs: what joined agents and the voice
+	// do for a meeting ends with it there (MeetingContext).
+	meeting                        context.Context
+	meetingCancel                  context.CancelFunc
 	manualSession                  bool
 	prevTimeout                    time.Duration
 	capturePaused                  bool          // no session may start while true
@@ -457,7 +463,7 @@ func (m *Manager) claimSessionLocked(now time.Time) (string, error) {
 
 	sessionID := m.newSessionIDLocked(now)
 	startedAt := m.recordingStart(now.UTC())
-	m.currentSessionID = sessionID
+	m.moveSessionLocked(sessionID)
 	m.currentStartedAt = startedAt
 	m.sessionStarts++
 	m.mu.Unlock()
@@ -466,7 +472,7 @@ func (m *Manager) claimSessionLocked(now time.Time) (string, error) {
 	sessionID, err := m.startSession(sessionID, startedAt)
 	if err != nil {
 		m.mu.Lock()
-		m.currentSessionID = ""
+		m.moveSessionLocked("")
 		m.currentStartedAt = time.Time{}
 		m.mu.Unlock()
 		return "", err
@@ -524,7 +530,7 @@ func (m *Manager) nextSessionID(taken string, startedAt time.Time) string {
 	defer m.mu.Unlock()
 	sessionID := m.newSessionIDLocked(startedAt)
 	if m.currentSessionID == taken {
-		m.currentSessionID = sessionID
+		m.moveSessionLocked(sessionID)
 	}
 	return sessionID
 }
@@ -615,7 +621,7 @@ func (m *Manager) endSession(ctx context.Context, want string) error {
 	}
 
 	m.mu.Lock()
-	m.currentSessionID = ""
+	m.moveSessionLocked("")
 	m.currentStartedAt = time.Time{}
 	m.failedEnd = sessionEnd{}
 	m.endManualLocked()
@@ -919,6 +925,46 @@ func (m *Manager) ActiveSession() (string, time.Time) {
 	return m.currentSessionID, m.currentStartedAt
 }
 
+// endedMeeting is the meeting context of every session that is not current:
+// it is done from the start.
+var endedMeeting = func() context.Context {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	return ctx
+}()
+
+// MeetingContext is the meeting context of recording session id: live while
+// id is the current session and the unit records, and done in the same step
+// that ends or replaces the session, or that pauses capture (PauseCapture),
+// before the session-ended hook. It is done at once for any other id. It
+// takes the manager's lock briefly and calls nothing.
+func (m *Manager) MeetingContext(id string) context.Context {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if id == "" || id != m.currentSessionID || m.meeting == nil {
+		return endedMeeting
+	}
+	return m.meeting
+}
+
+// moveSessionLocked makes id ("" for none) the current session: the last
+// session's meeting context ends here, and id's begins, done at once while
+// capture is paused (a start already under way when the pause came). m.mu is
+// held.
+func (m *Manager) moveSessionLocked(id string) {
+	if m.meetingCancel != nil {
+		m.meetingCancel()
+	}
+	m.currentSessionID = id
+	m.meeting, m.meetingCancel = nil, nil
+	if id != "" {
+		m.meeting, m.meetingCancel = context.WithCancel(context.Background())
+		if m.capturePaused {
+			m.meetingCancel()
+		}
+	}
+}
+
 // SetSummarizer replaces the summarizer used for new sessions.
 // Safe to call concurrently.
 func (m *Manager) SetSummarizer(s Summarizer) {
@@ -1081,7 +1127,7 @@ func (m *Manager) ManualStartSession(ctx context.Context, titleHint string) (str
 	}
 
 	sessionID := m.newSessionIDLocked(now)
-	m.currentSessionID = sessionID
+	m.moveSessionLocked(sessionID)
 	startedAt := m.recordingStart(now)
 	m.currentStartedAt = startedAt
 	m.manualSession = true
@@ -1099,7 +1145,7 @@ func (m *Manager) ManualStartSession(ctx context.Context, titleHint string) (str
 	sessionID, err := m.startSession(sessionID, startedAt)
 	if err != nil {
 		m.mu.Lock()
-		m.currentSessionID = ""
+		m.moveSessionLocked("")
 		m.currentStartedAt = time.Time{}
 		m.endManualLocked()
 		m.mu.Unlock()
@@ -1185,15 +1231,20 @@ func (m *Manager) endManualLocked() {
 	m.prevTimeout = 0
 }
 
-// PauseCapture stops new sessions from starting until ResumeCapture. It only
-// sets a flag and waits for nothing, so the capture gate can close at once; a
-// session start already under way still finishes, and WaitForSessionStarts
-// waits for it. It does not end the active session; the capture pause does
-// that once Deepgram's last words are in.
+// PauseCapture stops new sessions from starting until ResumeCapture, and ends
+// the current session's meeting context: the meeting ends the moment the unit
+// leaves recording, whatever the session's end still has to save. It only
+// sets a flag and cancels a context, and waits for nothing, so the capture
+// gate can close at once; a session start already under way still finishes,
+// and WaitForSessionStarts waits for it. It does not end the active session;
+// the capture pause does that once Deepgram's last words are in.
 func (m *Manager) PauseCapture() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.capturePaused = true
+	if m.meetingCancel != nil {
+		m.meetingCancel()
+	}
 }
 
 // WaitForSessionStarts waits until no session start is under way, so a session

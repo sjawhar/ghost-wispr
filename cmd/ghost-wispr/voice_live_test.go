@@ -256,7 +256,7 @@ func TestTheConciergeStartsOnFirstUse(t *testing.T) {
 	var started *concierge.Concierge
 	lazy := newLazyConcierge(func() (*concierge.Concierge, func(), error) {
 		starts++
-		c, stop, err := startConcierge(t.Context(), &cfg, store, discardLogger, nil)
+		c, stop, err := startConcierge(t.Context(), &cfg, store, discardLogger, nil, nil)
 		started = c
 		return c, stop, err
 	}, nil, discardLogger)

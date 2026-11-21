@@ -17,10 +17,11 @@
 # (deploy/pi/journalrecords), so a driver that reads another journal, another process's lines or
 # another key reads nothing. Each step runs once as it should pass and once against its
 # verification check's negative control. Cases run in parallel; each records its failures, and the
-# run goes on, so that one run shows every assertion that fails. On 2 CPUs a whole run takes about
-# 8 minutes (488 s and 507 s on sami-devbox, 2026-11-20), so give it a timeout of 15 minutes or
-# more. Killed early, it leaves nothing for long: its fake services end within 5 s of it, and a
-# driver still restoring its case within 150 s.
+# run goes on, so that one run shows every assertion that fails. On 2 CPUs a whole run takes 8 to 11
+# minutes (488 s and 507 s on 2026-11-20; 670 s and 662 s on 2026-11-21, on a machine at a load
+# average of about 400), so give it a timeout of 15 minutes or more. Killed early, it leaves nothing
+# for long: its fake services end within 5 s of it, and a driver still restoring its case within
+# 150 s.
 set -uo pipefail
 
 repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -123,12 +124,29 @@ def iso(ms):
     return datetime.fromtimestamp(ms // 1000, timezone.utc).strftime("%Y-%m-%dT%H:%M:%S") + ".%03d000000Z" % (ms % 1000)
 
 
+def clock(ms):
+    """The time of day at MS, as a pointer gives it (HH:MM:SS UTC)."""
+    return datetime.fromtimestamp(ms // 1000, timezone.utc).strftime("%H:%M:%S")
+
+
 def alive(pid):
     try:
         with open("/proc/%d/stat" % pid) as f:
             return f.read().rsplit(")", 1)[1].split()[0] != "Z"
     except (OSError, IndexError):
         return False
+
+
+def process_start_ms():
+    """When this process began, on now_ms's clock, never early: /proc/self/stat gives its start in
+    whole clock ticks since boot, rounded down, so one tick more; and boot is placed on the wall
+    clock by reading the boot clock first, so that the time between the two reads makes it later."""
+    with open("/proc/self/stat") as f:
+        ticks = int(f.read().rsplit(")", 1)[1].split()[19])
+    since_boot = time.clock_gettime_ns(time.CLOCK_BOOTTIME)
+    boot = time.time_ns() - since_boot
+    start = boot + (ticks + 1) * 1_000_000_000 // os.sysconf("SC_CLK_TCK")
+    return -(-start // 1_000_000)
 
 
 def test_running():
@@ -752,6 +770,10 @@ def react(kind, key, start, end):
                 emit(kind="sound", start=answer + 50, end=answer + 250, tag=atag)
                 voice_state(lambda s: s.setdefault("answers", []).append(task))
             voice_state(lambda s: s.setdefault("tasks", []).append(task))
+    elif kind == "mention":
+        joined_mention(end)
+    elif kind == "go-ahead" and "joined" in SCENARIO:
+        joined_go_ahead(start, end)
     elif kind == "go-ahead":
         state = voice_state(lambda s: dict(s))
         if state.get("ready") or state.get("answers"):
@@ -844,6 +866,101 @@ def aplay(args):
     return 0
 
 
+# ---- the joined step's test agent ----
+
+# The recording session the joined step's mention opens.
+JOINED_SESSION = "session-1"
+
+
+def joined_mention(end):
+    """A mention of the joined issue, which ended at END. The first opens the recording session; one
+    after the test agent joined brings its pointer, its read of the transcript and its floor
+    request, then the hand sound 1.6 s after the mention ended, as the voice waits for a gap in the
+    room's words. joined-other-meeting's pointer names another meeting; joined-early-spoken tells
+    the agent its words were spoken before anyone invited them."""
+    if not read("active-session"):
+        write("active-session", JOINED_SESSION + "\n")
+        return
+    if not read("probe-joined"):
+        return
+    pointed = "session-9" if "joined-other-meeting" in SCENARIO else JOINED_SESSION
+    span = {"from": clock(end - 2000), "to": clock(end)}
+    text = "Your work came up in the meeting Ghost Wispr records: recording session %s, %s to %s UTC." % (pointed, span["from"], span["to"])
+    emit(kind="probe", due=end + 300, step="received", fields={"from": "pi-session-1", "event": "event-pointer", "in_reply_to": "", "text": text})
+    emit(kind="probe", due=end + 300, step="pointer", fields=dict(span, recording_session=pointed, text=text))
+    emit(kind="probe", due=end + 500, step="transcript_read", fields={"status": 200, "segments": 3, "segments_in_range": 2})
+    emit(kind="probe", due=end + 700, step="floor_sent", fields={"event": "event-floor", "recipient_state": "live"})
+    hand = end + 1600
+    emit(kind="timing", due=hand, event="hand_chime", session_id=JOINED_SESSION)
+    emit(kind="sound", start=hand + 20, end=hand + 320, tag="hand-sound")
+    if "joined-early-spoken" in SCENARIO:
+        told(hand - 200)
+
+
+def joined_go_ahead(start, end):
+    """"Wispr, go ahead" with the test agent's hand up, played from START to END: the wake sound, the
+    agent's words for 2 s, voice_spoken, and the agent told its words were spoken; then it leaves.
+    joined-other-spoken's voice_spoken names another session; joined-spoken-during-clip's only
+    voice_spoken comes while the go-ahead still plays; joined-words-silent plays no words, only the
+    wake sound."""
+    emit(kind="sound", start=end + 150, end=end + 350, tag="go-ahead-wake")
+    words = end + 1000
+    if "joined-words-silent" not in SCENARIO:
+        emit(kind="sound", start=words, end=words + 2000, tag="joined-words")
+    if "joined-spoken-during-clip" in SCENARIO:
+        emit(kind="ws", due=start + 150, event={"type": "voice_spoken", "session_id": JOINED_SESSION})
+    else:
+        session = "session-2" if "joined-other-spoken" in SCENARIO else JOINED_SESSION
+        emit(kind="ws", due=words + 2100, event={"type": "voice_spoken", "session_id": session})
+    if "joined-early-spoken" not in SCENARIO:
+        told(words + 2200)
+    emit(kind="probe", due=words + 2400, step="leave_sent", fields={"event": "event-leave", "recipient_state": "live"})
+    emit(kind="ws", due=words + 2500, event={"type": "agent_left", "session_id": JOINED_SESSION})
+
+
+def told(at):
+    """The unit tells the test agent at AT that its words were spoken."""
+    text = "Your words were spoken in the room."
+    emit(kind="probe", due=at, step="received", fields={"from": "pi-session-1", "event": "event-outcome", "in_reply_to": "event-floor", "text": text})
+    emit(kind="probe", due=at, step="hand", fields={"outcome": "spoken", "text": text})
+
+
+def joined_probe(args):
+    """ghost-wispr joined-probe as the driver runs it: it joins the meeting now recording, as the join
+    message names it, then prints each step the fake voice sets out for it (kind probe) once that is
+    due, and exits once it left, or when the service it joined ends."""
+    with open(args[args.index("--invitation") + 1]) as f:
+        join = next((line.strip() for line in f if line.startswith("ghost-wispr join ")), "")
+    deadline = time.time() + int(args[args.index("--timeout") + 1]) + 60
+
+    def say(step, at, **fields):
+        print(json.dumps(dict(step=step, at=iso(at), **fields)), flush=True)
+
+    t = now_ms()
+    say("registered", t, session="probe-session")
+    say("invited", t, via="file", unit="pi-session-1", api="http://127.0.0.1:8080", join=join)
+    say("join_sent", t, event="event-join", recipient_state="live")
+    session = read("active-session").strip()
+    if not join or not session:
+        say("failed", now_ms(), error="no join line in the join message, or no meeting recording")
+        return 1
+    welcome = "You joined the meeting Ghost Wispr records. Its recording session is %s." % session
+    say("received", now_ms(), **{"from": "pi-session-1", "event": "event-welcome", "in_reply_to": "event-join", "text": welcome})
+    say("joined", now_ms(), recording_session=session, text=welcome)
+    emit(kind="ws", due=now_ms() + 50, event={"type": "agent_joined", "session_id": session})
+    write("probe-joined", "1\n")
+    pid, printed = service_pid(), set()
+    while service_pid() == pid and alive(pid) and time.time() < deadline:
+        t = now_ms()
+        for item in sorted((i for i in timeline() if i["kind"] == "probe" and i["due"] <= t and i["id"] not in printed), key=lambda i: i["due"]):
+            printed.add(item["id"])
+            say(item["step"], item["due"], **item["fields"])
+            if item["step"] == "leave_sent":
+                return 0
+        time.sleep(0.02)
+    return 1
+
+
 # ---- recordings ----
 
 
@@ -869,7 +986,16 @@ def arecord(args):
     with open(path, "wb") as f:
         f.write(bytes(44))
         f.flush()
-        begun = now_ms()
+        # The file's first sample: by default, when the fake has started, which on a loaded machine
+        # can be long after the driver started arecord, so that an early bound, which counts from
+        # then, is early by that long too. arecord-prompt captures it as the process began, as a
+        # real arecord does once it opens the device, so that an early bound is early only by the
+        # driver's fork and a clock tick; arecord-slow-start captures it 1.5 s after the fake has
+        # started, as an arecord slow to open its device does, so that every early bound is more
+        # than 1.5 s early.
+        if "arecord-slow-start" in SCENARIO:
+            time.sleep(1.5)
+        begun = min(process_start_ms(), now_ms()) if "arecord-prompt" in SCENARIO else now_ms()
         log_to("recordings", "%s %d" % (path, begun))
         written = 0
         # From the first clip played after the recording began: arecord-lag makes the file run 1 s
@@ -1136,7 +1262,7 @@ def curl(args):
         if service.get("no_listener_build"):
             warnings.append("voice.paused_listener is on, but this build has no paused listener: every pause closes the microphone")
         capture = {"recording": "capturing", "listening": "listening", "closed": "paused"}[state]
-        return answer(200, {"paused": paused, "capturing": not paused, "capture_state": capture, "warnings": warnings, "active_session_id": "session-0" if "session-active" in SCENARIO else "", "active_session_started_at": ""})
+        return answer(200, {"paused": paused, "capturing": not paused, "capture_state": capture, "warnings": warnings, "active_session_id": "session-0" if "session-active" in SCENARIO else read("active-session").strip(), "active_session_started_at": ""})
     if method == "POST" and path == "/api/resume":
         set_level("recording")
         emit(kind="ws", due=now_ms() + 50, event={"type": "component_status", "component": "deepgram", "status": "connected", "message": "Deepgram connected"})
@@ -1144,9 +1270,11 @@ def curl(args):
     if method == "POST" and path == "/api/pause":
         if "pause-fails" in SCENARIO:
             return answer(500, {"error": "pause not saved"})
-        # A paused unit stays as it is.
+        # A paused unit stays as it is; a pause ends the recording session.
         if level() == "recording":
             set_level(pause_to())
+            if read("active-session"):
+                os.remove(spath("active-session"))
         return answer(204, "")
     if method == "POST" and path == "/api/close":
         set_level("closed")
@@ -1157,6 +1285,9 @@ def curl(args):
         for item in sorted((i for i in timeline() if i["kind"] == "task" and i["due"] <= t), key=lambda i: i["due"]):
             tasks.setdefault(item["task"], {}).update(item["set"])
         return answer(200, sorted(tasks.values(), key=lambda task: task["asked_at"]))
+    if method == "GET" and path.startswith("/api/voice/join-message?issue="):
+        key = path.split("=", 1)[1]
+        return answer(200, {"message": "Ghost Wispr is the recorder in the meeting room. Its Envoy session is pi-session-1 and its API is http://127.0.0.1:8080. Send it each message below with envoy_send to that session.\n\n1. Join. Send Ghost Wispr this message:\nghost-wispr join %s\nIt answers with the meeting's recording session and where to read it.\n" % key})
     if method == "GET" and path == "/ws":
         return stream()
     return answer(404, {"error": "not found"})
@@ -1196,6 +1327,8 @@ def binary(args):
     if command in missing and missing[command] in SCENARIO:
         sys.stderr.write("usage: ghost-wispr <light-off|light-state>\n")
         return 2
+    if command == "joined-probe":
+        return joined_probe(args[1:])
     if command == "light-state":
         # The blink(1) read back: red only while recording; light-dim is the c-states-pi negative
         # control, a light someone set to (200, 0, 0) by hand.
@@ -1375,6 +1508,7 @@ new_case() {
   printf 'closed\n' >"$dir/asound/card3/pcm0p/sub0/status"
   printf 'question\n' >"$dir/question.wav"
   printf 'go-ahead\n' >"$dir/go-ahead.wav"
+  printf 'mention join-5\n' >"$dir/mention.wav"
   printf 'ask live-1\n' >"$dir/ask.wav"
   printf 'second live-1\n' >"$dir/second.wav"
   printf 'never-mind\n' >"$dir/never-mind.wav"
@@ -1567,10 +1701,11 @@ launch leftover pass '' "$original_env"$'\nGHOST_WISPR_MIC_DEVICE=Loopback' -- -
 launch no-loopback no-loopback '' -- --question @question.wav
 
 # The other slices' steps, and a step that lacks what it needs.
-for other in pause-closes-vendors vendor-probe joined room-test measure-echo; do
+for other in pause-closes-vendors vendor-probe room-test measure-echo; do
   launch "other-$other" pass '' -- --step "$other" --engine gptlive --rounds 20 --sessions 40 --script x
 done
 launch wake-needs pass '' -- --step wake-sound --calls 2
+launch joined-needs pass '' -- --step joined
 
 # states (c-states-pi): a pass; the light at (200, 0, 0) by hand while recording, the check's negative
 # control; a ring that stays unmuted in closed; a socket to Deepgram while listening; the Envoy hub's
@@ -1656,8 +1791,10 @@ launch barge-backchannel-late answer-until-clip,backchannel-stops,late-clip yes 
 # cancel that keeps the stream running with 80 ms of silence queued, which must pass; a status that
 # shows the stream running only 3 s after it starts; today's draining path, heard 800 ms on (the
 # negative control); audio heard 50 ms on; a stop just before a pause in the speech whose next word
-# still plays 150 ms later; a word 1.1 s on, after a silence long enough to pass for the end; a word
-# 150 ms on with the speech already quiet for 1 s at the stop, which the rig cannot time (UNKNOWN);
+# still plays 150 ms later, recorded by an arecord that starts at once (FAIL: even the early bound of
+# the word's end is over the bound) and by one slow to start (UNKNOWN: the early bound is not); a
+# word 1.1 s on, after a silence long enough to pass for the end; a word 150 ms on with the speech
+# already quiet for 1 s at the stop, which the rig cannot time (UNKNOWN);
 # a word still playing as the next question goes in: well before its chime, just before it and
 # apart, running into it, and after it, before the answer's first audio; a quiet chime, which must
 # pass, and a word that runs into it; a louder wake sound whose echo the rig hears for 320 ms, which
@@ -1676,7 +1813,9 @@ launch cancel-slow-status long,asound,slow-status yes -- $cancel_args
 # shellcheck disable=SC2086
 launch cancel-tail long,asound,tail-50 yes -- $cancel_args
 # shellcheck disable=SC2086
-launch cancel-leak long,asound,leak-150 yes -- $cancel_args
+launch cancel-leak long,asound,leak-150,arecord-prompt yes -- $cancel_args
+# shellcheck disable=SC2086
+launch cancel-leak-unsure long,asound,leak-150,arecord-slow-start yes -- $cancel_args
 # shellcheck disable=SC2086
 launch cancel-leak-late long,asound,leak-1100 yes -- $cancel_args
 # shellcheck disable=SC2086
@@ -1742,6 +1881,22 @@ launch first-audio pass '' -- --step tts-first-audio --engine gemini --engine au
 launch first-audio-close clip-close '' -- --step tts-first-audio --engine gemini --engine gemini-clip --sentences 3
 launch first-audio-optout aura-no-optout '' -- --step tts-first-audio --engine aura2 --sentences 3
 launch first-audio-missing tts-missing '' -- --step tts-first-audio --sentences 3
+# joined (c-joined-live): a pass; a pointer that names another meeting; the agent told its words
+# were spoken before the go-ahead; voice_spoken with another session's id; the meeting's only
+# voice_spoken while the go-ahead still plays; and the go-ahead followed by the wake sound alone, no
+# words at the rig. Each is the negative control of one of the step's checks. These record with an
+# arecord that starts at once, so that the words' onset, 1 s after the go-ahead, is after it even at
+# its early bound. joined-words-unsure records with one slow to start: the onset's early bound is
+# before the go-ahead's end and its late bound after it, so the step cannot tell (UNKNOWN).
+readonly joined_args="--step joined --join-issue join-5 --mention @mention.wav --go-ahead @go-ahead.wav --rig-mic $rig --event-timeout 10"
+# shellcheck disable=SC2086 # The arguments are words.
+launch joined-pass joined,arecord-prompt yes -- $joined_args
+for scenario in other-meeting early-spoken other-spoken spoken-during-clip words-silent; do
+  # shellcheck disable=SC2086
+  launch "joined-$scenario" "joined,arecord-prompt,joined-$scenario" yes -- $joined_args
+done
+# shellcheck disable=SC2086
+launch joined-words-unsure joined,arecord-slow-start yes -- $joined_args
 wait
 
 # Ctrl-C while the driver waits for voice_wake, then Ctrl-C again while the restore stops the
@@ -1941,7 +2096,7 @@ expect_line no-loopback 'REFUSED: the ALSA loopback is not loaded'
 expect_untouched no-loopback
 
 # The other slices' steps are UNKNOWN and touch nothing; a step that lacks what it needs names it.
-for other in pause-closes-vendors vendor-probe joined room-test measure-echo; do
+for other in pause-closes-vendors vendor-probe room-test measure-echo; do
   expect_rc "other-$other" 2
   expect_line "other-$other" "UNKNOWN: $other: not in this build: "
   expect_untouched "other-$other"
@@ -1951,6 +2106,12 @@ expect_rc wake-needs 2
 expect_line wake-needs 'UNKNOWN: wake-sound needs: --question ('
 expect_line wake-needs '--rig-mic (the USB microphone about 30 cm from the Jabra)'
 expect_untouched wake-needs
+expect_rc joined-needs 2
+expect_line joined-needs 'UNKNOWN: joined needs: --join-issue (an issue a test agent joins on'
+expect_line joined-needs '--mention (words that name --join-issue'"'"'s key and are no call to Wispr)'
+expect_line joined-needs '--go-ahead ("Wispr, go ahead")'
+expect_line joined-needs '--rig-mic (the USB microphone about 30 cm from the Jabra)'
+expect_untouched joined-needs
 
 # states.
 expect_rc states-pass 0
@@ -2245,9 +2406,24 @@ expect_between 'cancel-drain: how long the negative control is heard' "$(heard_a
 expect_restored cancel-drain
 expect_not_passed cancel-tail 30 120
 expect_restored cancel-tail
+# heard_no_earlier NAME: the milliseconds a FAIL or UNKNOWN line says a stop's speech was heard no
+# earlier than after it: the early bound of the tail it names.
+heard_no_earlier() {
+  sed -n "s/^\(FAIL\|UNKNOWN\): playback-cancel: .*no earlier than \([0-9]*\) ms after it.*/\2/p" "$root/$1/out"
+}
+# The word 150 ms after the stop, 250 ms long. Recorded by an arecord that starts at once, its end's
+# early bound is over the 20 ms bound too: FAIL. Recorded by one slow to start, its early bound is
+# 1.5 s early, under the bound, and its late bound over it: UNKNOWN, never FAIL or PASS.
 expect_rc cancel-leak 1
 expect_between 'cancel-leak: how long the leaked word is heard' "$(heard_after cancel-leak)" 150 500
+expect_between 'cancel-leak: how long the leaked word is heard, at the least' "$(heard_no_earlier cancel-leak)" 21 500
 expect_restored cancel-leak
+expect_rc cancel-leak-unsure 2
+expect_between 'cancel-leak-unsure: how long the leaked word is heard up to' "$(heard_up_to cancel-leak-unsure)" 150 500
+expect_between 'cancel-leak-unsure: how long the leaked word is heard, at the least' "$(heard_no_earlier cancel-leak-unsure)" 0 20
+expect_no_line cancel-leak-unsure "FAIL: playback-cancel: a stop's speech was heard"
+expect_no_line cancel-leak-unsure "PASS: playback-cancel: no stop's speech was heard"
+expect_restored cancel-leak-unsure
 expect_rc cancel-leak-late 1
 expect_between 'cancel-leak-late: how long the word after a long silence is heard' "$(heard_after cancel-leak-late)" 1300 1500
 expect_restored cancel-leak-late
@@ -2350,6 +2526,55 @@ expect_rc first-audio-optout 1
 expect_line first-audio-optout 'FAIL: tts-first-audio aura: 1 of 3 requests did not carry mip_opt_out=true'
 expect_rc first-audio-missing 2
 expect_line first-audio-missing 'UNKNOWN: tts-first-audio: this build has no ghost-wispr tts-first-audio'
+
+# joined.
+# joined_onset NAME: the early and late bounds of the words' onset, in ms from the end of the
+# go-ahead, as the joined step's PASS or UNKNOWN line for the words gives them.
+joined_onset() {
+  sed -n -e "s/^PASS: joined: the agent's words reached the Jabra \(-\{0,1\}[0-9]*\) ms after the go-ahead ended (no earlier than \(-\{0,1\}[0-9]*\) ms after it).*/\2 \1/p" \
+    -e "s/^UNKNOWN: joined: a sound at the rig microphone longer than the wake sound starts between \(-\{0,1\}[0-9]*\) and \(-\{0,1\}[0-9]*\) ms from the end of the go-ahead.*/\1 \2/p" "$root/$1/out"
+}
+expect_rc joined-pass 0
+for line in 'PASS: joined: recording session session-1' 'PASS: joined: the test agent joined session-1 and was told where to read it' \
+  'PASS: joined: agent_joined on /ws' 'PASS: joined: the pointer names recording session session-1, the meeting the test agent joined, ' \
+  'PASS: joined: the test agent read 2 segments' 'PASS: joined: voice_spoken for recording session session-1 ' \
+  'and it was told so ' 'PASS: joined: agent_left on /ws' 'PASS: joined: the hand sound reached the Jabra' \
+  "PASS: joined: the agent's words reached the Jabra "; do
+  expect_line joined-pass "$line"
+done
+# The words start 1 s after the go-ahead's clip ends: their onset's early bound is at or after the
+# go-ahead's end, as the driver timed it, and never later than 1 s after it.
+read -r onset_early onset_late <<<"$(joined_onset joined-pass)"
+expect_between "joined-pass: the early bound of the words' onset, from the end of the go-ahead" "$onset_early" 0 1000
+expect_between "joined-pass: the late bound of the words' onset, from the end of the go-ahead" "$onset_late" "${onset_early:-0}" 5000
+expect_restored joined-pass
+expect_rc joined-other-meeting 1
+expect_line joined-other-meeting 'FAIL: joined: the pointer names recording session session-9, not session-1, the meeting the test agent joined'
+expect_restored joined-other-meeting
+expect_rc joined-early-spoken 1
+expect_line joined-early-spoken 'FAIL: joined: the test agent was told its hand came down spoken '
+expect_line joined-early-spoken 'before the go-ahead'
+expect_restored joined-early-spoken
+for name in other-spoken spoken-during-clip; do
+  expect_rc "joined-$name" 1
+  expect_line "joined-$name" 'FAIL: joined: no voice_spoken for recording session session-1 within 10 s of the end of the go-ahead'
+  expect_restored "joined-$name"
+done
+expect_rc joined-words-silent 1
+expect_line joined-words-silent 'PASS: joined: the hand sound reached the Jabra'
+expect_line joined-words-silent 'FAIL: joined: no words at the rig microphone between the end of the go-ahead and voice_spoken'
+expect_restored joined-words-silent
+# An arecord slow to start: the words' onset is before the go-ahead's end at its early bound and
+# after it at its late bound, so whether they began after the go-ahead is UNKNOWN, never PASS.
+expect_rc joined-words-unsure 2
+expect_line joined-words-unsure 'PASS: joined: the hand sound reached the Jabra'
+expect_line joined-words-unsure 'UNKNOWN: joined: a sound at the rig microphone longer than the wake sound starts between '
+expect_line joined-words-unsure "so whether the agent's words began after the go-ahead and before voice_spoken is not known"
+expect_no_line joined-words-unsure "PASS: joined: the agent's words reached the Jabra"
+read -r onset_early onset_late <<<"$(joined_onset joined-words-unsure)"
+expect_between "joined-words-unsure: the early bound of the words' onset, from the end of the go-ahead" "$onset_early" -10000 -1
+expect_between "joined-words-unsure: the late bound of the words' onset, from the end of the go-ahead" "$onset_late" 0 5000
+expect_restored joined-words-unsure
 
 # Neither file names the company (tests/public_literals_test.go's list) or holds an issue key.
 literals=$(awk '

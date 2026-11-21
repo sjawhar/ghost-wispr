@@ -51,7 +51,7 @@ func TestTheEnvoySessionIsRetriedUntilItOpens(t *testing.T) {
 	}
 
 	cfg := config.Config{GenAIBackend: "gemini", GeminiAPIKey: "test", Concierge: config.Concierge{EnvoyURL: "http://127.0.0.1:1"}}
-	_, stop, err := startConcierge(t.Context(), &cfg, conciergeStore(t), discardLogger, nil)
+	_, stop, err := startConcierge(t.Context(), &cfg, conciergeStore(t), discardLogger, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

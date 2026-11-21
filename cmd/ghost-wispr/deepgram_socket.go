@@ -1,12 +1,15 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -57,6 +60,18 @@ type deepgramSocket struct {
 	writeMu sync.Mutex
 	closed  atomic.Bool
 	done    chan struct{}
+
+	// A Configure waits for Deepgram's answer before the next is sent
+	// (Deepgram refuses a second, CONFIGURE_ALREADY_PENDING): configWant is
+	// the newest keyterms not sent yet, when configWaiting; configSent is the
+	// keyterms of the one that waits for its answer, and configAnswer hears
+	// the answer (OnConfigured).
+	configMu      sync.Mutex
+	configPending bool
+	configWaiting bool
+	configWant    []string
+	configSent    []string
+	configAnswer  func(keyterms []string, taken bool)
 }
 
 // dialDeepgramLive opens a live-transcription socket to Deepgram with
@@ -134,6 +149,112 @@ func (s *deepgramSocket) Finalize() error {
 	return s.write(websocket.TextMessage, []byte(`{"type":"Finalize"}`))
 }
 
+// Configure replaces the stream's keyterms mid-stream, with Deepgram's
+// Configure message (transcript.Configurer). It returns at once: the message
+// goes when no other waits for Deepgram's answer, and a list given meanwhile
+// replaces the one still to send.
+func (s *deepgramSocket) Configure(keyterms []string) error {
+	if s.closed.Load() {
+		return errDeepgramSocketClosed
+	}
+	s.configMu.Lock()
+	s.configWant, s.configWaiting = slices.Clone(keyterms), true
+	send := !s.configPending
+	s.configPending = true
+	s.configMu.Unlock()
+	if send {
+		go s.sendConfigure()
+	}
+	return nil
+}
+
+// OnConfigured makes answer hear Deepgram's answer to each Configure, with
+// the keyterms it answers (transcript.Configurer). A socket that closes
+// first never answers: the next dial carries the keyterms.
+func (s *deepgramSocket) OnConfigured(answer func(keyterms []string, taken bool)) {
+	s.configMu.Lock()
+	defer s.configMu.Unlock()
+	s.configAnswer = answer
+}
+
+// sendConfigure sends the newest keyterms waiting, if any; configPending is
+// set.
+func (s *deepgramSocket) sendConfigure() {
+	s.configMu.Lock()
+	if !s.configWaiting {
+		s.configPending = false
+		s.configMu.Unlock()
+		return
+	}
+	want := s.configWant
+	s.configWant, s.configWaiting, s.configSent = nil, false, want
+	s.configMu.Unlock()
+	body, err := json.Marshal(struct {
+		Type     string   `json:"type"`
+		Keyterms []string `json:"keyterms"`
+	}{"Configure", want})
+	if err == nil {
+		err = s.write(websocket.TextMessage, body)
+	}
+	if err != nil {
+		// The socket is closing; the next dial carries the keyterms.
+		s.configMu.Lock()
+		s.configPending = false
+		s.configMu.Unlock()
+	}
+}
+
+// configured takes Deepgram's answer to a Configure: a refusal is logged by
+// its code, the answer goes to OnConfigured's hook with the keyterms it
+// answers, and the keyterms that waited meanwhile go next.
+func (s *deepgramSocket) configured(message []byte) {
+	var answer struct {
+		Type string `json:"type"`
+		Code string `json:"code"`
+	}
+	_ = json.Unmarshal(message, &answer)
+	taken := answer.Type == "ConfigureSuccess"
+	if !taken {
+		slog.Warn("deepgram refused the keyterms of a join or a leave", "provider", "deepgram", "code", providererr.Token(answer.Code))
+	}
+	s.configMu.Lock()
+	sent, answered := s.configSent, s.configAnswer
+	s.configSent = nil
+	s.configMu.Unlock()
+	if answered != nil && sent != nil {
+		answered(sent, taken)
+	}
+	s.sendConfigure()
+}
+
+// keytermsRefusedWarningKey is the warning GET /api/status shows while
+// Deepgram has refused the keyterms of a join or a leave.
+const keytermsRefusedWarningKey = "deepgram-keyterms"
+
+// keytermsRefusedWarning is the live keyterms' refusal hook for warnings
+// (transcript.LiveKeyterms.SetRefusalHook).
+func keytermsRefusedWarning(warnings *warningsRegistry) func(refused bool) {
+	return func(refused bool) {
+		if refused {
+			warnings.Set(keytermsRefusedWarningKey, "Deepgram refused the live transcript's keyterms after a join or a leave, so it may not hear a joined agent's issue key; they go again with the next join, leave or reconnect")
+			return
+		}
+		warnings.Clear(keytermsRefusedWarningKey)
+	}
+}
+
+// isConfigureAnswer reports whether message is Deepgram's answer to a
+// Configure, which the SDK's router does not know.
+func isConfigureAnswer(message []byte) bool {
+	if !bytes.Contains(message, []byte("Configure")) {
+		return false
+	}
+	var head struct {
+		Type string `json:"type"`
+	}
+	return json.Unmarshal(message, &head) == nil && (head.Type == "ConfigureSuccess" || head.Type == "ConfigureFailure")
+}
+
 // Close tells Deepgram the stream ends, unless a write is in progress, which
 // can be one stuck on a stalled peer, and closes the connection.
 func (s *deepgramSocket) Close() error {
@@ -207,6 +328,10 @@ func (s *deepgramSocket) read() {
 			return
 		}
 		if messageType == websocket.TextMessage {
+			if isConfigureAnswer(message) {
+				s.configured(message)
+				continue
+			}
 			_ = s.router.Message(message)
 		}
 	}

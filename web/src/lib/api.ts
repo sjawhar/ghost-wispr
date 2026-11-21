@@ -1,4 +1,5 @@
 import type {
+  JoinedAgent,
   PresetMap,
   SearchResult,
   SessionDetailResponse,
@@ -62,6 +63,12 @@ export function fetchSession(id: string): Promise<SessionDetailResponse> {
 // into it, oldest first, with each agent's written answer.
 export function fetchVoiceTasks(id: string): Promise<VoiceTask[]> {
   return request<VoiceTask[]>(`/api/sessions/${encodeURIComponent(id)}/voice-tasks`)
+}
+
+// The agents that joined the meeting of a recording session, in the order
+// they joined; none once the session ended.
+export function fetchJoinedAgents(id: string): Promise<JoinedAgent[]> {
+  return request<JoinedAgent[]>(`/api/sessions/${encodeURIComponent(id)}/joined-agents`)
 }
 
 export function fetchStatus(): Promise<StatusResponse> {

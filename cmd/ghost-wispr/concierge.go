@@ -15,14 +15,17 @@ import (
 	"github.com/sjawhar/ghost-wispr/internal/envoy"
 	"github.com/sjawhar/ghost-wispr/internal/storage"
 	"github.com/sjawhar/ghost-wispr/internal/voice"
+	"github.com/sjawhar/ghost-wispr/internal/voice/joined"
 )
 
 // startConcierge builds the voice's Concierge (newConcierge) and, in the
 // background, the unit's Envoy session for asking an issue's agent. With no
 // Envoy the Concierge answers from the record alone until the session opens.
-// stop closes the Envoy session and stops the Concierge.
-func startConcierge(ctx context.Context, cfg *config.Config, store *storage.SQLiteStore, logger *slog.Logger, changed func(sessionID string)) (*concierge.Concierge, func(), error) {
-	c, err := newConcierge(ctx, cfg, store, logger, changed)
+// The joined agents' roster, when set, takes the session's joins, floor
+// requests and leaves, and the Concierge the rest. stop closes the Envoy
+// session and stops the Concierge.
+func startConcierge(ctx context.Context, cfg *config.Config, store *storage.SQLiteStore, logger *slog.Logger, changed func(sessionID string), roster *joined.Roster) (*concierge.Concierge, func(), error) {
+	c, err := newConcierge(ctx, cfg, store, logger, changed, joinedAgentsOf(roster))
 	if err != nil {
 		return nil, nil, err
 	}
@@ -55,11 +58,14 @@ func startConcierge(ctx context.Context, cfg *config.Config, store *storage.SQLi
 				Host:          "ghost-wispr",
 				Plugin:        "ghost-wispr",
 				PluginVersion: Version,
-				Deliver:       c.Deliver,
+				Deliver:       deliverTo(roster, c),
 				Logger:        logger,
 			})
 			if err == nil {
 				c.SetAgents(session)
+				if roster != nil {
+					roster.SetAgents(session)
+				}
 				logger.Info("concierge: the Envoy session is open")
 				sessions <- session
 				return
@@ -76,6 +82,9 @@ func startConcierge(ctx context.Context, cfg *config.Config, store *storage.SQLi
 	stop := func() {
 		cancel()
 		if session, ok := <-sessions; ok && session != nil {
+			if roster != nil {
+				roster.SetAgents(nil) // the joined agents hear nothing more
+			}
 			closeCtx, done := context.WithTimeout(context.Background(), 5*time.Second)
 			defer done()
 			if err := session.Close(closeCtx); err != nil {
@@ -91,7 +100,7 @@ func startConcierge(ctx context.Context, cfg *config.Config, store *storage.SQLi
 // model client on the unit's genai settings, and Dispatch's record with the
 // unit's own token. With no token or no Dispatch URL the tools say they
 // cannot reach Dispatch yet.
-func newConcierge(ctx context.Context, cfg *config.Config, store *storage.SQLiteStore, logger *slog.Logger, changed func(sessionID string)) (*concierge.Concierge, error) {
+func newConcierge(ctx context.Context, cfg *config.Config, store *storage.SQLiteStore, logger *slog.Logger, changed func(sessionID string), joinedAgents func() []concierge.JoinedAgent) (*concierge.Concierge, error) {
 	options := genAIOptions(cfg, cfg.GeminiAPIKey)
 	if err := addVertexCredentials(ctx, cfg, options); err != nil {
 		return nil, fmt.Errorf("concierge: %w", err)
@@ -121,6 +130,7 @@ func newConcierge(ctx context.Context, cfg *config.Config, store *storage.SQLite
 		Records:   records,
 		Store:     store,
 		PublicURL: cfg.PublicURL,
+		Joined:    joinedAgents,
 		Logger:    logger,
 		Changed:   changed,
 	})

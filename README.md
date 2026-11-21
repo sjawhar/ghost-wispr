@@ -145,12 +145,13 @@ The blink(1) has two LEDs. LED 1, the top one (`blink1-tool --led 1`), is the re
 means the unit records. Every check reads LED 1 alone back, and only exact red (255,0,0) lets audio
 through; a read that fails, or any other colour, stops capture as above. The recorder writes both
 LEDs red while it records and both off when it stops. LED 2, the bottom one, flashes green, half a
-second on and half a second off, while an agent's answer waits for "Wispr, go ahead" (see "Meeting
-voice"). It goes back to red once nothing waits: the answer is spoken, "Wispr, never mind" drops it,
-or its session ends. At a pause, a light hold or shutdown it goes off with LED 1, and it never
-flashes while the unit does not record: in listening and in closed both LEDs are off, and a pause
-to either ends the session, which drops its waiting answers. "Wispr, start recording" in listening
-brings LED 1 to red before LED 2 flashes again. It flashes only while room audio reaches the recording:
+second on and half a second off, while an agent's answer or a joined agent's raised hand waits for
+"Wispr, go ahead" (see "Meeting voice"). It goes back to red once nothing waits: the answer or the
+hand is spoken, "Wispr, never mind" drops the answer, the hand comes down, or its session ends. At
+a pause, a light hold or shutdown it goes off with LED 1, and it never flashes while the unit does
+not record: in listening and in closed both LEDs are off, and a pause to either ends the session,
+which drops its waiting answers and hands. "Wispr, start recording" in listening brings LED 1 to
+red before LED 2 flashes again. It flashes only while room audio reaches the recording:
 while LED 1 is red for another reason, as while the microphone closes after a pause or reopens,
 LED 2 shows red. A check that finds LED 1 not red writes both LEDs red, and LED 2 stays red until a
 check finds LED 1 red again. A flash writes LED 2 alone, holds the lock below as every command
@@ -399,10 +400,15 @@ What the voice hears, and where the room's words go:
   the issue, the holder, the state and the agent's written answer, which the session's page shows
   under "Questions to agents". Deleting a session erases its questions and the answers the agents
   wrote. An agent's written answer may quote the asker, and only a session delete erases it: a segment delete does not.
+- An agent a person invites through Dispatch can join the meeting (below). It reads the words from
+  the unit's own API, which honours deletions, never from a copy the unit sends it: the unit sends
+  a joined agent a pointer, a recording session and a time range with no words, when its issue
+  comes up, at most once a minute. What the agent read before a deletion stays in its session, and
+  the unit cannot recall it. A joined agent's floor request holds the agent's own words, which the
+  voice speaks after its issue key, and the unit keeps them only until they are spoken or dropped.
 - The voice's `/ws` events (`voice_wake`, `voice_exchange_started`, `voice_answer_ready`,
-  `voice_spoken` and `voice_tasks_changed`; `agent_joined` and `agent_left` come with agents that
-  join a meeting, which this build does not have) carry the recording session's id and no words,
-  and none is stored.
+  `voice_spoken`, `voice_tasks_changed`, `agent_joined` and `agent_left`) carry the recording
+  session's id and no words, and none is stored.
 - A speech vendor's error message that quotes the text to speak is left out of the journal; the
   unit logs the vendor's status, and a note that the message was left out.
 
@@ -420,6 +426,53 @@ What the voice hears, and where the room's words go:
 | `concierge.model` | `gemini-3.5-flash-lite` | The Concierge's Gemini model, on the unit's genai settings |
 | `concierge.dispatch_url`, `GHOST_WISPR_DISPATCH_TOKEN` | — | Dispatch and the unit's own token; without both, the voice says it cannot reach Dispatch yet |
 | `concierge.envoy_url` | — | The Envoy listener the unit registers its session with, to ask an issue's agent |
+
+### Agents in a meeting
+
+A person can tell an agent, through Dispatch, to join the meeting the unit records. The unit
+writes the join message (`GET /api/voice/join-message?issue=KEY`), and the person sends it to the
+agent's session (`dispatch send-to-agent`). It names the unit's own Envoy session and the whole
+floor protocol, so an agent with an older copy of the Ghost Wispr skill can follow it. The agent
+joins, asks for the floor and leaves with Envoy messages to that session, each one line:
+`ghost-wispr join KEY`, `ghost-wispr floor` with its words on the lines after it, and
+`ghost-wispr leave`. A join is taken on trust from any session Envoy does not list as gone, with no
+check that a person invited it, since any agent on the tailnet can already ask the Concierge and
+read the API, a pointer holds no words, and a hand speaks only on a person's "go ahead". A command
+Envoy delivers again acts only once, for as long as Envoy can deliver it again (its stream keeps a
+message 72 hours), and a floor request or a leave sent before the agent's latest join is not
+taken. The unit keeps at most 4,096 commands of those 72 hours from one sending session, and
+1,048,576 from all of them: a session past its share replaces its own oldest, which Envoy could then
+deliver again, and past the total the session holding the most does. No command is refused, so one
+session's flood cannot hold off another agent's. With 256 sessions at their share, the record holds
+about 20 MiB; many sessions holding a command or two each cost more a command (131,072 sessions of
+one command each, about 46 MiB, and about 8 MiB after they expire). A
+command that comes before the unit's Envoy session is ready waits up to 2 s for it, then is not
+acknowledged, so Envoy delivers it again.
+
+A joined agent follows the meeting through the unit's own API, and gets a pointer with no words
+when its issue comes up: a final segment that names its key, its number, or two words of its
+issue's title, at most once in 60 s for an agent, across its joins.
+`GET /api/sessions/{id}/joined-agents` lists the agents in a meeting, and so does the session's
+page. Each joined agent's issue key becomes a keyterm of the live transcript from its join, with no
+redial. "Wispr, ask the ABC-12 agent …" goes to the agent that joined on ABC-12 before the issue's
+claim in Dispatch, and reaches it once.
+
+A floor request is at most 50 words as the room hears them, the attribution the voice says first
+("ABC-12's agent says:") included, written for the ear, at most one in 5 minutes for an agent,
+across its joins. The room hears a short two-tap sound at the next gap, and LED 2 flashes green
+while the hand is up, as it does for a waiting answer; LED 1 stays red. The voice says the words,
+after the agent's issue key, only when a person says "Wispr, go ahead" ("Wispr, go ahead, ABC-12"
+picks one of several), and drops them after 60 s; the agent is told which. "Wispr, never mind"
+leaves a hand up: it drops answers only, and a hand still sounds while one waits. "Wispr, who has a
+hand up?" names the agents waiting. An agent leaves when it says so, when the meeting ends or is
+deleted, when the voice stops, or when Envoy lists its session as not live for 10 minutes. The
+moment the recorder ends a meeting, or leaves recording for listening or closed, nothing more is
+sent or spoken for it: not a pointer on its way, a hand's sound or words, nor an exchange of the
+voice. A sound is its answers' or hands' until the speaker has played its last frame, so the last
+hand coming down stops it wherever it has got to, and a hand raised while one plays gets a sound of
+its own after it. A hand's sound stops with the membership of the last hand it sounds for, and a
+sound cut before it played out (by an exchange, or by a never mind holding answers back) sounds
+again.
 
 ## Deployment
 

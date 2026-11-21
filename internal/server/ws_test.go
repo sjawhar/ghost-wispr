@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -115,4 +116,77 @@ func TestWSDeliversInitialPausedStatus(t *testing.T) {
 		}
 	}
 	t.Fatal("websocket did not receive the initial paused status")
+}
+
+// TestWSSubscribesBeforeItSaysConnected fails if a socket sends its
+// connection frame before it hears the hub's events. The page reads its
+// joined agents and questions again on that frame, so an event published
+// after that read but before the subscription reaches neither.
+func TestWSSubscribesBeforeItSaysConnected(t *testing.T) {
+	hub := NewHub()
+	mux := http.NewServeMux()
+	registerWSRoute(mux, hub, slog.Default())
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	// The hub's lock holds Subscribe back. A socket that sends its frame
+	// first sends it while the lock is held, with no subscription yet.
+	hub.mu.Lock()
+	var unlocked sync.Once
+	unlock := func() { unlocked.Do(hub.mu.Unlock) }
+	t.Cleanup(unlock)
+
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/ws"
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	if err != nil {
+		t.Fatalf("dial websocket: %v", err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+	messages := make(chan []byte, 8)
+	go func() {
+		defer close(messages)
+		for {
+			_, message, err := conn.ReadMessage()
+			if err != nil {
+				return
+			}
+			messages <- message
+		}
+	}()
+
+	// A socket that subscribes first sends nothing while the lock is held;
+	// one that sends its frame first sends it at once.
+	select {
+	case message := <-messages:
+		t.Fatalf("the socket sent %s with %d subscriptions to the hub: an event published now never reaches it", message, len(hub.clients))
+	case <-time.After(500 * time.Millisecond):
+	}
+	unlock()
+
+	readType := func() string {
+		t.Helper()
+		select {
+		case message, ok := <-messages:
+			if !ok {
+				t.Fatal("websocket closed")
+			}
+			var event struct {
+				Type string `json:"type"`
+			}
+			if err := json.Unmarshal(message, &event); err != nil {
+				t.Fatalf("decode websocket event: %v", err)
+			}
+			return event.Type
+		case <-time.After(2 * time.Second):
+			t.Fatal("websocket sent nothing")
+		}
+		return ""
+	}
+	if got := readType(); got != "connection" {
+		t.Fatalf("first websocket event = %q, want connection", got)
+	}
+	hub.BroadcastSessionStarted("session-1")
+	if got := readType(); got != "session_started" {
+		t.Fatalf("websocket event after the connection frame = %q, want session_started", got)
+	}
 }

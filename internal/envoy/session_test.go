@@ -187,6 +187,36 @@ func TestSessionRegistersWithConsumerDelivery(t *testing.T) {
 	}
 }
 
+// TestASessionAdvertisesItsCapabilities fails if a session's registration
+// does not carry the capabilities its configuration names (Dispatch sends a
+// person's message only to a session that advertises its delivery mode), or
+// a session with none advertises any.
+func TestASessionAdvertisesItsCapabilities(t *testing.T) {
+	fake, server := newFakeListener(t)
+	fake.answer("/v1/interests/subscribe", http.StatusOK, `{"session_id":"pi-session-1"}`)
+	session := testSession(t, server, nil, nil)
+	if err := session.register(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got, ok := fake.lastBody(t, "/v1/interests/subscribe")["capabilities"].([]any); !ok || len(got) != 0 {
+		t.Fatalf("capabilities = %#v, want an empty list", got)
+	}
+	listener, err := NewListener(server.URL, server.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	probe, err := newSession(listener, &SessionConfig{SessionID: "probe-1", Plugin: "probe", Capabilities: []string{"btw"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := probe.register(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := fake.lastBody(t, "/v1/interests/subscribe")["capabilities"].([]any); len(got) != 1 || got[0] != "btw" {
+		t.Fatalf("capabilities = %#v, want [btw]", got)
+	}
+}
+
 func TestARefusedRegistrationIsAnError(t *testing.T) {
 	fake, server := newFakeListener(t)
 	fake.answer("/v1/interests/subscribe", http.StatusConflict, `{"error":"no consumer requested","reason":"not_requested"}`)

@@ -251,11 +251,12 @@ func TestAGoAheadWithNoVoiceOutlivesAnOlderNeverMind(t *testing.T) {
 func TestNeverMindCutsAnAnswerSoundStillPlaying(t *testing.T) {
 	c := newFakeConcierge()
 	r, light := newWaitingRig(t, c)
+	r.speaker.holdDrain(audio.InputChime)
 	holdAnswer(t, r, light, "t1", "It ships tomorrow.")
 	eventually(t, "the answer sound queued in full", func() bool {
 		r.s.mu.Lock()
 		defer r.s.mu.Unlock()
-		return r.speaker.written(audio.InputChime) > 0 && r.s.chimeCancel == nil
+		return r.s.chimeDraining
 	})
 	before := time.Now()
 	r.heard("Wispr, never mind.", true, true)
@@ -273,6 +274,7 @@ func TestNeverMindCutsAnAnswerSoundStillPlaying(t *testing.T) {
 func TestNeverMindCutsAnAnswerSoundThatStartedLate(t *testing.T) {
 	c := newFakeConcierge()
 	r, light := newWaitingRig(t, c)
+	r.speaker.holdDrain(audio.InputChime)
 	release := r.speaker.holdBegins(audio.InputChime) // the speaker opens late
 	holdAnswer(t, r, light, "t1", "It ships tomorrow.")
 	eventually(t, "the answer sound scheduled", func() bool {
@@ -285,7 +287,7 @@ func TestNeverMindCutsAnAnswerSoundThatStartedLate(t *testing.T) {
 	eventually(t, "the answer sound queued in full", func() bool {
 		r.s.mu.Lock()
 		defer r.s.mu.Unlock()
-		return r.speaker.written(audio.InputChime) > 0 && r.s.chimeCancel == nil
+		return r.s.chimeDraining
 	})
 	before := time.Now()
 	r.heard("Wispr, never mind.", true, true)

@@ -36,18 +36,24 @@ type fakeSpeaker struct {
 	cancelDelay map[string]time.Duration
 	writePace   map[string]time.Duration // each Write on an input takes this long
 	chimes      []*fakePlayback          // each playback begun on the chime input
+	// drainsAtOnce makes a Drain on an input return at once, as if its
+	// frames had played the moment they were queued: the chime input's
+	// default, so a sound ends with its writes unless a test holds its tail
+	// (holdDrain). Any other input drains at finish or Cancel.
+	drainsAtOnce map[string]bool
 }
 
 func newFakeSpeaker() *fakeSpeaker {
 	s := &fakeSpeaker{
-		writes:    map[string]int{},
-		cancels:   map[string]time.Time{},
-		speaking:  map[string]bool{},
-		gen:       map[string]int{},
-		finished:  map[string]chan struct{}{},
-		listeners: map[int]func(audio.SpeechEvent){},
-		began:     make(chan string, 64),
-		events:    make(chan audio.SpeechEvent, 256),
+		writes:       map[string]int{},
+		cancels:      map[string]time.Time{},
+		speaking:     map[string]bool{},
+		gen:          map[string]int{},
+		finished:     map[string]chan struct{}{},
+		listeners:    map[int]func(audio.SpeechEvent){},
+		began:        make(chan string, 64),
+		events:       make(chan audio.SpeechEvent, 256),
+		drainsAtOnce: map[string]bool{audio.InputChime: true},
 	}
 	// Speech events reach listeners in order on a goroutine of the speaker's,
 	// as audio.Output sends them: never inside Cancel or Write.
@@ -119,7 +125,7 @@ func (s *fakeSpeaker) soundsPlayed() []string {
 }
 
 func soundName(first []byte) string {
-	for name, pcm := range map[string][]byte{"wake": WakeChime(), "answer": AnswerChime(), "start": StartChime(), "error": ErrorChime()} {
+	for name, pcm := range map[string][]byte{"wake": WakeChime(), "answer": AnswerChime(), "hand": HandChime(), "start": StartChime(), "error": ErrorChime()} {
 		if len(pcm) >= len(first) && bytes.Equal(pcm[:len(first)], first) {
 			return name
 		}
@@ -142,6 +148,14 @@ func (s *fakeSpeaker) holdBegins(input string) (release func()) {
 		s.mu.Unlock()
 		close(ch)
 	}
+}
+
+// holdDrain makes a Drain on input wait for finish or Cancel, as the speaker
+// does while the input's queued frames still play.
+func (s *fakeSpeaker) holdDrain(input string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.drainsAtOnce[input] = false
 }
 
 func (s *fakeSpeaker) Cancel(input string) {
@@ -277,6 +291,10 @@ func (p *fakePlayback) Drain(ctx context.Context) error {
 		s.mu.Unlock()
 		return errFakeCancelled
 	}
+	if s.drainsAtOnce[p.input] {
+		s.mu.Unlock()
+		return nil
+	}
 	ch := s.finished[p.input]
 	s.mu.Unlock()
 	if ch == nil {
@@ -301,7 +319,8 @@ type fakeVoice struct {
 	sessions []*fakeSession
 	opened   chan *fakeSession
 	openErr  error
-	sayErr   error // every Say of a session opened while set fails with it
+	sayErr   error  // every Say of a session opened while set fails with it
+	onOpen   func() // runs at the start of each Open, when set
 }
 
 func newFakeVoice() *fakeVoice { return &fakeVoice{opened: make(chan *fakeSession, 16)} }
@@ -314,8 +333,11 @@ func (v *fakeVoice) failOpens(err error) {
 
 func (v *fakeVoice) Open(ctx context.Context, x *Exchange) (Session, error) {
 	v.mu.Lock()
-	err := v.openErr
+	err, onOpen := v.openErr, v.onOpen
 	v.mu.Unlock()
+	if onOpen != nil {
+		onOpen()
+	}
 	if err != nil {
 		return nil, err
 	}
