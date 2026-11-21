@@ -780,6 +780,29 @@ func (g *captureGate) captureMissing() bool {
 // confirmed red returns an error that wraps errLightNotConfirmed.
 func (g *captureGate) confirmMicOpen() error {
 	g.markMicOpen()
+	return g.confirmMarkedMicOpen()
+}
+
+// confirmMicReopen is confirmMicOpen for a reconnect of the microphone the
+// mic loop opened last: it returns errMicStartPaused, lighting and opening
+// nothing, when the gate is closed or has closed since that open's mark. The
+// check and the new mark are one step under the gate's lock, so a pause and a
+// resume that both come before it, as while the reconnect stores its status,
+// leave the open to the loop top, under that resume's own red confirmation,
+// which ends its resuming state (Sol's review of #136 at 56e1543).
+func (g *captureGate) confirmMicReopen() error {
+	g.mu.Lock()
+	if g.closed || (g.openMarked && g.closings != g.openMark) {
+		g.mu.Unlock()
+		return errMicStartPaused
+	}
+	g.openMarked, g.openMark = true, g.closings
+	g.mu.Unlock()
+	return g.confirmMarkedMicOpen()
+}
+
+// confirmMarkedMicOpen is confirmMicOpen after its mark.
+func (g *captureGate) confirmMarkedMicOpen() error {
 	if g.captureMissing() {
 		return errNoCaptureDevice
 	}
