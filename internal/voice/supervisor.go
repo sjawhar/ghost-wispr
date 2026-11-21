@@ -1111,15 +1111,13 @@ func (s *Supervisor) open(ex *exchange, voice Voice, x *Exchange, chime bool) {
 }
 
 // playChime plays pcm on the chime input, in 20 ms frames, and reports event
-// at its first frame. It reads ctx before each frame, so a sound whose owner
-// is gone (soundContext) writes nothing more, whatever the speaker checks.
+// at its first frame. Each Write reads ctx and queues nothing once it is done
+// (audio.Playback.Write), so a sound whose owner is gone (soundContext) writes
+// no further frame.
 func (s *Supervisor) playChime(ctx context.Context, pcm []byte, event, sessionID string) {
 	pb := s.cfg.Speaker.Begin(audio.InputChime)
 	const frame = 960 // 20 ms at 24 kHz mono PCM16
 	for off := 0; off < len(pcm); off += frame {
-		if ctx.Err() != nil {
-			return
-		}
 		if err := pb.Write(ctx, pcm[off:min(off+frame, len(pcm))], ChimeFormat); err != nil {
 			return
 		}
