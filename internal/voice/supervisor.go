@@ -357,6 +357,9 @@ type exchange struct {
 	toolCalls     int  // answer tools still running: the exchange stays open
 	// dropsAtOpen is the tap's drop count when the exchange opened.
 	dropsAtOpen uint64
+	// unbindMeeting stops the callback that ends the exchange when its
+	// meeting ends (bindMeetingLocked); endLocked calls it. Nil until bound.
+	unbindMeeting func() bool
 	// sayCtx, when set, is the context of a hand's words, derived from its
 	// membership's: its end stops them, and exchangeOutput refuses any frame
 	// written once it ended.
@@ -1051,14 +1054,17 @@ func (s *Supervisor) bindMeetingLocked(ex *exchange, sessionID string) {
 	}
 	meeting := s.cfg.Meeting(sessionID)
 	ex.authority.bind(meeting)
-	stop := context.AfterFunc(meeting, func() {
+	// The callback stays until ex ends (endLocked), not until ex's context
+	// is done: the meeting's end makes that context done too, and a stop run
+	// then could come before the callback, so the meeting's end would not
+	// end ex.
+	ex.unbindMeeting = context.AfterFunc(meeting, func() {
 		s.mu.Lock()
 		defer s.mu.Unlock()
 		if s.ex == ex && !ex.ended {
 			s.endLocked(ex, true, "its meeting ended")
 		}
 	})
-	context.AfterFunc(ex.ctx, func() { stop() })
 }
 
 // exchangeContext is an exchange's context: done when the exchange is (its
@@ -1894,6 +1900,9 @@ func (s *Supervisor) endLocked(ex *exchange, cut bool, reason string) {
 		return
 	}
 	ex.ended = true
+	if ex.unbindMeeting != nil {
+		ex.unbindMeeting()
+	}
 	if ex.timer != nil {
 		ex.timer.Stop()
 	}
