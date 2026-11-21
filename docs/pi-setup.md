@@ -510,9 +510,12 @@ open keeps the blink(1) red until that open has finished.
 
 To find what keeps the speaker's mixer from the Jabra when it underruns, set the debug setting
 `speaker_trace_dir` (or `GHOST_WISPR_SPEAKER_TRACE_DIR`) to a directory and restart the service; it
-is off by default. The process then keeps its last 3 seconds of Go execution trace in memory, at most
-16 MiB, and on an underrun writes them to `speaker-underrun-<time>.trace` there, at most once every
-10 seconds, keeping the newest 20; the log says `speaker trace: saved the capture of an underrun`.
+is off by default. The process then keeps its last 3 seconds of Go execution trace in memory, aiming
+at 16 MiB, a target the Go runtime can pass during a burst of events, and on an underrun writes them
+to `speaker-underrun-<time>.trace` there, at most once every 10 seconds. A capture larger than
+32 MiB is not saved (the log says `speaker trace: the capture was not saved`), and the directory
+keeps the newest 20 captures that fit 128 MiB together; the log says `speaker trace: saved the
+capture of an underrun`.
 `/opt/ghost-wispr/ghost-wispr speaker-trace FILE` prints each turn of the mixer longer than 40 ms
 in the capture (`-slow` changes the bound), longest first, with what it spent the time on: running,
 runnable (Go had no processor free), in a system call (ALSA's write), or waiting on the pacer's

@@ -2,7 +2,9 @@ package audio
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -49,17 +51,29 @@ func pacerSleep(d time.Duration) {
 	trace.WithRegion(traceRegions, regionPacer, func() { time.Sleep(d) })
 }
 
-// The speaker trace's limits: it keeps at least speakerTraceWindow of trace,
-// up to speakerTraceBytes; it saves at most once every speakerTraceEvery,
-// speakerTraceDelay after the underrun so the capture holds the write that
-// found the device dry; and it keeps the newest speakerTraceKeep captures.
+// The speaker trace's limits. The flight recorder keeps at least
+// speakerTraceWindow of trace, aiming at speakerTraceHint bytes: a target the
+// Go runtime may exceed, since it keeps whole generations of trace, so a burst
+// of events can make a snapshot far larger (41.5 MB against the 16 MiB hint
+// in one review probe). A capture is saved only if its snapshot fits
+// speakerTraceFileBytes, twice the hint, and the captures kept in the
+// directory are the newest speakerTraceKeep that fit speakerTraceDirBytes
+// together: the Pi's SD card holds the recordings too. It saves at most once
+// every speakerTraceEvery, speakerTraceDelay after the underrun so the capture
+// holds the write that found the device dry.
 const (
-	speakerTraceWindow = 3 * time.Second
-	speakerTraceBytes  = 16 << 20
-	speakerTraceEvery  = 10 * time.Second
-	speakerTraceDelay  = 250 * time.Millisecond
-	speakerTraceKeep   = 20
+	speakerTraceWindow    = 3 * time.Second
+	speakerTraceHint      = 16 << 20
+	speakerTraceFileBytes = 2 * speakerTraceHint
+	speakerTraceDirBytes  = 128 << 20
+	speakerTraceEvery     = 10 * time.Second
+	speakerTraceDelay     = 250 * time.Millisecond
+	speakerTraceKeep      = 20
 )
+
+// errCaptureTooLarge is a snapshot larger than a capture's byte budget: it is
+// not saved, and nothing of it is left on disk.
+var errCaptureTooLarge = errors.New("the speaker trace's snapshot is larger than a capture may be")
 
 // SpeakerTrace keeps the last seconds of the process's execution trace in
 // memory (runtime/trace's flight recorder) and writes them to a file in dir
@@ -71,6 +85,9 @@ type SpeakerTrace struct {
 	dir   string
 	fr    *trace.FlightRecorder
 	every time.Duration
+	// fileBytes and dirBytes are the byte budgets of one capture and of the
+	// captures kept in dir (speakerTraceFileBytes, speakerTraceDirBytes).
+	fileBytes, dirBytes int64
 
 	mu     sync.Mutex
 	last   time.Time
@@ -84,11 +101,11 @@ func StartSpeakerTrace(dir string) (*SpeakerTrace, error) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, fmt.Errorf("speaker trace: %w", err)
 	}
-	fr := trace.NewFlightRecorder(trace.FlightRecorderConfig{MinAge: speakerTraceWindow, MaxBytes: speakerTraceBytes})
+	fr := trace.NewFlightRecorder(trace.FlightRecorderConfig{MinAge: speakerTraceWindow, MaxBytes: speakerTraceHint})
 	if err := fr.Start(); err != nil {
 		return nil, fmt.Errorf("speaker trace: start the flight recorder: %w", err)
 	}
-	return &SpeakerTrace{dir: dir, fr: fr, every: speakerTraceEvery}, nil
+	return &SpeakerTrace{dir: dir, fr: fr, every: speakerTraceEvery, fileBytes: speakerTraceFileBytes, dirBytes: speakerTraceDirBytes}, nil
 }
 
 // Underrun saves a capture in the background, speakerTraceDelay from now,
@@ -117,30 +134,78 @@ func (s *SpeakerTrace) Underrun() {
 	}()
 }
 
-// save writes the flight recorder's window to a new file and removes the
-// oldest captures beyond speakerTraceKeep.
+// save writes the flight recorder's window to a new file, unless it is
+// larger than fileBytes: then it fails with errCaptureTooLarge and removes
+// what it wrote. It then removes the oldest captures until the newest
+// speakerTraceKeep are left and they fit dirBytes together; the new capture
+// is always kept.
 func (s *SpeakerTrace) save(at time.Time) (string, error) {
 	path := filepath.Join(s.dir, "speaker-underrun-"+at.UTC().Format("20060102T150405.000Z")+".trace")
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
 	if err != nil {
 		return "", err
 	}
-	if _, err := s.fr.WriteTo(f); err != nil {
+	if _, err := s.fr.WriteTo(&budgetWriter{w: f, left: s.fileBytes}); err != nil {
 		_ = f.Close()
 		_ = os.Remove(path)
 		return "", err
 	}
 	if err := f.Close(); err != nil {
+		_ = os.Remove(path)
 		return "", err
 	}
-	old, err := filepath.Glob(filepath.Join(s.dir, "speaker-underrun-*.trace"))
-	if err == nil && len(old) > speakerTraceKeep {
-		slices.SortFunc(old, strings.Compare) // the names sort by time
-		for _, p := range old[:len(old)-speakerTraceKeep] {
-			_ = os.Remove(p)
+	s.prune(path)
+	return path, nil
+}
+
+// prune removes the oldest captures in dir, never kept (the one just saved),
+// until at most speakerTraceKeep are left and their sizes add up to at most
+// dirBytes.
+func (s *SpeakerTrace) prune(kept string) {
+	captures, err := filepath.Glob(filepath.Join(s.dir, "speaker-underrun-*.trace"))
+	if err != nil {
+		return
+	}
+	slices.SortFunc(captures, strings.Compare) // the names sort by time
+	sizes := make([]int64, len(captures))
+	var total int64
+	for i, p := range captures {
+		if info, err := os.Stat(p); err == nil {
+			sizes[i] = info.Size()
+			total += sizes[i]
 		}
 	}
-	return path, nil
+	count := len(captures)
+	for i, p := range captures {
+		if count <= speakerTraceKeep && total <= s.dirBytes {
+			return
+		}
+		if p == kept {
+			continue
+		}
+		if err := os.Remove(p); err != nil && !errors.Is(err, os.ErrNotExist) {
+			slog.Warn("speaker trace: an old capture could not be removed", "path", p, "error", err)
+			continue
+		}
+		count--
+		total -= sizes[i]
+	}
+}
+
+// budgetWriter writes to w until a write would take it past left bytes: that
+// write writes nothing and fails with errCaptureTooLarge.
+type budgetWriter struct {
+	w    io.Writer
+	left int64
+}
+
+func (b *budgetWriter) Write(p []byte) (int, error) {
+	if int64(len(p)) > b.left {
+		return 0, errCaptureTooLarge
+	}
+	n, err := b.w.Write(p)
+	b.left -= int64(n)
+	return n, err
 }
 
 // Stop waits for a capture being saved and stops the flight recorder.
