@@ -84,12 +84,12 @@ fail:
 }
 
 // gw_status is one snapshot of a PCM's status: whether it is running (or
-// draining), its delay, which counts what is in flight to a USB speaker as
-// well as what the PCM holds and which ALSA reports only while it runs, and
-// how many frames its buffer has free, which it reports in every state, a
-// suspended one included; or snd_pcm_status's error.
+// draining) or suspended, its delay, which counts what is in flight to a USB
+// speaker as well as what the PCM holds and which ALSA reports only while it
+// runs, and how many frames its buffer has free, which it reports in every
+// state, a suspended one included; or snd_pcm_status's error.
 typedef struct {
-	int running, rc;
+	int running, suspended, rc;
 	long delay, avail;
 } gw_status;
 
@@ -101,6 +101,7 @@ static gw_status gw_status_read(snd_pcm_t *pcm) {
 	if ((s.rc = snd_pcm_status(pcm, st)) < 0) return s;
 	state = snd_pcm_status_get_state(st);
 	s.running = state == SND_PCM_STATE_RUNNING || state == SND_PCM_STATE_DRAINING;
+	s.suspended = state == SND_PCM_STATE_SUSPENDED;
 	s.delay = (long)snd_pcm_status_get_delay(st);
 	s.avail = (long)snd_pcm_status_get_avail(st);
 	return s;
@@ -159,7 +160,7 @@ func (p *cgoPCM) dropAfterStatus() (pcmStatus, time.Duration, int) {
 }
 
 func statusOf(s C.gw_status) pcmStatus {
-	return pcmStatus{running: s.running != 0, delay: int(s.delay), avail: int(s.avail), rc: int(s.rc)}
+	return pcmStatus{running: s.running != 0, suspended: s.suspended != 0, delay: int(s.delay), avail: int(s.avail), rc: int(s.rc)}
 }
 func (p *cgoPCM) prepare() int    { return int(C.snd_pcm_prepare(p.pcm)) }
 func (p *cgoPCM) rewindable() int { return int(C.snd_pcm_rewindable(p.pcm)) }
