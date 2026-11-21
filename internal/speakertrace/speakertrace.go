@@ -9,16 +9,61 @@
 package speakertrace
 
 import (
+	"bufio"
 	"cmp"
 	"errors"
 	"fmt"
 	"io"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"golang.org/x/exp/trace"
 )
+
+// traceHeader is how an execution trace begins: the Go version whose format
+// it is in, as runtime/trace and golang.org/x/exp/trace write and read it.
+const traceHeader = "go 1.%d trace\x00\x00\x00"
+
+// formatOf is the Go 1.x release whose trace format the header head names,
+// or 0 when head is not a trace's header.
+func formatOf(head []byte) int {
+	var minor int
+	if _, err := fmt.Sscanf(string(head), "go 1.%d trace", &minor); err != nil {
+		return 0
+	}
+	return minor
+}
+
+// newestFormat is the newest Go 1.x trace format the reader reads: the
+// highest minor version whose bare header golang.org/x/exp/trace accepts, as
+// the module's copy of it decides. A Go release that changes the format
+// writes traces only a newer copy reads.
+var newestFormat = sync.OnceValue(func() int {
+	for minor := 60; minor > 0; minor-- {
+		if _, err := trace.NewReader(strings.NewReader(fmt.Sprintf(traceHeader, minor))); err == nil {
+			return minor
+		}
+	}
+	return 0
+})
+
+// openTrace opens r as an execution trace. When golang.org/x/exp/trace
+// cannot read it, the error names the Go release whose format it is in and
+// the newest the reader reads.
+func openTrace(r io.Reader) (*trace.Reader, error) {
+	br := bufio.NewReader(r)
+	head, _ := br.Peek(len(fmt.Sprintf(traceHeader, 99)))
+	reader, err := trace.NewReader(br)
+	if err == nil {
+		return reader, nil
+	}
+	if format := formatOf(head); format > newestFormat() {
+		return nil, fmt.Errorf("the trace is in Go 1.%d's format, and this reader reads formats up to Go 1.%d's: rebuild it with a newer golang.org/x/exp: %w", format, newestFormat(), err)
+	}
+	return nil, fmt.Errorf("read the execution trace: %w", err)
+}
 
 // The trace regions the speaker's mixer marks (internal/audio): its write of
 // one frame to the device, the pacer holding it back to real time, and its
@@ -196,7 +241,7 @@ func (g *goroutine) account(now time.Duration) {
 // slow, in order. It fails if the trace holds no write to the device: a
 // trace with none was not taken while the speaker played, and says nothing.
 func Read(r io.Reader, slow time.Duration) ([]Cycle, error) {
-	reader, err := trace.NewReader(r)
+	reader, err := openTrace(r)
 	if err != nil {
 		return nil, err
 	}

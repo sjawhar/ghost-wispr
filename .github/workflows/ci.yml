@@ -137,6 +137,27 @@ jobs:
       - name: Test
         run: go test -race -tags kws ./...
 
+  # The speaker writes its traces with the unit's Go (speaker_trace_dir), and a Go release that
+  # changes the trace format needs a newer golang.org/x/exp to read them (internal/speakertrace).
+  # This job writes one with the newest stable Go and reads it back, so a new format is found
+  # before the unit's toolchain moves to it.
+  trace-reader:
+    name: Speaker trace reader on the newest Go
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version: stable
+
+      - name: Read a trace the newest Go writes
+        env:
+          GOTOOLCHAIN: local
+        run: |
+          go version
+          go test -count=1 -run '^TestTheReaderReadsWhatTheRunningGoWrites$' ./internal/speakertrace/
+
   web:
     name: Web
     runs-on: ubuntu-latest
