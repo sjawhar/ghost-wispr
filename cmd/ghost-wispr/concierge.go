@@ -358,10 +358,10 @@ func (l *lazyConcierge) halt(shutdown bool) {
 	l.c, l.stop, l.fwd, l.err = nil, nil, nil, nil
 	l.mu.Unlock()
 	if shutdown {
-		defer func() {
-			l.starting.Lock()
-			l.starting.Unlock() //nolint:staticcheck // waits for a start under way
-		}()
+		// A start under way holds starting until it has seen the shutdown
+		// and stopped what it started; no later start takes it (current).
+		l.starting.Lock()
+		defer l.starting.Unlock()
 	}
 	if c == nil {
 		return
