@@ -157,21 +157,32 @@ var spokenEnds = map[string]afterSpeech{
 // heldReports holds the speaker's report that a speech on the voice input
 // ended by itself (not cancelled) until release, and every report after it,
 // in order, as the speaker's callbacks, delivered on a goroutine of their
-// own, can come after the exchange has moved on. It queues them, so whatever
-// emits a report (a Cancel the Supervisor makes under its lock) never waits;
-// release delivers them in order. Reports before the held one pass at once.
+// own, can come after the exchange has moved on. With fromStart it holds
+// from the report that the speech started instead, so both its reports come
+// late. It queues them, so whatever emits a report (a Cancel the Supervisor
+// makes under its lock) never waits; release delivers them in order. Reports
+// before the held one pass at once.
 type heldReports struct {
 	*fakeSpeaker
-	// held closes when the first report a voice speech ended by itself comes
-	// before release, and is held; delivered, once that report, held or not,
-	// has been delivered.
+	// held closes when the first report it holds comes before release;
+	// delivered, once the report a voice speech ended by itself, held or
+	// not, has been delivered.
 	held, delivered chan struct{}
 	deliveredOnce   sync.Once
+	fromStart       bool // set before the Supervisor starts
 
 	mu       sync.Mutex
 	holding  bool // the held report came; release has not delivered the queue
 	released bool
 	queue    []heldReport
+}
+
+// queuedEnd reports whether the report that a voice speech ended by itself
+// waits in the queue.
+func (h *heldReports) queuedEnd() bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return slices.ContainsFunc(h.queue, func(q heldReport) bool { return endedByItself(q.e) })
 }
 
 // heldReport is one report heldReports keeps, for the callback it is for.
@@ -211,7 +222,7 @@ func (h *heldReports) OnSpeech(fn func(audio.SpeechEvent)) func() {
 			h.queue = append(h.queue, heldReport{fn: fn, e: e})
 			h.mu.Unlock()
 			return
-		case !h.released && endedByItself(e):
+		case !h.released && (endedByItself(e) || h.fromStart && e.Input == audio.InputVoice && e.Started):
 			h.holding = true
 			h.queue = append(h.queue, heldReport{fn: fn, e: e})
 			h.mu.Unlock()
@@ -269,14 +280,17 @@ func spokenCount(r *rig) int {
 // exchange whose voice drives its own turn, and whose speech the speaker
 // played to its end, ends in any way endLocked is called for without sending
 // voice_spoken exactly once, while the voice's own report that its speech
-// ended trails by a second, past the end. Each way runs in two orders: the
+// ended trails by a second, past the end. Each way runs in three orders: the
 // speaker's report of the speech's end comes before the end, or is held past
-// it, as the speaker's callbacks, on a goroutine of their own, can be. An end
-// that can come only after that report (afterReport) must keep the exchange
-// open while it is held. The ways are read from supervisor.go (endReasons):
-// a reason spokenEnds has no entry for, or one it lists that is gone, fails
-// the test, so a new end is not missed. Reviews 6004768767 and 6005017841 of
-// #143 found endings, in each order, that lost the event.
+// it, or its reports of both the speech's start and its end are held past
+// it, as the speaker's callbacks, on a goroutine of their own, can be. An
+// end that can come only after that report (afterReport) must keep the
+// exchange open while it is held, and does not run in the third order, in
+// which it cannot come. The ways are read from supervisor.go
+// (endReasons): a reason spokenEnds has no entry for, or one it lists that
+// is gone, fails the test, so a new end is not missed. Reviews 6004768767,
+// 6005017841 and 6005654289 of #143 found endings, in each order, that lost
+// the event.
 func TestEveryEndAfterADrivingVoiceSpokeReportsItSpokenOnce(t *testing.T) {
 	reasons := endReasons(t)
 	for _, reason := range reasons {
@@ -294,10 +308,11 @@ func TestEveryEndAfterADrivingVoiceSpokeReportsItSpokenOnce(t *testing.T) {
 		if !ok || path.end == nil {
 			continue
 		}
-		for _, late := range []bool{false, true} {
-			order := "the speaker reports the speech's end first"
-			if late {
-				order = "the speaker's report is held past the end"
+		for _, order := range []string{"the speaker reports the speech's end first", "the speaker's report is held past the end", "the speaker's reports of the start and the end are held past the end"} {
+			late := order != "the speaker reports the speech's end first"
+			fromStart := order == "the speaker's reports of the start and the end are held past the end"
+			if fromStart && path.afterReport != "" {
+				continue // it ends only after the speaker's reports, which this order holds
 			}
 			t.Run(reason+"/"+order, func(t *testing.T) {
 				if path.limit > 0 {
@@ -311,6 +326,7 @@ func TestEveryEndAfterADrivingVoiceSpokeReportsItSpokenOnce(t *testing.T) {
 				var reports *heldReports
 				r := newRigWith(t, c, func(cfg *SupervisorConfig, r *rig) {
 					reports = holdReports(t, cfg, r)
+					reports.fromStart = fromStart
 					cfg.Voice = func() (Voice, error) { return drivingVoice{r.voice}, nil }
 					cfg.Meeting = func(string) context.Context { return meeting }
 					cfg.IdleWait, cfg.FollowUpWait = time.Minute, time.Minute
@@ -334,9 +350,19 @@ func TestEveryEndAfterADrivingVoiceSpokeReportsItSpokenOnce(t *testing.T) {
 				sess.endLate = time.Second
 				sess.mu.Unlock()
 				speakAs(t, sess, "The issue is in review since this morning.")
-				r.waitSpeaking()
+				if fromStart {
+					// The Supervisor sees the speech only once its held start
+					// report is delivered.
+					waitFor(t, reports.held, "the speaker's report of the speech's start")
+				} else {
+					r.waitSpeaking()
+				}
 				r.speaker.finish(audio.InputVoice)
-				waitFor(t, reports.held, "the speaker's report of the speech's end")
+				if fromStart {
+					eventually(t, "the speaker's report of the speech's end queued", reports.queuedEnd)
+				} else {
+					waitFor(t, reports.held, "the speaker's report of the speech's end")
+				}
 				closed := func() bool { _, _, closed := sess.state(); return closed }
 				switch {
 				case !late:
@@ -459,5 +485,39 @@ func TestASpeechFromBeforeAnExchangeIsNotItsSpoken(t *testing.T) {
 	time.Sleep(50 * time.Millisecond)
 	if n := spokenCount(r); n != 0 {
 		t.Fatalf("voice_spoken %d times for a new exchange whose voice never spoke; events %v", n, r.events.all())
+	}
+}
+
+// TestASpeechAfterAnExchangeEndedIsNotItsSpoken fails if a speech that
+// started after an exchange gave up the floor (POST /api/tts/speak), and
+// played to its end with both its speaker reports held until then, marks
+// that ended exchange, whose voice never spoke, as spoken: an ended exchange
+// owns only a speech that started while it held the floor (lastFloorEnd).
+// From review 6005654289 of #143.
+func TestASpeechAfterAnExchangeEndedIsNotItsSpoken(t *testing.T) {
+	var reports *heldReports
+	r := newRigWith(t, newFakeConcierge(), func(cfg *SupervisorConfig, r *rig) {
+		reports = holdReports(t, cfg, r)
+		reports.fromStart = true
+		cfg.Voice = func() (Voice, error) { return drivingVoice{r.voice}, nil }
+		cfg.IdleWait, cfg.FollowUpWait = time.Minute, time.Minute
+	})
+	r.heard("Wispr, what is happening?", true, true)
+	sess := r.waitSession()
+	r.waitEvent("voice_exchange_started:sess-1")
+	r.s.Stop("the test ends the exchange before its voice speaks")
+	eventually(t, "the exchange closed", func() bool { _, _, closed := sess.state(); return closed })
+	pb := r.speaker.Begin(audio.InputVoice)
+	if err := pb.Write(t.Context(), make([]byte, 960), audio.AudioFormat{SampleRate: 24000, Channels: 1, Encoding: audio.EncodingPCM16}); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, reports.held, "the later speech's start report")
+	r.speaker.finish(audio.InputVoice)
+	eventually(t, "the later speech's end report queued", reports.queuedEnd)
+	reports.release()
+	waitFor(t, reports.delivered, "the later speech's reports delivered")
+	time.Sleep(50 * time.Millisecond)
+	if n := spokenCount(r); n != 0 {
+		t.Fatalf("voice_spoken %d times for an ended exchange whose voice never spoke; events %v", n, r.events.all())
 	}
 }

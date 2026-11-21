@@ -249,9 +249,14 @@ type Supervisor struct {
 	// time, not when its event came, nil for other speech. The speech's end
 	// is that exchange's, though another exchange may have taken the floor,
 	// and cut it, since. floorAt is when the exchange holding the floor took
-	// it.
-	speechEx *exchange
-	floorAt  time.Time
+	// it. lastEx is the exchange that held the floor last, from lastFloorAt
+	// until lastFloorEnd: a speech whose start the speaker reports only once
+	// it has ended, as a stop can come first, is still its own.
+	speechEx     *exchange
+	floorAt      time.Time
+	lastEx       *exchange
+	lastFloorAt  time.Time
+	lastFloorEnd time.Time
 
 	// commands counts a person's commands on held answers: each "Wispr,
 	// never mind" and each "Wispr, go ahead". neverMinds is how many never
@@ -1898,6 +1903,7 @@ func (s *Supervisor) endLocked(ex *exchange, cut bool, reason string) {
 	if s.ex == ex {
 		s.ex = nil
 		close(s.floor)
+		s.lastEx, s.lastFloorAt, s.lastFloorEnd = ex, s.floorAt, time.Now()
 	}
 	s.cfg.Tap.CloseOut()
 	if dropped := s.cfg.Tap.Dropped() - ex.dropsAtOpen; dropped > 0 {
@@ -1991,12 +1997,20 @@ func (s *Supervisor) onSpeech(e audio.SpeechEvent) {
 	}
 	var ex *exchange
 	if e.Started {
-		// A speech that started before the exchange took the floor, whose
-		// start came only after, is not its voice's: the floor's cut ends it.
+		// The speech is the voice's of the exchange that held the floor when
+		// it started, by its own start time: the one holding it now, or the
+		// one before, ended since, whose start the speaker reported late. A
+		// speech that started before the exchange holding the floor took it,
+		// and after the one before gave it up, is no exchange's: the floor's
+		// cut ends it.
 		ex, s.speechEx = nil, nil
-		if s.ex != nil && !e.At.Before(s.floorAt) {
-			ex, s.speechEx = s.ex, s.ex
+		switch {
+		case s.ex != nil && !e.At.Before(s.floorAt):
+			ex = s.ex
+		case s.lastEx != nil && !e.At.Before(s.lastFloorAt) && e.At.Before(s.lastFloorEnd):
+			ex = s.lastEx
 		}
+		s.speechEx = ex
 		s.voiceStarted = e.At
 	} else {
 		ex, s.speechEx = s.speechEx, nil
