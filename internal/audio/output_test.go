@@ -1283,7 +1283,7 @@ func TestOutputSpeechEventsCarryTheMonotonicClockReadWithAt(t *testing.T) {
 	}
 
 	before := monoclock.Read()
-	pb := out.Begin(InputChime)
+	pb := out.Begin(InputChime, nil)
 	if err := pb.WriteAll(ctx, constant(48000, 100*time.Millisecond, 1000), mono48k); err != nil {
 		t.Fatal(err)
 	}
@@ -1293,7 +1293,7 @@ func TestOutputSpeechEventsCarryTheMonotonicClockReadWithAt(t *testing.T) {
 	check("the chime's end", ended, started.AtMono, after, started)
 
 	before = monoclock.Read()
-	pb = out.Begin(InputVoice)
+	pb = out.Begin(InputVoice, nil)
 	go func() { _ = pb.WriteAll(ctx, constant(48000, 2*time.Second, 1000), mono48k) }()
 	voiceStart, after := next("the voice's start")
 	check("the voice's start", voiceStart, before, after, ended)
