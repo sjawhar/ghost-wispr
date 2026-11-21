@@ -125,15 +125,15 @@ var spokenEnds = map[string]afterSpeech{
 		}
 	}},
 
-	"Wispr, go ahead":         {cannot: "it ends only an exchange whose voice does not drive its turn"},
-	"a new call":              {cannot: "a call in a driving voice's own exchange continues that exchange; it ends one that answers or speaks a held answer"},
-	"the wake was misheard":   {cannot: "it ends only an exchange whose voice does not drive its turn"},
-	"barge-in":                {cannot: "a barge-in cuts a driving voice and keeps its exchange (cutDriverLocked)"},
-	"its session ended":       {cannot: "it ends only an exchange speaking a held answer"},
-	"the voice did not open":  {cannot: "it ends an exchange before its voice could speak"},
-	"turnWaited(reason)":      {cannot: "turnWaited does nothing for a voice that drives its turn"},
+	"Wispr, go ahead":          {cannot: "it ends only an exchange whose voice does not drive its turn"},
+	"a new call":               {cannot: "a call in a driving voice's own exchange continues that exchange; it ends one that answers or speaks a held answer"},
+	"the wake was misheard":    {cannot: "it ends only an exchange whose voice does not drive its turn"},
+	"barge-in":                 {cannot: "a barge-in cuts a driving voice and keeps its exchange (cutDriverLocked)"},
+	"its session ended":        {cannot: "it ends only an exchange speaking a held answer"},
+	"the voice did not open":   {cannot: "it ends an exchange before its voice could speak"},
+	"turnWaited(reason)":       {cannot: "turnWaited does nothing for a voice that drives its turn"},
 	"the voice did not finish": {cannot: "it ends an exchange whose speech the Supervisor waits for itself (finish): a held answer, or the answer of a voice that does not drive its turn"},
-	"done":                    {cannot: "it ends an exchange whose speech the Supervisor waits for itself (finish): a held answer, or the answer of a voice that does not drive its turn"},
+	"done":                     {cannot: "it ends an exchange whose speech the Supervisor waits for itself (finish): a held answer, or the answer of a voice that does not drive its turn"},
 }
 
 // spokenCount is how many voice_spoken events r saw for sess-1.
