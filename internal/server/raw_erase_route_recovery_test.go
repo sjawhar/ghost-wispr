@@ -2,6 +2,7 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"database/sql"
 	"errors"
 	"net/http"
@@ -131,8 +132,8 @@ func TestDeleteSessionRouteReusesAReservedRawErase(t *testing.T) {
 	finish := finishRawErasing
 	t.Cleanup(func() { finishRawErasing = finish })
 	finished := make(chan struct{})
-	finishRawErasing = func(store SessionStore, reservations []rawEraseReservation) {
-		finish(store, reservations)
+	finishRawErasing = func(ctx context.Context, store SessionStore, reservations []rawEraseReservation) {
+		finish(ctx, store, reservations)
 		close(finished)
 	}
 

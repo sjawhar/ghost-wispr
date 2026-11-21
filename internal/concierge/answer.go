@@ -137,8 +137,15 @@ var errOutOfReach = fmt.Errorf("concierge: %w", voice.ErrUnreachable)
 // turn names that was not read yet is read first. One answer takes at most
 // 8 s and 6 tool calls of the model's. When Dispatch or Envoy did not answer
 // a read, a lookup or the ask, the voice says so and the error wraps
-// voice.ErrUnreachable, for R10's error sound.
+// voice.ErrUnreachable, for R10's error sound. An answer, and an ask it
+// leaves running, is work Stop waits for; after Stop, Answer answers
+// nothing and its error wraps voice.ErrUnreachable.
 func (c *Concierge) Answer(parent context.Context, x *voice.Exchange, turn string, say voice.SayFunc) error {
+	parent, leave, ok := c.enter(parent)
+	if !ok {
+		return fmt.Errorf("%w: %w", voice.ErrUnreachable, errStopped)
+	}
+	defer leave()
 	sp := newSpeaker(parent, say)
 	err := c.answer(parent, x, turn, sp)
 	spokenErr := sp.wait()
@@ -174,9 +181,17 @@ func (c *Concierge) answer(parent context.Context, x *voice.Exchange, turn strin
 	var askingKey atomic.Pointer[string]
 	startAsk := func(session string, found *reading) {
 		if askStarted.CompareAndSwap(false, true) {
+			// The ask may outlive the answer (its send keeps its own
+			// bound), so it is work of its own that Stop waits for.
+			askCtx, leaveAsk, ok := c.enter(ctx)
+			if !ok {
+				asking <- askResult{}
+				return
+			}
 			askingKey.Store(&found.key)
 			go func() {
-				result := c.ask(ctx, x, session, turn, found)
+				defer leaveAsk()
+				result := c.ask(askCtx, x, session, turn, found)
 
 				asking <- result
 			}()

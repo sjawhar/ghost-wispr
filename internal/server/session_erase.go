@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -20,7 +21,7 @@ import (
 // (deleteSessionErasingAudio), then tells every connected web client which
 // sessions are gone (Hub.BroadcastSessionDeleted) and runs
 // controls.OnSessionDeleted. It refuses an active session.
-func registerSessionDeleteRoute(mux *http.ServeMux, store SessionStore, controls *ControlHooks, hub *Hub, audioDir func() string) {
+func registerSessionDeleteRoute(mux routeMux, store SessionStore, controls *ControlHooks, hub *Hub, audioDir func() string) {
 	mux.HandleFunc("DELETE /api/sessions/{id}", func(w http.ResponseWriter, r *http.Request) {
 		sessionID := r.PathValue("id")
 		if !storage.ValidSessionID(sessionID) {
@@ -42,7 +43,7 @@ func registerSessionDeleteRoute(mux *http.ServeMux, store SessionStore, controls
 			return
 		}
 
-		err = deleteSessionErasingAudio(store, sessionID, audioDir(), controls.RefreshRawEraseWarnings, controls.HoldSessionAudio, func(sessionIDs []string) {
+		err = deleteSessionErasingAudio(store, sessionID, audioDir(), controls.RefreshRawEraseWarnings, controls.HoldSessionAudio, controls.GoStoreWork, func(sessionIDs []string) {
 			if hub != nil {
 				hub.BroadcastSessionDeleted(sessionIDs[0], sessionIDs[1:])
 			}
@@ -78,7 +79,10 @@ func registerSessionDeleteRoute(mux *http.ServeMux, store SessionStore, controls
 //     file of each deleted session in recordingDir, whatever the row named
 //     (sessionAudioFiles), except a file a remaining session names (on a
 //     restored unit a merged session names its sources' recordings), and
-//     zeroes the hidden raw captures and recordings in the background. If
+//     zeroes the hidden raw captures and recordings in the background: the
+//     raw captures through goStoreWork, since their erase then clears their
+//     reservations in the store (a stop that refuses it leaves them to the
+//     start's recovery). If
 //     what remaining sessions name cannot be read, it hides only the
 //     recordings the row named, as before;
 //   - once every one of those files is off its name, it clears the delete
@@ -92,7 +96,7 @@ func registerSessionDeleteRoute(mux *http.ServeMux, store SessionStore, controls
 // DeleteSession records every erase directory before the row goes, so an
 // erase cut off by a stop is finished as the app starts. The files leave
 // their names before this returns; the zeros follow.
-func deleteSessionErasingAudio(store SessionStore, sessionID, recordingDir string, refreshWarning func(), hold func([]string) func(), onDeleted func(sessionIDs []string)) error {
+func deleteSessionErasingAudio(store SessionStore, sessionID, recordingDir string, refreshWarning func(), hold func([]string) func(), goStoreWork func(func(context.Context)), onDeleted func(sessionIDs []string)) error {
 	sourceIDs, err := store.SourceSessionIDs(sessionID)
 	if err != nil {
 		return fmt.Errorf("list source sessions for raw erase: %w", err)
@@ -108,7 +112,7 @@ func deleteSessionErasingAudio(store SessionStore, sessionID, recordingDir strin
 	audioPath, err := store.DeleteSession(sessionID, recordingDir)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			finishRawErasing(store, rawReservations)
+			finishRawErasing(context.Background(), store, rawReservations)
 		} else {
 			restoreRawSessionErasures(store, rawReservations, refreshWarning)
 		}
@@ -168,7 +172,16 @@ func deleteSessionErasingAudio(store SessionStore, sessionID, recordingDir strin
 		}
 	}
 	if len(rawReservations) > 0 {
-		go finishRawErasing(store, rawReservations)
+		// The function is read here, as a go statement would read it, not
+		// in the goroutine: a test replaces it, and a late erase must not
+		// read it then.
+		erase := finishRawErasing
+		finish := func(ctx context.Context) { erase(ctx, store, rawReservations) }
+		if goStoreWork != nil {
+			goStoreWork(finish)
+		} else {
+			go finish(context.Background())
+		}
 	}
 	if len(pending) > 0 {
 		go finishErasing(sessionID, pending)
@@ -336,9 +349,16 @@ func restoreRawSessionErasures(store SessionStore, reservations []rawEraseReserv
 
 // finishRawErasing zeroes hidden raw files after their session rows are gone.
 // It also reaches a persisted hidden name that a retry reuses but Begin cannot
-// return because its original name is already gone.
-var finishRawErasing = func(store SessionStore, reservations []rawEraseReservation) {
+// return because its original name is already gone. Once ctx ends (the app's
+// stop) it starts no other erase. A file it leaves under its hidden name is
+// zeroed at the next start by the erase of leftovers, which skips only
+// reserved names (erase.LeftoversExcept), and the delete removed its
+// reservation with the session's row.
+var finishRawErasing = func(ctx context.Context, store SessionStore, reservations []rawEraseReservation) {
 	for _, reservation := range reservations {
+		if ctx.Err() != nil {
+			return
+		}
 		var err error
 		if reservation.keepHidden {
 			err = erase.Finish(reservation.originalPath, reservation.hiddenPath)

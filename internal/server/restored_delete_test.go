@@ -58,7 +58,7 @@ func TestDeletingTheLastSessionWhoseRestoredFolderHoldsARecordingErasesIt(t *tes
 			deleteAll := func(ids ...string) {
 				t.Helper()
 				for _, id := range ids {
-					if err := deleteSessionErasingAudio(store, id, dir, func() {}, nil, func([]string) {}); err != nil {
+					if err := deleteSessionErasingAudio(store, id, dir, func() {}, nil, nil, func([]string) {}); err != nil {
 						t.Fatalf("delete %s: %v", id, err)
 					}
 				}
@@ -117,7 +117,7 @@ func TestADeleteTakesARestoredNameOnlyAsARecordingInTheAudioDirectory(t *testing
 		t.Errorf("NamedAudio = %q (%v), want only %s", named, err, recording)
 	}
 
-	if err := deleteSessionErasingAudio(store, id, dir, func() {}, nil, func([]string) {}); err != nil {
+	if err := deleteSessionErasingAudio(store, id, dir, func() {}, nil, nil, func([]string) {}); err != nil {
 		t.Fatalf("delete %s: %v", id, err)
 	}
 

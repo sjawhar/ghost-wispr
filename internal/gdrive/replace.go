@@ -15,6 +15,7 @@ import (
 	"google.golang.org/api/drive/v3"
 
 	recordingname "github.com/sjawhar/ghost-wispr/internal/recording"
+	"github.com/sjawhar/ghost-wispr/internal/stopping"
 	"github.com/sjawhar/ghost-wispr/internal/storage"
 )
 
@@ -135,6 +136,15 @@ func (o *Orchestrator) replaceSessionFiles(ctx context.Context, sess *storage.Se
 		outcome, err = o.replaceOwedFolders(ctx, current, now, folders, splicedRecording)
 		return err
 	})
+	if replaceErr != nil && stopping.CutOff(ctx) {
+		// The app's stop cut the replacement off: no failure is counted, and
+		// the claim stays held, as an exit inside it leaves it, for the next
+		// start's recovery, which puts the session back in the state its
+		// claim came from, its retry count as it was
+		// (storage.SQLiteStore.RecoverInterruptedSyncs).
+		o.logger.Info("gdrive replacement cut off by the stop; the next start recovers it", "operation", "replace_session_files", "session_id", sessionID, "error", replaceErr)
+		return fmt.Errorf("replace session files %s cut off by the stop: %w", sessionID, replaceErr)
+	}
 	release := syncStateOf(sess)
 	switch {
 	case outcome.ownTrashed || outcome.ownGone:

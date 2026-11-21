@@ -186,6 +186,10 @@ type SupervisorConfig struct {
 	// the Supervisor.
 	Meeting func(sessionID string) context.Context
 	Logf    func(string, ...any)
+	// followUpAfter starts a driving voice's follow-up window timer:
+	// time.AfterFunc, unless a test of this package sets it to run the
+	// window's expiry when the test says.
+	followUpAfter func(d time.Duration, f func()) *time.Timer
 }
 
 // Supervisor owns every exchange's lifetime: it opens one on the wake phrase,
@@ -367,6 +371,9 @@ func NewSupervisor(c *SupervisorConfig) *Supervisor {
 	}
 	if cfg.FollowUpWait <= 0 {
 		cfg.FollowUpWait = DefaultFollowUpWait
+	}
+	if cfg.followUpAfter == nil {
+		cfg.followUpAfter = time.AfterFunc
 	}
 	if cfg.ReplayWindow <= 0 {
 		cfg.ReplayWindow = DefaultReplayWindow
@@ -1237,7 +1244,7 @@ func (s *Supervisor) driverSpeechLocked(ex *exchange, started bool) {
 		return
 	}
 	gen := ex.followUpGen
-	ex.followUpTimer = time.AfterFunc(s.cfg.FollowUpWait, func() { s.driverFollowUpWaited(ex, gen) })
+	ex.followUpTimer = s.cfg.followUpAfter(s.cfg.FollowUpWait, func() { s.driverFollowUpWaited(ex, gen) })
 }
 
 // disarmFollowUpLocked closes ex's follow-up window without ending ex.

@@ -20,6 +20,14 @@ func cleanCutTranscriber(context.Context, string, string) ([]transcribe.Timestam
 
 var errTestRunnerHasNo = errors.New("this test runner has none")
 
+// directBackground admits work as the session manager does, with no stop: Go
+// runs it in a goroutine on a context that never ends, Run runs it at once.
+type directBackground struct{}
+
+func (directBackground) Go(f func(context.Context)) { go f(context.Background()) }
+
+func (directBackground) Run(ctx context.Context, f func(context.Context) error) error { return f(ctx) }
+
 // withTestDefaults gives r, which has its store, a fake for each dependency
 // it leaves nil, and checks it as the app's runner is checked. The fakes
 // change nothing: no recordings, no splice, a duration of -1 (unknown), a
@@ -53,6 +61,9 @@ func withTestDefaults(r *segmentDeleteRunner) *segmentDeleteRunner {
 	}
 	if r.warnings == nil {
 		r.warnings = newWarningsRegistry()
+	}
+	if r.background == nil {
+		r.background = directBackground{}
 	}
 	runner, err := newSegmentDeleteRunner(r)
 	if err != nil {

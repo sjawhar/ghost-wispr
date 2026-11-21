@@ -88,7 +88,9 @@ func (owingSweepStore) OwedDriveReplacements() ([]storage.OwedDriveReplacement, 
 func TestTheSyncSweepWarnsAsItStarts(t *testing.T) {
 	registry := newWarningsRegistry()
 	ctx, cancel := context.WithCancel(context.Background())
-	swept := goDone(func() { sweepDriveSync(ctx, owingSweepStore{}, &driveSync{}, registry, time.Hour, nil) })
+	swept := goDone(func() {
+		sweepDriveSync(ctx, directBackground{}, owingSweepStore{}, &driveSync{}, registry, time.Hour, nil)
+	})
 	t.Cleanup(func() {
 		cancel()
 		<-swept

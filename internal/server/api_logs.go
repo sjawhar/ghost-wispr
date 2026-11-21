@@ -6,7 +6,7 @@ import (
 	"time"
 )
 
-func registerLogRoutes(mux *http.ServeMux, controls *ControlHooks) {
+func registerLogRoutes(mux routeMux, controls *ControlHooks) {
 	mux.HandleFunc("GET /api/logs", func(w http.ResponseWriter, r *http.Request) {
 		if controls.GetLogs == nil {
 			writeJSONError(w, http.StatusServiceUnavailable, "log viewer not configured")
