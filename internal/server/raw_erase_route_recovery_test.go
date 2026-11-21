@@ -28,7 +28,7 @@ func routeMergedStore(t *testing.T, dbPath, audioDir string) *storage.SQLiteStor
 		if err := store.CreateSession(id, at); err != nil {
 			t.Fatal(err)
 		}
-		if err := store.EndSession(id, at.Add(time.Minute), ""); err != nil {
+		if err := store.EndSession(id, at.Add(time.Minute), "", ""); err != nil {
 			t.Fatal(err)
 		}
 		if err := os.WriteFile(filepath.Join(audioDir, id+".pcm"), []byte("raw audio of "+id), 0o600); err != nil {
@@ -106,7 +106,7 @@ func TestDeleteSessionRouteReusesAReservedRawErase(t *testing.T) {
 	if err := store.CreateSession("session", started); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.EndSession("session", started.Add(time.Minute), ""); err != nil {
+	if err := store.EndSession("session", started.Add(time.Minute), "", ""); err != nil {
 		t.Fatal(err)
 	}
 	raw := filepath.Join(audioDir, "session.pcm")
@@ -181,7 +181,7 @@ func TestDeleteSessionRetryKeepsItsReservationWhenTheRowDeleteRefuses(t *testing
 	if err := store.CreateSession("session", started); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.EndSession("session", started.Add(time.Minute), ""); err != nil {
+	if err := store.EndSession("session", started.Add(time.Minute), "", ""); err != nil {
 		t.Fatal(err)
 	}
 	raw := filepath.Join(audioDir, "session.pcm")
@@ -234,7 +234,7 @@ func TestDeleteSessionZeroesRawWhenItsRowDisappears(t *testing.T) {
 	if err := store.CreateSession("session", started); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.EndSession("session", started.Add(time.Minute), ""); err != nil {
+	if err := store.EndSession("session", started.Add(time.Minute), "", ""); err != nil {
 		t.Fatal(err)
 	}
 	raw := filepath.Join(dir, "session.pcm")
@@ -279,7 +279,7 @@ func TestDeleteSessionRefreshesRawWarningWhenFreshRestoreFails(t *testing.T) {
 	if err := store.CreateSession("session", started); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.EndSession("session", started.Add(time.Minute), ""); err != nil {
+	if err := store.EndSession("session", started.Add(time.Minute), "", ""); err != nil {
 		t.Fatal(err)
 	}
 	raw := filepath.Join(dir, "session.pcm")

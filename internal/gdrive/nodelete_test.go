@@ -57,7 +57,7 @@ func TestResyncOfAMainEraFolderUpdatesTheDocumentsInPlace(t *testing.T) {
 	if err := store.CreateSession(id, started); err != nil {
 		t.Fatalf("create session: %v", err)
 	}
-	if err := store.EndSession(id, started.Add(time.Minute), recording); err != nil {
+	if err := store.EndSession(id, started.Add(time.Minute), recording, ""); err != nil {
 		t.Fatalf("end session: %v", err)
 	}
 	if err := store.UpdateSummaryAtGeneration(id, "Merged", "The current summary.", storage.SummaryCompleted, "default", "{}", "", 0); err != nil {
@@ -681,7 +681,7 @@ func TestAStaleSyncNeverLeavesAnOldSummarySynced(t *testing.T) {
 	if err := store.CreateSession(id, started); err != nil {
 		t.Fatalf("create session: %v", err)
 	}
-	if err := store.EndSession(id, started.Add(time.Minute), recording); err != nil {
+	if err := store.EndSession(id, started.Add(time.Minute), recording, ""); err != nil {
 		t.Fatalf("end session: %v", err)
 	}
 	if err := store.UpdateSummaryAtGeneration(id, "", "The first summary.", storage.SummaryCompleted, "default", "{}", "", 0); err != nil {

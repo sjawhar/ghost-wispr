@@ -47,7 +47,7 @@ func TestATickCannotSendForAMeetingBeingDeleted(t *testing.T) {
 	r.clock.advance(15 * time.Second)
 	r.roster.OnSegment(r.segment("ABC-12 and XYZ-9 are late", false)) // queued for both
 	r.clock.advance(45 * time.Second)
-	if err := store.EndSession("sess-1", r.clock.Now(), ""); err != nil {
+	if err := store.EndSession("sess-1", r.clock.Now(), "", ""); err != nil {
 		t.Fatal(err)
 	}
 	r.setSession("")

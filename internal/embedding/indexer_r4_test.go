@@ -42,7 +42,7 @@ func r4Store(t *testing.T) (*storage.SQLiteStore, int64, int) {
 	for i, text := range texts {
 		_ = store.AppendSegment("s", transcribe.Segment{Text: text, StartTime: float64(i), EndTime: float64(i + 1), Timestamp: started.Add(time.Duration(i) * time.Second)})
 	}
-	_ = store.EndSession("s", started.Add(3*time.Second), "recording.mp3")
+	_ = store.EndSession("s", started.Add(3*time.Second), "recording.mp3", "")
 	words := make([]storage.RefinedWord, 0, len(texts))
 	refined := make([]storage.RefinedSegment, 0, len(texts))
 	for i, text := range texts {

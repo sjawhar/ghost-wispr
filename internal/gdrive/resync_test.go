@@ -44,7 +44,7 @@ func summarizedSession(t *testing.T, store *storage.SQLiteStore, audioDir, id st
 	if err := store.AppendSegment(id, transcribe.Segment{Text: "The streamed transcript.", StartTime: 0, EndTime: 1, Timestamp: started}); err != nil {
 		t.Fatalf("append segment: %v", err)
 	}
-	if err := store.EndSession(id, started.Add(time.Minute), recording); err != nil {
+	if err := store.EndSession(id, started.Add(time.Minute), recording, ""); err != nil {
 		t.Fatalf("end session: %v", err)
 	}
 	if _, _, err := store.Canonicalize(id); err != nil {

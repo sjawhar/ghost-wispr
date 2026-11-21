@@ -118,7 +118,7 @@ func TestDeleteNoAudioDoesNotPromiseUnavailableDriveRestore(t *testing.T) {
 	if err := store.CreateSession("unavailable", started); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.EndSession("unavailable", started.Add(time.Minute), ""); err != nil {
+	if err := store.EndSession("unavailable", started.Add(time.Minute), "", ""); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := store.DB().Exec(`UPDATE sessions SET refinement_status = 'no_audio' WHERE id = 'unavailable'`); err != nil {

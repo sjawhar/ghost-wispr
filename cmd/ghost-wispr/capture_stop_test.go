@@ -6,12 +6,16 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	api "github.com/deepgram/deepgram-go-sdk/v3/pkg/api/listen/v1/websocket/interfaces"
 
 	"github.com/sjawhar/ghost-wispr/internal/audio"
+	"github.com/sjawhar/ghost-wispr/internal/server"
 	"github.com/sjawhar/ghost-wispr/internal/session"
 	"github.com/sjawhar/ghost-wispr/internal/stopping"
 	"github.com/sjawhar/ghost-wispr/internal/storage"
@@ -157,6 +161,9 @@ func TestAPausesSettlementIsWorkTheStopWaitsFor(t *testing.T) {
 			}
 			deadline := 400 * time.Millisecond
 			if withinDeadline {
+				// The flush is released at 100 ms; the deadline leaves a
+				// loaded machine room to finish the stop after it.
+				deadline = 2 * time.Second
 				time.AfterFunc(100*time.Millisecond, func() { close(store.release) })
 			}
 			ctx, cancel := context.WithTimeout(context.Background(), deadline)
@@ -191,5 +198,230 @@ func TestAPausesSettlementIsWorkTheStopWaitsFor(t *testing.T) {
 				t.Errorf("%d segments saved, want the buffered words saved: %t", len(segments), withinDeadline)
 			}
 		})
+	}
+}
+
+// heldReadLight is a light whose read back, once block is set, waits until
+// release closes: an opening's red check is then under way, holding red.
+type heldReadLight struct {
+	*pluggableLight
+	block            atomic.Bool
+	once             sync.Once
+	entered, release chan struct{}
+}
+
+func (l *heldReadLight) ReadRGB() (r, g, b uint8, err error) {
+	if l.block.Load() {
+		l.once.Do(func() { close(l.entered) })
+		<-l.release
+	}
+	return l.pluggableLight.ReadRGB()
+}
+
+// TestAnOpeningTheStopOvertakesOpensNothing fails if a resume's gate opening
+// opens the gate once the stop has begun, though its red check, under way at
+// the stop, then reads red: the stop is the session manager's (the opening's
+// context ends) or the gate's own (captureGate.Stop, as main's shutdown
+// begins), during the check or during beforeResume. It also fails if an
+// opening the stop overtook during its check runs beforeResume, or if an
+// opening that opens nothing keeps the red hold its check took, so the light
+// stays red with no microphone. The control, with no stop, opens the gate
+// and ends the hold. From review 6005610488 of #138.
+func TestAnOpeningTheStopOvertakesOpensNothing(t *testing.T) {
+	for _, stop := range []string{"", "the manager's stop during the red check", "the gate's stop during the red check", "the gate's stop during beforeResume"} {
+		name := stop
+		if stop == "" {
+			name = "control: no stop"
+		}
+		t.Run(name, func(t *testing.T) {
+			store := openResumeStore(t, filepath.Join(t.TempDir(), "light.db"))
+			manager := session.NewManager(store, audio.NewRecorder(t.TempDir()), nil, nil, session.NewDetector(time.Hour), 0)
+			settling, releaseSettle := make(chan struct{}), make(chan struct{})
+			resuming, releaseResume := make(chan struct{}), make(chan struct{})
+			var resumed atomic.Bool
+			capture := newCaptureGate(nil, func() { close(settling); <-releaseSettle }, func() {
+				resumed.Store(true)
+				if stop == "the gate's stop during beforeResume" {
+					close(resuming)
+					<-releaseResume
+				}
+			})
+			capture.background = manager
+			light := &heldReadLight{pluggableLight: &pluggableLight{present: true}, entered: make(chan struct{}), release: make(chan struct{})}
+			hardware := &hardwareControl{light: &reconnectingLight{light: light, warnings: newWarningsRegistry()}}
+			controls := newPersistentControls(store, capture.Pause, capture, nil)
+			wirePauseControls(&server.ControlHooks{}, controls, capture, hardware, newWarningsRegistry())
+			if err := controls.Pause(); err != nil {
+				t.Fatal(err)
+			}
+			awaitClosed(t, settling, "the pause's settlement")
+			if err := controls.Resume(); err != nil {
+				t.Fatal(err)
+			}
+			light.block.Store(true)
+			close(releaseSettle)
+			awaitClosed(t, light.entered, "the opening's red check")
+			switch stop {
+			case "the manager's stop during the red check":
+				ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+				defer cancel()
+				if err := manager.StopBackground(ctx); !errors.Is(err, context.DeadlineExceeded) {
+					t.Fatalf("control: the stop = %v, want its deadline while the red check is held", err)
+				}
+			case "the gate's stop during the red check":
+				capture.Stop()
+			}
+			close(light.release) // the check reads red
+			if stop == "the gate's stop during beforeResume" {
+				awaitClosed(t, resuming, "beforeResume")
+				capture.Stop()
+				close(releaseResume)
+			}
+			if stop == "" {
+				// StopBackground cancels the opening it joins: the control
+				// lets it open first.
+				waitUntil(t, "the control's gate opening", func() bool { return !capture.isClosed() })
+			}
+			if err := manager.StopBackground(context.Background()); err != nil { // joins the opening
+				t.Fatal(err)
+			}
+			if opened := !capture.isClosed(); opened != (stop == "") {
+				t.Errorf("the gate opened: %t, want %t", opened, stop == "")
+			}
+			if overtakenInCheck := strings.HasSuffix(stop, "during the red check"); overtakenInCheck && resumed.Load() {
+				t.Error("beforeResume ran for an opening the stop overtook during its red check")
+			}
+			if hardware.holdsRed() {
+				t.Error("the opening's red hold outlived it")
+			}
+		})
+	}
+}
+
+// TestAShutdownKeepsAnAcceptedResumesSavedState fails if a shutdown that
+// begins while an accepted resume's gate opening waits for the pause to
+// settle makes the opening refuse the resume: the refusal saves the paused
+// state the unit came from over the accepted resume's, though its cause, the
+// light's stop at shutdown ("recording light stopped"), is the shutdown's
+// and not the light's. The saved state must stay the accepted resume's, so
+// the next start restores recording, and confirms the light red before its
+// microphone opens. It also fails if the gate opens once the app has
+// stopped. The control, with no shutdown, opens the gate. From review
+// 6005610488 of #138.
+func TestAShutdownKeepsAnAcceptedResumesSavedState(t *testing.T) {
+	for _, from := range []micState{micClosed, micListening} {
+		for _, shutdown := range []string{"", "the app stops", "the app and the light stop"} {
+			name := shutdown
+			if shutdown == "" {
+				name = "control: no shutdown"
+			}
+			t.Run(from.String()+"/"+name, func(t *testing.T) {
+				path := filepath.Join(t.TempDir(), "choice.db")
+				store := openResumeStore(t, path)
+				recorder := audio.NewRecorder(t.TempDir())
+				manager := session.NewManager(store, recorder, nil, nil, session.NewDetector(time.Hour), 0)
+				appCtx, stopApp := newAppContext()
+				defer stopApp()
+				capture := newSessionCaptureGate(appCtx, manager, recorder, func() deepgramFinalizer { return nil }, 10*time.Millisecond, testEndRetry, nopLogf)
+				settling, releaseSettle := make(chan struct{}), make(chan struct{})
+				settle := capture.settle
+				capture.settle = func() {
+					close(settling)
+					<-releaseSettle
+					settle()
+				}
+				openings := &countedBackground{backgroundWork: manager}
+				capture.background = openings
+				hardware := &hardwareControl{light: &reconnectingLight{light: &pluggableLight{present: true}, warnings: newWarningsRegistry()}}
+				controls := newPersistentControls(store, capture.Pause, capture, nil)
+				if from == micListening {
+					controls.useListener(capture, func() {}, func() bool { return true }, func() {})
+				}
+				wirePauseControls(&server.ControlHooks{}, controls, capture, hardware, newWarningsRegistry())
+				var refusals atomic.Int32
+				refuse := capture.onResumeRefused
+				capture.onResumeRefused = func(err error) {
+					refusals.Add(1)
+					refuse(err)
+				}
+				if err := controls.Pause(); err != nil {
+					t.Fatal(err)
+				}
+				awaitClosed(t, settling, "the pause's settlement")
+				if capture.micState() != from {
+					t.Fatalf("control: paused into %v, want %v", capture.micState(), from)
+				}
+				if err := controls.Resume(); err != nil {
+					t.Fatal(err)
+				}
+				if value, _, err := store.GetAppState(storage.AppStateCapturePaused); err != nil || value != savedRecording {
+					t.Fatalf("control: the accepted resume saved %q (%v), want %q", value, err, savedRecording)
+				}
+				switch shutdown {
+				case "the app stops":
+					stopApp()
+				case "the app and the light stop":
+					stopApp()
+					hardware.Stop()
+				}
+				close(releaseSettle)
+				// The opening ends before the manager's stop, which would
+				// cancel it: the app's stop alone must keep it from opening
+				// or refusing.
+				waitUntil(t, "the gate's opening to end", openings.allEnded)
+				if err := manager.StopBackground(context.Background()); err != nil { // joins the opening
+					t.Fatal(err)
+				}
+				if opened := !capture.isClosed(); opened != (shutdown == "") {
+					t.Errorf("the gate opened: %t, want %t", opened, shutdown == "")
+				}
+				if n := refusals.Load(); n != 0 {
+					t.Errorf("the opening refused the accepted resume %d times", n)
+				}
+				value, _, err := store.GetAppState(storage.AppStateCapturePaused)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if !closeStore(context.Background(), store) {
+					t.Fatal("closeStore left the store open")
+				}
+				restored, err := restorePause(openResumeStore(t, path), newCaptureGate(nil, nil, nil))
+				if err != nil || restored != micRecording {
+					t.Errorf("after the shutdown the saved state is %q, and the next start restores %v (%v), want recording", value, restored, err)
+				}
+			})
+		}
+	}
+}
+
+// countedBackground is background work that counts the work it starts with
+// Go, and the work that has ended.
+type countedBackground struct {
+	backgroundWork
+	started, ended atomic.Int32
+}
+
+func (b *countedBackground) Go(f func(ctx context.Context)) {
+	b.started.Add(1)
+	b.backgroundWork.Go(func(ctx context.Context) {
+		defer b.ended.Add(1)
+		f(ctx)
+	})
+}
+
+// allEnded reports whether work was started with Go, and all of it ended.
+func (b *countedBackground) allEnded() bool {
+	n := b.started.Load()
+	return n > 0 && b.ended.Load() == n
+}
+
+// awaitClosed waits for ch to close, and fails the test if it does not
+// within five seconds.
+func awaitClosed(t *testing.T, ch <-chan struct{}, what string) {
+	t.Helper()
+	select {
+	case <-ch:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("control: %s did not come", what)
 	}
 }

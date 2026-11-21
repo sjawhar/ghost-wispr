@@ -32,7 +32,7 @@ func recordedSession(t *testing.T, store *SQLiteStore, id string, started, ended
 			t.Fatal(err)
 		}
 	}
-	if err := store.EndSession(id, ended, "recording-"+id+".mp3"); err != nil {
+	if err := store.EndSession(id, ended, "recording-"+id+".mp3", ""); err != nil {
 		t.Fatal(err)
 	}
 }

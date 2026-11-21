@@ -76,7 +76,7 @@ func r3SessionStore(t *testing.T) (*storage.SQLiteStore, int64) {
 	for i, text := range []string{"before bridge", "private deletion token", "after bridge"} {
 		_ = store.AppendSegment("r3", transcribe.Segment{Text: text, StartTime: float64(i), EndTime: float64(i + 1), Timestamp: started.Add(time.Duration(i) * time.Second)})
 	}
-	_ = store.EndSession("r3", started.Add(3*time.Second), "recording.mp3")
+	_ = store.EndSession("r3", started.Add(3*time.Second), "recording.mp3", "")
 	segs, _ := store.GetSegments("r3")
 	return store, segs[1].ID
 }

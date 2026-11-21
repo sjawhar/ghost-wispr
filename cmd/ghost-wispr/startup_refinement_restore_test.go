@@ -30,7 +30,7 @@ func TestRefineUnfinishedDeletionRestoresPartialAudio(t *testing.T) {
 	if err := store.CreateSession("session", started); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.EndSession("session", started.Add(time.Minute), remaining); err != nil {
+	if err := store.EndSession("session", started.Add(time.Minute), remaining, ""); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := store.DB().Exec(`UPDATE sessions SET audio_removed_at = ?, refinement_status = ?, gdrive_folder_id = ?, sync_status = ?, sync_state = ? WHERE id = ?`, "2026-11-13T10:00:00Z", storage.RefinementPending, "folder", storage.SyncSynced, storage.SyncStateSynced, "session"); err != nil {
@@ -72,7 +72,7 @@ func TestRefineUnfinishedDeletionKeepsMarkerWhenDriveLacksRemovedAudio(t *testin
 	if err := store.CreateSession("session", started); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.EndSession("session", started.Add(time.Minute), remaining); err != nil {
+	if err := store.EndSession("session", started.Add(time.Minute), remaining, ""); err != nil {
 		t.Fatal(err)
 	}
 	const removedAt = "2026-11-13T10:00:00Z"

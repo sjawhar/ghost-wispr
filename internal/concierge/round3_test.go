@@ -454,7 +454,7 @@ func TestAFinalTurnThatNamesAnotherIssueReadsThatOne(t *testing.T) {
 func TestAnAnswerOfAnEndedSessionIsNotAnnounced(t *testing.T) {
 	r := newRig(t)
 	r.ask(t, "agent-7", "q", "")
-	if err := r.store.EndSession("meeting-1", testNow, ""); err != nil {
+	if err := r.store.EndSession("meeting-1", testNow, "", ""); err != nil {
 		t.Fatal(err)
 	}
 	r.model.turns = [][]*genai.GenerateContentResponse{{chunk(text("Done."))}}

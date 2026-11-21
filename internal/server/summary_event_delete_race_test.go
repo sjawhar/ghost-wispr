@@ -55,7 +55,7 @@ func TestASummaryEventAfterTheSessionsDeleteIsNotStored(t *testing.T) {
 	if err := store.AppendSegment(id, transcribe.Segment{Text: "We named the warehouse robot project and agreed to order a machine to clear the yard before the end of the month.", StartTime: 0, EndTime: 9, Timestamp: started}); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.EndSession(id, started.Add(time.Minute), ""); err != nil {
+	if err := store.EndSession(id, started.Add(time.Minute), "", ""); err != nil {
 		t.Fatal(err)
 	}
 	hub := NewHub()

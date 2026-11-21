@@ -32,7 +32,7 @@ func TestTheGuardFailsAndRecordsAWriteAfterClose(t *testing.T) {
 	if err := store.CreateSession("after", at); err == nil {
 		t.Error("an insert after Close was not refused")
 	}
-	if err := store.EndSession("before", at.Add(time.Minute), ""); err == nil {
+	if err := store.EndSession("before", at.Add(time.Minute), "", ""); err == nil {
 		t.Error("an update after Close was not refused")
 	}
 	if _, err := store.DB().Exec(`DELETE FROM sessions WHERE id = 'before'`); err == nil {

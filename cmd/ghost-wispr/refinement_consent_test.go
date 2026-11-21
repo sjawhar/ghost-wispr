@@ -32,7 +32,7 @@ func TestRestoreRefinementRefusesWhileDriveReplacementIsOwed(t *testing.T) {
 			if err := store.CreateSession("session", started); err != nil {
 				t.Fatal(err)
 			}
-			if err := store.EndSession("session", started.Add(time.Minute), ""); err != nil {
+			if err := store.EndSession("session", started.Add(time.Minute), "", ""); err != nil {
 				t.Fatal(err)
 			}
 			if _, err := store.DB().Exec(`UPDATE sessions SET audio_removed_at = ?, gdrive_folder_id = ?, sync_status = ?, sync_state = ? WHERE id = ?`, "2026-11-13T10:00:00Z", "folder", storage.SyncSynced, storage.SyncStateSynced, "session"); err != nil {

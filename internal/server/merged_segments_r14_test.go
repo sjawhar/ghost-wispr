@@ -24,7 +24,7 @@ func TestMergedSourceSegmentsRouteHidesStaleRows(t *testing.T) {
 		if err := store.CreateSession(id, at); err != nil {
 			t.Fatal(err)
 		}
-		if err := store.EndSession(id, at.Add(time.Minute), "/audio/"+id+".mp3"); err != nil {
+		if err := store.EndSession(id, at.Add(time.Minute), "/audio/"+id+".mp3", ""); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -65,13 +65,13 @@ func TestMergedDetailSendsZeroRevisionForUntimedSegments(t *testing.T) {
 	if err := store.AppendSegment("without-recording", transcribe.Segment{Text: "untimed source text", StartTime: 0, EndTime: 1, Timestamp: started}); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.EndSession("without-recording", started.Add(time.Minute), ""); err != nil {
+	if err := store.EndSession("without-recording", started.Add(time.Minute), "", ""); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.CreateSession("with-recording", started.Add(time.Hour)); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.EndSession("with-recording", started.Add(61*time.Minute), "/audio/with-recording.mp3"); err != nil {
+	if err := store.EndSession("with-recording", started.Add(61*time.Minute), "/audio/with-recording.mp3", ""); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.MergeSessions("merged", []string{"without-recording", "with-recording"}, started, started.Add(2*time.Hour)); err != nil {

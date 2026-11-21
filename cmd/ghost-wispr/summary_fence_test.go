@@ -215,7 +215,7 @@ func TestAnEmptyBatchSummaryLeavesARunStartedSinceRunning(t *testing.T) {
 			t.Fatalf("append segment: %v", err)
 		}
 	}
-	if err := store.EndSession(id, started.Add(2*time.Second), "recording.mp3"); err != nil {
+	if err := store.EndSession(id, started.Add(2*time.Second), "recording.mp3", ""); err != nil {
 		t.Fatalf("end session: %v", err)
 	}
 	segments, err := store.GetSegments(id)
@@ -258,7 +258,7 @@ func TestEmptySummaryWritesStartAtTheDeletionGeneration(t *testing.T) {
 		if err := store.AppendSegment(id, transcribe.Segment{Text: deletedWords, StartTime: 0, EndTime: 1, Timestamp: started}); err != nil {
 			t.Fatal(err)
 		}
-		if err := store.EndSession(id, started.Add(time.Second), "recording.mp3"); err != nil {
+		if err := store.EndSession(id, started.Add(time.Second), "recording.mp3", ""); err != nil {
 			t.Fatal(err)
 		}
 		segments, err := store.GetSegments(id)
@@ -321,7 +321,7 @@ func TestAStaleEmptyCompletionLeavesANewerCompletedSummary(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if err := store.EndSession(id, started.Add(2*time.Second), "recording.mp3"); err != nil {
+	if err := store.EndSession(id, started.Add(2*time.Second), "recording.mp3", ""); err != nil {
 		t.Fatal(err)
 	}
 	_, _, empty, err := readBatchSummarySessions(store, []string{id})
@@ -363,7 +363,7 @@ func TestStartupBackfillCompletesAnEmptySummaryLeftRunning(t *testing.T) {
 	if err := store.CreateSession(id, started); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.EndSession(id, started.Add(time.Second), "recording.mp3"); err != nil {
+	if err := store.EndSession(id, started.Add(time.Second), "recording.mp3", ""); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := store.DB().Exec(`UPDATE sessions SET summary_status = ?, summary_generation = 0 WHERE id = ?`, storage.SummaryRunning, id); err != nil {

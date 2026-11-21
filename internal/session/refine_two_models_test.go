@@ -66,7 +66,7 @@ func twoRecordingSession(t *testing.T, id, modelA, modelB string) (*storage.SQLi
 	if err := store.CreateSession(id, started); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.EndSession(id, started.Add(time.Minute), audioPath); err != nil {
+	if err := store.EndSession(id, started.Add(time.Minute), audioPath, ""); err != nil {
 		t.Fatal(err)
 	}
 	return store, audioPath, started

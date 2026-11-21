@@ -140,7 +140,7 @@ func TestGCKeepsMergedSessionWhenASourceRawIsItsOnlyCopy(t *testing.T) {
 	if err := store.CreateSession("source-b", started.Add(time.Hour)); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.EndSession("source-b", started.Add(time.Hour+time.Minute), ""); err != nil {
+	if err := store.EndSession("source-b", started.Add(time.Hour+time.Minute), "", ""); err != nil {
 		t.Fatal(err)
 	}
 	for _, id := range []string{"source-a", "source-b"} {

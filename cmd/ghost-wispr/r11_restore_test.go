@@ -46,7 +46,7 @@ func TestR11RestoreFindsPreMergeSourceFolder(t *testing.T) {
 	if err := store.CreateSession("source", started); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.EndSession("source", started.Add(time.Minute), path); err != nil {
+	if err := store.EndSession("source", started.Add(time.Minute), path, ""); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := store.DB().Exec(`UPDATE sessions SET gdrive_folder_id = 'source-folder' WHERE id = 'source'`); err != nil {
@@ -112,7 +112,7 @@ func TestR14NestedRestoreUsesOriginalSourceFolders(t *testing.T) {
 		if err := store.CreateSession(id, at); err != nil {
 			t.Fatal(err)
 		}
-		if err := store.EndSession(id, at.Add(time.Minute), path); err != nil {
+		if err := store.EndSession(id, at.Add(time.Minute), path, ""); err != nil {
 			t.Fatal(err)
 		}
 		if _, err := store.DB().Exec(`UPDATE sessions SET gdrive_folder_id = ? WHERE id = ?`, id+"-folder", id); err != nil {
@@ -176,7 +176,7 @@ func TestR12RestoreSkipsLeafFolderWhenMergedFolderHasRecording(t *testing.T) {
 	if err := store.CreateSession("source", started); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.EndSession("source", started.Add(time.Minute), path); err != nil {
+	if err := store.EndSession("source", started.Add(time.Minute), path, ""); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := store.DB().Exec(`UPDATE sessions SET gdrive_folder_id = 'source-folder' WHERE id = 'source'`); err != nil {

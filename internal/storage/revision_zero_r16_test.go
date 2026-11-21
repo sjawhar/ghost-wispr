@@ -17,7 +17,7 @@ func TestRevisionZeroDeleteTextRefusesTimedSegment(t *testing.T) {
 	if err := store.CreateSession("s", started); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.EndSession("s", started.Add(time.Minute), "/audio/s.mp3"); err != nil {
+	if err := store.EndSession("s", started.Add(time.Minute), "/audio/s.mp3", ""); err != nil {
 		t.Fatal(err)
 	}
 	words := []RefinedWord{{RecordingPath: "/audio/s.mp3", RecordingSHA256: "s", Ordinal: 0, Text: "timed words", Start: 0, End: 1}}

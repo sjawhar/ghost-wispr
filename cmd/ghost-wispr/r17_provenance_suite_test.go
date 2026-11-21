@@ -49,7 +49,7 @@ func suiteProvenanceDelete(t *testing.T, refinedFirst bool) string {
 	if err := store.CreateSession(sID, start); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.EndSession(sID, start.Add(time.Minute), sPath); err != nil {
+	if err := store.EndSession(sID, start.Add(time.Minute), sPath, ""); err != nil {
 		t.Fatal(err)
 	}
 	if refinedFirst {
@@ -69,7 +69,7 @@ func suiteProvenanceDelete(t *testing.T, refinedFirst bool) string {
 	if err := store.CreateSession(tID, start.Add(time.Hour)); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.EndSession(tID, start.Add(61*time.Minute), tPath); err != nil {
+	if err := store.EndSession(tID, start.Add(61*time.Minute), tPath, ""); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.MergeSessions("merged", []string{sID, tID}, start, start.Add(2*time.Hour)); err != nil {

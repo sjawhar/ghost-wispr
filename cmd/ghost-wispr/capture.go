@@ -134,7 +134,7 @@ type captureGate struct {
 	checkLightPattern  func() error
 	beforeMicOpen      func(ctx context.Context, closing <-chan struct{}) bool // readies the hardware before a resume's red confirmation; false once closing closes or ctx ends (prepareMicOpen)
 	afterMicStart      func()
-	afterGateOpen      func()
+	afterGateOpen      func()        // ends the red hold an opening's red check took (hardwareControl.ReleaseRedHold), once it opened the gate or opened nothing (openAfter)
 	onLightUnconfirmed func(error)   // a red confirmation for a microphone open failed; must not block
 	lightOffs          func() uint64 // counts the times the recording light was written, or read back, as anything but red; nil without a light
 	lightRedMark       func() uint64 // lightOffs as the light's last red confirmation left it, read under the light's lock
@@ -169,6 +169,7 @@ type captureGate struct {
 	starting        bool          // that Resume's start of the microphone has not finished (finishResume)
 	preparing       bool          // a start waits in beforeMicOpen (prepareMicOpen)
 	closed          bool          // no audio passes the gate
+	stopped         bool          // Stop was called: no opening opens the gate again (openAfter)
 	recordingDue    bool          // the gate opened into recording, and no audio has reached the recording since (onRecording)
 	closings        int           // counts closings, so a Resume left from an earlier one does nothing
 	resumed         chan struct{} // closed while the gate is open
@@ -176,6 +177,10 @@ type captureGate struct {
 	settled         chan struct{} // closed once the latest closing has settled
 	writing         int           // writes that passed the gate and are still running
 	writesDone      *sync.Cond    // signalled (with mu) when a write finishes
+	// stopCtx is the app's context, which ends as the shutdown begins: no
+	// opening opens the gate after that either (stopBegun). Nil for a gate
+	// with none (newCaptureGate); set before the gate is shared.
+	stopCtx context.Context
 	// audioAt is when audio last reached the recording through the gate, or
 	// when a start or gate opening gave it audioStall to begin (armAudio), in
 	// Unix nanoseconds; 0 before the first. While it is older than audioStall,
@@ -700,8 +705,12 @@ func (g *captureGate) startOpening(closing int, settled <-chan struct{}, forLigh
 // present, it takes no light check, and so releases no hold (afterGateOpen).
 // It checks the light's stored pattern (checkLightPattern) before it takes
 // control, so a pause meanwhile takes control at once; the switch it then
-// finds off stops the opening. Once ctx ends (the stop) it stops where it is:
-// it opens nothing, and refuses nothing, which would save the pause state.
+// finds off stops the opening. Once the stop has begun (Stop, or ctx's end)
+// it stops where it is, whatever its light check found: it opens nothing,
+// runs no beforeResume, and refuses nothing, which would save the pause
+// state. It checks for the stop and opens the gate in one step under mu,
+// which Stop takes. An opening that opens nothing after its red check
+// succeeded ends the hold that check took (afterGateOpen).
 func (g *captureGate) openAfter(ctx context.Context, closing int, settled <-chan struct{}, forLight bool) {
 	select {
 	case <-settled:
@@ -719,15 +728,24 @@ func (g *captureGate) openAfter(ctx context.Context, closing int, settled <-chan
 		return
 	}
 	checked := g.beforeGateOpen != nil && !g.captureMissing()
+	// abandon ends an opening that opens nothing; held says its red check
+	// succeeded, and so holds the light red.
+	abandon := func(held bool) {
+		g.control.Unlock()
+		if held && g.afterGateOpen != nil {
+			g.afterGateOpen()
+		}
+	}
 	if checked {
 		err := lightErr
 		if err == nil {
 			err = g.beforeGateOpen()
 		}
-		if err != nil && ctx.Err() != nil {
-			// The stop ran during the light check: the refusal is the
-			// stop's, not the light's, and saves nothing.
-			g.control.Unlock()
+		if g.stopBegun(ctx) {
+			// The stop began during the light check: a refusal is the
+			// stop's, not the light's, and saves nothing; a confirmation
+			// opens nothing.
+			abandon(err == nil)
 			return
 		}
 		if err != nil {
@@ -758,9 +776,9 @@ func (g *captureGate) openAfter(ctx context.Context, closing int, settled <-chan
 	}
 
 	g.mu.Lock()
-	if !g.closed || g.switchOff || g.lightHeld || g.closings != closing {
+	if g.stopBegunLocked(ctx) || !g.closed || g.switchOff || g.lightHeld || g.closings != closing {
 		g.mu.Unlock()
-		g.control.Unlock()
+		abandon(checked)
 		return
 	}
 	g.closed = false
@@ -775,6 +793,31 @@ func (g *captureGate) openAfter(ctx context.Context, closing int, settled <-chan
 	}
 }
 
+// Stop ends the gate's openings for good, as the shutdown begins: an opening
+// under way, whatever its light check finds, opens nothing (openAfter), and
+// no later one starts. It takes mu, under which an opening checks for it and
+// opens the gate in one step. It does not close an open gate: the shutdown's
+// mic loops close the microphone.
+func (g *captureGate) Stop() {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.stopped = true
+}
+
+// stopBegun reports whether the stop has begun for the opening whose context
+// is ctx: Stop has run, the app's context has ended (stopCtx), or ctx has
+// ended (the session manager's stop).
+func (g *captureGate) stopBegun(ctx context.Context) bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.stopBegunLocked(ctx)
+}
+
+// stopBegunLocked is stopBegun for a caller that holds mu.
+func (g *captureGate) stopBegunLocked(ctx context.Context) bool {
+	return g.stopped || ctx.Err() != nil || (g.stopCtx != nil && g.stopCtx.Err() != nil)
+}
+
 // redCheckFailed reports a failed red check: the error sound (R10).
 func (g *captureGate) redCheckFailed() {
 	if g.onRedCheckFailed != nil {
@@ -783,12 +826,12 @@ func (g *captureGate) redCheckFailed() {
 }
 
 // canOpen reports whether openAfter for closing number closing may still open
-// the gate: it is closed, the switch is on, the light does not hold it, and no
-// later closing has happened.
+// the gate: the stop has not begun (Stop), it is closed, the switch is on, the
+// light does not hold it, and no later closing has happened.
 func (g *captureGate) canOpen(closing int) bool {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	return g.closed && !g.switchOff && !g.lightHeld && g.closings == closing
+	return !g.stopped && (g.stopCtx == nil || g.stopCtx.Err() == nil) && g.closed && !g.switchOff && !g.lightHeld && g.closings == closing
 }
 
 func (g *captureGate) confirmMicStart() error {
@@ -1301,9 +1344,9 @@ type deepgramFinalizer interface{ Finalize() error }
 // file that never returns, keeps the microphone off until it recovers or the
 // process restarts; the capture reports resuming, then stalled, meanwhile.
 //
-// At shutdown (ctx ends) the pause stops retrying the session end. The gate
-// may then open, but it lets nothing through: the mic loops drop every buffer
-// written after shutdown began, and end.
+// At shutdown (ctx ends) the pause stops retrying the session end, and the
+// gate's opening opens nothing (stopCtx): the mic loops drop every buffer
+// written after shutdown began anyway, and end.
 func newSessionCaptureGate(ctx context.Context, sessions captureSessions, preroll interface{ DiscardPreroll() }, deepgram func() deepgramFinalizer, finalizeWait, endRetry time.Duration, logf func(string, ...any)) *captureGate {
 	g := newCaptureGate(
 		sessions.PauseCapture,
@@ -1314,6 +1357,7 @@ func newSessionCaptureGate(ctx context.Context, sessions captureSessions, prerol
 		},
 	)
 	g.dropHeldAudio = preroll.DiscardPreroll
+	g.stopCtx = ctx
 	return g
 }
 

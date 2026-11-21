@@ -22,7 +22,7 @@ func TestUntimedDeleteOwesMergedSourceDriveDocuments(t *testing.T) {
 	if err := store.AppendSegment("a", transcribeSegment("private untimed words", 0, started)); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.EndSession("a", started.Add(time.Minute), ""); err != nil {
+	if err := store.EndSession("a", started.Add(time.Minute), "", ""); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.StoreEvent(t.Context(), "live_transcript", `{"type":"live_transcript","session_id":"a","text":"private untimed words","start_time":0,"end_time":1}`); err != nil {
@@ -34,7 +34,7 @@ func TestUntimedDeleteOwesMergedSourceDriveDocuments(t *testing.T) {
 	if err := store.CreateSession("b", started.Add(time.Hour)); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.EndSession("b", started.Add(61*time.Minute), "/audio/b.mp3"); err != nil {
+	if err := store.EndSession("b", started.Add(61*time.Minute), "/audio/b.mp3", ""); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := store.DB().Exec(`UPDATE sessions SET gdrive_folder_id = 'folder-' || id, sync_status = ?, sync_state = ? WHERE id IN ('a', 'b')`, SyncSynced, SyncStateSynced); err != nil {

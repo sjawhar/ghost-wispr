@@ -169,7 +169,7 @@ func TestNoRequestWritesTheStoreAfterTheStop(t *testing.T) {
 		if err := store.AppendSegment(id, transcribe.Segment{Text: "synthetic words, no room audio", StartTime: 0, EndTime: 1, Timestamp: started}); err != nil {
 			t.Fatal(err)
 		}
-		if err := store.EndSession(id, started.Add(time.Minute), path); err != nil {
+		if err := store.EndSession(id, started.Add(time.Minute), path, ""); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -421,7 +421,7 @@ func TestTheStopWaitsForAHandlerThatOutlastsTheHTTPWait(t *testing.T) {
 			if err := db.CreateSession(id, time.Now()); err != nil {
 				t.Fatal(err)
 			}
-			if err := db.EndSession(id, time.Now(), ""); err != nil {
+			if err := db.EndSession(id, time.Now(), "", ""); err != nil {
 				t.Fatal(err)
 			}
 			store := &heldTitleStore{SQLiteStore: db, entered: make(chan struct{}), release: make(chan struct{})}
@@ -497,7 +497,7 @@ func TestAHandlerPastTheShutdownsDeadlineNeverWritesTheClosedStore(t *testing.T)
 	if err := db.CreateSession(id, time.Now()); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.EndSession(id, time.Now(), ""); err != nil {
+	if err := db.EndSession(id, time.Now(), "", ""); err != nil {
 		t.Fatal(err)
 	}
 	store := &heldTitleStore{SQLiteStore: db, entered: make(chan struct{}), release: make(chan struct{}), wrote: make(chan error, 1)}

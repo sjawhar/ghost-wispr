@@ -18,7 +18,7 @@ func TestR10LatestRecordingSHA256UsesInsertionOrder(t *testing.T) {
 	if err := store.CreateSession("session", started); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.EndSession("session", started.Add(time.Minute), "session.mp3"); err != nil {
+	if err := store.EndSession("session", started.Add(time.Minute), "session.mp3", ""); err != nil {
 		t.Fatal(err)
 	}
 	for _, row := range []struct {

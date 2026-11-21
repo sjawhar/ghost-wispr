@@ -68,7 +68,7 @@ func TestANewConciergeCancelsTheQuestionsOfEndedMeetings(t *testing.T) {
 		t.Fatal(err)
 	}
 	r.concierge.Stop()
-	if err := r.store.EndSession("meeting-1", testNow.Add(time.Minute), ""); err != nil {
+	if err := r.store.EndSession("meeting-1", testNow.Add(time.Minute), "", ""); err != nil {
 		t.Fatal(err)
 	}
 	var changed []string

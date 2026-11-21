@@ -88,7 +88,7 @@ func TestADeletedSessionLeavesNoStatusWarningNamingIt(t *testing.T) {
 		if err := store.CreateSession(id, at); err != nil {
 			t.Fatal(err)
 		}
-		if err := store.EndSession(id, at.Add(5*time.Minute), recording); err != nil {
+		if err := store.EndSession(id, at.Add(5*time.Minute), recording, ""); err != nil {
 			t.Fatal(err)
 		}
 	}

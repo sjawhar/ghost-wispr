@@ -39,7 +39,7 @@ func TestAFailedSummaryAfterARefinementKeepsTheLastGoodSummary(t *testing.T) {
 	if err := store.AppendSegment(id, transcribe.Segment{Text: "We agreed to move the launch to Friday.", StartTime: 0, EndTime: 3, Timestamp: started}); err != nil {
 		t.Fatalf("append segment: %v", err)
 	}
-	if err := store.EndSession(id, started.Add(time.Minute), recording); err != nil {
+	if err := store.EndSession(id, started.Add(time.Minute), recording, ""); err != nil {
 		t.Fatalf("end session: %v", err)
 	}
 	const speakers = `{"0":{"name":"Sam","confidence":"high"}}`
@@ -105,7 +105,7 @@ func TestASummaryAnsweredWithNoTextFailsWithItsReason(t *testing.T) {
 	if err := store.AppendSegment(id, transcribe.Segment{Text: "We named the warehouse robot project and agreed to order a machine to clear the yard before the end of the month.", StartTime: 0, EndTime: 9, Timestamp: started}); err != nil {
 		t.Fatalf("append segment: %v", err)
 	}
-	if err := store.EndSession(id, started.Add(time.Minute), ""); err != nil {
+	if err := store.EndSession(id, started.Add(time.Minute), "", ""); err != nil {
 		t.Fatalf("end session: %v", err)
 	}
 	summarizer := summary.New(config.Summarization{Model: "gemini/gemini-4-carbon", Presets: map[string]config.Preset{"default": {

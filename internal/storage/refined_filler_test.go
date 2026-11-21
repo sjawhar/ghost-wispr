@@ -16,7 +16,7 @@ func TestDeleteRefinedBatchOnlyFiller(t *testing.T) {
 	if err := store.CreateSession("s", started); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.EndSession("s", started.Add(time.Minute), "recording.mp3"); err != nil {
+	if err := store.EndSession("s", started.Add(time.Minute), "recording.mp3", ""); err != nil {
 		t.Fatal(err)
 	}
 	words := []RefinedWord{
@@ -52,7 +52,7 @@ func TestDeleteRefinedRepeatedFillerKeepsOtherOccurrence(t *testing.T) {
 	if err := store.CreateSession("s", started); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.EndSession("s", started.Add(time.Minute), "recording.mp3"); err != nil {
+	if err := store.EndSession("s", started.Add(time.Minute), "recording.mp3", ""); err != nil {
 		t.Fatal(err)
 	}
 	words := []RefinedWord{

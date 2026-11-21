@@ -12,7 +12,9 @@ import (
 
 type Store interface {
 	CreateSession(id string, startedAt time.Time) error
-	EndSession(id string, endedAt time.Time, audioPath string) error
+	// EndSession ends the session, and queues the lifecycle event queueEvent,
+	// unless "", in the same write (storage.SQLiteStore.EndSession).
+	EndSession(id string, endedAt time.Time, audioPath, queueEvent string) error
 	DiscardSession(id string) error
 	AppendSegment(sessionID string, seg transcribe.Segment) error
 	GetSegments(sessionID string) ([]transcribe.Segment, error)

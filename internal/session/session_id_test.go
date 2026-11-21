@@ -63,7 +63,7 @@ func endedSession(t *testing.T, store *storage.SQLiteStore, id string, startedAt
 	if err := store.CreateSession(id, startedAt); err != nil {
 		t.Fatalf("create session %s: %v", id, err)
 	}
-	if err := store.EndSession(id, startedAt.Add(time.Minute), recording); err != nil {
+	if err := store.EndSession(id, startedAt.Add(time.Minute), recording, ""); err != nil {
 		t.Fatalf("end session %s: %v", id, err)
 	}
 	sess, err := store.GetSession(id)

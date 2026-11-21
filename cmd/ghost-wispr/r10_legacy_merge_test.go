@@ -56,7 +56,7 @@ func TestR10RecordingSourcesPrecedeLegacyNames(t *testing.T) {
 		t.Fatal(err)
 	}
 	custom := filepath.Join(t.TempDir(), "meeting-recording.mp3")
-	if err := store.EndSession("source-session", started.Add(time.Minute), custom); err != nil {
+	if err := store.EndSession("source-session", started.Add(time.Minute), custom, ""); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.MergeSessions("merged", []string{"source-session"}, started, started.Add(time.Minute)); err != nil {

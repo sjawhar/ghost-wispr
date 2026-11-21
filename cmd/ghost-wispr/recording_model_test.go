@@ -101,7 +101,7 @@ func TestDeletedWordsStayGoneAfterAModelChangeMergeAndCut(t *testing.T) {
 		if err := store.CreateSession(id, started.Add(time.Duration(i)*time.Hour)); err != nil {
 			t.Fatal(err)
 		}
-		if err := store.EndSession(id, started.Add(time.Duration(i)*time.Hour+time.Minute), path); err != nil {
+		if err := store.EndSession(id, started.Add(time.Duration(i)*time.Hour+time.Minute), path, ""); err != nil {
 			t.Fatal(err)
 		}
 	}

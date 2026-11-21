@@ -15,7 +15,7 @@ func TestRefinedWordsKeepTheirModel(t *testing.T) {
 	if err := store.CreateSession("s", started); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.EndSession("s", started.Add(time.Minute), "/rec/a.mp3,/rec/b.mp3"); err != nil {
+	if err := store.EndSession("s", started.Add(time.Minute), "/rec/a.mp3,/rec/b.mp3", ""); err != nil {
 		t.Fatal(err)
 	}
 	words := []RefinedWord{
@@ -65,7 +65,7 @@ func TestRefinedWordsFromBeforeModelsTakeTheirSessionsModel(t *testing.T) {
 	if err := store.CreateSession("s", started); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.EndSession("s", started.Add(time.Minute), "/rec/a.mp3"); err != nil {
+	if err := store.EndSession("s", started.Add(time.Minute), "/rec/a.mp3", ""); err != nil {
 		t.Fatal(err)
 	}
 	words := []RefinedWord{{RecordingPath: "/rec/a.mp3", RecordingSHA256: "a", Ordinal: 0, Text: "Hello.", Start: 0, End: 0.5}}

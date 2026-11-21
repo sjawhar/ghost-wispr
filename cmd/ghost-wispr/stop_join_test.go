@@ -334,7 +334,7 @@ func TestAShutdownWaitsForAConciergeStartUnderWay(t *testing.T) {
 	if err := store.CreateSession("ended", at); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.EndSession("ended", at.Add(time.Minute), ""); err != nil {
+	if err := store.EndSession("ended", at.Add(time.Minute), "", ""); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.CreateVoiceTask(&storage.VoiceTask{ID: "q1", SessionID: "ended", AskedAt: at, Holder: "session:agent-7"}); err != nil {

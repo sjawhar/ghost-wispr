@@ -59,7 +59,7 @@ func TestGCRemovesRecordingsOnlyAfterDriveContentVerification(t *testing.T) {
 					t.Fatalf("write recording: %v", err)
 				}
 				createSession(t, store, id, policy.started)
-				if err := store.EndSession(id, policy.started.Add(time.Minute), recording); err != nil {
+				if err := store.EndSession(id, policy.started.Add(time.Minute), recording, ""); err != nil {
 					t.Fatalf("end session: %v", err)
 				}
 				if err := store.UpdateSummaryAtGeneration(id, "", "A summary.", storage.SummaryCompleted, "default", "{}", "", 0); err != nil {
