@@ -758,6 +758,15 @@ def react(kind, key, start, end):
             speech(tag, end + 700, 2300, fact=end + 1900)
         else:
             length = ANSWER_CEILING_MS if "answer-until-clip" in SCENARIO else 7000 if "long" in SCENARIO else 1500 if "short" in SCENARIO else 600
+            # stop-rounds-N: the step asks N questions to stop each answer (playback-cancel's
+            # --stops N), and only then the questions whose answers it plays to their end. Each of
+            # the first N answers plays until its stop clip ends it, ANSWER_CEILING_MS at most, so
+            # that a driver its machine holds up still plays the stop into speech; the rest end by
+            # themselves.
+            rounds = next((int(t[len("stop-rounds-"):]) for t in SCENARIO if t.startswith("stop-rounds-")), 0)
+            asked = voice_state(lambda s: s.__setitem__("questions", s.get("questions", 0) + 1) or s["questions"])
+            if asked <= rounds:
+                length = ANSWER_CEILING_MS
             speech(tag, end + 700, length)
         if "go-ahead" in SCENARIO:
             emit(kind="ws", due=end + 1500, event={"type": "voice_answer_ready", "session_id": "session-1"})
@@ -1563,10 +1572,18 @@ measured() {
   sed -n "s/^\(PASS\|FAIL\): $2 \(-\{0,1\}[0-9][0-9]*\) ms.*/\2/p" "$root/$1/out" | head -n 1
 }
 
+# expect_between NAME GOT LOW HIGH: GOT is a number of milliseconds from LOW to HIGH. NAME starts
+# with its case's name; when GOT is missing or out of range, the message also gives that case's
+# output and the fake's stops.log, since a tail that was never measured can have any cause, and an
+# unrelated FAIL may already have given the case its expected exit status.
 expect_between() {
-  local name=$1 got=$2 low=$3 high=$4
+  local name=$1 got=$2 low=$3 high=$4 case=${1%%:*} more=
   if ! [[ $got =~ ^-?[0-9]+$ ]] || ((got < low || got > high)); then
-    check_failed "$name: measured ${got:-nothing} ms, want $low to $high ms"
+    if [[ -f $root/$case/out ]]; then
+      [[ -s $root/$case/state/stops.log ]] && more=" the fake's stops: $(tr '\n' '|' <"$root/$case/state/stops.log");"
+      more="$more output: $(tr '\n' '|' <"$root/$case/out")"
+    fi
+    check_failed "$name: measured ${got:-nothing} ms, want $low to $high ms${more:+;$more}"
   fi
 }
 
@@ -1703,84 +1720,89 @@ launch barge-backchannel-late answer-until-clip,backchannel-stops,late-clip yes 
 # 60 ms behind, the words 150 ms and 1.1 s on, and the word well before the chime) records with an
 # arecord whose first sample is stamped at its fork (arecord-prompt): the early bound counts from
 # before the driver starts arecord, so a fake stamped once a loaded machine got round to starting
-# it would turn its FAIL into UNKNOWN.
+# it would turn its FAIL into UNKNOWN. Every case asks two stop rounds (--stops 2) and tells the fake
+# so (stop-rounds-2): each round's answer then plays until its stop arrives, however late the driver
+# plays the stop. A stop played after a 7 s answer's natural end, as a driver held up by its machine
+# plays it (cancel-late-stop, with late-clip), still stops speech and is timed.
 readonly cancel_args="--step playback-cancel --stops 2 --playback-seconds 3 --question @question.wav --stop-clip @stop.wav --rig-mic $rig --event-timeout 15"
 # shellcheck disable=SC2086
-launch cancel long,asound yes -- $cancel_args
+launch cancel long,asound,stop-rounds-2 yes -- $cancel_args
 # shellcheck disable=SC2086
-launch cancel-rewind long,asound,rewind yes -- $cancel_args
+launch cancel-late-stop long,asound,stop-rounds-2,late-clip yes -- $cancel_args
 # shellcheck disable=SC2086
-launch cancel-slow-status long,asound,slow-status yes -- $cancel_args
+launch cancel-rewind long,asound,stop-rounds-2,rewind yes -- $cancel_args
 # shellcheck disable=SC2086
-launch cancel-tail long,asound,tail-50 yes -- $cancel_args
+launch cancel-slow-status long,asound,stop-rounds-2,slow-status yes -- $cancel_args
+# shellcheck disable=SC2086
+launch cancel-tail long,asound,stop-rounds-2,tail-50 yes -- $cancel_args
 # The word 150 ms on, recorded by an arecord stamped at its fork: FAIL, even at its early bound; by
 # one that starts late: UNKNOWN, never FAIL or PASS; and by one stamped at its fork though the fake
 # runs late: FAIL still, so a stamp that slips back to the fake's own start fails here on a machine
 # with no load, not only on a loaded one.
 # shellcheck disable=SC2086
-launch cancel-leak long,asound,leak-150,arecord-prompt yes -- $cancel_args
+launch cancel-leak long,asound,stop-rounds-2,leak-150,arecord-prompt yes -- $cancel_args
 # shellcheck disable=SC2086
-launch cancel-leak-unsure long,asound,leak-150,arecord-slow-start yes -- $cancel_args
+launch cancel-leak-unsure long,asound,stop-rounds-2,leak-150,arecord-slow-start yes -- $cancel_args
 # shellcheck disable=SC2086
-launch cancel-leak-stalled long,asound,leak-150,arecord-prompt,arecord-slow-start yes -- $cancel_args
+launch cancel-leak-stalled long,asound,stop-rounds-2,leak-150,arecord-prompt,arecord-slow-start yes -- $cancel_args
 # shellcheck disable=SC2086
-launch cancel-leak-late long,asound,leak-1100,arecord-prompt yes -- $cancel_args
+launch cancel-leak-late long,asound,stop-rounds-2,leak-1100,arecord-prompt yes -- $cancel_args
 # shellcheck disable=SC2086
-launch cancel-leak-quiet long,asound,leak-after-quiet yes -- $cancel_args
+launch cancel-leak-quiet long,asound,stop-rounds-2,leak-after-quiet yes -- $cancel_args
 # shellcheck disable=SC2086
-launch cancel-leak-chime long,asound,leak-before-chime,arecord-prompt yes -- $cancel_args
+launch cancel-leak-chime long,asound,stop-rounds-2,leak-before-chime,arecord-prompt yes -- $cancel_args
 # shellcheck disable=SC2086
-launch cancel-leak-apart-chime long,asound,leak-apart-chime yes -- $cancel_args
+launch cancel-leak-apart-chime long,asound,stop-rounds-2,leak-apart-chime yes -- $cancel_args
 # shellcheck disable=SC2086
-launch cancel-leak-into-chime long,asound,leak-into-chime yes -- $cancel_args
+launch cancel-leak-into-chime long,asound,stop-rounds-2,leak-into-chime yes -- $cancel_args
 # shellcheck disable=SC2086
-launch cancel-leak-after-chime long,asound,leak-after-chime yes -- $cancel_args
+launch cancel-leak-after-chime long,asound,stop-rounds-2,leak-after-chime yes -- $cancel_args
 # shellcheck disable=SC2086
-launch cancel-quiet-chime long,asound,quiet-chime yes -- $cancel_args
+launch cancel-quiet-chime long,asound,stop-rounds-2,quiet-chime yes -- $cancel_args
 # shellcheck disable=SC2086
-launch cancel-leak-into-quiet-chime long,asound,quiet-chime,leak-into-quiet-chime yes -- $cancel_args
+launch cancel-leak-into-quiet-chime long,asound,stop-rounds-2,quiet-chime,leak-into-quiet-chime yes -- $cancel_args
 # shellcheck disable=SC2086
-launch cancel-long-wake long,asound,long-wake yes -- $cancel_args
+launch cancel-long-wake long,asound,stop-rounds-2,long-wake yes -- $cancel_args
 # shellcheck disable=SC2086
-launch cancel-long-wake-leak long,asound,long-wake,leak-into-chime yes -- $cancel_args
+launch cancel-long-wake-leak long,asound,stop-rounds-2,long-wake,leak-into-chime yes -- $cancel_args
 # shellcheck disable=SC2086
-launch cancel-sound-missing long,asound,sound-missing yes -- $cancel_args
+launch cancel-sound-missing long,asound,stop-rounds-2,sound-missing yes -- $cancel_args
 # shellcheck disable=SC2086
-launch cancel-clock-fast long,asound,clock-fast yes -- $cancel_args
+launch cancel-clock-fast long,asound,stop-rounds-2,clock-fast yes -- $cancel_args
 # shellcheck disable=SC2086
-launch cancel-clock-slow long,asound,clock-slow yes -- $cancel_args
+launch cancel-clock-slow long,asound,stop-rounds-2,clock-slow yes -- $cancel_args
 # shellcheck disable=SC2086
-launch cancel-tail-21-fast long,asound,clock-fast,tail-21 yes -- $cancel_args
+launch cancel-tail-21-fast long,asound,stop-rounds-2,clock-fast,tail-21 yes -- $cancel_args
 # shellcheck disable=SC2086
-launch cancel-recorder-dies long,asound,arecord-dies yes -- $cancel_args
+launch cancel-recorder-dies long,asound,stop-rounds-2,arecord-dies yes -- $cancel_args
 # shellcheck disable=SC2086
-launch cancel-no-chime long,asound,no-chime-after-stop yes -- $cancel_args
+launch cancel-no-chime long,asound,stop-rounds-2,no-chime-after-stop yes -- $cancel_args
 # shellcheck disable=SC2086
-launch cancel-no-wake long,asound,no-wake-after-stop yes -- $cancel_args
+launch cancel-no-wake long,asound,stop-rounds-2,no-wake-after-stop yes -- $cancel_args
 # shellcheck disable=SC2086
-launch cancel-drain long,asound,drain,arecord-prompt yes -- $cancel_args
+launch cancel-drain long,asound,stop-rounds-2,drain,arecord-prompt yes -- $cancel_args
 # shellcheck disable=SC2086
-launch cancel-underrun long,asound,underrun yes -- $cancel_args
+launch cancel-underrun long,asound,stop-rounds-2,underrun yes -- $cancel_args
 # shellcheck disable=SC2086
-launch cancel-xrun long,asound,xrun yes -- $cancel_args
+launch cancel-xrun long,asound,stop-rounds-2,xrun yes -- $cancel_args
 # A recorder that writes 60 ms behind for the whole recording: a good cancel, whose true tail is
 # within the bound but whose measured tail is not, is UNKNOWN, not FAIL; a drain, whose tail is over
 # even at its early bound, is FAIL.
 # shellcheck disable=SC2086
-launch cancel-behind long,asound,arecord-behind yes -- $cancel_args
+launch cancel-behind long,asound,stop-rounds-2,arecord-behind yes -- $cancel_args
 # shellcheck disable=SC2086
-launch cancel-behind-drain long,asound,arecord-behind,drain,arecord-prompt yes -- $cancel_args
+launch cancel-behind-drain long,asound,stop-rounds-2,arecord-behind,drain,arecord-prompt yes -- $cancel_args
 # A wc whose sizes come 200 ms late: the recording's anchors read their size without it, so a good
 # cancel still passes.
 # shellcheck disable=SC2086
-launch cancel-slow-wc long,asound,slow-wc yes -- $cancel_args
+launch cancel-slow-wc long,asound,stop-rounds-2,slow-wc yes -- $cancel_args
 # shellcheck disable=SC2086
-launch cancel-journal-error long,asound,late-journal-error yes -- $cancel_args
+launch cancel-journal-error long,asound,stop-rounds-2,late-journal-error yes -- $cancel_args
 # A service that gets to each stop request 7 s after it is due (late-apply), as a loaded machine can
 # hold it: the stop comes 0.9 to 3.2 s into a 7 s answer, so the apply lands after the answer's
 # natural end. A good cancel still passes, since an answer with a stop waiting does not end by itself.
 # shellcheck disable=SC2086
-launch cancel-late-apply long,asound,late-apply yes -- $cancel_args
+launch cancel-late-apply long,asound,stop-rounds-2,late-apply yes -- $cancel_args
 
 # tts-first-audio: a pass with the gemini-clip control; a control too close to tell (the negative
 # control); Aura without mip_opt_out; a build without the subcommand.
@@ -2244,6 +2266,14 @@ expect_line cancel 'NOTE: playback-cancel: the speaker logged 2 cancels: 0 by re
 expect_line cancel 'PASS: playback-cancel: 0 underruns over '
 expect_line cancel 'can miss a short underrun'
 expect_restored cancel
+# A stop played after a 7 s answer's natural end (late-clip holds the read that first shows each
+# answer's first_audio for 7 s): still played into speech, stopped and timed, as in cancel. The fake
+# held at least the two stop rounds' reads.
+expect_rc cancel-late-stop 0
+expect_line cancel-late-stop "PASS: playback-cancel: no stop's speech was heard at the rig microphone 20 ms after it"
+held=$(cat "$root/cancel-late-stop/state/late-clip.log" 2>/dev/null | grep -c .)
+((held >= 2)) || check_failed "cancel-late-stop: the fake held up $held reads, want at least the 2 stop rounds'"
+expect_restored cancel-late-stop
 expect_rc cancel-rewind 0
 expect_line cancel-rewind "PASS: playback-cancel: no stop's speech was heard at the rig microphone 20 ms after it"
 expect_line cancel-rewind 'NOTE: playback-cancel: the speaker logged 2 cancels: 2 by rewind, 0 by drop'
