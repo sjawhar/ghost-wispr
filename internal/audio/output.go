@@ -224,8 +224,9 @@ type outputInput struct {
 	pushes uint64
 
 	speaking  bool
-	cancelled bool // Cancel silenced its speech: the mixer takes it back and ends it
-	cut       bool // Cancel dropped audio of the speech still queued
+	cancelled bool      // Cancel silenced its speech: the mixer takes it back and ends it
+	cancelAt  time.Time // when the first Cancel of the speech came
+	cut       bool      // Cancel dropped audio of the speech still queued
 	// startFrame is the frame that holds its speech's first audio, which the
 	// speech starts with once the stream has taken it (wrote); startPending
 	// says it has not yet, and startedAt is when it did.
@@ -540,7 +541,10 @@ func (o *Output) Cancel(input string) {
 	in.end(ErrCancelled)
 	if in.speaking {
 		// A second Cancel before the mixer takes the first in finds nothing
-		// queued: it keeps the first one's cut and playback.
+		// queued: it keeps the first one's cut, playback and time.
+		if !in.cancelled {
+			in.cancelAt = time.Now()
+		}
 		in.cancelled, in.cut = true, in.cut || cut
 		if in.silenced == nil {
 			in.silenced = last
@@ -1091,7 +1095,10 @@ func (o *Output) wrote(seq uint64, at time.Time) {
 		if in.endPending && in.endFrame <= seq {
 			o.emitEndLocked(in, now)
 		}
-		if in.startPending && in.startFrame <= seq && !in.cancelled {
+		// A speech whose first audio the stream took before a Cancel came
+		// started, however late the mixer records it; one Cancel cut while
+		// the stream held that audio never started.
+		if in.startPending && in.startFrame <= seq && (!in.cancelled || in.cancelAt.After(at)) {
 			in.startPending, in.startedAt = false, now
 			o.emit(SpeechEvent{Input: in.name, Started: true, At: now})
 		}
@@ -1167,7 +1174,12 @@ func (o *Output) mixFrame(frame []int16, sum []float32, rate, hist int, now time
 					break
 				}
 			}
-			in.lastFrame, in.quietAt = o.mixed, time.Time{}
+			// A frame holds the speech's audio if that audio reaches into it:
+			// a filter flush that rounds to silence does not move its end.
+			if in.audioTo > o.pos {
+				in.lastFrame = o.mixed
+			}
+			in.quietAt = time.Time{}
 			active = true
 		}
 		for i, c := range in.contrib {
@@ -1300,7 +1312,7 @@ func (o *Output) endSpeech(in *outputInput, now time.Time, cancelled bool) {
 			in.endFrame = in.lastFrame
 		}
 	}
-	in.speaking, in.startPending, in.cancelled, in.cut, in.silenced, in.spoken, in.quietAt = false, false, false, false, nil, playedTime{}, time.Time{}
+	in.speaking, in.startPending, in.cancelled, in.cancelAt, in.cut, in.silenced, in.spoken, in.quietAt = false, false, false, time.Time{}, false, nil, playedTime{}, time.Time{}
 }
 
 func clip(s float32) int16 {

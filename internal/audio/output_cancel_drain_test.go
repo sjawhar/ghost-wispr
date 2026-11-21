@@ -823,3 +823,159 @@ func TestAReplayOfAResampledTailStampsTheSpeechsEnd(t *testing.T) {
 		})
 	}
 }
+
+// underrunAfterFirstWrite is a stream whose first write sends when it
+// returned, and that reports an underrun from then on, so the Output calls
+// its Underrun callback right after that write and before it records it.
+type underrunAfterFirstWrite struct {
+	writes int // only the mixer touches it
+	first  chan time.Time
+}
+
+func (s *underrunAfterFirstWrite) Write([]int16) error {
+	if s.writes++; s.writes == 1 {
+		s.first <- time.Now()
+	}
+	return nil
+}
+
+func (s *underrunAfterFirstWrite) underruns() int   { return min(s.writes, 1) }
+func (*underrunAfterFirstWrite) Drop() (int, error) { return 0, nil }
+func (*underrunAfterFirstWrite) Close() error       { return nil }
+
+// TestAStartTheStreamTookBeforeACancelIsReported fails if a speech whose
+// first audio the stream took reports no start, and so no end either, when a
+// Cancel came after the stream took it but before the mixer recorded that:
+// the speech was taken for one Cancel cut while the stream held its audio
+// (Sol's review of #133 at 4238ad3). The Underrun callback, called between
+// the write's return and its record, holds the mixer there, and the cut end
+// must follow. The control has no Cancel, and its speech starts and ends.
+func TestAStartTheStreamTookBeforeACancelIsReported(t *testing.T) {
+	for _, early := range []bool{false, true} {
+		t.Run(fmt.Sprintf("the Cancel before the record %v", early), func(t *testing.T) {
+			stream := &underrunAfterFirstWrite{first: make(chan time.Time, 1)}
+			barrier := newProbeBarrier()
+			out := NewOutput(OutputConfig{Open: func(string) (PlaybackStream, int, error) { return stream, 48000, nil }, Underrun: barrier.hold})
+			t.Cleanup(func() { _ = out.Close() })
+			t.Cleanup(barrier.unblock)
+			events := make(chan SpeechEvent, 16)
+			defer out.OnSpeech(func(e SpeechEvent) { events <- e })()
+			pb := out.Begin(InputVoice)
+			// 100 ms, all queued before the stream takes the first frame, so a
+			// Cancel while the mixer is held cuts audio still queued.
+			ctx := testContext(t)
+			if err := pb.WriteAll(ctx, constant(48000, 100*time.Millisecond, 1000), mono48k); err != nil {
+				t.Fatal(err)
+			}
+			probeWait(t, barrier.entered, "the Underrun callback after the first write returned")
+			took := <-stream.first
+			if early {
+				out.Cancel(InputVoice)
+			}
+			barrier.unblock()
+			var first SpeechEvent
+			select {
+			case first = <-events:
+			case <-time.After(time.Second):
+				t.Fatal("the speech reported no start, though the stream took its first audio before the Cancel")
+			}
+			if !first.Started || first.At.Before(took) {
+				t.Fatalf("the first event is %+v, want a start at or after %v", first, took)
+			}
+			end := probeVoiceEvent(t, events, false)
+			if end.Cancelled != early {
+				t.Fatalf("the end is %+v, want cancelled %v", end, early)
+			}
+		})
+	}
+}
+
+// TestAFilterFlushOfSilenceDoesNotMoveTheSpeechsEnd fails if a speech of
+// 24 kHz audio on a 48 kHz stream, whose filter flush reaches a frame that
+// rounds entirely to silence, is stamped ended when the stream took that
+// silent frame: the speech's end moved past its last audio by however long
+// the device held that write (Sol's review of #133 at 4238ad3: 161 ms with
+// 209 samples). The 240-sample control's flush frame holds audible samples,
+// so the end is that frame's. Either way the end comes after the stream took
+// the last audible write and before the first silent one began.
+func TestAFilterFlushOfSilenceDoesNotMoveTheSpeechsEnd(t *testing.T) {
+	for _, n := range []int{240, 209} {
+		t.Run(fmt.Sprintf("%d samples", n), func(t *testing.T) {
+			s := &ordinaryEndStream{held: make(chan struct{}), release: make(chan struct{})}
+			gate := make(chan struct{})
+			out := NewOutput(OutputConfig{Open: func(string) (PlaybackStream, int, error) {
+				<-gate
+				return s, 48000, nil
+			}})
+			open, release := sync.OnceFunc(func() { close(gate) }), sync.OnceFunc(func() { close(s.release) })
+			t.Cleanup(func() {
+				release()
+				open()
+				_ = out.Close()
+			})
+			events := make(chan SpeechEvent, 4)
+			defer out.OnSpeech(func(e SpeechEvent) { events <- e })()
+			signal := make([]int16, n)
+			for i := range signal {
+				signal[i] = 10000
+			}
+			ctx := testContext(t)
+			if err := out.Begin(InputVoice).Write(ctx, pcm16Bytes(signal), AudioFormat{SampleRate: 24000, Channels: 1, Encoding: EncodingPCM16}); err != nil {
+				t.Fatal(err)
+			}
+			open()
+			probeWait(t, s.held, "the first write that is all silence")
+			time.Sleep(150 * time.Millisecond)
+			release()
+			probeVoiceEvent(t, events, true)
+			end := probeVoiceEvent(t, events, false)
+			s.mu.Lock()
+			lastVoice, silent := s.lastVoice, s.firstSilent
+			s.mu.Unlock()
+			if lastVoice.IsZero() || !silent.After(lastVoice) || end.Cancelled {
+				t.Fatalf("control: the last audible write returned at %v, the first silent one began at %v, the end %+v", lastVoice, silent, end)
+			}
+			if end.At.Before(lastVoice) || !end.At.Before(silent) {
+				t.Fatalf("the speech ended %v after its last audible write, %v after the first silent write began", end.At.Sub(lastVoice).Round(time.Millisecond), end.At.Sub(silent).Round(time.Millisecond))
+			}
+		})
+	}
+}
+
+// TestAPartialTakeBackCountsTheDelayedSampleCentres fails if a Cancel whose
+// take-back covers only the second of two frames takes off what that frame
+// held at no delay, not the queued samples whose output it holds after the
+// resampler's delay: at 24 kHz the second frame holds the last 224 of the
+// 240 samples' centres (Sol's review of #133 at 4238ad3 found the take-back
+// test giving back all of a speech, so it could not tell). The control's
+// audio is at the stream's rate, where the second frame holds the last
+// 10 ms.
+func TestAPartialTakeBackCountsTheDelayedSampleCentres(t *testing.T) {
+	for _, rate := range []int{48000, 24000} {
+		t.Run(fmt.Sprintf("input %d Hz", rate), func(t *testing.T) {
+			o := &Output{inputs: map[string]*outputInput{}, wake: make(chan struct{}, 1), eventWake: make(chan struct{}, 1), listeners: map[int]func(SpeechEvent){}}
+			p := o.Begin(InputVoice)
+			ctx := testContext(t)
+			if err := p.Write(ctx, constant(rate, 10*time.Millisecond, 10000), AudioFormat{SampleRate: rate, Channels: 1}); err != nil {
+				t.Fatal(err)
+			}
+			frame, sum := make([]int16, 480), make([]float32, 480)
+			for range 2 {
+				o.mixFrame(frame, sum, 48000, 4800, time.Now())
+				o.wrote(o.mixed, time.Now())
+			}
+			if got := p.Played(); got != 10*time.Millisecond {
+				t.Fatalf("control: before the take-back the playback played %v", got)
+			}
+			o.Cancel(InputVoice)
+			o.retake(make([]int16, 480), sum) // the second frame only
+			want := 10 * time.Millisecond
+			if rate == 24000 {
+				want = 224 * time.Second / 24000
+			}
+			if got := p.Played(); got < want-time.Nanosecond || got > want+time.Nanosecond {
+				t.Fatalf("after taking back the second frame the playback played %v, want %v", got, want)
+			}
+		})
+	}
+}

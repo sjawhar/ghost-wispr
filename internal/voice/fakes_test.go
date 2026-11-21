@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"runtime"
 	"slices"
 	"strings"
 	"sync"
@@ -1057,6 +1058,73 @@ func TestHoldEventsStopsTheFakeSpeakersOwnDelivery(t *testing.T) {
 	}
 	s.FlushSpeech()
 	if !delivered("after") {
+		t.Fatal("control: FlushSpeech did not deliver the held event")
+	}
+}
+
+// TestAHoldAfterTheDeliveryWaitsOnItsLockHoldsTheEvent fails if the fake
+// speaker's own delivery, already past its barrier and waiting on deliverMu
+// when holdEvents is called, then hands out an event queued during the hold:
+// a delivery that read the hold before waiting on the lock still held its
+// stale answer (Sol's review of #133 at 4238ad3 found the barrier test alone
+// blind to that order). The test waits until the delivery's goroutine is
+// seen blocked in deliver on a mutex; a stack that never shows it is a
+// failed control, not a pass.
+func TestAHoldAfterTheDeliveryWaitsOnItsLockHoldsTheEvent(t *testing.T) {
+	s := newFakeSpeaker()
+	var mu sync.Mutex
+	after := false
+	defer s.OnSpeech(func(e audio.SpeechEvent) {
+		mu.Lock()
+		defer mu.Unlock()
+		if e.Input == "after" {
+			after = true
+		}
+	})()
+	delivered := func() bool { mu.Lock(); defer mu.Unlock(); return after }
+	b := &deliveryBarrier{entered: make(chan struct{}), release: make(chan struct{}), returned: make(chan struct{})}
+	letGo := sync.OnceFunc(func() { close(b.release) })
+	t.Cleanup(letGo)
+	s.mu.Lock()
+	s.barrier = b
+	s.mu.Unlock()
+	s.deliverMu.Lock()
+	unlock := sync.OnceFunc(s.deliverMu.Unlock)
+	t.Cleanup(unlock)
+	s.emit(audio.SpeechEvent{Input: "before", Started: true})
+	select {
+	case <-b.entered:
+	case <-time.After(testWait):
+		t.Fatal("control: the speaker's own delivery never began")
+	}
+	letGo()
+	eventually(t, "the speaker's own delivery to wait on deliverMu", func() bool {
+		buf := make([]byte, 1<<20)
+		n := runtime.Stack(buf, true)
+		if n == len(buf) {
+			t.Fatal("control: the goroutine stacks were cut short")
+		}
+		for _, g := range strings.Split(string(buf[:n]), "\n\n") {
+			if strings.Contains(g, "(*fakeSpeaker).deliver(") && strings.Contains(g, "SemacquireMutex") {
+				return true
+			}
+		}
+		return false
+	})
+	release := s.holdEvents()
+	defer release()
+	s.emit(audio.SpeechEvent{Input: "after", Started: true})
+	unlock()
+	select {
+	case <-b.returned:
+	case <-time.After(testWait):
+		t.Fatal("control: the speaker's own delivery never returned")
+	}
+	if delivered() {
+		t.Fatal("the speaker's own delivery handed out an event queued during the hold")
+	}
+	s.FlushSpeech()
+	if !delivered() {
 		t.Fatal("control: FlushSpeech did not deliver the held event")
 	}
 }

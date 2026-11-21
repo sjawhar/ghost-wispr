@@ -371,6 +371,7 @@ type exchange struct {
 	turnAt         time.Time // when the turn was handed to the Concierge
 	notified       map[string]bool
 	idle           *time.Timer // a driving voice's idle wait
+	idleGen        int         // a superseded idle wait's callback finds it changed
 	// A driving voice's follow-up window: armed when its speech ends, unless
 	// a barge-in cut it; a person's word disarms it (R10).
 	followUpTimer *time.Timer
@@ -1200,6 +1201,17 @@ func (ex *exchange) talksOver(at time.Time) bool {
 	return false
 }
 
+// spanBefore returns the last span of ex's voice that began before at: the
+// speech a word said at at was heard in, or heard just after.
+func (ex *exchange) spanBefore(at time.Time) (span, bool) {
+	for i := len(ex.played) - 1; i >= 0; i-- {
+		if at.After(ex.played[i].from) {
+			return ex.played[i], true
+		}
+	}
+	return span{}, false
+}
+
 // startLocked opens an exchange on a wake: the wake chime, the voice, and a
 // tap of room audio from the wake word on. A notification sound gives way to
 // the wake first, and sounds again after it, whether or not the exchange then
@@ -1431,14 +1443,21 @@ func (s *Supervisor) touchLocked(ex *exchange) {
 	if ex.idle != nil {
 		ex.idle.Stop()
 	}
-	ex.idle = time.AfterFunc(s.cfg.IdleWait, func() { s.idleWaited(ex) })
+	ex.idleGen++
+	gen := ex.idleGen
+	ex.idle = time.AfterFunc(s.cfg.IdleWait, func() { s.idleWaited(ex, gen) })
 }
 
-// idleWaited ends an exchange nobody and nothing spoke in for IdleWait.
-func (s *Supervisor) idleWaited(ex *exchange) {
+// idleWaited ends an exchange nobody and nothing spoke in for IdleWait, if
+// its idle wait gen is still the current one: a Stop cannot recall a
+// callback already under way when touchLocked began a new wait. It first
+// takes in the speaker's queued speech events, so a speech that began just
+// before counts though its delivery waits.
+func (s *Supervisor) idleWaited(ex *exchange, gen int) {
+	s.cfg.Speaker.FlushSpeech()
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.ex != ex || ex.ended {
+	if s.ex != ex || ex.ended || ex.idleGen != gen {
 		return
 	}
 	if s.voiceSpeaking || ex.toolCalls > 0 {
@@ -1490,8 +1509,11 @@ func (s *Supervisor) disarmFollowUpLocked(ex *exchange) {
 	}
 }
 
-// driverFollowUpWaited ends ex when nobody spoke in its follow-up window.
+// driverFollowUpWaited ends ex when nobody spoke in its follow-up window. It
+// first takes in the speaker's queued speech events, so a speech that began
+// just before counts though its delivery waits.
 func (s *Supervisor) driverFollowUpWaited(ex *exchange, gen int) {
+	s.cfg.Speaker.FlushSpeech()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.ex != ex || ex.ended || ex.followUpGen != gen || s.voiceSpeaking || ex.toolCalls > 0 {
@@ -2256,12 +2278,13 @@ func (s *Supervisor) onSpeech(e audio.SpeechEvent) {
 }
 
 // addOwnLocked keeps the words of text, which Wispr speaks, for the own-speech
-// filter. It forgets the words of lines said more than ownWordsKept ago, but
-// not while the exchange holding the floor keeps a span its voice played in
-// that a word matched against them could have been said in: a word said in a
-// span is matched against the lines said up to ownWordsKept before it
-// (ownSetLocked), and an echo of an old speech, however late its result,
-// must still be found its own.
+// filter. It forgets the words of lines said more than ownWordsKept before
+// now, or before the exchange holding the floor began, or its latest cut, or
+// its oldest span, whichever is earliest: a word said in a span is matched
+// against the lines said up to ownWordsKept before that span began
+// (ownSetLocked), a span can begin with its start event still queued, and an
+// echo of an old speech, however late its result, must still be found its
+// own.
 func (s *Supervisor) addOwnLocked(text string, now time.Time) {
 	words := map[string]bool{}
 	for _, w := range strings.Fields(text) {
@@ -2269,12 +2292,20 @@ func (s *Supervisor) addOwnLocked(text string, now time.Time) {
 			words[n] = true
 		}
 	}
-	horizon := now.Add(-ownWordsKept)
-	if s.ex != nil && len(s.ex.played) > 0 {
-		if h := s.ex.played[0].from.Add(-ownWordsKept); h.Before(horizon) {
-			horizon = h
+	base := now
+	if ex := s.ex; ex != nil {
+		from := ex.wakeAt
+		if ex.cutAt.After(from) {
+			from = ex.cutAt
+		}
+		if len(ex.played) > 0 && ex.played[0].from.Before(from) {
+			from = ex.played[0].from
+		}
+		if !from.IsZero() && from.Before(base) {
+			base = from
 		}
 	}
+	horizon := base.Add(-ownWordsKept)
 	kept := s.own[:0]
 	for _, o := range s.own {
 		if o.at.After(horizon) {
@@ -2285,17 +2316,27 @@ func (s *Supervisor) addOwnLocked(text string, now time.Time) {
 	s.own = kept
 }
 
-// ownSetLocked returns Wispr's recent words if words said at said, by when
-// they were captured (Transcript.saidBy), could be its speech heard back: it
-// was speaking, or had stopped less than echoHold before; else nil.
+// ownSetLocked returns the words of Wispr's lines that words said at said,
+// by when they were captured (Transcript.saidBy), could be heard back from:
+// if it was speaking, or had stopped less than echoHold before; else nil. A
+// word said in, or just after, a speech of the exchange holding the floor
+// matches the lines said from ownWordsKept before that speech began until
+// it ended, however long it played: a line said after it ended was not in
+// it. A word said where no span is kept, as after a cut, matches the lines
+// said up to ownWordsKept before it.
 func (s *Supervisor) ownSetLocked(said time.Time) map[string]bool {
-	now := said
-	if !s.voiceSpeaking && now.Sub(s.voiceEnded) >= echoHold {
+	if !s.voiceSpeaking && said.Sub(s.voiceEnded) >= echoHold {
 		return nil
+	}
+	from, until := said.Add(-ownWordsKept), time.Time{}
+	if s.ex != nil {
+		if sp, ok := s.ex.spanBefore(said); ok {
+			from, until = sp.from.Add(-ownWordsKept), sp.to
+		}
 	}
 	set := map[string]bool{}
 	for _, o := range s.own {
-		if now.Sub(o.at) < ownWordsKept {
+		if o.at.After(from) && (until.IsZero() || o.at.Before(until)) {
 			for w := range o.words {
 				set[w] = true
 			}
