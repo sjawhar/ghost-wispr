@@ -493,17 +493,19 @@ func wholeFrames(pcm []byte, format AudioFormat) (int, error) {
 }
 
 // Drain waits until the stream has taken all the playback queued, or the
-// playback ends, and then returns why it ended. A playback a Cancel ended
-// returns once the mixer has taken the Cancel in, which takes off what the
-// device gives back of it unheard: its Played is final then, as the
-// text-to-speech voice reads it.
+// playback ends, and then returns why it ended. A playback a Cancel ended,
+// whose audio the mixer took in the speech the Cancel cut, returns once the
+// mixer has taken the Cancel in, which takes off what the device gives back
+// of it unheard: its Played is final then, as the text-to-speech voice reads
+// it. A playback the mixer took none of in that speech has nothing to take
+// back, and returns at once.
 func (p *Playback) Drain(ctx context.Context) error {
 	o, in := p.out, p.in
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	for {
 		if err := p.gen.err; err != nil {
-			if !p.gen.settling {
+			if !p.gen.settling || p.seq == 0 || p.seq < in.startFrame {
 				return err
 			}
 		} else if p.pending == 0 && (in.last != p || in.idle()) && o.written >= p.seq {

@@ -174,3 +174,52 @@ func TestALaterCancelsDrainDoesNotWaitForAnEarlierSpeech(t *testing.T) {
 		})
 	}
 }
+
+// TestAPlaybackThatDidNotPlayDoesNotWaitForTheTakeBack fails if Drain of a
+// playback begun before a Cancel, but whose audio the mixer never took, waits
+// for the take-back of the playback that played before it in the same
+// generation (Sol's review of #153 at 5606321: context deadline exceeded),
+// or if that playback's own Drain does not wait. The later playback is
+// empty, or holds 20 ms queued behind the first that the held mixer cannot
+// reach.
+func TestAPlaybackThatDidNotPlayDoesNotWaitForTheTakeBack(t *testing.T) {
+	for _, queued := range []time.Duration{0, 20 * time.Millisecond} {
+		t.Run(fmt.Sprintf("%v queued", queued), func(t *testing.T) {
+			stream := &probeStream{fakeStream: newFakeStream(48000)}
+			out, start, _ := probeOutput(t, stream)
+			held := newProbeBarrier()
+			t.Cleanup(held.unblock)
+			stream.before = func(n int, _ []int16) {
+				if n == 2 {
+					held.hold()
+				}
+			}
+			a := out.Begin(InputVoice)
+			if err := a.WriteAll(testContext(t), constant(48000, 40*time.Millisecond, 1000), mono48k); err != nil {
+				t.Fatal(err)
+			}
+			start()
+			probeWait(t, held.entered, "the first playback's second write")
+			b := out.Begin(InputVoice)
+			if queued > 0 {
+				if err := b.WriteAll(testContext(t), constant(48000, queued, 1000), mono48k); err != nil {
+					t.Fatal(err)
+				}
+			}
+			out.Cancel(InputVoice)
+			ctx, stop := context.WithTimeout(context.Background(), 100*time.Millisecond)
+			defer stop()
+			bErr := b.Drain(ctx)
+			actx, astop := context.WithTimeout(context.Background(), 50*time.Millisecond)
+			defer astop()
+			aErr := a.Drain(actx)
+			held.unblock()
+			if !errors.Is(bErr, ErrCancelled) {
+				t.Fatalf("the playback that did not play: Drain %v, want ErrCancelled at once", bErr)
+			}
+			if !errors.Is(aErr, context.DeadlineExceeded) {
+				t.Fatalf("control: the playback that played returned %v before its take-back, want it to wait", aErr)
+			}
+		})
+	}
+}
