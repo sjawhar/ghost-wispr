@@ -45,7 +45,7 @@ func TestTheRosterReadsTheRecordersMeeting(t *testing.T) {
 		publicURL: "https://recorder.example",
 	})
 	t.Cleanup(roster.Close)
-	roster.SetAgents(&recordingAgents{})
+	roster.Open().SetAgents(&recordingAgents{})
 	if _, err := roster.Deliver(t.Context(), &envoy.Message{EventID: "e1", SourceSession: "agent-1", Text: "ghost-wispr join"}); err != nil {
 		t.Fatal(err)
 	}

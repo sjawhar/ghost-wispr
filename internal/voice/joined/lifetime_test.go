@@ -93,7 +93,7 @@ func TestAPointerInTransportEndsWithTheRecordersMeeting(t *testing.T) {
 			rec := newRecorderMeetings("sess-1")
 			r := newRig(t, func(cfg *Config) { cfg.Session, cfg.Meeting = rec.session, rec.meeting })
 			a := &heldPointerAgents{fakeAgents: r.agents, entered: make(chan struct{}), release: make(chan struct{})}
-			r.roster.SetAgents(a)
+			r.open(a)
 			r.join(t, "agent-1", "ABC-12")
 			r.roster.OnSegment(r.segment("ABC-12 needs attention", false))
 			<-a.entered
@@ -234,7 +234,7 @@ func TestARedeliveredCommandIsANoOp(t *testing.T) {
 // taken once and delivered again is the control: it joins once.
 func TestACommandTheRosterCouldNotTakeActsWhenDeliveredAgain(t *testing.T) {
 	r := newRig(t, nil)
-	r.roster.CloseAgents(context.Background())
+	r.opening.Close(context.Background())
 	join := &envoy.Message{EventID: "e-early", SourceSession: "agent-1", Text: "ghost-wispr join ABC-12", IssuedAt: r.clock.Now()}
 	if _, err := r.roster.Deliver(context.Background(), join); !errors.Is(err, ErrNotReady) {
 		t.Fatalf("a join with no Envoy session returned %v, want ErrNotReady so that Envoy delivers it again", err)
@@ -242,7 +242,7 @@ func TestACommandTheRosterCouldNotTakeActsWhenDeliveredAgain(t *testing.T) {
 	if len(r.roster.Joined()) != 0 {
 		t.Fatal("control: a join with no Envoy session made a membership")
 	}
-	r.roster.SetAgents(r.agents)
+	r.open(r.agents)
 	if _, err := r.roster.Deliver(context.Background(), join); err != nil {
 		t.Fatal(err)
 	}

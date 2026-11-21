@@ -172,7 +172,7 @@ func TestTheVoiceStoppingTellsJoinedAgents(t *testing.T) {
 	r := newRig(t, nil)
 	r.join(t, "agent-1", "ABC-12")
 	before := len(r.agents.to("agent-1"))
-	r.roster.CloseAgents(context.Background())
+	r.opening.Close(context.Background())
 	if got := r.roster.Joined(); len(got) != 0 {
 		t.Fatalf("roster %+v once the Envoy session closed, want none", got)
 	}

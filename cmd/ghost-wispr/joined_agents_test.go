@@ -172,7 +172,7 @@ func TestSessionChangesReachTheJoinedAgents(t *testing.T) {
 	forgotten := wireVoiceSessionHooks(manager, &hooks, &link, &joinedLink, other)
 	roster := testRoster(t, &link)
 	agents := &recordingAgents{}
-	roster.SetAgents(agents)
+	roster.Open().SetAgents(agents)
 	joinedLink.set(roster)
 	join := func() {
 		t.Helper()
@@ -208,7 +208,7 @@ func TestTheAPIListsJoinedAgentsAndGivesTheJoinMessage(t *testing.T) {
 	if _, err := hooks.JoinMessage("ABC-12"); err == nil {
 		t.Fatal("a join message with no Envoy session")
 	}
-	roster.SetAgents(&recordingAgents{})
+	roster.Open().SetAgents(&recordingAgents{})
 	if _, err := roster.Deliver(t.Context(), &envoy.Message{EventID: "e", SourceSession: "agent-1", Text: "ghost-wispr join"}); err != nil {
 		t.Fatal(err)
 	}

@@ -115,14 +115,14 @@ func TestTheCommandHistoryStaysCompact(t *testing.T) {
 // redeliveries whatever its own backoff.
 func TestANotReadyCommandWaitsForTheEnvoySession(t *testing.T) {
 	r := newRig(t, nil)
-	r.roster.CloseAgents(context.Background())
+	r.opening.Close(context.Background())
 	done := make(chan error, 1)
 	go func() {
 		_, err := r.roster.Deliver(context.Background(), &envoy.Message{EventID: "e-early", SourceSession: "agent-1", Text: "ghost-wispr join ABC-12", IssuedAt: r.clock.Now()})
 		done <- err
 	}()
 	time.Sleep(100 * time.Millisecond)
-	r.roster.SetAgents(r.agents)
+	r.open(r.agents)
 	select {
 	case err := <-done:
 		if err != nil {
@@ -136,7 +136,7 @@ func TestANotReadyCommandWaitsForTheEnvoySession(t *testing.T) {
 	}
 
 	idle := newRig(t, nil)
-	idle.roster.CloseAgents(context.Background())
+	idle.opening.Close(context.Background())
 	began := time.Now()
 	_, err := idle.roster.Deliver(context.Background(), &envoy.Message{EventID: "e-none", SourceSession: "agent-2", Text: "ghost-wispr join XYZ-9", IssuedAt: idle.clock.Now()})
 	if !errors.Is(err, ErrNotReady) {

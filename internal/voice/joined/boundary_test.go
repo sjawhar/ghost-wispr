@@ -82,7 +82,7 @@ func TestNoHookRunsUnderTheRosterLock(t *testing.T) {
 	r.floor.beforeRaise = func(*voice.Hand) { w.check("Floor.RaiseHand") }
 	r.floor.beforeLower = func(string) { w.check("Floor.LowerHands") }
 	agents := &watchedAgents{fakeAgents: r.agents, w: w}
-	r.roster.SetAgents(agents)
+	r.open(agents)
 	w.roster.Store(r.roster)
 	step := func(f func()) {
 		f()
@@ -106,7 +106,7 @@ func TestNoHookRunsUnderTheRosterLock(t *testing.T) {
 	step(func() { r.setSession("sess-2"); r.join(t, "agent-1", "ABC-12") })
 	step(func() { r.roster.SessionsDeleted([]string{"sess-2"}) })
 	step(func() { r.setSession("sess-3"); r.join(t, "agent-1", "ABC-12") })
-	step(func() { r.roster.CloseAgents(context.Background()) })
+	step(func() { r.opening.Close(context.Background()) })
 
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -134,11 +134,11 @@ func TestNoHookRunsUnderTheRosterLock(t *testing.T) {
 	}
 }
 
-// TestAnOldStopCannotClearANewEnvoySession fails if a CloseAgents still in
-// its cleanup when SetAgents(new) opens a new Envoy session, and a member
-// joins under it, then takes the new session or the new member when it
-// finishes; or if its notices go out through the new session. (ReviewPR122b's
-// TestReviewEOldStopCannotClearNewEnvoyEpoch.)
+// TestAnOldStopCannotClearANewEnvoySession fails if an opening's Close still
+// in its cleanup when a new opening's SetAgents opens a new Envoy session,
+// and a member joins under it, then takes the new session or the new member
+// when it finishes; or if its notices go out through the new session.
+// (ReviewPR122b's TestReviewEOldStopCannotClearNewEnvoyEpoch.)
 func TestAnOldStopCannotClearANewEnvoySession(t *testing.T) {
 	r := newRig(t, nil)
 	r.join(t, "agent-1", "ABC-12")
@@ -152,13 +152,14 @@ func TestAnOldStopCannotClearANewEnvoySession(t *testing.T) {
 		}
 	}
 	stopped := make(chan struct{})
+	old := r.opening
 	go func() {
 		defer close(stopped)
-		r.roster.CloseAgents(context.Background())
+		old.Close(context.Background())
 	}()
 	<-entered
 	next := newFakeAgents()
-	r.roster.SetAgents(next)
+	r.open(next)
 	r.deliver(t, "agent-2", "ghost-wispr join XYZ-9")
 	close(release)
 	<-stopped
