@@ -252,7 +252,7 @@ func (s *fakeSpeaker) Cancel(input string) {
 	}
 	if s.speaking[input] {
 		now := monoclock.Now()
-		s.queueLocked(audio.SpeechEvent{Input: input, Started: false, At: now.Wall, AtMono: now.Mono, Cancelled: true, Owner: s.owners[input]})
+		s.queueLocked(&audio.SpeechEvent{Input: input, Started: false, At: now.Wall, AtMono: now.Mono, Cancelled: true, Owner: s.owners[input]})
 	}
 	s.speaking[input] = false
 	delete(s.owners, input)
@@ -273,18 +273,18 @@ func (s *fakeSpeaker) OnSpeech(fn func(audio.SpeechEvent)) func() {
 	}
 }
 
-// emit queues e for the listeners.
-func (s *fakeSpeaker) emit(e audio.SpeechEvent) {
+// emit queues a copy of e for the listeners.
+func (s *fakeSpeaker) emit(e *audio.SpeechEvent) {
 	s.mu.Lock()
 	s.queueLocked(e)
 	s.mu.Unlock()
 	s.signal()
 }
 
-// queueLocked queues e under s.mu, in one step with the state change it
-// reports, as audio.Output does; signal then wakes the delivery.
-func (s *fakeSpeaker) queueLocked(e audio.SpeechEvent) {
-	s.queued = append(s.queued, e)
+// queueLocked queues a copy of e under s.mu, in one step with the state
+// change it reports, as audio.Output does; signal then wakes the delivery.
+func (s *fakeSpeaker) queueLocked(e *audio.SpeechEvent) {
+	s.queued = append(s.queued, *e)
 }
 
 func (s *fakeSpeaker) signal() {
@@ -338,7 +338,7 @@ func (s *fakeSpeaker) endSpeech(input string) {
 	s.mu.Lock()
 	if s.speaking[input] {
 		now := monoclock.Now()
-		s.queueLocked(audio.SpeechEvent{Input: input, Started: false, At: now.Wall, AtMono: now.Mono, Owner: s.owners[input]})
+		s.queueLocked(&audio.SpeechEvent{Input: input, Started: false, At: now.Wall, AtMono: now.Mono, Owner: s.owners[input]})
 	}
 	s.speaking[input] = false
 	delete(s.owners, input)
@@ -393,7 +393,7 @@ func (p *fakePlayback) Write(ctx context.Context, frame []byte, format audio.Aud
 	if !s.speaking[p.input] {
 		s.owners[p.input] = p.owner // the speech is this playback's owner's, as audio.Output's is
 		now := monoclock.Now()
-		s.queueLocked(audio.SpeechEvent{Input: p.input, Started: true, At: now.Wall, AtMono: now.Mono, Owner: p.owner})
+		s.queueLocked(&audio.SpeechEvent{Input: p.input, Started: true, At: now.Wall, AtMono: now.Mono, Owner: p.owner})
 	}
 	s.speaking[p.input] = true
 	s.mu.Unlock()
@@ -1130,7 +1130,7 @@ func TestHoldEventsStopsTheFakeSpeakersOwnDelivery(t *testing.T) {
 	s.mu.Lock()
 	s.barrier = b
 	s.mu.Unlock()
-	s.emit(audio.SpeechEvent{Input: "before", Started: true})
+	s.emit(&audio.SpeechEvent{Input: "before", Started: true})
 	select {
 	case <-b.entered: // the speaker's own delivery has begun
 	case <-time.After(testWait):
@@ -1138,7 +1138,7 @@ func TestHoldEventsStopsTheFakeSpeakersOwnDelivery(t *testing.T) {
 	}
 	release := s.holdEvents()
 	defer release()
-	s.emit(audio.SpeechEvent{Input: "after", Started: true})
+	s.emit(&audio.SpeechEvent{Input: "after", Started: true})
 	letGo()
 	select {
 	case <-b.returned:
@@ -1183,7 +1183,7 @@ func TestAHoldAfterTheDeliveryWaitsOnItsLockHoldsTheEvent(t *testing.T) {
 	s.deliverMu.Lock()
 	unlock := sync.OnceFunc(s.deliverMu.Unlock)
 	t.Cleanup(unlock)
-	s.emit(audio.SpeechEvent{Input: "before", Started: true})
+	s.emit(&audio.SpeechEvent{Input: "before", Started: true})
 	select {
 	case <-b.entered:
 	case <-time.After(testWait):
@@ -1205,7 +1205,7 @@ func TestAHoldAfterTheDeliveryWaitsOnItsLockHoldsTheEvent(t *testing.T) {
 	})
 	release := s.holdEvents()
 	defer release()
-	s.emit(audio.SpeechEvent{Input: "after", Started: true})
+	s.emit(&audio.SpeechEvent{Input: "after", Started: true})
 	unlock()
 	select {
 	case <-b.returned:

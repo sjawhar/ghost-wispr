@@ -160,7 +160,7 @@ func TestFlushSpeechWaitsForADeliveryUnderWay(t *testing.T) {
 		}
 	})()
 	out.mu.Lock()
-	out.emit(SpeechEvent{Input: "first", Started: true}) // the Output's own delivery takes it
+	out.emit(&SpeechEvent{Input: "first", Started: true}) // the Output's own delivery takes it
 	out.mu.Unlock()
 	probeWait(t, entered, "the Output's own delivery of the first event")
 	out.mu.Lock()

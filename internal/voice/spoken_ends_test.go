@@ -182,7 +182,7 @@ type heldReports struct {
 func (h *heldReports) queuedEnd() bool {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	return slices.ContainsFunc(h.queue, func(q heldReport) bool { return endedByItself(q.e) })
+	return slices.ContainsFunc(h.queue, func(q heldReport) bool { return endedByItself(&q.e) })
 }
 
 // heldReport is one report heldReports keeps, for the callback it is for.
@@ -201,14 +201,14 @@ func holdReports(t *testing.T, cfg *SupervisorConfig, r *rig) *heldReports {
 }
 
 // endedByItself reports whether e is a voice speech's end that no cancel cut.
-func endedByItself(e audio.SpeechEvent) bool {
+func endedByItself(e *audio.SpeechEvent) bool {
 	return e.Input == audio.InputVoice && !e.Started && !e.Cancelled
 }
 
 // deliver runs fn on e, and marks delivered once a speech ended by itself has
 // been.
-func (h *heldReports) deliver(fn func(audio.SpeechEvent), e audio.SpeechEvent) {
-	fn(e)
+func (h *heldReports) deliver(fn func(audio.SpeechEvent), e *audio.SpeechEvent) {
+	fn(*e)
 	if endedByItself(e) {
 		h.deliveredOnce.Do(func() { close(h.delivered) })
 	}
@@ -222,7 +222,7 @@ func (h *heldReports) OnSpeech(fn func(audio.SpeechEvent)) func() {
 			h.queue = append(h.queue, heldReport{fn: fn, e: e})
 			h.mu.Unlock()
 			return
-		case !h.released && (endedByItself(e) || h.fromStart && e.Input == audio.InputVoice && e.Started):
+		case !h.released && (endedByItself(&e) || h.fromStart && e.Input == audio.InputVoice && e.Started):
 			h.holding = true
 			h.queue = append(h.queue, heldReport{fn: fn, e: e})
 			h.mu.Unlock()
@@ -230,7 +230,7 @@ func (h *heldReports) OnSpeech(fn func(audio.SpeechEvent)) func() {
 			return
 		}
 		h.mu.Unlock()
-		h.deliver(fn, e)
+		h.deliver(fn, &e)
 	})
 }
 
@@ -248,7 +248,7 @@ func (h *heldReports) release() {
 		q := h.queue[0]
 		h.queue = h.queue[1:]
 		h.mu.Unlock()
-		h.deliver(q.fn, q.e)
+		h.deliver(q.fn, &q.e)
 		h.mu.Lock()
 	}
 	h.holding = false

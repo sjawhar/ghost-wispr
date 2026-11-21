@@ -147,8 +147,8 @@ type SpeechEvent struct {
 	// (Begin), on its start and on its end, whatever ended it: a cut, its
 	// end, or the stream's close. A listener tells whose speech an event is
 	// from it, not from when the event comes. Nil for a playback begun with
-	// none. The two flags sit together so the event stays under 80 bytes,
-	// which the listeners take by value.
+	// none. The event is 80 bytes with AtMono: the Output and the Supervisor
+	// pass it on by pointer, and each listener gets its own copy.
 	Owner any
 }
 
@@ -1259,7 +1259,7 @@ func (o *Output) wrote(seq uint64, at time.Time, atMono int64) {
 		// the stream held that audio never started.
 		if in.startPending && in.startFrame <= seq && (!in.cancelled || in.cancelAt.After(at)) {
 			in.startPending, in.startedAt, in.startedMono = false, now, atMono
-			o.emit(SpeechEvent{Input: in.name, Started: true, At: now, AtMono: atMono, Owner: in.owner})
+			o.emit(&SpeechEvent{Input: in.name, Started: true, At: now, AtMono: atMono, Owner: in.owner})
 		}
 	}
 	o.changed()
@@ -1274,7 +1274,7 @@ func (o *Output) emitEndLocked(in *outputInput, at time.Time, atMono int64) {
 	if e.At.Before(in.startedAt) {
 		e.At, e.AtMono = in.startedAt, in.startedMono
 	}
-	o.emit(e)
+	o.emit(&e)
 }
 
 // mixFrame mixes the inputs' next frame into frame, keeps each one's part in
@@ -1509,9 +1509,9 @@ func clip(s float32) int16 {
 	}
 }
 
-// emit queues e for the listeners. The caller holds mu.
-func (o *Output) emit(e SpeechEvent) {
-	o.events = append(o.events, e)
+// emit queues a copy of e for the listeners. The caller holds mu.
+func (o *Output) emit(e *SpeechEvent) {
+	o.events = append(o.events, *e)
 	signal(o.eventWake)
 }
 

@@ -431,8 +431,8 @@ func TestASpeechThatStartedBeforeTheCallIsNotItsVoices(t *testing.T) {
 	time.Sleep(20 * time.Millisecond)
 	r.heard("Wispr, what's the status of INFRA-1027?", true, true) // the call takes the floor
 	sess := r.waitSession()
-	r.speaker.emit(audio.SpeechEvent{Input: audio.InputVoice, Started: true, At: earlier})                              // its start, queued
-	r.speaker.emit(audio.SpeechEvent{Input: audio.InputVoice, At: earlier.Add(10 * time.Millisecond), Cancelled: true}) // the call cut it
+	r.speaker.emit(&audio.SpeechEvent{Input: audio.InputVoice, Started: true, At: earlier})                              // its start, queued
+	r.speaker.emit(&audio.SpeechEvent{Input: audio.InputVoice, At: earlier.Add(10 * time.Millisecond), Cancelled: true}) // the call cut it
 	never(t, "the exchange ended before its voice spoke", 500*time.Millisecond, func() bool { _, _, closed := sess.state(); return closed })
 }
 

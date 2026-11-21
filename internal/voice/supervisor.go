@@ -535,7 +535,7 @@ func NewSupervisor(c *SupervisorConfig) *Supervisor {
 		floor:  floor,
 		idle:   make(chan struct{}),
 	}
-	s.unlisten = cfg.Speaker.OnSpeech(s.onSpeech)
+	s.unlisten = cfg.Speaker.OnSpeech(func(e audio.SpeechEvent) { s.onSpeech(&e) })
 	s.spawn(s.sendNotes)
 	s.spawn(s.offerAnswers)
 	return s
@@ -1356,7 +1356,7 @@ type span struct{ from, to time.Time }
 // Supervisor's own, which records its cut when it makes it (cutDriverLocked),
 // while the speaker reports the end only once its mixer takes the Cancel in,
 // which can be after a later line was called.
-func (ex *exchange) playLocked(e audio.SpeechEvent) {
+func (ex *exchange) playLocked(e *audio.SpeechEvent) {
 	if e.Started {
 		if ex.playedFrom.IsZero() {
 			ex.playedFrom = e.At
@@ -2471,7 +2471,7 @@ func (s *Supervisor) sendNotes() {
 // comes: the exchange may have ended, and others taken the floor, since. A
 // speech no exchange's playback started, such as POST /api/tts/speak, is no
 // exchange's. speechEx is the exchange whose speech plays now, for barge-in.
-func (s *Supervisor) onSpeech(e audio.SpeechEvent) {
+func (s *Supervisor) onSpeech(e *audio.SpeechEvent) {
 	if e.Input != audio.InputVoice {
 		return
 	}
