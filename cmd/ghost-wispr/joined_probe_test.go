@@ -171,10 +171,9 @@ func TestTheProbeRefusesAPointerToAnotherMeeting(t *testing.T) {
 
 // TestTheProbeDatesAPointersRange fails if the probe counts a pointer's
 // segments on the wrong days: a pointer gives its range as clocks only
-// (HH:MM:SS UTC). A recording session's id from the recorder is its start
-// (YYYYMMDDhhmmss), which dates the range; any other id dates it by today.
-// Each case must count the segments in the range and none a day away. The
-// controls are ranges within today.
+// (HH:MM:SS UTC), and the meeting's own segments date it, whatever its
+// recording session's id. Each case must count the segments in the range and
+// none a day away. The controls are ranges on the day their meeting began.
 func TestTheProbeDatesAPointersRange(t *testing.T) {
 	today := time.Now().UTC().Truncate(24 * time.Hour)
 	day := 24 * time.Hour
@@ -187,15 +186,15 @@ func TestTheProbeDatesAPointersRange(t *testing.T) {
 		{"a range across midnight", id(today.Add(-10 * time.Second)), "23:59:58", "00:00:02",
 			[]time.Time{today.Add(-time.Second), today.Add(time.Second), today.Add(day - time.Second)}},
 		{"a range on the day after its meeting began", id(today.Add(-2*day + 10*time.Hour)), "09:00:00", "09:00:04",
-			[]time.Time{today.Add(-day + 9*time.Hour + time.Second), today.Add(-day + 9*time.Hour + 3*time.Second), today.Add(9*time.Hour + time.Second)}},
-		{"a range that starts a moment before its session's id", id(today.Add(-day + 10*time.Hour)), "09:59:58", "10:00:03",
+			[]time.Time{today.Add(-day + 9*time.Hour + time.Second), today.Add(-day + 9*time.Hour + 3*time.Second), today.Add(9*time.Hour + time.Second), today.Add(-2*day + 10*time.Hour + time.Second)}},
+		{"a range that starts a moment before its session's first segment", id(today.Add(-day + 10*time.Hour)), "09:59:58", "10:00:03",
 			[]time.Time{today.Add(-day + 10*time.Hour - time.Second), today.Add(-day + 10*time.Hour + 2*time.Second), today.Add(10*time.Hour + 2*time.Second)}},
 		{"a range today (control)", id(today.Add(8 * time.Hour)), "10:05:00", "10:05:04",
 			[]time.Time{today.Add(10*time.Hour + 5*time.Minute + time.Second), today.Add(10*time.Hour + 5*time.Minute + 3*time.Second), today.Add(day + 10*time.Hour + 5*time.Minute)}},
 		{"another id's range across midnight", "a-meeting", clock(today.Add(-2 * time.Second)), clock(today.Add(2 * time.Second)),
 			[]time.Time{today.Add(-time.Second), today.Add(time.Second), today.Add(day + time.Second)}},
 		{"another id's range today (control)", "a-meeting", "12:00:00", "12:00:04",
-			[]time.Time{today.Add(12*time.Hour + time.Second), today.Add(12*time.Hour + 3*time.Second), today.Add(-day + 12*time.Hour + time.Second)}},
+			[]time.Time{today.Add(12*time.Hour + time.Second), today.Add(12*time.Hour + 3*time.Second), today.Add(day + 12*time.Hour + time.Second)}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -212,6 +211,48 @@ func TestTheProbeDatesAPointersRange(t *testing.T) {
 			}
 			if got["segments_in_range"] != 2 {
 				t.Fatalf("session %s, %s to %s UTC: %v segments in range, want the first 2 of %v", tc.session, tc.from, tc.to, got["segments_in_range"], tc.segments)
+			}
+		})
+	}
+}
+
+// TestTheProbeDatesAPointerByItsSessionsSegments fails if the probe dates a
+// pointer's range by its recording session's id. The recorder moves a new
+// id past one already taken, or past the ids that a clock set back left
+// ahead of it (session.Manager.newSessionIDLocked and startSession), so an
+// id can be seconds or days later than its session began; the segments the
+// probe reads carry the session's own times. The control is an id that is
+// its session's start.
+func TestTheProbeDatesAPointerByItsSessionsSegments(t *testing.T) {
+	started := time.Now().UTC().Truncate(24 * time.Hour).Add(12 * time.Hour)
+	for _, tc := range []struct {
+		name string
+		id   time.Time
+	}{
+		{"an id that is its start (control)", started},
+		{"an id moved 10 s past a taken one", started.Add(10 * time.Second)},
+		{"an id 3 days ahead, left by a clock set back", started.Add(3 * 24 * time.Hour)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			session := tc.id.Format("20060102150405")
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path != "/api/sessions/"+session+"/segments" {
+					http.Error(w, "not this session's segments", http.StatusNotFound)
+					return
+				}
+				_ = json.NewEncoder(w).Encode([]transcribe.Segment{
+					{Timestamp: started.Add(time.Second)},
+					{Timestamp: started.Add(3 * time.Second)},
+					{Timestamp: started.Add(24*time.Hour + time.Second)},
+				})
+			}))
+			t.Cleanup(server.Close)
+			got, err := (&joinedProbe{}).readTranscript(t.Context(), server.URL, session, "12:00:00", "12:00:04")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got["segments"] != 3 || got["segments_in_range"] != 2 {
+				t.Fatalf("session %s, which began at %s: %v segments in 12:00:00 to 12:00:04 UTC of %v read, want the first 2 of 3", session, started.Format(time.RFC3339), got["segments_in_range"], got["segments"])
 			}
 		})
 	}

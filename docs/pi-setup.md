@@ -928,10 +928,10 @@ with the unit paused and no session active:
    - spoken clips made with any speech synthesizer: `--second-question`, `--never-mind` and
      `--stop-clip` WAVs, and the `--question-dir`, `--talkover-dir` and `--backchannel-dir`
      directories of WAVs;
-   - for `wake-sound`, `scripted`, `barge-in` and `playback-cancel`, a USB microphone about 30 cm
-     from the Jabra, named by `--rig-mic` (such as `plughw:CARD=Mic,DEV=0`). These steps play
-     through the Jabra, so run them with the room empty. The step asks you to confirm that, measures
-     the room and sets its sound threshold 10 dB above the room's peak;
+   - for `wake-sound`, `scripted`, `barge-in`, `playback-cancel` and `joined`, a USB microphone
+     about 30 cm from the Jabra, named by `--rig-mic` (such as `plughw:CARD=Mic,DEV=0`). These
+     steps play through the Jabra, so run them with the room empty. The step asks you to confirm
+     that, measures the room and sets its sound threshold 10 dB above the room's peak;
    - for `holder-cases` and `ask-holder`, scratch issues in Dispatch: one claimed by a live agent
      session (`--issue-live`), one by a stopped session (`--issue-stopped`), one by a person
      (`--issue-person`) and one with no session (`--issue-none`). The steps only read them, and ask
@@ -956,7 +956,10 @@ with the unit paused and no session active:
    passes when the late time is within 20 ms, fails when even the early time is over, and otherwise
    reports UNKNOWN with how late the recording's times may be, since a loaded Pi reads its anchors
    late. The early time is early by the time arecord took to start and by up to 400 ppm of the time
-   into the recording, so a tail a few tens of milliseconds over the bound can be UNKNOWN.
+   into the recording, so a tail a few tens of milliseconds over the bound can be UNKNOWN. `joined`
+   times the onset of the agent's words at the rig the same way: it passes when even the early time
+   is at or after the end of the go-ahead and the late time is before `voice_spoken`, fails when no
+   sound longer than the wake sound can start between them, and otherwise reports UNKNOWN.
 6. Slice 4's two steps check the three capture states and the paused listener, with the
    listener turned on for the run only (`GHOST_WISPR_VOICE_PAUSED_LISTENER=true`, beside the
    voice). Both keep the microphone on the loopback, so the listener hears only what the step plays

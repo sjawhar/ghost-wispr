@@ -6,8 +6,8 @@
 # speech the speaker plays, which it records from the loopback's other side.
 #
 # The microphone is the loopback in every step that plays sound, never the room. The steps that time
-# sound at the Jabra (wake-sound, scripted, barge-in, playback-cancel) leave the speaker on the
-# Jabra and record it with the rig microphone beside it, after a person confirms the rig on the
+# sound at the Jabra (wake-sound, scripted, barge-in, playback-cancel, joined) leave the speaker on
+# the Jabra and record it with the rig microphone beside it, after a person confirms the rig on the
 # terminal. Every step that changes the unit refuses to start unless it is paused with no session
 # active, and afterwards puts back the .env byte for byte and the saved capture state it read first.
 set -uo pipefail
@@ -193,8 +193,9 @@ Options:
                       accepted for the other slices' steps
 
 Each check prints one PASS or FAIL line; the first FAIL ends a step that changes the unit, and a step
-that only reads makes all its reads first. UNKNOWN means a check read nothing it could judge. Exit
-status: 0 all passed, 1 a check failed or the driver refused to start, 2 UNKNOWN, 130 interrupted.
+that only reads makes all its reads first. UNKNOWN means a check read nothing it could judge, or
+read times whose bounds cannot decide it. Exit status: 0 all passed, 1 a check failed or the driver
+refused to start, 2 UNKNOWN, 130 interrupted.
 Every exit after the first change restores the unit.
 EOF
 }
@@ -1630,16 +1631,20 @@ spoken_after() {
   done
 }
 
-# words_heard FROM_MS TO_MS: set found_sound to the first sound at the rig that starts in [FROM, TO)
-# and lasts longer than the wake sound can (sound_max_ms): speech, not the wake sound that "Wispr,
-# go ahead" itself brings. It fails when none does.
+# words_heard FROM_MS TO_MS: set found_sound to the first sound at the rig that lasts longer than the
+# wake sound can (sound_max_ms), so speech and not the wake sound that "Wispr, go ahead" itself
+# brings, and whose onset may lie in [FROM, TO): its late bound at FROM or later and its early bound
+# before TO. It succeeds when that onset certainly lies there: its early bound at FROM or later, so
+# the words began after FROM, and its late bound before TO. It fails with found_sound set when the
+# bounds cannot tell, and with found_sound empty when no such sound may start there.
 words_heard() {
   local i
+  found_sound=
   for i in "${!sound_on[@]}"; do
-    if ((sound_on[i] >= $1 && sound_on[i] < $2 && sound_len[i] > sound_max_ms * 1000)); then
-      found_sound=$i
-      return 0
-    fi
+    ((sound_len[i] > sound_max_ms * 1000 && sound_on[i] >= $1 && sound_on_early[i] < $2)) || continue
+    found_sound=$i
+    ((sound_on_early[i] >= $1 && sound_on[i] < $2))
+    return
   done
   return 1
 }
@@ -1651,7 +1656,9 @@ words_heard() {
 # hold to this run's recording session and to the go-ahead: the pointer names the meeting the
 # agent joined; the agent is told its words were spoken only after the go-ahead ended, with a
 # voice_spoken of that meeting after it; and the rig microphone hears the words after the go-ahead,
-# a sound longer than the wake sound, besides the hand sound.
+# a sound longer than the wake sound, besides the hand sound. The words' onset is timed twice, as
+# playback-cancel times a tail: PASS when even its early bound is at or after the go-ahead's end and
+# its late bound before voice_spoken, FAIL when no such sound may start there, UNKNOWN otherwise.
 step_joined() {
   local envoy_url auth session mention_ended floor_at hand_at deadline pointed go_ahead_ended spoken_at outcome told_at
   envoy_url=$(setting GHOST_WISPR_CONCIERGE_ENVOY_URL concierge envoy_url) \
@@ -1743,9 +1750,12 @@ step_joined() {
   first_sound $((hand_at - lead_ms)) $((hand_at + sound_max_ms)) \
     || fail 'joined: no sound at the rig microphone within 400 ms of hand_chime'
   pass "joined: the hand sound reached the Jabra $((sound_on[found_sound] - hand_at)) ms after hand_chime"
-  words_heard "$go_ahead_ended" "$spoken_at" \
-    || fail "joined: no words at the rig microphone between the end of the go-ahead and voice_spoken: no sound there lasted longer than the wake sound's $sound_max_ms ms"
-  pass "joined: the agent's words reached the Jabra $((sound_on[found_sound] - go_ahead_ended)) ms after the go-ahead ended, for $((sound_len[found_sound] / 1000)) ms"
+  if ! words_heard "$go_ahead_ended" "$spoken_at"; then
+    [[ -n $found_sound ]] \
+      || fail "joined: no words at the rig microphone between the end of the go-ahead and voice_spoken: no sound there lasted longer than the wake sound's $sound_max_ms ms"
+    unknown "joined: a sound at the rig microphone longer than the wake sound starts between $((sound_on_early[found_sound] - go_ahead_ended)) and $((sound_on[found_sound] - go_ahead_ended)) ms from the end of the go-ahead, and voice_spoken came at $((spoken_at - go_ahead_ended)) ms: the recording's times may be up to $((sound_on[found_sound] - sound_on_early[found_sound])) ms late, so whether the agent's words began after the go-ahead and before voice_spoken is not known"
+  fi
+  pass "joined: the agent's words reached the Jabra $((sound_on[found_sound] - go_ahead_ended)) ms after the go-ahead ended (no earlier than $((sound_on_early[found_sound] - go_ahead_ended)) ms after it), for $((sound_len[found_sound] / 1000)) ms"
 }
 
 # step_barge_in: verification c-stop-pi. The run's microphone is the loopback, so each clip goes

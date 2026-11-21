@@ -17,10 +17,11 @@
 # (deploy/pi/journalrecords), so a driver that reads another journal, another process's lines or
 # another key reads nothing. Each step runs once as it should pass and once against its
 # verification check's negative control. Cases run in parallel; each records its failures, and the
-# run goes on, so that one run shows every assertion that fails. On 2 CPUs a whole run takes about
-# 8 minutes (488 s and 507 s on sami-devbox, 2026-11-20), so give it a timeout of 15 minutes or
-# more. Killed early, it leaves nothing for long: its fake services end within 5 s of it, and a
-# driver still restoring its case within 150 s.
+# run goes on, so that one run shows every assertion that fails. On 2 CPUs a whole run takes 8 to 11
+# minutes (488 s and 507 s on 2026-11-20; 670 s and 662 s on 2026-11-21, on a machine at a load
+# average of about 400), so give it a timeout of 15 minutes or more. Killed early, it leaves nothing
+# for long: its fake services end within 5 s of it, and a driver still restoring its case within
+# 150 s.
 set -uo pipefail
 
 repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -134,6 +135,18 @@ def alive(pid):
             return f.read().rsplit(")", 1)[1].split()[0] != "Z"
     except (OSError, IndexError):
         return False
+
+
+def process_start_ms():
+    """When this process began, on now_ms's clock, never early: /proc/self/stat gives its start in
+    whole clock ticks since boot, rounded down, so one tick more; and boot is placed on the wall
+    clock by reading the boot clock first, so that the time between the two reads makes it later."""
+    with open("/proc/self/stat") as f:
+        ticks = int(f.read().rsplit(")", 1)[1].split()[19])
+    since_boot = time.clock_gettime_ns(time.CLOCK_BOOTTIME)
+    boot = time.time_ns() - since_boot
+    start = boot + (ticks + 1) * 1_000_000_000 // os.sysconf("SC_CLK_TCK")
+    return -(-start // 1_000_000)
 
 
 def test_running():
@@ -973,7 +986,16 @@ def arecord(args):
     with open(path, "wb") as f:
         f.write(bytes(44))
         f.flush()
-        begun = now_ms()
+        # The file's first sample: by default, when the fake has started, which on a loaded machine
+        # can be long after the driver started arecord, so that an early bound, which counts from
+        # then, is early by that long too. arecord-prompt captures it as the process began, as a
+        # real arecord does once it opens the device, so that an early bound is early only by the
+        # driver's fork and a clock tick; arecord-slow-start captures it 1.5 s after the fake has
+        # started, as an arecord slow to open its device does, so that every early bound is more
+        # than 1.5 s early.
+        if "arecord-slow-start" in SCENARIO:
+            time.sleep(1.5)
+        begun = min(process_start_ms(), now_ms()) if "arecord-prompt" in SCENARIO else now_ms()
         log_to("recordings", "%s %d" % (path, begun))
         written = 0
         # From the first clip played after the recording began: arecord-lag makes the file run 1 s
@@ -1769,8 +1791,10 @@ launch barge-backchannel-late answer-until-clip,backchannel-stops,late-clip yes 
 # cancel that keeps the stream running with 80 ms of silence queued, which must pass; a status that
 # shows the stream running only 3 s after it starts; today's draining path, heard 800 ms on (the
 # negative control); audio heard 50 ms on; a stop just before a pause in the speech whose next word
-# still plays 150 ms later; a word 1.1 s on, after a silence long enough to pass for the end; a word
-# 150 ms on with the speech already quiet for 1 s at the stop, which the rig cannot time (UNKNOWN);
+# still plays 150 ms later, recorded by an arecord that starts at once (FAIL: even the early bound of
+# the word's end is over the bound) and by one slow to start (UNKNOWN: the early bound is not); a
+# word 1.1 s on, after a silence long enough to pass for the end; a word 150 ms on with the speech
+# already quiet for 1 s at the stop, which the rig cannot time (UNKNOWN);
 # a word still playing as the next question goes in: well before its chime, just before it and
 # apart, running into it, and after it, before the answer's first audio; a quiet chime, which must
 # pass, and a word that runs into it; a louder wake sound whose echo the rig hears for 320 ms, which
@@ -1789,7 +1813,9 @@ launch cancel-slow-status long,asound,slow-status yes -- $cancel_args
 # shellcheck disable=SC2086
 launch cancel-tail long,asound,tail-50 yes -- $cancel_args
 # shellcheck disable=SC2086
-launch cancel-leak long,asound,leak-150 yes -- $cancel_args
+launch cancel-leak long,asound,leak-150,arecord-prompt yes -- $cancel_args
+# shellcheck disable=SC2086
+launch cancel-leak-unsure long,asound,leak-150,arecord-slow-start yes -- $cancel_args
 # shellcheck disable=SC2086
 launch cancel-leak-late long,asound,leak-1100 yes -- $cancel_args
 # shellcheck disable=SC2086
@@ -1858,14 +1884,19 @@ launch first-audio-missing tts-missing '' -- --step tts-first-audio --sentences 
 # joined (c-joined-live): a pass; a pointer that names another meeting; the agent told its words
 # were spoken before the go-ahead; voice_spoken with another session's id; the meeting's only
 # voice_spoken while the go-ahead still plays; and the go-ahead followed by the wake sound alone, no
-# words at the rig. Each is the negative control of one of the step's checks.
+# words at the rig. Each is the negative control of one of the step's checks. These record with an
+# arecord that starts at once, so that the words' onset, 1 s after the go-ahead, is after it even at
+# its early bound. joined-words-unsure records with one slow to start: the onset's early bound is
+# before the go-ahead's end and its late bound after it, so the step cannot tell (UNKNOWN).
 readonly joined_args="--step joined --join-issue join-5 --mention @mention.wav --go-ahead @go-ahead.wav --rig-mic $rig --event-timeout 10"
 # shellcheck disable=SC2086 # The arguments are words.
-launch joined-pass joined yes -- $joined_args
+launch joined-pass joined,arecord-prompt yes -- $joined_args
 for scenario in other-meeting early-spoken other-spoken spoken-during-clip words-silent; do
   # shellcheck disable=SC2086
-  launch "joined-$scenario" "joined,joined-$scenario" yes -- $joined_args
+  launch "joined-$scenario" "joined,arecord-prompt,joined-$scenario" yes -- $joined_args
 done
+# shellcheck disable=SC2086
+launch joined-words-unsure joined,arecord-slow-start yes -- $joined_args
 wait
 
 # Ctrl-C while the driver waits for voice_wake, then Ctrl-C again while the restore stops the
@@ -2375,9 +2406,24 @@ expect_between 'cancel-drain: how long the negative control is heard' "$(heard_a
 expect_restored cancel-drain
 expect_not_passed cancel-tail 30 120
 expect_restored cancel-tail
+# heard_no_earlier NAME: the milliseconds a FAIL or UNKNOWN line says a stop's speech was heard no
+# earlier than after it: the early bound of the tail it names.
+heard_no_earlier() {
+  sed -n "s/^\(FAIL\|UNKNOWN\): playback-cancel: .*no earlier than \([0-9]*\) ms after it.*/\2/p" "$root/$1/out"
+}
+# The word 150 ms after the stop, 250 ms long. Recorded by an arecord that starts at once, its end's
+# early bound is over the 20 ms bound too: FAIL. Recorded by one slow to start, its early bound is
+# 1.5 s early, under the bound, and its late bound over it: UNKNOWN, never FAIL or PASS.
 expect_rc cancel-leak 1
 expect_between 'cancel-leak: how long the leaked word is heard' "$(heard_after cancel-leak)" 150 500
+expect_between 'cancel-leak: how long the leaked word is heard, at the least' "$(heard_no_earlier cancel-leak)" 21 500
 expect_restored cancel-leak
+expect_rc cancel-leak-unsure 2
+expect_between 'cancel-leak-unsure: how long the leaked word is heard up to' "$(heard_up_to cancel-leak-unsure)" 150 500
+expect_between 'cancel-leak-unsure: how long the leaked word is heard, at the least' "$(heard_no_earlier cancel-leak-unsure)" 0 20
+expect_no_line cancel-leak-unsure "FAIL: playback-cancel: a stop's speech was heard"
+expect_no_line cancel-leak-unsure "PASS: playback-cancel: no stop's speech was heard"
+expect_restored cancel-leak-unsure
 expect_rc cancel-leak-late 1
 expect_between 'cancel-leak-late: how long the word after a long silence is heard' "$(heard_after cancel-leak-late)" 1300 1500
 expect_restored cancel-leak-late
@@ -2482,6 +2528,12 @@ expect_rc first-audio-missing 2
 expect_line first-audio-missing 'UNKNOWN: tts-first-audio: this build has no ghost-wispr tts-first-audio'
 
 # joined.
+# joined_onset NAME: the early and late bounds of the words' onset, in ms from the end of the
+# go-ahead, as the joined step's PASS or UNKNOWN line for the words gives them.
+joined_onset() {
+  sed -n -e "s/^PASS: joined: the agent's words reached the Jabra \(-\{0,1\}[0-9]*\) ms after the go-ahead ended (no earlier than \(-\{0,1\}[0-9]*\) ms after it).*/\2 \1/p" \
+    -e "s/^UNKNOWN: joined: a sound at the rig microphone longer than the wake sound starts between \(-\{0,1\}[0-9]*\) and \(-\{0,1\}[0-9]*\) ms from the end of the go-ahead.*/\1 \2/p" "$root/$1/out"
+}
 expect_rc joined-pass 0
 for line in 'PASS: joined: recording session session-1' 'PASS: joined: the test agent joined session-1 and was told where to read it' \
   'PASS: joined: agent_joined on /ws' 'PASS: joined: the pointer names recording session session-1, the meeting the test agent joined, ' \
@@ -2490,6 +2542,11 @@ for line in 'PASS: joined: recording session session-1' 'PASS: joined: the test 
   "PASS: joined: the agent's words reached the Jabra "; do
   expect_line joined-pass "$line"
 done
+# The words start 1 s after the go-ahead's clip ends: their onset's early bound is at or after the
+# go-ahead's end, as the driver timed it, and never later than 1 s after it.
+read -r onset_early onset_late <<<"$(joined_onset joined-pass)"
+expect_between "joined-pass: the early bound of the words' onset, from the end of the go-ahead" "$onset_early" 0 1000
+expect_between "joined-pass: the late bound of the words' onset, from the end of the go-ahead" "$onset_late" "${onset_early:-0}" 5000
 expect_restored joined-pass
 expect_rc joined-other-meeting 1
 expect_line joined-other-meeting 'FAIL: joined: the pointer names recording session session-9, not session-1, the meeting the test agent joined'
@@ -2507,6 +2564,17 @@ expect_rc joined-words-silent 1
 expect_line joined-words-silent 'PASS: joined: the hand sound reached the Jabra'
 expect_line joined-words-silent 'FAIL: joined: no words at the rig microphone between the end of the go-ahead and voice_spoken'
 expect_restored joined-words-silent
+# An arecord slow to start: the words' onset is before the go-ahead's end at its early bound and
+# after it at its late bound, so whether they began after the go-ahead is UNKNOWN, never PASS.
+expect_rc joined-words-unsure 2
+expect_line joined-words-unsure 'PASS: joined: the hand sound reached the Jabra'
+expect_line joined-words-unsure 'UNKNOWN: joined: a sound at the rig microphone longer than the wake sound starts between '
+expect_line joined-words-unsure "so whether the agent's words began after the go-ahead and before voice_spoken is not known"
+expect_no_line joined-words-unsure "PASS: joined: the agent's words reached the Jabra"
+read -r onset_early onset_late <<<"$(joined_onset joined-words-unsure)"
+expect_between "joined-words-unsure: the early bound of the words' onset, from the end of the go-ahead" "$onset_early" -10000 -1
+expect_between "joined-words-unsure: the late bound of the words' onset, from the end of the go-ahead" "$onset_late" 0 5000
+expect_restored joined-words-unsure
 
 # Neither file names the company (tests/public_literals_test.go's list) or holds an issue key.
 literals=$(awk '

@@ -275,8 +275,9 @@ const segmentSlack = 5 * time.Second
 // reports how many fall in the pointer's time range (pointerInterval), with
 // no words.
 func (p *joinedProbe) readTranscript(ctx context.Context, api, sessionID, from, to string) (map[string]any, error) {
-	start, end, err := pointerInterval(sessionID, from, to, time.Now())
-	if err != nil {
+	fromClock, err1 := time.Parse(time.TimeOnly, from)
+	toClock, err2 := time.Parse(time.TimeOnly, to)
+	if err := errors.Join(err1, err2); err != nil {
 		return nil, err
 	}
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(api, "/")+"/api/sessions/"+sessionID+"/segments", nil)
@@ -299,38 +300,40 @@ func (p *joinedProbe) readTranscript(ctx context.Context, api, sessionID, from, 
 		return nil, err
 	}
 	inRange := 0
-	for i := range segments {
-		at := segments[i].Timestamp
-		if !at.Before(start.Add(-segmentSlack)) && !at.After(end.Add(segmentSlack)) {
-			inRange++
+	if len(segments) > 0 {
+		first := segments[0].Timestamp
+		for i := range segments {
+			if segments[i].Timestamp.Before(first) {
+				first = segments[i].Timestamp
+			}
+		}
+		start, end := pointerInterval(fromClock, toClock, first)
+		for i := range segments {
+			at := segments[i].Timestamp
+			if !at.Before(start.Add(-segmentSlack)) && !at.After(end.Add(segmentSlack)) {
+				inRange++
+			}
 		}
 	}
 	return map[string]any{"status": response.StatusCode, "segments": len(segments), "segments_in_range": inRange}, nil
 }
 
 // pointerInterval dates a pointer's range, which gives clocks only (HH:MM:SS
-// UTC). The recorder's id for a recording session is its start
-// (YYYYMMDDhhmmss, UTC): from is then the first instant on from's clock at or
-// after that start, less segmentSlack, as a segment can begin a moment before
-// its session's id, and to the first instant on to's clock at or after from.
-// Any other id dates the range by now: to is on now's day (UTC), and from the
-// last instant on from's clock at or before to.
-func pointerInterval(sessionID, from, to string, now time.Time) (time.Time, time.Time, error) {
-	fromClock, err1 := time.Parse(time.TimeOnly, from)
-	toClock, err2 := time.Parse(time.TimeOnly, to)
-	if err := errors.Join(err1, err2); err != nil {
-		return time.Time{}, time.Time{}, err
-	}
-	if started, err := time.Parse("20060102150405", sessionID); err == nil {
-		start := clockAtOrAfter(started.Add(-segmentSlack), fromClock)
-		return start, clockAtOrAfter(start, toClock), nil
-	}
-	end := onDayOf(now.UTC(), toClock)
+// UTC), by the meeting's own times: first is the earliest stamp of its
+// recording session's segments. to is the first instant on to's clock at or
+// after first, less segmentSlack, as a segment counted in the range can
+// begin that long before it; from is the last instant on from's clock at or
+// before to. The session's id is not its start: the recorder moves a new id
+// past one already taken, and past the ids a clock set back left ahead of it
+// (session.Manager.newSessionIDLocked), so an id can be seconds or days later
+// than its session began.
+func pointerInterval(fromClock, toClock, first time.Time) (time.Time, time.Time) {
+	end := clockAtOrAfter(first.Add(-segmentSlack), toClock)
 	start := onDayOf(end, fromClock)
 	if start.After(end) {
 		start = start.AddDate(0, 0, -1)
 	}
-	return start, end, nil
+	return start, end
 }
 
 // clockAtOrAfter is the first instant on clock's time of day at or after t,
