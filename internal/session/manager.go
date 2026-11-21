@@ -14,6 +14,7 @@ import (
 	api "github.com/deepgram/deepgram-go-sdk/v3/pkg/api/listen/v1/websocket/interfaces"
 
 	"github.com/sjawhar/ghost-wispr/internal/logging"
+	"github.com/sjawhar/ghost-wispr/internal/stopping"
 	"github.com/sjawhar/ghost-wispr/internal/storage"
 	"github.com/sjawhar/ghost-wispr/internal/summary"
 	"github.com/sjawhar/ghost-wispr/internal/transcribe"
@@ -63,25 +64,22 @@ type Manager struct {
 	lifecyclePublishes             sync.WaitGroup
 	lifecycleStartPublishesStopped bool
 
-	// background is the context of the work a session's end leaves running:
-	// its refinement and its summary, and the sync, index and publish a
-	// summary starts (Go). StopBackground cancels it with
-	// ErrStopped and waits for that work, so the store closes under none of
-	// it; once stopped (backgroundStopped, under mu), no more starts.
-	// backgroundRunning, under mu, counts the work still running.
+	// background is the context of the work StopBackground cancels, with
+	// stopping.ErrStopped, and waits for, so the store closes under none of
+	// it: every goroutine that writes the store and that no caller waits for
+	// starts through Go, or runs inside Run. That is the work a session's end
+	// leaves running (its refinement and summary, and the sync, index and
+	// publish a summary starts), this manager's own entry points
+	// (RefineSession, SummarizeSession, the session-ended hook), and the app's
+	// background work on the store. Once stopped (backgroundStopped, under mu),
+	// nothing more starts. backgroundRunning, under mu, counts the work still
+	// running.
 	background        context.Context
 	stopBackground    context.CancelCauseFunc
 	backgroundWork    sync.WaitGroup
 	backgroundRunning int
 	backgroundStopped bool
 }
-
-// ErrStopped is the cause of the background work's context once
-// StopBackground has cancelled it: a stop cut the work off. A refinement or
-// summary cut off so is left running in the store, as a process that exits
-// inside it leaves it, for the next start to take up
-// (storage.RecoverStaleRefinements, the summary backfill).
-var ErrStopped = errors.New("session manager stopped")
 
 // sessionEnd is how far an end of a session got. An end that fails leaves it
 // behind, so retrying the end finishes it with the same end time and recording.
@@ -692,9 +690,8 @@ func (m *Manager) endSession(ctx context.Context, want string) error {
 
 // Go runs f in the background on the background context, as work
 // StopBackground cancels and waits for, unless StopBackground has run: work
-// it starts then is left to the next start. The app runs through it what it
-// starts after a summary and must not outlive the store: the summary's Envoy
-// publish.
+// it starts then is left to the next start. Every goroutine that writes the
+// store, and that no caller waits for, starts through Go or runs inside Run.
 func (m *Manager) Go(f func(ctx context.Context)) {
 	if !m.beginBackground() {
 		return
@@ -705,14 +702,13 @@ func (m *Manager) Go(f func(ctx context.Context)) {
 	}()
 }
 
-// Run runs f now, as work StopBackground waits for, as it waits for the work
-// a session's end leaves running: f's context ends when ctx does, or with
-// ErrStopped when StopBackground runs. Once StopBackground has run, Run runs
-// nothing and returns ErrStopped. The app runs its own work on the store
-// through it: the start's summary backfill and a requested summary.
+// Run runs f now, as work StopBackground waits for: f's context ends when ctx
+// does, or with stopping.ErrStopped when StopBackground runs. Once
+// StopBackground has run, Run runs nothing and returns stopping.ErrStopped.
+// Work admitted so may itself call Run or Go, which count it again.
 func (m *Manager) Run(ctx context.Context, f func(ctx context.Context) error) error {
 	if !m.beginBackground() {
-		return ErrStopped
+		return stopping.ErrStopped
 	}
 	defer m.endBackground()
 	runCtx, cancel := context.WithCancelCause(ctx)
@@ -743,16 +739,16 @@ func (m *Manager) endBackground() {
 	m.backgroundWork.Done()
 }
 
-// StopBackground cancels the work a session's end left running, with
-// ErrStopped, and waits until it has ended or ctx is done, so that the store
-// can close under none of it. With none running it returns nil at once, even
-// once ctx is done. No such work starts after it.
+// StopBackground cancels the work admitted through Go and Run, with
+// stopping.ErrStopped, and waits until it has ended or ctx is done, so that
+// the store can close under none of it. With none running it returns nil at
+// once, even once ctx is done. No such work starts after it.
 func (m *Manager) StopBackground(ctx context.Context) error {
 	m.mu.Lock()
 	m.backgroundStopped = true
 	running := m.backgroundRunning
 	m.mu.Unlock()
-	m.stopBackground(ErrStopped)
+	m.stopBackground(stopping.ErrStopped)
 	if running == 0 {
 		return nil
 	}
@@ -797,7 +793,7 @@ func (m *Manager) runBatchRefinement(ctx context.Context, sessionID, audioPath s
 	m.mu.Lock()
 	warn := m.refinementWarning
 	m.mu.Unlock()
-	if err != nil && errors.Is(context.Cause(ctx), ErrStopped) {
+	if err != nil && stopping.CutOff(ctx) {
 		// The stop cut it off: it stays running, as a process that exits
 		// inside it leaves it, and the next start runs it again once.
 		m.batchLogger.Info("batch refinement cut off by the stop; the next start runs it again", "operation", "batch_refinement", "session_id", sessionID, "audio_path", audioPath)
@@ -835,7 +831,8 @@ func (m *Manager) runBatchRefinement(ctx context.Context, sessionID, audioPath s
 // recorded audio, then regenerates the summary from the refined transcript. It
 // recovers sessions that ended without a usable live transcript (e.g. when live
 // transcription was unavailable at capture time). Intended to run off the
-// request path.
+// request path. It runs as work StopBackground waits for (Run), whoever calls
+// it, and returns stopping.ErrStopped once the stop has run.
 func (m *Manager) RefineSession(ctx context.Context, sessionID, audioPath string, startedAt time.Time) error {
 	if strings.TrimSpace(audioPath) == "" {
 		return fmt.Errorf("session %s has no audio to refine", sessionID)
@@ -848,18 +845,23 @@ func (m *Manager) RefineSession(ctx context.Context, sessionID, audioPath string
 		return fmt.Errorf("batch transcription not configured")
 	}
 
-	m.runBatchRefinement(ctx, sessionID, audioPath)
-	m.generateSummary(ctx, sessionID, startedAt)
-	return nil
+	return m.Run(ctx, func(ctx context.Context) error {
+		m.runBatchRefinement(ctx, sessionID, audioPath)
+		m.generateSummary(ctx, sessionID, startedAt)
+		return nil
+	})
 }
 
 // SummarizeSession makes session sessionID's summary again from its
 // transcript as it is, without refining it, then indexes and syncs it as a
 // refinement's summary is: "Delete text" of a session whose audio is gone,
-// so there is nothing to refine.
+// so there is nothing to refine. It runs as work StopBackground waits for
+// (Run), and returns stopping.ErrStopped once the stop has run.
 func (m *Manager) SummarizeSession(ctx context.Context, sessionID string, startedAt time.Time) error {
-	m.generateSummary(ctx, sessionID, startedAt)
-	return nil
+	return m.Run(ctx, func(ctx context.Context) error {
+		m.generateSummary(ctx, sessionID, startedAt)
+		return nil
+	})
 }
 
 func (m *Manager) generateSummary(ctx context.Context, sessionID string, startedAt time.Time) {
@@ -942,7 +944,7 @@ func (m *Manager) generateSummary(ctx context.Context, sessionID string, started
 	if strings.TrimSpace(title) == "" {
 		title = summary.GenerateTitle("", transcript, segments, startedAt)
 	}
-	if err != nil && errors.Is(context.Cause(ctx), ErrStopped) {
+	if err != nil && stopping.CutOff(ctx) {
 		// The stop cut it off: it stays running, and the next start's
 		// backfill makes it (storage.SQLiteStore.GetSessionsForBackfill).
 		m.logger.Info("summary cut off by the stop; the next start makes it", "operation", "generate_summary", "session_id", sessionID)
@@ -1120,9 +1122,9 @@ func (m *Manager) SetRefinementWarningHook(hook func(sessionID, warning string))
 	m.refinementWarning = hook
 }
 
-// SetSessionEndedHook sets what runs, in its own goroutine, each time a
-// session ends, kept or discarded: the meeting voice cancels the questions
-// the ended meeting still waits on.
+// SetSessionEndedHook sets what runs, in its own goroutine and as work
+// StopBackground waits for (Go), each time a session ends, kept or discarded:
+// the meeting voice cancels the questions the ended meeting still waits on.
 func (m *Manager) SetSessionEndedHook(hook func(sessionID string)) {
 	m.mu.Lock()
 	defer m.mu.Unlock()

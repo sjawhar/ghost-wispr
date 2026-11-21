@@ -150,6 +150,9 @@ func (i *Indexer) indexSession(ctx context.Context, sessionID, transcript string
 	return nil
 }
 
+// BackfillMissing indexes every session with no embeddings, two at a time.
+// It returns only once every worker it started has ended, also when ctx ends
+// first: a worker writes the store, which its caller may close next.
 func (i *Indexer) BackfillMissing(ctx context.Context) error {
 	ids, err := i.store.GetSessionsWithoutEmbeddings()
 	if err != nil {
@@ -165,20 +168,15 @@ func (i *Indexer) BackfillMissing(ctx context.Context) error {
 
 	for _, id := range ids {
 		select {
+		case sem <- struct{}{}:
 		case <-ctx.Done():
+			wg.Wait()
 			return ctx.Err()
-		default:
 		}
 
 		wg.Add(1)
 		go func(sessionID string) {
 			defer wg.Done()
-
-			select {
-			case sem <- struct{}{}:
-			case <-ctx.Done():
-				return
-			}
 			defer func() { <-sem }()
 
 			transcript, _, generation, err := i.store.GetCanonicalTranscriptWithGeneration(sessionID)

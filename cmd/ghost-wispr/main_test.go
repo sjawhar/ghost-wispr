@@ -829,7 +829,7 @@ func TestRefreshKeptRawRecordings(t *testing.T) {
 	var cache atomic.Pointer[server.KeptRawRecordings]
 	ctx, cancel := context.WithCancel(context.Background())
 	refreshed := goDone(func() {
-		refreshKeptRawRecordings(ctx, kept, func() int { return 10 }, &cache, 10*time.Millisecond)
+		refreshKeptRawRecordings(ctx, directBackground{}, kept, func() int { return 10 }, &cache, 10*time.Millisecond)
 	})
 	t.Cleanup(func() {
 		cancel()
@@ -878,7 +878,7 @@ func TestKeptRawWarningSizeNeverWraps(t *testing.T) {
 		var cache atomic.Pointer[server.KeptRawRecordings]
 		ctx, cancel := context.WithCancel(context.Background())
 		refreshed := goDone(func() {
-			refreshKeptRawRecordings(ctx, newKeptRecordings(openKeptStore(t), audio.NewRecorder(t.TempDir()), t.TempDir(), nil, nil), func() int { return int(tc.budgetMB) }, &cache, time.Hour)
+			refreshKeptRawRecordings(ctx, directBackground{}, newKeptRecordings(openKeptStore(t), audio.NewRecorder(t.TempDir()), t.TempDir(), nil, nil), func() int { return int(tc.budgetMB) }, &cache, time.Hour)
 		})
 		for deadline := time.Now().Add(testWait); cache.Load() == nil; time.Sleep(time.Millisecond) {
 			if time.Now().After(deadline) {

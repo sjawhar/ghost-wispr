@@ -417,7 +417,8 @@ func recordRefinementRetryFailure(registry *warningsRegistry, sessionID string, 
 
 // retryRefinement is the "Retry refinement" action: it restores the
 // session's recordings this unit lacks (ensureRecordings), then refines it,
-// and keeps a status warning while the retry fails.
+// and keeps a status warning while the retry fails. It runs as work the stop
+// cuts off and waits for (d.background.Run), whoever calls it.
 func (d *segmentDeleteRunner) retryRefinement(ctx context.Context, sessionID string) error {
 	ensure := func(ctx context.Context, sessionID string) error {
 		session, err := d.store.GetSession(sessionID)
@@ -426,9 +427,11 @@ func (d *segmentDeleteRunner) retryRefinement(ctx context.Context, sessionID str
 		}
 		return d.restoreRefinementRecording(ctx, d.store, &session, d.audioDir(), d.ensureRecordings)
 	}
-	return retryRefinementWithFailureWarning(ctx, d.warnings, sessionID, func(ctx context.Context, sessionID string) error {
-		return retryRefinementAfterRestoringRecording(ctx, sessionID, ensure, func(ctx context.Context, sessionID string) error {
-			return retryRefinementWithWarningClear(ctx, d.warnings, d.store, sessionID, d.refine)
+	return d.background.Run(ctx, func(ctx context.Context) error {
+		return retryRefinementWithFailureWarning(ctx, d.warnings, sessionID, func(ctx context.Context, sessionID string) error {
+			return retryRefinementAfterRestoringRecording(ctx, sessionID, ensure, func(ctx context.Context, sessionID string) error {
+				return retryRefinementWithWarningClear(ctx, d.warnings, d.store, sessionID, d.refine)
+			})
 		})
 	})
 }

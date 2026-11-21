@@ -73,7 +73,7 @@ func TestGCReportsItsHoldAsItStarts(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	collected := goDone(func() {
-		collectGarbage(ctx, cfgStore, store, &driveSync{}, health, newWarningsRegistry(), logger, time.Hour)
+		collectGarbage(ctx, directBackground{}, cfgStore, store, &driveSync{}, health, newWarningsRegistry(), logger, time.Hour)
 	})
 	t.Cleanup(func() {
 		cancel()

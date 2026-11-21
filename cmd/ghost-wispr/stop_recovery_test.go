@@ -18,6 +18,7 @@ import (
 	"github.com/sjawhar/ghost-wispr/internal/logtest"
 	recordingname "github.com/sjawhar/ghost-wispr/internal/recording"
 	"github.com/sjawhar/ghost-wispr/internal/session"
+	"github.com/sjawhar/ghost-wispr/internal/stopping"
 	"github.com/sjawhar/ghost-wispr/internal/storage"
 	"github.com/sjawhar/ghost-wispr/internal/transcribe"
 )
@@ -235,8 +236,10 @@ func TestARefinementAStopCutOffRunsAgainOnce(t *testing.T) {
 // recorder, as saving a long recording does: the stop must still return at
 // its deadline (main's 30 s and 5 s, scaled to 50 ms and 150 ms). Before, its
 // wait for the session's events began a time limit of its own after the
-// deadline was spent. The next start leaves the refinement failed, with
-// Retry's warning, and transcribes nothing.
+// deadline was spent. The hung refinement is the app's background work too
+// (session.Manager.RefineSession runs inside Run), so the stop warns that this
+// work did not end, as well as the retries. The next start leaves the
+// refinement failed, with Retry's warning, and transcribes nothing.
 func TestAStopDuringARetryEndsOnTimeAndTheRetryIsNotRunAgain(t *testing.T) {
 	dir := t.TempDir()
 	db := filepath.Join(dir, "stop.db")
@@ -282,7 +285,7 @@ func TestAStopDuringARetryEndsOnTimeAndTheRetryIsNotRunAgain(t *testing.T) {
 	if took > deadline+50*time.Millisecond {
 		t.Fatalf("the stop took %v, past its %v shutdown deadline", took, deadline)
 	}
-	if want := []string{"force end session failed", "lifecycle event publishing did not finish before shutdown", "the refinement retries a stop cut off did not end before shutdown"}; !slices.Equal(warned, want) {
+	if want := []string{"force end session failed", "lifecycle event publishing did not finish before shutdown", "the app's background work on the store did not end before shutdown", "the refinement retries a stop cut off did not end before shutdown"}; !slices.Equal(warned, want) {
 		t.Fatalf("the stop warned %q, want %q", warned, want)
 	}
 
@@ -631,8 +634,8 @@ func TestTheStopWaitsForARequestedSummary(t *testing.T) {
 	hook := resummarizeUntilStop(manager, store, summarizer, &recordingBroadcaster{}, func(string) {})
 	go func() { _ = hook(context.Background(), id, "minutes") }() // as the API runs it
 	stopDuringSummary(t, store, manager, summarizer, id, nil)
-	if err := hook(context.Background(), id, ""); !errors.Is(err, session.ErrStopped) {
-		t.Fatalf("a requested summary after the stop = %v, want %v", err, session.ErrStopped)
+	if err := hook(context.Background(), id, ""); !errors.Is(err, stopping.ErrStopped) {
+		t.Fatalf("a requested summary after the stop = %v, want %v", err, stopping.ErrStopped)
 	}
 }
 

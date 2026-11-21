@@ -14,12 +14,15 @@ func (m *Manager) publishSessionStarted(sessionID string) {
 	m.publishLifecycle(sessionID, "session_started", true, EventPublisher.PublishSessionStarted)
 }
 
+// publishSessionEnded runs the session-ended hook, as work StopBackground
+// waits for (Go): the Concierge's part of it writes the store. A session that
+// ends after the stop runs no hook.
 func (m *Manager) publishSessionEnded(sessionID string) {
 	m.mu.Lock()
 	hook := m.sessionEnded
 	m.mu.Unlock()
 	if hook != nil {
-		go hook(sessionID)
+		m.Go(func(context.Context) { hook(sessionID) })
 	}
 	m.publishLifecycle(sessionID, "session_ended", false, EventPublisher.PublishSessionEnded)
 }

@@ -7,7 +7,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/sjawhar/ghost-wispr/internal/session"
+	"github.com/sjawhar/ghost-wispr/internal/stopping"
 )
 
 // lifecyclePublishWait bounds the stop's wait for the current session's
@@ -15,12 +15,42 @@ import (
 const lifecyclePublishWait = 5 * time.Second
 
 // newAppContext is the app's context. stop ends it at shutdown with the cause
-// session.ErrStopped, so work it cuts off reads, as work the session
+// stopping.ErrStopped, so work it cuts off reads, as work the session
 // manager's stop cuts off does, as stopped and not as failed: the start's
 // summary backfill leaves its summary running for the next start.
 func newAppContext() (ctx context.Context, stop func()) {
 	ctx, cancel := context.WithCancelCause(context.Background())
-	return ctx, func() { cancel(session.ErrStopped) }
+	return ctx, func() { cancel(stopping.ErrStopped) }
+}
+
+// backgroundWork admits work the stop cuts off and waits for: the session
+// manager's Go and Run (session.Manager). Every goroutine of the app that
+// writes the store, and that no caller waits for, starts through Go or runs
+// inside Run, so the store closes under none of it. A loop runs each pass
+// inside Run, and ends once Run refuses it (stopping.ErrStopped).
+type backgroundWork interface {
+	Go(f func(ctx context.Context))
+	Run(ctx context.Context, f func(ctx context.Context) error) error
+}
+
+// runPasses runs pass inside background.Run at once and then every interval,
+// until ctx ends or the stop refuses a pass.
+func runPasses(ctx context.Context, background backgroundWork, interval time.Duration, pass func(ctx context.Context)) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		if err := background.Run(ctx, func(ctx context.Context) error {
+			pass(ctx)
+			return nil
+		}); errors.Is(err, stopping.ErrStopped) {
+			return
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
 }
 
 // stopRecoveryStore is what the app keeps in the store about the
@@ -80,11 +110,12 @@ func (r *stopRecovery) retry(ctx context.Context, warnings *warningsRegistry, re
 
 // stop ends the current session and waits, within shutdownCtx's deadline, for
 // any session end under way (a pause's), for the session's lifecycle events
-// (for lifecycleWait at most), for the work the session ends left running
-// (their refinements and summaries), which the stop cuts off, and for the
-// start's retries, which the stop has cancelled, so the database closes under
-// none of them and the stop still ends on time. A refinement or summary cut
-// off stays running in the store, for the next start (session.ErrStopped).
+// (for lifecycleWait at most), for the app's background work on the store
+// (backgroundWork: what a session's end leaves running, the merge hook, the
+// retries, the sweeps), which the stop cuts off, and for the start's
+// retries, which the stop has cancelled, so the database closes under none of
+// them and the stop still ends on time. A refinement or summary cut off stays
+// running in the store, for the next start (stopping.ErrStopped).
 func (r *stopRecovery) stop(shutdownCtx context.Context, manager shutdownSessionEnder, lifecycleWait time.Duration) {
 	if err := manager.ForceEndSession(shutdownCtx); err != nil {
 		slog.Warn("force end session failed", "error", err)
@@ -95,7 +126,7 @@ func (r *stopRecovery) stop(shutdownCtx context.Context, manager shutdownSession
 		slog.Warn("lifecycle event publishing did not finish before shutdown", "error", err)
 	}
 	if err := manager.StopBackground(shutdownCtx); err != nil {
-		slog.Warn("the work the session ends left running did not end before shutdown", "error", err)
+		slog.Warn("the app's background work on the store did not end before shutdown", "error", err)
 	}
 	retried := make(chan struct{})
 	go func() {

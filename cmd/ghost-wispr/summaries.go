@@ -13,6 +13,7 @@ import (
 	"google.golang.org/genai"
 
 	"github.com/sjawhar/ghost-wispr/internal/session"
+	"github.com/sjawhar/ghost-wispr/internal/stopping"
 	"github.com/sjawhar/ghost-wispr/internal/storage"
 )
 
@@ -111,6 +112,9 @@ func summarizeMergedSession(ctx context.Context, store *storage.SQLiteStore, sum
 
 	title, summaryText, preset, speakerNames, model, err := summarizer.SummarizeReported(ctx, sessionID, transcript)
 	if err != nil {
+		if cutOffByTheStop(ctx) {
+			return
+		}
 		slog.Warn("summarization failed for merged session", "session_id", sessionID, "error", err)
 		failSummary(store, hub, sessionID, generation, err)
 		return
@@ -163,11 +167,11 @@ func summarizeBackfillSession(ctx context.Context, store *storage.SQLiteStore, s
 }
 
 // cutOffByTheStop reports whether the stop cut off the work ctx is for
-// (session.ErrStopped). A summary cut off so is left running, with the
+// (stopping.ErrStopped). A summary cut off so is left running, with the
 // session's last good one kept, and the next start's backfill makes it
 // (storage.SQLiteStore.GetSessionsForBackfill): it did not fail.
 func cutOffByTheStop(ctx context.Context) bool {
-	if errors.Is(context.Cause(ctx), session.ErrStopped) {
+	if stopping.CutOff(ctx) {
 		slog.Info("summary cut off by the stop; the next start makes it")
 		return true
 	}
@@ -184,6 +188,25 @@ func startSummaryBackfill(ctx context.Context, manager *session.Manager, backfil
 			return nil
 		})
 	}()
+}
+
+// mergedSessionHook is the API's OnSessionMerged: the refinement and summary
+// of a session a merge just made (onSessionMerged), run as work the stop cuts
+// off and waits for (session.Manager.Run). summarizer nil makes the summary
+// with the manager's own summarizer (session.Manager.SummarizeSession).
+func mergedSessionHook(manager *session.Manager, store *storage.SQLiteStore, summarizer session.ReportedSummarizer, hub summaryBroadcaster, publish func(sessionID string), retryRefinement func(context.Context, string) error, recordRefinementFailure func(context.Context, string, error)) func(context.Context, string) {
+	return func(ctx context.Context, sessionID string) {
+		_ = manager.Run(ctx, func(ctx context.Context) error {
+			onSessionMerged(ctx, store, manager.RefineSession, func(ctx context.Context, sessionID string, startedAt time.Time) error {
+				if summarizer == nil {
+					return manager.SummarizeSession(ctx, sessionID, startedAt)
+				}
+				summarizeMergedSession(ctx, store, summarizer, hub, publish, sessionID)
+				return nil
+			}, retryRefinement, recordRefinementFailure, sessionID)
+			return nil
+		})
+	}
 }
 
 // summaryBackfill is the start's summary backfill: the sessions whose summary
