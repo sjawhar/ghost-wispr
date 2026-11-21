@@ -184,7 +184,7 @@ func quickKeyterms() (*LiveKeyterms, *fakeStream) {
 // it answered.
 func TestKeytermsChangeOnJoin(t *testing.T) {
 	k := NewLiveKeyterms([]string{"Wispr", "Ghost Wispr"}, func() []string { return []string{"INFRA", "OPS"} })
-	base := []string{"Wispr", "Ghost Wispr", "INFRA", "OPS"}
+	base := []string{"Wispr", "Whisper", "Ghost Wispr", "INFRA", "OPS"}
 	stream := &fakeStream{}
 	k.Attach(stream, k.List())
 	if !slices.Equal(k.List(), base) || len(stream.configured) != 0 {
@@ -192,7 +192,7 @@ func TestKeytermsChangeOnJoin(t *testing.T) {
 	}
 
 	k.SetJoined([]string{"ABC-12"})
-	joined := []string{"Wispr", "Ghost Wispr", "ABC-12", "INFRA", "OPS"}
+	joined := []string{"Wispr", "Whisper", "Ghost Wispr", "ABC-12", "INFRA", "OPS"}
 	if len(stream.configured) != 1 || !slices.Equal(stream.configured[0], joined) {
 		t.Fatalf("a join sent %q, want one Configure with %q", stream.configured, joined)
 	}
@@ -218,7 +218,7 @@ func TestKeytermsChangeOnJoin(t *testing.T) {
 	k.SetJoined([]string{"XYZ-9"})
 	late := &fakeStream{}
 	k.Attach(late, dialed)
-	want := []string{"Wispr", "Ghost Wispr", "XYZ-9", "INFRA", "OPS"}
+	want := []string{"Wispr", "Whisper", "Ghost Wispr", "XYZ-9", "INFRA", "OPS"}
 	if len(late.configured) != 1 || !slices.Equal(late.configured[0], want) {
 		t.Fatalf("a socket dialled before the join got %q, want one Configure with %q", late.configured, want)
 	}
@@ -253,12 +253,12 @@ func TestOneConfigureWaitsForItsAnswer(t *testing.T) {
 		t.Fatalf("the stream got %q before it answered the first Configure, want one", got)
 	}
 	stream.answer(true)
-	if got, want := stream.sent(), []string{"Wispr", "XYZ-9", "INFRA"}; len(got) != 2 || !slices.Equal(got[1], want) {
+	if got, want := stream.sent(), []string{"Wispr", "Whisper", "XYZ-9", "INFRA"}; len(got) != 2 || !slices.Equal(got[1], want) {
 		t.Fatalf("after the answer the stream got %q, want the newest list %q second", got, want)
 	}
 	k.SetJoined([]string{"XYZ-9", "DEF-3"})
 	stream.answer(false)
-	want := []string{"Wispr", "XYZ-9", "DEF-3", "INFRA"}
+	want := []string{"Wispr", "Whisper", "XYZ-9", "DEF-3", "INFRA"}
 	if got := stream.sent(); len(got) != 3 || !slices.Equal(got[2], want) {
 		t.Fatalf("after a refusal with a newer list wanted the stream got %q, want %q third, at once", got, want)
 	}
@@ -277,7 +277,7 @@ func TestARefusedListIsNotTheStreams(t *testing.T) {
 	k, stream := quickKeyterms()
 	refused := false
 	k.SetRefusalHook(func(r bool) { refused = r })
-	joined := []string{"Wispr", "ABC-12", "INFRA"}
+	joined := []string{"Wispr", "Whisper", "ABC-12", "INFRA"}
 	k.SetJoined([]string{"ABC-12"})
 	stream.answer(false)
 	if !refused {
@@ -302,7 +302,7 @@ func TestARefusedListIsNotTheStreams(t *testing.T) {
 // it again, with a resend of its own.
 func TestASecondRefusalWaitsForTheNextChange(t *testing.T) {
 	k, stream := quickKeyterms()
-	joined := []string{"Wispr", "ABC-12", "INFRA"}
+	joined := []string{"Wispr", "Whisper", "ABC-12", "INFRA"}
 	k.SetJoined([]string{"ABC-12"})
 	stream.answer(false)
 	waitSent(t, stream, 2)
