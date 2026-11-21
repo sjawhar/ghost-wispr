@@ -477,12 +477,14 @@ func (r *Roster) Deliver(ctx context.Context, m *envoy.Message) (bool, error) {
 		return true, nil
 	}
 	// A command Envoy delivers again was taken: it acts once, whatever the
-	// agent's membership is now.
+	// agent's membership is now. One that came while the roster had no Envoy
+	// session was not taken (it could not even be answered), so Envoy's next
+	// delivery of it acts.
 	if m.EventID != "" {
 		r.mu.Lock()
 		h := r.historyLocked(m.SourceSession)
 		taken := slices.Contains(h.events, m.EventID)
-		if !taken {
+		if !taken && r.open {
 			h.events = append(h.events, m.EventID)
 			if extra := len(h.events) - maxEvents; extra > 0 {
 				h.events = slices.Delete(h.events, 0, extra)

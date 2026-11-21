@@ -224,6 +224,36 @@ func TestARedeliveredCommandIsANoOp(t *testing.T) {
 	})
 }
 
+// TestACommandTheRosterCouldNotTakeActsWhenDeliveredAgain fails if a join
+// that arrived before the roster had its Envoy session, so it could take
+// nothing and answer nothing, is remembered as taken: delivered again once
+// the roster holds the session, it must join. A join taken once and delivered
+// again is the control: it joins once.
+func TestACommandTheRosterCouldNotTakeActsWhenDeliveredAgain(t *testing.T) {
+	r := newRig(t, nil)
+	r.roster.SetAgents(nil)
+	join := &envoy.Message{EventID: "e-early", SourceSession: "agent-1", Text: "ghost-wispr join ABC-12", IssuedAt: r.clock.Now()}
+	if _, err := r.roster.Deliver(context.Background(), join); err != nil {
+		t.Fatal(err)
+	}
+	if len(r.roster.Joined()) != 0 {
+		t.Fatal("control: a join with no Envoy session made a membership")
+	}
+	r.roster.SetAgents(r.agents)
+	if _, err := r.roster.Deliver(context.Background(), join); err != nil {
+		t.Fatal(err)
+	}
+	if got := r.roster.Joined(); len(got) != 1 {
+		t.Fatalf("the join delivered again once the roster had its Envoy session made %d memberships, want 1", len(got))
+	}
+	if _, err := r.roster.Deliver(context.Background(), join); err != nil {
+		t.Fatal(err)
+	}
+	if got := r.roster.Joined(); len(got) != 1 || got[0].ID != "agent-1#1" {
+		t.Fatalf("control: the join taken and delivered again acted again: %+v", got)
+	}
+}
+
 // TestAnAgentsRatesSurviveARejoin fails if an agent that leaves and joins
 // again may ask for the floor again within 5 minutes, or get a second pointer
 // within 60 s; once those pass, the next is taken.
