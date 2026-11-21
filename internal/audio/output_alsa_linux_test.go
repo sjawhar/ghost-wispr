@@ -4,6 +4,7 @@ package audio
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"math"
 	"runtime"
@@ -693,5 +694,119 @@ func TestOutputPlaysThroughALSAWithoutPortAudio(t *testing.T) {
 	// Control: the count sees an initialization.
 	if err := InitializePortAudio(); err != nil || initialized.Load() != 1 {
 		t.Fatalf("control: InitializePortAudio = %v, counted %d initializations, want 1", err, initialized.Load())
+	}
+}
+
+// replaySpy is a speaker stream on the ALSA stream code that counts, after a
+// Drop, the voiced samples of the voice (above the chime's level) in the
+// writes that mix again what the Drop took back, and when the last came.
+type replaySpy struct {
+	base         *alsaStream
+	mu           sync.Mutex
+	left, voiced int
+	last         time.Time
+	done         chan struct{}
+}
+
+func (s *replaySpy) bufferFrames() int { return s.base.bufferFrames() }
+func (s *replaySpy) queuedFrames() int { return s.base.queuedFrames() }
+func (s *replaySpy) Close() error      { return s.base.Close() }
+
+func (s *replaySpy) Write(frame []int16) error {
+	err := s.base.Write(frame)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.left > 0 {
+		for _, v := range frame {
+			if v > 100 {
+				s.voiced++
+				s.last = time.Now()
+			}
+		}
+		if s.left -= len(frame); s.left <= 0 {
+			close(s.done)
+		}
+	}
+	return err
+}
+
+func (s *replaySpy) Drop() (int, error) {
+	n, err := s.base.Drop()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.left = n; n == 0 {
+		close(s.done)
+	}
+	return n, err
+}
+
+// TestASpeechEndsOnlyOnceTheDeviceCannotGiveItBack fails if the voice's
+// speech is reported ended while the device still holds some of its audio,
+// as an ALSA buffer granted longer than speechEndHold does: a Cancel of the
+// chime then gave that audio back and the mixer played it again after the
+// speech's end, and a Cancel of the voice, no longer speaking, left it in
+// (Sol's review of #133 at f398ca8 found 960 samples of a cancelled voice
+// replayed with a 150 ms buffer). The 80 ms buffer is the control: it holds
+// no voice when its speech ends, before or after this fix.
+func TestASpeechEndsOnlyOnceTheDeviceCannotGiveItBack(t *testing.T) {
+	for _, buffer := range []int{80, 150} {
+		for _, cancelVoice := range []bool{false, true} {
+			t.Run(fmt.Sprintf("a %d ms buffer, the voice cancelled %v", buffer, cancelVoice), func(t *testing.T) {
+				pcm := newFakePCM(48000, 48*buffer)
+				spy := &replaySpy{base: streamOn(pcm), done: make(chan struct{})}
+				out := NewOutput(OutputConfig{Open: func(string) (PlaybackStream, int, error) { return spy, 48000, nil }})
+				t.Cleanup(func() { _ = out.Close() })
+				ends := make(chan SpeechEvent, 4)
+				defer out.OnSpeech(func(e SpeechEvent) {
+					if e.Input == InputVoice && !e.Started {
+						ends <- e
+					}
+				})()
+				ctx, cancel := context.WithTimeout(t.Context(), 4*time.Second)
+				defer cancel()
+				chime := out.Begin(InputChime)
+				go func() { _ = chime.WriteAll(ctx, constant(48000, 2*time.Second, 7), mono48k) }()
+				waitFor(t, "the device to play the chime", func() bool {
+					pcm.mu.Lock()
+					defer pcm.mu.Unlock()
+					return pcm.runs[len(pcm.runs)-1].started
+				})
+				if err := out.Begin(InputVoice).WriteAll(ctx, constant(48000, 20*time.Millisecond, 1000), mono48k); err != nil {
+					t.Fatal(err)
+				}
+				var end SpeechEvent
+				select {
+				case end = <-ends:
+				case <-ctx.Done():
+					t.Fatal("the voice's speech never ended")
+				}
+				pcm.mu.Lock()
+				run, held := pcm.runs[len(pcm.runs)-1], 0
+				for _, v := range run.samples[pcm.consumed(run, time.Now()):] {
+					if v > 100 {
+						held++
+					}
+				}
+				pcm.mu.Unlock()
+				if held > 0 {
+					t.Fatalf("the speech ended while the device still held %d samples of it", held)
+				}
+				if cancelVoice {
+					out.Cancel(InputVoice)
+				}
+				out.Cancel(InputChime)
+				select {
+				case <-spy.done:
+				case <-ctx.Done():
+					t.Fatal("the replay never ended")
+				}
+				spy.mu.Lock()
+				last, replayed := spy.last, spy.voiced
+				spy.mu.Unlock()
+				if replayed > 0 {
+					t.Fatalf("the mixer played %d samples of the ended voice again, the last %v after its end", replayed, last.Sub(end.At))
+				}
+			})
+		}
 	}
 }

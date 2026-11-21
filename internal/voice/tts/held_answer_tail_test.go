@@ -80,6 +80,7 @@ func (s *tailSpeaker) playedBy(at time.Time) bool {
 }
 
 func (s *tailSpeaker) OnSpeech(func(audio.SpeechEvent)) func() { return func() {} }
+func (s *tailSpeaker) FlushSpeech()                            {}
 
 type tailPlayback struct {
 	s     *tailSpeaker

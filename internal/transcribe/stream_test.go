@@ -217,6 +217,299 @@ func TestADropBeforeAWordDoesNotCountForIt(t *testing.T) {
 	}
 }
 
+// TestManyDropsKeepEachPointsCount fails if, past many drops of the send
+// queue, a point of the stream between two of them stops counting the drop
+// before it: the oldest two used to merge at the later place, so a word
+// between them was timed by audio captured earlier than its own (Sol's
+// review of #133 at d125fc1).
+func TestManyDropsKeepEachPointsCount(t *testing.T) {
+	rc := NewResilientClient(t.Context(), nil, ResilientConfig{SampleRate: 16000}, nil, nil)
+	for range 1100 {
+		_, _ = rc.Write(make([]byte, 32)) // 1 ms taken
+		rc.sendQueueDropped(320)          // then 10 ms dropped
+	}
+	// 1.5 ms into the stream lies between the first drop, after the first
+	// 1 ms, and the second, after the second: it counts the first.
+	if got, want := rc.CapturedBefore(1500*time.Microsecond), 11500*time.Microsecond; got != want {
+		t.Fatalf("CapturedBefore(1.5ms) = %v, want %v: the 1.5 ms of the stream and the 10 ms dropped before it", got, want)
+	}
+}
+
+// TestCapturedAtTimesAPointByWhenItsAudioWasCaptured fails if CapturedAt
+// does not place a point of the socket's stream at the time its audio was
+// captured, on the system clock: the time of the buffer that holds it, less
+// the buffer's audio after the point, whether the client took that buffer, a
+// send queue in front of it holds it while the uplink stalls, or the queue
+// dropped later ones. It must not move with when the time is asked, as when
+// a result arrives late. The voice tells the words of the question it
+// answers from words said over it by this time.
+func TestCapturedAtTimesAPointByWhenItsAudioWasCaptured(t *testing.T) {
+	// within fails unless got lies in [lo, hi].
+	within := func(t *testing.T, what string, got time.Time, ok bool, lo, hi time.Time) {
+		t.Helper()
+		if !ok || got.Before(lo) || got.After(hi) {
+			t.Fatalf("CapturedAt(%s) = %v, %v; want a time from %v to %v", what, got.Format(time.StampMicro), ok, lo.Format(time.StampMicro), hi.Format(time.StampMicro))
+		}
+	}
+	t.Run("before any audio", func(t *testing.T) {
+		rc := NewResilientClient(t.Context(), nil, ResilientConfig{}, nil, nil)
+		if at, ok := rc.CapturedAt(0); ok {
+			t.Fatalf("CapturedAt(0) = %v with no audio captured, want none", at)
+		}
+	})
+	t.Run("the client's own writes", func(t *testing.T) {
+		socket := &mockWriter{}
+		rc := NewResilientClient(t.Context(), func(context.Context) (io.WriteCloser, error) { return socket, nil }, ResilientConfig{}, nil, nil)
+		rc.reconnect(0)
+		lo1 := time.Now()
+		_, _ = rc.Write(make([]byte, secondOfAudio)) // stream 0-1 s, captured by this write
+		hi1 := time.Now()
+		time.Sleep(100 * time.Millisecond)
+		lo2 := time.Now()
+		_, _ = rc.Write(make([]byte, secondOfAudio)) // stream 1-2 s
+		hi2 := time.Now()
+		time.Sleep(50 * time.Millisecond) // a result that arrives later
+		at, ok := rc.CapturedAt(1500 * time.Millisecond)
+		within(t, "1.5s", at, ok, lo2.Add(-500*time.Millisecond), hi2.Add(-500*time.Millisecond))
+		at, ok = rc.CapturedAt(500 * time.Millisecond)
+		within(t, "0.5s", at, ok, lo1.Add(-500*time.Millisecond), hi1.Add(-500*time.Millisecond))
+		if at, ok := rc.CapturedAt(2500 * time.Millisecond); ok {
+			t.Fatalf("CapturedAt(2.5s) = %v, after all the audio captured; want none", at)
+		}
+	})
+	t.Run("a send queue on a stalled uplink", func(t *testing.T) {
+		socket := &heldSocket{entered: make(chan struct{}, 8), release: make(chan struct{})}
+		t.Cleanup(func() { close(socket.release) })
+		rc := NewResilientClient(t.Context(), func(context.Context) (io.WriteCloser, error) { return socket, nil }, ResilientConfig{}, nil, nil)
+		rc.reconnect(0)
+		sender := NewAsyncSender(t.Context(), rc, 4, nil)
+		_, _ = sender.Write(make([]byte, secondOfAudio)) // stream 0-1 s: the socket write that waits
+		<-socket.entered
+		_, _ = sender.Write(make([]byte, secondOfAudio)) // stream 1-2 s, queued
+		_, _ = sender.Write(make([]byte, secondOfAudio)) // stream 2-3 s, queued
+		lo := time.Now()
+		_, _ = sender.Write(make([]byte, secondOfAudio)) // stream 3-4 s, queued
+		hi := time.Now()
+		for range 2 {
+			_, _ = sender.Write(make([]byte, secondOfAudio)) // dropped
+		}
+		time.Sleep(50 * time.Millisecond)
+		// 3.5 s into the stream, half a second before its buffer's end.
+		at, ok := rc.CapturedAt(3500 * time.Millisecond)
+		within(t, "3.5s", at, ok, lo.Add(-500*time.Millisecond), hi.Add(-500*time.Millisecond))
+	})
+	t.Run("a word after the send queue dropped audio", func(t *testing.T) {
+		// The queue's drops are in the count of audio captured but not in
+		// the socket's stream: a word after them is in a later buffer than
+		// its place in the stream reads (Sol's review of #133 at 0dfeaad
+		// found the earlier cases blind to the drops, being before them).
+		socket := &heldSocket{entered: make(chan struct{}, 8), release: make(chan struct{})}
+		released := false
+		t.Cleanup(func() {
+			if !released {
+				close(socket.release)
+			}
+		})
+		rc := NewResilientClient(t.Context(), func(context.Context) (io.WriteCloser, error) { return socket, nil }, ResilientConfig{}, nil, nil)
+		rc.reconnect(0)
+		sender := NewAsyncSender(t.Context(), rc, 4, nil)
+		_, _ = sender.Write(make([]byte, secondOfAudio)) // stream 0-1 s: the socket write that waits
+		<-socket.entered
+		for range 3 {
+			_, _ = sender.Write(make([]byte, secondOfAudio)) // stream 1-4 s, queued
+		}
+		for range 2 {
+			_, _ = sender.Write(make([]byte, secondOfAudio)) // captured 4-6 s, dropped
+		}
+		close(socket.release)
+		released = true
+		for range 3 {
+			<-socket.entered // the queued audio goes out
+		}
+		time.Sleep(100 * time.Millisecond)
+		lo := time.Now()
+		_, _ = sender.Write(make([]byte, secondOfAudio)) // captured 6-7 s, stream 4-5 s
+		hi := time.Now()
+		<-socket.entered
+		at, ok := rc.CapturedAt(4500 * time.Millisecond)
+		within(t, "4.5s", at, ok, lo.Add(-500*time.Millisecond), hi.Add(-500*time.Millisecond))
+	})
+	t.Run("a later buffer held back", func(t *testing.T) {
+		// A buffer can reach the client late, as when the read of the light
+		// before it is slow: its time is no capture time, and must not move
+		// the words of the buffers before it.
+		socket := &mockWriter{}
+		rc := NewResilientClient(t.Context(), func(context.Context) (io.WriteCloser, error) { return socket, nil }, ResilientConfig{}, nil, nil)
+		rc.reconnect(0)
+		sender := NewAsyncSender(t.Context(), rc, 4, nil)
+		const quarter = secondOfAudio / 4
+		lo := time.Now()
+		_, _ = sender.Write(make([]byte, quarter)) // stream 0-0.25 s, on time
+		hi := time.Now()
+		time.Sleep(time.Second)
+		_, _ = sender.Write(make([]byte, quarter)) // stream 0.25-0.5 s, a second late
+		at, ok := rc.CapturedAt(0)
+		within(t, "0s", at, ok, lo.Add(-250*time.Millisecond), hi.Add(-250*time.Millisecond))
+	})
+	t.Run("the first words after a gap in capture", func(t *testing.T) {
+		// A capture pause leaves a gap in time that the count of audio does
+		// not hold: a word just after it was captured with the buffer after
+		// the gap, never at the time of the buffer before.
+		socket := &mockWriter{}
+		rc := NewResilientClient(t.Context(), func(context.Context) (io.WriteCloser, error) { return socket, nil }, ResilientConfig{}, nil, nil)
+		rc.reconnect(0)
+		const quarter = secondOfAudio / 4
+		_, _ = rc.Write(make([]byte, quarter)) // stream 0-0.25 s
+		time.Sleep(time.Second)                // capture paused
+		lo := time.Now()
+		_, _ = rc.Write(make([]byte, quarter)) // stream 0.25-0.5 s, after the resume
+		hi := time.Now()
+		at, ok := rc.CapturedAt(250 * time.Millisecond)
+		within(t, "0.25s", at, ok, lo.Add(-250*time.Millisecond), hi.Add(-250*time.Millisecond))
+	})
+	t.Run("a buffer held back after its capture", func(t *testing.T) {
+		// The microphone's read time, marked before the light check, is the
+		// buffer's: the words in it keep it however long the check held it.
+		socket := &mockWriter{}
+		rc := NewResilientClient(t.Context(), func(context.Context) (io.WriteCloser, error) { return socket, nil }, ResilientConfig{}, nil, nil)
+		rc.reconnect(0)
+		sender := NewAsyncSender(t.Context(), rc, 4, nil)
+		const quarter = secondOfAudio / 4
+		read := time.Now()
+		sender.MarkRead(read)
+		time.Sleep(time.Second) // a slow read of the light
+		_, _ = sender.Write(make([]byte, quarter))
+		at, ok := rc.CapturedAt(125 * time.Millisecond) // halfway through it
+		within(t, "0.125s", at, ok, read.Add(-125*time.Millisecond), read.Add(-125*time.Millisecond))
+	})
+	t.Run("audio a full buffer evicted while a new socket drains it", func(t *testing.T) {
+		// The stream skips audio the buffer lost before it was sent: the
+		// words after it are the audio written after, not the audio lost.
+		rc := NewResilientClient(t.Context(), nil, ResilientConfig{SampleRate: 16000, BufferSize: 8192}, nil, nil)
+		_, _ = rc.Write(make([]byte, 8192)) // A, 256 ms, buffered with no socket
+		time.Sleep(300 * time.Millisecond)
+		rc.Mu.Lock()
+		rc.origin = rc.accepted - int64(rc.Buffer.Len()) // a socket connects and starts on A
+		rc.State = StateDraining
+		rc.Buffer.Discard(4096) // and has taken A's first half
+		rc.Mu.Unlock()
+		lo := time.Now()
+		_, _ = rc.Write(make([]byte, 8192)) // B, buffered behind it: the full buffer evicts A's second half
+		hi := time.Now()
+		// The socket's 128 ms is B's start, 256 ms before B was captured.
+		at, ok := rc.CapturedAt(128 * time.Millisecond)
+		within(t, "0.128s", at, ok, lo.Add(-256*time.Millisecond), hi.Add(-256*time.Millisecond))
+	})
+	t.Run("a Finalize after some audio was sent", func(t *testing.T) {
+		// Finalize drops the buffered audio, which comes after the audio
+		// already sent: the words of that audio keep their times.
+		socket := &mockWriter{}
+		rc := NewResilientClient(t.Context(), func(context.Context) (io.WriteCloser, error) { return socket, nil }, ResilientConfig{}, nil, nil)
+		rc.reconnect(0)
+		_, _ = rc.Write(make([]byte, secondOfAudio)) // A, sent
+		rc.Mu.Lock()
+		rc.State = StateDraining
+		_, _ = rc.Buffer.Write(make([]byte, secondOfAudio)) // B, buffered, not yet sent
+		rc.accepted += secondOfAudio
+		rc.Mu.Unlock()
+		before, ok := rc.CapturedAt(500 * time.Millisecond)
+		if err := rc.Finalize(); err != nil {
+			t.Fatal(err)
+		}
+		after, ok2 := rc.CapturedAt(500 * time.Millisecond)
+		if !ok || !ok2 || !after.Equal(before) {
+			t.Fatalf("a word in A captured at %v before Finalize and %v after, want the same", before.Format(time.StampMicro), after.Format(time.StampMicro))
+		}
+	})
+}
+
+// TestAChunkLargerThanTheBufferIsAHoleToo fails if, while a socket drains, a
+// microphone chunk larger than the whole buffer loses its own first bytes to
+// the buffer with no hole recorded: the next socket byte was then timed by
+// audio captured 122 ms earlier than its own (Sol's review of #133 at
+// 55bdf53).
+func TestAChunkLargerThanTheBufferIsAHoleToo(t *testing.T) {
+	socket := &mockWriter{}
+	rc := NewResilientClient(t.Context(), func(context.Context) (io.WriteCloser, error) { return socket, nil }, ResilientConfig{SampleRate: 16000, BufferSize: 4096}, nil, nil)
+	rc.reconnect(0)
+	_, _ = rc.Write(make([]byte, 4096)) // sent: the socket's first 128 ms
+	rc.Mu.Lock()
+	rc.State = StateDraining
+	rc.Mu.Unlock()
+	_, _ = rc.Write(make([]byte, 8000)) // buffered: its first 3,904 bytes do not fit
+	if got, want := rc.CapturedBefore(128*time.Millisecond), 250*time.Millisecond; got != want {
+		t.Fatalf("CapturedBefore(128ms) = %v, want %v: the socket's next byte is the last 4,096 bytes of the 8,000-byte chunk", got, want)
+	}
+}
+
+// TestAnOldPointKeepsItsTime fails if a point of the stream that the clock
+// still times moves when later drops come: compacting old drop records into
+// the counts every point shares moved CapturedAt(500ms) by the dropped
+// second, though its stamp was still kept (Sol's review of #133 at 55bdf53).
+func TestAnOldPointKeepsItsTime(t *testing.T) {
+	socket := &mockWriter{}
+	rc := NewResilientClient(t.Context(), func(context.Context) (io.WriteCloser, error) { return socket, nil }, ResilientConfig{SampleRate: 16000}, nil, nil)
+	rc.reconnect(0)
+	_, _ = rc.Write(make([]byte, secondOfAudio))
+	rc.sendQueueDropped(secondOfAudio)
+	for range 361 * 4 {
+		_, _ = rc.Write(make([]byte, secondOfAudio/4))
+	}
+	before, ok := rc.CapturedAt(500 * time.Millisecond)
+	if !ok {
+		t.Fatal("control: the clock no longer times 0.5 s")
+	}
+	rc.sendQueueDropped(secondOfAudio / 4)
+	if after, ok := rc.CapturedAt(500 * time.Millisecond); !ok || !after.Equal(before) {
+		t.Fatalf("CapturedAt(500ms) = %v (%v) after a later drop, %v before; want it unchanged", after.Format(time.StampMicro), ok, before.Format(time.StampMicro))
+	}
+}
+
+// stampOrder is a live client that records, as the send queue stamps a
+// chunk, whether the chunk is already on the queue for the client to take:
+// no client goroutine runs, so the check needs no timing.
+type stampOrder struct {
+	s             *AsyncSender
+	stamps        int
+	queuedAtStamp int
+}
+
+func (*stampOrder) watchSendQueue(func() int64) {}
+func (*stampOrder) sendQueueDropped(int64)      {}
+
+func (*stampOrder) writeFromQueue([]byte, *atomic.Int64) (int, error) {
+	panic("no client takes from the queue in this test")
+}
+
+func (o *stampOrder) captured(time.Time, int64) {
+	o.stamps++
+	o.queuedAtStamp += len(o.s.queue)
+}
+
+// TestTheSendQueueStampsAChunkBeforeItHandsItOn fails if the send queue
+// hands a chunk to the live client before it has stamped when the chunk was
+// captured: a result for the chunk's words could then be timed from the
+// stamp before it, which a capture pause can place long before. It reads
+// the queue from inside the stamp, with no client goroutine, so it fails
+// whenever the hand-off comes first, however a machine schedules it (Sol's
+// review of #133 at aaa8e0f found the earlier check, a 50 ms stamp, passing
+// when the client was run later still).
+func TestTheSendQueueStampsAChunkBeforeItHandsItOn(t *testing.T) {
+	client := &stampOrder{}
+	s := &AsyncSender{slots: make([][]byte, 1), free: make(chan int, 1), queue: make(chan sendItem, 1), watcher: client}
+	client.s = s
+	s.free <- 0
+	if n, err := s.Write(make([]byte, secondOfAudio/4)); n != secondOfAudio/4 || err != nil {
+		t.Fatalf("Write = %d, %v", n, err)
+	}
+	if client.stamps != 1 || len(s.queue) != 1 {
+		t.Fatalf("control: %d stamps and %d queued chunks, want one of each", client.stamps, len(s.queue))
+	}
+	if client.queuedAtStamp != 0 {
+		t.Fatal("the send queue handed the chunk on before it stamped its capture")
+	}
+}
+
 // eventSocket logs its Close as "close <name>".
 type eventSocket struct {
 	name     string

@@ -89,6 +89,8 @@ func newLiveTranscription(ctx context.Context, apiKey string, cOptions *interfac
 			warnings.Set(deepgramWarningKey, deepgramNotConnected)
 		}
 	}
+	// The voice times each word by when its audio was captured.
+	callback.heardAt = rc.CapturedAt
 	rc.Factory = makeDeepgramClientFactory(ctx, apiKey, cOptions, tOptions, callback, deepgramWriteTimeout)
 	if manager, ok := callback.manager.(liveManager); ok && manager != nil {
 		manager.SetLiveStream(rc)

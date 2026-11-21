@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -31,7 +32,14 @@ type fakeSpeaker struct {
 	nextID    int
 	began     chan string              // each Begin's input
 	hold      map[string]chan struct{} // a Begin on this input waits until it closes
-	events    chan audio.SpeechEvent
+	// queued are the speech events not yet delivered, wake says some came,
+	// and held, when set, holds the speaker's own delivery until it closes
+	// (holdEvents): a FlushSpeech still delivers them. deliverMu keeps the
+	// deliveries in order.
+	queued    []audio.SpeechEvent
+	wake      chan struct{}
+	held      chan struct{}
+	deliverMu sync.Mutex
 	// cancelDelay holds each Cancel of an input back, as a late cancel does.
 	cancelDelay map[string]time.Duration
 	writePace   map[string]time.Duration // each Write on an input takes this long
@@ -41,6 +49,16 @@ type fakeSpeaker struct {
 	// default, so a sound ends with its writes unless a test holds its tail
 	// (holdDrain). Any other input drains at finish or Cancel.
 	drainsAtOnce map[string]bool
+	// barrier, set by a test, stops the speaker's own delivery once, as it
+	// begins: before it takes deliverMu, reads the hold or takes the events.
+	barrier *deliveryBarrier
+}
+
+// deliveryBarrier stops one delivery of the speaker's own: it closes entered,
+// waits until release closes, and closes returned once that delivery has
+// returned.
+type deliveryBarrier struct {
+	entered, release, returned chan struct{}
 }
 
 func newFakeSpeaker() *fakeSpeaker {
@@ -52,25 +70,83 @@ func newFakeSpeaker() *fakeSpeaker {
 		finished:     map[string]chan struct{}{},
 		listeners:    map[int]func(audio.SpeechEvent){},
 		began:        make(chan string, 64),
-		events:       make(chan audio.SpeechEvent, 256),
+		wake:         make(chan struct{}, 1),
 		drainsAtOnce: map[string]bool{audio.InputChime: true},
 	}
 	// Speech events reach listeners in order on a goroutine of the speaker's,
-	// as audio.Output sends them: never inside Cancel or Write.
+	// as audio.Output sends them: never inside Cancel or Write. While
+	// holdEvents holds them, it delivers nothing; a FlushSpeech still does.
 	go func() {
-		for e := range s.events {
-			s.mu.Lock()
-			fns := make([]func(audio.SpeechEvent), 0, len(s.listeners))
-			for _, fn := range s.listeners {
-				fns = append(fns, fn)
-			}
-			s.mu.Unlock()
-			for _, fn := range fns {
-				fn(e)
+		for range s.wake {
+			for !s.deliver(true) {
+				s.mu.Lock()
+				held := s.held
+				s.mu.Unlock()
+				if held != nil {
+					<-held
+				}
 			}
 		}
 	}()
 	return s
+}
+
+// FlushSpeech delivers every speech event queued so far, in order, on the
+// caller's goroutine, as audio.Output's does, also while holdEvents holds
+// the speaker's own delivery.
+func (s *fakeSpeaker) FlushSpeech() { s.deliver(false) }
+
+// deliver delivers every speech event queued so far, in order. With auto,
+// the speaker's own delivery, it delivers nothing and reports false if
+// holdEvents holds the events: the hold is read in the same step that takes
+// the events, so none queued after holdEvents returned slips through.
+func (s *fakeSpeaker) deliver(auto bool) bool {
+	if auto {
+		s.mu.Lock()
+		b := s.barrier
+		s.barrier = nil
+		s.mu.Unlock()
+		if b != nil {
+			close(b.entered)
+			<-b.release
+			defer close(b.returned)
+		}
+	}
+	s.deliverMu.Lock()
+	defer s.deliverMu.Unlock()
+	s.mu.Lock()
+	if auto && s.held != nil {
+		s.mu.Unlock()
+		return false
+	}
+	events := s.queued
+	s.queued = nil
+	fns := make([]func(audio.SpeechEvent), 0, len(s.listeners))
+	for _, fn := range s.listeners {
+		fns = append(fns, fn)
+	}
+	s.mu.Unlock()
+	for _, e := range events {
+		for _, fn := range fns {
+			fn(e)
+		}
+	}
+	return true
+}
+
+// holdEvents holds the speaker's own delivery of speech events, as a busy
+// machine can, until release is called; a FlushSpeech still delivers them.
+func (s *fakeSpeaker) holdEvents() (release func()) {
+	ch := make(chan struct{})
+	s.mu.Lock()
+	s.held = ch
+	s.mu.Unlock()
+	return sync.OnceFunc(func() {
+		s.mu.Lock()
+		s.held = nil
+		s.mu.Unlock()
+		close(ch)
+	})
 }
 
 func (s *fakeSpeaker) Begin(input string) Playback {
@@ -170,12 +246,12 @@ func (s *fakeSpeaker) Cancel(input string) {
 		close(ch)
 		s.finished[input] = nil
 	}
-	was := s.speaking[input]
+	if s.speaking[input] {
+		s.queueLocked(audio.SpeechEvent{Input: input, Started: false, At: time.Now(), Cancelled: true})
+	}
 	s.speaking[input] = false
 	s.mu.Unlock()
-	if was {
-		s.emit(audio.SpeechEvent{Input: input, Started: false, At: time.Now(), Cancelled: true})
-	}
+	s.signal()
 }
 
 func (s *fakeSpeaker) OnSpeech(fn func(audio.SpeechEvent)) func() {
@@ -191,8 +267,25 @@ func (s *fakeSpeaker) OnSpeech(fn func(audio.SpeechEvent)) func() {
 	}
 }
 
+// emit queues e for the listeners.
 func (s *fakeSpeaker) emit(e audio.SpeechEvent) {
-	s.events <- e
+	s.mu.Lock()
+	s.queueLocked(e)
+	s.mu.Unlock()
+	s.signal()
+}
+
+// queueLocked queues e under s.mu, in one step with the state change it
+// reports, as audio.Output does; signal then wakes the delivery.
+func (s *fakeSpeaker) queueLocked(e audio.SpeechEvent) {
+	s.queued = append(s.queued, e)
+}
+
+func (s *fakeSpeaker) signal() {
+	select {
+	case s.wake <- struct{}{}:
+	default:
+	}
 }
 
 // paceWrites makes every Write on input take d, as the device plays it.
@@ -224,12 +317,12 @@ func (s *fakeSpeaker) finish(input string) {
 		close(ch)
 		s.finished[input] = nil
 	}
-	was := s.speaking[input]
+	if s.speaking[input] {
+		s.queueLocked(audio.SpeechEvent{Input: input, Started: false, At: time.Now()})
+	}
 	s.speaking[input] = false
 	s.mu.Unlock()
-	if was {
-		s.emit(audio.SpeechEvent{Input: input, Started: false, At: time.Now()})
-	}
+	s.signal()
 }
 
 func (s *fakeSpeaker) cancelledAt(input string) (time.Time, bool) {
@@ -275,12 +368,12 @@ func (p *fakePlayback) Write(ctx context.Context, frame []byte, format audio.Aud
 	if s.finished[p.input] == nil {
 		s.finished[p.input] = make(chan struct{})
 	}
-	started := !s.speaking[p.input]
+	if !s.speaking[p.input] {
+		s.queueLocked(audio.SpeechEvent{Input: p.input, Started: true, At: time.Now()})
+	}
 	s.speaking[p.input] = true
 	s.mu.Unlock()
-	if started {
-		s.emit(audio.SpeechEvent{Input: p.input, Started: true, At: time.Now()})
-	}
+	s.signal()
 	return nil
 }
 
@@ -499,6 +592,9 @@ type fakeConcierge struct {
 	afterAcks chan struct{}
 	// ackMode, when set, is the mode the acks are said in (Ack else).
 	ackMode SayMode
+	// afterLines, when set, holds Answer's return, after its lines are
+	// said, until it is closed.
+	afterLines chan struct{}
 	// toolsUnreachable makes every tool answer as with Dispatch out of reach.
 	toolsUnreachable bool
 }
@@ -549,6 +645,13 @@ func (c *fakeConcierge) Answer(ctx context.Context, x *Exchange, turn string, sa
 		if err := say(ctx, l, Fact); err != nil {
 			c.cancelled <- time.Now()
 			return err
+		}
+	}
+	if c.afterLines != nil {
+		select {
+		case <-c.afterLines:
+		case <-ctx.Done():
+			return ctx.Err()
 		}
 	}
 	c.mu.Lock()
@@ -808,15 +911,30 @@ func (r *rig) ask(question string) *fakeSession {
 	return s
 }
 
+// waitSession returns the next session the fake voice opened, once the
+// Supervisor has taken it: the fake publishes it before its Open returns, and
+// the Supervisor installs it only after, so a test that runs a tool at once
+// would find no voice open (Sol's review of #133 at 99f652f).
 func (r *rig) waitSession() *fakeSession {
 	r.t.Helper()
+	var s *fakeSession
 	select {
-	case s := <-r.voice.opened:
-		return s
+	case s = <-r.voice.opened:
 	case <-time.After(testWait):
 		r.t.Fatal("no voice session opened")
 		return nil
 	}
+	r.s.mu.Lock()
+	ex := r.s.ex
+	r.s.mu.Unlock()
+	if ex != nil {
+		select {
+		case <-ex.opened:
+		case <-time.After(testWait):
+			r.t.Fatal("the Supervisor did not finish opening the voice")
+		}
+	}
+	return s
 }
 
 func (r *rig) waitTurn() string {
@@ -887,5 +1005,58 @@ func never(t *testing.T, what string, d time.Duration, cond func() bool) {
 			t.Fatalf("%s", what)
 		}
 		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// TestHoldEventsStopsTheFakeSpeakersOwnDelivery fails if the fake speaker's
+// own delivery hands out an event queued after holdEvents returned, when that
+// delivery had begun just before: it read the hold, found none, and was then
+// held up before it took the events (Sol's review of #133 at 4b7f919). Tests
+// that hold events to stand for a slow delivery then lost that state. The
+// delivery is stopped by a barrier as it begins, which the test observes, so
+// the order needs no sleep (Sol's review of #133 at aaa8e0f found a sleep
+// that let a late delivery pass); a FlushSpeech still delivers the held
+// event.
+func TestHoldEventsStopsTheFakeSpeakersOwnDelivery(t *testing.T) {
+	s := newFakeSpeaker()
+	var mu sync.Mutex
+	var got []string
+	defer s.OnSpeech(func(e audio.SpeechEvent) {
+		mu.Lock()
+		defer mu.Unlock()
+		got = append(got, e.Input)
+	})()
+	delivered := func(input string) bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return slices.Contains(got, input)
+	}
+	b := &deliveryBarrier{entered: make(chan struct{}), release: make(chan struct{}), returned: make(chan struct{})}
+	letGo := sync.OnceFunc(func() { close(b.release) })
+	t.Cleanup(letGo)
+	s.mu.Lock()
+	s.barrier = b
+	s.mu.Unlock()
+	s.emit(audio.SpeechEvent{Input: "before", Started: true})
+	select {
+	case <-b.entered: // the speaker's own delivery has begun
+	case <-time.After(testWait):
+		t.Fatal("control: the speaker's own delivery never began")
+	}
+	release := s.holdEvents()
+	defer release()
+	s.emit(audio.SpeechEvent{Input: "after", Started: true})
+	letGo()
+	select {
+	case <-b.returned:
+	case <-time.After(testWait):
+		t.Fatal("control: the speaker's own delivery never returned")
+	}
+	if delivered("after") {
+		t.Fatal("the speaker's own delivery handed out an event queued during the hold")
+	}
+	s.FlushSpeech()
+	if !delivered("after") {
+		t.Fatal("control: FlushSpeech did not deliver the held event")
 	}
 }

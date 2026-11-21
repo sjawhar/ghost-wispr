@@ -32,16 +32,21 @@ const (
 	maxKeys = 3
 )
 
-// spokenKey is an issue key as a transcript writes it: ABC-12, or "infra
-// 4592" as said aloud. A single digit is too often a plain number.
-var spokenKey = regexp.MustCompile(`\b([A-Za-z][A-Za-z0-9]*)[- ](\d{2,})\b`)
+// spokenKey is an issue key as a transcript writes it: ABC-12, "infra 4592"
+// as said aloud, or "infra 10/27", a number said in two groups that smart
+// formatting writes as a date. A single digit is too often a plain number.
+var spokenKey = regexp.MustCompile(`\b([A-Za-z][A-Za-z0-9]*)[- ](\d+(?:/\d+)+|\d{2,})\b`)
 
 // keytermKey is an issue key as Deepgram writes one whose project is a
 // keyterm, so in capitals: its number after a pause ("INFRA? 4592."), split
-// by a thousands comma or a decimal point ("INFRA 4,592", "INFRA 45.92"), or
-// in words ("INFRA four thousand five hundred and ninety two", "INFRA
-// forty-five ninety-two"). Group 2 is the number in digits, group 3 in words.
-var keytermKey = regexp.MustCompile(`\b([A-Z][A-Z0-9]+)[?.,:;!]?[\s-]+(?:(\d+(?:[.,]\d+)+|\d{2,})\b|((?:(?i:zero|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety|hundred|thousand)\b[\s-]*(?:(?i:and)\s+)?)+))`)
+// by a thousands comma, a decimal point or a date's slash ("INFRA 4,592",
+// "INFRA 45.92", "INFRA 10/27"), or in words ("INFRA four thousand five
+// hundred and ninety two", "INFRA forty-five ninety-two"). Group 2 is the
+// number in digits, group 3 in words.
+var keytermKey = regexp.MustCompile(`\b([A-Z][A-Z0-9]+)[?.,:;!]?[\s-]+(?:(\d+(?:[.,/]\d+)+|\d{2,})\b|((?:(?i:zero|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety|hundred|thousand)\b[\s-]*(?:(?i:and)\s+)?)+))`)
+
+// keyGroups joins the groups of an issue number Deepgram wrote split.
+var keyGroups = strings.NewReplacer(",", "", ".", "", "/", "")
 
 // spokenKeys rewrites each key keytermKey reads in words to its written form,
 // "INFRA-4592", so the rest of the turn reads as before. A number of one
@@ -49,7 +54,7 @@ var keytermKey = regexp.MustCompile(`\b([A-Z][A-Z0-9]+)[?.,:;!]?[\s-]+(?:(\d+(?:
 func spokenKeys(words string) string {
 	return keytermKey.ReplaceAllStringFunc(words, func(match string) string {
 		parts := keytermKey.FindStringSubmatch(match)
-		digits := strings.NewReplacer(",", "", ".", "").Replace(parts[2])
+		digits := keyGroups.Replace(parts[2])
 		trail := ""
 		if parts[3] != "" {
 			digits = keyDigits(parts[3])
@@ -106,7 +111,7 @@ func keyDigits(said string) string {
 func issueKeysIn(words string) []string {
 	var keys []string
 	for _, match := range spokenKey.FindAllStringSubmatch(spokenKeys(words), -1) {
-		if key, err := dispatch.NormalizeIssueKey(match[1] + "-" + match[2]); err == nil {
+		if key, err := dispatch.NormalizeIssueKey(match[1] + "-" + keyGroups.Replace(match[2])); err == nil {
 			keys = append(keys, key)
 		}
 	}

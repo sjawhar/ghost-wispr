@@ -55,6 +55,8 @@ const outputAhead = 100 * time.Millisecond
 
 // speechEndHold is how long an input has nothing to play before its speech
 // ends, so that a writer a moment late with its next frame does not end it.
+// It ends no sooner than the stream has moved past its last audio by the
+// history a Drop can give back (mixFrame).
 const speechEndHold = 100 * time.Millisecond
 
 // outputCloseWait is how long Close waits for the mixer to close its stream.
@@ -117,13 +119,16 @@ type OutputConfig struct {
 
 // SpeechEvent reports that an input's audio started or ended on the stream,
 // for barge-in. A speech ends once its input has had nothing to play for
-// speechEndHold, or at once on Cancel.
+// speechEndHold and the device can no longer give its audio back, or at once
+// on Cancel.
 type SpeechEvent struct {
 	Input   string
 	Started bool // false: the speech ended
-	// At is when the speech's first audio went to the stream, or its last,
-	// on the system clock: the room hears it later, by as much as the device
-	// holds (up to alsaBuffer on Linux).
+	// At is when the stream took the frame with the speech's first audio,
+	// once its write returned, or when the speech's last audio was mixed, on
+	// the system clock: the room hears it later, by as much as the device
+	// holds (up to alsaBuffer on Linux). A speech the stream took no audio
+	// of, as one cut before its first frame was written, has no events.
 	At time.Time
 	// Played, on an end, is how much of the input's audio the stream took in
 	// the speech, less what a Cancel took back from the device.
@@ -185,6 +190,10 @@ type Output struct {
 	nextID    int
 	events    []SpeechEvent
 	eventWake chan struct{}
+	// deliverMu lets one delivery of events run at a time (deliver), and
+	// fns is its listeners' list, kept between deliveries.
+	deliverMu sync.Mutex
+	fns       []func(SpeechEvent)
 }
 
 // outputInput is one input's queue and its part in the mix. The Output's mu
@@ -217,10 +226,34 @@ type outputInput struct {
 	speaking  bool
 	cancelled bool // Cancel silenced its speech: the mixer takes it back and ends it
 	cut       bool // Cancel dropped audio of the speech still queued
+	// startFrame is the frame that holds its speech's first audio, which the
+	// speech starts with once the stream has taken it (wrote); startPending
+	// says it has not yet, and startedAt is when it did.
+	startFrame   uint64
+	startPending bool
+	startedAt    time.Time
+
+	// takenFrame is the newest frame with its speech's audio that the
+	// stream has taken (wrote), and takenAt when. A speech ends once the
+	// stream has taken its last audio (lastFrame): an end that comes before,
+	// held in endEvent while endPending, waits for the write of endFrame.
+	takenFrame uint64
+	takenAt    time.Time
+	endPending bool
+	endFrame   uint64
+	endEvent   SpeechEvent
 	// silenced is the playback whose audio the stream took last before
 	// Cancel: what Cancel takes back from the device comes off what it played.
-	silenced  *Playback
-	lastAudio time.Time
+	silenced *Playback
+	// audioTo is the stream position just past the speech's last audio: past
+	// where its last queued sample lands, after the resampler's delay, or
+	// past its last audible sample, the filter's response to that audio, if
+	// later. A speech ends only once the stream has moved past it by the
+	// history a Drop can give back, and a replay that brings it back stamps
+	// the speech's end (replayed).
+	audioTo   int64
+	landedTo  int       // past the last position of the frame being mixed that holds queued audio (land)
+	lastFrame uint64    // the frame that holds its speech's last audio
 	quietAt   time.Time // when it ran out of audio; zero while it has some
 	spoken    playedTime
 	contrib   []float32 // its part in the frame being mixed
@@ -670,6 +703,7 @@ func (in *outputInput) render(rate int) {
 	if in.rs.from != in.rate || in.rs.to != rate {
 		in.rs.configure(in.rate, rate)
 	}
+	in.landedTo = 0
 	if in.rs.bypass() {
 		for i := range in.contrib {
 			s, pb := in.pull()
@@ -724,9 +758,11 @@ func (in *outputInput) render(rate int) {
 	}
 }
 
-// land counts one queued sample, at the input's rate, at landed[j].
+// land counts one queued sample, at the input's rate, at landed[j], and
+// notes how far into the stream the frame's queued audio reaches (landedTo).
 func (in *outputInput) land(j int) {
 	in.landed[j] = heldCount(int(in.landed[j]>>24)+1, in.rate)
+	in.landedTo = max(in.landedTo, j+1)
 }
 
 // run is the Output's mixer: it waits for audio, then plays a stream until
@@ -891,13 +927,16 @@ func (o *Output) mix(stream PlaybackStream, rate int) error {
 				o.retake(redo[:back], sum)
 				// What the stream took back plays again: the stream time
 				// written is as before, so the pacer is not touched. A
-				// Cancel during it takes back the device's audio again.
+				// Cancel during it takes back the device's audio again. A
+				// speech whose last audio is replayed was taken, last, at
+				// that write (replayed).
 				off, again := 0, false
 				for off < back && !again {
 					end := min(off+n, back)
 					if err := stream.Write(redo[off:end]); err != nil {
 						return fmt.Errorf("write speaker stream: %w", err)
 					}
+					o.replayed(back, off, end, time.Now())
 					off, again = end, end < back && o.takeDrop()
 				}
 				if !again {
@@ -912,18 +951,37 @@ func (o *Output) mix(stream PlaybackStream, rate int) error {
 		if err != nil {
 			return fmt.Errorf("write speaker stream: %w", err)
 		}
+		// When the stream took the frame, before anything that can wait: the
+		// underrun callback, or the Output's lock.
+		took := time.Now()
 		if counter != nil && o.cfg.Underrun != nil {
 			if n := counter.underruns(); n > underruns {
 				underruns = n
 				o.cfg.Underrun()
 			}
 		}
-		o.wrote(seq)
-		p.wrote(time.Since(began), time.Now())
+		o.wrote(seq, took)
+		p.wrote(took.Sub(began), took)
 		if active {
 			quiet = 0
 		} else {
 			quiet += n
+		}
+	}
+}
+
+// replayed records that the stream has taken again, at now, the samples off
+// to end of the last back samples it took back (Drop): a speech whose last
+// audio was among them was taken, last, only then (endSpeech). A speech whose
+// last audio came earlier in the replay keeps that write's time: the replay's
+// silence after it is not its speech.
+func (o *Output) replayed(back, off, end int, now time.Time) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	from := o.pos - int64(back)
+	for _, in := range o.order {
+		if in.speaking && in.takenFrame >= in.lastFrame && in.audioTo > from+int64(off) && in.audioTo <= from+int64(end) {
+			in.takenAt = now
 		}
 	}
 }
@@ -1013,13 +1071,44 @@ func (o *Output) takeDrop() bool {
 	return drop
 }
 
-// wrote records that the stream has taken frame seq, and wakes every Write
-// and Drain that waits.
-func (o *Output) wrote(seq uint64) {
+// wrote records that the stream has taken frame seq, at at, and wakes every
+// Write and Drain that waits.
+func (o *Output) wrote(seq uint64, at time.Time) {
 	o.lockForMix()
 	defer o.mu.Unlock()
 	o.written = seq
+	// A speech starts when the stream has taken its first audio: a write the
+	// device holds back holds back its start. A speech Cancel cut while its
+	// first write was held never starts: its start would come after whatever
+	// took the speaker over, and be taken for that. A speech ends when the
+	// stream has taken its last audio, so an end comes before the next start.
+	// The times are when the stream took the frame, not when the lock came.
+	now := at
+	for _, in := range o.order {
+		if in.takenFrame < in.lastFrame && in.lastFrame <= seq {
+			in.takenFrame, in.takenAt = in.lastFrame, now
+		}
+		if in.endPending && in.endFrame <= seq {
+			o.emitEndLocked(in, now)
+		}
+		if in.startPending && in.startFrame <= seq && !in.cancelled {
+			in.startPending, in.startedAt = false, now
+			o.emit(SpeechEvent{Input: in.name, Started: true, At: now})
+		}
+	}
 	o.changed()
+}
+
+// emitEndLocked reports in's pending speech end as at, never before its
+// start. The caller holds mu.
+func (o *Output) emitEndLocked(in *outputInput, at time.Time) {
+	e := in.endEvent
+	in.endPending, in.endEvent = false, SpeechEvent{}
+	e.At = at
+	if e.At.Before(in.startedAt) {
+		e.At = in.startedAt
+	}
+	o.emit(e)
 }
 
 // mixFrame mixes the inputs' next frame into frame, keeps each one's part in
@@ -1040,10 +1129,15 @@ func (o *Output) mixFrame(frame []int16, sum []float32, rate, hist int, now time
 			clear(in.contrib)
 		case in.idle():
 			clear(in.contrib)
+			// A speech ends once its input has had nothing to play for
+			// speechEndHold, and the stream has moved past its last audio by
+			// the history a Drop can give back (hist): until then a Cancel of
+			// another input can replay its tail, and a Cancel of it must take
+			// that tail back.
 			if in.speaking {
 				if in.quietAt.IsZero() {
 					in.quietAt = now
-				} else if now.Sub(in.quietAt) >= speechEndHold {
+				} else if now.Sub(in.quietAt) >= speechEndHold && o.pos-in.audioTo >= int64(hist) {
 					o.endSpeech(in, now, false)
 				}
 			}
@@ -1059,9 +1153,21 @@ func (o *Output) mixFrame(frame []int16, sum []float32, rate, hist int, now time
 			}
 			if queued && !in.speaking {
 				in.speaking, in.unlanded = true, playedTime{}
-				o.emit(SpeechEvent{Input: in.name, Started: true, At: now})
+				in.startFrame, in.startPending = o.mixed, true
 			}
-			in.lastAudio, in.quietAt = now, time.Time{}
+			if in.landedTo > 0 {
+				in.audioTo = o.pos + int64(in.landedTo)
+			}
+			// The filter's response to the last queued audio runs on past
+			// where that audio lands: the speech's audio ends with its last
+			// audible sample, which a replay may bring back alone.
+			for j := len(in.contrib) - 1; j >= 0; j-- {
+				if clip(in.contrib[j]) != 0 {
+					in.audioTo = max(in.audioTo, o.pos+int64(j+1))
+					break
+				}
+			}
+			in.lastFrame, in.quietAt = o.mixed, time.Time{}
 			active = true
 		}
 		for i, c := range in.contrib {
@@ -1167,21 +1273,34 @@ func (o *Output) retake(redo []int16, sum []float32) {
 func (o *Output) endSpeeches(now time.Time, cancelled bool) {
 	for _, in := range o.order {
 		o.endSpeech(in, now, cancelled)
+		if in.endPending { // the stream closes: its last audio is not taken
+			o.emitEndLocked(in, now)
+		}
 	}
 }
 
-// endSpeech reports the input's speech ended, if one was under way. The
-// caller holds mu.
+// endSpeech reports the input's speech ended, if one was under way: at once
+// when Cancel cut it, else once the stream has taken its last audio, as when
+// that write returned. The caller holds mu.
 func (o *Output) endSpeech(in *outputInput, now time.Time, cancelled bool) {
 	if !in.speaking {
 		return
 	}
-	at := in.lastAudio
-	if cancelled {
-		at = now
+	// A speech the stream never took audio of never started, and does not
+	// end either.
+	if !in.startPending {
+		in.endEvent = SpeechEvent{Input: in.name, Played: in.spoken.total(), Cancelled: cancelled}
+		in.endPending = true
+		switch {
+		case cancelled:
+			o.emitEndLocked(in, now)
+		case in.takenFrame >= in.lastFrame:
+			o.emitEndLocked(in, in.takenAt)
+		default:
+			in.endFrame = in.lastFrame
+		}
 	}
-	o.emit(SpeechEvent{Input: in.name, At: at, Played: in.spoken.total(), Cancelled: cancelled})
-	in.speaking, in.cancelled, in.cut, in.silenced, in.spoken, in.quietAt = false, false, false, nil, playedTime{}, time.Time{}
+	in.speaking, in.startPending, in.cancelled, in.cut, in.silenced, in.spoken, in.quietAt = false, false, false, false, nil, playedTime{}, time.Time{}
 }
 
 func clip(s float32) int16 {
@@ -1203,25 +1322,41 @@ func (o *Output) emit(e SpeechEvent) {
 
 // dispatch calls the listeners with each event, in order, until Close.
 func (o *Output) dispatch() {
-	var fns []func(SpeechEvent)
 	for {
 		<-o.eventWake
-		o.mu.Lock()
-		events := o.events
-		o.events = nil
-		fns = fns[:0]
-		for _, fn := range o.listeners {
-			fns = append(fns, fn)
-		}
-		closed := o.closed
-		o.mu.Unlock()
-		for _, e := range events {
-			for _, fn := range fns {
-				fn(e)
-			}
-		}
-		if closed {
+		if o.deliver() {
 			return
 		}
 	}
+}
+
+// FlushSpeech calls the listeners with every speech event queued so far, in
+// order, on the caller's goroutine, and returns once they have had them: a
+// decision that reads the speech can take in what the speaker has had,
+// though the Output's own delivery waits. The caller must not hold a lock a
+// listener takes.
+func (o *Output) FlushSpeech() { o.deliver() }
+
+// deliver calls the listeners with the events queued so far, in order, and
+// reports whether the Output is closed. Deliveries take turns (deliverMu),
+// so the events keep their order whoever delivers them.
+func (o *Output) deliver() (closed bool) {
+	o.deliverMu.Lock()
+	defer o.deliverMu.Unlock()
+	o.mu.Lock()
+	events := o.events
+	o.events = nil
+	o.fns = o.fns[:0]
+	for _, fn := range o.listeners {
+		o.fns = append(o.fns, fn)
+	}
+	fns := o.fns
+	closed = o.closed
+	o.mu.Unlock()
+	for _, e := range events {
+		for _, fn := range fns {
+			fn(e)
+		}
+	}
+	return closed
 }

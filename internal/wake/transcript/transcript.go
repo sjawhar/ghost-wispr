@@ -415,18 +415,22 @@ func numberWord(w string) bool {
 	_, o := ones[w]
 	_, te := teens[w]
 	_, tn := tens[w]
-	return o || te || tn || w == "hundred"
+	return o || te || tn || w == "hundred" || w == "thousand"
 }
+
+// writtenGroups joins the groups of a number smart formatting wrote split.
+var writtenGroups = strings.NewReplacer(",", "", "/", "")
 
 // spokenNumber reads the digits that tokens open with: written digits, or
 // number words read in groups ("ten twenty-seven" is 10 then 27, "one oh two
-// seven" is 1, 0, 2, 7, "eleven hundred five" is 1105). It reports the digits
-// and how many tokens it read.
+// seven" is 1, 0, 2, 7, "eleven hundred five" is 1105, "one thousand and
+// twenty seven" is 1027). It reports the digits and how many tokens it read.
 func spokenNumber(tokens []string) (string, int) {
 	if len(tokens) > 0 {
 		// Written digits, with the grouping commas smart formatting writes
-		// ("4,592").
-		if w := strings.ReplaceAll(strings.TrimSuffix(normalise(tokens[0]), "'s"), ",", ""); digitsOnly(w) {
+		// ("4,592"), or the slash of the date it writes for a number said
+		// in two groups ("10/27").
+		if w := writtenGroups.Replace(strings.TrimSuffix(normalise(tokens[0]), "'s")); digitsOnly(w) {
 			return w, 1
 		}
 	}
@@ -434,19 +438,20 @@ func spokenNumber(tokens []string) (string, int) {
 	used := 0
 	for used < len(tokens) {
 		w := normalise(tokens[used])
-		if w == "hundred" && b.Len() > 0 {
+		if places := scalePlaces[w]; places > 0 && b.Len() > 0 {
 			// "eleven hundred five": what follows fills the hundred's two
-			// places; "forty five hundred and two" says "and" first.
+			// places, a thousand's three; "forty five hundred and two" says
+			// "and" first.
 			after := tokens[used+1:]
 			skip := 0
 			if len(after) > 1 && normalise(after[0]) == "and" {
 				after, skip = after[1:], 1
 			}
 			rest, n := spokenNumber(after)
-			if len(rest) > 2 || n == 0 {
+			if len(rest) > places || n == 0 {
 				rest, n, skip = "", 0, 0
 			}
-			b.WriteString(strings.Repeat("0", 2-len(rest)) + rest)
+			b.WriteString(strings.Repeat("0", places-len(rest)) + rest)
 			return b.String(), used + 1 + skip + n
 		}
 		o, isOne := ones[w]
@@ -472,6 +477,9 @@ func spokenNumber(tokens []string) (string, int) {
 	}
 	return b.String(), used
 }
+
+// scalePlaces is how many digits follow a scale word of a spoken number.
+var scalePlaces = map[string]int{"hundred": 2, "thousand": 3}
 
 func lettersOnly(w string) bool {
 	for _, r := range w {

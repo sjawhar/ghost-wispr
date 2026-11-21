@@ -74,6 +74,7 @@ func (s *realtimeSpeaker) Cancel(input string) {
 }
 
 func (s *realtimeSpeaker) OnSpeech(func(audio.SpeechEvent)) func() { return func() {} }
+func (s *realtimeSpeaker) FlushSpeech()                            {}
 
 type rtPlayback struct {
 	s     *realtimeSpeaker

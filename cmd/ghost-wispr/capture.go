@@ -1128,6 +1128,11 @@ type gateStampedWriter interface {
 // the mic loop closes the microphone and opens it again under a new red
 // confirmation.
 func (w *gatedWriter) Write(p []byte) (int, error) {
+	// The microphone read p just now: its time, before the light's read can
+	// hold p back, times p's words for the voice.
+	if m, ok := w.dst.(readMarker); ok {
+		m.markRead(time.Now())
+	}
 	g := w.gate
 	g.mu.Lock()
 	if g.closed {

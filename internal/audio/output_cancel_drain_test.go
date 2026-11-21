@@ -758,3 +758,68 @@ func TestASecondCancelKeepsTheFirstCut(t *testing.T) {
 		})
 	}
 }
+
+// TestAReplayOfAResampledTailStampsTheSpeechsEnd fails if a speech of 24 kHz
+// audio on a 48 kHz stream, whose filter tail a Drop of another input brings
+// back, keeps an end stamped before that replay is taken: the speech's audio
+// was taken to end where its last queued sample lands, before its filter
+// response ends, so a replay starting after that point was not its speech
+// (Sol's review of #133 at aaa8e0f: 18 voice samples replayed, the end
+// 160 ms before them). The 480-sample control's replay includes the point
+// where the last sample lands.
+func TestAReplayOfAResampledTailStampsTheSpeechsEnd(t *testing.T) {
+	for _, back := range []int{480, 440} {
+		t.Run(fmt.Sprintf("%d samples given back", back), func(t *testing.T) {
+			stream := &probeStream{fakeStream: newFakeStream(48000)}
+			out, start, events := probeOutput(t, stream)
+			barrier := newProbeBarrier()
+			t.Cleanup(barrier.unblock)
+			ctx := testContext(t)
+			voice, chime := out.Begin(InputVoice), out.Begin(InputChime)
+			if err := voice.Write(ctx, constant(24000, 10*time.Millisecond, 10000), AudioFormat{SampleRate: 24000, Channels: 1}); err != nil {
+				t.Fatal(err)
+			}
+			if err := chime.Write(ctx, constant(48000, 20*time.Millisecond, 7), mono48k); err != nil {
+				t.Fatal(err)
+			}
+			replayed, taken := make(chan int, 1), make(chan time.Time, 1)
+			drops := 0
+			stream.drop = func() (int, error) {
+				if drops++; drops == 1 {
+					return back, nil
+				}
+				return 0, nil
+			}
+			stream.before = func(n int, frame []int16) {
+				switch n {
+				case 2:
+					out.Cancel(InputChime)
+				case 3: // the replay
+					replayed <- probeNonzero(frame)
+					barrier.hold()
+				}
+			}
+			stream.after = func(n int, _ []int16) {
+				if n == 3 {
+					taken <- time.Now()
+				}
+			}
+			start()
+			probeWait(t, barrier.entered, "the replay of the voice's filter tail")
+			samples := <-replayed
+			if samples == 0 {
+				t.Fatal("fixture: the replay holds none of the voice")
+			}
+			time.Sleep(150 * time.Millisecond)
+			barrier.unblock()
+			at := <-taken
+			end := probeVoiceEvent(t, events, false)
+			if end.Cancelled {
+				t.Fatal("fixture: the voice was cancelled")
+			}
+			if end.At.Before(at) {
+				t.Fatalf("the speech ended %v before the stream took the replay of %d samples of it", at.Sub(end.At).Round(time.Millisecond), samples)
+			}
+		})
+	}
+}

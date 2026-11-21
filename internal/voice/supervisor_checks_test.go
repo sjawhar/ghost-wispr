@@ -327,14 +327,18 @@ func TestStopRuleForEveryVoice(t *testing.T) {
 		for name, stop := range stops {
 			t.Run(v.name+"/"+name, func(t *testing.T) {
 				r, sess := v.start(t)
+				started := speechStart(r)
 				stop.do(r)
 				interrupted := func() bool { i, _, _ := sess.state(); return !i.IsZero() }
 				if !stop.stops {
-					never(t, "one word stopped the voice", 200*time.Millisecond, interrupted)
+					never(t, "one word stopped the voice", 200*time.Millisecond, func() bool { return interrupted() || voiceCutAfter(r, started) })
 					return
 				}
 				eventually(t, "the voice interrupted", interrupted)
-				if _, ok := r.speaker.cancelledAt(audio.InputVoice); !ok {
+				// The exchange cut the voice input as it took the floor, before
+				// its voice spoke: only a cancel after the speech started is the
+				// stop's.
+				if !voiceCutAfter(r, started) {
 					t.Error("the voice input was not cancelled")
 				}
 			})
@@ -342,24 +346,32 @@ func TestStopRuleForEveryVoice(t *testing.T) {
 	}
 }
 
-// TestBackchannelsDoNotStop fails if R11's backchannels stop the voice, or if
-// two other words do not.
+// TestBackchannelsDoNotStop fails if, for any voice, R11's backchannels stop
+// it, by its session or at the speaker, or if two other words do not stop it
+// both ways. A driving voice is stopped by another path than text to speech
+// (Sol's review of #133 at aaa8e0f found only text to speech tested).
 func TestBackchannelsDoNotStop(t *testing.T) {
 	cases := map[string]bool{
 		"mm-hm okay": false, "uh-huh yeah": false, "yeah right": false, "okay okay": false,
 		"yes sure": true,
 	}
-	for heard, stops := range cases {
-		t.Run(heard, func(t *testing.T) {
-			r, sess := everyVoice()[0].start(t)
-			r.heard(heard, false, false)
-			interrupted := func() bool { i, _, _ := sess.state(); return !i.IsZero() }
-			if stops {
-				eventually(t, "two real words stopped the voice", interrupted)
-				return
-			}
-			never(t, "backchannels stopped the voice", 200*time.Millisecond, interrupted)
-		})
+	for _, v := range everyVoice() {
+		for heard, stops := range cases {
+			t.Run(v.name+"/"+heard, func(t *testing.T) {
+				r, sess := v.start(t)
+				started := speechStart(r)
+				r.heard(heard, false, false)
+				interrupted := func() bool { i, _, _ := sess.state(); return !i.IsZero() }
+				if stops {
+					eventually(t, "two real words stopped the voice", interrupted)
+					if !voiceCutAfter(r, started) {
+						t.Error("control: two real words did not cancel the voice input")
+					}
+					return
+				}
+				never(t, "backchannels stopped the voice", 200*time.Millisecond, func() bool { return interrupted() || voiceCutAfter(r, started) })
+			})
+		}
 	}
 }
 
@@ -614,8 +626,9 @@ func waitTimings(t *testing.T, r *rig, want ...string) {
 
 // TestEachVoicePassesTheScriptedExchange fails if any voice, voice A or a
 // voice that drives its own turn with the Concierge's tools, misses a step of
-// one script: a call and its fast answer, a follow-up, a stop, a pause in the
-// middle of an answer, and a holder's answer on invitation.
+// one script: a call and its fast answer, a follow-up heard as the next turn,
+// a stop, a pause in the middle of an answer, and a holder's answer on
+// invitation.
 func TestEachVoicePassesTheScriptedExchange(t *testing.T) {
 	t.Run("tts", func(t *testing.T) {
 		c := newFakeConcierge("The voice issue is in review.")
@@ -663,6 +676,14 @@ func TestEachVoicePassesTheScriptedExchange(t *testing.T) {
 				speakAs(t, sess, res.Say)
 			}
 			vendorTurn("what is happening with the voice issue?")
+			r.speaker.finish(audio.InputVoice) // the answer plays to its end
+			r.heard("And who holds it?", true, true)
+			r.s.mu.Lock()
+			turn := r.s.turnOf(r.s.ex)
+			r.s.mu.Unlock()
+			if turn != "And who holds it?" {
+				t.Fatalf("the follow-up's turn is %q, want %q", turn, "And who holds it?")
+			}
 			vendorTurn("and who holds it?")
 			r.heard("Wispr, stop.", false, false)
 			eventually(t, "the stop", func() bool { _, _, closed := sess.state(); return closed })
