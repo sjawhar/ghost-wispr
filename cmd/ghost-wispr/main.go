@@ -2422,6 +2422,9 @@ func streamMicWithRetry(
 			closeMic(capture, streamer, why)
 		}
 		released = true // the loop top, after a pause, closes nothing more
+		// A pause since the microphone opened, though a resume may have
+		// opened the gate again since, leaves the open to the loop top: under
+		// that resume's own red confirmation, which ends its resuming state.
 		if isOverflow(err) {
 			slog.Warn("mic input overflow, restarting stream")
 			if hub != nil {
@@ -2431,7 +2434,7 @@ func streamMicWithRetry(
 			if ctx.Err() != nil {
 				return
 			}
-			if capture.isClosed() {
+			if capture.isClosed() || capture.closedSinceMicOpen() {
 				continue
 			}
 			// The loop top streams again, whatever the reopen did, unless the
@@ -2454,7 +2457,7 @@ func streamMicWithRetry(
 		if ctx.Err() != nil {
 			return
 		}
-		if capture.isClosed() {
+		if capture.isClosed() || capture.closedSinceMicOpen() {
 			continue // never reopen the mic while paused; the loop top waits
 		}
 		confirmed, reopenErr := reopenMic(capture, streamer, logf, hub)

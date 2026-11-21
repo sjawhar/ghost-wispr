@@ -270,15 +270,17 @@ func (r *jabraRig) warning() string {
 // mute button does not close the microphone, from recording and from
 // listening, and resume a closed unit, or the ring written after a press is
 // not ringMuted, true in closed only. The light check runs too seldom here to
-// repair it.
+// repair it: the light must come from the press and the listener's close
+// themselves. Each wait is on the state it names, bounded only by testWait.
 func TestJabraPressTogglesCaptureAndTheLight(t *testing.T) {
 	for _, from := range []micState{micRecording, micListening} {
 		t.Run(from.String(), func(t *testing.T) {
+			wait := func(what string, cond func() bool) { t.Helper(); waitForHardwareWithin(t, testWait, what, cond) }
 			rig := newJabraRig(false)
 			rig.checkEvery = time.Hour
 			rig.start(t)
 			device := rig.plugIn()
-			waitForHardware(t, "the Jabra connection to clear its warning", func() bool { return rig.warning() == "" && device.reportsSent() > 0 })
+			wait("the Jabra connection to clear its warning", func() bool { return rig.warning() == "" && device.reportsSent() > 0 })
 			if from == micListening {
 				rig.useListening()
 				if err := rig.controls.Pause(); err != nil {
@@ -292,18 +294,18 @@ func TestJabraPressTogglesCaptureAndTheLight(t *testing.T) {
 
 			device.press(t)
 			if from == micListening {
-				waitForHardware(t, "the press to close the microphone", rig.capture.inClosedState)
+				wait("the press to close the microphone", rig.capture.inClosedState)
 				if device.shows() {
 					t.Fatal("the ring changed while the listener's stream was open")
 				}
 				rig.closeListener(t) // the listener leaves at once
 			}
-			waitForHardware(t, "the first press to close the microphone and light the Jabra", func() bool { return rig.capture.inClosedState() && device.shows() })
+			wait("the first press to close the microphone and light the Jabra", func() bool { return rig.capture.inClosedState() && device.shows() })
 			// A person's second press, outside the listener close's cover: the
 			// Jabra's own report would come within jabraOwnMuteWindow of it.
-			time.Sleep(2 * jabraOwnMuteWindow)
+			wait("the listener close's cover to end", func() bool { return !rig.device.ownOperationAt(jabra.MonotonicNow()) })
 			device.press(t)
-			waitForHardware(t, "the second press to resume capture and darken the Jabra", func() bool { return !rig.capture.IsPaused() && !device.shows() })
+			wait("the second press to resume capture and darken the Jabra", func() bool { return !rig.capture.IsPaused() && !device.shows() })
 		})
 	}
 }
