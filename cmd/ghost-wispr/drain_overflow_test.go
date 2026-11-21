@@ -123,12 +123,13 @@ func wordAfterRefusedDrains(t *testing.T, overflow bool) {
 	t.Cleanup(func() { _ = rc.Close() })
 	rc.Client = takingSocket{}
 	_, _ = rc.Write(make([]byte, 3200)) // 100 ms to an earlier socket
-	rc.OptionsChanged()
+	rc.Client = nil                     // that socket is gone: the next audio is buffered
 	audio := make([]byte, 6144)
 	for i := range audio {
 		audio[i] = byte(i*13 + i/127)
 	}
 	_, _ = rc.Write(audio) // buffered for the next socket
+	rc.ConnectInBackground()
 	want := append([]byte(nil), audio...)
 	captured := 3200 + len(audio)
 	first := 3200 // the capture byte the third socket's stream starts at

@@ -295,7 +295,12 @@ func TestARefusedWriteOnAReplacedSocketDoesNotEndItsSuccessor(t *testing.T) {
 	old := &optionsSocket{held: make(chan struct{}), release: make(chan struct{})}
 	successor := &optionsSocket{held: make(chan struct{}), release: make(chan struct{})}
 	f := &sequenceFactory{next: []io.WriteCloser{successor}}
-	rc := NewResilientClient(ctx, f.dial, ResilientConfig{BufferSize: 1 << 16, InitialReconnectDelay: time.Millisecond, MaxReconnectBackoff: time.Millisecond}, nil, nil)
+	dialable := make(chan struct{}) // the successor's dial waits until the audio is buffered
+	dial := func(ctx context.Context) (io.WriteCloser, error) {
+		<-dialable
+		return f.dial(ctx)
+	}
+	rc := NewResilientClient(ctx, dial, ResilientConfig{BufferSize: 1 << 16, InitialReconnectDelay: time.Millisecond, MaxReconnectBackoff: time.Millisecond}, nil, nil)
 	rc.Client = old // connected
 	audio := audioBytes(9003)
 	wrote := make(chan struct{})
@@ -310,6 +315,7 @@ func TestARefusedWriteOnAReplacedSocketDoesNotEndItsSuccessor(t *testing.T) {
 	}
 	rc.OptionsChanged() // the old socket is replaced while the write is held
 	_, _ = rc.Write(audio[1001:8003])
+	close(dialable)
 	select {
 	case <-successor.held: // the successor drains, its first chunk held
 	case <-time.After(3 * time.Second):
