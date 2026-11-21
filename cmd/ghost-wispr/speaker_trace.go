@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/sjawhar/ghost-wispr/internal/speakertrace"
@@ -16,10 +17,12 @@ import (
 // prints the mixer's cycles slower than -slow and what kept the mixer from the
 // device in each, longest first. Each cycle's start and end are given on the
 // wall clock, in UTC with microseconds, as `journalctl --utc -o
-// short-iso-precise` prints, from the capture's own clock snapshot, and also
-// as time into the capture, which is not time since the process started. It
-// exits 1 when a file cannot be read, and 2 when a capture holds no slow
-// cycle, which shows nothing.
+// short-iso-precise` prints, from the capture's own clock snapshots, and also
+// as time into the capture, which is not time since the process started. A
+// wall-clock time the snapshots cannot pin to one instant (a clock step
+// between them, or no snapshot before it) is printed qualified, never as a
+// plain time (speakertrace.Wall). It exits 1 when a file cannot be read, and
+// 2 when a capture holds no slow cycle, which shows nothing.
 func runSpeakerTraceCommand(args []string, stdout, stderr io.Writer) int {
 	flags := flag.NewFlagSet("speaker-trace", flag.ContinueOnError)
 	flags.SetOutput(stderr)
@@ -50,6 +53,9 @@ func runSpeakerTraceCommand(args []string, stdout, stderr io.Writer) int {
 			code = max(code, 2)
 			continue
 		}
+		if !cycles[0].StartWall.IsZero() {
+			_, _ = fmt.Fprintln(stdout, "  Wall-clock times are projected from the latest clock snapshot before each (one each trace generation), assuming the clock did not step since; a step the next snapshot shows is printed as one.")
+		}
 		slices.SortStableFunc(cycles, func(a, b speakertrace.Cycle) int { return int(b.Length() - a.Length()) })
 		for i := range cycles {
 			c := &cycles[i]
@@ -71,12 +77,27 @@ func runSpeakerTraceCommand(args []string, stdout, stderr io.Writer) int {
 // microsecond, as `journalctl --utc -o short-iso-precise` does.
 const wallLayout = "2006-01-02T15:04:05.000000Z07:00"
 
-// cycleTimes is a cycle's start and end on the wall clock, and its start into
-// the capture; a capture without a clock snapshot gives the latter only.
+// cycleTimes is a cycle's start and end on the wall clock, each qualified
+// when the snapshots cannot pin it, and its start into the capture; a capture
+// without a clock snapshot gives the latter only.
 func cycleTimes(c *speakertrace.Cycle) string {
 	into := fmt.Sprintf("%v into the capture", c.Start.Round(time.Millisecond))
 	if c.StartWall.IsZero() {
 		return "at " + into + " (no wall-clock time in this capture)"
 	}
-	return fmt.Sprintf("from %s to %s (%s)", c.StartWall.UTC().Format(wallLayout), c.EndWall.UTC().Format(wallLayout), into)
+	notes := []string{into}
+	for _, w := range []speakertrace.Wall{c.StartWall, c.EndWall} {
+		if w.Note != "" && !slices.Contains(notes, w.Note) {
+			notes = append(notes, w.Note)
+		}
+	}
+	return fmt.Sprintf("from %s to %s (%s)", wallTime(c.StartWall), wallTime(c.EndWall), strings.Join(notes, "; "))
+}
+
+// wallTime is one wall-clock time, or the interval it lies in.
+func wallTime(w speakertrace.Wall) string {
+	if w.From.Equal(w.To) {
+		return w.From.UTC().Format(wallLayout)
+	}
+	return "between " + w.From.UTC().Format(wallLayout) + " and " + w.To.UTC().Format(wallLayout)
 }

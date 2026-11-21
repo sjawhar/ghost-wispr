@@ -37,10 +37,10 @@ type Cycle struct {
 	// to it.
 	Start, End time.Duration
 	// StartWall and EndWall are those times on the wall clock, from the
-	// clock snapshot the trace keeps beside its own clock (trace.Sync's
-	// ClockSnapshot, latest before the time): what the journal's timestamps
-	// can be matched against. They are zero for a trace without a snapshot.
-	StartWall, EndWall time.Time
+	// clock snapshots the trace keeps beside its own clock (trace.Sync's
+	// ClockSnapshot): what the journal's timestamps can be matched against
+	// (Wall). They are zero for a trace without a snapshot.
+	StartWall, EndWall Wall
 	// Spent is the cycle's time by what the mixer's goroutine did: its state
 	// ("running", "runnable", "syscall", or "waiting (reason)"), with " in
 	// REGION" while inside one of the speaker's regions. The reason is
@@ -212,7 +212,7 @@ func Read(r io.Reader, slow time.Duration) ([]Cycle, error) {
 	var first trace.Time
 	var cycles []Cycle
 	var stopped, marking spans
-	var clock wallClock
+	var snapshots []snapshot
 	writes := 0
 	var now time.Duration
 	for {
@@ -229,8 +229,11 @@ func Read(r io.Reader, slow time.Duration) ([]Cycle, error) {
 		now = time.Duration(ev.Time() - first)
 		switch ev.Kind() {
 		case trace.EventSync:
+			// The reader delivers a generation's sync at its first time;
+			// the snapshot may have been sampled later (snap.Trace), so
+			// its own trace time is what counts.
 			if snap := ev.Sync().ClockSnapshot; snap != nil {
-				clock = wallClock{at: time.Duration(snap.Trace - first), wall: snap.Wall, known: true}
+				snapshots = append(snapshots, snapshot{at: time.Duration(snap.Trace - first), wall: snap.Wall})
 			}
 		case trace.EventStateTransition:
 			st := ev.StateTransition()
@@ -286,12 +289,12 @@ func Read(r io.Reader, slow time.Duration) ([]Cycle, error) {
 			}
 			writes++
 			if c := g.cycle; c != nil {
-				c.End, c.EndWall = now, clock.of(now)
+				c.End = now
 				if c.Length() > slow {
 					cycles = append(cycles, *c)
 				}
 			}
-			g.cycle = &Cycle{Start: now, StartWall: clock.of(now), Spent: map[string]time.Duration{}}
+			g.cycle = &Cycle{Start: now, Spent: map[string]time.Duration{}}
 		}
 	}
 	if writes == 0 {
@@ -299,29 +302,87 @@ func Read(r io.Reader, slow time.Duration) ([]Cycle, error) {
 	}
 	stopped.end(now)
 	marking.end(now)
+	slices.SortFunc(snapshots, func(a, b snapshot) int { return cmp.Compare(a.at, b.at) })
 	for i := range cycles {
 		c := &cycles[i]
 		c.Stopped, c.Marking = stopped.overlap(c.Start, c.End), marking.overlap(c.Start, c.End)
+		c.StartWall, c.EndWall = wallAt(snapshots, c.Start), wallAt(snapshots, c.End)
 	}
 	slices.SortFunc(cycles, func(a, b Cycle) int { return cmp.Compare(a.Start, b.Start) })
 	return cycles, nil
 }
 
-// wallClock maps the capture's trace times to the wall clock, from a clock
-// snapshot the trace keeps: at is the snapshot's trace time, counted from the
-// capture's first event, and wall the wall clock then.
-type wallClock struct {
-	at    time.Duration
-	wall  time.Time
-	known bool
+// Wall is a trace time on the wall clock. The trace samples the wall clock
+// beside its own clock once each generation (a snapshot), and the time is
+// projected from the latest snapshot sampled before it, on the assumption
+// that the wall clock did not step between them. Two cases are qualified
+// (Note) instead of given as a plain time:
+//   - the next snapshot shows the wall clock stepped (its offset from the
+//     trace clock moved by more than stepTolerance): the step's moment is
+//     unknown, so the time is only known to lie between From and To, the
+//     projections from the snapshots before and after it;
+//   - no snapshot was sampled before the time: it is projected back from the
+//     first one after it, which is right only if the clock did not step in
+//     between, and nothing in the trace can show that.
+//
+// From equals To when the time is one instant.
+type Wall struct {
+	From, To time.Time
+	Note     string
 }
 
-// of is trace time t on the wall clock, or the zero time with no snapshot.
-func (c wallClock) of(t time.Duration) time.Time {
-	if !c.known {
-		return time.Time{}
+// IsZero reports a time the trace has no snapshot for.
+func (w Wall) IsZero() bool { return w.From.IsZero() }
+
+// snapshot is one of the trace's clock snapshots: its trace time, counted
+// from the capture's first event, and the wall clock then.
+type snapshot struct {
+	at   time.Duration
+	wall time.Time
+}
+
+// project is trace time t on the wall clock, by snapshot s.
+func (s snapshot) project(t time.Duration) time.Time { return s.wall.Add(t - s.at) }
+
+// stepTolerance is how far two snapshots' offsets between the wall clock and
+// the trace clock may differ and still count as one clock: NTP slews a clock
+// by up to 500 ppm, so 1 ms, plus that rate over the snapshots' distance.
+func stepTolerance(gap time.Duration) time.Duration {
+	return time.Millisecond + gap/2000
+}
+
+// wallAt is trace time t on the wall clock, from snapshots, which are sorted
+// by trace time (Wall).
+func wallAt(snapshots []snapshot, t time.Duration) Wall {
+	if len(snapshots) == 0 {
+		return Wall{}
 	}
-	return c.wall.Add(t - c.at)
+	next := slices.IndexFunc(snapshots, func(s snapshot) bool { return s.at > t })
+	if next < 0 {
+		next = len(snapshots)
+	}
+	if next == 0 {
+		after := snapshots[0]
+		at := after.project(t)
+		return Wall{From: at, To: at, Note: fmt.Sprintf("no clock snapshot before it: projected back from the one %v later, right only if the wall clock did not step between", (after.at - t).Round(time.Millisecond))}
+	}
+	before := snapshots[next-1]
+	at := before.project(t)
+	if next == len(snapshots) {
+		return Wall{From: at, To: at}
+	}
+	after := snapshots[next]
+	step := after.wall.Sub(before.wall) - (after.at - before.at)
+	if step.Abs() <= stepTolerance(after.at-before.at) {
+		return Wall{From: at, To: at}
+	}
+	other := after.project(t)
+	from, to := at, other
+	direction := "forward"
+	if to.Before(from) {
+		from, to, direction = to, from, "back"
+	}
+	return Wall{From: from, To: to, Note: fmt.Sprintf("the wall clock stepped %s by %v between the clock snapshots around it, at a moment the trace does not show: the time is only known to lie between the two shown", direction, step.Abs().Round(time.Millisecond))}
 }
 
 // spans are the stretches of one of the runtime's ranges: the world stopped,

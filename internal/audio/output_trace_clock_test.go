@@ -58,8 +58,11 @@ func TestTheReaderGivesASlowTurnsWallClockTime(t *testing.T) {
 	if turn.EndWall.IsZero() {
 		t.Fatalf("the reader gave the slow turn no wall-clock time (%v into the capture)", turn.End)
 	}
-	if off := turn.EndWall.Sub(ended); off < -10*time.Millisecond || off > 10*time.Millisecond {
+	if turn.EndWall.Note != "" || !turn.EndWall.From.Equal(turn.EndWall.To) {
+		t.Fatalf("the reader qualified a turn's end on a steady clock: %s to %s, %q", turn.EndWall.From, turn.EndWall.To, turn.EndWall.Note)
+	}
+	if off := turn.EndWall.From.Sub(ended); off < -10*time.Millisecond || off > 10*time.Millisecond {
 		t.Fatalf("the reader gave the turn's end as %s, %v from when it ended (%s), want within 10ms; %v into the capture",
-			turn.EndWall.UTC().Format(time.RFC3339Nano), off, ended.UTC().Format(time.RFC3339Nano), turn.End)
+			turn.EndWall.From.UTC().Format(time.RFC3339Nano), off, ended.UTC().Format(time.RFC3339Nano), turn.End)
 	}
 }

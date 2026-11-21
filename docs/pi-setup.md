@@ -518,15 +518,24 @@ keeps the newest 20 captures that fit 128 MiB together; the log says `speaker tr
 capture of an underrun`.
 `/opt/ghost-wispr/ghost-wispr speaker-trace FILE` prints each turn of the mixer longer than 40 ms
 in the capture (`-slow` changes the bound), longest first, with its start and end on the wall
-clock in UTC, from the capture's own clock snapshot, as `journalctl --utc -o short-iso-precise`
-prints the journal's lines, and with what it spent the time on: running, runnable (Go had no
-processor free), in a system call (ALSA's write), or waiting on the pacer's sleep, the garbage
-collector, the speaker's lock (naming the goroutine that held it) or something else, and how long
-the Go runtime stopped the world and the collector marked during the turn. The time it also gives
-into the capture counts from the capture's first event, not from the process's start. "Running"
-covers both computing and a thread Linux took off its processor, which a Go trace cannot tell
-apart.
-Remove the setting once the captures are taken: the trace costs CPU and memory while it runs.
+clock in UTC, as `journalctl --utc -o short-iso-precise` prints the journal's lines, and with what
+it spent the time on: running, runnable (Go had no processor free), in a system call (ALSA's
+write), or waiting on the pacer's sleep, the garbage collector, the speaker's lock (naming the
+goroutine that held it) or something else, and how long the Go runtime stopped the world and the
+collector marked during the turn. The wall-clock times come from the clock snapshots the trace
+takes once each generation (about every second): each is projected from the latest snapshot before
+it, assuming the clock did not step since. A time the snapshots cannot pin is printed qualified,
+never as a plain time: `between A and B` when the next snapshot shows the clock stepped (an NTP
+correction), at a moment the trace does not show; and `no clock snapshot before it` when it comes
+before the capture's first snapshot. The time it also gives into the capture counts from the
+capture's first event, not from the process's start. "Running" covers both computing and a thread
+Linux took off its processor, which a Go trace cannot tell apart.
+
+Every capture ends with the turn-off: remove `speaker_trace_dir`, and anything else added for the
+capture (a systemd drop-in, a `GODEBUG=gctrace=1` in `/opt/ghost-wispr/.env`), then restart the
+service. The trace costs CPU and memory while it runs. Provisioning is not a turn-off: it installs
+the base unit only and keeps every drop-in under `ghost-wispr.service.d`, and `provision.sh
+--models` keeps a `GODEBUG` line in `.env`, so a forgotten setting stays on after a reprovision.
 
 The microphone is never open while the blink(1) is off: the blink(1) stays red while the microphone
 is open, and goes off only once Ghost Wispr has closed it. A pause closes it at once, also while
