@@ -2,6 +2,7 @@ package joined
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -226,15 +227,17 @@ func TestARedeliveredCommandIsANoOp(t *testing.T) {
 
 // TestACommandTheRosterCouldNotTakeActsWhenDeliveredAgain fails if a join
 // that arrived before the roster had its Envoy session, so it could take
-// nothing and answer nothing, is remembered as taken: delivered again once
-// the roster holds the session, it must join. A join taken once and delivered
-// again is the control: it joins once.
+// nothing and answer nothing, is acknowledged (Deliver returns nil, and Envoy
+// answers it done and moves its resume point past it) or remembered as taken:
+// Deliver must refuse it with ErrNotReady, so Envoy delivers it again, and
+// delivered again once the roster holds the session, it must join. A join
+// taken once and delivered again is the control: it joins once.
 func TestACommandTheRosterCouldNotTakeActsWhenDeliveredAgain(t *testing.T) {
 	r := newRig(t, nil)
 	r.roster.SetAgents(nil)
 	join := &envoy.Message{EventID: "e-early", SourceSession: "agent-1", Text: "ghost-wispr join ABC-12", IssuedAt: r.clock.Now()}
-	if _, err := r.roster.Deliver(context.Background(), join); err != nil {
-		t.Fatal(err)
+	if _, err := r.roster.Deliver(context.Background(), join); !errors.Is(err, ErrNotReady) {
+		t.Fatalf("a join with no Envoy session returned %v, want ErrNotReady so that Envoy delivers it again", err)
 	}
 	if len(r.roster.Joined()) != 0 {
 		t.Fatal("control: a join with no Envoy session made a membership")

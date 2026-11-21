@@ -51,6 +51,10 @@ type Hand struct {
 // current reports whether h's membership is current (Current), asked now.
 func (h *Hand) current() bool { return h.Current == nil || h.Current() }
 
+// live reports whether h's membership is current and its context live, both
+// read now.
+func (h *Hand) live() bool { return h.current() && (h.Context == nil || h.Context.Err() == nil) }
+
 // HandOutcome says how a raised hand came down.
 type HandOutcome int
 

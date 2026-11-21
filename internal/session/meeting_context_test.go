@@ -95,3 +95,42 @@ func TestAMeetingContextOfATakenIDEnds(t *testing.T) {
 		t.Fatalf("the meeting context of %s, the session that started, is done: %v", free, err)
 	}
 }
+
+// TestLeavingRecordingEndsTheMeetingAtOnce fails if the meeting context of
+// the recording session outlives the moment capture pauses (PauseCapture, as
+// every pause, light hold and close runs before the gate closes), and waits
+// for the session's end, which follows only once Deepgram's last words are
+// in. The next session after the resume gets a live meeting context: the
+// control.
+func TestLeavingRecordingEndsTheMeetingAtOnce(t *testing.T) {
+	store := newStoreMock()
+	manager := NewManager(store, nil, nil, nil, NewDetector(time.Hour), 0)
+	if err := manager.ensureSessionStarted(time.Now().UTC()); err != nil {
+		t.Fatalf("start session: %v", err)
+	}
+	id := manager.currentSession()
+	meeting := manager.MeetingContext(id)
+	if meeting.Err() != nil {
+		t.Fatal("control: the recording session's meeting context is done")
+	}
+	manager.PauseCapture()
+	if meeting.Err() == nil {
+		t.Fatal("the meeting context was live when capture paused; only the session's later end would end it")
+	}
+	if again := manager.MeetingContext(id); again.Err() == nil {
+		t.Fatal("the session that is ending gives a live meeting context while capture is paused")
+	}
+	if current, _ := manager.ActiveSession(); current != id {
+		t.Fatalf("control: the pause cleared the session %q itself; its end does that", id)
+	}
+	if err := manager.endCurrentSession(context.Background()); err != nil {
+		t.Fatalf("end session: %v", err)
+	}
+	manager.ResumeCapture()
+	if err := manager.ensureSessionStarted(time.Now().UTC().Add(2 * time.Second)); err != nil {
+		t.Fatalf("start the next session: %v", err)
+	}
+	if err := manager.MeetingContext(manager.currentSession()).Err(); err != nil {
+		t.Fatalf("control: the session after the resume has a done meeting context: %v", err)
+	}
+}

@@ -102,11 +102,14 @@ func TestTheEnvoySessionCarriesJoinsToTheRoster(t *testing.T) {
 	}
 	deadline := time.Now().Add(2 * time.Second)
 	for {
-		if err := deliver(t.Context(), &envoy.Message{EventID: "e1", SourceSession: "agent-1", Text: "ghost-wispr join"}); err != nil {
+		// The roster takes the session just after Deliver is set; until then it
+		// refuses the join with ErrNotReady, so Envoy delivers it again.
+		err := deliver(t.Context(), &envoy.Message{EventID: "e1", SourceSession: "agent-1", Text: "ghost-wispr join"})
+		if err != nil && !errors.Is(err, joined.ErrNotReady) {
 			t.Fatalf("deliver the join: %v", err)
 		}
-		if len(roster.Joined()) == 1 || time.Now().After(deadline) {
-			break // the roster takes the session just after Deliver is set
+		if err == nil || time.Now().After(deadline) {
+			break
 		}
 		time.Sleep(10 * time.Millisecond)
 	}

@@ -154,10 +154,9 @@ type member struct {
 // memberships: the commands it took, so that one delivered again is a no-op,
 // and the agent's rate limits, which a leave and a rejoin do not reset.
 type agentHistory struct {
-	events      []string // the EventIDs of its commands taken, newest last, at most maxEvents
+	events      map[string]time.Time // the EventIDs of its commands taken, and when, kept for replayWindow
 	lastFloor   time.Time
 	lastPointer time.Time
-	touched     uint64 // when it was last used, for eviction
 }
 
 // liveContext is a context whose Err also reports it done the moment alive
@@ -236,10 +235,10 @@ type Roster struct {
 	// one whose end has begun and whose cleanup has not finished.
 	members  map[string]*member
 	meetings map[string]*meeting // the open meetings agents joined, by recording session
-	// history is each agent session's history, across its memberships, for
-	// at most maxAgents agents (agentHistory).
+	// history is each agent session's history, across its memberships
+	// (agentHistory): kept while Envoy can deliver one of its commands again,
+	// while one of its limits runs, or while it is joined (pruneHistoryLocked).
 	history map[string]*agentHistory
-	touch   uint64
 	// ended are the recording sessions that ended or were deleted, newest
 	// last, at most maxEnded: a decision made from a slow read commits
 	// nothing for one of them.
@@ -256,38 +255,51 @@ type Roster struct {
 // a few meetings a day.
 const maxEnded = 64
 
-// maxEvents bounds the commands remembered of one agent, and maxAgents the
-// agents remembered with no membership: a meeting takes a few commands of
-// each of a few agents.
-const (
-	maxEvents = 64
-	maxAgents = 256
-)
+// replayWindow is how long Envoy can deliver a command again. Its
+// notification stream keeps a message 72 h (legion
+// packages/envoy/internal/bus/stream.go: the stream's MaxAge is
+// contracts.DeliveryDuplicateWindow, 259200000 ms), and no consumer, a
+// re-registration's resume point included, reads what the stream no longer
+// keeps. The roster remembers each command it took for that long, from when
+// it took it by its own clock, which is no earlier than when Envoy stored it.
+// No count bounds it: a count would forget a command Envoy can still bring
+// back.
+const replayWindow = 72 * time.Hour
+
+// ErrNotReady is Deliver's answer to a command that comes while the roster
+// has no Envoy session: before SetAgents gives it one (the unit's session can
+// deliver a frame while it still registers), or once SetAgents(nil) took it
+// away. The roster can neither take nor answer the command then, so it does
+// not acknowledge it: the unit's Envoy session answers the frame nak, and
+// Envoy delivers it again (legion's listener does so 30 s later, up to 20
+// times).
+var ErrNotReady = errors.New("joined: the roster has no Envoy session to take the command with")
 
 // historyLocked is agent's history, made at its first command.
 func (r *Roster) historyLocked(agent string) *agentHistory {
-	r.touch++
 	h := r.history[agent]
 	if h == nil {
-		h = &agentHistory{}
+		h = &agentHistory{events: map[string]time.Time{}}
 		r.history[agent] = h
 	}
-	h.touched = r.touch
-	for len(r.history) > maxAgents {
-		oldest, found := "", false
-		var at uint64
-		for other, oh := range r.history {
-			if r.members[other] != nil || (found && oh.touched >= at) {
-				continue
-			}
-			oldest, at, found = other, oh.touched, true
-		}
-		if !found {
-			break
-		}
-		delete(r.history, oldest)
-	}
 	return h
+}
+
+// pruneHistoryLocked forgets the commands Envoy can no longer deliver again,
+// and the history of an agent with none left, no limit running and no
+// membership.
+func (r *Roster) pruneHistoryLocked(now time.Time) {
+	for agent, h := range r.history {
+		for id, at := range h.events {
+			if now.Sub(at) >= replayWindow {
+				delete(h.events, id)
+			}
+		}
+		if len(h.events) == 0 && r.members[agent] == nil &&
+			now.Sub(h.lastFloor) >= r.cfg.FloorEvery && now.Sub(h.lastPointer) >= r.cfg.PointerEvery {
+			delete(r.history, agent)
+		}
+	}
 }
 
 // meeting is the recorder's context of session id's meeting.
@@ -476,26 +488,24 @@ func (r *Roster) Deliver(ctx context.Context, m *envoy.Message) (bool, error) {
 		r.logf("joined: a %s message named no session it came from", c.verb)
 		return true, nil
 	}
-	// A command Envoy delivers again was taken: it acts once, whatever the
-	// agent's membership is now. One that came while the roster had no Envoy
-	// session was not taken (it could not even be answered), so Envoy's next
-	// delivery of it acts.
-	if m.EventID != "" {
-		r.mu.Lock()
-		h := r.historyLocked(m.SourceSession)
-		taken := slices.Contains(h.events, m.EventID)
-		if !taken && r.open {
-			h.events = append(h.events, m.EventID)
-			if extra := len(h.events) - maxEvents; extra > 0 {
-				h.events = slices.Delete(h.events, 0, extra)
-			}
-		}
+	now := r.cfg.Now() // no hook runs under r.mu
+	r.mu.Lock()
+	if !r.open {
 		r.mu.Unlock()
-		if taken {
+		return true, ErrNotReady
+	}
+	// A command Envoy delivers again was taken: it acts once, whatever the
+	// agent's membership is now, for as long as Envoy can bring it back.
+	if m.EventID != "" {
+		h := r.historyLocked(m.SourceSession)
+		if _, taken := h.events[m.EventID]; taken {
+			r.mu.Unlock()
 			r.logf("joined: a %s message already taken was delivered again", c.verb)
 			return true, nil
 		}
+		h.events[m.EventID] = now
 	}
+	r.mu.Unlock()
 	switch c.verb {
 	case verbJoin:
 		r.join(ctx, m, c.key)
@@ -810,9 +820,14 @@ func (r *Roster) leaveMeetings(ids []string, reason string) {
 	}
 }
 
-// Sweep reads whether each joined agent is live in Envoy, and makes one leave
-// that Envoy has listed as not live for NotLiveFor.
+// Sweep forgets the history Envoy can no longer replay (pruneHistoryLocked),
+// reads whether each joined agent is live in Envoy, and makes one leave that
+// Envoy has listed as not live for NotLiveFor.
 func (r *Roster) Sweep(ctx context.Context) {
+	now := r.cfg.Now()
+	r.mu.Lock()
+	r.pruneHistoryLocked(now)
+	r.mu.Unlock()
 	agents := r.currentAgents()
 	if agents == nil {
 		return

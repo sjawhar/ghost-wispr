@@ -934,8 +934,9 @@ var endedMeeting = func() context.Context {
 }()
 
 // MeetingContext is the meeting context of recording session id: live while
-// id is the current session, and done in the same step that ends or replaces
-// it, before the session-ended hook. It is done at once for any other id. It
+// id is the current session and the unit records, and done in the same step
+// that ends or replaces the session, or that pauses capture (PauseCapture),
+// before the session-ended hook. It is done at once for any other id. It
 // takes the manager's lock briefly and calls nothing.
 func (m *Manager) MeetingContext(id string) context.Context {
 	m.mu.Lock()
@@ -947,7 +948,9 @@ func (m *Manager) MeetingContext(id string) context.Context {
 }
 
 // moveSessionLocked makes id ("" for none) the current session: the last
-// session's meeting context ends here, and id's begins. m.mu is held.
+// session's meeting context ends here, and id's begins, done at once while
+// capture is paused (a start already under way when the pause came). m.mu is
+// held.
 func (m *Manager) moveSessionLocked(id string) {
 	if m.meetingCancel != nil {
 		m.meetingCancel()
@@ -956,6 +959,9 @@ func (m *Manager) moveSessionLocked(id string) {
 	m.meeting, m.meetingCancel = nil, nil
 	if id != "" {
 		m.meeting, m.meetingCancel = context.WithCancel(context.Background())
+		if m.capturePaused {
+			m.meetingCancel()
+		}
 	}
 }
 
@@ -1225,15 +1231,20 @@ func (m *Manager) endManualLocked() {
 	m.prevTimeout = 0
 }
 
-// PauseCapture stops new sessions from starting until ResumeCapture. It only
-// sets a flag and waits for nothing, so the capture gate can close at once; a
-// session start already under way still finishes, and WaitForSessionStarts
-// waits for it. It does not end the active session; the capture pause does
-// that once Deepgram's last words are in.
+// PauseCapture stops new sessions from starting until ResumeCapture, and ends
+// the current session's meeting context: the meeting ends the moment the unit
+// leaves recording, whatever the session's end still has to save. It only
+// sets a flag and cancels a context, and waits for nothing, so the capture
+// gate can close at once; a session start already under way still finishes,
+// and WaitForSessionStarts waits for it. It does not end the active session;
+// the capture pause does that once Deepgram's last words are in.
 func (m *Manager) PauseCapture() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.capturePaused = true
+	if m.meetingCancel != nil {
+		m.meetingCancel()
+	}
 }
 
 // WaitForSessionStarts waits until no session start is under way, so a session
