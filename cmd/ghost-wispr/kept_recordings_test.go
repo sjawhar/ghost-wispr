@@ -114,7 +114,7 @@ func keptSession(t *testing.T, store *storage.SQLiteStore, audioDir, id string, 
 		t.Fatalf("record %s: %v", id, err)
 	}
 	// The power cut: the session never ends in that run.
-	if _, err := store.RecoverStaleSessions(audioDir); err != nil {
+	if _, err := store.RecoverStaleSessions(audioDir, ""); err != nil {
 		t.Fatalf("recover stale sessions: %v", err)
 	}
 	if _, err := store.DB().Exec(`UPDATE sessions SET sync_state = ?, sync_status = ?, gdrive_folder_id = 'folder-1' WHERE id = ?`,
@@ -405,7 +405,7 @@ func TestASavedRecordingNoSessionNamesIsGivenToItsSession(t *testing.T) {
 	}
 	// The stop: the next start ends every session still recording with no
 	// recording; one more session has started since.
-	if _, err := store.RecoverStaleSessions(audioDir); err != nil {
+	if _, err := store.RecoverStaleSessions(audioDir, ""); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := store.DB().Exec(`UPDATE sessions SET status = ? WHERE id = ?`, storage.SessionActive, live); err != nil {
@@ -779,7 +779,7 @@ func TestASaveOrAdoptionLeavesAFileAnotherSessionNames(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if _, err := store.RecoverStaleSessions(audioDir); err != nil {
+	if _, err := store.RecoverStaleSessions(audioDir, ""); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.CreateSession(merged, started); err != nil {
@@ -860,7 +860,7 @@ func TestAnAdoptionLeavesARestoredSessionsRecording(t *testing.T) {
 	if err := store.CreateSession(source, time.Date(2026, 11, 6, 14, 0, 0, 0, time.UTC)); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.RecoverStaleSessions(audioDir); err != nil {
+	if _, err := store.RecoverStaleSessions(audioDir, ""); err != nil {
 		t.Fatal(err)
 	}
 	downloaded := filepath.Join(audioDir, source+".mp3")
@@ -930,7 +930,7 @@ func TestARestoredBackupKeepsTheAudioRecordedSinceIt(t *testing.T) {
 	if err := store.EndSession(saved, started.Add(time.Hour), mp3, ""); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.RecoverStaleSessions(audioDir); err != nil {
+	if _, err := store.RecoverStaleSessions(audioDir, ""); err != nil {
 		t.Fatal(err)
 	}
 	_ = store.Close()
@@ -988,7 +988,7 @@ func TestKeptRawCensusTellsTheKindsApart(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if _, err := store.RecoverStaleSessions(audioDir); err != nil {
+	if _, err := store.RecoverStaleSessions(audioDir, ""); err != nil {
 		t.Fatal(err)
 	}
 	raw(unsaved, 1000)

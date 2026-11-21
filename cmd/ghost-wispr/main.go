@@ -975,14 +975,9 @@ func main() {
 	indicator.RecordSavesIn(filepath.Join(filepath.Dir(dbPath), "blink1-saves"))
 
 	// Recover any sessions left as 'active' from a previous crash/restart:
-	// each ends when its raw recording was last written.
-	recoveredIDs, err := store.RecoverStaleSessions(cfg.AudioDir)
-	if err != nil {
-		slog.Warn("failed to recover stale sessions", "error", err)
-	} else if len(recoveredIDs) > 0 {
-		log.Printf("recovered %d stale session(s): %v", len(recoveredIDs), recoveredIDs)
-		cancelRecoveredQuestions(store, recoveredIDs)
-	}
+	// each ends when its raw recording was last written, with its
+	// session_ended event queued in the same write.
+	recoveredIDs := recoverStaleSessions(store, &cfg)
 	// A refinement left running by the previous run stopped with it. The store
 	// owes each one automatic retry, which runs below, once the recording
 	// directories are cleaned up; the stop ends with it (stopRecovery).

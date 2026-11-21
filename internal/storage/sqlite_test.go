@@ -609,7 +609,7 @@ func TestRecoverStaleSessionsMarksRefinementNoAudio(t *testing.T) {
 	if err := store.CreateSession("20261106140930", time.Date(2026, 11, 6, 14, 9, 30, 0, time.UTC)); err != nil {
 		t.Fatalf("CreateSession: %v", err)
 	}
-	if _, err := store.RecoverStaleSessions(t.TempDir()); err != nil {
+	if _, err := store.RecoverStaleSessions(t.TempDir(), ""); err != nil {
 		t.Fatalf("RecoverStaleSessions: %v", err)
 	}
 	session, err := store.GetSession("20261106140930")
@@ -653,7 +653,7 @@ func TestRecoverStaleSessionsEndsASessionAtItsLastAudio(t *testing.T) {
 	}
 
 	restartFrom := time.Now().UTC()
-	if _, err := store.RecoverStaleSessions(audioDir); err != nil {
+	if _, err := store.RecoverStaleSessions(audioDir, ""); err != nil {
 		t.Fatalf("RecoverStaleSessions: %v", err)
 	}
 	restartTo := time.Now().UTC()

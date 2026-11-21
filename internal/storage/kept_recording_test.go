@@ -18,7 +18,7 @@ func TestRecordKeptRecording(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if _, err := store.RecoverStaleSessions(t.TempDir()); err != nil {
+	if _, err := store.RecoverStaleSessions(t.TempDir(), ""); err != nil {
 		t.Fatal(err)
 	}
 	syncTo(t, store, synced, SyncStateSynced, "folder-1", 0, "")
@@ -91,7 +91,7 @@ func TestRecordKeptRecordingRecordsNothingWhenThePlaceFails(t *testing.T) {
 	if err := store.CreateSession(id, time.Date(2026, 11, 6, 14, 9, 30, 0, time.UTC)); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.RecoverStaleSessions(t.TempDir()); err != nil {
+	if _, err := store.RecoverStaleSessions(t.TempDir(), ""); err != nil {
 		t.Fatal(err)
 	}
 	if recorded, err := store.RecordKeptRecording(id, "/audio/"+id+".mp3", func() error { return errors.New("no space left on device") }); err == nil || recorded {
