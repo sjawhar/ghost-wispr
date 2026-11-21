@@ -245,9 +245,19 @@ type Supervisor struct {
 	lastRoomWord  time.Time      // the last word heard that was not Wispr's own
 	lastTimes     *exchangeTimes // the newest exchange a wake opened: its times, no words
 	chimedAt      time.Time
-	heard         []heardCall    // Heard calls OnTranscript makes once it unlocks
-	segments      []Segment      // Segment calls OnTranscript makes once it unlocks
-	wg            sync.WaitGroup // the goroutines Close waits for
+	heard         []heardCall // Heard calls OnTranscript makes once it unlocks
+	segments      []Segment   // Segment calls OnTranscript makes once it unlocks
+	// running counts the goroutines spawn started that Close waits for.
+	// Once Close began and found none running, it closes idle, and a
+	// goroutine spawn starts after that runs untracked: a WaitGroup's Add
+	// from zero while its Wait runs is a race, and spawn runs on callers that
+	// are no goroutine of the Supervisor's (LowerHands from the roster). All
+	// three are guarded by spawnMu.
+	spawnMu  sync.Mutex
+	running  int
+	closing  bool
+	idle     chan struct{}
+	idleDone bool // idle is closed
 
 	// commands counts a person's commands on held answers: each "Wispr,
 	// never mind" and each "Wispr, go ahead". neverMinds is how many never
@@ -399,6 +409,7 @@ func NewSupervisor(c *SupervisorConfig) *Supervisor {
 		notes:  make(chan [2]string, 64),
 		logf:   logf,
 		floor:  floor,
+		idle:   make(chan struct{}),
 	}
 	s.unlisten = cfg.Speaker.OnSpeech(s.onSpeech)
 	s.spawn(s.sendNotes)
@@ -423,23 +434,50 @@ func (s *Supervisor) Close() {
 	s.mu.Unlock()
 	s.unlisten()
 	s.cancel()
-	done := make(chan struct{})
-	go func() { s.wg.Wait(); close(done) }()
+	s.spawnMu.Lock()
+	s.closing = true
+	s.idleIfDoneLocked()
+	s.spawnMu.Unlock()
 	select {
-	case <-done:
+	case <-s.idle:
 	case <-time.After(closeWait):
 		s.logf("voice: a goroutine of the voice did not return within %v of shutdown", closeWait)
 	}
 }
 
-// spawn runs f on a goroutine that Close waits for. A goroutine it starts
-// runs while another of its goroutines runs, or before Close.
+// spawn runs f on a goroutine that Close waits for, unless Close already
+// found none of them running: then f runs untracked, as the shutdown no
+// longer waits.
 func (s *Supervisor) spawn(f func()) {
-	s.wg.Add(1)
+	s.spawnMu.Lock()
+	tracked := !s.idleDone
+	if tracked {
+		s.running++
+	}
+	s.spawnMu.Unlock()
 	go func() {
-		defer s.wg.Done()
+		if tracked {
+			defer s.spawned()
+		}
 		f()
 	}()
+}
+
+// spawned counts a tracked goroutine's return.
+func (s *Supervisor) spawned() {
+	s.spawnMu.Lock()
+	defer s.spawnMu.Unlock()
+	s.running--
+	s.idleIfDoneLocked()
+}
+
+// idleIfDoneLocked closes idle once Close began and no tracked goroutine
+// runs. spawnMu is held.
+func (s *Supervisor) idleIfDoneLocked() {
+	if s.closing && s.running == 0 && !s.idleDone {
+		s.idleDone = true
+		close(s.idle)
+	}
 }
 
 // GateClosed stops every exchange because the capture gate closed, for a pause
