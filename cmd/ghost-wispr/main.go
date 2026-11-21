@@ -1164,6 +1164,9 @@ func main() {
 		}
 		return nil
 	}, captureFinalizeWait, captureEndRetry, log.Printf)
+	// A refused resume saves the pause state from the gate's opening, which
+	// runs as work the stop waits for.
+	capture.background = manager
 	// The meeting voice. Its link is wired now, so every gate closing reaches
 	// it, the one restorePause may make included; the voice itself starts
 	// once the speaker output exists, below. Its tap is one more writer
@@ -1627,11 +1630,14 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 	if err := audio.UsePlugCapture(cfg.MicDevice); err != nil {
 		slog.Warn("open the microphone through ALSA's plug layer", "error", err)
 	}
-	startPowerButton(ctx, &cfg, capture, controlHooks, warningRegistry)
-	startJabraMuteButton(ctx, &cfg, capture, micDevice, controlHooks, warningRegistry, func() { voiceHooks.Stop("Jabra button") })
+	// The buttons and the paused listener save the pause state: each runs as
+	// work the stop waits for, and ends with the app's context.
+	startPowerButton(ctx, &cfg, capture, controlHooks, warningRegistry, manager)
+	startJabraMuteButton(ctx, &cfg, capture, micDevice, controlHooks, warningRegistry, func() { voiceHooks.Stop("Jabra button") }, manager)
 	startPausedListener(ctx, cfgStore, &pausedListenerUnit{
 		capture: capture, controls: pauseControls, hooks: controlHooks, device: micDevice,
 		wake: hardware.Wake, warnings: warningRegistry, restored: restoredState, built: local.Built,
+		background: manager,
 	})
 
 	envoyEvents.configure(ctx, &cfg, appLogger)

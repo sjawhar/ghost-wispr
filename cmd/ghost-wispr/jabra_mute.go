@@ -66,12 +66,13 @@ func newJabraMuteButton(capture *captureGate, device *captureDevice, controls *s
 }
 
 // startJabraMuteButton serves the Jabra's mute button when the config turns
-// it on; onPress runs at each press, before the toggle, and stops the voice.
-func startJabraMuteButton(ctx context.Context, cfg *config.Config, capture *captureGate, device *captureDevice, controls *server.ControlHooks, warnings *warningsRegistry, onPress func()) {
+// it on, as work the stop waits for (background): a press saves the pause
+// state. onPress runs at each press, before the toggle, and stops the voice.
+func startJabraMuteButton(ctx context.Context, cfg *config.Config, capture *captureGate, device *captureDevice, controls *server.ControlHooks, warnings *warningsRegistry, onPress func(), background backgroundWork) {
 	if cfg.JabraMuteButton {
 		button := newJabraMuteButton(capture, device, controls, warnings)
 		button.onPress = onPress
-		go button.run(ctx)
+		goUntilStop(ctx, background, button.run)
 	}
 }
 
