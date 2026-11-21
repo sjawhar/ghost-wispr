@@ -449,20 +449,45 @@ func TestNearSilenceOpensNoSpeech(t *testing.T) {
 	out.nextSpeech(t)
 }
 
-// Close stops the speech before it asks the server to finalize, not after.
+// TestCloseStopsTheSpeechAtOnce fails if speech goes on playing while Close
+// waits for the server to finalize: Close stops the player before it sends
+// session.close, so no frame of the speech may begin once the server has
+// decoded the message. One may, at most: a frame the player had taken before
+// the stop, whose Write began after it. The count rests on that order, timed
+// where the stand-in server decodes the message (clientEvent.decodedAt), not
+// on when the test runs: the second case reads the event 100 ms late, as a
+// test scheduled late would, and must still count the same frames.
 func TestCloseStopsTheSpeechAtOnce(t *testing.T) {
-	out := newFakeOutput()
-	out.pace = true
-	srv := newLiveServer(t)
-	s, c, _ := openSession(t, srv, testExchange(out, newFakeTools(voice.AnswerResult{})))
+	for _, late := range []time.Duration{0, 100 * time.Millisecond} {
+		name := "the test reads session.close at once"
+		if late > 0 {
+			name = "the test reads session.close late"
+		}
+		t.Run(name, func(t *testing.T) {
+			out := newFakeOutput()
+			out.pace = true
+			srv := newLiveServer(t)
+			s, c, _ := openSession(t, srv, testExchange(out, newFakeTools(voice.AnswerResult{})))
 
-	c.audioDelta(ramp(1000, SampleRate))
-	p := out.nextSpeech(t)
-	time.Sleep(100 * time.Millisecond)
-	before := len(p.samples())
-	_ = s.Close() // the server never answers session.close
-	if after := len(p.samples()); after-before > writeFrame {
-		t.Fatalf("%d samples played while Close waited for the server, want at most the frame under way", after-before)
+			c.audioDelta(ramp(1000, SampleRate))
+			p := out.nextSpeech(t)
+			p.waitSamples(t, 3*writeFrame)
+			closed := make(chan struct{})
+			go func() {
+				defer close(closed)
+				_ = s.Close() // the server never answers session.close
+			}()
+			time.Sleep(late)
+			received := c.expect(evSessionClose).decodedAt
+			select {
+			case <-closed:
+			case <-time.After(testWait):
+				t.Fatal("Close did not return")
+			}
+			if n := p.writesBegunAfter(received); n > 1 {
+				t.Fatalf("%d frames began to play once the server had decoded session.close, want at most the one the player had taken", n)
+			}
+		})
 	}
 }
 
