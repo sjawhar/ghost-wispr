@@ -210,6 +210,7 @@ func (s *frameSpeaker) Cancel(input string) {
 }
 
 func (s *frameSpeaker) OnSpeech(func(audio.SpeechEvent)) func() { return func() {} }
+func (s *frameSpeaker) FlushSpeech()                            {}
 
 type framePlayback struct {
 	s        *frameSpeaker

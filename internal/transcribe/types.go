@@ -158,12 +158,27 @@ type ResilientClient struct {
 	origin   int64
 	// queuedAhead reports the bytes an AsyncSender in front of the client
 	// holds (watchSendQueue), nil without one; drops the audio it dropped that
-	// a word on the current socket can still come before (sendQueueDropped);
-	// and forgottenDrops the bytes of the drops before the current socket's
-	// stream, which Captured still counts. Guarded by Mu.
+	// a word on the current socket can still come before (sendQueueDropped),
+	// each with the running sum of every drop, of which dropsBase is the part
+	// forgotten; and forgottenDrops the bytes of the drops before the current
+	// socket's stream, which Captured still counts. Guarded by Mu.
 	queuedAhead    func() int64
 	drops          []streamDrop
+	dropsBase      int64
 	forgottenDrops int64
+	// holes are audio the client took that the current socket's stream
+	// skips: buffered audio a full buffer dropped, or Finalize dropped,
+	// before it was sent, each at its place in the count Write takes,
+	// oldest first. Guarded by Mu.
+	holes []streamDrop
+	// stamps are the latest buffers captured, each with when it was
+	// captured and the span of the Captured count it holds, oldest
+	// overwritten first: the clock that times a point of the stream
+	// (CapturedAt). stampsN is how many are set, stampNext the slot the next
+	// takes. Guarded by Mu.
+	stamps    [captureStamps]captureStamp
+	stampsN   int
+	stampNext int
 	// stateSeq numbers the changes of State (StateChange.Seq). stateChanges
 	// are the changes not yet handed to OnStateChange, oldest first;
 	// notifying says a goroutine is handing them over, and notifierDone is

@@ -326,7 +326,9 @@ mind" cancels the newest question to an agent that has not answered yet; with no
 drops the meeting's newest answer still waiting, which then never sounds or speaks, and LED 2 stops
 flashing once no answer waits. The dropped answer stays in writing on the session's page.
 "Wispr, stop" stops it, and so does talking over it
-with real words; "mm-hm" or "yeah" alone does not. Other speech (`POST /api/tts/speak`) waits in
+with real words; "mm-hm" or "yeah" alone does not. Only words said while it plays count, timed by
+when the microphone read them: the question it answers, or one asked in a pause, does not stop it
+when the live transcript sends that question's words late, up to about 8 minutes of audio. Other speech (`POST /api/tts/speak`) waits in
 its queue while the voice speaks. Two more sounds: a single high note when capture starts
 recording, and a falling two-note sound when Wispr cannot do what was asked (Dispatch or Envoy out
 of reach, a voice that fails, or a failed red check).

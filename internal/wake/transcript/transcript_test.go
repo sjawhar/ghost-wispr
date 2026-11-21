@@ -484,6 +484,10 @@ func TestIssueKeyForms(t *testing.T) {
 		"I am in for a minute":                               nil,
 		// End-to-end run 8e: smart formatting writes "4,592".
 		"ask the agent on in For 4,592 when": {"INFRA-4592"},
+		// The office run of 2026-11-21: smart formatting wrote "ten
+		// twenty seven" as a date.
+		"what's the status of infra 10/27?": {"INFRA-1027"},
+		"What's the status of INFRA 10/27?": {"INFRA-1027"},
 	}
 	for text, want := range cases {
 		if got := IssueKeys(text); !slices.Equal(got, want) {
@@ -513,6 +517,10 @@ func TestSpokenKeysAreWritten(t *testing.T) {
 		"we're in for 2027":                "we're in for 2027",
 		"we're in for twenty twenty seven": "we're in for twenty twenty seven",
 		"what about infra 2027":            "what about INFRA-2027",
+		// The office run of 2026-11-21: smart formatting wrote "ten
+		// twenty seven" as a date.
+		"what's the status of infra 10/27?": "what's the status of INFRA-1027?",
+		"What's the status of INFRA 10/27?": "What's the status of INFRA-1027?",
 	} {
 		if got := WriteKeys(text, projects); got != want {
 			t.Errorf("WriteKeys(%q) = %q, want %q", text, got, want)
