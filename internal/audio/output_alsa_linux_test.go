@@ -879,6 +879,7 @@ type twistPCM struct {
 	afterFirst  func()
 	wrote       bool
 	resuspend   bool
+	replayed    int // writes since the first recovery's prepare, with resuspend
 	rearmed     bool
 	split       int
 	splitArmed  bool
@@ -922,15 +923,22 @@ func (p *twistPCM) writei(s []int16, n int) int {
 			p.afterFirst()
 		}
 	}
+	if rc > 0 && p.rearmed && p.replayed >= 0 {
+		// The second write of the replay: the PCM's buffer, just prepared,
+		// takes all the replay without the device playing any, so a suspend
+		// on the device's clock would come only after the replay returned.
+		if p.replayed++; p.replayed == 2 {
+			p.replayed = -1
+			p.suspend()
+		}
+	}
 	return rc
 }
 
 func (p *twistPCM) prepare() int {
 	rc := p.fakePCM.prepare()
 	if rc >= 0 && p.resuspend && !p.rearmed {
-		p.mu.Lock()
-		p.fired, p.fireAt, p.rearmed = false, p.clock+1, true
-		p.mu.Unlock()
+		p.rearmed = true
 	}
 	return rc
 }
@@ -1100,6 +1108,9 @@ func TestASuspendTheSpeakerCannotResumeFromLosesNoAudio(t *testing.T) {
 		{name: "it cannot resume, 1440 frames in flight, suspended after a whole write", inflight: 1440, afterWrite: true},
 		{name: "it cannot resume, an input begun during the suspend", begin: true},
 		{name: "it cannot resume, writes of 137 frames", partial: 137},
+		// Suspended at the replay's second write, so part of the replay is
+		// left to write again: suspended on the device's clock, it came only
+		// once the replay had returned (Sol's review of #148 at 9b80022).
 		{name: "it cannot resume, and is suspended again while the Output replays", resuspend: true},
 		// A 200 ms speech, the most the input queues: the mixer has taken
 		// 5280 of its frames at the suspend, so the speech still plays.
@@ -1155,4 +1166,80 @@ func TestASuspendTheSpeakerCannotResumeFromLosesNoAudio(t *testing.T) {
 			wantRamp(t, rampHeard(pcm), frames)
 		})
 	}
+}
+
+// secondCancelPCM is a fakePCM on which, once the first drop's prepare has
+// run, the device's next 960 frames end in a Cancel of the input second,
+// and the second drop finds the PCM suspended.
+type secondCancelPCM struct {
+	*fakePCM
+	out             *Output
+	second          string
+	prepares, drops int
+	cancelled       bool
+}
+
+func (p *secondCancelPCM) prepare() int {
+	rc := p.fakePCM.prepare()
+	if rc >= 0 {
+		if p.prepares++; p.prepares == 1 {
+			p.mu.Lock()
+			p.fired, p.fireAt = false, p.clock+960
+			p.fire = func() {
+				p.cancelled = true
+				p.out.Cancel(p.second)
+			}
+			p.mu.Unlock()
+		}
+	}
+	return rc
+}
+
+func (p *secondCancelPCM) dropAfterStatus() (pcmStatus, time.Duration, int) {
+	if p.drops++; p.drops == 2 {
+		p.suspend()
+	}
+	return p.fakePCM.dropAfterStatus()
+}
+
+// TestARewindAfterAnEarlierPrepareIsTakenOffWhatTheDeviceTook fails if the
+// frames the stream counts as taken by the device since its last prepare
+// keep a rewind's frames: a Cancel's drop that finds the PCM suspended while
+// its queue still fills counts all of them as lost, and the replay then
+// repeats speech the room heard before the earlier prepare (Sol's review of
+// #148 at 2e03d9d: 60 ms of the ramp heard twice). Two silent inputs are
+// cancelled in turn; the first Cancel's drop prepares the PCM, and the
+// second's, during that replay and after its rewind, finds the PCM
+// suspended. Each frame of the kept ramp must be heard once, in order.
+func TestARewindAfterAnEarlierPrepareIsTakenOffWhatTheDeviceTook(t *testing.T) {
+	pcm := newFakePCM(48000, 3840)
+	pcm.lockstep, pcm.inflight = true, 1440
+	p := &secondCancelPCM{fakePCM: pcm, second: "stopped2"}
+	gate := make(chan struct{})
+	out := NewOutput(OutputConfig{IdleClose: 100 * time.Millisecond, Open: func(string) (PlaybackStream, int, error) {
+		<-gate
+		return newALSAStream(p, "fake", alsaParams{rate: 48000, channels: 1, period: 480, buffer: 3840}), 48000, nil
+	}})
+	p.out = out
+	t.Cleanup(func() { _ = out.Close() })
+	pcm.fireAt, pcm.fire = 4320, func() { out.Cancel("stopped1") }
+	ctx := testContext(t)
+	kept := out.Begin("kept")
+	if err := kept.WriteAll(ctx, rampPCM(9600), mono48k); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"stopped1", "stopped2"} {
+		if err := out.Begin(name).WriteAll(ctx, constant(48000, 200*time.Millisecond, 0), mono48k); err != nil {
+			t.Fatal(err)
+		}
+	}
+	close(gate)
+	if err := kept.Drain(ctx); err != nil {
+		t.Fatalf("the kept input's Drain: %v", err)
+	}
+	waitFor(t, "the idle stream to close", pcm.isClosed)
+	if !p.cancelled || p.drops != 2 {
+		t.Fatalf("control: the second Cancel came %v, drops %d, want a Cancel and 2 drops", p.cancelled, p.drops)
+	}
+	wantRamp(t, rampHeard(pcm), 9600)
 }
