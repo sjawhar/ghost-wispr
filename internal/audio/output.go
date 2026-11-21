@@ -1136,14 +1136,15 @@ func (o *Output) mix(stream PlaybackStream, rate int) error {
 // last write returned, on both clocks, read before anything that can wait.
 func (o *Output) replay(stream PlaybackStream, redo []int16, sum []float32, n, back int, again func() int) (monoclock.Stamp, error) {
 	var last monoclock.Stamp
-	if back > 0 {
-		// What the stream gives back plays later than its account said.
-		o.disrupted()
-	}
 	for {
 		if back > len(redo) {
 			slog.Warn("speaker stream took back more than the Output keeps; the rest of the other inputs is lost", "frames", back, "kept", len(redo))
 			back = len(redo)
+		}
+		if back > 0 {
+			// What the stream gives back plays later than its account said, and
+			// a discard or Cancel during the replay gives back again.
+			o.disruptedBy(back)
 		}
 		o.retake(redo[:back], sum)
 		off, drop, lost := 0, false, 0
@@ -1327,9 +1328,8 @@ func (o *Output) wrote(seq uint64, at time.Time, atMono int64) (timing bool) {
 		if in.startPending && in.startFrame <= seq && (!in.cancelled || in.cancelAt.After(at)) {
 			in.startPending, in.startedAt, in.startedMono = false, now, atMono
 			o.emit(&SpeechEvent{Input: in.name, Started: true, At: now, AtMono: atMono, Owner: in.owner})
-			if in.audibleAt >= 0 {
-				in.audiblePending, in.audibleSince = true, o.disruptions
-			}
+			// Timed against the disruptions before its first write (mixFrame).
+			in.audiblePending = in.audibleAt >= 0
 		}
 		timing = timing || in.audiblePending
 	}
@@ -1399,7 +1399,10 @@ func (o *Output) mixFrame(frame []int16, sum []float32, rate, hist int, now time
 			if queued && !in.speaking {
 				in.speaking, in.unlanded, in.owner = true, playedTime{}, started
 				in.startFrame, in.startPending = o.mixed, true
-				in.audibleAt, in.audibleLead = firstLanded(in.landed), 0
+				// The disruptions before the speech's first write: one that comes to
+				// that write or its replay leaves the speech untimed, unless the replay
+				// carries its first sample (disruptedBy).
+				in.audibleAt, in.audibleLead, in.audibleSince = firstLanded(in.landed), 0, o.disruptions
 				if in.audibleAt >= 0 {
 					in.audibleAt += o.pos
 					if !in.rs.bypass() {
@@ -1659,12 +1662,32 @@ func firstLanded(landed []uint32) int64 {
 	return -1
 }
 
-// disrupted counts a replay, an underrun or a stream failure: each moves what
-// the device holds later than the stream's account said.
+// disrupted counts an underrun or a stream failure: each moves what the
+// device holds later than the stream's account said.
 func (o *Output) disrupted() {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	o.disruptions++
+}
+
+// disruptedBy counts a replay of the last back positions the stream was given,
+// which it took back or discarded by itself: what it held plays later than its
+// account said. A speech waiting to be timed whose first sample is among those
+// positions, with no other disruption since its first write, has that sample
+// written again by the replay, so the stream's account after it times the
+// sample. One whose first sample came before them was already the device's,
+// and may have played: no account after the replay gives its time, and it
+// stays untimed (Sol's review of #154 at 7d27574a).
+func (o *Output) disruptedBy(back int) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.disruptions++
+	from := o.pos - int64(back)
+	for _, in := range o.order {
+		if (in.startPending || in.audiblePending) && in.audibleAt >= from && in.audibleSince == o.disruptions-1 {
+			in.audibleSince = o.disruptions
+		}
+	}
 }
 
 // playPosition is a stream's account of its playback, read at one moment:
