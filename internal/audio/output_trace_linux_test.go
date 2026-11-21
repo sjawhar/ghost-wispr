@@ -4,6 +4,7 @@ package audio
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"runtime"
 	"runtime/trace"
@@ -71,6 +72,33 @@ func TestTheMixersRegionsAreTheReadersRegions(t *testing.T) {
 	if regionWrite != speakertrace.RegionWrite || regionPacer != speakertrace.RegionPacer || regionLock != speakertrace.RegionLock {
 		t.Fatalf("the mixer marks %q, %q and %q; the reader reads %q, %q and %q", regionWrite, regionPacer, regionLock,
 			speakertrace.RegionWrite, speakertrace.RegionPacer, speakertrace.RegionLock)
+	}
+}
+
+// nopStream is a stream whose writes do nothing.
+type nopStream struct{ PlaybackStream }
+
+func (nopStream) Write([]int16) error { return nil }
+
+// TestTheMixersRegionsAllocateNothing fails if marking the mixer's regions
+// allocates while a trace runs: a mixer that allocates during a collection's
+// mark phase is made to help mark and to wait for the phase to end, so the
+// trace would put it in waits it never has without one.
+func TestTheMixersRegionsAllocateNothing(t *testing.T) {
+	if err := trace.Start(io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	defer trace.Stop()
+	out := &Output{}
+	frame := make([]int16, 480)
+	for name, f := range map[string]func(){
+		"the lock":  func() { out.lockForMix(); out.mu.Unlock() },
+		"the write": func() { _ = writeFrame(nopStream{}, frame) },
+		"the pacer": func() { pacerSleep(0) },
+	} {
+		if n := testing.AllocsPerRun(100, f); n != 0 {
+			t.Errorf("%s's region allocates %v times while a trace runs, want 0", name, n)
+		}
 	}
 }
 

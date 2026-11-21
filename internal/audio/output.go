@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
-	"runtime/trace"
 	"slices"
 	"sync"
 	"time"
@@ -812,10 +811,8 @@ func (o *Output) mix(stream PlaybackStream, rate int) error {
 			}
 			continue
 		}
-		w := trace.StartRegion(traceRegions, regionWrite)
 		began := time.Now()
-		err := stream.Write(frame)
-		w.End()
+		err := writeFrame(stream, frame)
 		if err != nil {
 			return fmt.Errorf("write speaker stream: %w", err)
 		}
@@ -864,9 +861,7 @@ func (p *pacer) wrote(took time.Duration, now time.Time) {
 		return
 	}
 	if ahead := p.written - now.Sub(p.anchor); ahead > outputAhead {
-		r := trace.StartRegion(traceRegions, regionPacer)
-		time.Sleep(ahead - outputAhead)
-		r.End()
+		pacerSleep(ahead - outputAhead)
 	}
 }
 

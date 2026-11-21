@@ -26,12 +26,27 @@ const (
 // traceRegions is the context the mixer opens its regions on.
 var traceRegions = context.Background()
 
+// The mixer marks its regions with trace.WithRegion, which allocates nothing.
+// trace.StartRegion allocates a Region while a trace runs, and a mixer that
+// allocates during a collection's mark phase is made to help mark and to wait
+// for the phase to end: the trace would put the mixer in waits it never has
+// without it (TestTheMixersRegionsAllocateNothing).
+
 // lockForMix takes the Output's lock for the mixer, inside regionLock, so a
 // trace shows how long the mixer waited for it and who held it.
 func (o *Output) lockForMix() {
-	r := trace.StartRegion(traceRegions, regionLock)
-	o.mu.Lock()
-	r.End()
+	trace.WithRegion(traceRegions, regionLock, o.mu.Lock)
+}
+
+// writeFrame writes frame to stream inside regionWrite.
+func writeFrame(stream PlaybackStream, frame []int16) (err error) {
+	trace.WithRegion(traceRegions, regionWrite, func() { err = stream.Write(frame) })
+	return err
+}
+
+// pacerSleep sleeps d inside regionPacer.
+func pacerSleep(d time.Duration) {
+	trace.WithRegion(traceRegions, regionPacer, func() { time.Sleep(d) })
 }
 
 // The speaker trace's limits: it keeps at least speakerTraceWindow of trace,
