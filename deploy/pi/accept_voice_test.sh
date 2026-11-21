@@ -430,17 +430,20 @@ def stop():
         for field, what in (("SigIgn", "ignores"), ("SigBlk", "blocks")):
             if signal_mask(pid, field) & term:
                 write("fake-error", "the service process %d %s SIGTERM\n" % (pid, what))
-        os.kill(pid, signal.SIGTERM)
         try:
+            os.kill(pid, signal.SIGTERM)
             os.kill(pid, signal.SIGCONT)
         except ProcessLookupError:
-            pass
+            pass  # it ended, and a reaping PID 1 took it, after the check
         deadline = time.time() + STOP_TIMEOUT
         while alive(pid) and time.time() < deadline:
             time.sleep(0.01)
         if alive(pid):
             log_to("stop-killed", "%d %s, %d s after SIGTERM" % (pid, process_state(pid), STOP_TIMEOUT))
-            os.kill(pid, signal.SIGKILL)
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass  # it ended, and a reaping PID 1 took it, between the check and the kill
             deadline = time.time() + 120
             while alive(pid) and time.time() < deadline:
                 time.sleep(0.01)
