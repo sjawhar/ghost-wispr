@@ -70,7 +70,7 @@ func TestKeytermsOnlyForNova3(t *testing.T) {
 		t.Fatalf("keyterms %q for nova-2, want none", got)
 	}
 	cfg.DeepgramModel = "nova-3-general"
-	if got := voiceKeyterms(cfg, nil); !slices.Equal(got, []string{"Wispr"}) {
+	if got := voiceKeyterms(cfg, nil); !slices.Equal(got, []string{"Wispr", "Whisper"}) {
 		t.Fatalf("keyterms %q for nova-3-general, want the wake phrase", got)
 	}
 }

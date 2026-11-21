@@ -24,11 +24,16 @@ func TestWakePhrasePosition(t *testing.T) {
 		{"Whisper, what is happening?", true, "Wispr", "what is happening?"},
 		{"Whisper what is the status?", true, "Wispr", "what is the status?"},
 		{"Wispr", true, "Wispr", ""},
+		// The office run of 2026-11-21 heard the name as "Lispr".
+		{"Lispr, what's the status of INFRA ten twenty seven?", true, "Wispr", "what's the status of INFRA ten twenty seven?"},
 		// Not calls.
 		{"I will whisper it to you", false, "", ""},
 		{"Whisper it to me later.", false, "", ""},
 		{"We asked Wispr yesterday.", false, "", ""},
 		{"The ghost whisper film was good.", false, "", ""},
+		// "Mister" and the like are a person's address, not the name.
+		{"Mister, what's the status of info 10/27?", false, "", ""},
+		{"Miss Murray, what's the status?", false, "", ""},
 		{"", false, "", ""},
 	}
 	for _, c := range cases {
@@ -72,7 +77,9 @@ func TestCommands(t *testing.T) {
 }
 
 // TestKeyterms fails if the keyterms do not start with the wake phrases, once
-// each, or pass Deepgram's limits.
+// each, with "Whisper" right after "Wispr", or pass Deepgram's limits. Nova-3
+// knows how "Whisper" sounds, not "Wispr", which it heard as "Mister", "Miss
+// Burr" and "Lispr" on 2026-11-21.
 func TestKeyterms(t *testing.T) {
 	keys := make([]string, 0, 400)
 	for i := range 400 {
@@ -82,8 +89,8 @@ func TestKeyterms(t *testing.T) {
 	if len(got) > MaxKeyterms {
 		t.Fatalf("%d keyterms, want at most %d", len(got), MaxKeyterms)
 	}
-	if !slices.Equal(got[:2], []string{"Wispr", "Ghost Wispr"}) {
-		t.Fatalf("keyterms start %q, want the wake phrases first, once each", got[:2])
+	if !slices.Equal(got[:3], []string{"Wispr", "Whisper", "Ghost Wispr"}) {
+		t.Fatalf("keyterms start %q, want the wake phrases first, once each, with Whisper after Wispr", got[:3])
 	}
 	tokens := 0
 	for _, k := range got {
@@ -106,8 +113,8 @@ func TestKeyterms(t *testing.T) {
 func TestIsName(t *testing.T) {
 	d := New([]string{"Wispr", "Ghost Wispr"})
 	for word, want := range map[string]bool{
-		"Wispr,": true, "wispr": true, "Whisper.": true, "Ghost": true,
-		"Tell": false, "whiskey": false, "": false,
+		"Wispr,": true, "wispr": true, "Whisper.": true, "Ghost": true, "Lispr,": true,
+		"Tell": false, "whiskey": false, "Mister,": false, "": false,
 	} {
 		if got := d.IsName(word); got != want {
 			t.Errorf("IsName(%q) = %v, want %v", word, got, want)
