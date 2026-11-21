@@ -42,11 +42,12 @@ const probeInsertEvery = 4 * time.Minute
 // probeChunk is how much of a meeting one live socket hears.
 const probeChunk = 10 * time.Minute
 
-// amiWord is a word or punctuation mark of an AMI transcript.
+// amiWord is a word or punctuation mark of an AMI transcript, with when it
+// starts and ends; end is start when the transcript gives none.
 type amiWord struct {
-	start float64
-	text  string
-	punc  bool
+	start, end float64
+	text       string
+	punc       bool
 }
 
 // amiUtterance is what one speaker says without a pause of a second or more.
@@ -192,18 +193,21 @@ func TestProbeWakeFalseRate(t *testing.T) {
 
 // poissonUpper95 is the one-sided 95% upper bound of a Poisson mean from k
 // events: the mean at which k or fewer events come with probability 0.05.
+// The chance is summed in logs, so a large mean does not underflow, and the
+// search range grows until it holds the bound.
 func poissonUpper95(k int) float64 {
 	cdf := func(mean float64) float64 {
-		sum, term := 0.0, math.Exp(-mean)
-		for i := 0; i <= k; i++ {
-			if i > 0 {
-				term *= mean / float64(i)
-			}
-			sum += term
+		sum := 0.0
+		for i := range k + 1 {
+			lg, _ := math.Lgamma(float64(i + 1))
+			sum += math.Exp(float64(i)*math.Log(mean) - mean - lg)
 		}
 		return sum
 	}
 	lo, hi := 0.0, float64(k)+20
+	for cdf(hi) > 0.05 {
+		lo, hi = hi, 2*hi
+	}
 	for range 200 {
 		mid := (lo + hi) / 2
 		if cdf(mid) > 0.05 {
@@ -215,21 +219,38 @@ func poissonUpper95(k int) float64 {
 	return hi
 }
 
-// TestPoissonUpper95 fails if the bound is not the known one: 3.00 for no
-// events, 4.74 for one.
+// TestPoissonUpper95 fails if the bound is not the known one, 3.00 for no
+// events and 4.74 for one, or is no number, or is not the bound at larger
+// counts: for 200 events it returned 220, the end of its first search range,
+// where the chance of 200 or fewer events is 0.093, not 0.05 (Sol's review of
+// #135 at 21bbef7), and a NaN passed the old check.
 func TestPoissonUpper95(t *testing.T) {
 	for k, want := range map[int]float64{0: 2.9957, 1: 4.7439, 5: 10.5130} {
-		if got := poissonUpper95(k); math.Abs(got-want) > 0.001 {
+		if got := poissonUpper95(k); math.IsNaN(got) || math.IsInf(got, 0) || math.Abs(got-want) > 0.001 {
 			t.Errorf("poissonUpper95(%d) = %.4f, want %.4f", k, got, want)
+		}
+	}
+	for _, k := range []int{200, 2000} {
+		upper := poissonUpper95(k)
+		if math.IsNaN(upper) || math.IsInf(upper, 0) || upper <= float64(k) {
+			t.Fatalf("poissonUpper95(%d) = %v, want a number above %d", k, upper, k)
+		}
+		cdf := 0.0
+		for i := range k + 1 {
+			lg, _ := math.Lgamma(float64(i + 1))
+			cdf += math.Exp(float64(i)*math.Log(upper) - upper - lg)
+		}
+		if math.Abs(cdf-0.05) > 1e-6 {
+			t.Errorf("poissonUpper95(%d) = %.4f, where %d or fewer events come with probability %.6f, want 0.05", k, upper, k, cdf)
 		}
 	}
 }
 
 // probeMeeting returns AMI meeting m as synthetic speech, 16 kHz PCM16: its
 // utterances in order, each speaker in its own Aura-2 voice, 300 ms apart,
-// with one of the probe's own sentences every probeInsertEvery, and how many
-// of those it holds. It keeps the speech in dir, and speaks only what it has
-// not kept.
+// with one of the probe's own sentences each time the audio so far passes
+// another probeInsertEvery, and how many of those it holds. It keeps the
+// speech in dir, and speaks only what it has not kept.
 func probeMeeting(ctx context.Context, key, words, dir, m string, index int) ([]byte, int, error) {
 	path := filepath.Join(dir, "corpus", m+".pcm")
 	countPath := path + ".inserted"
@@ -242,23 +263,36 @@ func probeMeeting(ctx context.Context, key, words, dir, m string, index int) ([]
 	if err != nil {
 		return nil, 0, err
 	}
-	voices := map[string]string{}
 	type line struct{ voice, text string }
-	var lines []line
-	spoken, next, inserted := 0.0, probeInsertEvery.Seconds(), 0
-	for _, u := range utterances {
+	speak := func(l line) ([]byte, error) {
+		sum := sha256.Sum256([]byte(l.voice + "\x00" + l.text))
+		cache := filepath.Join(dir, "tts", hex.EncodeToString(sum[:16])+".pcm")
+		if pcm, err := os.ReadFile(cache); err == nil {
+			return pcm, nil
+		}
+		var pcm []byte
+		var err error
+		for attempt := range 4 {
+			if pcm, err = probeSpeak(ctx, key, l.voice, l.text); err == nil {
+				break
+			}
+			time.Sleep(time.Duration(attempt+1) * time.Second)
+		}
+		if err != nil {
+			return nil, fmt.Errorf("Aura %s, %d chars: %w", l.voice, len(l.text), err)
+		}
+		_ = os.WriteFile(cache, pcm, 0o600)
+		return pcm, nil
+	}
+	voices := map[string]string{}
+	lines := make([]line, len(utterances))
+	for i, u := range utterances {
 		v, ok := voices[u.speaker]
 		if !ok {
 			v = probeVoices[(index*4+len(voices))%len(probeVoices)]
 			voices[u.speaker] = v
 		}
-		if spoken >= next {
-			lines = append(lines, line{v, probeNonCalls[(index*7+inserted)%len(probeNonCalls)]})
-			inserted++
-			next += probeInsertEvery.Seconds()
-		}
-		lines = append(lines, line{v, u.text})
-		spoken += float64(len(strings.Fields(u.text))) / 2.5 // about 150 words a minute
+		lines[i] = line{v, u.text}
 	}
 	pcms := make([][]byte, len(lines))
 	var wg sync.WaitGroup
@@ -270,26 +304,12 @@ func probeMeeting(ctx context.Context, key, words, dir, m string, index int) ([]
 		go func() {
 			defer wg.Done()
 			defer func() { <-sem }()
-			sum := sha256.Sum256([]byte(l.voice + "\x00" + l.text))
-			cache := filepath.Join(dir, "tts", hex.EncodeToString(sum[:16])+".pcm")
-			if pcm, err := os.ReadFile(cache); err == nil {
-				pcms[i] = pcm
-				return
-			}
-			var pcm []byte
-			var err error
-			for attempt := range 4 {
-				if pcm, err = probeSpeak(ctx, key, l.voice, l.text); err == nil {
-					break
-				}
-				time.Sleep(time.Duration(attempt+1) * time.Second)
-			}
+			pcm, err := speak(l)
 			if err != nil {
-				errs <- fmt.Errorf("Aura %s, %d chars: %w", l.voice, len(l.text), err)
+				errs <- err
 				return
 			}
 			pcms[i] = pcm
-			_ = os.WriteFile(cache, pcm, 0o600)
 		}()
 	}
 	wg.Wait()
@@ -297,9 +317,22 @@ func probeMeeting(ctx context.Context, key, words, dir, m string, index int) ([]
 	for err := range errs {
 		return nil, 0, err
 	}
+	// The probe's own sentences go in by the audio so far, as the room
+	// would hear it: each utterance's own length and the gap after it.
 	gap := make([]byte, 16000*2*3/10)
 	var out bytes.Buffer
-	for _, pcm := range pcms {
+	next, inserted := int(probeInsertEvery.Seconds())*16000*2, 0
+	for i, pcm := range pcms {
+		if out.Len() >= next {
+			said, err := speak(line{lines[i].voice, probeNonCalls[(index*7+inserted)%len(probeNonCalls)]})
+			if err != nil {
+				return nil, 0, err
+			}
+			out.Write(said)
+			out.Write(gap)
+			inserted++
+			next += int(probeInsertEvery.Seconds()) * 16000 * 2
+		}
 		out.Write(pcm)
 		out.Write(gap)
 	}
@@ -312,7 +345,8 @@ func probeMeeting(ctx context.Context, key, words, dir, m string, index int) ([]
 
 // amiUtterances reads AMI meeting m's words, every speaker's, from the words
 // folder, as utterances in the order they start: what one speaker says with
-// no pause of a second or more, cut after a sentence's end past 30 words.
+// no pause of a second or more, from one word's end to the next word's
+// start, cut after a sentence's end past 30 words.
 func amiUtterances(dir, m string) ([]amiUtterance, error) {
 	files, err := filepath.Glob(filepath.Join(dir, m+".*.words.xml"))
 	if err != nil || len(files) == 0 {
@@ -326,7 +360,7 @@ func amiUtterances(dir, m string) ([]amiUtterance, error) {
 			return nil, err
 		}
 		var cur []amiWord
-		last := -1.0
+		lastEnd := -1.0
 		flush := func() {
 			var b strings.Builder
 			for _, w := range cur {
@@ -341,12 +375,12 @@ func amiUtterances(dir, m string) ([]amiUtterance, error) {
 			cur = nil
 		}
 		for _, w := range ws {
-			if len(cur) > 0 && !w.punc && w.start-last >= 1.0 {
+			if len(cur) > 0 && !w.punc && w.start-lastEnd >= 1.0 {
 				flush()
 			}
 			cur = append(cur, w)
 			if !w.punc {
-				last = w.start
+				lastEnd = w.end
 			}
 			if w.punc && (w.text == "." || w.text == "?") && len(cur) > 30 {
 				flush()
@@ -393,13 +427,20 @@ func amiWords(path string) ([]amiWord, error) {
 			continue
 		}
 		var w amiWord
+		end := false
 		for _, a := range se.Attr {
 			switch a.Name.Local {
 			case "starttime":
 				w.start, _ = strconv.ParseFloat(a.Value, 64)
+			case "endtime":
+				w.end, _ = strconv.ParseFloat(a.Value, 64)
+				end = true
 			case "punc":
 				w.punc = a.Value == "true"
 			}
+		}
+		if !end || w.end < w.start {
+			w.end = w.start
 		}
 		var text string
 		if err := dec.DecodeElement(&text, &se); err != nil {

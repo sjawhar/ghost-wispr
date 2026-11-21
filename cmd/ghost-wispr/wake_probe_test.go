@@ -63,12 +63,12 @@ var (
 
 // probeClip is one synthetic sentence and what the live transcript made of it.
 type probeClip struct {
-	Voice   string   `json:"voice"`
-	Text    string   `json:"text"`
-	Call    bool     `json:"call"`
-	Seconds float64  `json:"seconds"`
-	Woke    bool     `json:"woke"`
-	Heard   []string `json:"heard"` // every result's text, interim and final
+	Voice   string        `json:"voice"`
+	Text    string        `json:"text"`
+	Call    bool          `json:"call"`
+	Seconds float64       `json:"seconds"`
+	Woke    bool          `json:"woke"`
+	Heard   []probeResult `json:"heard"` // every result with text, interim and final, in order
 }
 
 // TestProbeWakeKeyterm measures how often the live transcript wakes Wispr on
@@ -141,7 +141,7 @@ func TestProbeWakeKeyterm(t *testing.T) {
 					return
 				}
 				for _, h := range heard {
-					results[i].Heard = append(results[i].Heard, h.Text)
+					results[i].Heard = append(results[i].Heard, h)
 					if _, ok := detector.Find(h.Text); ok {
 						results[i].Woke = true
 					}
@@ -213,28 +213,38 @@ type probeResult struct {
 	Final bool   `json:"final"`
 }
 
-// probeResults collects every result with text a live socket hands on.
+// probeResults collects every result with text a live socket hands on, and
+// counts its finals, with text or none.
 type probeResults struct {
 	transcriptCallback
-	mu    sync.Mutex
-	heard []probeResult
+	mu     sync.Mutex
+	heard  []probeResult
+	finals int
 }
 
 func (p *probeResults) Message(mr *api.MessageResponse) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if mr.IsFinal {
+		p.finals++
+	}
 	if len(mr.Channel.Alternatives) > 0 && strings.TrimSpace(mr.Channel.Alternatives[0].Transcript) != "" {
-		p.mu.Lock()
 		p.heard = append(p.heard, probeResult{Text: mr.Channel.Alternatives[0].Transcript, Final: mr.IsFinal})
-		p.mu.Unlock()
 	}
 	return nil
 }
 
+// probeHost is the Deepgram host the probes dial; empty is Deepgram's own.
+var probeHost string
+
 // probeTranscribe streams pcm to Deepgram's live endpoint with opts, as the
 // microphone does, in 100 ms buffers at the rate they are captured, then 1.5 s
-// of silence, and returns every result with text.
+// of silence, and returns every result with text. A socket that sent no final
+// result is an error: what it heard cannot be read, and must not count as
+// having heard nothing.
 func probeTranscribe(ctx context.Context, key string, opts *interfaces.LiveTranscriptionOptions, pcm []byte) ([]probeResult, error) {
 	results := &probeResults{}
-	socket, err := dialDeepgramLive(ctx, key, &interfaces.ClientOptions{}, opts, results, deepgramWriteTimeout)
+	socket, err := dialDeepgramLive(ctx, key, &interfaces.ClientOptions{Host: probeHost}, opts, results, deepgramWriteTimeout)
 	if err != nil {
 		return nil, fmt.Errorf("dial: %w", err)
 	}
@@ -259,5 +269,8 @@ func probeTranscribe(ctx context.Context, key string, opts *interfaces.LiveTrans
 	time.Sleep(2 * time.Second) // the last results
 	results.mu.Lock()
 	defer results.mu.Unlock()
+	if results.finals == 0 {
+		return nil, fmt.Errorf("no final result in %d results: the socket's hearing cannot be read", len(results.heard))
+	}
 	return slices.Clone(results.heard), nil
 }
