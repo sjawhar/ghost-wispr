@@ -127,6 +127,15 @@ func (s outputSpeaker) OnSpeech(fn func(audio.SpeechEvent)) func() {
 	return s.o.OnSpeech(fn)
 }
 func (s outputSpeaker) FlushSpeech() { s.o.FlushSpeech() }
+func (s outputSpeaker) OnAudible(fn func(audio.AudibleEvent)) func() {
+	return s.o.OnAudible(fn)
+}
+
+// audibleSpeaker is a Speaker that reports when each speech's first sample
+// left its buffer for the device (audio.Output.OnAudible).
+type audibleSpeaker interface {
+	OnAudible(fn func(audio.AudibleEvent)) (remove func())
+}
 
 // TurnDriver is implemented by a Voice whose vendor drives the turn itself
 // (voices B and C): the Supervisor then hands the Concierge no turn, and the
@@ -250,6 +259,7 @@ type Supervisor struct {
 	logf   func(string, ...any)
 
 	unlisten func()
+	unhear   func() // stops onAudible
 
 	mu         sync.Mutex
 	closed     bool
@@ -536,6 +546,10 @@ func NewSupervisor(c *SupervisorConfig) *Supervisor {
 		idle:   make(chan struct{}),
 	}
 	s.unlisten = cfg.Speaker.OnSpeech(func(e audio.SpeechEvent) { s.onSpeech(&e) })
+	s.unhear = func() {}
+	if a, ok := cfg.Speaker.(audibleSpeaker); ok {
+		s.unhear = a.OnAudible(s.onAudible)
+	}
 	s.spawn(s.sendNotes)
 	s.spawn(s.offerAnswers)
 	return s
@@ -557,6 +571,7 @@ func (s *Supervisor) Close() {
 	s.showWaitingLocked()
 	s.mu.Unlock()
 	s.unlisten()
+	s.unhear()
 	s.cancel()
 	s.spawnMu.Lock()
 	s.closing = true
@@ -2463,6 +2478,23 @@ func (s *Supervisor) sendNotes() {
 			return
 		}
 	}
+}
+
+// onAudible reports in the timing log when a sound on any of the speaker's
+// inputs, the chime's or the voice's, left the speaker's buffer for the
+// device, by the stream's own account (audio.AudibleEvent): the acceptance
+// driver times the answer against the chime in one recording of the room,
+// and the device's latency, the same for both, cancels. The times are on
+// CLOCK_MONOTONIC, the driver's clock.
+func (s *Supervisor) onAudible(e audio.AudibleEvent) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	sessionID := ""
+	if s.ex != nil {
+		sessionID = s.ex.x.SessionID
+	}
+	s.timing("audible", sessionID, time.Now(), "input", e.Input, "audible_mono_ns", e.At, "audible_lead_ns", e.Lead,
+		"audible_err_ns", e.Err, "disruptions", e.Disruptions)
 }
 
 // onSpeech follows the voice input's speech, for barge-in and the own-speech

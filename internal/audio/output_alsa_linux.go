@@ -9,6 +9,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 // playbackUsesPortAudio says whether the speaker's stream is PortAudio's: not
@@ -112,6 +114,34 @@ func (s *alsaStream) queuedFrames() int {
 		held = max(0, s.params.buffer-avail)
 	}
 	return held + s.params.buffer
+}
+
+// playPosition reads one status snapshot of the PCM, its state and its delay
+// (what it was given and has not yet played, with what the driver counts in
+// flight to the speaker), between two reads of CLOCK_MONOTONIC (Output's
+// timeAudible). A snapshot that fails, or a clock that cannot be read, gives
+// none.
+func (s *alsaStream) playPosition() (playPosition, bool) {
+	before, ok := monotonicNanos()
+	if !ok {
+		return playPosition{}, false
+	}
+	st := s.pcm.status()
+	after, ok := monotonicNanos()
+	if !ok || st.rc < 0 {
+		return playPosition{}, false
+	}
+	return playPosition{running: st.running, delay: max(0, st.delay), before: before, after: after}, true
+}
+
+// monotonicNanos reads CLOCK_MONOTONIC, the clock the acceptance driver times
+// the room's recording on.
+func monotonicNanos() (int64, bool) {
+	var ts unix.Timespec
+	if unix.ClockGettime(unix.CLOCK_MONOTONIC, &ts) != nil {
+		return 0, false
+	}
+	return ts.Nano(), true
 }
 
 // Write plays frame, waiting while the PCM is full. After an underrun, when
