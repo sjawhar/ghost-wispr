@@ -3,6 +3,7 @@ package audio
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 )
@@ -119,5 +120,57 @@ func TestADrainOfAnEarlierCancelDoesNotWaitForALaterOne(t *testing.T) {
 	}
 	if !errors.Is(err, ErrCancelled) {
 		t.Fatalf("the first playback's Drain waited for the later Cancel: %v", err)
+	}
+}
+
+// TestALaterCancelsDrainDoesNotWaitForAnEarlierSpeech fails if Drain of a
+// playback begun after a Cancel the mixer has not yet taken in, and then
+// cancelled, waits for that earlier speech's take-back: its playback played
+// none of it, and its Drain waited until the held write returned (Sol's
+// review of #153 at 80418b0: context deadline exceeded). The new playback
+// is empty, or holds 20 ms the held mixer cannot play. The control has no
+// earlier speech.
+func TestALaterCancelsDrainDoesNotWaitForAnEarlierSpeech(t *testing.T) {
+	for _, tc := range []struct {
+		earlier bool
+		queued  time.Duration
+	}{{false, 0}, {true, 0}, {true, 20 * time.Millisecond}} {
+		t.Run(fmt.Sprintf("an earlier speech %v, %v queued", tc.earlier, tc.queued), func(t *testing.T) {
+			stream := &probeStream{fakeStream: newFakeStream(48000)}
+			out, start, _ := probeOutput(t, stream)
+			held := newProbeBarrier()
+			t.Cleanup(held.unblock)
+			if tc.earlier {
+				stream.before = func(n int, _ []int16) {
+					if n == 2 {
+						held.hold()
+					}
+				}
+				a := out.Begin(InputVoice)
+				if err := a.WriteAll(testContext(t), constant(48000, 40*time.Millisecond, 1000), mono48k); err != nil {
+					t.Fatal(err)
+				}
+				start()
+				probeWait(t, held.entered, "the earlier speech's second write")
+				out.Cancel(InputVoice)
+			}
+			b := out.Begin(InputVoice)
+			if tc.queued > 0 {
+				if err := b.WriteAll(testContext(t), constant(48000, tc.queued, 1000), mono48k); err != nil {
+					t.Fatal(err)
+				}
+			}
+			out.Cancel(InputVoice)
+			ctx, stop := context.WithTimeout(context.Background(), 100*time.Millisecond)
+			defer stop()
+			err := b.Drain(ctx)
+			if got := b.Played(); got != 0 {
+				t.Fatalf("the later playback played %v, want none", got)
+			}
+			held.unblock()
+			if !errors.Is(err, ErrCancelled) {
+				t.Fatalf("the later playback's Drain: %v, want ErrCancelled at once", err)
+			}
+		})
 	}
 }

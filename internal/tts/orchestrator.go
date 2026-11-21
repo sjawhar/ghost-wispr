@@ -276,8 +276,11 @@ func (o *Orchestrator) play(resp *SpeechResponse) (bytesWritten, durationMs int6
 	} else if errors.Is(err, audio.ErrCancelled) {
 		// A Cancel during WriteAll: Drain returns once the mixer has taken
 		// it in and taken off what the device gave back unheard, so Played
-		// below is final.
-		_ = playback.Drain(o.ctx)
+		// below is final. A Stop that ends the wait first leaves Played not
+		// final: the speech fails with the Stop's error.
+		if dErr := playback.Drain(o.ctx); !errors.Is(dErr, audio.ErrCancelled) {
+			err = dErr
+		}
 	}
 	if errors.Is(err, audio.ErrCancelled) {
 		err = nil // it played until the Cancel

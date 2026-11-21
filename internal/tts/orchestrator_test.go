@@ -596,3 +596,71 @@ func TestOrchestratorReportsWhatPlayedOfASpeechCancelledInItsWrite(t *testing.T)
 		})
 	}
 }
+
+// TestAStoppedOrchestratorReportsNoPlayedBeforeTheTakeBack fails if a speech
+// cancelled in its write, whose orchestrator stops while the take-back is
+// still to come, completes with what it read as played before that
+// take-back: 20 ms and 1920 bytes, where the room heard none (Sol's review
+// of #153 at 80418b0). It must fail, or complete with what played. The
+// control does not stop, and completes with 0 ms once the take-back comes.
+func TestAStoppedOrchestratorReportsNoPlayedBeforeTheTakeBack(t *testing.T) {
+	for _, stop := range []bool{false, true} {
+		t.Run(fmt.Sprintf("stopped while it waits %v", stop), func(t *testing.T) {
+			pcm := make([]byte, 2*48000*4/10) // 400 ms at 48 kHz, more than the input queues
+			for i := 0; i < len(pcm); i += 2 {
+				pcm[i], pcm[i+1] = 0xE8, 0x03 // 1000
+			}
+			stream := &heldDropStream{entered: make(chan struct{}), release: make(chan struct{}), back: 960}
+			release := sync.OnceFunc(func() { close(stream.release) })
+			t.Cleanup(release)
+			out := newOutputOn(t, stream)
+			ended := make(chan audio.SpeechEvent, 2)
+			defer out.OnSpeech(func(e audio.SpeechEvent) {
+				if e.Input == audio.InputVoice && !e.Started {
+					ended <- e
+				}
+			})()
+			provider := &mockProvider{audio: pcm, format: audio.AudioFormat{SampleRate: 48000, Channels: 1, Encoding: audio.EncodingPCM16}}
+			o := NewOrchestrator(provider, out, OrchestratorOpts{MaxRequestsPerMin: 100})
+			defer o.Stop()
+			id, err := o.Speak("a long answer", "", "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case <-stream.entered:
+			case <-time.After(3 * time.Second):
+				t.Fatal("the mixer never reached its second write")
+			}
+			out.Cancel(audio.InputVoice)
+			time.Sleep(100 * time.Millisecond) // the cancelled write reaches its Drain
+			if stop {
+				o.Stop()
+			}
+			time.Sleep(100 * time.Millisecond)
+			release()
+			var end audio.SpeechEvent
+			select {
+			case end = <-ended:
+			case <-time.After(3 * time.Second):
+				t.Fatal("the cancelled speech never ended")
+			}
+			deadline := time.Now().Add(3 * time.Second)
+			for {
+				status, _ := o.Status(id)
+				switch {
+				case status.Status == StatusCompleted:
+					if status.DurationMs != end.Played.Milliseconds() {
+						t.Fatalf("the speech completed with %d ms, %d bytes played, but the room heard %v", status.DurationMs, status.BytesWritten, end.Played)
+					}
+					return
+				case status.Status == StatusFailed && stop:
+					return
+				case status.Status == StatusFailed || time.Now().After(deadline):
+					t.Fatalf("status %s (%s), want completed", status.Status, status.Error)
+				}
+				time.Sleep(time.Millisecond)
+			}
+		})
+	}
+}

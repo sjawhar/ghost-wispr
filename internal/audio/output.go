@@ -226,10 +226,10 @@ type outputInput struct {
 	pushes uint64
 
 	speaking  bool
-	cancelled bool       // Cancel silenced its speech: the mixer takes it back and ends it
-	unsettled []*playGen // the generations Cancel ended in that speech, settling until it ends (endSpeech)
-	cancelAt  time.Time  // when the first Cancel of the speech came
-	cut       bool       // Cancel dropped audio of the speech still queued
+	cancelled bool      // Cancel silenced its speech: the mixer takes it back and ends it
+	unsettled *playGen  // the generation the first Cancel ended in that speech, settling until it ends (endSpeech)
+	cancelAt  time.Time // when the first Cancel of the speech came
+	cut       bool      // Cancel dropped audio of the speech still queued
 	// startFrame is the frame that holds its speech's first audio, which the
 	// speech starts with once the stream has taken it (wrote); startPending
 	// says it has not yet, and startedAt is when it did.
@@ -568,12 +568,14 @@ func (o *Output) Cancel(input string) {
 	in.end(ErrCancelled)
 	if in.speaking {
 		// A second Cancel before the mixer takes the first in finds nothing
-		// queued: it keeps the first one's cut and time.
+		// queued: it keeps the first one's cut and time. Its generation was
+		// begun after the first Cancel, so it played none of the speech,
+		// and its Drain does not wait for the take-back.
 		if !in.cancelled {
 			in.cancelAt = time.Now()
+			gen.settling, in.unsettled = true, gen
 		}
 		in.cancelled, in.cut = true, in.cut || cut
-		gen.settling, in.unsettled = true, append(in.unsettled, gen)
 		o.dropNow = true
 	}
 	o.changed()
@@ -1427,15 +1429,11 @@ func (o *Output) endSpeech(in *outputInput, now time.Time, cancelled bool) {
 		}
 	}
 	in.speaking, in.startPending, in.cancelled, in.cancelAt, in.cut, in.spoken, in.quietAt = false, false, false, time.Time{}, false, playedTime{}, time.Time{}
-	if len(in.unsettled) > 0 {
-		// The Cancels are taken in, or the stream is gone: their Drains
-		// return, whatever ended the speech (retake, an idle close, a
-		// failure, Close).
-		for _, g := range in.unsettled {
-			g.settling = false
-		}
-		clear(in.unsettled)
-		in.unsettled = in.unsettled[:0]
+	if in.unsettled != nil {
+		// The Cancel is taken in, or the stream is gone: its Drains return,
+		// whatever ended the speech (retake, an idle close, a failure,
+		// Close).
+		in.unsettled.settling, in.unsettled = false, nil
 		o.changed()
 	}
 }
