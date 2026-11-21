@@ -55,11 +55,12 @@ func holdIt(mu *sync.Mutex, d time.Duration, locked chan<- struct{}) {
 	mu.Unlock()
 }
 
-// passIt waits for mu and lets it go at once: a waiter queued ahead of the
-// mixer, through which the lock passes to it.
+// passIt waits for mu, yields once while it holds it, and lets it go: a
+// waiter queued ahead of the mixer, through which the lock passes to it.
 func passIt(mu *sync.Mutex) {
 	mu.Lock()
-	mu.Unlock() //nolint:staticcheck // the empty critical section is the point
+	runtime.Gosched()
+	mu.Unlock()
 }
 
 // crowd keeps the mixer runnable but not run for about d: one processor for

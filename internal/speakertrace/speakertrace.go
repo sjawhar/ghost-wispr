@@ -198,7 +198,7 @@ func Read(r io.Reader, slow time.Duration) ([]Cycle, error) {
 			g.account(now)
 			from, to := st.Goroutine()
 			if from == trace.GoWaiting && to == trace.GoRunnable {
-				g.woke = wake{by: ev.Goroutine(), name: waker(ev), at: now, waitFrom: g.waited, reason: g.reason}
+				g.woke = wake{by: ev.Goroutine(), name: waker(&ev), at: now, waitFrom: g.waited, reason: g.reason}
 				if g.cycle != nil {
 					g.cycle.Woken = append(g.cycle.Woken, chain(gs, g.woke))
 				}
@@ -247,7 +247,7 @@ func Read(r io.Reader, slow time.Duration) ([]Cycle, error) {
 
 // waker names the goroutine that made a waiting goroutine runnable, and the
 // function it was in.
-func waker(ev trace.Event) string {
+func waker(ev *trace.Event) string {
 	if ev.Goroutine() == trace.NoGoroutine {
 		return "the runtime"
 	}
