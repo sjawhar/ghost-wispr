@@ -244,6 +244,19 @@ type Supervisor struct {
 	heard         []heardCall    // Heard calls OnTranscript makes once it unlocks
 	segments      []Segment      // Segment calls OnTranscript makes once it unlocks
 	wg            sync.WaitGroup // the goroutines Close waits for
+	// speechEx is the exchange whose voice's speech plays now: the one
+	// holding the floor when the speech started, by the speech's own start
+	// time, not when its event came, nil for other speech. The speech's end
+	// is that exchange's, though another exchange may have taken the floor,
+	// and cut it, since. floorAt is when the exchange holding the floor took
+	// it. lastEx is the exchange that held the floor last, from lastFloorAt
+	// until lastFloorEnd: a speech whose start the speaker reports only once
+	// it has ended, as a stop can come first, is still its own.
+	speechEx     *exchange
+	floorAt      time.Time
+	lastEx       *exchange
+	lastFloorAt  time.Time
+	lastFloorEnd time.Time
 
 	// commands counts a person's commands on held answers: each "Wispr,
 	// never mind" and each "Wispr, go ahead". neverMinds is how many never
@@ -344,6 +357,9 @@ type exchange struct {
 	toolCalls     int  // answer tools still running: the exchange stays open
 	// dropsAtOpen is the tap's drop count when the exchange opened.
 	dropsAtOpen uint64
+	// unbindMeeting stops the callback that ends the exchange when its
+	// meeting ends (bindMeetingLocked); endLocked calls it. Nil until bound.
+	unbindMeeting func() bool
 	// sayCtx, when set, is the context of a hand's words, derived from its
 	// membership's: its end stops them, and exchangeOutput refuses any frame
 	// written once it ended.
@@ -1038,14 +1054,17 @@ func (s *Supervisor) bindMeetingLocked(ex *exchange, sessionID string) {
 	}
 	meeting := s.cfg.Meeting(sessionID)
 	ex.authority.bind(meeting)
-	stop := context.AfterFunc(meeting, func() {
+	// The callback stays until ex ends (endLocked), not until ex's context
+	// is done: the meeting's end makes that context done too, and a stop run
+	// then could come before the callback, so the meeting's end would not
+	// end ex.
+	ex.unbindMeeting = context.AfterFunc(meeting, func() {
 		s.mu.Lock()
 		defer s.mu.Unlock()
 		if s.ex == ex && !ex.ended {
 			s.endLocked(ex, true, "its meeting ended")
 		}
 	})
-	context.AfterFunc(ex.ctx, func() { stop() })
 }
 
 // exchangeContext is an exchange's context: done when the exchange is (its
@@ -1162,9 +1181,7 @@ func (s *Supervisor) readEvents(ex *exchange, sess Session) {
 				s.timing("fact_audio", ex.x.SessionID, time.Now())
 			}
 		case EventSpeechEnded:
-			if ex.drives && !ex.spokeAt.IsZero() && !ex.ended {
-				s.noteLocked(ex, EventSpoken, ex.x.SessionID)
-			}
+			// voice_spoken comes from the speaker (driverSpeechLocked).
 			s.touchLocked(ex)
 		case EventErr:
 			s.logf("voice: %v", e.Err)
@@ -1221,15 +1238,26 @@ func (s *Supervisor) idleWaited(ex *exchange) {
 }
 
 // driverSpeechLocked follows the speech of ex's voice, which drives its own
-// turn: the room's next words are a new turn, and once its speech ends by
-// itself, the follow-up window opens (R10).
-func (s *Supervisor) driverSpeechLocked(ex *exchange, started bool) {
+// turn, as the speaker reports it: the room's next words are a new turn, and
+// once its speech ends by itself, it was spoken (EventSpoken, once for the
+// exchange) and the follow-up window opens (R10). A speech a cancel cut, a
+// barge-in's included, was not spoken: the speaker reports it cancelled.
+// voice_spoken comes from the speaker's report, not from the voice's own,
+// which can trail it, and it is ex's, the exchange that held the floor when
+// the speech started (speechEx): the report is made even when ex has ended
+// since, before the speaker's callback came, and a barge-in after the speech
+// had played to its end does not take it back.
+func (s *Supervisor) driverSpeechLocked(ex *exchange, started, cancelled bool) {
+	if !started && !cancelled {
+		s.noteLocked(ex, EventSpoken, ex.x.SessionID)
+	}
+	if ex.ended {
+		return
+	}
 	s.disarmFollowUpLocked(ex)
 	ex.newTurn = true
 	if started {
 		ex.unspokenAnswer = false
-	}
-	if started || ex.ended {
 		return
 	}
 	if ex.cutSpeech { // a barge-in: the person speaks now
@@ -1872,6 +1900,9 @@ func (s *Supervisor) endLocked(ex *exchange, cut bool, reason string) {
 		return
 	}
 	ex.ended = true
+	if ex.unbindMeeting != nil {
+		ex.unbindMeeting()
+	}
 	if ex.timer != nil {
 		ex.timer.Stop()
 	}
@@ -1881,6 +1912,7 @@ func (s *Supervisor) endLocked(ex *exchange, cut bool, reason string) {
 	if s.ex == ex {
 		s.ex = nil
 		close(s.floor)
+		s.lastEx, s.lastFloorAt, s.lastFloorEnd = ex, s.floorAt, time.Now()
 	}
 	s.cfg.Tap.CloseOut()
 	if dropped := s.cfg.Tap.Dropped() - ex.dropsAtOpen; dropped > 0 {
@@ -1927,7 +1959,7 @@ func (s *Supervisor) endLocked(ex *exchange, cut bool, reason string) {
 // has sounded yet, and the answer sound. Speech begun after this waits for
 // the floor (WithFloor).
 func (s *Supervisor) takeFloorLocked(ex *exchange) {
-	s.ex = ex
+	s.ex, s.floorAt = ex, time.Now()
 	s.floor = make(chan struct{})
 	s.cfg.Speaker.Cancel(audio.InputVoice)
 	s.cutChimeLocked(true) // a notification sound gives way to the exchange, and sounds again after it
@@ -1958,7 +1990,9 @@ func (s *Supervisor) sendNotes() {
 }
 
 // onSpeech follows the voice input's speech, for barge-in and the own-speech
-// filter.
+// filter. A speech belongs to the exchange that held the floor when it
+// started, and its end to that exchange too (speechEx): an exchange that
+// takes the floor cuts the speech playing, whose end then comes after.
 func (s *Supervisor) onSpeech(e audio.SpeechEvent) {
 	if e.Input != audio.InputVoice {
 		return
@@ -1966,14 +2000,29 @@ func (s *Supervisor) onSpeech(e audio.SpeechEvent) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.voiceSpeaking = e.Started
-	ex := s.ex
 	sessionID := ""
-	if ex != nil {
-		sessionID = ex.x.SessionID
+	if s.ex != nil {
+		sessionID = s.ex.x.SessionID
 	}
+	var ex *exchange
 	if e.Started {
+		// The speech is the voice's of the exchange that held the floor when
+		// it started, by its own start time: the one holding it now, or the
+		// one before, ended since, whose start the speaker reported late. A
+		// speech that started before the exchange holding the floor took it,
+		// and after the one before gave it up, is no exchange's: the floor's
+		// cut ends it.
+		ex, s.speechEx = nil, nil
+		switch {
+		case s.ex != nil && !e.At.Before(s.floorAt):
+			ex = s.ex
+		case s.lastEx != nil && !e.At.Before(s.lastFloorAt) && e.At.Before(s.lastFloorEnd):
+			ex = s.lastEx
+		}
+		s.speechEx = ex
 		s.voiceStarted = e.At
 	} else {
+		ex, s.speechEx = s.speechEx, nil
 		s.voiceEnded = time.Now()
 		s.timing("speech_end", sessionID, e.At)
 	}
@@ -1982,7 +2031,7 @@ func (s *Supervisor) onSpeech(e audio.SpeechEvent) {
 	}
 	s.touchLocked(ex)
 	if ex.drives {
-		s.driverSpeechLocked(ex, e.Started)
+		s.driverSpeechLocked(ex, e.Started, e.Cancelled)
 	}
 	if !e.Started {
 		return

@@ -368,6 +368,10 @@ type fakeSession struct {
 	says        []string
 	modes       []SayMode
 	sayErr      error
+	// endLate is how long after the speaker has played a speech the
+	// session reports its end (EventSpeechEnded), as a vendor's own report
+	// can trail the speaker's.
+	endLate time.Duration
 }
 
 func (s *fakeSession) Say(ctx context.Context, text string, mode SayMode) error {
@@ -382,6 +386,7 @@ func (s *fakeSession) Say(ctx context.Context, text string, mode SayMode) error 
 	}
 	s.says = append(s.says, text)
 	s.modes = append(s.modes, mode)
+	endLate := s.endLate
 	s.mu.Unlock()
 	s.send(EventAgentText, text)
 	pb := s.x.Out.Begin()
@@ -392,6 +397,7 @@ func (s *fakeSession) Say(ctx context.Context, text string, mode SayMode) error 
 	s.said <- text
 	go func() {
 		_ = pb.Drain(context.Background())
+		time.Sleep(endLate)
 		s.send(EventSpeechEnded, "")
 	}()
 	return nil
