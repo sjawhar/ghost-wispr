@@ -47,10 +47,17 @@ type GeminiConfig struct {
 	// Voice is a prebuilt voice name, an Extended Voice Library id, or a
 	// designed voice's id; "Kore" when empty.
 	Voice string
-	// Credentials authorise every request with their bearer token.
+	// Credentials authorise every request with their bearer token: an access
+	// token for Vertex AI, or an ID token for the model gateway.
 	Credentials *auth.Credentials
 	// BaseURL replaces the location's Vertex AI host, for tests.
 	BaseURL string
+	// GatewayURL, when set, sends each request to the model gateway instead
+	// of Vertex AI: Google's own path, <GatewayURL>/v1beta/models/<model>:
+	// streamGenerateContent?alt=sse, which the gateway serves by calling
+	// Vertex AI itself. Project, Location and BaseURL are not read; Credentials give
+	// the gateway's ID token.
+	GatewayURL string
 	// HTTPClient carries the requests; a plain client when nil. It needs no
 	// total timeout: a stream lasts as long as its speech plays.
 	HTTPClient *http.Client
@@ -76,24 +83,29 @@ func NewGemini(cfg *GeminiConfig) (*Gemini, error) {
 	if cfg == nil {
 		return nil, errors.New("gemini tts: no config")
 	}
+	if cfg.Credentials == nil {
+		return nil, errors.New("gemini tts: Google credentials are required")
+	}
+	model := cmp.Or(strings.TrimSpace(cfg.Model), geminiDefaultModel)
+	g := &Gemini{
+		voice:       cmp.Or(strings.TrimSpace(cfg.Voice), geminiDefaultVoice),
+		credentials: cfg.Credentials,
+		client:      cmp.Or(cfg.HTTPClient, &http.Client{}),
+	}
+	if gateway := strings.TrimRight(strings.TrimSpace(cfg.GatewayURL), "/"); gateway != "" {
+		g.host = gateway
+		g.endpoint = fmt.Sprintf("%s/v1beta/models/%s:streamGenerateContent?alt=sse", gateway, url.PathEscape(model))
+		return g, nil
+	}
 	project := strings.TrimSpace(cfg.Project)
 	if project == "" {
 		return nil, errors.New("gemini tts: a Vertex AI project is required")
 	}
-	if cfg.Credentials == nil {
-		return nil, errors.New("gemini tts: Google credentials are required")
-	}
 	location := cmp.Or(strings.TrimSpace(cfg.Location), geminiDefaultLocation)
-	model := cmp.Or(strings.TrimSpace(cfg.Model), geminiDefaultModel)
-	base := strings.TrimRight(cmp.Or(strings.TrimSpace(cfg.BaseURL), vertexHost(location)), "/")
-	return &Gemini{
-		host: base,
-		endpoint: fmt.Sprintf("%s/v1/projects/%s/locations/%s/publishers/google/models/%s:streamGenerateContent?alt=sse",
-			base, url.PathEscape(project), url.PathEscape(location), url.PathEscape(model)),
-		voice:       cmp.Or(strings.TrimSpace(cfg.Voice), geminiDefaultVoice),
-		credentials: cfg.Credentials,
-		client:      cmp.Or(cfg.HTTPClient, &http.Client{}),
-	}, nil
+	g.host = strings.TrimRight(cmp.Or(strings.TrimSpace(cfg.BaseURL), vertexHost(location)), "/")
+	g.endpoint = fmt.Sprintf("%s/v1/projects/%s/locations/%s/publishers/google/models/%s:streamGenerateContent?alt=sse",
+		g.host, url.PathEscape(project), url.PathEscape(location), url.PathEscape(model))
+	return g, nil
 }
 
 // vertexHost is the Vertex AI host of location, as go-genai maps it: the

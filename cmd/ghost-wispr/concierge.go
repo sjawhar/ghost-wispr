@@ -92,8 +92,8 @@ func startConcierge(ctx context.Context, cfg *config.Config, store *storage.SQLi
 // unit's own token. With no token or no Dispatch URL the tools say they
 // cannot reach Dispatch yet.
 func newConcierge(ctx context.Context, cfg *config.Config, store *storage.SQLiteStore, logger *slog.Logger, changed func(sessionID string)) (*concierge.Concierge, error) {
-	options := genAIOptions(cfg, cfg.GeminiAPIKey)
-	if err := addVertexCredentials(ctx, cfg, options); err != nil {
+	options, err := conciergeGenAIOptions(ctx, cfg)
+	if err != nil {
 		return nil, fmt.Errorf("concierge: %w", err)
 	}
 	generator, err := concierge.NewGenerator(ctx, options)

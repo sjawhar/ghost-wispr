@@ -34,6 +34,7 @@ type GeminiProvider struct {
 	defaultVoice    string
 	authCredentials *auth.Credentials
 	baseURL         string
+	gatewayURL      string // the model gateway's URL, which replaces Vertex AI; "" for Vertex AI
 	maxTextLen      int
 	httpClient      *http.Client
 }
@@ -46,9 +47,17 @@ func WithGeminiBaseURL(url string) GeminiOption {
 	return func(p *GeminiProvider) { p.baseURL = url }
 }
 
-// WithGeminiAuthCredentials sets the Google credentials used to authorize Vertex AI requests.
+// WithGeminiAuthCredentials sets the Google credentials used to authorize
+// requests: an access token for Vertex AI, or an ID token for the gateway.
 func WithGeminiAuthCredentials(credentials *auth.Credentials) GeminiOption {
 	return func(p *GeminiProvider) { p.authCredentials = credentials }
+}
+
+// WithGeminiGateway sends each request to the model gateway at url instead
+// of Vertex AI: Google's own path, <url>/v1beta/models/<model>:generateContent,
+// which the gateway serves by calling Vertex AI itself. No project is needed.
+func WithGeminiGateway(url string) GeminiOption {
+	return func(p *GeminiProvider) { p.gatewayURL = strings.TrimRight(strings.TrimSpace(url), "/") }
 }
 
 // NewGeminiProvider creates a Gemini TTS provider backed by Vertex AI's global endpoint.
@@ -70,7 +79,7 @@ func NewGeminiProvider(project, model, defaultVoice string, opts ...GeminiOption
 	for _, opt := range opts {
 		opt(p)
 	}
-	if p.project == "" {
+	if p.project == "" && p.gatewayURL == "" {
 		return nil, fmt.Errorf("gemini tts: Vertex AI project is required")
 	}
 	if p.authCredentials == nil {
@@ -183,6 +192,9 @@ func (p *GeminiProvider) Synthesize(ctx context.Context, req SpeechRequest) (*Sp
 		geminiVertexLocation,
 		url.PathEscape(p.model),
 	)
+	if p.gatewayURL != "" {
+		endpoint = fmt.Sprintf("%s/v1beta/models/%s:generateContent", p.gatewayURL, url.PathEscape(p.model))
+	}
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(bodyJSON))
 	if err != nil {
 		return nil, fmt.Errorf("gemini tts: create request: %w", err)

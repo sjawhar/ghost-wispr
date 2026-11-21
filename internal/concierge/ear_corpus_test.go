@@ -8,7 +8,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/sjawhar/ghost-wispr/internal/genaiconfig"
 	"github.com/sjawhar/ghost-wispr/internal/storage"
 )
 
@@ -62,25 +61,20 @@ func TestEarFormOnSavedOutputs(t *testing.T) {
 // TestLiveEarCorpus rewrites the corpus's replies with the live model, as
 // forEar does for a holder's answer, and saves the rewrites where
 // GHOST_WISPR_LIVE_EAR_OUT names. It runs only when GHOST_WISPR_LIVE_EAR=1
-// and GHOST_WISPR_LIVE_GCP_PROJECT names a project (Google's default
-// credentials, Vertex in GHOST_WISPR_LIVE_GCP_LOCATION, global by default).
+// and the environment names a live model (liveGenerator).
 func TestLiveEarCorpus(t *testing.T) {
 	if os.Getenv("GHOST_WISPR_LIVE_EAR") != "1" {
 		t.Skip("set GHOST_WISPR_LIVE_EAR=1 to rewrite the ear corpus with the live model")
 	}
-	project, out := os.Getenv("GHOST_WISPR_LIVE_GCP_PROJECT"), os.Getenv("GHOST_WISPR_LIVE_EAR_OUT")
-	if project == "" || out == "" {
-		t.Fatal("GHOST_WISPR_LIVE_GCP_PROJECT and GHOST_WISPR_LIVE_EAR_OUT must be set")
-	}
-	location := os.Getenv("GHOST_WISPR_LIVE_GCP_LOCATION")
-	if location == "" {
-		location = "global"
+	out := os.Getenv("GHOST_WISPR_LIVE_EAR_OUT")
+	if out == "" {
+		t.Fatal("GHOST_WISPR_LIVE_EAR_OUT must be set")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
-	generator, err := NewGenerator(ctx, &genaiconfig.Options{Backend: genaiconfig.BackendVertex, Project: project, Location: location})
-	if err != nil {
-		t.Fatal(err)
+	generator, ok := liveGenerator(ctx, t)
+	if !ok {
+		t.Fatal("GHOST_WISPR_MODEL_GATEWAY_URL or GHOST_WISPR_LIVE_GCP_PROJECT must name the live model")
 	}
 	store, err := storage.NewSQLiteStore(filepath.Join(t.TempDir(), "ear.db"))
 	if err != nil {

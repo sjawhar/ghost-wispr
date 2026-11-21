@@ -824,11 +824,15 @@ func newTTSProvider(ctx context.Context, cfg *config.Config, geminiOptions ...tt
 		}
 		return tts.NewGoogleProvider("", cfg.TTSVoice, tts.WithAuthCredentials(credentials))
 	case "gemini":
-		credentials, err := googleauth.Detect(ctx, cfg.GoogleCredentialsFile, googleauth.CloudPlatformScope)
+		credentials, gatewayURL, err := geminiVoiceCredentials(ctx, cfg)
 		if err != nil {
-			return nil, fmt.Errorf("detect Google credentials: %w", err)
+			return nil, err
 		}
-		return tts.NewGeminiProvider(cfg.GCPProject, cfg.TTSModel, cfg.TTSVoice, append([]tts.GeminiOption{tts.WithGeminiAuthCredentials(credentials)}, geminiOptions...)...)
+		options := []tts.GeminiOption{tts.WithGeminiAuthCredentials(credentials)}
+		if gatewayURL != "" {
+			options = append(options, tts.WithGeminiGateway(gatewayURL))
+		}
+		return tts.NewGeminiProvider(cfg.GCPProject, cfg.TTSModel, cfg.TTSVoice, append(options, geminiOptions...)...)
 	default:
 		return nil, fmt.Errorf("unsupported TTS provider: %s", cfg.TTSProvider)
 	}

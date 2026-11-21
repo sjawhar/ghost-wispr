@@ -151,6 +151,7 @@ type Config struct {
 	GCPProject                    string             `yaml:"gcp_project"`
 	GCPLocation                   string             `yaml:"gcp_location"`
 	GenAIBackend                  string             `yaml:"genai_backend"`
+	ModelGatewayURL               string             `yaml:"model_gateway_url"` // a model gateway that the concierge and both Gemini voices call instead of Vertex AI, with the machine's ID token: a developer box whose account holds no Vertex AI role; empty keeps Vertex AI, as on the Pi
 	GDriveSyncEnabled             bool               `yaml:"gdrive_sync_enabled"`
 	EnvoyEnabled                  bool               `yaml:"envoy_enabled"`
 	EnvoyHubURL                   string             `yaml:"envoy_hub_url"`
@@ -423,6 +424,9 @@ func applyEnvOverrides(cfg *Config) []string {
 	}
 	if v := os.Getenv(EnvPrefix + "GENAI_BACKEND"); v != "" {
 		cfg.GenAIBackend = strings.ToLower(strings.TrimSpace(v))
+	}
+	if v := strings.TrimSpace(os.Getenv(EnvPrefix + "MODEL_GATEWAY_URL")); v != "" {
+		cfg.ModelGatewayURL = v
 	}
 	if v := os.Getenv(EnvPrefix + "TRANSCRIPTION_ENDPOINTING"); v != "" {
 		cfg.Transcription.Endpointing = v

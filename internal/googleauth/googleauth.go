@@ -16,6 +16,7 @@ import (
 
 	"cloud.google.com/go/auth"
 	"cloud.google.com/go/auth/credentials"
+	"cloud.google.com/go/auth/credentials/idtoken"
 	"cloud.google.com/go/auth/credentials/impersonate"
 
 	"github.com/sjawhar/ghost-wispr/internal/providererr"
@@ -23,6 +24,10 @@ import (
 
 // CloudPlatformScope is required to mint an ID token through IAM Credentials.
 const CloudPlatformScope = "https://www.googleapis.com/auth/cloud-platform"
+
+// ModelGatewayAudience is the audience of the ID token that the model gateway
+// (config's model_gateway_url) signs a caller in by.
+const ModelGatewayAudience = "model-gateway-gce"
 
 type externalAccountFile struct {
 	Type                           string `json:"type"`
@@ -92,31 +97,63 @@ func externalAccountCredentialJSON(ctx context.Context, credPath string) ([]byte
 // IDToken mints an ID token for audience by impersonating the service account
 // named in the external-account credential file at credPath.
 func IDToken(ctx context.Context, credPath, audience string) (string, error) {
-	credentialData, err := externalAccountCredentialJSON(ctx, credPath)
+	idTokenCredentials, err := impersonatedIDTokenCredentials(ctx, credPath, audience)
 	if err != nil {
 		return "", err
+	}
+	token, err := idTokenCredentials.Token(ctx)
+	if err != nil {
+		return "", fmt.Errorf("mint ID token: %w", impersonationError(err))
+	}
+	return token.Value, nil
+}
+
+// GatewayCredentials give ID tokens for audience that the model gateway signs
+// a caller in by: tokens carrying the account's email, kept until a few
+// minutes before they expire. With a credential file at credPath they
+// impersonate the service account that external-account file names, as
+// IDToken does; with none, they are the metadata server's ID token in full
+// format, the developer box's own account.
+func GatewayCredentials(ctx context.Context, credPath, audience string) (*auth.Credentials, error) {
+	if strings.TrimSpace(credPath) != "" {
+		return impersonatedIDTokenCredentials(ctx, credPath, audience)
+	}
+	creds, err := idtoken.NewCredentials(&idtoken.Options{Audience: audience, ComputeTokenFormat: idtoken.ComputeTokenFormatFull})
+	if err != nil {
+		return nil, fmt.Errorf("the metadata server's ID token credentials: %w", err)
+	}
+	return creds, nil
+}
+
+// impersonatedIDTokenCredentials are ID token credentials for audience that
+// impersonate the service account named in the external-account credential
+// file at credPath, with the account's email in each token.
+func impersonatedIDTokenCredentials(ctx context.Context, credPath, audience string) (*auth.Credentials, error) {
+	credentialData, err := externalAccountCredentialJSON(ctx, credPath)
+	if err != nil {
+		return nil, err
 	}
 
 	var config externalAccountFile
 	if err := json.Unmarshal(credentialData, &config); err != nil {
-		return "", fmt.Errorf("parse Google credentials: %w", err)
+		return nil, fmt.Errorf("parse Google credentials: %w", err)
 	}
 	if config.Type != "external_account" {
-		return "", fmt.Errorf("google credential type %q cannot mint an impersonated ID token", config.Type)
+		return nil, fmt.Errorf("google credential type %q cannot mint an impersonated ID token", config.Type)
 	}
 	principal, err := serviceAccountFromImpersonationURL(config.ServiceAccountImpersonationURL)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 
 	var baseConfig map[string]json.RawMessage
 	if err := json.Unmarshal(credentialData, &baseConfig); err != nil {
-		return "", fmt.Errorf("parse Google credentials: %w", err)
+		return nil, fmt.Errorf("parse Google credentials: %w", err)
 	}
 	delete(baseConfig, "service_account_impersonation_url")
 	baseCredentialData, err := json.Marshal(baseConfig)
 	if err != nil {
-		return "", fmt.Errorf("prepare federated credentials: %w", err)
+		return nil, fmt.Errorf("prepare federated credentials: %w", err)
 	}
 	baseCredentials, err := credentials.NewCredentialsFromJSON(
 		credentials.ExternalAccount,
@@ -124,7 +161,7 @@ func IDToken(ctx context.Context, credPath, audience string) (string, error) {
 		&credentials.DetectOptions{Scopes: []string{CloudPlatformScope}},
 	)
 	if err != nil {
-		return "", fmt.Errorf("detect federated credentials: %w", err)
+		return nil, fmt.Errorf("detect federated credentials: %w", err)
 	}
 	idTokenCredentials, err := impersonate.NewIDTokenCredentials(&impersonate.IDTokenOptions{
 		Audience:        audience,
@@ -133,13 +170,9 @@ func IDToken(ctx context.Context, credPath, audience string) (string, error) {
 		Credentials:     baseCredentials,
 	})
 	if err != nil {
-		return "", fmt.Errorf("create ID token credentials: %w", err)
+		return nil, fmt.Errorf("create ID token credentials: %w", err)
 	}
-	token, err := idTokenCredentials.Token(ctx)
-	if err != nil {
-		return "", fmt.Errorf("mint ID token: %w", impersonationError(err))
-	}
-	return token.Value, nil
+	return idTokenCredentials, nil
 }
 
 // impersonationError is err, the impersonation's failure, reduced: IAM's

@@ -67,6 +67,15 @@ summarization:
 # google_credentials_file: /opt/ghost-wispr/google-credentials.json
 # gdrive_sync_enabled: false
 
+# On a developer box whose Google account holds no Vertex AI role: the Concierge and both Gemini
+# voices (voice A on gemini, tts_provider: gemini) call a model gateway instead, signed in with the
+# ID token of the metadata server's account (or of the account google_credentials_file
+# impersonates), audience model-gateway-gce. The gateway serves Google's generateContent routes
+# and calls Vertex AI itself; it must serve the Concierge's and the voices' models to that account.
+# Summaries and embeddings keep genai_backend. Empty: Vertex AI.
+# GHOST_WISPR_MODEL_GATEWAY_URL sets it too, and the live tests read that variable.
+# model_gateway_url: https://model-gateway.example.ts.net
+
 # Envoy events (optional): published to the Envoy hub's listener over the tailnet, with no
 # credential. With Envoy enabled and no hub URL, no event is sent.
 # envoy_enabled: false

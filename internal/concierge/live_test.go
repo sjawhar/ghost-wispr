@@ -18,6 +18,7 @@ import (
 	"github.com/sjawhar/ghost-wispr/internal/dispatch"
 	"github.com/sjawhar/ghost-wispr/internal/envoy"
 	"github.com/sjawhar/ghost-wispr/internal/genaiconfig"
+	"github.com/sjawhar/ghost-wispr/internal/googleauth"
 	"github.com/sjawhar/ghost-wispr/internal/storage"
 	"github.com/sjawhar/ghost-wispr/internal/voice"
 )
@@ -32,9 +33,39 @@ func (noModel) GenerateContentStream(context.Context, string, []*genai.Content, 
 	}
 }
 
+// liveGenerator is the live model client the environment names: the model
+// gateway at GHOST_WISPR_MODEL_GATEWAY_URL, signed in with the machine's ID
+// token (a developer box whose account holds no Vertex AI role), else Vertex
+// AI in GHOST_WISPR_LIVE_GCP_PROJECT at GHOST_WISPR_LIVE_GCP_LOCATION (global
+// by default) with Google's default credentials. ok is false when it names
+// neither.
+func liveGenerator(ctx context.Context, t *testing.T) (generator Generator, ok bool) {
+	t.Helper()
+	options := &genaiconfig.Options{Backend: genaiconfig.BackendVertex}
+	if gateway := os.Getenv("GHOST_WISPR_MODEL_GATEWAY_URL"); gateway != "" {
+		credentials, err := googleauth.GatewayCredentials(ctx, os.Getenv("GHOST_WISPR_GOOGLE_CREDENTIALS_FILE"), googleauth.ModelGatewayAudience)
+		if err != nil {
+			t.Fatalf("the model gateway's credentials: %v", err)
+		}
+		options.GatewayURL, options.GatewayCredentials = gateway, credentials
+	} else if options.Project = os.Getenv("GHOST_WISPR_LIVE_GCP_PROJECT"); options.Project != "" {
+		options.Location = os.Getenv("GHOST_WISPR_LIVE_GCP_LOCATION")
+		if options.Location == "" {
+			options.Location = "global"
+		}
+	} else {
+		return nil, false
+	}
+	generator, err := NewGenerator(ctx, options)
+	if err != nil {
+		t.Fatalf("build the Gemini client: %v", err)
+	}
+	return generator, true
+}
+
 // TestLiveConciergeRoundTrip drives the Concierge against a real Dispatch,
-// a real Envoy hub and, when GHOST_WISPR_LIVE_GCP_PROJECT names a project,
-// real Gemini on Vertex (Google's default credentials). With
+// a real Envoy hub and, when the environment names one (liveGenerator), real
+// Gemini, through the model gateway or on Vertex. With
 // GHOST_WISPR_LIVE_TURN it answers that spoken turn twice with the model,
 // before the Envoy session exists so the turn can ask no agent: cold, and
 // with Heard told the turn word by word while it is "spoken", and logs how
@@ -47,8 +78,9 @@ func (noModel) GenerateContentStream(context.Context, string, []*genai.Content, 
 //
 //	GHOST_WISPR_DISPATCH_URL, GHOST_WISPR_DISPATCH_TOKEN, GHOST_WISPR_ENVOY_URL,
 //	GHOST_WISPR_LIVE_QUERY, GHOST_WISPR_LIVE_ISSUE, GHOST_WISPR_LIVE_TARGET,
-//	GHOST_WISPR_LIVE_QUESTION, GHOST_WISPR_LIVE_TURN, GHOST_WISPR_LIVE_GCP_PROJECT,
-//	GHOST_WISPR_LIVE_GCP_LOCATION (global by default), GHOST_WISPR_LIVE_MODEL
+//	GHOST_WISPR_QUESTION, GHOST_WISPR_LIVE_TURN, GHOST_WISPR_MODEL_GATEWAY_URL
+//	or GHOST_WISPR_LIVE_GCP_PROJECT and GHOST_WISPR_LIVE_GCP_LOCATION
+//	(liveGenerator), GHOST_WISPR_LIVE_MODEL
 //	(DefaultModel by default) and GHOST_WISPR_LIVE_WAIT (20m by default).
 //
 // The target is asked as a joined agent of the meeting: ask_agent asks only a
@@ -75,15 +107,8 @@ func TestLiveConciergeRoundTrip(t *testing.T) {
 	defer cancel()
 
 	var generator Generator = noModel{}
-	if project := os.Getenv("GHOST_WISPR_LIVE_GCP_PROJECT"); project != "" {
-		location := os.Getenv("GHOST_WISPR_LIVE_GCP_LOCATION")
-		if location == "" {
-			location = "global"
-		}
-		var err error
-		if generator, err = NewGenerator(ctx, &genaiconfig.Options{Backend: genaiconfig.BackendVertex, Project: project, Location: location}); err != nil {
-			t.Fatalf("build the Gemini client: %v", err)
-		}
+	if live, ok := liveGenerator(ctx, t); ok {
+		generator = live
 	}
 	records, err := dispatch.NewClient(need("GHOST_WISPR_DISPATCH_URL"), need("GHOST_WISPR_DISPATCH_TOKEN"), nil)
 	if err != nil {

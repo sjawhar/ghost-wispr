@@ -12,6 +12,8 @@ import (
 	"sync/atomic"
 	"testing"
 
+	"cloud.google.com/go/auth"
+
 	"github.com/sjawhar/ghost-wispr/internal/audio"
 	"github.com/sjawhar/ghost-wispr/internal/googleauth"
 	"github.com/sjawhar/ghost-wispr/internal/googleauthtest"
@@ -705,6 +707,45 @@ func TestGeminiSynthesizeMarksMissingModelVersion(t *testing.T) {
 	}
 	if got := response.Model; got != "not reported by provider" {
 		t.Fatalf("model = %q, want not reported by provider", got)
+	}
+}
+
+// TestGeminiSynthesizeThroughTheModelGateway fails unless, with
+// WithGeminiGateway, the provider needs no project and posts to Google's own
+// path under the gateway, <gateway>/v1beta/models/<model>:generateContent,
+// with the credentials' token as its bearer: the gateway calls Vertex AI
+// itself.
+func TestGeminiSynthesizeThroughTheModelGateway(t *testing.T) {
+	pcm := []byte{0x01, 0x00}
+	var gotPath, gotAuth string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath, gotAuth = r.URL.Path, r.Header.Get("Authorization")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"candidates": []any{map[string]any{
+				"content": map[string]any{"parts": []any{map[string]any{
+					"inlineData": map[string]string{"data": base64.StdEncoding.EncodeToString(fakeWAV(pcm))},
+				}}},
+			}},
+		})
+	}))
+	t.Cleanup(server.Close)
+	credentials := auth.NewCredentials(&auth.CredentialsOptions{TokenProvider: staticToken{}})
+	if _, err := NewGeminiProvider("", "gemini-3.8-flash-tts", "Kore", WithGeminiAuthCredentials(credentials)); err == nil {
+		t.Fatal("NewGeminiProvider with no project and no gateway succeeded")
+	}
+	provider, err := NewGeminiProvider("", "gemini-3.8-flash-tts", "Kore", WithGeminiAuthCredentials(credentials), WithGeminiGateway(server.URL+"/"))
+	if err != nil {
+		t.Fatalf("NewGeminiProvider through the gateway with no project: %v", err)
+	}
+	if _, err := provider.Synthesize(context.Background(), SpeechRequest{Text: "Speak this."}); err != nil {
+		t.Fatalf("Synthesize: %v", err)
+	}
+	if want := "/v1beta/models/gemini-3.8-flash-tts:generateContent"; gotPath != want {
+		t.Errorf("path = %q, want %q", gotPath, want)
+	}
+	token, _ := staticToken{}.Token(context.Background())
+	if want := "Bearer " + token.Value; gotAuth != want {
+		t.Errorf("Authorization = %q, want %q", gotAuth, want)
 	}
 }
 

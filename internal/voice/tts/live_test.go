@@ -1,6 +1,7 @@
 package tts
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"net/http"
@@ -10,6 +11,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"cloud.google.com/go/auth"
 
 	"github.com/sjawhar/ghost-wispr/internal/audio"
 	"github.com/sjawhar/ghost-wispr/internal/googleauth"
@@ -108,7 +111,18 @@ func liveEngine(t *testing.T, logCredentials bool) (Engine, *streamConns) {
 		}
 		return a, nil
 	case "gemini":
-		credentials, err := googleauth.Detect(context.Background(), os.Getenv("GHOST_WISPR_GOOGLE_CREDENTIALS_FILE"), googleauth.CloudPlatformScope)
+		// GHOST_WISPR_MODEL_GATEWAY_URL sends the run to the model gateway,
+		// signed in with the machine's ID token: a developer box whose
+		// account holds no Vertex AI role.
+		gateway := os.Getenv("GHOST_WISPR_MODEL_GATEWAY_URL")
+		credentialFile := os.Getenv("GHOST_WISPR_GOOGLE_CREDENTIALS_FILE")
+		var credentials *auth.Credentials
+		var err error
+		if gateway != "" {
+			credentials, err = googleauth.GatewayCredentials(context.Background(), credentialFile, googleauth.ModelGatewayAudience)
+		} else {
+			credentials, err = googleauth.Detect(context.Background(), credentialFile, googleauth.CloudPlatformScope)
+		}
 		if err != nil {
 			t.Fatalf("Google credentials: %v", err)
 		}
@@ -119,10 +133,15 @@ func liveEngine(t *testing.T, logCredentials bool) (Engine, *streamConns) {
 			var kind struct {
 				Type string `json:"type"`
 			}
-			if data := credentials.JSON(); len(data) == 0 {
+			switch data := credentials.JSON(); {
+			case gateway != "":
+				t.Logf("gemini: through the model gateway, with an ID token from %s", cmp.Or(credentialFile, "the metadata server"))
+			case len(data) == 0:
 				t.Log("gemini: Google credentials from the metadata server")
-			} else if err := json.Unmarshal(data, &kind); err == nil {
-				t.Logf("gemini: Google credentials of type %q from a file", kind.Type)
+			default:
+				if err := json.Unmarshal(data, &kind); err == nil {
+					t.Logf("gemini: Google credentials of type %q from a file", kind.Type)
+				}
 			}
 		}
 		transport := http.DefaultTransport.(*http.Transport).Clone()
@@ -134,6 +153,7 @@ func liveEngine(t *testing.T, logCredentials bool) (Engine, *streamConns) {
 			Model:       os.Getenv("GHOST_WISPR_LIVE_TTS_MODEL"),
 			Voice:       os.Getenv("GHOST_WISPR_LIVE_TTS_VOICE"),
 			Credentials: credentials,
+			GatewayURL:  gateway,
 			HTTPClient:  &http.Client{Transport: conns},
 		})
 		if err != nil {
@@ -178,10 +198,14 @@ func logMedian(t *testing.T, name, what string, waits []time.Duration) {
 //
 //	GHOST_WISPR_LIVE_TTS=aura GHOST_WISPR_DEEPGRAM_API_KEY=<key> go test -run TestLive -v ./internal/voice/tts
 //	GHOST_WISPR_LIVE_TTS=gemini GHOST_WISPR_GCP_PROJECT=<project> go test -run TestLive -v ./internal/voice/tts
+//	GHOST_WISPR_LIVE_TTS=gemini GHOST_WISPR_MODEL_GATEWAY_URL=<gateway URL> go test -run TestLive -v ./internal/voice/tts
 //
 // Gemini reads Application Default Credentials, or the file
 // GHOST_WISPR_GOOGLE_CREDENTIALS_FILE names; GHOST_WISPR_LIVE_TTS_LOCATION
-// chooses its location ("us" by default; "global" to compare). Each engine
+// chooses its location ("us" by default; "global" to compare). With
+// GHOST_WISPR_MODEL_GATEWAY_URL it calls the model gateway instead, as a
+// developer box must, signed in with that identity's ID token; the gateway
+// picks the location. Each engine
 // takes GHOST_WISPR_LIVE_TTS_MODEL and, for Gemini, GHOST_WISPR_LIVE_TTS_VOICE.
 func TestLiveTimeToFirstAudio(t *testing.T) {
 	engine, _ := liveEngine(t, true)

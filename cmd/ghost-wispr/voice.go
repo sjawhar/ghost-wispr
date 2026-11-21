@@ -253,7 +253,7 @@ func (v *voiceSource) apply(ctx context.Context, cfg *config.Config) {
 	var build func() (voice.Voice, error)
 	switch cfg.Voice.Engine {
 	case config.VoiceEngineTTS:
-		key = strings.Join([]string{cfg.Voice.Engine, cfg.Voice.TTSEngine, cfg.Voice.TTSModel, cfg.Voice.TTSVoice, cfg.Voice.TTSLocation, cfg.GCPProject, cfg.GoogleCredentialsFile, cfg.DeepgramAPIKey}, "\x00")
+		key = strings.Join([]string{cfg.Voice.Engine, cfg.Voice.TTSEngine, cfg.Voice.TTSModel, cfg.Voice.TTSVoice, cfg.Voice.TTSLocation, cfg.GCPProject, cfg.GoogleCredentialsFile, cfg.ModelGatewayURL, cfg.DeepgramAPIKey}, "\x00")
 		build = func() (voice.Voice, error) { return newVoiceA(ctx, cfg) }
 	case config.VoiceEngineGPTLive:
 		key = strings.Join([]string{cfg.Voice.Engine, cfg.Voice.GPTLive.OpenAIIdentityProviderID, cfg.Voice.GPTLive.OpenAIServiceAccountID, cfg.GoogleCredentialsFile}, "\x00")
@@ -360,9 +360,9 @@ func voiceAEngine(ctx context.Context, cfg *config.Config, opts *voiceAOptions) 
 		}
 		return engine, nil
 	case config.TTSEngineGemini:
-		credentials, err := googleauth.Detect(ctx, cfg.GoogleCredentialsFile, googleauth.CloudPlatformScope)
+		credentials, gatewayURL, err := geminiVoiceCredentials(ctx, cfg)
 		if err != nil {
-			return nil, fmt.Errorf("voice A on Gemini: detect Google credentials: %w", err)
+			return nil, fmt.Errorf("voice A on Gemini: %w", err)
 		}
 		engine, err := voicetts.NewGemini(&voicetts.GeminiConfig{
 			Project:     cfg.GCPProject,
@@ -371,6 +371,7 @@ func voiceAEngine(ctx context.Context, cfg *config.Config, opts *voiceAOptions) 
 			Voice:       cfg.Voice.TTSVoice,
 			Credentials: credentials,
 			BaseURL:     opts.vertexBaseURL,
+			GatewayURL:  gatewayURL,
 		})
 		if err != nil {
 			return nil, fmt.Errorf("voice A on Gemini: %w", err)

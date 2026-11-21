@@ -160,6 +160,18 @@ func TestGeminiRequestsStreamingSpeech(t *testing.T) {
 		cfg:     GeminiConfig{Project: "example-project", Location: "us-central1"},
 		wantURL: "https://us-central1-aiplatform.googleapis.com/v1/projects/example-project/locations/us-central1/publishers/google/models/gemini-3.8-flash-tts:streamGenerateContent?alt=sse",
 		voice:   "Kore",
+	}, {
+		// Through the model gateway (GatewayURL): Google's own path, the model
+		// in it, no project and no location; the gateway calls Vertex AI.
+		name:    "gateway",
+		cfg:     GeminiConfig{GatewayURL: "https://model-gateway.example.test"},
+		wantURL: "https://model-gateway.example.test/v1beta/models/gemini-3.8-flash-tts:streamGenerateContent?alt=sse",
+		voice:   "Kore",
+	}, {
+		name:    "gateway, named, a trailing slash",
+		cfg:     GeminiConfig{GatewayURL: "https://model-gateway.example.test/", Model: "gemini-3.8-flash-tts", Voice: "Puck", Project: "ignored", Location: "eu"},
+		wantURL: "https://model-gateway.example.test/v1beta/models/gemini-3.8-flash-tts:streamGenerateContent?alt=sse",
+		voice:   "Puck",
 	}} {
 		t.Run(tc.name, func(t *testing.T) {
 			rt := &recordingTransport{pcm: ramp(0, 2400)}
@@ -626,5 +638,11 @@ func TestNewGeminiRequiresAProjectAndCredentials(t *testing.T) {
 	}
 	if _, err := NewGemini(&GeminiConfig{Project: "example-project"}); err == nil {
 		t.Error("NewGemini without credentials succeeded")
+	}
+	if _, err := NewGemini(&GeminiConfig{GatewayURL: "https://model-gateway.example.test"}); err == nil {
+		t.Error("NewGemini through the gateway without credentials succeeded")
+	}
+	if _, err := NewGemini(&GeminiConfig{GatewayURL: "https://model-gateway.example.test", Credentials: testCredentials()}); err != nil {
+		t.Errorf("NewGemini through the gateway with no project: %v; the gateway needs none", err)
 	}
 }

@@ -1,8 +1,17 @@
 package genaiconfig
 
 import (
+	"context"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
+	"cloud.google.com/go/auth"
 	"google.golang.org/genai"
 )
 
@@ -78,5 +87,85 @@ func TestBuildClientConfigErrorsWithoutCredentials(t *testing.T) {
 	_, err := BuildClientConfig(&Options{Backend: BackendGemini})
 	if err == nil {
 		t.Fatal("expected error when Gemini backend has no API key")
+	}
+}
+
+// rotatingToken gives a new ID token on each call: tok-1, tok-2, and so on.
+type rotatingToken struct{ n atomic.Int32 }
+
+func (r *rotatingToken) Token(context.Context) (*auth.Token, error) {
+	n := r.n.Add(1)
+	return &auth.Token{Value: "tok-" + string(rune('0'+n)), Type: "Bearer", Expiry: time.Now().Add(time.Hour)}, nil
+}
+
+// TestBuildClientConfigGateway fails unless a client on the model gateway
+// (Options.GatewayURL) asks Google's own path on the gateway, with the
+// credentials' current token in x-goog-api-key on each request, the header
+// the gateway reads as the caller's key, and no Authorization header.
+func TestBuildClientConfigGateway(t *testing.T) {
+	var mu sync.Mutex
+	var paths, keys, auths []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		mu.Lock()
+		paths = append(paths, r.URL.Path)
+		keys = append(keys, r.Header.Get("x-goog-api-key"))
+		auths = append(auths, r.Header.Get("Authorization"))
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"candidates":[{"content":{"role":"model","parts":[{"text":"ok"}]},"finishReason":"STOP"}]}`)
+	}))
+	defer srv.Close()
+	tokens := &rotatingToken{}
+	opts := &Options{
+		Backend:            BackendVertex,
+		Project:            "ignored",
+		GatewayURL:         srv.URL + "/",
+		GatewayCredentials: auth.NewCredentials(&auth.CredentialsOptions{TokenProvider: tokens}),
+	}
+	if !CanUse(opts) {
+		t.Fatal("CanUse = false for a gateway with credentials")
+	}
+	cfg, err := BuildClientConfig(opts)
+	if err != nil {
+		t.Fatalf("BuildClientConfig: %v", err)
+	}
+	if cfg.Backend != genai.BackendGeminiAPI {
+		t.Fatalf("Backend = %v, want the Gemini API's shape, which the gateway serves", cfg.Backend)
+	}
+	client, err := genai.NewClient(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("genai.NewClient: %v", err)
+	}
+	for range 2 {
+		if _, err := client.Models.GenerateContent(context.Background(), "gemini-3.5-flash-lite", genai.Text("hi"), nil); err != nil {
+			t.Fatalf("GenerateContent: %v", err)
+		}
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(paths) != 2 {
+		t.Fatalf("%d requests reached the gateway, want 2", len(paths))
+	}
+	for i, p := range paths {
+		if !strings.HasSuffix(p, "/models/gemini-3.5-flash-lite:generateContent") || !strings.HasPrefix(p, "/v1beta/") {
+			t.Errorf("request %d path = %q, want /v1beta/models/gemini-3.5-flash-lite:generateContent", i, p)
+		}
+		if want := "tok-" + string(rune('1'+i)); keys[i] != want {
+			t.Errorf("request %d x-goog-api-key = %q, want the credentials' token %q", i, keys[i], want)
+		}
+		if auths[i] != "" {
+			t.Errorf("request %d carries Authorization %q, want none", i, auths[i])
+		}
+	}
+}
+
+func TestBuildClientConfigGatewayNeedsCredentials(t *testing.T) {
+	opts := &Options{GatewayURL: "https://model-gateway.example.test"}
+	if CanUse(opts) {
+		t.Error("CanUse = true for a gateway with no credentials")
+	}
+	if _, err := BuildClientConfig(opts); err == nil {
+		t.Error("BuildClientConfig made a gateway client with no credentials")
 	}
 }
