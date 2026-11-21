@@ -357,7 +357,10 @@ type exchange struct {
 	// followUpTurn: the turn now heard began in the follow-up window with no
 	// wake phrase, so it continues the exchange only as a question (R10).
 	followUpTurn bool
-	turnFinal    bool // the turn now heard has a final result
+	// turnByName: the turn now heard began right after the wake phrase, so
+	// its first words are where a name goes (transcript.WriteKeysAfterName).
+	turnByName bool
+	turnFinal  bool // the turn now heard has a final result
 	// askedBack: Wispr's last line asked a question ("Did you mean A or
 	// B?"), so the next utterance answers it and continues the exchange.
 	askedBack bool
@@ -913,6 +916,8 @@ func (s *Supervisor) onTranscriptLocked(t *Transcript) {
 			s.neverMindLocked(s.cfg.Session())
 		case same && !ex.answering:
 			if ex.drives {
+				// The wake is the call this exchange already took: a turn
+				// these words begin after the voice spoke does not follow it.
 				s.driverHeardLocked(ex, t, m.Rest)
 			} else if !ex.stale(t) { // else the answered call, sent late
 				s.turnLocked(ex, t, m.Rest)
@@ -942,7 +947,7 @@ func (s *Supervisor) onTranscriptLocked(t *Transcript) {
 			}
 			ex.wakeStart, ex.wakeSaid = wakeStart(t, m), wakeSaidAt(t, m)
 			ex.turn, ex.interim, ex.turnFinal = nil, "", false
-			ex.followUpTurn = false // a call, with the wake phrase
+			ex.followUpTurn, ex.turnByName = false, true // a call, with the wake phrase
 			cut := false
 			if ex.drives {
 				s.touchLocked(ex)
@@ -1019,13 +1024,16 @@ func (s *Supervisor) onTranscriptLocked(t *Transcript) {
 // stays. When the voice answered a turn before any result of it came, in one
 // speech or several, that turn's late result begins it (answeredUnheard), as
 // main begins a new turn, and the turn heard before is dropped. Once a later
-// turn has begun, or if it is an earlier turn's, it is nothing.
+// turn has begun, or if it is an earlier turn's, it is nothing. A turn begun
+// here, after the voice spoke, does not follow the wake phrase (turnByName):
+// a wake in its result is the call the exchange already took, and a new call
+// begins its turn where the wake is read.
 func (s *Supervisor) driverHeardLocked(ex *exchange, t *Transcript, words string) {
 	if !ex.stale(t) {
 		if ex.newTurn {
 			ex.newTurn, ex.turnFrom = false, ex.turnEnd
 			ex.turn, ex.interim, ex.turnFinal = nil, "", false
-			ex.followUpTurn = ex.followUpTimer != nil && !ex.askedBack
+			ex.followUpTurn, ex.turnByName = ex.followUpTimer != nil && !ex.askedBack, false
 		}
 		s.disarmFollowUpLocked(ex)
 		s.turnLocked(ex, t, words)
@@ -1039,7 +1047,7 @@ func (s *Supervisor) driverHeardLocked(ex *exchange, t *Transcript, words string
 		// still a new turn.
 		ex.turnFrom = from
 		ex.turn, ex.interim, ex.turnFinal = nil, "", false
-		ex.followUpTurn = ex.followUpTimer != nil && !ex.askedBack
+		ex.followUpTurn, ex.turnByName = ex.followUpTimer != nil && !ex.askedBack, false
 		s.turnLocked(ex, t, words)
 	} else if ex.ofTurn(t) {
 		s.turnLocked(ex, t, words)
@@ -1274,7 +1282,7 @@ func (s *Supervisor) startLocked(t *Transcript, m transcript.Match) {
 		return
 	}
 	ctx := newExchangeContext(s.ctx)
-	ex := &exchange{ctx: ctx, cancel: ctx.cancel, authority: ctx, opened: make(chan struct{}), wakeStart: wakeStart(t, m), wakeSaid: wakeSaidAt(t, m), wakeAt: t.At, notified: map[string]bool{}, times: &exchangeTimes{wakeAt: t.At}}
+	ex := &exchange{ctx: ctx, cancel: ctx.cancel, authority: ctx, opened: make(chan struct{}), wakeStart: wakeStart(t, m), wakeSaid: wakeSaidAt(t, m), wakeAt: t.At, notified: map[string]bool{}, times: &exchangeTimes{wakeAt: t.At}, turnByName: true}
 	s.capExchange(ex)
 	if d, ok := voice.(TurnDriver); ok && d.DrivesTurn() {
 		ex.drives = true
@@ -1629,7 +1637,11 @@ func (s *Supervisor) turnLocked(ex *exchange, t *Transcript, words string) {
 func (s *Supervisor) turnOf(ex *exchange) string {
 	turn := strings.TrimSpace(strings.Join(append(ex.turn[:len(ex.turn):len(ex.turn)], ex.interim), " "))
 	if s.cfg.ProjectKeys != nil {
-		turn = transcript.WriteKeys(turn, s.cfg.ProjectKeys())
+		if ex.turnByName {
+			turn = transcript.WriteKeysAfterName(turn, s.cfg.ProjectKeys())
+		} else {
+			turn = transcript.WriteKeys(turn, s.cfg.ProjectKeys())
+		}
 	}
 	return turn
 }
@@ -1839,7 +1851,7 @@ func (s *Supervisor) followUpLocked(ex *exchange) {
 	ex.followUp = true
 	ex.followUpTurn = !ex.askedBack // an answer to Wispr's own question needs none
 	ex.answering = false
-	ex.turn, ex.interim = nil, ""
+	ex.turn, ex.interim, ex.turnByName = nil, "", false
 	ex.said, ex.last = false, nil
 	delete(ex.notified, EventSpoken) // each spoken answer reports itself
 	if ex.timer != nil {

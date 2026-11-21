@@ -152,6 +152,60 @@ func TestWhisperNeverDisplacesAKeyterm(t *testing.T) {
 	}
 }
 
+// TestKeytermsKeepToDeepgramsLimits fails if the keyterms pass Deepgram's
+// limits of 100 terms or 500 words, or stop short of either while terms are
+// left: TestKeyterms's keys repeat, so neither limit was reached and both
+// checks could be removed with it passing (Sol's review of #135 at 21bbef7).
+// 150 distinct keys fill the 100 terms; 90 terms of seven words fill the 500
+// words.
+func TestKeytermsKeepToDeepgramsLimits(t *testing.T) {
+	keys := make([]string, 150)
+	for i := range keys {
+		keys[i] = fmt.Sprintf("ABC-%d", i+1)
+	}
+	if got := Keyterms([]string{"Wispr", "Ghost Wispr"}, keys); len(got) != MaxKeyterms {
+		t.Fatalf("150 distinct keys gave %d keyterms, want the limit %d", len(got), MaxKeyterms)
+	}
+	long := make([]string, 90)
+	for i := range long {
+		long[i] = fmt.Sprintf("project term one two three four number%d", i)
+	}
+	words := 0
+	for _, k := range Keyterms(nil, long) {
+		words += len(strings.Fields(k))
+	}
+	if words > MaxKeytermTokens || words+7 <= MaxKeytermTokens {
+		t.Fatalf("90 seven-word terms gave %d words, want as many whole terms as fit in %d", words, MaxKeytermTokens)
+	}
+}
+
+// TestAKeyRightAfterTheNameReadsAsTheKey fails if a key of the project
+// Deepgram writes as "in for", said right after the wake phrase as a date or
+// with a thousand, does not read as that project's key when the turn is read
+// as words after the name: "Whisper, in for 10/27?" read as FOR-1027 (Sol's
+// review of #135 at 21bbef7; main does the same). Not after the name, those
+// forms still read as a date or an amount, as on main.
+func TestAKeyRightAfterTheNameReadsAsTheKey(t *testing.T) {
+	d := New([]string{"Wispr", "Ghost Wispr"})
+	for _, text := range []string{"Whisper, in for 10/27?", "Whisper, in for one thousand and twenty seven?", "Wispr, in for 10/27."} {
+		m, ok := d.Find(text)
+		if !ok {
+			t.Fatalf("fixture: %q does not wake", text)
+		}
+		if got := IssueKeysAfterName(m.Rest); !slices.Equal(got, []string{"INFRA-1027"}) {
+			t.Errorf("%q: keys %q after the name, want INFRA-1027", text, got)
+		}
+		if got := WriteKeysAfterName(m.Rest, []string{"INFRA"}); !strings.HasPrefix(got, "INFRA-1027") {
+			t.Errorf("%q: the turn written %q, want INFRA-1027", text, got)
+		}
+	}
+	for _, text := range []string{"In for five thousand dollars?", "In for 10/27, yes."} {
+		if got := WriteKeys(text, []string{"INFRA"}); got != text {
+			t.Errorf("%q, not after the name, written %q, want it as it was", text, got)
+		}
+	}
+}
+
 // fakeStream is a live Deepgram socket as LiveKeyterms reaches it: it records
 // each Configure message's keyterms, and gives the hook OnConfigured set
 // Deepgram's answer when the test says (answer).

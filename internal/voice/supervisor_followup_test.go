@@ -201,6 +201,36 @@ func TestASpokenKeySplitAcrossResultsReachesTheConciergeWritten(t *testing.T) {
 	}
 }
 
+// TestAKeyRightAfterTheNameReachesTheConciergeWritten fails if a key said
+// right after the wake phrase in the form a date or a thousand takes ("Wispr,
+// in for 10/27?") is not written as the key in the turn: those words follow
+// the name, where "in" cannot begin a phrase (Sol's review of #135 at
+// 21bbef7). The control is a reply to Wispr's own question with no name,
+// "In for five thousand dollars?", which stays an amount, as on main.
+func TestAKeyRightAfterTheNameReachesTheConciergeWritten(t *testing.T) {
+	c := newFakeConcierge()
+	c.acks = []string{didYouMean}
+	r := newRigWith(t, c, func(cfg *SupervisorConfig, _ *rig) {
+		cfg.ProjectKeys = func() []string { return []string{"INFRA"} }
+		cfg.FollowUpWait = time.Minute
+	})
+	sess := r.ask("in for 10/27?")
+	c.mu.Lock()
+	turns := append([]string(nil), c.turns...)
+	c.mu.Unlock()
+	if len(turns) == 0 || turns[0] != "INFRA-1027?" {
+		t.Fatalf("the Concierge got %q, want %q", turns, "INFRA-1027?")
+	}
+	waitSaid(t, sess)
+	r.speaker.finish(audio.InputVoice)
+	r.waitEvent("voice_spoken:sess-1")
+	c.acks = nil
+	r.heard("In for five thousand dollars?", true, true)
+	if got, want := r.waitTurn(), "In for five thousand dollars?"; got != want {
+		t.Fatalf("the reply with no name reached the Concierge as %q, want %q", got, want)
+	}
+}
+
 // TestAReplyToWisprsQuestionKeepsTheFloorFree fails if a person's reply to
 // Wispr's own question ("The first one.") counts as room speech against R7's
 // free floor: it is part of the exchange, whose last turn is R7's t0, so the

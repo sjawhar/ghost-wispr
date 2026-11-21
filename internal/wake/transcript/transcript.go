@@ -285,9 +285,17 @@ func saysHand(words []string) bool {
 // seven", and "in for" before a number, as Deepgram writes "infra". A key is
 // a word of letters and a number; the caller checks it against the keys it
 // knows.
-func IssueKeys(text string) []string {
+func IssueKeys(text string) []string { return issueKeys(text, false) }
+
+// IssueKeysAfterName is IssueKeys for text said right after the wake
+// phrase, as the turn of a call: "in" cannot begin a phrase there, so "in
+// for" at its start is the project's name, before a date or a thousand too
+// ("Wispr, in for 10/27?").
+func IssueKeysAfterName(text string) []string { return issueKeys(text, true) }
+
+func issueKeys(text string, afterName bool) []string {
 	var keys []string
-	for _, span := range keySpans(keyTokens(text)) {
+	for _, span := range keySpans(keyTokens(text), afterName) {
 		keys = append(keys, span.key)
 	}
 	return keys
@@ -296,7 +304,15 @@ func IssueKeys(text string) []string {
 // WriteKeys writes each key of projects that text says in a spoken form as
 // the key ("in for forty five ninety two" as INFRA-4592), so the Concierge
 // and Dispatch read it; other words stay as they were.
-func WriteKeys(text string, projects []string) string {
+func WriteKeys(text string, projects []string) string { return writeKeys(text, projects, false) }
+
+// WriteKeysAfterName is WriteKeys for text said right after the wake phrase
+// (IssueKeysAfterName).
+func WriteKeysAfterName(text string, projects []string) string {
+	return writeKeys(text, projects, true)
+}
+
+func writeKeys(text string, projects []string, afterName bool) string {
 	known := make(map[string]bool, len(projects))
 	for _, p := range projects {
 		known[strings.ToUpper(p)] = true
@@ -304,7 +320,7 @@ func WriteKeys(text string, projects []string) string {
 	tokens := keyTokens(text)
 	var out []string
 	next := 0
-	for _, span := range keySpans(tokens) {
+	for _, span := range keySpans(tokens, afterName) {
 		project, _, _ := strings.Cut(span.key, "-")
 		if !known[project] {
 			continue
@@ -376,7 +392,9 @@ var soundsLikeProject = map[[2]string]string{{"in", "for"}: "INFRA"}
 // for 10/27".
 var beforeAName = map[string]bool{"of": true, "about": true, "on": true, "with": true, "to": true, "for": true}
 
-func keySpans(tokens []token) []keySpan {
+// keySpans finds the keys tokens say. With afterName, the tokens follow the
+// wake phrase, so their start is where a name goes too (beforeAName).
+func keySpans(tokens []token, afterName bool) []keySpan {
 	texts := make([]string, len(tokens))
 	for i, t := range tokens {
 		texts[i] = t.text
@@ -395,13 +413,15 @@ func keySpans(tokens []token) []keySpan {
 				// numbers are, and no year: "in for thirty minutes" and "in
 				// for 2027" are no keys. A date smart formatting wrote, or a
 				// number said with a thousand, forms main did not read as a
-				// number, reads as the project only after a word "in" cannot
-				// follow: "pencilled in for 10/27" is a date, and "in for
-				// five thousand dollars" an amount. A number said with a
-				// hundred reads as main read it: "go ahead, in for forty five
-				// hundred and two" is INFRA-4502.
+				// number, reads as the project only where a name goes: after
+				// a word "in" cannot follow, or right after the wake phrase.
+				// "Pencilled in for 10/27" is a date, and "in for five
+				// thousand dollars" an amount. A number said with a hundred
+				// reads as main read it: "go ahead, in for forty five hundred
+				// and two" is INFRA-4502.
 				digits, used := spokenNumber(texts[i+2:])
-				if len(digits) >= 3 && !aYear(digits) && (!amountLike(texts[i+2:i+2+used]) || i > 0 && beforeAName[normalise(texts[i-1])]) {
+				named := i == 0 && afterName || i > 0 && beforeAName[normalise(texts[i-1])]
+				if len(digits) >= 3 && !aYear(digits) && (!amountLike(texts[i+2:i+2+used]) || named) {
 					spans = append(spans, keySpan{key: project + "-" + digits, from: i, to: i + 2 + used})
 					i += 1 + used
 					continue
