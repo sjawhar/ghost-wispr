@@ -85,37 +85,38 @@ func retiredCount(rc *ResilientClient) int {
 	return len(rc.retired)
 }
 
-// gapThenNext has the capture outrun first, the socket rc dials first, with
-// 16384 bytes on its 8192-byte buffer, and returns once next, the socket it
-// dials then, is connected while first still waits for its peer.
-func gapThenNext(t *testing.T, rc *ResilientClient, first *streamedFake) []byte {
+// rotateThenNext connects first, the socket rc dials first, sends it 8192
+// bytes, changes the options, and returns once next, the socket rc dials then,
+// is connected while first still waits for its peer, with the 8192 bytes
+// written after it.
+func rotateThenNext(t *testing.T, rc *ResilientClient, first *streamedFake) []byte {
 	t.Helper()
 	audio := audioBytes(16384)
-	_, _ = rc.Write(audio[:8192])
 	rc.ConnectInBackground()
-	awaitClosed(t, first.held, "the drain never wrote to the first socket")
-	_, _ = rc.Write(audio[8192:]) // overflows past the chunk in flight
-	close(first.release)          // the first socket takes the chunk after all
+	waitConnected(t, rc)
+	_, _ = rc.Write(audio[:8192]) // straight to the first socket
+	rc.OptionsChanged()
 	awaitClosed(t, first.ending, "the first socket never ended its stream gracefully")
 	waitConnected(t, rc) // while the first socket's peer still owes its results
+	_, _ = rc.Write(audio[8192:])
 	return audio
 }
 
-// TestARetiredSocketsLastResultsAreTimedInItsOwnStream fails if a socket the
-// capture outran by a whole buffer is closed at once, losing the final
-// results Deepgram owes for the audio it took; if the next socket is dialled
-// only after that socket's peer returned them, so a stalled peer would hold
-// it up; if a word on the retired socket, handed on while the next one is
-// live, is timed in the next socket's stream; or if the next socket's result
-// is handed on before the retired socket has closed, ahead of words captured
-// before it. The first socket's stream starts at capture byte 0 and the next
-// one's at 8192 (256 ms): a word at 10 ms is at capture 10 ms on the first
-// and 266 ms on the next.
+// TestARetiredSocketsLastResultsAreTimedInItsOwnStream fails if a socket an
+// options change replaced is closed at once, losing the final results
+// Deepgram owes for the audio it took; if the next socket is dialled only
+// after that socket's peer returned them, so a stalled peer would hold it up;
+// if a word on the retired socket, handed on while the next one is live, is
+// timed in the next socket's stream; or if the next socket's result is handed
+// on before the retired socket has closed, ahead of words captured before it.
+// The first socket's stream starts at capture byte 0 and the next one's at
+// 8192 (256 ms): a word at 10 ms is at capture 10 ms on the first and 266 ms
+// on the next.
 func TestARetiredSocketsLastResultsAreTimedInItsOwnStream(t *testing.T) {
-	first, next := newStreamedFake(true), newStreamedFake(false)
+	first, next := newStreamedFake(false), newStreamedFake(false)
 	f := &sequenceFactory{next: []io.WriteCloser{first, next}}
 	rc := newTailClient(t, f)
-	audio := gapThenNext(t, rc, first)
+	audio := rotateThenNext(t, rc, first)
 
 	if isClosed(first.aborted) {
 		t.Error("the first socket was closed at once, before its peer returned its last results")
@@ -124,7 +125,7 @@ func TestARetiredSocketsLastResultsAreTimedInItsOwnStream(t *testing.T) {
 		t.Errorf("the first socket was given %v to return its last results, want %v", got, want)
 	}
 	if got := next.got(); !bytes.Equal(got, audio[8192:]) {
-		t.Errorf("the next socket got %d bytes, want the kept tail, the newest %d, whole and in order", len(got), len(audio)-8192)
+		t.Errorf("the next socket got %d bytes, want the %d written after the change, whole and in order", len(got), len(audio)-8192)
 	}
 	ms := time.Millisecond
 	total := 512 * ms
@@ -171,11 +172,11 @@ func TestARetiredSocketsLastResultsAreTimedInItsOwnStream(t *testing.T) {
 // where it would come after the next socket's. The first socket's close never
 // returns here, as when its reader is stuck in the session.
 func TestTheNextSocketsResultsWaitNoLongerThanTheRetiredSocketsWait(t *testing.T) {
-	first, next := newStreamedFake(true), newStreamedFake(false)
+	first, next := newStreamedFake(false), newStreamedFake(false)
 	f := &sequenceFactory{next: []io.WriteCloser{first, next}}
 	rc := newTailClient(t, f)
 	t.Cleanup(func() { _ = rc.Close() })
-	gapThenNext(t, rc, first)
+	rotateThenNext(t, rc, first)
 	retiredAt := time.Now() // just after the first socket's close began
 	retired, current := first.streamOf(t), next.streamOf(t)
 	if !retired.Admit() {
@@ -205,36 +206,36 @@ func TestTheNextSocketsResultsWaitNoLongerThanTheRetiredSocketsWait(t *testing.T
 }
 
 // TestOneSocketRetiresAtATime fails if a socket still waiting for its peer's
-// last results stays open when the next socket retires too, so that a path
-// the capture outruns again and again piles up sockets; or if Close leaves a
-// retired socket open. The first socket's peer never answers; the second
-// socket retires while it waits, and the first is closed at once then.
+// last results stays open when the next socket retires too, so that options
+// changed again and again pile up sockets; or if Close leaves a retired
+// socket open. The first socket's peer never answers; the second socket
+// retires while it waits, and the first is closed at once then.
 func TestOneSocketRetiresAtATime(t *testing.T) {
-	first, second, third := newStreamedFake(true), newStreamedFake(true), newStreamedFake(false)
+	first, second, third := newStreamedFake(false), newStreamedFake(false), newStreamedFake(false)
 	f := &sequenceFactory{next: []io.WriteCloser{first, second, third}}
 	rc := newTailClient(t, f)
 	audio := audioBytes(24576)
-	_, _ = rc.Write(audio[:8192])
 	rc.ConnectInBackground()
-	awaitClosed(t, first.held, "the drain never wrote to the first socket")
-	_, _ = rc.Write(audio[8192:16384])
-	close(first.release)
+	waitConnected(t, rc)
+	_, _ = rc.Write(audio[:8192])
+	rc.OptionsChanged()
 	awaitClosed(t, first.ending, "the first socket never retired")
-	awaitClosed(t, second.held, "the drain never wrote to the second socket")
+	waitConnected(t, rc)
 	if isClosed(first.aborted) {
 		t.Fatal("control: the first socket was closed at once before the second retired")
 	}
-	_, _ = rc.Write(audio[16384:])
-	close(second.release)
+	_, _ = rc.Write(audio[8192:16384])
+	rc.OptionsChanged()
 	awaitClosed(t, second.ending, "the second socket never retired")
 	awaitClosed(t, first.aborted, "the first socket, still waiting for its peer, stayed open when the second retired")
 	waitConnected(t, rc)
+	_, _ = rc.Write(audio[16384:])
 
 	if isClosed(second.aborted) {
 		t.Error("the second socket was closed at once, before its peer returned its last results")
 	}
 	if got := third.got(); !bytes.Equal(got, audio[16384:]) {
-		t.Errorf("the third socket got %d bytes, want the kept tail, the newest %d, whole and in order", len(got), len(audio)-16384)
+		t.Errorf("the third socket got %d bytes, want the %d written after the second change, whole and in order", len(got), len(audio)-16384)
 	}
 	checkStreamClock(t, rc, len(audio), 16384)
 

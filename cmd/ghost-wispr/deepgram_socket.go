@@ -292,8 +292,7 @@ func (s *deepgramSocket) Close() error {
 // sent first (the write lock). All of it takes at most wait: then the
 // connection is closed whatever is under way, so a stalled peer, or a write
 // stuck on one, never holds it longer. It replaces a healthy socket after an
-// options change, or after the capture outran it (transcribe.GracefulCloser);
-// Close ends a failed one.
+// options change (transcribe.GracefulCloser); Close ends a failed one.
 func (s *deepgramSocket) CloseGracefully(wait time.Duration) error {
 	bound := time.AfterFunc(wait, s.abort)
 	defer bound.Stop()

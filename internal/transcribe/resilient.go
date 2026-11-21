@@ -131,51 +131,28 @@ func (rc *ResilientClient) write(p []byte, queued *atomic.Int64) (int, error) {
 	}
 }
 
-// bufferLocked keeps p for the next socket, behind the audio kept already: the
-// chunk a drain write has pending, then the buffer. What is kept is bounded by
-// the buffer's size and is always one tail of the capture: when p does not
-// fit, the oldest audio goes first, the pending chunk's front before the
-// buffer's, so one start of a socket's stream maps all of it to the times it
-// was captured. Called with Mu held, after p was counted.
+// bufferLocked buffers p for the next socket, or for the one draining. A
+// full buffer drops its oldest audio, and the oldest of p itself when p is
+// larger than the buffer, which no socket will be sent: a hole in the stream
+// (holeLocked). The socket keeps going, and its stream skips the hole. The
+// chunk a drain write has pending is out of the buffer, ahead of it, and
+// stays. It must be called with Mu held, after p was counted.
 func (rc *ResilientClient) bufferLocked(p []byte) {
-	if over := len(rc.pending) + rc.Buffer.Len() + len(p) - rc.Buffer.Cap(); over > 0 {
-		from := rc.accepted - int64(len(p)) - int64(rc.Buffer.Len()) - int64(len(rc.pending))
-		fromPending := min(over, len(rc.pending))
-		rc.pending = rc.pending[fromPending:]
-		// When p alone is longer than the buffer, the buffer's write drops
-		// p's front: the rest of over.
-		rc.Buffer.Discard(over - fromPending)
-		rc.evictedLocked(from, int64(over))
+	held := int64(rc.Buffer.Len())
+	if lost := held + int64(len(p)) - int64(rc.Buffer.Cap()); lost > 0 {
+		rc.holeLocked(rc.accepted-int64(len(p))-held, lost)
 	}
 	_, _ = rc.Buffer.Write(p)
 }
 
-// evictedLocked notes that an overflow dropped the d oldest bytes of the kept
-// audio, from at in the count of the bytes Write takes, while the client may
-// be draining it into a socket, whose stream must not jump over them. During
-// a drain write the count waits for the write's end, as the socket may take
-// some of the bytes dropped (drainChunk). Before the socket took any audio,
-// its stream skips them (holeLocked). After, its stream would jump, so it
-// ends at its next chunk. Called with Mu held.
-func (rc *ResilientClient) evictedLocked(at, d int64) {
-	if rc.State != StateDraining {
-		return // no socket's stream holds them: the next dial starts at the tail
+// streamStartLocked is where the next socket's stream starts, in the count of
+// the bytes Write takes: the chunk a failed drain left pending, if any, else
+// the buffer's oldest byte. Called with Mu held.
+func (rc *ResilientClient) streamStartLocked() int64 {
+	if len(rc.pending) > 0 {
+		return rc.pendingAt
 	}
-	switch {
-	case rc.inFlight:
-		rc.droppedInFlight += d
-	case rc.took == 0:
-		rc.holeLocked(at, d)
-	default:
-		rc.gap = true
-	}
-}
-
-// keptFromLocked is where the audio kept starts, in the count of the bytes
-// Write takes: the pending chunk, then the buffer, are the last bytes taken.
-// Called with Mu held.
-func (rc *ResilientClient) keptFromLocked() int64 {
-	return rc.accepted - int64(rc.Buffer.Len()) - int64(len(rc.pending))
+	return rc.accepted - int64(rc.Buffer.Len())
 }
 
 // Close stops reconnection attempts and the hand-over of state changes, and
@@ -509,18 +486,18 @@ type retiredSocket struct {
 }
 
 // retire ends the stream of c, the current socket, which the owner replaces
-// though it did not fail: after an options change, or after the capture
-// outran it (errStreamGap). Deepgram still owes the final results of the
-// audio it took. c ends its stream gracefully (GracefulCloser) and hands
-// those results on, timed in its own stream (StreamedSocket), on a goroutine
-// of its own while the owner dials the next socket, and is closed once it
-// returned them or after retiredSocketWait: a stalled peer never holds up the
-// next socket, nor keeps its own past the wait. Its results may be handed on
-// until then and no later (Stream.Admit), so the next socket's wait for them
-// ends by retiredSocketWait however slowly the session takes them. One socket
-// retires at a time: one still waiting when the next retires is closed at
-// once, and hands on no more, so a path the capture outruns again and again
-// keeps at most one waiting. Called by the owner, which then dials.
+// though it did not fail, after an options change. Deepgram still owes the
+// final results of the audio it took. c ends its stream gracefully
+// (GracefulCloser) and hands those results on, timed in its own stream
+// (StreamedSocket), on a goroutine of its own while the owner dials the next
+// socket, and is closed once it returned them or after retiredSocketWait: a
+// stalled peer never holds up the next socket, nor keeps its own past the
+// wait. Its results may be handed on until then and no later (Stream.Admit),
+// so the next socket's wait for them ends by retiredSocketWait however slowly
+// the session takes them. One socket retires at a time: one still waiting
+// when the next retires is closed at once, and hands on no more, so options
+// changed again and again keep at most one waiting. Called by the owner,
+// which then dials.
 func (rc *ResilientClient) retire(c io.WriteCloser) {
 	r := &retiredSocket{client: c, done: make(chan struct{})}
 	rc.Mu.Lock()
@@ -573,12 +550,6 @@ func (rc *ResilientClient) retire(c io.WriteCloser) {
 // socket whose dial predates an options change: the owner then retires it
 // and dials again.
 var errOptionsChanged = errors.New("the options changed since the socket was dialled")
-
-// errStreamGap is what a drain reports when an overflow dropped audio the
-// socket had not taken, after audio it had: one start of its stream can no
-// longer map both to the times they were captured, so the owner retires the
-// socket and dials the next.
-var errStreamGap = errors.New("the buffer overflowed past the audio the socket took")
 
 // dialUntilConnected dials after wait, then again with exponential backoff,
 // until a socket is connected and the buffered audio sent; it stops when rc.ctx
@@ -636,11 +607,12 @@ func (rc *ResilientClient) dialUntilConnected(wait time.Duration) {
 		rc.Client = newClient
 		rc.dialedGen = gen
 		// The new socket's stream starts at the oldest byte kept: the chunk a
-		// failed drain kept, then the buffer, one tail of the capture.
-		rc.origin = rc.keptFromLocked()
+		// failed drain kept, then the buffer. It skips the holes after that,
+		// which a full buffer made before it was dialled; those before are
+		// the last socket's.
+		rc.origin = rc.streamStartLocked()
 		rc.keepDropsAfterLocked(rc.origin)
-		rc.holes = rc.holes[:0]
-		rc.took, rc.inFlight, rc.droppedInFlight, rc.gap = 0, false, 0, false
+		rc.holes = slices.DeleteFunc(rc.holes, func(h streamDrop) bool { return h.at < rc.origin })
 		rc.freezeLocked(rc.current) // a failed socket's, whose results all came
 		rc.current = &Stream{rc: rc}
 		if streamed, ok := newClient.(StreamedSocket); ok {
@@ -660,17 +632,6 @@ func (rc *ResilientClient) dialUntilConnected(wait time.Duration) {
 				rc.log("deepgram: the options changed during the drain; redialling with them")
 				rc.retire(newClient)
 				wait = 0
-				continue
-			}
-			if errors.Is(err, errStreamGap) {
-				// The capture outran the socket by a whole buffer, so an
-				// overflow dropped audio it had not taken: its stream ends
-				// there, and it returns the final results of the audio it
-				// took while the next socket, which starts at the audio
-				// kept, is dialled.
-				rc.log("deepgram: the capture outran the socket by a whole buffer; it returns its last results while the next socket is dialled in %v", next)
-				rc.retire(newClient)
-				backOff()
 				continue
 			}
 			// The new socket is dead too: it ends at once, and the next one
@@ -717,21 +678,14 @@ func (rc *ResilientClient) drainBuffer() error {
 // this socket's dial, it leaves the client buffering and reports
 // errOptionsChanged instead, so the owner, still the only one, rotates: the
 // check and the hand-over to connected are one step, so no change is lost
-// between them. If an overflow dropped audio this socket had not taken, after
-// audio it had, it reports errStreamGap: its stream ends whole there, and the
-// next socket's starts at the audio kept.
+// between them.
 func (rc *ResilientClient) drainChunk(buf []byte) (bool, error) {
 	rc.drainMu.Lock()
 	defer rc.drainMu.Unlock()
 
 	rc.Mu.Lock()
-	if rc.gap && rc.ctx.Err() == nil {
-		// An overflow dropped audio this socket had not taken, after audio it
-		// had: its stream would jump over it.
-		rc.Mu.Unlock()
-		return false, errStreamGap
-	}
 	if len(rc.pending) == 0 {
+		rc.pendingAt = rc.accepted - int64(rc.Buffer.Len())
 		n, _ := rc.Buffer.Read(buf)
 		rc.pending = append(rc.pending[:0], buf[:n]...)
 	}
@@ -744,8 +698,6 @@ func (rc *ResilientClient) drainChunk(buf []byte) (bool, error) {
 		}
 		rc.setStateLocked(StateConnected)
 		rc.owning = false
-	} else {
-		rc.inFlight, rc.droppedInFlight = true, 0
 	}
 	rc.Mu.Unlock()
 
@@ -755,19 +707,10 @@ func (rc *ResilientClient) drainChunk(buf []byte) (bool, error) {
 	n, err := client.Write(chunk)
 	n = max(0, min(n, len(chunk)))
 	rc.Mu.Lock()
-	rc.inFlight = false
-	rc.took += int64(n)
-	// An overflow during the write dropped the oldest kept bytes, the chunk's
-	// front first. If the socket took at least as many, it took them all: the
-	// chunk's bytes it took beyond them are sent, and its stream goes on with
-	// no gap. Else it skipped audio the overflow dropped, and it ends at its
-	// next chunk.
-	if dropped := rc.droppedInFlight; dropped <= int64(n) {
-		rc.pending = rc.pending[n-int(dropped):]
-	} else {
-		rc.gap = true
-	}
-	rc.droppedInFlight = 0
+	// Only this drain, under drainMu, and Finalize, which waits for it, touch
+	// the pending chunk: a full buffer drops audio behind it, not of it.
+	rc.pending = rc.pending[n:]
+	rc.pendingAt += int64(n)
 	rc.Mu.Unlock()
 	if err == nil && n < len(chunk) {
 		err = io.ErrShortWrite
@@ -1070,11 +1013,9 @@ func (rc *ResilientClient) streamDuration(n int64) time.Duration {
 func (rc *ResilientClient) Finalize() error {
 	rc.Mu.Lock()
 	// The live socket, still draining, would have been sent these next: its
-	// stream skips them, after the audio already sent. The pending chunk, if
-	// any, ends where they start.
-	pendingEnd := rc.accepted - int64(rc.Buffer.Len())
+	// stream skips them, after the audio already sent.
 	if n := int64(rc.Buffer.Len()); n > 0 {
-		rc.holeLocked(pendingEnd, n)
+		rc.holeLocked(rc.accepted-n, n)
 	}
 	rc.Buffer.Reset()
 	rc.Mu.Unlock()
@@ -1086,7 +1027,7 @@ func (rc *ResilientClient) Finalize() error {
 	// pause: the live socket would have been sent it first, and its stream
 	// skips it too. A write since the buffer's reset took only its front.
 	if n := int64(len(rc.pending)); n > 0 {
-		rc.holeLocked(pendingEnd-n, n)
+		rc.holeLocked(rc.pendingAt, n)
 	}
 	rc.pending = rc.pending[:0]
 	state := rc.State

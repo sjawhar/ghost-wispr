@@ -65,58 +65,29 @@ func oneWordResult(word string) []byte {
 	return []byte(`{"type":"Results","is_final":true,"speech_final":true,"channel":{"alternatives":[{"transcript":"` + word + `.","words":[{"word":"` + word + `","punctuated_word":"` + word + `.","start":0.01,"end":0.02}]}]}}`)
 }
 
-// retireTrigger is what makes the resilient client retire its socket: an
-// options change while it is connected, or the capture outrunning it while it
-// drains.
-type retireTrigger int
-
-const (
-	optionsChange retireTrigger = iota
-	captureOutruns
-)
-
-func (tr retireTrigger) String() string {
-	if tr == optionsChange {
-		return "an options change replaces the socket"
-	}
-	return "the capture outruns the socket"
-}
-
 // retireRig is a resilient client on an 8192-byte buffer whose first
-// Deepgram socket retires by trigger; 100 ms (3200 bytes) went to an earlier
-// socket first, so the first socket's stream starts at capture byte 3200.
-// After an options change the first socket has the whole 8192 bytes of audio
-// and the next none; when the capture outruns it, the first socket's drain
-// holds its first write, the first 4096 bytes, while 8192 more are written,
-// and the next socket gets those, the kept tail. Either way the next socket's
-// stream starts at capture byte 11392.
+// Deepgram socket an options change replaces after it took 8192 bytes; 100 ms
+// (3200 bytes) went to an earlier socket first, so the first socket's stream
+// starts at capture byte 3200, and the next socket's at 11392.
 type retireRig struct {
 	rc    *transcribe.ResilientClient
 	dials atomic.Int32
 	audio []byte
-	// firstGot and nextGets are the audio the first and the next socket get
-	// before the test writes more.
-	firstGot, nextGets []byte
 }
 
-func startRetireRig(t *testing.T, srv *httptest.Server, callback transcriptCallback, trigger retireTrigger) *retireRig {
+func startRetireRig(t *testing.T, srv *httptest.Server, callback transcriptCallback) *retireRig {
 	t.Helper()
-	rig := &retireRig{audio: make([]byte, 16384)}
+	rig := &retireRig{audio: make([]byte, 8192)}
 	for i := range rig.audio {
 		rig.audio[i] = byte(i*13 + i/127)
 	}
 	opts := &interfaces.LiveTranscriptionOptions{Model: "nova-3", Language: "en-US", Encoding: "linear16", SampleRate: 16000, Channels: 1}
-	firstHeld := make(chan *heldSocket, 1)
 	factory := func(ctx context.Context) (io.WriteCloser, error) {
 		s, err := dialDeepgramLive(ctx, "test-key", &interfaces.ClientOptions{Host: "ws://" + srv.Listener.Addr().String()}, opts, callback, time.Second)
 		if err != nil {
 			return nil, err
 		}
-		if rig.dials.Add(1) == 1 && trigger == captureOutruns {
-			h := &heldSocket{deepgramSocket: s, entered: make(chan struct{}), release: make(chan struct{})}
-			firstHeld <- h
-			return h, nil
-		}
+		rig.dials.Add(1)
 		return s, nil
 	}
 	rig.rc = transcribe.NewResilientClient(context.Background(), factory, transcribe.ResilientConfig{BufferSize: 8192, InitialReconnectDelay: time.Millisecond, MaxReconnectBackoff: time.Millisecond}, nil, nil)
@@ -124,26 +95,10 @@ func startRetireRig(t *testing.T, srv *httptest.Server, callback transcriptCallb
 	rig.rc.Client = takingSocket{}
 	_, _ = rig.rc.Write(make([]byte, 3200)) // 100 ms to an earlier socket
 	rig.rc.Client = nil                     // that socket is gone: the next audio is buffered
-	if trigger == optionsChange {
-		rig.rc.ConnectInBackground()
-		waitForHardwareWithin(t, 3*time.Second, "the first socket", func() bool { return rig.dials.Load() == 1 && rig.rc.IsConnected() })
-		_, _ = rig.rc.Write(rig.audio[:8192]) // straight to the first socket
-		rig.firstGot = rig.audio[:8192]
-		rig.rc.OptionsChanged()
-		return rig
-	}
-	_, _ = rig.rc.Write(rig.audio[:8192])
 	rig.rc.ConnectInBackground()
-	var first *heldSocket
-	select {
-	case first = <-firstHeld:
-	case <-time.After(3 * time.Second):
-		t.Fatal("the first socket was never dialled")
-	}
-	awaitClosedWithin(t, first.entered, "the drain never wrote to the first socket")
-	_, _ = rig.rc.Write(rig.audio[8192:]) // the capture outruns the first socket
-	close(first.release)                  // which takes its chunk after all
-	rig.firstGot, rig.nextGets = rig.audio[:4096], rig.audio[8192:]
+	waitForHardwareWithin(t, 3*time.Second, "the first socket", func() bool { return rig.dials.Load() == 1 && rig.rc.IsConnected() })
+	_, _ = rig.rc.Write(rig.audio) // straight to the first socket
+	rig.rc.OptionsChanged()
 	return rig
 }
 
@@ -167,12 +122,6 @@ func awaitClosedWithin(t *testing.T, ch <-chan struct{}, what string) {
 // 3200, so its word at 10 ms was captured at 110 ms; the next socket's began
 // at 11392, so its word at 10 ms at 366 ms.
 func TestARetiredSocketsFinalIsKeptAndTimedInItsOwnStream(t *testing.T) {
-	for _, trigger := range []retireTrigger{optionsChange, captureOutruns} {
-		t.Run(trigger.String(), func(t *testing.T) { retiredSocketFinal(t, trigger) })
-	}
-}
-
-func retiredSocketFinal(t *testing.T, trigger retireTrigger) {
 	var handshakes atomic.Int32
 	afterSent := make(chan struct{})
 	firstPeerDone := make(chan struct{})
@@ -221,17 +170,16 @@ func retiredSocketFinal(t *testing.T, trigger retireTrigger) {
 	}))
 	t.Cleanup(srv.Close)
 	clock := &namedWordClock{words: make(chan namedWord, 8)}
-	rig := startRetireRig(t, srv, transcriptCallback{manager: clock}, trigger)
+	rig := startRetireRig(t, srv, transcriptCallback{manager: clock})
 	clock.rc = rig.rc
 	waitForHardwareWithin(t, 3*time.Second, "the next socket", func() bool { return rig.dials.Load() == 2 && rig.rc.IsConnected() })
 	post := bytes.Repeat([]byte{0xA5, 0x73}, 1600)
 	_, _ = rig.rc.Write(post)
 	_, _ = rig.rc.Write(marker)
-	wantNext := append(append([]byte(nil), rig.nextGets...), post...)
 	select {
 	case got := <-received:
-		if !bytes.Equal(got, wantNext) {
-			t.Fatalf("control: the next socket got %d bytes, want the newest %d, whole and in order", len(got), len(wantNext))
+		if !bytes.Equal(got, post) {
+			t.Fatalf("control: the next socket got %d bytes, want the %d written after it connected", len(got), len(post))
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("the next socket never got its audio")
@@ -261,8 +209,8 @@ collect:
 	mu.Lock()
 	prefix := append([]byte(nil), firstGot...)
 	mu.Unlock()
-	if !bytes.Equal(prefix, rig.firstGot) {
-		t.Errorf("control: the first socket's peer got %d bytes, want the first %d captured after the earlier socket", len(prefix), len(rig.firstGot))
+	if !bytes.Equal(prefix, rig.audio) {
+		t.Errorf("control: the first socket's peer got %d bytes, want the %d captured after the earlier socket", len(prefix), len(rig.audio))
 	}
 	if len(words) != 2 || words[0].text != "before" || words[1].text != "after" {
 		t.Errorf("the session manager heard %+v, want the first socket's word once, then the next socket's", words)
@@ -283,12 +231,6 @@ collect:
 // peer, which never answers CloseStream; or if the first socket stays open
 // past its 1 s wait, so stalled sockets would pile up.
 func TestARetiredSocketWhosePeerNeverAnswersDoesNotHoldUpItsSuccessor(t *testing.T) {
-	for _, trigger := range []retireTrigger{optionsChange, captureOutruns} {
-		t.Run(trigger.String(), func(t *testing.T) { retiredSocketNeverAnswered(t, trigger) })
-	}
-}
-
-func retiredSocketNeverAnswered(t *testing.T, trigger retireTrigger) {
 	var handshakes atomic.Int32
 	var closeStreamAt atomic.Int64
 	firstEnded := make(chan struct{})
@@ -314,7 +256,7 @@ func retiredSocketNeverAnswered(t *testing.T, trigger retireTrigger) {
 		}
 	}))
 	t.Cleanup(srv.Close)
-	rig := startRetireRig(t, srv, transcriptCallback{}, trigger)
+	rig := startRetireRig(t, srv, transcriptCallback{})
 	waitForHardwareWithin(t, 3*time.Second, "the next socket", func() bool { return rig.dials.Load() == 2 && rig.rc.IsConnected() })
 	connectedAt := time.Now()
 	if isClosedChan(firstEnded) {

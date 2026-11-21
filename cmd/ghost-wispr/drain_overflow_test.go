@@ -47,10 +47,10 @@ func (takingSocket) Close() error                { return nil }
 // was. 100 ms went to an earlier socket first. Without an overflow, the third
 // socket gets the whole buffer, and its word at 10 ms was captured at 110 ms.
 // When the buffer overflows while the second socket retries the refused chunk,
-// the oldest audio goes first, the chunk included: the third socket gets the
-// kept tail, the newest 8192 bytes, and its word at 10 ms was captured 10 ms
-// after that tail began, at 302 ms; with the chunk kept ahead of a gap it was
-// read as 174 ms.
+// it drops its own oldest audio, behind the chunk: the third socket gets the
+// chunk, then what the buffer kept, and its stream skips the 2048 bytes the
+// overflow dropped. Its word at 187.5 ms, 6000 bytes into its stream, past the
+// chunk and the hole, was captured at 351.5 ms; read with no hole, 287.5 ms.
 func TestAWordAfterRefusedDrainsMapsToItsCaptureTime(t *testing.T) {
 	for _, overflow := range []bool{false, true} {
 		name := "no overflow"
@@ -62,6 +62,12 @@ func TestAWordAfterRefusedDrainsMapsToItsCaptureTime(t *testing.T) {
 }
 
 func wordAfterRefusedDrains(t *testing.T, overflow bool) {
+	// The third socket's word: at 10 ms into its stream, or with an
+	// overflow at 187.5 ms, past the hole.
+	wordStart, wordEnd := "0.01", "0.02"
+	if overflow {
+		wordStart, wordEnd = "0.1875", "0.1975"
+	}
 	refuse := []chan struct{}{make(chan struct{}), make(chan struct{})}
 	var handshakes atomic.Int32
 	marker := []byte("END-OF-DRAIN")
@@ -91,7 +97,7 @@ func wordAfterRefusedDrains(t *testing.T, overflow bool) {
 			}
 			if bytes.Equal(p, marker) {
 				received <- got
-				_ = c.WriteMessage(websocket.TextMessage, []byte(`{"type":"Results","is_final":true,"speech_final":true,"channel":{"alternatives":[{"transcript":"Retried.","words":[{"word":"retried","punctuated_word":"Retried.","start":0.01,"end":0.02}]}]}}`))
+				_ = c.WriteMessage(websocket.TextMessage, []byte(`{"type":"Results","is_final":true,"speech_final":true,"channel":{"alternatives":[{"transcript":"Retried.","words":[{"word":"retried","punctuated_word":"Retried.","start":`+wordStart+`,"end":`+wordEnd+`}]}]}}`))
 				continue
 			}
 			got = append(got, p...)
@@ -132,7 +138,7 @@ func wordAfterRefusedDrains(t *testing.T, overflow bool) {
 	rc.ConnectInBackground()
 	want := append([]byte(nil), audio...)
 	captured := 3200 + len(audio)
-	first := 3200 // the capture byte the third socket's stream starts at
+	wordCapture := 3200 + 320 // capture byte of the word: 10 ms into the third socket's stream
 	await := func(ch <-chan struct{}, what string) {
 		t.Helper()
 		select {
@@ -153,10 +159,10 @@ func wordAfterRefusedDrains(t *testing.T, overflow bool) {
 			later := bytes.Repeat([]byte{0xB3, 0xC9}, 4096)
 			_, _ = rc.Write(later) // overflows the 8192-byte buffer
 			captured += len(later)
-			// The oldest audio goes first, the pending chunk included: what
-			// is kept is the newest 8192 bytes.
-			want = later
-			first = captured - len(later)
+			// The buffer drops its oldest 2048 bytes, behind the refused
+			// chunk, which the third socket gets first.
+			want = append(append([]byte(nil), audio[:4096]...), later...)
+			wordCapture = 3200 + 6000 + 2048 // 6000 bytes into the stream, past the hole
 		}
 		close(refuse[i])
 		await(s.done, "the socket never ended on Deepgram's error")
@@ -175,11 +181,10 @@ func wordAfterRefusedDrains(t *testing.T, overflow bool) {
 	}
 	select {
 	case got := <-clock.heard:
-		wordAt := 10 * time.Millisecond
-		wantBefore := time.Duration(first)*time.Second/32000 + wordAt
+		wantBefore := time.Duration(wordCapture) * time.Second / 32000
 		wantSince := time.Duration(captured)*time.Second/32000 - wantBefore
 		if got[0] != wantBefore || got[1] != wantSince {
-			t.Errorf("the word at stream time %v maps to capture %v, %v behind, want %v and %v", wordAt, got[0], got[1], wantBefore, wantSince)
+			t.Errorf("the word at stream time %s s maps to capture %v, %v behind, want %v and %v", wordStart, got[0], got[1], wantBefore, wantSince)
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("the third socket never returned the word")
