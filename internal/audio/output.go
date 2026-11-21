@@ -225,16 +225,27 @@ type outputInput struct {
 	histPos   int
 	// held counts, along history, the queued samples whose output each
 	// stream position holds, with the rate they were queued at (heldCount),
-	// and heldBy is the playback they came from: a Cancel takes off what each
-	// playback played only its audio it took back, as long as it was queued,
-	// though the speech had gaps and the resampler delays it. landed and
-	// landedBy are the same for the frame being mixed and, after it, the
-	// positions the resampler's delay reaches: landed[j] is the stream
-	// position pos+j. unlanded is what of the queued audio the resampler held
-	// when Cancel dropped it: it never reaches the stream.
+	// and heldBy is the playbacks they came from (owners): a Cancel takes
+	// off what each playback played only its audio it took back, as long as
+	// it was queued, though the speech had gaps and the resampler delays it.
+	// landed and landedBy are the same for the frame being mixed and, after
+	// it, the positions the resampler's delay reaches: landed[j] is the
+	// stream position pos+j. unlanded is what of the queued audio the
+	// resampler held when Cancel dropped it: it never reaches the stream.
 	held, landed     []uint32
-	heldBy, landedBy []*Playback
+	heldBy, landedBy []owners
 	unlanded         playedTime
+}
+
+// owners is who the queued samples a stream position holds came from: last,
+// and, when an earlier playback's samples share the position, as one
+// position of a downsampled input can hold the end of one playback and the
+// start of the next, first and how many of them were its. A third playback
+// in one position, one shorter than a resampling step, has its samples
+// counted as first's.
+type owners struct {
+	last, first *Playback
+	firstN      int
 }
 
 // tail is a playback whose last sample the resampler took at push last.
@@ -597,26 +608,34 @@ func (in *outputInput) end(err error) {
 // takeBack adds the queued samples counted in held to lost, and takes each
 // playback's share of them off what it played (heldBy). The caller holds the
 // Output's mu.
-func takeBack(held []uint32, heldBy []*Playback, lost *playedTime) {
+func takeBack(held []uint32, heldBy []owners, lost *playedTime) {
 	type share struct {
 		pb *Playback
 		t  playedTime
 	}
 	var shares []share
-	for i, v := range held {
-		if v == 0 {
-			continue
-		}
-		lost.addHeld(v)
-		pb := heldBy[i]
-		if pb == nil {
-			continue
+	charge := func(pb *Playback, rate, n int) {
+		if pb == nil || n <= 0 {
+			return
 		}
 		k := slices.IndexFunc(shares, func(s share) bool { return s.pb == pb })
 		if k < 0 {
 			shares, k = append(shares, share{pb: pb}), len(shares)
 		}
-		shares[k].t.addHeld(v)
+		shares[k].t.add(rate, n)
+	}
+	for i, v := range held {
+		if v == 0 {
+			continue
+		}
+		lost.addHeld(v)
+		rate, n, o := int(v&(1<<24-1)), int(v>>24), heldBy[i]
+		first := 0
+		if o.first != nil {
+			first = min(o.firstN, n)
+			charge(o.first, rate, first)
+		}
+		charge(o.last, rate, n-first)
 	}
 	for _, s := range shares {
 		s.pb.played.sub(s.t.total())
@@ -708,7 +727,7 @@ func (in *outputInput) render(rate int) {
 	}
 	lag := in.rs.lag() * rate / in.rate // output samples a pushed sample takes to reach the output
 	if need := len(in.contrib) + lag + 1; len(in.landed) < need {
-		grown, grownBy := make([]uint32, need), make([]*Playback, need)
+		grown, grownBy := make([]uint32, need), make([]owners, need)
 		copy(grown, in.landed)
 		copy(grownBy, in.landedBy)
 		in.landed, in.landedBy = grown, grownBy
@@ -750,10 +769,21 @@ func (in *outputInput) render(rate int) {
 	}
 }
 
-// land counts one queued sample of pb, at the input's rate, at landed[j].
+// land counts one queued sample of pb, at the input's rate, at landed[j]. A
+// position whose samples so far came from another playback keeps that one as
+// its first owner (owners).
 func (in *outputInput) land(j int, pb *Playback) {
-	in.landed[j] = heldCount(int(in.landed[j]>>24)+1, in.rate)
-	in.landedBy[j] = pb
+	n := int(in.landed[j] >> 24)
+	if o := &in.landedBy[j]; o.last != pb {
+		if o.last != nil {
+			if o.first == nil {
+				o.first = o.last
+			}
+			o.firstN = n
+		}
+		o.last = pb
+	}
+	in.landed[j] = heldCount(n+1, in.rate)
 }
 
 // run is the Output's mixer: it waits for audio, then plays a stream until
@@ -1090,8 +1120,8 @@ func (o *Output) mixFrame(frame []int16, sum []float32, rate, hist int, now time
 	for _, in := range o.order {
 		if len(in.contrib) != len(frame) || len(in.history) != hist {
 			in.contrib, in.history, in.held, in.histPos = make([]float32, len(frame)), make([]float32, hist), make([]uint32, hist), 0
-			in.heldBy = make([]*Playback, hist)
-			in.landed, in.landedBy = make([]uint32, 2*len(frame)), make([]*Playback, 2*len(frame))
+			in.heldBy = make([]owners, hist)
+			in.landed, in.landedBy = make([]uint32, 2*len(frame)), make([]owners, 2*len(frame))
 		}
 		switch {
 		case in == chime && hold:

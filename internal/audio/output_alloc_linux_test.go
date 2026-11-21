@@ -108,14 +108,16 @@ func allocationsHere() map[string]int64 {
 // mixer's pacer holds it to real time.
 type sinkPCM struct{ buffer int }
 
-func (p *sinkPCM) writei(_ []int16, frames int) int            { return frames }
-func (p *sinkPCM) recover(rc int) int                          { return rc }
-func (p *sinkPCM) resume() int                                 { return 0 }
-func (p *sinkPCM) statusAvail() int                            { return p.buffer }
-func (p *sinkPCM) avail() int                                  { return p.buffer }
-func (p *sinkPCM) delay() (int, int)                           { return 0, 0 }
-func (p *sinkPCM) rewindable() int                             { return 0 }
-func (p *sinkPCM) rewind(int) int                              { return 0 }
-func (p *sinkPCM) dropCounted() (int, time.Duration, int, int) { return 0, 0, 0, 0 }
-func (p *sinkPCM) prepare() int                                { return 0 }
-func (p *sinkPCM) close() int                                  { return 0 }
+func (p *sinkPCM) writei(_ []int16, frames int) int { return frames }
+func (p *sinkPCM) recover(rc int) int               { return rc }
+func (p *sinkPCM) resume() int                      { return 0 }
+func (p *sinkPCM) avail() int                       { return p.buffer }
+func (p *sinkPCM) delay() (int, int)                { return 0, 0 }
+func (p *sinkPCM) rewindable() int                  { return 0 }
+func (p *sinkPCM) rewind(int) int                   { return 0 }
+func (p *sinkPCM) status() pcmStatus                { return pcmStatus{running: true, avail: p.buffer} }
+func (p *sinkPCM) dropAfterStatus() (pcmStatus, time.Duration, int) {
+	return p.status(), 0, 0
+}
+func (p *sinkPCM) prepare() int { return 0 }
+func (p *sinkPCM) close() int   { return 0 }

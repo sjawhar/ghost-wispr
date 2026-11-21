@@ -3,6 +3,7 @@
 package audio
 
 import (
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -39,17 +40,28 @@ type alsaPCM interface {
 	writei(interleaved []int16, frames int) int // snd_pcm_writei
 	recover(rc int) int                         // snd_pcm_recover, silently
 	resume() int                                // snd_pcm_resume
-	statusAvail() int                           // snd_pcm_status's avail, in any state
 	avail() int                                 // snd_pcm_avail
 	delay() (frames, rc int)                    // snd_pcm_delay
 	rewindable() int                            // snd_pcm_rewindable
 	rewind(frames int) int                      // snd_pcm_rewind
-	// dropCounted reads snd_pcm_status's delay, then calls snd_pcm_drop, and
-	// reports the delay, the time between the two calls, and each call's
-	// result: a status that fails drops nothing.
-	dropCounted() (delay int, between time.Duration, statusRC, dropRC int)
+	status() pcmStatus                          // one snd_pcm_status snapshot
+	// dropAfterStatus reads one status snapshot, then calls snd_pcm_drop,
+	// and reports the snapshot, the time between the two calls, and the
+	// drop's result: a status that fails drops nothing.
+	dropAfterStatus() (st pcmStatus, between time.Duration, dropRC int)
 	prepare() int // snd_pcm_prepare
 	close() int   // snd_pcm_close
+}
+
+// pcmStatus is one snapshot of a PCM's status: whether it is running, its
+// delay, which counts what is in flight past its buffer as well as what the
+// buffer holds but which ALSA reports only while it runs, how many frames
+// its buffer has free, which it reports in every state, and the status
+// call's result.
+type pcmStatus struct {
+	running      bool
+	delay, avail int
+	rc           int
 }
 
 // alsaStream is the speaker's PlaybackStream on an ALSA playback PCM, opened
@@ -66,9 +78,11 @@ type alsaStream struct {
 	// Output is to write again (takeAgain).
 	again int
 	// inflight is what was in flight to the speaker past the PCM's buffer,
-	// as a USB speaker's requests are, at the last write: a suspend cancels
-	// it, and the PCM's status no longer counts it then.
-	inflight int
+	// as a USB speaker's requests are, at the last write, from one status
+	// snapshot: a suspend cancels it, and the PCM's status no longer counts
+	// it then. inflightUnknown says that snapshot failed.
+	inflight        int
+	inflightUnknown bool
 }
 
 func newALSAStream(pcm alsaPCM, device string, params alsaParams) *alsaStream {
@@ -78,12 +92,19 @@ func newALSAStream(pcm alsaPCM, device string, params alsaParams) *alsaStream {
 func (s *alsaStream) bufferFrames() int { return s.params.buffer }
 
 // queuedFrames is how many frames the room has yet to hear: what the PCM
-// holds and what is in flight to the speaker.
+// holds and what is in flight to the speaker. When the delay cannot be read
+// it counts what the PCM holds and a whole buffer more in flight, which the
+// Output's history also allows for, so the stream closes no sooner than
+// that could play out.
 func (s *alsaStream) queuedFrames() int {
 	if d, rc := s.pcm.delay(); rc >= 0 {
 		return max(0, d)
 	}
-	return s.held()
+	held := s.params.buffer
+	if avail := s.pcm.avail(); avail >= 0 {
+		held = max(0, s.params.buffer-avail)
+	}
+	return held + s.params.buffer
 }
 
 // Write plays frame, waiting while the PCM is full. After an underrun, when
@@ -135,10 +156,10 @@ func (s *alsaStream) Write(frame []int16) error {
 			return alsaErr("write", rc)
 		}
 	}
-	if d, rc := s.pcm.delay(); rc >= 0 {
-		if avail := s.pcm.avail(); avail >= 0 {
-			s.inflight = max(0, d-(s.params.buffer-avail))
-		}
+	if st := s.pcm.status(); st.rc < 0 {
+		s.inflightUnknown = true
+	} else {
+		s.inflight, s.inflightUnknown = s.inflightOf(st), false
 	}
 	if !s.told {
 		s.tell()
@@ -146,15 +167,24 @@ func (s *alsaStream) Write(frame []int16) error {
 	return nil
 }
 
+// inflightOf is what st says is in flight past the PCM's buffer: its delay
+// less what the buffer holds, while the PCM runs; nothing before it starts.
+func (s *alsaStream) inflightOf(st pcmStatus) int {
+	if !st.running {
+		return 0
+	}
+	return max(0, st.delay-(s.params.buffer-st.avail))
+}
+
 // resume brings a suspended PCM back. A resume loses nothing, and it reports
 // -1. A PCM that cannot resume it prepares, as snd_pcm_recover would, which
 // discards what the PCM held, and it reports how many frames are lost: what
 // the PCM's status says it held, and what was in flight past it at the last
-// write, which the suspend cancelled, as a USB speaker's driver does. A
-// status that fails leaves the loss unknown: then a PCM that cannot resume
-// fails the stream, rather than play on with audio gone.
+// write, which the suspend cancelled, as a USB speaker's driver does. When
+// either count is unknown, as when the status fails, a PCM that cannot
+// resume fails the stream, rather than play on with audio gone.
 func (s *alsaStream) resume() (lost int, err error) {
-	avail := s.pcm.statusAvail()
+	st := s.pcm.status()
 	rc := s.pcm.resume()
 	for rc == -int(syscall.EAGAIN) {
 		time.Sleep(alsaPeriod)
@@ -164,13 +194,16 @@ func (s *alsaStream) resume() (lost int, err error) {
 		slog.Info("speaker resumed after a suspend", "device", s.device)
 		return -1, nil
 	}
-	if avail < 0 {
-		return 0, alsaErr("status after a suspend", avail)
+	if st.rc < 0 {
+		return 0, alsaErr("status after a suspend", st.rc)
+	}
+	if s.inflightUnknown {
+		return 0, errors.New("speaker could not resume after a suspend, and what was in flight to it is unknown")
 	}
 	if rc := s.pcm.prepare(); rc < 0 {
 		return 0, alsaErr("prepare after a suspend", rc)
 	}
-	lost = max(0, s.params.buffer-avail) + s.inflight
+	lost = max(0, s.params.buffer-st.avail) + s.inflight
 	slog.Warn("speaker could not resume after a suspend; its queue plays again", "device", s.device, "discarded", frameTime(lost, s.params.rate))
 	return lost, nil
 }
@@ -205,11 +238,14 @@ func (s *alsaStream) tell() {
 // speaker, it cannot take back, and the room hears it; when that is more than
 // a period, or the PCM does not rewind, it drops the PCM instead, which also
 // cuts what is in flight, and prepares it for the next write: then it reports
-// what the drop cut, the delay read just before it less what the device
-// played until the drop, among the frames to write again, since the room
-// will not hear them otherwise. When it cannot read the delay it drops
-// nothing, and what it could not take back plays out. It logs which it did:
-// the stream's open line says only whether the PCM can rewind.
+// what the drop cut among the frames to write again, since the room will not
+// hear them otherwise. That is, from one status snapshot read just before
+// the drop, the delay of a running PCM less what the device played until the
+// drop, or what the buffer of a PCM not yet started holds. The OS can stop
+// the process between any two calls, so a few milliseconds may repeat. When
+// it cannot read the delay or the status it drops nothing, and what it could
+// not take back plays out. It logs which it did: the stream's open line says
+// only whether the PCM can rewind.
 func (s *alsaStream) Drop() (int, error) {
 	held := s.held()
 	if held == 0 {
@@ -229,17 +265,21 @@ func (s *alsaStream) Drop() (int, error) {
 		s.logCancel("rewind", back, tail)
 		return back, nil
 	}
-	delay, between, statusRC, dropRC := s.pcm.dropCounted()
-	if statusRC < 0 {
-		slog.Warn("speaker cancel could not read the status; what it could not rewind plays out", "device", s.device, "error", alsaErr("status", statusRC))
+	st, between, dropRC := s.pcm.dropAfterStatus()
+	if st.rc < 0 {
+		slog.Warn("speaker cancel could not read the status; what it could not rewind plays out", "device", s.device, "error", alsaErr("status", st.rc))
 		s.logCancel("rewind", back, tail)
 		return back, nil
 	}
 	if dropRC < 0 {
 		return 0, alsaErr("drop", dropRC)
 	}
-	played := int(int64(between) * int64(s.params.rate) / int64(time.Second))
-	back += max(0, delay-played)
+	if st.running {
+		played := int(int64(between) * int64(s.params.rate) / int64(time.Second))
+		back += max(0, st.delay-played)
+	} else {
+		back += max(0, s.params.buffer-st.avail)
+	}
 	if rc := s.pcm.prepare(); rc < 0 {
 		return 0, alsaErr("prepare", rc)
 	}

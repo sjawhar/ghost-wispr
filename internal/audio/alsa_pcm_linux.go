@@ -83,37 +83,49 @@ fail:
 	return r;
 }
 
-// gw_status_avail is how many frames the PCM's buffer has free, from its
-// status, which ALSA reports in every state, a suspended one included; or
-// snd_pcm_status's error.
-static long gw_status_avail(snd_pcm_t *pcm) {
+// gw_status is one snapshot of a PCM's status: whether it is running (or
+// draining), its delay, which counts what is in flight to a USB speaker as
+// well as what the PCM holds and which ALSA reports only while it runs, and
+// how many frames its buffer has free, which it reports in every state, a
+// suspended one included; or snd_pcm_status's error.
+typedef struct {
+	int running, rc;
+	long delay, avail;
+} gw_status;
+
+static gw_status gw_status_read(snd_pcm_t *pcm) {
+	gw_status s = {0};
 	snd_pcm_status_t *st;
-	int rc;
+	snd_pcm_state_t state;
 	snd_pcm_status_alloca(&st);
-	if ((rc = snd_pcm_status(pcm, st)) < 0) return rc;
-	return (long)snd_pcm_status_get_avail(st);
+	if ((s.rc = snd_pcm_status(pcm, st)) < 0) return s;
+	state = snd_pcm_status_get_state(st);
+	s.running = state == SND_PCM_STATE_RUNNING || state == SND_PCM_STATE_DRAINING;
+	s.delay = (long)snd_pcm_status_get_delay(st);
+	s.avail = (long)snd_pcm_status_get_avail(st);
+	return s;
 }
 
-// gw_drop is what gw_drop_counted read and did.
+// gw_drop is what gw_drop_after_status read and did.
 typedef struct {
-	long delay;
+	gw_status st;
 	long long between_ns;
-	int status_rc, drop_rc;
+	int drop_rc;
 } gw_drop;
 
-// gw_drop_counted reads the PCM's delay from its status, which counts what
-// is in flight to a USB speaker as well as what the PCM holds, then drops the
-// PCM, and reports the delay, the time between the status call's return and
-// the drop's call, during which the device played on, and each call's
-// result. A status that fails leaves the PCM not dropped.
-static gw_drop gw_drop_counted(snd_pcm_t *pcm) {
+// gw_drop_after_status reads the PCM's status, then drops the PCM, and
+// reports the status, the time between the status call's return and the
+// drop's call, during which a running device played on, and the drop's
+// result. A status that fails leaves the PCM not dropped. The OS can stop
+// the process between any two of these calls, inside the status call after
+// its snapshot or inside the drop before it stops the device too, and the
+// time measured does not see that.
+static gw_drop gw_drop_after_status(snd_pcm_t *pcm) {
 	gw_drop d = {0};
-	snd_pcm_status_t *st;
 	struct timespec a, b;
-	snd_pcm_status_alloca(&st);
-	if ((d.status_rc = snd_pcm_status(pcm, st)) < 0) return d;
+	d.st = gw_status_read(pcm);
+	if (d.st.rc < 0) return d;
 	clock_gettime(CLOCK_MONOTONIC, &a);
-	d.delay = (long)snd_pcm_status_get_delay(st);
 	clock_gettime(CLOCK_MONOTONIC, &b);
 	d.drop_rc = snd_pcm_drop(pcm);
 	d.between_ns = (long long)(b.tv_sec - a.tv_sec) * 1000000000LL + (b.tv_nsec - a.tv_nsec);
@@ -137,12 +149,17 @@ func (p *cgoPCM) writei(interleaved []int16, frames int) int {
 
 func (p *cgoPCM) recover(rc int) int { return int(C.snd_pcm_recover(p.pcm, C.int(rc), 1)) }
 func (p *cgoPCM) resume() int        { return int(C.snd_pcm_resume(p.pcm)) }
-func (p *cgoPCM) statusAvail() int   { return int(C.gw_status_avail(p.pcm)) }
 func (p *cgoPCM) avail() int         { return int(C.snd_pcm_avail(p.pcm)) }
 
-func (p *cgoPCM) dropCounted() (delay int, between time.Duration, statusRC, dropRC int) {
-	d := C.gw_drop_counted(p.pcm)
-	return int(d.delay), time.Duration(d.between_ns), int(d.status_rc), int(d.drop_rc)
+func (p *cgoPCM) status() pcmStatus { return statusOf(C.gw_status_read(p.pcm)) }
+
+func (p *cgoPCM) dropAfterStatus() (pcmStatus, time.Duration, int) {
+	d := C.gw_drop_after_status(p.pcm)
+	return statusOf(d.st), time.Duration(d.between_ns), int(d.drop_rc)
+}
+
+func statusOf(s C.gw_status) pcmStatus {
+	return pcmStatus{running: s.running != 0, delay: int(s.delay), avail: int(s.avail), rc: int(s.rc)}
 }
 func (p *cgoPCM) prepare() int    { return int(C.snd_pcm_prepare(p.pcm)) }
 func (p *cgoPCM) rewindable() int { return int(C.snd_pcm_rewindable(p.pcm)) }

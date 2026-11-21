@@ -383,7 +383,7 @@ func TestAPlaybacksFrameIsTheLastItsAudioReaches(t *testing.T) {
 	render := func(from, to, m int, next bool) run {
 		in := &outputInput{gen: &playGen{}, tails: make([]tail, 0, 4)}
 		in.setRate(from)
-		in.contrib, in.landed, in.landedBy = make([]float32, to/100), make([]uint32, 2*to/100), make([]*Playback, 2*to/100)
+		in.contrib, in.landed, in.landedBy = make([]float32, to/100), make([]uint32, 2*to/100), make([]owners, 2*to/100)
 		a := &Playback{}
 		signal := make([]int16, m)
 		for i := range signal {
@@ -807,6 +807,49 @@ func TestATakeBackComesOffEachPlaybackItTook(t *testing.T) {
 			}
 			if a, b := first.Played(), second.Played(); a != 0 || b != 0 {
 				t.Fatalf("taken-back audio still counts as played: the first playback %v, the second %v", a, b)
+			}
+		})
+	}
+}
+
+// TestATakeBackSplitsAPositionTwoPlaybacksShare fails if a stream position
+// that holds samples of two playbacks, as one 48 kHz position of a 96 kHz
+// input can hold the end of one and the start of the next, charges the whole
+// take-back of it to the later one: the first, all of it taken back, still
+// reported 10.416 µs played (Sol's review of #148 at fd1d2b6). The control
+// puts the boundary on a resampling step, where no position is shared.
+func TestATakeBackSplitsAPositionTwoPlaybacksShare(t *testing.T) {
+	for _, firstFrames := range []int{2, 1} {
+		t.Run(fmt.Sprintf("the first playback %d samples at 96 kHz", firstFrames), func(t *testing.T) {
+			stream := &probeStream{fakeStream: newFakeStream(48000)}
+			out, start, events := probeOutput(t, stream)
+			barrier := newProbeBarrier()
+			t.Cleanup(barrier.unblock)
+			ctx := testContext(t)
+			first, second := out.Begin(InputVoice), out.Begin(InputVoice)
+			format := AudioFormat{SampleRate: 96000, Channels: 1, Encoding: EncodingPCM16}
+			if err := first.Write(ctx, pcm16Bytes(make([]int16, firstFrames)), format); err != nil {
+				t.Fatal(err)
+			}
+			if err := second.Write(ctx, pcm16Bytes(make([]int16, 960-firstFrames)), format); err != nil {
+				t.Fatal(err)
+			}
+			stream.before = func(n int, _ []int16) {
+				if n == 3 {
+					barrier.hold()
+				}
+			}
+			stream.drop = func() (int, error) { return 3 * 480, nil }
+			start()
+			probeWait(t, barrier.entered, "all the resampled output queued")
+			if first.Played() == 0 || second.Played() == 0 {
+				t.Fatalf("control: before the take-back the playbacks played %v and %v", first.Played(), second.Played())
+			}
+			out.Cancel(InputVoice)
+			barrier.unblock()
+			end := probeVoiceEvent(t, events, false)
+			if a, b := first.Played(), second.Played(); a != 0 || b != 0 {
+				t.Fatalf("all of it taken back, the first playback played %v and the second %v (the speech %v)", a, b, end.Played)
 			}
 		})
 	}
