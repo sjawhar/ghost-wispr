@@ -24,8 +24,9 @@ readonly RECHECK_EVERY=120 ROLLBACK_READS=3
 # (TimeoutStartSec=30min; deploy/pi/update_test.sh checks the two agree). A restart of the recorder
 # takes at most RESTART_WORST: its main process's stop (TimeoutStopSec=90s), light-off after it
 # (ExecStopPost, bounded at 15 s by `timeout`; unbounded, it would add another 90 s), and its start
-# (TimeoutStartSec=5min, its waits included); update_test.sh checks this against systemd's own
-# reading of the recorder unit. Every step at its worst ends well inside
+# (TimeoutStartSec=5min, its waits included). update_test.sh holds both units to one form (each
+# timeout set once, in whole seconds or minutes; light-off only under `timeout -k`; no drop-in) and
+# computes UNIT_LIMIT and RESTART_WORST from them. Every step at its worst ends well inside
 # the limit: 10 s status read, 30 s release lookup, 10 s version read, 300 + 60 s download, 10 s
 # status read, a restart, the 120 s version wait, a 10 s status read and the rollback's restart:
 # about 1360 s. A rollback whose recorder's state it cannot read waits for another read only while

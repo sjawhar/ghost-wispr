@@ -15,7 +15,8 @@ ExecStart=/opt/ghost-wispr/ghost-wispr
 # Longer than both waits together; the user manager's default is 90 s.
 TimeoutStartSec=5min
 # The user manager's default, set here so the update's restart bound (deploy/pi/update.sh's
-# RESTART_WORST) depends on no manager's configuration.
+# RESTART_WORST) depends on no manager's configuration. update_test.sh requires each timeout here
+# set once, in whole seconds or minutes, and each ExecStopPost= under `timeout -k Ns Ms`.
 TimeoutStopSec=90s
 # Bounded, so a restart is bounded: light-off waits at most 2 s for the light's lock, and a light
 # that hangs gets SIGTERM at 10 s and SIGKILL 5 s later, not the stop's own 90 s on top of the
