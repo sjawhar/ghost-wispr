@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/sjawhar/ghost-wispr/internal/logging"
+	"github.com/sjawhar/ghost-wispr/internal/monoclock"
 	"github.com/sjawhar/ghost-wispr/internal/storage"
 	"github.com/sjawhar/ghost-wispr/internal/transcribe"
 )
@@ -326,7 +327,8 @@ func (h *Hub) BroadcastVoiceEvent(kind, sessionID string) {
 		h.logger.Warn("dropped an unknown voice event", "operation", "broadcast_voice_event", "event_type", kind)
 		return
 	}
-	h.broadcastEvent(VoiceEvent{Event: newEvent(kind, time.Now().UTC()), SessionID: sessionID})
+	now := monoclock.Now()
+	h.broadcastEvent(VoiceEvent{Event: newEvent(kind, now.Wall.UTC()), SessionID: sessionID, AtMonoNs: now.Mono})
 }
 
 // storedEventTypes is the set of event types persisted to the event queue.

@@ -7,15 +7,19 @@ import (
 	"errors"
 	"io"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	api "github.com/deepgram/deepgram-go-sdk/v3/pkg/api/listen/v1/websocket/interfaces"
+
 	"github.com/sjawhar/ghost-wispr/internal/audio"
 	"github.com/sjawhar/ghost-wispr/internal/concierge"
 	"github.com/sjawhar/ghost-wispr/internal/config"
 	"github.com/sjawhar/ghost-wispr/internal/logging"
+	"github.com/sjawhar/ghost-wispr/internal/monoclock"
 	"github.com/sjawhar/ghost-wispr/internal/voice"
 	"github.com/sjawhar/ghost-wispr/internal/voice/dgagent"
 	"github.com/sjawhar/ghost-wispr/internal/voice/gptlive"
@@ -299,18 +303,86 @@ func TestALazyConciergeThatCannotStartAnswersUnreachable(t *testing.T) {
 
 // TestVoiceTimingIsLogged fails if a timing event does not reach the journal
 // as the acceptance driver reads it: through logging.New, the logger the
-// service writes its journal with, as message "voice timing".
+// service writes its journal with, as message "voice timing", with its time on
+// the wall clock and, exactly, the CLOCK_MONOTONIC reading taken with it
+// (at_mono_ns), which the driver compares with its own reads of that clock. A
+// Stamp with no monotonic reading has no at_mono_ns, rather than one its wall
+// clock would place.
 func TestVoiceTimingIsLogged(t *testing.T) {
-	var buf bytes.Buffer
-	logger := logging.New(&buf, logging.ParseLevel("info"))
-	at := time.Date(2026, 11, 19, 9, 0, 0, 5, time.UTC)
-	voiceTiming(logger)("stop", "s1", at, "reason", "Jabra button")
-	var line map[string]any
-	if err := json.Unmarshal(buf.Bytes(), &line); err != nil {
-		t.Fatalf("%v: %s", err, buf.Bytes())
+	now := monoclock.Now()
+	for name, tc := range map[string]struct {
+		at   monoclock.Stamp
+		mono bool
+	}{
+		"monoclock.Now":    {now, true},
+		"no clock reading": {monoclock.Stamp{Wall: time.Date(2026, 11, 19, 9, 0, 0, 5, time.UTC)}, false},
+	} {
+		var buf bytes.Buffer
+		logger := logging.New(&buf, logging.ParseLevel("info"))
+		voiceTiming(logger)("stop", "s1", tc.at, "reason", "Jabra button")
+		var line map[string]any
+		dec := json.NewDecoder(&buf)
+		dec.UseNumber()
+		if err := dec.Decode(&line); err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		if line["message"] != "voice timing" || line["event"] != "stop" || line["session_id"] != "s1" || line["reason"] != "Jabra button" || line["at_unix_ns"] != json.Number(strconv.FormatInt(tc.at.Wall.UnixNano(), 10)) {
+			t.Fatalf("%s: logged %v", name, line)
+		}
+		mono, has := line["at_mono_ns"]
+		if has != tc.mono {
+			t.Fatalf("%s: at_mono_ns %v, want one: %v; logged %v", name, mono, tc.mono, line)
+		}
+		if has && mono != json.Number(strconv.FormatInt(tc.at.Mono, 10)) {
+			t.Fatalf("%s: at_mono_ns %v, want the Stamp's own %d", name, mono, tc.at.Mono)
+		}
 	}
-	if line["message"] != "voice timing" || line["event"] != "stop" || line["session_id"] != "s1" || line["reason"] != "Jabra button" || line["at_unix_ns"] != float64(at.UnixNano()) {
-		t.Fatalf("logged %s", buf.Bytes())
+}
+
+// stampsHeard is the voice as the transcript callback feeds it, keeping what
+// it was given.
+type stampsHeard struct {
+	transcripts []*voice.Transcript
+	ends        []monoclock.Stamp
+}
+
+func (h *stampsHeard) OnTranscript(t *voice.Transcript) { h.transcripts = append(h.transcripts, t) }
+func (h *stampsHeard) OnUtteranceEnd(_ int, _ bool, at monoclock.Stamp) {
+	h.ends = append(h.ends, at)
+}
+
+// TestVoiceTranscriptCarriesTheMonotonicClockReadWithAt fails if the voice's
+// transcript of a Deepgram result, or its UtteranceEnd, does not carry
+// CLOCK_MONOTONIC read with its wall time, when the callback began handling
+// it: the voice logs them as wake_heard's and turn_signal's at_mono_ns, which
+// the acceptance driver compares with its own reads of that clock.
+func TestVoiceTranscriptCarriesTheMonotonicClockReadWithAt(t *testing.T) {
+	var mr api.MessageResponse
+	mr.IsFinal = true
+	mr.Channel.Alternatives = []api.Alternative{{Transcript: "Wispr, hello"}}
+	heard := &stampsHeard{}
+	c := transcriptCallback{voice: heard}
+	base := monoclock.Now()
+	before := monoclock.Read()
+	if err := c.Message(&mr); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.UtteranceEnd(&api.UtteranceEndResponse{}); err != nil {
+		t.Fatal(err)
+	}
+	after := monoclock.Read()
+	if len(heard.transcripts) != 1 || len(heard.ends) != 1 {
+		t.Fatalf("the voice heard %d transcripts and %d UtteranceEnds, want 1 of each", len(heard.transcripts), len(heard.ends))
+	}
+	tr := heard.transcripts[0]
+	for what, at := range map[string]monoclock.Stamp{"the transcript": {Wall: tr.At, Mono: tr.Mono}, "the UtteranceEnd": heard.ends[0]} {
+		if at.Mono < before || at.Mono > after {
+			t.Fatalf("%s: Mono %d, outside the reads %d and %d around the callbacks", what, at.Mono, before, after)
+		}
+		wall, mono := at.Wall.Sub(base.Wall), time.Duration(at.Mono-base.Mono)
+		if d := wall - mono; d > time.Millisecond || d < -time.Millisecond {
+			t.Fatalf("%s: %v after the test's reading on the wall clock, %v on CLOCK_MONOTONIC: not read together", what, wall, mono)
+		}
 	}
 }
 

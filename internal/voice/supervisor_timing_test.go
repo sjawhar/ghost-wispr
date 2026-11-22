@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/sjawhar/ghost-wispr/internal/audio"
+	"github.com/sjawhar/ghost-wispr/internal/monoclock"
 )
 
 // TestEveryTimingEventOfTheFirstExchangeNamesItsSession fails if a timing
@@ -38,9 +39,9 @@ func TestEveryTimingEventOfTheFirstExchangeNamesItsSession(t *testing.T) {
 		}
 		switch l.event {
 		case "wake_heard":
-			wakeAt = l.at
+			wakeAt = l.at.Wall
 		case "turn_end":
-			turnAt = l.at
+			turnAt = l.at.Wall
 		}
 	}
 	if !wakeAt.Before(turnAt) {
@@ -100,9 +101,10 @@ func TestTurnEndNamesTheSignalItActedOn(t *testing.T) {
 		}},
 		{"utterance_end", func(r *rig) time.Time {
 			r.heard("Wispr, what is happening?", true, false)
-			at := time.Now().Add(-150 * time.Millisecond)
+			now := monoclock.Now()
+			at := monoclock.Stamp{Wall: now.Wall.Add(-150 * time.Millisecond), Mono: now.Mono - int64(150*time.Millisecond)}
 			r.s.OnUtteranceEnd(0, true, at)
-			return at
+			return at.Wall
 		}},
 		{"turn_wait", func(r *rig) time.Time {
 			r.heard("Wispr, what is happening?", true, false)
@@ -135,13 +137,13 @@ func TestTurnEndNamesTheSignalItActedOn(t *testing.T) {
 				t.Fatalf("turn_signal carries %v for session %q, want [kind %s] for sess-1", s.kv, s.sessionID, tc.kind)
 			}
 			if tc.kind == "turn_wait" {
-				if s.at.Before(at.Add(-50*time.Millisecond)) || s.at.After(turnEnd.at) {
-					t.Fatalf("turn_signal at %v, want when the turn wait ran out (about %v), no later than turn_end at %v", s.at, at, turnEnd.at)
+				if s.at.Wall.Before(at.Add(-50*time.Millisecond)) || s.at.Wall.After(turnEnd.at.Wall) {
+					t.Fatalf("turn_signal at %v, want when the turn wait ran out (about %v), no later than turn_end at %v", s.at.Wall, at, turnEnd.at.Wall)
 				}
 				return
 			}
-			if !s.at.Equal(at) {
-				t.Fatalf("turn_signal at %v, want %v, when the %s arrived", s.at, at, tc.kind)
+			if !s.at.Wall.Equal(at) {
+				t.Fatalf("turn_signal at %v, want %v, when the %s arrived", s.at.Wall, at, tc.kind)
 			}
 		})
 	}
@@ -163,7 +165,8 @@ func TestATimingEventAfterItsExchangeEndedNamesNoLaterSession(t *testing.T) {
 	r.setSession("later-session")
 	// A first frame written before the end, reported once the lock is free.
 	r.s.mu.Lock()
-	r.s.exTimingLocked(ex, "wake_chime_queued", time.Now().Add(-time.Second))
+	now := monoclock.Now()
+	r.s.exTimingLocked(ex, "wake_chime_queued", monoclock.Stamp{Wall: now.Wall.Add(-time.Second), Mono: now.Mono - int64(time.Second)})
 	r.s.mu.Unlock()
 	for _, l := range r.timingLines() {
 		if l.sessionID != "" {
@@ -210,9 +213,9 @@ func TestTheEndOfSpeechNamesTheSessionItsSpeechWasIn(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			r := newRig(t, newFakeConcierge())
 			r.setSession(tc.startSession)
-			r.s.onSpeech(audio.SpeechEvent{Input: audio.InputVoice, Started: true, At: time.Now()})
+			r.s.onSpeech(&audio.SpeechEvent{Input: audio.InputVoice, Started: true, At: time.Now()})
 			r.setSession("later-session")
-			r.s.onSpeech(audio.SpeechEvent{Input: audio.InputVoice, At: time.Now()})
+			r.s.onSpeech(&audio.SpeechEvent{Input: audio.InputVoice, At: time.Now()})
 			waitTimings(t, r, "speech_end")
 			for _, l := range r.timingLines() {
 				if l.event == "speech_end" && l.sessionID != tc.want {
@@ -355,7 +358,7 @@ func TestTheExchangeTakesTheSessionThatStartedAfterItOpened(t *testing.T) {
 	t.Run("a speech event before A's hook", func(t *testing.T) {
 		r, _ := open(t)
 		aThenB(r)
-		r.s.onSpeech(audio.SpeechEvent{Input: audio.InputVoice, Started: true, At: time.Now()})
+		r.s.onSpeech(&audio.SpeechEvent{Input: audio.InputVoice, Started: true, At: time.Now()})
 		r.s.SessionStarted("sess-a", 2) // late: the exchange is bound already
 		all(t, r, "sess-a")
 	})

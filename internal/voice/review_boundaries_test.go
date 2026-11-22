@@ -66,8 +66,8 @@ func TestReviewFloorSpanBoundaries(t *testing.T) {
 				owner = ex
 			}
 			at := now.Add(-5 * time.Second).Add(tc.offset)
-			s.onSpeech(audio.SpeechEvent{Input: audio.InputVoice, Started: true, At: at, Owner: owner})
-			s.onSpeech(audio.SpeechEvent{Input: audio.InputVoice, At: at.Add(time.Nanosecond), Played: time.Nanosecond, Owner: owner})
+			s.onSpeech(&audio.SpeechEvent{Input: audio.InputVoice, Started: true, At: at, Owner: owner})
+			s.onSpeech(&audio.SpeechEvent{Input: audio.InputVoice, At: at.Add(time.Nanosecond), Played: time.Nanosecond, Owner: owner})
 			for _, ex := range []*exchange{a, b, c} {
 				if ex.notified[EventSpoken] != (ex.x.SessionID == tc.want) {
 					t.Fatalf("exchange %s spoken=%v, want owner %q", ex.x.SessionID, ex.notified[EventSpoken], tc.want)
@@ -86,8 +86,8 @@ func TestReviewFloorThirtySecondRetention(t *testing.T) {
 			s := boundarySupervisor(t)
 			defer stopTimers(a, b)
 			at := now.Add(-age)
-			s.onSpeech(audio.SpeechEvent{Input: audio.InputVoice, Started: true, At: at, Owner: a})
-			s.onSpeech(audio.SpeechEvent{Input: audio.InputVoice, At: at.Add(time.Microsecond), Played: time.Microsecond, Owner: a})
+			s.onSpeech(&audio.SpeechEvent{Input: audio.InputVoice, Started: true, At: at, Owner: a})
+			s.onSpeech(&audio.SpeechEvent{Input: audio.InputVoice, At: at.Add(time.Microsecond), Played: time.Microsecond, Owner: a})
 			if !a.notified[EventSpoken] || b.notified[EventSpoken] {
 				t.Fatalf("age=%v a spoken=%v b spoken=%v, want true, false", age, a.notified[EventSpoken], b.notified[EventSpoken])
 			}
@@ -106,8 +106,8 @@ func TestReviewOldStartOnOpenOrRecentlyClosedSpan(t *testing.T) {
 				s.ex = ex
 			}
 			at := now.Add(-45 * time.Second)
-			s.onSpeech(audio.SpeechEvent{Input: audio.InputVoice, Started: true, At: at, Owner: ex})
-			s.onSpeech(audio.SpeechEvent{Input: audio.InputVoice, At: at.Add(time.Second), Played: time.Second, Owner: ex})
+			s.onSpeech(&audio.SpeechEvent{Input: audio.InputVoice, Started: true, At: at, Owner: ex})
+			s.onSpeech(&audio.SpeechEvent{Input: audio.InputVoice, At: at.Add(time.Second), Played: time.Second, Owner: ex})
 			if !ex.notified[EventSpoken] {
 				t.Fatal("old start was not reported spoken")
 			}
@@ -129,7 +129,7 @@ func TestALateStartOfAnEndedExchangeTimesNothing(t *testing.T) {
 			s.logf = func(format string, args ...any) { logged = append(logged, format) }
 			ex := &exchange{x: Exchange{SessionID: "a"}, drives: true, ended: ended, notified: map[string]bool{}, turnAt: time.Now().Add(-time.Second)}
 			defer stopTimers(ex)
-			s.onSpeech(audio.SpeechEvent{Input: audio.InputVoice, Started: true, At: time.Now(), Owner: ex})
+			s.onSpeech(&audio.SpeechEvent{Input: audio.InputVoice, Started: true, At: time.Now(), Owner: ex})
 			if got := slices.Contains(logged, "voice: first spoken audio %v after the turn ended"); got == ended || ex.firstOutDone == ended {
 				t.Fatalf("first audio logged: %v, timed: %v; want both %v", got, ex.firstOutDone, !ended)
 			}

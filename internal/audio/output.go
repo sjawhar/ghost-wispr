@@ -9,6 +9,8 @@ import (
 	"slices"
 	"sync"
 	"time"
+
+	"github.com/sjawhar/ghost-wispr/internal/monoclock"
 )
 
 // Inputs the Output mixes. Any other name makes an input of its own. While
@@ -135,6 +137,9 @@ type SpeechEvent struct {
 	// to alsaBuffer on Linux). A speech the stream took no audio of, as one
 	// cut before its first frame was written, has no events.
 	At time.Time
+	// AtMono is CLOCK_MONOTONIC in nanoseconds, read with At (monoclock), for
+	// the voice's timing log; 0 when it could not be read.
+	AtMono int64
 	// Played, on an end, is how much of the input's audio the stream took in
 	// the speech, less what a Cancel took back from the device.
 	Played time.Duration
@@ -142,8 +147,8 @@ type SpeechEvent struct {
 	// (Begin), on its start and on its end, whatever ended it: a cut, its
 	// end, or the stream's close. A listener tells whose speech an event is
 	// from it, not from when the event comes. Nil for a playback begun with
-	// none. The two flags sit together so the event stays under 80 bytes,
-	// which the listeners take by value.
+	// none. The event is 80 bytes with AtMono: the Output and the Supervisor
+	// pass it on by pointer, and each listener gets its own copy.
 	Owner any
 }
 
@@ -203,6 +208,10 @@ type Output struct {
 	// fns is its listeners' list, kept between deliveries.
 	deliverMu sync.Mutex
 	fns       []func(SpeechEvent)
+	// nowMono is CLOCK_MONOTONIC, read right after the time.Now of the step
+	// under way (next, endAll, retake, closeIdle), for the SpeechEvents it
+	// reports with that time.
+	nowMono int64
 }
 
 // outputInput is one input's queue and its part in the mix. The Output's mu
@@ -244,6 +253,7 @@ type outputInput struct {
 	startFrame   uint64
 	startPending bool
 	startedAt    time.Time
+	startedMono  int64 // CLOCK_MONOTONIC read with startedAt
 
 	// takenFrame is the newest frame with its speech's audio that the
 	// stream has taken (wrote), and takenAt when. A speech ends once the
@@ -251,6 +261,7 @@ type outputInput struct {
 	// held in endEvent while endPending, waits for the write of endFrame.
 	takenFrame uint64
 	takenAt    time.Time
+	takenMono  int64 // CLOCK_MONOTONIC read with takenAt
 	endPending bool
 	endFrame   uint64
 	endEvent   SpeechEvent
@@ -642,6 +653,7 @@ func (o *Output) stopForTeardown() {
 // holds mu.
 func (o *Output) endAll(err error) {
 	now := time.Now()
+	o.nowMono = monoclock.Read()
 	for _, in := range o.order {
 		in.end(err)
 		o.endSpeech(in, now, true)
@@ -1029,6 +1041,7 @@ func (o *Output) mix(stream PlaybackStream, rate int) error {
 		// When the stream took the frame, before anything that can wait: the
 		// underrun callback, or the Output's lock.
 		took := time.Now()
+		tookMono := monoclock.Read()
 		if lost := again(); lost > 0 {
 			// The frame and some before it the device discarded: they play
 			// again before the frame counts as taken, and the stream took
@@ -1037,7 +1050,7 @@ func (o *Output) mix(stream PlaybackStream, rate int) error {
 			if err != nil {
 				return err
 			}
-			took = at
+			took, tookMono = at.Wall, at.Mono
 		}
 		if counter != nil && o.cfg.Underrun != nil {
 			if n := counter.underruns(); n > underruns {
@@ -1045,7 +1058,7 @@ func (o *Output) mix(stream PlaybackStream, rate int) error {
 				o.cfg.Underrun()
 			}
 		}
-		o.wrote(seq, took)
+		o.wrote(seq, took, tookMono)
 		p.wrote(took.Sub(began), took)
 		if active {
 			quiet = 0
@@ -1062,9 +1075,9 @@ func (o *Output) mix(stream PlaybackStream, rate int) error {
 // device's audio again, and a discard during it is written again too, with
 // what of the replay was left unwritten. A speech whose last audio is
 // replayed was taken, last, at that write (replayed). It returns when its
-// last write returned, read before anything that can wait.
-func (o *Output) replay(stream PlaybackStream, redo []int16, sum []float32, n, back int, again func() int) (time.Time, error) {
-	var last time.Time
+// last write returned, on both clocks, read before anything that can wait.
+func (o *Output) replay(stream PlaybackStream, redo []int16, sum []float32, n, back int, again func() int) (monoclock.Stamp, error) {
+	var last monoclock.Stamp
 	for {
 		if back > len(redo) {
 			slog.Warn("speaker stream took back more than the Output keeps; the rest of the other inputs is lost", "frames", back, "kept", len(redo))
@@ -1077,8 +1090,8 @@ func (o *Output) replay(stream PlaybackStream, redo []int16, sum []float32, n, b
 			if err := stream.Write(redo[off:end]); err != nil {
 				return last, fmt.Errorf("write speaker stream: %w", err)
 			}
-			last = time.Now()
-			o.replayed(back, off, end, last)
+			last = monoclock.Now()
+			o.replayed(back, off, end, last.Wall, last.Mono)
 			off, lost = end, again()
 			drop = lost == 0 && end < back && o.takeDrop()
 		}
@@ -1098,18 +1111,19 @@ func (o *Output) replay(stream PlaybackStream, redo []int16, sum []float32, n, b
 	}
 }
 
-// replayed records that the stream has taken again, at now, the samples off
-// to end of the last back samples it took back (Drop) or that it discarded
-// by itself: a speech whose last audio was among them was taken, last, only
-// then (endSpeech). A speech whose last audio came earlier in the replay
-// keeps that write's time: the replay's silence after it is not its speech.
-func (o *Output) replayed(back, off, end int, now time.Time) {
+// replayed records that the stream has taken again, at now (nowMono on
+// CLOCK_MONOTONIC), the samples off to end of the last back samples it took
+// back (Drop) or that it discarded by itself: a speech whose last audio was
+// among them was taken, last, only then (endSpeech). A speech whose last
+// audio came earlier in the replay keeps that write's time: the replay's
+// silence after it is not its speech.
+func (o *Output) replayed(back, off, end int, now time.Time, nowMono int64) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	from := o.pos - int64(back)
 	for _, in := range o.order {
 		if in.speaking && in.takenFrame >= in.lastFrame && in.audioTo > from+int64(off) && in.audioTo <= from+int64(end) {
-			in.takenAt = now
+			in.takenAt, in.takenMono = now, nowMono
 		}
 	}
 }
@@ -1162,6 +1176,7 @@ func (o *Output) next(frame []int16, sum []float32, rate, hist int, idleSince *t
 	o.lockForMix()
 	defer o.mu.Unlock()
 	now := time.Now()
+	o.nowMono = monoclock.Read()
 	if o.closeNow {
 		o.endSpeeches(now, false)
 		return stepClose, 0, false
@@ -1193,7 +1208,9 @@ func (o *Output) next(frame []int16, sum []float32, rate, hist int, idleSince *t
 func (o *Output) closeIdle() {
 	o.mu.Lock()
 	defer o.mu.Unlock()
-	o.endSpeeches(time.Now(), false)
+	now := time.Now()
+	o.nowMono = monoclock.Read()
+	o.endSpeeches(now, false)
 	for _, in := range o.order {
 		if in.idle() {
 			in.last = nil
@@ -1217,9 +1234,9 @@ func (o *Output) takeDrop() bool {
 	return drop
 }
 
-// wrote records that the stream has taken frame seq, at at, and wakes every
-// Write and Drain that waits.
-func (o *Output) wrote(seq uint64, at time.Time) {
+// wrote records that the stream has taken frame seq, at at (atMono on
+// CLOCK_MONOTONIC), and wakes every Write and Drain that waits.
+func (o *Output) wrote(seq uint64, at time.Time, atMono int64) {
 	o.lockForMix()
 	defer o.mu.Unlock()
 	o.written = seq
@@ -1232,32 +1249,32 @@ func (o *Output) wrote(seq uint64, at time.Time) {
 	now := at
 	for _, in := range o.order {
 		if in.takenFrame < in.lastFrame && in.lastFrame <= seq {
-			in.takenFrame, in.takenAt = in.lastFrame, now
+			in.takenFrame, in.takenAt, in.takenMono = in.lastFrame, now, atMono
 		}
 		if in.endPending && in.endFrame <= seq {
-			o.emitEndLocked(in, now)
+			o.emitEndLocked(in, now, atMono)
 		}
 		// A speech whose first audio the stream took before a Cancel came
 		// started, however late the mixer records it; one Cancel cut while
 		// the stream held that audio never started.
 		if in.startPending && in.startFrame <= seq && (!in.cancelled || in.cancelAt.After(at)) {
-			in.startPending, in.startedAt = false, now
-			o.emit(SpeechEvent{Input: in.name, Started: true, At: now, Owner: in.owner})
+			in.startPending, in.startedAt, in.startedMono = false, now, atMono
+			o.emit(&SpeechEvent{Input: in.name, Started: true, At: now, AtMono: atMono, Owner: in.owner})
 		}
 	}
 	o.changed()
 }
 
-// emitEndLocked reports in's pending speech end as at, never before its
-// start. The caller holds mu.
-func (o *Output) emitEndLocked(in *outputInput, at time.Time) {
+// emitEndLocked reports in's pending speech end as at (atMono on
+// CLOCK_MONOTONIC), never before its start. The caller holds mu.
+func (o *Output) emitEndLocked(in *outputInput, at time.Time, atMono int64) {
 	e := in.endEvent
 	in.endPending, in.endEvent = false, SpeechEvent{}
-	e.At = at
+	e.At, e.AtMono = at, atMono
 	if e.At.Before(in.startedAt) {
-		e.At = in.startedAt
+		e.At, e.AtMono = in.startedAt, in.startedMono
 	}
-	o.emit(e)
+	o.emit(&e)
 }
 
 // mixFrame mixes the inputs' next frame into frame, keeps each one's part in
@@ -1392,6 +1409,7 @@ func (o *Output) retake(redo []int16, sum []float32) {
 	defer o.mu.Unlock()
 	back := len(redo)
 	now := time.Now()
+	o.nowMono = monoclock.Read()
 	for _, in := range o.order {
 		if !in.cancelled {
 			continue
@@ -1444,7 +1462,7 @@ func (o *Output) endSpeeches(now time.Time, cancelled bool) {
 	for _, in := range o.order {
 		o.endSpeech(in, now, cancelled)
 		if in.endPending { // the stream closes: its last audio is not taken
-			o.emitEndLocked(in, now)
+			o.emitEndLocked(in, now, o.nowMono)
 		}
 	}
 }
@@ -1463,9 +1481,9 @@ func (o *Output) endSpeech(in *outputInput, now time.Time, cancelled bool) {
 		in.endPending = true
 		switch {
 		case cancelled:
-			o.emitEndLocked(in, now)
+			o.emitEndLocked(in, now, o.nowMono)
 		case in.takenFrame >= in.lastFrame:
-			o.emitEndLocked(in, in.takenAt)
+			o.emitEndLocked(in, in.takenAt, in.takenMono)
 		default:
 			in.endFrame = in.lastFrame
 		}
@@ -1491,9 +1509,9 @@ func clip(s float32) int16 {
 	}
 }
 
-// emit queues e for the listeners. The caller holds mu.
-func (o *Output) emit(e SpeechEvent) {
-	o.events = append(o.events, e)
+// emit queues a copy of e for the listeners. The caller holds mu.
+func (o *Output) emit(e *SpeechEvent) {
+	o.events = append(o.events, *e)
 	signal(o.eventWake)
 }
 

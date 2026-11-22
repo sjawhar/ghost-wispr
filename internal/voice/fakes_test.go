@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/sjawhar/ghost-wispr/internal/audio"
+	"github.com/sjawhar/ghost-wispr/internal/monoclock"
 )
 
 const testWait = 2 * time.Second
@@ -250,7 +251,8 @@ func (s *fakeSpeaker) Cancel(input string) {
 		s.finished[input] = nil
 	}
 	if s.speaking[input] {
-		s.queueLocked(audio.SpeechEvent{Input: input, Started: false, At: time.Now(), Cancelled: true, Owner: s.owners[input]})
+		now := monoclock.Now()
+		s.queueLocked(&audio.SpeechEvent{Input: input, Started: false, At: now.Wall, AtMono: now.Mono, Cancelled: true, Owner: s.owners[input]})
 	}
 	s.speaking[input] = false
 	delete(s.owners, input)
@@ -271,18 +273,18 @@ func (s *fakeSpeaker) OnSpeech(fn func(audio.SpeechEvent)) func() {
 	}
 }
 
-// emit queues e for the listeners.
-func (s *fakeSpeaker) emit(e audio.SpeechEvent) {
+// emit queues a copy of e for the listeners.
+func (s *fakeSpeaker) emit(e *audio.SpeechEvent) {
 	s.mu.Lock()
 	s.queueLocked(e)
 	s.mu.Unlock()
 	s.signal()
 }
 
-// queueLocked queues e under s.mu, in one step with the state change it
-// reports, as audio.Output does; signal then wakes the delivery.
-func (s *fakeSpeaker) queueLocked(e audio.SpeechEvent) {
-	s.queued = append(s.queued, e)
+// queueLocked queues a copy of e under s.mu, in one step with the state
+// change it reports, as audio.Output does; signal then wakes the delivery.
+func (s *fakeSpeaker) queueLocked(e *audio.SpeechEvent) {
+	s.queued = append(s.queued, *e)
 }
 
 func (s *fakeSpeaker) signal() {
@@ -335,7 +337,8 @@ func (s *fakeSpeaker) drain(input string) {
 func (s *fakeSpeaker) endSpeech(input string) {
 	s.mu.Lock()
 	if s.speaking[input] {
-		s.queueLocked(audio.SpeechEvent{Input: input, Started: false, At: time.Now(), Owner: s.owners[input]})
+		now := monoclock.Now()
+		s.queueLocked(&audio.SpeechEvent{Input: input, Started: false, At: now.Wall, AtMono: now.Mono, Owner: s.owners[input]})
 	}
 	s.speaking[input] = false
 	delete(s.owners, input)
@@ -389,7 +392,8 @@ func (p *fakePlayback) Write(ctx context.Context, frame []byte, format audio.Aud
 	}
 	if !s.speaking[p.input] {
 		s.owners[p.input] = p.owner // the speech is this playback's owner's, as audio.Output's is
-		s.queueLocked(audio.SpeechEvent{Input: p.input, Started: true, At: time.Now(), Owner: p.owner})
+		now := monoclock.Now()
+		s.queueLocked(&audio.SpeechEvent{Input: p.input, Started: true, At: now.Wall, AtMono: now.Mono, Owner: p.owner})
 	}
 	s.speaking[p.input] = true
 	s.mu.Unlock()
@@ -801,13 +805,14 @@ type rig struct {
 	start      float64           // the next transcript's socket time
 	timings    []string
 	timingAt   map[string]time.Time
+	timingMono map[string]int64
 	lines      []timingLine
 }
 
 // timingLine is one timing event as the Supervisor reported it.
 type timingLine struct {
 	event, sessionID string
-	at               time.Time
+	at               monoclock.Stamp
 	kv               []any
 }
 
@@ -875,17 +880,18 @@ func newRigWith(t *testing.T, c *fakeConcierge, change func(*SupervisorConfig, *
 	return r
 }
 
-// timing records the Supervisor's timing events, and when each said it was.
-func (r *rig) timing(event, sessionID string, at time.Time, kv ...any) {
+// timing records the Supervisor's timing events, and when each said it was,
+// on both clocks.
+func (r *rig) timing(event, sessionID string, at monoclock.Stamp, kv ...any) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.timings = append(r.timings, event)
 	r.lines = append(r.lines, timingLine{event: event, sessionID: sessionID, at: at, kv: kv})
 	if r.timingAt == nil {
-		r.timingAt = map[string]time.Time{}
+		r.timingAt, r.timingMono = map[string]time.Time{}, map[string]int64{}
 	}
 	if _, ok := r.timingAt[event]; !ok {
-		r.timingAt[event] = at
+		r.timingAt[event], r.timingMono[event] = at.Wall, at.Mono
 	}
 }
 
@@ -918,6 +924,14 @@ func (r *rig) startSession(id string) uint64 {
 	r.mu.Unlock()
 	r.s.SessionStarted(id, seq)
 	return seq
+}
+
+// timingMonoOf is timing event's first CLOCK_MONOTONIC reading, 0 if it did
+// not come.
+func (r *rig) timingMonoOf(event string) int64 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.timingMono[event]
 }
 
 // timingOf is when timing event first said it was, zero if it did not come.
@@ -971,7 +985,8 @@ func (r *rig) heard(text string, final, speechFinal bool) {
 }
 
 func transcriptOf(text string, start float64, final, speechFinal bool, closings int) Transcript {
-	t := Transcript{Text: text, IsFinal: final, SpeechFinal: speechFinal, Closings: closings, GateOpen: true, At: time.Now()}
+	now := monoclock.Now()
+	t := Transcript{Text: text, IsFinal: final, SpeechFinal: speechFinal, Closings: closings, GateOpen: true, At: now.Wall, Mono: now.Mono}
 	for i, w := range strings.Fields(text) {
 		ws := start + 0.2*float64(i)
 		t.Words = append(t.Words, Word{Text: w, Speaker: 0, Start: ws, End: ws + 0.15})
@@ -1115,7 +1130,7 @@ func TestHoldEventsStopsTheFakeSpeakersOwnDelivery(t *testing.T) {
 	s.mu.Lock()
 	s.barrier = b
 	s.mu.Unlock()
-	s.emit(audio.SpeechEvent{Input: "before", Started: true})
+	s.emit(&audio.SpeechEvent{Input: "before", Started: true})
 	select {
 	case <-b.entered: // the speaker's own delivery has begun
 	case <-time.After(testWait):
@@ -1123,7 +1138,7 @@ func TestHoldEventsStopsTheFakeSpeakersOwnDelivery(t *testing.T) {
 	}
 	release := s.holdEvents()
 	defer release()
-	s.emit(audio.SpeechEvent{Input: "after", Started: true})
+	s.emit(&audio.SpeechEvent{Input: "after", Started: true})
 	letGo()
 	select {
 	case <-b.returned:
@@ -1168,7 +1183,7 @@ func TestAHoldAfterTheDeliveryWaitsOnItsLockHoldsTheEvent(t *testing.T) {
 	s.deliverMu.Lock()
 	unlock := sync.OnceFunc(s.deliverMu.Unlock)
 	t.Cleanup(unlock)
-	s.emit(audio.SpeechEvent{Input: "before", Started: true})
+	s.emit(&audio.SpeechEvent{Input: "before", Started: true})
 	select {
 	case <-b.entered:
 	case <-time.After(testWait):
@@ -1190,7 +1205,7 @@ func TestAHoldAfterTheDeliveryWaitsOnItsLockHoldsTheEvent(t *testing.T) {
 	})
 	release := s.holdEvents()
 	defer release()
-	s.emit(audio.SpeechEvent{Input: "after", Started: true})
+	s.emit(&audio.SpeechEvent{Input: "after", Started: true})
 	unlock()
 	select {
 	case <-b.returned:

@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/sjawhar/ghost-wispr/internal/config"
+	"github.com/sjawhar/ghost-wispr/internal/monoclock"
 	"github.com/sjawhar/ghost-wispr/internal/voice"
 	"github.com/sjawhar/ghost-wispr/internal/wake/transcript"
 )
@@ -21,7 +22,7 @@ func TestTheVoiceLinkIsInertUntilTheVoiceStarts(t *testing.T) {
 	link.GateClosed(1)
 	link.Stop("Jabra button")
 	link.OnTranscript(&voice.Transcript{Text: "Wispr, hello", GateOpen: true})
-	link.OnUtteranceEnd(0, true, time.Now())
+	link.OnUtteranceEnd(0, true, monoclock.Now())
 	if err := link.WithFloor(t.Context(), func() {}); err != nil {
 		t.Fatalf("WithFloor with no voice: %v", err)
 	}
@@ -96,7 +97,7 @@ func (c *closingsHeard) Stop(reason string) {
 	c.stops = append(c.stops, reason)
 }
 func (*closingsHeard) OnTranscript(*voice.Transcript)                  {}
-func (*closingsHeard) OnUtteranceEnd(int, bool, time.Time)             {}
+func (*closingsHeard) OnUtteranceEnd(int, bool, monoclock.Stamp)       {}
 func (*closingsHeard) WithFloor(_ context.Context, start func()) error { start(); return nil }
 func (*closingsHeard) Close()                                          {}
 func (*closingsHeard) SessionStarted(string, uint64)                   {}

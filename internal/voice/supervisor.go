@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/sjawhar/ghost-wispr/internal/audio"
+	"github.com/sjawhar/ghost-wispr/internal/monoclock"
 	"github.com/sjawhar/ghost-wispr/internal/wake/transcript"
 )
 
@@ -144,6 +145,7 @@ type Transcript struct {
 	Closings     int       // the capture gate's closings count when it arrived
 	GateOpen     bool      // the capture gate was open when it arrived
 	At           time.Time // when the unit's transcript callback began handling it, before the session manager's work on it
+	Mono         int64     // CLOCK_MONOTONIC read with At (monoclock), for the timing log
 }
 
 // Word is one word of a Transcript, with Deepgram's speaker label and its
@@ -198,16 +200,17 @@ type SupervisorConfig struct {
 	FollowUpWait time.Duration // 0: DefaultFollowUpWait
 	ReplayWindow time.Duration // 0: DefaultReplayWindow
 	// Timing gets the timing events the acceptance driver reads, each with
-	// the recording session it belongs to ("" only while none has started)
-	// and no words; nil drops them. An exchange's events wait for its
-	// session to start, so they keep their own times, not the log's order.
-	// turn_signal, just before turn_end, names what ended the asker's turn
-	// (kind speech_final, utterance_end or turn_wait) at the time the unit's
-	// callback began handling that signal. The SDK runs the callbacks in turn
-	// off its one receive loop, so this is callback-entry time, not Deepgram's
-	// transport time: a slow earlier callback delays it. turn_end minus
-	// turn_signal is the unit's own work after the callback began.
-	Timing func(event, sessionID string, at time.Time, kv ...any)
+	// the recording session it belongs to ("" only while none has started),
+	// both clocks read where its time was taken (monoclock), and no words;
+	// nil drops them. An exchange's events wait for its session to start,
+	// so they keep their own times, not the log's order. turn_signal, just
+	// before turn_end, names what ended the asker's turn (kind speech_final,
+	// utterance_end or turn_wait) at the time the unit's callback began
+	// handling that signal. The SDK runs the callbacks in turn off its one
+	// receive loop, so this is callback-entry time, not Deepgram's transport
+	// time: a slow earlier callback delays it. turn_end minus turn_signal is
+	// the unit's own work after the callback began.
+	Timing func(event, sessionID string, at monoclock.Stamp, kv ...any)
 	// HandDone is told how each raised hand came down (RaiseHand); nil
 	// tells nobody. It runs on a goroutine of its own, never under the
 	// Supervisor's lock.
@@ -275,6 +278,7 @@ type Supervisor struct {
 	lit           bool      // the waiting light was last told On (showWaitingLocked)
 	voiceSpeaking bool      // the voice input plays
 	voiceStarted  time.Time // when it last started
+	voiceMono     int64     // CLOCK_MONOTONIC read with voiceStarted
 	voiceEnded    time.Time // when it last stopped
 	own           []ownWords
 	recent        []TurnText
@@ -352,7 +356,7 @@ type exchangeTimes struct {
 // session's id (exTimingLocked).
 type timingEvent struct {
 	event string
-	at    time.Time
+	at    monoclock.Stamp
 	kv    []any
 }
 
@@ -361,7 +365,7 @@ type timingEvent struct {
 // on it, which starts the recording session on its first words.
 type turnSignal struct {
 	kind string
-	at   time.Time
+	at   monoclock.Stamp
 }
 
 // The kinds of turnSignal.
@@ -531,7 +535,7 @@ func NewSupervisor(c *SupervisorConfig) *Supervisor {
 		floor:  floor,
 		idle:   make(chan struct{}),
 	}
-	s.unlisten = cfg.Speaker.OnSpeech(s.onSpeech)
+	s.unlisten = cfg.Speaker.OnSpeech(func(e audio.SpeechEvent) { s.onSpeech(&e) })
 	s.spawn(s.sendNotes)
 	s.spawn(s.offerAnswers)
 	return s
@@ -668,7 +672,7 @@ func (s *Supervisor) soundLocked(pcm []byte, event, sessionID, timingSession str
 	s.errorSounds[ctx] = struct{}{}
 	s.spawn(func() {
 		defer ctx.cancel()
-		pb, err := s.playChime(ctx, pcm, func(at time.Time) { s.timing(event, timingSession, at) })
+		pb, err := s.playChime(ctx, pcm, func(at monoclock.Stamp) { s.timing(event, timingSession, at) })
 		if err == nil {
 			err = pb.Drain(ctx)
 		}
@@ -684,7 +688,7 @@ func (s *Supervisor) soundLocked(pcm []byte, event, sessionID, timingSession str
 
 // timing reports a timing event, for the acceptance driver. Each names the
 // recording session it belongs to; "" only while none has started.
-func (s *Supervisor) timing(event, sessionID string, at time.Time, kv ...any) {
+func (s *Supervisor) timing(event, sessionID string, at monoclock.Stamp, kv ...any) {
 	if s.cfg.Timing != nil {
 		s.cfg.Timing(event, sessionID, at, kv...)
 	}
@@ -694,7 +698,7 @@ func (s *Supervisor) timing(event, sessionID string, at time.Time, kv ...any) {
 // id. Before ex has one, as its wake heard before the session began, it holds
 // the event until it does (sessionLocked). Once ex ended its session is
 // settled, none included, and an event reported later names that.
-func (s *Supervisor) exTimingLocked(ex *exchange, event string, at time.Time, kv ...any) {
+func (s *Supervisor) exTimingLocked(ex *exchange, event string, at monoclock.Stamp, kv ...any) {
 	s.sessionLocked(ex)
 	if ex.x.SessionID == "" && !ex.ended {
 		ex.unsent = append(ex.unsent, timingEvent{event: event, at: at, kv: kv})
@@ -958,8 +962,8 @@ func (s *Supervisor) WithFloor(ctx context.Context, start func()) error {
 }
 
 // OnUtteranceEnd takes Deepgram's UtteranceEnd as the end of the asker's
-// turn, as SpeechFinal is. at is when it reached the unit.
-func (s *Supervisor) OnUtteranceEnd(closings int, gateOpen bool, at time.Time) {
+// turn, as SpeechFinal is. at is when it reached the unit, on both clocks.
+func (s *Supervisor) OnUtteranceEnd(closings int, gateOpen bool, at monoclock.Stamp) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.closed || !gateOpen || closings < s.closings || s.offLocked() {
@@ -1352,7 +1356,7 @@ type span struct{ from, to time.Time }
 // Supervisor's own, which records its cut when it makes it (cutDriverLocked),
 // while the speaker reports the end only once its mixer takes the Cancel in,
 // which can be after a later line was called.
-func (ex *exchange) playLocked(e audio.SpeechEvent) {
+func (ex *exchange) playLocked(e *audio.SpeechEvent) {
 	if e.Started {
 		if ex.playedFrom.IsZero() {
 			ex.playedFrom = e.At
@@ -1446,7 +1450,7 @@ func (s *Supervisor) startLocked(t *Transcript, m transcript.Match) {
 		Out:       exchangeOutput{s: s, ex: ex},
 	}
 	ex.x.Tools = exchangeTools{s: s, ex: ex}
-	s.exTimingLocked(ex, "wake_heard", t.At)
+	s.exTimingLocked(ex, "wake_heard", monoclock.Stamp{Wall: t.At, Mono: t.Mono})
 	s.noteLocked(ex, EventWakeHeard, sessionID)
 	s.turnLocked(ex, t, m.Rest)
 	x := ex.x
@@ -1522,7 +1526,7 @@ func (c *exchangeContext) Err() error {
 func (s *Supervisor) open(ex *exchange, voice Voice, x *Exchange, chime bool) {
 	if chime {
 		s.spawn(func() {
-			_, _ = s.playChime(ex.ctx, WakeChime(), func(at time.Time) {
+			_, _ = s.playChime(ex.ctx, WakeChime(), func(at monoclock.Stamp) {
 				s.mu.Lock()
 				defer s.mu.Unlock()
 				s.exTimingLocked(ex, "wake_chime_queued", at)
@@ -1564,7 +1568,7 @@ func (s *Supervisor) open(ex *exchange, voice Voice, x *Exchange, chime bool) {
 // once it is done (audio.Playback.Write), so a sound whose owner is gone
 // (soundContext) writes no further frame. It returns the playback, and the
 // error of a Write that refused a frame.
-func (s *Supervisor) playChime(ctx context.Context, pcm []byte, queued func(at time.Time)) (Playback, error) {
+func (s *Supervisor) playChime(ctx context.Context, pcm []byte, queued func(at monoclock.Stamp)) (Playback, error) {
 	pb := s.cfg.Speaker.Begin(audio.InputChime, nil)
 	const frame = 960 // 20 ms at 24 kHz mono PCM16
 	for off := 0; off < len(pcm); off += frame {
@@ -1572,7 +1576,7 @@ func (s *Supervisor) playChime(ctx context.Context, pcm []byte, queued func(at t
 			return pb, err
 		}
 		if off == 0 {
-			queued(time.Now())
+			queued(monoclock.Now())
 		}
 	}
 	return pb, nil
@@ -1597,7 +1601,7 @@ func (s *Supervisor) readEvents(ex *exchange, sess Session) {
 		case EventTextAudio:
 			if e.Text != "" && e.Text == ex.factText && !ex.factDone {
 				ex.factDone = true
-				s.exTimingLocked(ex, "fact_audio", time.Now())
+				s.exTimingLocked(ex, "fact_audio", monoclock.Now())
 			}
 		case EventSpeechEnded:
 			// voice_spoken comes from the speaker (driverSpeechLocked).
@@ -1761,7 +1765,7 @@ func (s *Supervisor) turnLocked(ex *exchange, t *Transcript, words string) {
 		return // the vendor drives the turn
 	}
 	if t.IsFinal && t.SpeechFinal && s.turnOf(ex) != "" {
-		s.handTurnLocked(ex, turnSignal{kind: signalSpeechFinal, at: t.At})
+		s.handTurnLocked(ex, turnSignal{kind: signalSpeechFinal, at: monoclock.Stamp{Wall: t.At, Mono: t.Mono}})
 		return
 	}
 	if ex.timer != nil {
@@ -1823,7 +1827,7 @@ func (t exchangeTools) followUpTurn(ctx context.Context) (side bool, turn string
 // asker said as the turn when Deepgram's endpoint never came. The wait ran out
 // as it was called, before it waited for the lock.
 func (s *Supervisor) turnWaited(ex *exchange) {
-	ranOut := time.Now()
+	ranOut := monoclock.Now()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.ex != ex || ex.answering || ex.drives || s.offLocked() {
@@ -1856,7 +1860,8 @@ func (s *Supervisor) handTurnLocked(ex *exchange, signal turnSignal) {
 	ex.followUpTurn = false
 	ex.answering = true
 	ex.answerFrom, ex.answerPending = time.Time{}, true
-	ex.turnAt = time.Now()
+	turnEnd := monoclock.Now()
+	ex.turnAt = turnEnd.Wall
 	ex.times.lastTurnEnd = ex.turnAt
 	ex.firstOutDone, ex.factPending, ex.factDone, ex.factText = false, false, false, ""
 	turn := s.turnOf(ex)
@@ -1864,7 +1869,7 @@ func (s *Supervisor) handTurnLocked(ex *exchange, signal turnSignal) {
 	s.sessionLocked(ex)
 	ex.x.Recent = s.recentLocked()
 	s.exTimingLocked(ex, "turn_signal", signal.at, "kind", signal.kind)
-	s.exTimingLocked(ex, "turn_end", ex.turnAt)
+	s.exTimingLocked(ex, "turn_end", turnEnd)
 	s.noteLocked(ex, EventExchangeStarted, ex.x.SessionID)
 	x := ex.x
 	s.spawn(func() { s.answer(ex, &x, turn) })
@@ -1893,7 +1898,7 @@ func (s *Supervisor) answer(ex *exchange, x *Exchange, turn string) {
 			ex.factText = text
 		}
 		s.mu.Unlock()
-		called := time.Now()
+		called := monoclock.Now()
 		if err := sess.Say(ctx, text, mode); err != nil {
 			return err
 		}
@@ -1908,9 +1913,9 @@ func (s *Supervisor) answer(ex *exchange, x *Exchange, turn string) {
 			// still played, since the Output queues 200 ms at most; else
 			// when it starts.
 			switch {
-			case !s.voiceStarted.Before(called):
+			case !s.voiceStarted.Before(called.Wall):
 				ex.factDone = true
-				s.exTimingLocked(ex, "fact_audio", s.voiceStarted)
+				s.exTimingLocked(ex, "fact_audio", monoclock.Stamp{Wall: s.voiceStarted, Mono: s.voiceMono})
 			case s.voiceSpeaking:
 				ex.factDone = true
 				s.exTimingLocked(ex, "fact_audio", called)
@@ -2193,7 +2198,7 @@ func (s *Supervisor) offerAnswers() {
 				s.arrivals++
 				s.pending = append(s.pending, &pendingAnswer{PendingAnswer: a, arrived: s.arrivals, needsInvite: a.AskedAt.IsZero() || stoppedSince || talkedSince})
 				s.showWaitingLocked()
-				s.timing("answer_ready", a.SessionID, time.Now())
+				s.timing("answer_ready", a.SessionID, monoclock.Now())
 				select {
 				case s.notes <- [2]string{EventAnswerReady, a.SessionID}:
 				default:
@@ -2270,7 +2275,7 @@ func (s *Supervisor) offer() {
 		ctx := newSoundContext(s.ctx, meeting, owners)
 		s.chimeCancel, s.chimeCtx, s.chimeHands, s.chimeOwners = ctx.cancel, ctx, hands, owners
 		s.spawn(func() {
-			pb, err := s.playChime(ctx, pcm, func(at time.Time) { s.timing(event, sessionID, at) })
+			pb, err := s.playChime(ctx, pcm, func(at monoclock.Stamp) { s.timing(event, sessionID, at) })
 			if err == nil {
 				s.mu.Lock()
 				if ctx == s.chimeCtx {
@@ -2336,13 +2341,14 @@ func (s *Supervisor) idleLocked(ex *exchange) bool {
 // stopLocked ends the exchange holding the floor for reason, and makes every
 // held answer wait for an invitation.
 func (s *Supervisor) stopLocked(reason string) {
-	now := time.Now()
+	stamp := monoclock.Now()
+	now := stamp.Wall
 	s.lastStopAt = now
 	sessionID := s.cfg.Session()
 	if s.ex != nil && s.ex.x.SessionID != "" {
 		sessionID = s.ex.x.SessionID
 	}
-	s.timing("stop", sessionID, now, "reason", reason)
+	s.timing("stop", sessionID, stamp, "reason", reason)
 	for _, p := range s.pending {
 		p.needsInvite = true
 	}
@@ -2465,20 +2471,21 @@ func (s *Supervisor) sendNotes() {
 // comes: the exchange may have ended, and others taken the floor, since. A
 // speech no exchange's playback started, such as POST /api/tts/speak, is no
 // exchange's. speechEx is the exchange whose speech plays now, for barge-in.
-func (s *Supervisor) onSpeech(e audio.SpeechEvent) {
+func (s *Supervisor) onSpeech(e *audio.SpeechEvent) {
 	if e.Input != audio.InputVoice {
 		return
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.voiceSpeaking = e.Started
+	at := monoclock.Stamp{Wall: e.At, Mono: e.AtMono}
 	ex, _ := e.Owner.(*exchange)
 	if ex != nil {
 		s.sessionLocked(ex)
 	}
 	if e.Started {
 		s.speechEx = ex
-		s.voiceStarted = e.At
+		s.voiceStarted, s.voiceMono = e.At, e.AtMono
 		s.speechSession = nil
 		if ex == nil {
 			id := s.sessionNow()
@@ -2489,11 +2496,11 @@ func (s *Supervisor) onSpeech(e audio.SpeechEvent) {
 		s.voiceEnded = time.Now()
 		switch {
 		case ex != nil:
-			s.exTimingLocked(ex, "speech_end", e.At)
+			s.exTimingLocked(ex, "speech_end", at)
 		case s.speechSession != nil:
-			s.timing("speech_end", *s.speechSession, e.At)
+			s.timing("speech_end", *s.speechSession, at)
 		default: // it began before the Supervisor listened
-			s.timing("speech_end", s.sessionNow(), e.At)
+			s.timing("speech_end", s.sessionNow(), at)
 		}
 		s.speechSession = nil
 	}
@@ -2512,12 +2519,12 @@ func (s *Supervisor) onSpeech(e audio.SpeechEvent) {
 	}
 	if !ex.turnAt.IsZero() && !ex.firstOutDone {
 		ex.firstOutDone = true
-		s.exTimingLocked(ex, "first_audio", e.At)
+		s.exTimingLocked(ex, "first_audio", at)
 		s.logf("voice: first spoken audio %v after the turn ended", e.At.Sub(ex.turnAt).Round(time.Millisecond))
 	}
 	if ex.factPending {
 		ex.factPending, ex.factDone = false, true
-		s.exTimingLocked(ex, "fact_audio", e.At)
+		s.exTimingLocked(ex, "fact_audio", at)
 	}
 }
 

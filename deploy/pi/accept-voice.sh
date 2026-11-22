@@ -397,8 +397,206 @@ api_post() {
   curl --fail --silent --show-error --max-time 30 --request POST "$api$1"
 }
 
+# The driver's clock is CLOCK_MONOTONIC, the clock the voice also writes each event's at_mono_ns on
+# (internal/monoclock): a step of the wall clock (settimeofday, an NTP step) moves neither, so the
+# driver compares its times with the voice's across one. Bash reads only the wall clock, so mono_py
+# reads the monotonic one: as the coprocess mono_clock, which answers each line with the time
+# (start_mono_clock), as the recording's sampler (start_recording) and as the playback poller
+# (start_poller). Every time the driver compares is on this clock; the wall clock serves only
+# journalctl's --since, which takes a wall time.
+read -r -d '' mono_py <<'EOF'
+import os
+import re
+import signal
+import sys
+import time
+import wave
+
+HEADER = 44
+
+
+def us():
+    return time.monotonic_ns() // 1000
+
+
+def alive(pid):
+    try:
+        with open("/proc/%d/stat" % pid) as f:
+            return f.read().rsplit(")", 1)[1].split()[0] != "Z"
+    except (OSError, IndexError):
+        return False
+
+
+class Stop(Exception):
+    pass
+
+
+def stop(*_):
+    raise Stop
+
+
+def clock():
+    """One line out, the time in microseconds, for each line in. Ctrl-C reaches the driver's whole
+    process group, and the driver needs its clock to restore the unit after one: it is ignored here,
+    and the clock ends when the driver closes its end."""
+    for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, signal.SIG_IGN)
+    for _ in sys.stdin:
+        sys.stdout.write("%d\n" % us())
+        sys.stdout.flush()
+
+
+def size_reader(path):
+    """A read of the bytes arecord has written: from its fdinfo's pos while /proc shows the file open
+    in it (pid, once known), else from a stat of the file. It gives 0 while there is no file and
+    none was seen, and None when the read fails, or the file is gone once seen: arecord never
+    removes it."""
+    fd, seen = None, False
+
+    def find(pid):
+        for name in os.listdir("/proc/%d/fd" % pid):
+            try:
+                if os.path.samefile("/proc/%d/fd/%s" % (pid, name), path):
+                    return name
+            except OSError:
+                pass
+        return None
+
+    def read(pid):
+        nonlocal fd, seen
+        if pid is not None:
+            try:
+                if fd is None:
+                    fd = find(pid)
+                if fd is not None:
+                    with open("/proc/%d/fdinfo/%s" % (pid, fd)) as f:
+                        pos = next((int(line.split(":", 1)[1]) for line in f if line.startswith("pos:")), None)
+                    # The fd still names the file after the read: a number arecord closed and
+                    # reused for another file gives no size.
+                    if pos is not None and os.path.samefile("/proc/%d/fd/%s" % (pid, fd), path):
+                        seen = True
+                        return pos
+                    fd = None
+            except (OSError, ValueError):
+                fd = None
+        try:
+            size = os.stat(path).st_size
+        except FileNotFoundError:
+            return None if seen else 0
+        except OSError:
+            return None
+        seen = True
+        return size
+
+    return read
+
+
+def record(path, anchors, pidfile):
+    """The recording's sampler, started before arecord: every 10 ms until arecord has written a
+    sample, then every 0.5 s, and once more at SIGTERM, after arecord has ended, it writes an anchor,
+    "US BYTES", the time read after the size. It prints "ready" after its first read, before which
+    arecord does not start, and learns arecord's pid from PIDFILE. Before the first sample, a read
+    that found less than the header, or no file yet, came before the capture began: the last such
+    read's time, read before the size, is the start. It prints "started US" once arecord has written
+    a sample, "stopped" if arecord ends before, and "timeout" if it has written none within 5 s of
+    its pid; a sample counts even when found after the 5 s."""
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    signal.signal(signal.SIGTERM, stop)
+    read = size_reader(path)
+    out = open(anchors, "a", buffering=1)
+    pid, deadline, started, ready = None, None, None, False
+    try:
+        while True:
+            if pid is None:
+                try:
+                    with open(pidfile) as f:
+                        pid = int(f.read())
+                    deadline = us() + 5_000_000
+                except (OSError, ValueError):
+                    pass
+            before = us()
+            size = read(pid)
+            seen = us()
+            if size is not None and size > HEADER:
+                out.write("%d %d\n" % (seen, size))
+                break
+            if size is not None and size < HEADER:
+                started = before
+            if not ready:
+                print("ready", flush=True)
+                ready = True
+            if pid is not None and not alive(pid):
+                print("stopped", flush=True)
+                return
+            if deadline is not None and seen >= deadline:
+                print("timeout", flush=True)
+                return
+            time.sleep(0.01)
+        if started is None:
+            print("no read came before the capture", flush=True)
+            return
+        print("started %d" % started, flush=True)
+        while alive(pid):
+            time.sleep(0.5)
+            size = read(pid)
+            seen = us()
+            if size is not None:
+                out.write("%d %d\n" % (seen, size))
+    except Stop:
+        pass
+    # arecord has ended: the file is whole.
+    try:
+        size = os.stat(path).st_size
+    except OSError:
+        return
+    out.write("%d %d\n" % (us(), size))
+
+
+def poll(status, log):
+    """The playback poller: every 5 ms, the speaker substream's state, "MS STATE", the time read
+    after the status."""
+    out = open(log, "a", buffering=1)
+    while True:
+        try:
+            with open(status) as f:
+                content = f.read()
+        except OSError:
+            content = ""
+        now = us() // 1000
+        match = re.search(r"state: ([A-Z_]+)", content)
+        out.write("%d %s\n" % (now, match.group(1) if match else "CLOSED"))
+        time.sleep(0.005)
+
+
+def duration(path):
+    """The length of the WAV file at PATH in whole milliseconds, rounded down, from its frames and
+    rate as the wave module reads them."""
+    with wave.open(path) as w:
+        print(w.getnframes() * 1000 // w.getframerate())
+
+
+mode = sys.argv[1]
+if mode == "clock":
+    clock()
+elif mode == "record":
+    record(sys.argv[2], sys.argv[3], sys.argv[4])
+elif mode == "poll":
+    poll(sys.argv[2], sys.argv[3])
+elif mode == "duration":
+    duration(sys.argv[2])
+EOF
+readonly mono_py
+
+# start_mono_clock: the driver's clock coprocess, mono_clock.
+start_mono_clock() {
+  coproc mono_clock { exec python3 -c "$mono_py" clock 2>/dev/null; }
+}
+
+# now_ms: the driver's clock, CLOCK_MONOTONIC, in milliseconds.
 now_ms() {
-  local now=${EPOCHREALTIME//[!0-9]/}
+  local now
+  printf '\n' >&"${mono_clock[1]}" && IFS= read -r now <&"${mono_clock[0]}" && [[ $now =~ ^[0-9]+$ ]] \
+    || unknown "the driver's clock (python3, CLOCK_MONOTONIC) gave no time"
   printf '%s\n' "$((now / 1000))"
 }
 
@@ -550,38 +748,45 @@ deepgram_connected() {
     "$ws_capture" >/dev/null 2>&1
 }
 
-# time_ms RFC3339: the time (UTC, as Go writes it) in Unix milliseconds, on the same clock as now_ms:
-# the driver runs on the Pi.
+# time_ms RFC3339: the time (UTC, as Go writes it) in Unix milliseconds, on the wall clock: only for
+# a time the service gives on the wall clock alone, compared with another of its wall times.
 time_ms() {
   jq -r -n --arg t "$1" '$t
     | capture("^(?<s>[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2})(\\.(?<f>[0-9]+))?Z$")
     | ((.s + "Z") | fromdateiso8601) * 1000 + (((.f // "") + "000")[0:3] | tonumber)' 2>/dev/null
 }
 
-# check_voice_event NAME EVENT [SESSION]: a voice event carries session_id and nothing else of its
-# own, never words; given SESSION, its session_id is that one. It sets event_at to the event's
-# time, and fails the run when a check fails, so it runs in the main shell, not in $(...).
+# mono_ms JSON: the at_mono_ns of a voice event, a timing line or a test agent's step, on now_ms's
+# clock (CLOCK_MONOTONIC), in milliseconds; nothing when it has none.
+mono_ms() {
+  jq -r '(.at_mono_ns | numbers) / 1000000 | floor' <<<"$1" 2>/dev/null
+}
+
+# check_voice_event NAME EVENT [SESSION]: a voice event carries session_id, its time and nothing
+# else of its own, never words; given SESSION, its session_id is that one. It sets event_at to the
+# event's time on now_ms's clock, at_mono_ns, and fails the run when a check fails, so it runs in the
+# main shell, not in $(...).
 event_at=
 check_voice_event() {
   local name=$1 event=$2 want=${3:-} extra got
-  extra=$(jq -r '(keys - ["session_id", "timestamp", "type", "version"]) | join(", ")' <<<"$event") \
+  extra=$(jq -r '(keys - ["session_id", "timestamp", "at_mono_ns", "type", "version"]) | join(", ")' <<<"$event") \
     || unknown "$name: cannot read the event: $event"
-  [[ -z $extra ]] || fail "$name: carries a field other than type, version, timestamp and session_id: $extra"
+  [[ -z $extra ]] || fail "$name: carries a field other than type, version, timestamp, at_mono_ns and session_id: $extra"
   jq -e 'has("session_id") and (.session_id | type == "string")' >/dev/null <<<"$event" || fail "$name: has no session_id: $event"
   got=$(jq -r '.session_id' <<<"$event")
   if [[ -n $want && $got != "$want" ]]; then
     fail "$name: session_id \"$got\", want \"$want\" from voice_exchange_started"
   fi
-  event_at=$(time_ms "$(jq -r '.timestamp' <<<"$event")")
-  whole_number "$event_at" || unknown "$name: cannot read its timestamp: $event"
+  event_at=$(mono_ms "$event")
+  whole_number "$event_at" || unknown "$name: no at_mono_ns, its time on the monotonic clock, so it cannot be compared with the driver's: this build does not give it: $event"
 }
 
 # journal_lines: what the service's running process wrote to the journal. The Pi keeps no user
 # journal, so this reads the system journal as root, the user unit's lines from its main process,
 # in this boot and since this unit run's restart: a process ID recurs, within a boot and across
-# boots of a persistent journal.
+# boots of a persistent journal. --since takes a wall time, the one use of the wall clock here.
 journal_lines() {
-  sudo -n journalctl _SYSTEMD_USER_UNIT="$unit" _PID="$unit_pid" -o cat --boot=0 --since "@$((restart_ms / 1000 - 1))" 2>"$work_dir/journal.err"
+  sudo -n journalctl _SYSTEMD_USER_UNIT="$unit" _PID="$unit_pid" -o cat --boot=0 --since "@$((restart_wall_s - 1))" 2>"$work_dir/journal.err"
 }
 
 # journal_error: what the last journal read printed on stderr, to say why a read failed.
@@ -595,18 +800,20 @@ journal_records() {
   journal_lines | jq -R -c --arg message "$1" 'fromjson? | select(type == "object" and .message == $message)' 2>/dev/null
 }
 
-# timing_events: the voice timing log since the restart: {event, session_id, reason, at}, at in Unix
-# milliseconds.
+# timing_events: the voice timing log since the restart: {event, session_id, reason, at, wall}: at
+# on now_ms's clock (at_mono_ns), -1 for a line without one, and wall on the wall clock (at_unix_ns),
+# in milliseconds.
 timing_events() {
   journal_records 'voice timing' | jq -c '{event: (.event // ""), session_id: (.session_id // ""),
-    reason: (.reason // ""), at: ((((.at_unix_ns | tonumber?) // 0) / 1000000) | floor)}' 2>/dev/null
+    reason: (.reason // ""), at: ((((.at_mono_ns | tonumber?) // -1000000) / 1000000) | floor),
+    wall: ((((.at_unix_ns | tonumber?) // 0) / 1000000) | floor)}' 2>/dev/null
 }
 
-# timing_first EVENT FROM_MS TO_MS: the time of the first EVENT in the timing log in [FROM, TO], or
-# nothing.
+# timing_first EVENT FROM_MS TO_MS [FIELD]: the time of the first EVENT in the timing log in
+# [FROM, TO], or nothing; FIELD at (now_ms's clock) by default, or wall.
 timing_first() {
-  timing_events | jq -r -n --arg e "$1" --argjson from "$2" --argjson to "$3" \
-    '[inputs | select(.event == $e and .at >= $from and .at <= $to) | .at] | min // empty'
+  timing_events | jq -r -n --arg e "$1" --argjson from "$2" --argjson to "$3" --arg f "${4:-at}" \
+    '[inputs | select(.event == $e and .[$f] >= $from and .[$f] <= $to) | .[$f]] | min // empty'
 }
 
 # wait_for_timing EVENT AFTER_MS DEADLINE_MS: wait until the timing log holds EVENT at or after
@@ -627,12 +834,16 @@ wait_for_timing() {
 }
 
 # timing_fail REASON: a timing line did not come. With no "voice timing" line at all since the
-# restart, the build does not write the log, and the step read nothing: UNKNOWN. Otherwise FAIL.
+# restart, the build does not write the log, and the step read nothing: UNKNOWN. With lines that
+# have no at_mono_ns, the build gives no time the driver can compare with its own: UNKNOWN.
+# Otherwise FAIL.
 timing_fail() {
   local events
   events=$(timing_events) || unknown "voice timing log: cannot read the journal of $unit (process $unit_pid)$(journal_error)"
   [[ -n $events ]] \
     || unknown "voice timing log: the journal of $unit holds no \"voice timing\" line since its restart; this build does not write the timing log"
+  jq -e -s 'all(.at >= 0)' >/dev/null <<<"$events" \
+    || unknown "voice timing log: a \"voice timing\" line has no at_mono_ns, its time on the monotonic clock; this build does not give it, so its times cannot be compared with the driver's"
   fail "$1"
 }
 
@@ -837,13 +1048,14 @@ trap 'interrupted HUP 129' HUP
 for command in curl jq python3 systemctl journalctl sudo; do
   command -v "$command" >/dev/null || refuse "missing required command: $command"
 done
+start_mono_clock
 work_dir=$(mktemp -d) || refuse 'cannot make a private directory'
 
 # ---- the unit's run: the service on the loopback, capturing ----
 
 unit_runs=0
 unit_pid=
-restart_ms=0
+restart_wall_s=0
 voice_off_reason=
 
 # start_unit_run SETTING...: put the service on the run's settings, each KEY=VALUE written into the
@@ -868,7 +1080,7 @@ start_unit_run() {
     awk -v pattern="^[[:space:]]*(export[[:space:]]+)?($pattern)=" '$0 !~ pattern' "$saved_env"
     printf '%s\n' "$@"
   } >"$env_file" || fail "loopback: could not write $env_file"
-  restart_ms=$(now_ms)
+  restart_wall_s=$EPOCHSECONDS
   service restart || fail "loopback: could not restart $unit"
   wait_for_status "$restart_seconds" || fail "loopback: $unit did not answer within $restart_seconds s of its restart"
   unit_pid=$(service show --property=MainPID --value 2>/dev/null)
@@ -922,16 +1134,30 @@ start_voice_run() {
   fail "$step: the meeting voice is off: $voice_off_reason"
 }
 
-# play_clip NAME FILE: play FILE into the microphone's side of the loopback, and set clip_started
-# and clip_ended to when aplay began and returned; it returns once the clip has played.
+# play_clip NAME FILE: play FILE into the microphone's side of the loopback; it returns once the clip
+# has played. Its audio begins no earlier than clip_started, read just before aplay starts, and ends
+# no later than clip_ended, read once aplay has returned, which it does only after it drains the
+# clip. The audio lasts clip_ms, the WAV's length rounded down (mono_py duration), so it begins no
+# later than clip_start_late, clip_ended less clip_ms, and ends no earlier than clip_end_early,
+# clip_started plus clip_ms. aplay's own start and exit fall between the two bounds, and a loaded
+# machine can widen them; a check on a time from a clip's start or end decides only where its
+# verdict holds across them.
 clip_started=
 clip_ended=
+clip_ms=
+clip_start_late=
+clip_end_early=
 play_clip() {
+  clip_ms=$(python3 -c "$mono_py" duration "$2" 2>"$work_dir/duration.err") \
+    || unknown "$1: cannot read the length of $2 as a WAV file: $(tail -n 3 "$work_dir/duration.err" | tr '\n' ' ')"
+  whole_number "$clip_ms" || unknown "$1: read no length from $2: $clip_ms"
   clip_started=$(now_ms)
   aplay -q -D "$injection_device" "$2" 2>"$work_dir/aplay.err" \
     || fail "$1: aplay could not play $2 into $injection_device: $(tr '\n' ' ' <"$work_dir/aplay.err")"
   clip_ended=$(now_ms)
-  note "$1: played into $injection_device in $((clip_ended - clip_started)) ms"
+  clip_end_early=$((clip_started + clip_ms))
+  clip_start_late=$((clip_ended - clip_ms))
+  note "$1: played into $injection_device in $((clip_ended - clip_started)) ms, a $clip_ms ms clip"
 }
 
 # wait_spoken N DEADLINE_MS NAME: wait for this unit run's Nth voice_spoken.
@@ -941,107 +1167,129 @@ wait_spoken() {
 
 # ---- recordings ----
 
-# start_recording DEVICE FILE: record DEVICE to FILE. A background loop writes anchors, "US BYTES"
-# lines: by the driver's clock US (microseconds, read just after the size), BYTES of the file were
-# written. recording-times.awk bounds each sound's time with the anchors after it, late only by how
-# late its best anchor was read (analyse_recording). The size comes from arecord's own fdinfo, whose
-# pos is the bytes it has written, read by the shell with no fork: a fork between the size and the
-# clock, on a loaded machine, makes every anchor late by as long as the fork takes, and no later
-# anchor then makes up for it. Where /proc does not show that fd, the size comes from wc.
+# A time no sound can reach: the open end of a window that runs to the end of a recording, and the
+# missing bound of a time that has none.
+readonly never_ms=9999999999999
+
+# start_recording DEVICE FILE: record DEVICE to FILE with arecord, until stop_recording. A sampler
+# (mono_py record) writes anchors, "US BYTES" lines: by the driver's clock US (CLOCK_MONOTONIC, in
+# microseconds, read just after the size), BYTES of the file were written. recording-times.awk
+# bounds each sound's time with the anchors after it, late only by how late its best anchor was read
+# (analyse_recording). The sampler reads the size from arecord's own fdinfo, whose pos is the bytes
+# it has written, or with a stat of the file where /proc does not show that fd, and the clock in the
+# same process: no fork comes between the size and the clock.
+#
+# The recording starts between two times. recording_started is the earlier: arecord opens its
+# device, then creates the file and writes its whole 44-byte header, and only then reads, which
+# starts the capture (alsa-utils aplay.c capture(): set_params, then the file, begin_wave, then
+# pcm_read; for arecord the start threshold is one frame). So a read of the file's size that found
+# less than the header, or no file yet, came before the capture began, and the last such read is
+# recording_started. The sampler starts first, and arecord only once it has read, so that some read
+# comes before arecord and the last comes as late as the polls can make it. A read that fails finds
+# nothing and moves nothing; so does a file missing once the sampler has seen it, as arecord never
+# removes its file. The later time is the first read that finds a sample, the first anchor:
+# recording-times.awk bounds the file's first sample from above with it. An arecord slow to open
+# its device makes no time late; one held back between its header and its first read makes every
+# time counted from recording_started early by as long, and a check that needs that time to be
+# exact reads UNKNOWN (analyse_recording).
 recording=
 anchors_file=
 recording_cut=false
 recording_started=
-recording_fdinfo=
+sampler_said=
 start_recording() {
-  local deadline size seen link
   recording=$2
   anchors_file="$recording.anchors"
   recording_cut=false
-  recording_fdinfo=
   : >"$anchors_file"
-  # arecord captures nothing before it starts: the earliest the file's first sample can be.
-  recording_started=${EPOCHREALTIME//[!0-9]/}
+  : >"$recording.sampler"
+  rm -f -- "$recording.pid"
+  python3 -c "$mono_py" record "$recording" "$anchors_file" "$recording.pid" \
+    >"$recording.sampler" 2>"$work_dir/sampler.err" &
+  anchor_pid=$!
+  sampler_line 1
+  [[ $sampler_said == ready ]] || unknown "recording: the sampler of $recording said: $sampler_said"
   arecord -q -D "$1" -f S16_LE -r "$sample_rate" -c 1 -t wav --buffer-time=40000 --period-time=10000 \
     "$recording" 2>"$work_dir/arecord.err" &
   arecord_pid=$!
-  deadline=$(($(now_ms) + 5000))
-  while :; do
-    size=$(wc -c 2>/dev/null <"$recording" || printf 0)
-    seen=${EPOCHREALTIME//[!0-9]/}
-    if ((size > wav_header_bytes)); then
-      printf '%s %s\n' "$seen" "$size" >>"$anchors_file"
-      break
-    fi
-    kill -0 "$arecord_pid" 2>/dev/null || unknown "recording: arecord stopped: $(tr '\n' ' ' <"$work_dir/arecord.err")"
-    ((seen / 1000 < deadline)) || unknown "recording: arecord wrote no audio from $1 within 5 s"
-    sleep 0.01
-  done
-  for link in /proc/"$arecord_pid"/fd/*; do
-    if [[ $link -ef $recording ]]; then
-      recording_fdinfo=/proc/$arecord_pid/fdinfo/${link##*/}
-      break
-    fi
-  done
-  (
-    while kill -0 "$arecord_pid" 2>/dev/null; do
-      sleep 0.5
-      recording_size || break
-      seen=${EPOCHREALTIME//[!0-9]/}
-      printf '%s %s\n' "$seen" "$size" >>"$anchors_file"
-    done
-  ) &
-  anchor_pid=$!
+  if ! { printf '%s\n' "$arecord_pid" >"$recording.pid.tmp" && mv -- "$recording.pid.tmp" "$recording.pid"; }; then
+    unknown "recording: cannot give the sampler arecord's process id"
+  fi
+  sampler_line 2
+  case $sampler_said in
+    started\ *) recording_started=${sampler_said#started } ;;
+    stopped) unknown "recording: arecord stopped: $(tr '\n' ' ' <"$work_dir/arecord.err")" ;;
+    timeout) unknown "recording: arecord wrote no audio from $1 within 5 s" ;;
+    *) unknown "recording: the sampler of $recording said: $sampler_said" ;;
+  esac
+  whole_number "$recording_started" || unknown "recording: the sampler of $recording gave no start: $sampler_said"
   note "recording: from $1"
 }
 
-# recording_size: set size to the bytes arecord has written to the recording: from its fdinfo, read
-# by the shell itself, when start_recording found it, else with wc.
-recording_size() {
-  local key value
-  if [[ -n $recording_fdinfo ]] && read -r key value 2>/dev/null <"$recording_fdinfo" && [[ $key == pos: && $value =~ ^[0-9]+$ ]]; then
-    size=$value
-    return 0
-  fi
-  size=$(wc -c 2>/dev/null <"$recording")
+# sampler_line N: set sampler_said to the sampler's Nth line, once it has written it. The sampler
+# gives up 5 s after arecord's start on the monotonic clock; this wait only bounds a sampler that
+# never answers.
+sampler_line() {
+  local deadline tick
+  deadline=$(($(now_ms) + 60000))
+  exec {tick}<> <(:)
+  until sampler_said=$(sed -n "$1p" "$recording.sampler" 2>/dev/null) && [[ -n $sampler_said ]]; do
+    kill -0 "$anchor_pid" 2>/dev/null \
+      || unknown "recording: the sampler of $recording ended without its line $1: $(head -c 300 "$work_dir/sampler.err" | tr '\n' ' ')"
+    (($(now_ms) < deadline)) || unknown "recording: the sampler of $recording did not answer within 60 s"
+    read -r -t 0.01 -u "$tick" _ || true
+  done
+  exec {tick}>&-
 }
 
 # stop_recording: end the recording. On SIGTERM arecord finishes the file's header and drops what it
 # had captured but not yet written. Every sample in the file was captured before arecord ended, so a
-# last anchor, taken once it has, bounds the end of the file too. An arecord that already ended on
-# its own cut the recording short, which analyse_recording reports.
+# last anchor, which the sampler takes once arecord has ended and it gets SIGTERM, bounds the end of
+# the file too. An arecord that already ended on its own cut the recording short, which
+# analyse_recording reports.
 stop_recording() {
-  local size seen stopped=false
   if [[ -n $arecord_pid ]]; then
     kill -TERM "$arecord_pid" 2>/dev/null || recording_cut=true
     wait "$arecord_pid" 2>/dev/null
     arecord_pid=
-    stopped=true
   fi
   if [[ -n $anchor_pid ]]; then
-    kill "$anchor_pid" 2>/dev/null
+    kill -TERM "$anchor_pid" 2>/dev/null
     wait "$anchor_pid" 2>/dev/null
     anchor_pid=
-  fi
-  if [[ $stopped == true ]] && size=$(wc -c 2>/dev/null <"$recording"); then
-    seen=${EPOCHREALTIME//[!0-9]/}
-    printf '%s %s\n' "$seen" "$size" >>"$anchors_file"
   fi
 }
 
 # analyse_recording THRESHOLD_DB: read the sounds in the recording. sound_on and sound_off hold each
 # sound's onset and end on the driver's clock, never early; sound_on_early and sound_off_early the
-# same times, never late; sound_len its length in the file, in microseconds; recording_end the
-# driver's time, never late, before which the recording shows every sound that starts
-# (recording-times.awk). A true time lies between its two bounds.
+# same times, never late; sound_len its length in the file, in microseconds; sound_gap_min the
+# silence before it, from the end of the sound before it (or from the file's start), never long. The
+# recording shows every sound that starts before recording_end_early and nothing after
+# recording_end_late (never_ms when no anchor bounds it); recording_trail_min is the silence after
+# its last sound, to recording_end_early's place, never long (recording-times.awk). A true time lies
+# between its two bounds, and a check decides PASS or FAIL only where it holds for every time between
+# them, else UNKNOWN.
+#
+# Every time here is when a sound reached the rig microphone. A USB microphone captures a sound a
+# little after it arrives: its converter's filter and its USB audio class transfer, which moves audio
+# in 1 ms frames, take about 1 to 2 ms. mic_delay_us allows for 2 ms: every early bound and every
+# silence's lower bound is that much earlier or shorter (recording-times.awk), so a verdict on the
+# edge of a bound, such as words that begin less than 2 ms after the go-ahead, reads UNKNOWN. The
+# 2 ms is an assumption of the rig, not a measured bound: a microphone slower than that can make an
+# early bound late by the difference. A late bound needs no allowance: the sound came no later than
+# its capture.
+readonly mic_delay_us=2000
 sound_on=()
 sound_off=()
 sound_on_early=()
 sound_off_early=()
 sound_len=()
-recording_end=
+sound_gap_min=()
+recording_end_early=
+recording_end_late=
+recording_trail_min=
 analyse_recording() {
-  local analysis bytes kind rest on off len on_early off_early
+  local analysis bytes kind rest on off len on_early off_early gap
   analysis=$(ffmpeg -hide_banner -nostats -i "$recording" -af "silencedetect=noise=${1}dB:d=$silence_seconds" -f null - 2>&1) \
     || unknown "recording: ffmpeg could not read $recording: $(tail -n 3 <<<"$analysis" | tr '\n' ' ')"
   [[ $recording_cut == false ]] \
@@ -1052,72 +1300,138 @@ analyse_recording() {
   sound_on_early=()
   sound_off_early=()
   sound_len=()
-  recording_end=
+  sound_gap_min=()
+  recording_end_early=
+  recording_end_late=
+  recording_trail_min=
   while read -r kind rest; do
     case $kind in
       sound)
-        read -r on off len on_early off_early <<<"$rest"
+        read -r on off len on_early off_early gap <<<"$rest"
         sound_on+=("$on")
         sound_off+=("$off")
         sound_on_early+=("$on_early")
         sound_off_early+=("$off_early")
         sound_len+=("$len")
+        sound_gap_min+=("$gap")
         ;;
-      end) recording_end=$rest ;;
+      end) read -r recording_end_early recording_end_late recording_trail_min <<<"$rest" ;;
       error) unknown "recording: $recording: $rest" ;;
     esac
   done < <(awk -v rate="$sample_rate" -v header="$wav_header_bytes" -v frame="$sample_bytes" -v bytes="$bytes" \
-    -v started_us="$recording_started" -f "$recording_times" "$anchors_file" - <<<"$analysis")
-  whole_number "$recording_end" || unknown "recording: the times of $recording could not be read"
+    -v started_us="$recording_started" -v mic_delay_us="$mic_delay_us" -f "$recording_times" "$anchors_file" - <<<"$analysis")
+  [[ $recording_end_late == none ]] && recording_end_late=$never_ms
+  [[ $recording_end_early =~ ^[0-9]+$ && $recording_end_late =~ ^[0-9]+$ && $recording_trail_min =~ ^[0-9]+$ ]] \
+    || unknown "recording: the times of $recording could not be read"
 }
 
-# first_sound FROM_MS TO_MS: set found_sound to the index of the first sound that starts in
-# [FROM, TO); it fails when none does.
+# onset_between FROM_LOW FROM_HIGH TO_MS: the first sound whose onset lies at or after FROM, a time
+# known to lie in [FROM_LOW, FROM_HIGH], and before TO. maybe_sound is the first sound whose onset
+# may lie there: its late bound at FROM_LOW or later and its early bound before TO. found_sound is
+# the first whose onset certainly does: its early bound at FROM_HIGH or later and its late bound
+# before TO. The first onset there lies in [onset_low, onset_high]: no earlier than FROM_LOW or
+# maybe_sound's early bound, and no later than found_sound's late bound. It returns 0 with
+# found_sound set; 2 with only maybe_sound set, as a sound may start there or none may; and 1 when
+# no sound may start there, which the recording shows only for a window that ends by
+# recording_end_early.
+maybe_sound=
 found_sound=
-first_sound() {
+onset_low=
+onset_high=
+onset_between() {
   local i
+  maybe_sound=
+  found_sound=
+  onset_low=
+  onset_high=
   for i in "${!sound_on[@]}"; do
-    if ((sound_on[i] >= $1 && sound_on[i] < $2)); then
+    ((sound_on[i] >= $1 && sound_on_early[i] < $3)) || continue
+    if [[ -z $maybe_sound ]]; then
+      maybe_sound=$i
+      onset_low=$((sound_on_early[i] > $1 ? sound_on_early[i] : $1))
+    fi
+    if ((sound_on_early[i] >= $2 && sound_on[i] < $3)); then
       found_sound=$i
+      onset_high=${sound_on[i]}
       return 0
     fi
   done
+  [[ -n $maybe_sound ]] && return 2
   return 1
 }
 
-# silence_from FROM_MS TO_MS: set silent_at to when the speaker went quiet for at least
-# stop_silence_ms at or after FROM and no later than TO; it fails when it did not.
-silent_at=
+# silence_from FROM_LOW FROM_HIGH WINDOW_MS: whether the speaker went quiet for at least
+# stop_silence_ms in a gap that ends after FROM and starts no later than FROM plus WINDOW, FROM a time
+# known to lie in [FROM_LOW, FROM_HIGH] (a clip's start: play_clip). A gap is timed twice: its start
+# and end on the driver's clock, each between its bounds, and its length, between its length in the
+# file (sound_gap_min, never long) and its end's late bound less its start's early bound (never
+# short, even where the file lost audio). The gap before the first sound may have begun before the
+# recording, and the one after the last may go on after it: neither length has an upper bound. It
+# returns 0 when such a gap certainly holds, for every FROM and every time between the bounds; 2 when
+# one may; and 1 when none can. silent_delay_low is the least time from FROM to when the speaker went
+# quiet (the gap's start, or FROM if later) that the first gap that may hold allows, and with 0,
+# silent_delay_high the most that the gap that holds allows.
+silent_delay_low=
+silent_delay_high=
 silence_from() {
-  local i gap_start gap_end count=${#sound_on[@]}
+  local i count=${#sound_on[@]} start_low start_high end_low end_high len_low len_high
+  silent_delay_low=
+  silent_delay_high=
   for ((i = 0; i <= count; i++)); do
-    if ((i == 0)); then gap_start=0; else gap_start=${sound_off[i - 1]}; fi
-    if ((i == count)); then gap_end=$recording_end; else gap_end=${sound_on[i]}; fi
-    ((gap_end > $1 && gap_end - gap_start >= stop_silence_ms)) || continue
-    silent_at=$((gap_start > $1 ? gap_start : $1))
-    ((silent_at <= $2)) && return 0
-    return 1
+    if ((i == 0)); then
+      start_low=0
+      start_high=0
+    else
+      start_low=${sound_off_early[i - 1]}
+      start_high=${sound_off[i - 1]}
+    fi
+    if ((i == count)); then
+      end_low=$recording_end_early
+      end_high=$never_ms
+      len_low=$recording_trail_min
+      len_high=$never_ms
+    else
+      end_low=${sound_on_early[i]}
+      end_high=${sound_on[i]}
+      len_low=${sound_gap_min[i]}
+      if ((i == 0)); then len_high=$never_ms; else len_high=$((end_high - start_low)); fi
+    fi
+    # May hold: may end after the earliest FROM, may last long enough, may start by the latest end of
+    # the window.
+    ((end_high > $1 && len_high >= stop_silence_ms && start_low <= $2 + $3)) || continue
+    [[ -n $silent_delay_low ]] || silent_delay_low=$((start_low > $2 ? start_low - $2 : 0))
+    # Holds: ends after the latest FROM, lasts long enough and starts by the earliest end of the
+    # window, at every time between the bounds.
+    if ((end_low > $2 && len_low >= stop_silence_ms && start_high <= $1 + $3)); then
+      silent_delay_high=$((start_high > $1 ? start_high - $1 : 0))
+      return 0
+    fi
   done
+  [[ -n $silent_delay_low ]] && return 2
   return 1
 }
 
-# cancel_heard STOP_MS NEXT_MS: set heard_ms to how long after STOP the rig still heard sound before
-# NEXT, the next sound the step expects: the end of the last sound that spans STOP or starts after
-# it, so a word after any pause or silence counts; 0 when the rig was quiet from STOP. heard_ms is
-# from the sounds' ends never early, so the true time is no longer; heard_early_ms is the same from
-# their ends never late, so the true time is no shorter. It fails when the rig did not hear sound up
-# to STOP (within a pause of silence_ms), which leaves the cancel untimed.
+# cancel_heard STOP_MS NEXT_MS LIMIT: set heard_ms to how long after STOP the rig still heard sound
+# before NEXT, the next sound the step expects, from the sounds before the LIMITth (the next
+# question's chime, or all of them): the end of the last sound that spans STOP or starts after it,
+# so a word after any pause or silence counts; 0 when the rig was quiet from STOP. heard_ms counts
+# every sound that may start before NEXT, at its end's late bound, so the true time is no longer;
+# heard_early_ms only those that certainly do, at its end's early bound, so the true time is no
+# shorter. It fails when the recording does not show that the rig heard sound up to STOP (within a
+# pause of silence_ms): a sound that certainly began by STOP and certainly lasted to STOP less
+# silence_ms. Without one the cancel is untimed.
 heard_ms=
 heard_early_ms=
 cancel_heard() {
   local i heard_up_to=false
   heard_ms=0
   heard_early_ms=0
-  for i in "${!sound_on[@]}"; do
-    ((sound_on[i] < $2)) || continue
-    ((sound_on[i] <= $1 && sound_off[i] >= $1 - silence_ms)) && heard_up_to=true
+  for ((i = 0; i < $3; i++)); do
+    ((sound_on_early[i] < $2)) || continue
     ((sound_off[i] > $1 + heard_ms)) && heard_ms=$((sound_off[i] - $1))
+    ((sound_on[i] < $2)) || continue
     ((sound_off_early[i] > $1 + heard_early_ms)) && heard_early_ms=$((sound_off_early[i] - $1))
+    ((sound_on[i] <= $1 && sound_off_early[i] >= $1 - silence_ms)) && heard_up_to=true
   done
   [[ $heard_up_to == true ]]
 }
@@ -1180,16 +1494,25 @@ analyse_rig() {
     || unknown "rig microphone: no sound above $rig_threshold_db dB in the whole run: it could not hear the Jabra"
 }
 
+# undecided WHAT LOW HIGH LIMIT: UNKNOWN, as WHAT lies between LOW and HIGH ms (HIGH never_ms when
+# the recording sets no upper bound), and LIMIT lies between them too.
+undecided() {
+  (($3 < never_ms)) \
+    || unknown "$1: no less than $2 ms, but the recording cannot show that it is within $4 ms"
+  unknown "$1: between $2 and $3 ms, so whether it is within $4 ms is not known: the recording's times for it may be up to $(($3 - $2)) ms late"
+}
+
 # ---- steps ----
 
 step_exchange() {
-  local wake exchange spoken ready spoken_again wake_ms exchange_ms spoken_ms session question_started question_ended
-  local chime_onset chime_end speech_onset measured i
+  local wake exchange spoken ready spoken_again wake_ms exchange_ms spoken_ms session question_started question_ended question_end_early
+  local rc chime_low chime_high chime_len from_low from_high speech_low speech_high
   start_voice_run "$loopback_mic" "$loopback_speaker" "$voice_on"
   start_recording "$speaker_capture" "$work_dir/speaker.wav"
   play_clip question "$question"
   question_started=$clip_started
   question_ended=$clip_ended
+  question_end_early=$clip_end_early
 
   wait_for_event voice_wake 1 $((question_ended + event_timeout * 1000)) \
     || fail "voice_wake: none within $event_timeout s of the end of the question$(ws_ended)"
@@ -1229,37 +1552,56 @@ step_exchange() {
   fi
 
   # A short tail, then the recording ends and is read: a chime soon after voice_wake, and speech
-  # after voice_exchange_started soon after the end of the question.
+  # after voice_exchange_started soon after the end of the question. Each is the first sound from its
+  # event on, and its delay lies between two bounds.
   sleep 0.3
   stop_recording
   analyse_recording "$loopback_threshold_db"
   ((${#sound_on[@]} > 0)) \
     || unknown "speaker recording: no sound at all, though voice_spoken came: it could not hear the speaker"
-  first_sound $((wake_ms - lead_ms)) 9999999999999 || fail 'chime: no sound in the speaker recording after voice_wake'
-  i=$found_sound
-  chime_onset=${sound_on[i]}
-  chime_end=${sound_off[i]}
-  measured=$((chime_onset - wake_ms))
-  ((measured <= chime_ms)) || fail "chime: $measured ms after voice_wake, more than $chime_ms ms"
-  pass "chime $measured ms after voice_wake; the sound lasts $((chime_end - chime_onset)) ms"
-  speech_onset=
-  for i in "${!sound_on[@]}"; do
-    if ((sound_on[i] >= chime_onset + sound_max_ms && sound_on[i] >= exchange_ms)); then
-      speech_onset=${sound_on[i]}
-      break
-    fi
-  done
-  [[ -n $speech_onset ]] || fail 'speech: no sound in the speaker recording after the chime and voice_exchange_started'
-  measured=$((speech_onset - question_ended))
-  ((measured <= speech_ms)) || fail "speech: $measured ms after the end of the question, more than $speech_ms ms"
-  pass "speech $measured ms after the end of the question"
+  onset_between $((wake_ms - lead_ms)) $((wake_ms - lead_ms)) "$never_ms"
+  rc=$?
+  if ((rc == 1)); then
+    ((wake_ms + chime_ms <= recording_end_early)) \
+      || unknown "chime: no sound in the speaker recording after voice_wake, which shows every sound only up to $((recording_end_early - wake_ms)) ms after it, less than $chime_ms ms"
+    fail 'chime: no sound in the speaker recording after voice_wake'
+  fi
+  chime_low=$onset_low
+  chime_high=$never_ms
+  ((rc == 0)) && chime_high=$onset_high
+  chime_len=${sound_len[${found_sound:-$maybe_sound}]}
+  ((chime_low - wake_ms <= chime_ms)) || fail "chime: no earlier than $((chime_low - wake_ms)) ms after voice_wake, more than $chime_ms ms"
+  # The speech starts at least sound_max_ms after the chime's onset, and at or after
+  # voice_exchange_started.
+  from_low=$((chime_low + sound_max_ms > exchange_ms ? chime_low + sound_max_ms : exchange_ms))
+  from_high=$never_ms
+  ((chime_high < never_ms)) && from_high=$((chime_high + sound_max_ms > exchange_ms ? chime_high + sound_max_ms : exchange_ms))
+  onset_between "$from_low" "$from_high" "$never_ms"
+  rc=$?
+  if ((rc == 1)); then
+    ((question_ended + speech_ms <= recording_end_early)) \
+      || unknown "speech: no sound in the speaker recording after the chime and voice_exchange_started, which shows every sound only up to $((recording_end_early - question_ended)) ms after the end of the question, less than $speech_ms ms"
+    fail 'speech: no sound in the speaker recording after the chime and voice_exchange_started'
+  fi
+  # The question ended between question_end_early and question_ended: the delay is no less than the
+  # onset's early bound less the latest end, and no more than its late bound less the earliest.
+  speech_low=$((onset_low - question_ended))
+  speech_high=$never_ms
+  ((rc == 0)) && speech_high=$((onset_high - question_end_early))
+  chime_low=$((chime_low - wake_ms))
+  ((chime_high < never_ms)) && chime_high=$((chime_high - wake_ms))
+  ((speech_low <= speech_ms)) || fail "speech: no earlier than $speech_low ms after the end of the question, more than $speech_ms ms"
+  ((chime_high <= chime_ms)) || undecided 'chime: its delay after voice_wake' "$chime_low" "$chime_high" "$chime_ms"
+  ((speech_high <= speech_ms)) || undecided 'speech: its delay after the end of the question' "$speech_low" "$speech_high" "$speech_ms"
+  pass "chime $chime_high ms after voice_wake (no earlier than $chime_low ms); the sound lasts $((chime_len / 1000)) ms"
+  pass "speech $speech_high ms after the end of the question (no earlier than $speech_low ms)"
 }
 
 # step_wake_sound: verification c-wake-pi. Each call goes in with the Output closed (idle longer than
 # its 300 ms close); the wake sound's arrival at the Jabra, at the rig microphone, is timed from the
 # wake_heard line of the voice timing log.
 step_wake_sound() {
-  local i next latencies=() call_start=() call_wake=() median max
+  local i from to rc lows=() highs=() call_start=() call_wake=() median_low median_high max_low max_high
   start_rig_run
   for ((i = 1; i <= calls; i++)); do
     play_clip "call $i" "$question"
@@ -1271,27 +1613,50 @@ step_wake_sound() {
     sleep "$idle_seconds"
   done
   analyse_rig
+  # Each call's wake sound is the first sound from its wake_heard (less lead_ms) to the next call, and
+  # its delay lies between two bounds; so do the longest and the median.
   for ((i = 0; i < calls; i++)); do
-    if ((i + 1 < calls)); then next=${call_start[i + 1]}; else next=$recording_end; fi
-    first_sound $((call_wake[i] - lead_ms)) "$next" \
-      || fail "wake-sound call $((i + 1)): no sound at the rig microphone after its wake_heard"
-    latencies+=($((sound_on[found_sound] - call_wake[i])))
-    note "wake-sound call $((i + 1)): the wake sound reached the rig microphone ${latencies[i]} ms after wake_heard"
+    from=$((call_wake[i] - lead_ms))
+    to=$never_ms
+    ((i + 1 < calls)) && to=${call_start[i + 1]}
+    onset_between "$from" "$from" "$to"
+    rc=$?
+    if ((rc == 1)); then
+      ((to <= recording_end_early || call_wake[i] + wake_max_ms <= recording_end_early)) \
+        || unknown "wake-sound call $((i + 1)): no sound at the rig microphone after its wake_heard, and the rig recording shows every sound only up to $((recording_end_early - call_wake[i])) ms after it, less than $wake_max_ms ms"
+      fail "wake-sound call $((i + 1)): no sound at the rig microphone after its wake_heard"
+    fi
+    lows+=($((onset_low - call_wake[i])))
+    if ((rc == 0)); then
+      highs+=($((onset_high - call_wake[i])))
+      note "wake-sound call $((i + 1)): the wake sound reached the rig microphone ${highs[i]} ms after wake_heard (no earlier than ${lows[i]} ms)"
+    else
+      highs+=("$never_ms")
+      note "wake-sound call $((i + 1)): a sound may have reached the rig microphone ${lows[i]} ms after wake_heard, but the recording cannot show which sound is the wake sound"
+    fi
   done
-  max=$(maximum "${latencies[@]}")
-  median=$(percentile 50 "${latencies[@]}")
-  ((max <= wake_max_ms)) || fail "wake-sound: a call took $max ms from wake_heard to the wake sound at the Jabra, more than $wake_max_ms ms"
-  pass "wake-sound: no call passed $wake_max_ms ms (the longest took $max ms, over $calls calls)"
-  ((median <= wake_median_ms)) || fail "wake-sound: median $median ms from wake_heard to the wake sound at the Jabra, more than $wake_median_ms ms"
-  pass "wake-sound: median $median ms from wake_heard to the wake sound at the Jabra, at most $wake_median_ms ms"
+  max_low=$(maximum "${lows[@]}")
+  max_high=$(maximum "${highs[@]}")
+  median_low=$(percentile 50 "${lows[@]}")
+  median_high=$(percentile 50 "${highs[@]}")
+  ((max_low <= wake_max_ms)) || fail "wake-sound: a call took $max_low ms or more from wake_heard to the wake sound at the Jabra, more than $wake_max_ms ms"
+  ((median_low <= wake_median_ms)) || fail "wake-sound: median $median_low ms or more from wake_heard to the wake sound at the Jabra, more than $wake_median_ms ms"
+  ((max_high <= wake_max_ms)) || undecided 'wake-sound: the longest call from wake_heard to the wake sound at the Jabra' "$max_low" "$max_high" "$wake_max_ms"
+  ((median_high <= wake_median_ms)) || undecided 'wake-sound: the median from wake_heard to the wake sound at the Jabra' "$median_low" "$median_high" "$wake_median_ms"
+  pass "wake-sound: no call passed $wake_max_ms ms (the longest took $max_high ms, no less than $max_low ms, over $calls calls)"
+  pass "wake-sound: median $median_high ms from wake_heard to the wake sound at the Jabra (no less than $median_low ms), at most $wake_median_ms ms"
 }
 
 # step_scripted: verification c-fast-answer-pi. t0 is the end of the injected question on the
-# driver's clock; the first fact is the first sound at the rig microphone of the sentence the
-# timing log marks fact_audio. A fact sentence that follows the one before it with no gap is
-# placed by the path from the voice's first frame (first_audio) to its first sound at the rig.
+# driver's clock, between its clip's earliest end and when aplay returned (play_clip); the first fact
+# is the first sound at the rig microphone of the sentence the timing log marks fact_audio. A fact
+# sentence that follows the one before it with no gap is placed by the path from the voice's first
+# frame (first_audio) to its first sound at the rig. Each question's time to the first fact lies
+# between two bounds, the early one from the latest t0 and the late one from the earliest, and so do
+# the median and the 90th percentile.
 step_scripted() {
-  local engine clip files=() i t0s fact_at first_at latencies median p90 path
+  local engine clip files=() i t0s t0s_early fact_at first_at path rc placed fact_low path_low path_high lows highs
+  local median_low median_high p90_low p90_high
   mapfile -t files < <(wav_files "$question_dir" | head -n "$questions")
   for engine in "${engines[@]}"; do
     if ! start_unit_run "$loopback_mic" "$voice_on" "GHOST_WISPR_VOICE_ENGINE=$engine"; then
@@ -1307,12 +1672,14 @@ step_scripted() {
     start_recording "$rig_mic" "$work_dir/rig.$unit_runs.wav"
     sleep "$idle_seconds"
     t0s=()
+    t0s_early=()
     fact_at=()
     first_at=()
     for ((i = 0; i < questions; i++)); do
       clip=${files[i]}
       play_clip "scripted $engine question $((i + 1))" "$clip"
       t0s+=("$clip_ended")
+      t0s_early+=("$clip_end_early")
       wait_for_timing fact_audio "$clip_started" $((clip_ended + event_timeout * 1000)) \
         || timing_fail "scripted $engine question $((i + 1)) (${clip##*/}): no sentence marked fact_audio in the timing log within $event_timeout s"
       fact_at+=("$timing_at")
@@ -1323,25 +1690,56 @@ step_scripted() {
       sleep "$idle_seconds"
     done
     analyse_rig
-    latencies=()
+    lows=()
+    highs=()
     for ((i = 0; i < questions; i++)); do
-      if first_sound $((fact_at[i] - lead_ms)) $((fact_at[i] + fact_window_ms)); then
-        latencies+=($((sound_on[found_sound] - t0s[i])))
-        note "scripted $engine question $((i + 1)): the first fact reached the rig microphone ${latencies[i]} ms after t0"
-      elif [[ -n ${first_at[i]} ]] && first_sound $((first_at[i] - lead_ms)) $((first_at[i] + fact_window_ms)); then
-        path=$((sound_on[found_sound] - first_at[i]))
-        latencies+=($((fact_at[i] + path - t0s[i])))
-        note "scripted $engine question $((i + 1)): the first fact followed the sentence before it with no gap; placed at fact_audio plus the $path ms path to the rig: ${latencies[i]} ms after t0"
+      onset_between $((fact_at[i] - lead_ms)) $((fact_at[i] - lead_ms)) $((fact_at[i] + fact_window_ms))
+      rc=$?
+      fact_low=$onset_low
+      if ((rc == 0)); then
+        lows+=($((fact_low - t0s[i])))
+        highs+=($((onset_high - t0s_early[i])))
+        note "scripted $engine question $((i + 1)): the first fact reached the rig microphone ${highs[i]} ms after t0 (no earlier than ${lows[i]} ms)"
+        continue
+      fi
+      # No sound certainly starts where the fact belongs: it may follow the sentence before it with
+      # no gap, placed by the path from first_audio.
+      placed=1
+      path_low=$never_ms
+      path_high=$never_ms
+      if [[ -n ${first_at[i]} ]]; then
+        onset_between $((first_at[i] - lead_ms)) $((first_at[i] - lead_ms)) $((first_at[i] + fact_window_ms))
+        placed=$?
+        ((placed != 1)) && path_low=$((fact_at[i] + onset_low - first_at[i] - t0s[i]))
+        ((placed == 0)) && path_high=$((fact_at[i] + onset_high - first_at[i] - t0s_early[i]))
+      fi
+      ((rc != 1 || placed != 1)) \
+        || unknown "scripted $engine question $((i + 1)): the rig microphone heard no sound within $fact_window_ms ms of the voice's first frame or of its first fact"
+      if ((rc == 1)); then
+        lows+=("$path_low")
+        highs+=("$path_high")
+        if ((path_high < never_ms)); then
+          note "scripted $engine question $((i + 1)): the first fact followed the sentence before it with no gap; placed at fact_audio plus the path from first_audio to the rig: ${highs[i]} ms after t0 (no earlier than ${lows[i]} ms)"
+        else
+          note "scripted $engine question $((i + 1)): the first fact followed the sentence before it with no gap; a sound may start where its first frame belongs, placing it no earlier than ${lows[i]} ms after t0, but the recording cannot show which sound is that frame's"
+        fi
       else
-        unknown "scripted $engine question $((i + 1)): the rig microphone heard no sound within $fact_window_ms ms of the voice's first frame or of its first fact"
+        # Either a sound in the fact's own window is the fact, or the path places it.
+        lows+=($((placed != 1 && path_low < fact_low - t0s[i] ? path_low : fact_low - t0s[i])))
+        highs+=("$never_ms")
+        note "scripted $engine question $((i + 1)): a sound may start where the first fact belongs, no earlier than ${lows[i]} ms after t0, but the recording cannot show whether it is the fact"
       fi
     done
-    median=$(percentile 50 "${latencies[@]}")
-    p90=$(percentile 90 "${latencies[@]}")
-    ((median <= fact_median_ms)) || fail "scripted $engine: median $median ms from t0 to the first fact at the Jabra, more than $fact_median_ms ms; this voice is past the bound"
-    pass "scripted $engine: median $median ms from t0 to the first fact at the Jabra, at most $fact_median_ms ms"
-    ((p90 <= fact_p90_ms)) || fail "scripted $engine: 90th percentile $p90 ms from t0 to the first fact at the Jabra, more than $fact_p90_ms ms; this voice is past the bound"
-    pass "scripted $engine: 90th percentile $p90 ms from t0 to the first fact at the Jabra, at most $fact_p90_ms ms"
+    median_low=$(percentile 50 "${lows[@]}")
+    median_high=$(percentile 50 "${highs[@]}")
+    p90_low=$(percentile 90 "${lows[@]}")
+    p90_high=$(percentile 90 "${highs[@]}")
+    ((median_low <= fact_median_ms)) || fail "scripted $engine: median $median_low ms or more from t0 to the first fact at the Jabra, more than $fact_median_ms ms; this voice is past the bound"
+    ((p90_low <= fact_p90_ms)) || fail "scripted $engine: 90th percentile $p90_low ms or more from t0 to the first fact at the Jabra, more than $fact_p90_ms ms; this voice is past the bound"
+    ((median_high <= fact_median_ms)) || undecided "scripted $engine: the median from t0 to the first fact at the Jabra" "$median_low" "$median_high" "$fact_median_ms"
+    ((p90_high <= fact_p90_ms)) || undecided "scripted $engine: the 90th percentile from t0 to the first fact at the Jabra" "$p90_low" "$p90_high" "$fact_p90_ms"
+    pass "scripted $engine: median $median_high ms from t0 to the first fact at the Jabra (no less than $median_low ms), at most $fact_median_ms ms"
+    pass "scripted $engine: 90th percentile $p90_high ms from t0 to the first fact at the Jabra (no less than $p90_low ms), at most $fact_p90_ms ms"
   done
 }
 
@@ -1529,7 +1927,8 @@ step_ask_holder() {
   pass "ask-holder: voice_answer_ready on /ws, same session_id"
   answer_at=
   if whole_number "${asked:-}"; then
-    answer_at=$(timing_first answer_ready "$asked" 9999999999999) \
+    # asked_at is a wall time only, so the answer's is too.
+    answer_at=$(timing_first answer_ready "$asked" "$never_ms" wall) \
       || unknown "voice timing log: cannot read the journal of $unit (process $unit_pid)$(journal_error)"
   fi
   if [[ -n $answer_at ]]; then
@@ -1615,12 +2014,13 @@ probe_says() {
 }
 
 # spoken_after SESSION FROM_MS DEADLINE_MS: wait for the first voice_spoken of SESSION timed at FROM
-# or later; set event_json to it. A voice_spoken of another meeting, or one before FROM, is not it.
+# or later on now_ms's clock; set event_json to it. A voice_spoken of another meeting, or one before
+# FROM, is not it.
 spoken_after() {
   local event at
   while :; do
     while IFS= read -r event; do
-      at=$(time_ms "$(jq -r '.timestamp' <<<"$event")")
+      at=$(mono_ms "$event")
       if whole_number "$at" && ((at >= $2)); then
         event_json=$event
         return 0
@@ -1631,19 +2031,20 @@ spoken_after() {
   done
 }
 
-# words_heard FROM_MS TO_MS: set found_sound to the first sound at the rig that lasts longer than the
-# wake sound can (sound_max_ms), so speech and not the wake sound that "Wispr, go ahead" itself
-# brings, and whose onset may lie in [FROM, TO): its late bound at FROM or later and its early bound
-# before TO. It succeeds when that onset certainly lies there: its early bound at FROM or later, so
-# the words began after FROM, and its late bound before TO. It fails with found_sound set when the
-# bounds cannot tell, and with found_sound empty when no such sound may start there.
+# words_heard FROM_LOW FROM_HIGH TO_MS: set found_sound to the first sound at the rig that lasts
+# longer than the wake sound can (sound_max_ms), so speech and not the wake sound that "Wispr, go
+# ahead" itself brings, and whose onset may lie at or after FROM, a time known to lie in [FROM_LOW,
+# FROM_HIGH], and before TO: its late bound at FROM_LOW or later and its early bound before TO. It
+# succeeds when that onset certainly lies there: its early bound at FROM_HIGH or later, so the words
+# began after FROM, and its late bound before TO. It fails with found_sound set when the bounds cannot
+# tell, and with found_sound empty when no such sound may start there.
 words_heard() {
   local i
   found_sound=
   for i in "${!sound_on[@]}"; do
-    ((sound_len[i] > sound_max_ms * 1000 && sound_on[i] >= $1 && sound_on_early[i] < $2)) || continue
+    ((sound_len[i] > sound_max_ms * 1000 && sound_on[i] >= $1 && sound_on_early[i] < $3)) || continue
     found_sound=$i
-    ((sound_on_early[i] >= $1 && sound_on[i] < $2))
+    ((sound_on_early[i] >= $2 && sound_on[i] < $3))
     return
   done
   return 1
@@ -1656,11 +2057,13 @@ words_heard() {
 # hold to this run's recording session and to the go-ahead: the pointer names the meeting the
 # agent joined; the agent is told its words were spoken only after the go-ahead ended, with a
 # voice_spoken of that meeting after it; and the rig microphone hears the words after the go-ahead,
-# a sound longer than the wake sound, besides the hand sound. The words' onset is timed twice, as
-# playback-cancel times a tail: PASS when even its early bound is at or after the go-ahead's end and
-# its late bound before voice_spoken, FAIL when no such sound may start there, UNKNOWN otherwise.
+# a sound longer than the wake sound, besides the hand sound. Each clip's end lies between its
+# earliest end and when aplay returned (play_clip), and the words' onset between its two bounds, as
+# playback-cancel times a tail: each check passes only where it holds across both, fails only where
+# it fails across both, and is UNKNOWN otherwise, after any FAIL.
 step_joined() {
-  local envoy_url auth session mention_ended floor_at hand_at deadline pointed go_ahead_ended spoken_at outcome told_at
+  local envoy_url auth session mention_ended mention_end_early floor_at hand_at deadline pointed go_ahead_ended go_ahead_end_early
+  local spoken_at outcome told_at gap_unknown='' told_unknown=''
   envoy_url=$(setting GHOST_WISPR_CONCIERGE_ENVOY_URL concierge envoy_url) \
     || unknown 'joined: the unit names no Envoy URL (concierge.envoy_url or GHOST_WISPR_CONCIERGE_ENVOY_URL)'
   start_rig_run
@@ -1698,6 +2101,7 @@ step_joined() {
 
   play_clip mention "$mention"
   mention_ended=$clip_ended
+  mention_end_early=$clip_end_early
   probe_step pointer $((mention_ended + event_timeout * 1000)) \
     || fail "joined: no pointer within $event_timeout s of the mention of $join_issue: $(probe_says)"
   pointed=$(jq -r '.recording_session' <<<"$probe_json")
@@ -1710,14 +2114,20 @@ step_joined() {
   pass "joined: the test agent read $(jq -r '.segments_in_range' <<<"$probe_json") segments in the pointer's time range from the recorder's API"
 
   probe_step floor_sent $(($(now_ms) + event_timeout * 1000)) || fail "joined: the test agent sent no floor request: $(probe_says)"
-  floor_at=$(time_ms "$(jq -r '.at' <<<"$probe_json")")
-  whole_number "$floor_at" || unknown "joined: cannot read the floor request's time: $probe_json"
+  floor_at=$(mono_ms "$probe_json")
+  whole_number "$floor_at" || unknown "joined: no at_mono_ns for the floor request, so its time cannot be compared with the driver's: $probe_json"
   wait_for_timing hand_chime $((floor_at - 1000)) $((floor_at + event_timeout * 1000)) \
     || timing_fail "joined: no hand_chime in the voice timing log within $event_timeout s of the floor request"
   hand_at=$timing_at
-  ((hand_at - mention_ended >= 1000)) \
-    || fail "joined: the hand sound began $((hand_at - mention_ended)) ms after the mention ended, before a gap of 1000 ms"
-  pass "joined: the hand sound began $((hand_at - floor_at)) ms after the floor request, $((hand_at - mention_ended)) ms after the last words"
+  # The gap from the mention's end to the hand sound: no more than from its earliest end, and no less
+  # than from when aplay returned.
+  ((hand_at - mention_end_early >= 1000)) \
+    || fail "joined: the hand sound began $((hand_at - mention_end_early)) ms or less after the mention ended, before a gap of 1000 ms"
+  if ((hand_at - mention_ended >= 1000)); then
+    pass "joined: the hand sound began $((hand_at - floor_at)) ms after the floor request, $((hand_at - mention_ended)) ms or more after the last words"
+  else
+    gap_unknown="joined: the hand sound began between $((hand_at - mention_ended)) and $((hand_at - mention_end_early)) ms after the mention ended: aplay returned $((mention_ended - mention_end_early)) ms after the earliest the clip could end, so whether the voice waited for a gap of 1000 ms is not known"
+  fi
 
   # The hand comes down on the go-ahead: an outcome the test agent already has was not invited.
   if probe_step hand "$(now_ms)"; then
@@ -1725,19 +2135,29 @@ step_joined() {
   fi
   play_clip go-ahead "$go_ahead"
   go_ahead_ended=$clip_ended
-  spoken_after "$session" "$go_ahead_ended" $((go_ahead_ended + event_timeout * 1000)) \
-    || fail "joined: no voice_spoken for recording session $session within $event_timeout s of the end of the go-ahead$(ws_ended)"
+  go_ahead_end_early=$clip_end_early
+  # A voice_spoken at or after aplay returned came after the go-ahead; one before its earliest end
+  # came during it, and is not it; one between may be either.
+  if ! spoken_after "$session" "$go_ahead_ended" $((go_ahead_ended + event_timeout * 1000)); then
+    spoken_after "$session" "$go_ahead_end_early" "$(now_ms)" \
+      && unknown "joined: the only voice_spoken for recording session $session came $((go_ahead_ended - $(mono_ms "$event_json"))) ms before aplay returned from the go-ahead, after the earliest the clip could end, so whether it came after the go-ahead is not known"
+    fail "joined: no voice_spoken for recording session $session within $event_timeout s of the end of the go-ahead$(ws_ended)"
+  fi
   check_voice_event 'joined: voice_spoken' "$event_json" "$session"
   spoken_at=$event_at
-  pass "joined: voice_spoken for recording session $session $((spoken_at - go_ahead_ended)) ms after the go-ahead ended"
+  pass "joined: voice_spoken for recording session $session $((spoken_at - go_ahead_ended)) ms or more after the go-ahead ended"
   probe_step hand $(($(now_ms) + event_timeout * 1000)) || fail "joined: the test agent was not told how its hand came down: $(probe_says)"
   outcome=$(jq -r '.outcome' <<<"$probe_json")
   [[ $outcome == spoken ]] || fail "joined: the hand came down $outcome, not spoken"
-  told_at=$(time_ms "$(jq -r '.at' <<<"$probe_json")")
-  whole_number "$told_at" || unknown "joined: cannot read when the test agent was told how its hand came down: $probe_json"
-  ((told_at >= go_ahead_ended)) \
-    || fail "joined: the test agent was told its hand came down spoken $((go_ahead_ended - told_at)) ms before the go-ahead ended"
-  pass "joined: the agent's words were spoken on \"Wispr, go ahead\", and it was told so $((told_at - go_ahead_ended)) ms after the go-ahead ended"
+  told_at=$(mono_ms "$probe_json")
+  whole_number "$told_at" || unknown "joined: no at_mono_ns for when the test agent was told how its hand came down, so it cannot be compared with the driver's: $probe_json"
+  ((told_at >= go_ahead_end_early)) \
+    || fail "joined: the test agent was told its hand came down spoken $((go_ahead_end_early - told_at)) ms or more before the go-ahead ended"
+  if ((told_at >= go_ahead_ended)); then
+    pass "joined: the agent's words were spoken on \"Wispr, go ahead\", and it was told so $((told_at - go_ahead_ended)) ms or more after the go-ahead ended"
+  else
+    told_unknown="joined: the test agent was told its hand came down spoken between $((told_at - go_ahead_ended)) and $((told_at - go_ahead_end_early)) ms from the end of the go-ahead, so whether it was told after the go-ahead ended is not known"
+  fi
 
   probe_step leave_sent $(($(now_ms) + event_timeout * 1000)) || fail "joined: the test agent did not leave: $(probe_says)"
   wait_for_event agent_left 1 $(($(now_ms) + event_timeout * 1000)) \
@@ -1747,26 +2167,48 @@ step_joined() {
   wait "$probe_pid" 2>/dev/null
 
   analyse_rig
-  first_sound $((hand_at - lead_ms)) $((hand_at + sound_max_ms)) \
-    || fail 'joined: no sound at the rig microphone within 400 ms of hand_chime'
-  pass "joined: the hand sound reached the Jabra $((sound_on[found_sound] - hand_at)) ms after hand_chime"
-  if ! words_heard "$go_ahead_ended" "$spoken_at"; then
-    [[ -n $found_sound ]] \
-      || fail "joined: no words at the rig microphone between the end of the go-ahead and voice_spoken: no sound there lasted longer than the wake sound's $sound_max_ms ms"
+  # The hand sound is the first sound from hand_chime (less lead_ms) to sound_max_ms after it; the
+  # words, words_heard. A FAIL of either comes before an UNKNOWN of either.
+  local hand hand_low hand_high hand_unknown=
+  onset_between $((hand_at - lead_ms)) $((hand_at - lead_ms)) $((hand_at + sound_max_ms))
+  hand=$?
+  hand_low=$onset_low
+  hand_high=$onset_high
+  case $hand in
+    0) pass "joined: the hand sound reached the Jabra $((hand_high - hand_at)) ms after hand_chime (no earlier than $((hand_low - hand_at)) ms after it)" ;;
+    1)
+      ((hand_at + sound_max_ms <= recording_end_early)) \
+        || unknown "joined: no sound at the rig microphone within $sound_max_ms ms of hand_chime, but the rig recording shows every sound only up to $((recording_end_early - hand_at)) ms after it"
+      fail "joined: no sound at the rig microphone within $sound_max_ms ms of hand_chime"
+      ;;
+    2) hand_unknown="joined: a sound at the rig microphone starts between $((sound_on_early[maybe_sound] - hand_at)) and $((sound_on[maybe_sound] - hand_at)) ms from hand_chime: the recording's times may be up to $((sound_on[maybe_sound] - sound_on_early[maybe_sound])) ms late, so whether the hand sound reached the Jabra within $sound_max_ms ms of hand_chime is not known" ;;
+  esac
+  if ! words_heard "$go_ahead_end_early" "$go_ahead_ended" "$spoken_at"; then
+    if [[ -z $found_sound ]]; then
+      ((spoken_at <= recording_end_early)) \
+        || unknown "joined: no words at the rig microphone after the end of the go-ahead, but the rig recording shows every sound only up to $((recording_end_early - go_ahead_ended)) ms after it, and voice_spoken came at $((spoken_at - go_ahead_ended)) ms"
+      fail "joined: no words at the rig microphone between the end of the go-ahead and voice_spoken: no sound there lasted longer than the wake sound's $sound_max_ms ms"
+    fi
     unknown "joined: a sound at the rig microphone longer than the wake sound starts between $((sound_on_early[found_sound] - go_ahead_ended)) and $((sound_on[found_sound] - go_ahead_ended)) ms from the end of the go-ahead, and voice_spoken came at $((spoken_at - go_ahead_ended)) ms: the recording's times may be up to $((sound_on[found_sound] - sound_on_early[found_sound])) ms late, so whether the agent's words began after the go-ahead and before voice_spoken is not known"
   fi
+  [[ -z $hand_unknown ]] || unknown "$hand_unknown"
+  [[ -z $gap_unknown ]] || unknown "$gap_unknown"
+  [[ -z $told_unknown ]] || unknown "$told_unknown"
   pass "joined: the agent's words reached the Jabra $((sound_on[found_sound] - go_ahead_ended)) ms after the go-ahead ended (no earlier than $((sound_on_early[found_sound] - go_ahead_ended)) ms after it), for $((sound_len[found_sound] / 1000)) ms"
 }
 
 # step_barge_in: verification c-stop-pi. The run's microphone is the loopback, so each clip goes
-# into it, timed from aplay's start, and the rig microphone hears only the Jabra. Stops are read at
-# the Jabra: speech that went quiet for at least stop_silence_ms within stop_window_ms of the clip's
-# start. A round in which the voice logged no stop and its answer ended by itself (voice_spoken) is
-# not counted.
+# into it, and the rig microphone hears only the Jabra. Stops are read at the Jabra: speech that went
+# quiet for at least stop_silence_ms within stop_window_ms of the clip's start (silence_from), which
+# lies between when aplay began and the latest the clip can have begun (play_clip). A round in which
+# the voice logged no stop and its answer ended by itself inside the window (voice_spoken) is not
+# counted. A round the recording's times cannot decide counts against the step: a backchannel that
+# may have stopped the speech as one that did, until the allowance is passed, and then UNKNOWN; a
+# talk-over that may not have, UNKNOWN.
 step_barge_in() {
-  local kinds=() clips=() talkover_files=() backchannel_files=() i kind clip spoken_count speech_at
-  local starts=() ended_alone=() latencies=() stopped_backchannels=0 counted_backchannels=0 counted_talkovers=0
-  local no_stop=() allowed limit spoken_at stop_at
+  local kinds=() clips=() talkover_files=() backchannel_files=() i kind clip spoken_count speech_at rc
+  local starts=() starts_late=() ended_alone=() lows=() highs=() stopped_backchannels=0 counted_backchannels=0 counted_talkovers=0
+  local no_stop=() unsure_talkovers=() unsure_backchannels=() allowed limit limit_late spoken_at stop_at median_low median_high
   mapfile -t talkover_files < <(wav_files "$talkover_dir" | head -n "$talkovers")
   mapfile -t backchannel_files < <(wav_files "$backchannel_dir" | head -n "$backchannels")
   for ((i = 0; i < talkovers || i < backchannels; i++)); do
@@ -1791,9 +2233,11 @@ step_barge_in() {
     sleep "$(awk -v ms=$((speech_at + 1000 - $(now_ms))) 'BEGIN { printf "%.3f", (ms > 0 ? ms : 0) / 1000 }')"
     play_clip "barge-in round $((i + 1)) $kind" "$clip"
     starts+=("$clip_started")
+    starts_late+=("$clip_start_late")
     limit=$((clip_started + stop_window_ms))
-    # Wait out the window, then the end of the answer if it goes on.
-    while (($(now_ms) < limit)); do sleep 0.2; done
+    limit_late=$((clip_start_late + stop_window_ms))
+    # Wait out the window, to its latest end, then the end of the answer if it goes on.
+    while (($(now_ms) < limit_late)); do sleep 0.2; done
     stop_at=$(timing_first stop "$clip_started" 9999999999999) \
       || unknown "voice timing log: cannot read the journal of $unit (process $unit_pid)$(journal_error)"
     if [[ -z $stop_at ]]; then
@@ -1804,7 +2248,8 @@ step_barge_in() {
       check_voice_event voice_spoken "$(ws_event voice_spoken $((spoken_count + 1)))"
       spoken_at=$event_at
     fi
-    # Ended by itself: no stop in the log, and the answer was spoken to its end inside the window.
+    # Ended by itself: no stop in the log, and the answer was spoken to its end inside the window, even
+    # its earliest end.
     if [[ -z $stop_at && -n $spoken_at ]] && ((spoken_at <= limit)); then ended_alone+=(true); else ended_alone+=(false); fi
     sleep "$idle_seconds"
   done
@@ -1815,37 +2260,68 @@ step_barge_in() {
       note "barge-in round $((i + 1)) ($kind): the answer ended by itself inside the window; not counted"
       continue
     fi
-    if silence_from "${starts[i]}" $((starts[i] + stop_window_ms)); then
-      if [[ $kind == talk-over ]]; then
-        latencies+=($((silent_at - starts[i])))
-        counted_talkovers=$((counted_talkovers + 1))
-        note "barge-in round $((i + 1)) (talk-over): the Jabra went quiet $((silent_at - starts[i])) ms after the clip began"
-      else
-        stopped_backchannels=$((stopped_backchannels + 1))
-        counted_backchannels=$((counted_backchannels + 1))
-        note "barge-in round $((i + 1)) (backchannel): it stopped the speech; the Jabra went quiet $((silent_at - starts[i])) ms after the clip began"
-      fi
-    elif [[ $kind == talk-over ]]; then
-      no_stop+=($((i + 1)))
+    silence_from "${starts[i]}" "${starts_late[i]}" "$stop_window_ms"
+    rc=$?
+    if [[ $kind == talk-over ]]; then
       counted_talkovers=$((counted_talkovers + 1))
-      note "barge-in round $((i + 1)) (talk-over): no stop: the Jabra kept sounding for $stop_window_ms ms after the clip began"
+      case $rc in
+        0)
+          lows+=("$silent_delay_low")
+          highs+=("$silent_delay_high")
+          note "barge-in round $((i + 1)) (talk-over): the Jabra went quiet $silent_delay_high ms after the clip began (no earlier than $silent_delay_low ms)"
+          ;;
+        1)
+          no_stop+=($((i + 1)))
+          note "barge-in round $((i + 1)) (talk-over): no stop: the Jabra kept sounding for $stop_window_ms ms after the clip began"
+          ;;
+        2)
+          unsure_talkovers+=($((i + 1)))
+          lows+=("$silent_delay_low")
+          highs+=("$never_ms")
+          note "barge-in round $((i + 1)) (talk-over): the Jabra may have gone quiet $silent_delay_low ms after the clip began, but the recording's times cannot show that it did"
+          ;;
+      esac
     else
       counted_backchannels=$((counted_backchannels + 1))
-      note "barge-in round $((i + 1)) (backchannel): the speech went on"
+      case $rc in
+        0)
+          stopped_backchannels=$((stopped_backchannels + 1))
+          note "barge-in round $((i + 1)) (backchannel): it stopped the speech; the Jabra went quiet $silent_delay_high ms after the clip began (no earlier than $silent_delay_low ms)"
+          ;;
+        1) note "barge-in round $((i + 1)) (backchannel): the speech went on" ;;
+        2)
+          unsure_backchannels+=($((i + 1)))
+          note "barge-in round $((i + 1)) (backchannel): the speech may have stopped, the Jabra quiet from $silent_delay_low ms after the clip began, but the recording's times cannot show whether it did"
+          ;;
+      esac
     fi
   done
+  allowed=$((backchannels / 10))
+  # A FAIL is proven, so it comes before any UNKNOWN.
   ((${#no_stop[@]} == 0)) || fail "barge-in: no stop on talk-over rounds ${no_stop[*]}: the Jabra kept sounding for $stop_window_ms ms after the clip began"
+  ((stopped_backchannels <= allowed)) || fail "barge-in: $stopped_backchannels of $backchannels backchannels stopped the speech, more than $allowed"
+  if ((${#lows[@]} > 0)); then
+    median_low=$(percentile 50 "${lows[@]}")
+    median_high=$(percentile 50 "${highs[@]}")
+    ((median_low <= talkover_median_ms)) || fail "barge-in: median $median_low ms or more from a talk-over clip's start to silence at the Jabra, more than $talkover_median_ms ms"
+  fi
   ((counted_talkovers == talkovers)) \
     || unknown "barge-in: only $counted_talkovers of $talkovers talk-over rounds counted, as the others' answers ended by themselves; use a question with a longer answer"
   ((counted_backchannels == backchannels)) \
     || unknown "barge-in: only $counted_backchannels of $backchannels backchannel rounds counted, as the others' answers ended by themselves; use a question with a longer answer"
-  allowed=$((backchannels / 10))
-  ((stopped_backchannels <= allowed)) || fail "barge-in: $stopped_backchannels of $backchannels backchannels stopped the speech, more than $allowed"
-  pass "barge-in: $stopped_backchannels of $backchannels backchannels stopped the speech, at most $allowed"
+  ((stopped_backchannels + ${#unsure_backchannels[@]} <= allowed)) \
+    || unknown "barge-in: $stopped_backchannels of $backchannels backchannels stopped the speech, and backchannel rounds ${unsure_backchannels[*]} may have: the recording's times cannot show whether the Jabra went quiet for $stop_silence_ms ms there, so whether more than $allowed stopped it is not known"
+  ((${#unsure_talkovers[@]} == 0)) \
+    || unknown "barge-in: the recording's times cannot show whether talk-over rounds ${unsure_talkovers[*]} stopped the speech within $stop_window_ms ms of the clip's start"
+  ((talkovers == 0 || median_high <= talkover_median_ms)) \
+    || undecided "barge-in: the median from a talk-over clip's start to silence at the Jabra" "$median_low" "$median_high" "$talkover_median_ms"
+  if ((${#unsure_backchannels[@]} == 0)); then
+    pass "barge-in: $stopped_backchannels of $backchannels backchannels stopped the speech, at most $allowed"
+  else
+    pass "barge-in: $stopped_backchannels of $backchannels backchannels stopped the speech, and ${#unsure_backchannels[@]} more may have, at most $allowed"
+  fi
   ((talkovers == 0)) && return
-  median=$(percentile 50 "${latencies[@]}")
-  ((median <= talkover_median_ms)) || fail "barge-in: median $median ms from a talk-over clip's start to silence at the Jabra, more than $talkover_median_ms ms"
-  pass "barge-in: median $median ms from a talk-over clip's start to silence at the Jabra, at most $talkover_median_ms ms"
+  pass "barge-in: median $median_high ms from a talk-over clip's start to silence at the Jabra (no less than $median_low ms), at most $talkover_median_ms ms"
 }
 
 # speaker_status: set status_path to the /proc status file of the speaker's playback
@@ -1881,24 +2357,13 @@ speaker_status() {
   [[ -r $status_path ]] || unknown "playback-cancel: cannot read $status_path"
 }
 
-# start_poller: read the speaker substream's status every 5 ms into poll_log, "MS STATE".
+# start_poller: read the speaker substream's status every 5 ms into poll_log, "MS STATE", on now_ms's
+# clock (mono_py poll).
 poll_log=
 start_poller() {
   poll_log="$work_dir/playback.poll"
   : >"$poll_log"
-  mkfifo "$work_dir/never" || unknown 'playback-cancel: cannot make the poller its fifo'
-  (
-    exec 3<>"$work_dir/never"
-    while :; do
-      content=
-      IFS= read -r -d '' content <"$status_path"
-      now=${EPOCHREALTIME//[!0-9]/}
-      state=CLOSED
-      [[ $content =~ state:\ ([A-Z_]+) ]] && state=${BASH_REMATCH[1]}
-      printf '%s %s\n' "$((now / 1000))" "$state" >>"$poll_log"
-      read -r -t 0.005 -u 3 _
-    done
-  ) &
+  python3 -c "$mono_py" poll "$status_path" "$poll_log" 2>"$work_dir/poller.err" &
   poller_pid=$!
 }
 
@@ -1933,12 +2398,12 @@ running_ms() {
 # Known limits. A leak can hide only where it runs into the next question's chime, with less than
 # silence_ms between them: the part of it outside the chime must add at most chime_tolerance_ms to
 # the chime as the rig hears it, and any of it that plays during the chime is not told apart. And a
-# leak that starts so shortly before the next answer's first_audio that the recording's time for it,
-# late by however late its best anchor was read, falls after first_audio, passes for that answer.
+# leak that certainly starts at or after the next answer's first_audio is not told apart from that
+# answer; one that may start before it reads UNKNOWN.
 step_playback_cancel() {
   local i q wake first spoken_count speech_at wait_ms stop_ats=() question_starts=() question_wakes=()
   local question_firsts=() heard=() heard_early=() deadline max xruns streams ways next chime boundary_unknown
-  local underruns played worst rc calib_from calib_to calib calib_len calib_ms alone_until
+  local underruns played worst rc calib_from calib_to calib calib_len calib_ms calib_unknown alone_until
   speaker_status
   start_rig_run
   # The calibration: the wake sound alone, while the rig records, then quiet until the first question.
@@ -1999,27 +2464,45 @@ step_playback_cancel() {
   stop_poller
   analyse_rig
   # The calibration is the first sound that starts while play-sound played. It must be alone: it ends,
-  # and no other sound starts, before the step's first question.
-  first_sound $((calib_from - lead_ms)) "$calib_to" \
-    || unknown 'playback-cancel: no sound at the rig microphone while ghost-wispr play-sound played the wake sound alone'
-  calib=$found_sound
-  calib_len=${sound_len[calib]}
-  calib_ms=$(((calib_len + 500) / 1000))
-  alone_until=${question_starts[0]:-$recording_end}
-  ((sound_off[calib] <= alone_until)) \
-    || unknown "playback-cancel: the sound at the rig microphone while ghost-wispr play-sound played the wake sound alone is heard for $calib_ms ms, into the step's first question, so how long the rig hears the wake sound alone is not known"
-  ((calib + 1 >= ${#sound_on[@]} || sound_on[calib + 1] >= alone_until)) \
-    || unknown "playback-cancel: another sound at the rig microphone starts $((sound_on[calib + 1] - sound_off[calib])) ms after the wake sound that ghost-wispr play-sound played alone, before the step's first question, so how long the rig hears the wake sound alone is not known"
-  note "playback-cancel: calibration: the wake sound played alone (ghost-wispr play-sound) is heard at the rig microphone for $calib_ms ms above $rig_threshold_db dB; a chime after a stop may be heard for up to $((calib_ms + chime_tolerance_ms)) ms (the calibration and $chime_tolerance_ms ms)"
+  # and no other sound starts, before the step's first question. The calibration decides only whether
+  # a chime is the chime alone, so when the recording's times cannot tell, the step goes on and reads
+  # UNKNOWN only after any FAIL.
+  calib_unknown=
+  calib=
+  onset_between $((calib_from - lead_ms)) $((calib_from - lead_ms)) "$calib_to"
+  case $? in
+    1) calib_unknown='playback-cancel: no sound at the rig microphone while ghost-wispr play-sound played the wake sound alone' ;;
+    2) calib_unknown="playback-cancel: a sound at the rig microphone starts between $((sound_on_early[maybe_sound] - calib_from)) and $((sound_on[maybe_sound] - calib_from)) ms from when ghost-wispr play-sound played the wake sound alone, so whether it is the wake sound is not known" ;;
+    0)
+      if ((maybe_sound != found_sound)); then
+        calib_unknown="playback-cancel: a sound at the rig microphone may start before the one that starts while ghost-wispr play-sound played the wake sound alone, so which one is the wake sound is not known"
+      else
+        calib=$found_sound
+      fi
+      ;;
+  esac
+  if [[ -n $calib ]]; then
+    calib_len=${sound_len[calib]}
+    calib_ms=$(((calib_len + 500) / 1000))
+    alone_until=${question_starts[0]}
+    ((sound_off[calib] <= alone_until)) \
+      || calib_unknown="playback-cancel: the sound at the rig microphone while ghost-wispr play-sound played the wake sound alone is heard for $calib_ms ms, into the step's first question, so how long the rig hears the wake sound alone is not known"
+    ((calib + 1 >= ${#sound_on[@]} || sound_on_early[calib + 1] >= alone_until)) \
+      || calib_unknown=${calib_unknown:-"playback-cancel: another sound at the rig microphone may start $((sound_on_early[calib + 1] - sound_off[calib])) ms after the wake sound that ghost-wispr play-sound played alone, before the step's first question, so how long the rig hears the wake sound alone is not known"}
+    [[ -n $calib_unknown ]] \
+      || note "playback-cancel: calibration: the wake sound played alone (ghost-wispr play-sound) is heard at the rig microphone for $calib_ms ms above $rig_threshold_db dB; a chime after a stop may be heard for up to $((calib_ms + chime_tolerance_ms)) ms (the calibration and $chime_tolerance_ms ms)"
+  fi
   boundary_unknown=
   for i in "${!stop_ats[@]}"; do
     # Every sound that starts from the stop until the earliest the next question's chime can start
     # (its wake_heard, less lead_ms) is audio after the cancel. The first sound that starts where the
-    # chime belongs (up to wake_max_ms after the wake) is taken for the chime: it must be heard no
-    # longer than the calibration and chime_tolerance_ms, and the next sound must not start before
-    # the answer's first_audio. With no wake_heard or first_audio for that question, or no sound
-    # where its chime belongs, the window is not known: UNKNOWN, unless what was heard fails.
-    next=$recording_end
+    # chime belongs (up to wake_max_ms after the wake) is taken for the chime, when it certainly
+    # starts there and no sound before it may: it must be heard no longer than the calibration and
+    # chime_tolerance_ms, and the next sound must not start before the answer's first_audio. With no
+    # wake_heard or first_audio for that question, or no sound that is certainly the chime, the
+    # window is not known: UNKNOWN, unless what was heard fails.
+    next=$recording_end_early
+    chime=${#sound_on[@]}
     for q in "${!question_starts[@]}"; do
       ((question_starts[q] > stop_ats[i])) || continue
       next=${question_starts[q]}
@@ -2028,25 +2511,44 @@ step_playback_cancel() {
         break
       fi
       next=$((question_wakes[q] - lead_ms))
-      if ! first_sound "$next" $((question_wakes[q] + wake_max_ms)); then
-        boundary_unknown=${boundary_unknown:-"playback-cancel stop $((i + 1)): no sound at the rig microphone where the next question's chime belongs (up to $wake_max_ms ms after its wake_heard), so the window's end is not known"}
+      onset_between "$next" "$next" $((question_wakes[q] + wake_max_ms))
+      case $? in
+        1)
+          boundary_unknown=${boundary_unknown:-"playback-cancel stop $((i + 1)): no sound at the rig microphone where the next question's chime belongs (up to $wake_max_ms ms after its wake_heard), so the window's end is not known"}
+          break
+          ;;
+        2)
+          boundary_unknown=${boundary_unknown:-"playback-cancel stop $((i + 1)): a sound at the rig microphone starts between $((sound_on_early[maybe_sound] - question_wakes[q])) and $((sound_on[maybe_sound] - question_wakes[q])) ms from the next question's wake_heard, so whether it is the chime, or audio before it, is not known, nor the window's end"}
+          break
+          ;;
+      esac
+      if ((maybe_sound != found_sound)); then
+        boundary_unknown=${boundary_unknown:-"playback-cancel stop $((i + 1)): a sound at the rig microphone may start where the next question's chime belongs before the one that certainly does, so which one is the chime is not known, nor the window's end"}
         break
       fi
       chime=$found_sound
-      ((sound_len[chime] <= calib_len + chime_tolerance_ms * 1000)) \
-        || fail "playback-cancel stop $((i + 1)): the sound at the next question's chime is not the chime alone: it lasts $((sound_len[chime] / 1000)) ms, more than the calibration, the wake sound played alone ($calib_ms ms), by over $chime_tolerance_ms ms"
+      if [[ -n $calib && -z $calib_unknown ]]; then
+        ((sound_len[chime] <= calib_len + chime_tolerance_ms * 1000)) \
+          || fail "playback-cancel stop $((i + 1)): the sound at the next question's chime is not the chime alone: it lasts $((sound_len[chime] / 1000)) ms, more than the calibration, the wake sound played alone ($calib_ms ms), by over $chime_tolerance_ms ms"
+      fi
+      # first_audio is when the answer's first frame was handed to the speaker (internal/audio,
+      # Output.next reads the clock before it writes the frame), so the answer is heard at it or
+      # later: a sound after the chime that starts before it is audio of the cancelled answer, and
+      # one that may start before it may be.
       if [[ -z ${question_firsts[q]} ]]; then
         boundary_unknown=${boundary_unknown:-"playback-cancel stop $((i + 1)): the timing log has no first_audio for the next question's answer, so the quiet after its chime cannot be checked"}
       elif ((chime + 1 < ${#sound_on[@]} && sound_on[chime + 1] < question_firsts[q])); then
         fail "playback-cancel stop $((i + 1)): a sound at the rig microphone starts $((sound_on[chime + 1] - sound_off[chime])) ms after the next question's chime ends, before its answer's first audio ($((question_firsts[q] - sound_on[chime + 1])) ms later): audio of the cancelled answer"
+      elif ((chime + 1 < ${#sound_on[@]} && sound_on_early[chime + 1] < question_firsts[q])); then
+        boundary_unknown=${boundary_unknown:-"playback-cancel stop $((i + 1)): a sound at the rig microphone starts between $((sound_on_early[chime + 1] - question_firsts[q])) and $((sound_on[chime + 1] - question_firsts[q])) ms from the next answer's first audio, after the chime, so whether it is audio of the cancelled answer is not known"}
       fi
       break
     done
-    ((next <= recording_end)) \
-      || unknown "playback-cancel stop $((i + 1)): the rig recording ends before the step's next sound after the stop"
+    ((next <= recording_end_early)) \
+      || boundary_unknown=${boundary_unknown:-"playback-cancel stop $((i + 1)): the rig recording shows every sound only up to $((recording_end_early - stop_ats[i])) ms after the stop, before the step's next sound after it"}
     ((next - stop_ats[i] >= stop_silence_ms)) \
       || unknown "playback-cancel stop $((i + 1)): the step's next sound came $((next - stop_ats[i])) ms after the stop, less than $stop_silence_ms ms"
-    cancel_heard "${stop_ats[i]}" "$next" \
+    cancel_heard "${stop_ats[i]}" "$next" "$chime" \
       || unknown "playback-cancel stop $((i + 1)): the rig microphone did not hear the speech up to the stop, so it cannot time the cancel"
     heard+=("$heard_ms")
     heard_early+=("$heard_early_ms")
@@ -2065,7 +2567,8 @@ step_playback_cancel() {
   # Each stop's true tail lies between its two bounds. PASS when even the late one is within
   # cancel_heard_ms; FAIL when even the early one is over; UNKNOWN otherwise, since the anchors that
   # timed the recording may have been read that late. A FAIL is proven, so it comes before an
-  # unknown window's end, and that before an undecided tail, which the window bounds.
+  # unknown window's end, and that before an undecided tail, which the window bounds. A calibration
+  # the recording cannot decide leaves only the chime checks undecided, so it comes last.
   max=$(maximum "${heard[@]}")
   worst=
   for i in "${!heard_early[@]}"; do
@@ -2080,6 +2583,7 @@ step_playback_cancel() {
     for i in "${!heard[@]}"; do ((heard[i] > heard[worst])) && worst=$i; done
     unknown "playback-cancel: stop $((worst + 1))'s speech was heard at the rig microphone up to ${heard[worst]} ms after it, more than $cancel_heard_ms ms, but no earlier than ${heard_early[worst]} ms after it: the recording's times may be up to $((heard[worst] - heard_early[worst])) ms late, so whether it ended within $cancel_heard_ms ms is not known"
   fi
+  [[ -z $calib_unknown ]] || unknown "$calib_unknown"
   pass "playback-cancel: no stop's speech was heard at the rig microphone $cancel_heard_ms ms after it, and the rig stayed quiet until the step's next sound (the longest $max ms, over $stops stops)"
   ways=$(journal_records 'speaker cancel' | jq -r '.way // ""') \
     || unknown "playback-cancel: cannot read the speaker cancel lines from the journal$(journal_error)"

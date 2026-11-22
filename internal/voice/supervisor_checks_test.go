@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/sjawhar/ghost-wispr/internal/audio"
+	"github.com/sjawhar/ghost-wispr/internal/monoclock"
 )
 
 // The tests here carry the names of slice 1's checks in verification.md
@@ -511,6 +512,55 @@ func TestTimingEvents(t *testing.T) {
 	r.s.Stop("Jabra button")
 	c.answers <- PendingAnswer{TaskID: "t1", SessionID: "sess-1", Text: "x"}
 	waitTimings(t, r, "stop", "answer_ready", "answer_chime")
+}
+
+// TestTimingEventsCarryTheMonotonicClockReadWithTheirTime fails if a timing
+// event does not carry CLOCK_MONOTONIC read where its time was taken: every
+// event's reading must lie between reads of that clock before and after the
+// exchange, and the time between any two events must agree on both clocks.
+// wake_heard carries its transcript's own reading, not a later one, and so
+// does the speech start for first_audio. The acceptance driver compares these
+// readings with its own; a conversion calibrated once at startup put them off
+// by as long as the calibration was held up.
+func TestTimingEventsCarryTheMonotonicClockReadWithTheirTime(t *testing.T) {
+	c := newFakeConcierge("The voice issue is in review.")
+	r := newRig(t, c)
+	before := monoclock.Read()
+	sess := r.ask("what is happening?")
+	waitSaid(t, sess)
+	r.speaker.finish(audio.InputVoice)
+	r.waitEvent("voice_spoken:sess-1")
+	events := []string{"wake_heard", "wake_chime_queued", "turn_end", "first_audio", "fact_audio", "speech_end"}
+	waitTimings(t, r, events...)
+	r.s.Stop("Jabra button")
+	waitTimings(t, r, "stop")
+	after := monoclock.Read()
+	events = append(events, "stop")
+	for _, e := range events {
+		if mono := r.timingMonoOf(e); mono < before || mono > after {
+			t.Fatalf("%s: CLOCK_MONOTONIC %d, outside the reads %d and %d around the exchange", e, mono, before, after)
+		}
+	}
+	for _, a := range events {
+		for _, b := range events {
+			wall := r.timingOf(b).Sub(r.timingOf(a))
+			mono := time.Duration(r.timingMonoOf(b) - r.timingMonoOf(a))
+			if d := wall - mono; d > time.Millisecond || d < -time.Millisecond {
+				t.Fatalf("%s to %s: %v on the wall clock, %v on CLOCK_MONOTONIC", a, b, wall, mono)
+			}
+		}
+	}
+
+	// A transcript's own reading, not one taken when the Supervisor got to it.
+	c2 := newFakeConcierge("The voice issue is in review.")
+	r2 := newRig(t, c2)
+	tr := transcriptOf("Wispr, what is happening?", 0, true, true, 0)
+	tr.Mono -= int64(3 * time.Second)
+	r2.s.OnTranscript(&tr)
+	waitTimings(t, r2, "wake_heard")
+	if got := r2.timingMonoOf("wake_heard"); got != tr.Mono {
+		t.Fatalf("wake_heard's CLOCK_MONOTONIC %d, want its transcript's own %d", got, tr.Mono)
+	}
 }
 
 // TestFactAudioOfASayThatPlayedBeforeItReturned fails if the first fact's

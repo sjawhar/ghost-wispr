@@ -93,7 +93,21 @@ CLOCK = 1.0002 if "clock-fast" in SCENARIO else 0.9998 if "clock-slow" in SCENAR
 
 
 def now_ms():
-    return time.time_ns() // 1_000_000
+    """The Pi's CLOCK_MONOTONIC in milliseconds, which the driver times its recordings and the
+    voice's events on: every time in the timeline is on it."""
+    return time.monotonic_ns() // 1_000_000
+
+
+def wall_ms(ms):
+    """MS, a time on now_ms's clock, on the wall clock, as the service also writes its times. With
+    realtime-step the wall clock steps 1 s forward once the case's first clip has begun, as an NTP
+    step does: the service's wall times from then on are 1 s later, its CLOCK_MONOTONIC times not."""
+    offset = (time.time_ns() - time.monotonic_ns()) // 1_000_000
+    if "realtime-step" in SCENARIO:
+        step = read("realtime-step-at")
+        if step and ms >= int(step):
+            offset += 1000
+    return ms + offset
 
 
 def spath(name):
@@ -121,12 +135,14 @@ def log_to(name, line):
 
 
 def iso(ms):
+    """MS, on now_ms's clock, as the service writes a time: RFC 3339 on the wall clock."""
+    ms = wall_ms(ms)
     return datetime.fromtimestamp(ms // 1000, timezone.utc).strftime("%Y-%m-%dT%H:%M:%S") + ".%03d000000Z" % (ms % 1000)
 
 
 def clock(ms):
-    """The time of day at MS, as a pointer gives it (HH:MM:SS UTC)."""
-    return datetime.fromtimestamp(ms // 1000, timezone.utc).strftime("%H:%M:%S")
+    """The time of day at MS, on now_ms's clock, as a pointer gives it (HH:MM:SS UTC)."""
+    return datetime.fromtimestamp(wall_ms(ms) // 1000, timezone.utc).strftime("%H:%M:%S")
 
 
 def alive(pid):
@@ -140,16 +156,16 @@ def alive(pid):
 def process_start_ms():
     """When this process began, on now_ms's clock, never early. The fake tools exec python3, so
     this is the fork of the process that ran the tool. /proc/self/stat gives its start in whole
-    clock ticks since boot, rounded down, so one tick more; and boot is placed on the wall clock by
-    reading the boot clock first, so that the time between the two reads makes it later, and the
-    least of three such placings is taken, so that a preemption between two of the reads costs
-    nothing unless every placing is preempted, and then only in the late direction."""
+    clock ticks since boot, rounded down, so one tick more; and boot is placed on the monotonic
+    clock by reading the boot clock first, so that the time between the two reads makes it later,
+    and the least of three such placings is taken, so that a preemption between two of the reads
+    costs nothing unless every placing is preempted, and then only in the late direction."""
     with open("/proc/self/stat") as f:
         ticks = int(f.read().rsplit(")", 1)[1].split()[19])
     boot = None
     for _ in range(3):
         since_boot = time.clock_gettime_ns(time.CLOCK_BOOTTIME)
-        placed = time.time_ns() - since_boot
+        placed = time.monotonic_ns() - since_boot
         boot = placed if boot is None else min(boot, placed)
     start = boot + (ticks + 1) * 1_000_000_000 // os.sysconf("SC_CLK_TCK")
     return (start + 999_999) // 1_000_000
@@ -657,6 +673,13 @@ def voice_state(fn):
         return result
 
 
+# The speaker plays a frame after the audio queued before it: the Output keeps about 30 ms queued
+# (status_text's RUNNING delay), so the voice's first frame, logged as first_audio when it is
+# written (internal/audio, Output.next), is heard 30 ms later. A cancel drops the queue, so a
+# speech's sound ends where its cut puts it.
+SPEAKER_QUEUE_MS = 30
+
+
 def speech(tag, start, length, session="session-1", fact=None):
     """The voice speaks: its first frame, the fact sentence, the sound, the speaker's stream line,
     the end of its speech and voice_spoken."""
@@ -665,7 +688,7 @@ def speech(tag, start, length, session="session-1", fact=None):
     # As internal/audio's alsaStream logs it for the hw_params new_case writes (480 and 1920 frames
     # at 48 kHz): period and buffer are time.Durations, which the journal holds in nanoseconds.
     emit(kind="log", due=start, tag=tag, level="INFO", msg="speaker stream", fields={"device": "plughw:CARD=J75,DEV=0", "rate": 48000, "channels": 2, "period": 10_000_000, "buffer": 40_000_000, "rewind": True})
-    emit(kind="sound", start=start, end=start + length, tag=tag)
+    emit(kind="sound", start=start + SPEAKER_QUEUE_MS, end=start + length, tag=tag)
     emit(kind="timing", due=start + length, tag=tag, event="speech_end", session_id=session)
     spoken(tag, start + length, session)
 
@@ -714,6 +737,9 @@ def wake_heard_ms():
 
 
 def react(kind, key, start, end):
+    if "realtime-step" in SCENARIO and not read("realtime-step-at"):
+        # The wall clock steps as the case's first clip begins (wall_ms).
+        write("realtime-step-at", str(start))
     service = json.loads(read("service.json") or "{}")
     if not service.get("voice") or service.get("voice_off") or "sigint" in SCENARIO:
         if kind in ("stop", "talkover", "backchannel"):
@@ -728,17 +754,24 @@ def react(kind, key, start, end):
             # chime (leak-before-chime); just before it, apart (leak-apart-chime); running into it
             # (leak-into-chime; leak-into-quiet-chime adds 70 ms to a quiet chime); or after the
             # chime and before the answer's first audio, apart from both (leak-after-chime).
-            leaks = (("leak-before-chime", 30, 200), ("leak-apart-chime", 60, 100), ("leak-into-chime", 100, 250),
+            leaks = (("leak-before-chime", 30, 200), ("leak-apart-chime", 80, 110), ("leak-into-chime", 100, 250),
                      ("leak-into-quiet-chime", 200, 260), ("leak-after-chime", 700, 800))
             for scenario, leak_start, leak_end in leaks:
                 if scenario in SCENARIO:
                     emit(kind="sound", start=start + leak_start, end=start + leak_end, tag="leaked-word")
+            # leak-before-first: a 20 ms word after the chime, from 80 to 60 ms before the answer's
+            # first_audio, as #146's second review planted it: it ends before the answer can be heard,
+            # and here runs into it, less than silence_ms apart, as one sound.
+            if "leak-before-first" in SCENARIO:
+                emit(kind="sound", start=end + 700 - 80, end=end + 700 - 60, tag="leaked-word")
         wake = start + 150
         chime = 120
         if "late-chime" in SCENARIO:
             chime = 600
-        if "wake-310" in SCENARIO:
-            chime = 310
+        # wake-380: the median control, 80 ms over the 300 ms bound, so that even the early bound,
+        # early by the time between the driver's reads of the file's size, is over it.
+        if "wake-380" in SCENARIO:
+            chime = 380
         chime_heard = wake_heard_ms()
         emit(kind="ws", due=wake, event={"type": "voice_wake", "session_id": ""})
         if not ("no-wake-after-stop" in SCENARIO and read("stop-count")):
@@ -750,6 +783,9 @@ def react(kind, key, start, end):
         emit(kind="ws", due=end + 200, event={"type": "voice_exchange_started", "session_id": "session-1"})
         emit(kind="timing", due=end + 200, event="turn_end", session_id="session-1")
         tag = "speech-%d" % n
+        # The clip's true times, by the fake's own clock, beside the answer's tag: the self-test
+        # checks the driver's intervals against them (true_fact_median).
+        log_to("questions.log", "%s %d %d" % (tag, start, end))
         if "filler" in SCENARIO:
             # A filler early, then the fact at 5 s: the verification's negative control (a filler at
             # 0.3 s). Here the filler starts at 0.5 s, so that 150 ms of silence part it from the
@@ -761,7 +797,9 @@ def react(kind, key, start, end):
             emit(kind="ws", due=end + 5600, tag=tag, event={"type": "voice_spoken", "session_id": "session-1"})
         elif "fact-joined" in SCENARIO:
             # The fact sentence follows the first one with no gap: one sound from the first frame.
-            speech(tag, end + 700, 2300, fact=end + 1900)
+            # It comes 0.5 s into the speech, 1.2 s after the question, so that a median interval
+            # that a loaded machine's aplay widens by 700 ms still stays under the 2.5 s bound.
+            speech(tag, end + 700, 2300, fact=end + 1200)
         else:
             length = ANSWER_CEILING_MS if "answer-until-clip" in SCENARIO else 7000 if "long" in SCENARIO else 1500 if "short" in SCENARIO else 600
             # stop-rounds-N: the step asks N questions to stop each answer (playback-cancel's
@@ -814,6 +852,10 @@ def react(kind, key, start, end):
             # A clip the voice does not stop for: with answer-until-clip, the answer ends from it.
             if "answer-until-clip" in SCENARIO:
                 end_answer_after(start, end)
+            # backchannel-pause-500: the answer pauses 500 ms, 1 s into the backchannel, shorter
+            # than a stop's silence (stop_silence_ms).
+            if kind == "backchannel" and "backchannel-pause-500" in SCENARIO:
+                emit(kind="quiet", start=start + 1000, end=start + 1500)
             return
         stop_at = start + 700
         items = timeline()
@@ -845,6 +887,29 @@ def react(kind, key, start, end):
             emit(kind="xrun", due=first + 500)
 
 
+def clip(path):
+    """The self-test's clip at PATH: its words, from its "gwfk" chunk, and its length in whole ms, from
+    its fmt and data chunks, as the driver reads it."""
+    with open(path, "rb") as f:
+        data = f.read()
+    if data[:4] != b"RIFF" or data[8:12] != b"WAVE":
+        raise ValueError("not a WAV file")
+    pos, words, rate, frame, size = 12, None, None, None, None
+    while pos + 8 <= len(data):
+        cid, n = data[pos:pos + 4], int.from_bytes(data[pos + 4:pos + 8], "little")
+        body = data[pos + 8:pos + 8 + n]
+        if cid == b"fmt ":
+            rate, frame = int.from_bytes(body[4:8], "little"), int.from_bytes(body[12:14], "little")
+        elif cid == b"gwfk":
+            words = body.decode().split()
+        elif cid == b"data":
+            size = n
+        pos += 8 + n + (n & 1)
+    if not words or not rate or not frame or size is None:
+        raise ValueError("no gwfk, fmt or data chunk")
+    return words, size * 1000 // (rate * frame)
+
+
 def aplay(args):
     device, path = "", ""
     i = 0
@@ -858,21 +923,29 @@ def aplay(args):
             path = args[i]
             i += 1
     try:
-        with open(path) as f:
-            words = f.read().split()
-    except OSError:
-        sys.stderr.write("aplay: cannot open %s\n" % path)
+        words, length = clip(path)
+    except (OSError, ValueError) as e:
+        sys.stderr.write("aplay: cannot play %s: %s\n" % (path, e))
         return 1
     n = int(read("aplays", "0").strip() or 0) + 1
     write("aplays", "%d\n" % n)
     log_to("aplay.log", "%s %s" % (device, path))
     write("aplay-pid.%d" % n, "%d\n" % os.getpid())
+    # slow-aplay-WORD starts the clip whose first word is WORD 2 s after aplay began, aplay-late-WORD
+    # 700 ms after, and slow-exit-WORD returns 1.8 s after it ended, as aplay's start and exit on a
+    # loaded machine: the driver knows only that the clip began after it started aplay and ended
+    # before aplay returned.
+    if "slow-aplay-" + words[0] in SCENARIO:
+        time.sleep(2.0)
+    if "aplay-late-" + words[0] in SCENARIO:
+        time.sleep(0.7)
     start = now_ms()
     write("aplay-start.%d" % n, "%d\n" % start)
-    # The voice's reaction is worked out while the 300 ms clip plays, so that aplay ends at the end
-    # the reaction counts from whenever that work fits in the clip: the driver times its clip's end
-    # when aplay exits, and the fake's own work would otherwise sit between the two.
-    end = start + 300
+    # The voice's reaction is worked out while the clip plays (for its WAV length, 300 ms), so that
+    # aplay ends at the end the reaction counts from whenever that work fits in the clip: the driver
+    # times its clip's end when aplay exits, and the fake's own work would otherwise sit between the
+    # two.
+    end = start + length
     if words[0] in ("phrase", "speech"):
         # The paused listener's clips: "Wispr, start recording" resumes a listening unit; speech
         # that is not the phrase does nothing.
@@ -881,6 +954,8 @@ def aplay(args):
     else:
         react(words[0], words[1] if len(words) > 1 else "", start, end)
     time.sleep(max(0, end - now_ms()) / 1000)
+    if "slow-exit-" + words[0] in SCENARIO:
+        time.sleep(1.8)
     write("aplay-end.%d" % n, "%d\n" % now_ms())
     return 0
 
@@ -894,9 +969,10 @@ JOINED_SESSION = "session-1"
 def joined_mention(end):
     """A mention of the joined issue, which ended at END. The first opens the recording session; one
     after the test agent joined brings its pointer, its read of the transcript and its floor
-    request, then the hand sound 1.6 s after the mention ended, as the voice waits for a gap in the
-    room's words. joined-other-meeting's pointer names another meeting; joined-early-spoken tells
-    the agent its words were spoken before anyone invited them."""
+    request, then the hand sound 2.5 s after the mention ended, as the voice waits for a gap in the
+    room's words: 1.5 s over the 1 s gap the driver checks, as a loaded machine can return the
+    driver from aplay that much after the clip ended. joined-other-meeting's pointer names another
+    meeting; joined-early-spoken tells the agent its words were spoken before anyone invited them."""
     if not read("active-session"):
         write("active-session", JOINED_SESSION + "\n")
         return
@@ -909,7 +985,7 @@ def joined_mention(end):
     emit(kind="probe", due=end + 300, step="pointer", fields=dict(span, recording_session=pointed, text=text))
     emit(kind="probe", due=end + 500, step="transcript_read", fields={"status": 200, "segments": 3, "segments_in_range": 2})
     emit(kind="probe", due=end + 700, step="floor_sent", fields={"event": "event-floor", "recipient_state": "live"})
-    hand = end + 1600
+    hand = end + 2500
     emit(kind="timing", due=hand, event="hand_chime", session_id=JOINED_SESSION)
     emit(kind="sound", start=hand + 20, end=hand + 320, tag="hand-sound")
     if "joined-early-spoken" in SCENARIO:
@@ -918,20 +994,23 @@ def joined_mention(end):
 
 def joined_go_ahead(start, end):
     """"Wispr, go ahead" with the test agent's hand up, played from START to END: the wake sound, the
-    agent's words for 2 s, voice_spoken, and the agent told its words were spoken; then it leaves.
-    joined-other-spoken's voice_spoken names another session; joined-spoken-during-clip's only
-    voice_spoken comes while the go-ahead still plays; joined-words-silent plays no words, only the
-    wake sound."""
+    agent's words for 2 s from 1.3 s after the go-ahead ended, voice_spoken, and the agent told its
+    words were spoken; then it leaves. joined-other-spoken's voice_spoken names another session;
+    joined-spoken-during-clip's only voice_spoken comes as the go-ahead starts playing;
+    joined-told-during-clip tells the agent as it starts; joined-words-silent plays no words, only
+    the wake sound."""
     emit(kind="sound", start=end + 150, end=end + 350, tag="go-ahead-wake")
-    words = end + 1000
+    words = end + 1300
     if "joined-words-silent" not in SCENARIO:
         emit(kind="sound", start=words, end=words + 2000, tag="joined-words")
     if "joined-spoken-during-clip" in SCENARIO:
-        emit(kind="ws", due=start + 150, event={"type": "voice_spoken", "session_id": JOINED_SESSION})
+        emit(kind="ws", due=start, event={"type": "voice_spoken", "session_id": JOINED_SESSION})
     else:
         session = "session-2" if "joined-other-spoken" in SCENARIO else JOINED_SESSION
         emit(kind="ws", due=words + 2100, event={"type": "voice_spoken", "session_id": session})
-    if "joined-early-spoken" not in SCENARIO:
+    if "joined-told-during-clip" in SCENARIO:
+        told(start)
+    elif "joined-early-spoken" not in SCENARIO:
         told(words + 2200)
     emit(kind="probe", due=words + 2400, step="leave_sent", fields={"event": "event-leave", "recipient_state": "live"})
     emit(kind="ws", due=words + 2500, event={"type": "agent_left", "session_id": JOINED_SESSION})
@@ -953,7 +1032,8 @@ def joined_probe(args):
     deadline = time.time() + int(args[args.index("--timeout") + 1]) + 60
 
     def say(step, at, **fields):
-        print(json.dumps(dict(step=step, at=iso(at), **fields)), flush=True)
+        # As cmd/ghost-wispr/joined_probe.go's emit: the wall time and CLOCK_MONOTONIC's.
+        print(json.dumps(dict(step=step, at=iso(at), at_mono_ns=at * 1_000_000, **fields)), flush=True)
 
     t = now_ms()
     say("registered", t, session="probe-session")
@@ -1002,23 +1082,69 @@ def arecord(args):
         sys.exit(0)
     signal.signal(signal.SIGTERM, stopped)
     signal.signal(signal.SIGINT, stopped)
-    with open(path, "wb") as f:
-        f.write(bytes(44))
-        f.flush()
-        # The file's first sample: by default, when the fake has started, which on a loaded machine
-        # can be long after the driver started arecord, so that an early bound, which counts from
-        # then, is early by that long too. arecord-prompt captures it as the process began, as an
-        # arecord that opens its device at once does, so that an early bound is early only by the
-        # driver's fork and a clock tick, however late the fake runs; arecord-slow-start captures it
-        # 1.5 s after the fake has started, as an arecord slow to open its device does, so that every
-        # early bound is more than 1.5 s early (joined-words-unsure needs over 1 s: its words begin
-        # 1 s after the go-ahead). With both, the prompt stamp stands. The process start is rounded
-        # up a tick, so the stamp is also kept no later than now: the first sample is never stamped
-        # after it is written.
+    # arecord-start-3s opens its device 3 s after the process began, before it creates the file, as
+    # an arecord slow to open its device does (aplay.c opens the device, then the file).
+    if "arecord-start-3s" in SCENARIO:
+        time.sleep(max(0, process_start_ms() + 3000 - now_ms()) / 1000)
+    # arecord-reopen opens the file for each write and closes it again, so that /proc seldom shows
+    # the driver an open fd and it reads the size with a stat of the file.
+    reopen = "arecord-reopen" in SCENARIO
+    f = None if reopen else open(path, "wb")
+
+    def put(data, mode="ab"):
+        if reopen:
+            with open(path, mode) as g:
+                g.write(data)
+        else:
+            f.write(data)
+            f.flush()
+    put(bytes(44), "wb")
+    # The file's first sample is captured once its whole header is written, as arecord's first
+    # read starts its capture only then, and stamped in whole milliseconds rounded up, so never
+    # before the header. arecord-slow-start reads 1.5 s after the header, as an arecord its
+    # machine holds back between its header and its first read does: the driver's start, read
+    # before the header, is then 1.5 s early, and so is every early bound (joined-words-unsure
+    # needs over 1 s: its words begin 1 s after the go-ahead). arecord-freeze-8s does the same for
+    # 8 s, and stops the driver and its sampler (the process that names this arecord and its file)
+    # for as long, as a machine that holds them all back does: a sampler that polls on would give
+    # up after 5 s. arecord-hold-200 holds the first sample, and what follows it, 200 ms before
+    # writing any, longer than a real arecord can without an overrun, so that a start taken from the
+    # first sample's landing fails at any load: the driver's start still comes no later than the
+    # sample. arecord-locked takes the search right off the file's directory for that hold, so that
+    # every read of its size fails there: a failed read taken for no file yet moves the start into
+    # the hold.
+    frozen = []
+    try:
         if "arecord-slow-start" in SCENARIO:
             time.sleep(1.5)
-        begun = min(process_start_ms(), now_ms()) if "arecord-prompt" in SCENARIO else now_ms()
+        if "arecord-freeze-8s" in SCENARIO:
+            frozen = [os.getppid()]
+            for pid in os.listdir("/proc"):
+                try:
+                    with open("/proc/%s/cmdline" % pid, "rb") as c:
+                        argv = c.read().split(b"\0")
+                except OSError:
+                    continue
+                if pid.isdigit() and int(pid) != os.getpid() and b"record" in argv and path.encode() in argv:
+                    frozen.append(int(pid))
+            for pid in frozen:
+                os.kill(pid, signal.SIGSTOP)
+            log_to("arecord-froze", " ".join(map(str, frozen)))
+            time.sleep(8)
+        begun = -(-time.monotonic_ns() // 1_000_000)
         log_to("recordings", "%s %d" % (path, begun))
+        if "arecord-hold-200" in SCENARIO:
+            folder = mode = None
+            if "arecord-locked" in SCENARIO:
+                folder = os.path.dirname(os.path.abspath(path))
+                mode = os.stat(folder).st_mode & 0o7777
+                os.chmod(folder, mode & ~0o111)
+                log_to("arecord-locked", folder)
+            try:
+                time.sleep(0.2)
+            finally:
+                if folder is not None:
+                    os.chmod(folder, mode)
         written = 0
         # From the first clip played after the recording began: arecord-lag makes the file run 1 s
         # behind for 2 s, as an arecord the machine holds back writes late, so that the anchor after
@@ -1043,9 +1169,14 @@ def arecord(args):
             # Whole 2-byte samples at 24 kHz of the rig's clock, CLOCK times the Pi's.
             target = 2 * int((t - lag - skip - begun) * CLOCK * 24)
             if target > written:
-                f.write(bytes(target - written))
-                f.flush()
+                put(bytes(target - written))
                 written = target
+                for pid in frozen:
+                    os.kill(pid, signal.SIGCONT)
+                frozen = []
+    finally:
+        for pid in frozen:
+            os.kill(pid, signal.SIGCONT)
 
 
 def ffmpeg(args):
@@ -1066,13 +1197,17 @@ def ffmpeg(args):
         if name == path:
             begun = int(at)
     sounds = []
+    quiets = []
     if begun is not None and "silent" not in SCENARIO:
         for item in timeline():
-            if item["kind"] == "sound":
-                # A sound's place in the file, in ms of the rig's clock.
+            if item["kind"] in ("sound", "quiet"):
+                # A sound's place in the file, in ms of the rig's clock; a quiet stretch is a pause
+                # in whatever plays then.
                 a, b = max((item["start"] - begun) * CLOCK, 0), min((item["end"] - begun) * CLOCK, duration)
                 if b > a:
-                    sounds.append([a, b])
+                    (sounds if item["kind"] == "sound" else quiets).append([a, b])
+    for qa, qb in quiets:
+        sounds = [piece for a, b in sounds for piece in ([[a, b]] if qb <= a or qa >= b else [p for p in ([a, qa], [qb, b]) if p[1] > p[0]])]
     sounds.sort()
     merged = []
     for a, b in sounds:
@@ -1135,7 +1270,7 @@ def journalctl(args):
     records = []
     for item in sorted(timeline(), key=lambda item: item.get("due", 0)):
         due = item.get("due", 0)
-        if not since <= due <= t:
+        if not since <= wall_ms(due) <= wall_ms(t):
             continue
         if pids and str(item.get("pid")) not in pids:
             continue
@@ -1145,7 +1280,7 @@ def journalctl(args):
             records.append({"raw": item["text"]})
         elif item["kind"] == "timing":
             # As cmd/ghost-wispr/voice.go's voiceTiming logs it.
-            fields = {"event": item["event"], "session_id": item["session_id"], "at_unix_ns": due * 1_000_000}
+            fields = {"event": item["event"], "session_id": item["session_id"], "at_unix_ns": wall_ms(due) * 1_000_000, "at_mono_ns": due * 1_000_000}
             if item.get("reason"):
                 fields["reason"] = item["reason"]
             records.append(journal_record(due, "INFO", "voice timing", fields))
@@ -1170,7 +1305,7 @@ def journalctl(args):
 def journal_record(due, level, msg, fields):
     """One record for journal-records (deploy/pi/journalrecords), its attributes in the order the
     service logs them."""
-    return {"time_ns": due * 1_000_000, "level": level, "msg": msg, "attrs": [list(pair) for pair in fields.items()]}
+    return {"time_ns": wall_ms(due) * 1_000_000, "level": level, "msg": msg, "attrs": [list(pair) for pair in fields.items()]}
 
 
 # ---- curl: the unit's API, /ws, Dispatch, the Envoy hub and its NATS port ----
@@ -1332,6 +1467,9 @@ def stream():
         for item in due:
             sent.add(item["id"])
             event = {"type": item["event"]["type"], "version": 1, "timestamp": iso(item["due"])}
+            # As internal/server's VoiceEvent: a voice event's time on CLOCK_MONOTONIC too.
+            if event["type"].startswith(("voice_", "agent_")):
+                event["at_mono_ns"] = item["due"] * 1_000_000
             event.update({k: v for k, v in item["event"].items() if k != "type"})
             sys.stdout.write(json.dumps(event))
         sys.stdout.flush()
@@ -1512,6 +1650,27 @@ exec $(printf '%q' "$(type -P sleep)") "\$@"
 EOF
 chmod +x "$root/sigint-bin/sleep"
 
+# The clips the cases play: WAV files of 300 ms of silence at 16 kHz, mono, each with a "gwfk" chunk
+# of the words that name it for the fake aplay, which plays it for its WAV length; the driver reads
+# that length too (play_clip).
+mkdir -p "$root/clips"
+python3 - "$root/clips" <<'EOF'
+import os
+import struct
+import sys
+
+for name, words in (("question", "question"), ("go-ahead", "go-ahead"), ("mention", "mention join-5"),
+                    ("ask", "ask live-1"), ("second", "second live-1"), ("never-mind", "never-mind"), ("stop", "stop"),
+                    ("phrase", "phrase"), ("speech", "speech"), ("talkover", "talkover"), ("backchannel", "backchannel")):
+    tag = words.encode()
+    data = bytes(2 * 16000 * 300 // 1000)
+    body = (b"WAVE" + b"fmt " + struct.pack("<IHHIIHH", 16, 1, 1, 16000, 32000, 2, 16)
+            + b"gwfk" + struct.pack("<I", len(tag)) + tag + (b"\0" if len(tag) % 2 else b"")
+            + b"data" + struct.pack("<I", len(data)) + data)
+    with open(os.path.join(sys.argv[1], name + ".wav"), "wb") as f:
+        f.write(b"RIFF" + struct.pack("<I", len(body)) + body)
+EOF
+
 # new_case NAME [ENV]: a fake Pi for one case, paused with no session, its .env ENV (the original
 # by default), its saved capture state 1 and its Envoy session id, with the service running.
 # Prints its directory.
@@ -1528,18 +1687,12 @@ new_case() {
   printf 'access: RW_INTERLEAVED\nformat: S16_LE\nchannels: 2\nrate: 48000 (48000/1)\nperiod_size: 480\nbuffer_size: 1920\n' \
     >"$dir/asound/card3/pcm0p/sub0/hw_params"
   printf 'closed\n' >"$dir/asound/card3/pcm0p/sub0/status"
-  printf 'question\n' >"$dir/question.wav"
-  printf 'go-ahead\n' >"$dir/go-ahead.wav"
-  printf 'mention join-5\n' >"$dir/mention.wav"
-  printf 'ask live-1\n' >"$dir/ask.wav"
-  printf 'second live-1\n' >"$dir/second.wav"
-  printf 'never-mind\n' >"$dir/never-mind.wav"
-  printf 'stop\n' >"$dir/stop.wav"
-  printf 'phrase\n' >"$dir/phrase.wav"
-  printf 'speech\n' >"$dir/speech.wav"
-  for name in q1 q2 q3; do printf 'question\n' >"$dir/questions/$name.wav"; done
-  for name in t1 t2; do printf 'talkover\n' >"$dir/talkovers/$name.wav"; done
-  for name in b1 b2; do printf 'backchannel\n' >"$dir/backchannels/$name.wav"; done
+  for name in question go-ahead mention ask second never-mind stop phrase speech; do
+    cp -- "$root/clips/$name.wav" "$dir/$name.wav"
+  done
+  for name in q1 q2 q3; do cp -- "$root/clips/question.wav" "$dir/questions/$name.wav"; done
+  for name in t1 t2; do cp -- "$root/clips/talkover.wav" "$dir/talkovers/$name.wav"; done
+  for name in b1 b2; do cp -- "$root/clips/backchannel.wav" "$dir/backchannels/$name.wav"; done
   python3 -c 'import sqlite3, sys
 connection = sqlite3.connect(sys.argv[1])
 connection.execute("PRAGMA journal_mode=WAL")
@@ -1554,7 +1707,8 @@ connection.commit()' "$dir/ghost-wispr.db"
 
 # driver_env DIR SCENARIO: the environment the driver runs in for that case.
 driver_env() {
-  printf '%s\n' "PATH=$root/bin:$PATH" "GW_FAKE_STATE=$1/state" "GW_FAKE_DB=$1/ghost-wispr.db" "GW_FAKE_TEST_PID=$$" \
+  local path="$root/bin:$PATH"
+  printf '%s\n' "PATH=$path" "GW_FAKE_STATE=$1/state" "GW_FAKE_DB=$1/ghost-wispr.db" "GW_FAKE_TEST_PID=$$" \
     "GW_FAKE_SCENARIO=$2" "GHOST_WISPR_DEPLOY_DIR=$1/deploy" "GHOST_WISPR_ASOUND_ROOT=$1/asound" "TMPDIR=$1/tmp"
   [[ $2 != *asound* ]] || printf '%s\n' "GW_FAKE_ASOUND=$1/asound"
 }
@@ -1626,14 +1780,18 @@ row = sqlite3.connect(sys.argv[1]).execute("SELECT value FROM app_state WHERE ke
 print("missing" if row is None else row[0])' "$1/ghost-wispr.db"
 }
 
-# expect_rc NAME STATUS: the case's driver exited with STATUS. When it did not, the message also
-# gives the fake's stops.log, each stop request and apply with the speech's own times, so that a
-# timing verdict that went wrong shows when each happened.
+# expect_rc NAME STATUS...: the case's driver exited with one of the STATUSes. When it did not, the
+# message also gives the fake's stops.log, each stop request and apply with the speech's own times,
+# so that a timing verdict that went wrong shows when each happened.
 expect_rc() {
-  local got stops=
-  got=$(cat "$root/$1/rc" 2>/dev/null)
-  [[ -s $root/$1/state/stops.log ]] && stops=" the fake's stops: $(tr '\n' '|' <"$root/$1/state/stops.log");"
-  [[ $got == "$2" ]] || check_failed "$1: exit status ${got:-none}, want $2;$stops output: $(tr '\n' '|' <"$root/$1/out")"
+  local name=$1 got stops='' want
+  shift
+  got=$(cat "$root/$name/rc" 2>/dev/null)
+  [[ -s $root/$name/state/stops.log ]] && stops=" the fake's stops: $(tr '\n' '|' <"$root/$name/state/stops.log");"
+  for want in "$@"; do
+    [[ $got == "$want" ]] && return
+  done
+  check_failed "$name: exit status ${got:-none}, want $(printf '%s or ' "$@" | sed 's/ or $//');$stops output: $(tr '\n' '|' <"$root/$name/out")"
 }
 
 expect_line() {
@@ -1686,6 +1844,51 @@ measured() {
   sed -n "s/^\(PASS\|FAIL\): $2 \(-\{0,1\}[0-9][0-9]*\) ms.*/\2/p" "$root/$1/out" | head -n 1
 }
 
+# true_fact_median NAME: by the fake's own clock, the nearest-rank median, over the questions the
+# fake answered (questions.log), of the time from each question clip's true end to when its first
+# fact truly reached the microphone: the fact_audio time, plus the speaker's queue that the fake's
+# sound starts after its first frame (the sound's start less first_audio). Empty with no question.
+true_fact_median() {
+  python3 - "$root/$1/state" <<'EOF'
+import json, math, os, sys
+state = sys.argv[1]
+items = [json.loads(line) for line in open(os.path.join(state, "timeline.jsonl")) if line.strip()]
+
+
+def first(kind, tag, key, event=None):
+    for item in items:
+        if item.get("kind") == kind and item.get("tag") == tag and event in (None, item.get("event")):
+            return item[key]
+    return None
+
+
+truths = []
+for line in open(os.path.join(state, "questions.log")):
+    tag, _, end = line.split()
+    first_audio, fact = first("timing", tag, "due", "first_audio"), first("timing", tag, "due", "fact_audio")
+    sound = first("sound", tag, "start")
+    if None not in (first_audio, fact, sound):
+        truths.append(fact + sound - first_audio - int(end))
+truths.sort()
+print(truths[math.ceil(len(truths) / 2) - 1] if truths else "")
+EOF
+}
+
+# expect_holds NAME PATTERN TRUTH: the PASS line after PATTERN gives an interval, its first number
+# (the late bound) and the one after "no earlier than" or "no less than" (the early bound), that
+# holds TRUTH, the fake's own time for what it measured. A driver's interval may be as wide as its
+# clips' timing allows; it must never leave out the truth.
+expect_holds() {
+  local got low high
+  got=$(sed -n "s/^PASS: $2 \([0-9][0-9]*\) ms.*(no \(earlier\|less\) than \(-\{0,1\}[0-9][0-9]*\) ms).*/\3 \1/p" "$root/$1/out" | head -n 1)
+  read -r low high <<<"$got"
+  if [[ -z $low || -z $high || -z $3 ]]; then
+    check_failed "$1: no interval in a line \"PASS: $2\", or no true time from the fake (interval '$got', truth '$3'); output: $(tr '\n' '|' <"$root/$1/out")"
+  elif ((low > $3 || $3 > high)); then
+    check_failed "$1: $2: the driver's interval, $low to $high ms, leaves out the fake's true $3 ms"
+  fi
+}
+
 # expect_between NAME GOT LOW HIGH: GOT is a number of milliseconds from LOW to HIGH. NAME starts
 # with its case's name; when GOT is missing or out of range, the message also gives that case's
 # output and the fake's stops.log, since a tail that was never measured can have any cause, and an
@@ -1708,6 +1911,10 @@ readonly rig=plughw:CARD=Rigmic,DEV=0
 
 # The exchange step (the default): a full pass, --go-ahead with --keep, and its failures.
 launch pass pass '' -- --question @question.wav --event-timeout 10
+# The pass with the question's aplay starting the clip 700 ms after the driver started it
+# (aplay-late-question): the delay's interval is at least that much wider, and still holds the
+# fake's true delay, under the 3 s bound: PASS.
+launch pass-aplay-late pass,aplay-late-question '' -- --question @question.wav --event-timeout 10
 # The restore's stop finds a service whose shutdown hangs: it takes SIGTERM (and SIGCONT) but goes
 # on running, as does a process the kernel holds in uninterruptible sleep. systemd sends SIGKILL
 # after its stop timeout (90 s, the unit's default) and the stop succeeds: the run must pass.
@@ -1723,6 +1930,16 @@ launch ws-silent ws-silent '' -- --question @question.wav --event-timeout 2
 launch silent silent '' -- --question @question.wav --event-timeout 10
 launch late-chime late-chime '' -- --question @question.wav --event-timeout 10
 launch slow-speech pass '' -- --question @question.wav --event-timeout 10 --speech-ms 300
+# The pass with the question's aplay starting the clip 2 s after the driver started it
+# (slow-aplay-question), against a 1 s speech bound: the speech came 0.7 s after the question ended,
+# but the driver knows only that the question ended between 0.3 s after it started aplay and when
+# aplay returned, so the delay may be over 2 s: UNKNOWN, never the PASS of a delay from aplay's
+# return alone.
+launch slow-start-speech pass,slow-aplay-question '' -- --question @question.wav --event-timeout 10 --speech-ms 1000
+# The late chime with an arecord that reads 1.5 s after its header (arecord-slow-start): every early
+# bound is 1.5 s early, so the recording cannot show that the chime came over 400 ms after voice_wake,
+# nor which sound it is: UNKNOWN, never the FAIL of the late bound alone.
+launch late-chime-unsure late-chime,arecord-slow-start '' -- --question @question.wav --event-timeout 10
 launch pause-fails pause-fails '' -- --question @question.wav --event-timeout 10
 
 # Refusals: each happens before any change.
@@ -1752,13 +1969,23 @@ launch listener-cpu pass '' -- --step listener-cpu --speech @speech.wav --cpu-se
 launch listener-cpu-hot listener-hot '' -- --step listener-cpu --speech @speech.wav --cpu-seconds 2 --event-timeout 10
 
 # wake-sound: a pass; a pass while the rig recording runs 1 s behind for a while, which the driver's
-# clock must not take for a late chime; the chime 310 ms after wake_heard (the verification's
-# negative control: a median over 300 ms) and 600 ms (a call over 400 ms); no person; a journal the
-# driver cannot read; a loud room; a rig microphone that is not connected.
+# clock must not take for a late chime; an overrun that loses 250 ms just before the chime, which
+# leaves its early bound 250 ms early, before the 100 ms the chime may lead wake_heard: whether it
+# is the wake sound or a sound before it is not known, so UNKNOWN, never PASS; the chime 380 ms after
+# wake_heard (the verification's negative control: a median over 300 ms) and 600 ms (a call over
+# 400 ms); no person; a journal the driver cannot read; a loud room; a rig microphone that is not
+# connected.
 launch wake pass yes -- --step wake-sound --calls 3 --question @question.wav --rig-mic "$rig" --event-timeout 10
 launch wake-lag arecord-lag yes -- --step wake-sound --calls 1 --question @question.wav --rig-mic "$rig" --event-timeout 10
 launch wake-overrun arecord-overrun yes -- --step wake-sound --calls 1 --question @question.wav --rig-mic "$rig" --event-timeout 10
-launch wake-median wake-310 yes -- --step wake-sound --calls 3 --question @question.wav --rig-mic "$rig" --event-timeout 10
+launch wake-median wake-380 yes -- --step wake-sound --calls 3 --question @question.wav --rig-mic "$rig" --event-timeout 10
+# The median control with an arecord that reads 1.5 s after its header: a median over 300 ms at the
+# late bounds may be under it at the early ones: UNKNOWN, never FAIL. The pass with the service's
+# wall clock stepped 1 s forward as the call begins (realtime-step): every time the driver compares
+# is on the monotonic clock, so still a pass; timed by the service's wall times, the wake sound
+# came about 1 s before wake_heard.
+launch wake-median-unsure wake-380,arecord-slow-start yes -- --step wake-sound --calls 3 --question @question.wav --rig-mic "$rig" --event-timeout 10
+launch wake-realtime-step pass,realtime-step yes -- --step wake-sound --calls 1 --question @question.wav --rig-mic "$rig" --event-timeout 10
 launch wake-max late-chime yes -- --step wake-sound --calls 2 --question @question.wav --rig-mic "$rig" --event-timeout 10
 launch wake-no-person pass '' -- --step wake-sound --calls 2 --question @question.wav --rig-mic "$rig"
 launch wake-blind journal-blind yes -- --step wake-sound --calls 2 --question @question.wav --rig-mic "$rig" --event-timeout 10
@@ -1774,8 +2001,20 @@ launch wake-verbose verbose-journal yes -- --step wake-sound --calls 1 --questio
 # scripted: tts passes and gptlive is refused; a filler early and the fact at 5 s (the negative
 # control); a fact sentence with no gap before it.
 launch scripted pass yes -- --step scripted --engine tts --engine gptlive --questions 2 --question-dir @questions --rig-mic "$rig" --event-timeout 10
+# The pass with an arecord that reads 1.5 s after its header: no fact's sound certainly starts in its
+# window: UNKNOWN, never PASS.
+launch scripted-unsure pass,arecord-slow-start yes -- --step scripted --engine tts --questions 2 --question-dir @questions --rig-mic "$rig" --event-timeout 10
+# The pass with each question's aplay starting the clip 2 s late (slow-aplay-question): each first
+# fact came 0.7 s after its question ended, but may have come 3 s after, over the 2.5 s median bound:
+# UNKNOWN, never PASS.
+launch scripted-slow-start pass,slow-aplay-question yes -- --step scripted --engine tts --questions 2 --question-dir @questions --rig-mic "$rig" --event-timeout 10
 launch scripted-filler filler yes -- --step scripted --engine tts --questions 2 --question-dir @questions --rig-mic "$rig" --event-timeout 10
 launch scripted-joined fact-joined yes -- --step scripted --questions 1 --question-dir @questions --rig-mic "$rig" --event-timeout 10
+# The same with the question's aplay starting the clip 700 ms after the driver started it
+# (aplay-late-question), as on a loaded machine: the median's interval is that much wider, still
+# holds the fake's true time, and stays under the 2.5 s bound: PASS (Sol's review of #149 at
+# 6d98ad98 saw scripted-joined read UNKNOWN on a loaded machine).
+launch scripted-joined-aplay-late fact-joined,aplay-late-question yes -- --step scripted --questions 1 --question-dir @questions --rig-mic "$rig" --event-timeout 10
 launch scripted-few pass yes -- --step scripted --questions 5 --question-dir @questions --rig-mic "$rig"
 
 # holder-cases: a pass; the Pi's token replaced by an invalid one (the negative control); a holder
@@ -1809,6 +2048,11 @@ launch ask-journal-error journal-error-after-answer_ready '' -- $ask_args
 launch barge answer-until-clip yes -- --step barge-in --talkovers 2 --backchannels 2 --question @question.wav --talkover-dir @talkovers --backchannel-dir @backchannels --rig-mic "$rig" --event-timeout 15
 launch barge-off answer-until-clip,stop-off yes -- --step barge-in --talkovers 1 --backchannels 0 --question @question.wav --talkover-dir @talkovers --backchannel-dir @backchannels --rig-mic "$rig" --event-timeout 15
 launch barge-short short yes -- --step barge-in --talkovers 1 --backchannels 0 --question @question.wav --talkover-dir @talkovers --backchannel-dir @backchannels --rig-mic "$rig" --event-timeout 15
+# The pass with the talk-over's aplay starting the clip 2 s late (slow-aplay-talkover): the speech
+# stopped 0.7 s after the clip began, but the driver knows only that the clip began between when it
+# started aplay and 0.3 s before aplay returned, so the delay may be 2.7 s, over the 1.5 s median
+# bound: UNKNOWN, never the FAIL of a delay from aplay's start alone.
+launch barge-slow-start answer-until-clip,slow-aplay-talkover yes -- --step barge-in --talkovers 1 --backchannels 0 --question @question.wav --talkover-dir @talkovers --backchannel-dir @backchannels --rig-mic "$rig" --event-timeout 15
 launch barge-backchannel answer-until-clip,backchannel-stops yes -- --step barge-in --talkovers 1 --backchannels 1 --question @question.wav --talkover-dir @talkovers --backchannel-dir @backchannels --rig-mic "$rig" --event-timeout 15
 # A journal that cannot be read once the voice stops: UNKNOWN, not a talk-over with no stop.
 launch barge-journal-error answer-until-clip,journal-error-after-stop yes -- --step barge-in --talkovers 1 --backchannels 0 --question @question.wav --talkover-dir @talkovers --backchannel-dir @backchannels --rig-mic "$rig" --event-timeout 15
@@ -1816,15 +2060,26 @@ launch barge-journal-error answer-until-clip,journal-error-after-stop yes -- --s
 # not change.
 launch barge-late answer-until-clip,late-clip yes -- --step barge-in --talkovers 2 --backchannels 2 --question @question.wav --talkover-dir @talkovers --backchannel-dir @backchannels --rig-mic "$rig" --event-timeout 15
 launch barge-backchannel-late answer-until-clip,backchannel-stops,late-clip yes -- --step barge-in --talkovers 1 --backchannels 1 --question @question.wav --talkover-dir @talkovers --backchannel-dir @backchannels --rig-mic "$rig" --event-timeout 15
+# A backchannel that stops the speech, recorded by an arecord that reads 8 s after its header with the
+# driver and its sampler held up as long (arecord-freeze-8s), as #146's review showed it: every
+# early bound is 8 s early, so the recording cannot show whether the silence after the stop came
+# after the clip began: UNKNOWN, or FAIL where the times still show the stop; never the PASS of a
+# recording end counted from that start.
+launch barge-backchannel-frozen answer-until-clip,backchannel-stops,arecord-freeze-8s yes -- --step barge-in --talkovers 1 --backchannels 1 --question @question.wav --talkover-dir @talkovers --backchannel-dir @backchannels --rig-mic "$rig" --event-timeout 15
+# A 500 ms pause in the speech 1 s into a backchannel (backchannel-pause-500): the speech went on, a
+# pass; with an arecord that reads 1.5 s after its header, the pause may have been a stop's 1 s of
+# silence: UNKNOWN, never PASS.
+launch barge-pause answer-until-clip,backchannel-pause-500 yes -- --step barge-in --talkovers 1 --backchannels 1 --question @question.wav --talkover-dir @talkovers --backchannel-dir @backchannels --rig-mic "$rig" --event-timeout 15
+launch barge-pause-unsure answer-until-clip,backchannel-pause-500,arecord-slow-start yes -- --step barge-in --talkovers 1 --backchannels 1 --question @question.wav --talkover-dir @talkovers --backchannel-dir @backchannels --rig-mic "$rig" --event-timeout 15
 
 # playback-cancel, timed by the end of the cancelled speech at the rig microphone: a pass; a correct
 # cancel that keeps the stream running with 80 ms of silence queued, which must pass; a status that
 # shows the stream running only 3 s after it starts; today's draining path, heard 800 ms on (the
 # negative control); audio heard 50 ms on; a stop just before a pause in the speech whose next word
 # still plays 150 ms later, recorded by an arecord that starts at once (FAIL: even the early bound of
-# the word's end is over the bound) and by one slow to start (UNKNOWN: the early bound is not); a
-# word 1.1 s on, after a silence long enough to pass for the end; a word 150 ms on with the speech
-# already quiet for 1 s at the stop, which the rig cannot time (UNKNOWN);
+# the word's end is over the bound) and by one that reads 1.5 s after its header (UNKNOWN: the early
+# bound is not); a word 1.1 s on, after a silence long enough to pass for the end; a word 150 ms on
+# with the speech already quiet for 1 s at the stop, which the rig cannot time (UNKNOWN);
 # a word still playing as the next question goes in: well before its chime, just before it and
 # apart, running into it, and after it, before the answer's first audio; a quiet chime, which must
 # pass, and a word that runs into it; a louder wake sound whose echo the rig hears for 320 ms, which
@@ -1833,47 +2088,71 @@ launch barge-backchannel-late answer-until-clip,backchannel-stops,late-clip yes 
 # 200 ppm fast and slow, which must pass, and a 21 ms tail on the fast clock, over the bound only at
 # its late bound (UNKNOWN); a rig recording that ends before the step stops it, no chime heard where
 # the next question's belongs, and no wake_heard for it (each UNKNOWN); a logged underrun; an XRUN
-# the speaker did not log. Each case whose FAIL rests on a tail's early bound (the drain, alone and
-# 60 ms behind, the words 150 ms and 1.1 s on, and the word well before the chime) records with an
-# arecord whose first sample is stamped at its fork (arecord-prompt): the early bound counts from
-# before the driver starts arecord, so a fake stamped once a loaded machine got round to starting
-# it would turn its FAIL into UNKNOWN. Every case asks two stop rounds (--stops 2) and tells the fake
-# so (stop-rounds-2): each round's answer then plays until its stop arrives, however late the driver
-# plays the stop. A stop played after a 7 s answer's natural end, as a driver held up by its machine
-# plays it (cancel-late-stop, with late-clip), still stops speech and is timed.
+# the speaker did not log. The driver times every recording from its last read of the file's size
+# before arecord wrote its header, so every early bound holds however late the fake runs; the fake
+# captures its first sample once its header is written, as arecord does. Every case asks two stop
+# rounds (--stops 2) and tells the fake so (stop-rounds-2): each round's answer then plays until its
+# stop arrives, however late the driver plays the stop. A stop played after a 7 s answer's natural
+# end, as a driver held up by its machine plays it (cancel-late-stop, with late-clip), still stops
+# speech and is timed.
 readonly cancel_args="--step playback-cancel --stops 2 --playback-seconds 3 --question @question.wav --stop-clip @stop.wav --rig-mic $rig --event-timeout 15"
 # shellcheck disable=SC2086
 launch cancel long,asound,stop-rounds-2 yes -- $cancel_args
 # shellcheck disable=SC2086
 launch cancel-late-stop long,asound,stop-rounds-2,late-clip yes -- $cancel_args
+# A good cancel recorded by an arecord that holds its first 200 ms before writing it (arecord-hold-200),
+# longer than a real arecord can: still a pass, as the start, read before the header, comes no later
+# than the first sample. A start taken from the first sample's landing would be 200 ms late, and so
+# would every early bound: FAIL.
+# shellcheck disable=SC2086
+launch cancel-held-start long,asound,stop-rounds-2,arecord-hold-200 yes -- $cancel_args
+# The same, with an arecord whose fd /proc seldom shows (arecord-reopen), so the driver reads the
+# size with a stat of the file, and whose file's directory refuses every read for the hold
+# (arecord-locked): a failed read moves the start nowhere, so it stays before the header: PASS. A
+# failed read taken for no file yet put the start inside the 200 ms hold: a clean stop read as a
+# leak, FAIL (#146's review).
+# shellcheck disable=SC2086
+launch cancel-locked long,asound,stop-rounds-2,arecord-hold-200,arecord-reopen,arecord-locked yes -- $cancel_args
+# A good cancel with an arecord that reads 1.5 s after its header: the recording cannot show that the
+# rig heard the speech up to the stop: UNKNOWN, never PASS.
+# shellcheck disable=SC2086
+launch cancel-unsure long,asound,stop-rounds-2,arecord-slow-start yes -- $cancel_args
 # shellcheck disable=SC2086
 launch cancel-rewind long,asound,stop-rounds-2,rewind yes -- $cancel_args
 # shellcheck disable=SC2086
 launch cancel-slow-status long,asound,stop-rounds-2,slow-status yes -- $cancel_args
 # shellcheck disable=SC2086
 launch cancel-tail long,asound,stop-rounds-2,tail-50 yes -- $cancel_args
-# The word 150 ms on, recorded by an arecord stamped at its fork: FAIL, even at its early bound; by
-# one that starts late: UNKNOWN, never FAIL or PASS; and by one stamped at its fork though the fake
-# runs late: FAIL still, so a stamp that slips back to the fake's own start fails here on a machine
-# with no load, not only on a loaded one.
+# The word 150 ms on: FAIL, even at its early bound, with an arecord that starts at once and with one
+# that opens its device 3 s late (arecord-start-3s), as the driver times the recording from before
+# arecord's header; UNKNOWN, never FAIL or PASS, with one that reads 1.5 s after its header
+# (arecord-slow-start), as every early bound is then 1.5 s early. The pass with an arecord 3 s slow
+# to start: still a pass. Timed from arecord's start instead, the recording's end came 3 s early, and
+# both slow-start cases read UNKNOWN.
 # shellcheck disable=SC2086
-launch cancel-leak long,asound,stop-rounds-2,leak-150,arecord-prompt yes -- $cancel_args
+launch cancel-leak long,asound,stop-rounds-2,leak-150 yes -- $cancel_args
+# shellcheck disable=SC2086
+launch cancel-leak-slow-start long,asound,stop-rounds-2,leak-150,arecord-start-3s yes -- $cancel_args
 # shellcheck disable=SC2086
 launch cancel-leak-unsure long,asound,stop-rounds-2,leak-150,arecord-slow-start yes -- $cancel_args
 # shellcheck disable=SC2086
-launch cancel-leak-stalled long,asound,stop-rounds-2,leak-150,arecord-prompt,arecord-slow-start yes -- $cancel_args
+launch cancel-slow-start long,asound,stop-rounds-2,arecord-start-3s yes -- $cancel_args
 # shellcheck disable=SC2086
-launch cancel-leak-late long,asound,stop-rounds-2,leak-1100,arecord-prompt yes -- $cancel_args
+launch cancel-leak-late long,asound,stop-rounds-2,leak-1100 yes -- $cancel_args
 # shellcheck disable=SC2086
 launch cancel-leak-quiet long,asound,stop-rounds-2,leak-after-quiet yes -- $cancel_args
 # shellcheck disable=SC2086
-launch cancel-leak-chime long,asound,stop-rounds-2,leak-before-chime,arecord-prompt yes -- $cancel_args
+launch cancel-leak-chime long,asound,stop-rounds-2,leak-before-chime yes -- $cancel_args
 # shellcheck disable=SC2086
 launch cancel-leak-apart-chime long,asound,stop-rounds-2,leak-apart-chime yes -- $cancel_args
 # shellcheck disable=SC2086
 launch cancel-leak-into-chime long,asound,stop-rounds-2,leak-into-chime yes -- $cancel_args
 # shellcheck disable=SC2086
 launch cancel-leak-after-chime long,asound,stop-rounds-2,leak-after-chime yes -- $cancel_args
+# The word #146's second review planted, 80 to 60 ms before the next answer's first_audio: it starts
+# before the answer can be heard, so FAIL, never the PASS of an allowance before first_audio.
+# shellcheck disable=SC2086
+launch cancel-leak-before-first long,asound,stop-rounds-2,leak-before-first yes -- $cancel_args
 # shellcheck disable=SC2086
 launch cancel-quiet-chime long,asound,stop-rounds-2,quiet-chime yes -- $cancel_args
 # shellcheck disable=SC2086
@@ -1897,7 +2176,7 @@ launch cancel-no-chime long,asound,stop-rounds-2,no-chime-after-stop yes -- $can
 # shellcheck disable=SC2086
 launch cancel-no-wake long,asound,stop-rounds-2,no-wake-after-stop yes -- $cancel_args
 # shellcheck disable=SC2086
-launch cancel-drain long,asound,stop-rounds-2,drain,arecord-prompt yes -- $cancel_args
+launch cancel-drain long,asound,stop-rounds-2,drain yes -- $cancel_args
 # shellcheck disable=SC2086
 launch cancel-underrun long,asound,stop-rounds-2,underrun yes -- $cancel_args
 # shellcheck disable=SC2086
@@ -1908,7 +2187,7 @@ launch cancel-xrun long,asound,stop-rounds-2,xrun yes -- $cancel_args
 # shellcheck disable=SC2086
 launch cancel-behind long,asound,stop-rounds-2,arecord-behind yes -- $cancel_args
 # shellcheck disable=SC2086
-launch cancel-behind-drain long,asound,stop-rounds-2,arecord-behind,drain,arecord-prompt yes -- $cancel_args
+launch cancel-behind-drain long,asound,stop-rounds-2,arecord-behind,drain yes -- $cancel_args
 # A wc whose sizes come 200 ms late: the recording's anchors read their size without it, so a good
 # cancel still passes.
 # shellcheck disable=SC2086
@@ -1930,19 +2209,31 @@ launch first-audio-missing tts-missing '' -- --step tts-first-audio --sentences 
 # joined (c-joined-live): a pass; a pointer that names another meeting; the agent told its words
 # were spoken before the go-ahead; voice_spoken with another session's id; the meeting's only
 # voice_spoken while the go-ahead still plays; and the go-ahead followed by the wake sound alone, no
-# words at the rig. Each is the negative control of one of the step's checks. These record with an
-# arecord that starts at once, so that the words' onset, 1 s after the go-ahead, is after it even at
-# its early bound. joined-words-unsure records with one slow to start: the onset's early bound is
-# before the go-ahead's end and its late bound after it, so the step cannot tell (UNKNOWN).
+# words at the rig. Each is the negative control of one of the step's checks. The driver times the
+# recording from before arecord's header, so the words' onset, 1 s after the go-ahead, is after it
+# even at its early bound. joined-words-unsure records with an arecord that reads 1.5 s after its
+# header: the onset's early bound is before the go-ahead's end and its late bound after it, so the
+# step cannot tell (UNKNOWN).
 readonly joined_args="--step joined --join-issue join-5 --mention @mention.wav --go-ahead @go-ahead.wav --rig-mic $rig --event-timeout 10"
 # shellcheck disable=SC2086 # The arguments are words.
-launch joined-pass joined,arecord-prompt yes -- $joined_args
+launch joined-pass joined yes -- $joined_args
 for scenario in other-meeting early-spoken other-spoken spoken-during-clip words-silent; do
   # shellcheck disable=SC2086
-  launch "joined-$scenario" "joined,arecord-prompt,joined-$scenario" yes -- $joined_args
+  launch "joined-$scenario" "joined,joined-$scenario" yes -- $joined_args
 done
 # shellcheck disable=SC2086
 launch joined-words-unsure joined,arecord-slow-start yes -- $joined_args
+# The mention's aplay returning 1.8 s after the clip ended (slow-exit-mention): the hand sound came
+# 2.5 s after the mention ended, but only 0.7 s after aplay returned: UNKNOWN, never the FAIL of a gap
+# from aplay's return alone. The go-ahead's aplay starting the clip 2 s late (slow-aplay-go-ahead),
+# with the only voice_spoken, or the agent told, as the clip starts: each may be after the earliest
+# the clip can end, so UNKNOWN, never the FAIL of a time from aplay's return alone.
+# shellcheck disable=SC2086
+launch joined-slow-exit joined,slow-exit-mention yes -- $joined_args
+# shellcheck disable=SC2086
+launch joined-spoken-slow-start joined,joined-spoken-during-clip,slow-aplay-go-ahead yes -- $joined_args
+# shellcheck disable=SC2086
+launch joined-told-slow-start joined,joined-told-during-clip,slow-aplay-go-ahead yes -- $joined_args
 wait
 
 # Ctrl-C while the driver waits for voice_wake, then Ctrl-C again while the restore stops the
@@ -2032,11 +2323,21 @@ for line in 'PASS: precondition: the unit is paused with no active session' \
   expect_line pass "$line"
 done
 expect_no_line pass 'FAIL'
-# The fake speaks 700 ms after its own end of the clip; the driver's end comes later by aplay's exit,
-# which grows under load, so the lower bounds leave room for it.
+# The chime is timed from voice_wake, which the fake stamps 120 ms before it; no clip's timing comes
+# into it. The speech's delay is an interval as wide as the question clip's timing allows, which
+# grows with aplay's start and exit under load: it must hold the fake's true delay.
 expect_between 'pass: wake to chime' "$(measured pass chime)" 60 300
-expect_between 'pass: end of the question to speech' "$(measured pass speech)" 450 1000
+expect_holds pass speech "$(true_fact_median pass)"
 expect_restored pass
+expect_rc pass-aplay-late 0
+expect_line pass-aplay-late 'PASS: speech '
+expect_holds pass-aplay-late speech "$(true_fact_median pass-aplay-late)"
+late_interval=$(sed -n 's/^PASS: speech \([0-9]*\) ms after the end of the question (no earlier than \(-\{0,1\}[0-9]*\) ms).*/\2 \1/p' "$root/pass-aplay-late/out")
+read -r late_low late_high <<<"$late_interval"
+if [[ -z $late_low || -z $late_high ]] || ((late_high - late_low < 700)); then
+  check_failed "pass-aplay-late: the speech's interval, '$late_interval', is not at least the 700 ms aplay waited before the clip: the case did not delay it"
+fi
+expect_restored pass-aplay-late
 expect_rc pass-slow-exit 0
 expect_restored pass-slow-exit
 [[ -s $root/pass-slow-exit/state/stop-killed ]] \
@@ -2082,7 +2383,7 @@ expect_no_leftovers no-spoken
 
 # A voice event that carries words, or another session's id, fails.
 expect_rc spoken-words 1
-expect_line spoken-words 'FAIL: voice_spoken: carries a field other than type, version, timestamp and session_id: text'
+expect_line spoken-words 'FAIL: voice_spoken: carries a field other than type, version, timestamp, at_mono_ns and session_id: text'
 expect_restored spoken-words
 expect_rc other-session 1
 expect_line other-session 'FAIL: voice_spoken: session_id "session-2", want "session-1" from voice_exchange_started'
@@ -2107,6 +2408,14 @@ expect_restored late-chime
 expect_rc slow-speech 1
 expect_line slow-speech 'ms after the end of the question, more than 300 ms'
 expect_restored slow-speech
+expect_rc slow-start-speech 2
+expect_line slow-start-speech 'UNKNOWN: speech: its delay after the end of the question: between '
+expect_no_line slow-start-speech 'PASS: speech '
+expect_restored slow-start-speech
+expect_rc late-chime-unsure 2
+expect_line late-chime-unsure 'UNKNOWN: chime: its delay after voice_wake: '
+expect_no_line late-chime-unsure 'FAIL: chime: '
+expect_restored late-chime-unsure
 
 # A pause the API cannot save: the restore writes the saved capture state back itself, so the service
 # starts paused.
@@ -2236,13 +2545,23 @@ expect_no_leftovers wake
 expect_rc wake-lag 0
 expect_between 'wake-lag: median' "$(measured wake-lag 'wake-sound: median')" 60 280
 expect_restored wake-lag
-expect_rc wake-overrun 0
-expect_between 'wake-overrun: median' "$(measured wake-overrun 'wake-sound: median')" 60 280
+expect_rc wake-overrun 2
+expect_line wake-overrun 'UNKNOWN: wake-sound: the longest call from wake_heard to the wake sound at the Jabra: between -100 and '
+expect_no_line wake-overrun 'PASS: wake-sound: '
 expect_restored wake-overrun
 expect_rc wake-median 1
 expect_line wake-median 'more than 300 ms'
 expect_between 'wake-median: the median the negative control reports' "$(measured wake-median 'wake-sound: median')" 301 399
 expect_restored wake-median
+expect_rc wake-median-unsure 2
+expect_line wake-median-unsure 'UNKNOWN: wake-sound: the '
+expect_no_line wake-median-unsure 'FAIL: wake-sound: '
+expect_restored wake-median-unsure
+expect_rc wake-realtime-step 0
+expect_line wake-realtime-step 'PASS: wake-sound: no call passed 400 ms'
+expect_between 'wake-realtime-step: median' "$(measured wake-realtime-step 'wake-sound: median')" 60 280
+[[ -s $root/wake-realtime-step/state/realtime-step-at ]] || check_failed 'wake-realtime-step: the fake service never stepped its wall clock'
+expect_restored wake-realtime-step
 expect_rc wake-max 1
 expect_line wake-max 'FAIL: wake-sound: a call took '
 expect_line wake-max 'more than 400 ms'
@@ -2277,17 +2596,40 @@ expect_rc scripted 2
 expect_line scripted 'PASS: scripted tts: median '
 expect_line scripted 'PASS: scripted tts: 90th percentile '
 expect_line scripted 'UNKNOWN: scripted gptlive: this build refuses voice.engine gptlive: voice.engine "gptlive" is not in this build'
-expect_between 'scripted: tts median' "$(measured scripted 'scripted tts: median')" 450 1000
+expect_holds scripted 'scripted tts: median' "$(true_fact_median scripted)"
 grep -Fqx GHOST_WISPR_VOICE_ENGINE=gptlive "$root/scripted/state/started-env.3" || check_failed 'scripted: gptlive did not get its own start'
 expect_restored scripted
+expect_rc scripted-unsure 2
+expect_line scripted-unsure 'UNKNOWN: scripted tts: the median from t0 to the first fact at the Jabra: '
+expect_no_line scripted-unsure 'PASS: scripted tts: median '
+expect_restored scripted-unsure
+expect_rc scripted-slow-start 2
+expect_line scripted-slow-start 'UNKNOWN: scripted tts: the median from t0 to the first fact at the Jabra: between '
+expect_no_line scripted-slow-start 'PASS: scripted tts: median '
+expect_restored scripted-slow-start
 expect_rc scripted-filler 1
 expect_line scripted-filler 'more than 2500 ms; this voice is past the bound'
-expect_between 'scripted-filler: the median the negative control reports' "$(measured scripted-filler 'scripted tts: median')" 4500 5600
+# The negative control: the fake's true median is past the 2.5 s bound, and the FAIL's early bound is
+# no later than it.
+filler_truth=$(true_fact_median scripted-filler)
+filler_low=$(measured scripted-filler 'scripted tts: median')
+if [[ -z $filler_truth || -z $filler_low ]] || ((filler_truth <= 2500 || filler_low > filler_truth)); then
+  check_failed "scripted-filler: the FAIL's early bound, '${filler_low}' ms, or the fake's true median, '${filler_truth}' ms, is not a median past the 2500 ms bound bounded from below"
+fi
 expect_restored scripted-filler
 expect_rc scripted-joined 0
 expect_line scripted-joined 'followed the sentence before it with no gap'
-expect_between 'scripted-joined: median' "$(measured scripted-joined 'scripted tts: median')" 1550 2150
+expect_holds scripted-joined 'scripted tts: median' "$(true_fact_median scripted-joined)"
 expect_restored scripted-joined
+expect_rc scripted-joined-aplay-late 0
+expect_line scripted-joined-aplay-late 'followed the sentence before it with no gap'
+expect_holds scripted-joined-aplay-late 'scripted tts: median' "$(true_fact_median scripted-joined-aplay-late)"
+joined_interval=$(sed -n 's/^PASS: scripted tts: median \([0-9]*\) ms .*(no less than \(-\{0,1\}[0-9]*\) ms).*/\2 \1/p' "$root/scripted-joined-aplay-late/out")
+read -r joined_low joined_high <<<"$joined_interval"
+if [[ -z $joined_low || -z $joined_high ]] || ((joined_high - joined_low < 700)); then
+  check_failed "scripted-joined-aplay-late: the median's interval, '$joined_interval', is not at least the 700 ms aplay waited before the clip: the case did not delay it"
+fi
+expect_restored scripted-joined-aplay-late
 expect_rc scripted-few 2
 expect_line scripted-few 'UNKNOWN: scripted needs: --question-dir with 5 clips'
 expect_untouched scripted-few
@@ -2370,6 +2712,10 @@ expect_rc barge-short 2
 expect_line barge-short 'NOTE: barge-in round 1 (talk-over): the answer ended by itself inside the window; not counted'
 expect_line barge-short 'UNKNOWN: barge-in: only 0 of 1 talk-over rounds counted'
 expect_restored barge-short
+expect_rc barge-slow-start 2
+expect_line barge-slow-start "UNKNOWN: barge-in: the median from a talk-over clip's start to silence at the Jabra: between "
+expect_no_line barge-slow-start 'FAIL: barge-in'
+expect_restored barge-slow-start
 expect_rc barge-backchannel 1
 expect_line barge-backchannel 'FAIL: barge-in: 1 of 1 backchannels stopped the speech, more than 0'
 expect_restored barge-backchannel
@@ -2395,6 +2741,20 @@ expect_line barge-backchannel-late 'FAIL: barge-in: 1 of 1 backchannels stopped 
 expect_no_line barge-backchannel-late 'not counted'
 expect_held barge-backchannel-late 2
 expect_restored barge-backchannel-late
+# FAIL or UNKNOWN, never PASS: how much of the hold the recording's times can see depends on load.
+expect_rc barge-backchannel-frozen 1 2
+expect_no_line barge-backchannel-frozen 'PASS: barge-in: '
+[[ -s $root/barge-backchannel-frozen/state/arecord-froze ]] || check_failed 'barge-backchannel-frozen: the fake arecord did not hold the driver up'
+expect_restored barge-backchannel-frozen
+expect_rc barge-pause 0
+expect_line barge-pause 'PASS: barge-in: 0 of 1 backchannels stopped the speech, at most 0'
+expect_line barge-pause 'NOTE: barge-in round 2 (backchannel): the speech went on'
+grep -Fq '"kind": "quiet"' "$root/barge-pause/state/timeline.jsonl" || check_failed 'barge-pause: the fake voice did not pause'
+expect_restored barge-pause
+expect_rc barge-pause-unsure 2
+expect_line barge-pause-unsure 'UNKNOWN: barge-in: 0 of 1 backchannels stopped the speech, and backchannel rounds 2 may have'
+expect_no_line barge-pause-unsure 'PASS: barge-in: 0 of 1'
+expect_restored barge-pause-unsure
 
 # playback-cancel.
 expect_rc cancel 0
@@ -2413,6 +2773,20 @@ expect_line cancel-late-stop "PASS: playback-cancel: no stop's speech was heard 
 held=$(cat "$root/cancel-late-stop/state/late-clip.log" 2>/dev/null | grep -c .)
 ((held >= 2)) || check_failed "cancel-late-stop: the fake held up $held reads, want at least the 2 stop rounds'"
 expect_restored cancel-late-stop
+expect_rc cancel-held-start 0
+expect_line cancel-held-start "PASS: playback-cancel: no stop's speech was heard at the rig microphone 20 ms after it"
+expect_restored cancel-held-start
+expect_rc cancel-locked 0
+expect_line cancel-locked "PASS: playback-cancel: no stop's speech was heard at the rig microphone 20 ms after it"
+[[ -s $root/cancel-locked/state/arecord-locked ]] || check_failed 'cancel-locked: the fake arecord never locked its file away, so the case tested no failed read'
+expect_restored cancel-locked
+expect_rc cancel-unsure 2
+expect_line cancel-unsure 'UNKNOWN: playback-cancel stop 1: the rig microphone did not hear the speech up to the stop'
+expect_no_line cancel-unsure "PASS: playback-cancel: no stop's speech was heard"
+expect_restored cancel-unsure
+expect_rc cancel-slow-start 0
+expect_line cancel-slow-start "PASS: playback-cancel: no stop's speech was heard at the rig microphone 20 ms after it"
+expect_restored cancel-slow-start
 expect_rc cancel-rewind 0
 expect_line cancel-rewind "PASS: playback-cancel: no stop's speech was heard at the rig microphone 20 ms after it"
 expect_line cancel-rewind 'NOTE: playback-cancel: the speaker logged 2 cancels: 2 by rewind, 0 by drop'
@@ -2470,21 +2844,20 @@ expect_restored cancel-drain
 expect_not_passed cancel-tail 30 120
 expect_restored cancel-tail
 # The word 150 ms after the stop, 250 ms long, so its end is 400 ms after the stop. Recorded by an
-# arecord that starts at once, its early bound is over the 20 ms bound too, and never over 400, as a
-# stamp that is never early keeps it: FAIL. Recorded by one slow to start, its early bound is more
-# than 1.5 s early, under the bound, and its late bound over it: UNKNOWN, never FAIL or PASS; and by
-# one stamped at its fork though the fake runs late, FAIL again.
+# arecord that starts at once, or opens its device 3 s late, its early bound is over the 20 ms bound
+# too, and never over 400, as a bound that is never late keeps it: FAIL. Recorded by one that reads
+# 1.5 s after its header, every early bound is more than 1.5 s early, so the recording cannot show
+# that the rig heard the speech up to the stop: UNKNOWN, never FAIL or PASS.
 expect_rc cancel-leak 1
 expect_between 'cancel-leak: how long the leaked word is heard' "$(heard_after cancel-leak)" 150 500
 expect_between 'cancel-leak: how long the leaked word is heard, at the least' "$(heard_no_earlier cancel-leak)" 21 400
 expect_restored cancel-leak
-expect_rc cancel-leak-stalled 1
-expect_between 'cancel-leak-stalled: how long the leaked word is heard, at the least, with the fake 1.5 s late' "$(heard_no_earlier cancel-leak-stalled)" 21 400
-expect_restored cancel-leak-stalled
+expect_rc cancel-leak-slow-start 1
+expect_line cancel-leak-slow-start "FAIL: playback-cancel: a stop's speech was heard at the rig microphone "
+expect_between 'cancel-leak-slow-start: how long the leaked word is heard, at the least, with the device opened 3 s late' "$(heard_no_earlier cancel-leak-slow-start)" 21 400
+expect_restored cancel-leak-slow-start
 expect_rc cancel-leak-unsure 2
-expect_line cancel-leak-unsure "UNKNOWN: playback-cancel: stop "
-expect_between 'cancel-leak-unsure: how long the leaked word is heard up to' "$(heard_up_to cancel-leak-unsure)" 150 500
-expect_between 'cancel-leak-unsure: how long the leaked word is heard, at the least' "$(heard_no_earlier cancel-leak-unsure)" 0 20
+expect_line cancel-leak-unsure 'UNKNOWN: playback-cancel stop 1: the rig microphone did not hear the speech up to the stop'
 expect_no_line cancel-leak-unsure "FAIL: playback-cancel: a stop's speech was heard"
 expect_no_line cancel-leak-unsure "PASS: playback-cancel: no stop's speech was heard"
 expect_restored cancel-leak-unsure
@@ -2509,6 +2882,11 @@ expect_rc cancel-leak-after-chime 1
 expect_line cancel-leak-after-chime "FAIL: playback-cancel stop 1: a sound at the rig microphone starts "
 expect_line cancel-leak-after-chime "after the next question's chime ends, before its answer's first audio"
 expect_restored cancel-leak-after-chime
+expect_rc cancel-leak-before-first 1
+expect_line cancel-leak-before-first "FAIL: playback-cancel stop 1: a sound at the rig microphone starts "
+expect_line cancel-leak-before-first "after the next question's chime ends, before its answer's first audio"
+expect_no_line cancel-leak-before-first "PASS: playback-cancel: no stop's speech was heard"
+expect_restored cancel-leak-before-first
 expect_rc cancel-quiet-chime 0
 expect_line cancel-quiet-chime "PASS: playback-cancel: no stop's speech was heard at the rig microphone 20 ms after it"
 expect_line cancel-quiet-chime 'NOTE: playback-cancel: calibration: the wake sound played alone (ghost-wispr play-sound) is heard at the rig microphone for 130 ms above -50 dB'
@@ -2539,7 +2917,8 @@ expect_restored cancel-clock-fast
 expect_rc cancel-clock-slow 0
 expect_restored cancel-clock-slow
 # A 21 ms tail with the rig clock 200 ppm fast: over the bound at its late bound, and never over it
-# at its early bound, which is early by at least the time arecord took to start.
+# at its early bound, which is early by the time from the driver's last read before arecord's header
+# to the capture, and rounded down to the millisecond.
 expect_rc cancel-tail-21-fast 2
 expect_between 'cancel-tail-21-fast: how long a 21 ms tail is heard up to with the rig clock 200 ppm fast' "$(heard_up_to cancel-tail-21-fast)" 21 40
 expect_no_line cancel-tail-21-fast "PASS: playback-cancel: no stop's speech was heard"
@@ -2608,10 +2987,10 @@ for line in 'PASS: joined: recording session session-1' 'PASS: joined: the test 
   "PASS: joined: the agent's words reached the Jabra "; do
   expect_line joined-pass "$line"
 done
-# The words start 1 s after the go-ahead's clip ends: their onset's early bound is at or after the
-# go-ahead's end, as the driver timed it, and never later than 1 s after it.
+# The words start 1.3 s after the go-ahead's clip ends: their onset's early bound is at or after the
+# go-ahead's end, as the driver timed it, and never later than 1.3 s after it.
 read -r onset_early onset_late <<<"$(joined_onset joined-pass)"
-expect_between "joined-pass: the early bound of the words' onset, from the end of the go-ahead" "$onset_early" 0 1000
+expect_between "joined-pass: the early bound of the words' onset, from the end of the go-ahead" "$onset_early" 0 1300
 expect_between "joined-pass: the late bound of the words' onset, from the end of the go-ahead" "$onset_late" "${onset_early:-0}" 5000
 expect_restored joined-pass
 expect_rc joined-other-meeting 1
@@ -2621,19 +3000,29 @@ expect_rc joined-early-spoken 1
 expect_line joined-early-spoken 'FAIL: joined: the test agent was told its hand came down spoken '
 expect_line joined-early-spoken 'before the go-ahead'
 expect_restored joined-early-spoken
-for name in other-spoken spoken-during-clip; do
-  expect_rc "joined-$name" 1
-  expect_line "joined-$name" 'FAIL: joined: no voice_spoken for recording session session-1 within 10 s of the end of the go-ahead'
-  expect_restored "joined-$name"
-done
+expect_rc joined-other-spoken 1
+expect_line joined-other-spoken 'FAIL: joined: no voice_spoken for recording session session-1 within 10 s of the end of the go-ahead'
+expect_restored joined-other-spoken
+# The only voice_spoken comes as the go-ahead starts: before the earliest the clip can end, it is
+# not one after the go-ahead, FAIL; where a loaded machine starts the fake aplay late enough that it
+# may be after that earliest end, UNKNOWN. Never a PASS of a voice_spoken after the go-ahead.
+expect_rc joined-spoken-during-clip 1 2
+expect_no_line joined-spoken-during-clip 'PASS: joined: voice_spoken for recording session session-1 '
+if [[ $(cat "$root/joined-spoken-during-clip/rc" 2>/dev/null) == 1 ]]; then
+  expect_line joined-spoken-during-clip 'FAIL: joined: no voice_spoken for recording session session-1 within 10 s of the end of the go-ahead'
+else
+  expect_line joined-spoken-during-clip 'UNKNOWN: joined: the only voice_spoken for recording session session-1 came '
+fi
+expect_restored joined-spoken-during-clip
 expect_rc joined-words-silent 1
 expect_line joined-words-silent 'PASS: joined: the hand sound reached the Jabra'
 expect_line joined-words-silent 'FAIL: joined: no words at the rig microphone between the end of the go-ahead and voice_spoken'
 expect_restored joined-words-silent
-# An arecord slow to start: the words' onset is before the go-ahead's end at its early bound and
-# after it at its late bound, so whether they began after the go-ahead is UNKNOWN, never PASS.
+# An arecord that reads 1.5 s after its header: the words' onset is before the go-ahead's end at its
+# early bound and after it at its late bound, so whether they began after the go-ahead is UNKNOWN,
+# never PASS; nor can the recording show that the hand sound began after hand_chime.
 expect_rc joined-words-unsure 2
-expect_line joined-words-unsure 'PASS: joined: the hand sound reached the Jabra'
+expect_no_line joined-words-unsure 'PASS: joined: the hand sound reached the Jabra'
 expect_line joined-words-unsure 'UNKNOWN: joined: a sound at the rig microphone longer than the wake sound starts between '
 expect_line joined-words-unsure "so whether the agent's words began after the go-ahead and before voice_spoken is not known"
 expect_no_line joined-words-unsure "PASS: joined: the agent's words reached the Jabra"
@@ -2641,6 +3030,23 @@ read -r onset_early onset_late <<<"$(joined_onset joined-words-unsure)"
 expect_between "joined-words-unsure: the early bound of the words' onset, from the end of the go-ahead" "$onset_early" -10000 -1
 expect_between "joined-words-unsure: the late bound of the words' onset, from the end of the go-ahead" "$onset_late" 0 5000
 expect_restored joined-words-unsure
+expect_rc joined-slow-exit 2
+expect_line joined-slow-exit 'UNKNOWN: joined: the hand sound began between '
+expect_no_line joined-slow-exit 'FAIL: joined: the hand sound began'
+expect_restored joined-slow-exit
+expect_rc joined-spoken-slow-start 2
+expect_line joined-spoken-slow-start 'UNKNOWN: joined: the only voice_spoken for recording session session-1 came '
+expect_restored joined-spoken-slow-start
+expect_rc joined-told-slow-start 2
+expect_line joined-told-slow-start 'UNKNOWN: joined: the test agent was told its hand came down spoken between '
+expect_no_line joined-told-slow-start 'FAIL: joined: the test agent was told'
+expect_restored joined-told-slow-start
+
+# The driver compares times on the monotonic clock only: bash's wall clock serves journalctl's
+# --since alone, so a step of the wall clock can move no time it compares.
+# shellcheck disable=SC2016 # The $ is the driver's, matched literally.
+realtime=$(grep -n 'EPOCHREALTIME\|EPOCHSECONDS\|date +%s' "$driver" | grep -v 'restart_wall_s=\$EPOCHSECONDS$')
+[[ -z $realtime ]] || check_failed "the driver reads the wall clock beyond journalctl's --since: $realtime"
 
 # Neither file names the company (tests/public_literals_test.go's list) or holds an issue key.
 literals=$(awk '

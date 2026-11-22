@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Checks deploy/pi/recording-times.awk, which gives deploy/pi/accept-voice.sh the driver's times of
 # the sounds in a rig recording: never early, so that no bound on a measured time (a cancel's tail,
-# a latency) passes on an early time; and the end of what the recording shows, never late. Recordings
+# a latency) passes on an early time; their early bounds; the silences between them, never long; and
+# the end of what the recording shows, between two bounds. Recordings
 # here are made up: anchors, as the driver writes them, and ffmpeg's silencedetect report, for a
 # sound card whose clock runs up to 200 ppm off the driver's, an arecord that writes late or loses
 # audio in an overrun, and places printed as ffmpeg prints them (%.6g) or to the microsecond.
@@ -80,7 +81,9 @@ off=$(awk '$1 == "sound" { print $3; exit }' <<<"$out")
 # Never early, and late only by the read delays and the rounding: for a clock 200 ppm fast, 200 ppm
 # slow and right; anchors every 0.5 s, each read up to 30 ms late, or every 5 s on time; an overrun
 # that loses 250 ms 5 s into the file; places printed in %.6g and to the microsecond. The end is
-# never later than the time of the last place the report shows.
+# never later than the time of the last place the report shows, and its late bound never earlier
+# than the file's end. A silence's length, before each sound and after the last, is never longer
+# than the true one, and shorter only by 400 ppm, the rounding and any audio lost in it.
 python3 - "$work_dir" "$program" <<'EOF' || fail "a time came out early or far late (above)"
 import math, os, random, subprocess, sys
 d, program = sys.argv[1], sys.argv[2]
@@ -143,9 +146,10 @@ for speed in (1.0002, 0.9998, 1.0):
                     if place > last_periodic:
                         s += 5
                     return s
+                prev_off = None
                 for (on, off), fields in zip(sounds, got):
-                    if len(fields) != 6:
-                        failures.append("%s: a sound line %s, want sound ON OFF LENGTH ON_EARLY OFF_EARLY" % (case, " ".join(fields)))
+                    if len(fields) != 7:
+                        failures.append("%s: a sound line %s, want sound ON OFF LENGTH ON_EARLY OFF_EARLY GAP" % (case, " ".join(fields)))
                         continue
                     for place, ms, early in ((on, int(fields[1]), int(fields[4])), (off, int(fields[2]), int(fields[5]))):
                         checked += 1
@@ -162,14 +166,113 @@ for speed in (1.0002, 0.9998, 1.0):
                             failures.append("%s: the place %.3f ms into the file is at %.3f ms, its early bound %d ms: late" % (case, place, want, early))
                         elif early < want - (place * 0.0004 + (lost if overrun and place >= 5000 else 0) + 3):
                             failures.append("%s: the place %.3f ms into the file is at %.3f ms, its early bound %d ms: far early" % (case, place, want, early))
+                    # The silence before the sound, from the last sound's end or the file's start.
+                    start = 0.0 if prev_off is None else prev_off
+                    true_gap = true_ms(on) - true_ms(start)
+                    gap = int(fields[6])
+                    checked += 1
+                    if gap > true_gap:
+                        failures.append("%s: the silence from %.3f to %.3f ms into the file lasts %.3f ms, given %d ms: long" % (case, start, on, true_gap, gap))
+                    elif gap < true_gap - ((on - start) * 0.0004 + (lost if overrun and start < 5000 <= on else 0) + 2):
+                        failures.append("%s: the silence from %.3f to %.3f ms into the file lasts %.3f ms, given %d ms: far short" % (case, start, on, true_gap, gap))
+                    prev_off = off
                 end = [line.split() for line in out if line.startswith("end ")]
-                if not end or int(end[0][1]) > true_ms(length - 20):
+                if not end or len(end[0]) != 4:
+                    failures.append("%s: the end line %s, want end END_MS END_LATE_MS TRAIL_MS" % (case, end))
+                    continue
+                if int(end[0][1]) > true_ms(length - 20):
                     failures.append("%s: the end %s is later than %.3f ms, the time of the last place the report shows" % (case, end, true_ms(length - 20)))
+                checked += 1
+                if end[0][2] == "none" or int(end[0][2]) < true_ms(length) or int(end[0][2]) > true_ms(length) + 7:
+                    failures.append("%s: the end's late bound %s, want %.3f to %.3f ms: the last anchor bounds it" % (case, end[0][2], true_ms(length), true_ms(length) + 7))
+                true_trail = true_ms(length - 20) - true_ms(sounds[-1][1])
+                checked += 1
+                if int(end[0][3]) > true_trail:
+                    failures.append("%s: the silence after the last sound lasts %.3f ms to the end the report shows, given %s ms: long" % (case, true_trail, end[0][3]))
+                elif int(end[0][3]) < true_trail - ((length - sounds[-1][1]) * 0.0004 + 4):
+                    failures.append("%s: the silence after the last sound lasts %.3f ms to the end the report shows, given %s ms: far short" % (case, true_trail, end[0][3]))
 if checked == 0:
     failures.append("no place was checked")
 for line in failures[:20]:
     print(line)
 print("recording-times: checked %d places, %d failures" % (checked, len(failures)))
+sys.exit(1 if failures else 0)
+EOF
+
+# The microphone's delay: each sound reaches the microphone 0 to 2 ms before its capture. With
+# mic_delay_us=2000, every early bound must be no later than the arrival, every silence no longer
+# than the time between the arrivals, and the end early enough that a sound arriving before it is
+# captured before the last place the report shows. Without it, the same recordings must break the
+# first of these, or the check could not fail.
+python3 - "$work_dir" "$program" <<'EOF' || fail "a bound did not allow for the microphone's delay (above)"
+import math, os, random, subprocess, sys
+d, program = sys.argv[1], sys.argv[2]
+random.seed(2000)
+failures = []
+checked = 0
+late_without = 0
+for trial in range(6):
+    origin = 100000.0 + random.random()
+    length = 6000
+    def capture_ms(rel):
+        return origin + rel
+    with open(os.path.join(d, "ma"), "w") as f:
+        for rel in range(500, length + 1, 500):
+            f.write("%d %d\n" % (math.floor(capture_ms(rel) * 1000) + 1, 44 + rel * 48))
+    sounds = []
+    at = 300.0
+    while at < length - 600:
+        on = at + random.random() * 100
+        off = on + 50 + random.random() * 300
+        sounds.append((on, off))
+        at = off + 200
+    delay = {}
+    for on, off in sounds:
+        delay[on] = random.random() * 2.0
+        delay[off] = random.random() * 2.0
+    def arrival_ms(place):
+        return capture_ms(place) - delay[place]
+    lines = ["[silencedetect @ 0x1] silence_start: 0\n"]
+    for on, off in sounds:
+        lines.append("[silencedetect @ 0x1] silence_end: %.6f | x\n" % (on / 1000))
+        lines.append("[silencedetect @ 0x1] silence_start: %.6f\n" % (off / 1000))
+    lines.append("[silencedetect @ 0x1] silence_end: %.6f | x\n" % (length / 1000))
+    with open(os.path.join(d, "ms"), "w") as f:
+        f.writelines(lines)
+    for mic in ("2000", ""):
+        with open(os.path.join(d, "ms")) as report:
+            out = subprocess.run(["awk", "-v", "rate=24000", "-v", "header=44", "-v", "frame=2",
+                                  "-v", "bytes=%d" % (44 + length * 48), "-v", "started_us=%d" % math.floor(origin * 1000),
+                                  "-v", "mic_delay_us=" + mic, "-f", program, os.path.join(d, "ma"), "-"],
+                                 stdin=report, capture_output=True, text=True, check=True).stdout.split("\n")
+        got = [line.split() for line in out if line.startswith("sound ")]
+        end = [line.split() for line in out if line.startswith("end ")]
+        if len(got) != len(sounds) or not end:
+            failures.append("trial %d, mic_delay_us %r: %d sounds, want %d; end %s" % (trial, mic, len(got), len(sounds), end))
+            continue
+        prev_off = None
+        for (on, off), fields in zip(sounds, got):
+            for place, early in ((on, int(fields[4])), (off, int(fields[5]))):
+                if not mic:
+                    late_without += early > arrival_ms(place)
+                    continue
+                checked += 1
+                if early > arrival_ms(place):
+                    failures.append("trial %d: the sound %.3f ms in reached the microphone at %.3f ms, its early bound %d ms: late" % (trial, place, arrival_ms(place), early))
+            if mic and prev_off is not None:
+                checked += 1
+                if int(fields[6]) > arrival_ms(on) - arrival_ms(prev_off):
+                    failures.append("trial %d: the silence before %.3f ms in lasted %.3f ms between arrivals, given %s ms: long" % (trial, on, arrival_ms(on) - arrival_ms(prev_off), fields[6]))
+            prev_off = off
+        if mic:
+            checked += 1
+            if int(end[0][1]) > capture_ms(length - 20) - 2:
+                failures.append("trial %d: the end %s ms, later than %.3f ms, so a sound arriving 2 ms before its capture at the last place shown may be missing" % (trial, end[0][1], capture_ms(length - 20) - 2))
+if late_without == 0:
+    failures.append("without mic_delay_us no early bound came after an arrival, so this test cannot fail")
+for line in failures[:20]:
+    print(line)
+print("recording-times mic delay: checked %d bounds, %d failures; %d early bounds after the arrival without it" % (checked, len(failures), late_without))
 sys.exit(1 if failures else 0)
 EOF
 
@@ -184,6 +287,7 @@ out=$(times "$work_dir/edge.anchors" "$work_dir/edge.txt" $((44 + 2000 * 48)) 0)
 [[ $(grep -c '^sound ' <<<"$out") == 2 ]] || fail "want 2 sounds (0.5 to 0.8 s, and 1.6 s to the end): $out"
 [[ $(awk '$1 == "sound" { off = $3 } END { print off }' <<<"$out") == 2001 ]] \
   || fail "the sound still going at the end does not run to the end of the file, 2001 ms on the clock: $out"
+[[ $(awk '$1 == "end" { print $4 }' <<<"$out") == 0 ]] || fail "a sound still going at the end leaves no silence after it: $out"
 
 # A sound that runs to the end of a file whose length is not a whole number of microseconds: 48,001
 # and 48,002 samples at 24 kHz end 2000041.67 and 2000083.33 us in. The driver's last anchor, read
@@ -207,5 +311,13 @@ grep -q '^error ' <<<"$out" || fail "no error without an anchor: $out"
 printf '1000000 %s\n' $((44 + 1000 * 48)) >"$work_dir/short.anchors"
 out=$(times "$work_dir/short.anchors" "$work_dir/edge.txt" $((44 + 2000 * 48)) 0)
 grep -q '^error ' <<<"$out" || fail "no error for a sound after the last anchor: $out"
+# A file whose last anchor came before its end, with no sound after the anchor: the sounds have
+# times, and the end's late bound is none.
+printf '%s\n' '[silencedetect @ 0x1] silence_start: -0.00133' \
+  '[silencedetect @ 0x1] silence_end: 0.5 | silence_duration: 0.50133' \
+  '[silencedetect @ 0x1] silence_start: 0.8' \
+  '[silencedetect @ 0x1] silence_end: 2 | silence_duration: 1.2' >"$work_dir/quiet-end.txt"
+out=$(times "$work_dir/short.anchors" "$work_dir/quiet-end.txt" $((44 + 2000 * 48)) 0) || fail "the unbounded end failed: $out"
+[[ $(awk '$1 == "end" { print $3 }' <<<"$out") == none ]] || fail "an end after the last anchor has a late bound: $out"
 
 printf 'recording-times test passed\n'

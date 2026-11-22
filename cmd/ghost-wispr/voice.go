@@ -9,11 +9,11 @@ import (
 	"net/url"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/sjawhar/ghost-wispr/internal/audio"
 	"github.com/sjawhar/ghost-wispr/internal/config"
 	"github.com/sjawhar/ghost-wispr/internal/googleauth"
+	"github.com/sjawhar/ghost-wispr/internal/monoclock"
 	"github.com/sjawhar/ghost-wispr/internal/server"
 	"github.com/sjawhar/ghost-wispr/internal/voice"
 	"github.com/sjawhar/ghost-wispr/internal/voice/dgagent"
@@ -35,7 +35,7 @@ type voiceControl interface {
 	Started()
 	RedCheckFailed()
 	OnTranscript(t *voice.Transcript)
-	OnUtteranceEnd(closings int, gateOpen bool, at time.Time)
+	OnUtteranceEnd(closings int, gateOpen bool, at monoclock.Stamp)
 	WithFloor(ctx context.Context, start func()) error
 	Close()
 }
@@ -100,7 +100,7 @@ func (l *voiceLink) OnTranscript(t *voice.Transcript) {
 	}
 }
 
-func (l *voiceLink) OnUtteranceEnd(closings int, gateOpen bool, at time.Time) {
+func (l *voiceLink) OnUtteranceEnd(closings int, gateOpen bool, at monoclock.Stamp) {
 	if v := l.get(); v != nil {
 		v.OnUtteranceEnd(closings, gateOpen, at)
 	}
@@ -201,7 +201,7 @@ type voiceDeps struct {
 	voices      func() (voice.Voice, error) // the voice for the next call
 	enabled     func() bool                 // voice.enabled, live
 	wakePhrases []string
-	timing      func(event, sessionID string, at time.Time, kv ...any)
+	timing      func(event, sessionID string, at monoclock.Stamp, kv ...any)
 	session     func() string                // the recording session now, once its start is done ("" before)
 	mark        func() (string, uint64)      // the settled session and the count of settled starts, together (SessionMark)
 	ofStart     func(uint64) string          // the id of the settled start with that sequence (SessionOfStart)
@@ -322,11 +322,16 @@ func (v *voiceSource) warnBuild(enabled bool, warnings *warningsRegistry) {
 
 // voiceTiming writes the Supervisor's timing events to the journal, as the
 // acceptance driver reads them: message "voice timing" (the key logging.New
-// writes), with event, session_id and at_unix_ns.
-func voiceTiming(logger *slog.Logger) func(event, sessionID string, at time.Time, kv ...any) {
-	return func(event, sessionID string, at time.Time, kv ...any) {
-		attrs := append([]any{"event", event, "session_id", sessionID, "at_unix_ns", at.UnixNano()}, kv...)
-		logger.Info("voice timing", attrs...)
+// writes), with event, session_id, at_unix_ns, and at_mono_ns, CLOCK_MONOTONIC
+// read where the event's time was taken, which the driver compares with its own
+// reads of that clock (monoclock). A Stamp with no Mono has no at_mono_ns.
+func voiceTiming(logger *slog.Logger) func(event, sessionID string, at monoclock.Stamp, kv ...any) {
+	return func(event, sessionID string, at monoclock.Stamp, kv ...any) {
+		attrs := []any{"event", event, "session_id", sessionID, "at_unix_ns", at.Wall.UnixNano()}
+		if at.Mono > 0 {
+			attrs = append(attrs, "at_mono_ns", at.Mono)
+		}
+		logger.Info("voice timing", append(attrs, kv...)...)
 	}
 }
 
