@@ -105,7 +105,7 @@
     </div>
 
     <div class="field">
-      <label for="gdrive-creds">Google Credentials</label>
+      <span class="field-label">Google Credentials</span>
       <p class="hint">
         {#if config.gdrive.has_credentials}
           Credentials configured ✓
@@ -193,7 +193,8 @@
     gap: 0.25rem;
   }
 
-  .field label {
+  .field label,
+  .field-label {
     font-weight: 600;
     font-size: 0.85rem;
   }

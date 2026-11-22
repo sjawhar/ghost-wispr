@@ -418,12 +418,11 @@
         <h4>Test Preset: {testingPreset}</h4>
 
         <div class="field">
-          <label for="test-session-select">Select Session</label>
-          {#if testSessionsLoading}
-            <p class="hint">Loading sessions...</p>
-          {:else if testSessions.length === 0}
-            <p class="hint">No sessions found</p>
+          {#if testSessionsLoading || testSessions.length === 0}
+            <span class="field-label">Select Session</span>
+            <p class="hint">{testSessionsLoading ? 'Loading sessions...' : 'No sessions found'}</p>
           {:else}
+            <label for="test-session-select">Select Session</label>
             <select
               id="test-session-select"
               value={testSessionId}
@@ -603,7 +602,8 @@
     gap: 0.25rem;
   }
 
-  .field label {
+  .field label,
+  .field-label {
     font-weight: 600;
     font-size: 0.85rem;
   }
