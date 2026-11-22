@@ -742,6 +742,20 @@ def audible(input_name, heard, session, tag=None):
          **({"tag": tag} if tag else {}))
 
 
+def answer_line(task, at, tag):
+    """The service's line for an agent's answer to TASK, taken at AT, as internal/concierge's
+    Deliver logs it: with at_mono_ns, CLOCK_MONOTONIC (the driver's clock) read right after the
+    store took it; without it under answer-untimed, as a build from before it was logged. TAG, when
+    given, lets a cut of the answer remove the line."""
+    fields = {"task": task, "session": "session-1"}
+    if "answer-untimed" not in SCENARIO:
+        fields["at_mono_ns"] = at * 1_000_000
+    item = dict(kind="log", due=at, level="INFO", msg="concierge took an agent's answer", fields=fields)
+    if tag is not None:
+        item["tag"] = tag
+    emit(**item)
+
+
 def speech(tag, start, length, session="session-1", fact=None):
     """The voice speaks: its first frame, the fact sentence, the sound, the speaker's stream line,
     the end of its speech and voice_spoken."""
@@ -912,6 +926,7 @@ def react(kind, key, start, end):
                 answer = end + (2500 if kind == "ask" else 600 if "second-answered-fast" in SCENARIO else ANSWER_CEILING_MS)
                 atag = "answer-" + task
                 emit(kind="task", due=answer, tag=atag, task=task, set={"state": "done", "answer_written": "the agent's answer"})
+                answer_line(task, answer, atag)
                 emit(kind="timing", due=answer, tag=atag, event="answer_ready", session_id="session-1")
                 emit(kind="ws", due=answer, tag=atag, event={"type": "voice_answer_ready", "session_id": "session-1"})
                 emit(kind="sound", start=answer + 50, end=answer + 250, tag=atag)
@@ -933,6 +948,18 @@ def react(kind, key, start, end):
         tasks = voice_state(lambda s: list(s.get("tasks", [])))
         if tasks:
             task = tasks[-1]
+            # The agent's answer to the question "never mind" is for lands first, and the voice cancels
+            # nothing: while the clip plays (second-answered-in-clip; answer-untimed: its answer line
+            # has no at_mono_ns), after it but before its cancel is due (second-answered-before-due),
+            # or after the voice let the never mind pass (never-mind-ignored).
+            early = (start + 100 if SCENARIO & {"second-answered-in-clip", "answer-untimed"}
+                     else end + 500 if "second-answered-before-due" in SCENARIO
+                     else start + 5000 if "never-mind-ignored" in SCENARIO else None)
+            if early is not None:
+                emit(kind="cut", tag="answer-" + task, at=early, sound_end=early)
+                emit(kind="task", due=early, task=task, set={"state": "done", "answer_written": "the agent's answer"})
+                answer_line(task, early, None)
+                return
             emit(kind="cut", tag="answer-" + task, at=end + 300, sound_end=end + 300)
             emit(kind="task", due=end + 300, task=task, set={"state": "cancelled"})
             if "no-cancel-trace" not in SCENARIO:
@@ -2567,6 +2594,19 @@ launch ask-journal-error journal-error-after-answer_ready '' -- $ask_args
 # missing second question.
 # shellcheck disable=SC2086
 launch ask-fast-second second-answered-fast '' -- $ask_args
+# The second question working when the step says "never mind", and its agent's answer landing first,
+# so that the voice cancels nothing: while the clip plays (ask-answered-in-clip) and after it but
+# before its cancel is due (ask-answered-before-due), each UNKNOWN, as the cancel was not tested;
+# with the answer's line lacking at_mono_ns (ask-answer-untimed), UNKNOWN, as it cannot be timed;
+# and 5 s after the clip began, past the 4 s a spoken command has (ask-never-mind-ignored), FAIL.
+# shellcheck disable=SC2086
+launch ask-answered-in-clip second-answered-in-clip '' -- $ask_args
+# shellcheck disable=SC2086
+launch ask-answered-before-due second-answered-before-due '' -- $ask_args
+# shellcheck disable=SC2086
+launch ask-answer-untimed answer-untimed '' -- $ask_args
+# shellcheck disable=SC2086
+launch ask-never-mind-ignored never-mind-ignored '' -- $ask_args
 
 # barge-in: a pass; the stop rule off (the negative control); answers too short to count; a
 # backchannel that stops speech. Each answer but barge-short's ends from the step's clips
@@ -3405,6 +3445,23 @@ expect_line ask-fast-second 'UNKNOWN: ask-holder: the agent answered question'
 expect_line ask-fast-second 'so the cancel was not tested'
 expect_no_line ask-fast-second 'FAIL: ask-holder:'
 expect_restored ask-fast-second
+for name in ask-answered-in-clip ask-answered-before-due; do
+  expect_rc "$name" 2
+  expect_line "$name" 'PASS: ask-holder: the second question went out as Envoy event'
+  expect_line "$name" 'UNKNOWN: ask-holder: the agent answered question'
+  expect_line "$name" 'so the cancel was not tested'
+  expect_no_line "$name" 'FAIL: ask-holder:'
+  expect_restored "$name"
+done
+expect_line ask-answered-in-clip 'before "never mind" ended'
+expect_rc ask-answer-untimed 2
+expect_line ask-answer-untimed "UNKNOWN: ask-holder: question event-3 is done, not cancelled, and its \"concierge took an agent's answer\" line has no at_mono_ns"
+expect_no_line ask-answer-untimed 'FAIL: ask-holder:'
+expect_restored ask-answer-untimed
+expect_rc ask-never-mind-ignored 1
+expect_line ask-never-mind-ignored 'FAIL: ask-holder: question event-3 was answered '
+expect_line ask-never-mind-ignored 'after "never mind" began and not cancelled, though a spoken command has 4000 ms'
+expect_restored ask-never-mind-ignored
 
 # barge-in.
 expect_rc barge 0
