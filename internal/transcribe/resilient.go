@@ -658,7 +658,7 @@ func (rc *ResilientClient) dialUntilConnected(wait time.Duration) {
 // deadlock; drainMu covers the read and the write of each chunk, so Finalize
 // waits for a chunk already read and no chunk is read after it.
 func (rc *ResilientClient) drainBuffer() error {
-	buf := make([]byte, 4096)
+	buf := make([]byte, drainChunkBytes)
 	for {
 		more, err := rc.drainChunk(buf)
 		if err != nil || !more {
@@ -720,6 +720,10 @@ func (rc *ResilientClient) drainChunk(buf []byte) (bool, error) {
 	}
 	return true, nil
 }
+
+// drainChunkBytes is the size of the chunks a drain sends: a failed write can
+// keep at most this much out of the buffer (pending).
+const drainChunkBytes = 4096
 
 // IsConnected returns true if the Deepgram connection is currently connected.
 func (rc *ResilientClient) IsConnected() bool {
@@ -979,11 +983,23 @@ func (rc *ResilientClient) keepDropsAfterLocked(from int64) {
 	rc.drops = append([]streamDrop(nil), rc.drops[i:]...)
 }
 
-// MaxBehind returns how far the stream Deepgram hears can fall behind the
-// audio written: the most audio the client buffers while it is not
-// connected.
+// MaxBehind returns how far behind the newest audio the session keeps
+// recording history for the audio the client sends: twice the buffer and one
+// drain chunk. After an outage the client sends the chunk a failed drain write
+// kept (pending), whatever its age, then the buffer, which keeps the newest
+// audio of the outage. The session keeps this much history, and a margin for
+// Deepgram's late results (session.Manager.SetLiveStream), so a word Deepgram
+// hears in that chunk leads a recording that holds its audio while the chunk
+// is no further behind than this: through an outage up to as long as the
+// buffer and the chunk again. After a longer outage the chunk is still sent,
+// and its words keep their capture times, but no recording holds its audio.
 func (rc *ResilientClient) MaxBehind() time.Duration {
-	return rc.streamDuration(int64(rc.Buffer.Cap()))
+	return rc.streamDuration(rc.maxBehindBytes())
+}
+
+// maxBehindBytes is MaxBehind in bytes.
+func (rc *ResilientClient) maxBehindBytes() int64 {
+	return 2*int64(rc.Buffer.Cap()) + drainChunkBytes
 }
 
 // streamBytes is the size of d of the audio written, in whole samples. It

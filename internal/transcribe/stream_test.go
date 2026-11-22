@@ -88,8 +88,10 @@ func TestCapturedSinceCountsFromTheSocketsFirstByte(t *testing.T) {
 	if got := rc.CapturedSince(time.Second); got != 2*time.Second {
 		t.Fatalf("CapturedSince(1s) = %v, want 2s", got)
 	}
-	if got := rc.MaxBehind(); got != DefaultBufferSeconds*time.Second {
-		t.Fatalf("MaxBehind() = %v, want %ds, the default buffer", got, DefaultBufferSeconds)
+	// Twice the default buffer and a drain chunk (128 ms at 16 kHz): the
+	// session keeps recording history this far back.
+	if got, want := rc.MaxBehind(), 2*DefaultBufferSeconds*time.Second+128*time.Millisecond; got != want {
+		t.Fatalf("MaxBehind() = %v, want %v, twice the default buffer and a drain chunk", got, want)
 	}
 }
 
