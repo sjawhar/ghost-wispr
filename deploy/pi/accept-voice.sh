@@ -60,8 +60,8 @@ readonly lead_ms=100
 readonly fact_window_ms=400
 # A stop leaves at least this much silence at the Jabra; a pause between sentences is shorter.
 readonly stop_silence_ms=1000
-# A stop must come within this long of the talk-over clip's start; a "never mind" must cancel within
-# this long of its clip's start too, as both are a spoken command (ask-holder).
+# A stop must come within this long of the talk-over clip's start. The ask-holder step also gives a
+# "never mind" this long to cancel: its own policy, as the spec (R7) sets no deadline for it.
 readonly stop_window_ms=4000
 # Between two calls the Output is idle for longer than its 300 ms close.
 readonly idle_seconds=1
@@ -2287,9 +2287,10 @@ step_reach() {
 # "concierge took an agent's answer" line for it (internal/concierge, Deliver: CLOCK_MONOTONIC read
 # right after the store took the answer, now_ms's clock). An answer taken by the time the clip
 # ended came before the voice could act on "never mind": UNKNOWN, as the cancel was not tested. So
-# does one taken while its cancel was still due: a spoken command has stop_window_ms from its clip's
-# start, as a stop phrase does. One taken after that: the voice did not cancel in time, FAIL. A
-# line without at_mono_ns, or none within the event timeout, cannot time it: UNKNOWN.
+# does one taken while its cancel was still due: the step's policy gives a never mind stop_window_ms
+# from its clip's start, the window of a spoken stop phrase, as R7 sets no deadline for it. One taken
+# after that: the voice did not cancel within the step's window, FAIL. A line without at_mono_ns, or
+# none within the event timeout, cannot time it: UNKNOWN.
 answered_by_never_mind() {
   local at deadline=$(($(now_ms) + event_timeout * 1000)) due=$((clip_started + stop_window_ms))
   while :; do
