@@ -5,6 +5,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/sjawhar/ghost-wispr/internal/monoclock"
 )
 
 // clockedStream is a fakeStream that gives an account of its playback as an
@@ -42,13 +44,17 @@ func (s *clockedStream) Write(frame []int16) error {
 	return err
 }
 
+// clockedWall is the wall clock a clockedStream reads with its account: an
+// instant that moves with its fake CLOCK_MONOTONIC.
+var clockedWall = time.Unix(1_800_000_000, 0)
+
 func (s *clockedStream) playPosition() (playPosition, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.clock += int64(time.Millisecond)
 	r := positionRead{running: s.running, written: s.written, before: s.clock, after: s.clock + 2000}
 	s.reads = append(s.reads, r)
-	return playPosition{running: r.running, delay: s.delay, before: r.before, after: r.after}, true
+	return playPosition{running: r.running, delay: s.delay, before: r.before, after: r.after, wall: clockedWall.Add(time.Duration(r.before))}, true
 }
 
 func (s *clockedStream) underruns() int {
@@ -165,16 +171,20 @@ func (r *audibleRig) firstNonzero(from int64) int64 {
 
 // timedBy finds the stream's account, while it ran, that times position p as
 // e.At: its read's middle plus p less what it had played (written less its
-// delay), at 48 kHz. It fails the test when none does.
+// delay), at 48 kHz. It fails the test when none does, or when e.At's wall
+// time is not its CLOCK_MONOTONIC moved as the account's wall clock is.
 func (r *audibleRig) timedBy(e AudibleEvent, p int64) positionRead {
 	r.t.Helper()
+	if !e.At.Wall.Equal(clockedWall.Add(time.Duration(e.At.Mono))) {
+		r.t.Fatalf("the event's wall time %v does not go with its CLOCK_MONOTONIC %d: want %v", e.At.Wall, e.At.Mono, clockedWall.Add(time.Duration(e.At.Mono)))
+	}
 	for _, a := range r.stream.accounts() {
 		mid := a.before + (a.after-a.before)/2
-		if a.running && e.At == mid+(p-(a.written-int64(r.stream.delay)))*int64(time.Second)/48000 {
+		if a.running && e.At.Mono == mid+(p-(a.written-int64(r.stream.delay)))*int64(time.Second)/48000 {
 			return a
 		}
 	}
-	r.t.Fatalf("no account of the stream, while it ran, times position %d as %d: %+v", p, e.At, r.stream.accounts())
+	r.t.Fatalf("no account of the stream, while it ran, times position %d as %d: %+v", p, e.At.Mono, r.stream.accounts())
 	return positionRead{}
 }
 
@@ -280,12 +290,91 @@ func TestAudibleEventOfAResampledInputLeadsByItsFilter(t *testing.T) {
 			continue
 		}
 		mid := a.before + (a.after-a.before)/2
-		timed := (voice.At-mid)*48000/int64(time.Second) + a.written - int64(r.stream.delay)
+		timed := (voice.At.Mono-mid)*48000/int64(time.Second) + a.written - int64(r.stream.delay)
 		lead := (voice.Lead*48000 + int64(time.Second) - 1) / int64(time.Second)
 		if timed >= half-3 && timed <= half+3 && first >= timed-lead {
 			return
 		}
 	}
 	t.Fatalf("no account of the stream times position %d, where the voice reaches half its height, within 3 samples as %d, with its first sound, at %d, no earlier than its lead of %v before: %+v",
-		half, voice.At, first, time.Duration(voice.Lead), r.stream.accounts())
+		half, voice.At.Mono, first, time.Duration(voice.Lead), r.stream.accounts())
+}
+
+// liveStream is a clockedStream whose account reads the real clocks, as an
+// ALSA stream's does, so that its times lie ahead of now by its delay.
+type liveStream struct{ *clockedStream }
+
+func (s *liveStream) playPosition() (playPosition, bool) {
+	before, _ := monotonicNanos()
+	wall := time.Now()
+	s.mu.Lock()
+	r := positionRead{running: s.running, written: s.written, before: before}
+	s.mu.Unlock()
+	r.after, _ = monotonicNanos()
+	s.mu.Lock()
+	s.reads = append(s.reads, r)
+	s.mu.Unlock()
+	return playPosition{running: r.running, delay: s.delay, before: r.before, after: r.after, wall: wall}, true
+}
+
+// TestAudibleEventWaitsForItsTimeToPassUndisrupted fails if a speech's
+// audible event is reported before its first sample's time has passed, or at
+// all when an underrun came after the event was timed and before that time:
+// a sample still queued then may play later than the account said (Sol's
+// review of #154 at 7bf1ae31: nothing may disrupt the stream between the
+// write that carries the sample and its time). The control, with no
+// underrun, is reported once its time has passed, and its wall time goes
+// with its CLOCK_MONOTONIC.
+func TestAudibleEventWaitsForItsTimeToPassUndisrupted(t *testing.T) {
+	for _, underrun := range []bool{false, true} {
+		t.Run(map[bool]string{false: "undisrupted", true: "an underrun before its time"}[underrun], func(t *testing.T) {
+			stream := &liveStream{newClockedStream(9600)} // 200 ms queued
+			stream.set(true, 0)
+			out := NewOutput(OutputConfig{IdleClose: 10 * time.Second, Open: func(string) (PlaybackStream, int, error) {
+				return stream, 48000, nil
+			}})
+			t.Cleanup(func() { _ = out.Close() })
+			type heard struct {
+				event AudibleEvent
+				at    monoclock.Stamp
+			}
+			got := make(chan heard, 4)
+			out.OnAudible(func(e AudibleEvent) { got <- heard{e, monoclock.Now()} })
+			started := make(chan struct{}, 4)
+			out.OnSpeech(func(e SpeechEvent) {
+				if e.Input == InputChime && e.Started {
+					started <- struct{}{}
+				}
+			})
+			pb := out.Begin(InputChime, nil)
+			go func() { _ = pb.WriteAll(testContext(t), constant(48000, 50*time.Millisecond, 1000), mono48k) }()
+			// The chime is timed at the write its speech starts at, about 190 ms before its
+			// first sample leaves the 200 ms queue.
+			select {
+			case <-started:
+			case <-time.After(5 * time.Second):
+				t.Fatal("fixture: the chime did not start")
+			}
+			if underrun {
+				stream.set(true, 1)
+			}
+			select {
+			case h := <-got:
+				switch {
+				case underrun:
+					t.Fatalf("the chime was reported across an underrun before its time: %+v", h.event)
+				case h.at.Mono < h.event.At.Mono:
+					t.Fatalf("the chime was reported %v before its time", time.Duration(h.event.At.Mono-h.at.Mono))
+				}
+				wall, mono := h.at.Wall.Sub(h.event.At.Wall), time.Duration(h.at.Mono-h.event.At.Mono)
+				if d := wall - mono; d > time.Millisecond || d < -time.Millisecond {
+					t.Fatalf("the event came %v after its time on the wall clock, %v on CLOCK_MONOTONIC: its two clocks do not agree", wall, mono)
+				}
+			case <-time.After(time.Second):
+				if !underrun {
+					t.Fatal("the chime was never reported")
+				}
+			}
+		})
+	}
 }

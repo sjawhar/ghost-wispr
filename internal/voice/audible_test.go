@@ -3,6 +3,7 @@ package voice
 import (
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/sjawhar/ghost-wispr/internal/audio"
 	"github.com/sjawhar/ghost-wispr/internal/monoclock"
@@ -54,6 +55,7 @@ func (s *hearingSpeaker) hear(e audio.AudibleEvent) {
 func TestTheSpeakersAudibleTimesReachTheTimingLog(t *testing.T) {
 	var mu sync.Mutex
 	var lines [][]any
+	var stamps []monoclock.Stamp
 	var speaker *hearingSpeaker
 	r := newRigWith(t, newFakeConcierge("ok"), func(cfg *SupervisorConfig, r *rig) {
 		speaker = &hearingSpeaker{fakeSpeaker: r.speaker}
@@ -62,26 +64,28 @@ func TestTheSpeakersAudibleTimesReachTheTimingLog(t *testing.T) {
 			if event == "audible" {
 				mu.Lock()
 				lines = append(lines, kv)
+				stamps = append(stamps, at)
 				mu.Unlock()
 			}
 			r.timing(event, sessionID, at, kv...)
 		}
 	})
+	wall := time.Unix(1_800_000_000, 0)
 	sent := []audio.AudibleEvent{
-		{Input: audio.InputChime, At: 1_000_000_123, Lead: 0, Err: 1001, Disruptions: 2},
-		{Input: audio.InputVoice, At: 1_900_000_456, Lead: 666_667, Err: 1500, Disruptions: 2},
+		{Input: audio.InputChime, At: monoclock.Stamp{Wall: wall, Mono: 1_000_000_123}, Lead: 0, Err: 1001, Disruptions: 2},
+		{Input: audio.InputVoice, At: monoclock.Stamp{Wall: wall.Add(900 * time.Millisecond), Mono: 1_900_000_456}, Lead: 666_667, Err: 1500, Disruptions: 2},
 	}
 	for _, e := range sent {
 		speaker.hear(e)
 	}
 	mu.Lock()
-	got := append([][]any(nil), lines...)
+	got, gotAt := append([][]any(nil), lines...), append([]monoclock.Stamp(nil), stamps...)
 	mu.Unlock()
 	if len(got) != len(sent) {
 		t.Fatalf("%d audible lines, want %d: %v", len(got), len(sent), got)
 	}
 	for i, e := range sent {
-		want := []any{"input", e.Input, "audible_mono_ns", e.At, "audible_lead_ns", e.Lead, "audible_err_ns", e.Err, "disruptions", e.Disruptions}
+		want := []any{"input", e.Input, "audible_mono_ns", e.At.Mono, "audible_lead_ns", e.Lead, "audible_err_ns", e.Err, "disruptions", e.Disruptions}
 		if len(got[i]) != len(want) {
 			t.Fatalf("audible line %d: %v, want %v", i, got[i], want)
 		}
@@ -89,6 +93,11 @@ func TestTheSpeakersAudibleTimesReachTheTimingLog(t *testing.T) {
 			if got[i][j] != want[j] {
 				t.Fatalf("audible line %d: %v, want %v", i, got[i], want)
 			}
+		}
+		// The line is stamped at the audible instant, on both clocks: its
+		// at_mono_ns is its audible_mono_ns, and its wall time goes with it.
+		if gotAt[i].Mono != e.At.Mono || !gotAt[i].Wall.Equal(e.At.Wall) {
+			t.Fatalf("audible line %d is stamped %+v, want the event's instant %+v", i, gotAt[i], e.At)
 		}
 	}
 
@@ -122,7 +131,7 @@ func TestAnAudibleLineNamesItsExchangesSession(t *testing.T) {
 		return out
 	}
 	r.setSession("sess-0")
-	speaker.hear(audio.AudibleEvent{Input: audio.InputChime, At: 1_000, Err: 1001})
+	speaker.hear(audio.AudibleEvent{Input: audio.InputChime, At: monoclock.Stamp{Wall: time.Now(), Mono: 1_000}, Err: 1001})
 	if got := audible(); len(got) != 1 || got[0].sessionID != "sess-0" {
 		t.Fatalf("control: a sound of no exchange gave %+v, want one audible line naming sess-0", got)
 	}
@@ -133,8 +142,8 @@ func TestAnAudibleLineNamesItsExchangesSession(t *testing.T) {
 		defer r.s.mu.Unlock()
 		return r.s.ex != nil
 	})
-	before := monoclock.Now()
-	speaker.hear(audio.AudibleEvent{Input: audio.InputChime, At: 2_000, Err: 1001})
+	held := audio.AudibleEvent{Input: audio.InputChime, At: monoclock.Stamp{Wall: time.Now(), Mono: 2_000}, Err: 1001}
+	speaker.hear(held)
 	if got := audible(); len(got) != 1 {
 		t.Fatalf("before its session the exchange's audible line was written: %+v", got[1:])
 	}
@@ -143,7 +152,7 @@ func TestAnAudibleLineNamesItsExchangesSession(t *testing.T) {
 	if len(got) != 2 || got[1].sessionID != "sess-1" {
 		t.Fatalf("as its session started the exchange wrote %+v, want its audible line naming sess-1", got)
 	}
-	if got[1].at.Mono < before.Mono {
-		t.Fatalf("the held audible line is stamped %d, before the event was heard at %d", got[1].at.Mono, before.Mono)
+	if got[1].at.Mono != held.At.Mono || !got[1].at.Wall.Equal(held.At.Wall) {
+		t.Fatalf("the held audible line is stamped %+v, want its event's instant %+v", got[1].at, held.At)
 	}
 }

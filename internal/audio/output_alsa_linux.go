@@ -74,7 +74,10 @@ type alsaStream struct {
 	params alsaParams
 	wide   []int16 // a frame copied to every channel
 	xruns  int
-	told   bool // the stream has logged what it is
+	// broke counts the times the PCM's playback broke: a suspend, resumed or
+	// not, a recovery, and a Drop that held audio (breaks).
+	broke int
+	told  bool // the stream has logged what it is
 	// again is how many of the last frames the Output gave it that the PCM
 	// discarded by itself, in a suspend it could not resume from, and the
 	// Output is to write again (takeAgain).
@@ -118,21 +121,26 @@ func (s *alsaStream) queuedFrames() int {
 
 // playPosition reads one status snapshot of the PCM, its state and its delay
 // (what it was given and has not yet played, with what the driver counts in
-// flight to the speaker), between two reads of CLOCK_MONOTONIC (Output's
-// timeAudible). A snapshot that fails, or a clock that cannot be read, gives
-// none.
+// flight to the speaker), between two reads of CLOCK_MONOTONIC, with the wall
+// clock read right after the first (Output's timeAudible). A snapshot that
+// fails, or a clock that cannot be read, gives none.
 func (s *alsaStream) playPosition() (playPosition, bool) {
 	before, ok := monotonicNanos()
 	if !ok {
 		return playPosition{}, false
 	}
+	wall := time.Now()
 	st := s.pcm.status()
 	after, ok := monotonicNanos()
 	if !ok || st.rc < 0 {
 		return playPosition{}, false
 	}
-	return playPosition{running: st.running, delay: max(0, st.delay), before: before, after: after}, true
+	return playPosition{running: st.running, delay: max(0, st.delay), before: before, after: after, wall: wall}, true
 }
+
+// breaks reports how many times the PCM's playback broke (broke): what it
+// held may then play at another time than an account read before said.
+func (s *alsaStream) breaks() int { return s.broke }
 
 // monotonicNanos reads CLOCK_MONOTONIC, the clock the acceptance driver times
 // the room's recording on.
@@ -172,6 +180,7 @@ func (s *alsaStream) Write(frame []int16) error {
 			continue
 		}
 		if rc == -int(syscall.ESTRPIPE) {
+			s.broke++
 			lost, err := s.resume()
 			if err != nil {
 				return err
@@ -191,6 +200,7 @@ func (s *alsaStream) Write(frame []int16) error {
 			slog.Warn("speaker underrun", "device", s.device, "underruns", s.xruns,
 				"buffer", frameTime(s.params.buffer, s.params.rate))
 		}
+		s.broke++
 		if s.pcm.recover(rc) < 0 {
 			return alsaErr("write", rc)
 		}
@@ -322,6 +332,7 @@ func (s *alsaStream) Drop() (int, error) {
 	if held == 0 {
 		return 0, nil
 	}
+	s.broke++
 	back := 0
 	if n := s.pcm.rewindable(); n > 0 {
 		back = max(0, s.pcm.rewind(n))

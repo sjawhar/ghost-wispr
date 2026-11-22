@@ -4,8 +4,11 @@ package audio
 
 import (
 	"sync"
+	"syscall"
 	"testing"
 	"time"
+
+	"github.com/sjawhar/ghost-wispr/internal/monoclock"
 )
 
 // discardingStream gives an account of its playback (playPosition) on its own
@@ -13,25 +16,22 @@ import (
 // with keep it had played the first half of that frame and gives back only
 // the second half (takeAgain); without it, it gives back the whole frame, of
 // which it played nothing. Its clock moves on 1 s across the suspend.
-// replayAt is its clock when the Output wrote the replay.
 type discardingStream struct {
-	mu       sync.Mutex
-	discard  bool
-	keep     bool
-	writes   int
-	again    int
-	now      int64
-	delay    int
-	first    int64
-	replayAt int64
+	mu      sync.Mutex
+	discard bool
+	keep    bool
+	writes  int
+	again   int
+	now     int64
+	delay   int
+	first   int64
 }
 
 func (s *discardingStream) Write(frame []int16) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.writes++
-	switch {
-	case s.writes == 1:
+	if s.writes == 1 {
 		s.first = s.now
 		if s.discard {
 			s.again = len(frame)
@@ -42,8 +42,6 @@ func (s *discardingStream) Write(frame []int16) error {
 			s.delay = 0
 			return nil
 		}
-	case s.writes == 2 && s.discard:
-		s.replayAt = s.now
 	}
 	s.delay = len(frame)
 	return nil
@@ -60,22 +58,22 @@ func (s *discardingStream) takeAgain() int {
 func (s *discardingStream) playPosition() (playPosition, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return playPosition{running: true, delay: s.delay, before: s.now, after: s.now}, true
+	return playPosition{running: true, delay: s.delay, before: s.now, after: s.now, wall: time.Unix(0, s.now)}, true
 }
 
 func (*discardingStream) Drop() (int, error) { return 0, nil }
 func (*discardingStream) Close() error       { return nil }
 
-// TestAnAudibleTimeComesFromTheWriteThatCarriesTheFirstSample fails if a
-// speech whose first write the device partly discarded is timed by the
-// account after the replay although the device had already played its first
-// sample (GPT-6.1 Sol's review of #154 at 7d27574a): that sample's time is lost
-// across the suspend, and the replay's account puts it a second late here. A
-// late chime would shorten the time from the chime to the answer and could
-// hide a leak. It fails too if a first sample the device discarded unplayed,
-// which the replay writes again, is not timed by the account after that
-// replay, or if the control, with no discard, is not timed at its write.
-func TestAnAudibleTimeComesFromTheWriteThatCarriesTheFirstSample(t *testing.T) {
+// TestAnAudibleTimeIsGivenOnlyWithNoDisruptionAtItsFirstWrite fails if a
+// speech whose first write the device discarded, in part or in whole, is
+// timed at all. With half the frame played before the discard, the replay's
+// account puts the first sample a second late here (Sol's review of #154 at
+// 7d27574a): a late chime shortens the time from the chime to the answer and
+// can hide a leak. A replay is a disruption, so no speech it came to is timed,
+// even one whose first sample it wrote again (Sol at 7bf1ae31: whether that
+// sample was unplayed is an estimate). The control, with no discard, is timed
+// at its write.
+func TestAnAudibleTimeIsGivenOnlyWithNoDisruptionAtItsFirstWrite(t *testing.T) {
 	for _, tc := range []struct {
 		name          string
 		discard, keep bool
@@ -96,19 +94,17 @@ func TestAnAudibleTimeComesFromTheWriteThatCarriesTheFirstSample(t *testing.T) {
 			select {
 			case e := <-events:
 				stream.mu.Lock()
-				first, replayAt := stream.first, stream.replayAt
+				first := stream.first
 				stream.mu.Unlock()
-				switch {
-				case tc.keep:
-					t.Fatalf("the chime was timed at %d, though the device played its first sample before the discard, at %d, a time the replay's account cannot give: %+v", e.At, first, e)
-				case tc.discard && e.At != replayAt:
-					t.Fatalf("the replay carries the chime's first sample and its account puts it at %d; the event says %+v", replayAt, e)
-				case !tc.discard && e.At != first:
+				if tc.discard {
+					t.Fatalf("the chime was timed at %d across a discard of its first write, which began at %d: %+v", e.At.Mono, first, e)
+				}
+				if e.At.Mono != first || !e.At.Wall.Equal(time.Unix(0, first)) {
 					t.Fatalf("control: the chime's first sample left the buffer at %d; the event says %+v", first, e)
 				}
 			case <-time.After(300 * time.Millisecond):
-				if !tc.keep {
-					t.Fatal("no audible event for the chime")
+				if !tc.discard {
+					t.Fatal("control: no audible event for the chime")
 				}
 			}
 		})
@@ -116,16 +112,24 @@ func TestAnAudibleTimeComesFromTheWriteThatCarriesTheFirstSample(t *testing.T) {
 }
 
 // suspendingPCM is a fakePCM that, at the first write carrying the chime,
-// takes half of it, plays 120 of those samples, and suspends with the other
-// 120 still queued, for 150 ms: a resume that fails leaves the Output to
-// replay the 120 and the half it never wrote (GPT-6.1 Sol's probe of #154).
+// takes 240 samples of it, lets the device take 120 of those, and suspends
+// with the other 120 still queued, for 150 ms (GPT-6.1 Sol's probes of #154):
+// the room has heard what the device took less what is in flight. With
+// inflightThen set, what is in flight shrinks to it before the suspend, so
+// the stream's last count, from the snapshot before, says more was in flight
+// than was: a resume that fails then replays from before the chime's first
+// sample, which the room had heard. resumes (fakePCM) makes the resume
+// succeed.
 type suspendingPCM struct {
 	*fakePCM
-	fired bool // only writei, on the mixer goroutine
+	stream       *alsaStream
+	inflightThen int
+	fired        bool // only writei, on the mixer goroutine
 
 	stampMu     sync.Mutex
 	suspendedAt int64
 	heardBefore int
+	estimate    int
 }
 
 func (p *suspendingPCM) writei(samples []int16, frames int) int {
@@ -133,17 +137,21 @@ func (p *suspendingPCM) writei(samples []int16, frames int) int {
 		return p.fakePCM.writei(samples, frames)
 	}
 	p.fired = true
+	estimate := p.stream.inflight
 	n := p.fakePCM.writei(samples[:240], 240)
 	if n <= 0 {
 		return n
 	}
-	// Advance the device, not the process clock: 120 samples of the chime
-	// played, and 120 stay queued when it suspends.
+	// Advance the device, not the process clock: it took 120 samples of the
+	// chime, and the rest stay queued when it suspends.
 	p.mu.Lock()
 	run := p.runs[len(p.runs)-1]
 	target := len(run.samples) - 120
 	p.clock += target - run.taken
 	run.taken = target
+	if p.inflightThen > 0 {
+		p.inflight = p.inflightThen
+	}
 	p.mu.Unlock()
 	p.suspend()
 	at, _ := monotonicNanos()
@@ -154,57 +162,162 @@ func (p *suspendingPCM) writei(samples []int16, frames int) int {
 		}
 	})
 	p.stampMu.Lock()
-	p.suspendedAt, p.heardBefore = at, prefix
+	p.suspendedAt, p.heardBefore, p.estimate = at, prefix, estimate
 	p.stampMu.Unlock()
 	time.Sleep(150 * time.Millisecond)
 	return n
 }
 
-// TestAnAudibleTimeIsNotGivenForASampleThePCMPlayedBeforeASuspend fails if,
-// through the ALSA stream, a chime whose first 120 samples the PCM played
-// before it suspended is still timed: the replay carries only the rest, and
-// its account puts the first sample after the suspend (144 to 156 ms after it
-// in Sol's probe of 7d27574a). No time is right for it, so the chime must have
-// no audible event, and the acceptance driver falls back with a NOTE.
-func TestAnAudibleTimeIsNotGivenForASampleThePCMPlayedBeforeASuspend(t *testing.T) {
-	pcm := &suspendingPCM{fakePCM: newFakePCM(48000, 3840)}
-	pcm.lockstep = true
-	stream := newALSAStream(pcm, "suspending", alsaParams{rate: 48000, channels: 1, period: 480, buffer: 3840})
-	out, start, _ := probeOutput(t, stream)
-	events := make(chan AudibleEvent, 16)
-	out.OnAudible(func(e AudibleEvent) { events <- e })
-	ctx := testContext(t)
-	if err := out.Begin("bed", nil).WriteAll(ctx, constant(48000, 100*time.Millisecond, 1000), mono48k); err != nil {
-		t.Fatal(err)
-	}
-	start()
-	select {
-	case <-events:
-	case <-time.After(time.Second):
-		t.Fatal("fixture: the bed under the chime did not start")
-	}
-	if err := out.Begin(InputChime, nil).Write(ctx, constant(48000, 10*time.Millisecond, 3000), mono48k); err != nil {
-		t.Fatal(err)
-	}
-	deadline := time.After(time.Second)
-	for {
-		select {
-		case e := <-events:
-			if e.Input != InputChime {
-				continue
+// TestAnAudibleTimeIsNotGivenAcrossASuspend fails if, through the ALSA
+// stream, a chime whose first samples the PCM played before it suspended is
+// timed at all. Each account after the suspend puts its first sample after
+// the suspend, though the room heard it before (Sol's probes of #154):
+//   - the resume fails, and the replay carries only the rest: 144 to 156 ms
+//     late at 7d27574a;
+//   - the resume succeeds: the queue keeps its samples but not their timing,
+//     148 to 153 ms late at 7bf1ae31;
+//   - the resume fails, and the stream's count of what was in flight, from the
+//     snapshot before the suspend, is 48 frames more than was: the replay
+//     starts 24 frames before the chime, so its first sample seems unplayed,
+//     though 24 had played; 152 to 159 ms late at 7bf1ae31.
+//
+// No time is right for it, so the chime must have no audible event, and the
+// acceptance driver falls back with a NOTE.
+func TestAnAudibleTimeIsNotGivenAcrossASuspend(t *testing.T) {
+	for _, tc := range []struct {
+		name                string
+		resumes             bool
+		inflight, inflight2 int
+		heard               int
+	}{
+		{name: "the resume fails", heard: 120},
+		{name: "the resume succeeds", resumes: true, heard: 120},
+		{name: "the resume fails, with less in flight than counted", inflight: 144, inflight2: 96, heard: 24},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			pcm := &suspendingPCM{fakePCM: newFakePCM(48000, 3840), inflightThen: tc.inflight2}
+			pcm.lockstep, pcm.resumes, pcm.inflight = true, tc.resumes, tc.inflight
+			stream := newALSAStream(pcm, "suspending", alsaParams{rate: 48000, channels: 1, period: 480, buffer: 3840})
+			pcm.stream = stream
+			out, start, _ := probeOutput(t, stream)
+			events := make(chan AudibleEvent, 16)
+			out.OnAudible(func(e AudibleEvent) { events <- e })
+			ctx := testContext(t)
+			if err := out.Begin("bed", nil).WriteAll(ctx, constant(48000, 100*time.Millisecond, 1000), mono48k); err != nil {
+				t.Fatal(err)
 			}
-			pcm.stampMu.Lock()
-			suspended, prefix := pcm.suspendedAt, pcm.heardBefore
-			pcm.stampMu.Unlock()
-			t.Fatalf("the chime was timed at %d, %v after the PCM suspended, though it had played %d of its samples before: %+v", e.At, time.Duration(e.At-suspended), prefix, e)
-		case <-deadline:
-			pcm.stampMu.Lock()
-			suspended, prefix := pcm.suspendedAt, pcm.heardBefore
-			pcm.stampMu.Unlock()
-			if suspended == 0 || prefix != 120 {
-				t.Fatalf("fixture: suspended at %d, with %d of the chime's samples played before, want 120", suspended, prefix)
+			start()
+			select {
+			case <-events:
+			case <-time.After(time.Second):
+				t.Fatal("fixture: the bed under the chime did not start")
 			}
-			return
+			if tc.inflight > 0 {
+				waitFor(t, "a full in-flight queue", func() bool {
+					pcm.mu.Lock()
+					defer pcm.mu.Unlock()
+					return pcm.clock >= 960
+				})
+			}
+			if err := out.Begin(InputChime, nil).Write(ctx, constant(48000, 10*time.Millisecond, 3000), mono48k); err != nil {
+				t.Fatal(err)
+			}
+			deadline := time.After(time.Second)
+			for {
+				select {
+				case e := <-events:
+					if e.Input != InputChime {
+						continue
+					}
+					pcm.stampMu.Lock()
+					suspended, prefix := pcm.suspendedAt, pcm.heardBefore
+					pcm.stampMu.Unlock()
+					t.Fatalf("the chime was timed at %d, %v after the PCM suspended, though it had played %d of its samples before: %+v", e.At.Mono, time.Duration(e.At.Mono-suspended), prefix, e)
+				case <-deadline:
+					pcm.stampMu.Lock()
+					suspended, prefix, estimate := pcm.suspendedAt, pcm.heardBefore, pcm.estimate
+					pcm.stampMu.Unlock()
+					if suspended == 0 || prefix != tc.heard || (tc.inflight > 0 && estimate != tc.inflight) {
+						t.Fatalf("fixture: suspended at %d, with %d of the chime's samples played before (want %d), the stream counting %d in flight (want %d)", suspended, prefix, tc.heard, estimate, tc.inflight)
+					}
+					return
+				}
+			}
+		})
+	}
+}
+
+// TestOrdinaryStartsAreTimed fails if a chime played through the ALSA stream
+// with nothing disrupting it is not timed, every time, with no disruption, or
+// if its time's two clocks do not agree with the clocks read as it comes: the
+// rule that drops a time across any disruption must not drop the ordinary
+// start (Sol's census of #154 at 7bf1ae31: 20 of 20 timed).
+func TestOrdinaryStartsAreTimed(t *testing.T) {
+	const trials = 20
+	for i := range trials {
+		pcm := newFakePCM(48000, 3840)
+		pcm.lockstep, pcm.inflight = true, 144
+		stream := newALSAStream(pcm, "ordinary", alsaParams{rate: 48000, channels: 1, period: 480, buffer: 3840})
+		out, start, _ := probeOutput(t, stream)
+		type heard struct {
+			event AudibleEvent
+			at    monoclock.Stamp
 		}
+		events := make(chan heard, 16)
+		out.OnAudible(func(e AudibleEvent) { events <- heard{e, monoclock.Now()} })
+		if err := out.Begin(InputChime, nil).Write(testContext(t), constant(48000, 10*time.Millisecond, 1000), mono48k); err != nil {
+			t.Fatal(err)
+		}
+		start()
+		select {
+		case h := <-events:
+			if h.event.Input != InputChime || h.event.Disruptions != 0 {
+				t.Fatalf("trial %d: event %+v, want the chime with no disruption", i, h.event)
+			}
+			if h.at.Mono < h.event.At.Mono {
+				t.Fatalf("trial %d: the event came %v before its time", i, time.Duration(h.event.At.Mono-h.at.Mono))
+			}
+			wall, mono := h.at.Wall.Sub(h.event.At.Wall), time.Duration(h.at.Mono-h.event.At.Mono)
+			if d := wall - mono; d > time.Millisecond || d < -time.Millisecond {
+				t.Fatalf("trial %d: the event came %v after its time on the wall clock, %v on CLOCK_MONOTONIC", i, wall, mono)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("trial %d: an ordinary start gave no audible event", i)
+		}
+		if err := out.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// failingStatusPCM is a sinkPCM whose status fails while fail is set.
+type failingStatusPCM struct {
+	*sinkPCM
+	fail bool
+}
+
+func (p *failingStatusPCM) status() pcmStatus {
+	if p.fail {
+		return pcmStatus{running: true, delay: 480, rc: -int(syscall.EIO)}
+	}
+	return pcmStatus{running: true, delay: 480}
+}
+
+// TestAFailedAccountTimesNothing fails if a status snapshot that fails times
+// the speech that waits, or lets it stop waiting, or if the next snapshot,
+// which succeeds, does not time it (Sol's probe of #154 at 7d27574a).
+func TestAFailedAccountTimesNothing(t *testing.T) {
+	pcm := &failingStatusPCM{sinkPCM: &sinkPCM{buffer: 3840}, fail: true}
+	stream := newALSAStream(pcm, "failing", alsaParams{rate: 48000, channels: 1, period: 480, buffer: 3840})
+	in := &outputInput{name: InputChime, audiblePending: true}
+	out := &Output{order: []*outputInput{in}, pos: 480, eventWake: make(chan struct{}, 1)}
+	out.timeAudible(stream, 48000)
+	if len(out.timed) != 0 || !in.audiblePending {
+		t.Fatalf("a failed status timed %+v, or the speech stopped waiting (%v)", out.timed, !in.audiblePending)
+	}
+	pcm.fail = false
+	out.timeAudible(stream, 48000)
+	if len(out.timed) != 1 || in.audiblePending {
+		t.Fatalf("a successful status did not time the waiting speech: %+v", out.timed)
 	}
 }

@@ -157,16 +157,23 @@ type SpeechEvent struct {
 // write while the stream ran, with the clock around the read. The device
 // plays a sample a latency after that, the same for every input, so the
 // acceptance driver can time one input's sound against another's in one
-// recording of the room, and the latency cancels.
+// recording of the room, and the latency cancels. The Output reports it only
+// once that time has passed with nothing disrupting the stream since the
+// write that carried the sample (settleAudibles): a suspend, a resume, a
+// discard, a replay, an underrun or a failure can make the sample play at
+// another time than the account said, and then no time is given.
 type AudibleEvent struct {
 	Input string
-	// At is when the speech's first queued sample left the buffer, on
-	// CLOCK_MONOTONIC, in nanoseconds, good to within Err. A resampled
-	// input's output can be nonzero up to Lead before it: its filter's span.
-	At, Lead, Err int64
-	// Disruptions counts the replays, underruns and stream failures the
-	// Output had had when At was read. One that comes after At and before
-	// the sample plays makes it play later than At.
+	// At is when the speech's first queued sample left the buffer: Mono on
+	// CLOCK_MONOTONIC, in nanoseconds, good to within Err, and Wall the wall
+	// clock at that instant, read with the account and moved by as much. A
+	// resampled input's output can be nonzero up to Lead before it: its
+	// filter's span.
+	At        monoclock.Stamp
+	Lead, Err int64
+	// Disruptions counts the replays, underruns, suspends and stream
+	// failures the Output had had when it reported the event; none came
+	// between the sample's write and At.
 	Disruptions uint64
 }
 
@@ -232,12 +239,22 @@ type Output struct {
 	nowMono int64
 
 	// hear holds the listeners for audible events, and audibles the events
-	// queued for them (OnAudible); disruptions counts the replays, underruns
-	// and failures so far (AudibleEvent.Disruptions).
+	// queued for them (OnAudible); timed holds the events timed that wait for
+	// their time to pass (settleAudibles); disruptions counts the replays,
+	// underruns, suspends and failures so far (AudibleEvent.Disruptions).
 	hear        map[int]func(AudibleEvent)
 	audibles    []AudibleEvent
+	timed       []timedAudible
 	disruptions uint64
 	hearFns     []func(AudibleEvent)
+}
+
+// timedAudible is a speech's audible event, timed, and the disruptions before
+// the write that carried its first sample: it is reported once its time has
+// passed with no disruption since (settleAudibles).
+type timedAudible struct {
+	event AudibleEvent
+	since uint64
 }
 
 // outputInput is one input's queue and its part in the mix. The Output's mu
@@ -282,9 +299,10 @@ type outputInput struct {
 	startedMono  int64 // CLOCK_MONOTONIC read with startedAt
 	// audibleAt is the stream position of the speech's first queued sample
 	// and audibleLead its filter's span, in positions, or -1 when that sample
-	// did not land in reach of the frame the speech started in. Once the
-	// speech starts, audiblePending waits for a write at which the stream
-	// runs, to time it (hear), unless a disruption came since audibleSince.
+	// did not land in reach of the frame the speech started in; audibleSince
+	// is the disruptions before its first write. Once the speech starts,
+	// audiblePending waits for a write at which the stream runs, to time it
+	// (timeAudible), unless a disruption came since audibleSince.
 	audibleAt, audibleLead int64
 	audiblePending         bool
 	audibleSince           uint64
@@ -1064,6 +1082,11 @@ func (o *Output) mix(stream PlaybackStream, rate int) error {
 	// device dry (OutputConfig.Underrun).
 	counter, _ := stream.(interface{ underruns() int })
 	underruns := 0
+	// breaker is the stream's count of the times its playback broke, when it
+	// keeps one: a suspend (resumed or not), a recovery or a drop. A write
+	// that raises it disrupted the stream (AudibleEvent).
+	breaker, _ := stream.(interface{ breaks() int })
+	breaks := 0
 	for {
 		step, seq, active := o.next(frame, sum, rate, hist, &idleSince)
 		switch step {
@@ -1071,6 +1094,7 @@ func (o *Output) mix(stream PlaybackStream, rate int) error {
 			return nil
 		case stepIdle:
 			if q, ok := stream.(interface{ queuedFrames() int }); !ok || quiet >= q.queuedFrames() {
+				o.settleAudibles(monoclock.Read(), true)
 				o.closeIdle()
 				return nil
 			}
@@ -1114,9 +1138,18 @@ func (o *Output) mix(stream PlaybackStream, rate int) error {
 				}
 			}
 		}
+		if breaker != nil {
+			if b := breaker.breaks(); b > breaks {
+				// The stream suspended, resumed, recovered or dropped: what
+				// it holds may play at another time than its account says.
+				breaks = b
+				o.disrupted()
+			}
+		}
 		if o.wrote(seq, took, tookMono) {
 			o.timeAudible(stream, rate)
 		}
+		o.settleAudibles(monoclock.Read(), false)
 		p.wrote(took.Sub(began), took)
 		if active {
 			quiet = 0
@@ -1144,7 +1177,7 @@ func (o *Output) replay(stream PlaybackStream, redo []int16, sum []float32, n, b
 		if back > 0 {
 			// What the stream gives back plays later than its account said, and
 			// a discard or Cancel during the replay gives back again.
-			o.disruptedBy(back)
+			o.disrupted()
 		}
 		o.retake(redo[:back], sum)
 		off, drop, lost := 0, false, 0
@@ -1233,6 +1266,7 @@ func (o *Output) startStream() {
 	for _, in := range o.order {
 		in.audiblePending = false
 	}
+	o.timed = o.timed[:0]
 }
 
 // next decides the mixer's next step: close, take back for a Cancel, or
@@ -1400,8 +1434,8 @@ func (o *Output) mixFrame(frame []int16, sum []float32, rate, hist int, now time
 				in.speaking, in.unlanded, in.owner = true, playedTime{}, started
 				in.startFrame, in.startPending = o.mixed, true
 				// The disruptions before the speech's first write: one that comes to
-				// that write or its replay leaves the speech untimed, unless the replay
-				// carries its first sample (disruptedBy).
+				// that write, or after it before its first sample has played, leaves
+				// the speech untimed (settleAudibles).
 				in.audibleAt, in.audibleLead, in.audibleSince = firstLanded(in.landed), 0, o.disruptions
 				if in.audibleAt >= 0 {
 					in.audibleAt += o.pos
@@ -1662,42 +1696,48 @@ func firstLanded(landed []uint32) int64 {
 	return -1
 }
 
-// disrupted counts an underrun or a stream failure: each moves what the
-// device holds later than the stream's account said.
+// disrupted counts a replay, an underrun, a suspend or a stream failure: each
+// can move what the device holds to another time than the stream's account
+// said, so no speech whose first sample it may have come to is timed.
 func (o *Output) disrupted() {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	o.disruptions++
 }
 
-// disruptedBy counts a replay of the last back positions the stream was given,
-// which it took back or discarded by itself: what it held plays later than its
-// account said. A speech waiting to be timed whose first sample is among those
-// positions, with no other disruption since its first write, has that sample
-// written again by the replay, so the stream's account after it times the
-// sample. One whose first sample came before them was already the device's,
-// and may have played: no account after the replay gives its time, and it
-// stays untimed (Sol's review of #154 at 7d27574a).
-func (o *Output) disruptedBy(back int) {
+// settleAudibles reports each timed audible event whose time, with its error,
+// has passed by CLOCK_MONOTONIC (nowMono) with no disruption since the write
+// that carried its sample, and drops each a disruption came to. closing, as
+// the stream closes, drops the rest: no account of a closed stream says when
+// they play.
+func (o *Output) settleAudibles(nowMono int64, closing bool) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
-	o.disruptions++
-	from := o.pos - int64(back)
-	for _, in := range o.order {
-		if (in.startPending || in.audiblePending) && in.audibleAt >= from && in.audibleSince == o.disruptions-1 {
-			in.audibleSince = o.disruptions
+	kept := o.timed[:0]
+	for _, t := range o.timed {
+		switch {
+		case t.since != o.disruptions:
+		case nowMono != 0 && nowMono >= t.event.At.Mono+t.event.Err:
+			t.event.Disruptions = o.disruptions
+			o.audibles = append(o.audibles, t.event)
+			signal(o.eventWake)
+		case !closing:
+			kept = append(kept, t)
 		}
 	}
+	clear(o.timed[len(kept):])
+	o.timed = kept
 }
 
 // playPosition is a stream's account of its playback, read at one moment:
 // whether it runs, and how many frames it was given that it has not yet
 // played (its delay), read between before and after, on CLOCK_MONOTONIC in
-// nanoseconds.
+// nanoseconds; wall is the wall clock, read right after before.
 type playPosition struct {
 	running       bool
 	delay         int
 	before, after int64
+	wall          time.Time
 }
 
 // timeAudible reads the stream's account of its playback right after a write,
@@ -1706,8 +1746,9 @@ type playPosition struct {
 // into the stream's playing, at the read's time plus (p - (o.pos - delay))
 // positions at rate, in the past if the stream has played it. A stream that
 // does not run yet (still filling, before its start threshold) gives no time:
-// it will start later than its delay says. A speech that a disruption came to
-// since it started is not timed.
+// it will start later than its delay says. A timed speech is reported only
+// once its time has passed with no disruption since its first write
+// (settleAudibles).
 func (o *Output) timeAudible(stream PlaybackStream, rate int) {
 	s, ok := stream.(interface{ playPosition() (playPosition, bool) })
 	if !ok {
@@ -1728,16 +1769,12 @@ func (o *Output) timeAudible(stream PlaybackStream, rate int) {
 			continue
 		}
 		in.audiblePending = false
-		if in.audibleSince != o.disruptions {
-			continue
-		}
-		o.audibles = append(o.audibles, AudibleEvent{
-			Input:       in.name,
-			At:          mid + (in.audibleAt-played)*second/int64(rate),
-			Lead:        (in.audibleLead*second + int64(rate) - 1) / int64(rate),
-			Err:         err,
-			Disruptions: o.disruptions,
-		})
-		signal(o.eventWake)
+		at := mid + (in.audibleAt-played)*second/int64(rate)
+		o.timed = append(o.timed, timedAudible{since: in.audibleSince, event: AudibleEvent{
+			Input: in.name,
+			At:    monoclock.Stamp{Wall: pos.wall.Add(time.Duration(at - pos.before)), Mono: at},
+			Lead:  (in.audibleLead*second + int64(rate) - 1) / int64(rate),
+			Err:   err,
+		}})
 	}
 }
