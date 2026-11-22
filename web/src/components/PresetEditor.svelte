@@ -254,11 +254,13 @@
     feedback = ''
     try {
       const result = await refinePreset(refiningPreset, refineFeedback.trim())
-      // The refinement starts from the preset as the unit holds it: a field it
-      // returns as it was is no edit, and what the person typed there stays.
-      fields.description.propose(result.description)
-      fields.system_prompt.propose(result.system_prompt)
-      fields.user_template.propose(result.user_template || '{{transcript}}')
+      // The refinement starts from the preset as the unit held it (from): a
+      // field it returns as it was there is no edit, and what the person typed
+      // there stays.
+      const from = result.from
+      fields.description.propose(result.description, from?.description)
+      fields.system_prompt.propose(result.system_prompt, from?.system_prompt)
+      fields.user_template.propose(result.user_template || '{{transcript}}', from?.user_template)
       refiningPreset = ''
       feedback = 'Refined! Review the changes and Save.'
     } catch (error) {

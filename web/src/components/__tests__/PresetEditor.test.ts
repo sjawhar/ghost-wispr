@@ -467,13 +467,17 @@ describe('PresetEditor', () => {
     },
   )
 
-  // Refine answers with every field of the preset; a field it did not change
-  // comes back as the unit holds it. The unit answers a save with the config.
-  function stubRefine(result: Omit<PresetDetail, 'model'>) {
+  // Refine answers with every field of the preset, and with the preset it
+  // started from, as the unit held it (from; left out: a server older than
+  // from). The unit answers a save with the config.
+  function stubRefine(
+    result: Omit<PresetDetail, 'model'>,
+    started: { from?: PresetDetail } = { from: presets.standup },
+  ) {
     const fetch = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input)
       if (url === '/api/config/presets/refine') {
-        return Promise.resolve(new Response(JSON.stringify({ ...result, model: '' })))
+        return Promise.resolve(new Response(JSON.stringify({ ...result, model: '', ...started })))
       }
       if (init?.method === 'PATCH') {
         return Promise.resolve(
@@ -567,6 +571,61 @@ describe('PresetEditor', () => {
           summarization: {
             presets: {
               standup: { description: 'Mine', system_prompt: 'More concise system prompt' },
+            },
+          },
+        },
+      ]),
+    )
+  })
+
+  // The proof's case: another tab set the description "Elsewhere", which this
+  // page has not read. The refinement starts from the unit's preset, returns
+  // "Elsewhere" as it found it, and changes the prompt. The description is no
+  // edit, so a save does not send it over a later change.
+  it('sends no field the refinement found already changed on the unit', async () => {
+    const fetch = stubRefine(
+      {
+        description: 'Elsewhere',
+        system_prompt: 'New prompt',
+        user_template: '{{transcript}}',
+      },
+      { from: { ...presets.standup, description: 'Elsewhere' } },
+    )
+    await expandStandup()
+
+    await refine()
+    expect(field('Description').value).toBe('Daily standup notes')
+    await fireEvent.click(screen.getByRole('button', { name: 'Save' }))
+
+    await waitFor(() =>
+      expect(patches(fetch)).toEqual([
+        { summarization: { presets: { standup: { system_prompt: 'New prompt' } } } },
+      ]),
+    )
+  })
+
+  // A server older than from: a field is a refinement's change where it
+  // differs from the config and from what the field shows. Nothing is dropped.
+  it('takes a refinement from a server that names no starting preset', async () => {
+    const fetch = stubRefine(
+      {
+        description: 'Daily standup notes',
+        system_prompt: 'New prompt',
+        user_template: 'Notes: {{transcript}}',
+      },
+      {},
+    )
+    await expandStandup()
+
+    await refine()
+    await fireEvent.click(screen.getByRole('button', { name: 'Save' }))
+
+    await waitFor(() =>
+      expect(patches(fetch)).toEqual([
+        {
+          summarization: {
+            presets: {
+              standup: { system_prompt: 'New prompt', user_template: 'Notes: {{transcript}}' },
             },
           },
         },

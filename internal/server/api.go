@@ -2213,6 +2213,8 @@ func handleRefinePreset(cfgStore *config.Store, refineFn func(ctx context.Contex
 			return
 		}
 
+		// One read of the preset: the same value goes to the model and comes
+		// back as from.
 		cfg := cfgStore.Get()
 		current, ok := cfg.Summarization.Presets[body.Name]
 		if !ok {
@@ -2229,8 +2231,17 @@ func handleRefinePreset(cfgStore *config.Store, refineFn func(ctx context.Contex
 			return
 		}
 
-		writeJSON(w, http.StatusOK, refined)
+		writeJSON(w, http.StatusOK, refineResponse{Preset: refined, From: current})
 	}
+}
+
+// refineResponse is a refined preset, and the preset the refinement started
+// from, as the unit held it. A field the refinement returns as it is in From
+// is one it did not change: the settings page makes no edit of it, though its
+// own config may be older than From.
+type refineResponse struct {
+	config.Preset
+	From config.Preset `json:"from"`
 }
 
 func registerRestoreRoutes(mux routeMux, controls *ControlHooks) {

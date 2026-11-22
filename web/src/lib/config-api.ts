@@ -229,8 +229,14 @@ export function generatePreset(description: string): Promise<GeneratePresetRespo
   })
 }
 
-export function refinePreset(name: string, feedback: string): Promise<GeneratePresetResponse> {
-  return configRequest<GeneratePresetResponse>('/api/config/presets/refine', {
+// RefinePresetResponse is a refined preset, and the preset the refinement
+// started from, as the unit held it (absent from a server older than it).
+export interface RefinePresetResponse extends GeneratePresetResponse {
+  from?: PresetDetail
+}
+
+export function refinePreset(name: string, feedback: string): Promise<RefinePresetResponse> {
+  return configRequest<RefinePresetResponse>('/api/config/presets/refine', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ name, feedback }),

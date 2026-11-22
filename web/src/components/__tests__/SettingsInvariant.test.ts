@@ -19,8 +19,9 @@ import { unitConfig } from './configFixture'
 //   the value saved, until the page takes a config;
 // - a field the person is editing shows what they typed or what a refinement
 //   proposed; a refinement proposes a field only where its output differs both
-//   from the config's value (a field the refinement did not change) and from
-//   what the field shows;
+//   from the preset it started from as the unit held it (from; a field it did
+//   not change), or the config's value if the answer names none, and from what
+//   the field shows;
 // - a config whose value for the field is neither what the field showed when
 //   the editing began nor what was typed ends the edit, and the field says
 //   "Changed on the unit or in another tab; your edit was replaced." until the
@@ -140,7 +141,7 @@ class FakeUnit {
   pending: Pending[] = []
   sent: Body[] = []
   holding = false
-  refineAnswer = { description: '', system_prompt: '', user_template: '', model: '' }
+  refineAnswer: Record<string, unknown> = {}
 
   constructor(private random: () => number) {}
 
@@ -353,31 +354,46 @@ async function runSequence(seed: number, steps: number): Promise<void> {
       const refineButton = presetButton('Refine')
       if (refineButton.disabled) continue
       const taken = configState.config as ConfigResponse
-      // For each field: as the page's config holds it (not changed), the same
-      // with a new line after it, what the field shows, as the unit holds it
-      // now, or another text.
+      // The handler starts from the preset as the unit holds it now (from).
+      // For each field: as it was there (not changed), the same with a space
+      // after it (a text input drops a new line, so the field would not show
+      // it), as the page's config holds it, what the field shows,
+      // or another text. One answer in five comes from a server older than
+      // from, and names no starting preset.
       const output = Object.fromEntries(
         PRESET_FIELDS.map((field) => [
           field,
           pick([
-            valueIn(taken, field),
-            `${valueIn(taken, field)}\n`,
-            input(field).value,
             unit.values[field],
+            `${unit.values[field]} `,
+            valueIn(taken, field),
+            input(field).value,
             pick(POOL[field]),
           ]),
         ]),
       ) as Record<Field, string>
+      const withFrom = random() < 0.8
       unit.refineAnswer = {
         description: output.description,
         system_prompt: output.prompt,
         user_template: output.template,
         model: '',
+        ...(withFrom
+          ? {
+              from: {
+                description: unit.values.description,
+                system_prompt: unit.values.prompt,
+                user_template: unit.values.template,
+                model: '',
+              },
+            }
+          : {}),
       }
       for (const field of PRESET_FIELDS) {
         const shown = input(field).value
         const value = output[field]
-        if (same(value, valueIn(taken, field)) || same(value, shown)) continue
+        const unchanged = withFrom ? unit.values[field] : valueIn(taken, field)
+        if (same(value, unchanged) || same(value, shown)) continue
         edit(field, value, shown)
       }
       await fireEvent.click(refineButton)

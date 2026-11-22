@@ -343,8 +343,9 @@ began with a key a save has since replaced is not kept as the provider's last ch
   read again after 1 s, then twice as long each time up to 30 s, saying meanwhile that the settings
   may be out of date. What a save sends does not depend on what is shown: General, Meeting voice,
   Integrations and an open preset send each field the person changed since a save of it last
-  succeeded. A preset's Refine changes a field only where its output differs from the preset as the
-  unit holds it; a field it returns unchanged keeps what was typed there and is not sent for it. A
+  succeeded. A preset's Refine changes a field only where its output differs from the preset it
+  started from, which `POST /api/config/presets/refine` answers as `from` (the preset as the unit
+  held it); a field it returns unchanged keeps what was typed there and is not sent for it. A
   field nobody is typing in shows the config the page last took. A config with another value for a
   field being typed in ends that edit for good; the field shows the new value and says "Changed on
   the unit or in another tab; your edit was replaced." until the next input in it.

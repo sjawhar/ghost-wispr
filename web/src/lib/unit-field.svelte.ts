@@ -21,11 +21,12 @@ export interface UnitField<T> {
   // shows that value. A value changed and changed back stays edited, and is
   // sent: it is the person's value.
   readonly edited: boolean
-  // A value from the page itself, such as a refinement's output. It is an
-  // edit only where it is neither the config's value (what the unit held, so
-  // the proposal did not change the field: what the person typed stays) nor
-  // what the field shows, spaces around text aside.
-  propose(next: T): void
+  // A value from the page itself, such as a refinement's output; from is the
+  // value it started from, as the unit held it. It is an edit only where it is
+  // neither from (so the proposal did not change the field, and what the
+  // person typed stays) nor what the field shows, spaces around text aside.
+  // Without from (a server older than it), the config's value stands in.
+  propose(next: T, from?: T): void
   // A config the page took replaced the person's edit with a value other than
   // what they typed; until the person's next input in the field.
   readonly replaced: boolean
@@ -101,8 +102,9 @@ export function unitField<T>(read: () => T, taken: () => unknown): UnitField<T> 
       if (Object.is(next, value)) return
       change(next)
     },
-    propose(next: T) {
-      if (sameEntry(next, unit) || sameEntry(next, value)) return
+    propose(next: T, from?: T) {
+      const unchanged = from === undefined ? unit : from
+      if (sameEntry(next, unchanged) || sameEntry(next, value)) return
       change(next)
     },
     get edited() {

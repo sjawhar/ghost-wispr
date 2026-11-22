@@ -1308,7 +1308,7 @@ func OpenAPISpec() map[string]any {
 					},
 					"responses": map[string]any{
 						"200": map[string]any{
-							"description": "Refined preset",
+							"description": "The refined preset's description, system_prompt, user_template and model, and from: the preset the refinement started from, as the unit held it. A field equal in both is one the refinement did not change.",
 						},
 					},
 				},
