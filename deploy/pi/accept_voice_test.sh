@@ -2538,9 +2538,12 @@ launch cancel-locked long,asound,stop-rounds-2,arecord-hold-200,arecord-reopen,a
 # fake writes on through its fd with no hold (arecord-lock-start): no overrun, so the recording stays
 # continuous and the case is held to the chime path: PASS by the chime, counted. cancel-locked's hold
 # overruns in every run, so it can never test the locked reads there (Sol's review of #156 at
-# d49d0fe7). A failed read taken for no file yet puts the start inside the lock: FAIL.
+# d49d0fe7). A failed read taken for no file yet puts the start inside the lock: FAIL. It has the
+# 250 ms capture buffer (capture-buffer-250), as the floor cases do, so that a loaded machine
+# seldom makes the fake overrun and the strict path runs there too (Sol's review of #159 at
+# 75a99ec1: at the 40 ms buffer two loaded runs overran and fell back).
 # shellcheck disable=SC2086
-launch cancel-lock-start long,asound,stop-rounds-2,arecord-lock-start yes -- $cancel_args
+launch cancel-lock-start long,asound,stop-rounds-2,arecord-lock-start,capture-buffer-250 yes -- $cancel_args
 # A good cancel with an arecord that reads 1.5 s after its header: the recording cannot show that the
 # rig heard the speech up to the stop: UNKNOWN, never PASS.
 # shellcheck disable=SC2086
