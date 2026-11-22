@@ -1002,12 +1002,14 @@ def aplay(args):
     write("aplays", "%d\n" % n)
     log_to("aplay.log", "%s %s" % (device, path))
     write("aplay-pid.%d" % n, "%d\n" % os.getpid())
-    # slow-aplay-WORD starts the clip whose first word is WORD 2 s after aplay began, aplay-late-WORD
-    # 700 ms after, and slow-exit-WORD returns 1.8 s after it ended, as aplay's start and exit on a
-    # loaded machine: the driver knows only that the clip began after it started aplay and ended
-    # before aplay returned.
+    # slow-aplay-WORD starts the clip whose first word is WORD 2 s after aplay began, held-aplay-WORD
+    # 5 s after, aplay-late-WORD 700 ms after, and slow-exit-WORD returns 1.8 s after it ended, as
+    # aplay's start and exit on a loaded machine: the driver knows only that the clip began after it
+    # started aplay and ended before aplay returned.
     if "slow-aplay-" + words[0] in SCENARIO:
         time.sleep(2.0)
+    if "held-aplay-" + words[0] in SCENARIO:
+        time.sleep(5.0)
     if "aplay-late-" + words[0] in SCENARIO:
         time.sleep(0.7)
     start = now_ms()
@@ -2544,6 +2546,14 @@ launch cancel-leak-late long,asound,stop-rounds-2,leak-1100 yes -- $cancel_args
 launch cancel-leak-quiet long,asound,stop-rounds-2,leak-after-quiet yes -- $cancel_args
 # shellcheck disable=SC2086
 launch cancel-leak-chime long,asound,stop-rounds-2,leak-before-chime yes -- $cancel_args
+# The same with the step's own pace slowed as a loaded machine slows it: the stop's aplay returns
+# 1.8 s after its clip (slow-exit-stop) and each question's starts its clip 5 s late
+# (held-aplay-question), so the next question, and the word before its chime, come over 8 s after
+# the stop, where an idle machine brings them in about 2.5 s (Sol's run of #149 at 44738566
+# measured 9394 ms). The driver must still measure that word: FAIL, with an interval that holds
+# the fake's true end of the sound that holds it.
+# shellcheck disable=SC2086
+launch cancel-leak-chime-slow long,asound,stop-rounds-2,leak-before-chime,slow-exit-stop,held-aplay-question yes -- $cancel_args
 # shellcheck disable=SC2086
 launch cancel-leak-apart-chime long,asound,stop-rounds-2,leak-apart-chime yes -- $cancel_args
 # shellcheck disable=SC2086
@@ -3357,6 +3367,47 @@ heard_up_to() {
 heard_no_earlier() {
   sed -n "s/^\(FAIL\|UNKNOWN\): playback-cancel: .*no earlier than \([0-9]*\) ms after it.*/\2/p" "$root/$1/out"
 }
+# true_after_stop NAME TAG N: by the fake's own clock, how long after the Nth stop line (its time,
+# which the driver times that cancel from) the rig stops hearing the sound that holds the first
+# sound tagged TAG after it, before the next stop. The driver's analysis hears sounds less than
+# 150 ms apart (accept-voice.sh's silence_ms) as one, so a word that runs into the chime within that
+# is heard to the chime's end. Empty when the fake logged no such stop or sound.
+true_after_stop() {
+  python3 - "$root/$1/state" "$2" "$3" <<'EOF'
+import json, os, sys
+state, tag, n = sys.argv[1], sys.argv[2], int(sys.argv[3])
+items = [json.loads(line) for line in open(os.path.join(state, "timeline.jsonl")) if line.strip()]
+stops = sorted(i["due"] for i in items if i.get("kind") == "timing" and i.get("event") == "stop")
+if len(stops) < n:
+    sys.exit()
+stop, after = stops[n - 1], stops[n] if len(stops) > n else float("inf")
+word = next((i for i in items if i.get("kind") == "sound" and i.get("tag") == tag and stop < i["start"] < after), None)
+if word is None:
+    sys.exit()
+end = word["end"]
+for sound in sorted((i for i in items if i.get("kind") == "sound" and i["start"] >= word["start"]), key=lambda i: i["start"]):
+    if sound["start"] - end < 150:
+        end = max(end, sound["end"])
+print(end - stop)
+EOF
+}
+# expect_heard_holds NAME TAG: for each stop the fake played a TAG sound after, the driver's NOTE
+# says how long the rig heard sound after that stop, from its early bound ("no earlier than") to its
+# late one, and that interval holds the fake's true end of the sound that holds TAG
+# (true_after_stop): the driver measured that sound, however late the step's own pace on a loaded
+# machine brought it. The FAIL line gives the worst stop's interval, one of these.
+expect_heard_holds() {
+  local n high low truth checked=0
+  while read -r n high low; do
+    truth=$(true_after_stop "$1" "$2" "$n")
+    [[ -n $truth ]] || continue
+    checked=$((checked + 1))
+    ((low <= truth && truth <= high)) \
+      || check_failed "$1: the driver's interval for how long stop $n's speech was heard, $low to $high ms, leaves out the fake's true end of the sound that holds the $2, $truth ms after the stop"
+  done < <(sed -n "s/^NOTE: playback-cancel stop \([0-9]*\): the rig microphone heard sound until \([0-9]*\) ms after the stop (no earlier than \([0-9]*\) ms.*/\1 \2 \3/p" "$root/$1/out")
+  ((checked > 0)) \
+    || check_failed "$1: no stop's interval to check against a $2 the fake played after it; output: $(tr '\n' '|' <"$root/$1/out")"
+}
 # expect_not_passed NAME LOW HIGH: a tail over the bound whose early bound may or may not be over
 # it, by how late the recording's anchors were read: FAIL or UNKNOWN, never PASS, and the tail it
 # names, late bound, between LOW and HIGH.
@@ -3437,8 +3488,21 @@ expect_line cancel-leak-quiet 'UNKNOWN: playback-cancel stop 1: the rig micropho
 expect_restored cancel-leak-quiet
 expect_rc cancel-leak-chime 1
 expect_line cancel-leak-chime "FAIL: playback-cancel: a stop's speech was heard at the rig microphone "
-expect_between 'cancel-leak-chime: how long the word before the next chime is heard' "$(heard_after cancel-leak-chime)" 1500 6000
+# How long after the stop the word is heard depends on the step's own pace to the next question,
+# which a loaded machine stretches (Sol's run of #149 at 44738566: 9394 ms, past a fixed 6000 ms):
+# the FAIL's interval must hold the fake's own end of the sound that holds the word, wherever it
+# came. The word ends 70 ms before the chime starts, inside the analyser's 150 ms of silence, so the
+# rig hears the two as one sound, to the chime's end.
+expect_heard_holds cancel-leak-chime leaked-word
 expect_restored cancel-leak-chime
+expect_rc cancel-leak-chime-slow 1
+expect_line cancel-leak-chime-slow "FAIL: playback-cancel: a stop's speech was heard at the rig microphone "
+expect_heard_holds cancel-leak-chime-slow leaked-word
+slow_word=$(true_after_stop cancel-leak-chime-slow leaked-word 1)
+if [[ -z $slow_word ]] || ((slow_word <= 6000)); then
+  check_failed "cancel-leak-chime-slow: the word ends ${slow_word:-never} ms after the stop, not past the 6000 ms an idle machine's pace stays within: the case did not slow the step"
+fi
+expect_restored cancel-leak-chime-slow
 expect_rc cancel-leak-apart-chime 1
 expect_line cancel-leak-apart-chime "FAIL: playback-cancel stop 1: a sound at the rig microphone starts "
 expect_restored cancel-leak-apart-chime
