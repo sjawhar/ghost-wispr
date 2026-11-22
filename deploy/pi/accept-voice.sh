@@ -533,18 +533,22 @@ def record(path, anchors, pidfile, root):
     prints "started US" once arecord has written a sample, "stopped" if arecord ends before, and
     "timeout" if it has written none within 5 s of its pid; a sample counts even when found after the
     5 s. A sample found before the pid, which the driver writes after it starts arecord, is an
-    anchor without a floor, and the reads go on every 10 ms until the pid comes. Each read from the
-    first sample on, once the pid is known, is followed by a read of the state of the capture
-    substream arecord holds (capture_state under ROOT). Only when that state is RUNNING, from the
-    trigger of the first such read, is the anchor written with BEFORE_US, the floor that bounds
-    later samples from below; otherwise it is written "US BYTES", a late bound alone. An overrun
-    (XRUN), a suspend or a restart (another trigger) prints "discontinuous US STATE" once: arecord
-    may not live to report it. A substream gone is arecord closing its capture, as it does as it
-    ends, and breaks nothing unless samples land after it: a write arecord held across an overrun
-    and finished as it closed (Sol's review of #149 at b7edd969). So on finding it gone the size is
-    read again at once, and that read or any later one that finds the file longer than at the close
-    prints "discontinuous US CLOSED". A state read after the size can be later than it, never
-    earlier."""
+    anchor without a floor, and the reads go on every 10 ms until the pid comes; as the substream's
+    state could not be read while those samples landed, no anchor keeps its floor, and it prints
+    "discontinuous US UNWATCHED". Each read from the first sample on, once the pid is known, is
+    followed by a read of the state of the capture substream arecord holds (capture_state under
+    ROOT). Only when that state is RUNNING, from the trigger of the first such read, is the anchor
+    written with BEFORE_US, the floor that bounds later samples from below; otherwise it is written
+    "US BYTES", a late bound alone. The first such read could follow a restart that came after the
+    file's first samples, so the size read that first finds samples is preceded by a state read too:
+    unless that shows the substream never triggered (no run yet) or RUNNING from the same trigger,
+    no anchor keeps its floor. An overrun (XRUN), a suspend or a restart (another trigger) prints
+    "discontinuous US STATE" once: arecord may not live to report it. A substream gone is arecord
+    closing its capture, as it does as it ends, and breaks nothing unless samples land after it: a
+    write arecord held across an overrun and finished as it closed (Sol's review of #149 at
+    b7edd969). So on finding it gone the size is read again at once, and that read or any later one
+    that finds the file longer than at the close prints "discontinuous US CLOSED". A state read
+    after the size can be later than it, never earlier."""
     signal.signal(signal.SIGINT, signal.SIG_IGN)
     signal.signal(signal.SIGTERM, stop)
     read = size_reader(path)
@@ -554,10 +558,25 @@ def record(path, anchors, pidfile, root):
     # closed is the file's size when the substream was first found gone.
     broken, reported, closed = None, False, None
 
-    def anchored(seen, size, before):
-        """Write the anchor of a read with samples, its floor only if the substream ran on."""
+    def anchored(seen, size, before, prior=None):
+        """Write the anchor of a read with samples, its floor only if the substream ran on. PRIOR,
+        for the first anchor, is the state read just before its size read: the kernel sets the
+        trigger at every start, stop, pause, suspend and resume, never at a prepare, and a
+        substream never started shows 0 (sound/core/pcm_native.c, snd_pcm_trigger_tstamp and
+        snd_pcm_status64). So a run before the one the read after the size shows had begun unless
+        PRIOR shows no substream, a substream never triggered, or RUNNING from the same trigger."""
         nonlocal broken, trigger, closed
         state, now_trigger = capture_state(root, pid)
+        if prior is not None and broken is None:
+            prior_state, prior_trigger = prior
+            if prior_state is not None and prior_trigger is None:
+                broken = "discontinuous %d NO-TRIGGER" % seen
+            elif prior_state == "RUNNING" and prior_trigger != now_trigger:
+                broken = "discontinuous %d RESTARTED" % seen
+            elif prior_state in ("OPEN", "SETUP", "PREPARED") and prior_trigger != (0, 0):
+                broken = "discontinuous %d RESTARTED" % seen
+            elif prior_state not in (None, "OPEN", "SETUP", "PREPARED", "RUNNING"):
+                broken = "discontinuous %d %s" % (seen, prior_state)
         if state == "RUNNING" and now_trigger is None:
             # RUNNING with no trigger_time in the kernel's form shows nothing about a restart (Sol's
             # reviews of #149 at 9b3d27cb and 44738566): no floor, now or after.
@@ -597,16 +616,20 @@ def record(path, anchors, pidfile, root):
                 except (OSError, ValueError):
                     pass
             before = us()
+            prior = capture_state(root, pid) if pid is not None else None
             size = read(pid)
             seen = us()
             if size is not None and size > HEADER and pid is None:
                 # A sample before arecord's pid: the driver writes the pid after it starts arecord,
                 # and a loaded machine can delay that past arecord's first write (c28 of #156, where
                 # the loop below then failed on the missing pid and wrote no anchor after this one).
-                # The substream's state needs the pid, so a late bound alone, until the pid comes.
+                # The substream's state needs the pid, so a late bound alone, and no floor after: a
+                # restart while these samples landed would go unseen.
                 out.write("%d %d\n" % (seen, size))
+                if broken is None:
+                    broken = "discontinuous %d UNWATCHED" % seen
             elif size is not None and size > HEADER:
-                anchored(seen, size, before)
+                anchored(seen, size, before, prior)
                 break
             if size is not None and size == HEADER:
                 out.write("%d %d %d\n" % (seen, size, before))
@@ -1589,6 +1612,9 @@ analyse_recording() {
   elif [[ $(<"$work_dir/arecord.err") == *Suspended* ]]; then
     floor=
     note "recording: arecord reported a suspend, so the recording's early bounds come from its start alone"
+  elif [[ $discontinuous == UNWATCHED ]]; then
+    floor=
+    note "recording: arecord wrote its first samples before the sampler knew its process, so the capture substream's state could not show it ran on from them, and the recording's early bounds come from its start alone"
   elif [[ $discontinuous == NO-TRIGGER ]]; then
     floor=
     note "recording: the capture substream arecord held showed RUNNING with no trigger_time in the kernel's form (seconds and nine digits of nanoseconds), which cannot show it ran on without a restart, so the recording's early bounds come from its start alone"

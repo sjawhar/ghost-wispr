@@ -1392,13 +1392,20 @@ def arecord(args):
         # capture-silent-restart shows it in XRUN for 30 ms only, which the sampler's reads miss,
         # then RUNNING again from a new trigger_time, as a prepare and start do; arecord-suspend
         # prints the suspend recovery arecord prints unless -q (alsa-utils aplay.c, suspend()).
-        clipped, shown = None, "RUNNING"
+        clipped, shown, said_unwatched = None, "RUNNING", False
         while True:
             time.sleep(0.005)
             t = now_ms()
             if unlock is not None and t >= unlock[2]:
                 os.chmod(unlock[0], unlock[1])
                 unlock = None
+            # sampler-says-unwatched: 1 s into the capture, long after the sampler's "started" line,
+            # the sampler's line for first samples that landed before it knew arecord's process,
+            # added to its output, which the driver reads at the end; the sampler writes no more there.
+            if "sampler-says-unwatched" in SCENARIO and not said_unwatched and t >= begun + 1000:
+                with open(path + ".sampler", "a") as g:
+                    g.write("discontinuous %d UNWATCHED\n" % (time.monotonic_ns() // 1000))
+                said_unwatched = True
             held = t - last + (50 if "arecord-behind" in SCENARIO else 0)
             if held > FAKE_RESIDENCY_MS and not (lag_until is not None and t < lag_until):
                 overrun(held)
@@ -2171,8 +2178,17 @@ floor_decided() {
     printf 'NOTE: %s: the fake arecord was held back past its buffer and reported an overrun, so the case read the start-only bounds\n' "$1"
     return 1
   fi
+  if grep -Fq "$unwatched_note" "$root/$1/out"; then
+    printf 'NOTE: %s: the driver gave arecord'"'"'s process to the sampler after its first samples, so the case read the start-only bounds\n' "$1"
+    return 1
+  fi
   floor_cases=$((floor_cases + 1))
 }
+
+# The driver's NOTE for a recording whose first samples landed before the sampler knew arecord's
+# process: on a loaded machine the driver can give it late (c28 of #156), so the capture
+# substream's state could not show it ran on, and the early bounds come from the start alone.
+readonly unwatched_note="NOTE: recording: arecord wrote its first samples before the sampler knew its process"
 
 # The driver's NOTE for a stop whose next answer it times against its chime, as a whole line.
 readonly chime_note_re='^NOTE: playback-cancel stop [0-9]+: the next answer is timed against its chime in the same recording$'
@@ -2228,8 +2244,13 @@ chime_counted() {
 # a case with no overrun can still fall back by design (no audible lines, a disruption), so only a
 # chime case whose own chime-relative checks passed counts (chime_counted).
 capture_unbroken() {
-  fake_overran "$1" || return 0
-  printf 'NOTE: %s: the fake arecord overran (%s), so the case fell back to first_audio\n' "$1" "$(tr '\n' ';' <"$root/$1/state/overruns")"
+  if fake_overran "$1"; then
+    printf 'NOTE: %s: the fake arecord overran (%s), so the case fell back to first_audio\n' "$1" "$(tr '\n' ';' <"$root/$1/state/overruns")"
+  elif grep -Fq "$unwatched_note" "$root/$1/out"; then
+    printf 'NOTE: %s: the driver gave arecord'"'"'s process to the sampler after its first samples, so the case fell back to first_audio\n' "$1"
+  else
+    return 0
+  fi
   expect_line "$1" 'the recording is not shown continuous'
   return 1
 }
@@ -2483,6 +2504,11 @@ launch barge-pause-sampler-crash answer-until-clip,backchannel-pause-500,sampler
 # alone cannot show the substream ran on without a restart, so UNKNOWN with a NOTE naming the missing
 # trigger, never PASS (Sol's review of #149 at 9b3d27cb).
 launch barge-pause-no-trigger answer-until-clip,backchannel-pause-500,arecord-slow-start,capture-buffer-250,capture-no-trigger yes -- --step barge-in --talkovers 1 --backchannels 1 --question @question.wav --talkover-dir @talkovers --backchannel-dir @backchannels --rig-mic "$rig" --event-timeout 15
+# The same pause with the sampler saying its recording's first samples landed before it knew
+# arecord's process (sampler-says-unwatched: the fake writes the sampler's line, 1 s into the
+# capture), as on a loaded machine whose driver gives the pid late: the state could not show the
+# substream ran on, so UNKNOWN with a NOTE naming that, never PASS.
+launch barge-pause-unwatched answer-until-clip,backchannel-pause-500,arecord-slow-start,capture-buffer-250,sampler-says-unwatched yes -- --step barge-in --talkovers 1 --backchannels 1 --question @question.wav --talkover-dir @talkovers --backchannel-dir @backchannels --rig-mic "$rig" --event-timeout 15
 # A backchannel that stops the speech, with arecord stalled in a write during the speech, its
 # capture overrunning and its sampler held for as long; stopped, arecord lands the held period and
 # closes with no read that would report the overrun (arecord-terminal-stall, Sol's review of #149 at
@@ -3336,6 +3362,10 @@ expect_rc barge-pause-no-trigger 2
 expect_line barge-pause-no-trigger "NOTE: recording: the capture substream arecord held showed RUNNING with no trigger_time in the kernel's form"
 expect_no_line barge-pause-no-trigger 'PASS: barge-in: 0 of 1'
 expect_restored barge-pause-no-trigger
+expect_rc barge-pause-unwatched 2
+expect_line barge-pause-unwatched "$unwatched_note"
+expect_no_line barge-pause-unwatched 'PASS: barge-in: 0 of 1'
+expect_restored barge-pause-unwatched
 expect_rc barge-backchannel-terminal-stall 1 2
 # On a loaded machine the fake can also overrun before the stall, and the driver then names the
 # overrun, which turns the anchors' bound off as well: the case still must not PASS. It is no floor
