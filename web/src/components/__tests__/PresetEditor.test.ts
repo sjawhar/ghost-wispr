@@ -117,6 +117,11 @@ describe('PresetEditor', () => {
     await waitFor(() =>
       expect(field('Model Override (optional)').value).toBe('vertex/gemini-4-carbon'),
     )
+    // Neither the person's own save nor a change to a field nobody typed in
+    // replaced an edit.
+    expect(
+      screen.queryByText('Changed on the unit or in another tab; your edit was replaced.'),
+    ).toBeNull()
     await fireEvent.input(field('Description'), { target: { value: 'Weekly notes, short' } })
     await fireEvent.click(screen.getByRole('button', { name: 'Save' }))
 
@@ -179,6 +184,29 @@ describe('PresetEditor', () => {
 
     expect(field('Model Override (optional)').value).toBe('vertex/gemini-4-carbon')
     expect(field('Description').value).toBe('Weekly notes')
+  })
+
+  // The other tab changes the description the person is typing: the field
+  // takes it, and says so next to it until the person types there again.
+  it('says when a change from elsewhere replaced the description being typed', async () => {
+    const note = 'Changed on the unit or in another tab; your edit was replaced.'
+    const view = await expandStandup()
+    await fireEvent.input(field('Description'), { target: { value: 'Weekly notes' } })
+
+    await view.rerender({
+      presets: { standup: { ...presets.standup, model: 'vertex/gemini-4-carbon' } },
+    })
+    expect(screen.queryByText(note)).toBeNull()
+    await view.rerender({
+      presets: {
+        standup: { ...presets.standup, description: 'Elsewhere', model: 'vertex/gemini-4-carbon' },
+      },
+    })
+
+    expect(field('Description').value).toBe('Elsewhere')
+    expect(field('Description').closest('.field')?.textContent).toContain(note)
+    await fireEvent.input(field('Description'), { target: { value: 'Mine again' } })
+    expect(screen.queryByText(note)).toBeNull()
   })
 
   // The person opened another preset while the first one's save was on its

@@ -85,10 +85,13 @@ describe('IntegrationsSettings', () => {
     expect(
       (screen.getByLabelText('Delete sessions older than (days)') as HTMLInputElement).value,
     ).toBe('60')
+    const note = 'Changed on the unit or in another tab; your edit was replaced.'
+    expect(screen.queryByText(note)).toBeNull()
 
     await view.rerender({ config: { ...config, gdrive: { ...config.gdrive, folder_id: 'other' } } })
 
     expect((screen.getByLabelText('Folder ID') as HTMLInputElement).value).toBe('other')
+    expect(screen.getByLabelText('Folder ID').closest('.field')?.textContent).toContain(note)
   })
 
   it('sends no folder ID that was not changed', async () => {

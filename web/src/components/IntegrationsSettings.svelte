@@ -4,6 +4,7 @@
   import { setConfig } from '../lib/config.svelte'
   import { unitField } from '../lib/unit-field.svelte'
   import ModelProviders from './ModelProviders.svelte'
+  import ReplacedNote from './ReplacedNote.svelte'
 
   let {
     config,
@@ -33,10 +34,11 @@
     gdriveSaving = true
     gdriveFeedback = ''
     try {
+      const sent = gdriveFolder.value.trim()
       const updated = await patchConfig({
-        gdrive: { folder_id: gdriveFolder.value.trim() },
+        gdrive: { folder_id: sent },
       })
-      gdriveFolder.acknowledge()
+      gdriveFolder.acknowledge(sent)
       setConfig(updated)
       gdriveFeedback = 'Saved!'
     } catch (error) {
@@ -50,10 +52,11 @@
     syncSaving = true
     syncFeedback = ''
     try {
+      const sent = syncEnabled.value
       const updated = await patchConfig({
-        gdrive: { sync_enabled: syncEnabled.value },
+        gdrive: { sync_enabled: sent },
       })
-      syncEnabled.acknowledge()
+      syncEnabled.acknowledge(sent)
       setConfig(updated)
       syncFeedback = 'Saved!'
     } catch (error) {
@@ -77,18 +80,23 @@
       return
     }
     const gc: NonNullable<ConfigPatch['gc']> = {}
-    const carried: { acknowledge(): void }[] = []
+    // Each field the save carries, acknowledged with the value sent once the
+    // unit takes it.
+    const carried: (() => void)[] = []
     if (gcEnabled.edited) {
-      gc.enabled = gcEnabled.value
-      carried.push(gcEnabled)
+      const sent = gcEnabled.value
+      gc.enabled = sent
+      carried.push(() => gcEnabled.acknowledge(sent))
     }
     if (ageSet && gcMaxAgeDays.edited) {
-      gc.max_age_days = gcMaxAgeDays.value
-      carried.push(gcMaxAgeDays)
+      const sent = gcMaxAgeDays.value
+      gc.max_age_days = sent
+      carried.push(() => gcMaxAgeDays.acknowledge(sent))
     }
     if (sizeSet && gcMaxAudioSizeMB.edited) {
-      gc.max_audio_size_mb = gcMaxAudioSizeMB.value
-      carried.push(gcMaxAudioSizeMB)
+      const sent = gcMaxAudioSizeMB.value
+      gc.max_audio_size_mb = sent
+      carried.push(() => gcMaxAudioSizeMB.acknowledge(sent))
     }
     if (carried.length === 0) {
       gcFeedback = 'No changes to save.'
@@ -98,7 +106,7 @@
     gcFeedback = ''
     try {
       const updated = await patchConfig({ gc })
-      for (const field of carried) field.acknowledge()
+      for (const acknowledge of carried) acknowledge()
       setConfig(updated)
       gcFeedback = 'Saved!'
     } catch (error) {
@@ -140,6 +148,7 @@
         disabled={gdriveSaving}
         placeholder="Google Drive folder ID"
       />
+      <ReplacedNote shown={gdriveFolder.replaced} />
     </div>
 
     <div class="field">
@@ -181,6 +190,7 @@
         <input type="checkbox" bind:checked={gcEnabled.value} disabled={gcSaving} />
         Enable garbage collection
       </label>
+      <ReplacedNote shown={gcEnabled.replaced} />
     </div>
 
     {#if gcEnabled.value}
@@ -193,6 +203,7 @@
           bind:value={gcMaxAgeDays.value}
           disabled={gcSaving}
         />
+        <ReplacedNote shown={gcMaxAgeDays.replaced} />
         <p class="hint">
           0 = never. Deletes only ended sessions that have a verified copy in Google Drive. A
           session restored from Drive counts from its restore.
@@ -207,6 +218,7 @@
           bind:value={gcMaxAudioSizeMB.value}
           disabled={gcSaving}
         />
+        <ReplacedNote shown={gcMaxAudioSizeMB.replaced} />
         <p class="hint">
           0 = no budget: GC removes no audio to free space. Past the budget, the oldest verified
           Drive copies' local audio is removed; sessions, transcripts and summaries are kept.

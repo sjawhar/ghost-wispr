@@ -342,7 +342,10 @@ began with a key a save has since replaced is not kept as the provider's last ch
   `GET /api/config` again, which only the live run answers, one read at a time, and tries a failed
   read again after 1 s, then twice as long each time up to 30 s, saying meanwhile that the settings
   may be out of date. What a save sends does not depend on what is shown: General, Meeting voice and
-  Integrations send each field the person edited since a save of it last succeeded.
+  Integrations send each field the person typed in since a save of it last succeeded. A change of the
+  field's value on the unit or in another tab ends that edit for good; the field shows the new value
+  and says "Changed on the unit or in another tab; your edit was replaced." until the next input in
+  it, as the preset editor's fields do.
 - `PATCH /api/config` takes `provider_keys: {"<provider>": "<key>"}` for `api_key` providers and
   writes each key into `.env` under the provider's `auth.env`; any other provider or a key containing
   control characters is a 400. It also takes `tts: {model, voice}`, `summarization: {model, presets}`

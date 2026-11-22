@@ -3,6 +3,7 @@
   import { patchConfig } from '../lib/config-api'
   import { setConfig, setError } from '../lib/config.svelte'
   import { unitField } from '../lib/unit-field.svelte'
+  import ReplacedNote from './ReplacedNote.svelte'
 
   let {
     config,
@@ -23,24 +24,30 @@
     feedback = ''
     try {
       const patch: ConfigPatch = {}
-      const carried: { acknowledge(): void }[] = []
+      // Each field the save carries, acknowledged with the value sent once
+      // the unit takes it.
+      const carried: (() => void)[] = []
 
       if (silenceTimeout.edited) {
-        patch.silence_timeout = silenceTimeout.value
-        carried.push(silenceTimeout)
+        const sent = silenceTimeout.value
+        patch.silence_timeout = sent
+        carried.push(() => silenceTimeout.acknowledge(sent))
       }
       if (model.edited) {
-        patch.summarization = { model: model.value }
-        carried.push(model)
+        const sent = model.value
+        patch.summarization = { model: sent }
+        carried.push(() => model.acknowledge(sent))
       }
       const transcription: NonNullable<ConfigPatch['transcription']> = {}
       if (endpointing.edited) {
-        transcription.endpointing = endpointing.value
-        carried.push(endpointing)
+        const sent = endpointing.value
+        transcription.endpointing = sent
+        carried.push(() => endpointing.acknowledge(sent))
       }
       if (utteranceEndMs.edited) {
-        transcription.utterance_end_ms = utteranceEndMs.value
-        carried.push(utteranceEndMs)
+        const sent = utteranceEndMs.value
+        transcription.utterance_end_ms = sent
+        carried.push(() => utteranceEndMs.acknowledge(sent))
       }
       if (Object.keys(transcription).length > 0) {
         patch.transcription = transcription
@@ -51,7 +58,7 @@
       }
 
       const updated = await patchConfig(patch)
-      for (const field of carried) field.acknowledge()
+      for (const acknowledge of carried) acknowledge()
       setConfig(updated)
       feedback = 'Saved!'
     } catch (error) {
@@ -73,6 +80,7 @@
       disabled={saving}
       placeholder="30s"
     />
+    <ReplacedNote shown={silenceTimeout.replaced} />
     <span class="hint">Go duration format (e.g. 30s, 1m, 1m30s)</span>
   </div>
 
@@ -85,6 +93,7 @@
       disabled={saving}
       placeholder="openai/gpt-4o-mini"
     />
+    <ReplacedNote shown={model.replaced} />
     <span class="hint">Format: provider/model_name</span>
   </div>
 
@@ -97,6 +106,7 @@
       disabled={saving}
       placeholder="400"
     />
+    <ReplacedNote shown={endpointing.replaced} />
   </div>
 
   <div class="field">
@@ -108,6 +118,7 @@
       disabled={saving}
       placeholder="1000"
     />
+    <ReplacedNote shown={utteranceEndMs.replaced} />
     <span class="hint">Changes to transcription settings will reconnect Deepgram</span>
   </div>
 

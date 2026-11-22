@@ -1,7 +1,8 @@
+import { untrack } from 'svelte'
+
 // UnitField is a settings field. Its value starts as the unit's value that
 // read returns, and takes each new value the unit gives it, such as one the
-// settings page loads or another section's save answers. While the unit's
-// value stays the same, the field keeps what the person typed.
+// settings page loads or another section's save answers.
 //
 // What a save sends is not read from the config: the page cannot keep the
 // config exactly current (an answer can be on its way, or a read after a
@@ -11,37 +12,66 @@
 // carried once the unit takes it.
 export interface UnitField<T> {
   value: T
-  // Whether the person changed the value since a save carried the field or
-  // the unit's value for it last changed. A value changed and changed back
-  // stays edited, and is sent: it is the person's value.
+  // Set by the person's input in the field and by nothing else. Cleared when a
+  // save carries the field, and for good when the unit's value for the field
+  // changes: the field then shows the unit's value. A value changed and
+  // changed back stays edited, and is sent: it is the person's value.
   readonly edited: boolean
-  // A save carried the field, and the unit took it.
-  acknowledge(): void
+  // The unit's value for the field changed while the person was editing it,
+  // and replaced the edit; until the person's next input in the field.
+  readonly replaced: boolean
+  // A save carried the field with this value, and the unit took it.
+  acknowledge(sent: T): void
 }
 
 export function unitField<T>(read: () => T): UnitField<T> {
   // A derived changes only when its value does, so a new config object with
-  // the same value for this field leaves unit, and so value, as they are.
+  // the same value for this field leaves unit as it is.
   const unit = $derived.by(read)
-  // What the person types replaces value until unit changes.
-  let value = $derived(unit)
-  // The unit's value the person's edit was made over, while there is one.
-  // When the unit's value changes, value takes it, and the edit is over.
-  let editedOver = $state<{ unit: T }>()
+  // What a successful save of the field sent: the unit holds it, though the
+  // config the page shows may not say so yet (an answer from another run waits
+  // for a read of the config). It resets when the config's value changes, so
+  // that read, bringing the value this page saved, is no news to the field.
+  let saved = $derived.by((): { value: T } | undefined => {
+    void unit
+    return undefined
+  })
+  // The unit's value for the field, as far as the page knows.
+  const known = $derived(saved ? saved.value : unit)
+  // What the person types replaces value until known changes.
+  let value = $derived(known)
+  let edited = $state(false)
+  let replaced = $state(false)
+
+  // Each change of the unit's value ends the person's edit. This runs on the
+  // change itself, so the unit's value coming back to what it was before the
+  // edit does not bring the edit back.
+  $effect.pre(() => {
+    void known
+    untrack(() => {
+      if (edited) replaced = true
+      edited = false
+    })
+  })
+
   return {
     get value() {
       return value
     },
     set value(next: T) {
-      if (Object.is(next, value)) return
-      editedOver = { unit }
       value = next
+      edited = true
+      replaced = false
     },
     get edited() {
-      return editedOver !== undefined && Object.is(editedOver.unit, unit)
+      return edited
     },
-    acknowledge() {
-      editedOver = undefined
+    get replaced() {
+      return replaced
+    },
+    acknowledge(sent: T) {
+      saved = { value: sent }
+      edited = false
     },
   }
 }

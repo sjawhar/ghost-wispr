@@ -3,6 +3,7 @@
   import { patchConfig } from '../lib/config-api'
   import { setConfig } from '../lib/config.svelte'
   import { unitField } from '../lib/unit-field.svelte'
+  import ReplacedNote from './ReplacedNote.svelte'
 
   let {
     config,
@@ -26,24 +27,30 @@
   let feedback = $state('')
 
   async function save(): Promise<void> {
-    const carried: { acknowledge(): void }[] = []
+    // Each field the save carries, acknowledged with the value sent once the
+    // unit takes it.
+    const carried: (() => void)[] = []
     const voice: NonNullable<ConfigPatch['voice']> = {}
     if (enabled.edited) {
-      voice.enabled = enabled.value
-      carried.push(enabled)
+      const sent = enabled.value
+      voice.enabled = sent
+      carried.push(() => enabled.acknowledge(sent))
     }
     if (engine.edited) {
-      voice.engine = engine.value
-      carried.push(engine)
+      const sent = engine.value
+      voice.engine = sent
+      carried.push(() => engine.acknowledge(sent))
     }
     const tts: NonNullable<ConfigPatch['tts']> = {}
     if (ttsModel.edited) {
-      tts.model = ttsModel.value.trim()
-      carried.push(ttsModel)
+      const sent = ttsModel.value.trim()
+      tts.model = sent
+      carried.push(() => ttsModel.acknowledge(sent))
     }
     if (ttsVoice.edited) {
-      tts.voice = ttsVoice.value.trim()
-      carried.push(ttsVoice)
+      const sent = ttsVoice.value.trim()
+      tts.voice = sent
+      carried.push(() => ttsVoice.acknowledge(sent))
     }
     const patch: ConfigPatch = {}
     if (Object.keys(voice).length > 0) {
@@ -61,7 +68,7 @@
     feedback = ''
     try {
       const updated = await patchConfig(patch)
-      for (const field of carried) field.acknowledge()
+      for (const acknowledge of carried) acknowledge()
       setConfig(updated)
       feedback = 'Saved!'
     } catch (error) {
@@ -77,6 +84,7 @@
     <input type="checkbox" bind:checked={enabled.value} disabled={saving} />
     Enable meeting voice
   </label>
+  <ReplacedNote shown={enabled.replaced} />
 
   <fieldset class="choices">
     <legend>Voice</legend>
@@ -92,6 +100,7 @@
         {option.label}
       </label>
     {/each}
+    <ReplacedNote shown={engine.replaced} />
   </fieldset>
 
   {#if engine.value === 'tts'}
@@ -108,6 +117,7 @@
         As provider/model: the provider is one of the Model providers under Integrations. Empty
         turns text-to-speech off.
       </p>
+      <ReplacedNote shown={ttsModel.replaced} />
     </div>
     <div class="field">
       <label for="tts-voice">Text-to-speech voice</label>
@@ -118,6 +128,7 @@
         disabled={saving}
         placeholder="The model's default voice"
       />
+      <ReplacedNote shown={ttsVoice.replaced} />
     </div>
   {/if}
 

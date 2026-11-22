@@ -225,13 +225,19 @@ describe('VoiceSettings', () => {
   // sends a field edited after it, and not the one it carried.
   it('sends a field once its save is acknowledged, and a later edit again', async () => {
     const fetch = stubFetch({ config: { ...config, tts: { ...config.tts, voice: 'Puck' } } })
-    render(VoiceSettings, { config })
+    const view = render(VoiceSettings, { config })
 
     await fireEvent.input(screen.getByLabelText('Text-to-speech voice'), {
       target: { value: 'Puck' },
     })
     await save()
     expect(await screen.findByText('Saved!')).toBeTruthy()
+    // The settings page passes in the config the save stored: the person's
+    // own save replaced no edit.
+    await view.rerender({ config: { ...config, tts: { ...config.tts, voice: 'Puck' } } })
+    expect(
+      screen.queryByText('Changed on the unit or in another tab; your edit was replaced.'),
+    ).toBeNull()
     await fireEvent.click(screen.getByLabelText('Enable meeting voice'))
     await save()
 
@@ -273,6 +279,36 @@ describe('VoiceSettings', () => {
 
     expect(await screen.findByText('Saved!')).toBeTruthy()
     expect(answers).toBe(2)
+  })
+
+  // A save tells the field what the unit holds until the config says so too,
+  // and no longer: when another tab then changes the voice back, the field
+  // shows that.
+  it('takes a later change of a saved field once the config has caught up', async () => {
+    stubFetch({ config: { ...config, tts: { ...config.tts, voice: 'Puck' } } })
+    const view = render(VoiceSettings, { config })
+    const voice = screen.getByLabelText('Text-to-speech voice') as HTMLInputElement
+
+    await fireEvent.input(voice, { target: { value: 'Puck' } })
+    await save()
+    expect(await screen.findByText('Saved!')).toBeTruthy()
+    await view.rerender({ config: { ...config, tts: { ...config.tts, voice: 'Puck' } } })
+    await view.rerender({ config })
+
+    expect(voice.value).toBe('Kore')
+  })
+
+  it('says when a change from elsewhere replaced the voice being typed', async () => {
+    const view = render(VoiceSettings, { config })
+    const voice = screen.getByLabelText('Text-to-speech voice') as HTMLInputElement
+    await fireEvent.input(voice, { target: { value: 'Puck' } })
+
+    await view.rerender({ config: { ...config, tts: { ...config.tts, voice: 'Charon' } } })
+
+    expect(voice.value).toBe('Charon')
+    expect(
+      screen.getByText('Changed on the unit or in another tab; your edit was replaced.'),
+    ).toBeTruthy()
   })
 })
 
@@ -577,5 +613,37 @@ describe('SettingsPage', () => {
       expect(screen.queryByText('Settings may be out of date, reloading…')).toBeNull(),
     )
     expect(configState.config?.revision).toEqual({ run: 'run-B', count: 1 })
+  })
+
+  // The proof's case: after a restart, voice Puck is saved, and the read after
+  // it is on its way when the person types Aoede in the same field. The read
+  // lands with the Puck this page saved: that is not news to the field, so
+  // Aoede stays, and a Save sends it.
+  it('keeps typing in a field just saved when the read after it lands', async () => {
+    const unit = fakeUnit({ ...config, revision: { run: 'run-A', count: 9 } })
+    render(SettingsPage, { onBack: () => {} })
+    const voiceSection = await screen.findByTestId('voice-settings')
+    const voice = within(voiceSection).getByLabelText('Text-to-speech voice') as HTMLInputElement
+    unit.readMode = 'hold'
+
+    await fireEvent.input(voice, { target: { value: 'Puck' } })
+    await fireEvent.click(within(voiceSection).getByRole('button', { name: 'Save' }))
+    const inB = {
+      ...config,
+      tts: { ...config.tts, voice: 'Puck' },
+      revision: { run: 'run-B', count: 1 },
+    }
+    unit.current = inB
+    unit.patches[0](inB)
+    expect(await within(voiceSection).findByText('Saved!')).toBeTruthy()
+
+    await fireEvent.input(voice, { target: { value: 'Aoede' } })
+    unit.held[0]()
+    await waitFor(() => expect(configState.config?.revision).toEqual({ run: 'run-B', count: 1 }))
+    expect(voice.value).toBe('Aoede')
+    await fireEvent.click(within(voiceSection).getByRole('button', { name: 'Save' }))
+
+    await waitFor(() => expect(unit.bodies).toHaveLength(2))
+    expect(unit.bodies[1]).toEqual({ tts: { voice: 'Aoede' } })
   })
 })

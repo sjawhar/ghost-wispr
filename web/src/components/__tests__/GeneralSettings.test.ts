@@ -96,4 +96,56 @@ describe('GeneralSettings', () => {
     expect(await screen.findByText('No changes to save.')).toBeTruthy()
     expect(sent(fetch).filter((r) => r.method === 'PATCH')).toEqual([])
   })
+
+  // Sol's case: 45s is typed over 30s; another tab sets 60s, then 30s again,
+  // then 90s, which this page has not read. The unit's change ended the edit
+  // for good, so a save of only the endpointing sends only the endpointing.
+  it('does not revive an edit when the unit returns to the value it was made over', async () => {
+    const fetch = stubFetch()
+    const view = render(GeneralSettings, { config })
+    await fireEvent.input(screen.getByLabelText('Silence Timeout'), { target: { value: '45s' } })
+
+    await view.rerender({ config: { ...config, silence_timeout: '60s' } })
+    expect(value('Silence Timeout')).toBe('60s')
+    await view.rerender({ config: { ...config, silence_timeout: '30s' } })
+    expect(value('Silence Timeout')).toBe('30s')
+    await fireEvent.input(screen.getByLabelText('Transcription Endpointing (ms)'), {
+      target: { value: '500' },
+    })
+    await fireEvent.click(screen.getByRole('button', { name: 'Save' }))
+
+    await waitFor(() =>
+      expect(
+        sent(fetch)
+          .filter((r) => r.method === 'PATCH')
+          .map((r) => r.body),
+      ).toEqual([{ transcription: { endpointing: '500' } }]),
+    )
+  })
+
+  // A change from elsewhere that replaces what the person was typing says so
+  // next to the field, until the person types there again.
+  it('says when a change from elsewhere replaced what was typed, until the next input', async () => {
+    const view = render(GeneralSettings, { config })
+    const note = 'Changed on the unit or in another tab; your edit was replaced.'
+    const silence = screen.getByLabelText('Silence Timeout')
+    await fireEvent.input(silence, { target: { value: '45s' } })
+    expect(screen.queryByText(note)).toBeNull()
+
+    await view.rerender({ config: { ...config, silence_timeout: '60s' } })
+    const shown = screen.getByText(note)
+    expect(silence.closest('.field')?.contains(shown)).toBe(true)
+    // A change to a field nobody was typing in says nothing.
+    await view.rerender({
+      config: {
+        ...config,
+        silence_timeout: '60s',
+        transcription: { endpointing: '450', utterance_end_ms: '1000' },
+      },
+    })
+    expect(screen.getAllByText(note)).toHaveLength(1)
+
+    await fireEvent.input(silence, { target: { value: '50s' } })
+    expect(screen.queryByText(note)).toBeNull()
+  })
 })

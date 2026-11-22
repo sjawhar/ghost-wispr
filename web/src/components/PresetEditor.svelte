@@ -10,6 +10,8 @@
   } from '../lib/config-api'
   import { fetchDates, fetchSessions, fetchSession } from '../lib/api'
   import { setConfig } from '../lib/config.svelte'
+  import ReplacedNote from './ReplacedNote.svelte'
+  import { untrack } from 'svelte'
 
   let {
     presets,
@@ -51,23 +53,42 @@
   // made to it elsewhere since.
   let base: PresetDetail | undefined
 
+  // The open preset's fields whose typing a change from elsewhere replaced,
+  // each until the person's next input in it.
+  const noneReplaced = {
+    description: false,
+    system_prompt: false,
+    user_template: false,
+    model: false,
+  }
+  let replaced = $state<Record<keyof PresetDetail, boolean>>({ ...noneReplaced })
+
   // takeUnit gives each field the unit's value where the unit changed it since
   // base, keeps what was typed in the others, and makes preset the new base.
+  // A field that held typing other than both is marked replaced: its own save's
+  // answer, holding what was typed, replaces nothing.
   function takeUnit(preset: PresetDetail): void {
     if (base) {
-      if (preset.description !== base.description) editDesc = preset.description
-      if (preset.system_prompt !== base.system_prompt) editPrompt = preset.system_prompt
-      if (preset.user_template !== base.user_template) editTemplate = preset.user_template
-      if (preset.model !== base.model) editModel = preset.model
+      const was = base
+      const take = (key: keyof PresetDetail, typed: string): boolean => {
+        if (preset[key] === was[key]) return false
+        if (typed !== was[key] && typed !== preset[key]) replaced[key] = true
+        return true
+      }
+      if (take('description', editDesc)) editDesc = preset.description
+      if (take('system_prompt', editPrompt)) editPrompt = preset.system_prompt
+      if (take('user_template', editTemplate)) editTemplate = preset.user_template
+      if (take('model', editModel)) editModel = preset.model
     }
     base = { ...preset }
   }
 
   // The open preset as the settings page passes it in, after another
-  // section's save, say.
+  // section's save, say. Only that runs this: takeUnit reads what was typed,
+  // and typing must not make the page's copy of the preset apply again.
   $effect(() => {
     const preset = presets[expandedPreset]
-    if (!isNew && preset && base) takeUnit(preset)
+    if (!isNew && preset && base) untrack(() => takeUnit(preset))
   })
 
   // Whether the press that a click on a dialog's overlay ends began on the
@@ -94,6 +115,7 @@
     editTemplate = preset.user_template
     editModel = preset.model
     base = { ...preset }
+    replaced = { ...noneReplaced }
     isNew = false
     feedback = ''
   }
@@ -111,6 +133,7 @@
       editTemplate = preset.user_template
       editModel = preset.model
       base = { ...preset }
+      replaced = { ...noneReplaced }
       feedback = 'Changes discarded.'
     }
   }
@@ -125,6 +148,7 @@
     editModel = ''
     isNew = true
     base = undefined
+    replaced = { ...noneReplaced }
     newStep = 'describe'
     generating = false
     feedback = ''
@@ -359,17 +383,36 @@
           </div>
           <div class="field">
             <label for="preset-description">Description</label>
-            <input id="preset-description" type="text" bind:value={editDesc} disabled={saving} />
+            <input
+              id="preset-description"
+              type="text"
+              bind:value={editDesc}
+              oninput={() => (replaced.description = false)}
+              disabled={saving}
+            />
+            <ReplacedNote shown={replaced.description} />
           </div>
           <div class="field">
             <label for="preset-system-prompt">System Prompt</label>
-            <textarea id="preset-system-prompt" rows="6" bind:value={editPrompt} disabled={saving}
+            <textarea
+              id="preset-system-prompt"
+              rows="6"
+              bind:value={editPrompt}
+              oninput={() => (replaced.system_prompt = false)}
+              disabled={saving}
             ></textarea>
+            <ReplacedNote shown={replaced.system_prompt} />
           </div>
           <div class="field">
             <label for="preset-user-template">User Template</label>
-            <textarea id="preset-user-template" rows="3" bind:value={editTemplate} disabled={saving}
+            <textarea
+              id="preset-user-template"
+              rows="3"
+              bind:value={editTemplate}
+              oninput={() => (replaced.user_template = false)}
+              disabled={saving}
             ></textarea>
+            <ReplacedNote shown={replaced.user_template} />
             <span class="hint">Use {'{{transcript}}'} as placeholder</span>
           </div>
           <div class="field">
@@ -378,9 +421,11 @@
               id="preset-model"
               type="text"
               bind:value={editModel}
+              oninput={() => (replaced.model = false)}
               disabled={saving}
               placeholder="provider/model_name"
             />
+            <ReplacedNote shown={replaced.model} />
           </div>
           <div class="form-actions">
             <button class="save-btn" type="button" onclick={save} disabled={saving}>
