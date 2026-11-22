@@ -903,7 +903,13 @@ def react(kind, key, start, end):
             task = "event-%d" % n
             emit(kind="task", due=end + 300, task=task, set={"id": task, "issue_key": key, "holder": "session:agent-live", "state": "working", "asked_at": iso(end + 300), "answer_written": ""})
             if "holder-stopped" not in SCENARIO:
-                answer = end + (2500 if kind == "ask" else 6000)
+                # The first question is answered 2.5 s after it is asked. The second is the one the
+                # step cancels with "never mind", so its agent answers it only at ANSWER_CEILING_MS,
+                # past any wait of the step's (two event timeouts, 20 s here), so that only the
+                # cancel ends it however slowly a loaded machine runs the step (k6 of #162 failed on a
+                # 6 s answer the step first saw done). second-answered-fast: the agent answers it
+                # 300 ms after it is asked, before the step can read the page.
+                answer = end + (2500 if kind == "ask" else 600 if "second-answered-fast" in SCENARIO else ANSWER_CEILING_MS)
                 atag = "answer-" + task
                 emit(kind="task", due=answer, tag=atag, task=task, set={"state": "done", "answer_written": "the agent's answer"})
                 emit(kind="timing", due=answer, tag=atag, event="answer_ready", session_id="session-1")
@@ -2556,6 +2562,11 @@ launch ask-no-trace no-cancel-trace '' -- $ask_args
 # A journal that cannot be read once the answer is ready: UNKNOWN, not an answer with no timing line.
 # shellcheck disable=SC2086
 launch ask-journal-error journal-error-after-answer_ready '' -- $ask_args
+# The second question answered 300 ms after it is asked, before the step first reads the page
+# (second-answered-fast): the cancel cannot be tested, so UNKNOWN naming that, never the FAIL of a
+# missing second question.
+# shellcheck disable=SC2086
+launch ask-fast-second second-answered-fast '' -- $ask_args
 
 # barge-in: a pass; the stop rule off (the negative control); answers too short to count; a
 # backchannel that stops speech. Each answer but barge-short's ends from the step's clips
@@ -3388,6 +3399,12 @@ expect_line ask-journal-error 'UNKNOWN: voice timing log: cannot read the journa
 expect_line ask-journal-error ': Failed to read journal: Input/output error'
 expect_no_line ask-journal-error 'no answer_ready line'
 expect_restored ask-journal-error
+expect_rc ask-fast-second 2
+expect_line ask-fast-second 'PASS: ask-holder: the second question went out as Envoy event'
+expect_line ask-fast-second 'UNKNOWN: ask-holder: the agent answered question'
+expect_line ask-fast-second 'so the cancel was not tested'
+expect_no_line ask-fast-second 'FAIL: ask-holder:'
+expect_restored ask-fast-second
 
 # barge-in.
 expect_rc barge 0
