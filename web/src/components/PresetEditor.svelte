@@ -1,7 +1,13 @@
 <script lang="ts">
   import type { PresetDetail } from '../lib/config-api'
   import { SessionStatus, type SessionSummary, type Segment } from '../lib/types'
-  import { generatePreset, refinePreset, patchConfig, testPreset } from '../lib/config-api'
+  import {
+    ConfigRequestError,
+    generatePreset,
+    refinePreset,
+    patchConfig,
+    testPreset,
+  } from '../lib/config-api'
   import { fetchDates, fetchSessions, fetchSession } from '../lib/api'
   import { setConfig } from '../lib/config.svelte'
 
@@ -113,6 +119,12 @@
       feedback = 'Preset name is required'
       return
     }
+    // A new preset sends every field, so one under a name already taken
+    // would replace that preset whole.
+    if (isNew && Object.hasOwn(presets, name)) {
+      feedback = `A preset named "${name}" already exists.`
+      return
+    }
     if (!editPrompt.trim()) {
       feedback = 'System prompt is required'
       return
@@ -144,7 +156,13 @@
         expandedPreset = name
       }
     } catch (error) {
-      feedback = error instanceof Error ? error.message : 'Save failed'
+      // The unit answers 404 to a change to a preset it does not hold that
+      // does not create it: another tab or the unit deleted it.
+      if (!isNew && error instanceof ConfigRequestError && error.status === 404) {
+        feedback = 'This preset was deleted elsewhere.'
+      } else {
+        feedback = error instanceof Error ? error.message : 'Save failed'
+      }
     } finally {
       saving = false
     }

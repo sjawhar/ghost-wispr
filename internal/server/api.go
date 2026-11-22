@@ -1831,13 +1831,24 @@ type summarizationPatch struct {
 // presetPatch is one preset's fields in a PATCH. A field it leaves out keeps
 // the preset's value. The model or description it names replaces the
 // preset's, "" included: an empty model takes the override off, so the preset
-// uses summarization.model. A preset needs its system prompt and user
-// template, so "" for either keeps the preset's.
+// uses summarization.model. "" for the system prompt or user template keeps
+// the preset's.
 type presetPatch struct {
 	Description  *string `json:"description,omitempty"`
 	SystemPrompt *string `json:"system_prompt,omitempty"`
 	UserTemplate *string `json:"user_template,omitempty"`
 	Model        *string `json:"model,omitempty"`
+}
+
+// creates reports whether the patch names all four of a preset's fields,
+// with a user template, as the settings page's new preset does. A patch to a
+// preset the config does not hold creates it only then: anything less is an
+// update to a preset deleted elsewhere, and would make a preset with empty
+// fields. The template carries the transcript; the system prompt may be empty
+// (the built-in default's is, and the summarizer has its own).
+func (p *presetPatch) creates() bool {
+	return p.Description != nil && p.SystemPrompt != nil && p.Model != nil &&
+		p.UserTemplate != nil && *p.UserTemplate != ""
 }
 
 type transcriptionPatch struct {
@@ -1888,9 +1899,17 @@ func handlePatchConfig(cfgStore *config.Store) http.HandlerFunc {
 
 		// A patch it refuses changes nothing: not the config, not its file.
 		if err := cfgStore.TryUpdate(func(c *config.Config) error {
+			if err := checkPresetsHeld(c, &patch); err != nil {
+				return err
+			}
 			return applyConfigPatch(c, &patch)
 		}); err != nil {
-			writeJSONError(w, http.StatusBadRequest, err.Error())
+			status := http.StatusBadRequest
+			var notHeld presetNotHeldError
+			if errors.As(err, &notHeld) {
+				status = http.StatusNotFound
+			}
+			writeJSONError(w, status, err.Error())
 			return
 		}
 
@@ -2011,6 +2030,30 @@ func applyConfigPatch(c *config.Config, p *configPatch) error {
 				return fmt.Errorf("invalid voice.engine %q: supported engines are tts, gptlive, dgagent", *p.Voice.Engine)
 			}
 		}
+	}
+	return nil
+}
+
+// presetNotHeldError is a patch to a preset the config does not hold that does
+// not create it: an update to a preset deleted elsewhere, or an incomplete new
+// preset.
+type presetNotHeldError struct{ name string }
+
+func (e presetNotHeldError) Error() string {
+	return fmt.Sprintf("summarization preset %q does not exist; a new preset names its description, system_prompt, user_template and model, with a user_template", e.name)
+}
+
+// checkPresetsHeld refuses a patch that changes a preset c does not hold
+// without creating it (presetPatch.creates).
+func checkPresetsHeld(c *config.Config, p *configPatch) error {
+	if p.Summarization == nil {
+		return nil
+	}
+	for name, preset := range p.Summarization.Presets {
+		if _, held := c.Summarization.Presets[name]; preset == nil || held || preset.creates() {
+			continue
+		}
+		return presetNotHeldError{name: name}
 	}
 	return nil
 }

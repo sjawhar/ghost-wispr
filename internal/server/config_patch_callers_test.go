@@ -22,6 +22,11 @@ var settingsPageBodies = map[string]string{
 	"VoiceSettings: voice and its tts": `{"voice":{"enabled":true,"engine":"tts"},"tts":{"model":"vertex-us/gemini-3.8-flash-tts","voice":"Puck"}}`,
 }
 
+// heldPreset creates the standup preset the page's preset bodies change: the
+// page saves a preset's fields only to a preset it shows, one the unit holds,
+// and a change to a preset the unit does not hold is a 404.
+const heldPreset = `{"summarization":{"presets":{"standup":{"description":"Stand-up","system_prompt":"Summarize briefly","user_template":"{{transcript}}","model":""}}}}`
+
 // TestPatchConfigTakesEveryBodyTheSettingsPageSends fails if PATCH
 // /api/config refuses a body the settings page sends, or takes a field it
 // does not know (the control: api_keys, which the page no longer sends).
@@ -30,6 +35,9 @@ func TestPatchConfigTakesEveryBodyTheSettingsPageSends(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			cfgStore, _ := newProvidersConfigStore(t)
 			h := newConfigHandler(t, cfgStore, &ControlHooks{})
+			if rr := patchConfig(h, heldPreset); rr.Code != http.StatusOK {
+				t.Fatalf("PATCH %s = %d %s, want 200", heldPreset, rr.Code, rr.Body.String())
+			}
 			if rr := patchConfig(h, body); rr.Code != http.StatusOK {
 				t.Fatalf("PATCH %s = %d %s, want 200", body, rr.Code, rr.Body.String())
 			}
