@@ -337,7 +337,8 @@ began with a key a save has since replaced is not kept as the provider's last ch
   and `dgagent_provider`. It and each `PATCH /api/config` answer carry `revision: {run, count}`, the
   state of the config they hold: `count` rises by one with each change in this run of the unit,
   which `run` names. Of two answers in one run, the one with the higher count holds the later state,
-  whichever order they arrive in; the settings page keeps that one.
+  whichever order they arrive in; the settings page keeps that one. It takes an answer from a new
+  run, as after a restart, and drops any later answer from a run it has seen replaced.
 - `PATCH /api/config` takes `provider_keys: {"<provider>": "<key>"}` for `api_key` providers and
   writes each key into `.env` under the provider's `auth.env`; any other provider or a key containing
   control characters is a 400. It also takes `tts: {model, voice}`, `summarization: {model, presets}`

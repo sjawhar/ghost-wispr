@@ -18,15 +18,22 @@ export const configState = $state<ConfigState>({
 // be on their way at once, and their answers land in any order; of two
 // answers in one run of the unit, the one with the lower count holds the
 // older state, so when it lands after the other it is dropped. An answer from
-// another run, as after a restart, is taken.
+// a new run, as after a restart, is taken, and the run it replaces goes into
+// replacedRuns: that run is over, so a late answer from it holds a state from
+// before the restart, whatever its count, and is dropped.
 let shownRevision: ConfigRevision | undefined
+const replacedRuns = new Set<string>()
 
 export function setConfig(config: ConfigResponse): void {
   const revision = config.revision
-  if (revision && shownRevision?.run === revision.run && revision.count < shownRevision.count) {
-    return
+  if (revision) {
+    if (replacedRuns.has(revision.run)) return
+    if (shownRevision?.run === revision.run && revision.count < shownRevision.count) return
+    if (shownRevision && shownRevision.run !== revision.run) {
+      replacedRuns.add(shownRevision.run)
+    }
+    shownRevision = revision
   }
-  shownRevision = revision ?? shownRevision
   configState.loaded = true
   configState.config = config
   configState.error = ''
@@ -42,6 +49,7 @@ export function setError(error: string): void {
 
 export function resetConfigState(): void {
   shownRevision = undefined
+  replacedRuns.clear()
   configState.loaded = false
   configState.saving = false
   configState.error = ''
