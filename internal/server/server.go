@@ -143,6 +143,23 @@ func unitOnlyWarning(n int) string {
 	return fmt.Sprintf("%d sessions are kept on this unit only, because their Drive folder is gone or unreadable; retry sync once the folder is back, or, if a session's Drive folder was deleted on purpose, remove the session from this unit", n)
 }
 
+// envoyOffNotice is the GET /api/status notice of a config that names an
+// Envoy hub with Envoy off, as the office Pi has while the hub moves
+// (dispatch://INFRA-3862), and "" otherwise. Nothing goes out, and a start
+// with Envoy on again publishes each summary completed meanwhile. A notice, not
+// a warning: the rollout's check and the acceptance scripts need warnings
+// empty, and Envoy off is on purpose.
+func envoyOffNotice(cfg *config.Config) string {
+	if cfg.EnvoyEnabled || strings.TrimSpace(cfg.EnvoyHubURL) == "" {
+		return ""
+	}
+	notice := "Envoy is off (envoy_enabled: false): no session event goes to the Envoy hub, and each completed summary waits until Envoy is on again."
+	if strings.TrimSpace(cfg.Concierge.EnvoyURL) == "" {
+		notice += " The voice cannot ask an issue's agent: no concierge.envoy_url."
+	}
+	return notice
+}
+
 type ControlHooks struct {
 	// Pause stops capture. A non-nil error means capture stopped but the
 	// stopped state was not persisted.

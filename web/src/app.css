@@ -769,6 +769,26 @@ h1 {
   margin-top: 0.2rem;
 }
 
+/* ── Notices: a state the configuration chose, not a fault ── */
+
+.notices-banner {
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--line-strong);
+  border-radius: 0.4rem;
+  padding: 0.5rem 0.65rem;
+  margin-top: 0.55rem;
+}
+
+.notice-item {
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.8rem;
+}
+
+.notice-item + .notice-item {
+  margin-top: 0.2rem;
+}
+
 /* ── Responsive ── */
 
 .load-more {

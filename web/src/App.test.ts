@@ -101,6 +101,32 @@ describe('App', () => {
     expect(configRequests()).toHaveLength(2)
   })
 
+  // A notice from GET /api/status, such as Envoy turned off on purpose, shows
+  // on the page apart from the warnings banner: it failed while the page read
+  // only warnings, so the unit said nothing of Envoy being off.
+  it('shows the status notices apart from the warnings', async () => {
+    const notice =
+      'Envoy is off (envoy_enabled: false): no session event goes to the Envoy hub, and each completed summary waits until Envoy is on again.'
+    stubUnit(
+      rules,
+      {},
+      {
+        '/api/status': {
+          paused: false,
+          capturing: true,
+          capture_state: '',
+          warnings: [],
+          notices: [notice],
+        },
+      },
+    )
+    render(App)
+
+    const notices = await screen.findByTestId('notices-banner')
+    expect(within(notices).getByText(notice)).toBeTruthy()
+    expect(screen.queryByTestId('warnings-banner')).toBeNull()
+  })
+
   // The session's page shows its questions to agents with its other data,
   // reads them again when an answer lands and when it is spoken, and shows
   // none once the session is deleted: it failed while the page showed none.

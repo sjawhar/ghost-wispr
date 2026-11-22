@@ -753,6 +753,22 @@ for case in \
   [[ ! -s $TEST_LOG ]] || fail "--models changed the Pi before it refused $name: $(<"$TEST_LOG")"
   [[ $(models_files) == "$before" ]] || fail "--models changed a file when it refused $name"
 done
+# An unreadable .env stops --models too, before it writes anything: the check cannot say it sets no
+# Envoy override, and a read through a pipe must not pass for a clean one.
+printf 'old: config\n' >"$models_dir/ghost-wispr.yaml"
+printf '%s\n' GHOST_WISPR_DEEPGRAM_API_KEY=dg-1 >"$models_dir/.env"
+before=$(models_files)
+chmod 000 "$models_dir/.env"
+status=0
+run_models || status=$?
+# The check itself fails, not only the later .env render, which would also stop the step.
+! bash -c 'source "$1" && envoy_on_env_names "$2"' _ "$repo_root/deploy/pi/provision.sh" "$models_dir/.env" >/dev/null 2>&1 \
+  || fail 'envoy_on_env_names read an unreadable .env as one that sets no Envoy override'
+chmod 600 "$models_dir/.env"
+((status != 0)) || fail "--models installed with an unreadable .env: $(<"$work_dir/out")"
+grep -qF "could not read $models_dir/.env" "$work_dir/out" || fail "--models did not say it could not read .env: $(<"$work_dir/out")"
+[[ ! -s $TEST_LOG ]] || fail "--models changed the Pi before it refused an unreadable .env: $(<"$TEST_LOG")"
+[[ $(models_files) == "$before" ]] || fail "--models changed a file when it refused an unreadable .env"
 # The control: a .env that names neither installs, with the hub's URL, a commented-out override and
 # a longer name that starts with one.
 printf '%s\n' GHOST_WISPR_DEEPGRAM_API_KEY=dg-1 'GHOST_WISPR_ENVOY_HUB_URL=http://hub.example.test:9020' \

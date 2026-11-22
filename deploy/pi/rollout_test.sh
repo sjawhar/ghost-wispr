@@ -480,6 +480,14 @@ for case in \
   [[ $out != *'hub.example.test'* && $out != *'first line'* && $out != *dg-1* ]] \
     || fail "install printed a value from .env when it refused $name: $out"
 done
+# An unreadable .env stops install too, before any change: the check cannot say it sets no Envoy
+# override, and a read through a pipe must not pass for a clean one.
+reset
+chmod 000 "$deploy/.env"
+rollout install
+chmod 600 "$deploy/.env"
+expect_stop 'install with an unreadable .env' "cannot read $deploy/.env on the Pi"
+refused_before_change 'an unreadable .env'
 # The control: a .env that names neither installs, with the hub's URL, a commented-out override and
 # a longer name that starts with one.
 reset

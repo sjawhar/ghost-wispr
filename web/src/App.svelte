@@ -20,6 +20,7 @@
     setCaptureState,
     setDates,
     setLiveSegmentsForSession,
+    setNotices,
     setPaused,
     setPresets,
     setSessionDetailIfCurrent,
@@ -196,6 +197,7 @@
         setCaptureState(status.capture_state)
         setCapturing(status.capturing)
         setWarnings(status.warnings)
+        setNotices(status.notices ?? [])
         setDates(dates)
         setPresets(presets)
 
@@ -250,6 +252,7 @@
           setCaptureState(status.capture_state)
           setCapturing(status.capturing)
           setWarnings(status.warnings)
+          setNotices(status.notices ?? [])
         })
         .catch((error) => {
           void error
@@ -321,6 +324,14 @@
       <aside class="warnings-banner" data-testid="warnings-banner">
         {#each visibleWarnings as warning (warning)}
           <p class="warning-item">{warning}</p>
+        {/each}
+      </aside>
+    {/if}
+
+    {#if appState.notices.length > 0}
+      <aside class="notices-banner" data-testid="notices-banner">
+        {#each appState.notices as notice (notice)}
+          <p class="notice-item">{notice}</p>
         {/each}
       </aside>
     {/if}

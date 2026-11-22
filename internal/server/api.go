@@ -1368,6 +1368,13 @@ func registerAPIRoutes(mux routeMux, store SessionStore, controls *ControlHooks,
 		if warnings == nil {
 			warnings = []string{}
 		}
+		notices := []string{}
+		if cfgStore != nil {
+			cfg := cfgStore.Get()
+			if notice := envoyOffNotice(&cfg); notice != "" {
+				notices = append(notices, notice)
+			}
+		}
 		var activeSessionID string
 		var activeSessionStartedAt string
 		if controls.ActiveSession != nil {
@@ -1383,6 +1390,7 @@ func registerAPIRoutes(mux routeMux, store SessionStore, controls *ControlHooks,
 			"capturing":                 capturing,
 			"capture_state":             captureState,
 			"warnings":                  warnings,
+			"notices":                   notices,
 			"kept_raw_recordings":       kept.Count,
 			"kept_raw_bytes":            kept.Bytes,
 			"kept_raw_by_hand":          keptByHand,
