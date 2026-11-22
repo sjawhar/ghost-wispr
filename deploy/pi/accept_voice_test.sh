@@ -2128,13 +2128,34 @@ floor_decided() {
   floor_cases=$((floor_cases + 1))
 }
 
+# The driver's NOTE for a stop whose next answer it times against its chime, as a whole line.
+readonly chime_note_re='^NOTE: playback-cancel stop [0-9]+: the next answer is timed against its chime in the same recording$'
+
 # expect_timed_against_chime NAME: the case's answers were timed against their chimes in the same
-# recording, and none against first_audio, the threshold whose window the recording's early bounds
-# can cover on a loaded machine (#146's h3 and #149's g1 read UNKNOWN there).
+# recording (the driver's NOTE, whole), and none against first_audio, the threshold whose window the
+# recording's early bounds can cover on a loaded machine (#146's h3 and #149's g1 read UNKNOWN there).
 expect_timed_against_chime() {
-  expect_line "$1" "$chime_timed_note"
+  grep -Eq -- "$chime_note_re" "$root/$1/out" \
+    || check_failed "$1: no line is the driver's NOTE that a next answer is timed against its chime; output: $(tr '\n' '|' <"$root/$1/out")"
   expect_no_line "$1" "so a sound after its chime is timed against the answer's first_audio"
   expect_no_line "$1" "from the next answer's first audio, after the chime"
+}
+
+# chime_begin and chime_counted NAME: a chime case's own assertions call chime_begin before their
+# chime-relative checks and chime_counted after them. chime_counted counts NAME (chime_cases) only
+# when none of those checks failed and NAME's output holds the driver's NOTE, whole. Nothing else
+# counts, and no output is scanned for it: a case that prints the NOTE but whose assertions check no
+# chime verdict (cancel-underrun, which FAILs on its underrun) must not stand for the chime path
+# (Sol's reviews of #156 at 21b41d02 and 428ab1a8). A run that counts none fails (at the end).
+chime_cases=0
+chime_failures=0
+chime_begin() {
+  chime_failures=$failures
+}
+chime_counted() {
+  if ((failures == chime_failures)) && grep -Eq -- "$chime_note_re" "$root/$1/out"; then
+    chime_cases=$((chime_cases + 1))
+  fi
 }
 
 # capture_unbroken NAME: true when the fake arecord did not overrun in the case, so that the case may
@@ -2144,8 +2165,7 @@ expect_timed_against_chime() {
 # name, the case falls back to first_audio: capture_unbroken prints a NOTE, checks the fallback's
 # NOTE, and is false, and the caller holds the case to what the fallback can say. It counts nothing:
 # a case with no overrun can still fall back by design (no audible lines, a disruption), so only a
-# case whose output shows the chime timing an answer counts (chime_timed, at the end; Sol's review of
-# #156 at 21b41d02).
+# chime case whose own chime-relative checks passed counts (chime_counted).
 capture_unbroken() {
   local overran=false noted=false
   [[ -s $root/$1/state/overruns ]] && overran=true
@@ -2160,23 +2180,17 @@ capture_unbroken() {
   fi
 }
 
-# chime_timed NAME: NAME's output shows the chime path: the driver's NOTE that a next answer is timed
-# against its chime in the same recording, which it prints before any verdict on that stop. A run in
-# which no case shows it tested none of the chime path, and fails (at the end).
-readonly chime_timed_note='the next answer is timed against its chime in the same recording'
-chime_timed() {
-  grep -Fq -- "$chime_timed_note" "$root/$1/out" 2>/dev/null
-}
-
 # expect_load_case NAME: a load case. With no overrun, it must PASS, each answer timed against its
 # chime: an UNKNOWN there stays a failure of the acceptance line. Only in a run where the fake truly
 # overran (capture_unbroken) may it fall back to first_audio, and then it must not FAIL; it may read
 # UNKNOWN, #146's stated limit, the honest answer across a break in the recording.
 expect_load_case() {
   if capture_unbroken "$1"; then
+    chime_begin
     expect_rc "$1" 0
     expect_line "$1" "PASS: playback-cancel: no stop's speech was heard at the rig microphone 20 ms after it"
     expect_timed_against_chime "$1"
+    chime_counted "$1"
     return
   fi
   expect_rc "$1" 0 2
@@ -3261,9 +3275,11 @@ expect_line cancel-unsure 'UNKNOWN: playback-cancel stop 1: the rig microphone d
 expect_no_line cancel-unsure "PASS: playback-cancel: no stop's speech was heard"
 expect_restored cancel-unsure
 if floor_decided cancel-slow-read; then
+  chime_begin
   expect_rc cancel-slow-read 0
   expect_line cancel-slow-read "PASS: playback-cancel: no stop's speech was heard at the rig microphone 20 ms after it"
   expect_timed_against_chime cancel-slow-read
+  chime_counted cancel-slow-read
 else
   # An overrun leaves the start-only bounds, 1.5 s early here: cancel-unsure's case, which the
   # answer's timing does not reach.
@@ -3380,26 +3396,36 @@ expect_line cancel-leak-into-chime "FAIL: playback-cancel stop 1: the sound at t
 expect_restored cancel-leak-into-chime
 expect_rc cancel-leak-after-chime 1
 expect_line cancel-leak-after-chime "FAIL: playback-cancel stop 1: a sound at the rig microphone starts "
-capture_unbroken cancel-leak-after-chime \
-  && expect_line cancel-leak-after-chime "before the next question's answer can be heard there (timed against its chime in the same recording)"
+if capture_unbroken cancel-leak-after-chime; then
+  chime_begin
+  expect_line cancel-leak-after-chime "before the next question's answer can be heard there (timed against its chime in the same recording)"
+  chime_counted cancel-leak-after-chime
+fi
 expect_restored cancel-leak-after-chime
 expect_rc cancel-leak-before-first 1
 expect_line cancel-leak-before-first "FAIL: playback-cancel stop 1: a sound at the rig microphone starts "
-capture_unbroken cancel-leak-before-first \
-  && expect_line cancel-leak-before-first "before the next question's answer can be heard there (timed against its chime in the same recording)"
+if capture_unbroken cancel-leak-before-first; then
+  chime_begin
+  expect_line cancel-leak-before-first "before the next question's answer can be heard there (timed against its chime in the same recording)"
+  chime_counted cancel-leak-before-first
+fi
 expect_no_line cancel-leak-before-first "PASS: playback-cancel: no stop's speech was heard"
 expect_restored cancel-leak-before-first
 # A leak inside the speaker's queue is seen only by the chime path; after an overrun the fallback can
 # miss it (#146's stated limit), so the case then says only that it fell back.
 if capture_unbroken cancel-leak-in-queue; then
+  chime_begin
   expect_rc cancel-leak-in-queue 1
   expect_line cancel-leak-in-queue "before the next question's answer can be heard there (timed against its chime in the same recording)"
   expect_no_line cancel-leak-in-queue "PASS: playback-cancel: no stop's speech was heard"
+  chime_counted cancel-leak-in-queue
 fi
 expect_restored cancel-leak-in-queue
 if capture_unbroken cancel-leak-in-queue-latency; then
+  chime_begin
   expect_rc cancel-leak-in-queue-latency 1
   expect_line cancel-leak-in-queue-latency "before the next question's answer can be heard there (timed against its chime in the same recording)"
+  chime_counted cancel-leak-in-queue-latency
 fi
 expect_restored cancel-leak-in-queue-latency
 expect_load_case cancel-latency
@@ -3428,9 +3454,11 @@ capture_unbroken cancel-leak-in-queue-disrupted \
 expect_no_line cancel-leak-in-queue-disrupted "FAIL: playback-cancel"
 expect_restored cancel-leak-in-queue-disrupted
 if capture_unbroken cancel-leak-in-queue-own-audible; then
+  chime_begin
   expect_rc cancel-leak-in-queue-own-audible 1
   expect_line cancel-leak-in-queue-own-audible "before the next question's answer can be heard there (timed against its chime in the same recording)"
   expect_no_line cancel-leak-in-queue-own-audible "PASS: playback-cancel: no stop's speech was heard"
+  chime_counted cancel-leak-in-queue-own-audible
 fi
 expect_restored cancel-leak-in-queue-own-audible
 expect_rc cancel-capture-gap 0 2
@@ -3607,19 +3635,17 @@ fi
 expect_restored joined-words-slow-read
 ((floor_cases > 0)) \
   || check_failed "no case was timed by the anchors' bound: in every floor case the fake arecord reported an overrun, so the run tested none of it"
-# Only a case whose output shows the chime timing an answer counts. Sol's control (review of #156 at
-# 21b41d02): a chime case whose capture overran (cancel-capture-gap) and the cases that fall back by
-# design with no overrun show none, so a run of only these counts none and fails this check.
-chime_cases=0
-for case_out in "$root"/*/out; do
-  case_dir=${case_out%/out}
-  chime_timed "${case_dir##*/}" && chime_cases=$((chime_cases + 1))
-done
+# Only the chime cases count, each in its own assertions after its chime-relative checks
+# (chime_counted), never a scan of every case's output: cancel-underrun prints the NOTE, but its
+# assertions check its underrun FAIL, not a chime verdict (Sol's review of #156 at 428ab1a8). The
+# cases that fall back by design, and a chime case whose capture overran (cancel-capture-gap), must
+# not time an answer against its chime at all.
 for name in cancel-capture-gap cancel-no-audible cancel-leak-in-queue-no-audible cancel-leak-in-queue-disrupted; do
-  ! chime_timed "$name" || check_failed "$name: its output shows a next answer timed against its chime, though the case falls back to first_audio"
+  ! grep -Eq -- "$chime_note_re" "$root/$name/out" 2>/dev/null \
+    || check_failed "$name: its output shows a next answer timed against its chime, though the case falls back to first_audio"
 done
 ((chime_cases > 0)) \
-  || check_failed "no case's output shows a next answer timed against its chime: the run tested none of the chime path"
+  || check_failed "no chime case's own checks passed with a next answer timed against its chime: the run tested none of the chime path"
 printf 'NOTE: %d cases decided by the chime path\n' "$chime_cases"
 
 # The driver compares times on the monotonic clock only: bash's wall clock serves journalctl's
