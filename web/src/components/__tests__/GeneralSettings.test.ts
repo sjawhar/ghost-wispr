@@ -148,4 +148,36 @@ describe('GeneralSettings', () => {
     await fireEvent.input(silence, { target: { value: '50s' } })
     expect(screen.queryByText(note)).toBeNull()
   })
+
+  // Nothing was replaced when the new value is what the person typed.
+  it('says nothing when a change from elsewhere brings the value that was typed', async () => {
+    const view = render(GeneralSettings, { config })
+    await fireEvent.input(screen.getByLabelText('Silence Timeout'), { target: { value: '60s' } })
+
+    await view.rerender({ config: { ...config, silence_timeout: '60s' } })
+
+    expect(value('Silence Timeout')).toBe('60s')
+    expect(
+      screen.queryByText('Changed on the unit or in another tab; your edit was replaced.'),
+    ).toBeNull()
+  })
+
+  // The proof's case: the person's own save is on its way when another
+  // answer brings the value it sent. Nothing was replaced, then or when the
+  // save's own answer lands.
+  it("says nothing when another answer carries the person's own save on its way", async () => {
+    const answer = deferredFetch()
+    const view = render(GeneralSettings, { config })
+    await fireEvent.input(screen.getByLabelText('Silence Timeout'), { target: { value: '47s' } })
+    await fireEvent.click(screen.getByRole('button', { name: 'Save' }))
+
+    await view.rerender({ config: { ...config, silence_timeout: '47s' } })
+    answer(new Response(JSON.stringify({ ...config, silence_timeout: '47s' })))
+    expect(await screen.findByText('Saved!')).toBeTruthy()
+
+    expect(value('Silence Timeout')).toBe('47s')
+    expect(
+      screen.queryByText('Changed on the unit or in another tab; your edit was replaced.'),
+    ).toBeNull()
+  })
 })

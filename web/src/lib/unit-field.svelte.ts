@@ -42,14 +42,18 @@ export function unitField<T>(read: () => T): UnitField<T> {
   let value = $derived(known)
   let edited = $state(false)
   let replaced = $state(false)
+  // What the person last typed in the field.
+  let typed: T | undefined
 
   // Each change of the unit's value ends the person's edit. This runs on the
   // change itself, so the unit's value coming back to what it was before the
-  // edit does not bring the edit back.
+  // edit does not bring the edit back. The edit was replaced only if the new
+  // value is not what the person typed: one's own save on its way, carried by
+  // another answer, or another tab setting the same value, replaces nothing.
   $effect.pre(() => {
-    void known
+    const incoming = known
     untrack(() => {
-      if (edited) replaced = true
+      if (edited && !Object.is(incoming, typed)) replaced = true
       edited = false
     })
   })
@@ -60,6 +64,7 @@ export function unitField<T>(read: () => T): UnitField<T> {
     },
     set value(next: T) {
       value = next
+      typed = next
       edited = true
       replaced = false
     },
