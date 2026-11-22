@@ -209,8 +209,9 @@ jobs:
         timeout-minutes: 15
         run: bash deploy/pi/accept_slice3_test.sh
 
+      # accept_voice_test.sh alone takes about 9 minutes on a GitHub runner; the step gets twice that.
       - name: Deploy script tests
-        timeout-minutes: 10
+        timeout-minutes: 20
         run: |
           # provision.sh stages the bundle in the service user's runtime directory.
           sudo install -d -o "$(id -u)" -g "$(id -g)" -m 0700 "/run/user/$(id -u)"
