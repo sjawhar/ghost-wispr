@@ -158,7 +158,7 @@ export function deferredFetch(): (answer: Response) => void {
     vi.fn((input: RequestInfo | URL) =>
       String(input).startsWith('/api/providers')
         ? Promise.resolve(new Response(JSON.stringify({ providers: [] })))
-        : pending,
+        : pending.then((answer) => answer.clone()),
     ),
   )
   return give

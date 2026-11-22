@@ -69,8 +69,8 @@
     // parser error. While GC is on the limits show, so the page says what each
     // needs; while it is off they are hidden, and one that is not a limit is
     // not sent.
-    const ageSet = Number.isInteger(gcMaxAgeDays.value) && gcMaxAgeDays.value >= 0
-    const sizeSet = Number.isInteger(gcMaxAudioSizeMB.value) && gcMaxAudioSizeMB.value >= 0
+    const ageSet = Number.isSafeInteger(gcMaxAgeDays.value) && gcMaxAgeDays.value >= 0
+    const sizeSet = Number.isSafeInteger(gcMaxAudioSizeMB.value) && gcMaxAudioSizeMB.value >= 0
     if (gcEnabled.value && (!ageSet || !sizeSet)) {
       gcFeedback = 'Each GC limit needs a whole number, 0 or more; 0 means no limit.'
       return

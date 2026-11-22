@@ -117,18 +117,20 @@ describe('IntegrationsSettings', () => {
 
   // The unit reads a cleared field's null as no value (a save of it would
   // change nothing while the page said "Saved!"), refuses a negative limit,
-  // and refuses a fraction with a parser error.
+  // and refuses a fraction or a number past its integers with a parser error.
   it.each([
-    ['left empty', ''],
-    ['negative', '-5'],
-    ['a fraction', '2.5'],
-  ])('saves no GC limit %s, and says what it needs', async (_, entered) => {
+    ['Delete sessions older than (days)', ''],
+    ['Delete sessions older than (days)', '-5'],
+    ['Delete sessions older than (days)', '2.5'],
+    ['Delete sessions older than (days)', '1e21'],
+    ['Audio budget (MB)', ''],
+    ['Audio budget (MB)', '-1'],
+    ['Audio budget (MB)', '3.5'],
+  ])('saves no %s of %j, and says what it needs', async (label, entered) => {
     const fetch = stubFetch()
     const { container } = render(IntegrationsSettings, { config })
 
-    await fireEvent.input(screen.getByLabelText('Delete sessions older than (days)'), {
-      target: { value: entered },
-    })
+    await fireEvent.input(screen.getByLabelText(label), { target: { value: entered } })
     const gcSection = container.querySelector('.gc-section') as HTMLElement
     await fireEvent.click(within(gcSection).getByRole('button', { name: 'Save' }))
 
@@ -195,6 +197,7 @@ describe('IntegrationsSettings', () => {
     expect(sync.disabled).toBe(true)
     answer(new Response(JSON.stringify(config)))
     await waitFor(() => expect(folder.disabled || sync.disabled).toBe(false))
+    expect(within(gdrive).getAllByText('Saved!')).toHaveLength(2)
   })
 })
 

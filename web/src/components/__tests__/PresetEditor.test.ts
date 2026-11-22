@@ -285,6 +285,38 @@ describe('PresetEditor', () => {
     expect(sent(fetch).filter((r) => r.method === 'PATCH')).toEqual([])
   })
 
+  // Every object has toString and constructor; no preset does here.
+  it('creates a preset under a name every object has built in', async () => {
+    const fetch = stubFetch()
+    render(PresetEditor, { presets })
+    await fireEvent.click(screen.getByRole('button', { name: '+ Add Preset' }))
+    await fireEvent.input(field('Name'), { target: { value: 'toString' } })
+    await fireEvent.click(screen.getByRole('button', { name: 'Edit manually' }))
+    await fireEvent.input(field('System Prompt'), { target: { value: 'Summarize.' } })
+    await fireEvent.click(screen.getByRole('button', { name: 'Create' }))
+
+    await waitFor(() =>
+      expect(
+        sent(fetch)
+          .filter((r) => r.method === 'PATCH')
+          .map((r) => r.body),
+      ).toEqual([
+        {
+          summarization: {
+            presets: {
+              toString: {
+                description: '',
+                system_prompt: 'Summarize.',
+                user_template: '{{transcript}}',
+                model: '',
+              },
+            },
+          },
+        },
+      ]),
+    )
+  })
+
   it.each(dialogs)(
     'keeps the $button dialog open on a click inside it',
     async ({ button, heading }) => {

@@ -169,7 +169,7 @@
     }
     // A new preset sends every field, so one under a name already taken
     // would replace that preset whole.
-    if (isNew && name in presets) {
+    if (isNew && Object.hasOwn(presets, name)) {
       feedback = `A preset named "${name}" already exists.`
       return
     }
