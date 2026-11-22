@@ -104,7 +104,10 @@ EOF
 # that runs to the file's end has a late bound. The driver sends it SIGTERM once arecord has ended.
 # A sampler that has already seen arecord end and left its loop may get that SIGTERM while it reads
 # the size for its last anchor: here os.stat sends it there on purpose, and the last anchor must
-# still be written, as it is with no SIGTERM at all.
+# still be written, as it is with no SIGTERM at all. The writer starts once the sampler says
+# "ready", as the driver starts arecord, so that a read comes before the header however loaded the
+# machine: started at once, a writer that got ahead of a held-off sampler made it say "no read came
+# before the capture" and write no last anchor (Sol's run of #162 at 15c3a91f).
 python3 - "$work_dir/mono.py" "$work_dir" <<'EOF' || fail "mono_py record lost its last anchor (above)"
 import contextlib, os, signal, subprocess, sys, time
 src, base = sys.argv[1], sys.argv[2]
@@ -125,9 +128,15 @@ for late_term in (False, True):
         pass
     sys.argv = argv
     path, anchors, pidfile = (os.path.join(work, name) for name in ("r.wav", "anchors", "pid"))
-    writer = subprocess.Popen([sys.executable, "-c", writer_code, path])
-    with open(pidfile, "w") as f:
-        f.write(str(writer.pid))
+    started = {}
+
+    def said(*words, **_):
+        if words and words[0] == "ready" and not started:
+            started["writer"] = subprocess.Popen([sys.executable, "-c", writer_code, path])
+            with open(pidfile + ".tmp", "w") as f:
+                f.write(str(started["writer"].pid))
+            os.replace(pidfile + ".tmp", pidfile)
+    ns["print"] = said
     real_alive, real_stat = ns["alive"], os.stat
     state = {"ended": False, "sent": False}
 
@@ -153,7 +162,11 @@ for late_term in (False, True):
     finally:
         os.stat = real_stat
         signal.signal(signal.SIGTERM, signal.SIG_DFL)
-    writer.wait()
+    if "writer" in started:
+        started["writer"].wait()
+    else:
+        failures.append("the sampler never said ready, so no writer started")
+        continue
     what = "with the SIGTERM in the last read" if late_term else "with no SIGTERM"
     if late_term and not state["sent"]:
         failures.append("the probe sent no SIGTERM in the sampler's last read")
@@ -612,25 +625,41 @@ failures = []
 # #149 at 9b3d27cb): a status with no trigger_time, or one that is not a number, shows nothing about
 # a restart, so no anchor keeps its floor and the sampler names the trigger it could not read. So
 # do inf, nan and a time not in the kernel's form (Sol's review of #149 at 44738566). Two triggers
-# 1 ns apart are a restart (restarted-1ns): a float holds neither apart.
+# 1 ns apart are a restart (restarted-1ns): a float holds neither apart. Seconds with a redundant
+# leading zero (padded-trigger) or past signed 64 bits (huge-trigger) are not what "%lld" prints, so
+# NO-TRIGGER too (Sol's review of #159 at 75a99ec1); seconds of 0 and of the largest signed 64-bit
+# value are (zero-trigger, max-trigger), so the substream runs on.
 # late-pid (c28 of #156): on a loaded machine the driver can write arecord's pid after arecord's
-# first sample. The sampler must go on taking anchors, a floor once it can read the substream's
-# state by the pid, and the last one, of the whole file, once arecord has ended; it must not stop.
+# first sample. The sampler must go on taking anchors, and the last one, of the whole file, once
+# arecord has ended; it must not stop. But it cannot read the substream's state while those samples
+# land, and a restart then would go unseen (restarted-before-pid: the trigger changes 0.6 s on,
+# between the first samples and the pid), so no anchor keeps its floor, and it says UNWATCHED.
 t1, t2 = "1700000000.000000001", "1700000000.000000002"
-no_trigger = ("no-trigger", "bad-trigger", "inf-trigger", "nan-trigger", "short-trigger")
+no_trigger = ("no-trigger", "bad-trigger", "inf-trigger", "nan-trigger", "short-trigger", "padded-trigger", "huge-trigger")
+running = ("running", "closed-at-end", "zero-trigger", "max-trigger")
+unwatched = ("late-pid", "restarted-before-pid")
 for case, states in (("running", ["RUNNING " + t1] * 4), ("closed", ["RUNNING " + t1, "closed"]),
                      ("xrun", ["RUNNING " + t1, "XRUN " + t1]), ("restarted", ["RUNNING " + t1, "RUNNING 1700000001.000000001"]),
                      ("restarted-1ns", ["RUNNING " + t1, "RUNNING " + t2]),
                      ("closed-at-end", ["RUNNING " + t1] * 5 + ["closed"]),
                      ("no-trigger", ["RUNNING -"] * 4), ("bad-trigger", ["RUNNING soon"] * 4),
                      ("inf-trigger", ["RUNNING inf"] * 4), ("nan-trigger", ["RUNNING nan"] * 4),
-                     ("short-trigger", ["RUNNING 1700000000.5"] * 4), ("late-pid", ["RUNNING " + t1] * 4)):
+                     ("short-trigger", ["RUNNING 1700000000.5"] * 4), ("late-pid", ["RUNNING " + t1] * 4),
+                     ("padded-trigger", ["RUNNING 0001.000000001"] * 4),
+                     ("huge-trigger", ["RUNNING 9223372036854775808.000000001"] * 4),
+                     ("zero-trigger", ["RUNNING 0.000000001"] * 4),
+                     ("max-trigger", ["RUNNING 9223372036854775807.999999999"] * 4),
+                     ("restarted-before-pid", ["RUNNING " + t1] + ["RUNNING " + t2] * 4)):
     work = os.path.join(base, "sampler-" + case)
     status_dir = os.path.join(work, "asound", "card4", "pcm0c", "sub0")
     os.makedirs(status_dir)
     path, anchors, pidfile = (os.path.join(work, n) for n in ("r.wav", "anchors", "pid"))
-    # It opens the file 0.2 s on, after the sampler's first read, as arecord starts after it. In
-    # closed-at-end it lives 1.5 s past its last sample, which lands about 2.8 s on.
+    # The sampler starts first, and the writer once it says "ready", as the driver starts arecord.
+    # The writer opens the file 0.2 s on. In closed-at-end it lives 1.5 s past its last sample,
+    # which lands about 2.8 s on.
+    sampler = subprocess.Popen([sys.executable, src, "record", path, anchors, pidfile, os.path.join(work, "asound")],
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    first_line = sampler.stdout.readline()
     writer = subprocess.Popen([sys.executable, "-c", (
         "import sys, time\n"
         "time.sleep(0.2); f = open(sys.argv[1], 'wb'); f.write(bytes(44)); f.flush(); time.sleep(0.05)\n"
@@ -641,8 +670,8 @@ for case, states in (("running", ["RUNNING " + t1] * 4), ("closed", ["RUNNING " 
         with open(pidfile + ".tmp", "w") as f:
             f.write(str(writer.pid))
         os.replace(pidfile + ".tmp", pidfile)
-    # late-pid: the pid 1 s on, after about 0.75 s of samples.
-    giver = threading.Timer(1.0 if case == "late-pid" else 0, give_pid)
+    # late-pid and restarted-before-pid: the pid 1 s on, after about 0.75 s of samples.
+    giver = threading.Timer(1.0 if case in unwatched else 0, give_pid)
     giver.start()
 
     def status(text):
@@ -665,8 +694,8 @@ for case, states in (("running", ["RUNNING " + t1] * 4), ("closed", ["RUNNING " 
     shower = threading.Thread(target=show)
     shower.start()
     sys.stdout.flush()
-    run = subprocess.run([sys.executable, src, "record", path, anchors, pidfile, os.path.join(work, "asound")],
-                         capture_output=True, text=True, timeout=30)
+    rest, err = sampler.communicate(timeout=30)
+    run = subprocess.CompletedProcess(sampler.args, sampler.returncode, first_line + rest, err)
     out = run.stdout
     shower.join()
     giver.join()
@@ -675,13 +704,17 @@ for case, states in (("running", ["RUNNING " + t1] * 4), ("closed", ["RUNNING " 
     sampled = [l for l in lines if int(l[1]) > 44]
     floors = [l for l in sampled if len(l) == 3]
     reported = [l for l in out.splitlines() if l.startswith("discontinuous ")]
-    if case in ("running", "closed-at-end", "late-pid"):
+    if case in running:
         if not floors or reported:
             failures.append("%s: %d floor anchors, discontinuous %r; want floors and none" % (case, len(floors), reported))
         if case == "closed-at-end" and lines and len(lines[-1]) == 3:
             failures.append("closed-at-end: the last anchor, read after the close, kept its floor: %r" % lines[-1])
-        if case == "late-pid" and (not lines or int(lines[-1][1]) != os.path.getsize(path) or run.stderr):
-            failures.append("late-pid: the last anchor %r, the file %d bytes, the sampler's stderr %r; want the whole file and no error" % (lines[-1] if lines else None, os.path.getsize(path), run.stderr[-300:]))
+        continue
+    if case in unwatched:
+        if floors or len(reported) != 1 or not reported[0].endswith(" UNWATCHED"):
+            failures.append("%s: %d floor anchors, discontinuous %r; want none and one naming UNWATCHED" % (case, len(floors), reported))
+        if not lines or int(lines[-1][1]) != os.path.getsize(path) or run.stderr:
+            failures.append("%s: the last anchor %r, the file %d bytes, the sampler's stderr %r; want the whole file and no error" % (case, lines[-1] if lines else None, os.path.getsize(path), run.stderr[-300:]))
         continue
     want = {"closed": "CLOSED", "xrun": "XRUN", "restarted": "RESTARTED", "restarted-1ns": "RESTARTED"}.get(case, "NO-TRIGGER")
     if len(reported) != 1 or not reported[0].endswith(" " + want):
@@ -692,6 +725,80 @@ for case, states in (("running", ["RUNNING " + t1] * 4), ("closed", ["RUNNING " 
         failures.append("%s: %d floor anchors, with no trigger_time to show the substream ran on: %r" % (case, len(floors), floors[:2]))
     elif late:
         failures.append("%s: %d floor anchors at or after the state that is not RUNNING from the first trigger: %r" % (case, len(late), late[:2]))
+
+# The state reads before the size read that first finds samples (in-process, with capture_state
+# scripted): the first state read after the size could follow a restart that came after the file's
+# first samples, so it is taken for the first trigger only when every read before the first samples
+# shows no substream, a substream never triggered (trigger 0, as the kernel shows one before its
+# first start), or RUNNING from that same trigger. Each case gives the states read one after another
+# before the samples (the last repeats), then the state after. xrun-while-header-only is Sol's
+# sequence (review of #162 at 15c3a91f): a run, its overrun, and a new run, all before the samples.
+writer_code = (
+    "import sys, time\n"
+    "time.sleep(0.2); f = open(sys.argv[1], 'wb'); f.write(bytes(44)); f.flush(); time.sleep(0.05)\n"
+    "for _ in range(80): f.write(b'\\1\\0' * 240); f.flush(); time.sleep(0.01)\n")
+for case, before_samples, after_samples, want in (
+        ("restart-between-reads", [("RUNNING", (5, 1))], ("RUNNING", (5, 2)), "RESTARTED"),
+        ("stopped-run-prepared", [("PREPARED", (5, 1))], ("RUNNING", (5, 2)), "RESTARTED"),
+        ("xrun-before-samples", [("XRUN", (5, 1))], ("RUNNING", (5, 2)), "XRUN"),
+        ("xrun-while-header-only", [("PREPARED", (0, 0)), ("RUNNING", (5, 1)), ("XRUN", (5, 2)), ("RUNNING", (5, 3))],
+         ("RUNNING", (5, 3)), "XRUN"),
+        ("restarted-before-samples", [("RUNNING", (5, 1)), ("RUNNING", (5, 2))], ("RUNNING", (5, 2)), "RESTARTED"),
+        ("opened-after-run", [("RUNNING", (5, 1)), ("OPEN", (0, 0)), ("RUNNING", (5, 2))], ("RUNNING", (5, 2)), "RESTARTED"),
+        ("never-started", [("PREPARED", (0, 0))], ("RUNNING", (5, 1)), None),
+        ("started-before-samples", [("PREPARED", (0, 0)), ("RUNNING", (5, 1))], ("RUNNING", (5, 1)), None),
+        ("same-run", [("RUNNING", (5, 1))], ("RUNNING", (5, 1)), None)):
+    work = os.path.join(base, "prior-" + case)
+    os.mkdir(work)
+    path, anchors, pidfile = (os.path.join(work, n) for n in ("r.wav", "anchors", "pid"))
+    sampled = {"yes": False}
+    early = list(before_samples)
+    real_reader, real_state = ns["size_reader"], ns["capture_state"]
+
+    def reader(p):
+        read = real_reader(p)
+
+        def read_noting(pid):
+            size = read(pid)
+            sampled["yes"] = sampled["yes"] or (size is not None and size > 44)
+            return size
+        return read_noting
+
+    def scripted(root, pid, early=early, after_samples=after_samples):
+        if sampled["yes"]:
+            return after_samples
+        return early.pop(0) if len(early) > 1 else early[0]
+    printed, started = [], {}
+
+    def said(*words, **_):
+        # The writer starts once the sampler says "ready", as the driver starts arecord.
+        printed.append(" ".join(map(str, words)))
+        if words and words[0] == "ready" and not started:
+            started["writer"] = subprocess.Popen([sys.executable, "-c", writer_code, path])
+            with open(pidfile + ".tmp", "w") as f:
+                f.write(str(started["writer"].pid))
+            os.replace(pidfile + ".tmp", pidfile)
+    ns["size_reader"], ns["capture_state"] = reader, scripted
+    real_print = ns.get("print", print)
+    ns["print"] = said
+    try:
+        ns["record"](path, anchors, pidfile, work)
+    finally:
+        ns["size_reader"], ns["capture_state"] = real_reader, real_state
+        ns["print"] = real_print
+        signal.signal(signal.SIGTERM, signal.SIG_DFL)
+        signal.signal(signal.SIGINT, signal.SIG_DFL)
+    if "writer" not in started:
+        failures.append("%s: the sampler never said ready, so no writer started" % case)
+        continue
+    started["writer"].wait()
+    lines = [l.split() for l in open(anchors).read().splitlines()]
+    floors = [l for l in lines if int(l[1]) > 44 and len(l) == 3]
+    reported = [l for l in printed if l.startswith("discontinuous ")]
+    if want is None and (not floors or reported):
+        failures.append("%s: %d floor anchors, discontinuous %r; want floors and none" % (case, len(floors), reported))
+    if want is not None and (floors or len(reported) != 1 or not reported[0].endswith(" " + want)):
+        failures.append("%s: %d floor anchors, discontinuous %r; want none and one naming %s" % (case, len(floors), reported, want))
 for line in failures:
     print(line)
 sys.exit(1 if failures else 0)

@@ -1255,10 +1255,23 @@ def arecord(args):
             with open(os.path.join(substream, "status"), "w") as f:
                 f.write("closed\n")
 
+    def german():
+        """Whether arecord's messages come in German, as gettext picks them: LC_ALL, else
+        LC_MESSAGES, else LANG names the locale, and the C or POSIX locale, or none, gives English
+        and ignores LANGUAGE (alsa-utils de.po translates "overrun" as "Überlauf")."""
+        locale = os.environ.get("LC_ALL") or os.environ.get("LC_MESSAGES") or os.environ.get("LANG") or ""
+        if locale.split(".")[0] in ("", "C", "POSIX"):
+            return False
+        return (os.environ.get("LANGUAGE") or locale).startswith("de")
+
     def overrun(ms):
-        """arecord's own line for an overrun (alsa-utils aplay.c, xrun), which -q does not quiet;
-        the fake also logs it (overruns), so the self-test knows an overrun truly came."""
-        sys.stderr.write("overrun!!! (at least %.3f ms long)\n" % ms)
+        """arecord's own line for an overrun (alsa-utils aplay.c, xrun), which -q does not quiet,
+        in the language of its locale; the fake also logs it (overruns), so the self-test knows an
+        overrun truly came."""
+        if german():
+            sys.stderr.write("Überlauf!!! (mindestens %.3f ms lang)\n" % ms)
+        else:
+            sys.stderr.write("overrun!!! (at least %.3f ms long)\n" % ms)
         sys.stderr.flush()
         log_to("overruns", "%d %.3f" % (now_ms(), ms))
 
@@ -1299,6 +1312,19 @@ def arecord(args):
     # arecord-reopen opens the file for each write and closes it again, so that /proc seldom shows
     # the driver an open fd and it reads the size with a stat of the file.
     reopen = "arecord-reopen" in SCENARIO
+    # arecord-lock-start waits for the driver's pid file before it creates its file, so that the
+    # driver's own write in the folder is done before the lock, and its capture starts at once after
+    # its header, as arecord's does: a wait between the header and the first read would make the
+    # recording's start early by as long, and with the 250 ms buffer the anchors could not make up
+    # for it (Sol's review of #162 at 41b33cd7: under load the case read "did not hear the speech up
+    # to the stop"). pid_seen is its own record that the pid file was there before its first sample,
+    # which a stat under the lock cannot show.
+    pid_seen = False
+    if "arecord-lock-start" in SCENARIO and not reopen:
+        wait_until = time.monotonic() + 5
+        while not os.path.exists(path + ".pid") and time.monotonic() < wait_until:
+            time.sleep(0.005)
+        pid_seen = os.path.exists(path + ".pid")
     f = None if reopen else open(path, "wb")
 
     def put(data, mode="ab"):
@@ -1326,8 +1352,7 @@ def arecord(args):
     # while the fake writes on through the fd it holds open, as arecord does: every read of the size
     # fails there, yet no sample waits, so no overrun, and the recording stays continuous (Sol's
     # review of #156 at d49d0fe7: cancel-locked's hold always overruns, so no case held the locked
-    # reads to the chime path). It waits for the driver's pid file first, so that the driver's own
-    # write in the folder is done; unlock is the folder, its mode and when it opens again.
+    # reads to the chime path); unlock is the folder, its mode and when it opens again.
     frozen = []
     unlock = None
     try:
@@ -1347,10 +1372,6 @@ def arecord(args):
                 os.kill(pid, signal.SIGSTOP)
             log_to("arecord-froze", " ".join(map(str, frozen)))
             time.sleep(8)
-        if "arecord-lock-start" in SCENARIO and f is not None:
-            wait_until = time.monotonic() + 5
-            while not os.path.exists(path + ".pid") and time.monotonic() < wait_until:
-                time.sleep(0.005)
         begun = -(-time.monotonic_ns() // 1_000_000)
         log_to("recordings", "%s %d" % (path, begun))
         if "arecord-lock-start" in SCENARIO and f is not None:
@@ -1395,13 +1416,21 @@ def arecord(args):
         # capture-silent-restart shows it in XRUN for 30 ms only, which the sampler's reads miss,
         # then RUNNING again from a new trigger_time, as a prepare and start do; arecord-suspend
         # prints the suspend recovery arecord prints unless -q (alsa-utils aplay.c, suspend()).
-        clipped, shown = None, "RUNNING"
+        clipped, shown, said_unwatched = None, "RUNNING", False
         while True:
             time.sleep(0.005)
             t = now_ms()
             if unlock is not None and t >= unlock[2]:
                 os.chmod(unlock[0], unlock[1])
                 unlock = None
+            # sampler-says-unwatched: 1 s into the capture, long after the sampler's "started" line,
+            # the sampler's line for first samples that landed before it knew arecord's process,
+            # added to its output, which the driver reads at the end; the sampler writes no more there.
+            # sampler-says-unwatched-wrongly adds the same line where the pid was not late.
+            if SCENARIO & {"sampler-says-unwatched", "sampler-says-unwatched-wrongly"} and not said_unwatched and t >= begun + 1000:
+                with open(path + ".sampler", "a") as g:
+                    g.write("discontinuous %d UNWATCHED\n" % (time.monotonic_ns() // 1000))
+                said_unwatched = True
             held = t - last + (50 if "arecord-behind" in SCENARIO else 0)
             if held > FAKE_RESIDENCY_MS and not (lag_until is not None and t < lag_until):
                 overrun(held)
@@ -1420,7 +1449,7 @@ def arecord(args):
             if clipped is None and SCENARIO & {"capture-silent-xrun", "capture-silent-restart", "arecord-suspend", "sampler-crash"} and read("aplays", "0") != aplays:
                 clipped = t
                 if "arecord-suspend" in SCENARIO and "-q" not in args:
-                    sys.stderr.write("Suspended. Trying resume. Done.\n")
+                    sys.stderr.write("Ruhezustand. Versuche fortzusetzen. Fertig.\n" if german() else "Suspended. Trying resume. Done.\n")
                     sys.stderr.flush()
                 # sampler-crash: a status with a byte that is not utf-8, which the sampler's read of
                 # the substream's state raises on: a sampler that fails partway, whose failure the
@@ -1471,6 +1500,25 @@ def arecord(args):
             # Whole 2-byte samples at 24 kHz of the rig's clock, CLOCK times the Pi's.
             target = 2 * int((t - lag - skip - lost - begun) * CLOCK * 24)
             if target > written:
+                # pid-at-first-sample: whether the driver's pid file for this recording was there as
+                # the first sample landed: present, absent (no such file), or unreadable (the stat
+                # failed otherwise, as under arecord-lock-start's lock, where the fake's own record
+                # before the lock says present). The self-test takes the driver's UNWATCHED NOTE only
+                # on a clean absent (Sol's review of #162 at 494ba440); sampler-says-unwatched plays a
+                # late pid, so it logs it absent.
+                if written == 0:
+                    try:
+                        os.stat(path + ".pid")
+                        there = "present"
+                    except FileNotFoundError:
+                        there = "absent"
+                    except OSError:
+                        there = "unreadable"
+                    if pid_seen:
+                        there = "present"
+                    if "sampler-says-unwatched" in SCENARIO:
+                        there = "absent"
+                    log_to("pid-at-first-sample", there)
                 put(bytes(target - written))
                 written = target
                 for pid in frozen:
@@ -1992,6 +2040,8 @@ driver_env() {
   printf '%s\n' "PATH=$path" "GW_FAKE_STATE=$1/state" "GW_FAKE_DB=$1/ghost-wispr.db" "GW_FAKE_TEST_PID=$$" \
     "GW_FAKE_SCENARIO=$2" "GHOST_WISPR_DEPLOY_DIR=$1/deploy" "GHOST_WISPR_ASOUND_ROOT=$1/asound" "TMPDIR=$1/tmp"
   [[ $2 != *asound* ]] || printf '%s\n' "GW_FAKE_ASOUND=$1/asound"
+  # locale-de: the driver runs in a German locale, whose arecord prints its overrun in German.
+  [[ $2 != *locale-de* ]] || printf '%s\n' "LC_ALL=" "LC_MESSAGES=" "LANG=de_DE.utf8" "LANGUAGE=de"
 }
 
 # launch NAME SCENARIO STDIN [ENV] -- ARGS...: make the case and run the driver in the background;
@@ -2179,15 +2229,58 @@ expect_holds() {
 # floor_decided NAME: whether the anchors' bound timed the case NAME. A fake arecord that a loaded
 # machine holds back longer than a sample may wait unwritten (FAKE_RESIDENCY_MS) reports an
 # overrun, as a real one would, and the driver then takes the case's early bounds from the start
-# alone, so the case is its start-only case. floor_cases counts the cases the bound did time: a run
-# in which it timed none tested none of it, and fails at the end.
+# alone, so the case is its start-only case: only where the fake truly overran and the driver named
+# it (fake_overran), as a driver naming an overrun the fake never had would turn a floor case into a
+# fallback. floor_cases counts the cases the bound did time: a run in which it timed none tested none
+# of it, and fails at the end.
 floor_cases=0
 floor_decided() {
-  if grep -Fq "NOTE: recording: arecord reported an overrun" "$root/$1/out"; then
+  if fake_overran "$1"; then
     printf 'NOTE: %s: the fake arecord was held back past its buffer and reported an overrun, so the case read the start-only bounds\n' "$1"
     return 1
   fi
+  if unwatched_agreed "$1"; then
+    printf 'NOTE: %s: the driver gave arecord'"'"'s process to the sampler after its first samples, so the case read the start-only bounds\n' "$1"
+    return 1
+  fi
   floor_cases=$((floor_cases + 1))
+}
+
+# The driver's NOTE for a recording whose first samples landed before the sampler knew arecord's
+# process: on a loaded machine the driver can give it late (c28 of #156), so the capture
+# substream's state could not show it ran on, and the early bounds come from the start alone.
+readonly unwatched_note="NOTE: recording: arecord wrote its first samples before the sampler knew its process"
+
+# unwatched_evidence NAME: the fake's account (pid-at-first-sample) of the driver's pid file as the
+# first sample of each of NAME's recordings landed: absent when every recording logged it absent,
+# unreadable when one could not tell, present when one found it there, and none when none logged.
+unwatched_evidence() {
+  local log=$root/$1/state/pid-at-first-sample
+  if [[ ! -s $log ]]; then
+    printf 'none\n'
+  elif grep -qx unreadable "$log"; then
+    printf 'unreadable\n'
+  elif grep -qx present "$log"; then
+    printf 'present\n'
+  else
+    printf 'absent\n'
+  fi
+}
+
+# unwatched_agreed NAME: whether the driver named UNWATCHED in NAME and the fake agrees, on a clean
+# absent: its own log says the driver's pid file for every recording of the case was not there as
+# its first sample landed. Only then may the case fall back as after an overrun. The driver naming
+# it otherwise fails, a pid file found there or one the fake could not stat (Sol's review of #162 at
+# 494ba440: under arecord-lock-start's lock a check for the file read as absent): the sampler may
+# have had the pid before any sample, so a wrong UNWATCHED would turn a strict case into a fallback.
+unwatched_agreed() {
+  grep -Fq "$unwatched_note" "$root/$1/out" || return 1
+  local evidence
+  evidence=$(unwatched_evidence "$1")
+  if [[ $evidence != absent ]]; then
+    check_failed "$1: the driver said arecord wrote its first samples before the sampler knew its process, but the fake's account of the pid file as its first sample landed is $evidence ($(tr '\n' ';' <"$root/$1/state/pid-at-first-sample" 2>/dev/null))"
+    return 1
+  fi
 }
 
 # The driver's NOTE for a stop whose next answer it times against its chime, as a whole line.
@@ -2244,8 +2337,13 @@ chime_counted() {
 # a case with no overrun can still fall back by design (no audible lines, a disruption), so only a
 # chime case whose own chime-relative checks passed counts (chime_counted).
 capture_unbroken() {
-  fake_overran "$1" || return 0
-  printf 'NOTE: %s: the fake arecord overran (%s), so the case fell back to first_audio\n' "$1" "$(tr '\n' ';' <"$root/$1/state/overruns")"
+  if fake_overran "$1"; then
+    printf 'NOTE: %s: the fake arecord overran (%s), so the case fell back to first_audio\n' "$1" "$(tr '\n' ';' <"$root/$1/state/overruns")"
+  elif unwatched_agreed "$1"; then
+    printf 'NOTE: %s: the driver gave arecord'"'"'s process to the sampler after its first samples, so the case fell back to first_audio\n' "$1"
+  else
+    return 0
+  fi
   expect_line "$1" 'the recording is not shown continuous'
   return 1
 }
@@ -2260,6 +2358,23 @@ fake_overran() {
     check_failed "$1: the fake logged an overrun: $overran; the driver named one: $noted"
   fi
   [[ $overran == true ]]
+}
+
+# expect_discontinuity NAME NOTE...: NAME's scenario breaks the recording's continuity in a way the
+# driver names with one of the NOTEs. The driver names an overrun first, before any other reason
+# (analyse_recording), so where the fake truly overran (fake_overran: its log and the driver's NOTE
+# agree) none of the NOTEs is wanted; otherwise a line must hold one. Either way the caller checks
+# the verdict: UNKNOWN, never PASS. Every case that wants a discontinuity NOTE goes through here, so
+# that a load that brings an overrun cannot fail one of them (k5 of #162 at 41b33cd7, and Sol's
+# review of #162 at 15c3a91f, each found one case).
+expect_discontinuity() {
+  local name=$1 note
+  shift
+  fake_overran "$name" && return 0
+  for note in "$@"; do
+    grep -Fq -- "$note" "$root/$name/out" && return 0
+  done
+  check_failed "$name: with no overrun from the fake, no line holds $(printf '"%s" ' "$@"); output: $(tr '\n' '|' <"$root/$name/out")"
 }
 
 # expect_load_case NAME: a load case. With no overrun, it must PASS, each answer timed against its
@@ -2499,6 +2614,11 @@ launch barge-pause-sampler-crash answer-until-clip,backchannel-pause-500,sampler
 # alone cannot show the substream ran on without a restart, so UNKNOWN with a NOTE naming the missing
 # trigger, never PASS (Sol's review of #149 at 9b3d27cb).
 launch barge-pause-no-trigger answer-until-clip,backchannel-pause-500,arecord-slow-start,capture-buffer-250,capture-no-trigger yes -- --step barge-in --talkovers 1 --backchannels 1 --question @question.wav --talkover-dir @talkovers --backchannel-dir @backchannels --rig-mic "$rig" --event-timeout 15
+# The same pause with the sampler saying its recording's first samples landed before it knew
+# arecord's process (sampler-says-unwatched: the fake writes the sampler's line, 1 s into the
+# capture), as on a loaded machine whose driver gives the pid late: the state could not show the
+# substream ran on, so UNKNOWN with a NOTE naming that, never PASS.
+launch barge-pause-unwatched answer-until-clip,backchannel-pause-500,arecord-slow-start,capture-buffer-250,sampler-says-unwatched yes -- --step barge-in --talkovers 1 --backchannels 1 --question @question.wav --talkover-dir @talkovers --backchannel-dir @backchannels --rig-mic "$rig" --event-timeout 15
 # A backchannel that stops the speech, with arecord stalled in a write during the speech, its
 # capture overrunning and its sampler held for as long; stopped, arecord lands the held period and
 # closes with no read that would report the overrun (arecord-terminal-stall, Sol's review of #149 at
@@ -2543,6 +2663,11 @@ launch cancel-late-stop long,asound,stop-rounds-2,late-clip yes -- $cancel_args
 # would every early bound: FAIL.
 # shellcheck disable=SC2086
 launch cancel-held-start long,asound,stop-rounds-2,arecord-hold-200 yes -- $cancel_args
+# The same with the driver in a German locale (locale-de), whose arecord would print its overrun as
+# "Überlauf": the driver runs arecord with LC_ALL=C, so it still reads the overrun and turns the
+# floor off, and the fake's log and the driver's NOTE agree (Sol's review of #162 at 15c3a91f).
+# shellcheck disable=SC2086
+launch cancel-held-start-de long,asound,stop-rounds-2,arecord-hold-200,locale-de yes -- $cancel_args
 # The same, with an arecord whose fd /proc seldom shows (arecord-reopen), so the driver reads the
 # size with a stat of the file, and whose file's directory refuses every read for the hold
 # (arecord-locked): a failed read moves the start nowhere, so it stays before the header: PASS. A
@@ -2554,9 +2679,25 @@ launch cancel-locked long,asound,stop-rounds-2,arecord-hold-200,arecord-reopen,a
 # fake writes on through its fd with no hold (arecord-lock-start): no overrun, so the recording stays
 # continuous and the case is held to the chime path: PASS by the chime, counted. cancel-locked's hold
 # overruns in every run, so it can never test the locked reads there (Sol's review of #156 at
-# d49d0fe7). A failed read taken for no file yet puts the start inside the lock: FAIL.
+# d49d0fe7). A failed read taken for no file yet puts the start inside the lock: FAIL. It has the
+# 250 ms capture buffer (capture-buffer-250), as the floor cases do, so that a loaded machine
+# seldom makes the fake overrun and the strict path runs there too (Sol's review of #159 at
+# 75a99ec1: at the 40 ms buffer two loaded runs overran and fell back).
 # shellcheck disable=SC2086
-launch cancel-lock-start long,asound,stop-rounds-2,arecord-lock-start yes -- $cancel_args
+launch cancel-lock-start long,asound,stop-rounds-2,arecord-lock-start,capture-buffer-250 yes -- $cancel_args
+# The same with the sampler's UNWATCHED line though the pid was not late
+# (sampler-says-unwatched-wrongly): the fake's account, under its lock, must still say the pid file
+# was there, so that the self-test would not take the NOTE (Sol's review of #162 at 494ba440: a
+# check for the file under the lock read as absent, and the wrong NOTE passed as a fallback).
+# shellcheck disable=SC2086
+launch cancel-lock-start-wrongly long,asound,stop-rounds-2,arecord-lock-start,capture-buffer-250,sampler-says-unwatched-wrongly yes -- $cancel_args
+# A good cancel whose sampler says its first samples landed before it knew arecord's process
+# (sampler-says-unwatched, which plays a late pid and logs the pid file absent at its first sample):
+# the driver turns the floor off with its NOTE, and as the fake's log agrees, the case falls back as
+# after an overrun: no FAIL. With the pid file logged there, the same NOTE fails the case
+# (unwatched_agreed).
+# shellcheck disable=SC2086
+launch cancel-unwatched long,asound,stop-rounds-2,sampler-says-unwatched yes -- $cancel_args
 # A good cancel with an arecord that reads 1.5 s after its header: the recording cannot show that the
 # rig heard the speech up to the stop: UNKNOWN, never PASS.
 # shellcheck disable=SC2086
@@ -3337,35 +3478,40 @@ expect_line barge-backchannel-final-rewrite 'FAIL: barge-in: 1 of 1 backchannels
 expect_no_line barge-backchannel-final-rewrite 'PASS: barge-in: '
 expect_restored barge-backchannel-final-rewrite
 expect_rc barge-pause-silent-xrun 2
-expect_line barge-pause-silent-xrun 'NOTE: recording: the capture substream arecord held read XRUN during the recording, so the recording'"'"'s early bounds come from its start alone'
+expect_discontinuity barge-pause-silent-xrun 'NOTE: recording: the capture substream arecord held read XRUN during the recording, so the recording'"'"'s early bounds come from its start alone'
 expect_no_line barge-pause-silent-xrun 'PASS: barge-in: 0 of 1'
 expect_restored barge-pause-silent-xrun
 expect_rc barge-pause-suspend 2
-expect_line barge-pause-suspend 'NOTE: recording: arecord reported a suspend, so the recording'"'"'s early bounds come from its start alone'
+expect_discontinuity barge-pause-suspend 'NOTE: recording: arecord reported a suspend, so the recording'"'"'s early bounds come from its start alone'
 expect_no_line barge-pause-suspend 'PASS: barge-in: 0 of 1'
 expect_restored barge-pause-suspend
 # The sampler's reads miss the 30 ms of XRUN on an idle machine and see the restart; on a loaded
 # one a read can land in it, and the driver names the XRUN (Sol's review of #149 at 44738566). Both
 # are true: either NOTE, and still UNKNOWN, never PASS.
 expect_rc barge-pause-silent-restart 2
-expect_either_line barge-pause-silent-restart \
+expect_discontinuity barge-pause-silent-restart \
   'NOTE: recording: the capture substream arecord held read RESTARTED during the recording, so the recording'"'"'s early bounds come from its start alone' \
   'NOTE: recording: the capture substream arecord held read XRUN during the recording, so the recording'"'"'s early bounds come from its start alone'
 expect_no_line barge-pause-silent-restart 'PASS: barge-in: 0 of 1'
 expect_restored barge-pause-silent-restart
 expect_rc barge-pause-no-trigger 2
-expect_line barge-pause-no-trigger "NOTE: recording: the capture substream arecord held showed RUNNING with no trigger_time in the kernel's form"
+expect_discontinuity barge-pause-no-trigger "NOTE: recording: the capture substream arecord held showed RUNNING with no trigger_time in the kernel's form"
 expect_no_line barge-pause-no-trigger 'PASS: barge-in: 0 of 1'
 expect_restored barge-pause-no-trigger
+expect_rc barge-pause-unwatched 2
+# An overrun the fake truly logged comes first in the driver's NOTEs, so the UNWATCHED NOTE is
+# wanted only without one, and then with the fake's agreement (Sol's review of #162 at 15c3a91f).
+if ! fake_overran barge-pause-unwatched; then
+  unwatched_agreed barge-pause-unwatched \
+    || check_failed "barge-pause-unwatched: no line holds \"$unwatched_note\" that the fake agrees with"
+fi
+expect_no_line barge-pause-unwatched 'PASS: barge-in: 0 of 1'
+expect_restored barge-pause-unwatched
 expect_rc barge-backchannel-terminal-stall 1 2
 # On a loaded machine the fake can also overrun before the stall, and the driver then names the
 # overrun, which turns the anchors' bound off as well: the case still must not PASS. It is no floor
 # case, so it does not count toward floor_cases.
-if grep -Fq "NOTE: recording: arecord reported an overrun" "$root/barge-backchannel-terminal-stall/out"; then
-  printf 'NOTE: %s: the fake arecord overran before the stall, and the driver named the overrun\n' barge-backchannel-terminal-stall
-else
-  expect_line barge-backchannel-terminal-stall 'NOTE: recording: the capture substream arecord held read CLOSED during the recording, so the recording'"'"'s early bounds come from its start alone'
-fi
+expect_discontinuity barge-backchannel-terminal-stall 'NOTE: recording: the capture substream arecord held read CLOSED during the recording, so the recording'"'"'s early bounds come from its start alone'
 expect_line barge-backchannel-terminal-stall 'barge-in:'
 expect_no_line barge-backchannel-terminal-stall 'PASS: barge-in: 0 of 1'
 expect_restored barge-backchannel-terminal-stall
@@ -3390,6 +3536,10 @@ expect_rc cancel-held-start 0
 expect_line cancel-held-start "PASS: playback-cancel: no stop's speech was heard at the rig microphone 20 ms after it"
 expect_restored cancel-held-start
 expect_line cancel-held-start "NOTE: recording: arecord reported an overrun, so the recording's early bounds come from its start alone"
+expect_line cancel-held-start-de "NOTE: recording: arecord reported an overrun, so the recording's early bounds come from its start alone"
+fake_overran cancel-held-start-de || check_failed 'cancel-held-start-de: the fake logged no overrun, so the case tested no overrun message'
+expect_load_case cancel-held-start-de
+expect_restored cancel-held-start-de
 # arecord-hold-200 makes the fake report a 200 ms overrun, so the recording is never shown
 # continuous and the answer is timed against first_audio, whose window the start-only bounds can
 # cover on a loaded machine: UNKNOWN there is the honest answer, never FAIL (#149's g11 and c31 of
@@ -3400,6 +3550,17 @@ expect_restored cancel-locked
 expect_load_case cancel-lock-start
 [[ -s $root/cancel-lock-start/state/arecord-locked ]] || check_failed 'cancel-lock-start: the fake arecord never locked its file away, so the case tested no failed read'
 expect_restored cancel-lock-start
+expect_discontinuity cancel-lock-start-wrongly "$unwatched_note"
+[[ -s $root/cancel-lock-start-wrongly/state/arecord-locked ]] || check_failed 'cancel-lock-start-wrongly: the fake arecord never locked its file away'
+evidence=$(unwatched_evidence cancel-lock-start-wrongly)
+[[ $evidence == present ]] \
+  || check_failed "cancel-lock-start-wrongly: the fake's account of the pid file under its lock is $evidence, want present, so a wrong UNWATCHED would pass"
+expect_restored cancel-lock-start-wrongly
+if ! fake_overran cancel-unwatched; then
+  unwatched_agreed cancel-unwatched || check_failed "cancel-unwatched: no line holds \"$unwatched_note\" that the fake agrees with"
+fi
+expect_load_case cancel-unwatched
+expect_restored cancel-unwatched
 expect_rc cancel-unsure 2
 expect_line cancel-unsure 'UNKNOWN: playback-cancel stop 1: the rig microphone did not hear the speech up to the stop'
 expect_no_line cancel-unsure "PASS: playback-cancel: no stop's speech was heard"
