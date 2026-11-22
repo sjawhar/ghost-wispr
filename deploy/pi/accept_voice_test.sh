@@ -694,11 +694,12 @@ def voice_state(fn):
 # speech's sound ends where its cut puts it.
 SPEAKER_QUEUE_MS = 30
 # The service's "audible" line for each speech on the chime or the voice input gives when its first
-# sample left the speaker's buffer, by the stream's account (audible_mono_ns), logged as the frame is
-# written, a queue before; the rig hears it DEVICE_LATENCY_MS later, the same for both inputs: 8 ms,
-# or 25 ms with device-latency-25. The voice, at 24 kHz, leads by its resampler's filter (65 samples
-# at 48 kHz); each time is good to about 1 us. Every line counts no disruption, but with
-# audible-disrupted the voice's counts one, as after an underrun between the chime and the answer.
+# sample left the speaker's buffer, by the stream's account (audible_mono_ns); the service logs it
+# once that time has passed, stamped at it (#154), and the rig hears it DEVICE_LATENCY_MS later, the
+# same for both inputs: 8 ms, or 25 ms with device-latency-25. The voice, at 24 kHz, leads by its
+# resampler's filter (65 samples at 48 kHz); each time is good to about 1 us. Every line counts no
+# disruption, but with audible-disrupted the voice's counts one, as after an underrun between the
+# chime and the answer.
 # With no-audible the service logs no such lines, as a build before them.
 DEVICE_LATENCY_MS = 25 if "device-latency-25" in SCENARIO else 8
 
@@ -707,7 +708,7 @@ def audible(input_name, heard, session, tag=None):
     """The service's audible line for a sound on INPUT_NAME the rig hears at HEARD."""
     if "no-audible" in SCENARIO:
         return
-    emit(kind="timing", due=heard - DEVICE_LATENCY_MS - SPEAKER_QUEUE_MS, event="audible", input=input_name, session_id=session,
+    emit(kind="timing", due=heard - DEVICE_LATENCY_MS, event="audible", input=input_name, session_id=session,
          audible_mono_ns=(heard - DEVICE_LATENCY_MS) * 1_000_000, audible_lead_ns=1_354_167 if input_name == "voice" else 0,
          audible_err_ns=1001, disruptions=1 if input_name == "voice" and "audible-disrupted" in SCENARIO else 0,
          **({"tag": tag} if tag else {}))
