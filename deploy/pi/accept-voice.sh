@@ -405,7 +405,12 @@ api_post() {
 # (start_poller). Every time the driver compares is on this clock; the wall clock serves only
 # journalctl's --since, which takes a wall time.
 read -r -d '' mono_py <<'EOF'
+import array
+import collections
 import glob
+import io
+import itertools
+import math
 import os
 import re
 import signal
@@ -523,7 +528,9 @@ def record(path, anchors, pidfile, root):
     before the capture began: the last such read's time, read before the size, is the start. It
     prints "started US" once arecord has written a sample, "stopped" if arecord ends before, and
     "timeout" if it has written none within 5 s of its pid; a sample counts even when found after the
-    5 s. Each read from the first sample on is followed by a read of the state of the capture
+    5 s. A sample found before the pid, which the driver writes after it starts arecord, is an
+    anchor without a floor, and the reads go on every 10 ms until the pid comes. Each read from the
+    first sample on, once the pid is known, is followed by a read of the state of the capture
     substream arecord holds (capture_state under ROOT). Only when that state is RUNNING, from the
     trigger of the first such read, is the anchor written with BEFORE_US, the floor that bounds
     later samples from below; otherwise it is written "US BYTES", a late bound alone. An overrun
@@ -588,7 +595,13 @@ def record(path, anchors, pidfile, root):
             before = us()
             size = read(pid)
             seen = us()
-            if size is not None and size > HEADER:
+            if size is not None and size > HEADER and pid is None:
+                # A sample before arecord's pid: the driver writes the pid after it starts arecord,
+                # and a loaded machine can delay that past arecord's first write (c28 of #156, where
+                # the loop below then failed on the missing pid and wrote no anchor after this one).
+                # The substream's state needs the pid, so a late bound alone, until the pid comes.
+                out.write("%d %d\n" % (seen, size))
+            elif size is not None and size > HEADER:
                 anchored(seen, size, before)
                 break
             if size is not None and size == HEADER:
@@ -618,6 +631,9 @@ def record(path, anchors, pidfile, root):
             if size is not None and size > HEADER:
                 anchored(seen, size, before)
                 report()
+        # arecord ended before the SIGTERM came: the SIGTERM, still on its way, must not stop the
+        # last anchor, which is what bounds a sound that runs to the file's end.
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
     except Stop:
         pass
     # A discontinuity that the last read found, if SIGTERM came before it was printed.
@@ -654,6 +670,58 @@ def duration(path):
         print(w.getnframes() * 1000 // w.getframerate())
 
 
+def samples_of(path, rate):
+    """The samples of the WAV file arecord wrote at PATH, mono PCM16 at RATE: its format from the
+    wave module, and its samples from the 44-byte header on, as many as the file holds. arecord
+    writes the data chunk's size only when it ends, so the file's size, not the header's, counts."""
+    with open(path, "rb") as f:
+        data = f.read()
+    with wave.open(io.BytesIO(data[:HEADER])) as w:
+        got = (w.getnchannels(), w.getsampwidth(), w.getframerate())
+    if got != (1, 2, rate) or data[36:40] != b"data":
+        raise ValueError("%s is not mono PCM16 at %d Hz with its data at byte 44: %r" % (path, rate, got))
+    samples = array.array("h")
+    samples.frombytes(data[HEADER:HEADER + (len(data) - HEADER) // 2 * 2])
+    if sys.byteorder == "big":
+        samples.byteswap()
+    return samples
+
+
+def sounds(path, rate, threshold_db, silence_s):
+    """The sounds in the recording at PATH, in sample indices, exact at any length: a sample is loud
+    when its magnitude is at least THRESHOLD_DB of full scale, as ffmpeg's silencedetect counts it
+    (silence is under noise * 32767), and a silence is a run of quiet samples at least SILENCE_S long.
+    A sound runs from its first loud sample to one past its last, and holds the shorter quiet runs
+    inside it. It prints "samples N", then "sound ON OFF" for each sound."""
+    samples = samples_of(path, rate)
+    loud_from = math.ceil(10 ** (threshold_db / 20) * 32767)
+    min_quiet = round(silence_s * rate)
+    print("samples %d" % len(samples))
+    on = off = None
+    at = 0
+    for loud, run in itertools.groupby(map(loud_from.__le__, map(abs, samples))):
+        # The last of enumerate(run, 1) is the run's length, counted in C, not one Python step a sample.
+        n = collections.deque(enumerate(run, 1), maxlen=1)[0][0]
+        if loud:
+            if on is None:
+                on = at
+            elif at - off >= min_quiet:
+                print("sound %d %d" % (on, off))
+                on = at
+            off = at + n
+        at += n
+    if on is not None:
+        print("sound %d %d" % (on, off))
+
+
+def peak(path, rate):
+    """The loudest sample of the recording at PATH, in dB of full scale, to 0.1 dB, as ffmpeg's
+    volumedetect prints max_volume; -91.0 for a file of silence."""
+    samples = samples_of(path, rate)
+    loudest = max(map(abs, samples), default=0)
+    print("%.1f" % (20 * math.log10(loudest / 32768) if loudest else -91.0))
+
+
 mode = sys.argv[1]
 if mode == "clock":
     clock()
@@ -663,6 +731,10 @@ elif mode == "poll":
     poll(sys.argv[2], sys.argv[3])
 elif mode == "duration":
     duration(sys.argv[2])
+elif mode == "sounds":
+    sounds(sys.argv[2], int(sys.argv[3]), float(sys.argv[4]), float(sys.argv[5]))
+elif mode == "peak":
+    peak(sys.argv[2], int(sys.argv[3]))
 EOF
 readonly mono_py
 
@@ -879,13 +951,58 @@ journal_records() {
   journal_lines | jq -R -c --arg message "$1" 'fromjson? | select(type == "object" and .message == $message)' 2>/dev/null
 }
 
-# timing_events: the voice timing log since the restart: {event, session_id, reason, at, wall}: at
-# on now_ms's clock (at_mono_ns), -1 for a line without one, and wall on the wall clock (at_unix_ns),
-# in milliseconds.
+# timing_events: the voice timing log since the restart: {event, session_id, reason, input, speech,
+# at, at_us, wall, audible_us, lead_us, err_us, disruptions}: at on now_ms's clock (at_mono_ns), -1
+# for a line without one, at_us the same in microseconds, and wall on the wall clock (at_unix_ns), in
+# milliseconds. speech is the number the speaker gives each speech (internal/audio,
+# SpeechEvent.Speech), on its first_audio, speech_end and audible lines, or -1. An "audible" line
+# also gives, in microseconds on now_ms's clock, when its sound's first sample left the speaker's
+# buffer (audible_mono_ns, -1 without), how much earlier the sound can be (audible_lead_ns) and how
+# far off the time can be (audible_err_ns), each rounded outwards, and the disruptions the speaker
+# had had by then.
 timing_events() {
   journal_records 'voice timing' | jq -c '{event: (.event // ""), session_id: (.session_id // ""),
-    reason: (.reason // ""), at: ((((.at_mono_ns | tonumber?) // -1000000) / 1000000) | floor),
-    wall: ((((.at_unix_ns | tonumber?) // 0) / 1000000) | floor)}' 2>/dev/null
+    reason: (.reason // ""), input: (.input // ""),
+    speech: ((.speech | tonumber?) // -1),
+    at: ((((.at_mono_ns | tonumber?) // -1000000) / 1000000) | floor),
+    at_us: ((((.at_mono_ns | tonumber?) // -1000) / 1000) | floor),
+    wall: ((((.at_unix_ns | tonumber?) // 0) / 1000000) | floor),
+    audible_us: ((((.audible_mono_ns | tonumber?) // -1000) / 1000) | floor),
+    lead_us: ((((.audible_lead_ns | tonumber?) // 0) / 1000) | ceil),
+    err_us: ((((.audible_err_ns | tonumber?) // 0) / 1000) | ceil),
+    disruptions: ((.disruptions | tonumber?) // -1)}' 2>/dev/null
+}
+
+# audible_of INPUT FROM_MS TO_MS: "AUDIBLE_US LEAD_US ERR_US DISRUPTIONS" of the first "audible"
+# line for the speaker's INPUT (chime or voice) in audible_lines whose sound left the speaker's
+# buffer from FROM to TO, or nothing. The service logs one as each speech on an input starts, timed
+# by the stream's own account of its playback (internal/audio, AudibleEvent): the device plays the
+# sample a latency later, the same for every input. audible_lines is the timing log's audible and
+# first_audio lines (timing_events), read once, before the step stops its recording and reads the
+# rest of the journal.
+audible_lines=
+audible_of() {
+  jq -r -n --arg input "$1" --argjson from "$(($2 * 1000))" --argjson to "$(($3 * 1000))" \
+    '[inputs | select(.event == "audible" and .input == $input and .audible_us >= $from and .audible_us <= $to)]
+     | min_by(.audible_us) // empty | "\(.audible_us) \(.lead_us) \(.err_us) \(.disruptions)"' <<<"$audible_lines"
+}
+
+# audible_of_speech FIRST_MS: the voice's "audible" line for the speech whose first_audio is at
+# FIRST_MS, as audible_of gives it: the first_audio line at FIRST_MS names its speech, and exactly one
+# voice audible line must name the same. It prints "none" when the first_audio line names no speech
+# or no audible line names it, and "ambiguous" when more than one first_audio line is at FIRST_MS
+# with different speeches, or more than one audible line names the speech: another speech's line,
+# such as a cancelled word's, never times the answer (Sol's review of #156 at 053df77c).
+audible_of_speech() {
+  jq -r -n --argjson first "$1" \
+    '[inputs] as $all
+     | [$all[] | select(.event == "first_audio" and .at == $first) | .speech] | unique as $speeches
+     | if ($speeches | length) > 1 then "ambiguous"
+       elif ($speeches | length) == 0 or $speeches[0] < 0 then "none"
+       else [$all[] | select(.event == "audible" and .input == "voice" and .speech == $speeches[0])] as $lines
+         | if ($lines | length) == 0 then "none" elif ($lines | length) > 1 then "ambiguous"
+           else $lines[0] | "\(.audible_us) \(.lead_us) \(.err_us) \(.disruptions)" end
+       end' <<<"$audible_lines"
 }
 
 # timing_first EVENT FROM_MS TO_MS [FIELD]: the time of the first EVENT in the timing log in
@@ -1286,6 +1403,7 @@ start_recording() {
   recording=$2
   anchors_file="$recording.anchors"
   recording_cut=false
+  sampler_status=0
   : >"$anchors_file"
   : >"$recording.sampler"
   rm -f -- "$recording.pid"
@@ -1373,7 +1491,10 @@ sampler_line() {
 # had captured but not yet written. Every sample in the file was captured before arecord ended, so a
 # last anchor, which the sampler takes once arecord has ended and it gets SIGTERM, bounds the end of
 # the file too. An arecord that already ended on its own cut the recording short, which
-# analyse_recording reports.
+# analyse_recording reports. sampler_status is the sampler's exit status: it ends 0 on SIGTERM, so
+# any other status, or anything on its stderr, is a sampler that failed partway, whose anchors stop
+# where it failed (c28 of #156 read that as "after its last anchor").
+sampler_status=0
 stop_recording() {
   if [[ -n $arecord_pid ]]; then
     kill -TERM "$arecord_pid" 2>/dev/null || recording_cut=true
@@ -1383,19 +1504,22 @@ stop_recording() {
   if [[ -n $anchor_pid ]]; then
     kill -TERM "$anchor_pid" 2>/dev/null
     wait "$anchor_pid" 2>/dev/null
+    sampler_status=$?
     anchor_pid=
   fi
 }
 
-# analyse_recording THRESHOLD_DB: read the sounds in the recording. sound_on and sound_off hold each
-# sound's onset and end on the driver's clock, never early; sound_on_early and sound_off_early the
-# same times, never late; sound_len its length in the file, in microseconds; sound_gap_min the
-# silence before it, from the end of the sound before it (or from the file's start), never long. The
-# recording shows every sound that starts before recording_end_early and nothing after
-# recording_end_late (never_ms when no anchor bounds it); recording_trail_min is the silence after
-# its last sound, to recording_end_early's place, never long (recording-times.awk). A true time lies
-# between its two bounds, and a check decides PASS or FAIL only where it holds for every time between
-# them, else UNKNOWN.
+# analyse_recording THRESHOLD_DB: read the sounds in the recording (mono_py sounds, in sample
+# indices, exact at any length: a place ffmpeg prints in %.6g is good only to 10 ms past 1000 s, and
+# playback-cancel records for about 20 minutes). sound_on and sound_off hold each sound's onset and
+# end on the driver's clock, never early; sound_on_early and sound_off_early the same times, never
+# late; sound_len its length in the file, in microseconds; sound_gap_min the silence before it, from
+# the end of the sound before it (or from the file's start), never long; sound_at and sound_until its
+# onset and end as sample indices in the recording, exact. The recording shows every sound that
+# starts before recording_end_early and nothing after recording_end_late (never_ms when no anchor
+# bounds it); recording_trail_min is the silence after its last sound, to the file's end, never long
+# (recording-times.awk). A true time lies between its two bounds, and a check decides PASS or FAIL
+# only where it holds for every time between them, else UNKNOWN.
 #
 # Every time here is when a sound reached the rig microphone. A USB microphone captures a sound a
 # little after it arrives: its converter's filter and its USB audio class transfer, which moves audio
@@ -1412,25 +1536,41 @@ sound_on_early=()
 sound_off_early=()
 sound_len=()
 sound_gap_min=()
+sound_at=()
+sound_until=()
 recording_end_early=
 recording_end_late=
 recording_trail_min=
+# recording_continuous is true when the recording is shown to have lost no capture: a capture
+# substream names arecord, arecord reported no overrun and no suspend, and every state read after a
+# size showed it running from its first trigger. Only then does the time between two sounds count
+# in samples of the file (answer_earliest).
+recording_continuous=false
 analyse_recording() {
-  local analysis bytes kind rest on off len on_early off_early gap floor=$capture_residency_us
-  analysis=$(ffmpeg -hide_banner -nostats -i "$recording" -af "silencedetect=noise=${1}dB:d=$silence_seconds" -f null - 2>&1) \
-    || unknown "recording: ffmpeg could not read $recording: $(tail -n 3 <<<"$analysis" | tr '\n' ' ')"
+  local analysis kind rest on off len on_early off_early gap at until floor=$capture_residency_us
+  analysis=$(python3 -c "$mono_py" sounds "$recording" "$sample_rate" "$1" "$silence_seconds" 2>"$work_dir/sounds.err") \
+    || unknown "recording: cannot read the sounds of $recording: $(tail -n 3 "$work_dir/sounds.err" | tr '\n' ' ')"
   [[ $recording_cut == false ]] \
     || unknown "recording: arecord stopped before the step ended it, so the recording does not cover the step: $(tr '\n' ' ' <"$work_dir/arecord.err")"
-  bytes=$(wc -c <"$recording") || unknown "recording: cannot read the size of $recording"
+  if [[ $sampler_status != 0 || -s $work_dir/sampler.err ]]; then
+    local first last
+    first=$(head -n 1 "$work_dir/sampler.err")
+    last=$(tail -n 1 "$work_dir/sampler.err")
+    [[ $last != "$first" ]] || last=
+    unknown "recording: the sampler of $recording failed (exit status $sampler_status), so its anchors stop where it failed and no time after can be bounded by them: ${first:-it wrote nothing}${last:+ … $last}"
+  fi
   sound_on=()
   sound_off=()
   sound_on_early=()
   sound_off_early=()
   sound_len=()
   sound_gap_min=()
+  sound_at=()
+  sound_until=()
   recording_end_early=
   recording_end_late=
   recording_trail_min=
+  recording_continuous=false
   # An overrun or a suspend drops what ALSA's buffer held, and a sample can then stay captured and
   # not yet in the file for longer than capture_residency_us: the early bounds come from the start
   # alone. So do they when the sampler saw the capture substream stop running, which arecord may
@@ -1452,21 +1592,24 @@ analyse_recording() {
     floor=
     note "recording: the capture substream arecord held read $discontinuous during the recording, so the recording's early bounds come from its start alone"
   fi
+  [[ -n $floor ]] && recording_continuous=true
   while read -r kind rest; do
     case $kind in
       sound)
-        read -r on off len on_early off_early gap <<<"$rest"
+        read -r on off len on_early off_early gap at until <<<"$rest"
         sound_on+=("$on")
         sound_off+=("$off")
         sound_on_early+=("$on_early")
         sound_off_early+=("$off_early")
         sound_len+=("$len")
         sound_gap_min+=("$gap")
+        sound_at+=("$at")
+        sound_until+=("$until")
         ;;
       end) read -r recording_end_early recording_end_late recording_trail_min <<<"$rest" ;;
       error) unknown "recording: $recording: $rest" ;;
     esac
-  done < <(awk -v rate="$sample_rate" -v header="$wav_header_bytes" -v frame="$sample_bytes" -v bytes="$bytes" \
+  done < <(awk -v rate="$sample_rate" -v header="$wav_header_bytes" -v frame="$sample_bytes" \
     -v started_us="$recording_started" -v mic_delay_us="$mic_delay_us" -v floor_us="$floor" -f "$recording_times" "$anchors_file" - <<<"$analysis")
   [[ $recording_end_late == none ]] && recording_end_late=$never_ms
   [[ $recording_end_early =~ ^[0-9]+$ && $recording_end_late =~ ^[0-9]+$ && $recording_trail_min =~ ^[0-9]+$ ]] \
@@ -1606,16 +1749,15 @@ confirm_rig() {
 }
 
 # calibrate_rig: record 2 s of the room with the voice silent, and set rig_threshold_db 10 dB above
-# its peak, so that the room's own sound is silence to silencedetect.
+# its peak (mono_py peak), so that the room's own sound is silence to analyse_recording.
 rig_threshold_db=
 calibrate_rig() {
-  local tone="$work_dir/rig-room.$unit_runs.wav" analysis peak
+  local tone="$work_dir/rig-room.$unit_runs.wav" peak
   arecord -q -D "$rig_mic" -f S16_LE -r "$sample_rate" -c 1 -t wav -d 2 "$tone" 2>"$work_dir/arecord.err" \
     || unknown "rig microphone: arecord could not record from $rig_mic: $(tr '\n' ' ' <"$work_dir/arecord.err")"
-  analysis=$(ffmpeg -hide_banner -nostats -i "$tone" -af volumedetect -f null - 2>&1) \
-    || unknown "rig microphone: ffmpeg could not read $tone"
-  peak=$(sed -n 's/.*max_volume: \(-\{0,1\}[0-9.]*\) dB.*/\1/p' <<<"$analysis" | head -n 1)
-  [[ $peak =~ ^-?[0-9]+(\.[0-9]+)?$ ]] || unknown "rig microphone: ffmpeg read no level from $tone"
+  peak=$(python3 -c "$mono_py" peak "$tone" "$sample_rate" 2>"$work_dir/peak.err") \
+    || unknown "rig microphone: cannot read $tone: $(tail -n 3 "$work_dir/peak.err" | tr '\n' ' ')"
+  [[ $peak =~ ^-?[0-9]+(\.[0-9]+)?$ ]] || unknown "rig microphone: read no level from $tone"
   rig_threshold_db=$(awk -v peak="$peak" 'BEGIN { t = peak + 10; if (t < -50) t = -50; printf "%d", t }')
   ((rig_threshold_db <= -12)) \
     || unknown "rig microphone: the room peaks at $peak dB with the voice silent, too loud to tell the Jabra from the room"
@@ -2533,25 +2675,96 @@ running_ms() {
 # stop (the stop line of the timing log) until its next question's chime can start, at least
 # stop_silence_ms later, must end by then (cancel_heard), so that a word after a pause in the speech
 # does not pass. The chime must be the chime alone, heard no longer than the calibration give or
-# take chime_tolerance_ms; and nothing else may start after it before that question's answer (its
-# first_audio), since the next question plays into the microphone, not the speaker. The calibration
-# is how long the rig hears the wake sound played alone, as the voice plays it, through ghost-wispr
-# play-sound at the step's start, before any question: in this room, at this threshold, with this
-# build's sound. Nothing else plays after a stop: the voice has no stop sound. ALSA's queue is not
-# the measure: after a cancel the Output can keep the stream running and fill it with silence.
-# Underruns are the lines the speaker logs for each one; the poller's XRUN states cross-check them;
-# the calibration plays before the poller starts, so that its stream, another process's, is not
-# counted.
+# take chime_tolerance_ms; and nothing else may start after it before that question's answer can be
+# heard, since the next question plays into the microphone, not the speaker. When the timing log
+# gives "audible" times for the chime and the answer, the earliest the answer can be heard at the rig
+# is the chime's onset in the same recording, in exact samples, plus the time between their audible
+# times: the speaker's latency, the room and the rig's delay are the same for both, so they cancel
+# (answer_earliest). Without them, the answer's first_audio, when the Output handed its first frame
+# to the speaker, is the threshold. The calibration is how long the rig hears the wake sound played
+# alone, as the voice plays it, through ghost-wispr play-sound at the step's start, before any
+# question: in this room, at this threshold, with this build's sound. Nothing else plays after a
+# stop: the voice has no stop sound. ALSA's queue is not the measure: after a cancel the Output can
+# keep the stream running and fill it with silence. Underruns are the lines the speaker logs for
+# each one; the poller's XRUN states cross-check them; the calibration plays before the poller
+# starts, so that its stream, another process's, is not counted.
 #
 # Known limits. A leak can hide only where it runs into the next question's chime, with less than
 # silence_ms between them: the part of it outside the chime must add at most chime_tolerance_ms to
-# the chime as the rig hears it, and any of it that plays during the chime is not told apart. And a
-# leak that certainly starts at or after the next answer's first_audio is not told apart from that
-# answer; one that may start before it reads UNKNOWN.
+# the chime as the rig hears it, and any of it that plays during the chime is not told apart. A leak
+# that starts less than chime_attack_us, two audible_error_us, the voice's lead (its resampler's
+# filter, about 1.4 ms) and the clock's 200 ppm before the next answer is heard, about 9 ms, is not
+# told apart from the answer. Without audible times, or with a disruption between the chime's and the
+# answer's, the window is the speaker's whole queue before first_audio, about 40 ms on the Pi: a leak
+# that starts at or after first_audio is not told apart, and one that may start before it reads
+# UNKNOWN.
+#
+# chime_attack_us is how late the rig can first hear the chime past its true start: its first note
+# rises over 5 ms (internal/voice/chime.go) and is loud only at a peak of its 659 Hz sine, at most
+# 0.8 ms on. audible_error_us is how far ALSA's account of when a sample leaves its buffer can be off
+# for a USB speaker, which moves audio in 1 ms frames: an assumption of the rig, not a measured bound.
+readonly chime_attack_us=6000 audible_error_us=1000
+
+# answer_earliest WAKE_MS FIRST_MS CHIME: set answer_from to the earliest sample of the recording at
+# which the rig can hear the answer whose first_audio is FIRST_MS, after the chime that starts sound
+# CHIME, the question's wake sound (its wake_heard WAKE_MS). It fails, setting nothing and answer_why
+# to why, when the recording is not shown continuous (recording_continuous); when the timing log
+# gives no audible time for that chime, from lead_ms before WAKE_MS to wake_max_ms after it, or none
+# for the answer's own speech, or more than one (audible_of_speech); when the speaker had a
+# disruption between the two (a replay, an underrun or a failure), which can make the chime play
+# later than its audible time; or when it gives the answer's no later than the chime's.
+#
+# Both sounds left the same Output for the same speaker, so the rig hears each a latency after its
+# audible time, the same for both. The rig hears the answer's first sound (the time between their
+# audible times) after the chime's first sample, at the rig's rate of the driver's clock, less 200
+# ppm; the chime's first sample is no later than its onset in the recording, less chime_attack_us.
+# Each term is taken at its earliest: the answer's time less its lead (its resampler's filter can
+# sound before its first sample lands) and its error, the chime's plus its error, each less
+# audible_error_us for the device's account, and rounded down a sample, so answer_from is never late.
+# The time between the two counts in samples of the file only while the capture lost none between
+# them: samples a capture overrun drops move every later sound earlier in the file (Sol's review of
+# #156 at 053df77c), so the comparison needs the recording shown continuous.
+answer_from=
+answer_why=
+answer_earliest() {
+  local chime answer chime_at chime_err chime_seen answer_at answer_lead answer_err answer_seen gap_us
+  if [[ $recording_continuous != true ]]; then
+    answer_why='the recording is not shown continuous (an overrun, a suspend, a break in the capture substream, or no substream named), so the time between the chime and the answer does not count in its samples'
+    return 1
+  fi
+  answer_why='the timing log gives no audible times for the chime and the answer'
+  chime=$(audible_of chime $(($1 - lead_ms)) $(($1 + wake_max_ms)))
+  [[ -n $chime ]] || return 1
+  answer=$(audible_of_speech "$2")
+  case $answer in
+    none)
+      answer_why="the timing log gives no audible time for the answer's own speech (the speech its first_audio names)"
+      return 1
+      ;;
+    ambiguous)
+      answer_why="the timing log gives more than one audible time, or first_audio, that could be the answer's own speech"
+      return 1
+      ;;
+  esac
+  read -r chime_at _ chime_err chime_seen <<<"$chime"
+  read -r answer_at answer_lead answer_err answer_seen <<<"$answer"
+  whole_number "$chime_at" && whole_number "$answer_at" && whole_number "$chime_err" && whole_number "$answer_lead" \
+    && whole_number "$answer_err" && whole_number "$chime_seen" && whole_number "$answer_seen" || return 1
+  if ((chime_seen != answer_seen)); then
+    answer_why="the speaker had $((answer_seen - chime_seen)) disruptions (replays, underruns or failures) between the chime's audible time and the answer's, which can make the chime play later than its audible time"
+    return 1
+  fi
+  gap_us=$(((answer_at - answer_lead - answer_err) - (chime_at + chime_err) - 2 * audible_error_us))
+  if ((gap_us < 0)); then
+    answer_why="the answer's audible time is within its error of the chime's"
+    return 1
+  fi
+  answer_from=$((sound_at[$3] - chime_attack_us * sample_rate / 1000000 + gap_us * sample_rate * 4999 / (1000000 * 5000) - 1))
+}
 step_playback_cancel() {
   local i q wake first spoken_count speech_at wait_ms stop_ats=() question_starts=() question_wakes=()
   local question_firsts=() heard=() heard_early=() deadline max xruns streams ways next chime boundary_unknown
-  local underruns played worst rc calib_from calib_to calib calib_len calib_ms calib_unknown alone_until
+  local underruns played worst rc calib_from calib_to calib calib_len calib_ms calib_unknown alone_until audible_noted=
   speaker_status
   start_rig_run
   # The calibration: the wake sound alone, while the rig records, then quiet until the first question.
@@ -2610,6 +2823,10 @@ step_playback_cancel() {
   done
   played=$(running_ms)
   stop_poller
+  # The audible and first_audio lines, before the recording stops and the step reads the rest of the
+  # journal: an answer's audible line is the one that names its first_audio's speech.
+  audible_lines=$(timing_events | jq -c 'select(.event == "audible" or .event == "first_audio")') \
+    || unknown "voice timing log: cannot read the journal of $unit (process $unit_pid)$(journal_error)"
   analyse_rig
   # The calibration is the first sound that starts while play-sound played. It must be alone: it ends,
   # and no other sound starts, before the step's first question. The calibration decides only whether
@@ -2679,16 +2896,31 @@ step_playback_cancel() {
         ((sound_len[chime] <= calib_len + chime_tolerance_ms * 1000)) \
           || fail "playback-cancel stop $((i + 1)): the sound at the next question's chime is not the chime alone: it lasts $((sound_len[chime] / 1000)) ms, more than the calibration, the wake sound played alone ($calib_ms ms), by over $chime_tolerance_ms ms"
       fi
-      # first_audio is when the answer's first frame was handed to the speaker (internal/audio,
-      # Output.next reads the clock before it writes the frame), so the answer is heard at it or
-      # later: a sound after the chime that starts before it is audio of the cancelled answer, and
-      # one that may start before it may be.
       if [[ -z ${question_firsts[q]} ]]; then
         boundary_unknown=${boundary_unknown:-"playback-cancel stop $((i + 1)): the timing log has no first_audio for the next question's answer, so the quiet after its chime cannot be checked"}
-      elif ((chime + 1 < ${#sound_on[@]} && sound_on[chime + 1] < question_firsts[q])); then
-        fail "playback-cancel stop $((i + 1)): a sound at the rig microphone starts $((sound_on[chime + 1] - sound_off[chime])) ms after the next question's chime ends, before its answer's first audio ($((question_firsts[q] - sound_on[chime + 1])) ms later): audio of the cancelled answer"
-      elif ((chime + 1 < ${#sound_on[@]} && sound_on_early[chime + 1] < question_firsts[q])); then
-        boundary_unknown=${boundary_unknown:-"playback-cancel stop $((i + 1)): a sound at the rig microphone starts between $((sound_on_early[chime + 1] - question_firsts[q])) and $((sound_on[chime + 1] - question_firsts[q])) ms from the next answer's first audio, after the chime, so whether it is audio of the cancelled answer is not known"}
+      elif answer_earliest "${question_wakes[q]}" "${question_firsts[q]}" "$chime"; then
+        # The answer is heard at the rig no earlier than sample answer_from: a sound after the chime
+        # that starts before it is audio of the cancelled answer. The NOTE, before any verdict on
+        # this stop, shows that the chime timed it (Sol's review of #156 at 21b41d02).
+        note "playback-cancel stop $((i + 1)): the next answer is timed against its chime in the same recording"
+        if ((chime + 1 < ${#sound_on[@]} && sound_at[chime + 1] < answer_from)); then
+          fail "playback-cancel stop $((i + 1)): a sound at the rig microphone starts $(((answer_from - sound_at[chime + 1]) * 1000 / sample_rate)) ms or more before the next question's answer can be heard there (timed against its chime in the same recording): audio of the cancelled answer"
+        fi
+      else
+        # No audible times this build, or none usable (answer_why): first_audio is when the
+        # answer's first frame was handed to the speaker (internal/audio, Output.next reads the
+        # clock before it writes the frame), so the answer is heard at it or later: a sound after
+        # the chime that starts before it is audio of the cancelled answer, and one that may start
+        # before it may be.
+        if [[ $audible_noted != *"[$answer_why]"* ]]; then
+          note "playback-cancel stop $((i + 1)): $answer_why, so a sound after its chime is timed against the answer's first_audio, and a leak that starts within the speaker's queue before it is not seen"
+          audible_noted+="[$answer_why]"
+        fi
+        if ((chime + 1 < ${#sound_on[@]} && sound_on[chime + 1] < question_firsts[q])); then
+          fail "playback-cancel stop $((i + 1)): a sound at the rig microphone starts $((sound_on[chime + 1] - sound_off[chime])) ms after the next question's chime ends, before its answer's first audio ($((question_firsts[q] - sound_on[chime + 1])) ms later): audio of the cancelled answer"
+        elif ((chime + 1 < ${#sound_on[@]} && sound_on_early[chime + 1] < question_firsts[q])); then
+          boundary_unknown=${boundary_unknown:-"playback-cancel stop $((i + 1)): a sound at the rig microphone starts between $((sound_on_early[chime + 1] - question_firsts[q])) and $((sound_on[chime + 1] - question_firsts[q])) ms from the next answer's first audio, after the chime, so whether it is audio of the cancelled answer is not known"}
+        fi
       fi
       break
     done
@@ -3120,7 +3352,7 @@ fi
 
 # Before any change: refuse unless the Pi can run this without recording the room, and unless
 # what the restore puts back is the unit as a person left it.
-for command in aplay arecord ffmpeg cmp; do
+for command in aplay arecord cmp; do
   command -v "$command" >/dev/null || refuse "missing required command: $command"
 done
 grep -Eq '^Protocols:.* ws( |$)' <<<"$(curl --version)" || refuse 'this curl cannot subscribe to /ws: its Protocols line has no ws'

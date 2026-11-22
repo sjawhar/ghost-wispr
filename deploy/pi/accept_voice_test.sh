@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 # Runs every step of deploy/pi/accept-voice.sh against a fake Pi, with no root, no sound card and no
 # network. One Python module, fakepi.py, is every fake command on PATH (systemctl, curl, aplay,
-# arecord, ffmpeg, journalctl) and the unit's binary; a fake sudo runs a command as root; a real
+# arecord, journalctl) and the unit's binary; a fake sudo runs a command as root; a real
 # SQLite database holds the saved capture state; and a fake service process holds that database open
 # with the .env's variables in its environment, as ghost-wispr.service does.
 #
 # The fake voice reacts to each injected clip by writing a timeline: /ws events, voice timing lines,
 # log lines, the sounds the speaker plays, and the questions to agents. A stop cuts a sound and the
 # events it would still have caused. The fake curl streams /ws from the timeline, the fake journalctl
-# prints its journal, the fake ffmpeg reports its sounds in a recording, and the fake service writes
+# prints its journal, the fake arecord writes its sounds into a recording, and the fake service writes
 # the speaker's /proc status from it. With that status, the service applies the voice's stops and
 # XRUNs itself, so that what the driver reads does not hang on how soon a loaded machine runs a fake:
 # a stop line comes only once the status shows the drop, and an XRUN lasts exactly one read of the
@@ -71,6 +71,7 @@ readonly config_yaml=$'db_path: data/ghost-wispr.db\nspeaker_device: J75\nmic_de
 
 cat >"$fakepi" <<'EOF'
 """The fake Pi of accept_voice_test.sh: every fake command, chosen by its first argument."""
+import array
 import errno
 import fcntl
 import json
@@ -78,6 +79,7 @@ import os
 import signal
 import re
 import sqlite3
+import struct
 import subprocess
 import sys
 import time
@@ -420,14 +422,18 @@ def start():
     write("voice.json", "{}")
     environment = {k: v for k, v in os.environ.items() if k == "PATH" or k.startswith("GW_FAKE_") or k == "GHOST_WISPR_DEPLOY_DIR"}
     environment.update(variables)
-    process = subprocess.Popen(
-        [sys.executable, os.path.abspath(__file__), "service"],
-        env=environment,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        start_new_session=True,
-    )
+    # The service's stderr goes to service.err, which the self-test reports: a fake service that
+    # dies of an exception would otherwise end silently, and every later wait on it would read as
+    # a timeout of the driver's.
+    with open(spath("service.err"), "ab") as err:
+        process = subprocess.Popen(
+            [sys.executable, os.path.abspath(__file__), "service"],
+            env=environment,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=err,
+            start_new_session=True,
+        )
     write("main.pid", "%d\n" % process.pid)
     emit(kind="raw", due=now_ms(), text="2026/11/19 10:00:00 ghost-wispr: starting", pid=process.pid)
     if "earlier-boot" in SCENARIO:
@@ -687,18 +693,45 @@ def voice_state(fn):
 # written (internal/audio, Output.next), is heard 30 ms later. A cancel drops the queue, so a
 # speech's sound ends where its cut puts it.
 SPEAKER_QUEUE_MS = 30
+# The service's "audible" line for each speech on the chime or the voice input gives when its first
+# sample left the speaker's buffer, by the stream's account (audible_mono_ns); the service logs it
+# once that time has passed, stamped at it (#154), and the rig hears it DEVICE_LATENCY_MS later, the
+# same for both inputs: 8 ms, or 25 ms with device-latency-25. The voice, at 24 kHz, leads by its
+# resampler's filter (65 samples at 48 kHz); each time is good to about 1 us. Every line counts no
+# disruption, but with audible-disrupted the voice's counts one, as after an underrun between the
+# chime and the answer.
+# With no-audible the service logs no such lines, as a build before them.
+DEVICE_LATENCY_MS = 25 if "device-latency-25" in SCENARIO else 8
+
+
+def speech_number(tag):
+    """The number the speaker gives the speech TAG (internal/audio, SpeechEvent.Speech), the same on
+    its first_audio, speech_end and audible lines: one per tag, from its bytes."""
+    return 1 + sum(byte * 257**i for i, byte in enumerate(tag.encode())) % 1_000_003 if tag else 0
+
+
+def audible(input_name, heard, session, tag=None):
+    """The service's audible line for a sound on INPUT_NAME the rig hears at HEARD."""
+    if "no-audible" in SCENARIO:
+        return
+    emit(kind="timing", due=heard - DEVICE_LATENCY_MS, event="audible", input=input_name, session_id=session,
+         speech=speech_number(tag), audible_mono_ns=(heard - DEVICE_LATENCY_MS) * 1_000_000,
+         audible_lead_ns=1_354_167 if input_name == "voice" else 0,
+         audible_err_ns=1001, disruptions=1 if input_name == "voice" and "audible-disrupted" in SCENARIO else 0,
+         **({"tag": tag} if tag else {}))
 
 
 def speech(tag, start, length, session="session-1", fact=None):
     """The voice speaks: its first frame, the fact sentence, the sound, the speaker's stream line,
     the end of its speech and voice_spoken."""
-    emit(kind="timing", due=start, tag=tag, event="first_audio", session_id=session)
+    emit(kind="timing", due=start, tag=tag, event="first_audio", session_id=session, speech=speech_number(tag))
     emit(kind="timing", due=start if fact is None else fact, tag=tag, event="fact_audio", session_id=session)
     # As internal/audio's alsaStream logs it for the hw_params new_case writes (480 and 1920 frames
     # at 48 kHz): period and buffer are time.Durations, which the journal holds in nanoseconds.
     emit(kind="log", due=start, tag=tag, level="INFO", msg="speaker stream", fields={"device": "plughw:CARD=J75,DEV=0", "rate": 48000, "channels": 2, "period": 10_000_000, "buffer": 40_000_000, "rewind": True})
     emit(kind="sound", start=start + SPEAKER_QUEUE_MS, end=start + length, tag=tag)
-    emit(kind="timing", due=start + length, tag=tag, event="speech_end", session_id=session)
+    audible("voice", start + SPEAKER_QUEUE_MS, session, tag)
+    emit(kind="timing", due=start + length, tag=tag, event="speech_end", session_id=session, speech=speech_number(tag))
     spoken(tag, start + length, session)
 
 
@@ -733,7 +766,7 @@ def end_answer_after(clip_start, clip_end):
             # A cut whose sound plays out to its end (drain) at the moment it is cut: the speech's own
             # end, then speech_end and voice_spoken at that moment.
             emit(kind="cut", tag=item["tag"], at=at, sound_end=at, drain=True)
-            emit(kind="timing", due=at, tag=item["tag"], event="speech_end", session_id="session-1")
+            emit(kind="timing", due=at, tag=item["tag"], event="speech_end", session_id="session-1", speech=speech_number(item["tag"]))
             spoken(item["tag"], at, "session-1")
             break
 
@@ -773,6 +806,21 @@ def react(kind, key, start, end):
             # and here runs into it, less than silence_ms apart, as one sound.
             if "leak-before-first" in SCENARIO:
                 emit(kind="sound", start=end + 700 - 80, end=end + 700 - 60, tag="leaked-word")
+            # leak-in-queue: a 12 ms word from 15 to 27 ms after the answer's first_audio, ending 3 ms
+            # before the answer is heard: within the speaker's queue, so after first_audio, and
+            # running into the answer as one sound. Only timing the answer against the chime sees it.
+            if "leak-in-queue" in SCENARIO:
+                emit(kind="sound", start=end + 700 + 15, end=end + 700 + 27, tag="leaked-word")
+                # leaked-word-audible: the leaked word's own speech logs an audible line too, its own
+                # speech number, earlier than the answer's: the line nearest first_audio is then the
+                # word's (Sol's review of #156 at 053df77c).
+                if "leaked-word-audible" in SCENARIO:
+                    audible("voice", end + 700 + 15, "session-1", "leaked-word")
+            # capture-gap: the rig's capture loses 250 ms between this question's chime and its
+            # answer, as an overrun does, which the fake arecord reports: every later sound sits
+            # 250 ms earlier in the file (Sol's review of #156 at 053df77c).
+            if "capture-gap" in SCENARIO:
+                emit(kind="capture-gap", start=start + 600, end=start + 850)
         wake = start + 150
         chime = 120
         if "late-chime" in SCENARIO:
@@ -789,6 +837,7 @@ def react(kind, key, start, end):
         emit(kind="ws", due=wake + 20, event={"type": "transcript", "session_id": "session-1", "speaker": 0, "text": "the injected question", "start_time": 0})
         if not ("no-chime-after-stop" in SCENARIO and read("stop-count")):
             emit(kind="sound", start=wake + chime, end=wake + chime + chime_heard, tag="chime-%d" % n)
+            audible("chime", wake + chime, "")
         emit(kind="ws", due=end + 200, event={"type": "voice_exchange_started", "session_id": "session-1"})
         emit(kind="timing", due=end + 200, event="turn_end", session_id="session-1")
         tag = "speech-%d" % n
@@ -799,7 +848,7 @@ def react(kind, key, start, end):
             # A filler early, then the fact at 5 s: the verification's negative control (a filler at
             # 0.3 s). Here the filler starts at 0.5 s, so that 150 ms of silence part it from the
             # chime and the recording holds it as a sound of its own.
-            emit(kind="timing", due=end + 500, tag=tag, event="first_audio", session_id="session-1")
+            emit(kind="timing", due=end + 500, tag=tag, event="first_audio", session_id="session-1", speech=speech_number(tag))
             emit(kind="sound", start=end + 500, end=end + 900, tag=tag)
             emit(kind="timing", due=end + 5000, tag=tag, event="fact_audio", session_id="session-1")
             emit(kind="sound", start=end + 5000, end=end + 5600, tag=tag)
@@ -1077,6 +1126,62 @@ def joined_probe(args):
 # ---- recordings ----
 
 
+def wav_header(data_bytes):
+    """A WAV header as arecord writes one, for mono PCM16 at 24 kHz: 0x7fffffff bytes of data while it
+    records, and its true size once it ends."""
+    return b"RIFF" + struct.pack("<I", min(data_bytes + 36, 0xFFFFFFFF)) + b"WAVEfmt " + \
+        struct.pack("<IHHIIHH", 16, 1, 1, 24000, 48000, 2, 16) + b"data" + struct.pack("<I", data_bytes)
+
+
+# The fake rig hears a sound as a square wave of this amplitude, about -12 dBFS, over every threshold
+# the driver uses; silence is digital zeros.
+SOUND_AMPLITUDE = 8000
+
+
+def render(path):
+    """Write into the recording at PATH, in place, the sounds the timeline put in it: zeros elsewhere.
+    A sound's place in the file is its time since the recording began (the recordings log's last
+    entry for PATH, which an overrun moves on), in ms of the rig's clock; a quiet stretch is a pause in
+    whatever plays then. The size of the file does not change, so the anchors the driver read stand."""
+    if not os.path.exists(path):
+        return
+    size = os.path.getsize(path)
+    count = max(0, (size - 44) // 2)
+    samples = array.array("h", bytes(2 * count))
+    begun = None
+    for line in read("recordings").splitlines():
+        name, _, at = line.rpartition(" ")
+        if name == path:
+            begun = int(at)
+    if begun is not None and "silent" not in SCENARIO:
+        duration = count / 24
+        sounds, quiets = [], []
+        items = timeline()
+        # A capture gap loses what played during it: every later sound sits that much earlier.
+        gaps = [(i["start"], i["end"]) for i in items if i["kind"] == "capture-gap"]
+
+        def captured(at):
+            return at - begun - sum(max(0, min(at, b) - max(a, begun)) for a, b in gaps)
+
+        for item in items:
+            if item["kind"] in ("sound", "quiet"):
+                a, b = max(captured(item["start"]) * CLOCK, 0), min(captured(item["end"]) * CLOCK, duration)
+                if b > a:
+                    (sounds if item["kind"] == "sound" else quiets).append([a, b])
+        for qa, qb in quiets:
+            sounds = [piece for a, b in sounds for piece in ([[a, b]] if qb <= a or qa >= b else [p for p in ([a, qa], [qb, b]) if p[1] > p[0]])]
+        for a, b in sounds:
+            first, last = round(a * 24), min(round(b * 24), count)
+            if last > first:
+                tone = array.array("h", [SOUND_AMPLITUDE, -SOUND_AMPLITUDE]) * ((last - first + 1) // 2)
+                samples[first:last] = tone[:last - first]
+    if sys.byteorder == "big":
+        samples.byteswap()
+    with open(path, "r+b") as f:
+        f.write(wav_header(2 * count))
+        f.write(samples.tobytes())
+
+
 def arecord(args):
     if args[:1] == ["-l"]:
         print("card 2: Loopback [Loopback], device 0: Loopback PCM [Loopback PCM]" if "no-loopback" not in SCENARIO else "")
@@ -1087,9 +1192,12 @@ def arecord(args):
     log_to("arecord.log", " ".join(args))
     path = args[-1]
     if "-d" in args:
+        # The room, for so many seconds: a hum that peaks at -62 dBFS, or -5 dBFS with loud-room.
         seconds = int(args[args.index("-d") + 1])
+        level = round(32768 * 10 ** ((-5.0 if "loud-room" in SCENARIO else -62.0) / 20))
         with open(path, "wb") as f:
-            f.write(bytes(44 + seconds * 48000))
+            f.write(wav_header(seconds * 48000))
+            f.write((array.array("h", [level, -level]) * (seconds * 12000)).tobytes())
         return 0
     # The capture substream arecord holds, in the case's /proc/asound: its status names arecord as
     # owner_pid, with the trigger_time the kernel sets at every start, stop (an overrun's included),
@@ -1126,9 +1234,11 @@ def arecord(args):
                 f.write("closed\n")
 
     def overrun(ms):
-        """arecord's own line for an overrun (alsa-utils aplay.c, xrun), which -q does not quiet."""
+        """arecord's own line for an overrun (alsa-utils aplay.c, xrun), which -q does not quiet;
+        the fake also logs it (overruns), so the self-test knows an overrun truly came."""
         sys.stderr.write("overrun!!! (at least %.3f ms long)\n" % ms)
         sys.stderr.flush()
+        log_to("overruns", "%d %.3f" % (now_ms(), ms))
 
     # arecord-terminal-stall (Sol's review of #149 at b7edd969): arecord stalls in a write of audio
     # it already read, its capture overruns, and the sampler is held up for as long. Stopped, arecord
@@ -1176,7 +1286,7 @@ def arecord(args):
         else:
             f.write(data)
             f.flush()
-    put(bytes(44), "wb")
+    put(wav_header(0x7FFFFFFF), "wb")
     # The file's first sample is captured once its whole header is written, as arecord's first
     # read starts its capture only then, and stamped in whole milliseconds rounded up, so never
     # before the header. arecord-slow-start reads 1.5 s after the header, as an arecord its
@@ -1230,7 +1340,7 @@ def arecord(args):
         # behind for 2 s, as an arecord the machine holds back writes late, so that the anchor after
         # the chime is late, and then catch up, well before the step stops the recording;
         # arecord-overrun loses 250 ms of audio for good, as an arecord overrun does, so that every
-        # later sound sits 250 ms earlier in the file (and the recordings log says so for ffmpeg);
+        # later sound sits 250 ms earlier in the file (and the recordings log says so for render);
         # arecord-dies ends the recording 1 s later. From the start, arecord-behind keeps the file
         # 50 ms behind for the whole recording, as a loaded machine does, so that every anchor is
         # read 50 ms late and no later anchor makes up for it; 50 ms and the loop's 5 ms stay within
@@ -1239,6 +1349,9 @@ def arecord(args):
         # its buffer and the interrupt's 1 ms: the fake says so too when its own stall, with the lag
         # it keeps, leaves a sample unwritten that long, as a loaded machine can hold the fake back.
         aplays, lag_until, skip, last = read("aplays", "0"), None, 0, now_ms()
+        # capture-gap: the samples of a capture gap are never written (lost), and arecord reports
+        # the overrun that lost them, once.
+        lost, gap_reported = 0, False
         # From the first clip played after the recording began: capture-silent-xrun shows the
         # capture substream in XRUN for 600 ms, longer than the sampler's 0.5 s between reads, and
         # prints nothing, as an arecord stopped in a stalled write never reads again to report it;
@@ -1264,11 +1377,17 @@ def arecord(args):
                     log_to("recordings", "%s %d" % (path, begun + skip))
             if "arecord-dies" in SCENARIO and lag_until is not None and t > lag_until + 1000:
                 return 1
-            if clipped is None and SCENARIO & {"capture-silent-xrun", "capture-silent-restart", "arecord-suspend"} and read("aplays", "0") != aplays:
+            if clipped is None and SCENARIO & {"capture-silent-xrun", "capture-silent-restart", "arecord-suspend", "sampler-crash"} and read("aplays", "0") != aplays:
                 clipped = t
                 if "arecord-suspend" in SCENARIO and "-q" not in args:
                     sys.stderr.write("Suspended. Trying resume. Done.\n")
                     sys.stderr.flush()
+                # sampler-crash: a status with a byte that is not utf-8, which the sampler's read of
+                # the substream's state raises on: a sampler that fails partway, whose failure the
+                # driver must name (c28 of #156 hid a traceback behind "after its last anchor").
+                if "sampler-crash" in SCENARIO and substream:
+                    with open(os.path.join(substream, "status"), "wb") as g:
+                        g.write(b"state: RUNNING\nowner_pid   : %d\ntrigger_time: %s\n\xff\n" % (os.getpid(), trigger[0].encode()))
             if SCENARIO & {"capture-silent-xrun", "capture-silent-restart"} and clipped is not None:
                 state = "XRUN" if t < clipped + (600 if "capture-silent-xrun" in SCENARIO else 30) else "RUNNING"
                 if state != shown:
@@ -1303,8 +1422,13 @@ def arecord(args):
                 while True:  # no read comes that would report the overrun; SIGTERM ends it
                     time.sleep(1)
             lag = (1000 if lag_until is not None and t < lag_until else 0) + (50 if "arecord-behind" in SCENARIO else 0)
+            if "capture-gap" in SCENARIO:
+                lost = sum(max(0, min(t, i["end"]) - i["start"]) for i in timeline() if i["kind"] == "capture-gap")
+                if lost > 0 and not gap_reported:
+                    overrun(250)
+                    gap_reported = True
             # Whole 2-byte samples at 24 kHz of the rig's clock, CLOCK times the Pi's.
-            target = 2 * int((t - lag - skip - begun) * CLOCK * 24)
+            target = 2 * int((t - lag - skip - lost - begun) * CLOCK * 24)
             if target > written:
                 put(bytes(target - written))
                 written = target
@@ -1312,6 +1436,7 @@ def arecord(args):
                     os.kill(pid, signal.SIGCONT)
                 frozen = []
     finally:
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
         # arecord-final-rewrite: as arecord ends, it seeks back to write the data chunk's size into
         # the header (alsa-utils aplay.c, end_wave) and holds 800 ms before it closes: its offset in
         # the file is then 44, though the file holds the whole recording.
@@ -1325,58 +1450,9 @@ def arecord(args):
         for pid in frozen:
             os.kill(pid, signal.SIGCONT)
         close_substream()
-
-
-def ffmpeg(args):
-    path = args[args.index("-i") + 1]
-    if not os.path.exists(path):
-        sys.stderr.write("%s: No such file or directory\n" % path)
-        return 1
-    duration = (os.path.getsize(path) - 44) / 48
-    sys.stderr.write("Input #0, wav, from '%s':\n  Duration: %02d:%02d:%02d.%02d, bitrate: 384 kb/s\n" % (path, duration // 3600000, duration // 60000 % 60, duration // 1000 % 60, duration % 1000 // 10))
-    filters = args[args.index("-af") + 1]
-    if filters.startswith("volumedetect"):
-        sys.stderr.write("[Parsed_volumedetect_0 @ 0x1] max_volume: %s dB\n" % ("-5.0" if "loud-room" in SCENARIO else "-62.0"))
-        return 0
-    minimum = float(filters.split("d=")[1]) * 1000
-    begun = None
-    for line in read("recordings").splitlines():
-        name, _, at = line.rpartition(" ")
-        if name == path:
-            begun = int(at)
-    sounds = []
-    quiets = []
-    if begun is not None and "silent" not in SCENARIO:
-        for item in timeline():
-            if item["kind"] in ("sound", "quiet"):
-                # A sound's place in the file, in ms of the rig's clock; a quiet stretch is a pause
-                # in whatever plays then.
-                a, b = max((item["start"] - begun) * CLOCK, 0), min((item["end"] - begun) * CLOCK, duration)
-                if b > a:
-                    (sounds if item["kind"] == "sound" else quiets).append([a, b])
-    for qa, qb in quiets:
-        sounds = [piece for a, b in sounds for piece in ([[a, b]] if qb <= a or qa >= b else [p for p in ([a, qa], [qb, b]) if p[1] > p[0]])]
-    sounds.sort()
-    merged = []
-    for a, b in sounds:
-        if merged and a <= merged[-1][1] + minimum:
-            merged[-1][1] = max(merged[-1][1], b)
-        else:
-            merged.append([a, b])
-    # As ffmpeg prints them: %.6g, six significant digits.
-    out = []
-    cursor = 0
-    for a, b in merged:
-        if a - cursor >= minimum or (cursor == 0 and a > 0 and a >= minimum):
-            out.append("[silencedetect @ 0x1] silence_start: %.6g" % (cursor / 1000))
-            out.append("[silencedetect @ 0x1] silence_end: %.6g | silence_duration: %.6g" % (a / 1000, (a - cursor) / 1000))
-        cursor = b
-    if duration - cursor >= minimum:
-        out.append("[silencedetect @ 0x1] silence_start: %.6g" % (cursor / 1000))
-        out.append("[silencedetect @ 0x1] silence_end: %.6g | silence_duration: %.6g" % (duration / 1000, (duration - cursor) / 1000))
-    out.append("size=N/A time=00:00:01.00 bitrate=N/A speed= 500x")
-    sys.stderr.write("\n".join(out) + "\n")
-    return 0
+        if f is not None:
+            f.close()
+        render(path)
 
 
 # ---- the journal ----
@@ -1429,8 +1505,9 @@ def journalctl(args):
         elif item["kind"] == "timing":
             # As cmd/ghost-wispr/voice.go's voiceTiming logs it.
             fields = {"event": item["event"], "session_id": item["session_id"], "at_unix_ns": wall_ms(due) * 1_000_000, "at_mono_ns": due * 1_000_000}
-            if item.get("reason"):
-                fields["reason"] = item["reason"]
+            for extra in ("reason", "input", "speech", "audible_mono_ns", "audible_lead_ns", "audible_err_ns", "disruptions"):
+                if extra in item and item[extra] != "":
+                    fields[extra] = item[extra]
             records.append(journal_record(due, "INFO", "voice timing", fields))
         elif item["kind"] == "log":
             records.append(journal_record(due, item["level"], item["msg"], item["fields"]))
@@ -1736,7 +1813,7 @@ def person(args):
 
 if __name__ == "__main__":
     tool = sys.argv[1]
-    handlers = {"systemctl": systemctl, "curl": curl, "aplay": aplay, "arecord": arecord, "ffmpeg": ffmpeg, "journalctl": journalctl, "binary": binary,
+    handlers = {"systemctl": systemctl, "curl": curl, "aplay": aplay, "arecord": arecord, "journalctl": journalctl, "binary": binary,
                 "ss": ss, "getent": getent, "person": person}
     if tool == "service":
         service()
@@ -1744,7 +1821,7 @@ if __name__ == "__main__":
     sys.exit(handlers[tool](sys.argv[2:]) or 0)
 EOF
 
-for tool in systemctl curl aplay arecord ffmpeg journalctl ss getent; do
+for tool in systemctl curl aplay arecord journalctl ss getent; do
   if [[ $tool == systemctl ]]; then
     cat >"$root/bin/$tool" <<EOF
 #!/usr/bin/env bash
@@ -2051,6 +2128,94 @@ floor_decided() {
   floor_cases=$((floor_cases + 1))
 }
 
+# The driver's NOTE for a stop whose next answer it times against its chime, as a whole line.
+readonly chime_note_re='^NOTE: playback-cancel stop [0-9]+: the next answer is timed against its chime in the same recording$'
+
+# expect_timed_against_chime NAME: the case's answers were timed against their chimes in the same
+# recording (the driver's NOTE, whole), and none against first_audio, the threshold whose window the
+# recording's early bounds can cover on a loaded machine (#146's h3 and #149's g1 read UNKNOWN there).
+expect_timed_against_chime() {
+  grep -Eq -- "$chime_note_re" "$root/$1/out" \
+    || check_failed "$1: no line is the driver's NOTE that a next answer is timed against its chime; output: $(tr '\n' '|' <"$root/$1/out")"
+  expect_no_line "$1" "so a sound after its chime is timed against the answer's first_audio"
+  expect_no_line "$1" "from the next answer's first audio, after the chime"
+}
+
+# chime_case NAME, then chime_counted NAME: a chime case's own assertions open their chime-relative
+# checks with chime_case, which is true when the fake did not overrun (capture_unbroken), and close
+# them with chime_counted. chime_counted counts NAME (chime_cases) only when none of those checks
+# failed and NAME's output holds the driver's NOTE, whole; a case whose checks passed with no NOTE
+# fails. Nothing else counts, and no output is scanned for it: a case that prints the NOTE but whose
+# assertions check no chime verdict (cancel-underrun, which FAILs on its underrun) must not stand
+# for the chime path (Sol's reviews of #156 at 21b41d02 and 428ab1a8). A run that counts none fails
+# (at the end), saying whether every chime case overran (the load) or one that did not still did not
+# count (a defect). chime_overran and chime_uncounted name those cases.
+chime_cases=0
+chime_failures=0
+chime_overran=()
+chime_uncounted=()
+chime_case() {
+  if capture_unbroken "$1"; then
+    chime_failures=$failures
+    return 0
+  fi
+  chime_overran+=("$1")
+  return 1
+}
+chime_counted() {
+  if ((failures != chime_failures)); then
+    chime_uncounted+=("$1")
+  elif grep -Eq -- "$chime_note_re" "$root/$1/out"; then
+    chime_cases=$((chime_cases + 1))
+  else
+    chime_uncounted+=("$1")
+    check_failed "$1: its chime checks passed with no line that is the driver's NOTE that a next answer is timed against its chime"
+  fi
+}
+
+# capture_unbroken NAME: true when the fake arecord did not overrun in the case, so that the case may
+# be held to the chime path. An overrun is a real break in the recording, so after one the time
+# between a chime and its answer does not count in the file's samples (Sol's review of #156 at
+# 053df77c). So where the fake arecord truly overran (its own log, overruns), which the driver must
+# name, the case falls back to first_audio: capture_unbroken prints a NOTE, checks the fallback's
+# NOTE, and is false, and the caller holds the case to what the fallback can say. It counts nothing:
+# a case with no overrun can still fall back by design (no audible lines, a disruption), so only a
+# chime case whose own chime-relative checks passed counts (chime_counted).
+capture_unbroken() {
+  fake_overran "$1" || return 0
+  printf 'NOTE: %s: the fake arecord overran (%s), so the case fell back to first_audio\n' "$1" "$(tr '\n' ';' <"$root/$1/state/overruns")"
+  expect_line "$1" 'the recording is not shown continuous'
+  return 1
+}
+
+# fake_overran NAME: whether the fake arecord truly overran in NAME (its own log, overruns); the
+# driver must have named the overrun exactly then.
+fake_overran() {
+  local overran=false noted=false
+  [[ -s $root/$1/state/overruns ]] && overran=true
+  grep -Fq "NOTE: recording: arecord reported an overrun" "$root/$1/out" && noted=true
+  if [[ $overran != "$noted" ]]; then
+    check_failed "$1: the fake logged an overrun: $overran; the driver named one: $noted"
+  fi
+  [[ $overran == true ]]
+}
+
+# expect_load_case NAME: a load case. With no overrun, it must PASS, each answer timed against its
+# chime: an UNKNOWN there stays a failure of the acceptance line. Only in a run where the fake truly
+# overran (capture_unbroken) may it fall back to first_audio, and then it must not FAIL; it may read
+# UNKNOWN, #146's stated limit, the honest answer across a break in the recording.
+expect_load_case() {
+  if chime_case "$1"; then
+    expect_rc "$1" 0
+    expect_line "$1" "PASS: playback-cancel: no stop's speech was heard at the rig microphone 20 ms after it"
+    expect_timed_against_chime "$1"
+    chime_counted "$1"
+    return
+  fi
+  expect_rc "$1" 0 2
+  expect_no_line "$1" 'FAIL: playback-cancel'
+}
+
 # expect_between NAME GOT LOW HIGH: GOT is a number of milliseconds from LOW to HIGH. NAME starts
 # with its case's name; when GOT is missing or out of range, the message also gives that case's
 # output and the fake's stops.log, since a tail that was never measured can have any cause, and an
@@ -2263,6 +2428,10 @@ launch barge-pause-suspend answer-until-clip,backchannel-pause-500,arecord-slow-
 # again from a new trigger_time (capture-silent-restart): continuity is not shown, so UNKNOWN with
 # a NOTE, never PASS.
 launch barge-pause-silent-restart answer-until-clip,backchannel-pause-500,arecord-slow-start,capture-buffer-250,capture-silent-restart yes -- --step barge-in --talkovers 1 --backchannels 1 --question @question.wav --talkover-dir @talkovers --backchannel-dir @backchannels --rig-mic "$rig" --event-timeout 15
+# The same pause with the sampler failing partway (sampler-crash: a capture status it cannot decode):
+# its anchors stop, so UNKNOWN naming the sampler's failure and its stderr, never PASS, and never the
+# "after its last anchor" that hid c28's traceback (#156).
+launch barge-pause-sampler-crash answer-until-clip,backchannel-pause-500,sampler-crash yes -- --step barge-in --talkovers 1 --backchannels 1 --question @question.wav --talkover-dir @talkovers --backchannel-dir @backchannels --rig-mic "$rig" --event-timeout 15
 # The same pause with the substream's status giving no trigger_time (capture-no-trigger): RUNNING
 # alone cannot show the substream ran on without a restart, so UNKNOWN with a NOTE naming the missing
 # trigger, never PASS (Sol's review of #149 at 9b3d27cb).
@@ -2295,8 +2464,12 @@ launch barge-backchannel-terminal-stall answer-until-clip,backchannel-stops,arec
 # rounds (--stops 2) and tells the fake so (stop-rounds-2): each round's answer then plays until its
 # stop arrives, however late the driver plays the stop. A stop played after a 7 s answer's natural
 # end, as a driver held up by its machine plays it (cancel-late-stop, with late-clip), still stops
-# speech and is timed.
-readonly cancel_args="--step playback-cancel --stops 2 --playback-seconds 3 --question @question.wav --stop-clip @stop.wav --rig-mic $rig --event-timeout 15"
+# speech and is timed. Each wait on the fake service (the voice's first audio, the poller's RUNNING,
+# the stop line) has the driver's own 60 s ceiling, as each answer has: the service's loop applies
+# the stops and writes the speaker's status, and on a loaded machine a 15 s wait on it ran out twice
+# (c7 and c9 in the chime PR's runs). The driver returns at each event, so a case is no slower for it,
+# and a service that died is named from its stderr (service.err), not taken for a slow one.
+readonly cancel_args="--step playback-cancel --stops 2 --playback-seconds 3 --question @question.wav --stop-clip @stop.wav --rig-mic $rig --event-timeout 60"
 # shellcheck disable=SC2086
 launch cancel long,asound,stop-rounds-2 yes -- $cancel_args
 # shellcheck disable=SC2086
@@ -2319,10 +2492,10 @@ launch cancel-locked long,asound,stop-rounds-2,arecord-hold-200,arecord-reopen,a
 # shellcheck disable=SC2086
 launch cancel-unsure long,asound,stop-rounds-2,arecord-slow-start,no-capture-params yes -- $cancel_args
 # The same with the capture substream known: the anchors' bound may still be up to 61 ms early, more
-# than the 30 ms the fake's answer is heard after its first_audio, so whether the sound after each
-# chime starts before first_audio is not known: UNKNOWN, a limit of the bound (#146 reads first_audio
-# as the earliest the answer is heard). PASS only where a loaded machine left the answer's first
-# samples unwritten long enough to narrow the bound; never FAIL.
+# than the 30 ms the fake's answer is heard after its first_audio. The answer is timed against its
+# chime in the same recording, where that slack cancels, so a good cancel is a PASS at any load
+# (on #149's driver, which timed it against first_audio, it was UNKNOWN). Where a loaded machine
+# makes the fake overrun, the case is cancel-unsure's start-only case: UNKNOWN, never PASS.
 # shellcheck disable=SC2086
 launch cancel-slow-read long,asound,stop-rounds-2,arecord-slow-start yes -- $cancel_args
 # shellcheck disable=SC2086
@@ -2366,6 +2539,40 @@ launch cancel-leak-after-chime long,asound,stop-rounds-2,leak-after-chime yes --
 # before the answer can be heard, so FAIL, never the PASS of an allowance before first_audio.
 # shellcheck disable=SC2086
 launch cancel-leak-before-first long,asound,stop-rounds-2,leak-before-first yes -- $cancel_args
+# The answer timed against its chime (the service's audible lines): a 12 ms word that ends 3 ms before
+# the answer is heard, inside the speaker's queue and after first_audio, FAIL, as it is with the
+# speaker 25 ms behind ALSA's account (device-latency-25), which cancels; a good cancel with that
+# latency, PASS. Without audible lines (no-audible), first_audio is the threshold: a good cancel,
+# PASS with a NOTE of the limit; the word inside the queue is not seen there, PASS or UNKNOWN;
+# the word before first_audio, FAIL.
+# shellcheck disable=SC2086
+launch cancel-leak-in-queue long,asound,stop-rounds-2,leak-in-queue yes -- $cancel_args
+# shellcheck disable=SC2086
+launch cancel-leak-in-queue-latency long,asound,stop-rounds-2,leak-in-queue,device-latency-25 yes -- $cancel_args
+# shellcheck disable=SC2086
+launch cancel-latency long,asound,stop-rounds-2,device-latency-25 yes -- $cancel_args
+# shellcheck disable=SC2086
+launch cancel-no-audible long,asound,stop-rounds-2,no-audible yes -- $cancel_args
+# shellcheck disable=SC2086
+launch cancel-leak-in-queue-no-audible long,asound,stop-rounds-2,leak-in-queue,no-audible yes -- $cancel_args
+# shellcheck disable=SC2086
+launch cancel-leak-before-first-no-audible long,asound,stop-rounds-2,leak-before-first,no-audible yes -- $cancel_args
+# The word inside the queue with an underrun between the chime's audible line and the answer's
+# (audible-disrupted): the chime may have played later than its line says, so the check falls back
+# to first_audio, with a NOTE of why; never the FAIL of a chime-timed threshold that cannot hold.
+# shellcheck disable=SC2086
+launch cancel-leak-in-queue-disrupted long,asound,stop-rounds-2,leak-in-queue,audible-disrupted yes -- $cancel_args
+# The word inside the queue, with its own audible line, earlier than the answer's
+# (leaked-word-audible): only the answer's own speech's line times it, so FAIL, never the PASS of
+# the voice's line nearest first_audio (Sol's review of #156 at 053df77c).
+# shellcheck disable=SC2086
+launch cancel-leak-in-queue-own-audible long,asound,stop-rounds-2,leak-in-queue,leaked-word-audible yes -- $cancel_args
+# A good cancel, with the rig's capture losing 250 ms between the second question's chime and its
+# answer (capture-gap), which arecord reports: the time between them does not count in the file's
+# samples, so the step falls back to first_audio with a NOTE and must not FAIL (Sol's review of
+# #156 at 053df77c: a false FAIL).
+# shellcheck disable=SC2086
+launch cancel-capture-gap long,asound,stop-rounds-2,capture-gap yes -- $cancel_args
 # shellcheck disable=SC2086
 launch cancel-quiet-chime long,asound,stop-rounds-2,quiet-chime yes -- $cancel_args
 # shellcheck disable=SC2086
@@ -2524,6 +2731,9 @@ for setup in "$root"/*/setup-error; do
 done
 for error in "$root"/*/state/fake-error; do
   [[ -e $error ]] && check_failed "${error%/state/fake-error}: the fake Pi: $(<"$error")"
+done
+for error in "$root"/*/state/service.err; do
+  [[ -s $error ]] && check_failed "${error%/state/service.err}: the fake service wrote to stderr: $(head -c 1500 "$error" | tr '\n' '|')"
 done
 for killed in "$root"/*/state/stop-killed; do
   [[ -e $killed ]] && printf 'NOTE: %s: the fake systemctl sent SIGKILL after its stop timeout: %s\n' \
@@ -3002,6 +3212,14 @@ expect_line barge-pause 'PASS: barge-in: 0 of 1 backchannels stopped the speech,
 expect_line barge-pause 'NOTE: barge-in round 2 (backchannel): the speech went on'
 grep -Fq '"kind": "quiet"' "$root/barge-pause/state/timeline.jsonl" || check_failed 'barge-pause: the fake voice did not pause'
 expect_restored barge-pause
+# The control: a sampler that ran clean says nothing of its own.
+expect_no_line barge-pause 'UNKNOWN: recording: the sampler of'
+expect_rc barge-pause-sampler-crash 2
+expect_line barge-pause-sampler-crash 'UNKNOWN: recording: the sampler of'
+expect_line barge-pause-sampler-crash 'UnicodeDecodeError'
+expect_no_line barge-pause-sampler-crash 'after its last anchor'
+expect_no_line barge-pause-sampler-crash 'PASS: barge-in: 0 of 1'
+expect_restored barge-pause-sampler-crash
 expect_rc barge-pause-unsure 2
 expect_line barge-pause-unsure 'UNKNOWN: barge-in: 0 of 1 backchannels stopped the speech, and backchannel rounds 2 may have'
 expect_no_line barge-pause-unsure 'PASS: barge-in: 0 of 1'
@@ -3048,10 +3266,9 @@ expect_no_line barge-backchannel-terminal-stall 'PASS: barge-in: 0 of 1'
 expect_restored barge-backchannel-terminal-stall
 
 # playback-cancel.
-expect_rc cancel 0
+expect_load_case cancel
 expect_line cancel 'PASS: playback-cancel: the poller sees the speaker'\''s stream run at '
 expect_line cancel 'NOTE: playback-cancel: calibration: the wake sound played alone (ghost-wispr play-sound) is heard at the rig microphone for 200 ms above -50 dB; a chime after a stop may be heard for up to 220 ms (the calibration and 20 ms)'
-expect_line cancel "PASS: playback-cancel: no stop's speech was heard at the rig microphone 20 ms after it"
 expect_line cancel 'NOTE: playback-cancel: the speaker logged 2 cancels: 0 by rewind, 2 by drop'
 expect_line cancel 'PASS: playback-cancel: 0 underruns over '
 expect_line cancel 'can miss a short underrun'
@@ -3068,23 +3285,34 @@ expect_rc cancel-held-start 0
 expect_line cancel-held-start "PASS: playback-cancel: no stop's speech was heard at the rig microphone 20 ms after it"
 expect_restored cancel-held-start
 expect_line cancel-held-start "NOTE: recording: arecord reported an overrun, so the recording's early bounds come from its start alone"
-expect_rc cancel-locked 0
-expect_line cancel-locked "PASS: playback-cancel: no stop's speech was heard at the rig microphone 20 ms after it"
+# arecord-hold-200 makes the fake report a 200 ms overrun, so the recording is never shown
+# continuous and the answer is timed against first_audio, whose window the start-only bounds can
+# cover on a loaded machine: UNKNOWN there is the honest answer, never FAIL (#149's g11 and c31 of
+# #156 read "starts between -1 and 31 ms from the next answer's first audio").
+expect_load_case cancel-locked
 [[ -s $root/cancel-locked/state/arecord-locked ]] || check_failed 'cancel-locked: the fake arecord never locked its file away, so the case tested no failed read'
 expect_restored cancel-locked
 expect_rc cancel-unsure 2
 expect_line cancel-unsure 'UNKNOWN: playback-cancel stop 1: the rig microphone did not hear the speech up to the stop'
 expect_no_line cancel-unsure "PASS: playback-cancel: no stop's speech was heard"
 expect_restored cancel-unsure
-expect_rc cancel-slow-read 2 0
-if floor_decided cancel-slow-read && [[ $(cat "$root/cancel-slow-read/rc" 2>/dev/null) == 2 ]]; then
-  expect_line cancel-slow-read "from the next answer's first audio, after the chime, so whether it is audio of the cancelled answer is not known"
+if floor_decided cancel-slow-read; then
+  chime_failures=$failures
+  expect_rc cancel-slow-read 0
+  expect_line cancel-slow-read "PASS: playback-cancel: no stop's speech was heard at the rig microphone 20 ms after it"
+  expect_timed_against_chime cancel-slow-read
+  chime_counted cancel-slow-read
+else
+  # An overrun leaves the start-only bounds, 1.5 s early here: cancel-unsure's case, which the
+  # answer's timing does not reach.
+  chime_overran+=(cancel-slow-read)
+  expect_rc cancel-slow-read 2
+  expect_line cancel-slow-read 'the rig microphone did not hear the speech up to the stop'
+  expect_no_line cancel-slow-read "PASS: playback-cancel: no stop's speech was heard"
 fi
-expect_no_line cancel-slow-read "FAIL: playback-cancel"
 expect_no_line cancel-slow-read 'NOTE: recording: no capture substream'
 expect_restored cancel-slow-read
-expect_rc cancel-slow-start 0
-expect_line cancel-slow-start "PASS: playback-cancel: no stop's speech was heard at the rig microphone 20 ms after it"
+expect_load_case cancel-slow-start
 expect_restored cancel-slow-start
 expect_rc cancel-rewind 0
 expect_line cancel-rewind "PASS: playback-cancel: no stop's speech was heard at the rig microphone 20 ms after it"
@@ -3126,10 +3354,18 @@ expect_not_passed() {
 # machine that holds the fake 11 ms past its 50 ms makes it overrun, and the case reads the
 # start-only bounds, which no residency moves. floor_decided says so in the run's output.
 floor_decided cancel-behind || true
-expect_rc cancel-behind 2
-expect_line cancel-behind "UNKNOWN: playback-cancel: stop "
-expect_line cancel-behind ", but no earlier than "
-expect_between 'cancel-behind: how long the good cancel is heard up to, 50 ms behind' "$(heard_up_to cancel-behind)" 50 110
+if fake_overran cancel-behind; then
+  # The start-only bounds can leave the next answer's start unknown first (a full run of #159, s6,
+  # read "a sound at the rig microphone starts between -19 and 82 ms from the next answer's first
+  # audio"): UNKNOWN either way, never PASS, never the FAIL of a good cancel.
+  expect_rc cancel-behind 2
+  expect_no_line cancel-behind "PASS: playback-cancel: no stop's speech was heard"
+else
+  expect_rc cancel-behind 2
+  expect_line cancel-behind "UNKNOWN: playback-cancel: stop "
+  expect_line cancel-behind ", but no earlier than "
+  expect_between 'cancel-behind: how long the good cancel is heard up to, 50 ms behind' "$(heard_up_to cancel-behind)" 50 110
+fi
 expect_line cancel-behind 'PASS: playback-cancel: 0 underruns'
 expect_no_line cancel-behind "FAIL: playback-cancel: a stop's speech was heard"
 expect_restored cancel-behind
@@ -3137,8 +3373,7 @@ expect_rc cancel-behind-drain 1
 expect_line cancel-behind-drain "FAIL: playback-cancel: a stop's speech was heard at the rig microphone "
 expect_between 'cancel-behind-drain: how long the negative control is heard, 50 ms behind' "$(heard_after cancel-behind-drain)" 450 1000
 expect_restored cancel-behind-drain
-expect_rc cancel-slow-wc 0
-expect_line cancel-slow-wc "PASS: playback-cancel: no stop's speech was heard at the rig microphone 20 ms after it"
+expect_load_case cancel-slow-wc
 expect_restored cancel-slow-wc
 expect_rc cancel-drain 1
 expect_line cancel-drain "FAIL: playback-cancel: a stop's speech was heard at the rig microphone "
@@ -3192,13 +3427,71 @@ expect_line cancel-leak-into-chime "FAIL: playback-cancel stop 1: the sound at t
 expect_restored cancel-leak-into-chime
 expect_rc cancel-leak-after-chime 1
 expect_line cancel-leak-after-chime "FAIL: playback-cancel stop 1: a sound at the rig microphone starts "
-expect_line cancel-leak-after-chime "after the next question's chime ends, before its answer's first audio"
+if chime_case cancel-leak-after-chime; then
+  expect_line cancel-leak-after-chime "before the next question's answer can be heard there (timed against its chime in the same recording)"
+  chime_counted cancel-leak-after-chime
+fi
 expect_restored cancel-leak-after-chime
 expect_rc cancel-leak-before-first 1
 expect_line cancel-leak-before-first "FAIL: playback-cancel stop 1: a sound at the rig microphone starts "
-expect_line cancel-leak-before-first "after the next question's chime ends, before its answer's first audio"
+if chime_case cancel-leak-before-first; then
+  expect_line cancel-leak-before-first "before the next question's answer can be heard there (timed against its chime in the same recording)"
+  chime_counted cancel-leak-before-first
+fi
 expect_no_line cancel-leak-before-first "PASS: playback-cancel: no stop's speech was heard"
 expect_restored cancel-leak-before-first
+# A leak inside the speaker's queue is seen only by the chime path; after an overrun the fallback can
+# miss it (#146's stated limit), so the case then says only that it fell back.
+if chime_case cancel-leak-in-queue; then
+  expect_rc cancel-leak-in-queue 1
+  expect_line cancel-leak-in-queue "before the next question's answer can be heard there (timed against its chime in the same recording)"
+  expect_no_line cancel-leak-in-queue "PASS: playback-cancel: no stop's speech was heard"
+  chime_counted cancel-leak-in-queue
+fi
+expect_restored cancel-leak-in-queue
+if chime_case cancel-leak-in-queue-latency; then
+  expect_rc cancel-leak-in-queue-latency 1
+  expect_line cancel-leak-in-queue-latency "before the next question's answer can be heard there (timed against its chime in the same recording)"
+  chime_counted cancel-leak-in-queue-latency
+fi
+expect_restored cancel-leak-in-queue-latency
+expect_load_case cancel-latency
+expect_no_line cancel-latency 'the timing log gives no audible times for the chime and the answer'
+expect_restored cancel-latency
+if capture_unbroken cancel-no-audible; then
+  expect_rc cancel-no-audible 0
+  expect_line cancel-no-audible "PASS: playback-cancel: no stop's speech was heard at the rig microphone 20 ms after it"
+  expect_line cancel-no-audible 'the timing log gives no audible times for the chime and the answer, so a sound after its chime is timed against the answer'
+else
+  expect_rc cancel-no-audible 0 2
+  expect_no_line cancel-no-audible "FAIL: playback-cancel"
+fi
+expect_restored cancel-no-audible
+expect_rc cancel-leak-in-queue-no-audible 0 2
+capture_unbroken cancel-leak-in-queue-no-audible \
+  && expect_line cancel-leak-in-queue-no-audible 'the timing log gives no audible times for the chime and the answer, so a sound after its chime is timed against the answer'
+expect_no_line cancel-leak-in-queue-no-audible "FAIL: playback-cancel"
+expect_restored cancel-leak-in-queue-no-audible
+expect_rc cancel-leak-before-first-no-audible 1
+expect_line cancel-leak-before-first-no-audible "after the next question's chime ends, before its answer's first audio"
+expect_restored cancel-leak-before-first-no-audible
+expect_rc cancel-leak-in-queue-disrupted 0 2
+capture_unbroken cancel-leak-in-queue-disrupted \
+  && expect_line cancel-leak-in-queue-disrupted "the speaker had 1 disruptions (replays, underruns or failures) between the chime's audible time and the answer's"
+expect_no_line cancel-leak-in-queue-disrupted "FAIL: playback-cancel"
+expect_restored cancel-leak-in-queue-disrupted
+if chime_case cancel-leak-in-queue-own-audible; then
+  expect_rc cancel-leak-in-queue-own-audible 1
+  expect_line cancel-leak-in-queue-own-audible "before the next question's answer can be heard there (timed against its chime in the same recording)"
+  expect_no_line cancel-leak-in-queue-own-audible "PASS: playback-cancel: no stop's speech was heard"
+  chime_counted cancel-leak-in-queue-own-audible
+fi
+expect_restored cancel-leak-in-queue-own-audible
+expect_rc cancel-capture-gap 0 2
+expect_line cancel-capture-gap 'NOTE: recording: arecord reported an overrun'
+expect_line cancel-capture-gap 'the recording is not shown continuous'
+expect_no_line cancel-capture-gap "FAIL: playback-cancel"
+expect_restored cancel-capture-gap
 expect_rc cancel-quiet-chime 0
 expect_line cancel-quiet-chime "PASS: playback-cancel: no stop's speech was heard at the rig microphone 20 ms after it"
 expect_line cancel-quiet-chime 'NOTE: playback-cancel: calibration: the wake sound played alone (ghost-wispr play-sound) is heard at the rig microphone for 130 ms above -50 dB'
@@ -3216,9 +3509,17 @@ expect_line cancel-long-wake 'PASS: playback-cancel: 0 underruns over '
 expect_no_line cancel-long-wake 'UNKNOWN: '
 expect_restored cancel-long-wake
 # The calibrated bound still catches a word that runs into the louder chime.
-expect_rc cancel-long-wake-leak 1
-expect_line cancel-long-wake-leak "FAIL: playback-cancel stop 1: the sound at the next question's chime is not the chime alone: it lasts "
-expect_line cancel-long-wake-leak "than the calibration, the wake sound played alone (320 ms), by over 20 ms"
+# After a fake overrun the start-only bounds can leave the chime's window unknown (c33 of #156 read
+# "a sound at the rig microphone starts between -139 and -49 ms from the next question's
+# wake_heard"): UNKNOWN then, never PASS.
+if fake_overran cancel-long-wake-leak; then
+  expect_rc cancel-long-wake-leak 1 2
+  expect_no_line cancel-long-wake-leak "PASS: playback-cancel: no stop's speech was heard"
+else
+  expect_rc cancel-long-wake-leak 1
+  expect_line cancel-long-wake-leak "FAIL: playback-cancel stop 1: the sound at the next question's chime is not the chime alone: it lasts "
+  expect_line cancel-long-wake-leak "than the calibration, the wake sound played alone (320 ms), by over 20 ms"
+fi
 expect_restored cancel-long-wake-leak
 expect_rc cancel-sound-missing 2
 expect_line cancel-sound-missing 'UNKNOWN: playback-cancel: this build has no ghost-wispr play-sound, which plays the wake sound alone to calibrate the rig'
@@ -3226,7 +3527,12 @@ expect_no_line cancel-sound-missing 'PASS: playback-cancel: the poller sees'
 expect_restored cancel-sound-missing
 expect_rc cancel-clock-fast 0
 expect_restored cancel-clock-fast
-expect_rc cancel-clock-slow 0
+if capture_unbroken cancel-clock-slow; then
+  expect_rc cancel-clock-slow 0
+else
+  expect_rc cancel-clock-slow 0 2
+  expect_no_line cancel-clock-slow "FAIL: playback-cancel"
+fi
 expect_restored cancel-clock-slow
 # A 21 ms tail with the rig clock 200 ppm fast: over the bound at its late bound, and never over it
 # at its early bound, which is early by the time from the driver's last read before arecord's header
@@ -3260,8 +3566,7 @@ expect_applied_late() {
   late=$(sed -n 's/.*applied the stop of .*, due at [0-9]* (\([0-9]*\) ms late).*/\1/p' "$root/$1/state/stops.log" 2>/dev/null | awk '$1 >= 7000' | grep -c .)
   [[ $late == "$2" ]] || check_failed "$1: the fake applied $late of the $2 stops at least 7 s late"
 }
-expect_rc cancel-late-apply 0
-expect_line cancel-late-apply "PASS: playback-cancel: no stop's speech was heard at the rig microphone 20 ms after it"
+expect_load_case cancel-late-apply
 expect_line cancel-late-apply 'NOTE: playback-cancel: the speaker logged 2 cancels: 0 by rewind, 2 by drop'
 expect_line cancel-late-apply 'PASS: playback-cancel: 0 underruns over '
 expect_applied_late cancel-late-apply 2
@@ -3364,6 +3669,30 @@ fi
 expect_restored joined-words-slow-read
 ((floor_cases > 0)) \
   || check_failed "no case was timed by the anchors' bound: in every floor case the fake arecord reported an overrun, so the run tested none of it"
+# Only the chime cases count, each in its own assertions after its chime-relative checks
+# (chime_counted), never a scan of every case's output: cancel-underrun prints the NOTE, but its
+# assertions check its underrun FAIL, not a chime verdict (Sol's review of #156 at 428ab1a8). The
+# cases that fall back by design, and a chime case whose capture overran (cancel-capture-gap), must
+# not time an answer against its chime at all.
+for name in cancel-capture-gap cancel-no-audible cancel-leak-in-queue-no-audible cancel-leak-in-queue-disrupted; do
+  ! grep -Eq -- "$chime_note_re" "$root/$name/out" 2>/dev/null \
+    || check_failed "$name: its output shows a next answer timed against its chime, though the case falls back to first_audio"
+done
+# A run that counts no chime case tested none of the chime path, and never passes. When every chime
+# case overran, that is the machine's load (a devbox at a load average near 2000 does it), and the
+# run says so; when one ran with no overrun and still did not count, that is a defect, and it says so.
+if ((chime_cases == 0)); then
+  if ((${#chime_uncounted[@]} > 0)); then
+    check_failed "0 cases decided by the chime path: ${#chime_uncounted[@]} chime cases ran with no overrun and did not count (${chime_uncounted[*]}), a defect in the chime path or its checks"
+  else
+    chime_overruns=0
+    for name in "${chime_overran[@]}"; do
+      chime_overruns=$((chime_overruns + $(cat "$root/$name/state/overruns" 2>/dev/null | grep -c .)))
+    done
+    check_failed "0 cases decided by the chime path: all ${#chime_overran[@]} chime cases overran (load: $chime_overruns overruns the fake logged); the chime path was not tested"
+  fi
+fi
+printf 'NOTE: %d cases decided by the chime path\n' "$chime_cases"
 
 # The driver compares times on the monotonic clock only: bash's wall clock serves journalctl's
 # --since alone, so a step of the wall clock can move no time it compares.
