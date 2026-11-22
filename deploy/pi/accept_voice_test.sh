@@ -1319,8 +1319,14 @@ def arecord(args):
     # first sample's landing fails at any load: the driver's start still comes no later than the
     # sample. arecord-locked takes the search right off the file's directory for that hold, so that
     # every read of its size fails there: a failed read taken for no file yet moves the start into
-    # the hold.
+    # the hold. arecord-lock-start takes it off for 200 ms from the capture's start with no hold,
+    # while the fake writes on through the fd it holds open, as arecord does: every read of the size
+    # fails there, yet no sample waits, so no overrun, and the recording stays continuous (Sol's
+    # review of #156 at d49d0fe7: cancel-locked's hold always overruns, so no case held the locked
+    # reads to the chime path). It waits for the driver's pid file first, so that the driver's own
+    # write in the folder is done; unlock is the folder, its mode and when it opens again.
     frozen = []
+    unlock = None
     try:
         if "arecord-slow-start" in SCENARIO:
             time.sleep(1.5)
@@ -1338,8 +1344,17 @@ def arecord(args):
                 os.kill(pid, signal.SIGSTOP)
             log_to("arecord-froze", " ".join(map(str, frozen)))
             time.sleep(8)
+        if "arecord-lock-start" in SCENARIO and f is not None:
+            wait_until = time.monotonic() + 5
+            while not os.path.exists(path + ".pid") and time.monotonic() < wait_until:
+                time.sleep(0.005)
         begun = -(-time.monotonic_ns() // 1_000_000)
         log_to("recordings", "%s %d" % (path, begun))
+        if "arecord-lock-start" in SCENARIO and f is not None:
+            folder = os.path.dirname(os.path.abspath(path))
+            unlock = (folder, os.stat(folder).st_mode & 0o7777, begun + 200)
+            os.chmod(folder, unlock[1] & ~0o111)
+            log_to("arecord-locked", folder)
         if "arecord-hold-200" in SCENARIO:
             # Held longer than the buffer: a real arecord overruns.
             overrun(200)
@@ -1381,6 +1396,9 @@ def arecord(args):
         while True:
             time.sleep(0.005)
             t = now_ms()
+            if unlock is not None and t >= unlock[2]:
+                os.chmod(unlock[0], unlock[1])
+                unlock = None
             held = t - last + (50 if "arecord-behind" in SCENARIO else 0)
             if held > FAKE_RESIDENCY_MS and not (lag_until is not None and t < lag_until):
                 overrun(held)
@@ -1457,6 +1475,8 @@ def arecord(args):
                 frozen = []
     finally:
         signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        if unlock is not None:
+            os.chmod(unlock[0], unlock[1])
         # arecord-final-rewrite: as arecord ends, it seeks back to write the data chunk's size into
         # the header (alsa-utils aplay.c, end_wave) and holds 800 ms before it closes: its offset in
         # the file is then 44, though the file holds the whole recording.
@@ -2514,6 +2534,13 @@ launch cancel-held-start long,asound,stop-rounds-2,arecord-hold-200 yes -- $canc
 # leak, FAIL (#146's review).
 # shellcheck disable=SC2086
 launch cancel-locked long,asound,stop-rounds-2,arecord-hold-200,arecord-reopen,arecord-locked yes -- $cancel_args
+# The file's folder refuses every read of its size for 200 ms from the capture's start, while the
+# fake writes on through its fd with no hold (arecord-lock-start): no overrun, so the recording stays
+# continuous and the case is held to the chime path: PASS by the chime, counted. cancel-locked's hold
+# overruns in every run, so it can never test the locked reads there (Sol's review of #156 at
+# d49d0fe7). A failed read taken for no file yet puts the start inside the lock: FAIL.
+# shellcheck disable=SC2086
+launch cancel-lock-start long,asound,stop-rounds-2,arecord-lock-start yes -- $cancel_args
 # A good cancel with an arecord that reads 1.5 s after its header: the recording cannot show that the
 # rig heard the speech up to the stop: UNKNOWN, never PASS.
 # shellcheck disable=SC2086
@@ -3346,6 +3373,9 @@ expect_line cancel-held-start "NOTE: recording: arecord reported an overrun, so 
 expect_load_case cancel-locked
 [[ -s $root/cancel-locked/state/arecord-locked ]] || check_failed 'cancel-locked: the fake arecord never locked its file away, so the case tested no failed read'
 expect_restored cancel-locked
+expect_load_case cancel-lock-start
+[[ -s $root/cancel-lock-start/state/arecord-locked ]] || check_failed 'cancel-lock-start: the fake arecord never locked its file away, so the case tested no failed read'
+expect_restored cancel-lock-start
 expect_rc cancel-unsure 2
 expect_line cancel-unsure 'UNKNOWN: playback-cancel stop 1: the rig microphone did not hear the speech up to the stop'
 expect_no_line cancel-unsure "PASS: playback-cancel: no stop's speech was heard"
