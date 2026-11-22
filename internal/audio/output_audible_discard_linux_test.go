@@ -3,6 +3,7 @@
 package audio
 
 import (
+	"fmt"
 	"sync"
 	"syscall"
 	"testing"
@@ -546,6 +547,61 @@ func TestAnAudibleTimeIsNotReleasedByAStaleRunningStatus(t *testing.T) {
 			}
 			if len(out.audibles) != 0 {
 				t.Fatalf("the chime was reported, with %d of its samples heard, after the status read at its release stopped the PCM on an XRUN: %+v", heard, out.audibles[0])
+			}
+		})
+	}
+}
+
+// TestAnAudibleTimeIsNotReleasedAtTheSampleBoundary fails if a held chime is
+// reported when the first status read at its release shows the pointer at the
+// chime's first sample, and the second read finds an XRUN and stops the PCM
+// there: no chime sample played, since a pointer equal to a sample's
+// zero-based position means it is the next to play (Sol's review of #154 at
+// 1f0c891a, whose probe this is). The controls: one sample before the
+// boundary holds the chime, and one past it, a played sample, reports it.
+func TestAnAudibleTimeIsNotReleasedAtTheSampleBoundary(t *testing.T) {
+	const size, first = 3840, 3360
+	for _, delta := range []int{-1, 0, 1} {
+		t.Run(fmt.Sprintf("played=%d", first+delta), func(t *testing.T) {
+			pcm := &staleStatusPCM{fakePCM: newFakePCM(48000, size), faultOn: 2}
+			pcm.lockstep = true
+			frame := make([]int16, size)
+			for i := first; i < size; i++ {
+				frame[i] = 3000
+			}
+			if n := pcm.writei(frame, len(frame)); n != size {
+				t.Fatalf("fixture: the PCM took %d frames", n)
+			}
+			stream := newALSAStream(pcm, "boundary-xrun", alsaParams{rate: 48000, channels: 1, period: 480, buffer: size})
+			in := &outputInput{name: InputChime, audiblePending: true, audibleAt: first}
+			out := &Output{order: []*outputInput{in}, pos: size, eventWake: make(chan struct{}, 1)}
+			out.timeAudible(stream, 48000)
+			if len(out.timed) != 1 {
+				t.Fatal("fixture: the chime was not timed")
+			}
+			event := out.timed[0].event
+			if left := event.At.Mono + event.Err - monoclock.Read(); left > 0 {
+				time.Sleep(time.Duration(left) + time.Millisecond)
+			}
+			pcm.mu.Lock()
+			pcm.runs[0].taken, pcm.clock = first+delta, first+delta
+			pcm.mu.Unlock()
+			pcm.fault = true
+			out.settleAudibles(stream, false)
+			heard := 0
+			pcm.heard(func(v int16, _ time.Time) {
+				if v > 1000 {
+					heard++
+				}
+			})
+			if !pcm.xrun || heard != max(delta, 0) || pcm.calls != 2 {
+				t.Fatalf("fixture: xrun %v, %d chime samples heard, %d status calls", pcm.xrun, heard, pcm.calls)
+			}
+			switch {
+			case delta <= 0 && len(out.audibles) != 0:
+				t.Fatalf("the chime was reported with %d of its samples heard, the pointer at %d: %+v", heard, first+delta, out.audibles[0])
+			case delta > 0 && len(out.audibles) != 1:
+				t.Fatalf("control: the chime's first sample played, and it was not reported")
 			}
 		})
 	}

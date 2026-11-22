@@ -1734,9 +1734,11 @@ func (o *Output) disrupted() {
 // one, the stream itself confirms that it played on: its account read after
 // the time (two status snapshots, playPosition) must find it running, from
 // the trigger of the account that timed the event, and its pointer past the
-// event's sample (Sol's reviews of #154 at ce454880, where a suspend between
-// two writes was seen by no write, and at 7444ec94, where an old kernel's
-// status showed RUNNING for a PCM it had just stopped). An account that shows
+// event's sample: more frames played than the sample's zero-based position,
+// since at equality that sample is the next to play, not one played (Sol's
+// reviews of #154 at ce454880, where a suspend between two writes was seen by
+// no write, at 7444ec94, where an old kernel's status showed RUNNING for a PCM
+// it had just stopped, and at 1f0c891a). An account that shows
 // a stop, a suspend or another trigger is a disruption. One that shows the
 // stream running from that trigger with its pointer not yet past the sample,
 // as a pointer that moves a period at a time can, keeps the event waiting for
@@ -1765,7 +1767,7 @@ func (o *Output) settleAudibles(stream PlaybackStream, closing bool) {
 		due := nowMono != 0 && nowMono >= t.event.At.Mono+t.event.Err
 		switch {
 		case t.since != o.disruptions:
-		case due && read && pos.running && pos.trigger == t.trigger && o.pos-int64(pos.delay) >= t.position:
+		case due && read && pos.running && pos.trigger == t.trigger && o.pos-int64(pos.delay) > t.position:
 			t.event.Disruptions = o.disruptions
 			o.audibles = append(o.audibles, t.event)
 			signal(o.eventWake)
