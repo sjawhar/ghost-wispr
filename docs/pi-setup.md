@@ -1060,9 +1060,13 @@ the unit.
    so the models step (`provision.sh --models`) and `deploy/pi/rollout.sh install` each refuse, and
    change nothing, while a line of the Pi's `.env` could set `GHOST_WISPR_ENVOY_ENABLED` or
    `GHOST_WISPR_CONCIERGE_ENVOY_URL`: a line that, past leading space and an `export`, starts with
-   the name and `=`. They name the variable. To turn Envoy on again, set both in the template,
-   remove `ENVOY_ON_VARIABLES` and its check from `deploy/pi/provision.sh` and
-   `deploy/pi/rollout.sh`, and run the provisioner.
+   the name and `=`, where a carriage return ends a line as a line feed does, as systemd reads
+   `.env`. They name the variable. While the config names a hub with Envoy off, the web page shows
+   a notice under the warnings, and `/api/status` gives it in `notices`, never in `warnings`, which
+   `rollout.sh check` needs empty: no session event goes to the hub, each completed summary waits
+   until Envoy is on again, and, with no `concierge.envoy_url`, the voice cannot ask an issue's
+   agent. To turn Envoy on again, set both in the template, remove `ENVOY_ON_VARIABLES` and its
+   check from `deploy/pi/provision.sh` and `deploy/pi/rollout.sh`, and run the provisioner.
 2. The Pi's Dispatch token: a no-scope agent token, never a person's. Before you run
    `provision-pi.sh`, mint it into `$prepared/dispatch-token` with your own Dispatch token, which
    must hold the `person` and `approve` scopes, in the file `DISPATCH_TOKEN_FILE` names:
