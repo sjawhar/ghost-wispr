@@ -20,6 +20,11 @@ readonly CONFIG_TEMPLATE="$repo_root/deploy/pi/files/ghost-wispr.yaml"
 # replaced (internal/config, removedEnvironment), such as the Vertex embedding location an earlier
 # provisioner wrote.
 readonly REMOVED_ENV_VARIABLES='ENVOY_WEBHOOK_SECRET|GCP_PROJECT|GCP_LOCATION|GENAI_BACKEND|EMBEDDING_BACKEND|EMBEDDING_LOCATION|DEEPGRAM_MODEL|BATCH_TRANSCRIPTION_PROVIDER|TTS_PROVIDER|TTS_API_KEY|VOICE_TTS_ENGINE|VOICE_TTS_MODEL|VOICE_TTS_VOICE|VOICE_TTS_LOCATION'
+# The .env variables that would turn Envoy on over the template, which keeps it off while the hub
+# moves (dispatch://INFRA-3862): the overrides of envoy_enabled and of concierge.envoy_url. The
+# hub's URL stays: with Envoy off it sends nothing. Remove this with the template's
+# envoy_enabled: false.
+readonly ENVOY_ON_ENV_VARIABLES='ENVOY_ENABLED|CONCIERGE_ENVOY_URL'
 
 fail() {
   printf 'ghost-wispr provision: %s\n' "$*" >&2
@@ -69,10 +74,20 @@ deployed_drive_id() {
 }
 
 # render_models_env keeps the deployed .env but the lines of variables Ghost Wispr no longer reads,
-# so none is left on disk to warn at each start.
+# so none is left on disk to warn at each start, and the lines that would turn Envoy on over the
+# template, also with spaces around the name, each of which it names on stderr.
 render_models_env() {
   local env_file=$1
-  awk -v removed="^GHOST_WISPR_($REMOVED_ENV_VARIABLES)=" '$0 !~ removed' "$env_file"
+  awk -v removed="^GHOST_WISPR_($REMOVED_ENV_VARIABLES)=" \
+    -v envoy_on="^[ \t]*GHOST_WISPR_($ENVOY_ON_ENV_VARIABLES)[ \t]*=" '
+    $0 ~ removed { next }
+    $0 ~ envoy_on {
+      name = $0; sub(/^[ \t]*/, "", name); sub(/[ \t]*=.*/, "", name)
+      printf "ghost-wispr provision: removed %s from .env: the template keeps Envoy off while the hub moves (dispatch://INFRA-3862)\n", name >"/dev/stderr"
+      next
+    }
+    { print }
+  ' "$env_file"
 }
 
 # run_user_systemctl reads runtime_dir from its caller: the global, or provision_models' local.

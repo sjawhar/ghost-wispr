@@ -296,6 +296,26 @@ if provisioner_function render_models_env "$work_dir/missing.env" >/dev/null 2>&
   fail 'the .env renderer succeeded without a deployed .env'
 fi
 
+# While the hub moves (dispatch://INFRA-3862), --models also drops each .env line that would turn
+# Envoy on over the template, which turns it off: an override of envoy_enabled or of
+# concierge.envoy_url, also with spaces around its name. It names each on stderr. It keeps the
+# hub's URL, which sends nothing with Envoy off, and every other line, in order.
+envoy_env="$work_dir/envoy.env"
+envoy_models_env="$work_dir/envoy-models.env"
+envoy_messages="$work_dir/envoy-messages"
+readonly envoy_kept_lines=(GHOST_WISPR_ADDR=127.0.0.1:8080 "GHOST_WISPR_ENVOY_HUB_URL=$hub_url"
+  GHOST_WISPR_VOICE_ENGINE=tts)
+printf '%s\n' "${envoy_kept_lines[0]}" GHOST_WISPR_ENVOY_ENABLED=true "${envoy_kept_lines[1]}" \
+  "GHOST_WISPR_CONCIERGE_ENVOY_URL=$hub_url" ' GHOST_WISPR_ENVOY_ENABLED = 1' "${envoy_kept_lines[2]}" >"$envoy_env"
+provisioner_function render_models_env "$envoy_env" >"$envoy_models_env" 2>"$envoy_messages" \
+  || fail 'the .env renderer rejected a deployed .env with Envoy overrides'
+if ! diff <(printf '%s\n' "${envoy_kept_lines[@]}") "$envoy_models_env" >&2; then
+  fail "--models did not drop exactly the .env lines that turn Envoy on (diff above)"
+fi
+for name in GHOST_WISPR_ENVOY_ENABLED GHOST_WISPR_CONCIERGE_ENVOY_URL GHOST_WISPR_ENVOY_ENABLED; do
+  printf 'ghost-wispr provision: removed %s from .env: the template keeps Envoy off while the hub moves (dispatch://INFRA-3862)\n' "$name"
+done | diff - "$envoy_messages" >&2 || fail "--models did not name each .env line it dropped to keep Envoy off (diff above)"
+
 for file in "$provisioner" "$test_root/docs/pi-setup.md"; do
   grep -Fq -- 'replaces settings saved in the UI' "$file" \
     || fail "$file does not say --models replaces settings saved in the UI"
