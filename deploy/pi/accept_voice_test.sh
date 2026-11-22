@@ -3249,7 +3249,7 @@ expect_line barge-pause-silent-restart 'NOTE: recording: the capture substream a
 expect_no_line barge-pause-silent-restart 'PASS: barge-in: 0 of 1'
 expect_restored barge-pause-silent-restart
 expect_rc barge-pause-no-trigger 2
-expect_line barge-pause-no-trigger 'NOTE: recording: the capture substream arecord held showed RUNNING with no numeric trigger_time'
+expect_line barge-pause-no-trigger "NOTE: recording: the capture substream arecord held showed RUNNING with no trigger_time in the kernel's form"
 expect_no_line barge-pause-no-trigger 'PASS: barge-in: 0 of 1'
 expect_restored barge-pause-no-trigger
 expect_rc barge-backchannel-terminal-stall 1 2

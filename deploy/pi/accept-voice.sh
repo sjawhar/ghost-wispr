@@ -500,9 +500,12 @@ def size_reader(path):
 
 def capture_state(root, pid):
     """The state of the capture substream arecord (pid) holds, from its /proc/asound status under
-    root, as RUNNING, and its trigger_time as a number, which the kernel sets at every start, stop
-    (an overrun's included), pause, suspend and resume; None for a trigger_time missing or not a
-    number; (None, None) when no substream names it. The kernel pads the keys ("owner_pid   :")."""
+    root, as RUNNING, and its trigger_time, which the kernel sets at every start, stop (an
+    overrun's included), pause, suspend and resume, as exact (seconds, nanoseconds): the kernel
+    prints it "%lld.%09lld" (sound/core/pcm.c, snd_pcm_substream_proc_status_read), and a float
+    would hold two triggers 1 ns apart as one (Sol's review of #149 at 44738566). None for a
+    trigger_time missing or in any other form, inf and nan among them; (None, None) when no
+    substream names it. The kernel pads the keys ("owner_pid   :")."""
     for status in glob.glob(os.path.join(root, "card*", "pcm*c", "sub*", "status")):
         try:
             with open(status) as f:
@@ -510,11 +513,8 @@ def capture_state(root, pid):
         except OSError:
             continue
         if fields.get("owner_pid") == str(pid):
-            try:
-                trigger = float(fields.get("trigger_time", ""))
-            except ValueError:
-                trigger = None
-            return fields.get("state"), trigger
+            trigger = re.fullmatch(r"([0-9]+)\.([0-9]{9})", fields.get("trigger_time", ""))
+            return fields.get("state"), (int(trigger[1]), int(trigger[2])) if trigger else None
     return None, None
 
 
@@ -555,8 +555,8 @@ def record(path, anchors, pidfile, root):
         nonlocal broken, trigger, closed
         state, now_trigger = capture_state(root, pid)
         if state == "RUNNING" and now_trigger is None:
-            # RUNNING with no trigger_time to read shows nothing about a restart (Sol's review of
-            # #149 at 9b3d27cb): no floor, now or after.
+            # RUNNING with no trigger_time in the kernel's form shows nothing about a restart (Sol's
+            # reviews of #149 at 9b3d27cb and 44738566): no floor, now or after.
             out.write("%d %d\n" % (seen, size))
             if broken is None:
                 broken = "discontinuous %d NO-TRIGGER" % seen
@@ -1587,7 +1587,7 @@ analyse_recording() {
     note "recording: arecord reported a suspend, so the recording's early bounds come from its start alone"
   elif [[ $discontinuous == NO-TRIGGER ]]; then
     floor=
-    note "recording: the capture substream arecord held showed RUNNING with no numeric trigger_time, which cannot show it ran on without a restart, so the recording's early bounds come from its start alone"
+    note "recording: the capture substream arecord held showed RUNNING with no trigger_time in the kernel's form (seconds and nine digits of nanoseconds), which cannot show it ran on without a restart, so the recording's early bounds come from its start alone"
   elif [[ -n $discontinuous ]]; then
     floor=
     note "recording: the capture substream arecord held read $discontinuous during the recording, so the recording's early bounds come from its start alone"
