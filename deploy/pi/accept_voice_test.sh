@@ -60,8 +60,16 @@ cleanup() {
 trap cleanup EXIT
 mkdir -p "$root/bin"
 readonly fakepi="$root/bin/fakepi.py"
-(cd -- "$repo_root" && go build -o "$root/bin/journal-records" ./deploy/pi/journalrecords) \
+# The fake journalctl runs journal-records on every read, and the driver reads the journal every
+# 0.2 s while it waits: -race=false keeps a caller's GOFLAGS='-race' off this helper, whose race
+# build ran about 1 s a read, against about 20 ms, on two loaded cores of sami-devbox, and stretched
+# every step (Sol's run of #149 at 44738566 took 3398 s).
+(cd -- "$repo_root" && go build -race=false -o "$root/bin/journal-records" ./deploy/pi/journalrecords) \
   || { printf 'voice acceptance test: cannot build deploy/pi/journalrecords, which needs Go\n'; exit 1; }
+if go version -m "$root/bin/journal-records" | grep -Fq -- '-race=true'; then
+  printf 'voice acceptance test: deploy/pi/journalrecords was built with -race, which slows every fake journal read\n'
+  exit 1
+fi
 
 # The .env each case starts with: a comment, two secrets (one quoted), a voice setting the run
 # overrides, a value with a tab and two spaces, and no newline at the end, so that a restore that is
