@@ -5,9 +5,9 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
-# update.sh's steps at their worst, a rollback included, take about 1840 s, and its rollback's waits
-# for a recorder whose state it cannot read about 250 s more (its UNIT_LIMIT, which
-# deploy/pi/update_test.sh checks against this value).
-TimeoutStartSec=40min
+# No time limit: a limit's kill can land mid-swap, with the new binary in place and no rollback.
+# Each step update.sh waits on has a bound of its own (deploy/pi/update.sh), and
+# deploy/pi/update_test.sh checks this is the unit's only time limit.
+TimeoutStartSec=infinity
 WorkingDirectory=/opt/ghost-wispr
 ExecStart=/opt/ghost-wispr/update.sh

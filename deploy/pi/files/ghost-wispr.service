@@ -7,27 +7,14 @@ StartLimitIntervalSec=0
 [Service]
 Type=simple
 WorkingDirectory=/opt/ghost-wispr
-# Each start command runs under `timeout`, so a restart is bounded (deploy/pi/update.sh's
-# RESTART_WORST): systemd gives each start phase a TimeoutStartSec of its own. The network wait gives
-# up after 60 s (plus a 3 s probe and a 2 s pause); the clock wait after 120 one-second sleeps. A
-# GHOST_WISPR_NETWAIT_TIMEOUT or GHOST_WISPR_TIMESYNC_TIMEOUT above them has the wait killed, and
-# the start fails.
-ExecStartPre=/usr/bin/timeout -k 5s 75s /opt/ghost-wispr/wait-for-network.sh
+ExecStartPre=/opt/ghost-wispr/wait-for-network.sh
 # A user unit cannot be ordered after the system's time-sync.target: this
 # waits for the clock to be synchronized itself, giving up after 120 s.
-ExecStartPre=/usr/bin/timeout -k 5s 150s /opt/ghost-wispr/wait-for-time-sync.sh
+ExecStartPre=/opt/ghost-wispr/wait-for-time-sync.sh
 ExecStart=/opt/ghost-wispr/ghost-wispr
 # Longer than both waits together; the user manager's default is 90 s.
 TimeoutStartSec=5min
-# The user manager's default, set here so the update's restart bound (deploy/pi/update.sh's
-# RESTART_WORST) depends on no manager's configuration. update_test.sh requires each timeout here
-# set once, in whole seconds or minutes, each start and stop command under `timeout -k Ns Ms`, and
-# Type= simple or notify, the start it counts.
-TimeoutStopSec=90s
-# Bounded, so a restart is bounded: light-off waits at most 2 s for the light's lock, and a light
-# that hangs gets SIGTERM at 10 s and SIGKILL 5 s later, not the stop's own 90 s on top of the
-# main process's (deploy/pi/update.sh's RESTART_WORST, which update_test.sh checks).
-ExecStopPost=/usr/bin/timeout -k 5s 10s /opt/ghost-wispr/ghost-wispr light-off
+ExecStopPost=/opt/ghost-wispr/ghost-wispr light-off
 EnvironmentFile=/opt/ghost-wispr/.env
 Restart=always
 RestartSec=10

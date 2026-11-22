@@ -339,269 +339,28 @@ rolled_back 'a new binary that answers idle again' $'sleep 120\nsleep 120'
 paused_only='' update_with stopped-new
 rolled_back 'a new binary whose unit stopped' ''
 
-# unit_contract UNIT KEYS [TYPES]: the timeouts unit file UNIT sets in the form the update's bounds
-# rely on (the contract below), one "KEY SECONDS" line for each of KEYS, then "KEY SECONDS" for each
-# start or stop command (ExecCondition, ExecStartPre, ExecStartPost, ExecStopPost: its `timeout
-# -k`'s SIGKILL time). With TYPES, the unit's one Type= must be one of them. Anything outside the
-# form fails, naming the line.
-unit_contract() {
-  if [[ -e $1.d ]]; then
-    printf '%s: a drop-in directory is beside it (%s.d); the contract has none\n' "$1" "$1" >&2
-    return 1
-  fi
-  awk -v unit="$1" -v keys="$2" -v types="${3:-}" '
-    function fail(why) { printf "%s:%d: %s: %s\n", unit, NR, $0, why > "/dev/stderr"; bad = 1 }
-    BEGIN {
-      n = split(keys, k, " ")
-      for (i = 1; i <= n; i++) want[k[i]] = 1
-      split("ExecCondition ExecStartPre ExecStartPost ExecStopPost", e, " ")
-      for (i in e) command[e[i]] = 1
-      if (types != "") { n_types = split(types, t, " "); for (i = 1; i <= n_types; i++) allowed[t[i]] = 1 }
-    }
-    /\\$/ { fail("it ends with a backslash, which continues it on the next line; the contract has no continued line"); next }
-    /^[ \t]*([#;]|$)/ { next }
-    /^[ \t]*\[/ { section = $0; gsub(/^[ \t]+|[ \t]+$/, "", section); next }
-    index($0, "=") == 0 { next }
-    {
-      key = substr($0, 1, index($0, "=") - 1)
-      gsub(/^[ \t]+|[ \t]+$/, "", key)
-    }
-    key in want {
-      count[key]++
-      if (section != "[Service]") { fail("it is not in [Service]"); next }
-      if ($0 !~ ("^" key "=[1-9][0-9]*(s|min)$")) {
-        fail("the contract takes " key "= only as a whole number of seconds or minutes, such as 90s or 5min, with nothing around =")
-        next
-      }
-      value = substr($0, length(key) + 2)
-      seconds[key] = value ~ /min$/ ? (value + 0) * 60 : value + 0
-      next
-    }
-    key in command {
-      if (section != "[Service]") { fail("it is not in [Service]"); next }
-      if ($0 !~ ("^" key "=/usr/bin/timeout -k [1-9][0-9]*s [1-9][0-9]*s [^ ]")) {
-        fail("the contract takes " key "= only as /usr/bin/timeout -k Ns Ms COMMAND, in whole seconds")
-        next
-      }
-      split($0, w, " ")
-      commands[++n_commands] = key " " ((w[3] + 0) + (w[4] + 0))
-      next
-    }
-    key == "Type" && types != "" {
-      types_set++
-      if (section != "[Service]") { fail("it is not in [Service]"); next }
-      value = substr($0, 6)
-      if ($0 !~ /^Type=[a-z-]+$/ || !(value in allowed)) { fail("the contract takes Type= only as one of: " types); next }
-      next
-    }
-    key == "ExecStop" { fail("the contract has no ExecStop="); next }
-    key ~ /Timeout/ || key == "RuntimeMaxSec" { fail("the contract has no " key "="); next }
-    END {
-      for (i = 1; i <= n; i++) {
-        if (count[k[i]] == 0) { printf "%s: no %s= line; the contract requires one\n", unit, k[i] > "/dev/stderr"; bad = 1 }
-        else if (count[k[i]] > 1) { printf "%s: %s= is set %d times; the contract requires one\n", unit, k[i], count[k[i]] > "/dev/stderr"; bad = 1 }
-      }
-      if (types != "" && types_set == 0) { printf "%s: no Type= line; the contract requires one of: %s\n", unit, types > "/dev/stderr"; bad = 1 }
-      if (types_set > 1) { printf "%s: Type= is set %d times; the contract requires one\n", unit, types_set > "/dev/stderr"; bad = 1 }
-      if (bad) exit 1
-      for (i = 1; i <= n; i++) print k[i], seconds[k[i]]
-      for (i = 1; i <= n_commands; i++) print commands[i]
-    }' "$1"
-}
-
-# update_limit_of UNIT: the time the update unit UNIT gives update.sh (its TimeoutStartSec).
-update_limit_of() {
-  local contract
-  contract=$(unit_contract "$1" TimeoutStartSec) || return 1
-  printf '%s' "$(sed -n 's/^TimeoutStartSec //p' <<<"$contract")"
-}
-
-# restart_worst_of UNIT: a restart of the recorder at its worst, from its unit file UNIT, of a Type
-# whose start this counts (simple or notify): its main process's stop (TimeoutStopSec) and each
-# ExecStopPost (its `timeout -k`, or its own TimeoutStopSec if less), then its start: the main
-# process's (TimeoutStartSec) and each ExecCondition, ExecStartPre and ExecStartPost, each a phase
-# with a TimeoutStartSec of its own (its `timeout -k`, or that if less).
-restart_worst_of() {
-  local contract key seconds stop=0 start=0 worst=0
-  contract=$(unit_contract "$1" 'TimeoutStopSec TimeoutStartSec' 'simple notify') || return 1
-  while read -r key seconds; do
-    case $key in
-      TimeoutStopSec) stop=$seconds worst=$((worst + seconds)) ;;
-      TimeoutStartSec) start=$seconds worst=$((worst + seconds)) ;;
-      ExecStopPost) worst=$((worst + (seconds < stop ? seconds : stop))) ;;
-      ExecCondition | ExecStartPre | ExecStartPost) worst=$((worst + (seconds < start ? seconds : start))) ;;
-    esac
-  done <<<"$contract"
-  printf '%s' "$worst"
-}
-
-# The update unit (ghost-wispr-update.service) ends update.sh at its TimeoutStartSec, which update.sh
-# knows as UNIT_LIMIT.
-limit=$(update_limit_of "$script_dir/files/ghost-wispr-update.service") || exit 1
-script_limit=$(sed -n 's/^readonly UNIT_LIMIT=\([0-9][0-9]*\).*/\1/p' "$update_script")
-[[ $script_limit == "$limit" ]] \
-  || { printf "update.sh's UNIT_LIMIT (%s) is not the update unit's TimeoutStartSec (%s s)\n" "$script_limit" "$limit" >&2; exit 1; }
-usable=$((limit - 60))
-
-# No drop-in in the repository: a drop-in could set any timeout outside the contract's two files.
-repo_root=$(cd -- "$script_dir/../.." && pwd)
-dropins=$(find "$repo_root" \( -name .git -o -name node_modules \) -prune -o -type d -name '*.d' -path '*.service.d' -print -o -type d -name '*.timer.d' -print)
-[[ -z $dropins ]] || { printf 'the repository has a systemd drop-in, which the contract has none of: %s\n' "$dropins" >&2; exit 1; }
-
-# The bounds hold only for units in one form, a contract this test enforces rather than a reading of
-# systemd's parser: in ghost-wispr.service exactly one TimeoutStopSec= and one TimeoutStartSec=, in
-# [Service], each a whole number of seconds or minutes (`90s`, `5min`), and each ExecStopPost=
-# in the form `/usr/bin/timeout -k Ns Ms COMMAND`; in ghost-wispr-update.service exactly one
-# TimeoutStartSec= in that form; no other key naming a timeout or RuntimeMaxSec=, no ExecStop=, no
-# line continued by a backslash, and no drop-in in the repository. Anything else fails by name. Three
-# rounds of review found a parser's gaps (whitespace around =, milliseconds systemd's dump drops, a
-# manager's default standing in for an absent line); the contract has none to find.
-# unit_case WANT SED [DROPIN]: the recorder unit edited by the sed script SED, with DROPIN as a
-# drop-in beside it, must have the restart bound WANT (seconds), or with WANT fail:TEXT, fail
-# naming TEXT. update_case WANT SED: the update unit edited by SED must have the limit WANT.
-recorder_unit="$script_dir/files/ghost-wispr.service"
+# The update unit gives update.sh no time limit (TimeoutStartSec=infinity), so systemd never kills it
+# mid-swap: each step it blocks on has its own bound (curl's --max-time, the version wait's 120 s,
+# the rollback's three status reads), and its restarts end within the recorder unit's own timeouts.
+# Four reviews found a gap in each model of how long systemd lets a restart take; with no limit to
+# fit, none is needed.
 update_unit="$script_dir/files/ghost-wispr-update.service"
-unit_failures=0
-check_case() {
-  local want=$1 what=$2 out status=0
-  out=$( ("${@:3}") 2>&1) || status=$?
-  case $want in
-    fail:*) [[ $status -ne 0 && $out == *"${want#fail:}"* ]] && return 0
-      printf '%s: exit %s, %s; want a failure naming %q\n' "$what" "$status" "$out" "${want#fail:}" >&2 ;;
-    *) [[ $status -eq 0 && $out == "$want" ]] && return 0
-      printf '%s: exit %s, %s; want %s s\n' "$what" "$status" "$out" "$want" >&2 ;;
-  esac
-  unit_failures=$((unit_failures + 1))
-}
-unit_case() {
-  local dir
-  dir=$(mktemp -d "$work_dir/unit-case.XXXXXX")
-  sed -e "$2" "$recorder_unit" >"$dir/ghost-wispr.service"
-  if [[ -n ${3:-} ]]; then
-    mkdir "$dir/ghost-wispr.service.d"
-    printf '[Service]\n%s\n' "$3" >"$dir/ghost-wispr.service.d/bound.conf"
-  fi
-  check_case "$1" "the restart bound of the recorder unit with ${2:-no change}${3:+, drop-in $3}" restart_worst_of "$dir/ghost-wispr.service"
-}
-update_case() {
-  local dir
-  dir=$(mktemp -d "$work_dir/unit-case.XXXXXX")
-  sed -e "$2" "$update_unit" >"$dir/ghost-wispr-update.service"
-  check_case "$1" "the limit of the update unit with ${2:-no change}" update_limit_of "$dir/ghost-wispr-update.service"
-}
-stop_line='s/^TimeoutStopSec=90s$/'
-start_line='s/^TimeoutStartSec=5min$/'
-post_line='s#^ExecStopPost=/usr/bin/timeout -k 5s 10s #'
-net_line='s#^ExecStartPre=.*wait-for-network.sh$#'
-add_line='s#^ExecStopPost=.*#&\n'
-unit_case 640 ''
-# GPT-6.1 Sol's cases at 9d0de140: a fraction of a second that systemd's dump dropped, and a missing
-# line for which a manager's default (the Pi's may be 180 s) would stand in.
-unit_case 'fail:TimeoutStopSec=90001ms' "${stop_line}TimeoutStopSec=90001ms/"
-unit_case 'fail:no TimeoutStopSec=' '/^TimeoutStopSec=/d'
-unit_case 'fail:no TimeoutStartSec=' '/^TimeoutStartSec=/d'
-# GPT-6.1 Sol's case at 9e29a719: each start phase has a TimeoutStartSec of its own, so two 299 s
-# sleeps in two phases passed as 405 s and take 598.
-unit_case 'fail:ExecStartPre=/bin/sleep 299' "${net_line}ExecStartPre=/bin/sleep 299#; ${add_line}ExecStartPost=/bin/sleep 299#"
-unit_case 'fail:ExecStartPost=/bin/sleep 299' "${add_line}ExecStartPost=/bin/sleep 299#"
-unit_case 'fail:ExecCondition=/bin/true' "${add_line}ExecCondition=/bin/true#"
-unit_case 665 "${add_line}ExecStartPost=/usr/bin/timeout -k 5s 20s /bin/true#"
-unit_case 643 "${add_line}ExecCondition=/usr/bin/timeout -k 1s 2s /bin/true#"
-# A start command's own TimeoutStartSec bounds it below its `timeout`.
-unit_case 860 "${net_line}ExecStartPre=/usr/bin/timeout -k 5s 400s /opt/ghost-wispr/wait-for-network.sh#"
-unit_case 'fail:Type=oneshot' 's/^Type=simple$/Type=oneshot/'
-unit_case 'fail:no Type=' '/^Type=/d'
-unit_case 'fail:Type= is set 2 times' 's/^Type=simple$/&\nType=simple/'
-unit_case 640 's/^Type=simple$/Type=notify/'
-unit_case 730 "${stop_line}TimeoutStopSec=3min/"
-unit_case 630 "${start_line}TimeoutStartSec=290s/"
-unit_case 'fail:TimeoutStopSec =180s' "${stop_line}TimeoutStopSec =180s/"
-unit_case 'fail:TimeoutStopSec=1min 30s' "${stop_line}TimeoutStopSec=1min 30s/"
-unit_case 'fail:TimeoutStopSec=infinity' "${stop_line}TimeoutStopSec=infinity/"
-unit_case 'fail:TimeoutStartSec=infinity' "${start_line}TimeoutStartSec=infinity/"
-unit_case 'fail:TimeoutStopSec=0' "${stop_line}TimeoutStopSec=0s/"
-unit_case 'fail:  TimeoutStopSec=90s' "${stop_line}  TimeoutStopSec=90s/"
-unit_case 'fail:TimeoutStopSec= is set 2 times' "${stop_line}TimeoutStopSec=90s\\nTimeoutStopSec=180s/"
-unit_case 'fail:TimeoutSec=3min' "${stop_line}TimeoutStopSec=90s\\nTimeoutSec=3min/"
-unit_case 'fail:not in [Service]' '/^TimeoutStopSec=/d; s/^StartLimitIntervalSec=0$/&\nTimeoutStopSec=90s/'
-unit_case 'fail:ends with a backslash' "${start_line}TimeoutStartSec=5min \\\\/"
-unit_case 'fail:ExecStopPost=/usr/bin/timeout --foreground' "${post_line}ExecStopPost=/usr/bin/timeout --foreground 10s #"
-unit_case 'fail:ExecStopPost=-/usr/bin/timeout' "${post_line}ExecStopPost=-/usr/bin/timeout -k 5s 10s #"
-unit_case 'fail:ExecStopPost=/usr/bin/timeout -k 5.5s' "${post_line}ExecStopPost=/usr/bin/timeout -k 5.5s 10s #"
-unit_case 645 "${add_line}ExecStopPost=/usr/bin/timeout -k 2s 3s /bin/true#"
-# A stop command's own TimeoutStopSec bounds it below its `timeout`.
-unit_case 715 "${post_line}ExecStopPost=/usr/bin/timeout -k 50s 60s #"
-unit_case 'fail:ExecStop=' "${add_line}ExecStop=/bin/true#"
-unit_case 'fail:drop-in' '' 'TimeoutStopSec=180s'
-update_case 2400 ''
-update_case 2400 's/^TimeoutStartSec=40min$/TimeoutStartSec=2400s/'
-update_case 'fail:no TimeoutStartSec=' '/^TimeoutStartSec=/d'
-update_case 'fail:TimeoutStartSec = 40min' 's/^TimeoutStartSec=40min$/TimeoutStartSec = 40min/'
-update_case 'fail:TimeoutStartSec=2399999ms' 's/^TimeoutStartSec=40min$/TimeoutStartSec=2399999ms/'
-update_case 'fail:RuntimeMaxSec=10min' 's/^TimeoutStartSec=40min$/&\nRuntimeMaxSec=10min/'
-update_case 'fail:TimeoutSec=10min' 's/^TimeoutStartSec=40min$/&\nTimeoutSec=10min/'
-((unit_failures == 0)) || exit 1
-restart_worst=$(restart_worst_of "$recorder_unit") || exit 1
+limits=$(grep -E '^[[:space:]]*[A-Za-z]*(Timeout|RuntimeMax)[A-Za-z]*[[:space:]]*=' "$update_unit" || true)
+[[ $limits == 'TimeoutStartSec=infinity' ]] \
+  || { printf "the update unit's time limits are %q; want TimeoutStartSec=infinity alone, so systemd never kills update.sh mid-swap\n" "$limits" >&2; exit 1; }
 
-# The new binary starts but never reports its commit; the rollback's first status read gets no
-# answer and the next two find it idle (GPT-6.1 Sol's delayed-idle case at 25ff1c5), each step at
-# its worst, each restart at the recorder's worst: 420 s of reads and downloads, the restart, the
-# 120 s version wait, a read, a 120 s wait, a read, a wait, a read and the rollback's restart. Its
-# waits must reserve the true restart, and the whole must end 60 s before the unit's limit: with
-# light-off unbounded (90 s more per restart) and update.sh reserving 390 s, it ended at 1770 s.
-slow=1 restart_seconds=$restart_worst paused_only='' update_with never-answers-then-idle
-elapsed=$(($(<"$work_dir/clock") - 1000))
-[[ $status -ne 0 && $out == *'version verification timed out; restored the previous binary'* ]] && cmp -s /bin/true "$work_dir/deploy/ghost-wispr" \
-  || { printf 'the delayed-idle case: exit %s, %s; want the rollback\n' "$status" "$out" >&2; exit 1; }
-((elapsed == 810 + 2 * restart_worst)) \
-  || { printf 'the delayed-idle case took %s s, want %s s: a step changed, so check this worst case again\n' "$elapsed" "$((810 + 2 * restart_worst))" >&2; exit 1; }
-((elapsed <= usable)) \
-  || { printf "the delayed-idle case, with %s s restarts, takes %s s, past the update unit's %s s limit less 60 s\n" "$restart_worst" "$elapsed" "$limit" >&2; exit 1; }
-script_restart=$(sed -n 's/^readonly .*RESTART_WORST=\([0-9][0-9]*\).*/\1/p' "$update_script")
-[[ $script_restart == "$restart_worst" ]] \
-  || { printf "update.sh's RESTART_WORST (%s s) is not the recorder unit's restart at its worst (%s s)\n" "$script_restart" "$restart_worst" >&2; exit 1; }
-
-# A rollback waits for a recorder whose state it cannot read only while that wait, the read after
-# it and a restart at the recorder's worst still end 60 s before the unit's limit; otherwise it
-# gives up at once, the new binary left running, and says why. With an instant restart it waits
-# twice (above). No real restart is slow enough to make it stop early, so these restarts take what
-# puts the clock where the guard binds: one that leaves room for one wait and not a second, and one
-# for none.
-out_of_time() {
-  [[ $status -ne 0 && $out == *'its state could not be read'* && $out == *"before the update unit's $limit s limit"* && $out != *'restored the previous binary'* ]] \
-    || { printf '%s: exit %s, %s; want a failure that leaves it running for lack of time\n' "$1" "$status" "$out" >&2; exit 1; }
-  cmp -s "$new_source" "$work_dir/deploy/ghost-wispr" || { printf '%s: the running new binary was replaced\n' "$1" >&2; exit 1; }
-  [[ $(grep -cx -- '--user restart ghost-wispr.service' "$work_dir/systemctl.log") == 1 ]] \
-    || { printf '%s: the recorder was restarted again: %s\n' "$1" "$(<"$work_dir/systemctl.log")" >&2; exit 1; }
-  [[ $(<"$work_dir/sleep.log") == "$2" && $(<"$work_dir/state/reads") == "$3" ]] \
-    || { printf '%s: %s reads after waits %q; want %s reads after %q\n' "$1" "$(<"$work_dir/state/reads")" "$(<"$work_dir/sleep.log")" "$3" "$2" >&2; exit 1; }
-  (($(<"$work_dir/clock") - 1000 <= usable)) || { printf '%s: ended at %s s, past %s\n' "$1" "$(($(<"$work_dir/clock") - 1000))" "$usable" >&2; exit 1; }
-}
-restart_seconds=$((usable - script_restart - 190)) paused_only='' update_with unreadable
-out_of_time 'a slow restart, then no status' 'sleep 120' 2
-restart_seconds=$((usable - script_restart - 100)) paused_only='' update_with unreadable
-out_of_time 'a slower restart, then no status' '' 1
-
-# Every step at its worst: each curl takes its whole --max-time (status 10 s, release 30 s, version
-# 10 s, download 300 s, checksum 60 s, status 10 s), the restart at the recorder's worst, the new
-# binary never reports its commit (the 120 s version wait), the rollback reads the status (10 s)
-# and restarts. Under the old 15 min limit it did not end in time, and systemd killed update.sh
-# with the unverified binary in place. GPT-6.1 Sol's case at 1db0cbc (each HTTP call just under
-# its --max-time, a 365 s restart, version reads that time out) is the second run.
-for restart in "$restart_worst" 365; do
-  slow=1 restart_seconds=$restart paused_only='' update_with never-answers
-  elapsed=$(($(<"$work_dir/clock") - 1000))
-  [[ $status -ne 0 && $out == *'version verification timed out; restored the previous binary'* ]] && cmp -s /bin/true "$work_dir/deploy/ghost-wispr" \
-    || { printf 'every step at its worst, a %s s restart: exit %s, %s; want the rollback\n' "$restart" "$status" "$out" >&2; exit 1; }
-  [[ $(grep -cx -- '--user restart ghost-wispr.service' "$work_dir/systemctl.log") == 2 ]] \
-    || { printf 'every step at its worst, a %s s restart: want the rollback'\''s restart: %s\n' "$restart" "$(<"$work_dir/systemctl.log")" >&2; exit 1; }
-  # 420 s of reads and downloads, the restart, the 120 s version wait, a 10 s status read, the
-  # rollback's restart.
-  want=$((550 + 2 * restart))
-  ((elapsed == want)) || { printf 'every step at its worst, a %s s restart, took %s s, want %s s: a step changed, so check this worst case again\n' "$restart" "$elapsed" "$want" >&2; exit 1; }
-  ((elapsed <= usable)) \
-    || { printf "every step at its worst, a %s s restart, takes %s s, past the update unit's %s s limit less 60 s: systemd kills update.sh first\n" "$restart" "$elapsed" "$limit" >&2; exit 1; }
-done
+# A restart that takes hours, every other step at its worst too, is never cut off: the update
+# installs and verifies, or, when the new binary never reports its commit, rolls back once the
+# recorder answers again.
+slow=1 restart_seconds=36000 paused_only='' update_with unpaused
+[[ $status -eq 0 && $out == *"installed commit $commit"* ]] && cmp -s "$new_source" "$work_dir/deploy/ghost-wispr" \
+  || { printf 'a 10-hour restart: exit %s, %s; want the release installed\n' "$status" "$out" >&2; exit 1; }
+(($(<"$work_dir/clock") - 1000 > 36000)) \
+  || { printf 'control: the 10-hour restart took %s s of the clock\n' "$(($(<"$work_dir/clock") - 1000))" >&2; exit 1; }
+slow=1 restart_seconds=36000 paused_only='' update_with never-answers-then-idle
+# The version wait's ten 2 s pauses between its 10 s reads, then the rollback's two status waits.
+rolled_back 'a 10-hour restart, then a new binary that never reports its commit' \
+  "$(printf 'sleep 2\n%.0s' {1..10}; printf 'sleep 120\nsleep 120')"
 
 # An update killed after the swap (a power cut, or systemd's kill) leaves the new binary in place
 # unverified. The next run must not take it for the previous binary: with a broken release, its

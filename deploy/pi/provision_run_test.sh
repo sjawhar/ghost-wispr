@@ -297,8 +297,7 @@ grep -Fxq "sudo install -o ghost-wispr -g ghost-wispr -m 0755 $repo_root/deploy/
   || fail "provision.sh does not install wait-for-time-sync.sh beside the binary"
 unit="$repo_root/deploy/pi/files/ghost-wispr.service"
 mapfile -t start_steps < <(grep -E '^Exec(StartPre|Start)=' "$unit")
-want_steps=("ExecStartPre=/usr/bin/timeout -k 5s 75s /opt/ghost-wispr/wait-for-network.sh"
-  "ExecStartPre=/usr/bin/timeout -k 5s 150s /opt/ghost-wispr/wait-for-time-sync.sh"
+want_steps=(ExecStartPre=/opt/ghost-wispr/wait-for-network.sh ExecStartPre=/opt/ghost-wispr/wait-for-time-sync.sh
   ExecStart=/opt/ghost-wispr/ghost-wispr)
 [[ "${start_steps[*]}" == "${want_steps[*]}" ]] \
   || fail "ghost-wispr.service starts with [${start_steps[*]}], want [${want_steps[*]}]"
@@ -309,13 +308,6 @@ done
 network_wait=$(sed -n 's/.*GHOST_WISPR_NETWAIT_TIMEOUT:-\([0-9][0-9]*\).*/\1/p' "$repo_root/wait-for-network.sh")
 sync_wait=$(sed -n 's/.*GHOST_WISPR_TIMESYNC_TIMEOUT:-\([0-9][0-9]*\).*/\1/p' "$repo_root/deploy/pi/files/wait-for-time-sync.sh")
 [[ -n $network_wait && -n $sync_wait ]] || fail "cannot read the network wait ($network_wait) or the clock wait ($sync_wait)"
-# Each wait runs under `timeout`, which bounds a restart (update.sh's RESTART_WORST): the wait must
-# give up on its own first, or it is killed and the start fails. The network wait's last try can run
-# 5 s past its limit; the clock wait counts one-second sleeps.
-network_timeout=$(sed -n 's#^ExecStartPre=/usr/bin/timeout -k [0-9]*s \([0-9]*\)s /opt/ghost-wispr/wait-for-network.sh$#\1#p' "$unit")
-sync_timeout=$(sed -n 's#^ExecStartPre=/usr/bin/timeout -k [0-9]*s \([0-9]*\)s /opt/ghost-wispr/wait-for-time-sync.sh$#\1#p' "$unit")
-((network_timeout >= network_wait + 5 + 10 && sync_timeout >= sync_wait + 30)) \
-  || fail "the start waits' timeouts (${network_timeout}s, ${sync_timeout}s) do not leave them their own limits (${network_wait}s, ${sync_wait}s)"
 start_limit=$(sed -n 's/^TimeoutStartSec=//p' "$unit")
 case $start_limit in
   *min) start_limit=$((${start_limit%min} * 60)) ;;

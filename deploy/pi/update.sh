@@ -6,8 +6,8 @@ readonly DEPLOY_DIR="${GHOST_WISPR_DEPLOY_DIR:-/opt/ghost-wispr}"
 readonly BINARY="$DEPLOY_DIR/ghost-wispr"
 readonly PREVIOUS_BINARY="$DEPLOY_DIR/ghost-wispr.prev"
 # The sha256 of the binary update.sh saw run and answer its commit last (record_verified). Only
-# that binary becomes the previous binary: an update killed after its swap (a power cut, or the
-# update unit's limit) leaves a binary nobody verified, which a later rollback must not restore.
+# that binary becomes the previous binary: an update stopped after its swap (a power cut, or an
+# operator's stop) leaves a binary nobody verified, which a later rollback must not restore.
 readonly VERIFIED="$DEPLOY_DIR/ghost-wispr.verified"
 # Where the running recorder's image is read (record_running); a test points it at a fake.
 readonly PROC_DIR="${GHOST_WISPR_PROC_DIR:-/proc}"
@@ -20,24 +20,10 @@ readonly PAUSED_ONLY="${GHOST_WISPR_UPDATE_PAUSED_ONLY:-}"
 # A rollback reads the status of a recorder whose state it could not read again every RECHECK_EVERY
 # seconds, as pi-when-idle.sh does, and at most ROLLBACK_READS times.
 readonly RECHECK_EVERY=120 ROLLBACK_READS=3
-# The update unit (ghost-wispr-update.service) ends this script UNIT_LIMIT seconds after its start
-# (TimeoutStartSec=40min; deploy/pi/update_test.sh checks the two agree). A restart of the recorder
-# takes at most RESTART_WORST: its main process's stop (TimeoutStopSec=90s), light-off after it
-# (ExecStopPost, bounded at 15 s by `timeout`), its start waits, each a start phase of its own under
-# `timeout` (the network's 80 s, the clock's 155 s), and its start (TimeoutStartSec=5min).
-# update_test.sh holds both units to one form (each timeout set once, in whole seconds or minutes;
-# each start and stop command under `timeout -k`; Type= simple or notify; no drop-in) and computes
-# UNIT_LIMIT and RESTART_WORST from them. Every step at its worst ends inside the limit: 10 s status
-# read, 30 s release lookup, 10 s version read, 300 + 60 s download, 10 s status read, a restart,
-# the 120 s version wait, a 10 s status read and the rollback's restart: about 1840 s. A rollback
-# whose recorder's state it cannot read waits for another read only while that wait
-# (RECHECK_EVERY), the read (STATUS_READ, curl's --max-time) and a restart at its worst still end
-# MARGIN seconds before the limit; otherwise it gives up, the new binary left running. Its two waits
-# fit: about 2100 s in all. With 15 min, as before, the steps alone could outlast the limit, and
-# systemd killed update.sh with the new binary in place and no rollback.
-readonly UNIT_LIMIT=2400 MARGIN=60 STATUS_READ=10 RESTART_WORST=640
-STARTED=$(date +%s)
-readonly STARTED
+# The update unit (ghost-wispr-update.service) gives this script no time limit
+# (TimeoutStartSec=infinity), so systemd never kills it mid-swap: each step it waits on has a bound
+# of its own (each curl's --max-time, the version wait's deadline, the rollback's ROLLBACK_READS),
+# and each restart of the recorder ends within the recorder unit's own timeouts.
 
 fail() {
   printf 'ghost-wispr update: %s\n' "$*" >&2
@@ -142,8 +128,6 @@ restartable() {
     fi
     ((reads < ROLLBACK_READS)) \
       || fail "$why; ghost-wispr.service runs, but its state could not be read on $reads reads ${RECHECK_EVERY} s apart (/api/status gave no status), so it may be recording and is left running; $PREVIOUS_BINARY holds the previous binary for a rollback once it answers that nothing records"
-    (($(date +%s) - STARTED + RECHECK_EVERY + STATUS_READ + RESTART_WORST <= UNIT_LIMIT - MARGIN)) \
-      || fail "$why; ghost-wispr.service runs, but its state could not be read on $reads reads (/api/status gave no status), and another read ${RECHECK_EVERY} s on and a restart would not end before the update unit's ${UNIT_LIMIT} s limit, so it may be recording and is left running; $PREVIOUS_BINARY holds the previous binary for a rollback once it answers that nothing records"
     sleep "$RECHECK_EVERY"
   done
 }

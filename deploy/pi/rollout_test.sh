@@ -102,13 +102,17 @@ case "$*" in
   'is-enabled ghost-wispr-update.timer') cat "$state/timer-enabled"; [[ $(<"$state/timer-enabled") == enabled ]] ;;
   'is-active --quiet ghost-wispr.service') [[ $(<"$state/service") == active ]] ;;
   'show -p ActiveState --value ghost-wispr-update.service')
-    if [[ -s $state/update-states ]]; then
+    if [[ -e $state/update-forever ]]; then
+      echo activating
+    elif [[ -s $state/update-states ]]; then
       sed -n 1p "$state/update-states"
       sed -i 1d "$state/update-states"
     else
       echo inactive
     fi
     ;;
+  'show -p MainPID --value ghost-wispr-update.service') echo 4321 ;;
+  'show -p InactiveExitTimestamp --value ghost-wispr-update.service') echo 'Sun 2026-11-22 03:30:00 UTC' ;;
   'daemon-reload') ;;
   # LoadState from state/load-UNIT (loaded by default); DropInPaths from state/dropins-UNIT, and
   # from the second query on also state/dropins-later-UNIT (a drop-in that appears mid-install).
@@ -273,6 +277,19 @@ off_after_reboot hold
 [[ $out == *'the 2 protected recordings have their sha256 (before)'* && $out == *'(after)'* ]] \
   || fail "hold did not check the protected recordings before and after: $out"
 
+# hold: an update that still runs at the cap is left running, named with its PID and how long it
+# has run; nothing kills or stops it.
+reset
+: >"$state/update-forever"
+rollout hold
+expect_stop 'hold with an update that does not end' 'ghost-wispr-update.service (pid 4321, since Sun 2026-11-22 03:30:00 UTC) still runs after 35 minutes'
+[[ $out == *'left running'* ]] || fail "hold did not say the update is left running: $out"
+! grep -Eq 'systemctl (kill|stop|restart) ghost-wispr-update|^kill' "$state/events" \
+  || fail "hold killed or stopped the running update: $(<"$state/events")"
+[[ $(grep -c '^sleep 5$' "$state/events") == 420 ]] \
+  || fail "hold waited $(grep -c '^sleep 5$' "$state/events") times 5 s for the update, want 420 (35 minutes)"
+rm -f "$state/update-forever"
+
 # install: refused while the latest release is another commit's, before any change.
 reset
 release "$old"
@@ -304,8 +321,8 @@ grep -qx 'echo old update.sh' "$kept/update.sh" || fail 'the kept update.sh is n
 [[ $(<"$kept/commit") == "$old" ]] || fail 'the kept commit is not the one the Pi ran'
 [[ $(stat -c %a "$kept") == 700 && $(stat -c %a "$kept/.env") == 600 ]] || fail 'the kept copy is readable by others'
 cmp -s "$deploy/update.sh" "$tree/deploy/pi/update.sh" || fail "install did not install the merge commit's update.sh"
-# update.sh's UNIT_LIMIT is the merge commit's update unit's limit, and its RESTART_WORST the merge
-# commit's recorder unit's restart: both units must reach the Pi with it.
+# The merge commit's units reach the Pi with its update.sh: the update unit gives update.sh no time
+# limit, so nothing kills it mid-swap.
 for unit in ghost-wispr-update.service ghost-wispr.service; do
   cmp -s "$pi/home/.config/systemd/user/$unit" "$tree/deploy/pi/files/$unit" \
     || fail "install did not install the merge commit's $unit"
