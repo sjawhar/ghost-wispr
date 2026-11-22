@@ -51,9 +51,13 @@ fail() {
 }
 usage() { sed -n '6,15p' "$0" | sed 's/^# \{0,1\}//'; }
 
-# pi runs a command on the Pi with no input; pi_in gives it this script's input.
-pi() { ssh -n -o BatchMode=yes "$PI" "$@"; }
-pi_in() { ssh -o BatchMode=yes "$PI" "$@"; }
+# pi runs a command on the Pi with no input; pi_in gives it this script's input. Each gives up on a
+# Pi it cannot reach in 10 s, or that stops answering for a minute (ssh exits 255).
+readonly SSH_OPTIONS=(-o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=4)
+pi() { ssh -n "${SSH_OPTIONS[@]}" "$PI" "$@"; }
+pi_in() { ssh "${SSH_OPTIONS[@]}" "$PI" "$@"; }
+# The Pi's monotonic clock, which no NTP correction steps (stop_updates); a test points it at a fake.
+readonly PI_UPTIME="${GHOST_WISPR_PI_UPTIME:-/proc/uptime}"
 
 # The Pi is idle: paused, with no session, and no GPT-Live probe running (docs/pi-setup.md, "Probe
 # voice B (GPT-Live)").
@@ -113,27 +117,32 @@ readonly UPDATES_ON_COMMAND="ssh $PI 'XDG_RUNTIME_DIR=/run/user/\$(id -u) system
 # ghost-wispr's user manager starts an enabled timer at each boot, and Persistent=true then runs a
 # missed update at once, which would install the release's binary on the old config after a reboot.
 # The update has no time limit (each step of it has one), so this waits at most 35 minutes of the
-# Pi's clock, more than an update takes at its worst, however slow each poll is, and then stops,
-# naming the update, its PID and since when it runs. It never kills it: a kill can land mid-swap.
+# Pi's monotonic clock (its uptime), more than an update takes at its worst, however slow each poll
+# is or however the wall clock steps; each poll has 30 s (and 5 more before SIGKILL), so one that
+# hangs neither blocks the report nor stretches the wait. Then it stops, naming the update, its PID
+# and since when it runs. It never kills the update: a kill can land mid-swap.
 stop_updates() {
   local status=0 out
   out=$(pi "${USER_SYSTEMD}systemctl --user disable --now ghost-wispr-update.timer || exit 2
 [ \"\$(systemctl --user is-enabled ghost-wispr-update.timer)\" = disabled ] || exit 2
 [ \"\$(systemctl --user is-active ghost-wispr-update.timer)\" = inactive ] || exit 2
-deadline=\$((\$(date +%s) + 2100))
+uptime_s() { cut -d. -f1 $(printf %q "$PI_UPTIME"); }
+show() { timeout -k 5s 30s systemctl --user show -p \"\$1\" --value ghost-wispr-update.service; }
+deadline=\$((\$(uptime_s) + 2100))
 while :; do
-  case \$(systemctl --user show -p ActiveState --value ghost-wispr-update.service) in
+  case \$(show ActiveState) in
     inactive | failed) exit 0 ;;
   esac
-  [ \"\$(date +%s)\" -lt \"\$deadline\" ] || break
+  [ \"\$(uptime_s)\" -lt \"\$deadline\" ] || break
   sleep 5
 done
-echo \"pid \$(systemctl --user show -p MainPID --value ghost-wispr-update.service), since \$(systemctl --user show -p InactiveExitTimestamp --value ghost-wispr-update.service)\"
+echo \"pid \$(show MainPID), since \$(show InactiveExitTimestamp)\"
 exit 3") || status=$?
   case $status in
     0) log 'the nightly update is off: its timer is disabled and inactive, and no update runs' ;;
     2) fail 'ghost-wispr-update.timer did not stop and disable' ;;
-    *) fail "ghost-wispr-update.service (${out:-pid unknown}) still runs after 35 minutes; it is left running, since a kill can land mid-swap: run this step again once it ends" ;;
+    3) fail "ghost-wispr-update.service (${out:-pid unknown}) still runs after 35 minutes; it is left running, since a kill can land mid-swap: run this step again once it ends" ;;
+    *) fail "lost the Pi while waiting for an update under way (ssh exit $status); whether it runs is unknown, and nothing stopped it: run this step again" ;;
   esac
 }
 
