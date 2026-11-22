@@ -276,6 +276,110 @@ print("recording-times mic delay: checked %d bounds, %d failures; %d early bound
 sys.exit(1 if failures else 0)
 EOF
 
+# With floor_us, the longest a sample can stay captured and not yet in the file, every read of the
+# file's size bounds the places after it from below, the header-only reads of an arecord held 1.5 s
+# between its header and its first read among them. Each early bound must be never late, and early
+# only by floor_us less how long the samples truly stayed, the 10 ms between header-only reads, 400
+# ppm over the 0.5 s between anchors, and the rounding: for a clock 200 ppm fast, slow and right,
+# with samples that stay 0, 30 and 60 ms. Without floor_us, the same recording's early bounds are
+# the start's, 1.5 s early.
+python3 - "$work_dir" "$program" <<'EOF' || fail "an early bound from the anchors came out late or far early (above)"
+import math, os, random, subprocess, sys
+d, program = sys.argv[1], sys.argv[2]
+random.seed(146)
+floor_us = 61000
+failures = []
+checked = 0
+for speed in (1.0002, 0.9998, 1.0):
+    for stay in (0.0, 30.0, 60.0):
+        origin = 100000.0 + random.random()
+        def true_ms(rel):
+            """The driver's time the sample REL ms into the file was captured."""
+            return origin + rel / speed
+        length = 14000
+        lines = []
+        # Header-only reads every 10 ms from 1.5 s before the first capture until the first sample
+        # lands, stay ms after it; each read's BEFORE_US 0.1 ms before its size, US 0.1 ms after.
+        t = origin - 1500.0
+        while t < origin + stay:
+            lines.append("%d 44 %d\n" % (math.floor((t + 0.1) * 1000), math.floor((t - 0.1) * 1000)))
+            t += 10.0
+        for rel in range(500, length + 1, 500):
+            # At true_ms(rel) + stay the file holds the samples up to rel.
+            read = true_ms(rel) + stay
+            lines.append("%d %d %d\n" % (math.floor((read + 0.1) * 1000), 44 + rel * 48, math.floor((read - 0.1) * 1000)))
+        lines.append("%d %d\n" % (math.floor((true_ms(length) + stay + 5) * 1000), 44 + length * 48))
+        with open(os.path.join(d, "fa"), "w") as f:
+            f.writelines(lines)
+        sounds = []
+        at = 300.0
+        while at < length - 600:
+            on = at + random.random() * 100
+            off = on + 50 + random.random() * 300
+            sounds.append((on, off))
+            at = off + 200
+        report = ["[silencedetect @ 0x1] silence_start: 0\n"]
+        for on, off in sounds:
+            report.append("[silencedetect @ 0x1] silence_end: %.6f | x\n" % (on / 1000))
+            report.append("[silencedetect @ 0x1] silence_start: %.6f\n" % (off / 1000))
+        report.append("[silencedetect @ 0x1] silence_end: %.6f | x\n" % (length / 1000))
+        with open(os.path.join(d, "fs"), "w") as f:
+            f.writelines(report)
+        started = math.floor((origin - 1500.0) * 1000)
+        case = "speed %s, samples stay %d ms" % (speed, stay)
+        for floor in (str(floor_us), ""):
+            with open(os.path.join(d, "fs")) as rep:
+                out = subprocess.run(["awk", "-v", "rate=24000", "-v", "header=44", "-v", "frame=2",
+                                      "-v", "bytes=%d" % (44 + length * 48), "-v", "started_us=%d" % started,
+                                      "-v", "floor_us=" + floor, "-f", program, os.path.join(d, "fa"), "-"],
+                                     stdin=rep, capture_output=True, text=True, check=True).stdout.split("\n")
+            got = [line.split() for line in out if line.startswith("sound ")]
+            if len(got) != len(sounds):
+                failures.append("%s, floor %r: %d sounds, want %d" % (case, floor, len(got), len(sounds)))
+                continue
+            far = 0
+            for (on, off), fields in zip(sounds, got):
+                for place, early in ((on, int(fields[4])), (off, int(fields[5]))):
+                    checked += 1
+                    want = true_ms(place)
+                    if early > want:
+                        failures.append("%s, floor %r: the place %.3f ms in is at %.3f ms, its early bound %d ms: late" % (case, floor, place, want, early))
+                    elif floor and early < want - (floor_us / 1000.0 - stay + 10 + 500 * 0.0004 + 3):
+                        failures.append("%s, floor %r: the place %.3f ms in is at %.3f ms, its early bound %d ms: far early" % (case, floor, place, want, early))
+                    if early < want - 1400:
+                        far += 1
+            if not floor and far == 0:
+                failures.append("%s: without floor_us, no early bound is the start's, 1.5 s early" % case)
+if checked == 0:
+    failures.append("no place was checked")
+for line in failures[:20]:
+    print(line)
+print("recording-times floor: checked %d places, %d failures" % (checked, len(failures)))
+sys.exit(1 if failures else 0)
+EOF
+
+# A read that finds only the header after a read that found a sample bounds nothing: arecord seeks
+# back to rewrite the header as it ends (alsa-utils aplay.c, end_wave), and a reader of its offset
+# would see 44 bytes of the whole file there (Sol's review of #149 at 6d98ad98). Such an anchor, the
+# early bounds from it would come after the late ones. The start's header-only read is the control:
+# it still bounds.
+late_header() {
+  printf '%s\n' '1000100 44 1000000' "1600000 $((44 + 600 * 48)) 1599900" "2500000 $((44 + 1500 * 48)) 2499900" \
+    "$1" "3000600 $((44 + 2000 * 48))" >"$work_dir/late-header.anchors"
+  awk -v rate=24000 -v header=44 -v frame=2 -v bytes=$((44 + 2000 * 48)) -v started_us=1000000 -v floor_us=61000 \
+    -f "$program" "$work_dir/late-header.anchors" - <"$work_dir/late-header.txt"
+}
+printf '%s\n' '[silencedetect @ 0x1] silence_start: -0.00133' \
+  '[silencedetect @ 0x1] silence_end: 0.5 | silence_duration: 0.50133' \
+  '[silencedetect @ 0x1] silence_start: 0.8' \
+  '[silencedetect @ 0x1] silence_end: 1.6 | silence_duration: 0.8' >"$work_dir/late-header.txt"
+for row in '3000500 44 3000400' "3000500 $((44 + 2000 * 48)) 3000400"; do
+  out=$(late_header "$row") || fail "the program failed with the anchor '$row': $out"
+  [[ $(grep -c '^sound ' <<<"$out") == 2 ]] || fail "with the anchor '$row', want 2 sounds: $out"
+  awk '$1 == "sound" && ($5 > $2 || $6 > $3) { bad = 1 } END { exit bad }' <<<"$out" \
+    || fail "with the anchor '$row', an early bound comes after its late bound: $out"
+done
+
 # ffmpeg's own silences: one it reports just before the start (a negative time) starts no sound, nor
 # does the one it ends at the end of the file; a sound still going at the end runs to the end.
 printf '2000000 %s\n' $((44 + 2000 * 48)) >"$work_dir/edge.anchors"
@@ -319,5 +423,134 @@ printf '%s\n' '[silencedetect @ 0x1] silence_start: -0.00133' \
   '[silencedetect @ 0x1] silence_end: 2 | silence_duration: 1.2' >"$work_dir/quiet-end.txt"
 out=$(times "$work_dir/short.anchors" "$work_dir/quiet-end.txt" $((44 + 2000 * 48)) 0) || fail "the unbounded end failed: $out"
 [[ $(awk '$1 == "end" { print $3 }' <<<"$out") == none ]] || fail "an end after the last anchor has a late bound: $out"
+
+# ---- mono_py's size reader: the file's length, never arecord's offset ----
+
+# arecord seeks back to byte 40 to write the data chunk's size as it ends (alsa-utils aplay.c,
+# end_wave), and holds the file open after: the reader must give the file's whole length there,
+# never arecord's offset in it (Sol's review of #149 at 6d98ad98). The writer here does just that,
+# and the reader reads through its fd, as the driver does while /proc shows it.
+awk '/^read -r -d .. mono_py <<.EOF.$/ {on=1; next} on && /^EOF$/ {exit} on' \
+  "$repo_root/deploy/pi/accept-voice.sh" >"$work_dir/mono.py"
+python3 - "$work_dir/mono.py" "$work_dir" <<'EOF' || fail "mono_py's size reader gave arecord's offset (above)"
+import os, subprocess, sys, time
+src, base = sys.argv[1], sys.argv[2]
+ns = {"__name__": "mono_py"}
+argv, sys.argv = sys.argv, ["mono_py", "none"]
+try:
+    exec(open(src).read(), ns)
+except SystemExit:
+    pass
+sys.argv = argv
+path = os.path.join(base, "rewrite.wav")
+ready, go = os.path.join(base, "rewrite.ready"), os.path.join(base, "rewrite.go")
+writer = subprocess.Popen([sys.executable, "-c", (
+    "import os, sys, time\n"
+    "path, ready, go = sys.argv[1:4]\n"
+    "f = open(path, 'wb'); f.write(bytes(44) + b'\\1\\0' * 4800); f.flush()\n"
+    "f.seek(40); f.write((9600).to_bytes(4, 'little')); f.flush()\n"
+    "open(ready, 'w').close()\n"
+    "while not os.path.exists(go): time.sleep(0.01)\n"), path, ready, go])
+while not os.path.exists(ready):
+    time.sleep(0.01)
+read = ns["size_reader"](path)
+got = read(writer.pid)
+open(go, "w").close()
+writer.wait()
+want = 44 + 9600
+if got != want:
+    print("with arecord's offset at byte 44, the reader gave %r, want the file's length, %d" % (got, want))
+    sys.exit(1)
+EOF
+
+# ---- mono_py's sampler: an anchor's floor only while the substream is shown running ----
+
+# record writes an anchor's BEFORE_US, the floor that bounds later samples from below, only when a
+# state read after the size finds the capture substream RUNNING from the trigger of its first such
+# read (Sol's review of #149 at b7edd969: a substream that closed, read after a stale size, kept the
+# floor). Here a writer plays arecord: it writes a header, then samples, while the test sets the
+# substream's status; each case must leave three-field anchors exactly where the state allowed. A
+# substream that closes after the writer's last sample, while the writer lives on (closed-at-end, as
+# arecord closes its capture before it exits), breaks nothing: no discontinuity, and no floor after
+# the close. One that closes while samples still land (closed) is a discontinuity.
+python3 - "$work_dir/mono.py" "$work_dir" <<'EOF' || fail "mono_py's sampler kept a floor it could not show (above)"
+import os, signal, subprocess, sys, threading, time
+src, base = sys.argv[1], sys.argv[2]
+ns = {"__name__": "mono_py"}
+argv, sys.argv = sys.argv, ["mono_py", "none"]
+try:
+    exec(open(src).read(), ns)
+except SystemExit:
+    pass
+sys.argv = argv
+failures = []
+# no-trigger and bad-trigger (Sol's review of #149 at 9b3d27cb): a status with no trigger_time, or a
+# trigger_time that is not a number, shows nothing about a restart, so no anchor keeps its floor and
+# the sampler names the trigger it could not read.
+for case, states in (("running", ["RUNNING 1"] * 4), ("closed", ["RUNNING 1", "closed"]),
+                     ("xrun", ["RUNNING 1", "XRUN 1"]), ("restarted", ["RUNNING 1", "RUNNING 2"]),
+                     ("closed-at-end", ["RUNNING 1"] * 5 + ["closed"]),
+                     ("no-trigger", ["RUNNING -"] * 4), ("bad-trigger", ["RUNNING x"] * 4)):
+    work = os.path.join(base, "sampler-" + case)
+    status_dir = os.path.join(work, "asound", "card4", "pcm0c", "sub0")
+    os.makedirs(status_dir)
+    path, anchors, pidfile = (os.path.join(work, n) for n in ("r.wav", "anchors", "pid"))
+    # It opens the file 0.2 s on, after the sampler's first read, as arecord starts after it. In
+    # closed-at-end it lives 1.5 s past its last sample, which lands about 2.8 s on.
+    writer = subprocess.Popen([sys.executable, "-c", (
+        "import sys, time\n"
+        "time.sleep(0.2); f = open(sys.argv[1], 'wb'); f.write(bytes(44)); f.flush(); time.sleep(0.05)\n"
+        "for _ in range(250): f.write(b'\\1\\0' * 240); f.flush(); time.sleep(0.01)\n"
+        + ("time.sleep(1.5)\n" if case == "closed-at-end" else "")), path])
+    with open(pidfile, "w") as f:
+        f.write(str(writer.pid))
+
+    def status(text):
+        tmp = os.path.join(status_dir, "status.tmp")
+        with open(tmp, "w") as f:
+            f.write(text)
+        os.replace(tmp, os.path.join(status_dir, "status"))
+
+    def show(states=states):
+        # The first state from the start, then one more each 0.6 s, past the sampler's 0.5 s reads.
+        for i, s in enumerate(states):
+            if s == "closed":
+                status("closed\n")
+            else:
+                state, trig = s.split()
+                trigger_line = "" if trig == "-" else "trigger_time: %s\n" % ("soon" if trig == "x" else trig + ".0")
+                status("state: %s\nowner_pid   : %d\n%s" % (state, writer.pid, trigger_line))
+            time.sleep(0.6)
+
+    shower = threading.Thread(target=show)
+    shower.start()
+    sys.stdout.flush()
+    out = subprocess.run([sys.executable, src, "record", path, anchors, pidfile, os.path.join(work, "asound")],
+                         capture_output=True, text=True, timeout=30).stdout
+    shower.join()
+    writer.wait()
+    lines = [l.split() for l in open(anchors).read().splitlines()]
+    sampled = [l for l in lines if int(l[1]) > 44]
+    floors = [l for l in sampled if len(l) == 3]
+    reported = [l for l in out.splitlines() if l.startswith("discontinuous ")]
+    if case in ("running", "closed-at-end"):
+        if not floors or reported:
+            failures.append("%s: %d floor anchors, discontinuous %r; want floors and none" % (case, len(floors), reported))
+        if case == "closed-at-end" and lines and len(lines[-1]) == 3:
+            failures.append("closed-at-end: the last anchor, read after the close, kept its floor: %r" % lines[-1])
+        continue
+    want = {"closed": "CLOSED", "xrun": "XRUN", "restarted": "RESTARTED", "no-trigger": "NO-TRIGGER", "bad-trigger": "NO-TRIGGER"}[case]
+    if len(reported) != 1 or not reported[0].endswith(" " + want):
+        failures.append("%s: discontinuous lines %r, want one naming %s" % (case, reported, want))
+    after = int(reported[0].split()[1]) if reported else 0
+    late = [l for l in floors if int(l[0]) >= after]
+    if case in ("no-trigger", "bad-trigger") and floors:
+        failures.append("%s: %d floor anchors, with no trigger_time to show the substream ran on: %r" % (case, len(floors), floors[:2]))
+    elif late:
+        failures.append("%s: %d floor anchors at or after the state that is not RUNNING from the first trigger: %r" % (case, len(late), late[:2]))
+for line in failures:
+    print(line)
+sys.exit(1 if failures else 0)
+EOF
 
 printf 'recording-times test passed\n'

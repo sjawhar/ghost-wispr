@@ -405,6 +405,7 @@ api_post() {
 # (start_poller). Every time the driver compares is on this clock; the wall clock serves only
 # journalctl's --since, which takes a wall time.
 read -r -d '' mono_py <<'EOF'
+import glob
 import os
 import re
 import signal
@@ -447,10 +448,12 @@ def clock():
 
 
 def size_reader(path):
-    """A read of the bytes arecord has written: from its fdinfo's pos while /proc shows the file open
-    in it (pid, once known), else from a stat of the file. It gives 0 while there is no file and
-    none was seen, and None when the read fails, or the file is gone once seen: arecord never
-    removes it."""
+    """A read of the bytes arecord has written: the length of the file, through the fd arecord holds
+    it open by while /proc shows one (pid, once known), else through its path. Never arecord's
+    offset in it: arecord seeks back to rewrite the header when it ends (alsa-utils aplay.c,
+    end_wave), and an offset read then is not what the file holds. It gives 0 while there is no
+    file and none was seen, and None when the read fails, or the file is gone once seen: arecord
+    never removes it."""
     fd, seen = None, False
 
     def find(pid):
@@ -469,15 +472,14 @@ def size_reader(path):
                 if fd is None:
                     fd = find(pid)
                 if fd is not None:
-                    with open("/proc/%d/fdinfo/%s" % (pid, fd)) as f:
-                        pos = next((int(line.split(":", 1)[1]) for line in f if line.startswith("pos:")), None)
-                    # The fd still names the file after the read: a number arecord closed and
-                    # reused for another file gives no size.
-                    if pos is not None and os.path.samefile("/proc/%d/fd/%s" % (pid, fd), path):
+                    held = os.stat("/proc/%d/fd/%s" % (pid, fd))
+                    # The fd still names the file: a number arecord closed and reused for
+                    # another file gives no size.
+                    if os.path.samestat(held, os.stat(path)):
                         seen = True
-                        return pos
+                        return held.st_size
                     fd = None
-            except (OSError, ValueError):
+            except OSError:
                 fd = None
         try:
             size = os.stat(path).st_size
@@ -491,20 +493,89 @@ def size_reader(path):
     return read
 
 
-def record(path, anchors, pidfile):
+def capture_state(root, pid):
+    """The state of the capture substream arecord (pid) holds, from its /proc/asound status under
+    root, as RUNNING, and its trigger_time as a number, which the kernel sets at every start, stop
+    (an overrun's included), pause, suspend and resume; None for a trigger_time missing or not a
+    number; (None, None) when no substream names it. The kernel pads the keys ("owner_pid   :")."""
+    for status in glob.glob(os.path.join(root, "card*", "pcm*c", "sub*", "status")):
+        try:
+            with open(status) as f:
+                fields = {k.strip(): v.strip() for k, v in (line.split(":", 1) for line in f if ":" in line)}
+        except OSError:
+            continue
+        if fields.get("owner_pid") == str(pid):
+            try:
+                trigger = float(fields.get("trigger_time", ""))
+            except ValueError:
+                trigger = None
+            return fields.get("state"), trigger
+    return None, None
+
+
+def record(path, anchors, pidfile, root):
     """The recording's sampler, started before arecord: every 10 ms until arecord has written a
     sample, then every 0.5 s, and once more at SIGTERM, after arecord has ended, it writes an anchor,
-    "US BYTES", the time read after the size. It prints "ready" after its first read, before which
-    arecord does not start, and learns arecord's pid from PIDFILE. Before the first sample, a read
-    that found less than the header, or no file yet, came before the capture began: the last such
-    read's time, read before the size, is the start. It prints "started US" once arecord has written
-    a sample, "stopped" if arecord ends before, and "timeout" if it has written none within 5 s of
-    its pid; a sample counts even when found after the 5 s."""
+    "US BYTES BEFORE_US", the times read after and before the size; before the first sample, a read
+    that finds only the header is an anchor too, and after it none is written. It prints "ready"
+    after its first read, before which arecord does not start, and learns arecord's pid from
+    PIDFILE. Before the first sample, a read that found less than the header, or no file yet, came
+    before the capture began: the last such read's time, read before the size, is the start. It
+    prints "started US" once arecord has written a sample, "stopped" if arecord ends before, and
+    "timeout" if it has written none within 5 s of its pid; a sample counts even when found after the
+    5 s. Each read from the first sample on is followed by a read of the state of the capture
+    substream arecord holds (capture_state under ROOT). Only when that state is RUNNING, from the
+    trigger of the first such read, is the anchor written with BEFORE_US, the floor that bounds
+    later samples from below; otherwise it is written "US BYTES", a late bound alone. An overrun
+    (XRUN), a suspend or a restart (another trigger) prints "discontinuous US STATE" once: arecord
+    may not live to report it. A substream gone is arecord closing its capture, as it does as it
+    ends, and breaks nothing unless samples land after it: a write arecord held across an overrun
+    and finished as it closed (Sol's review of #149 at b7edd969). So on finding it gone the size is
+    read again at once, and that read or any later one that finds the file longer than at the close
+    prints "discontinuous US CLOSED". A state read after the size can be later than it, never
+    earlier."""
     signal.signal(signal.SIGINT, signal.SIG_IGN)
     signal.signal(signal.SIGTERM, stop)
     read = size_reader(path)
     out = open(anchors, "a", buffering=1)
-    pid, deadline, started, ready = None, None, None, False
+    pid, deadline, started, ready, trigger = None, None, None, False, None
+    # The first discontinuity seen, printed after "started": the driver reads that line second.
+    # closed is the file's size when the substream was first found gone.
+    broken, reported, closed = None, False, None
+
+    def anchored(seen, size, before):
+        """Write the anchor of a read with samples, its floor only if the substream ran on."""
+        nonlocal broken, trigger, closed
+        state, now_trigger = capture_state(root, pid)
+        if state == "RUNNING" and now_trigger is None:
+            # RUNNING with no trigger_time to read shows nothing about a restart (Sol's review of
+            # #149 at 9b3d27cb): no floor, now or after.
+            out.write("%d %d\n" % (seen, size))
+            if broken is None:
+                broken = "discontinuous %d NO-TRIGGER" % seen
+            return
+        if state == "RUNNING" and trigger is None and broken is None:
+            trigger = now_trigger
+        if state == "RUNNING" and now_trigger == trigger and closed is None and broken is None:
+            out.write("%d %d %d\n" % (seen, size, before))
+            return
+        out.write("%d %d\n" % (seen, size))
+        if state is None:
+            again = read(pid)
+            if closed is None:
+                closed = size
+            if broken is None and (again is None or again > closed or size > closed):
+                broken = "discontinuous %d CLOSED" % seen
+            return
+        if broken is None:
+            broken = "discontinuous %d %s" % (seen, "RESTARTED" if state == "RUNNING" else state)
+
+    def report():
+        nonlocal reported
+        if broken is not None and not reported:
+            print(broken, flush=True)
+            reported = True
+
     try:
         while True:
             if pid is None:
@@ -518,8 +589,10 @@ def record(path, anchors, pidfile):
             size = read(pid)
             seen = us()
             if size is not None and size > HEADER:
-                out.write("%d %d\n" % (seen, size))
+                anchored(seen, size, before)
                 break
+            if size is not None and size == HEADER:
+                out.write("%d %d %d\n" % (seen, size, before))
             if size is not None and size < HEADER:
                 started = before
             if not ready:
@@ -536,14 +609,20 @@ def record(path, anchors, pidfile):
             print("no read came before the capture", flush=True)
             return
         print("started %d" % started, flush=True)
+        report()
         while alive(pid):
             time.sleep(0.5)
+            before = us()
             size = read(pid)
             seen = us()
-            if size is not None:
-                out.write("%d %d\n" % (seen, size))
+            if size is not None and size > HEADER:
+                anchored(seen, size, before)
+                report()
     except Stop:
         pass
+    # A discontinuity that the last read found, if SIGTERM came before it was printed.
+    if started is not None:
+        report()
     # arecord has ended: the file is whole.
     try:
         size = os.stat(path).st_size
@@ -579,7 +658,7 @@ mode = sys.argv[1]
 if mode == "clock":
     clock()
 elif mode == "record":
-    record(sys.argv[2], sys.argv[3], sys.argv[4])
+    record(sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5])
 elif mode == "poll":
     poll(sys.argv[2], sys.argv[3])
 elif mode == "duration":
@@ -1172,12 +1251,13 @@ wait_spoken() {
 readonly never_ms=9999999999999
 
 # start_recording DEVICE FILE: record DEVICE to FILE with arecord, until stop_recording. A sampler
-# (mono_py record) writes anchors, "US BYTES" lines: by the driver's clock US (CLOCK_MONOTONIC, in
-# microseconds, read just after the size), BYTES of the file were written. recording-times.awk
-# bounds each sound's time with the anchors after it, late only by how late its best anchor was read
-# (analyse_recording). The sampler reads the size from arecord's own fdinfo, whose pos is the bytes
-# it has written, or with a stat of the file where /proc does not show that fd, and the clock in the
-# same process: no fork comes between the size and the clock.
+# (mono_py record) writes anchors, "US BYTES BEFORE_US" lines: by the driver's clock US
+# (CLOCK_MONOTONIC, in microseconds, read just after the size), BYTES of the file were written, and
+# at BEFORE_US (read just before the size) no more than BYTES were. recording-times.awk bounds each
+# sound's time with the anchors after it, late only by how late its best anchor was read
+# (analyse_recording). The sampler reads the file's length, through arecord's own fd where /proc
+# shows it, and the clock in the same process: no fork comes between the size and the clock. It
+# never reads arecord's offset in the file, which arecord rewinds to rewrite the header as it ends.
 #
 # The recording starts between two times. recording_started is the earlier: arecord opens its
 # device, then creates the file and writes its whole 44-byte header, and only then reads, which
@@ -1189,9 +1269,14 @@ readonly never_ms=9999999999999
 # nothing and moves nothing; so does a file missing once the sampler has seen it, as arecord never
 # removes its file. The later time is the first read that finds a sample, the first anchor:
 # recording-times.awk bounds the file's first sample from above with it. An arecord slow to open
-# its device makes no time late; one held back between its header and its first read makes every
-# time counted from recording_started early by as long, and a check that needs that time to be
-# exact reads UNKNOWN (analyse_recording).
+# its device makes no time late. One held back between its header and its first read would make
+# every time counted from recording_started early by as long; a read that finds only the header is
+# an anchor too, so that the capture's buffer bounds those times instead (capture_residency_us).
+# That bound holds only while no captured sample waits past the buffer: arecord runs without -q, so
+# that it reports a suspend as well as an overrun (alsa-utils aplay.c, suspend() and xrun()), and
+# the sampler reports a capture substream that stops running (an overrun or a suspend arecord may
+# not live to report, as when it is stopped in a stalled write); either way the early bounds come
+# from the start alone (analyse_recording).
 recording=
 anchors_file=
 recording_cut=false
@@ -1204,12 +1289,12 @@ start_recording() {
   : >"$anchors_file"
   : >"$recording.sampler"
   rm -f -- "$recording.pid"
-  python3 -c "$mono_py" record "$recording" "$anchors_file" "$recording.pid" \
+  python3 -c "$mono_py" record "$recording" "$anchors_file" "$recording.pid" "$asound_root" \
     >"$recording.sampler" 2>"$work_dir/sampler.err" &
   anchor_pid=$!
   sampler_line 1
   [[ $sampler_said == ready ]] || unknown "recording: the sampler of $recording said: $sampler_said"
-  arecord -q -D "$1" -f S16_LE -r "$sample_rate" -c 1 -t wav --buffer-time=40000 --period-time=10000 \
+  arecord -D "$1" -f S16_LE -r "$sample_rate" -c 1 -t wav --buffer-time=40000 --period-time=10000 \
     "$recording" 2>"$work_dir/arecord.err" &
   arecord_pid=$!
   if ! { printf '%s\n' "$arecord_pid" >"$recording.pid.tmp" && mv -- "$recording.pid.tmp" "$recording.pid"; }; then
@@ -1223,7 +1308,49 @@ start_recording() {
     *) unknown "recording: the sampler of $recording said: $sampler_said" ;;
   esac
   whole_number "$recording_started" || unknown "recording: the sampler of $recording gave no start: $sampler_said"
+  capture_buffer
   note "recording: from $1"
+}
+
+# capture_buffer: set capture_residency_us to the longest a sample can stay captured and not yet in
+# the file while arecord runs with no overrun, from the hw_params of the capture substream arecord
+# holds (its status names it as owner_pid): two periods and the buffer, and capture_irq_us.
+# - A sample reaches ALSA's buffer within a period of its capture: a capture driver moves its
+#   position on at least once a period. snd-usb-audio does so in URBs of at most 1 ms of audio
+#   (sound/usb/endpoint.c, data_ep_set_params: urb_packs is at most packs_per_ms), and snd-aloop on
+#   its period timer.
+# - Without an overrun, ALSA's buffer never holds a buffer's worth, so a sample is read from it
+#   within a buffer of its arrival. arecord then writes the period it read before the buffer can
+#   fill again: within a period of the sample's arrival and a buffer, as the period it read spans a
+#   period.
+# capture_irq_us allows 1 ms for the interrupt that delivers a period: an assumption of the rig,
+# not a bound, as a machine can hold an interrupt back for longer. Empty when no substream names
+# arecord.
+readonly capture_irq_us=1000
+capture_residency_us=
+capture_buffer() {
+  local status key value rate='' period='' buffer='' owner=''
+  capture_residency_us=
+  for status in "$asound_root"/card*/pcm*c/sub*/status; do
+    [[ -r $status && -r ${status%/status}/hw_params ]] || continue
+    owner=
+    while IFS=: read -r key value; do
+      [[ ${key//[[:space:]]/} == owner_pid ]] && owner=${value//[[:space:]]/}
+    done <"$status"
+    [[ $owner == "$arecord_pid" ]] || continue
+    while IFS=: read -r key value; do
+      value=${value#"${value%%[![:space:]]*}"}
+      case ${key//[[:space:]]/} in
+        rate) rate=${value%% *} ;;
+        period_size) period=$value ;;
+        buffer_size) buffer=$value ;;
+      esac
+    done <"${status%/status}/hw_params"
+    break
+  done
+  if whole_number "$rate" && whole_number "$period" && whole_number "$buffer" && ((rate > 0)); then
+    capture_residency_us=$((((buffer + 2 * period) * 1000000 + rate - 1) / rate + capture_irq_us))
+  fi
 }
 
 # sampler_line N: set sampler_said to the sampler's Nth line, once it has written it. The sampler
@@ -1289,7 +1416,7 @@ recording_end_early=
 recording_end_late=
 recording_trail_min=
 analyse_recording() {
-  local analysis bytes kind rest on off len on_early off_early gap
+  local analysis bytes kind rest on off len on_early off_early gap floor=$capture_residency_us
   analysis=$(ffmpeg -hide_banner -nostats -i "$recording" -af "silencedetect=noise=${1}dB:d=$silence_seconds" -f null - 2>&1) \
     || unknown "recording: ffmpeg could not read $recording: $(tail -n 3 <<<"$analysis" | tr '\n' ' ')"
   [[ $recording_cut == false ]] \
@@ -1304,6 +1431,27 @@ analyse_recording() {
   recording_end_early=
   recording_end_late=
   recording_trail_min=
+  # An overrun or a suspend drops what ALSA's buffer held, and a sample can then stay captured and
+  # not yet in the file for longer than capture_residency_us: the early bounds come from the start
+  # alone. So do they when the sampler saw the capture substream stop running, which arecord may
+  # never report, as when the step stops it in a stalled write.
+  local discontinuous
+  discontinuous=$(sed -n 's/^discontinuous [0-9]* \(.*\)/\1/p' "$recording.sampler" | head -n 1)
+  if [[ -z $floor ]]; then
+    note "recording: no capture substream names arecord, so the recording's early bounds come from its start alone"
+  elif [[ $(<"$work_dir/arecord.err") == *overrun* ]]; then
+    floor=
+    note "recording: arecord reported an overrun, so the recording's early bounds come from its start alone"
+  elif [[ $(<"$work_dir/arecord.err") == *Suspended* ]]; then
+    floor=
+    note "recording: arecord reported a suspend, so the recording's early bounds come from its start alone"
+  elif [[ $discontinuous == NO-TRIGGER ]]; then
+    floor=
+    note "recording: the capture substream arecord held showed RUNNING with no numeric trigger_time, which cannot show it ran on without a restart, so the recording's early bounds come from its start alone"
+  elif [[ -n $discontinuous ]]; then
+    floor=
+    note "recording: the capture substream arecord held read $discontinuous during the recording, so the recording's early bounds come from its start alone"
+  fi
   while read -r kind rest; do
     case $kind in
       sound)
@@ -1319,7 +1467,7 @@ analyse_recording() {
       error) unknown "recording: $recording: $rest" ;;
     esac
   done < <(awk -v rate="$sample_rate" -v header="$wav_header_bytes" -v frame="$sample_bytes" -v bytes="$bytes" \
-    -v started_us="$recording_started" -v mic_delay_us="$mic_delay_us" -f "$recording_times" "$anchors_file" - <<<"$analysis")
+    -v started_us="$recording_started" -v mic_delay_us="$mic_delay_us" -v floor_us="$floor" -f "$recording_times" "$anchors_file" - <<<"$analysis")
   [[ $recording_end_late == none ]] && recording_end_late=$never_ms
   [[ $recording_end_early =~ ^[0-9]+$ && $recording_end_late =~ ^[0-9]+$ && $recording_trail_min =~ ^[0-9]+$ ]] \
     || unknown "recording: the times of $recording could not be read"
