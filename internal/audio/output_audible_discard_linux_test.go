@@ -247,6 +247,162 @@ func TestAnAudibleTimeIsNotGivenAcrossASuspend(t *testing.T) {
 	}
 }
 
+// betweenWritesPCM is a fakePCM that suspends right after it took a whole
+// write: the chime's second, so that its first sample is still queued and no
+// write has yet found the suspend (Sol's probe of #154 at ce454880). The next
+// write waits for release, so no recovery hides the state.
+type betweenWritesPCM struct {
+	*fakePCM
+	suspendIt   bool
+	chimeWrites int
+	fired       bool
+	release     chan struct{}
+
+	stampMu     sync.Mutex
+	suspendedAt int64
+	heardChime  int
+}
+
+func (p *betweenWritesPCM) writei(samples []int16, frames int) int {
+	if p.fired {
+		<-p.release
+	}
+	n := p.fakePCM.writei(samples, frames)
+	if n <= 0 || !p.suspendIt {
+		return n
+	}
+	if p.chimeWrites > 0 || samples[0] > 1000 {
+		p.chimeWrites++
+	}
+	if p.chimeWrites == 2 && n == frames && !p.fired {
+		p.fired = true
+		p.suspend()
+		at, _ := monotonicNanos()
+		heard := 0
+		p.heard(func(v int16, _ time.Time) {
+			if v > 1000 {
+				heard++
+			}
+		})
+		p.stampMu.Lock()
+		p.suspendedAt, p.heardChime = at, heard
+		p.stampMu.Unlock()
+		time.Sleep(150 * time.Millisecond)
+	}
+	return n
+}
+
+// TestAnAudibleTimeIsNotGivenAcrossASuspendBetweenWrites fails if a chime
+// whose first sample was still queued when the PCM suspended, after a write
+// it took whole, is timed: no write found the suspend, and the event, held
+// for its time, was reported 63 to 73 ms after the suspend (Sol's review of
+// #154 at ce454880). The control, with no suspend, is timed.
+func TestAnAudibleTimeIsNotGivenAcrossASuspendBetweenWrites(t *testing.T) {
+	for _, suspend := range []bool{false, true} {
+		t.Run(map[bool]string{false: "no suspend", true: "a suspend after a whole write"}[suspend], func(t *testing.T) {
+			pcm := &betweenWritesPCM{fakePCM: newFakePCM(48000, 3840), suspendIt: suspend, release: make(chan struct{})}
+			pcm.lockstep, pcm.inflight = true, 144
+			stream := newALSAStream(pcm, "between-writes", alsaParams{rate: 48000, channels: 1, period: 480, buffer: 3840})
+			out, start, _ := probeOutput(t, stream)
+			t.Cleanup(func() { close(pcm.release) })
+			events := make(chan AudibleEvent, 16)
+			out.OnAudible(func(e AudibleEvent) { events <- e })
+			ctx := testContext(t)
+			if err := out.Begin("bed", nil).WriteAll(ctx, constant(48000, 100*time.Millisecond, 1000), mono48k); err != nil {
+				t.Fatal(err)
+			}
+			start()
+			select {
+			case <-events:
+			case <-time.After(time.Second):
+				t.Fatal("fixture: the bed under the chime was not timed")
+			}
+			if err := out.Begin(InputChime, nil).Write(ctx, constant(48000, 10*time.Millisecond, 3000), mono48k); err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case e := <-events:
+				if e.Input != InputChime {
+					t.Fatalf("fixture: event %+v", e)
+				}
+				if suspend {
+					pcm.stampMu.Lock()
+					at, heard := pcm.suspendedAt, pcm.heardChime
+					pcm.stampMu.Unlock()
+					t.Fatalf("the chime was timed %v after the PCM suspended, with %d of its samples heard before: %+v", time.Duration(e.At.Mono-at), heard, e)
+				}
+			case <-time.After(time.Second):
+				if !suspend {
+					t.Fatal("control: the chime was not timed")
+				}
+				pcm.stampMu.Lock()
+				at, heard := pcm.suspendedAt, pcm.heardChime
+				pcm.stampMu.Unlock()
+				if at == 0 || heard != 0 {
+					t.Fatalf("fixture: suspended at %d, with %d of the chime's samples heard before, want 0", at, heard)
+				}
+			}
+		})
+	}
+}
+
+// restartingPCM is a sinkPCM that runs with half a second queued, and whose
+// trigger timestamp, ALSA's time of its last start, stop, suspend or resume,
+// the test moves, as a restart no write of the stream's own found would.
+type restartingPCM struct {
+	*sinkPCM
+	mu      sync.Mutex
+	trigger int64
+}
+
+func (p *restartingPCM) status() pcmStatus {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return pcmStatus{running: true, delay: 24000, avail: p.buffer - 24000, trigger: p.trigger}
+}
+
+// TestAnAudibleTimeIsNotGivenAcrossARestartOfTheStream fails if a held event
+// is reported when the stream, read as its time passes, runs from another
+// trigger than the account that timed it: it stopped or suspended and started
+// again between the two reads, and the account's time no longer holds. The
+// control, with the same trigger, is reported.
+func TestAnAudibleTimeIsNotGivenAcrossARestartOfTheStream(t *testing.T) {
+	for _, restart := range []bool{false, true} {
+		t.Run(map[bool]string{false: "the same trigger", true: "another trigger"}[restart], func(t *testing.T) {
+			pcm := &restartingPCM{sinkPCM: &sinkPCM{buffer: 28800}, trigger: 1_000_000_000}
+			stream := newALSAStream(pcm, "restarting", alsaParams{rate: 48000, channels: 1, period: 480, buffer: 28800})
+			out, start, _ := probeOutput(t, stream)
+			events := make(chan AudibleEvent, 16)
+			out.OnAudible(func(e AudibleEvent) { events <- e })
+			// A second of chime keeps the stream playing past the half second queued, so that it
+			// does not close idle before the chime's time comes.
+			pb := out.Begin(InputChime, nil)
+			go func() { _ = pb.WriteAll(testContext(t), constant(48000, time.Second, 1000), mono48k) }()
+			start()
+			waitFor(t, "the chime to be timed", func() bool {
+				out.mu.Lock()
+				defer out.mu.Unlock()
+				return len(out.timed) == 1
+			})
+			if restart {
+				pcm.mu.Lock()
+				pcm.trigger += int64(time.Second)
+				pcm.mu.Unlock()
+			}
+			select {
+			case e := <-events:
+				if restart {
+					t.Fatalf("the chime was timed across a restart of the stream: %+v", e)
+				}
+			case <-time.After(1500 * time.Millisecond):
+				if !restart {
+					t.Fatal("control: the chime was not timed")
+				}
+			}
+		})
+	}
+}
+
 // TestOrdinaryStartsAreTimed fails if a chime played through the ALSA stream
 // with nothing disrupting it is not timed, every time, with no disruption, or
 // if its time's two clocks do not agree with the clocks read as it comes: the

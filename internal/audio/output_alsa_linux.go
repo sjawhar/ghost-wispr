@@ -58,11 +58,13 @@ type alsaPCM interface {
 // pcmStatus is one snapshot of a PCM's status: whether it is running or
 // suspended, its delay, which counts what is in flight past its buffer as
 // well as what the buffer holds but which ALSA reports only while it runs,
-// how many frames its buffer has free, which it reports in every state, and
-// the status call's result.
+// how many frames its buffer has free, which it reports in every state, its
+// trigger timestamp in nanoseconds, which ALSA sets at every start, stop,
+// pause, suspend and resume, and the status call's result.
 type pcmStatus struct {
 	running, suspended bool
 	delay, avail       int
+	trigger            int64
 	rc                 int
 }
 
@@ -119,11 +121,13 @@ func (s *alsaStream) queuedFrames() int {
 	return held + s.params.buffer
 }
 
-// playPosition reads one status snapshot of the PCM, its state and its delay
+// playPosition reads one status snapshot of the PCM, its state, its delay
 // (what it was given and has not yet played, with what the driver counts in
-// flight to the speaker), between two reads of CLOCK_MONOTONIC, with the wall
-// clock read right after the first (Output's timeAudible). A snapshot that
-// fails, or a clock that cannot be read, gives none.
+// flight to the speaker) and its trigger timestamp, between two reads of
+// CLOCK_MONOTONIC, with the wall clock read right after the first (Output's
+// timeAudible and settleAudibles). A snapshot that fails, or a clock that
+// cannot be read, gives none. A suspended PCM it finds is a break (breaks),
+// as it is when a write finds it.
 func (s *alsaStream) playPosition() (playPosition, bool) {
 	before, ok := monotonicNanos()
 	if !ok {
@@ -135,7 +139,10 @@ func (s *alsaStream) playPosition() (playPosition, bool) {
 	if !ok || st.rc < 0 {
 		return playPosition{}, false
 	}
-	return playPosition{running: st.running, delay: max(0, st.delay), before: before, after: after, wall: wall}, true
+	if st.suspended {
+		s.broke++
+	}
+	return playPosition{running: st.running, delay: max(0, st.delay), trigger: st.trigger, before: before, after: after, wall: wall}, true
 }
 
 // breaks reports how many times the PCM's playback broke (broke): what it
@@ -214,7 +221,10 @@ func (s *alsaStream) Write(frame []int16) error {
 	case st.suspended:
 		// Suspended after the write: the suspend cancelled what was in
 		// flight, which a suspended status no longer counts. The next
-		// write's recovery counts it lost (inflightAtSuspend).
+		// write's recovery counts it lost (inflightAtSuspend). The suspend is
+		// a break now, though the write succeeded (Sol's review of #154 at
+		// ce454880).
+		s.broke++
 	default:
 		s.inflight, s.inflightUnknown = s.inflightOf(st), false
 		s.filling = s.inflight > 0 && st.delay >= s.written

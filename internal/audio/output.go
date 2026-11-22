@@ -249,12 +249,15 @@ type Output struct {
 	hearFns     []func(AudibleEvent)
 }
 
-// timedAudible is a speech's audible event, timed, and the disruptions before
-// the write that carried its first sample: it is reported once its time has
-// passed with no disruption since (settleAudibles).
+// timedAudible is a speech's audible event, timed, the disruptions before the
+// write that carried its first sample, and the stream's trigger timestamp in
+// the account that timed it: it is reported once its time has passed with no
+// disruption since, and the stream, read then, still runs from that trigger
+// (settleAudibles).
 type timedAudible struct {
-	event AudibleEvent
-	since uint64
+	event   AudibleEvent
+	since   uint64
+	trigger int64
 }
 
 // outputInput is one input's queue and its part in the mix. The Output's mu
@@ -998,13 +1001,16 @@ func (o *Output) play() {
 		return stream.Close()
 	})
 	// A panic while the stream is in use ends every playback before the
-	// stream closes (deferred last, so it runs first).
+	// stream closes (deferred last but one, so it runs after dropTimed).
 	defer func() {
 		if r := recover(); r != nil {
 			slog.Error("speaker output panic recovered", "panic", r)
 			o.fail(fmt.Errorf("speaker output: %v", r))
 		}
 	}()
+	// The audible events still held belong to this stream: they go before it
+	// closes, on every path out (a failure, a teardown, Close, idle).
+	defer o.dropTimed()
 	if o.closing() {
 		return
 	}
@@ -1094,7 +1100,7 @@ func (o *Output) mix(stream PlaybackStream, rate int) error {
 			return nil
 		case stepIdle:
 			if q, ok := stream.(interface{ queuedFrames() int }); !ok || quiet >= q.queuedFrames() {
-				o.settleAudibles(monoclock.Read(), true)
+				o.settleAudibles(stream, true)
 				o.closeIdle()
 				return nil
 			}
@@ -1149,7 +1155,7 @@ func (o *Output) mix(stream PlaybackStream, rate int) error {
 		if o.wrote(seq, took, tookMono) {
 			o.timeAudible(stream, rate)
 		}
-		o.settleAudibles(monoclock.Read(), false)
+		o.settleAudibles(stream, false)
 		p.wrote(took.Sub(began), took)
 		if active {
 			quiet = 0
@@ -1706,21 +1712,46 @@ func (o *Output) disrupted() {
 }
 
 // settleAudibles reports each timed audible event whose time, with its error,
-// has passed by CLOCK_MONOTONIC (nowMono) with no disruption since the write
-// that carried its sample, and drops each a disruption came to. closing, as
-// the stream closes, drops the rest: no account of a closed stream says when
-// they play.
-func (o *Output) settleAudibles(nowMono int64, closing bool) {
+// has passed by CLOCK_MONOTONIC with no disruption since the write that
+// carried its sample, and drops each a disruption came to. Before it reports
+// one, the stream itself confirms that it played on: a status read after the
+// time must find it running, from the trigger of the account that timed the
+// event (Sol's review of #154 at ce454880: a suspend between two writes is
+// seen by no write). A status that shows a stop, a suspend or another trigger
+// is a disruption; one that cannot be read reports nothing. closing, as the
+// stream closes, drops what has not come due: no account of a closed stream
+// says when it plays.
+func (o *Output) settleAudibles(stream PlaybackStream, closing bool) {
+	nowMono := monoclock.Read()
+	o.mu.Lock()
+	due := false
+	for _, t := range o.timed {
+		due = due || (t.since == o.disruptions && nowMono != 0 && nowMono >= t.event.At.Mono+t.event.Err)
+	}
+	o.mu.Unlock()
+	var pos playPosition
+	read := false
+	if due {
+		if s, ok := stream.(interface{ playPosition() (playPosition, bool) }); ok {
+			pos, read = s.playPosition()
+		}
+	}
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	kept := o.timed[:0]
 	for _, t := range o.timed {
+		due := nowMono != 0 && nowMono >= t.event.At.Mono+t.event.Err
 		switch {
 		case t.since != o.disruptions:
-		case nowMono != 0 && nowMono >= t.event.At.Mono+t.event.Err:
+		case due && read && pos.running && pos.trigger == t.trigger:
 			t.event.Disruptions = o.disruptions
 			o.audibles = append(o.audibles, t.event)
 			signal(o.eventWake)
+		case due && read:
+			// The stream stopped, or started again, since the account that
+			// timed the event: nothing held across that is timed.
+			o.disruptions++
+		case due:
 		case !closing:
 			kept = append(kept, t)
 		}
@@ -1729,13 +1760,24 @@ func (o *Output) settleAudibles(nowMono int64, closing bool) {
 	o.timed = kept
 }
 
+// dropTimed forgets the timed audible events still held, as the stream ends
+// by any path: failure, teardown, Close or idle.
+func (o *Output) dropTimed() {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	clear(o.timed)
+	o.timed = o.timed[:0]
+}
+
 // playPosition is a stream's account of its playback, read at one moment:
-// whether it runs, and how many frames it was given that it has not yet
-// played (its delay), read between before and after, on CLOCK_MONOTONIC in
-// nanoseconds; wall is the wall clock, read right after before.
+// whether it runs, how many frames it was given that it has not yet played
+// (its delay), and the trigger timestamp of its last start, stop, suspend or
+// resume, read between before and after, on CLOCK_MONOTONIC in nanoseconds;
+// wall is the wall clock, read right after before.
 type playPosition struct {
 	running       bool
 	delay         int
+	trigger       int64
 	before, after int64
 	wall          time.Time
 }
@@ -1770,7 +1812,7 @@ func (o *Output) timeAudible(stream PlaybackStream, rate int) {
 		}
 		in.audiblePending = false
 		at := mid + (in.audibleAt-played)*second/int64(rate)
-		o.timed = append(o.timed, timedAudible{since: in.audibleSince, event: AudibleEvent{
+		o.timed = append(o.timed, timedAudible{since: in.audibleSince, trigger: pos.trigger, event: AudibleEvent{
 			Input: in.name,
 			At:    monoclock.Stamp{Wall: pos.wall.Add(time.Duration(at - pos.before)), Mono: at},
 			Lead:  (in.audibleLead*second + int64(rate) - 1) / int64(rate),

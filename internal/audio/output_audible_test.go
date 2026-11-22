@@ -1,6 +1,7 @@
 package audio
 
 import (
+	"errors"
 	"slices"
 	"sync"
 	"testing"
@@ -305,16 +306,111 @@ func TestAudibleEventOfAResampledInputLeadsByItsFilter(t *testing.T) {
 type liveStream struct{ *clockedStream }
 
 func (s *liveStream) playPosition() (playPosition, bool) {
-	before, _ := monotonicNanos()
+	before := monoclock.Read()
 	wall := time.Now()
 	s.mu.Lock()
 	r := positionRead{running: s.running, written: s.written, before: before}
 	s.mu.Unlock()
-	r.after, _ = monotonicNanos()
+	r.after = monoclock.Read()
 	s.mu.Lock()
 	s.reads = append(s.reads, r)
 	s.mu.Unlock()
 	return playPosition{running: r.running, delay: s.delay, before: r.before, after: r.after, wall: wall}, true
+}
+
+// endingStream is a liveStream whose second write waits for stop, then fails
+// when fail is set; gone closes when the Output closes it.
+type endingStream struct {
+	*liveStream
+	writes int // only the mixer's goroutine writes
+	stop   chan struct{}
+	gone   chan struct{}
+	once   sync.Once
+	fail   bool
+}
+
+func (s *endingStream) Write(frame []int16) error {
+	s.writes++
+	if s.writes == 2 {
+		<-s.stop
+		if s.fail {
+			return errors.New("the test's stream failed")
+		}
+	}
+	return s.liveStream.Write(frame)
+}
+
+func (s *endingStream) Close() error {
+	s.once.Do(func() { close(s.gone) })
+	return nil
+}
+
+// TestHeldAudibleEventsGoWithTheStream fails if an audible event still held
+// for its time outlives its stream, closed by a failure, a teardown, Close or
+// being idle (Sol's review of #154 at ce454880): no account of a closed
+// stream says when it plays. Nothing held may be reported after either.
+func TestHeldAudibleEventsGoWithTheStream(t *testing.T) {
+	for _, how := range []string{"idle", "failure", "teardown", "close"} {
+		t.Run(how, func(t *testing.T) {
+			clock := newClockedStream(24000) // 500 ms queued
+			clock.set(true, 0)
+			stream := &endingStream{liveStream: &liveStream{clock}, stop: make(chan struct{}), gone: make(chan struct{}), fail: how == "failure"}
+			out := NewOutput(OutputConfig{IdleClose: 20 * time.Millisecond, Open: func(string) (PlaybackStream, int, error) {
+				return stream, 48000, nil
+			}})
+			var released sync.Once
+			unblock := func() { released.Do(func() { close(stream.stop) }) }
+			t.Cleanup(func() {
+				unblock()
+				if err := out.Close(); err != nil {
+					t.Error(err)
+				}
+			})
+			got := make(chan AudibleEvent, 16)
+			out.OnAudible(func(e AudibleEvent) { got <- e })
+			if err := out.Begin(InputChime, nil).Write(testContext(t), constant(48000, 10*time.Millisecond, 1000), mono48k); err != nil {
+				t.Fatal(err)
+			}
+			waitFor(t, "a held audible event", func() bool {
+				out.mu.Lock()
+				defer out.mu.Unlock()
+				return len(out.timed) == 1
+			})
+			switch how {
+			case "teardown":
+				out.stopForTeardown()
+			case "close":
+				done := make(chan error, 1)
+				go func() { done <- out.Close() }()
+				waitFor(t, "Close to begin", func() bool {
+					out.mu.Lock()
+					defer out.mu.Unlock()
+					return out.closed
+				})
+				unblock()
+				if err := <-done; err != nil {
+					t.Fatal(err)
+				}
+			}
+			unblock()
+			select {
+			case <-stream.gone:
+			case <-time.After(5 * time.Second):
+				t.Fatal("fixture: the stream did not close")
+			}
+			out.mu.Lock()
+			held := len(out.timed)
+			out.mu.Unlock()
+			if held != 0 {
+				t.Fatalf("%d audible events still held after the stream closed (%s)", held, how)
+			}
+			select {
+			case e := <-got:
+				t.Fatalf("a held audible event was reported after its stream closed (%s): %+v", how, e)
+			case <-time.After(600 * time.Millisecond):
+			}
+		})
+	}
 }
 
 // TestAudibleEventWaitsForItsTimeToPassUndisrupted fails if a speech's
