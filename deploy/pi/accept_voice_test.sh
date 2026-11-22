@@ -1102,6 +1102,12 @@ def arecord(args):
         with open(os.path.join(substream, "status"), "w") as f:
             f.write("state: RUNNING\nowner_pid   : %d\n" % os.getpid())
 
+    def set_state(state):
+        """The capture substream's state, as the kernel's status shows it while arecord holds it."""
+        if substream:
+            with open(os.path.join(substream, "status"), "w") as g:
+                g.write("state: %s\nowner_pid   : %d\n" % (state, os.getpid()))
+
     def close_substream():
         if substream:
             with open(os.path.join(substream, "status"), "w") as f:
@@ -1197,6 +1203,12 @@ def arecord(args):
         # its buffer and the interrupt's 1 ms: the fake says so too when its own stall, with the lag
         # it keeps, leaves a sample unwritten that long, as a loaded machine can hold the fake back.
         aplays, lag_until, skip, last = read("aplays", "0"), None, 0, now_ms()
+        # From the first clip played after the recording began: capture-silent-xrun shows the
+        # capture substream in XRUN for 600 ms, longer than the sampler's 0.5 s between reads, and
+        # prints nothing, as an arecord stopped in a stalled write never reads again to report it;
+        # arecord-suspend prints the suspend recovery arecord prints unless -q (alsa-utils aplay.c,
+        # suspend()).
+        clipped, shown = None, "RUNNING"
         while True:
             time.sleep(0.005)
             t = now_ms()
@@ -1215,6 +1227,16 @@ def arecord(args):
                     log_to("recordings", "%s %d" % (path, begun + skip))
             if "arecord-dies" in SCENARIO and lag_until is not None and t > lag_until + 1000:
                 return 1
+            if clipped is None and SCENARIO & {"capture-silent-xrun", "arecord-suspend"} and read("aplays", "0") != aplays:
+                clipped = t
+                if "arecord-suspend" in SCENARIO and "-q" not in args:
+                    sys.stderr.write("Suspended. Trying resume. Done.\n")
+                    sys.stderr.flush()
+            if "capture-silent-xrun" in SCENARIO and clipped is not None:
+                state = "XRUN" if t < clipped + 600 else "RUNNING"
+                if state != shown:
+                    set_state(state)
+                    shown = state
             lag = (1000 if lag_until is not None and t < lag_until else 0) + (50 if "arecord-behind" in SCENARIO else 0)
             # Whole 2-byte samples at 24 kHz of the rig's clock, CLOCK times the Pi's.
             target = 2 * int((t - lag - skip - begun) * CLOCK * 24)
@@ -1225,6 +1247,16 @@ def arecord(args):
                     os.kill(pid, signal.SIGCONT)
                 frozen = []
     finally:
+        # arecord-final-rewrite: as arecord ends, it seeks back to write the data chunk's size into
+        # the header (alsa-utils aplay.c, end_wave) and holds 800 ms before it closes: its offset in
+        # the file is then 44, though the file holds the whole recording.
+        if "arecord-final-rewrite" in SCENARIO and f is not None:
+            f.flush()
+            data = os.path.getsize(path) - 44
+            f.seek(40)
+            f.write(max(data, 0).to_bytes(4, "little"))
+            f.flush()
+            time.sleep(0.8)
         for pid in frozen:
             os.kill(pid, signal.SIGCONT)
         close_substream()
@@ -2148,6 +2180,17 @@ launch barge-backchannel-frozen-floor answer-until-clip,backchannel-stops,arecor
 launch barge-pause answer-until-clip,backchannel-pause-500 yes -- --step barge-in --talkovers 1 --backchannels 1 --question @question.wav --talkover-dir @talkovers --backchannel-dir @backchannels --rig-mic "$rig" --event-timeout 15
 launch barge-pause-unsure answer-until-clip,backchannel-pause-500,arecord-slow-start,no-capture-params yes -- --step barge-in --talkovers 1 --backchannels 1 --question @question.wav --talkover-dir @talkovers --backchannel-dir @backchannels --rig-mic "$rig" --event-timeout 15
 launch barge-pause-slow-read answer-until-clip,backchannel-pause-500,arecord-slow-start,capture-buffer-250 yes -- --step barge-in --talkovers 1 --backchannels 1 --question @question.wav --talkover-dir @talkovers --backchannel-dir @backchannels --rig-mic "$rig" --event-timeout 15
+# A backchannel that stops the speech, recorded by an arecord that rewrites its header as it ends
+# and holds 800 ms before it closes (arecord-final-rewrite), with the 250 ms buffer: a reader of its
+# offset took 44 bytes then for a read with no sample, and its early bounds came after the late
+# ones: a false PASS, "0 of 1" (Sol's review of #149 at 6d98ad98). FAIL, 1 of 1, never PASS.
+launch barge-backchannel-final-rewrite answer-until-clip,backchannel-stops,capture-buffer-250,arecord-final-rewrite yes -- --step barge-in --talkovers 0 --backchannels 1 --question @question.wav --talkover-dir @talkovers --backchannel-dir @backchannels --rig-mic "$rig" --event-timeout 15
+# barge-pause-slow-read with the capture substream in XRUN for 600 ms and arecord silent about it
+# (capture-silent-xrun), as one stopped in a stalled write, and with a suspend arecord prints only
+# without -q (arecord-suspend): continuity is not shown, so the early bounds come from the start
+# alone, with a NOTE, and the pause reads cancel-unsure's UNKNOWN, never PASS.
+launch barge-pause-silent-xrun answer-until-clip,backchannel-pause-500,arecord-slow-start,capture-buffer-250,capture-silent-xrun yes -- --step barge-in --talkovers 1 --backchannels 1 --question @question.wav --talkover-dir @talkovers --backchannel-dir @backchannels --rig-mic "$rig" --event-timeout 15
+launch barge-pause-suspend answer-until-clip,backchannel-pause-500,arecord-slow-start,capture-buffer-250,arecord-suspend yes -- --step barge-in --talkovers 1 --backchannels 1 --question @question.wav --talkover-dir @talkovers --backchannel-dir @backchannels --rig-mic "$rig" --event-timeout 15
 
 # playback-cancel, timed by the end of the cancelled speech at the rig microphone: a pass; a correct
 # cancel that keeps the stream running with 80 ms of silence queued, which must pass; a status that
@@ -2880,6 +2923,18 @@ else
   expect_no_line barge-pause-slow-read 'PASS: barge-in: 0 of 1'
 fi
 expect_restored barge-pause-slow-read
+expect_rc barge-backchannel-final-rewrite 1
+expect_line barge-backchannel-final-rewrite 'FAIL: barge-in: 1 of 1 backchannels stopped the speech, more than 0'
+expect_no_line barge-backchannel-final-rewrite 'PASS: barge-in: '
+expect_restored barge-backchannel-final-rewrite
+expect_rc barge-pause-silent-xrun 2
+expect_line barge-pause-silent-xrun 'NOTE: recording: the capture substream arecord held read XRUN during the recording, so the recording'"'"'s early bounds come from its start alone'
+expect_no_line barge-pause-silent-xrun 'PASS: barge-in: 0 of 1'
+expect_restored barge-pause-silent-xrun
+expect_rc barge-pause-suspend 2
+expect_line barge-pause-suspend 'NOTE: recording: arecord reported a suspend, so the recording'"'"'s early bounds come from its start alone'
+expect_no_line barge-pause-suspend 'PASS: barge-in: 0 of 1'
+expect_restored barge-pause-suspend
 
 # playback-cancel.
 expect_rc cancel 0

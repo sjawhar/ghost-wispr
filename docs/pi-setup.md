@@ -987,12 +987,17 @@ with the unit paused and no session active:
    read that starts its capture. It is early by up to the time between two reads (10 ms on an idle
    Pi), the time arecord took from its header to its first read, and up to 400 ppm of the time into
    the recording. A read of the size that fails moves the start nowhere. When `/proc/asound` shows
-   the capture substream arecord holds, and arecord reports no overrun, every read of the size also
-   bounds the times after it from below. A sample not yet in the file was captured at most two
-   periods and the buffer before (61 ms with arecord's 40 ms buffer and 10 ms periods). That
-   includes 1 ms for the interrupt that delivers a period, an assumption about the Pi, not a
-   measured bound. The recording's end lies between the start plus its length and the last anchor,
-   and a silence's length is never longer than its length in the file.
+   the capture substream arecord holds, every read of the size also bounds the times after it from
+   below, while continuity holds: arecord reports no overrun and no suspend (it runs without `-q`,
+   so that it prints both), and the driver never reads the substream in any state but `RUNNING`.
+   arecord may not live to report an overrun, as when the step stops it in a stalled write, so the
+   driver reads the substream's state after each read of the size. A sample not yet in the file was
+   captured at most two periods and the buffer before (61 ms with arecord's 40 ms buffer and 10 ms
+   periods). That includes 1 ms for the interrupt that delivers a period, an assumption about the
+   Pi, not a measured bound. The size read is the file's length, never arecord's offset in it:
+   arecord seeks back to rewrite the header as it ends, and a read that finds only the header
+   counts only before the first sample. The recording's end lies between the start plus its length
+   and the last anchor, and a silence's length is never longer than its length in the file.
    Every check passes or fails only when its verdict holds for every time between the bounds, and
    otherwise reports UNKNOWN with how late the recording's times may be. `playback-cancel` passes a
    stop when the late time of its tail is within 20 ms, and fails it when even the early time is

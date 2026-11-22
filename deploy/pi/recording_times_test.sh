@@ -358,6 +358,28 @@ print("recording-times floor: checked %d places, %d failures" % (checked, len(fa
 sys.exit(1 if failures else 0)
 EOF
 
+# A read that finds only the header after a read that found a sample bounds nothing: arecord seeks
+# back to rewrite the header as it ends (alsa-utils aplay.c, end_wave), and a reader of its offset
+# would see 44 bytes of the whole file there (Sol's review of #149 at 6d98ad98). Such an anchor, the
+# early bounds from it would come after the late ones. The start's header-only read is the control:
+# it still bounds.
+late_header() {
+  printf '%s\n' '1000100 44 1000000' "1600000 $((44 + 600 * 48)) 1599900" "2500000 $((44 + 1500 * 48)) 2499900" \
+    "$1" "3000600 $((44 + 2000 * 48))" >"$work_dir/late-header.anchors"
+  awk -v rate=24000 -v header=44 -v frame=2 -v bytes=$((44 + 2000 * 48)) -v started_us=1000000 -v floor_us=61000 \
+    -f "$program" "$work_dir/late-header.anchors" - <"$work_dir/late-header.txt"
+}
+printf '%s\n' '[silencedetect @ 0x1] silence_start: -0.00133' \
+  '[silencedetect @ 0x1] silence_end: 0.5 | silence_duration: 0.50133' \
+  '[silencedetect @ 0x1] silence_start: 0.8' \
+  '[silencedetect @ 0x1] silence_end: 1.6 | silence_duration: 0.8' >"$work_dir/late-header.txt"
+for row in '3000500 44 3000400' "3000500 $((44 + 2000 * 48)) 3000400"; do
+  out=$(late_header "$row") || fail "the program failed with the anchor '$row': $out"
+  [[ $(grep -c '^sound ' <<<"$out") == 2 ]] || fail "with the anchor '$row', want 2 sounds: $out"
+  awk '$1 == "sound" && ($5 > $2 || $6 > $3) { bad = 1 } END { exit bad }' <<<"$out" \
+    || fail "with the anchor '$row', an early bound comes after its late bound: $out"
+done
+
 # ffmpeg's own silences: one it reports just before the start (a negative time) starts no sound, nor
 # does the one it ends at the end of the file; a sound still going at the end runs to the end.
 printf '2000000 %s\n' $((44 + 2000 * 48)) >"$work_dir/edge.anchors"
@@ -401,5 +423,44 @@ printf '%s\n' '[silencedetect @ 0x1] silence_start: -0.00133' \
   '[silencedetect @ 0x1] silence_end: 2 | silence_duration: 1.2' >"$work_dir/quiet-end.txt"
 out=$(times "$work_dir/short.anchors" "$work_dir/quiet-end.txt" $((44 + 2000 * 48)) 0) || fail "the unbounded end failed: $out"
 [[ $(awk '$1 == "end" { print $3 }' <<<"$out") == none ]] || fail "an end after the last anchor has a late bound: $out"
+
+# ---- mono_py's size reader: the file's length, never arecord's offset ----
+
+# arecord seeks back to byte 40 to write the data chunk's size as it ends (alsa-utils aplay.c,
+# end_wave), and holds the file open after: the reader must give the file's whole length there,
+# never arecord's offset in it (Sol's review of #149 at 6d98ad98). The writer here does just that,
+# and the reader reads through its fd, as the driver does while /proc shows it.
+awk '/^read -r -d .. mono_py <<.EOF.$/ {on=1; next} on && /^EOF$/ {exit} on' \
+  "$repo_root/deploy/pi/accept-voice.sh" >"$work_dir/mono.py"
+python3 - "$work_dir/mono.py" "$work_dir" <<'EOF' || fail "mono_py's size reader gave arecord's offset (above)"
+import os, subprocess, sys, time
+src, base = sys.argv[1], sys.argv[2]
+ns = {"__name__": "mono_py"}
+argv, sys.argv = sys.argv, ["mono_py", "none"]
+try:
+    exec(open(src).read(), ns)
+except SystemExit:
+    pass
+sys.argv = argv
+path = os.path.join(base, "rewrite.wav")
+ready, go = os.path.join(base, "rewrite.ready"), os.path.join(base, "rewrite.go")
+writer = subprocess.Popen([sys.executable, "-c", (
+    "import os, sys, time\n"
+    "path, ready, go = sys.argv[1:4]\n"
+    "f = open(path, 'wb'); f.write(bytes(44) + b'\\1\\0' * 4800); f.flush()\n"
+    "f.seek(40); f.write((9600).to_bytes(4, 'little')); f.flush()\n"
+    "open(ready, 'w').close()\n"
+    "while not os.path.exists(go): time.sleep(0.01)\n"), path, ready, go])
+while not os.path.exists(ready):
+    time.sleep(0.01)
+read = ns["size_reader"](path)
+got = read(writer.pid)
+open(go, "w").close()
+writer.wait()
+want = 44 + 9600
+if got != want:
+    print("with arecord's offset at byte 44, the reader gave %r, want the file's length, %d" % (got, want))
+    sys.exit(1)
+EOF
 
 printf 'recording-times test passed\n'

@@ -136,8 +136,10 @@ FILENAME == ARGV[1] {
   if (NF != 2 && NF != 3) next
   s = int(($2 - header) / frame)
   if (s < 0) next
-  # A read that found S samples, even only the header, bounds every later sample from below.
-  if (NF == 3) {
+  # A read that found S samples, even only the header, bounds every later sample from below. One
+  # that found only the header after a read that found a sample is no such read: arecord rewrites
+  # the header as it ends, and a reader of its offset then sees 44 bytes of a whole file.
+  if (NF == 3 && (s > 0 || anchors == 0)) {
     floors++
     fl_samples[floors] = s
     fl_before[floors] = $3
