@@ -75,6 +75,27 @@ func TestThePiConfigSearchesOnVertexAIUntilTheGatewayAdmitsThePi(t *testing.T) {
 	}
 }
 
+// TestThePiConfigKeepsEnvoyOffWhileTheHubMoves fails if the office Pi's
+// config turns Envoy on: envoy_enabled, or a concierge.envoy_url. The Pi keeps
+// Envoy off while the hub moves (dispatch://INFRA-3862). A start with Envoy on
+// publishes every completed summary Envoy has not had, oldest first
+// (envoyPublishing's sweep), so a provision that turned it on would send the
+// hub every summary made while it was off. To turn it on again, set both in the
+// template and run the provisioner (docs/pi-setup.md).
+func TestThePiConfigKeepsEnvoyOffWhileTheHubMoves(t *testing.T) {
+	clearEnv(t)
+	cfg, _, err := Load(piConfigPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.EnvoyEnabled {
+		t.Error("the Pi's config publishes to Envoy (envoy_enabled: true); want it off while the hub moves")
+	}
+	if cfg.Concierge.EnvoyURL != "" {
+		t.Errorf("the Pi's Concierge asks agents through %q; want no concierge.envoy_url while the hub moves", cfg.Concierge.EnvoyURL)
+	}
+}
+
 // TestThePiConfigsGatewaySwitchLoads fails if the switch the office Pi's
 // config names for search once the gateway admits the Pi, its commented-out
 // gateway entry uncommented and embedding.model set to

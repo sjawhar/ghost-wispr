@@ -437,6 +437,39 @@ rollout install
 expect_stop 'install with a drop-in found once it installed the units' 'late.conf'
 (($(line update.sh) == 0)) || fail "install ran update.sh past a drop-in it found once it installed the units: $(<"$state/events")"
 
+# install refuses, before it changes anything, while a line of the Pi's .env could set a variable
+# that would turn Envoy on over the template, which keeps it off while the hub moves
+# (dispatch://INFRA-3862): a line that, past leading space and an export, starts with the name and
+# =. It names the variable, prints no value, and leaves .env byte for byte as it was. A match inside
+# a multi-line quoted value refuses too: a false refusal only stops the install. systemd's
+# EnvironmentFile= parser ends a line at a carriage return as at a line feed (NEWLINE "\n\r",
+# src/basic/env-file.c), so a bare CR starts a line too; a case whose text holds CR LF is a CRLF file.
+for case in \
+  'GHOST_WISPR_ENVOY_ENABLED|GHOST_WISPR_ENVOY_ENABLED=true' \
+  'GHOST_WISPR_CONCIERGE_ENVOY_URL|  export GHOST_WISPR_CONCIERGE_ENVOY_URL = http://hub.example.test:9020' \
+  $'GHOST_WISPR_ENVOY_ENABLED|GHOST_WISPR_DISPATCH_TOKEN="first line\nGHOST_WISPR_ENVOY_ENABLED=true\nlast line"' \
+  $'GHOST_WISPR_ENVOY_ENABLED|GHOST_WISPR_ADDR=127.0.0.1:8080\rGHOST_WISPR_ENVOY_ENABLED=true' \
+  $'GHOST_WISPR_CONCIERGE_ENVOY_URL|GHOST_WISPR_ADDR=127.0.0.1:8080\r\nGHOST_WISPR_CONCIERGE_ENVOY_URL=http://hub.example.test:9020\r'; do
+  name=${case%%|*} content=${case#*|} eol=''
+  [[ $content != *$'\r\n'* ]] || eol=$'\r'
+  reset
+  printf "%s$eol\n%s\n" GHOST_WISPR_DEEPGRAM_API_KEY=dg-1 "$content" >"$deploy/.env"
+  before=$(sha256sum <"$deploy/.env")
+  rollout install
+  expect_stop "install with $name in .env" "the Pi's .env can set $name"
+  refused_before_change "$name in .env"
+  [[ $(sha256sum <"$deploy/.env") == "$before" ]] || fail "install changed .env when it refused $name"
+  [[ $out != *'hub.example.test'* && $out != *'first line'* && $out != *dg-1* ]] \
+    || fail "install printed a value from .env when it refused $name: $out"
+done
+# The control: a .env that names neither installs, with the hub's URL, a commented-out override and
+# a longer name that starts with one.
+reset
+printf '%s\n' 'GHOST_WISPR_ENVOY_HUB_URL=http://hub.example.test:9020' '# GHOST_WISPR_ENVOY_ENABLED=true' \
+  'GHOST_WISPR_ENVOY_ENABLED_BEFORE=true' >>"$deploy/.env"
+rollout install
+expect_ok 'install with a .env that sets no Envoy override'
+
 # check: each failure leaves the nightly update stopped.
 check_fails() {
   local name=$1 because=$2

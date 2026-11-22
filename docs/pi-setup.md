@@ -459,7 +459,9 @@ with `deploy/pi/files/ghost-wispr.yaml` rendered with that ID,
 no longer reads (an old Envoy webhook signing key, and those of the settings that providers
 replaced: README, "Removed settings"), and
 restarts Ghost Wispr. The credential files from the full provisioner stay as they are. A later
-full-provisioner run keeps the drive ID and both enablements.
+full-provisioner run keeps the drive ID and both enablements. While the Envoy hub moves, it refuses
+before it writes anything if a line of `.env` could turn Envoy on ("Turn on the meeting voice",
+step 1), naming the variable.
 
 ```bash
 (
@@ -897,7 +899,11 @@ again at its end. It stops at the first check that fails. Save no settings in th
    units. Before it changes anything, and again once it has installed the units, it refuses while
    either unit is not loaded on the Pi or has a drop-in there (a `ghost-wispr.service.d` file, such
    as one left from a speaker trace), naming it: a drop-in can change how the units run, such as
-   give the update a time limit. Remove the drop-in and run `install` again. It runs `update.sh`
+   give the update a time limit. Remove the drop-in and run `install` again. Before it changes
+   anything, it also refuses while the Envoy hub moves if a line of the Pi's `.env` could set
+   `GHOST_WISPR_ENVOY_ENABLED` or `GHOST_WISPR_CONCIERGE_ENVOY_URL`, naming the variable ("Turn on
+   the meeting voice", step 1). Such a line overrides the template, and the models step keeps
+   `.env`. Remove the line and run `install` again. It runs `update.sh`
    paused-only ("Update and inspect"), so a resume during the download leaves the binary in place;
    it must print `installed commit <merge commit>` or `already on commit <merge commit>`. Then, at
    once, it runs
@@ -1047,7 +1053,16 @@ the unit.
 1. Reach. The Concierge reads `concierge.dispatch_url` and registers with the Envoy listener at
    `concierge.envoy_url`. The Pi reaches neither until the tailnet grant of dispatch://INFRA-4617
    is applied; until then the voice answers "I cannot reach Dispatch yet", and the log warns every
-   minute that the Envoy session did not open, with no restart needed once it can.
+   minute that the Envoy session did not open, with no restart needed once it can. While the Envoy
+   hub moves (dispatch://INFRA-3862), the template sets `envoy_enabled: false` and no
+   `concierge.envoy_url`, so the Pi opens no Envoy session and publishes no event: a start with
+   Envoy on publishes every completed summary Envoy has not had. A `.env` line overrides the YAML,
+   so the models step (`provision.sh --models`) and `deploy/pi/rollout.sh install` each refuse, and
+   change nothing, while a line of the Pi's `.env` could set `GHOST_WISPR_ENVOY_ENABLED` or
+   `GHOST_WISPR_CONCIERGE_ENVOY_URL`: a line that, past leading space and an `export`, starts with
+   the name and `=`. They name the variable. To turn Envoy on again, set both in the template,
+   remove `ENVOY_ON_VARIABLES` and its check from `deploy/pi/provision.sh` and
+   `deploy/pi/rollout.sh`, and run the provisioner.
 2. The Pi's Dispatch token: a no-scope agent token, never a person's. Before you run
    `provision-pi.sh`, mint it into `$prepared/dispatch-token` with your own Dispatch token, which
    must hold the `person` and `approve` scopes, in the file `DISPATCH_TOKEN_FILE` names:
