@@ -1234,9 +1234,11 @@ def arecord(args):
                 f.write("closed\n")
 
     def overrun(ms):
-        """arecord's own line for an overrun (alsa-utils aplay.c, xrun), which -q does not quiet."""
+        """arecord's own line for an overrun (alsa-utils aplay.c, xrun), which -q does not quiet;
+        the fake also logs it (overruns), so the self-test knows an overrun truly came."""
         sys.stderr.write("overrun!!! (at least %.3f ms long)\n" % ms)
         sys.stderr.flush()
+        log_to("overruns", "%d %.3f" % (now_ms(), ms))
 
     # arecord-terminal-stall (Sol's review of #149 at b7edd969): arecord stalls in a write of audio
     # it already read, its capture overruns, and the sampler is held up for as long. Stopped, arecord
@@ -2126,6 +2128,31 @@ floor_decided() {
 expect_timed_against_chime() {
   expect_no_line "$1" "so a sound after its chime is timed against the answer's first_audio"
   expect_no_line "$1" "from the next answer's first audio, after the chime"
+}
+
+# expect_load_case NAME: a load case. With no overrun, it must PASS, each answer timed against its
+# chime: an UNKNOWN there stays a failure of the acceptance line. Only in a run where the fake
+# arecord truly overran (its own log, overruns) and the driver named it may the case fall back to
+# first_audio: the capture lost samples, so the time between a chime and its answer does not count in
+# the file's samples (Sol's review of #156 at 053df77c). The fallback must give its NOTE and must not
+# FAIL; it may read UNKNOWN, #146's stated limit, the honest answer across a break in the recording.
+expect_load_case() {
+  local overran=false noted=false
+  [[ -s $root/$1/state/overruns ]] && overran=true
+  grep -Fq "NOTE: recording: arecord reported an overrun" "$root/$1/out" && noted=true
+  if [[ $overran != "$noted" ]]; then
+    check_failed "$1: the fake logged an overrun: $overran; the driver named one: $noted"
+  fi
+  if [[ $overran == true ]]; then
+    printf 'NOTE: %s: the fake arecord overran (%s), so the case fell back to first_audio\n' "$1" "$(tr '\n' ';' <"$root/$1/state/overruns")"
+    expect_rc "$1" 0 2
+    expect_line "$1" 'the recording is not shown continuous'
+    expect_no_line "$1" 'FAIL: playback-cancel'
+    return
+  fi
+  expect_rc "$1" 0
+  expect_line "$1" "PASS: playback-cancel: no stop's speech was heard at the rig microphone 20 ms after it"
+  expect_timed_against_chime "$1"
 }
 
 # expect_between NAME GOT LOW HIGH: GOT is a number of milliseconds from LOW to HIGH. NAME starts
@@ -3166,11 +3193,9 @@ expect_no_line barge-backchannel-terminal-stall 'PASS: barge-in: 0 of 1'
 expect_restored barge-backchannel-terminal-stall
 
 # playback-cancel.
-expect_rc cancel 0
+expect_load_case cancel
 expect_line cancel 'PASS: playback-cancel: the poller sees the speaker'\''s stream run at '
 expect_line cancel 'NOTE: playback-cancel: calibration: the wake sound played alone (ghost-wispr play-sound) is heard at the rig microphone for 200 ms above -50 dB; a chime after a stop may be heard for up to 220 ms (the calibration and 20 ms)'
-expect_line cancel "PASS: playback-cancel: no stop's speech was heard at the rig microphone 20 ms after it"
-expect_timed_against_chime cancel
 expect_line cancel 'NOTE: playback-cancel: the speaker logged 2 cancels: 0 by rewind, 2 by drop'
 expect_line cancel 'PASS: playback-cancel: 0 underruns over '
 expect_line cancel 'can miss a short underrun'
@@ -3208,9 +3233,7 @@ fi
 expect_timed_against_chime cancel-slow-read
 expect_no_line cancel-slow-read 'NOTE: recording: no capture substream'
 expect_restored cancel-slow-read
-expect_rc cancel-slow-start 0
-expect_line cancel-slow-start "PASS: playback-cancel: no stop's speech was heard at the rig microphone 20 ms after it"
-expect_timed_against_chime cancel-slow-start
+expect_load_case cancel-slow-start
 expect_restored cancel-slow-start
 expect_rc cancel-rewind 0
 expect_line cancel-rewind "PASS: playback-cancel: no stop's speech was heard at the rig microphone 20 ms after it"
@@ -3263,9 +3286,7 @@ expect_rc cancel-behind-drain 1
 expect_line cancel-behind-drain "FAIL: playback-cancel: a stop's speech was heard at the rig microphone "
 expect_between 'cancel-behind-drain: how long the negative control is heard, 50 ms behind' "$(heard_after cancel-behind-drain)" 450 1000
 expect_restored cancel-behind-drain
-expect_rc cancel-slow-wc 0
-expect_line cancel-slow-wc "PASS: playback-cancel: no stop's speech was heard at the rig microphone 20 ms after it"
-expect_timed_against_chime cancel-slow-wc
+expect_load_case cancel-slow-wc
 expect_restored cancel-slow-wc
 expect_rc cancel-drain 1
 expect_line cancel-drain "FAIL: playback-cancel: a stop's speech was heard at the rig microphone "
@@ -3422,9 +3443,7 @@ expect_applied_late() {
   late=$(sed -n 's/.*applied the stop of .*, due at [0-9]* (\([0-9]*\) ms late).*/\1/p' "$root/$1/state/stops.log" 2>/dev/null | awk '$1 >= 7000' | grep -c .)
   [[ $late == "$2" ]] || check_failed "$1: the fake applied $late of the $2 stops at least 7 s late"
 }
-expect_rc cancel-late-apply 0
-expect_line cancel-late-apply "PASS: playback-cancel: no stop's speech was heard at the rig microphone 20 ms after it"
-expect_timed_against_chime cancel-late-apply
+expect_load_case cancel-late-apply
 expect_line cancel-late-apply 'NOTE: playback-cancel: the speaker logged 2 cancels: 0 by rewind, 2 by drop'
 expect_line cancel-late-apply 'PASS: playback-cancel: 0 underruns over '
 expect_applied_late cancel-late-apply 2
