@@ -9,6 +9,7 @@ import {
   SummaryStatus,
   SyncState,
   SyncStatus,
+  VoiceTaskState,
   type SessionSummary,
 } from '../../lib/types'
 
@@ -114,6 +115,101 @@ describe('SessionCard', () => {
         name: 'Remove from this unit; the shared drive keeps its copy',
       }),
     ).toBeNull()
+  })
+
+  // A summary is the model's text from meeting speech, so it can hold anything
+  // a speaker said: raw HTML in it must not become markup, and a link in it
+  // must not run script.
+  const hostileSummary = [
+    'Notes <img src=x onerror="window.summaryXss = 1"> from the call.',
+    '',
+    '<script>window.summaryXss = 2</script>',
+    '',
+    '[open](javascript:window.summaryXss=3), [also](JaVa\tScRiPt:window.summaryXss=4) and [docs](https://example.com/docs).',
+  ].join('\n')
+
+  it.each([
+    ['preview', { summary_status: SummaryStatus.Completed }, false],
+    ['preview kept after a failure', { summary_status: SummaryStatus.Failed }, false],
+    ['opened card', { summary_status: SummaryStatus.Completed }, true],
+  ])('renders raw HTML in a summary as text in the %s', (_, status, expanded) => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(() => Promise.resolve(new Response('[]'))),
+    )
+    const session = { ...baseSession, ...status, summary: hostileSummary }
+    const { container } = render({
+      session,
+      detail: { session, segments: [] },
+      expanded,
+      presets: {},
+      onToggle: vi.fn(),
+      onLoadDetail: vi.fn(),
+      onResummarize: vi.fn(),
+      onDelete: vi.fn(),
+    })
+
+    const summaries = container.querySelectorAll('.summary-preview-md, .summary-markdown')
+    expect(summaries.length).toBe(expanded ? 2 : 1)
+    for (const summary of summaries) {
+      expect(summary.querySelector('img, script, [onerror]')).toBeNull()
+      expect(summary.textContent).toContain('from the call.')
+      const links = [...summary.querySelectorAll('a')].map((a) => a.getAttribute('href'))
+      expect(links).toEqual(['https://example.com/docs'])
+      expect(summary.textContent).toContain('open')
+      expect(summary.textContent).toContain('also')
+    }
+    expect('summaryXss' in window).toBe(false)
+  })
+
+  it("renders HTML in a title, a transcript line and an agent's answer as text", () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(() => Promise.resolve(new Response('[]'))),
+    )
+    const hostile = (n: number) => `<img src=x onerror="window.summaryXss = ${n}"><b>bold</b>`
+    const session = { ...baseSession, title: hostile(1) }
+    const { container } = render({
+      session,
+      detail: {
+        session,
+        segments: [
+          {
+            id: 1,
+            speaker: 0,
+            text: hostile(2),
+            start_time: 0,
+            end_time: 2,
+            timestamp: '2026-11-11T10:00:00Z',
+            transcript_revision: 1,
+          },
+        ],
+      },
+      expanded: true,
+      presets: {},
+      voiceTasks: {
+        tasks: [
+          {
+            id: 't1',
+            issue_key: 'INFRA-1',
+            holder: 'agent',
+            state: VoiceTaskState.Done,
+            asked_at: '2026-11-11T10:00:00Z',
+            answer_written: hostile(3),
+          },
+        ],
+        error: '',
+      },
+      onToggle: vi.fn(),
+      onLoadDetail: vi.fn(),
+      onResummarize: vi.fn(),
+      onDelete: vi.fn(),
+    })
+
+    expect(container.querySelector('img, b, [onerror]')).toBeNull()
+    for (const n of [1, 2, 3]) {
+      expect(container.textContent).toContain(hostile(n))
+    }
   })
 
   it('loads details when opened', async () => {

@@ -1,5 +1,5 @@
 <script lang="ts">
-  import Markdown from '@humanspeak/svelte-markdown'
+  import SummaryMarkdown from './SummaryMarkdown.svelte'
   import AudioPlayer from './AudioPlayer.svelte'
   import VoiceTasks from './VoiceTasks.svelte'
   import JoinedAgents from './JoinedAgents.svelte'
@@ -412,14 +412,14 @@
 
   {#if session.summary_status === SummaryStatus.Completed && session.summary}
     <div class="summary-preview-md prose">
-      <Markdown source={session.summary} />
+      <SummaryMarkdown source={session.summary} />
     </div>
   {:else if session.summary_status === SummaryStatus.Running || session.summary_status === SummaryStatus.Pending}
     <p class="summary-preview">Summarizing...</p>
   {:else if session.summary_status === SummaryStatus.Failed && session.summary}
     <p class="summary-preview">The last attempt failed; this is the previous summary.</p>
     <div class="summary-preview-md prose">
-      <Markdown source={session.summary} />
+      <SummaryMarkdown source={session.summary} />
     </div>
   {:else if session.summary_status === SummaryStatus.Failed}
     <p class="summary-preview">Summary unavailable</p>
@@ -490,7 +490,7 @@
               <p class="summary-preview">The last attempt failed; this is the previous summary.</p>
             {/if}
             <div class="summary-markdown prose">
-              <Markdown source={session.summary} />
+              <SummaryMarkdown source={session.summary} />
             </div>
           </div>
         {/if}
