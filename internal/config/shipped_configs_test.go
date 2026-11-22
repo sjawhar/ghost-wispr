@@ -3,7 +3,6 @@ package config
 import (
 	"maps"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -82,8 +81,7 @@ func TestThePiConfigSearchesOnVertexAIUntilTheGatewayAdmitsThePi(t *testing.T) {
 // publishes every completed summary Envoy has not had, oldest first
 // (envoyPublishing's sweep), so a provision that turned it on would send the
 // hub every summary made while it was off. To turn it on again, set both in the
-// template, remove deploy/pi/provision.sh's ENVOY_ON_ENV_VARIABLES, and run the
-// provisioner (docs/pi-setup.md).
+// template and run the provisioner (docs/pi-setup.md).
 func TestThePiConfigKeepsEnvoyOffWhileTheHubMoves(t *testing.T) {
 	clearEnv(t)
 	cfg, _, err := Load(piConfigPath)
@@ -96,100 +94,6 @@ func TestThePiConfigKeepsEnvoyOffWhileTheHubMoves(t *testing.T) {
 	if cfg.Concierge.EnvoyURL != "" {
 		t.Errorf("the Pi's Concierge asks agents through %q; want no concierge.envoy_url while the hub moves", cfg.Concierge.EnvoyURL)
 	}
-}
-
-// TestThePiKeepsEnvoyOffOverItsEnvOverrides fails if a .env override on the
-// office Pi turns Envoy on again, over the template, in the .env and config
-// provision.sh --models installs: an override of envoy_enabled would publish
-// every completed summary to the hub that moves (dispatch://INFRA-3862), and
-// one of concierge.envoy_url would let the Concierge ask agents through it.
-// The real renderers write both files and the real loader reads them. Its
-// control, the deployed .env with the same config, must turn both on, so the
-// test sees an override that --models keeps.
-func TestThePiKeepsEnvoyOffOverItsEnvOverrides(t *testing.T) {
-	const hub = "http://hub.example.ts.net:9020"
-	dir := t.TempDir()
-	deployed := filepath.Join(dir, "deployed.env")
-	deployedLines := []string{
-		EnvPrefix + "DEEPGRAM_API_KEY=dg-1",
-		EnvPrefix + "ENVOY_ENABLED=true",
-		EnvPrefix + "ENVOY_HUB_URL=" + hub,
-		EnvPrefix + "CONCIERGE_ENVOY_URL=" + hub,
-	}
-	if err := os.WriteFile(deployed, []byte(strings.Join(deployedLines, "\n")+"\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	config := filepath.Join(dir, "ghost-wispr.yaml")
-	if err := os.WriteFile(config, runProvisioner(t, "render_models_config", piConfigPath, "0AAbCdEf_Gh-Ij"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	rendered := filepath.Join(dir, "rendered.env")
-	if err := os.WriteFile(rendered, runProvisioner(t, "render_models_env", deployed), 0o600); err != nil {
-		t.Fatal(err)
-	}
-
-	for _, tc := range []struct {
-		name, env string
-		wantOn    bool
-	}{
-		{"the deployed .env, the control", deployed, true},
-		{"the .env --models installs", rendered, false},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			clearEnv(t)
-			for _, line := range deployedLines {
-				t.Setenv(line[:strings.IndexByte(line, '=')], "")
-			}
-			for key, value := range readEnvFile(t, tc.env) {
-				t.Setenv(key, value)
-			}
-			cfg, _, err := Load(config)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if publishing := cfg.EnvoyEnabled && cfg.EnvoyHubURL != ""; publishing != tc.wantOn {
-				t.Errorf("Envoy publishing = %v (envoy_enabled %v, envoy_hub_url %q); want %v", publishing, cfg.EnvoyEnabled, cfg.EnvoyHubURL, tc.wantOn)
-			}
-			if asks := cfg.Concierge.EnvoyURL != ""; asks != tc.wantOn {
-				t.Errorf("the Concierge asks agents through %q; want asking %v", cfg.Concierge.EnvoyURL, tc.wantOn)
-			}
-		})
-	}
-}
-
-// runProvisioner runs one of deploy/pi/provision.sh's renderers, which it
-// exposes when sourced, and returns what it prints on stdout.
-func runProvisioner(t *testing.T, args ...string) []byte {
-	t.Helper()
-	provisioner := filepath.Join("..", "..", "deploy", "pi", "provision.sh")
-	cmd := exec.Command("bash", append([]string{"-c", `source "$1" && shift && "$@"`, "bash", provisioner}, args...)...)
-	var stderr strings.Builder
-	cmd.Stderr = &stderr
-	out, err := cmd.Output()
-	if err != nil {
-		t.Fatalf("provision.sh %v: %v\n%s", args, err, stderr.String())
-	}
-	return out
-}
-
-// readEnvFile reads a .env file of NAME=value lines, as the unit's
-// EnvironmentFile= gives them to the process: a line with no = is left out,
-// and spaces around the name and the value are trimmed.
-func readEnvFile(t *testing.T, path string) map[string]string {
-	t.Helper()
-	data, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	env := map[string]string{}
-	for line := range strings.Lines(string(data)) {
-		name, value, ok := strings.Cut(line, "=")
-		if !ok || strings.HasPrefix(strings.TrimSpace(name), "#") {
-			continue
-		}
-		env[strings.TrimSpace(name)] = strings.TrimSpace(value)
-	}
-	return env
 }
 
 // TestThePiConfigsGatewaySwitchLoads fails if the switch the office Pi's

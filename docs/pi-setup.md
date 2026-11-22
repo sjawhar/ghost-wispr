@@ -457,8 +457,7 @@ with `deploy/pi/files/ghost-wispr.yaml` rendered with that ID,
 `gdrive_sync_enabled: true` and `gc_enabled: true`, installs the result over
 `/opt/ghost-wispr/ghost-wispr.yaml`, removes from `/opt/ghost-wispr/.env` each variable Ghost Wispr
 no longer reads (an old Envoy webhook signing key, and those of the settings that providers
-replaced: README, "Removed settings") and, while the Envoy hub moves, each override that would turn
-Envoy on ("Turn on the meeting voice", step 1), and
+replaced: README, "Removed settings"), and
 restarts Ghost Wispr. The credential files from the full provisioner stay as they are. A later
 full-provisioner run keeps the drive ID and both enablements.
 
@@ -812,9 +811,8 @@ outside meetings. Save no settings in the web UI from step 1 until step 4 passes
 A setting the Pi holds in `/opt/ghost-wispr/.env` overrides its YAML, and the steps treat the two
 files differently. The office Pi can set the Jabra's Mute button there, with
 `GHOST_WISPR_JABRA_MUTE_BUTTON` ("Pause and resume at the unit"). The models step keeps every
-`.env` line but those of variables Ghost Wispr no longer reads and, while the Envoy hub moves, the
-overrides that would turn Envoy on, so that line stays as it is. The full provisioner rewrites
-`.env` without it, and the template's `jabra_mute_button: true` applies.
+`.env` line but those of variables Ghost Wispr no longer reads, so that line stays as it is. The
+full provisioner rewrites `.env` without it, and the template's `jabra_mute_button: true` applies.
 
 1. Just before you merge, run the models step ("Enable models and Drive sync") from a checkout of
    the pull request's head (`provision.sh --models <shared-drive-id>`). The shared-drive ID is the
@@ -899,14 +897,17 @@ again at its end. It stops at the first check that fails. Save no settings in th
    units. Before it changes anything, and again once it has installed the units, it refuses while
    either unit is not loaded on the Pi or has a drop-in there (a `ghost-wispr.service.d` file, such
    as one left from a speaker trace), naming it: a drop-in can change how the units run, such as
-   give the update a time limit. Remove the drop-in and run `install` again. It runs `update.sh`
+   give the update a time limit. Remove the drop-in and run `install` again. Before it changes
+   anything, it also refuses while the Envoy hub moves if a line of the Pi's `.env` could set
+   `GHOST_WISPR_ENVOY_ENABLED` or `GHOST_WISPR_CONCIERGE_ENVOY_URL`, naming the variable ("Turn on
+   the meeting voice", step 1). Such a line overrides the template, and the models step keeps
+   `.env`. Remove the line and run `install` again. It runs `update.sh`
    paused-only ("Update and inspect"), so a resume during the download leaves the binary in place;
    it must print `installed commit <merge commit>` or `already on commit <merge commit>`. Then, at
    once, it runs
    the models step ("Enable models and Drive sync") with the shared drive the Pi's config names:
    that installs the new config, removes from `.env` the variables of removed settings (such as
-   the `GHOST_WISPR_EMBEDDING_LOCATION` an earlier provisioner wrote) and the overrides that would
-   turn Envoy on, and restarts the recorder on
+   the `GHOST_WISPR_EMBEDDING_LOCATION` an earlier provisioner wrote), and restarts the recorder on
    both. When the Pi's config names no shared drive, it stops before it installs anything: run the
    full provisioner ("Provision") from the merge commit instead.
 
@@ -1054,10 +1055,11 @@ the unit.
    hub moves (dispatch://INFRA-3862), the template sets `envoy_enabled: false` and no
    `concierge.envoy_url`, so the Pi opens no Envoy session and publishes no event: a start with
    Envoy on publishes every completed summary Envoy has not had. A `.env` line overrides the YAML,
-   so the models step also removes from `.env` each `GHOST_WISPR_ENVOY_ENABLED` and
-   `GHOST_WISPR_CONCIERGE_ENVOY_URL` line, and names each one it removes; a rollback puts the old
-   `.env` back. To turn Envoy on again, set both in the template, remove `ENVOY_ON_ENV_VARIABLES`
-   from `deploy/pi/provision.sh`, and run the provisioner.
+   so `deploy/pi/rollout.sh install` refuses, and changes nothing, while a line of the Pi's `.env`
+   could set `GHOST_WISPR_ENVOY_ENABLED` or `GHOST_WISPR_CONCIERGE_ENVOY_URL`: a line that, past
+   leading space and an `export`, starts with the name and `=`. To turn Envoy on again, set both in
+   the template, remove `ENVOY_ON_VARIABLES` and its check from `deploy/pi/rollout.sh`, and run the
+   provisioner.
 2. The Pi's Dispatch token: a no-scope agent token, never a person's. Before you run
    `provision-pi.sh`, mint it into `$prepared/dispatch-token` with your own Dispatch token, which
    must hold the `person` and `approve` scopes, in the file `DISPATCH_TOKEN_FILE` names:
