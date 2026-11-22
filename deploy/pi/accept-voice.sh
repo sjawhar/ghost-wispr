@@ -500,9 +500,12 @@ def size_reader(path):
 
 def capture_state(root, pid):
     """The state of the capture substream arecord (pid) holds, from its /proc/asound status under
-    root, as RUNNING, and its trigger_time as a number, which the kernel sets at every start, stop
-    (an overrun's included), pause, suspend and resume; None for a trigger_time missing or not a
-    number; (None, None) when no substream names it. The kernel pads the keys ("owner_pid   :")."""
+    root, as RUNNING, and its trigger_time, which the kernel sets at every start, stop (an
+    overrun's included), pause, suspend and resume, as exact (seconds, nanoseconds): the kernel
+    prints it "%lld.%09lld" (sound/core/pcm.c, snd_pcm_substream_proc_status_read), and a float
+    would hold two triggers 1 ns apart as one (Sol's review of #149 at 44738566). None for a
+    trigger_time missing or in any other form, inf and nan among them; (None, None) when no
+    substream names it. The kernel pads the keys ("owner_pid   :")."""
     for status in glob.glob(os.path.join(root, "card*", "pcm*c", "sub*", "status")):
         try:
             with open(status) as f:
@@ -510,11 +513,8 @@ def capture_state(root, pid):
         except OSError:
             continue
         if fields.get("owner_pid") == str(pid):
-            try:
-                trigger = float(fields.get("trigger_time", ""))
-            except ValueError:
-                trigger = None
-            return fields.get("state"), trigger
+            trigger = re.fullmatch(r"([0-9]+)\.([0-9]{9})", fields.get("trigger_time", ""))
+            return fields.get("state"), (int(trigger[1]), int(trigger[2])) if trigger else None
     return None, None
 
 
@@ -555,8 +555,8 @@ def record(path, anchors, pidfile, root):
         nonlocal broken, trigger, closed
         state, now_trigger = capture_state(root, pid)
         if state == "RUNNING" and now_trigger is None:
-            # RUNNING with no trigger_time to read shows nothing about a restart (Sol's review of
-            # #149 at 9b3d27cb): no floor, now or after.
+            # RUNNING with no trigger_time in the kernel's form shows nothing about a restart (Sol's
+            # reviews of #149 at 9b3d27cb and 44738566): no floor, now or after.
             out.write("%d %d\n" % (seen, size))
             if broken is None:
                 broken = "discontinuous %d NO-TRIGGER" % seen
@@ -1587,7 +1587,7 @@ analyse_recording() {
     note "recording: arecord reported a suspend, so the recording's early bounds come from its start alone"
   elif [[ $discontinuous == NO-TRIGGER ]]; then
     floor=
-    note "recording: the capture substream arecord held showed RUNNING with no numeric trigger_time, which cannot show it ran on without a restart, so the recording's early bounds come from its start alone"
+    note "recording: the capture substream arecord held showed RUNNING with no trigger_time in the kernel's form (seconds and nine digits of nanoseconds), which cannot show it ran on without a restart, so the recording's early bounds come from its start alone"
   elif [[ -n $discontinuous ]]; then
     floor=
     note "recording: the capture substream arecord held read $discontinuous during the recording, so the recording's early bounds come from its start alone"
@@ -2761,10 +2761,48 @@ answer_earliest() {
   fi
   answer_from=$((sound_at[$3] - chime_attack_us * sample_rate / 1000000 + gap_us * sample_rate * 4999 / (1000000 * 5000) - 1))
 }
+# leak_beside_chime I Q: set beside_fail, once, when two sounds each certainly end more than
+# cancel_heard_ms after stop I and certainly start before the first_audio of question Q's answer.
+# Between a stop and the next answer the rig may hear only the next question's chime, and the answer
+# is heard at its first_audio or later, so one of two such sounds is audio of the cancelled answer,
+# whichever is the chime. That holds where the recording's times cannot tell which sound is the
+# chime: after an overrun its early bounds come from its start alone, early by the audio the overrun
+# dropped, and a word just before the chime may then start where the chime belongs (Sol's run of #149
+# at 44738566 read UNKNOWN so). cancel_fail_proven reports it as a FAIL after any FAIL of how long a
+# stop's speech was heard, which measures the tail, and before any UNKNOWN of the step.
+leak_beside_chime() {
+  local s count=0 stop=${stop_ats[$1]} first=${question_firsts[$2]}
+  [[ -n $first && -z $beside_fail ]] || return 0
+  for s in "${!sound_on[@]}"; do
+    ((sound_off_early[s] > stop + cancel_heard_ms && sound_on[s] < first)) && count=$((count + 1))
+  done
+  ((count < 2)) \
+    || beside_fail="playback-cancel stop $(($1 + 1)): a sound at the rig microphone starts beside the next question's chime, before its answer's first audio: $count sounds there each end more than $cancel_heard_ms ms after the stop, where only the chime belongs, so at least one is audio of the cancelled answer (the recording's times cannot tell which is the chime)"
+}
+# cancel_fail_proven: FAIL with what the stops timed so far prove, if anything: a tail heard over
+# cancel_heard_ms even at its early bound (the longest such), else two sounds beside a chime
+# (beside_fail). A proven FAIL outranks a verdict the recording cannot decide, so every UNKNOWN of
+# the step from its first stop's timing on comes through cancel_unknown, after it.
+cancel_fail_proven() {
+  local s worst=
+  for s in "${!heard_early[@]}"; do
+    ((heard_early[s] > cancel_heard_ms)) || continue
+    [[ -n $worst ]] && ((heard[s] <= heard[worst])) || worst=$s
+  done
+  [[ -z $worst ]] \
+    || fail "playback-cancel: a stop's speech was heard at the rig microphone ${heard[worst]} ms after it, more than $cancel_heard_ms ms (no earlier than ${heard_early[worst]} ms after it)"
+  [[ -z $beside_fail ]] || fail "$beside_fail"
+}
+# cancel_unknown MESSAGE: UNKNOWN with MESSAGE, after any FAIL the stops timed so far prove.
+cancel_unknown() {
+  cancel_fail_proven
+  unknown "$1"
+}
 step_playback_cancel() {
   local i q wake first spoken_count speech_at wait_ms stop_ats=() question_starts=() question_wakes=()
   local question_firsts=() heard=() heard_early=() deadline max xruns streams ways next chime boundary_unknown
   local underruns played worst rc calib_from calib_to calib calib_len calib_ms calib_unknown alone_until audible_noted=
+  local beside_fail=
   speaker_status
   start_rig_run
   # The calibration: the wake sound alone, while the rig records, then quiet until the first question.
@@ -2865,7 +2903,8 @@ step_playback_cancel() {
     # starts there and no sound before it may: it must be heard no longer than the calibration and
     # chime_tolerance_ms, and the next sound must not start before the answer's first_audio. With no
     # wake_heard or first_audio for that question, or no sound that is certainly the chime, the
-    # window is not known: UNKNOWN, unless what was heard fails.
+    # window is not known: UNKNOWN, unless what was heard fails, or two sounds lie where only the
+    # chime may (leak_beside_chime).
     next=$recording_end_early
     chime=${#sound_on[@]}
     for q in "${!question_starts[@]}"; do
@@ -2883,11 +2922,13 @@ step_playback_cancel() {
           break
           ;;
         2)
+          leak_beside_chime "$i" "$q"
           boundary_unknown=${boundary_unknown:-"playback-cancel stop $((i + 1)): a sound at the rig microphone starts between $((sound_on_early[maybe_sound] - question_wakes[q])) and $((sound_on[maybe_sound] - question_wakes[q])) ms from the next question's wake_heard, so whether it is the chime, or audio before it, is not known, nor the window's end"}
           break
           ;;
       esac
       if ((maybe_sound != found_sound)); then
+        leak_beside_chime "$i" "$q"
         boundary_unknown=${boundary_unknown:-"playback-cancel stop $((i + 1)): a sound at the rig microphone may start where the next question's chime belongs before the one that certainly does, so which one is the chime is not known, nor the window's end"}
         break
       fi
@@ -2927,19 +2968,19 @@ step_playback_cancel() {
     ((next <= recording_end_early)) \
       || boundary_unknown=${boundary_unknown:-"playback-cancel stop $((i + 1)): the rig recording shows every sound only up to $((recording_end_early - stop_ats[i])) ms after the stop, before the step's next sound after it"}
     ((next - stop_ats[i] >= stop_silence_ms)) \
-      || unknown "playback-cancel stop $((i + 1)): the step's next sound came $((next - stop_ats[i])) ms after the stop, less than $stop_silence_ms ms"
+      || cancel_unknown "playback-cancel stop $((i + 1)): the step's next sound came $((next - stop_ats[i])) ms after the stop, less than $stop_silence_ms ms"
     cancel_heard "${stop_ats[i]}" "$next" "$chime" \
-      || unknown "playback-cancel stop $((i + 1)): the rig microphone did not hear the speech up to the stop, so it cannot time the cancel"
+      || cancel_unknown "playback-cancel stop $((i + 1)): the rig microphone did not hear the speech up to the stop, so it cannot time the cancel"
     heard+=("$heard_ms")
     heard_early+=("$heard_early_ms")
     note "playback-cancel stop $((i + 1)): the rig microphone heard sound until ${heard_ms} ms after the stop (no earlier than ${heard_early_ms} ms: the recording's times for it may be up to $((heard_ms - heard_early_ms)) ms late), then nothing until the step's next sound could start, $((next - stop_ats[i])) ms after it"
   done
   # The underruns first: a timing that cannot be decided must not hide them.
   streams=$(journal_records 'speaker stream' | jq -s 'length') \
-    || unknown "playback-cancel: cannot read the speaker stream lines from the journal$(journal_error)"
-  ((streams > 0)) || unknown "playback-cancel: the journal has no \"speaker stream\" line, so the speaker's underrun lines cannot be read"
+    || cancel_unknown "playback-cancel: cannot read the speaker stream lines from the journal$(journal_error)"
+  ((streams > 0)) || cancel_unknown "playback-cancel: the journal has no \"speaker stream\" line, so the speaker's underrun lines cannot be read"
   underruns=$(journal_records 'speaker underrun' | jq -s 'length') \
-    || unknown "playback-cancel: cannot read the speaker underrun lines from the journal$(journal_error)"
+    || cancel_unknown "playback-cancel: cannot read the speaker underrun lines from the journal$(journal_error)"
   xruns=$(awk '{ if ($2 == "XRUN" && last != "XRUN") n++; last = $2 } END { print n + 0 }' "$poll_log")
   ((underruns == 0)) || fail "playback-cancel: the speaker logged $underruns underruns over $((played / 1000)) s of playback"
   ((xruns == 0)) || fail "playback-cancel: the speaker logged no underrun, but the poller saw its stream in XRUN $xruns times"
@@ -2950,13 +2991,7 @@ step_playback_cancel() {
   # unknown window's end, and that before an undecided tail, which the window bounds. A calibration
   # the recording cannot decide leaves only the chime checks undecided, so it comes last.
   max=$(maximum "${heard[@]}")
-  worst=
-  for i in "${!heard_early[@]}"; do
-    ((heard_early[i] > cancel_heard_ms)) || continue
-    [[ -n $worst ]] && ((heard[i] <= heard[worst])) || worst=$i
-  done
-  [[ -z $worst ]] \
-    || fail "playback-cancel: a stop's speech was heard at the rig microphone ${heard[worst]} ms after it, more than $cancel_heard_ms ms (no earlier than ${heard_early[worst]} ms after it)"
+  cancel_fail_proven
   [[ -z $boundary_unknown ]] || unknown "$boundary_unknown"
   if ((max > cancel_heard_ms)); then
     worst=0

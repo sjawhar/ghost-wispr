@@ -607,17 +607,24 @@ except SystemExit:
     pass
 sys.argv = argv
 failures = []
-# no-trigger and bad-trigger (Sol's review of #149 at 9b3d27cb): a status with no trigger_time, or a
-# trigger_time that is not a number, shows nothing about a restart, so no anchor keeps its floor and
-# the sampler names the trigger it could not read.
+# A state's trigger_time is written as the kernel prints it, "%lld.%09lld" (sound/core/pcm.c,
+# snd_pcm_substream_proc_status_read), or "-" for none. no-trigger and bad-trigger (Sol's review of
+# #149 at 9b3d27cb): a status with no trigger_time, or one that is not a number, shows nothing about
+# a restart, so no anchor keeps its floor and the sampler names the trigger it could not read. So
+# do inf, nan and a time not in the kernel's form (Sol's review of #149 at 44738566). Two triggers
+# 1 ns apart are a restart (restarted-1ns): a float holds neither apart.
 # late-pid (c28 of #156): on a loaded machine the driver can write arecord's pid after arecord's
 # first sample. The sampler must go on taking anchors, a floor once it can read the substream's
 # state by the pid, and the last one, of the whole file, once arecord has ended; it must not stop.
-for case, states in (("running", ["RUNNING 1"] * 4), ("closed", ["RUNNING 1", "closed"]),
-                     ("xrun", ["RUNNING 1", "XRUN 1"]), ("restarted", ["RUNNING 1", "RUNNING 2"]),
-                     ("closed-at-end", ["RUNNING 1"] * 5 + ["closed"]),
-                     ("no-trigger", ["RUNNING -"] * 4), ("bad-trigger", ["RUNNING x"] * 4),
-                     ("late-pid", ["RUNNING 1"] * 4)):
+t1, t2 = "1700000000.000000001", "1700000000.000000002"
+no_trigger = ("no-trigger", "bad-trigger", "inf-trigger", "nan-trigger", "short-trigger")
+for case, states in (("running", ["RUNNING " + t1] * 4), ("closed", ["RUNNING " + t1, "closed"]),
+                     ("xrun", ["RUNNING " + t1, "XRUN " + t1]), ("restarted", ["RUNNING " + t1, "RUNNING 1700000001.000000001"]),
+                     ("restarted-1ns", ["RUNNING " + t1, "RUNNING " + t2]),
+                     ("closed-at-end", ["RUNNING " + t1] * 5 + ["closed"]),
+                     ("no-trigger", ["RUNNING -"] * 4), ("bad-trigger", ["RUNNING soon"] * 4),
+                     ("inf-trigger", ["RUNNING inf"] * 4), ("nan-trigger", ["RUNNING nan"] * 4),
+                     ("short-trigger", ["RUNNING 1700000000.5"] * 4), ("late-pid", ["RUNNING " + t1] * 4)):
     work = os.path.join(base, "sampler-" + case)
     status_dir = os.path.join(work, "asound", "card4", "pcm0c", "sub0")
     os.makedirs(status_dir)
@@ -651,7 +658,7 @@ for case, states in (("running", ["RUNNING 1"] * 4), ("closed", ["RUNNING 1", "c
                 status("closed\n")
             else:
                 state, trig = s.split()
-                trigger_line = "" if trig == "-" else "trigger_time: %s\n" % ("soon" if trig == "x" else trig + ".0")
+                trigger_line = "" if trig == "-" else "trigger_time: %s\n" % trig
                 status("state: %s\nowner_pid   : %d\n%s" % (state, writer.pid, trigger_line))
             time.sleep(0.6)
 
@@ -676,12 +683,12 @@ for case, states in (("running", ["RUNNING 1"] * 4), ("closed", ["RUNNING 1", "c
         if case == "late-pid" and (not lines or int(lines[-1][1]) != os.path.getsize(path) or run.stderr):
             failures.append("late-pid: the last anchor %r, the file %d bytes, the sampler's stderr %r; want the whole file and no error" % (lines[-1] if lines else None, os.path.getsize(path), run.stderr[-300:]))
         continue
-    want = {"closed": "CLOSED", "xrun": "XRUN", "restarted": "RESTARTED", "no-trigger": "NO-TRIGGER", "bad-trigger": "NO-TRIGGER"}[case]
+    want = {"closed": "CLOSED", "xrun": "XRUN", "restarted": "RESTARTED", "restarted-1ns": "RESTARTED"}.get(case, "NO-TRIGGER")
     if len(reported) != 1 or not reported[0].endswith(" " + want):
         failures.append("%s: discontinuous lines %r, want one naming %s" % (case, reported, want))
     after = int(reported[0].split()[1]) if reported else 0
     late = [l for l in floors if int(l[0]) >= after]
-    if case in ("no-trigger", "bad-trigger") and floors:
+    if case in no_trigger and floors:
         failures.append("%s: %d floor anchors, with no trigger_time to show the substream ran on: %r" % (case, len(floors), floors[:2]))
     elif late:
         failures.append("%s: %d floor anchors at or after the state that is not RUNNING from the first trigger: %r" % (case, len(late), late[:2]))

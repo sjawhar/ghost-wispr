@@ -60,8 +60,16 @@ cleanup() {
 trap cleanup EXIT
 mkdir -p "$root/bin"
 readonly fakepi="$root/bin/fakepi.py"
-(cd -- "$repo_root" && go build -o "$root/bin/journal-records" ./deploy/pi/journalrecords) \
+# The fake journalctl runs journal-records on every read, and the driver reads the journal every
+# 0.2 s while it waits: -race=false keeps a caller's GOFLAGS='-race' off this helper, whose race
+# build ran about 1 s a read, against about 20 ms, on two loaded cores of sami-devbox, and stretched
+# every step (Sol's run of #149 at 44738566 took 3398 s).
+(cd -- "$repo_root" && go build -race=false -o "$root/bin/journal-records" ./deploy/pi/journalrecords) \
   || { printf 'voice acceptance test: cannot build deploy/pi/journalrecords, which needs Go\n'; exit 1; }
+if go version -m "$root/bin/journal-records" | grep -Fq -- '-race=true'; then
+  printf 'voice acceptance test: deploy/pi/journalrecords was built with -race, which slows every fake journal read\n'
+  exit 1
+fi
 
 # The .env each case starts with: a comment, two secrets (one quoted), a voice setting the run
 # overrides, a value with a tab and two spaces, and no newline at the end, so that a restore that is
@@ -101,6 +109,8 @@ CLOCK = 1.0002 if "clock-fast" in SCENARIO else 0.9998 if "clock-slow" in SCENAR
 # 1 ms, as accept-voice.sh's capture_buffer computes it.
 CAPTURE_BUFFER_FRAMES = 12000 if "capture-buffer-250" in SCENARIO else 1920
 FAKE_RESIDENCY_MS = (CAPTURE_BUFFER_FRAMES + 2 * 480) // 48 + 1
+# The scenarios whose rig capture loses audio (capture-gap items in the timeline), as an overrun does.
+CAPTURE_GAPS = {"capture-gap", "capture-gap-after-stop-100", "capture-gap-after-stop-300"}
 
 
 def now_ms():
@@ -660,6 +670,13 @@ def drop(status, items, request):
     at = now_ms()
     append(dict(cut, at=at, sound_end=at + end))
     emit(kind="timing", due=at, event="stop", session_id="session-1", reason=request["reason"])
+    # capture-gap-after-stop-MS: after the first stop, the rig's capture loses MS ms from 500 ms on,
+    # before the next question, as an overrun on a loaded machine does, which the fake arecord
+    # reports: every later sound sits MS ms earlier in the file, and the recording's early bounds
+    # come from its start alone (Sol's run of #149 at 44738566 read leak-apart-chime UNKNOWN so).
+    for ms in (100, 300):
+        if "capture-gap-after-stop-%d" % ms in SCENARIO and not read("stop-count"):
+            emit(kind="capture-gap", start=at + 500, end=at + 500 + ms)
     write("stop-count", "%d\n" % (int(read("stop-count", "0").strip() or 0) + 1))
     emit(kind="log", due=at, level="INFO", msg="speaker cancel", fields={"device": "plughw:CARD=J75,DEV=0", "way": "rewind" if "rewind" in SCENARIO else "drop"})
     leak = 1100 if "leak-1100" in SCENARIO else 150 if SCENARIO & {"leak-150", "leak-after-quiet"} else None
@@ -994,12 +1011,14 @@ def aplay(args):
     write("aplays", "%d\n" % n)
     log_to("aplay.log", "%s %s" % (device, path))
     write("aplay-pid.%d" % n, "%d\n" % os.getpid())
-    # slow-aplay-WORD starts the clip whose first word is WORD 2 s after aplay began, aplay-late-WORD
-    # 700 ms after, and slow-exit-WORD returns 1.8 s after it ended, as aplay's start and exit on a
-    # loaded machine: the driver knows only that the clip began after it started aplay and ended
-    # before aplay returned.
+    # slow-aplay-WORD starts the clip whose first word is WORD 2 s after aplay began, held-aplay-WORD
+    # 5 s after, aplay-late-WORD 700 ms after, and slow-exit-WORD returns 1.8 s after it ended, as
+    # aplay's start and exit on a loaded machine: the driver knows only that the clip began after it
+    # started aplay and ended before aplay returned.
     if "slow-aplay-" + words[0] in SCENARIO:
         time.sleep(2.0)
+    if "held-aplay-" + words[0] in SCENARIO:
+        time.sleep(5.0)
     if "aplay-late-" + words[0] in SCENARIO:
         time.sleep(0.7)
     start = now_ms()
@@ -1300,8 +1319,14 @@ def arecord(args):
     # first sample's landing fails at any load: the driver's start still comes no later than the
     # sample. arecord-locked takes the search right off the file's directory for that hold, so that
     # every read of its size fails there: a failed read taken for no file yet moves the start into
-    # the hold.
+    # the hold. arecord-lock-start takes it off for 200 ms from the capture's start with no hold,
+    # while the fake writes on through the fd it holds open, as arecord does: every read of the size
+    # fails there, yet no sample waits, so no overrun, and the recording stays continuous (Sol's
+    # review of #156 at d49d0fe7: cancel-locked's hold always overruns, so no case held the locked
+    # reads to the chime path). It waits for the driver's pid file first, so that the driver's own
+    # write in the folder is done; unlock is the folder, its mode and when it opens again.
     frozen = []
+    unlock = None
     try:
         if "arecord-slow-start" in SCENARIO:
             time.sleep(1.5)
@@ -1319,8 +1344,17 @@ def arecord(args):
                 os.kill(pid, signal.SIGSTOP)
             log_to("arecord-froze", " ".join(map(str, frozen)))
             time.sleep(8)
+        if "arecord-lock-start" in SCENARIO and f is not None:
+            wait_until = time.monotonic() + 5
+            while not os.path.exists(path + ".pid") and time.monotonic() < wait_until:
+                time.sleep(0.005)
         begun = -(-time.monotonic_ns() // 1_000_000)
         log_to("recordings", "%s %d" % (path, begun))
+        if "arecord-lock-start" in SCENARIO and f is not None:
+            folder = os.path.dirname(os.path.abspath(path))
+            unlock = (folder, os.stat(folder).st_mode & 0o7777, begun + 200)
+            os.chmod(folder, unlock[1] & ~0o111)
+            log_to("arecord-locked", folder)
         if "arecord-hold-200" in SCENARIO:
             # Held longer than the buffer: a real arecord overruns.
             overrun(200)
@@ -1362,6 +1396,9 @@ def arecord(args):
         while True:
             time.sleep(0.005)
             t = now_ms()
+            if unlock is not None and t >= unlock[2]:
+                os.chmod(unlock[0], unlock[1])
+                unlock = None
             held = t - last + (50 if "arecord-behind" in SCENARIO else 0)
             if held > FAKE_RESIDENCY_MS and not (lag_until is not None and t < lag_until):
                 overrun(held)
@@ -1422,10 +1459,11 @@ def arecord(args):
                 while True:  # no read comes that would report the overrun; SIGTERM ends it
                     time.sleep(1)
             lag = (1000 if lag_until is not None and t < lag_until else 0) + (50 if "arecord-behind" in SCENARIO else 0)
-            if "capture-gap" in SCENARIO:
-                lost = sum(max(0, min(t, i["end"]) - i["start"]) for i in timeline() if i["kind"] == "capture-gap")
-                if lost > 0 and not gap_reported:
-                    overrun(250)
+            if SCENARIO & CAPTURE_GAPS:
+                gaps_now = [i for i in timeline() if i["kind"] == "capture-gap" and i["start"] < t]
+                lost = sum(min(t, i["end"]) - i["start"] for i in gaps_now)
+                if gaps_now and not gap_reported:
+                    overrun(gaps_now[0]["end"] - gaps_now[0]["start"])
                     gap_reported = True
             # Whole 2-byte samples at 24 kHz of the rig's clock, CLOCK times the Pi's.
             target = 2 * int((t - lag - skip - lost - begun) * CLOCK * 24)
@@ -1437,6 +1475,8 @@ def arecord(args):
                 frozen = []
     finally:
         signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        if unlock is not None:
+            os.chmod(unlock[0], unlock[1])
         # arecord-final-rewrite: as arecord ends, it seeks back to write the data chunk's size into
         # the header (alsa-utils aplay.c, end_wave) and holds 800 ms before it closes: its offset in
         # the file is then 44, though the file holds the whole recording.
@@ -2023,6 +2063,12 @@ expect_line() {
   grep -Fq -- "$2" "$root/$1/out" || check_failed "$1: no line holds \"$2\"; output: $(tr '\n' '|' <"$root/$1/out")"
 }
 
+# expect_either_line NAME A B: a line of NAME's output holds A or B.
+expect_either_line() {
+  grep -Fq -e "$2" -e "$3" -- "$root/$1/out" \
+    || check_failed "$1: no line holds \"$2\" or \"$3\"; output: $(tr '\n' '|' <"$root/$1/out")"
+}
+
 expect_no_line() {
   if grep -Fq -- "$2" "$root/$1/out"; then
     check_failed "$1: a line holds \"$2\""
@@ -2424,9 +2470,10 @@ launch barge-backchannel-final-rewrite answer-until-clip,backchannel-stops,captu
 # alone, with a NOTE, and the pause reads cancel-unsure's UNKNOWN, never PASS.
 launch barge-pause-silent-xrun answer-until-clip,backchannel-pause-500,arecord-slow-start,capture-buffer-250,capture-silent-xrun yes -- --step barge-in --talkovers 1 --backchannels 1 --question @question.wav --talkover-dir @talkovers --backchannel-dir @backchannels --rig-mic "$rig" --event-timeout 15
 launch barge-pause-suspend answer-until-clip,backchannel-pause-500,arecord-slow-start,capture-buffer-250,arecord-suspend yes -- --step barge-in --talkovers 1 --backchannels 1 --question @question.wav --talkover-dir @talkovers --backchannel-dir @backchannels --rig-mic "$rig" --event-timeout 15
-# The same pause with the substream in XRUN for 30 ms, which the sampler's reads miss, and RUNNING
-# again from a new trigger_time (capture-silent-restart): continuity is not shown, so UNKNOWN with
-# a NOTE, never PASS.
+# The same pause with the substream in XRUN for 30 ms, which the sampler's reads miss on an idle
+# machine, and RUNNING again from a new trigger_time (capture-silent-restart): continuity is not
+# shown, so UNKNOWN with a NOTE naming the restart, or the XRUN where a loaded machine's read lands
+# in it, never PASS.
 launch barge-pause-silent-restart answer-until-clip,backchannel-pause-500,arecord-slow-start,capture-buffer-250,capture-silent-restart yes -- --step barge-in --talkovers 1 --backchannels 1 --question @question.wav --talkover-dir @talkovers --backchannel-dir @backchannels --rig-mic "$rig" --event-timeout 15
 # The same pause with the sampler failing partway (sampler-crash: a capture status it cannot decode):
 # its anchors stop, so UNKNOWN naming the sampler's failure and its stderr, never PASS, and never the
@@ -2487,6 +2534,13 @@ launch cancel-held-start long,asound,stop-rounds-2,arecord-hold-200 yes -- $canc
 # leak, FAIL (#146's review).
 # shellcheck disable=SC2086
 launch cancel-locked long,asound,stop-rounds-2,arecord-hold-200,arecord-reopen,arecord-locked yes -- $cancel_args
+# The file's folder refuses every read of its size for 200 ms from the capture's start, while the
+# fake writes on through its fd with no hold (arecord-lock-start): no overrun, so the recording stays
+# continuous and the case is held to the chime path: PASS by the chime, counted. cancel-locked's hold
+# overruns in every run, so it can never test the locked reads there (Sol's review of #156 at
+# d49d0fe7). A failed read taken for no file yet puts the start inside the lock: FAIL.
+# shellcheck disable=SC2086
+launch cancel-lock-start long,asound,stop-rounds-2,arecord-lock-start yes -- $cancel_args
 # A good cancel with an arecord that reads 1.5 s after its header: the recording cannot show that the
 # rig heard the speech up to the stop: UNKNOWN, never PASS.
 # shellcheck disable=SC2086
@@ -2529,6 +2583,14 @@ launch cancel-leak-late long,asound,stop-rounds-2,leak-1100 yes -- $cancel_args
 launch cancel-leak-quiet long,asound,stop-rounds-2,leak-after-quiet yes -- $cancel_args
 # shellcheck disable=SC2086
 launch cancel-leak-chime long,asound,stop-rounds-2,leak-before-chime yes -- $cancel_args
+# The same with the step's own pace slowed as a loaded machine slows it: the stop's aplay returns
+# 1.8 s after its clip (slow-exit-stop) and each question's starts its clip 5 s late
+# (held-aplay-question), so the next question, and the word before its chime, come over 8 s after
+# the stop, where an idle machine brings them in about 2.5 s (Sol's run of #149 at 44738566
+# measured 9394 ms). The driver must still measure that word: FAIL, with an interval that holds
+# the fake's true end of the sound that holds it.
+# shellcheck disable=SC2086
+launch cancel-leak-chime-slow long,asound,stop-rounds-2,leak-before-chime,slow-exit-stop,held-aplay-question yes -- $cancel_args
 # shellcheck disable=SC2086
 launch cancel-leak-apart-chime long,asound,stop-rounds-2,leak-apart-chime yes -- $cancel_args
 # shellcheck disable=SC2086
@@ -2573,6 +2635,20 @@ launch cancel-leak-in-queue-own-audible long,asound,stop-rounds-2,leak-in-queue,
 # #156 at 053df77c: a false FAIL).
 # shellcheck disable=SC2086
 launch cancel-capture-gap long,asound,stop-rounds-2,capture-gap yes -- $cancel_args
+# A word just before the next chime (leak-apart-chime) with the rig's capture losing 100 ms after the
+# stop (capture-gap-after-stop-100), as an overrun on a loaded machine does: the recording's early
+# bounds come from its start alone, 100 ms early, so the word may start where the chime belongs and
+# the recording cannot tell which sound is the chime (Sol's run of #149 at 44738566 read UNKNOWN
+# so). Two sounds lie between the stop and the next answer's first audio, where only the chime
+# belongs, so one is audio of the cancelled answer: FAIL, never UNKNOWN or PASS. With 300 ms lost
+# (capture-gap-after-stop-300) neither sound certainly starts where the chime belongs: FAIL too. A
+# good cancel with 300 ms lost, the control, has only the chime there: no FAIL.
+# shellcheck disable=SC2086
+launch cancel-leak-apart-chime-gap long,asound,stop-rounds-2,leak-apart-chime,capture-gap-after-stop-100 yes -- $cancel_args
+# shellcheck disable=SC2086
+launch cancel-leak-apart-chime-wide-gap long,asound,stop-rounds-2,leak-apart-chime,capture-gap-after-stop-300 yes -- $cancel_args
+# shellcheck disable=SC2086
+launch cancel-gap-after-stop long,asound,stop-rounds-2,capture-gap-after-stop-300 yes -- $cancel_args
 # shellcheck disable=SC2086
 launch cancel-quiet-chime long,asound,stop-rounds-2,quiet-chime yes -- $cancel_args
 # shellcheck disable=SC2086
@@ -3244,12 +3320,17 @@ expect_rc barge-pause-suspend 2
 expect_line barge-pause-suspend 'NOTE: recording: arecord reported a suspend, so the recording'"'"'s early bounds come from its start alone'
 expect_no_line barge-pause-suspend 'PASS: barge-in: 0 of 1'
 expect_restored barge-pause-suspend
+# The sampler's reads miss the 30 ms of XRUN on an idle machine and see the restart; on a loaded
+# one a read can land in it, and the driver names the XRUN (Sol's review of #149 at 44738566). Both
+# are true: either NOTE, and still UNKNOWN, never PASS.
 expect_rc barge-pause-silent-restart 2
-expect_line barge-pause-silent-restart 'NOTE: recording: the capture substream arecord held read RESTARTED during the recording, so the recording'"'"'s early bounds come from its start alone'
+expect_either_line barge-pause-silent-restart \
+  'NOTE: recording: the capture substream arecord held read RESTARTED during the recording, so the recording'"'"'s early bounds come from its start alone' \
+  'NOTE: recording: the capture substream arecord held read XRUN during the recording, so the recording'"'"'s early bounds come from its start alone'
 expect_no_line barge-pause-silent-restart 'PASS: barge-in: 0 of 1'
 expect_restored barge-pause-silent-restart
 expect_rc barge-pause-no-trigger 2
-expect_line barge-pause-no-trigger 'NOTE: recording: the capture substream arecord held showed RUNNING with no numeric trigger_time'
+expect_line barge-pause-no-trigger "NOTE: recording: the capture substream arecord held showed RUNNING with no trigger_time in the kernel's form"
 expect_no_line barge-pause-no-trigger 'PASS: barge-in: 0 of 1'
 expect_restored barge-pause-no-trigger
 expect_rc barge-backchannel-terminal-stall 1 2
@@ -3292,6 +3373,9 @@ expect_line cancel-held-start "NOTE: recording: arecord reported an overrun, so 
 expect_load_case cancel-locked
 [[ -s $root/cancel-locked/state/arecord-locked ]] || check_failed 'cancel-locked: the fake arecord never locked its file away, so the case tested no failed read'
 expect_restored cancel-locked
+expect_load_case cancel-lock-start
+[[ -s $root/cancel-lock-start/state/arecord-locked ]] || check_failed 'cancel-lock-start: the fake arecord never locked its file away, so the case tested no failed read'
+expect_restored cancel-lock-start
 expect_rc cancel-unsure 2
 expect_line cancel-unsure 'UNKNOWN: playback-cancel stop 1: the rig microphone did not hear the speech up to the stop'
 expect_no_line cancel-unsure "PASS: playback-cancel: no stop's speech was heard"
@@ -3336,6 +3420,47 @@ heard_up_to() {
 # earlier than after it: the early bound of the tail it names.
 heard_no_earlier() {
   sed -n "s/^\(FAIL\|UNKNOWN\): playback-cancel: .*no earlier than \([0-9]*\) ms after it.*/\2/p" "$root/$1/out"
+}
+# true_after_stop NAME TAG N: by the fake's own clock, how long after the Nth stop line (its time,
+# which the driver times that cancel from) the rig stops hearing the sound that holds the first
+# sound tagged TAG after it, before the next stop. The driver's analysis hears sounds less than
+# 150 ms apart (accept-voice.sh's silence_ms) as one, so a word that runs into the chime within that
+# is heard to the chime's end. Empty when the fake logged no such stop or sound.
+true_after_stop() {
+  python3 - "$root/$1/state" "$2" "$3" <<'EOF'
+import json, os, sys
+state, tag, n = sys.argv[1], sys.argv[2], int(sys.argv[3])
+items = [json.loads(line) for line in open(os.path.join(state, "timeline.jsonl")) if line.strip()]
+stops = sorted(i["due"] for i in items if i.get("kind") == "timing" and i.get("event") == "stop")
+if len(stops) < n:
+    sys.exit()
+stop, after = stops[n - 1], stops[n] if len(stops) > n else float("inf")
+word = next((i for i in items if i.get("kind") == "sound" and i.get("tag") == tag and stop < i["start"] < after), None)
+if word is None:
+    sys.exit()
+end = word["end"]
+for sound in sorted((i for i in items if i.get("kind") == "sound" and i["start"] >= word["start"]), key=lambda i: i["start"]):
+    if sound["start"] - end < 150:
+        end = max(end, sound["end"])
+print(end - stop)
+EOF
+}
+# expect_heard_holds NAME TAG: for each stop the fake played a TAG sound after, the driver's NOTE
+# says how long the rig heard sound after that stop, from its early bound ("no earlier than") to its
+# late one, and that interval holds the fake's true end of the sound that holds TAG
+# (true_after_stop): the driver measured that sound, however late the step's own pace on a loaded
+# machine brought it. The FAIL line gives the worst stop's interval, one of these.
+expect_heard_holds() {
+  local n high low truth checked=0
+  while read -r n high low; do
+    truth=$(true_after_stop "$1" "$2" "$n")
+    [[ -n $truth ]] || continue
+    checked=$((checked + 1))
+    ((low <= truth && truth <= high)) \
+      || check_failed "$1: the driver's interval for how long stop $n's speech was heard, $low to $high ms, leaves out the fake's true end of the sound that holds the $2, $truth ms after the stop"
+  done < <(sed -n "s/^NOTE: playback-cancel stop \([0-9]*\): the rig microphone heard sound until \([0-9]*\) ms after the stop (no earlier than \([0-9]*\) ms.*/\1 \2 \3/p" "$root/$1/out")
+  ((checked > 0)) \
+    || check_failed "$1: no stop's interval to check against a $2 the fake played after it; output: $(tr '\n' '|' <"$root/$1/out")"
 }
 # expect_not_passed NAME LOW HIGH: a tail over the bound whose early bound may or may not be over
 # it, by how late the recording's anchors were read: FAIL or UNKNOWN, never PASS, and the tail it
@@ -3417,8 +3542,21 @@ expect_line cancel-leak-quiet 'UNKNOWN: playback-cancel stop 1: the rig micropho
 expect_restored cancel-leak-quiet
 expect_rc cancel-leak-chime 1
 expect_line cancel-leak-chime "FAIL: playback-cancel: a stop's speech was heard at the rig microphone "
-expect_between 'cancel-leak-chime: how long the word before the next chime is heard' "$(heard_after cancel-leak-chime)" 1500 6000
+# How long after the stop the word is heard depends on the step's own pace to the next question,
+# which a loaded machine stretches (Sol's run of #149 at 44738566: 9394 ms, past a fixed 6000 ms):
+# the FAIL's interval must hold the fake's own end of the sound that holds the word, wherever it
+# came. The word ends 70 ms before the chime starts, inside the analyser's 150 ms of silence, so the
+# rig hears the two as one sound, to the chime's end.
+expect_heard_holds cancel-leak-chime leaked-word
 expect_restored cancel-leak-chime
+expect_rc cancel-leak-chime-slow 1
+expect_line cancel-leak-chime-slow "FAIL: playback-cancel: a stop's speech was heard at the rig microphone "
+expect_heard_holds cancel-leak-chime-slow leaked-word
+slow_word=$(true_after_stop cancel-leak-chime-slow leaked-word 1)
+if [[ -z $slow_word ]] || ((slow_word <= 6000)); then
+  check_failed "cancel-leak-chime-slow: the word ends ${slow_word:-never} ms after the stop, not past the 6000 ms an idle machine's pace stays within: the case did not slow the step"
+fi
+expect_restored cancel-leak-chime-slow
 expect_rc cancel-leak-apart-chime 1
 expect_line cancel-leak-apart-chime "FAIL: playback-cancel stop 1: a sound at the rig microphone starts "
 expect_restored cancel-leak-apart-chime
@@ -3492,6 +3630,16 @@ expect_line cancel-capture-gap 'NOTE: recording: arecord reported an overrun'
 expect_line cancel-capture-gap 'the recording is not shown continuous'
 expect_no_line cancel-capture-gap "FAIL: playback-cancel"
 expect_restored cancel-capture-gap
+for name in cancel-leak-apart-chime-gap cancel-leak-apart-chime-wide-gap; do
+  expect_rc "$name" 1
+  expect_line "$name" 'NOTE: recording: arecord reported an overrun'
+  expect_line "$name" "FAIL: playback-cancel stop 1: a sound at the rig microphone starts beside the next question's chime, before its answer's first audio: 2 sounds there each end more than 20 ms after the stop"
+  expect_restored "$name"
+done
+expect_rc cancel-gap-after-stop 0 2
+expect_line cancel-gap-after-stop 'NOTE: recording: arecord reported an overrun'
+expect_no_line cancel-gap-after-stop 'FAIL: playback-cancel'
+expect_restored cancel-gap-after-stop
 expect_rc cancel-quiet-chime 0
 expect_line cancel-quiet-chime "PASS: playback-cancel: no stop's speech was heard at the rig microphone 20 ms after it"
 expect_line cancel-quiet-chime 'NOTE: playback-cancel: calibration: the wake sound played alone (ghost-wispr play-sound) is heard at the rig microphone for 130 ms above -50 dB'
