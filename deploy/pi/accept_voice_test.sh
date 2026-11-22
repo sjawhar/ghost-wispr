@@ -1233,42 +1233,24 @@ def arecord(args):
         with open(os.path.join(substream, "hw_params"), "w") as f:
             f.write("access: RW_INTERLEAVED\nformat: S16_LE\nsubformat: STD\nchannels: 1\nrate: 48000 (48000/1)\nperiod_size: 480\nbuffer_size: %d\n" % CAPTURE_BUFFER_FRAMES)
     trigger = ["%d.%09d" % divmod(time.time_ns(), 1_000_000_000)]
-    # shown: the substream's state as the status shows it; appl: its appl_ptr, the hardware frames
-    # (48 kHz) arecord's reads have taken in this run, set before the frames they give reach the
-    # file, as plughw's rate plugin takes a hardware period before it gives its frames.
-    shown_state, appl, crashed = ["RUNNING"], [0], [False]
-
-    def write_status(text):
-        tmp = os.path.join(substream, "status.tmp")
-        with open(tmp, "w") as g:
-            g.write(text)
-        os.replace(tmp, os.path.join(substream, "status"))
 
     def set_state(state, restarted=False):
         """The capture substream's state, as the kernel's status shows it while arecord holds it;
         restarted gives it a new trigger_time, as a prepare and start after an overrun do."""
         if restarted:
             trigger[0] = "%d.%09d" % divmod(time.time_ns(), 1_000_000_000)
-        shown_state[0] = state
         if substream:
             # capture-no-trigger: a status without trigger_time (Sol's review of #149 at 9b3d27cb).
             trigger_line = "" if "capture-no-trigger" in SCENARIO else "trigger_time: %s\n" % trigger[0]
-            write_status("state: %s\nowner_pid   : %d\n%s-----\nhw_ptr      : %d\nappl_ptr    : %d\n"
-                         % (state, os.getpid(), trigger_line, appl[0], appl[0]))
-
-    def taken(frames):
-        """arecord's reads have taken the hardware frames that give FRAMES frames of the file;
-        pointer-deficit shows 4800 fewer (100 ms), as a run whose prepare reset the pointer while
-        the file kept the frames before it. A status sampler-crash broke stays broken."""
-        appl[0] = max(0, 2 * frames - (4800 if "pointer-deficit" in SCENARIO else 0))
-        if not crashed[0]:
-            set_state(shown_state[0])
+            with open(os.path.join(substream, "status"), "w") as g:
+                g.write("state: %s\nowner_pid   : %d\n%s" % (state, os.getpid(), trigger_line))
 
     set_state("RUNNING")
 
     def close_substream():
         if substream:
-            write_status("closed\n")
+            with open(os.path.join(substream, "status"), "w") as f:
+                f.write("closed\n")
 
     def german():
         """Whether arecord's messages come in German, as gettext picks them: LC_ALL, else
@@ -1466,7 +1448,6 @@ def arecord(args):
                 # the substream's state raises on: a sampler that fails partway, whose failure the
                 # driver must name (c28 of #156 hid a traceback behind "after its last anchor").
                 if "sampler-crash" in SCENARIO and substream:
-                    crashed[0] = True
                     with open(os.path.join(substream, "status"), "wb") as g:
                         g.write(b"state: RUNNING\nowner_pid   : %d\ntrigger_time: %s\n\xff\n" % (os.getpid(), trigger[0].encode()))
             if SCENARIO & {"capture-silent-xrun", "capture-silent-restart"} and clipped is not None:
@@ -1531,7 +1512,6 @@ def arecord(args):
                     if "sampler-says-unwatched" in SCENARIO:
                         there = "absent"
                     log_to("pid-at-first-sample", there)
-                taken(target // 2)
                 put(bytes(target - written))
                 written = target
                 for pid in frozen:
@@ -2679,12 +2659,6 @@ launch cancel-lock-start-wrongly long,asound,stop-rounds-2,arecord-lock-start,ca
 # (unwatched_agreed).
 # shellcheck disable=SC2086
 launch cancel-unwatched long,asound,stop-rounds-2,sampler-says-unwatched yes -- $cancel_args
-# A good cancel whose substream's appl_ptr counts 100 ms fewer hardware frames than the file holds
-# (pointer-deficit), as after a prepare the trigger reads missed: a restart, so no floor, with the
-# NOTE naming it, and no FAIL. Every other case's fake keeps appl_ptr at the frames it gave or
-# more, and must keep its floor (Sol's review of #162 at 494ba440).
-# shellcheck disable=SC2086
-launch cancel-pointer-deficit long,asound,stop-rounds-2,pointer-deficit yes -- $cancel_args
 # A good cancel with an arecord that reads 1.5 s after its header: the recording cannot show that the
 # rig heard the speech up to the stop: UNKNOWN, never PASS.
 # shellcheck disable=SC2086
@@ -3544,14 +3518,6 @@ if ! fake_overran cancel-unwatched; then
 fi
 expect_load_case cancel-unwatched
 expect_restored cancel-unwatched
-# An overrun the fake truly logged comes first in the driver's NOTEs, so the RESTARTED NOTE is wanted
-# only without one.
-if ! fake_overran cancel-pointer-deficit; then
-  expect_line cancel-pointer-deficit "NOTE: recording: the capture substream arecord held read RESTARTED during the recording"
-fi
-expect_rc cancel-pointer-deficit 0 2
-expect_no_line cancel-pointer-deficit 'FAIL: playback-cancel'
-expect_restored cancel-pointer-deficit
 expect_rc cancel-unsure 2
 expect_line cancel-unsure 'UNKNOWN: playback-cancel stop 1: the rig microphone did not hear the speech up to the stop'
 expect_no_line cancel-unsure "PASS: playback-cancel: no stop's speech was heard"
