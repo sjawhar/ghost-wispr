@@ -165,7 +165,8 @@ func TestATimingEventAfterItsExchangeEndedNamesNoLaterSession(t *testing.T) {
 	r.setSession("later-session")
 	// A first frame written before the end, reported once the lock is free.
 	r.s.mu.Lock()
-	r.s.exTimingLocked(ex, "wake_chime_queued", time.Now().Add(-time.Second))
+	now := monoclock.Now()
+	r.s.exTimingLocked(ex, "wake_chime_queued", monoclock.Stamp{Wall: now.Wall.Add(-time.Second), Mono: now.Mono - int64(time.Second)})
 	r.s.mu.Unlock()
 	for _, l := range r.timingLines() {
 		if l.sessionID != "" {
@@ -212,9 +213,9 @@ func TestTheEndOfSpeechNamesTheSessionItsSpeechWasIn(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			r := newRig(t, newFakeConcierge())
 			r.setSession(tc.startSession)
-			r.s.onSpeech(audio.SpeechEvent{Input: audio.InputVoice, Started: true, At: time.Now()})
+			r.s.onSpeech(&audio.SpeechEvent{Input: audio.InputVoice, Started: true, At: time.Now()})
 			r.setSession("later-session")
-			r.s.onSpeech(audio.SpeechEvent{Input: audio.InputVoice, At: time.Now()})
+			r.s.onSpeech(&audio.SpeechEvent{Input: audio.InputVoice, At: time.Now()})
 			waitTimings(t, r, "speech_end")
 			for _, l := range r.timingLines() {
 				if l.event == "speech_end" && l.sessionID != tc.want {
@@ -357,7 +358,7 @@ func TestTheExchangeTakesTheSessionThatStartedAfterItOpened(t *testing.T) {
 	t.Run("a speech event before A's hook", func(t *testing.T) {
 		r, _ := open(t)
 		aThenB(r)
-		r.s.onSpeech(audio.SpeechEvent{Input: audio.InputVoice, Started: true, At: time.Now()})
+		r.s.onSpeech(&audio.SpeechEvent{Input: audio.InputVoice, Started: true, At: time.Now()})
 		r.s.SessionStarted("sess-a", 2) // late: the exchange is bound already
 		all(t, r, "sess-a")
 	})
