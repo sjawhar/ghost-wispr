@@ -21,20 +21,21 @@ readonly PAUSED_ONLY="${GHOST_WISPR_UPDATE_PAUSED_ONLY:-}"
 # seconds, as pi-when-idle.sh does, and at most ROLLBACK_READS times.
 readonly RECHECK_EVERY=120 ROLLBACK_READS=3
 # The update unit (ghost-wispr-update.service) ends this script UNIT_LIMIT seconds after its start
-# (TimeoutStartSec=30min; deploy/pi/update_test.sh checks the two agree). A restart of the recorder
+# (TimeoutStartSec=40min; deploy/pi/update_test.sh checks the two agree). A restart of the recorder
 # takes at most RESTART_WORST: its main process's stop (TimeoutStopSec=90s), light-off after it
-# (ExecStopPost, bounded at 15 s by `timeout`; unbounded, it would add another 90 s), and its start
-# (TimeoutStartSec=5min, its waits included). update_test.sh holds both units to one form (each
-# timeout set once, in whole seconds or minutes; light-off only under `timeout -k`; no drop-in) and
-# computes UNIT_LIMIT and RESTART_WORST from them. Every step at its worst ends well inside
-# the limit: 10 s status read, 30 s release lookup, 10 s version read, 300 + 60 s download, 10 s
-# status read, a restart, the 120 s version wait, a 10 s status read and the rollback's restart:
-# about 1360 s. A rollback whose recorder's state it cannot read waits for another read only while
-# that wait (RECHECK_EVERY), the read (STATUS_READ, curl's --max-time) and a restart at its worst
-# still end MARGIN seconds before the limit; otherwise it gives up, the new binary left running.
-# With 15 min, as before, the steps alone could outlast the limit, and systemd killed update.sh
-# with the new binary in place and no rollback.
-readonly UNIT_LIMIT=1800 MARGIN=60 STATUS_READ=10 RESTART_WORST=405
+# (ExecStopPost, bounded at 15 s by `timeout`), its start waits, each a start phase of its own under
+# `timeout` (the network's 80 s, the clock's 155 s), and its start (TimeoutStartSec=5min).
+# update_test.sh holds both units to one form (each timeout set once, in whole seconds or minutes;
+# each start and stop command under `timeout -k`; Type= simple or notify; no drop-in) and computes
+# UNIT_LIMIT and RESTART_WORST from them. Every step at its worst ends inside the limit: 10 s status
+# read, 30 s release lookup, 10 s version read, 300 + 60 s download, 10 s status read, a restart,
+# the 120 s version wait, a 10 s status read and the rollback's restart: about 1840 s. A rollback
+# whose recorder's state it cannot read waits for another read only while that wait
+# (RECHECK_EVERY), the read (STATUS_READ, curl's --max-time) and a restart at its worst still end
+# MARGIN seconds before the limit; otherwise it gives up, the new binary left running. Its two waits
+# fit: about 2100 s in all. With 15 min, as before, the steps alone could outlast the limit, and
+# systemd killed update.sh with the new binary in place and no rollback.
+readonly UNIT_LIMIT=2400 MARGIN=60 STATUS_READ=10 RESTART_WORST=640
 STARTED=$(date +%s)
 readonly STARTED
 

@@ -339,17 +339,25 @@ rolled_back 'a new binary that answers idle again' $'sleep 120\nsleep 120'
 paused_only='' update_with stopped-new
 rolled_back 'a new binary whose unit stopped' ''
 
-# unit_contract UNIT KEYS: the timeouts unit file UNIT sets in the form the update's bounds rely on
-# (the contract below), one "KEY SECONDS" line for each of KEYS, then "ExecStopPost SECONDS" for each
-# stop command (its `timeout -k`'s SIGKILL time). Anything outside the form fails, naming the line.
+# unit_contract UNIT KEYS [TYPES]: the timeouts unit file UNIT sets in the form the update's bounds
+# rely on (the contract below), one "KEY SECONDS" line for each of KEYS, then "KEY SECONDS" for each
+# start or stop command (ExecCondition, ExecStartPre, ExecStartPost, ExecStopPost: its `timeout
+# -k`'s SIGKILL time). With TYPES, the unit's one Type= must be one of them. Anything outside the
+# form fails, naming the line.
 unit_contract() {
   if [[ -e $1.d ]]; then
     printf '%s: a drop-in directory is beside it (%s.d); the contract has none\n' "$1" "$1" >&2
     return 1
   fi
-  awk -v unit="$1" -v keys="$2" '
+  awk -v unit="$1" -v keys="$2" -v types="${3:-}" '
     function fail(why) { printf "%s:%d: %s: %s\n", unit, NR, $0, why > "/dev/stderr"; bad = 1 }
-    BEGIN { n = split(keys, k, " "); for (i = 1; i <= n; i++) want[k[i]] = 1 }
+    BEGIN {
+      n = split(keys, k, " ")
+      for (i = 1; i <= n; i++) want[k[i]] = 1
+      split("ExecCondition ExecStartPre ExecStartPost ExecStopPost", e, " ")
+      for (i in e) command[e[i]] = 1
+      if (types != "") { n_types = split(types, t, " "); for (i = 1; i <= n_types; i++) allowed[t[i]] = 1 }
+    }
     /\\$/ { fail("it ends with a backslash, which continues it on the next line; the contract has no continued line"); next }
     /^[ \t]*([#;]|$)/ { next }
     /^[ \t]*\[/ { section = $0; gsub(/^[ \t]+|[ \t]+$/, "", section); next }
@@ -369,14 +377,21 @@ unit_contract() {
       seconds[key] = value ~ /min$/ ? (value + 0) * 60 : value + 0
       next
     }
-    key == "ExecStopPost" {
+    key in command {
       if (section != "[Service]") { fail("it is not in [Service]"); next }
-      if ($0 !~ /^ExecStopPost=\/usr\/bin\/timeout -k [1-9][0-9]*s [1-9][0-9]*s [^ ]/) {
-        fail("the contract takes ExecStopPost= only as /usr/bin/timeout -k Ns Ms COMMAND, in whole seconds")
+      if ($0 !~ ("^" key "=/usr/bin/timeout -k [1-9][0-9]*s [1-9][0-9]*s [^ ]")) {
+        fail("the contract takes " key "= only as /usr/bin/timeout -k Ns Ms COMMAND, in whole seconds")
         next
       }
       split($0, w, " ")
-      post[++posts] = (w[3] + 0) + (w[4] + 0)
+      commands[++n_commands] = key " " ((w[3] + 0) + (w[4] + 0))
+      next
+    }
+    key == "Type" && types != "" {
+      types_set++
+      if (section != "[Service]") { fail("it is not in [Service]"); next }
+      value = substr($0, 6)
+      if ($0 !~ /^Type=[a-z-]+$/ || !(value in allowed)) { fail("the contract takes Type= only as one of: " types); next }
       next
     }
     key == "ExecStop" { fail("the contract has no ExecStop="); next }
@@ -386,9 +401,11 @@ unit_contract() {
         if (count[k[i]] == 0) { printf "%s: no %s= line; the contract requires one\n", unit, k[i] > "/dev/stderr"; bad = 1 }
         else if (count[k[i]] > 1) { printf "%s: %s= is set %d times; the contract requires one\n", unit, k[i], count[k[i]] > "/dev/stderr"; bad = 1 }
       }
+      if (types != "" && types_set == 0) { printf "%s: no Type= line; the contract requires one of: %s\n", unit, types > "/dev/stderr"; bad = 1 }
+      if (types_set > 1) { printf "%s: Type= is set %d times; the contract requires one\n", unit, types_set > "/dev/stderr"; bad = 1 }
       if (bad) exit 1
       for (i = 1; i <= n; i++) print k[i], seconds[k[i]]
-      for (i = 1; i <= posts; i++) print "ExecStopPost", post[i]
+      for (i = 1; i <= n_commands; i++) print commands[i]
     }' "$1"
 }
 
@@ -396,20 +413,23 @@ unit_contract() {
 update_limit_of() {
   local contract
   contract=$(unit_contract "$1" TimeoutStartSec) || return 1
-  printf '%s' "${contract#TimeoutStartSec }"
+  printf '%s' "$(sed -n 's/^TimeoutStartSec //p' <<<"$contract")"
 }
 
-# restart_worst_of UNIT: a restart of the recorder at its worst, from its unit file UNIT: its main
-# process's stop (TimeoutStopSec), each ExecStopPost (its `timeout -k`, or its own TimeoutStopSec if
-# less), and its start (TimeoutStartSec, its ExecStartPre waits included).
+# restart_worst_of UNIT: a restart of the recorder at its worst, from its unit file UNIT, of a Type
+# whose start this counts (simple or notify): its main process's stop (TimeoutStopSec) and each
+# ExecStopPost (its `timeout -k`, or its own TimeoutStopSec if less), then its start: the main
+# process's (TimeoutStartSec) and each ExecCondition, ExecStartPre and ExecStartPost, each a phase
+# with a TimeoutStartSec of its own (its `timeout -k`, or that if less).
 restart_worst_of() {
-  local contract key seconds stop=0 worst=0
-  contract=$(unit_contract "$1" 'TimeoutStopSec TimeoutStartSec') || return 1
+  local contract key seconds stop=0 start=0 worst=0
+  contract=$(unit_contract "$1" 'TimeoutStopSec TimeoutStartSec' 'simple notify') || return 1
   while read -r key seconds; do
     case $key in
       TimeoutStopSec) stop=$seconds worst=$((worst + seconds)) ;;
-      TimeoutStartSec) worst=$((worst + seconds)) ;;
+      TimeoutStartSec) start=$seconds worst=$((worst + seconds)) ;;
       ExecStopPost) worst=$((worst + (seconds < stop ? seconds : stop))) ;;
+      ExecCondition | ExecStartPre | ExecStartPost) worst=$((worst + (seconds < start ? seconds : start))) ;;
     esac
   done <<<"$contract"
   printf '%s' "$worst"
@@ -472,14 +492,29 @@ update_case() {
 stop_line='s/^TimeoutStopSec=90s$/'
 start_line='s/^TimeoutStartSec=5min$/'
 post_line='s#^ExecStopPost=/usr/bin/timeout -k 5s 10s #'
-unit_case 405 ''
+net_line='s#^ExecStartPre=.*wait-for-network.sh$#'
+add_line='s#^ExecStopPost=.*#&\n'
+unit_case 640 ''
 # GPT-6.1 Sol's cases at 9d0de140: a fraction of a second that systemd's dump dropped, and a missing
 # line for which a manager's default (the Pi's may be 180 s) would stand in.
 unit_case 'fail:TimeoutStopSec=90001ms' "${stop_line}TimeoutStopSec=90001ms/"
 unit_case 'fail:no TimeoutStopSec=' '/^TimeoutStopSec=/d'
 unit_case 'fail:no TimeoutStartSec=' '/^TimeoutStartSec=/d'
-unit_case 495 "${stop_line}TimeoutStopSec=3min/"
-unit_case 395 "${start_line}TimeoutStartSec=290s/"
+# GPT-6.1 Sol's case at 9e29a719: each start phase has a TimeoutStartSec of its own, so two 299 s
+# sleeps in two phases passed as 405 s and take 598.
+unit_case 'fail:ExecStartPre=/bin/sleep 299' "${net_line}ExecStartPre=/bin/sleep 299#; ${add_line}ExecStartPost=/bin/sleep 299#"
+unit_case 'fail:ExecStartPost=/bin/sleep 299' "${add_line}ExecStartPost=/bin/sleep 299#"
+unit_case 'fail:ExecCondition=/bin/true' "${add_line}ExecCondition=/bin/true#"
+unit_case 665 "${add_line}ExecStartPost=/usr/bin/timeout -k 5s 20s /bin/true#"
+unit_case 643 "${add_line}ExecCondition=/usr/bin/timeout -k 1s 2s /bin/true#"
+# A start command's own TimeoutStartSec bounds it below its `timeout`.
+unit_case 860 "${net_line}ExecStartPre=/usr/bin/timeout -k 5s 400s /opt/ghost-wispr/wait-for-network.sh#"
+unit_case 'fail:Type=oneshot' 's/^Type=simple$/Type=oneshot/'
+unit_case 'fail:no Type=' '/^Type=/d'
+unit_case 'fail:Type= is set 2 times' 's/^Type=simple$/&\nType=simple/'
+unit_case 640 's/^Type=simple$/Type=notify/'
+unit_case 730 "${stop_line}TimeoutStopSec=3min/"
+unit_case 630 "${start_line}TimeoutStartSec=290s/"
 unit_case 'fail:TimeoutStopSec =180s' "${stop_line}TimeoutStopSec =180s/"
 unit_case 'fail:TimeoutStopSec=1min 30s' "${stop_line}TimeoutStopSec=1min 30s/"
 unit_case 'fail:TimeoutStopSec=infinity' "${stop_line}TimeoutStopSec=infinity/"
@@ -493,18 +528,18 @@ unit_case 'fail:ends with a backslash' "${start_line}TimeoutStartSec=5min \\\\/"
 unit_case 'fail:ExecStopPost=/usr/bin/timeout --foreground' "${post_line}ExecStopPost=/usr/bin/timeout --foreground 10s #"
 unit_case 'fail:ExecStopPost=-/usr/bin/timeout' "${post_line}ExecStopPost=-/usr/bin/timeout -k 5s 10s #"
 unit_case 'fail:ExecStopPost=/usr/bin/timeout -k 5.5s' "${post_line}ExecStopPost=/usr/bin/timeout -k 5.5s 10s #"
-unit_case 410 's#^ExecStopPost=.*#&\nExecStopPost=/usr/bin/timeout -k 2s 3s /bin/true#'
+unit_case 645 "${add_line}ExecStopPost=/usr/bin/timeout -k 2s 3s /bin/true#"
 # A stop command's own TimeoutStopSec bounds it below its `timeout`.
-unit_case 480 "${post_line}ExecStopPost=/usr/bin/timeout -k 50s 60s #"
-unit_case 'fail:ExecStop=' 's#^ExecStopPost=.*#&\nExecStop=/bin/true#'
+unit_case 715 "${post_line}ExecStopPost=/usr/bin/timeout -k 50s 60s #"
+unit_case 'fail:ExecStop=' "${add_line}ExecStop=/bin/true#"
 unit_case 'fail:drop-in' '' 'TimeoutStopSec=180s'
-update_case 1800 ''
-update_case 1800 's/^TimeoutStartSec=30min$/TimeoutStartSec=1800s/'
+update_case 2400 ''
+update_case 2400 's/^TimeoutStartSec=40min$/TimeoutStartSec=2400s/'
 update_case 'fail:no TimeoutStartSec=' '/^TimeoutStartSec=/d'
-update_case 'fail:TimeoutStartSec = 30min' 's/^TimeoutStartSec=30min$/TimeoutStartSec = 30min/'
-update_case 'fail:TimeoutStartSec=1799999ms' 's/^TimeoutStartSec=30min$/TimeoutStartSec=1799999ms/'
-update_case 'fail:RuntimeMaxSec=10min' 's/^TimeoutStartSec=30min$/&\nRuntimeMaxSec=10min/'
-update_case 'fail:TimeoutSec=10min' 's/^TimeoutStartSec=30min$/&\nTimeoutSec=10min/'
+update_case 'fail:TimeoutStartSec = 40min' 's/^TimeoutStartSec=40min$/TimeoutStartSec = 40min/'
+update_case 'fail:TimeoutStartSec=2399999ms' 's/^TimeoutStartSec=40min$/TimeoutStartSec=2399999ms/'
+update_case 'fail:RuntimeMaxSec=10min' 's/^TimeoutStartSec=40min$/&\nRuntimeMaxSec=10min/'
+update_case 'fail:TimeoutSec=10min' 's/^TimeoutStartSec=40min$/&\nTimeoutSec=10min/'
 ((unit_failures == 0)) || exit 1
 restart_worst=$(restart_worst_of "$recorder_unit") || exit 1
 

@@ -110,6 +110,16 @@ case "$*" in
     fi
     ;;
   'daemon-reload') ;;
+  # LoadState from state/load-UNIT (loaded by default); DropInPaths from state/dropins-UNIT, and
+  # from the second query on also state/dropins-later-UNIT (a drop-in that appears mid-install).
+  'show -p LoadState -p DropInPaths ghost-wispr.service' | 'show -p LoadState -p DropInPaths ghost-wispr-update.service')
+    unit=${*: -1}
+    queries=$(($(cat "$state/queries-$unit" 2>/dev/null || echo 0) + 1))
+    echo "$queries" >"$state/queries-$unit"
+    paths=$(cat "$state/dropins-$unit" 2>/dev/null || true)
+    ((queries < 2)) || paths="$paths$(cat "$state/dropins-later-$unit" 2>/dev/null || true)"
+    printf 'LoadState=%s\nDropInPaths=%s\n' "$(cat "$state/load-$unit" 2>/dev/null || echo loaded)" "$paths"
+    ;;
   'restart ghost-wispr.service')
     echo active >"$state/service"
     printf '{"commit":"%s"}\n' "$(sed -n 's/^commit //p' "$FAKE_DEPLOY/ghost-wispr")" >"$state/version.json"
@@ -324,6 +334,29 @@ printf '%s\n' "$old" >"$state/release"
 rollout install
 expect_stop 'install when update.sh installs another commit' "did not install the merge commit $merge"
 (($(line "provision --models $drive") == 0)) || fail 'install ran the models step after update.sh installed another commit'
+
+# install refuses while either unit is not loaded on the Pi, or has a drop-in there, which can change
+# any timeout update.sh's bounds rely on (deploy/pi/update_test.sh's contract): it names them, and
+# changes nothing. It checks again once it has installed the units, before update.sh runs.
+refused_before_change() {
+  (($(line 'systemctl disable --now ghost-wispr-update.timer') == 0 && $(line update.sh) == 0)) && [[ $(timer) == active ]] \
+    || fail "install changed the Pi before it refused $1: $(<"$state/events")"
+}
+reset
+printf '%s\n' "$pi/home/.config/systemd/user/ghost-wispr.service.d/trace.conf" >"$state/dropins-ghost-wispr.service"
+rollout install
+expect_stop 'install with a drop-in on the recorder unit' 'ghost-wispr.service.d/trace.conf'
+refused_before_change 'a drop-in'
+reset
+echo not-found >"$state/load-ghost-wispr-update.service"
+rollout install
+expect_stop 'install with the update unit not loaded' 'ghost-wispr-update.service is not-found'
+refused_before_change 'a unit not loaded'
+reset
+printf '%s\n' /run/user/1000/systemd/user/ghost-wispr-update.service.d/late.conf >"$state/dropins-later-ghost-wispr-update.service"
+rollout install
+expect_stop 'install with a drop-in found once it installed the units' 'late.conf'
+(($(line update.sh) == 0)) || fail "install ran update.sh past a drop-in it found once it installed the units: $(<"$state/events")"
 
 # check: each failure leaves the nightly update stopped.
 check_fails() {

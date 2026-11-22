@@ -72,6 +72,24 @@ require_idle_or_down() {
     || fail "the recorder runs and is not paused and idle (paused, no session, no GPT-Live probe), or its /api/status cannot be read, so it may be recording: nothing was changed; pause it outside a meeting, or wait until it answers, and run this step again"
 }
 
+# require_unit_files WHAT: after a reload of the user units, ghost-wispr.service and
+# ghost-wispr-update.service are each loaded on the Pi and have no drop-in, which could change any
+# timeout update.sh's bounds rely on (deploy/pi/update_test.sh holds the repository's units to that
+# form). Otherwise it fails, naming the unit and its drop-ins, and WHAT (what the step has changed).
+require_unit_files() {
+  local unit out load paths
+  pi "${USER_SYSTEMD}systemctl --user daemon-reload" || fail "could not reload the user units on the Pi; $1"
+  for unit in ghost-wispr.service ghost-wispr-update.service; do
+    out=$(pi "${USER_SYSTEMD}systemctl --user show -p LoadState -p DropInPaths $unit") \
+      || fail "cannot read whether $unit is loaded on the Pi; $1"
+    load=$(sed -n 's/^LoadState=//p' <<<"$out")
+    paths=$(sed -n 's/^DropInPaths=//p' <<<"$out")
+    [[ $load == loaded ]] || fail "$unit is ${load:-of no load state} on the Pi, not loaded; $1"
+    [[ -z $paths ]] \
+      || fail "$unit has a drop-in on the Pi ($paths), which can change the timeouts update.sh's bounds rely on; remove it and run this step again; $1"
+  done
+}
+
 # check_protected WHEN: each protected recording on the Pi has the sha256 PI_PROTECTED_RECORDINGS
 # gives it. A list that names none has checked nothing, and fails.
 check_protected() {
@@ -91,7 +109,7 @@ readonly UPDATES_ON_COMMAND="ssh $PI 'XDG_RUNTIME_DIR=/run/user/\$(id -u) system
 
 # stop_updates disables the nightly update's timer and stops it, then waits until an update the
 # timer already started has ended (ghost-wispr-update.service inactive or failed): stopping the
-# timer does not stop it, and it can still swap or roll back the binary. The service may run 30
+# timer does not stop it, and it can still swap or roll back the binary. The service may run 40
 # minutes. Disabled, not only stopped: ghost-wispr's user manager starts an enabled timer at each
 # boot, and Persistent=true then runs a missed update at once, which would install the release's
 # binary on the old config after a reboot.
@@ -100,7 +118,7 @@ stop_updates() {
   pi "${USER_SYSTEMD}systemctl --user disable --now ghost-wispr-update.timer || exit 2
 [ \"\$(systemctl --user is-enabled ghost-wispr-update.timer)\" = disabled ] || exit 2
 [ \"\$(systemctl --user is-active ghost-wispr-update.timer)\" = inactive ] || exit 2
-for _ in \$(seq 372); do
+for _ in \$(seq 492); do
   case \$(systemctl --user show -p ActiveState --value ghost-wispr-update.service) in
     inactive | failed) exit 0 ;;
   esac
@@ -110,7 +128,7 @@ exit 3" || status=$?
   case $status in
     0) log 'the nightly update is off: its timer is disabled and inactive, and no update runs' ;;
     2) fail 'ghost-wispr-update.timer did not stop and disable' ;;
-    *) fail 'an update the timer started has not ended after 31 minutes (ghost-wispr-update.service is still active)' ;;
+    *) fail 'an update the timer started has not ended after 41 minutes (ghost-wispr-update.service is still active)' ;;
   esac
 }
 
@@ -203,6 +221,7 @@ step_install() {
   [[ $latest == "$merge" ]] \
     || fail "the latest release is of commit ${latest:-<none>}, not the merge commit $merge; wait until the release workflow publishes it"
   require_idle
+  require_unit_files 'nothing was changed'
   check_protected before
   stop_updates
   keep "$merge"
@@ -225,7 +244,7 @@ step_install() {
     [[ $(pi "sha256sum <\$HOME/.config/systemd/user/$unit") == "$(sha256sum <"$repo_root/deploy/pi/files/$unit")" ]] \
       || fail "the $unit on the Pi is not the merge commit's"
   done
-  pi "${USER_SYSTEMD}systemctl --user daemon-reload" || fail 'could not reload the user units on the Pi'
+  require_unit_files "the Pi has the merge commit's update.sh and units, with its old binary and config, and the nightly update off: run install again once the drop-in is gone, or roll back"
   log "installed the merge commit's ghost-wispr-update.service and ghost-wispr.service"
 
   require_idle

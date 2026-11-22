@@ -773,11 +773,12 @@ and fails. When `/api/status` gives no status (no answer, or an answer that is n
 recorder may be recording: it reads the status again every 2 minutes, as `pi-when-idle.sh` does,
 rolls back after two readable reads that allow the restart, and after three reads with no such
 pair leaves the new binary running and fails, saying so. It waits for another read only while that
-wait, the read and a restart at its worst still end a minute before the update unit's 30 min
+wait, the read and a restart at its worst still end a minute before the update unit's 40 min
 limit; otherwise it stops waiting, with the same result. A restart at its worst is the recorder
-unit's 90 s stop, `light-off` after it (bounded at 15 s: SIGTERM at 10 s, SIGKILL 5 s later) and
-its 5 min start. It never restarts a recorder whose state it could not read. Every step at its
-worst, a rollback included, takes about 23 minutes, inside that limit.
+unit's 90 s stop, `light-off` after it (bounded at 15 s: SIGTERM at 10 s, SIGKILL 5 s later), its
+two start waits, each under `timeout` in a start phase of its own (80 s and 155 s), and its 5 min
+start. It never restarts a recorder whose state it could not read. Every step at its worst, a
+rollback included, takes about 31 minutes, and its waits about 4 more, inside that limit.
 
 Run an update manually:
 
@@ -887,10 +888,14 @@ again at its end. It stops at the first check that fails. Save no settings in th
    another commit's. It turns the nightly update off again, and keeps the Pi's binary, config, `.env`,
    `update.sh` and the commit it runs in `~/.local/share/ghost-wispr-rollback/<merge commit>` on
    the Pi, mode 0700 (a second run keeps the first copy). It installs the merge commit's
-   `update.sh`, `ghost-wispr-update.service` and `ghost-wispr.service` (their 30 min limit and
-   bounded `light-off` are what `update.sh` plans for; only the full provisioner installs them
-   otherwise), reloads the user units, and runs
-   `update.sh` paused-only ("Update and inspect"), so a resume during the download leaves the
+   `update.sh`, `ghost-wispr-update.service` and `ghost-wispr.service` (their 40 min limit and
+   bounded start and stop commands are what `update.sh` plans for; only the full provisioner
+   installs them otherwise) and reloads the user units. Before it changes anything, and again once
+   it has installed the units, it refuses while either unit is not loaded on the Pi or has a
+   drop-in there (a `ghost-wispr.service.d` file, such as one left from a speaker trace), naming
+   it: a drop-in can change any timeout `update.sh` plans for. Remove the drop-in and run `install`
+   again. It runs `update.sh` paused-only ("Update and inspect"), so a resume during the download
+   leaves the
    binary in place; it must print `installed commit <merge commit>` or `already on commit <merge
    commit>`. Then, at once, it runs
    the models step ("Enable models and Drive sync") with the shared drive the Pi's config names:
