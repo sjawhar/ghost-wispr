@@ -141,9 +141,10 @@ readonly UPDATES_ON_COMMAND="ssh $PI 'XDG_RUNTIME_DIR=/run/user/\$(id -u) system
 # minutes on by the Pi's monotonic clock (its uptime), more than an update takes at its worst,
 # however slow each poll is or however the wall clock steps. Each poll and each of the report's
 # two reads has 30 s (and 5 more before SIGKILL), so one that hangs neither blocks the report nor
-# moves the deadline: the step ends at most a last poll and those two reads past it. Then it stops,
-# naming the update, its PID and since when it runs, or unknown for a read that gave nothing. It
-# never kills the update: a kill can land mid-swap.
+# moves the deadline: the step ends at most the 5 s sleep after the last poll before it, a last
+# poll, and those two reads past it (110 s). Then it stops, naming the update, its PID and since
+# when it runs, or unknown for a read that gave nothing. It never kills the update: a kill can land
+# mid-swap.
 stop_updates() {
   local status=0 out
   out=$(pi "${USER_SYSTEMD}systemctl --user disable --now ghost-wispr-update.timer || exit 2
