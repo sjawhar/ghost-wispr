@@ -148,9 +148,9 @@ for line in \
   'gc_enabled: false' \
   'gc_max_age_days: 0' \
   'gc_max_audio_size_mb: 20000' \
-  'envoy_enabled: true' \
+  'envoy_enabled: false' \
   "envoy_hub_url: $hub_url" \
-  "  envoy_url: $hub_url" \
+  '  envoy_url: ""' \
   "  dispatch_url: $PI_DISPATCH_URL" \
   'jabra_mute_button: true' \
   'mic_device: J75' \
@@ -200,6 +200,8 @@ for line in \
   'gc_max_age_days: 0' \
   'gc_max_audio_size_mb: 20000' \
   "envoy_hub_url: $hub_url" \
+  'envoy_enabled: false' \
+  '  envoy_url: ""' \
   "gdrive_folder_id: \"$drive_id\"" \
   'gdrive_sync_enabled: true' \
   'gc_enabled: true' \
@@ -208,7 +210,7 @@ for line in \
   'speaker_device: J75'; do
   assert_line "$line" "$models_config"
 done
-for key in gdrive_folder_id gdrive_sync_enabled gc_enabled envoy_hub_url jabra_mute_button mic_device speaker_device providers; do
+for key in gdrive_folder_id gdrive_sync_enabled gc_enabled envoy_enabled envoy_hub_url jabra_mute_button mic_device speaker_device providers; do
   assert_count "^$key:" 1 "$models_config"
 done
 

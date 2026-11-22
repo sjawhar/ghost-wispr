@@ -108,7 +108,11 @@ power_button: true
 jabra_mute_button: true
 # Envoy events go to the Envoy hub's listener over the tailnet, with no credential (README "Envoy
 # events"). The hub is the NATS server pi.env's PI_NATS_SERVER names; its listener answers on 9020.
-envoy_enabled: true
+# Envoy is off while the hub moves (dispatch://INFRA-3862): a start with it on publishes every
+# completed summary Envoy has not had, so turning it on here would send the hub every summary made
+# while it was off. To turn it on again, set envoy_enabled: true here and concierge.envoy_url
+# below to the hub's listener, then run the provisioner (docs/pi-setup.md, "Provision").
+envoy_enabled: false
 envoy_hub_url: http://envoy-hub.tail12ec1c.ts.net:9020
 # The meeting voice (README "Meeting voice"): "Wispr, …" at the start of a sentence asks about the
 # work in Dispatch. Voice A, text-to-speech, speaks with the provider and model of tts above.
@@ -128,8 +132,9 @@ voice:
     provider: deepgram
 # The Concierge answers on Gemini on Vertex AI. It reads Dispatch with the Pi's own no-scope token
 # (GHOST_WISPR_DISPATCH_TOKEN, the credential bundle's dispatch-token) and asks an issue's agent
-# through the Envoy listener.
+# through the Envoy listener, which is off while the hub moves (envoy_enabled above): with no
+# envoy_url it asks no agent.
 concierge:
   model: vertex/gemini-3.5-flash-lite
   dispatch_url: https://dispatch.tail12ec1c.ts.net
-  envoy_url: http://envoy-hub.tail12ec1c.ts.net:9020
+  envoy_url: ""

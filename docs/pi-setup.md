@@ -1047,7 +1047,11 @@ the unit.
 1. Reach. The Concierge reads `concierge.dispatch_url` and registers with the Envoy listener at
    `concierge.envoy_url`. The Pi reaches neither until the tailnet grant of dispatch://INFRA-4617
    is applied; until then the voice answers "I cannot reach Dispatch yet", and the log warns every
-   minute that the Envoy session did not open, with no restart needed once it can.
+   minute that the Envoy session did not open, with no restart needed once it can. While the Envoy
+   hub moves (dispatch://INFRA-3862), the template sets `envoy_enabled: false` and no
+   `concierge.envoy_url`, so the Pi opens no Envoy session and publishes no event: a start with
+   Envoy on publishes every completed summary Envoy has not had. To turn it on again, set both in
+   the template and run the provisioner.
 2. The Pi's Dispatch token: a no-scope agent token, never a person's. Before you run
    `provision-pi.sh`, mint it into `$prepared/dispatch-token` with your own Dispatch token, which
    must hold the `person` and `approve` scopes, in the file `DISPATCH_TOKEN_FILE` names:
