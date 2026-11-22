@@ -127,6 +127,15 @@ func (s outputSpeaker) OnSpeech(fn func(audio.SpeechEvent)) func() {
 	return s.o.OnSpeech(fn)
 }
 func (s outputSpeaker) FlushSpeech() { s.o.FlushSpeech() }
+func (s outputSpeaker) OnAudible(fn func(audio.AudibleEvent)) func() {
+	return s.o.OnAudible(fn)
+}
+
+// audibleSpeaker is a Speaker that reports when each speech's first sample
+// left its buffer for the device (audio.Output.OnAudible).
+type audibleSpeaker interface {
+	OnAudible(fn func(audio.AudibleEvent)) (remove func())
+}
 
 // TurnDriver is implemented by a Voice whose vendor drives the turn itself
 // (voices B and C): the Supervisor then hands the Concierge no turn, and the
@@ -250,6 +259,7 @@ type Supervisor struct {
 	logf   func(string, ...any)
 
 	unlisten func()
+	unhear   func() // stops onAudible
 
 	mu         sync.Mutex
 	closed     bool
@@ -536,6 +546,10 @@ func NewSupervisor(c *SupervisorConfig) *Supervisor {
 		idle:   make(chan struct{}),
 	}
 	s.unlisten = cfg.Speaker.OnSpeech(func(e audio.SpeechEvent) { s.onSpeech(&e) })
+	s.unhear = func() {}
+	if a, ok := cfg.Speaker.(audibleSpeaker); ok {
+		s.unhear = a.OnAudible(func(e audio.AudibleEvent) { s.onAudible(&e) })
+	}
 	s.spawn(s.sendNotes)
 	s.spawn(s.offerAnswers)
 	return s
@@ -557,6 +571,7 @@ func (s *Supervisor) Close() {
 	s.showWaitingLocked()
 	s.mu.Unlock()
 	s.unlisten()
+	s.unhear()
 	s.cancel()
 	s.spawnMu.Lock()
 	s.closing = true
@@ -2465,6 +2480,28 @@ func (s *Supervisor) sendNotes() {
 	}
 }
 
+// onAudible reports in the timing log when a sound on any of the speaker's
+// inputs, the chime's or the voice's, left the speaker's buffer for the
+// device, by the stream's own account (audio.AudibleEvent): the acceptance
+// driver times the answer against the chime in one recording of the room,
+// and the device's latency, the same for both, cancels. The line is stamped
+// at that instant on both clocks (AudibleEvent.At), so its at_mono_ns is its
+// audible_mono_ns, CLOCK_MONOTONIC, the driver's clock. It names its speech
+// (speech), as the voice's first_audio and speech_end lines do, so that the
+// driver times an answer by its own speech's line, not another's. A line
+// heard during an exchange names its session, held until it has one, as its
+// other timing lines are (exTimingLocked); any other names the session now.
+func (s *Supervisor) onAudible(e *audio.AudibleEvent) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	kv := []any{"input", e.Input, "speech", e.Speech, "audible_mono_ns", e.At.Mono, "audible_lead_ns", e.Lead, "audible_err_ns", e.Err, "disruptions", e.Disruptions}
+	if s.ex != nil {
+		s.exTimingLocked(s.ex, "audible", e.At, kv...)
+		return
+	}
+	s.timing("audible", s.sessionNow(), e.At, kv...)
+}
+
 // onSpeech follows the voice input's speech, for barge-in and the own-speech
 // filter. A speech is the exchange's whose playback started it, as the
 // speaker's report says (audio.SpeechEvent.Owner), whenever the report
@@ -2496,11 +2533,11 @@ func (s *Supervisor) onSpeech(e *audio.SpeechEvent) {
 		s.voiceEnded = time.Now()
 		switch {
 		case ex != nil:
-			s.exTimingLocked(ex, "speech_end", at)
+			s.exTimingLocked(ex, "speech_end", at, "speech", e.Speech)
 		case s.speechSession != nil:
-			s.timing("speech_end", *s.speechSession, at)
+			s.timing("speech_end", *s.speechSession, at, "speech", e.Speech)
 		default: // it began before the Supervisor listened
-			s.timing("speech_end", s.sessionNow(), at)
+			s.timing("speech_end", s.sessionNow(), at, "speech", e.Speech)
 		}
 		s.speechSession = nil
 	}
@@ -2519,7 +2556,7 @@ func (s *Supervisor) onSpeech(e *audio.SpeechEvent) {
 	}
 	if !ex.turnAt.IsZero() && !ex.firstOutDone {
 		ex.firstOutDone = true
-		s.exTimingLocked(ex, "first_audio", at)
+		s.exTimingLocked(ex, "first_audio", at, "speech", e.Speech)
 		s.logf("voice: first spoken audio %v after the turn ended", e.At.Sub(ex.turnAt).Round(time.Millisecond))
 	}
 	if ex.factPending {

@@ -9,6 +9,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 // playbackUsesPortAudio says whether the speaker's stream is PortAudio's: not
@@ -56,11 +58,13 @@ type alsaPCM interface {
 // pcmStatus is one snapshot of a PCM's status: whether it is running or
 // suspended, its delay, which counts what is in flight past its buffer as
 // well as what the buffer holds but which ALSA reports only while it runs,
-// how many frames its buffer has free, which it reports in every state, and
-// the status call's result.
+// how many frames its buffer has free, which it reports in every state, its
+// trigger timestamp in nanoseconds, which ALSA sets at every start, stop,
+// pause, suspend and resume, and the status call's result.
 type pcmStatus struct {
 	running, suspended bool
 	delay, avail       int
+	trigger            int64
 	rc                 int
 }
 
@@ -72,7 +76,10 @@ type alsaStream struct {
 	params alsaParams
 	wide   []int16 // a frame copied to every channel
 	xruns  int
-	told   bool // the stream has logged what it is
+	// broke counts the times the PCM's playback broke: a suspend, resumed or
+	// not, a recovery, and a Drop that held audio (breaks).
+	broke int
+	told  bool // the stream has logged what it is
 	// again is how many of the last frames the Output gave it that the PCM
 	// discarded by itself, in a suspend it could not resume from, and the
 	// Output is to write again (takeAgain).
@@ -114,6 +121,65 @@ func (s *alsaStream) queuedFrames() int {
 	return held + s.params.buffer
 }
 
+// playPosition reads two status snapshots of the PCM, one right after the
+// other, between two reads of CLOCK_MONOTONIC, with the wall clock read right
+// after the first (Output's timeAudible and settleAudibles). It gives running
+// only when both snapshots show the PCM running from the same trigger, and
+// then the first's delay (what the PCM was given and has not yet played, with
+// what the driver counts in flight to the speaker) and trigger.
+//
+// Each snapshot is a full snd_pcm_status: the SNDRV_PCM_IOCTL_STATUS(_EXT)
+// ioctl, which runs snd_pcm_status64. A kernel without Linux's 81d17d6911a7
+// ("ALSA: pcm: update state after xrun"), v6.12 among them, copies the state
+// and the trigger timestamp into the status first (sound/core/pcm_native.c
+// at v6.12, lines 1032 and 1036–1037), and only then, while running, calls
+// snd_pcm_update_hw_ptr (line 1039). That update can find an XRUN and stop
+// the PCM (pcm_lib.c lines 324–325, 168–180): snd_pcm_post_stop sets the
+// state and a new trigger timestamp (pcm_native.c lines 1519–1525). The
+// delay is taken after the update, and is 0 once stopped (lines 1074–1075).
+// So a snapshot whose update finds the XRUN shows RUNNING, with the old
+// trigger and a delay of 0, for a PCM it has just stopped (Sol's review of
+// #154 at 7444ec94). Each call takes the stream lock (line 1014), so the
+// second snapshot copies the state after the first's update: when the first
+// found the XRUN, the second shows the stop. When only the second finds one,
+// the first's update found none, so its delay was read while the PCM ran from
+// that trigger: it is the first's delay that is given, never the second's. A
+// snapshot that fails, or a clock that cannot be read, gives none. A
+// suspended PCM either finds is a break (breaks), as it is when a write finds
+// it.
+func (s *alsaStream) playPosition() (playPosition, bool) {
+	before, ok := monotonicNanos()
+	if !ok {
+		return playPosition{}, false
+	}
+	wall := time.Now()
+	first := s.pcm.status()
+	second := s.pcm.status()
+	after, ok := monotonicNanos()
+	if !ok || first.rc < 0 || second.rc < 0 {
+		return playPosition{}, false
+	}
+	if first.suspended || second.suspended {
+		s.broke++
+	}
+	running := first.running && second.running && first.trigger == second.trigger
+	return playPosition{running: running, delay: max(0, first.delay), trigger: first.trigger, before: before, after: after, wall: wall}, true
+}
+
+// breaks reports how many times the PCM's playback broke (broke): what it
+// held may then play at another time than an account read before said.
+func (s *alsaStream) breaks() int { return s.broke }
+
+// monotonicNanos reads CLOCK_MONOTONIC, the clock the acceptance driver times
+// the room's recording on.
+func monotonicNanos() (int64, bool) {
+	var ts unix.Timespec
+	if unix.ClockGettime(unix.CLOCK_MONOTONIC, &ts) != nil {
+		return 0, false
+	}
+	return ts.Nano(), true
+}
+
 // Write plays frame, waiting while the PCM is full. After an underrun, when
 // the PCM ran out of audio and stopped, it prepares the PCM and plays on, and
 // counts and logs the underrun. After a suspend, as of the system, it resumes
@@ -142,6 +208,7 @@ func (s *alsaStream) Write(frame []int16) error {
 			continue
 		}
 		if rc == -int(syscall.ESTRPIPE) {
+			s.broke++
 			lost, err := s.resume()
 			if err != nil {
 				return err
@@ -161,6 +228,7 @@ func (s *alsaStream) Write(frame []int16) error {
 			slog.Warn("speaker underrun", "device", s.device, "underruns", s.xruns,
 				"buffer", frameTime(s.params.buffer, s.params.rate))
 		}
+		s.broke++
 		if s.pcm.recover(rc) < 0 {
 			return alsaErr("write", rc)
 		}
@@ -174,7 +242,10 @@ func (s *alsaStream) Write(frame []int16) error {
 	case st.suspended:
 		// Suspended after the write: the suspend cancelled what was in
 		// flight, which a suspended status no longer counts. The next
-		// write's recovery counts it lost (inflightAtSuspend).
+		// write's recovery counts it lost (inflightAtSuspend). The suspend is
+		// a break now, though the write succeeded (Sol's review of #154 at
+		// ce454880).
+		s.broke++
 	default:
 		s.inflight, s.inflightUnknown = s.inflightOf(st), false
 		s.filling = s.inflight > 0 && st.delay >= s.written
@@ -292,6 +363,7 @@ func (s *alsaStream) Drop() (int, error) {
 	if held == 0 {
 		return 0, nil
 	}
+	s.broke++
 	back := 0
 	if n := s.pcm.rewindable(); n > 0 {
 		back = max(0, s.pcm.rewind(n))
