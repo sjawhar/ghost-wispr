@@ -24,7 +24,7 @@ mkdir -p "$tree/deploy/pi/files" "$deploy" "$pi/home" "$state" "$bin"
 
 # The checkout: rollout.sh and the template as they are, a fake update.sh and provision.sh.
 cp -- "$repo_root/deploy/pi/rollout.sh" "$tree/deploy/pi/"
-cp -- "$repo_root/deploy/pi/files/ghost-wispr.yaml" "$repo_root/deploy/pi/files/ghost-wispr-update.service" "$tree/deploy/pi/files/"
+cp -- "$repo_root/deploy/pi/files/ghost-wispr.yaml" "$repo_root/deploy/pi/files/ghost-wispr-update.service" "$repo_root/deploy/pi/files/ghost-wispr.service" "$tree/deploy/pi/files/"
 cat >"$tree/deploy/pi/update.sh" <<'EOF'
 #!/usr/bin/env bash
 # The fake update.sh: installs the fake Pi's latest release, as update.sh does. The rollout runs it
@@ -102,14 +102,28 @@ case "$*" in
   'is-enabled ghost-wispr-update.timer') cat "$state/timer-enabled"; [[ $(<"$state/timer-enabled") == enabled ]] ;;
   'is-active --quiet ghost-wispr.service') [[ $(<"$state/service") == active ]] ;;
   'show -p ActiveState --value ghost-wispr-update.service')
-    if [[ -s $state/update-states ]]; then
+    if [[ -e $state/update-forever ]]; then
+      echo activating
+    elif [[ -s $state/update-states ]]; then
       sed -n 1p "$state/update-states"
       sed -i 1d "$state/update-states"
     else
       echo inactive
     fi
     ;;
+  'show -p MainPID --value ghost-wispr-update.service') echo 4321 ;;
+  'show -p InactiveExitTimestamp --value ghost-wispr-update.service') echo 'Sun 2026-11-22 03:30:00 UTC' ;;
   'daemon-reload') ;;
+  # LoadState from state/load-UNIT (loaded by default); DropInPaths from state/dropins-UNIT, and
+  # from the second query on also state/dropins-later-UNIT (a drop-in that appears mid-install).
+  'show -p LoadState -p DropInPaths ghost-wispr.service' | 'show -p LoadState -p DropInPaths ghost-wispr-update.service')
+    unit=${*: -1}
+    queries=$(($(cat "$state/queries-$unit" 2>/dev/null || echo 0) + 1))
+    echo "$queries" >"$state/queries-$unit"
+    paths=$(cat "$state/dropins-$unit" 2>/dev/null || true)
+    ((queries < 2)) || paths="$paths$(cat "$state/dropins-later-$unit" 2>/dev/null || true)"
+    printf 'LoadState=%s\nDropInPaths=%s\n' "$(cat "$state/load-$unit" 2>/dev/null || echo loaded)" "$paths"
+    ;;
   'restart ghost-wispr.service')
     echo active >"$state/service"
     printf '{"commit":"%s"}\n' "$(sed -n 's/^commit //p' "$FAKE_DEPLOY/ghost-wispr")" >"$state/version.json"
@@ -263,6 +277,19 @@ off_after_reboot hold
 [[ $out == *'the 2 protected recordings have their sha256 (before)'* && $out == *'(after)'* ]] \
   || fail "hold did not check the protected recordings before and after: $out"
 
+# hold: an update that still runs at the cap is left running, named with its PID and how long it
+# has run; nothing kills or stops it.
+reset
+: >"$state/update-forever"
+rollout hold
+expect_stop 'hold with an update that does not end' 'ghost-wispr-update.service (pid 4321, since Sun 2026-11-22 03:30:00 UTC) still runs after 35 minutes'
+[[ $out == *'left running'* ]] || fail "hold did not say the update is left running: $out"
+! grep -Eq 'systemctl (kill|stop|restart) ghost-wispr-update|^kill' "$state/events" \
+  || fail "hold killed or stopped the running update: $(<"$state/events")"
+[[ $(grep -c '^sleep 5$' "$state/events") == 420 ]] \
+  || fail "hold waited $(grep -c '^sleep 5$' "$state/events") times 5 s for the update, want 420 (35 minutes)"
+rm -f "$state/update-forever"
+
 # install: refused while the latest release is another commit's, before any change.
 reset
 release "$old"
@@ -294,9 +321,12 @@ grep -qx 'echo old update.sh' "$kept/update.sh" || fail 'the kept update.sh is n
 [[ $(<"$kept/commit") == "$old" ]] || fail 'the kept commit is not the one the Pi ran'
 [[ $(stat -c %a "$kept") == 700 && $(stat -c %a "$kept/.env") == 600 ]] || fail 'the kept copy is readable by others'
 cmp -s "$deploy/update.sh" "$tree/deploy/pi/update.sh" || fail "install did not install the merge commit's update.sh"
-# update.sh's UNIT_LIMIT is the merge commit's unit's limit: the unit must reach the Pi with it.
-cmp -s "$pi/home/.config/systemd/user/ghost-wispr-update.service" "$tree/deploy/pi/files/ghost-wispr-update.service" \
-  || fail "install did not install the merge commit's ghost-wispr-update.service"
+# The merge commit's units reach the Pi with its update.sh: the update unit gives update.sh no time
+# limit, so nothing kills it mid-swap.
+for unit in ghost-wispr-update.service ghost-wispr.service; do
+  cmp -s "$pi/home/.config/systemd/user/$unit" "$tree/deploy/pi/files/$unit" \
+    || fail "install did not install the merge commit's $unit"
+done
 reload=$(line 'systemctl daemon-reload')
 ((reload > 0 && reload < $(line update.sh))) || fail "install did not reload the user units before update.sh: $(<"$state/events")"
 grep -qx "commit $merge" "$deploy/ghost-wispr" || fail 'install did not install the release'
@@ -321,6 +351,29 @@ printf '%s\n' "$old" >"$state/release"
 rollout install
 expect_stop 'install when update.sh installs another commit' "did not install the merge commit $merge"
 (($(line "provision --models $drive") == 0)) || fail 'install ran the models step after update.sh installed another commit'
+
+# install refuses while either unit is not loaded on the Pi, or has a drop-in there, which can change
+# any timeout update.sh's bounds rely on (deploy/pi/update_test.sh's contract): it names them, and
+# changes nothing. It checks again once it has installed the units, before update.sh runs.
+refused_before_change() {
+  (($(line 'systemctl disable --now ghost-wispr-update.timer') == 0 && $(line update.sh) == 0)) && [[ $(timer) == active ]] \
+    || fail "install changed the Pi before it refused $1: $(<"$state/events")"
+}
+reset
+printf '%s\n' "$pi/home/.config/systemd/user/ghost-wispr.service.d/trace.conf" >"$state/dropins-ghost-wispr.service"
+rollout install
+expect_stop 'install with a drop-in on the recorder unit' 'ghost-wispr.service.d/trace.conf'
+refused_before_change 'a drop-in'
+reset
+echo not-found >"$state/load-ghost-wispr-update.service"
+rollout install
+expect_stop 'install with the update unit not loaded' 'ghost-wispr-update.service is not-found'
+refused_before_change 'a unit not loaded'
+reset
+printf '%s\n' /run/user/1000/systemd/user/ghost-wispr-update.service.d/late.conf >"$state/dropins-later-ghost-wispr-update.service"
+rollout install
+expect_stop 'install with a drop-in found once it installed the units' 'late.conf'
+(($(line update.sh) == 0)) || fail "install ran update.sh past a drop-in it found once it installed the units: $(<"$state/events")"
 
 # check: each failure leaves the nightly update stopped.
 check_fails() {

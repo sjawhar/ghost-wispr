@@ -72,6 +72,24 @@ require_idle_or_down() {
     || fail "the recorder runs and is not paused and idle (paused, no session, no GPT-Live probe), or its /api/status cannot be read, so it may be recording: nothing was changed; pause it outside a meeting, or wait until it answers, and run this step again"
 }
 
+# require_unit_files WHAT: after a reload of the user units, ghost-wispr.service and
+# ghost-wispr-update.service are each loaded on the Pi and have no drop-in, which could change how
+# they run, such as a time limit that kills update.sh mid-swap. Otherwise it fails, naming the unit
+# and its drop-ins, and WHAT (what the step has changed).
+require_unit_files() {
+  local unit out load paths
+  pi "${USER_SYSTEMD}systemctl --user daemon-reload" || fail "could not reload the user units on the Pi; $1"
+  for unit in ghost-wispr.service ghost-wispr-update.service; do
+    out=$(pi "${USER_SYSTEMD}systemctl --user show -p LoadState -p DropInPaths $unit") \
+      || fail "cannot read whether $unit is loaded on the Pi; $1"
+    load=$(sed -n 's/^LoadState=//p' <<<"$out")
+    paths=$(sed -n 's/^DropInPaths=//p' <<<"$out")
+    [[ $load == loaded ]] || fail "$unit is ${load:-of no load state} on the Pi, not loaded; $1"
+    [[ -z $paths ]] \
+      || fail "$unit has a drop-in on the Pi ($paths), which can change how it runs, such as its time limits; remove it and run this step again; $1"
+  done
+}
+
 # check_protected WHEN: each protected recording on the Pi has the sha256 PI_PROTECTED_RECORDINGS
 # gives it. A list that names none has checked nothing, and fails.
 check_protected() {
@@ -91,26 +109,29 @@ readonly UPDATES_ON_COMMAND="ssh $PI 'XDG_RUNTIME_DIR=/run/user/\$(id -u) system
 
 # stop_updates disables the nightly update's timer and stops it, then waits until an update the
 # timer already started has ended (ghost-wispr-update.service inactive or failed): stopping the
-# timer does not stop it, and it can still swap or roll back the binary. The service may run 30
-# minutes. Disabled, not only stopped: ghost-wispr's user manager starts an enabled timer at each
-# boot, and Persistent=true then runs a missed update at once, which would install the release's
-# binary on the old config after a reboot.
+# timer does not stop it, and it can still swap or roll back the binary. Disabled, not only stopped:
+# ghost-wispr's user manager starts an enabled timer at each boot, and Persistent=true then runs a
+# missed update at once, which would install the release's binary on the old config after a reboot.
+# The update has no time limit (each step of it has one), so this waits at most 35 minutes, more
+# than an update takes at its worst, and then stops, naming the update, its PID and since when it
+# runs. It never kills it: a kill can land mid-swap.
 stop_updates() {
-  local status=0
-  pi "${USER_SYSTEMD}systemctl --user disable --now ghost-wispr-update.timer || exit 2
+  local status=0 out
+  out=$(pi "${USER_SYSTEMD}systemctl --user disable --now ghost-wispr-update.timer || exit 2
 [ \"\$(systemctl --user is-enabled ghost-wispr-update.timer)\" = disabled ] || exit 2
 [ \"\$(systemctl --user is-active ghost-wispr-update.timer)\" = inactive ] || exit 2
-for _ in \$(seq 372); do
+for _ in \$(seq 420); do
   case \$(systemctl --user show -p ActiveState --value ghost-wispr-update.service) in
     inactive | failed) exit 0 ;;
   esac
   sleep 5
 done
-exit 3" || status=$?
+echo \"pid \$(systemctl --user show -p MainPID --value ghost-wispr-update.service), since \$(systemctl --user show -p InactiveExitTimestamp --value ghost-wispr-update.service)\"
+exit 3") || status=$?
   case $status in
     0) log 'the nightly update is off: its timer is disabled and inactive, and no update runs' ;;
     2) fail 'ghost-wispr-update.timer did not stop and disable' ;;
-    *) fail 'an update the timer started has not ended after 31 minutes (ghost-wispr-update.service is still active)' ;;
+    *) fail "ghost-wispr-update.service (${out:-pid unknown}) still runs after 35 minutes; it is left running, since a kill can land mid-swap: run this step again once it ends" ;;
   esac
 }
 
@@ -203,6 +224,7 @@ step_install() {
   [[ $latest == "$merge" ]] \
     || fail "the latest release is of commit ${latest:-<none>}, not the merge commit $merge; wait until the release workflow publishes it"
   require_idle
+  require_unit_files 'nothing was changed'
   check_protected before
   stop_updates
   keep "$merge"
@@ -214,15 +236,18 @@ step_install() {
   [[ $(pi "sha256sum <$(printf %q "$DEPLOY_DIR/update.sh")") == "$(sha256sum <"$repo_root/deploy/pi/update.sh")" ]] \
     || fail 'the update.sh on the Pi is not the merge commit'\''s'
   log "installed the merge commit's update.sh"
-  # Its update unit too: update.sh's UNIT_LIMIT is this unit's TimeoutStartSec, and only the full
-  # provisioner installs the unit otherwise. A rollback keeps it; the longer limit only gives the
-  # old update.sh more room.
-  pi_in "set -e; d=\$HOME/.config/systemd/user; mkdir -p \"\$d\"; cat >\"\$d/ghost-wispr-update.service.new\"; chmod 0644 \"\$d/ghost-wispr-update.service.new\"; mv -f \"\$d/ghost-wispr-update.service.new\" \"\$d/ghost-wispr-update.service\"" \
-    <"$repo_root/deploy/pi/files/ghost-wispr-update.service" || fail 'could not install the merge commit'\''s ghost-wispr-update.service'
-  [[ $(pi "sha256sum <\$HOME/.config/systemd/user/ghost-wispr-update.service") == "$(sha256sum <"$repo_root/deploy/pi/files/ghost-wispr-update.service")" ]] \
-    || fail 'the ghost-wispr-update.service on the Pi is not the merge commit'\''s'
-  pi "${USER_SYSTEMD}systemctl --user daemon-reload" || fail 'could not reload the user units on the Pi'
-  log "installed the merge commit's ghost-wispr-update.service"
+  # Its units too, which only the full provisioner installs otherwise: the update unit gives
+  # update.sh no time limit, so nothing kills it mid-swap. A rollback keeps them: the old update.sh
+  # runs as well with no limit.
+  local unit
+  for unit in ghost-wispr-update.service ghost-wispr.service; do
+    pi_in "set -e; d=\$HOME/.config/systemd/user; mkdir -p \"\$d\"; cat >\"\$d/$unit.new\"; chmod 0644 \"\$d/$unit.new\"; mv -f \"\$d/$unit.new\" \"\$d/$unit\"" \
+      <"$repo_root/deploy/pi/files/$unit" || fail "could not install the merge commit's $unit"
+    [[ $(pi "sha256sum <\$HOME/.config/systemd/user/$unit") == "$(sha256sum <"$repo_root/deploy/pi/files/$unit")" ]] \
+      || fail "the $unit on the Pi is not the merge commit's"
+  done
+  require_unit_files "the Pi has the merge commit's update.sh and units, with its old binary and config, and the nightly update off: run install again once the drop-in is gone, or roll back"
+  log "installed the merge commit's ghost-wispr-update.service and ghost-wispr.service"
 
   require_idle
   # Paused-only: update.sh checks again just before the swap and before a rollback's restart, so a

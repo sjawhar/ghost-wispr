@@ -762,18 +762,23 @@ just before it replaces the binary. With `GHOST_WISPR_UPDATE_PAUSED_ONLY=1`, as
 GitHub release checksum, keeps `/opt/ghost-wispr/ghost-wispr.prev`, and restores that binary if the
 new process or `/api/version` check fails. Only the binary it last saw answer its commit becomes
 `ghost-wispr.prev`: it records that binary's sha256 in `/opt/ghost-wispr/ghost-wispr.verified`, so
-an update cut off after its swap (a power cut, or the unit's limit) never makes an unverified
-binary the one a rollback restores. It restarts the recorder for that rollback only when
+an update stopped after its swap (a power cut, or an operator's stop) never makes an unverified
+binary the one a rollback restores. Its first run, with no record yet, records the installed binary
+only when it is the image the recorder's main process runs (by sha256); otherwise, or when that
+image cannot be read, it records none, keeps `ghost-wispr.prev` and says so. It restarts the
+recorder for that rollback only when
 the unit has stopped, or when `/api/status` answers that it may restart. When the new process
 answers that it records a session (or, paused-only, that it is not paused), it leaves it running
 and fails. When `/api/status` gives no status (no answer, or an answer that is not a status), the
 recorder may be recording: it reads the status again every 2 minutes, as `pi-when-idle.sh` does,
 rolls back after two readable reads that allow the restart, and after three reads with no such
-pair leaves the new binary running and fails, saying so. It waits for another read only while that
-wait, the read and a restart at its worst (the recorder unit's 90 s stop and 5 min start) still end
-a minute before the update unit's 30 min limit; otherwise it stops waiting, with the same result.
-It never restarts a recorder whose state it could not read. Every step at its worst, a rollback
-included, takes about 22 minutes, inside that limit.
+pair leaves the new binary running and fails, saying so. It never restarts a recorder whose state
+it could not read.
+
+`ghost-wispr-update.service` gives `update.sh` no time limit (`TimeoutStartSec=infinity`): a
+limit's kill could land mid-swap, with the new binary in place and no rollback. Each step it waits
+on has a bound of its own: each `curl` its `--max-time`, the version check 120 s, a rollback's
+status reads three, and each restart of the recorder the recorder unit's own timeouts.
 
 Run an update manually:
 
@@ -872,7 +877,9 @@ again at its end. It stops at the first check that fails. Save no settings in th
    enabled timer at boot, and `Persistent=true` then runs a missed update at once). It then waits
    until an update the timer already started has ended (`ghost-wispr-update.service` inactive or
    failed): stopping the timer does not stop that update, and it can still swap or roll back the
-   binary.
+   binary. It waits at most 35 minutes, more than an update takes at its worst; past that it stops,
+   naming the update's PID and since when it runs, and leaves it running: run `hold` again once it
+   ends. Nothing in the rollout kills an update, since a kill can land mid-swap.
 
    ```bash
    deploy/pi/rollout.sh hold
@@ -883,11 +890,15 @@ again at its end. It stops at the first check that fails. Save no settings in th
    another commit's. It turns the nightly update off again, and keeps the Pi's binary, config, `.env`,
    `update.sh` and the commit it runs in `~/.local/share/ghost-wispr-rollback/<merge commit>` on
    the Pi, mode 0700 (a second run keeps the first copy). It installs the merge commit's
-   `update.sh` and `ghost-wispr-update.service` (its 30 min limit is the one `update.sh` plans
-   for; only the full provisioner installs either otherwise), reloads the user units, and runs
-   `update.sh` paused-only ("Update and inspect"), so a resume during the download leaves the
-   binary in place; it must print `installed commit <merge commit>` or `already on commit <merge
-   commit>`. Then, at once, it runs
+   `update.sh`, `ghost-wispr-update.service` and `ghost-wispr.service` (only the full provisioner
+   installs them otherwise; the update unit gives `update.sh` no time limit) and reloads the user
+   units. Before it changes anything, and again once it has installed the units, it refuses while
+   either unit is not loaded on the Pi or has a drop-in there (a `ghost-wispr.service.d` file, such
+   as one left from a speaker trace), naming it: a drop-in can change how the units run, such as
+   give the update a time limit. Remove the drop-in and run `install` again. It runs `update.sh`
+   paused-only ("Update and inspect"), so a resume during the download leaves the binary in place;
+   it must print `installed commit <merge commit>` or `already on commit <merge commit>`. Then, at
+   once, it runs
    the models step ("Enable models and Drive sync") with the shared drive the Pi's config names:
    that installs the new config, removes from `.env` the variables of removed settings (such as
    the `GHOST_WISPR_EMBEDDING_LOCATION` an earlier provisioner wrote), and restarts the recorder on
