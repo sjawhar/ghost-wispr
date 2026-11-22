@@ -334,7 +334,10 @@ began with a key a save has since replaced is not kept as the provider's last ch
   provider's settings, with no secret) and `models`: each role's provider/model as the running
   process resolved it, environment overrides included, under `live_transcription`,
   `batch_transcription`, `summarization`, `embedding`, `concierge`, `tts`, `tts_voice`, `gptlive`
-  and `dgagent_provider`.
+  and `dgagent_provider`. It and each `PATCH /api/config` answer carry `revision: {run, count}`, the
+  state of the config they hold: `count` rises by one with each change in this run of the unit,
+  which `run` names. Of two answers in one run, the one with the higher count holds the later state,
+  whichever order they arrive in; the settings page keeps that one.
 - `PATCH /api/config` takes `provider_keys: {"<provider>": "<key>"}` for `api_key` providers and
   writes each key into `.env` under the provider's `auth.env`; any other provider or a key containing
   control characters is a 400. It also takes `tts: {model, voice}`, `summarization: {model, presets}`

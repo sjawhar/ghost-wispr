@@ -74,6 +74,15 @@ var configSchema = map[string]any{
 			"description":          "GET only: the model providers the configuration names (providers:), by name. Each role's provider/model names one. No secret: an api_key provider names the variable that holds its key. A PATCH cannot set it; GET /api/providers says whether each one signs in.",
 			"additionalProperties": providerSchema,
 		},
+		"revision": map[string]any{
+			"type":        "object",
+			"readOnly":    true,
+			"description": "GET and PATCH answers only: the state of the configuration the answer holds. count rises by one with each change in this run of the unit, which run names (it changes with each start, and count starts again from 0). Of two answers in one run, the one with the higher count holds the later state, whichever order they arrive in.",
+			"properties": map[string]any{
+				"run":   map[string]any{"type": "string"},
+				"count": map[string]any{"type": "integer", "minimum": 0},
+			},
+		},
 		"provider_keys": map[string]any{
 			"type":                 "object",
 			"writeOnly":            true,

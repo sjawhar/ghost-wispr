@@ -1715,6 +1715,10 @@ type configResponse struct {
 	// as written in recording_rules; empty when there are none. Read-only.
 	RecordingRules []string            `json:"recording_rules"`
 	Voice          configVoiceResponse `json:"voice"`
+	// Revision is the state of the config this answer holds. Read-only: a
+	// page that sends two saves keeps the answer with the later revision,
+	// whichever order the answers land in.
+	Revision config.Revision `json:"revision"`
 }
 
 type configSummarizationResponse struct {
@@ -1755,7 +1759,7 @@ type configVoiceResponse struct {
 
 func handleGetConfig(cfgStore *config.Store) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		cfg := cfgStore.Get()
+		cfg, revision := cfgStore.GetRevision()
 		resp := configResponse{
 			SilenceTimeout:     cfg.SilenceTimeout,
 			MinSessionSegments: cfg.MinSessionSegments,
@@ -1795,6 +1799,7 @@ func handleGetConfig(cfgStore *config.Store) http.HandlerFunc {
 				Enabled: cfg.Voice.Enabled,
 				Engine:  cfg.Voice.Engine,
 			},
+			Revision: revision,
 		}
 		if resp.Summarization.Presets == nil {
 			resp.Summarization.Presets = map[string]config.Preset{}

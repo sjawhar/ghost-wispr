@@ -105,6 +105,16 @@ export interface ConfigResponse {
     enabled: boolean
     engine: VoiceEngine
   }
+  // The state of the config this answer holds: count rises by one with each
+  // change in this run of the unit, which run names. Of two answers in one
+  // run, the one with the higher count holds the later state. Absent from an
+  // older unit.
+  revision?: ConfigRevision
+}
+
+export interface ConfigRevision {
+  run: string
+  count: number
 }
 
 // The body of PATCH /api/config: each field it changes, and nothing else.
@@ -175,27 +185,8 @@ async function configRequest<T>(input: RequestInfo | URL, init?: RequestInit): P
   return (await response.json()) as T
 }
 
-// Each read and save of the config is numbered as it is sent. Two can be on
-// their way at once, and the answer to the earlier one can land later; its
-// config is then the older, and setConfig keeps the newer.
-let configRequests = 0
-const sentAs = new WeakMap<ConfigResponse, number>()
-
-// sentNumber is the number of the request a config answered, if it answered
-// one.
-export function sentNumber(config: ConfigResponse): number | undefined {
-  return sentAs.get(config)
-}
-
-async function numbered(request: () => Promise<ConfigResponse>): Promise<ConfigResponse> {
-  const number = ++configRequests
-  const config = await request()
-  sentAs.set(config, number)
-  return config
-}
-
 export function fetchConfig(): Promise<ConfigResponse> {
-  return numbered(() => configRequest<ConfigResponse>('/api/config'))
+  return configRequest<ConfigResponse>('/api/config')
 }
 
 // fetchProviders returns each configured provider's sign-in and last check;
@@ -208,13 +199,11 @@ export async function fetchProviders(refresh = false): Promise<ProviderStatus[]>
 }
 
 export function patchConfig(patch: ConfigPatch): Promise<ConfigResponse> {
-  return numbered(() =>
-    configRequest<ConfigResponse>('/api/config', {
-      method: 'PATCH',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(patch),
-    }),
-  )
+  return configRequest<ConfigResponse>('/api/config', {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(patch),
+  })
 }
 
 export function testPreset(name: string, sessionId: string): Promise<TestPresetResponse> {

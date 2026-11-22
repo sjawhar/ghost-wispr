@@ -242,46 +242,86 @@ describe('SettingsPage', () => {
     )
   })
 
-  // A General save goes out first and its answer, with voice Kore, lands
-  // last; the voice save of Puck goes out second and lands first. The older
-  // answer must not put Kore back in the voice field.
-  it('keeps a newer save when an older answer lands after it', async () => {
-    const answers: ((answer: Response) => void)[] = []
-    vi.stubGlobal(
-      'fetch',
-      vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
-        if (String(input).startsWith('/api/providers')) {
-          return Promise.resolve(new Response(JSON.stringify({ providers: [] })))
-        }
-        if (init?.method === 'PATCH') {
-          // The app's TypeScript library, ES2022, has no Promise.withResolvers.
-          return new Promise<Response>((resolve) => answers.push(resolve))
-        }
-        return Promise.resolve(new Response(JSON.stringify(config)))
-      }),
-    )
-    render(SettingsPage, { onBack: () => {} })
-    const general = await screen.findByTestId('general-settings')
-    const voice = screen.getByTestId('voice-settings')
+  // A General save (45s) goes out first and a voice save (Puck) second, and
+  // the voice save's answer lands first. Whichever save the unit applied
+  // last holds the later state, with the higher revision count:
+  // - the General save reached the unit first, so its answer holds voice
+  //   Kore and must not put it back in the voice field;
+  // - the General save reached the unit last, so its answer holds both
+  //   changes and must be taken.
+  it.each([
+    {
+      unitApplied: 'the General save first',
+      generalAnswer: { silence_timeout: '45s', voice: 'Kore', count: 1 },
+      voiceAnswer: { silence_timeout: '45s', voice: 'Puck', count: 2 },
+    },
+    {
+      unitApplied: 'the voice save first',
+      generalAnswer: { silence_timeout: '45s', voice: 'Puck', count: 2 },
+      voiceAnswer: { silence_timeout: '30s', voice: 'Puck', count: 1 },
+    },
+  ])(
+    'keeps the later state when $unitApplied and the answers land in the other order',
+    async ({ generalAnswer, voiceAnswer }) => {
+      const answer = ({ silence_timeout, voice, count }: typeof generalAnswer) =>
+        new Response(
+          JSON.stringify({
+            ...config,
+            silence_timeout,
+            tts: { ...config.tts, voice },
+            revision: { run: 'run-1', count },
+          }),
+        )
+      const answers: ((answer: Response) => void)[] = []
+      vi.stubGlobal(
+        'fetch',
+        vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+          if (String(input).startsWith('/api/providers')) {
+            return Promise.resolve(new Response(JSON.stringify({ providers: [] })))
+          }
+          if (init?.method === 'PATCH') {
+            // The app's TypeScript library, ES2022, has no Promise.withResolvers.
+            return new Promise<Response>((resolve) => answers.push(resolve))
+          }
+          return Promise.resolve(
+            new Response(JSON.stringify({ ...config, revision: { run: 'run-1', count: 0 } })),
+          )
+        }),
+      )
+      render(SettingsPage, { onBack: () => {} })
+      const general = await screen.findByTestId('general-settings')
+      const voice = screen.getByTestId('voice-settings')
 
-    await fireEvent.input(within(general).getByLabelText('Silence Timeout'), {
-      target: { value: '45s' },
-    })
-    await fireEvent.click(within(general).getByRole('button', { name: 'Save' }))
-    await fireEvent.input(within(voice).getByLabelText('Text-to-speech voice'), {
-      target: { value: 'Puck' },
-    })
-    await fireEvent.click(within(voice).getByRole('button', { name: 'Save' }))
-    expect(answers).toHaveLength(2)
+      await fireEvent.input(within(general).getByLabelText('Silence Timeout'), {
+        target: { value: '45s' },
+      })
+      await fireEvent.click(within(general).getByRole('button', { name: 'Save' }))
+      await fireEvent.input(within(voice).getByLabelText('Text-to-speech voice'), {
+        target: { value: 'Puck' },
+      })
+      await fireEvent.click(within(voice).getByRole('button', { name: 'Save' }))
+      expect(answers).toHaveLength(2)
 
-    answers[1](new Response(JSON.stringify({ ...config, tts: { ...config.tts, voice: 'Puck' } })))
-    expect(await within(voice).findByText('Saved!')).toBeTruthy()
-    answers[0](new Response(JSON.stringify({ ...config, silence_timeout: '45s' })))
-    expect(await within(general).findByText('Saved!')).toBeTruthy()
+      answers[1](answer(voiceAnswer))
+      expect(await within(voice).findByText('Saved!')).toBeTruthy()
+      answers[0](answer(generalAnswer))
+      expect(await within(general).findByText('Saved!')).toBeTruthy()
 
-    expect((within(voice).getByLabelText('Text-to-speech voice') as HTMLInputElement).value).toBe(
-      'Puck',
-    )
-    expect(configState.config?.tts.voice).toBe('Puck')
+      expect(configState.config?.tts.voice).toBe('Puck')
+      expect(configState.config?.silence_timeout).toBe('45s')
+      expect((within(voice).getByLabelText('Text-to-speech voice') as HTMLInputElement).value).toBe(
+        'Puck',
+      )
+      expect((within(general).getByLabelText('Silence Timeout') as HTMLInputElement).value).toBe(
+        '45s',
+      )
+    },
+  )
+
+  it('takes a config from another run of the unit, as after a restart', () => {
+    setConfig({ ...config, silence_timeout: '45s', revision: { run: 'run-1', count: 9 } })
+    setConfig({ ...config, silence_timeout: '50s', revision: { run: 'run-2', count: 0 } })
+
+    expect(configState.config?.silence_timeout).toBe('50s')
   })
 })
