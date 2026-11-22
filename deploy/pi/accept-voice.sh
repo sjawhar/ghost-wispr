@@ -522,6 +522,40 @@ def capture_state(root, pid):
     return None, None
 
 
+def capture_frames(root, pid):
+    """The application pointer of the capture substream arecord (pid) holds, from its /proc/asound
+    status under root, with the rate and the period, in frames, of its hw_params: (appl_ptr, rate,
+    period), or None when any is missing. A prepare sets appl_ptr to hw_ptr, which a substream not
+    running resets to 0 (sound/core/pcm_native.c, snd_pcm_post_prepare; pcm_lib.c,
+    snd_pcm_lib_ioctl_reset), and in a run it only grows, by the frames arecord's reads take from
+    the hardware."""
+    for status in glob.glob(os.path.join(root, "card*", "pcm*c", "sub*", "status")):
+        try:
+            with open(status) as f:
+                fields = {k.strip(): v.strip() for k, v in (line.split(":", 1) for line in f if ":" in line)}
+            if fields.get("owner_pid") != str(pid):
+                continue
+            with open(os.path.join(os.path.dirname(status), "hw_params")) as f:
+                params = {k.strip(): v.split()[0] for k, v in (line.split(":", 1) for line in f if ":" in line) if v.split()}
+            return int(fields["appl_ptr"]), int(params["rate"]), int(params["period_size"])
+        except (OSError, KeyError, ValueError):
+            return None
+    return None
+
+
+def wav_frames(path):
+    """The rate and the bytes per frame of the WAV file at path, from its header, or None."""
+    try:
+        with open(path, "rb") as f:
+            header = f.read(HEADER)
+    except OSError:
+        return None
+    if len(header) < HEADER or header[:4] != b"RIFF" or header[8:12] != b"WAVE":
+        return None
+    rate, align = int.from_bytes(header[24:28], "little"), int.from_bytes(header[32:34], "little")
+    return (rate, align) if rate > 0 and align > 0 else None
+
+
 def record(path, anchors, pidfile, root):
     """The recording's sampler, started before arecord: every 10 ms until arecord has written a
     sample, then every 0.5 s, and once more at SIGTERM, after arecord has ended, it writes an anchor,
@@ -592,13 +626,27 @@ def record(path, anchors, pidfile, root):
     def anchored(seen, size, before, first=False):
         """Write the anchor of a read with samples, its floor only if the substream ran on. For the
         FIRST anchor, the state reads before it (watched) must show no run that stopped or
-        restarted, and any RUNNING among them the trigger the read after its size shows."""
+        restarted, and any RUNNING among them the trigger the read after its size shows. At every
+        anchor, a file holding more frames than the run's appl_ptr counts is a restart too: in one
+        run arecord writes only frames it has read, and its reads (through plughw's rate plugin,
+        which takes whole hardware periods before it gives their frames: alsa-lib pcm_rate.c,
+        snd_pcm_rate_grab_next_period) take at least as many hardware frames, in the file's
+        frames times the rates' ratio, as they give, give or take one frame of the conversion;
+        appl_ptr, read after the size, is no smaller than at the size read. So only frames from
+        before a prepare can put the file more than a hardware period ahead. This takes a floor
+        away, never gives one (Sol's review of #162 at 494ba440)."""
         nonlocal broken, trigger, closed
         state, now_trigger = capture_state(root, pid)
         if first and broken is None:
             if early_broken is not None:
                 broken = "discontinuous %d %s" % (seen, early_broken)
             elif early_trigger is not None and now_trigger != early_trigger:
+                broken = "discontinuous %d RESTARTED" % seen
+        frames, wav = capture_frames(root, pid), wav_frames(path)
+        if broken is None and frames is not None and wav is not None:
+            appl, hw_rate, period = frames
+            file_rate, align = wav
+            if (size - HEADER) // align * hw_rate > (appl + period) * file_rate:
                 broken = "discontinuous %d RESTARTED" % seen
         if state == "RUNNING" and now_trigger is None:
             # RUNNING with no trigger_time in the kernel's form shows nothing about a restart (Sol's

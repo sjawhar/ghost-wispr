@@ -799,6 +799,62 @@ for case, before_samples, after_samples, want in (
         failures.append("%s: %d floor anchors, discontinuous %r; want floors and none" % (case, len(floors), reported))
     if want is not None and (floors or len(reported) != 1 or not reported[0].endswith(" " + want)):
         failures.append("%s: %d floor anchors, discontinuous %r; want none and one naming %s" % (case, len(floors), reported, want))
+
+# The pointer detector (in-process, with capture_frames scripted from the file's size when it is
+# read, after the sampler's size read): appl_ptr counts hardware frames at 48 kHz, twice the 24 kHz
+# file's, plus LEAD; the period is 480. Only a file more than a period ahead of appl_ptr is a
+# restart; a pointer level with the file, ahead of it, or behind it within the period keeps the
+# floor, as does any pointer without the file's own WAV header to give its rate (no-header).
+wav = (b"RIFF\xff\xff\xff\x7fWAVEfmt \x10\x00\x00\x00\x01\x00\x01\x00" + (24000).to_bytes(4, "little")
+       + (48000).to_bytes(4, "little") + b"\x02\x00\x10\x00data\xff\xff\xff\x7f")
+for case, lead, header, want in (
+        ("pointer-deficit", -20000, True, "RESTARTED"),
+        ("pointer-level", 0, True, None),
+        ("pointer-within-period", -400, True, None),
+        ("pointer-ahead", 2400, True, None),
+        ("pointer-no-header", -20000, False, None)):
+    work = os.path.join(base, "pointer-" + case)
+    os.mkdir(work)
+    path, anchors, pidfile = (os.path.join(work, n) for n in ("r.wav", "anchors", "pid"))
+    code = ("import sys, time\n"
+            "time.sleep(0.2); f = open(sys.argv[1], 'wb'); f.write(%r); f.flush(); time.sleep(0.05)\n"
+            "for _ in range(80): f.write(b'\\1\\0' * 240); f.flush(); time.sleep(0.01)\n") % (wav if header else bytes(44))
+    # .get: a sampler without the detector has no capture_frames, and must then keep the floor.
+    real_state, real_frames = ns["capture_state"], ns.get("capture_frames")
+
+    def frames(root, pid, lead=lead, path=path):
+        data = max(0, (os.path.getsize(path) - 44) // 2)
+        return 2 * data + lead, 48000, 480
+    started, printed = {}, []
+
+    def said(*words, code=code, path=path, pidfile=pidfile, **_):
+        printed.append(" ".join(map(str, words)))
+        if words and words[0] == "ready" and not started:
+            started["writer"] = subprocess.Popen([sys.executable, "-c", code, path])
+            with open(pidfile + ".tmp", "w") as f:
+                f.write(str(started["writer"].pid))
+            os.replace(pidfile + ".tmp", pidfile)
+    ns["capture_state"], ns["capture_frames"] = (lambda root, pid: ("RUNNING", (5, 1))), frames
+    real_print = ns.get("print", print)
+    ns["print"] = said
+    try:
+        ns["record"](path, anchors, pidfile, work)
+    finally:
+        ns["capture_state"], ns["capture_frames"] = real_state, real_frames
+        ns["print"] = real_print
+        signal.signal(signal.SIGTERM, signal.SIG_DFL)
+        signal.signal(signal.SIGINT, signal.SIG_DFL)
+    if "writer" not in started:
+        failures.append("%s: the sampler never said ready, so no writer started" % case)
+        continue
+    started["writer"].wait()
+    lines = [l.split() for l in open(anchors).read().splitlines()]
+    floors = [l for l in lines if int(l[1]) > 44 and len(l) == 3]
+    reported = [l for l in printed if l.startswith("discontinuous ")]
+    if want is None and (not floors or reported):
+        failures.append("%s: %d floor anchors, discontinuous %r; want floors and none" % (case, len(floors), reported))
+    if want is not None and (floors or len(reported) != 1 or not reported[0].endswith(" " + want)):
+        failures.append("%s: %d floor anchors, discontinuous %r; want none and one naming %s" % (case, len(floors), reported, want))
 for line in failures:
     print(line)
 sys.exit(1 if failures else 0)

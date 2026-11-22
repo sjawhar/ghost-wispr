@@ -1233,24 +1233,42 @@ def arecord(args):
         with open(os.path.join(substream, "hw_params"), "w") as f:
             f.write("access: RW_INTERLEAVED\nformat: S16_LE\nsubformat: STD\nchannels: 1\nrate: 48000 (48000/1)\nperiod_size: 480\nbuffer_size: %d\n" % CAPTURE_BUFFER_FRAMES)
     trigger = ["%d.%09d" % divmod(time.time_ns(), 1_000_000_000)]
+    # shown: the substream's state as the status shows it; appl: its appl_ptr, the hardware frames
+    # (48 kHz) arecord's reads have taken in this run, set before the frames they give reach the
+    # file, as plughw's rate plugin takes a hardware period before it gives its frames.
+    shown_state, appl, crashed = ["RUNNING"], [0], [False]
+
+    def write_status(text):
+        tmp = os.path.join(substream, "status.tmp")
+        with open(tmp, "w") as g:
+            g.write(text)
+        os.replace(tmp, os.path.join(substream, "status"))
 
     def set_state(state, restarted=False):
         """The capture substream's state, as the kernel's status shows it while arecord holds it;
         restarted gives it a new trigger_time, as a prepare and start after an overrun do."""
         if restarted:
             trigger[0] = "%d.%09d" % divmod(time.time_ns(), 1_000_000_000)
+        shown_state[0] = state
         if substream:
             # capture-no-trigger: a status without trigger_time (Sol's review of #149 at 9b3d27cb).
             trigger_line = "" if "capture-no-trigger" in SCENARIO else "trigger_time: %s\n" % trigger[0]
-            with open(os.path.join(substream, "status"), "w") as g:
-                g.write("state: %s\nowner_pid   : %d\n%s" % (state, os.getpid(), trigger_line))
+            write_status("state: %s\nowner_pid   : %d\n%s-----\nhw_ptr      : %d\nappl_ptr    : %d\n"
+                         % (state, os.getpid(), trigger_line, appl[0], appl[0]))
+
+    def taken(frames):
+        """arecord's reads have taken the hardware frames that give FRAMES frames of the file;
+        pointer-deficit shows 4800 fewer (100 ms), as a run whose prepare reset the pointer while
+        the file kept the frames before it. A status sampler-crash broke stays broken."""
+        appl[0] = max(0, 2 * frames - (4800 if "pointer-deficit" in SCENARIO else 0))
+        if not crashed[0]:
+            set_state(shown_state[0])
 
     set_state("RUNNING")
 
     def close_substream():
         if substream:
-            with open(os.path.join(substream, "status"), "w") as f:
-                f.write("closed\n")
+            write_status("closed\n")
 
     def german():
         """Whether arecord's messages come in German, as gettext picks them: LC_ALL, else
@@ -1340,6 +1358,9 @@ def arecord(args):
     # write in the folder is done; unlock is the folder, its mode and when it opens again.
     frozen = []
     unlock = None
+    # pid_seen: arecord-lock-start's own record that the driver's pid file was there before it
+    # locked the folder (and so before its first sample), which a stat under the lock cannot show.
+    pid_seen = False
     try:
         if "arecord-slow-start" in SCENARIO:
             time.sleep(1.5)
@@ -1361,6 +1382,7 @@ def arecord(args):
             wait_until = time.monotonic() + 5
             while not os.path.exists(path + ".pid") and time.monotonic() < wait_until:
                 time.sleep(0.005)
+            pid_seen = os.path.exists(path + ".pid")
         begun = -(-time.monotonic_ns() // 1_000_000)
         log_to("recordings", "%s %d" % (path, begun))
         if "arecord-lock-start" in SCENARIO and f is not None:
@@ -1415,7 +1437,8 @@ def arecord(args):
             # sampler-says-unwatched: 1 s into the capture, long after the sampler's "started" line,
             # the sampler's line for first samples that landed before it knew arecord's process,
             # added to its output, which the driver reads at the end; the sampler writes no more there.
-            if "sampler-says-unwatched" in SCENARIO and not said_unwatched and t >= begun + 1000:
+            # sampler-says-unwatched-wrongly adds the same line where the pid was not late.
+            if SCENARIO & {"sampler-says-unwatched", "sampler-says-unwatched-wrongly"} and not said_unwatched and t >= begun + 1000:
                 with open(path + ".sampler", "a") as g:
                     g.write("discontinuous %d UNWATCHED\n" % (time.monotonic_ns() // 1000))
                 said_unwatched = True
@@ -1443,6 +1466,7 @@ def arecord(args):
                 # the substream's state raises on: a sampler that fails partway, whose failure the
                 # driver must name (c28 of #156 hid a traceback behind "after its last anchor").
                 if "sampler-crash" in SCENARIO and substream:
+                    crashed[0] = True
                     with open(os.path.join(substream, "status"), "wb") as g:
                         g.write(b"state: RUNNING\nowner_pid   : %d\ntrigger_time: %s\n\xff\n" % (os.getpid(), trigger[0].encode()))
             if SCENARIO & {"capture-silent-xrun", "capture-silent-restart"} and clipped is not None:
@@ -1489,11 +1513,25 @@ def arecord(args):
             target = 2 * int((t - lag - skip - lost - begun) * CLOCK * 24)
             if target > written:
                 # pid-at-first-sample: whether the driver's pid file for this recording was there as
-                # the first sample landed. The self-test takes the driver's UNWATCHED NOTE only where
-                # it was not; sampler-says-unwatched plays a late pid, so it logs it absent.
+                # the first sample landed: present, absent (no such file), or unreadable (the stat
+                # failed otherwise, as under arecord-lock-start's lock, where the fake's own record
+                # before the lock says present). The self-test takes the driver's UNWATCHED NOTE only
+                # on a clean absent (Sol's review of #162 at 494ba440); sampler-says-unwatched plays a
+                # late pid, so it logs it absent.
                 if written == 0:
-                    there = os.path.exists(path + ".pid") and "sampler-says-unwatched" not in SCENARIO
-                    log_to("pid-at-first-sample", "present" if there else "absent")
+                    try:
+                        os.stat(path + ".pid")
+                        there = "present"
+                    except FileNotFoundError:
+                        there = "absent"
+                    except OSError:
+                        there = "unreadable"
+                    if pid_seen:
+                        there = "present"
+                    if "sampler-says-unwatched" in SCENARIO:
+                        there = "absent"
+                    log_to("pid-at-first-sample", there)
+                taken(target // 2)
                 put(bytes(target - written))
                 written = target
                 for pid in frozen:
@@ -2211,15 +2249,34 @@ floor_decided() {
 # substream's state could not show it ran on, and the early bounds come from the start alone.
 readonly unwatched_note="NOTE: recording: arecord wrote its first samples before the sampler knew its process"
 
-# unwatched_agreed NAME: whether the driver named UNWATCHED in NAME and the fake agrees: its own log
-# (pid-at-first-sample) says the driver's pid file for a recording of the case was not there as its
-# first sample landed. Only then may the case fall back as after an overrun. The driver naming it
-# while every such pid file was there fails: the sampler then had the pid before any sample, so a
-# wrong UNWATCHED would turn a strict case into a fallback.
+# unwatched_evidence NAME: the fake's account (pid-at-first-sample) of the driver's pid file as the
+# first sample of each of NAME's recordings landed: absent when every recording logged it absent,
+# unreadable when one could not tell, present when one found it there, and none when none logged.
+unwatched_evidence() {
+  local log=$root/$1/state/pid-at-first-sample
+  if [[ ! -s $log ]]; then
+    printf 'none\n'
+  elif grep -qx unreadable "$log"; then
+    printf 'unreadable\n'
+  elif grep -qx present "$log"; then
+    printf 'present\n'
+  else
+    printf 'absent\n'
+  fi
+}
+
+# unwatched_agreed NAME: whether the driver named UNWATCHED in NAME and the fake agrees, on a clean
+# absent: its own log says the driver's pid file for every recording of the case was not there as
+# its first sample landed. Only then may the case fall back as after an overrun. The driver naming
+# it otherwise fails, a pid file found there or one the fake could not stat (Sol's review of #162 at
+# 494ba440: under arecord-lock-start's lock a check for the file read as absent): the sampler may
+# have had the pid before any sample, so a wrong UNWATCHED would turn a strict case into a fallback.
 unwatched_agreed() {
   grep -Fq "$unwatched_note" "$root/$1/out" || return 1
-  if ! grep -qx absent "$root/$1/state/pid-at-first-sample" 2>/dev/null; then
-    check_failed "$1: the driver said arecord wrote its first samples before the sampler knew its process, but the fake found the pid file there as its first sample landed ($(tr '\n' ';' <"$root/$1/state/pid-at-first-sample" 2>/dev/null))"
+  local evidence
+  evidence=$(unwatched_evidence "$1")
+  if [[ $evidence != absent ]]; then
+    check_failed "$1: the driver said arecord wrote its first samples before the sampler knew its process, but the fake's account of the pid file as its first sample landed is $evidence ($(tr '\n' ';' <"$root/$1/state/pid-at-first-sample" 2>/dev/null))"
     return 1
   fi
 }
@@ -2609,6 +2666,12 @@ launch cancel-locked long,asound,stop-rounds-2,arecord-hold-200,arecord-reopen,a
 # 75a99ec1: at the 40 ms buffer two loaded runs overran and fell back).
 # shellcheck disable=SC2086
 launch cancel-lock-start long,asound,stop-rounds-2,arecord-lock-start,capture-buffer-250 yes -- $cancel_args
+# The same with the sampler's UNWATCHED line though the pid was not late
+# (sampler-says-unwatched-wrongly): the fake's account, under its lock, must still say the pid file
+# was there, so that the self-test would not take the NOTE (Sol's review of #162 at 494ba440: a
+# check for the file under the lock read as absent, and the wrong NOTE passed as a fallback).
+# shellcheck disable=SC2086
+launch cancel-lock-start-wrongly long,asound,stop-rounds-2,arecord-lock-start,capture-buffer-250,sampler-says-unwatched-wrongly yes -- $cancel_args
 # A good cancel whose sampler says its first samples landed before it knew arecord's process
 # (sampler-says-unwatched, which plays a late pid and logs the pid file absent at its first sample):
 # the driver turns the floor off with its NOTE, and as the fake's log agrees, the case falls back as
@@ -2616,6 +2679,12 @@ launch cancel-lock-start long,asound,stop-rounds-2,arecord-lock-start,capture-bu
 # (unwatched_agreed).
 # shellcheck disable=SC2086
 launch cancel-unwatched long,asound,stop-rounds-2,sampler-says-unwatched yes -- $cancel_args
+# A good cancel whose substream's appl_ptr counts 100 ms fewer hardware frames than the file holds
+# (pointer-deficit), as after a prepare the trigger reads missed: a restart, so no floor, with the
+# NOTE naming it, and no FAIL. Every other case's fake keeps appl_ptr at the frames it gave or
+# more, and must keep its floor (Sol's review of #162 at 494ba440).
+# shellcheck disable=SC2086
+launch cancel-pointer-deficit long,asound,stop-rounds-2,pointer-deficit yes -- $cancel_args
 # A good cancel with an arecord that reads 1.5 s after its header: the recording cannot show that the
 # rig heard the speech up to the stop: UNKNOWN, never PASS.
 # shellcheck disable=SC2086
@@ -3464,11 +3533,25 @@ expect_restored cancel-locked
 expect_load_case cancel-lock-start
 [[ -s $root/cancel-lock-start/state/arecord-locked ]] || check_failed 'cancel-lock-start: the fake arecord never locked its file away, so the case tested no failed read'
 expect_restored cancel-lock-start
+expect_line cancel-lock-start-wrongly "$unwatched_note"
+[[ -s $root/cancel-lock-start-wrongly/state/arecord-locked ]] || check_failed 'cancel-lock-start-wrongly: the fake arecord never locked its file away'
+evidence=$(unwatched_evidence cancel-lock-start-wrongly)
+[[ $evidence == present ]] \
+  || check_failed "cancel-lock-start-wrongly: the fake's account of the pid file under its lock is $evidence, want present, so a wrong UNWATCHED would pass"
+expect_restored cancel-lock-start-wrongly
 if ! fake_overran cancel-unwatched; then
   unwatched_agreed cancel-unwatched || check_failed "cancel-unwatched: no line holds \"$unwatched_note\" that the fake agrees with"
 fi
 expect_load_case cancel-unwatched
 expect_restored cancel-unwatched
+# An overrun the fake truly logged comes first in the driver's NOTEs, so the RESTARTED NOTE is wanted
+# only without one.
+if ! fake_overran cancel-pointer-deficit; then
+  expect_line cancel-pointer-deficit "NOTE: recording: the capture substream arecord held read RESTARTED during the recording"
+fi
+expect_rc cancel-pointer-deficit 0 2
+expect_no_line cancel-pointer-deficit 'FAIL: playback-cancel'
+expect_restored cancel-pointer-deficit
 expect_rc cancel-unsure 2
 expect_line cancel-unsure 'UNKNOWN: playback-cancel stop 1: the rig microphone did not hear the speech up to the stop'
 expect_no_line cancel-unsure "PASS: playback-cancel: no stop's speech was heard"
