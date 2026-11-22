@@ -73,8 +73,9 @@ case "$url" in
       # A recorder paused and idle until the new binary's start, whose start job fails while the
       # unit stays active, and whose /api/status then does not answer (unreadable), answers no
       # status (garbage), answers again after one unanswered read (unreadable-then-idle), or is
-      # never read, the unit being stopped (stopped-new).
-      unreadable | garbage | unreadable-then-idle | stopped-new | killed-after-swap | never-answers)
+      # never read, the unit being stopped (stopped-new). never-answers-then-idle starts, never
+      # reports its commit, and then answers as unreadable-then-idle does.
+      unreadable | garbage | unreadable-then-idle | stopped-new | killed-after-swap | never-answers | never-answers-then-idle)
         if [[ ! -e ${TEST_STATE:?}/changed ]]; then
           printf '{"paused":true,"capture_state":"paused","active_session_id":""}\n'
           exit 0
@@ -84,7 +85,7 @@ case "$url" in
         case $TEST_SCENARIO in
           unreadable) exit 7 ;;
           garbage) printf '<html>502 Bad Gateway</html>\n' ;;
-          unreadable-then-idle)
+          unreadable-then-idle | never-answers-then-idle)
             ((reads > 1)) || exit 7
             printf '{"paused":true,"capture_state":"paused","active_session_id":""}\n'
             ;;
@@ -109,7 +110,7 @@ case "$url" in
     fi
     # busy, and the rest until a restart: never the release, so the install goes ahead.
     # never-answers: a new binary that starts but never reports its commit.
-    if [[ $TEST_SCENARIO == busy || $TEST_SCENARIO == never-answers || ($TEST_SCENARIO != down && ! -s $TEST_SYSTEMCTL_LOG) ]]; then
+    if [[ $TEST_SCENARIO == busy || $TEST_SCENARIO == never-answers || $TEST_SCENARIO == never-answers-then-idle || ($TEST_SCENARIO != down && ! -s $TEST_SYSTEMCTL_LOG) ]]; then
       printf '{"commit":"%s"}\n' "previous"
       exit 0
     fi
@@ -127,6 +128,11 @@ cat >"$work_dir/bin/systemctl" <<'EOF'
 if [[ "$*" == '--user is-active --quiet ghost-wispr.service' ]]; then
   [[ ${TEST_SCENARIO:?} == down ]] && exit 3
   [[ $TEST_SCENARIO == stopped-new && -e $TEST_STATE/changed ]] && exit 3
+  exit 0
+fi
+# The recorder's main process: TEST_MAIN_PID, whose image is the fake /proc's <pid>/exe.
+if [[ "$*" == '--user show -p MainPID --value ghost-wispr.service' ]]; then
+  echo "${TEST_MAIN_PID:-4242}"
   exit 0
 fi
 printf '%s\n' "$*" >>"$TEST_SYSTEMCTL_LOG"
@@ -155,6 +161,10 @@ if [[ $TEST_SCENARIO =~ ^(recording-new|unreadable|garbage|unreadable-then-idle|
   : >"$TEST_STATE/changed"
   exit 1
 fi
+# never-answers-then-idle: the new binary's start job succeeds.
+if [[ $TEST_SCENARIO == never-answers-then-idle && "$*" == '--user restart ghost-wispr.service' && ! -e $TEST_STATE/changed ]]; then
+  : >"$TEST_STATE/changed"
+fi
 EOF
 chmod +x "$work_dir/bin/systemctl"
 # sleep notes each wait of update.sh and moves the test's clock on by it, at once; the fakes' own
@@ -174,6 +184,12 @@ cat "$TEST_CLOCK"
 EOF
 chmod +x "$work_dir/bin/date"
 
+# The fake /proc: the recorder's main process (4242) runs the installed binary, unless a test points
+# its exe elsewhere (running_image).
+mkdir -p "$work_dir/proc/4242"
+running_image() { ln -sfn "$1" "$work_dir/proc/4242/exe"; }
+running_image "$work_dir/deploy/ghost-wispr"
+
 run_update() {
   echo 1000 >"$work_dir/clock"
   PATH="$work_dir/bin:$PATH" \
@@ -187,8 +203,10 @@ run_update() {
     TEST_CLOCK="$work_dir/clock" \
     TEST_RESTART_SECONDS="${restart_seconds:-0}" \
     TEST_SLOW="${slow:-}" \
+    TEST_MAIN_PID="${main_pid:-4242}" \
     TEST_STATE="$work_dir/state" \
     GHOST_WISPR_DEPLOY_DIR="$work_dir/deploy" \
+    GHOST_WISPR_PROC_DIR="$work_dir/proc" \
     GHOST_WISPR_RELEASE_API=https://test.invalid/releases/latest \
     GHOST_WISPR_STATUS_URL=https://test.invalid/status \
     GHOST_WISPR_VERSION_URL=https://test.invalid/version \
@@ -321,24 +339,65 @@ rolled_back 'a new binary that answers idle again' $'sleep 120\nsleep 120'
 paused_only='' update_with stopped-new
 rolled_back 'a new binary whose unit stopped' ''
 
+# seconds UNIT KEY DEFAULT: KEY's time in the unit file UNIT, in seconds (5min, 90s, 90), or DEFAULT.
+seconds() {
+  local value
+  value=$(sed -n "s/^$2=//p" "$1")
+  case $value in
+    '') value=$3 ;;
+    *min) value=$((${value%min} * 60)) ;;
+    *s) value=${value%s} ;;
+  esac
+  [[ $value =~ ^[0-9]+$ ]] || { printf 'cannot read %s from %s\n' "$2" "$1" >&2; exit 1; }
+  printf '%s' "$value"
+}
+
 # The update unit (ghost-wispr-update.service) ends update.sh at its TimeoutStartSec, which update.sh
-# knows as UNIT_LIMIT. A rollback waits for a recorder whose state it cannot read only while that
-# wait, the read after it and a restart at the recorder's worst (390 s: its unit's 90 s stop and
-# 5 min start) still end 60 s before then; otherwise it gives up at once, the new binary left
-# running, and says why. With an instant restart it waits twice (above). No real restart is slow
-# enough to make it stop early (the worst case below), so these restarts take what puts the clock
-# where the guard binds: one that leaves room for one wait and not a second, and one for none.
-unit_file="$script_dir/files/ghost-wispr-update.service"
-limit=$(sed -n 's/^TimeoutStartSec=//p' "$unit_file")
-case $limit in
-  *min) limit=$((${limit%min} * 60)) ;;
-  *s) limit=${limit%s} ;;
-esac
-[[ $limit =~ ^[0-9]+$ ]] || { printf 'cannot read TimeoutStartSec from %s: %q\n' "$unit_file" "$limit" >&2; exit 1; }
+# knows as UNIT_LIMIT.
+limit=$(seconds "$script_dir/files/ghost-wispr-update.service" TimeoutStartSec '')
 script_limit=$(sed -n 's/^readonly UNIT_LIMIT=\([0-9][0-9]*\).*/\1/p' "$update_script")
 [[ $script_limit == "$limit" ]] \
   || { printf "update.sh's UNIT_LIMIT (%s) is not the update unit's TimeoutStartSec (%s s)\n" "$script_limit" "$limit" >&2; exit 1; }
 usable=$((limit - 60))
+
+# A restart of the recorder (ghost-wispr.service) at its worst: its main process's stop (TimeoutStopSec,
+# the user manager's 90 s by default), each ExecStopPost (bounded by TimeoutStopSec of its own, or
+# by the `timeout` it runs under), and its start (TimeoutStartSec, its ExecStartPre waits included).
+recorder_unit="$script_dir/files/ghost-wispr.service"
+stop=$(seconds "$recorder_unit" TimeoutStopSec 90)
+restart_worst=$((stop + $(seconds "$recorder_unit" TimeoutStartSec '')))
+while IFS= read -r post; do
+  if [[ $post =~ ^/usr/bin/timeout\ -k\ ([0-9]+)s?\ ([0-9]+)s?\  ]]; then
+    restart_worst=$((restart_worst + BASH_REMATCH[1] + BASH_REMATCH[2]))
+  else
+    restart_worst=$((restart_worst + stop))
+  fi
+done < <(sed -n 's/^ExecStopPost=//p' "$recorder_unit")
+
+# The new binary starts but never reports its commit; the rollback's first status read gets no
+# answer and the next two find it idle (GPT-6.1 Sol's delayed-idle case at 25ff1c5), each step at
+# its worst, each restart at the recorder's worst: 420 s of reads and downloads, the restart, the
+# 120 s version wait, a read, a 120 s wait, a read, a wait, a read and the rollback's restart. Its
+# waits must reserve the true restart, and the whole must end 60 s before the unit's limit: with
+# light-off unbounded (90 s more per restart) and update.sh reserving 390 s, it ended at 1770 s.
+slow=1 restart_seconds=$restart_worst paused_only='' update_with never-answers-then-idle
+elapsed=$(($(<"$work_dir/clock") - 1000))
+[[ $status -ne 0 && $out == *'version verification timed out; restored the previous binary'* ]] && cmp -s /bin/true "$work_dir/deploy/ghost-wispr" \
+  || { printf 'the delayed-idle case: exit %s, %s; want the rollback\n' "$status" "$out" >&2; exit 1; }
+((elapsed == 810 + 2 * restart_worst)) \
+  || { printf 'the delayed-idle case took %s s, want %s s: a step changed, so check this worst case again\n' "$elapsed" "$((810 + 2 * restart_worst))" >&2; exit 1; }
+((elapsed <= usable)) \
+  || { printf "the delayed-idle case, with %s s restarts, takes %s s, past the update unit's %s s limit less 60 s\n" "$restart_worst" "$elapsed" "$limit" >&2; exit 1; }
+script_restart=$(sed -n 's/^readonly .*RESTART_WORST=\([0-9][0-9]*\).*/\1/p' "$update_script")
+[[ $script_restart == "$restart_worst" ]] \
+  || { printf "update.sh's RESTART_WORST (%s s) is not the recorder unit's restart at its worst (%s s)\n" "$script_restart" "$restart_worst" >&2; exit 1; }
+
+# A rollback waits for a recorder whose state it cannot read only while that wait, the read after
+# it and a restart at the recorder's worst still end 60 s before the unit's limit; otherwise it
+# gives up at once, the new binary left running, and says why. With an instant restart it waits
+# twice (above). No real restart is slow enough to make it stop early, so these restarts take what
+# puts the clock where the guard binds: one that leaves room for one wait and not a second, and one
+# for none.
 out_of_time() {
   [[ $status -ne 0 && $out == *'its state could not be read'* && $out == *"before the update unit's $limit s limit"* && $out != *'restored the previous binary'* ]] \
     || { printf '%s: exit %s, %s; want a failure that leaves it running for lack of time\n' "$1" "$status" "$out" >&2; exit 1; }
@@ -349,19 +408,18 @@ out_of_time() {
     || { printf '%s: %s reads after waits %q; want %s reads after %q\n' "$1" "$(<"$work_dir/state/reads")" "$(<"$work_dir/sleep.log")" "$3" "$2" >&2; exit 1; }
   (($(<"$work_dir/clock") - 1000 <= usable)) || { printf '%s: ended at %s s, past %s\n' "$1" "$(($(<"$work_dir/clock") - 1000))" "$usable" >&2; exit 1; }
 }
-restart_seconds=$((usable - 580)) paused_only='' update_with unreadable
+restart_seconds=$((usable - script_restart - 190)) paused_only='' update_with unreadable
 out_of_time 'a slow restart, then no status' 'sleep 120' 2
-restart_seconds=$((usable - 500)) paused_only='' update_with unreadable
+restart_seconds=$((usable - script_restart - 100)) paused_only='' update_with unreadable
 out_of_time 'a slower restart, then no status' '' 1
 
 # Every step at its worst: each curl takes its whole --max-time (status 10 s, release 30 s, version
-# 10 s, download 300 s, checksum 60 s, status 10 s), the restart 390 s, the new binary never reports
-# its commit (the 120 s version wait), the rollback reads the status (10 s) and restarts (390 s):
-# 1330 s, which must end 60 s before the unit stops update.sh. Under the old 15 min limit it did
-# not, and systemd killed update.sh with the unverified binary in place. GPT-6.1 Sol's case at
-# 1db0cbc (each HTTP call just under its --max-time, a 365 s restart, version reads that time out)
-# is the second run: its rollback must start and end inside the limit too.
-for restart in 390 365; do
+# 10 s, download 300 s, checksum 60 s, status 10 s), the restart at the recorder's worst, the new
+# binary never reports its commit (the 120 s version wait), the rollback reads the status (10 s)
+# and restarts. Under the old 15 min limit it did not end in time, and systemd killed update.sh
+# with the unverified binary in place. GPT-6.1 Sol's case at 1db0cbc (each HTTP call just under
+# its --max-time, a 365 s restart, version reads that time out) is the second run.
+for restart in "$restart_worst" 365; do
   slow=1 restart_seconds=$restart paused_only='' update_with never-answers
   elapsed=$(($(<"$work_dir/clock") - 1000))
   [[ $status -ne 0 && $out == *'version verification timed out; restored the previous binary'* ]] && cmp -s /bin/true "$work_dir/deploy/ghost-wispr" \
@@ -401,4 +459,39 @@ cmp -s /bin/true "$work_dir/deploy/ghost-wispr.prev" \
   || { printf 'after an update killed after its swap, the next run kept the unverified binary as .prev: %s\n' "$out" >&2; exit 1; }
 [[ $status -ne 0 && $out == *'restored the previous binary'* && $out == *'not the binary verified last'* ]] && cmp -s /bin/true "$work_dir/deploy/ghost-wispr" \
   || { printf 'the rollback after an update killed after its swap did not restore the binary verified last: exit %s, %s\n' "$status" "$out" >&2; exit 1; }
+
+# The first run with no record of a verified binary records the installed binary only when it is
+# the image the recorder runs. An interrupted update can leave unverified B installed while A still
+# runs and answers /api/version (GPT-6.1 Sol's case at 25ff1c5): B must not be recorded, and a
+# later rollback must not restore it.
+a_image="$work_dir/a-binary"
+cp /bin/true "$a_image"
+rm -rf -- "$work_dir/state" "$work_dir/deploy/ghost-wispr.verified"
+mkdir -p "$work_dir/state"
+cp /bin/true "$work_dir/deploy/ghost-wispr.prev"
+cp "$new_source" "$work_dir/deploy/ghost-wispr" # B, installed and never verified
+running_image "$a_image"
+: >"$work_dir/systemctl.log"
+status=0
+out=$(TEST_BINARY_SOURCE="$broken_source" TEST_BINARY_CHECKSUM=$(sha256sum "$broken_source" | cut -d' ' -f1) \
+  run_update stopped-new 2>&1) || status=$?
+running_image "$work_dir/deploy/ghost-wispr"
+if [[ -f "$work_dir/deploy/ghost-wispr.verified" && $(<"$work_dir/deploy/ghost-wispr.verified") == "$new_checksum" ]]; then
+  printf 'the first run recorded installed B as verified while the recorder ran A: %s\n' "$out" >&2
+  exit 1
+fi
+cmp -s /bin/true "$work_dir/deploy/ghost-wispr.prev" \
+  || { printf 'with B installed and A running, .prev became B: %s\n' "$out" >&2; exit 1; }
+[[ $out == *'is not the image the recorder runs'* ]] \
+  || { printf 'the first run did not say why it recorded no verified binary: %s\n' "$out" >&2; exit 1; }
+# The same when the running image cannot be read (systemd reports no main process): no record.
+rm -rf -- "$work_dir/state" "$work_dir/deploy/ghost-wispr.verified"
+mkdir -p "$work_dir/state"
+cp /bin/true "$work_dir/deploy/ghost-wispr"
+: >"$work_dir/systemctl.log"
+status=0
+out=$(main_pid=0 TEST_BINARY_SOURCE="$broken_source" TEST_BINARY_CHECKSUM=$(sha256sum "$broken_source" | cut -d' ' -f1) \
+  run_update stopped-new 2>&1) || status=$?
+[[ ! -e "$work_dir/deploy/ghost-wispr.verified" && $out == *'is not the image the recorder runs (main process 0)'* ]] \
+  || { printf 'with no main process to read, the first run recorded a verified binary: %s\n' "$out" >&2; exit 1; }
 printf 'update tests passed\n'

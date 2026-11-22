@@ -9,6 +9,8 @@ readonly PREVIOUS_BINARY="$DEPLOY_DIR/ghost-wispr.prev"
 # that binary becomes the previous binary: an update killed after its swap (a power cut, or the
 # update unit's limit) leaves a binary nobody verified, which a later rollback must not restore.
 readonly VERIFIED="$DEPLOY_DIR/ghost-wispr.verified"
+# Where the running recorder's image is read (record_running); a test points it at a fake.
+readonly PROC_DIR="${GHOST_WISPR_PROC_DIR:-/proc}"
 readonly RELEASE_API="${GHOST_WISPR_RELEASE_API:-https://api.github.com/repos/sjawhar/ghost-wispr/releases/latest}"
 readonly STATUS_URL="${GHOST_WISPR_STATUS_URL:-http://127.0.0.1:8080/api/status}"
 readonly VERSION_URL="${GHOST_WISPR_VERSION_URL:-http://127.0.0.1:8080/api/version}"
@@ -19,17 +21,19 @@ readonly PAUSED_ONLY="${GHOST_WISPR_UPDATE_PAUSED_ONLY:-}"
 # seconds, as pi-when-idle.sh does, and at most ROLLBACK_READS times.
 readonly RECHECK_EVERY=120 ROLLBACK_READS=3
 # The update unit (ghost-wispr-update.service) ends this script UNIT_LIMIT seconds after its start
-# (TimeoutStartSec=30min; deploy/pi/update_test.sh checks the two agree). Every step at its worst
-# ends well inside it: 10 s status read, 30 s release lookup, 10 s version read, 300 + 60 s
-# download, 10 s status read, a 390 s restart (RESTART_WORST: the recorder unit's 90 s stop, the
-# user manager's DefaultTimeoutStopSec, and its TimeoutStartSec=5min start), the 120 s version wait
-# (its last read can start just before the end: 132 s), a 10 s status read and the rollback's 390 s
-# restart: about 1342 s. A rollback whose recorder's state it cannot read waits for another read
-# only while that wait (RECHECK_EVERY), the read (STATUS_READ, curl's --max-time) and a restart at
-# its worst still end MARGIN seconds before the limit; otherwise it gives up, the new binary left
-# running. With 15 min, as before, the steps alone could outlast the limit, and systemd killed
-# update.sh with the new binary in place and no rollback.
-readonly UNIT_LIMIT=1800 MARGIN=60 STATUS_READ=10 RESTART_WORST=390
+# (TimeoutStartSec=30min; deploy/pi/update_test.sh checks the two agree). A restart of the recorder
+# takes at most RESTART_WORST: its main process's stop (90 s, the user manager's
+# DefaultTimeoutStopSec), light-off after it (ExecStopPost, bounded at 15 s by `timeout`; unbounded,
+# it would add another 90 s), and its start (TimeoutStartSec=5min, its waits included);
+# update_test.sh checks this against the recorder unit. Every step at its worst ends well inside
+# the limit: 10 s status read, 30 s release lookup, 10 s version read, 300 + 60 s download, 10 s
+# status read, a restart, the 120 s version wait, a 10 s status read and the rollback's restart:
+# about 1360 s. A rollback whose recorder's state it cannot read waits for another read only while
+# that wait (RECHECK_EVERY), the read (STATUS_READ, curl's --max-time) and a restart at its worst
+# still end MARGIN seconds before the limit; otherwise it gives up, the new binary left running.
+# With 15 min, as before, the steps alone could outlast the limit, and systemd killed update.sh
+# with the new binary in place and no rollback.
+readonly UNIT_LIMIT=1800 MARGIN=60 STATUS_READ=10 RESTART_WORST=405
 STARTED=$(date +%s)
 readonly STARTED
 
@@ -45,6 +49,22 @@ record_verified() {
   sum=$(sha256sum "$BINARY" | cut -d' ' -f1)
   printf '%s\n' "$sum" >"$VERIFIED.tmp"
   mv -f "$VERIFIED.tmp" "$VERIFIED"
+}
+
+# record_running records the installed binary as verified only when it is the image the recorder
+# runs now (its main process's exe, by sha256), the process that answered its commit: an
+# interrupted update can leave an unverified binary installed while the old one still runs and
+# answers. Otherwise, or when the image cannot be read, it records nothing and says why, and
+# PREVIOUS_BINARY stays as it is (keep_previous).
+record_running() {
+  local pid running installed
+  pid=$(systemctl --user show -p MainPID --value ghost-wispr.service 2>/dev/null || true)
+  if [[ $pid =~ ^[1-9][0-9]*$ ]] && running=$(sha256sum <"$PROC_DIR/$pid/exe" 2>/dev/null) \
+    && installed=$(sha256sum <"$BINARY") && [[ ${running%% *} == "${installed%% *}" ]]; then
+    record_verified
+    return 0
+  fi
+  printf 'ghost-wispr update: %s is not the image the recorder runs (main process %s), or that image cannot be read, so no binary is recorded as verified\n' "$BINARY" "${pid:-unknown}"
 }
 
 # keep_previous copies the installed binary to PREVIOUS_BINARY, by a rename, only when it is the
@@ -156,13 +176,14 @@ checksum_url=$(jq -r '.assets[] | select(.name == "ghost-wispr-linux-arm64.sha25
 
 current_commit=$(curl --connect-timeout 5 --max-time 10 --fail --silent --show-error "$VERSION_URL" 2>/dev/null \
   | jq -r '.commit // empty' 2>/dev/null || true)
-# The first run of this update.sh finds no record: the binary that runs and answers its commit
-# now is the one verified last.
+# The first run of this update.sh finds no record, and a run on the release's commit repairs it:
+# the binary that runs and answers its commit now is the one verified last, when it is the installed
+# file (record_running).
 if [[ -n $current_commit && ! -f "$VERIFIED" ]]; then
-  record_verified
+  record_running
 fi
 if [[ "$current_commit" == "$release_commit" ]]; then
-  record_verified
+  record_running
   printf 'ghost-wispr update: already on commit %s\n' "$current_commit"
   exit 0
 fi

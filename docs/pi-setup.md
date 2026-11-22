@@ -763,17 +763,21 @@ GitHub release checksum, keeps `/opt/ghost-wispr/ghost-wispr.prev`, and restores
 new process or `/api/version` check fails. Only the binary it last saw answer its commit becomes
 `ghost-wispr.prev`: it records that binary's sha256 in `/opt/ghost-wispr/ghost-wispr.verified`, so
 an update cut off after its swap (a power cut, or the unit's limit) never makes an unverified
-binary the one a rollback restores. It restarts the recorder for that rollback only when
+binary the one a rollback restores. Its first run, with no record yet, records the installed binary
+only when it is the image the recorder's main process runs (by sha256); otherwise, or when that
+image cannot be read, it records none, keeps `ghost-wispr.prev` and says so. It restarts the
+recorder for that rollback only when
 the unit has stopped, or when `/api/status` answers that it may restart. When the new process
 answers that it records a session (or, paused-only, that it is not paused), it leaves it running
 and fails. When `/api/status` gives no status (no answer, or an answer that is not a status), the
 recorder may be recording: it reads the status again every 2 minutes, as `pi-when-idle.sh` does,
 rolls back after two readable reads that allow the restart, and after three reads with no such
 pair leaves the new binary running and fails, saying so. It waits for another read only while that
-wait, the read and a restart at its worst (the recorder unit's 90 s stop and 5 min start) still end
-a minute before the update unit's 30 min limit; otherwise it stops waiting, with the same result.
-It never restarts a recorder whose state it could not read. Every step at its worst, a rollback
-included, takes about 22 minutes, inside that limit.
+wait, the read and a restart at its worst still end a minute before the update unit's 30 min
+limit; otherwise it stops waiting, with the same result. A restart at its worst is the recorder
+unit's 90 s stop, `light-off` after it (bounded at 15 s: SIGTERM at 10 s, SIGKILL 5 s later) and
+its 5 min start. It never restarts a recorder whose state it could not read. Every step at its
+worst, a rollback included, takes about 23 minutes, inside that limit.
 
 Run an update manually:
 
@@ -883,8 +887,9 @@ again at its end. It stops at the first check that fails. Save no settings in th
    another commit's. It turns the nightly update off again, and keeps the Pi's binary, config, `.env`,
    `update.sh` and the commit it runs in `~/.local/share/ghost-wispr-rollback/<merge commit>` on
    the Pi, mode 0700 (a second run keeps the first copy). It installs the merge commit's
-   `update.sh` and `ghost-wispr-update.service` (its 30 min limit is the one `update.sh` plans
-   for; only the full provisioner installs either otherwise), reloads the user units, and runs
+   `update.sh`, `ghost-wispr-update.service` and `ghost-wispr.service` (their 30 min limit and
+   bounded `light-off` are what `update.sh` plans for; only the full provisioner installs them
+   otherwise), reloads the user units, and runs
    `update.sh` paused-only ("Update and inspect"), so a resume during the download leaves the
    binary in place; it must print `installed commit <merge commit>` or `already on commit <merge
    commit>`. Then, at once, it runs

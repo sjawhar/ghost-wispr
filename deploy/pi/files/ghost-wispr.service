@@ -14,7 +14,10 @@ ExecStartPre=/opt/ghost-wispr/wait-for-time-sync.sh
 ExecStart=/opt/ghost-wispr/ghost-wispr
 # Longer than both waits together; the user manager's default is 90 s.
 TimeoutStartSec=5min
-ExecStopPost=/opt/ghost-wispr/ghost-wispr light-off
+# Bounded, so a restart is bounded: light-off waits at most 2 s for the light's lock, and a light
+# that hangs gets SIGTERM at 10 s and SIGKILL 5 s later, not the stop's own 90 s on top of the
+# main process's (deploy/pi/update.sh's RESTART_WORST, which update_test.sh checks).
+ExecStopPost=/usr/bin/timeout -k 5s 10s /opt/ghost-wispr/ghost-wispr light-off
 EnvironmentFile=/opt/ghost-wispr/.env
 Restart=always
 RestartSec=10

@@ -24,7 +24,7 @@ mkdir -p "$tree/deploy/pi/files" "$deploy" "$pi/home" "$state" "$bin"
 
 # The checkout: rollout.sh and the template as they are, a fake update.sh and provision.sh.
 cp -- "$repo_root/deploy/pi/rollout.sh" "$tree/deploy/pi/"
-cp -- "$repo_root/deploy/pi/files/ghost-wispr.yaml" "$repo_root/deploy/pi/files/ghost-wispr-update.service" "$tree/deploy/pi/files/"
+cp -- "$repo_root/deploy/pi/files/ghost-wispr.yaml" "$repo_root/deploy/pi/files/ghost-wispr-update.service" "$repo_root/deploy/pi/files/ghost-wispr.service" "$tree/deploy/pi/files/"
 cat >"$tree/deploy/pi/update.sh" <<'EOF'
 #!/usr/bin/env bash
 # The fake update.sh: installs the fake Pi's latest release, as update.sh does. The rollout runs it
@@ -294,9 +294,12 @@ grep -qx 'echo old update.sh' "$kept/update.sh" || fail 'the kept update.sh is n
 [[ $(<"$kept/commit") == "$old" ]] || fail 'the kept commit is not the one the Pi ran'
 [[ $(stat -c %a "$kept") == 700 && $(stat -c %a "$kept/.env") == 600 ]] || fail 'the kept copy is readable by others'
 cmp -s "$deploy/update.sh" "$tree/deploy/pi/update.sh" || fail "install did not install the merge commit's update.sh"
-# update.sh's UNIT_LIMIT is the merge commit's unit's limit: the unit must reach the Pi with it.
-cmp -s "$pi/home/.config/systemd/user/ghost-wispr-update.service" "$tree/deploy/pi/files/ghost-wispr-update.service" \
-  || fail "install did not install the merge commit's ghost-wispr-update.service"
+# update.sh's UNIT_LIMIT is the merge commit's update unit's limit, and its RESTART_WORST the merge
+# commit's recorder unit's restart: both units must reach the Pi with it.
+for unit in ghost-wispr-update.service ghost-wispr.service; do
+  cmp -s "$pi/home/.config/systemd/user/$unit" "$tree/deploy/pi/files/$unit" \
+    || fail "install did not install the merge commit's $unit"
+done
 reload=$(line 'systemctl daemon-reload')
 ((reload > 0 && reload < $(line update.sh))) || fail "install did not reload the user units before update.sh: $(<"$state/events")"
 grep -qx "commit $merge" "$deploy/ghost-wispr" || fail 'install did not install the release'

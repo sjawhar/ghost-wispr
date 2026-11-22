@@ -214,15 +214,19 @@ step_install() {
   [[ $(pi "sha256sum <$(printf %q "$DEPLOY_DIR/update.sh")") == "$(sha256sum <"$repo_root/deploy/pi/update.sh")" ]] \
     || fail 'the update.sh on the Pi is not the merge commit'\''s'
   log "installed the merge commit's update.sh"
-  # Its update unit too: update.sh's UNIT_LIMIT is this unit's TimeoutStartSec, and only the full
-  # provisioner installs the unit otherwise. A rollback keeps it; the longer limit only gives the
-  # old update.sh more room.
-  pi_in "set -e; d=\$HOME/.config/systemd/user; mkdir -p \"\$d\"; cat >\"\$d/ghost-wispr-update.service.new\"; chmod 0644 \"\$d/ghost-wispr-update.service.new\"; mv -f \"\$d/ghost-wispr-update.service.new\" \"\$d/ghost-wispr-update.service\"" \
-    <"$repo_root/deploy/pi/files/ghost-wispr-update.service" || fail 'could not install the merge commit'\''s ghost-wispr-update.service'
-  [[ $(pi "sha256sum <\$HOME/.config/systemd/user/ghost-wispr-update.service") == "$(sha256sum <"$repo_root/deploy/pi/files/ghost-wispr-update.service")" ]] \
-    || fail 'the ghost-wispr-update.service on the Pi is not the merge commit'\''s'
+  # Its units too: update.sh's UNIT_LIMIT is the update unit's TimeoutStartSec, and its
+  # RESTART_WORST the recorder unit's restart at its worst (light-off bounded), and only the full
+  # provisioner installs the units otherwise. A rollback keeps them: the old update.sh only gets
+  # more room, and the old binary runs light-off as the new one does.
+  local unit
+  for unit in ghost-wispr-update.service ghost-wispr.service; do
+    pi_in "set -e; d=\$HOME/.config/systemd/user; mkdir -p \"\$d\"; cat >\"\$d/$unit.new\"; chmod 0644 \"\$d/$unit.new\"; mv -f \"\$d/$unit.new\" \"\$d/$unit\"" \
+      <"$repo_root/deploy/pi/files/$unit" || fail "could not install the merge commit's $unit"
+    [[ $(pi "sha256sum <\$HOME/.config/systemd/user/$unit") == "$(sha256sum <"$repo_root/deploy/pi/files/$unit")" ]] \
+      || fail "the $unit on the Pi is not the merge commit's"
+  done
   pi "${USER_SYSTEMD}systemctl --user daemon-reload" || fail 'could not reload the user units on the Pi'
-  log "installed the merge commit's ghost-wispr-update.service"
+  log "installed the merge commit's ghost-wispr-update.service and ghost-wispr.service"
 
   require_idle
   # Paused-only: update.sh checks again just before the swap and before a rollback's restart, so a
