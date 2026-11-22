@@ -188,6 +188,9 @@ func TestTheEndOfSpeechNamesTheSessionItsSpeechWasIn(t *testing.T) {
 		r.heard("Wispr, what is happening?", false, false) // answered on the turn wait
 		first := r.waitSession()
 		r.waitTurn()
+		// Both facts are written before the speech plays out: a fact written
+		// after it would start a speech that never ends here.
+		waitSaid(t, first)
 		waitSaid(t, first)
 		r.waitSpeaking()
 		r.speaker.finish(audio.InputVoice)
@@ -309,10 +312,13 @@ func TestTheExchangeTakesTheSessionThatStartedAfterItOpened(t *testing.T) {
 		r.setSession("")
 		r.heard("Wispr,", false, false)
 		r.waitSession()
-		eventually(t, "the wake's held lines", func() bool {
+		// The wake sound reports its first frame from its own goroutine: wait
+		// until that line is held too, so no line comes later and binds the
+		// exchange before the test's hooks do.
+		eventually(t, "the wake's held lines, its sound's first frame included", func() bool {
 			r.s.mu.Lock()
 			defer r.s.mu.Unlock()
-			return r.s.ex != nil && len(r.s.ex.unsent) > 0
+			return r.s.ex != nil && slices.ContainsFunc(r.s.ex.unsent, func(e timingEvent) bool { return e.event == "wake_chime_queued" })
 		})
 		return r, func() []string {
 			mu.Lock()

@@ -289,24 +289,55 @@ func TestStalledDeepgramSocketsDoNotPileUp(t *testing.T) {
 	}
 }
 
-// establishedTo counts this host's established TCP connections to local port
-// port, from the client side, read from /proc/net/tcp.
+// establishedTo counts this host's established TCP connections to the
+// loopback peer at 127.0.0.1:port, from the client side, read from
+// /proc/net/tcp. Only that address counts: a connection of another process
+// on the host to the same port of another address is not the rig's.
 func establishedTo(t *testing.T, port int) int {
 	t.Helper()
 	data, err := os.ReadFile("/proc/net/tcp")
 	if err != nil {
 		t.Skipf("no /proc/net/tcp to count sockets: %v", err)
 	}
-	want := fmt.Sprintf(":%04X", port)
+	want := fmt.Sprintf("0100007F:%04X", port) // 127.0.0.1, as /proc/net/tcp writes it
 	count := 0
 	for _, line := range strings.Split(string(data), "\n")[1:] {
 		fields := strings.Fields(line)
 		// fields: sl local_address rem_address st ...; 01 is ESTABLISHED.
-		if len(fields) > 3 && strings.HasSuffix(fields[2], want) && fields[3] == "01" {
+		if len(fields) > 3 && fields[2] == want && fields[3] == "01" {
 			count++
 		}
 	}
 	return count
+}
+
+// TestEstablishedToCountsOnlyTheLoopbackPeer fails if establishedTo counts a
+// connection to the peer's port on another address, as another process on a
+// shared host can hold: the stall test then reads more sockets to its peer
+// than it has. A peer on 127.0.0.2, the same port, stands in for it.
+func TestEstablishedToCountsOnlyTheLoopbackPeer(t *testing.T) {
+	peer, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = peer.Close() })
+	port := peer.Addr().(*net.TCPAddr).Port
+	other, err := net.Listen("tcp", fmt.Sprintf("127.0.0.2:%d", port))
+	if err != nil {
+		t.Skipf("no second loopback address to hold the same port: %v", err)
+	}
+	t.Cleanup(func() { _ = other.Close() })
+	for _, addr := range []string{peer.Addr().String(), other.Addr().String()} {
+		c, err := net.Dial("tcp", addr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = c.Close() })
+	}
+	waitForHardwareWithin(t, time.Second, "the connection to the peer", func() bool { return establishedTo(t, port) >= 1 })
+	if n := establishedTo(t, port); n != 1 {
+		t.Errorf("establishedTo(%d) = %d, want 1: only the connection to 127.0.0.1", port, n)
+	}
 }
 
 // TestLightGoesOffWhenNoAudioIsRecorded fails if the light stays red, or the
