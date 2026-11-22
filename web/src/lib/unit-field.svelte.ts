@@ -27,6 +27,11 @@ export interface UnitField<T> {
   // person typed stays) nor what the field shows, spaces around text aside.
   // Without from (a server older than it), the config's value stands in.
   propose(next: T, from?: T): void
+  // A proposal's value was kept out because the person had edited the field:
+  // it was the value the proposal started from, and the field shows the
+  // person's typing instead. Until the person's next input, the next
+  // proposal, or the end of the edit.
+  readonly kept: boolean
   // A config the page took replaced the person's edit with a value other than
   // what they typed; until the person's next input in the field.
   readonly replaced: boolean
@@ -49,6 +54,7 @@ export function unitField<T>(read: () => T, taken: () => unknown): UnitField<T> 
   let value = $derived(unit)
   let edited = $state(false)
   let replaced = $state(false)
+  let kept = $state(false)
   // What the field showed when the person began the edit, and what they last
   // typed.
   let before: T | undefined
@@ -82,6 +88,7 @@ export function unitField<T>(read: () => T, taken: () => unknown): UnitField<T> 
       }
       if (!sameEntry(incoming, typed)) replaced = true
       edited = false
+      kept = false
       value = incoming
     })
   })
@@ -92,6 +99,7 @@ export function unitField<T>(read: () => T, taken: () => unknown): UnitField<T> 
     typed = next
     edited = true
     replaced = false
+    kept = false
   }
 
   return {
@@ -104,17 +112,24 @@ export function unitField<T>(read: () => T, taken: () => unknown): UnitField<T> 
     },
     propose(next: T, from?: T) {
       const unchanged = from === undefined ? unit : from
-      if (sameEntry(next, unchanged) || sameEntry(next, value)) return
+      if (sameEntry(next, unchanged) || sameEntry(next, value)) {
+        kept = edited && sameEntry(next, unchanged) && !sameEntry(next, value)
+        return
+      }
       change(next)
     },
     get edited() {
       return edited
+    },
+    get kept() {
+      return kept
     },
     get replaced() {
       return replaced
     },
     acknowledge(take: ConfigTake) {
       edited = false
+      kept = false
       if (take === 'older') {
         void value
         value = unit
@@ -123,6 +138,7 @@ export function unitField<T>(read: () => T, taken: () => unknown): UnitField<T> 
     reset() {
       edited = false
       replaced = false
+      kept = false
       void value
       value = unit
     },

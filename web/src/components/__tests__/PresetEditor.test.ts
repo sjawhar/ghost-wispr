@@ -563,6 +563,11 @@ describe('PresetEditor', () => {
 
     await refine()
     expect(field('Description').value).toBe('Mine')
+    // The refinement's text for the description was kept out: the field says
+    // so, and the fields it changed say nothing.
+    const kept = "The refinement's text for this field was not applied, because you had edited it."
+    expect(field('Description').closest('.field')?.textContent).toContain(kept)
+    expect(screen.getAllByText(kept)).toHaveLength(1)
     await fireEvent.click(screen.getByRole('button', { name: 'Save' }))
 
     await waitFor(() =>
@@ -575,6 +580,103 @@ describe('PresetEditor', () => {
           },
         },
       ]),
+    )
+  })
+
+  it('says nothing about kept text once the person types in the field again', async () => {
+    stubRefine({
+      description: 'Daily standup notes',
+      system_prompt: 'More concise system prompt',
+      user_template: '{{transcript}}',
+    })
+    await expandStandup()
+    await fireEvent.input(field('Description'), { target: { value: 'Mine' } })
+    await refine()
+    const kept = "The refinement's text for this field was not applied, because you had edited it."
+    expect(screen.getByText(kept)).toBeTruthy()
+
+    await fireEvent.input(field('Description'), { target: { value: 'Mine, again' } })
+
+    expect(screen.queryByText(kept)).toBeNull()
+  })
+
+  // A refinement that changed a field the person had typed in replaces the
+  // typing: nothing was kept out, and no note shows.
+  it('says nothing when a refinement changed a field the person had typed in', async () => {
+    stubRefine({
+      description: 'Refined description',
+      system_prompt: 'Summarize the standup.',
+      user_template: '{{transcript}}',
+    })
+    await expandStandup()
+    await fireEvent.input(field('Description'), { target: { value: 'Mine' } })
+
+    await refine()
+
+    expect(field('Description').value).toBe('Refined description')
+    expect(
+      screen.queryByText(
+        "The refinement's text for this field was not applied, because you had edited it.",
+      ),
+    ).toBeNull()
+  })
+
+  // Cancel abandons a refinement on its way: its answer changes nothing.
+  it('drops the answer of a refinement the person cancelled', async () => {
+    let answer: (response: Response) => void = () => {}
+    vi.stubGlobal(
+      'fetch',
+      vi.fn((input: RequestInfo | URL) =>
+        String(input) === '/api/config/presets/refine'
+          ? new Promise<Response>((resolve) => (answer = resolve))
+          : Promise.resolve(new Response('[]')),
+      ),
+    )
+    await expandStandup()
+    await fireEvent.click(screen.getByRole('button', { name: 'Refine' }))
+    await fireEvent.input(field('What would you like to change?'), {
+      target: { value: 'Shorter, please.' },
+    })
+    await fireEvent.click(screen.getByRole('button', { name: 'Refine with LLM' }))
+    expect((screen.getByRole('button', { name: 'Save' }) as HTMLButtonElement).disabled).toBe(true)
+
+    await fireEvent.click(screen.getByRole('button', { name: 'Cancel' }))
+    expect((screen.getByRole('button', { name: 'Save' }) as HTMLButtonElement).disabled).toBe(false)
+    answer(
+      new Response(
+        JSON.stringify({
+          description: 'Refined description',
+          system_prompt: 'Refined prompt',
+          user_template: '{{transcript}}',
+          model: '',
+          from: presets.standup,
+        }),
+      ),
+    )
+    await new Promise((resolve) => setTimeout(resolve, 0))
+
+    expect(field('Description').value).toBe('Daily standup notes')
+    expect(field('System Prompt').value).toBe('Summarize the standup.')
+    expect(screen.queryByText('Refined! Review the changes and Save.')).toBeNull()
+    await fireEvent.click(screen.getByRole('button', { name: 'Save' }))
+    expect(await screen.findByText('No changes to save.')).toBeTruthy()
+  })
+
+  it('sends an edited model override, and only that', async () => {
+    const fetch = stubFetch()
+    await expandStandup()
+
+    await fireEvent.input(field('Model Override (optional)'), {
+      target: { value: 'vertex/gemini-4-carbon' },
+    })
+    await fireEvent.click(screen.getByRole('button', { name: 'Save' }))
+
+    await waitFor(() =>
+      expect(
+        sent(fetch)
+          .filter((r) => r.method === 'PATCH')
+          .map((r) => r.body),
+      ).toEqual([{ summarization: { presets: { standup: { model: 'vertex/gemini-4-carbon' } } } }]),
     )
   })
 

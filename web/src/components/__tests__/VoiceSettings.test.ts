@@ -463,7 +463,8 @@ describe('SettingsPage', () => {
   // A fake unit for SettingsPage: a GET answers with the state the unit holds
   // now (`unit.current`), or, by `unit.readMode`, waits until the test answers
   // it, fails on the network, or answers 500; each PATCH waits until the test
-  // answers it, and its body is kept in `unit.bodies`.
+  // answers it, and its body is kept in `unit.bodies`; each refinement waits
+  // until the test answers it (`unit.refines`).
   function fakeUnit(start: ConfigResponse) {
     const unit = {
       current: start,
@@ -472,12 +473,18 @@ describe('SettingsPage', () => {
       reads: 0,
       readMode: 'answer' as 'answer' | 'hold' | 'network' | 'http500',
       held: [] as (() => void)[],
+      refines: [] as ((answer: unknown) => void)[],
     }
     vi.stubGlobal(
       'fetch',
       vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
         if (String(input).startsWith('/api/providers')) {
           return Promise.resolve(new Response(JSON.stringify({ providers: [] })))
+        }
+        if (String(input) === '/api/config/presets/refine') {
+          return new Promise<Response>((resolve) =>
+            unit.refines.push((answer) => resolve(new Response(JSON.stringify(answer)))),
+          )
         }
         if (init?.method === 'PATCH') {
           unit.bodies.push(JSON.parse(String(init.body)))
@@ -935,5 +942,64 @@ describe('SettingsPage', () => {
     expect(voice.value).toBe('Kore')
     await fireEvent.click(within(voiceSection).getByRole('button', { name: 'Save' }))
     expect(await within(voiceSection).findByText('No changes to save.')).toBeTruthy()
+  })
+
+  // Sol's round-10 case: standup is open at A/9 with description Original; a
+  // voice save of Puck is held. A refinement starts from that preset. Another
+  // tab sets the description Elsewhere at A/10, the voice save lands at A/11,
+  // and the page shows Elsewhere while the refinement waits. The refinement
+  // returns Original unchanged and a new prompt: the field stays Elsewhere,
+  // and Save sends only the prompt.
+  it('keeps a newer description when a refinement that started before it lands', async () => {
+    const standup = {
+      description: 'Original',
+      system_prompt: 'Summarize the standup.',
+      user_template: '{{transcript}}',
+      model: '',
+    }
+    const withStandup = (preset: typeof standup) => ({
+      ...config,
+      summarization: { ...config.summarization, presets: { standup: preset } },
+    })
+    const unit = fakeUnit({ ...withStandup(standup), revision: { run: 'run-A', count: 9 } })
+    render(SettingsPage, { onBack: () => {} })
+    const editor = await screen.findByTestId('preset-editor')
+    const voiceSection = screen.getByTestId('voice-settings')
+    await fireEvent.click(within(editor).getByRole('button', { name: /standup/ }))
+    const description = within(editor).getByLabelText('Description') as HTMLInputElement
+
+    await fireEvent.input(within(voiceSection).getByLabelText('Text-to-speech voice'), {
+      target: { value: 'Puck' },
+    })
+    await fireEvent.click(within(voiceSection).getByRole('button', { name: 'Save' }))
+    await fireEvent.click(within(editor).getByRole('button', { name: 'Refine' }))
+    await fireEvent.input(screen.getByLabelText('What would you like to change?'), {
+      target: { value: 'A more concise system prompt.' },
+    })
+    await fireEvent.click(screen.getByRole('button', { name: 'Refine with LLM' }))
+    expect(unit.refines).toHaveLength(1)
+
+    unit.patches[0]({
+      ...withStandup({ ...standup, description: 'Elsewhere' }),
+      tts: { ...config.tts, voice: 'Puck' },
+      revision: { run: 'run-A', count: 11 },
+    })
+    expect(await within(voiceSection).findByText('Saved!')).toBeTruthy()
+    expect(description.value).toBe('Elsewhere')
+    unit.refines[0]({
+      description: 'Original',
+      system_prompt: 'More concise system prompt',
+      user_template: '{{transcript}}',
+      model: '',
+      from: standup,
+    })
+    expect(await within(editor).findByText('Refined! Review the changes and Save.')).toBeTruthy()
+
+    expect(description.value).toBe('Elsewhere')
+    await fireEvent.click(within(editor).getByRole('button', { name: 'Save' }))
+    await waitFor(() => expect(unit.bodies).toHaveLength(2))
+    expect(unit.bodies[1]).toEqual({
+      summarization: { presets: { standup: { system_prompt: 'More concise system prompt' } } },
+    })
   })
 })

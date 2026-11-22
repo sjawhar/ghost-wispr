@@ -11,6 +11,7 @@
   import { fetchDates, fetchSessions, fetchSession } from '../lib/api'
   import { setConfig } from '../lib/config.svelte'
   import { unitField, type UnitField } from '../lib/unit-field.svelte'
+  import KeptNote from './KeptNote.svelte'
   import ReplacedNote from './ReplacedNote.svelte'
 
   let {
@@ -74,6 +75,10 @@
   let refiningPreset = $state('')
   let refineFeedback = $state('')
   let refineRunning = $state(false)
+  // refineRuns counts the refinements started and the Refine dialogs opened or
+  // closed, so an answer applies only to the refinement still waiting in its
+  // dialog: one the person cancelled, or a dialog opened again, is over.
+  let refineRuns = 0
 
   // Whether the press that a click on a dialog's overlay ends began on the
   // overlay too: a press inside the dialog, such as one that selects text,
@@ -244,19 +249,31 @@
   }
 
   function openRefine(name: string): void {
+    refineRuns++
     refiningPreset = name
     refineFeedback = ''
   }
 
+  // Cancel, or a click outside the dialog: a refinement still on its way is
+  // abandoned, and its answer changes nothing.
+  function closeRefine(): void {
+    refineRuns++
+    refiningPreset = ''
+    refineRunning = false
+  }
+
   async function runRefine(): Promise<void> {
     if (!refineFeedback.trim()) return
+    const run = ++refineRuns
+    const name = refiningPreset
     refineRunning = true
     feedback = ''
     try {
-      const result = await refinePreset(refiningPreset, refineFeedback.trim())
+      const result = await refinePreset(name, refineFeedback.trim())
+      if (run !== refineRuns) return
       // The refinement starts from the preset as the unit held it (from): a
       // field it returns as it was there is no edit, and what the person typed
-      // there stays.
+      // there stays, with a note saying the refinement's text was kept out.
       const from = result.from
       fields.description.propose(result.description, from?.description)
       fields.system_prompt.propose(result.system_prompt, from?.system_prompt)
@@ -264,9 +281,10 @@
       refiningPreset = ''
       feedback = 'Refined! Review the changes and Save.'
     } catch (error) {
+      if (run !== refineRuns) return
       feedback = error instanceof Error ? error.message : 'Refine failed'
     } finally {
-      refineRunning = false
+      if (run === refineRuns) refineRunning = false
     }
   }
 
@@ -368,6 +386,7 @@
               disabled={saving}
             />
             <ReplacedNote shown={fields.description.replaced} />
+            <KeptNote shown={fields.description.kept} />
           </div>
           <div class="field">
             <label for="preset-system-prompt">System Prompt</label>
@@ -378,6 +397,7 @@
               disabled={saving}
             ></textarea>
             <ReplacedNote shown={fields.system_prompt.replaced} />
+            <KeptNote shown={fields.system_prompt.kept} />
           </div>
           <div class="field">
             <label for="preset-user-template">User Template</label>
@@ -388,6 +408,7 @@
               disabled={saving}
             ></textarea>
             <ReplacedNote shown={fields.user_template.replaced} />
+            <KeptNote shown={fields.user_template.kept} />
             <span class="hint">Use {'{{transcript}}'} as placeholder</span>
           </div>
           <div class="field">
@@ -402,7 +423,12 @@
             <ReplacedNote shown={fields.model.replaced} />
           </div>
           <div class="form-actions">
-            <button class="save-btn" type="button" onclick={save} disabled={saving}>
+            <button
+              class="save-btn"
+              type="button"
+              onclick={save}
+              disabled={saving || refineRunning}
+            >
               {saving ? 'Saving...' : 'Save'}
             </button>
             <button class="test-btn" type="button" onclick={() => openTest(name)}> Test </button>
@@ -641,7 +667,7 @@
       }}
       onclick={(e) => {
         if (overlayPressed && e.target === e.currentTarget) {
-          refiningPreset = ''
+          closeRefine()
         }
       }}
       role="presentation"
@@ -666,15 +692,7 @@
           >
             {refineRunning ? 'Refining...' : 'Refine with LLM'}
           </button>
-          <button
-            class="cancel-btn"
-            type="button"
-            onclick={() => {
-              refiningPreset = ''
-            }}
-          >
-            Cancel
-          </button>
+          <button class="cancel-btn" type="button" onclick={closeRefine}> Cancel </button>
         </div>
       </div>
     </div>

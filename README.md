@@ -345,7 +345,9 @@ began with a key a save has since replaced is not kept as the provider's last ch
   Integrations and an open preset send each field the person changed since a save of it last
   succeeded. A preset's Refine changes a field only where its output differs from the preset it
   started from, which `POST /api/config/presets/refine` answers as `from` (the preset as the unit
-  held it); a field it returns unchanged keeps what was typed there and is not sent for it. A
+  held it); a field it returns unchanged keeps what was typed there, is not sent for it, and says
+  "The refinement's text for this field was not applied, because you had edited it." Cancel drops a
+  refinement still on its way, and Save waits while one runs. A
   field nobody is typing in shows the config the page last took. A config with another value for a
   field being typed in ends that edit for good; the field shows the new value and says "Changed on
   the unit or in another tab; your edit was replaced." until the next input in it.

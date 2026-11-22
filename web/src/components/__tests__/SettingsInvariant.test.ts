@@ -8,41 +8,55 @@ import { unitConfig } from './configFixture'
 
 // The settings page's field invariant, checked over random sequences of
 // typing, saves (some failing), answers in any order, re-reads, restarts,
-// changes in another tab, refinements of the open preset, Discard, and
-// switching to another preset and back. For five fields (General's silence
-// timeout, the meeting voice, and the open preset's description, system prompt
-// and user template), after every step:
+// changes in another tab, refinements of the open preset (answered after any
+// number of other steps, or cancelled), Discard, and switching to another
+// preset and back. For six fields (General's silence timeout, the meeting
+// voice, and the open preset's description, system prompt, user template and
+// model override), after every step:
 // - a field the person is not editing shows the config the page last took,
 //   with one exception: a field still showing the person's typing when its
 //   save's answer comes from another run of the unit (so the page reads the
 //   config again instead of taking the answer) keeps showing what it showed,
 //   the value saved, until the page takes a config;
 // - a field the person is editing shows what they typed or what a refinement
-//   proposed; a refinement proposes a field only where its output differs both
-//   from the preset it started from as the unit held it (from; a field it did
-//   not change), or the config's value if the answer names none, and from what
-//   the field shows;
+//   proposed. When a refinement's answer lands, it proposes a field only where
+//   its output differs both from the preset it started from as the unit held
+//   it (from; a field it did not change), or the config's value if the answer
+//   names none, and from what the field shows. Where it did not change a field
+//   the person is editing, and the field shows other text, the field says
+//   "The refinement's text for this field was not applied, because you had
+//   edited it." until the next input there, the next refinement, or the end of
+//   the edit; no other step shows that note;
 // - a config whose value for the field is neither what the field showed when
 //   the editing began nor what was typed ends the edit, and the field says
 //   "Changed on the unit or in another tab; your edit was replaced." until the
 //   next input there; no other step shows that note;
 // - a save sends exactly the fields of its section being edited: the whole
-//   request body is compared, so a field sent without an edit fails.
+//   request body is compared, so a field sent without an edit, or an edited
+//   field left out, fails;
+// - the Refine dialog is open exactly while a refinement the person has not
+//   cancelled waits; a cancelled refinement's answer changes nothing.
+// While the Refine dialog is open, its overlay covers the page: the person can
+// only cancel, and the unit's answers, restarts and other tabs go on.
 // The unit applies a save when its request arrives or when its answer is
 // released, and answers each request in any order. A failed save is a 500 for
 // a request the unit had not applied. Failed reads are covered on their own.
 
 const NOTE = 'Changed on the unit or in another tab; your edit was replaced.'
-type Field = 'silence' | 'voice' | 'description' | 'prompt' | 'template'
+const KEPT = "The refinement's text for this field was not applied, because you had edited it."
+type Field = 'silence' | 'voice' | 'description' | 'prompt' | 'template' | 'model'
 type Section = 'general' | 'voice' | 'preset'
-const FIELDS: Field[] = ['silence', 'voice', 'description', 'prompt', 'template']
-const PRESET_FIELDS: Field[] = ['description', 'prompt', 'template']
+const FIELDS: Field[] = ['silence', 'voice', 'description', 'prompt', 'template', 'model']
+// The open preset's fields, and those a refinement proposes.
+const PRESET_FIELDS: Field[] = ['description', 'prompt', 'template', 'model']
+const REFINED_FIELDS: Field[] = ['description', 'prompt', 'template']
 const SECTION: Record<Field, Section> = {
   silence: 'general',
   voice: 'voice',
   description: 'preset',
   prompt: 'preset',
   template: 'preset',
+  model: 'preset',
 }
 const LABEL: Record<Field, string> = {
   silence: 'Silence Timeout',
@@ -50,6 +64,7 @@ const LABEL: Record<Field, string> = {
   description: 'Description',
   prompt: 'System Prompt',
   template: 'User Template',
+  model: 'Model Override (optional)',
 }
 const POOL: Record<Field, string[]> = {
   silence: ['30s', '45s', '60s'],
@@ -57,6 +72,7 @@ const POOL: Record<Field, string[]> = {
   description: ['Original', 'Draft', 'Elsewhere'],
   prompt: ['Summarize the standup.', 'Be brief.', 'List action items.'],
   template: ['{{transcript}}', 'Notes: {{transcript}}', 'Meeting: {{transcript}}'],
+  model: ['', 'openai/gpt-4o-mini', 'vertex/gemini-4-carbon'],
 }
 
 // mulberry32: a small seeded generator, so a failing sequence can be replayed.
@@ -81,7 +97,12 @@ type Body = {
   tts?: { voice?: string }
   summarization?: {
     presets?: {
-      standup?: { description?: string; system_prompt?: string; user_template?: string }
+      standup?: {
+        description?: string
+        system_prompt?: string
+        user_template?: string
+        model?: string
+      }
     }
   }
 }
@@ -94,6 +115,7 @@ function carriedBy(body: Body): Partial<Record<Field, string>> {
   if (preset?.description !== undefined) carried.description = preset.description
   if (preset?.system_prompt !== undefined) carried.prompt = preset.system_prompt
   if (preset?.user_template !== undefined) carried.template = preset.user_template
+  if (preset?.model !== undefined) carried.model = preset.model
   return carried
 }
 
@@ -106,6 +128,7 @@ function bodyFor(section: Section, edited: Partial<Record<Field, string>>): Body
   if (edited.description !== undefined) standup.description = edited.description
   if (edited.prompt !== undefined) standup.system_prompt = edited.prompt
   if (edited.template !== undefined) standup.user_template = edited.template
+  if (edited.model !== undefined) standup.model = edited.model
   return { summarization: { presets: { standup } } }
 }
 
@@ -115,13 +138,23 @@ function valueIn(config: ConfigResponse, field: Field): string {
   const standup = config.summarization.presets.standup
   if (field === 'description') return standup.description
   if (field === 'prompt') return standup.system_prompt
-  return standup.user_template
+  if (field === 'template') return standup.user_template
+  return standup.model
+}
+
+type RefineAnswer = {
+  description: string
+  system_prompt: string
+  user_template: string
+  model: string
+  from?: { description: string; system_prompt: string; user_template: string; model: string }
 }
 
 type Pending = {
-  kind: 'get' | 'patch'
+  kind: 'get' | 'patch' | 'refine'
   body?: Body
   answer?: ConfigResponse
+  refine?: RefineAnswer
   // The preset save's form: the switches made before it was sent.
   switches?: number
   resolve: (response: Response) => void
@@ -137,11 +170,14 @@ class FakeUnit {
     description: 'Original',
     prompt: 'Summarize the standup.',
     template: '{{transcript}}',
+    model: '',
   }
   pending: Pending[] = []
   sent: Body[] = []
   holding = false
-  refineAnswer: Record<string, unknown> = {}
+  // The next refinement's output, and whether its answer names from.
+  refineOutput = { description: '', system_prompt: '', user_template: '' }
+  refineWithFrom = true
 
   constructor(private random: () => number) {}
 
@@ -158,7 +194,7 @@ class FakeUnit {
             description: this.values.description,
             system_prompt: this.values.prompt,
             user_template: this.values.template,
-            model: '',
+            model: this.values.model,
           },
           retro: {
             description: 'Retro notes',
@@ -185,7 +221,23 @@ class FakeUnit {
       return Promise.resolve(new Response(JSON.stringify({ providers: [] })))
     }
     if (url === '/api/config/presets/refine') {
-      return Promise.resolve(new Response(JSON.stringify(this.refineAnswer)))
+      // As the handler does: one read of the preset as the unit holds it on
+      // arrival, fed to the model and answered as from.
+      const refine: RefineAnswer = {
+        ...this.refineOutput,
+        model: '',
+        ...(this.refineWithFrom
+          ? {
+              from: {
+                description: this.values.description,
+                system_prompt: this.values.prompt,
+                user_template: this.values.template,
+                model: this.values.model,
+              },
+            }
+          : {}),
+      }
+      return new Promise((resolve) => this.pending.push({ kind: 'refine', refine, resolve }))
     }
     if (!url.startsWith('/api/config')) {
       return Promise.resolve(new Response('{}'))
@@ -208,6 +260,10 @@ class FakeUnit {
 
   release(index: number): Pending {
     const [entry] = this.pending.splice(index, 1)
+    if (entry.kind === 'refine') {
+      entry.resolve(new Response(JSON.stringify(entry.refine)))
+      return entry
+    }
     if (!entry.answer) {
       if (entry.body) this.apply(entry.body)
       entry.answer = this.snapshot()
@@ -239,6 +295,7 @@ type Model = {
   // What a save a new run answered sent, shown until the next config take.
   sentShown: string | null
   note: boolean
+  kept: boolean
 }
 
 async function runSequence(seed: number, steps: number): Promise<void> {
@@ -264,23 +321,24 @@ async function runSequence(seed: number, steps: number): Promise<void> {
     within(sections.preset()).getByRole('button', { name }) as HTMLButtonElement
   const saveButton = (section: Section) =>
     sections[section]().querySelector('.save-btn') as HTMLButtonElement
-  const noteShown = (field: Field) =>
-    (input(field).closest('.field')?.textContent ?? '').includes(NOTE)
+  const fieldText = (field: Field) => input(field).closest('.field')?.textContent ?? ''
 
   const model = Object.fromEntries(
     FIELDS.map((field) => [
       field,
-      { editing: false, typed: '', before: '', sentShown: null, note: false } as Model,
+      { editing: false, typed: '', before: '', sentShown: null, note: false, kept: false } as Model,
     ]),
   ) as Record<Field, Model>
   let switches = 0
+  // The refinement waiting in the open Refine dialog, if any.
+  let liveRefine: Pending | null = null
   const log: string[] = []
   const fail = (what: string, step: number) =>
     `seed ${seed}, step ${step}: ${what}\n${log.join('\n')}`
 
   const startOver = () => {
     for (const field of PRESET_FIELDS) {
-      Object.assign(model[field], { editing: false, sentShown: null, note: false })
+      Object.assign(model[field], { editing: false, sentShown: null, note: false, kept: false })
     }
   }
   const edit = (field: Field, value: string, shown: string) => {
@@ -290,13 +348,20 @@ async function runSequence(seed: number, steps: number): Promise<void> {
     m.typed = value
     m.sentShown = null
     m.note = false
+    m.kept = false
   }
 
   const check = (step: number) => {
     const taken = configState.config as ConfigResponse
+    expect(screen.queryByRole('dialog') !== null, fail('the Refine dialog is open', step)).toBe(
+      liveRefine !== null,
+    )
     for (const field of FIELDS) {
       const m = model[field]
-      expect(noteShown(field), fail(`the note next to ${field}`, step)).toBe(m.note)
+      expect(fieldText(field).includes(NOTE), fail(`the note next to ${field}`, step)).toBe(m.note)
+      expect(fieldText(field).includes(KEPT), fail(`the kept note next to ${field}`, step)).toBe(
+        m.kept,
+      )
       const shown = input(field).value
       if (m.editing) expect(shown, fail(`${field} shows the typing`, step)).toBe(m.typed)
       else if (m.sentShown !== null) {
@@ -309,7 +374,9 @@ async function runSequence(seed: number, steps: number): Promise<void> {
     const takenBefore = configState.config
     const runBefore = configState.config?.revision?.run
     let released: Pending | undefined
-    const roll = random()
+    // While the Refine dialog is open, the person can only cancel it; the
+    // unit's answers, restarts, failures and other tabs go on.
+    const roll = liveRefine ? pick([0.05, 0.15, 0.77, 0.83, 0.9, 0.95]) : random()
 
     if (roll < 0.12) {
       const field = pick(FIELDS)
@@ -328,7 +395,7 @@ async function runSequence(seed: number, steps: number): Promise<void> {
       const value = pick(POOL[field].filter((v) => v !== box.value))
       edit(field, value, box.value)
       await fireEvent.input(box, { target: { value } })
-      log.push(`${step}: types ${field} ${value}`)
+      log.push(`${step}: types ${field} ${JSON.stringify(value)}`)
     } else if (roll < 0.55) {
       const section = pick<Section>(['general', 'voice', 'preset'])
       const button = saveButton(section)
@@ -354,14 +421,14 @@ async function runSequence(seed: number, steps: number): Promise<void> {
       const refineButton = presetButton('Refine')
       if (refineButton.disabled) continue
       const taken = configState.config as ConfigResponse
-      // The handler starts from the preset as the unit holds it now (from).
-      // For each field: as it was there (not changed), the same with a space
+      // The handler starts from the preset as the unit holds it on arrival.
+      // For each field: as it is there (not changed), the same with a space
       // after it (a text input drops a new line, so the field would not show
-      // it), as the page's config holds it, what the field shows,
-      // or another text. One answer in five comes from a server older than
-      // from, and names no starting preset.
+      // it), as the page's config holds it, what the field shows, or another
+      // text. One answer in five comes from a server older than from, and
+      // names no starting preset.
       const output = Object.fromEntries(
-        PRESET_FIELDS.map((field) => [
+        REFINED_FIELDS.map((field) => [
           field,
           pick([
             unit.values[field],
@@ -372,36 +439,20 @@ async function runSequence(seed: number, steps: number): Promise<void> {
           ]),
         ]),
       ) as Record<Field, string>
-      const withFrom = random() < 0.8
-      unit.refineAnswer = {
+      unit.refineOutput = {
         description: output.description,
         system_prompt: output.prompt,
         user_template: output.template,
-        model: '',
-        ...(withFrom
-          ? {
-              from: {
-                description: unit.values.description,
-                system_prompt: unit.values.prompt,
-                user_template: unit.values.template,
-                model: '',
-              },
-            }
-          : {}),
       }
-      for (const field of PRESET_FIELDS) {
-        const shown = input(field).value
-        const value = output[field]
-        const unchanged = withFrom ? unit.values[field] : valueIn(taken, field)
-        if (same(value, unchanged) || same(value, shown)) continue
-        edit(field, value, shown)
-      }
+      unit.refineWithFrom = random() < 0.8
       await fireEvent.click(refineButton)
       await fireEvent.input(screen.getByLabelText('What would you like to change?'), {
         target: { value: 'Shorter, please.' },
       })
+      const pendingBefore = unit.pending.length
       await fireEvent.click(screen.getByRole('button', { name: 'Refine with LLM' }))
-      log.push(`${step}: refines: ${JSON.stringify(output)}`)
+      liveRefine = unit.pending[pendingBefore]
+      log.push(`${step}: starts a refinement: ${JSON.stringify(liveRefine.refine)}`)
     } else if (roll < 0.69) {
       startOver()
       await fireEvent.click(presetButton('Discard'))
@@ -420,14 +471,52 @@ async function runSequence(seed: number, steps: number): Promise<void> {
       if (failing.length === 0) continue
       const entry = unit.fail(pick(failing).index)
       log.push(`${step}: a save fails: ${JSON.stringify(entry.body)}`)
+    } else if (roll < 0.86) {
+      if (!liveRefine) continue
+      liveRefine = null
+      await fireEvent.click(screen.getByRole('button', { name: 'Cancel' }))
+      log.push(`${step}: cancels the refinement`)
     } else if (unit.pending.length > 0) {
-      released = unit.release(Math.floor(random() * unit.pending.length))
-      const answer = released.answer as ConfigResponse
-      log.push(
-        `${step}: answers a ${released.kind} with ${answer.revision?.run}/${answer.revision?.count} ${JSON.stringify(
-          Object.fromEntries(FIELDS.map((f) => [f, valueIn(answer, f)])),
-        )}`,
-      )
+      const index = Math.floor(random() * unit.pending.length)
+      if (unit.pending[index] === liveRefine) {
+        // The refinement lands: each field as the page holds it now, before it
+        // applies the answer.
+        const answer = liveRefine.refine as RefineAnswer
+        const output: Record<string, string> = {
+          description: answer.description,
+          prompt: answer.system_prompt,
+          template: answer.user_template,
+        }
+        const fromValue: Record<string, string | undefined> = {
+          description: answer.from?.description,
+          prompt: answer.from?.system_prompt,
+          template: answer.from?.user_template,
+        }
+        const taken = configState.config as ConfigResponse
+        for (const field of REFINED_FIELDS) {
+          const m = model[field]
+          const shown = input(field).value
+          const value = output[field]
+          const unchanged = fromValue[field] ?? valueIn(taken, field)
+          if (same(value, unchanged) || same(value, shown)) {
+            m.kept = m.editing && same(value, unchanged) && !same(value, shown)
+            continue
+          }
+          edit(field, value, shown)
+        }
+        liveRefine = null
+      }
+      released = unit.release(index)
+      if (released.kind === 'refine') {
+        log.push(`${step}: answers a refinement: ${JSON.stringify(released.refine)}`)
+      } else {
+        const answer = released.answer as ConfigResponse
+        log.push(
+          `${step}: answers a ${released.kind} with ${answer.revision?.run}/${answer.revision?.count} ${JSON.stringify(
+            Object.fromEntries(FIELDS.map((f) => [f, valueIn(answer, f)])),
+          )}`,
+        )
+      }
     } else {
       continue
     }
@@ -444,6 +533,7 @@ async function runSequence(seed: number, steps: number): Promise<void> {
       const m = model[field]
       const wasEditing = m.editing
       m.editing = false
+      m.kept = false
       const answer = released?.answer as ConfigResponse
       const fromAnotherRun = answer.revision?.run !== runBefore
       if (took || !fromAnotherRun) m.sentShown = null
@@ -461,6 +551,7 @@ async function runSequence(seed: number, steps: number): Promise<void> {
         const incoming = valueIn(taken, field)
         if (same(incoming, m.before)) continue
         m.editing = false
+        m.kept = false
         if (!same(incoming, m.typed)) m.note = true
       }
     }
