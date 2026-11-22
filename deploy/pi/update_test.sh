@@ -339,40 +339,126 @@ rolled_back 'a new binary that answers idle again' $'sleep 120\nsleep 120'
 paused_only='' update_with stopped-new
 rolled_back 'a new binary whose unit stopped' ''
 
-# seconds UNIT KEY DEFAULT: KEY's time in the unit file UNIT, in seconds (5min, 90s, 90), or DEFAULT.
-seconds() {
-  local value
-  value=$(sed -n "s/^$2=//p" "$1")
-  case $value in
-    '') value=$3 ;;
-    *min) value=$((${value%min} * 60)) ;;
-    *s) value=${value%s} ;;
-  esac
-  [[ $value =~ ^[0-9]+$ ]] || { printf 'cannot read %s from %s\n' "$2" "$1" >&2; exit 1; }
-  printf '%s' "$value"
+# The update's bounds come from systemd's own reading of the units: their dump under
+# `systemd-analyze verify`, which parses a unit as systemd does (whitespace around =, every time
+# unit and their sums, infinity, the last assignment, the drop-ins beside it), and its timespan
+# conversion. A value it cannot bound fails the test by name, never a default.
+command -v systemd-analyze >/dev/null \
+  || { printf 'systemd-analyze is not installed: the update bounds are read from systemd itself\n' >&2; exit 1; }
+
+# unit_dump UNIT: systemd's dump of unit file UNIT. The system manager loads it, so no user manager
+# is needed; the units set every timeout read here, so no manager's defaults enter it.
+unit_dump() {
+  local name dump
+  name=$(basename "$1")
+  dump=$({ env -i PATH="$PATH" LANG=C SYSTEMD_LOG_LEVEL=debug systemd-analyze --system --man=no verify "$1" 2>&1 || true; } \
+    | awk -v unit="-> Unit $name:" 'index($0, unit) {f = 1; next} f && /-> Unit / {exit} f')
+  [[ -n $dump ]] || { printf '%s: systemd shows no reading of it\n' "$1" >&2; return 1; }
+  printf '%s\n' "$dump"
+}
+
+# dump_seconds DUMP KEY UNIT: KEY's time in systemd's DUMP of UNIT, in whole seconds rounded up.
+dump_seconds() {
+  local value usec
+  value=$(sed -n "s/^[[:space:]]*$2: //p" <<<"$1")
+  [[ -n $value ]] || { printf '%s: systemd shows no %s\n' "$3" "$2" >&2; return 1; }
+  [[ $value != infinity ]] || { printf '%s: %s is infinity, so it has no bound\n' "$3" "$2" >&2; return 1; }
+  usec=$(LANG=C systemd-analyze timespan "$value" | sed -nE 's/^[[:space:]]*(μs|us): ([0-9]+)$/\2/p')
+  [[ $usec =~ ^[0-9]+$ ]] || { printf '%s: systemd-analyze cannot convert %s %q\n' "$3" "$2" "$value" >&2; return 1; }
+  printf '%s' $(((usec + 999999) / 1000000))
+}
+
+# coreutils_seconds DURATION: a duration as coreutils timeout reads it (a number, then s, m, h or
+# d), in whole seconds rounded up; it fails on any other form.
+coreutils_seconds() {
+  [[ $1 =~ ^([0-9]+(\.[0-9]*)?|\.[0-9]+)([smhd]?)$ ]] || return 1
+  awk -v n="${BASH_REMATCH[1]}" -v u="${BASH_REMATCH[3]}" \
+    'BEGIN { s = n * (u == "m" ? 60 : u == "h" ? 3600 : u == "d" ? 86400 : 1); c = int(s); if (c < s) c++; print c }'
+}
+
+# stop_command_seconds COMMAND STOP: how long systemd lets a stop command (ExecStop, ExecStopPost)
+# run: STOP, its stop timeout, which systemd applies to each, or less when it runs under coreutils
+# `timeout -k KILL DURATION` (SIGTERM at DURATION, SIGKILL KILL later; 0 turns either off).
+stop_command_seconds() {
+  local -a words
+  local kill duration
+  read -r -a words <<<"$1"
+  if [[ ${words[0]##*/} == timeout && ${words[1]:-} == -k && ${#words[@]} -ge 5 ]] \
+    && kill=$(coreutils_seconds "${words[2]}") && duration=$(coreutils_seconds "${words[3]}") \
+    && ((kill > 0 && duration > 0 && kill + duration < $2)); then
+    printf '%s' $((kill + duration))
+    return 0
+  fi
+  printf '%s' "$2"
 }
 
 # The update unit (ghost-wispr-update.service) ends update.sh at its TimeoutStartSec, which update.sh
 # knows as UNIT_LIMIT.
-limit=$(seconds "$script_dir/files/ghost-wispr-update.service" TimeoutStartSec '')
+update_unit="$script_dir/files/ghost-wispr-update.service"
+update_dump=$(unit_dump "$update_unit") || exit 1
+limit=$(dump_seconds "$update_dump" TimeoutStartSec "$update_unit") || exit 1
 script_limit=$(sed -n 's/^readonly UNIT_LIMIT=\([0-9][0-9]*\).*/\1/p' "$update_script")
 [[ $script_limit == "$limit" ]] \
   || { printf "update.sh's UNIT_LIMIT (%s) is not the update unit's TimeoutStartSec (%s s)\n" "$script_limit" "$limit" >&2; exit 1; }
 usable=$((limit - 60))
 
-# A restart of the recorder (ghost-wispr.service) at its worst: its main process's stop (TimeoutStopSec,
-# the user manager's 90 s by default), each ExecStopPost (bounded by TimeoutStopSec of its own, or
-# by the `timeout` it runs under), and its start (TimeoutStartSec, its ExecStartPre waits included).
+# restart_worst_of UNIT: a restart of the recorder at its worst, from systemd's reading of its unit
+# file UNIT: its main process's stop (TimeoutStopSec), each ExecStop and ExecStopPost (bounded by
+# its own stop timeout, or by the `timeout` it runs under), and its start (TimeoutStartSec, its
+# ExecStartPre waits included). It fails, saying why, on a value it cannot bound.
+restart_worst_of() {
+  local dump stop start worst command bound
+  dump=$(unit_dump "$1") || return 1
+  stop=$(dump_seconds "$dump" TimeoutStopSec "$1") || return 1
+  start=$(dump_seconds "$dump" TimeoutStartSec "$1") || return 1
+  worst=$((stop + start))
+  while IFS= read -r command; do
+    [[ -n $command ]] || continue
+    bound=$(stop_command_seconds "$command" "$stop") || return 1
+    worst=$((worst + bound))
+  done < <(awk '/-> ExecStop(Post)?:$/ {f = 1; next} /-> / {f = 0} f && /Command Line: / {sub(/^[[:space:]]*Command Line: /, ""); print}' <<<"$dump")
+  printf '%s' "$worst"
+}
+
+# The bound is systemd's reading of the unit, whatever valid form the unit writes it in, and a value
+# it cannot bound fails the test by name, never a default. GPT-6.1 Sol's case at 683a678b: systemd
+# reads `TimeoutStopSec =180s` as 180 s (a restart of 495 s), where a hand parser took it as unset.
+# unit_case WANT EXTRA [SED] [DROPIN]: the recorder unit with EXTRA as the last line of its
+# [Service] section, edited by SED, with DROPIN as a drop-in beside it, must have the restart bound
+# WANT (seconds), or with WANT fail:TEXT, fail naming TEXT.
 recorder_unit="$script_dir/files/ghost-wispr.service"
-stop=$(seconds "$recorder_unit" TimeoutStopSec 90)
-restart_worst=$((stop + $(seconds "$recorder_unit" TimeoutStartSec '')))
-while IFS= read -r post; do
-  if [[ $post =~ ^/usr/bin/timeout\ -k\ ([0-9]+)s?\ ([0-9]+)s?\  ]]; then
-    restart_worst=$((restart_worst + BASH_REMATCH[1] + BASH_REMATCH[2]))
-  else
-    restart_worst=$((restart_worst + stop))
+unit_failures=0
+unit_case() {
+  local dir
+  dir=$(mktemp -d "$work_dir/unit-case.XXXXXX")
+  awk -v extra="$2" '/^\[Install\]$/ && extra != "" {print extra} {print}' "$recorder_unit" >"$dir/ghost-wispr.service"
+  [[ -z ${3:-} ]] || sed -i "$3" "$dir/ghost-wispr.service"
+  if [[ -n ${4:-} ]]; then
+    mkdir "$dir/ghost-wispr.service.d"
+    printf '[Service]\n%s\n' "$4" >"$dir/ghost-wispr.service.d/bound.conf"
   fi
-done < <(sed -n 's/^ExecStopPost=//p' "$recorder_unit")
+  status=0
+  out=$( (restart_worst_of "$dir/ghost-wispr.service") 2>&1) || status=$?
+  case $1 in
+    fail:*) [[ $status -ne 0 && $out == *"${1#fail:}"* ]] && return 0
+      printf 'the restart bound of a unit with %q%s%s: exit %s, %s; want a failure naming %q\n' "$2" "${3:+, $3}" "${4:+, drop-in $4}" "$status" "$out" "${1#fail:}" >&2 ;;
+    *) [[ $status -eq 0 && $out == "$1" ]] && return 0
+      printf 'the restart bound of a unit with %q%s%s: exit %s, %s; want %s s\n' "$2" "${3:+, $3}" "${4:+, drop-in $4}" "$status" "$out" "$1" >&2 ;;
+  esac
+  unit_failures=$((unit_failures + 1))
+}
+unit_case 405 ''
+unit_case 405 'TimeoutStopSec=1min 30s'
+unit_case 495 'TimeoutStopSec =180s'
+unit_case 495 'TimeoutStopSec=3min'
+unit_case 375 'TimeoutSec=3min'
+unit_case 495 '' '' 'TimeoutStopSec = 180'
+unit_case 'fail:TimeoutStopSec is infinity' 'TimeoutStopSec=infinity'
+unit_case 'fail:TimeoutStartSec is infinity' 'TimeoutStartSec=infinity'
+# A light-off under a timeout this test does not read is bounded by its own stop timeout.
+unit_case 480 '' 's#^ExecStopPost=/usr/bin/timeout -k 5s 10s #ExecStopPost=/usr/bin/timeout --foreground 10s #'
+((unit_failures == 0)) || exit 1
+restart_worst=$(restart_worst_of "$recorder_unit") || exit 1
 
 # The new binary starts but never reports its commit; the rollback's first status read gets no
 # answer and the next two find it idle (GPT-6.1 Sol's delayed-idle case at 25ff1c5), each step at
