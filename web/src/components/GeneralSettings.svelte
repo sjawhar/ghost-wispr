@@ -23,29 +23,35 @@
     feedback = ''
     try {
       const patch: ConfigPatch = {}
+      const carried: { acknowledge(): void }[] = []
 
-      if (silenceTimeout.value !== config.silence_timeout) {
+      if (silenceTimeout.edited) {
         patch.silence_timeout = silenceTimeout.value
+        carried.push(silenceTimeout)
       }
-      if (model.value !== config.summarization.model) {
+      if (model.edited) {
         patch.summarization = { model: model.value }
+        carried.push(model)
       }
       const transcription: NonNullable<ConfigPatch['transcription']> = {}
-      if (endpointing.value !== config.transcription.endpointing) {
+      if (endpointing.edited) {
         transcription.endpointing = endpointing.value
+        carried.push(endpointing)
       }
-      if (utteranceEndMs.value !== config.transcription.utterance_end_ms) {
+      if (utteranceEndMs.edited) {
         transcription.utterance_end_ms = utteranceEndMs.value
+        carried.push(utteranceEndMs)
       }
       if (Object.keys(transcription).length > 0) {
         patch.transcription = transcription
       }
-      if (Object.keys(patch).length === 0) {
+      if (carried.length === 0) {
         feedback = 'No changes to save.'
         return
       }
 
       const updated = await patchConfig(patch)
+      for (const field of carried) field.acknowledge()
       setConfig(updated)
       feedback = 'Saved!'
     } catch (error) {

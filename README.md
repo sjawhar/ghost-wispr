@@ -337,9 +337,12 @@ began with a key a save has since replaced is not kept as the provider's last ch
   and `dgagent_provider`. It and each `PATCH /api/config` answer carry `revision: {run, count}`, the
   state of the config they hold: `count` rises by one with each change in this run of the unit,
   which `run` names. Of two answers in one run, the one with the higher count holds the later state,
-  whichever order they arrive in; the settings page keeps that one. An answer from another run than
-  the one it shows (after a restart, or late from before one) it does not take: it reads
-  `GET /api/config` again, which only the live run answers, and takes that, one read at a time.
+  whichever order they arrive in; the settings page shows that one. An answer from another run than
+  the one it shows (after a restart, or late from before one) it does not show: it reads
+  `GET /api/config` again, which only the live run answers, one read at a time, and tries a failed
+  read again after 1 s, then twice as long each time up to 30 s, saying meanwhile that the settings
+  may be out of date. What a save sends does not depend on what is shown: General, Meeting voice and
+  Integrations send each field the person edited since a save of it last succeeded.
 - `PATCH /api/config` takes `provider_keys: {"<provider>": "<key>"}` for `api_key` providers and
   writes each key into `.env` under the provider's `auth.env`; any other provider or a key containing
   control characters is a 400. It also takes `tts: {model, voice}`, `summarization: {model, presets}`

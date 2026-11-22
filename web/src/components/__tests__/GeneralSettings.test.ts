@@ -81,4 +81,19 @@ describe('GeneralSettings', () => {
     )
     expect(value('Silence Timeout')).toBe('45s')
   })
+
+  // The unit changed a field the person had typed in: the field shows the
+  // unit's value, and the person's edit is over, so nothing is sent.
+  it('sends nothing for a field whose typing the unit replaced', async () => {
+    const fetch = stubFetch()
+    const view = render(GeneralSettings, { config })
+    await fireEvent.input(screen.getByLabelText('Silence Timeout'), { target: { value: '45s' } })
+
+    await view.rerender({ config: { ...config, silence_timeout: '1m' } })
+    expect(value('Silence Timeout')).toBe('1m')
+    await fireEvent.click(screen.getByRole('button', { name: 'Save' }))
+
+    expect(await screen.findByText('No changes to save.')).toBeTruthy()
+    expect(sent(fetch).filter((r) => r.method === 'PATCH')).toEqual([])
+  })
 })

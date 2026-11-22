@@ -26,8 +26,7 @@
   let gcFeedback = $state('')
 
   async function saveGDrive(): Promise<void> {
-    const folder = gdriveFolder.value.trim()
-    if (folder === config.gdrive.folder_id) {
+    if (!gdriveFolder.edited) {
       gdriveFeedback = 'No changes to save.'
       return
     }
@@ -35,8 +34,9 @@
     gdriveFeedback = ''
     try {
       const updated = await patchConfig({
-        gdrive: { folder_id: folder },
+        gdrive: { folder_id: gdriveFolder.value.trim() },
       })
+      gdriveFolder.acknowledge()
       setConfig(updated)
       gdriveFeedback = 'Saved!'
     } catch (error) {
@@ -53,6 +53,7 @@
       const updated = await patchConfig({
         gdrive: { sync_enabled: syncEnabled.value },
       })
+      syncEnabled.acknowledge()
       setConfig(updated)
       syncFeedback = 'Saved!'
     } catch (error) {
@@ -76,16 +77,20 @@
       return
     }
     const gc: NonNullable<ConfigPatch['gc']> = {}
-    if (gcEnabled.value !== config.gc.enabled) {
+    const carried: { acknowledge(): void }[] = []
+    if (gcEnabled.edited) {
       gc.enabled = gcEnabled.value
+      carried.push(gcEnabled)
     }
-    if (ageSet && gcMaxAgeDays.value !== config.gc.max_age_days) {
+    if (ageSet && gcMaxAgeDays.edited) {
       gc.max_age_days = gcMaxAgeDays.value
+      carried.push(gcMaxAgeDays)
     }
-    if (sizeSet && gcMaxAudioSizeMB.value !== config.gc.max_audio_size_mb) {
+    if (sizeSet && gcMaxAudioSizeMB.edited) {
       gc.max_audio_size_mb = gcMaxAudioSizeMB.value
+      carried.push(gcMaxAudioSizeMB)
     }
-    if (Object.keys(gc).length === 0) {
+    if (carried.length === 0) {
       gcFeedback = 'No changes to save.'
       return
     }
@@ -93,6 +98,7 @@
     gcFeedback = ''
     try {
       const updated = await patchConfig({ gc })
+      for (const field of carried) field.acknowledge()
       setConfig(updated)
       gcFeedback = 'Saved!'
     } catch (error) {

@@ -26,19 +26,24 @@
   let feedback = $state('')
 
   async function save(): Promise<void> {
+    const carried: { acknowledge(): void }[] = []
     const voice: NonNullable<ConfigPatch['voice']> = {}
-    if (enabled.value !== config.voice.enabled) {
+    if (enabled.edited) {
       voice.enabled = enabled.value
+      carried.push(enabled)
     }
-    if (engine.value !== config.voice.engine) {
+    if (engine.edited) {
       voice.engine = engine.value
+      carried.push(engine)
     }
     const tts: NonNullable<ConfigPatch['tts']> = {}
-    if (ttsModel.value.trim() !== config.tts.model) {
+    if (ttsModel.edited) {
       tts.model = ttsModel.value.trim()
+      carried.push(ttsModel)
     }
-    if (ttsVoice.value.trim() !== config.tts.voice) {
+    if (ttsVoice.edited) {
       tts.voice = ttsVoice.value.trim()
+      carried.push(ttsVoice)
     }
     const patch: ConfigPatch = {}
     if (Object.keys(voice).length > 0) {
@@ -47,7 +52,7 @@
     if (Object.keys(tts).length > 0) {
       patch.tts = tts
     }
-    if (!patch.voice && !patch.tts) {
+    if (carried.length === 0) {
       feedback = 'No changes to save.'
       return
     }
@@ -55,7 +60,9 @@
     saving = true
     feedback = ''
     try {
-      setConfig(await patchConfig(patch))
+      const updated = await patchConfig(patch)
+      for (const field of carried) field.acknowledge()
+      setConfig(updated)
       feedback = 'Saved!'
     } catch (error) {
       feedback = error instanceof Error ? error.message : 'Save failed'

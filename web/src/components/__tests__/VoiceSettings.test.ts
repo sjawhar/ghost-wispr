@@ -203,6 +203,77 @@ describe('VoiceSettings', () => {
     answer(new Response(JSON.stringify({ ...config, tts: { ...config.tts, voice: 'Puck' } })))
     await waitFor(() => expect(controls.some((control) => control.disabled)).toBe(false))
   })
+
+  // A value changed and changed back is still the person's value: it is sent.
+  it('sends a value the person changed and changed back', async () => {
+    const fetch = stubFetch({ config })
+    render(VoiceSettings, { config })
+    const voice = screen.getByLabelText('Text-to-speech voice')
+
+    await fireEvent.input(voice, { target: { value: 'Puck' } })
+    await fireEvent.input(voice, { target: { value: 'Kore' } })
+    await save()
+
+    await waitFor(() =>
+      expect(sent(fetch).filter((r) => r.method === 'PATCH')).toEqual([
+        { url: '/api/config', method: 'PATCH', body: { tts: { voice: 'Kore' } } },
+      ]),
+    )
+  })
+
+  // A save acknowledges the fields it carried, and only those: the next save
+  // sends a field edited after it, and not the one it carried.
+  it('sends a field once its save is acknowledged, and a later edit again', async () => {
+    const fetch = stubFetch({ config: { ...config, tts: { ...config.tts, voice: 'Puck' } } })
+    render(VoiceSettings, { config })
+
+    await fireEvent.input(screen.getByLabelText('Text-to-speech voice'), {
+      target: { value: 'Puck' },
+    })
+    await save()
+    expect(await screen.findByText('Saved!')).toBeTruthy()
+    await fireEvent.click(screen.getByLabelText('Enable meeting voice'))
+    await save()
+
+    await waitFor(() =>
+      expect(
+        sent(fetch)
+          .filter((r) => r.method === 'PATCH')
+          .map((r) => r.body),
+      ).toEqual([{ tts: { voice: 'Puck' } }, { voice: { enabled: false } }]),
+    )
+  })
+
+  // A save the unit refused carried nothing: the next save sends the field
+  // again.
+  it('sends a field again after a save of it failed', async () => {
+    let answers = 0
+    vi.stubGlobal(
+      'fetch',
+      vi.fn((_input: RequestInfo | URL, init?: RequestInit) => {
+        answers++
+        return Promise.resolve(
+          answers === 1
+            ? new Response(JSON.stringify({ error: 'unit busy' }), { status: 500 })
+            : new Response(JSON.stringify({ ...config, tts: { ...config.tts, voice: 'Puck' } })),
+        ).then((response) => {
+          expect(JSON.parse(String(init?.body))).toEqual({ tts: { voice: 'Puck' } })
+          return response
+        })
+      }),
+    )
+    render(VoiceSettings, { config })
+
+    await fireEvent.input(screen.getByLabelText('Text-to-speech voice'), {
+      target: { value: 'Puck' },
+    })
+    await save()
+    expect(await screen.findByText('unit busy')).toBeTruthy()
+    await save()
+
+    expect(await screen.findByText('Saved!')).toBeTruthy()
+    expect(answers).toBe(2)
+  })
 })
 
 describe('SettingsPage', () => {
@@ -319,12 +390,17 @@ describe('SettingsPage', () => {
   )
 
   // A fake unit for SettingsPage: a GET answers with the state the unit holds
-  // now (`unit.current`); each PATCH waits until the test answers it.
+  // now (`unit.current`), or, by `unit.readMode`, waits until the test answers
+  // it, fails on the network, or answers 500; each PATCH waits until the test
+  // answers it, and its body is kept in `unit.bodies`.
   function fakeUnit(start: ConfigResponse) {
     const unit = {
       current: start,
       patches: [] as ((answer: ConfigResponse) => void)[],
+      bodies: [] as unknown[],
       reads: 0,
+      readMode: 'answer' as 'answer' | 'hold' | 'network' | 'http500',
+      held: [] as (() => void)[],
     }
     vi.stubGlobal(
       'fetch',
@@ -333,12 +409,26 @@ describe('SettingsPage', () => {
           return Promise.resolve(new Response(JSON.stringify({ providers: [] })))
         }
         if (init?.method === 'PATCH') {
+          unit.bodies.push(JSON.parse(String(init.body)))
           // The app's TypeScript library, ES2022, has no Promise.withResolvers.
           return new Promise<Response>((resolve) =>
             unit.patches.push((answer) => resolve(new Response(JSON.stringify(answer)))),
           )
         }
         unit.reads++
+        if (unit.readMode === 'hold') {
+          return new Promise<Response>((resolve) =>
+            unit.held.push(() => resolve(new Response(JSON.stringify(unit.current)))),
+          )
+        }
+        if (unit.readMode === 'network') {
+          return Promise.reject(new TypeError('Failed to fetch'))
+        }
+        if (unit.readMode === 'http500') {
+          return Promise.resolve(
+            new Response(JSON.stringify({ error: 'unit busy' }), { status: 500 }),
+          )
+        }
         return Promise.resolve(new Response(JSON.stringify(unit.current)))
       }),
     )
@@ -419,5 +509,73 @@ describe('SettingsPage', () => {
     expect((within(voice).getByLabelText('Text-to-speech voice') as HTMLInputElement).value).toBe(
       'Puck',
     )
+  })
+
+  // Sol's case: the page shows run A with voice Kore. The unit restarts as
+  // run B, and the person saves voice Puck there; the page reads the config
+  // again, and that read is held, or fails. Another tab saves voice Charon.
+  // The person then changes only whether the meeting voice is on, and saves:
+  // that save must not send Puck back over Charon.
+  it.each(['hold', 'network', 'http500'] as const)(
+    "sends only what the person changed while the read after a new run's answer is %s",
+    async (readMode) => {
+      const unit = fakeUnit({ ...config, revision: { run: 'run-A', count: 9 } })
+      render(SettingsPage, { onBack: () => {} })
+      const voice = await screen.findByTestId('voice-settings')
+      unit.readMode = readMode
+
+      await fireEvent.input(within(voice).getByLabelText('Text-to-speech voice'), {
+        target: { value: 'Puck' },
+      })
+      await fireEvent.click(within(voice).getByRole('button', { name: 'Save' }))
+      const inB = {
+        ...config,
+        tts: { ...config.tts, voice: 'Puck' },
+        revision: { run: 'run-B', count: 1 },
+      }
+      unit.current = inB
+      unit.patches[0](inB)
+      expect(await within(voice).findByText('Saved!')).toBeTruthy()
+
+      unit.current = {
+        ...inB,
+        tts: { ...inB.tts, voice: 'Charon' },
+        revision: { run: 'run-B', count: 2 },
+      }
+      await fireEvent.click(within(voice).getByLabelText('Enable meeting voice'))
+      await fireEvent.click(within(voice).getByRole('button', { name: 'Save' }))
+
+      await waitFor(() => expect(unit.bodies).toHaveLength(2))
+      expect(unit.bodies[1]).toEqual({ voice: { enabled: false } })
+    },
+  )
+
+  // While the page reads the config again it says the settings may be out of
+  // date; the line goes once the read lands.
+  it('says the settings may be out of date while it reads them again', async () => {
+    const unit = fakeUnit({ ...config, revision: { run: 'run-A', count: 9 } })
+    render(SettingsPage, { onBack: () => {} })
+    const voice = await screen.findByTestId('voice-settings')
+    expect(screen.queryByText('Settings may be out of date, reloading…')).toBeNull()
+    unit.readMode = 'hold'
+
+    await fireEvent.input(within(voice).getByLabelText('Text-to-speech voice'), {
+      target: { value: 'Puck' },
+    })
+    await fireEvent.click(within(voice).getByRole('button', { name: 'Save' }))
+    const inB = {
+      ...config,
+      tts: { ...config.tts, voice: 'Puck' },
+      revision: { run: 'run-B', count: 1 },
+    }
+    unit.current = inB
+    unit.patches[0](inB)
+
+    expect(await screen.findByText('Settings may be out of date, reloading…')).toBeTruthy()
+    unit.held[0]()
+    await waitFor(() =>
+      expect(screen.queryByText('Settings may be out of date, reloading…')).toBeNull(),
+    )
+    expect(configState.config?.revision).toEqual({ run: 'run-B', count: 1 })
   })
 })

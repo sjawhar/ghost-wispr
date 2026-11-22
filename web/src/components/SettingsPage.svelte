@@ -32,6 +32,10 @@
     <p class="settings-error">{configState.error}</p>
   {/if}
 
+  {#if configState.reloading}
+    <p class="settings-reloading" role="status">Settings may be out of date, reloading…</p>
+  {/if}
+
   {#if !configState.loaded}
     <p class="settings-loading">Loading configuration...</p>
   {:else if configState.config}
@@ -96,6 +100,12 @@
   .settings-loading {
     color: var(--muted);
     font-style: italic;
+  }
+
+  .settings-reloading {
+    color: var(--muted);
+    font-size: 0.85rem;
+    margin: 0 0 0.55rem;
   }
 
   .settings-section {

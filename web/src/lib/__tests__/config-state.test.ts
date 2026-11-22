@@ -10,7 +10,10 @@ function at(run: string, count: number, silence = '30s'): ConfigResponse {
 // A fake unit: each GET /api/config waits until the test answers it, with the
 // state of the run that is live when it is answered.
 function fakeReads() {
-  const reads: { answer: (config: ConfigResponse) => void; fail: () => void }[] = []
+  const reads: {
+    answer: (config: ConfigResponse) => void
+    fail: (how: 'network' | 'http500') => void
+  }[] = []
   vi.stubGlobal(
     'fetch',
     vi.fn(
@@ -19,7 +22,10 @@ function fakeReads() {
         new Promise<Response>((resolve, reject) =>
           reads.push({
             answer: (config) => resolve(new Response(JSON.stringify(config))),
-            fail: () => reject(new TypeError('Failed to fetch')),
+            fail: (how) =>
+              how === 'network'
+                ? reject(new TypeError('Failed to fetch'))
+                : resolve(new Response(JSON.stringify({ error: 'unit busy' }), { status: 500 })),
           }),
         ),
     ),
@@ -39,6 +45,7 @@ async function settle(): Promise<void> {
 
 describe('setConfig', () => {
   afterEach(() => {
+    vi.useRealTimers()
     vi.unstubAllGlobals()
     resetConfigState()
   })
@@ -177,20 +184,76 @@ describe('setConfig', () => {
     expect(shown()).toEqual({ run: 'run-B', count: 1 })
   })
 
-  it('keeps what it shows when a read fails, and reads again on the next answer', async () => {
-    const reads = fakeReads()
-    setConfig(at('run-A', 9, '45s'))
-    setConfig(at('run-B', 1, '50s'))
-    reads[0].fail()
-    await settle()
-    expect(shown()).toEqual({ run: 'run-A', count: 9 })
+  // A read that fails, on the network or with a 500, is tried again: 1 s
+  // later, then after twice as long each time. While it waits, an answer from
+  // another run asks for no read of its own: the next try covers it. Until a
+  // read lands the page says the settings may be out of date.
+  it.each(['network', 'http500'] as const)(
+    'tries a read that fails (%s) again, waiting twice as long each time, until one lands',
+    async (how) => {
+      vi.useFakeTimers()
+      const reads = fakeReads()
+      setConfig(at('run-A', 9, '45s'))
+      expect(configState.reloading).toBe(false)
+      setConfig(at('run-B', 1, '50s'))
+      expect(configState.reloading).toBe(true)
+      reads[0].fail(how)
+      await vi.advanceTimersByTimeAsync(0)
+      expect(shown()).toEqual({ run: 'run-A', count: 9 })
+      expect(reads).toHaveLength(1)
 
-    setConfig(at('run-B', 2, '50s'))
-    await settle()
-    expect(reads).toHaveLength(2)
-    reads[1].answer(at('run-B', 2, '50s'))
-    await settle()
-    expect(shown()).toEqual({ run: 'run-B', count: 2 })
+      setConfig(at('run-B', 2, '50s'))
+      await vi.advanceTimersByTimeAsync(999)
+      expect(reads).toHaveLength(1)
+      await vi.advanceTimersByTimeAsync(1)
+      expect(reads).toHaveLength(2)
+
+      reads[1].fail(how)
+      await vi.advanceTimersByTimeAsync(1999)
+      expect(reads).toHaveLength(2)
+      await vi.advanceTimersByTimeAsync(1)
+      expect(reads).toHaveLength(3)
+      expect(configState.reloading).toBe(true)
+
+      reads[2].answer(at('run-B', 2, '50s'))
+      await vi.advanceTimersByTimeAsync(0)
+      expect(shown()).toEqual({ run: 'run-B', count: 2 })
+      expect(configState.reloading).toBe(false)
+      await vi.advanceTimersByTimeAsync(60_000)
+      expect(reads).toHaveLength(3)
+    },
+  )
+
+  it('waits no longer than 30 s between tries', async () => {
+    vi.useFakeTimers()
+    const reads = fakeReads()
+    setConfig(at('run-A', 9))
+    setConfig(at('run-B', 1))
+    const waits: number[] = []
+    for (let tries = 1; tries < 8; tries++) {
+      reads.at(-1)?.fail('network')
+      await vi.advanceTimersByTimeAsync(0)
+      let waited = 0
+      while (reads.length === tries) {
+        await vi.advanceTimersByTimeAsync(1000)
+        waited += 1000
+      }
+      waits.push(waited)
+    }
+    expect(waits).toEqual([1000, 2000, 4000, 8000, 16_000, 30_000, 30_000])
+  })
+
+  it('stops trying a failed read again when the state is reset', async () => {
+    vi.useFakeTimers()
+    const reads = fakeReads()
+    setConfig(at('run-A', 9))
+    setConfig(at('run-B', 1))
+    reads[0].fail('network')
+    await vi.advanceTimersByTimeAsync(0)
+    resetConfigState()
+    await vi.advanceTimersByTimeAsync(60_000)
+    expect(reads).toHaveLength(1)
+    expect(configState.reloading).toBe(false)
   })
 
   it('shows no read that was on its way when the state was reset', async () => {

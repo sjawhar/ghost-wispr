@@ -5,6 +5,10 @@ type ConfigState = {
   saving: boolean
   error: string
   config: ConfigResponse | null
+  // Whether the page is reading the config again after an answer from
+  // another run of the unit: until that read lands, what it shows may be out
+  // of date. (What a save sends does not depend on it: see unit-field.)
+  reloading: boolean
 }
 
 export const configState = $state<ConfigState>({
@@ -12,6 +16,7 @@ export const configState = $state<ConfigState>({
   saving: false,
   error: '',
   config: null,
+  reloading: false,
 })
 
 // shownRevision is the revision of the config the page holds. Two saves can
@@ -29,13 +34,19 @@ export const configState = $state<ConfigState>({
 // meanwhile asks for one more read once that one lands, as the unit may have
 // restarted after the first read was answered; more such answers ask for no
 // more than that. A read's answer is shown, never fed back here, so a read
-// starts no read.
+// starts no read. A read that fails is tried again, 1 s later, then after
+// twice as long each time, up to 30 s, until one lands.
 let shownRevision: ConfigRevision | undefined
 let reading = false
 let readAgain = false
+let failures = 0
+let retry: number | undefined
 // generation rises when the state is reset, so a read on its way for the old
 // state is not shown.
 let generation = 0
+
+const firstRetryMs = 1000
+const longestRetryMs = 30_000
 
 export function setConfig(config: ConfigResponse): void {
   const revision = config.revision
@@ -55,25 +66,36 @@ function readCurrentRun(): void {
     return
   }
   reading = true
+  configState.reloading = true
+  read()
+}
+
+function read(): void {
   readAgain = false
+  retry = undefined
   const started = generation
-  fetchConfig()
-    .then((current) => {
+  fetchConfig().then(
+    (current) => {
       if (started !== generation) return
+      failures = 0
       const revision = current.revision
-      if (revision && shownRevision?.run === revision.run && revision.count < shownRevision.count) {
-        return
-      }
-      show(current)
-    })
-    // The unit did not answer: the page keeps what it shows, and the next
-    // answer from another run reads again.
-    .catch(() => {})
-    .finally(() => {
-      if (started !== generation) return
+      const older =
+        revision && shownRevision?.run === revision.run && revision.count < shownRevision.count
+      if (!older) show(current)
       reading = false
-      if (readAgain) readCurrentRun()
-    })
+      if (readAgain) {
+        readCurrentRun()
+      } else {
+        configState.reloading = false
+      }
+    },
+    () => {
+      if (started !== generation) return
+      const wait = Math.min(firstRetryMs * 2 ** failures, longestRetryMs)
+      failures++
+      retry = window.setTimeout(read, wait)
+    },
+  )
 }
 
 function show(config: ConfigResponse): void {
@@ -94,10 +116,14 @@ export function setError(error: string): void {
 export function resetConfigState(): void {
   shownRevision = undefined
   generation++
+  window.clearTimeout(retry)
+  retry = undefined
   reading = false
   readAgain = false
+  failures = 0
   configState.loaded = false
   configState.saving = false
   configState.error = ''
   configState.config = null
+  configState.reloading = false
 }
