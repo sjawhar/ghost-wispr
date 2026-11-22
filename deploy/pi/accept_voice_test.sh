@@ -809,6 +809,11 @@ def react(kind, key, start, end):
             # It comes 0.5 s into the speech, 1.2 s after the question, so that a median interval
             # that a loaded machine's aplay widens by 700 ms still stays under the 2.5 s bound.
             speech(tag, end + 700, 2300, fact=end + 1200)
+        elif "fact-joined-slow" in SCENARIO:
+            # The same with the fact sentence 5.03 s after the question, 4.33 s into one sound with no
+            # gap: a slow answer the joined fixture's quick fact must not hide (Sol's review of #146 at
+            # b52a6e6d: its independent 5030 ms case failed).
+            speech(tag, end + 700, 6000, fact=end + 5030)
         else:
             length = ANSWER_CEILING_MS if "answer-until-clip" in SCENARIO else 7000 if "long" in SCENARIO else 1500 if "short" in SCENARIO else 600
             # stop-rounds-N: the step asks N questions to stop each answer (playback-cancel's
@@ -2119,6 +2124,9 @@ launch scripted-joined fact-joined yes -- --step scripted --questions 1 --questi
 # holds the fake's true time, and stays under the 2.5 s bound: PASS (Sol's review of #149 at
 # 6d98ad98 saw scripted-joined read UNKNOWN on a loaded machine).
 launch scripted-joined-aplay-late fact-joined,aplay-late-question yes -- --step scripted --questions 1 --question-dir @questions --rig-mic "$rig" --event-timeout 10
+# A slow joined answer: the fact 5.03 s after the question, with no gap before it. Placed by the path
+# from first_audio, it is past the 2.5 s bound even at its early bound: FAIL, never PASS.
+launch scripted-joined-slow fact-joined-slow yes -- --step scripted --questions 1 --question-dir @questions --rig-mic "$rig" --event-timeout 10
 launch scripted-few pass yes -- --step scripted --questions 5 --question-dir @questions --rig-mic "$rig"
 
 # holder-cases: a pass; the Pi's token replaced by an invalid one (the negative control); a holder
@@ -2781,6 +2789,16 @@ if [[ -z $joined_low || -z $joined_high ]] || ((joined_high - joined_low < 700))
   check_failed "scripted-joined-aplay-late: the median's interval, '$joined_interval', is not at least the 700 ms aplay waited before the clip: the case did not delay it"
 fi
 expect_restored scripted-joined-aplay-late
+expect_rc scripted-joined-slow 1
+expect_line scripted-joined-slow 'followed the sentence before it with no gap'
+expect_line scripted-joined-slow 'more than 2500 ms; this voice is past the bound'
+expect_no_line scripted-joined-slow 'PASS: scripted tts: median'
+slow_truth=$(true_fact_median scripted-joined-slow)
+slow_low=$(measured scripted-joined-slow 'scripted tts: median')
+if [[ -z $slow_truth || -z $slow_low ]] || ((slow_truth <= 2500 || slow_low > slow_truth)); then
+  check_failed "scripted-joined-slow: the FAIL's early bound, '${slow_low}' ms, or the fake's true median, '${slow_truth}' ms, is not a median past the 2500 ms bound bounded from below"
+fi
+expect_restored scripted-joined-slow
 expect_rc scripted-few 2
 expect_line scripted-few 'UNKNOWN: scripted needs: --question-dir with 5 clips'
 expect_untouched scripted-few
