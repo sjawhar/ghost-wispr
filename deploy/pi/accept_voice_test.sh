@@ -797,7 +797,9 @@ def react(kind, key, start, end):
             emit(kind="ws", due=end + 5600, tag=tag, event={"type": "voice_spoken", "session_id": "session-1"})
         elif "fact-joined" in SCENARIO:
             # The fact sentence follows the first one with no gap: one sound from the first frame.
-            speech(tag, end + 700, 2300, fact=end + 1900)
+            # It comes 0.5 s into the speech, 1.2 s after the question, so that a median interval
+            # that a loaded machine's aplay widens by 700 ms still stays under the 2.5 s bound.
+            speech(tag, end + 700, 2300, fact=end + 1200)
         else:
             length = ANSWER_CEILING_MS if "answer-until-clip" in SCENARIO else 7000 if "long" in SCENARIO else 1500 if "short" in SCENARIO else 600
             # stop-rounds-N: the step asks N questions to stop each answer (playback-cancel's
@@ -2008,6 +2010,11 @@ launch scripted-unsure pass,arecord-slow-start yes -- --step scripted --engine t
 launch scripted-slow-start pass,slow-aplay-question yes -- --step scripted --engine tts --questions 2 --question-dir @questions --rig-mic "$rig" --event-timeout 10
 launch scripted-filler filler yes -- --step scripted --engine tts --questions 2 --question-dir @questions --rig-mic "$rig" --event-timeout 10
 launch scripted-joined fact-joined yes -- --step scripted --questions 1 --question-dir @questions --rig-mic "$rig" --event-timeout 10
+# The same with the question's aplay starting the clip 700 ms after the driver started it
+# (aplay-late-question), as on a loaded machine: the median's interval is that much wider, still
+# holds the fake's true time, and stays under the 2.5 s bound: PASS (Sol's review of #149 at
+# 6d98ad98 saw scripted-joined read UNKNOWN on a loaded machine).
+launch scripted-joined-aplay-late fact-joined,aplay-late-question yes -- --step scripted --questions 1 --question-dir @questions --rig-mic "$rig" --event-timeout 10
 launch scripted-few pass yes -- --step scripted --questions 5 --question-dir @questions --rig-mic "$rig"
 
 # holder-cases: a pass; the Pi's token replaced by an invalid one (the negative control); a holder
@@ -2614,6 +2621,15 @@ expect_rc scripted-joined 0
 expect_line scripted-joined 'followed the sentence before it with no gap'
 expect_holds scripted-joined 'scripted tts: median' "$(true_fact_median scripted-joined)"
 expect_restored scripted-joined
+expect_rc scripted-joined-aplay-late 0
+expect_line scripted-joined-aplay-late 'followed the sentence before it with no gap'
+expect_holds scripted-joined-aplay-late 'scripted tts: median' "$(true_fact_median scripted-joined-aplay-late)"
+joined_interval=$(sed -n 's/^PASS: scripted tts: median \([0-9]*\) ms .*(no less than \(-\{0,1\}[0-9]*\) ms).*/\2 \1/p' "$root/scripted-joined-aplay-late/out")
+read -r joined_low joined_high <<<"$joined_interval"
+if [[ -z $joined_low || -z $joined_high ]] || ((joined_high - joined_low < 700)); then
+  check_failed "scripted-joined-aplay-late: the median's interval, '$joined_interval', is not at least the 700 ms aplay waited before the clip: the case did not delay it"
+fi
+expect_restored scripted-joined-aplay-late
 expect_rc scripted-few 2
 expect_line scripted-few 'UNKNOWN: scripted needs: --question-dir with 5 clips'
 expect_untouched scripted-few
