@@ -2023,6 +2023,12 @@ expect_line() {
   grep -Fq -- "$2" "$root/$1/out" || check_failed "$1: no line holds \"$2\"; output: $(tr '\n' '|' <"$root/$1/out")"
 }
 
+# expect_either_line NAME A B: a line of NAME's output holds A or B.
+expect_either_line() {
+  grep -Fq -e "$2" -e "$3" -- "$root/$1/out" \
+    || check_failed "$1: no line holds \"$2\" or \"$3\"; output: $(tr '\n' '|' <"$root/$1/out")"
+}
+
 expect_no_line() {
   if grep -Fq -- "$2" "$root/$1/out"; then
     check_failed "$1: a line holds \"$2\""
@@ -2424,9 +2430,10 @@ launch barge-backchannel-final-rewrite answer-until-clip,backchannel-stops,captu
 # alone, with a NOTE, and the pause reads cancel-unsure's UNKNOWN, never PASS.
 launch barge-pause-silent-xrun answer-until-clip,backchannel-pause-500,arecord-slow-start,capture-buffer-250,capture-silent-xrun yes -- --step barge-in --talkovers 1 --backchannels 1 --question @question.wav --talkover-dir @talkovers --backchannel-dir @backchannels --rig-mic "$rig" --event-timeout 15
 launch barge-pause-suspend answer-until-clip,backchannel-pause-500,arecord-slow-start,capture-buffer-250,arecord-suspend yes -- --step barge-in --talkovers 1 --backchannels 1 --question @question.wav --talkover-dir @talkovers --backchannel-dir @backchannels --rig-mic "$rig" --event-timeout 15
-# The same pause with the substream in XRUN for 30 ms, which the sampler's reads miss, and RUNNING
-# again from a new trigger_time (capture-silent-restart): continuity is not shown, so UNKNOWN with
-# a NOTE, never PASS.
+# The same pause with the substream in XRUN for 30 ms, which the sampler's reads miss on an idle
+# machine, and RUNNING again from a new trigger_time (capture-silent-restart): continuity is not
+# shown, so UNKNOWN with a NOTE naming the restart, or the XRUN where a loaded machine's read lands
+# in it, never PASS.
 launch barge-pause-silent-restart answer-until-clip,backchannel-pause-500,arecord-slow-start,capture-buffer-250,capture-silent-restart yes -- --step barge-in --talkovers 1 --backchannels 1 --question @question.wav --talkover-dir @talkovers --backchannel-dir @backchannels --rig-mic "$rig" --event-timeout 15
 # The same pause with the sampler failing partway (sampler-crash: a capture status it cannot decode):
 # its anchors stop, so UNKNOWN naming the sampler's failure and its stderr, never PASS, and never the
@@ -3244,8 +3251,13 @@ expect_rc barge-pause-suspend 2
 expect_line barge-pause-suspend 'NOTE: recording: arecord reported a suspend, so the recording'"'"'s early bounds come from its start alone'
 expect_no_line barge-pause-suspend 'PASS: barge-in: 0 of 1'
 expect_restored barge-pause-suspend
+# The sampler's reads miss the 30 ms of XRUN on an idle machine and see the restart; on a loaded
+# one a read can land in it, and the driver names the XRUN (Sol's review of #149 at 44738566). Both
+# are true: either NOTE, and still UNKNOWN, never PASS.
 expect_rc barge-pause-silent-restart 2
-expect_line barge-pause-silent-restart 'NOTE: recording: the capture substream arecord held read RESTARTED during the recording, so the recording'"'"'s early bounds come from its start alone'
+expect_either_line barge-pause-silent-restart \
+  'NOTE: recording: the capture substream arecord held read RESTARTED during the recording, so the recording'"'"'s early bounds come from its start alone' \
+  'NOTE: recording: the capture substream arecord held read XRUN during the recording, so the recording'"'"'s early bounds come from its start alone'
 expect_no_line barge-pause-silent-restart 'PASS: barge-in: 0 of 1'
 expect_restored barge-pause-silent-restart
 expect_rc barge-pause-no-trigger 2
