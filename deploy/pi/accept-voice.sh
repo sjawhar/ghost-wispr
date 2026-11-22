@@ -528,7 +528,9 @@ def record(path, anchors, pidfile, root):
     before the capture began: the last such read's time, read before the size, is the start. It
     prints "started US" once arecord has written a sample, "stopped" if arecord ends before, and
     "timeout" if it has written none within 5 s of its pid; a sample counts even when found after the
-    5 s. Each read from the first sample on is followed by a read of the state of the capture
+    5 s. A sample found before the pid, which the driver writes after it starts arecord, is an
+    anchor without a floor, and the reads go on every 10 ms until the pid comes. Each read from the
+    first sample on, once the pid is known, is followed by a read of the state of the capture
     substream arecord holds (capture_state under ROOT). Only when that state is RUNNING, from the
     trigger of the first such read, is the anchor written with BEFORE_US, the floor that bounds
     later samples from below; otherwise it is written "US BYTES", a late bound alone. An overrun
@@ -593,7 +595,13 @@ def record(path, anchors, pidfile, root):
             before = us()
             size = read(pid)
             seen = us()
-            if size is not None and size > HEADER:
+            if size is not None and size > HEADER and pid is None:
+                # A sample before arecord's pid: the driver writes the pid after it starts arecord,
+                # and a loaded machine can delay that past arecord's first write (c28 of #156, where
+                # the loop below then failed on the missing pid and wrote no anchor after this one).
+                # The substream's state needs the pid, so a late bound alone, until the pid comes.
+                out.write("%d %d\n" % (seen, size))
+            elif size is not None and size > HEADER:
                 anchored(seen, size, before)
                 break
             if size is not None and size == HEADER:

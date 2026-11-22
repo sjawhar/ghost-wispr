@@ -610,10 +610,14 @@ failures = []
 # no-trigger and bad-trigger (Sol's review of #149 at 9b3d27cb): a status with no trigger_time, or a
 # trigger_time that is not a number, shows nothing about a restart, so no anchor keeps its floor and
 # the sampler names the trigger it could not read.
+# late-pid (c28 of #156): on a loaded machine the driver can write arecord's pid after arecord's
+# first sample. The sampler must go on taking anchors, a floor once it can read the substream's
+# state by the pid, and the last one, of the whole file, once arecord has ended; it must not stop.
 for case, states in (("running", ["RUNNING 1"] * 4), ("closed", ["RUNNING 1", "closed"]),
                      ("xrun", ["RUNNING 1", "XRUN 1"]), ("restarted", ["RUNNING 1", "RUNNING 2"]),
                      ("closed-at-end", ["RUNNING 1"] * 5 + ["closed"]),
-                     ("no-trigger", ["RUNNING -"] * 4), ("bad-trigger", ["RUNNING x"] * 4)):
+                     ("no-trigger", ["RUNNING -"] * 4), ("bad-trigger", ["RUNNING x"] * 4),
+                     ("late-pid", ["RUNNING 1"] * 4)):
     work = os.path.join(base, "sampler-" + case)
     status_dir = os.path.join(work, "asound", "card4", "pcm0c", "sub0")
     os.makedirs(status_dir)
@@ -625,8 +629,14 @@ for case, states in (("running", ["RUNNING 1"] * 4), ("closed", ["RUNNING 1", "c
         "time.sleep(0.2); f = open(sys.argv[1], 'wb'); f.write(bytes(44)); f.flush(); time.sleep(0.05)\n"
         "for _ in range(250): f.write(b'\\1\\0' * 240); f.flush(); time.sleep(0.01)\n"
         + ("time.sleep(1.5)\n" if case == "closed-at-end" else "")), path])
-    with open(pidfile, "w") as f:
-        f.write(str(writer.pid))
+
+    def give_pid():
+        with open(pidfile + ".tmp", "w") as f:
+            f.write(str(writer.pid))
+        os.replace(pidfile + ".tmp", pidfile)
+    # late-pid: the pid 1 s on, after about 0.75 s of samples.
+    giver = threading.Timer(1.0 if case == "late-pid" else 0, give_pid)
+    giver.start()
 
     def status(text):
         tmp = os.path.join(status_dir, "status.tmp")
@@ -648,19 +658,23 @@ for case, states in (("running", ["RUNNING 1"] * 4), ("closed", ["RUNNING 1", "c
     shower = threading.Thread(target=show)
     shower.start()
     sys.stdout.flush()
-    out = subprocess.run([sys.executable, src, "record", path, anchors, pidfile, os.path.join(work, "asound")],
-                         capture_output=True, text=True, timeout=30).stdout
+    run = subprocess.run([sys.executable, src, "record", path, anchors, pidfile, os.path.join(work, "asound")],
+                         capture_output=True, text=True, timeout=30)
+    out = run.stdout
     shower.join()
+    giver.join()
     writer.wait()
     lines = [l.split() for l in open(anchors).read().splitlines()]
     sampled = [l for l in lines if int(l[1]) > 44]
     floors = [l for l in sampled if len(l) == 3]
     reported = [l for l in out.splitlines() if l.startswith("discontinuous ")]
-    if case in ("running", "closed-at-end"):
+    if case in ("running", "closed-at-end", "late-pid"):
         if not floors or reported:
             failures.append("%s: %d floor anchors, discontinuous %r; want floors and none" % (case, len(floors), reported))
         if case == "closed-at-end" and lines and len(lines[-1]) == 3:
             failures.append("closed-at-end: the last anchor, read after the close, kept its floor: %r" % lines[-1])
+        if case == "late-pid" and (not lines or int(lines[-1][1]) != os.path.getsize(path) or run.stderr):
+            failures.append("late-pid: the last anchor %r, the file %d bytes, the sampler's stderr %r; want the whole file and no error" % (lines[-1] if lines else None, os.path.getsize(path), run.stderr[-300:]))
         continue
     want = {"closed": "CLOSED", "xrun": "XRUN", "restarted": "RESTARTED", "no-trigger": "NO-TRIGGER", "bad-trigger": "NO-TRIGGER"}[case]
     if len(reported) != 1 or not reported[0].endswith(" " + want):
