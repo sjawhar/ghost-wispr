@@ -3439,7 +3439,11 @@ expect_line barge-pause-silent-xrun 'NOTE: recording: the capture substream arec
 expect_no_line barge-pause-silent-xrun 'PASS: barge-in: 0 of 1'
 expect_restored barge-pause-silent-xrun
 expect_rc barge-pause-suspend 2
-expect_line barge-pause-suspend 'NOTE: recording: arecord reported a suspend, so the recording'"'"'s early bounds come from its start alone'
+# An overrun the fake truly logged comes first in the driver's NOTEs, so the suspend NOTE is wanted
+# only without one (k5 of #162, at a load average near 1000, read the overrun).
+if ! fake_overran barge-pause-suspend; then
+  expect_line barge-pause-suspend 'NOTE: recording: arecord reported a suspend, so the recording'"'"'s early bounds come from its start alone'
+fi
 expect_no_line barge-pause-suspend 'PASS: barge-in: 0 of 1'
 expect_restored barge-pause-suspend
 # The sampler's reads miss the 30 ms of XRUN on an idle machine and see the restart; on a loaded
