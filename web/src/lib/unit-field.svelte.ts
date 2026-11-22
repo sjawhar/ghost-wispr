@@ -50,10 +50,11 @@ export function unitField<T>(read: () => T): UnitField<T> {
   // edit does not bring the edit back. The edit was replaced only if the new
   // value is not what the person typed: one's own save on its way, carried by
   // another answer, or another tab setting the same value, replaces nothing.
+  // A save of text sends it trimmed, so spaces around it are no difference.
   $effect.pre(() => {
     const incoming = known
     untrack(() => {
-      if (edited && !Object.is(incoming, typed)) replaced = true
+      if (edited && !sameEntry(incoming, typed)) replaced = true
       edited = false
     })
   })
@@ -79,4 +80,9 @@ export function unitField<T>(read: () => T): UnitField<T> {
       edited = false
     },
   }
+}
+
+function sameEntry(a: unknown, b: unknown): boolean {
+  if (typeof a === 'string' && typeof b === 'string') return a.trim() === b.trim()
+  return Object.is(a, b)
 }

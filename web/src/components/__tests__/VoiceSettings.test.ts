@@ -310,6 +310,27 @@ describe('VoiceSettings', () => {
       screen.getByText('Changed on the unit or in another tab; your edit was replaced.'),
     ).toBeTruthy()
   })
+
+  // The proof's case: the model typed with spaces around it is sent trimmed,
+  // and another answer carries the trimmed value while the save is on its way.
+  // Spaces around the text are no replacement.
+  it('says nothing when another answer carries a trimmed save on its way', async () => {
+    const answer = deferredFetch()
+    const view = render(VoiceSettings, { config })
+    await fireEvent.input(screen.getByLabelText('Text-to-speech model'), {
+      target: { value: '  openai/tts-1-hd  ' },
+    })
+    await save()
+
+    const saved = { ...config, tts: { ...config.tts, model: 'openai/tts-1-hd' } }
+    await view.rerender({ config: saved })
+    answer(new Response(JSON.stringify(saved)))
+    expect(await screen.findByText('Saved!')).toBeTruthy()
+
+    expect(
+      screen.queryByText('Changed on the unit or in another tab; your edit was replaced.'),
+    ).toBeNull()
+  })
 })
 
 describe('SettingsPage', () => {
