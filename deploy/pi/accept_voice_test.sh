@@ -2213,11 +2213,13 @@ expect_holds() {
 # floor_decided NAME: whether the anchors' bound timed the case NAME. A fake arecord that a loaded
 # machine holds back longer than a sample may wait unwritten (FAKE_RESIDENCY_MS) reports an
 # overrun, as a real one would, and the driver then takes the case's early bounds from the start
-# alone, so the case is its start-only case. floor_cases counts the cases the bound did time: a run
-# in which it timed none tested none of it, and fails at the end.
+# alone, so the case is its start-only case: only where the fake truly overran and the driver named
+# it (fake_overran), as a driver naming an overrun the fake never had would turn a floor case into a
+# fallback. floor_cases counts the cases the bound did time: a run in which it timed none tested none
+# of it, and fails at the end.
 floor_cases=0
 floor_decided() {
-  if grep -Fq "NOTE: recording: arecord reported an overrun" "$root/$1/out"; then
+  if fake_overran "$1"; then
     printf 'NOTE: %s: the fake arecord was held back past its buffer and reported an overrun, so the case read the start-only bounds\n' "$1"
     return 1
   fi
@@ -2340,6 +2342,23 @@ fake_overran() {
     check_failed "$1: the fake logged an overrun: $overran; the driver named one: $noted"
   fi
   [[ $overran == true ]]
+}
+
+# expect_discontinuity NAME NOTE...: NAME's scenario breaks the recording's continuity in a way the
+# driver names with one of the NOTEs. The driver names an overrun first, before any other reason
+# (analyse_recording), so where the fake truly overran (fake_overran: its log and the driver's NOTE
+# agree) none of the NOTEs is wanted; otherwise a line must hold one. Either way the caller checks
+# the verdict: UNKNOWN, never PASS. Every case that wants a discontinuity NOTE goes through here, so
+# that a load that brings an overrun cannot fail one of them (k5 of #162 at 41b33cd7, and Sol's
+# review of #162 at 15c3a91f, each found one case).
+expect_discontinuity() {
+  local name=$1 note
+  shift
+  fake_overran "$name" && return 0
+  for note in "$@"; do
+    grep -Fq -- "$note" "$root/$name/out" && return 0
+  done
+  check_failed "$name: with no overrun from the fake, no line holds $(printf '"%s" ' "$@"); output: $(tr '\n' '|' <"$root/$name/out")"
 }
 
 # expect_load_case NAME: a load case. With no overrun, it must PASS, each answer timed against its
@@ -3435,28 +3454,24 @@ expect_line barge-backchannel-final-rewrite 'FAIL: barge-in: 1 of 1 backchannels
 expect_no_line barge-backchannel-final-rewrite 'PASS: barge-in: '
 expect_restored barge-backchannel-final-rewrite
 expect_rc barge-pause-silent-xrun 2
-expect_line barge-pause-silent-xrun 'NOTE: recording: the capture substream arecord held read XRUN during the recording, so the recording'"'"'s early bounds come from its start alone'
+expect_discontinuity barge-pause-silent-xrun 'NOTE: recording: the capture substream arecord held read XRUN during the recording, so the recording'"'"'s early bounds come from its start alone'
 expect_no_line barge-pause-silent-xrun 'PASS: barge-in: 0 of 1'
 expect_restored barge-pause-silent-xrun
 expect_rc barge-pause-suspend 2
-# An overrun the fake truly logged comes first in the driver's NOTEs, so the suspend NOTE is wanted
-# only without one (k5 of #162, at a load average near 1000, read the overrun).
-if ! fake_overran barge-pause-suspend; then
-  expect_line barge-pause-suspend 'NOTE: recording: arecord reported a suspend, so the recording'"'"'s early bounds come from its start alone'
-fi
+expect_discontinuity barge-pause-suspend 'NOTE: recording: arecord reported a suspend, so the recording'"'"'s early bounds come from its start alone'
 expect_no_line barge-pause-suspend 'PASS: barge-in: 0 of 1'
 expect_restored barge-pause-suspend
 # The sampler's reads miss the 30 ms of XRUN on an idle machine and see the restart; on a loaded
 # one a read can land in it, and the driver names the XRUN (Sol's review of #149 at 44738566). Both
 # are true: either NOTE, and still UNKNOWN, never PASS.
 expect_rc barge-pause-silent-restart 2
-expect_either_line barge-pause-silent-restart \
+expect_discontinuity barge-pause-silent-restart \
   'NOTE: recording: the capture substream arecord held read RESTARTED during the recording, so the recording'"'"'s early bounds come from its start alone' \
   'NOTE: recording: the capture substream arecord held read XRUN during the recording, so the recording'"'"'s early bounds come from its start alone'
 expect_no_line barge-pause-silent-restart 'PASS: barge-in: 0 of 1'
 expect_restored barge-pause-silent-restart
 expect_rc barge-pause-no-trigger 2
-expect_line barge-pause-no-trigger "NOTE: recording: the capture substream arecord held showed RUNNING with no trigger_time in the kernel's form"
+expect_discontinuity barge-pause-no-trigger "NOTE: recording: the capture substream arecord held showed RUNNING with no trigger_time in the kernel's form"
 expect_no_line barge-pause-no-trigger 'PASS: barge-in: 0 of 1'
 expect_restored barge-pause-no-trigger
 expect_rc barge-pause-unwatched 2
@@ -3472,11 +3487,7 @@ expect_rc barge-backchannel-terminal-stall 1 2
 # On a loaded machine the fake can also overrun before the stall, and the driver then names the
 # overrun, which turns the anchors' bound off as well: the case still must not PASS. It is no floor
 # case, so it does not count toward floor_cases.
-if grep -Fq "NOTE: recording: arecord reported an overrun" "$root/barge-backchannel-terminal-stall/out"; then
-  printf 'NOTE: %s: the fake arecord overran before the stall, and the driver named the overrun\n' barge-backchannel-terminal-stall
-else
-  expect_line barge-backchannel-terminal-stall 'NOTE: recording: the capture substream arecord held read CLOSED during the recording, so the recording'"'"'s early bounds come from its start alone'
-fi
+expect_discontinuity barge-backchannel-terminal-stall 'NOTE: recording: the capture substream arecord held read CLOSED during the recording, so the recording'"'"'s early bounds come from its start alone'
 expect_line barge-backchannel-terminal-stall 'barge-in:'
 expect_no_line barge-backchannel-terminal-stall 'PASS: barge-in: 0 of 1'
 expect_restored barge-backchannel-terminal-stall
@@ -3515,7 +3526,7 @@ expect_restored cancel-locked
 expect_load_case cancel-lock-start
 [[ -s $root/cancel-lock-start/state/arecord-locked ]] || check_failed 'cancel-lock-start: the fake arecord never locked its file away, so the case tested no failed read'
 expect_restored cancel-lock-start
-expect_line cancel-lock-start-wrongly "$unwatched_note"
+expect_discontinuity cancel-lock-start-wrongly "$unwatched_note"
 [[ -s $root/cancel-lock-start-wrongly/state/arecord-locked ]] || check_failed 'cancel-lock-start-wrongly: the fake arecord never locked its file away'
 evidence=$(unwatched_evidence cancel-lock-start-wrongly)
 [[ $evidence == present ]] \
