@@ -60,7 +60,8 @@ readonly lead_ms=100
 readonly fact_window_ms=400
 # A stop leaves at least this much silence at the Jabra; a pause between sentences is shorter.
 readonly stop_silence_ms=1000
-# A stop must come within this long of the talk-over clip's start.
+# A stop must come within this long of the talk-over clip's start; a "never mind" must cancel within
+# this long of its clip's start too, as both are a spoken command (ask-holder).
 readonly stop_window_ms=4000
 # Between two calls the Output is idle for longer than its 300 ms close.
 readonly idle_seconds=1
@@ -2281,6 +2282,35 @@ step_reach() {
   fi
 }
 
+# answered_by_never_mind TASK: the question TASK, working when the step said "never mind", is done,
+# not cancelled: the agent's answer landed first. Its time is the at_mono_ns of the service's
+# "concierge took an agent's answer" line for it (internal/concierge, Deliver: CLOCK_MONOTONIC read
+# right after the store took the answer, now_ms's clock). An answer taken by the time the clip
+# ended came before the voice could act on "never mind": UNKNOWN, as the cancel was not tested. So
+# does one taken while its cancel was still due: a spoken command has stop_window_ms from its clip's
+# start, as a stop phrase does. One taken after that: the voice did not cancel in time, FAIL. A
+# line without at_mono_ns, or none within the event timeout, cannot time it: UNKNOWN.
+answered_by_never_mind() {
+  local at deadline=$(($(now_ms) + event_timeout * 1000)) due=$((clip_started + stop_window_ms))
+  while :; do
+    at=$(journal_records "concierge took an agent's answer" \
+      | jq -r -s --arg id "$1" 'map(select(.task == $id)) | .[0] | if . == null then "" else ((.at_mono_ns | tonumber?) // -1) end') \
+      || unknown "ask-holder: cannot read the answer lines from the journal of $unit (process $unit_pid)$(journal_error)"
+    [[ -n $at ]] && break
+    (($(now_ms) < deadline)) \
+      || unknown "ask-holder: question $1 is done, not cancelled, and the journal has no \"concierge took an agent's answer\" line for it, so its answer cannot be timed against \"never mind\""
+    sleep 0.5
+  done
+  ((at >= 0)) \
+    || unknown "ask-holder: question $1 is done, not cancelled, and its \"concierge took an agent's answer\" line has no at_mono_ns, so its answer cannot be timed against \"never mind\""
+  at=$((at / 1000000))
+  ((at > clip_ended)) \
+    || unknown "ask-holder: the agent answered question $1 before \"never mind\" ended ($((clip_ended - at)) ms before the step's clip had played), so the cancel was not tested"
+  ((at > due)) \
+    || unknown "ask-holder: the agent answered question $1 $((at - clip_started)) ms after \"never mind\" began, before its cancel was due ($stop_window_ms ms), so the cancel was not tested"
+  fail "ask-holder: question $1 was answered $((at - clip_started)) ms after \"never mind\" began and not cancelled, though a spoken command has $stop_window_ms ms"
+}
+
 # step_ask_holder: verification c-ask-holder-live. The holder's case is read first; a holder that is
 # not live still gets the question, so that the run shows that no answer is spoken.
 step_ask_holder() {
@@ -2351,8 +2381,7 @@ step_ask_holder() {
   # working would end in a false "no second question" (k6 of #162: the fake's agent answered 5.7 s
   # after it was asked, and the step first read the page later). Done before "never mind" means the
   # cancel could not be tested: UNKNOWN. Cancelled or replaced before it is the voice's own doing:
-  # FAIL. A question that turns done after the step read it working, while "never mind" plays, is not
-  # told apart from a cancel the voice ignored, as the page gives no time for an answer: FAIL.
+  # FAIL. One that turns done once "never mind" plays is timed by its answer (answered_by_never_mind).
   wait_for_task "$session" "$issue_live" "$first" '' $(($(now_ms) + event_timeout * 1000)) \
     || fail "ask-holder: no second question about $issue_live on the session's page within $event_timeout s"
   second=$(jq -r '.id' <<<"$task")
@@ -2363,8 +2392,16 @@ step_ask_holder() {
     *) fail "ask-holder: question $second was $(jq -r '.state' <<<"$task") before the step said \"never mind\"" ;;
   esac
   play_clip 'never mind' "$never_mind"
-  wait_for_task "$session" "$issue_live" "$first" cancelled $(($(now_ms) + event_timeout * 1000)) \
-    || fail "ask-holder: question $second is not cancelled within $event_timeout s of \"never mind\""
+  deadline=$(($(now_ms) + event_timeout * 1000))
+  until wait_for_task "$session" "$issue_live" "$first" '' "$deadline" && [[ $(jq -r '.state' <<<"$task") != working ]]; do
+    (($(now_ms) < deadline)) || fail "ask-holder: question $second is not cancelled within $event_timeout s of \"never mind\""
+    sleep 0.5
+  done
+  case $(jq -r '.state' <<<"$task") in
+    cancelled) ;;
+    done) answered_by_never_mind "$second" ;;
+    *) fail "ask-holder: question $second was $(jq -r '.state' <<<"$task") after \"never mind\", not cancelled" ;;
+  esac
   pass "ask-holder: question $second is cancelled"
   deadline=$(($(now_ms) + event_timeout * 1000))
   while :; do

@@ -11,6 +11,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/sjawhar/ghost-wispr/internal/envoy"
+	"github.com/sjawhar/ghost-wispr/internal/monoclock"
 	"github.com/sjawhar/ghost-wispr/internal/storage"
 	"github.com/sjawhar/ghost-wispr/internal/voice"
 )
@@ -28,8 +29,10 @@ var errAskStillSending = errors.New("concierge: the reply names a question still
 // holds its local id, or when it names the request to reply again). A message
 // that names nothing is never taken as an answer: its sender is asked once,
 // per question, to reply with in_reply_to. The written answer is stored at
-// once, and announced on Answers once rewritten for the ear. A message that
-// is no answer to a task of a meeting the unit still holds changes nothing.
+// once, and announced on Answers once rewritten for the ear; its log line
+// carries at_mono_ns, CLOCK_MONOTONIC read right after the store took it, which
+// the acceptance driver compares with its own reads of that clock. A message
+// that is no answer to a task of a meeting the unit still holds changes nothing.
 // An error answers the frame nak, so Envoy delivers it again: a store that
 // could not be written, or a reply to a question still being sent.
 func (c *Concierge) Deliver(_ context.Context, message *envoy.Message) error {
@@ -38,6 +41,7 @@ func (c *Concierge) Deliver(_ context.Context, message *envoy.Message) error {
 		return err
 	}
 	answered, err := c.store.AnswerVoiceTask(task.ID, message.Text)
+	at := monoclock.Read()
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil
 	}
@@ -49,7 +53,11 @@ func (c *Concierge) Deliver(_ context.Context, message *envoy.Message) error {
 	if !answered {
 		return nil
 	}
-	c.logger.Info("concierge took an agent's answer", "task", task.ID, "session", task.SessionID)
+	attrs := []any{"task", task.ID, "session", task.SessionID}
+	if at > 0 {
+		attrs = append(attrs, "at_mono_ns", at)
+	}
+	c.logger.Info("concierge took an agent's answer", attrs...)
 	c.background(func(life context.Context) { c.announce(life, &task, message.Text) })
 	return nil
 }
