@@ -100,3 +100,50 @@ func TestTheSpeakersAudibleTimesReachTheTimingLog(t *testing.T) {
 		t.Fatalf("the closed Supervisor logged %d more audible lines", len(lines)-len(sent))
 	}
 }
+
+// TestAnAudibleLineNamesItsExchangesSession fails if an audible line heard
+// while an exchange waits for its recording session names no session, or a
+// later one: like the exchange's other timing lines (#130), it waits for the
+// session that started after the exchange opened, and keeps its own time. The
+// control, a sound of no exchange, names the session now.
+func TestAnAudibleLineNamesItsExchangesSession(t *testing.T) {
+	var speaker *hearingSpeaker
+	r := newRigWith(t, newFakeConcierge("The voice issue is in review."), func(cfg *SupervisorConfig, r *rig) {
+		speaker = &hearingSpeaker{fakeSpeaker: r.speaker}
+		cfg.Speaker = speaker
+	})
+	audible := func() []timingLine {
+		var out []timingLine
+		for _, l := range r.timingLines() {
+			if l.event == "audible" {
+				out = append(out, l)
+			}
+		}
+		return out
+	}
+	r.setSession("sess-0")
+	speaker.hear(audio.AudibleEvent{Input: audio.InputChime, At: 1_000, Err: 1001})
+	if got := audible(); len(got) != 1 || got[0].sessionID != "sess-0" {
+		t.Fatalf("control: a sound of no exchange gave %+v, want one audible line naming sess-0", got)
+	}
+	r.setSession("")
+	r.heard("Wispr, what is happening?", true, false)
+	eventually(t, "the exchange to open", func() bool {
+		r.s.mu.Lock()
+		defer r.s.mu.Unlock()
+		return r.s.ex != nil
+	})
+	before := monoclock.Now()
+	speaker.hear(audio.AudibleEvent{Input: audio.InputChime, At: 2_000, Err: 1001})
+	if got := audible(); len(got) != 1 {
+		t.Fatalf("before its session the exchange's audible line was written: %+v", got[1:])
+	}
+	r.startSession("sess-1")
+	got := audible()
+	if len(got) != 2 || got[1].sessionID != "sess-1" {
+		t.Fatalf("as its session started the exchange wrote %+v, want its audible line naming sess-1", got)
+	}
+	if got[1].at.Mono < before.Mono {
+		t.Fatalf("the held audible line is stamped %d, before the event was heard at %d", got[1].at.Mono, before.Mono)
+	}
+}

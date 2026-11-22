@@ -2485,16 +2485,19 @@ func (s *Supervisor) sendNotes() {
 // device, by the stream's own account (audio.AudibleEvent): the acceptance
 // driver times the answer against the chime in one recording of the room,
 // and the device's latency, the same for both, cancels. The times are on
-// CLOCK_MONOTONIC, the driver's clock.
+// CLOCK_MONOTONIC, the driver's clock. A line heard during an exchange names
+// its session, held until it has one, as its other timing lines are
+// (exTimingLocked); any other names the session now.
 func (s *Supervisor) onAudible(e audio.AudibleEvent) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	sessionID := ""
+	at := monoclock.Now()
+	kv := []any{"input", e.Input, "audible_mono_ns", e.At, "audible_lead_ns", e.Lead, "audible_err_ns", e.Err, "disruptions", e.Disruptions}
 	if s.ex != nil {
-		sessionID = s.ex.x.SessionID
+		s.exTimingLocked(s.ex, "audible", at, kv...)
+		return
 	}
-	s.timing("audible", sessionID, monoclock.Now(), "input", e.Input, "audible_mono_ns", e.At, "audible_lead_ns", e.Lead,
-		"audible_err_ns", e.Err, "disruptions", e.Disruptions)
+	s.timing("audible", s.sessionNow(), at, kv...)
 }
 
 // onSpeech follows the voice input's speech, for barge-in and the own-speech
