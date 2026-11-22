@@ -75,8 +75,8 @@ func TestAPIStatusSaysWhenEnvoyIsOffWithAHubNamed(t *testing.T) {
 			if resp.Notices == nil {
 				t.Fatalf("GET /api/status has no notices list: %s", rr.Body.String())
 			}
-			if want := tc.want; !slices.Equal(*resp.Notices, want) && !(len(want) == 0 && len(*resp.Notices) == 0) {
-				t.Errorf("notices = %q, want %q", *resp.Notices, want)
+			if !slices.Equal(*resp.Notices, tc.want) {
+				t.Errorf("notices = %q, want %q", *resp.Notices, tc.want)
 			}
 			if len(resp.Warnings) != 0 {
 				t.Errorf("warnings = %q, want none: an Envoy turned off on purpose is a notice", resp.Warnings)

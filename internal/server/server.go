@@ -149,7 +149,7 @@ func unitOnlyWarning(n int) string {
 // with Envoy on again publishes each summary completed meanwhile. A notice, not
 // a warning: the rollout's check and the acceptance scripts need warnings
 // empty, and Envoy off is on purpose.
-func envoyOffNotice(cfg config.Config) string {
+func envoyOffNotice(cfg *config.Config) string {
 	if cfg.EnvoyEnabled || strings.TrimSpace(cfg.EnvoyHubURL) == "" {
 		return ""
 	}

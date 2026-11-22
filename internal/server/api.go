@@ -1370,7 +1370,8 @@ func registerAPIRoutes(mux routeMux, store SessionStore, controls *ControlHooks,
 		}
 		notices := []string{}
 		if cfgStore != nil {
-			if notice := envoyOffNotice(cfgStore.Get()); notice != "" {
+			cfg := cfgStore.Get()
+			if notice := envoyOffNotice(&cfg); notice != "" {
 				notices = append(notices, notice)
 			}
 		}
