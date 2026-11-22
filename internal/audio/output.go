@@ -250,14 +250,16 @@ type Output struct {
 }
 
 // timedAudible is a speech's audible event, timed, the disruptions before the
-// write that carried its first sample, and the stream's trigger timestamp in
-// the account that timed it: it is reported once its time has passed with no
-// disruption since, and the stream, read then, still runs from that trigger
+// write that carried its first sample, the stream's trigger timestamp in the
+// account that timed it, and the sample's stream position: it is reported
+// once its time has passed with no disruption since, and the stream, read
+// then, still runs from that trigger and has played up to the sample
 // (settleAudibles).
 type timedAudible struct {
-	event   AudibleEvent
-	since   uint64
-	trigger int64
+	event    AudibleEvent
+	since    uint64
+	trigger  int64
+	position int64
 }
 
 // outputInput is one input's queue and its part in the mix. The Output's mu
@@ -1714,13 +1716,18 @@ func (o *Output) disrupted() {
 // settleAudibles reports each timed audible event whose time, with its error,
 // has passed by CLOCK_MONOTONIC with no disruption since the write that
 // carried its sample, and drops each a disruption came to. Before it reports
-// one, the stream itself confirms that it played on: a status read after the
-// time must find it running, from the trigger of the account that timed the
-// event (Sol's review of #154 at ce454880: a suspend between two writes is
-// seen by no write). A status that shows a stop, a suspend or another trigger
-// is a disruption; one that cannot be read reports nothing. closing, as the
-// stream closes, drops what has not come due: no account of a closed stream
-// says when it plays.
+// one, the stream itself confirms that it played on: its account read after
+// the time (two status snapshots, playPosition) must find it running, from
+// the trigger of the account that timed the event, and its pointer past the
+// event's sample (Sol's reviews of #154 at ce454880, where a suspend between
+// two writes was seen by no write, and at 7444ec94, where an old kernel's
+// status showed RUNNING for a PCM it had just stopped). An account that shows
+// a stop, a suspend or another trigger is a disruption. One that shows the
+// stream running from that trigger with its pointer not yet past the sample,
+// as a pointer that moves a period at a time can, keeps the event waiting for
+// a later account. One that cannot be read reports nothing. closing, as the
+// stream closes, drops what is still held: no account of a closed stream says
+// when it plays.
 func (o *Output) settleAudibles(stream PlaybackStream, closing bool) {
 	nowMono := monoclock.Read()
 	o.mu.Lock()
@@ -1743,10 +1750,16 @@ func (o *Output) settleAudibles(stream PlaybackStream, closing bool) {
 		due := nowMono != 0 && nowMono >= t.event.At.Mono+t.event.Err
 		switch {
 		case t.since != o.disruptions:
-		case due && read && pos.running && pos.trigger == t.trigger:
+		case due && read && pos.running && pos.trigger == t.trigger && o.pos-int64(pos.delay) >= t.position:
 			t.event.Disruptions = o.disruptions
 			o.audibles = append(o.audibles, t.event)
 			signal(o.eventWake)
+		case due && read && pos.running && pos.trigger == t.trigger:
+			// Running on from the same trigger, its pointer not yet past
+			// the sample: a later account decides.
+			if !closing {
+				kept = append(kept, t)
+			}
 		case due && read:
 			// The stream stopped, or started again, since the account that
 			// timed the event: nothing held across that is timed.
@@ -1812,7 +1825,7 @@ func (o *Output) timeAudible(stream PlaybackStream, rate int) {
 		}
 		in.audiblePending = false
 		at := mid + (in.audibleAt-played)*second/int64(rate)
-		o.timed = append(o.timed, timedAudible{since: in.audibleSince, trigger: pos.trigger, event: AudibleEvent{
+		o.timed = append(o.timed, timedAudible{since: in.audibleSince, trigger: pos.trigger, position: in.audibleAt, event: AudibleEvent{
 			Input: in.name,
 			At:    monoclock.Stamp{Wall: pos.wall.Add(time.Duration(at - pos.before)), Mono: at},
 			Lead:  (in.audibleLead*second + int64(rate) - 1) / int64(rate),

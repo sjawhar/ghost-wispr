@@ -121,28 +121,37 @@ func (s *alsaStream) queuedFrames() int {
 	return held + s.params.buffer
 }
 
-// playPosition reads one status snapshot of the PCM, its state, its delay
-// (what it was given and has not yet played, with what the driver counts in
-// flight to the speaker) and its trigger timestamp, between two reads of
-// CLOCK_MONOTONIC, with the wall clock read right after the first (Output's
-// timeAudible and settleAudibles). A snapshot that fails, or a clock that
-// cannot be read, gives none. A suspended PCM it finds is a break (breaks),
-// as it is when a write finds it.
+// playPosition reads two status snapshots of the PCM, one right after the
+// other, between two reads of CLOCK_MONOTONIC, with the wall clock read right
+// after the first (Output's timeAudible and settleAudibles). It gives the
+// second's delay (what the PCM was given and has not yet played, with what
+// the driver counts in flight to the speaker) and trigger timestamp, and
+// running only when both snapshots show it running from the same trigger.
+// A kernel without Linux's 81d17d6911a7 ("ALSA: pcm: update state after
+// xrun") copies the state and trigger into a status before it updates the
+// hardware pointer, which can find an XRUN and stop the PCM: that snapshot
+// shows RUNNING for a PCM it has just stopped (Sol's review of #154 at
+// 7444ec94). The second snapshot is copied after the first's update, so it
+// shows the stop. A snapshot that fails, or a clock that cannot be read,
+// gives none. A suspended PCM either finds is a break (breaks), as it is when
+// a write finds it.
 func (s *alsaStream) playPosition() (playPosition, bool) {
 	before, ok := monotonicNanos()
 	if !ok {
 		return playPosition{}, false
 	}
 	wall := time.Now()
-	st := s.pcm.status()
+	first := s.pcm.status()
+	second := s.pcm.status()
 	after, ok := monotonicNanos()
-	if !ok || st.rc < 0 {
+	if !ok || first.rc < 0 || second.rc < 0 {
 		return playPosition{}, false
 	}
-	if st.suspended {
+	if first.suspended || second.suspended {
 		s.broke++
 	}
-	return playPosition{running: st.running, delay: max(0, st.delay), trigger: st.trigger, before: before, after: after, wall: wall}, true
+	running := first.running && second.running && first.trigger == second.trigger
+	return playPosition{running: running, delay: max(0, second.delay), trigger: second.trigger, before: before, after: after, wall: wall}, true
 }
 
 // breaks reports how many times the PCM's playback broke (broke): what it

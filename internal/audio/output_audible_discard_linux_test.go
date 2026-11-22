@@ -446,6 +446,134 @@ func TestOrdinaryStartsAreTimed(t *testing.T) {
 	}
 }
 
+// staleStatusPCM is a fakePCM whose status, with fault set, behaves as a
+// kernel without Linux's 81d17d6911a7 does when the driver's pointer reports
+// an XRUN: it copies the state and trigger first, then updates the hardware
+// pointer, which finds the XRUN and stops the PCM. That status shows RUNNING,
+// with the old trigger and a delay of 0, for a PCM it has just stopped; with
+// fixed set, it shows the stop, as a kernel with that commit does (Sol's
+// review of #154 at 7444ec94).
+type staleStatusPCM struct {
+	*fakePCM
+	fault, fixed bool
+}
+
+func (p *staleStatusPCM) status() pcmStatus {
+	st := p.fakePCM.status()
+	st.trigger = 100
+	if p.fault {
+		p.mu.Lock()
+		p.stop(p.runs[len(p.runs)-1], time.Now())
+		p.xrun = true
+		p.mu.Unlock()
+		st.delay = 0
+		if p.fixed {
+			st.running, st.trigger = false, 200
+		}
+	}
+	return st
+}
+
+// TestAnAudibleTimeIsNotReleasedByAStaleRunningStatus fails if a held chime
+// is reported when the status read at its release shows RUNNING, with the
+// old trigger, for a PCM that status just stopped on an XRUN: the chime never
+// played (Sol's review of #154 at 7444ec94: 3 of 3 released). The controls: an
+// ordinary release reports the chime, and a kernel that shows the stop
+// reports nothing.
+func TestAnAudibleTimeIsNotReleasedByAStaleRunningStatus(t *testing.T) {
+	for _, mode := range []string{"ordinary", "a kernel that shows the stop", "an old kernel's stale RUNNING"} {
+		t.Run(mode, func(t *testing.T) {
+			pcm := &staleStatusPCM{fakePCM: newFakePCM(48000, 3840), fixed: mode == "a kernel that shows the stop"}
+			pcm.lockstep = true
+			frame := make([]int16, 3840)
+			for i := 3360; i < len(frame); i++ {
+				frame[i] = 3000
+			}
+			if n := pcm.writei(frame, len(frame)); n != len(frame) {
+				t.Fatalf("fixture: the PCM took %d frames", n)
+			}
+			stream := newALSAStream(pcm, "stale-status", alsaParams{rate: 48000, channels: 1, period: 480, buffer: 3840})
+			in := &outputInput{name: InputChime, audiblePending: true, audibleAt: 3360}
+			out := &Output{order: []*outputInput{in}, pos: 3840, eventWake: make(chan struct{}, 1)}
+			out.timeAudible(stream, 48000)
+			if len(out.timed) != 1 {
+				t.Fatal("fixture: the chime was not timed")
+			}
+			event := out.timed[0].event
+			pcm.fault = mode != "ordinary"
+			if left := event.At.Mono + event.Err - monoclock.Read(); left > 0 {
+				time.Sleep(time.Duration(left) + time.Millisecond)
+			}
+			if !pcm.fault {
+				pcm.mu.Lock()
+				pcm.runs[0].taken, pcm.clock = len(frame), len(frame)
+				pcm.mu.Unlock()
+			}
+			out.settleAudibles(stream, false)
+			heard := 0
+			pcm.heard(func(v int16, _ time.Time) {
+				if v > 1000 {
+					heard++
+				}
+			})
+			if !pcm.fault {
+				if len(out.audibles) != 1 || heard != 480 {
+					t.Fatalf("control: %d events, %d chime samples heard; want 1 event and 480", len(out.audibles), heard)
+				}
+				return
+			}
+			if !pcm.xrun || heard != 0 {
+				t.Fatalf("fixture: xrun %v, %d chime samples heard", pcm.xrun, heard)
+			}
+			if len(out.audibles) != 0 {
+				t.Fatalf("the chime was reported, with %d of its samples heard, after the status read at its release stopped the PCM on an XRUN: %+v", heard, out.audibles[0])
+			}
+		})
+	}
+}
+
+// pointerPCM is a sinkPCM that runs from one trigger with the delay the test
+// sets (behind): how far its pointer is behind what it was given.
+type pointerPCM struct {
+	*sinkPCM
+	behind int
+}
+
+func (p *pointerPCM) status() pcmStatus {
+	return pcmStatus{running: true, delay: p.behind, avail: p.buffer - p.behind, trigger: 100}
+}
+
+// TestAnAudibleTimeIsReleasedOnlyOnceThePointerPassesItsSample fails if a held
+// chime is reported while the stream's pointer, read at its release, is not
+// yet past the chime's first sample, or if such an account drops the chime
+// rather than waiting for a later one: a pointer that moves a period at a time
+// lags the account's clock, and the chime is reported once an account shows
+// the sample played, the stream running from the same trigger throughout.
+func TestAnAudibleTimeIsReleasedOnlyOnceThePointerPassesItsSample(t *testing.T) {
+	pcm := &pointerPCM{sinkPCM: &sinkPCM{buffer: 3840}, behind: 3840}
+	stream := newALSAStream(pcm, "pointer", alsaParams{rate: 48000, channels: 1, period: 480, buffer: 3840})
+	in := &outputInput{name: InputChime, audiblePending: true, audibleAt: 3360}
+	out := &Output{order: []*outputInput{in}, pos: 3840, eventWake: make(chan struct{}, 1)}
+	out.timeAudible(stream, 48000)
+	if len(out.timed) != 1 {
+		t.Fatal("fixture: the chime was not timed")
+	}
+	event := out.timed[0].event
+	if left := event.At.Mono + event.Err - monoclock.Read(); left > 0 {
+		time.Sleep(time.Duration(left) + time.Millisecond)
+	}
+	pcm.behind = 3840 - 3000 // played 3000 of 3840: 360 short of the chime's first sample
+	out.settleAudibles(stream, false)
+	if len(out.audibles) != 0 || len(out.timed) != 1 || out.disruptions != 0 {
+		t.Fatalf("with the pointer behind the chime: %d events, %d held, %d disruptions; want the chime still held, unreported", len(out.audibles), len(out.timed), out.disruptions)
+	}
+	pcm.behind = 3840 - 3400 // played past it
+	out.settleAudibles(stream, false)
+	if len(out.audibles) != 1 || out.audibles[0].At != event.At {
+		t.Fatalf("with the pointer past the chime: events %+v, want the chime timed at %+v", out.audibles, event.At)
+	}
+}
+
 // failingStatusPCM is a sinkPCM whose status fails while fail is set.
 type failingStatusPCM struct {
 	*sinkPCM
