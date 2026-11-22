@@ -548,7 +548,7 @@ func NewSupervisor(c *SupervisorConfig) *Supervisor {
 	s.unlisten = cfg.Speaker.OnSpeech(func(e audio.SpeechEvent) { s.onSpeech(&e) })
 	s.unhear = func() {}
 	if a, ok := cfg.Speaker.(audibleSpeaker); ok {
-		s.unhear = a.OnAudible(s.onAudible)
+		s.unhear = a.OnAudible(func(e audio.AudibleEvent) { s.onAudible(&e) })
 	}
 	s.spawn(s.sendNotes)
 	s.spawn(s.offerAnswers)
@@ -2491,7 +2491,7 @@ func (s *Supervisor) sendNotes() {
 // driver times an answer by its own speech's line, not another's. A line
 // heard during an exchange names its session, held until it has one, as its
 // other timing lines are (exTimingLocked); any other names the session now.
-func (s *Supervisor) onAudible(e audio.AudibleEvent) {
+func (s *Supervisor) onAudible(e *audio.AudibleEvent) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	kv := []any{"input", e.Input, "speech", e.Speech, "audible_mono_ns", e.At.Mono, "audible_lead_ns", e.Lead, "audible_err_ns", e.Err, "disruptions", e.Disruptions}

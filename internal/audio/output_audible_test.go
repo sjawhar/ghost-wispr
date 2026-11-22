@@ -174,7 +174,7 @@ func (r *audibleRig) firstNonzero(from int64) int64 {
 // e.At: its read's middle plus p less what it had played (written less its
 // delay), at 48 kHz. It fails the test when none does, or when e.At's wall
 // time is not its CLOCK_MONOTONIC moved as the account's wall clock is.
-func (r *audibleRig) timedBy(e AudibleEvent, p int64) positionRead {
+func (r *audibleRig) timedBy(e *AudibleEvent, p int64) positionRead {
 	r.t.Helper()
 	if !e.At.Wall.Equal(clockedWall.Add(time.Duration(e.At.Mono))) {
 		r.t.Fatalf("the event's wall time %v does not go with its CLOCK_MONOTONIC %d: want %v", e.At.Wall, e.At.Mono, clockedWall.Add(time.Duration(e.At.Mono)))
@@ -202,12 +202,12 @@ func TestAudibleEventsTimeEachSpeechsFirstSampleByTheStreamsAccount(t *testing.T
 	chime := r.waitAudible(InputChime)
 	r.waitSpeech(InputChime, false)
 	chimeAt := r.firstNonzero(0)
-	r.timedBy(chime, chimeAt)
+	r.timedBy(&chime, chimeAt)
 
 	r.play(InputVoice, 48000, 100*time.Millisecond, 3000)
 	voice := r.waitAudible(InputVoice)
 	voiceAt := r.firstNonzero(chimeAt + 4800)
-	r.timedBy(voice, voiceAt)
+	r.timedBy(&voice, voiceAt)
 
 	for _, e := range []AudibleEvent{chime, voice} {
 		if e.Lead != 0 || e.Err != 1001 || e.Disruptions != 0 {
@@ -264,7 +264,7 @@ func TestAudibleEventWaitsForTheStreamToRun(t *testing.T) {
 	ran := len(r.stream.accounts())
 	r.stream.set(true, 0)
 	chime := r.waitAudible(InputChime)
-	a := r.timedBy(chime, r.firstNonzero(0))
+	a := r.timedBy(&chime, r.firstNonzero(0))
 	if !slices.Contains(r.stream.accounts()[ran:], a) {
 		t.Fatalf("the chime was timed by an account from before the stream ran: %+v", a)
 	}

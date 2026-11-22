@@ -123,18 +123,30 @@ func (s *alsaStream) queuedFrames() int {
 
 // playPosition reads two status snapshots of the PCM, one right after the
 // other, between two reads of CLOCK_MONOTONIC, with the wall clock read right
-// after the first (Output's timeAudible and settleAudibles). It gives the
-// second's delay (what the PCM was given and has not yet played, with what
-// the driver counts in flight to the speaker) and trigger timestamp, and
-// running only when both snapshots show it running from the same trigger.
-// A kernel without Linux's 81d17d6911a7 ("ALSA: pcm: update state after
-// xrun") copies the state and trigger into a status before it updates the
-// hardware pointer, which can find an XRUN and stop the PCM: that snapshot
-// shows RUNNING for a PCM it has just stopped (Sol's review of #154 at
-// 7444ec94). The second snapshot is copied after the first's update, so it
-// shows the stop. A snapshot that fails, or a clock that cannot be read,
-// gives none. A suspended PCM either finds is a break (breaks), as it is when
-// a write finds it.
+// after the first (Output's timeAudible and settleAudibles). It gives running
+// only when both snapshots show the PCM running from the same trigger, and
+// then the first's delay (what the PCM was given and has not yet played, with
+// what the driver counts in flight to the speaker) and trigger.
+//
+// Each snapshot is a full snd_pcm_status: the SNDRV_PCM_IOCTL_STATUS(_EXT)
+// ioctl, which runs snd_pcm_status64. A kernel without Linux's 81d17d6911a7
+// ("ALSA: pcm: update state after xrun"), v6.12 among them, copies the state
+// and the trigger timestamp into the status first (sound/core/pcm_native.c
+// at v6.12, lines 1032 and 1036–1037), and only then, while running, calls
+// snd_pcm_update_hw_ptr (line 1039). That update can find an XRUN and stop
+// the PCM (pcm_lib.c lines 324–325, 168–180): snd_pcm_post_stop sets the
+// state and a new trigger timestamp (pcm_native.c lines 1519–1525). The
+// delay is taken after the update, and is 0 once stopped (lines 1074–1075).
+// So a snapshot whose update finds the XRUN shows RUNNING, with the old
+// trigger and a delay of 0, for a PCM it has just stopped (Sol's review of
+// #154 at 7444ec94). Each call takes the stream lock (line 1014), so the
+// second snapshot copies the state after the first's update: when the first
+// found the XRUN, the second shows the stop. When only the second finds one,
+// the first's update found none, so its delay was read while the PCM ran from
+// that trigger: it is the first's delay that is given, never the second's. A
+// snapshot that fails, or a clock that cannot be read, gives none. A
+// suspended PCM either finds is a break (breaks), as it is when a write finds
+// it.
 func (s *alsaStream) playPosition() (playPosition, bool) {
 	before, ok := monotonicNanos()
 	if !ok {
@@ -151,7 +163,7 @@ func (s *alsaStream) playPosition() (playPosition, bool) {
 		s.broke++
 	}
 	running := first.running && second.running && first.trigger == second.trigger
-	return playPosition{running: running, delay: max(0, second.delay), trigger: second.trigger, before: before, after: after, wall: wall}, true
+	return playPosition{running: running, delay: max(0, first.delay), trigger: first.trigger, before: before, after: after, wall: wall}, true
 }
 
 // breaks reports how many times the PCM's playback broke (broke): what it

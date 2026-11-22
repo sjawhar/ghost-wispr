@@ -34,7 +34,7 @@ func (s *hearingSpeaker) OnAudible(fn func(audio.AudibleEvent)) func() {
 	}
 }
 
-func (s *hearingSpeaker) hear(e audio.AudibleEvent) {
+func (s *hearingSpeaker) hear(e *audio.AudibleEvent) {
 	s.mu.Lock()
 	fns := make([]func(audio.AudibleEvent), 0, len(s.fns))
 	for _, fn := range s.fns {
@@ -42,7 +42,7 @@ func (s *hearingSpeaker) hear(e audio.AudibleEvent) {
 	}
 	s.mu.Unlock()
 	for _, fn := range fns {
-		fn(e)
+		fn(*e)
 	}
 }
 
@@ -75,8 +75,8 @@ func TestTheSpeakersAudibleTimesReachTheTimingLog(t *testing.T) {
 		{Input: audio.InputChime, Speech: 7, At: monoclock.Stamp{Wall: wall, Mono: 1_000_000_123}, Lead: 0, Err: 1001, Disruptions: 2},
 		{Input: audio.InputVoice, Speech: 8, At: monoclock.Stamp{Wall: wall.Add(900 * time.Millisecond), Mono: 1_900_000_456}, Lead: 666_667, Err: 1500, Disruptions: 2},
 	}
-	for _, e := range sent {
-		speaker.hear(e)
+	for i := range sent {
+		speaker.hear(&sent[i])
 	}
 	mu.Lock()
 	got, gotAt := append([][]any(nil), lines...), append([]monoclock.Stamp(nil), stamps...)
@@ -102,7 +102,7 @@ func TestTheSpeakersAudibleTimesReachTheTimingLog(t *testing.T) {
 	}
 
 	r.s.Close()
-	speaker.hear(sent[0])
+	speaker.hear(&sent[0])
 	mu.Lock()
 	defer mu.Unlock()
 	if len(lines) != len(sent) {
@@ -131,7 +131,7 @@ func TestAnAudibleLineNamesItsExchangesSession(t *testing.T) {
 		return out
 	}
 	r.setSession("sess-0")
-	speaker.hear(audio.AudibleEvent{Input: audio.InputChime, At: monoclock.Stamp{Wall: time.Now(), Mono: 1_000}, Err: 1001})
+	speaker.hear(&audio.AudibleEvent{Input: audio.InputChime, At: monoclock.Stamp{Wall: time.Now(), Mono: 1_000}, Err: 1001})
 	if got := audible(); len(got) != 1 || got[0].sessionID != "sess-0" {
 		t.Fatalf("control: a sound of no exchange gave %+v, want one audible line naming sess-0", got)
 	}
@@ -143,7 +143,7 @@ func TestAnAudibleLineNamesItsExchangesSession(t *testing.T) {
 		return r.s.ex != nil
 	})
 	held := audio.AudibleEvent{Input: audio.InputChime, At: monoclock.Stamp{Wall: time.Now(), Mono: 2_000}, Err: 1001}
-	speaker.hear(held)
+	speaker.hear(&held)
 	if got := audible(); len(got) != 1 {
 		t.Fatalf("before its session the exchange's audible line was written: %+v", got[1:])
 	}

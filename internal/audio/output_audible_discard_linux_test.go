@@ -446,44 +446,63 @@ func TestOrdinaryStartsAreTimed(t *testing.T) {
 	}
 }
 
-// staleStatusPCM is a fakePCM whose status, with fault set, behaves as a
+// staleStatusPCM is a fakePCM whose status, once fault is set, behaves as a
 // kernel without Linux's 81d17d6911a7 does when the driver's pointer reports
-// an XRUN: it copies the state and trigger first, then updates the hardware
-// pointer, which finds the XRUN and stops the PCM. That status shows RUNNING,
-// with the old trigger and a delay of 0, for a PCM it has just stopped; with
-// fixed set, it shows the stop, as a kernel with that commit does (Sol's
-// review of #154 at 7444ec94).
+// an XRUN: the status call that finds it (the faultOn-th after fault is set)
+// copies the state and trigger first, then updates the hardware pointer,
+// which finds the XRUN and stops the PCM. That status shows RUNNING, with the
+// old trigger and a delay of 0, for a PCM it has just stopped; with fixed
+// set, it shows the stop, as a kernel with that commit does (Sol's review of
+// #154 at 7444ec94). Each call after it finds the PCM stopped.
 type staleStatusPCM struct {
 	*fakePCM
-	fault, fixed bool
+	fault, fixed   bool
+	faultOn, calls int
 }
 
 func (p *staleStatusPCM) status() pcmStatus {
 	st := p.fakePCM.status()
 	st.trigger = 100
-	if p.fault {
-		p.mu.Lock()
-		p.stop(p.runs[len(p.runs)-1], time.Now())
-		p.xrun = true
-		p.mu.Unlock()
-		st.delay = 0
-		if p.fixed {
-			st.running, st.trigger = false, 200
-		}
+	if !p.fault {
+		return st
+	}
+	p.calls++
+	if p.calls != p.faultOn {
+		return st
+	}
+	p.mu.Lock()
+	p.stop(p.runs[len(p.runs)-1], time.Now())
+	p.xrun = true
+	p.mu.Unlock()
+	st.delay = 0
+	if p.fixed {
+		st.running, st.trigger = false, 200
 	}
 	return st
 }
 
 // TestAnAudibleTimeIsNotReleasedByAStaleRunningStatus fails if a held chime
-// is reported when the status read at its release shows RUNNING, with the
-// old trigger, for a PCM that status just stopped on an XRUN: the chime never
-// played (Sol's review of #154 at 7444ec94: 3 of 3 released). The controls: an
-// ordinary release reports the chime, and a kernel that shows the stop
-// reports nothing.
+// is reported when a status read at its release shows RUNNING, with the old
+// trigger, for a PCM that status just stopped on an XRUN: the chime never
+// played (Sol's review of #154 at 7444ec94: 3 of 3 released). The account
+// reads two snapshots; the XRUN is found by the first, whose stale RUNNING the
+// second shows stopped, or by the second, whose stale delay of 0 must not
+// stand for the pointer: the first's delay, read while the stream ran, does.
+// The controls: an ordinary release reports the chime, and a kernel that
+// shows the stop reports nothing.
 func TestAnAudibleTimeIsNotReleasedByAStaleRunningStatus(t *testing.T) {
-	for _, mode := range []string{"ordinary", "a kernel that shows the stop", "an old kernel's stale RUNNING"} {
-		t.Run(mode, func(t *testing.T) {
-			pcm := &staleStatusPCM{fakePCM: newFakePCM(48000, 3840), fixed: mode == "a kernel that shows the stop"}
+	for _, tc := range []struct {
+		mode            string
+		faultOn         int
+		fixed, ordinary bool
+	}{
+		{mode: "ordinary", ordinary: true},
+		{mode: "a kernel that shows the stop", faultOn: 1, fixed: true},
+		{mode: "an old kernel's stale RUNNING, found by the first read", faultOn: 1},
+		{mode: "an old kernel's stale RUNNING, found by the second read", faultOn: 2},
+	} {
+		t.Run(tc.mode, func(t *testing.T) {
+			pcm := &staleStatusPCM{fakePCM: newFakePCM(48000, 3840), fixed: tc.fixed, faultOn: tc.faultOn}
 			pcm.lockstep = true
 			frame := make([]int16, 3840)
 			for i := 3360; i < len(frame); i++ {
@@ -500,7 +519,7 @@ func TestAnAudibleTimeIsNotReleasedByAStaleRunningStatus(t *testing.T) {
 				t.Fatal("fixture: the chime was not timed")
 			}
 			event := out.timed[0].event
-			pcm.fault = mode != "ordinary"
+			pcm.fault = !tc.ordinary
 			if left := event.At.Mono + event.Err - monoclock.Read(); left > 0 {
 				time.Sleep(time.Duration(left) + time.Millisecond)
 			}
