@@ -522,31 +522,42 @@ def record(path, anchors, pidfile, root):
     5 s. Each read from the first sample on is followed by a read of the state of the capture
     substream arecord holds (capture_state under ROOT). Only when that state is RUNNING, from the
     trigger of the first such read, is the anchor written with BEFORE_US, the floor that bounds
-    later samples from below; otherwise it is written "US BYTES", a late bound alone, and
-    "discontinuous US STATE" is printed once: an overrun (XRUN), a suspend, a restart (another
-    trigger) or a substream gone (CLOSED) that arecord may not live to report. A state read after
-    the size can be later than it, never earlier (Sol's review of #149 at b7edd969: arecord can end
-    a held write and close without another read that would report the overrun)."""
+    later samples from below; otherwise it is written "US BYTES", a late bound alone. An overrun
+    (XRUN), a suspend or a restart (another trigger) prints "discontinuous US STATE" once: arecord
+    may not live to report it. A substream gone is arecord closing its capture, as it does as it
+    ends, and breaks nothing unless samples land after it: a write arecord held across an overrun
+    and finished as it closed (Sol's review of #149 at b7edd969). So on finding it gone the size is
+    read again at once, and that read or any later one that finds the file longer than at the close
+    prints "discontinuous US CLOSED". A state read after the size can be later than it, never
+    earlier."""
     signal.signal(signal.SIGINT, signal.SIG_IGN)
     signal.signal(signal.SIGTERM, stop)
     read = size_reader(path)
     out = open(anchors, "a", buffering=1)
     pid, deadline, started, ready, trigger = None, None, None, False, None
     # The first discontinuity seen, printed after "started": the driver reads that line second.
-    broken, reported = None, False
+    # closed is the file's size when the substream was first found gone.
+    broken, reported, closed = None, False, None
 
     def anchored(seen, size, before):
         """Write the anchor of a read with samples, its floor only if the substream ran on."""
-        nonlocal broken, trigger
+        nonlocal broken, trigger, closed
         state, now_trigger = capture_state(root, pid)
         if state == "RUNNING" and trigger is None:
             trigger = now_trigger
-        if state == "RUNNING" and now_trigger == trigger:
+        if state == "RUNNING" and now_trigger == trigger and closed is None:
             out.write("%d %d %d\n" % (seen, size, before))
             return
         out.write("%d %d\n" % (seen, size))
+        if state is None:
+            again = read(pid)
+            if closed is None:
+                closed = size
+            if broken is None and (again is None or again > closed or size > closed):
+                broken = "discontinuous %d CLOSED" % seen
+            return
         if broken is None:
-            broken = "discontinuous %d %s" % (seen, "RESTARTED" if state == "RUNNING" else state or "CLOSED")
+            broken = "discontinuous %d %s" % (seen, "RESTARTED" if state == "RUNNING" else state)
 
     def report():
         nonlocal reported

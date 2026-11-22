@@ -469,7 +469,10 @@ EOF
 # state read after the size finds the capture substream RUNNING from the trigger of its first such
 # read (Sol's review of #149 at b7edd969: a substream that closed, read after a stale size, kept the
 # floor). Here a writer plays arecord: it writes a header, then samples, while the test sets the
-# substream's status; each case must leave three-field anchors exactly where the state allowed.
+# substream's status; each case must leave three-field anchors exactly where the state allowed. A
+# substream that closes after the writer's last sample, while the writer lives on (closed-at-end, as
+# arecord closes its capture before it exits), breaks nothing: no discontinuity, and no floor after
+# the close. One that closes while samples still land (closed) is a discontinuity.
 python3 - "$work_dir/mono.py" "$work_dir" <<'EOF' || fail "mono_py's sampler kept a floor it could not show (above)"
 import os, signal, subprocess, sys, threading, time
 src, base = sys.argv[1], sys.argv[2]
@@ -482,16 +485,19 @@ except SystemExit:
 sys.argv = argv
 failures = []
 for case, states in (("running", ["RUNNING 1"] * 4), ("closed", ["RUNNING 1", "closed"]),
-                     ("xrun", ["RUNNING 1", "XRUN 1"]), ("restarted", ["RUNNING 1", "RUNNING 2"])):
+                     ("xrun", ["RUNNING 1", "XRUN 1"]), ("restarted", ["RUNNING 1", "RUNNING 2"]),
+                     ("closed-at-end", ["RUNNING 1"] * 5 + ["closed"])):
     work = os.path.join(base, "sampler-" + case)
     status_dir = os.path.join(work, "asound", "card4", "pcm0c", "sub0")
     os.makedirs(status_dir)
     path, anchors, pidfile = (os.path.join(work, n) for n in ("r.wav", "anchors", "pid"))
-    # It opens the file 0.2 s on, after the sampler's first read, as arecord starts after it.
+    # It opens the file 0.2 s on, after the sampler's first read, as arecord starts after it. In
+    # closed-at-end it lives 1.5 s past its last sample, which lands about 2.8 s on.
     writer = subprocess.Popen([sys.executable, "-c", (
         "import sys, time\n"
         "time.sleep(0.2); f = open(sys.argv[1], 'wb'); f.write(bytes(44)); f.flush(); time.sleep(0.05)\n"
-        "for _ in range(250): f.write(b'\\1\\0' * 240); f.flush(); time.sleep(0.01)\n"), path])
+        "for _ in range(250): f.write(b'\\1\\0' * 240); f.flush(); time.sleep(0.01)\n"
+        + ("time.sleep(1.5)\n" if case == "closed-at-end" else "")), path])
     with open(pidfile, "w") as f:
         f.write(str(writer.pid))
 
@@ -522,9 +528,11 @@ for case, states in (("running", ["RUNNING 1"] * 4), ("closed", ["RUNNING 1", "c
     sampled = [l for l in lines if int(l[1]) > 44]
     floors = [l for l in sampled if len(l) == 3]
     reported = [l for l in out.splitlines() if l.startswith("discontinuous ")]
-    if case == "running":
+    if case in ("running", "closed-at-end"):
         if not floors or reported:
-            failures.append("running: %d floor anchors, discontinuous %r; want floors and none" % (len(floors), reported))
+            failures.append("%s: %d floor anchors, discontinuous %r; want floors and none" % (case, len(floors), reported))
+        if case == "closed-at-end" and lines and len(lines[-1]) == 3:
+            failures.append("closed-at-end: the last anchor, read after the close, kept its floor: %r" % lines[-1])
         continue
     want = {"closed": "CLOSED", "xrun": "XRUN", "restarted": "RESTARTED"}[case]
     if len(reported) != 1 or not reported[0].endswith(" " + want):
