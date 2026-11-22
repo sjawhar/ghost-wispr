@@ -216,7 +216,12 @@
         expandedPreset = name
       }
     } catch (error) {
-      if (stillOpen()) {
+      if (!stillOpen()) return
+      // The unit answers 404 to a save of fields to a preset it does not
+      // hold: another tab or the unit deleted it while it was open here.
+      if (opened !== '__new__' && error instanceof ConfigRequestError && error.status === 404) {
+        feedback = 'This preset was deleted elsewhere.'
+      } else {
         feedback = error instanceof Error ? error.message : 'Save failed'
       }
     } finally {

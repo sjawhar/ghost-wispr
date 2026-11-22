@@ -241,4 +241,47 @@ describe('SettingsPage', () => {
       ]),
     )
   })
+
+  // A General save goes out first and its answer, with voice Kore, lands
+  // last; the voice save of Puck goes out second and lands first. The older
+  // answer must not put Kore back in the voice field.
+  it('keeps a newer save when an older answer lands after it', async () => {
+    const answers: ((answer: Response) => void)[] = []
+    vi.stubGlobal(
+      'fetch',
+      vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+        if (String(input).startsWith('/api/providers')) {
+          return Promise.resolve(new Response(JSON.stringify({ providers: [] })))
+        }
+        if (init?.method === 'PATCH') {
+          // The app's TypeScript library, ES2022, has no Promise.withResolvers.
+          return new Promise<Response>((resolve) => answers.push(resolve))
+        }
+        return Promise.resolve(new Response(JSON.stringify(config)))
+      }),
+    )
+    render(SettingsPage, { onBack: () => {} })
+    const general = await screen.findByTestId('general-settings')
+    const voice = screen.getByTestId('voice-settings')
+
+    await fireEvent.input(within(general).getByLabelText('Silence Timeout'), {
+      target: { value: '45s' },
+    })
+    await fireEvent.click(within(general).getByRole('button', { name: 'Save' }))
+    await fireEvent.input(within(voice).getByLabelText('Text-to-speech voice'), {
+      target: { value: 'Puck' },
+    })
+    await fireEvent.click(within(voice).getByRole('button', { name: 'Save' }))
+    expect(answers).toHaveLength(2)
+
+    answers[1](new Response(JSON.stringify({ ...config, tts: { ...config.tts, voice: 'Puck' } })))
+    expect(await within(voice).findByText('Saved!')).toBeTruthy()
+    answers[0](new Response(JSON.stringify({ ...config, silence_timeout: '45s' })))
+    expect(await within(general).findByText('Saved!')).toBeTruthy()
+
+    expect((within(voice).getByLabelText('Text-to-speech voice') as HTMLInputElement).value).toBe(
+      'Puck',
+    )
+    expect(configState.config?.tts.voice).toBe('Puck')
+  })
 })

@@ -132,6 +132,32 @@ describe('PresetEditor', () => {
     )
   })
 
+  // Another tab deleted the preset while it was open here; the unit refuses
+  // the save of its changed fields with 404 rather than recreate it.
+  it('says a preset was deleted elsewhere when the unit answers 404', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(() =>
+        Promise.resolve(
+          new Response(
+            JSON.stringify({
+              error:
+                'summarization preset "standup" does not exist; a new preset needs a user_template',
+            }),
+            { status: 404 },
+          ),
+        ),
+      ),
+    )
+    await expandStandup()
+
+    await fireEvent.input(field('Description'), { target: { value: 'Weekly notes' } })
+    await fireEvent.click(screen.getByRole('button', { name: 'Save' }))
+
+    const shown = await screen.findByText('This preset was deleted elsewhere.')
+    expect(shown.classList.contains('error')).toBe(true)
+  })
+
   it('saves nothing when no field was changed', async () => {
     const fetch = stubFetch()
     await expandStandup()

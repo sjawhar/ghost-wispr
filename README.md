@@ -346,11 +346,10 @@ began with a key a save has since replaced is not kept as the provider's last ch
   every client that signs in with it with no restart: search, the next live-transcription
   reconnect, speech and summaries. A check of the providers that read the settings before the save
   never gives them the key it replaced.
-- A `PATCH /api/config` creates a summarization preset the config does not hold only when it names
-  all four of the preset's fields (`description`, `system_prompt`, `user_template`, `model`) with a
-  non-empty `user_template`, as the settings page's new preset does. Any other change to such a
-  preset answers 404 and changes nothing: it is an update to a preset deleted elsewhere, which would
-  otherwise come back with empty fields.
+- A `PATCH /api/config` that changes a summarization preset the config does not hold, with no
+  `user_template` for it, answers 404 and changes nothing: it is an update to a preset deleted
+  elsewhere, or a new preset without the template that carries the transcript. A new preset needs
+  a `user_template`.
 - `POST /api/tts/speak` takes `{text, voice?}` and speaks with `tts.model`. Its headers
   `X-Ghost-Wispr-TTS-Model` and `X-Ghost-Wispr-TTS-Voice` name the model and voice the provider
   used. A provider that fails to synthesize the speech answers 502 (`TTS synthesis failed: …`); a

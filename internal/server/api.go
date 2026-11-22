@@ -1899,10 +1899,11 @@ func handlePatchConfig(cfgStore *config.Store) http.HandlerFunc {
 
 		// A patch it refuses changes nothing: not the config, not its file.
 		if err := cfgStore.TryUpdate(func(c *config.Config) error {
-			if err := checkPresetsHeld(c, &patch); err != nil {
+			missing := presetsNotHeld(c, &patch)
+			if err := applyConfigPatch(c, &patch); err != nil {
 				return err
 			}
-			return applyConfigPatch(c, &patch)
+			return checkNewPresets(c, missing)
 		}); err != nil {
 			status := http.StatusBadRequest
 			var notHeld presetNotHeldError
@@ -2034,26 +2035,38 @@ func applyConfigPatch(c *config.Config, p *configPatch) error {
 	return nil
 }
 
-// presetNotHeldError is a patch to a preset the config does not hold that does
-// not create it: an update to a preset deleted elsewhere, or an incomplete new
-// preset.
+// presetNotHeldError is a patch to a preset the config does not hold that
+// does not give it a user template: an update to a preset deleted elsewhere,
+// or a new preset without the template that carries the transcript.
 type presetNotHeldError struct{ name string }
 
 func (e presetNotHeldError) Error() string {
-	return fmt.Sprintf("summarization preset %q does not exist; a new preset names its description, system_prompt, user_template and model, with a user_template", e.name)
+	return fmt.Sprintf("summarization preset %q does not exist; a new preset needs a user_template", e.name)
 }
 
-// checkPresetsHeld refuses a patch that changes a preset c does not hold
-// without creating it (presetPatch.creates).
-func checkPresetsHeld(c *config.Config, p *configPatch) error {
+// presetsNotHeld names the presets the patch changes (not deletes) that c
+// does not hold.
+func presetsNotHeld(c *config.Config, p *configPatch) []string {
 	if p.Summarization == nil {
 		return nil
 	}
+	var names []string
 	for name, preset := range p.Summarization.Presets {
-		if _, held := c.Summarization.Presets[name]; preset == nil || held || preset.creates() {
-			continue
+		if _, held := c.Summarization.Presets[name]; preset != nil && !held {
+			names = append(names, name)
 		}
-		return presetNotHeldError{name: name}
+	}
+	return names
+}
+
+// checkNewPresets refuses a patch that made a preset, among those c did not
+// hold, with no user template: the summarizer renders the transcript into it,
+// so such a preset would summarize nothing.
+func checkNewPresets(c *config.Config, names []string) error {
+	for _, name := range names {
+		if c.Summarization.Presets[name].UserTemplate == "" {
+			return presetNotHeldError{name: name}
+		}
 	}
 	return nil
 }
