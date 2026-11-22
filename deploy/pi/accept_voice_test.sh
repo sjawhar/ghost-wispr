@@ -422,14 +422,18 @@ def start():
     write("voice.json", "{}")
     environment = {k: v for k, v in os.environ.items() if k == "PATH" or k.startswith("GW_FAKE_") or k == "GHOST_WISPR_DEPLOY_DIR"}
     environment.update(variables)
-    process = subprocess.Popen(
-        [sys.executable, os.path.abspath(__file__), "service"],
-        env=environment,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        start_new_session=True,
-    )
+    # The service's stderr goes to service.err, which the self-test reports: a fake service that
+    # dies of an exception would otherwise end silently, and every later wait on it would read as
+    # a timeout of the driver's.
+    with open(spath("service.err"), "ab") as err:
+        process = subprocess.Popen(
+            [sys.executable, os.path.abspath(__file__), "service"],
+            env=environment,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=err,
+            start_new_session=True,
+        )
     write("main.pid", "%d\n" % process.pid)
     emit(kind="raw", due=now_ms(), text="2026/11/19 10:00:00 ghost-wispr: starting", pid=process.pid)
     if "earlier-boot" in SCENARIO:
@@ -2335,8 +2339,12 @@ launch barge-backchannel-terminal-stall answer-until-clip,backchannel-stops,arec
 # rounds (--stops 2) and tells the fake so (stop-rounds-2): each round's answer then plays until its
 # stop arrives, however late the driver plays the stop. A stop played after a 7 s answer's natural
 # end, as a driver held up by its machine plays it (cancel-late-stop, with late-clip), still stops
-# speech and is timed.
-readonly cancel_args="--step playback-cancel --stops 2 --playback-seconds 3 --question @question.wav --stop-clip @stop.wav --rig-mic $rig --event-timeout 15"
+# speech and is timed. Each wait on the fake service (the voice's first audio, the poller's RUNNING,
+# the stop line) has the driver's own 60 s ceiling, as each answer has: the service's loop applies
+# the stops and writes the speaker's status, and on a loaded machine a 15 s wait on it ran out twice
+# (c7 and c9 in the chime PR's runs). The driver returns at each event, so a case is no slower for it,
+# and a service that died is named from its stderr (service.err), not taken for a slow one.
+readonly cancel_args="--step playback-cancel --stops 2 --playback-seconds 3 --question @question.wav --stop-clip @stop.wav --rig-mic $rig --event-timeout 60"
 # shellcheck disable=SC2086
 launch cancel long,asound,stop-rounds-2 yes -- $cancel_args
 # shellcheck disable=SC2086
@@ -2587,6 +2595,9 @@ for setup in "$root"/*/setup-error; do
 done
 for error in "$root"/*/state/fake-error; do
   [[ -e $error ]] && check_failed "${error%/state/fake-error}: the fake Pi: $(<"$error")"
+done
+for error in "$root"/*/state/service.err; do
+  [[ -s $error ]] && check_failed "${error%/state/service.err}: the fake service wrote to stderr: $(head -c 1500 "$error" | tr '\n' '|')"
 done
 for killed in "$root"/*/state/stop-killed; do
   [[ -e $killed ]] && printf 'NOTE: %s: the fake systemctl sent SIGKILL after its stop timeout: %s\n' \
