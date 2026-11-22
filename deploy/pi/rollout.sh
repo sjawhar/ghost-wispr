@@ -112,18 +112,20 @@ readonly UPDATES_ON_COMMAND="ssh $PI 'XDG_RUNTIME_DIR=/run/user/\$(id -u) system
 # timer does not stop it, and it can still swap or roll back the binary. Disabled, not only stopped:
 # ghost-wispr's user manager starts an enabled timer at each boot, and Persistent=true then runs a
 # missed update at once, which would install the release's binary on the old config after a reboot.
-# The update has no time limit (each step of it has one), so this waits at most 35 minutes, more
-# than an update takes at its worst, and then stops, naming the update, its PID and since when it
-# runs. It never kills it: a kill can land mid-swap.
+# The update has no time limit (each step of it has one), so this waits at most 35 minutes of the
+# Pi's clock, more than an update takes at its worst, however slow each poll is, and then stops,
+# naming the update, its PID and since when it runs. It never kills it: a kill can land mid-swap.
 stop_updates() {
   local status=0 out
   out=$(pi "${USER_SYSTEMD}systemctl --user disable --now ghost-wispr-update.timer || exit 2
 [ \"\$(systemctl --user is-enabled ghost-wispr-update.timer)\" = disabled ] || exit 2
 [ \"\$(systemctl --user is-active ghost-wispr-update.timer)\" = inactive ] || exit 2
-for _ in \$(seq 420); do
+deadline=\$((\$(date +%s) + 2100))
+while :; do
   case \$(systemctl --user show -p ActiveState --value ghost-wispr-update.service) in
     inactive | failed) exit 0 ;;
   esac
+  [ \"\$(date +%s)\" -lt \"\$deadline\" ] || break
   sleep 5
 done
 echo \"pid \$(systemctl --user show -p MainPID --value ghost-wispr-update.service), since \$(systemctl --user show -p InactiveExitTimestamp --value ghost-wispr-update.service)\"
