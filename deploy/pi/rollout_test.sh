@@ -73,7 +73,7 @@ no_input=false
 while [[ $# -gt 0 ]]; do
   case $1 in
     -n) no_input=true; shift ;;
-    -o) shift 2 ;;
+    -o) printf '%s\n' "$2" >>"$FAKE_PI/state/ssh-options"; shift 2 ;;
     -*) echo "fake ssh: unknown option $1" >&2; exit 255 ;;
     *) break ;;
   esac
@@ -102,6 +102,17 @@ case "$*" in
   'is-enabled ghost-wispr-update.timer') cat "$state/timer-enabled"; [[ $(<"$state/timer-enabled") == enabled ]] ;;
   'is-active --quiet ghost-wispr.service') [[ $(<"$state/service") == active ]] ;;
   'show -p ActiveState --value ghost-wispr-update.service')
+    # A poll takes state/poll-seconds of the fake Pi's clock, as a slow systemctl does; with
+    # state/poll-hang it never returns, and only a timeout (the fake timeout's) ends it.
+    [[ ! -s $state/poll-seconds ]] || fake-clock-advance "$(<"$state/poll-seconds")"
+    if [[ -e $state/poll-hang ]]; then
+      if [[ -z ${FAKE_TIMEOUT_SECONDS:-} ]]; then
+        echo 'a poll ran with no timeout' >>"$state/events"
+        exit 1
+      fi
+      fake-clock-advance "$FAKE_TIMEOUT_SECONDS"
+      exit 124
+    fi
     if [[ -e $state/update-forever ]]; then
       echo activating
     elif [[ -s $state/update-states ]]; then
@@ -155,8 +166,40 @@ exec $(printf %q "$real_sha256sum") "\$@"
 EOF
 # shellcheck disable=SC2016 # $FAKE_PI and $* expand when the fakes run.
 printf '#!/usr/bin/env bash\n[[ -e $FAKE_PI/state/probe ]]\n' >"$bin/pgrep"
+# The fake Pi's clocks. state/uptime is its monotonic clock, as /proc/uptime reads ("SECONDS.00
+# IDLE"): sleep, slow and timed-out polls move it on (fake-clock-advance). date +%s is its wall
+# clock: the uptime plus 1700000000, stepped by state/wall-step (STEP seconds once the uptime
+# reaches AT: "AT STEP"), as an NTP correction steps it; else the real date.
+cat >"$bin/fake-clock-advance" <<'EOF'
+#!/usr/bin/env bash
+[[ -s $FAKE_PI/state/uptime ]] || exit 0
+read -r up _ <"$FAKE_PI/state/uptime"
+printf '%s.00 0.00\n' $((${up%%.*} + $1)) >"$FAKE_PI/state/uptime"
+EOF
 # shellcheck disable=SC2016
-printf '#!/usr/bin/env bash\nprintf "sleep %%s\\n" "$*" >>"$FAKE_PI/state/events"\n' >"$bin/sleep"
+printf '#!/usr/bin/env bash\nprintf "sleep %%s\\n" "$*" >>"$FAKE_PI/state/events"\nfake-clock-advance "$1"\n' >"$bin/sleep"
+real_date=$(command -v date)
+cat >"$bin/date" <<EOF
+#!/usr/bin/env bash
+if [[ \$* == +%s && -s \$FAKE_PI/state/uptime ]]; then
+  read -r up _ <"\$FAKE_PI/state/uptime"
+  wall=\$((1700000000 + \${up%%.*}))
+  if [[ -s \$FAKE_PI/state/wall-step ]]; then
+    read -r at step <"\$FAKE_PI/state/wall-step"
+    ((\${up%%.*} < at)) || wall=\$((wall + step))
+  fi
+  echo "\$wall"
+else
+  exec $(printf %q "$real_date") "\$@"
+fi
+EOF
+# timeout [-k KILL] DURATION COMMAND: runs COMMAND, telling a fake that hangs how long it may take
+# (FAKE_TIMEOUT_SECONDS) before it is killed.
+cat >"$bin/timeout" <<'EOF'
+#!/usr/bin/env bash
+[[ $1 != -k ]] || shift 2
+FAKE_TIMEOUT_SECONDS=${1%s} exec "${@:2}"
+EOF
 chmod +x "$bin"/*
 
 # The protected recordings, and deployment settings that name them.
@@ -204,6 +247,7 @@ reset() {
   printf '%s\n' "$merge" >"$state/release"
   printf '%s\n' "$good_config" >"$state/config.json"
   printf '%s\n' "$good_providers" >"$state/providers.json"
+  echo '1000.00 0.00' >"$state/uptime"
   : >"$state/events"
 }
 
@@ -212,7 +256,7 @@ reset() {
 rollout() {
   rc=0
   out=$(PATH="$bin:$PATH" FAKE_PI="$pi" FAKE_DEPLOY="$deploy" FAKE_PI_HOST="ghost-wispr@$PI_HOST" \
-    GHOST_WISPR_PI_ENV="$env_file" GHOST_WISPR_DEPLOY_DIR="$deploy" \
+    GHOST_WISPR_PI_ENV="$env_file" GHOST_WISPR_DEPLOY_DIR="$deploy" GHOST_WISPR_PI_UPTIME="$state/uptime" \
     GHOST_WISPR_RELEASE_API="file://$work/release.json" bash "$tree/deploy/pi/rollout.sh" "$1" 2>&1) || rc=$?
 }
 release() { printf '{"target_commitish":"%s"}\n' "$1" >"$work/release.json"; }
@@ -277,18 +321,36 @@ off_after_reboot hold
 [[ $out == *'the 2 protected recordings have their sha256 (before)'* && $out == *'(after)'* ]] \
   || fail "hold did not check the protected recordings before and after: $out"
 
-# hold: an update that still runs at the cap is left running, named with its PID and how long it
-# has run; nothing kills or stops it.
-reset
-: >"$state/update-forever"
-rollout hold
-expect_stop 'hold with an update that does not end' 'ghost-wispr-update.service (pid 4321, since Sun 2026-11-22 03:30:00 UTC) still runs after 35 minutes'
-[[ $out == *'left running'* ]] || fail "hold did not say the update is left running: $out"
-! grep -Eq 'systemctl (kill|stop|restart) ghost-wispr-update|^kill' "$state/events" \
-  || fail "hold killed or stopped the running update: $(<"$state/events")"
-[[ $(grep -c '^sleep 5$' "$state/events") == 420 ]] \
-  || fail "hold waited $(grep -c '^sleep 5$' "$state/events") times 5 s for the update, want 420 (35 minutes)"
-rm -f "$state/update-forever"
+# hold: an update that still runs 35 minutes on, by the Pi's monotonic clock (its uptime), is left
+# running, named with its PID and since when it runs; nothing kills or stops it. The 35 minutes are
+# of the uptime, not a count of polls nor the wall clock. GPT-6.1 Sol's cases: a slow systemctl
+# (each poll 25 s, at 93a3b1e1) must not stretch them; a wall clock stepped forward 2 hours or back
+# 1 hour (at a9e966db) must not cut them short or stretch them; and a poll that never returns (at
+# a9e966db) is cut off by its own timeout, so it neither blocks the report nor stretches them.
+# CASE: POLL_SECONDS WALL_STEP HANG
+for case in '0 - -' '25 - -' '0 7200 -' '0 -3600 -' '0 - hang'; do
+  read -r poll step hang <<<"$case"
+  reset
+  : >"$state/update-forever"
+  echo '1000.00 0.00' >"$state/uptime"
+  [[ $poll == 0 ]] || echo "$poll" >"$state/poll-seconds"
+  [[ $step == - ]] || echo "1005 $step" >"$state/wall-step"
+  [[ $hang == - ]] || : >"$state/poll-hang"
+  rollout hold
+  expect_stop "hold with an update that does not end ($case)" 'ghost-wispr-update.service (pid 4321, since Sun 2026-11-22 03:30:00 UTC) still runs after 35 minutes'
+  [[ $out == *'left running'* ]] || fail "hold did not say the update is left running: $out"
+  ! grep -Eq 'systemctl (kill|stop|restart) ghost-wispr-update|^kill' "$state/events" \
+    || fail "hold killed or stopped the running update: $(<"$state/events")"
+  ! grep -q 'a poll ran with no timeout' "$state/events" || fail "hold ($case) polled the update with no timeout"
+  read -r up _ <"$state/uptime"
+  waited=$((${up%%.*} - 1000))
+  slowest=$poll
+  [[ $hang == - ]] || slowest=30
+  ((waited >= 2100 && waited < 2100 + 5 + slowest + 5)) \
+    || fail "hold ($case) gave up after ${waited} s of the Pi's uptime, want 35 minutes"
+done
+grep -qx 'ConnectTimeout=10' "$state/ssh-options" && grep -qx 'ServerAliveInterval=15' "$state/ssh-options" \
+  || fail "hold reached the Pi without a connect timeout and keepalives: $(<"$state/ssh-options")"
 
 # install: refused while the latest release is another commit's, before any change.
 reset
