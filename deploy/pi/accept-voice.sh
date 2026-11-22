@@ -2880,7 +2880,9 @@ step_playback_cancel() {
         boundary_unknown=${boundary_unknown:-"playback-cancel stop $((i + 1)): the timing log has no first_audio for the next question's answer, so the quiet after its chime cannot be checked"}
       elif answer_earliest "${question_wakes[q]}" "${question_firsts[q]}" "$chime"; then
         # The answer is heard at the rig no earlier than sample answer_from: a sound after the chime
-        # that starts before it is audio of the cancelled answer.
+        # that starts before it is audio of the cancelled answer. The NOTE, before any verdict on
+        # this stop, shows that the chime timed it (Sol's review of #156 at 21b41d02).
+        note "playback-cancel stop $((i + 1)): the next answer is timed against its chime in the same recording"
         if ((chime + 1 < ${#sound_on[@]} && sound_at[chime + 1] < answer_from)); then
           fail "playback-cancel stop $((i + 1)): a sound at the rig microphone starts $(((answer_from - sound_at[chime + 1]) * 1000 / sample_rate)) ms or more before the next question's answer can be heard there (timed against its chime in the same recording): audio of the cancelled answer"
         fi
