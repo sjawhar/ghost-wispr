@@ -943,16 +943,19 @@ journal_records() {
   journal_lines | jq -R -c --arg message "$1" 'fromjson? | select(type == "object" and .message == $message)' 2>/dev/null
 }
 
-# timing_events: the voice timing log since the restart: {event, session_id, reason, input, at, at_us,
-# wall, audible_us, lead_us, err_us, disruptions}: at on now_ms's clock (at_mono_ns), -1 for a line
-# without one, at_us the same in microseconds, and wall on the wall clock (at_unix_ns), in
-# milliseconds. An "audible" line also gives, in microseconds on now_ms's clock, when its sound's
-# first sample left the speaker's buffer (audible_mono_ns, -1 without), how much earlier the sound
-# can be (audible_lead_ns) and how far off the time can be (audible_err_ns), each rounded outwards,
-# and the disruptions the speaker had had by then.
+# timing_events: the voice timing log since the restart: {event, session_id, reason, input, speech,
+# at, at_us, wall, audible_us, lead_us, err_us, disruptions}: at on now_ms's clock (at_mono_ns), -1
+# for a line without one, at_us the same in microseconds, and wall on the wall clock (at_unix_ns), in
+# milliseconds. speech is the number the speaker gives each speech (internal/audio,
+# SpeechEvent.Speech), on its first_audio, speech_end and audible lines, or -1. An "audible" line
+# also gives, in microseconds on now_ms's clock, when its sound's first sample left the speaker's
+# buffer (audible_mono_ns, -1 without), how much earlier the sound can be (audible_lead_ns) and how
+# far off the time can be (audible_err_ns), each rounded outwards, and the disruptions the speaker
+# had had by then.
 timing_events() {
   journal_records 'voice timing' | jq -c '{event: (.event // ""), session_id: (.session_id // ""),
     reason: (.reason // ""), input: (.input // ""),
+    speech: ((.speech | tonumber?) // -1),
     at: ((((.at_mono_ns | tonumber?) // -1000000) / 1000000) | floor),
     at_us: ((((.at_mono_ns | tonumber?) // -1000) / 1000) | floor),
     wall: ((((.at_unix_ns | tonumber?) // 0) / 1000000) | floor),
@@ -966,13 +969,32 @@ timing_events() {
 # line for the speaker's INPUT (chime or voice) in audible_lines whose sound left the speaker's
 # buffer from FROM to TO, or nothing. The service logs one as each speech on an input starts, timed
 # by the stream's own account of its playback (internal/audio, AudibleEvent): the device plays the
-# sample a latency later, the same for every input. audible_lines is the timing log's audible lines
-# (timing_events), read once, before the step stops its recording and reads the rest of the journal.
+# sample a latency later, the same for every input. audible_lines is the timing log's audible and
+# first_audio lines (timing_events), read once, before the step stops its recording and reads the
+# rest of the journal.
 audible_lines=
 audible_of() {
   jq -r -n --arg input "$1" --argjson from "$(($2 * 1000))" --argjson to "$(($3 * 1000))" \
     '[inputs | select(.event == "audible" and .input == $input and .audible_us >= $from and .audible_us <= $to)]
      | min_by(.audible_us) // empty | "\(.audible_us) \(.lead_us) \(.err_us) \(.disruptions)"' <<<"$audible_lines"
+}
+
+# audible_of_speech FIRST_MS: the voice's "audible" line for the speech whose first_audio is at
+# FIRST_MS, as audible_of gives it: the first_audio line at FIRST_MS names its speech, and exactly one
+# voice audible line must name the same. It prints "none" when the first_audio line names no speech
+# or no audible line names it, and "ambiguous" when more than one first_audio line is at FIRST_MS
+# with different speeches, or more than one audible line names the speech: another speech's line,
+# such as a cancelled word's, never times the answer (Sol's review of #156 at 053df77c).
+audible_of_speech() {
+  jq -r -n --argjson first "$1" \
+    '[inputs] as $all
+     | [$all[] | select(.event == "first_audio" and .at == $first) | .speech] | unique as $speeches
+     | if ($speeches | length) > 1 then "ambiguous"
+       elif ($speeches | length) == 0 or $speeches[0] < 0 then "none"
+       else [$all[] | select(.event == "audible" and .input == "voice" and .speech == $speeches[0])] as $lines
+         | if ($lines | length) == 0 then "none" elif ($lines | length) > 1 then "ambiguous"
+           else $lines[0] | "\(.audible_us) \(.lead_us) \(.err_us) \(.disruptions)" end
+       end' <<<"$audible_lines"
 }
 
 # timing_first EVENT FROM_MS TO_MS [FIELD]: the time of the first EVENT in the timing log in
@@ -1506,6 +1528,11 @@ sound_until=()
 recording_end_early=
 recording_end_late=
 recording_trail_min=
+# recording_continuous is true when the recording is shown to have lost no capture: a capture
+# substream names arecord, arecord reported no overrun and no suspend, and every state read after a
+# size showed it running from its first trigger. Only then does the time between two sounds count
+# in samples of the file (answer_earliest).
+recording_continuous=false
 analyse_recording() {
   local analysis kind rest on off len on_early off_early gap at until floor=$capture_residency_us
   analysis=$(python3 -c "$mono_py" sounds "$recording" "$sample_rate" "$1" "$silence_seconds" 2>"$work_dir/sounds.err") \
@@ -1523,6 +1550,7 @@ analyse_recording() {
   recording_end_early=
   recording_end_late=
   recording_trail_min=
+  recording_continuous=false
   # An overrun or a suspend drops what ALSA's buffer held, and a sample can then stay captured and
   # not yet in the file for longer than capture_residency_us: the early bounds come from the start
   # alone. So do they when the sampler saw the capture substream stop running, which arecord may
@@ -1544,6 +1572,7 @@ analyse_recording() {
     floor=
     note "recording: the capture substream arecord held read $discontinuous during the recording, so the recording's early bounds come from its start alone"
   fi
+  [[ -n $floor ]] && recording_continuous=true
   while read -r kind rest; do
     case $kind in
       sound)
@@ -2659,8 +2688,9 @@ readonly chime_attack_us=6000 audible_error_us=1000
 # answer_earliest WAKE_MS FIRST_MS CHIME: set answer_from to the earliest sample of the recording at
 # which the rig can hear the answer whose first_audio is FIRST_MS, after the chime that starts sound
 # CHIME, the question's wake sound (its wake_heard WAKE_MS). It fails, setting nothing and answer_why
-# to why, when the timing log gives no audible time for that chime, from lead_ms before WAKE_MS to
-# wake_max_ms after it, or for that answer, from FIRST_MS to 2 s after it; when the speaker had a
+# to why, when the recording is not shown continuous (recording_continuous); when the timing log
+# gives no audible time for that chime, from lead_ms before WAKE_MS to wake_max_ms after it, or none
+# for the answer's own speech, or more than one (audible_of_speech); when the speaker had a
 # disruption between the two (a replay, an underrun or a failure), which can make the chime play
 # later than its audible time; or when it gives the answer's no later than the chime's.
 #
@@ -2671,13 +2701,31 @@ readonly chime_attack_us=6000 audible_error_us=1000
 # Each term is taken at its earliest: the answer's time less its lead (its resampler's filter can
 # sound before its first sample lands) and its error, the chime's plus its error, each less
 # audible_error_us for the device's account, and rounded down a sample, so answer_from is never late.
+# The time between the two counts in samples of the file only while the capture lost none between
+# them: samples a capture overrun drops move every later sound earlier in the file (Sol's review of
+# #156 at 053df77c), so the comparison needs the recording shown continuous.
 answer_from=
 answer_why=
 answer_earliest() {
   local chime answer chime_at chime_err chime_seen answer_at answer_lead answer_err answer_seen gap_us
+  if [[ $recording_continuous != true ]]; then
+    answer_why='the recording is not shown continuous (an overrun, a suspend, a break in the capture substream, or no substream named), so the time between the chime and the answer does not count in its samples'
+    return 1
+  fi
   answer_why='the timing log gives no audible times for the chime and the answer'
   chime=$(audible_of chime $(($1 - lead_ms)) $(($1 + wake_max_ms)))
-  answer=$(audible_of voice "$2" $(($2 + 2000)))
+  [[ -n $chime ]] || return 1
+  answer=$(audible_of_speech "$2")
+  case $answer in
+    none)
+      answer_why="the timing log gives no audible time for the answer's own speech (the speech its first_audio names)"
+      return 1
+      ;;
+    ambiguous)
+      answer_why="the timing log gives more than one audible time, or first_audio, that could be the answer's own speech"
+      return 1
+      ;;
+  esac
   read -r chime_at _ chime_err chime_seen <<<"$chime"
   read -r answer_at answer_lead answer_err answer_seen <<<"$answer"
   whole_number "$chime_at" && whole_number "$answer_at" && whole_number "$chime_err" && whole_number "$answer_lead" \
@@ -2755,8 +2803,9 @@ step_playback_cancel() {
   done
   played=$(running_ms)
   stop_poller
-  # The audible lines, before the recording stops and the step reads the rest of the journal.
-  audible_lines=$(timing_events | jq -c 'select(.event == "audible")') \
+  # The audible and first_audio lines, before the recording stops and the step reads the rest of the
+  # journal: an answer's audible line is the one that names its first_audio's speech.
+  audible_lines=$(timing_events | jq -c 'select(.event == "audible" or .event == "first_audio")') \
     || unknown "voice timing log: cannot read the journal of $unit (process $unit_pid)$(journal_error)"
   analyse_rig
   # The calibration is the first sound that starts while play-sound played. It must be alone: it ends,

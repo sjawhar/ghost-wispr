@@ -704,12 +704,19 @@ SPEAKER_QUEUE_MS = 30
 DEVICE_LATENCY_MS = 25 if "device-latency-25" in SCENARIO else 8
 
 
+def speech_number(tag):
+    """The number the speaker gives the speech TAG (internal/audio, SpeechEvent.Speech), the same on
+    its first_audio, speech_end and audible lines: one per tag, from its bytes."""
+    return 1 + sum(byte * 257**i for i, byte in enumerate(tag.encode())) % 1_000_003 if tag else 0
+
+
 def audible(input_name, heard, session, tag=None):
     """The service's audible line for a sound on INPUT_NAME the rig hears at HEARD."""
     if "no-audible" in SCENARIO:
         return
     emit(kind="timing", due=heard - DEVICE_LATENCY_MS, event="audible", input=input_name, session_id=session,
-         audible_mono_ns=(heard - DEVICE_LATENCY_MS) * 1_000_000, audible_lead_ns=1_354_167 if input_name == "voice" else 0,
+         speech=speech_number(tag), audible_mono_ns=(heard - DEVICE_LATENCY_MS) * 1_000_000,
+         audible_lead_ns=1_354_167 if input_name == "voice" else 0,
          audible_err_ns=1001, disruptions=1 if input_name == "voice" and "audible-disrupted" in SCENARIO else 0,
          **({"tag": tag} if tag else {}))
 
@@ -717,14 +724,14 @@ def audible(input_name, heard, session, tag=None):
 def speech(tag, start, length, session="session-1", fact=None):
     """The voice speaks: its first frame, the fact sentence, the sound, the speaker's stream line,
     the end of its speech and voice_spoken."""
-    emit(kind="timing", due=start, tag=tag, event="first_audio", session_id=session)
+    emit(kind="timing", due=start, tag=tag, event="first_audio", session_id=session, speech=speech_number(tag))
     emit(kind="timing", due=start if fact is None else fact, tag=tag, event="fact_audio", session_id=session)
     # As internal/audio's alsaStream logs it for the hw_params new_case writes (480 and 1920 frames
     # at 48 kHz): period and buffer are time.Durations, which the journal holds in nanoseconds.
     emit(kind="log", due=start, tag=tag, level="INFO", msg="speaker stream", fields={"device": "plughw:CARD=J75,DEV=0", "rate": 48000, "channels": 2, "period": 10_000_000, "buffer": 40_000_000, "rewind": True})
     emit(kind="sound", start=start + SPEAKER_QUEUE_MS, end=start + length, tag=tag)
     audible("voice", start + SPEAKER_QUEUE_MS, session, tag)
-    emit(kind="timing", due=start + length, tag=tag, event="speech_end", session_id=session)
+    emit(kind="timing", due=start + length, tag=tag, event="speech_end", session_id=session, speech=speech_number(tag))
     spoken(tag, start + length, session)
 
 
@@ -759,7 +766,7 @@ def end_answer_after(clip_start, clip_end):
             # A cut whose sound plays out to its end (drain) at the moment it is cut: the speech's own
             # end, then speech_end and voice_spoken at that moment.
             emit(kind="cut", tag=item["tag"], at=at, sound_end=at, drain=True)
-            emit(kind="timing", due=at, tag=item["tag"], event="speech_end", session_id="session-1")
+            emit(kind="timing", due=at, tag=item["tag"], event="speech_end", session_id="session-1", speech=speech_number(item["tag"]))
             spoken(item["tag"], at, "session-1")
             break
 
@@ -804,6 +811,16 @@ def react(kind, key, start, end):
             # running into the answer as one sound. Only timing the answer against the chime sees it.
             if "leak-in-queue" in SCENARIO:
                 emit(kind="sound", start=end + 700 + 15, end=end + 700 + 27, tag="leaked-word")
+                # leaked-word-audible: the leaked word's own speech logs an audible line too, its own
+                # speech number, earlier than the answer's: the line nearest first_audio is then the
+                # word's (Sol's review of #156 at 053df77c).
+                if "leaked-word-audible" in SCENARIO:
+                    audible("voice", end + 700 + 15, "session-1", "leaked-word")
+            # capture-gap: the rig's capture loses 250 ms between this question's chime and its
+            # answer, as an overrun does, which the fake arecord reports: every later sound sits
+            # 250 ms earlier in the file (Sol's review of #156 at 053df77c).
+            if "capture-gap" in SCENARIO:
+                emit(kind="capture-gap", start=start + 600, end=start + 850)
         wake = start + 150
         chime = 120
         if "late-chime" in SCENARIO:
@@ -831,7 +848,7 @@ def react(kind, key, start, end):
             # A filler early, then the fact at 5 s: the verification's negative control (a filler at
             # 0.3 s). Here the filler starts at 0.5 s, so that 150 ms of silence part it from the
             # chime and the recording holds it as a sound of its own.
-            emit(kind="timing", due=end + 500, tag=tag, event="first_audio", session_id="session-1")
+            emit(kind="timing", due=end + 500, tag=tag, event="first_audio", session_id="session-1", speech=speech_number(tag))
             emit(kind="sound", start=end + 500, end=end + 900, tag=tag)
             emit(kind="timing", due=end + 5000, tag=tag, event="fact_audio", session_id="session-1")
             emit(kind="sound", start=end + 5000, end=end + 5600, tag=tag)
@@ -1139,9 +1156,16 @@ def render(path):
     if begun is not None and "silent" not in SCENARIO:
         duration = count / 24
         sounds, quiets = [], []
-        for item in timeline():
+        items = timeline()
+        # A capture gap loses what played during it: every later sound sits that much earlier.
+        gaps = [(i["start"], i["end"]) for i in items if i["kind"] == "capture-gap"]
+
+        def captured(at):
+            return at - begun - sum(max(0, min(at, b) - max(a, begun)) for a, b in gaps)
+
+        for item in items:
             if item["kind"] in ("sound", "quiet"):
-                a, b = max((item["start"] - begun) * CLOCK, 0), min((item["end"] - begun) * CLOCK, duration)
+                a, b = max(captured(item["start"]) * CLOCK, 0), min(captured(item["end"]) * CLOCK, duration)
                 if b > a:
                     (sounds if item["kind"] == "sound" else quiets).append([a, b])
         for qa, qb in quiets:
@@ -1323,6 +1347,9 @@ def arecord(args):
         # its buffer and the interrupt's 1 ms: the fake says so too when its own stall, with the lag
         # it keeps, leaves a sample unwritten that long, as a loaded machine can hold the fake back.
         aplays, lag_until, skip, last = read("aplays", "0"), None, 0, now_ms()
+        # capture-gap: the samples of a capture gap are never written (lost), and arecord reports
+        # the overrun that lost them, once.
+        lost, gap_reported = 0, False
         # From the first clip played after the recording began: capture-silent-xrun shows the
         # capture substream in XRUN for 600 ms, longer than the sampler's 0.5 s between reads, and
         # prints nothing, as an arecord stopped in a stalled write never reads again to report it;
@@ -1387,8 +1414,13 @@ def arecord(args):
                 while True:  # no read comes that would report the overrun; SIGTERM ends it
                     time.sleep(1)
             lag = (1000 if lag_until is not None and t < lag_until else 0) + (50 if "arecord-behind" in SCENARIO else 0)
+            if "capture-gap" in SCENARIO:
+                lost = sum(max(0, min(t, i["end"]) - i["start"]) for i in timeline() if i["kind"] == "capture-gap")
+                if lost > 0 and not gap_reported:
+                    overrun(250)
+                    gap_reported = True
             # Whole 2-byte samples at 24 kHz of the rig's clock, CLOCK times the Pi's.
-            target = 2 * int((t - lag - skip - begun) * CLOCK * 24)
+            target = 2 * int((t - lag - skip - lost - begun) * CLOCK * 24)
             if target > written:
                 put(bytes(target - written))
                 written = target
@@ -1465,7 +1497,7 @@ def journalctl(args):
         elif item["kind"] == "timing":
             # As cmd/ghost-wispr/voice.go's voiceTiming logs it.
             fields = {"event": item["event"], "session_id": item["session_id"], "at_unix_ns": wall_ms(due) * 1_000_000, "at_mono_ns": due * 1_000_000}
-            for extra in ("reason", "input", "audible_mono_ns", "audible_lead_ns", "audible_err_ns", "disruptions"):
+            for extra in ("reason", "input", "speech", "audible_mono_ns", "audible_lead_ns", "audible_err_ns", "disruptions"):
                 if extra in item and item[extra] != "":
                     fields[extra] = item[extra]
             records.append(journal_record(due, "INFO", "voice timing", fields))
@@ -2438,6 +2470,17 @@ launch cancel-leak-before-first-no-audible long,asound,stop-rounds-2,leak-before
 # to first_audio, with a NOTE of why; never the FAIL of a chime-timed threshold that cannot hold.
 # shellcheck disable=SC2086
 launch cancel-leak-in-queue-disrupted long,asound,stop-rounds-2,leak-in-queue,audible-disrupted yes -- $cancel_args
+# The word inside the queue, with its own audible line, earlier than the answer's
+# (leaked-word-audible): only the answer's own speech's line times it, so FAIL, never the PASS of
+# the voice's line nearest first_audio (Sol's review of #156 at 053df77c).
+# shellcheck disable=SC2086
+launch cancel-leak-in-queue-own-audible long,asound,stop-rounds-2,leak-in-queue,leaked-word-audible yes -- $cancel_args
+# A good cancel, with the rig's capture losing 250 ms between the second question's chime and its
+# answer (capture-gap), which arecord reports: the time between them does not count in the file's
+# samples, so the step falls back to first_audio with a NOTE and must not FAIL (Sol's review of
+# #156 at 053df77c: a false FAIL).
+# shellcheck disable=SC2086
+launch cancel-capture-gap long,asound,stop-rounds-2,capture-gap yes -- $cancel_args
 # shellcheck disable=SC2086
 launch cancel-quiet-chime long,asound,stop-rounds-2,quiet-chime yes -- $cancel_args
 # shellcheck disable=SC2086
@@ -3309,6 +3352,15 @@ expect_rc cancel-leak-in-queue-disrupted 0 2
 expect_line cancel-leak-in-queue-disrupted "the speaker had 1 disruptions (replays, underruns or failures) between the chime's audible time and the answer's"
 expect_no_line cancel-leak-in-queue-disrupted "FAIL: playback-cancel"
 expect_restored cancel-leak-in-queue-disrupted
+expect_rc cancel-leak-in-queue-own-audible 1
+expect_line cancel-leak-in-queue-own-audible "before the next question's answer can be heard there (timed against its chime in the same recording)"
+expect_no_line cancel-leak-in-queue-own-audible "PASS: playback-cancel: no stop's speech was heard"
+expect_restored cancel-leak-in-queue-own-audible
+expect_rc cancel-capture-gap 0 2
+expect_line cancel-capture-gap 'NOTE: recording: arecord reported an overrun'
+expect_line cancel-capture-gap 'the recording is not shown continuous'
+expect_no_line cancel-capture-gap "FAIL: playback-cancel"
+expect_restored cancel-capture-gap
 expect_rc cancel-quiet-chime 0
 expect_line cancel-quiet-chime "PASS: playback-cancel: no stop's speech was heard at the rig microphone 20 ms after it"
 expect_line cancel-quiet-chime 'NOTE: playback-cancel: calibration: the wake sound played alone (ghost-wispr play-sound) is heard at the rig microphone for 130 ms above -50 dB'
