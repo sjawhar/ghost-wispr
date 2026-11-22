@@ -2346,10 +2346,22 @@ step_ask_holder() {
   spoken_count=$(ws_count voice_spoken)
   play_clip 'second question' "$second_question"
   wait_spoken $((spoken_count + 1)) $((clip_ended + event_timeout * 1000)) 'ask-holder second question'
-  wait_for_task "$session" "$issue_live" "$first" working $(($(now_ms) + event_timeout * 1000)) \
-    || fail "ask-holder: no second question about $issue_live is working on the session's page"
+  # The second question in any state: an agent that answers before the step's first read of the page
+  # (a fast agent, or the step held on a loaded machine) leaves it done, and waiting for it to be
+  # working would end in a false "no second question" (k6 of #162: the fake's agent answered 5.7 s
+  # after it was asked, and the step first read the page later). Done before "never mind" means the
+  # cancel could not be tested: UNKNOWN. Cancelled or replaced before it is the voice's own doing:
+  # FAIL. A question that turns done after the step read it working, while "never mind" plays, is not
+  # told apart from a cancel the voice ignored, as the page gives no time for an answer: FAIL.
+  wait_for_task "$session" "$issue_live" "$first" '' $(($(now_ms) + event_timeout * 1000)) \
+    || fail "ask-holder: no second question about $issue_live on the session's page within $event_timeout s"
   second=$(jq -r '.id' <<<"$task")
   pass "ask-holder: the second question went out as Envoy event $second"
+  case $(jq -r '.state' <<<"$task") in
+    working) ;;
+    done) unknown "ask-holder: the agent answered question $second before the step could say \"never mind\" (it was done when the step first read the page), so the cancel was not tested" ;;
+    *) fail "ask-holder: question $second was $(jq -r '.state' <<<"$task") before the step said \"never mind\"" ;;
+  esac
   play_clip 'never mind' "$never_mind"
   wait_for_task "$session" "$issue_live" "$first" cancelled $(($(now_ms) + event_timeout * 1000)) \
     || fail "ask-holder: question $second is not cancelled within $event_timeout s of \"never mind\""
