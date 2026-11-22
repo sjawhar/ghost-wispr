@@ -463,4 +463,79 @@ if got != want:
     sys.exit(1)
 EOF
 
+# ---- mono_py's sampler: an anchor's floor only while the substream is shown running ----
+
+# record writes an anchor's BEFORE_US, the floor that bounds later samples from below, only when a
+# state read after the size finds the capture substream RUNNING from the trigger of its first such
+# read (Sol's review of #149 at b7edd969: a substream that closed, read after a stale size, kept the
+# floor). Here a writer plays arecord: it writes a header, then samples, while the test sets the
+# substream's status; each case must leave three-field anchors exactly where the state allowed.
+python3 - "$work_dir/mono.py" "$work_dir" <<'EOF' || fail "mono_py's sampler kept a floor it could not show (above)"
+import os, signal, subprocess, sys, threading, time
+src, base = sys.argv[1], sys.argv[2]
+ns = {"__name__": "mono_py"}
+argv, sys.argv = sys.argv, ["mono_py", "none"]
+try:
+    exec(open(src).read(), ns)
+except SystemExit:
+    pass
+sys.argv = argv
+failures = []
+for case, states in (("running", ["RUNNING 1"] * 4), ("closed", ["RUNNING 1", "closed"]),
+                     ("xrun", ["RUNNING 1", "XRUN 1"]), ("restarted", ["RUNNING 1", "RUNNING 2"])):
+    work = os.path.join(base, "sampler-" + case)
+    status_dir = os.path.join(work, "asound", "card4", "pcm0c", "sub0")
+    os.makedirs(status_dir)
+    path, anchors, pidfile = (os.path.join(work, n) for n in ("r.wav", "anchors", "pid"))
+    # It opens the file 0.2 s on, after the sampler's first read, as arecord starts after it.
+    writer = subprocess.Popen([sys.executable, "-c", (
+        "import sys, time\n"
+        "time.sleep(0.2); f = open(sys.argv[1], 'wb'); f.write(bytes(44)); f.flush(); time.sleep(0.05)\n"
+        "for _ in range(250): f.write(b'\\1\\0' * 240); f.flush(); time.sleep(0.01)\n"), path])
+    with open(pidfile, "w") as f:
+        f.write(str(writer.pid))
+
+    def status(text):
+        tmp = os.path.join(status_dir, "status.tmp")
+        with open(tmp, "w") as f:
+            f.write(text)
+        os.replace(tmp, os.path.join(status_dir, "status"))
+
+    def show(states=states):
+        # The first state from the start, then one more each 0.6 s, past the sampler's 0.5 s reads.
+        for i, s in enumerate(states):
+            if s == "closed":
+                status("closed\n")
+            else:
+                state, trig = s.split()
+                status("state: %s\nowner_pid   : %d\ntrigger_time: %s.0\n" % (state, writer.pid, trig))
+            time.sleep(0.6)
+
+    shower = threading.Thread(target=show)
+    shower.start()
+    sys.stdout.flush()
+    out = subprocess.run([sys.executable, src, "record", path, anchors, pidfile, os.path.join(work, "asound")],
+                         capture_output=True, text=True, timeout=30).stdout
+    shower.join()
+    writer.wait()
+    lines = [l.split() for l in open(anchors).read().splitlines()]
+    sampled = [l for l in lines if int(l[1]) > 44]
+    floors = [l for l in sampled if len(l) == 3]
+    reported = [l for l in out.splitlines() if l.startswith("discontinuous ")]
+    if case == "running":
+        if not floors or reported:
+            failures.append("running: %d floor anchors, discontinuous %r; want floors and none" % (len(floors), reported))
+        continue
+    want = {"closed": "CLOSED", "xrun": "XRUN", "restarted": "RESTARTED"}[case]
+    if len(reported) != 1 or not reported[0].endswith(" " + want):
+        failures.append("%s: discontinuous lines %r, want one naming %s" % (case, reported, want))
+    after = int(reported[0].split()[1]) if reported else 0
+    late = [l for l in floors if int(l[0]) >= after]
+    if late:
+        failures.append("%s: %d floor anchors at or after the state that is not RUNNING from the first trigger: %r" % (case, len(late), late[:2]))
+for line in failures:
+    print(line)
+sys.exit(1 if failures else 0)
+EOF
+
 printf 'recording-times test passed\n'

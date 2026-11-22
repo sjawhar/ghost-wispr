@@ -1092,8 +1092,9 @@ def arecord(args):
             f.write(bytes(44 + seconds * 48000))
         return 0
     # The capture substream arecord holds, in the case's /proc/asound: its status names arecord as
-    # owner_pid, and its hw_params give the 40 ms buffer and 10 ms period arecord asks for, at the
-    # card's 48 kHz. With no-capture-params no substream names it.
+    # owner_pid, with the trigger_time the kernel sets at every start, stop (an overrun's included),
+    # suspend and resume, and its hw_params give the 40 ms buffer and 10 ms period arecord asks for,
+    # at the card's 48 kHz. With no-capture-params no substream names it.
     substream = None
     if "no-capture-params" not in SCENARIO and os.environ.get("GHOST_WISPR_ASOUND_ROOT"):
         device = args[args.index("-D") + 1]
@@ -1104,14 +1105,18 @@ def arecord(args):
         os.makedirs(substream, exist_ok=True)
         with open(os.path.join(substream, "hw_params"), "w") as f:
             f.write("access: RW_INTERLEAVED\nformat: S16_LE\nsubformat: STD\nchannels: 1\nrate: 48000 (48000/1)\nperiod_size: 480\nbuffer_size: %d\n" % CAPTURE_BUFFER_FRAMES)
-        with open(os.path.join(substream, "status"), "w") as f:
-            f.write("state: RUNNING\nowner_pid   : %d\n" % os.getpid())
+    trigger = ["%d.%09d" % divmod(time.time_ns(), 1_000_000_000)]
 
-    def set_state(state):
-        """The capture substream's state, as the kernel's status shows it while arecord holds it."""
+    def set_state(state, restarted=False):
+        """The capture substream's state, as the kernel's status shows it while arecord holds it;
+        restarted gives it a new trigger_time, as a prepare and start after an overrun do."""
+        if restarted:
+            trigger[0] = "%d.%09d" % divmod(time.time_ns(), 1_000_000_000)
         if substream:
             with open(os.path.join(substream, "status"), "w") as g:
-                g.write("state: %s\nowner_pid   : %d\n" % (state, os.getpid()))
+                g.write("state: %s\nowner_pid   : %d\ntrigger_time: %s\n" % (state, os.getpid(), trigger[0]))
+
+    set_state("RUNNING")
 
     def close_substream():
         if substream:
@@ -1123,7 +1128,31 @@ def arecord(args):
         sys.stderr.write("overrun!!! (at least %.3f ms long)\n" % ms)
         sys.stderr.flush()
 
+    # arecord-terminal-stall (Sol's review of #149 at b7edd969): arecord stalls in a write of audio
+    # it already read, its capture overruns, and the sampler is held up for as long. Stopped, arecord
+    # ends the held write and closes the substream with no read that would report the overrun. The
+    # held write carries the end of the speech a backchannel stopped, so that a floor taken from the
+    # sampler's last size read dates that end seconds late, past the 1 s of silence the step looks
+    # for: the false "PASS: barge-in: 0 of 1" Sol saw. The status becomes a FIFO for the close: the
+    # sampler, let go, reads the file's old length, then waits on the status while the held write
+    # lands and the substream closes.
+    stalled = {"sampler": None, "until": None}
+
     def stopped(*_):
+        if stalled["sampler"] is not None and substream:
+            status_path = os.path.join(substream, "status")
+            os.unlink(status_path)
+            os.mkfifo(status_path)
+            os.kill(stalled["sampler"], signal.SIGCONT)
+            with open(status_path, "w") as status:
+                held = max(2 * int((stalled["until"] - skip - begun) * CLOCK * 24) - written, 0)
+                put(bytes(held))
+                status.write("closed\n")
+                status.flush()
+            with open(status_path + ".closed", "w") as status:
+                status.write("closed\n")
+            os.replace(status_path + ".closed", status_path)
+            log_to("terminal-stall", "the held write of %d bytes, to %d, landed after the sampler's size read; the substream then closed" % (held, stalled["until"]))
         write("recording-stopped", "1")
         close_substream()
         sys.exit(0)
@@ -1211,8 +1240,9 @@ def arecord(args):
         # From the first clip played after the recording began: capture-silent-xrun shows the
         # capture substream in XRUN for 600 ms, longer than the sampler's 0.5 s between reads, and
         # prints nothing, as an arecord stopped in a stalled write never reads again to report it;
-        # arecord-suspend prints the suspend recovery arecord prints unless -q (alsa-utils aplay.c,
-        # suspend()).
+        # capture-silent-restart shows it in XRUN for 30 ms only, which the sampler's reads miss,
+        # then RUNNING again from a new trigger_time, as a prepare and start do; arecord-suspend
+        # prints the suspend recovery arecord prints unless -q (alsa-utils aplay.c, suspend()).
         clipped, shown = None, "RUNNING"
         while True:
             time.sleep(0.005)
@@ -1232,16 +1262,44 @@ def arecord(args):
                     log_to("recordings", "%s %d" % (path, begun + skip))
             if "arecord-dies" in SCENARIO and lag_until is not None and t > lag_until + 1000:
                 return 1
-            if clipped is None and SCENARIO & {"capture-silent-xrun", "arecord-suspend"} and read("aplays", "0") != aplays:
+            if clipped is None and SCENARIO & {"capture-silent-xrun", "capture-silent-restart", "arecord-suspend"} and read("aplays", "0") != aplays:
                 clipped = t
                 if "arecord-suspend" in SCENARIO and "-q" not in args:
                     sys.stderr.write("Suspended. Trying resume. Done.\n")
                     sys.stderr.flush()
-            if "capture-silent-xrun" in SCENARIO and clipped is not None:
-                state = "XRUN" if t < clipped + 600 else "RUNNING"
+            if SCENARIO & {"capture-silent-xrun", "capture-silent-restart"} and clipped is not None:
+                state = "XRUN" if t < clipped + (600 if "capture-silent-xrun" in SCENARIO else 30) else "RUNNING"
                 if state != shown:
-                    set_state(state)
+                    set_state(state, restarted=state == "RUNNING")
                     shown = state
+            # timeline() folds a cut into its sound, so the stall reads the raw cut, which a stop clip
+            # schedules when it plays: its sound_end is still ahead then.
+            cut = next((item for item in map(json.loads, filter(None, read("timeline.jsonl").splitlines())) if item["kind"] == "cut" and item["tag"].startswith("speech-")), None) if "arecord-terminal-stall" in SCENARIO and stalled["sampler"] is None else None
+            if cut is not None and t >= cut["sound_end"] - 300:
+                if t >= cut["sound_end"]:
+                    raise RuntimeError("arecord-terminal-stall: the loop came at %d, after the stopped speech's end at %d" % (t, cut["sound_end"]))
+                # The sampler is the driver's child that names this recording; only it is held.
+                parent = os.getppid()
+                with open("/proc/%d/task/%d/children" % (parent, parent)) as children:
+                    owned = children.read().split()
+                samplers = []
+                for child in owned:
+                    try:
+                        with open("/proc/%s/cmdline" % child, "rb") as cmd:
+                            argv = cmd.read().split(b"\0")
+                    except OSError:
+                        continue
+                    if b"record" in argv and path.encode() in argv:
+                        samplers.append(int(child))
+                if len(samplers) != 1:
+                    raise RuntimeError("arecord-terminal-stall: want the one sampler of %s, found %r" % (path, samplers))
+                stalled["sampler"], stalled["until"] = samplers[0], cut["sound_end"] + 5
+                os.kill(stalled["sampler"], signal.SIGSTOP)
+                log_to("terminal-stall", "the write stalls at %d, before the stopped speech's end at %d; the sampler %d is held" % (t, cut["sound_end"], stalled["sampler"]))
+                time.sleep(0.05)
+                set_state("XRUN")
+                while True:  # no read comes that would report the overrun; SIGTERM ends it
+                    time.sleep(1)
             lag = (1000 if lag_until is not None and t < lag_until else 0) + (50 if "arecord-behind" in SCENARIO else 0)
             # Whole 2-byte samples at 24 kHz of the rig's clock, CLOCK times the Pi's.
             target = 2 * int((t - lag - skip - begun) * CLOCK * 24)
@@ -2199,6 +2257,15 @@ launch barge-backchannel-final-rewrite answer-until-clip,backchannel-stops,captu
 # alone, with a NOTE, and the pause reads cancel-unsure's UNKNOWN, never PASS.
 launch barge-pause-silent-xrun answer-until-clip,backchannel-pause-500,arecord-slow-start,capture-buffer-250,capture-silent-xrun yes -- --step barge-in --talkovers 1 --backchannels 1 --question @question.wav --talkover-dir @talkovers --backchannel-dir @backchannels --rig-mic "$rig" --event-timeout 15
 launch barge-pause-suspend answer-until-clip,backchannel-pause-500,arecord-slow-start,capture-buffer-250,arecord-suspend yes -- --step barge-in --talkovers 1 --backchannels 1 --question @question.wav --talkover-dir @talkovers --backchannel-dir @backchannels --rig-mic "$rig" --event-timeout 15
+# The same pause with the substream in XRUN for 30 ms, which the sampler's reads miss, and RUNNING
+# again from a new trigger_time (capture-silent-restart): continuity is not shown, so UNKNOWN with
+# a NOTE, never PASS.
+launch barge-pause-silent-restart answer-until-clip,backchannel-pause-500,arecord-slow-start,capture-buffer-250,capture-silent-restart yes -- --step barge-in --talkovers 1 --backchannels 1 --question @question.wav --talkover-dir @talkovers --backchannel-dir @backchannels --rig-mic "$rig" --event-timeout 15
+# A backchannel that stops the speech, with arecord stalled in a write during the speech, its
+# capture overrunning and its sampler held for as long; stopped, arecord lands the held period and
+# closes with no read that would report the overrun (arecord-terminal-stall, Sol's review of #149 at
+# b7edd969, where it read a false "PASS: barge-in: 0 of 1"). FAIL or UNKNOWN, never PASS.
+launch barge-backchannel-terminal-stall answer-until-clip,backchannel-stops,arecord-terminal-stall yes -- --step barge-in --talkovers 0 --backchannels 1 --question @question.wav --talkover-dir @talkovers --backchannel-dir @backchannels --rig-mic "$rig" --event-timeout 15
 
 # playback-cancel, timed by the end of the cancelled speech at the rig microphone: a pass; a correct
 # cancel that keeps the stream running with 80 ms of silence queued, which must pass; a status that
@@ -2953,6 +3020,15 @@ expect_rc barge-pause-suspend 2
 expect_line barge-pause-suspend 'NOTE: recording: arecord reported a suspend, so the recording'"'"'s early bounds come from its start alone'
 expect_no_line barge-pause-suspend 'PASS: barge-in: 0 of 1'
 expect_restored barge-pause-suspend
+expect_rc barge-pause-silent-restart 2
+expect_line barge-pause-silent-restart 'NOTE: recording: the capture substream arecord held read RESTARTED during the recording, so the recording'"'"'s early bounds come from its start alone'
+expect_no_line barge-pause-silent-restart 'PASS: barge-in: 0 of 1'
+expect_restored barge-pause-silent-restart
+expect_rc barge-backchannel-terminal-stall 1 2
+expect_line barge-backchannel-terminal-stall 'NOTE: recording: the capture substream arecord held read CLOSED during the recording, so the recording'"'"'s early bounds come from its start alone'
+expect_line barge-backchannel-terminal-stall 'barge-in:'
+expect_no_line barge-backchannel-terminal-stall 'PASS: barge-in: 0 of 1'
+expect_restored barge-backchannel-terminal-stall
 
 # playback-cancel.
 expect_rc cancel 0

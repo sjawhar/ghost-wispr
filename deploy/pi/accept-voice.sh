@@ -495,7 +495,9 @@ def size_reader(path):
 
 def capture_state(root, pid):
     """The state of the capture substream arecord (pid) holds, from its /proc/asound status under
-    root, as RUNNING; None when no substream names it. The kernel pads the keys ("owner_pid   :")."""
+    root, as RUNNING, and its trigger_time, which the kernel sets at every start, stop (an
+    overrun's included), pause, suspend and resume; (None, None) when no substream names it. The
+    kernel pads the keys ("owner_pid   :")."""
     for status in glob.glob(os.path.join(root, "card*", "pcm*c", "sub*", "status")):
         try:
             with open(status) as f:
@@ -503,8 +505,8 @@ def capture_state(root, pid):
         except OSError:
             continue
         if fields.get("owner_pid") == str(pid):
-            return fields.get("state")
-    return None
+            return fields.get("state"), fields.get("trigger_time")
+    return None, None
 
 
 def record(path, anchors, pidfile, root):
@@ -517,14 +519,34 @@ def record(path, anchors, pidfile, root):
     before the capture began: the last such read's time, read before the size, is the start. It
     prints "started US" once arecord has written a sample, "stopped" if arecord ends before, and
     "timeout" if it has written none within 5 s of its pid; a sample counts even when found after the
-    5 s. After each read from the first sample on, it reads the state of the capture substream
-    arecord holds (capture_state under ROOT): one that is not RUNNING, an overrun (XRUN) or a
-    suspend (SUSPENDED) that arecord may not live to report, prints "discontinuous US STATE" once."""
+    5 s. Each read from the first sample on is followed by a read of the state of the capture
+    substream arecord holds (capture_state under ROOT). Only when that state is RUNNING, from the
+    trigger of the first such read, is the anchor written with BEFORE_US, the floor that bounds
+    later samples from below; otherwise it is written "US BYTES", a late bound alone, and
+    "discontinuous US STATE" is printed once: an overrun (XRUN), a suspend, a restart (another
+    trigger) or a substream gone (CLOSED) that arecord may not live to report. A state read after
+    the size can be later than it, never earlier (Sol's review of #149 at b7edd969: arecord can end
+    a held write and close without another read that would report the overrun)."""
     signal.signal(signal.SIGINT, signal.SIG_IGN)
     signal.signal(signal.SIGTERM, stop)
     read = size_reader(path)
     out = open(anchors, "a", buffering=1)
-    pid, deadline, started, ready, reported = None, None, None, False, False
+    pid, deadline, started, ready, reported, trigger = None, None, None, False, False, None
+
+    def anchored(seen, size, before):
+        """Write the anchor of a read with samples, its floor only if the substream ran on."""
+        nonlocal reported, trigger
+        state, now_trigger = capture_state(root, pid)
+        if state == "RUNNING" and trigger is None:
+            trigger = now_trigger
+        if state == "RUNNING" and now_trigger == trigger:
+            out.write("%d %d %d\n" % (seen, size, before))
+            return
+        out.write("%d %d\n" % (seen, size))
+        if not reported:
+            print("discontinuous %d %s" % (seen, "RESTARTED" if state == "RUNNING" else state or "CLOSED"), flush=True)
+            reported = True
+
     try:
         while True:
             if pid is None:
@@ -537,10 +559,11 @@ def record(path, anchors, pidfile, root):
             before = us()
             size = read(pid)
             seen = us()
-            if size is not None and size >= HEADER:
+            if size is not None and size > HEADER:
+                anchored(seen, size, before)
+                break
+            if size is not None and size == HEADER:
                 out.write("%d %d %d\n" % (seen, size, before))
-                if size > HEADER:
-                    break
             if size is not None and size < HEADER:
                 started = before
             if not ready:
@@ -563,14 +586,7 @@ def record(path, anchors, pidfile, root):
             size = read(pid)
             seen = us()
             if size is not None and size > HEADER:
-                out.write("%d %d %d\n" % (seen, size, before))
-            # The size was read while the substream ran: no captured sample had waited past
-            # the buffer by then. Read after the size, a state that is not RUNNING may be later
-            # than it, never earlier.
-            state = capture_state(root, pid)
-            if state not in (None, "RUNNING") and not reported:
-                print("discontinuous %d %s" % (seen, state), flush=True)
-                reported = True
+                anchored(seen, size, before)
     except Stop:
         pass
     # arecord has ended: the file is whole.
