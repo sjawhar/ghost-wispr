@@ -32,8 +32,9 @@ const (
 	// recording.
 	prerollSeconds = 5
 	// maxHeldSeconds bounds the audio a hold (HoldPreroll) keeps for the next
-	// session's start: far longer than any stretch of speech without the end
-	// of speech or the utterance end that starts a session.
+	// session's start, unless history keeps more: far longer than any stretch
+	// of speech without the end of speech or the utterance end that starts a
+	// session.
 	maxHeldSeconds = 300
 )
 
@@ -89,7 +90,7 @@ type Recorder struct {
 	holdBack int
 	held     []byte
 	// trimWarned is set once the hold under way has dropped its oldest
-	// audio past maxHeldSeconds and said so in the log.
+	// audio past its limit (heldBytesLocked) and said so in the log.
 	trimWarned bool
 	// sinceClose counts the bytes taken since the last recording closed
 	// (SinceClose).
@@ -392,15 +393,15 @@ func (r *Recorder) writePCM(data []byte) error {
 			return nil
 		}
 		r.held = append(r.held, data...)
-		// Past maxHeldSeconds, the oldest audio goes: first what history
-		// keeps for the hold, then what the hold took.
-		if over := r.holdBack + len(r.held) - maxHeldSeconds*pcmBytesPerSecond(r.sampleRate); over > 0 {
+		// Past its limit, the oldest audio goes: first what history keeps
+		// for the hold, then what the hold took.
+		if over := r.holdBack + len(r.held) - r.heldBytesLocked(); over > 0 {
 			back := min(over, r.holdBack)
 			r.holdBack -= back
 			r.held = r.held[over-back:]
 			if !r.trimWarned {
 				r.trimWarned = true
-				slog.Warn("the audio kept for the next session's start reached its limit with no session started; its oldest audio is dropped from now on, and with it maybe the first words", "limit_seconds", maxHeldSeconds)
+				slog.Warn("the audio kept for the next session's start reached its limit with no session started; its oldest audio is dropped from now on, and with it maybe the first words", "limit_seconds", r.heldBytesLocked()/pcmBytesPerSecond(r.sampleRate))
 			}
 		}
 		return nil
@@ -513,8 +514,8 @@ func (r *Recorder) DiscardPreroll() {
 // HoldPreroll makes the next session's recording start prerollSeconds before
 // the audio taken ago, or at the oldest audio history keeps: it keeps that
 // audio, and all the audio taken from now on, until that session starts
-// (StartSession), a ReleasePreroll, or a DiscardPreroll; up to
-// maxHeldSeconds in all. Words Deepgram hears open a session only at the end
+// (StartSession), a ReleasePreroll, or a DiscardPreroll; up to its limit in
+// all (heldBytesLocked). Words Deepgram hears open a session only at the end
 // of their speech, and it can hear them late (SetLookback), so the session
 // manager calls it at each result with words while no session is open, ago
 // being how long before now their first word was captured: the recording
@@ -531,10 +532,18 @@ func (r *Recorder) HoldPreroll(ago time.Duration) {
 		r.holding, r.holdBack, r.held, r.trimWarned = true, 0, nil, false
 	}
 	reach := pcmBytes(max(ago, 0), r.sampleRate) + prerollSeconds*pcmBytesPerSecond(r.sampleRate)
-	// No further back than maxHeldSeconds: a hold at its bound has dropped
-	// its oldest audio (writePCM), and history no longer joins what it holds.
-	bound := maxHeldSeconds*pcmBytesPerSecond(r.sampleRate) - len(r.held)
+	// No further back than the limit: a hold at its limit has dropped its
+	// oldest audio (writePCM), and history no longer joins what it holds.
+	bound := r.heldBytesLocked() - len(r.held)
 	r.holdBack = max(r.holdBack, min(reach-len(r.held), r.history.Len(), bound))
+}
+
+// heldBytesLocked is the most audio a hold keeps: maxHeldSeconds, or all
+// that history keeps when that is more, so a hold reaches as far back as
+// Deepgram can hear words late (SetLookback). It must be called with r.mu
+// held.
+func (r *Recorder) heldBytesLocked() int {
+	return max(maxHeldSeconds*pcmBytesPerSecond(r.sampleRate), r.history.Cap())
 }
 
 // ReleasePreroll ends a hold (HoldPreroll) whose words opened no session,

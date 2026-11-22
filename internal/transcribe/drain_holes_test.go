@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"sync"
 	"testing"
@@ -162,18 +163,15 @@ func TestAnOverflowBetweenChunksKeepsTheSocket(t *testing.T) {
 	checkPoints(t, rc, len(audio), overflowHole)
 }
 
-// TestAnOverflowWhileARefusedChunkWaitsIsAHoleAfterIt fails if the buffer,
-// overflowing while a socket refuses the chunk the drain wrote it, drops the
-// chunk, or leaves the next socket's stream reading the audio after the
-// overflow as if the dropped audio had been sent: the next socket gets the
-// chunk, then what the buffer kept, and its stream skips the hole between
-// them, which the overflow made before that socket was dialled.
-func TestAnOverflowWhileARefusedChunkWaitsIsAHoleAfterIt(t *testing.T) {
+// refusedChunkThenOverflow has the first socket of rc, on an 8192-byte
+// buffer, refuse the 4096-byte chunk the drain wrote it, while audio[8192:]
+// is written behind it, and returns once the next socket is connected.
+func refusedChunkThenOverflow(t *testing.T, audio []byte) (*optionsSocket, *ResilientClient, *sequenceFactory) {
+	t.Helper()
 	failed := &rejectingSocket{accept: 0, held: make(chan struct{}), release: make(chan struct{})}
 	next := &optionsSocket{}
 	f := &sequenceFactory{next: []io.WriteCloser{failed, next}}
 	rc := newTailClient(t, f)
-	audio := audioBytes(16384)
 	_, _ = rc.Write(audio[:8192]) // fills the buffer: no socket yet
 	rc.ConnectInBackground()
 	select {
@@ -184,17 +182,37 @@ func TestAnOverflowWhileARefusedChunkWaitsIsAHoleAfterIt(t *testing.T) {
 	_, _ = rc.Write(audio[8192:]) // the buffer overflows behind the chunk
 	close(failed.release)         // the first socket refuses the chunk
 	waitConnected(t, rc)
-
 	if got := failed.got(); len(got) != 0 {
 		t.Fatalf("control: the first socket took %d bytes, want none", len(got))
 	}
-	want := append(append([]byte(nil), audio[:4096]...), audio[8192:]...)
-	if got := next.got(); !bytes.Equal(got, want) {
-		t.Errorf("the next socket got %d bytes, want the refused chunk, then the %d the buffer kept, once and in order", len(got), len(audio)-8192)
+	if got, want := rc.MaxBehind(), 640*time.Millisecond; got != want {
+		t.Errorf("MaxBehind() = %v, want %v: twice the buffer and a chunk", got, want)
 	}
-	checkPoints(t, rc, len(audio), overflowHole)
-	if n := f.dials(); n != 2 {
-		t.Errorf("the factory dialled %d sockets, want 2", n)
+	return next, rc, f
+}
+
+// TestARefusedChunkIsSentWhateverItsAge fails if the chunk a socket refused,
+// kept for the next socket while the buffer overflows behind it, loses audio
+// once it is older than the buffer's audio, or older than MaxBehind: main
+// sends all of it, whatever its age, and Deepgram still hears the words in
+// it. The next socket gets it whole, then what the 8192-byte buffer kept, and
+// its stream skips the hole between. The outages put the chunk past the
+// buffer and a chunk (12288 behind), at MaxBehind (20480), and twice past it.
+func TestARefusedChunkIsSentWhateverItsAge(t *testing.T) {
+	for _, captured := range []int{14336, 20480, 40960} {
+		t.Run(fmt.Sprintf("%d bytes behind", captured), func(t *testing.T) {
+			audio := audioBytes(captured)
+			next, rc, f := refusedChunkThenOverflow(t, audio)
+			kept := captured - 8192 // the buffer's newest
+			want := append(append([]byte(nil), audio[:4096]...), audio[kept:]...)
+			if got := next.got(); !bytes.Equal(got, want) {
+				t.Errorf("the next socket got %d bytes, want the whole refused chunk, then the 8192 the buffer kept, once and in order", len(got))
+			}
+			checkPoints(t, rc, len(audio), map[int]int{0: 0, 4094: 4094, 4096: kept, 12286: captured - 2})
+			if n := f.dials(); n != 2 {
+				t.Errorf("the factory dialled %d sockets, want 2", n)
+			}
+		})
 	}
 }
 
@@ -203,13 +221,14 @@ func TestAnOverflowWhileARefusedChunkWaitsIsAHoleAfterIt(t *testing.T) {
 // overflowed behind the chunk, leaves the next socket anything but the rest of
 // the chunk, then what the buffer kept: the bytes it took are sent once, and
 // the next socket's stream starts where the first socket's ended and skips
-// the hole after the chunk.
+// the hole after the chunk. The rest of the chunk is within MaxBehind, so it
+// is kept whole.
 func TestAPartialWriteThenAnOverflowKeepsTheRestOfTheChunk(t *testing.T) {
 	failed := &rejectingSocket{accept: 3000, held: make(chan struct{}), release: make(chan struct{})}
 	next := &optionsSocket{}
 	f := &sequenceFactory{next: []io.WriteCloser{failed, next}}
 	rc := newTailClient(t, f)
-	audio := audioBytes(16384)
+	audio := audioBytes(14336)
 	_, _ = rc.Write(audio[:8192])
 	rc.ConnectInBackground()
 	select {
@@ -217,18 +236,18 @@ func TestAPartialWriteThenAnOverflowKeepsTheRestOfTheChunk(t *testing.T) {
 	case <-time.After(3 * time.Second):
 		t.Fatal("the drain never wrote to the first socket")
 	}
-	_, _ = rc.Write(audio[8192:]) // 4096 over: the buffer's oldest, behind the chunk
+	_, _ = rc.Write(audio[8192:]) // 2048 over: the buffer's oldest, behind the chunk
 	close(failed.release)         // the socket takes 3000 bytes of the chunk, then fails
 	waitConnected(t, rc)
 
 	if got := failed.got(); !bytes.Equal(got, audio[:3000]) {
 		t.Fatalf("control: the first socket took %d bytes, want the chunk's first 3000", len(got))
 	}
-	want := append(append([]byte(nil), audio[3000:4096]...), audio[8192:]...)
+	want := append(append([]byte(nil), audio[3000:4096]...), audio[6144:]...)
 	if got := next.got(); !bytes.Equal(got, want) {
-		t.Errorf("the next socket got %d bytes, want the chunk's last 1096, then the %d the buffer kept, once and in order", len(got), len(audio)-8192)
+		t.Errorf("the next socket got %d bytes, want the chunk's last 1096, then the %d the buffer kept, once and in order", len(got), len(audio)-6144)
 	}
-	checkPoints(t, rc, len(audio), map[int]int{0: 3000, 1094: 4094, 1096: 8192, 9286: 16382})
+	checkPoints(t, rc, len(audio), map[int]int{0: 3000, 1094: 4094, 1096: 6144, 9286: 14334})
 }
 
 // TestAnOverflowBeforeTheFirstChunkIsAHoleAtTheStreamsStart fails if the

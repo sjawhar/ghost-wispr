@@ -246,9 +246,12 @@ starts 5 s before the first word the live transcript holds, so the recording and
 transcript that replaces the live one hold every word from the first. To do that, while no session
 is recording the recorder keeps the last 5 s of audio in memory, plus as much as Deepgram can fall
 behind: the live client buffers up to 60 s (`deepgram_buffer_size`) while Deepgram is away, and
-its words for that audio come only after the reconnect, so the recorder keeps 95 s in all. From the
-first words Deepgram hears until the session starts, it keeps all the audio after them too, up to
-300 s. It keeps only audio captured while the light was red: every close of the microphone (a
+sends the piece of audio a failed send left unsent first, however old it is. The recorder keeps
+enough to hold that piece after an outage of up to twice the buffer, 120 s, and 30 s for
+Deepgram's late results: 155 s in all. After a longer outage the piece is still transcribed, but
+no recording holds it. From the first words Deepgram hears until the session starts, it keeps all
+the audio after them too, up to 300 s, or as much as it keeps before them when that is more. It
+keeps only audio captured while the light was red: every close of the microphone (a
 pause, the light reading back off or failing, no audio reaching the recording) drops it, and no
 audio of an earlier session is ever kept. A session's start time is when its recording starts.
 Deepgram can give its words for the last seconds before a pause, or before a session's recording

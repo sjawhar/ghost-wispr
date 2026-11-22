@@ -170,10 +170,10 @@ type ResilientClient struct {
 	drainMu sync.Mutex
 	// pending is the chunk the drain took out of Buffer and has not yet sent
 	// whole: what a failed or partial write left unsent. It is older than
-	// everything in Buffer, so the next drain sends it first; a full buffer
-	// drops audio behind it, not of it (bufferLocked). pendingAt is where it
-	// starts, in the count of the bytes Write takes. Guarded by Mu, and
-	// changed only with drainMu held.
+	// everything in Buffer, so the next drain sends it first, whatever its
+	// age; a full buffer drops audio behind it, not of it (bufferLocked).
+	// pendingAt is where it starts, in the count of the bytes Write takes.
+	// Guarded by Mu, and changed only with drainMu held.
 	pending   []byte
 	pendingAt int64
 
