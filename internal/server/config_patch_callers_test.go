@@ -17,6 +17,7 @@ var settingsPageBodies = map[string]string{
 	"IntegrationsSettings: gc":         `{"gc":{"enabled":true,"max_age_days":0,"max_audio_size_mb":1024}}`,
 	"ModelProviders: a key":            `{"provider_keys":{"deepgram":"dg-2"}}`,
 	"PresetEditor: save":               `{"summarization":{"presets":{"standup":{"description":"Stand-up","system_prompt":"Summarize briefly","user_template":"{{transcript}}","model":""}}}}`,
+	"PresetEditor: clear the model":    `{"summarization":{"presets":{"standup":{"model":""}}}}`,
 	"PresetEditor: delete":             `{"summarization":{"presets":{"standup":null}}}`,
 	"VoiceSettings: voice and its tts": `{"voice":{"enabled":true,"engine":"tts"},"tts":{"model":"vertex-us/gemini-3.8-flash-tts","voice":"Puck"}}`,
 }

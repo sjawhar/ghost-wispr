@@ -1824,8 +1824,20 @@ type configPatch struct {
 }
 
 type summarizationPatch struct {
-	Model   *string                   `json:"model,omitempty"`
-	Presets map[string]*config.Preset `json:"presets,omitempty"` // null value = delete
+	Model   *string                 `json:"model,omitempty"`
+	Presets map[string]*presetPatch `json:"presets,omitempty"` // null value = delete
+}
+
+// presetPatch is one preset's fields in a PATCH. A field it leaves out keeps
+// the preset's value. The model or description it names replaces the
+// preset's, "" included: an empty model takes the override off, so the preset
+// uses summarization.model. A preset needs its system prompt and user
+// template, so "" for either keeps the preset's.
+type presetPatch struct {
+	Description  *string `json:"description,omitempty"`
+	SystemPrompt *string `json:"system_prompt,omitempty"`
+	UserTemplate *string `json:"user_template,omitempty"`
+	Model        *string `json:"model,omitempty"`
 }
 
 type transcriptionPatch struct {
@@ -1911,19 +1923,18 @@ func applyConfigPatch(c *config.Config, p *configPatch) error {
 					// null = delete per RFC 7386
 					delete(c.Summarization.Presets, name)
 				} else {
-					// Merge: only overwrite non-zero fields.
 					existing := c.Summarization.Presets[name]
-					if preset.Description != "" {
-						existing.Description = preset.Description
+					if preset.Description != nil {
+						existing.Description = *preset.Description
 					}
-					if preset.SystemPrompt != "" {
-						existing.SystemPrompt = preset.SystemPrompt
+					if preset.SystemPrompt != nil && *preset.SystemPrompt != "" {
+						existing.SystemPrompt = *preset.SystemPrompt
 					}
-					if preset.UserTemplate != "" {
-						existing.UserTemplate = preset.UserTemplate
+					if preset.UserTemplate != nil && *preset.UserTemplate != "" {
+						existing.UserTemplate = *preset.UserTemplate
 					}
-					if preset.Model != "" {
-						existing.Model = preset.Model
+					if preset.Model != nil {
+						existing.Model = *preset.Model
 					}
 					c.Summarization.Presets[name] = existing
 				}

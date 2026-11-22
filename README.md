@@ -339,7 +339,10 @@ began with a key a save has since replaced is not kept as the provider's last ch
   writes each key into `.env` under the provider's `auth.env`; any other provider or a key containing
   control characters is a 400. It also takes `tts: {model, voice}`, `summarization: {model, presets}`
   and `voice: {enabled, engine}` among its other fields, refuses a summarization or text-to-speech
-  model that no provider serves, and answers 400 to a field it does not know. A saved key reaches
+  model that no provider serves, and answers 400 to a field it does not know. A preset in
+  `summarization.presets` changes only the fields the patch names, `null` deletes it, and a preset
+  `model` or `description` of `""` clears it (a preset with no model uses `summarization.model`;
+  `""` leaves its `system_prompt` and `user_template` as they are). A saved key reaches
   every client that signs in with it with no restart: search, the next live-transcription
   reconnect, speech and summaries. A check of the providers that read the settings before the save
   never gives them the key it replaced.

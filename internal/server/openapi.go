@@ -84,7 +84,7 @@ var configSchema = map[string]any{
 			"type": "object",
 			"properties": map[string]any{
 				"model":   map[string]any{"type": "string", "description": "Summaries and titles: the provider/model, such as vertex/gemini-3.5-flash-lite"},
-				"presets": map[string]any{"type": "object", "description": "The summary presets, by name; in a PATCH, null deletes one"},
+				"presets": map[string]any{"type": "object", "description": "The summary presets, by name. In a PATCH, null deletes one; a preset's fields left out keep their values, and a model or description of \"\" clears it (a preset with no model uses summarization.model)"},
 			},
 		},
 		"tts": map[string]any{
