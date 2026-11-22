@@ -56,8 +56,9 @@ type Manager struct {
 	startIDs                       map[uint64]string // the last startIDsKept settled starts' ids, by sequence number (SessionOfStart)
 	startsDone                     *sync.Cond        // signalled (with mu) when a session start finishes
 	endingSession                  bool              // an end of the current session is under way
-	endsDone                       *sync.Cond        // signalled (with mu) when an end of the session finishes, and when endsRunning falls
+	endsDone                       *sync.Cond        // signalled (with mu) when an end of the session finishes, when endsRunning falls, and when a flush ends
 	endsRunning                    int               // session ends under way, from their claim until they return (WaitForLifecyclePublishes)
+	flushesRunning                 int               // flushes storing the words they took from the buffer (flushBuffer); an end waits for them
 	failedEnd                      sessionEnd        // how far an end of the current session that failed got
 	finalizeWaiter                 chan struct{}     // closed by Deepgram's next Finalize reply; see AwaitFinalize
 	lastIDTime                     time.Time         // the start second the latest session ID names
@@ -417,6 +418,16 @@ func (m *Manager) flushBuffer() error {
 		m.mu.Unlock()
 		return nil
 	}
+	// The words are out of the buffer but not yet stored: an end of their
+	// session waits until they are (endSession), so the session never ends,
+	// nor its summary starts, without them.
+	m.flushesRunning++
+	defer func() {
+		m.mu.Lock()
+		m.flushesRunning--
+		m.endsDone.Broadcast()
+		m.mu.Unlock()
+	}()
 	sessionID, err := m.claimSessionLocked(time.Now().UTC())
 	if err != nil {
 		if errors.Is(err, ErrCapturePaused) {
@@ -601,18 +612,20 @@ func (m *Manager) endCurrentSession(ctx context.Context) error {
 // nothing and returns ErrNoActiveSession.
 func (m *Manager) endSession(ctx context.Context, want string) error {
 	m.mu.Lock()
-	// Another end of the session (silence timer, pause, stop) is under way: wait
-	// for it, up to ctx's deadline, instead of reporting no session while one
-	// still holds the recorder. Then this end finds the session gone, or
-	// retries one that failed.
-	if m.endingSession {
+	// Another end of the session (silence timer, pause, stop) is under way, or
+	// a flush is storing words it took from the buffer (a pause's or the stop's
+	// own, ForceEndSession): wait for it, up to ctx's deadline, instead of
+	// reporting no session while one still holds the recorder, or ending the
+	// session before its last words are stored. Then this end finds the
+	// session gone, or retries one that failed.
+	if m.endingSession || m.flushesRunning > 0 {
 		stop := context.AfterFunc(ctx, func() {
 			m.mu.Lock()
 			defer m.mu.Unlock()
 			m.endsDone.Broadcast()
 		})
 		defer stop()
-		for m.endingSession {
+		for m.endingSession || m.flushesRunning > 0 {
 			if err := ctx.Err(); err != nil {
 				m.mu.Unlock()
 				return err

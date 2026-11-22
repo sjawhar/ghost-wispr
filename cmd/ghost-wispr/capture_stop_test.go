@@ -131,7 +131,10 @@ func bufferedFinal(t *testing.T, text string) *api.MessageResponse {
 // flushes the buffered words to the store (AppendSegment), which must land
 // before the stop returns (the join). When the flush outlasts the stop's
 // deadline, main closes the store, and the store refuses the late flush
-// itself (stopping.ErrStopped). From review 6005005351 of #138.
+// itself (stopping.ErrStopped). The stop's own end waits for that flush and
+// so does not end the session before its words are stored: the session stays
+// active, for the next start to end (storage's RecoverStaleSessions). From
+// review 6005005351 of #138.
 func TestAPausesSettlementIsWorkTheStopWaitsFor(t *testing.T) {
 	for _, withinDeadline := range []bool{true, false} {
 		name := "the flush ends within the stop's deadline"
@@ -144,7 +147,9 @@ func TestAPausesSettlementIsWorkTheStopWaitsFor(t *testing.T) {
 			store := &heldAppendStore{SQLiteStore: db, entered: make(chan struct{}), release: make(chan struct{}), wrote: make(chan error, 1)}
 			recorder := audio.NewRecorder(t.TempDir())
 			manager := session.NewManager(store, recorder, nil, nil, session.NewDetector(time.Hour), 0)
-			capture := newSessionCaptureGate(context.Background(), manager, recorder, func() deepgramFinalizer { return nil }, 10*time.Millisecond, testEndRetry, nopLogf)
+			// As main's, the gate's context ends with the app (here, the test),
+			// which stops a pause's end that keeps failing on the closed store.
+			capture := newSessionCaptureGate(t.Context(), manager, recorder, func() deepgramFinalizer { return nil }, 10*time.Millisecond, testEndRetry, nopLogf)
 			capture.background = manager
 			id, err := manager.ManualStartSession(context.Background(), "")
 			if err != nil {
@@ -196,6 +201,13 @@ func TestAPausesSettlementIsWorkTheStopWaitsFor(t *testing.T) {
 			}
 			if got := len(segments) == 1; got != withinDeadline {
 				t.Errorf("%d segments saved, want the buffered words saved: %t", len(segments), withinDeadline)
+			}
+			sess, err := reopened.GetSession(id)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if want := map[bool]string{true: storage.SessionEnded, false: storage.SessionActive}[withinDeadline]; sess.Status != want {
+				t.Errorf("the session is %s after the stop, want %s", sess.Status, want)
 			}
 		})
 	}

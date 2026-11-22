@@ -2228,6 +2228,8 @@ func TestManager_EndWaitingOnAnotherEndHonorsItsDeadline(t *testing.T) {
 // Words that a flush took before a pause stay with the session they were
 // taken for, even when the whole pause and resume happen while that flush is
 // still saving them. They must not open the first session after the resume.
+// The pause's end of the session waits for the flush, so the session ends
+// with its words stored (TestASessionEndsOnlyAfterTheWordsAnotherEndIsFlushing).
 func TestManager_FlushTakenBeforePauseDoesNotOpenAPostResumeSession(t *testing.T) {
 	store := newStoreMock()
 	manager := NewManager(store, &recorderMock{}, nil, &hubMock{}, NewDetector(time.Hour), 0)
@@ -2255,13 +2257,20 @@ func TestManager_FlushTakenBeforePauseDoesNotOpenAPostResumeSession(t *testing.T
 	before, _ := manager.ActiveSession()
 
 	manager.PauseCapture()
-	if err := manager.ForceEndSession(context.Background()); err != nil {
-		t.Fatalf("ForceEndSession failed: %v", err)
-	}
+	ended := make(chan error, 1)
+	go func() { ended <- manager.ForceEndSession(context.Background()) }()
 	manager.ResumeCapture()
 	close(release)
 	if err := <-flushed; err != nil {
 		t.Fatalf("Message failed: %v", err)
+	}
+	select {
+	case err := <-ended:
+		if err != nil {
+			t.Fatalf("ForceEndSession failed: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("ForceEndSession did not return once the flush was stored")
 	}
 
 	if id, _ := manager.ActiveSession(); id != "" {
