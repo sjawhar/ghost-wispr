@@ -1,26 +1,22 @@
 <script lang="ts">
-  import type { ConfigPatch } from '../lib/config-api'
+  import type { ConfigPatch, ConfigResponse } from '../lib/config-api'
   import { patchConfig } from '../lib/config-api'
-  import { configState, setConfig, setError } from '../lib/config.svelte'
+  import { setConfig, setError } from '../lib/config.svelte'
+  import { unitField } from '../lib/unit-field.svelte'
 
-  let config = $derived(configState.config!)
+  let {
+    config,
+  }: {
+    config: ConfigResponse
+  } = $props()
 
-  let silenceTimeout = $state(config.silence_timeout)
-  let model = $state(config.summarization.model)
-  let endpointing = $state(config.transcription.endpointing)
-  let utteranceEndMs = $state(config.transcription.utterance_end_ms)
+  const silenceTimeout = unitField(() => config.silence_timeout)
+  const model = unitField(() => config.summarization.model)
+  const endpointing = unitField(() => config.transcription.endpointing)
+  const utteranceEndMs = unitField(() => config.transcription.utterance_end_ms)
 
   let saving = $state(false)
   let feedback = $state('')
-
-  $effect(() => {
-    if (configState.config) {
-      silenceTimeout = configState.config.silence_timeout
-      model = configState.config.summarization.model
-      endpointing = configState.config.transcription.endpointing
-      utteranceEndMs = configState.config.transcription.utterance_end_ms
-    }
-  })
 
   async function save(): Promise<void> {
     saving = true
@@ -28,19 +24,22 @@
     try {
       const patch: ConfigPatch = {}
 
-      if (silenceTimeout !== config.silence_timeout) {
-        patch.silence_timeout = silenceTimeout
+      if (silenceTimeout.value !== config.silence_timeout) {
+        patch.silence_timeout = silenceTimeout.value
       }
-      if (model !== config.summarization.model) {
-        patch.summarization = { model }
+      if (model.value !== config.summarization.model) {
+        patch.summarization = { model: model.value }
       }
-      if (
-        endpointing !== config.transcription.endpointing ||
-        utteranceEndMs !== config.transcription.utterance_end_ms
-      ) {
-        patch.transcription = { endpointing, utterance_end_ms: utteranceEndMs }
+      const transcription: NonNullable<ConfigPatch['transcription']> = {}
+      if (endpointing.value !== config.transcription.endpointing) {
+        transcription.endpointing = endpointing.value
       }
-
+      if (utteranceEndMs.value !== config.transcription.utterance_end_ms) {
+        transcription.utterance_end_ms = utteranceEndMs.value
+      }
+      if (Object.keys(transcription).length > 0) {
+        patch.transcription = transcription
+      }
       if (Object.keys(patch).length === 0) {
         feedback = 'No changes to save.'
         return
@@ -61,24 +60,29 @@
 <div class="general-settings" data-testid="general-settings">
   <div class="field">
     <label for="silence-timeout">Silence Timeout</label>
-    <input id="silence-timeout" type="text" bind:value={silenceTimeout} placeholder="30s" />
+    <input id="silence-timeout" type="text" bind:value={silenceTimeout.value} placeholder="30s" />
     <span class="hint">Go duration format (e.g. 30s, 1m, 1m30s)</span>
   </div>
 
   <div class="field">
     <label for="default-model">Default Summarization Model</label>
-    <input id="default-model" type="text" bind:value={model} placeholder="openai/gpt-4o-mini" />
+    <input
+      id="default-model"
+      type="text"
+      bind:value={model.value}
+      placeholder="openai/gpt-4o-mini"
+    />
     <span class="hint">Format: provider/model_name</span>
   </div>
 
   <div class="field">
     <label for="endpointing">Transcription Endpointing (ms)</label>
-    <input id="endpointing" type="text" bind:value={endpointing} placeholder="400" />
+    <input id="endpointing" type="text" bind:value={endpointing.value} placeholder="400" />
   </div>
 
   <div class="field">
     <label for="utterance-end">Utterance End (ms)</label>
-    <input id="utterance-end" type="text" bind:value={utteranceEndMs} placeholder="1000" />
+    <input id="utterance-end" type="text" bind:value={utteranceEndMs.value} placeholder="1000" />
     <span class="hint">Changes to transcription settings will reconnect Deepgram</span>
   </div>
 

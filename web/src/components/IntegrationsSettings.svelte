@@ -1,7 +1,8 @@
 <script lang="ts">
-  import type { ConfigResponse } from '../lib/config-api'
+  import type { ConfigPatch, ConfigResponse } from '../lib/config-api'
   import { patchConfig } from '../lib/config-api'
   import { setConfig } from '../lib/config.svelte'
+  import { unitField } from '../lib/unit-field.svelte'
   import ModelProviders from './ModelProviders.svelte'
 
   let {
@@ -10,26 +11,31 @@
     config: ConfigResponse
   } = $props()
 
-  let gdriveFolder = $state(config.gdrive.folder_id)
+  const gdriveFolder = unitField(() => config.gdrive.folder_id)
   let gdriveSaving = $state(false)
   let gdriveFeedback = $state('')
 
-  let syncEnabled = $state(config.gdrive.sync_enabled)
+  const syncEnabled = unitField(() => config.gdrive.sync_enabled)
   let syncSaving = $state(false)
   let syncFeedback = $state('')
 
-  let gcEnabled = $state(config.gc.enabled)
-  let gcMaxAgeDays = $state(config.gc.max_age_days)
-  let gcMaxAudioSizeMB = $state(config.gc.max_audio_size_mb)
+  const gcEnabled = unitField(() => config.gc.enabled)
+  const gcMaxAgeDays = unitField(() => config.gc.max_age_days)
+  const gcMaxAudioSizeMB = unitField(() => config.gc.max_audio_size_mb)
   let gcSaving = $state(false)
   let gcFeedback = $state('')
 
   async function saveGDrive(): Promise<void> {
+    const folder = gdriveFolder.value.trim()
+    if (folder === config.gdrive.folder_id) {
+      gdriveFeedback = 'No changes to save.'
+      return
+    }
     gdriveSaving = true
     gdriveFeedback = ''
     try {
       const updated = await patchConfig({
-        gdrive: { folder_id: gdriveFolder.trim() },
+        gdrive: { folder_id: folder },
       })
       setConfig(updated)
       gdriveFeedback = 'Saved!'
@@ -45,7 +51,7 @@
     syncFeedback = ''
     try {
       const updated = await patchConfig({
-        gdrive: { sync_enabled: syncEnabled },
+        gdrive: { sync_enabled: syncEnabled.value },
       })
       setConfig(updated)
       syncFeedback = 'Saved!'
@@ -57,16 +63,24 @@
   }
 
   async function saveGC(): Promise<void> {
+    const gc: NonNullable<ConfigPatch['gc']> = {}
+    if (gcEnabled.value !== config.gc.enabled) {
+      gc.enabled = gcEnabled.value
+    }
+    if (gcMaxAgeDays.value !== config.gc.max_age_days) {
+      gc.max_age_days = gcMaxAgeDays.value
+    }
+    if (gcMaxAudioSizeMB.value !== config.gc.max_audio_size_mb) {
+      gc.max_audio_size_mb = gcMaxAudioSizeMB.value
+    }
+    if (Object.keys(gc).length === 0) {
+      gcFeedback = 'No changes to save.'
+      return
+    }
     gcSaving = true
     gcFeedback = ''
     try {
-      const updated = await patchConfig({
-        gc: {
-          enabled: gcEnabled,
-          max_age_days: gcMaxAgeDays,
-          max_audio_size_mb: gcMaxAudioSizeMB,
-        },
-      })
+      const updated = await patchConfig({ gc })
       setConfig(updated)
       gcFeedback = 'Saved!'
     } catch (error) {
@@ -84,7 +98,7 @@
   <div class="gdrive-section">
     <div class="field">
       <label class="toggle-label">
-        <input type="checkbox" bind:checked={syncEnabled} onchange={saveSyncEnabled} />
+        <input type="checkbox" bind:checked={syncEnabled.value} onchange={saveSyncEnabled} />
         Enable automatic sync
         {#if syncSaving}
           <span class="saving">Saving...</span>
@@ -99,7 +113,7 @@
       <input
         id="gdrive-folder"
         type="text"
-        bind:value={gdriveFolder}
+        bind:value={gdriveFolder.value}
         placeholder="Google Drive folder ID"
       />
     </div>
@@ -122,8 +136,9 @@
       {#if gdriveFeedback}
         <span
           class="feedback"
-          class:error={!gdriveFeedback.includes('Saved') && !gdriveFeedback.includes('uploaded')}
-          >{gdriveFeedback}</span
+          class:error={!gdriveFeedback.includes('Saved') &&
+            gdriveFeedback !== 'No changes to save.' &&
+            !gdriveFeedback.includes('uploaded')}>{gdriveFeedback}</span
         >
       {/if}
     </div>
@@ -131,7 +146,7 @@
 
   <h4>Garbage Collection</h4>
   <div class="gc-section">
-    {#if gcEnabled && !config.gdrive.sync_enabled}
+    {#if gcEnabled.value && !config.gdrive.sync_enabled}
       <div class="warning-banner">
         Garbage collection is on hold until Google Drive sync is enabled.
       </div>
@@ -139,15 +154,15 @@
 
     <div class="field">
       <label class="toggle-label">
-        <input type="checkbox" bind:checked={gcEnabled} />
+        <input type="checkbox" bind:checked={gcEnabled.value} />
         Enable garbage collection
       </label>
     </div>
 
-    {#if gcEnabled}
+    {#if gcEnabled.value}
       <div class="field">
         <label for="gc-max-age">Delete sessions older than (days)</label>
-        <input id="gc-max-age" type="number" min="0" bind:value={gcMaxAgeDays} />
+        <input id="gc-max-age" type="number" min="0" bind:value={gcMaxAgeDays.value} />
         <p class="hint">
           0 = never. Deletes only ended sessions that have a verified copy in Google Drive. A
           session restored from Drive counts from its restore.
@@ -155,7 +170,7 @@
       </div>
       <div class="field">
         <label for="gc-max-size">Audio budget (MB)</label>
-        <input id="gc-max-size" type="number" min="0" bind:value={gcMaxAudioSizeMB} />
+        <input id="gc-max-size" type="number" min="0" bind:value={gcMaxAudioSizeMB.value} />
         <p class="hint">
           0 = no budget: GC removes no audio to free space. Past the budget, the oldest verified
           Drive copies' local audio is removed; sessions, transcripts and summaries are kept.
@@ -169,7 +184,11 @@
         {gcSaving ? 'Saving...' : 'Save'}
       </button>
       {#if gcFeedback}
-        <span class="feedback" class:error={gcFeedback !== 'Saved!'}>{gcFeedback}</span>
+        <span
+          class="feedback"
+          class:error={gcFeedback !== 'Saved!' && gcFeedback !== 'No changes to save.'}
+          >{gcFeedback}</span
+        >
       {/if}
     </div>
   </div>

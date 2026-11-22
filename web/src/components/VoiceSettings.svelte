@@ -2,6 +2,7 @@
   import type { ConfigPatch, ConfigResponse, VoiceEngine } from '../lib/config-api'
   import { patchConfig } from '../lib/config-api'
   import { setConfig } from '../lib/config.svelte'
+  import { unitField } from '../lib/unit-field.svelte'
 
   let {
     config,
@@ -15,32 +16,29 @@
     { value: 'dgagent', label: 'Voice agent: Deepgram (dgagent)' },
   ]
 
-  // answered is what the unit answered the last save: a save sends the fields
-  // that differ from it (from config before the first), and after a save the
-  // fields show what the unit answered (a new model's voice is its default).
-  let answered: ConfigResponse | undefined
-  let enabled = $state(config.voice.enabled)
-  let engine = $state(config.voice.engine)
-  let ttsModel = $state(config.tts.model)
-  let ttsVoice = $state(config.tts.voice)
+  // After a save the fields show what the unit answered, as the settings page
+  // passes it in (a new model's voice is its default).
+  const enabled = unitField(() => config.voice.enabled)
+  const engine = unitField(() => config.voice.engine)
+  const ttsModel = unitField(() => config.tts.model)
+  const ttsVoice = unitField(() => config.tts.voice)
   let saving = $state(false)
   let feedback = $state('')
 
   async function save(): Promise<void> {
-    const saved = answered ?? config
     const voice: NonNullable<ConfigPatch['voice']> = {}
-    if (enabled !== saved.voice.enabled) {
-      voice.enabled = enabled
+    if (enabled.value !== config.voice.enabled) {
+      voice.enabled = enabled.value
     }
-    if (engine !== saved.voice.engine) {
-      voice.engine = engine
+    if (engine.value !== config.voice.engine) {
+      voice.engine = engine.value
     }
     const tts: NonNullable<ConfigPatch['tts']> = {}
-    if (ttsModel.trim() !== saved.tts.model) {
-      tts.model = ttsModel.trim()
+    if (ttsModel.value.trim() !== config.tts.model) {
+      tts.model = ttsModel.value.trim()
     }
-    if (ttsVoice.trim() !== saved.tts.voice) {
-      tts.voice = ttsVoice.trim()
+    if (ttsVoice.value.trim() !== config.tts.voice) {
+      tts.voice = ttsVoice.value.trim()
     }
     const patch: ConfigPatch = {}
     if (Object.keys(voice).length > 0) {
@@ -57,13 +55,7 @@
     saving = true
     feedback = ''
     try {
-      const updated = await patchConfig(patch)
-      setConfig(updated)
-      answered = updated
-      enabled = updated.voice.enabled
-      engine = updated.voice.engine
-      ttsModel = updated.tts.model
-      ttsVoice = updated.tts.voice
+      setConfig(await patchConfig(patch))
       feedback = 'Saved!'
     } catch (error) {
       feedback = error instanceof Error ? error.message : 'Save failed'
@@ -75,7 +67,7 @@
 
 <div class="voice-settings" data-testid="voice-settings">
   <label class="toggle-label">
-    <input type="checkbox" bind:checked={enabled} />
+    <input type="checkbox" bind:checked={enabled.value} />
     Enable meeting voice
   </label>
 
@@ -83,19 +75,19 @@
     <legend>Voice</legend>
     {#each engines as option (option.value)}
       <label class="choice">
-        <input type="radio" name="voice-engine" value={option.value} bind:group={engine} />
+        <input type="radio" name="voice-engine" value={option.value} bind:group={engine.value} />
         {option.label}
       </label>
     {/each}
   </fieldset>
 
-  {#if engine === 'tts'}
+  {#if engine.value === 'tts'}
     <div class="field">
       <label for="tts-model">Text-to-speech model</label>
       <input
         id="tts-model"
         type="text"
-        bind:value={ttsModel}
+        bind:value={ttsModel.value}
         placeholder="provider/model, such as vertex/gemini-3.8-flash-tts"
       />
       <p class="hint">
@@ -108,7 +100,7 @@
       <input
         id="tts-voice"
         type="text"
-        bind:value={ttsVoice}
+        bind:value={ttsVoice.value}
         placeholder="The model's default voice"
       />
     </div>

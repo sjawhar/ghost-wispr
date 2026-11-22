@@ -42,7 +42,7 @@
 
     <section class="settings-section">
       <h3 class="section-heading">General Settings</h3>
-      <GeneralSettings />
+      <GeneralSettings config={configState.config} />
     </section>
 
     <section class="settings-section">
@@ -110,11 +110,5 @@
     font-size: 0.95rem;
     margin: 0 0 0.55rem;
     color: var(--ink);
-  }
-
-  .section-placeholder {
-    color: var(--muted);
-    font-style: italic;
-    margin: 0;
   }
 </style>

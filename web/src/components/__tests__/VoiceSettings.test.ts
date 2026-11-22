@@ -1,9 +1,9 @@
-import { fireEvent, render, screen, waitFor } from '@testing-library/svelte'
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/svelte'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import VoiceSettings from '../VoiceSettings.svelte'
 import SettingsPage from '../SettingsPage.svelte'
 import type { ConfigResponse } from '../../lib/config-api'
-import { configState, resetConfigState } from '../../lib/config.svelte'
+import { configState, resetConfigState, setConfig } from '../../lib/config.svelte'
 import { sent, stubFetch, unitConfig } from './configFixture'
 
 const config: ConfigResponse = {
@@ -98,15 +98,16 @@ describe('VoiceSettings', () => {
       tts: { model: 'deepgram/aura-2-example-en', voice: '' },
     }
     const fetch = stubFetch({ config: answer })
-    render(VoiceSettings, { config })
+    const view = render(VoiceSettings, { config })
 
     await fireEvent.input(screen.getByLabelText('Text-to-speech model'), {
       target: { value: 'deepgram/aura-2-example-en' },
     })
     await save()
-    await waitFor(() =>
-      expect((screen.getByLabelText('Text-to-speech voice') as HTMLInputElement).value).toBe(''),
-    )
+    await waitFor(() => expect(configState.config).toEqual(answer))
+    // The settings page passes in the config the save stored.
+    await view.rerender({ config: configState.config! })
+    expect((screen.getByLabelText('Text-to-speech voice') as HTMLInputElement).value).toBe('')
     await save()
 
     expect(sent(fetch)).toEqual([
@@ -164,6 +165,26 @@ describe('VoiceSettings', () => {
     expect(shown.classList.contains('error')).toBe(true)
     expect(configState.config).toBeNull()
   })
+
+  it('shows a voice setting the unit changed', async () => {
+    const view = render(VoiceSettings, { config })
+
+    await view.rerender({ config: { ...config, tts: { ...config.tts, voice: 'Charon' } } })
+
+    expect((screen.getByLabelText('Text-to-speech voice') as HTMLInputElement).value).toBe('Charon')
+  })
+
+  it('keeps a typed voice when the unit changes another setting', async () => {
+    const view = render(VoiceSettings, { config })
+    await fireEvent.input(screen.getByLabelText('Text-to-speech voice'), {
+      target: { value: 'Puck' },
+    })
+
+    await view.rerender({ config: { ...config, voice: { enabled: false, engine: 'tts' } } })
+
+    expect((screen.getByLabelText('Text-to-speech voice') as HTMLInputElement).value).toBe('Puck')
+    expect(checked('Enable meeting voice')).toBe(false)
+  })
 })
 
 describe('SettingsPage', () => {
@@ -178,5 +199,28 @@ describe('SettingsPage', () => {
 
     expect(await screen.findByRole('heading', { name: 'Meeting voice' })).toBeTruthy()
     expect(checked('Text-to-speech (tts)')).toBe(true)
+  })
+
+  // The app loaded the config when it started; the voice was turned off on
+  // the unit since, and the settings page loads the config again when it
+  // opens. A save of the voice alone must not turn the meeting voice back on.
+  it('shows the config it loads, and a save reverts no change made since the app loaded', async () => {
+    setConfig(config)
+    const fetch = stubFetch({ config: { ...config, voice: { enabled: false, engine: 'tts' } } })
+    render(SettingsPage, { onBack: () => {} })
+    await waitFor(() => expect(configState.config?.voice.enabled).toBe(false))
+
+    expect(checked('Enable meeting voice')).toBe(false)
+    const voice = screen.getByTestId('voice-settings')
+    await fireEvent.input(within(voice).getByLabelText('Text-to-speech voice'), {
+      target: { value: 'Puck' },
+    })
+    await fireEvent.click(within(voice).getByRole('button', { name: 'Save' }))
+
+    await waitFor(() =>
+      expect(sent(fetch).filter((r) => r.method === 'PATCH')).toEqual([
+        { url: '/api/config', method: 'PATCH', body: { tts: { voice: 'Puck' } } },
+      ]),
+    )
   })
 })
