@@ -165,12 +165,18 @@ describe('PresetEditor', () => {
       user_template: '{{transcript}}',
       model: '',
     }
-    render(PresetEditor, { presets: { ...presets, retro } })
+    const { container } = render(PresetEditor, { presets: { ...presets, retro } })
     await fireEvent.click(screen.getByRole('button', { name: /standup/ }))
     await fireEvent.input(field('Description'), { target: { value: 'Weekly notes' } })
     await fireEvent.click(screen.getByRole('button', { name: 'Save' }))
 
-    expect((field('Description') as HTMLInputElement).disabled).toBe(true)
+    const editable = [
+      ...container.querySelectorAll<HTMLInputElement | HTMLTextAreaElement>(
+        '.preset-form input:not(#preset-name), .preset-form textarea',
+      ),
+    ]
+    expect(editable).toHaveLength(4)
+    expect(editable.every((control) => control.disabled)).toBe(true)
     await fireEvent.click(screen.getByRole('button', { name: /retro/ }))
     answer(
       new Response(
@@ -221,6 +227,62 @@ describe('PresetEditor', () => {
         },
       ]),
     )
+  })
+
+  // A second "+ Add Preset" while a Create is on its way opens a new blank
+  // form; the first Create's answer must not fill it.
+  it('leaves a second new-preset form as it is when the first Create lands', async () => {
+    const answer = deferredFetch()
+    const { container } = render(PresetEditor, { presets })
+    await fireEvent.click(screen.getByRole('button', { name: '+ Add Preset' }))
+    await fireEvent.input(field('Name'), { target: { value: 'retro' } })
+    await fireEvent.click(screen.getByRole('button', { name: 'Edit manually' }))
+    await fireEvent.input(field('System Prompt'), { target: { value: 'Summarize the retro.' } })
+    await fireEvent.click(screen.getByRole('button', { name: 'Create' }))
+
+    const editable = [
+      ...container.querySelectorAll<HTMLInputElement | HTMLTextAreaElement>(
+        '.preset-form input, .preset-form textarea',
+      ),
+    ]
+    expect(editable).toHaveLength(5)
+    expect(editable.every((control) => control.disabled)).toBe(true)
+    await fireEvent.click(screen.getByRole('button', { name: '+ Add Preset' }))
+    const retro = {
+      description: '',
+      system_prompt: 'Summarize the retro.',
+      user_template: '{{transcript}}',
+      model: '',
+    }
+    answer(
+      new Response(
+        JSON.stringify({
+          ...unitConfig,
+          summarization: { ...unitConfig.summarization, presets: { ...presets, retro } },
+        }),
+      ),
+    )
+
+    await waitFor(() => expect((field('Name') as HTMLInputElement).disabled).toBe(false))
+    expect(field('Name').value).toBe('')
+    expect(screen.getByRole('button', { name: 'Generate with LLM' })).toBeTruthy()
+    expect(screen.queryByText('Saved!')).toBeNull()
+  })
+
+  // A new preset sends every field, so one under a name already taken would
+  // replace that preset whole.
+  it('creates no preset under a name already taken', async () => {
+    const fetch = stubFetch()
+    render(PresetEditor, { presets })
+    await fireEvent.click(screen.getByRole('button', { name: '+ Add Preset' }))
+    await fireEvent.input(field('Name'), { target: { value: 'standup' } })
+    await fireEvent.click(screen.getByRole('button', { name: 'Edit manually' }))
+    await fireEvent.input(field('System Prompt'), { target: { value: 'Something else.' } })
+    await fireEvent.click(screen.getByRole('button', { name: 'Create' }))
+
+    const shown = await screen.findByText('A preset named "standup" already exists.')
+    expect(shown.classList.contains('error')).toBe(true)
+    expect(sent(fetch).filter((r) => r.method === 'PATCH')).toEqual([])
   })
 
   it.each(dialogs)(

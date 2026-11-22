@@ -115,39 +115,86 @@ describe('IntegrationsSettings', () => {
     expect(sent(fetch).filter((r) => r.method === 'PATCH')).toEqual([])
   })
 
-  // The unit reads a cleared number field's null as no value, so a save of it
-  // would change nothing while the page said "Saved!".
-  it('saves no GC limit left empty, and says it needs a number', async () => {
+  // The unit reads a cleared field's null as no value (a save of it would
+  // change nothing while the page said "Saved!"), refuses a negative limit,
+  // and refuses a fraction with a parser error.
+  it.each([
+    ['left empty', ''],
+    ['negative', '-5'],
+    ['a fraction', '2.5'],
+  ])('saves no GC limit %s, and says what it needs', async (_, entered) => {
+    const fetch = stubFetch()
+    const { container } = render(IntegrationsSettings, { config })
+
+    await fireEvent.input(screen.getByLabelText('Delete sessions older than (days)'), {
+      target: { value: entered },
+    })
+    const gcSection = container.querySelector('.gc-section') as HTMLElement
+    await fireEvent.click(within(gcSection).getByRole('button', { name: 'Save' }))
+
+    const shown = await within(gcSection).findByText(
+      'Each GC limit needs a whole number, 0 or more; 0 means no limit.',
+    )
+    expect(shown.classList.contains('error')).toBe(true)
+    expect(sent(fetch).filter((r) => r.method === 'PATCH')).toEqual([])
+  })
+
+  it('sends no GC limit left empty while GC is off and the limits are hidden', async () => {
     const fetch = stubFetch()
     const { container } = render(IntegrationsSettings, { config })
 
     await fireEvent.input(screen.getByLabelText('Delete sessions older than (days)'), {
       target: { value: '' },
     })
+    await fireEvent.click(screen.getByLabelText('Enable garbage collection'))
     const gcSection = container.querySelector('.gc-section') as HTMLElement
     await fireEvent.click(within(gcSection).getByRole('button', { name: 'Save' }))
 
-    const shown = await within(gcSection).findByText(
-      'Each GC limit needs a number; 0 means no limit.',
+    await waitFor(() =>
+      expect(
+        sent(fetch)
+          .filter((r) => r.method === 'PATCH')
+          .map((r) => r.body),
+      ).toEqual([{ gc: { enabled: false } }]),
     )
-    expect(shown.classList.contains('error')).toBe(true)
-    expect(sent(fetch).filter((r) => r.method === 'PATCH')).toEqual([])
   })
 
   // Text typed while a save is on its way would be replaced by the save's
   // answer, so the fields take none until it lands.
-  it('takes no typing in the GC limits while their save is on its way', async () => {
+  it('takes no input in a section while its save is on its way', async () => {
     const answer = deferredFetch()
     const { container } = render(IntegrationsSettings, { config })
-    const age = screen.getByLabelText('Delete sessions older than (days)') as HTMLInputElement
-
-    await fireEvent.input(age, { target: { value: '45' } })
     const gcSection = container.querySelector('.gc-section') as HTMLElement
+    const gcControls = [...gcSection.querySelectorAll<HTMLInputElement>('input')]
+    expect(gcControls).toHaveLength(3)
+
+    await fireEvent.input(screen.getByLabelText('Delete sessions older than (days)'), {
+      target: { value: '45' },
+    })
     await fireEvent.click(within(gcSection).getByRole('button', { name: 'Save' }))
 
-    expect(age.disabled).toBe(true)
+    expect(gcControls.map((input) => input.disabled)).toEqual([true, true, true])
     answer(new Response(JSON.stringify({ ...config, gc: { ...config.gc, max_age_days: 45 } })))
-    await waitFor(() => expect(age.disabled).toBe(false))
+    await waitFor(() =>
+      expect(gcControls.map((input) => input.disabled)).toEqual([false, false, false]),
+    )
+  })
+
+  it('takes no Drive folder or sync change while its save is on its way', async () => {
+    const answer = deferredFetch()
+    const { container } = render(IntegrationsSettings, { config })
+    const folder = screen.getByLabelText('Folder ID') as HTMLInputElement
+    const sync = screen.getByLabelText(/Enable automatic sync/) as HTMLInputElement
+
+    await fireEvent.input(folder, { target: { value: 'folder-2' } })
+    const gdrive = container.querySelector('.gdrive-section') as HTMLElement
+    await fireEvent.click(within(gdrive).getByRole('button', { name: 'Save' }))
+    expect(folder.disabled).toBe(true)
+
+    await fireEvent.click(sync)
+    expect(sync.disabled).toBe(true)
+    answer(new Response(JSON.stringify(config)))
+    await waitFor(() => expect(folder.disabled || sync.disabled).toBe(false))
   })
 })
 

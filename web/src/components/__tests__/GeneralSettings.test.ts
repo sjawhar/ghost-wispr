@@ -67,18 +67,18 @@ describe('GeneralSettings', () => {
   // answer, so the fields take none until it lands.
   it('takes no typing while its save is on its way', async () => {
     const answer = deferredFetch()
-    render(GeneralSettings, { config })
-    const silence = screen.getByLabelText('Silence Timeout') as HTMLInputElement
+    const { container } = render(GeneralSettings, { config })
+    const inputs = [...container.querySelectorAll('input')]
+    expect(inputs).toHaveLength(4)
 
-    await fireEvent.input(silence, { target: { value: '45s' } })
+    await fireEvent.input(screen.getByLabelText('Silence Timeout'), { target: { value: '45s' } })
     await fireEvent.click(screen.getByRole('button', { name: 'Save' }))
 
-    expect(silence.disabled).toBe(true)
-    expect(
-      (screen.getByLabelText('Default Summarization Model') as HTMLInputElement).disabled,
-    ).toBe(true)
+    expect(inputs.map((input) => input.disabled)).toEqual([true, true, true, true])
     answer(new Response(JSON.stringify({ ...config, silence_timeout: '45s' })))
-    await waitFor(() => expect(silence.disabled).toBe(false))
-    expect(silence.value).toBe('45s')
+    await waitFor(() =>
+      expect(inputs.map((input) => input.disabled)).toEqual([false, false, false, false]),
+    )
+    expect(value('Silence Timeout')).toBe('45s')
   })
 })

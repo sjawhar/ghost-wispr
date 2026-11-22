@@ -75,12 +75,18 @@
   // can end on the overlay, and must not close the dialog.
   let overlayPressed = false
 
+  // opens counts the forms opened, so a save's answer can tell whether its
+  // form is still the one open: the same preset opened again, or a second
+  // new-preset form, is not.
+  let opens = 0
+
   function expand(name: string): void {
     if (expandedPreset === name && !isNew) {
       expandedPreset = ''
       return
     }
     const preset = presets[name]
+    opens++
     expandedPreset = name
     editName = name
     editDesc = preset.description
@@ -110,6 +116,7 @@
   }
 
   function startNew(): void {
+    opens++
     expandedPreset = '__new__'
     editName = ''
     editDesc = ''
@@ -152,18 +159,18 @@
       feedback = 'Preset name is required'
       return
     }
-    // A new preset sends every field, so one under a name already taken
-    // would replace that preset whole.
-    if (isNew && Object.hasOwn(presets, name)) {
-      feedback = `A preset named "${name}" already exists.`
-      return
-    }
     if (!editPrompt.trim()) {
       feedback = 'System prompt is required'
       return
     }
     if (!editTemplate.trim()) {
       feedback = 'User template is required'
+      return
+    }
+    // A new preset sends every field, so one under a name already taken
+    // would replace that preset whole.
+    if (isNew && name in presets) {
+      feedback = `A preset named "${name}" already exists.`
       return
     }
 
@@ -184,9 +191,11 @@
       return
     }
 
-    // The person can open another preset while the save is on its way; its
+    // The person can open another form while the save is on its way; its
     // answer then changes the stored config and no form.
     const opened = isNew ? '__new__' : name
+    const opening = opens
+    const stillOpen = () => opens === opening && expandedPreset === opened
     saving = true
     feedback = ''
     try {
@@ -194,7 +203,7 @@
         summarization: { presets: { [name]: fields } },
       })
       setConfig(updated)
-      if (expandedPreset !== opened) return
+      if (!stillOpen()) return
       // The answer can carry a change made elsewhere since the preset opened:
       // a field takes it here, before the page passes the new presets in.
       const saved = updated.summarization.presets[name]
@@ -207,7 +216,7 @@
         expandedPreset = name
       }
     } catch (error) {
-      if (expandedPreset === opened) {
+      if (stillOpen()) {
         feedback = error instanceof Error ? error.message : 'Save failed'
       }
     } finally {

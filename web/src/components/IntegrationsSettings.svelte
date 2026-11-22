@@ -63,20 +63,26 @@
   }
 
   async function saveGC(): Promise<void> {
-    // A cleared number field holds null, which the unit reads as no value:
-    // it would change nothing while the page said "Saved!".
-    if (!Number.isFinite(gcMaxAgeDays.value) || !Number.isFinite(gcMaxAudioSizeMB.value)) {
-      gcFeedback = 'Each GC limit needs a number; 0 means no limit.'
+    // The unit takes a whole number of 0 or more for each limit. A cleared
+    // field holds null, which it reads as no value, so a save would change
+    // nothing while the page said "Saved!"; a fraction it refuses with a
+    // parser error. While GC is on the limits show, so the page says what each
+    // needs; while it is off they are hidden, and one that is not a limit is
+    // not sent.
+    const ageSet = Number.isInteger(gcMaxAgeDays.value) && gcMaxAgeDays.value >= 0
+    const sizeSet = Number.isInteger(gcMaxAudioSizeMB.value) && gcMaxAudioSizeMB.value >= 0
+    if (gcEnabled.value && (!ageSet || !sizeSet)) {
+      gcFeedback = 'Each GC limit needs a whole number, 0 or more; 0 means no limit.'
       return
     }
     const gc: NonNullable<ConfigPatch['gc']> = {}
     if (gcEnabled.value !== config.gc.enabled) {
       gc.enabled = gcEnabled.value
     }
-    if (gcMaxAgeDays.value !== config.gc.max_age_days) {
+    if (ageSet && gcMaxAgeDays.value !== config.gc.max_age_days) {
       gc.max_age_days = gcMaxAgeDays.value
     }
-    if (gcMaxAudioSizeMB.value !== config.gc.max_audio_size_mb) {
+    if (sizeSet && gcMaxAudioSizeMB.value !== config.gc.max_audio_size_mb) {
       gc.max_audio_size_mb = gcMaxAudioSizeMB.value
     }
     if (Object.keys(gc).length === 0) {

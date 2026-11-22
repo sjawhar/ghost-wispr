@@ -190,16 +190,18 @@ describe('VoiceSettings', () => {
   // answer, so the fields take none until it lands.
   it('takes no typing while its save is on its way', async () => {
     const answer = deferredFetch()
-    render(VoiceSettings, { config })
-    const voice = screen.getByLabelText('Text-to-speech voice') as HTMLInputElement
+    const { container } = render(VoiceSettings, { config })
+    const controls = [...container.querySelectorAll('input')]
+    expect(controls).toHaveLength(6)
 
-    await fireEvent.input(voice, { target: { value: 'Puck' } })
+    await fireEvent.input(screen.getByLabelText('Text-to-speech voice'), {
+      target: { value: 'Puck' },
+    })
     await save()
 
-    expect(voice.disabled).toBe(true)
-    expect((screen.getByLabelText('Enable meeting voice') as HTMLInputElement).disabled).toBe(true)
+    expect(controls.every((control) => control.disabled)).toBe(true)
     answer(new Response(JSON.stringify({ ...config, tts: { ...config.tts, voice: 'Puck' } })))
-    await waitFor(() => expect(voice.disabled).toBe(false))
+    await waitFor(() => expect(controls.some((control) => control.disabled)).toBe(false))
   })
 })
 
