@@ -658,6 +658,8 @@ describe('SettingsPage', () => {
     unit.patches[0](inB)
     expect(await within(voiceSection).findByText('Saved!')).toBeTruthy()
 
+    // Typed in two inputs, as a person does.
+    await fireEvent.input(voice, { target: { value: 'Ao' } })
     await fireEvent.input(voice, { target: { value: 'Aoede' } })
     unit.held[0]()
     await waitFor(() => expect(configState.config?.revision).toEqual({ run: 'run-B', count: 1 }))
@@ -666,5 +668,47 @@ describe('SettingsPage', () => {
 
     await waitFor(() => expect(unit.bodies).toHaveLength(2))
     expect(unit.bodies[1]).toEqual({ tts: { voice: 'Aoede' } })
+  })
+
+  // Sol's round-7 case: voice Puck is saved, and the unit takes it at A/10,
+  // but its answer is held. Another tab saves Charon at A/11. General's save
+  // answers A/12, holding Charon. Then the held A/10 answer lands. The field
+  // follows the config, which stays at A/12: it shows Charon, and a voice Save
+  // has nothing to send.
+  it("keeps the newer value when a save's own answer lands late", async () => {
+    const unit = fakeUnit({ ...config, revision: { run: 'run-A', count: 9 } })
+    render(SettingsPage, { onBack: () => {} })
+    const general = await screen.findByTestId('general-settings')
+    const voiceSection = screen.getByTestId('voice-settings')
+    const voice = within(voiceSection).getByLabelText('Text-to-speech voice') as HTMLInputElement
+
+    await fireEvent.input(voice, { target: { value: 'Puck' } })
+    await fireEvent.click(within(voiceSection).getByRole('button', { name: 'Save' }))
+    await fireEvent.input(within(general).getByLabelText('Silence Timeout'), {
+      target: { value: '45s' },
+    })
+    await fireEvent.click(within(general).getByRole('button', { name: 'Save' }))
+    expect(unit.patches).toHaveLength(2)
+
+    unit.patches[1]({
+      ...config,
+      silence_timeout: '45s',
+      tts: { ...config.tts, voice: 'Charon' },
+      revision: { run: 'run-A', count: 12 },
+    })
+    expect(await within(general).findByText('Saved!')).toBeTruthy()
+    expect(voice.value).toBe('Charon')
+    unit.patches[0]({
+      ...config,
+      tts: { ...config.tts, voice: 'Puck' },
+      revision: { run: 'run-A', count: 10 },
+    })
+    expect(await within(voiceSection).findByText('Saved!')).toBeTruthy()
+
+    expect(configState.config?.revision).toEqual({ run: 'run-A', count: 12 })
+    expect(voice.value).toBe('Charon')
+    await fireEvent.click(within(voiceSection).getByRole('button', { name: 'Save' }))
+    expect(await within(voiceSection).findByText('No changes to save.')).toBeTruthy()
+    expect(unit.bodies).toHaveLength(2)
   })
 })

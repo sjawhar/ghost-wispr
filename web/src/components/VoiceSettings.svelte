@@ -27,30 +27,25 @@
   let feedback = $state('')
 
   async function save(): Promise<void> {
-    // Each field the save carries, acknowledged with the value sent once the
-    // unit takes it.
-    const carried: (() => void)[] = []
+    // Each field the save carries, acknowledged once the unit takes it.
+    const carried: { acknowledge(): void }[] = []
     const voice: NonNullable<ConfigPatch['voice']> = {}
     if (enabled.edited) {
-      const sent = enabled.value
-      voice.enabled = sent
-      carried.push(() => enabled.acknowledge(sent))
+      voice.enabled = enabled.value
+      carried.push(enabled)
     }
     if (engine.edited) {
-      const sent = engine.value
-      voice.engine = sent
-      carried.push(() => engine.acknowledge(sent))
+      voice.engine = engine.value
+      carried.push(engine)
     }
     const tts: NonNullable<ConfigPatch['tts']> = {}
     if (ttsModel.edited) {
-      const sent = ttsModel.value.trim()
-      tts.model = sent
-      carried.push(() => ttsModel.acknowledge(sent))
+      tts.model = ttsModel.value.trim()
+      carried.push(ttsModel)
     }
     if (ttsVoice.edited) {
-      const sent = ttsVoice.value.trim()
-      tts.voice = sent
-      carried.push(() => ttsVoice.acknowledge(sent))
+      tts.voice = ttsVoice.value.trim()
+      carried.push(ttsVoice)
     }
     const patch: ConfigPatch = {}
     if (Object.keys(voice).length > 0) {
@@ -68,7 +63,7 @@
     feedback = ''
     try {
       const updated = await patchConfig(patch)
-      for (const acknowledge of carried) acknowledge()
+      for (const field of carried) field.acknowledge()
       setConfig(updated)
       feedback = 'Saved!'
     } catch (error) {

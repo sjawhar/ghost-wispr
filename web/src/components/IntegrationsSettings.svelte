@@ -34,11 +34,10 @@
     gdriveSaving = true
     gdriveFeedback = ''
     try {
-      const sent = gdriveFolder.value.trim()
       const updated = await patchConfig({
-        gdrive: { folder_id: sent },
+        gdrive: { folder_id: gdriveFolder.value.trim() },
       })
-      gdriveFolder.acknowledge(sent)
+      gdriveFolder.acknowledge()
       setConfig(updated)
       gdriveFeedback = 'Saved!'
     } catch (error) {
@@ -52,11 +51,10 @@
     syncSaving = true
     syncFeedback = ''
     try {
-      const sent = syncEnabled.value
       const updated = await patchConfig({
-        gdrive: { sync_enabled: sent },
+        gdrive: { sync_enabled: syncEnabled.value },
       })
-      syncEnabled.acknowledge(sent)
+      syncEnabled.acknowledge()
       setConfig(updated)
       syncFeedback = 'Saved!'
     } catch (error) {
@@ -80,23 +78,19 @@
       return
     }
     const gc: NonNullable<ConfigPatch['gc']> = {}
-    // Each field the save carries, acknowledged with the value sent once the
-    // unit takes it.
-    const carried: (() => void)[] = []
+    // Each field the save carries, acknowledged once the unit takes it.
+    const carried: { acknowledge(): void }[] = []
     if (gcEnabled.edited) {
-      const sent = gcEnabled.value
-      gc.enabled = sent
-      carried.push(() => gcEnabled.acknowledge(sent))
+      gc.enabled = gcEnabled.value
+      carried.push(gcEnabled)
     }
     if (ageSet && gcMaxAgeDays.edited) {
-      const sent = gcMaxAgeDays.value
-      gc.max_age_days = sent
-      carried.push(() => gcMaxAgeDays.acknowledge(sent))
+      gc.max_age_days = gcMaxAgeDays.value
+      carried.push(gcMaxAgeDays)
     }
     if (sizeSet && gcMaxAudioSizeMB.edited) {
-      const sent = gcMaxAudioSizeMB.value
-      gc.max_audio_size_mb = sent
-      carried.push(() => gcMaxAudioSizeMB.acknowledge(sent))
+      gc.max_audio_size_mb = gcMaxAudioSizeMB.value
+      carried.push(gcMaxAudioSizeMB)
     }
     if (carried.length === 0) {
       gcFeedback = 'No changes to save.'
@@ -106,7 +100,7 @@
     gcFeedback = ''
     try {
       const updated = await patchConfig({ gc })
-      for (const acknowledge of carried) acknowledge()
+      for (const field of carried) field.acknowledge()
       setConfig(updated)
       gcFeedback = 'Saved!'
     } catch (error) {

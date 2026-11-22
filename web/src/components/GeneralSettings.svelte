@@ -24,30 +24,25 @@
     feedback = ''
     try {
       const patch: ConfigPatch = {}
-      // Each field the save carries, acknowledged with the value sent once
-      // the unit takes it.
-      const carried: (() => void)[] = []
+      // Each field the save carries, acknowledged once the unit takes it.
+      const carried: { acknowledge(): void }[] = []
 
       if (silenceTimeout.edited) {
-        const sent = silenceTimeout.value
-        patch.silence_timeout = sent
-        carried.push(() => silenceTimeout.acknowledge(sent))
+        patch.silence_timeout = silenceTimeout.value
+        carried.push(silenceTimeout)
       }
       if (model.edited) {
-        const sent = model.value
-        patch.summarization = { model: sent }
-        carried.push(() => model.acknowledge(sent))
+        patch.summarization = { model: model.value }
+        carried.push(model)
       }
       const transcription: NonNullable<ConfigPatch['transcription']> = {}
       if (endpointing.edited) {
-        const sent = endpointing.value
-        transcription.endpointing = sent
-        carried.push(() => endpointing.acknowledge(sent))
+        transcription.endpointing = endpointing.value
+        carried.push(endpointing)
       }
       if (utteranceEndMs.edited) {
-        const sent = utteranceEndMs.value
-        transcription.utterance_end_ms = sent
-        carried.push(() => utteranceEndMs.acknowledge(sent))
+        transcription.utterance_end_ms = utteranceEndMs.value
+        carried.push(utteranceEndMs)
       }
       if (Object.keys(transcription).length > 0) {
         patch.transcription = transcription
@@ -58,7 +53,7 @@
       }
 
       const updated = await patchConfig(patch)
-      for (const acknowledge of carried) acknowledge()
+      for (const field of carried) field.acknowledge()
       setConfig(updated)
       feedback = 'Saved!'
     } catch (error) {
