@@ -142,7 +142,7 @@ describe('PresetEditor', () => {
           new Response(
             JSON.stringify({
               error:
-                'summarization preset "standup" does not exist; a new preset needs a user_template',
+                'summarization preset "standup" does not exist; a new preset names its description, system_prompt, user_template and model, with a user_template',
             }),
             { status: 404 },
           ),

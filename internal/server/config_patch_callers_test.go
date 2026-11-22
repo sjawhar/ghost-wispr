@@ -25,7 +25,7 @@ var settingsPageBodies = map[string]string{
 }
 
 // heldPreset creates the standup preset the page's preset bodies change.
-const heldPreset = `{"summarization":{"presets":{"standup":{"description":"Stand-up","system_prompt":"Summarize briefly","user_template":"{{transcript}}"}}}}`
+const heldPreset = `{"summarization":{"presets":{"standup":{"description":"Stand-up","system_prompt":"Summarize briefly","user_template":"{{transcript}}","model":""}}}}`
 
 // TestPatchConfigTakesEveryBodyTheSettingsPageSends fails if PATCH
 // /api/config refuses a body the settings page sends, or takes a field it

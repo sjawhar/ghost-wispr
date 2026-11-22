@@ -1842,10 +1842,10 @@ type presetPatch struct {
 
 // creates reports whether the patch names all four of a preset's fields,
 // with a user template, as the settings page's new preset does. A patch to a
-// preset the config does not hold creates it only then: anything less is an
-// update to a preset deleted elsewhere, and would make a preset with empty
-// fields. The template carries the transcript; the system prompt may be empty
-// (the built-in default's is, and the summarizer has its own).
+// preset the config does not hold creates it only then: the page sends only
+// a preset's changed fields, so anything less is an update to a preset
+// deleted elsewhere. The template carries the transcript; the system prompt
+// may be empty (the built-in default's is, and the summarizer has its own).
 func (p *presetPatch) creates() bool {
 	return p.Description != nil && p.SystemPrompt != nil && p.Model != nil &&
 		p.UserTemplate != nil && *p.UserTemplate != ""
@@ -1899,11 +1899,10 @@ func handlePatchConfig(cfgStore *config.Store) http.HandlerFunc {
 
 		// A patch it refuses changes nothing: not the config, not its file.
 		if err := cfgStore.TryUpdate(func(c *config.Config) error {
-			missing := presetsNotHeld(c, &patch)
-			if err := applyConfigPatch(c, &patch); err != nil {
+			if err := checkPresetsHeld(c, &patch); err != nil {
 				return err
 			}
-			return checkNewPresets(c, missing)
+			return applyConfigPatch(c, &patch)
 		}); err != nil {
 			status := http.StatusBadRequest
 			var notHeld presetNotHeldError
@@ -2035,38 +2034,26 @@ func applyConfigPatch(c *config.Config, p *configPatch) error {
 	return nil
 }
 
-// presetNotHeldError is a patch to a preset the config does not hold that
-// does not give it a user template: an update to a preset deleted elsewhere,
-// or a new preset without the template that carries the transcript.
+// presetNotHeldError is a patch to a preset the config does not hold that does
+// not create it: an update to a preset deleted elsewhere, or an incomplete new
+// preset.
 type presetNotHeldError struct{ name string }
 
 func (e presetNotHeldError) Error() string {
-	return fmt.Sprintf("summarization preset %q does not exist; a new preset needs a user_template", e.name)
+	return fmt.Sprintf("summarization preset %q does not exist; a new preset names its description, system_prompt, user_template and model, with a user_template", e.name)
 }
 
-// presetsNotHeld names the presets the patch changes (not deletes) that c
-// does not hold.
-func presetsNotHeld(c *config.Config, p *configPatch) []string {
+// checkPresetsHeld refuses a patch that changes a preset c does not hold
+// without creating it (presetPatch.creates).
+func checkPresetsHeld(c *config.Config, p *configPatch) error {
 	if p.Summarization == nil {
 		return nil
 	}
-	var names []string
 	for name, preset := range p.Summarization.Presets {
-		if _, held := c.Summarization.Presets[name]; preset != nil && !held {
-			names = append(names, name)
+		if _, held := c.Summarization.Presets[name]; preset == nil || held || preset.creates() {
+			continue
 		}
-	}
-	return names
-}
-
-// checkNewPresets refuses a patch that made a preset, among those c did not
-// hold, with no user template: the summarizer renders the transcript into it,
-// so such a preset would summarize nothing.
-func checkNewPresets(c *config.Config, names []string) error {
-	for _, name := range names {
-		if c.Summarization.Presets[name].UserTemplate == "" {
-			return presetNotHeldError{name: name}
-		}
+		return presetNotHeldError{name: name}
 	}
 	return nil
 }
