@@ -45,6 +45,29 @@
   let refineFeedback = $state('')
   let refineRunning = $state(false)
 
+  // base is the open preset as the unit last held it, which its fields
+  // started from. A save sends only the fields that differ from it: the unit
+  // replaces each field sent, so a field sent unchanged would undo a change
+  // made to it elsewhere since.
+  let base: PresetDetail | undefined
+
+  // A field the unit changes while its preset is open takes the unit's value;
+  // the other fields keep what was typed.
+  $effect(() => {
+    const preset = presets[expandedPreset]
+    if (isNew || !preset || !base) return
+    if (preset.description !== base.description) editDesc = preset.description
+    if (preset.system_prompt !== base.system_prompt) editPrompt = preset.system_prompt
+    if (preset.user_template !== base.user_template) editTemplate = preset.user_template
+    if (preset.model !== base.model) editModel = preset.model
+    base = { ...preset }
+  })
+
+  // Whether the press that a click on a dialog's overlay ends began on the
+  // overlay too: a press inside the dialog, such as one that selects text,
+  // can end on the overlay, and must not close the dialog.
+  let overlayPressed = false
+
   function expand(name: string): void {
     if (expandedPreset === name && !isNew) {
       expandedPreset = ''
@@ -57,6 +80,7 @@
     editPrompt = preset.system_prompt
     editTemplate = preset.user_template
     editModel = preset.model
+    base = { ...preset }
     isNew = false
     feedback = ''
   }
@@ -73,6 +97,7 @@
       editPrompt = preset.system_prompt
       editTemplate = preset.user_template
       editModel = preset.model
+      base = { ...preset }
       feedback = 'Changes discarded.'
     }
   }
@@ -85,6 +110,7 @@
     editTemplate = '{{transcript}}'
     editModel = ''
     isNew = true
+    base = undefined
     newStep = 'describe'
     generating = false
     feedback = ''
@@ -134,22 +160,34 @@
       return
     }
 
+    const edited: PresetDetail = {
+      description: editDesc,
+      system_prompt: editPrompt,
+      user_template: editTemplate,
+      model: editModel,
+    }
+    const fields: Partial<PresetDetail> = {}
+    for (const key of Object.keys(edited) as (keyof PresetDetail)[]) {
+      if (isNew || !base || edited[key] !== base[key]) {
+        fields[key] = edited[key]
+      }
+    }
+    if (Object.keys(fields).length === 0) {
+      feedback = 'No changes to save.'
+      return
+    }
+
     saving = true
     feedback = ''
     try {
       const updated = await patchConfig({
-        summarization: {
-          presets: {
-            [name]: {
-              description: editDesc,
-              system_prompt: editPrompt,
-              user_template: editTemplate,
-              model: editModel,
-            },
-          },
-        },
+        summarization: { presets: { [name]: fields } },
       })
       setConfig(updated)
+      const saved = updated.summarization.presets[name]
+      if (saved) {
+        base = { ...saved }
+      }
       feedback = 'Saved!'
       if (isNew) {
         isNew = false
@@ -293,25 +331,30 @@
       {#if expandedPreset === name}
         <div class="preset-form">
           <div class="field">
-            <label>Name</label>
-            <input type="text" value={name} disabled />
+            <label for="preset-name">Name</label>
+            <input id="preset-name" type="text" value={name} disabled />
           </div>
           <div class="field">
-            <label>Description</label>
-            <input type="text" bind:value={editDesc} />
+            <label for="preset-description">Description</label>
+            <input id="preset-description" type="text" bind:value={editDesc} />
           </div>
           <div class="field">
-            <label>System Prompt</label>
-            <textarea rows="6" bind:value={editPrompt}></textarea>
+            <label for="preset-system-prompt">System Prompt</label>
+            <textarea id="preset-system-prompt" rows="6" bind:value={editPrompt}></textarea>
           </div>
           <div class="field">
-            <label>User Template</label>
-            <textarea rows="3" bind:value={editTemplate}></textarea>
+            <label for="preset-user-template">User Template</label>
+            <textarea id="preset-user-template" rows="3" bind:value={editTemplate}></textarea>
             <span class="hint">Use {'{{transcript}}'} as placeholder</span>
           </div>
           <div class="field">
-            <label>Model Override (optional)</label>
-            <input type="text" bind:value={editModel} placeholder="provider/model_name" />
+            <label for="preset-model">Model Override (optional)</label>
+            <input
+              id="preset-model"
+              type="text"
+              bind:value={editModel}
+              placeholder="provider/model_name"
+            />
           </div>
           <div class="form-actions">
             <button class="save-btn" type="button" onclick={save} disabled={saving}>
@@ -337,6 +380,7 @@
                 class="feedback"
                 class:error={feedback !== 'Saved!' &&
                   feedback !== 'Changes discarded.' &&
+                  feedback !== 'No changes to save.' &&
                   feedback !== 'Refined! Review the changes and Save.'}>{feedback}</span
               >
             {/if}
@@ -350,12 +394,13 @@
     <div class="preset-card expanded">
       <div class="preset-form">
         <div class="field">
-          <label>Name</label>
-          <input type="text" bind:value={editName} placeholder="my-preset" />
+          <label for="new-preset-name">Name</label>
+          <input id="new-preset-name" type="text" bind:value={editName} placeholder="my-preset" />
         </div>
         <div class="field">
-          <label>Description</label>
+          <label for="new-preset-description">Description</label>
           <input
+            id="new-preset-description"
             type="text"
             bind:value={editDesc}
             placeholder="What kind of summary do you want?"
@@ -389,17 +434,22 @@
           </div>
         {:else}
           <div class="field">
-            <label>System Prompt</label>
-            <textarea rows="6" bind:value={editPrompt}></textarea>
+            <label for="new-preset-system-prompt">System Prompt</label>
+            <textarea id="new-preset-system-prompt" rows="6" bind:value={editPrompt}></textarea>
           </div>
           <div class="field">
-            <label>User Template</label>
-            <textarea rows="3" bind:value={editTemplate}></textarea>
+            <label for="new-preset-user-template">User Template</label>
+            <textarea id="new-preset-user-template" rows="3" bind:value={editTemplate}></textarea>
             <span class="hint">Use {'{{transcript}}'} as placeholder</span>
           </div>
           <div class="field">
-            <label>Model Override (optional)</label>
-            <input type="text" bind:value={editModel} placeholder="provider/model_name" />
+            <label for="new-preset-model">Model Override (optional)</label>
+            <input
+              id="new-preset-model"
+              type="text"
+              bind:value={editModel}
+              placeholder="provider/model_name"
+            />
           </div>
           <div class="form-actions">
             <button class="save-btn" type="button" onclick={save} disabled={saving}>
@@ -425,14 +475,20 @@
   {/if}
 
   {#if testingPreset}
+    <!-- A press and click on the overlay itself, outside the dialog, closes it. -->
     <div
       class="test-modal-overlay"
-      onclick={() => {
-        testingPreset = ''
+      onpointerdown={(e) => {
+        overlayPressed = e.target === e.currentTarget
+      }}
+      onclick={(e) => {
+        if (overlayPressed && e.target === e.currentTarget) {
+          testingPreset = ''
+        }
       }}
       role="presentation"
     >
-      <div class="test-modal" onclick={(e) => e.stopPropagation()} role="dialog">
+      <div class="test-modal" role="dialog">
         <h4>Test Preset: {testingPreset}</h4>
 
         <div class="field">
@@ -509,14 +565,20 @@
   {/if}
 
   {#if refiningPreset}
+    <!-- A press and click on the overlay itself, outside the dialog, closes it. -->
     <div
       class="test-modal-overlay"
-      onclick={() => {
-        refiningPreset = ''
+      onpointerdown={(e) => {
+        overlayPressed = e.target === e.currentTarget
+      }}
+      onclick={(e) => {
+        if (overlayPressed && e.target === e.currentTarget) {
+          refiningPreset = ''
+        }
       }}
       role="presentation"
     >
-      <div class="test-modal" onclick={(e) => e.stopPropagation()} role="dialog">
+      <div class="test-modal" role="dialog">
         <h4>Refine Preset: {refiningPreset}</h4>
         <div class="field">
           <label for="refine-feedback">What would you like to change?</label>

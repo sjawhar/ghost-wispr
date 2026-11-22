@@ -1,0 +1,205 @@
+import { fireEvent, render, screen, waitFor } from '@testing-library/svelte'
+import { afterEach, describe, expect, it, vi } from 'vitest'
+import type { PresetDetail } from '../../lib/config-api'
+import PresetEditor from '../PresetEditor.svelte'
+import { resetConfigState } from '../../lib/config.svelte'
+import { sent, stubFetch } from './configFixture'
+
+const presets: Record<string, PresetDetail> = {
+  standup: {
+    description: 'Daily standup notes',
+    system_prompt: 'Summarize the standup.',
+    user_template: '{{transcript}}',
+    model: 'openai/gpt-4o-mini',
+  },
+}
+
+function field(label: string): HTMLInputElement | HTMLTextAreaElement {
+  return screen.getByLabelText(label) as HTMLInputElement | HTMLTextAreaElement
+}
+
+async function expandStandup() {
+  const view = render(PresetEditor, { presets })
+  await fireEvent.click(screen.getByRole('button', { name: /standup/ }))
+  return view
+}
+
+function overlay(container: HTMLElement): HTMLElement {
+  const element = container.querySelector('.test-modal-overlay')
+  if (!(element instanceof HTMLElement)) throw new Error('No dialog overlay is open')
+  return element
+}
+
+// The Test dialog loads the unit's recent sessions; the unit has none.
+function stubNoSessions(): void {
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(() => Promise.resolve(new Response('[]'))),
+  )
+}
+
+const dialogs = [
+  { button: 'Test', heading: 'Test Preset: standup', closer: 'Close' },
+  { button: 'Refine', heading: 'Refine Preset: standup', closer: 'Cancel' },
+]
+
+describe('PresetEditor', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals()
+    resetConfigState()
+  })
+
+  it("names each field of a preset's form by its label", async () => {
+    await expandStandup()
+
+    expect(field('Name').value).toBe('standup')
+    expect(field('Description').value).toBe('Daily standup notes')
+    expect(field('System Prompt').value).toBe('Summarize the standup.')
+    expect(field('User Template').value).toBe('{{transcript}}')
+    expect(field('Model Override (optional)').value).toBe('openai/gpt-4o-mini')
+  })
+
+  it("names each field of a new preset's form by its label", async () => {
+    render(PresetEditor, { presets })
+    await fireEvent.click(screen.getByRole('button', { name: '+ Add Preset' }))
+    expect(field('Name').placeholder).toBe('my-preset')
+    expect(field('Description').placeholder).toBe('What kind of summary do you want?')
+
+    await fireEvent.click(screen.getByRole('button', { name: 'Edit manually' }))
+    expect(field('System Prompt').value).toBe('')
+    expect(field('User Template').value).toBe('{{transcript}}')
+    expect(field('Model Override (optional)').placeholder).toBe('provider/model_name')
+  })
+
+  // The unit merges a preset's fields: a field sent replaces the unit's. The
+  // model changed on the unit after the form opened, and the form was not
+  // told: a save of the description alone must not send the old model.
+  it('sends only the fields that were changed, so a save reverts no change made elsewhere', async () => {
+    const fetch = stubFetch()
+    await expandStandup()
+
+    await fireEvent.input(field('Description'), { target: { value: 'Weekly notes' } })
+    await fireEvent.click(screen.getByRole('button', { name: 'Save' }))
+
+    await waitFor(() =>
+      expect(sent(fetch).filter((r) => r.method === 'PATCH')).toEqual([
+        {
+          url: '/api/config',
+          method: 'PATCH',
+          body: { summarization: { presets: { standup: { description: 'Weekly notes' } } } },
+        },
+      ]),
+    )
+  })
+
+  it('saves nothing when no field was changed', async () => {
+    const fetch = stubFetch()
+    await expandStandup()
+
+    await fireEvent.click(screen.getByRole('button', { name: 'Save' }))
+
+    const shown = await screen.findByText('No changes to save.')
+    expect(shown.classList.contains('error')).toBe(false)
+    expect(sent(fetch).filter((r) => r.method === 'PATCH')).toEqual([])
+  })
+
+  it('shows a field the unit changed, and keeps what was typed in another', async () => {
+    const view = await expandStandup()
+    await fireEvent.input(field('Description'), { target: { value: 'Weekly notes' } })
+
+    await view.rerender({
+      presets: { standup: { ...presets.standup, model: 'vertex/gemini-4-carbon' } },
+    })
+
+    expect(field('Model Override (optional)').value).toBe('vertex/gemini-4-carbon')
+    expect(field('Description').value).toBe('Weekly notes')
+  })
+
+  it('sends every field of a new preset', async () => {
+    const fetch = stubFetch()
+    render(PresetEditor, { presets })
+    await fireEvent.click(screen.getByRole('button', { name: '+ Add Preset' }))
+    await fireEvent.input(field('Name'), { target: { value: 'retro' } })
+    await fireEvent.click(screen.getByRole('button', { name: 'Edit manually' }))
+    await fireEvent.input(field('System Prompt'), { target: { value: 'Summarize the retro.' } })
+    await fireEvent.click(screen.getByRole('button', { name: 'Create' }))
+
+    await waitFor(() =>
+      expect(sent(fetch).filter((r) => r.method === 'PATCH')).toEqual([
+        {
+          url: '/api/config',
+          method: 'PATCH',
+          body: {
+            summarization: {
+              presets: {
+                retro: {
+                  description: '',
+                  system_prompt: 'Summarize the retro.',
+                  user_template: '{{transcript}}',
+                  model: '',
+                },
+              },
+            },
+          },
+        },
+      ]),
+    )
+  })
+
+  it.each(dialogs)(
+    'keeps the $button dialog open on a click inside it',
+    async ({ button, heading }) => {
+      stubNoSessions()
+      await expandStandup()
+      await fireEvent.click(screen.getByRole('button', { name: button }))
+
+      await fireEvent.click(screen.getByRole('heading', { name: heading }))
+      await fireEvent.click(screen.getByRole('dialog'))
+
+      expect(screen.getByRole('dialog')).toBeTruthy()
+    },
+  )
+
+  // Selecting text in a field and letting go past the dialog's edge ends the
+  // press on the overlay; the browser then sends the click to the overlay.
+  it.each(dialogs)(
+    'keeps the $button dialog open when a press inside it ends on the overlay',
+    async ({ button, heading }) => {
+      stubNoSessions()
+      const { container } = await expandStandup()
+      await fireEvent.click(screen.getByRole('button', { name: button }))
+
+      await fireEvent.pointerDown(screen.getByRole('heading', { name: heading }))
+      await fireEvent.click(overlay(container))
+
+      expect(screen.getByRole('dialog')).toBeTruthy()
+    },
+  )
+
+  it.each(dialogs)(
+    'closes the $button dialog on a click on the overlay around it',
+    async ({ button }) => {
+      stubNoSessions()
+      const { container } = await expandStandup()
+      await fireEvent.click(screen.getByRole('button', { name: button }))
+
+      await fireEvent.pointerDown(overlay(container))
+      await fireEvent.click(overlay(container))
+
+      expect(screen.queryByRole('dialog')).toBeNull()
+    },
+  )
+
+  it.each(dialogs)(
+    'closes the $button dialog with its $closer button',
+    async ({ button, closer }) => {
+      stubNoSessions()
+      await expandStandup()
+      await fireEvent.click(screen.getByRole('button', { name: button }))
+
+      await fireEvent.click(screen.getByRole('button', { name: closer }))
+
+      expect(screen.queryByRole('dialog')).toBeNull()
+    },
+  )
+})
