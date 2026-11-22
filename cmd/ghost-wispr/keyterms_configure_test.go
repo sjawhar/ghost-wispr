@@ -95,7 +95,7 @@ func dialConfigureEndpoint(t *testing.T) (*configureEndpoint, *transcript.LiveKe
 	keyterms := transcript.NewLiveKeyterms([]string{"Wispr", "Ghost Wispr"}, func() []string { return []string{"INFRA"} })
 	factory := makeDeepgramClientFactory(context.Background(), "test-key",
 		&interfaces.ClientOptions{Host: host},
-		&interfaces.LiveTranscriptionOptions{Model: "nova-3", Language: "en-US", Encoding: "linear16", SampleRate: 16000, Channels: 1},
+		constOpts(&interfaces.LiveTranscriptionOptions{Model: "nova-3", Language: "en-US", Encoding: "linear16", SampleRate: 16000, Channels: 1}),
 		transcriptCallback{keyterms: keyterms}, time.Second)
 	socket, err := factory(context.Background())
 	if err != nil {
@@ -115,7 +115,7 @@ func TestAJoinConfiguresTheLiveStream(t *testing.T) {
 	keyterms := transcript.NewLiveKeyterms([]string{"Wispr", "Ghost Wispr"}, func() []string { return []string{"INFRA"} })
 	factory := makeDeepgramClientFactory(context.Background(), "test-key",
 		&interfaces.ClientOptions{Host: host},
-		&interfaces.LiveTranscriptionOptions{Model: "nova-3", Language: "en-US", Encoding: "linear16", SampleRate: 16000, Channels: 1},
+		constOpts(&interfaces.LiveTranscriptionOptions{Model: "nova-3", Language: "en-US", Encoding: "linear16", SampleRate: 16000, Channels: 1}),
 		transcriptCallback{keyterms: keyterms}, time.Second)
 	socket, err := factory(context.Background())
 	if err != nil {

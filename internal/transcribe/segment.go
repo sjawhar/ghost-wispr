@@ -9,8 +9,16 @@ import (
 type Word struct {
 	Speaker        *int
 	PunctuatedWord string
-	Start          float64
-	End            float64
+	// Start and End are seconds into the stream of the socket that heard the
+	// word, which a reconnect replaces with another.
+	Start float64
+	End   float64
+	// CapturedStart and CapturedMid are when the word's start and middle
+	// were captured, on the live stream's count of all the audio captured,
+	// which no reconnect moves: the session reads them while it takes the
+	// word's result, through that socket's stream (session.Manager). Zero
+	// without a live stream.
+	CapturedStart, CapturedMid time.Duration
 }
 
 // Segment is one speaker's run of transcribed words, as live transcription,

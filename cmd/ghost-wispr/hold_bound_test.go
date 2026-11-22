@@ -91,7 +91,7 @@ func TestAPauseDuringTheDeepgramDialLetsTheLightGoOff(t *testing.T) {
 			close(opened)
 			clients <- newLiveTranscription(ctx, "test-key",
 				&interfaces.ClientOptions{Host: host},
-				&interfaces.LiveTranscriptionOptions{Model: "nova-3", Language: "en-US", Encoding: "linear16", SampleRate: 16000, Channels: 1},
+				constOpts(&interfaces.LiveTranscriptionOptions{Model: "nova-3", Language: "en-US", Encoding: "linear16", SampleRate: 16000, Channels: 1}),
 				transcribe.ResilientConfig{}, transcriptCallback{}, newWarningsRegistry(), nil)
 			return nil
 		})

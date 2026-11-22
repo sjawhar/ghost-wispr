@@ -54,7 +54,7 @@ type liveManager interface {
 // the voice. The client is the manager's live stream (SetLiveStream) when the
 // manager takes one, so a session's recording starts before the first words
 // Deepgram hears, even when it hears them late after a reconnect.
-func newLiveTranscription(ctx context.Context, apiKey string, cOptions *interfaces.ClientOptions, tOptions *interfaces.LiveTranscriptionOptions, config transcribe.ResilientConfig, callback transcriptCallback, warnings *warningsRegistry, hub *server.Hub) *transcribe.ResilientClient {
+func newLiveTranscription(ctx context.Context, apiKey string, cOptions *interfaces.ClientOptions, optsFor func() *interfaces.LiveTranscriptionOptions, config transcribe.ResilientConfig, callback transcriptCallback, warnings *warningsRegistry, hub *server.Hub) *transcribe.ResilientClient {
 	// The warning changes with the client's state, under the client's lock
 	// at the change itself (OnStateChangeLocked): it is local and quick, so
 	// it is never behind. The hub's "deepgram" status is broadcast from the
@@ -91,7 +91,7 @@ func newLiveTranscription(ctx context.Context, apiKey string, cOptions *interfac
 	}
 	// The voice times each word by when its audio was captured.
 	callback.heardAt = rc.CapturedAt
-	rc.Factory = makeDeepgramClientFactory(ctx, apiKey, cOptions, tOptions, callback, deepgramWriteTimeout)
+	rc.Factory = makeDeepgramClientFactory(ctx, apiKey, cOptions, optsFor, callback, deepgramWriteTimeout)
 	if manager, ok := callback.manager.(liveManager); ok && manager != nil {
 		manager.SetLiveStream(rc)
 	}

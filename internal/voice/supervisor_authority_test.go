@@ -34,7 +34,7 @@ func TestAWakeBeforeTheFirstFinalWaitsForItsMeeting(t *testing.T) {
 	c := newFakeConcierge("It is in review.")
 	c.hold = true
 	r := newRigWith(t, c, func(cfg *SupervisorConfig, r *rig) {
-		r.session = ""
+		r.session, r.sessionSeq, r.starts = "", 0, map[uint64]string{} // no session has started
 		cfg.Meeting = func(id string) context.Context {
 			if id == "sess-1" {
 				return meeting
@@ -52,9 +52,7 @@ func TestAWakeBeforeTheFirstFinalWaitsForItsMeeting(t *testing.T) {
 		ex := exchange()
 		return ex == nil || ex.ended || ex.ctx.Err() != nil
 	})
-	r.mu.Lock()
-	r.session = "sess-1" // the first final opened the recording session
-	r.mu.Unlock()
+	r.setSession("sess-1") // the first final opened the recording session
 	r.heard("Wispr, what is left on the release?", true, true)
 	r.waitTurn()
 	ex := exchange()

@@ -21,7 +21,7 @@ func TestGoAheadAfterItsOwnInterimSpeaksTheAnswer(t *testing.T) {
 	r.heard("Wispr,", false, false)
 	wake := r.waitSession()
 	r.heard("Wispr, go ahead.", true, true)
-	r.s.OnUtteranceEnd(0, true)
+	r.s.OnUtteranceEnd(0, true, time.Now())
 	answer := r.waitSession()
 	if got := waitSaid(t, answer); got != "It ships tomorrow." {
 		t.Fatalf("said %q, want the held answer", got)
@@ -192,9 +192,7 @@ func TestAnAnswerOfASessionNoLongerRecordingIsNeverSpoken(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			c := newFakeConcierge()
 			r := newRig(t, c)
-			r.mu.Lock()
-			r.session = "sess-2" // sess-1 ended
-			r.mu.Unlock()
+			r.setSession("sess-2") // sess-1 ended, and sess-2 started
 			chimes := r.speaker.written(audio.InputChime)
 			c.answers <- PendingAnswer{TaskID: "t1", SessionID: "sess-1", Text: "It ships tomorrow.", AskedAt: time.Now()}
 			r.waitEvent("voice_answer_ready:sess-1")

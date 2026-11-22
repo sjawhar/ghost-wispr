@@ -14,6 +14,7 @@ import (
 	"github.com/sjawhar/ghost-wispr/internal/audio"
 	"github.com/sjawhar/ghost-wispr/internal/config"
 	"github.com/sjawhar/ghost-wispr/internal/server"
+	"github.com/sjawhar/ghost-wispr/internal/session"
 	"github.com/sjawhar/ghost-wispr/internal/voice"
 )
 
@@ -48,9 +49,10 @@ func TestEveryGateClosingTellsTheVoice(t *testing.T) {
 }
 
 type heardTranscripts struct {
-	mu   sync.Mutex
-	got  []voice.Transcript
-	ends []bool
+	mu     sync.Mutex
+	got    []voice.Transcript
+	ends   []bool
+	endAts []time.Time
 }
 
 func (h *heardTranscripts) OnTranscript(t *voice.Transcript) {
@@ -59,10 +61,97 @@ func (h *heardTranscripts) OnTranscript(t *voice.Transcript) {
 	h.got = append(h.got, *t)
 }
 
-func (h *heardTranscripts) OnUtteranceEnd(closings int, open bool) {
+func (h *heardTranscripts) OnUtteranceEnd(closings int, open bool, at time.Time) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.ends = append(h.ends, open)
+	h.endAts = append(h.endAts, at)
+}
+
+// slowManager is a session manager whose work on each result and each
+// UtteranceEnd takes d, as the start of a recording session on the Pi's
+// storage can.
+type slowManager struct {
+	session.LifecycleManager
+	d time.Duration
+}
+
+func (m slowManager) Message(*api.MessageResponse) error {
+	time.Sleep(m.d)
+	return nil
+}
+
+func (m slowManager) UtteranceEnd(*api.UtteranceEndResponse) error {
+	time.Sleep(m.d)
+	return nil
+}
+
+// TestTheVoiceHearsEachSignalWhenItsCallbackBegins fails if a Deepgram result
+// or its UtteranceEnd reaches the voice stamped with a time after the session
+// manager's work on it, rather than when its callback began. On the first words
+// of a recording session that work starts the session; the stamp is taken
+// before it, so it is callback-entry time, not the time Deepgram's transport
+// delivered the signal (TestASlowCallbackDelaysTheNextStamp shows a slow
+// earlier callback delays it).
+func TestTheVoiceHearsEachSignalWhenItsCallbackBegins(t *testing.T) {
+	const work = 200 * time.Millisecond
+	heard := &heardTranscripts{}
+	cb := transcriptCallback{manager: slowManager{d: work}, voice: heard}
+	mr := deepgramResult(t, `{"is_final":true,"speech_final":true,"channel":{"alternatives":[{"transcript":"Wispr, hello.","words":[
+		{"word":"wispr","punctuated_word":"Wispr,","start":1.0,"end":1.3},
+		{"word":"hello","punctuated_word":"hello.","start":1.4,"end":1.8}]}]}}`)
+	arrived := time.Now()
+	if err := cb.Message(mr); err != nil {
+		t.Fatal(err)
+	}
+	endArrived := time.Now()
+	if err := cb.UtteranceEnd(&api.UtteranceEndResponse{}); err != nil {
+		t.Fatal(err)
+	}
+	heard.mu.Lock()
+	defer heard.mu.Unlock()
+	if len(heard.got) != 1 || len(heard.endAts) != 1 {
+		t.Fatalf("the voice heard %d results and %d utterance ends, want 1 each", len(heard.got), len(heard.endAts))
+	}
+	if late := heard.got[0].At.Sub(arrived); late < 0 || late >= work/2 {
+		t.Errorf("the result reached the voice stamped %v after it arrived, want its arrival: the manager's %v of work came first", late, work)
+	}
+	if late := heard.endAts[0].Sub(endArrived); late < 0 || late >= work/2 {
+		t.Errorf("the UtteranceEnd reached the voice stamped %v after it arrived, want its arrival: the manager's %v of work came first", late, work)
+	}
+}
+
+// TestASlowCallbackDelaysTheNextStamp fails if a result's stamp does not
+// include the time a slow earlier callback held the SDK's single receive loop.
+// The SDK runs the callbacks in turn off that loop, so the stamp is
+// callback-entry time, not Deepgram's transport time: turn_end minus
+// turn_signal is the unit's own work after the callback began, and must not be
+// read as Deepgram's delay.
+func TestASlowCallbackDelaysTheNextStamp(t *testing.T) {
+	const work = 200 * time.Millisecond
+	heard := &heardTranscripts{}
+	cb := transcriptCallback{manager: slowManager{d: work}, voice: heard}
+	first := deepgramResult(t, `{"is_final":true,"speech_final":true,"channel":{"alternatives":[{"transcript":"First.","words":[
+		{"word":"first","punctuated_word":"First.","start":0.0,"end":0.4}]}]}}`)
+	second := deepgramResult(t, `{"is_final":true,"speech_final":true,"channel":{"alternatives":[{"transcript":"Second.","words":[
+		{"word":"second","punctuated_word":"Second.","start":0.5,"end":0.9}]}]}}`)
+	start := time.Now()
+	// The SDK runs the callbacks in turn off one receive loop: the second
+	// begins only after the first returns, the first's work (work) later.
+	if err := cb.Message(first); err != nil {
+		t.Fatal(err)
+	}
+	if err := cb.Message(second); err != nil {
+		t.Fatal(err)
+	}
+	heard.mu.Lock()
+	defer heard.mu.Unlock()
+	if len(heard.got) != 2 {
+		t.Fatalf("the voice heard %d results, want 2", len(heard.got))
+	}
+	if d := heard.got[1].At.Sub(start); d < work {
+		t.Errorf("the second result's stamp is %v after the first callback began, want at least the first's %v of work: the stamp is callback entry, not Deepgram's transport time", d, work)
+	}
 }
 
 // TestTheVoiceHearsEveryTranscriptWithTheGateStamp fails if a Deepgram result

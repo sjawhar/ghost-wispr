@@ -102,9 +102,7 @@ func TestTheWaitingLightGoesOffWhenNothingWaits(t *testing.T) {
 		"the session ended":               func(r *rig) { r.s.SessionEnded("sess-1") },
 		"the session deleted":             func(r *rig) { r.s.SessionsDeleted([]string{"sess-1"}) },
 		"another session records": func(r *rig) {
-			r.mu.Lock()
-			r.session = "sess-2"
-			r.mu.Unlock()
+			r.setSession("sess-2")
 		},
 		"the voice turned off":  func(r *rig) { r.setEnabled(false); r.s.EnabledChanged() },
 		"the Supervisor closed": func(r *rig) { r.s.Close() },

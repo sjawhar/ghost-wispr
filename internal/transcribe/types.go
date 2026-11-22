@@ -54,6 +54,24 @@ type ResilientConfig struct {
 	InitialReconnectDelay time.Duration
 }
 
+// GracefulCloser is a client that can end its stream gracefully: it tells the
+// peer the stream ends, so the peer processes the audio it has and returns its
+// final results, and closes once the peer has closed or wait has passed. A
+// client that is not one is closed at once.
+type GracefulCloser interface {
+	CloseGracefully(wait time.Duration) error
+}
+
+// StreamedSocket is a socket whose results are timed in its own stream: once
+// the client dialled it, it gives the socket that Stream (UseStream), and the
+// socket hands each result on with it, once Stream.Admit lets it. A socket
+// that retired, replaced though healthy, returns its last results while the
+// next socket is live (retire), and the words in them are times into its own
+// stream, not its successor's.
+type StreamedSocket interface {
+	UseStream(stream *Stream)
+}
+
 // ClientFactory is a function type that creates a new Deepgram client.
 // It decouples the ResilientClient from SDK specifics and enables testing with mock factories.
 type ClientFactory func(ctx context.Context) (io.WriteCloser, error)
@@ -150,12 +168,25 @@ type ResilientClient struct {
 	// drainMu is held across each chunk drainBuffer reads and writes, and by
 	// Finalize, so a finalize never overtakes buffered audio already in flight.
 	drainMu sync.Mutex
+	// pending is the chunk the drain took out of Buffer and has not yet sent
+	// whole: what a failed or partial write left unsent. It is older than
+	// everything in Buffer, so the next drain sends it first; a full buffer
+	// drops audio behind it, not of it (bufferLocked). pendingAt is where it
+	// starts, in the count of the bytes Write takes. Guarded by Mu, and
+	// changed only with drainMu held.
+	pending   []byte
+	pendingAt int64
 
 	// accepted counts the bytes Write has taken, and origin is the count at
 	// the first byte the current Client was sent: the stream Deepgram times
 	// its results in starts there (CapturedSince). Both are guarded by Mu.
 	accepted int64
 	origin   int64
+	// current is the stream of the current Client, until it retires, and
+	// retired are the sockets that retired and may still return their last
+	// results (retire). Guarded by Mu.
+	current *Stream
+	retired []*retiredSocket
 	// queuedAhead reports the bytes an AsyncSender in front of the client
 	// holds (watchSendQueue), nil without one; drops the audio it dropped that
 	// a word on the current socket can still come before (sendQueueDropped),
@@ -187,4 +218,13 @@ type ResilientClient struct {
 	stateChanges []StateChange
 	notifying    bool
 	notifierDone chan struct{}
+	// owning says a reconnect owner runs: the one goroutine that dials,
+	// drains and rotates sockets, from its start until it leaves the client
+	// connected (drainChunk). There is at most one. optionsGen counts the
+	// changes of the factory's options (OptionsChanged), and dialedGen is
+	// optionsGen when the current socket's dial began: the owner redials once
+	// when they differ. All guarded by Mu.
+	owning     bool
+	optionsGen uint64
+	dialedGen  uint64
 }
