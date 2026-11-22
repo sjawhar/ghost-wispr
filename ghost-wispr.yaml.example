@@ -1,15 +1,9 @@
 # Ghost Wispr Configuration
 # Copy to ghost-wispr.yaml and customize as needed.
 #
-# Google authentication uses google_credentials_file in this YAML first.
-# GOOGLE_APPLICATION_CREDENTIALS is the fallback when that key is empty.
-# The fallback accepts any Application Default Credential type.
-# API keys are configured ONLY via environment variables:
-#   GHOST_WISPR_DEEPGRAM_API_KEY    (required for live transcription)
-#   GHOST_WISPR_OPENAI_API_KEY      (for OpenAI summarization)
-#   GHOST_WISPR_ANTHROPIC_API_KEY   (for Anthropic summarization)
-#   GHOST_WISPR_GEMINI_API_KEY      (for Gemini summarization)
-#   GHOST_WISPR_DISPATCH_TOKEN      (the meeting voice's Concierge: the unit's own Dispatch token)
+# No key is ever in this file: a provider that signs in with a key reads it from the environment
+# variable its auth.env names (.env.example). The meeting voice's Concierge reads Dispatch with the
+# unit's own token, GHOST_WISPR_DISPATCH_TOKEN.
 
 # Database
 db_path: data/ghost-wispr.db
@@ -50,10 +44,55 @@ mic_sample_rates: [48000, 44100, 32000, 24000]
 # power_button: true
 # jabra_mute_button: true
 
-# Summarization — model format is provider/model_name
+# Model providers (README "Model providers"): each one named once, with the API it speaks, its
+# address (url; empty is the API's public address) and how Ghost Wispr signs in to it. Each role
+# below names one as provider/model. A file with no providers section gets these two.
+providers:
+  deepgram:
+    api: deepgram
+    auth:
+      kind: api_key
+      env: GHOST_WISPR_DEEPGRAM_API_KEY
+  openai:
+    api: openai
+    auth:
+      kind: api_key
+      env: GHOST_WISPR_OPENAI_API_KEY
+  # The other APIs: anthropic, vertex (Google Vertex AI), gemini (Google's Gemini API), elevenlabs
+  # and google-tts (Google Cloud Text-to-Speech). The other sign-ins: google (a Google access
+  # token), google_id_token (a Google ID token for an audience, as a model gateway may take) and
+  # openai_wif (OpenAI workload identity).
+  # gateway:                          # a model gateway that speaks the OpenAI API
+  #   api: openai
+  #   url: https://gateway.example.test/v1
+  #   auth:
+  #     kind: google_id_token
+  #     audience: example-gateway
+  # vertex:
+  #   api: vertex
+  #   project: example-project
+  #   location: global                # or us, eu, or a region such as us-central1
+  #   auth:
+  #     kind: google
+  # anthropic:
+  #   api: anthropic
+  #   auth:
+  #     kind: api_key
+  #     env: GHOST_WISPR_ANTHROPIC_API_KEY
+
+# Live transcription, and the pass that transcribes a session's recording again after it ends
+# (batch_transcription; "" is transcription.model).
+transcription:
+  model: deepgram/nova-3
+# batch_transcription:
+#   model: deepgram/nova-3
+
+# Summaries, titles and speaker names
 summarization:
   model: openai/gpt-4o-mini
-  # base_url: ""  # Optional: for OpenAI-compatible endpoints (Ollama, OpenRouter, etc.)
+  # A backlog of sessions goes as one batch job on a Gemini API provider (a Vertex AI provider
+  # summarizes online whatever this says); false summarizes each online instead.
+  # batch_jobs: true
 
   presets:
     default:
@@ -61,8 +100,20 @@ summarization:
       system_prompt: "Summarize the following office conversation transcript concisely in markdown. Include key topics, decisions made, and action items if any."
       user_template: "{{transcript}}"
 
-# Google Drive, Vertex AI, text-to-speech, and ghost-wispr google-id-token use google_credentials_file.
-# When it is empty, Google Application Default Credentials are the fallback.
+# Semantic search over the transcripts; "" turns it off.
+# embedding:
+#   model: openai/text-embedding-3-small
+
+# Text-to-speech, for voice A and POST /api/tts/speak; "" turns it off. voice "" is the model's
+# default voice (README "Model providers").
+# tts:
+#   model: openai/gpt-4o-mini-tts
+#   voice: marin
+#   max_length: 5000                  # the longest text POST /api/tts/speak takes
+
+# Google Drive, the providers that sign in with Google (auth kinds google, google_id_token and
+# openai_wif) and ghost-wispr google-id-token use google_credentials_file. When it is empty,
+# Google Application Default Credentials, such as the file GOOGLE_APPLICATION_CREDENTIALS names, are the fallback.
 # gdrive_folder_id:
 # google_credentials_file: /opt/ghost-wispr/google-credentials.json
 # gdrive_sync_enabled: false
@@ -77,22 +128,20 @@ summarization:
 # the speaker (speaker_enabled). The voice hears the room only while the light reads red.
 # voice:
 #   enabled: false
-#   engine: tts                       # tts (voice A, text-to-speech), gptlive (voice B, speech-to-speech: OpenAI GPT-Live) or dgagent (voice C, voice agent: Deepgram)
+#   engine: tts                       # tts (voice A, text-to-speech with tts above), gptlive (voice B, speech-to-speech: OpenAI GPT-Live) or dgagent (voice C, voice agent: Deepgram)
 #   wake_phrases: [Wispr, Ghost Wispr]
-#   tts_engine: gemini                # voice A's text-to-speech provider: gemini (Vertex AI, gcp_project) or aura (the Deepgram key)
-#   tts_model: gemini-3.8-flash-tts
-#   tts_voice: Kore                   # aura: an Aura-2 voice such as aura-2-harmonia-en
-#   tts_location: us
 #   paused_listener: false            # a pause listens for "Wispr, start recording" (a -tags kws build, the Jabra button)
-#   gptlive:                          # voice B: the OpenAI workload identity ids, not secrets
-#     openai_identity_provider_id: idp_example
-#     openai_service_account_id: user-example
+#   gptlive:
+#     model: openai/gpt-live-1        # voice B: GPT-Live on an openai provider
 #   dgagent:
-#     think_model: ""                 # voice C: provider/model that keeps the turn; "" is Deepgram's own
-# The Concierge: its Gemini model on the genai settings above, Dispatch with the unit's own token
-# (GHOST_WISPR_DISPATCH_TOKEN), and the Envoy listener that relays its questions to an issue's agent.
+#     provider: deepgram              # voice C: a deepgram provider, whose key opens the Voice Agent
+#     think_model: ""                 # the model that keeps the turn, by Deepgram's own provider/model names; "" is Deepgram's own
+# The Concierge: its model on a vertex, gemini or openai provider (a model gateway's OpenAI API
+# serves it, such as gateway/claude-haiku-4-5 or gateway/openai/gpt-5-mini), Dispatch with the
+# unit's own token (GHOST_WISPR_DISPATCH_TOKEN), and the Envoy listener that relays its questions
+# to an issue's agent.
 # concierge:
-#   model: gemini-3.5-flash-lite
+#   model: vertex/gemini-3.5-flash-lite
 #   dispatch_url: https://dispatch.example.test
 #   envoy_url: http://envoy.example.test:9020
 

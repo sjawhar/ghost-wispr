@@ -3,6 +3,7 @@ package config
 import (
 	"bufio"
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
 	"slices"
@@ -35,7 +36,7 @@ type Store struct {
 // applies env overrides, loads secrets, validates, and returns
 // a mutable store.
 func NewStore(path string) (*Store, []string, error) {
-	cfg, fileLogLevel, warnings, err := load(path)
+	cfg, fileLogLevel, warnings, err := load(path, nil)
 	if err != nil {
 		return nil, warnings, err
 	}
@@ -43,17 +44,16 @@ func NewStore(path string) (*Store, []string, error) {
 	return &Store{cfg: cfg, writtenLogLevel: fileLogLevel, path: path}, warnings, nil
 }
 
-// NewStoreWithEnv loads config from YAML, then secrets from .env file
-// (environment variables still take precedence), and returns a mutable store.
+// NewStoreWithEnv loads config from YAML, then provider keys from the .env
+// file where the environment sets none, and returns a mutable store.
 func NewStoreWithEnv(yamlPath, envPath string) (*Store, []string, error) {
 	envSecrets := loadEnvFile(envPath)
 
-	cfg, fileLogLevel, warnings, err := load(yamlPath)
+	cfg, fileLogLevel, warnings, err := load(yamlPath, envSecrets)
 	if err != nil {
 		return nil, warnings, err
 	}
 
-	applyEnvFileSecrets(&cfg, envSecrets)
 	// Load warned about a leftover signing key in the environment; one left
 	// only in .env is warned about here.
 	if envSecrets[EnvPrefix+"ENVOY_WEBHOOK_SECRET"] != "" && os.Getenv(EnvPrefix+"ENVOY_WEBHOOK_SECRET") == "" {
@@ -149,13 +149,10 @@ func (s *Store) copyConfig() Config {
 		copy(c.MicSampleRates, s.cfg.MicSampleRates)
 	}
 	c.RecordingRules = slices.Clone(s.cfg.RecordingRules)
-
-	if s.cfg.Summarization.Presets != nil {
-		c.Summarization.Presets = make(map[string]Preset, len(s.cfg.Summarization.Presets))
-		for k, v := range s.cfg.Summarization.Presets {
-			c.Summarization.Presets[k] = v
-		}
-	}
+	c.Summarization.Presets = maps.Clone(s.cfg.Summarization.Presets)
+	c.Providers = maps.Clone(s.cfg.Providers)
+	c.ProviderKeys = maps.Clone(s.cfg.ProviderKeys)
+	c.keysSet = maps.Clone(s.cfg.keysSet)
 
 	return c
 }
@@ -166,18 +163,8 @@ func (s *Store) validateForUpdate() error {
 		return fmt.Errorf("invalid silence_timeout %q: %w", s.cfg.SilenceTimeout, err)
 	}
 
-	if s.cfg.Summarization.Model != "" {
-		if err := validateModelFormat(s.cfg.Summarization.Model); err != nil {
-			return err
-		}
-	}
-
-	for name, preset := range s.cfg.Summarization.Presets {
-		if preset.Model != "" {
-			if err := validateModelFormat(preset.Model); err != nil {
-				return fmt.Errorf("preset %q: %w", name, err)
-			}
-		}
+	if err := validateRoleChange(&s.cfg); err != nil {
+		return err
 	}
 
 	if v := s.cfg.Transcription.Endpointing; v != "" {
@@ -206,31 +193,6 @@ func (s *Store) writeYAML(logLevel string) error {
 		return err
 	}
 	return atomicWriteFile(s.path, data, 0o644)
-}
-
-// validateModelFormat checks provider/model_name format without importing llm package.
-func validateModelFormat(model string) error {
-	for i, c := range model {
-		if c == '/' {
-			if i == 0 || i == len(model)-1 {
-				return fmt.Errorf("invalid model format %q: expected provider/model_name", model)
-			}
-			return nil
-		}
-	}
-	return fmt.Errorf("invalid model format %q: expected provider/model_name", model)
-}
-
-// secretEnvKeys maps Config secret fields to their environment variable names.
-var secretEnvKeys = []struct {
-	envKey string
-	get    func(*Config) string
-	set    func(*Config, string)
-}{
-	{EnvPrefix + "DEEPGRAM_API_KEY", func(c *Config) string { return c.DeepgramAPIKey }, func(c *Config, v string) { c.DeepgramAPIKey = v }},
-	{EnvPrefix + "OPENAI_API_KEY", func(c *Config) string { return c.OpenAIAPIKey }, func(c *Config, v string) { c.OpenAIAPIKey = v }},
-	{EnvPrefix + "ANTHROPIC_API_KEY", func(c *Config) string { return c.AnthropicAPIKey }, func(c *Config, v string) { c.AnthropicAPIKey = v }},
-	{EnvPrefix + "GEMINI_API_KEY", func(c *Config) string { return c.GeminiAPIKey }, func(c *Config, v string) { c.GeminiAPIKey = v }},
 }
 
 // loadEnvFile reads KEY=VALUE pairs from a .env file.
@@ -269,21 +231,9 @@ func loadEnvFile(path string) map[string]string {
 	return result
 }
 
-// applyEnvFileSecrets sets secret fields from the .env map,
-// but only if the corresponding environment variable is not already set.
-func applyEnvFileSecrets(cfg *Config, envMap map[string]string) {
-	for _, sk := range secretEnvKeys {
-		// Environment variable already set by loadSecrets — don't override.
-		if sk.get(cfg) != "" {
-			continue
-		}
-		if v, ok := envMap[sk.envKey]; ok && v != "" {
-			sk.set(cfg, v)
-		}
-	}
-}
-
-// writeEnvFile writes all non-empty secret values to the .env file.
+// writeEnvFile writes the provider keys the settings set (SetAPIKey) to the
+// .env file, keeping its other lines. A key from the environment alone, or
+// the one .env holds, is left as it is.
 func (s *Store) writeEnvFile() error {
 	if err := os.MkdirAll(filepath.Dir(s.envPath), 0o755); err != nil {
 		return err
@@ -292,13 +242,15 @@ func (s *Store) writeEnvFile() error {
 	// Read existing .env to preserve non-secret entries.
 	existing := loadEnvFile(s.envPath)
 
-	// Update secret entries.
-	for _, sk := range secretEnvKeys {
-		v := sk.get(&s.cfg)
-		if v != "" {
-			existing[sk.envKey] = v
+	// Update the keys set, each under the variable its auth.env names.
+	for _, name := range s.cfg.keyEnvNames() {
+		if !s.cfg.keysSet[name] {
+			continue
+		}
+		if v := s.cfg.ProviderKeys[name]; v != "" {
+			existing[name] = v
 		} else {
-			delete(existing, sk.envKey)
+			delete(existing, name)
 		}
 	}
 

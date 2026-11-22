@@ -5,42 +5,35 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
-	"sync"
 
 	"google.golang.org/genai"
 
-	"github.com/sjawhar/ghost-wispr/internal/genaiconfig"
 	"github.com/sjawhar/ghost-wispr/internal/providererr"
+	"github.com/sjawhar/ghost-wispr/internal/providers"
 )
 
 type geminiClient struct {
-	client *genai.Client
-	model  string
-
-	mu            sync.RWMutex
-	reportedModel string
+	client   *genai.Client
+	model    string
+	provider string // the provider's name, which its errors name
+	// reported is each answer's ModelVersion. Vertex may omit it; the
+	// model resolved into the request is then the only model identity the
+	// API provides, and the report says the answer named none.
+	reported
 }
 
-func newGeminiClient(apiKey, model string, opts *clientOptions) (*geminiClient, error) {
-	ctx := context.Background()
-	config, err := genaiconfig.BuildClientConfig(&genaiconfig.Options{
-		Backend:     opts.genai.Backend,
-		Project:     opts.genai.Project,
-		Location:    opts.genai.Location,
-		APIKey:      apiKey,
-		BaseURL:     opts.baseURL,
-		Credentials: opts.genai.Credentials,
-	})
+// newGeminiClient returns the client of model on a Vertex AI or Gemini API
+// provider.
+func newGeminiClient(p *providers.Provider, model string) (*geminiClient, error) {
+	config, err := p.GenAIConfig()
 	if err != nil {
 		return nil, err
 	}
-
-	client, err := genai.NewClient(ctx, config)
+	client, err := genai.NewClient(context.Background(), config)
 	if err != nil {
 		return nil, fmt.Errorf("create gemini client: %w", err)
 	}
-
-	return &geminiClient{client: client, model: model}, nil
+	return &geminiClient{client: client, model: model, provider: p.Name}, nil
 }
 
 func convertGeminiMessages(messages []Message) (*genai.Content, []*genai.Content) {
@@ -78,14 +71,14 @@ func (c *geminiClient) Complete(ctx context.Context, messages []Message) (string
 	config := &genai.GenerateContentConfig{SystemInstruction: systemInstruction}
 	result, err := c.client.Models.GenerateContent(ctx, c.model, contents, config)
 	if err != nil {
-		return "", fmt.Errorf("gemini completion: %w", providererr.From("gemini", err))
+		return "", fmt.Errorf("%s completion: %w", c.provider, providererr.From(c.provider, err))
 	}
 
 	text := strings.TrimSpace(result.Text())
 	if text == "" {
-		return "", fmt.Errorf("gemini: empty response text")
+		return "", fmt.Errorf("%s: empty response text", c.provider)
 	}
-	c.recordReportedModel(result.ModelVersion)
+	c.record(result.ModelVersion)
 	return text, nil
 }
 
@@ -110,32 +103,13 @@ func (c *geminiClient) CompleteJSON(ctx context.Context, messages []Message, sch
 	}
 	result, err := c.client.Models.GenerateContent(ctx, c.model, contents, config)
 	if err != nil {
-		return nil, fmt.Errorf("gemini json completion: %w", providererr.From("gemini", err))
+		return nil, fmt.Errorf("%s json completion: %w", c.provider, providererr.From(c.provider, err))
 	}
 
 	text := strings.TrimSpace(result.Text())
 	if text == "" {
-		return nil, fmt.Errorf("gemini: empty response text")
+		return nil, fmt.Errorf("%s: empty response text", c.provider)
 	}
-	c.recordReportedModel(result.ModelVersion)
+	c.record(result.ModelVersion)
 	return json.RawMessage(text), nil
-}
-
-// ReportedModel returns ModelVersion from the latest successful Vertex
-// response. Vertex may omit ModelVersion; in that documented case the model
-// resolved into the request is the only model identity the API provides.
-func (c *geminiClient) ReportedModel() string {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	return c.reportedModel
-}
-
-func (c *geminiClient) recordReportedModel(modelVersion string) {
-	model := strings.TrimSpace(modelVersion)
-	if model == "" {
-		model = ModelNotReportedByProvider
-	}
-	c.mu.Lock()
-	c.reportedModel = model
-	c.mu.Unlock()
 }

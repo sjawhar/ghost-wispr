@@ -97,13 +97,18 @@ func writeReplies(t *testing.T, keys, texts []string) string {
 	return dir
 }
 
+// conciergeOn is a config whose Concierge runs model on a Vertex AI provider.
+func conciergeOn(model string) string {
+	return "providers:\n  vertex: {api: vertex, project: example-project, auth: {kind: google}}\nconcierge:\n  model: vertex/" + model + "\n"
+}
+
 // runTool runs the tool on model with args, and a config file of its own
 // unless args name one.
 func runTool(t *testing.T, model *fakeModel, args ...string) (code int, stdout, stderr string) {
 	t.Helper()
 	if !containsFlag(args, "-config") {
 		path := filepath.Join(t.TempDir(), "ghost-wispr.yaml")
-		if err := os.WriteFile(path, []byte("concierge:\n  model: gemini-fake\n"), 0o600); err != nil {
+		if err := os.WriteFile(path, []byte(conciergeOn("gemini-fake")), 0o600); err != nil {
 			t.Fatal(err)
 		}
 		args = append([]string{"-config", path}, args...)
@@ -366,7 +371,7 @@ func TestUsageAndConfigErrorsExit2(t *testing.T) {
 // rewrite and the judge use its concierge.model.
 func TestConfigDefaultsToGhostWisprConfig(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "unit.yaml")
-	if err := os.WriteFile(path, []byte("concierge:\n  model: gemini-of-the-unit\n"), 0o600); err != nil {
+	if err := os.WriteFile(path, []byte(conciergeOn("gemini-of-the-unit")), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv(config.EnvPrefix+"CONFIG", path)
@@ -381,9 +386,10 @@ func TestConfigDefaultsToGhostWisprConfig(t *testing.T) {
 	}
 }
 
-// TestTheJudgeAsksAtTemperatureZeroForAFixedShape: the judge's call sets
-// temperature 0 and asks for JSON of one field, "yes" or "no", and holds the
-// text it judges.
+// TestTheJudgeAsksAtTemperatureZeroForAFixedShape: the judge's call on a
+// Vertex AI provider sets temperature 0 (on an OpenAI API provider it sets
+// none, TestTheJudgeRunsOnAnOpenAIAPIProvider) and asks for JSON of one
+// field, "yes" or "no", and holds the text it judges.
 func TestTheJudgeAsksAtTemperatureZeroForAFixedShape(t *testing.T) {
 	model := &fakeModel{}
 	if code, _, stderr := runTool(t, model, "-judge-only", writeReplies(t, nil, []string{"It is merged."})); code != 1 {
@@ -431,6 +437,9 @@ func TestAStoppedRunExits1(t *testing.T) {
 	model := &fakeModel{}
 	connect := func(context.Context, *config.Config) (concierge.Generator, error) { return model, nil }
 	path := filepath.Join(t.TempDir(), "ghost-wispr.yaml")
+	if err := os.WriteFile(path, []byte(conciergeOn("gemini-fake")), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	var stdout, stderr bytes.Buffer
 	if code := run(ctx, []string{"-config", path, "-replies", writeReplies(t, nil, invented(2, 0, "")), "-judge"}, &stdout, &stderr, connect); code != 1 || strings.Contains(stdout.String(), "summary:") {
 		t.Errorf("exit %d, stdout:\n%s\nwant 1 and no summary", code, stdout.String())

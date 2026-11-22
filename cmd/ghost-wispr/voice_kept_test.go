@@ -50,7 +50,7 @@ func TestALateWakeFromBeforeAPauseDoesNotReachTheVoice(t *testing.T) {
 			}
 			ctx, cancel := context.WithCancel(context.Background())
 			t.Cleanup(cancel)
-			rc := newLiveTranscription(ctx, "test-key",
+			rc := newLiveTranscription(ctx, fixedKey("test-key"),
 				&interfaces.ClientOptions{Host: host},
 				constOpts(&interfaces.LiveTranscriptionOptions{Model: "nova-3", Language: "en-US", Encoding: "linear16", SampleRate: 16000, Channels: 1}),
 				transcribe.ResilientConfig{SampleRate: 16000, InitialReconnectDelay: 20 * time.Millisecond, MaxReconnectBackoff: 50 * time.Millisecond},

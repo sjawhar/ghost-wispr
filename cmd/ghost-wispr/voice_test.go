@@ -47,11 +47,16 @@ func (stubConcierge) NeverMind(context.Context, string, uint64) (bool, error) { 
 // voice.dgagent.think_model names.
 func TestVoiceCTakesTheKeyTheWakePhrasesAndTheThinkModel(t *testing.T) {
 	key := strings.Repeat("k", 8)
-	cfg := &config.Config{DeepgramAPIKey: key, Voice: config.Voice{
+	base := deepgramKeyConfig(key)
+	cfg := &base
+	cfg.Voice = config.Voice{
 		Enabled: true, Engine: config.VoiceEngineDGAgent, WakePhrases: []string{"Wispr", "Ghost Wispr"},
-		DGAgent: config.DGAgent{ThinkModel: "google/gemini-3.1-flash-lite"},
-	}}
-	c := voiceCConfig(cfg)
+		DGAgent: config.DGAgent{Provider: "deepgram", ThinkModel: "google/gemini-3.1-flash-lite"},
+	}
+	c, err := voiceCConfig(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if c.APIKey != key {
 		t.Errorf("voice C's key = %q, want the unit's Deepgram key", c.APIKey)
 	}
@@ -66,11 +71,14 @@ func TestVoiceCTakesTheKeyTheWakePhrasesAndTheThinkModel(t *testing.T) {
 // TestKeytermsOnlyForNova3 fails if keyterms go to a Deepgram model that does
 // not take them.
 func TestKeytermsOnlyForNova3(t *testing.T) {
-	cfg := &config.Config{DeepgramModel: "nova-2", SpeakerEnabled: true, Voice: config.Voice{WakePhrases: []string{"Wispr"}}}
+	base := deepgramKeyConfig("")
+	cfg := &base
+	cfg.Transcription.Model = "deepgram/nova-2"
+	cfg.SpeakerEnabled, cfg.Voice.WakePhrases = true, []string{"Wispr"}
 	if got := voiceKeyterms(cfg, nil); len(got) != 0 {
 		t.Fatalf("keyterms %q for nova-2, want none", got)
 	}
-	cfg.DeepgramModel = "nova-3-general"
+	cfg.Transcription.Model = "deepgram/nova-3-general"
 	if got := voiceKeyterms(cfg, nil); !slices.Equal(got, []string{"Wispr", "Whisper"}) {
 		t.Fatalf("keyterms %q for nova-3-general, want the wake phrase", got)
 	}

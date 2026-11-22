@@ -59,12 +59,15 @@ func TestFromKeepsOnlyStatusAndCode(t *testing.T) {
 	}
 }
 
-// A transport error loses its URL and keeps a cancel, a deadline or a
-// network failure, which hold nothing the provider sent; any other transport
-// failure is withheld, since net/http quotes an answer it could not read.
+// A transport error loses its URL and keeps a cancel, a deadline, a network
+// failure or a failure that says its text is its own (ProviderFailure, as a
+// refused redirect's), which hold nothing the provider sent; any other
+// transport failure is withheld, since net/http quotes an answer it could
+// not read.
 func TestFromKeepsOnlyATransportErrorsOwnFailure(t *testing.T) {
 	address := "https://api.example/v1?q=" + planted
 	refused := &net.OpError{Op: "dial", Net: "tcp", Err: errors.New("connect: connection refused")}
+	stopped := ownWords("provider \"p\" at https://api.example redirected the call to another origin")
 	for _, tc := range []struct {
 		err   error
 		want  string
@@ -73,6 +76,7 @@ func TestFromKeepsOnlyATransportErrorsOwnFailure(t *testing.T) {
 		{&url.Error{Op: "Post", URL: address, Err: context.DeadlineExceeded}, "deepgram call failed: Post: context deadline exceeded", context.DeadlineExceeded},
 		{&url.Error{Op: "Post", URL: address, Err: fmt.Errorf("read: %w", context.Canceled)}, "deepgram call failed: Post: context canceled", context.Canceled},
 		{&url.Error{Op: "Post", URL: address, Err: refused}, "deepgram call failed: Post: dial tcp: connect: connection refused", refused},
+		{&url.Error{Op: "Get", URL: address, Err: stopped}, `deepgram call failed: Get: provider "p" at https://api.example redirected the call to another origin`, stopped},
 		{&url.Error{Op: "Post", URL: address, Err: fmt.Errorf(`net/http: HTTP/1.x transport connection broken: malformed HTTP status code %q`, planted)}, "deepgram call failed (its error is withheld: it can quote the request or the answer)", nil},
 	} {
 		got := From("deepgram", tc.err)
@@ -84,6 +88,12 @@ func TestFromKeepsOnlyATransportErrorsOwnFailure(t *testing.T) {
 		}
 	}
 }
+
+// ownWords is a failure whose text holds nothing a provider sent.
+type ownWords string
+
+func (w ownWords) Error() string           { return string(w) }
+func (w ownWords) ProviderFailure() string { return string(w) }
 
 // Another error of a call, such as an SDK's failure to read an answer it
 // quotes, is withheld; errors.Is still finds it. A wrapped cancel keeps only

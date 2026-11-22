@@ -6,18 +6,20 @@ import (
 	"log/slog"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/sjawhar/ghost-wispr/internal/config"
 	"github.com/sjawhar/ghost-wispr/internal/llm"
 )
 
 type Router struct {
-	cfg     config.Summarization
-	factory ClientFactory
+	cfg         config.Summarization
+	factory     ClientFactory
+	callTimeout time.Duration // bounds its model call, as a summary's (callTimeout)
 }
 
 func NewRouter(cfg config.Summarization, factory ClientFactory) *Router {
-	return &Router{cfg: cfg, factory: factory}
+	return &Router{cfg: cfg, factory: factory, callTimeout: callTimeout}
 }
 
 func SampleTranscript(transcript string, firstN, midN, lastN int) string {
@@ -53,7 +55,7 @@ Available presets:
 %s
 Reply with ONLY the preset name, nothing else.`, sampled, presetList.String())
 
-	provider, model, err := llm.ParseModel(r.cfg.Model)
+	provider, model, err := config.ParseModelRef(r.cfg.Model)
 	if err != nil {
 		slog.Warn("router: falling back to default preset", "reason", "parse model failed", "error", err)
 		return r.fallbackPreset(), nil
@@ -65,7 +67,11 @@ Reply with ONLY the preset name, nothing else.`, sampled, presetList.String())
 		return r.fallbackPreset(), nil
 	}
 
-	result, err := client.Complete(ctx, []llm.Message{{Role: "user", Content: prompt}})
+	var result string
+	err = withCallTimeout(ctx, r.callTimeout, func(ctx context.Context) (err error) {
+		result, err = client.Complete(ctx, []llm.Message{{Role: "user", Content: prompt}})
+		return err
+	})
 	if err != nil {
 		slog.Warn("router: falling back to default preset", "reason", "llm complete failed", "error", err)
 		return r.fallbackPreset(), nil

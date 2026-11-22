@@ -31,8 +31,8 @@ func TestVoiceIsOffByDefault(t *testing.T) {
 	if v.Enabled || v.PausedListener {
 		t.Errorf("voice enabled %v, paused listener %v by default; want both off", v.Enabled, v.PausedListener)
 	}
-	if v.Engine != VoiceEngineTTS || v.TTSEngine != TTSEngineGemini || v.TTSLocation != "us" {
-		t.Errorf("engine %q, tts engine %q, tts location %q; want tts, gemini, us", v.Engine, v.TTSEngine, v.TTSLocation)
+	if v.Engine != VoiceEngineTTS || v.GPTLive.Model != "openai/gpt-live-1" || v.DGAgent.Provider != "deepgram" {
+		t.Errorf("engine %q, gptlive %q, dgagent provider %q; want tts, openai/gpt-live-1, deepgram", v.Engine, v.GPTLive.Model, v.DGAgent.Provider)
 	}
 	if !slices.Equal(v.WakePhrases, []string{"Wispr", "Ghost Wispr"}) {
 		t.Errorf("wake phrases %q, want Wispr and Ghost Wispr", v.WakePhrases)
@@ -48,15 +48,17 @@ func TestVoiceAndConciergeComeFromTheConfigAndTheEnvironment(t *testing.T) {
 	clearVoiceEnv(t)
 	path := writeConfig(t, `
 speaker_enabled: true
-gcp_project: example-project
+providers:
+  deepgram: {api: deepgram, auth: {kind: api_key, env: GHOST_WISPR_DEEPGRAM_API_KEY}}
+  vertex: {api: vertex, project: example-project, auth: {kind: google}}
+tts:
+  model: deepgram/aura-2-thalia-en
 voice:
   enabled: true
   engine: tts
   wake_phrases: [Wispr]
-  tts_engine: aura
-  tts_voice: aura-2-thalia-en
 concierge:
-  model: gemini-example
+  model: vertex/gemini-example
   dispatch_url: https://dispatch.example.test
   envoy_url: http://envoy.example.test:9020
 dispatch_token: from-the-file
@@ -66,10 +68,10 @@ dispatch_token: from-the-file
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !cfg.Voice.Enabled || cfg.Voice.TTSEngine != TTSEngineAura || cfg.Voice.TTSVoice != "aura-2-thalia-en" || !slices.Equal(cfg.Voice.WakePhrases, []string{"Wispr"}) {
-		t.Errorf("voice %+v, want the file's", cfg.Voice)
+	if !cfg.Voice.Enabled || cfg.TTS.Model != "deepgram/aura-2-thalia-en" || !slices.Equal(cfg.Voice.WakePhrases, []string{"Wispr"}) {
+		t.Errorf("voice %+v, tts %+v, want the file's", cfg.Voice, cfg.TTS)
 	}
-	if cfg.Concierge.Model != "gemini-example" || cfg.Concierge.DispatchURL != "https://dispatch.example.test" || cfg.Concierge.EnvoyURL != "http://envoy.example.test:9020" {
+	if cfg.Concierge.Model != "vertex/gemini-example" || cfg.Concierge.DispatchURL != "https://dispatch.example.test" || cfg.Concierge.EnvoyURL != "http://envoy.example.test:9020" {
 		t.Errorf("concierge %+v, want the file's", cfg.Concierge)
 	}
 	if cfg.DispatchToken != "from-the-env" {
@@ -77,13 +79,13 @@ dispatch_token: from-the-file
 	}
 
 	t.Setenv(EnvPrefix+"VOICE_ENABLED", "false")
-	t.Setenv(EnvPrefix+"VOICE_TTS_ENGINE", "gemini")
+	t.Setenv(EnvPrefix+"VOICE_ENGINE", "gptlive")
 	t.Setenv(EnvPrefix+"CONCIERGE_DISPATCH_URL", "https://other.example.test")
 	cfg, _, err = Load(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.Voice.Enabled || cfg.Voice.TTSEngine != TTSEngineGemini || cfg.Concierge.DispatchURL != "https://other.example.test" {
+	if cfg.Voice.Enabled || cfg.Voice.Engine != VoiceEngineGPTLive || cfg.Concierge.DispatchURL != "https://other.example.test" {
 		t.Errorf("voice %+v, concierge %+v; want the environment's overrides", cfg.Voice, cfg.Concierge)
 	}
 
@@ -100,7 +102,7 @@ dispatch_token: from-the-file
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"tts_engine: aura", "dispatch_url: https://dispatch.example.test"} {
+	for _, want := range []string{"model: deepgram/aura-2-thalia-en", "dispatch_url: https://dispatch.example.test"} {
 		if !strings.Contains(string(saved), want) {
 			t.Errorf("a settings save dropped %q:\n%s", want, saved)
 		}
@@ -168,14 +170,14 @@ func TestThePausedListenerComesFromTheEnvironmentForAnAcceptanceRun(t *testing.T
 // URL that is not absolute passes without a warning.
 func TestVoiceConfigWarnings(t *testing.T) {
 	clearVoiceEnv(t)
+	const vertex = "providers:\n  vertex: {api: vertex, project: p, auth: {kind: google}}\nconcierge:\n  model: vertex/gemini\ntts:\n  model: vertex/gemini-tts\n"
 	cases := map[string]string{
 		"no speaker":         "voice:\n  enabled: true\n",
 		"unknown engine":     "speaker_enabled: true\nvoice:\n  enabled: true\n  engine: telepathy\n",
-		"unknown tts engine": "speaker_enabled: true\nvoice:\n  enabled: true\n  tts_engine: parrot\n",
-		"aura with no key":   "speaker_enabled: true\nvoice:\n  enabled: true\n  tts_engine: aura\n",
-		"gemini, no project": "speaker_enabled: true\nvoice:\n  enabled: true\n",
-		"relative dispatch":  "speaker_enabled: true\ngcp_project: p\nvoice:\n  enabled: true\nconcierge:\n  dispatch_url: dispatch.example.test\n",
-		"no wake phrase":     "speaker_enabled: true\ngcp_project: p\nvoice:\n  enabled: true\n  wake_phrases: []\n",
+		"no tts model":       "speaker_enabled: true\nproviders:\n  vertex: {api: vertex, project: p, auth: {kind: google}}\nconcierge:\n  model: vertex/gemini\nvoice:\n  enabled: true\n",
+		"no concierge model": "speaker_enabled: true\nproviders:\n  vertex: {api: vertex, project: p, auth: {kind: google}}\ntts:\n  model: vertex/gemini-tts\nvoice:\n  enabled: true\n",
+		"relative dispatch":  "speaker_enabled: true\nproviders:\n  vertex: {api: vertex, project: p, auth: {kind: google}}\ntts:\n  model: vertex/gemini-tts\nvoice:\n  enabled: true\nconcierge:\n  model: vertex/gemini\n  dispatch_url: dispatch.example.test\n",
+		"no wake phrase":     "speaker_enabled: true\n" + vertex + "voice:\n  enabled: true\n  wake_phrases: []\n",
 	}
 	for name, yaml := range cases {
 		_, warnings, err := Load(writeConfig(t, yaml))
@@ -184,7 +186,7 @@ func TestVoiceConfigWarnings(t *testing.T) {
 		}
 		found := false
 		for _, w := range warnings {
-			if strings.Contains(strings.ToLower(w), "voice") || strings.Contains(strings.ToLower(w), "concierge") {
+			if l := strings.ToLower(w); strings.Contains(l, "voice") || strings.Contains(l, "concierge") || strings.Contains(l, "tts.model") {
 				found = true
 			}
 		}
@@ -194,16 +196,29 @@ func TestVoiceConfigWarnings(t *testing.T) {
 	}
 }
 
-// TestVoiceBOpenAIIdentityComesFromTheConfig fails if voice B's two OpenAI
-// workload-identity ids (not secrets) are not read from voice.gptlive.
-func TestVoiceBOpenAIIdentityComesFromTheConfig(t *testing.T) {
+// TestVoiceBNamesAnOpenAIProvider fails if voice B's model is not read from
+// voice.gptlive.model, or resolves to anything but the OpenAI provider it
+// names, which signs in by OpenAI workload identity with two ids (not
+// secrets).
+func TestVoiceBNamesAnOpenAIProvider(t *testing.T) {
 	clearVoiceEnv(t)
-	cfg, _, err := Load(writeConfig(t, "voice:\n  gptlive:\n    openai_identity_provider_id: idp-example\n    openai_service_account_id: sa-example\n"))
+	cfg, warnings, err := Load(writeConfig(t, `
+providers:
+  openai: {api: openai, auth: {kind: openai_wif, identity_provider_id: idp-example, service_account_id: sa-example}}
+voice:
+  engine: gptlive
+  gptlive:
+    model: openai/gpt-live-example
+`))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := cfg.Voice.GPTLive; got.OpenAIIdentityProviderID != "idp-example" || got.OpenAIServiceAccountID != "sa-example" {
-		t.Fatalf("voice.gptlive = %+v, want the file's ids", got)
+	m, err := cfg.ResolveModel(RoleGPTLive, cfg.Voice.GPTLive.Model)
+	if err != nil || m.Model != "gpt-live-example" || m.Config.Auth.IdentityProviderID != "idp-example" || m.Config.Auth.ServiceAccountID != "sa-example" {
+		t.Fatalf("voice B resolved %+v, %v; want the file's model on the OpenAI provider's workload identity", m, err)
+	}
+	if slices.ContainsFunc(warnings, func(w string) bool { return strings.Contains(w, "gptlive") }) {
+		t.Fatalf("unexpected voice B warning: %q", warnings)
 	}
 }
 

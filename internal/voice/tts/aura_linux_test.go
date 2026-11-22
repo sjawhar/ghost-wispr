@@ -15,7 +15,7 @@ import (
 // unacknowledged data as soon as a write's deadline does.
 func TestAuraSocketHasTCPUserTimeout(t *testing.T) {
 	f := startSpeak(t, speakBack(nil))
-	s, err := newTestAura(t, f).dial(context.Background())
+	s, err := newTestAura(t, f).(*Aura).dial(context.Background())
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}

@@ -357,8 +357,10 @@
 </main>
 
 <style>
+  /* Wraps on a narrow screen, so the header stays within it. */
   .header-actions {
     display: flex;
+    flex-wrap: wrap;
     align-items: center;
     gap: 0.6rem;
   }

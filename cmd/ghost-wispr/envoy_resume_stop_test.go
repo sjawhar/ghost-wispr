@@ -14,7 +14,6 @@ import (
 	"time"
 
 	"github.com/sjawhar/ghost-wispr/internal/concierge"
-	"github.com/sjawhar/ghost-wispr/internal/config"
 	"github.com/sjawhar/ghost-wispr/internal/envoy"
 )
 
@@ -129,7 +128,8 @@ func TestARunningConciergesEnvoyResumeWriteDoesNotHoldTheShutdown(t *testing.T) 
 				close(opened)
 				return tracked, nil
 			}
-			cfg := config.Config{GenAIBackend: "gemini", GeminiAPIKey: "test", Concierge: config.Concierge{EnvoyURL: listener.URL}}
+			cfg := geminiKeyConfig("test")
+			cfg.Concierge.EnvoyURL = listener.URL
 			lazy := newLazyConcierge(func() (*concierge.Concierge, func(context.Context), error) {
 				return startConcierge(t.Context(), &cfg, store, discardLogger, nil, nil)
 			}, nil, discardLogger)

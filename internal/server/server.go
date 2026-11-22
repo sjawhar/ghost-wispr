@@ -14,6 +14,7 @@ import (
 	"github.com/sjawhar/ghost-wispr/internal/config"
 	"github.com/sjawhar/ghost-wispr/internal/embedding"
 	"github.com/sjawhar/ghost-wispr/internal/logging"
+	"github.com/sjawhar/ghost-wispr/internal/providers"
 )
 
 var (
@@ -222,10 +223,17 @@ type ControlHooks struct {
 	DeleteSegment func(ctx context.Context, sessionID string, segmentID int64, revision int) error
 	// DeleteSegmentText is "Delete text" (mode=text) for a specific batch
 	// transcript revision.
-	DeleteSegmentText   func(ctx context.Context, sessionID string, segmentID int64, revision int) error
-	BatchBackfill       func(ctx context.Context) (batchName string, sessionCount int, err error)
-	BatchPoll           func(ctx context.Context, batchName string) (map[string]any, error)
-	TTSSpeak            func(text, voice, provider string) (string, error)
+	DeleteSegmentText func(ctx context.Context, sessionID string, segmentID int64, revision int) error
+	BatchBackfill     func(ctx context.Context) (batchName string, sessionCount int, err error)
+	// SummarizeBacklog summarizes each of sessionIDs online, in the
+	// background, as the start's backlog does: each only once it claims the
+	// summary (storage's StartBackfillSummary), so a session another backlog
+	// claimed is summarized once.
+	SummarizeBacklog func(sessionIDs []string)
+	BatchPoll        func(ctx context.Context, batchName string) (map[string]any, error)
+	// TTSSpeak speaks text with the tts role, in voice, or tts.voice when
+	// voice is "".
+	TTSSpeak            func(text, voice string) (string, error)
 	TTSStatus           func(id string) (map[string]any, bool)
 	TTSWaitForSynthesis func(ctx context.Context, id string) (map[string]any, error)
 	TTSHasProvider      func() bool
@@ -238,6 +246,10 @@ type ControlHooks struct {
 	// session and the floor protocol. It returns ErrBadIssueKey for a key
 	// that is not one, and another error when no agent can join now.
 	JoinMessage func(issueKey string) (string, error)
+	// ProviderStatuses is GET /api/providers: each configured provider's
+	// sign-in and its last check, checked again when older than maxAge
+	// (maxAge 0 checks every one now). Unset, the route answers 501.
+	ProviderStatuses func(ctx context.Context, maxAge time.Duration) []providers.Status
 }
 
 func Handler(staticFS fs.FS, hub *Hub, store SessionStore, controls *ControlHooks, authToken string, healthChecker HealthChecker, cfgStore ...*config.Store) (http.Handler, error) {

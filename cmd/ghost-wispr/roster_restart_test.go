@@ -6,7 +6,6 @@ import (
 	"time"
 
 	"github.com/sjawhar/ghost-wispr/internal/concierge"
-	"github.com/sjawhar/ghost-wispr/internal/config"
 	"github.com/sjawhar/ghost-wispr/internal/envoy"
 )
 
@@ -47,7 +46,8 @@ func TestARestartedVoiceKeepsItsRoster(t *testing.T) {
 			}
 			var link voiceLink
 			roster := testRoster(t, &link)
-			cfg := config.Config{GenAIBackend: "gemini", GeminiAPIKey: "test", Concierge: config.Concierge{EnvoyURL: "http://127.0.0.1:1"}}
+			cfg := geminiKeyConfig("test")
+			cfg.Concierge.EnvoyURL = "http://127.0.0.1:1"
 			lazy := newLazyConcierge(func() (*concierge.Concierge, func(context.Context), error) {
 				return startConcierge(t.Context(), &cfg, conciergeStore(t), discardLogger, nil, roster)
 			}, nil, discardLogger)

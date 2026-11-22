@@ -1,8 +1,7 @@
 package main
 
 import (
-	"context"
-	"path/filepath"
+	"errors"
 	"reflect"
 	"strings"
 	"testing"
@@ -26,53 +25,74 @@ func TestTTSStatusResponseNamesEveryField(t *testing.T) {
 	}
 }
 
-// TestNewTTSProviderBuildsTheNamedProvider fails if a configured TTS provider
-// is not the one built, or a provider that cannot be built is not refused
-// with its reason.
-func TestNewTTSProviderBuildsTheNamedProvider(t *testing.T) {
-	missing := filepath.Join(t.TempDir(), "missing-credentials.json")
+// ttsConfig is a config whose tts role is model on provider p, named name,
+// which signs in with key when it signs in with one.
+func ttsConfig(name string, p *config.Provider, model, key string) config.Config {
+	cfg := config.Config{Providers: map[string]config.Provider{name: *p}, TTS: config.TTS{Model: model}}
+	if key != "" {
+		cfg.ProviderKeys = map[string]string{p.Auth.Env: key}
+	}
+	return cfg
+}
+
+// TestNewSpeechProviderBuildsTheNamedProvider fails if the speak API's
+// provider is not the one tts.model names, or one that cannot speak is not
+// refused with its reason.
+func TestNewSpeechProviderBuildsTheNamedProvider(t *testing.T) {
+	keyed := func(api string) *config.Provider {
+		return &config.Provider{API: api, Auth: config.ProviderAuth{Kind: config.AuthAPIKey, Env: "EXAMPLE_TTS_KEY"}}
+	}
 	for _, tc := range []struct {
-		name string
-		cfg  config.Config
-		want string // the provider's name, or the start of the error
+		name  string
+		cfg   config.Config
+		built bool   // the case wants a provider built, not an error
+		want  string // the provider's name, or a part of the error
 	}{
-		{"elevenlabs", config.Config{TTSProvider: "elevenlabs", TTSAPIKey: "key"}, "elevenlabs"},
-		{"elevenlabs without a key", config.Config{TTSProvider: "elevenlabs"}, "ElevenLabs requires GHOST_WISPR_TTS_API_KEY"},
-		{"google with a key", config.Config{TTSProvider: "google", TTSAPIKey: "key"}, "google"},
-		{"google without credentials", config.Config{TTSProvider: "google", GoogleCredentialsFile: missing}, "detect Google credentials"},
-		{"gemini without credentials", config.Config{TTSProvider: "gemini", GCPProject: "project", GoogleCredentialsFile: missing}, "detect Google credentials"},
-		{"unsupported", config.Config{TTSProvider: "other"}, "unsupported TTS provider: other"},
+		{"elevenlabs", ttsConfig("eleven", keyed(config.APIElevenLabs), "eleven/eleven_flash_v2_5", "k-1"), true, "eleven"},
+		{"aura", ttsConfig("dg", keyed(config.APIDeepgram), "dg/aura-2-thalia-en", "k-1"), true, "dg"},
+		{"openai", ttsConfig("oa", keyed(config.APIOpenAI), "oa/gpt-4o-mini-tts", "k-1"), true, "oa"},
+		{"no such provider", ttsConfig("dg", keyed(config.APIDeepgram), "nowhere/aura", "k-1"), false, `"nowhere"`},
+		{"a provider with no speech", ttsConfig("claude", keyed(config.APIAnthropic), "claude/x", "k-1"), false, "anthropic"},
+		{"vertex with no project", ttsConfig("vertex", &config.Provider{API: config.APIVertex, Auth: config.ProviderAuth{Kind: config.AuthGoogle}}, "vertex/gemini-tts", ""), false, "project"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			provider, err := newTTSProvider(context.Background(), &tc.cfg)
-			got := ""
-			if err != nil {
-				got = err.Error()
-			} else {
-				got = provider.Name()
+			provider, err := newSpeechProvider(&tc.cfg)
+			if tc.built {
+				if err != nil || provider.Name() != tc.want {
+					t.Fatalf("newSpeechProvider = %v, %v; want the provider %q", provider, err, tc.want)
+				}
+				return
 			}
-			if !strings.HasPrefix(got, tc.want) {
-				t.Fatalf("newTTSProvider = %q, want %q", got, tc.want)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("newSpeechProvider = %v, %v; want an error containing %q", provider, err, tc.want)
 			}
 		})
 	}
 }
 
-// TestBatchClientConfigUsesTheGeminiSettings fails if the summary batch
-// client is not configured from the Gemini settings, or a Vertex AI backend
-// is configured without detecting its credentials.
-func TestBatchClientConfigUsesTheGeminiSettings(t *testing.T) {
-	clientConfig, err := batchClientConfig(context.Background(), &config.Config{GenAIBackend: "gemini", GeminiAPIKey: "key"})
-	if err != nil || clientConfig.APIKey != "key" || clientConfig.Backend != genai.BackendGeminiAPI {
-		t.Fatalf("batchClientConfig with a Gemini key = %+v, %v; want the Gemini API with that key", clientConfig, err)
+// TestBatchClientConfigUsesTheSummaryProvider fails if the summary batch
+// client is not configured from summarization.model's provider, or a
+// provider that takes no batch job (Vertex AI, to which genai sends no batch
+// of inlined requests, or another API) is not refused with
+// errNoBatchProvider.
+func TestBatchClientConfigUsesTheSummaryProvider(t *testing.T) {
+	gemini := geminiKeyConfig("k-1")
+	gemini.Summarization.Model = "gemini/gemini-test"
+	clientConfig, model, err := batchClientConfig(&gemini)
+	if err != nil || clientConfig.Backend != genai.BackendGeminiAPI || model != "gemini-test" {
+		t.Fatalf("batchClientConfig on the Gemini API = %+v, %q, %v; want the Gemini API and the model", clientConfig, model, err)
 	}
-	if _, err := batchClientConfig(context.Background(), &config.Config{GenAIBackend: "gemini"}); err == nil ||
-		err.Error() != "genai backend not configured for batch operations: gemini api key is required" {
-		t.Fatalf("batchClientConfig without a Gemini key = %v, want the batch configuration error", err)
+	vertex := config.Config{
+		Providers:     map[string]config.Provider{"vertex": {API: config.APIVertex, Project: "project", Location: "global", Auth: config.ProviderAuth{Kind: config.AuthGoogle}}},
+		Summarization: config.Summarization{Model: "vertex/gemini-test"},
 	}
-	missing := filepath.Join(t.TempDir(), "missing-credentials.json")
-	if _, err := batchClientConfig(context.Background(), &config.Config{GenAIBackend: "vertex", GCPProject: "project", GoogleCredentialsFile: missing}); err == nil ||
-		!strings.HasPrefix(err.Error(), "detect Google credentials") {
-		t.Fatalf("batchClientConfig for Vertex AI without credentials = %v, want the credential error", err)
+	openai := config.Config{
+		Providers:     map[string]config.Provider{"gateway": {API: config.APIOpenAI, URL: "https://gateway.example.test/v1", Auth: config.ProviderAuth{Kind: config.AuthGoogleIDToken, Audience: "aud"}}},
+		Summarization: config.Summarization{Model: "gateway/gpt-test"},
+	}
+	for name, cfg := range map[string]*config.Config{"Vertex AI": &vertex, "an OpenAI API provider": &openai} {
+		if _, _, err := batchClientConfig(cfg); !errors.Is(err, errNoBatchProvider) {
+			t.Errorf("batchClientConfig on %s = %v, want %v", name, err, errNoBatchProvider)
+		}
 	}
 }

@@ -9,7 +9,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/sjawhar/ghost-wispr/internal/config"
 	"github.com/sjawhar/ghost-wispr/internal/envoy"
 	"github.com/sjawhar/ghost-wispr/internal/voice/joined"
 )
@@ -60,7 +59,8 @@ func TestAStopTellsTheJoinedAgentsOnlyWithinItsDeadline(t *testing.T) {
 			}
 			var link voiceLink
 			roster := testRoster(t, &link)
-			cfg := config.Config{GenAIBackend: "gemini", GeminiAPIKey: "test", Concierge: config.Concierge{EnvoyURL: "http://127.0.0.1:1"}}
+			cfg := geminiKeyConfig("test")
+			cfg.Concierge.EnvoyURL = "http://127.0.0.1:1"
 			_, stop, err := startConcierge(t.Context(), &cfg, conciergeStore(t), discardLogger, nil, roster)
 			if err != nil {
 				t.Fatal(err)

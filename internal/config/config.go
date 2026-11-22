@@ -11,8 +11,6 @@ import (
 	"time"
 	"unicode"
 
-	"github.com/sjawhar/ghost-wispr/internal/genaiconfig"
-	"github.com/sjawhar/ghost-wispr/internal/llm"
 	"github.com/sjawhar/ghost-wispr/internal/logging"
 
 	"gopkg.in/yaml.v3"
@@ -38,33 +36,50 @@ type Preset struct {
 }
 
 type Summarization struct {
-	Model           string            `yaml:"model"`
-	BaseURL         string            `yaml:"base_url"`
+	Model           string            `yaml:"model"` // provider/model
 	Presets         map[string]Preset `yaml:"presets"`
 	MinSummaryWords int               `yaml:"min_summary_words"`
+	// BatchJobs summarizes a backlog of sessions as one batch job of
+	// summarization.model's provider when it is the Gemini API (genai sends
+	// Vertex AI no batch of inlined requests, so a Vertex AI provider
+	// summarizes online whatever this says); false summarizes each online,
+	// one call a session.
+	BatchJobs bool `yaml:"batch_jobs"`
 }
 
+// Transcription is live transcription: the provider/model the microphone's
+// stream goes to, and its turn settings.
 type Transcription struct {
+	Model          string `yaml:"model"` // provider/model
 	Endpointing    string `yaml:"endpointing"`
 	UtteranceEndMs string `yaml:"utterance_end_ms"`
 }
 
+// BatchTranscription is the provider/model a session's recording is
+// transcribed again with after it ends.
 type BatchTranscription struct {
-	Provider string `yaml:"provider"`
-	Model    string `yaml:"model"`
+	Model string `yaml:"model"` // provider/model; "" is transcription.model
+}
+
+// Embedding is the provider/model that indexes the transcripts for semantic
+// search; "" turns embeddings off.
+type Embedding struct {
+	Model string `yaml:"model"`
+}
+
+// TTS is text-to-speech: the provider/model and voice that voice A and
+// POST /api/tts/speak speak with.
+type TTS struct {
+	Model     string `yaml:"model"`      // provider/model; "" turns text-to-speech off
+	Voice     string `yaml:"voice"`      // "" is the model's default voice
+	MaxLength int    `yaml:"max_length"` // the longest text POST /api/tts/speak takes
 }
 
 // The voices, voice.engine's values.
 const (
-	VoiceEngineTTS     = "tts"     // voice A: text-to-speech
+	VoiceEngineTTS     = "tts"     // voice A: text-to-speech, with the tts role's model
 	VoiceEngineGPTLive = "gptlive" // voice B: speech-to-speech, OpenAI GPT-Live
-	VoiceEngineDGAgent = "dgagent" // voice C: voice agent, Deepgram
-)
-
-// Voice A's text-to-speech providers, voice.tts_engine's values.
-const (
-	TTSEngineGemini = "gemini" // Gemini TTS streamed from Vertex AI
-	TTSEngineAura   = "aura"   // Deepgram Aura-2, with the Deepgram key
+	VoiceEngineDGAgent = "dgagent" // voice C: Deepgram's Voice Agent
 )
 
 // Voice configures Wispr's meeting voice: a person says a wake phrase on the
@@ -83,29 +98,28 @@ type Voice struct {
 	// PausedListenerThreads is the spotter's threads, 1 but for the control
 	// of the acceptance run's CPU check (GHOST_WISPR_VOICE_PAUSED_LISTENER_THREADS,
 	// 1 to 8); never in the file.
-	PausedListenerThreads int    `yaml:"-"`
-	TTSEngine             string `yaml:"tts_engine"`   // voice A's text-to-speech provider: gemini or aura
-	TTSModel              string `yaml:"tts_model"`    // "" is the provider's default
-	TTSVoice              string `yaml:"tts_voice"`    // "" is the provider's default
-	TTSLocation           string `yaml:"tts_location"` // the Vertex AI location Gemini streams from
-	// GPTLive is voice B's OpenAI route: the workload identity ids its token
-	// exchange names. They are not secrets.
+	PausedListenerThreads int `yaml:"-"`
+	// GPTLive is voice B's provider/model.
 	GPTLive GPTLive `yaml:"gptlive"`
-	// DGAgent is voice C's choice of the model that keeps its turns.
+	// DGAgent is voice C's provider and the model that keeps its turns.
 	DGAgent DGAgent `yaml:"dgagent"`
 }
 
 // GPTLive configures voice B (voice.engine gptlive).
 type GPTLive struct {
-	OpenAIIdentityProviderID string `yaml:"openai_identity_provider_id"`
-	OpenAIServiceAccountID   string `yaml:"openai_service_account_id"`
+	// Model is the provider/model of the Live session, on an OpenAI API
+	// provider, such as openai/gpt-live-1.
+	Model string `yaml:"model"`
 }
 
 // DGAgent configures voice C (voice.engine dgagent).
 type DGAgent struct {
-	// ThinkModel is the model Deepgram runs to keep the voice's turns, as
-	// provider/model, such as google/gemini-3.1-flash-lite; "" is the
-	// voice's default. The Concierge words every answer either way.
+	// Provider names the Deepgram API provider whose key opens the agent.
+	Provider string `yaml:"provider"`
+	// ThinkModel is the model Deepgram runs to keep the voice's turns, by
+	// Deepgram's own provider/model names, such as
+	// google/gemini-3.1-flash-lite, since Deepgram's servers call it; "" is
+	// the voice's default. The Concierge words every answer either way.
 	ThinkModel string `yaml:"think_model"`
 }
 
@@ -136,55 +150,54 @@ type Concierge struct {
 }
 
 type Config struct {
-	DBPath                        string             `yaml:"db_path"`
-	AudioDir                      string             `yaml:"audio_dir"`
-	LogLevel                      string             `yaml:"log_level"`
-	PublicURL                     string             `yaml:"public_url"`      // the unit's own HTTPS address, its tailnet name
-	RecordingRules                []string           `yaml:"recording_rules"` // the rules the web UI shows under Recording rules, as written; with none, it shows no button
-	SilenceTimeout                string             `yaml:"silence_timeout"`
-	MinSessionSegments            int                `yaml:"min_session_segments"`
-	MicSampleRate                 int                `yaml:"mic_sample_rate"`
-	MicSampleRates                []int              `yaml:"mic_sample_rates"`
-	MicDevice                     string             `yaml:"mic_device"` // the sound card the microphone opens, by its ALSA id or name; empty opens the default input
-	GDriveFolderID                string             `yaml:"gdrive_folder_id"`
-	GoogleCredentialsFile         string             `yaml:"google_credentials_file"`
-	GCPProject                    string             `yaml:"gcp_project"`
-	GCPLocation                   string             `yaml:"gcp_location"`
-	GenAIBackend                  string             `yaml:"genai_backend"`
-	GDriveSyncEnabled             bool               `yaml:"gdrive_sync_enabled"`
-	EnvoyEnabled                  bool               `yaml:"envoy_enabled"`
-	EnvoyHubURL                   string             `yaml:"envoy_hub_url"`
-	GCEnabled                     bool               `yaml:"gc_enabled"`
-	GCMaxAgeDays                  int                `yaml:"gc_max_age_days"`
-	GCMaxAudioSizeMB              int                `yaml:"gc_max_audio_size_mb"`
-	Summarization                 Summarization      `yaml:"summarization"`
-	Transcription                 Transcription      `yaml:"transcription"`
-	BatchTranscription            BatchTranscription `yaml:"batch_transcription"`
-	EmbeddingModel                string             `yaml:"embedding_model"`
-	DeepgramModel                 string             `yaml:"deepgram_model"`
-	DeepgramBufferSize            int                `yaml:"deepgram_buffer_size,omitempty"` // bytes of live audio held while Deepgram reconnects; 0 holds 60 s at the rate the microphone opened at, and is not written back on a save. The recorder keeps as much audio again, plus 35 s, in memory while no session records, so a recording can start before words Deepgram hears late
-	DeepgramReconnectInitialDelay string             `yaml:"deepgram_reconnect_initial_delay"`
-	DeepgramReconnectMaxBackoff   string             `yaml:"deepgram_reconnect_max_backoff"`
-	SpeakerEnabled                bool               `yaml:"speaker_enabled"`
-	SpeakerDevice                 string             `yaml:"speaker_device"`
-	SpeakerTraceDir               string             `yaml:"speaker_trace_dir,omitempty"` // a debug setting, off when empty: the speaker keeps the last seconds of the process's execution trace and saves them here on each underrun (audio.SpeakerTrace)
-	IndicatorLight                string             `yaml:"indicator_light"`
-	PowerButton                   bool               `yaml:"power_button"`
-	JabraMuteButton               bool               `yaml:"jabra_mute_button"`
-	TTSProvider                   string             `yaml:"tts_provider"`
-	TTSModel                      string             `yaml:"tts_model"`
-	TTSVoice                      string             `yaml:"tts_voice"`
-	TTSMaxLength                  int                `yaml:"tts_max_length"`
-	Voice                         Voice              `yaml:"voice"`
-	Concierge                     Concierge          `yaml:"concierge"`
+	DBPath                string   `yaml:"db_path"`
+	AudioDir              string   `yaml:"audio_dir"`
+	LogLevel              string   `yaml:"log_level"`
+	PublicURL             string   `yaml:"public_url"`      // the unit's own HTTPS address, its tailnet name
+	RecordingRules        []string `yaml:"recording_rules"` // the rules the web UI shows under Recording rules, as written; with none, it shows no button
+	SilenceTimeout        string   `yaml:"silence_timeout"`
+	MinSessionSegments    int      `yaml:"min_session_segments"`
+	MicSampleRate         int      `yaml:"mic_sample_rate"`
+	MicSampleRates        []int    `yaml:"mic_sample_rates"`
+	MicDevice             string   `yaml:"mic_device"` // the sound card the microphone opens, by its ALSA id or name; empty opens the default input
+	GDriveFolderID        string   `yaml:"gdrive_folder_id"`
+	GoogleCredentialsFile string   `yaml:"google_credentials_file"`
+	// Providers names each model provider once: its endpoint, wire API and
+	// sign-in. Each role's provider/model names one of them. A file that
+	// names none gets defaultProviders.
+	Providers                     map[string]Provider `yaml:"providers"`
+	GDriveSyncEnabled             bool                `yaml:"gdrive_sync_enabled"`
+	EnvoyEnabled                  bool                `yaml:"envoy_enabled"`
+	EnvoyHubURL                   string              `yaml:"envoy_hub_url"`
+	GCEnabled                     bool                `yaml:"gc_enabled"`
+	GCMaxAgeDays                  int                 `yaml:"gc_max_age_days"`
+	GCMaxAudioSizeMB              int                 `yaml:"gc_max_audio_size_mb"`
+	Summarization                 Summarization       `yaml:"summarization"`
+	Transcription                 Transcription       `yaml:"transcription"`
+	BatchTranscription            BatchTranscription  `yaml:"batch_transcription"`
+	Embedding                     Embedding           `yaml:"embedding"`
+	DeepgramBufferSize            int                 `yaml:"deepgram_buffer_size,omitempty"` // bytes of live audio held while Deepgram reconnects; 0 holds 60 s at the rate the microphone opened at, and is not written back on a save. The recorder keeps as much audio again, plus 35 s, in memory while no session records, so a recording can start before words Deepgram hears late
+	DeepgramReconnectInitialDelay string              `yaml:"deepgram_reconnect_initial_delay"`
+	DeepgramReconnectMaxBackoff   string              `yaml:"deepgram_reconnect_max_backoff"`
+	SpeakerEnabled                bool                `yaml:"speaker_enabled"`
+	SpeakerDevice                 string              `yaml:"speaker_device"`
+	SpeakerTraceDir               string              `yaml:"speaker_trace_dir,omitempty"` // a debug setting, off when empty: the speaker keeps the last seconds of the process's execution trace and saves them here on each underrun (audio.SpeakerTrace)
+	IndicatorLight                string              `yaml:"indicator_light"`
+	PowerButton                   bool                `yaml:"power_button"`
+	JabraMuteButton               bool                `yaml:"jabra_mute_button"`
+	TTS                           TTS                 `yaml:"tts"`
+	Voice                         Voice               `yaml:"voice"`
+	Concierge                     Concierge           `yaml:"concierge"`
 
 	// Secrets — env vars only, never serialized to YAML.
-	DeepgramAPIKey  string `yaml:"-"`
-	OpenAIAPIKey    string `yaml:"-"`
-	AnthropicAPIKey string `yaml:"-"`
-	GeminiAPIKey    string `yaml:"-"`
-	TTSAPIKey       string `yaml:"-"`
-	DispatchToken   string `yaml:"-"` // the unit's own Dispatch credential, for the Concierge
+	// ProviderKeys are the keys of the api_key providers, by the variable
+	// each one's auth.env names (APIKey reads one).
+	ProviderKeys  map[string]string `yaml:"-"`
+	DispatchToken string            `yaml:"-"` // the unit's own Dispatch credential, for the Concierge
+	// keysSet are the variables of the keys SetAPIKey set: the only keys a
+	// store writes to .env. A key only the environment holds, such as a
+	// credential broker's short-lived one, stays off the disk.
+	keysSet map[string]bool
 }
 
 func defaults() Config {
@@ -197,12 +210,13 @@ func defaults() Config {
 		MicSampleRate:         16000,
 		MicSampleRates:        []int{48000, 44100, 32000, 24000},
 		GoogleCredentialsFile: "",
-		GCPLocation:           genaiconfig.DefaultLocation,
+		Providers:             defaultProviders(),
 		GCMaxAgeDays:          30,
 		GCMaxAudioSizeMB:      1024,
 		Summarization: Summarization{
 			Model:           "openai/gpt-4o-mini",
 			MinSummaryWords: 20,
+			BatchJobs:       true,
 			Presets: map[string]Preset{
 				"default": {
 					Description:  "General-purpose summary adapted to content depth",
@@ -212,26 +226,19 @@ func defaults() Config {
 			},
 		},
 		Transcription: Transcription{
+			Model:          "deepgram/nova-3",
 			Endpointing:    "400",
 			UtteranceEndMs: "1000",
 		},
-		BatchTranscription: BatchTranscription{
-			Provider: "deepgram",
-			Model:    "nova-3",
-		},
-		EmbeddingModel:                "",
-		DeepgramModel:                 "nova-3",
 		DeepgramBufferSize:            0,
 		DeepgramReconnectInitialDelay: "500ms",
 		DeepgramReconnectMaxBackoff:   "30s",
-		TTSMaxLength:                  5000,
+		TTS:                           TTS{MaxLength: 5000},
 		Voice: Voice{
-			Engine:      VoiceEngineTTS,
-			WakePhrases: []string{"Wispr", "Ghost Wispr"},
-			TTSEngine:   TTSEngineGemini,
-			// Google: the us multi-region gives a lower time to first audio
-			// than global.
-			TTSLocation:           "us",
+			Engine:                VoiceEngineTTS,
+			WakePhrases:           []string{"Wispr", "Ghost Wispr"},
+			GPTLive:               GPTLive{Model: "openai/gpt-live-1"},
+			DGAgent:               DGAgent{Provider: "deepgram"},
 			PausedListenerThreads: 1,
 		},
 	}
@@ -242,19 +249,30 @@ func defaults() Config {
 // wrote into the file. Load reads it as 0, 60 s at the microphone's rate.
 const oldDefaultDeepgramBufferSize = 1920000
 
+// PathFromEnvironment is the config file the recorder and the commands beside
+// it load: GHOST_WISPR_CONFIG, else ghost-wispr.yaml in the working
+// directory.
+func PathFromEnvironment() string {
+	if path := os.Getenv(EnvPrefix + "CONFIG"); path != "" {
+		return path
+	}
+	return "ghost-wispr.yaml"
+}
+
 // Load reads configuration from a YAML file (if it exists), applies
 // environment variable overrides, loads secrets, and validates the result.
 // It returns the config, any validation warnings, and an error if the file
 // exists but cannot be read or parsed.
 func Load(path string) (Config, []string, error) {
-	cfg, _, warnings, err := load(path)
+	cfg, _, warnings, err := load(path, nil)
 	return cfg, warnings, err
 }
 
 // load is Load that also returns the log_level the config file names, or the
 // default: GHOST_WISPR_LOG_LEVEL overrides it in memory only, so a settings
-// change writes this one back.
-func load(path string) (cfg Config, fileLogLevel string, warnings []string, err error) {
+// change writes this one back. envFile is a .env file's entries, which give a
+// provider its key when the environment does not.
+func load(path string, envFile map[string]string) (cfg Config, fileLogLevel string, warnings []string, err error) {
 	cfg = defaults()
 	warnings = deprecatedEnvoyEnvironmentWarnings()
 
@@ -265,10 +283,19 @@ func load(path string) (cfg Config, fileLogLevel string, warnings []string, err 
 				return cfg, "", nil, fmt.Errorf("read config file: %w", err)
 			}
 		} else {
+			// A file that names its providers names its roles' models too:
+			// the defaults that name the default providers do not apply, and
+			// its providers replace the defaults rather than add to them, as
+			// yaml.v3 would decode them into the default map.
+			if namesProviders(data) {
+				cfg.Providers = nil
+				clearQuickstartModels(&cfg)
+			}
 			if err := yaml.Unmarshal(data, &cfg); err != nil {
 				return cfg, "", nil, fmt.Errorf("parse config file: %w", err)
 			}
 			warnings = append(warnings, deprecatedEnvoyConfigWarnings(data)...)
+			warnings = append(warnings, removedSettingWarnings(data)...)
 		}
 	}
 
@@ -290,11 +317,11 @@ func load(path string) (cfg Config, fileLogLevel string, warnings []string, err 
 	if credentialPath == "" {
 		credentialPath = os.Getenv("GOOGLE_APPLICATION_CREDENTIALS")
 	}
-	googleCredentialInfo := inspectGoogleCredentialFile(credentialPath)
-	applyGenAIConfigDefaults(&cfg, googleCredentialInfo.serviceAccountProject)
-	loadSecrets(&cfg)
+	applyProviderDefaults(&cfg, inspectGoogleCredentialFile(credentialPath).serviceAccountProject)
+	loadSecrets(&cfg, envFile)
 
-	warnings = append(warnings, validate(&cfg, googleCredentialInfo.hasExternalAccount)...)
+	warnings = append(warnings, removedEnvironmentWarnings(&cfg, envFile)...)
+	warnings = append(warnings, validate(&cfg)...)
 	return cfg, fileLogLevel, warnings, nil
 }
 
@@ -408,7 +435,7 @@ func applyEnvOverrides(cfg *Config) []string {
 		cfg.MicSampleRates = parseSampleRates(v)
 	}
 	if v := os.Getenv(EnvPrefix + "SUMMARIZATION_MODEL"); v != "" {
-		cfg.Summarization.Model = v
+		cfg.Summarization.Model = strings.TrimSpace(v)
 	}
 	if v := os.Getenv(EnvPrefix + "GDRIVE_FOLDER_ID"); v != "" {
 		cfg.GDriveFolderID = v
@@ -416,29 +443,20 @@ func applyEnvOverrides(cfg *Config) []string {
 	if v := os.Getenv(EnvPrefix + "GOOGLE_CREDENTIALS_FILE"); v != "" {
 		cfg.GoogleCredentialsFile = v
 	}
-	if v := os.Getenv(EnvPrefix + "GCP_PROJECT"); v != "" {
-		cfg.GCPProject = strings.TrimSpace(v)
-	}
-	if v := os.Getenv(EnvPrefix + "GCP_LOCATION"); v != "" {
-		cfg.GCPLocation = strings.TrimSpace(v)
-	}
-	if v := os.Getenv(EnvPrefix + "GENAI_BACKEND"); v != "" {
-		cfg.GenAIBackend = strings.ToLower(strings.TrimSpace(v))
-	}
 	if v := os.Getenv(EnvPrefix + "TRANSCRIPTION_ENDPOINTING"); v != "" {
 		cfg.Transcription.Endpointing = v
 	}
 	if v := os.Getenv(EnvPrefix + "TRANSCRIPTION_UTTERANCE_END_MS"); v != "" {
 		cfg.Transcription.UtteranceEndMs = v
 	}
-	if v := os.Getenv(EnvPrefix + "BATCH_TRANSCRIPTION_PROVIDER"); v != "" {
-		cfg.BatchTranscription.Provider = strings.ToLower(strings.TrimSpace(v))
+	if v := os.Getenv(EnvPrefix + "TRANSCRIPTION_MODEL"); v != "" {
+		cfg.Transcription.Model = strings.TrimSpace(v)
 	}
 	if v := os.Getenv(EnvPrefix + "BATCH_TRANSCRIPTION_MODEL"); v != "" {
 		cfg.BatchTranscription.Model = strings.TrimSpace(v)
 	}
 	if v := os.Getenv(EnvPrefix + "EMBEDDING_MODEL"); v != "" {
-		cfg.EmbeddingModel = strings.TrimSpace(v)
+		cfg.Embedding.Model = strings.TrimSpace(v)
 	}
 	if v := os.Getenv(EnvPrefix + "DEEPGRAM_BUFFER_SIZE"); v != "" {
 		if size, err := strconv.Atoi(strings.TrimSpace(v)); err == nil && size > 0 {
@@ -447,9 +465,6 @@ func applyEnvOverrides(cfg *Config) []string {
 	}
 	if v := os.Getenv(EnvPrefix + "DEEPGRAM_RECONNECT_INITIAL_DELAY"); v != "" {
 		cfg.DeepgramReconnectInitialDelay = v
-	}
-	if v := os.Getenv(EnvPrefix + "DEEPGRAM_MODEL"); v != "" {
-		cfg.DeepgramModel = v
 	}
 	if v := os.Getenv(EnvPrefix + "DEEPGRAM_RECONNECT_MAX_BACKOFF"); v != "" {
 		cfg.DeepgramReconnectMaxBackoff = v
@@ -508,18 +523,15 @@ func applyEnvOverrides(cfg *Config) []string {
 	if v := os.Getenv(EnvPrefix + "JABRA_MUTE_BUTTON"); v != "" {
 		cfg.JabraMuteButton = strings.EqualFold(v, "true") || v == "1"
 	}
-	if v := os.Getenv(EnvPrefix + "TTS_PROVIDER"); v != "" {
-		cfg.TTSProvider = strings.ToLower(strings.TrimSpace(v))
-	}
 	if v := os.Getenv(EnvPrefix + "TTS_MODEL"); v != "" {
-		cfg.TTSModel = strings.TrimSpace(v)
+		cfg.TTS.Model = strings.TrimSpace(v)
 	}
 	if v := os.Getenv(EnvPrefix + "TTS_VOICE"); v != "" {
-		cfg.TTSVoice = strings.TrimSpace(v)
+		cfg.TTS.Voice = strings.TrimSpace(v)
 	}
 	if v := os.Getenv(EnvPrefix + "TTS_MAX_LENGTH"); v != "" {
 		if n, err := strconv.Atoi(strings.TrimSpace(v)); err == nil && n > 0 {
-			cfg.TTSMaxLength = n
+			cfg.TTS.MaxLength = n
 		}
 	}
 	if v := os.Getenv(EnvPrefix + "VOICE_ENABLED"); v != "" {
@@ -535,10 +547,6 @@ func applyEnvOverrides(cfg *Config) []string {
 	}
 	for key, field := range map[string]*string{
 		"VOICE_ENGINE":           &cfg.Voice.Engine,
-		"VOICE_TTS_ENGINE":       &cfg.Voice.TTSEngine,
-		"VOICE_TTS_MODEL":        &cfg.Voice.TTSModel,
-		"VOICE_TTS_VOICE":        &cfg.Voice.TTSVoice,
-		"VOICE_TTS_LOCATION":     &cfg.Voice.TTSLocation,
 		"CONCIERGE_MODEL":        &cfg.Concierge.Model,
 		"CONCIERGE_DISPATCH_URL": &cfg.Concierge.DispatchURL,
 		"CONCIERGE_ENVOY_URL":    &cfg.Concierge.EnvoyURL,
@@ -550,31 +558,46 @@ func applyEnvOverrides(cfg *Config) []string {
 	return warnings
 }
 
-func applyGenAIConfigDefaults(cfg *Config, serviceAccountProject string) {
-	if cfg.GCPProject == "" {
-		cfg.GCPProject = serviceAccountProject
-	}
-	if strings.TrimSpace(cfg.GCPLocation) == "" {
-		cfg.GCPLocation = genaiconfig.DefaultLocation
-	}
-	cfg.GenAIBackend = strings.ToLower(strings.TrimSpace(cfg.GenAIBackend))
-	if cfg.GenAIBackend == "" {
-		cfg.GenAIBackend = genaiconfig.DefaultBackend(cfg.GCPProject)
+// applyProviderDefaults gives a Vertex AI provider with no location the
+// global one, and one with no project the project of a service-account
+// credential file; an external-account file names no project to take.
+func applyProviderDefaults(cfg *Config, serviceAccountProject string) {
+	for name := range cfg.Providers {
+		p := cfg.Providers[name]
+		if p.API != APIVertex {
+			continue
+		}
+		p.Project = strings.TrimSpace(p.Project)
+		if p.Project == "" {
+			p.Project = serviceAccountProject
+		}
+		p.Location = strings.TrimSpace(p.Location)
+		if p.Location == "" {
+			p.Location = DefaultVertexLocation
+		}
+		cfg.Providers[name] = p
 	}
 }
 
-func loadSecrets(cfg *Config) {
-	cfg.DeepgramAPIKey = os.Getenv(EnvPrefix + "DEEPGRAM_API_KEY")
-	cfg.OpenAIAPIKey = os.Getenv(EnvPrefix + "OPENAI_API_KEY")
-	cfg.AnthropicAPIKey = os.Getenv(EnvPrefix + "ANTHROPIC_API_KEY")
-	cfg.GeminiAPIKey = os.Getenv(EnvPrefix + "GEMINI_API_KEY")
-	cfg.TTSAPIKey = os.Getenv(EnvPrefix + "TTS_API_KEY")
+// loadSecrets reads each api_key provider's key from the variable its
+// auth.env names, or from envFile when the environment has none, and the
+// unit's Dispatch token.
+func loadSecrets(cfg *Config, envFile map[string]string) {
+	cfg.ProviderKeys = map[string]string{}
+	for _, name := range cfg.keyEnvNames() {
+		v := strings.TrimSpace(os.Getenv(name))
+		if v == "" {
+			v = strings.TrimSpace(envFile[name])
+		}
+		if v != "" {
+			cfg.ProviderKeys[name] = v
+		}
+	}
 	cfg.DispatchToken = os.Getenv(EnvPrefix + "DISPATCH_TOKEN")
 }
 
 type googleCredentialInfo struct {
 	serviceAccountProject string
-	hasExternalAccount    bool
 }
 
 func inspectGoogleCredentialFile(path string) googleCredentialInfo {
@@ -598,18 +621,19 @@ func inspectGoogleCredentialFile(path string) googleCredentialInfo {
 	switch credential.Type {
 	case "service_account":
 		return googleCredentialInfo{serviceAccountProject: strings.TrimSpace(credential.ProjectID)}
-	case "external_account":
-		return googleCredentialInfo{hasExternalAccount: true}
 	default:
 		return googleCredentialInfo{}
 	}
 }
 
-func validate(cfg *Config, hasExternalAccount bool) []string {
+func validate(cfg *Config) []string {
 	var warnings []string
-
-	if cfg.DeepgramAPIKey == "" {
-		warnings = append(warnings, "Deepgram API key not configured — live transcription is disabled. Set "+EnvPrefix+"DEEPGRAM_API_KEY.")
+	cfg.Voice.Engine = strings.ToLower(strings.TrimSpace(cfg.Voice.Engine))
+	if strings.TrimSpace(cfg.BatchTranscription.Model) == "" {
+		cfg.BatchTranscription.Model = cfg.Transcription.Model
+	}
+	if cfg.TTS.MaxLength <= 0 {
+		cfg.TTS.MaxLength = 5000
 	}
 
 	if _, known := logging.LevelNamed(cfg.LogLevel); !known && strings.TrimSpace(cfg.LogLevel) != "" {
@@ -620,64 +644,12 @@ func validate(cfg *Config, hasExternalAccount bool) []string {
 		warnings = append(warnings, fmt.Sprintf("Invalid %s %q — logging at info. Set it to debug, info, warn or error.", where, cfg.LogLevel))
 	}
 
-	if cfg.GenAIBackend != "" && genaiconfig.NormalizeBackend(cfg.GenAIBackend) == "" {
-		warnings = append(warnings, fmt.Sprintf("Invalid genai_backend %q — using %s.", cfg.GenAIBackend, genaiconfig.DefaultBackend(cfg.GCPProject)))
-		cfg.GenAIBackend = genaiconfig.DefaultBackend(cfg.GCPProject)
-	}
-	if strings.TrimSpace(cfg.GCPLocation) == "" {
-		cfg.GCPLocation = genaiconfig.DefaultLocation
-	}
-
-	if cfg.GCPProject == "" && hasExternalAccount {
-		warnings = append(warnings, "Set gcp_project: an external-account credential file names no project.")
-	}
-
-	providers := make(map[string]struct{})
-	addModelProvider := func(scope, model string) {
-		provider, _, err := llm.ParseModel(model)
-		if err != nil {
-			warnings = append(warnings, fmt.Sprintf("Invalid %s model %q — %v.", scope, model, err))
-			return
-		}
-		providers[provider] = struct{}{}
-	}
-
-	addModelProvider("summarization", cfg.Summarization.Model)
-	if strings.TrimSpace(cfg.EmbeddingModel) != "" {
-		addModelProvider("embedding", cfg.EmbeddingModel)
-	}
+	warnings = append(warnings, validateProviders(cfg.Providers)...)
+	warnings = append(warnings, validateRoles(cfg)...)
+	warnings = append(warnings, missingKeyWarnings(cfg)...)
 
 	if _, ok := cfg.Summarization.Presets["default"]; !ok {
 		warnings = append(warnings, "No default summarization preset configured — set summarization.presets.default.")
-	}
-
-	for name, preset := range cfg.Summarization.Presets {
-		if strings.TrimSpace(preset.Model) == "" {
-			continue
-		}
-		addModelProvider(fmt.Sprintf("summarization preset %q", name), preset.Model)
-	}
-
-	for provider := range providers {
-		switch provider {
-		case "openai":
-			if cfg.OpenAIAPIKey == "" {
-				warnings = append(warnings, "OpenAI API key not configured — set "+EnvPrefix+"OPENAI_API_KEY.")
-			}
-		case "anthropic":
-			if cfg.AnthropicAPIKey == "" {
-				warnings = append(warnings, "Anthropic API key not configured — set "+EnvPrefix+"ANTHROPIC_API_KEY.")
-			}
-		case "gemini":
-			if !genaiconfig.CanUse(&genaiconfig.Options{
-				Backend:  cfg.GenAIBackend,
-				Project:  cfg.GCPProject,
-				Location: cfg.GCPLocation,
-				APIKey:   cfg.GeminiAPIKey,
-			}) {
-				warnings = append(warnings, "Gemini backend not configured — set "+EnvPrefix+"GCP_PROJECT for Vertex AI or "+EnvPrefix+"GEMINI_API_KEY for Gemini API.")
-			}
-		}
 	}
 
 	if _, err := time.ParseDuration(cfg.SilenceTimeout); err != nil {
@@ -695,9 +667,6 @@ func validate(cfg *Config, hasExternalAccount bool) []string {
 		}
 	}
 
-	if cfg.BatchTranscription.Provider == "" {
-		cfg.BatchTranscription.Provider = "deepgram"
-	}
 	cfg.EnvoyHubURL = strings.TrimSpace(cfg.EnvoyHubURL)
 	if cfg.EnvoyEnabled {
 		parsedURL, err := url.Parse(cfg.EnvoyHubURL)
@@ -718,17 +687,8 @@ func validate(cfg *Config, hasExternalAccount bool) []string {
 			cfg.PublicURL = parsed.Scheme + "://" + parsed.Host
 		}
 	}
-	if cfg.BatchTranscription.Model == "" {
-		cfg.BatchTranscription.Model = cfg.DeepgramModel
-	}
 	// A blank rule would show as an empty line under Recording rules.
 	cfg.RecordingRules = slices.DeleteFunc(cfg.RecordingRules, func(rule string) bool { return strings.TrimSpace(rule) == "" })
-	switch cfg.BatchTranscription.Provider {
-	case "deepgram", "groq", "openai":
-	default:
-		warnings = append(warnings, fmt.Sprintf("Invalid batch_transcription.provider %q — using default deepgram.", cfg.BatchTranscription.Provider))
-		cfg.BatchTranscription.Provider = "deepgram"
-	}
 
 	// 0 is each GC limit's "no limit"; a negative limit is a mistake.
 	if cfg.GCMaxAgeDays < 0 {
@@ -740,22 +700,6 @@ func validate(cfg *Config, hasExternalAccount bool) []string {
 		cfg.GCMaxAudioSizeMB = 1024
 	}
 
-	if cfg.TTSProvider != "" {
-		switch cfg.TTSProvider {
-		case "elevenlabs", "google", "gemini":
-		default:
-			warnings = append(warnings, fmt.Sprintf("Invalid tts_provider %q — supported providers are elevenlabs, gemini, google.", cfg.TTSProvider))
-		}
-		if cfg.TTSProvider == "gemini" && strings.TrimSpace(cfg.GCPProject) == "" {
-			warnings = append(warnings, "Gemini TTS provider requires gcp_project for Vertex AI.")
-		}
-		if cfg.TTSAPIKey == "" && cfg.TTSProvider != "google" && cfg.TTSProvider != "gemini" {
-			warnings = append(warnings, "TTS provider configured but API key not set — set "+EnvPrefix+"TTS_API_KEY.")
-		}
-		if cfg.TTSMaxLength <= 0 {
-			cfg.TTSMaxLength = 5000
-		}
-	}
 	warnings = append(warnings, validateVoice(cfg)...)
 	return warnings
 }
@@ -763,8 +707,6 @@ func validate(cfg *Config, hasExternalAccount bool) []string {
 // validateVoice warns about a voice that cannot speak as configured.
 func validateVoice(cfg *Config) []string {
 	v := &cfg.Voice
-	v.Engine = strings.ToLower(strings.TrimSpace(v.Engine))
-	v.TTSEngine = strings.ToLower(strings.TrimSpace(v.TTSEngine))
 	var warnings []string
 	if !v.Enabled {
 		return warnings
@@ -777,17 +719,11 @@ func validateVoice(cfg *Config) []string {
 	default:
 		warnings = append(warnings, fmt.Sprintf("Invalid voice.engine %q — supported engines are tts, gptlive, dgagent.", v.Engine))
 	}
-	switch v.TTSEngine {
-	case TTSEngineGemini:
-		if v.Engine == VoiceEngineTTS && strings.TrimSpace(cfg.GCPProject) == "" {
-			warnings = append(warnings, "voice.tts_engine gemini needs gcp_project for Vertex AI.")
-		}
-	case TTSEngineAura:
-		if v.Engine == VoiceEngineTTS && cfg.DeepgramAPIKey == "" {
-			warnings = append(warnings, "voice.tts_engine aura needs the Deepgram key — set "+EnvPrefix+"DEEPGRAM_API_KEY.")
-		}
-	default:
-		warnings = append(warnings, fmt.Sprintf("Invalid voice.tts_engine %q — supported engines are gemini, aura.", v.TTSEngine))
+	if v.Engine == VoiceEngineTTS && strings.TrimSpace(cfg.TTS.Model) == "" {
+		warnings = append(warnings, "voice.engine tts needs tts.model — set it to the provider/model the voice speaks with.")
+	}
+	if strings.TrimSpace(cfg.Concierge.Model) == "" {
+		warnings = append(warnings, "The voice needs concierge.model — set it to provider/model, such as vertex/gemini-3.5-flash-lite; the voice cannot answer.")
 	}
 	phrases := v.WakePhrases[:0]
 	for _, p := range v.WakePhrases {

@@ -30,7 +30,7 @@ func TestAnEmptySummaryKeepsTheModelOfTheKeptSummary(t *testing.T) {
 				t.Fatalf("publish to Envoy: %v", err)
 			}
 			if run.start {
-				if err := store.StartSummary(id); err != nil {
+				if _, err := store.StartSummary(id); err != nil {
 					t.Fatalf("StartSummary: %v", err)
 				}
 			}

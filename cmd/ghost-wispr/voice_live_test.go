@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"maps"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -106,9 +107,9 @@ func TestThePiConfigCanPickVoiceB(t *testing.T) {
 	if cfg.Voice.Engine != config.VoiceEngineTTS {
 		t.Errorf("the Pi starts with voice.engine %q, want %q until a build with voice B runs there", cfg.Voice.Engine, config.VoiceEngineTTS)
 	}
-	ids := cfg.Voice.GPTLive
-	if !strings.HasPrefix(ids.OpenAIIdentityProviderID, "idp_") || !strings.HasPrefix(ids.OpenAIServiceAccountID, "user-") {
-		t.Fatalf("the Pi's voice.gptlive is %+v, want its OpenAI identity provider (idp_…) and service account (user-…)", ids)
+	ids := cfg.Providers["openai"].Auth
+	if ids.Kind != config.AuthOpenAIWIF || !strings.HasPrefix(ids.IdentityProviderID, "idp_") || !strings.HasPrefix(ids.ServiceAccountID, "user-") {
+		t.Fatalf("the Pi's openai provider signs in with %+v, want OpenAI workload identity with its identity provider (idp_…) and service account (user-…)", ids)
 	}
 	cfg.Voice.Engine = config.VoiceEngineGPTLive
 	var source voiceSource
@@ -126,7 +127,10 @@ func TestThePiConfigCanPickVoiceB(t *testing.T) {
 // voice.engine dgagent, and again for a new think model.
 func TestEachSettingBuildsItsVoice(t *testing.T) {
 	key := strings.Repeat("k", 8) // any non-empty key; no request leaves the test
-	cfg := config.Config{DeepgramAPIKey: key, Voice: config.Voice{Engine: config.VoiceEngineTTS, TTSEngine: config.TTSEngineAura}}
+	cfg := deepgramKeyConfig(key)
+	cfg.Providers["openai"] = config.Provider{API: config.APIOpenAI, Auth: config.ProviderAuth{Kind: config.AuthOpenAIWIF}}
+	cfg.TTS = config.TTS{Model: "deepgram/aura-2-thalia-en"}
+	cfg.Voice.Engine, cfg.Voice.GPTLive.Model = config.VoiceEngineTTS, "openai/gpt-live-1"
 	var source voiceSource
 	source.apply(t.Context(), &cfg)
 	first, err := source.Voice()
@@ -137,17 +141,18 @@ func TestEachSettingBuildsItsVoice(t *testing.T) {
 	if again, _ := source.Voice(); again != first {
 		t.Fatal("the same settings built a second voice")
 	}
-	cfg.Voice.TTSVoice = "aura-2-other-en"
+	cfg.TTS.Voice = "aura-2-other-en"
 	source.apply(t.Context(), &cfg)
 	if changed, _ := source.Voice(); changed == first || changed == nil {
-		t.Fatal("a new tts_voice kept the old voice")
+		t.Fatal("a new tts.voice kept the old voice")
 	}
 	cfg.Voice.Engine = config.VoiceEngineGPTLive
 	source.apply(t.Context(), &cfg)
-	if v, err := source.Voice(); v != nil || err == nil || !strings.Contains(err.Error(), "openai_identity_provider_id") {
+	if v, err := source.Voice(); v != nil || err == nil || !strings.Contains(err.Error(), "identity_provider_id") {
 		t.Fatalf("voice B without its OpenAI ids: %v, %v", v, err)
 	}
-	cfg.Voice.GPTLive = config.GPTLive{OpenAIIdentityProviderID: "idp_example", OpenAIServiceAccountID: "user-example"}
+	cfg.Providers = maps.Clone(cfg.Providers)
+	cfg.Providers["openai"] = config.Provider{API: config.APIOpenAI, Auth: config.ProviderAuth{Kind: config.AuthOpenAIWIF, IdentityProviderID: "idp_example", ServiceAccountID: "user-example"}}
 	source.apply(t.Context(), &cfg)
 	voiceB, err := source.Voice()
 	if _, ok := voiceB.(*gptlive.Voice); !ok || err != nil {
@@ -164,7 +169,7 @@ func TestEachSettingBuildsItsVoice(t *testing.T) {
 	if changed, _ := source.Voice(); changed == voiceC || changed == nil {
 		t.Fatal("a new voice.dgagent.think_model kept the old voice C")
 	}
-	cfg.DeepgramAPIKey = ""
+	cfg.ProviderKeys = nil
 	source.apply(t.Context(), &cfg)
 	if v, err := source.Voice(); v != nil || err == nil {
 		t.Fatalf("voice C with no key: %v, %v", v, err)
@@ -254,7 +259,7 @@ func TestAFailedRedCheckPlaysTheErrorSound(t *testing.T) {
 // off at start-up starts before a call needs it, starts twice, or does not
 // pass its answers on once started.
 func TestTheConciergeStartsOnFirstUse(t *testing.T) {
-	cfg := config.Config{GenAIBackend: "gemini", GeminiAPIKey: "test"}
+	cfg := geminiKeyConfig("test")
 	store := conciergeStore(t)
 	starts := 0
 	var started *concierge.Concierge

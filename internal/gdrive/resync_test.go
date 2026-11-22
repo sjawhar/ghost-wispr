@@ -59,7 +59,7 @@ func summarizedSession(t *testing.T, store *storage.SQLiteStore, audioDir, id st
 // is running, the last one kept, then the new one is stored.
 func resummarize(t *testing.T, store *storage.SQLiteStore, id, summary string) {
 	t.Helper()
-	if err := store.StartSummary(id); err != nil {
+	if _, err := store.StartSummary(id); err != nil {
 		t.Fatalf("start summary: %v", err)
 	}
 	if err := store.UpdateSummaryAtGeneration(id, "Standup", summary, storage.SummaryCompleted, "default", "{}", "", 0); err != nil {

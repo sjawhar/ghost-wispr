@@ -9,7 +9,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/sjawhar/ghost-wispr/internal/config"
 	"github.com/sjawhar/ghost-wispr/internal/logtest"
 )
 
@@ -17,7 +16,8 @@ import (
 // not keyterms of the live Deepgram request, after the wake phrases, so that
 // "infra" is not heard as "in for" (R4; end-to-end run 8c).
 func TestLiveOptionsCarryTheProjectKeys(t *testing.T) {
-	cfg := config.Config{DeepgramModel: "nova-3", SpeakerEnabled: true, Voice: config.Voice{WakePhrases: []string{"Wispr", "Ghost Wispr"}}}
+	cfg := deepgramKeyConfig("")
+	cfg.SpeakerEnabled, cfg.Voice.WakePhrases = true, []string{"Wispr", "Ghost Wispr"}
 	if got, want := liveTranscriptionOptions(&cfg, 16000, []string{"INFRA", "ABC"}).Keyterm, []string{"Wispr", "Whisper", "Ghost Wispr", "INFRA", "ABC"}; !slices.Equal(got, want) {
 		t.Fatalf("keyterms %q, want %q", got, want)
 	}

@@ -359,8 +359,10 @@
 </section>
 
 <style>
+  /* Wraps on a narrow screen, so the search and filters stay within it. */
   .filter-controls {
     display: flex;
+    flex-wrap: wrap;
     gap: 0.5rem;
     margin-top: 0.5rem;
     align-items: center;

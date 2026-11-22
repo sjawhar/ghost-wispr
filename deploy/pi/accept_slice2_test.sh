@@ -36,6 +36,17 @@ done
   || fail 'self-test did not prove run_a8 passes, and runs every role, when no provider reports its model'
 [[ "$output" == *'A8 self-test RAN: every role is compared with the model the running process reports'* ]] \
   || fail 'self-test did not prove A8 compares every role with the running process'
+# The Pi names each provider once (README "Model providers"): A8 compares how the running process
+# signs in to each with the plan, and refuses a deployed YAML or service environment that still sets
+# a setting the providers replaced, at any depth.
+[[ "$output" == *'A8 self-test RAN: every provider is compared with how the running process signs in to it'* ]] \
+  || fail 'self-test did not prove A8 compares every provider with the running process'
+[[ "$output" == *'A8 self-test RAN: every removed setting is rejected wherever it is nested'* ]] \
+  || fail 'self-test did not prove A8 rejects a removed setting in the deployed YAML'
+[[ "$output" == *"A8 self-test RAN: the deployed YAML's providers are compared with the plan's"* ]] \
+  || fail "self-test did not prove A8 compares the deployed YAML's providers with the plan"
+[[ "$output" == *'A8 self-test RAN: every removed variable in the service environment is rejected'* ]] \
+  || fail 'self-test did not prove A8 rejects a removed variable in the service environment'
 
 # The Cert-warning row checks that the test instance cannot open the Jabra before it trusts the
 # instance's status: an instance that holds the audio or input group, runs with the Jabra button
@@ -70,12 +81,29 @@ fi
 
 assert_source_contains 'assert_provider_model'
 assert_source_contains 'provider model mismatch'
-# shellcheck disable=SC2016 # The needle is the driver's source text.
+# shellcheck disable=SC2016 # The needles are the driver's source text.
 assert_source_contains 'assert_running_models "$current_config"'
+# shellcheck disable=SC2016
+assert_source_contains 'assert_running_providers "$current_config"'
+# shellcheck disable=SC2016
+assert_source_contains 'assert_expected_config "$deployed_yaml"'
+
+# POST /api/tts/speak speaks with the tts role and takes no provider, so A8's request names only its
+# text.
+speak_source=$(awk '/^speak\(\) \{$/ { found = 1 } found { print } found && /^\}$/ { exit }' "$driver")
+[[ $speak_source == *'/api/tts/speak'* ]] || fail "could not read speak from the driver: $speak_source"
+[[ $speak_source == *"--data '{\"text\":"*'}'"'"* && $speak_source != *provider* ]] \
+  || fail "A8's text-to-speech request names more than its text: $speak_source"
 
 mutation_dir=$(mktemp -d)
 trap 'rm -rf -- "$mutation_dir"' EXIT
 mutated_driver="$mutation_dir/accept-slice2.sh"
+# The self-test reads the Pi's template beside the driver, so each copy has one. The control: an
+# unchanged copy passes there, so a mutated copy fails for its mutation, not for where it runs.
+mkdir "$mutation_dir/files"
+cp -- "$repo_root/deploy/pi/files/ghost-wispr.yaml" "$mutation_dir/files/"
+cp -- "$driver" "$mutated_driver"
+bash "$mutated_driver" --self-test >/dev/null 2>&1 || fail 'an unchanged copy of the driver fails its self-test where the mutations run'
 source_text=$(<"$driver")
 needle=$'printf \'%s provider model mismatch: got %q, want %q\\n\' "$role" "$actual" "$expected" >&2\n    return 1'
 replacement=$'printf \'%s provider model mismatch: got %q, want %q\\n\' "$role" "$actual" "$expected" >&2\n    return 0'
@@ -110,13 +138,52 @@ run_row_output=$(
 [[ "$run_row_output" == *'row_failures=1'* ]] \
   || fail "run_row counted the wrong number of failures: $run_row_output"
 
-# A check of the running models that always passes must fail the self-test.
+# A check of the running models, of how the running process signs in to each provider, of the
+# deployed YAML's providers or removed settings, or of the service environment's removed variables
+# that always passes must fail the self-test.
+for check in assert_running_models assert_running_providers assert_expected_providers assert_no_removed_settings assert_no_removed_variables; do
+  source_text=$(<"$driver")
+  needle=$'\n'"$check() {"$'\n'
+  [[ "$source_text" == *"$needle"* ]] || fail "could not plant the $check mutation"
+  printf '%s' "${source_text/"$needle"/"$needle  return 0"$'\n'}" >"$mutated_driver"
+  if bash "$mutated_driver" --self-test >/dev/null 2>&1; then
+    fail "self-test accepted a $check that always passes"
+  fi
+done
+
+# A8 compares OpenAI's workload identity ids with the template's own
+# (deploy/pi/files/ghost-wispr.yaml). Each comparison loosened to the shape it had before, any
+# string, must fail the self-test, whose running process signs in with well-formed values that are
+# not the template's. The unchanged copy above passing is the control.
+for check in auth.identity_provider_id:providers.openai.auth.identity_provider_id \
+  auth.service_account_id:providers.openai.auth.service_account_id; do
+  field=${check%%:*} path=${check#*:}
+  source_text=$(<"$driver")
+  needle=".$field == \$plan[\"$path\"]"
+  [[ "$source_text" == *"$needle"* ]] || fail "could not plant the mutation of the $path comparison"
+  printf '%s' "${source_text/"$needle"/"(.$field | type == \"string\")"}" >"$mutated_driver"
+  if bash "$mutated_driver" --self-test >/dev/null 2>&1; then
+    fail "self-test accepted a running process whose $path is any string"
+  fi
+done
+# A8 refuses a running process that names a provider the plan does not, such as the gateway the
+# template keeps commented out until it admits the Pi: that provider's row can read Fails.
 source_text=$(<"$driver")
-needle=$'\nassert_running_models() {\n'
-[[ "$source_text" == *"$needle"* ]] || fail 'could not plant the running-models mutation'
-printf '%s' "${source_text/"$needle"/"$needle  return 0"$'\n'}" >"$mutated_driver"
+# shellcheck disable=SC2016 # The needle is the driver's source text.
+needle='if [[ "$names" != "$want_names" ]]; then'
+[[ "$source_text" == *"$needle"* ]] || fail 'could not plant the mutation of the provider-set comparison'
+printf '%s' "${source_text/"$needle"/'if false; then'}" >"$mutated_driver"
 if bash "$mutated_driver" --self-test >/dev/null 2>&1; then
-  fail 'self-test accepted a running-models check that always passes'
+  fail 'self-test accepted a running process that names a provider the plan does not'
+fi
+# A plan that sets no value to compare with must fail the check, not pass on an empty value.
+source_text=$(<"$driver")
+# shellcheck disable=SC2016 # The needle is the driver's source text.
+needle='if [[ -z "$value" ]]; then'
+[[ "$source_text" == *"$needle"* ]] || fail 'could not plant the mutation of the plan reader'
+printf '%s' "${source_text/"$needle"/'if false; then'}" >"$mutated_driver"
+if bash "$mutated_driver" --self-test >/dev/null 2>&1; then
+  fail 'self-test accepted a plan reader that passes a setting the plan does not set'
 fi
 
 # The cert-warning test instance runs beside the recorder, on the same Pi. Its PortAudio scan, the

@@ -7,6 +7,8 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/sjawhar/ghost-wispr/internal/config"
 )
 
 func TestOpenAIComplete(t *testing.T) {
@@ -52,9 +54,9 @@ func TestOpenAIComplete(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client, err := newOpenAIClient("test-key", "gpt-4o-mini", &clientOptions{baseURL: server.URL + "/v1"})
+	client, err := NewClient(keyProvider(t, config.APIOpenAI, server.URL+"/v1"), "gpt-4o-mini")
 	if err != nil {
-		t.Fatalf("newOpenAIClient failed: %v", err)
+		t.Fatalf("NewClient failed: %v", err)
 	}
 
 	got, err := client.Complete(context.Background(), []Message{{Role: "system", Content: "you are helpful"}, {Role: "user", Content: "hello"}})
@@ -63,46 +65,6 @@ func TestOpenAIComplete(t *testing.T) {
 	}
 	if got != "hello from openai" {
 		t.Fatalf("expected trimmed response, got %q", got)
-	}
-}
-
-func TestNewClientOpenAIWithBaseURL(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/v1/chat/completions" {
-			t.Fatalf("unexpected path %q", r.URL.Path)
-		}
-		if auth := r.Header.Get("Authorization"); !strings.Contains(auth, "test-key") {
-			t.Fatalf("expected auth header to include test-key, got %q", auth)
-		}
-
-		_ = json.NewEncoder(w).Encode(map[string]any{
-			"id":      "chatcmpl-2",
-			"object":  "chat.completion",
-			"created": 123,
-			"model":   "gpt-4o-mini",
-			"choices": []map[string]any{{
-				"index": 0,
-				"message": map[string]any{
-					"role":    "assistant",
-					"content": "ok",
-				},
-				"finish_reason": "stop",
-			}},
-		})
-	}))
-	defer server.Close()
-
-	client, err := NewClient("openai", "test-key", "gpt-4o-mini", WithBaseURL(server.URL+"/v1"))
-	if err != nil {
-		t.Fatalf("NewClient failed: %v", err)
-	}
-
-	got, err := client.Complete(context.Background(), []Message{{Role: "user", Content: "ping"}})
-	if err != nil {
-		t.Fatalf("Complete failed: %v", err)
-	}
-	if got != "ok" {
-		t.Fatalf("expected response ok, got %q", got)
 	}
 }
 
@@ -118,9 +80,9 @@ func TestOpenAI_Complete_EmptyChoices(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client, err := newOpenAIClient("test-key", "gpt-4o-mini", &clientOptions{baseURL: server.URL + "/v1"})
+	client, err := NewClient(keyProvider(t, config.APIOpenAI, server.URL+"/v1"), "gpt-4o-mini")
 	if err != nil {
-		t.Fatalf("newOpenAIClient failed: %v", err)
+		t.Fatalf("NewClient failed: %v", err)
 	}
 
 	_, err = client.Complete(context.Background(), []Message{{Role: "user", Content: "hello"}})

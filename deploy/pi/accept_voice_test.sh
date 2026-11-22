@@ -75,7 +75,10 @@ fi
 # overrides, a value with a tab and two spaces, and no newline at the end, so that a restore that is
 # not byte for byte shows.
 readonly original_env=$'# Ghost Wispr settings\nGHOST_WISPR_DEEPGRAM_API_KEY=example-not-a-key\nGHOST_WISPR_DISPATCH_TOKEN="good-token"\nGHOST_WISPR_ADDR=127.0.0.1:8080\nGHOST_WISPR_VOICE_ENABLED=false\nGHOST_WISPR_NOTE="two  spaces\tand a tab"\nLAST_LINE=no-newline'
-readonly config_yaml=$'db_path: data/ghost-wispr.db\nspeaker_device: J75\nmic_device: J75\nvoice:\n  enabled: false\n  tts_location: us\nconcierge:\n  dispatch_url: https://dispatch.example\n  envoy_url: http://envoy.example:9020\n'
+# The config each case starts with. Its providers are written as yaml.v3 writes them and as a person
+# may: one with its api after a nested auth, one with its auth in flow style, so that the step that
+# reads a provider's api reads it at the provider's own level.
+readonly config_yaml=$'db_path: data/ghost-wispr.db\nspeaker_device: J75\nmic_device: J75\nproviders:\n  vertex:\n    api: vertex\n    project: example-project\n    auth:\n      kind: google\n  vertex-us:\n    api: vertex\n    project: example-project\n    location: us\n    auth: {kind: google}\n  deepgram:\n    auth:\n      kind: api_key\n      env: GHOST_WISPR_DEEPGRAM_API_KEY\n    api: deepgram\ntts:\n  model: vertex-us/gemini-3.8-flash-tts\n  voice: Kore\nvoice:\n  enabled: false\nconcierge:\n  dispatch_url: https://dispatch.example\n  envoy_url: http://envoy.example:9020\n'
 
 cat >"$fakepi" <<'EOF'
 """The fake Pi of accept_voice_test.sh: every fake command, chosen by its first argument."""
@@ -1782,12 +1785,25 @@ def binary(args):
         print(json.dumps(answers.get(args[1], {"holder": "none", "assignee": ""})))
         return 0
     if command == "tts-first-audio":
-        engine = args[args.index("--engine") + 1]
-        location = args[args.index("--location") + 1] if "--location" in args else ""
-        ms = {"gemini": 450 if location == "global" else 300, "aura": 250, "gemini-clip": 380 if "clip-close" in SCENARIO else 1200}[engine]
+        # ghost-wispr tts-first-audio [--model provider/model] [--voice VOICE] [--clip]: the driver
+        # names the model each time. mip_opt_out is null but for a Deepgram (Aura) model's stream.
+        if "--model" not in args:
+            sys.stderr.write("fake tts-first-audio: the driver named no --model\n")
+            return 2
+        model = args[args.index("--model") + 1]
+        clip = "--clip" in args
+        if clip:
+            ms = 380 if "clip-close" in SCENARIO else 1200
+        else:
+            ms = {"vertex-us/gemini-3.8-flash-tts": 300, "vertex/gemini-3.8-flash-tts": 450, "deepgram/aura-2-thalia-en": 250}[model]
+        if "slow-first-frame" in SCENARIO:
+            ms += 600
+        aura = model.startswith("deepgram/") and not clip
         for n, line in enumerate(sys.stdin):
             if line.strip():
-                opt_out = None if engine != "aura" else (n != 1 if "aura-no-optout" in SCENARIO else True)
+                opt_out = None
+                if aura and "aura-null-optout" not in SCENARIO:
+                    opt_out = n != 1 if "aura-no-optout" in SCENARIO else True
                 print(json.dumps({"ms_to_first_frame": ms + n % 3 + 0.4, "mip_opt_out": opt_out}))
         return 0
     if command == "play-sound":
@@ -2698,11 +2714,19 @@ launch cancel-journal-error long,asound,stop-rounds-2,late-journal-error yes -- 
 # shellcheck disable=SC2086
 launch cancel-late-apply long,asound,stop-rounds-2,late-apply yes -- $cancel_args
 
-# tts-first-audio: a pass with the gemini-clip control; a control too close to tell (the negative
-# control); Aura without mip_opt_out; a build without the subcommand.
-launch first-audio pass '' -- --step tts-first-audio --engine gemini --engine aura2 --engine gemini-clip --sentences 3
-launch first-audio-close clip-close '' -- --step tts-first-audio --engine gemini --engine gemini-clip --sentences 3
-launch first-audio-optout aura-no-optout '' -- --step tts-first-audio --engine aura2 --sentences 3
+# tts-first-audio: a pass on one model at Vertex AI's us and global locations and on Aura, with the
+# whole-clip control; the unit's tts.model alone, its control too close to tell (the negative
+# control); Aura with one request and with every request lacking mip_opt_out; the unit's model past
+# the bound; a model of a provider the unit does not name; the voice flag --engine, which the step
+# does not take; a build without the subcommand.
+launch first-audio pass '' -- --step tts-first-audio --model vertex-us/gemini-3.8-flash-tts \
+  --model vertex/gemini-3.8-flash-tts --model deepgram/aura-2-thalia-en --clip --sentences 3
+launch first-audio-close clip-close '' -- --step tts-first-audio --clip --sentences 3
+launch first-audio-optout aura-no-optout '' -- --step tts-first-audio --model deepgram/aura-2-thalia-en --sentences 3
+launch first-audio-null-optout aura-null-optout '' -- --step tts-first-audio --model deepgram/aura-2-thalia-en --sentences 3
+launch first-audio-slow slow-first-frame '' -- --step tts-first-audio --sentences 3
+launch first-audio-no-provider pass '' -- --step tts-first-audio --model nowhere/tts-1 --sentences 3
+launch first-audio-engine pass '' -- --step tts-first-audio --engine gemini --sentences 3
 launch first-audio-missing tts-missing '' -- --step tts-first-audio --sentences 3
 # joined (c-joined-live): a pass; a pointer that names another meeting; the agent told its words
 # were spoken before the go-ahead; voice_spoken with another session's id; the meeting's only
@@ -3722,18 +3746,34 @@ expect_restored cancel-late-apply
 
 # tts-first-audio.
 expect_rc first-audio 0
-for line in "PASS: tts-first-audio gemini (us, the unit's location): median 301 ms" 'NOTE: tts-first-audio gemini (global): median 451 ms' \
-  'PASS: tts-first-audio aura: median 251 ms' 'PASS: tts-first-audio aura: mip_opt_out=true on all 3 requests' \
-  "PASS: tts-first-audio control: gemini-clip's median 1201 ms is at least 3 times streaming Gemini's 301 ms"; do
+for line in "PASS: tts-first-audio vertex-us/gemini-3.8-flash-tts (the unit's tts.model): median 301 ms to the first frame, at most 700 ms" \
+  'PASS: tts-first-audio vertex/gemini-3.8-flash-tts: median 451 ms to the first frame' \
+  'PASS: tts-first-audio deepgram/aura-2-thalia-en: median 251 ms to the first frame' \
+  'PASS: tts-first-audio deepgram/aura-2-thalia-en: mip_opt_out=true on all 3 requests' \
+  "PASS: tts-first-audio control: vertex-us/gemini-3.8-flash-tts's whole clip, median 1201 ms, takes at least 3 times its stream's 301 ms"; do
   expect_line first-audio "$line"
 done
-grep -Fqx 'tts-first-audio --engine gemini --location global' "$root/first-audio/state/binary.log" \
-  || check_failed 'first-audio: gemini did not run at the global location'
+# Only the Deepgram model is checked for its opt-out: the others send no such parameter.
+expect_no_line first-audio 'tts-first-audio vertex-us/gemini-3.8-flash-tts: mip_opt_out'
+expect_no_line first-audio 'tts-first-audio vertex/gemini-3.8-flash-tts: mip_opt_out'
+for call in 'tts-first-audio --model vertex/gemini-3.8-flash-tts' 'tts-first-audio --model vertex-us/gemini-3.8-flash-tts --clip'; do
+  grep -Fqx -- "$call" "$root/first-audio/state/binary.log" || check_failed "first-audio: the step did not run $call"
+done
 expect_untouched first-audio
 expect_rc first-audio-close 1
-expect_line first-audio-close "FAIL: tts-first-audio control: gemini-clip's median 381 ms is less than 3 times streaming Gemini's 301 ms"
+expect_line first-audio-close "FAIL: tts-first-audio control: vertex-us/gemini-3.8-flash-tts's whole clip, median 381 ms, takes less than 3 times its stream's 301 ms"
+grep -Fqx 'tts-first-audio --model vertex-us/gemini-3.8-flash-tts' "$root/first-audio-close/state/binary.log" \
+  || check_failed "first-audio-close: the step did not time the unit's tts.model when no --model named one"
 expect_rc first-audio-optout 1
-expect_line first-audio-optout 'FAIL: tts-first-audio aura: 1 of 3 requests did not carry mip_opt_out=true'
+expect_line first-audio-optout 'FAIL: tts-first-audio deepgram/aura-2-thalia-en: 1 of 3 requests did not carry mip_opt_out=true'
+expect_rc first-audio-null-optout 1
+expect_line first-audio-null-optout 'FAIL: tts-first-audio deepgram/aura-2-thalia-en: 3 of 3 requests did not carry mip_opt_out=true'
+expect_rc first-audio-slow 1
+expect_line first-audio-slow "FAIL: tts-first-audio vertex-us/gemini-3.8-flash-tts (the unit's tts.model): median 901 ms to the first frame, more than 700 ms"
+expect_rc first-audio-no-provider 2
+expect_line first-audio-no-provider "UNKNOWN: tts-first-audio nowhere/tts-1: the unit's config names no provider nowhere with an api"
+expect_rc first-audio-engine 1
+expect_line first-audio-engine 'tts-first-audio takes --model PROVIDER/MODEL'
 expect_rc first-audio-missing 2
 expect_line first-audio-missing 'UNKNOWN: tts-first-audio: this build has no ghost-wispr tts-first-audio'
 

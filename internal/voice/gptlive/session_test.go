@@ -788,22 +788,11 @@ func TestAnAPIErrorsTextLeavesOutItsMessage(t *testing.T) {
 }
 
 // A code or type that is free text, not a plain token, is left out of the
-// error's text and of a token refusal's code, as a message is.
+// error's text.
 func TestAnAPIErrorsCodeIsAPlainToken(t *testing.T) {
 	e := &APIError{Type: "the words someone said", Code: "bad content someone said"}
 	if got := e.Error(); strings.Contains(got, "said") || got != "gpt-live error server_error" {
 		t.Fatalf("Error() = %q, want the fallback code and no free text", got)
-	}
-	for _, body := range []string{
-		`{"error":{"code":"bad content someone said","type":"the words someone said"}}`,
-		`{"error":"the words someone said"}`,
-	} {
-		if got := exchangeErrorCode([]byte(body), ""); got != "server_refusal" {
-			t.Errorf("exchangeErrorCode(%s) = %q, want server_refusal", body, got)
-		}
-	}
-	if got := exchangeErrorCode([]byte(`{"error":{"code":"invalid_api_key","type":"the words"}}`), ""); got != "invalid_api_key" {
-		t.Errorf("exchangeErrorCode kept %q, want invalid_api_key", got)
 	}
 }
 

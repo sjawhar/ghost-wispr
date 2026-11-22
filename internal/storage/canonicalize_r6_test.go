@@ -24,7 +24,7 @@ func TestR6CanonicalizePairsItsTranscriptWithItsGeneration(t *testing.T) {
 	if transcript != storedTranscript || generation != readGeneration || strings.Contains(transcript, "private deletion token") {
 		t.Fatalf("canonicalize = (%q, generation %d); stored = (%q, generation %d); want deleted text absent at the written generation", transcript, generation, storedTranscript, readGeneration)
 	}
-	if err := store.StartSummary("s"); err != nil {
+	if _, err := store.StartSummary("s"); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.UpdateSummaryAtGeneration("s", "Safe title", transcript, SummaryCompleted, "default", "{}", "", generation); err != nil {

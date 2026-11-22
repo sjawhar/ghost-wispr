@@ -93,6 +93,8 @@ backchannels=40
 stops=100
 sentences=40
 engines=()
+models=()
+clip=false
 rig_mic=
 issue_live=
 issue_stopped=
@@ -148,8 +150,9 @@ Steps:
                       speech ends at the Jabra after each, and underruns over --playback-seconds of
                       playback. It first plays the wake sound alone (ghost-wispr play-sound), to
                       learn how long the rig hears a chime. Needs --rig-mic.
-  tts-first-audio     --sentences N sentences to each --engine (gemini, aura2 or aura,
-                      gemini-clip) through ghost-wispr tts-first-audio. Changes nothing.
+  tts-first-audio     --sentences N sentences to each --model through ghost-wispr tts-first-audio,
+                      each streamed, and with --clip the unit's tts.model as a whole clip.
+                      Changes nothing.
   states              the three capture states with the paused listener on: the page, POST
                       /api/close, --phrase into the loopback, and a person's presses of the power
                       and Jabra buttons, each read by /api/status, the light, the saved state, the
@@ -172,7 +175,11 @@ Options:
                       tts-first-audio's sentences, one a line (default: built-in sentences)
   --calls N --questions N --talkovers N --backchannels N --stops N --sentences N
                       counts (defaults $calls, $questions, $talkovers, $backchannels, $stops, $sentences)
-  --engine NAME       repeatable
+  --engine NAME       scripted: a voice (voice.engine), repeatable
+  --model PROVIDER/MODEL
+                      tts-first-audio: a text-to-speech model, repeatable (default: the unit's
+                      tts.model); to compare Vertex AI locations, name one provider in each
+  --clip              tts-first-audio: also time the unit's tts.model as a whole clip, the control
   --rig-mic PCM       the USB microphone about 30 cm from the Jabra, such as plughw:CARD=Mic,DEV=0
   --issue-live KEY --issue-stopped KEY --issue-person KEY --issue-none KEY --join-issue KEY
                       scratch issues: claimed by a live agent session, by a stopped one, by a
@@ -232,7 +239,7 @@ while (($#)); do
   case $1 in
     --step | --question | --go-ahead | --second-question | --never-mind | --stop-clip | --question-dir | \
       --talkover-dir | --backchannel-dir | --sentences-file | --calls | --questions | --talkovers | \
-      --backchannels | --stops | --sentences | --engine | --rig-mic | --issue-live | --issue-stopped | \
+      --backchannels | --stops | --sentences | --engine | --model | --rig-mic | --issue-live | --issue-stopped | \
       --issue-person | --issue-none | --event-timeout | --answer-timeout | --chime-ms | --speech-ms | \
       --playback-seconds | --phrase | --speech | --cpu-seconds | --hub-seconds | --threads | --rounds | \
       --sessions | --script | --mention | --join-issue)
@@ -255,6 +262,7 @@ while (($#)); do
         --stops) stops=$2 ;;
         --sentences) sentences=$2 ;;
         --engine) engines+=("$2") ;;
+        --model) models+=("$2") ;;
         --rig-mic) rig_mic=$2 ;;
         --issue-live) issue_live=$2 ;;
         --issue-stopped) issue_stopped=$2 ;;
@@ -277,6 +285,10 @@ while (($#)); do
       ;;
     --keep)
       keep=true
+      shift
+      ;;
+    --clip)
+      clip=true
       shift
       ;;
     --help)
@@ -367,7 +379,12 @@ case $step in
     need --stop-clip "$stop_clip" '"Wispr, stop"'
     need --rig-mic "$rig_mic" "$rig_need"
     ;;
-  tts-first-audio) ((${#engines[@]} > 0)) || engines=(gemini aura) ;;
+  tts-first-audio)
+    ((${#engines[@]} == 0)) || usage_error '--engine names a voice for scripted; tts-first-audio takes --model PROVIDER/MODEL'
+    for model in "${models[@]}"; do
+      [[ $model == ?*/?* ]] || usage_error "--model $model is not provider/model"
+    done
+    ;;
   states)
     need --phrase "$phrase" '"Wispr, start recording", spoken'
     need --speech "$speech" 'speech that is not the phrase, such as "Wispr, stop recording"'
@@ -814,6 +831,31 @@ yaml_value() {
 # setting ENV_KEY PARENT KEY: a setting as the unit resolves it: the .env's override, else the config.
 setting() {
   env_value "$1" 2>/dev/null || yaml_value "$2" "$3"
+}
+
+# provider_api NAME: the api of provider NAME in the unit's config (providers.NAME.api), read at the
+# provider's own level, from a config written one setting a line, as the template and a settings save
+# write it. It fails when the config names no such provider, or none with an api.
+provider_api() {
+  awk -v name="$1" '
+    /^[^[:space:]#]/ { inside = ($0 ~ /^providers:[[:space:]]*$/); entry_indent = ""; entry = ""; next }
+    !inside || /^[[:space:]]*(#|$)/ { next }
+    {
+      indent = match($0, /[^[:space:]]/) - 1
+      key = substr($0, indent + 1); sub(/:.*/, "", key)
+    }
+    entry_indent == "" || indent <= entry_indent { entry_indent = indent; entry = key; field_indent = ""; next }
+    entry != name { next }
+    field_indent == "" { field_indent = indent }
+    indent == field_indent && key == "api" {
+      value = substr($0, indent + 1); sub(/^[^:]*:[[:space:]]*/, "", value); found = 1
+    }
+    END {
+      sub(/[[:space:]]+#.*$/, "", value)
+      if (value ~ /^".*"$/ || value ~ /^\047.*\047$/) value = substr(value, 2, length(value) - 2)
+      if (!found || value == "") exit 1
+      print value
+    }' "$config_file" 2>/dev/null
 }
 
 # unit_command ARGS...: run the unit's binary as ghost-wispr.service runs it: in its directory, with
@@ -3019,8 +3061,9 @@ The pull request has two approvals and waits for its checks.
 EOF
 }
 
-# first_frames ENGINE [LOCATION]: run ghost-wispr tts-first-audio on the step's sentences; set
-# frames_ms to each sentence's time to its first frame and opt_outs to each mip_opt_out.
+# first_frames MODEL [--clip]: run ghost-wispr tts-first-audio on the step's sentences with MODEL,
+# streamed, or with --clip as whole clips; set frames_ms to each sentence's time to its first frame
+# and opt_outs to each mip_opt_out.
 frames_ms=()
 opt_outs=()
 first_frames() {
@@ -3032,74 +3075,62 @@ first_frames() {
     text=$(default_sentences)
   fi
   awk 'NF' <<<"$text" | awk -v n="$sentences" '{ line[NR] = $0 } END { for (i = 0; i < n; i++) print line[i % NR + 1] }' \
-    | unit_command tts-first-audio --engine "$1" ${2:+--location "$2"} >"$output" 2>"$work_dir/first-audio.err"
+    | unit_command tts-first-audio --model "$1" ${2:+"$2"} >"$output" 2>"$work_dir/first-audio.err"
   rc=$?
   subcommand_missing "$rc" "$work_dir/first-audio.err" \
     && unknown 'tts-first-audio: this build has no ghost-wispr tts-first-audio, which times the text to the first frame'
-  ((rc == 0)) || fail "tts-first-audio $1${2:+ ($2)}: ghost-wispr tts-first-audio exited $rc: $(head -c 300 "$work_dir/first-audio.err" | tr '\n' ' ')"
+  ((rc == 0)) || fail "tts-first-audio $1${2:+ $2}: ghost-wispr tts-first-audio exited $rc: $(head -c 300 "$work_dir/first-audio.err" | tr '\n' ' ')"
   mapfile -t frames_ms < <(jq -r 'select(.ms_to_first_frame | numbers) | .ms_to_first_frame | floor' "$output" 2>/dev/null)
   mapfile -t opt_outs < <(jq -r 'select(.ms_to_first_frame | numbers) | .mip_opt_out | tostring' "$output" 2>/dev/null)
   ((${#frames_ms[@]} == sentences)) \
-    || unknown "tts-first-audio $1${2:+ ($2)}: read ${#frames_ms[@]} first-frame times for $sentences sentences"
+    || unknown "tts-first-audio $1${2:+ $2}: read ${#frames_ms[@]} first-frame times for $sentences sentences"
 }
 
-# step_tts_first_audio: verification c-voice-tts. Gemini runs at both locations, reported apart;
-# the bound holds at the location the unit uses. gemini-clip is today's whole-clip provider: the
-# control, whose median must be at least 3 times streaming Gemini's.
+# step_tts_first_audio: verification c-voice-tts. Each --model (by default the unit's tts.model)
+# streams the sentences, reported apart, and must reach its first frame within the bound; the same
+# model at a provider in each Vertex AI location compares the locations. A model whose provider
+# speaks the Deepgram API (Aura) must also send mip_opt_out=true on every request. --clip adds the
+# control: the unit's tts.model as whole clips, as POST /api/tts/speak gets it, whose median must be
+# at least 3 times its stream's.
 step_tts_first_audio() {
-  local engine location unit_location median gemini_median='' clip_median='' other
-  unit_location=$(setting GHOST_WISPR_VOICE_TTS_LOCATION voice tts_location) || unit_location=us
-  for engine in "${engines[@]}"; do
-    [[ $engine == aura2 ]] && engine=aura
-    case $engine in
-      gemini)
-        for location in us global; do
-          first_frames gemini "$location"
-          median=$(percentile 50 "${frames_ms[@]}")
-          if [[ $location == "$unit_location" ]]; then
-            gemini_median=$median
-            if ((median <= first_frame_median_ms)); then
-              pass "tts-first-audio gemini ($location, the unit's location): median $median ms to the first frame, at most $first_frame_median_ms ms"
-            else
-              printf 'FAIL: tts-first-audio gemini (%s, the unit'\''s location): median %s ms to the first frame, more than %s ms\n' "$location" "$median" "$first_frame_median_ms"
-              step_failed=true
-            fi
-          else
-            note "tts-first-audio gemini ($location): median $median ms to the first frame"
-          fi
-        done
-        ;;
-      aura)
-        first_frames aura
-        median=$(percentile 50 "${frames_ms[@]}")
-        if ((median <= first_frame_median_ms)); then
-          pass "tts-first-audio aura: median $median ms to the first frame, at most $first_frame_median_ms ms"
-        else
-          printf 'FAIL: tts-first-audio aura: median %s ms to the first frame, more than %s ms\n' "$median" "$first_frame_median_ms"
-          step_failed=true
-        fi
-        other=$(printf '%s\n' "${opt_outs[@]}" | grep -cvx true)
-        if ((other == 0)); then
-          pass "tts-first-audio aura: mip_opt_out=true on all $sentences requests"
-        else
-          printf 'FAIL: tts-first-audio aura: %s of %s requests did not carry mip_opt_out=true\n' "$other" "$sentences"
-          step_failed=true
-        fi
-        ;;
-      gemini-clip)
-        first_frames gemini-clip
-        clip_median=$(percentile 50 "${frames_ms[@]}")
-        note "tts-first-audio gemini-clip (today's whole-clip provider): median $clip_median ms to the first frame"
-        ;;
-      *) unknown "tts-first-audio: no such engine: $engine (gemini, aura2, aura, gemini-clip)" ;;
-    esac
+  local model unit_model label wire_api median streamed_median='' clip_median='' other
+  unit_model=$(setting GHOST_WISPR_TTS_MODEL tts model) && [[ -n $unit_model ]] \
+    || unknown 'tts-first-audio: the unit names no text-to-speech model (tts.model or GHOST_WISPR_TTS_MODEL)'
+  ((${#models[@]} > 0)) || models=("$unit_model")
+  for model in "${models[@]}"; do
+    wire_api=$(provider_api "${model%%/*}") \
+      || unknown "tts-first-audio $model: the unit's config names no provider ${model%%/*} with an api (providers.${model%%/*}.api)"
+    first_frames "$model"
+    median=$(percentile 50 "${frames_ms[@]}")
+    label=$model
+    if [[ $model == "$unit_model" ]]; then
+      streamed_median=$median
+      label+=" (the unit's tts.model)"
+    fi
+    if ((median <= first_frame_median_ms)); then
+      pass "tts-first-audio $label: median $median ms to the first frame, at most $first_frame_median_ms ms"
+    else
+      printf 'FAIL: tts-first-audio %s: median %s ms to the first frame, more than %s ms\n' "$label" "$median" "$first_frame_median_ms"
+      step_failed=true
+    fi
+    [[ $wire_api == deepgram ]] || continue
+    other=$(printf '%s\n' "${opt_outs[@]}" | grep -cvx true)
+    if ((other == 0)); then
+      pass "tts-first-audio $model: mip_opt_out=true on all $sentences requests"
+    else
+      printf 'FAIL: tts-first-audio %s: %s of %s requests did not carry mip_opt_out=true\n' "$model" "$other" "$sentences"
+      step_failed=true
+    fi
   done
-  [[ -n $clip_median ]] || return 0
-  [[ -n $gemini_median ]] || unknown 'tts-first-audio: the gemini-clip control needs --engine gemini in the same run'
-  if ((clip_median >= clip_ratio_min * gemini_median)); then
-    pass "tts-first-audio control: gemini-clip's median $clip_median ms is at least $clip_ratio_min times streaming Gemini's $gemini_median ms"
+  [[ $clip == true ]] || return 0
+  [[ -n $streamed_median ]] || unknown "tts-first-audio: the --clip control needs the unit's tts.model ($unit_model) among the --model models"
+  first_frames "$unit_model" --clip
+  clip_median=$(percentile 50 "${frames_ms[@]}")
+  if ((clip_median >= clip_ratio_min * streamed_median)); then
+    pass "tts-first-audio control: $unit_model's whole clip, median $clip_median ms, takes at least $clip_ratio_min times its stream's $streamed_median ms"
   else
-    printf 'FAIL: tts-first-audio control: gemini-clip'\''s median %s ms is less than %s times streaming Gemini'\''s %s ms: the step does not see the first frame\n' "$clip_median" "$clip_ratio_min" "$gemini_median"
+    printf 'FAIL: tts-first-audio control: %s'\''s whole clip, median %s ms, takes less than %s times its stream'\''s %s ms: the step does not see the first frame\n' \
+      "$unit_model" "$clip_median" "$clip_ratio_min" "$streamed_median"
     step_failed=true
   fi
 }

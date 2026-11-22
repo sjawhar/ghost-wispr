@@ -49,10 +49,11 @@ func TestADocumentChangeSendsASyncedSessionBackToSync(t *testing.T) {
 			return store.UpdateSummaryAtGeneration(id, "Standup", "The summary, made again.", SummaryCompleted, "default", "{}", "", 0)
 		}, true},
 		{"summary started again", func(_ *testing.T, store *SQLiteStore, id string) error {
-			return store.StartSummary(id)
+			_, err := store.StartSummary(id)
+			return err
 		}, false},
 		{"summary made again failed", func(t *testing.T, store *SQLiteStore, id string) error {
-			if err := store.StartSummary(id); err != nil {
+			if _, err := store.StartSummary(id); err != nil {
 				t.Fatalf("StartSummary: %v", err)
 			}
 			_, err := store.FailSummaryAtGeneration(id, "summarization failed", 0)

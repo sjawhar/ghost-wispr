@@ -8,6 +8,8 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/sjawhar/ghost-wispr/internal/config"
 )
 
 // plantedWord stands for a meeting's words in the requests these tests send.
@@ -31,7 +33,7 @@ func TestAProviderErrorDoesNotQuoteTheRequest(t *testing.T) {
 				return fmt.Sprintf(`{"error":{"message":%q,"type":"invalid_request_error","code":"bad_content"}}`, "Invalid content: "+request)
 			},
 			client: func(t *testing.T, url string) Client {
-				c, err := NewClient("openai", "test-key", "gpt-test", WithBaseURL(url+"/v1"))
+				c, err := NewClient(keyProvider(t, config.APIOpenAI, url+"/v1"), "gpt-test")
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -44,7 +46,7 @@ func TestAProviderErrorDoesNotQuoteTheRequest(t *testing.T) {
 				return fmt.Sprintf(`{"type":"error","error":{"type":"invalid_request_error","message":%q}}`, "Invalid content: "+request)
 			},
 			client: func(t *testing.T, url string) Client {
-				c, err := NewClient("anthropic", "test-key", "claude-test", WithBaseURL(url))
+				c, err := NewClient(keyProvider(t, config.APIAnthropic, url), "claude-test")
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -57,7 +59,7 @@ func TestAProviderErrorDoesNotQuoteTheRequest(t *testing.T) {
 				return fmt.Sprintf(`{"error":{"code":400,"message":%q,"status":"INVALID_ARGUMENT"}}`, "Invalid content: "+request)
 			},
 			client: func(t *testing.T, url string) Client {
-				c, err := NewClient("gemini", "test-key", "gemini-test", WithBaseURL(url))
+				c, err := NewClient(keyProvider(t, config.APIGemini, url), "gemini-test")
 				if err != nil {
 					t.Fatal(err)
 				}

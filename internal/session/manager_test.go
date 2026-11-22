@@ -31,8 +31,10 @@ type storeMock struct {
 	summary       map[string]string
 	status        map[string]string
 	summaryStatus map[string]string
-	preset        map[string]string
-	audio         map[string]string
+	// summaryAttempts counts each session's summary starts, as summary_attempt does.
+	summaryAttempts map[string]int
+	preset          map[string]string
+	audio           map[string]string
 
 	summaryModel            map[string]string
 	refinementModel         map[string]string
@@ -151,17 +153,34 @@ func (s *storeMock) UpdateSummaryAtGeneration(sessionID, title, summary, status,
 	return nil
 }
 
-// StartSummary keeps the title and summary, as the store does.
-func (s *storeMock) StartSummary(sessionID string) error {
+// StartSummary keeps the title and summary, as the store does, and returns
+// the summary attempt it started.
+func (s *storeMock) StartSummary(sessionID string) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.summaryStatus[sessionID] = storage.SummaryRunning
-	return nil
+	if s.summaryAttempts == nil {
+		s.summaryAttempts = map[string]int{}
+	}
+	s.summaryAttempts[sessionID]++
+	return s.summaryAttempts[sessionID], nil
 }
 
 // StartEmptySummary marks the summary running, as the store does.
-func (s *storeMock) StartEmptySummary(sessionID string) error {
+func (s *storeMock) StartEmptySummary(sessionID string) (int, error) {
 	return s.StartSummary(sessionID)
+}
+
+// ReleaseSummary puts the summary back to pending while attempt is still its
+// own and running, as the store does.
+func (s *storeMock) ReleaseSummary(sessionID string, attempt int) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.summaryStatus[sessionID] != storage.SummaryRunning || s.summaryAttempts[sessionID] != attempt {
+		return false, nil
+	}
+	s.summaryStatus[sessionID] = storage.SummaryPending
+	return true, nil
 }
 
 // FailSummaryAtGeneration keeps the title and summary, and fails the summary
@@ -289,6 +308,29 @@ func (s *storeMock) Canonicalize(sessionID string) (string, int, error) {
 		s.transcriptSource[sessionID] = "streaming"
 	}
 	return s.canonicalTranscript[sessionID], s.canonicalizeGeneration[sessionID], nil
+}
+
+// CanonicalizeForSummary is Canonicalize, with the transcript a summary
+// reads: the refined text, or each live segment after its speaker's label.
+func (s *storeMock) CanonicalizeForSummary(sessionID string) (string, string, int, error) {
+	canonical, generation, err := s.Canonicalize(sessionID)
+	if err != nil {
+		return "", "", 0, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.transcriptSource[sessionID] == "refined" {
+		return canonical, canonical, generation, nil
+	}
+	var b strings.Builder
+	for i := range s.segments[sessionID] {
+		if strings.TrimSpace(s.segments[sessionID][i].Text) == "" {
+			continue
+		}
+		b.WriteString(s.segments[sessionID][i].SpeakerLine())
+		b.WriteByte('\n')
+	}
+	return canonical, b.String(), generation, nil
 }
 
 type recorderMock struct {

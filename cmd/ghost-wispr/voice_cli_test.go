@@ -2,10 +2,10 @@ package main
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
-	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -32,11 +32,24 @@ import (
 // 24 kHz, more than one whole frame.
 var firstAudioPCM = bytes.Repeat([]byte{1, 0}, 2400)
 
-// firstAudioUnit writes a unit's ghost-wispr.yaml with extra appended, and
-// sets the environment the unit's .env would: a Deepgram key, Vertex AI
-// credentials that need no network, and a Gemini API key for the
-// Concierge's model client. It returns the config's path.
+// fakeURLs are the fakes a unit's providers point at; "" is an address that
+// answers nothing.
+type fakeURLs struct{ vertex, deepgram string }
+
+// firstAudioUnit writes a unit's ghost-wispr.yaml, its providers pointing at
+// nothing, with extra appended; firstAudioUnitAt points them at fakes.
 func firstAudioUnit(t *testing.T, extra string) string {
+	t.Helper()
+	return firstAudioUnitAt(t, fakeURLs{}, extra)
+}
+
+// firstAudioUnitAt writes a unit's ghost-wispr.yaml, whose text-to-speech is
+// Gemini on Vertex AI's us multi-region with voice Kore, with Vertex AI in
+// us and global and Deepgram at the fakes, and extra appended. It sets the
+// environment the unit's .env would: a Deepgram key, Vertex AI credentials
+// that need no network, and a Gemini API key for the Concierge's model
+// client. It returns the config's path.
+func firstAudioUnitAt(t *testing.T, urls fakeURLs, extra string) string {
 	t.Helper()
 	dir := t.TempDir()
 	credentials := googleauthtest.X509CredentialFile(t, vertexTestToken)
@@ -46,12 +59,23 @@ func firstAudioUnit(t *testing.T, extra string) string {
 	t.Setenv("GCE_METADATA_HOST", "127.0.0.1:1")
 	t.Setenv("GHOST_WISPR_GOOGLE_CREDENTIALS_FILE", credentials)
 	t.Setenv("GHOST_WISPR_DEEPGRAM_API_KEY", strings.Repeat("k", 8))
-	t.Setenv("GHOST_WISPR_GENAI_BACKEND", "gemini")
-	t.Setenv("GHOST_WISPR_GEMINI_API_KEY", strings.Repeat("g", 8))
+	t.Setenv(exampleGeminiKeyEnv, strings.Repeat("g", 8))
+	t.Setenv("GHOST_WISPR_CONCIERGE_MODEL", "gemini/gemini-test")
 	t.Setenv("GHOST_WISPR_DISPATCH_TOKEN", "")
 	t.Setenv("GHOST_WISPR_CONCIERGE_DISPATCH_URL", "")
 	t.Setenv("GHOST_WISPR_CONCIERGE_ENVOY_URL", "")
-	yaml := fmt.Sprintf("db_path: %s\ngcp_project: example-project\n%s", filepath.Join(dir, "ghost-wispr.db"), extra)
+	nowhere := "http://127.0.0.1:1"
+	vertex, deepgram := cmp.Or(urls.vertex, nowhere), cmp.Or(urls.deepgram, nowhere)
+	yaml := fmt.Sprintf(`db_path: %s
+providers:
+  vertex: {api: vertex, project: example-project, location: global, url: %q, auth: {kind: google}}
+  vertex-us: {api: vertex, project: example-project, location: us, url: %q, auth: {kind: google}}
+  deepgram: {api: deepgram, url: %q, auth: {kind: api_key, env: GHOST_WISPR_DEEPGRAM_API_KEY}}
+  gemini: {api: gemini, auth: {kind: api_key, env: %s}}
+tts:
+  model: vertex-us/gemini-3.8-flash-tts
+  voice: Kore
+%s`, filepath.Join(dir, "ghost-wispr.db"), vertex, vertex, deepgram, exampleGeminiKeyEnv, extra)
 	path := filepath.Join(dir, "ghost-wispr.yaml")
 	if err := os.WriteFile(path, []byte(yaml), 0o600); err != nil {
 		t.Fatal(err)
@@ -175,62 +199,57 @@ func startFakeAura(t *testing.T, refuse bool) *fakeAura {
 		}
 	}))
 	t.Cleanup(srv.Close)
-	f.url = "ws" + strings.TrimPrefix(srv.URL, "http")
+	f.url = srv.URL // the provider's url; Aura dials it as ws://
 	return f
 }
 
 // TestTTSFirstAudioAuraReportsTheOptOutItsSocketCarried fails if
-// tts-first-audio on Aura (by either name) does not speak each non-empty line
-// once and print one line for it, with a positive time to the first frame,
-// or if the mip_opt_out it prints is not true while the sockets Deepgram saw
+// tts-first-audio on an Aura model does not speak each non-empty line once
+// and print one line for it, with a positive time to the first frame, or if
+// the mip_opt_out it prints is not true while the sockets Deepgram saw
 // carried mip_opt_out=true. The opt-out must come from the URL Aura dialled:
 // with the parameter dropped from Aura's request, the line says false.
 func TestTTSFirstAudioAuraReportsTheOptOutItsSocketCarried(t *testing.T) {
-	for _, engine := range []string{"aura", "aura2"} {
-		t.Run(engine, func(t *testing.T) {
-			deepgram := startFakeAura(t, false)
-			run := runFirstAudio(t, firstAudioUnit(t, ""), &voiceAOptions{deepgramBaseURL: deepgram.url},
-				"One fact.\n\nTwo facts.\n   \nThree facts.\n", "--engine", engine)
-			if run.code != 0 {
-				t.Fatalf("exit %d, stderr %q", run.code, run.stderr)
-			}
-			lines := firstAudioLines(t, run.stdout)
-			deepgram.mu.Lock()
-			defer deepgram.mu.Unlock()
-			if want := []string{"One fact.", "Two facts.", "Three facts."}; !slices.Equal(deepgram.spoken, want) {
-				t.Fatalf("Deepgram was asked to speak %q, want %q", deepgram.spoken, want)
-			}
-			if len(lines) != 3 {
-				t.Fatalf("printed %d lines for 3 sentences: %q", len(lines), run.stdout)
-			}
-			if len(deepgram.opts) == 0 {
-				t.Fatal("no socket reached Deepgram")
-			}
-			for i, opt := range deepgram.opts {
-				if !slices.Equal(opt, []string{"true"}) {
-					t.Errorf("socket %d reached Deepgram with mip_opt_out %q, want [\"true\"]", i+1, opt)
-				}
-			}
-			for i, line := range lines {
-				if line.optOut != "true" {
-					t.Errorf("sentence %d: printed mip_opt_out %s; Deepgram saw the sockets' mip_opt_out as %q; want true from the dialled URL", i+1, line.optOut, deepgram.opts)
-				}
-			}
-		})
+	deepgram := startFakeAura(t, false)
+	run := runFirstAudio(t, firstAudioUnitAt(t, fakeURLs{deepgram: deepgram.url}, ""), nil,
+		"One fact.\n\nTwo facts.\n   \nThree facts.\n", "--model", "deepgram/aura-2-thalia-en")
+	if run.code != 0 {
+		t.Fatalf("exit %d, stderr %q", run.code, run.stderr)
+	}
+	lines := firstAudioLines(t, run.stdout)
+	deepgram.mu.Lock()
+	defer deepgram.mu.Unlock()
+	if want := []string{"One fact.", "Two facts.", "Three facts."}; !slices.Equal(deepgram.spoken, want) {
+		t.Fatalf("Deepgram was asked to speak %q, want %q", deepgram.spoken, want)
+	}
+	if len(lines) != 3 {
+		t.Fatalf("printed %d lines for 3 sentences: %q", len(lines), run.stdout)
+	}
+	if len(deepgram.opts) == 0 {
+		t.Fatal("no socket reached Deepgram")
+	}
+	for i, opt := range deepgram.opts {
+		if !slices.Equal(opt, []string{"true"}) {
+			t.Errorf("socket %d reached Deepgram with mip_opt_out %q, want [\"true\"]", i+1, opt)
+		}
+	}
+	for i, line := range lines {
+		if line.optOut != "true" {
+			t.Errorf("sentence %d: printed mip_opt_out %s; Deepgram saw the sockets' mip_opt_out as %q; want true from the dialled URL", i+1, line.optOut, deepgram.opts)
+		}
 	}
 }
 
-// fakeVertex is Vertex AI for both Gemini engines. A stream sends one event
-// of audio, then holds the rest for hold, or ends with none when silent; a
-// whole clip answers after clipDelay. It keeps each request's path.
+// fakeVertex is Vertex AI's streaming Gemini TTS. A stream sends one event of
+// audio, then holds the rest for hold, or ends with none when silent. It
+// keeps each request's path.
 type fakeVertex struct {
-	url       string
-	hold      time.Duration
-	clipDelay time.Duration
-	status    int  // a refusal of every speech request, when not 0
-	silent    bool // a stream that ends with no audio
-	mu        sync.Mutex
-	paths     []string
+	url    string
+	hold   time.Duration
+	status int  // a refusal of every speech request, when not 0
+	silent bool // a stream that ends with no audio
+	mu     sync.Mutex
+	paths  []string
 }
 
 func startFakeVertex(t *testing.T, f *fakeVertex) *fakeVertex {
@@ -267,12 +286,6 @@ func startFakeVertex(t *testing.T, f *fakeVertex) *fakeVertex {
 				return
 			}
 			_, _ = fmt.Fprint(w, event(firstAudioPCM))
-		case strings.HasSuffix(r.URL.Path, ":generateContent"):
-			time.Sleep(f.clipDelay)
-			w.Header().Set("Content-Type", "application/json")
-			_ = json.NewEncoder(w).Encode(map[string]any{"candidates": []any{map[string]any{"content": map[string]any{"parts": []any{
-				map[string]any{"inlineData": map[string]any{"data": base64.StdEncoding.EncodeToString(wavOf(firstAudioPCM))}},
-			}}}}})
 		default:
 			http.NotFound(w, r)
 		}
@@ -288,45 +301,24 @@ func (f *fakeVertex) requested() []string {
 	return slices.Clone(f.paths)
 }
 
-// wavOf is pcm, PCM16 mono at 24 kHz, in a WAV container, as Gemini's
-// generateContent answers.
-func wavOf(pcm []byte) []byte {
-	var b bytes.Buffer
-	le := func(v any) { _ = binary.Write(&b, binary.LittleEndian, v) }
-	b.WriteString("RIFF")
-	le(uint32(36 + len(pcm)))
-	b.WriteString("WAVEfmt ")
-	le(uint32(16))
-	le(uint16(1))
-	le(uint16(1))
-	le(uint32(24000))
-	le(uint32(48000))
-	le(uint16(2))
-	le(uint16(16))
-	b.WriteString("data")
-	le(uint32(len(pcm)))
-	b.Write(pcm)
-	return b.Bytes()
-}
-
-// TestTTSFirstAudioGeminiTimesTheFirstFrameAtTheLocationAsked fails if
-// tts-first-audio on streaming Gemini does not stream from voice.tts_location,
-// or from --location when given, times each sentence to the end of its stream
-// instead of its first frame, or prints a mip_opt_out other than null.
-func TestTTSFirstAudioGeminiTimesTheFirstFrameAtTheLocationAsked(t *testing.T) {
+// TestTTSFirstAudioGeminiTimesTheFirstFrameAtTheModelsLocation fails if
+// tts-first-audio on streaming Gemini does not stream from the location of
+// the provider the model names (tts.model's when --model names none), times
+// each sentence to the end of its stream instead of its first frame, or
+// prints a mip_opt_out other than null.
+func TestTTSFirstAudioGeminiTimesTheFirstFrameAtTheModelsLocation(t *testing.T) {
 	const hold = 600 * time.Millisecond
 	for _, tc := range []struct {
 		name     string
 		args     []string
 		location string
 	}{
-		{"the unit's location", nil, "eu"},
-		{"--location", []string{"--location", "global"}, "global"},
+		{"the unit's model", nil, "us"},
+		{"--model on another location", []string{"--model", "vertex/gemini-3.8-flash-tts"}, "global"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			vertex := startFakeVertex(t, &fakeVertex{hold: hold})
-			run := runFirstAudio(t, firstAudioUnit(t, "voice:\n  tts_location: eu\n"), &voiceAOptions{vertexBaseURL: vertex.url},
-				"One fact.\nTwo facts.\n", append([]string{"--engine", "gemini"}, tc.args...)...)
+			run := runFirstAudio(t, firstAudioUnitAt(t, fakeURLs{vertex: vertex.url}, ""), nil, "One fact.\nTwo facts.\n", tc.args...)
 			if run.code != 0 {
 				t.Fatalf("exit %d, stderr %q", run.code, run.stderr)
 			}
@@ -350,14 +342,14 @@ func TestTTSFirstAudioGeminiTimesTheFirstFrameAtTheLocationAsked(t *testing.T) {
 	}
 }
 
-// TestTTSFirstAudioGeminiClipTimesTheWholeClip fails if tts-first-audio on
-// gemini-clip does not use today's whole-clip provider (generateContent at
-// the global location), times a sentence before its whole clip came, or
-// prints a mip_opt_out other than null.
-func TestTTSFirstAudioGeminiClipTimesTheWholeClip(t *testing.T) {
-	const delay = 150 * time.Millisecond
-	vertex := startFakeVertex(t, &fakeVertex{clipDelay: delay})
-	run := runFirstAudio(t, firstAudioUnit(t, ""), &voiceAOptions{vertexBaseURL: vertex.url}, "One fact.\nTwo facts.\n", "--engine", "gemini-clip")
+// TestTTSFirstAudioClipTimesTheWholeClip fails if tts-first-audio --clip does
+// not speak through POST /api/tts/speak's provider, which takes the whole
+// stream before it plays, so it times a sentence before its whole clip came,
+// or prints a mip_opt_out other than null for Gemini.
+func TestTTSFirstAudioClipTimesTheWholeClip(t *testing.T) {
+	const hold = 150 * time.Millisecond
+	vertex := startFakeVertex(t, &fakeVertex{hold: hold})
+	run := runFirstAudio(t, firstAudioUnitAt(t, fakeURLs{vertex: vertex.url}, ""), nil, "One fact.\nTwo facts.\n", "--clip")
 	if run.code != 0 {
 		t.Fatalf("exit %d, stderr %q", run.code, run.stderr)
 	}
@@ -369,85 +361,67 @@ func TestTTSFirstAudioGeminiClipTimesTheWholeClip(t *testing.T) {
 		if line.optOut != "null" {
 			t.Errorf("sentence %d: mip_opt_out %s, want null for Gemini", i+1, line.optOut)
 		}
-		if line.ms < float64(delay/time.Millisecond) {
-			t.Errorf("sentence %d: %.1f ms, less than the %v Vertex AI took to answer the clip", i+1, line.ms, delay)
+		if line.ms < float64(hold/time.Millisecond) {
+			t.Errorf("sentence %d: %.1f ms, less than the %v Vertex AI held the rest of the clip", i+1, line.ms, hold)
 		}
-	}
-	want := "/v1/projects/example-project/locations/global/publishers/google/models/gemini-3.8-flash-tts:generateContent"
-	if paths := vertex.requested(); len(paths) != 2 || paths[0] != want || paths[1] != want {
-		t.Fatalf("Vertex AI was asked on %q, want %q twice", paths, want)
 	}
 }
 
-// TestTTSFirstAudioGivesNoEngineAnotherEnginesVoice fails if tts-first-audio
-// asks an engine for the model or voice the unit configures for the other
-// one: a unit's Aura voice is no Gemini model, nor its Gemini voice an Aura
-// model, and the step runs both engines on one unit.
-func TestTTSFirstAudioGivesNoEngineAnotherEnginesVoice(t *testing.T) {
-	t.Run("gemini on a unit whose voice is Aura", func(t *testing.T) {
-		vertex := startFakeVertex(t, &fakeVertex{})
-		run := runFirstAudio(t, firstAudioUnit(t, "voice:\n  tts_engine: aura\n  tts_model: aura-2-thalia-en\n"), &voiceAOptions{vertexBaseURL: vertex.url}, "One fact.\n", "--engine", "gemini")
-		if run.code != 0 {
-			t.Fatalf("exit %d, stderr %q", run.code, run.stderr)
+// TestTTSFirstAudioGivesAnotherModelItsOwnVoice fails if tts-first-audio on a
+// --model other than tts.model speaks in tts.voice, which belongs to the
+// unit's own model: the unit's Gemini voice Kore is no Aura model.
+func TestTTSFirstAudioGivesAnotherModelItsOwnVoice(t *testing.T) {
+	var mu sync.Mutex
+	var models []string
+	upgrader := websocket.Upgrader{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		models = append(models, r.URL.Query().Get("model"))
+		mu.Unlock()
+		ws, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
 		}
-		if paths := vertex.requested(); len(paths) != 1 || !strings.Contains(paths[0], "/models/gemini-3.8-flash-tts:") {
-			t.Fatalf("Vertex AI was asked on %q, want Gemini's default model", paths)
-		}
-	})
-	t.Run("aura on a unit whose voice is Gemini", func(t *testing.T) {
-		var mu sync.Mutex
-		var models []string
-		upgrader := websocket.Upgrader{}
-		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			mu.Lock()
-			models = append(models, r.URL.Query().Get("model"))
-			mu.Unlock()
-			ws, err := upgrader.Upgrade(w, r, nil)
-			if err != nil {
+		defer func() { _ = ws.Close() }()
+		for {
+			_, data, err := ws.ReadMessage()
+			if err != nil || bytes.Contains(data, []byte(`"Close"`)) {
 				return
 			}
-			defer func() { _ = ws.Close() }()
-			for {
-				_, data, err := ws.ReadMessage()
-				if err != nil || bytes.Contains(data, []byte(`"Close"`)) {
-					return
-				}
-				if bytes.Contains(data, []byte(`"Flush"`)) {
-					_ = ws.WriteMessage(websocket.BinaryMessage, firstAudioPCM)
-					_ = ws.WriteMessage(websocket.TextMessage, []byte(`{"type":"Flushed","sequence_id":0}`))
-				}
+			if bytes.Contains(data, []byte(`"Flush"`)) {
+				_ = ws.WriteMessage(websocket.BinaryMessage, firstAudioPCM)
+				_ = ws.WriteMessage(websocket.TextMessage, []byte(`{"type":"Flushed","sequence_id":0}`))
 			}
-		}))
-		t.Cleanup(srv.Close)
-		run := runFirstAudio(t, firstAudioUnit(t, "voice:\n  tts_engine: gemini\n  tts_voice: Kore\n  tts_model: gemini-3.8-flash-tts\n"),
-			&voiceAOptions{deepgramBaseURL: "ws" + strings.TrimPrefix(srv.URL, "http")}, "One fact.\n", "--engine", "aura")
-		if run.code != 0 {
-			t.Fatalf("exit %d, stderr %q", run.code, run.stderr)
 		}
-		mu.Lock()
-		defer mu.Unlock()
-		if !slices.Equal(models, []string{"aura-2-harmonia-en"}) {
-			t.Fatalf("Deepgram was asked for models %q, want Aura's default", models)
-		}
-	})
+	}))
+	t.Cleanup(srv.Close)
+	run := runFirstAudio(t, firstAudioUnitAt(t, fakeURLs{deepgram: srv.URL}, ""), nil, "One fact.\n", "--model", "deepgram/aura-2-harmonia-en")
+	if run.code != 0 {
+		t.Fatalf("exit %d, stderr %q", run.code, run.stderr)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(models) == 0 || !slices.Equal(slices.Compact(models), []string{"aura-2-harmonia-en"}) {
+		t.Fatalf("Deepgram was asked for models %q, want the model --model names and not the unit's voice", models)
+	}
 }
 
 // TestTTSFirstAudioEngineErrorExitsNonzero fails if an engine that refuses
 // the unit leaves tts-first-audio exiting 0, or without the engine's error
-// on stderr: each Gemini engine names Vertex AI's status and not its
-// message, which can quote the text spoken.
+// on stderr: Gemini names Vertex AI's status and not its message, which can
+// quote the text spoken.
 func TestTTSFirstAudioEngineErrorExitsNonzero(t *testing.T) {
 	t.Run("aura", func(t *testing.T) {
 		deepgram := startFakeAura(t, true)
-		run := runFirstAudio(t, firstAudioUnit(t, ""), &voiceAOptions{deepgramBaseURL: deepgram.url}, "One fact.\n", "--engine", "aura")
+		run := runFirstAudio(t, firstAudioUnitAt(t, fakeURLs{deepgram: deepgram.url}, ""), nil, "One fact.\n", "--model", "deepgram/aura-2-thalia-en")
 		if run.code == 0 || !strings.Contains(run.stderr, "401") || run.stdout != "" {
 			t.Fatalf("exit %d, stdout %q, stderr %q; want nonzero, nothing printed, and Deepgram's 401 on stderr", run.code, run.stdout, run.stderr)
 		}
 	})
-	for _, engine := range []string{"gemini", "gemini-clip"} {
-		t.Run(engine, func(t *testing.T) {
+	for name, args := range map[string][]string{"gemini": nil, "gemini --clip": {"--clip"}} {
+		t.Run(name, func(t *testing.T) {
 			vertex := startFakeVertex(t, &fakeVertex{status: http.StatusForbidden})
-			run := runFirstAudio(t, firstAudioUnit(t, ""), &voiceAOptions{vertexBaseURL: vertex.url}, "One fact.\n", "--engine", engine)
+			run := runFirstAudio(t, firstAudioUnitAt(t, fakeURLs{vertex: vertex.url}, ""), nil, "One fact.\n", args...)
 			if run.code == 0 || !strings.Contains(run.stderr, "HTTP 403") || strings.Contains(run.stderr, "permission denied") || run.stdout != "" {
 				t.Fatalf("exit %d, stdout %q, stderr %q; want nonzero, nothing printed, and HTTP 403 without Vertex AI's message on stderr", run.code, run.stdout, run.stderr)
 			}
@@ -459,14 +433,14 @@ func TestTTSFirstAudioEngineErrorExitsNonzero(t *testing.T) {
 // the engine answers with no audio leaves tts-first-audio exiting 0, or
 // waiting seconds before it says so: voice A's Say returns once the text's
 // first frame is queued, or once the text ended with none. The engine can say
-// `stream returned no audio` before the timer sees its empty sink, or the
-// timer can say `the engine gave no audio`; both tell the caller the required
-// fact and neither prints a result line.
+// it returned no audio before the timer sees its empty sink, or the timer can
+// say `the engine gave no audio`; both tell the caller the required fact and
+// neither prints a result line.
 func TestTTSFirstAudioAnEngineWithNoAudioExitsNonzeroAtOnce(t *testing.T) {
 	vertex := startFakeVertex(t, &fakeVertex{silent: true})
-	unit := firstAudioUnit(t, "")
+	unit := firstAudioUnitAt(t, fakeURLs{vertex: vertex.url}, "")
 	start := time.Now()
-	run := runFirstAudio(t, unit, &voiceAOptions{vertexBaseURL: vertex.url}, "One fact.\n", "--engine", "gemini")
+	run := runFirstAudio(t, unit, nil, "One fact.\n")
 	took := time.Since(start)
 	if run.code == 0 || !strings.Contains(run.stderr, "no audio") || run.stdout != "" {
 		t.Fatalf("exit %d, stdout %q, stderr %q; want nonzero, nothing printed, and no audio on stderr", run.code, run.stdout, run.stderr)
@@ -481,15 +455,25 @@ func TestTTSFirstAudioAnEngineWithNoAudioExitsNonzeroAtOnce(t *testing.T) {
 // accept-voice.sh reads as a build without the subcommand.
 func TestTTSFirstAudioUsage(t *testing.T) {
 	configPath := firstAudioUnit(t, "")
-	for name, args := range map[string][]string{
-		"no engine":               nil,
-		"unknown engine":          {"--engine", "speakwell"},
-		"a location for aura":     {"--engine", "aura", "--location", "global"},
-		"an argument left over":   {"--engine", "gemini", "extra"},
-		"--engine without a name": {"--engine"},
+	noModel := firstAudioUnit(t, "")
+	data, err := os.ReadFile(noModel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(noModel, []byte(strings.Replace(string(data), "model: vertex-us/gemini-3.8-flash-tts", `model: ""`, 1)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for name, c := range map[string]struct {
+		config string
+		args   []string
+	}{
+		"the old --engine":       {configPath, []string{"--engine", "aura"}},
+		"an argument left over":  {configPath, []string{"extra"}},
+		"--model without a name": {configPath, []string{"--model"}},
+		"no model anywhere":      {noModel, nil},
 	} {
 		t.Run(name, func(t *testing.T) {
-			run := runFirstAudio(t, configPath, nil, "One fact.\n", args...)
+			run := runFirstAudio(t, c.config, nil, "One fact.\n", c.args...)
 			if run.code != 2 || !strings.Contains(run.stderr, "usage: ghost-wispr tts-first-audio") || strings.Contains(run.stderr, "light-off") || run.stdout != "" {
 				t.Fatalf("exit %d, stdout %q, stderr %q; want 2 and the usage", run.code, run.stdout, run.stderr)
 			}

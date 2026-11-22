@@ -8,7 +8,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/sjawhar/ghost-wispr/internal/genaiconfig"
 	"github.com/sjawhar/ghost-wispr/internal/storage"
 )
 
@@ -78,7 +77,7 @@ func TestLiveEarCorpus(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
-	generator, err := NewGenerator(ctx, &genaiconfig.Options{Backend: genaiconfig.BackendVertex, Project: project, Location: location})
+	generator, err := NewGenerator(ctx, liveVertex(t, project, location))
 	if err != nil {
 		t.Fatal(err)
 	}

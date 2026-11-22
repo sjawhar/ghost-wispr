@@ -315,7 +315,7 @@ func TestSummaryVersionIncrements(t *testing.T) {
 	}
 
 	// The first summary keeps version 1.
-	if err := store.StartSummary(sessionID); err != nil {
+	if _, err := store.StartSummary(sessionID); err != nil {
 		t.Fatalf("StartSummary first: %v", err)
 	}
 	if err := store.UpdateSummaryAtGeneration(sessionID, "First", "First summary", SummaryCompleted, "default", "{}", "", 0); err != nil {
@@ -326,7 +326,7 @@ func TestSummaryVersionIncrements(t *testing.T) {
 	}
 
 	// A regeneration through StartSummary bumps it once.
-	if err := store.StartSummary(sessionID); err != nil {
+	if _, err := store.StartSummary(sessionID); err != nil {
 		t.Fatalf("StartSummary regenerated: %v", err)
 	}
 	if err := store.UpdateSummaryAtGeneration(sessionID, "Corrected", "Corrected summary", SummaryCompleted, "default", "{}", "", 0); err != nil {
@@ -1471,7 +1471,7 @@ func TestStartSummaryResetsEnvoyPublishStatus(t *testing.T) {
 		t.Fatalf("update envoy publish status: %v", err)
 	}
 
-	if err := store.StartSummary(sessionID); err != nil {
+	if _, err := store.StartSummary(sessionID); err != nil {
 		t.Fatalf("start summary: %v", err)
 	}
 

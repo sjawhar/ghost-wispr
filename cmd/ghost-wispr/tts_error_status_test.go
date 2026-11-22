@@ -13,6 +13,8 @@ import (
 
 	"cloud.google.com/go/auth"
 
+	"github.com/sjawhar/ghost-wispr/internal/config"
+	"github.com/sjawhar/ghost-wispr/internal/providers"
 	"github.com/sjawhar/ghost-wispr/internal/server"
 	"github.com/sjawhar/ghost-wispr/internal/tts"
 )
@@ -29,8 +31,8 @@ func (ttsTestToken) Token(context.Context) (*auth.Token, error) {
 // status and code, and no word of its message.
 func TestASpeechErrorShowsNoRoomWord(t *testing.T) {
 	const planted = "quokkaplantedroomword"
-	for _, name := range []string{"gemini", "google", "elevenlabs"} {
-		t.Run(name, func(t *testing.T) {
+	for _, api := range []string{config.APIVertex, config.APIGoogleTTS, config.APIElevenLabs} {
+		t.Run(api, func(t *testing.T) {
 			keepDefaultLogger(t)
 			_, sink := startAppLogger(appLogConfigStore(t), io.Discard) // the app's logger, as main builds it
 			quoted := 0
@@ -44,22 +46,25 @@ func TestASpeechErrorShowsNoRoomWord(t *testing.T) {
 				_, _ = fmt.Fprintf(w, `{"error":{"code":400,"status":"INVALID_ARGUMENT","message":"Rejected token %s"},"detail":{"status":"invalid_text","message":"Rejected token %s"}}`, planted, planted)
 			}))
 			t.Cleanup(fake.Close)
-			var p tts.Provider
-			var err error
-			switch name {
-			case "gemini":
-				p, err = tts.NewGeminiProvider("project", "model", "Kore", tts.WithGeminiAuthCredentials(auth.NewCredentials(&auth.CredentialsOptions{TokenProvider: ttsTestToken{}})), tts.WithGeminiBaseURL(fake.URL))
-			case "google":
-				p, err = tts.NewGoogleProvider("test-key", "voice", tts.WithGoogleBaseURL(fake.URL))
-			case "elevenlabs":
-				p, err = tts.NewElevenLabsProvider("test-key", "voice", tts.WithElevenLabsBaseURL(fake.URL))
+			entry := config.Provider{API: api, URL: fake.URL, Auth: config.ProviderAuth{Kind: config.AuthAPIKey, Env: "EXAMPLE_TTS_KEY"}}
+			if api == config.APIVertex {
+				entry.Project, entry.Auth = "project", config.ProviderAuth{Kind: config.AuthGoogle}
 			}
+			cfg := &config.Config{Providers: map[string]config.Provider{"speech": entry}, ProviderKeys: map[string]string{"EXAMPLE_TTS_KEY": "k-1"}}
+			set := providers.New(cfg, providers.Options{GoogleCredentials: func(context.Context, string, ...string) (*auth.Credentials, error) {
+				return auth.NewCredentials(&auth.CredentialsOptions{TokenProvider: ttsTestToken{}}), nil
+			}})
+			speech, err := set.Get("speech")
+			if err != nil {
+				t.Fatal(err)
+			}
+			p, err := tts.NewEngineProvider(speech, "model", "voice", 0)
 			if err != nil {
 				t.Fatal(err)
 			}
 			o := tts.NewOrchestrator(p, nil, tts.OrchestratorOpts{})
 			t.Cleanup(o.Stop)
-			id, err := o.Speak("We agreed on "+planted+" today.", "", "")
+			id, err := o.Speak("We agreed on "+planted+" today.", "")
 			if err != nil {
 				t.Fatal(err)
 			}
