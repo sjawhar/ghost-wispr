@@ -318,37 +318,14 @@ describe('SettingsPage', () => {
     },
   )
 
-  it('takes a config from another run of the unit, as after a restart', () => {
-    setConfig({ ...config, silence_timeout: '45s', revision: { run: 'run-1', count: 9 } })
-    setConfig({ ...config, silence_timeout: '50s', revision: { run: 'run-2', count: 0 } })
-
-    expect(configState.config?.silence_timeout).toBe('50s')
-  })
-
-  // A run the page has seen replaced is over: an answer from it that lands
-  // later holds a state from before the restart, whatever its count.
-  it('drops a late answer from a run of the unit it has seen replaced', () => {
-    setConfig({ ...config, silence_timeout: '45s', revision: { run: 'run-A', count: 9 } })
-    setConfig({ ...config, silence_timeout: '50s', revision: { run: 'run-B', count: 1 } })
-    setConfig({ ...config, silence_timeout: '45s', revision: { run: 'run-A', count: 10 } })
-
-    expect(configState.config?.silence_timeout).toBe('50s')
-    expect(configState.config?.revision).toEqual({ run: 'run-B', count: 1 })
-  })
-
-  it('drops a late answer from the new run with a lower count', () => {
-    setConfig({ ...config, silence_timeout: '45s', revision: { run: 'run-A', count: 9 } })
-    setConfig({ ...config, silence_timeout: '50s', revision: { run: 'run-B', count: 3 } })
-    setConfig({ ...config, silence_timeout: '47s', revision: { run: 'run-B', count: 1 } })
-
-    expect(configState.config?.silence_timeout).toBe('50s')
-  })
-
-  // Sol's case: a General save sent to run A is held; the unit restarts as
-  // run B, and a voice save of Puck lands there; then A's answer, holding
-  // voice Kore, lands. The voice field must keep Puck.
-  it('keeps a save made after a restart when the old run answers late', async () => {
-    const answers: ((answer: Response) => void)[] = []
+  // A fake unit for SettingsPage: a GET answers with the state the unit holds
+  // now (`unit.current`); each PATCH waits until the test answers it.
+  function fakeUnit(start: ConfigResponse) {
+    const unit = {
+      current: start,
+      patches: [] as ((answer: ConfigResponse) => void)[],
+      reads: 0,
+    }
     vi.stubGlobal(
       'fetch',
       vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
@@ -357,13 +334,23 @@ describe('SettingsPage', () => {
         }
         if (init?.method === 'PATCH') {
           // The app's TypeScript library, ES2022, has no Promise.withResolvers.
-          return new Promise<Response>((resolve) => answers.push(resolve))
+          return new Promise<Response>((resolve) =>
+            unit.patches.push((answer) => resolve(new Response(JSON.stringify(answer)))),
+          )
         }
-        return Promise.resolve(
-          new Response(JSON.stringify({ ...config, revision: { run: 'run-A', count: 9 } })),
-        )
+        unit.reads++
+        return Promise.resolve(new Response(JSON.stringify(unit.current)))
       }),
     )
+    return unit
+  }
+
+  // Sol's case: a General save sent to run A is held; the unit restarts as
+  // run B, and a voice save of Puck lands there; then A's answer, holding
+  // voice Kore, lands. The page reads the config again on each answer from
+  // another run, and the live run B answers: the voice field keeps Puck.
+  it('keeps a save made after a restart when the old run answers late', async () => {
+    const unit = fakeUnit({ ...config, revision: { run: 'run-A', count: 9 } })
     render(SettingsPage, { onBack: () => {} })
     const general = await screen.findByTestId('general-settings')
     const voice = screen.getByTestId('voice-settings')
@@ -376,34 +363,61 @@ describe('SettingsPage', () => {
       target: { value: 'Puck' },
     })
     await fireEvent.click(within(voice).getByRole('button', { name: 'Save' }))
-    expect(answers).toHaveLength(2)
+    expect(unit.patches).toHaveLength(2)
 
-    answers[1](
-      new Response(
-        JSON.stringify({
-          ...config,
-          tts: { ...config.tts, voice: 'Puck' },
-          revision: { run: 'run-B', count: 1 },
-        }),
-      ),
-    )
+    const inB = {
+      ...config,
+      silence_timeout: '45s',
+      tts: { ...config.tts, voice: 'Puck' },
+      revision: { run: 'run-B', count: 1 },
+    }
+    unit.current = inB
+    unit.patches[1](inB)
     expect(await within(voice).findByText('Saved!')).toBeTruthy()
-    answers[0](
-      new Response(
-        JSON.stringify({
-          ...config,
-          silence_timeout: '45s',
-          tts: { ...config.tts, voice: 'Kore' },
-          revision: { run: 'run-A', count: 10 },
-        }),
-      ),
-    )
+    unit.patches[0]({
+      ...config,
+      silence_timeout: '45s',
+      tts: { ...config.tts, voice: 'Kore' },
+      revision: { run: 'run-A', count: 10 },
+    })
     expect(await within(general).findByText('Saved!')).toBeTruthy()
 
+    await waitFor(() => expect(configState.config?.revision).toEqual({ run: 'run-B', count: 1 }))
     expect((within(voice).getByLabelText('Text-to-speech voice') as HTMLInputElement).value).toBe(
       'Puck',
     )
     expect(configState.config?.tts.voice).toBe('Puck')
-    expect(configState.config?.revision).toEqual({ run: 'run-B', count: 1 })
+  })
+
+  // The unit restarts while silence is typed and not saved; a voice save is
+  // answered by the new run, and the page reads the config again. The new
+  // run holds the same silence, so the typing stays.
+  it('keeps unsaved typing through a read of the config after a restart', async () => {
+    const unit = fakeUnit({ ...config, revision: { run: 'run-A', count: 9 } })
+    render(SettingsPage, { onBack: () => {} })
+    const general = await screen.findByTestId('general-settings')
+    const voice = screen.getByTestId('voice-settings')
+    const silence = within(general).getByLabelText('Silence Timeout') as HTMLInputElement
+    const readsBefore = unit.reads
+
+    await fireEvent.input(silence, { target: { value: '41s' } })
+    await fireEvent.input(within(voice).getByLabelText('Text-to-speech voice'), {
+      target: { value: 'Puck' },
+    })
+    await fireEvent.click(within(voice).getByRole('button', { name: 'Save' }))
+    const inB = {
+      ...config,
+      tts: { ...config.tts, voice: 'Puck' },
+      revision: { run: 'run-B', count: 1 },
+    }
+    unit.current = inB
+    unit.patches[0](inB)
+
+    await waitFor(() => expect(configState.config?.revision).toEqual({ run: 'run-B', count: 1 }))
+    expect(unit.reads).toBe(readsBefore + 1)
+    expect(silence.value).toBe('41s')
+    expect((within(voice).getByLabelText('Text-to-speech voice') as HTMLInputElement).value).toBe(
+      'Puck',
+    )
   })
 })
