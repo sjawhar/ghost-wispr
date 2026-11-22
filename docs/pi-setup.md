@@ -991,21 +991,23 @@ with the unit paused and no session active:
    the recording. A read of the size that fails moves the start nowhere. When `/proc/asound` shows
    the capture substream arecord holds, every read of the size also bounds the times after it from
    below, while continuity holds: arecord reports no overrun and no suspend (it runs without `-q`,
-   so that it prints both), and each read of the size is followed by a read of the substream's
+   so that it prints both, and with `LC_ALL=C`, so that it prints them in the English the driver
+   reads whatever the caller's locale), and each read of the size is followed by a read of the substream's
    state that shows it `RUNNING`, from the `trigger_time` of the first such read. arecord may not
    live to report an overrun, as when the step stops it in a stalled write and it closes the
    substream, and the kernel sets `trigger_time` at every start, stop, suspend and resume. It is
    compared exactly, as the kernel prints it: whole seconds (no leading zero, within signed 64
    bits) and nine digits of nanoseconds. A state read that shows anything else, another trigger,
    or no `trigger_time` in that form (which can show no restart) turns this bound off for the
-   whole recording. The first `trigger_time` counts only for samples of its own run, so the read
-   of the size that first finds samples is preceded by a state read too, which must show a
-   substream never started (`trigger_time` 0, as the kernel shows it before the first start) or
-   `RUNNING` from the same trigger; and samples that land before the sampler knows arecord's
-   process, and so before it can read the state at all, turn the bound off too. A restart that
-   lands between the last read that found no sample and that state read stays unseen; it needs a
-   start, a stall past the buffer (40 ms) and a new start within it, so it needs the sampler held
-   off the CPU for that long between two of its reads 10 ms apart.
+   whole recording. The first `trigger_time` counts only for samples of its own run, so before the
+   first samples every read of the size is preceded by a state read too, and each must show no
+   substream, one never started (`trigger_time` 0, as the kernel shows it before the first start),
+   or `RUNNING` from the trigger the first anchor's read shows; and samples that land before the
+   sampler knows arecord's process, and so before it can read the state at all, turn the bound off
+   too. A restart that lands between the last read that found no sample and the state read before
+   the next stays unseen; it needs a start, a 10 ms chunk, a stall past the buffer (40 ms) and a new
+   start within it, so it needs the sampler about 40 ms late for one of its reads 10 ms apart, and
+   arecord's overrun line still turns the bound off there whenever arecord lives to print it.
    No substream at all is arecord closing its capture as it ends, which it does after its last
    write: it turns the bound off only if the file grows after it. A sample not yet in the file was
    captured at most two periods and the buffer before (61 ms with arecord's 40 ms buffer and 10 ms
