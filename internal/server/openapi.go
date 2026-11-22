@@ -1117,6 +1117,9 @@ func OpenAPISpec() map[string]any {
 						"400": map[string]any{
 							"description": "An invalid setting, such as a negative GC limit, a key for a provider that does not sign in with one, a model no provider serves, or a field the settings do not have; nothing is changed",
 						},
+						"404": map[string]any{
+							"description": "A change to a summarization preset the configuration does not hold that does not create it: a new preset names all four of its fields (description, system_prompt, user_template, model), with a user_template; anything less is an update to a preset deleted elsewhere. Nothing is changed",
+						},
 					},
 				},
 			},

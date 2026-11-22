@@ -140,6 +140,16 @@ export interface TestPresetResponse {
   error: string
 }
 
+// ConfigRequestError is a refusal from a settings route: the unit's own words
+// and the status it answered with.
+export class ConfigRequestError extends Error {
+  status: number
+  constructor(message: string, status: number) {
+    super(message)
+    this.status = status
+  }
+}
+
 // configRequest fetches a settings route; a refusal throws the unit's own
 // words, the error of its {"error": ...} answer.
 async function configRequest<T>(input: RequestInfo | URL, init?: RequestInit): Promise<T> {
@@ -160,7 +170,7 @@ async function configRequest<T>(input: RequestInfo | URL, init?: RequestInit): P
     } catch {
       // Not JSON: the text is the refusal.
     }
-    throw new Error(message || `request failed: ${response.status}`)
+    throw new ConfigRequestError(message || `request failed: ${response.status}`, response.status)
   }
   return (await response.json()) as T
 }
