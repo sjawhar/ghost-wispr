@@ -118,14 +118,16 @@ describe('SessionCard', () => {
   })
 
   // A summary is the model's text from meeting speech, so it can hold anything
-  // a speaker said: raw HTML in it must not become markup, and a link in it
-  // must not run script.
+  // a speaker said: raw HTML in it must show as the text it is, not become
+  // markup, and a link in it must not run script.
   const hostileSummary = [
     'Notes <img src=x onerror="window.summaryXss = 1"> from the call.',
     '',
     '<script>window.summaryXss = 2</script>',
     '',
-    '[open](javascript:window.summaryXss=3), [also](JaVa\tScRiPt:window.summaryXss=4) and [docs](https://example.com/docs).',
+    '<iframe src="javascript:window.summaryXss = 5"></iframe>',
+    '',
+    '[open](javascript:window.summaryXss=3), [also](JaVa\tScRiPt:window.summaryXss=4), <javascript:window.summaryXss=6> and [docs](https://example.com/docs).',
   ].join('\n')
 
   it.each([
@@ -152,8 +154,14 @@ describe('SessionCard', () => {
     const summaries = container.querySelectorAll('.summary-preview-md, .summary-markdown')
     expect(summaries.length).toBe(expanded ? 2 : 1)
     for (const summary of summaries) {
-      expect(summary.querySelector('img, script, [onerror]')).toBeNull()
-      expect(summary.textContent).toContain('from the call.')
+      expect(summary.querySelector('img, script, iframe, [onerror]')).toBeNull()
+      expect(summary.textContent).toContain(
+        'Notes <img src=x onerror="window.summaryXss = 1"> from the call.',
+      )
+      expect(summary.textContent).toContain('<script>window.summaryXss = 2</script>')
+      expect(summary.textContent).toContain(
+        '<iframe src="javascript:window.summaryXss = 5"></iframe>',
+      )
       const links = [...summary.querySelectorAll('a')].map((a) => a.getAttribute('href'))
       expect(links).toEqual(['https://example.com/docs'])
       expect(summary.textContent).toContain('open')
