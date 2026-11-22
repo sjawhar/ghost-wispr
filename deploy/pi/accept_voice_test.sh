@@ -1309,6 +1309,19 @@ def arecord(args):
     # arecord-reopen opens the file for each write and closes it again, so that /proc seldom shows
     # the driver an open fd and it reads the size with a stat of the file.
     reopen = "arecord-reopen" in SCENARIO
+    # arecord-lock-start waits for the driver's pid file before it creates its file, so that the
+    # driver's own write in the folder is done before the lock, and its capture starts at once after
+    # its header, as arecord's does: a wait between the header and the first read would make the
+    # recording's start early by as long, and with the 250 ms buffer the anchors could not make up
+    # for it (Sol's review of #162 at 41b33cd7: under load the case read "did not hear the speech up
+    # to the stop"). pid_seen is its own record that the pid file was there before its first sample,
+    # which a stat under the lock cannot show.
+    pid_seen = False
+    if "arecord-lock-start" in SCENARIO and not reopen:
+        wait_until = time.monotonic() + 5
+        while not os.path.exists(path + ".pid") and time.monotonic() < wait_until:
+            time.sleep(0.005)
+        pid_seen = os.path.exists(path + ".pid")
     f = None if reopen else open(path, "wb")
 
     def put(data, mode="ab"):
@@ -1336,13 +1349,9 @@ def arecord(args):
     # while the fake writes on through the fd it holds open, as arecord does: every read of the size
     # fails there, yet no sample waits, so no overrun, and the recording stays continuous (Sol's
     # review of #156 at d49d0fe7: cancel-locked's hold always overruns, so no case held the locked
-    # reads to the chime path). It waits for the driver's pid file first, so that the driver's own
-    # write in the folder is done; unlock is the folder, its mode and when it opens again.
+    # reads to the chime path); unlock is the folder, its mode and when it opens again.
     frozen = []
     unlock = None
-    # pid_seen: arecord-lock-start's own record that the driver's pid file was there before it
-    # locked the folder (and so before its first sample), which a stat under the lock cannot show.
-    pid_seen = False
     try:
         if "arecord-slow-start" in SCENARIO:
             time.sleep(1.5)
@@ -1360,11 +1369,6 @@ def arecord(args):
                 os.kill(pid, signal.SIGSTOP)
             log_to("arecord-froze", " ".join(map(str, frozen)))
             time.sleep(8)
-        if "arecord-lock-start" in SCENARIO and f is not None:
-            wait_until = time.monotonic() + 5
-            while not os.path.exists(path + ".pid") and time.monotonic() < wait_until:
-                time.sleep(0.005)
-            pid_seen = os.path.exists(path + ".pid")
         begun = -(-time.monotonic_ns() // 1_000_000)
         log_to("recordings", "%s %d" % (path, begun))
         if "arecord-lock-start" in SCENARIO and f is not None:
