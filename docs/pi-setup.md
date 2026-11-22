@@ -1054,7 +1054,11 @@ with the unit paused and no session active:
    which moves audio in 1 ms frames, not a measured bound. A disruption between the two lines can
    make the chime play later than its line says, so the check then falls back to the answer's
    `first_audio`, with a NOTE, as it does for a build without the lines: a leak within the speaker's
-   queue before `first_audio`, about 40 ms, is then not seen.
+   queue before `first_audio`, about 40 ms, is then not seen. After an overrun the recording's
+   times may not tell which of two sounds near the chime is the chime. Between a stop and the next
+   answer the rig may hear only that chime, so two sounds that each end more than 20 ms after the
+   stop and start before the answer's `first_audio` fail the stop: one of them is audio of the
+   cancelled answer, whichever is the chime.
 6. Slice 4's two steps check the three capture states and the paused listener, with the
    listener turned on for the run only (`GHOST_WISPR_VOICE_PAUSED_LISTENER=true`, beside the
    voice). Both keep the microphone on the loopback, so the listener hears only what the step plays

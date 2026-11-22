@@ -109,6 +109,8 @@ CLOCK = 1.0002 if "clock-fast" in SCENARIO else 0.9998 if "clock-slow" in SCENAR
 # 1 ms, as accept-voice.sh's capture_buffer computes it.
 CAPTURE_BUFFER_FRAMES = 12000 if "capture-buffer-250" in SCENARIO else 1920
 FAKE_RESIDENCY_MS = (CAPTURE_BUFFER_FRAMES + 2 * 480) // 48 + 1
+# The scenarios whose rig capture loses audio (capture-gap items in the timeline), as an overrun does.
+CAPTURE_GAPS = {"capture-gap", "capture-gap-after-stop-100", "capture-gap-after-stop-300"}
 
 
 def now_ms():
@@ -668,6 +670,13 @@ def drop(status, items, request):
     at = now_ms()
     append(dict(cut, at=at, sound_end=at + end))
     emit(kind="timing", due=at, event="stop", session_id="session-1", reason=request["reason"])
+    # capture-gap-after-stop-MS: after the first stop, the rig's capture loses MS ms from 500 ms on,
+    # before the next question, as an overrun on a loaded machine does, which the fake arecord
+    # reports: every later sound sits MS ms earlier in the file, and the recording's early bounds
+    # come from its start alone (Sol's run of #149 at 44738566 read leak-apart-chime UNKNOWN so).
+    for ms in (100, 300):
+        if "capture-gap-after-stop-%d" % ms in SCENARIO and not read("stop-count"):
+            emit(kind="capture-gap", start=at + 500, end=at + 500 + ms)
     write("stop-count", "%d\n" % (int(read("stop-count", "0").strip() or 0) + 1))
     emit(kind="log", due=at, level="INFO", msg="speaker cancel", fields={"device": "plughw:CARD=J75,DEV=0", "way": "rewind" if "rewind" in SCENARIO else "drop"})
     leak = 1100 if "leak-1100" in SCENARIO else 150 if SCENARIO & {"leak-150", "leak-after-quiet"} else None
@@ -1432,10 +1441,11 @@ def arecord(args):
                 while True:  # no read comes that would report the overrun; SIGTERM ends it
                     time.sleep(1)
             lag = (1000 if lag_until is not None and t < lag_until else 0) + (50 if "arecord-behind" in SCENARIO else 0)
-            if "capture-gap" in SCENARIO:
-                lost = sum(max(0, min(t, i["end"]) - i["start"]) for i in timeline() if i["kind"] == "capture-gap")
-                if lost > 0 and not gap_reported:
-                    overrun(250)
+            if SCENARIO & CAPTURE_GAPS:
+                gaps_now = [i for i in timeline() if i["kind"] == "capture-gap" and i["start"] < t]
+                lost = sum(min(t, i["end"]) - i["start"] for i in gaps_now)
+                if gaps_now and not gap_reported:
+                    overrun(gaps_now[0]["end"] - gaps_now[0]["start"])
                     gap_reported = True
             # Whole 2-byte samples at 24 kHz of the rig's clock, CLOCK times the Pi's.
             target = 2 * int((t - lag - skip - lost - begun) * CLOCK * 24)
@@ -2598,6 +2608,20 @@ launch cancel-leak-in-queue-own-audible long,asound,stop-rounds-2,leak-in-queue,
 # #156 at 053df77c: a false FAIL).
 # shellcheck disable=SC2086
 launch cancel-capture-gap long,asound,stop-rounds-2,capture-gap yes -- $cancel_args
+# A word just before the next chime (leak-apart-chime) with the rig's capture losing 100 ms after the
+# stop (capture-gap-after-stop-100), as an overrun on a loaded machine does: the recording's early
+# bounds come from its start alone, 100 ms early, so the word may start where the chime belongs and
+# the recording cannot tell which sound is the chime (Sol's run of #149 at 44738566 read UNKNOWN
+# so). Two sounds lie between the stop and the next answer's first audio, where only the chime
+# belongs, so one is audio of the cancelled answer: FAIL, never UNKNOWN or PASS. With 300 ms lost
+# (capture-gap-after-stop-300) neither sound certainly starts where the chime belongs: FAIL too. A
+# good cancel with 300 ms lost, the control, has only the chime there: no FAIL.
+# shellcheck disable=SC2086
+launch cancel-leak-apart-chime-gap long,asound,stop-rounds-2,leak-apart-chime,capture-gap-after-stop-100 yes -- $cancel_args
+# shellcheck disable=SC2086
+launch cancel-leak-apart-chime-wide-gap long,asound,stop-rounds-2,leak-apart-chime,capture-gap-after-stop-300 yes -- $cancel_args
+# shellcheck disable=SC2086
+launch cancel-gap-after-stop long,asound,stop-rounds-2,capture-gap-after-stop-300 yes -- $cancel_args
 # shellcheck disable=SC2086
 launch cancel-quiet-chime long,asound,stop-rounds-2,quiet-chime yes -- $cancel_args
 # shellcheck disable=SC2086
@@ -3576,6 +3600,16 @@ expect_line cancel-capture-gap 'NOTE: recording: arecord reported an overrun'
 expect_line cancel-capture-gap 'the recording is not shown continuous'
 expect_no_line cancel-capture-gap "FAIL: playback-cancel"
 expect_restored cancel-capture-gap
+for name in cancel-leak-apart-chime-gap cancel-leak-apart-chime-wide-gap; do
+  expect_rc "$name" 1
+  expect_line "$name" 'NOTE: recording: arecord reported an overrun'
+  expect_line "$name" "FAIL: playback-cancel stop 1: a sound at the rig microphone starts beside the next question's chime, before its answer's first audio: 2 sounds there each end more than 20 ms after the stop"
+  expect_restored "$name"
+done
+expect_rc cancel-gap-after-stop 0 2
+expect_line cancel-gap-after-stop 'NOTE: recording: arecord reported an overrun'
+expect_no_line cancel-gap-after-stop 'FAIL: playback-cancel'
+expect_restored cancel-gap-after-stop
 expect_rc cancel-quiet-chime 0
 expect_line cancel-quiet-chime "PASS: playback-cancel: no stop's speech was heard at the rig microphone 20 ms after it"
 expect_line cancel-quiet-chime 'NOTE: playback-cancel: calibration: the wake sound played alone (ghost-wispr play-sound) is heard at the rig microphone for 130 ms above -50 dB'
