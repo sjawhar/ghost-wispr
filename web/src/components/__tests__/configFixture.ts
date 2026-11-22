@@ -144,6 +144,26 @@ export function stubFetch(
   return fetch
 }
 
+// deferredFetch stubs fetch so that a request to the unit waits until the
+// test passes the answer to the function it returns: a save stays on its way
+// until then. GET /api/providers answers at once, with no provider. (The
+// app's TypeScript library, ES2022, has no Promise.withResolvers.)
+export function deferredFetch(): (answer: Response) => void {
+  let give: (answer: Response) => void = () => {}
+  const pending = new Promise<Response>((resolve) => {
+    give = resolve
+  })
+  vi.stubGlobal(
+    'fetch',
+    vi.fn((input: RequestInfo | URL) =>
+      String(input).startsWith('/api/providers')
+        ? Promise.resolve(new Response(JSON.stringify({ providers: [] })))
+        : pending,
+    ),
+  )
+  return give
+}
+
 // sent lists the requests a stubbed fetch was sent, each as its URL, method
 // and JSON body.
 export function sent(fetch: FetchMock): { url: string; method: string; body: unknown }[] {

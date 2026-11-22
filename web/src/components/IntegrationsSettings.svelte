@@ -63,6 +63,12 @@
   }
 
   async function saveGC(): Promise<void> {
+    // A cleared number field holds null, which the unit reads as no value:
+    // it would change nothing while the page said "Saved!".
+    if (!Number.isFinite(gcMaxAgeDays.value) || !Number.isFinite(gcMaxAudioSizeMB.value)) {
+      gcFeedback = 'Each GC limit needs a number; 0 means no limit.'
+      return
+    }
     const gc: NonNullable<ConfigPatch['gc']> = {}
     if (gcEnabled.value !== config.gc.enabled) {
       gc.enabled = gcEnabled.value
@@ -98,7 +104,12 @@
   <div class="gdrive-section">
     <div class="field">
       <label class="toggle-label">
-        <input type="checkbox" bind:checked={syncEnabled.value} onchange={saveSyncEnabled} />
+        <input
+          type="checkbox"
+          bind:checked={syncEnabled.value}
+          onchange={saveSyncEnabled}
+          disabled={syncSaving}
+        />
         Enable automatic sync
         {#if syncSaving}
           <span class="saving">Saving...</span>
@@ -114,6 +125,7 @@
         id="gdrive-folder"
         type="text"
         bind:value={gdriveFolder.value}
+        disabled={gdriveSaving}
         placeholder="Google Drive folder ID"
       />
     </div>
@@ -154,7 +166,7 @@
 
     <div class="field">
       <label class="toggle-label">
-        <input type="checkbox" bind:checked={gcEnabled.value} />
+        <input type="checkbox" bind:checked={gcEnabled.value} disabled={gcSaving} />
         Enable garbage collection
       </label>
     </div>
@@ -162,7 +174,13 @@
     {#if gcEnabled.value}
       <div class="field">
         <label for="gc-max-age">Delete sessions older than (days)</label>
-        <input id="gc-max-age" type="number" min="0" bind:value={gcMaxAgeDays.value} />
+        <input
+          id="gc-max-age"
+          type="number"
+          min="0"
+          bind:value={gcMaxAgeDays.value}
+          disabled={gcSaving}
+        />
         <p class="hint">
           0 = never. Deletes only ended sessions that have a verified copy in Google Drive. A
           session restored from Drive counts from its restore.
@@ -170,7 +188,13 @@
       </div>
       <div class="field">
         <label for="gc-max-size">Audio budget (MB)</label>
-        <input id="gc-max-size" type="number" min="0" bind:value={gcMaxAudioSizeMB.value} />
+        <input
+          id="gc-max-size"
+          type="number"
+          min="0"
+          bind:value={gcMaxAudioSizeMB.value}
+          disabled={gcSaving}
+        />
         <p class="hint">
           0 = no budget: GC removes no audio to free space. Past the budget, the oldest verified
           Drive copies' local audio is removed; sessions, transcripts and summaries are kept.

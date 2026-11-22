@@ -3,7 +3,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import IntegrationsSettings from '../IntegrationsSettings.svelte'
 import SettingsPage from '../SettingsPage.svelte'
 import { configState, resetConfigState, setConfig } from '../../lib/config.svelte'
-import { sent, stubFetch, unitConfig as config } from './configFixture'
+import { deferredFetch, sent, stubFetch, unitConfig as config } from './configFixture'
 
 describe('IntegrationsSettings', () => {
   afterEach(() => {
@@ -101,6 +101,53 @@ describe('IntegrationsSettings', () => {
     const shown = await within(gdrive).findByText('No changes to save.')
     expect(shown.classList.contains('error')).toBe(false)
     expect(sent(fetch).filter((r) => r.method === 'PATCH')).toEqual([])
+  })
+
+  it('sends no GC limit that was not changed', async () => {
+    const fetch = stubFetch()
+    const { container } = render(IntegrationsSettings, { config })
+
+    const gcSection = container.querySelector('.gc-section') as HTMLElement
+    await fireEvent.click(within(gcSection).getByRole('button', { name: 'Save' }))
+
+    const shown = await within(gcSection).findByText('No changes to save.')
+    expect(shown.classList.contains('error')).toBe(false)
+    expect(sent(fetch).filter((r) => r.method === 'PATCH')).toEqual([])
+  })
+
+  // The unit reads a cleared number field's null as no value, so a save of it
+  // would change nothing while the page said "Saved!".
+  it('saves no GC limit left empty, and says it needs a number', async () => {
+    const fetch = stubFetch()
+    const { container } = render(IntegrationsSettings, { config })
+
+    await fireEvent.input(screen.getByLabelText('Delete sessions older than (days)'), {
+      target: { value: '' },
+    })
+    const gcSection = container.querySelector('.gc-section') as HTMLElement
+    await fireEvent.click(within(gcSection).getByRole('button', { name: 'Save' }))
+
+    const shown = await within(gcSection).findByText(
+      'Each GC limit needs a number; 0 means no limit.',
+    )
+    expect(shown.classList.contains('error')).toBe(true)
+    expect(sent(fetch).filter((r) => r.method === 'PATCH')).toEqual([])
+  })
+
+  // Text typed while a save is on its way would be replaced by the save's
+  // answer, so the fields take none until it lands.
+  it('takes no typing in the GC limits while their save is on its way', async () => {
+    const answer = deferredFetch()
+    const { container } = render(IntegrationsSettings, { config })
+    const age = screen.getByLabelText('Delete sessions older than (days)') as HTMLInputElement
+
+    await fireEvent.input(age, { target: { value: '45' } })
+    const gcSection = container.querySelector('.gc-section') as HTMLElement
+    await fireEvent.click(within(gcSection).getByRole('button', { name: 'Save' }))
+
+    expect(age.disabled).toBe(true)
+    answer(new Response(JSON.stringify({ ...config, gc: { ...config.gc, max_age_days: 45 } })))
+    await waitFor(() => expect(age.disabled).toBe(false))
   })
 })
 

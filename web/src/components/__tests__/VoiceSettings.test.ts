@@ -4,7 +4,7 @@ import VoiceSettings from '../VoiceSettings.svelte'
 import SettingsPage from '../SettingsPage.svelte'
 import type { ConfigResponse } from '../../lib/config-api'
 import { configState, resetConfigState, setConfig } from '../../lib/config.svelte'
-import { sent, stubFetch, unitConfig } from './configFixture'
+import { deferredFetch, sent, stubFetch, unitConfig } from './configFixture'
 
 const config: ConfigResponse = {
   ...unitConfig,
@@ -184,6 +184,22 @@ describe('VoiceSettings', () => {
 
     expect((screen.getByLabelText('Text-to-speech voice') as HTMLInputElement).value).toBe('Puck')
     expect(checked('Enable meeting voice')).toBe(false)
+  })
+
+  // Text typed while a save is on its way would be replaced by the save's
+  // answer, so the fields take none until it lands.
+  it('takes no typing while its save is on its way', async () => {
+    const answer = deferredFetch()
+    render(VoiceSettings, { config })
+    const voice = screen.getByLabelText('Text-to-speech voice') as HTMLInputElement
+
+    await fireEvent.input(voice, { target: { value: 'Puck' } })
+    await save()
+
+    expect(voice.disabled).toBe(true)
+    expect((screen.getByLabelText('Enable meeting voice') as HTMLInputElement).disabled).toBe(true)
+    answer(new Response(JSON.stringify({ ...config, tts: { ...config.tts, voice: 'Puck' } })))
+    await waitFor(() => expect(voice.disabled).toBe(false))
   })
 })
 

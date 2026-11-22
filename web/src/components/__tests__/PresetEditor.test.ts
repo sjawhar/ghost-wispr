@@ -3,7 +3,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { PresetDetail } from '../../lib/config-api'
 import PresetEditor from '../PresetEditor.svelte'
 import { resetConfigState } from '../../lib/config.svelte'
-import { sent, stubFetch, unitConfig } from './configFixture'
+import { deferredFetch, sent, stubFetch, unitConfig } from './configFixture'
 
 const presets: Record<string, PresetDetail> = {
   standup: {
@@ -153,6 +153,43 @@ describe('PresetEditor', () => {
 
     expect(field('Model Override (optional)').value).toBe('vertex/gemini-4-carbon')
     expect(field('Description').value).toBe('Weekly notes')
+  })
+
+  // The person opened another preset while the first one's save was on its
+  // way: the answer must not write the saved preset's fields into it.
+  it('leaves a preset opened during a save as it is when the save lands', async () => {
+    const answer = deferredFetch()
+    const retro = {
+      description: 'Retro notes',
+      system_prompt: 'Summarize the retro.',
+      user_template: '{{transcript}}',
+      model: '',
+    }
+    render(PresetEditor, { presets: { ...presets, retro } })
+    await fireEvent.click(screen.getByRole('button', { name: /standup/ }))
+    await fireEvent.input(field('Description'), { target: { value: 'Weekly notes' } })
+    await fireEvent.click(screen.getByRole('button', { name: 'Save' }))
+
+    expect((field('Description') as HTMLInputElement).disabled).toBe(true)
+    await fireEvent.click(screen.getByRole('button', { name: /retro/ }))
+    answer(
+      new Response(
+        JSON.stringify({
+          ...unitConfig,
+          summarization: {
+            ...unitConfig.summarization,
+            presets: { standup: { ...presets.standup, description: 'Weekly notes' }, retro },
+          },
+        }),
+      ),
+    )
+
+    await waitFor(() => expect((field('Description') as HTMLInputElement).disabled).toBe(false))
+    expect(field('Name').value).toBe('retro')
+    expect(field('Description').value).toBe('Retro notes')
+    expect(field('System Prompt').value).toBe('Summarize the retro.')
+    expect(field('Model Override (optional)').value).toBe('')
+    expect(screen.queryByText('Saved!')).toBeNull()
   })
 
   it('sends every field of a new preset', async () => {

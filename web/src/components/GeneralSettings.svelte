@@ -60,7 +60,13 @@
 <div class="general-settings" data-testid="general-settings">
   <div class="field">
     <label for="silence-timeout">Silence Timeout</label>
-    <input id="silence-timeout" type="text" bind:value={silenceTimeout.value} placeholder="30s" />
+    <input
+      id="silence-timeout"
+      type="text"
+      bind:value={silenceTimeout.value}
+      disabled={saving}
+      placeholder="30s"
+    />
     <span class="hint">Go duration format (e.g. 30s, 1m, 1m30s)</span>
   </div>
 
@@ -70,6 +76,7 @@
       id="default-model"
       type="text"
       bind:value={model.value}
+      disabled={saving}
       placeholder="openai/gpt-4o-mini"
     />
     <span class="hint">Format: provider/model_name</span>
@@ -77,12 +84,24 @@
 
   <div class="field">
     <label for="endpointing">Transcription Endpointing (ms)</label>
-    <input id="endpointing" type="text" bind:value={endpointing.value} placeholder="400" />
+    <input
+      id="endpointing"
+      type="text"
+      bind:value={endpointing.value}
+      disabled={saving}
+      placeholder="400"
+    />
   </div>
 
   <div class="field">
     <label for="utterance-end">Utterance End (ms)</label>
-    <input id="utterance-end" type="text" bind:value={utteranceEndMs.value} placeholder="1000" />
+    <input
+      id="utterance-end"
+      type="text"
+      bind:value={utteranceEndMs.value}
+      disabled={saving}
+      placeholder="1000"
+    />
     <span class="hint">Changes to transcription settings will reconnect Deepgram</span>
   </div>
 

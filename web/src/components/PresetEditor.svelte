@@ -184,6 +184,9 @@
       return
     }
 
+    // The person can open another preset while the save is on its way; its
+    // answer then changes the stored config and no form.
+    const opened = isNew ? '__new__' : name
     saving = true
     feedback = ''
     try {
@@ -191,6 +194,7 @@
         summarization: { presets: { [name]: fields } },
       })
       setConfig(updated)
+      if (expandedPreset !== opened) return
       // The answer can carry a change made elsewhere since the preset opened:
       // a field takes it here, before the page passes the new presets in.
       const saved = updated.summarization.presets[name]
@@ -203,11 +207,7 @@
         expandedPreset = name
       }
     } catch (error) {
-      // The unit answers 404 to a change to a preset it does not hold that
-      // does not create it: another tab or the unit deleted it.
-      if (!isNew && error instanceof ConfigRequestError && error.status === 404) {
-        feedback = 'This preset was deleted elsewhere.'
-      } else {
+      if (expandedPreset === opened) {
         feedback = error instanceof Error ? error.message : 'Save failed'
       }
     } finally {
@@ -345,15 +345,17 @@
           </div>
           <div class="field">
             <label for="preset-description">Description</label>
-            <input id="preset-description" type="text" bind:value={editDesc} />
+            <input id="preset-description" type="text" bind:value={editDesc} disabled={saving} />
           </div>
           <div class="field">
             <label for="preset-system-prompt">System Prompt</label>
-            <textarea id="preset-system-prompt" rows="6" bind:value={editPrompt}></textarea>
+            <textarea id="preset-system-prompt" rows="6" bind:value={editPrompt} disabled={saving}
+            ></textarea>
           </div>
           <div class="field">
             <label for="preset-user-template">User Template</label>
-            <textarea id="preset-user-template" rows="3" bind:value={editTemplate}></textarea>
+            <textarea id="preset-user-template" rows="3" bind:value={editTemplate} disabled={saving}
+            ></textarea>
             <span class="hint">Use {'{{transcript}}'} as placeholder</span>
           </div>
           <div class="field">
@@ -362,6 +364,7 @@
               id="preset-model"
               type="text"
               bind:value={editModel}
+              disabled={saving}
               placeholder="provider/model_name"
             />
           </div>
@@ -404,7 +407,13 @@
       <div class="preset-form">
         <div class="field">
           <label for="new-preset-name">Name</label>
-          <input id="new-preset-name" type="text" bind:value={editName} placeholder="my-preset" />
+          <input
+            id="new-preset-name"
+            type="text"
+            bind:value={editName}
+            disabled={saving}
+            placeholder="my-preset"
+          />
         </div>
         <div class="field">
           <label for="new-preset-description">Description</label>
@@ -412,6 +421,7 @@
             id="new-preset-description"
             type="text"
             bind:value={editDesc}
+            disabled={saving}
             placeholder="What kind of summary do you want?"
           />
         </div>
@@ -444,11 +454,21 @@
         {:else}
           <div class="field">
             <label for="new-preset-system-prompt">System Prompt</label>
-            <textarea id="new-preset-system-prompt" rows="6" bind:value={editPrompt}></textarea>
+            <textarea
+              id="new-preset-system-prompt"
+              rows="6"
+              bind:value={editPrompt}
+              disabled={saving}
+            ></textarea>
           </div>
           <div class="field">
             <label for="new-preset-user-template">User Template</label>
-            <textarea id="new-preset-user-template" rows="3" bind:value={editTemplate}></textarea>
+            <textarea
+              id="new-preset-user-template"
+              rows="3"
+              bind:value={editTemplate}
+              disabled={saving}
+            ></textarea>
             <span class="hint">Use {'{{transcript}}'} as placeholder</span>
           </div>
           <div class="field">
@@ -457,6 +477,7 @@
               id="new-preset-model"
               type="text"
               bind:value={editModel}
+              disabled={saving}
               placeholder="provider/model_name"
             />
           </div>

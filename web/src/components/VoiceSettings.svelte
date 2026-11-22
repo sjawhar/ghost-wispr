@@ -67,7 +67,7 @@
 
 <div class="voice-settings" data-testid="voice-settings">
   <label class="toggle-label">
-    <input type="checkbox" bind:checked={enabled.value} />
+    <input type="checkbox" bind:checked={enabled.value} disabled={saving} />
     Enable meeting voice
   </label>
 
@@ -75,7 +75,13 @@
     <legend>Voice</legend>
     {#each engines as option (option.value)}
       <label class="choice">
-        <input type="radio" name="voice-engine" value={option.value} bind:group={engine.value} />
+        <input
+          type="radio"
+          name="voice-engine"
+          value={option.value}
+          bind:group={engine.value}
+          disabled={saving}
+        />
         {option.label}
       </label>
     {/each}
@@ -88,6 +94,7 @@
         id="tts-model"
         type="text"
         bind:value={ttsModel.value}
+        disabled={saving}
         placeholder="provider/model, such as vertex/gemini-3.8-flash-tts"
       />
       <p class="hint">
@@ -101,6 +108,7 @@
         id="tts-voice"
         type="text"
         bind:value={ttsVoice.value}
+        disabled={saving}
         placeholder="The model's default voice"
       />
     </div>
