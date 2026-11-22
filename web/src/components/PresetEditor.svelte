@@ -254,9 +254,11 @@
     feedback = ''
     try {
       const result = await refinePreset(refiningPreset, refineFeedback.trim())
-      fields.description.value = result.description
-      fields.system_prompt.value = result.system_prompt
-      fields.user_template.value = result.user_template || '{{transcript}}'
+      // The refinement starts from the preset as the unit holds it: a field it
+      // returns as it was is no edit, and what the person typed there stays.
+      fields.description.propose(result.description)
+      fields.system_prompt.propose(result.system_prompt)
+      fields.user_template.propose(result.user_template || '{{transcript}}')
       refiningPreset = ''
       feedback = 'Refined! Review the changes and Save.'
     } catch (error) {
@@ -402,7 +404,12 @@
               {saving ? 'Saving...' : 'Save'}
             </button>
             <button class="test-btn" type="button" onclick={() => openTest(name)}> Test </button>
-            <button class="refine-btn" type="button" onclick={() => openRefine(name)}>
+            <button
+              class="refine-btn"
+              type="button"
+              onclick={() => openRefine(name)}
+              disabled={saving}
+            >
               Refine
             </button>
             {#if name !== 'default'}

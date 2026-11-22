@@ -204,6 +204,20 @@ describe('VoiceSettings', () => {
     await waitFor(() => expect(controls.some((control) => control.disabled)).toBe(false))
   })
 
+  // An input that leaves the field as it shows is no edit: nothing to save.
+  it('takes an input of the value the field shows as no edit', async () => {
+    const fetch = stubFetch({ config })
+    render(VoiceSettings, { config })
+
+    await fireEvent.input(screen.getByLabelText('Text-to-speech voice'), {
+      target: { value: 'Kore' },
+    })
+    await save()
+
+    expect(await screen.findByText('No changes to save.')).toBeTruthy()
+    expect(sent(fetch).filter((r) => r.method === 'PATCH')).toEqual([])
+  })
+
   // A value changed and changed back is still the person's value: it is sent.
   it('sends a value the person changed and changed back', async () => {
     const fetch = stubFetch({ config })

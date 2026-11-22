@@ -466,4 +466,132 @@ describe('PresetEditor', () => {
       expect(screen.queryByRole('dialog')).toBeNull()
     },
   )
+
+  // Refine answers with every field of the preset; a field it did not change
+  // comes back as the unit holds it. The unit answers a save with the config.
+  function stubRefine(result: Omit<PresetDetail, 'model'>) {
+    const fetch = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input)
+      if (url === '/api/config/presets/refine') {
+        return Promise.resolve(new Response(JSON.stringify({ ...result, model: '' })))
+      }
+      if (init?.method === 'PATCH') {
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              ...unitConfig,
+              summarization: { ...unitConfig.summarization, presets },
+            }),
+          ),
+        )
+      }
+      return Promise.resolve(new Response('[]'))
+    })
+    vi.stubGlobal('fetch', fetch)
+    return fetch
+  }
+
+  async function refine(): Promise<void> {
+    await fireEvent.click(screen.getByRole('button', { name: 'Refine' }))
+    await fireEvent.input(field('What would you like to change?'), {
+      target: { value: 'Shorter, please.' },
+    })
+    await fireEvent.click(screen.getByRole('button', { name: 'Refine with LLM' }))
+    expect(await screen.findByText('Refined! Review the changes and Save.')).toBeTruthy()
+  }
+
+  function patches(fetch: ReturnType<typeof stubRefine>): unknown[] {
+    return fetch.mock.calls
+      .filter(([, init]) => init?.method === 'PATCH')
+      .map(([, init]) => JSON.parse(String(init?.body)))
+  }
+
+  // Sol's case: a refinement changes only the system prompt. A save sends
+  // only that, so it does not send the description back over a change made
+  // to it in another tab.
+  it('sends only the fields a refinement changed', async () => {
+    const fetch = stubRefine({
+      description: 'Daily standup notes',
+      system_prompt: 'More concise system prompt',
+      user_template: '{{transcript}}',
+    })
+    await expandStandup()
+
+    await refine()
+    expect(field('System Prompt').value).toBe('More concise system prompt')
+    await fireEvent.click(screen.getByRole('button', { name: 'Save' }))
+
+    await waitFor(() =>
+      expect(patches(fetch)).toEqual([
+        {
+          summarization: { presets: { standup: { system_prompt: 'More concise system prompt' } } },
+        },
+      ]),
+    )
+  })
+
+  it('leaves nothing to save after a refinement that changed nothing', async () => {
+    const fetch = stubRefine({
+      description: 'Daily standup notes\n',
+      system_prompt: 'Summarize the standup.',
+      user_template: '{{transcript}}',
+    })
+    await expandStandup()
+
+    await refine()
+    await fireEvent.click(screen.getByRole('button', { name: 'Save' }))
+
+    expect(await screen.findByText('No changes to save.')).toBeTruthy()
+    expect(patches(fetch)).toEqual([])
+  })
+
+  // A refinement starts from the preset as the unit holds it: a field it
+  // returns unchanged keeps what the person typed there, and the save sends
+  // the typing with the refined prompt.
+  it('keeps what was typed in a field a refinement did not change', async () => {
+    const fetch = stubRefine({
+      description: 'Daily standup notes',
+      system_prompt: 'More concise system prompt',
+      user_template: '{{transcript}}',
+    })
+    await expandStandup()
+    await fireEvent.input(field('Description'), { target: { value: 'Mine' } })
+
+    await refine()
+    expect(field('Description').value).toBe('Mine')
+    await fireEvent.click(screen.getByRole('button', { name: 'Save' }))
+
+    await waitFor(() =>
+      expect(patches(fetch)).toEqual([
+        {
+          summarization: {
+            presets: {
+              standup: { description: 'Mine', system_prompt: 'More concise system prompt' },
+            },
+          },
+        },
+      ]),
+    )
+  })
+
+  it('takes no refinement while its save is on its way', async () => {
+    const answer = deferredFetch()
+    await expandStandup()
+    await fireEvent.input(field('Description'), { target: { value: 'Mine' } })
+    await fireEvent.click(screen.getByRole('button', { name: 'Save' }))
+
+    expect((screen.getByRole('button', { name: 'Refine' }) as HTMLButtonElement).disabled).toBe(
+      true,
+    )
+    answer(
+      new Response(
+        JSON.stringify({ ...unitConfig, summarization: { ...unitConfig.summarization, presets } }),
+      ),
+    )
+    await waitFor(() =>
+      expect((screen.getByRole('button', { name: 'Refine' }) as HTMLButtonElement).disabled).toBe(
+        false,
+      ),
+    )
+  })
 })

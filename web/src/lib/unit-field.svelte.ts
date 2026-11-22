@@ -12,13 +12,20 @@ import type { ConfigTake } from './config.svelte'
 // A save sends the fields the person edited, and acknowledges each field it
 // carried once the unit takes it.
 export interface UnitField<T> {
+  // The person's input. A value that is not what the field shows is an edit; a
+  // value the field already shows changes nothing.
   value: T
-  // Set by the person's input in the field and by nothing else. Cleared when a
-  // save carries the field, and for good when the page takes a config whose
-  // value for the field is not the one the field showed when the person began
-  // typing: the field then shows that value. A value changed and changed back
-  // stays edited, and is sent: it is the person's value.
+  // Set by an edit and by nothing else. Cleared when a save carries the
+  // field, and for good when the page takes a config whose value for the field
+  // is not the one the field showed when the editing began: the field then
+  // shows that value. A value changed and changed back stays edited, and is
+  // sent: it is the person's value.
   readonly edited: boolean
+  // A value from the page itself, such as a refinement's output. It is an
+  // edit only where it is neither the config's value (what the unit held, so
+  // the proposal did not change the field: what the person typed stays) nor
+  // what the field shows, spaces around text aside.
+  propose(next: T): void
   // A config the page took replaced the person's edit with a value other than
   // what they typed; until the person's next input in the field.
   readonly replaced: boolean
@@ -78,16 +85,25 @@ export function unitField<T>(read: () => T, taken: () => unknown): UnitField<T> 
     })
   })
 
+  function change(next: T): void {
+    if (!edited) before = value
+    value = next
+    typed = next
+    edited = true
+    replaced = false
+  }
+
   return {
     get value() {
       return value
     },
     set value(next: T) {
-      if (!edited) before = value
-      value = next
-      typed = next
-      edited = true
-      replaced = false
+      if (Object.is(next, value)) return
+      change(next)
+    },
+    propose(next: T) {
+      if (sameEntry(next, unit) || sameEntry(next, value)) return
+      change(next)
     },
     get edited() {
       return edited
