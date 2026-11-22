@@ -3025,7 +3025,14 @@ expect_line barge-pause-silent-restart 'NOTE: recording: the capture substream a
 expect_no_line barge-pause-silent-restart 'PASS: barge-in: 0 of 1'
 expect_restored barge-pause-silent-restart
 expect_rc barge-backchannel-terminal-stall 1 2
-expect_line barge-backchannel-terminal-stall 'NOTE: recording: the capture substream arecord held read CLOSED during the recording, so the recording'"'"'s early bounds come from its start alone'
+# On a loaded machine the fake can also overrun before the stall, and the driver then names the
+# overrun, which turns the anchors' bound off as well: the case still must not PASS. It is no floor
+# case, so it does not count toward floor_cases.
+if grep -Fq "NOTE: recording: arecord reported an overrun" "$root/barge-backchannel-terminal-stall/out"; then
+  printf 'NOTE: %s: the fake arecord overran before the stall, and the driver named the overrun\n' barge-backchannel-terminal-stall
+else
+  expect_line barge-backchannel-terminal-stall 'NOTE: recording: the capture substream arecord held read CLOSED during the recording, so the recording'"'"'s early bounds come from its start alone'
+fi
 expect_line barge-backchannel-terminal-stall 'barge-in:'
 expect_no_line barge-backchannel-terminal-stall 'PASS: barge-in: 0 of 1'
 expect_restored barge-backchannel-terminal-stall

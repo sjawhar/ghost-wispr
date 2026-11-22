@@ -531,11 +531,13 @@ def record(path, anchors, pidfile, root):
     signal.signal(signal.SIGTERM, stop)
     read = size_reader(path)
     out = open(anchors, "a", buffering=1)
-    pid, deadline, started, ready, reported, trigger = None, None, None, False, False, None
+    pid, deadline, started, ready, trigger = None, None, None, False, None
+    # The first discontinuity seen, printed after "started": the driver reads that line second.
+    broken, reported = None, False
 
     def anchored(seen, size, before):
         """Write the anchor of a read with samples, its floor only if the substream ran on."""
-        nonlocal reported, trigger
+        nonlocal broken, trigger
         state, now_trigger = capture_state(root, pid)
         if state == "RUNNING" and trigger is None:
             trigger = now_trigger
@@ -543,8 +545,13 @@ def record(path, anchors, pidfile, root):
             out.write("%d %d %d\n" % (seen, size, before))
             return
         out.write("%d %d\n" % (seen, size))
-        if not reported:
-            print("discontinuous %d %s" % (seen, "RESTARTED" if state == "RUNNING" else state or "CLOSED"), flush=True)
+        if broken is None:
+            broken = "discontinuous %d %s" % (seen, "RESTARTED" if state == "RUNNING" else state or "CLOSED")
+
+    def report():
+        nonlocal reported
+        if broken is not None and not reported:
+            print(broken, flush=True)
             reported = True
 
     try:
@@ -580,6 +587,7 @@ def record(path, anchors, pidfile, root):
             print("no read came before the capture", flush=True)
             return
         print("started %d" % started, flush=True)
+        report()
         while alive(pid):
             time.sleep(0.5)
             before = us()
@@ -587,8 +595,12 @@ def record(path, anchors, pidfile, root):
             seen = us()
             if size is not None and size > HEADER:
                 anchored(seen, size, before)
+                report()
     except Stop:
         pass
+    # A discontinuity that the last read found, if SIGTERM came before it was printed.
+    if started is not None:
+        report()
     # arecord has ended: the file is whole.
     try:
         size = os.stat(path).st_size
