@@ -552,6 +552,10 @@ func (s *SQLiteStore) init(dbPath string) error {
 		// the start found it: its owed retry is for that transcript, and a
 		// deletion since ends it (ClaimRefinementResume).
 		`ALTER TABLE sessions ADD COLUMN refinement_resume_generation INTEGER NOT NULL DEFAULT 0`,
+		// When an end of the active session closed its recording
+		// (RecordSessionClose), '' before one has: the next start ends a
+		// session the app stopped inside at that time (RecoverStaleSessions).
+		`ALTER TABLE sessions ADD COLUMN closed_at TEXT NOT NULL DEFAULT ''`,
 	} {
 		if _, err := s.db.Exec(stmt); err != nil && !strings.Contains(err.Error(), "duplicate column") {
 			return fmt.Errorf("migration failed: %w", err)
@@ -1143,6 +1147,20 @@ func (s *SQLiteStore) CreateSession(id string, startedAt time.Time) error {
 	}
 	if rows == 0 {
 		return fmt.Errorf("create session %s: %w", id, ErrSessionExists)
+	}
+	return nil
+}
+
+// RecordSessionClose records closedAt as the time an end of active session id
+// closed its recording, before the end saves the recording and writes the
+// session's end. An end that does not finish (a stop's deadline cuts it off)
+// leaves the session active, and the next start ends it at this time
+// (RecoverStaleSessions): its raw recording, whose last write would say when,
+// may already be saved and gone.
+func (s *SQLiteStore) RecordSessionClose(id string, closedAt time.Time) error {
+	if _, err := s.db.Exec(`UPDATE sessions SET closed_at = ? WHERE id = ? AND status = 'active'`,
+		closedAt.UTC().Format(time.RFC3339Nano), id); err != nil {
+		return fmt.Errorf("record when session %s closed: %w", id, err)
 	}
 	return nil
 }
@@ -2283,10 +2301,12 @@ func (s *SQLiteStore) FinishRefinementResume(id string) error {
 
 // RecoverStaleSessions ends every session still marked active, which the app
 // stopped inside (a power cut, a crash), and returns their ids. Each ends when
-// its audio stopped: the last write of its raw recording in audioDir, not now,
-// which can be long after. That time is kept between the session's start and
-// now, the restart, since a clock set back or ahead while it recorded can
-// stamp the file outside them. A session with no raw recording ends now. Each
+// its audio stopped, not now, which can be long after: the time an end of it
+// closed its recording (RecordSessionClose), when an end got that far before
+// the app stopped; else the last write of its raw recording in audioDir. That
+// time is kept between the session's start and now, the restart, since a
+// clock set back or ahead while it recorded can stamp it outside them. A
+// session with neither ends now. Each
 // ends with no saved recording, so it cannot be refined (no_audio) until the
 // app saves its raw recording as its recording. queueEvent, unless "", is a
 // lifecycle event each session's end queues in the same transaction (as
@@ -2295,7 +2315,7 @@ func (s *SQLiteStore) FinishRefinementResume(id string) error {
 func (s *SQLiteStore) RecoverStaleSessions(audioDir, queueEvent string) ([]string, error) {
 	now := time.Now().UTC()
 
-	rows, err := s.db.Query(`SELECT id, started_at FROM sessions WHERE status = 'active'`)
+	rows, err := s.db.Query(`SELECT id, started_at, closed_at FROM sessions WHERE status = 'active'`)
 	if err != nil {
 		return nil, fmt.Errorf("query active sessions: %w", err)
 	}
@@ -2304,11 +2324,12 @@ func (s *SQLiteStore) RecoverStaleSessions(audioDir, queueEvent string) ([]strin
 	type staleSession struct {
 		id        string
 		startedAt string
+		closedAt  string
 	}
 	var stale []staleSession
 	for rows.Next() {
 		var sess staleSession
-		if err := rows.Scan(&sess.id, &sess.startedAt); err != nil {
+		if err := rows.Scan(&sess.id, &sess.startedAt, &sess.closedAt); err != nil {
 			return nil, fmt.Errorf("scan active session: %w", err)
 		}
 		stale = append(stale, sess)
@@ -2322,9 +2343,13 @@ func (s *SQLiteStore) RecoverStaleSessions(audioDir, queueEvent string) ([]strin
 
 	ids := make([]string, 0, len(stale))
 	for _, sess := range stale {
-		endedAt := now
-		if lastAudio, ok := lastRawWrite(audioDir, sess.id); ok {
-			endedAt = lastAudio
+		endedAt, known := now, false
+		if closedAt, err := time.Parse(time.RFC3339Nano, sess.closedAt); err == nil {
+			endedAt, known = closedAt.UTC(), true
+		} else if lastAudio, ok := lastRawWrite(audioDir, sess.id); ok {
+			endedAt, known = lastAudio, true
+		}
+		if known {
 			if startedAt, err := time.Parse(time.RFC3339Nano, sess.startedAt); err == nil && endedAt.Before(startedAt) {
 				endedAt = startedAt.UTC()
 			}

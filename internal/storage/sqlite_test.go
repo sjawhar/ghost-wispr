@@ -682,6 +682,55 @@ func TestRecoverStaleSessionsEndsASessionAtItsLastAudio(t *testing.T) {
 	}
 }
 
+// A session whose end recorded when it closed the recording
+// (RecordSessionClose), and did not finish, ends then at the next start: not
+// at its raw recording's last write, nor at the restart when the end already
+// saved the raw recording away. The close is kept between the start and the
+// restart too. A session that has ended is not changed by a later record.
+func TestRecoverStaleSessionsEndsASessionWhenItsEndClosedTheRecording(t *testing.T) {
+	store := newTestSQLiteStore(t)
+	audioDir := t.TempDir()
+	started := time.Date(2026, 11, 6, 14, 9, 30, 0, time.UTC)
+	closed := started.Add(42*time.Minute + 123456789)
+	const withRaw, noRaw, beforeStart, ended = "20261106140930", "20261106141000", "20261106141100", "20261106141200"
+	for _, id := range []string{withRaw, noRaw, beforeStart, ended} {
+		if err := store.CreateSession(id, started); err != nil {
+			t.Fatal(err)
+		}
+	}
+	raw := filepath.Join(audioDir, withRaw+".pcm")
+	if err := os.WriteFile(raw, []byte{1, 2}, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(raw, closed.Add(time.Minute), closed.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	for id, at := range map[string]time.Time{withRaw: closed, noRaw: closed, beforeStart: started.Add(-time.Hour)} {
+		if err := store.RecordSessionClose(id, at); err != nil {
+			t.Fatal(err)
+		}
+	}
+	endedAt := started.Add(time.Hour)
+	if err := store.EndSession(ended, endedAt, "", ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RecordSessionClose(ended, closed); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.RecoverStaleSessions(audioDir, ""); err != nil {
+		t.Fatalf("RecoverStaleSessions: %v", err)
+	}
+	for id, want := range map[string]time.Time{withRaw: closed, noRaw: closed, beforeStart: started, ended: endedAt} {
+		sess, err := store.GetSession(id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if sess.Status != SessionEnded || sess.EndedAt == nil || !sess.EndedAt.UTC().Equal(want) {
+			t.Errorf("session %s is %q, ending at %v; want ended at %s", id, sess.Status, sess.EndedAt, want.Format(time.RFC3339Nano))
+		}
+	}
+}
+
 // Sessions that ended without a saved recording before no_audio existed (the
 // recordings given up since #35, or sessions recovered at startup) are moved
 // off pending when the store opens; sessions with a recording, still active,

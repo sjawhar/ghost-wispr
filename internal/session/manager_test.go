@@ -82,6 +82,9 @@ func (s *storeMock) CreateSession(id string, startedAt time.Time) error {
 	return nil
 }
 
+// RecordSessionClose keeps nothing: these tests read no recovery.
+func (s *storeMock) RecordSessionClose(string, time.Time) error { return nil }
+
 func (s *storeMock) EndSession(id string, _ time.Time, audioPath, _ string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()

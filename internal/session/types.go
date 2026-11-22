@@ -15,6 +15,9 @@ type Store interface {
 	// EndSession ends the session, and queues the lifecycle event queueEvent,
 	// unless "", in the same write (storage.SQLiteStore.EndSession).
 	EndSession(id string, endedAt time.Time, audioPath, queueEvent string) error
+	// RecordSessionClose records when an end of the active session closed its
+	// recording, so a start after an end that did not finish ends it then.
+	RecordSessionClose(id string, closedAt time.Time) error
 	DiscardSession(id string) error
 	AppendSegment(sessionID string, seg transcribe.Segment) error
 	GetSegments(sessionID string) ([]transcribe.Segment, error)

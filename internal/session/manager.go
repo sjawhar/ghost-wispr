@@ -94,6 +94,7 @@ type sessionEnd struct {
 	audioPath    string    // the saved recording, once saved
 	saved        bool      // the recorder has saved the recording, or the end gave it up
 	saveFailures int       // attempts to save the recording that failed
+	closeStored  bool      // endedAt is in the store (SessionStore.RecordSessionClose)
 }
 
 // maxRecordingSaveAttempts is how many times ending a session tries to save
@@ -678,6 +679,17 @@ func (m *Manager) endSession(ctx context.Context, want string) error {
 		}
 	}()
 	endedAt := end.endedAt
+	// Store when the recording closed before saving it: the save consumes the
+	// raw recording whose last write would say so, and an end the stop's
+	// deadline cuts off after it leaves the session active, for the next
+	// start to end at this time (storage.SQLiteStore.RecoverStaleSessions).
+	// A refused write leaves the raw recording, and the end, to a retry.
+	if !end.closeStored {
+		if err := m.store.RecordSessionClose(sessionID, endedAt); err != nil {
+			return fmt.Errorf("record when the session closed: %w", err)
+		}
+		end.closeStored = true
+	}
 	if !end.saved && m.recorder != nil {
 		path, err := m.recorder.EndSession(sessionID)
 		if err != nil {
