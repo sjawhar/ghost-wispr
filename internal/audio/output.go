@@ -124,7 +124,11 @@ type OutputConfig struct {
 // speechEndHold and the device can no longer give its audio back, or at once
 // on Cancel.
 type SpeechEvent struct {
-	Input   string
+	Input string
+	// Speech numbers the speech among all the Output's speeches, on any
+	// input, from 1: its start, its end and its audible event carry the same
+	// number, so that a listener can tie them together.
+	Speech  uint64
 	Started bool // false: the speech ended
 	// Cancelled is true when a Cancel cut the speech: it took back audio the
 	// room had not heard, or dropped audio still queued.
@@ -147,8 +151,8 @@ type SpeechEvent struct {
 	// (Begin), on its start and on its end, whatever ended it: a cut, its
 	// end, or the stream's close. A listener tells whose speech an event is
 	// from it, not from when the event comes. Nil for a playback begun with
-	// none. The event is 80 bytes with AtMono: the Output and the Supervisor
-	// pass it on by pointer, and each listener gets its own copy.
+	// none. The event is 88 bytes with AtMono and Speech: the Output and the
+	// Supervisor pass it on by pointer, and each listener gets its own copy.
 	Owner any
 }
 
@@ -164,6 +168,9 @@ type SpeechEvent struct {
 // another time than the account said, and then no time is given.
 type AudibleEvent struct {
 	Input string
+	// Speech is the number of the speech this event times, as its
+	// SpeechEvents carry it.
+	Speech uint64
 	// At is when the speech's first queued sample left the buffer: Mono on
 	// CLOCK_MONOTONIC, in nanoseconds, good to within Err, and Wall the wall
 	// clock at that instant, read with the account and moved by as much. A
@@ -237,6 +244,9 @@ type Output struct {
 	// under way (next, endAll, retake, closeIdle), for the SpeechEvents it
 	// reports with that time.
 	nowMono int64
+	// speeches counts the speeches started so far, on any input
+	// (SpeechEvent.Speech).
+	speeches uint64
 
 	// hear holds the listeners for audible events, and audibles the events
 	// queued for them (OnAudible); timed holds the events timed that wait for
@@ -311,6 +321,9 @@ type outputInput struct {
 	audibleAt, audibleLead int64
 	audiblePending         bool
 	audibleSince           uint64
+	// speech is the number of the input's speech under way
+	// (SpeechEvent.Speech).
+	speech uint64
 
 	// takenFrame is the newest frame with its speech's audio that the
 	// stream has taken (wrote), and takenAt when. A speech ends once the
@@ -1369,7 +1382,7 @@ func (o *Output) wrote(seq uint64, at time.Time, atMono int64) (timing bool) {
 		// the stream held that audio never started.
 		if in.startPending && in.startFrame <= seq && (!in.cancelled || in.cancelAt.After(at)) {
 			in.startPending, in.startedAt, in.startedMono = false, now, atMono
-			o.emit(&SpeechEvent{Input: in.name, Started: true, At: now, AtMono: atMono, Owner: in.owner})
+			o.emit(&SpeechEvent{Input: in.name, Speech: in.speech, Started: true, At: now, AtMono: atMono, Owner: in.owner})
 			// Timed against the disruptions before its first write (mixFrame).
 			in.audiblePending = in.audibleAt >= 0
 		}
@@ -1441,6 +1454,8 @@ func (o *Output) mixFrame(frame []int16, sum []float32, rate, hist int, now time
 			if queued && !in.speaking {
 				in.speaking, in.unlanded, in.owner = true, playedTime{}, started
 				in.startFrame, in.startPending = o.mixed, true
+				o.speeches++
+				in.speech = o.speeches
 				// The disruptions before the speech's first write: one that comes to
 				// that write, or after it before its first sample has played, leaves
 				// the speech untimed (settleAudibles).
@@ -1601,7 +1616,7 @@ func (o *Output) endSpeech(in *outputInput, now time.Time, cancelled bool) {
 	// A speech the stream never took audio of never started, and does not
 	// end either.
 	if !in.startPending {
-		in.endEvent = SpeechEvent{Input: in.name, Played: in.spoken.total(), Cancelled: cancelled, Owner: in.owner}
+		in.endEvent = SpeechEvent{Input: in.name, Speech: in.speech, Played: in.spoken.total(), Cancelled: cancelled, Owner: in.owner}
 		in.endPending = true
 		switch {
 		case cancelled:
@@ -1826,10 +1841,11 @@ func (o *Output) timeAudible(stream PlaybackStream, rate int) {
 		in.audiblePending = false
 		at := mid + (in.audibleAt-played)*second/int64(rate)
 		o.timed = append(o.timed, timedAudible{since: in.audibleSince, trigger: pos.trigger, position: in.audibleAt, event: AudibleEvent{
-			Input: in.name,
-			At:    monoclock.Stamp{Wall: pos.wall.Add(time.Duration(at - pos.before)), Mono: at},
-			Lead:  (in.audibleLead*second + int64(rate) - 1) / int64(rate),
-			Err:   err,
+			Input:  in.name,
+			Speech: in.speech,
+			At:     monoclock.Stamp{Wall: pos.wall.Add(time.Duration(at - pos.before)), Mono: at},
+			Lead:   (in.audibleLead*second + int64(rate) - 1) / int64(rate),
+			Err:    err,
 		}})
 	}
 }

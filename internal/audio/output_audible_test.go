@@ -117,13 +117,13 @@ func (r *audibleRig) play(input string, rate int, d time.Duration, value int16) 
 	r.waitSpeech(input, true)
 }
 
-func (r *audibleRig) waitSpeech(input string, started bool) {
+func (r *audibleRig) waitSpeech(input string, started bool) SpeechEvent {
 	r.t.Helper()
 	for {
 		select {
 		case e := <-r.speech:
 			if e.Input == input && e.Started == started {
-				return
+				return e
 			}
 		case <-time.After(5 * time.Second):
 			r.t.Fatalf("no speech event (%s, started %v)", input, started)
@@ -213,6 +213,40 @@ func TestAudibleEventsTimeEachSpeechsFirstSampleByTheStreamsAccount(t *testing.T
 		if e.Lead != 0 || e.Err != 1001 || e.Disruptions != 0 {
 			t.Fatalf("%s: lead %d, error %d, disruptions %d; want 0, 1001 (half the 2 us read, and 1 ns), 0", e.Input, e.Lead, e.Err, e.Disruptions)
 		}
+	}
+}
+
+// TestASpeechsEventsShareItsNumber fails if a speech's start, its end and its
+// audible event do not carry the same number, or if two speeches, on the
+// chime and then the voice, share one: the acceptance driver times an answer
+// by its own speech's audible line, which it ties to the answer's
+// first_audio by that number (Sol's review of #156 at 053df77c: the earliest
+// voice line near first_audio could be a cancelled word's).
+func TestASpeechsEventsShareItsNumber(t *testing.T) {
+	r := newAudibleRig(t, true)
+	pb := r.out.Begin(InputChime, nil)
+	go func() { _ = pb.WriteAll(testContext(t), constant(48000, 100*time.Millisecond, 1000), mono48k) }()
+	chimeStart := r.waitSpeech(InputChime, true)
+	chime := r.waitAudible(InputChime)
+	chimeEnd := r.waitSpeech(InputChime, false)
+	pb = r.out.Begin(InputVoice, nil)
+	go func() { _ = pb.WriteAll(testContext(t), constant(48000, 100*time.Millisecond, 3000), mono48k) }()
+	voiceStart := r.waitSpeech(InputVoice, true)
+	voice := r.waitAudible(InputVoice)
+	voiceEnd := r.waitSpeech(InputVoice, false)
+	for _, s := range []struct {
+		name              string
+		start, end, heard uint64
+	}{
+		{"the chime", chimeStart.Speech, chimeEnd.Speech, chime.Speech},
+		{"the voice", voiceStart.Speech, voiceEnd.Speech, voice.Speech},
+	} {
+		if s.start == 0 || s.end != s.start || s.heard != s.start {
+			t.Fatalf("%s: start %d, end %d, audible %d; want one number, not 0", s.name, s.start, s.end, s.heard)
+		}
+	}
+	if chimeStart.Speech == voiceStart.Speech {
+		t.Fatalf("the chime and the voice share speech %d", chimeStart.Speech)
 	}
 }
 

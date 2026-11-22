@@ -72,8 +72,8 @@ func TestTheSpeakersAudibleTimesReachTheTimingLog(t *testing.T) {
 	})
 	wall := time.Unix(1_800_000_000, 0)
 	sent := []audio.AudibleEvent{
-		{Input: audio.InputChime, At: monoclock.Stamp{Wall: wall, Mono: 1_000_000_123}, Lead: 0, Err: 1001, Disruptions: 2},
-		{Input: audio.InputVoice, At: monoclock.Stamp{Wall: wall.Add(900 * time.Millisecond), Mono: 1_900_000_456}, Lead: 666_667, Err: 1500, Disruptions: 2},
+		{Input: audio.InputChime, Speech: 7, At: monoclock.Stamp{Wall: wall, Mono: 1_000_000_123}, Lead: 0, Err: 1001, Disruptions: 2},
+		{Input: audio.InputVoice, Speech: 8, At: monoclock.Stamp{Wall: wall.Add(900 * time.Millisecond), Mono: 1_900_000_456}, Lead: 666_667, Err: 1500, Disruptions: 2},
 	}
 	for _, e := range sent {
 		speaker.hear(e)
@@ -85,7 +85,7 @@ func TestTheSpeakersAudibleTimesReachTheTimingLog(t *testing.T) {
 		t.Fatalf("%d audible lines, want %d: %v", len(got), len(sent), got)
 	}
 	for i, e := range sent {
-		want := []any{"input", e.Input, "audible_mono_ns", e.At.Mono, "audible_lead_ns", e.Lead, "audible_err_ns", e.Err, "disruptions", e.Disruptions}
+		want := []any{"input", e.Input, "speech", e.Speech, "audible_mono_ns", e.At.Mono, "audible_lead_ns", e.Lead, "audible_err_ns", e.Err, "disruptions", e.Disruptions}
 		if len(got[i]) != len(want) {
 			t.Fatalf("audible line %d: %v, want %v", i, got[i], want)
 		}

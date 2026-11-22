@@ -29,6 +29,8 @@ type fakeSpeaker struct {
 	cancels   map[string]time.Time // last Cancel per input
 	speaking  map[string]bool      // an input's speech is under way
 	owners    map[string]any       // the owner of the playback that started an input's speech
+	speeches  uint64               // speeches started so far, as audio.Output numbers them
+	speech    map[string]uint64    // the number of an input's speech under way
 	gen       map[string]int       // bumps on each Cancel, ending its playbacks
 	finished  map[string]chan struct{}
 	listeners map[int]func(audio.SpeechEvent)
@@ -252,7 +254,7 @@ func (s *fakeSpeaker) Cancel(input string) {
 	}
 	if s.speaking[input] {
 		now := monoclock.Now()
-		s.queueLocked(&audio.SpeechEvent{Input: input, Started: false, At: now.Wall, AtMono: now.Mono, Cancelled: true, Owner: s.owners[input]})
+		s.queueLocked(&audio.SpeechEvent{Input: input, Speech: s.speech[input], Started: false, At: now.Wall, AtMono: now.Mono, Cancelled: true, Owner: s.owners[input]})
 	}
 	s.speaking[input] = false
 	delete(s.owners, input)
@@ -338,7 +340,7 @@ func (s *fakeSpeaker) endSpeech(input string) {
 	s.mu.Lock()
 	if s.speaking[input] {
 		now := monoclock.Now()
-		s.queueLocked(&audio.SpeechEvent{Input: input, Started: false, At: now.Wall, AtMono: now.Mono, Owner: s.owners[input]})
+		s.queueLocked(&audio.SpeechEvent{Input: input, Speech: s.speech[input], Started: false, At: now.Wall, AtMono: now.Mono, Owner: s.owners[input]})
 	}
 	s.speaking[input] = false
 	delete(s.owners, input)
@@ -392,8 +394,13 @@ func (p *fakePlayback) Write(ctx context.Context, frame []byte, format audio.Aud
 	}
 	if !s.speaking[p.input] {
 		s.owners[p.input] = p.owner // the speech is this playback's owner's, as audio.Output's is
+		if s.speech == nil {
+			s.speech = make(map[string]uint64)
+		}
+		s.speeches++
+		s.speech[p.input] = s.speeches
 		now := monoclock.Now()
-		s.queueLocked(&audio.SpeechEvent{Input: p.input, Started: true, At: now.Wall, AtMono: now.Mono, Owner: p.owner})
+		s.queueLocked(&audio.SpeechEvent{Input: p.input, Speech: s.speech[p.input], Started: true, At: now.Wall, AtMono: now.Mono, Owner: p.owner})
 	}
 	s.speaking[p.input] = true
 	s.mu.Unlock()

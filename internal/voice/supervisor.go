@@ -2486,13 +2486,15 @@ func (s *Supervisor) sendNotes() {
 // driver times the answer against the chime in one recording of the room,
 // and the device's latency, the same for both, cancels. The line is stamped
 // at that instant on both clocks (AudibleEvent.At), so its at_mono_ns is its
-// audible_mono_ns, CLOCK_MONOTONIC, the driver's clock. A line heard during
-// an exchange names its session, held until it has one, as its other timing
-// lines are (exTimingLocked); any other names the session now.
+// audible_mono_ns, CLOCK_MONOTONIC, the driver's clock. It names its speech
+// (speech), as the voice's first_audio and speech_end lines do, so that the
+// driver times an answer by its own speech's line, not another's. A line
+// heard during an exchange names its session, held until it has one, as its
+// other timing lines are (exTimingLocked); any other names the session now.
 func (s *Supervisor) onAudible(e audio.AudibleEvent) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	kv := []any{"input", e.Input, "audible_mono_ns", e.At.Mono, "audible_lead_ns", e.Lead, "audible_err_ns", e.Err, "disruptions", e.Disruptions}
+	kv := []any{"input", e.Input, "speech", e.Speech, "audible_mono_ns", e.At.Mono, "audible_lead_ns", e.Lead, "audible_err_ns", e.Err, "disruptions", e.Disruptions}
 	if s.ex != nil {
 		s.exTimingLocked(s.ex, "audible", e.At, kv...)
 		return
@@ -2531,11 +2533,11 @@ func (s *Supervisor) onSpeech(e *audio.SpeechEvent) {
 		s.voiceEnded = time.Now()
 		switch {
 		case ex != nil:
-			s.exTimingLocked(ex, "speech_end", at)
+			s.exTimingLocked(ex, "speech_end", at, "speech", e.Speech)
 		case s.speechSession != nil:
-			s.timing("speech_end", *s.speechSession, at)
+			s.timing("speech_end", *s.speechSession, at, "speech", e.Speech)
 		default: // it began before the Supervisor listened
-			s.timing("speech_end", s.sessionNow(), at)
+			s.timing("speech_end", s.sessionNow(), at, "speech", e.Speech)
 		}
 		s.speechSession = nil
 	}
@@ -2554,7 +2556,7 @@ func (s *Supervisor) onSpeech(e *audio.SpeechEvent) {
 	}
 	if !ex.turnAt.IsZero() && !ex.firstOutDone {
 		ex.firstOutDone = true
-		s.exTimingLocked(ex, "first_audio", at)
+		s.exTimingLocked(ex, "first_audio", at, "speech", e.Speech)
 		s.logf("voice: first spoken audio %v after the turn ended", e.At.Sub(ex.turnAt).Round(time.Millisecond))
 	}
 	if ex.factPending {

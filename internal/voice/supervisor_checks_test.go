@@ -591,6 +591,50 @@ func TestFactAudioIsTheSpeechStart(t *testing.T) {
 	}
 }
 
+// TestTheAnswersTimingLinesNameItsSpeech fails if the answer's first_audio
+// and speech_end lines do not name the speech the speaker numbered, or name
+// different ones: the acceptance driver ties the answer's audible line to its
+// first_audio by that number, so that another speech's line, such as a
+// cancelled word's, never times the answer (Sol's review of #156 at
+// 053df77c).
+func TestTheAnswersTimingLinesNameItsSpeech(t *testing.T) {
+	r := newRig(t, newFakeConcierge("The voice issue is in review."))
+	var mu sync.Mutex
+	var voice []uint64
+	r.speaker.OnSpeech(func(e audio.SpeechEvent) {
+		if e.Input == audio.InputVoice && e.Started {
+			mu.Lock()
+			voice = append(voice, e.Speech)
+			mu.Unlock()
+		}
+	})
+	r.ask("what is happening?")
+	waitTimings(t, r, "first_audio")
+	r.speaker.finish(audio.InputVoice)
+	waitTimings(t, r, "speech_end")
+	mu.Lock()
+	starts := append([]uint64(nil), voice...)
+	mu.Unlock()
+	if len(starts) != 1 {
+		t.Fatalf("fixture: the voice's speech started %d times, want once: %v", len(starts), starts)
+	}
+	want := starts[0]
+	got := map[string]any{}
+	for _, l := range r.timingLines() {
+		if l.event != "first_audio" && l.event != "speech_end" {
+			continue
+		}
+		for i := 0; i+1 < len(l.kv); i += 2 {
+			if l.kv[i] == "speech" {
+				got[l.event] = l.kv[i+1]
+			}
+		}
+	}
+	if want == 0 || got["first_audio"] != want || got["speech_end"] != want {
+		t.Fatalf("first_audio names speech %v and speech_end %v; want the speaker's speech %d in both", got["first_audio"], got["speech_end"], want)
+	}
+}
+
 // slowSayVoice opens the rig's fake sessions, and returns from each Say
 // 300 ms after its speech started, while it still plays.
 type slowSayVoice struct{ r *rig }
