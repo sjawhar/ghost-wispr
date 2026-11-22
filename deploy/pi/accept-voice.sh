@@ -1403,6 +1403,7 @@ start_recording() {
   recording=$2
   anchors_file="$recording.anchors"
   recording_cut=false
+  sampler_status=0
   : >"$anchors_file"
   : >"$recording.sampler"
   rm -f -- "$recording.pid"
@@ -1490,7 +1491,10 @@ sampler_line() {
 # had captured but not yet written. Every sample in the file was captured before arecord ended, so a
 # last anchor, which the sampler takes once arecord has ended and it gets SIGTERM, bounds the end of
 # the file too. An arecord that already ended on its own cut the recording short, which
-# analyse_recording reports.
+# analyse_recording reports. sampler_status is the sampler's exit status: it ends 0 on SIGTERM, so
+# any other status, or anything on its stderr, is a sampler that failed partway, whose anchors stop
+# where it failed (c28 of #156 read that as "after its last anchor").
+sampler_status=0
 stop_recording() {
   if [[ -n $arecord_pid ]]; then
     kill -TERM "$arecord_pid" 2>/dev/null || recording_cut=true
@@ -1500,6 +1504,7 @@ stop_recording() {
   if [[ -n $anchor_pid ]]; then
     kill -TERM "$anchor_pid" 2>/dev/null
     wait "$anchor_pid" 2>/dev/null
+    sampler_status=$?
     anchor_pid=
   fi
 }
@@ -1547,6 +1552,13 @@ analyse_recording() {
     || unknown "recording: cannot read the sounds of $recording: $(tail -n 3 "$work_dir/sounds.err" | tr '\n' ' ')"
   [[ $recording_cut == false ]] \
     || unknown "recording: arecord stopped before the step ended it, so the recording does not cover the step: $(tr '\n' ' ' <"$work_dir/arecord.err")"
+  if [[ $sampler_status != 0 || -s $work_dir/sampler.err ]]; then
+    local first last
+    first=$(head -n 1 "$work_dir/sampler.err")
+    last=$(tail -n 1 "$work_dir/sampler.err")
+    [[ $last != "$first" ]] || last=
+    unknown "recording: the sampler of $recording failed (exit status $sampler_status), so its anchors stop where it failed and no time after can be bounded by them: ${first:-it wrote nothing}${last:+ … $last}"
+  fi
   sound_on=()
   sound_off=()
   sound_on_early=()

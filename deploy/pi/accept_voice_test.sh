@@ -1377,11 +1377,17 @@ def arecord(args):
                     log_to("recordings", "%s %d" % (path, begun + skip))
             if "arecord-dies" in SCENARIO and lag_until is not None and t > lag_until + 1000:
                 return 1
-            if clipped is None and SCENARIO & {"capture-silent-xrun", "capture-silent-restart", "arecord-suspend"} and read("aplays", "0") != aplays:
+            if clipped is None and SCENARIO & {"capture-silent-xrun", "capture-silent-restart", "arecord-suspend", "sampler-crash"} and read("aplays", "0") != aplays:
                 clipped = t
                 if "arecord-suspend" in SCENARIO and "-q" not in args:
                     sys.stderr.write("Suspended. Trying resume. Done.\n")
                     sys.stderr.flush()
+                # sampler-crash: a status with a byte that is not utf-8, which the sampler's read of
+                # the substream's state raises on: a sampler that fails partway, whose failure the
+                # driver must name (c28 of #156 hid a traceback behind "after its last anchor").
+                if "sampler-crash" in SCENARIO and substream:
+                    with open(os.path.join(substream, "status"), "wb") as g:
+                        g.write(b"state: RUNNING\nowner_pid   : %d\ntrigger_time: %s\n\xff\n" % (os.getpid(), trigger[0].encode()))
             if SCENARIO & {"capture-silent-xrun", "capture-silent-restart"} and clipped is not None:
                 state = "XRUN" if t < clipped + (600 if "capture-silent-xrun" in SCENARIO else 30) else "RUNNING"
                 if state != shown:
@@ -2389,6 +2395,10 @@ launch barge-pause-suspend answer-until-clip,backchannel-pause-500,arecord-slow-
 # again from a new trigger_time (capture-silent-restart): continuity is not shown, so UNKNOWN with
 # a NOTE, never PASS.
 launch barge-pause-silent-restart answer-until-clip,backchannel-pause-500,arecord-slow-start,capture-buffer-250,capture-silent-restart yes -- --step barge-in --talkovers 1 --backchannels 1 --question @question.wav --talkover-dir @talkovers --backchannel-dir @backchannels --rig-mic "$rig" --event-timeout 15
+# The same pause with the sampler failing partway (sampler-crash: a capture status it cannot decode):
+# its anchors stop, so UNKNOWN naming the sampler's failure and its stderr, never PASS, and never the
+# "after its last anchor" that hid c28's traceback (#156).
+launch barge-pause-sampler-crash answer-until-clip,backchannel-pause-500,sampler-crash yes -- --step barge-in --talkovers 1 --backchannels 1 --question @question.wav --talkover-dir @talkovers --backchannel-dir @backchannels --rig-mic "$rig" --event-timeout 15
 # The same pause with the substream's status giving no trigger_time (capture-no-trigger): RUNNING
 # alone cannot show the substream ran on without a restart, so UNKNOWN with a NOTE naming the missing
 # trigger, never PASS (Sol's review of #149 at 9b3d27cb).
@@ -3169,6 +3179,14 @@ expect_line barge-pause 'PASS: barge-in: 0 of 1 backchannels stopped the speech,
 expect_line barge-pause 'NOTE: barge-in round 2 (backchannel): the speech went on'
 grep -Fq '"kind": "quiet"' "$root/barge-pause/state/timeline.jsonl" || check_failed 'barge-pause: the fake voice did not pause'
 expect_restored barge-pause
+# The control: a sampler that ran clean says nothing of its own.
+expect_no_line barge-pause 'UNKNOWN: recording: the sampler of'
+expect_rc barge-pause-sampler-crash 2
+expect_line barge-pause-sampler-crash 'UNKNOWN: recording: the sampler of'
+expect_line barge-pause-sampler-crash 'UnicodeDecodeError'
+expect_no_line barge-pause-sampler-crash 'after its last anchor'
+expect_no_line barge-pause-sampler-crash 'PASS: barge-in: 0 of 1'
+expect_restored barge-pause-sampler-crash
 expect_rc barge-pause-unsure 2
 expect_line barge-pause-unsure 'UNKNOWN: barge-in: 0 of 1 backchannels stopped the speech, and backchannel rounds 2 may have'
 expect_no_line barge-pause-unsure 'PASS: barge-in: 0 of 1'
