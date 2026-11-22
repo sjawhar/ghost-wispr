@@ -1,7 +1,6 @@
 <!--
-A markdown link in text a model wrote. A link to a web or mail address is a
-link; any other address, such as a javascript: one that would run script when
-clicked, shows as the link's text only.
+A markdown link in text a model wrote. A link to an http, https or mailto
+address is a link; any other address shows as the link's text only.
 -->
 <script lang="ts">
   import type { Snippet } from 'svelte'
@@ -12,11 +11,14 @@ clicked, shows as the link's text only.
     children,
   }: { href?: string; title?: string; children?: Snippet } = $props()
 
-  // The URL parser removes the tabs and line breaks a browser removes, and
-  // lowercases the scheme, so "JaVa\tScRiPt:" reads as "javascript:".
+  // The address is parsed on its own, with no base: one that names no scheme,
+  // or a scheme the parser does not take (a space or an entity in it), fails
+  // to parse and is text. The parser removes the tabs and line breaks a
+  // browser removes and lowercases the scheme, so "JaVa<tab>ScRiPt:" is
+  // javascript:.
   const safe = $derived.by(() => {
     try {
-      return ['http:', 'https:', 'mailto:'].includes(new URL(href, document.baseURI).protocol)
+      return ['http:', 'https:', 'mailto:'].includes(new URL(href).protocol)
     } catch {
       return false
     }
