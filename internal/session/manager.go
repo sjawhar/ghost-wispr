@@ -683,9 +683,12 @@ func (m *Manager) endSession(ctx context.Context, want string) error {
 	// raw recording whose last write would say so, and an end the stop's
 	// deadline cuts off after it leaves the session active, for the next
 	// start to end at this time (storage.SQLiteStore.RecoverStaleSessions).
-	// A refused write leaves the raw recording, and the end, to a retry.
+	// A refused write fails the end before the recording closes: the
+	// recording goes on, so the retry takes the time it closes it, not this
+	// one (failedEnd keeps nothing of this attempt).
 	if !end.closeStored {
 		if err := m.store.RecordSessionClose(sessionID, endedAt); err != nil {
+			end = sessionEnd{}
 			return fmt.Errorf("record when the session closed: %w", err)
 		}
 		end.closeStored = true
