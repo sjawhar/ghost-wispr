@@ -107,10 +107,11 @@ CLOCK = 1.0002 if "clock-fast" in SCENARIO else 0.9998 if "clock-slow" in SCENAR
 # The capture buffer the fake arecord's substream reports, in frames at 48 kHz: the 40 ms arecord asks
 # for on the Pi, or 250 ms with capture-buffer-250. The floor cases take the larger one, so that a
 # loaded test machine, which can hold the fake back by more than the Pi's 61 ms, seldom makes it
-# overrun; their fixtures keep a margin over the larger bound. FAKE_RESIDENCY_MS is the longest a
-# captured sample may then wait unwritten without an overrun: two 10 ms periods, the buffer and
-# 1 ms, as accept-voice.sh's capture_buffer computes it.
-CAPTURE_BUFFER_FRAMES = 12000 if "capture-buffer-250" in SCENARIO else 1920
+# overrun; their fixtures keep a margin over the larger bound. capture-buffer-5000 is for a case that
+# must not overrun at all and uses no floor: no load seen holds the fake back 5 s. FAKE_RESIDENCY_MS
+# is the longest a captured sample may then wait unwritten without an overrun: two 10 ms periods,
+# the buffer and 1 ms, as accept-voice.sh's capture_buffer computes it.
+CAPTURE_BUFFER_FRAMES = 240000 if "capture-buffer-5000" in SCENARIO else 12000 if "capture-buffer-250" in SCENARIO else 1920
 FAKE_RESIDENCY_MS = (CAPTURE_BUFFER_FRAMES + 2 * 480) // 48 + 1
 # The scenarios whose rig capture loses audio (capture-gap items in the timeline), as an overrun does.
 CAPTURE_GAPS = {"capture-gap", "capture-gap-after-stop-100", "capture-gap-after-stop-300"}
@@ -2687,10 +2688,13 @@ launch cancel-locked long,asound,stop-rounds-2,arecord-hold-200,arecord-reopen,a
 launch cancel-lock-start long,asound,stop-rounds-2,arecord-lock-start,capture-buffer-250 yes -- $cancel_args
 # The same with the sampler's UNWATCHED line though the pid was not late
 # (sampler-says-unwatched-wrongly): the fake's account, under its lock, must still say the pid file
-# was there, so that the self-test would not take the NOTE (Sol's review of #162 at 494ba440: a
-# check for the file under the lock read as absent, and the wrong NOTE passed as a fallback).
+# was there, and the self-test must reject the NOTE (Sol's review of #162 at 494ba440: a check for
+# the file under the lock read as absent, and the wrong NOTE passed as a fallback). Its 5 s buffer
+# (capture-buffer-5000) keeps the fake from overrunning however loaded the machine, as an overrun
+# would come first and hide the NOTE; the case uses no floor, as the NOTE turns it off. A run that
+# overran anyway fails (Sol's review of #162 at dabcc799).
 # shellcheck disable=SC2086
-launch cancel-lock-start-wrongly long,asound,stop-rounds-2,arecord-lock-start,capture-buffer-250,sampler-says-unwatched-wrongly yes -- $cancel_args
+launch cancel-lock-start-wrongly long,asound,stop-rounds-2,arecord-lock-start,capture-buffer-5000,sampler-says-unwatched-wrongly yes -- $cancel_args
 # A good cancel whose sampler says its first samples landed before it knew arecord's process
 # (sampler-says-unwatched, which plays a late pid and logs the pid file absent at its first sample):
 # the driver turns the floor off with its NOTE, and as the fake's log agrees, the case falls back as
@@ -3550,7 +3554,19 @@ expect_restored cancel-locked
 expect_load_case cancel-lock-start
 [[ -s $root/cancel-lock-start/state/arecord-locked ]] || check_failed 'cancel-lock-start: the fake arecord never locked its file away, so the case tested no failed read'
 expect_restored cancel-lock-start
-expect_discontinuity cancel-lock-start-wrongly "$unwatched_note"
+# cancel-lock-start-wrongly cannot overrun (its 5 s buffer), so its driver must name the wrong
+# UNWATCHED, and unwatched_agreed must reject it for the pid file the fake found there. The rejection
+# is expected, so it runs in a subshell: its FAIL line is read here, and counts nothing.
+if fake_overran cancel-lock-start-wrongly; then
+  check_failed "cancel-lock-start-wrongly: the fake overran, which its 5 s buffer must prevent, so the wrong UNWATCHED's rejection was not tested"
+else
+  expect_line cancel-lock-start-wrongly "$unwatched_note"
+  if rejection=$(unwatched_agreed cancel-lock-start-wrongly); then
+    check_failed "cancel-lock-start-wrongly: the self-test took the driver's wrong UNWATCHED as a fallback, though the fake found the pid file there"
+  elif [[ $rejection != *"the fake's account of the pid file as its first sample landed is present"* ]]; then
+    check_failed "cancel-lock-start-wrongly: the wrong UNWATCHED was not rejected for the pid file found there: ${rejection:-no reason given}"
+  fi
+fi
 [[ -s $root/cancel-lock-start-wrongly/state/arecord-locked ]] || check_failed 'cancel-lock-start-wrongly: the fake arecord never locked its file away'
 evidence=$(unwatched_evidence cancel-lock-start-wrongly)
 [[ $evidence == present ]] \
