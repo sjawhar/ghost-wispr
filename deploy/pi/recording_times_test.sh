@@ -612,19 +612,27 @@ failures = []
 # #149 at 9b3d27cb): a status with no trigger_time, or one that is not a number, shows nothing about
 # a restart, so no anchor keeps its floor and the sampler names the trigger it could not read. So
 # do inf, nan and a time not in the kernel's form (Sol's review of #149 at 44738566). Two triggers
-# 1 ns apart are a restart (restarted-1ns): a float holds neither apart.
+# 1 ns apart are a restart (restarted-1ns): a float holds neither apart. Seconds with a redundant
+# leading zero (padded-trigger) or past signed 64 bits (huge-trigger) are not what "%lld" prints, so
+# NO-TRIGGER too (Sol's review of #159 at 75a99ec1); seconds of 0 and of the largest signed 64-bit
+# value are (zero-trigger, max-trigger), so the substream runs on.
 # late-pid (c28 of #156): on a loaded machine the driver can write arecord's pid after arecord's
 # first sample. The sampler must go on taking anchors, a floor once it can read the substream's
 # state by the pid, and the last one, of the whole file, once arecord has ended; it must not stop.
 t1, t2 = "1700000000.000000001", "1700000000.000000002"
-no_trigger = ("no-trigger", "bad-trigger", "inf-trigger", "nan-trigger", "short-trigger")
+no_trigger = ("no-trigger", "bad-trigger", "inf-trigger", "nan-trigger", "short-trigger", "padded-trigger", "huge-trigger")
+running = ("running", "closed-at-end", "late-pid", "zero-trigger", "max-trigger")
 for case, states in (("running", ["RUNNING " + t1] * 4), ("closed", ["RUNNING " + t1, "closed"]),
                      ("xrun", ["RUNNING " + t1, "XRUN " + t1]), ("restarted", ["RUNNING " + t1, "RUNNING 1700000001.000000001"]),
                      ("restarted-1ns", ["RUNNING " + t1, "RUNNING " + t2]),
                      ("closed-at-end", ["RUNNING " + t1] * 5 + ["closed"]),
                      ("no-trigger", ["RUNNING -"] * 4), ("bad-trigger", ["RUNNING soon"] * 4),
                      ("inf-trigger", ["RUNNING inf"] * 4), ("nan-trigger", ["RUNNING nan"] * 4),
-                     ("short-trigger", ["RUNNING 1700000000.5"] * 4), ("late-pid", ["RUNNING " + t1] * 4)):
+                     ("short-trigger", ["RUNNING 1700000000.5"] * 4), ("late-pid", ["RUNNING " + t1] * 4),
+                     ("padded-trigger", ["RUNNING 0001.000000001"] * 4),
+                     ("huge-trigger", ["RUNNING 9223372036854775808.000000001"] * 4),
+                     ("zero-trigger", ["RUNNING 0.000000001"] * 4),
+                     ("max-trigger", ["RUNNING 9223372036854775807.999999999"] * 4)):
     work = os.path.join(base, "sampler-" + case)
     status_dir = os.path.join(work, "asound", "card4", "pcm0c", "sub0")
     os.makedirs(status_dir)
@@ -675,7 +683,7 @@ for case, states in (("running", ["RUNNING " + t1] * 4), ("closed", ["RUNNING " 
     sampled = [l for l in lines if int(l[1]) > 44]
     floors = [l for l in sampled if len(l) == 3]
     reported = [l for l in out.splitlines() if l.startswith("discontinuous ")]
-    if case in ("running", "closed-at-end", "late-pid"):
+    if case in running:
         if not floors or reported:
             failures.append("%s: %d floor anchors, discontinuous %r; want floors and none" % (case, len(floors), reported))
         if case == "closed-at-end" and lines and len(lines[-1]) == 3:

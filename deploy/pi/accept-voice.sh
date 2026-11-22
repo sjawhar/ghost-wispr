@@ -503,9 +503,11 @@ def capture_state(root, pid):
     root, as RUNNING, and its trigger_time, which the kernel sets at every start, stop (an
     overrun's included), pause, suspend and resume, as exact (seconds, nanoseconds): the kernel
     prints it "%lld.%09lld" (sound/core/pcm.c, snd_pcm_substream_proc_status_read), and a float
-    would hold two triggers 1 ns apart as one (Sol's review of #149 at 44738566). None for a
-    trigger_time missing or in any other form, inf and nan among them; (None, None) when no
-    substream names it. The kernel pads the keys ("owner_pid   :")."""
+    would hold two triggers 1 ns apart as one (Sol's review of #149 at 44738566). Only that form
+    counts: seconds as "%lld" prints a time, with no redundant leading zero and within signed 64
+    bits, then nine digits (Sol's review of #159 at 75a99ec1). None for a trigger_time missing or in
+    any other form, inf and nan among them; (None, None) when no substream names it. The kernel
+    pads the keys ("owner_pid   :")."""
     for status in glob.glob(os.path.join(root, "card*", "pcm*c", "sub*", "status")):
         try:
             with open(status) as f:
@@ -513,8 +515,10 @@ def capture_state(root, pid):
         except OSError:
             continue
         if fields.get("owner_pid") == str(pid):
-            trigger = re.fullmatch(r"([0-9]+)\.([0-9]{9})", fields.get("trigger_time", ""))
-            return fields.get("state"), (int(trigger[1]), int(trigger[2])) if trigger else None
+            trigger = re.fullmatch(r"(0|[1-9][0-9]*)\.([0-9]{9})", fields.get("trigger_time", ""))
+            if trigger and int(trigger[1]) < 1 << 63:
+                return fields.get("state"), (int(trigger[1]), int(trigger[2]))
+            return fields.get("state"), None
     return None, None
 
 

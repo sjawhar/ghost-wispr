@@ -995,7 +995,8 @@ with the unit paused and no session active:
    state that shows it `RUNNING`, from the `trigger_time` of the first such read. arecord may not
    live to report an overrun, as when the step stops it in a stalled write and it closes the
    substream, and the kernel sets `trigger_time` at every start, stop, suspend and resume. It is
-   compared exactly, as the whole seconds and nine digits of nanoseconds the kernel prints. A state
+   compared exactly, as the kernel prints it: whole seconds (no leading zero, within signed 64
+   bits) and nine digits of nanoseconds. A state
    read that shows anything else, another trigger, or no `trigger_time` in that form (which can
    show no restart) turns this bound off for the whole recording.
    No substream at all is arecord closing its capture as it ends, which it does after its last
