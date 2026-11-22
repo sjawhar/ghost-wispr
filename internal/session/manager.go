@@ -56,8 +56,10 @@ type Manager struct {
 	startIDs                       map[uint64]string // the last startIDsKept settled starts' ids, by sequence number (SessionOfStart)
 	startsDone                     *sync.Cond        // signalled (with mu) when a session start finishes
 	endingSession                  bool              // an end of the current session is under way
-	endsDone                       *sync.Cond        // signalled (with mu) when an end of the session finishes, and when endsRunning falls
+	endsDone                       *sync.Cond        // signalled (with mu) when an end of the session finishes, when endsRunning falls, and when a flush ends
 	endsRunning                    int               // session ends under way, from their claim until they return (WaitForLifecyclePublishes)
+	flushesRunning                 int               // flushes storing the words they took from the buffer (flushBuffer); an end waits for them before it writes
+	sealedSession                  string            // a session whose end is writing it: no flush takes words for it (endSession)
 	failedEnd                      sessionEnd        // how far an end of the current session that failed got
 	finalizeWaiter                 chan struct{}     // closed by Deepgram's next Finalize reply; see AwaitFinalize
 	lastIDTime                     time.Time         // the start second the latest session ID names
@@ -92,6 +94,7 @@ type sessionEnd struct {
 	audioPath    string    // the saved recording, once saved
 	saved        bool      // the recorder has saved the recording, or the end gave it up
 	saveFailures int       // attempts to save the recording that failed
+	closeStored  bool      // endedAt is in the store (SessionStore.RecordSessionClose)
 }
 
 // maxRecordingSaveAttempts is how many times ending a session tries to save
@@ -402,6 +405,14 @@ func (m *Manager) flushBuffer() error {
 	// to the session they were spoken in, or are dropped while paused, and can
 	// never open a session after the resume.
 	m.mu.Lock()
+	if m.sealedSession != "" && m.sealedSession == m.currentSessionID {
+		// The session's end is writing it: words stored now would land in an
+		// ended session. They stay in the buffer, and the end sorts them as
+		// it sorts the words that come after it (raiseFloorToCloseLocked,
+		// openWaitingSession).
+		m.mu.Unlock()
+		return nil
+	}
 	words := m.buffer.Flush()
 	if m.endingSession && !m.capturePaused {
 		// The current session is ending, and its recording may be closed
@@ -417,6 +428,16 @@ func (m *Manager) flushBuffer() error {
 		m.mu.Unlock()
 		return nil
 	}
+	// The words are out of the buffer but not yet stored: an end of their
+	// session waits until they are before it writes the end (endSession), so
+	// the session never ends, nor its summary starts, without them.
+	m.flushesRunning++
+	defer func() {
+		m.mu.Lock()
+		m.flushesRunning--
+		m.endsDone.Broadcast()
+		m.mu.Unlock()
+	}()
 	sessionID, err := m.claimSessionLocked(time.Now().UTC())
 	if err != nil {
 		if errors.Is(err, ErrCapturePaused) {
@@ -652,11 +673,26 @@ func (m *Manager) endSession(ctx context.Context, want string) error {
 			m.mu.Lock()
 			m.failedEnd = end
 			m.endingSession = false
+			m.sealedSession = ""
 			m.endsDone.Broadcast()
 			m.mu.Unlock()
 		}
 	}()
 	endedAt := end.endedAt
+	// Store when the recording closed before saving it: the save consumes the
+	// raw recording whose last write would say so, and an end the stop's
+	// deadline cuts off after it leaves the session active, for the next
+	// start to end at this time (storage.SQLiteStore.RecoverStaleSessions).
+	// A refused write fails the end before the recording closes: the
+	// recording goes on, so the retry takes the time it closes it, not this
+	// one (failedEnd keeps nothing of this attempt).
+	if !end.closeStored {
+		if err := m.store.RecordSessionClose(sessionID, endedAt); err != nil {
+			end = sessionEnd{}
+			return fmt.Errorf("record when the session closed: %w", err)
+		}
+		end.closeStored = true
+	}
 	if !end.saved && m.recorder != nil {
 		path, err := m.recorder.EndSession(sessionID)
 		if err != nil {
@@ -673,10 +709,30 @@ func (m *Manager) endSession(ctx context.Context, want string) error {
 		end.audioPath, end.saved = path, true
 	}
 
-	// With a publisher, the session_ended event is queued in the same write
-	// as the end: a stop that refuses its send (publishLifecycle) leaves it
-	// for the next start's sweep.
+	// Seal the session: from here no flush takes words for it (flushBuffer).
+	// The flushes that took words before, a pause's or those of results that
+	// came while the recording was saved, store them before the session ends,
+	// up to ctx's deadline, so its summary has them and none lands in it
+	// after. With a publisher, the session_ended event is queued in the same
+	// write as the end: a stop that refuses its send (publishLifecycle) leaves
+	// it for the next start's sweep.
 	m.mu.Lock()
+	m.sealedSession = sessionID
+	if m.flushesRunning > 0 {
+		stop := context.AfterFunc(ctx, func() {
+			m.mu.Lock()
+			defer m.mu.Unlock()
+			m.endsDone.Broadcast()
+		})
+		defer stop()
+		for m.flushesRunning > 0 {
+			if err := ctx.Err(); err != nil {
+				m.mu.Unlock()
+				return err
+			}
+			m.endsDone.Wait()
+		}
+	}
 	queue := ""
 	if m.publisher != nil {
 		queue = sessionEndedEvent
@@ -694,6 +750,7 @@ func (m *Manager) endSession(ctx context.Context, want string) error {
 	// No word captured before the recording closed reaches a later session.
 	m.raiseFloorToCloseLocked()
 	m.endingSession = false
+	m.sealedSession = ""
 	m.endsDone.Broadcast()
 	ended = true
 	minSegs := m.minSessionSegments
