@@ -3,7 +3,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { PresetDetail } from '../../lib/config-api'
 import PresetEditor from '../PresetEditor.svelte'
 import { resetConfigState } from '../../lib/config.svelte'
-import { sent, stubFetch } from './configFixture'
+import { sent, stubFetch, unitConfig } from './configFixture'
 
 const presets: Record<string, PresetDetail> = {
   standup: {
@@ -88,6 +88,46 @@ describe('PresetEditor', () => {
           method: 'PATCH',
           body: { summarization: { presets: { standup: { description: 'Weekly notes' } } } },
         },
+      ]),
+    )
+  })
+
+  // The model changed on the unit while the form was open; the first save's
+  // answer carries it. The field must take it, so the next save does not send
+  // the old model back.
+  it("takes a change its save's answer carries, so the next save does not undo it", async () => {
+    const answered = {
+      ...unitConfig,
+      summarization: {
+        ...unitConfig.summarization,
+        presets: {
+          standup: {
+            ...presets.standup,
+            description: 'Weekly notes',
+            model: 'vertex/gemini-4-carbon',
+          },
+        },
+      },
+    }
+    const fetch = stubFetch({ config: answered })
+    await expandStandup()
+
+    await fireEvent.input(field('Description'), { target: { value: 'Weekly notes' } })
+    await fireEvent.click(screen.getByRole('button', { name: 'Save' }))
+    await waitFor(() =>
+      expect(field('Model Override (optional)').value).toBe('vertex/gemini-4-carbon'),
+    )
+    await fireEvent.input(field('Description'), { target: { value: 'Weekly notes, short' } })
+    await fireEvent.click(screen.getByRole('button', { name: 'Save' }))
+
+    await waitFor(() =>
+      expect(
+        sent(fetch)
+          .filter((r) => r.method === 'PATCH')
+          .map((r) => r.body),
+      ).toEqual([
+        { summarization: { presets: { standup: { description: 'Weekly notes' } } } },
+        { summarization: { presets: { standup: { description: 'Weekly notes, short' } } } },
       ]),
     )
   })

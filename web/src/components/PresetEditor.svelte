@@ -51,16 +51,23 @@
   // made to it elsewhere since.
   let base: PresetDetail | undefined
 
-  // A field the unit changes while its preset is open takes the unit's value;
-  // the other fields keep what was typed.
+  // takeUnit gives each field the unit's value where the unit changed it since
+  // base, keeps what was typed in the others, and makes preset the new base.
+  function takeUnit(preset: PresetDetail): void {
+    if (base) {
+      if (preset.description !== base.description) editDesc = preset.description
+      if (preset.system_prompt !== base.system_prompt) editPrompt = preset.system_prompt
+      if (preset.user_template !== base.user_template) editTemplate = preset.user_template
+      if (preset.model !== base.model) editModel = preset.model
+    }
+    base = { ...preset }
+  }
+
+  // The open preset as the settings page passes it in, after another
+  // section's save, say.
   $effect(() => {
     const preset = presets[expandedPreset]
-    if (isNew || !preset || !base) return
-    if (preset.description !== base.description) editDesc = preset.description
-    if (preset.system_prompt !== base.system_prompt) editPrompt = preset.system_prompt
-    if (preset.user_template !== base.user_template) editTemplate = preset.user_template
-    if (preset.model !== base.model) editModel = preset.model
-    base = { ...preset }
+    if (!isNew && preset && base) takeUnit(preset)
   })
 
   // Whether the press that a click on a dialog's overlay ends began on the
@@ -184,9 +191,11 @@
         summarization: { presets: { [name]: fields } },
       })
       setConfig(updated)
+      // The answer can carry a change made elsewhere since the preset opened:
+      // a field takes it here, before the page passes the new presets in.
       const saved = updated.summarization.presets[name]
       if (saved) {
-        base = { ...saved }
+        takeUnit(saved)
       }
       feedback = 'Saved!'
       if (isNew) {
