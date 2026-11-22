@@ -114,7 +114,9 @@ export interface ConfigPatch {
   min_session_segments?: number
   summarization?: {
     model?: string
-    // A preset's fields to change; null deletes the preset.
+    // A preset's fields to change; null deletes the preset. A model or
+    // description of '' clears it: a preset with no model uses
+    // summarization.model.
     presets?: Record<string, Partial<PresetDetail> | null>
   }
   transcription?: {
