@@ -495,9 +495,9 @@ def size_reader(path):
 
 def capture_state(root, pid):
     """The state of the capture substream arecord (pid) holds, from its /proc/asound status under
-    root, as RUNNING, and its trigger_time, which the kernel sets at every start, stop (an
-    overrun's included), pause, suspend and resume; (None, None) when no substream names it. The
-    kernel pads the keys ("owner_pid   :")."""
+    root, as RUNNING, and its trigger_time as a number, which the kernel sets at every start, stop
+    (an overrun's included), pause, suspend and resume; None for a trigger_time missing or not a
+    number; (None, None) when no substream names it. The kernel pads the keys ("owner_pid   :")."""
     for status in glob.glob(os.path.join(root, "card*", "pcm*c", "sub*", "status")):
         try:
             with open(status) as f:
@@ -505,7 +505,11 @@ def capture_state(root, pid):
         except OSError:
             continue
         if fields.get("owner_pid") == str(pid):
-            return fields.get("state"), fields.get("trigger_time")
+            try:
+                trigger = float(fields.get("trigger_time", ""))
+            except ValueError:
+                trigger = None
+            return fields.get("state"), trigger
     return None, None
 
 
@@ -543,9 +547,16 @@ def record(path, anchors, pidfile, root):
         """Write the anchor of a read with samples, its floor only if the substream ran on."""
         nonlocal broken, trigger, closed
         state, now_trigger = capture_state(root, pid)
-        if state == "RUNNING" and trigger is None:
+        if state == "RUNNING" and now_trigger is None:
+            # RUNNING with no trigger_time to read shows nothing about a restart (Sol's review of
+            # #149 at 9b3d27cb): no floor, now or after.
+            out.write("%d %d\n" % (seen, size))
+            if broken is None:
+                broken = "discontinuous %d NO-TRIGGER" % seen
+            return
+        if state == "RUNNING" and trigger is None and broken is None:
             trigger = now_trigger
-        if state == "RUNNING" and now_trigger == trigger and closed is None:
+        if state == "RUNNING" and now_trigger == trigger and closed is None and broken is None:
             out.write("%d %d %d\n" % (seen, size, before))
             return
         out.write("%d %d\n" % (seen, size))
@@ -1434,6 +1445,9 @@ analyse_recording() {
   elif [[ $(<"$work_dir/arecord.err") == *Suspended* ]]; then
     floor=
     note "recording: arecord reported a suspend, so the recording's early bounds come from its start alone"
+  elif [[ $discontinuous == NO-TRIGGER ]]; then
+    floor=
+    note "recording: the capture substream arecord held showed RUNNING with no numeric trigger_time, which cannot show it ran on without a restart, so the recording's early bounds come from its start alone"
   elif [[ -n $discontinuous ]]; then
     floor=
     note "recording: the capture substream arecord held read $discontinuous during the recording, so the recording's early bounds come from its start alone"

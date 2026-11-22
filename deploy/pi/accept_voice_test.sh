@@ -1113,8 +1113,10 @@ def arecord(args):
         if restarted:
             trigger[0] = "%d.%09d" % divmod(time.time_ns(), 1_000_000_000)
         if substream:
+            # capture-no-trigger: a status without trigger_time (Sol's review of #149 at 9b3d27cb).
+            trigger_line = "" if "capture-no-trigger" in SCENARIO else "trigger_time: %s\n" % trigger[0]
             with open(os.path.join(substream, "status"), "w") as g:
-                g.write("state: %s\nowner_pid   : %d\ntrigger_time: %s\n" % (state, os.getpid(), trigger[0]))
+                g.write("state: %s\nowner_pid   : %d\n%s" % (state, os.getpid(), trigger_line))
 
     set_state("RUNNING")
 
@@ -2261,6 +2263,10 @@ launch barge-pause-suspend answer-until-clip,backchannel-pause-500,arecord-slow-
 # again from a new trigger_time (capture-silent-restart): continuity is not shown, so UNKNOWN with
 # a NOTE, never PASS.
 launch barge-pause-silent-restart answer-until-clip,backchannel-pause-500,arecord-slow-start,capture-buffer-250,capture-silent-restart yes -- --step barge-in --talkovers 1 --backchannels 1 --question @question.wav --talkover-dir @talkovers --backchannel-dir @backchannels --rig-mic "$rig" --event-timeout 15
+# The same pause with the substream's status giving no trigger_time (capture-no-trigger): RUNNING
+# alone cannot show the substream ran on without a restart, so UNKNOWN with a NOTE naming the missing
+# trigger, never PASS (Sol's review of #149 at 9b3d27cb).
+launch barge-pause-no-trigger answer-until-clip,backchannel-pause-500,arecord-slow-start,capture-buffer-250,capture-no-trigger yes -- --step barge-in --talkovers 1 --backchannels 1 --question @question.wav --talkover-dir @talkovers --backchannel-dir @backchannels --rig-mic "$rig" --event-timeout 15
 # A backchannel that stops the speech, with arecord stalled in a write during the speech, its
 # capture overrunning and its sampler held for as long; stopped, arecord lands the held period and
 # closes with no read that would report the overrun (arecord-terminal-stall, Sol's review of #149 at
@@ -3024,6 +3030,10 @@ expect_rc barge-pause-silent-restart 2
 expect_line barge-pause-silent-restart 'NOTE: recording: the capture substream arecord held read RESTARTED during the recording, so the recording'"'"'s early bounds come from its start alone'
 expect_no_line barge-pause-silent-restart 'PASS: barge-in: 0 of 1'
 expect_restored barge-pause-silent-restart
+expect_rc barge-pause-no-trigger 2
+expect_line barge-pause-no-trigger 'NOTE: recording: the capture substream arecord held showed RUNNING with no numeric trigger_time'
+expect_no_line barge-pause-no-trigger 'PASS: barge-in: 0 of 1'
+expect_restored barge-pause-no-trigger
 expect_rc barge-backchannel-terminal-stall 1 2
 # On a loaded machine the fake can also overrun before the stall, and the driver then names the
 # overrun, which turns the anchors' bound off as well: the case still must not PASS. It is no floor

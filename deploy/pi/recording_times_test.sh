@@ -484,9 +484,13 @@ except SystemExit:
     pass
 sys.argv = argv
 failures = []
+# no-trigger and bad-trigger (Sol's review of #149 at 9b3d27cb): a status with no trigger_time, or a
+# trigger_time that is not a number, shows nothing about a restart, so no anchor keeps its floor and
+# the sampler names the trigger it could not read.
 for case, states in (("running", ["RUNNING 1"] * 4), ("closed", ["RUNNING 1", "closed"]),
                      ("xrun", ["RUNNING 1", "XRUN 1"]), ("restarted", ["RUNNING 1", "RUNNING 2"]),
-                     ("closed-at-end", ["RUNNING 1"] * 5 + ["closed"])):
+                     ("closed-at-end", ["RUNNING 1"] * 5 + ["closed"]),
+                     ("no-trigger", ["RUNNING -"] * 4), ("bad-trigger", ["RUNNING x"] * 4)):
     work = os.path.join(base, "sampler-" + case)
     status_dir = os.path.join(work, "asound", "card4", "pcm0c", "sub0")
     os.makedirs(status_dir)
@@ -514,7 +518,8 @@ for case, states in (("running", ["RUNNING 1"] * 4), ("closed", ["RUNNING 1", "c
                 status("closed\n")
             else:
                 state, trig = s.split()
-                status("state: %s\nowner_pid   : %d\ntrigger_time: %s.0\n" % (state, writer.pid, trig))
+                trigger_line = "" if trig == "-" else "trigger_time: %s\n" % ("soon" if trig == "x" else trig + ".0")
+                status("state: %s\nowner_pid   : %d\n%s" % (state, writer.pid, trigger_line))
             time.sleep(0.6)
 
     shower = threading.Thread(target=show)
@@ -534,12 +539,14 @@ for case, states in (("running", ["RUNNING 1"] * 4), ("closed", ["RUNNING 1", "c
         if case == "closed-at-end" and lines and len(lines[-1]) == 3:
             failures.append("closed-at-end: the last anchor, read after the close, kept its floor: %r" % lines[-1])
         continue
-    want = {"closed": "CLOSED", "xrun": "XRUN", "restarted": "RESTARTED"}[case]
+    want = {"closed": "CLOSED", "xrun": "XRUN", "restarted": "RESTARTED", "no-trigger": "NO-TRIGGER", "bad-trigger": "NO-TRIGGER"}[case]
     if len(reported) != 1 or not reported[0].endswith(" " + want):
         failures.append("%s: discontinuous lines %r, want one naming %s" % (case, reported, want))
     after = int(reported[0].split()[1]) if reported else 0
     late = [l for l in floors if int(l[0]) >= after]
-    if late:
+    if case in ("no-trigger", "bad-trigger") and floors:
+        failures.append("%s: %d floor anchors, with no trigger_time to show the substream ran on: %r" % (case, len(floors), floors[:2]))
+    elif late:
         failures.append("%s: %d floor anchors at or after the state that is not RUNNING from the first trigger: %r" % (case, len(late), late[:2]))
 for line in failures:
     print(line)
