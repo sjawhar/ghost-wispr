@@ -511,7 +511,16 @@ func TestATurnOffHeldInTheStoreDoesNotHoldTheShutdownPastItsDeadline(t *testing.
 					return store.DB().Stats().WaitCount > waitsBefore
 				})
 			}
-			shutdownCtx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+			// The held turn-off must outlast the stop's deadline, so that deadline is short. The
+			// control's turn-off is free to finish: it gets a deadline it fits under any load
+			// (main's is shutdownWait, 30 s). With 150 ms, a turn-off slowed by -race and a loaded
+			// machine still committed its write when the stop gave up, and closeStore rightly left
+			// the store open under it (5 of 50 runs on one core beside 20 busy processes).
+			deadline := 150 * time.Millisecond
+			if !held {
+				deadline = 10 * time.Second
+			}
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), deadline)
 			defer cancel()
 			recovery.stop(shutdownCtx, manager, lifecyclePublishWait)
 			stopped := make(chan struct{})
@@ -521,7 +530,7 @@ func TestATurnOffHeldInTheStoreDoesNotHoldTheShutdownPastItsDeadline(t *testing.
 			}()
 			select {
 			case <-stopped:
-			case <-time.After(time.Second):
+			case <-time.After(deadline + time.Second):
 				t.Fatal("the Concierge's shutdown waited past the shutdown's deadline for the turn-off")
 			}
 			if !closeStore(shutdownCtx, store) {
