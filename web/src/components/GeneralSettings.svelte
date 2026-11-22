@@ -1,53 +1,61 @@
 <script lang="ts">
-  import type { ConfigPatch } from '../lib/config-api'
+  import type { ConfigPatch, ConfigResponse } from '../lib/config-api'
   import { patchConfig } from '../lib/config-api'
-  import { configState, setConfig, setError } from '../lib/config.svelte'
+  import { setConfig, setError } from '../lib/config.svelte'
+  import { unitField, type UnitField } from '../lib/unit-field.svelte'
+  import ReplacedNote from './ReplacedNote.svelte'
 
-  let config = $derived(configState.config!)
+  let {
+    config,
+  }: {
+    config: ConfigResponse
+  } = $props()
 
-  let silenceTimeout = $state(config.silence_timeout)
-  let model = $state(config.summarization.model)
-  let endpointing = $state(config.transcription.endpointing)
-  let utteranceEndMs = $state(config.transcription.utterance_end_ms)
+  const taken = () => config
+  const silenceTimeout = unitField(() => config.silence_timeout, taken)
+  const model = unitField(() => config.summarization.model, taken)
+  const endpointing = unitField(() => config.transcription.endpointing, taken)
+  const utteranceEndMs = unitField(() => config.transcription.utterance_end_ms, taken)
 
   let saving = $state(false)
   let feedback = $state('')
-
-  $effect(() => {
-    if (configState.config) {
-      silenceTimeout = configState.config.silence_timeout
-      model = configState.config.summarization.model
-      endpointing = configState.config.transcription.endpointing
-      utteranceEndMs = configState.config.transcription.utterance_end_ms
-    }
-  })
 
   async function save(): Promise<void> {
     saving = true
     feedback = ''
     try {
       const patch: ConfigPatch = {}
+      // Each field the save carries, acknowledged once the unit takes it.
+      const carried: Pick<UnitField<unknown>, 'acknowledge'>[] = []
 
-      if (silenceTimeout !== config.silence_timeout) {
-        patch.silence_timeout = silenceTimeout
+      if (silenceTimeout.edited) {
+        patch.silence_timeout = silenceTimeout.value
+        carried.push(silenceTimeout)
       }
-      if (model !== config.summarization.model) {
-        patch.summarization = { model }
+      if (model.edited) {
+        patch.summarization = { model: model.value }
+        carried.push(model)
       }
-      if (
-        endpointing !== config.transcription.endpointing ||
-        utteranceEndMs !== config.transcription.utterance_end_ms
-      ) {
-        patch.transcription = { endpointing, utterance_end_ms: utteranceEndMs }
+      const transcription: NonNullable<ConfigPatch['transcription']> = {}
+      if (endpointing.edited) {
+        transcription.endpointing = endpointing.value
+        carried.push(endpointing)
       }
-
-      if (Object.keys(patch).length === 0) {
+      if (utteranceEndMs.edited) {
+        transcription.utterance_end_ms = utteranceEndMs.value
+        carried.push(utteranceEndMs)
+      }
+      if (Object.keys(transcription).length > 0) {
+        patch.transcription = transcription
+      }
+      if (carried.length === 0) {
         feedback = 'No changes to save.'
         return
       }
 
       const updated = await patchConfig(patch)
-      setConfig(updated)
+      const take = setConfig(updated)
+      for (const field of carried) field.acknowledge(take)
       feedback = 'Saved!'
     } catch (error) {
       feedback = error instanceof Error ? error.message : 'Save failed'
@@ -61,24 +69,52 @@
 <div class="general-settings" data-testid="general-settings">
   <div class="field">
     <label for="silence-timeout">Silence Timeout</label>
-    <input id="silence-timeout" type="text" bind:value={silenceTimeout} placeholder="30s" />
+    <input
+      id="silence-timeout"
+      type="text"
+      bind:value={silenceTimeout.value}
+      disabled={saving}
+      placeholder="30s"
+    />
+    <ReplacedNote shown={silenceTimeout.replaced} />
     <span class="hint">Go duration format (e.g. 30s, 1m, 1m30s)</span>
   </div>
 
   <div class="field">
     <label for="default-model">Default Summarization Model</label>
-    <input id="default-model" type="text" bind:value={model} placeholder="openai/gpt-4o-mini" />
+    <input
+      id="default-model"
+      type="text"
+      bind:value={model.value}
+      disabled={saving}
+      placeholder="openai/gpt-4o-mini"
+    />
+    <ReplacedNote shown={model.replaced} />
     <span class="hint">Format: provider/model_name</span>
   </div>
 
   <div class="field">
     <label for="endpointing">Transcription Endpointing (ms)</label>
-    <input id="endpointing" type="text" bind:value={endpointing} placeholder="400" />
+    <input
+      id="endpointing"
+      type="text"
+      bind:value={endpointing.value}
+      disabled={saving}
+      placeholder="400"
+    />
+    <ReplacedNote shown={endpointing.replaced} />
   </div>
 
   <div class="field">
     <label for="utterance-end">Utterance End (ms)</label>
-    <input id="utterance-end" type="text" bind:value={utteranceEndMs} placeholder="1000" />
+    <input
+      id="utterance-end"
+      type="text"
+      bind:value={utteranceEndMs.value}
+      disabled={saving}
+      placeholder="1000"
+    />
+    <ReplacedNote shown={utteranceEndMs.replaced} />
     <span class="hint">Changes to transcription settings will reconnect Deepgram</span>
   </div>
 

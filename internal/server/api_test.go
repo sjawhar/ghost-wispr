@@ -2380,12 +2380,21 @@ func TestAPI_RefinePreset_Success(t *testing.T) {
 		t.Fatalf("expected 200, got %d body=%s", rr.Code, rr.Body.String())
 	}
 
-	var resp config.Preset
+	var resp struct {
+		config.Preset
+		From *config.Preset `json:"from"`
+	}
 	if err := json.NewDecoder(rr.Body).Decode(&resp); err != nil {
 		t.Fatalf("decode failed: %v", err)
 	}
 	if resp.SystemPrompt != "Refined prompt" {
 		t.Fatalf("expected refined prompt, got %q", resp.SystemPrompt)
+	}
+	// The answer names the preset the refinement started from, as the unit
+	// held it: the page tells a field the refinement changed from one the unit
+	// already held that way, though its own config may be older.
+	if want := cfgStore.Get().Summarization.Presets["default"]; resp.From == nil || *resp.From != want {
+		t.Fatalf("from = %+v, want the stored preset %+v", resp.From, want)
 	}
 }
 

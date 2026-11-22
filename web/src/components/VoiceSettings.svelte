@@ -2,6 +2,8 @@
   import type { ConfigPatch, ConfigResponse, VoiceEngine } from '../lib/config-api'
   import { patchConfig } from '../lib/config-api'
   import { setConfig } from '../lib/config.svelte'
+  import { unitField, type UnitField } from '../lib/unit-field.svelte'
+  import ReplacedNote from './ReplacedNote.svelte'
 
   let {
     config,
@@ -15,32 +17,36 @@
     { value: 'dgagent', label: 'Voice agent: Deepgram (dgagent)' },
   ]
 
-  // answered is what the unit answered the last save: a save sends the fields
-  // that differ from it (from config before the first), and after a save the
-  // fields show what the unit answered (a new model's voice is its default).
-  let answered: ConfigResponse | undefined
-  let enabled = $state(config.voice.enabled)
-  let engine = $state(config.voice.engine)
-  let ttsModel = $state(config.tts.model)
-  let ttsVoice = $state(config.tts.voice)
+  // After a save the fields show what the unit answered, as the settings page
+  // passes it in (a new model's voice is its default).
+  const taken = () => config
+  const enabled = unitField(() => config.voice.enabled, taken)
+  const engine = unitField(() => config.voice.engine, taken)
+  const ttsModel = unitField(() => config.tts.model, taken)
+  const ttsVoice = unitField(() => config.tts.voice, taken)
   let saving = $state(false)
   let feedback = $state('')
 
   async function save(): Promise<void> {
-    const saved = answered ?? config
+    // Each field the save carries, acknowledged once the unit takes it.
+    const carried: Pick<UnitField<unknown>, 'acknowledge'>[] = []
     const voice: NonNullable<ConfigPatch['voice']> = {}
-    if (enabled !== saved.voice.enabled) {
-      voice.enabled = enabled
+    if (enabled.edited) {
+      voice.enabled = enabled.value
+      carried.push(enabled)
     }
-    if (engine !== saved.voice.engine) {
-      voice.engine = engine
+    if (engine.edited) {
+      voice.engine = engine.value
+      carried.push(engine)
     }
     const tts: NonNullable<ConfigPatch['tts']> = {}
-    if (ttsModel.trim() !== saved.tts.model) {
-      tts.model = ttsModel.trim()
+    if (ttsModel.edited) {
+      tts.model = ttsModel.value.trim()
+      carried.push(ttsModel)
     }
-    if (ttsVoice.trim() !== saved.tts.voice) {
-      tts.voice = ttsVoice.trim()
+    if (ttsVoice.edited) {
+      tts.voice = ttsVoice.value.trim()
+      carried.push(ttsVoice)
     }
     const patch: ConfigPatch = {}
     if (Object.keys(voice).length > 0) {
@@ -49,7 +55,7 @@
     if (Object.keys(tts).length > 0) {
       patch.tts = tts
     }
-    if (!patch.voice && !patch.tts) {
+    if (carried.length === 0) {
       feedback = 'No changes to save.'
       return
     }
@@ -58,12 +64,8 @@
     feedback = ''
     try {
       const updated = await patchConfig(patch)
-      setConfig(updated)
-      answered = updated
-      enabled = updated.voice.enabled
-      engine = updated.voice.engine
-      ttsModel = updated.tts.model
-      ttsVoice = updated.tts.voice
+      const take = setConfig(updated)
+      for (const field of carried) field.acknowledge(take)
       feedback = 'Saved!'
     } catch (error) {
       feedback = error instanceof Error ? error.message : 'Save failed'
@@ -75,42 +77,54 @@
 
 <div class="voice-settings" data-testid="voice-settings">
   <label class="toggle-label">
-    <input type="checkbox" bind:checked={enabled} />
+    <input type="checkbox" bind:checked={enabled.value} disabled={saving} />
     Enable meeting voice
   </label>
+  <ReplacedNote shown={enabled.replaced} />
 
   <fieldset class="choices">
     <legend>Voice</legend>
     {#each engines as option (option.value)}
       <label class="choice">
-        <input type="radio" name="voice-engine" value={option.value} bind:group={engine} />
+        <input
+          type="radio"
+          name="voice-engine"
+          value={option.value}
+          bind:group={engine.value}
+          disabled={saving}
+        />
         {option.label}
       </label>
     {/each}
+    <ReplacedNote shown={engine.replaced} />
   </fieldset>
 
-  {#if engine === 'tts'}
+  {#if engine.value === 'tts'}
     <div class="field">
       <label for="tts-model">Text-to-speech model</label>
       <input
         id="tts-model"
         type="text"
-        bind:value={ttsModel}
+        bind:value={ttsModel.value}
+        disabled={saving}
         placeholder="provider/model, such as vertex/gemini-3.8-flash-tts"
       />
       <p class="hint">
         As provider/model: the provider is one of the Model providers under Integrations. Empty
         turns text-to-speech off.
       </p>
+      <ReplacedNote shown={ttsModel.replaced} />
     </div>
     <div class="field">
       <label for="tts-voice">Text-to-speech voice</label>
       <input
         id="tts-voice"
         type="text"
-        bind:value={ttsVoice}
+        bind:value={ttsVoice.value}
+        disabled={saving}
         placeholder="The model's default voice"
       />
+      <ReplacedNote shown={ttsVoice.replaced} />
     </div>
   {/if}
 

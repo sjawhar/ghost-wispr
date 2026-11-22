@@ -1715,6 +1715,10 @@ type configResponse struct {
 	// as written in recording_rules; empty when there are none. Read-only.
 	RecordingRules []string            `json:"recording_rules"`
 	Voice          configVoiceResponse `json:"voice"`
+	// Revision is the state of the config this answer holds. Read-only: a
+	// page that sends two saves keeps the answer with the later revision,
+	// whichever order the answers land in.
+	Revision config.Revision `json:"revision"`
 }
 
 type configSummarizationResponse struct {
@@ -1755,7 +1759,7 @@ type configVoiceResponse struct {
 
 func handleGetConfig(cfgStore *config.Store) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		cfg := cfgStore.Get()
+		cfg, revision := cfgStore.GetRevision()
 		resp := configResponse{
 			SilenceTimeout:     cfg.SilenceTimeout,
 			MinSessionSegments: cfg.MinSessionSegments,
@@ -1795,6 +1799,7 @@ func handleGetConfig(cfgStore *config.Store) http.HandlerFunc {
 				Enabled: cfg.Voice.Enabled,
 				Engine:  cfg.Voice.Engine,
 			},
+			Revision: revision,
 		}
 		if resp.Summarization.Presets == nil {
 			resp.Summarization.Presets = map[string]config.Preset{}
@@ -1842,10 +1847,10 @@ type presetPatch struct {
 
 // creates reports whether the patch names all four of a preset's fields,
 // with a user template, as the settings page's new preset does. A patch to a
-// preset the config does not hold creates it only then: anything less is an
-// update to a preset deleted elsewhere, and would make a preset with empty
-// fields. The template carries the transcript; the system prompt may be empty
-// (the built-in default's is, and the summarizer has its own).
+// preset the config does not hold creates it only then: the page sends only
+// a preset's changed fields, so anything less is an update to a preset
+// deleted elsewhere. The template carries the transcript; the system prompt
+// may be empty (the built-in default's is, and the summarizer has its own).
 func (p *presetPatch) creates() bool {
 	return p.Description != nil && p.SystemPrompt != nil && p.Model != nil &&
 		p.UserTemplate != nil && *p.UserTemplate != ""
@@ -2208,6 +2213,8 @@ func handleRefinePreset(cfgStore *config.Store, refineFn func(ctx context.Contex
 			return
 		}
 
+		// One read of the preset: the same value goes to the model and comes
+		// back as from.
 		cfg := cfgStore.Get()
 		current, ok := cfg.Summarization.Presets[body.Name]
 		if !ok {
@@ -2224,8 +2231,17 @@ func handleRefinePreset(cfgStore *config.Store, refineFn func(ctx context.Contex
 			return
 		}
 
-		writeJSON(w, http.StatusOK, refined)
+		writeJSON(w, http.StatusOK, refineResponse{Preset: refined, From: current})
 	}
+}
+
+// refineResponse is a refined preset, and the preset the refinement started
+// from, as the unit held it. A field the refinement returns as it is in From
+// is one it did not change: the settings page makes no edit of it, though its
+// own config may be older than From.
+type refineResponse struct {
+	config.Preset
+	From config.Preset `json:"from"`
 }
 
 func registerRestoreRoutes(mux routeMux, controls *ControlHooks) {

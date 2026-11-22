@@ -32,6 +32,10 @@
     <p class="settings-error">{configState.error}</p>
   {/if}
 
+  {#if configState.reloading}
+    <p class="settings-reloading" role="status">Settings may be out of date, reloading…</p>
+  {/if}
+
   {#if !configState.loaded}
     <p class="settings-loading">Loading configuration...</p>
   {:else if configState.config}
@@ -42,7 +46,7 @@
 
     <section class="settings-section">
       <h3 class="section-heading">General Settings</h3>
-      <GeneralSettings />
+      <GeneralSettings config={configState.config} />
     </section>
 
     <section class="settings-section">
@@ -98,6 +102,12 @@
     font-style: italic;
   }
 
+  .settings-reloading {
+    color: var(--muted);
+    font-size: 0.85rem;
+    margin: 0 0 0.55rem;
+  }
+
   .settings-section {
     background: var(--card);
     border: 1px solid var(--line);
@@ -110,11 +120,5 @@
     font-size: 0.95rem;
     margin: 0 0 0.55rem;
     color: var(--ink);
-  }
-
-  .section-placeholder {
-    color: var(--muted);
-    font-style: italic;
-    margin: 0;
   }
 </style>

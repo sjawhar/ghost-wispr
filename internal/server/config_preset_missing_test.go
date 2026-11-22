@@ -18,9 +18,10 @@ func storedPreset(cfgStore *config.Store, name string) (config.Preset, bool) {
 // TestPatchConfigRefusesAPatchToAPresetItDoesNotHold fails if a PATCH that
 // names a preset the config does not hold creates it unless it names all four
 // of the preset's fields, with a user template (it carries the transcript), as
-// the page's new preset does. It did: a patch of only a description (or a
-// template) to a preset another tab had deleted recreated the preset with the
-// other fields empty, an empty template leaving the transcript out of its
+// the page's new preset does. It did: the settings page, which sends only a
+// preset's changed fields, saved a description (or a template) to a preset
+// another tab had deleted, and the unit recreated the preset with the other
+// fields empty, an empty template leaving the transcript out of its
 // summaries. It also fails if such a patch answers other than 404, or if a
 // patch with any field cannot update a preset the config holds. (The built-in
 // default preset has no system prompt; the summarizer has its own.)

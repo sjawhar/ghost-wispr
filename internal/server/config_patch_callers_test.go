@@ -20,11 +20,11 @@ var settingsPageBodies = map[string]string{
 	"PresetEditor: clear the model":    `{"summarization":{"presets":{"standup":{"model":""}}}}`,
 	"PresetEditor: delete":             `{"summarization":{"presets":{"standup":null}}}`,
 	"VoiceSettings: voice and its tts": `{"voice":{"enabled":true,"engine":"tts"},"tts":{"model":"vertex-us/gemini-3.8-flash-tts","voice":"Puck"}}`,
+	"IntegrationsSettings: gc limit":   `{"gc":{"max_age_days":0}}`,
+	"PresetEditor: change a field":     `{"summarization":{"presets":{"standup":{"description":"Daily stand-up"}}}}`,
 }
 
-// heldPreset creates the standup preset the page's preset bodies change: the
-// page saves a preset's fields only to a preset it shows, one the unit holds,
-// and a change to a preset the unit does not hold is a 404.
+// heldPreset creates the standup preset the page's preset bodies change.
 const heldPreset = `{"summarization":{"presets":{"standup":{"description":"Stand-up","system_prompt":"Summarize briefly","user_template":"{{transcript}}","model":""}}}}`
 
 // TestPatchConfigTakesEveryBodyTheSettingsPageSends fails if PATCH
@@ -35,6 +35,8 @@ func TestPatchConfigTakesEveryBodyTheSettingsPageSends(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			cfgStore, _ := newProvidersConfigStore(t)
 			h := newConfigHandler(t, cfgStore, &ControlHooks{})
+			// The page saves a preset's changed fields only to a preset it
+			// shows, one the unit holds.
 			if rr := patchConfig(h, heldPreset); rr.Code != http.StatusOK {
 				t.Fatalf("PATCH %s = %d %s, want 200", heldPreset, rr.Code, rr.Body.String())
 			}

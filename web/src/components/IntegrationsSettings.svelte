@@ -1,8 +1,10 @@
 <script lang="ts">
-  import type { ConfigResponse } from '../lib/config-api'
+  import type { ConfigPatch, ConfigResponse } from '../lib/config-api'
   import { patchConfig } from '../lib/config-api'
   import { setConfig } from '../lib/config.svelte'
+  import { unitField, type UnitField } from '../lib/unit-field.svelte'
   import ModelProviders from './ModelProviders.svelte'
+  import ReplacedNote from './ReplacedNote.svelte'
 
   let {
     config,
@@ -10,28 +12,33 @@
     config: ConfigResponse
   } = $props()
 
-  let gdriveFolder = $state(config.gdrive.folder_id)
+  const taken = () => config
+  const gdriveFolder = unitField(() => config.gdrive.folder_id, taken)
   let gdriveSaving = $state(false)
   let gdriveFeedback = $state('')
 
-  let syncEnabled = $state(config.gdrive.sync_enabled)
+  const syncEnabled = unitField(() => config.gdrive.sync_enabled, taken)
   let syncSaving = $state(false)
   let syncFeedback = $state('')
 
-  let gcEnabled = $state(config.gc.enabled)
-  let gcMaxAgeDays = $state(config.gc.max_age_days)
-  let gcMaxAudioSizeMB = $state(config.gc.max_audio_size_mb)
+  const gcEnabled = unitField(() => config.gc.enabled, taken)
+  const gcMaxAgeDays = unitField(() => config.gc.max_age_days, taken)
+  const gcMaxAudioSizeMB = unitField(() => config.gc.max_audio_size_mb, taken)
   let gcSaving = $state(false)
   let gcFeedback = $state('')
 
   async function saveGDrive(): Promise<void> {
+    if (!gdriveFolder.edited) {
+      gdriveFeedback = 'No changes to save.'
+      return
+    }
     gdriveSaving = true
     gdriveFeedback = ''
     try {
       const updated = await patchConfig({
-        gdrive: { folder_id: gdriveFolder.trim() },
+        gdrive: { folder_id: gdriveFolder.value.trim() },
       })
-      setConfig(updated)
+      gdriveFolder.acknowledge(setConfig(updated))
       gdriveFeedback = 'Saved!'
     } catch (error) {
       gdriveFeedback = error instanceof Error ? error.message : 'Save failed'
@@ -45,9 +52,9 @@
     syncFeedback = ''
     try {
       const updated = await patchConfig({
-        gdrive: { sync_enabled: syncEnabled },
+        gdrive: { sync_enabled: syncEnabled.value },
       })
-      setConfig(updated)
+      syncEnabled.acknowledge(setConfig(updated))
       syncFeedback = 'Saved!'
     } catch (error) {
       syncFeedback = error instanceof Error ? error.message : 'Save failed'
@@ -57,17 +64,43 @@
   }
 
   async function saveGC(): Promise<void> {
+    // The unit takes a whole number of 0 or more for each limit. A cleared
+    // field holds null, which it reads as no value, so a save would change
+    // nothing while the page said "Saved!"; a fraction it refuses with a
+    // parser error. While GC is on the limits show, so the page says what each
+    // needs; while it is off they are hidden, and one that is not a limit is
+    // not sent.
+    const ageSet = Number.isSafeInteger(gcMaxAgeDays.value) && gcMaxAgeDays.value >= 0
+    const sizeSet = Number.isSafeInteger(gcMaxAudioSizeMB.value) && gcMaxAudioSizeMB.value >= 0
+    if (gcEnabled.value && (!ageSet || !sizeSet)) {
+      gcFeedback = 'Each GC limit needs a whole number, 0 or more; 0 means no limit.'
+      return
+    }
+    const gc: NonNullable<ConfigPatch['gc']> = {}
+    // Each field the save carries, acknowledged once the unit takes it.
+    const carried: Pick<UnitField<unknown>, 'acknowledge'>[] = []
+    if (gcEnabled.edited) {
+      gc.enabled = gcEnabled.value
+      carried.push(gcEnabled)
+    }
+    if (ageSet && gcMaxAgeDays.edited) {
+      gc.max_age_days = gcMaxAgeDays.value
+      carried.push(gcMaxAgeDays)
+    }
+    if (sizeSet && gcMaxAudioSizeMB.edited) {
+      gc.max_audio_size_mb = gcMaxAudioSizeMB.value
+      carried.push(gcMaxAudioSizeMB)
+    }
+    if (carried.length === 0) {
+      gcFeedback = 'No changes to save.'
+      return
+    }
     gcSaving = true
     gcFeedback = ''
     try {
-      const updated = await patchConfig({
-        gc: {
-          enabled: gcEnabled,
-          max_age_days: gcMaxAgeDays,
-          max_audio_size_mb: gcMaxAudioSizeMB,
-        },
-      })
-      setConfig(updated)
+      const updated = await patchConfig({ gc })
+      const take = setConfig(updated)
+      for (const field of carried) field.acknowledge(take)
       gcFeedback = 'Saved!'
     } catch (error) {
       gcFeedback = error instanceof Error ? error.message : 'Save failed'
@@ -84,7 +117,12 @@
   <div class="gdrive-section">
     <div class="field">
       <label class="toggle-label">
-        <input type="checkbox" bind:checked={syncEnabled} onchange={saveSyncEnabled} />
+        <input
+          type="checkbox"
+          bind:checked={syncEnabled.value}
+          onchange={saveSyncEnabled}
+          disabled={syncSaving}
+        />
         Enable automatic sync
         {#if syncSaving}
           <span class="saving">Saving...</span>
@@ -99,9 +137,11 @@
       <input
         id="gdrive-folder"
         type="text"
-        bind:value={gdriveFolder}
+        bind:value={gdriveFolder.value}
+        disabled={gdriveSaving}
         placeholder="Google Drive folder ID"
       />
+      <ReplacedNote shown={gdriveFolder.replaced} />
     </div>
 
     <div class="field">
@@ -122,8 +162,9 @@
       {#if gdriveFeedback}
         <span
           class="feedback"
-          class:error={!gdriveFeedback.includes('Saved') && !gdriveFeedback.includes('uploaded')}
-          >{gdriveFeedback}</span
+          class:error={!gdriveFeedback.includes('Saved') &&
+            gdriveFeedback !== 'No changes to save.' &&
+            !gdriveFeedback.includes('uploaded')}>{gdriveFeedback}</span
         >
       {/if}
     </div>
@@ -131,7 +172,7 @@
 
   <h4>Garbage Collection</h4>
   <div class="gc-section">
-    {#if gcEnabled && !config.gdrive.sync_enabled}
+    {#if gcEnabled.value && !config.gdrive.sync_enabled}
       <div class="warning-banner">
         Garbage collection is on hold until Google Drive sync is enabled.
       </div>
@@ -139,15 +180,23 @@
 
     <div class="field">
       <label class="toggle-label">
-        <input type="checkbox" bind:checked={gcEnabled} />
+        <input type="checkbox" bind:checked={gcEnabled.value} disabled={gcSaving} />
         Enable garbage collection
       </label>
+      <ReplacedNote shown={gcEnabled.replaced} />
     </div>
 
-    {#if gcEnabled}
+    {#if gcEnabled.value}
       <div class="field">
         <label for="gc-max-age">Delete sessions older than (days)</label>
-        <input id="gc-max-age" type="number" min="0" bind:value={gcMaxAgeDays} />
+        <input
+          id="gc-max-age"
+          type="number"
+          min="0"
+          bind:value={gcMaxAgeDays.value}
+          disabled={gcSaving}
+        />
+        <ReplacedNote shown={gcMaxAgeDays.replaced} />
         <p class="hint">
           0 = never. Deletes only ended sessions that have a verified copy in Google Drive. A
           session restored from Drive counts from its restore.
@@ -155,7 +204,14 @@
       </div>
       <div class="field">
         <label for="gc-max-size">Audio budget (MB)</label>
-        <input id="gc-max-size" type="number" min="0" bind:value={gcMaxAudioSizeMB} />
+        <input
+          id="gc-max-size"
+          type="number"
+          min="0"
+          bind:value={gcMaxAudioSizeMB.value}
+          disabled={gcSaving}
+        />
+        <ReplacedNote shown={gcMaxAudioSizeMB.replaced} />
         <p class="hint">
           0 = no budget: GC removes no audio to free space. Past the budget, the oldest verified
           Drive copies' local audio is removed; sessions, transcripts and summaries are kept.
@@ -169,7 +225,11 @@
         {gcSaving ? 'Saving...' : 'Save'}
       </button>
       {#if gcFeedback}
-        <span class="feedback" class:error={gcFeedback !== 'Saved!'}>{gcFeedback}</span>
+        <span
+          class="feedback"
+          class:error={gcFeedback !== 'Saved!' && gcFeedback !== 'No changes to save.'}
+          >{gcFeedback}</span
+        >
       {/if}
     </div>
   </div>

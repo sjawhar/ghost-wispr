@@ -2,6 +2,8 @@ package config
 
 import (
 	"bufio"
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"maps"
 	"os"
@@ -15,6 +17,22 @@ import (
 
 	"gopkg.in/yaml.v3"
 )
+
+// Revision names a state of the config: Count rises by one with each change
+// in this run of the process, which Run names, so a client can tell which of
+// two answers holds the later state, whatever order they reach it in. Run
+// changes with each start, and Count starts again from 0.
+type Revision struct {
+	Run   string `json:"run"`
+	Count uint64 `json:"count"`
+}
+
+// newRun returns a random name for this run of the process.
+func newRun() string {
+	b := make([]byte, 8)
+	_, _ = rand.Read(b) // crypto/rand.Read does not fail
+	return hex.EncodeToString(b)
+}
 
 // Store holds mutable config with thread-safe access and YAML write-back.
 type Store struct {
@@ -30,6 +48,7 @@ type Store struct {
 	path            string
 	envPath         string
 	onChange        []func(Config)
+	revision        Revision
 }
 
 // NewStore loads config from the given YAML path (if it exists),
@@ -41,7 +60,7 @@ func NewStore(path string) (*Store, []string, error) {
 		return nil, warnings, err
 	}
 
-	return &Store{cfg: cfg, writtenLogLevel: fileLogLevel, path: path}, warnings, nil
+	return &Store{cfg: cfg, writtenLogLevel: fileLogLevel, path: path, revision: Revision{Run: newRun()}}, warnings, nil
 }
 
 // NewStoreWithEnv loads config from YAML, then provider keys from the .env
@@ -60,7 +79,7 @@ func NewStoreWithEnv(yamlPath, envPath string) (*Store, []string, error) {
 		warnings = append(warnings, leftoverEnvoyWebhookSecretWarning)
 	}
 
-	return &Store{cfg: cfg, writtenLogLevel: fileLogLevel, path: yamlPath, envPath: envPath}, warnings, nil
+	return &Store{cfg: cfg, writtenLogLevel: fileLogLevel, path: yamlPath, envPath: envPath, revision: Revision{Run: newRun()}}, warnings, nil
 }
 
 // Get returns a snapshot copy of the current config.
@@ -68,6 +87,14 @@ func (s *Store) Get() Config {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.copyConfig()
+}
+
+// GetRevision returns a snapshot copy of the current config and the revision
+// it is.
+func (s *Store) GetRevision() (Config, Revision) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.copyConfig(), s.revision
 }
 
 // Update applies a mutation to the config, validates the result,
@@ -122,6 +149,7 @@ func (s *Store) TryUpdate(fn func(*Config) error) error {
 		}
 	}
 	s.writtenLogLevel = writtenLogLevel
+	s.revision.Count++
 
 	current := s.copyConfig()
 	callbacks := make([]func(Config), len(s.onChange))
