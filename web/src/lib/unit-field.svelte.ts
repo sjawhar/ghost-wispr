@@ -24,6 +24,9 @@ export interface UnitField<T> {
   // A save carried the field, and the unit took it. Only the edit ends: what
   // the field shows still comes from the config.
   acknowledge(): void
+  // The field starts over from the config, as when another form opens in its
+  // place: no edit, no note.
+  reset(): void
 }
 
 export function unitField<T>(read: () => T): UnitField<T> {
@@ -85,6 +88,12 @@ export function unitField<T>(read: () => T): UnitField<T> {
     },
     acknowledge() {
       edited = false
+    },
+    reset() {
+      edited = false
+      replaced = false
+      void value
+      value = unit
     },
   }
 }

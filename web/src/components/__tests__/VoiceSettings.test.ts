@@ -711,4 +711,110 @@ describe('SettingsPage', () => {
     expect(await within(voiceSection).findByText('No changes to save.')).toBeTruthy()
     expect(unit.bodies).toHaveLength(2)
   })
+
+  // Sol's round-8 case: standup's description is saved as "My saved draft",
+  // and the unit takes it at A/10, but its answer is held. Another tab sets
+  // the description "Elsewhere" and the model "gateway/newer" at A/11.
+  // General's save answers A/12, holding both. Then the held A/10 answer
+  // lands. The form follows the config, which stays at A/12, and a preset
+  // Save has nothing to send.
+  it("keeps the newer preset when the preset save's own answer lands late", async () => {
+    const standup = {
+      description: 'Original',
+      system_prompt: 'Summarize the standup.',
+      user_template: '{{transcript}}',
+      model: 'vertex/gemini-4-carbon',
+    }
+    const withStandup = (preset: typeof standup) => ({
+      ...config,
+      summarization: { ...config.summarization, presets: { standup: preset } },
+    })
+    const unit = fakeUnit({ ...withStandup(standup), revision: { run: 'run-A', count: 9 } })
+    render(SettingsPage, { onBack: () => {} })
+    const editor = await screen.findByTestId('preset-editor')
+    const general = screen.getByTestId('general-settings')
+    await fireEvent.click(within(editor).getByRole('button', { name: /standup/ }))
+    const description = within(editor).getByLabelText('Description') as HTMLInputElement
+    const model = within(editor).getByLabelText('Model Override (optional)') as HTMLInputElement
+
+    await fireEvent.input(description, { target: { value: 'My saved draft' } })
+    await fireEvent.click(within(editor).getByRole('button', { name: 'Save' }))
+    await fireEvent.input(within(general).getByLabelText('Silence Timeout'), {
+      target: { value: '45s' },
+    })
+    await fireEvent.click(within(general).getByRole('button', { name: 'Save' }))
+    expect(unit.patches).toHaveLength(2)
+
+    unit.patches[1]({
+      ...withStandup({ ...standup, description: 'Elsewhere', model: 'gateway/newer' }),
+      silence_timeout: '45s',
+      revision: { run: 'run-A', count: 12 },
+    })
+    expect(await within(general).findByText('Saved!')).toBeTruthy()
+    expect(description.value).toBe('Elsewhere')
+    expect(model.value).toBe('gateway/newer')
+    unit.patches[0]({
+      ...withStandup({ ...standup, description: 'My saved draft' }),
+      revision: { run: 'run-A', count: 10 },
+    })
+    expect(await within(editor).findByText('Saved!')).toBeTruthy()
+
+    expect(configState.config?.revision).toEqual({ run: 'run-A', count: 12 })
+    expect(description.value).toBe('Elsewhere')
+    expect(model.value).toBe('gateway/newer')
+    await fireEvent.click(within(editor).getByRole('button', { name: 'Save' }))
+    expect(await within(editor).findByText('No changes to save.')).toBeTruthy()
+    expect(unit.bodies).toHaveLength(2)
+  })
+
+  // The preset editor on the same terms: its model is saved after a restart,
+  // and the read after the new run's answer is held, or fails. Another tab
+  // changes the description. The person types a description and saves: only
+  // the description is sent, not the model again.
+  it.each(['hold', 'network', 'http500'] as const)(
+    "sends only the preset fields the person changed while the read after a new run's answer is %s",
+    async (readMode) => {
+      const standup = {
+        description: 'Original',
+        system_prompt: 'Summarize the standup.',
+        user_template: '{{transcript}}',
+        model: 'vertex/gemini-4-carbon',
+      }
+      const withStandup = (preset: typeof standup) => ({
+        ...config,
+        summarization: { ...config.summarization, presets: { standup: preset } },
+      })
+      const unit = fakeUnit({ ...withStandup(standup), revision: { run: 'run-A', count: 9 } })
+      render(SettingsPage, { onBack: () => {} })
+      const editor = await screen.findByTestId('preset-editor')
+      await fireEvent.click(within(editor).getByRole('button', { name: /standup/ }))
+      unit.readMode = readMode
+
+      await fireEvent.input(within(editor).getByLabelText('Model Override (optional)'), {
+        target: { value: 'gateway/newer' },
+      })
+      await fireEvent.click(within(editor).getByRole('button', { name: 'Save' }))
+      const inB = {
+        ...withStandup({ ...standup, model: 'gateway/newer' }),
+        revision: { run: 'run-B', count: 1 },
+      }
+      unit.current = inB
+      unit.patches[0](inB)
+      expect(await within(editor).findByText('Saved!')).toBeTruthy()
+
+      unit.current = {
+        ...withStandup({ ...standup, description: 'Elsewhere', model: 'gateway/newer' }),
+        revision: { run: 'run-B', count: 2 },
+      }
+      await fireEvent.input(within(editor).getByLabelText('Description'), {
+        target: { value: 'Mine' },
+      })
+      await fireEvent.click(within(editor).getByRole('button', { name: 'Save' }))
+
+      await waitFor(() => expect(unit.bodies).toHaveLength(2))
+      expect(unit.bodies[1]).toEqual({
+        summarization: { presets: { standup: { description: 'Mine' } } },
+      })
+    },
+  )
 })

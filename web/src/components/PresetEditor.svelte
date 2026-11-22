@@ -10,8 +10,8 @@
   } from '../lib/config-api'
   import { fetchDates, fetchSessions, fetchSession } from '../lib/api'
   import { setConfig } from '../lib/config.svelte'
+  import { unitField, type UnitField } from '../lib/unit-field.svelte'
   import ReplacedNote from './ReplacedNote.svelte'
-  import { untrack } from 'svelte'
 
   let {
     presets,
@@ -20,16 +20,32 @@
   } = $props()
 
   let expandedPreset = $state('')
-  let editName = $state('')
-  let editDesc = $state('')
-  let editPrompt = $state('')
-  let editTemplate = $state('')
-  let editModel = $state('')
+  // The new-preset form's own fields, sent whole on Create.
+  let newName = $state('')
+  let newDesc = $state('')
+  let newPrompt = $state('')
+  let newTemplate = $state('')
+  let newModel = $state('')
   let isNew = $state(false)
   let newStep = $state<'describe' | 'form'>('describe')
   let generating = $state(false)
   let saving = $state(false)
   let feedback = $state('')
+
+  // The open preset's fields, as the other settings sections' fields: each
+  // shows the preset as the config the page last took holds it, or what the
+  // person typed over it, and a save sends the fields the person edited.
+  const openPreset = (): PresetDetail | undefined => presets[expandedPreset]
+  const fields: Record<keyof PresetDetail, UnitField<string>> = {
+    description: unitField(() => openPreset()?.description ?? ''),
+    system_prompt: unitField(() => openPreset()?.system_prompt ?? ''),
+    user_template: unitField(() => openPreset()?.user_template ?? ''),
+    model: unitField(() => openPreset()?.model ?? ''),
+  }
+
+  function resetFields(): void {
+    for (const field of Object.values(fields)) field.reset()
+  }
 
   // Test modal state
   let testingPreset = $state('')
@@ -47,50 +63,6 @@
   let refineFeedback = $state('')
   let refineRunning = $state(false)
 
-  // base is the open preset as the unit last held it, which its fields
-  // started from. A save sends only the fields that differ from it: the unit
-  // replaces each field sent, so a field sent unchanged would undo a change
-  // made to it elsewhere since.
-  let base: PresetDetail | undefined
-
-  // The open preset's fields whose typing a change from elsewhere replaced,
-  // each until the person's next input in it.
-  const noneReplaced = {
-    description: false,
-    system_prompt: false,
-    user_template: false,
-    model: false,
-  }
-  let replaced = $state<Record<keyof PresetDetail, boolean>>({ ...noneReplaced })
-
-  // takeUnit gives each field the unit's value where the unit changed it since
-  // base, keeps what was typed in the others, and makes preset the new base.
-  // A field that held typing other than both is marked replaced: its own save's
-  // answer, holding what was typed, replaces nothing.
-  function takeUnit(preset: PresetDetail): void {
-    if (base) {
-      const was = base
-      const take = (key: keyof PresetDetail, typed: string): boolean => {
-        if (preset[key] === was[key]) return false
-        if (typed !== was[key] && typed !== preset[key]) replaced[key] = true
-        return true
-      }
-      if (take('description', editDesc)) editDesc = preset.description
-      if (take('system_prompt', editPrompt)) editPrompt = preset.system_prompt
-      if (take('user_template', editTemplate)) editTemplate = preset.user_template
-      if (take('model', editModel)) editModel = preset.model
-    }
-    base = { ...preset }
-  }
-
-  // The open preset as the settings page passes it in, after another
-  // section's save, say. Only that runs this: takeUnit reads what was typed,
-  // and typing must not make the page's copy of the preset apply again.
-  $effect(() => {
-    const preset = presets[expandedPreset]
-    if (!isNew && preset && base) untrack(() => takeUnit(preset))
-  })
-
   // Whether the press that a click on a dialog's overlay ends began on the
   // overlay too: a press inside the dialog, such as one that selects text,
   // can end on the overlay, and must not close the dialog.
@@ -106,17 +78,10 @@
       expandedPreset = ''
       return
     }
-    const preset = presets[name]
     opens++
     expandedPreset = name
-    editName = name
-    editDesc = preset.description
-    editPrompt = preset.system_prompt
-    editTemplate = preset.user_template
-    editModel = preset.model
-    base = { ...preset }
-    replaced = { ...noneReplaced }
     isNew = false
+    resetFields()
     feedback = ''
   }
 
@@ -126,14 +91,8 @@
       isNew = false
       return
     }
-    const preset = presets[expandedPreset]
-    if (preset) {
-      editDesc = preset.description
-      editPrompt = preset.system_prompt
-      editTemplate = preset.user_template
-      editModel = preset.model
-      base = { ...preset }
-      replaced = { ...noneReplaced }
+    if (openPreset()) {
+      resetFields()
       feedback = 'Changes discarded.'
     }
   }
@@ -141,14 +100,12 @@
   function startNew(): void {
     opens++
     expandedPreset = '__new__'
-    editName = ''
-    editDesc = ''
-    editPrompt = ''
-    editTemplate = '{{transcript}}'
-    editModel = ''
+    newName = ''
+    newDesc = ''
+    newPrompt = ''
+    newTemplate = '{{transcript}}'
+    newModel = ''
     isNew = true
-    base = undefined
-    replaced = { ...noneReplaced }
     newStep = 'describe'
     generating = false
     feedback = ''
@@ -159,16 +116,16 @@
   }
 
   async function generateFromLLM(): Promise<void> {
-    if (!editDesc.trim()) {
+    if (!newDesc.trim()) {
       feedback = 'Description is required'
       return
     }
     generating = true
     feedback = ''
     try {
-      const result = await generatePreset(editDesc.trim())
-      editPrompt = result.system_prompt
-      editTemplate = result.user_template || '{{transcript}}'
+      const result = await generatePreset(newDesc.trim())
+      newPrompt = result.system_prompt
+      newTemplate = result.user_template || '{{transcript}}'
       newStep = 'form'
     } catch (error) {
       feedback = error instanceof Error ? error.message : 'Generation failed'
@@ -178,16 +135,18 @@
   }
 
   async function save(): Promise<void> {
-    const name = isNew ? editName.trim() : expandedPreset
+    const name = isNew ? newName.trim() : expandedPreset
     if (!name) {
       feedback = 'Preset name is required'
       return
     }
-    if (!editPrompt.trim()) {
+    const prompt = isNew ? newPrompt : fields.system_prompt.value
+    const template = isNew ? newTemplate : fields.user_template.value
+    if (!prompt.trim()) {
       feedback = 'System prompt is required'
       return
     }
-    if (!editTemplate.trim()) {
+    if (!template.trim()) {
       feedback = 'User template is required'
       return
     }
@@ -198,21 +157,28 @@
       return
     }
 
-    const edited: PresetDetail = {
-      description: editDesc,
-      system_prompt: editPrompt,
-      user_template: editTemplate,
-      model: editModel,
-    }
-    const fields: Partial<PresetDetail> = {}
-    for (const key of Object.keys(edited) as (keyof PresetDetail)[]) {
-      if (isNew || !base || edited[key] !== base[key]) {
-        fields[key] = edited[key]
+    // A new preset sends every field; an open one, the fields the person
+    // edited, each acknowledged once the unit takes it.
+    const sent: Partial<PresetDetail> = {}
+    const carried: UnitField<string>[] = []
+    if (isNew) {
+      Object.assign(sent, {
+        description: newDesc,
+        system_prompt: newPrompt,
+        user_template: newTemplate,
+        model: newModel,
+      })
+    } else {
+      for (const key of Object.keys(fields) as (keyof PresetDetail)[]) {
+        if (fields[key].edited) {
+          sent[key] = fields[key].value
+          carried.push(fields[key])
+        }
       }
-    }
-    if (Object.keys(fields).length === 0) {
-      feedback = 'No changes to save.'
-      return
+      if (carried.length === 0) {
+        feedback = 'No changes to save.'
+        return
+      }
     }
 
     // The person can open another form while the save is on its way; its
@@ -224,20 +190,16 @@
     feedback = ''
     try {
       const updated = await patchConfig({
-        summarization: { presets: { [name]: fields } },
+        summarization: { presets: { [name]: sent } },
       })
       setConfig(updated)
       if (!stillOpen()) return
-      // The answer can carry a change made elsewhere since the preset opened:
-      // a field takes it here, before the page passes the new presets in.
-      const saved = updated.summarization.presets[name]
-      if (saved) {
-        takeUnit(saved)
-      }
+      for (const field of carried) field.acknowledge()
       feedback = 'Saved!'
       if (isNew) {
         isNew = false
         expandedPreset = name
+        resetFields()
       }
     } catch (error) {
       if (!stillOpen()) return
@@ -280,9 +242,9 @@
     feedback = ''
     try {
       const result = await refinePreset(refiningPreset, refineFeedback.trim())
-      editDesc = result.description
-      editPrompt = result.system_prompt
-      editTemplate = result.user_template || '{{transcript}}'
+      fields.description.value = result.description
+      fields.system_prompt.value = result.system_prompt
+      fields.user_template.value = result.user_template || '{{transcript}}'
       refiningPreset = ''
       feedback = 'Refined! Review the changes and Save.'
     } catch (error) {
@@ -386,33 +348,30 @@
             <input
               id="preset-description"
               type="text"
-              bind:value={editDesc}
-              oninput={() => (replaced.description = false)}
+              bind:value={fields.description.value}
               disabled={saving}
             />
-            <ReplacedNote shown={replaced.description} />
+            <ReplacedNote shown={fields.description.replaced} />
           </div>
           <div class="field">
             <label for="preset-system-prompt">System Prompt</label>
             <textarea
               id="preset-system-prompt"
               rows="6"
-              bind:value={editPrompt}
-              oninput={() => (replaced.system_prompt = false)}
+              bind:value={fields.system_prompt.value}
               disabled={saving}
             ></textarea>
-            <ReplacedNote shown={replaced.system_prompt} />
+            <ReplacedNote shown={fields.system_prompt.replaced} />
           </div>
           <div class="field">
             <label for="preset-user-template">User Template</label>
             <textarea
               id="preset-user-template"
               rows="3"
-              bind:value={editTemplate}
-              oninput={() => (replaced.user_template = false)}
+              bind:value={fields.user_template.value}
               disabled={saving}
             ></textarea>
-            <ReplacedNote shown={replaced.user_template} />
+            <ReplacedNote shown={fields.user_template.replaced} />
             <span class="hint">Use {'{{transcript}}'} as placeholder</span>
           </div>
           <div class="field">
@@ -420,12 +379,11 @@
             <input
               id="preset-model"
               type="text"
-              bind:value={editModel}
-              oninput={() => (replaced.model = false)}
+              bind:value={fields.model.value}
               disabled={saving}
               placeholder="provider/model_name"
             />
-            <ReplacedNote shown={replaced.model} />
+            <ReplacedNote shown={fields.model.replaced} />
           </div>
           <div class="form-actions">
             <button class="save-btn" type="button" onclick={save} disabled={saving}>
@@ -469,7 +427,7 @@
           <input
             id="new-preset-name"
             type="text"
-            bind:value={editName}
+            bind:value={newName}
             disabled={saving}
             placeholder="my-preset"
           />
@@ -479,7 +437,7 @@
           <input
             id="new-preset-description"
             type="text"
-            bind:value={editDesc}
+            bind:value={newDesc}
             disabled={saving}
             placeholder="What kind of summary do you want?"
           />
@@ -491,7 +449,7 @@
               class="generate-btn"
               type="button"
               onclick={generateFromLLM}
-              disabled={generating || !editDesc.trim()}
+              disabled={generating || !newDesc.trim()}
             >
               {generating ? 'Generating...' : 'Generate with LLM'}
             </button>
@@ -516,7 +474,7 @@
             <textarea
               id="new-preset-system-prompt"
               rows="6"
-              bind:value={editPrompt}
+              bind:value={newPrompt}
               disabled={saving}
             ></textarea>
           </div>
@@ -525,7 +483,7 @@
             <textarea
               id="new-preset-user-template"
               rows="3"
-              bind:value={editTemplate}
+              bind:value={newTemplate}
               disabled={saving}
             ></textarea>
             <span class="hint">Use {'{{transcript}}'} as placeholder</span>
@@ -535,7 +493,7 @@
             <input
               id="new-preset-model"
               type="text"
-              bind:value={editModel}
+              bind:value={newModel}
               disabled={saving}
               placeholder="provider/model_name"
             />

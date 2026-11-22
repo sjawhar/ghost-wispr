@@ -2,7 +2,7 @@ import { fireEvent, render, screen, waitFor } from '@testing-library/svelte'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { PresetDetail } from '../../lib/config-api'
 import PresetEditor from '../PresetEditor.svelte'
-import { resetConfigState } from '../../lib/config.svelte'
+import { configState, resetConfigState } from '../../lib/config.svelte'
 import { deferredFetch, sent, stubFetch, unitConfig } from './configFixture'
 
 const presets: Record<string, PresetDetail> = {
@@ -110,13 +110,14 @@ describe('PresetEditor', () => {
       },
     }
     const fetch = stubFetch({ config: answered })
-    await expandStandup()
+    const view = await expandStandup()
 
     await fireEvent.input(field('Description'), { target: { value: 'Weekly notes' } })
     await fireEvent.click(screen.getByRole('button', { name: 'Save' }))
-    await waitFor(() =>
-      expect(field('Model Override (optional)').value).toBe('vertex/gemini-4-carbon'),
-    )
+    expect(await screen.findByText('Saved!')).toBeTruthy()
+    // The settings page passes in the presets of the config the save stored.
+    await view.rerender({ presets: configState.config!.summarization.presets })
+    expect(field('Model Override (optional)').value).toBe('vertex/gemini-4-carbon')
     // Neither the person's own save nor a change to a field nobody typed in
     // replaced an edit.
     expect(
@@ -161,6 +162,44 @@ describe('PresetEditor', () => {
 
     const shown = await screen.findByText('This preset was deleted elsewhere.')
     expect(shown.classList.contains('error')).toBe(true)
+  })
+
+  it('discards what was typed, and then has nothing to save', async () => {
+    const fetch = stubFetch()
+    await expandStandup()
+    await fireEvent.input(field('Description'), { target: { value: 'Typed' } })
+
+    await fireEvent.click(screen.getByRole('button', { name: 'Discard' }))
+    expect(field('Description').value).toBe('Daily standup notes')
+    await fireEvent.click(screen.getByRole('button', { name: 'Save' }))
+
+    expect(await screen.findByText('No changes to save.')).toBeTruthy()
+    expect(sent(fetch).filter((r) => r.method === 'PATCH')).toEqual([])
+  })
+
+  // Opening another preset starts its form over: the first one's unsaved
+  // typing goes, with no note, and is not sent with the other preset.
+  it("starts another preset's form over, with no note and nothing to save", async () => {
+    const fetch = stubFetch()
+    const retro = {
+      description: 'Retro notes',
+      system_prompt: 'Summarize the retro.',
+      user_template: '{{transcript}}',
+      model: '',
+    }
+    render(PresetEditor, { presets: { ...presets, retro } })
+    await fireEvent.click(screen.getByRole('button', { name: /standup/ }))
+    await fireEvent.input(field('Description'), { target: { value: 'Typed' } })
+
+    await fireEvent.click(screen.getByRole('button', { name: /retro/ }))
+    expect(field('Description').value).toBe('Retro notes')
+    expect(
+      screen.queryByText('Changed on the unit or in another tab; your edit was replaced.'),
+    ).toBeNull()
+    await fireEvent.click(screen.getByRole('button', { name: 'Save' }))
+
+    expect(await screen.findByText('No changes to save.')).toBeTruthy()
+    expect(sent(fetch).filter((r) => r.method === 'PATCH')).toEqual([])
   })
 
   it('saves nothing when no field was changed', async () => {
