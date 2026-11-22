@@ -137,11 +137,13 @@ readonly UPDATES_ON_COMMAND="ssh $PI 'XDG_RUNTIME_DIR=/run/user/\$(id -u) system
 # timer does not stop it, and it can still swap or roll back the binary. Disabled, not only stopped:
 # ghost-wispr's user manager starts an enabled timer at each boot, and Persistent=true then runs a
 # missed update at once, which would install the release's binary on the old config after a reboot.
-# The update has no time limit (each step of it has one), so this waits at most 35 minutes of the
-# Pi's monotonic clock (its uptime), more than an update takes at its worst, however slow each poll
-# is or however the wall clock steps; each poll has 30 s (and 5 more before SIGKILL), so one that
-# hangs neither blocks the report nor stretches the wait. Then it stops, naming the update, its PID
-# and since when it runs. It never kills the update: a kill can land mid-swap.
+# The update has no time limit (each step of it has one), so this stops polling at a deadline 35
+# minutes on by the Pi's monotonic clock (its uptime), more than an update takes at its worst,
+# however slow each poll is or however the wall clock steps. Each poll and each of the report's
+# two reads has 30 s (and 5 more before SIGKILL), so one that hangs neither blocks the report nor
+# moves the deadline: the step ends at most a last poll and those two reads past it. Then it stops,
+# naming the update, its PID and since when it runs, or unknown for a read that gave nothing. It
+# never kills the update: a kill can land mid-swap.
 stop_updates() {
   local status=0 out
   out=$(pi "${USER_SYSTEMD}systemctl --user disable --now ghost-wispr-update.timer || exit 2
@@ -157,12 +159,14 @@ while :; do
   [ \"\$(uptime_s)\" -lt \"\$deadline\" ] || break
   sleep 5
 done
-echo \"pid \$(show MainPID), since \$(show InactiveExitTimestamp)\"
+pid=\$(show MainPID) || pid=
+since=\$(show InactiveExitTimestamp) || since=
+echo \"pid \${pid:-unknown}, since \${since:-unknown}\"
 exit 3") || status=$?
   case $status in
     0) log 'the nightly update is off: its timer is disabled and inactive, and no update runs' ;;
     2) fail 'ghost-wispr-update.timer did not stop and disable' ;;
-    3) fail "ghost-wispr-update.service (${out:-pid unknown}) still runs after 35 minutes; it is left running, since a kill can land mid-swap: run this step again once it ends" ;;
+    3) fail "ghost-wispr-update.service (${out:-pid unknown, since unknown}) still runs at its 35-minute deadline; it is left running, since a kill can land mid-swap: run this step again once it ends" ;;
     *) fail "lost the Pi while waiting for an update under way (ssh exit $status); whether it runs is unknown, and nothing stopped it: run this step again" ;;
   esac
 }

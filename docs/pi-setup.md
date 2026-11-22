@@ -879,11 +879,12 @@ again at its end. It stops at the first check that fails. Save no settings in th
    enabled timer at boot, and `Persistent=true` then runs a missed update at once). It then waits
    until an update the timer already started has ended (`ghost-wispr-update.service` inactive or
    failed): stopping the timer does not stop that update, and it can still swap or roll back the
-   binary. It waits at most 35 minutes of the Pi's uptime, more than an update takes at its worst,
-   however slow a poll is or however the clock is corrected; each poll gives up after 30 s. Past
-   that it stops, naming the update's PID and since when it runs, and leaves it running: run
-   `hold` again once it ends. Nothing in the rollout kills an update, since a kill can land
-   mid-swap.
+   binary. It stops waiting at a deadline 35 minutes on by the Pi's uptime, more than an update
+   takes at its worst, however slow a poll is or however the clock is corrected. Each poll, and each
+   of the two reads of its report, gives up after 30 s (35 s with SIGKILL), so the step ends at most
+   about two minutes past that deadline. It then stops, naming the update's PID and since when it
+   runs (`unknown` for a read that gave nothing), and leaves it running: run `hold` again once it
+   ends. Nothing in the rollout kills an update, since a kill can land mid-swap.
 
    ```bash
    deploy/pi/rollout.sh hold

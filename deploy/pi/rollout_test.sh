@@ -122,8 +122,15 @@ case "$*" in
       echo inactive
     fi
     ;;
-  'show -p MainPID --value ghost-wispr-update.service') echo 4321 ;;
-  'show -p InactiveExitTimestamp --value ghost-wispr-update.service') echo 'Sun 2026-11-22 03:30:00 UTC' ;;
+  # The report's reads hang, as a hanging poll does, with state/report-hang.
+  'show -p MainPID --value ghost-wispr-update.service' | 'show -p InactiveExitTimestamp --value ghost-wispr-update.service')
+    if [[ -e $state/report-hang ]]; then
+      [[ -n ${FAKE_TIMEOUT_SECONDS:-} ]] || { echo 'a report read ran with no timeout' >>"$state/events"; exit 1; }
+      fake-clock-advance "$FAKE_TIMEOUT_SECONDS"
+      exit 124
+    fi
+    case $* in *MainPID*) echo 4321 ;; *) echo 'Sun 2026-11-22 03:30:00 UTC' ;; esac
+    ;;
   'daemon-reload') ;;
   # LoadState from state/load-UNIT (loaded by default); DropInPaths from state/dropins-UNIT, and
   # from the second query on also state/dropins-later-UNIT (a drop-in that appears mid-install).
@@ -321,9 +328,10 @@ off_after_reboot hold
 [[ $out == *'the 2 protected recordings have their sha256 (before)'* && $out == *'(after)'* ]] \
   || fail "hold did not check the protected recordings before and after: $out"
 
-# hold: an update that still runs 35 minutes on, by the Pi's monotonic clock (its uptime), is left
-# running, named with its PID and since when it runs; nothing kills or stops it. The 35 minutes are
-# of the uptime, not a count of polls nor the wall clock. GPT-6.1 Sol's cases: a slow systemctl
+# hold: an update that still runs once its 35-minute deadline on the Pi's monotonic clock (its
+# uptime) has passed is left running, named with its PID and since when it runs; nothing kills or
+# stops it. The 35 minutes are of the uptime, not a count of polls nor the wall clock. GPT-6.1
+# Sol's cases: a slow systemctl
 # (each poll 25 s, at 93a3b1e1) must not stretch them; a wall clock stepped forward 2 hours or back
 # 1 hour (at a9e966db) must not cut them short or stretch them; and a poll that never returns (at
 # a9e966db) is cut off by its own timeout, so it neither blocks the report nor stretches them.
@@ -337,7 +345,7 @@ for case in '0 - -' '25 - -' '0 7200 -' '0 -3600 -' '0 - hang'; do
   [[ $step == - ]] || echo "1005 $step" >"$state/wall-step"
   [[ $hang == - ]] || : >"$state/poll-hang"
   rollout hold
-  expect_stop "hold with an update that does not end ($case)" 'ghost-wispr-update.service (pid 4321, since Sun 2026-11-22 03:30:00 UTC) still runs after 35 minutes'
+  expect_stop "hold with an update that does not end ($case)" 'ghost-wispr-update.service (pid 4321, since Sun 2026-11-22 03:30:00 UTC) still runs at its 35-minute deadline'
   [[ $out == *'left running'* ]] || fail "hold did not say the update is left running: $out"
   ! grep -Eq 'systemctl (kill|stop|restart) ghost-wispr-update|^kill' "$state/events" \
     || fail "hold killed or stopped the running update: $(<"$state/events")"
@@ -351,6 +359,16 @@ for case in '0 - -' '25 - -' '0 7200 -' '0 -3600 -' '0 - hang'; do
 done
 grep -qx 'ConnectTimeout=10' "$state/ssh-options" && grep -qx 'ServerAliveInterval=15' "$state/ssh-options" \
   || fail "hold reached the Pi without a connect timeout and keepalives: $(<"$state/ssh-options")"
+
+# The report's reads that hang time out like the polls, and the report says which fields it could
+# not read instead of leaving them blank (GPT-6.1 Sol's note at e3c284d2: "pid , since ").
+reset
+: >"$state/update-forever"
+: >"$state/report-hang"
+rollout hold
+expect_stop 'hold whose report reads hang' 'ghost-wispr-update.service (pid unknown, since unknown) still runs at its 35-minute deadline'
+! grep -q 'a report read ran with no timeout' "$state/events" || fail 'hold read its report with no timeout'
+rm -f "$state/update-forever" "$state/report-hang"
 
 # install: refused while the latest release is another commit's, before any change.
 reset
