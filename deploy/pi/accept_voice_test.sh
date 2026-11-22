@@ -3266,8 +3266,11 @@ expect_rc cancel-held-start 0
 expect_line cancel-held-start "PASS: playback-cancel: no stop's speech was heard at the rig microphone 20 ms after it"
 expect_restored cancel-held-start
 expect_line cancel-held-start "NOTE: recording: arecord reported an overrun, so the recording's early bounds come from its start alone"
-expect_rc cancel-locked 0
-expect_line cancel-locked "PASS: playback-cancel: no stop's speech was heard at the rig microphone 20 ms after it"
+# arecord-hold-200 makes the fake report a 200 ms overrun, so the recording is never shown
+# continuous and the answer is timed against first_audio, whose window the start-only bounds can
+# cover on a loaded machine: UNKNOWN there is the honest answer, never FAIL (#149's g11 and c31 of
+# #156 read "starts between -1 and 31 ms from the next answer's first audio").
+expect_load_case cancel-locked
 [[ -s $root/cancel-locked/state/arecord-locked ]] || check_failed 'cancel-locked: the fake arecord never locked its file away, so the case tested no failed read'
 expect_restored cancel-locked
 expect_rc cancel-unsure 2
