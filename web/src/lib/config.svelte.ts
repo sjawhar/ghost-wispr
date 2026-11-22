@@ -48,16 +48,22 @@ let generation = 0
 const firstRetryMs = 1000
 const longestRetryMs = 30_000
 
-export function setConfig(config: ConfigResponse): void {
+// ConfigTake is what setConfig did with a config: showed it; dropped it as
+// older than the one shown, in the same run of the unit; or, as it came from
+// another run, read the config again instead, the read still to land.
+export type ConfigTake = 'shown' | 'older' | 'reading'
+
+export function setConfig(config: ConfigResponse): ConfigTake {
   const revision = config.revision
   if (revision && shownRevision) {
     if (revision.run !== shownRevision.run) {
       readCurrentRun()
-      return
+      return 'reading'
     }
-    if (revision.count < shownRevision.count) return
+    if (revision.count < shownRevision.count) return 'older'
   }
   show(config)
+  return 'shown'
 }
 
 function readCurrentRun(): void {

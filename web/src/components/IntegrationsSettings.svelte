@@ -2,7 +2,7 @@
   import type { ConfigPatch, ConfigResponse } from '../lib/config-api'
   import { patchConfig } from '../lib/config-api'
   import { setConfig } from '../lib/config.svelte'
-  import { unitField } from '../lib/unit-field.svelte'
+  import { unitField, type UnitField } from '../lib/unit-field.svelte'
   import ModelProviders from './ModelProviders.svelte'
   import ReplacedNote from './ReplacedNote.svelte'
 
@@ -12,17 +12,18 @@
     config: ConfigResponse
   } = $props()
 
-  const gdriveFolder = unitField(() => config.gdrive.folder_id)
+  const taken = () => config
+  const gdriveFolder = unitField(() => config.gdrive.folder_id, taken)
   let gdriveSaving = $state(false)
   let gdriveFeedback = $state('')
 
-  const syncEnabled = unitField(() => config.gdrive.sync_enabled)
+  const syncEnabled = unitField(() => config.gdrive.sync_enabled, taken)
   let syncSaving = $state(false)
   let syncFeedback = $state('')
 
-  const gcEnabled = unitField(() => config.gc.enabled)
-  const gcMaxAgeDays = unitField(() => config.gc.max_age_days)
-  const gcMaxAudioSizeMB = unitField(() => config.gc.max_audio_size_mb)
+  const gcEnabled = unitField(() => config.gc.enabled, taken)
+  const gcMaxAgeDays = unitField(() => config.gc.max_age_days, taken)
+  const gcMaxAudioSizeMB = unitField(() => config.gc.max_audio_size_mb, taken)
   let gcSaving = $state(false)
   let gcFeedback = $state('')
 
@@ -37,8 +38,7 @@
       const updated = await patchConfig({
         gdrive: { folder_id: gdriveFolder.value.trim() },
       })
-      gdriveFolder.acknowledge()
-      setConfig(updated)
+      gdriveFolder.acknowledge(setConfig(updated))
       gdriveFeedback = 'Saved!'
     } catch (error) {
       gdriveFeedback = error instanceof Error ? error.message : 'Save failed'
@@ -54,8 +54,7 @@
       const updated = await patchConfig({
         gdrive: { sync_enabled: syncEnabled.value },
       })
-      syncEnabled.acknowledge()
-      setConfig(updated)
+      syncEnabled.acknowledge(setConfig(updated))
       syncFeedback = 'Saved!'
     } catch (error) {
       syncFeedback = error instanceof Error ? error.message : 'Save failed'
@@ -79,7 +78,7 @@
     }
     const gc: NonNullable<ConfigPatch['gc']> = {}
     // Each field the save carries, acknowledged once the unit takes it.
-    const carried: { acknowledge(): void }[] = []
+    const carried: Pick<UnitField<unknown>, 'acknowledge'>[] = []
     if (gcEnabled.edited) {
       gc.enabled = gcEnabled.value
       carried.push(gcEnabled)
@@ -100,8 +99,8 @@
     gcFeedback = ''
     try {
       const updated = await patchConfig({ gc })
-      for (const field of carried) field.acknowledge()
-      setConfig(updated)
+      const take = setConfig(updated)
+      for (const field of carried) field.acknowledge(take)
       gcFeedback = 'Saved!'
     } catch (error) {
       gcFeedback = error instanceof Error ? error.message : 'Save failed'

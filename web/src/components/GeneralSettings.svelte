@@ -2,7 +2,7 @@
   import type { ConfigPatch, ConfigResponse } from '../lib/config-api'
   import { patchConfig } from '../lib/config-api'
   import { setConfig, setError } from '../lib/config.svelte'
-  import { unitField } from '../lib/unit-field.svelte'
+  import { unitField, type UnitField } from '../lib/unit-field.svelte'
   import ReplacedNote from './ReplacedNote.svelte'
 
   let {
@@ -11,10 +11,11 @@
     config: ConfigResponse
   } = $props()
 
-  const silenceTimeout = unitField(() => config.silence_timeout)
-  const model = unitField(() => config.summarization.model)
-  const endpointing = unitField(() => config.transcription.endpointing)
-  const utteranceEndMs = unitField(() => config.transcription.utterance_end_ms)
+  const taken = () => config
+  const silenceTimeout = unitField(() => config.silence_timeout, taken)
+  const model = unitField(() => config.summarization.model, taken)
+  const endpointing = unitField(() => config.transcription.endpointing, taken)
+  const utteranceEndMs = unitField(() => config.transcription.utterance_end_ms, taken)
 
   let saving = $state(false)
   let feedback = $state('')
@@ -25,7 +26,7 @@
     try {
       const patch: ConfigPatch = {}
       // Each field the save carries, acknowledged once the unit takes it.
-      const carried: { acknowledge(): void }[] = []
+      const carried: Pick<UnitField<unknown>, 'acknowledge'>[] = []
 
       if (silenceTimeout.edited) {
         patch.silence_timeout = silenceTimeout.value
@@ -53,8 +54,8 @@
       }
 
       const updated = await patchConfig(patch)
-      for (const field of carried) field.acknowledge()
-      setConfig(updated)
+      const take = setConfig(updated)
+      for (const field of carried) field.acknowledge(take)
       feedback = 'Saved!'
     } catch (error) {
       feedback = error instanceof Error ? error.message : 'Save failed'

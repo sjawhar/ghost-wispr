@@ -817,4 +817,109 @@ describe('SettingsPage', () => {
       })
     },
   )
+
+  // The proof's case at 4fc2961: after a restart, voice Puck is saved and the
+  // new run answers; before the read after it lands, another tab sets Kore,
+  // the value the old run's config held. The field must follow the config the
+  // read brings, though its own value there did not change.
+  it("follows the read after a new run's answer back to the old run's value", async () => {
+    const unit = fakeUnit({ ...config, revision: { run: 'run-A', count: 9 } })
+    render(SettingsPage, { onBack: () => {} })
+    const voiceSection = await screen.findByTestId('voice-settings')
+    const voice = within(voiceSection).getByLabelText('Text-to-speech voice') as HTMLInputElement
+    unit.readMode = 'hold'
+
+    await fireEvent.input(voice, { target: { value: 'Puck' } })
+    await fireEvent.click(within(voiceSection).getByRole('button', { name: 'Save' }))
+    const inB = {
+      ...config,
+      tts: { ...config.tts, voice: 'Puck' },
+      revision: { run: 'run-B', count: 1 },
+    }
+    unit.current = inB
+    unit.patches[0](inB)
+    expect(await within(voiceSection).findByText('Saved!')).toBeTruthy()
+    expect(voice.value).toBe('Puck')
+
+    unit.current = { ...config, revision: { run: 'run-B', count: 2 } }
+    unit.held[0]()
+    await waitFor(() => expect(configState.config?.revision).toEqual({ run: 'run-B', count: 2 }))
+
+    expect(voice.value).toBe('Kore')
+    expect(
+      screen.queryByText('Changed on the unit or in another tab; your edit was replaced.'),
+    ).toBeNull()
+    await fireEvent.click(within(voiceSection).getByRole('button', { name: 'Save' }))
+    expect(await within(voiceSection).findByText('No changes to save.')).toBeTruthy()
+    expect(unit.bodies).toHaveLength(1)
+  })
+
+  // The same, with Aoede typed after the Puck save: the read brings Kore, not
+  // the Puck the typing was made over, so the typing was replaced, and the
+  // field says so.
+  it("says the read after a new run's answer replaced typing made over the saved value", async () => {
+    const unit = fakeUnit({ ...config, revision: { run: 'run-A', count: 9 } })
+    render(SettingsPage, { onBack: () => {} })
+    const voiceSection = await screen.findByTestId('voice-settings')
+    const voice = within(voiceSection).getByLabelText('Text-to-speech voice') as HTMLInputElement
+    unit.readMode = 'hold'
+
+    await fireEvent.input(voice, { target: { value: 'Puck' } })
+    await fireEvent.click(within(voiceSection).getByRole('button', { name: 'Save' }))
+    const inB = {
+      ...config,
+      tts: { ...config.tts, voice: 'Puck' },
+      revision: { run: 'run-B', count: 1 },
+    }
+    unit.current = inB
+    unit.patches[0](inB)
+    expect(await within(voiceSection).findByText('Saved!')).toBeTruthy()
+    await fireEvent.input(voice, { target: { value: 'Aoede' } })
+
+    unit.current = { ...config, revision: { run: 'run-B', count: 2 } }
+    unit.held[0]()
+    await waitFor(() => expect(configState.config?.revision).toEqual({ run: 'run-B', count: 2 }))
+
+    expect(voice.value).toBe('Kore')
+    expect(
+      screen.getByText('Changed on the unit or in another tab; your edit was replaced.'),
+    ).toBeTruthy()
+    await fireEvent.click(within(voiceSection).getByRole('button', { name: 'Save' }))
+    expect(await within(voiceSection).findByText('No changes to save.')).toBeTruthy()
+  })
+
+  // Puck is typed over Kore and saved; the unit takes it at A/10, but its
+  // answer is held. Another tab sets Kore again at A/11, and General's save
+  // answers A/12 with Kore, the value the typing was made over, so the field
+  // keeps showing the save on its way. Then the A/10 answer lands, older than
+  // A/12: the save is over, and the field shows the config, Kore.
+  it('shows the config once a save it was showing turns out older than it', async () => {
+    const unit = fakeUnit({ ...config, revision: { run: 'run-A', count: 9 } })
+    render(SettingsPage, { onBack: () => {} })
+    const general = await screen.findByTestId('general-settings')
+    const voiceSection = screen.getByTestId('voice-settings')
+    const voice = within(voiceSection).getByLabelText('Text-to-speech voice') as HTMLInputElement
+
+    await fireEvent.input(voice, { target: { value: 'Puck' } })
+    await fireEvent.click(within(voiceSection).getByRole('button', { name: 'Save' }))
+    await fireEvent.input(within(general).getByLabelText('Silence Timeout'), {
+      target: { value: '45s' },
+    })
+    await fireEvent.click(within(general).getByRole('button', { name: 'Save' }))
+    unit.patches[1]({ ...config, silence_timeout: '45s', revision: { run: 'run-A', count: 12 } })
+    expect(await within(general).findByText('Saved!')).toBeTruthy()
+    expect(voice.value).toBe('Puck')
+
+    unit.patches[0]({
+      ...config,
+      tts: { ...config.tts, voice: 'Puck' },
+      revision: { run: 'run-A', count: 10 },
+    })
+    expect(await within(voiceSection).findByText('Saved!')).toBeTruthy()
+
+    expect(configState.config?.revision).toEqual({ run: 'run-A', count: 12 })
+    expect(voice.value).toBe('Kore')
+    await fireEvent.click(within(voiceSection).getByRole('button', { name: 'Save' }))
+    expect(await within(voiceSection).findByText('No changes to save.')).toBeTruthy()
+  })
 })

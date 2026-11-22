@@ -1,7 +1,8 @@
 import { untrack } from 'svelte'
+import type { ConfigTake } from './config.svelte'
 
-// UnitField is a settings field. It shows the unit's value that read returns,
-// from the config the page holds (ordered by the unit's revision), or what the
+// UnitField is a settings field. It shows the value read returns from the
+// config the page last took (ordered by the unit's revision), or what the
 // person typed over it.
 //
 // What a save sends is not read from the config: the page cannot keep the
@@ -13,27 +14,30 @@ import { untrack } from 'svelte'
 export interface UnitField<T> {
   value: T
   // Set by the person's input in the field and by nothing else. Cleared when a
-  // save carries the field, and for good when the unit's value for the field
-  // changes to something other than what the field showed when the person
-  // began typing: the field then shows the unit's value. A value changed and
-  // changed back stays edited, and is sent: it is the person's value.
+  // save carries the field, and for good when the page takes a config whose
+  // value for the field is not the one the field showed when the person began
+  // typing: the field then shows that value. A value changed and changed back
+  // stays edited, and is sent: it is the person's value.
   readonly edited: boolean
-  // The unit's value for the field changed while the person was editing it,
-  // and replaced the edit; until the person's next input in the field.
+  // A config the page took replaced the person's edit with a value other than
+  // what they typed; until the person's next input in the field.
   readonly replaced: boolean
-  // A save carried the field, and the unit took it. Only the edit ends: what
-  // the field shows still comes from the config.
-  acknowledge(): void
+  // A save carried the field, and the unit took it; take is what the page did
+  // with the save's answer. Only the edit ends, and the field keeps showing
+  // the value saved, until the page takes a config, unless the answer was
+  // older than the config shown: the field then shows that config.
+  acknowledge(take: ConfigTake): void
   // The field starts over from the config, as when another form opens in its
   // place: no edit, no note.
   reset(): void
 }
 
-export function unitField<T>(read: () => T): UnitField<T> {
-  // A derived changes only when its value does, so a new config object with
-  // the same value for this field leaves unit as it is.
+// unitField makes a field over the value read returns from the config the
+// page holds; taken returns that config, a new object for each config the
+// page takes.
+export function unitField<T>(read: () => T, taken: () => unknown): UnitField<T> {
   const unit = $derived.by(read)
-  // What the person types replaces value until unit changes.
+  // What the person types replaces value until the page takes a config.
   let value = $derived(unit)
   let edited = $state(false)
   let replaced = $state(false)
@@ -42,30 +46,35 @@ export function unitField<T>(read: () => T): UnitField<T> {
   let before: T | undefined
   let typed: T | undefined
 
-  // Each change of the unit's value ends the person's edit, on the change
-  // itself, so the unit's value coming back later does not bring the edit
-  // back. One change is no news: the unit's value becoming what the field
-  // showed when the person began typing. After a save answered by a run of
-  // the unit the page has not read yet, the field shows the value saved while
-  // the config still holds the old one; the read then brings the saved value,
-  // and what the person typed since stays. The edit was replaced only if the
-  // new value is not what the person typed: one's own save on its way,
-  // carried by another answer, or another tab setting the same value,
-  // replaces nothing. A save of text sends it trimmed, so spaces around it are
-  // no difference.
+  // On each config the page takes, a field the person is not editing shows
+  // its value, so it never keeps an older one. An edit survives a config only
+  // if the config's value is the one the field showed when the person began
+  // typing: after a save answered by a run of the unit the page has not read
+  // yet, the field shows the value saved while the config still holds the old
+  // one, and the read bringing the saved value leaves what the person typed
+  // since. Any other value ends the edit for good, so a value coming back
+  // later does not revive it. The edit was replaced only if the new value is
+  // not what the person typed: one's own save on its way, carried by another
+  // answer, or another tab setting the same value, replaces nothing. A save
+  // of text sends it trimmed, so spaces around it are no difference.
   $effect.pre(() => {
     const incoming = unit
+    void taken()
     untrack(() => {
-      if (!edited) return
+      // value may have taken unit with this config: read it, so the
+      // assignment below is not undone when it is next read.
+      void value
+      if (!edited) {
+        value = incoming
+        return
+      }
       if (sameEntry(incoming, before)) {
-        // value took the unit's value with this change: read it, so the
-        // assignment is not undone when it is next read.
-        void value
         value = typed as T
         return
       }
       if (!sameEntry(incoming, typed)) replaced = true
       edited = false
+      value = incoming
     })
   })
 
@@ -86,8 +95,12 @@ export function unitField<T>(read: () => T): UnitField<T> {
     get replaced() {
       return replaced
     },
-    acknowledge() {
+    acknowledge(take: ConfigTake) {
       edited = false
+      if (take === 'older') {
+        void value
+        value = unit
+      }
     },
     reset() {
       edited = false

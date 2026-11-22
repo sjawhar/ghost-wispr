@@ -2,7 +2,7 @@
   import type { ConfigPatch, ConfigResponse, VoiceEngine } from '../lib/config-api'
   import { patchConfig } from '../lib/config-api'
   import { setConfig } from '../lib/config.svelte'
-  import { unitField } from '../lib/unit-field.svelte'
+  import { unitField, type UnitField } from '../lib/unit-field.svelte'
   import ReplacedNote from './ReplacedNote.svelte'
 
   let {
@@ -19,16 +19,17 @@
 
   // After a save the fields show what the unit answered, as the settings page
   // passes it in (a new model's voice is its default).
-  const enabled = unitField(() => config.voice.enabled)
-  const engine = unitField(() => config.voice.engine)
-  const ttsModel = unitField(() => config.tts.model)
-  const ttsVoice = unitField(() => config.tts.voice)
+  const taken = () => config
+  const enabled = unitField(() => config.voice.enabled, taken)
+  const engine = unitField(() => config.voice.engine, taken)
+  const ttsModel = unitField(() => config.tts.model, taken)
+  const ttsVoice = unitField(() => config.tts.voice, taken)
   let saving = $state(false)
   let feedback = $state('')
 
   async function save(): Promise<void> {
     // Each field the save carries, acknowledged once the unit takes it.
-    const carried: { acknowledge(): void }[] = []
+    const carried: Pick<UnitField<unknown>, 'acknowledge'>[] = []
     const voice: NonNullable<ConfigPatch['voice']> = {}
     if (enabled.edited) {
       voice.enabled = enabled.value
@@ -63,8 +64,8 @@
     feedback = ''
     try {
       const updated = await patchConfig(patch)
-      for (const field of carried) field.acknowledge()
-      setConfig(updated)
+      const take = setConfig(updated)
+      for (const field of carried) field.acknowledge(take)
       feedback = 'Saved!'
     } catch (error) {
       feedback = error instanceof Error ? error.message : 'Save failed'

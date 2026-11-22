@@ -37,10 +37,22 @@
   // person typed over it, and a save sends the fields the person edited.
   const openPreset = (): PresetDetail | undefined => presets[expandedPreset]
   const fields: Record<keyof PresetDetail, UnitField<string>> = {
-    description: unitField(() => openPreset()?.description ?? ''),
-    system_prompt: unitField(() => openPreset()?.system_prompt ?? ''),
-    user_template: unitField(() => openPreset()?.user_template ?? ''),
-    model: unitField(() => openPreset()?.model ?? ''),
+    description: unitField(
+      () => openPreset()?.description ?? '',
+      () => presets,
+    ),
+    system_prompt: unitField(
+      () => openPreset()?.system_prompt ?? '',
+      () => presets,
+    ),
+    user_template: unitField(
+      () => openPreset()?.user_template ?? '',
+      () => presets,
+    ),
+    model: unitField(
+      () => openPreset()?.model ?? '',
+      () => presets,
+    ),
   }
 
   function resetFields(): void {
@@ -192,9 +204,9 @@
       const updated = await patchConfig({
         summarization: { presets: { [name]: sent } },
       })
-      setConfig(updated)
+      const take = setConfig(updated)
       if (!stillOpen()) return
-      for (const field of carried) field.acknowledge()
+      for (const field of carried) field.acknowledge(take)
       feedback = 'Saved!'
       if (isNew) {
         isNew = false
