@@ -2167,17 +2167,22 @@ chime_counted() {
 # a case with no overrun can still fall back by design (no audible lines, a disruption), so only a
 # chime case whose own chime-relative checks passed counts (chime_counted).
 capture_unbroken() {
+  fake_overran "$1" || return 0
+  printf 'NOTE: %s: the fake arecord overran (%s), so the case fell back to first_audio\n' "$1" "$(tr '\n' ';' <"$root/$1/state/overruns")"
+  expect_line "$1" 'the recording is not shown continuous'
+  return 1
+}
+
+# fake_overran NAME: whether the fake arecord truly overran in NAME (its own log, overruns); the
+# driver must have named the overrun exactly then.
+fake_overran() {
   local overran=false noted=false
   [[ -s $root/$1/state/overruns ]] && overran=true
   grep -Fq "NOTE: recording: arecord reported an overrun" "$root/$1/out" && noted=true
   if [[ $overran != "$noted" ]]; then
     check_failed "$1: the fake logged an overrun: $overran; the driver named one: $noted"
   fi
-  if [[ $overran == true ]]; then
-    printf 'NOTE: %s: the fake arecord overran (%s), so the case fell back to first_audio\n' "$1" "$(tr '\n' ';' <"$root/$1/state/overruns")"
-    expect_line "$1" 'the recording is not shown continuous'
-    return 1
-  fi
+  [[ $overran == true ]]
 }
 
 # expect_load_case NAME: a load case. With no overrun, it must PASS, each answer timed against its
@@ -3334,10 +3339,18 @@ expect_not_passed() {
 # machine that holds the fake 11 ms past its 50 ms makes it overrun, and the case reads the
 # start-only bounds, which no residency moves. floor_decided says so in the run's output.
 floor_decided cancel-behind || true
-expect_rc cancel-behind 2
-expect_line cancel-behind "UNKNOWN: playback-cancel: stop "
-expect_line cancel-behind ", but no earlier than "
-expect_between 'cancel-behind: how long the good cancel is heard up to, 50 ms behind' "$(heard_up_to cancel-behind)" 50 110
+if fake_overran cancel-behind; then
+  # The start-only bounds can leave the next answer's start unknown first (a full run of #159, s6,
+  # read "a sound at the rig microphone starts between -19 and 82 ms from the next answer's first
+  # audio"): UNKNOWN either way, never PASS, never the FAIL of a good cancel.
+  expect_rc cancel-behind 2
+  expect_no_line cancel-behind "PASS: playback-cancel: no stop's speech was heard"
+else
+  expect_rc cancel-behind 2
+  expect_line cancel-behind "UNKNOWN: playback-cancel: stop "
+  expect_line cancel-behind ", but no earlier than "
+  expect_between 'cancel-behind: how long the good cancel is heard up to, 50 ms behind' "$(heard_up_to cancel-behind)" 50 110
+fi
 expect_line cancel-behind 'PASS: playback-cancel: 0 underruns'
 expect_no_line cancel-behind "FAIL: playback-cancel: a stop's speech was heard"
 expect_restored cancel-behind
@@ -3486,9 +3499,17 @@ expect_line cancel-long-wake 'PASS: playback-cancel: 0 underruns over '
 expect_no_line cancel-long-wake 'UNKNOWN: '
 expect_restored cancel-long-wake
 # The calibrated bound still catches a word that runs into the louder chime.
-expect_rc cancel-long-wake-leak 1
-expect_line cancel-long-wake-leak "FAIL: playback-cancel stop 1: the sound at the next question's chime is not the chime alone: it lasts "
-expect_line cancel-long-wake-leak "than the calibration, the wake sound played alone (320 ms), by over 20 ms"
+# After a fake overrun the start-only bounds can leave the chime's window unknown (c33 of #156 read
+# "a sound at the rig microphone starts between -139 and -49 ms from the next question's
+# wake_heard"): UNKNOWN then, never PASS.
+if fake_overran cancel-long-wake-leak; then
+  expect_rc cancel-long-wake-leak 1 2
+  expect_no_line cancel-long-wake-leak "PASS: playback-cancel: no stop's speech was heard"
+else
+  expect_rc cancel-long-wake-leak 1
+  expect_line cancel-long-wake-leak "FAIL: playback-cancel stop 1: the sound at the next question's chime is not the chime alone: it lasts "
+  expect_line cancel-long-wake-leak "than the calibration, the wake sound played alone (320 ms), by over 20 ms"
+fi
 expect_restored cancel-long-wake-leak
 expect_rc cancel-sound-missing 2
 expect_line cancel-sound-missing 'UNKNOWN: playback-cancel: this build has no ghost-wispr play-sound, which plays the wake sound alone to calibrate the rig'
