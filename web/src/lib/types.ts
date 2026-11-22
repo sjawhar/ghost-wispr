@@ -211,6 +211,9 @@ export interface StatusResponse {
   capturing: boolean
   capture_state: string
   warnings: string[]
+  // What the page shows apart from warnings, about a state the configuration
+  // chose, such as Envoy turned off; absent from an older unit.
+  notices?: string[]
   active_session_id: string
   active_session_started_at: string
 }

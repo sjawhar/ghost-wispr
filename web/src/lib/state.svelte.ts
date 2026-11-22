@@ -56,6 +56,7 @@ type AppState = {
   joinedAgents: Map<string, SessionJoinedAgents>
   dates: string[]
   warnings: string[]
+  notices: string[]
   presets: PresetMap
   activeSessionId: string
   activeSessionStartedAt: number
@@ -78,6 +79,7 @@ export const appState = $state<AppState>({
   joinedAgents: new Map(),
   dates: [],
   warnings: [],
+  notices: [],
   presets: {},
   activeSessionId: '',
   activeSessionStartedAt: 0,
@@ -143,6 +145,10 @@ export function setDates(dates: string[]): void {
 
 export function setWarnings(warnings: string[]): void {
   appState.warnings = warnings
+}
+
+export function setNotices(notices: string[]): void {
+  appState.notices = notices
 }
 
 export function setPresets(presets: PresetMap): void {
@@ -485,6 +491,7 @@ export function resetState(): void {
   appState.activeSessionStartedAt = 0
   appState.activeAudioSessionId = ''
   appState.warnings = []
+  appState.notices = []
   appState.presets = {}
   appState.interimText = ''
   appState.interimSpeaker = -1
