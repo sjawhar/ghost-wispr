@@ -58,13 +58,25 @@ func crowd(d time.Duration) {
 	spinning.Wait()
 }
 
-// liveHeap is a heap of a million small objects, so that each collection
-// takes a while to mark. It is built once, before any fault runs: building it
+// liveHeap is a heap that takes long to mark: eight arrays of a million
+// pointers, each to the same small object. Each runtime.GC call runs part of
+// the collection on its caller, running (it starts the collection and stops
+// the world, and sweeps after the mark), and waits for the rest, the mark.
+// A heap of a million small objects took about 20 ms a collection, eight or
+// nine collections in the fault's 150 ms, and on a loaded machine their
+// running parts once made most of the fault's turn, which the reader rightly
+// named running. This heap takes 75 to 150 ms to mark, one to three
+// collections in the fault, so its turn is mostly the mark the calling
+// goroutine waits for. It is built once, before any fault runs: building it
 // is computing, which is not what the collector control injects.
-var liveHeap = sync.OnceValue(func() []*[16]byte {
-	live := make([]*[16]byte, 1<<20)
+var liveHeap = sync.OnceValue(func() [][]*[16]byte {
+	target := new([16]byte)
+	live := make([][]*[16]byte, 8)
 	for i := range live {
-		live[i] = new([16]byte)
+		live[i] = make([]*[16]byte, 1<<20)
+		for j := range live[i] {
+			live[i][j] = target
+		}
 	}
 	return live
 })
