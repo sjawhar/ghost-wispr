@@ -459,7 +459,9 @@ with `deploy/pi/files/ghost-wispr.yaml` rendered with that ID,
 no longer reads (an old Envoy webhook signing key, and those of the settings that providers
 replaced: README, "Removed settings"), and
 restarts Ghost Wispr. The credential files from the full provisioner stay as they are. A later
-full-provisioner run keeps the drive ID and both enablements.
+full-provisioner run keeps the drive ID and both enablements. While the Envoy hub moves, it refuses
+before it writes anything if a line of `.env` could turn Envoy on ("Turn on the meeting voice",
+step 1), naming the variable.
 
 ```bash
 (
@@ -1055,11 +1057,12 @@ the unit.
    hub moves (dispatch://INFRA-3862), the template sets `envoy_enabled: false` and no
    `concierge.envoy_url`, so the Pi opens no Envoy session and publishes no event: a start with
    Envoy on publishes every completed summary Envoy has not had. A `.env` line overrides the YAML,
-   so `deploy/pi/rollout.sh install` refuses, and changes nothing, while a line of the Pi's `.env`
-   could set `GHOST_WISPR_ENVOY_ENABLED` or `GHOST_WISPR_CONCIERGE_ENVOY_URL`: a line that, past
-   leading space and an `export`, starts with the name and `=`. To turn Envoy on again, set both in
-   the template, remove `ENVOY_ON_VARIABLES` and its check from `deploy/pi/rollout.sh`, and run the
-   provisioner.
+   so the models step (`provision.sh --models`) and `deploy/pi/rollout.sh install` each refuse, and
+   change nothing, while a line of the Pi's `.env` could set `GHOST_WISPR_ENVOY_ENABLED` or
+   `GHOST_WISPR_CONCIERGE_ENVOY_URL`: a line that, past leading space and an `export`, starts with
+   the name and `=`. They name the variable. To turn Envoy on again, set both in the template,
+   remove `ENVOY_ON_VARIABLES` and its check from `deploy/pi/provision.sh` and
+   `deploy/pi/rollout.sh`, and run the provisioner.
 2. The Pi's Dispatch token: a no-scope agent token, never a person's. Before you run
    `provision-pi.sh`, mint it into `$prepared/dispatch-token` with your own Dispatch token, which
    must hold the `person` and `approve` scopes, in the file `DISPATCH_TOKEN_FILE` names:
