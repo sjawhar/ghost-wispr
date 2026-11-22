@@ -33,11 +33,13 @@ fail() {
 
 # envoy_on_env_names prints, one a line, each variable of ENVOY_ON_VARIABLES that a line of the .env
 # file ENV_FILE could set: a line that, past leading space and an export, starts with its name and
-# =. A match inside a multi-line value counts too. It reads no value, and fails when it cannot read
-# ENV_FILE.
+# =. A line ends at a carriage return as at a line feed, as systemd's EnvironmentFile= parser reads
+# one (NEWLINE "\n\r", src/basic/env-file.c), so tr turns each CR into a line feed first. A match
+# inside a multi-line value counts too. It reads no value, and fails when it cannot read ENV_FILE.
 envoy_on_env_names() {
   local found status=0
-  found=$(grep -oE "^[[:space:]]*(export[[:space:]]+)?($ENVOY_ON_VARIABLES)[[:space:]]*=" "$1") || status=$?
+  [[ -r $1 ]] || return 1
+  found=$(tr '\r' '\n' <"$1" | grep -oE "^[[:space:]]*(export[[:space:]]+)?($ENVOY_ON_VARIABLES)[[:space:]]*=") || status=$?
   ((status <= 1)) || return 1
   [[ -z $found ]] || grep -oE "$ENVOY_ON_VARIABLES" <<<"$found" | sort -u
 }

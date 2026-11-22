@@ -723,7 +723,9 @@ restart_at=$(grep -n -F -x -- "sudo -u ghost-wispr XDG_RUNTIME_DIR=$runtime_dir 
 # .env could set a variable that would turn Envoy on over the template, which keeps it off while the
 # hub moves (dispatch://INFRA-3862): a line that, past leading space and an export, starts with the
 # name and =. It names the variable, prints no value, and leaves every file byte for byte as it was.
-# A match inside a multi-line quoted value refuses too: a false refusal only stops the step.
+# A match inside a multi-line quoted value refuses too: a false refusal only stops the step. systemd's
+# EnvironmentFile= parser ends a line at a carriage return as at a line feed (NEWLINE "\n\r",
+# src/basic/env-file.c), so a bare CR starts a line too; a case whose text holds CR LF is a CRLF file.
 models_dir=$work_dir/models-deploy
 mkdir -p "$models_dir"
 run_models() {
@@ -735,10 +737,13 @@ models_files() { sha256sum "$models_dir/ghost-wispr.yaml" "$models_dir/.env"; }
 for case in \
   'GHOST_WISPR_ENVOY_ENABLED|GHOST_WISPR_ENVOY_ENABLED=true' \
   'GHOST_WISPR_CONCIERGE_ENVOY_URL|  export GHOST_WISPR_CONCIERGE_ENVOY_URL = http://hub.example.test:9020' \
-  $'GHOST_WISPR_ENVOY_ENABLED|GHOST_WISPR_DISPATCH_TOKEN="first line\nGHOST_WISPR_ENVOY_ENABLED=true\nlast line"'; do
-  name=${case%%|*}
+  $'GHOST_WISPR_ENVOY_ENABLED|GHOST_WISPR_DISPATCH_TOKEN="first line\nGHOST_WISPR_ENVOY_ENABLED=true\nlast line"' \
+  $'GHOST_WISPR_ENVOY_ENABLED|GHOST_WISPR_ADDR=127.0.0.1:8080\rGHOST_WISPR_ENVOY_ENABLED=true' \
+  $'GHOST_WISPR_CONCIERGE_ENVOY_URL|GHOST_WISPR_ADDR=127.0.0.1:8080\r\nGHOST_WISPR_CONCIERGE_ENVOY_URL=http://hub.example.test:9020\r'; do
+  name=${case%%|*} content=${case#*|} eol=''
+  [[ $content != *$'\r\n'* ]] || eol=$'\r'
   printf 'old: config\n' >"$models_dir/ghost-wispr.yaml"
-  printf '%s\n' GHOST_WISPR_DEEPGRAM_API_KEY=dg-1 "${case#*|}" >"$models_dir/.env"
+  printf "%s$eol\n%s\n" GHOST_WISPR_DEEPGRAM_API_KEY=dg-1 "$content" >"$models_dir/.env"
   before=$(models_files)
   if run_models; then
     fail "--models installed with $name in .env: $(<"$work_dir/out")"

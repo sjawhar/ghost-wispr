@@ -83,11 +83,13 @@ readonly ENVOY_ON_VARIABLES='GHOST_WISPR_ENVOY_ENABLED|GHOST_WISPR_CONCIERGE_ENV
 
 # require_no_envoy_override fails, naming each variable, while a line of the Pi's .env could set one
 # of ENVOY_ON_VARIABLES: a line that, past leading space and an export, starts with its name and =.
-# A match inside a multi-line value fails too, which only stops the install. grep -o reads back from
-# the Pi each match up to its =, so no value leaves the Pi, and .env is not changed.
+# A line ends at a carriage return as at a line feed, as systemd's EnvironmentFile= parser reads
+# one (NEWLINE "\n\r", src/basic/env-file.c), so tr turns each CR into a line feed first. A match
+# inside a multi-line value fails too, which only stops the install. grep -o reads back from the Pi
+# each match up to its =, so no value leaves the Pi, and .env is not changed.
 require_no_envoy_override() {
   local found names status=0
-  found=$(pi "grep -oE '^[[:space:]]*(export[[:space:]]+)?($ENVOY_ON_VARIABLES)[[:space:]]*=' $(printf %q "$DEPLOY_DIR/.env")") \
+  found=$(pi "f=$(printf %q "$DEPLOY_DIR/.env"); [ -r \"\$f\" ] || exit 2; tr '\r' '\n' <\"\$f\" | grep -oE '^[[:space:]]*(export[[:space:]]+)?($ENVOY_ON_VARIABLES)[[:space:]]*='") \
     || status=$?
   ((status <= 1)) || fail "cannot read $DEPLOY_DIR/.env on the Pi (exit $status): nothing was changed"
   [[ -n $found ]] || return 0
