@@ -77,9 +77,13 @@ EOF
 
 # sudo records each command and runs none, but systemd-run's command is kept to run below, with the
 # whole systemd-run line, and what provision.sh installs from stdin or as the configuration is kept
-# to read. systemctl --user show-environment prints ghost-wispr's user manager's environment: the
-# file TEST_MANAGER_ENV names when it exists, else the few variables a manager has; it exits
-# TEST_MANAGER_ENV_EXIT (0 by default).
+# to read. ghost-wispr's user manager:
+# - systemctl --user show-environment prints its environment: the file TEST_MANAGER_ENV names when
+#   it exists, else the few variables a manager has; it exits TEST_MANAGER_ENV_EXIT (0 by default).
+# - systemctl --user daemon-reload moves the file TEST_MANAGER_ENV_PENDING names, when it exists,
+#   over TEST_MANAGER_ENV: an environment.d line written since the last reload counts from the next.
+# - systemctl --user show -p LoadState -p DropInPaths UNIT prints the unit's load state from
+#   $TEST_UNITS/load-UNIT (loaded when absent) and its drop-ins from $TEST_UNITS/dropins-UNIT.
 cat >"$work_dir/bin/sudo" <<'EOF'
 #!/usr/bin/env bash
 printf 'sudo %s\n' "$*" >>"$TEST_LOG"
@@ -91,6 +95,14 @@ fi
 if [[ $1 == systemd-run ]]; then
   printf '%s' "${!#}" >"$TEST_LOG.join"
   printf '%s\n' "$*" >"$TEST_LOG.systemd-run"
+fi
+if [[ $* == *' systemctl --user daemon-reload' && -f ${TEST_MANAGER_ENV_PENDING:-} ]]; then
+  mv -f -- "$TEST_MANAGER_ENV_PENDING" "$TEST_MANAGER_ENV"
+fi
+if [[ $* == *' systemctl --user show -p LoadState -p DropInPaths '* ]]; then
+  unit=${!#} units=${TEST_UNITS:-/nonexistent}
+  printf 'LoadState=%s\nDropInPaths=%s\n' "$(cat -- "$units/load-$unit" 2>/dev/null || echo loaded)" \
+    "$(cat -- "$units/dropins-$unit" 2>/dev/null || true)"
 fi
 if [[ $* == *' systemctl --user show-environment' ]]; then
   if [[ -f ${TEST_MANAGER_ENV:-} ]]; then
@@ -729,6 +741,61 @@ restart_at=$(grep -n -F -x -- "sudo -u ghost-wispr XDG_RUNTIME_DIR=$runtime_dir 
 [[ -n $config_at && -n $restart_at && $restart_at -gt $config_at ]] \
   || fail "the rerun did not restart a running recorder after it installed the configuration: $(<"$TEST_LOG")"
 
+# ghost-wispr's user manager, as the fake sudo above stands for it. Each of its units inherits its
+# environment (systemctl --user set-environment or import-environment, an environment.d file,
+# DefaultEnvironment=, the manager's own start-up environment), ghost-wispr.service with it.
+export TEST_MANAGER_ENV="$work_dir/manager-env" TEST_MANAGER_ENV_PENDING="$work_dir/manager-env-pending"
+export TEST_UNITS="$work_dir/units"
+mkdir -p "$TEST_UNITS"
+readonly user_systemctl="sudo -u ghost-wispr XDG_RUNTIME_DIR=$runtime_dir systemctl --user"
+readonly reload="$user_systemctl daemon-reload" show_environment="$user_systemctl show-environment"
+# env_lines VARIABLE...: an environment as systemctl --user show-environment prints one, with these
+# VARIABLEs among the few a manager has.
+env_lines() { printf '%s\n' HOME=/home/ghost-wispr LANG=C.UTF-8 "$@" PATH=/usr/local/bin:/usr/bin:/bin; }
+manager_env() { env_lines "$@" >"$TEST_MANAGER_ENV"; }
+# The rerun above reloaded the manager and read its environment before its first change.
+reload_at=$(grep -n -F -x -- "$reload" "$TEST_LOG" | cut -d: -f1 | head -n 1) || true
+read_at=$(grep -n -F -x -- "$show_environment" "$TEST_LOG" | cut -d: -f1 | head -n 1) || true
+change_at=$(grep -n -F -x -- 'sudo apt-get update' "$TEST_LOG" | cut -d: -f1 | head -n 1) || true
+[[ -n $reload_at && -n $read_at && -n $change_at && $reload_at -lt $read_at && $read_at -lt $change_at ]] \
+  || fail "the rerun did not reload the user manager and read its environment before it changed anything: $(<"$TEST_LOG")"
+# The full provisioner refuses, before it changes anything, while the manager sets one of the
+# variables the models step refuses in .env (below): a .env the full provisioner writes anew holds
+# none of them, but the recorder would still inherit the manager's. It reloads the manager first, so
+# an environment.d line written since its last reload counts, as it would at the provisioner's own
+# reload. It names the variable and why, prints no value, and refuses as well when it cannot read
+# the environment or reads an empty one.
+# Each case is NAME|REASON|NOW|PENDING: the manager sets NOW now, and PENDING from its next reload.
+# With no NAME the manager's environment reads empty.
+for case in \
+  'GHOST_WISPR_CONFIG|replace the installed config|GHOST_WISPR_CONFIG=/srv/elsewhere/ghost-wispr.yaml|' \
+  "GHOST_WISPR_ENVOY_HUB_URL|override the template's|GHOST_WISPR_ENVOY_HUB_URL=http://hub.example.test:9020|" \
+  'GHOST_WISPR_CONFIG|replace the installed config||GHOST_WISPR_CONFIG=/srv/elsewhere/ghost-wispr.yaml' \
+  '|||'; do
+  IFS='|' read -r name reason now pending <<<"$case"
+  manager_env ${now:+"$now"}
+  [[ -n $name ]] || : >"$TEST_MANAGER_ENV"
+  rm -f -- "$TEST_MANAGER_ENV_PENDING"
+  [[ -z $pending ]] || env_lines "$pending" >"$TEST_MANAGER_ENV_PENDING"
+  what=${name:-an empty environment}${pending:+ from an environment.d line since the last reload}
+  : >"$TEST_LOG"
+  if run_provision "${bundle_files[@]}"; then
+    fail "the full provisioner ran with $what in the user manager: $(<"$work_dir/out")"
+  fi
+  if [[ -n $name ]]; then
+    grep -qF "ghost-wispr's user manager sets $name, which would $reason" "$work_dir/out" \
+      || fail "the full provisioner did not name $name in the user manager's environment, and that it would $reason: $(<"$work_dir/out")"
+  else
+    grep -qF "could not read the environment of ghost-wispr's user manager" "$work_dir/out" \
+      || fail "the full provisioner did not say it could not read an empty user manager environment: $(<"$work_dir/out")"
+  fi
+  ! grep -qE 'hub\.example\.test|elsewhere' "$work_dir/out" \
+    || fail "the full provisioner printed a value from the user manager's environment: $(<"$work_dir/out")"
+  [[ $(<"$TEST_LOG") == "$reload"$'\n'"$show_environment" ]] \
+    || fail "the full provisioner did more than reload the user manager and read its environment before it refused $what: $(<"$TEST_LOG")"
+done
+rm -f -- "$TEST_MANAGER_ENV" "$TEST_MANAGER_ENV_PENDING"
+
 # provision.sh --models, run by hand, refuses before it writes anything while a line of the deployed
 # .env could set GHOST_WISPR_CONFIG, which would replace the installed config with another file, or a
 # variable that would override the template's envoy_enabled, envoy_hub_url or concierge.envoy_url: a
@@ -787,15 +854,56 @@ grep -qF "could not read $models_dir/.env" "$work_dir/out" || fail "--models did
 [[ ! -s $TEST_LOG ]] || fail "--models changed the Pi before it refused an unreadable .env: $(<"$TEST_LOG")"
 [[ $(models_files) == "$before" ]] || fail "--models changed a file when it refused an unreadable .env"
 # --models refuses too, before it changes anything, while ghost-wispr's user manager sets one of
-# those variables in its own environment (systemctl --user set-environment or import-environment, an
-# environment.d file, DefaultEnvironment=): each of its units inherits that environment,
-# ghost-wispr.service with it. It reads the names from systemctl --user show-environment, names the
-# variable and why, and prints no value. It refuses as well when it cannot read that environment, or
-# reads an empty one: a user manager always holds some variables, so an empty reading is a blind one.
-export TEST_MANAGER_ENV="$work_dir/manager-env"
-readonly show_environment="sudo -u ghost-wispr XDG_RUNTIME_DIR=$runtime_dir systemctl --user show-environment"
-manager_env() { printf '%s\n' HOME=/home/ghost-wispr LANG=C.UTF-8 "$@" PATH=/usr/local/bin:/usr/bin:/bin >"$TEST_MANAGER_ENV"; }
+# those variables in its own environment. Before it reads the environment it runs the check
+# rollout.sh install runs (require_unit_files): it reloads the manager, so an environment.d line
+# written since the last reload counts, as it will at the recorder's next start, and it refuses while
+# either unit is not loaded or has a drop-in, which can set the recorder's environment
+# (Environment=, EnvironmentFile=) past every file it checks. It reads the names from systemctl
+# --user show-environment, names the variable and why, and prints no value. It refuses as well when
+# it cannot read that environment, or reads an empty one: a user manager always holds some
+# variables, so an empty reading is a blind one.
+show_unit() { printf '%s show -p LoadState -p DropInPaths %s' "$user_systemctl" "$1"; }
+models_reads="$reload
+$(show_unit ghost-wispr.service)
+$(show_unit ghost-wispr-update.service)
+$show_environment"
+readonly models_reads
 printf '%s\n' GHOST_WISPR_DEEPGRAM_API_KEY=dg-1 >"$models_dir/.env"
+# A line the manager reads only from its next reload: --models reloads it before it reads.
+manager_env
+env_lines GHOST_WISPR_CONFIG=/srv/elsewhere/ghost-wispr.yaml >"$TEST_MANAGER_ENV_PENDING"
+printf 'old: config\n' >"$models_dir/ghost-wispr.yaml"
+before=$(models_files)
+if run_models; then
+  fail "--models installed with GHOST_WISPR_CONFIG from an environment.d line written since the user manager's last reload: $(<"$work_dir/out")"
+fi
+grep -qF "ghost-wispr's user manager sets GHOST_WISPR_CONFIG, which would replace the installed config" "$work_dir/out" \
+  || fail "--models did not name GHOST_WISPR_CONFIG from an environment.d line written since the last reload: $(<"$work_dir/out")"
+[[ $(<"$TEST_LOG") == "$models_reads" ]] \
+  || fail "--models did more than reload the user manager and read it before it refused: $(<"$TEST_LOG")"
+[[ $(models_files) == "$before" ]] || fail "--models changed a file when it refused a pending environment.d line"
+rm -f -- "$TEST_MANAGER_ENV" "$TEST_MANAGER_ENV_PENDING"
+# A unit not loaded, or with a drop-in: each case is UNIT|FILE|CONTENT|SAYS, FILE in $TEST_UNITS.
+readonly dropin=/home/ghost-wispr/.config/systemd/user/ghost-wispr.service.d/trace.conf
+for case in \
+  "ghost-wispr.service|dropins|$dropin|ghost-wispr.service has a drop-in ($dropin), which can change how it runs" \
+  'ghost-wispr-update.service|dropins|/etc/systemd/user/ghost-wispr-update.service.d/limit.conf|ghost-wispr-update.service has a drop-in (/etc/systemd/user/ghost-wispr-update.service.d/limit.conf)' \
+  'ghost-wispr-update.service|load|not-found|ghost-wispr-update.service is not-found, not loaded'; do
+  IFS='|' read -r unit file content says <<<"$case"
+  printf '%s\n' "$content" >"$TEST_UNITS/$file-$unit"
+  printf 'old: config\n' >"$models_dir/ghost-wispr.yaml"
+  before=$(models_files)
+  if run_models; then
+    fail "--models installed with $unit's $file $content: $(<"$work_dir/out")"
+  fi
+  rm -f -- "$TEST_UNITS/$file-$unit"
+  grep -qF "$says" "$work_dir/out" || fail "--models did not say: $says: $(<"$work_dir/out")"
+  expected="$reload"$'\n'"$(show_unit ghost-wispr.service)"
+  [[ $unit == ghost-wispr.service ]] || expected+=$'\n'"$(show_unit "$unit")"
+  [[ $(<"$TEST_LOG") == "$expected" ]] \
+    || fail "--models did more than reload the user manager and read the units before it refused $unit's $file: $(<"$TEST_LOG")"
+  [[ $(models_files) == "$before" ]] || fail "--models changed a file when it refused $unit's $file"
+done
 for case in \
   'GHOST_WISPR_CONFIG|GHOST_WISPR_CONFIG=/srv/elsewhere/ghost-wispr.yaml' \
   $'GHOST_WISPR_CONFIG|GHOST_WISPR_ENVOY_ENABLED=false\nGHOST_WISPR_CONFIG=/srv/elsewhere/ghost-wispr.yaml' \
@@ -814,8 +922,8 @@ for case in \
     || fail "--models did not name $name in the user manager's environment, and that it would $reason: $(<"$work_dir/out")"
   ! grep -qE 'hub\.example\.test|elsewhere' "$work_dir/out" \
     || fail "--models printed a value from the user manager's environment: $(<"$work_dir/out")"
-  [[ $(<"$TEST_LOG") == "$show_environment" ]] \
-    || fail "--models did more than read the user manager's environment before it refused $name: $(<"$TEST_LOG")"
+  [[ $(<"$TEST_LOG") == "$models_reads" ]] \
+    || fail "--models did more than reload the user manager and read it before it refused $name: $(<"$TEST_LOG")"
   [[ $(models_files) == "$before" ]] || fail "--models changed a file when it refused $name in the user manager's environment"
 done
 for broken in 'systemctl fails' 'an empty environment'; do
@@ -833,14 +941,15 @@ for broken in 'systemctl fails' 'an empty environment'; do
   ((status != 0)) || fail "--models installed when $broken: $(<"$work_dir/out")"
   grep -qF "could not read the environment of ghost-wispr's user manager" "$work_dir/out" \
     || fail "--models did not say it could not read the user manager's environment when $broken: $(<"$work_dir/out")"
-  [[ $(<"$TEST_LOG") == "$show_environment" ]] \
-    || fail "--models did more than read the user manager's environment when $broken: $(<"$TEST_LOG")"
+  [[ $(<"$TEST_LOG") == "$models_reads" ]] \
+    || fail "--models did more than reload the user manager and read it when $broken: $(<"$TEST_LOG")"
   [[ $(models_files) == "$before" ]] || fail "--models changed a file when $broken"
 done
 # The control: a .env and a user manager's environment that set none install. The .env has each
 # override commented out and longer names that start with one; the environment has those longer
 # names, a name inside another variable's value, and a value with a line break, quoted onto one line
-# as systemctl prints it. --models still read the environment.
+# as systemctl prints it. --models still reloaded the manager and read the units and the environment,
+# first.
 printf '%s\n' GHOST_WISPR_DEEPGRAM_API_KEY=dg-1 '# GHOST_WISPR_CONFIG=/srv/elsewhere/ghost-wispr.yaml' \
   '# GHOST_WISPR_ENVOY_HUB_URL=http://hub.example.test:9020' '# GHOST_WISPR_ENVOY_ENABLED=true' \
   '# GHOST_WISPR_CONCIERGE_ENVOY_URL=http://hub.example.test:9020' 'GHOST_WISPR_ENVOY_ENABLED_BEFORE=true' \
@@ -848,6 +957,7 @@ printf '%s\n' GHOST_WISPR_DEEPGRAM_API_KEY=dg-1 '# GHOST_WISPR_CONFIG=/srv/elsew
 manager_env 'GHOST_WISPR_CONFIG_DIR=/srv/elsewhere' 'GHOST_WISPR_ENVOY_ENABLED_BEFORE=true' \
   'LESSOPEN=GHOST_WISPR_CONFIG=/srv/elsewhere' "GHOST_WISPR_DISPATCH_TOKEN=\$'first\\nGHOST_WISPR_CONFIG=x'"
 run_models || fail "--models refused a .env and a user manager's environment that set no override: $(<"$work_dir/out")"
-grep -qxF "$show_environment" "$TEST_LOG" || fail "--models installed without reading the user manager's environment: $(<"$TEST_LOG")"
+[[ $(head -n 4 "$TEST_LOG") == "$models_reads" ]] \
+  || fail "--models installed without first reloading the user manager and reading it: $(<"$TEST_LOG")"
 grep -qE '^sudo install .*/ghost-wispr\.yaml$' "$TEST_LOG" || fail "--models did not install the config: $(<"$TEST_LOG")"
 printf 'provision run test passed\n'

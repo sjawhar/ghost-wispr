@@ -219,7 +219,10 @@ machine that reaches the Pi over SSH.
 - It copies only the provisioning sources to a temporary directory on the Pi and removes it
   afterwards, so the card keeps no source checkout.
 
-`provision.sh` runs as `ghost-wispr` with passwordless sudo. It installs `libportaudio2`,
+`provision.sh` runs as `ghost-wispr` with passwordless sudo. Before it changes anything, it reloads
+`ghost-wispr`'s user manager and refuses while the manager's own environment sets
+`GHOST_WISPR_CONFIG` or an Envoy variable, which the recorder would inherit ("Turn on the meeting
+voice", step 1); the `.env` it writes sets none of them. It installs `libportaudio2`,
 `ffmpeg`, `lame`, `jq`, and `curl`; copies the release runtime to `/opt/ghost-wispr`; installs
 the user services; verifies and installs the newest release; restarts a running recorder so it
 reads the configuration it installed; enables Tailscale Serve; and then starts the detached
@@ -465,7 +468,11 @@ writes anything if a line of `.env`, or the environment of `ghost-wispr`'s user 
 or `GHOST_WISPR_ENVOY_ENABLED`, `GHOST_WISPR_ENVOY_HUB_URL` or `GHOST_WISPR_CONCIERGE_ENVOY_URL`,
 which override the template's `envoy_enabled`, `envoy_hub_url` and `concierge.envoy_url` ("Turn on
 the meeting voice", step 1), naming the variable. Set `GHOST_WISPR_CONFIG` only on a command line,
-as for the test instance ("Accept slice 2").
+as for the test instance ("Accept slice 2"). Before it reads the manager's environment it runs
+`rollout.sh install`'s unit check: it reloads the manager, and refuses while `ghost-wispr.service`
+or `ghost-wispr-update.service` is not loaded or has a drop-in, naming it, since a drop-in can set
+the recorder's environment past both checks. Remove the drop-in and run the step again; for a unit
+that is not loaded, run the full provisioner ("Provision"), which installs both.
 
 ```bash
 (
@@ -605,9 +612,10 @@ Linux took off its processor, which a Go trace cannot tell apart.
 
 Every capture ends with the turn-off: remove `speaker_trace_dir`, and anything else added for the
 capture (a systemd drop-in, a `GODEBUG=gctrace=1` in `/opt/ghost-wispr/.env`), then restart the
-service. The trace costs CPU and memory while it runs. Provisioning is not a turn-off: it installs
-the base unit only and keeps every drop-in under `ghost-wispr.service.d`, and `provision.sh
---models` keeps a `GODEBUG` line in `.env`, so a forgotten setting stays on after a reprovision.
+service. The trace costs CPU and memory while it runs. The full provisioner is not a turn-off: it
+installs the base unit only and keeps every drop-in under `ghost-wispr.service.d`, so a forgotten
+setting stays on after it. The models step and `rollout.sh install` refuse while a drop-in is
+there, but the models step keeps a `GODEBUG` line in `.env`, so that one stays on after it.
 
 The microphone is never open while the blink(1) is off: the blink(1) stays red while the microphone
 is open, and goes off only once Ghost Wispr has closed it. A pause closes it at once, also while
@@ -1078,10 +1086,11 @@ the unit.
    goes with `systemctl --user unset-environment NAME`; one from an `environment.d` or `user.conf`
    line goes once you remove the line and run `systemctl --user daemon-reload`; one from the
    manager's start-up environment (`/etc/environment`, a `user@.service` drop-in) goes once you
-   remove it and restart `user@<uid>.service`. `provision.sh --models` does not reload the manager,
-   so it sees a newly written `environment.d` line only after a reload; `install` reloads first.
-   They name the variable and why, and `GHOST_WISPR_CONFIG` first. While a config names a hub with
-   Envoy off, the web page shows a notice under the warnings, and `/api/status` gives it in
+   remove it and restart `user@<uid>.service`. Each reloads the manager before it reads, so a newly
+   written `environment.d` line counts. The full provisioner refuses the same way while the
+   manager's environment sets one of them, before it changes anything; the `.env` it writes sets
+   none. They name the variable and why, and `GHOST_WISPR_CONFIG` first. While a config names a
+   hub with Envoy off, the web page shows a notice under the warnings, and `/api/status` gives it in
    `notices`, never in `warnings`, which `rollout.sh check` needs empty: no session event goes to
    the hub, each completed summary waits until Envoy is on again, and, with no
    `concierge.envoy_url`, the voice cannot ask an issue's agent.
