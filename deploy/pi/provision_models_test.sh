@@ -140,7 +140,8 @@ assert_models() {
   done
 }
 
-# The committed template names the approved providers and models, and keeps sync and GC off.
+# The committed template names the approved providers and models, keeps sync and GC off, and turns
+# Envoy on at the hub's listener, for events and for the Concierge.
 assert_models "$template"
 for line in \
   'google_credentials_file: /opt/ghost-wispr/google-credentials.json' \
@@ -148,9 +149,9 @@ for line in \
   'gc_enabled: false' \
   'gc_max_age_days: 0' \
   'gc_max_audio_size_mb: 20000' \
-  'envoy_enabled: false' \
+  'envoy_enabled: true' \
   "envoy_hub_url: $hub_url" \
-  '  envoy_url: ""' \
+  "  envoy_url: $hub_url" \
   "  dispatch_url: $PI_DISPATCH_URL" \
   'jabra_mute_button: true' \
   'mic_device: J75' \
@@ -200,8 +201,8 @@ for line in \
   'gc_max_age_days: 0' \
   'gc_max_audio_size_mb: 20000' \
   "envoy_hub_url: $hub_url" \
-  'envoy_enabled: false' \
-  '  envoy_url: ""' \
+  'envoy_enabled: true' \
+  "  envoy_url: $hub_url" \
   "gdrive_folder_id: \"$drive_id\"" \
   'gdrive_sync_enabled: true' \
   'gc_enabled: true' \

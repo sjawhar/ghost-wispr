@@ -144,8 +144,7 @@ func unitOnlyWarning(n int) string {
 }
 
 // envoyOffNotice is the GET /api/status notice of a config that names an
-// Envoy hub with Envoy off, as the office Pi has while the hub moves
-// (dispatch://INFRA-3862), and "" otherwise. Nothing goes out, and a start
+// Envoy hub with Envoy off, and "" otherwise. Nothing goes out, and a start
 // with Envoy on again publishes each summary completed meanwhile. A notice, not
 // a warning: the rollout's check and the acceptance scripts need warnings
 // empty, and Envoy off is on purpose.
