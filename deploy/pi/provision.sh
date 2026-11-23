@@ -61,8 +61,8 @@ config_override_names() {
 # variable a line, its name first; a value with a line break is quoted onto the line as $'...'
 # (src/systemctl/systemctl-set-environment.c). It reads no value, and fails when it cannot read the
 # environment or reads none: a user manager always sets PATH, so an empty reading is a blind one.
-# An environment.d or user.conf line takes effect at the manager's next reload, so one written since
-# is not seen yet.
+# Read it after a reload of the manager (require_unit_files, or daemon-reload), so that an
+# environment.d or user.conf line written since the last reload counts, as it will at the next.
 manager_override_names() {
   local environment found status=0
   environment=$(run_user_systemctl show-environment) || return 1
@@ -79,8 +79,42 @@ refuse_overrides() {
   local where=$1 how=$2 names=$3
   [[ -n $names ]] || return 0
   ! grep -qx "$CONFIG_FILE_VARIABLE" <<<"$names" \
-    || fail "$where $CONFIG_FILE_VARIABLE, which would replace the installed config with another file: nothing was changed; $how and run --models again"
-  fail "$where $(paste -sd ' ' - <<<"$names"), which would override the template's envoy_enabled, envoy_hub_url or concierge.envoy_url: nothing was changed; $how and run --models again"
+    || fail "$where $CONFIG_FILE_VARIABLE, which would replace the installed config with another file: nothing was changed; $how"
+  fail "$where $(paste -sd ' ' - <<<"$names"), which would override the template's envoy_enabled, envoy_hub_url or concierge.envoy_url: nothing was changed; $how"
+}
+
+# require_no_manager_override AGAIN fails, before anything changes, while ghost-wispr's user manager
+# sets CONFIG_FILE_VARIABLE or one of ENVOY_OVERRIDE_VARIABLES (manager_override_names), or its
+# environment cannot be read. AGAIN says which step to run again.
+require_no_manager_override() {
+  local names
+  names=$(manager_override_names) \
+    || fail "could not read the environment of $SERVICE_USER's user manager (systemctl --user show-environment), or it was empty: nothing was changed"
+  refuse_overrides "$SERVICE_USER's user manager sets" \
+    "unset each (systemctl --user unset-environment NAME; for an environment.d or user.conf line, remove it, then systemctl --user daemon-reload) and $1" \
+    "$names"
+}
+
+# require_unit_files: after a reload of ghost-wispr's user manager, ghost-wispr.service and
+# ghost-wispr-update.service are each loaded and have no drop-in, which could change how they run,
+# such as set the recorder's environment (Environment=, EnvironmentFile=) past every file --models
+# checks, or give the update a time limit. Otherwise it fails, naming the unit and its drop-ins,
+# before anything changes. deploy/pi/rollout.sh install runs the same check over ssh, also named
+# require_unit_files: the two are copies, since rollout.sh cannot source this file (both define
+# fail and a readonly DEPLOY_DIR).
+require_unit_files() {
+  local unit out load paths
+  run_user_systemctl daemon-reload || fail "could not reload $SERVICE_USER's user manager: nothing was changed"
+  for unit in ghost-wispr.service ghost-wispr-update.service; do
+    out=$(run_user_systemctl show -p LoadState -p DropInPaths "$unit") \
+      || fail "cannot read whether $unit is loaded: nothing was changed"
+    load=$(sed -n 's/^LoadState=//p' <<<"$out")
+    paths=$(sed -n 's/^DropInPaths=//p' <<<"$out")
+    [[ $load == loaded ]] \
+      || fail "$unit is ${load:-of no load state}, not loaded: nothing was changed; run the full provisioner first"
+    [[ -z $paths ]] \
+      || fail "$unit has a drop-in ($paths), which can change how it runs, such as its environment or its time limits: nothing was changed; remove it and run --models again"
+  done
 }
 
 require_single_line_file() {
@@ -154,12 +188,9 @@ provision_models() {
     || fail "missing $DEPLOY_DIR/ghost-wispr.yaml or $DEPLOY_DIR/.env; run the full provisioner first"
   local overrides
   overrides=$(config_override_names "$DEPLOY_DIR/.env") || fail "could not read $DEPLOY_DIR/.env"
-  refuse_overrides "$DEPLOY_DIR/.env can set" 'remove each such line' "$overrides"
-  overrides=$(manager_override_names) \
-    || fail "could not read the environment of $SERVICE_USER's user manager (systemctl --user show-environment), or it was empty: nothing was changed"
-  refuse_overrides "$SERVICE_USER's user manager sets" \
-    'unset each (systemctl --user unset-environment NAME; for an environment.d or user.conf line, remove it, then systemctl --user daemon-reload)' \
-    "$overrides"
+  refuse_overrides "$DEPLOY_DIR/.env can set" 'remove each such line and run --models again' "$overrides"
+  require_unit_files
+  require_no_manager_override 'run --models again'
 
   # Global, not local: the EXIT trap runs after this function returns.
   staging_dir=$(mktemp -d -p "$runtime_dir" ghost-wispr-models.XXXXXX)
@@ -338,6 +369,13 @@ fi
 readonly dispatch_token
 [[ -n "$tailscale_client_id" && "$tailscale_client_id" != null && "$tailscale_client_id" =~ ^[A-Za-z0-9._:-]+$ ]] || fail "tailscale-client-id is empty or invalid"
 [[ "$tailscale_subject" =~ ^[0-9]+$ ]] || fail "tailscale-subject must be the service account unique ID"
+
+# The .env written below sets none of the variables --models refuses there, but the recorder also
+# inherits its user manager's environment. Reload the manager first, as the provisioner does below,
+# so that an environment.d or user.conf line written since its last reload counts.
+run_user_systemctl daemon-reload \
+  || fail "could not reload $SERVICE_USER's user manager: nothing was changed; start it (sudo systemctl start user@$service_uid.service) and run the provisioner again"
+require_no_manager_override 'run the provisioner again'
 
 sudo apt-get update
 sudo apt-get install -y --no-install-recommends libportaudio2 ffmpeg lame jq curl

@@ -134,8 +134,9 @@ require_no_config_override() {
 
 # require_unit_files WHAT: after a reload of the user units, ghost-wispr.service and
 # ghost-wispr-update.service are each loaded on the Pi and have no drop-in, which could change how
-# they run, such as a time limit that kills update.sh mid-swap. Otherwise it fails, naming the unit
-# and its drop-ins, and WHAT (what the step has changed).
+# they run, such as a time limit that kills update.sh mid-swap, or Environment= lines past the
+# .env and manager checks. Otherwise it fails, naming the unit and its drop-ins, and WHAT (what the
+# step has changed). deploy/pi/provision.sh --models runs a copy of this check, of the same name.
 require_unit_files() {
   local unit out load paths
   pi "${USER_SYSTEMD}systemctl --user daemon-reload" || fail "could not reload the user units on the Pi; $1"
