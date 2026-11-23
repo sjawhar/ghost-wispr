@@ -76,25 +76,25 @@ require_idle_or_down() {
     || fail "the recorder runs and is not paused and idle (paused, no session, no GPT-Live probe), or its /api/status cannot be read, so it may be recording: nothing was changed; pause it outside a meeting, or wait until it answers, and run this step again"
 }
 
-# The .env variables that would turn Envoy on over the template, which keeps it off while the hub
-# moves (dispatch://INFRA-3862): a .env line overrides the YAML, and the models step keeps .env.
-# Remove this, and its check in install, with the template's envoy_enabled: false.
-readonly ENVOY_ON_VARIABLES='GHOST_WISPR_ENVOY_ENABLED|GHOST_WISPR_CONCIERGE_ENVOY_URL'
+# The .env variables that would override the template's Envoy settings, envoy_enabled and
+# concierge.envoy_url: a .env line overrides the YAML, and the models step keeps .env, so such a line
+# would change what the template says. deploy/pi/provision.sh --models holds the same check.
+readonly ENVOY_OVERRIDE_VARIABLES='GHOST_WISPR_ENVOY_ENABLED|GHOST_WISPR_CONCIERGE_ENVOY_URL'
 
 # require_no_envoy_override fails, naming each variable, while a line of the Pi's .env could set one
-# of ENVOY_ON_VARIABLES: a line that, past leading space and an export, starts with its name and =.
-# A line ends at a carriage return as at a line feed, as systemd's EnvironmentFile= parser reads
-# one (NEWLINE "\n\r", src/basic/env-file.c), so tr turns each CR into a line feed first. A match
-# inside a multi-line value fails too, which only stops the install. grep -o reads back from the Pi
-# each match up to its =, so no value leaves the Pi, and .env is not changed.
+# of ENVOY_OVERRIDE_VARIABLES: a line that, past leading space and an export, starts with its name
+# and =. A line ends at a carriage return as at a line feed, as systemd's EnvironmentFile= parser
+# reads one (NEWLINE "\n\r", src/basic/env-file.c), so tr turns each CR into a line feed first. A
+# match inside a multi-line value fails too, which only stops the install. grep -o reads back from
+# the Pi each match up to its =, so no value leaves the Pi, and .env is not changed.
 require_no_envoy_override() {
   local found names status=0
-  found=$(pi "f=$(printf %q "$DEPLOY_DIR/.env"); [ -r \"\$f\" ] || exit 2; tr '\r' '\n' <\"\$f\" | grep -oE '^[[:space:]]*(export[[:space:]]+)?($ENVOY_ON_VARIABLES)[[:space:]]*='") \
+  found=$(pi "f=$(printf %q "$DEPLOY_DIR/.env"); [ -r \"\$f\" ] || exit 2; tr '\r' '\n' <\"\$f\" | grep -oE '^[[:space:]]*(export[[:space:]]+)?($ENVOY_OVERRIDE_VARIABLES)[[:space:]]*='") \
     || status=$?
   ((status <= 1)) || fail "cannot read $DEPLOY_DIR/.env on the Pi (exit $status): nothing was changed"
   [[ -n $found ]] || return 0
-  names=$(grep -oE "$ENVOY_ON_VARIABLES" <<<"$found" | sort -u | paste -sd ' ' -)
-  fail "the Pi's .env can set $names, which would turn Envoy on over the template while the hub moves (dispatch://INFRA-3862): nothing was changed; remove each such line from $DEPLOY_DIR/.env and run install again"
+  names=$(grep -oE "$ENVOY_OVERRIDE_VARIABLES" <<<"$found" | sort -u | paste -sd ' ' -)
+  fail "the Pi's .env can set $names, which would override the template's envoy_enabled or concierge.envoy_url: nothing was changed; remove each such line from $DEPLOY_DIR/.env and run install again"
 }
 
 # require_unit_files WHAT: after a reload of the user units, ghost-wispr.service and

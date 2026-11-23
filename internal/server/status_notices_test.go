@@ -17,9 +17,8 @@ import (
 // event and keeps each completed summary for later, and, with no
 // concierge.envoy_url as well, that the voice cannot ask an issue's agent; if
 // it says so in warnings, which the rollout's check and the acceptance scripts
-// need empty while the office Pi keeps Envoy off for the hub's move
-// (dispatch://INFRA-3862); or if a unit that names no hub, or has Envoy on by
-// its file or its environment, gets a notice.
+// need empty; or if a unit that names no hub, or has Envoy on by its file or
+// its environment, gets a notice.
 func TestAPIStatusSaysWhenEnvoyIsOffWithAHubNamed(t *testing.T) {
 	const (
 		hub      = "http://hub.example.test:9020"

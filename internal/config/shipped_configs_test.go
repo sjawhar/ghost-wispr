@@ -75,24 +75,26 @@ func TestThePiConfigSearchesOnVertexAIUntilTheGatewayAdmitsThePi(t *testing.T) {
 	}
 }
 
-// TestThePiConfigKeepsEnvoyOffWhileTheHubMoves fails if the office Pi's
-// config turns Envoy on: envoy_enabled, or a concierge.envoy_url. The Pi keeps
-// Envoy off while the hub moves (dispatch://INFRA-3862). A start with Envoy on
-// publishes every completed summary Envoy has not had, oldest first
-// (envoyPublishing's sweep), so a provision that turned it on would send the
-// hub every summary made while it was off. To turn it on again, set both in the
-// template and run the provisioner (docs/pi-setup.md).
-func TestThePiConfigKeepsEnvoyOffWhileTheHubMoves(t *testing.T) {
-	clearEnv(t)
+// TestThePiConfigTurnsEnvoyOnAtTheHub fails if the office Pi's config does not
+// publish to the Envoy hub it names (envoy_enabled, envoy_hub_url), or does not
+// have the Concierge ask an issue's agent through that hub's listener
+// (concierge.envoy_url). With either off, a provision would turn it off on the
+// Pi. deploy/pi/provision_models_test.sh checks that envoy_hub_url is the hub
+// pi.env's PI_NATS_SERVER names.
+func TestThePiConfigTurnsEnvoyOnAtTheHub(t *testing.T) {
+	clearVoiceEnv(t)
 	cfg, _, err := Load(piConfigPath)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.EnvoyEnabled {
-		t.Error("the Pi's config publishes to Envoy (envoy_enabled: true); want it off while the hub moves")
+	if !cfg.EnvoyEnabled {
+		t.Error("the Pi's config does not publish to Envoy (envoy_enabled: false); want it on")
 	}
-	if cfg.Concierge.EnvoyURL != "" {
-		t.Errorf("the Pi's Concierge asks agents through %q; want no concierge.envoy_url while the hub moves", cfg.Concierge.EnvoyURL)
+	if cfg.EnvoyHubURL == "" {
+		t.Error("the Pi's config names no envoy_hub_url; want the hub's listener")
+	}
+	if cfg.Concierge.EnvoyURL != cfg.EnvoyHubURL {
+		t.Errorf("the Pi's Concierge asks agents through %q; want the hub's listener, envoy_hub_url %q", cfg.Concierge.EnvoyURL, cfg.EnvoyHubURL)
 	}
 }
 
