@@ -132,6 +132,16 @@ case "$*" in
     case $* in *MainPID*) echo 4321 ;; *) echo 'Sun 2026-11-22 03:30:00 UTC' ;; esac
     ;;
   'daemon-reload') ;;
+  # The user manager's environment: state/manager-env when it exists, else the few variables a
+  # manager has. With state/manager-env-fail it fails.
+  'show-environment')
+    [[ ! -e $state/manager-env-fail ]] || exit 1
+    if [[ -e $state/manager-env ]]; then
+      cat "$state/manager-env"
+    else
+      printf '%s\n' HOME=/home/ghost-wispr LANG=C.UTF-8 PATH=/usr/local/bin:/usr/bin:/bin
+    fi
+    ;;
   # LoadState from state/load-UNIT (loaded by default); DropInPaths from state/dropins-UNIT, and
   # from the second query on also state/dropins-later-UNIT (a drop-in that appears mid-install).
   'show -p LoadState -p DropInPaths ghost-wispr.service' | 'show -p LoadState -p DropInPaths ghost-wispr-update.service')
@@ -485,6 +495,8 @@ for case in \
   [[ $(sha256sum <"$deploy/.env") == "$before" ]] || fail "install changed .env when it refused $name"
   [[ $out != *'hub.example.test'* && $out != *elsewhere* && $out != *'first line'* && $out != *dg-1* ]] \
     || fail "install printed a value from .env when it refused $name: $out"
+  (($(line 'systemctl show-environment') == 0)) \
+    || fail "install read the user manager's environment before it refused $name in .env: $(<"$state/events")"
 done
 # An unreadable .env stops install too, before any change: the check cannot say it sets no
 # override, and a read through a pipe must not pass for a clean one.
@@ -494,15 +506,52 @@ rollout install
 chmod 600 "$deploy/.env"
 expect_stop 'install with an unreadable .env' "cannot read $deploy/.env on the Pi"
 refused_before_change 'an unreadable .env'
-# The control: a .env that sets none installs, with each override commented out and longer names
-# that start with one.
+# install refuses too, before it changes anything, while ghost-wispr's user manager on the Pi sets
+# one of those variables in its own environment (systemctl --user set-environment or
+# import-environment, an environment.d file, DefaultEnvironment=): each of its units inherits that
+# environment, ghost-wispr.service with it. It reads the names from systemctl --user
+# show-environment, names the variable and why, and prints no value. It refuses as well when it
+# cannot read that environment, or reads an empty one: a user manager always holds some variables,
+# so an empty reading is a blind one.
+manager_env() { printf '%s\n' HOME=/home/ghost-wispr LANG=C.UTF-8 "$@" PATH=/usr/local/bin:/usr/bin:/bin >"$state/manager-env"; }
+for case in \
+  'GHOST_WISPR_CONFIG|GHOST_WISPR_CONFIG=/srv/elsewhere/ghost-wispr.yaml' \
+  $'GHOST_WISPR_CONFIG|GHOST_WISPR_ENVOY_ENABLED=false\nGHOST_WISPR_CONFIG=/srv/elsewhere/ghost-wispr.yaml' \
+  'GHOST_WISPR_ENVOY_ENABLED|GHOST_WISPR_ENVOY_ENABLED=false' \
+  'GHOST_WISPR_ENVOY_HUB_URL|GHOST_WISPR_ENVOY_HUB_URL=http://hub.example.test:9020' \
+  'GHOST_WISPR_CONCIERGE_ENVOY_URL|GHOST_WISPR_CONCIERGE_ENVOY_URL=http://hub.example.test:9020'; do
+  name=${case%%|*} reason="override the template's"
+  [[ $name != GHOST_WISPR_CONFIG ]] || reason='replace the installed config'
+  reset
+  manager_env "${case#*|}"
+  rollout install
+  expect_stop "install with $name in the user manager's environment" \
+    "ghost-wispr's user manager on the Pi sets $name, which would $reason"
+  refused_before_change "$name in the user manager's environment"
+  [[ $out != *'hub.example.test'* && $out != *elsewhere* ]] \
+    || fail "install printed a value from the user manager's environment when it refused $name: $out"
+done
+for broken in 'systemctl fails' 'an empty environment'; do
+  reset
+  if [[ $broken == 'systemctl fails' ]]; then touch "$state/manager-env-fail"; else : >"$state/manager-env"; fi
+  rollout install
+  expect_stop "install when $broken" "cannot read the environment of ghost-wispr's user manager on the Pi"
+  refused_before_change "a user manager's environment it could not read ($broken)"
+done
+# The control: a .env and a user manager's environment that set none install. The .env has each
+# override commented out and longer names that start with one; the environment has those longer
+# names, a name inside another variable's value, and a value with a line break, quoted onto one line
+# as systemctl prints it. install still read the environment.
 reset
 printf '%s\n' '# GHOST_WISPR_CONFIG=/srv/elsewhere/ghost-wispr.yaml' \
   '# GHOST_WISPR_ENVOY_HUB_URL=http://hub.example.test:9020' '# GHOST_WISPR_ENVOY_ENABLED=true' \
   '# GHOST_WISPR_CONCIERGE_ENVOY_URL=http://hub.example.test:9020' 'GHOST_WISPR_ENVOY_ENABLED_BEFORE=true' \
   'GHOST_WISPR_CONFIG_DIR=/srv/elsewhere' >>"$deploy/.env"
+manager_env 'GHOST_WISPR_CONFIG_DIR=/srv/elsewhere' 'GHOST_WISPR_ENVOY_ENABLED_BEFORE=true' \
+  'LESSOPEN=GHOST_WISPR_CONFIG=/srv/elsewhere' "GHOST_WISPR_DISPATCH_TOKEN=\$'first\\nGHOST_WISPR_CONFIG=x'"
 rollout install
-expect_ok 'install with a .env that sets no override'
+expect_ok 'install with a .env and a user manager environment that set no override'
+(($(line 'systemctl show-environment') > 0)) || fail "install did not read the user manager's environment: $(<"$state/events")"
 
 # check: each failure leaves the nightly update stopped.
 check_fails() {
