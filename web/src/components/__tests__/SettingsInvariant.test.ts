@@ -48,6 +48,14 @@ import { unitConfig } from './configFixture'
 // read of the config counts unless it is lower in the same run (the page
 // reads again when a save's answer comes from another run, and only the live
 // run answers a read). The page's own revision is then checked against it.
+//
+// Runtime: 64 seeds of 60 steps take about 90 seconds on two CPUs and two
+// minutes in CI's Web job, nearly all of its test step. That is on purpose.
+// Most planted faults fail on only some of the seeds (setConfig taking an
+// older answer of the same run fails 25 of 64; a read's older answer taken,
+// 33; an edited preset model left out of Save, 13), so fewer seeds or steps
+// would let faults through. Before trimming either, plant those faults again
+// and check each still fails.
 
 const NOTE = 'Changed on the unit or in another tab; your edit was replaced.'
 const KEPT = "The refinement's text for this field was not applied, because you had edited it."
@@ -187,6 +195,9 @@ class FakeUnit {
   refineWithFrom = true
   // Set for the next save: true has the unit take it on arrival.
   applyNext: boolean | undefined
+  // Set during a planned case: the unit answers a read of the config as it
+  // arrives (the answer may still wait).
+  readsAnswerOnArrival = false
 
   constructor(private random: () => number) {}
 
@@ -261,7 +272,11 @@ class FakeUnit {
     // request itself waits, and the unit takes it when it is released.
     let answer: ConfigResponse | undefined
     const applyNow =
-      kind === 'patch' && this.applyNext !== undefined ? this.applyNext : this.random() < 0.5
+      kind === 'patch' && this.applyNext !== undefined
+        ? this.applyNext
+        : kind === 'get' && this.readsAnswerOnArrival
+          ? true
+          : this.random() < 0.5
     if (kind === 'patch') this.applyNext = undefined
     if (applyNow) {
       if (body) this.apply(body)
@@ -387,23 +402,35 @@ async function runSequence(seed: number, steps: number): Promise<void> {
     }
   }
 
-  // Now and then a planned race replaces the random choices for seven steps:
-  // a field of General or Meeting voice is typed in and saved (the unit takes
-  // the save at once, and its answer waits); another tab sets the field back
-  // to what it showed before the typing; the other section is typed in and
-  // saved; its newer answer lands, then the first save's older one. That
-  // older answer must end the edit and leave the field on the config. Each
-  // step is checked as any other.
+  // Now and then a planned case replaces the random choices for a few steps;
+  // each step is checked as any other, and a step that cannot run ends the
+  // plan. During a plan the unit answers a read as it arrives.
+  // - A race: a field of General or Meeting voice is typed in and saved (the
+  //   unit takes the save at once, and its answer waits); another tab sets the
+  //   field back to what it showed before the typing; the other section is
+  //   typed in and saved; its newer answer lands, then the first save's older
+  //   one. That older answer must end the edit and leave the field on the
+  //   config.
+  // - A late read: a General save is taken and its answer waits; the unit
+  //   restarts; a Meeting voice save is taken by the new run and lands, so the
+  //   page reads the config, and that read lands; the held answer of the old
+  //   run lands, so the page reads again, and the new run answers that read
+  //   at once, but the answer waits; a second voice save is taken and lands;
+  //   then the read's answer lands, lower than the config shown in the same
+  //   run. The page must drop it.
   type Planned = {
     roll: number
     field?: Field
     section?: Section
     revert?: boolean
     apply?: boolean
-    release?: 'newest' | 'race'
+    // Name the one request this step sends, or makes the page send.
+    name?: string
+    // Answer the request of that name, or the newest.
+    release?: string
   }
   let plan: Planned[] = []
-  let raceEntry: Pending | undefined
+  let named: Record<string, Pending> = {}
   const racePlan = (): Planned[] => {
     const [first, second] = pick<[Section, Section]>([
       ['general', 'voice'],
@@ -412,23 +439,41 @@ async function runSequence(seed: number, steps: number): Promise<void> {
     const fieldOf = (section: Section): Field => (section === 'general' ? 'silence' : 'voice')
     return [
       { roll: 0.3, field: fieldOf(first) },
-      { roll: 0.5, section: first, apply: true },
+      { roll: 0.5, section: first, apply: true, name: 'older' },
       { roll: 0.05, field: fieldOf(first), revert: true },
       { roll: 0.3, field: fieldOf(second) },
       { roll: 0.5, section: second, apply: true },
       { roll: 0.95, release: 'newest' },
-      { roll: 0.95, release: 'race' },
+      { roll: 0.95, release: 'older' },
     ]
   }
+  const lateReadPlan = (): Planned[] => [
+    { roll: 0.3, field: 'silence' },
+    { roll: 0.5, section: 'general', apply: true, name: 'oldRun' },
+    { roll: 0.15 },
+    { roll: 0.3, field: 'voice' },
+    { roll: 0.5, section: 'voice', apply: true, name: 'firstVoice' },
+    { roll: 0.95, release: 'firstVoice', name: 'firstRead' },
+    { roll: 0.95, release: 'firstRead' },
+    { roll: 0.95, release: 'oldRun', name: 'lateRead' },
+    { roll: 0.3, field: 'voice' },
+    { roll: 0.5, section: 'voice', apply: true, name: 'secondVoice' },
+    { roll: 0.95, release: 'secondVoice' },
+    { roll: 0.95, release: 'lateRead' },
+  ]
 
   for (let step = 0; step < steps; step++) {
     const expectedBefore = expected
+    const pendingAtStart = new Set(unit.pending)
     let released: Pending | undefined
     if (plan.length === 0 && !liveRefine && random() < 0.05) {
-      plan = racePlan()
-      log.push(`${step}: a planned race begins`)
+      const late = random() < 0.5
+      plan = late ? lateReadPlan() : racePlan()
+      named = {}
+      log.push(`${step}: a planned ${late ? 'late read' : 'race'} begins`)
     }
     const forced = plan.shift()
+    unit.readsAnswerOnArrival = forced !== undefined
     // A planned step that cannot run ends the plan.
     const skip = () => {
       plan = []
@@ -490,8 +535,6 @@ async function runSequence(seed: number, steps: number): Promise<void> {
       for (const entry of unit.pending.slice(pendingBefore)) {
         if (section === 'preset') entry.switches = switches
       }
-      // The plan's first save: its answer is the older one to land last.
-      if (forced?.apply && plan.length === 5) raceEntry = unit.pending[pendingBefore]
       const bodies = unit.sent.slice(sentBefore)
       log.push(`${step}: saves the ${section} section: ${JSON.stringify(bodies)}`)
       const expected = bodyFor(section, edited)
@@ -560,8 +603,12 @@ async function runSequence(seed: number, steps: number): Promise<void> {
       // often land after newer ones, the case the revision ordering is for.
       let index =
         random() < 0.5 ? unit.pending.length - 1 : Math.floor(random() * unit.pending.length)
-      if (forced?.release === 'newest') index = unit.pending.length - 1
-      if (forced?.release === 'race') index = unit.pending.indexOf(raceEntry as Pending)
+      if (forced?.release) {
+        index =
+          forced.release === 'newest'
+            ? unit.pending.length - 1
+            : unit.pending.indexOf(named[forced.release])
+      }
       if (index < 0) {
         skip()
         continue
@@ -617,6 +664,12 @@ async function runSequence(seed: number, steps: number): Promise<void> {
     }
 
     await settle()
+    // The one request a planned step sent, or made the page send, by its name.
+    if (forced?.name) {
+      const created = unit.pending.filter((entry) => !pendingAtStart.has(entry))
+      if (created.length === 1) named[forced.name] = created[0]
+      else skip()
+    }
     const took = expected !== expectedBefore
     const taken = expected
 
