@@ -13,7 +13,7 @@ import { unitConfig } from './configFixture'
 // preset and back. For six fields (General's silence timeout, the meeting
 // voice, and the open preset's description, system prompt, user template and
 // model override), after every step:
-// - a field the person is not editing shows the config the page last took,
+// - a field the person is not editing shows the config the page must hold,
 //   with one exception: a field still showing the person's typing when its
 //   save's answer comes from another run of the unit (so the page reads the
 //   config again instead of taking the answer) keeps showing what it showed,
@@ -41,6 +41,13 @@ import { unitConfig } from './configFixture'
 // The unit applies a save when its request arrives or when its answer is
 // released, and answers each request in any order. A failed save is a 500 for
 // a request the unit had not applied. Failed reads are covered on their own.
+//
+// The config the page must hold is never read from the page. It is the fake
+// unit's own answer that the unit's revisions make the latest: an answer in
+// the run the page holds counts if its count is not lower; an answer to a
+// read of the config counts unless it is lower in the same run (the page
+// reads again when a save's answer comes from another run, and only the live
+// run answers a read). The page's own revision is then checked against it.
 
 const NOTE = 'Changed on the unit or in another tab; your edit was replaced.'
 const KEPT = "The refinement's text for this field was not applied, because you had edited it."
@@ -178,6 +185,8 @@ class FakeUnit {
   // The next refinement's output, and whether its answer names from.
   refineOutput = { description: '', system_prompt: '', user_template: '' }
   refineWithFrom = true
+  // Set for the next save: true has the unit take it on arrival.
+  applyNext: boolean | undefined
 
   constructor(private random: () => number) {}
 
@@ -251,7 +260,10 @@ class FakeUnit {
     // The unit takes the request now, and only its answer waits; or the
     // request itself waits, and the unit takes it when it is released.
     let answer: ConfigResponse | undefined
-    if (this.random() < 0.5) {
+    const applyNow =
+      kind === 'patch' && this.applyNext !== undefined ? this.applyNext : this.random() < 0.5
+    if (kind === 'patch') this.applyNext = undefined
+    if (applyNow) {
       if (body) this.apply(body)
       answer = this.snapshot()
     }
@@ -309,6 +321,9 @@ async function runSequence(seed: number, steps: number): Promise<void> {
   await fireEvent.click(within(editor).getByRole('button', { name: /standup/ }))
   await settle()
   unit.holding = true
+  // The page loaded the config the unit answered, which nothing has changed
+  // since.
+  let expected: ConfigResponse = unit.snapshot()
 
   const sections: Record<Section, () => HTMLElement> = {
     general: () => screen.getByTestId('general-settings'),
@@ -352,7 +367,9 @@ async function runSequence(seed: number, steps: number): Promise<void> {
   }
 
   const check = (step: number) => {
-    const taken = configState.config as ConfigResponse
+    expect(configState.config?.revision, fail("the page's config revision", step)).toEqual(
+      expected.revision,
+    )
     expect(screen.queryByRole('dialog') !== null, fail('the Refine dialog is open', step)).toBe(
       liveRefine !== null,
     )
@@ -366,40 +383,99 @@ async function runSequence(seed: number, steps: number): Promise<void> {
       if (m.editing) expect(shown, fail(`${field} shows the typing`, step)).toBe(m.typed)
       else if (m.sentShown !== null) {
         expect(shown, fail(`${field} shows the value saved`, step)).toBe(m.sentShown)
-      } else expect(shown, fail(`${field} shows the config`, step)).toBe(valueIn(taken, field))
+      } else expect(shown, fail(`${field} shows the config`, step)).toBe(valueIn(expected, field))
     }
   }
 
+  // Now and then a planned race replaces the random choices for seven steps:
+  // a field of General or Meeting voice is typed in and saved (the unit takes
+  // the save at once, and its answer waits); another tab sets the field back
+  // to what it showed before the typing; the other section is typed in and
+  // saved; its newer answer lands, then the first save's older one. That
+  // older answer must end the edit and leave the field on the config. Each
+  // step is checked as any other.
+  type Planned = {
+    roll: number
+    field?: Field
+    section?: Section
+    revert?: boolean
+    apply?: boolean
+    release?: 'newest' | 'race'
+  }
+  let plan: Planned[] = []
+  let raceEntry: Pending | undefined
+  const racePlan = (): Planned[] => {
+    const [first, second] = pick<[Section, Section]>([
+      ['general', 'voice'],
+      ['voice', 'general'],
+    ])
+    const fieldOf = (section: Section): Field => (section === 'general' ? 'silence' : 'voice')
+    return [
+      { roll: 0.3, field: fieldOf(first) },
+      { roll: 0.5, section: first, apply: true },
+      { roll: 0.05, field: fieldOf(first), revert: true },
+      { roll: 0.3, field: fieldOf(second) },
+      { roll: 0.5, section: second, apply: true },
+      { roll: 0.95, release: 'newest' },
+      { roll: 0.95, release: 'race' },
+    ]
+  }
+
   for (let step = 0; step < steps; step++) {
-    const takenBefore = configState.config
-    const runBefore = configState.config?.revision?.run
+    const expectedBefore = expected
     let released: Pending | undefined
+    if (plan.length === 0 && !liveRefine && random() < 0.05) {
+      plan = racePlan()
+      log.push(`${step}: a planned race begins`)
+    }
+    const forced = plan.shift()
+    // A planned step that cannot run ends the plan.
+    const skip = () => {
+      plan = []
+    }
     // While the Refine dialog is open, the person can only cancel it; the
     // unit's answers, restarts, failures and other tabs go on.
-    const roll = liveRefine ? pick([0.05, 0.15, 0.77, 0.83, 0.9, 0.95]) : random()
+    const roll = forced?.roll ?? (liveRefine ? pick([0.05, 0.15, 0.77, 0.83, 0.9, 0.95]) : random())
 
     if (roll < 0.12) {
-      const field = pick(FIELDS)
-      const value = pick(POOL[field])
+      // Half the time, while the person edits a field, the other tab sets it
+      // back to what the field showed when the editing began: the case where
+      // an edit survives a config, and a later answer must still end it.
+      const editing = FIELDS.filter((f) => model[f].editing)
+      if (forced?.revert && !model[forced.field as Field].editing) {
+        skip()
+        continue
+      }
+      const revert = forced?.revert ?? (editing.length > 0 && random() < 0.5)
+      const field = forced?.field ?? (revert ? pick(editing) : pick(FIELDS))
+      const value = revert ? model[field].before : pick(POOL[field])
       unit.values[field] = value
       unit.count++
-      log.push(`${step}: another tab sets ${field} ${value} at ${unit.run}/${unit.count}`)
+      log.push(
+        `${step}: another tab sets ${field} ${JSON.stringify(value)} at ${unit.run}/${unit.count}`,
+      )
     } else if (roll < 0.18) {
       unit.run = `run-${++unit.runs}`
       unit.count = 0
       log.push(`${step}: the unit restarts as ${unit.run}`)
     } else if (roll < 0.4) {
-      const field = pick(FIELDS)
+      const field = forced?.field ?? pick(FIELDS)
       const box = input(field)
-      if (box.disabled) continue
+      if (box.disabled) {
+        skip()
+        continue
+      }
       const value = pick(POOL[field].filter((v) => v !== box.value))
       edit(field, value, box.value)
       await fireEvent.input(box, { target: { value } })
       log.push(`${step}: types ${field} ${JSON.stringify(value)}`)
     } else if (roll < 0.55) {
-      const section = pick<Section>(['general', 'voice', 'preset'])
+      const section = forced?.section ?? pick<Section>(['general', 'voice', 'preset'])
       const button = saveButton(section)
-      if (button.disabled) continue
+      if (button.disabled) {
+        skip()
+        continue
+      }
       const edited = Object.fromEntries(
         FIELDS.filter((f) => SECTION[f] === section && model[f].editing).map((f) => [
           f,
@@ -408,11 +484,14 @@ async function runSequence(seed: number, steps: number): Promise<void> {
       )
       const sentBefore = unit.sent.length
       const pendingBefore = unit.pending.length
+      unit.applyNext = forced?.apply
       await fireEvent.click(button)
       await settle()
       for (const entry of unit.pending.slice(pendingBefore)) {
         if (section === 'preset') entry.switches = switches
       }
+      // The plan's first save: its answer is the older one to land last.
+      if (forced?.apply && plan.length === 5) raceEntry = unit.pending[pendingBefore]
       const bodies = unit.sent.slice(sentBefore)
       log.push(`${step}: saves the ${section} section: ${JSON.stringify(bodies)}`)
       const expected = bodyFor(section, edited)
@@ -420,7 +499,7 @@ async function runSequence(seed: number, steps: number): Promise<void> {
     } else if (roll < 0.64) {
       const refineButton = presetButton('Refine')
       if (refineButton.disabled) continue
-      const taken = configState.config as ConfigResponse
+      const taken = expected
       // The handler starts from the preset as the unit holds it on arrival.
       // For each field: as it is there (not changed), the same with a space
       // after it (a text input drops a new line, so the field would not show
@@ -477,7 +556,16 @@ async function runSequence(seed: number, steps: number): Promise<void> {
       await fireEvent.click(screen.getByRole('button', { name: 'Cancel' }))
       log.push(`${step}: cancels the refinement`)
     } else if (unit.pending.length > 0) {
-      const index = Math.floor(random() * unit.pending.length)
+      // Half the time the newest request is answered first, so older answers
+      // often land after newer ones, the case the revision ordering is for.
+      let index =
+        random() < 0.5 ? unit.pending.length - 1 : Math.floor(random() * unit.pending.length)
+      if (forced?.release === 'newest') index = unit.pending.length - 1
+      if (forced?.release === 'race') index = unit.pending.indexOf(raceEntry as Pending)
+      if (index < 0) {
+        skip()
+        continue
+      }
       if (unit.pending[index] === liveRefine) {
         // The refinement lands: each field as the page holds it now, before it
         // applies the answer.
@@ -492,7 +580,7 @@ async function runSequence(seed: number, steps: number): Promise<void> {
           prompt: answer.from?.system_prompt,
           template: answer.from?.user_template,
         }
-        const taken = configState.config as ConfigResponse
+        const taken = expected
         for (const field of REFINED_FIELDS) {
           const m = model[field]
           const shown = input(field).value
@@ -507,6 +595,13 @@ async function runSequence(seed: number, steps: number): Promise<void> {
         liveRefine = null
       }
       released = unit.release(index)
+      // The unit's answer, ordered by its revision (not by what the page did).
+      if (released.kind !== 'refine') {
+        const answer = released.answer as ConfigResponse
+        const sameRun = answer.revision?.run === expected.revision?.run
+        const notLower = (answer.revision?.count ?? 0) >= (expected.revision?.count ?? 0)
+        if (sameRun ? notLower : released.kind === 'get') expected = answer
+      }
       if (released.kind === 'refine') {
         log.push(`${step}: answers a refinement: ${JSON.stringify(released.refine)}`)
       } else {
@@ -522,8 +617,8 @@ async function runSequence(seed: number, steps: number): Promise<void> {
     }
 
     await settle()
-    const taken = configState.config as ConfigResponse
-    const took = taken !== takenBefore
+    const took = expected !== expectedBefore
+    const taken = expected
 
     // A save's answer ends the edit of each field it carried, unless the
     // preset it carried was left (another preset was opened) since it was sent.
@@ -535,7 +630,7 @@ async function runSequence(seed: number, steps: number): Promise<void> {
       m.editing = false
       m.kept = false
       const answer = released?.answer as ConfigResponse
-      const fromAnotherRun = answer.revision?.run !== runBefore
+      const fromAnotherRun = answer.revision?.run !== expectedBefore.revision?.run
       if (took || !fromAnotherRun) m.sentShown = null
       else if (wasEditing) m.sentShown = value
     }
