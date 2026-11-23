@@ -456,14 +456,15 @@ expect_stop 'install with a drop-in found once it installed the units' 'late.con
 (($(line update.sh) == 0)) || fail "install ran update.sh past a drop-in it found once it installed the units: $(<"$state/events")"
 
 # install refuses, before it changes anything, while a line of the Pi's .env could set a variable
-# that would override the template's envoy_enabled or concierge.envoy_url: a line that, past leading
-# space and an export, starts with the name and =. It names the variable, prints no value, and
-# leaves .env byte for byte as it was. A match inside a multi-line quoted value refuses too: a false
-# refusal only stops the install. systemd's EnvironmentFile= parser ends a line at a carriage return
-# as at a line feed (NEWLINE "\n\r", src/basic/env-file.c), so a bare CR starts a line too; a case
-# whose text holds CR LF is a CRLF file.
+# that would override the template's envoy_enabled, envoy_hub_url or concierge.envoy_url: a line
+# that, past leading space and an export, starts with the name and =. It names the variable, prints
+# no value, and leaves .env byte for byte as it was. A match inside a multi-line quoted value refuses
+# too: a false refusal only stops the install. systemd's EnvironmentFile= parser ends a line at a
+# carriage return as at a line feed (NEWLINE "\n\r", src/basic/env-file.c), so a bare CR starts a
+# line too; a case whose text holds CR LF is a CRLF file.
 for case in \
   'GHOST_WISPR_ENVOY_ENABLED|GHOST_WISPR_ENVOY_ENABLED=false' \
+  'GHOST_WISPR_ENVOY_HUB_URL|GHOST_WISPR_ENVOY_HUB_URL=http://hub.example.test:9020' \
   'GHOST_WISPR_CONCIERGE_ENVOY_URL|  export GHOST_WISPR_CONCIERGE_ENVOY_URL = http://hub.example.test:9020' \
   $'GHOST_WISPR_ENVOY_ENABLED|GHOST_WISPR_DISPATCH_TOKEN="first line\nGHOST_WISPR_ENVOY_ENABLED=true\nlast line"' \
   $'GHOST_WISPR_ENVOY_ENABLED|GHOST_WISPR_ADDR=127.0.0.1:8080\rGHOST_WISPR_ENVOY_ENABLED=true' \
@@ -488,11 +489,12 @@ rollout install
 chmod 600 "$deploy/.env"
 expect_stop 'install with an unreadable .env' "cannot read $deploy/.env on the Pi"
 refused_before_change 'an unreadable .env'
-# The control: a .env that names neither installs, with the hub's URL, a commented-out override and
-# a longer name that starts with one.
+# The control: a .env that sets none installs, with each override commented out and a longer name
+# that starts with one.
 reset
-printf '%s\n' 'GHOST_WISPR_ENVOY_HUB_URL=http://hub.example.test:9020' '# GHOST_WISPR_ENVOY_ENABLED=true' \
-  'GHOST_WISPR_ENVOY_ENABLED_BEFORE=true' >>"$deploy/.env"
+printf '%s\n' '# GHOST_WISPR_ENVOY_HUB_URL=http://hub.example.test:9020' '# GHOST_WISPR_ENVOY_ENABLED=true' \
+  '# GHOST_WISPR_CONCIERGE_ENVOY_URL=http://hub.example.test:9020' 'GHOST_WISPR_ENVOY_ENABLED_BEFORE=true' \
+  >>"$deploy/.env"
 rollout install
 expect_ok 'install with a .env that sets no Envoy override'
 

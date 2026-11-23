@@ -76,10 +76,11 @@ require_idle_or_down() {
     || fail "the recorder runs and is not paused and idle (paused, no session, no GPT-Live probe), or its /api/status cannot be read, so it may be recording: nothing was changed; pause it outside a meeting, or wait until it answers, and run this step again"
 }
 
-# The .env variables that would override the template's Envoy settings, envoy_enabled and
-# concierge.envoy_url: a .env line overrides the YAML, and the models step keeps .env, so such a line
-# would change what the template says. deploy/pi/provision.sh --models holds the same check.
-readonly ENVOY_OVERRIDE_VARIABLES='GHOST_WISPR_ENVOY_ENABLED|GHOST_WISPR_CONCIERGE_ENVOY_URL'
+# The .env variables that would override the template's Envoy settings, envoy_enabled, envoy_hub_url
+# and concierge.envoy_url: each variable internal/config's applyEnvOverrides reads for an Envoy
+# setting. A .env line overrides the YAML, and the models step keeps .env, so such a line would
+# change what the template says. deploy/pi/provision.sh --models holds the same check.
+readonly ENVOY_OVERRIDE_VARIABLES='GHOST_WISPR_ENVOY_ENABLED|GHOST_WISPR_ENVOY_HUB_URL|GHOST_WISPR_CONCIERGE_ENVOY_URL'
 
 # require_no_envoy_override fails, naming each variable, while a line of the Pi's .env could set one
 # of ENVOY_OVERRIDE_VARIABLES: a line that, past leading space and an export, starts with its name
@@ -94,7 +95,7 @@ require_no_envoy_override() {
   ((status <= 1)) || fail "cannot read $DEPLOY_DIR/.env on the Pi (exit $status): nothing was changed"
   [[ -n $found ]] || return 0
   names=$(grep -oE "$ENVOY_OVERRIDE_VARIABLES" <<<"$found" | sort -u | paste -sd ' ' -)
-  fail "the Pi's .env can set $names, which would override the template's envoy_enabled or concierge.envoy_url: nothing was changed; remove each such line from $DEPLOY_DIR/.env and run install again"
+  fail "the Pi's .env can set $names, which would override the template's envoy_enabled, envoy_hub_url or concierge.envoy_url: nothing was changed; remove each such line from $DEPLOY_DIR/.env and run install again"
 }
 
 # require_unit_files WHAT: after a reload of the user units, ghost-wispr.service and

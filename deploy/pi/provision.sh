@@ -20,11 +20,12 @@ readonly CONFIG_TEMPLATE="$repo_root/deploy/pi/files/ghost-wispr.yaml"
 # replaced (internal/config, removedEnvironment), such as the Vertex embedding location an earlier
 # provisioner wrote.
 readonly REMOVED_ENV_VARIABLES='ENVOY_WEBHOOK_SECRET|GCP_PROJECT|GCP_LOCATION|GENAI_BACKEND|EMBEDDING_BACKEND|EMBEDDING_LOCATION|DEEPGRAM_MODEL|BATCH_TRANSCRIPTION_PROVIDER|TTS_PROVIDER|TTS_API_KEY|VOICE_TTS_ENGINE|VOICE_TTS_MODEL|VOICE_TTS_VOICE|VOICE_TTS_LOCATION'
-# The .env variables that would override the template's Envoy settings, envoy_enabled and
-# concierge.envoy_url: a .env line overrides the YAML, and --models keeps .env, so such a line would
-# change what the template says. deploy/pi/rollout.sh install holds the same check, so that it stops
-# before it changes anything.
-readonly ENVOY_OVERRIDE_VARIABLES='GHOST_WISPR_ENVOY_ENABLED|GHOST_WISPR_CONCIERGE_ENVOY_URL'
+# The .env variables that would override the template's Envoy settings, envoy_enabled, envoy_hub_url
+# and concierge.envoy_url: each variable internal/config's applyEnvOverrides reads for an Envoy
+# setting. A .env line overrides the YAML, and --models keeps .env, so such a line would change what
+# the template says. deploy/pi/rollout.sh install holds the same check, so that it stops before it
+# changes anything.
+readonly ENVOY_OVERRIDE_VARIABLES='GHOST_WISPR_ENVOY_ENABLED|GHOST_WISPR_ENVOY_HUB_URL|GHOST_WISPR_CONCIERGE_ENVOY_URL'
 
 fail() {
   printf 'ghost-wispr provision: %s\n' "$*" >&2
@@ -117,7 +118,7 @@ provision_models() {
   local envoy_override
   envoy_override=$(envoy_override_names "$DEPLOY_DIR/.env") || fail "could not read $DEPLOY_DIR/.env"
   [[ -z $envoy_override ]] \
-    || fail "$DEPLOY_DIR/.env can set $(paste -sd ' ' - <<<"$envoy_override"), which would override the template's envoy_enabled or concierge.envoy_url: nothing was changed; remove each such line and run --models again"
+    || fail "$DEPLOY_DIR/.env can set $(paste -sd ' ' - <<<"$envoy_override"), which would override the template's envoy_enabled, envoy_hub_url or concierge.envoy_url: nothing was changed; remove each such line and run --models again"
 
   # Global, not local: the EXIT trap runs after this function returns.
   staging_dir=$(mktemp -d -p "$runtime_dir" ghost-wispr-models.XXXXXX)
