@@ -720,13 +720,14 @@ restart_at=$(grep -n -F -x -- "sudo -u ghost-wispr XDG_RUNTIME_DIR=$runtime_dir 
   || fail "the rerun did not restart a running recorder after it installed the configuration: $(<"$TEST_LOG")"
 
 # provision.sh --models, run by hand, refuses before it writes anything while a line of the deployed
-# .env could set a variable that would override the template's envoy_enabled, envoy_hub_url or
-# concierge.envoy_url: a line that, past leading space and an export, starts with the name and =. It
-# names the variable, prints no value, and leaves every file byte for byte as it was. A match inside
-# a multi-line quoted value refuses too: a false refusal only stops the step. systemd's
-# EnvironmentFile= parser ends a line at a carriage return as at a line feed (NEWLINE "\n\r",
-# src/basic/env-file.c), so a bare CR starts a line too; a case whose text holds CR LF is a CRLF
-# file.
+# .env could set GHOST_WISPR_CONFIG, which would replace the installed config with another file, or a
+# variable that would override the template's envoy_enabled, envoy_hub_url or concierge.envoy_url: a
+# line that, past leading space and an export, starts with the name and =. It names the variable and
+# why, prints no value, and leaves every file byte for byte as it was. GHOST_WISPR_CONFIG's reason
+# comes first when .env sets both kinds. A match inside a multi-line quoted value refuses too: a
+# false refusal only stops the step. systemd's EnvironmentFile= parser ends a line at a carriage
+# return as at a line feed (NEWLINE "\n\r", src/basic/env-file.c), so a bare CR starts a line too; a
+# case whose text holds CR LF is a CRLF file.
 models_dir=$work_dir/models-deploy
 mkdir -p "$models_dir"
 run_models() {
@@ -736,27 +737,31 @@ run_models() {
 }
 models_files() { sha256sum "$models_dir/ghost-wispr.yaml" "$models_dir/.env"; }
 for case in \
+  'GHOST_WISPR_CONFIG|export GHOST_WISPR_CONFIG=/srv/elsewhere/ghost-wispr.yaml' \
+  $'GHOST_WISPR_CONFIG|GHOST_WISPR_ENVOY_ENABLED=false\nGHOST_WISPR_CONFIG=/srv/elsewhere/ghost-wispr.yaml' \
   'GHOST_WISPR_ENVOY_ENABLED|GHOST_WISPR_ENVOY_ENABLED=false' \
   'GHOST_WISPR_ENVOY_HUB_URL|GHOST_WISPR_ENVOY_HUB_URL=http://hub.example.test:9020' \
   'GHOST_WISPR_CONCIERGE_ENVOY_URL|  export GHOST_WISPR_CONCIERGE_ENVOY_URL = http://hub.example.test:9020' \
   $'GHOST_WISPR_ENVOY_ENABLED|GHOST_WISPR_DISPATCH_TOKEN="first line\nGHOST_WISPR_ENVOY_ENABLED=true\nlast line"' \
   $'GHOST_WISPR_ENVOY_ENABLED|GHOST_WISPR_ADDR=127.0.0.1:8080\rGHOST_WISPR_ENVOY_ENABLED=true' \
   $'GHOST_WISPR_CONCIERGE_ENVOY_URL|GHOST_WISPR_ADDR=127.0.0.1:8080\r\nGHOST_WISPR_CONCIERGE_ENVOY_URL=http://hub.example.test:9020\r'; do
-  name=${case%%|*} content=${case#*|} eol=''
+  name=${case%%|*} content=${case#*|} eol='' reason="override the template's"
   [[ $content != *$'\r\n'* ]] || eol=$'\r'
+  [[ $name != GHOST_WISPR_CONFIG ]] || reason='replace the installed config'
   printf 'old: config\n' >"$models_dir/ghost-wispr.yaml"
   printf "%s$eol\n%s\n" GHOST_WISPR_DEEPGRAM_API_KEY=dg-1 "$content" >"$models_dir/.env"
   before=$(models_files)
   if run_models; then
     fail "--models installed with $name in .env: $(<"$work_dir/out")"
   fi
-  grep -qF "can set $name" "$work_dir/out" || fail "--models did not name $name: $(<"$work_dir/out")"
-  ! grep -qE 'hub\.example\.test|first line|dg-1' "$work_dir/out" || fail "--models printed a value from .env: $(<"$work_dir/out")"
+  grep -qF "can set $name, which would $reason" "$work_dir/out" \
+    || fail "--models did not name $name, and that it would $reason: $(<"$work_dir/out")"
+  ! grep -qE 'hub\.example\.test|elsewhere|first line|dg-1' "$work_dir/out" || fail "--models printed a value from .env: $(<"$work_dir/out")"
   [[ ! -s $TEST_LOG ]] || fail "--models changed the Pi before it refused $name: $(<"$TEST_LOG")"
   [[ $(models_files) == "$before" ]] || fail "--models changed a file when it refused $name"
 done
 # An unreadable .env stops --models too, before it writes anything: the check cannot say it sets no
-# Envoy override, and a read through a pipe must not pass for a clean one.
+# override, and a read through a pipe must not pass for a clean one.
 printf 'old: config\n' >"$models_dir/ghost-wispr.yaml"
 printf '%s\n' GHOST_WISPR_DEEPGRAM_API_KEY=dg-1 >"$models_dir/.env"
 before=$(models_files)
@@ -764,18 +769,19 @@ chmod 000 "$models_dir/.env"
 status=0
 run_models || status=$?
 # The check itself fails, not only the later .env render, which would also stop the step.
-! bash -c 'source "$1" && envoy_override_names "$2"' _ "$repo_root/deploy/pi/provision.sh" "$models_dir/.env" >/dev/null 2>&1 \
-  || fail 'envoy_override_names read an unreadable .env as one that sets no Envoy override'
+! bash -c 'source "$1" && config_override_names "$2"' _ "$repo_root/deploy/pi/provision.sh" "$models_dir/.env" >/dev/null 2>&1 \
+  || fail 'config_override_names read an unreadable .env as one that sets no override'
 chmod 600 "$models_dir/.env"
 ((status != 0)) || fail "--models installed with an unreadable .env: $(<"$work_dir/out")"
 grep -qF "could not read $models_dir/.env" "$work_dir/out" || fail "--models did not say it could not read .env: $(<"$work_dir/out")"
 [[ ! -s $TEST_LOG ]] || fail "--models changed the Pi before it refused an unreadable .env: $(<"$TEST_LOG")"
 [[ $(models_files) == "$before" ]] || fail "--models changed a file when it refused an unreadable .env"
-# The control: a .env that sets none installs, with each override commented out and a longer name
-# that starts with one.
-printf '%s\n' GHOST_WISPR_DEEPGRAM_API_KEY=dg-1 '# GHOST_WISPR_ENVOY_HUB_URL=http://hub.example.test:9020' \
-  '# GHOST_WISPR_ENVOY_ENABLED=true' '# GHOST_WISPR_CONCIERGE_ENVOY_URL=http://hub.example.test:9020' \
-  'GHOST_WISPR_ENVOY_ENABLED_BEFORE=true' >"$models_dir/.env"
-run_models || fail "--models refused a .env that sets no Envoy override: $(<"$work_dir/out")"
+# The control: a .env that sets none installs, with each override commented out and longer names
+# that start with one.
+printf '%s\n' GHOST_WISPR_DEEPGRAM_API_KEY=dg-1 '# GHOST_WISPR_CONFIG=/srv/elsewhere/ghost-wispr.yaml' \
+  '# GHOST_WISPR_ENVOY_HUB_URL=http://hub.example.test:9020' '# GHOST_WISPR_ENVOY_ENABLED=true' \
+  '# GHOST_WISPR_CONCIERGE_ENVOY_URL=http://hub.example.test:9020' 'GHOST_WISPR_ENVOY_ENABLED_BEFORE=true' \
+  'GHOST_WISPR_CONFIG_DIR=/srv/elsewhere' >"$models_dir/.env"
+run_models || fail "--models refused a .env that sets no override: $(<"$work_dir/out")"
 grep -qE '^sudo install .*/ghost-wispr\.yaml$' "$TEST_LOG" || fail "--models did not install the config: $(<"$TEST_LOG")"
 printf 'provision run test passed\n'
