@@ -76,35 +76,60 @@ require_idle_or_down() {
     || fail "the recorder runs and is not paused and idle (paused, no session, no GPT-Live probe), or its /api/status cannot be read, so it may be recording: nothing was changed; pause it outside a meeting, or wait until it answers, and run this step again"
 }
 
-# The .env variables that would override the template's Envoy settings, envoy_enabled, envoy_hub_url
-# and concierge.envoy_url: each variable internal/config's applyEnvOverrides reads for an Envoy
-# setting. A .env line overrides the YAML, and the models step keeps .env, so such a line would
-# change what the template says. deploy/pi/provision.sh --models holds the same check.
+# The variables that would override the template's Envoy settings, envoy_enabled, envoy_hub_url and
+# concierge.envoy_url: each variable internal/config's applyEnvOverrides reads for an Envoy setting.
+# A .env line overrides the YAML, and the models step keeps .env, so such a line would change what
+# the template says; so would the variable in the environment of ghost-wispr's user manager, which
+# each of its units inherits. deploy/pi/provision.sh --models holds the same checks.
 readonly ENVOY_OVERRIDE_VARIABLES='GHOST_WISPR_ENVOY_ENABLED|GHOST_WISPR_ENVOY_HUB_URL|GHOST_WISPR_CONCIERGE_ENVOY_URL'
-# The .env variable that names the config file the recorder loads (internal/config,
-# PathFromEnvironment); without it, the recorder loads ghost-wispr.yaml in its working directory,
-# DEPLOY_DIR. A .env line with it would have the recorder load another file than the config the
-# models step installs, which replaces every setting of the template, Envoy's included.
+# The variable that names the config file the recorder loads (internal/config, PathFromEnvironment);
+# without it, the recorder loads ghost-wispr.yaml in its working directory, DEPLOY_DIR. Set in .env or
+# in the user manager's environment, it would have the recorder load another file than the config
+# the models step installs, which replaces every setting of the template, Envoy's included.
 # deploy/pi/provision.sh --models refuses it too.
 readonly CONFIG_FILE_VARIABLE='GHOST_WISPR_CONFIG'
 
-# require_no_config_override fails, naming the variable, while a line of the Pi's .env could set
-# CONFIG_FILE_VARIABLE or one of ENVOY_OVERRIDE_VARIABLES: a line that, past leading space and an
-# export, starts with its name and =. A line ends at a carriage return as at a line feed, as
-# systemd's EnvironmentFile= parser reads one (NEWLINE "\n\r", src/basic/env-file.c), so tr turns
-# each CR into a line feed first. A match inside a multi-line value fails too, which only stops the
-# install. grep -o reads back from the Pi each match up to its =, so no value leaves the Pi, and
-# .env is not changed.
+# refuse_overrides WHERE HOW FOUND: fails while FOUND, matches of CONFIG_FILE_VARIABLE and
+# ENVOY_OVERRIDE_VARIABLES one a line, is not empty: "WHERE <names>, which would <why>", then what to
+# do (HOW). CONFIG_FILE_VARIABLE's reason comes first.
+refuse_overrides() {
+  local where=$1 how=$2 names
+  [[ -n $3 ]] || return 0
+  names=$(grep -oE "$CONFIG_FILE_VARIABLE|$ENVOY_OVERRIDE_VARIABLES" <<<"$3" | sort -u)
+  ! grep -qx "$CONFIG_FILE_VARIABLE" <<<"$names" \
+    || fail "$where $CONFIG_FILE_VARIABLE, which would replace the installed config with another file: nothing was changed; $how and run install again"
+  fail "$where $(paste -sd ' ' - <<<"$names"), which would override the template's envoy_enabled, envoy_hub_url or concierge.envoy_url: nothing was changed; $how and run install again"
+}
+
+# require_no_config_override fails, naming the variable, while CONFIG_FILE_VARIABLE or one of
+# ENVOY_OVERRIDE_VARIABLES can reach the recorder past the config the models step installs:
+# - a line of the Pi's .env that, past leading space and an export, starts with its name and =. A
+#   line ends at a carriage return as at a line feed, as systemd's EnvironmentFile= parser reads one
+#   (NEWLINE "\n\r", src/basic/env-file.c), so tr turns each CR into a line feed first. A match
+#   inside a multi-line value fails too, which only stops the install.
+# - the environment of ghost-wispr's user manager (systemctl --user set-environment or
+#   import-environment, an environment.d file, DefaultEnvironment=, the manager's own start-up
+#   environment), which each of its units inherits, ghost-wispr.service with it. systemctl --user
+#   show-environment prints it one variable a line, its name first; a value with a line break is
+#   quoted onto the line as $'...' (src/systemctl/systemctl-set-environment.c). require_unit_files
+#   reloads the manager first, so a newly written environment.d or user.conf line counts. It fails
+#   too when it cannot read the environment, or reads none: a user manager always sets PATH, so an
+#   empty reading is a blind one.
+# grep -o reads back from the Pi each match up to its =, so no value leaves the Pi, and nothing on
+# the Pi is changed.
 require_no_config_override() {
-  local found names status=0
+  local found status=0
   found=$(pi "f=$(printf %q "$DEPLOY_DIR/.env"); [ -r \"\$f\" ] || exit 2; tr '\r' '\n' <\"\$f\" | grep -oE '^[[:space:]]*(export[[:space:]]+)?($CONFIG_FILE_VARIABLE|$ENVOY_OVERRIDE_VARIABLES)[[:space:]]*='") \
     || status=$?
   ((status <= 1)) || fail "cannot read $DEPLOY_DIR/.env on the Pi (exit $status): nothing was changed"
-  [[ -n $found ]] || return 0
-  names=$(grep -oE "$CONFIG_FILE_VARIABLE|$ENVOY_OVERRIDE_VARIABLES" <<<"$found" | sort -u)
-  ! grep -qx "$CONFIG_FILE_VARIABLE" <<<"$names" \
-    || fail "the Pi's .env can set $CONFIG_FILE_VARIABLE, which would replace the installed config with another file: nothing was changed; remove each such line from $DEPLOY_DIR/.env and run install again"
-  fail "the Pi's .env can set $(paste -sd ' ' - <<<"$names"), which would override the template's envoy_enabled, envoy_hub_url or concierge.envoy_url: nothing was changed; remove each such line from $DEPLOY_DIR/.env and run install again"
+  refuse_overrides "the Pi's .env can set" "remove each such line from $DEPLOY_DIR/.env" "$found"
+  status=0
+  found=$(pi "${USER_SYSTEMD}e=\$(systemctl --user show-environment) || exit 2; [ -n \"\$e\" ] || exit 3; printf '%s\n' \"\$e\" | grep -oE '^($CONFIG_FILE_VARIABLE|$ENVOY_OVERRIDE_VARIABLES)='") \
+    || status=$?
+  ((status <= 1)) \
+    || fail "cannot read the environment of ghost-wispr's user manager on the Pi (systemctl --user show-environment), or it was empty (exit $status): nothing was changed"
+  refuse_overrides "ghost-wispr's user manager on the Pi sets" \
+    'unset each (systemctl --user unset-environment NAME; for an environment.d or user.conf line, remove it, then systemctl --user daemon-reload)' "$found"
 }
 
 # require_unit_files WHAT: after a reload of the user units, ghost-wispr.service and

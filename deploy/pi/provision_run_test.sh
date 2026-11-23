@@ -77,7 +77,9 @@ EOF
 
 # sudo records each command and runs none, but systemd-run's command is kept to run below, with the
 # whole systemd-run line, and what provision.sh installs from stdin or as the configuration is kept
-# to read.
+# to read. systemctl --user show-environment prints ghost-wispr's user manager's environment: the
+# file TEST_MANAGER_ENV names when it exists, else the few variables a manager has; it exits
+# TEST_MANAGER_ENV_EXIT (0 by default).
 cat >"$work_dir/bin/sudo" <<'EOF'
 #!/usr/bin/env bash
 printf 'sudo %s\n' "$*" >>"$TEST_LOG"
@@ -89,6 +91,14 @@ fi
 if [[ $1 == systemd-run ]]; then
   printf '%s' "${!#}" >"$TEST_LOG.join"
   printf '%s\n' "$*" >"$TEST_LOG.systemd-run"
+fi
+if [[ $* == *' systemctl --user show-environment' ]]; then
+  if [[ -f ${TEST_MANAGER_ENV:-} ]]; then
+    cat -- "$TEST_MANAGER_ENV"
+  else
+    printf '%s\n' HOME=/home/ghost-wispr LANG=C.UTF-8 PATH=/usr/local/bin:/usr/bin:/bin
+  fi
+  exit "${TEST_MANAGER_ENV_EXIT:-0}"
 fi
 EOF
 
@@ -776,12 +786,68 @@ chmod 600 "$models_dir/.env"
 grep -qF "could not read $models_dir/.env" "$work_dir/out" || fail "--models did not say it could not read .env: $(<"$work_dir/out")"
 [[ ! -s $TEST_LOG ]] || fail "--models changed the Pi before it refused an unreadable .env: $(<"$TEST_LOG")"
 [[ $(models_files) == "$before" ]] || fail "--models changed a file when it refused an unreadable .env"
-# The control: a .env that sets none installs, with each override commented out and longer names
-# that start with one.
+# --models refuses too, before it changes anything, while ghost-wispr's user manager sets one of
+# those variables in its own environment (systemctl --user set-environment or import-environment, an
+# environment.d file, DefaultEnvironment=): each of its units inherits that environment,
+# ghost-wispr.service with it. It reads the names from systemctl --user show-environment, names the
+# variable and why, and prints no value. It refuses as well when it cannot read that environment, or
+# reads an empty one: a user manager always holds some variables, so an empty reading is a blind one.
+export TEST_MANAGER_ENV="$work_dir/manager-env"
+readonly show_environment="sudo -u ghost-wispr XDG_RUNTIME_DIR=$runtime_dir systemctl --user show-environment"
+manager_env() { printf '%s\n' HOME=/home/ghost-wispr LANG=C.UTF-8 "$@" PATH=/usr/local/bin:/usr/bin:/bin >"$TEST_MANAGER_ENV"; }
+printf '%s\n' GHOST_WISPR_DEEPGRAM_API_KEY=dg-1 >"$models_dir/.env"
+for case in \
+  'GHOST_WISPR_CONFIG|GHOST_WISPR_CONFIG=/srv/elsewhere/ghost-wispr.yaml' \
+  $'GHOST_WISPR_CONFIG|GHOST_WISPR_ENVOY_ENABLED=false\nGHOST_WISPR_CONFIG=/srv/elsewhere/ghost-wispr.yaml' \
+  'GHOST_WISPR_ENVOY_ENABLED|GHOST_WISPR_ENVOY_ENABLED=false' \
+  'GHOST_WISPR_ENVOY_HUB_URL|GHOST_WISPR_ENVOY_HUB_URL=http://hub.example.test:9020' \
+  'GHOST_WISPR_CONCIERGE_ENVOY_URL|GHOST_WISPR_CONCIERGE_ENVOY_URL=http://hub.example.test:9020'; do
+  name=${case%%|*} reason="override the template's"
+  [[ $name != GHOST_WISPR_CONFIG ]] || reason='replace the installed config'
+  manager_env "${case#*|}"
+  printf 'old: config\n' >"$models_dir/ghost-wispr.yaml"
+  before=$(models_files)
+  if run_models; then
+    fail "--models installed with $name in the user manager's environment: $(<"$work_dir/out")"
+  fi
+  grep -qF "ghost-wispr's user manager sets $name, which would $reason" "$work_dir/out" \
+    || fail "--models did not name $name in the user manager's environment, and that it would $reason: $(<"$work_dir/out")"
+  ! grep -qE 'hub\.example\.test|elsewhere' "$work_dir/out" \
+    || fail "--models printed a value from the user manager's environment: $(<"$work_dir/out")"
+  [[ $(<"$TEST_LOG") == "$show_environment" ]] \
+    || fail "--models did more than read the user manager's environment before it refused $name: $(<"$TEST_LOG")"
+  [[ $(models_files) == "$before" ]] || fail "--models changed a file when it refused $name in the user manager's environment"
+done
+for broken in 'systemctl fails' 'an empty environment'; do
+  if [[ $broken == 'systemctl fails' ]]; then
+    manager_env
+    export TEST_MANAGER_ENV_EXIT=1
+  else
+    : >"$TEST_MANAGER_ENV"
+  fi
+  printf 'old: config\n' >"$models_dir/ghost-wispr.yaml"
+  before=$(models_files)
+  status=0
+  run_models || status=$?
+  unset TEST_MANAGER_ENV_EXIT
+  ((status != 0)) || fail "--models installed when $broken: $(<"$work_dir/out")"
+  grep -qF "could not read the environment of ghost-wispr's user manager" "$work_dir/out" \
+    || fail "--models did not say it could not read the user manager's environment when $broken: $(<"$work_dir/out")"
+  [[ $(<"$TEST_LOG") == "$show_environment" ]] \
+    || fail "--models did more than read the user manager's environment when $broken: $(<"$TEST_LOG")"
+  [[ $(models_files) == "$before" ]] || fail "--models changed a file when $broken"
+done
+# The control: a .env and a user manager's environment that set none install. The .env has each
+# override commented out and longer names that start with one; the environment has those longer
+# names, a name inside another variable's value, and a value with a line break, quoted onto one line
+# as systemctl prints it. --models still read the environment.
 printf '%s\n' GHOST_WISPR_DEEPGRAM_API_KEY=dg-1 '# GHOST_WISPR_CONFIG=/srv/elsewhere/ghost-wispr.yaml' \
   '# GHOST_WISPR_ENVOY_HUB_URL=http://hub.example.test:9020' '# GHOST_WISPR_ENVOY_ENABLED=true' \
   '# GHOST_WISPR_CONCIERGE_ENVOY_URL=http://hub.example.test:9020' 'GHOST_WISPR_ENVOY_ENABLED_BEFORE=true' \
   'GHOST_WISPR_CONFIG_DIR=/srv/elsewhere' >"$models_dir/.env"
-run_models || fail "--models refused a .env that sets no override: $(<"$work_dir/out")"
+manager_env 'GHOST_WISPR_CONFIG_DIR=/srv/elsewhere' 'GHOST_WISPR_ENVOY_ENABLED_BEFORE=true' \
+  'LESSOPEN=GHOST_WISPR_CONFIG=/srv/elsewhere' "GHOST_WISPR_DISPATCH_TOKEN=\$'first\\nGHOST_WISPR_CONFIG=x'"
+run_models || fail "--models refused a .env and a user manager's environment that set no override: $(<"$work_dir/out")"
+grep -qxF "$show_environment" "$TEST_LOG" || fail "--models installed without reading the user manager's environment: $(<"$TEST_LOG")"
 grep -qE '^sudo install .*/ghost-wispr\.yaml$' "$TEST_LOG" || fail "--models did not install the config: $(<"$TEST_LOG")"
 printf 'provision run test passed\n'
