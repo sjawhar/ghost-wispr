@@ -460,9 +460,12 @@ no longer reads (an old Envoy webhook signing key, and those of the settings tha
 replaced: README, "Removed settings"), and
 restarts Ghost Wispr. The credential files from the full provisioner stay as they are. A later
 full-provisioner run keeps the drive ID and both enablements. The models step refuses before it
-writes anything if a line of `.env` could set `GHOST_WISPR_ENVOY_ENABLED` or
-`GHOST_WISPR_CONCIERGE_ENVOY_URL`, which override the template's `envoy_enabled` and
-`concierge.envoy_url` ("Turn on the meeting voice", step 1), naming the variable.
+writes anything if a line of `.env` could set `GHOST_WISPR_CONFIG`, which would have the recorder
+load another file than the config it installs, or `GHOST_WISPR_ENVOY_ENABLED`,
+`GHOST_WISPR_ENVOY_HUB_URL` or `GHOST_WISPR_CONCIERGE_ENVOY_URL`, which override the template's
+`envoy_enabled`, `envoy_hub_url` and `concierge.envoy_url` ("Turn on the meeting voice", step 1),
+naming the variable. Set `GHOST_WISPR_CONFIG` only on a command line, as for the test instance
+("Accept slice 2").
 
 ```bash
 (
@@ -902,10 +905,11 @@ again at its end. It stops at the first check that fails. Save no settings in th
    either unit is not loaded on the Pi or has a drop-in there (a `ghost-wispr.service.d` file, such
    as one left from a speaker trace), naming it: a drop-in can change how the units run, such as
    give the update a time limit. Remove the drop-in and run `install` again. Before it changes
-   anything, it also refuses if a line of the Pi's `.env` could set `GHOST_WISPR_ENVOY_ENABLED` or
-   `GHOST_WISPR_CONCIERGE_ENVOY_URL`, naming the variable ("Turn on the meeting voice", step 1).
-   Such a line overrides the template, and the models step keeps `.env`. Remove the line and run
-   `install` again. It runs `update.sh`
+   anything, it also refuses if a line of the Pi's `.env` could set `GHOST_WISPR_CONFIG`, which
+   would replace the installed config with another file, or `GHOST_WISPR_ENVOY_ENABLED`,
+   `GHOST_WISPR_ENVOY_HUB_URL` or `GHOST_WISPR_CONCIERGE_ENVOY_URL`, naming the variable ("Turn on
+   the meeting voice", step 1). Such a line overrides the template, and the models step keeps
+   `.env`. Remove the line and run `install` again. It runs `update.sh`
    paused-only ("Update and inspect"), so a resume during the download leaves the binary in place;
    it must print `installed commit <merge commit>` or `already on commit <merge commit>`. Then, at
    once, it runs
@@ -1059,13 +1063,16 @@ the unit.
    sets `envoy_enabled: true`, and `envoy_hub_url` and `concierge.envoy_url` to the hub's listener.
    A `.env` line overrides the YAML, so the models step (`provision.sh --models`) and
    `deploy/pi/rollout.sh install` each refuse, and change nothing, while a line of the Pi's `.env`
-   could set `GHOST_WISPR_ENVOY_ENABLED` or `GHOST_WISPR_CONCIERGE_ENVOY_URL`: a line that, past
-   leading space and an `export`, starts with the name and `=`, where a carriage return ends a line
-   as a line feed does, as systemd reads `.env`. They name the variable. While a config names a hub
-   with Envoy off, the web page shows a notice under the warnings, and `/api/status` gives it in
-   `notices`, never in `warnings`, which `rollout.sh check` needs empty: no session event goes to
-   the hub, each completed summary waits until Envoy is on again, and, with no
-   `concierge.envoy_url`, the voice cannot ask an issue's agent.
+   could set `GHOST_WISPR_ENVOY_ENABLED`, `GHOST_WISPR_ENVOY_HUB_URL` or
+   `GHOST_WISPR_CONCIERGE_ENVOY_URL`, or `GHOST_WISPR_CONFIG`, which would have the recorder load
+   another file than the installed config and so replace every setting, Envoy's included: a line
+   that, past leading space and an `export`, starts with the name and `=`, where a carriage return
+   ends a line as a line feed does, as systemd reads `.env`. They name the variable and why, and
+   `GHOST_WISPR_CONFIG` first. While a config names a hub with Envoy off, the web page shows a
+   notice under the warnings, and `/api/status` gives it in `notices`, never in `warnings`, which
+   `rollout.sh check` needs empty: no session event goes to the hub, each completed summary waits
+   until Envoy is on again, and, with no `concierge.envoy_url`, the voice cannot ask an issue's
+   agent.
 2. The Pi's Dispatch token: a no-scope agent token, never a person's. Before you run
    `provision-pi.sh`, mint it into `$prepared/dispatch-token` with your own Dispatch token, which
    must hold the `person` and `approve` scopes, in the file `DISPATCH_TOKEN_FILE` names:

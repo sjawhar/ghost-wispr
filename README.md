@@ -718,8 +718,8 @@ What the voice hears, and where the room's words go:
 | `voice.gptlive.model` | `openai/gpt-live-1` with no `providers` | Voice B's provider/model, on an `openai` provider. With `openai_wif`, the unit exchanges its Google ID token (`google_credentials_file`) for an OpenAI access token of an hour at most. `gptlive-probe` (`cmd/gptlive-probe`) checks the route from the unit |
 | `voice.dgagent.provider` | `deepgram` with no `providers` | Voice C's provider, a `deepgram` one, whose key opens the Voice Agent |
 | `concierge.model` (`GHOST_WISPR_CONCIERGE_MODEL`) | — | The Concierge's provider/model, on a `vertex`, `gemini` or `openai` provider, such as `vertex/gemini-3.5-flash-lite`, or a model gateway's `gateway/claude-haiku-4-5` or `gateway/openai/gpt-5-mini`; without it the voice cannot answer |
-| `concierge.dispatch_url`, `GHOST_WISPR_DISPATCH_TOKEN` | — | Dispatch and the unit's own token; without both, the voice says it cannot reach Dispatch yet |
-| `concierge.envoy_url` | — | The Envoy listener the unit registers its session with, to ask an issue's agent. `envoy_enabled` does not turn this session off: it is for the events alone; without `concierge.envoy_url` the unit opens no Envoy session |
+| `concierge.dispatch_url` (`GHOST_WISPR_CONCIERGE_DISPATCH_URL`), `GHOST_WISPR_DISPATCH_TOKEN` | — | Dispatch and the unit's own token; without both, the voice says it cannot reach Dispatch yet |
+| `concierge.envoy_url` (`GHOST_WISPR_CONCIERGE_ENVOY_URL`) | — | The Envoy listener the unit registers its session with, to ask an issue's agent. `envoy_enabled` does not turn this session off: it is for the events alone; without `concierge.envoy_url` the unit opens no Envoy session |
 
 ### Agents in a meeting
 

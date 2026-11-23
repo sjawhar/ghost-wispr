@@ -455,32 +455,38 @@ rollout install
 expect_stop 'install with a drop-in found once it installed the units' 'late.conf'
 (($(line update.sh) == 0)) || fail "install ran update.sh past a drop-in it found once it installed the units: $(<"$state/events")"
 
-# install refuses, before it changes anything, while a line of the Pi's .env could set a variable
-# that would override the template's envoy_enabled or concierge.envoy_url: a line that, past leading
-# space and an export, starts with the name and =. It names the variable, prints no value, and
-# leaves .env byte for byte as it was. A match inside a multi-line quoted value refuses too: a false
+# install refuses, before it changes anything, while a line of the Pi's .env could set
+# GHOST_WISPR_CONFIG, which would replace the installed config with another file, or a variable
+# that would override the template's envoy_enabled, envoy_hub_url or concierge.envoy_url: a line
+# that, past leading space and an export, starts with the name and =. It names the variable and
+# why, prints no value, and leaves .env byte for byte as it was. GHOST_WISPR_CONFIG's reason comes
+# first when .env sets both kinds. A match inside a multi-line quoted value refuses too: a false
 # refusal only stops the install. systemd's EnvironmentFile= parser ends a line at a carriage return
 # as at a line feed (NEWLINE "\n\r", src/basic/env-file.c), so a bare CR starts a line too; a case
 # whose text holds CR LF is a CRLF file.
 for case in \
+  'GHOST_WISPR_CONFIG|export GHOST_WISPR_CONFIG=/srv/elsewhere/ghost-wispr.yaml' \
+  $'GHOST_WISPR_CONFIG|GHOST_WISPR_ENVOY_ENABLED=false\nGHOST_WISPR_CONFIG=/srv/elsewhere/ghost-wispr.yaml' \
   'GHOST_WISPR_ENVOY_ENABLED|GHOST_WISPR_ENVOY_ENABLED=false' \
+  'GHOST_WISPR_ENVOY_HUB_URL|GHOST_WISPR_ENVOY_HUB_URL=http://hub.example.test:9020' \
   'GHOST_WISPR_CONCIERGE_ENVOY_URL|  export GHOST_WISPR_CONCIERGE_ENVOY_URL = http://hub.example.test:9020' \
   $'GHOST_WISPR_ENVOY_ENABLED|GHOST_WISPR_DISPATCH_TOKEN="first line\nGHOST_WISPR_ENVOY_ENABLED=true\nlast line"' \
   $'GHOST_WISPR_ENVOY_ENABLED|GHOST_WISPR_ADDR=127.0.0.1:8080\rGHOST_WISPR_ENVOY_ENABLED=true' \
   $'GHOST_WISPR_CONCIERGE_ENVOY_URL|GHOST_WISPR_ADDR=127.0.0.1:8080\r\nGHOST_WISPR_CONCIERGE_ENVOY_URL=http://hub.example.test:9020\r'; do
-  name=${case%%|*} content=${case#*|} eol=''
+  name=${case%%|*} content=${case#*|} eol='' reason="override the template's"
   [[ $content != *$'\r\n'* ]] || eol=$'\r'
+  [[ $name != GHOST_WISPR_CONFIG ]] || reason='replace the installed config'
   reset
   printf "%s$eol\n%s\n" GHOST_WISPR_DEEPGRAM_API_KEY=dg-1 "$content" >"$deploy/.env"
   before=$(sha256sum <"$deploy/.env")
   rollout install
-  expect_stop "install with $name in .env" "the Pi's .env can set $name"
+  expect_stop "install with $name in .env" "the Pi's .env can set $name, which would $reason"
   refused_before_change "$name in .env"
   [[ $(sha256sum <"$deploy/.env") == "$before" ]] || fail "install changed .env when it refused $name"
-  [[ $out != *'hub.example.test'* && $out != *'first line'* && $out != *dg-1* ]] \
+  [[ $out != *'hub.example.test'* && $out != *elsewhere* && $out != *'first line'* && $out != *dg-1* ]] \
     || fail "install printed a value from .env when it refused $name: $out"
 done
-# An unreadable .env stops install too, before any change: the check cannot say it sets no Envoy
+# An unreadable .env stops install too, before any change: the check cannot say it sets no
 # override, and a read through a pipe must not pass for a clean one.
 reset
 chmod 000 "$deploy/.env"
@@ -488,13 +494,15 @@ rollout install
 chmod 600 "$deploy/.env"
 expect_stop 'install with an unreadable .env' "cannot read $deploy/.env on the Pi"
 refused_before_change 'an unreadable .env'
-# The control: a .env that names neither installs, with the hub's URL, a commented-out override and
-# a longer name that starts with one.
+# The control: a .env that sets none installs, with each override commented out and longer names
+# that start with one.
 reset
-printf '%s\n' 'GHOST_WISPR_ENVOY_HUB_URL=http://hub.example.test:9020' '# GHOST_WISPR_ENVOY_ENABLED=true' \
-  'GHOST_WISPR_ENVOY_ENABLED_BEFORE=true' >>"$deploy/.env"
+printf '%s\n' '# GHOST_WISPR_CONFIG=/srv/elsewhere/ghost-wispr.yaml' \
+  '# GHOST_WISPR_ENVOY_HUB_URL=http://hub.example.test:9020' '# GHOST_WISPR_ENVOY_ENABLED=true' \
+  '# GHOST_WISPR_CONCIERGE_ENVOY_URL=http://hub.example.test:9020' 'GHOST_WISPR_ENVOY_ENABLED_BEFORE=true' \
+  'GHOST_WISPR_CONFIG_DIR=/srv/elsewhere' >>"$deploy/.env"
 rollout install
-expect_ok 'install with a .env that sets no Envoy override'
+expect_ok 'install with a .env that sets no override'
 
 # check: each failure leaves the nightly update stopped.
 check_fails() {

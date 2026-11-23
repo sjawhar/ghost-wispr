@@ -76,25 +76,35 @@ require_idle_or_down() {
     || fail "the recorder runs and is not paused and idle (paused, no session, no GPT-Live probe), or its /api/status cannot be read, so it may be recording: nothing was changed; pause it outside a meeting, or wait until it answers, and run this step again"
 }
 
-# The .env variables that would override the template's Envoy settings, envoy_enabled and
-# concierge.envoy_url: a .env line overrides the YAML, and the models step keeps .env, so such a line
-# would change what the template says. deploy/pi/provision.sh --models holds the same check.
-readonly ENVOY_OVERRIDE_VARIABLES='GHOST_WISPR_ENVOY_ENABLED|GHOST_WISPR_CONCIERGE_ENVOY_URL'
+# The .env variables that would override the template's Envoy settings, envoy_enabled, envoy_hub_url
+# and concierge.envoy_url: each variable internal/config's applyEnvOverrides reads for an Envoy
+# setting. A .env line overrides the YAML, and the models step keeps .env, so such a line would
+# change what the template says. deploy/pi/provision.sh --models holds the same check.
+readonly ENVOY_OVERRIDE_VARIABLES='GHOST_WISPR_ENVOY_ENABLED|GHOST_WISPR_ENVOY_HUB_URL|GHOST_WISPR_CONCIERGE_ENVOY_URL'
+# The .env variable that names the config file the recorder loads (internal/config,
+# PathFromEnvironment); without it, the recorder loads ghost-wispr.yaml in its working directory,
+# DEPLOY_DIR. A .env line with it would have the recorder load another file than the config the
+# models step installs, which replaces every setting of the template, Envoy's included.
+# deploy/pi/provision.sh --models refuses it too.
+readonly CONFIG_FILE_VARIABLE='GHOST_WISPR_CONFIG'
 
-# require_no_envoy_override fails, naming each variable, while a line of the Pi's .env could set one
-# of ENVOY_OVERRIDE_VARIABLES: a line that, past leading space and an export, starts with its name
-# and =. A line ends at a carriage return as at a line feed, as systemd's EnvironmentFile= parser
-# reads one (NEWLINE "\n\r", src/basic/env-file.c), so tr turns each CR into a line feed first. A
-# match inside a multi-line value fails too, which only stops the install. grep -o reads back from
-# the Pi each match up to its =, so no value leaves the Pi, and .env is not changed.
-require_no_envoy_override() {
+# require_no_config_override fails, naming the variable, while a line of the Pi's .env could set
+# CONFIG_FILE_VARIABLE or one of ENVOY_OVERRIDE_VARIABLES: a line that, past leading space and an
+# export, starts with its name and =. A line ends at a carriage return as at a line feed, as
+# systemd's EnvironmentFile= parser reads one (NEWLINE "\n\r", src/basic/env-file.c), so tr turns
+# each CR into a line feed first. A match inside a multi-line value fails too, which only stops the
+# install. grep -o reads back from the Pi each match up to its =, so no value leaves the Pi, and
+# .env is not changed.
+require_no_config_override() {
   local found names status=0
-  found=$(pi "f=$(printf %q "$DEPLOY_DIR/.env"); [ -r \"\$f\" ] || exit 2; tr '\r' '\n' <\"\$f\" | grep -oE '^[[:space:]]*(export[[:space:]]+)?($ENVOY_OVERRIDE_VARIABLES)[[:space:]]*='") \
+  found=$(pi "f=$(printf %q "$DEPLOY_DIR/.env"); [ -r \"\$f\" ] || exit 2; tr '\r' '\n' <\"\$f\" | grep -oE '^[[:space:]]*(export[[:space:]]+)?($CONFIG_FILE_VARIABLE|$ENVOY_OVERRIDE_VARIABLES)[[:space:]]*='") \
     || status=$?
   ((status <= 1)) || fail "cannot read $DEPLOY_DIR/.env on the Pi (exit $status): nothing was changed"
   [[ -n $found ]] || return 0
-  names=$(grep -oE "$ENVOY_OVERRIDE_VARIABLES" <<<"$found" | sort -u | paste -sd ' ' -)
-  fail "the Pi's .env can set $names, which would override the template's envoy_enabled or concierge.envoy_url: nothing was changed; remove each such line from $DEPLOY_DIR/.env and run install again"
+  names=$(grep -oE "$CONFIG_FILE_VARIABLE|$ENVOY_OVERRIDE_VARIABLES" <<<"$found" | sort -u)
+  ! grep -qx "$CONFIG_FILE_VARIABLE" <<<"$names" \
+    || fail "the Pi's .env can set $CONFIG_FILE_VARIABLE, which would replace the installed config with another file: nothing was changed; remove each such line from $DEPLOY_DIR/.env and run install again"
+  fail "the Pi's .env can set $(paste -sd ' ' - <<<"$names"), which would override the template's envoy_enabled, envoy_hub_url or concierge.envoy_url: nothing was changed; remove each such line from $DEPLOY_DIR/.env and run install again"
 }
 
 # require_unit_files WHAT: after a reload of the user units, ghost-wispr.service and
@@ -262,7 +272,7 @@ step_install() {
     || fail "the latest release is of commit ${latest:-<none>}, not the merge commit $merge; wait until the release workflow publishes it"
   require_idle
   require_unit_files 'nothing was changed'
-  require_no_envoy_override
+  require_no_config_override
   check_protected before
   stop_updates
   keep "$merge"

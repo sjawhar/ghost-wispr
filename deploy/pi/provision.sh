@@ -20,29 +20,36 @@ readonly CONFIG_TEMPLATE="$repo_root/deploy/pi/files/ghost-wispr.yaml"
 # replaced (internal/config, removedEnvironment), such as the Vertex embedding location an earlier
 # provisioner wrote.
 readonly REMOVED_ENV_VARIABLES='ENVOY_WEBHOOK_SECRET|GCP_PROJECT|GCP_LOCATION|GENAI_BACKEND|EMBEDDING_BACKEND|EMBEDDING_LOCATION|DEEPGRAM_MODEL|BATCH_TRANSCRIPTION_PROVIDER|TTS_PROVIDER|TTS_API_KEY|VOICE_TTS_ENGINE|VOICE_TTS_MODEL|VOICE_TTS_VOICE|VOICE_TTS_LOCATION'
-# The .env variables that would override the template's Envoy settings, envoy_enabled and
-# concierge.envoy_url: a .env line overrides the YAML, and --models keeps .env, so such a line would
-# change what the template says. deploy/pi/rollout.sh install holds the same check, so that it stops
-# before it changes anything.
-readonly ENVOY_OVERRIDE_VARIABLES='GHOST_WISPR_ENVOY_ENABLED|GHOST_WISPR_CONCIERGE_ENVOY_URL'
+# The .env variables that would override the template's Envoy settings, envoy_enabled, envoy_hub_url
+# and concierge.envoy_url: each variable internal/config's applyEnvOverrides reads for an Envoy
+# setting. A .env line overrides the YAML, and --models keeps .env, so such a line would change what
+# the template says. deploy/pi/rollout.sh install holds the same check, so that it stops before it
+# changes anything.
+readonly ENVOY_OVERRIDE_VARIABLES='GHOST_WISPR_ENVOY_ENABLED|GHOST_WISPR_ENVOY_HUB_URL|GHOST_WISPR_CONCIERGE_ENVOY_URL'
+# The .env variable that names the config file the recorder loads (internal/config,
+# PathFromEnvironment); without it, the recorder loads ghost-wispr.yaml in its working directory,
+# DEPLOY_DIR. A .env line with it would have the recorder load another file than the config --models
+# installs, which replaces every setting of the template, Envoy's included. rollout.sh install
+# refuses it too.
+readonly CONFIG_FILE_VARIABLE='GHOST_WISPR_CONFIG'
 
 fail() {
   printf 'ghost-wispr provision: %s\n' "$*" >&2
   exit 1
 }
 
-# envoy_override_names prints, one a line, each variable of ENVOY_OVERRIDE_VARIABLES that a line of
-# the .env file ENV_FILE could set: a line that, past leading space and an export, starts with its
-# name and =. A line ends at a carriage return as at a line feed, as systemd's EnvironmentFile=
-# parser reads one (NEWLINE "\n\r", src/basic/env-file.c), so tr turns each CR into a line feed
-# first. A match inside a multi-line value counts too. It reads no value, and fails when it cannot
-# read ENV_FILE.
-envoy_override_names() {
+# config_override_names prints, one a line, each variable of CONFIG_FILE_VARIABLE and
+# ENVOY_OVERRIDE_VARIABLES that a line of the .env file ENV_FILE could set: a line that, past leading
+# space and an export, starts with its name and =. A line ends at a carriage return as at a line
+# feed, as systemd's EnvironmentFile= parser reads one (NEWLINE "\n\r", src/basic/env-file.c), so tr
+# turns each CR into a line feed first. A match inside a multi-line value counts too. It reads no
+# value, and fails when it cannot read ENV_FILE.
+config_override_names() {
   local found status=0
   [[ -r $1 ]] || return 1
-  found=$(tr '\r' '\n' <"$1" | grep -oE "^[[:space:]]*(export[[:space:]]+)?($ENVOY_OVERRIDE_VARIABLES)[[:space:]]*=") || status=$?
+  found=$(tr '\r' '\n' <"$1" | grep -oE "^[[:space:]]*(export[[:space:]]+)?($CONFIG_FILE_VARIABLE|$ENVOY_OVERRIDE_VARIABLES)[[:space:]]*=") || status=$?
   ((status <= 1)) || return 1
-  [[ -z $found ]] || grep -oE "$ENVOY_OVERRIDE_VARIABLES" <<<"$found" | sort -u
+  [[ -z $found ]] || grep -oE "$CONFIG_FILE_VARIABLE|$ENVOY_OVERRIDE_VARIABLES" <<<"$found" | sort -u
 }
 
 require_single_line_file() {
@@ -114,10 +121,12 @@ provision_models() {
   [[ -d "$runtime_dir" ]] || fail "$runtime_dir is unavailable; log in as $SERVICE_USER before provisioning"
   [[ -f "$DEPLOY_DIR/ghost-wispr.yaml" && -f "$DEPLOY_DIR/.env" ]] \
     || fail "missing $DEPLOY_DIR/ghost-wispr.yaml or $DEPLOY_DIR/.env; run the full provisioner first"
-  local envoy_override
-  envoy_override=$(envoy_override_names "$DEPLOY_DIR/.env") || fail "could not read $DEPLOY_DIR/.env"
-  [[ -z $envoy_override ]] \
-    || fail "$DEPLOY_DIR/.env can set $(paste -sd ' ' - <<<"$envoy_override"), which would override the template's envoy_enabled or concierge.envoy_url: nothing was changed; remove each such line and run --models again"
+  local overrides
+  overrides=$(config_override_names "$DEPLOY_DIR/.env") || fail "could not read $DEPLOY_DIR/.env"
+  ! grep -qx "$CONFIG_FILE_VARIABLE" <<<"$overrides" \
+    || fail "$DEPLOY_DIR/.env can set $CONFIG_FILE_VARIABLE, which would replace the installed config with another file: nothing was changed; remove each such line and run --models again"
+  [[ -z $overrides ]] \
+    || fail "$DEPLOY_DIR/.env can set $(paste -sd ' ' - <<<"$overrides"), which would override the template's envoy_enabled, envoy_hub_url or concierge.envoy_url: nothing was changed; remove each such line and run --models again"
 
   # Global, not local: the EXIT trap runs after this function returns.
   staging_dir=$(mktemp -d -p "$runtime_dir" ghost-wispr-models.XXXXXX)
