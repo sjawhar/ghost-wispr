@@ -117,7 +117,7 @@ func (s *Summarizer) SummarizeResult(ctx context.Context, sessionID, transcript 
 	}()
 
 	presetName := s.fallbackPreset()
-	if !s.tooShort(transcript) {
+	if _, short := s.spoken(transcript); !short {
 		if presetName, err = s.selectPreset(ctx, transcript); err != nil {
 			return SummaryResult{}, fmt.Errorf("select preset: %w", err)
 		}
@@ -146,8 +146,9 @@ func (s *Summarizer) SummarizeWithPresetResult(ctx context.Context, _ string, tr
 		}
 	}()
 
-	if s.tooShort(transcript) {
-		return SummaryResult{Title: guaranteedTitle(transcript), SpeakerNames: "{}"}, nil
+	// The transcript's speaker labels are not words of the conversation.
+	if spoken, short := s.spoken(transcript); short {
+		return SummaryResult{Title: guaranteedTitle(spoken), SpeakerNames: "{}"}, nil
 	}
 
 	preset, ok := s.cfg.Presets[presetName]
@@ -665,14 +666,16 @@ func (s *Summarizer) fallbackPreset() string {
 	return "default"
 }
 
-// tooShort says whether transcript has fewer words of conversation than a
-// summary needs (MinSummaryWords); its speaker labels are not words of it.
-func (s *Summarizer) tooShort(transcript string) bool {
+// spoken is transcript without its speaker labels, which are not words of the
+// conversation, and whether it has fewer words than a summary needs
+// (MinSummaryWords).
+func (s *Summarizer) spoken(transcript string) (spoken string, short bool) {
 	minWords := s.cfg.MinSummaryWords
 	if minWords <= 0 {
 		minWords = defaultMinSummaryWords
 	}
-	return len(strings.Fields(transcribe.WithoutSpeakerLabels(transcript))) < minWords
+	spoken = transcribe.WithoutSpeakerLabels(transcript)
+	return spoken, len(strings.Fields(spoken)) < minWords
 }
 
 func (s *Summarizer) Presets() map[string]config.Preset {
