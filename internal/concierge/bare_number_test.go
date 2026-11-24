@@ -1,7 +1,6 @@
 package concierge
 
 import (
-	"context"
 	"strings"
 	"testing"
 	"time"
@@ -64,7 +63,7 @@ func textsOf(spoken []said) []string {
 func TestBareNumberConfirmationDoesNotMakeAHimForKey(t *testing.T) {
 	r := newRig(t)
 	r.records.issues["INFRA-4592"] = &dispatch.Issue{Key: "INFRA-4592", UpdatedAt: testNow}
-	if target := r.concierge.readTarget(context.Background(), "ask him for 4592", true); strings.HasPrefix(target, "keys:") {
+	if target := r.concierge.readTarget("ask him for 4592"); strings.HasPrefix(target, "keys:") {
 		t.Fatalf("readTarget = %q, want a non-key target", target)
 	}
 }

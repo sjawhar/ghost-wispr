@@ -27,7 +27,7 @@ type numberedCandidate struct {
 // deadline and returns the two most recently active, so the person confirms
 // a key rather than the Concierge guessing a project.
 func (c *Concierge) bareNumberCandidates(ctx context.Context, turn string) []candidate {
-	if c.records == nil || strings.HasPrefix(c.readTarget(ctx, turn, true), "keys:") {
+	if c.records == nil || strings.HasPrefix(c.readTarget(turn), "keys:") {
 		return nil
 	}
 	numbers := slices.Compact(bareIssueNumber.FindAllString(turn, -1))

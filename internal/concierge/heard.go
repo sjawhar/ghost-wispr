@@ -99,14 +99,14 @@ func spokenKeys(words string) string {
 // turn is neither a pick nor words to search. A turn goes through it once,
 // where it enters the Concierge (Heard, answer), so every reading of the
 // turn after sees the key.
-func (c *Concierge) readSpelledKeys(ctx context.Context, words string) (read string, unread bool) {
+func (c *Concierge) readSpelledKeys(words string) (read string, unread bool) {
 	read = spelledKey.ReplaceAllStringFunc(words, func(match string) string {
 		key, trail, ok := writtenKey(spelledKey, match)
 		if !ok {
 			return match
 		}
 		project, _, _ := strings.Cut(key, "-")
-		switch known, sure := c.cachedProject(ctx, project); {
+		switch known, sure := c.cachedProject(project); {
 		case !sure:
 			unread = true
 		case known:
@@ -249,14 +249,13 @@ func (p *prefetch) cancelAll() {
 //   - "search:terms" when it names none;
 //   - nothing when its words name no work either.
 //
-// terms is searchTerms's, the fewest words. With wait, Dispatch's projects
-// are read first when they are not known; Heard, which must not wait, uses
-// what is known.
-func (c *Concierge) readTarget(ctx context.Context, words string, wait bool) string {
+// terms is searchTerms's, the fewest words. The projects are the cached
+// list's (isProject), never waited for.
+func (c *Concierge) readTarget(words string) string {
 	var keys []string
 	for _, key := range issueKeysIn(words) {
 		project, _, _ := strings.Cut(key, "-")
-		if c.isProject(ctx, project, wait) {
+		if c.isProject(project) {
 			keys = append(keys, key)
 		}
 	}
@@ -288,11 +287,11 @@ func (c *Concierge) Heard(ctx context.Context, x *voice.Exchange, words string) 
 	}
 	// A run of letters that could be a key the project list cannot tell
 	// yet is neither read nor searched (readSpelledKeys).
-	words, unread := c.readSpelledKeys(ctx, words)
+	words, unread := c.readSpelledKeys(words)
 	if unread {
 		return
 	}
-	target := c.readTarget(ctx, words, false)
+	target := c.readTarget(words)
 	// A number-only turn (no key, no work words) skips the read-ahead: it
 	// goes straight to the bare-number candidate lookup. A turn with words
 	// beyond the number keeps its search.
@@ -385,11 +384,13 @@ func (r *read) heldBy(early *reading) {
 // the answer's, bounds both; cut, when it closes, ends the wait for a full
 // search (searchBoth).
 func (c *Concierge) readFor(ctx context.Context, x *voice.Exchange, turn string, onHolder func(*reading), cut <-chan struct{}) *reading {
-	target := c.readTarget(ctx, turn, true)
+	target := c.readTarget(turn)
 	if target == "" {
-		// A key-shaped word with no list of projects to tell it by: Dispatch
-		// did not answer (R10).
-		if len(issueKeysIn(turn)) > 0 && c.projectsDownNow() {
+		// A key-shaped word the cached project list cannot tell, with no
+		// other words to search: Dispatch did not answer (R10). A written
+		// "word NN" among other words may be speech ("the last 30 days"),
+		// so those words are searched.
+		if c.keyUntold(turn) {
 			return &reading{unreachable: true}
 		}
 		return &reading{noResult: len(bareIssueNumber.FindAllString(turn, -1)) > 0}

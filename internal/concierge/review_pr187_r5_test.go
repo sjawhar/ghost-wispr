@@ -1,7 +1,6 @@
 package concierge
 
 import (
-	"context"
 	"slices"
 	"strings"
 	"testing"
@@ -74,7 +73,6 @@ func TestReview187R5FramedSelectionsSendThePendingQuestion(t *testing.T) {
 // other letters stay as said.
 func TestReview187R5SpelledKeysNameKnownProjects(t *testing.T) {
 	r := newRig(t) // Dispatch knows ABC, XYZ, DEF and INFRA.
-	ctx := context.Background()
 	for in, want := range map[string]string{
 		"A B C thirteen":                 "ABC-13",
 		"A. B. C. 12":                    "ABC-12",
@@ -93,7 +91,7 @@ func TestReview187R5SpelledKeysNameKnownProjects(t *testing.T) {
 		"I O U twenty dollars":                 "search:twenty dollars",
 		"what's happening with X V six evals?": "search:xv6 evals",
 	} {
-		if got := r.concierge.readTarget(ctx, readKeys(t, r, in), true); got != want {
+		if got := r.concierge.readTarget(readKeys(t, r, in)); got != want {
 			t.Errorf("readTarget(%q) = %q, want %q", in, got, want)
 		}
 	}
@@ -119,7 +117,6 @@ func TestReview187R5SpelledKeysThroughAnswer(t *testing.T) {
 func pendingSends(t *testing.T, candidates []candidate, reply string) int {
 	t.Helper()
 	r := newRig(t)
-	warmProjects(r)
 	heldIssue(r, "session", false)
 	r.exchange.FollowUpTurn = true
 	r.model.turns = [][]*genai.GenerateContentResponse{{chunk(text("ABC-12: PR 80 is in review."))}}

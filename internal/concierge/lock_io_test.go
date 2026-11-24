@@ -81,7 +81,7 @@ func TestNoConciergeLogWriteHoldsItsLock(t *testing.T) {
 		r.concierge.mu.Unlock()
 		free := make(chan bool, 1)
 		go lockFreeWhileHeld(r.concierge, held, free)
-		r.concierge.isProject(context.Background(), "ABC", true)
+		r.concierge.isProject("ABC") // reads the stale list in the background
 		if !<-free {
 			t.Fatal("the Concierge's lock was held while it logged the failed read of the projects")
 		}

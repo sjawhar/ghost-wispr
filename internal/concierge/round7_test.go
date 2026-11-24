@@ -903,15 +903,16 @@ func TestAStoppedProjectReadMarksNothingDown(t *testing.T) {
 	r.records.mu.Unlock()
 	defer close(r.records.projectsBlock)
 	r.concierge.mu.Lock()
-	r.concierge.startProjectsReadLocked()
-	r.concierge.mu.Unlock()
-	r.concierge.mu.Lock()
+	r.concierge.projectsBusy = true
 	readBefore := r.concierge.projectsRead
 	r.concierge.mu.Unlock()
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	r.concierge.readProjects(ctx)
-	if r.concierge.projectsDownNow() {
+	r.concierge.mu.Lock()
+	down := r.concierge.projectsDown
+	r.concierge.mu.Unlock()
+	if down {
 		t.Fatal("a stopped read marked the projects down")
 	}
 	r.concierge.mu.Lock()

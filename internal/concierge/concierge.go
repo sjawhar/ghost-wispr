@@ -252,9 +252,6 @@ type Concierge struct {
 	projectsBusy bool
 	// projectsDown: the last read of the projects failed.
 	projectsDown bool
-	// projectsDone is closed when the read of the projects now running
-	// ends; nil when none runs.
-	projectsDone chan struct{}
 	// fastBound, knownBound, lookupBound, callBound, searchBound,
 	// searchSettle and routingAfter are the constants of those names
 	// (fastAnswerBound for fastBound, knownAfter for knownBound); a test
@@ -363,8 +360,8 @@ func New(cfg *Config) (*Concierge, error) {
 	if c.records != nil {
 		// The project list is read at once, so the first question's keys
 		// are known (isProject).
-		c.startProjectsReadLocked()
-		c.background(func(ctx context.Context) { c.readProjects(ctx) })
+		c.projectsBusy = true
+		c.background(c.readProjects)
 	}
 	return c, nil
 }
@@ -728,71 +725,52 @@ func (c *Concierge) closeLocked(sessionID string, deleted bool) {
 // projectsFor is how long a read of Dispatch's project keys is kept.
 const projectsFor = 10 * time.Minute
 
-// isProject reports whether key names one of Dispatch's projects. Until the
-// projects are known, or while their read fails, none does: a "word NN" said
-// in the room is no key, so it never reaches Dispatch in an address. With
-// wait, a stale or missing list is read first, or the read already running
-// is waited for; without, it is read in the background and this call
-// answers from what is known.
-func (c *Concierge) isProject(ctx context.Context, project string, wait bool) bool {
-	c.mu.Lock()
-	stale := c.now().Sub(c.projectsRead) > projectsFor
-	refresh := stale && !c.projectsBusy && c.records != nil
-	if refresh {
-		c.startProjectsReadLocked()
-	}
-	running := c.projectsDone
-	known := c.projects
-	c.mu.Unlock()
-	switch {
-	case refresh && wait:
-		known = c.readProjects(ctx)
-	case refresh:
-		c.background(func(life context.Context) { c.readProjects(life) })
-	case wait && stale && running != nil:
-		// A read Heard started is waited for no longer than a read's bound.
-		select {
-		case <-running:
-		case <-ctx.Done():
-		case <-time.After(c.callBound):
-		}
-		c.mu.Lock()
-		known = c.projects
-		c.mu.Unlock()
-	}
-	return known[strings.ToUpper(project)]
+// isProject reports whether project is one of Dispatch's projects, by the
+// cached list. Until the projects are known none is: a "word NN" said in the
+// room is no key, so it never reaches Dispatch in an address. After a failed
+// read the list last read still answers. It never waits: a stale or missing
+// list is read in the background, for a later turn.
+func (c *Concierge) isProject(project string) bool {
+	known, _ := c.cachedProject(project)
+	return known
 }
 
 // cachedProject reports whether the cached list of Dispatch's projects holds
 // project, and whether that list can tell (sure): it cannot when it was
-// never read or its last read failed. It never waits: a stale or missing
-// list is read in the background, for a later turn.
-func (c *Concierge) cachedProject(ctx context.Context, project string) (known, sure bool) {
-	c.isProject(ctx, project, false)
+// never read or its last read failed, Dispatch not answering. It never waits:
+// a stale or missing list is read in the background, for a later turn.
+func (c *Concierge) cachedProject(project string) (known, sure bool) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.projects[strings.ToUpper(project)], c.projects != nil && !c.projectsDown
+	refresh := c.now().Sub(c.projectsRead) > projectsFor && !c.projectsBusy && c.records != nil
+	if refresh {
+		c.projectsBusy = true
+	}
+	known, sure = c.projects[strings.ToUpper(project)], c.projects != nil && !c.projectsDown
+	c.mu.Unlock()
+	if refresh {
+		c.background(c.readProjects)
+	}
+	return known, sure
 }
 
-// startProjectsReadLocked marks a read of the projects as running. c.mu is
-// held.
-func (c *Concierge) startProjectsReadLocked() {
-	c.projectsBusy = true
-	c.projectsDone = make(chan struct{})
-}
-
-// projectsDownNow reports whether the last read of Dispatch's projects
-// failed, so a key-shaped word cannot be told for a key.
-func (c *Concierge) projectsDownNow() bool {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.projectsDown
+// keyUntold reports whether words name an issue key whose project the
+// cached list neither holds nor can tell it does not (cachedProject): the
+// check failed because Dispatch did not answer, so the turn is an outage of
+// Dispatch's, not a key Dispatch has no project for.
+func (c *Concierge) keyUntold(words string) bool {
+	for _, key := range issueKeysIn(words) {
+		project, _, _ := strings.Cut(key, "-")
+		if known, sure := c.cachedProject(project); !known && !sure {
+			return true
+		}
+	}
+	return false
 }
 
 // readProjects reads Dispatch's project keys, within a read's bound, and
-// keeps them. A failed read keeps what was known, marks Dispatch down for
-// the keys (projectsDownNow), and is tried again after a minute.
-func (c *Concierge) readProjects(ctx context.Context) map[string]bool {
+// keeps them. A failed read keeps what was known, marks the list unable to
+// tell (projectsDown), and is tried again after a minute.
+func (c *Concierge) readProjects(ctx context.Context) {
 	var keys []string
 	err := boundCall(ctx, c.callBound, dispatch.ErrUnreachable, func(ctx context.Context) error {
 		var err error
@@ -805,8 +783,6 @@ func (c *Concierge) readProjects(ctx context.Context) map[string]bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.projectsBusy = false
-	close(c.projectsDone)
-	c.projectsDone = nil
 	// A stop is no failure of Dispatch's.
 	c.projectsDown = err != nil && ctx.Err() == nil
 	if err != nil {
@@ -814,14 +790,13 @@ func (c *Concierge) readProjects(ctx context.Context) map[string]bool {
 			// A stop is no failure: the next read may come at once.
 			c.projectsRead = c.now().Add(time.Minute - projectsFor)
 		}
-		return c.projects
+		return
 	}
 	known := make(map[string]bool, len(keys))
 	for _, key := range keys {
 		known[strings.ToUpper(key)] = true
 	}
 	c.projects, c.projectsRead = known, c.now()
-	return known
 }
 
 // SessionEnded cancels the questions its meeting still waits on and
