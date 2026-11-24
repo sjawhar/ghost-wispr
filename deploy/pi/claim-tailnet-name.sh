@@ -32,7 +32,7 @@ fail() {
 }
 log() { printf 'claim-tailnet-name: %s\n' "$*"; }
 
-[[ -n ${TAILSCALE_API_KEY:-} ]] || fail "TAILSCALE_API_KEY is not set; run this under agent-secrets TAILSCALE_API_KEY"
+[[ -n ${TAILSCALE_API_KEY:-} ]] || fail "TAILSCALE_API_KEY is not set; run agent-secrets TAILSCALE_API_KEY --reason '<why>' -- deploy/pi/claim-tailnet-name.sh (docs/pi-setup.md, \"Provision\")"
 for command in curl jq; do
   command -v "$command" >/dev/null || fail "missing required command: $command"
 done
