@@ -57,7 +57,8 @@ func TestAClearKeywordMatchAnswersAtOnce(t *testing.T) {
 
 // TestAnUnclearKeywordMatchTakesTheFullSearch (R5, R6): when the keyword
 // result has no one clear match, or fails, the full search's result is taken.
-// A full search past its bound falls back to the keyword result.
+// A full search past its bound falls back to the keyword result's issues
+// whose title holds a word searched: here only ABC-12, "Realtime voice".
 func TestAnUnclearKeywordMatchTakesTheFullSearch(t *testing.T) {
 	for _, c := range []struct {
 		name string
@@ -85,8 +86,8 @@ func TestAnUnclearKeywordMatchTakesTheFullSearch(t *testing.T) {
 	r.records.kwHits = []dispatch.SearchHit{{Kind: "issue", IssueKey: "ABC-13", Title: "Wake word", Score: 0.5}, {Kind: "issue", IssueKey: "ABC-12", Title: "Realtime voice", Score: 0.4}}
 	r.records.searchDelay = time.Hour
 	spoken := answerTurn(t, r, "what is happening with the realtime voice")
-	if len(spoken) != 1 || spoken[0].text != "Did you mean A B C thirteen, or A B C twelve?" {
-		t.Fatalf("a full search past its bound: spoken = %+v, want the keyword result's top two", spoken)
+	if len(spoken) != 1 || spoken[0].text != "Did you mean A B C twelve?" {
+		t.Fatalf("a full search past its bound: spoken = %+v, want the keyword result's issue the words name", spoken)
 	}
 }
 
@@ -668,9 +669,9 @@ func TestAnAskedQuestionUsesTheFixedSentence(t *testing.T) {
 
 // TestAnUnclearKeywordResultWaitsTwoSecondsAtMost (R5, R6; Main's rule): when
 // the keyword result has no one clear match, the full search is waited for
-// until 2 s after the turn ended, then the voice asks which of the keyword
-// result's top two the person meant, and says nothing more when the full
-// search lands. A full result in time still wins.
+// until 2 s after the turn ended, then the voice asks about the keyword
+// result's issues whose title holds a word searched, and says nothing more
+// when the full search lands. A full result in time still wins.
 func TestAnUnclearKeywordResultWaitsTwoSecondsAtMost(t *testing.T) {
 	if fullWaitAfterTurn != 2*time.Second {
 		t.Fatalf("fullWaitAfterTurn = %v, want 2 s", fullWaitAfterTurn)
@@ -688,8 +689,8 @@ func TestAnUnclearKeywordResultWaitsTwoSecondsAtMost(t *testing.T) {
 		t.Fatalf("the answer took %v, want the question which issue at the 200 ms mark", took)
 	}
 	time.Sleep(time.Second)
-	if len(spoken) != 1 || spoken[0].text != "Did you mean A B C thirteen, or A B C twelve?" {
-		t.Fatalf("spoken = %+v, want only the keyword result's top two", spoken)
+	if len(spoken) != 1 || spoken[0].text != "Did you mean A B C twelve?" {
+		t.Fatalf("spoken = %+v, want only the keyword result's issue the words name", spoken)
 	}
 
 	r = newRig(t)

@@ -58,13 +58,18 @@ const (
 	lookupBound = 2 * time.Second
 	callBound   = 3 * time.Second
 	// searchBound bounds one search. Dispatch's normal search took 1.0 to
-	// 6.4 s live (median 1.2 s, p90 2.2 s), so a search past it is slow, not
-	// out of reach: it has found nothing yet.
+	// 6.4 s live on 2026-11-19 (median 1.2 s, p90 2.2 s), and 3.3 to 5.0 s
+	// on 2026-11-24 (20 runs from the devbox: median 3.9 to 4.2 s, p90 4.3
+	// s; the server's own time 2.8 to 4.2 s), so a search past it is slow,
+	// not out of reach: it has found nothing yet.
 	searchBound = 5 * time.Second
 	// fullWaitAfterTurn is how long after the turn an answer waits for the
 	// full search when the keyword result has no one clear match; then the
-	// voice asks which of the keyword result's top two the person meant
-	// (R5, Main's rule).
+	// voice asks about the keyword result's top two whose title holds a
+	// word searched (R5, Main's rule). On 2026-11-24 a full search begun at
+	// the turn's end never answered within it (0 of 40, fastest 3.3 s); one
+	// the read-ahead begun while the person spoke did in 3 of 4 live runs.
+	// The keyword search took 0.2 to 1.0 s (median 0.22 to 0.41 s).
 	fullWaitAfterTurn = 2 * time.Second
 	// maxToolCalls bounds the model's tool calls in one fast answer (R6).
 	maxToolCalls = 6
@@ -238,7 +243,7 @@ func (c *Concierge) answer(parent context.Context, x *voice.Exchange, turn strin
 	if found.key == "" && !found.unreachable && len(found.candidates) == 0 {
 		if candidates := c.bareNumberCandidates(ctx, turn); len(candidates) > 0 {
 			c.offerPick(x, turn, candidates)
-			return sp.sayText(ctx, bareNumberConfirmation(candidates), voice.Ack)
+			return sp.sayText(ctx, didYouMean(candidates), voice.Ack)
 		}
 	}
 	switch {
@@ -274,9 +279,10 @@ func (c *Concierge) answer(parent context.Context, x *voice.Exchange, turn strin
 		return errOutOfReach
 	case found.noResult:
 		return sp.sayText(ctx, noIssueFound, voice.Ack)
-	case found.searched && !found.clear && len(found.candidates) > 1:
+	case found.searched && !found.clear && len(found.candidates) > 0:
 		// R5: no one clear match. The voice asks which of the top two the
-		// person meant; the next turn of the exchange picks one.
+		// person meant, or whether the one a keyword fallback kept is it;
+		// the next turn of the exchange picks.
 		c.offerPick(x, turn, found.candidates)
 		return sp.sayText(ctx, didYouMean(found.candidates), voice.Ack)
 	}
@@ -398,11 +404,15 @@ func (c *Concierge) answer(parent context.Context, x *voice.Exchange, turn strin
 	return err
 }
 
-// didYouMean asks which of a search's top two issues the person meant (R5),
-// by each key as it is spoken (sayKey). Two keys never share a spoken form,
-// so the keys alone tell the issues apart; their titles, which made the
-// question 9 to 11 s long on the office Pi, are not said.
+// didYouMean asks which of the top two issues the person meant, or whether
+// the one offered is it (R5), by each key as it is spoken (sayKey). Two keys
+// never share a spoken form, so the keys alone tell the issues apart; their
+// titles, which made the question 9 to 11 s long on the office Pi, are not
+// said.
 func didYouMean(candidates []candidate) string {
+	if len(candidates) == 1 {
+		return "Did you mean " + sayKey(candidates[0].key) + "?"
+	}
 	return "Did you mean " + sayKey(candidates[0].key) + ", or " + sayKey(candidates[1].key) + "?"
 }
 

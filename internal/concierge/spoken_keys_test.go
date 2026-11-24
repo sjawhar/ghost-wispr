@@ -57,7 +57,7 @@ func TestDidYouMeanSaysEachKeyAsItIsSpoken(t *testing.T) {
 			t.Errorf("didYouMean(%s, %s) = %q fails the ear's form: %s", tc.a.key, tc.b.key, got, reason)
 		}
 	}
-	if got, want := bareNumberConfirmation([]candidate{{"INFRA-4592", "Ghost Wispr"}}), "Did you mean Infra forty-five ninety-two?"; got != want {
-		t.Errorf("bareNumberConfirmation = %q, want %q", got, want)
+	if got, want := didYouMean([]candidate{{"INFRA-4592", "Ghost Wispr"}}), "Did you mean Infra forty-five ninety-two?"; got != want {
+		t.Errorf("didYouMean of one = %q, want %q", got, want)
 	}
 }

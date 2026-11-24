@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"strings"
 	"time"
+	"unicode"
 	"unicode/utf8"
 
 	"github.com/google/uuid"
@@ -309,11 +310,12 @@ func (r *runner) searchIssues(ctx context.Context, query string) (map[string]any
 // searchBoth runs Dispatch's keyword-only search and its full search, words
 // and meaning, at once; together they are one search. A keyword result with
 // one clear match (R5) is taken at once and the full search is stopped:
-// keywords answer in about 0.15 s, the full search in 1 to 6 s. Otherwise
+// keywords answer in about 0.2 s, the full search in 3 to 6 s. Otherwise
 // the full result is taken, until cut closes (2 s after the turn ended);
 // then, or when the full search fails or runs past its bound, the keyword
-// result is, whose top two the voice offers (Main's rule). A search that
-// found nothing in its time is slow, not out of reach (R6, R10).
+// result is, with only the issues whose own title holds a word searched
+// (fallback), whose top two, or one, the voice offers (Main's rule). A search
+// that found nothing in its time is slow, not out of reach (R6, R10).
 func (c *Concierge) searchBoth(ctx context.Context, records Records, terms string, cut <-chan struct{}) (map[string]any, error) {
 	type found struct {
 		hits []dispatch.SearchHit
@@ -342,7 +344,7 @@ func (c *Concierge) searchBoth(ctx context.Context, records Records, terms strin
 		case got = <-full:
 		case <-cut:
 			c.logger.Info("concierge took the keyword result: the full search had not answered by its mark")
-			return map[string]any{"issues": kwIssues, "clear_match": false}, nil
+			return c.fallback(kwIssues, terms), nil
 		}
 	}
 	if got.err == nil {
@@ -351,7 +353,7 @@ func (c *Concierge) searchBoth(ctx context.Context, records Records, terms strin
 	}
 	if kwErr == nil && len(kwIssues) > 0 && ctx.Err() == nil {
 		c.logger.Info("concierge took the keyword result: the full search failed", "error", got.err)
-		return map[string]any{"issues": kwIssues, "clear_match": false}, nil
+		return c.fallback(kwIssues, terms), nil
 	}
 	if errors.Is(kwErr, errSearchSlow) && errors.Is(got.err, errSearchSlow) {
 		// The keyword search answers in about 0.15 s: both past their bound
@@ -363,6 +365,39 @@ func (c *Concierge) searchBoth(ctx context.Context, records Records, terms strin
 		return map[string]any{"issues": []map[string]any{}, "clear_match": false, "note": "The search took too long. Ask for the issue's key."}, nil
 	}
 	return nil, got.err
+}
+
+// fallback is the keyword result taken in place of the full one: only its
+// issues whose own title holds a word of terms, the search's words (R5). A
+// keyword hit names an issue through any of its texts, such as a document
+// about it, so the room could hear an issue whose name holds nothing it
+// said. The log says how many were kept, never which.
+func (c *Concierge) fallback(issues []map[string]any, terms string) map[string]any {
+	kept := make([]map[string]any, 0, len(issues))
+	for _, issue := range issues {
+		if title, _ := issue["title"].(string); titled(title, terms) {
+			kept = append(kept, issue)
+		}
+	}
+	if len(kept) < len(issues) {
+		c.logger.Info("concierge offers only the keyword result's issues whose title holds a word searched", "kept", len(kept), "of", len(issues))
+	}
+	return map[string]any{"issues": kept, "clear_match": false}
+}
+
+// titled reports whether title holds a word of terms, as a whole word or its
+// plural ("eval" and "evals"), with a hyphen apart: "Parser-evals" holds
+// "evals".
+func titled(title, terms string) bool {
+	words := strings.FieldsFunc(strings.ToLower(title), func(r rune) bool { return !unicode.IsLetter(r) && !unicode.IsDigit(r) })
+	for _, term := range strings.Fields(strings.ToLower(terms)) {
+		for _, word := range words {
+			if word == term || word+"s" == term || term+"s" == word || word+"es" == term || term+"es" == word {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // issuesOf is a search's issues, best first and once each, at most five,

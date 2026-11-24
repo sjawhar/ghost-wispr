@@ -1,0 +1,86 @@
+package concierge
+
+import (
+	"testing"
+	"time"
+
+	"github.com/sjawhar/ghost-wispr/internal/dispatch"
+)
+
+// TestTheKeywordFallbackOffersOnlyIssuesItsTitleNames (R5; the office Pi on
+// 2026-11-24): when the full search misses its mark or fails, the keyword
+// result is taken, and on the Pi it offered an issue whose own title holds
+// none of the words said, found through a document about it, beside one the
+// words name. It fails unless that fallback offers only the issues whose own
+// title holds a word of the search, a stem's plural form included: two such
+// issues are offered, one is offered alone, and none is no issue found. A
+// full result in time is offered as it came.
+func TestTheKeywordFallbackOffersOnlyIssuesItsTitleNames(t *testing.T) {
+	var (
+		contracts = dispatch.SearchHit{Kind: "issue", IssueKey: "ABC-41", Title: "Parser eval contracts", Score: 0.0104}
+		stateFile = dispatch.SearchHit{Kind: "document", IssueKey: "ABC-7", Title: "Team state file", Score: 0.0102}
+		answers   = dispatch.SearchHit{Kind: "issue", IssueKey: "ABC-42", Title: "Parser-evals: first answers", Score: 0.0102}
+		roadmap   = dispatch.SearchHit{Kind: "issue", IssueKey: "ABC-9", Title: "Roadmap: one grader", Score: 0.0101}
+	)
+	for _, tc := range []struct {
+		name string
+		kw   []dispatch.SearchHit
+		want string
+	}{
+		{"two titles hold the words", []dispatch.SearchHit{contracts, stateFile, answers, roadmap}, "Did you mean A B C forty-one, or A B C forty-two?"},
+		{"one title holds them", []dispatch.SearchHit{contracts, stateFile, roadmap}, "Did you mean A B C forty-one?"},
+		{"no title holds them", []dispatch.SearchHit{stateFile, roadmap}, noIssueFound},
+	} {
+		for _, fallback := range []string{"the full search missed its mark", "the full search failed"} {
+			t.Run(tc.name+", "+fallback, func(t *testing.T) {
+				r := newRig(t)
+				if fallback == "the full search failed" {
+					r.concierge.searchBound = 200 * time.Millisecond
+				} else {
+					r.concierge.fullWait = 200 * time.Millisecond
+				}
+				r.records.searchDelay = time.Hour
+				r.records.hits = []dispatch.SearchHit{stateFile, roadmap}
+				r.records.kwHits = tc.kw
+				spoken := answerTurn(t, r, "what is happening with the parser evals")
+				if len(spoken) != 1 || spoken[0].text != tc.want {
+					t.Fatalf("spoken = %+v, want only %q", spoken, tc.want)
+				}
+				if len(r.model.requests) != 0 {
+					t.Fatalf("model calls %d, want none", len(r.model.requests))
+				}
+			})
+		}
+	}
+	t.Run("control: a full result in time is offered as it came", func(t *testing.T) {
+		r := newRig(t)
+		r.records.searchDelay = 20 * time.Millisecond
+		r.records.hits = []dispatch.SearchHit{stateFile, roadmap}
+		r.records.kwHits = []dispatch.SearchHit{contracts, stateFile, answers, roadmap}
+		spoken := answerTurn(t, r, "what is happening with the parser evals")
+		if want := "Did you mean A B C seven, or A B C nine?"; len(spoken) != 1 || spoken[0].text != want {
+			t.Fatalf("spoken = %+v, want only %q", spoken, want)
+		}
+	})
+}
+
+// TestAPickOfTheOneIssueOfferedAnswersTheQuestion (R5): a keyword fallback
+// that offered one issue takes a yes as that issue, and answers the question
+// first asked about it.
+func TestAPickOfTheOneIssueOfferedAnswersTheQuestion(t *testing.T) {
+	r := newRig(t)
+	r.concierge.fullWait = 200 * time.Millisecond
+	r.records.searchDelay = time.Hour
+	r.records.issues["ABC-41"] = &dispatch.Issue{Key: "ABC-41", Title: "Parser eval contracts", Status: "in_review", UpdatedAt: testNow}
+	r.records.kwHits = []dispatch.SearchHit{
+		{Kind: "issue", IssueKey: "ABC-41", Title: "Parser eval contracts", Score: 0.0104},
+		{Kind: "document", IssueKey: "ABC-7", Title: "Team state file", Score: 0.0102},
+	}
+	if spoken := answerTurn(t, r, "what is happening with the parser evals"); len(spoken) != 1 || spoken[0].text != "Did you mean A B C forty-one?" {
+		t.Fatalf("spoken = %+v, want the one issue offered", spoken)
+	}
+	asked, key, ok := r.concierge.takePick(&r.exchange, "yes")
+	if !ok || key != "ABC-41" || asked != "what is happening with the parser evals" {
+		t.Fatalf("takePick(yes) = %q, %q, %v; want ABC-41 for the question first asked", asked, key, ok)
+	}
+}
