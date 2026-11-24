@@ -16,7 +16,7 @@ func TestBareNumberConfirmation(t *testing.T) {
 		r := newRig(t)
 		r.records.issues["INFRA-4592"] = &dispatch.Issue{Key: "INFRA-4592", Title: "Realtime voice", Status: "in_progress", UpdatedAt: testNow}
 		spoken := answerTurn(t, r, "ask him for 4592")
-		if len(spoken) != 1 || spoken[0].text != "Did you mean INFRA-4592?" {
+		if len(spoken) != 1 || spoken[0].text != "Did you mean Infra forty-five ninety-two?" {
 			t.Fatalf("spoken = %+v, want the confirmation", spoken)
 		}
 		if len(r.agents.sent) != 0 {
@@ -46,7 +46,7 @@ func TestBareNumberConfirmation(t *testing.T) {
 		r.records.issues["ABC-4592"] = &dispatch.Issue{Key: "ABC-4592", Title: "Older work", Status: "in_progress", UpdatedAt: testNow.Add(-time.Hour)}
 		r.records.issues["INFRA-4592"] = &dispatch.Issue{Key: "INFRA-4592", Title: "Newer work", Status: "in_progress", UpdatedAt: testNow.Add(-time.Minute)}
 		spoken := answerTurn(t, r, "ask him for 4592")
-		want := "Did you mean INFRA-4592, Newer, or ABC-4592, Older?"
+		want := "Did you mean Infra forty-five ninety-two, or A B C forty-five ninety-two?"
 		if len(spoken) != 1 || spoken[0].text != want {
 			t.Fatalf("spoken = %+v, want %q", spoken, want)
 		}

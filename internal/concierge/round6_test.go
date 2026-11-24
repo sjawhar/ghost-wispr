@@ -68,7 +68,7 @@ func TestOneClearMatch(t *testing.T) {
 	for _, c := range []struct {
 		ratio float64
 		first string
-	}{{1.4, "Did you mean ABC-12, Realtime voice, or ABC-13, Wake word?"}, {1.6, "I took ABC-12."}} {
+	}{{1.4, "Did you mean A B C twelve, or A B C thirteen?"}, {1.6, "I took ABC-12."}} {
 		r := newRig(t)
 		heldIssue(r, "none", false)
 		r.records.issues["ABC-13"] = &dispatch.Issue{Key: "ABC-13", Title: "Wake word", Status: "done"}

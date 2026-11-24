@@ -37,36 +37,84 @@ const (
 // formatting writes as a date. A single digit is too often a plain number.
 var spokenKey = regexp.MustCompile(`\b([A-Za-z][A-Za-z0-9]*)[- ](\d+(?:/\d+)+|\d{2,})\b`)
 
+// keyNumber is an issue number after its project: after a pause ("INFRA?
+// 4592."), split by a thousands comma, a decimal point or a date's slash
+// ("INFRA 4,592", "INFRA 45.92", "INFRA 10/27"), or in words ("INFRA four
+// thousand five hundred and ninety two", "INFRA forty-five ninety-two"). Its
+// group 1 is the number in digits, group 2 in words.
+const keyNumber = `[?.,:;!]?[\s-]+(?:(\d+(?:[.,/]\d+)+|\d{2,})\b|((?:(?i:zero|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety|hundred|thousand)\b[\s-]*(?:(?i:and)\s+)?)+))`
+
 // keytermKey is an issue key as Deepgram writes one whose project is a
-// keyterm, so in capitals: its number after a pause ("INFRA? 4592."), split
-// by a thousands comma, a decimal point or a date's slash ("INFRA 4,592",
-// "INFRA 45.92", "INFRA 10/27"), or in words ("INFRA four thousand five
-// hundred and ninety two", "INFRA forty-five ninety-two"). Group 2 is the
-// number in digits, group 3 in words.
-var keytermKey = regexp.MustCompile(`\b([A-Z][A-Z0-9]+)[?.,:;!]?[\s-]+(?:(\d+(?:[.,/]\d+)+|\d{2,})\b|((?:(?i:zero|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety|hundred|thousand)\b[\s-]*(?:(?i:and)\s+)?)+))`)
+// keyterm, so in capitals, with its number as keyNumber reads it.
+var keytermKey = regexp.MustCompile(`\b([A-Z][A-Z0-9]+)` + keyNumber)
+
+// spelledKey is an issue key whose project is said letter by letter ("A B C
+// thirteen", "A. B. C. 12"), as the voice says a project that reads as no
+// word. It is a key only when the letters name a project Dispatch knows
+// (readSpelledKeys): "I O U twenty dollars" is speech.
+var spelledKey = regexp.MustCompile(`\b([A-Z](?:\.?\s+[A-Z])+\.?)` + keyNumber)
+
+// spelledProject is what a project said letter by letter leaves between its
+// letters.
+var spelledProject = strings.NewReplacer(" ", "", ".", "", "\t", "")
 
 // keyGroups joins the groups of an issue number Deepgram wrote split.
 var keyGroups = strings.NewReplacer(",", "", ".", "", "/", "")
 
-// spokenKeys rewrites each key keytermKey reads in words to its written form,
+// writtenKey is the key a match of re (keytermKey or spelledKey) reads, in
+// its written form, "INFRA-4592", and the space the match took after it;
+// ok is false for a number of one digit.
+func writtenKey(re *regexp.Regexp, match string) (key, trail string, ok bool) {
+	parts := re.FindStringSubmatch(match)
+	digits := keyGroups.Replace(parts[2])
+	if parts[3] != "" {
+		digits = keyDigits(parts[3])
+		if strings.HasSuffix(parts[3], " ") {
+			trail = " "
+		}
+	}
+	if len(digits) < 2 {
+		return "", "", false
+	}
+	return spelledProject.Replace(parts[1]) + "-" + digits, trail, true
+}
+
+// spokenKeys rewrites each key keytermKey reads to its written form,
 // "INFRA-4592", so the rest of the turn reads as before. A number of one
 // digit stays as said.
 func spokenKeys(words string) string {
 	return keytermKey.ReplaceAllStringFunc(words, func(match string) string {
-		parts := keytermKey.FindStringSubmatch(match)
-		digits := keyGroups.Replace(parts[2])
-		trail := ""
-		if parts[3] != "" {
-			digits = keyDigits(parts[3])
-			if strings.HasSuffix(parts[3], " ") {
-				trail = " "
-			}
+		if key, trail, ok := writtenKey(keytermKey, match); ok {
+			return key + trail
 		}
-		if len(digits) < 2 {
+		return match
+	})
+}
+
+// readSpelledKeys rewrites each key of words whose project is said letter by
+// letter (spelledKey) to its written form, "ABC-13", when the cached project
+// list holds the project (cachedProject); other letters stay as said. It
+// never waits for the list. unread reports a run of letters that could be a
+// key while the list cannot tell (never read, or its read failed): such a
+// turn is neither a pick nor words to search. A turn goes through it once,
+// where it enters the Concierge (Heard, answer), so every reading of the
+// turn after sees the key.
+func (c *Concierge) readSpelledKeys(ctx context.Context, words string) (read string, unread bool) {
+	read = spelledKey.ReplaceAllStringFunc(words, func(match string) string {
+		key, trail, ok := writtenKey(spelledKey, match)
+		if !ok {
 			return match
 		}
-		return parts[1] + "-" + digits + trail
+		project, _, _ := strings.Cut(key, "-")
+		switch known, sure := c.cachedProject(ctx, project); {
+		case !sure:
+			unread = true
+		case known:
+			return key + trail
+		}
+		return match
 	})
+	return read, unread
 }
 
 // keyDigits is an issue number said in words, in digits: a number with a
@@ -236,6 +284,12 @@ func (c *Concierge) readTarget(ctx context.Context, words string, wait bool) str
 // context, ends with a stop. With no Dispatch it reads nothing.
 func (c *Concierge) Heard(ctx context.Context, x *voice.Exchange, words string) {
 	if ctx.Err() != nil || c.records == nil {
+		return
+	}
+	// A run of letters that could be a key the project list cannot tell
+	// yet is neither read nor searched (readSpelledKeys).
+	words, unread := c.readSpelledKeys(ctx, words)
+	if unread {
 		return
 	}
 	target := c.readTarget(ctx, words, false)
