@@ -81,13 +81,18 @@ func (c *Concierge) dropPick(x *voice.Exchange) {
 	c.mu.Unlock()
 }
 
-// offeredKeys is the keys of the issues x's last answer offered, the offer
-// left in place; none when no offer is pending.
-func (c *Concierge) offeredKeys(x *voice.Exchange) []string {
+// offeredPick is the issues x's last answer offered, the offer left in
+// place; none when no offer is pending.
+func (c *Concierge) offeredPick(x *voice.Exchange) []candidate {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	var keys []string
-	for _, candidate := range c.picks[wakeKey(x)].candidates {
+	return slices.Clone(c.picks[wakeKey(x)].candidates)
+}
+
+// keysOf is the keys of candidates.
+func keysOf(candidates []candidate) []string {
+	keys := make([]string, 0, len(candidates))
+	for _, candidate := range candidates {
 		keys = append(keys, candidate.key)
 	}
 	return keys

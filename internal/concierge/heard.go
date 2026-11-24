@@ -384,7 +384,10 @@ func (r *read) heldBy(early *reading) {
 // order, which is final once it ran to its end, else a read made now. ctx,
 // the answer's, bounds both; cut, when it closes, ends the wait for a full
 // search (searchBoth). view is the turn's one reading of the project list.
-func (c *Concierge) readFor(ctx context.Context, x *voice.Exchange, view projectsView, turn string, onHolder func(*reading), cut <-chan struct{}) *reading {
+// avoid is the issues an offer pending held when turn names a key the list
+// cannot tell, other than theirs: the read never resolves to one of them, or
+// asks its holder, unless its own title holds a word searched (avoided).
+func (c *Concierge) readFor(ctx context.Context, x *voice.Exchange, view projectsView, turn string, avoid []candidate, onHolder func(*reading), cut <-chan struct{}) *reading {
 	target := c.readTarget(view, turn)
 	if target == "" {
 		// A key-shaped word the project list cannot tell, with no other
@@ -396,6 +399,21 @@ func (c *Concierge) readFor(ctx context.Context, x *voice.Exchange, view project
 		}
 		return &reading{noResult: len(bareIssueNumber.FindAllString(turn, -1)) > 0}
 	}
+	avoided := avoidedIn(avoid, target)
+	if heard := onHolder; heard != nil && len(avoid) > 0 {
+		onHolder = func(early *reading) {
+			if !avoided(early.key) {
+				heard(early)
+			}
+		}
+	}
+	found := c.readOrReuse(ctx, x, target, onHolder, cut)
+	return withoutAvoided(found, avoided)
+}
+
+// readOrReuse is readFor's read of target: the read-ahead's when it fits,
+// else a read made now.
+func (c *Concierge) readOrReuse(ctx context.Context, x *voice.Exchange, target string, onHolder func(*reading), cut <-chan struct{}) *reading {
 	c.mu.Lock()
 	var pending *read
 	searchAgain := false
@@ -463,6 +481,41 @@ func (c *Concierge) readFor(ctx context.Context, x *voice.Exchange, view project
 		}
 	}
 	return c.readRecord(ctx, x, target, onHolder, cut)
+}
+
+// avoidedIn is whether key is one of avoid, the issues an offer pending held,
+// whose own title holds no word target searches: a turn that names a key the
+// project list cannot tell, other than theirs, does not describe it.
+func avoidedIn(avoid []candidate, target string) func(key string) bool {
+	terms := strings.TrimPrefix(target, "search:")
+	if _, after, keyed := strings.Cut(target, "|"); keyed {
+		terms = after
+	}
+	return func(key string) bool {
+		for _, offered := range avoid {
+			if offered.key == key {
+				return !titled(offered.title, terms)
+			}
+		}
+		return false
+	}
+}
+
+// withoutAvoided is found with the issues avoided takes out. A clear match
+// avoided leaves the rest of the search unclear, so the voice asks which of
+// them; with none left, the search found no issue.
+func withoutAvoided(found *reading, avoided func(key string) bool) *reading {
+	if !found.searched || found.unreachable || found.clear && found.key != "" && !avoided(found.key) {
+		return found
+	}
+	kept := slices.DeleteFunc(slices.Clone(found.candidates), func(c candidate) bool { return avoided(c.key) })
+	switch {
+	case len(kept) == len(found.candidates) && !avoided(found.key):
+		return found
+	case len(kept) == 0:
+		return &reading{searched: true, noResult: true}
+	}
+	return &reading{searched: true, candidates: kept}
 }
 
 // sameWords reports whether ahead, a read-ahead's search target, searched

@@ -174,31 +174,38 @@ func (c *Concierge) answer(parent context.Context, x *voice.Exchange, turn strin
 	defer cancel()
 	// One reading of the project list decides the turn (projectsView), never
 	// waiting for it. A key said letter by letter is read here, once, so the
-	// pick, the routing line, the search and the ask all see it. With an
-	// offer pending, a key the voice offered picks it (takePick) whatever
-	// the list says: that issue is real, the voice just offered it. When the
-	// list cannot tell, Dispatch did not answer: letters that could be a key,
-	// and with an offer pending any key not offered, are neither read nor
-	// searched, no offered issue is picked, and the room hears so, with the
-	// error sound (R10).
+	// pick, the routing line, the search and the ask all see it. When the
+	// list cannot tell, Dispatch did not answer: letters that could be a key
+	// are neither read nor searched, no offered issue is picked, and the room
+	// hears so, with the error sound (R10).
 	view := c.viewProjects()
 	turn, unread := view.readSpelledKeys(turn)
-	if offered := c.offeredKeys(x); unread || len(offered) > 0 && view.keyUntold(turn, offered) {
+	if unread {
 		c.dropPick(x)
-		c.logger.Info("concierge could not tell a key: Dispatch's projects are not known")
+		c.logger.Info("concierge could not read a key said letter by letter: Dispatch's projects are not known")
 		if err := sp.sayText(ctx, cannotReachDispatch, voice.Ack); err != nil {
 			return err
 		}
 		return errOutOfReach
 	}
 	// A turn that picks one of the issues the last answer offered answers
-	// the question first asked, about that issue (R5).
+	// the question first asked, about that issue (R5). A key the voice
+	// offered picks it whatever the list says: that issue is real, the voice
+	// just offered it. Any other turn is a new question, read as with no
+	// offer pending; when it names a key the list cannot tell, other than the
+	// offered ones, its search never resolves to an offered issue its words do
+	// not describe (avoid, readFor).
+	offered := c.offeredPick(x)
 	target := ""
 	if asked, key, ok := c.takePick(x, turn); ok {
 		if key == "" {
 			return sp.sayText(ctx, "Okay.", voice.Ack)
 		}
 		turn, target = asked, "keys:"+key
+	}
+	var avoid []candidate
+	if target == "" && len(offered) > 0 && view.keyUntold(turn, keysOf(offered)) {
+		avoid = offered
 	}
 	// The ask runs beside the facts, so Envoy's time holds no fact back. A
 	// person's "ask" needs only the holder, so it goes out once the holder
@@ -254,7 +261,7 @@ func (c *Concierge) answer(parent context.Context, x *voice.Exchange, turn strin
 	case target != "":
 		found = c.readRecord(ctx, x, target, onHolder, fullCut)
 	default:
-		found = c.readFor(ctx, x, view, turn, onHolder, fullCut)
+		found = c.readFor(ctx, x, view, turn, avoid, onHolder, fullCut)
 	}
 	// R6: at most two searches an answer, the read-ahead's counted; the count
 	// is taken here, so an answer that ends early starts it over too.
