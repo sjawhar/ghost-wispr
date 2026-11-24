@@ -2393,11 +2393,15 @@ func (s *Supervisor) stopLocked(reason string) {
 }
 
 // endLocked ends ex. cut says a stop or a barge-in ended it: its voice and
-// chime are cut at once. A held answer cut within ReplayWindow stays pending.
+// chime are cut at once, and a held answer cut within ReplayWindow stays
+// pending. An exchange whose context already ended, as a meeting's end ends
+// it before its callback runs, has its voice and chime cut too, with no
+// replay: a refused write stops none of the samples the speaker holds.
 func (s *Supervisor) endLocked(ex *exchange, cut bool, reason string) {
 	if ex.ended {
 		return
 	}
+	silence := cut || ex.ctx.Err() != nil
 	// Its session settles as it ends: the start it waited for, if that start
 	// has settled by now, is its, whatever session is current. One that never
 	// settled leaves its session unknown: the timing events held for it
@@ -2444,7 +2448,7 @@ func (s *Supervisor) endLocked(ex *exchange, cut bool, reason string) {
 	// cut landing late can never end the next exchange's chime. The voice's
 	// own interrupt and close may wait on its vendor, so they run apart.
 	ex.cancel()
-	if cut {
+	if silence {
 		s.cfg.Speaker.Cancel(audio.InputVoice)
 		s.cutChimeLocked(true)
 	}
@@ -2452,7 +2456,7 @@ func (s *Supervisor) endLocked(ex *exchange, cut bool, reason string) {
 		if sess == nil {
 			return
 		}
-		if cut {
+		if silence {
 			sess.Interrupt()
 		}
 		if err := sess.Close(); err != nil {
