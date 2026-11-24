@@ -254,13 +254,14 @@ func workWords(text string) string {
 	return strings.Join(words[:min(len(words), maxSearchTerms)], " ")
 }
 
-// namingWords is every word of text that names work, once each, in order: a
-// spelled-out name as one word, an issue key left out, no stopword and no
-// word under three letters.
+// namingWords is every word of text that names work, once each, in order: an
+// issue key left out (a key said letter by letter too, read before spelled
+// names are joined), a spelled-out name as one word, no stopword and no word
+// under three letters.
 func namingWords(text string) []string {
 	var words []string
 	seen := map[string]bool{}
-	rest := compound.ReplaceAllString(spokenKey.ReplaceAllString(spokenKeys(spelledOut(text)), " "), "realtime")
+	rest := compound.ReplaceAllString(spokenKey.ReplaceAllString(spelledOut(spokenKeys(text)), " "), "realtime")
 	for _, word := range strings.FieldsFunc(strings.ToLower(rest), func(r rune) bool {
 		return !unicode.IsLetter(r) && !unicode.IsDigit(r) && r != '\''
 	}) {

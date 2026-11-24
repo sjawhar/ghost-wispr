@@ -49,9 +49,10 @@ func (c *Concierge) offerPick(x *voice.Exchange, turn string, candidates []candi
 // whole no ("no", "nope, not that one") picks none. Any other reply that is
 // no confirmation (confirms: a question mark, a question word or a negation)
 // is a new question, whatever key, place or title it names. A confirmation
-// picks the issue it names (pickIn). It returns the question first asked and
-// the picked key. Either way the offer is used up: a turn that picks nothing
-// is a question of its own.
+// picks an issue only when it is a selection of one (pickIn): talk that holds
+// a cue ("first coffee, then lunch") picks none. It returns the question
+// first asked and the picked key. Either way the offer is used up: a turn
+// that picks nothing is a question of its own.
 func (c *Concierge) takePick(x *voice.Exchange, turn string) (asked, key string, ok bool) {
 	c.mu.Lock()
 	p, offered := c.picks[wakeKey(x)]
@@ -89,15 +90,17 @@ var (
 	noWords   = set(strings.Fields("no nope nah"))
 	noTails   = set([]string{"", "not", "not that", "not that one", "not this one", "thanks", "thank you", "neither"})
 	noPhrases = set([]string{"not that one", "not this one", "neither", "neither one"})
-	// keyTails may follow an issue key that picks it alone: "ABC-12,
-	// please".
-	keyTails = set([]string{"", "please", "that one", "the one", "yes", "yes please"})
+	// selectionWords may stand beside the cues of a selection and add
+	// nothing to it: a filler, a yes, and the words that frame a pick ("the
+	// one", "that's the wake word issue", "please use the first one"). Any
+	// other word is substance: the reply is talk, not a selection.
+	selectionWords = set(strings.Fields("uh um oh hmm mm okay ok so well yeah yea yes yep yup sure right correct exactly please thanks thank you the a one that that's this it it's issue ticket i i'll i'd mean meant use take pick choose go with want about"))
 )
 
 // replyWords are turn's words, lower case, its issue keys and the fillers it
 // begins with left out; an apostrophe stays in its word ("that's").
 func replyWords(turn string) []string {
-	rest := spokenKey.ReplaceAllString(spokenKeys(turn), " ")
+	rest := compound.ReplaceAllString(spokenKey.ReplaceAllString(spokenKeys(turn), " "), "realtime")
 	words := strings.FieldsFunc(strings.ToLower(strings.ReplaceAll(rest, "’", "'")), func(r rune) bool {
 		return !unicode.IsLetter(r) && !unicode.IsDigit(r) && r != '\''
 	})
@@ -135,35 +138,64 @@ func confirms(turn string) bool {
 	return true
 }
 
-// pickIn is the offered issue a confirmation names, or "": every cue in it
-// must name the same one. Its key picks alone or with "please" or "that one"
-// (keyTails); a key not offered picks none. Its place ("the first one", "the
-// other") or words of one offered title and no other's ("the wake word one")
-// pick it, however many were offered, and so does its key with either. Of one
-// issue offered, a yes form picks it too ("yes", "yeah, that one").
+// pickIn is the offered issue a confirmation selects, or "". The reply's cues
+// name it: its key, its place ("the first one", "the other") or words of its
+// title and no other offered title's ("the wake word one"), read over every
+// word. Cues that name two issues, a key not offered or a place past the
+// offered issues pick none, whatever else the reply holds. A reply with a cue
+// picks only when it is a selection (isSelection): nothing but its cues and
+// words that frame a pick. Of one issue offered, a reply with no cue picks it
+// when it is a yes form ("yes", "yeah, that one", "sure, that's it").
 func pickIn(candidates []candidate, turn string) string {
 	words := replyWords(turn)
-	phrase := strings.Join(words, " ")
-	keyed := ""
+	cue := ""
 	for _, named := range issueKeysIn(turn) {
-		if !slices.ContainsFunc(candidates, func(c candidate) bool { return c.key == named }) || (keyed != "" && keyed != named) {
+		if !slices.ContainsFunc(candidates, func(c candidate) bool { return c.key == named }) || (cue != "" && cue != named) {
 			return ""
 		}
-		keyed = named
+		cue = named
 	}
-	if keyed != "" && keyTails[phrase] {
-		return keyed
-	}
-	cue, conflict := placeOrTitle(candidates, words)
+	named, conflict := placeOrTitle(candidates, words)
 	switch {
-	case conflict, cue != "" && keyed != "" && keyed != cue:
+	case conflict, named != "" && cue != "" && named != cue:
 		return ""
-	case cue != "":
+	case named != "":
+		cue = named
+	}
+	switch {
+	case cue != "" && isSelection(candidates, words):
 		return cue
-	case len(candidates) == 1 && keyed == "" && (yesWords[firstOf(words)] && yesTails[strings.Join(words[min(1, len(words)):], " ")] || yesPhrases[phrase]):
+	case cue == "" && len(candidates) == 1 && yesForm(words):
 		return candidates[0].key
 	}
 	return ""
+}
+
+// isSelection reports whether words, a reply's words with its keys left out,
+// hold nothing but cues and words that add nothing (selectionWords): a place
+// (pickWords) or a word of an offered title. "the wake word one", "ABC-13,
+// first please" and "yeah wake word" are selections; "first coffee, then
+// lunch" is talk.
+func isSelection(candidates []candidate, words []string) bool {
+	titled := map[string]bool{}
+	for _, candidate := range candidates {
+		for _, word := range replyWords(candidate.title) {
+			titled[word] = true
+		}
+	}
+	for _, word := range words {
+		if _, place := pickWords[word]; !place && !titled[word] && !selectionWords[word] {
+			return false
+		}
+	}
+	return true
+}
+
+// yesForm reports whether words are a yes alone: "yes", "yeah, that one",
+// "sure, that's it", "that one", maybe with "please".
+func yesForm(words []string) bool {
+	phrase := strings.Join(words, " ")
+	return yesWords[firstOf(words)] && yesTails[strings.Join(words[min(1, len(words)):], " ")] || yesPhrases[phrase]
 }
 
 // firstOf is words' first word, or "".

@@ -38,19 +38,25 @@ const (
 var spokenKey = regexp.MustCompile(`\b([A-Za-z][A-Za-z0-9]*)[- ](\d+(?:/\d+)+|\d{2,})\b`)
 
 // keytermKey is an issue key as Deepgram writes one whose project is a
-// keyterm, so in capitals: its number after a pause ("INFRA? 4592."), split
-// by a thousands comma, a decimal point or a date's slash ("INFRA 4,592",
-// "INFRA 45.92", "INFRA 10/27"), or in words ("INFRA four thousand five
-// hundred and ninety two", "INFRA forty-five ninety-two"). Group 2 is the
-// number in digits, group 3 in words.
-var keytermKey = regexp.MustCompile(`\b([A-Z][A-Z0-9]+)[?.,:;!]?[\s-]+(?:(\d+(?:[.,/]\d+)+|\d{2,})\b|((?:(?i:zero|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety|hundred|thousand)\b[\s-]*(?:(?i:and)\s+)?)+))`)
+// keyterm, so in capitals, or is said letter by letter ("A B C", "A. B.
+// C."), as the voice says a project that reads as no word: its number after a
+// pause ("INFRA? 4592."), split by a thousands comma, a decimal point or a
+// date's slash ("INFRA 4,592", "INFRA 45.92", "INFRA 10/27"), or in words
+// ("INFRA four thousand five hundred and ninety two", "INFRA forty-five
+// ninety-two", "A B C thirteen"). Group 2 is the number in digits, group 3 in
+// words.
+var keytermKey = regexp.MustCompile(`\b([A-Z][A-Z0-9]+|[A-Z](?:\.?\s+[A-Z])+\.?)[?.,:;!]?[\s-]+(?:(\d+(?:[.,/]\d+)+|\d{2,})\b|((?:(?i:zero|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety|hundred|thousand)\b[\s-]*(?:(?i:and)\s+)?)+))`)
+
+// spelledProject is what a project said letter by letter leaves between its
+// letters.
+var spelledProject = strings.NewReplacer(" ", "", ".", "", "\t", "")
 
 // keyGroups joins the groups of an issue number Deepgram wrote split.
 var keyGroups = strings.NewReplacer(",", "", ".", "", "/", "")
 
-// spokenKeys rewrites each key keytermKey reads in words to its written form,
-// "INFRA-4592", so the rest of the turn reads as before. A number of one
-// digit stays as said.
+// spokenKeys rewrites each key keytermKey reads to its written form,
+// "INFRA-4592" or "ABC-13", so the rest of the turn reads as before. A
+// number of one digit stays as said, so "X V six" is no key.
 func spokenKeys(words string) string {
 	return keytermKey.ReplaceAllStringFunc(words, func(match string) string {
 		parts := keytermKey.FindStringSubmatch(match)
@@ -65,7 +71,7 @@ func spokenKeys(words string) string {
 		if len(digits) < 2 {
 			return match
 		}
-		return parts[1] + "-" + digits + trail
+		return spelledProject.Replace(parts[1]) + "-" + digits + trail
 	})
 }
 
