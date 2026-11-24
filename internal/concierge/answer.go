@@ -141,17 +141,21 @@ var errOutOfReach = fmt.Errorf("concierge: %w", voice.ErrUnreachable)
 // leaves running, is work Stop waits for; after Stop, Answer answers
 // nothing and its error wraps voice.ErrUnreachable.
 func (c *Concierge) Answer(parent context.Context, x *voice.Exchange, turn string, say voice.SayFunc) error {
-	parent, leave, ok := c.enter(parent)
+	work, leave, ok := c.enter(parent)
 	if !ok {
 		return fmt.Errorf("%w: %w", voice.ErrUnreachable, errStopped)
 	}
 	defer leave()
-	sp := newSpeaker(parent, say)
-	err := c.answer(parent, x, turn, sp)
+	// The texts are said under parent, the exchange's context, not under
+	// work, which ends when Answer returns: voice A's Say returns once a
+	// text's first frame is queued and plays the rest under the context it
+	// was given, so the last text of every answer would be cut there.
+	sp := newSpeaker(parent, work, say)
+	err := c.answer(work, x, turn, sp)
 	spokenErr := sp.wait()
 	switch {
-	case parent.Err() != nil:
-		return parent.Err()
+	case work.Err() != nil:
+		return work.Err()
 	case spokenErr != nil && !errors.Is(err, spokenErr):
 		return errors.Join(err, spokenErr)
 	}
@@ -1131,9 +1135,12 @@ func (c *Concierge) rewriteForEar(ctx context.Context, written, issueKey, reason
 // at the mark in place of the routing line.
 type speaker struct {
 	say voice.SayFunc
-	// ctx is the exchange's: a stop ends the speech.
-	ctx context.Context
-	mu  sync.Mutex
+	// ctx is the exchange's: a stop ends the speech. Every Say gets it, and
+	// voice A plays a text on under it after its Say returned. work is the
+	// answer's call (enter): once it ended, as Stop ends it, no queued text
+	// starts.
+	ctx, work context.Context
+	mu        sync.Mutex
 	// texts are the texts queued, the routing line not counted; leads is
 	// how many of them name the issue.
 	texts []string
@@ -1156,8 +1163,8 @@ type queuedText struct {
 	mode voice.SayMode
 }
 
-func newSpeaker(ctx context.Context, say voice.SayFunc) *speaker {
-	return &speaker{ctx: ctx, say: say}
+func newSpeaker(ctx, work context.Context, say voice.SayFunc) *speaker {
+	return &speaker{ctx: ctx, work: work, say: say}
 }
 
 // holdLead holds line, which names the issue key (R5), until the first text
@@ -1247,7 +1254,10 @@ func (s *speaker) speak(drained chan struct{}) {
 		next := s.queue[0]
 		s.queue = s.queue[1:]
 		s.mu.Unlock()
-		err := s.ctx.Err()
+		err := s.work.Err()
+		if err == nil {
+			err = s.ctx.Err()
+		}
 		if err == nil {
 			err = s.say(s.ctx, next.text, next.mode)
 		}
