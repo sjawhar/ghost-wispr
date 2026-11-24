@@ -431,7 +431,9 @@ type exchange struct {
 	// unspokenAnswer: the answer tool returned words the driving voice has
 	// not begun to speak.
 	unspokenAnswer bool
-	turnAt         time.Time // when the turn was handed to the Concierge, or a held answer chosen to speak
+	// erred: the error sound played for it (exErrorLocked).
+	erred  bool
+	turnAt time.Time // when the turn was handed to the Concierge, or a held answer chosen to speak
 	// unsent are its timing events reported before it had its recording
 	// session's id: the session starts when Deepgram's first speech_final or
 	// UtteranceEnd flushes its finals, after the wake was heard on an interim
@@ -660,6 +662,16 @@ func (s *Supervisor) RedCheckFailed() {
 // Concierge that cannot reach Dispatch or Envoy (R10).
 func (s *Supervisor) errorLocked(sessionID string) {
 	s.soundLocked(ErrorChime(), "error_sound", sessionID, sessionID)
+}
+
+// exErrorLocked plays the error sound for ex, once: a voice that reports its
+// failure and a speech that therefore did not play to its end are one fault.
+func (s *Supervisor) exErrorLocked(ex *exchange, sessionID string) {
+	if ex.erred {
+		return
+	}
+	ex.erred = true
+	s.errorLocked(sessionID)
 }
 
 // soundLocked plays pcm on the chime input at once, unless the Supervisor is
@@ -1630,7 +1642,7 @@ func (s *Supervisor) readEvents(ex *exchange, sess Session) {
 				s.endLocked(ex, true, "the voice failed")
 			}
 			if current && ex.answer == nil {
-				s.errorLocked(ex.x.SessionID)
+				s.exErrorLocked(ex, ex.x.SessionID)
 			}
 		}
 		s.mu.Unlock()
@@ -1947,7 +1959,7 @@ func (s *Supervisor) answer(ex *exchange, x *Exchange, turn string) {
 		s.logf("voice: the Concierge did not answer: %v", err)
 		s.mu.Lock()
 		said := ex.said
-		s.errorLocked(x.SessionID)
+		s.exErrorLocked(ex, x.SessionID)
 		s.mu.Unlock()
 		if !said {
 			_ = say(ex.ctx, sorryLine, Ack)
@@ -1970,14 +1982,15 @@ func (s *Supervisor) finish(ex *exchange, sessionID string) bool {
 		authority = ex.sayCtx
 	}
 	s.mu.Unlock()
-	played := true
+	var unplayed error
 	if said {
 		if waiter, ok := sess.(SpeechWaiter); ok {
-			played = waiter.WaitSpoken(authority) == nil
+			unplayed = waiter.WaitSpoken(authority)
 		} else if last != nil {
-			played = last.Drain(authority) == nil
+			unplayed = last.Drain(authority)
 		}
 	}
+	played := unplayed == nil
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.ex != ex || ex.ended {
@@ -1995,12 +2008,15 @@ func (s *Supervisor) finish(ex *exchange, sessionID string) bool {
 		s.followUpLocked(ex)
 		return spoken
 	}
-	if !spoken && said && ex.answer != nil && ex.ctx.Err() == nil {
-		// The engine or Output cut a held answer after Say queued its first
-		// frame. Apply R11's replay rule exactly as a stop does, then begin
-		// the error sound on the new chime input the cut just opened.
-		s.endLocked(ex, true, "the voice did not finish")
-		s.errorLocked(sessionID)
+	if !spoken && said && ex.ctx.Err() == nil {
+		// The engine or the Output cut the speech after Say queued its
+		// first frame, with no stop: the room hears the error sound, not a
+		// silence (R10). A held answer gets R11's replay rule exactly as a
+		// stop does first; the error sound begins on the new chime input
+		// the cut just opened.
+		s.logf("voice: the answer did not play to its end: %v", unplayed)
+		s.endLocked(ex, ex.answer != nil, "the voice did not finish")
+		s.exErrorLocked(ex, sessionID)
 		return false
 	}
 	s.endLocked(ex, false, "done")

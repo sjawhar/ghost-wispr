@@ -118,7 +118,9 @@ type Session interface {
 	// Say speaks text. It returns no sooner than its speech is queued to the
 	// Output (voice A returns then; a vendor voice may return once it has
 	// played), and an error means the text was not heard: the Supervisor
-	// keeps a held answer whose Say failed for the next invitation.
+	// keeps a held answer whose Say failed for the next invitation. ctx must
+	// be the exchange's own context: voice A plays the text on under it after
+	// Say returns, so a context that ends sooner cuts the text.
 	Say(ctx context.Context, text string, mode SayMode) error
 	// Deliver hands a late tool result to the voice, such as GPT-Live's
 	// delegation id.
@@ -240,7 +242,9 @@ type WaitingLight interface {
 // Envoy.
 var ErrUnreachable = errors.New("the Concierge cannot reach Dispatch or Envoy")
 
-// SayFunc speaks text in the open exchange.
+// SayFunc speaks text in the open exchange. Its ctx reaches the voice's Say
+// (Session.Say), so it must be the exchange's own context, the one Answer
+// was given, never one that ends when Answer returns.
 type SayFunc func(ctx context.Context, text string, mode SayMode) error
 
 // PendingAnswer is a holder's answer to a question an exchange sent.

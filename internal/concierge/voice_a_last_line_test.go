@@ -2,6 +2,7 @@ package concierge
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"path/filepath"
@@ -236,5 +237,40 @@ func TestTheLastLineOfAnAnswerPlaysToItsEndOnVoiceA(t *testing.T) {
 				t.Errorf("the exchange ended %q, want (no follow-up): the person's pick must be heard with no wake phrase", got)
 			}
 		})
+	}
+}
+
+// TestAStopStartsNoLineQueuedBehindTheOneInFlight fails if the speaker says
+// a line under a context that ends with the answer's work, or starts a line
+// queued behind the one in flight once that work ended, as Stop ends it: the
+// lines are said under the exchange's context, which outlives the answer, so
+// only the work tells the speaker to start no more.
+func TestAStopStartsNoLineQueuedBehindTheOneInFlight(t *testing.T) {
+	work, stop := context.WithCancel(context.Background())
+	defer stop()
+	started, release := make(chan context.Context, 2), make(chan struct{})
+	var texts []string
+	sp := newSpeaker(context.Background(), work, func(ctx context.Context, text string, _ voice.SayMode) error {
+		texts = append(texts, text)
+		started <- ctx
+		<-release
+		return nil
+	})
+	for _, line := range []string{"First line.", "Second line."} {
+		if err := sp.sayText(work, line, voice.Fact); err != nil {
+			t.Fatal(err)
+		}
+	}
+	sayCtx := <-started
+	stop()
+	if err := sayCtx.Err(); err != nil {
+		t.Errorf("the line in flight was said under a context the work's end ended: %v", err)
+	}
+	close(release)
+	if err := sp.wait(); !errors.Is(err, context.Canceled) {
+		t.Errorf("wait = %v, want the work's end", err)
+	}
+	if len(texts) != 1 {
+		t.Errorf("said %q, want only the line in flight when the work ended", texts)
 	}
 }
