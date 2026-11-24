@@ -44,7 +44,10 @@ func TestTheKeywordFallbackOffersOnlyIssuesItsTitleNames(t *testing.T) {
 				if fallback == "the full search failed" {
 					r.concierge.searchBound = 200 * time.Millisecond
 				} else {
-					r.concierge.fullWait = 200 * time.Millisecond
+					// With no keyword issue kept, the full search is waited
+					// for to its bound: here it fails at 1 s, before the
+					// routing line's mark.
+					r.concierge.fullWait, r.concierge.searchBound = 200*time.Millisecond, time.Second
 				}
 				r.records.searchDelay = time.Hour
 				r.records.hits = []dispatch.SearchHit{stateFile, roadmap}

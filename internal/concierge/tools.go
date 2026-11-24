@@ -316,8 +316,10 @@ func (r *runner) searchIssues(ctx context.Context, query string) (map[string]any
 // full result is taken, until cut closes (2 s after the turn ended); then, or
 // when the full search fails or runs past its bound, the keyword result is,
 // with only the issues whose own title holds a word searched (fallback),
-// whose top two, or one, the voice offers (Main's rule). A search that found
-// nothing in its time is slow, not out of reach (R6, R10).
+// whose top two, or one, the voice offers (Main's rule). When the fallback at
+// cut keeps no issue, the full search is waited for within its own bound and
+// taken as it comes. A search that found nothing in its time is slow, not out
+// of reach (R6, R10).
 func (c *Concierge) searchBoth(ctx context.Context, records Records, terms string, cut <-chan struct{}) (map[string]any, error) {
 	type found struct {
 		hits []dispatch.SearchHit
@@ -349,7 +351,19 @@ func (c *Concierge) searchBoth(ctx context.Context, records Records, terms strin
 		case got = <-full:
 		case <-cut:
 			c.logger.Info("concierge took the keyword result: the full search had not answered by its mark")
-			return c.fallback(kwHits, terms), nil
+			kept := c.fallback(kwHits, terms)
+			if issues, _ := kept["issues"].([]map[string]any); len(issues) > 0 {
+				return kept, nil
+			}
+			// No keyword issue's title holds a word searched: the full
+			// search, which reads the meaning too, decides, within its own
+			// bound; the routing line plays meanwhile (Main's rule).
+			c.logger.Info("concierge waits for the full search: the keyword result kept no issue")
+			select {
+			case got = <-full:
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
 		}
 	}
 	if got.err == nil {

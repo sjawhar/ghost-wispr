@@ -81,3 +81,109 @@ func TestAClearKeywordMatchMustBeNamedByItsTitle(t *testing.T) {
 		})
 	}
 }
+
+// TestAnEmptyKeywordFallbackWaitsForTheFullSearch (R5; Main's decision on
+// #189): when no keyword issue's title holds a word searched, the voice waits
+// for the full search, which reads the meaning, up to its own bound, and
+// offers its result as it came, after the routing line; it says no issue was
+// found only when the full search also fails or finds nothing. A kept keyword
+// issue is still offered at once.
+func TestAnEmptyKeywordFallbackWaitsForTheFullSearch(t *testing.T) {
+	settings := dispatch.SearchHit{Kind: "document", IssueKey: "ABC-50", Title: "Provider settings page", Score: 0.02}
+	gateway := dispatch.SearchHit{Kind: "document", IssueKey: "ABC-52", Title: "Model gateway sign-in", Score: 0.005}
+	roadmap := dispatch.SearchHit{Kind: "document", IssueKey: "ABC-9", Title: "Roadmap: one grader", Score: 0.0007}
+	budget := dispatch.SearchHit{Kind: "document", IssueKey: "ABC-1", Title: "Budget", Score: 0.0007}
+	for _, tc := range []struct {
+		name        string
+		turn        string
+		kw, full    []dispatch.SearchHit
+		fullDelay   time.Duration
+		fullWait    time.Duration
+		searchBound time.Duration
+		want        []string
+		// tookAtLeast and tookAtMost bound the answer's time.
+		tookAtLeast, tookAtMost time.Duration
+	}{
+		{
+			name: "a clear keyword lead no title names, the full result clear at 4 s",
+			turn: "what is happening with the kore voice",
+			kw:   []dispatch.SearchHit{settings, gateway},
+			full: []dispatch.SearchHit{
+				{Kind: "document", IssueKey: "ABC-50", Title: "Provider settings page", Score: 0.01},
+				{Kind: "document", IssueKey: "ABC-53", Title: "Speaker trace", Score: 0.002},
+			},
+			fullDelay:   4 * time.Second,
+			want:        []string{"Reading the record.", "I took ABC-50."},
+			tookAtLeast: 4 * time.Second,
+		},
+		{
+			name: "keyword titles name none of the final words, the full result unclear at 4 s",
+			turn: "what's one blocker on the meeting voice",
+			kw:   []dispatch.SearchHit{roadmap, budget},
+			full: []dispatch.SearchHit{
+				{Kind: "comment", IssueKey: "ABC-60", Title: "Meeting voice measurements", Score: 0.0026},
+				{Kind: "document", IssueKey: "ABC-61", Title: "Agents join a meeting", Score: 0.0025},
+			},
+			fullDelay:   4 * time.Second,
+			want:        []string{"Reading the record.", "Did you mean A B C sixty, or A B C sixty-one?"},
+			tookAtLeast: 4 * time.Second,
+		},
+		{
+			name:        "the full search finds nothing either",
+			turn:        "what's one blocker on the meeting voice",
+			kw:          []dispatch.SearchHit{roadmap, budget},
+			full:        []dispatch.SearchHit{},
+			fullDelay:   3 * time.Second,
+			want:        []string{"Reading the record.", noIssueFound},
+			tookAtLeast: 3 * time.Second,
+		},
+		{
+			name:        "the full search fails at its bound",
+			turn:        "what's one blocker on the meeting voice",
+			kw:          []dispatch.SearchHit{roadmap, budget},
+			fullDelay:   time.Hour,
+			searchBound: 3 * time.Second,
+			want:        []string{"Reading the record.", noIssueFound},
+			tookAtLeast: 3 * time.Second,
+		},
+		{
+			name: "control: a kept keyword issue is offered at once",
+			turn: "what is happening with the kore voice",
+			kw: []dispatch.SearchHit{settings,
+				{Kind: "issue", IssueKey: "ABC-51", Title: "Kore voice tuning", Score: 0.005},
+			},
+			full:       []dispatch.SearchHit{settings},
+			fullDelay:  4 * time.Second,
+			fullWait:   200 * time.Millisecond,
+			want:       []string{"Did you mean A B C fifty-one?"},
+			tookAtMost: time.Second,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := newRig(t)
+			if tc.fullWait > 0 {
+				r.concierge.fullWait = tc.fullWait
+			}
+			if tc.searchBound > 0 {
+				r.concierge.searchBound = tc.searchBound
+			}
+			r.records.searchDelay = tc.fullDelay
+			r.records.hits, r.records.kwHits = tc.full, tc.kw
+			r.records.issues["ABC-50"] = &dispatch.Issue{Key: "ABC-50", Title: "Provider settings page", Status: "in_progress", UpdatedAt: testNow}
+			r.model.turns = [][]*genai.GenerateContentResponse{{chunk(text("It is in progress."))}}
+			start := time.Now()
+			spoken := answerTurn(t, r, tc.turn)
+			took := time.Since(start)
+			var texts []string
+			for _, s := range spoken {
+				texts = append(texts, s.text)
+			}
+			if len(texts) < len(tc.want) || !slices.Equal(texts[:len(tc.want)], tc.want) {
+				t.Fatalf("spoken %q, want it to begin %q", texts, tc.want)
+			}
+			if took < tc.tookAtLeast || (tc.tookAtMost > 0 && took > tc.tookAtMost) {
+				t.Fatalf("the answer took %v, want at least %v and at most %v", took, tc.tookAtLeast, tc.tookAtMost)
+			}
+		})
+	}
+}
