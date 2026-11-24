@@ -309,10 +309,10 @@ func TestARetryIsToldTheCheckItFailed(t *testing.T) {
 	}
 }
 
-// TestAKeyWaitsForAProjectsReadRunning: a key read with wait waits for the
-// read of Dispatch's projects already running, rather than answer from the
-// old list.
-func TestAKeyWaitsForAProjectsReadRunning(t *testing.T) {
+// TestAKeyCheckNeverWaitsForAProjectsRead: a key is checked against the
+// cached list at once, while a read of Dispatch's projects runs; the read,
+// once it ends, is the list later checks use.
+func TestAKeyCheckNeverWaitsForAProjectsRead(t *testing.T) {
 	r := newRig(t)
 	release := make(chan struct{})
 	r.records.mu.Lock()
@@ -321,14 +321,13 @@ func TestAKeyWaitsForAProjectsReadRunning(t *testing.T) {
 	r.concierge.mu.Lock()
 	r.concierge.projectsRead = time.Time{}
 	r.concierge.mu.Unlock()
-	r.concierge.isProject(context.Background(), "ABC", false)
-	go func() {
-		time.Sleep(100 * time.Millisecond)
-		close(release)
-	}()
-	if !r.concierge.isProject(context.Background(), "NEW", true) {
-		t.Fatal("a read with wait answered from the old list while a read of the projects ran")
+	start := time.Now()
+	view := r.concierge.viewProjects()
+	if view.holds("NEW") || !view.holds("ABC") || time.Since(start) > 100*time.Millisecond {
+		t.Fatalf("a check while the read ran took %v or did not answer from the cached list", time.Since(start))
 	}
+	close(release)
+	eventually(t, "the read's list is used", func() bool { return r.concierge.viewProjects().holds("NEW") })
 }
 
 // TestAFastAnswerNamesTheQuestionsKey (c-fast-answer, R8): when the holder

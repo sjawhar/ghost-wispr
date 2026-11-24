@@ -23,23 +23,21 @@ type numberedCandidate struct {
 }
 
 // bareNumberCandidates reads the issues whose number is in turn, across the
-// known Dispatch projects. It issues all reads in parallel under a shared
+// projects of the turn's view. It issues all reads in parallel under a shared
 // deadline and returns the two most recently active, so the person confirms
 // a key rather than the Concierge guessing a project.
-func (c *Concierge) bareNumberCandidates(ctx context.Context, turn string) []candidate {
-	if c.records == nil || strings.HasPrefix(c.readTarget(ctx, turn, true), "keys:") {
+func (c *Concierge) bareNumberCandidates(ctx context.Context, view projectsView, turn string) []candidate {
+	if c.records == nil || strings.HasPrefix(c.readTarget(view, turn), "keys:") {
 		return nil
 	}
 	numbers := slices.Compact(bareIssueNumber.FindAllString(turn, -1))
 	if len(numbers) == 0 {
 		return nil
 	}
-	c.mu.Lock()
-	projects := make([]string, 0, len(c.projects))
-	for project := range c.projects {
+	projects := make([]string, 0, len(view.known))
+	for project := range view.known {
 		projects = append(projects, project)
 	}
-	c.mu.Unlock()
 	sort.Strings(projects)
 	lookupCtx, cancel := context.WithTimeout(ctx, bareNumberLookupBound)
 	defer cancel()

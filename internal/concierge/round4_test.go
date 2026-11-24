@@ -186,7 +186,7 @@ func TestANotFoundOutsideAnIssueReadIsLogged(t *testing.T) {
 func TestAnUnreachableDispatchEndsTheKeyReads(t *testing.T) {
 	r := newRig(t)
 	r.records.err = fmt.Errorf("%w: dial tcp: no route to host", dispatch.ErrUnreachable)
-	r.concierge.readRecord(context.Background(), &r.exchange, r.concierge.readTarget(context.Background(), "what about abc 12 and xyz 34 and def 56", true), nil, nil)
+	r.concierge.readRecord(context.Background(), &r.exchange, r.concierge.readTarget(r.concierge.viewProjects(), "what about abc 12 and xyz 34 and def 56"), nil, nil)
 	// The first key's issue and holder are read side by side: one key, read
 	// once by each.
 	if calls := slices.Compact(r.records.calls()); len(calls) != 1 {

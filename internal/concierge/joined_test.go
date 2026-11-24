@@ -1,7 +1,6 @@
 package concierge
 
 import (
-	"context"
 	"strings"
 	"testing"
 
@@ -43,11 +42,11 @@ func TestAJoinedAgentIsAskedFirst(t *testing.T) {
 // joined on it, or names one with no agent joined on it.
 func TestABareNumberNamesAJoinedAgentsIssue(t *testing.T) {
 	r := newRig(t)
-	if target := r.concierge.readTarget(context.Background(), "ask the 1027 agent what is left", true); strings.HasPrefix(target, "keys:") {
+	if target := r.concierge.readTarget(r.concierge.viewProjects(), "ask the 1027 agent what is left"); strings.HasPrefix(target, "keys:") {
 		t.Fatalf("readTarget = %q with no agent joined, want no key", target)
 	}
 	joinAgent(r, "joined-1", "INFRA-1027")
-	if target := r.concierge.readTarget(context.Background(), "ask the 1027 agent what is left", true); !strings.HasPrefix(target, "keys:INFRA-1027|") {
+	if target := r.concierge.readTarget(r.concierge.viewProjects(), "ask the 1027 agent what is left"); !strings.HasPrefix(target, "keys:INFRA-1027|") {
 		t.Fatalf("readTarget = %q, want the joined agent's INFRA-1027", target)
 	}
 

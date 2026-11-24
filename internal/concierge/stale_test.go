@@ -1,7 +1,6 @@
 package concierge
 
 import (
-	"context"
 	"slices"
 	"strings"
 	"testing"
@@ -145,7 +144,7 @@ func TestEveryFormOfAKeyReadsAsTheKey(t *testing.T) {
 		{"Are we in for five thousand dollars?", ""},
 	} {
 		turn := transcript.WriteKeys(tc.said, projects)
-		target := r.concierge.readTarget(context.Background(), turn, true)
+		target := r.concierge.readTarget(r.concierge.viewProjects(), turn)
 		got := ""
 		if keys, ok := strings.CutPrefix(target, "keys:"); ok {
 			got, _, _ = strings.Cut(keys, "|")

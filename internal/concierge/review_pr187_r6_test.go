@@ -95,20 +95,16 @@ const (
 	projectsRefreshFailed
 	// projectsStale: a list is cached and stale, and the refresh hangs.
 	projectsStale
+	// projectsKnown: the list is read and fresh, as newRig leaves it.
+	projectsKnown
 )
 
-// warmProjects waits for r's Concierge to know Dispatch's projects, as the
-// read New starts brings them in.
-func warmProjects(r *rig) {
-	r.concierge.isProject(context.Background(), "ABC", true)
-}
-
 // readKeys is words as the Concierge reads a turn where it enters (answer,
-// Heard), its project list known: a key said letter by letter written.
+// Heard), its project list known (newRig waits for it): a key said letter by
+// letter written.
 func readKeys(t *testing.T, r *rig, words string) string {
 	t.Helper()
-	warmProjects(r)
-	read, unread := r.concierge.readSpelledKeys(context.Background(), words)
+	read, unread := r.concierge.viewProjects().readSpelledKeys(words)
 	if unread {
 		t.Fatalf("readSpelledKeys(%q): the project list could not tell", words)
 	}
@@ -117,7 +113,6 @@ func readKeys(t *testing.T, r *rig, words string) string {
 
 func (s projectsState) set(t *testing.T, r *rig) {
 	t.Helper()
-	warmProjects(r) // the read New starts ends before the state is set
 	r.records.mu.Lock()
 	switch s {
 	case projectsReadFails:
@@ -144,8 +139,9 @@ func (s projectsState) set(t *testing.T, r *rig) {
 // read as a key only from the cached project list, and answer never waits
 // for a read of it. When the list cannot tell (never read, or its read
 // failed), a run of letters that could be a key is neither rewritten nor
-// searched as words: a reply picks nothing, and the voice asks for the key.
-// A stale list that holds the project still reads it, at once.
+// searched as words: a reply picks nothing, and the room hears that Dispatch
+// is out of reach (since the outage wording of the PR after #187). A stale
+// list that holds the project still reads it, at once.
 func TestReview187R6ASpelledKeyFailsClosed(t *testing.T) {
 	for _, tc := range []struct {
 		name  string
@@ -153,11 +149,11 @@ func TestReview187R6ASpelledKeyFailsClosed(t *testing.T) {
 		reply string
 		want  string // the first line spoken
 	}{
-		{"a Records failure, a reply", projectsReadFails, "A B C thirteen", noIssueFound},
-		{"a Records failure, a question", projectsReadFails, "what is happening with A B C thirteen", noIssueFound},
-		{"an empty cache, a reply", projectsNeverRead, "A B C thirteen", noIssueFound},
-		{"an empty cache, a question", projectsNeverRead, "what is happening with A B C thirteen", noIssueFound},
-		{"a failed refresh of a cached list", projectsRefreshFailed, "A B C thirteen", noIssueFound},
+		{"a Records failure, a reply", projectsReadFails, "A B C thirteen", cannotReachDispatch},
+		{"a Records failure, a question", projectsReadFails, "what is happening with A B C thirteen", cannotReachDispatch},
+		{"an empty cache, a reply", projectsNeverRead, "A B C thirteen", cannotReachDispatch},
+		{"an empty cache, a question", projectsNeverRead, "what is happening with A B C thirteen", cannotReachDispatch},
+		{"a failed refresh of a cached list", projectsRefreshFailed, "A B C thirteen", cannotReachDispatch},
 		{"control: a stale list that holds the project", projectsStale, "A B C thirteen", "Reading ABC-13."},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -181,9 +177,9 @@ func TestReview187R6ASpelledKeyFailsClosed(t *testing.T) {
 			r.agents.mu.Lock()
 			sent := len(r.agents.sent)
 			r.agents.mu.Unlock()
-			if tc.want == noIssueFound {
-				if len(spoken) != 1 || spoken[0].text != noIssueFound {
-					t.Errorf("spoken %+v, want only %q", spoken, noIssueFound)
+			if tc.want == cannotReachDispatch {
+				if len(spoken) != 1 || spoken[0].text != cannotReachDispatch {
+					t.Errorf("spoken %+v, want only %q", spoken, cannotReachDispatch)
 				}
 				if searched != 0 || sent != 0 || r.exchange.IssueKey != "" {
 					t.Errorf("searched %d times, sent %d, took %q; want nothing", searched, sent, r.exchange.IssueKey)
