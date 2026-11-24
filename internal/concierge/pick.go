@@ -45,15 +45,13 @@ func (c *Concierge) offerPick(x *voice.Exchange, turn string, candidates []candi
 	c.picks[wakeKey(x)] = offeredPick{at: now, sessionID: x.SessionID, turn: turn, candidates: candidates}
 }
 
-// takePick reads turn as a pick of the issues x's last answer offered: by
-// key, when the reply is the key alone or with "please" or "that one", by
-// place ("the first one", "the other"), or by words of exactly one offered
-// title ("the wake word one"). Of one issue offered, only a whole reply that
-// confirms picks it: a yes form or its key; a no picks none, whatever was
-// offered (replyTo). Side talk, a question or a new question that names the
-// key picks nothing. It returns the question first asked and the picked key.
-// Either way the offer is used up: a turn that picks nothing is a question
-// of its own.
+// takePick reads turn as a reply to the issues x's last answer offered. A
+// whole no ("no", "nope, not that one") picks none. Any other reply that is
+// no confirmation (confirms: a question mark, a question word or a negation)
+// is a new question, whatever key, place or title it names. A confirmation
+// picks the issue it names (pickIn). It returns the question first asked and
+// the picked key. Either way the offer is used up: a turn that picks nothing
+// is a question of its own.
 func (c *Concierge) takePick(x *voice.Exchange, turn string) (asked, key string, ok bool) {
 	c.mu.Lock()
 	p, offered := c.picks[wakeKey(x)]
@@ -62,68 +60,24 @@ func (c *Concierge) takePick(x *voice.Exchange, turn string) (asked, key string,
 	if !offered {
 		return "", "", false
 	}
-	kind := replyTo(turn)
-	if kind == "no" {
+	switch {
+	case declines(turn):
 		return p.turn, "", true
-	}
-	if len(p.candidates) == 1 {
-		switch {
-		case kind == "yes":
-			return p.turn, p.candidates[0].key, true
-		case kind == "key" && slices.Contains(issueKeysIn(turn), p.candidates[0].key):
-			return p.turn, p.candidates[0].key, true
-		}
-		return p.turn, "", false
-	}
-	if kind == "key" {
-		for _, named := range issueKeysIn(turn) {
-			for _, candidate := range p.candidates {
-				if candidate.key == named {
-					return p.turn, named, true
-				}
-			}
-		}
-	}
-	for _, word := range strings.FieldsFunc(strings.ToLower(turn), func(r rune) bool { return !strings.ContainsRune("abcdefghijklmnopqrstuvwxyz0123456789", r) }) {
-		if place, ok := pickWords[word]; ok && place < len(p.candidates) {
-			return p.turn, p.candidates[place].key, true
-		}
-	}
-	said := set(strings.Fields(workWords(turn)))
-	// Words every offered title holds tell them apart no better than none.
-	for word := range said {
-		shared := true
-		for _, candidate := range p.candidates {
-			if !set(strings.Fields(workWords(candidate.title)))[word] {
-				shared = false
-				break
-			}
-		}
-		if shared {
-			delete(said, word)
-		}
-	}
-	picked := ""
-	for _, candidate := range p.candidates {
-		for _, word := range strings.Fields(workWords(candidate.title)) {
-			if said[word] {
-				if picked != "" {
-					return "", "", false // words of both titles
-				}
-				picked = candidate.key
-				break
-			}
-		}
-	}
-	if picked == "" {
+	case !confirms(turn):
 		return "", "", false
 	}
-	return p.turn, picked, true
+	if picked := pickIn(p.candidates, turn); picked != "" {
+		return p.turn, picked, true
+	}
+	return "", "", false
 }
 
 var (
 	// replyFillers may begin a reply: "uh, yes".
 	replyFillers = set(strings.Fields("uh um oh well hmm mm"))
+	// negations make a reply no confirmation, as does any word that ends
+	// in "n't".
+	negations = set(strings.Fields("no not nope nah never neither nor none cannot"))
 	// yesWords may begin a yes, and yesTails follow one: "yes", "yeah,
 	// that one", "sure, that's it".
 	yesWords = set(strings.Fields("yes yeah yea yep yup sure correct right exactly ok okay"))
@@ -135,21 +89,14 @@ var (
 	noWords   = set(strings.Fields("no nope nah"))
 	noTails   = set([]string{"", "not", "not that", "not that one", "not this one", "thanks", "thank you", "neither"})
 	noPhrases = set([]string{"not that one", "not this one", "neither", "neither one"})
-	// keyTails may follow an issue key that picks it: "ABC-12, please".
+	// keyTails may follow an issue key that picks it alone: "ABC-12,
+	// please".
 	keyTails = set([]string{"", "please", "that one", "the one", "yes", "yes please"})
 )
 
-// replyTo reads turn as a whole reply to "Did you mean …?": "yes", "no", or
-// "key" when it is an issue key alone or with "please" or "that one". Words
-// a reply begins with ("uh") do not count. Anything else is "", a new
-// question: a question mark, a number or any other word makes it one, so
-// "Is that right?", "That's 100, right." and "What is blocking ABC-12" are
-// questions, and "No, not ABC-12." is a no.
-func replyTo(turn string) string {
-	if strings.Contains(turn, "?") {
-		return ""
-	}
-	keyed := len(issueKeysIn(turn)) > 0
+// replyWords are turn's words, lower case, its issue keys and the fillers it
+// begins with left out; an apostrophe stays in its word ("that's").
+func replyWords(turn string) []string {
 	rest := spokenKey.ReplaceAllString(spokenKeys(turn), " ")
 	words := strings.FieldsFunc(strings.ToLower(strings.ReplaceAll(rest, "’", "'")), func(r rune) bool {
 		return !unicode.IsLetter(r) && !unicode.IsDigit(r) && r != '\''
@@ -157,22 +104,118 @@ func replyTo(turn string) string {
 	for len(words) > 0 && replyFillers[words[0]] {
 		words = words[1:]
 	}
-	if len(words) == 0 {
-		if keyed {
-			return "key"
+	return words
+}
+
+// declines reports whether turn is a whole no: "no", "nope, not that one",
+// "no, not ABC-12", "neither".
+func declines(turn string) bool {
+	words := replyWords(turn)
+	if strings.Contains(turn, "?") || len(words) == 0 {
+		return false
+	}
+	return noWords[words[0]] && noTails[strings.Join(words[1:], " ")] || noPhrases[strings.Join(words, " ")]
+}
+
+// confirms reports whether turn may confirm an offered issue: it holds no
+// question mark, no question word or auxiliary verb a question puts first
+// (questionWords, auxiliaries; "what's" is "what"), and no negation
+// (negations, or a word that ends in "n't"). Every way a reply picks an
+// issue (pickIn) runs only behind it.
+func confirms(turn string) bool {
+	if strings.Contains(turn, "?") {
+		return false
+	}
+	for _, word := range replyWords(turn) {
+		base, _, _ := strings.Cut(word, "'")
+		if questionWords[base] || auxiliaries[base] || base == "am" || negations[base] || strings.HasSuffix(word, "n't") {
+			return false
+		}
+	}
+	return true
+}
+
+// pickIn is the offered issue a confirmation names, or "": every cue in it
+// must name the same one. Its key picks alone or with "please" or "that one"
+// (keyTails), or with a place or title that names the same issue; a key not
+// offered picks none. Of one issue offered, a yes form picks it too
+// ("yeah, that one", "the first one"). Of two, so does its place ("the
+// first one", "the other") or words of its title and not the other's ("the
+// wake word one").
+func pickIn(candidates []candidate, turn string) string {
+	words := replyWords(turn)
+	phrase := strings.Join(words, " ")
+	keyed := ""
+	for _, named := range issueKeysIn(turn) {
+		if !slices.ContainsFunc(candidates, func(c candidate) bool { return c.key == named }) || (keyed != "" && keyed != named) {
+			return ""
+		}
+		keyed = named
+	}
+	if keyed != "" && keyTails[phrase] {
+		return keyed
+	}
+	if len(candidates) == 1 {
+		if keyed == "" && (yesWords[firstOf(words)] && yesTails[strings.Join(words[min(1, len(words)):], " ")] || yesPhrases[phrase]) {
+			return candidates[0].key
 		}
 		return ""
 	}
-	phrase, first, after := strings.Join(words, " "), words[0], strings.Join(words[1:], " ")
-	switch {
-	case noWords[first] && noTails[after], noPhrases[phrase]:
-		return "no"
-	case keyed && keyTails[phrase]:
-		return "key"
-	case keyed:
+	cue := placeOrTitle(candidates, words)
+	if cue == "" || (keyed != "" && keyed != cue) {
 		return ""
-	case yesWords[first] && yesTails[after], yesPhrases[phrase]:
-		return "yes"
 	}
-	return ""
+	return cue
+}
+
+// firstOf is words' first word, or "".
+func firstOf(words []string) string {
+	if len(words) == 0 {
+		return ""
+	}
+	return words[0]
+}
+
+// placeOrTitle is the one of two or more offered issues that words name by
+// its place (pickWords) or by words its title holds and no other offered
+// title does, or "" when they name none or more than one.
+func placeOrTitle(candidates []candidate, words []string) string {
+	picked := ""
+	pick := func(key string) bool {
+		if picked != "" && picked != key {
+			return false
+		}
+		picked = key
+		return true
+	}
+	for _, word := range words {
+		if place, ok := pickWords[word]; ok && place < len(candidates) && !pick(candidates[place].key) {
+			return ""
+		}
+	}
+	said := set(strings.Fields(workWords(strings.Join(words, " "))))
+	// Words every offered title holds tell them apart no better than none.
+	for word := range said {
+		shared := true
+		for _, candidate := range candidates {
+			if !set(strings.Fields(workWords(candidate.title)))[word] {
+				shared = false
+				break
+			}
+		}
+		if shared {
+			delete(said, word)
+		}
+	}
+	for _, candidate := range candidates {
+		for _, word := range strings.Fields(workWords(candidate.title)) {
+			if said[word] {
+				if !pick(candidate.key) {
+					return ""
+				}
+				break
+			}
+		}
+	}
+	return picked
 }

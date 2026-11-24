@@ -395,44 +395,37 @@ func (c *Concierge) fallback(hits []dispatch.SearchHit, terms string) map[string
 }
 
 // titled reports whether title holds a word of terms: one of its words, with
-// a hyphen apart ("Parser-evals"), is that word or its regular plural,
-// either way (singular). A stopword or a word under three letters, on either
-// side, holds nothing: "us" is no "uses".
+// a hyphen apart ("Parser-evals"), and a searched word are one (wordsMatch).
 func titled(title, terms string) bool {
-	counts := func(word string) bool { return utf8.RuneCountInString(word) >= 3 && !searchStopwords[word] }
-	searched := map[string]bool{}
-	for _, term := range strings.Fields(strings.ToLower(terms)) {
-		if counts(term) {
-			searched[singular(term)] = true
-		}
-	}
+	searched := strings.Fields(strings.ToLower(terms))
 	for _, word := range strings.FieldsFunc(strings.ToLower(title), func(r rune) bool { return !unicode.IsLetter(r) && !unicode.IsDigit(r) }) {
-		if counts(word) && searched[singular(word)] {
-			return true
+		for _, term := range searched {
+			if wordsMatch(word, term) {
+				return true
+			}
 		}
 	}
 	return false
 }
 
-// singular is a word's regular singular, so that a word and its plural read
-// as one: "policies" is "policy", "boxes" "box", "matches" "match", "uses"
-// "use", "evals" "eval". A word that is no regular plural, "class" or
-// "xv6", comes back as it was.
-func singular(word string) string {
-	switch {
-	case len(word) > 4 && strings.HasSuffix(word, "ies"):
-		return word[:len(word)-3] + "y"
-	case len(word) > 4 && strings.HasSuffix(word, "es"):
-		for _, stem := range []string{"ss", "x", "z", "ch", "sh"} {
-			if strings.HasSuffix(word[:len(word)-2], stem) {
-				return word[:len(word)-2]
-			}
-		}
+// wordsMatch reports whether a and b are one word: equal, or one is the
+// other plus "s" or "es", or, for a word that ends in a consonant and "y",
+// with "ies" for the "y"; either way round. A stopword or a word under three
+// letters matches nothing: "us" is no "uses".
+func wordsMatch(a, b string) bool {
+	counts := func(word string) bool { return utf8.RuneCountInString(word) >= 3 && !searchStopwords[word] }
+	return counts(a) && counts(b) && (a == b || pluralOf(a, b) || pluralOf(b, a))
+}
+
+// pluralOf reports whether plural is word's regular plural: word plus "s"
+// or "es" ("bus", "buses"; "cookie", "cookies"), or, after a consonant,
+// word's "y" made "ies" ("policy", "policies").
+func pluralOf(word, plural string) bool {
+	if rest, ok := strings.CutPrefix(plural, word); ok && (rest == "s" || rest == "es") {
+		return true
 	}
-	if len(word) > 3 && strings.HasSuffix(word, "s") && !strings.HasSuffix(word, "ss") {
-		return word[:len(word)-1]
-	}
-	return word
+	stem, ok := strings.CutSuffix(word, "y")
+	return ok && stem != "" && !strings.ContainsRune("aeiouy", rune(stem[len(stem)-1])) && plural == stem+"ies"
 }
 
 // issuesOf is a search's issues, best first and once each, at most five,
