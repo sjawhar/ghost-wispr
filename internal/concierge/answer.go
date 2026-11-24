@@ -172,6 +172,9 @@ func (c *Concierge) answer(parent context.Context, x *voice.Exchange, turn strin
 	start := time.Now()
 	ctx, cancel := context.WithTimeout(parent, c.fastBound)
 	defer cancel()
+	// A key said letter by letter is read once, here, so the pick, the
+	// routing line, the search and the ask all see it.
+	turn = c.readSpelledKeys(ctx, turn, true)
 	// A turn that picks one of the issues the last answer offered answers
 	// the question first asked, about that issue (R5).
 	target := ""

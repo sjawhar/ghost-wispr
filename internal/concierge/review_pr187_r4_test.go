@@ -1,6 +1,7 @@
 package concierge
 
 import (
+	"context"
 	"slices"
 	"strings"
 	"testing"
@@ -180,7 +181,8 @@ func TestReview187R4SelectionMatrix(t *testing.T) {
 	} {
 		r := newRig(t)
 		r.concierge.offerPick(&r.exchange, twoOfferedTurn, tc.candidates)
-		_, key, ok := r.concierge.takePick(&r.exchange, tc.reply)
+		// As answer reads a turn: a key said letter by letter first.
+		_, key, ok := r.concierge.takePick(&r.exchange, r.concierge.readSpelledKeys(context.Background(), tc.reply, true))
 		if key != tc.key || ok != tc.ok {
 			t.Errorf("takePick(%q) of %d offered = %q, %v; want %q, %v", tc.reply, len(tc.candidates), key, ok, tc.key, tc.ok)
 		}
@@ -189,18 +191,22 @@ func TestReview187R4SelectionMatrix(t *testing.T) {
 
 // TestReview187R4ASpelledProjectIsAKey (Sol's I): a key whose project is
 // said letter by letter, as the voice now says one ("A B C thirteen"), is
-// that key; spelled letters that make no key stay as they were.
+// that key when Dispatch knows the project (round 5); spelled letters that
+// make no key stay as they were.
 func TestReview187R4ASpelledProjectIsAKey(t *testing.T) {
+	r := newRig(t) // Dispatch knows ABC, XYZ, DEF and INFRA.
+	ctx := context.Background()
 	for in, want := range map[string][]string{
 		"A B C thirteen":                          {"ABC-13"},
 		"A B C forty-five ninety-two":             {"ABC-4592"},
-		"what changed on A R S T fifteen hundred": {"ARST-1500"},
+		"what changed on D E F fifteen hundred":   {"DEF-1500"},
 		"A. B. C. 12":                             {"ABC-12"},
+		"what changed on A R S T fifteen hundred": nil,
 		"X V six evals":                           nil,
 		"X V 6 evals":                             nil,
 		"a b testing":                             nil,
 	} {
-		if got := issueKeysIn(in); !slices.Equal(got, want) {
+		if got := issueKeysIn(r.concierge.readSpelledKeys(ctx, in, true)); !slices.Equal(got, want) {
 			t.Errorf("issueKeysIn(%q) = %q, want %q", in, got, want)
 		}
 	}
@@ -209,7 +215,7 @@ func TestReview187R4ASpelledProjectIsAKey(t *testing.T) {
 		"what's happening with X V 6 evals?":   "xv6 evals",
 		"what's happening with A B C thirteen": "",
 	} {
-		if got := searchTerms(in); got != want {
+		if got := searchTerms(r.concierge.readSpelledKeys(ctx, in, true)); got != want {
 			t.Errorf("searchTerms(%q) = %q, want %q", in, got, want)
 		}
 	}
