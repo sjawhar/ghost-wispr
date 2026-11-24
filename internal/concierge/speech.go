@@ -247,25 +247,29 @@ func sayLastPair(pair string) string {
 	return sayPair(pair)
 }
 
-// workWords is the words of text that name work, at most maxSearchTerms.
+// workWords is the words of text that name work, at most maxSearchTerms: the
+// words a search takes.
 func workWords(text string) string {
-	var terms []string
+	words := namingWords(text)
+	return strings.Join(words[:min(len(words), maxSearchTerms)], " ")
+}
+
+// namingWords is every word of text that names work, once each, in order: a
+// spelled-out name as one word, an issue key left out, no stopword and no
+// word under three letters.
+func namingWords(text string) []string {
+	var words []string
 	seen := map[string]bool{}
-	add := func(term string) {
-		if len(terms) < maxSearchTerms && !seen[term] {
-			seen[term] = true
-			terms = append(terms, term)
-		}
-	}
 	rest := compound.ReplaceAllString(spokenKey.ReplaceAllString(spokenKeys(spelledOut(text)), " "), "realtime")
 	for _, word := range strings.FieldsFunc(strings.ToLower(rest), func(r rune) bool {
 		return !unicode.IsLetter(r) && !unicode.IsDigit(r) && r != '\''
 	}) {
 		word = strings.Trim(strings.TrimSuffix(word, "'s"), "'")
-		if len([]rune(word)) < 3 || searchStopwords[word] || strings.IndexFunc(word, unicode.IsLetter) < 0 {
+		if len([]rune(word)) < 3 || searchStopwords[word] || strings.IndexFunc(word, unicode.IsLetter) < 0 || seen[word] {
 			continue
 		}
-		add(word)
+		seen[word] = true
+		words = append(words, word)
 	}
-	return strings.Join(terms, " ")
+	return words
 }

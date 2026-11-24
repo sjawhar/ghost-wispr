@@ -137,11 +137,10 @@ func confirms(turn string) bool {
 
 // pickIn is the offered issue a confirmation names, or "": every cue in it
 // must name the same one. Its key picks alone or with "please" or "that one"
-// (keyTails), or with a place or title that names the same issue; a key not
-// offered picks none. Of one issue offered, a yes form picks it too
-// ("yeah, that one", "the first one"). Of two, so does its place ("the
-// first one", "the other") or words of its title and not the other's ("the
-// wake word one").
+// (keyTails); a key not offered picks none. Its place ("the first one", "the
+// other") or words of one offered title and no other's ("the wake word one")
+// pick it, however many were offered, and so does its key with either. Of one
+// issue offered, a yes form picks it too ("yes", "yeah, that one").
 func pickIn(candidates []candidate, turn string) string {
 	words := replyWords(turn)
 	phrase := strings.Join(words, " ")
@@ -155,17 +154,16 @@ func pickIn(candidates []candidate, turn string) string {
 	if keyed != "" && keyTails[phrase] {
 		return keyed
 	}
-	if len(candidates) == 1 {
-		if keyed == "" && (yesWords[firstOf(words)] && yesTails[strings.Join(words[min(1, len(words)):], " ")] || yesPhrases[phrase]) {
-			return candidates[0].key
-		}
+	cue, conflict := placeOrTitle(candidates, words)
+	switch {
+	case conflict, cue != "" && keyed != "" && keyed != cue:
 		return ""
+	case cue != "":
+		return cue
+	case len(candidates) == 1 && keyed == "" && (yesWords[firstOf(words)] && yesTails[strings.Join(words[min(1, len(words)):], " ")] || yesPhrases[phrase]):
+		return candidates[0].key
 	}
-	cue := placeOrTitle(candidates, words)
-	if cue == "" || (keyed != "" && keyed != cue) {
-		return ""
-	}
-	return cue
+	return ""
 }
 
 // firstOf is words' first word, or "".
@@ -176,46 +174,46 @@ func firstOf(words []string) string {
 	return words[0]
 }
 
-// placeOrTitle is the one of two or more offered issues that words name by
-// its place (pickWords) or by words its title holds and no other offered
-// title does, or "" when they name none or more than one.
-func placeOrTitle(candidates []candidate, words []string) string {
-	picked := ""
-	pick := func(key string) bool {
-		if picked != "" && picked != key {
+// placeOrTitle is the offered issue words name by its place (pickWords) or
+// by words its title holds and no other offered title does, reading every
+// word of both (namingWords), not the few a search takes; "" when they name
+// none. conflict says they name more than one, or a place past the offered
+// issues ("the second one" of one).
+func placeOrTitle(candidates []candidate, words []string) (key string, conflict bool) {
+	pick := func(named string) bool {
+		if key != "" && key != named {
+			conflict = true
 			return false
 		}
-		picked = key
+		key = named
 		return true
 	}
 	for _, word := range words {
-		if place, ok := pickWords[word]; ok && place < len(candidates) && !pick(candidates[place].key) {
-			return ""
+		place, ok := pickWords[word]
+		if !ok {
+			continue
+		}
+		if place >= len(candidates) || !pick(candidates[place].key) {
+			return "", true
 		}
 	}
-	said := set(strings.Fields(workWords(strings.Join(words, " "))))
-	// Words every offered title holds tell them apart no better than none.
-	for word := range said {
-		shared := true
-		for _, candidate := range candidates {
-			if !set(strings.Fields(workWords(candidate.title)))[word] {
-				shared = false
-				break
+	said := set(namingWords(strings.Join(words, " ")))
+	titles := make([]map[string]bool, len(candidates))
+	for i, candidate := range candidates {
+		titles[i] = set(namingWords(candidate.title))
+	}
+	for i, candidate := range candidates {
+		for word := range said {
+			// A word every offered title holds tells two apart no better
+			// than none; of one offered, every word of its title names it.
+			if !titles[i][word] || (len(candidates) > 1 && !slices.ContainsFunc(titles, func(title map[string]bool) bool { return !title[word] })) {
+				continue
 			}
-		}
-		if shared {
-			delete(said, word)
-		}
-	}
-	for _, candidate := range candidates {
-		for _, word := range strings.Fields(workWords(candidate.title)) {
-			if said[word] {
-				if !pick(candidate.key) {
-					return ""
-				}
-				break
+			if !pick(candidate.key) {
+				return "", true
 			}
+			break
 		}
 	}
-	return picked
+	return key, false
 }
