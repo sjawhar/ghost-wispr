@@ -1,6 +1,7 @@
 package concierge
 
 import (
+	"slices"
 	"strings"
 	"time"
 
@@ -45,9 +46,11 @@ func (c *Concierge) offerPick(x *voice.Exchange, turn string, candidates []candi
 
 // takePick reads turn as a pick of the issues x's last answer offered: by
 // key ("ABC 13"), by place ("the first one", "the other"), or by words of
-// exactly one offered title ("the wake word one"). It returns the question
-// first asked and the picked key. Either way the offer is used up: a turn
-// that picks nothing is a question of its own.
+// exactly one offered title ("the wake word one"). Of one issue offered, only
+// a yes or its key picks it, and a no picks none (yesOrNo): side talk such as
+// "the first item is rent" picks nothing. It returns the question first
+// asked and the picked key. Either way the offer is used up: a turn that
+// picks nothing is a question of its own.
 func (c *Concierge) takePick(x *voice.Exchange, turn string) (asked, key string, ok bool) {
 	c.mu.Lock()
 	p, offered := c.picks[wakeKey(x)]
@@ -57,12 +60,14 @@ func (c *Concierge) takePick(x *voice.Exchange, turn string) (asked, key string,
 		return "", "", false
 	}
 	if len(p.candidates) == 1 {
-		words := strings.FieldsFunc(strings.ToLower(turn), func(r rune) bool { return !strings.ContainsRune("abcdefghijklmnopqrstuvwxyz", r) })
-		if len(words) == 1 && words[0] == "yes" {
+		switch yesOrNo(turn) {
+		case "yes":
 			return p.turn, p.candidates[0].key, true
-		}
-		if len(words) == 1 && words[0] == "no" {
+		case "no":
 			return p.turn, "", true
+		}
+		if slices.Contains(issueKeysIn(turn), p.candidates[0].key) {
+			return p.turn, p.candidates[0].key, true
 		}
 		return p.turn, "", false
 	}
@@ -108,4 +113,36 @@ func (c *Concierge) takePick(x *voice.Exchange, turn string) (asked, key string,
 		return "", "", false
 	}
 	return p.turn, picked, true
+}
+
+var (
+	// yesWords and noWords answer "Did you mean KEY?"; replyWords may go
+	// with either ("yeah, that one", "nope, not that one").
+	yesWords   = set(strings.Fields("yes yeah yea yep yup sure correct right exactly ok okay"))
+	noWords    = set(strings.Fields("no nope nah neither not"))
+	replyWords = set(strings.Fields("that this one it is s the please uh um mm hmm oh i mean meant thanks thank you"))
+)
+
+// yesOrNo reads turn as a reply to a question about one issue: "yes" when it
+// says yes and nothing but words that go with a reply, "no" likewise for no,
+// else "".
+func yesOrNo(turn string) string {
+	yes, no := false, false
+	for _, word := range strings.FieldsFunc(strings.ToLower(turn), func(r rune) bool { return r < 'a' || r > 'z' }) {
+		switch {
+		case yesWords[word]:
+			yes = true
+		case noWords[word]:
+			no = true
+		case !replyWords[word]:
+			return ""
+		}
+	}
+	switch {
+	case yes && !no:
+		return "yes"
+	case no && !yes:
+		return "no"
+	}
+	return ""
 }

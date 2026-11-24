@@ -30,6 +30,13 @@ func TestTheKeywordFallbackOffersOnlyIssuesItsTitleNames(t *testing.T) {
 		{"two titles hold the words", []dispatch.SearchHit{contracts, stateFile, answers, roadmap}, "Did you mean A B C forty-one, or A B C forty-two?"},
 		{"one title holds them", []dispatch.SearchHit{contracts, stateFile, roadmap}, "Did you mean A B C forty-one?"},
 		{"no title holds them", []dispatch.SearchHit{stateFile, roadmap}, noIssueFound},
+		{"the only title that holds them is past the fifth issue", []dispatch.SearchHit{
+			stateFile, roadmap,
+			{Kind: "issue", IssueKey: "ABC-1", Title: "Budget", Score: 0.01},
+			{Kind: "issue", IssueKey: "ABC-2", Title: "Hiring", Score: 0.0099},
+			{Kind: "issue", IssueKey: "ABC-3", Title: "Lights", Score: 0.0098},
+			{Kind: "issue", IssueKey: "ABC-41", Title: "Parser eval contracts", Score: 0.0097},
+		}, "Did you mean A B C forty-one?"},
 	} {
 		for _, fallback := range []string{"the full search missed its mark", "the full search failed"} {
 			t.Run(tc.name+", "+fallback, func(t *testing.T) {
@@ -65,22 +72,39 @@ func TestTheKeywordFallbackOffersOnlyIssuesItsTitleNames(t *testing.T) {
 }
 
 // TestAPickOfTheOneIssueOfferedAnswersTheQuestion (R5): a keyword fallback
-// that offered one issue takes a yes as that issue, and answers the question
-// first asked about it.
+// that offered one issue takes a yes, said as people say one, or the issue's
+// key, as that issue, for the question first asked; a no as no pick; and
+// anything else, such as side talk with "first" in it, as a question of its
+// own. Live, "Yeah, that one." was searched as a question.
 func TestAPickOfTheOneIssueOfferedAnswersTheQuestion(t *testing.T) {
-	r := newRig(t)
-	r.concierge.fullWait = 200 * time.Millisecond
-	r.records.searchDelay = time.Hour
-	r.records.issues["ABC-41"] = &dispatch.Issue{Key: "ABC-41", Title: "Parser eval contracts", Status: "in_review", UpdatedAt: testNow}
-	r.records.kwHits = []dispatch.SearchHit{
-		{Kind: "issue", IssueKey: "ABC-41", Title: "Parser eval contracts", Score: 0.0104},
-		{Kind: "document", IssueKey: "ABC-7", Title: "Team state file", Score: 0.0102},
-	}
-	if spoken := answerTurn(t, r, "what is happening with the parser evals"); len(spoken) != 1 || spoken[0].text != "Did you mean A B C forty-one?" {
-		t.Fatalf("spoken = %+v, want the one issue offered", spoken)
-	}
-	asked, key, ok := r.concierge.takePick(&r.exchange, "yes")
-	if !ok || key != "ABC-41" || asked != "what is happening with the parser evals" {
-		t.Fatalf("takePick(yes) = %q, %q, %v; want ABC-41 for the question first asked", asked, key, ok)
+	for reply, want := range map[string]struct {
+		key string
+		ok  bool
+	}{
+		"yes":                  {"ABC-41", true},
+		"Yeah, that one.":      {"ABC-41", true},
+		"Yep.":                 {"ABC-41", true},
+		"Sure, that's it.":     {"ABC-41", true},
+		"ABC-41, please":       {"ABC-41", true},
+		"the first one":        {"", false},
+		"no":                   {"", true},
+		"Nope, not that one.":  {"", true},
+		"what about the tests": {"", false},
+		"yes and no":           {"", false},
+	} {
+		r := newRig(t)
+		r.concierge.fullWait = 200 * time.Millisecond
+		r.records.searchDelay = time.Hour
+		r.records.kwHits = []dispatch.SearchHit{
+			{Kind: "issue", IssueKey: "ABC-41", Title: "Parser eval contracts", Score: 0.0104},
+			{Kind: "document", IssueKey: "ABC-7", Title: "Team state file", Score: 0.0102},
+		}
+		if spoken := answerTurn(t, r, "what is happening with the parser evals"); len(spoken) != 1 || spoken[0].text != "Did you mean A B C forty-one?" {
+			t.Fatalf("spoken = %+v, want the one issue offered", spoken)
+		}
+		asked, key, ok := r.concierge.takePick(&r.exchange, reply)
+		if key != want.key || ok != want.ok || (ok && asked != "what is happening with the parser evals") {
+			t.Errorf("takePick(%q) = %q, %q, %v; want key %q, ok %v, for the question first asked", reply, asked, key, ok, want.key, want.ok)
+		}
 	}
 }

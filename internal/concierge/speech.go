@@ -76,54 +76,80 @@ func searchTerms(words string) string {
 // titles write one: "real time" and "real-time" are "realtime".
 var compound = regexp.MustCompile(`(?i)\breal[- ]time\b`)
 
-// spelledChar is what one spoken character of a name spelled out may be
-// written as: a letter alone (not "a" or "i", which are words), a letter's
-// name that is no common word, a digit, or a digit's word.
-const spelledChar = `(?:[b-hj-z]|ex|vee|bee|cee|dee|ef|eff|gee|aitch|jay|kay|el|ell|em|en|pee|cue|ess|tee|wye|zed|zee|[0-9]|zero|one|two|three|four|five|six|seven|eight|nine)`
-
-// spelledRun finds a name spelled out, as Deepgram writes a name said letter
-// by letter: two or more spoken characters apart by spaces or hyphens ("ex v
-// six", "x v 6", "ex-v-six").
-var spelledRun = regexp.MustCompile(`(?i)\b` + spelledChar + `(?:[ -]+` + spelledChar + `)+\b`)
-
-// spelledLetters are the spoken characters that are letters: a letter alone
-// is itself; a letter's name is its letter.
+// spelledLetters are the words a name spelled out writes for a letter: the
+// letter alone, except "a" and "i", which are words, and a letter's name
+// that is no common word.
 var spelledLetters = map[string]string{
 	"ex": "x", "vee": "v", "bee": "b", "cee": "c", "dee": "d", "ef": "f", "eff": "f", "gee": "g", "aitch": "h",
 	"jay": "j", "kay": "k", "el": "l", "ell": "l", "em": "m", "en": "n", "pee": "p", "cue": "q", "ess": "s",
 	"tee": "t", "wye": "y", "zed": "z", "zee": "z",
 }
 
-// spelledDigits are the spoken characters that are digits' words.
+func init() {
+	for letter := 'b'; letter <= 'z'; letter++ {
+		if letter != 'i' {
+			spelledLetters[string(letter)] = string(letter)
+		}
+	}
+}
+
+// spelledDigits are the words a name spelled out writes for a digit.
 var spelledDigits = map[string]string{
 	"zero": "0", "one": "1", "two": "2", "three": "3", "four": "4", "five": "5", "six": "6", "seven": "7", "eight": "8", "nine": "9",
+	"0": "0", "1": "1", "2": "2", "3": "3", "4": "4", "5": "5", "6": "6", "7": "7", "8": "8", "9": "9",
 }
 
 // spelledOut writes each name spelled out in text as the one word it spells
 // ("the ex v six port" is "the xv6 port"), so the search gets the name, not
-// letters too short to search or a digit's word. A run of digits alone ("one
-// two") spells no name and stays as it was.
+// letters too short to search or a digit's word. A name spelled out, as
+// Deepgram writes one said letter by letter, is two or more whole words in a
+// row, apart by spaces or hyphens, each a letter or a digit as spoken
+// (spelledLetters, spelledDigits), at least one of them a letter. A comma or
+// a full stop ends it. Words of a run of digits alone ("one two") and part
+// of a word ("what's one") stay as they were.
 func spelledOut(text string) string {
-	return spelledRun.ReplaceAllStringFunc(text, func(run string) string {
-		var word strings.Builder
-		letters := false
-		for _, char := range strings.FieldsFunc(strings.ToLower(run), func(r rune) bool { return r == ' ' || r == '-' }) {
-			switch {
-			case spelledDigits[char] != "":
-				word.WriteString(spelledDigits[char])
-			case spelledLetters[char] != "":
-				word.WriteString(spelledLetters[char])
+	fields := strings.Fields(text)
+	out := make([]string, 0, len(fields))
+	var spelled strings.Builder
+	var from []string // the words of the run under way, as written
+	chars, letters := 0, false
+	end := func(tail string) {
+		if chars >= 2 && letters {
+			out = append(out, spelled.String()+tail)
+		} else {
+			out = append(out, from...)
+		}
+		spelled.Reset()
+		from, chars, letters = from[:0], 0, false
+	}
+	for _, field := range fields {
+		word := strings.TrimRight(field, ",.;:!?")
+		parts := strings.Split(strings.ToLower(word), "-")
+		ok := word != ""
+		for _, part := range parts {
+			ok = ok && (spelledLetters[part] != "" || spelledDigits[part] != "")
+		}
+		if !ok {
+			end("")
+			out = append(out, field)
+			continue
+		}
+		for _, part := range parts {
+			if letter := spelledLetters[part]; letter != "" {
+				spelled.WriteString(letter)
 				letters = true
-			default:
-				word.WriteString(char)
-				letters = letters || unicode.IsLetter(rune(char[0]))
+			} else {
+				spelled.WriteString(spelledDigits[part])
 			}
+			chars++
 		}
-		if !letters {
-			return run
+		from = append(from, field)
+		if tail := field[len(word):]; tail != "" {
+			end(tail)
 		}
-		return word.String()
-	})
+	}
+	end("")
+	return strings.Join(out, " ")
 }
 
 // sayKey is an issue key as people say one, for the voice: its project as a

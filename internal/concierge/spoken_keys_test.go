@@ -15,11 +15,15 @@ func TestASpelledOutNameIsSearchedAsOneWord(t *testing.T) {
 		"what's happening with the ex-v-six port?": "xv6 port",
 		"what's happening with the XV6 port?":      "xv6 port",
 		"how is the g p u budget":                  "gpu budget",
-		// No spelled name: a letter name alone, digit words alone, a key.
-		"my ex boss asked about six ports":   "boss six ports",
-		"is one or two ports ready":          "ports",
-		"what changed on INFRA-4592 today":   "",
-		"what is the status of infra 4592 v": "",
+		// No spelled name: a letter name alone, digit words alone, a key, a
+		// contraction or a possessive before a digit's word.
+		"my ex boss asked about six ports":      "boss six ports",
+		"is one or two ports ready":             "ports",
+		"what changed on INFRA-4592 today":      "",
+		"what is the status of infra 4592 v":    "",
+		"what's one thing blocking the deploy?": "blocking deploy",
+		"the team's one on one notes":           "team notes",
+		"it's x v 6 again":                      "xv6",
 	} {
 		if got := searchTerms(turn); got != want {
 			t.Errorf("searchTerms(%q) = %q, want %q", turn, got, want)

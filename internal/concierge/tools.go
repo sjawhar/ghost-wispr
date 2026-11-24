@@ -344,7 +344,7 @@ func (c *Concierge) searchBoth(ctx context.Context, records Records, terms strin
 		case got = <-full:
 		case <-cut:
 			c.logger.Info("concierge took the keyword result: the full search had not answered by its mark")
-			return c.fallback(kwIssues, terms), nil
+			return c.fallback(kwHits, terms), nil
 		}
 	}
 	if got.err == nil {
@@ -353,7 +353,7 @@ func (c *Concierge) searchBoth(ctx context.Context, records Records, terms strin
 	}
 	if kwErr == nil && len(kwIssues) > 0 && ctx.Err() == nil {
 		c.logger.Info("concierge took the keyword result: the full search failed", "error", got.err)
-		return c.fallback(kwIssues, terms), nil
+		return c.fallback(kwHits, terms), nil
 	}
 	if errors.Is(kwErr, errSearchSlow) && errors.Is(got.err, errSearchSlow) {
 		// The keyword search answers in about 0.15 s: both past their bound
@@ -367,22 +367,31 @@ func (c *Concierge) searchBoth(ctx context.Context, records Records, terms strin
 	return nil, got.err
 }
 
-// fallback is the keyword result taken in place of the full one: only its
-// issues whose own title holds a word of terms, the search's words (R5). A
-// keyword hit names an issue through any of its texts, such as a document
-// about it, so the room could hear an issue whose name holds nothing it
-// said. The log says how many were kept, never which.
-func (c *Concierge) fallback(issues []map[string]any, terms string) map[string]any {
-	kept := make([]map[string]any, 0, len(issues))
-	for _, issue := range issues {
-		if title, _ := issue["title"].(string); titled(title, terms) {
-			kept = append(kept, issue)
+// fallback is the keyword result taken in place of the full one: only the
+// issues of its hits, all of them, whose own title holds a word of terms,
+// the search's words, best first, at most five (R5). A keyword hit names an
+// issue through any of its texts, such as a document about it, so the room
+// could hear an issue whose name holds nothing it said. The log says how
+// many were kept, never which.
+func (c *Concierge) fallback(hits []dispatch.SearchHit, terms string) map[string]any {
+	named, dropped := map[string]bool{}, false
+	kept := make([]dispatch.SearchHit, 0, len(hits))
+	for _, hit := range hits {
+		if hit.IssueKey == "" {
+			continue
+		}
+		named[hit.IssueKey] = true
+		if titled(hit.Title, terms) {
+			kept = append(kept, hit)
+		} else {
+			dropped = true
 		}
 	}
-	if len(kept) < len(issues) {
-		c.logger.Info("concierge offers only the keyword result's issues whose title holds a word searched", "kept", len(kept), "of", len(issues))
+	issues, _ := issuesOf(kept)
+	if dropped {
+		c.logger.Info("concierge offers only the keyword result's issues whose title holds a word searched", "kept", len(issues), "of", len(named))
 	}
-	return map[string]any{"issues": kept, "clear_match": false}
+	return map[string]any{"issues": issues, "clear_match": false}
 }
 
 // titled reports whether title holds a word of terms, as a whole word or its
