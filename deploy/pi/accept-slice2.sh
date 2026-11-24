@@ -307,13 +307,14 @@ assert_running_models() {
 # How the running process signs in to each provider the plan's roles name, as /api/config reports
 # it under "providers": the provider's name, then a jq test of its entry, with $plan the template's
 # own settings (plan_provider_settings). OpenAI's workload identity ids are the office's own, which
-# only the template names; each Vertex AI provider runs in the Pi's Google project. The plan names
-# no other provider: the model gateway refuses the Pi until it admits it, so the template keeps the
-# gateway's entry commented out (deploy/pi/files/ghost-wispr.yaml).
+# only the template names; each Vertex AI provider runs in the Pi's Google project, with exactly the
+# template's billing labels (a build from before providers took labels ignores them, and its calls
+# carry none). The plan names no other provider: the model gateway refuses the Pi until it admits
+# it, so the template keeps the gateway's entry commented out (deploy/pi/files/ghost-wispr.yaml).
 # shellcheck disable=SC2016 # $project and $plan are jq variables, which assert_running_providers passes.
 expected_running_providers=(
-  'vertex|.api == "vertex" and .project == $project and .location == "global" and .auth.kind == "google"'
-  'vertex-us|.api == "vertex" and .project == $project and .location == "us" and .auth.kind == "google"'
+  'vertex|.api == "vertex" and .project == $project and .location == "global" and .auth.kind == "google" and .labels == {"owner": $plan["providers.vertex.labels.owner"], "stream": $plan["providers.vertex.labels.stream"]}'
+  'vertex-us|.api == "vertex" and .project == $project and .location == "us" and .auth.kind == "google" and .labels == {"owner": $plan["providers.vertex-us.labels.owner"], "stream": $plan["providers.vertex-us.labels.stream"]}'
   'openai|.api == "openai" and .auth.kind == "openai_wif" and .auth.identity_provider_id == $plan["providers.openai.auth.identity_provider_id"] and .auth.service_account_id == $plan["providers.openai.auth.service_account_id"]'
   'deepgram|.api == "deepgram" and .auth.kind == "api_key" and .auth.env == "GHOST_WISPR_DEEPGRAM_API_KEY"'
 )
@@ -323,6 +324,8 @@ readonly plan_yaml=$script_dir/files/ghost-wispr.yaml
 # The template's settings that expected_running_providers compares with as $plan["<path>"].
 readonly plan_provider_paths=(
   providers.openai.auth.identity_provider_id providers.openai.auth.service_account_id
+  providers.vertex.labels.owner providers.vertex.labels.stream
+  providers.vertex-us.labels.owner providers.vertex-us.labels.stream
 )
 
 # plan_provider_settings < YAML: prints as one JSON object each setting of plan_provider_paths that
@@ -1192,8 +1195,10 @@ EOF
       "concierge": "vertex/gemini-3.5-flash-lite", "tts": "vertex-us/gemini-3.8-flash-tts", "tts_voice": "Kore",
       "gptlive": "openai/gpt-live-1", "dgagent_provider": "deepgram"},
     "providers": {
-      "vertex": {"api": "vertex", "project": $project, "location": "global", "auth": {"kind": "google"}},
-      "vertex-us": {"api": "vertex", "project": $project, "location": "us", "auth": {"kind": "google"}},
+      "vertex": {"api": "vertex", "project": $project, "location": "global", "auth": {"kind": "google"},
+        "labels": {"owner": $plan["providers.vertex.labels.owner"], "stream": $plan["providers.vertex.labels.stream"]}},
+      "vertex-us": {"api": "vertex", "project": $project, "location": "us", "auth": {"kind": "google"},
+        "labels": {"owner": $plan["providers.vertex-us.labels.owner"], "stream": $plan["providers.vertex-us.labels.stream"]}},
       "openai": {"api": "openai", "auth": {"kind": "openai_wif",
         "identity_provider_id": $plan["providers.openai.auth.identity_provider_id"],
         "service_account_id": $plan["providers.openai.auth.service_account_id"]}},
@@ -1210,11 +1215,15 @@ EOF
   done
   assert_running_providers "$good_running_config" || fail 'A8 self-test rejected the running providers of the plan'
   # Each id below is well formed and not the template's: OpenAI's ids of another workload identity.
-  # A provider the plan does not name, the gateway the template keeps commented out, fails as well.
+  # A provider the plan does not name, the gateway the template keeps commented out, fails as well,
+  # as do a Vertex AI provider with no labels (a build that ignores them), another label value, or
+  # a label the plan does not set.
   for drift in '.providers.vertex.project = "other-project"' '.providers["vertex-us"].location = "global"' \
     '.providers.gateway = {"api": "openai", "url": "https://gateway.example.test/v1", "auth": {"kind": "google_id_token", "audience": "example-gateway"}}' \
     '.providers.openai.auth.kind = "api_key"' 'del(.providers.openai.auth.service_account_id)' \
     '.providers.openai.auth.identity_provider_id = "idp-other"' '.providers.openai.auth.service_account_id = "sa-other"' \
+    'del(.providers.vertex.labels)' 'del(.providers["vertex-us"].labels)' '.providers.vertex.labels.stream = "other-stream"' \
+    '.providers["vertex-us"].labels.owner = "other-owner"' '.providers.vertex.labels.extra = "other"' \
     '.providers.deepgram.auth.env = "DEEPGRAM_KEY"' 'del(.providers.deepgram)' 'del(.providers)'; do
     if assert_running_providers "$(jq -c "$drift" <<<"$good_running_config")" 2>/dev/null; then
       fail "A8 self-test accepted a running process with $drift"

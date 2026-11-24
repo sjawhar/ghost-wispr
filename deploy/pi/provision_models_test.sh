@@ -94,8 +94,9 @@ readonly removed_settings=(genai_backend gcp_project gcp_location embedding_mode
   voice.gptlive.openai_identity_provider_id voice.gptlive.openai_service_account_id)
 
 # assert_models FILE: FILE names the office Pi's providers, each in the Pi's Google project where it
-# is Vertex AI, and each role's provider/model; it sets no removed setting, and names no gateway
-# provider, which refuses the Pi until it admits it.
+# is Vertex AI, with the request labels Cloud Billing attributes the Pi's Gemini spend by, and each
+# role's provider/model; it sets no removed setting, and names no gateway provider, which refuses
+# the Pi until it admits it.
 assert_models() {
   local file=$1 paths line path
   paths=$(config_paths "$file")
@@ -104,10 +105,14 @@ assert_models() {
     "providers.vertex.project: $PI_GCP_PROJECT" \
     'providers.vertex.location: global' \
     'providers.vertex.auth.kind: google' \
+    'providers.vertex.labels.owner: sjawhar' \
+    'providers.vertex.labels.stream: agents-no-stream' \
     'providers.vertex-us.api: vertex' \
     "providers.vertex-us.project: $PI_GCP_PROJECT" \
     'providers.vertex-us.location: us' \
     'providers.vertex-us.auth.kind: google' \
+    'providers.vertex-us.labels.owner: sjawhar' \
+    'providers.vertex-us.labels.stream: agents-no-stream' \
     'providers.openai.api: openai' \
     'providers.openai.auth.kind: openai_wif' \
     'providers.deepgram.api: deepgram' \

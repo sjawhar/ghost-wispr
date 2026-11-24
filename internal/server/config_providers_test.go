@@ -544,8 +544,8 @@ func TestOpenAPISpecDocumentsTheProviders(t *testing.T) {
 		if at("providers", "readOnly") != true {
 			t.Errorf("%v providers is not readOnly", schema[:3])
 		}
-		if got := properties(at("providers", "additionalProperties", "properties")); !slices.Equal(got, []string{"api", "auth", "location", "project", "url"}) {
-			t.Errorf("%v a provider's properties %v, want api, auth, location, project, url", schema[:3], got)
+		if got := properties(at("providers", "additionalProperties", "properties")); !slices.Equal(got, []string{"api", "auth", "labels", "location", "project", "url"}) {
+			t.Errorf("%v a provider's properties %v, want api, auth, labels, location, project, url", schema[:3], got)
 		}
 		if got := properties(at("providers", "additionalProperties", "properties", "auth", "properties")); !slices.Equal(got, []string{"audience", "env", "identity_provider_id", "kind", "service_account_id"}) {
 			t.Errorf("%v a provider's auth properties %v", schema[:3], got)

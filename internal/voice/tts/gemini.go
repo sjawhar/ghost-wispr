@@ -41,6 +41,7 @@ type Gemini struct {
 	endpoint string
 	model    string
 	voice    string
+	labels   map[string]string // a Vertex AI provider's GenerateLabels, which each request carries
 }
 
 // newVertex is Gemini TTS on a Vertex AI provider: the Google publisher
@@ -50,7 +51,7 @@ func newVertex(p *providers.Provider, model, voice string, o *options) (Voiced, 
 	if p.Project == "" {
 		return nil, fmt.Errorf("gemini tts: Vertex AI provider %q names no project", p.Name)
 	}
-	g := &Gemini{httpEngine: newHTTPEngine("gemini tts", p, o), model: model, voice: cmp.Or(voice, geminiDefaultVoice)}
+	g := &Gemini{httpEngine: newHTTPEngine("gemini tts", p, o), model: model, voice: cmp.Or(voice, geminiDefaultVoice), labels: p.GenerateLabels()}
 	g.endpoint = fmt.Sprintf("%s/v1/projects/%s/locations/%s/publishers/google/models/%s:streamGenerateContent?alt=sse",
 		g.host, url.PathEscape(p.Project), url.PathEscape(cmp.Or(p.Location, config.DefaultVertexLocation)), url.PathEscape(model))
 	return g, nil
@@ -84,6 +85,7 @@ func (g *Gemini) Connect(context.Context) (Conn, error) { return g.connect(g.Str
 type geminiRequest struct {
 	Contents         []geminiContent        `json:"contents"`
 	GenerationConfig geminiGenerationConfig `json:"generationConfig"`
+	Labels           map[string]string      `json:"labels,omitempty"`
 }
 
 type geminiContent struct {
@@ -149,6 +151,7 @@ func (g *Gemini) StreamModel(ctx context.Context, text string, emit func(pcm []b
 			ResponseModalities: []string{"AUDIO"},
 			SpeechConfig:       geminiSpeechConfig{VoiceConfig: geminiVoiceConfig{Voice: g.voice}},
 		},
+		Labels: g.labels,
 	})
 	if err != nil {
 		return "", fmt.Errorf("gemini tts: marshal request: %w", err)

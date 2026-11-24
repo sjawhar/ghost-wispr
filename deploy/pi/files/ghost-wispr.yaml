@@ -32,21 +32,30 @@ providers:
   #     kind: google_id_token
   #     audience: model-gateway-gce
   # Vertex AI in the Pi's Google project, signed in with a Google access token. The Concierge,
-  # summaries and search call Gemini here directly.
+  # summaries and search call Gemini here directly. Each generate call here (the Concierge's and
+  # the summaries') carries these labels, which Vertex AI copies into Cloud Billing, so the Pi's
+  # Gemini spend is attributed to its owner and stream (dispatch://INFRA-1027); search's
+  # embeddings carry none.
   vertex:
     api: vertex
     project: theorem-agent-infra
     location: global
     auth:
       kind: google
+    labels:
+      owner: sjawhar
+      stream: agents-no-stream
   # Vertex AI's us multi-region, for text-to-speech: Gemini TTS streams its first audio sooner there
-  # than from global.
+  # than from global. Each speech call carries the same labels.
   vertex-us:
     api: vertex
     project: theorem-agent-infra
     location: us
     auth:
       kind: google
+    labels:
+      owner: sjawhar
+      stream: agents-no-stream
   # OpenAI, for voice B's GPT-Live, which no gateway route carries: the Pi exchanges its Google ID
   # token for an OpenAI access token with these workload identity ids, which are not secrets.
   openai:

@@ -15,7 +15,8 @@ import (
 type geminiClient struct {
 	client   *genai.Client
 	model    string
-	provider string // the provider's name, which its errors name
+	provider string            // the provider's name, which its errors name
+	labels   map[string]string // the provider's GenerateLabels, which each call carries
 	// reported is each answer's ModelVersion. Vertex may omit it; the
 	// model resolved into the request is then the only model identity the
 	// API provides, and the report says the answer named none.
@@ -33,7 +34,7 @@ func newGeminiClient(p *providers.Provider, model string) (*geminiClient, error)
 	if err != nil {
 		return nil, fmt.Errorf("create gemini client: %w", err)
 	}
-	return &geminiClient{client: client, model: model, provider: p.Name}, nil
+	return &geminiClient{client: client, model: model, provider: p.Name, labels: p.GenerateLabels()}, nil
 }
 
 func convertGeminiMessages(messages []Message) (*genai.Content, []*genai.Content) {
@@ -68,7 +69,7 @@ func (c *geminiClient) Complete(ctx context.Context, messages []Message) (string
 		return "", fmt.Errorf("gemini: no user message provided")
 	}
 
-	config := &genai.GenerateContentConfig{SystemInstruction: systemInstruction}
+	config := &genai.GenerateContentConfig{SystemInstruction: systemInstruction, Labels: c.labels}
 	result, err := c.client.Models.GenerateContent(ctx, c.model, contents, config)
 	if err != nil {
 		return "", fmt.Errorf("%s completion: %w", c.provider, providererr.From(c.provider, err))
@@ -100,6 +101,7 @@ func (c *geminiClient) CompleteJSON(ctx context.Context, messages []Message, sch
 		SystemInstruction:  systemInstruction,
 		ResponseMIMEType:   "application/json",
 		ResponseJsonSchema: schema,
+		Labels:             c.labels,
 	}
 	result, err := c.client.Models.GenerateContent(ctx, c.model, contents, config)
 	if err != nil {
