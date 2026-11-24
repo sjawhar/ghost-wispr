@@ -380,9 +380,9 @@ func (r *read) heldBy(early *reading) {
 }
 
 // readFor is what the record holds for turn: the read Heard made of exactly
-// what the final turn asks, or of a search whose words the turn's all hold,
-// which is final once it ran to its end, else a read made now. ctx, the
-// answer's, bounds both; cut, when it closes, ends the wait for a full
+// what the final turn asks, or of a search of the same words in another
+// order, which is final once it ran to its end, else a read made now. ctx,
+// the answer's, bounds both; cut, when it closes, ends the wait for a full
 // search (searchBoth).
 func (c *Concierge) readFor(ctx context.Context, x *voice.Exchange, turn string, onHolder func(*reading), cut <-chan struct{}) *reading {
 	target := c.readTarget(ctx, turn, true)
@@ -397,30 +397,33 @@ func (c *Concierge) readFor(ctx context.Context, x *voice.Exchange, turn string,
 	c.mu.Lock()
 	var pending *read
 	searchAgain := false
-	aheadWords, held := 0, 0
+	aheadWords, finalWords, held := 0, 0, 0
 	if p := c.prefetchLocked(x); p != nil {
 		pending = p.reads[target]
 		switch {
 		case pending != nil:
-		case wordsHeldBy(p.current, target):
-			// The read-ahead searched words the final turn holds: its search,
+		case sameWords(p.current, target):
+			// The read-ahead searched the final turn's words: its search,
 			// keyword and full, is this answer's (Main's rule).
 			pending = p.reads[p.current]
 		case strings.HasPrefix(p.current, "search:") && strings.HasPrefix(target, "search:"):
 			// Counts only, never the words: why the answer searches again.
+			// A final turn that adds words the read-ahead did not search is
+			// searched for all of them.
 			ahead := strings.Fields(strings.TrimPrefix(p.current, "search:"))
-			heldWords := set(strings.Fields(strings.TrimPrefix(target, "search:")))
+			final := strings.Fields(strings.TrimPrefix(target, "search:"))
+			heldWords := set(final)
 			for _, word := range ahead {
 				if heldWords[word] {
 					held++
 				}
 			}
-			searchAgain, aheadWords = true, len(ahead)
+			searchAgain, aheadWords, finalWords = true, len(ahead), len(final)
 		}
 	}
 	c.mu.Unlock()
 	if searchAgain { // logged without c.mu: a log write can wait
-		c.logger.Info("concierge searches again: the turn holds not all of the read-ahead's words", "ahead_words", aheadWords, "held", held)
+		c.logger.Info("concierge searches again: the turn's search words are not the read-ahead's", "ahead_words", aheadWords, "final_words", finalWords, "held", held)
 	}
 	if pending != nil {
 		// The answer needs the read now: a search still settling starts, and
@@ -460,21 +463,19 @@ func (c *Concierge) readFor(ctx context.Context, x *voice.Exchange, turn string,
 	return c.readRecord(ctx, x, target, onHolder, cut)
 }
 
-// wordsHeldBy reports whether ahead, a read-ahead's search target, searched
-// words that target, the final turn's search, all holds.
-func wordsHeldBy(ahead, target string) bool {
+// sameWords reports whether ahead, a read-ahead's search target, searched
+// the words of target, the final turn's search, in any order: no more and no
+// fewer.
+func sameWords(ahead, target string) bool {
 	aheadTerms, ok := strings.CutPrefix(ahead, "search:")
 	finalTerms, final := strings.CutPrefix(target, "search:")
 	if !ok || !final || aheadTerms == "" {
 		return false
 	}
-	held := set(strings.Fields(finalTerms))
-	for _, word := range strings.Fields(aheadTerms) {
-		if !held[word] {
-			return false
-		}
-	}
-	return true
+	aheadWords, finalWords := strings.Fields(aheadTerms), strings.Fields(finalTerms)
+	slices.Sort(aheadWords)
+	slices.Sort(finalWords)
+	return slices.Equal(aheadWords, finalWords)
 }
 
 // prefetchLocked is exchange x's read-ahead. An exchange whose wake came

@@ -706,8 +706,9 @@ func TestAnUnclearKeywordResultWaitsTwoSecondsAtMost(t *testing.T) {
 }
 
 // TestAnswerReusesTheReadAheadsSearch (R6; Main's rule): when the final
-// turn's search words hold all of the words the read-ahead searched, Answer
-// takes the read-ahead's search, keyword and full, and searches no more.
+// turn's search words are the words the read-ahead searched, in any order,
+// Answer takes the read-ahead's search, keyword and full, and searches no
+// more.
 func TestAnswerReusesTheReadAheadsSearch(t *testing.T) {
 	r := newRig(t)
 	r.concierge.searchSettle = 50 * time.Millisecond
@@ -716,7 +717,7 @@ func TestAnswerReusesTheReadAheadsSearch(t *testing.T) {
 	r.concierge.Heard(context.Background(), &r.exchange, "what is happening with the realtime voice")
 	eventually(t, "the read-ahead searched", func() bool { return len(r.records.searches()) == 1 })
 	r.model.turns = [][]*genai.GenerateContentResponse{{chunk(text("PR 80 is in review."))}}
-	spoken := answerTurn(t, r, "what is happening with the realtime voice rollout")
+	spoken := answerTurn(t, r, "the voice, realtime: what is happening with it")
 	if full, kw := len(r.records.searches()), len(r.records.kwQueries); full != 1 || kw != 1 {
 		t.Fatalf("full searches %d, keyword %d; want the read-ahead's one of each, reused", full, kw)
 	}
