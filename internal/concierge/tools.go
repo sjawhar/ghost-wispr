@@ -309,13 +309,15 @@ func (r *runner) searchIssues(ctx context.Context, query string) (map[string]any
 
 // searchBoth runs Dispatch's keyword-only search and its full search, words
 // and meaning, at once; together they are one search. A keyword result with
-// one clear match (R5) is taken at once and the full search is stopped:
-// keywords answer in about 0.2 s, the full search in 3 to 6 s. Otherwise
-// the full result is taken, until cut closes (2 s after the turn ended);
-// then, or when the full search fails or runs past its bound, the keyword
-// result is, with only the issues whose own title holds a word searched
-// (fallback), whose top two, or one, the voice offers (Main's rule). A search
-// that found nothing in its time is slow, not out of reach (R6, R10).
+// one clear match (R5) whose own title holds a word searched is taken at once
+// and the full search is stopped: keywords answer in about 0.2 s, the full
+// search in 3 to 6 s. A keyword hit names an issue through any of its texts,
+// so a clear lead whose title holds none is no clear match. Otherwise the
+// full result is taken, until cut closes (2 s after the turn ended); then, or
+// when the full search fails or runs past its bound, the keyword result is,
+// with only the issues whose own title holds a word searched (fallback),
+// whose top two, or one, the voice offers (Main's rule). A search that found
+// nothing in its time is slow, not out of reach (R6, R10).
 func (c *Concierge) searchBoth(ctx context.Context, records Records, terms string, cut <-chan struct{}) (map[string]any, error) {
 	type found struct {
 		hits []dispatch.SearchHit
@@ -331,7 +333,10 @@ func (c *Concierge) searchBoth(ctx context.Context, records Records, terms strin
 	kwHits, kwErr := records.SearchKeywords(ctx, terms, 10)
 	kwIssues, kwClear := issuesOf(kwHits)
 	if kwErr == nil && kwClear {
-		return map[string]any{"issues": kwIssues, "clear_match": true}, nil
+		if title, _ := kwIssues[0]["title"].(string); titled(title, terms) {
+			return map[string]any{"issues": kwIssues, "clear_match": true}, nil
+		}
+		c.logger.Info("concierge took no clear keyword match: its title holds no word searched")
 	}
 	if kwErr != nil || len(kwIssues) == 0 {
 		cut = nil // nothing to offer: the full search decides

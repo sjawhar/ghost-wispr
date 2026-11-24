@@ -87,7 +87,7 @@ func TestNoConciergeLogWriteHoldsItsLock(t *testing.T) {
 		}
 	})
 	t.Run("an answer that searches again", func(t *testing.T) {
-		held := newHeldLog("concierge searches again: the turn holds not all of the read-ahead's words")
+		held := newHeldLog("concierge searches again: the turn's search words are not the read-ahead's")
 		r := newLoggedRig(t, slog.New(held))
 		r.concierge.searchSettle = 50 * time.Millisecond
 		unclearSearch(r)
