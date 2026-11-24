@@ -91,7 +91,7 @@ func (c *Concierge) bareNumberCandidates(ctx context.Context, turn string) []can
 
 func bareNumberConfirmation(candidates []candidate) string {
 	if len(candidates) == 1 {
-		return "Did you mean " + candidates[0].key + "?"
+		return "Did you mean " + sayKey(candidates[0].key) + "?"
 	}
 	return didYouMean(candidates)
 }

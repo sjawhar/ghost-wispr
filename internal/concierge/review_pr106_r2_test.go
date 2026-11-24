@@ -78,7 +78,7 @@ func TestReview106R2DescriptionWithoutIssueAbout(t *testing.T) {
 			}
 			r.model.turns = [][]*genai.GenerateContentResponse{{chunk(text("ABC-12 is in progress."))}}
 			spoken := answerTurn(t, r, "what is happening with realtime voice in room 4592?")
-			want := "Did you mean ABC-12, Realtime voice, or ABC-13, Wake word?"
+			want := "Did you mean A B C twelve, or A B C thirteen?"
 			if clear {
 				want = "ABC-12 is in progress."
 			}
@@ -95,7 +95,7 @@ func TestReview106R2NumberOnlyTurnConfirms(t *testing.T) {
 	r := newRig(t)
 	probe106Issue(r)
 	spoken := answerTurn(t, r, "4592")
-	if len(spoken) != 1 || spoken[0].text != "Did you mean INFRA-4592?" {
+	if len(spoken) != 1 || spoken[0].text != "Did you mean Infra forty-five ninety-two?" {
 		t.Fatalf("spoken=%+v want confirmation", spoken)
 	}
 	r.records.mu.Lock()
@@ -115,7 +115,7 @@ func TestReview106R2WordsPlusNumberSearchesThenFallsBack(t *testing.T) {
 	r.records.issues["ABC-12"] = &dispatch.Issue{Key: "ABC-12", Title: "Realtime voice", Status: "in_progress", UpdatedAt: testNow}
 	r.records.hits = []dispatch.SearchHit{} // search finds nothing
 	spoken := answerTurn(t, r, "ask him for 4592")
-	if len(spoken) != 1 || spoken[0].text != "Did you mean INFRA-4592?" {
+	if len(spoken) != 1 || spoken[0].text != "Did you mean Infra forty-five ninety-two?" {
 		t.Fatalf("spoken=%+v want bare-number confirmation after empty search", spoken)
 	}
 }

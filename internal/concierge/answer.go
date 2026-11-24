@@ -399,35 +399,11 @@ func (c *Concierge) answer(parent context.Context, x *voice.Exchange, turn strin
 }
 
 // didYouMean asks which of a search's top two issues the person meant (R5),
-// by key and the start of its title when that has the ear's form, else by
-// key.
+// by each key as it is spoken (sayKey). Two keys never share a spoken form,
+// so the keys alone tell the issues apart; their titles, which made the
+// question 9 to 11 s long on the office Pi, are not said.
 func didYouMean(candidates []candidate) string {
-	named := func(c candidate) string {
-		if title := titleStart(c.title); title != "" {
-			return c.key + ", " + title
-		}
-		return c.key
-	}
-	return spokenLine("Did you mean "+named(candidates[0])+", or "+named(candidates[1])+"?",
-		"Did you mean "+candidates[0].key+" or "+candidates[1].key+"?")
-}
-
-// titleWords is how much of a title the question which issue says.
-const titleWords = 5
-
-// titleStart is a title's first words, as the voice may say them, without a
-// trailing word that leads nowhere ("with", "and").
-func titleStart(title string) string {
-	words := strings.Fields(spokenName(title))
-	words = words[:min(len(words), titleWords)]
-	for len(words) > 0 {
-		last := strings.ToLower(strings.TrimRight(words[len(words)-1], ",;:"))
-		if !searchStopwords[last] {
-			break
-		}
-		words = words[:len(words)-1]
-	}
-	return strings.TrimRight(strings.Join(words, " "), ",;:")
+	return "Did you mean " + sayKey(candidates[0].key) + ", or " + sayKey(candidates[1].key) + "?"
 }
 
 // known is what the voice says when no fact came by the mark (R6): the

@@ -38,7 +38,7 @@ func TestReview106OrdinaryNumbersNeedExistingIssue(t *testing.T) {
 	r := newRig(t)
 	probe106Issue(r)
 	spoken := answerTurn(t, r, "ask him for 4592")
-	if len(spoken) != 1 || spoken[0].text != "Did you mean INFRA-4592?" {
+	if len(spoken) != 1 || spoken[0].text != "Did you mean Infra forty-five ninety-two?" {
 		t.Fatalf("positive control=%+v", spoken)
 	}
 }
@@ -106,7 +106,7 @@ func TestReview106R5AndBareNumber(t *testing.T) {
 			}
 			r.model.turns = [][]*genai.GenerateContentResponse{{chunk(text("ABC-12 is in progress."))}}
 			spoken := answerTurn(t, r, "what is happening with the issue about realtime voice in room 4592?")
-			want := "Did you mean ABC-12, Realtime voice, or ABC-13, Wake word?"
+			want := "Did you mean A B C twelve, or A B C thirteen?"
 			if clear {
 				want = "ABC-12 is in progress."
 			}
@@ -139,7 +139,7 @@ func TestReview106KnownCandidateDoesNotWaitForUnrelatedProject(t *testing.T) {
 	if err != nil {
 		t.Errorf("known candidate was lost: %v", err)
 	}
-	if !slices.ContainsFunc(spoken, func(s said) bool { return s.text == "Did you mean INFRA-4592?" }) {
+	if !slices.ContainsFunc(spoken, func(s said) bool { return s.text == "Did you mean Infra forty-five ninety-two?" }) {
 		t.Error("known matching issue never confirmed")
 	}
 }
@@ -156,7 +156,7 @@ func TestReview106SideTalkDoesNotAskTheHolder(t *testing.T) {
 	records.mu.Unlock()
 	r.hear("Wispr, ask him for 4592")
 	r7Until(t, "confirmation spoken", func() bool {
-		return slices.ContainsFunc(r.voice.said(), func(s r7Said) bool { return s.text == "Did you mean ABC-4592?" })
+		return slices.ContainsFunc(r.voice.said(), func(s r7Said) bool { return s.text == "Did you mean A B C forty-five ninety-two?" })
 	})
 	time.Sleep(20 * time.Millisecond)
 	r.hear("the first item in our budget is rent")

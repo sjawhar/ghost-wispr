@@ -612,8 +612,8 @@ With `voice.enabled`, people in the room can ask Wispr about the work tracked in
 say the wake phrase at the start of a sentence: "Wispr, what is happening with the issue about
 the meeting voice?" ("Ghost Wispr" and "Hey Wispr" work too; "I will whisper it to you" does not).
 Wispr plays a short two-note sound, the Concierge reads Dispatch's record, and the voice speaks the
-answer. For 6 s after Wispr's answer, a follow-up that the transcript ends with a question mark needs no wake phrase, and so does a reply when Wispr asked ("Did you mean ABC-12, or
-ABC-13?"). Anything else said in those 6 s is side talk: no voice answers it, and nothing of it goes to Dispatch.
+answer. For 6 s after Wispr's answer, a follow-up that the transcript ends with a question mark needs no wake phrase, and so does a reply when Wispr asked ("Did you mean Infra forty-five ninety-two, or
+Infra ten twenty-seven?", each key as people say one). Anything else said in those 6 s is side talk: no voice answers it, and nothing of it goes to Dispatch.
 "Thanks, Wispr" ends the exchange. When the record cannot answer, the Concierge asks the agent that holds the issue. When
 its answer lands, Wispr plays a rising three-note sound twice after a second in which nobody speaks, the
 blink(1)'s LED 2 flashes green while the unit records (see "Recording light"), and Wispr speaks
