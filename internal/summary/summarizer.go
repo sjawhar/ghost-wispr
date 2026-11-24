@@ -106,6 +106,9 @@ func (s *Summarizer) SummarizeReported(ctx context.Context, sessionID, transcrip
 	return result.Title, result.Summary, result.Preset, result.SpeakerNames, result.Model, err
 }
 
+// SummarizeResult summarizes transcript with the preset the router chooses. A
+// transcript too short to summarize gets its title alone, with the preset the
+// router falls back to: no model is asked which preset fits it.
 func (s *Summarizer) SummarizeResult(ctx context.Context, sessionID, transcript string) (result SummaryResult, err error) {
 	defer func() {
 		if s.OnResult != nil {
@@ -113,9 +116,11 @@ func (s *Summarizer) SummarizeResult(ctx context.Context, sessionID, transcript 
 		}
 	}()
 
-	presetName, err := s.selectPreset(ctx, transcript)
-	if err != nil {
-		return SummaryResult{}, fmt.Errorf("select preset: %w", err)
+	presetName := s.fallbackPreset()
+	if _, short := s.spoken(transcript); !short {
+		if presetName, err = s.selectPreset(ctx, transcript); err != nil {
+			return SummaryResult{}, fmt.Errorf("select preset: %w", err)
+		}
 	}
 	result, err = s.SummarizeWithPresetResult(ctx, sessionID, transcript, presetName)
 	result.Preset = presetName
@@ -141,12 +146,8 @@ func (s *Summarizer) SummarizeWithPresetResult(ctx context.Context, _ string, tr
 		}
 	}()
 
-	minWords := s.cfg.MinSummaryWords
-	if minWords <= 0 {
-		minWords = defaultMinSummaryWords
-	}
 	// The transcript's speaker labels are not words of the conversation.
-	if spoken := transcribe.WithoutSpeakerLabels(transcript); len(strings.Fields(spoken)) < minWords {
+	if spoken, short := s.spoken(transcript); short {
 		return SummaryResult{Title: guaranteedTitle(spoken), SpeakerNames: "{}"}, nil
 	}
 
@@ -648,12 +649,33 @@ func splitTranscript(transcript string, chunkSize, overlap int) []string {
 
 func (s *Summarizer) selectPreset(ctx context.Context, transcript string) (string, error) {
 	if s.router == nil {
-		for name := range s.cfg.Presets {
-			return name, nil
-		}
-		return "default", nil
+		return s.fallbackPreset(), nil
 	}
 	return s.router.SelectPreset(ctx, transcript)
+}
+
+// fallbackPreset is the preset a summary takes when no model chooses one: the
+// router's fallback, else the one preset there is, else "default".
+func (s *Summarizer) fallbackPreset() string {
+	if s.router != nil {
+		return s.router.fallbackPreset()
+	}
+	for name := range s.cfg.Presets {
+		return name
+	}
+	return "default"
+}
+
+// spoken is transcript without its speaker labels, which are not words of the
+// conversation, and whether it has fewer words than a summary needs
+// (MinSummaryWords).
+func (s *Summarizer) spoken(transcript string) (spoken string, short bool) {
+	minWords := s.cfg.MinSummaryWords
+	if minWords <= 0 {
+		minWords = defaultMinSummaryWords
+	}
+	spoken = transcribe.WithoutSpeakerLabels(transcript)
+	return spoken, len(strings.Fields(spoken)) < minWords
 }
 
 func (s *Summarizer) Presets() map[string]config.Preset {
