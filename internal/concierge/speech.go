@@ -104,9 +104,10 @@ var spelledDigits = map[string]string{
 // letters too short to search or a digit's word. A name spelled out, as
 // Deepgram writes one said letter by letter, is two or more whole words in a
 // row, apart by spaces or hyphens, each a letter or a digit as spoken
-// (spelledLetters, spelledDigits), at least one of them a letter. A comma or
-// a full stop ends it. Words of a run of digits alone ("one two") and part
-// of a word ("what's one") stay as they were.
+// (spelledLetters, spelledDigits), at least one of them a letter; its last
+// may be possessive ("ex v six's" is "xv6's"). A comma or a full stop ends
+// it. Words of a run of digits alone ("one two") and part of a word ("what's
+// one") stay as they were.
 func spelledOut(text string) string {
 	fields := strings.Fields(text)
 	out := make([]string, 0, len(fields))
@@ -122,19 +123,31 @@ func spelledOut(text string) string {
 		spelled.Reset()
 		from, chars, letters = from[:0], 0, false
 	}
+	spelledWord := func(word string) bool {
+		for _, part := range strings.Split(strings.ToLower(word), "-") {
+			if spelledLetters[part] == "" && spelledDigits[part] == "" {
+				return false
+			}
+		}
+		return word != ""
+	}
 	for _, field := range fields {
 		word := strings.TrimRight(field, ",.;:!?")
-		parts := strings.Split(strings.ToLower(word), "-")
-		ok := word != ""
-		for _, part := range parts {
-			ok = ok && (spelledLetters[part] != "" || spelledDigits[part] != "")
+		tail := field[len(word):]
+		if chars > 0 {
+			for _, possessive := range []string{"'s", "’s"} {
+				if name, ok := strings.CutSuffix(word, possessive); ok && spelledWord(name) {
+					word, tail = name, possessive+tail
+					break
+				}
+			}
 		}
-		if !ok {
+		if !spelledWord(word) {
 			end("")
 			out = append(out, field)
 			continue
 		}
-		for _, part := range parts {
+		for _, part := range strings.Split(strings.ToLower(word), "-") {
 			if letter := spelledLetters[part]; letter != "" {
 				spelled.WriteString(letter)
 				letters = true
@@ -144,7 +157,7 @@ func spelledOut(text string) string {
 			chars++
 		}
 		from = append(from, field)
-		if tail := field[len(word):]; tail != "" {
+		if tail != "" {
 			end(tail)
 		}
 	}

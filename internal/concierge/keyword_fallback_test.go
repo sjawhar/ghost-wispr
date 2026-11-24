@@ -72,10 +72,10 @@ func TestTheKeywordFallbackOffersOnlyIssuesItsTitleNames(t *testing.T) {
 }
 
 // TestAPickOfTheOneIssueOfferedAnswersTheQuestion (R5): a keyword fallback
-// that offered one issue takes a yes, said as people say one, or the issue's
-// key, as that issue, for the question first asked; a no as no pick; and
-// anything else, such as side talk with "first" in it, as a question of its
-// own. Live, "Yeah, that one." was searched as a question.
+// that offered one issue takes a whole reply that confirms, a yes form or the
+// issue's key, as that issue, for the question first asked; a no as no pick;
+// and anything else, such as side talk with "first" in it, as a question of
+// its own. Live, "Yeah, that one." was searched as a question.
 func TestAPickOfTheOneIssueOfferedAnswersTheQuestion(t *testing.T) {
 	for reply, want := range map[string]struct {
 		key string
@@ -86,7 +86,7 @@ func TestAPickOfTheOneIssueOfferedAnswersTheQuestion(t *testing.T) {
 		"Yep.":                 {"ABC-41", true},
 		"Sure, that's it.":     {"ABC-41", true},
 		"ABC-41, please":       {"ABC-41", true},
-		"the first one":        {"", false},
+		"the first one":        {"ABC-41", true},
 		"no":                   {"", true},
 		"Nope, not that one.":  {"", true},
 		"what about the tests": {"", false},

@@ -394,19 +394,45 @@ func (c *Concierge) fallback(hits []dispatch.SearchHit, terms string) map[string
 	return map[string]any{"issues": issues, "clear_match": false}
 }
 
-// titled reports whether title holds a word of terms, as a whole word or its
-// plural ("eval" and "evals"), with a hyphen apart: "Parser-evals" holds
-// "evals".
+// titled reports whether title holds a word of terms: one of its words, with
+// a hyphen apart ("Parser-evals"), is that word or its regular plural,
+// either way (singular). A stopword or a word under three letters, on either
+// side, holds nothing: "us" is no "uses".
 func titled(title, terms string) bool {
-	words := strings.FieldsFunc(strings.ToLower(title), func(r rune) bool { return !unicode.IsLetter(r) && !unicode.IsDigit(r) })
+	counts := func(word string) bool { return utf8.RuneCountInString(word) >= 3 && !searchStopwords[word] }
+	searched := map[string]bool{}
 	for _, term := range strings.Fields(strings.ToLower(terms)) {
-		for _, word := range words {
-			if word == term || word+"s" == term || term+"s" == word || word+"es" == term || term+"es" == word {
-				return true
-			}
+		if counts(term) {
+			searched[singular(term)] = true
+		}
+	}
+	for _, word := range strings.FieldsFunc(strings.ToLower(title), func(r rune) bool { return !unicode.IsLetter(r) && !unicode.IsDigit(r) }) {
+		if counts(word) && searched[singular(word)] {
+			return true
 		}
 	}
 	return false
+}
+
+// singular is a word's regular singular, so that a word and its plural read
+// as one: "policies" is "policy", "boxes" "box", "matches" "match", "uses"
+// "use", "evals" "eval". A word that is no regular plural, "class" or
+// "xv6", comes back as it was.
+func singular(word string) string {
+	switch {
+	case len(word) > 4 && strings.HasSuffix(word, "ies"):
+		return word[:len(word)-3] + "y"
+	case len(word) > 4 && strings.HasSuffix(word, "es"):
+		for _, stem := range []string{"ss", "x", "z", "ch", "sh"} {
+			if strings.HasSuffix(word[:len(word)-2], stem) {
+				return word[:len(word)-2]
+			}
+		}
+	}
+	if len(word) > 3 && strings.HasSuffix(word, "s") && !strings.HasSuffix(word, "ss") {
+		return word[:len(word)-1]
+	}
+	return word
 }
 
 // issuesOf is a search's issues, best first and once each, at most five,
