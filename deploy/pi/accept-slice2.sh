@@ -1222,8 +1222,10 @@ EOF
     '.providers.gateway = {"api": "openai", "url": "https://gateway.example.test/v1", "auth": {"kind": "google_id_token", "audience": "example-gateway"}}' \
     '.providers.openai.auth.kind = "api_key"' 'del(.providers.openai.auth.service_account_id)' \
     '.providers.openai.auth.identity_provider_id = "idp-other"' '.providers.openai.auth.service_account_id = "sa-other"' \
-    'del(.providers.vertex.labels)' 'del(.providers["vertex-us"].labels)' '.providers.vertex.labels.stream = "other-stream"' \
-    '.providers["vertex-us"].labels.owner = "other-owner"' '.providers.vertex.labels.extra = "other"' \
+    'del(.providers.vertex.labels)' 'del(.providers["vertex-us"].labels)' \
+    '.providers.vertex.labels.owner = "other-owner"' '.providers.vertex.labels.stream = "other-stream"' \
+    '.providers["vertex-us"].labels.owner = "other-owner"' '.providers["vertex-us"].labels.stream = "other-stream"' \
+    '.providers.vertex.labels.extra = "other"' '.providers["vertex-us"].labels.extra = "other"' \
     '.providers.deepgram.auth.env = "DEEPGRAM_KEY"' 'del(.providers.deepgram)' 'del(.providers)'; do
     if assert_running_providers "$(jq -c "$drift" <<<"$good_running_config")" 2>/dev/null; then
       fail "A8 self-test accepted a running process with $drift"

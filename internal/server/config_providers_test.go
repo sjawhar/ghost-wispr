@@ -39,7 +39,7 @@ func getJSON(t *testing.T, h http.Handler, path string, v any) *httptest.Respons
 
 // TestGetConfigServesEachProviderAndNoSecret fails if GET /api/config does not
 // serve each provider as the config names it (its API, url, project,
-// location and sign-in), and the text-to-speech role; if it serves a
+// location, sign-in and labels), and the text-to-speech role; if it serves a
 // provider's key; or if it keeps a field the providers replaced: api_keys,
 // summarization.base_url.
 func TestGetConfigServesEachProviderAndNoSecret(t *testing.T) {
@@ -70,7 +70,7 @@ func TestGetConfigServesEachProviderAndNoSecret(t *testing.T) {
 		t.Fatalf("providers %s: %v", resp["providers"], err)
 	}
 	want := cfgStore.Get().Providers
-	if len(want) != 5 || want["gateway"].URL != "https://gateway.example.test/v1" || want["openai"].Auth.IdentityProviderID != "idp-example" {
+	if len(want) != 5 || want["gateway"].URL != "https://gateway.example.test/v1" || want["openai"].Auth.IdentityProviderID != "idp-example" || want["vertex"].Labels["owner"] != "example-owner" {
 		t.Fatalf("the config holds providers %+v, not providersYAML's", want)
 	}
 	if !reflect.DeepEqual(served, want) {

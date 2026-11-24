@@ -63,44 +63,45 @@ type Provider struct {
 	Project  string       `yaml:"project,omitempty" json:"project,omitempty"`
 	Location string       `yaml:"location,omitempty" json:"location,omitempty"`
 	Auth     ProviderAuth `yaml:"auth" json:"auth"`
-	// Labels are Vertex AI's: the request labels each generate call
-	// (generateContent, streamGenerateContent) carries, which Vertex AI
-	// copies into Cloud Billing for pay-as-you-go traffic, such as the
-	// owner and the stream a deployment's spend is attributed to.
+	// Labels are Vertex AI's: request labels, such as the owner and the
+	// stream a deployment's spend is attributed to, that each generate call
+	// (generateContent, streamGenerateContent) carries. Vertex AI copies
+	// them into Cloud Billing for pay-as-you-go traffic.
 	Labels map[string]string `yaml:"labels,omitempty" json:"labels,omitempty"`
 }
 
 // GenerateLabels are the labels a generate call on the provider carries:
 // its labels on Vertex AI, and none on another API. Only Vertex AI bills by
-// them; genai would send them to the Gemini API as well, whose callers
-// include a model gateway's Google routes, which must get each request as
-// before. Labels Vertex AI would refuse are none too: it would refuse every
-// call that carried them (validateProviders warns about them). The map is
-// the provider's own: a caller only reads it.
+// them; genai would send them to the Gemini API as well, and a Gemini API
+// provider can be a model gateway's Google routes, which must get each
+// request as before. Labels outside Google's rules are sent as written:
+// Vertex AI answers a call that carries them, and validateProviders warns
+// about them. The map is the provider's own: a caller only reads it.
 func (p *Provider) GenerateLabels() map[string]string {
-	if p.API != APIVertex || len(p.Labels) == 0 || len(labelProblems(p.Labels)) > 0 {
+	if p.API != APIVertex || len(p.Labels) == 0 {
 		return nil
 	}
 	return p.Labels
 }
 
-// maxLabels is the most labels Vertex AI takes on one call.
+// maxLabels is the most labels Google's rules allow on one call.
 const maxLabels = 64
 
-// labelKey and labelValue are a key and a value Vertex AI takes: 1 to 63
-// (a value 0 to 63) lowercase or international letters, digits, underscores
-// or dashes, where an international letter is any uncased one, and a key
-// starts with a letter.
+// labelKey and labelValue are a key and a value Google's rules for labels
+// allow: 1 to 63 (a value 0 to 63) lowercase letters, other letters (Unicode
+// Lo, such as 名), digits, underscores or dashes, and a key starts with a
+// letter.
 var (
 	labelKey   = regexp.MustCompile(`^[\p{Ll}\p{Lo}][\p{Ll}\p{Lo}\p{N}_-]{0,62}$`)
 	labelValue = regexp.MustCompile(`^[\p{Ll}\p{Lo}\p{N}_-]{0,63}$`)
 )
 
-// labelProblems says what of labels Vertex AI would refuse, in key order.
+// labelProblems says what of labels Google's rules do not allow, in key
+// order.
 func labelProblems(labels map[string]string) []string {
 	var problems []string
 	if len(labels) > maxLabels {
-		problems = append(problems, fmt.Sprintf("has %d labels, and Vertex AI takes at most %d", len(labels), maxLabels))
+		problems = append(problems, fmt.Sprintf("has %d labels, more than %d", len(labels), maxLabels))
 	}
 	for _, key := range slices.Sorted(maps.Keys(labels)) {
 		if !labelKey.MatchString(key) {
@@ -395,7 +396,7 @@ func validateProviders(providers map[string]Provider) []string {
 			if p.API != APIVertex {
 				warnings = append(warnings, fmt.Sprintf("%s.labels: only Vertex AI takes request labels, and %s calls the %s API — its calls carry none; remove them.", at, at, p.API))
 			} else if problems := labelProblems(p.Labels); len(problems) > 0 {
-				warnings = append(warnings, fmt.Sprintf("%s.labels %s — Vertex AI would refuse every call that carried them, so its calls carry none of its labels until they are fixed.", at, strings.Join(problems, "; ")))
+				warnings = append(warnings, fmt.Sprintf("%s.labels %s, which Google's rules for labels do not allow — its calls carry them as written and Vertex AI answers them, but Cloud Billing may not attribute spend by them; fix them.", at, strings.Join(problems, "; ")))
 			}
 		}
 		a := p.Auth

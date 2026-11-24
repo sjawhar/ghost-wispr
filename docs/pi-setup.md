@@ -495,8 +495,8 @@ provisioner writes into `.env` as `GHOST_WISPR_DEEPGRAM_API_KEY`. Both Vertex AI
 the labels `owner: sjawhar` and `stream: agents-no-stream`: every Gemini generate call (the
 Concierge, summaries, speech) sends them, and Vertex AI copies them into Cloud Billing, so the Pi's
 Gemini spend is attributed to its owner and stream (dispatch://INFRA-1027); search's embeddings
-carry none. The model gateway's `gateway`
-entry is there commented out, until the gateway admits the Pi ("The model gateway"). Its roles:
+carry none. The model gateway's `gateway` entry is there commented out, until the gateway admits
+the Pi ("The model gateway"). Its roles:
 `deepgram/nova-3` for live and batch transcription,
 `vertex/gemini-4-carbon` for summaries (each session online: `summarization.batch_jobs: false`,
 because `theorem-agent-infra`'s IAM deny policy `vertex-jobs-fence`, dispatch://INFRA-3614, refuses

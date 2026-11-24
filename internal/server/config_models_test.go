@@ -15,12 +15,12 @@ import (
 )
 
 // providersYAML is a unit's ghost-wispr.yaml with a provider of each sign-in
-// kind and every role set: the model gateway, Vertex AI in two locations,
-// OpenAI by workload identity and Deepgram by key.
+// kind and every role set: the model gateway, Vertex AI in two locations with
+// billing labels, OpenAI by workload identity and Deepgram by key.
 const providersYAML = `providers:
   gateway: {api: openai, url: https://gateway.example.test/v1, auth: {kind: google_id_token, audience: example-gateway}}
-  vertex: {api: vertex, project: example-project, location: global, auth: {kind: google}}
-  vertex-us: {api: vertex, project: example-project, location: us, auth: {kind: google}}
+  vertex: {api: vertex, project: example-project, location: global, auth: {kind: google}, labels: {owner: example-owner, stream: example-stream}}
+  vertex-us: {api: vertex, project: example-project, location: us, auth: {kind: google}, labels: {owner: example-owner, stream: example-stream}}
   openai: {api: openai, auth: {kind: openai_wif, identity_provider_id: idp-example, service_account_id: sa-example}}
   deepgram: {api: deepgram, auth: {kind: api_key, env: GHOST_WISPR_DEEPGRAM_API_KEY}}
 transcription: {model: deepgram/nova-3}

@@ -40,8 +40,8 @@ providers:
 
 // TestGenerateLabelsAreVertexAIsAlone fails if a generate call on a provider
 // of another API than Vertex AI would carry labels: only Vertex AI bills by
-// them, and genai would send them on to the Gemini API, a model gateway's
-// Google routes among its callers.
+// them, genai would send them on to the Gemini API, and a Gemini API provider
+// can be a model gateway's Google routes.
 func TestGenerateLabelsAreVertexAIsAlone(t *testing.T) {
 	labels := map[string]string{"owner": "example-owner"}
 	for _, api := range APIs {
@@ -54,14 +54,15 @@ func TestGenerateLabelsAreVertexAIsAlone(t *testing.T) {
 	}
 }
 
-// TestLabelsVertexAIWouldRefuseWarn fails if labels on a provider that is not
-// Vertex AI, or labels that break Vertex AI's rules (a key of 1 to 63
+// TestLabelsOutsideGooglesRulesWarn fails if labels on a provider that is not
+// Vertex AI, or labels that break Google's rules for labels (a key of 1 to 63
 // lowercase or international letters, digits, underscores or dashes that
 // starts with a letter; a value of up to 63 of them; at most 64 labels a
-// call), start without a warning that names the provider's labels, or if such
-// labels are still the ones its generate calls carry: Vertex AI would refuse
-// every call.
-func TestLabelsVertexAIWouldRefuseWarn(t *testing.T) {
+// call), start without a warning that names the provider's labels. It fails
+// too if a Vertex AI provider's generate calls do not carry such labels as
+// written: Vertex AI answers a call that carries them (2026-11-23), so
+// keeping them back would protect nothing and lose the labels beside them.
+func TestLabelsOutsideGooglesRulesWarn(t *testing.T) {
 	vertex := func(labels string) string {
 		return "{api: vertex, project: example-project, auth: {kind: google}, labels: " + labels + "}"
 	}
@@ -69,6 +70,8 @@ func TestLabelsVertexAIWouldRefuseWarn(t *testing.T) {
 	for i := range many {
 		many[i] = fmt.Sprintf("k%d: v", i)
 	}
+	// The labels of each case on a provider that is not Vertex AI are none.
+	notVertex := map[string]bool{"on the gemini api": true, "on the openai api": true}
 	cases := map[string]string{
 		"on the gemini api":       "{api: gemini, auth: {kind: api_key, env: EXAMPLE_KEY}, labels: {owner: example-owner}}",
 		"on the openai api":       "{api: openai, auth: {kind: api_key, env: EXAMPLE_KEY}, labels: {owner: example-owner}}",
@@ -93,12 +96,16 @@ func TestLabelsVertexAIWouldRefuseWarn(t *testing.T) {
 			if !slices.ContainsFunc(warnings, func(w string) bool { return strings.Contains(w, "providers.broken.labels") }) {
 				t.Errorf("warnings %q name no providers.broken.labels", warnings)
 			}
-			if broken := cfg.Providers["broken"]; broken.GenerateLabels() != nil {
-				t.Errorf("GenerateLabels = %v, want none: Vertex AI would refuse every call that carried them", broken.GenerateLabels())
+			broken := cfg.Providers["broken"]
+			switch got := broken.GenerateLabels(); {
+			case notVertex[name] && got != nil:
+				t.Errorf("GenerateLabels = %v, want none on the %s API", got, broken.API)
+			case !notVertex[name] && (len(got) == 0 || !maps.Equal(got, broken.Labels)):
+				t.Errorf("GenerateLabels = %v, want the labels as written, %v", got, broken.Labels)
 			}
 		})
 	}
-	t.Run("labels Vertex AI takes", func(t *testing.T) {
+	t.Run("labels within Google's rules", func(t *testing.T) {
 		clearVoiceEnv(t)
 		most := make([]string, 64)
 		for i := range most {
