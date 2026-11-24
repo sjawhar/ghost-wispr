@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Give the recorder's tagged Tailscale device the name ghost-wispr (docs/pi-setup.md, "Provision").
 #
-#   secret-run --register --wait 12h --reason TEXT TAILSCALE_API_KEY -- deploy/pi/claim-tailnet-name.sh
+#   agent-secrets TAILSCALE_API_KEY --reason TEXT --wait 12h -- deploy/pi/claim-tailnet-name.sh
 #
 # The tagged join makes a new device. While the temporary device the operator joined as their own
 # still holds the name, Tailscale names the tagged one ghost-wispr-1, and the recorder is not at its
@@ -32,7 +32,7 @@ fail() {
 }
 log() { printf 'claim-tailnet-name: %s\n' "$*"; }
 
-[[ -n ${TAILSCALE_API_KEY:-} ]] || fail "TAILSCALE_API_KEY is not set; run this under secret-run TAILSCALE_API_KEY"
+[[ -n ${TAILSCALE_API_KEY:-} ]] || fail "TAILSCALE_API_KEY is not set; run this under agent-secrets TAILSCALE_API_KEY"
 for command in curl jq; do
   command -v "$command" >/dev/null || fail "missing required command: $command"
 done

@@ -265,9 +265,9 @@ that: `provision-pi.sh` reaches the Pi by that name. Give the tagged device its 
 approves on the broker page:
 
 ```bash
-secret-run --register --wait 12h \
+agent-secrets TAILSCALE_API_KEY --wait 12h \
   --reason 'Ghost Wispr (docs/pi-setup.md): give the tagged recorder the tailnet name ghost-wispr' \
-  TAILSCALE_API_KEY -- deploy/pi/claim-tailnet-name.sh
+  -- deploy/pi/claim-tailnet-name.sh
 ```
 
 It removes the temporary device only when that device is the one device other than the tagged
