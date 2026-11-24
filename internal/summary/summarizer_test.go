@@ -189,6 +189,56 @@ func TestSummarizeSkipsShortTranscript(t *testing.T) {
 	}
 }
 
+// TestAShortTranscriptAsksNoModelForItsPreset fails if a transcript too short
+// to summarize makes a model call when more than one preset could take it:
+// the preset router asks a model which preset fits, and the summary that
+// follows is the title alone, so the call is spend for nothing. Its preset is
+// the one the router falls back to.
+func TestAShortTranscriptAsksNoModelForItsPreset(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		presets []string
+		want    string
+	}{
+		{name: "with a default preset", presets: []string{"engineering", "default"}, want: "default"},
+		{name: "with no default preset", presets: []string{"engineering", "brief"}, want: "brief"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			client := &mockLLMClient{response: "engineering"}
+			presets := map[string]config.Preset{}
+			for _, name := range tc.presets {
+				presets[name] = config.Preset{Description: name, SystemPrompt: "system", UserTemplate: "{{transcript}}"}
+			}
+			s := New(config.Summarization{Model: "openai/gpt-4o-mini", Presets: presets}, func(_, _ string) (llm.Client, error) {
+				return client, nil
+			})
+			s.sleep = func(time.Duration) {}
+
+			title, summaryText, preset, _, err := s.Summarize(context.Background(), "session-1", "too short")
+			if err != nil {
+				t.Fatalf("Summarize: %v", err)
+			}
+			if client.calls != 0 {
+				t.Fatalf("a short transcript made %d model calls, want none", client.calls)
+			}
+			if title == "" || summaryText != "" || preset != tc.want {
+				t.Fatalf("title %q, summary %q, preset %q; want a title, no summary and preset %q", title, summaryText, preset, tc.want)
+			}
+		})
+	}
+	// The control: a transcript long enough to summarize asks the router,
+	// so the count above can see a preset call.
+	client := &mockLLMClient{textQueue: []mockTextResult{{response: "engineering"}}, response: `{"title":"T","summary":"S"}`}
+	s := New(config.Summarization{Model: "openai/gpt-4o-mini", Presets: map[string]config.Preset{
+		"engineering": {Description: "engineering", SystemPrompt: "system", UserTemplate: "{{transcript}}"},
+		"default":     {Description: "default", SystemPrompt: "system", UserTemplate: "{{transcript}}"},
+	}}, func(_, _ string) (llm.Client, error) { return client, nil })
+	s.sleep = func(time.Duration) {}
+	if _, _, preset, _, err := s.Summarize(context.Background(), "session-1", buildTranscript(25)); err != nil || preset != "engineering" || client.calls != 2 {
+		t.Fatalf("a long transcript: preset %q, %d model calls, err %v; want the router's engineering after 2 calls", preset, client.calls, err)
+	}
+}
+
 func TestSummarizeRendersTemplate(t *testing.T) {
 	transcript := buildTranscript(25)
 	client := &mockLLMClient{response: `{"title":"Title","summary":"ok"}`}
