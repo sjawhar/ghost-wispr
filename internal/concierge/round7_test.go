@@ -1234,7 +1234,7 @@ func TestTheFirstFactNamesTheIssue(t *testing.T) {
 func TestALongerKeyDoesNotNameTheIssue(t *testing.T) {
 	for fact, lead := range map[string]bool{"ABC-12 is merged.": true, "ABC-1's agent merged it.": false, "ABC-1 is merged.": false} {
 		var spoken []said
-		sp := newSpeaker(context.Background(), recorder(&spoken))
+		sp := newSpeaker(context.Background(), context.Background(), recorder(&spoken))
 		if err := sp.holdLead(context.Background(), "ABC-1", "I took ABC-1."); err != nil {
 			t.Fatal(err)
 		}
