@@ -762,14 +762,14 @@ func (v projectsView) holds(project string) bool {
 	return v.known[strings.ToUpper(project)]
 }
 
-// keyUntold reports whether words name an issue key, other than one of
-// except, whose project the view neither holds nor can tell it does not:
-// the check failed because Dispatch did not answer, so the turn is an outage
-// of Dispatch's, not a key Dispatch has no project for.
-func (v projectsView) keyUntold(words string, except []string) bool {
+// keyUntold reports whether words name an issue key whose project the view
+// neither holds nor can tell it does not: the check failed because Dispatch
+// did not answer, so the turn is an outage of Dispatch's, not a key Dispatch
+// has no project for.
+func (v projectsView) keyUntold(words string) bool {
 	for _, key := range issueKeysIn(words) {
 		project, _, _ := strings.Cut(key, "-")
-		if !v.holds(project) && !v.sure && !slices.Contains(except, key) {
+		if !v.holds(project) && !v.sure {
 			return true
 		}
 	}
