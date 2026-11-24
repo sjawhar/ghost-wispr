@@ -104,7 +104,7 @@ const (
 // letter written.
 func readKeys(t *testing.T, r *rig, words string) string {
 	t.Helper()
-	read, unread := r.concierge.readSpelledKeys(words)
+	read, unread := r.concierge.viewProjects().readSpelledKeys(words)
 	if unread {
 		t.Fatalf("readSpelledKeys(%q): the project list could not tell", words)
 	}

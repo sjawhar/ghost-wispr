@@ -91,7 +91,7 @@ func TestReview187R5SpelledKeysNameKnownProjects(t *testing.T) {
 		"I O U twenty dollars":                 "search:twenty dollars",
 		"what's happening with X V six evals?": "search:xv6 evals",
 	} {
-		if got := r.concierge.readTarget(readKeys(t, r, in)); got != want {
+		if got := r.concierge.readTarget(r.concierge.viewProjects(), readKeys(t, r, in)); got != want {
 			t.Errorf("readTarget(%q) = %q, want %q", in, got, want)
 		}
 	}

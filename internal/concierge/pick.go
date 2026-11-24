@@ -81,6 +81,18 @@ func (c *Concierge) dropPick(x *voice.Exchange) {
 	c.mu.Unlock()
 }
 
+// offeredKeys is the keys of the issues x's last answer offered, the offer
+// left in place; none when no offer is pending.
+func (c *Concierge) offeredKeys(x *voice.Exchange) []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	var keys []string
+	for _, candidate := range c.picks[wakeKey(x)].candidates {
+		keys = append(keys, candidate.key)
+	}
+	return keys
+}
+
 var (
 	// replyFillers may begin a reply: "uh, yes".
 	replyFillers = set(strings.Fields("uh um oh well hmm mm"))

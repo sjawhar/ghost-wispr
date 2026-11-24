@@ -107,13 +107,20 @@ func TestAKeyQuestionDoesNotWaitForAStaleList(t *testing.T) {
 	}
 }
 
-// TestAWrittenWordNNAmongOtherWordsIsSearched: a written "word NN" the
-// project list cannot tell may be speech ("the last 30 days"), so the
-// turn's other words are searched as before; the outage is only for a key
-// with nothing else to search.
+// TestAWrittenWordNNAmongOtherWordsIsSearched: in a fresh question, with no
+// offer pending, a written "word NN" the project list cannot tell may be
+// speech ("the last 30 days"), so the turn's other words are searched as
+// before; the outage is only for a key with nothing else to search.
 func TestAWrittenWordNNAmongOtherWordsIsSearched(t *testing.T) {
-	got := answerInOutage(t, projectsReadFails, "what changed on the realtime voice in the last 30 days")
-	if got.searched == 0 || errors.Is(got.err, voice.ErrUnreachable) {
-		t.Errorf("searched %d times, Answer = %v, spoken %+v; want the other words searched", got.searched, got.err, got.spoken)
+	r := newRig(t)
+	voiceIssue(r)
+	projectsReadFails.set(t, r)
+	var spoken []said
+	err := r.concierge.Answer(context.Background(), &r.exchange, "what changed on the realtime voice in the last 30 days", recorder(&spoken))
+	r.records.mu.Lock()
+	searched := len(r.records.queries) + len(r.records.kwQueries)
+	r.records.mu.Unlock()
+	if searched == 0 || errors.Is(err, voice.ErrUnreachable) {
+		t.Errorf("searched %d times, Answer = %v, spoken %+v; want the other words searched", searched, err, spoken)
 	}
 }

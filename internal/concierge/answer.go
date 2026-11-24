@@ -172,16 +172,20 @@ func (c *Concierge) answer(parent context.Context, x *voice.Exchange, turn strin
 	start := time.Now()
 	ctx, cancel := context.WithTimeout(parent, c.fastBound)
 	defer cancel()
-	// A key said letter by letter is read once, here, from the cached project
-	// list and never waiting for it, so the pick, the routing line, the
-	// search and the ask all see it. When the list cannot tell, Dispatch did
-	// not answer: the letters are neither a key nor words to search, no
-	// offered issue is picked, and the room hears so, with the error sound
-	// (R10).
-	turn, unread := c.readSpelledKeys(turn)
-	if unread {
+	// One reading of the project list decides the turn (projectsView), never
+	// waiting for it. A key said letter by letter is read here, once, so the
+	// pick, the routing line, the search and the ask all see it. With an
+	// offer pending, a key the voice offered picks it (takePick) whatever
+	// the list says: that issue is real, the voice just offered it. When the
+	// list cannot tell, Dispatch did not answer: letters that could be a key,
+	// and with an offer pending any key not offered, are neither read nor
+	// searched, no offered issue is picked, and the room hears so, with the
+	// error sound (R10).
+	view := c.viewProjects()
+	turn, unread := view.readSpelledKeys(turn)
+	if offered := c.offeredKeys(x); unread || len(offered) > 0 && view.keyUntold(turn, offered) {
 		c.dropPick(x)
-		c.logger.Info("concierge could not read a key said letter by letter: Dispatch's projects are not known")
+		c.logger.Info("concierge could not tell a key: Dispatch's projects are not known")
 		if err := sp.sayText(ctx, cannotReachDispatch, voice.Ack); err != nil {
 			return err
 		}
@@ -227,7 +231,7 @@ func (c *Concierge) answer(parent context.Context, x *voice.Exchange, turn strin
 		if key := askingKey.Load(); key != nil && *key != "" {
 			return "Asking the agent on " + *key + "."
 		}
-		return c.routingLine(ctx, turn)
+		return routingLine(view, turn)
 	})()
 	// An "ask", or a question the record cannot answer, goes to the live
 	// holder once the holder is known; a follow-up turn said with no wake
@@ -250,13 +254,13 @@ func (c *Concierge) answer(parent context.Context, x *voice.Exchange, turn strin
 	case target != "":
 		found = c.readRecord(ctx, x, target, onHolder, fullCut)
 	default:
-		found = c.readFor(ctx, x, turn, onHolder, fullCut)
+		found = c.readFor(ctx, x, view, turn, onHolder, fullCut)
 	}
 	// R6: at most two searches an answer, the read-ahead's counted; the count
 	// is taken here, so an answer that ends early starts it over too.
 	aheadSearches := c.takeAheadSearches(x)
 	if found.key == "" && !found.unreachable && len(found.candidates) == 0 {
-		if candidates := c.bareNumberCandidates(ctx, turn); len(candidates) > 0 {
+		if candidates := c.bareNumberCandidates(ctx, view, turn); len(candidates) > 0 {
 			c.offerPick(x, turn, candidates)
 			return sp.sayText(ctx, didYouMean(candidates), voice.Ack)
 		}
@@ -462,12 +466,12 @@ func (r *reading) agedStatus(now time.Time) string {
 }
 
 // routingLine is the routing line for turn: the issue key it names, when it
-// names one of Dispatch's known projects, else the record.
-func (c *Concierge) routingLine(ctx context.Context, turn string) string {
+// names one of the projects of the turn's view, else the record.
+func routingLine(view projectsView, turn string) string {
 	keys := issueKeysIn(turn)
 	for i := len(keys) - 1; i >= 0; i-- {
 		project, _, _ := strings.Cut(keys[i], "-")
-		if c.isProject(project) {
+		if view.holds(project) {
 			return "Reading " + keys[i] + "."
 		}
 	}

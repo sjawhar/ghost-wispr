@@ -359,7 +359,7 @@ func New(cfg *Config) (*Concierge, error) {
 	}()
 	if c.records != nil {
 		// The project list is read at once, so the first question's keys
-		// are known (isProject).
+		// are known (viewProjects).
 		c.projectsBusy = true
 		c.background(c.readProjects)
 	}
@@ -725,42 +725,51 @@ func (c *Concierge) closeLocked(sessionID string, deleted bool) {
 // projectsFor is how long a read of Dispatch's project keys is kept.
 const projectsFor = 10 * time.Minute
 
-// isProject reports whether project is one of Dispatch's projects, by the
-// cached list. Until the projects are known none is: a "word NN" said in the
-// room is no key, so it never reaches Dispatch in an address. After a failed
-// read the list last read still answers. It never waits: a stale or missing
-// list is read in the background, for a later turn.
-func (c *Concierge) isProject(project string) bool {
-	known, _ := c.cachedProject(project)
-	return known
+// projectsView is the cached list of Dispatch's projects as one turn reads
+// it, once, where the turn enters the Concierge (Heard, answer). Every
+// decision of the turn, its keys, its target and an outage, comes from this
+// one reading, so a read of the list that lands mid-turn changes none of
+// them; the next turn reads the new list.
+type projectsView struct {
+	known map[string]bool
+	// sure: the list can tell a project from none. It cannot when it was
+	// never read or its last read failed, Dispatch not answering.
+	sure bool
 }
 
-// cachedProject reports whether the cached list of Dispatch's projects holds
-// project, and whether that list can tell (sure): it cannot when it was
-// never read or its last read failed, Dispatch not answering. It never waits:
-// a stale or missing list is read in the background, for a later turn.
-func (c *Concierge) cachedProject(project string) (known, sure bool) {
+// viewProjects reads the cached list once, for one turn. Until the projects
+// are known none is: a "word NN" said in the room is no key, so it never
+// reaches Dispatch in an address. After a failed read the list last read
+// still answers. It never waits: a stale or missing list is read in the
+// background, for a later turn.
+func (c *Concierge) viewProjects() projectsView {
 	c.mu.Lock()
 	refresh := c.now().Sub(c.projectsRead) > projectsFor && !c.projectsBusy && c.records != nil
 	if refresh {
 		c.projectsBusy = true
 	}
-	known, sure = c.projects[strings.ToUpper(project)], c.projects != nil && !c.projectsDown
+	// readProjects replaces the map, never changes it, so the view may keep it.
+	view := projectsView{known: c.projects, sure: c.projects != nil && !c.projectsDown}
 	c.mu.Unlock()
 	if refresh {
 		c.background(c.readProjects)
 	}
-	return known, sure
+	return view
 }
 
-// keyUntold reports whether words name an issue key whose project the
-// cached list neither holds nor can tell it does not (cachedProject): the
-// check failed because Dispatch did not answer, so the turn is an outage of
-// Dispatch's, not a key Dispatch has no project for.
-func (c *Concierge) keyUntold(words string) bool {
+// holds reports whether project is one of the view's projects.
+func (v projectsView) holds(project string) bool {
+	return v.known[strings.ToUpper(project)]
+}
+
+// keyUntold reports whether words name an issue key, other than one of
+// except, whose project the view neither holds nor can tell it does not:
+// the check failed because Dispatch did not answer, so the turn is an outage
+// of Dispatch's, not a key Dispatch has no project for.
+func (v projectsView) keyUntold(words string, except []string) bool {
 	for _, key := range issueKeysIn(words) {
 		project, _, _ := strings.Cut(key, "-")
-		if known, sure := c.cachedProject(project); !known && !sure {
+		if !v.holds(project) && !v.sure && !slices.Contains(except, key) {
 			return true
 		}
 	}

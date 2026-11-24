@@ -92,24 +92,23 @@ func spokenKeys(words string) string {
 }
 
 // readSpelledKeys rewrites each key of words whose project is said letter by
-// letter (spelledKey) to its written form, "ABC-13", when the cached project
-// list holds the project (cachedProject); other letters stay as said. It
-// never waits for the list. unread reports a run of letters that could be a
-// key while the list cannot tell (never read, or its read failed): such a
-// turn is neither a pick nor words to search. A turn goes through it once,
-// where it enters the Concierge (Heard, answer), so every reading of the
-// turn after sees the key.
-func (c *Concierge) readSpelledKeys(words string) (read string, unread bool) {
+// letter (spelledKey) to its written form, "ABC-13", when the view holds the
+// project; other letters stay as said. unread reports a run of letters that
+// could be a key while the view cannot tell (the list never read, or its read
+// failed): such a turn is neither a pick nor words to search. A turn goes
+// through it once, where it enters the Concierge (Heard, answer), so every
+// reading of the turn after sees the key.
+func (v projectsView) readSpelledKeys(words string) (read string, unread bool) {
 	read = spelledKey.ReplaceAllStringFunc(words, func(match string) string {
 		key, trail, ok := writtenKey(spelledKey, match)
 		if !ok {
 			return match
 		}
 		project, _, _ := strings.Cut(key, "-")
-		switch known, sure := c.cachedProject(project); {
-		case !sure:
+		switch {
+		case !v.sure:
 			unread = true
-		case known:
+		case v.holds(project):
 			return key + trail
 		}
 		return match
@@ -249,13 +248,13 @@ func (p *prefetch) cancelAll() {
 //   - "search:terms" when it names none;
 //   - nothing when its words name no work either.
 //
-// terms is searchTerms's, the fewest words. The projects are the cached
-// list's (isProject), never waited for.
-func (c *Concierge) readTarget(words string) string {
+// terms is searchTerms's, the fewest words. The projects are the turn's
+// view's.
+func (c *Concierge) readTarget(v projectsView, words string) string {
 	var keys []string
 	for _, key := range issueKeysIn(words) {
 		project, _, _ := strings.Cut(key, "-")
-		if c.isProject(project) {
+		if v.holds(project) {
 			keys = append(keys, key)
 		}
 	}
@@ -285,13 +284,15 @@ func (c *Concierge) Heard(ctx context.Context, x *voice.Exchange, words string) 
 	if ctx.Err() != nil || c.records == nil {
 		return
 	}
-	// A run of letters that could be a key the project list cannot tell
-	// yet is neither read nor searched (readSpelledKeys).
-	words, unread := c.readSpelledKeys(words)
+	// One reading of the project list decides the turn (projectsView). A run
+	// of letters that could be a key the list cannot tell yet is neither read
+	// nor searched (readSpelledKeys).
+	view := c.viewProjects()
+	words, unread := view.readSpelledKeys(words)
 	if unread {
 		return
 	}
-	target := c.readTarget(words)
+	target := c.readTarget(view, words)
 	// A number-only turn (no key, no work words) skips the read-ahead: it
 	// goes straight to the bare-number candidate lookup. A turn with words
 	// beyond the number keeps its search.
@@ -382,15 +383,15 @@ func (r *read) heldBy(early *reading) {
 // what the final turn asks, or of a search of the same words in another
 // order, which is final once it ran to its end, else a read made now. ctx,
 // the answer's, bounds both; cut, when it closes, ends the wait for a full
-// search (searchBoth).
-func (c *Concierge) readFor(ctx context.Context, x *voice.Exchange, turn string, onHolder func(*reading), cut <-chan struct{}) *reading {
-	target := c.readTarget(turn)
+// search (searchBoth). view is the turn's one reading of the project list.
+func (c *Concierge) readFor(ctx context.Context, x *voice.Exchange, view projectsView, turn string, onHolder func(*reading), cut <-chan struct{}) *reading {
+	target := c.readTarget(view, turn)
 	if target == "" {
-		// A key-shaped word the cached project list cannot tell, with no
-		// other words to search: Dispatch did not answer (R10). A written
-		// "word NN" among other words may be speech ("the last 30 days"),
-		// so those words are searched.
-		if c.keyUntold(turn) {
+		// A key-shaped word the project list cannot tell, with no other
+		// words to search: Dispatch did not answer (R10). A written "word
+		// NN" among other words may be speech ("the last 30 days"), so
+		// those words are searched.
+		if view.keyUntold(turn, nil) {
 			return &reading{unreachable: true}
 		}
 		return &reading{noResult: len(bareIssueNumber.FindAllString(turn, -1)) > 0}

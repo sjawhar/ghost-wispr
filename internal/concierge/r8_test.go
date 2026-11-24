@@ -322,11 +322,12 @@ func TestAKeyCheckNeverWaitsForAProjectsRead(t *testing.T) {
 	r.concierge.projectsRead = time.Time{}
 	r.concierge.mu.Unlock()
 	start := time.Now()
-	if r.concierge.isProject("NEW") || !r.concierge.isProject("ABC") || time.Since(start) > 100*time.Millisecond {
+	view := r.concierge.viewProjects()
+	if view.holds("NEW") || !view.holds("ABC") || time.Since(start) > 100*time.Millisecond {
 		t.Fatalf("a check while the read ran took %v or did not answer from the cached list", time.Since(start))
 	}
 	close(release)
-	eventually(t, "the read's list is used", func() bool { return r.concierge.isProject("NEW") })
+	eventually(t, "the read's list is used", func() bool { return r.concierge.viewProjects().holds("NEW") })
 }
 
 // TestAFastAnswerNamesTheQuestionsKey (c-fast-answer, R8): when the holder
