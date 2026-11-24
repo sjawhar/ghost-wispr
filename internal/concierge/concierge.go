@@ -763,6 +763,17 @@ func (c *Concierge) isProject(ctx context.Context, project string, wait bool) bo
 	return known[strings.ToUpper(project)]
 }
 
+// cachedProject reports whether the cached list of Dispatch's projects holds
+// project, and whether that list can tell (sure): it cannot when it was
+// never read or its last read failed. It never waits: a stale or missing
+// list is read in the background, for a later turn.
+func (c *Concierge) cachedProject(ctx context.Context, project string) (known, sure bool) {
+	c.isProject(ctx, project, false)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.projects[strings.ToUpper(project)], c.projects != nil && !c.projectsDown
+}
+
 // startProjectsReadLocked marks a read of the projects as running. c.mu is
 // held.
 func (c *Concierge) startProjectsReadLocked() {

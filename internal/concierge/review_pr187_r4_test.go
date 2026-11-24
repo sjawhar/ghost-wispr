@@ -1,7 +1,6 @@
 package concierge
 
 import (
-	"context"
 	"slices"
 	"strings"
 	"testing"
@@ -182,7 +181,7 @@ func TestReview187R4SelectionMatrix(t *testing.T) {
 		r := newRig(t)
 		r.concierge.offerPick(&r.exchange, twoOfferedTurn, tc.candidates)
 		// As answer reads a turn: a key said letter by letter first.
-		_, key, ok := r.concierge.takePick(&r.exchange, r.concierge.readSpelledKeys(context.Background(), tc.reply, true))
+		_, key, ok := r.concierge.takePick(&r.exchange, readKeys(t, r, tc.reply))
 		if key != tc.key || ok != tc.ok {
 			t.Errorf("takePick(%q) of %d offered = %q, %v; want %q, %v", tc.reply, len(tc.candidates), key, ok, tc.key, tc.ok)
 		}
@@ -195,7 +194,6 @@ func TestReview187R4SelectionMatrix(t *testing.T) {
 // make no key stay as they were.
 func TestReview187R4ASpelledProjectIsAKey(t *testing.T) {
 	r := newRig(t) // Dispatch knows ABC, XYZ, DEF and INFRA.
-	ctx := context.Background()
 	for in, want := range map[string][]string{
 		"A B C thirteen":                          {"ABC-13"},
 		"A B C forty-five ninety-two":             {"ABC-4592"},
@@ -206,7 +204,7 @@ func TestReview187R4ASpelledProjectIsAKey(t *testing.T) {
 		"X V 6 evals":                             nil,
 		"a b testing":                             nil,
 	} {
-		if got := issueKeysIn(r.concierge.readSpelledKeys(ctx, in, true)); !slices.Equal(got, want) {
+		if got := issueKeysIn(readKeys(t, r, in)); !slices.Equal(got, want) {
 			t.Errorf("issueKeysIn(%q) = %q, want %q", in, got, want)
 		}
 	}
@@ -215,7 +213,7 @@ func TestReview187R4ASpelledProjectIsAKey(t *testing.T) {
 		"what's happening with X V 6 evals?":   "xv6 evals",
 		"what's happening with A B C thirteen": "",
 	} {
-		if got := searchTerms(r.concierge.readSpelledKeys(ctx, in, true)); got != want {
+		if got := searchTerms(readKeys(t, r, in)); got != want {
 			t.Errorf("searchTerms(%q) = %q, want %q", in, got, want)
 		}
 	}

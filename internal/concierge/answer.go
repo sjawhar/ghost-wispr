@@ -172,9 +172,17 @@ func (c *Concierge) answer(parent context.Context, x *voice.Exchange, turn strin
 	start := time.Now()
 	ctx, cancel := context.WithTimeout(parent, c.fastBound)
 	defer cancel()
-	// A key said letter by letter is read once, here, so the pick, the
-	// routing line, the search and the ask all see it.
-	turn = c.readSpelledKeys(ctx, turn, true)
+	// A key said letter by letter is read once, here, from the cached project
+	// list and never waiting for it, so the pick, the routing line, the
+	// search and the ask all see it. When the list cannot tell, the letters
+	// are neither a key nor words to search: no offered issue is picked, and
+	// the voice asks for the key.
+	turn, unread := c.readSpelledKeys(ctx, turn)
+	if unread {
+		c.dropPick(x)
+		c.logger.Info("concierge could not read a key said letter by letter: Dispatch's projects are not known")
+		return sp.sayText(ctx, noIssueFound, voice.Ack)
+	}
 	// A turn that picks one of the issues the last answer offered answers
 	// the question first asked, about that issue (R5).
 	target := ""

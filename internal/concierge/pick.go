@@ -73,6 +73,14 @@ func (c *Concierge) takePick(x *voice.Exchange, turn string) (asked, key string,
 	return "", "", false
 }
 
+// dropPick uses up the offer of x's last answer with no pick: a turn the
+// Concierge cannot read is a question of its own.
+func (c *Concierge) dropPick(x *voice.Exchange) {
+	c.mu.Lock()
+	delete(c.picks, wakeKey(x))
+	c.mu.Unlock()
+}
+
 var (
 	// replyFillers may begin a reply: "uh, yes".
 	replyFillers = set(strings.Fields("uh um oh well hmm mm"))
@@ -91,20 +99,17 @@ var (
 	noTails   = set([]string{"", "not", "not that", "not that one", "not this one", "thanks", "thank you", "neither"})
 	noPhrases = set([]string{"not that one", "not this one", "neither", "neither one"})
 	// selectionWords may stand beside the cues of a selection and add
-	// nothing to it: a filler, a yes, and the words people put around a
+	// nothing to it: a filler, a yes, and the few words people put around a
 	// choice ("the one", "that's the wake word issue", "please use the first
-	// one", "I think the first one", "let's do the first one", "I'd say the
-	// wake word one", "probably the second one", "the first one then"). Any
-	// other word is substance: the reply is talk, not a selection. A phrase
-	// outside this list is treated as a new question by design: a missed
-	// pick only answers the reply as a question, where a wrong one sends the
-	// question first asked.
+	// one", "I think the first one", "probably the second one", "the first
+	// one then"). Any other word is substance: the reply is talk, not a
+	// selection. The list is kept narrow, and a phrase outside it is a new
+	// question by design ("let's do the first one", "go for the first one",
+	// "I'd say the wake word one"): a missed pick costs a new answer, where a
+	// wrong one sends a question nobody asked.
 	selectionWords = set(strings.Fields(`uh um oh hmm mm okay ok so well yeah yea yes yep yup sure right correct exactly please thanks thank you
 		the a one that that's this it it's issue ticket i i'll i'd mean meant use take pick choose go with want about
-		think guess say then let's lets do for maybe probably actually just now`))
-	// replyOpeners may come before a question's leading verb and leave it
-	// leading: "okay, do you mean the first one".
-	replyOpeners = set(strings.Fields("uh um oh hmm mm well so okay ok yeah yea yes yep yup sure right"))
+		think guess then maybe probably actually just now`))
 )
 
 // replyWords are turn's words, lower case, its issue keys and the fillers it
@@ -131,23 +136,20 @@ func declines(turn string) bool {
 }
 
 // confirms reports whether turn may confirm an offered issue: it holds no
-// question mark, no question word ("what", "which"; "what's" is "what") and
-// no negation (negations, or a word that ends in "n't") anywhere, and does not
-// lead with a question's verb (auxiliaries, "am"), after the words a reply
-// opens with (replyOpeners): "do you mean the first one" asks, "let's do the
-// first one" picks. Every way a reply picks an issue (pickIn) runs only
-// behind it.
+// question mark, no question word or verb a question puts first
+// (questionWords, auxiliaries, "am"; "what's" is "what") and no negation
+// (negations, or a word that ends in "n't"), anywhere: "the first one, do I
+// pick that" asks. Every way a reply picks an issue (pickIn) runs only behind
+// it.
 func confirms(turn string) bool {
 	if strings.Contains(turn, "?") {
 		return false
 	}
-	leading := true
 	for _, word := range replyWords(turn) {
 		base, _, _ := strings.Cut(word, "'")
-		if questionWords[base] || negations[base] || strings.HasSuffix(word, "n't") || leading && (auxiliaries[base] || base == "am") {
+		if questionWords[base] || auxiliaries[base] || base == "am" || negations[base] || strings.HasSuffix(word, "n't") {
 			return false
 		}
-		leading = leading && replyOpeners[word]
 	}
 	return true
 }

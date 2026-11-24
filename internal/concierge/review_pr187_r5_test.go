@@ -14,7 +14,8 @@ import (
 
 // TestReview187R5FramedSelections (the R): the words people put around a
 // choice frame a selection and add nothing to it; any other word still makes
-// the reply talk, and a question's leading verb still makes it a question.
+// the reply talk, and a question's verb still makes it a question. Round 6
+// narrowed the list: "let's do", "go for" and "I'd say" are new questions.
 func TestReview187R5FramedSelections(t *testing.T) {
 	for _, tc := range []struct {
 		reply, key string
@@ -23,18 +24,18 @@ func TestReview187R5FramedSelections(t *testing.T) {
 		// Sol's two.
 		{"I think the first one", "ABC-12", true},
 		{"the first one then", "ABC-12", true},
-		// Main's four.
-		{"let's do the first one", "ABC-12", true},
+		// Main's four, two of them new questions since round 6.
+		{"let's do the first one", "", false},
 		{"I guess the wake word one", "ABC-13", true},
-		{"go for the first one", "ABC-12", true},
+		{"go for the first one", "", false},
 		{"probably the second one", "ABC-13", true},
 		// The rest of the list.
-		{"I'd say the wake word one", "ABC-13", true},
+		{"I'd say the wake word one", "", false},
 		{"maybe the first one", "ABC-12", true},
 		{"actually, the second one", "ABC-13", true},
 		{"just the first one", "ABC-12", true},
 		{"the second one now", "ABC-13", true},
-		{"lets do ABC-13", "ABC-13", true},
+		{"lets do ABC-13", "", false},
 		// Still talk: words outside the list.
 		{"first coffee, then lunch", "", false},
 		{lessonsReply, "", false},
@@ -83,7 +84,7 @@ func TestReview187R5SpelledKeysNameKnownProjects(t *testing.T) {
 		"X V six evals":                  "X V six evals",
 		"what's happening with A B C 13": "what's happening with ABC-13",
 	} {
-		if got := r.concierge.readSpelledKeys(ctx, in, true); got != want {
+		if got := readKeys(t, r, in); got != want {
 			t.Errorf("readSpelledKeys(%q) = %q, want %q", in, got, want)
 		}
 	}
@@ -92,7 +93,7 @@ func TestReview187R5SpelledKeysNameKnownProjects(t *testing.T) {
 		"I O U twenty dollars":                 "search:twenty dollars",
 		"what's happening with X V six evals?": "search:xv6 evals",
 	} {
-		if got := r.concierge.readTarget(ctx, r.concierge.readSpelledKeys(ctx, in, true), true); got != want {
+		if got := r.concierge.readTarget(ctx, readKeys(t, r, in), true); got != want {
 			t.Errorf("readTarget(%q) = %q, want %q", in, got, want)
 		}
 	}
@@ -118,6 +119,7 @@ func TestReview187R5SpelledKeysThroughAnswer(t *testing.T) {
 func pendingSends(t *testing.T, candidates []candidate, reply string) int {
 	t.Helper()
 	r := newRig(t)
+	warmProjects(r)
 	heldIssue(r, "session", false)
 	r.exchange.FollowUpTurn = true
 	r.model.turns = [][]*genai.GenerateContentResponse{{chunk(text("ABC-12: PR 80 is in review."))}}

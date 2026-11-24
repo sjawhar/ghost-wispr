@@ -92,18 +92,29 @@ func spokenKeys(words string) string {
 }
 
 // readSpelledKeys rewrites each key of words whose project is said letter by
-// letter (spelledKey) to its written form, "ABC-13", when Dispatch knows the
-// project (isProject; with wait, as readTarget's); other letters stay as
-// said. A turn goes through it once, where it enters the Concierge (Heard,
-// answer), so every reading of the turn after sees the key.
-func (c *Concierge) readSpelledKeys(ctx context.Context, words string, wait bool) string {
-	return spelledKey.ReplaceAllStringFunc(words, func(match string) string {
+// letter (spelledKey) to its written form, "ABC-13", when the cached project
+// list holds the project (cachedProject); other letters stay as said. It
+// never waits for the list. unread reports a run of letters that could be a
+// key while the list cannot tell (never read, or its read failed): such a
+// turn is neither a pick nor words to search. A turn goes through it once,
+// where it enters the Concierge (Heard, answer), so every reading of the
+// turn after sees the key.
+func (c *Concierge) readSpelledKeys(ctx context.Context, words string) (read string, unread bool) {
+	read = spelledKey.ReplaceAllStringFunc(words, func(match string) string {
 		key, trail, ok := writtenKey(spelledKey, match)
-		if project, _, _ := strings.Cut(key, "-"); !ok || !c.isProject(ctx, project, wait) {
+		if !ok {
 			return match
 		}
-		return key + trail
+		project, _, _ := strings.Cut(key, "-")
+		switch known, sure := c.cachedProject(ctx, project); {
+		case !sure:
+			unread = true
+		case known:
+			return key + trail
+		}
+		return match
 	})
+	return read, unread
 }
 
 // keyDigits is an issue number said in words, in digits: a number with a
@@ -275,7 +286,13 @@ func (c *Concierge) Heard(ctx context.Context, x *voice.Exchange, words string) 
 	if ctx.Err() != nil || c.records == nil {
 		return
 	}
-	target := c.readTarget(ctx, c.readSpelledKeys(ctx, words, false), false)
+	// A run of letters that could be a key the project list cannot tell
+	// yet is neither read nor searched (readSpelledKeys).
+	words, unread := c.readSpelledKeys(ctx, words)
+	if unread {
+		return
+	}
+	target := c.readTarget(ctx, words, false)
 	// A number-only turn (no key, no work words) skips the read-ahead: it
 	// goes straight to the bare-number candidate lookup. A turn with words
 	// beyond the number keeps its search.
