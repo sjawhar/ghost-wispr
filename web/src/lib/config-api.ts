@@ -29,6 +29,8 @@ export interface ProviderConfig {
   url?: string
   project?: string
   location?: string
+  // Vertex AI: the request labels each Gemini generate call carries.
+  labels?: Record<string, string>
   auth: {
     // api_key, google, google_id_token or openai_wif in a config the unit
     // takes without a warning.

@@ -20,6 +20,11 @@ var providerSchema = map[string]any{
 		"url":      map[string]any{"type": "string", "description": "The API's base URL, such as a model gateway's; absent is the API's public address"},
 		"project":  map[string]any{"type": "string", "description": "Vertex AI: the Google Cloud project"},
 		"location": map[string]any{"type": "string", "description": "Vertex AI: the location, such as global or us"},
+		"labels": map[string]any{
+			"type":                 "object",
+			"additionalProperties": map[string]any{"type": "string"},
+			"description":          "Vertex AI: the request labels each generateContent and streamGenerateContent call carries, which Vertex AI copies into Cloud Billing for pay-as-you-go traffic",
+		},
 		"auth": map[string]any{
 			"type": "object",
 			"properties": map[string]any{

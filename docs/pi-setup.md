@@ -491,8 +491,12 @@ ssh ghost-wispr@ghost-wispr.tail12ec1c.ts.net "rm -rf -- '$remote_dir'"
 That YAML names the Pi's providers (README, "Model providers"): `vertex` and `vertex-us`, Vertex AI
 in `theorem-agent-infra` at `global` and at the `us` multi-region, signed in with the Pi's Google
 workload identity; `openai`, by OpenAI workload identity; and `deepgram`, by the key the full
-provisioner writes into `.env` as `GHOST_WISPR_DEEPGRAM_API_KEY`. The model gateway's `gateway`
-entry is there commented out, until the gateway admits the Pi ("The model gateway"). Its roles:
+provisioner writes into `.env` as `GHOST_WISPR_DEEPGRAM_API_KEY`. Both Vertex AI providers carry
+the labels `owner: sjawhar` and `stream: agents-no-stream`: every Gemini generate call (the
+Concierge, summaries, speech) sends them, and Vertex AI copies them into Cloud Billing, so the Pi's
+Gemini spend is attributed to its owner and stream (dispatch://INFRA-1027); search's embeddings
+carry none. The model gateway's `gateway` entry is there commented out, until the gateway admits
+the Pi ("The model gateway"). Its roles:
 `deepgram/nova-3` for live and batch transcription,
 `vertex/gemini-4-carbon` for summaries (each session online: `summarization.batch_jobs: false`,
 because `theorem-agent-infra`'s IAM deny policy `vertex-jobs-fence`, dispatch://INFRA-3614, refuses

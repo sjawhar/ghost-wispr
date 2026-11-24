@@ -74,6 +74,8 @@ providers:
   #   location: global                # or us, eu, or a region such as us-central1
   #   auth:
   #     kind: google
+  #   labels:                         # what Cloud Billing attributes its Gemini calls to
+  #     owner: example-owner
   # anthropic:
   #   api: anthropic
   #   auth:

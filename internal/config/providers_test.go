@@ -11,8 +11,9 @@ import (
 )
 
 // examplePi is a config in the office Pi's shape: a model gateway signed in by
-// a Google ID token, Vertex AI in two locations by Google workload identity,
-// OpenAI by OpenAI workload identity and Deepgram by a key.
+// a Google ID token, Vertex AI in two locations by Google workload identity
+// with billing labels, OpenAI by OpenAI workload identity and Deepgram by a
+// key.
 const examplePi = `
 google_credentials_file: /etc/example/google-credentials.json
 providers:
@@ -25,11 +26,13 @@ providers:
     project: example-project
     location: global
     auth: {kind: google}
+    labels: {owner: example-owner, stream: example-stream}
   vertex-us:
     api: vertex
     project: example-project
     location: us
     auth: {kind: google}
+    labels: {owner: example-owner, stream: example-stream}
   openai:
     api: openai
     auth: {kind: openai_wif, identity_provider_id: idp-example, service_account_id: sa-example}
@@ -413,8 +416,8 @@ func TestRoleModelsComeFromTheEnvironment(t *testing.T) {
 	}
 }
 
-// TestASettingsSaveKeepsTheProviders fails if a settings save drops a provider
-// or its sign-in from the file, or writes a key into it.
+// TestASettingsSaveKeepsTheProviders fails if a settings save drops a provider,
+// its sign-in or its labels from the file, or writes a key into it.
 func TestASettingsSaveKeepsTheProviders(t *testing.T) {
 	clearVoiceEnv(t)
 	t.Setenv(EnvPrefix+"DEEPGRAM_API_KEY", "dg-secret-example")
@@ -439,6 +442,11 @@ func TestASettingsSaveKeepsTheProviders(t *testing.T) {
 	}
 	if !reflect.DeepEqual(reloaded.Providers, store.Get().Providers) || len(reloaded.Providers) != 5 {
 		t.Errorf("providers after a save %+v, want the five saved %+v", reloaded.Providers, store.Get().Providers)
+	}
+	for _, name := range []string{"vertex", "vertex-us"} {
+		if got, want := reloaded.Providers[name].Labels, map[string]string{"owner": "example-owner", "stream": "example-stream"}; !maps.Equal(got, want) {
+			t.Errorf("%s's labels after a save = %v, want %v", name, got, want)
+		}
 	}
 }
 

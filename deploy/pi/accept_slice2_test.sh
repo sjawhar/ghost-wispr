@@ -166,6 +166,17 @@ for check in auth.identity_provider_id:providers.openai.auth.identity_provider_i
     fail "self-test accepted a running process whose $path is any string"
   fi
 done
+# A8 compares each Vertex AI provider's billing labels with the template's. Either comparison
+# dropped must fail the self-test, whose drifts include a provider with no labels.
+for provider in vertex vertex-us; do
+  source_text=$(<"$driver")
+  needle=".labels == {\"owner\": \$plan[\"providers.$provider.labels.owner\"], \"stream\": \$plan[\"providers.$provider.labels.stream\"]}"
+  [[ "$source_text" == *"$needle"* ]] || fail "could not plant the mutation of the $provider labels comparison"
+  printf '%s' "${source_text/"$needle"/true}" >"$mutated_driver"
+  if bash "$mutated_driver" --self-test >/dev/null 2>&1; then
+    fail "self-test accepted a running process whatever its $provider labels"
+  fi
+done
 # A8 refuses a running process that names a provider the plan does not, such as the gateway the
 # template keeps commented out until it admits the Pi: that provider's row can read Fails.
 source_text=$(<"$driver")

@@ -62,7 +62,7 @@ func NewGenerator(ctx context.Context, p *providers.Provider) (Generator, error)
 		if err != nil {
 			return nil, fmt.Errorf("concierge: create the Gemini client: %w", err)
 		}
-		return genaiGenerator{models: client.Models, provider: p.Name}, nil
+		return genaiGenerator{models: client.Models, provider: p.Name, labels: p.GenerateLabels()}, nil
 	case config.APIOpenAI:
 		return newOpenAIGenerator(p), nil
 	}
@@ -71,12 +71,23 @@ func NewGenerator(ctx context.Context, p *providers.Provider) (Generator, error)
 
 // genaiGenerator is genai's client, whose errors it reduces as the
 // provider's (providererr): genai's own text quotes the provider's message.
+// Each call carries the provider's labels, on Vertex AI.
 type genaiGenerator struct {
 	models   *genai.Models
-	provider string // the provider's name, which its errors name
+	provider string            // the provider's name, which its errors name
+	labels   map[string]string // the provider's GenerateLabels
 }
 
 func (g genaiGenerator) GenerateContentStream(ctx context.Context, model string, contents []*genai.Content, cfg *genai.GenerateContentConfig) iter.Seq2[*genai.GenerateContentResponse, error] {
+	if len(g.labels) > 0 {
+		// A copy: the Concierge reuses the config it passes.
+		var labeled genai.GenerateContentConfig
+		if cfg != nil {
+			labeled = *cfg
+		}
+		labeled.Labels = g.labels
+		cfg = &labeled
+	}
 	return func(yield func(*genai.GenerateContentResponse, error) bool) {
 		for response, err := range g.models.GenerateContentStream(ctx, model, contents, cfg) {
 			if !yield(response, providererr.From(g.provider, err)) {
