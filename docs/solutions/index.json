@@ -55,5 +55,11 @@
   ],
   "internal/voice/tts": [
     "stop-gates-read-the-source-context.md"
+  ],
+  "internal/voice": [
+    "revised-final-wake-boundary.md"
+  ],
+  "internal/concierge": [
+    "revised-final-wake-boundary.md"
   ]
 }
