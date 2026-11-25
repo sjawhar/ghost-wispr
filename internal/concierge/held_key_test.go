@@ -33,15 +33,22 @@ func heldKeyRig(t *testing.T, unit string) *rig {
 // read-ahead reads no key of one digit, so the answer takes the read ahead
 // of the room's keys of two digits or more (AskerTurn, #192), as main does:
 // ABC-12. It reads no one-digit key the vendor's words leave out, as main,
-// which reads none. It fails if INFRA-7 is read, or if ABC-12 is not named
-// where the room said it. At 8998810 the mixed turn heard "I found no issue
-// for that"; at e5cf4d6 it named INFRA-7.
+// which reads none. Keys of one digit take no place in the read-ahead's three
+// (maxKeys): "what about ABC-12 and INFRA-1 and INFRA-2 and INFRA-3" reads
+// ABC-12, and "... ABC-12 and ABC-13 and ABC-14 and INFRA-7" tries ABC-14 and
+// ABC-13, then ABC-12, as main (Sol's review of #194 at 07cc6a5, round 6). It
+// fails if a key of one digit is read, or if ABC-12 is not named where the
+// room said it. At 8998810 the mixed turn heard "I found no issue for that";
+// at e5cf4d6 it named INFRA-7; at 07cc6a5 the two rows of four keys asked for
+// the key.
 func TestAVendorsWordingReadsWhatMainReads(t *testing.T) {
 	for unit, want := range map[string]string{
-		"what about ABC-12":             "ABC-12",
-		"what about ABC-12 and INFRA-7": "ABC-12",
-		"what about INFRA-7":            "",
-		"what about infra 7":            "",
+		"what about ABC-12":                                     "ABC-12",
+		"what about ABC-12 and INFRA-7":                         "ABC-12",
+		"what about INFRA-7":                                    "",
+		"what about infra 7":                                    "",
+		"what about ABC-12 and INFRA-1 and INFRA-2 and INFRA-3": "ABC-12",
+		"what about ABC-12 and ABC-13 and ABC-14 and INFRA-7":   "ABC-12",
 	} {
 		t.Run(unit, func(t *testing.T) {
 			r := heldKeyRig(t, unit)
@@ -50,10 +57,38 @@ func TestAVendorsWordingReadsWhatMainReads(t *testing.T) {
 			r.model.turns = [][]*genai.GenerateContentResponse{{chunk(text("ABC-12 is todo."))}}
 			var spoken []said
 			err := r.concierge.Answer(context.Background(), &r.exchange, "what about the realtime voice", recorder(&spoken))
-			if calls := r.records.calls(); slices.Contains(calls, "INFRA-7") || r.exchange.IssueKey != want {
-				t.Fatalf("reads %q, IssueKey %q, spoken %+v, err %v; want IssueKey %q and no read of INFRA-7", calls, r.exchange.IssueKey, spoken, err, want)
+			calls := r.records.calls()
+			if slices.ContainsFunc(calls, oneDigit) || r.exchange.IssueKey != want {
+				t.Fatalf("reads %q, IssueKey %q, spoken %+v, err %v; want IssueKey %q and no read of a key of one digit", calls, r.exchange.IssueKey, spoken, err, want)
 			}
 		})
+	}
+}
+
+// oneDigit reports whether key's number has one digit.
+func oneDigit(key string) bool {
+	_, number, _ := strings.Cut(key, "-")
+	return len(number) == 1
+}
+
+// TestTheReadAheadKeepsMainsKeysUnderItsLimit (Sol's review of #194 at
+// 07cc6a5, round 6): the read-ahead reads main's keys, two digits or more,
+// the last said first, at most maxKeys of them; keys of one digit are left
+// out before the limit, so they take none of its places. It fails if a key of
+// one digit takes a place a key of two digits main reads would have had.
+func TestTheReadAheadKeepsMainsKeysUnderItsLimit(t *testing.T) {
+	r := newRig(t)
+	view := r.concierge.viewProjects()
+	for words, want := range map[string]string{
+		"what about ABC-12 and INFRA-1 and INFRA-2 and INFRA-3": "keys:ABC-12",
+		"what about ABC-12 and ABC-13 and ABC-14 and INFRA-7":   "keys:ABC-14,ABC-13,ABC-12",
+		"what about INFRA-1 and ABC-12 and INFRA-2 and ABC-13":  "keys:ABC-13,ABC-12",
+		"what about ABC-11 and ABC-12 and ABC-13 and ABC-14":    "keys:ABC-14,ABC-13,ABC-12",
+		"what about INFRA-1 and INFRA-2":                        "",
+	} {
+		if got := r.concierge.aheadTarget(view, words); keysOf(got) != keysOf(want) {
+			t.Errorf("aheadTarget(%q) = %q, want the keys of %q", words, got, want)
+		}
 	}
 }
 

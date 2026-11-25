@@ -382,10 +382,31 @@ func (p *prefetch) cancelAll() {
 // (searchTerms); both empty when it sends nothing. A read-ahead's search is
 // reused for the same target alone, so for the same two.
 func (c *Concierge) readTarget(v projectsView, words string) string {
+	keys := c.targetKeys(v, words, nil)
+	// A key of one digit the view reads is read, not searched: the turn's
+	// search holds no such key's words, as it holds none of a longer key's.
+	rest := v.withoutOneDigitKeys(words)
+	question := v.searchQuestion(rest)
+	search := question + "|" + searchTerms(rest)
+	if len(keys) > 0 {
+		return "keys:" + strings.Join(keys, ",") + "|" + search
+	}
+	if question != "" {
+		return "search:" + search
+	}
+	return ""
+}
+
+// targetKeys is the keys a read of words tries: each key the view reads in
+// them whose project it holds and that skip leaves in (skip nil: every one),
+// or, with none, the issue of the agent that joined on a number said alone;
+// the last said first, each once, at most maxKeys of them. skip is applied
+// before the limit, so a key it leaves out takes none of the limit's places.
+func (c *Concierge) targetKeys(v projectsView, words string, skip map[string]bool) []string {
 	var keys []string
 	for _, key := range v.issueKeys(words) {
 		project, _, _ := strings.Cut(key, "-")
-		if v.holds(project) {
+		if v.holds(project) && !skip[key] {
 			keys = append(keys, key)
 		}
 	}
@@ -396,20 +417,9 @@ func (c *Concierge) readTarget(v projectsView, words string) string {
 			keys = append(keys, key)
 		}
 	}
-	// A key of one digit the view reads is read, not searched: the turn's
-	// search holds no such key's words, as it holds none of a longer key's.
-	rest := v.withoutOneDigitKeys(words)
-	question := v.searchQuestion(rest)
-	search := question + "|" + searchTerms(rest)
-	if len(keys) > 0 {
-		slices.Reverse(keys)
-		keys = slices.Compact(keys)
-		return "keys:" + strings.Join(keys[:min(len(keys), maxKeys)], ",") + "|" + search
-	}
-	if question != "" {
-		return "search:" + search
-	}
-	return ""
+	slices.Reverse(keys)
+	keys = slices.Compact(keys)
+	return keys[:min(len(keys), maxKeys)]
 }
 
 // aheadTarget is what the read-ahead reads of words, the turn so far: what
@@ -419,25 +429,21 @@ func (c *Concierge) readTarget(v projectsView, words string) string {
 // not mean (Sol's R2 to R5); main reads none at all. A key of one digit is
 // read only by the answer, from the turn's final words (readTarget). Words
 // that hold one are read ahead for their other keys alone, as main reads
-// them, and are not searched, since the answer reads the key first; with no
-// other key nothing is read ahead. Words with no key of one digit are read
-// as main reads them.
+// them: the keys of one digit are left out before the limit of maxKeys, so
+// they take none of its places (Sol's review of #194 at 07cc6a5: "what about
+// ABC-12 and INFRA-1 and INFRA-2 and INFRA-3" read nothing ahead). They are
+// not searched, since the answer reads the key first; with no other key
+// nothing is read ahead. Words with no key of one digit are read as main
+// reads them.
 func (c *Concierge) aheadTarget(v projectsView, words string) string {
-	target := c.readTarget(v, words)
 	oneDigit := v.oneDigitKeys(words)
 	if len(oneDigit) == 0 {
-		return target
+		return c.readTarget(v, words)
 	}
-	var keys []string
-	for _, key := range strings.Split(keysOf(target), ",") {
-		if key != "" && !oneDigit[key] {
-			keys = append(keys, key)
-		}
+	if keys := c.targetKeys(v, words, oneDigit); len(keys) > 0 {
+		return "keys:" + strings.Join(keys, ",")
 	}
-	if len(keys) == 0 {
-		return ""
-	}
-	return "keys:" + strings.Join(keys, ",")
+	return ""
 }
 
 // searchOf is what target's search sends Dispatch: the question for its
