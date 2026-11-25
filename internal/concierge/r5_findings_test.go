@@ -352,10 +352,11 @@ func TestAZeroScoreIsNoClearMatch(t *testing.T) {
 
 // TestAFailedKeywordSearchAndASlowFullSearchAreAnOutage (R10): when the
 // keyword search fails and the full search answers nothing in its bound,
-// neither search answered: the room hears that Dispatch is out of reach,
+// Dispatch failed a search: the room hears that Dispatch is out of reach,
 // with the error sound, as for any other outage of Dispatch's. On main it
 // heard "I found no issue for that". A keyword search that answered, with
-// nothing, beside a slow full one is still a slow search, no outage.
+// nothing, beside a slow full one is a slow search: the room hears so, with
+// no error sound (#194's rule: a slow search is no outage, a failed one is).
 func TestAFailedKeywordSearchAndASlowFullSearchAreAnOutage(t *testing.T) {
 	for name, kwErr := range map[string]error{
 		"out of reach": fmt.Errorf("dispatch: %w", dispatch.ErrUnreachable),
@@ -382,8 +383,8 @@ func TestAFailedKeywordSearchAndASlowFullSearchAreAnOutage(t *testing.T) {
 		r.records.searchDelay = time.Hour
 		var spoken []said
 		err := r.concierge.Answer(context.Background(), &r.exchange, "what is happening with the realtime voice", recorder(&spoken))
-		if errors.Is(err, voice.ErrUnreachable) || len(spoken) == 0 || spoken[len(spoken)-1].text != noIssueFound {
-			t.Errorf("Answer = %v, spoken %+v; want %q and no outage", err, spoken, noIssueFound)
+		if err != nil || len(spoken) == 0 || spoken[len(spoken)-1].text != searchIsSlow {
+			t.Errorf("Answer = %v, spoken %+v; want %q and no error", err, spoken, searchIsSlow)
 		}
 	})
 }
