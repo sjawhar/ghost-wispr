@@ -2,7 +2,6 @@ package concierge
 
 import (
 	"regexp"
-	"slices"
 	"strings"
 	"unicode"
 	"unicode/utf8"
@@ -32,23 +31,33 @@ func spokenName(name string) string {
 }
 
 // titleSeparator is what a session's title puts between its parts: "Legion
-// architect · INFRA-7", "Worker | INFRA-7", "Release - notes". The voice says
-// none of them.
-var titleSeparator = regexp.MustCompile(`\s*[·•‧∙|—–]\s*|\s+-\s+`)
+// architect · INFRA-7", "Worker | INFRA-7", "Release - notes", and a hyphen
+// that stands alone at either end, "Worker - ". The voice says none of them.
+// A hyphen inside a word ("Parser-evals", "INFRA-7") is no separator.
+var titleSeparator = regexp.MustCompile(`\s*[·•‧∙|—–]\s*|(?:^|\s+)-(?:\s+|$)`)
 
-// legionRole is a part of a Legion session's title that names its role:
-// "Legion architect".
-var legionRole = regexp.MustCompile(`(?i)^legion\s+(\p{L}+)$`)
+// legionRole is the first part of a Legion session's title, "Legion" and its
+// role of one or two words: "Legion architect", "Legion merge queue",
+// "Legion merge-queue". Legion titles its sessions "Legion <role> · <issue>"
+// (pi-legion's legionSessionTitle), a controller "Legion controller ·
+// <PROJECT>", and its daemon "Legion daemon · <project>".
+var legionRole = regexp.MustCompile(`(?i)^legion\s+([\p{L}-]+(?:\s+[\p{L}-]+)?)$`)
+
+// titleProject is a Dispatch project key standing alone as a part of a title.
+var titleProject = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9]*$`)
 
 // sessionName is an agent session's title as the voice and its model may say
-// it of issue key ("" when it is of no issue): spokenName's words, with no
-// separator (titleSeparator) between its parts, which are joined by commas,
-// and the issue's own key left out, as the sentence names the issue. A
-// Legion session's title, its role and an issue's key, is the role of that
-// issue: "Legion architect · INFRA-7" is "its architect" of INFRA-7 and
-// "INFRA-7's architect" of another issue. Live on 2026-11-25 the room heard
-// "INFRA-7 is held by Legion architect · INFRA-7". A title that is the
-// issue's key alone is "its agent".
+// it of issue key ("" when it is of no issue). Its words are spokenName's,
+// its parts apart from their separators (titleSeparator) are joined by
+// commas, and the issue's own key is left out wherever it stands as a word,
+// as the sentence names the issue already (withoutKey). A Legion session's
+// title, its role and an issue's key, is the role of that issue, its role's
+// words as said: "Legion architect · INFRA-7" is "its architect" of INFRA-7
+// and "INFRA-7's architect" of another issue, "Legion merge-queue · INFRA-7"
+// "its merge queue"; its role and a project, the project's Legion role:
+// "Legion controller · INFRA" is "INFRA's Legion controller". A title that is
+// the issue's key alone is "its agent". Live on 2026-11-25 the room heard
+// "INFRA-7 is held by Legion architect · INFRA-7".
 func sessionName(title, key string) string {
 	var parts []string
 	for _, part := range titleSeparator.Split(spokenName(title), -1) {
@@ -58,22 +67,55 @@ func sessionName(title, key string) string {
 	}
 	if len(parts) == 2 {
 		if role := legionRole.FindStringSubmatch(parts[0]); role != nil {
+			said := strings.Join(strings.Fields(strings.ToLower(strings.ReplaceAll(role[1], "-", " "))), " ")
 			if issue, err := dispatch.NormalizeIssueKey(parts[1]); err == nil {
 				if issue == key {
-					return "its " + strings.ToLower(role[1])
+					return "its " + said
 				}
-				return issue + "'s " + strings.ToLower(role[1])
+				return issue + "'s " + said
+			}
+			if titleProject.MatchString(parts[1]) {
+				return strings.ToUpper(parts[1]) + "'s Legion " + said
 			}
 		}
 	}
-	kept := slices.DeleteFunc(slices.Clone(parts), func(part string) bool {
-		issue, err := dispatch.NormalizeIssueKey(part)
-		return err == nil && issue == key
-	})
+	var kept []string
+	for _, part := range parts {
+		if part = withoutKey(part, key); part != "" {
+			kept = append(kept, part)
+		}
+	}
 	if len(kept) == 0 && len(parts) > 0 {
 		return "its agent"
 	}
 	return strings.Join(kept, ", ")
+}
+
+// withoutKey is part with each occurrence of issue key as a word of its own
+// ("INFRA-17", "infra-17", "INFRA-17's"), any case, taken out, and the
+// spaces and the comma, colon or semicolon it leaves at either end gone. A
+// key at the part's end takes the preposition before it along ("Worker on
+// ABC-12" is "Worker"), which would be left with no object. A key inside a
+// longer word ("XINFRA-17", "INFRA-170", "INFRA-17-b") stays.
+func withoutKey(part, key string) string {
+	if key == "" {
+		return part
+	}
+	quoted := regexp.QuoteMeta(key)
+	part = regexp.MustCompile(`(?i)(^|[^\p{L}\p{N}-])(?:(?:on|for|of|about|with|to|at|in|from|by)\s+)?`+quoted+`(?:['’]s)?[\s.,:;!?]*$`).ReplaceAllString(part, "$1")
+	own := regexp.MustCompile(`(?i)(^|[^\p{L}\p{N}-])` + quoted + `(?:['’]s)?($|[^\p{L}\p{N}-])`)
+	// A match takes the character on each side of the key, so a key right
+	// after another is found on the next pass.
+	for {
+		next := own.ReplaceAllString(part, "$1$2")
+		if next == part {
+			break
+		}
+		part = next
+	}
+	return strings.TrimFunc(strings.Join(strings.Fields(part), " "), func(r rune) bool {
+		return r == ',' || r == ':' || r == ';' || unicode.IsSpace(r)
+	})
 }
 
 // searchStopwords are the words of a spoken question that name no work:

@@ -90,28 +90,113 @@ func TestTheHolderIsSpokenByItsRole(t *testing.T) {
 	}
 }
 
-// TestASessionNameIsItsWords: sessionName's table. A title's parts apart from
-// its separators ("·", "•", "|", a dash), the issue's own key left out, a
-// Legion role named as the issue's ("its architect") or another issue's
-// ("INFRA-12's reviewer"); an emoji goes, as spokenName has it.
+// TestASessionNameIsItsWords: sessionName's table, over Sol's review of #198
+// at 8821f65, each title Legion gives a session, and each shape of title
+// live Dispatch's sessions had on 2026-11-25 (1,373 sessions, their words
+// made up here). A title is said as its parts apart from their separators
+// ("·", "•", "|", an en or em dash, a hyphen that stands alone, at either end
+// too), joined by commas, an emoji gone (spokenName), and the issue's own key
+// left out wherever it stands as a word. A Legion session's title, "Legion
+// <role> · <KEY>", is the role of that issue, its role words as said ("its
+// architect", "INFRA-12's merge queue"); "Legion <role> · <PROJECT>" is the
+// project's Legion role ("INFRA's Legion controller").
 func TestASessionNameIsItsWords(t *testing.T) {
 	for _, tc := range []struct{ title, key, want string }{
+		// Legion's phase roles (legion-roles.ts, LEGION_ROLES), of the issue
+		// and of another: "Legion <role> · <issue>" (pi-legion's
+		// legionSessionTitle, claudebridge's Title).
 		{"Legion architect · INFRA-7", "INFRA-7", "its architect"},
+		{"Legion planner · INFRA-7", "INFRA-7", "its planner"},
+		{"Legion implementer · INFRA-7", "INFRA-7", "its implementer"},
+		{"Legion tester · INFRA-7", "INFRA-7", "its tester"},
+		{"Legion reviewer · INFRA-7", "INFRA-7", "its reviewer"},
+		{"Legion merger · INFRA-7", "INFRA-7", "its merger"},
+		{"Legion architect · INFRA-12", "INFRA-7", "INFRA-12's architect"},
+		{"Legion planner · INFRA-12", "INFRA-7", "INFRA-12's planner"},
+		{"Legion implementer · INFRA-12", "INFRA-7", "INFRA-12's implementer"},
+		{"Legion tester · INFRA-12", "INFRA-7", "INFRA-12's tester"},
 		{"Legion reviewer · INFRA-12", "INFRA-7", "INFRA-12's reviewer"},
+		{"Legion merger · INFRA-12", "INFRA-7", "INFRA-12's merger"},
+		// A role of several words, as a project's merge-queue role (Sol's O2),
+		// or one with a hyphen, said as words.
+		{"Legion merge queue · INFRA-17", "INFRA-17", "its merge queue"},
+		{"Legion merge queue · INFRA-12", "INFRA-17", "INFRA-12's merge queue"},
+		{"Legion merge-queue · INFRA-17", "INFRA-17", "its merge queue"},
+		{"Legion sub-architect · INFRA-12", "INFRA-17", "INFRA-12's sub architect"},
+		// The controller and the daemon name a project, not an issue.
+		{"Legion controller · INFRA", "INFRA-7", "INFRA's Legion controller"},
+		{"Legion daemon · INFRA", "INFRA-7", "INFRA's Legion daemon"},
+		{"Legion controller", "INFRA-7", "Legion controller"},
+		// Case, other separators, and no issue to speak of.
 		{"Legion implementer · infra-7", "INFRA-7", "its implementer"},
 		{"Legion architect • INFRA-7", "INFRA-7", "its architect"},
 		{"Legion architect · INFRA-7", "", "INFRA-7's architect"},
-		{"🍓 PI: Deploy the unit", "INFRA-7", "PI: Deploy the unit"},
-		{"Worker | INFRA-7", "INFRA-7", "Worker"},
-		{"Worker — realtime voice", "INFRA-7", "Worker, realtime voice"},
-		{"Release - INFRA-7 - notes", "INFRA-7", "Release, notes"},
 		{"Legion architect", "INFRA-7", "Legion architect"},
+		// A title that only looks like a role keeps its words.
+		{"Legion keeps the repository · INFRA-7", "INFRA-7", "Legion keeps the repository"},
+		{"Legion daily report", "INFRA-7", "Legion daily report"},
+		// A worker's name with an issue: "<emoji> <name> · <KEY>".
+		{"🦇 spiffy-bat · ABC-611", "ABC-611", "spiffy-bat"},
+		{"🦇 spiffy-bat · ABC-611", "INFRA-7", "spiffy-bat, ABC-611"},
+		// A task title: "<emoji> <TAG>: <sentence>", a key in it or not.
+		{"🍓 PI: Deploy the unit", "INFRA-7", "PI: Deploy the unit"},
+		{"📋 INFRA: Follow INFRA-5310 lead brief", "INFRA-5310", "INFRA: Follow lead brief"},
+		{"📋 INFRA: Follow INFRA-5310 lead brief", "INFRA-7", "INFRA: Follow INFRA-5310 lead brief"},
+		{"📨 3684: Handle INFRA-3684 Dispatch ask", "INFRA-3684", "3684: Handle Dispatch ask"},
+		{"🔑 LOGIN: Build INFRA-17's box tools login", "INFRA-17", "LOGIN: Build box tools login"},
+		// The issue's own key inside a part (Sol's O3), and only that key.
+		{"INFRA-17 Fix pause | reviewer", "INFRA-17", "Fix pause, reviewer"},
+		{"Review INFRA-17 before INFRA-170", "INFRA-17", "Review before INFRA-170"},
+		{"XINFRA-17 notes", "INFRA-17", "XINFRA-17 notes"},
+		// A key that ends its part takes the preposition before it along,
+		// which would have no object; one in the middle leaves it.
+		{"Worker on ABC-12", "ABC-12", "Worker"},
+		{"Worker on ABC-12.", "ABC-12", "Worker"},
+		{"Worker for infra-17", "INFRA-17", "Worker"},
+		{"Notes on ABC-12 rollout", "ABC-12", "Notes on rollout"},
+		{"Worker on ABC-12", "ABC-13", "Worker on ABC-12"},
+		// A tmux window and a directory with a short id, and bare names.
+		{"0:lib-L2 0cba5e30", "INFRA-7", "0:lib-L2 0cba5e30"},
+		{"legion 3084299d", "INFRA-7", "legion 3084299d"},
+		{"split:review aaaaaaaa", "INFRA-7", "split:review aaaaaaaa"},
+		{"zlib-roundtrip-TL", "INFRA-7", "zlib-roundtrip-TL"},
+		{"Parser-evals", "INFRA-7", "Parser-evals"},
+		// Free text with a dash between its clauses, cut short.
+		{"btw: how does this work - what is a hypervisor, what are the dif...", "INFRA-7", "btw: how does this work, what is a hypervisor, what are the dif..."},
+		// Separators: between parts, and at either end (Sol's O1).
+		{"Worker | INFRA-7", "INFRA-7", "Worker"},
+		{"Worker | realtime voice", "INFRA-17", "Worker, realtime voice"},
+		{"Worker — realtime voice", "INFRA-7", "Worker, realtime voice"},
+		{"Worker – realtime voice", "INFRA-7", "Worker, realtime voice"},
+		{"Release - INFRA-7 - notes", "INFRA-7", "Release, notes"},
+		{"Worker - ", "INFRA-17", "Worker"},
+		{"- Worker", "INFRA-17", "Worker"},
+		{"· Worker ·", "INFRA-17", "Worker"},
+		{"-", "INFRA-17", ""},
 		{"INFRA-7", "INFRA-7", "its agent"},
 		{"", "INFRA-7", ""},
-		{"Parser-evals", "INFRA-7", "Parser-evals"},
 	} {
 		if got := sessionName(tc.title, tc.key); got != tc.want {
 			t.Errorf("sessionName(%q, %q) = %q, want %q", tc.title, tc.key, got, tc.want)
+		}
+	}
+}
+
+// TestTheHolderToolSaysTheTitlesWords (Sol's review of #198, O2 and O3):
+// through issue_holder, a multiword Legion role is the issue's, and the
+// issue's own key inside a title is left out.
+func TestTheHolderToolSaysTheTitlesWords(t *testing.T) {
+	for _, tc := range []struct{ key, title, want string }{
+		{"INFRA-17", "Legion merge queue · INFRA-17", "its merge queue"},
+		{"INFRA-17", "Legion merge queue · INFRA-12", "INFRA-12's merge queue"},
+		{"INFRA-17", "INFRA-17 Fix pause | reviewer", "Fix pause, reviewer"},
+	} {
+		r := newRig(t)
+		issue := claimed(tc.key, "session", "agent-7", tc.title)
+		issue.HolderState = "live"
+		r.records.issues[tc.key] = issue
+		if holder := r.run(t, "issue_holder", map[string]string{"key": tc.key}); holder["title"] != tc.want {
+			t.Errorf("issue_holder(%s), session title %q: title %q, want %q", tc.key, tc.title, holder["title"], tc.want)
 		}
 	}
 }

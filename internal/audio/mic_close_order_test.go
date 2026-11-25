@@ -48,8 +48,14 @@ func TestMicCloseEndsAStreamThatBeganWhileCloseWaited(t *testing.T) {
 				time.Sleep(50 * time.Millisecond)
 				go func() { streamed <- mic.Stream(io.Discard) }()
 				// Stream has taken the stream and registered its own
-				// stopping channel, and waits for pa too.
-				time.Sleep(50 * time.Millisecond)
+				// stopping channel, and waits for pa too. It is waited for,
+				// not slept on: a Stream that began after Close took the
+				// stream would find none (Sol's review of #198, R1).
+				waitUntil(t, "Stream to register", func() bool {
+					mic.mu.Lock()
+					defer mic.mu.Unlock()
+					return mic.reading != nil
+				})
 				<-pa
 			} else {
 				go func() { streamed <- mic.Stream(io.Discard) }()
