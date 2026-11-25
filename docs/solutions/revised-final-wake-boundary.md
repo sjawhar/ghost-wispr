@@ -57,10 +57,11 @@ Sol (GPT-6.1 Sol, the cross-family reviewer) marked this C, a consent finding: r
 
 ### A blocking finding that returns after each fix
 
-- The signal: the same finding comes back in a new form after each fix. That is a bar problem, not a code problem. Do not try another shape.
+- The signal: the same finding comes back in a new form after each fix. It can mean the code is still wrong, or that the bar is. Check the bar before you try another shape.
 - Ask who set the bar. A bar in criteria that an agent wrote is that agent's claim, not the owner's.
 - Check the owner's goals and non-goals where they are recorded: the issue's spec and its non-goals, the owner's comments on it, and the owner's answers to asks (`dispatch read --issue KEY`, `dispatch answers`).
 - If the record contradicts the bar, reclassify the finding, give the reviewer the record, and ask for a review under the corrected criteria.
+- If the record supports the bar, the code is wrong: fix it. Each fix's own regressions are code defects whatever the bar. In #192, rounds 2 and 4 also lost words that main kept, and those findings stood.
 
 ## Why This Matters
 
