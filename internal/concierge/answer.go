@@ -1450,11 +1450,10 @@ func (s *sentences) speak(ctx context.Context, sentence string) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	// A retry may start with a sentence the room already heard.
-	for _, heard := range s.sp.said() {
-		if strings.EqualFold(strings.TrimSpace(heard), sentence) {
-			return nil
-		}
+	// A retry may start with a sentence the room already heard, word for
+	// word or in other words (saysNothingNew).
+	if saysNothingNew(sentence, s.sp.said()) {
+		return nil
 	}
 	words := len(strings.Fields(sentence))
 	if s.spoken >= maxFactSentences || s.words+words > maxFactWords {
@@ -1475,4 +1474,45 @@ func (s *sentences) speak(ctx context.Context, sentence string) error {
 	s.spoken++
 	s.words += words
 	return nil
+}
+
+// smallWords carry no meaning of their own in a sentence the voice says:
+// "INFRA-7's agent is not answering" and "the agent of INFRA-7 is not
+// answering" say the same. "Not", "no" and every number carry meaning, and
+// so do "it" and "this", which name a subject: "It is in review." after "PR
+// 80 is in review." says it of the issue.
+var smallWords = set(strings.Fields("a an the is are was were be been being and or but so then also of to in on at for with by as from has have had s"))
+
+// saysNothingNew reports whether sentence says nothing the room has not
+// heard: each of its words that carries meaning, in lower case, is in one
+// sentence of heard. A retry of the model's may say again, in other words,
+// a sentence the room heard before the check stopped the first try: live on
+// 2026-11-25 the room heard "INFRA-7 is in todo status with priority P1, and
+// was updated two days ago." and then "INFRA-7 is in todo status with
+// priority P1, updated two days ago.". A sentence that adds one word that
+// carries meaning, a "not" or another number among them, is said.
+func saysNothingNew(sentence string, heard []string) bool {
+	words := meaningWords(sentence)
+	for _, line := range heard {
+		held := set(meaningWords(line))
+		if !slices.ContainsFunc(words, func(word string) bool { return !held[word] }) {
+			return true
+		}
+	}
+	return false
+}
+
+// meaningWords are text's words that carry meaning (no smallWords), in lower
+// case, an issue key's project and number apart ("INFRA-7's" is "infra",
+// "7").
+func meaningWords(text string) []string {
+	var words []string
+	for _, word := range strings.FieldsFunc(strings.ToLower(text), func(r rune) bool {
+		return !unicode.IsLetter(r) && !unicode.IsDigit(r)
+	}) {
+		if !smallWords[word] {
+			words = append(words, word)
+		}
+	}
+	return words
 }
