@@ -682,14 +682,35 @@ What the voice hears, and where the room's words go:
   Deepgram hears someone start to speak over the voice, the frames still waiting are dropped. Model
   audio that comes more than 250 ms before its own text would play. The probe measured that lead at
   24 ms at most, over 146 sentences in 28 real sessions. The wait makes each answer start 250 ms later.
-- Dispatch gets a question's words only as a few search keywords (at most five), never the whole
-  sentence. Each search runs Dispatch's keyword search and its search by meaning at once, so those
-  keywords also reach its embedding model, Cohere Embed v4 on Microsoft Azure, even when the
-  keyword search answers first. An issue key the asker says
-  ("infra 4592") goes to Dispatch in the address of that issue's read, which Dispatch's access log
-  records. A number said after a word that is no project of Dispatch ("the last 30 days") is not
-  read as a key. "In for" reads as INFRA only before a number of three or more digits, as Deepgram
-  sometimes writes "infra 4592"; "in for thirty minutes" is no key.
+- Dispatch's search gets the question as spoken, without the wake phrase. When Deepgram's final
+  result drops the name or writes it otherwise ("Mister"), the turn is that result whole, so words
+  said just before the wake can go with the question. Each search runs two of Dispatch's searches
+  at once:
+  - Its search by words and meaning gets the question whole: in lower case, without the
+    punctuation around each word, a name spelled letter by letter written as the word it spells,
+    and an issue key left out (a key of one of Dispatch's projects, or, while the unit cannot tell
+    Dispatch's projects because it has not read them or its last read failed, any word that reads
+    as a key). This search sends the question to Dispatch's embedding model, Cohere Embed v4 on
+    Microsoft Azure, even when the keyword search answers first.
+  - Its keyword search, which reaches no embedding model, gets only the question's words that name
+    work, without words such as "what", "the" or "happening" and without anything that reads as a
+    key. For "the issue about X", it gets X's words alone.
+
+  The voice starts its search while the person is still speaking, once the words said so far
+  have stayed the same for 0.4 s, so the start of a question can reach Dispatch and the embedding
+  model before the person finishes it. With voice B or C, an answer whose read-ahead did not
+  search the unit's own transcript of the question searches the vendor's text of it: GPT-Live's
+  transcript joined to the unit's, or the wording of Deepgram's think model, which holds the last
+  two minutes of the transcript. When the Concierge's model searches again, it
+  sends the question or the description of the work in its own words, which can draw on the last
+  two minutes of the transcript it holds, and that text goes the same way. Dispatch searches at
+  most 1000 characters, so a longer text is cut there, between words. A search's words travel in
+  the query of its address, which Dispatch's access log does not keep. An issue key the asker
+  says ("infra 4592") goes to Dispatch in the address of that issue's read, which Dispatch's
+  access log records. A number said after a word that is no project of Dispatch ("the last 30
+  days") is not read as a key, and stays in the question. "In for" reads as INFRA only before a
+  number of three or more digits, as Deepgram sometimes writes "infra 4592"; "in for thirty
+  minutes" is no key.
 - When the record cannot answer, the Concierge asks the agent that holds the issue, over Envoy.
   The message carries the asker's question, framed as a read-only question from someone the unit
   cannot identify, with the recording session's id and time, not the transcript. A question sent to

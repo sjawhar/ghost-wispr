@@ -186,7 +186,9 @@ func TestANotFoundOutsideAnIssueReadIsLogged(t *testing.T) {
 func TestAnUnreachableDispatchEndsTheKeyReads(t *testing.T) {
 	r := newRig(t)
 	r.records.err = fmt.Errorf("%w: dial tcp: no route to host", dispatch.ErrUnreachable)
-	r.concierge.readRecord(context.Background(), &r.exchange, r.concierge.readTarget(r.concierge.viewProjects(), "what about abc 12 and xyz 34 and def 56"), nil, nil)
+	view := r.concierge.viewProjects()
+	const words = "what about abc 12 and xyz 34 and def 56"
+	r.concierge.readRecord(context.Background(), &r.exchange, view, words, r.concierge.readTarget(view, words), nil, nil)
 	// The first key's issue and holder are read side by side: one key, read
 	// once by each.
 	if calls := slices.Compact(r.records.calls()); len(calls) != 1 {
@@ -214,20 +216,6 @@ func TestANumberThatNamesNoIssueGivesWayToASearch(t *testing.T) {
 	}
 	if !slices.Contains(r.records.calls(), "AT-10") || len(r.records.searches()) != 1 {
 		t.Fatalf("issue reads %q, searches %q", r.records.calls(), r.records.searches())
-	}
-}
-
-// TestASearchSendsDispatchTheFewestWords: a search carries the issue words
-// of what was said, never the whole sentence.
-func TestASearchSendsDispatchTheFewestWords(t *testing.T) {
-	r := newRig(t)
-	r.run(t, "search_issues", map[string]string{"query": "Wispr, what is happening with the realtime spoken conversation work?"})
-	if searches := r.records.searches(); len(searches) != 1 || searches[0] != "realtime spoken conversation" {
-		t.Fatalf("searches = %q, want [realtime spoken conversation]", searches)
-	}
-	result := r.run(t, "search_issues", map[string]string{"query": "what is it, then?"})
-	if result["error"] == nil || len(r.records.searches()) != 1 {
-		t.Fatalf("a sentence with no issue words was searched: %v, %q", result, r.records.searches())
 	}
 }
 

@@ -251,8 +251,8 @@ func TestNoFactBySixSecondsSaysWhatIsKnown(t *testing.T) {
 }
 
 // TestSearchTermsTakeTheDescription: a turn that describes the issue ("the
-// issue about realtime spoken conversation") searches the description's
-// words alone, not the rest of the question.
+// issue about realtime spoken conversation") gives the keyword search the
+// description's words alone, not the rest of the question.
 func TestSearchTermsTakeTheDescription(t *testing.T) {
 	for turn, want := range map[string]string{
 		"please ask the agent who holds the issue about realtime spoken conversation when slice one will be ready to try.": "realtime spoken conversation",
@@ -523,8 +523,8 @@ func TestTheReadAheadSearchesOnceSettled(t *testing.T) {
 		{chunk(text("PR 80 is in review."))},
 	}
 	answerTurn(t, r, "what is happening with the realtime voice today now")
-	if searches := r.records.searches(); len(searches) > 2 || searches[0] != "realtime voice" {
-		t.Fatalf("searches = %q, want the settled words first and at most two in all", searches)
+	if searches := r.records.searches(); len(searches) > 2 || searches[0] != "what is happening with the realtime voice" {
+		t.Fatalf("searches = %q, want the settled question first and at most two in all", searches)
 	}
 }
 
@@ -706,9 +706,9 @@ func TestAnUnclearKeywordResultWaitsTwoSecondsAtMost(t *testing.T) {
 }
 
 // TestAnswerReusesTheReadAheadsSearch (R6; Main's rule): when the final
-// turn's search words are the words the read-ahead searched, in any order,
-// Answer takes the read-ahead's search, keyword and full, and searches no
-// more.
+// turn's question is the one the read-ahead searched, case and punctuation
+// aside, Answer takes the read-ahead's search, keyword and full, and
+// searches no more.
 func TestAnswerReusesTheReadAheadsSearch(t *testing.T) {
 	r := newRig(t)
 	r.concierge.searchSettle = 50 * time.Millisecond
@@ -717,7 +717,7 @@ func TestAnswerReusesTheReadAheadsSearch(t *testing.T) {
 	r.concierge.Heard(context.Background(), &r.exchange, "what is happening with the realtime voice")
 	eventually(t, "the read-ahead searched", func() bool { return len(r.records.searches()) == 1 })
 	r.model.turns = [][]*genai.GenerateContentResponse{{chunk(text("PR 80 is in review."))}}
-	spoken := answerTurn(t, r, "the voice, realtime: what is happening with it")
+	spoken := answerTurn(t, r, "What is happening with the realtime voice?")
 	if full, kw := len(r.records.searches()), len(r.records.kwQueries); full != 1 || kw != 1 {
 		t.Fatalf("full searches %d, keyword %d; want the read-ahead's one of each, reused", full, kw)
 	}
@@ -829,16 +829,17 @@ func TestBothSearchesHungIsAnOutage(t *testing.T) {
 	}
 }
 
-// TestAnUncountedReadAheadSearchIsCounted (R6): a read-ahead of a key that
-// names no issue searches the turn's words; that search counts toward the
-// answer's two like any other.
-func TestAnUncountedReadAheadSearchIsCounted(t *testing.T) {
+// TestAKeyReadAheadMakesNoUncountedSearch (R6): a read ahead of a key that
+// names no issue reads the key alone and searches nothing uncounted, so the
+// answer's search and the model's are at most two in all.
+func TestAKeyReadAheadMakesNoUncountedSearch(t *testing.T) {
 	r := newRig(t)
 	unclearSearch(r)
 	r.records.hits[0].Score = 0.012
 	const turn = "what about abc 99 and the realtime voice"
 	r.concierge.Heard(context.Background(), &r.exchange, turn)
-	eventually(t, "the read-ahead searched", func() bool { return len(r.records.searches()) == 1 })
+	eventually(t, "the read-ahead read the key", func() bool { return slices.Contains(r.records.calls(), "ABC-99") })
+	time.Sleep(100 * time.Millisecond)
 	search := func(id string) []*genai.GenerateContentResponse {
 		return []*genai.GenerateContentResponse{chunk(call(id, "search_issues", map[string]any{"query": "wake word " + id}, ""))}
 	}
@@ -1088,7 +1089,7 @@ func TestAReplyThatPicksNothingIsSearchedAfresh(t *testing.T) {
 	r.concierge.Heard(context.Background(), &r.exchange, "the wake word timeout")
 	r.model.turns = [][]*genai.GenerateContentResponse{{chunk(text("It is open."))}}
 	answerTurn(t, r, "the wake word timeout")
-	if searches := r.records.searches(); !slices.Contains(searches, "wake word timeout") {
+	if searches := r.records.searches(); !slices.Contains(searches, "the wake word timeout") {
 		t.Fatalf("searches = %q, want the reply's own words searched", searches)
 	}
 }

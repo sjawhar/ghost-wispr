@@ -75,14 +75,15 @@ func stringArg(description string) map[string]any {
 	return map[string]any{"type": "string", "description": description}
 }
 
-// ToolSpecs are the Concierge's tools. Voices B and C declare exactly these
-// to their vendors, and their Run takes exactly these arguments.
+// ToolSpecs are the Concierge's tools, which its model calls (all but
+// ask_agent, which the Concierge calls itself), and Run takes exactly these
+// arguments.
 func ToolSpecs() []ToolSpec {
 	return []ToolSpec{
 		{
 			Name:        "search_issues",
-			Description: "Search Dispatch, the team's issue tracker, for the issues a description names. Use it when people describe the work rather than giving an issue key.",
-			Parameters:  object([]string{"query"}, map[string]any{"query": stringArg("Two to five keywords from the description, such as 'realtime voice agent'.")}),
+			Description: "Search Dispatch, the team's issue tracker, for the issues a question or a description of the work names. Use it when people describe the work rather than giving an issue key.",
+			Parameters:  object([]string{"query"}, map[string]any{"query": stringArg("The person's question or description, whole and in their own words, without the wake phrase, such as 'what is happening with the realtime voice agent'. Dispatch searches it by words and meaning, and searches its words that name the work by keyword alone.")}),
 		},
 		{
 			Name:        "read_issue",
@@ -135,6 +136,11 @@ type runner struct {
 	fullCut <-chan struct{}
 	// holderKnown: the answer's record holds the issue's holder (offered).
 	holderKnown bool
+	// view, when set, is the turn's one reading of the project list
+	// (projectsView), which a search reads its question with. Tools leaves
+	// it nil: its runner serves a vendor's tool call made outside an answer,
+	// with no turn here, so a search reads the list as it is then.
+	view *projectsView
 }
 
 // Tools gives x's tools, for x.Tools.
@@ -293,10 +299,11 @@ func (r *runner) searchIssues(ctx context.Context, query string) (map[string]any
 	if err != nil {
 		return nil, err
 	}
-	// Dispatch gets the issue words of what was said, never the sentence.
+	// The keyword search gets the question's words that name work
+	// (searchTerms); none, and nothing is searched.
 	terms := searchTerms(query)
 	if terms == "" {
-		return nil, tell("Search for what? Give a few keywords.")
+		return nil, tell("Search for what? Give the question, or say what the work is.")
 	}
 	if r.searchesLeft != nil && *r.searchesLeft <= 0 {
 		return nil, tell("This answer has made its searches; answer from what you have.")
@@ -304,23 +311,31 @@ func (r *runner) searchIssues(ctx context.Context, query string) (map[string]any
 	if r.searchesLeft != nil {
 		*r.searchesLeft--
 	}
-	return r.c.searchBoth(ctx, records, terms, r.fullCut)
+	// The full search gets the question as said (searchQuestion), read with
+	// the turn's view of the projects, or, for Tools's runner, the list as
+	// it is now. Both are cut to what Dispatch searches.
+	view := r.view
+	if view == nil {
+		now := r.c.viewProjects()
+		view = &now
+	}
+	return r.c.searchBoth(ctx, records, withinSearchLength(view.searchQuestion(query)), withinSearchLength(terms), r.fullCut)
 }
 
-// searchBoth runs Dispatch's keyword-only search and its full search, words
-// and meaning, at once; together they are one search. A keyword result with
-// one clear match (R5) whose own title holds a word searched is taken at once
-// and the full search is stopped: keywords answer in about 0.2 s, the full
-// search in 3 to 6 s. A keyword hit names an issue through any of its texts,
-// so a clear lead whose title holds none is no clear match. Otherwise the
-// full result is taken, until cut closes (2 s after the turn ended); then, or
-// when the full search fails or runs past its bound, the keyword result is,
-// with only the issues whose own title holds a word searched (fallback),
-// whose top two, or one, the voice offers (Main's rule). When the fallback at
-// cut keeps no issue, the full search is waited for within its own bound and
-// taken as it comes. A search that found nothing in its time is slow, not out
-// of reach (R6, R10).
-func (c *Concierge) searchBoth(ctx context.Context, records Records, terms string, cut <-chan struct{}) (map[string]any, error) {
+// searchBoth runs Dispatch's keyword-only search for terms and its full
+// search, words and meaning, for question, at once; together they are one
+// search. A keyword result with one clear match (R5) whose own title holds a
+// word of terms is taken at once and the full search is stopped: keywords
+// answer in about 0.2 s, the full search in 3 to 6 s. A keyword hit names an
+// issue through any of its texts, so a clear lead whose title holds none is
+// no clear match. Otherwise the full result is taken, until cut closes (2 s
+// after the turn ended); then, or when the full search fails or runs past
+// its bound, the keyword result is, with only the issues whose own title
+// holds a word of terms (fallback), whose top two, or one, the voice offers
+// (Main's rule). When the fallback at cut keeps no issue, the full search is
+// waited for within its own bound and taken as it comes. A search that
+// found nothing in its time is slow, not out of reach (R6, R10).
+func (c *Concierge) searchBoth(ctx context.Context, records Records, question, terms string, cut <-chan struct{}) (map[string]any, error) {
 	type found struct {
 		hits []dispatch.SearchHit
 		err  error
@@ -329,7 +344,7 @@ func (c *Concierge) searchBoth(ctx context.Context, records Records, terms strin
 	defer stopFull()
 	full := make(chan found, 1)
 	go func() {
-		hits, err := records.Search(fullCtx, terms, 10)
+		hits, err := records.Search(fullCtx, question, 10)
 		full <- found{hits, err}
 	}()
 	kwHits, kwErr := records.SearchKeywords(ctx, terms, 10)

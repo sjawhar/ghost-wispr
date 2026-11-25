@@ -252,7 +252,7 @@ func (c *Concierge) answer(parent context.Context, x *voice.Exchange, turn strin
 	var found *reading
 	switch {
 	case target != "":
-		found = c.readRecord(ctx, x, target, onHolder, fullCut)
+		found = c.readRecord(ctx, x, view, turn, target, onHolder, fullCut)
 	default:
 		found = c.readFor(ctx, x, view, turn, onHolder, fullCut)
 	}
@@ -339,7 +339,7 @@ func (c *Concierge) answer(parent context.Context, x *voice.Exchange, turn strin
 		searchesLeft--
 	}
 	searchesLeft = max(searchesLeft, 0)
-	tools := &runner{c: c, x: x, searchesLeft: &searchesLeft, fullCut: fullCut, holderKnown: found.holder != nil}
+	tools := &runner{c: c, x: x, searchesLeft: &searchesLeft, fullCut: fullCut, holderKnown: found.holder != nil, view: &view}
 	var err error
 	if !staleSaid {
 		// With no fact by c.knownBound, the model stops and the voice says
