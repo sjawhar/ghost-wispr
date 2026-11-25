@@ -361,6 +361,10 @@ type prefetch struct {
 	reads    map[string]*read
 	current  string
 	searches int
+	// held is the keys of the words so far ("INFRA-7,ABC-12") when they end
+	// in a key of one digit the read-ahead holds (Heard); "" when none is
+	// held. Words said after the key, the turn's end and an answer end it.
+	held string
 }
 
 // cancelAll ends every read of p still running.
@@ -512,23 +516,27 @@ func (c *Concierge) Heard(ctx context.Context, x *voice.Exchange, words string) 
 	}
 	// A key of one digit that ends the words so far is a key only if the
 	// turn ends there: "ops 1" goes on "and 2", which is speech, and reads
-	// no issue. The read-ahead holds that key alone: it reads the keys said
-	// before it, alone ("what about ABC-12 and INFRA-7" reads ABC-12), and
-	// searches nothing, or with no key before it reads nothing; either way
-	// it stops a read of older words still running, which the new words
-	// made stale, as a new target does. The answer reads the final turn, and
-	// reads the room's keys a vendor's wording leaves out (readFor).
+	// no issue. Until the turn ends (TurnEnded) the read-ahead holds that key
+	// alone: it reads the keys said before it, alone ("what about ABC-12 and
+	// INFRA-7" reads ABC-12), and searches nothing, or with no key before it
+	// reads nothing; either way it stops a read of older words still running,
+	// which the new words made stale, as a new target does. At the turn's end
+	// it reads the key, as a longer key is read while it is said. The hold is
+	// kept for the answer (prefetch.held, readFor): a vendor can answer
+	// before the unit's transcript ends the turn.
 	before, hold := view.beforeTrailingOneDigitKey(words)
-	target := ""
+	hold = hold && !x.TurnEnded
+	target, held := "", ""
 	if hold {
+		held = keysOf(c.readTarget(view, words))
 		if keys := keysOf(c.readTarget(view, before)); keys != "" {
 			target = "keys:" + keys
 		}
-	} else if target = c.readTarget(view, words); target == "" {
+	} else {
 		// A number-only turn (no key, no work words) skips the read-ahead:
 		// it goes straight to the bare-number candidate lookup. A turn with
 		// words beyond the number keeps its search.
-		return
+		target = c.readTarget(view, words)
 	}
 	exchange := *x
 	now := c.now()
@@ -545,8 +553,17 @@ func (c *Concierge) Heard(ctx context.Context, x *voice.Exchange, words string) 
 	}
 	key := exchangeKey(&exchange)
 	p := c.prefetchLocked(&exchange)
-	if hold && p != nil && p.current != target {
-		p.stopCurrent()
+	if p == nil && held != "" {
+		p = &prefetch{at: now, reads: map[string]*read{}}
+		c.prefetches[key] = p
+	}
+	if p != nil {
+		// The words so far hold their last key, or no key is held: words
+		// said after a held key, and the turn's end, end its hold.
+		p.held = held
+		if hold && p.current != target {
+			p.stopCurrent()
+		}
 	}
 	if target == "" {
 		return
@@ -700,25 +717,16 @@ func (c *Concierge) readFor(ctx context.Context, x *voice.Exchange, view project
 			searchAgain, sameTerms, aheadWords, finalWords = true, slices.Equal(aheadSorted, finalSorted), len(ahead), len(final)
 		}
 	}
-	// The room's keys (AskerTurn) that a vendor's wording leaves out, and
-	// that no read took ahead, are read now: the read-ahead holds a key of
-	// one digit that ends the words said (Heard), so the room's "what about
-	// INFRA-7" can have no read ahead when the vendor answers "what about the
-	// realtime voice" (Sol's review of #194, R2). A read of them that failed
-	// or that an answer took stays as #192 left it: the vendor's wording is
-	// read, for voices B and C can leave the turn before as AskerTurn.
-	if keys := keysOf(asked); pending == nil && keys != "" && keysOf(target) == "" && (p == nil || p.reads["keys:"+keys] == nil) {
-		target = "keys:" + keys + "|" + strings.TrimPrefix(target, "search:")
-	}
-	// Keys the answer reads itself are spent with it (takeAheadSearches), as
-	// a read ahead is: no later answer reads them for the turn before, and no
-	// later words read them ahead.
-	if keys := keysOf(target); pending == nil && keys != "" {
-		if p == nil {
-			p = &prefetch{at: c.now(), reads: map[string]*read{}}
-			c.prefetches[exchangeKey(x)] = p
-		}
-		p.reads["keys:"+keys] = spent
+	// The key of one digit the read-ahead holds for the turn under way
+	// (Heard), which a vendor's wording leaves out, is read now: a vendor
+	// (voices B and C) can answer before the unit's transcript ends the turn,
+	// and the room's "what about INFRA-7" then had no read (Sol's review of
+	// #194, R2). The hold is the turn's alone: an answer ends it
+	// (takeAheadSearches), and so do words said after its key, so a later
+	// question never reads the turn before's key (R3). A vendor's own keys
+	// come first (#192).
+	if pending == nil && p != nil && p.held != "" && keysOf(target) == "" && keysOf(asked) == p.held {
+		target = "keys:" + p.held + "|" + strings.TrimPrefix(target, "search:")
 	}
 	c.mu.Unlock()
 	if searchAgain { // logged without c.mu: a log write can wait
@@ -832,7 +840,7 @@ func (c *Concierge) takeAheadSearches(x *voice.Exchange) int {
 	for target := range p.reads {
 		p.reads[target] = spent
 	}
-	p.current = ""
+	p.current, p.held = "", ""
 	return n
 }
 

@@ -29,10 +29,14 @@ type Exchange struct {
 	// phrase (a question; R10). The Concierge asks an agent about it only
 	// when it says "ask".
 	FollowUpTurn bool
-	Recent       []TurnText         // up to the last 2 minutes of labelled final segments
-	Tap          <-chan audio.Frame // room audio from the wake on, 16 kHz mono, only while the capture gate is open
-	Out          Output             // the speaker output's "voice" input
-	Tools        ToolRunner         // the Concierge
+	// TurnEnded: AskerTurn is the whole turn, as Deepgram's endpoint marks
+	// it (a final result with speech_final). The Concierge's read-ahead then
+	// reads what it held for more words (Heard).
+	TurnEnded bool
+	Recent    []TurnText         // up to the last 2 minutes of labelled final segments
+	Tap       <-chan audio.Frame // room audio from the wake on, 16 kHz mono, only while the capture gate is open
+	Out       Output             // the speaker output's "voice" input
+	Tools     ToolRunner         // the Concierge
 }
 
 // TurnText is one final transcript segment.
