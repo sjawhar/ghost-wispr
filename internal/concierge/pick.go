@@ -117,39 +117,22 @@ func sideTalk(turn string) bool {
 	return !asks(turn) && !saysKey(turn)
 }
 
-// sideTalkOn reports whether turn, a reply to p, is side talk on any reading
-// of it: the room's words, and vendor, the voice's own text of them
-// (voice.Exchange.VendorReading), when vendor holds the room's words
-// (holdsWords; Main, after Sol's fourth review of #191). A reading is side
-// talk when it picks nothing (pick) and is sideTalk. Letters the view cannot
-// tell are read as the key they may be (everySpelledKey). An endpoint can
-// leave the room's words only the end of a statement, "can wait" of "okay,
-// ABC-12 can wait", which on its own asks. A vendor's rephrasing, which does
-// not hold the room's words, is no reading: a question it turned into a
-// statement is still answered.
-func (p *offeredPick) sideTalkOn(view projectsView, turn, vendor string) bool {
-	readings := []string{turn}
-	if holdsWords(vendor, turn) {
-		readings = append(readings, vendor)
+// sideTalkOn reports whether reply, the room's words in answer to p, is side
+// talk: it picks nothing (pick) and is sideTalk. Letters the view cannot
+// tell are read as the key they may be (everySpelledKey). reply is every
+// final the room said since the voice asked (voice.Exchange.Reply), so an
+// endpoint inside a statement cannot leave it only the statement's end, "can
+// wait" of "okay, ABC-12 can wait", which on its own asks; and a reply that
+// holds a question anywhere is a question (Main, after Sol's fifth review of
+// #191). A vendor's text is never read: it could neither be trusted to make
+// a reply side talk nor to make it a question.
+func (p *offeredPick) sideTalkOn(view projectsView, reply string) bool {
+	written, unread := view.readSpelledKeys(reply)
+	if unread {
+		written = everySpelledKey(written)
 	}
-	for _, reading := range readings {
-		written, unread := view.readSpelledKeys(reading)
-		if unread {
-			written = everySpelledKey(written)
-		}
-		if _, picks := p.pick(written); !picks && sideTalk(written) {
-			return true
-		}
-	}
-	return false
-}
-
-// holdsWords reports whether text holds the words of part, together and in
-// order, whatever their case, their punctuation or a key's spelling.
-func holdsWords(text, part string) bool {
-	words := func(s string) string { return " " + strings.Join(lowerWords(everySpelledKey(s)), " ") + " " }
-	t, p := words(text), words(part)
-	return strings.TrimSpace(p) != "" && strings.Contains(t, p)
+	_, picks := p.pick(written)
+	return !picks && sideTalk(written)
 }
 
 // keyWords may frame a key said for "What is its key?", beside the words

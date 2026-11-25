@@ -200,37 +200,45 @@ func TestADrivingTurnEndsOnlyAtItsOwnEndpoint(t *testing.T) {
 	})
 }
 
-// TestTheAnswerToolKeepsTheVendorsReadingOfAReply fails if, after Wispr asked
-// the room a question, the answer tool does not hand the Concierge the
-// vendor's own text of the reply (Exchange.VendorReading) beside the room's
-// words, or hands it with no question asked: the Concierge takes the reply
-// for side talk when either reading is, the vendor's when it holds the
-// room's words, so a reply the Supervisor's turn heard only the end of ("can
-// wait", of "okay, the budget can wait") is not read as a question (Main's
-// rule after Sol's fourth review of #191).
-func TestTheAnswerToolKeepsTheVendorsReadingOfAReply(t *testing.T) {
+// TestTheAnswerToolHandsTheRoomsWholeReply fails if, after Wispr asked the
+// room a question, the answer tool does not hand the Concierge the room's
+// own words since that question (Exchange.Reply): every final since the
+// voice spoke, joined in order, through the turn answered, across an
+// endpoint inside the reply, with no word from before the question and none
+// of the vendor's. The Concierge decides on it whether the reply is side
+// talk; it answers the turn. At 707af97 a speech_final pause inside "okay,
+// the budget can wait" left the Concierge "can wait" alone (Main's rule
+// after Sol's fifth review of #191).
+func TestTheAnswerToolHandsTheRoomsWholeReply(t *testing.T) {
 	for _, tc := range []struct {
-		heard, vendor string
+		name        string
+		finals      []string
+		turn, reply string
+		vendor      string
 	}{
-		{"can wait", "okay, the budget can wait"},
-		{"okay, the budget can wait", "Can wait?"},
+		{"a statement split by a speech_final", []string{"okay, the budget", "can wait"}, "can wait", "okay, the budget can wait", "Okay, the budget can be postponed."},
+		{"a statement, then a question", []string{"okay, the budget can wait.", "what about the wake word?"}, "what about the wake word?", "okay, the budget can wait. what about the wake word?", "The user asked about the wake word."},
+		{"control: one final", []string{"what about the wake word?"}, "what about the wake word?", "what about the wake word?", "What about the wake word?"},
 	} {
-		t.Run(tc.heard+" / "+tc.vendor, func(t *testing.T) {
+		t.Run(tc.name, func(t *testing.T) {
 			c := newFakeConcierge() // its answer's last line is Wispr's question
 			r, sess := askedBack(t, c)
-			r.heard(tc.heard, true, true)
+			t0 := time.Now()
+			for i, final := range tc.finals {
+				deliver(r.s, spoken(final, true, true, t0.Add(time.Duration(i)*1500*time.Millisecond)))
+			}
 			args, _ := json.Marshal(AnswerArgs{Question: tc.vendor})
 			if _, err := sess.x.Tools.Run(t.Context(), ToolCall{ID: "d2", Name: AnswerTool, Args: args}); err != nil {
 				t.Fatalf("the answer tool: %v", err)
 			}
-			if got := <-c.asked; got != tc.heard {
-				t.Fatalf("the Concierge got %q, want the room's words %q", got, tc.heard)
+			if got := <-c.asked; got != tc.turn {
+				t.Fatalf("the Concierge got %q, want the turn %q", got, tc.turn)
 			}
 			c.mu.Lock()
 			x := c.exchanges[len(c.exchanges)-1]
 			c.mu.Unlock()
-			if x.VendorReading != tc.vendor {
-				t.Errorf("the vendor's reading is %q, want its text %q", x.VendorReading, tc.vendor)
+			if x.Reply != tc.reply {
+				t.Errorf("the room's reply is %q, want %q", x.Reply, tc.reply)
 			}
 		})
 	}
@@ -247,8 +255,8 @@ func TestTheAnswerToolKeepsTheVendorsReadingOfAReply(t *testing.T) {
 		c.mu.Lock()
 		x := c.exchanges[len(c.exchanges)-1]
 		c.mu.Unlock()
-		if x.VendorReading != "" {
-			t.Errorf("the vendor's reading is %q with no question of Wispr's, want none", x.VendorReading)
+		if x.Reply != "" {
+			t.Errorf("the room's reply is %q with no question of Wispr's, want none", x.Reply)
 		}
 	})
 }

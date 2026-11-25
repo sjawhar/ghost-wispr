@@ -50,15 +50,15 @@ type offerOutcome struct {
 // answers it. pending counts the sends of the question first asked.
 func answerAfterOffer(t *testing.T, reply string) (*rig, offerOutcome) {
 	t.Helper()
-	return answerAfterOfferRead(t, reply, "")
+	return answerAfterOfferReply(t, reply, "")
 }
 
-// answerAfterOfferRead is answerAfterOffer with vendor, a voice's own text of
-// the reply (voice.Exchange.VendorReading).
-func answerAfterOfferRead(t *testing.T, reply, vendor string) (*rig, offerOutcome) {
+// answerAfterOfferReply is answerAfterOffer with whole, the room's words
+// since Wispr's question, through the turn reply (voice.Exchange.Reply).
+func answerAfterOfferReply(t *testing.T, reply, whole string) (*rig, offerOutcome) {
 	t.Helper()
 	r := newRig(t)
-	r.exchange.VendorReading = vendor
+	r.exchange.Reply = whole
 	r.concierge.searchSettle = 20 * time.Millisecond
 	heldIssue(r, "session", false)
 	r.records.mu.Lock()

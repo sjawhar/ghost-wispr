@@ -194,19 +194,23 @@ func (c *Concierge) answer(parent context.Context, x *voice.Exchange, turn strin
 	view := c.viewProjects()
 	// A turn that replies to the question the last answer asked ("Did you
 	// mean …?", "What is its key?", or the model's own) is decided first,
-	// before anything is said or read. It is side talk when any reading of
-	// it is (sideTalkOn): the room's words, or the voice's own text of them
-	// when it holds them (Main's rule on R5's rewrite, and after Sol's fourth
-	// review of #191): nothing is said, read, searched or sent, and the
-	// Supervisor closes the exchange as it closes side talk in the follow-up
-	// window. Else, from the room's words alone: a pick answers the question
-	// first asked, about that issue (R5); a key the voice offered picks it
-	// whatever the list says: that issue is real, the voice just offered it.
-	// A key said alone (saysKey) answers the question first asked, about
-	// that key (takeKey). A question is read exactly as with no offer
-	// pending.
+	// before anything is said or read, on the room's whole reply: every
+	// final it said since the voice asked (voice.Exchange.Reply), or the
+	// turn when there is none. Side talk (sideTalkOn): nothing is said,
+	// read, searched or sent, and the Supervisor closes the exchange as it
+	// closes side talk in the follow-up window (Main's rule on R5's rewrite,
+	// and after Sol's fifth review of #191). Else, from the turn: a pick
+	// answers the question first asked, about that issue (R5); a key the
+	// voice offered picks it whatever the list says: that issue is real, the
+	// voice just offered it. A key said alone (saysKey) answers the question
+	// first asked, about that key (takeKey). A question is read exactly as
+	// with no offer pending.
 	offer, offered := c.pendingOffer(x)
-	if offered && offer.sideTalkOn(view, turn, x.VendorReading) {
+	reply := x.Reply
+	if strings.TrimSpace(reply) == "" {
+		reply = turn
+	}
+	if offered && offer.sideTalkOn(view, reply) {
 		c.dropPick(x)
 		c.logger.Info("concierge took a reply to its own question for side talk: it picks nothing, says no key and asks nothing")
 		return errSideTalk

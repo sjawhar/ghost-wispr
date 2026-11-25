@@ -425,28 +425,29 @@ func TestAStatementAfterWisprsQuestionStaysSideTalkAtAnyEndpoint(t *testing.T) {
 	}
 }
 
-// TestTheVendorsReadingOfAReplyCanOnlyMakeItSideTalk (Main's rule after Sol's
-// fourth review of #191): a reply to Wispr's question is side talk when any
-// reading of it is, the room's words or the vendor's own text
-// (voice.Exchange.VendorReading) when that text holds the room's words, in
-// order, whatever their case and punctuation: nothing is said, read,
-// searched or sent. It is picked and answered from the room's words alone. A
-// vendor's text that does not hold the room's words, a rephrasing, is not a
-// reading: a real question the vendor rephrased as a statement is answered.
-func TestTheVendorsReadingOfAReplyCanOnlyMakeItSideTalk(t *testing.T) {
+// TestTheRoomsWholeReplyDecidesSideTalk (Main's rule after Sol's fifth
+// review of #191): after Wispr asked the room a question, whether the reply
+// is side talk is decided on the room's own words since that question
+// ended (voice.Exchange.Reply), never on a vendor's text: an endpoint inside
+// a statement leaves the turn only its end ("can wait", which on its own
+// asks), and the whole reply is the statement. A reply that holds a
+// question is answered, from the turn. With no whole reply, the turn
+// decides. At 707af97 the whole reply went unread: "can wait" was answered
+// and sent to ABC-12's holder.
+func TestTheRoomsWholeReplyDecidesSideTalk(t *testing.T) {
 	for _, tc := range []struct {
-		name, reply, vendor, want string // want: "side talk", "answered" or "picked"
+		name, turn, whole, want string // want: "side talk", "answered" or "picked"
 	}{
-		{"the room heard only a statement's tail", "can wait", "okay, ABC-12 can wait", "side talk"},
-		{"the room heard a spelled key's statement's tail", "can wait", "Okay, A B C 12 can wait.", "side talk"},
-		{"the vendor's statement, the room's question", "what about the realtime voice budget", "Tell me about the realtime voice budget.", "answered"},
-		{"the vendor's longer statement, the room's question", "what about the realtime voice budget", "Okay, so the user wants to know about the realtime voice budget.", "answered"},
-		{"the room's side talk, the vendor's question", "okay, let's move on to the realtime voice budget", "What about the realtime voice budget?", "side talk"},
-		{"control: a question, both readings", "what about the realtime voice budget", "What about the realtime voice budget?", "answered"},
-		{"control: a pick, both readings", "the first one", "The first one.", "picked"},
+		{"a statement's tail, the whole statement", "can wait", "okay, ABC-12 can wait", "side talk"},
+		{"a statement's tail, its key spelled", "can wait", "Okay, A B C 12 can wait.", "side talk"},
+		{"a statement, then a question", "What about the realtime voice budget?", "okay, ABC-12 can wait. What about the realtime voice budget?", "answered"},
+		{"control: the tail with no whole reply", "can wait", "", "answered"},
+		{"control: a question in one final", "what about the realtime voice budget", "what about the realtime voice budget", "answered"},
+		{"control: side talk in one final", "okay, let's move on to the realtime voice budget", "okay, let's move on to the realtime voice budget", "side talk"},
+		{"control: a pick in one final", "the first one", "the first one", "picked"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			_, got := answerAfterOfferRead(t, tc.reply, tc.vendor)
+			_, got := answerAfterOfferReply(t, tc.turn, tc.whole)
 			switch tc.want {
 			case "side talk":
 				if !errors.Is(got.err, voice.ErrSideTalk) || len(got.spoken) != 0 || got.full+got.keyword+got.reads+got.sent != 0 {
@@ -460,6 +461,74 @@ func TestTheVendorsReadingOfAReplyCanOnlyMakeItSideTalk(t *testing.T) {
 				if got.err != nil || got.took != "ABC-12" || got.pending != 1 {
 					t.Errorf("Answer = %v, took %q, sent the question first asked %d times; want ABC-12 picked", got.err, got.took, got.pending)
 				}
+			}
+		})
+	}
+}
+
+// TestTheVendorsTextDecidesNoReplyToWisprsQuestion (Sol's fifth review of
+// #191 at 707af97b, from Sol's probes): through the real Supervisor and
+// Concierge, after the model asks the room "Do you mean its status or its
+// holder?", whatever text the vendor sends with its answer call, the room's
+// own words decide. C1: "okay, ABC-12" with a speech_final pause, then "can
+// wait", with the vendor's paraphrase "Okay, ABC-12 can be postponed." or
+// "Can ABC-12 wait?": at 707af97 the Concierge got "can wait" alone and sent
+// "Can wait?" to ABC-12's holder; it is side talk. R1: a room question the
+// vendor wraps ("The user asked …") or strips of its "?": at 707af97 the
+// vendor's text vetoed it; main c1a03f3 answers it, and so must this.
+func TestTheVendorsTextDecidesNoReplyToWisprsQuestion(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		finals []string // the room's finals, each ending its utterance when pause
+		pause  bool
+		vendor string
+		answer bool
+	}{
+		{"C1: a paused statement, the vendor's statement", []string{"okay, ABC-12", "can wait"}, true, "Okay, ABC-12 can be postponed.", false},
+		{"C1: a paused statement, the vendor's question", []string{"okay, ABC-12", "can wait"}, true, "Can ABC-12 wait?", false},
+		{"control: an unpaused statement, the vendor's statement", []string{"okay, ABC-12", "can wait"}, false, "Okay, ABC-12 can be postponed.", false},
+		{"control: a paused statement, the vendor's own words", []string{"okay, ABC-12", "can wait"}, true, "okay, ABC-12 can wait", false},
+		{"control: a room statement, the vendor's question", []string{"okay, let's move on to the realtime voice budget"}, true, "What about the realtime voice budget?", false},
+		{"R1: a room question, the vendor's wrapper", []string{"what about the realtime voice budget"}, true, "The user asked what about the realtime voice budget.", true},
+		{"R1: a room question, the vendor drops its question mark", []string{"ABC-12 merged?"}, true, "ABC-12 merged.", true},
+		{"control: a room question, the vendor's same question", []string{"what about the realtime voice budget"}, true, "What about the realtime voice budget?", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := newCutRig(t,
+				[]*genai.GenerateContentResponse{chunk(text("ABC-12 is in progress. Do you mean its status or its holder?"))},
+				[]*genai.GenerateContentResponse{chunk(text("ABC-12 is in progress."))},
+				[]*genai.GenerateContentResponse{chunk(text("ABC-12 is in progress."))},
+			)
+			if initial := r.answer(t, "initial", ""); !strings.HasSuffix(initial.Say, "?") {
+				t.Fatalf("control: the first answer asks nothing: %q", initial.Say)
+			}
+			r.speak(t)
+			time.Sleep(1200 * time.Millisecond)
+			p0 := time.Now().Add(-time.Second) // the reply, said since the voice began
+			searched, read := len(r.records.searches()), len(r.records.calls())
+			r.agents.mu.Lock()
+			sent := len(r.agents.sent)
+			r.agents.mu.Unlock()
+			for i, final := range tc.finals {
+				at := []time.Time{}
+				for j := range strings.Fields(final) {
+					at = append(at, p0.Add(time.Duration(i)*600*time.Millisecond+time.Duration(j)*100*time.Millisecond))
+				}
+				r.hearEnding(final, true, tc.pause || i == len(tc.finals)-1, at)
+			}
+			out := r.answer(t, "reply", tc.vendor)
+			r.agents.mu.Lock()
+			messages := slices.Clone(r.agents.sent[sent:])
+			r.agents.mu.Unlock()
+			searches, calls := r.records.searches()[searched:], r.records.calls()[read:]
+			if tc.answer {
+				if out.Say == "" {
+					t.Errorf("the room's question was not answered: searched %q, read %q, sent %+v", searches, calls, messages)
+				}
+				return
+			}
+			if len(searches)+len(calls)+len(messages) != 0 || out.Say != "" {
+				t.Errorf("the room's statement was searched %q, read %q, sent %+v and said %q; want nothing", searches, calls, messages, out.Say)
 			}
 		})
 	}

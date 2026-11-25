@@ -461,7 +461,12 @@ type exchange struct {
 	// heardTo is when the latest word of the turn now heard began, by
 	// capture (Transcript.heardAt), interim words included: an endpoint ends
 	// the turn only when it ends no earlier (endsTurn).
-	heardTo   time.Time
+	heardTo time.Time
+	// reply is every final the room said since the driving voice last
+	// spoke, in order, across endpoints (Exchange.Reply): a turn the voice
+	// did not answer yet. An endpoint ends a turn, not the reply; the
+	// voice's next speech begins a new one.
+	reply     []string
 	toolCalls int // answer tools still running: the exchange stays open
 	// turnEnd is when the driving voice first spoke after the turn it now
 	// answers began, or its speech ended by itself over a turn begun while
@@ -1152,7 +1157,7 @@ func (s *Supervisor) onTranscriptLocked(t *Transcript) {
 				ex.turnFrom = from // the voice answered this call before its result came
 			}
 			ex.wakeStart, ex.wakeSaid = wakeStart(t, m), wakeSaidAt(t, m)
-			ex.turn, ex.interim, ex.turnFinal, ex.uttered, ex.heardTo = nil, "", false, false, time.Time{}
+			ex.turn, ex.interim, ex.turnFinal, ex.uttered, ex.heardTo, ex.reply = nil, "", false, false, time.Time{}, nil
 			ex.followUpTurn, ex.turnByName = false, true // a call, with the wake phrase
 			if !stale {
 				ex.x.Turn++ // a new call; a late result keeps the turn it completes
@@ -1240,6 +1245,9 @@ func (s *Supervisor) onTranscriptLocked(t *Transcript) {
 func (s *Supervisor) driverHeardLocked(ex *exchange, t *Transcript, words string) {
 	if !ex.stale(t) {
 		if ex.newTurn || ex.uttered {
+			if ex.newTurn {
+				ex.reply = nil // the voice spoke: a new reply begins
+			}
 			ex.newTurn, ex.turnFrom = false, ex.turnEnd
 			ex.turn, ex.interim, ex.turnFinal, ex.uttered, ex.heardTo = nil, "", false, false, time.Time{}
 			ex.followUpTurn, ex.turnByName = ex.followUpTimer != nil && !ex.askedBack, false
@@ -1256,7 +1264,7 @@ func (s *Supervisor) driverHeardLocked(ex *exchange, t *Transcript, words string
 		// The voice's speeches since answer it: the room's next words are
 		// still a new turn.
 		ex.turnFrom = from
-		ex.turn, ex.interim, ex.turnFinal, ex.uttered, ex.heardTo = nil, "", false, false, time.Time{}
+		ex.turn, ex.interim, ex.turnFinal, ex.uttered, ex.heardTo, ex.reply = nil, "", false, false, time.Time{}, nil
 		ex.followUpTurn, ex.turnByName = ex.followUpTimer != nil && !ex.askedBack, false
 		ex.x.Turn++
 		s.turnLocked(ex, t, words)
@@ -1821,6 +1829,9 @@ func (s *Supervisor) turnLocked(ex *exchange, t *Transcript, words string) {
 	if t.IsFinal {
 		if words != "" {
 			ex.turn = append(ex.turn, words)
+			if ex.drives {
+				ex.reply = append(ex.reply, words)
+			}
 		}
 		ex.interim = ""
 		ex.turnFinal = true
@@ -1876,6 +1887,17 @@ func (s *Supervisor) turnOf(ex *exchange) string {
 		}
 	}
 	return turn
+}
+
+// replyOf is ex's reply as the Concierge reads it (Exchange.Reply): the
+// room's finals since the voice last spoke, a key said in a spoken form
+// written as the key, as in a turn (turnOf).
+func (s *Supervisor) replyOf(ex *exchange) string {
+	reply := strings.TrimSpace(strings.Join(ex.reply, " "))
+	if s.cfg.ProjectKeys != nil {
+		reply = transcript.WriteKeys(reply, s.cfg.ProjectKeys())
+	}
+	return reply
 }
 
 // isQuestion reports whether Deepgram punctuated turn as a question.
@@ -3277,13 +3299,13 @@ func (t exchangeTools) Run(ctx context.Context, c ToolCall) (json.RawMessage, er
 	// key?") goes to the Concierge in the room's words, as Deepgram's final
 	// heard them, never the vendor's: a vendor that rewrote side talk as a
 	// question would get it past the rule that side talk after Wispr's
-	// question is not answered (Main, on R5's rewrite). A reply with no final
-	// by followUpTurnWait is side talk, as in the follow-up window. The
-	// vendor's own text goes with it (Exchange.VendorReading): an endpoint
-	// can leave the room's turn only the end of what was said, "can wait" of
-	// "okay, ABC-12 can wait", and the Concierge takes the reply for side
-	// talk when the vendor's text holds the room's words and is side talk.
-	vendor := args.Question
+	// question is not answered (Main, on R5's rewrite), and one that wrapped
+	// a question or dropped its "?" would silence it (Sol's fifth review of
+	// #191). A reply with no final by followUpTurnWait is side talk, as in
+	// the follow-up window. The room's whole reply goes with it
+	// (Exchange.Reply): an endpoint inside a statement leaves the turn only
+	// its end, "can wait" of "okay, ABC-12 can wait", and the Concierge
+	// decides on the whole reply whether it is side talk.
 	reply, askedBack, err := t.replyTurn(ctx)
 	switch {
 	case err != nil:
@@ -3304,10 +3326,10 @@ func (t exchangeTools) Run(ctx context.Context, c ToolCall) (json.RawMessage, er
 	s.mu.Lock()
 	x = t.ex.x
 	x.FollowUpTurn = t.ex.followUpTurn
-	s.mu.Unlock()
 	if askedBack {
-		x.VendorReading = vendor
+		x.Reply = s.replyOf(t.ex)
 	}
+	s.mu.Unlock()
 	var (
 		said   []string  // the result's lines, in order
 		spoken bool      // a line was spoken at once

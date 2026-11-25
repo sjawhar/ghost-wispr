@@ -39,13 +39,14 @@ type Exchange struct {
 	// earlier one, which the Supervisor makes apart from the answer and can
 	// deliver after it, reads nothing.
 	Turn uint64
-	// VendorReading is, for a voice that drives its own turn, the vendor's
-	// own text of a reply to a question Wispr asked. When it holds the
-	// room's words (AskerTurn, Answer's turn), the Concierge takes the reply
-	// for side talk if either reading of it is; it picks and answers from
-	// the room's words alone. A rephrasing that does not hold them is no
-	// reading.
-	VendorReading string
+	// Reply is, after Wispr asked the room a question, the room's own words
+	// since that question ended: every final since then, joined in order,
+	// through the turn answered (AskerTurn, Answer's turn). The Concierge
+	// decides on it whether the reply is side talk, never on a vendor's
+	// text; it picks and answers from the turn. An endpoint inside the reply
+	// ("okay, ABC-12" … "can wait") leaves the turn only its end. Empty when
+	// Wispr asked nothing.
+	Reply string
 }
 
 // TurnText is one final transcript segment.
