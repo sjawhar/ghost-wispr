@@ -736,7 +736,17 @@ What the voice hears, and where the room's words go:
   an agent leaves the unit, and deleting the segment or the session cannot recall it: Envoy keeps
   messages for 72 hours, and the agent keeps what it read. The agent reads the question with its
   own model, so the question also reaches that model's vendor.
-- The unit stores none of the room's words for a question it sent: its `voice_tasks` ledger holds
+- The unit keeps each question to Wispr, its answer and how it ended, and deletes them with its session or with a segment its words were heard in.
+  This question log (`voice_questions`) is the test bed of the Concierge's answers. Each row holds
+  the turn as heard after the wake phrase, the wording of voice B's or voice C's vendor when it
+  asked in other words, the voice, the issue taken, the answer Wispr was given to say, the outcome
+  (`answered`, `asked_back`, `picked`, `side_talk`, `outage`, `asked_agent`, `stopped`,
+  `never_mind` or `failed`), when its words were said, and the time to its first audio and to its
+  end. A reply to Wispr's own question that asks nothing is kept as `side_talk`; other side talk,
+  and a wake with no question, are not kept. A segment delete erases each question whose words
+  were said within a second of the segment's span. `ghost-wispr voice questions [--since DATE]
+  [--json]` prints the log, read without writing to the database.
+- The `voice_tasks` ledger of questions sent to agents holds none of the room's words: it holds
   the issue, the holder, the state and the agent's written answer, which the session's page shows
   under "Questions to agents". Deleting a session erases its questions and the answers the agents
   wrote. An agent's written answer may quote the asker, and only a session delete erases it: a segment delete does not.

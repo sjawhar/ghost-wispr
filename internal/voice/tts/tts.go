@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/sjawhar/ghost-wispr/internal/audio"
+	"github.com/sjawhar/ghost-wispr/internal/config"
 	"github.com/sjawhar/ghost-wispr/internal/voice"
 )
 
@@ -66,6 +67,9 @@ const eventBuffer = 64
 func New(e Engine) voice.Voice { return voiceA{engine: e} }
 
 type voiceA struct{ engine Engine }
+
+// Engine names voice A as voice.engine does (voice.NamedEngine).
+func (voiceA) Engine() string { return config.VoiceEngineTTS }
 
 // Open opens a Session that speaks into x.Out. When the engine is a
 // Connector, it connects first.

@@ -144,6 +144,13 @@ type TurnDriver interface {
 	DrivesTurn() bool
 }
 
+// NamedEngine is implemented by a Voice that names its engine as
+// voice.engine does ("tts", "gptlive" or "dgagent"), for the question log
+// (Question.Engine).
+type NamedEngine interface {
+	Engine() string
+}
+
 // Transcript is one Deepgram result, as the Supervisor reads it.
 type Transcript struct {
 	Text         string
@@ -246,6 +253,12 @@ type SupervisorConfig struct {
 	// tells nobody. It runs on a goroutine of its own, never under the
 	// Supervisor's lock.
 	HandDone func(h *Hand, outcome HandOutcome)
+	// Question gets each turn the Concierge handled once its outcome is
+	// known, for the question log; nil drops them. It runs on a goroutine
+	// of its own, never under the Supervisor's lock, after the turn's answer
+	// was spoken or cut, so nothing it does, a failed write included, can
+	// change the answer.
+	Question func(q *Question)
 	// Segment gets each final transcript segment of the room, for the joined
 	// agents' pointers; nil drops them. It runs on the transcript reader,
 	// never under the Supervisor's lock, and must return at once.
@@ -604,6 +617,18 @@ type exchange struct {
 	// membership's: its end stops them, and exchangeOutput refuses any frame
 	// written once it ended.
 	sayCtx context.Context
+	// engine names its voice (NamedEngine), for the question log.
+	engine string
+	// wordsFrom and wordsTo are when the turn now heard (wordsTurn, its
+	// Exchange.Turn) was said (questionHeardLocked); question is the turn
+	// the Concierge handles now, until the question log has it
+	// (openQuestionLocked); endedAs is how the question log tells the end
+	// endLocked makes of it, when a stop's is not right: a never mind or a
+	// failure.
+	wordsTurn          uint64
+	wordsFrom, wordsTo time.Time
+	question           *openQuestion
+	endedAs            QuestionOutcome
 }
 
 // NewSupervisor starts a Supervisor; Close stops it.
@@ -1287,6 +1312,7 @@ func (s *Supervisor) onTranscriptLocked(t *Transcript) {
 				// The question it cancels leaves the room's recent words,
 				// as a take-back's does (Sol's eleventh review of #191).
 				s.neverMindTurnLocked(ex)
+				ex.endedAs = OutcomeNeverMind
 				s.endLocked(ex, true, "Wispr, never mind")
 			}
 			s.neverMindLocked(s.cfg.Session())
@@ -1653,6 +1679,7 @@ func (s *Supervisor) answerSoundLocked() bool {
 func (s *Supervisor) cutDriverLocked(ex *exchange) {
 	ex.cutSpeech = true
 	ex.cutLocked(time.Now())
+	s.settleQuestionLocked(ex, ex.question, OutcomeStopped)
 	s.cfg.Speaker.Cancel(audio.InputVoice)
 	if sess := ex.session; sess != nil {
 		s.spawn(sess.Interrupt)
@@ -1745,6 +1772,9 @@ func (s *Supervisor) startLocked(t *Transcript, m transcript.Match) {
 	s.capExchange(ex)
 	if d, ok := voice.(TurnDriver); ok && d.DrivesTurn() {
 		ex.drives = true
+	}
+	if named, ok := voice.(NamedEngine); ok {
+		ex.engine = named.Engine()
 	}
 	ex.dropsAtOpen = s.cfg.Tap.Dropped()
 	s.takeFloorLocked(ex)
@@ -1936,6 +1966,7 @@ func (s *Supervisor) readEvents(ex *exchange, sess Session) {
 			if ex.drives && s.ex == ex {
 				// The cut first: it cancels the chime input, and the error
 				// sound begun before it would go with it.
+				ex.endedAs = OutcomeFailed
 				s.endLocked(ex, true, "the voice failed")
 			}
 			if current && ex.answer == nil {
@@ -1947,6 +1978,7 @@ func (s *Supervisor) readEvents(ex *exchange, sess Session) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.ex == ex {
+		ex.endedAs = OutcomeFailed
 		s.endLocked(ex, true, "the voice ended by itself")
 	}
 }
@@ -1982,6 +2014,9 @@ func (s *Supervisor) idleWaited(ex *exchange, gen int) {
 		return
 	}
 	unspoken := ex.unspokenAnswer
+	if unspoken {
+		ex.endedAs = OutcomeFailed
+	}
 	s.endLocked(ex, false, "idle")
 	if unspoken {
 		// The voice got an answer to speak and never began it: the room
@@ -2008,6 +2043,16 @@ func (s *Supervisor) driverSpeechLocked(ex *exchange, started, cancelled bool, a
 	}
 	if ex.ended {
 		return
+	}
+	// A speech begun once the answer tool returned speaks its answer, and
+	// its end, with no cut, is the turn's outcome for the question log.
+	if q := ex.question; q != nil && q.answered {
+		switch {
+		case started && !at.Before(q.answeredAt):
+			q.playing = true
+		case !started && !cancelled && q.playing:
+			s.settleQuestionLocked(ex, q, "")
+		}
 	}
 	s.disarmFollowUpLocked(ex)
 	// Each speech the voice starts answers what was said before it; a turn
@@ -2077,6 +2122,7 @@ func (s *Supervisor) turnLocked(ex *exchange, t *Transcript, words string) {
 	// replaced socket can come after the next words' interim.
 	endpoint := t.IsFinal && t.SpeechFinal && ex.endsTurn(t.endsAt())
 	words = strings.TrimSpace(words)
+	ex.questionHeardLocked(t)
 	if t.IsFinal {
 		// A final that replaces the pending interim supersedes it: a
 		// take-back counted on the final must not also see the interim's
@@ -2459,6 +2505,12 @@ func (s *Supervisor) answer(ex *exchange, x *Exchange, turn string) {
 	}
 	s.mu.Lock()
 	sess := ex.session
+	// The question log's row of the turn: a turn cut before the Concierge
+	// got it has none.
+	var q *openQuestion
+	if sess != nil && !ex.ended {
+		q = s.openQuestionLocked(ex, turn, "", ex.turnAt)
+	}
 	s.mu.Unlock()
 	if sess == nil {
 		return
@@ -2480,6 +2532,15 @@ func (s *Supervisor) answer(ex *exchange, x *Exchange, turn string) {
 		defer s.mu.Unlock()
 		ex.said = true
 		ex.askedBack, ex.voiceAsked = isQuestion(text), false
+		if q != nil {
+			q.said = append(q.said, text)
+			if q.firstAudio.IsZero() && s.voiceSpeaking && s.speechEx == ex && s.voiceStarted.Before(called.Wall) {
+				// The speech of the answer before still plays, as the
+				// speaker holds it a moment past its last audio: this text
+				// plays in it, with no start of its own, as soon as queued.
+				q.firstAudio = called.Wall
+			}
+		}
 		if !reportsText && mode == Fact && !ex.factDone && !ex.factPending {
 			// The first fact's audio, for a voice whose Say returns once
 			// the last of its audio is queued: at its speech's start when
@@ -2500,6 +2561,11 @@ func (s *Supervisor) answer(ex *exchange, x *Exchange, turn string) {
 		return nil
 	}
 	err := s.cfg.Concierge.Answer(ex.ctx, x, turn, say)
+	if q != nil {
+		s.mu.Lock()
+		s.answeredLocked(ex, q, x, err, false)
+		s.mu.Unlock()
+	}
 	if errors.Is(err, ErrSideTalk) {
 		// A reply to Wispr's own question that the Concierge took for side
 		// talk: it said nothing, and the exchange closes with no sorry and no
@@ -2571,6 +2637,7 @@ func (s *Supervisor) finish(ex *exchange, sessionID string) bool {
 		// stop does first; the error sound begins on the new chime input
 		// the cut just opened.
 		s.logf("voice: the answer did not play to its end: %v", unplayed)
+		ex.endedAs = OutcomeFailed
 		s.endLocked(ex, ex.answer != nil, "the voice did not finish")
 		s.exErrorLocked(ex, sessionID)
 		return false
@@ -2580,8 +2647,10 @@ func (s *Supervisor) finish(ex *exchange, sessionID string) bool {
 }
 
 // followUpLocked keeps ex open after Wispr's answer for FollowUpWait: an
-// utterance in it is the next turn, with no wake phrase (R10).
+// utterance in it is the next turn, with no wake phrase (R10). The answer
+// played to its end: the question log has its turn.
 func (s *Supervisor) followUpLocked(ex *exchange) {
+	s.settleQuestionLocked(ex, ex.question, "")
 	ex.followUp = true
 	ex.followUpTurn = !ex.askedBack // an answer to Wispr's own question needs none
 	ex.answering = false
@@ -2969,6 +3038,13 @@ func (s *Supervisor) endLocked(ex *exchange, cut bool, reason string) {
 	if ex.x.SessionID == "" && len(ex.unsent) > 0 {
 		s.logf("voice: the exchange ended before its recording session (start %d) settled; its %d held timing lines name no session, as its session is unknown", ex.openSeq+1, len(ex.unsent))
 	}
+	// The question log's turn ends with ex: cut by a stop, a barge-in or the
+	// meeting's end, unless a never mind or a failure ended it (endedAs).
+	how := ex.endedAs
+	if how == "" && silence {
+		how = OutcomeStopped
+	}
+	s.settleQuestionLocked(ex, ex.question, how)
 	ex.ended = true
 	s.roomChangedLocked(ex) // a delegation waiting for a final ends its wait
 	if ex.unbindMeeting != nil {
@@ -3133,6 +3209,11 @@ func (s *Supervisor) onSpeech(e *audio.SpeechEvent) {
 	// late report of an ended exchange's speech carries only its spoken.
 	if !e.Started || ex.ended {
 		return
+	}
+	// A start reported late, of a speech begun before the turn was asked, is
+	// no audio of its answer.
+	if q := ex.question; q != nil && q.firstAudio.IsZero() && !e.At.Before(q.q.AskedAt) {
+		q.firstAudio = e.At
 	}
 	if !ex.turnAt.IsZero() && !ex.firstOutDone {
 		ex.firstOutDone = true
@@ -4144,12 +4225,15 @@ func (t exchangeTools) Run(ctx context.Context, c ToolCall) (json.RawMessage, er
 	// (Exchange.Reply): an endpoint inside a statement leaves the turn only
 	// its end, "can wait" of "okay, ABC-12 can wait", and the Concierge
 	// decides on the whole reply whether it is side talk.
+	vendor := args.Question // the vendor's wording, for the question log
 	reply, askedBack, err := t.replyTurn(ctx)
 	switch {
 	case err != nil:
 		return nil, err
 	case askedBack && reply == "":
+		// Side talk after Wispr's question, which the question log keeps.
 		s.mu.Lock()
+		s.answeredLocked(t.ex, s.openQuestionLocked(t.ex, turn, vendor, time.Now()), &x, ErrSideTalk, true)
 		s.endLocked(t.ex, false, "side talk after Wispr's question")
 		s.mu.Unlock()
 		return json.Marshal(AnswerResult{})
@@ -4181,6 +4265,17 @@ func (t exchangeTools) Run(ctx context.Context, c ToolCall) (json.RawMessage, er
 			t.ex.claimedWords[args.Question] = n - 1
 		}
 	}
+	// The question log's row of the turn: the room's words the Concierge
+	// answers (AskerTurn, a claimed request's committed words), the reply
+	// to Wispr's question, else the turn heard.
+	heard := turn
+	switch {
+	case askedBack:
+		heard = reply
+	case strings.TrimSpace(x.AskerTurn) != "":
+		heard = x.AskerTurn
+	}
+	q := s.openQuestionLocked(t.ex, heard, vendor, time.Now())
 	// A handed turn's words are no later answer's: a vendor that asks again
 	// before the room's next words would get them, and a take-back in them
 	// would cut its new question (Sol's tenth review of #191). They stay
@@ -4226,7 +4321,20 @@ func (t exchangeTools) Run(ctx context.Context, c ToolCall) (json.RawMessage, er
 	t.ex.saidMu.Lock()
 	lines, anySaid, l, firstFact := append([]string(nil), said...), spoken || len(said) > 0, lead, factAt
 	t.ex.saidMu.Unlock()
-	if l != nil && !t.played(l) {
+	leadPlayed := l != nil && t.played(l)
+	// answered gives the question log the Concierge's answer, and the lines
+	// the voice was given for it: the line spoken at once first, then
+	// spoken; silent says the voice was given nothing more to say.
+	answered := func(err error, spoken []string, silent bool) {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		if leadPlayed {
+			q.said = append(q.said, l.text)
+		}
+		q.said = append(q.said, spoken...)
+		s.answeredLocked(t.ex, q, &x, err, silent)
+	}
+	if l != nil && !leadPlayed {
 		// Main's rule on gap H: R5's line naming the issue a search chose
 		// (Lead) always leads; a routing line that never played is dropped
 		// when the answer's first fact was ready within leadLineDropWithin of
@@ -4247,6 +4355,7 @@ func (t exchangeTools) Run(ctx context.Context, c ToolCall) (json.RawMessage, er
 		}
 	}
 	if errors.Is(err, ErrSideTalk) {
+		answered(err, nil, true)
 		// Side talk after Wispr's own question: as side talk in the
 		// follow-up window, no voice answers it, and the window closes (R10).
 		// The vendor gets no words to say.
@@ -4264,15 +4373,19 @@ func (t exchangeTools) Run(ctx context.Context, c ToolCall) (json.RawMessage, er
 			if !anySaid {
 				lines = []string{sorryLine}
 			}
+			answered(err, lines, false)
 			for _, line := range lines {
 				if sayErr := t.speak(ctx, line, Ack); sayErr != nil {
 					s.logf("voice: speak the Concierge's line for a failed answer: %v", sayErr)
 					break
 				}
 			}
+		} else {
+			answered(err, nil, true)
 		}
 		return nil, err
 	}
+	answered(nil, lines, len(lines) == 0)
 	if len(lines) > 0 {
 		s.mu.Lock()
 		t.ex.askedBack, t.ex.voiceAsked = isQuestion(lines[len(lines)-1]), false

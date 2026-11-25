@@ -35,7 +35,10 @@ func TestReadmeStatesVoiceConsent(t *testing.T) {
 		"A question sent to an agent leaves the unit, and deleting the segment or the session cannot recall it",
 		"Deleting a session erases its questions and the answers the agents wrote",
 		"An agent's written answer may quote the asker, and only a session delete erases it: a segment delete does not",
-		"The unit stores none of the room's words for a question it sent",
+		"The `voice_tasks` ledger of questions sent to agents holds none of the room's words",
+		// The question log (dispatch://INFRA-5782).
+		"The unit keeps each question to Wispr, its answer and how it ended, and deletes them with its session or with a segment its words were heard in.",
+		"A segment delete erases each question whose words",
 		"Every pause, light hold, press of the Jabra's Mute button, \"Wispr, stop\" and shutdown stop the voice at once",
 		"With `voice.engine: dgagent` (voice C, a voice agent), during an exchange only",
 		"hands the turn, with the same transcript, to OpenAI's gpt-4.1-mini",

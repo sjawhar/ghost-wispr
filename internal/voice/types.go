@@ -94,6 +94,13 @@ type Exchange struct {
 	// with spaces, and nothing said before it is read, searched or sent. A
 	// question other than AskerTurn, a vendor's new one, is not cut by them.
 	Finals string
+	// Outcome is how the Concierge's answer to the turn ended, as it saw it,
+	// which Answer sets before it returns, as it sets IssueKey:
+	// OutcomeAnswered, OutcomeAskedBack, OutcomePicked, OutcomeNeverMind (a
+	// "no" to the issues it offered) or OutcomeAskedAgent. Side talk and an
+	// outage are told by Answer's error. The Supervisor keeps it in the
+	// question log (Question).
+	Outcome QuestionOutcome
 }
 
 // RoomView is the room's words a vendor may read now (Exchange.Room). Asker
@@ -133,6 +140,75 @@ type RoomView struct {
 	Turn      uint64
 	Request   string
 	Changed   <-chan struct{}
+}
+
+// QuestionOutcome is how one turn the Concierge handled ended, as the
+// question log keeps it (Question).
+type QuestionOutcome string
+
+const (
+	// OutcomeAnswered: Wispr answered from Dispatch's record.
+	OutcomeAnswered QuestionOutcome = "answered"
+	// OutcomeAskedBack: Wispr's answer ended with a question to the person,
+	// such as which issue they meant ("Did you mean …?") or its key.
+	OutcomeAskedBack QuestionOutcome = "asked_back"
+	// OutcomePicked: the turn picked one of the issues Wispr offered, or
+	// said the key it asked for, and Wispr answered the question first
+	// asked, about that issue.
+	OutcomePicked QuestionOutcome = "picked"
+	// OutcomeSideTalk: a reply to Wispr's own question that asked nothing
+	// (ErrSideTalk); no voice answered it.
+	OutcomeSideTalk QuestionOutcome = "side_talk"
+	// OutcomeOutage: Dispatch or Envoy did not answer (ErrUnreachable).
+	OutcomeOutage QuestionOutcome = "outage"
+	// OutcomeAskedAgent: the question went to the agent that holds the
+	// issue.
+	OutcomeAskedAgent QuestionOutcome = "asked_agent"
+	// OutcomeStopped: a stop, a barge-in or the end of the meeting cut the
+	// answer before it played to its end.
+	OutcomeStopped QuestionOutcome = "stopped"
+	// OutcomeNeverMind: "Wispr, never mind" cut the answer, or the person
+	// said no to the issues Wispr offered.
+	OutcomeNeverMind QuestionOutcome = "never_mind"
+	// OutcomeFailed: the Concierge's model or the voice failed.
+	OutcomeFailed QuestionOutcome = "failed"
+)
+
+// QuestionOutcomes are every QuestionOutcome.
+var QuestionOutcomes = []QuestionOutcome{
+	OutcomeAnswered, OutcomeAskedBack, OutcomePicked, OutcomeSideTalk, OutcomeOutage,
+	OutcomeAskedAgent, OutcomeStopped, OutcomeNeverMind, OutcomeFailed,
+}
+
+// Question is one turn the Concierge handled, as the question log keeps it
+// once its outcome is known (SupervisorConfig.Question). It holds the room's
+// words.
+type Question struct {
+	SessionID string
+	// AskedAt is when the turn was handed to the Concierge; FirstAudio and
+	// Took count from it.
+	AskedAt time.Time
+	// HeardFrom and HeardTo are when the turn's words were said, by their
+	// capture times: from the first word of the results that held the turn,
+	// the wake phrase's included, to the end of the last.
+	HeardFrom, HeardTo time.Time
+	// Heard is the turn as the Supervisor handed it to the Concierge, after
+	// the wake phrase, in Deepgram's words.
+	Heard string
+	// VendorWording is a driving voice's own wording of the turn, the
+	// question its vendor asked the answer tool, when it differs from Heard.
+	VendorWording string
+	// Engine is the voice, as voice.engine names it (NamedEngine); "" for a
+	// voice that names none.
+	Engine   string
+	IssueKey string // the issue the Concierge took, or ""
+	Outcome  QuestionOutcome
+	// Answer is the lines the voice was given to say for the turn, in order.
+	Answer string
+	// FirstAudio is how long after AskedAt the turn's first audio played;
+	// nil when none did.
+	FirstAudio *time.Duration
+	Took       time.Duration // how long after AskedAt the outcome was known
 }
 
 // TurnText is one final transcript segment.

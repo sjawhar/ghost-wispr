@@ -33,6 +33,7 @@ import (
 	"github.com/gorilla/websocket"
 
 	"github.com/sjawhar/ghost-wispr/internal/audio"
+	"github.com/sjawhar/ghost-wispr/internal/config"
 	"github.com/sjawhar/ghost-wispr/internal/logging"
 	"github.com/sjawhar/ghost-wispr/internal/openaiwif"
 	"github.com/sjawhar/ghost-wispr/internal/providererr"
@@ -153,8 +154,9 @@ type Voice struct {
 }
 
 var (
-	_ voice.Voice      = (*Voice)(nil)
-	_ voice.TurnDriver = (*Voice)(nil)
+	_ voice.Voice       = (*Voice)(nil)
+	_ voice.TurnDriver  = (*Voice)(nil)
+	_ voice.NamedEngine = (*Voice)(nil)
 )
 
 // New makes voice B.
@@ -175,6 +177,9 @@ func New(cfg Config) (*Voice, error) {
 // DrivesTurn reports that GPT-Live drives the turn: it decides when to
 // answer and delegates to the Concierge's answer tool.
 func (v *Voice) DrivesTurn() bool { return true }
+
+// Engine names voice B as voice.engine does (voice.NamedEngine).
+func (v *Voice) Engine() string { return config.VoiceEngineGPTLive }
 
 // Open connects to GPT-Live and starts a session for x. It returns once the
 // session has started, so x's tap audio, which it keeps from the start,

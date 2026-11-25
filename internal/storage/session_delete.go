@@ -228,12 +228,15 @@ func clearSessionsDeleted(tx *sql.Tx) (int64, error) {
 }
 
 // dropRowsOfDeletedSessions deletes, in tx, the rows besides stored events
-// that name a session the database does not have and that no foreign key
-// deletes with it: a cut "Delete text and audio" refused (refused_cuts),
-// which the status page forgets once its session is gone anyway, and a
-// claimed summary request (summary_requests), which would also keep a
-// session made later with the same id from claiming one. A table the
-// database does not have yet is left alone.
+// that name a session the database does not have: a cut "Delete text and
+// audio" refused (refused_cuts), which the status page forgets once its
+// session is gone anyway, and a claimed summary request (summary_requests),
+// which would also keep a session made later with the same id from claiming
+// one, which no foreign key deletes with it; and the voice's questions
+// (voice_questions) and questions to agents (voice_tasks), which hold the
+// room's words and an agent's answer, and which their foreign key deletes
+// only on a connection with foreign keys on, as the sqlite3 shell's is not.
+// A table the database does not have yet is left alone.
 //
 // A deleted text span (deleted_text_spans) stays. It holds no words: the
 // recording's file name, the span's times and the recording's SHA-256. It is
@@ -243,7 +246,7 @@ func clearSessionsDeleted(tx *sql.Tx) (int64, error) {
 // for good. It belongs to its recording, not to the session the text was
 // deleted in, and is read by the recording's name (TextDeletionSpans).
 func dropRowsOfDeletedSessions(tx *sql.Tx) error {
-	for _, table := range []string{"refused_cuts", "summary_requests"} {
+	for _, table := range []string{"refused_cuts", "summary_requests", "voice_questions", "voice_tasks"} {
 		if exists, err := tableExists(tx, table); err != nil {
 			return fmt.Errorf("check table %s before deleting the rows of deleted sessions: %w", table, err)
 		} else if !exists {

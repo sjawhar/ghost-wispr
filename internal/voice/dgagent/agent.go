@@ -197,13 +197,17 @@ type Agent struct {
 }
 
 var (
-	_ voice.Voice      = (*Agent)(nil)
-	_ voice.TurnDriver = (*Agent)(nil)
+	_ voice.Voice       = (*Agent)(nil)
+	_ voice.TurnDriver  = (*Agent)(nil)
+	_ voice.NamedEngine = (*Agent)(nil)
 )
 
 // DrivesTurn says Deepgram drives voice C's turns: it hears the room, decides
 // when the asker is done, and asks the Concierge for the answer itself.
 func (*Agent) DrivesTurn() bool { return true }
+
+// Engine names voice C as voice.engine does (voice.NamedEngine).
+func (*Agent) Engine() string { return config.VoiceEngineDGAgent }
 
 // New returns voice C with cfg's defaults filled in. It keeps its own copy
 // of cfg's lists, so a change the caller makes to cfg afterwards does not

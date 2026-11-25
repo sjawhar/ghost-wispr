@@ -1053,6 +1053,9 @@ func main() {
 		logging.SetDefault(logging.New(os.Stderr, slog.LevelWarn))
 		os.Exit(runJoinedProbeCommand(context.Background(), os.Args[1:], configPath, os.Stdout, os.Stderr))
 	}
+	if len(os.Args) > 1 && os.Args[1] == "voice" {
+		os.Exit(runVoiceCommand(os.Args[1:], configPath, os.Stdout, os.Stderr))
+	}
 	if len(os.Args) > 1 {
 		if exitCode := runLightCommand(os.Args[1:], os.Stdout, os.Stderr); exitCode != 0 {
 			os.Exit(exitCode)
@@ -1985,6 +1988,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 			asks:        concierge.Asks,
 			segment:     joinedLink.OnSegment,
 			handDone:    joinedLink.HandDone,
+			question:    recordQuestion(store, appLogger),
 			waiting:     waitingLED{hardware},
 		}); err != nil {
 			slog.Warn("the meeting voice is off", "error", err)
