@@ -898,12 +898,15 @@ func (c *Concierge) facts(ctx context.Context, tools *runner, view projectsView,
 	reason := ""
 	for try := 1; try <= earTries; try++ {
 		note := ""
-		if said := sp.said(); len(said) > 0 {
-			note += "\n\nAlready said to the room: " + strings.Join(said, " ")
+		if heard := sp.said(); len(heard) > 0 {
+			// Named one a line, each said once: the model's next try says
+			// what they leave out, not them in other words (heardAgain).
+			note += "\n\nAlready said to the room, one a line. Say none of them again, in these words or in others:\n- " + strings.Join(heard, "\n- ") + "\n"
 		}
 		if reason != "" {
 			note += "\n\nYour last answer failed R8's check: " + reason + ". Answer again from the record only, in the form asked."
 		}
+		said.retry = try > 1
 		err := c.generate(ctx, tools, prompt+note, said, &budget)
 		var invented *inventedError
 		if !errors.As(err, &invented) {
@@ -1412,6 +1415,9 @@ type sentences struct {
 	pending     strings.Builder
 	// spoken and words count the sentences and words said.
 	spoken, words int
+	// retry: the model writes again after a try that failed R8's check, and
+	// may say again what that try said (heardAgain).
+	retry bool
 }
 
 func (s *sentences) add(ctx context.Context, text string) error {
@@ -1450,9 +1456,16 @@ func (s *sentences) speak(ctx context.Context, sentence string) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	// A retry may start with a sentence the room already heard, word for
-	// word or in other words (saysNothingNew).
-	if saysNothingNew(sentence, s.sp.said()) {
+	// A sentence the room heard word for word is not said again. A retry
+	// may also say again, as a clause of its own, what its first try said
+	// (heardAgain); a first try's sentences are all said.
+	heard := s.sp.said()
+	for _, line := range heard {
+		if strings.EqualFold(strings.TrimSpace(line), sentence) {
+			return nil
+		}
+	}
+	if s.retry && heardAgain(sentence, heard) {
 		return nil
 	}
 	words := len(strings.Fields(sentence))
@@ -1476,43 +1489,62 @@ func (s *sentences) speak(ctx context.Context, sentence string) error {
 	return nil
 }
 
-// smallWords carry no meaning of their own in a sentence the voice says:
-// "INFRA-7's agent is not answering" and "the agent of INFRA-7 is not
-// answering" say the same. "Not", "no" and every number carry meaning, and
-// so do "it" and "this", which name a subject: "It is in review." after "PR
-// 80 is in review." says it of the issue.
-var smallWords = set(strings.Fields("a an the is are was were be been being and or but so then also of to in on at for with by as from has have had s"))
-
-// saysNothingNew reports whether sentence says nothing the room has not
-// heard: each of its words that carries meaning, in lower case, is in one
-// sentence of heard. A retry of the model's may say again, in other words,
-// a sentence the room heard before the check stopped the first try: live on
-// 2026-11-25 the room heard "INFRA-7 is in todo status with priority P1, and
-// was updated two days ago." and then "INFRA-7 is in todo status with
-// priority P1, updated two days ago.". A sentence that adds one word that
-// carries meaning, a "not" or another number among them, is said.
-func saysNothingNew(sentence string, heard []string) bool {
-	words := meaningWords(sentence)
-	for _, line := range heard {
-		held := set(meaningWords(line))
-		if !slices.ContainsFunc(words, func(word string) bool { return !held[word] }) {
-			return true
-		}
-	}
-	return false
+// heardWord is a word of a sentence as heardAgain reads it: lower case, with
+// the punctuation around it gone and the hyphen or apostrophe inside it kept
+// ("abc-12", "infra-7's"); stop: a full stop, a question or an exclamation
+// mark ended a sentence at it.
+type heardWord struct {
+	word string
+	stop bool
 }
 
-// meaningWords are text's words that carry meaning (no smallWords), in lower
-// case, an issue key's project and number apart ("INFRA-7's" is "infra",
-// "7").
-func meaningWords(text string) []string {
-	var words []string
-	for _, word := range strings.FieldsFunc(strings.ToLower(text), func(r rune) bool {
-		return !unicode.IsLetter(r) && !unicode.IsDigit(r)
-	}) {
-		if !smallWords[word] {
-			words = append(words, word)
+// heardWords is text's words, each one kept, in order (heardWord).
+func heardWords(text string) []heardWord {
+	notWord := func(r rune) bool { return !unicode.IsLetter(r) && !unicode.IsDigit(r) }
+	var words []heardWord
+	for _, field := range strings.Fields(strings.ToLower(strings.ReplaceAll(text, "’", "'"))) {
+		if word := strings.TrimFunc(field, notWord); word != "" {
+			words = append(words, heardWord{word: word, stop: strings.ContainsAny(field[len(strings.TrimRightFunc(field, notWord)):], ".!?")})
 		}
 	}
 	return words
+}
+
+// clauseJoiners join two clauses of a sentence, each a sentence of its own:
+// "ABC-12 is in progress and PR 80 is in review."
+var clauseJoiners = set([]string{"and", "but", "so"})
+
+// heardAgain reports whether sentence, a retry's, is a clause the room
+// heard: its words, every one of them in order (heardWords), are a run of a
+// text of heard that stands as a sentence there. The run starts a sentence
+// of that text or follows a word that joins clauses (clauseJoiners), and it
+// ends that sentence or comes before such a word. Live on 2026-11-25 a retry
+// said its first try's sentence again.
+//
+// The check errs toward a repeat, never toward a fact unsaid. A word added,
+// gone or in another place makes a sentence new ("XYZ-7 blocks ABC-12."
+// after "ABC-12 blocks XYZ-7.", "It is done." after "It is not done."), and
+// so does a run that stands under other words: "ABC-12 is done." after
+// "Nobody said ABC-12 is done.", "If PR 80 merges, ABC-12 is done." or
+// "ABC-12 is done, if PR 80 merges.". A repeat in other words ("INFRA-7 is in
+// todo status with priority P1, updated two days ago." after "…, and was
+// updated two days ago.") is said too: the retry's prompt asks the model to
+// say none of those again.
+func heardAgain(sentence string, heard []string) bool {
+	words := heardWords(sentence)
+	if len(words) == 0 {
+		return false
+	}
+	for _, line := range heard {
+		said := heardWords(line)
+		for at := 0; at+len(words) <= len(said); at++ {
+			end := at + len(words)
+			starts := at == 0 || said[at-1].stop || clauseJoiners[said[at-1].word]
+			ends := end == len(said) || said[end-1].stop || clauseJoiners[said[end].word]
+			if starts && ends && slices.EqualFunc(said[at:end], words, func(a, b heardWord) bool { return a.word == b.word }) {
+				return true
+			}
+		}
+	}
+	return false
 }
