@@ -127,10 +127,17 @@ func TestPendingWaitsForFreeFloor(t *testing.T) {
 }
 
 // TestSoundsWaitForAGap fails if the answer sound plays while people talk,
-// before a gap of SoundGap with no transcript word.
+// before a gap of SoundGap with no transcript word. The talk is a word every
+// 30 ms. With the rig's gap of 100 ms, a pause of 70 ms in the talk was a real
+// gap to the Supervisor, and a suite run on two CPUs shared with other
+// packages' tests failed once so (#197's, at f0311d8). The gap here is 1 s,
+// so the talk must pause for nearly a second; and the wait while people talk
+// is 2.5 times the gap, so a sound that waited the gap from the answer, not
+// from the last word, is still caught.
 func TestSoundsWaitForAGap(t *testing.T) {
+	const gap = time.Second
 	c := newFakeConcierge()
-	r := newRig(t, c)
+	r := newRigWith(t, c, func(cfg *SupervisorConfig, _ *rig) { cfg.SoundGap = gap })
 	stop := make(chan struct{})
 	var wg sync.WaitGroup
 	wg.Add(1)
@@ -148,10 +155,14 @@ func TestSoundsWaitForAGap(t *testing.T) {
 	r.heard("people keep talking", false, false) // already talking as the answer lands
 	c.answers <- PendingAnswer{TaskID: "t1", SessionID: "sess-1", Text: "It ships tomorrow."}
 	r.waitEvent("voice_answer_ready:sess-1")
-	never(t, "the answer sound played while people talked", 400*time.Millisecond, func() bool { return len(r.speaker.soundsPlayed()) > 0 })
+	never(t, "the answer sound played while people talked", 5*gap/2, func() bool { return len(r.speaker.soundsPlayed()) > 0 })
 	close(stop)
 	wg.Wait()
-	eventually(t, "the answer sound after the gap", func() bool { return slices.Equal(r.speaker.soundsPlayed(), []string{"answer"}) })
+	for until := time.Now().Add(gap + testWait); !slices.Equal(r.speaker.soundsPlayed(), []string{"answer"}); time.Sleep(10 * time.Millisecond) {
+		if time.Now().After(until) {
+			t.Fatalf("no answer sound within %v of the talk's end: played %q", gap+testWait, r.speaker.soundsPlayed())
+		}
+	}
 }
 
 // TestSoundTriggersAndPitch fails if a sound does not play on its trigger, or
