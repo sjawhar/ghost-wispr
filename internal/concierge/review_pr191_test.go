@@ -404,9 +404,7 @@ func TestAStatementAfterWisprsQuestionStaysSideTalkAtAnyEndpoint(t *testing.T) {
 			if initial := r.answer(t, "initial", ""); !strings.HasSuffix(initial.Say, "?") {
 				t.Fatalf("control: the first answer asks nothing: %q", initial.Say)
 			}
-			r.speak(t)
-			time.Sleep(1200 * time.Millisecond)
-			p0 := time.Now().Add(-time.Second) // the reply, said since the voice began
+			p0 := r.speak(t).Add(20 * time.Millisecond) // the reply, said since the voice began
 			prefixAt := []time.Time{p0, p0.Add(200 * time.Millisecond)}
 			tailAt := []time.Time{p0.Add(600 * time.Millisecond), p0.Add(800 * time.Millisecond)}
 			searched, read := len(r.records.searches()), len(r.records.calls())
@@ -563,9 +561,7 @@ func TestTheVendorsTextDecidesNoReplyToWisprsQuestion(t *testing.T) {
 			if initial := r.answer(t, "initial", ""); !strings.HasSuffix(initial.Say, "?") {
 				t.Fatalf("control: the first answer asks nothing: %q", initial.Say)
 			}
-			r.speak(t)
-			time.Sleep(1200 * time.Millisecond)
-			p0 := time.Now().Add(-time.Second) // the reply, said since the voice began
+			p0 := r.speak(t).Add(20 * time.Millisecond) // the reply, said since the voice began
 			searched, read := len(r.records.searches()), len(r.records.calls())
 			r.agents.mu.Lock()
 			sent := len(r.agents.sent)
