@@ -1971,6 +1971,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 			red:         func() bool { return capture.capturing(micStatus) },
 			notify:      hub.BroadcastVoiceEvent,
 			projects:    dispatchProjects.Get,
+			takeBack:    concierge.TakeBack,
 			segment:     joinedLink.OnSegment,
 			handDone:    joinedLink.HandDone,
 			waiting:     waitingLED{hardware},

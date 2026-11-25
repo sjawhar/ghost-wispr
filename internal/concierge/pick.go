@@ -200,7 +200,9 @@ var takeBacks = set([]string{"stop", "never mind", "nevermind", "cancel", "forge
 // ABC-12?" says the question. A clause with any other word, a question word
 // or a question mark is no take-back: "stop the rollout?", "never mind the
 // budget what about ABC-12?" (Sol's sixth review of #191, where a prefix
-// match took them for take-backs). With no take-back, it is reply.
+// match took them for take-backs). Nor is a clause that holds a quote mark:
+// a quoted word is what the room is talking about, `did ABC-12, "Cancel",
+// ship?` (Sol's tenth review of #191). With no take-back, it is reply.
 func afterTakeBack(reply string) string {
 	rest := reply
 	for clause := reply; clause != ""; {
@@ -211,7 +213,7 @@ func afterTakeBack(reply string) string {
 		} else {
 			next = clause[end+1:]
 		}
-		if (end == len(clause) || clause[end] != '?') && takesBack(clause[:end]) {
+		if (end == len(clause) || clause[end] != '?') && !quotes(clause[:end]) && takesBack(clause[:end]) {
 			rest = next
 		}
 		clause = next
@@ -229,14 +231,44 @@ func takesItBack(reply string) bool {
 	return afterTakeBack(reply) != strings.TrimSpace(reply)
 }
 
+// TakeBack is the room's last take-back in finals, one a line, keys
+// unwritten, as the answer finds it (afterTakeBack): taken reports one, and
+// rest is what the finals say after it. The Supervisor drops what it
+// cancelled from the room's recent words (voice.Config.TakeBack).
+func TakeBack(finals string) (rest string, taken bool) {
+	rest = afterTakeBack(finals)
+	return rest, rest != strings.TrimSpace(finals)
+}
+
+// quotes reports whether clause holds a quote mark, straight or curly: a
+// double one anywhere, or a single one that opens or closes a word, not the
+// apostrophe inside one ("that's all").
+func quotes(clause string) bool {
+	if strings.ContainsAny(clause, "\"“”„«»") {
+		return true
+	}
+	for _, word := range strings.Fields(clause) {
+		for _, mark := range []string{"'", "‘", "’"} {
+			if strings.HasPrefix(word, mark) || strings.HasSuffix(word, mark) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // roomFinals is the room's raw words that a take-back is found on: the reply
 // to Wispr's question (voice.Exchange.Reply), else the turn's own finals
-// (voice.Exchange.Finals), one a line, else turn.
+// (voice.Exchange.Finals) when turn is that turn (AskerTurn), one a line,
+// else turn. A vendor's new question, asked before the room's next words,
+// is never cut by the take-back of the turn before (Sol's tenth review of
+// #191).
 func roomFinals(x *voice.Exchange, turn string) string {
-	for _, finals := range []string{x.Reply, x.Finals} {
-		if strings.TrimSpace(finals) != "" {
-			return finals
-		}
+	if strings.TrimSpace(x.Reply) != "" {
+		return x.Reply
+	}
+	if strings.TrimSpace(x.Finals) != "" && strings.TrimSpace(turn) == strings.TrimSpace(x.AskerTurn) {
+		return x.Finals
 	}
 	return turn
 }

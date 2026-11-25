@@ -147,10 +147,6 @@ type runner struct {
 	fullCut <-chan struct{}
 	// holderKnown: the answer's record holds the issue's holder (offered).
 	holderKnown bool
-	// recent, when set, is the room's recent words the model gets in place
-	// of x.Recent: those with the turn's words before its last take-back
-	// left out (withoutTakenBack).
-	recent []voice.TurnText
 	// view, when set, is the turn's one reading of the project list
 	// (projectsView), which a search reads its question with. Tools leaves
 	// it nil: its runner serves a vendor's tool call made outside an answer,

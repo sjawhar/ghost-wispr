@@ -198,6 +198,12 @@ type SupervisorConfig struct {
 	// ProjectKeys are Dispatch's project keys, whose spoken keys the turn
 	// writes as keys; nil writes none. It must return at once.
 	ProjectKeys func() []string
+	// TakeBack finds the room's last take-back in a turn's finals, one a
+	// line, keys unwritten (the Concierge's rule, concierge.TakeBack): taken
+	// reports one, and rest is what the finals say after it. The turn's
+	// words before it then leave the room's recent words (Exchange.Recent),
+	// so no later answer hears them. nil finds none. It must return at once.
+	TakeBack func(finals string) (rest string, taken bool)
 	// WaitingLight is told On while something waits for a person, and Off
 	// once nothing does (Supervisor.waitingLocked); nil shows nothing.
 	WaitingLight WaitingLight
@@ -292,6 +298,8 @@ type Supervisor struct {
 	voiceEnded    time.Time // when it last stopped
 	own           []ownWords
 	recent        []TurnText
+	recentSeq     uint64         // the id of the newest recent entry (TurnText.seq)
+	recentOf      *Transcript    // the final that entry was kept from
 	lastHeard     time.Time      // the last word heard
 	lastRoomWord  time.Time      // the last word heard that was not Wispr's own
 	lastTimes     *exchangeTimes // the newest exchange a wake opened: its times, no words
@@ -402,6 +410,7 @@ type exchange struct {
 	wakeStart    float64 // the wake word's start on the socket; later results of its utterance repeat it
 	wakeAt       time.Time
 	turn         []string // final words of the asker's turn
+	turnSeqs     []uint64 // each final's entry in the room's recent words, 0 for none
 	interim      string   // the turn's words not final yet
 	timer        *time.Timer
 	said         bool
@@ -1829,6 +1838,15 @@ func (s *Supervisor) turnLocked(ex *exchange, t *Transcript, words string) {
 	if t.IsFinal {
 		if words != "" {
 			ex.turn = append(ex.turn, words)
+			// ex.turnSeqs keeps ex.turn's last entries, one a final: a
+			// reset of ex.turn drops the rest of them here.
+			seq := uint64(0)
+			if s.recentOf == t {
+				seq = s.recentSeq
+			}
+			keep := min(len(ex.turnSeqs), len(ex.turn)-1)
+			ex.turnSeqs = append(ex.turnSeqs[len(ex.turnSeqs)-keep:], seq)
+			s.takeBackLocked(ex)
 			if ex.drives {
 				ex.reply = append(ex.reply, words)
 			}
@@ -2030,6 +2048,9 @@ func (s *Supervisor) handTurnLocked(ex *exchange, signal turnSignal) {
 	s.exTimingLocked(ex, "turn_end", turnEnd)
 	s.noteLocked(ex, EventExchangeStarted, ex.x.SessionID)
 	x := ex.x
+	// A handed turn's words are no later answer's (Sol's tenth review of
+	// #191): a take-back in them cuts that turn alone.
+	ex.x.AskerTurn, ex.x.Finals = "", ""
 	s.spawn(func() { s.answer(ex, &x, turn) })
 }
 
@@ -2937,8 +2958,58 @@ func (s *Supervisor) keepRecentLocked(t *Transcript, now time.Time) {
 			kept = append(kept, r)
 		}
 	}
-	kept = append(kept, TurnText{Speaker: speaker, Text: strings.TrimSpace(t.Text), At: now})
+	s.recentSeq++
+	s.recentOf = t
+	kept = append(kept, TurnText{Speaker: speaker, Text: strings.TrimSpace(t.Text), At: now, seq: s.recentSeq})
 	s.recent = kept
+}
+
+// takeBackLocked drops from the room's recent words what ex's turn took
+// back (Config.TakeBack), from the Supervisor's own and from the
+// exchange's: no later answer, of this turn or of the next, hears words the
+// room cancelled (Main, after Sol's tenth review of #191). The final that
+// holds the take-back keeps what follows it; the finals after it stay.
+func (s *Supervisor) takeBackLocked(ex *exchange) {
+	if s.cfg.TakeBack == nil {
+		return
+	}
+	rest, taken := s.cfg.TakeBack(strings.Join(ex.turn, "\n"))
+	if !taken {
+		return
+	}
+	kept := 0
+	if rest != "" {
+		kept = len(strings.Split(rest, "\n"))
+	}
+	first := len(ex.turn) - kept // the final that holds the take-back
+	texts := map[uint64]string{}
+	for i, seq := range ex.turnSeqs {
+		switch {
+		case seq == 0:
+		case i < first:
+			texts[seq] = ""
+		case i == first:
+			texts[seq], _, _ = strings.Cut(rest, "\n")
+		}
+	}
+	s.recent = withTexts(s.recent, texts)
+	ex.x.Recent = withTexts(ex.x.Recent, texts)
+}
+
+// withTexts is recent, a new slice, with each entry texts names given its
+// text there, and left out where that text is "".
+func withTexts(recent []TurnText, texts map[uint64]string) []TurnText {
+	out := make([]TurnText, 0, len(recent))
+	for _, r := range recent {
+		if text, ok := texts[r.seq]; ok {
+			if text == "" {
+				continue
+			}
+			r.Text = text
+		}
+		out = append(out, r)
+	}
+	return out
 }
 
 // recentLocked is the transcript of the last recentKept, pruned by age as it
@@ -3343,6 +3414,10 @@ func (t exchangeTools) Run(ctx context.Context, c ToolCall) (json.RawMessage, er
 	// followUpTurn waited for it.
 	s.mu.Lock()
 	x = t.ex.x
+	// A handed turn's words are no later answer's: a vendor that asks again
+	// before the room's next words would get them, and a take-back in them
+	// would cut its new question (Sol's tenth review of #191).
+	t.ex.x.AskerTurn, t.ex.x.Finals = "", ""
 	x.FollowUpTurn = t.ex.followUpTurn
 	if askedBack {
 		x.Reply = replyOf(t.ex)

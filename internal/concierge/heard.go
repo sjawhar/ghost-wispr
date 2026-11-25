@@ -553,11 +553,18 @@ func (c *Concierge) Heard(ctx context.Context, x *voice.Exchange, words string) 
 	// Only what the room said after its last take-back is read ahead
 	// (roomFinals; Main, after Sol's review of #191 at 31b6af9): "what
 	// about ABC-42? never mind" reads nothing ahead, and "what about ABC-12?"
-	// after it reads ABC-12 alone.
-	if finals := roomFinals(x, words); takesItBack(finals) {
-		if words = c.viewProjects().replyText(finals); words == "" {
-			return
-		}
+	// after it reads ABC-12 alone. A take-back that leaves nothing to read
+	// drops the read ahead of what it cancelled, which may wait to search
+	// (Sol's tenth review of #191); one that leaves words to read replaces it
+	// below, as a new reading of the turn does.
+	finals := roomFinals(x, words)
+	takenBack := takesItBack(finals)
+	if takenBack {
+		words = c.viewProjects().replyText(finals)
+	}
+	if words == "" {
+		c.dropAheadRead(x, takenBack)
+		return
 	}
 	// One reading of the project list decides the turn (projectsView). A run
 	// of letters that could be a key the list cannot tell yet is neither read
@@ -565,6 +572,7 @@ func (c *Concierge) Heard(ctx context.Context, x *voice.Exchange, words string) 
 	view := c.viewProjects()
 	words, unread := view.readSpelledKeys(words)
 	if unread {
+		c.dropAheadRead(x, takenBack)
 		return
 	}
 	target := c.aheadTarget(view, words)
@@ -573,6 +581,7 @@ func (c *Concierge) Heard(ctx context.Context, x *voice.Exchange, words string) 
 	// beyond the number keeps its search. A turn whose only key has one
 	// digit skips it too: the answer reads that key (aheadTarget).
 	if target == "" {
+		c.dropAheadRead(x, takenBack)
 		return
 	}
 	exchange := *x
@@ -670,6 +679,27 @@ func (c *Concierge) Heard(ctx context.Context, x *voice.Exchange, words string) 
 			r.found, r.complete = found, true
 		}
 	}()
+}
+
+// dropAheadRead, when taken (the turn took back what came before), cancels
+// x's read ahead of the words it cancelled, running or waiting to search,
+// and forgets it: no answer takes it, and its search never reaches
+// Dispatch.
+func (c *Concierge) dropAheadRead(x *voice.Exchange, taken bool) {
+	if !taken {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	p := c.prefetchLocked(x)
+	if p == nil || p.current == "" {
+		return
+	}
+	if r := p.reads[p.current]; r != nil {
+		r.cancel()
+		delete(p.reads, p.current)
+	}
+	p.current = ""
 }
 
 // aheadSearch reports whether x's read-ahead read r may search now, and

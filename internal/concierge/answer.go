@@ -437,7 +437,7 @@ func (c *Concierge) answer(parent context.Context, x *voice.Exchange, turn strin
 		searchesLeft--
 	}
 	searchesLeft = max(searchesLeft, 0)
-	tools := &runner{c: c, x: x, searchesLeft: &searchesLeft, fullCut: fullCut, holderKnown: found.holder != nil, view: &view, recent: withoutTakenBack(x.Recent, reply)}
+	tools := &runner{c: c, x: x, searchesLeft: &searchesLeft, fullCut: fullCut, holderKnown: found.holder != nil, view: &view}
 	var err error
 	if !staleSaid {
 		// With no fact by c.knownBound, the model stops and the voice says
@@ -931,11 +931,7 @@ func direct(question string) string {
 // R8's bounds hold across both tries. view is the turn's one reading of the
 // project list, which reads the keys the turn names.
 func (c *Concierge) facts(ctx context.Context, tools *runner, view projectsView, turn string, found *reading, asking bool, sp *speaker) error {
-	recent := tools.recent
-	if recent == nil {
-		recent = tools.x.Recent
-	}
-	prompt := c.turnPrompt(transcriptOf(recent), turn)
+	prompt := c.turnPrompt(transcriptOf(tools.x.Recent), turn)
 	switch {
 	case found.text == "":
 	case found.searched && found.clear && found.key != "":
@@ -1102,37 +1098,6 @@ func (c *Concierge) generate(ctx context.Context, tools *runner, prompt string, 
 		}
 		contents = append(contents, &genai.Content{Role: genai.RoleUser, Parts: results})
 	}
-}
-
-// withoutTakenBack is recent, the room's recent words, with the words that
-// finals, the turn's raw finals (roomFinals), said before their last
-// take-back left out, the last time each was said: the model hears the room
-// as it hears the turn, with nothing that was taken back (Main, after Sol's
-// review of #191 at 31b6af9). With no take-back it is recent.
-func withoutTakenBack(recent []voice.TurnText, finals string) []voice.TurnText {
-	if !takesItBack(finals) {
-		return recent
-	}
-	finals = strings.TrimSpace(finals)
-	taken := finals
-	if kept := afterTakeBack(finals); kept != "" {
-		taken = finals[:strings.LastIndex(finals, kept)]
-	}
-	out := slices.Clone(recent)
-	lines := strings.Split(taken, "\n")
-	for i := len(lines) - 1; i >= 0; i-- {
-		line := strings.TrimSpace(lines[i])
-		if line == "" {
-			continue
-		}
-		for k := len(out) - 1; k >= 0; k-- {
-			if at := strings.LastIndex(out[k].Text, line); at >= 0 {
-				out[k].Text = strings.Join(strings.Fields(out[k].Text[:at]+" "+out[k].Text[at+len(line):]), " ")
-				break
-			}
-		}
-	}
-	return slices.DeleteFunc(out, func(t voice.TurnText) bool { return t.Text == "" })
 }
 
 func transcriptOf(recent []voice.TurnText) string {

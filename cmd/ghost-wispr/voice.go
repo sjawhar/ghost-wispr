@@ -209,8 +209,9 @@ type voiceDeps struct {
 	meeting     func(string) context.Context // a session's meeting context, which the recorder ends with it
 	red         func() bool                  // the light reads red and audio passes the gate
 	notify      func(kind, sessionID string)
-	projects    func() []string    // Dispatch's project keys, for spoken keys
-	waiting     voice.WaitingLight // shows that something waits for a person; nil shows nothing
+	projects    func() []string                               // Dispatch's project keys, for spoken keys
+	takeBack    func(finals string) (rest string, taken bool) // the Concierge's take-back rule (concierge.TakeBack)
+	waiting     voice.WaitingLight                            // shows that something waits for a person; nil shows nothing
 	// segment and handDone reach the joined agents' roster: the room's
 	// final segments, and how each raised hand came down.
 	segment  func(*voice.Segment)
@@ -247,6 +248,7 @@ func startVoice(deps *voiceDeps) error {
 		Enabled:        deps.enabled,
 		Notify:         deps.notify,
 		ProjectKeys:    deps.projects,
+		TakeBack:       deps.takeBack,
 		WaitingLight:   deps.waiting,
 		Tap:            deps.tap,
 		Segment:        deps.segment,

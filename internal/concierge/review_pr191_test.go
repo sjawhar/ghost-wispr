@@ -192,6 +192,7 @@ func newCutRigOpening(t *testing.T, finals []string, endpoints bool, turns ...[]
 		Speaker:      r.speaker,
 		WakePhrases:  []string{"Wispr"},
 		ProjectKeys:  func() []string { return []string{"ABC", "XYZ", "DEF", "INFRA"} },
+		TakeBack:     TakeBack,
 		Session:      func() string { return "meeting-1" },
 		Red:          func() bool { return true },
 		IdleWait:     time.Minute,

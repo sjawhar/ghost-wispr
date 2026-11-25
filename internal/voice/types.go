@@ -20,7 +20,9 @@ import (
 type Exchange struct {
 	SessionID string
 	WakeAt    time.Time
-	AskerTurn string // the asker's words after the wake phrase, so far
+	// AskerTurn is the asker's words after the wake phrase, so far; the
+	// Supervisor clears it, and Finals, once it hands the turn to an answer.
+	AskerTurn string
 	// IssueKey is the canonical resolved Dispatch key for the answer this
 	// exchange speaks, or empty when no issue was resolved. Held answers set
 	// it directly; voices never reconstruct it from speech.
@@ -29,10 +31,12 @@ type Exchange struct {
 	// phrase (a question; R10). The Concierge asks an agent about it only
 	// when it says "ask".
 	FollowUpTurn bool
-	Recent       []TurnText         // up to the last 2 minutes of labelled final segments
-	Tap          <-chan audio.Frame // room audio from the wake on, 16 kHz mono, only while the capture gate is open
-	Out          Output             // the speaker output's "voice" input
-	Tools        ToolRunner         // the Concierge
+	// Recent is up to the last 2 minutes of labelled final segments, with
+	// the words a take-back cancelled left out (Config.TakeBack).
+	Recent []TurnText
+	Tap    <-chan audio.Frame // room audio from the wake on, 16 kHz mono, only while the capture gate is open
+	Out    Output             // the speaker output's "voice" input
+	Tools  ToolRunner         // the Concierge
 	// Turn numbers the asker's turns in the exchange: the Heard calls of a
 	// turn and its Answer carry one number, and a later turn a greater one.
 	// Once the Concierge begins to answer a turn, a Heard of that turn or an
@@ -50,10 +54,11 @@ type Exchange struct {
 	Reply string
 	// Finals is the turn's own words (AskerTurn) as Deepgram wrote them,
 	// each final, and the interim after them, one a line, keys unwritten.
-	// The Concierge finds a take-back on them in any turn: a take-back a
-	// final's end closed ("what about ABC-42? never mind" / "what about
-	// ABC-12?") is no clause of AskerTurn, which joins the finals with
-	// spaces, and nothing said before it is read, searched or sent.
+	// The Concierge finds a take-back on them in the turn they are of: a
+	// take-back a final's end closed ("what about ABC-42? never mind" /
+	// "what about ABC-12?") is no clause of AskerTurn, which joins the finals
+	// with spaces, and nothing said before it is read, searched or sent. A
+	// question other than AskerTurn, a vendor's new one, is not cut by them.
 	Finals string
 }
 
@@ -62,6 +67,7 @@ type TurnText struct {
 	Speaker int // Deepgram's speaker label; -1 when it gave none
 	Text    string
 	At      time.Time // when the segment arrived
+	seq     uint64    // the Supervisor's id of it, so a take-back can cut it
 }
 
 // ToolCall is a voice's request to run one of the Concierge's tools.
