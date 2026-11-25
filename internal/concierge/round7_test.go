@@ -137,17 +137,20 @@ func TestAPickAnswersTheQuestionAsked(t *testing.T) {
 	}
 }
 
-// TestAReplyThatPicksNothingIsItsOwnQuestion (c-find, R5): "one" alone picks
-// nothing, nor do words both titles share or words of neither; such a turn
-// is a question of its own, and asks nobody unasked.
-func TestAReplyThatPicksNothingIsItsOwnQuestion(t *testing.T) {
+// TestAReplyThatPicksNothingSendsNothing (c-find, R5): "one" alone picks
+// nothing, nor do words both titles share or words of neither; such a turn,
+// no question, is side talk (Main's rule on R5's rewrite), and asks nobody
+// unasked.
+func TestAReplyThatPicksNothingSendsNothing(t *testing.T) {
 	for _, reply := range []string{"that one", "the word one", "never mind the tap"} {
 		r := newRig(t)
 		unclearSearch(r)
 		r.records.issues["ABC-12"].Title, r.records.hits[0].Title = "Voice word", "Voice word"
 		answerTurn(t, r, "ask the agent on the realtime voice whether the tap is merged")
 		r.model.turns = [][]*genai.GenerateContentResponse{{chunk(text("It is open."))}}
-		answerTurn(t, r, reply)
+		if spoken := replyTurn(t, r, reply); len(spoken) != 0 {
+			t.Errorf("%q: spoken %+v, want nothing: side talk", reply, spoken)
+		}
 		for _, m := range r.agents.sent {
 			if strings.Contains(m.Message, "the tap merged") {
 				t.Errorf("%q picked an issue: sent %+v", reply, m)
@@ -852,23 +855,36 @@ func TestAKeyReadAheadMakesNoUncountedSearch(t *testing.T) {
 	}
 }
 
-// TestTheReadAheadMaySearchAfterNoIssueFound (R6): an answer that found no
-// issue takes the read-ahead's count all the same, so the reply, which names
-// the issue another way, is searched ahead.
-func TestTheReadAheadMaySearchAfterNoIssueFound(t *testing.T) {
+// TestTheReplyToWhatIsItsKeyIsReadByItsAnswer (R6; Main on #191): after "What
+// is its key?", the read-ahead reads nothing for the reply, side talk or a
+// question: the answer decides whether the reply is side talk before any
+// read, then searches a question itself, once.
+func TestTheReplyToWhatIsItsKeyIsReadByItsAnswer(t *testing.T) {
 	r := newRig(t)
 	r.concierge.searchSettle = 50 * time.Millisecond
 	r.records.hits = nil
 	r.concierge.Heard(context.Background(), &r.exchange, "what is happening with the purple submarine")
 	eventually(t, "the read-ahead searched", func() bool { return len(r.records.searches()) == 1 })
 	answerTurn(t, r, "what is happening with the purple submarine")
+	voiceIssue(r)
+	r.exchange.Turn++ // the reply's turn, as the Supervisor numbers it: the offer, not the turn, stops its read-ahead
 	r.concierge.Heard(context.Background(), &r.exchange, "the realtime voice one")
-	eventually(t, "the reply's read-ahead searched", func() bool { return len(r.records.searches()) == 2 })
+	r.concierge.Heard(context.Background(), &r.exchange, "what about the realtime voice")
+	time.Sleep(200 * time.Millisecond)
+	if n := len(r.records.searches()); n != 1 {
+		t.Fatalf("the reply to What is its key was searched ahead: searches %q", r.records.searches())
+	}
+	r.model.turns = [][]*genai.GenerateContentResponse{{chunk(text("ABC-12 is in progress."))}}
+	answerTurn(t, r, "what about the realtime voice")
+	if n := len(r.records.searches()); n != 2 {
+		t.Fatalf("searches %q, want the reply's answer to search it once", r.records.searches())
+	}
 }
 
 // TestTheReadAheadCountStartsOverEachAnswer (R6): an answer that ends early,
 // as "Did you mean" does, still takes the read-ahead's count, so the next
 // turn's read-ahead may search; a reply that only picks searches nothing.
+// Each turn carries its number, as the Supervisor gives it (Exchange.Turn).
 func TestTheReadAheadCountStartsOverEachAnswer(t *testing.T) {
 	r := newRig(t)
 	r.concierge.searchSettle = 50 * time.Millisecond
@@ -876,6 +892,7 @@ func TestTheReadAheadCountStartsOverEachAnswer(t *testing.T) {
 	r.concierge.Heard(context.Background(), &r.exchange, "what is happening with the realtime voice")
 	eventually(t, "the read-ahead searched", func() bool { return len(r.records.searches()) == 1 })
 	answerTurn(t, r, "what is happening with the realtime voice")
+	r.exchange.Turn++
 	r.concierge.Heard(context.Background(), &r.exchange, "the second one")
 	time.Sleep(200 * time.Millisecond)
 	if n := len(r.records.searches()); n != 1 {
@@ -883,6 +900,7 @@ func TestTheReadAheadCountStartsOverEachAnswer(t *testing.T) {
 	}
 	r.model.turns = [][]*genai.GenerateContentResponse{{chunk(text("It is done."))}}
 	answerTurn(t, r, "the second one")
+	r.exchange.Turn++
 	r.concierge.Heard(context.Background(), &r.exchange, "and what about the wake word")
 	eventually(t, "the next turn's read-ahead searched", func() bool { return len(r.records.searches()) == 2 })
 }
@@ -1073,9 +1091,10 @@ func TestTheChosenIssueIsNamedByItsKey(t *testing.T) {
 	}
 }
 
-// TestAReplyThatPicksNothingIsSearchedAfresh (R5; the third review): a reply
-// to "Did you mean" that picks neither issue is searched for its own words,
-// not answered from the read-ahead of the question before it.
+// TestAReplyThatPicksNothingIsSearchedAfresh (R5; the third review): a
+// question in reply to "Did you mean" that picks neither issue is searched
+// for its own words, not answered from the read-ahead of the question before
+// it.
 func TestAReplyThatPicksNothingIsSearchedAfresh(t *testing.T) {
 	r := newRig(t)
 	r.concierge.searchSettle = 30 * time.Millisecond
@@ -1088,10 +1107,11 @@ func TestAReplyThatPicksNothingIsSearchedAfresh(t *testing.T) {
 	r.concierge.Heard(context.Background(), &r.exchange, "what is happening with the wake word")
 	eventually(t, "the read-ahead searched", func() bool { return len(r.records.searches()) == 1 })
 	answerTurn(t, r, "what is happening with the wake word")
-	r.concierge.Heard(context.Background(), &r.exchange, "the wake word timeout")
+	r.exchange.Turn++
+	r.concierge.Heard(context.Background(), &r.exchange, "what about the wake word timeout")
 	r.model.turns = [][]*genai.GenerateContentResponse{{chunk(text("It is open."))}}
-	answerTurn(t, r, "the wake word timeout")
-	if searches := r.records.searches(); !slices.Contains(searches, "the wake word timeout") {
+	answerTurn(t, r, "what about the wake word timeout")
+	if searches := r.records.searches(); !slices.Contains(searches, "what about the wake word timeout") {
 		t.Fatalf("searches = %q, want the reply's own words searched", searches)
 	}
 }

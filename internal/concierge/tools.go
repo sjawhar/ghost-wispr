@@ -528,11 +528,12 @@ func issuesOf(hits []dispatch.SearchHit) ([]map[string]any, bool) {
 // for a search to have one clear match (R5).
 const clearMatchRatio = 1.5
 
-// clearMatch reports whether the first of scores, the best issue's, is at
-// least clearMatchRatio times every other's. One issue is a clear match; none
-// is not.
+// clearMatch reports whether the first of scores, the best issue's, is above
+// zero and at least clearMatchRatio times every other's. One issue is a clear
+// match when its score is above zero; none is not. A score of zero is no rank
+// at all: it leads nothing, and nothing leads it by a ratio.
 func clearMatch(scores []float64) bool {
-	if len(scores) == 0 {
+	if len(scores) == 0 || scores[0] <= 0 {
 		return false
 	}
 	for _, score := range scores[1:] {

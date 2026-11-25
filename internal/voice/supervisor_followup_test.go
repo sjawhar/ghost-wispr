@@ -167,6 +167,214 @@ func TestAnAnswerToWisprsQuestionContinuesTheExchange(t *testing.T) {
 	})
 }
 
+// TestSideTalkAfterWisprsQuestionClosesTheExchange fails if a reply to
+// Wispr's own question that the Concierge takes for side talk (ErrSideTalk:
+// it picks nothing offered and asks nothing) gets a word, a sorry or the
+// error sound, or leaves the exchange open, for voice A or a driving voice.
+func TestSideTalkAfterWisprsQuestionClosesTheExchange(t *testing.T) {
+	const reply = "Okay, let's move on to the budget."
+	sideTalk := map[string]error{reply: fmt.Errorf("concierge: %w", ErrSideTalk)}
+	t.Run("tts", func(t *testing.T) {
+		c := newFakeConcierge()
+		c.acks = []string{didYouMean}
+		c.turnErrs = sideTalk
+		r := newRigWith(t, c, func(cfg *SupervisorConfig, _ *rig) { cfg.FollowUpWait = time.Minute })
+		sess := r.ask("what is happening with the voice work?")
+		waitSaid(t, sess)
+		r.speaker.finish(audio.InputVoice)
+		r.waitEvent("voice_spoken:sess-1")
+		r.heard(reply, true, true)
+		if got := r.waitTurn(); got != reply {
+			t.Fatalf("the reply went to the Concierge as %q", got)
+		}
+		eventually(t, "the exchange closed on side talk", func() bool { _, _, closed := sess.state(); return closed })
+		if says := sess.saysCopy(); !slices.Equal(says, []string{didYouMean}) {
+			t.Errorf("the voice said %q, want only %q", says, didYouMean)
+		}
+		if slices.Contains(r.timingEvents(), "error_sound") {
+			t.Error("side talk played the error sound")
+		}
+	})
+	t.Run("driving", func(t *testing.T) {
+		c := newFakeConcierge()
+		c.acks = []string{didYouMean}
+		c.turnErrs = sideTalk
+		r := newDrivingRigWith(t, time.Minute, c)
+		r.s.cfg.FollowUpWait = time.Minute
+		r.heard("Wispr, what is happening with the voice work?", true, true)
+		sess := r.waitSession()
+		if _, err := sess.x.Tools.Run(t.Context(), ToolCall{ID: "d1", Name: AnswerTool, Args: json.RawMessage(`{}`)}); err != nil {
+			t.Fatalf("the answer tool: %v", err)
+		}
+		<-c.asked
+		r.waitSpeaking()
+		r.speaker.finish(audio.InputVoice)
+		eventually(t, "the follow-up window opened after Wispr asked", func() bool {
+			r.s.mu.Lock()
+			defer r.s.mu.Unlock()
+			return r.s.ex != nil && r.s.ex.followUpTimer != nil && r.s.ex.askedBack
+		})
+		r.heard(reply, true, true)
+		out, err := sess.x.Tools.Run(t.Context(), ToolCall{ID: "d2", Name: AnswerTool, Args: json.RawMessage(`{}`)})
+		if err != nil {
+			t.Fatalf("the answer tool on side talk: %v", err)
+		}
+		var res AnswerResult
+		if err := json.Unmarshal(out, &res); err != nil || res.Say != "" {
+			t.Fatalf("the answer tool on side talk returned %s (%v), want no words", out, err)
+		}
+		if got := <-c.asked; got != reply {
+			t.Fatalf("the reply went to the Concierge as %q", got)
+		}
+		eventually(t, "the exchange closed on side talk", func() bool { _, _, closed := sess.state(); return closed })
+		if slices.Contains(r.timingEvents(), "error_sound") {
+			t.Error("side talk played the error sound")
+		}
+	})
+}
+
+// TestAReplyToWisprsQuestionGoesInTheRoomsWords fails if a driving voice's
+// answer tool, called on a reply to Wispr's own question, hands the
+// Concierge the vendor's own wording rather than the reply Deepgram heard: a
+// vendor that rewrote side talk as a question ("What about the budget?")
+// would get it past the rule that side talk after Wispr's question is not
+// answered (Main, on R5's rewrite). It also fails if a reply with no final
+// result within followUpTurnWait reaches the Concierge, gets words, or
+// leaves the exchange open: it is side talk.
+func TestAReplyToWisprsQuestionGoesInTheRoomsWords(t *testing.T) {
+	const said, rewritten = "Okay, let's move on to the budget.", `{"question":"What about the budget?"}`
+	askBack := func(t *testing.T, c *fakeConcierge) (*rig, *fakeSession) {
+		t.Helper()
+		c.acks = []string{didYouMean}
+		r := newDrivingRigWith(t, time.Minute, c)
+		r.s.cfg.FollowUpWait = time.Minute
+		r.heard("Wispr, what is happening with the voice work?", true, true)
+		sess := r.waitSession()
+		if _, err := sess.x.Tools.Run(t.Context(), ToolCall{ID: "d1", Name: AnswerTool, Args: json.RawMessage(`{}`)}); err != nil {
+			t.Fatalf("the answer tool: %v", err)
+		}
+		<-c.asked
+		r.waitSpeaking()
+		r.speaker.finish(audio.InputVoice)
+		eventually(t, "the follow-up window opened after Wispr asked", func() bool {
+			r.s.mu.Lock()
+			defer r.s.mu.Unlock()
+			return r.s.ex != nil && r.s.ex.followUpTimer != nil && r.s.ex.askedBack
+		})
+		return r, sess
+	}
+	t.Run("a final reply", func(t *testing.T) {
+		c := newFakeConcierge()
+		c.turnErrs = map[string]error{said: fmt.Errorf("concierge: %w", ErrSideTalk)}
+		r, sess := askBack(t, c)
+		r.heard(said, true, true)
+		out, err := sess.x.Tools.Run(t.Context(), ToolCall{ID: "d2", Name: AnswerTool, Args: json.RawMessage(rewritten)})
+		if err != nil {
+			t.Fatalf("the answer tool: %v", err)
+		}
+		if got := <-c.asked; got != said {
+			t.Fatalf("the Concierge got %q, want the room's words %q", got, said)
+		}
+		var res AnswerResult
+		if err := json.Unmarshal(out, &res); err != nil || res.Say != "" {
+			t.Fatalf("the answer tool returned %s (%v), want no words", out, err)
+		}
+		eventually(t, "the exchange closed on side talk", func() bool { _, _, closed := sess.state(); return closed })
+	})
+	t.Run("no final reply", func(t *testing.T) {
+		c := newFakeConcierge()
+		r, sess := askBack(t, c)
+		r.heard("Okay, let's move", false, false)
+		start := time.Now()
+		out, err := sess.x.Tools.Run(t.Context(), ToolCall{ID: "d2", Name: AnswerTool, Args: json.RawMessage(rewritten)})
+		if err != nil {
+			t.Fatalf("the answer tool: %v", err)
+		}
+		var res AnswerResult
+		if err := json.Unmarshal(out, &res); err != nil || res.Say != "" {
+			t.Fatalf("the answer tool returned %s (%v), want no words", out, err)
+		}
+		select {
+		case got := <-c.asked:
+			t.Fatalf("a reply with no final went to the Concierge as %q", got)
+		default:
+		}
+		if took := time.Since(start); took < followUpTurnWait {
+			t.Errorf("the answer tool gave up after %v, want it to wait %v for the final", took, followUpTurnWait)
+		}
+		eventually(t, "the exchange closed on side talk", func() bool { _, _, closed := sess.state(); return closed })
+	})
+}
+
+// TestATurnsHeardAndAnswerCarryItsNumber fails if the Heard calls of a turn
+// and the Answer of that turn carry different numbers (Exchange.Turn), or a
+// later turn's are not greater: the Concierge reads nothing ahead for a turn
+// once it began to answer it, the Heard of which the Supervisor can deliver
+// after the answer started, and still reads ahead for the next turn (Sol's
+// review of #191 at 1cbcb494).
+func TestATurnsHeardAndAnswerCarryItsNumber(t *testing.T) {
+	const reply = "The first one."
+	check := func(t *testing.T, c *fakeConcierge) {
+		t.Helper()
+		eventually(t, "the reply's Heard", func() bool {
+			return slices.ContainsFunc(c.heardCalls(), func(h heardCall) bool { return h.words == reply })
+		})
+		c.mu.Lock()
+		exchanges := slices.Clone(c.exchanges)
+		c.mu.Unlock()
+		if len(exchanges) != 2 {
+			t.Fatalf("%d answers, want the question's and the reply's", len(exchanges))
+		}
+		if exchanges[1].Turn <= exchanges[0].Turn {
+			t.Errorf("the reply's answer carries turn %d, the question's %d: want a greater one", exchanges[1].Turn, exchanges[0].Turn)
+		}
+		for _, h := range c.heardCalls() {
+			for _, x := range exchanges {
+				if h.words == x.AskerTurn && h.x.Turn != x.Turn {
+					t.Errorf("Heard(%q) carries turn %d, its answer %d", h.words, h.x.Turn, x.Turn)
+				}
+			}
+		}
+	}
+	t.Run("tts", func(t *testing.T) {
+		c := newFakeConcierge()
+		c.acks = []string{didYouMean}
+		r := newRigWith(t, c, func(cfg *SupervisorConfig, _ *rig) { cfg.FollowUpWait = time.Minute })
+		sess := r.ask("what is happening with the voice work?")
+		waitSaid(t, sess)
+		r.speaker.finish(audio.InputVoice)
+		r.waitEvent("voice_spoken:sess-1")
+		r.heard(reply, true, true)
+		r.waitTurn()
+		check(t, c)
+	})
+	t.Run("driving", func(t *testing.T) {
+		c := newFakeConcierge()
+		c.acks = []string{didYouMean}
+		r := newDrivingRigWith(t, time.Minute, c)
+		r.s.cfg.FollowUpWait = time.Minute
+		r.heard("Wispr, what is happening with the voice work?", true, true)
+		sess := r.waitSession()
+		if _, err := sess.x.Tools.Run(t.Context(), ToolCall{ID: "d1", Name: AnswerTool, Args: json.RawMessage(`{}`)}); err != nil {
+			t.Fatalf("the answer tool: %v", err)
+		}
+		<-c.asked
+		r.waitSpeaking()
+		r.speaker.finish(audio.InputVoice)
+		eventually(t, "the follow-up window opened after Wispr asked", func() bool {
+			r.s.mu.Lock()
+			defer r.s.mu.Unlock()
+			return r.s.ex != nil && r.s.ex.followUpTimer != nil && r.s.ex.askedBack
+		})
+		r.heard(reply, true, true)
+		if _, err := sess.x.Tools.Run(t.Context(), ToolCall{ID: "d2", Name: AnswerTool, Args: json.RawMessage(`{}`)}); err != nil {
+			t.Fatalf("the answer tool: %v", err)
+		}
+		<-c.asked
+		check(t, c)
+	})
+}
+
 // TestASpokenKeyReachesTheConciergeWritten fails if a key of one of
 // Dispatch's projects, said as Deepgram writes it ("in for forty five ninety
 // two", end-to-end run 8c), reaches the Concierge as words it cannot read as

@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/sjawhar/ghost-wispr/internal/audio"
 	"github.com/sjawhar/ghost-wispr/internal/config"
@@ -35,7 +36,7 @@ type voiceControl interface {
 	Started()
 	RedCheckFailed()
 	OnTranscript(t *voice.Transcript)
-	OnUtteranceEnd(closings int, gateOpen bool, at monoclock.Stamp)
+	OnUtteranceEnd(closings int, gateOpen bool, lastWordEnd time.Time, at monoclock.Stamp)
 	WithFloor(ctx context.Context, start func()) error
 	Close()
 }
@@ -100,9 +101,9 @@ func (l *voiceLink) OnTranscript(t *voice.Transcript) {
 	}
 }
 
-func (l *voiceLink) OnUtteranceEnd(closings int, gateOpen bool, at monoclock.Stamp) {
+func (l *voiceLink) OnUtteranceEnd(closings int, gateOpen bool, lastWordEnd time.Time, at monoclock.Stamp) {
 	if v := l.get(); v != nil {
-		v.OnUtteranceEnd(closings, gateOpen, at)
+		v.OnUtteranceEnd(closings, gateOpen, lastWordEnd, at)
 	}
 }
 

@@ -440,7 +440,7 @@ func (c transcriptCallback) admit(kind string, streamSeconds float64) bool {
 // voice.Supervisor.
 type voiceListener interface {
 	OnTranscript(t *voice.Transcript)
-	OnUtteranceEnd(closings int, gateOpen bool, at monoclock.Stamp)
+	OnUtteranceEnd(closings int, gateOpen bool, lastWordEnd time.Time, at monoclock.Stamp)
 }
 
 // keptMessager is a session manager that takes each result with the stream
@@ -556,8 +556,10 @@ func (c transcriptCallback) Metadata(*api.MetadataResponse) error { return nil }
 func (c transcriptCallback) SpeechStarted(*api.SpeechStartedResponse) error { return nil }
 
 // UtteranceEnd hands Deepgram's UtteranceEnd to the session manager, then to
-// the voice with the gate's stamp and the time this callback began handling it,
-// before the manager's work: callback-entry time, not Deepgram's transport time
+// the voice with the gate's stamp, when its last word ended by capture (its
+// last_word_end, timed as a result's words are; zero when that cannot be
+// timed), and the time this callback began handling it, before the
+// manager's work: callback-entry time, not Deepgram's transport time
 // (Message).
 func (c transcriptCallback) UtteranceEnd(ur *api.UtteranceEndResponse) error {
 	if !c.admit("utterance_end", ur.LastWordEnd) {
@@ -574,7 +576,17 @@ func (c transcriptCallback) UtteranceEnd(ur *api.UtteranceEndResponse) error {
 		err = c.manager.UtteranceEnd(ur)
 	}
 	if c.voice != nil {
-		c.voice.OnUtteranceEnd(closings, open, entered)
+		heardAt := c.heardAt
+		if c.stream != nil {
+			heardAt = c.stream.CapturedAt
+		}
+		var lastWordEnd time.Time
+		if heardAt != nil {
+			if at, ok := heardAt(time.Duration(math.Round(ur.LastWordEnd * float64(time.Second)))); ok {
+				lastWordEnd = at
+			}
+		}
+		c.voice.OnUtteranceEnd(closings, open, lastWordEnd, entered)
 	}
 	return err
 }

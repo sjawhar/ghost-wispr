@@ -33,6 +33,19 @@ type Exchange struct {
 	Tap          <-chan audio.Frame // room audio from the wake on, 16 kHz mono, only while the capture gate is open
 	Out          Output             // the speaker output's "voice" input
 	Tools        ToolRunner         // the Concierge
+	// Turn numbers the asker's turns in the exchange: the Heard calls of a
+	// turn and its Answer carry one number, and a later turn a greater one.
+	// Once the Concierge begins to answer a turn, a Heard of that turn or an
+	// earlier one, which the Supervisor makes apart from the answer and can
+	// deliver after it, reads nothing.
+	Turn uint64
+	// VendorReading is, for a voice that drives its own turn, the vendor's
+	// own text of a reply to a question Wispr asked. When it holds the
+	// room's words (AskerTurn, Answer's turn), the Concierge takes the reply
+	// for side talk if either reading of it is; it picks and answers from
+	// the room's words alone. A rephrasing that does not hold them is no
+	// reading.
+	VendorReading string
 }
 
 // TurnText is one final transcript segment.
@@ -210,7 +223,9 @@ type Concierge interface {
 	// acknowledgement, then the facts) and returns once the turn is done. The
 	// Supervisor cancels ctx to stop its model and tool calls. When Dispatch or
 	// Envoy cannot be reached, it says so and returns an error that wraps
-	// ErrUnreachable; the Supervisor then plays the error sound.
+	// ErrUnreachable; the Supervisor then plays the error sound. When the turn
+	// is side talk, it says nothing and returns an error that wraps
+	// ErrSideTalk; the Supervisor then closes the exchange.
 	Answer(ctx context.Context, x *Exchange, turn string, say SayFunc) error
 	// Answers reports each holder's answer once it lands. The Supervisor
 	// plays the answer sound and speaks it on invitation.
@@ -241,6 +256,13 @@ type WaitingLight interface {
 // ErrUnreachable marks a Concierge answer that could not reach Dispatch or
 // Envoy.
 var ErrUnreachable = errors.New("the Concierge cannot reach Dispatch or Envoy")
+
+// ErrSideTalk marks a turn the Concierge took for side talk: a reply to
+// Wispr's own question ("Did you mean …?") that picks nothing it offered and
+// asks no question. Nothing was said, searched or sent, and the exchange
+// closes as side talk in the follow-up window does: no word, no sorry, no
+// error sound (R10).
+var ErrSideTalk = errors.New("the turn is side talk, not a question")
 
 // SayFunc speaks text in the open exchange. Its ctx reaches the voice's Say
 // (Session.Say), so it must be the exchange's own context, the one Answer

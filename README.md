@@ -622,7 +622,8 @@ say the wake phrase at the start of a sentence: "Wispr, what is happening with t
 the meeting voice?" ("Ghost Wispr" and "Hey Wispr" work too; "I will whisper it to you" does not).
 Wispr plays a short two-note sound, the Concierge reads Dispatch's record, and the voice speaks the
 answer. For 6 s after Wispr's answer, a follow-up that the transcript ends with a question mark needs no wake phrase, and so does a reply when Wispr asked ("Did you mean Infra forty-five ninety-two, or
-Infra ten twenty-seven?", each key as people say one). Anything else said in those 6 s is side talk: no voice answers it, and nothing of it goes to Dispatch.
+Infra ten twenty-seven?", each key as people say one, or "What is its key?"). Anything else said in those 6 s is side talk: no voice answers it, and nothing of it goes to Dispatch.
+A reply to any question Wispr asked, these or one of its model's own, that picks none of the issues it offered and is no key said alone, is side talk too unless it is a question: a question mark, or a clause that starts with a question word or a verb that starts a question ("okay, what about the budget", not "we can move on"). Wispr says nothing, nothing of it goes to Dispatch or to an agent, and nothing is read ahead for it while it is said. A key said alone ("ABC-12", "it's 4592") answers the question first asked, about that key; a key among other words ("ABC-14 rollout") is side talk.
 "Thanks, Wispr" ends the exchange. When the record cannot answer, the Concierge asks the agent that holds the issue. When
 its answer lands, Wispr plays a rising three-note sound twice after a second in which nobody speaks, the
 blink(1)'s LED 2 flashes green while the unit records (see "Recording light"), and Wispr speaks
@@ -714,7 +715,8 @@ What the voice hears, and where the room's words go:
 
   The voice starts its search while the person is still speaking, once the words said so far
   have stayed the same for 0.4 s, so the start of a question can reach Dispatch and the embedding
-  model before the person finishes it. With voice B or C, an answer whose read-ahead did not
+  model before the person finishes it. A question makes at most two searches, those made while it
+  is still being asked included. With voice B or C, an answer whose read-ahead did not
   search the unit's own transcript of the question searches the vendor's text of it: GPT-Live's
   transcript joined to the unit's, or the wording of Deepgram's think model, which holds the last
   two minutes of the transcript. When the Concierge's model searches again, it

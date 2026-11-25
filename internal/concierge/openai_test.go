@@ -396,7 +396,7 @@ func TestTheConciergeAnswersOnAnOpenAIAPIProvider(t *testing.T) {
 		t.Fatal(err)
 	}
 	records := &fakeRecords{
-		hits:     []dispatch.SearchHit{{Kind: "issue", IssueKey: "ABC-12", Title: "Realtime voice", Status: "in_progress"}},
+		hits:     []dispatch.SearchHit{{Kind: "issue", IssueKey: "ABC-12", Title: "Realtime voice", Status: "in_progress", Score: 0.9}},
 		issues:   map[string]*dispatch.Issue{},
 		events:   map[string][]dispatch.Event{},
 		docs:     map[string]string{},

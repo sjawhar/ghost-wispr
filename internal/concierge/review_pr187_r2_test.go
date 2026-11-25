@@ -96,7 +96,7 @@ func TestReview187R2AQuestionWithAPlaceSendsItsOwnWords(t *testing.T) {
 			heldIssue(r, "session", false)
 			r.model.turns = [][]*genai.GenerateContentResponse{{chunk(text("ABC-12: PR 80 is in review."))}}
 			r.concierge.offerPick(&r.exchange, twoOfferedTurn, twoOffered)
-			_ = answerTurn(t, r, reply)
+			_ = replyTurn(t, r, reply)
 			r.agents.mu.Lock()
 			defer r.agents.mu.Unlock()
 			for _, sent := range r.agents.sent {

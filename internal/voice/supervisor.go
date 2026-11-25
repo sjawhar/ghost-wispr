@@ -453,16 +453,27 @@ type exchange struct {
 	followUpGen   int  // a stale window's timer finds it changed
 	cutSpeech     bool // a barge-in cut the driving voice's speech
 	newTurn       bool // the driving voice spoke: the room's next words are a new turn
-	toolCalls     int  // answer tools still running: the exchange stays open
+	// uttered: Deepgram ended the utterance of the turn now heard, by a final
+	// result's speech_final or by UtteranceEnd: the room's next words are a
+	// new turn, as on the path of a voice that does not drive its turn, which
+	// hands the turn over there; whatever a cut of the voice did.
+	uttered bool
+	// heardTo is when the latest word of the turn now heard began, by
+	// capture (Transcript.heardAt), interim words included: an endpoint ends
+	// the turn only when it ends no earlier (endsTurn).
+	heardTo   time.Time
+	toolCalls int // answer tools still running: the exchange stays open
 	// turnEnd is when the driving voice first spoke after the turn it now
-	// answers began, or stopped speaking over a turn begun while it spoke:
-	// a result whose words were all said before it is that turn's, which
-	// Deepgram sent late (stale). turnFrom is turnEnd as it was when that
-	// turn began: a stale result none of whose words was said after it is an
-	// earlier turn's (ofTurn). starts are when each of its voice's speeches
-	// began: a stale result a word of which was said after a speech that
-	// began after the turn now heard began is of a turn the voice answered
-	// before any result of it came (answeredUnheard).
+	// answers began, or its speech ended by itself over a turn begun while
+	// it spoke: a result whose words were all said before it is that turn's,
+	// which Deepgram sent late (stale). A cut of the speech (a barge-in's, a
+	// call's) leaves both alone: the turn begun over the speech goes on to
+	// the end of its utterance (uttered). turnFrom is turnEnd as it was when
+	// that turn began: a stale result none of whose words was said after it
+	// is an earlier turn's (ofTurn). starts are when each of its voice's
+	// speeches began: a stale result a word of which was said after a speech
+	// that began after the turn now heard began is of a turn the voice
+	// answered before any result of it came (answeredUnheard).
 	turnEnd, turnFrom time.Time
 	starts            []time.Time
 	// played are the spans in which its voice played since its latest cut
@@ -989,16 +1000,40 @@ func (s *Supervisor) WithFloor(ctx context.Context, start func()) error {
 }
 
 // OnUtteranceEnd takes Deepgram's UtteranceEnd as the end of the asker's
-// turn, as SpeechFinal is. at is when it reached the unit, on both clocks.
-func (s *Supervisor) OnUtteranceEnd(closings int, gateOpen bool, at monoclock.Stamp) {
+// turn, as SpeechFinal is: for a voice that drives its own turn, the room's
+// next words begin the next turn (uttered). lastWordEnd is when the last
+// word of the utterance it ends was captured to have ended (its
+// last_word_end), zero when that cannot be timed. at is when it reached the
+// unit, on both clocks.
+func (s *Supervisor) OnUtteranceEnd(closings int, gateOpen bool, lastWordEnd time.Time, at monoclock.Stamp) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.closed || !gateOpen || closings < s.closings || s.offLocked() {
 		return
 	}
 	if ex := s.ex; ex != nil && !ex.answering && s.turnOf(ex) != "" {
+		// It ends only the utterance whose last word ended at lastWordEnd:
+		// a turn a word of which began later goes on, and one that cannot
+		// be placed may be an earlier utterance's (Main, after Sol's fourth
+		// review of #191). A late one cut "okay, ABC-12 can wait" in two
+		// after Wispr asked the room a question, and "can wait" was read as
+		// a question.
+		if !ex.endsTurn(lastWordEnd) {
+			return
+		}
+		if ex.drives {
+			ex.uttered = true
+			return
+		}
 		s.handTurnLocked(ex, turnSignal{kind: signalUtteranceEnd, at: at})
 	}
+}
+
+// endsTurn reports whether an endpoint of an utterance whose last word ended
+// at end, by capture, ends ex's turn now heard: no word of the turn began
+// after it (heardTo). An endpoint that cannot be placed (zero) ends none.
+func (ex *exchange) endsTurn(end time.Time) bool {
+	return !end.IsZero() && !ex.heardTo.After(end)
 }
 
 // OnTranscript reads one Deepgram result: the wake phrase, the asker's turn,
@@ -1117,8 +1152,11 @@ func (s *Supervisor) onTranscriptLocked(t *Transcript) {
 				ex.turnFrom = from // the voice answered this call before its result came
 			}
 			ex.wakeStart, ex.wakeSaid = wakeStart(t, m), wakeSaidAt(t, m)
-			ex.turn, ex.interim, ex.turnFinal = nil, "", false
+			ex.turn, ex.interim, ex.turnFinal, ex.uttered, ex.heardTo = nil, "", false, false, time.Time{}
 			ex.followUpTurn, ex.turnByName = false, true // a call, with the wake phrase
+			if !stale {
+				ex.x.Turn++ // a new call; a late result keeps the turn it completes
+			}
 			cut := false
 			if ex.drives {
 				s.touchLocked(ex)
@@ -1201,10 +1239,11 @@ func (s *Supervisor) onTranscriptLocked(t *Transcript) {
 // begins its turn where the wake is read.
 func (s *Supervisor) driverHeardLocked(ex *exchange, t *Transcript, words string) {
 	if !ex.stale(t) {
-		if ex.newTurn {
+		if ex.newTurn || ex.uttered {
 			ex.newTurn, ex.turnFrom = false, ex.turnEnd
-			ex.turn, ex.interim, ex.turnFinal = nil, "", false
+			ex.turn, ex.interim, ex.turnFinal, ex.uttered, ex.heardTo = nil, "", false, false, time.Time{}
 			ex.followUpTurn, ex.turnByName = ex.followUpTimer != nil && !ex.askedBack, false
+			ex.x.Turn++
 		}
 		s.disarmFollowUpLocked(ex)
 		s.turnLocked(ex, t, words)
@@ -1217,8 +1256,9 @@ func (s *Supervisor) driverHeardLocked(ex *exchange, t *Transcript, words string
 		// The voice's speeches since answer it: the room's next words are
 		// still a new turn.
 		ex.turnFrom = from
-		ex.turn, ex.interim, ex.turnFinal = nil, "", false
+		ex.turn, ex.interim, ex.turnFinal, ex.uttered, ex.heardTo = nil, "", false, false, time.Time{}
 		ex.followUpTurn, ex.turnByName = ex.followUpTimer != nil && !ex.askedBack, false
+		ex.x.Turn++
 		s.turnLocked(ex, t, words)
 	} else if ex.ofTurn(t) {
 		s.turnLocked(ex, t, words)
@@ -1714,14 +1754,22 @@ func (s *Supervisor) driverSpeechLocked(ex *exchange, started, cancelled bool, a
 	}
 	s.disarmFollowUpLocked(ex)
 	// Each speech the voice starts answers what was said before it; a turn
-	// begun while it spoke ends with the speech.
+	// begun while it spoke ends with the speech when it ends by itself. A cut
+	// ends the speech, not the turn begun over it, a barge-in's or a call's:
+	// the person still speaks, and words said past the speaker's report of
+	// the cut go on with that turn, under its number (Exchange.Turn), to the
+	// end of its utterance (uttered). A new number then would let a
+	// read-ahead search again for a question already handed over (Sol's
+	// second review of #191).
 	if started {
 		ex.starts = append(ex.starts, at)
 	}
-	if started || !ex.newTurn {
-		ex.turnEnd = at
+	if !cancelled {
+		if started || !ex.newTurn {
+			ex.turnEnd = at
+		}
+		ex.newTurn = true
 	}
-	ex.newTurn = true
 	if started {
 		ex.unspokenAnswer = false
 		return
@@ -1759,6 +1807,16 @@ func (s *Supervisor) driverFollowUpWaited(ex *exchange, gen int) {
 // turnLocked adds words of the asker's turn, and hands the turn to the
 // Concierge once Deepgram marks it final.
 func (s *Supervisor) turnLocked(ex *exchange, t *Transcript, words string) {
+	for i := range t.Words {
+		if at := t.heardAt(&t.Words[i]); at.After(ex.heardTo) {
+			ex.heardTo = at
+		}
+	}
+	// A speech_final ends the utterance its own words end: it ends a turn
+	// none of whose words, an earlier interim's included, began after them
+	// (endsTurn), not whichever turn is now heard. A late final from a
+	// replaced socket can come after the next words' interim.
+	endpoint := t.IsFinal && t.SpeechFinal && ex.endsTurn(t.endsAt())
 	words = strings.TrimSpace(words)
 	if t.IsFinal {
 		if words != "" {
@@ -1769,9 +1827,8 @@ func (s *Supervisor) turnLocked(ex *exchange, t *Transcript, words string) {
 		if ex.drives {
 			ex.times.lastTurnEnd = time.Now()
 			ex.turnSaidAt = ex.times.lastTurnEnd
-			if n := len(t.Words); n > 0 {
-				last := &t.Words[n-1]
-				ex.turnSaidAt = t.heardAt(last).Add(time.Duration(math.Round((last.End - last.Start) * float64(time.Second))))
+			if len(t.Words) > 0 {
+				ex.turnSaidAt = t.endsAt()
 			}
 		}
 	} else {
@@ -1789,9 +1846,14 @@ func (s *Supervisor) turnLocked(ex *exchange, t *Transcript, words string) {
 		s.heard = append(s.heard, heardCall{ctx: ex.ctx, x: ex.x, words: turn})
 	}
 	if ex.drives {
-		return // the vendor drives the turn
+		// The vendor drives the turn. Deepgram's endpoint ends it all the
+		// same, as below: the room's next words begin the next turn.
+		if endpoint && turn != "" {
+			ex.uttered = true
+		}
+		return
 	}
-	if t.IsFinal && t.SpeechFinal && s.turnOf(ex) != "" {
+	if endpoint && s.turnOf(ex) != "" {
 		s.handTurnLocked(ex, turnSignal{kind: signalSpeechFinal, at: monoclock.Stamp{Wall: t.At, Mono: t.Mono}})
 		return
 	}
@@ -1845,6 +1907,35 @@ func (t exchangeTools) followUpTurn(ctx context.Context) (side bool, turn string
 		}
 		if final || time.Now().After(deadline) || ctx.Err() != nil {
 			return !isQuestion(turn), turn
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// replyTurn is the room's reply to Wispr's own question, for a voice that
+// drives its turn: askedBack reports that the last line the exchange's
+// answer tool returned asked one, and reply is the turn begun since the
+// voice spoke, once Deepgram marked it final. It waits up to
+// followUpTurnWait for that final; reply is "" when none came, or no turn
+// began. Its error is ctx's.
+func (t exchangeTools) replyTurn(ctx context.Context) (reply string, askedBack bool, err error) {
+	s := t.s
+	deadline := time.Now().Add(followUpTurnWait)
+	for {
+		s.mu.Lock()
+		askedBack = t.ex.askedBack
+		final := !t.ex.newTurn && t.ex.turnFinal
+		reply = strings.TrimSpace(s.turnOf(t.ex))
+		s.mu.Unlock()
+		switch {
+		case !askedBack:
+			return "", false, nil
+		case final && reply != "":
+			return reply, true, nil
+		case ctx.Err() != nil:
+			return "", true, ctx.Err()
+		case time.Now().After(deadline):
+			return "", true, nil
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
@@ -1953,6 +2044,15 @@ func (s *Supervisor) answer(ex *exchange, x *Exchange, turn string) {
 		return nil
 	}
 	err := s.cfg.Concierge.Answer(ex.ctx, x, turn, say)
+	if errors.Is(err, ErrSideTalk) {
+		// A reply to Wispr's own question that the Concierge took for side
+		// talk: it said nothing, and the exchange closes with no sorry and no
+		// error sound, as side talk in the follow-up window does (R10).
+		s.mu.Lock()
+		s.endLocked(ex, false, "side talk after Wispr's question")
+		s.mu.Unlock()
+		return
+	}
 	if err != nil && ex.ctx.Err() == nil {
 		// A Concierge that cannot reach Dispatch or Envoy has said so; any
 		// other failure is a vendor's. Both get the error sound (R10).
@@ -2029,7 +2129,8 @@ func (s *Supervisor) followUpLocked(ex *exchange) {
 	ex.followUp = true
 	ex.followUpTurn = !ex.askedBack // an answer to Wispr's own question needs none
 	ex.answering = false
-	ex.turn, ex.interim, ex.turnByName = nil, "", false
+	ex.turn, ex.interim, ex.turnByName, ex.heardTo = nil, "", false, time.Time{}
+	ex.x.Turn++
 	ex.said, ex.last = false, nil
 	delete(ex.notified, EventSpoken) // each spoken answer reports itself
 	if ex.timer != nil {
@@ -2761,6 +2862,17 @@ func (t *Transcript) saidBy() time.Time {
 	return by
 }
 
+// endsAt is when t's last word ended, by capture (heardAt and its length),
+// or when t came with no words: where a speech_final on it ends the
+// utterance.
+func (t *Transcript) endsAt() time.Time {
+	if len(t.Words) == 0 {
+		return t.At
+	}
+	last := &t.Words[len(t.Words)-1]
+	return t.heardAt(last).Add(time.Duration(math.Round((last.End - last.Start) * float64(time.Second))))
+}
+
 // saidAfter reports whether a word of t was said after since.
 func (t *Transcript) saidAfter(since time.Time) bool {
 	if len(t.Words) == 0 {
@@ -3161,7 +3273,29 @@ func (t exchangeTools) Run(ctx context.Context, c ToolCall) (json.RawMessage, er
 		s.mu.Unlock()
 		return json.Marshal(AnswerResult{})
 	}
-	if strings.TrimSpace(args.Question) == "" {
+	// A reply to Wispr's own question ("Did you mean …?", "What is its
+	// key?") goes to the Concierge in the room's words, as Deepgram's final
+	// heard them, never the vendor's: a vendor that rewrote side talk as a
+	// question would get it past the rule that side talk after Wispr's
+	// question is not answered (Main, on R5's rewrite). A reply with no final
+	// by followUpTurnWait is side talk, as in the follow-up window. The
+	// vendor's own text goes with it (Exchange.VendorReading): an endpoint
+	// can leave the room's turn only the end of what was said, "can wait" of
+	// "okay, ABC-12 can wait", and the Concierge takes the reply for side
+	// talk when the vendor's text holds the room's words and is side talk.
+	vendor := args.Question
+	reply, askedBack, err := t.replyTurn(ctx)
+	switch {
+	case err != nil:
+		return nil, err
+	case askedBack && reply == "":
+		s.mu.Lock()
+		s.endLocked(t.ex, false, "side talk after Wispr's question")
+		s.mu.Unlock()
+		return json.Marshal(AnswerResult{})
+	case askedBack:
+		args.Question = reply
+	case strings.TrimSpace(args.Question) == "":
 		// A vendor may delegate before its own transcript of the turn.
 		args.Question = turn
 	}
@@ -3171,13 +3305,16 @@ func (t exchangeTools) Run(ctx context.Context, c ToolCall) (json.RawMessage, er
 	x = t.ex.x
 	x.FollowUpTurn = t.ex.followUpTurn
 	s.mu.Unlock()
+	if askedBack {
+		x.VendorReading = vendor
+	}
 	var (
 		said   []string  // the result's lines, in order
 		spoken bool      // a line was spoken at once
 		lead   *leadLine // that line, while its Say may not have played
 		factAt time.Time // when the result's first fact was said
 	)
-	err := s.cfg.Concierge.Answer(ctx, &x, args.Question, func(sayCtx context.Context, text string, mode SayMode) error {
+	err = s.cfg.Concierge.Answer(ctx, &x, args.Question, func(sayCtx context.Context, text string, mode SayMode) error {
 		t.ex.saidMu.Lock()
 		first := (mode == Ack || mode == Lead) && len(said) == 0 && lead == nil
 		t.ex.saidMu.Unlock()
@@ -3222,6 +3359,15 @@ func (t exchangeTools) Run(ctx context.Context, c ToolCall) (json.RawMessage, er
 			s.logf("voice: the %s line had not played, so it leads the answer", l.mode)
 			lines = append([]string{l.text}, lines...)
 		}
+	}
+	if errors.Is(err, ErrSideTalk) {
+		// Side talk after Wispr's own question: as side talk in the
+		// follow-up window, no voice answers it, and the window closes (R10).
+		// The vendor gets no words to say.
+		s.mu.Lock()
+		s.endLocked(t.ex, false, "side talk after Wispr's question")
+		s.mu.Unlock()
+		return json.Marshal(AnswerResult{})
 	}
 	if err != nil {
 		if ctx.Err() == nil && t.ex.ctx.Err() == nil {

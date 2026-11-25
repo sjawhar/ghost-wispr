@@ -67,7 +67,7 @@ func TestReview187R4SideTalkSendsNoPendingQuestion(t *testing.T) {
 			r.exchange.FollowUpTurn = true
 			r.model.turns = [][]*genai.GenerateContentResponse{{chunk(text("ABC-12: PR 80 is in review."))}}
 			r.concierge.offerPick(&r.exchange, twoOfferedTurn, tc.candidates)
-			_ = answerTurn(t, r, tc.reply)
+			_ = replyTurn(t, r, tc.reply)
 			r.agents.mu.Lock()
 			sent := slices.Clone(r.agents.sent)
 			r.agents.mu.Unlock()

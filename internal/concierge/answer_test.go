@@ -31,7 +31,7 @@ func recorder(into *[]said) voice.SayFunc {
 
 func TestAnswerRunsToolsThenSpeaksTheFactSentenceBySentence(t *testing.T) {
 	r := newRig(t)
-	r.records.hits = []dispatch.SearchHit{{Kind: "issue", IssueKey: "ABC-12", Title: "Realtime voice", Status: "in_progress"}}
+	r.records.hits = []dispatch.SearchHit{{Kind: "issue", IssueKey: "ABC-12", Title: "Realtime voice", Status: "in_progress", Score: 0.9}}
 	r.model.turns = [][]*genai.GenerateContentResponse{
 		{chunk(thought("The room asks about voice work; search first.")), chunk(call("c1", "search_issues", map[string]any{"query": "voice work"}, "sig-1"))},
 		{chunk(text("ABC-12 is in progress. It was updat")), chunk(text("ed this morning."))},

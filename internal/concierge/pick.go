@@ -1,6 +1,7 @@
 package concierge
 
 import (
+	"context"
 	"slices"
 	"strings"
 	"time"
@@ -9,8 +10,10 @@ import (
 	"github.com/sjawhar/ghost-wispr/internal/voice"
 )
 
-// offeredPick is what an answer with no one clear match offered (R5): the
-// question asked, and the two issues it named, best first.
+// offeredPick is what an answer asked the room after it (R5): with no one
+// clear match, the question asked and the two issues it named, best first;
+// with a question that offered no issue ("What is its key?", or the model's
+// own, askBack), the question asked and no issue.
 type offeredPick struct {
 	at         time.Time
 	sessionID  string
@@ -45,14 +48,20 @@ func (c *Concierge) offerPick(x *voice.Exchange, turn string, candidates []candi
 	c.picks[wakeKey(x)] = offeredPick{at: now, sessionID: x.SessionID, turn: turn, candidates: candidates}
 }
 
-// takePick reads turn as a reply to the issues x's last answer offered. A
-// whole no ("no", "nope, not that one") picks none. Any other reply that is
-// no confirmation (confirms: a question mark, a question word or a negation)
-// is a new question, whatever key, place or title it names. A confirmation
-// picks an issue only when it is a selection of one (pickIn): talk that holds
-// a cue ("first coffee, then lunch") picks none. It returns the question
-// first asked and the picked key. Either way the offer is used up: a turn
-// that picks nothing is a question of its own.
+// askBack keeps, for x's next turn, the question turn, after which the voice
+// asked the room a question that offered no issue to pick: "What is its
+// key?" (noIssueFound), or the model's own. The Supervisor takes the next
+// utterance after any line that ends in "?" with no question mark of its own
+// (R10), so that reply is read as a reply to an offer.
+func (c *Concierge) askBack(x *voice.Exchange, turn string) {
+	c.offerPick(x, turn, nil)
+}
+
+// takePick reads turn as a reply to the issues x's last answer offered
+// (pick), and returns the question first asked and the picked key, "" for a
+// whole no. Either way the offer is used up: a turn that picks nothing is a
+// key said for the question (saysKey), a question of its own, or side talk
+// (sideTalk).
 func (c *Concierge) takePick(x *voice.Exchange, turn string) (asked, key string, ok bool) {
 	c.mu.Lock()
 	p, offered := c.picks[wakeKey(x)]
@@ -61,23 +70,147 @@ func (c *Concierge) takePick(x *voice.Exchange, turn string) (asked, key string,
 	if !offered {
 		return "", "", false
 	}
-	// An offered issue is real, whatever the project list says: its key,
-	// said letter by letter ("A B C seven") or of one digit ("INFRA-7"),
-	// is a key of the reply. A no is a no whatever word and number of one
-	// digit it names: "no, not INFRA-7".
+	if key, ok = p.pick(turn); ok {
+		return p.turn, key, true
+	}
+	return "", "", false
+}
+
+// pick reads turn as a reply to p. A whole no ("no", "nope, not that one")
+// picks none, ok. Any other reply that is no confirmation (confirms: a
+// question mark, a question word or a negation) picks nothing, whatever key,
+// place or title it names. A confirmation picks an issue only when it is a
+// selection of one (pickIn): talk that holds a cue ("first coffee, then
+// lunch") picks none. An offered issue is real, whatever the project list
+// says: its key, said letter by letter ("A B C seven") or of one digit
+// ("INFRA-7"), is a key of the reply. A no is a no whatever word and number
+// of one digit it names: "no, not INFRA-7" (#194).
+func (p *offeredPick) pick(turn string) (key string, ok bool) {
 	view := offeredView(p.candidates)
 	turn, _ = view.readSpelledKeys(turn)
 	reply := view.withoutOneDigitKeys(turn)
 	switch {
 	case declines(withoutOneDigitWords(reply)):
-		return p.turn, "", true
+		return "", true
 	case !confirms(reply):
-		return "", "", false
+		return "", false
 	}
-	if picked := pickIn(p.candidates, turn); picked != "" {
-		return p.turn, picked, true
+	key = pickIn(p.candidates, turn)
+	return key, key != ""
+}
+
+// pendingOffer is what x's last answer offered that no turn has replied to
+// yet, and whether there is one.
+func (c *Concierge) pendingOffer(x *voice.Exchange) (offeredPick, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	p, offered := c.picks[wakeKey(x)]
+	return p, offered
+}
+
+// sideTalk reports whether turn, a reply to an offer that picks nothing
+// (takePick), is side talk (Main's rule on R5's rewrite): it is no question
+// (asks) and no key said alone (saysKey). The voice's question makes the
+// next utterance a turn with no question mark, so talk in the room that only
+// follows it must not be answered, read, searched or sent.
+func sideTalk(turn string) bool {
+	return !asks(turn) && !saysKey(turn)
+}
+
+// sideTalkOn reports whether turn, a reply to p, is side talk on any reading
+// of it: the room's words, and vendor, the voice's own text of them
+// (voice.Exchange.VendorReading), when vendor holds the room's words
+// (holdsWords; Main, after Sol's fourth review of #191). A reading is side
+// talk when it picks nothing (pick) and is sideTalk. Letters the view cannot
+// tell are read as the key they may be (everySpelledKey). An endpoint can
+// leave the room's words only the end of a statement, "can wait" of "okay,
+// ABC-12 can wait", which on its own asks. A vendor's rephrasing, which does
+// not hold the room's words, is no reading: a question it turned into a
+// statement is still answered.
+func (p *offeredPick) sideTalkOn(view projectsView, turn, vendor string) bool {
+	readings := []string{turn}
+	if holdsWords(vendor, turn) {
+		readings = append(readings, vendor)
 	}
-	return "", "", false
+	for _, reading := range readings {
+		written, unread := view.readSpelledKeys(reading)
+		if unread {
+			written = everySpelledKey(written)
+		}
+		if _, picks := p.pick(written); !picks && sideTalk(written) {
+			return true
+		}
+	}
+	return false
+}
+
+// holdsWords reports whether text holds the words of part, together and in
+// order, whatever their case, their punctuation or a key's spelling.
+func holdsWords(text, part string) bool {
+	words := func(s string) string { return " " + strings.Join(lowerWords(everySpelledKey(s)), " ") + " " }
+	t, p := words(text), words(part)
+	return strings.TrimSpace(p) != "" && strings.Contains(t, p)
+}
+
+// keyWords may frame a key said for "What is its key?", beside the words
+// that frame a pick (selectionWords): "the key is ABC-12", "its number is
+// 4592".
+var keyWords = set(strings.Fields("key number is its"))
+
+// saysKey reports whether turn, a reply to Wispr's question, says one key
+// and nothing else of substance: an issue key ("ABC-12", "it's ABC-12",
+// "ABC-12?") or a number alone ("4592"), with only the words that frame a
+// pick or a key (selectionWords, keyWords), and no negation. "We spent 500
+// on the voice" and "ABC-14 rollout" say no key: a bare key is no
+// conversation, a key among other words may be.
+func saysKey(turn string) bool {
+	if _, negation := replyGate(turn); negation {
+		return false
+	}
+	keys := issueKeysIn(turn)
+	slices.Sort(keys)
+	said := len(slices.Compact(keys))
+	for _, word := range replyWords(turn) {
+		switch {
+		case len(word) >= 3 && strings.Trim(word, "0123456789") == "":
+			said++ // a number alone, as bareIssueNumber reads one
+		case !selectionWords[word] && !keyWords[word]:
+			return false
+		}
+	}
+	return said == 1
+}
+
+// takeKey reads reply, a key said alone (saysKey) for the question first
+// asked, asked, after Wispr's question: "What is its key?", the model's own,
+// or "Did you mean …?" when the key was not offered (Main on #191). A key of
+// the turn's project snapshot (view), or the number of an agent that joined,
+// is read: its target, the key alone, is what the answer reads for asked.
+// Otherwise takeKey says what follows and reports done, with Answer's error:
+// which issue a number names, offered for asked; that Dispatch is out of
+// reach (R10), when the view cannot tell the key's project or Dispatch did
+// not answer the number's reads; or that no issue was found, asking for the
+// key of asked again.
+func (c *Concierge) takeKey(ctx context.Context, x *voice.Exchange, view projectsView, asked, reply string, sp *speaker) (target string, done bool, err error) {
+	if target, _, _ := strings.Cut(c.readTarget(view, reply), "|"); strings.HasPrefix(target, "keys:") {
+		return target, false, nil
+	}
+	untold := view.keyUntold(reply)
+	if len(issueKeysIn(reply)) == 0 {
+		var candidates []candidate
+		if candidates, untold = c.bareNumberCandidates(ctx, view, reply); len(candidates) > 0 {
+			c.offerPick(x, asked, candidates)
+			return "", true, sp.sayText(ctx, didYouMean(candidates), voice.Ack)
+		}
+	}
+	if untold {
+		if err := sp.sayText(ctx, cannotReachDispatch, voice.Ack); err != nil {
+			return "", true, err
+		}
+		return "", true, errOutOfReach
+	}
+	c.askBack(x, asked)
+	return "", true, sp.sayText(ctx, noIssueFound, voice.Ack)
 }
 
 // dropPick uses up the offer of x's last answer with no pick: a turn the
@@ -132,10 +265,11 @@ var (
 	// choice ("the one", "that's the wake word issue", "please use the first
 	// one", "I think the first one", "probably the second one", "the first
 	// one then"). Any other word is substance: the reply is talk, not a
-	// selection. The list is kept narrow, and a phrase outside it is a new
-	// question by design ("let's do the first one", "go for the first one",
-	// "I'd say the wake word one"): a missed pick costs a new answer, where a
-	// wrong one sends a question nobody asked.
+	// selection. The list is kept narrow, and a phrase outside it picks
+	// nothing by design ("let's do the first one", "go for the first one",
+	// "I'd say the wake word one"): a missed pick is side talk, or a new
+	// question when it asks one, where a wrong pick sends a question nobody
+	// asked.
 	selectionWords = set(strings.Fields(`uh um oh hmm mm okay ok so well yeah yea yes yep yup sure right correct exactly please thanks thank you
 		the a one that that's this it it's issue ticket i i'll i'd mean meant use take pick choose go with want about
 		think guess then maybe probably actually just now`))
@@ -144,14 +278,19 @@ var (
 // replyWords are turn's words, lower case, its issue keys and the fillers it
 // begins with left out; an apostrophe stays in its word ("that's").
 func replyWords(turn string) []string {
-	rest := compound.ReplaceAllString(spokenKey.ReplaceAllString(projectsView{}.spokenKeys(turn), " "), "realtime")
-	words := strings.FieldsFunc(strings.ToLower(strings.ReplaceAll(rest, "’", "'")), func(r rune) bool {
-		return !unicode.IsLetter(r) && !unicode.IsDigit(r) && r != '\''
-	})
+	words := lowerWords(compound.ReplaceAllString(spokenKey.ReplaceAllString(projectsView{}.spokenKeys(turn), " "), "realtime"))
 	for len(words) > 0 && replyFillers[words[0]] {
 		words = words[1:]
 	}
 	return words
+}
+
+// lowerWords are text's words, lower case, split at whatever is no letter,
+// digit or apostrophe; an apostrophe stays in its word ("that's").
+func lowerWords(text string) []string {
+	return strings.FieldsFunc(strings.ToLower(strings.ReplaceAll(text, "’", "'")), func(r rune) bool {
+		return !unicode.IsLetter(r) && !unicode.IsDigit(r) && r != '\''
+	})
 }
 
 // declines reports whether turn is a whole no: "no", "nope, not that one",
@@ -164,23 +303,69 @@ func declines(turn string) bool {
 	return noWords[words[0]] && noTails[strings.Join(words[1:], " ")] || noPhrases[strings.Join(words, " ")]
 }
 
-// confirms reports whether turn may confirm an offered issue: it holds no
-// question mark, no question word or verb a question puts first
-// (questionWords, auxiliaries, "am"; "what's" is "what") and no negation
-// (negations, or a word that ends in "n't"), anywhere: "the first one, do I
+// clauseOpeners may come before the word that starts a clause: "okay, what
+// about the budget", "and when does it land".
+var clauseOpeners = set(strings.Fields("uh um oh well hmm mm okay ok so and but then also right yeah yes actually"))
+
+// asks reports whether turn is a question: it holds a question mark, or a
+// clause of it starts, after the words that may open one (clauseOpeners),
+// with a question word or a verb a question puts first (questionWords,
+// auxiliaries, "am"; "what's" is "what", "isn't" is "is"). Inside a clause
+// such a word asks nothing: "we can move on", "let's see what it is". An
+// issue key is a word of its clause, so "okay, ABC-12 can wait" asks
+// nothing. After an offer, a turn that picks nothing and asks nothing is
+// side talk (sideTalk). The gate before a pick (replyGate) reads every word
+// instead: there a wrong question costs only a pick.
+func asks(turn string) bool {
+	if strings.Contains(turn, "?") {
+		return true
+	}
+	for _, clause := range strings.FieldsFunc(turn, func(r rune) bool { return strings.ContainsRune(",;:.!", r) }) {
+		for _, word := range lowerWords(clause) {
+			if clauseOpeners[word] {
+				continue
+			}
+			base, _, _ := strings.Cut(word, "'")
+			switch word {
+			case "can't":
+				base = "can"
+			case "won't":
+				base = "will"
+			default:
+				if verb, ok := strings.CutSuffix(word, "n't"); ok {
+					base = verb
+				}
+			}
+			if questionWords[base] || auxiliaries[base] || base == "am" {
+				return true
+			}
+			break
+		}
+	}
+	return false
+}
+
+// confirms reports whether turn may confirm an offered issue: it asks
+// nothing and holds no negation (replyGate), anywhere: "the first one, do I
 // pick that" asks. Every way a reply picks an issue (pickIn) runs only behind
 // it.
 func confirms(turn string) bool {
-	if strings.Contains(turn, "?") {
-		return false
-	}
+	question, negation := replyGate(turn)
+	return !question && !negation
+}
+
+// replyGate reads turn for the gate before every pick (#187): question, for
+// a question mark, or a question word or a verb a question puts first
+// (questionWords, auxiliaries, "am"; "what's" is "what") anywhere in it;
+// negation, for a negation (negations, or a word that ends in "n't").
+func replyGate(turn string) (question, negation bool) {
+	question = strings.Contains(turn, "?")
 	for _, word := range replyWords(turn) {
 		base, _, _ := strings.Cut(word, "'")
-		if questionWords[base] || auxiliaries[base] || base == "am" || negations[base] || strings.HasSuffix(word, "n't") {
-			return false
-		}
+		question = question || questionWords[base] || auxiliaries[base] || base == "am"
+		negation = negation || negations[base] || strings.HasSuffix(word, "n't")
 	}
-	return true
+	return question, negation
 }
 
 // pickIn is the offered issue a confirmation selects, or "". The reply's cues
