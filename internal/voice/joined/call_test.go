@@ -119,6 +119,10 @@ func (f *claimedRecords) Events(context.Context, string, int) ([]dispatch.Event,
 	return nil, nil
 }
 
+func (f *claimedRecords) RoleHolders(context.Context, string) ([]dispatch.RoleHolder, error) {
+	return nil, nil
+}
+
 func (f *claimedRecords) DocumentText(context.Context, string, string) (string, error) {
 	return "", &dispatch.APIError{Status: 404, Code: "NOT_FOUND", Route: "document"}
 }

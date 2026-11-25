@@ -281,7 +281,7 @@ func TestFactsBoundsHoldAcrossARewrite(t *testing.T) {
 	}
 	facts := 0
 	for _, s := range answerTurn(t, r, "what is happening with ABC-12") {
-		if s.mode == voice.Fact && !strings.HasPrefix(s.text, "No agent session") {
+		if s.mode == voice.Fact && s.text != "No agent is on ABC-12 right now." {
 			facts++
 		}
 	}

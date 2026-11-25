@@ -503,6 +503,8 @@ func startFakeDispatch(t *testing.T, token, own string) *httptest.Server {
 			_, _ = fmt.Fprint(w, `[]`)
 		case "/api/v1/issues/ABC-13":
 			_, _ = fmt.Fprint(w, `{"key":"ABC-13","title":"Nobody holds it"}`)
+		case "/api/v1/issues/ABC-13/role-holders":
+			_, _ = fmt.Fprint(w, `{"issue":"ABC-13","holders":[]}`)
 		case "/api/v1/issues/ABC-13/events":
 			_, _ = fmt.Fprintf(w, `[{"type":"comment","created_at":"2026-11-19T10:00:00Z","actor":{"kind":"session","id":%q,"origin":{"session_title":"Ghost Wispr"}}},`+
 				`{"type":"comment","created_at":"2026-11-19T09:00:00Z","actor":{"kind":"session","id":"agent-live","origin":{"session_title":"Spec writer"}}}]`, own)

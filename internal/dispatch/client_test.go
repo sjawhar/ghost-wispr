@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -212,6 +213,30 @@ func TestEventsAsksForTheNewestFirst(t *testing.T) {
 	}
 	if !strings.Contains(string(events[0].Payload), "Merged PR 80.") {
 		t.Errorf("payload = %s", events[0].Payload)
+	}
+}
+
+// TestRoleHoldersReadsTheLegionRoles fails if RoleHolders does not read the
+// sessions the Legion daemon last published for an issue's roles, in the
+// order Dispatch gives them, or reads an issue with none as an error.
+func TestRoleHoldersReadsTheLegionRoles(t *testing.T) {
+	fake, client := newFakeDispatch(t)
+	fake.answer("/api/v1/issues/ABC-12/role-holders", `{"issue":"ABC-12","holders":[
+		{"role":"architect","session":"s-1","recorded_at":"2026-11-24T18:02:56Z"},
+		{"role":"implementer","session":"s-2","recorded_at":"2026-11-24T18:03:00Z"}]}`)
+	fake.answer("/api/v1/issues/ABC-13/role-holders", `{"issue":"ABC-13","holders":[]}`)
+	holders, err := client.RoleHolders(context.Background(), "abc-12")
+	if err != nil {
+		t.Fatalf("RoleHolders: %v", err)
+	}
+	if want := []RoleHolder{{Role: "architect", Session: "s-1"}, {Role: "implementer", Session: "s-2"}}; !slices.Equal(holders, want) {
+		t.Errorf("holders = %+v, want %+v", holders, want)
+	}
+	if holders, err := client.RoleHolders(context.Background(), "ABC-13"); err != nil || len(holders) != 0 {
+		t.Errorf("an issue no session holds a role of = %+v, %v; want none", holders, err)
+	}
+	if _, err := client.RoleHolders(context.Background(), "ABC-1/events"); !errors.Is(err, ErrBadIssueKey) {
+		t.Errorf("RoleHolders of a bad key = %v, want ErrBadIssueKey", err)
 	}
 }
 

@@ -516,7 +516,7 @@ func spokenLine(full, short string) string {
 }
 
 // holderLine is issue_holder's answer for key in at most 8 words, for the
-// answers R6 speaks; "" for a live session.
+// answers R6 speaks; "" for a live session and for a holder nobody knows.
 func holderLine(key string, holder map[string]any) string {
 	switch holder["holder"] {
 	case "unresponsive":
@@ -535,7 +535,7 @@ func holderLine(key string, holder map[string]any) string {
 		}
 		return spokenLine(full, key+" is held by a person.")
 	case "none":
-		return "No agent session is on " + key + "."
+		return "No agent is on " + key + " right now."
 	}
 	return ""
 }

@@ -99,12 +99,14 @@ func (g genaiGenerator) GenerateContentStream(ctx context.Context, model string,
 
 // Records is Dispatch's record as the tools read it; *dispatch.Client is one.
 // Search is Dispatch's normal search, words and meaning; SearchKeywords its
-// words leg alone, far faster.
+// words leg alone, far faster. RoleHolders are the sessions the Legion daemon
+// publishes for an issue's roles.
 type Records interface {
 	Search(ctx context.Context, query string, limit int) ([]dispatch.SearchHit, error)
 	SearchKeywords(ctx context.Context, query string, limit int) ([]dispatch.SearchHit, error)
 	Issue(ctx context.Context, key string) (*dispatch.Issue, error)
 	Events(ctx context.Context, key string, limit int) ([]dispatch.Event, error)
+	RoleHolders(ctx context.Context, key string) ([]dispatch.RoleHolder, error)
 	DocumentText(ctx context.Context, key, slug string) (string, error)
 	Projects(ctx context.Context) ([]string, error)
 }

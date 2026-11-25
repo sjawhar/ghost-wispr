@@ -72,6 +72,14 @@ func (b boundedRecords) Events(ctx context.Context, key string, limit int) (even
 	return events, err
 }
 
+func (b boundedRecords) RoleHolders(ctx context.Context, key string) (holders []dispatch.RoleHolder, err error) {
+	err = b.within(ctx, func(ctx context.Context) error {
+		holders, err = b.inner.RoleHolders(ctx, key)
+		return err
+	})
+	return holders, err
+}
+
 func (b boundedRecords) DocumentText(ctx context.Context, key, slug string) (text string, err error) {
 	err = b.within(ctx, func(ctx context.Context) error {
 		text, err = b.inner.DocumentText(ctx, key, slug)
