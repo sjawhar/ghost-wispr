@@ -229,6 +229,18 @@ func takesItBack(reply string) bool {
 	return afterTakeBack(reply) != strings.TrimSpace(reply)
 }
 
+// roomFinals is the room's raw words that a take-back is found on: the reply
+// to Wispr's question (voice.Exchange.Reply), else the turn's own finals
+// (voice.Exchange.Finals), one a line, else turn.
+func roomFinals(x *voice.Exchange, turn string) string {
+	for _, finals := range []string{x.Reply, x.Finals} {
+		if strings.TrimSpace(finals) != "" {
+			return finals
+		}
+	}
+	return turn
+}
+
 // takesBack reports whether clause, with no question mark, is a take-back
 // phrase after the words that may open a clause (afterTakeBack).
 func takesBack(clause string) bool {

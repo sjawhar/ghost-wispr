@@ -206,27 +206,33 @@ func (c *Concierge) answer(parent context.Context, x *voice.Exchange, turn strin
 	// alone (saysKey) answers the question first asked, about that key
 	// (takeKey). A question is read exactly as with no offer pending; when
 	// the question was said before the turn, the whole reply is read
-	// (readsReply). Nothing said before the reply's last take-back is read,
-	// searched, sent or given to the model: when the reply holds a
-	// take-back, found on the raw finals, the answer reads what follows it
-	// (said), never a cut of the turn, where the Supervisor joined the
+	// (readsReply). In every turn, a reply to Wispr's question or not,
+	// nothing said before the room's last take-back is read, searched, sent
+	// or given to the model (Main, after Sol's review of #191 at 31b6af9):
+	// the answer reads what follows it (said), cut on the raw finals
+	// (roomFinals), never on the turn, where the Supervisor joined the
 	// finals with spaces and a take-back that a final's end closed is no
 	// clause of its own ("what about ABC-42? never mind" / "what about
 	// ABC-12?" is "what about ABC-12?"; Sol's seventh and eighth reviews of
-	// #191). With no reply (no question of Wispr's pending a reply, or a
-	// voice that does not drive its turn), the take-back is found on the turn.
+	// #191). A turn that takes itself back whole answers nothing, as
+	// "Wispr, never mind" answers nothing.
 	offer, offered := c.pendingOffer(x)
-	reply := x.Reply
-	if strings.TrimSpace(reply) == "" {
-		reply = turn
-	}
+	reply := roomFinals(x, turn)
 	said := view.replyText(reply)
 	if offered && offer.sideTalkOn(view, said) {
 		c.dropPick(x)
 		c.logger.Info("concierge took a reply to its own question for side talk: it picks nothing, says no key and asks nothing, or takes itself back")
 		return errSideTalk
 	}
-	if offered && (takesItBack(reply) || strings.TrimSpace(x.Reply) != "" && offer.readsReply(view, turn, said)) {
+	switch {
+	case takesItBack(reply) && said == "":
+		c.dropPick(x)
+		c.takeAheadSearches(x) // the reads of what was taken back
+		c.logger.Info("concierge answered nothing: the turn took itself back")
+		return errSideTalk
+	case takesItBack(reply):
+		turn = said
+	case offered && strings.TrimSpace(x.Reply) != "" && offer.readsReply(view, turn, said):
 		turn = said
 	}
 	// A key said letter by letter is read here, once, so the pick, the
@@ -431,7 +437,7 @@ func (c *Concierge) answer(parent context.Context, x *voice.Exchange, turn strin
 		searchesLeft--
 	}
 	searchesLeft = max(searchesLeft, 0)
-	tools := &runner{c: c, x: x, searchesLeft: &searchesLeft, fullCut: fullCut, holderKnown: found.holder != nil, view: &view}
+	tools := &runner{c: c, x: x, searchesLeft: &searchesLeft, fullCut: fullCut, holderKnown: found.holder != nil, view: &view, recent: withoutTakenBack(x.Recent, reply)}
 	var err error
 	if !staleSaid {
 		// With no fact by c.knownBound, the model stops and the voice says
@@ -925,7 +931,11 @@ func direct(question string) string {
 // R8's bounds hold across both tries. view is the turn's one reading of the
 // project list, which reads the keys the turn names.
 func (c *Concierge) facts(ctx context.Context, tools *runner, view projectsView, turn string, found *reading, asking bool, sp *speaker) error {
-	prompt := c.turnPrompt(transcriptOf(tools.x.Recent), turn)
+	recent := tools.recent
+	if recent == nil {
+		recent = tools.x.Recent
+	}
+	prompt := c.turnPrompt(transcriptOf(recent), turn)
 	switch {
 	case found.text == "":
 	case found.searched && found.clear && found.key != "":
@@ -1092,6 +1102,37 @@ func (c *Concierge) generate(ctx context.Context, tools *runner, prompt string, 
 		}
 		contents = append(contents, &genai.Content{Role: genai.RoleUser, Parts: results})
 	}
+}
+
+// withoutTakenBack is recent, the room's recent words, with the words that
+// finals, the turn's raw finals (roomFinals), said before their last
+// take-back left out, the last time each was said: the model hears the room
+// as it hears the turn, with nothing that was taken back (Main, after Sol's
+// review of #191 at 31b6af9). With no take-back it is recent.
+func withoutTakenBack(recent []voice.TurnText, finals string) []voice.TurnText {
+	if !takesItBack(finals) {
+		return recent
+	}
+	finals = strings.TrimSpace(finals)
+	taken := finals
+	if kept := afterTakeBack(finals); kept != "" {
+		taken = finals[:strings.LastIndex(finals, kept)]
+	}
+	out := slices.Clone(recent)
+	lines := strings.Split(taken, "\n")
+	for i := len(lines) - 1; i >= 0; i-- {
+		line := strings.TrimSpace(lines[i])
+		if line == "" {
+			continue
+		}
+		for k := len(out) - 1; k >= 0; k-- {
+			if at := strings.LastIndex(out[k].Text, line); at >= 0 {
+				out[k].Text = strings.Join(strings.Fields(out[k].Text[:at]+" "+out[k].Text[at+len(line):]), " ")
+				break
+			}
+		}
+	}
+	return slices.DeleteFunc(out, func(t voice.TurnText) bool { return t.Text == "" })
 }
 
 func transcriptOf(recent []voice.TurnText) string {

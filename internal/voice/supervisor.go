@@ -1850,7 +1850,7 @@ func (s *Supervisor) turnLocked(ex *exchange, t *Transcript, words string) {
 	// takes its id as soon as there is one.
 	s.sessionLocked(ex)
 	turn := s.turnOf(ex)
-	ex.x.AskerTurn = turn
+	ex.x.AskerTurn, ex.x.Finals = turn, finalsOf(ex)
 	// A follow-up with no wake phrase may be side talk, which leaves the
 	// unit for nothing: it is read for only once it is the next turn.
 	if turn != "" && !ex.followUpTurn {
@@ -1887,6 +1887,19 @@ func (s *Supervisor) turnOf(ex *exchange) string {
 		}
 	}
 	return turn
+}
+
+// finalsOf is ex's turn so far as Deepgram wrote it (Exchange.Finals): each
+// final, and the interim after them, one a line, keys unwritten, so a
+// take-back a final's end closed stays a clause of its own.
+func finalsOf(ex *exchange) string {
+	lines := make([]string, 0, len(ex.turn)+1)
+	for _, line := range append(ex.turn[:len(ex.turn):len(ex.turn)], ex.interim) {
+		if line = strings.TrimSpace(line); line != "" {
+			lines = append(lines, line)
+		}
+	}
+	return strings.Join(lines, "\n")
 }
 
 // replyOf is ex's reply as the Concierge reads it (Exchange.Reply): the
@@ -2010,7 +2023,7 @@ func (s *Supervisor) handTurnLocked(ex *exchange, signal turnSignal) {
 	ex.times.lastTurnEnd = ex.turnAt
 	ex.firstOutDone, ex.factPending, ex.factDone, ex.factText = false, false, false, ""
 	turn := s.turnOf(ex)
-	ex.x.AskerTurn = turn
+	ex.x.AskerTurn, ex.x.Finals = turn, finalsOf(ex)
 	s.sessionLocked(ex)
 	ex.x.Recent = s.recentLocked()
 	s.exTimingLocked(ex, "turn_signal", signal.at, "kind", signal.kind)

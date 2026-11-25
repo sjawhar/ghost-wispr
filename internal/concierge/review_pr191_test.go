@@ -754,6 +754,116 @@ func TestASplitKeyTheRecordLacksIsHeardAsNoIssue(t *testing.T) {
 	}
 }
 
+// TestATakeBackInAnyTurnSendsOnlyWhatFollowsIt (Sol's review of #191 at
+// 31b6af9; Main's rule): in any turn, not only a reply to Wispr's question,
+// only what the room said after its last take-back is answered, read for,
+// given to the model or sent to a holder. The turn opens the exchange with
+// the wake phrase, so no question of Wispr's is pending. At 31b6af9 the cut
+// was made only for a reply to Wispr's question: "what about ABC-42? never
+// mind" / "what about ABC-12?" gave the model and ABC-12's holder the
+// cancelled question, with a stop after "never mind" or without one. A turn
+// that takes itself back whole answers nothing, as "Wispr, never mind" does.
+// Where the take-back comes in the final that names ABC-42, ABC-42 is never
+// read, not even ahead; a final that ends at "ABC-42?" may be read ahead
+// before the take-back is said. Controls: the question alone, and "stop"
+// inside a clause, which is no take-back.
+func TestATakeBackInAnyTurnSendsOnlyWhatFollowsIt(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		finals    []string
+		endpoints bool
+		answered  bool   // the answer is about ABC-12
+		unread    bool   // ABC-42 is never read
+		prompted  string // when set, the model's prompt holds it
+	}{
+		{"a take-back ends its final", []string{"Wispr, what about ABC-42? never mind", "what about ABC-12?"}, false, true, true, ""},
+		{"a take-back ends its final with a stop", []string{"Wispr, what about ABC-42? never mind.", "what about ABC-12?"}, false, true, true, ""},
+		{"a take-back a final of its own", []string{"Wispr, what about ABC-42?", "never mind", "what about ABC-12?"}, false, true, false, ""},
+		{"a comma before the take-back", []string{"Wispr, what about ABC-42, never mind", "what about ABC-12?"}, false, true, true, ""},
+		{"one final", []string{"Wispr, what about ABC-42? never mind. what about ABC-12?"}, false, true, true, ""},
+		{"the turn taken back whole", []string{"Wispr, what about ABC-42? never mind"}, false, false, true, ""},
+		{"control: the question alone", []string{"Wispr, what about ABC-12?"}, false, true, true, ""},
+		{"control: stop inside a clause", []string{"Wispr, what about ABC-12, don't stop the rollout?"}, false, true, true, "stop the rollout"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := newCutRigOpening(t, tc.finals, tc.endpoints, []*genai.GenerateContentResponse{chunk(text("ABC-12 is in progress."))})
+			r.records.mu.Lock()
+			r.records.issues["ABC-42"] = &dispatch.Issue{Key: "ABC-42", Title: "A different issue", Status: "todo", UpdatedAt: testNow}
+			r.records.mu.Unlock()
+			question := strings.TrimPrefix(strings.Join(tc.finals, " "), "Wispr, ")
+			out := r.answer(t, "turn", question)
+			r.agents.mu.Lock()
+			messages := slices.Clone(r.agents.sent)
+			r.agents.mu.Unlock()
+			prompt := lastPrompt(r.rig)
+			for _, m := range messages {
+				if strings.Contains(m.Message, "ABC-42") {
+					t.Errorf("a holder was sent the cancelled question: %q", m.Message)
+				}
+			}
+			if strings.Contains(prompt, "ABC-42") {
+				t.Errorf("the model was given the cancelled question:\n%s", prompt)
+			}
+			if calls := r.records.calls(); tc.unread && slices.Contains(calls, "ABC-42") {
+				t.Errorf("the cancelled issue was read: %q", calls)
+			}
+			if !tc.answered {
+				if out.Say != "" || len(messages) != 0 || prompt != "" {
+					t.Errorf("said %q, sent %d, prompted %q; want nothing for a turn taken back whole", out.Say, len(messages), prompt)
+				}
+				return
+			}
+			if out.IssueKey != "ABC-12" || out.Say == "" {
+				t.Errorf("took %q, said %q; want the question after the take-back answered about ABC-12", out.IssueKey, out.Say)
+			}
+			if tc.prompted != "" && !strings.Contains(prompt, tc.prompted) {
+				t.Errorf("the model was given:\n%s\nwant it to hold %q", prompt, tc.prompted)
+			}
+		})
+	}
+}
+
+// TestAVendorsWordingTakesNoReadOfAKeyTakenBack (Main's rule after Sol's
+// review of #191 at 31b6af9): voices B and C answer in their vendor's words,
+// and the answer looks up the read-ahead's read by the room's own words
+// (AskerTurn). The read-ahead read ABC-12 while "what about ABC-12?" was the
+// whole turn; then the room said "never mind. what about the budget", and
+// the vendor answers "how is the budget doing". A key said before the last
+// take-back is no key of the turn: the answer names no ABC-12 and takes no
+// read of it, whether the read-ahead heard the last final or the answer came
+// first, as a late delivery lets it. Control: "what about ABC-12" alone,
+// answered in the same words, names ABC-12.
+func TestAVendorsWordingTakesNoReadOfAKeyTakenBack(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		finals []string
+		heard  int // the finals the read-ahead hears before the answer
+		want   string
+	}{
+		{"taken back in a final after it", []string{"what about ABC-12?", "never mind. what about the budget"}, 2, ""},
+		{"taken back in a final the read-ahead has not heard", []string{"what about ABC-12?", "never mind. what about the budget"}, 1, ""},
+		{"control: the key alone", []string{"what about ABC-12"}, 1, "ABC-12"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := heldKeyRig(t, "")
+			for i := range tc.heard {
+				r.exchange.AskerTurn = strings.Join(tc.finals[:i+1], " ")
+				r.exchange.Finals = strings.Join(tc.finals[:i+1], "\n")
+				r.concierge.Heard(context.Background(), &r.exchange, r.exchange.AskerTurn)
+				time.Sleep(150 * time.Millisecond)
+			}
+			r.exchange.AskerTurn = strings.Join(tc.finals, " ")
+			r.exchange.Finals = strings.Join(tc.finals, "\n")
+			r.model.turns = [][]*genai.GenerateContentResponse{{chunk(text("The budget is set."))}}
+			var spoken []said
+			err := r.concierge.Answer(context.Background(), &r.exchange, "how is the budget doing", recorder(&spoken))
+			if r.exchange.IssueKey != tc.want {
+				t.Fatalf("reads %q, IssueKey %q, spoken %+v, err %v; want IssueKey %q", r.records.calls(), r.exchange.IssueKey, spoken, err, tc.want)
+			}
+		})
+	}
+}
+
 // TestWhereTheTwoRulesMeet (Main, on rebasing #191 onto #194): #194's rules
 // and #191's meet where a reply to Wispr's question holds a decline, a key
 // of one digit, a spelled key or more keys than a read tries. It fails if

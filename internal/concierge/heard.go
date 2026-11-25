@@ -550,6 +550,15 @@ func (c *Concierge) Heard(ctx context.Context, x *voice.Exchange, words string) 
 	if ctx.Err() != nil || c.records == nil {
 		return
 	}
+	// Only what the room said after its last take-back is read ahead
+	// (roomFinals; Main, after Sol's review of #191 at 31b6af9): "what
+	// about ABC-42? never mind" reads nothing ahead, and "what about ABC-12?"
+	// after it reads ABC-12 alone.
+	if finals := roomFinals(x, words); takesItBack(finals) {
+		if words = c.viewProjects().replyText(finals); words == "" {
+			return
+		}
+	}
 	// One reading of the project list decides the turn (projectsView). A run
 	// of letters that could be a key the list cannot tell yet is neither read
 	// nor searched (readSpelledKeys).
@@ -731,9 +740,15 @@ func (c *Concierge) readFor(ctx context.Context, x *voice.Exchange, view project
 	// read-ahead read the unit's own transcript of the turn, AskerTurn
 	// (found in review on 2026-11-24): its read is looked up as the
 	// read-ahead made it (aheadTarget), with no key of one digit.
+	// A take-back cuts it as it cuts the turn: nothing said before it is
+	// looked up (roomFinals).
+	asker := x.AskerTurn
+	if finals := roomFinals(x, asker); takesItBack(finals) {
+		asker = view.replyText(finals)
+	}
 	asked := ""
-	if x.AskerTurn != "" && x.AskerTurn != turn {
-		if words, unread := view.readSpelledKeys(x.AskerTurn); !unread {
+	if asker != "" && asker != turn {
+		if words, unread := view.readSpelledKeys(asker); !unread {
 			asked = c.aheadTarget(view, words)
 		}
 	}

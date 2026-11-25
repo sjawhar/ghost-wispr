@@ -48,6 +48,13 @@ type Exchange struct {
 	// its own. An endpoint inside the reply ("okay, ABC-12" … "can wait")
 	// leaves the turn only its end. Empty when Wispr asked nothing.
 	Reply string
+	// Finals is the turn's own words (AskerTurn) as Deepgram wrote them,
+	// each final, and the interim after them, one a line, keys unwritten.
+	// The Concierge finds a take-back on them in any turn: a take-back a
+	// final's end closed ("what about ABC-42? never mind" / "what about
+	// ABC-12?") is no clause of AskerTurn, which joins the finals with
+	// spaces, and nothing said before it is read, searched or sent.
+	Finals string
 }
 
 // TurnText is one final transcript segment.
