@@ -152,6 +152,8 @@ type runner struct {
 	// it nil: its runner serves a vendor's tool call made outside an answer,
 	// with no turn here, so a search reads the list as it is then.
 	view *projectsView
+	// searchSlow: a search found nothing in its time (searchBoth's slow).
+	searchSlow bool
 }
 
 // Tools gives x's tools, for x.Tools.
@@ -310,6 +312,16 @@ func (r *runner) searchIssues(ctx context.Context, query string) (map[string]any
 	if err != nil {
 		return nil, err
 	}
+	// The search reads the question with the turn's view of the projects,
+	// or, for Tools's runner, the list as it is now. A key of one digit the
+	// view reads is read, not searched, as a longer key is: neither search
+	// gets its words.
+	view := r.view
+	if view == nil {
+		now := r.c.viewProjects()
+		view = &now
+	}
+	query = view.withoutOneDigitKeys(query)
 	// The keyword search gets the question's words that name work
 	// (searchTerms); none, and nothing is searched.
 	terms := searchTerms(query)
@@ -322,15 +334,13 @@ func (r *runner) searchIssues(ctx context.Context, query string) (map[string]any
 	if r.searchesLeft != nil {
 		*r.searchesLeft--
 	}
-	// The full search gets the question as said (searchQuestion), read with
-	// the turn's view of the projects, or, for Tools's runner, the list as
-	// it is now. Both are cut to what Dispatch searches.
-	view := r.view
-	if view == nil {
-		now := r.c.viewProjects()
-		view = &now
+	// The full search gets the question as said (searchQuestion). Both are
+	// cut to what Dispatch searches.
+	result, err := r.c.searchBoth(ctx, records, withinSearchLength(view.searchQuestion(query)), withinSearchLength(terms), r.fullCut)
+	if slow, _ := result["slow"].(bool); slow {
+		r.searchSlow = true
 	}
-	return r.c.searchBoth(ctx, records, withinSearchLength(view.searchQuestion(query)), withinSearchLength(terms), r.fullCut)
+	return result, err
 }
 
 // searchBoth runs Dispatch's keyword-only search for terms and its full
@@ -345,7 +355,12 @@ func (r *runner) searchIssues(ctx context.Context, query string) (map[string]any
 // holds a word of terms (fallback), whose top two, or one, the voice offers
 // (Main's rule). When the fallback at cut keeps no issue, the full search is
 // waited for within its own bound and taken as it comes. A search that
-// found nothing in its time is slow, not out of reach (R6, R10).
+// found nothing in its time is slow, not out of reach: the full search past
+// its bound, with the keyword search past its own or with nothing the words
+// name, is answered "slow" with no issue, and the room hears that
+// Dispatch's search is slow, with no error sound (R6, R10). A search
+// Dispatch refused or did not answer, not by a bound, is Dispatch out of
+// reach.
 func (c *Concierge) searchBoth(ctx context.Context, records Records, question, terms string, cut <-chan struct{}) (map[string]any, error) {
 	type found struct {
 		hits []dispatch.SearchHit
@@ -396,19 +411,29 @@ func (c *Concierge) searchBoth(ctx context.Context, records Records, question, t
 		issues, clear := issuesOf(got.hits)
 		return map[string]any{"issues": issues, "clear_match": clear}, nil
 	}
+	fullSlow := errors.Is(got.err, errSearchSlow)
 	if kwErr == nil && len(kwIssues) > 0 && ctx.Err() == nil {
-		c.logger.Info("concierge took the keyword result: the full search failed", "error", got.err)
-		return c.fallback(kwHits, terms), nil
+		kept := c.fallback(kwHits, terms)
+		if issues, _ := kept["issues"].([]map[string]any); len(issues) > 0 {
+			c.logger.Info("concierge took the keyword result: the full search failed", "error", got.err)
+			return kept, nil
+		}
 	}
-	if errors.Is(kwErr, errSearchSlow) && errors.Is(got.err, errSearchSlow) {
-		// The keyword search answers in about 0.15 s: both past their bound
-		// is Dispatch out of reach (R10).
-		return nil, fmt.Errorf("%w: neither search answered in %v", dispatch.ErrUnreachable, c.searchBound)
+	switch {
+	case fullSlow && kwErr != nil && !errors.Is(kwErr, errSearchSlow):
+		// The keyword search failed of its own, not by its bound: Dispatch
+		// did not answer it, and the room hears so (R10).
+		return nil, kwErr
+	case fullSlow:
+		// The full search ran past its bound, and the keyword search ran
+		// past its own or kept no issue the words name: the search is
+		// slow, not Dispatch out of reach. The room hears so, with no error
+		// sound (R6, R10). The note tells a model that searched so.
+		c.logger.Info("concierge's search was slow: it found nothing in its time", "bound", c.searchBound)
+		return map[string]any{"issues": []map[string]any{}, "clear_match": false, "slow": true, "note": searchIsSlow + " It found nothing in its time. Ask for the issue's key."}, nil
 	}
-	if errors.Is(got.err, errSearchSlow) {
-		c.logger.Info("concierge's search found nothing in its time", "bound", c.searchBound)
-		return map[string]any{"issues": []map[string]any{}, "clear_match": false, "note": "The search took too long. Ask for the issue's key."}, nil
-	}
+	// The full search failed of its own, not by its bound, and the keyword
+	// search kept no issue: Dispatch did not answer (R10).
 	return nil, got.err
 }
 
@@ -488,7 +513,7 @@ func issuesOf(hits []dispatch.SearchHit) ([]map[string]any, bool) {
 		}
 		best[hit.IssueKey] = hit.Score
 		if len(issues) < 5 {
-			issues = append(issues, map[string]any{"key": hit.IssueKey, "title": hit.Title, "status": hit.Status, "match": hit.Snippet})
+			issues = append(issues, map[string]any{"key": hit.IssueKey, "title": statusesInWords(hit.Title), "status": spokenStatus(hit.Status), "match": statusesInWords(hit.Snippet)})
 		}
 	}
 	scores := make([]float64, 0, len(issues))
@@ -536,7 +561,7 @@ func (r *runner) readIssue(ctx context.Context, key string) (map[string]any, err
 	// a field named "assignee" for who holds the issue, which only
 	// issue_holder says.
 	result := map[string]any{
-		"key": issue.Key, "title": issue.Title, "status": issue.Status, "priority": issue.Priority,
+		"key": issue.Key, "title": statusesInWords(issue.Title), "status": spokenStatus(issue.Status), "priority": issue.Priority,
 		"assigned_to": issue.Assignee, "parent": issue.Parent, "open_asks": issue.OpenAsks,
 	}
 	if !issue.UpdatedAt.IsZero() {
@@ -545,7 +570,7 @@ func (r *runner) readIssue(ctx context.Context, key string) (map[string]any, err
 	if slug := issue.PrimaryDocument(); slug != "" {
 		switch spec, err := records.DocumentText(ctx, issue.Key, slug); {
 		case err == nil:
-			result["spec_summary"] = cut(spec, specSummaryChars)
+			result["spec_summary"] = statusesInWords(cut(spec, specSummaryChars))
 		case ctx.Err() == nil:
 			// A read whose context ended (a newer target, a stop, the
 			// answer's bound) is no failure of Dispatch's; a hung Dispatch
@@ -566,7 +591,7 @@ func (r *runner) readIssue(ctx context.Context, key string) (map[string]any, err
 		}
 		entry := map[string]any{"type": event.Type, "when": ago(now, event.CreatedAt), "by": sessionName(event.Actor.Title(), issue.Key)}
 		if text := eventText(event.Payload); text != "" {
-			entry["text"] = cut(text, eventTextChars)
+			entry["text"] = statusesInWords(cut(text, eventTextChars))
 		}
 		recent = append(recent, entry)
 	}
@@ -1245,7 +1270,7 @@ func (r *runner) taskStatus(id string) (map[string]any, error) {
 		"spoken": task.SpokenAt != nil,
 	}
 	if task.AnswerWritten != "" {
-		result["answer"] = task.AnswerWritten
+		result["answer"] = statusesInWords(task.AnswerWritten)
 	}
 	return result, nil
 }

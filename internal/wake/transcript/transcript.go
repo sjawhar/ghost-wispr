@@ -7,6 +7,7 @@
 package transcript
 
 import (
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -303,7 +304,11 @@ func issueKeys(text string, afterName bool) []string {
 
 // WriteKeys writes each key of projects that text says in a spoken form as
 // the key ("in for forty five ninety two" as INFRA-4592), so the Concierge
-// and Dispatch read it; other words stay as they were.
+// and Dispatch read it; other words stay as they were. "One" after a
+// project is as often a pronoun as a number ("the INFRA one", "is INFRA one
+// of them"), so a key of one digit said so is not written, and nor is any
+// key of one digit inside other speech ("I bet five dollars"): only a bare
+// issue reference is one (BareIssueReference).
 func WriteKeys(text string, projects []string) string { return writeKeys(text, projects, false) }
 
 // WriteKeysAfterName is WriteKeys for text said right after the wake phrase
@@ -321,8 +326,15 @@ func writeKeys(text string, projects []string, afterName bool) string {
 	var out []string
 	next := 0
 	for _, span := range keySpans(tokens, afterName) {
-		project, _, _ := strings.Cut(span.key, "-")
+		project, number, _ := strings.Cut(span.key, "-")
 		if !known[project] {
+			continue
+		}
+		if len(number) == 1 && normalise(tokens[span.to-1].text) == "one" {
+			continue
+		}
+		written := span.to-span.from == 1 && keyToken(tokens[span.from].text)
+		if len(number) == 1 && !written && !BareIssueReference(strings.Join(joinTokens(tokens[:span.from]), " "), strings.Join(joinTokens(tokens[span.to:]), " ")) {
 			continue
 		}
 		out = append(out, joinTokens(tokens[next:span.from])...)
@@ -336,6 +348,69 @@ func writeKeys(text string, projects []string, afterName bool) string {
 	}
 	out = append(out, joinTokens(tokens[next:])...)
 	return strings.Join(out, " ")
+}
+
+// BareIssueReference reports whether a key of one digit said as a project
+// word and a number ("infra 7", "INFRA seven"), with before and after the
+// words of the turn around it, is said as a bare issue reference, and so is
+// a key. It is when the turn is the key alone, maybe after a filler or a
+// yes or no and before "please" ("infra 7", "yes, infra 7", "infra 7,
+// please"), when it is the question's whole object, at the turn's end after
+// a word that takes one ("what about infra 7", "status of infra 7", "who's
+// on infra 7", "what is infra 7"), and when an ask names it ("ask the agent
+// on infra 7 is it merged"). A project word and one digit inside other
+// speech are speech, though the word is a project's: "I bet 5", "I'd bet 2
+// of them", "the infra 3 times", "ops 1 and 2". A key written as one
+// ("INFRA-7") and a key of two digits or more need no such reading.
+func BareIssueReference(before, after string) bool {
+	if askNamesKey.MatchString(before) {
+		return true
+	}
+	rest := referenceWords(after)
+	if len(rest) > 0 && rest[len(rest)-1] == "please" {
+		rest = rest[:len(rest)-1]
+	}
+	if len(rest) > 0 {
+		return false
+	}
+	said := referenceWords(before)
+	if len(said) > 0 && objectWords[said[len(said)-1]] {
+		return true
+	}
+	for _, word := range said {
+		if !leadWords[word] {
+			return false
+		}
+	}
+	return true
+}
+
+var (
+	// objectWords are the words after which a key at the turn's end is the
+	// question's object.
+	objectWords = setOf("about", "of", "on", "with", "for", "is", "issue", "what's", "how's", "where's")
+	// leadWords may stand before a key that is the whole turn: a filler, a
+	// yes or a no.
+	leadWords = setOf("uh", "um", "oh", "well", "hmm", "mm", "okay", "ok", "so", "and", "yes", "yeah", "yep", "no", "nope", "not")
+	// askNamesKey is the start of an ask, up to the key it names: "ask the
+	// agent on".
+	askNamesKey = regexp.MustCompile(`(?i)^\s*(?:please\s+)?ask\s+(?:the\s+)?(?:agent|holder|session)\s+(?:on|for|of|working\s+on|holding)(?:\s+issue)?\s*$`)
+)
+
+// referenceWords are text's words, lower case, an apostrophe kept in its
+// word ("who's").
+func referenceWords(text string) []string {
+	return strings.FieldsFunc(strings.ToLower(strings.ReplaceAll(text, "’", "'")), func(r rune) bool {
+		return !unicode.IsLetter(r) && !unicode.IsDigit(r) && r != '\''
+	})
+}
+
+func setOf(words ...string) map[string]bool {
+	set := make(map[string]bool, len(words))
+	for _, word := range words {
+		set[word] = true
+	}
+	return set
 }
 
 func notWordRune(r rune) bool { return !unicode.IsLetter(r) && !unicode.IsDigit(r) }

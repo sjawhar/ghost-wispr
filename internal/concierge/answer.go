@@ -98,6 +98,8 @@ const (
 	sorry = "Sorry, I cannot answer that right now."
 	// noIssueFound is what the voice says when a search finds no issue (R5).
 	noIssueFound = "I found no issue for that. What is its key?"
+	// searchIsSlow is what the voice says when a search ran past its bound.
+	searchIsSlow = "Dispatch's search is slow right now."
 	// usualWait is the wait the voice names after asking the holder (R6).
 	// Measurement 4 has not run; the live replies seen took 4 to 19 s.
 	usualWait = "Its answer usually comes within a minute, with a chime."
@@ -202,6 +204,12 @@ func (c *Concierge) answer(parent context.Context, x *voice.Exchange, turn strin
 	target := ""
 	if asked, key, ok := c.takePick(x, turn); ok {
 		if key == "" {
+			// A declined offer's reads are dropped, as an answer's are
+			// (takeAheadSearches): the read ahead of "no, not ABC-12" read
+			// the issue the room turned down, and a next keyless question
+			// took it through AskerTurn and asked its holder (Sol's review
+			// of #194 at e5cf4d6, R6). Main does so for a key of two digits.
+			c.takeAheadSearches(x)
 			return sp.sayText(ctx, "Okay.", voice.Ack)
 		}
 		turn, target = asked, "keys:"+key
@@ -225,7 +233,7 @@ func (c *Concierge) answer(parent context.Context, x *voice.Exchange, turn strin
 			askingKey.Store(&found.key)
 			go func() {
 				defer leaveAsk()
-				result := c.ask(askCtx, x, session, turn, found)
+				result := c.ask(askCtx, x, view, session, turn, found)
 
 				asking <- result
 			}()
@@ -302,6 +310,10 @@ func (c *Concierge) answer(parent context.Context, x *voice.Exchange, turn strin
 			return err
 		}
 		return errOutOfReach
+	case found.slow:
+		// A search past its bound is slow, not out of reach (R10). The
+		// error sound plays only when Dispatch itself did not answer.
+		return sp.sayText(ctx, searchIsSlow, voice.Ack)
 	case found.noResult:
 		return sp.sayText(ctx, noIssueFound, voice.Ack)
 	case found.searched && !found.clear && len(found.candidates) > 0:
@@ -359,7 +371,7 @@ func (c *Concierge) answer(parent context.Context, x *voice.Exchange, turn strin
 				stopFacts()
 			}
 		})
-		err = c.facts(factsCtx, tools, turn, found, askStarted.Load(), sp)
+		err = c.facts(factsCtx, tools, view, turn, found, askStarted.Load(), sp)
 		knownTimer.Stop()
 		switch {
 		case parent.Err() != nil:
@@ -367,11 +379,16 @@ func (c *Concierge) answer(parent context.Context, x *voice.Exchange, turn strin
 		case knownCut.Load():
 			c.logger.Info("concierge said what it knew: no fact by its mark", "after", c.knownBound)
 			err = nil
-			mode := voice.Fact
+			mode, known := voice.Fact, found.known(c.now())
 			if found.key == "" {
 				mode = voice.Ack
 			}
-			if sayErr := sp.sayText(parent, found.known(c.now()), mode); sayErr != nil {
+			if found.key == "" && tools.searchSlow {
+				// The model's search found nothing in its time: no issue
+				// was found because the search was slow (R10).
+				known = searchIsSlow
+			}
+			if sayErr := sp.sayText(parent, known, mode); sayErr != nil {
 				return sayErr
 			}
 		case errors.Is(err, errNoWords) && found.key != "" && sp.count() == 0:
@@ -456,7 +473,7 @@ func didYouMean(candidates []candidate) string {
 // chosen issue's status with the age of its newest event, or that it found no
 // issue.
 func (r *reading) known(now time.Time) string {
-	status := strings.ReplaceAll(r.status, "_", " ")
+	status := spokenStatus(r.status)
 	switch {
 	case r.key == "":
 		return noIssueFound
@@ -479,13 +496,13 @@ func (r *reading) agedStatus(now time.Time) string {
 	if r.key == "" || r.status == "" || r.newest.IsZero() || now.Sub(r.newest) <= staleRecord {
 		return ""
 	}
-	return r.key + " was " + strings.ReplaceAll(r.status, "_", " ") + " as of " + ago(now, r.newest) + "."
+	return r.key + " was " + spokenStatus(r.status) + " as of " + ago(now, r.newest) + "."
 }
 
 // routingLine is the routing line for turn: the issue key it names, when it
 // names one of the projects of the turn's view, else the record.
 func routingLine(view projectsView, turn string) string {
-	keys := issueKeysIn(turn)
+	keys := view.issueKeys(turn)
 	for i := len(keys) - 1; i >= 0; i-- {
 		project, _, _ := strings.Cut(keys[i], "-")
 		if view.holds(project) {
@@ -577,6 +594,11 @@ var (
 	// askPrefix is what a person says before the question itself: "ask the
 	// agent on ABC-12".
 	askPrefix = regexp.MustCompile(`(?i)^\s*(?:please\s+)?ask\s+(?:the\s+)?(?:agent|holder|session)\b(?:\s+(?:on|for|of|working\s+on|holding)\s+(?:issue\s+)?(?:[A-Za-z][A-Za-z0-9]*[- ]\d{2,}))?[\s,:]*`)
+	// askPrefixOneDigit is askPrefix with a key of one digit ("ask the agent
+	// on INFRA-7"), whose project group 1 names. It is the prefix only when
+	// the turn's view holds that project: "ask the agent for 5 minutes" is
+	// no key.
+	askPrefixOneDigit = regexp.MustCompile(`(?i)^\s*(?:please\s+)?ask\s+(?:the\s+)?(?:agent|holder|session)\s+(?:on|for|of|working\s+on|holding)\s+(?:issue\s+)?([A-Za-z][A-Za-z0-9]*)[- ]\d\b[\s,:]*`)
 	// statusWords are the words of a question about status, or about what
 	// the record holds: who holds the issue, its priority, its assignee, its
 	// asks, its history and recent events (R7). Words that as often start
@@ -627,9 +649,10 @@ func (c *Concierge) askPlan(turn string, found *reading, followUp bool) string {
 // unknown. A question for an unresponsive holder is left for it: Envoy stores
 // it and delivers it when the session comes back, and the room hears that in
 // one line (leftQuestion). An ask to such a holder that failed says the
-// holder's case too.
-func (c *Concierge) ask(ctx context.Context, x *voice.Exchange, session, turn string, found *reading) askResult {
-	result, err := (&runner{c: c, x: x}).call(ctx, "ask_agent", map[string]any{"session": session, "question": fewestWords(turn), "issue_key": found.key})
+// holder's case too. view, the turn's one reading of the project list, reads
+// the keys of the question (fewestWords).
+func (c *Concierge) ask(ctx context.Context, x *voice.Exchange, view projectsView, session, turn string, found *reading) askResult {
+	result, err := (&runner{c: c, x: x}).call(ctx, "ask_agent", map[string]any{"session": session, "question": fewestWords(view, turn), "issue_key": found.key})
 	holderCase := ""
 	if unresponsiveHolder(found) {
 		holderCase = found.holderCase()
@@ -678,9 +701,14 @@ func aboutStatus(turn string) bool {
 // ("ask the agent on ABC-12", "who holds the issue about X"), an embedded
 // question made direct ("when slice one will be ready" becomes "When will
 // slice one be ready?"), cut to 300 characters at a word. The issue's key
-// goes in the message's header, not here.
-func fewestWords(turn string) string {
-	question := strings.Join(strings.Fields(askPrefix.ReplaceAllString(turn, "")), " ")
+// goes in the message's header, not here. view, the turn's one reading of
+// the project list, reads its keys.
+func fewestWords(view projectsView, turn string) string {
+	prefix := askPrefix.FindString(turn)
+	if m := askPrefixOneDigit.FindStringSubmatch(turn); len(m) > 1 && view.holds(m[1]) {
+		prefix = m[0]
+	}
+	question := strings.Join(strings.Fields(turn[len(prefix):]), " ")
 	// Deepgram may end a sentence at the key ("…on INFRA-4592. When …"): the
 	// question starts at its first word, in the asker's own words.
 	question = strings.TrimLeftFunc(question, func(r rune) bool { return !unicode.IsLetter(r) && !unicode.IsDigit(r) })
@@ -690,9 +718,9 @@ func fewestWords(turn string) string {
 	// names that key again, and after a pause ("ask the agent, …") unless it
 	// names any key.
 	if m := routingClause.FindStringSubmatchIndex(question); m != nil {
-		prefix := strings.TrimSpace(askPrefix.FindString(turn))
-		named, inClause := issueKeysIn(prefix), issueKeysIn(question[:m[1]])
-		paused := strings.HasSuffix(prefix, ",") || strings.HasSuffix(prefix, ":")
+		said := strings.TrimSpace(prefix)
+		named, inClause := view.issueKeys(said), view.issueKeys(question[:m[1]])
+		paused := strings.HasSuffix(said, ",") || strings.HasSuffix(said, ":")
 		// A clause that names the holder ("who holds …") always routes.
 		lead, _, _ := strings.Cut(strings.ToLower(question), " ")
 		routes := lead == "who" || lead == "that" || lead == "working" || lead == "holding"
@@ -820,8 +848,9 @@ func direct(question string) string {
 // A sentence that fails R8's check is not spoken: the model writes once
 // more, told why, and after a second failure the voice says R8's fixed
 // sentence, led by the question's key when the first fact had to name it.
-// R8's bounds hold across both tries.
-func (c *Concierge) facts(ctx context.Context, tools *runner, turn string, found *reading, asking bool, sp *speaker) error {
+// R8's bounds hold across both tries. view is the turn's one reading of the
+// project list, which reads the keys the turn names.
+func (c *Concierge) facts(ctx context.Context, tools *runner, view projectsView, turn string, found *reading, asking bool, sp *speaker) error {
 	prompt := c.turnPrompt(transcriptOf(tools.x.Recent), turn)
 	switch {
 	case found.text == "":
@@ -845,7 +874,7 @@ func (c *Concierge) facts(ctx context.Context, tools *runner, turn string, found
 	source := &strings.Builder{}
 	source.WriteString(found.text)
 	questionKey := ""
-	if found.key != "" && slices.Contains(issueKeysIn(turn), found.key) &&
+	if found.key != "" && slices.Contains(view.issueKeys(turn), found.key) &&
 		found.holder["holder"] == "session" && found.holder["live"] == true {
 		// An explicit key is in the first fact, before any later holder or
 		// routing line. Its presence never depends on the Envoy send.
@@ -1099,13 +1128,17 @@ func (c *Concierge) forEar(ctx context.Context, written, issueKey string) string
 }
 
 // rewrite rewrites an agent's written answer to be spoken, and checks the
-// spoken text against it (R8 as written, earCheck). The model is told the
-// issue key the question named; when its rewrite does not hold it, the key
-// is put in front, and the check reads the text with it. A rewrite that
-// fails the check, or a model that fails, gets one more try, told why; after
-// the second the voice says the fixed sentence. The log says only why, never
-// the words.
+// spoken text against it (R8 as written, earCheck). A status the answer
+// names as Dispatch writes it ("needs_review") is in words first, so the
+// model, the check and the room all have the words; and so is one the
+// rewrite names, before the check, since the model may write it back. The
+// model is told the issue key the question named; when its rewrite does not
+// hold it, the key is put in front, and the check reads the text with it. A
+// rewrite that fails the check, or a model that fails, gets one more try,
+// told why; after the second the voice says the fixed sentence. The log says
+// only why, never the words.
 func (c *Concierge) rewrite(ctx context.Context, written, issueKey string) EarRewrite {
+	written = statusesInWords(written)
 	reason := ""
 	tries := 0
 	for try := 1; try <= earTries && ctx.Err() == nil; try++ {
@@ -1116,6 +1149,7 @@ func (c *Concierge) rewrite(ctx context.Context, written, issueKey string) EarRe
 			reason = "the rewrite was empty or failed"
 			continue
 		}
+		text = statusesInWords(text)
 		if issueKey != "" && !set(earKey.FindAllString(text, -1))[issueKey] {
 			text = issueKey + ": " + text
 		}
@@ -1404,8 +1438,12 @@ func (s *sentences) flush(ctx context.Context) error {
 	return s.speak(ctx, rest)
 }
 
+// speak says one sentence of the model's, each status in it in words
+// ("needs review", not "needs_review"), within R8's bounds and once it holds
+// only what the source does. The words are counted, checked and said as the
+// room hears them.
 func (s *sentences) speak(ctx context.Context, sentence string) error {
-	sentence = strings.TrimSpace(sentence)
+	sentence = statusesInWords(strings.TrimSpace(sentence))
 	if sentence == "" {
 		return nil
 	}

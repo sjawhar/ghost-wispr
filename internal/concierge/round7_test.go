@@ -194,7 +194,7 @@ func TestAnEmptySearchSpendsNoSearch(t *testing.T) {
 // TestASlowSearchIsNoOutage (R6, R10): Dispatch's normal search takes 1 to
 // 6 s, measured live, so a search past a read's bound is slow, not out of
 // reach. One within its own bound is used; one past it has found nothing
-// yet, so the voice asks for the key, and no error sound plays.
+// yet, so the voice says the search is slow, and no error sound plays.
 func TestASlowSearchIsNoOutage(t *testing.T) {
 	if searchBound != 5*time.Second {
 		t.Fatalf("searchBound = %v, want 5 s", searchBound)
@@ -217,8 +217,8 @@ func TestASlowSearchIsNoOutage(t *testing.T) {
 	r.records.searchDelay = time.Hour
 	spoken = nil
 	err = r.concierge.Answer(context.Background(), &r.exchange, "what is happening with the realtime voice", recorder(&spoken))
-	if err != nil || len(spoken) == 0 || spoken[len(spoken)-1].text != noIssueFound {
-		t.Fatalf("a search past its bound: %v, spoken %+v; want %q and no error", err, spoken, noIssueFound)
+	if err != nil || len(spoken) == 0 || spoken[len(spoken)-1].text != searchIsSlow {
+		t.Fatalf("a search past its bound: %v, spoken %+v; want %q and no error", err, spoken, searchIsSlow)
 	}
 }
 
@@ -763,7 +763,7 @@ func TestTheHolderGetsAQuestionInTheAskersIntent(t *testing.T) {
 		"is the tap on ABC-12 merged":                  "Is the tap on ABC-12 merged?",
 		"ask the agent on ABC-12 why the build failed": "Why the build failed?",
 	} {
-		if got := fewestWords(turn); got != want {
+		if got := fewestWords(projectsView{}, turn); got != want {
 			t.Errorf("fewestWords(%q) = %q, want %q", turn, got, want)
 		}
 	}
@@ -814,18 +814,20 @@ func TestASearchedTurnSaysWhatIsKnownAtTheMark(t *testing.T) {
 	}
 }
 
-// TestBothSearchesHungIsAnOutage (R10): the keyword search answers in about
-// 0.15 s; when it and the full search both run past their bound, Dispatch is
-// out of reach, with the error sound.
-func TestBothSearchesHungIsAnOutage(t *testing.T) {
+// TestBothSearchesHungIsSlowNotAnOutage (R6, R10): the keyword search
+// answers in about 0.15 s; when it and the full search both run past their
+// bound, the search is slow, not out of reach. The voice says that the
+// search is slow, and no error sound plays. Only a failure of Dispatch
+// itself (refused, not reached, server fault) triggers the error sound.
+func TestBothSearchesHungIsSlowNotAnOutage(t *testing.T) {
 	r := newRig(t)
 	r.concierge.searchBound = 200 * time.Millisecond
 	unclearSearch(r)
 	r.records.kwDelay, r.records.searchDelay = time.Hour, time.Hour
 	var spoken []said
 	err := r.concierge.Answer(context.Background(), &r.exchange, "what is happening with the realtime voice", recorder(&spoken))
-	if !errors.Is(err, voice.ErrUnreachable) || len(spoken) == 0 || spoken[len(spoken)-1].text != cannotReachDispatch {
-		t.Fatalf("Answer = %v, spoken %+v; want %q and voice.ErrUnreachable", err, spoken, cannotReachDispatch)
+	if err != nil || len(spoken) == 0 || spoken[len(spoken)-1].text != searchIsSlow {
+		t.Fatalf("Answer = %v, spoken %+v; want %q and no error", err, spoken, searchIsSlow)
 	}
 }
 
@@ -1167,7 +1169,7 @@ func TestTheHoldersQuestionKeepsItsShape(t *testing.T) {
 		"ask the agent on ABC-12 who is working on the cache, is it merged":    "Is it merged?",
 		"ask the agent on ABC-12.": "Ask the agent on ABC-12?",
 	} {
-		if got := fewestWords(turn); got != want {
+		if got := fewestWords(projectsView{}, turn); got != want {
 			t.Errorf("fewestWords(%q) = %q, want %q", turn, got, want)
 		}
 	}

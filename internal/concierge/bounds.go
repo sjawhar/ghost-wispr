@@ -14,7 +14,7 @@ import (
 // searchBound: a Dispatch that takes the connection and never answers must
 // not spend the answer's 8 s. A read past its bound is Dispatch out of reach
 // (dispatch.ErrUnreachable); a search past its own is slow, not out of reach
-// (errSearchSlow).
+// (errSearchSlow). An answer Dispatch refused is its refusal, bound or no.
 type boundedRecords struct {
 	inner       Records
 	bound       time.Duration
@@ -29,12 +29,15 @@ func (b boundedRecords) within(ctx context.Context, read func(context.Context) e
 }
 
 // boundCall runs call within bound; a call the bound ended, and not its
-// caller, returns past.
+// caller, returns past. A refusal Dispatch sent (dispatch.APIError, its
+// status seen before the bound, its body maybe not) stays as it is: an
+// explicit no is never a slow search (Sol's review of #194, R1).
 func boundCall(ctx context.Context, bound time.Duration, past error, call func(context.Context) error) error {
 	callCtx, cancel := context.WithTimeout(ctx, bound)
 	defer cancel()
 	err := call(callCtx)
-	if err != nil && ctx.Err() == nil && errors.Is(callCtx.Err(), context.DeadlineExceeded) {
+	var refused *dispatch.APIError
+	if err != nil && ctx.Err() == nil && errors.Is(callCtx.Err(), context.DeadlineExceeded) && !errors.As(err, &refused) {
 		return fmt.Errorf("%w: no answer in %v", past, bound)
 	}
 	return err

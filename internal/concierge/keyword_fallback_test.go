@@ -8,13 +8,14 @@ import (
 )
 
 // TestTheKeywordFallbackOffersOnlyIssuesItsTitleNames (R5; the office Pi on
-// 2026-11-24): when the full search misses its mark or fails, the keyword
-// result is taken, and on the Pi it offered an issue whose own title holds
-// none of the words said, found through a document about it, beside one the
-// words name. It fails unless that fallback offers only the issues whose own
-// title holds a word of the search, a stem's plural form included: two such
-// issues are offered, one is offered alone, and none is no issue found. A
-// full result in time is offered as it came.
+// 2026-11-24): when the full search misses its mark or runs past its bound,
+// the keyword result is taken, and on the Pi it offered an issue whose own
+// title holds none of the words said, found through a document about it,
+// beside one the words name. It fails unless that fallback offers only the
+// issues whose own title holds a word of the search, a stem's plural form
+// included: two such issues are offered, one is offered alone, and with none
+// the full search, past its bound, is a slow search. A full result in time
+// is offered as it came.
 func TestTheKeywordFallbackOffersOnlyIssuesItsTitleNames(t *testing.T) {
 	var (
 		contracts = dispatch.SearchHit{Kind: "issue", IssueKey: "ABC-41", Title: "Parser eval contracts", Score: 0.0104}
@@ -29,7 +30,7 @@ func TestTheKeywordFallbackOffersOnlyIssuesItsTitleNames(t *testing.T) {
 	}{
 		{"two titles hold the words", []dispatch.SearchHit{contracts, stateFile, answers, roadmap}, "Did you mean A B C forty-one, or A B C forty-two?"},
 		{"one title holds them", []dispatch.SearchHit{contracts, stateFile, roadmap}, "Did you mean A B C forty-one?"},
-		{"no title holds them", []dispatch.SearchHit{stateFile, roadmap}, noIssueFound},
+		{"no title holds them", []dispatch.SearchHit{stateFile, roadmap}, searchIsSlow},
 		{"the only title that holds them is past the fifth issue", []dispatch.SearchHit{
 			stateFile, roadmap,
 			{Kind: "issue", IssueKey: "ABC-1", Title: "Budget", Score: 0.01},

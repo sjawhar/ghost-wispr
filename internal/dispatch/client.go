@@ -336,7 +336,10 @@ func NormalizeIssueKey(key string) (string, error) {
 	return strings.ToUpper(key), nil
 }
 
-// get reads path into into. Its errors name route, never path.
+// get reads path into into. Its errors name route, never path. The status
+// is read before the body: an answer that is no success is an APIError even
+// when its body never comes (a 503 whose body stalls to the call's end), so
+// a refusal is never taken for an answer that did not come.
 func (c *Client) get(ctx context.Context, route, path string, params url.Values, into any) error {
 	target := c.base.JoinPath(path)
 	target.RawQuery = params.Encode()
@@ -351,17 +354,23 @@ func (c *Client) get(ctx context.Context, route, path string, params url.Values,
 		return fmt.Errorf("%w: %s: %w", ErrUnreachable, route, withoutURL(err))
 	}
 	defer func() { _ = response.Body.Close() }()
+	if response.StatusCode < 200 || response.StatusCode > 299 {
+		refused := &APIError{Status: response.StatusCode, Route: route}
+		// The code is read when the body comes; the status is the answer
+		// either way.
+		if body, err := io.ReadAll(io.LimitReader(response.Body, maxAnswerBytes)); err == nil {
+			var refusal struct {
+				Code  string `json:"code"`
+				Error string `json:"error"`
+			}
+			_ = json.Unmarshal(body, &refusal)
+			refused.Code, refused.Message = refusal.Code, refusal.Error
+		}
+		return refused
+	}
 	body, err := io.ReadAll(io.LimitReader(response.Body, maxAnswerBytes))
 	if err != nil {
 		return fmt.Errorf("%w: read the %s answer: %w", ErrUnreachable, route, withoutURL(err))
-	}
-	if response.StatusCode < 200 || response.StatusCode > 299 {
-		var refusal struct {
-			Code  string `json:"code"`
-			Error string `json:"error"`
-		}
-		_ = json.Unmarshal(body, &refusal)
-		return &APIError{Status: response.StatusCode, Code: refusal.Code, Message: refusal.Error, Route: route}
 	}
 	if err := json.Unmarshal(body, into); err != nil {
 		return fmt.Errorf("dispatch: decode the %s answer: %w", route, err)

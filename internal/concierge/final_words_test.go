@@ -152,7 +152,7 @@ func TestAnEmptyKeywordFallbackWaitsForTheFullSearch(t *testing.T) {
 			kw:          []dispatch.SearchHit{roadmap, budget},
 			fullDelay:   time.Hour,
 			searchBound: 3 * time.Second,
-			want:        []string{"Reading the record.", noIssueFound},
+			want:        []string{"Reading the record.", searchIsSlow},
 			tookAtLeast: 3 * time.Second,
 		},
 		{

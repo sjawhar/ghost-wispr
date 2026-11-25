@@ -346,3 +346,32 @@ func TestAnErrorNamesTheRouteNotTheKey(t *testing.T) {
 		t.Fatalf("an unreachable read of LAST-24 = %v", err)
 	}
 }
+
+// TestARefusalWhoseBodyStallsKeepsItsStatus (Sol's review of #194, R1): a
+// Dispatch that answers 503 and then holds the body refused the call; its
+// status says so before any body comes. At 0081b237 the client read the body
+// first, and a body that stalled to the call's end lost the status. It
+// fails there unless the error is the 503. A success whose body stalls is
+// the control: no status said no, so it is an answer that never came.
+func TestARefusalWhoseBodyStallsKeepsItsStatus(t *testing.T) {
+	for _, status := range []int{http.StatusServiceUnavailable, http.StatusOK} {
+		fake, client := newFakeDispatch(t)
+		fake.routes["/api/v1/search"] = func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(status)
+			w.(http.Flusher).Flush()
+			<-r.Context().Done()
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+		_, err := client.Search(ctx, "realtime voice", 5)
+		cancel()
+		var apiErr *APIError
+		refused := errors.As(err, &apiErr) && apiErr.Status == status
+		switch {
+		case status != http.StatusOK && !refused:
+			t.Errorf("a %d whose body stalls = %v, want the %d", status, err, status)
+		case status == http.StatusOK && (apiErr != nil || !errors.Is(err, ErrUnreachable)):
+			t.Errorf("control: a 200 whose body stalls = %v, want ErrUnreachable", err)
+		}
+	}
+}
