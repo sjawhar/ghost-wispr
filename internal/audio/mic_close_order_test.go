@@ -1,6 +1,7 @@
 package audio
 
 import (
+	"errors"
 	"io"
 	"sync"
 	"testing"
@@ -59,7 +60,10 @@ func TestMicCloseEndsAStreamThatBeganWhileCloseWaited(t *testing.T) {
 				_ = mic.Close() // ends a Stream the first Close missed
 				stream.abandon()
 				select {
-				case <-streamed:
+				case err := <-streamed:
+					if !errors.Is(err, errMicClosed) {
+						t.Errorf("Stream after Close = %v, want errMicClosed", err)
+					}
 				case <-time.After(time.Second):
 					t.Error("Stream still running after the cleanup's Close")
 				}

@@ -141,7 +141,12 @@ func (m *scriptedMic) capture(t *testing.T, chunk []byte) {
 		t.Fatal("timed out handing a chunk to the mic loop")
 	}
 	select {
-	case <-m.written:
+	case err := <-m.written:
+		// The write's result is the test's to check, not capture's: a
+		// closed gate, a paused light or a shutdown refuses it by design.
+		if err != nil {
+			t.Logf("the mic loop's write of a chunk was refused: %v", err)
+		}
 	case <-time.After(testWait):
 		t.Fatal("timed out waiting for the mic loop to write a chunk")
 	}

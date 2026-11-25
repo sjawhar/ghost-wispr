@@ -329,8 +329,8 @@ func TestTheFloorQueuesOtherSpeech(t *testing.T) {
 	free := make(chan error, 1)
 	go func() { free <- r.s.WithFloor(t.Context(), func() {}) }()
 	select {
-	case <-free:
-		t.Fatal("WithFloor returned while an exchange held the floor")
+	case err := <-free:
+		t.Fatalf("WithFloor returned (%v) while an exchange held the floor", err)
 	case <-time.After(100 * time.Millisecond):
 	}
 	waitSaid(t, sess)

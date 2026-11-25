@@ -273,7 +273,10 @@ func TestCloseStopsWaitingAtItsDeadlineWhileAResumeWriteWaits(t *testing.T) {
 			if held {
 				_ = conn.Close() // the resume write gets the connection now
 				select {
-				case <-saved:
+				case err := <-saved:
+					if err != nil {
+						t.Fatal(err)
+					}
 				case <-time.After(5 * time.Second):
 					t.Fatal("the resume write did not end")
 				}
