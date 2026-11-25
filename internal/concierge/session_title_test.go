@@ -2,10 +2,12 @@ package concierge
 
 import (
 	"encoding/json"
+	"math/rand/v2"
 	"slices"
 	"strings"
 	"testing"
 	"time"
+	"unicode"
 
 	"google.golang.org/genai"
 
@@ -173,11 +175,65 @@ func TestASessionNameIsItsWords(t *testing.T) {
 		{"- Worker", "INFRA-17", "Worker"},
 		{"· Worker ·", "INFRA-17", "Worker"},
 		{"-", "INFRA-17", ""},
+		// A run of separators and spaces is one boundary, at either end too
+		// (Sol's review of #198, round 2, O1).
+		{"- -", "INFRA-17", ""},
+		{"- - Worker", "INFRA-17", "Worker"},
+		{"Worker - -", "INFRA-17", "Worker"},
+		{"Worker - - notes", "INFRA-17", "Worker, notes"},
+		{"- - Worker - -", "INFRA-17", "Worker"},
+		{"Worker - · notes", "INFRA-17", "Worker, notes"},
+		{"Worker · - notes", "INFRA-17", "Worker, notes"},
+		{"Worker ·· | notes", "INFRA-17", "Worker, notes"},
+		{"Worker -- notes", "INFRA-17", "Worker, notes"},
+		{"Worker—notes", "INFRA-17", "Worker, notes"},
+		// Brackets the own key leaves empty go with it (Sol's round 2, I).
+		{"Worker (INFRA-17)", "INFRA-17", "Worker"},
+		{"Legion architect · (INFRA-17)", "INFRA-17", "its architect"},
+		{"Worker (INFRA-12) | reviewer", "INFRA-17", "Worker (INFRA-12), reviewer"},
 		{"INFRA-7", "INFRA-7", "its agent"},
 		{"", "INFRA-7", ""},
 	} {
 		if got := sessionName(tc.title, tc.key); got != tc.want {
 			t.Errorf("sessionName(%q, %q) = %q, want %q", tc.title, tc.key, got, tc.want)
+		}
+	}
+}
+
+// TestNoTitleSaysAMarkAlone (Sol's review of #198, round 2): for random
+// titles built from words, issue keys and separators, in any order and
+// spacing, sessionName's output holds no separator and no word made only of
+// punctuation ("-", "·", "()"), which the voice would read out. The seed is
+// fixed, so a failure repeats; it prints the title. It fails if a run of
+// separators, or a key in brackets, leaves a mark to say.
+func TestNoTitleSaysAMarkAlone(t *testing.T) {
+	words := []string{"Worker", "release", "notes", "Parser-evals", "night-shift", "(reviewer)", "OWNER:", "Legion", "architect", "merge", "queue", "🔑"}
+	keys := []string{"INFRA-17", "infra-17", "INFRA-17's", "(INFRA-17)", "[INFRA-17]", "INFRA-12", "INFRA-170", "XINFRA-17"}
+	separators := []string{"·", "•", "‧", "∙", "|", "—", "–", "-", "--", "- -", "· -"}
+	spaces := []string{"", " ", "  ", "\t"}
+	rng := rand.New(rand.NewPCG(194, 198))
+	for range 20000 {
+		var b strings.Builder
+		for n := rng.IntN(7); n >= 0; n-- {
+			switch rng.IntN(3) {
+			case 0:
+				b.WriteString(words[rng.IntN(len(words))])
+			case 1:
+				b.WriteString(keys[rng.IntN(len(keys))])
+			default:
+				b.WriteString(separators[rng.IntN(len(separators))])
+			}
+			b.WriteString(spaces[rng.IntN(len(spaces))])
+		}
+		title := b.String()
+		got := sessionName(title, "INFRA-17")
+		if strings.ContainsAny(got, "·•‧∙|—–") {
+			t.Fatalf("sessionName(%q) = %q, which holds a separator", title, got)
+		}
+		for _, word := range strings.FieldsFunc(got, func(r rune) bool { return r == ',' || unicode.IsSpace(r) }) {
+			if !strings.ContainsFunc(word, func(r rune) bool { return unicode.IsLetter(r) || unicode.IsDigit(r) }) {
+				t.Fatalf("sessionName(%q) = %q: %q is punctuation alone", title, got, word)
+			}
 		}
 	}
 }
