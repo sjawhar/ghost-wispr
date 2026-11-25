@@ -1174,15 +1174,45 @@ func (s *Supervisor) onTranscriptLocked(t *Transcript) {
 		return
 	}
 	if ex.drives && ex.answer == nil {
-		s.driverHeardLocked(ex, t, t.Text)
+		s.driverHeardLocked(ex, t, s.sinceWakeLocked(ex, t))
 	}
 	if !ex.answering && !ex.drives {
 		if !ex.stale(t) { // else a late result of a turn answered already
-			s.turnLocked(ex, t, t.Text)
+			s.turnLocked(ex, t, s.sinceWakeLocked(ex, t))
 		}
 		return
 	}
 	s.bargeInLocked(ex, t, now)
+}
+
+// sinceWakeLocked is t's words from the wake phrase on, for a turn that began
+// at one (turnByName) in a result that no longer holds it: Deepgram's final
+// sometimes drops the name, and sometimes writes a person's address in its
+// place ("Mister"), which is no name of Wispr's (transcript.Find). The words
+// before it are speech the room did not address to Wispr, and they went to
+// Dispatch's search, its embedding vendor and the model with the question
+// (Sol's review of #192). The wake's place is where an interim heard it
+// (wakeStart), within the slack a final may move it by. A result with no
+// word times, or none left at that place, is taken as it came.
+func (s *Supervisor) sinceWakeLocked(ex *exchange, t *Transcript) string {
+	if !ex.turnByName || len(t.Words) == 0 {
+		return t.Text
+	}
+	from := len(t.Words)
+	for i := range t.Words {
+		if t.Words[i].Start >= ex.wakeStart-finalMoves {
+			from = i
+			break
+		}
+	}
+	if from == 0 || from == len(t.Words) {
+		return t.Text
+	}
+	words := make([]string, 0, len(t.Words)-from)
+	for _, w := range t.Words[from:] {
+		words = append(words, w.Text)
+	}
+	return strings.Join(words, " ")
 }
 
 // driverHeardLocked takes words, of t, into the turn of ex, whose voice

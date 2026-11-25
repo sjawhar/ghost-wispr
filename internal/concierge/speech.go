@@ -2,6 +2,7 @@ package concierge
 
 import (
 	"regexp"
+	"slices"
 	"strings"
 	"unicode"
 	"unicode/utf8"
@@ -137,25 +138,37 @@ var possessiveKey = regexp.MustCompile(spokenKey.String() + `(?:['’]s\b)?`)
 
 // wakeNames are how a transcript writes the name in the wake phrase, as the
 // wake phrase's detector reads it (internal/wake/transcript), and
-// wakeOpeners the words a call may start with before it.
+// wakeOpeners the words a call may start with before it. misheardWake are
+// forms Deepgram wrote for the name that the detector refuses (the sound of
+// an ordinary word or a person's address), which a final the detector did
+// write a wake for can still carry into the turn (sinceWakeLocked); they
+// strip from the start of the question alone, where the wake sat.
 var (
-	wakeNames   = map[string]bool{"wispr": true, "whisper": true, "wisper": true, "whispr": true, "wispa": true, "whispa": true, "lispr": true}
-	wakeOpeners = map[string]bool{"hey": true, "hi": true, "ok": true, "okay": true, "so": true, "um": true, "uh": true, "and": true}
+	wakeNames    = map[string]bool{"wispr": true, "whisper": true, "wisper": true, "whispr": true, "wispa": true, "whispa": true, "lispr": true}
+	wakeOpeners  = map[string]bool{"hey": true, "hi": true, "ok": true, "okay": true, "so": true, "um": true, "uh": true, "and": true}
+	misheardWake = [][]string{{"miss", "burr"}, {"miss", "murray"}, {"mister"}}
 )
 
-// withoutWake is words, lower case and without punctuation, without the
-// wake phrase they open with, after at most one opener ("hey wispr"):
-// "wispr" or "ghost wispr", the name as Deepgram may spell it.
+// withoutWake is words, lower case and without punctuation, without the wake
+// phrase they open with, after at most one opener ("hey wispr"): "wispr" or
+// "ghost wispr", the name as Deepgram may spell it (wakeNames), or a form
+// the detector refuses that a final the detector did write a wake for still
+// carried into the turn (misheardWake).
 func withoutWake(words []string) []string {
 	rest := words
 	if len(rest) > 1 && wakeOpeners[rest[0]] {
 		rest = rest[1:]
 	}
-	switch {
-	case len(rest) > 1 && rest[0] == "ghost" && wakeNames[rest[1]]:
+	if len(rest) > 1 && rest[0] == "ghost" && wakeNames[rest[1]] {
 		return rest[2:]
-	case len(rest) > 0 && wakeNames[rest[0]]:
+	}
+	if len(rest) > 0 && wakeNames[rest[0]] {
 		return rest[1:]
+	}
+	for _, form := range misheardWake {
+		if len(rest) > len(form) && slices.Equal(rest[:len(form)], form) {
+			return rest[len(form):]
+		}
 	}
 	return words
 }

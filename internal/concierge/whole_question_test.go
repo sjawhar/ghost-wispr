@@ -676,3 +676,29 @@ func TestAnAnswerTakesNoReadOfTheAnswerBefore(t *testing.T) {
 		t.Errorf("ABC-12 read %d times, want the read-ahead's 2 and the second answer's 2", got)
 	}
 }
+
+// TestAMisheardNameOpeningTheTurnGoesWithTheWake (Sol's review of #192): a
+// turn sometimes opens with a form Deepgram wrote for the name that the
+// wake detector refuses — a person's address, which it never counts as a
+// call — because the final said so, but an interim named Wispr at that
+// place and the exchange took the turn (sinceWakeLocked). It fails if the
+// form stays in what the full search gets; the control shows the same form
+// inside the question stays.
+func TestAMisheardNameOpeningTheTurnGoesWithTheWake(t *testing.T) {
+	for _, tc := range []struct{ query, full string }{
+		{"Mister, what is happening with the realtime voice?", "what is happening with the realtime voice"},
+		{"Miss Burr, what is happening with the realtime voice?", "what is happening with the realtime voice"},
+		{"Miss Murray, what is happening with the realtime voice?", "what is happening with the realtime voice"},
+		// Control: the same words inside the question are not stripped.
+		{"what did Mister Lopez say about the realtime voice?", "what did mister lopez say about the realtime voice"},
+	} {
+		r := newRig(t)
+		r.run(t, "search_issues", map[string]string{"query": tc.query})
+		r.records.mu.Lock()
+		full := slices.Clone(r.records.queries)
+		r.records.mu.Unlock()
+		if !slices.Equal(full, []string{tc.full}) {
+			t.Errorf("search_issues(%q): full %q, want %q", tc.query, full, tc.full)
+		}
+	}
+}
