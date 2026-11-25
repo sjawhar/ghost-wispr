@@ -829,10 +829,10 @@ func TestBothSearchesHungIsAnOutage(t *testing.T) {
 	}
 }
 
-// TestAnUncountedReadAheadSearchIsCounted (R6): a read ahead of a key that
+// TestAKeyReadAheadMakesNoUncountedSearch (R6): a read ahead of a key that
 // names no issue reads the key alone and searches nothing uncounted, so the
 // answer's search and the model's are at most two in all.
-func TestAnUncountedReadAheadSearchIsCounted(t *testing.T) {
+func TestAKeyReadAheadMakesNoUncountedSearch(t *testing.T) {
 	r := newRig(t)
 	unclearSearch(r)
 	r.records.hits[0].Score = 0.012

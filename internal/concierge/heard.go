@@ -320,8 +320,8 @@ func searchTarget(target string) string {
 
 // keyRead is p's read ahead of keys, which reads them alone, and how it
 // ended: named, one of them named an issue; none, each named none. Both are
-// false while it runs, and when it failed or was stopped: then the keys are
-// read again. c.mu is held.
+// false while it runs, and when it failed, was stopped or was taken by an
+// answer (spent): then the answer reads the keys again. c.mu is held.
 func (p *prefetch) keyRead(keys string) (r *read, named, none bool) {
 	r = p.reads["keys:"+keys]
 	if r == nil || !ended(r) {
@@ -394,18 +394,19 @@ func (c *Concierge) Heard(ctx context.Context, x *voice.Exchange, words string) 
 	// The read ahead of keys reads them alone, once (found in review on
 	// 2026-11-24): the target holds the turn's search, which each word
 	// changes, and a key read's search of the words said so far went
-	// uncounted. While the keys are read, or once one named its issue, later
-	// words start no read. Once each named none, they are the turn's search
-	// alone, which waits for its words to settle and counts as the
-	// read-ahead's one.
+	// uncounted. Once the keys were read, under way, named an issue, failed
+	// (the answer reads them again) or were taken by an answer, later words
+	// start no read of them. Once each named none, the later words are the
+	// turn's search alone, which waits for its words to settle and counts as
+	// the read-ahead's one.
 	if keys := keysOf(target); keys != "" {
-		r, named, none := p.keyRead(keys)
+		r, _, none := p.keyRead(keys)
 		question, _ := searchOf(target)
 		switch {
-		case named, none && question == "", r != nil && !ended(r):
-			return
-		case none:
+		case none && question != "":
 			target = searchTarget(target)
+		case r != nil:
+			return
 		default:
 			target = "keys:" + keys
 		}
@@ -454,8 +455,8 @@ func (c *Concierge) Heard(ctx context.Context, x *voice.Exchange, words string) 
 		}
 		found := c.readRecord(readCtx, &exchange, view, words, target, r.heldBy, r.cut)
 		if readCtx.Err() == nil {
-			// Only a counted search is the read-ahead's: a key that names no
-			// issue searches too, uncounted, and the answer counts it.
+			// Only a counted search is the read-ahead's: a read of keys
+			// alone searches nothing.
 			found.ahead = search
 			r.found, r.complete = found, true
 		}
@@ -502,8 +503,12 @@ func (c *Concierge) readFor(ctx context.Context, x *voice.Exchange, view project
 	searchAgain, sameTerms := false, false
 	aheadWords, finalWords, held := 0, 0, 0
 	if p := c.prefetchLocked(x); p != nil {
+		keys := keysOf(target)
 		pending, target = p.aheadFor(target)
-		if pending == nil && asked != "" {
+		// The unit's own transcript stands in for the vendor's wording when
+		// both name the same keys, or the wording names none: a key the
+		// vendor heard otherwise is read as it heard it.
+		if pending == nil && asked != "" && (keys == "" || keysOf(asked) == keys) {
 			pending, _ = p.aheadFor(asked)
 		}
 		if pending == nil {
