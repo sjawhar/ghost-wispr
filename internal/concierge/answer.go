@@ -900,13 +900,13 @@ func (c *Concierge) facts(ctx context.Context, tools *runner, view projectsView,
 		note := ""
 		if heard := sp.said(); len(heard) > 0 {
 			// Named one a line, each said once: the model's next try says
-			// what they leave out, not them in other words (heardAgain).
+			// what they leave out, not them in other words, which no check
+			// of words can tell from a new fact (saidBefore).
 			note += "\n\nAlready said to the room, one a line. Say none of them again, in these words or in others:\n- " + strings.Join(heard, "\n- ") + "\n"
 		}
 		if reason != "" {
 			note += "\n\nYour last answer failed R8's check: " + reason + ". Answer again from the record only, in the form asked."
 		}
-		said.retry = try > 1
 		err := c.generate(ctx, tools, prompt+note, said, &budget)
 		var invented *inventedError
 		if !errors.As(err, &invented) {
@@ -1415,9 +1415,6 @@ type sentences struct {
 	pending     strings.Builder
 	// spoken and words count the sentences and words said.
 	spoken, words int
-	// retry: the model writes again after a try that failed R8's check, and
-	// may say again what that try said (heardAgain).
-	retry bool
 }
 
 func (s *sentences) add(ctx context.Context, text string) error {
@@ -1456,16 +1453,8 @@ func (s *sentences) speak(ctx context.Context, sentence string) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	// A sentence the room heard word for word is not said again. A retry
-	// may also say again, as a clause of its own, what its first try said
-	// (heardAgain); a first try's sentences are all said.
-	heard := s.sp.said()
-	for _, line := range heard {
-		if strings.EqualFold(strings.TrimSpace(line), sentence) {
-			return nil
-		}
-	}
-	if s.retry && heardAgain(sentence, heard) {
+	// A retry may start with a sentence the room already heard (saidBefore).
+	if saidBefore(sentence, s.sp.said()) {
 		return nil
 	}
 	words := len(strings.Fields(sentence))
@@ -1489,62 +1478,18 @@ func (s *sentences) speak(ctx context.Context, sentence string) error {
 	return nil
 }
 
-// heardWord is a word of a sentence as heardAgain reads it: lower case, with
-// the punctuation around it gone and the hyphen or apostrophe inside it kept
-// ("abc-12", "infra-7's"); stop: a full stop, a question or an exclamation
-// mark ended a sentence at it.
-type heardWord struct {
-	word string
-	stop bool
-}
-
-// heardWords is text's words, each one kept, in order (heardWord).
-func heardWords(text string) []heardWord {
-	notWord := func(r rune) bool { return !unicode.IsLetter(r) && !unicode.IsDigit(r) }
-	var words []heardWord
-	for _, field := range strings.Fields(strings.ToLower(strings.ReplaceAll(text, "’", "'"))) {
-		if word := strings.TrimFunc(field, notWord); word != "" {
-			words = append(words, heardWord{word: word, stop: strings.ContainsAny(field[len(strings.TrimRightFunc(field, notWord)):], ".!?")})
-		}
-	}
-	return words
-}
-
-// clauseJoiners join two clauses of a sentence, each a sentence of its own:
-// "ABC-12 is in progress and PR 80 is in review."
-var clauseJoiners = set([]string{"and", "but", "so"})
-
-// heardAgain reports whether sentence, a retry's, is a clause the room
-// heard: its words, every one of them in order (heardWords), are a run of a
-// text of heard that stands as a sentence there. The run starts a sentence
-// of that text or follows a word that joins clauses (clauseJoiners), and it
-// ends that sentence or comes before such a word. Live on 2026-11-25 a retry
-// said its first try's sentence again.
-//
-// The check errs toward a repeat, never toward a fact unsaid. A word added,
-// gone or in another place makes a sentence new ("XYZ-7 blocks ABC-12."
-// after "ABC-12 blocks XYZ-7.", "It is done." after "It is not done."), and
-// so does a run that stands under other words: "ABC-12 is done." after
-// "Nobody said ABC-12 is done.", "If PR 80 merges, ABC-12 is done." or
-// "ABC-12 is done, if PR 80 merges.". A repeat in other words ("INFRA-7 is in
-// todo status with priority P1, updated two days ago." after "…, and was
-// updated two days ago.") is said too: the retry's prompt asks the model to
-// say none of those again.
-func heardAgain(sentence string, heard []string) bool {
-	words := heardWords(sentence)
-	if len(words) == 0 {
-		return false
-	}
-	for _, line := range heard {
-		said := heardWords(line)
-		for at := 0; at+len(words) <= len(said); at++ {
-			end := at + len(words)
-			starts := at == 0 || said[at-1].stop || clauseJoiners[said[at-1].word]
-			ends := end == len(said) || said[end-1].stop || clauseJoiners[said[end].word]
-			if starts && ends && slices.EqualFunc(said[at:end], words, func(a, b heardWord) bool { return a.word == b.word }) {
-				return true
-			}
-		}
-	}
-	return false
+// saidBefore reports whether sentence is one of heard word for word, with its
+// punctuation, in any case or spacing: a retry may begin with the sentence
+// its first try said. Nothing short of that is dropped: a part of a heard
+// sentence, its words in another order or with other punctuation can each
+// say something new ("XYZ-7 is done." after "Sam said ABC-12 is open and
+// XYZ-7 is done.", "No, tests failed." after "No tests failed.", "XYZ-7 is
+// done." after "XYZ-7 is done?"; Sol's reviews of #197). A repeat in other
+// words is said, if the model writes it though the retry's prompt names each
+// sentence the room heard and asks for none of them again (facts).
+func saidBefore(sentence string, heard []string) bool {
+	sentence = strings.Join(strings.Fields(sentence), " ")
+	return slices.ContainsFunc(heard, func(line string) bool {
+		return strings.EqualFold(strings.Join(strings.Fields(line), " "), sentence)
+	})
 }

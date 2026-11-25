@@ -38,37 +38,35 @@ func texts(spoken []said) []string {
 	return out
 }
 
-// TestARetryDropsAClauseTheRoomHeard (live on 2026-11-25): a sentence failed
-// R8's check, the model wrote again, and the retry said again what the
-// first try had said. A retry's sentence is dropped when its words, in
-// order and every one, are a clause of a sentence the room heard: the whole
-// sentence again, punctuation aside, or a clause of it. The retry's new
+// TestARetryDropsASentenceSaidWordForWord: a sentence failed R8's check, the
+// model wrote again, and the retry began with the sentence the first try had
+// said. It is dropped, in another case or spacing too, and the retry's new
 // sentence is said.
-func TestARetryDropsAClauseTheRoomHeard(t *testing.T) {
+func TestARetryDropsASentenceSaidWordForWord(t *testing.T) {
 	const heard = "ABC-12 is in progress, and PR 80 is in review."
-	for _, again := range []string{
-		"ABC-12 is in progress and PR 80 is in review.",
-		"PR 80 is in review.",
-		"ABC-12 is in progress.",
-	} {
+	for _, again := range []string{heard, "abc-12 is in progress,  and PR 80 is in review."} {
 		r := retryRig(t, []string{heard, "Its title is Realtime voice."}, heard, again+" Its title is Realtime voice.")
 		spoken := texts(answerTurn(t, r, "what is happening with ABC-12"))
-		if slices.Contains(spoken, again) || !slices.Contains(spoken, heard) || !slices.Contains(spoken, "Its title is Realtime voice.") {
-			t.Errorf("after %q, a retry of %q spoke %q; want it dropped and the new sentence said", heard, again, spoken)
+		if n := len(slices.DeleteFunc(slices.Clone(spoken), func(s string) bool { return !strings.EqualFold(s, heard) })); n != 1 || !slices.Contains(spoken, "Its title is Realtime voice.") {
+			t.Errorf("after %q, a retry of %q spoke %q; want it once and the new sentence said", heard, again, spoken)
 		}
 	}
 }
 
-// TestARetryKeepsWhatChangesMeaning (Sol's review of #197 at 0b9cb31): a
-// retry's sentence whose words a heard sentence holds, in another order or
-// with a word added, removed or changed, can say something new: the other
-// way round, a negation gone, another tense, another key. 0b9cb31 dropped
-// it, reading a sentence as its set of words. It fails unless each is said.
+// TestARetryKeepsWhatChangesMeaning (Sol's reviews of #197 at 0b9cb31 and
+// 7791198): a retry's sentence that is not a sentence the room heard, word
+// for word with its punctuation, is said, though its words are a heard
+// sentence's in another order, a part of one, or the same words with other
+// punctuation: each can say something new. 0b9cb31 read a sentence as its set
+// of words, and 7791198 as a clause of a heard sentence with its punctuation
+// gone; each dropped some of these. It fails unless each is said.
 func TestARetryKeepsWhatChangesMeaning(t *testing.T) {
 	for _, tc := range []struct {
 		heard []string
 		next  string
 	}{
+		// Sol's first review: the words in another order, added, gone or
+		// changed.
 		{[]string{"ABC-12 blocks XYZ-7."}, "XYZ-7 blocks ABC-12."},
 		{[]string{"It is not done."}, "It is done."},
 		{[]string{"It is done."}, "It is not done."},
@@ -80,6 +78,19 @@ func TestARetryKeepsWhatChangesMeaning(t *testing.T) {
 		{[]string{"PR 80 is merged.", "ABC-12 is done."}, "PR 80 is merged and ABC-12 is done."},
 		{[]string{"PR 80 is in review."}, "It is in review."},
 		{[]string{"ABC-12 is in progress, and PR 80 is in review."}, "PR 80 is in review, and ABC-12 is in progress."},
+		// Sol's second review: a clause under a report, a condition, a
+		// checklist or a negation is no fact the room heard asserted.
+		{[]string{"Sam said ABC-12 is open and XYZ-7 is done."}, "XYZ-7 is done."},
+		{[]string{"If PR 80 merges then ABC-12 is open and XYZ-7 is done."}, "XYZ-7 is done."},
+		{[]string{"Checks to make: ABC-12 is open and XYZ-7 is done."}, "XYZ-7 is done."},
+		{[]string{"Nobody said ABC-12 is open and XYZ-7 is done."}, "XYZ-7 is done."},
+		{[]string{"ABC-12 is open and XYZ-7 is done if PR 80 merges."}, "ABC-12 is open."},
+		// Sol's second review: punctuation that changes the assertion.
+		{[]string{"No tests failed."}, "No, tests failed."},
+		{[]string{"XYZ-7 is done?"}, "XYZ-7 is done."},
+		// A clause of a heard sentence, or the same words with a comma gone.
+		{[]string{"ABC-12 is in progress, and PR 80 is in review."}, "PR 80 is in review."},
+		{[]string{"ABC-12 is in progress, and PR 80 is in review."}, "ABC-12 is in progress and PR 80 is in review."},
 	} {
 		r := retryRig(t, append(slices.Clone(tc.heard), tc.next), strings.Join(tc.heard, " "), tc.next)
 		if spoken := texts(answerTurn(t, r, "what is happening with ABC-12")); !slices.Contains(spoken, tc.next) {
@@ -89,8 +100,7 @@ func TestARetryKeepsWhatChangesMeaning(t *testing.T) {
 }
 
 // TestAFirstAttemptIsNotFiltered (Sol's review of #197): a first try's
-// sentences are all said, whatever the room heard before them in other
-// words. Only a retry can say again what its first try said. 0b9cb31
+// sentences are all said but one the room heard word for word. 0b9cb31
 // dropped "XYZ-7 blocks ABC-12." after "ABC-12 blocks XYZ-7." in one try.
 func TestAFirstAttemptIsNotFiltered(t *testing.T) {
 	for _, answer := range [][]string{
@@ -116,8 +126,8 @@ func TestAFirstAttemptIsNotFiltered(t *testing.T) {
 
 // TestARetryIsToldWhatTheRoomHeard: a retry's prompt names each sentence
 // the room already heard and asks for none of them again, so the model
-// says no repeat in other words, which no check of words can tell from a
-// new fact. It fails at 0b9cb31, whose prompt ran the sentences together
+// says no repeat in other words, which only a sentence said word for word is
+// dropped as. It fails at 0b9cb31, whose prompt ran the sentences together
 // and asked nothing of them.
 func TestARetryIsToldWhatTheRoomHeard(t *testing.T) {
 	const heard = "ABC-12 is in progress, and PR 80 is in review."
@@ -131,51 +141,22 @@ func TestARetryIsToldWhatTheRoomHeard(t *testing.T) {
 	}
 }
 
-// TestAHeardClauseIsOnlyARunOfItsWords: heardAgain's table. A sentence is
-// heard again only when its words, lower case, punctuation aside and every
-// word kept, in order, are a run of a text the room heard that stands as a
-// sentence there: it starts a sentence of that text or follows "and", "but"
-// or "so", and ends that sentence or comes before one of them. Sol's cases
-// of a changed meaning are each new; so is a run under other words ("Nobody
-// said ABC-12 is done.", "If PR 80 merges, ABC-12 is done."), and a repeat
-// in other words, which the retry's prompt asks the model not to say.
-func TestAHeardClauseIsOnlyARunOfItsWords(t *testing.T) {
-	for _, tc := range []struct {
-		heard  []string
-		next   string
-		repeat bool
-	}{
-		{[]string{"PR 80 is in review."}, "PR 80 is in review.", true},
-		{[]string{"ABC-12 is in progress, and PR 80 is in review."}, "ABC-12 is in progress and PR 80 is in review.", true},
-		{[]string{"ABC-12 is in progress, and PR 80 is in review."}, "PR 80 is in review.", true},
-		{[]string{"ABC-12 is in progress and PR 80 is in review."}, "ABC-12 is in progress.", true},
-		{[]string{"PR 80 merged, but ABC-12 is open."}, "ABC-12 is open.", true},
-		{[]string{"I asked the agent on ABC-12. Its answer usually comes within a minute, with a chime."}, "Its answer usually comes within a minute, with a chime.", true},
-		{[]string{"Reading the record.", "It is in review."}, "it is in review", true},
-		{[]string{"PR 80 is in review."}, "PR 80 is merged.", false},
-		{[]string{"It is done."}, "It is not done.", false},
-		{[]string{"It is not done."}, "It is done.", false},
-		{[]string{"PR 80 is in review."}, "PR 81 is in review.", false},
-		{[]string{"Alex owns ABC-12."}, "Sam owns ABC-12.", false},
-		{[]string{"ABC-12 blocks XYZ-7."}, "XYZ-7 blocks ABC-12.", false},
-		{[]string{"PR 80 is merged.", "ABC-12 is done."}, "PR 80 is merged and ABC-12 is done.", false},
-		{[]string{"PR 80 was in review."}, "PR 80 is in review.", false},
-		{[]string{"PR 80 is merged and PR 81 is in review."}, "PR 80 is in review.", false},
-		{[]string{"PR 80 blocks PR 81."}, "PR 81 blocks PR 80.", false},
-		{[]string{"ABC-12 blocks XYZ-7."}, "ABC-7 blocks XYZ-12.", false},
-		{[]string{"Alex asked Sam."}, "Sam asked Alex.", false},
-		{[]string{"PR 80 is in review."}, "It is in review.", false},
-		{[]string{"PR 80 is in review."}, "This is in review.", false},
-		{[]string{"Nobody said ABC-12 is done."}, "ABC-12 is done.", false},
-		{[]string{"ABC-12 is done if PR 80 merges."}, "ABC-12 is done.", false},
-		{[]string{"If PR 80 merges, ABC-12 is done."}, "ABC-12 is done.", false},
-		{[]string{"ABC-12 is done, if PR 80 merges."}, "ABC-12 is done.", false},
-		{[]string{"Yes, PR 80 merged the tap."}, "Yes.", false},
-		{[]string{"ABC-12 is in progress, and PR 80 is in review."}, "PR 80 is in review, and ABC-12 is in progress.", false},
-		{[]string{"INFRA-7 is in todo status with priority P1, and was updated two days ago."}, "INFRA-7 is in todo status with priority P1, updated two days ago.", false},
+// TestASentenceSaidAgainIsWordForWord: saidBefore's table. A sentence is
+// said again only when it is a sentence the room heard, word for word with
+// its punctuation, in any case or spacing.
+func TestASentenceSaidAgainIsWordForWord(t *testing.T) {
+	heard := []string{"Reading the record.", "PR 80 is in review."}
+	for sentence, want := range map[string]bool{
+		"PR 80 is in review.":    true,
+		"pr 80  is in review.":   true,
+		" PR 80 is in review. ":  true,
+		"PR 80 is in review?":    false,
+		"PR 80 is in review":     false,
+		"PR 80 is in review, it": false,
+		"It is in review.":       false,
 	} {
-		if got := heardAgain(tc.next, tc.heard); got != tc.repeat {
-			t.Errorf("after %q, heardAgain(%q) = %v, want %v", tc.heard, tc.next, got, tc.repeat)
+		if got := saidBefore(sentence, heard); got != want {
+			t.Errorf("after %q, saidBefore(%q) = %v, want %v", heard, sentence, got, want)
 		}
 	}
 }
