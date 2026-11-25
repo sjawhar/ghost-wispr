@@ -29,7 +29,8 @@ func spokenName(name string) string {
 }
 
 // searchStopwords are the words of a spoken question that name no work:
-// function words, question words, the wake word and talk about status.
+// function words, question words, the wake name as Deepgram spells it
+// (internal/wake/transcript) and talk about status.
 var searchStopwords = map[string]bool{}
 
 func init() {
@@ -39,7 +40,7 @@ func init() {
 		i me my mine we us our ours you your yours he him his she her hers it its they them their theirs this that these those there here
 		what whats who whom whose which where when why how whether if then than so just also too very really quite any some all each every
 		not no yes ok okay right well um uh oh hey hi hello please thanks thank tell say said ask asked know knew think thought see look find
-		wispr whisper ghost agent agents issue issues ticket tickets thing things stuff work working worked works job task tasks
+		wispr whisper wisper whispr wispa whispa lispr ghost agent agents issue issues ticket tickets thing things stuff work working worked works job task tasks
 		happening happen happened happens going go goes gone get got status update updates updated latest new news progress
 		change changes changed changing ready
 		now today yesterday tomorrow yet still again ever last next first days day weeks week hours hour minutes minute time
@@ -84,8 +85,7 @@ func searchTerms(words string) string {
 // five words that name work and 5 of 10 for all of them; a key in it put the
 // issue meant second.
 func (v projectsView) searchQuestion(words string) string {
-	terms := searchTerms(words)
-	if terms == "" {
+	if searchTerms(words) == "" {
 		return ""
 	}
 	text := possessiveKey.ReplaceAllStringFunc(spokenKeys(spelledOut(words)), func(key string) string {
@@ -105,12 +105,7 @@ func (v projectsView) searchQuestion(words string) string {
 			question = append(question, word)
 		}
 	}
-	if question = withoutWake(question); len(question) == 0 {
-		// Its one word that names work was a spelling of the wake name
-		// ("Wispa?"): Dispatch refuses an empty search with a 400.
-		return terms
-	}
-	return strings.Join(question, " ")
+	return strings.Join(withoutWake(question), " ")
 }
 
 // maxSearchLength is the most Dispatch searches: it refuses a query of more

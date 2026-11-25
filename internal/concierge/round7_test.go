@@ -829,16 +829,17 @@ func TestBothSearchesHungIsAnOutage(t *testing.T) {
 	}
 }
 
-// TestAnUncountedReadAheadSearchIsCounted (R6): a read-ahead of a key that
-// names no issue searches the turn's words; that search counts toward the
-// answer's two like any other.
+// TestAnUncountedReadAheadSearchIsCounted (R6): a read ahead of a key that
+// names no issue reads the key alone and searches nothing uncounted, so the
+// answer's search and the model's are at most two in all.
 func TestAnUncountedReadAheadSearchIsCounted(t *testing.T) {
 	r := newRig(t)
 	unclearSearch(r)
 	r.records.hits[0].Score = 0.012
 	const turn = "what about abc 99 and the realtime voice"
 	r.concierge.Heard(context.Background(), &r.exchange, turn)
-	eventually(t, "the read-ahead searched", func() bool { return len(r.records.searches()) == 1 })
+	eventually(t, "the read-ahead read the key", func() bool { return slices.Contains(r.records.calls(), "ABC-99") })
+	time.Sleep(100 * time.Millisecond)
 	search := func(id string) []*genai.GenerateContentResponse {
 		return []*genai.GenerateContentResponse{chunk(call(id, "search_issues", map[string]any{"query": "wake word " + id}, ""))}
 	}

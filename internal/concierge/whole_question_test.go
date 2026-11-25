@@ -295,7 +295,8 @@ func TestAKeyReadThatNamedTheIssueIsReused(t *testing.T) {
 		r := newRig(t)
 		voiceIssue(r)
 		r.concierge.Heard(context.Background(), &r.exchange, "what about ABC-99 on the realtime voice")
-		eventually(t, "the search of the key's words", func() bool { return len(r.records.searches()) == 1 })
+		eventually(t, "the read of ABC-99", func() bool { return keyReads(r, "ABC-99") >= 1 })
+		time.Sleep(100 * time.Millisecond)
 		r.model.turns = [][]*genai.GenerateContentResponse{{chunk(text("ABC-12 is in progress."))}}
 		answerTurn(t, r, "what about ABC-99 on the realtime voice rollout")
 		if got := r.records.searches(); !slices.Contains(got, "what about on the realtime voice rollout") {
@@ -420,11 +421,13 @@ func TestAKeyReadIsNotStartedAgainWhileItRuns(t *testing.T) {
 	}
 }
 
-// TestAKeyThatNamesNoIssueIsReadOnce (found in review on 2026-11-24): once
-// a key's read found no issue, the turn's later words are its search, which
-// waits for its words to settle and counts as the read-ahead's one. It fails
-// if the key is read again for each word, or the answer reads it again, or
-// does not search the final turn's question.
+// TestAKeyThatNamesNoIssueIsReadOnce (found in review on 2026-11-24): the
+// read ahead of a key reads the key alone, once; once it named no issue, the
+// turn's later words are its search, which waits for its words to settle and
+// counts as the read-ahead's one (R6: two searches in all with the answer's).
+// It fails if the key is read again for each word or in the answer, if the
+// read-ahead searches more than once, or if the answer does not search the
+// final turn's question.
 func TestAKeyThatNamesNoIssueIsReadOnce(t *testing.T) {
 	r := newRig(t)
 	voiceIssue(r)
@@ -433,18 +436,118 @@ func TestAKeyThatNamesNoIssueIsReadOnce(t *testing.T) {
 		return len(slices.DeleteFunc(r.records.calls(), func(k string) bool { return k != "ABC-99" }))
 	}
 	r.concierge.Heard(context.Background(), &r.exchange, "what about ABC-99 on the realtime voice")
-	eventually(t, "the key's read searched", func() bool { return len(r.records.searches()) == 1 })
-	time.Sleep(50 * time.Millisecond)
+	eventually(t, "the key's read", func() bool { return reads() >= 1 })
+	time.Sleep(100 * time.Millisecond)
 	first := reads()
+	if searched := r.records.searches(); len(searched) != 0 {
+		t.Fatalf("the key's read searched %q; want the key read alone", searched)
+	}
 	r.concierge.Heard(context.Background(), &r.exchange, "what about ABC-99 on the realtime voice rollout")
-	eventually(t, "the later words searched", func() bool { return len(r.records.searches()) == 2 })
+	eventually(t, "the later words searched", func() bool { return len(r.records.searches()) == 1 })
 	r.concierge.Heard(context.Background(), &r.exchange, "what about ABC-99 on the realtime voice rollout today")
 	time.Sleep(150 * time.Millisecond)
 	r.model.turns = [][]*genai.GenerateContentResponse{{chunk(text("ABC-12 is in progress."))}}
 	answerTurn(t, r, "what about ABC-99 on the realtime voice rollout today")
 	searches := r.records.searches()
-	if got := reads(); got != first || len(searches) != 3 || searches[2] != "what about on the realtime voice rollout today" {
-		t.Errorf("ABC-99 read %d times (first read %d), full searches %q; want no more reads and the final question searched last", got, first, searches)
+	if got := reads(); got != first || len(searches) != 2 || searches[1] != "what about on the realtime voice rollout today" {
+		t.Errorf("ABC-99 read %d times (first read %d), full searches %q; want no more reads and two searches, the final question last", got, first, searches)
+	}
+}
+
+// TestAFailedKeyReadIsReadAgain (found in review on 2026-11-24): a key's read
+// that Dispatch did not answer found no issue only because it failed. It
+// fails if the answer then searches in place of reading the key again.
+func TestAFailedKeyReadIsReadAgain(t *testing.T) {
+	r := newRig(t)
+	voiceIssue(r)
+	r.records.mu.Lock()
+	r.records.err = fmt.Errorf("%w: dial tcp: connection refused", dispatch.ErrUnreachable)
+	r.records.mu.Unlock()
+	reads := func() int {
+		return len(slices.DeleteFunc(r.records.calls(), func(k string) bool { return k != "ABC-12" }))
+	}
+	r.concierge.Heard(context.Background(), &r.exchange, "what about ABC-12 on the realtime voice")
+	eventually(t, "the failed read of ABC-12", func() bool { return reads() >= 1 })
+	time.Sleep(100 * time.Millisecond)
+	failed := reads()
+	r.records.mu.Lock()
+	r.records.err = nil
+	r.records.mu.Unlock()
+	r.model.turns = [][]*genai.GenerateContentResponse{{chunk(text("ABC-12 is in progress."))}}
+	spoken := answerTurn(t, r, "what about ABC-12 on the realtime voice today")
+	if got, searched := reads(), r.records.searches(); got <= failed || len(searched) != 0 || len(spoken) == 0 || !strings.HasPrefix(spoken[0].text, "ABC-12") {
+		t.Errorf("ABC-12 read %d times (%d before), searches %q, spoken %+v; want the key read again and answered, no search", got, failed, searched, spoken)
+	}
+}
+
+// TestAnAnswerWaitsForTheKeyReadUnderWay (found in review on 2026-11-24): a
+// final turn that comes while the read ahead of its key still runs waits for
+// that read. It fails if the answer reads the key again, or searches.
+func TestAnAnswerWaitsForTheKeyReadUnderWay(t *testing.T) {
+	r := newRig(t)
+	voiceIssue(r)
+	release := make(chan struct{})
+	r.records.mu.Lock()
+	r.records.block, r.records.blockKey = release, "ABC-12"
+	r.records.mu.Unlock()
+	reads := func() int {
+		return len(slices.DeleteFunc(r.records.calls(), func(k string) bool { return k != "ABC-12" }))
+	}
+	r.concierge.Heard(context.Background(), &r.exchange, "what about ABC-12 on the realtime voice")
+	eventually(t, "the read of ABC-12 and its holder", func() bool { return reads() == 2 })
+	go func() {
+		time.Sleep(200 * time.Millisecond)
+		close(release)
+	}()
+	r.model.turns = [][]*genai.GenerateContentResponse{{chunk(text("ABC-12 is in progress."))}}
+	answerTurn(t, r, "what about ABC-12 on the realtime voice rollout today")
+	if got, searched := reads(), len(r.records.searches()); got != 2 || searched != 0 {
+		t.Errorf("ABC-12 read %d times, %d searches; want the read-ahead's read alone", got, searched)
+	}
+}
+
+// TestAVendorsWordingTakesTheUnitsKeyRead (found in review on 2026-11-24):
+// the unit's own transcript of the turn named a key whose read named its
+// issue; a vendor's wording that leaves the key out takes that read. It fails
+// if the answer searches or reads the key again.
+func TestAVendorsWordingTakesTheUnitsKeyRead(t *testing.T) {
+	const unit = "what about ABC-12 on the realtime voice"
+	r := newRig(t)
+	voiceIssue(r)
+	r.exchange.AskerTurn = unit
+	reads := func() int {
+		return len(slices.DeleteFunc(r.records.calls(), func(k string) bool { return k != "ABC-12" }))
+	}
+	r.concierge.Heard(context.Background(), &r.exchange, "what about ABC-12")
+	eventually(t, "the read of ABC-12", func() bool { return reads() >= 2 })
+	time.Sleep(100 * time.Millisecond)
+	r.concierge.Heard(context.Background(), &r.exchange, unit)
+	time.Sleep(50 * time.Millisecond)
+	r.model.turns = [][]*genai.GenerateContentResponse{{chunk(text("ABC-12 is in progress."))}}
+	answerTurn(t, r, "What's happening with the real-time voice?")
+	if got, searched := reads(), len(r.records.searches()); got != 2 || searched != 0 {
+		t.Errorf("ABC-12 read %d times, %d searches; want the read-ahead's read alone", got, searched)
+	}
+}
+
+// TestTheWordsAnAnswerTookAreNotReadAhead (found in review on 2026-11-24):
+// voices B and C tell the Concierge the unit's final words while it answers.
+// It fails if words an answer already took start a search once that answer
+// took its reading: no one uses it, and it spends the next turn's one.
+func TestTheWordsAnAnswerTookAreNotReadAhead(t *testing.T) {
+	const turn = "what is happening with the realtime voice"
+	r := newRig(t)
+	r.concierge.searchSettle = 50 * time.Millisecond
+	unclearSearch(r)
+	r.records.hits[0].Score = 0.012
+	r.concierge.Heard(context.Background(), &r.exchange, turn)
+	eventually(t, "the read-ahead searched", func() bool { return len(r.records.searches()) == 1 })
+	r.model.turns = [][]*genai.GenerateContentResponse{{chunk(text("PR 80 is in review."))}}
+	answerTurn(t, r, turn)
+	r.concierge.Heard(context.Background(), &r.exchange, turn)
+	time.Sleep(200 * time.Millisecond)
+	if got := r.records.searches(); len(got) != 1 {
+		t.Errorf("full searches %q, want the read-ahead's alone", got)
 	}
 }
 
@@ -470,27 +573,29 @@ func TestAStaleReadAheadDoesNotSearchAfterTheAnswerStarts(t *testing.T) {
 
 // TestASearchKeepsWithinDispatchsLimits: Dispatch refuses a search of fewer
 // than 2 or more than 1000 characters with a 400, which the room would hear
-// as Dispatch out of reach. It fails if a question with no word left after
-// the wake phrase's spellings is sent as empty, or a search is sent more
-// than 1000 characters or cut inside a word.
+// as Dispatch out of reach. It fails if a question whose only words are the
+// wake name, as Deepgram spells it, and words of no work is searched, or a
+// search is sent more than 1000 characters or cut inside a word.
 func TestASearchKeepsWithinDispatchsLimits(t *testing.T) {
-	r := newRig(t)
-	r.run(t, "search_issues", map[string]string{"query": "Wispa?"})
-	r.records.mu.Lock()
-	full, kw := slices.Clone(r.records.queries), slices.Clone(r.records.kwQueries)
-	r.records.mu.Unlock()
-	if !slices.Equal(full, []string{"wispa"}) || !slices.Equal(kw, []string{"wispa"}) {
-		t.Errorf("full %q, keyword %q; want [wispa] for both", full, kw)
+	for _, query := range []string{"Wispa?", "Lispr, are you there?", "wisper a"} {
+		r := newRig(t)
+		result := r.run(t, "search_issues", map[string]string{"query": query})
+		r.records.mu.Lock()
+		searched := len(r.records.queries) + len(r.records.kwQueries)
+		r.records.mu.Unlock()
+		if result["error"] == nil || searched != 0 {
+			t.Errorf("%q: %v, %d searches; want none, and the model told to say what to search", query, result, searched)
+		}
 	}
 	words := make([]string, 120)
 	for i := range words {
 		words[i] = fmt.Sprintf("workword%03d", i)
 	}
 	long := strings.Join(words, " ")
-	r = newRig(t)
+	r := newRig(t)
 	r.run(t, "search_issues", map[string]string{"query": long})
 	r.records.mu.Lock()
-	full, kw = slices.Clone(r.records.queries), slices.Clone(r.records.kwQueries)
+	full, kw := slices.Clone(r.records.queries), slices.Clone(r.records.kwQueries)
 	r.records.mu.Unlock()
 	for _, sent := range append(full, kw...) {
 		if len(sent) > 1000 || !strings.HasPrefix(long, sent+" ") {
