@@ -24,9 +24,9 @@ import (
 const (
 	// prefetchTimeout bounds one read.
 	prefetchTimeout = 10 * time.Second
-	// searchSettle is how long a turn's search words must stay the same
-	// before Heard searches them: each new word changes them, and every
-	// search reaches Dispatch and its embedding model (R6).
+	// searchSettle is how long a turn's question must stay the same before
+	// Heard searches it: each new word changes it, and every search reaches
+	// Dispatch and its embedding model (R6).
 	searchSettle = 400 * time.Millisecond
 	// maxKeys is how many of a turn's keys a read tries.
 	maxKeys = 3
@@ -242,14 +242,17 @@ func (p *prefetch) cancelAll() {
 }
 
 // readTarget is what a turn asks the record for:
-//   - "keys:K1,K2|terms" when it names issue keys of Dispatch's projects, the
-//     last first, which a read tries in that order, then searches terms when
-//     none names an issue;
-//   - "search:terms" when it names none;
+//   - "keys:K1,K2|question|terms" when it names issue keys of Dispatch's
+//     projects, the last first, which a read tries in that order, then
+//     searches when none names an issue;
+//   - "search:question|terms" when it names none;
 //   - nothing when its words name no work either.
 //
-// terms is searchTerms's, the fewest words. The projects are the turn's
-// view's.
+// question and terms are what the search sends Dispatch, read with the
+// turn's view of the projects: the question for its full search
+// (searchQuestion), the words that name work for its keyword search
+// (searchTerms); both empty when it sends nothing. A read-ahead's search is
+// reused for the same target alone, so for the same two.
 func (c *Concierge) readTarget(v projectsView, words string) string {
 	var keys []string
 	for _, key := range issueKeysIn(words) {
@@ -265,16 +268,91 @@ func (c *Concierge) readTarget(v projectsView, words string) string {
 			keys = append(keys, key)
 		}
 	}
-	terms := searchTerms(words)
+	question := v.searchQuestion(words)
+	search := question + "|" + searchTerms(words)
 	if len(keys) > 0 {
 		slices.Reverse(keys)
 		keys = slices.Compact(keys)
-		return "keys:" + strings.Join(keys[:min(len(keys), maxKeys)], ",") + "|" + terms
+		return "keys:" + strings.Join(keys[:min(len(keys), maxKeys)], ",") + "|" + search
 	}
-	if terms != "" {
-		return "search:" + terms
+	if question != "" {
+		return "search:" + search
 	}
 	return ""
+}
+
+// searchOf is what target's search sends Dispatch: the question for its
+// full search and the words for its keyword search; both empty when target
+// searches nothing. Neither keys nor the words that name work hold a "|".
+func searchOf(target string) (question, terms string) {
+	rest, ok := strings.CutPrefix(target, "search:")
+	if !ok {
+		if rest, ok = strings.CutPrefix(target, "keys:"); ok {
+			_, rest, ok = strings.Cut(rest, "|")
+		}
+	}
+	i := strings.LastIndex(rest, "|")
+	if !ok || i < 0 {
+		return "", ""
+	}
+	return rest[:i], rest[i+1:]
+}
+
+// keysOf is the keys a keys target reads, "K1,K2"; "" for any other target.
+func keysOf(target string) string {
+	keys, ok := strings.CutPrefix(target, "keys:")
+	if !ok {
+		return ""
+	}
+	keys, _, _ = strings.Cut(keys, "|")
+	return keys
+}
+
+// searchTarget is a keys target's search alone, "search:question|terms", for
+// a turn whose keys name no issue.
+func searchTarget(target string) string {
+	_, search, _ := strings.Cut(strings.TrimPrefix(target, "keys:"), "|")
+	return "search:" + search
+}
+
+// keysRead is how the reads of p that have ended read keys: named, a read
+// in which one of them named an issue; none, that one has ended in which
+// none did. A turn's search is made only when no key names an issue, so a
+// read that named one holds all the turn asks of its keys, and after one
+// that named none the turn's later words are its search alone. c.mu is held.
+func (p *prefetch) keysRead(keys string) (named *read, none bool) {
+	for target, r := range p.reads {
+		if keysOf(target) != keys {
+			continue
+		}
+		select {
+		case <-r.done:
+		default:
+			continue
+		}
+		switch {
+		case !r.complete:
+		case r.found.key != "" && !r.found.searched:
+			return r, false
+		default:
+			none = true
+		}
+	}
+	return nil, none
+}
+
+// running reports whether p's current read has not ended. c.mu is held.
+func (p *prefetch) running() bool {
+	r, ok := p.reads[p.current]
+	if !ok {
+		return false
+	}
+	select {
+	case <-r.done:
+		return false
+	default:
+		return true
+	}
 }
 
 // Heard tells the Concierge the turn so far in exchange x. It returns at
@@ -321,6 +399,24 @@ func (c *Concierge) Heard(ctx context.Context, x *voice.Exchange, words string) 
 	if _, read := p.reads[target]; read {
 		return
 	}
+	// The target holds the turn's search, so each word changes it; a key's
+	// read is no more started again for each (found in review on
+	// 2026-11-24). While the keys are read, or once one named its issue,
+	// later words start no read. Once none did, they are the turn's search
+	// alone, which waits for its words to settle and counts.
+	if keys := keysOf(target); keys != "" {
+		named, none := p.keysRead(keys)
+		question, _ := searchOf(target)
+		switch {
+		case named != nil, none && question == "", !none && keysOf(p.current) == keys && p.running():
+			return
+		case none:
+			target = searchTarget(target)
+			if _, read := p.reads[target]; read {
+				return
+			}
+		}
+	}
 	// A search waits for its words to settle, and the read-ahead makes one
 	// a turn: every search reaches Dispatch and its embedding model (R6). A
 	// reply to "Did you mean" picks; it is not searched.
@@ -360,7 +456,7 @@ func (c *Concierge) Heard(ctx context.Context, x *voice.Exchange, words string) 
 				return
 			}
 		}
-		found := c.readRecord(readCtx, &exchange, target, r.heldBy, r.cut)
+		found := c.readRecord(readCtx, &exchange, view, words, target, r.heldBy, r.cut)
 		if readCtx.Err() == nil {
 			// Only a counted search is the read-ahead's: a key that names no
 			// issue searches too, uncounted, and the answer counts it.
@@ -380,10 +476,11 @@ func (r *read) heldBy(early *reading) {
 }
 
 // readFor is what the record holds for turn: the read Heard made of exactly
-// what the final turn asks, or of a search of the same words in another
-// order, which is final once it ran to its end, else a read made now. ctx,
-// the answer's, bounds both; cut, when it closes, ends the wait for a full
-// search (searchBoth). view is the turn's one reading of the project list.
+// what the final turn asks, its keys and what its search sends, or of the
+// same keys that read an issue, which is final once it ran to its end, else
+// a read made now. ctx, the answer's, bounds both; cut, when it closes, ends
+// the wait for a full search (searchBoth). view is the turn's one reading of
+// the project list.
 func (c *Concierge) readFor(ctx context.Context, x *voice.Exchange, view projectsView, turn string, onHolder func(*reading), cut <-chan struct{}) *reading {
 	target := c.readTarget(view, turn)
 	if target == "" {
@@ -396,36 +493,68 @@ func (c *Concierge) readFor(ctx context.Context, x *voice.Exchange, view project
 		}
 		return &reading{noResult: len(bareIssueNumber.FindAllString(turn, -1)) > 0}
 	}
+	// Voices B and C answer a question in their vendor's words, while the
+	// read-ahead read the unit's own transcript of the turn, AskerTurn
+	// (found in review on 2026-11-24).
+	asked := ""
+	if x.AskerTurn != "" && x.AskerTurn != turn {
+		if words, unread := view.readSpelledKeys(x.AskerTurn); !unread {
+			asked = c.readTarget(view, words)
+		}
+	}
 	c.mu.Lock()
 	var pending *read
-	searchAgain := false
+	searchAgain, sameTerms := false, false
 	aheadWords, finalWords, held := 0, 0, 0
 	if p := c.prefetchLocked(x); p != nil {
-		pending = p.reads[target]
-		switch {
-		case pending != nil:
-		case sameWords(p.current, target):
-			// The read-ahead searched the final turn's words: its search,
-			// keyword and full, is this answer's (Main's rule).
-			pending = p.reads[p.current]
-		case strings.HasPrefix(p.current, "search:") && strings.HasPrefix(target, "search:"):
+		if keys := keysOf(target); keys != "" && p.reads[target] == nil {
+			if named, none := p.keysRead(keys); named != nil {
+				pending = named
+			} else if question, _ := searchOf(target); none && question != "" {
+				// No key names an issue: the turn's search alone is read.
+				target = searchTarget(target)
+			}
+		}
+		if pending == nil {
+			pending = p.reads[target]
+		}
+		if pending == nil && asked != "" {
+			pending = p.reads[asked]
+		}
+		if pending == nil {
+			// The answer reads its own target: a read-ahead of other words
+			// still waiting or running would search a question no one uses
+			// and spend one of the answer's searches.
+			if r := p.reads[p.current]; r != nil {
+				r.cancel()
+			}
+		}
+		if pending == nil && strings.HasPrefix(p.current, "search:") && strings.HasPrefix(target, "search:") {
 			// Counts only, never the words: why the answer searches again.
-			// A final turn that adds words the read-ahead did not search is
-			// searched for all of them.
-			ahead := strings.Fields(strings.TrimPrefix(p.current, "search:"))
-			final := strings.Fields(strings.TrimPrefix(target, "search:"))
+			// A final turn whose search is not the one the read-ahead sent,
+			// by a word, the order of its words or the words that name
+			// work, is searched as it is: the read-ahead's search is reused
+			// only for what it sent (Main's rule). same_keyword_words says
+			// whether the rule before, which compared those words alone in
+			// any order, could have reused it.
+			aheadQuestion, aheadTerms := searchOf(p.current)
+			finalQuestion, finalTerms := searchOf(target)
+			ahead, final := strings.Fields(aheadQuestion), strings.Fields(finalQuestion)
 			heldWords := set(final)
 			for _, word := range ahead {
 				if heldWords[word] {
 					held++
 				}
 			}
-			searchAgain, aheadWords, finalWords = true, len(ahead), len(final)
+			aheadSorted, finalSorted := strings.Fields(aheadTerms), strings.Fields(finalTerms)
+			slices.Sort(aheadSorted)
+			slices.Sort(finalSorted)
+			searchAgain, sameTerms, aheadWords, finalWords = true, slices.Equal(aheadSorted, finalSorted), len(ahead), len(final)
 		}
 	}
 	c.mu.Unlock()
 	if searchAgain { // logged without c.mu: a log write can wait
-		c.logger.Info("concierge searches again: the turn's search words are not the read-ahead's", "ahead_words", aheadWords, "final_words", finalWords, "held", held)
+		c.logger.Info("concierge searches again: the turn's question is not the read-ahead's", "ahead_words", aheadWords, "final_words", finalWords, "held", held, "same_keyword_words", sameTerms)
 	}
 	if pending != nil {
 		// The answer needs the read now: a search still settling starts, and
@@ -462,22 +591,7 @@ func (c *Concierge) readFor(ctx context.Context, x *voice.Exchange, view project
 			return &reading{}
 		}
 	}
-	return c.readRecord(ctx, x, target, onHolder, cut)
-}
-
-// sameWords reports whether ahead, a read-ahead's search target, searched
-// the words of target, the final turn's search, in any order: no more and no
-// fewer.
-func sameWords(ahead, target string) bool {
-	aheadTerms, ok := strings.CutPrefix(ahead, "search:")
-	finalTerms, final := strings.CutPrefix(target, "search:")
-	if !ok || !final || aheadTerms == "" {
-		return false
-	}
-	aheadWords, finalWords := strings.Fields(aheadTerms), strings.Fields(finalTerms)
-	slices.Sort(aheadWords)
-	slices.Sort(finalWords)
-	return slices.Equal(aheadWords, finalWords)
+	return c.readRecord(ctx, x, view, turn, target, onHolder, cut)
 }
 
 // prefetchLocked is exchange x's read-ahead. An exchange whose wake came
@@ -512,22 +626,35 @@ func (c *Concierge) takeAheadSearches(x *voice.Exchange) int {
 	n := p.searches
 	p.searches = 0
 	p.cancelAll()
-	// A later answer reuses only a read made since this one.
-	p.current = ""
+	// A later answer reuses only a read made since this one: a reading of
+	// the same words this answer took would be the record as it was then.
+	p.reads, p.current = map[string]*read{}, ""
 	return n
 }
 
 // readRecord reads target with the tools, as the model would call them. For
 // keys, the first key that names an issue is read with its holder, and the
 // reads of the others are left out, so the model is not told of an issue
-// nobody asked about; when none names one, the terms are searched. For a
-// search, the top hit's issue is read with its holder, and whether it is one
-// clear match (R5) is kept: with none, the voice asks which issue the person
-// meant, and asks its holder nothing. cut, when it closes, ends the search's
-// wait for its full search. A failure other than not-found, such as
-// Dispatch out of reach, ends the read.
-func (c *Concierge) readRecord(ctx context.Context, x *voice.Exchange, target string, onHolder func(*reading), cut <-chan struct{}) *reading {
-	tools := &runner{c: c, x: x, fullCut: cut}
+// nobody asked about; when none names one, target's search, if it has one,
+// is made. For a search, the top hit's issue is read with its holder, and
+// whether it is one clear match (R5) is kept: with none, the voice asks
+// which issue the person meant, and asks its holder nothing. cut, when it
+// closes, ends the search's wait for its full search. A failure other than
+// not-found, such as Dispatch out of reach, ends the read. view is the
+// turn's one reading of the project list, which the search reads its
+// question with.
+//
+// words are the turn's, which target was read from (readTarget), and the
+// search is sent them, as the model would send them: search_issues reads
+// them once. An offered issue picked is read by its key alone and never
+// searched, so its words, the question first asked, are not sent. Read
+// again from the question in target, which has lost its punctuation, the
+// keyword search lost the end of a description ("the issue about the
+// realtime voice, is it close?" searched "realtime voice close"), and the
+// full search was not sent the question target holds ("X. V. 6" went as
+// "xv6"). Found in review on 2026-11-24.
+func (c *Concierge) readRecord(ctx context.Context, x *voice.Exchange, view projectsView, words, target string, onHolder func(*reading), cut <-chan struct{}) *reading {
+	tools := &runner{c: c, x: x, view: &view, fullCut: cut}
 	found := &reading{}
 	var lines []string
 	// record keeps name's call and result for the model and R8's check.
@@ -586,9 +713,17 @@ func (c *Concierge) readRecord(ctx context.Context, x *voice.Exchange, target st
 			return false, issue["error"] != noSuchIssue
 		}
 	}
-	search := func(terms string) {
+	search := func() {
 		found.searched = true
-		hits := call("search_issues", map[string]any{"query": terms}, true)
+		// The record's line holds the words searched by keyword (searchTerms),
+		// not the question: the record is R8's source, where a figure or key
+		// of the asker's is no fact (earCheckAsked). With the question in it,
+		// "what changed in the last 45 days" let the voice say "45" as the
+		// record's. Found in review on 2026-11-24.
+		var hits map[string]any
+		if result, err := tools.call(ctx, "search_issues", map[string]any{"query": words}); err == nil {
+			hits = record("search_issues", map[string]any{"query": searchTerms(words)}, result, true)
+		}
 		issues, _ := hits["issues"].([]map[string]any)
 		if hits == nil || hits["error"] != nil {
 			return
@@ -614,8 +749,7 @@ func (c *Concierge) readRecord(ctx context.Context, x *voice.Exchange, target st
 	}
 	switch {
 	case strings.HasPrefix(target, "keys:"):
-		list, terms, _ := strings.Cut(strings.TrimPrefix(target, "keys:"), "|")
-		for _, key := range strings.Split(list, ",") {
+		for _, key := range strings.Split(keysOf(target), ",") {
 			if ctx.Err() != nil {
 				break
 			}
@@ -624,11 +758,11 @@ func (c *Concierge) readRecord(ctx context.Context, x *voice.Exchange, target st
 				return found
 			}
 		}
-		if terms != "" && ctx.Err() == nil {
-			search(terms)
+		if _, terms := searchOf(target); terms != "" && ctx.Err() == nil {
+			search()
 		}
 	case strings.HasPrefix(target, "search:"):
-		search(strings.TrimPrefix(target, "search:"))
+		search()
 	}
 	found.text = strings.Join(lines, "\n")
 	return found

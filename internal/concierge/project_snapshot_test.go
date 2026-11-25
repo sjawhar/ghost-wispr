@@ -113,7 +113,9 @@ func TestAnOfferedKeyPicksWhenTheListCannotTell(t *testing.T) {
 // question whose "word NN" may be speech is searched as with no offer
 // pending, and answers about the issue its search finds, an offered one
 // included: by a keyword and full search, or by the full search alone, its
-// meaning, when no keyword hit holds the words ("speech interface").
+// meaning, when no keyword hit holds the words ("speech interface"). The
+// full search is sent the question, the keyword search its words of work;
+// "last 30" may be a key while the list cannot tell, so neither gets it.
 func TestANewQuestionWithAnOfferPendingIsSearched(t *testing.T) {
 	noKeywordHit := func(r *rig) { r.records.kwHits = nil }
 	for _, tc := range []struct {
@@ -127,8 +129,9 @@ func TestANewQuestionWithAnOfferPendingIsSearched(t *testing.T) {
 	} {
 		t.Run(tc.turn, func(t *testing.T) {
 			got := outcomeOf(t, true, tc.setup, tc.turn)
-			if got.Unreachable || !got.ErrNil || !slices.Equal(got.Full, []string{tc.terms}) || !slices.Equal(got.Keyword, []string{tc.terms}) || got.Took != "ABC-12" || got.Sent != 0 {
-				t.Errorf("%+v; want one full and one keyword search for %q, ABC-12 answered, nothing sent", got, tc.terms)
+			question := strings.Replace(strings.TrimSuffix(tc.turn, "?"), " last 30", "", 1)
+			if got.Unreachable || !got.ErrNil || !slices.Equal(got.Full, []string{question}) || !slices.Equal(got.Keyword, []string{tc.terms}) || got.Took != "ABC-12" || got.Sent != 0 {
+				t.Errorf("%+v; want one full search for %q and one keyword search for %q, ABC-12 answered, nothing sent", got, question, tc.terms)
 			}
 		})
 	}

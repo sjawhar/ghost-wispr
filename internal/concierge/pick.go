@@ -224,9 +224,9 @@ func firstOf(words []string) string {
 
 // placeOrTitle is the offered issue words name by its place (pickWords) or
 // by words its title holds and no other offered title does, reading every
-// word of both (namingWords), not the few a search takes; "" when they name
-// none. conflict says they name more than one, or a place past the offered
-// issues ("the second one" of one).
+// word of both that names work (namingWords); "" when they name none.
+// conflict says they name more than one, or a place past the offered issues
+// ("the second one" of one).
 func placeOrTitle(candidates []candidate, words []string) (key string, conflict bool) {
 	pick := func(named string) bool {
 		if key != "" && key != named {

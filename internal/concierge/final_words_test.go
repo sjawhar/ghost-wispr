@@ -11,34 +11,43 @@ import (
 	"github.com/sjawhar/ghost-wispr/internal/dispatch"
 )
 
-// TestAnswerSearchesTheFinalWordsTheReadAheadDidNot (R6; the proof of #187):
-// the read-ahead searches the words said so far, and the final turn can add
-// words that name the work ("what's one blocker on the meeting voice" was
-// searched as "blocker" alone). It fails if the answer takes a read-ahead
-// whose words are not the final turn's words, or searches again when they
-// are.
-func TestAnswerSearchesTheFinalWordsTheReadAheadDidNot(t *testing.T) {
+// TestAnswerSearchesTheFinalQuestionTheReadAheadDidNot (R6; the proof of
+// #187): the read-ahead searches the question said so far, and the final
+// turn can add words ("what's one blocker on the meeting voice" was searched
+// as "blocker" alone). The answer takes the read-ahead's search only when
+// the final turn's question, as the full search is sent it, is the one the
+// read-ahead searched. It fails if the answer takes a read-ahead whose
+// question is not the final turn's, a word that names no work or the same
+// words in another order included, or searches again when it is, case and
+// punctuation aside.
+func TestAnswerSearchesTheFinalQuestionTheReadAheadDidNot(t *testing.T) {
+	const heard, searched = "what is happening with the realtime voice", "realtime voice"
 	for _, tc := range []struct {
-		name, heard, turn string
-		want              []string
+		name, turn    string
+		full, keyword []string
 	}{
-		{"the final turn adds words", "what is happening with the realtime voice", "what is happening with the realtime voice rollout", []string{"realtime voice", "realtime voice rollout"}},
-		{"control: the same words", "what is happening with the realtime voice", "what is happening with the realtime voice?", []string{"realtime voice"}},
+		{"the final turn adds a word of work", "what is happening with the realtime voice rollout",
+			[]string{heard, "what is happening with the realtime voice rollout"}, []string{searched, "realtime voice rollout"}},
+		{"the final turn adds a word that names no work", "what is happening with the realtime voice today",
+			[]string{heard, "what is happening with the realtime voice today"}, []string{searched, searched}},
+		{"the same words in another order", "what is happening with the voice, realtime?",
+			[]string{heard, "what is happening with the voice realtime"}, []string{searched, "voice realtime"}},
+		{"control: the same question", "What is happening with the realtime voice?", []string{heard}, []string{searched}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			r := newRig(t)
 			r.concierge.searchSettle = 50 * time.Millisecond
 			unclearSearch(r)
 			r.records.hits[0].Score = 0.012
-			r.concierge.Heard(context.Background(), &r.exchange, tc.heard)
+			r.concierge.Heard(context.Background(), &r.exchange, heard)
 			eventually(t, "the read-ahead searched", func() bool { return len(r.records.searches()) == 1 })
 			r.model.turns = [][]*genai.GenerateContentResponse{{chunk(text("PR 80 is in review."))}}
 			spoken := answerTurn(t, r, tc.turn)
 			r.records.mu.Lock()
 			kw := slices.Clone(r.records.kwQueries)
 			r.records.mu.Unlock()
-			if full := r.records.searches(); !slices.Equal(full, tc.want) || !slices.Equal(kw, tc.want) {
-				t.Fatalf("full searches %q, keyword %q; want %q", full, kw, tc.want)
+			if full := r.records.searches(); !slices.Equal(full, tc.full) || !slices.Equal(kw, tc.keyword) {
+				t.Fatalf("full searches %q, keyword %q; want %q and %q", full, kw, tc.full, tc.keyword)
 			}
 			if len(spoken) == 0 || spoken[0].text != "I took ABC-12." {
 				t.Fatalf("spoken = %+v, want the issue the search chose", spoken)

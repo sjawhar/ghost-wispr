@@ -88,7 +88,7 @@ func TestSearchSendsTheQueryAndTheBearerToken(t *testing.T) {
 		t.Errorf("limit = %q", got)
 	}
 	// A search is Dispatch's normal one, words and meaning: the unit sends
-	// it a question's few keywords, never the sentence (searchTerms).
+	// it the question said in the room (searchQuestion).
 	if _, set := request.URL.Query()["keywords_only"]; set {
 		t.Errorf("keywords_only = %q, want Dispatch's normal search", request.URL.Query().Get("keywords_only"))
 	}

@@ -67,8 +67,8 @@ func lockFreeWhileHeld(c *Concierge, h *heldLog, free chan<- bool) {
 // that does not read, and every call of the Concierge's, its stop's
 // included, would wait behind it. The cases are the two records the audit of
 // #132 (review 6006047326) found written under the lock: a failed read of
-// Dispatch's projects, and an answer that searches again because its words
-// do not hold the read-ahead's.
+// Dispatch's projects, and an answer that searches again because its
+// question is not the read-ahead's.
 func TestNoConciergeLogWriteHoldsItsLock(t *testing.T) {
 	t.Run("a failed read of the projects", func(t *testing.T) {
 		held := newHeldLog("concierge could not read Dispatch's projects")
@@ -87,7 +87,7 @@ func TestNoConciergeLogWriteHoldsItsLock(t *testing.T) {
 		}
 	})
 	t.Run("an answer that searches again", func(t *testing.T) {
-		held := newHeldLog("concierge searches again: the turn's search words are not the read-ahead's")
+		held := newHeldLog("concierge searches again: the turn's question is not the read-ahead's")
 		r := newLoggedRig(t, slog.New(held))
 		r.concierge.searchSettle = 50 * time.Millisecond
 		unclearSearch(r)

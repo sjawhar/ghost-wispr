@@ -87,9 +87,9 @@ func TestReview187R5SpelledKeysNameKnownProjects(t *testing.T) {
 		}
 	}
 	for in, want := range map[string]string{
-		"what's happening with A B C thirteen": "keys:ABC-13|",
-		"I O U twenty dollars":                 "search:twenty dollars",
-		"what's happening with X V six evals?": "search:xv6 evals",
+		"what's happening with A B C thirteen": "keys:ABC-13||",
+		"I O U twenty dollars":                 "search:i ou twenty dollars|twenty dollars",
+		"what's happening with X V six evals?": "search:what's happening with xv6 evals|xv6 evals",
 	} {
 		if got := r.concierge.readTarget(r.concierge.viewProjects(), readKeys(t, r, in)); got != want {
 			t.Errorf("readTarget(%q) = %q, want %q", in, got, want)

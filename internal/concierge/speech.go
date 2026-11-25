@@ -4,6 +4,7 @@ import (
 	"regexp"
 	"strings"
 	"unicode"
+	"unicode/utf8"
 )
 
 // spokenName is an agent session's title or name as the voice may say it:
@@ -26,9 +27,6 @@ func spokenName(name string) string {
 	}, name)
 	return strings.Join(strings.Fields(kept), " ")
 }
-
-// maxSearchTerms is how many words a search sends Dispatch.
-const maxSearchTerms = 5
 
 // searchStopwords are the words of a spoken question that name no work:
 // function words, question words, the wake word and talk about status.
@@ -56,20 +54,115 @@ func init() {
 // about realtime spoken conversation", up to where the question goes on.
 var describedIssue = regexp.MustCompile(`(?i)\b(?:issue|ticket|task|work|project|thing)s?\s+(?:about|on|for|called|named|of|with)\s+(.+?)(?:\s+(?:when|whether|if|and|but|what|how|why|who|which|so|because)\b|[?.!,;]|$)`)
 
-// searchTerms is what a search sends Dispatch for words said in the room:
-// their words that name work, at most maxSearchTerms, in order and once each.
-// A turn that describes the issue ("the issue about X") gives the
-// description's words alone. What reads as an issue key ("infra 4592", but
-// also "the last 30") is left out: a read tries it as a key. Dispatch gets
-// the fewest words, never the sentence; empty when none of the words names
-// work.
+// searchTerms is what Dispatch's keyword search is sent for words said in
+// the room: each of their words that names work (namingWords), in order and
+// once each, however many. A turn that describes the issue ("the issue about
+// X") gives the description's words alone. What reads as an issue key
+// ("infra 4592", but also "the last 30") is left out: a read tries it as a
+// key. Empty when none of the words names work, and then nothing is
+// searched. Live on 2026-11-24 these words found the issue meant for 5 of 10
+// questions, as their first five did, and the whole question for 3 of 10.
 func searchTerms(words string) string {
 	if match := describedIssue.FindStringSubmatch(words); match != nil {
-		if terms := workWords(match[1]); terms != "" {
+		if terms := strings.Join(namingWords(match[1]), " "); terms != "" {
 			return terms
 		}
 	}
-	return workWords(words)
+	return strings.Join(namingWords(words), " ")
+}
+
+// searchQuestion is what Dispatch's full search, words and meaning, is sent
+// for words said in the room: the question as said after the wake phrase,
+// whole, in lower case and without the punctuation around its words; a name
+// spelled out is the one word it spells (spelledOut), "real time" is
+// "realtime" (compound), and an issue key is left out, since a read tries it
+// as a key: a key of a project the view holds, or any word that reads as a
+// key while the view cannot tell. A question that still opens with the wake
+// phrase, as the model may search one, is sent without it. Empty when none
+// of the words names work (searchTerms). Live on 2026-11-24 the question put
+// the issue meant first for 8 of 10 questions, against 4 of 10 for its first
+// five words that name work and 5 of 10 for all of them; a key in it put the
+// issue meant second.
+func (v projectsView) searchQuestion(words string) string {
+	terms := searchTerms(words)
+	if terms == "" {
+		return ""
+	}
+	text := possessiveKey.ReplaceAllStringFunc(spokenKeys(spelledOut(words)), func(key string) string {
+		if !v.sure || v.holds(possessiveKey.FindStringSubmatch(key)[1]) {
+			return " "
+		}
+		return key
+	})
+	text = compound.ReplaceAllString(text, "realtime")
+	// A curly apostrophe is read as a straight one, as pick.go reads a
+	// reply, so a question reads the same with either: a voice's model may
+	// write the final turn, Deepgram the read-ahead's, and the answer reuses
+	// the read-ahead only for the same question.
+	var question []string
+	for _, field := range strings.Fields(strings.ToLower(strings.ReplaceAll(text, "’", "'"))) {
+		if word := strings.TrimFunc(field, func(r rune) bool { return !unicode.IsLetter(r) && !unicode.IsDigit(r) }); word != "" {
+			question = append(question, word)
+		}
+	}
+	if question = withoutWake(question); len(question) == 0 {
+		// Its one word that names work was a spelling of the wake name
+		// ("Wispa?"): Dispatch refuses an empty search with a 400.
+		return terms
+	}
+	return strings.Join(question, " ")
+}
+
+// maxSearchLength is the most Dispatch searches: it refuses a query of more
+// than 1000 characters with a 400 (`dispatch search --help`: "2 to 1000
+// characters"), which the room would hear as Dispatch out of reach. A
+// character there is a UTF-16 unit, and no character takes fewer bytes.
+const maxSearchLength = 1000
+
+// withinSearchLength is text cut to what Dispatch searches, after its last
+// word that fits, or at the limit for a word longer than it.
+func withinSearchLength(text string) string {
+	if len(text) <= maxSearchLength {
+		return text
+	}
+	if i := strings.LastIndexByte(text[:maxSearchLength+1], ' '); i > 0 {
+		return text[:i]
+	}
+	cut := text[:maxSearchLength]
+	for !utf8.ValidString(cut) {
+		cut = cut[:len(cut)-1]
+	}
+	return cut
+}
+
+// possessiveKey is an issue key as spokenKey reads it, with the possessive
+// said after it ("ABC-12's"), which goes with the key: left out alone, the
+// key left a lone "s" in the question.
+var possessiveKey = regexp.MustCompile(spokenKey.String() + `(?:['’]s\b)?`)
+
+// wakeNames are how a transcript writes the name in the wake phrase, as the
+// wake phrase's detector reads it (internal/wake/transcript), and
+// wakeOpeners the words a call may start with before it.
+var (
+	wakeNames   = map[string]bool{"wispr": true, "whisper": true, "wisper": true, "whispr": true, "wispa": true, "whispa": true, "lispr": true}
+	wakeOpeners = map[string]bool{"hey": true, "hi": true, "ok": true, "okay": true, "so": true, "um": true, "uh": true, "and": true}
+)
+
+// withoutWake is words, lower case and without punctuation, without the
+// wake phrase they open with, after at most one opener ("hey wispr"):
+// "wispr" or "ghost wispr", the name as Deepgram may spell it.
+func withoutWake(words []string) []string {
+	rest := words
+	if len(rest) > 1 && wakeOpeners[rest[0]] {
+		rest = rest[1:]
+	}
+	switch {
+	case len(rest) > 1 && rest[0] == "ghost" && wakeNames[rest[1]]:
+		return rest[2:]
+	case len(rest) > 0 && wakeNames[rest[0]]:
+		return rest[1:]
+	}
+	return words
 }
 
 // compound is a word Deepgram may write as two, or hyphened, where Dispatch's
@@ -245,13 +338,6 @@ func sayLastPair(pair string) string {
 		return "oh " + unitWords[pair[1]-'0']
 	}
 	return sayPair(pair)
-}
-
-// workWords is the words of text that name work, at most maxSearchTerms: the
-// words a search takes.
-func workWords(text string) string {
-	words := namingWords(text)
-	return strings.Join(words[:min(len(words), maxSearchTerms)], " ")
 }
 
 // namingWords is every word of text that names work, once each, in order: a

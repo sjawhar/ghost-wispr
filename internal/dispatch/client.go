@@ -116,8 +116,7 @@ func (c *Client) Projects(ctx context.Context) ([]string, error) {
 
 // Search runs Dispatch's normal search, words and meaning, and returns up to
 // limit hits, best first. Its meaning leg sends the query to Dispatch's
-// embedding model, outside Dispatch, so a caller sends the fewest words that
-// name the work, never a sentence said in a room.
+// embedding model, outside Dispatch.
 func (c *Client) Search(ctx context.Context, query string, limit int) ([]SearchHit, error) {
 	return c.search(ctx, query, limit, false)
 }
