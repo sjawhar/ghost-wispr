@@ -2,9 +2,12 @@ package concierge
 
 import (
 	"regexp"
+	"slices"
 	"strings"
 	"unicode"
 	"unicode/utf8"
+
+	"github.com/sjawhar/ghost-wispr/internal/dispatch"
 )
 
 // spokenName is an agent session's title or name as the voice may say it:
@@ -26,6 +29,51 @@ func spokenName(name string) string {
 		}
 	}, name)
 	return strings.Join(strings.Fields(kept), " ")
+}
+
+// titleSeparator is what a session's title puts between its parts: "Legion
+// architect · INFRA-7", "Worker | INFRA-7", "Release - notes". The voice says
+// none of them.
+var titleSeparator = regexp.MustCompile(`\s*[·•‧∙|—–]\s*|\s+-\s+`)
+
+// legionRole is a part of a Legion session's title that names its role:
+// "Legion architect".
+var legionRole = regexp.MustCompile(`(?i)^legion\s+(\p{L}+)$`)
+
+// sessionName is an agent session's title as the voice and its model may say
+// it of issue key ("" when it is of no issue): spokenName's words, with no
+// separator (titleSeparator) between its parts, which are joined by commas,
+// and the issue's own key left out, as the sentence names the issue. A
+// Legion session's title, its role and an issue's key, is the role of that
+// issue: "Legion architect · INFRA-7" is "its architect" of INFRA-7 and
+// "INFRA-7's architect" of another issue. Live on 2026-11-25 the room heard
+// "INFRA-7 is held by Legion architect · INFRA-7". A title that is the
+// issue's key alone is "its agent".
+func sessionName(title, key string) string {
+	var parts []string
+	for _, part := range titleSeparator.Split(spokenName(title), -1) {
+		if part = strings.TrimSpace(part); part != "" {
+			parts = append(parts, part)
+		}
+	}
+	if len(parts) == 2 {
+		if role := legionRole.FindStringSubmatch(parts[0]); role != nil {
+			if issue, err := dispatch.NormalizeIssueKey(parts[1]); err == nil {
+				if issue == key {
+					return "its " + strings.ToLower(role[1])
+				}
+				return issue + "'s " + strings.ToLower(role[1])
+			}
+		}
+	}
+	kept := slices.DeleteFunc(slices.Clone(parts), func(part string) bool {
+		issue, err := dispatch.NormalizeIssueKey(part)
+		return err == nil && issue == key
+	})
+	if len(kept) == 0 && len(parts) > 0 {
+		return "its agent"
+	}
+	return strings.Join(kept, ", ")
 }
 
 // searchStopwords are the words of a spoken question that name no work:
