@@ -10,9 +10,11 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"github.com/sjawhar/ghost-wispr/internal/dispatch"
 	"github.com/sjawhar/ghost-wispr/internal/voice"
+	"github.com/sjawhar/ghost-wispr/internal/wake/transcript"
 )
 
 // Reading the record while the asker speaks (plan stage 4): the Supervisor
@@ -65,40 +67,51 @@ var keyGroups = strings.NewReplacer(",", "", ".", "", "/", "")
 
 // writtenKey is the key a match of re (keytermKey or spelledKey) reads, in
 // its written form, "INFRA-4592", and the space the match took after it;
-// after is the text after the match. ok is false for a number of one digit
-// unless held reports true for the key's project, and for one said in words
-// that may be no number: "one", as often a pronoun ("the INFRA one"), or a
-// word before "oh", the start of a longer number ("INFRA one oh five").
-func writtenKey(re *regexp.Regexp, match, after string, held func(string) bool) (key, trail string, ok bool) {
-	parts := re.FindStringSubmatch(match)
-	digits := keyGroups.Replace(parts[2])
-	if parts[3] != "" {
-		digits = keyDigits(parts[3])
-		if strings.HasSuffix(parts[3], " ") {
+// before and after are the turn's text around the match. ok is false for a
+// number of one digit unless held reports true for the key's project and the
+// key is written as one ("INFRA-7") or said as a bare issue reference
+// (transcript.BareIssueReference: "what about INFRA seven", not "I BET 5
+// dollars"); and for one said in words that may be no number: "one", as
+// often a pronoun ("the INFRA one"), or a word before "oh", the start of a
+// longer number ("INFRA one oh five").
+func writtenKey(re *regexp.Regexp, before, match, after string, held func(string) bool) (key, trail string, ok bool) {
+	at := re.FindStringSubmatchIndex(match)
+	group := func(i int) string {
+		if at[2*i] < 0 {
+			return ""
+		}
+		return match[at[2*i]:at[2*i+1]]
+	}
+	digits, said, numberAt := keyGroups.Replace(group(2)), group(3), at[4]
+	if said != "" {
+		digits, numberAt = keyDigits(said), at[6]
+		if strings.HasSuffix(said, " ") {
 			trail = " "
 		}
 	}
-	project := spelledProject.Replace(parts[1])
+	project := spelledProject.Replace(group(1))
+	written := match[at[3]:numberAt] == "-"
 	next, _, _ := strings.Cut(strings.ToLower(strings.TrimSpace(after)), " ")
 	switch {
 	case digits == "":
 		return "", "", false
 	case len(digits) >= 2:
 	case !held(project),
-		parts[3] != "" && (strings.EqualFold(strings.TrimSpace(parts[3]), "one") || strings.Trim(next, ",.;:?!") == "oh"):
+		!written && !transcript.BareIssueReference(before, after),
+		said != "" && (strings.EqualFold(strings.TrimSpace(said), "one") || strings.Trim(next, ",.;:?!") == "oh"):
 		return "", "", false
 	}
 	return project + "-" + digits, trail, true
 }
 
 // rewriteKeys rewrites each match of re in words with write, which gets the
-// match and the text after it.
-func rewriteKeys(re *regexp.Regexp, words string, write func(match, after string) string) string {
+// text before the match, the match and the text after it.
+func rewriteKeys(re *regexp.Regexp, words string, write func(before, match, after string) string) string {
 	var b strings.Builder
 	last := 0
 	for _, at := range re.FindAllStringIndex(words, -1) {
 		b.WriteString(words[last:at[0]])
-		b.WriteString(write(words[at[0]:at[1]], words[at[1]:]))
+		b.WriteString(write(words[:at[0]], words[at[0]:at[1]], words[at[1]:]))
 		last = at[1]
 	}
 	b.WriteString(words[last:])
@@ -107,11 +120,12 @@ func rewriteKeys(re *regexp.Regexp, words string, write func(match, after string
 
 // spokenKeys rewrites each key keytermKey reads to its written form,
 // "INFRA-4592", so the rest of the turn reads as before. A number of one
-// digit is a key only when the view holds its project ("INFRA seven" is
-// INFRA-7); else it stays as said. The zero view holds none.
+// digit is a key only when the view holds its project and the turn names it
+// as a bare issue reference ("what about INFRA seven" is INFRA-7); else it
+// stays as said. The zero view holds none.
 func (v projectsView) spokenKeys(words string) string {
-	return rewriteKeys(keytermKey, words, func(match, after string) string {
-		if key, trail, ok := writtenKey(keytermKey, match, after, v.holds); ok {
+	return rewriteKeys(keytermKey, words, func(before, match, after string) string {
+		if key, trail, ok := writtenKey(keytermKey, before, match, after, v.holds); ok {
 			return key + trail
 		}
 		return match
@@ -124,12 +138,13 @@ func (v projectsView) spokenKeys(words string) string {
 // could be a key while the view cannot tell (the list never read, or its read
 // failed): such a turn is neither a pick nor words to search. Letters before
 // a number of one digit are such a run only when the view holds their
-// project: "I O U 5 dollars" is speech. A turn goes through it once, where it
-// enters the Concierge (Heard, answer), so every reading of the turn after
-// sees the key.
+// project and the turn names it as a bare issue reference: "I O U 5
+// dollars" is speech. A turn goes through it once, where it enters the
+// Concierge (Heard, answer), so every reading of the turn after sees the
+// key.
 func (v projectsView) readSpelledKeys(words string) (read string, unread bool) {
-	read = rewriteKeys(spelledKey, words, func(match, after string) string {
-		key, trail, ok := writtenKey(spelledKey, match, after, v.holds)
+	read = rewriteKeys(spelledKey, words, func(before, match, after string) string {
+		key, trail, ok := writtenKey(spelledKey, before, match, after, v.holds)
 		if !ok {
 			return match
 		}
@@ -201,41 +216,68 @@ func issueKeysIn(words string) []string {
 // ("6.8", "7,500"): a number so written is no key of one digit.
 var anyDigitsKey = regexp.MustCompile(`\b([A-Za-z][A-Za-z0-9]*)[- ](\d+(?:/\d+)+|\d+)((?:[.,]\d+)*)\b`)
 
-// heldOneDigit reports whether match, a match of anyDigitsKey, is a key of
-// one digit whose project the view holds.
-func (v projectsView) heldOneDigit(match []string) bool {
-	return len(keyGroups.Replace(match[2])) == 1 && match[3] == "" && v.holds(match[1])
+// oneDigitKey reports whether m, a match of anyDigitsKey in text, is a key
+// of one digit the view reads: its number one digit with no decimal or
+// thousands part, its project held, and the key written as one ("INFRA-7")
+// or said as a bare issue reference (transcript.BareIssueReference): "what
+// about infra 7", not "the infra 3 times".
+func (v projectsView) oneDigitKey(text string, m []int) bool {
+	if len(keyGroups.Replace(text[m[4]:m[5]])) != 1 || m[6] != m[7] || !v.holds(text[m[2]:m[3]]) {
+		return false
+	}
+	return text[m[3]] == '-' || transcript.BareIssueReference(text[:m[0]], text[m[1]:])
 }
 
 // issueKeys is the issue keys words name as the turn's view reads them, in
 // order, upper-cased: every key issueKeysIn reads, and a key of one digit
-// whose project the view holds ("INFRA-7", "infra 7", "INFRA seven"). A
-// number of one digit after any other word is speech ("the last 7 days",
-// "room 2 is free"), as is one with a decimal or thousands part ("Linux
-// 6.8", "infra 7,500").
+// the view reads (oneDigitKey: "INFRA-7", "what about infra 7", "what about
+// INFRA seven"). A number of one digit after any other word is speech ("the
+// last 7 days", "room 2 is free"), as is one with a decimal or thousands
+// part ("Linux 6.8", "infra 7,500") and one inside other speech ("I bet 5").
 func (v projectsView) issueKeys(words string) []string {
 	var keys []string
-	for _, match := range anyDigitsKey.FindAllStringSubmatch(v.spokenKeys(words), -1) {
-		if len(keyGroups.Replace(match[2])) < 2 && !v.heldOneDigit(match) {
+	text := v.spokenKeys(words)
+	for _, m := range anyDigitsKey.FindAllStringSubmatchIndex(text, -1) {
+		number := keyGroups.Replace(text[m[4]:m[5]])
+		if len(number) < 2 && !v.oneDigitKey(text, m) {
 			continue
 		}
-		if key, err := dispatch.NormalizeIssueKey(match[1] + "-" + keyGroups.Replace(match[2])); err == nil {
+		if key, err := dispatch.NormalizeIssueKey(text[m[2]:m[3]] + "-" + number); err == nil {
 			keys = append(keys, key)
 		}
 	}
 	return keys
 }
 
-// withoutOneDigitKeys is words with each key of one digit the view holds
-// taken out, so the turn's search words hold no such key's project, as they
-// hold none of a longer key's (searchTerms).
+// withoutOneDigitKeys is words with each key of one digit the view reads
+// (oneDigitKey) taken out, so the turn's search words hold no such key's
+// project, as they hold none of a longer key's (searchTerms). A project
+// word and one digit that are speech stay: "I bet 5" searches "bet".
 func (v projectsView) withoutOneDigitKeys(words string) string {
-	return anyDigitsKey.ReplaceAllStringFunc(v.spokenKeys(words), func(match string) string {
-		if v.heldOneDigit(anyDigitsKey.FindStringSubmatch(match)) {
-			return " "
+	text := v.spokenKeys(words)
+	var b strings.Builder
+	last := 0
+	for _, m := range anyDigitsKey.FindAllStringSubmatchIndex(text, -1) {
+		if v.oneDigitKey(text, m) {
+			b.WriteString(text[last:m[0]])
+			b.WriteString(" ")
+			last = m[1]
 		}
-		return match
-	})
+	}
+	b.WriteString(text[last:])
+	return b.String()
+}
+
+// endsInOneDigitKey reports whether words, a turn so far, end in a key of one
+// digit the view reads (oneDigitKey), which more words may make speech.
+func (v projectsView) endsInOneDigitKey(words string) bool {
+	text := v.spokenKeys(words)
+	matches := anyDigitsKey.FindAllStringSubmatchIndex(text, -1)
+	if len(matches) == 0 {
+		return false
+	}
+	last := matches[len(matches)-1]
+	return v.oneDigitKey(text, last) && strings.IndexFunc(text[last[1]:], func(r rune) bool { return unicode.IsLetter(r) || unicode.IsDigit(r) }) < 0
 }
 
 // read is one read of the record for a target. complete is set when it ran
@@ -317,6 +359,22 @@ type prefetch struct {
 func (p *prefetch) cancelAll() {
 	for _, r := range p.reads {
 		r.cancel()
+	}
+}
+
+// stopCurrent ends the read of p's current target if it still runs: newer
+// words made it stale. A read that ran to its end stays, for an answer to
+// the same words.
+func (p *prefetch) stopCurrent() {
+	running, ok := p.reads[p.current]
+	if !ok {
+		return
+	}
+	select {
+	case <-running.done:
+	default:
+		running.cancel()
+		delete(p.reads, p.current)
 	}
 }
 
@@ -444,12 +502,21 @@ func (c *Concierge) Heard(ctx context.Context, x *voice.Exchange, words string) 
 	if unread {
 		return
 	}
-	target := c.readTarget(view, words)
-	// A number-only turn (no key, no work words) skips the read-ahead: it
-	// goes straight to the bare-number candidate lookup. A turn with words
-	// beyond the number keeps its search.
-	if target == "" {
-		return
+	// A key of one digit that ends the words so far is a key only if the
+	// turn ends there: "ops 1" goes on "and 2", which is speech, and reads
+	// no issue. For such words the read-ahead reads nothing and stops the
+	// read of older words, which they made stale, as a new target does; the
+	// answer reads the final turn.
+	hold := view.endsInOneDigitKey(words)
+	target := ""
+	if !hold {
+		target = c.readTarget(view, words)
+		// A number-only turn (no key, no work words) skips the read-ahead:
+		// it goes straight to the bare-number candidate lookup. A turn with
+		// words beyond the number keeps its search.
+		if target == "" {
+			return
+		}
 	}
 	exchange := *x
 	now := c.now()
@@ -466,6 +533,12 @@ func (c *Concierge) Heard(ctx context.Context, x *voice.Exchange, words string) 
 	}
 	key := exchangeKey(&exchange)
 	p := c.prefetchLocked(&exchange)
+	if hold {
+		if p != nil {
+			p.stopCurrent()
+		}
+		return
+	}
 	if p == nil {
 		p = &prefetch{at: now, reads: map[string]*read{}}
 		c.prefetches[key] = p
@@ -500,14 +573,7 @@ func (c *Concierge) Heard(ctx context.Context, x *voice.Exchange, words string) 
 	if _, offered := c.picks[wakeKey(&exchange)]; search && (p.searches > 0 || offered) {
 		return
 	}
-	if running, ok := p.reads[p.current]; ok {
-		select {
-		case <-running.done:
-		default:
-			running.cancel()
-			delete(p.reads, p.current)
-		}
-	}
+	p.stopCurrent()
 	readCtx, cancel := context.WithTimeout(ctx, prefetchTimeout)
 	r := &read{done: make(chan struct{}), seen: make(chan struct{}), cancel: cancel, start: make(chan struct{}), cut: make(chan struct{})}
 	p.reads[target], p.current = r, target

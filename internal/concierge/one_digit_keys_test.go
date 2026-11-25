@@ -51,7 +51,7 @@ func TestAOneDigitKeyIsReadWhenItsProjectIsHeld(t *testing.T) {
 			t.Errorf("readSpelledKeys(%q) = %q, %v; want %q", said, got, unread, want)
 		}
 	}
-	if got, want := r.concierge.readTarget(view, "Who is working on INFRA-7?"), "keys:INFRA-7|"; got != want {
+	if got, want := r.concierge.readTarget(view, "Who is working on INFRA-7?"), "keys:INFRA-7||"; got != want {
 		t.Errorf("readTarget = %q, want %q: the key's project is no search word", got, want)
 	}
 	if got, want := routingLine(view, "Who is working on INFRA-7?"), "Reading INFRA-7."; got != want {

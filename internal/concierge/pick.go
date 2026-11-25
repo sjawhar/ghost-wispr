@@ -191,8 +191,8 @@ func confirms(turn string) bool {
 // picks only when it is a selection (isSelection): nothing but its cues and
 // words that frame a pick. Of one issue offered, a reply with no cue picks it
 // when it is a yes form ("yes", "yeah, that one", "sure, that's it"). A key
-// of one digit ("INFRA-7", "infra 7") of an offered issue's project is a key
-// (offeredView).
+// of one digit of an offered issue's project ("INFRA-7", "infra 7, please")
+// is a key (offeredView), read as the turn's view reads one (oneDigitKey).
 func pickIn(candidates []candidate, turn string) string {
 	offered := offeredView(candidates)
 	words := replyWords(offered.withoutOneDigitKeys(turn))

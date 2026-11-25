@@ -513,7 +513,7 @@ func issuesOf(hits []dispatch.SearchHit) ([]map[string]any, bool) {
 		}
 		best[hit.IssueKey] = hit.Score
 		if len(issues) < 5 {
-			issues = append(issues, map[string]any{"key": hit.IssueKey, "title": hit.Title, "status": spokenStatus(hit.Status), "match": statusesInWords(hit.Snippet)})
+			issues = append(issues, map[string]any{"key": hit.IssueKey, "title": statusesInWords(hit.Title), "status": spokenStatus(hit.Status), "match": statusesInWords(hit.Snippet)})
 		}
 	}
 	scores := make([]float64, 0, len(issues))
@@ -561,7 +561,7 @@ func (r *runner) readIssue(ctx context.Context, key string) (map[string]any, err
 	// a field named "assignee" for who holds the issue, which only
 	// issue_holder says.
 	result := map[string]any{
-		"key": issue.Key, "title": issue.Title, "status": spokenStatus(issue.Status), "priority": issue.Priority,
+		"key": issue.Key, "title": statusesInWords(issue.Title), "status": spokenStatus(issue.Status), "priority": issue.Priority,
 		"assigned_to": issue.Assignee, "parent": issue.Parent, "open_asks": issue.OpenAsks,
 	}
 	if !issue.UpdatedAt.IsZero() {

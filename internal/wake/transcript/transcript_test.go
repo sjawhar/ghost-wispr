@@ -600,7 +600,7 @@ func TestIssueKeyForms(t *testing.T) {
 // common form, is not written as the key in the turn the Concierge gets, or
 // if words that name no known project's issue change.
 func TestSpokenKeysAreWritten(t *testing.T) {
-	projects := []string{"INFRA", "ABC"}
+	projects := []string{"INFRA", "ABC", "BET", "OPS"}
 	for text, want := range map[string]string{
 		"please ask the agent on in for forty five ninety two when it ships?": "please ask the agent on INFRA-4592 when it ships?",
 		"what about infra ten twenty-seven today":                             "what about INFRA-1027 today",
@@ -629,9 +629,63 @@ func TestSpokenKeysAreWritten(t *testing.T) {
 		"the infra one":                 "the infra one",
 		"is INFRA one of them":          "is INFRA one of them",
 		"what about infra one oh five":  "what about INFRA-105",
+		// A key of one digit is written only as a bare issue reference
+		// (BareIssueReference, Sol's review of #194): the turn's whole
+		// object, or the whole turn. Inside other speech it is speech,
+		// though BET and OPS are projects.
+		"what about infra 7": "what about INFRA-7",
+		"infra seven?":       "INFRA-7?",
+		"ask the agent on infra seven is it merged": "ask the agent on INFRA-7 is it merged",
+		"I bet five dollars":                        "I bet five dollars",
+		"I bet 5":                                   "I bet 5",
+		"the infra 3 times":                         "the infra 3 times",
+		"ops 1 and 2":                               "ops 1 and 2",
+		"is abc 12 done, or bet 5":                  "is ABC-12 done, or bet 5",
 	} {
 		if got := WriteKeys(text, projects); got != want {
 			t.Errorf("WriteKeys(%q) = %q, want %q", text, got, want)
+		}
+	}
+}
+
+// TestABareIssueReferenceIsAKey (Sol's review of #194, O1): a key of one
+// digit said as a project word and a number is a key only as a bare issue
+// reference: the turn alone, the question's whole object, or the key an ask
+// names. Inside other speech it is speech, though the word is a project's:
+// Sol's "I bet 5", "I'd bet 2 of them", "the infra 3 times" and "ops 1"
+// before more words. Each turn marks the key in brackets. It fails if a
+// project word and one digit inside other speech read as a key, or if a
+// bare reference does not.
+func TestABareIssueReferenceIsAKey(t *testing.T) {
+	for turn, want := range map[string]bool{
+		"[infra 7]":                               true,
+		"[INFRA seven]?":                          true,
+		"what about [infra 7]":                    true,
+		"status of [infra 7]":                     true,
+		"what's the status of [infra 7]?":         true,
+		"who's on [infra 7]":                      true,
+		"What is happening with [INFRA 7]":        true,
+		"Who is working on [INFRA? 7].":           true,
+		"what is [infra 7]":                       true,
+		"how's [infra 7]":                         true,
+		"yes, [infra 7]":                          true,
+		"no, not [infra 7]":                       true,
+		"[infra 7], please":                       true,
+		"ask the agent on [infra 7] is it merged": true,
+		"[ops 1]":                                 true,
+		"I [bet 5]":                               false,
+		"I'd [bet 2] of them":                     false,
+		"the [infra 3] times":                     false,
+		"[ops 1] and 2":                           false,
+		"I [bet five] dollars":                    false,
+		"is abc 12 done, or [bet 5]":              false,
+		"what about [infra 7] and infra 8":        false,
+		"what changed in the [last 7] days":       false,
+	} {
+		before, rest, _ := strings.Cut(turn, "[")
+		_, after, _ := strings.Cut(rest, "]")
+		if got := BareIssueReference(before, after); got != want {
+			t.Errorf("BareIssueReference in %q = %v, want %v", turn, got, want)
 		}
 	}
 }

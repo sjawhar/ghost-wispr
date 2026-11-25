@@ -1124,12 +1124,13 @@ func (c *Concierge) forEar(ctx context.Context, written, issueKey string) string
 // rewrite rewrites an agent's written answer to be spoken, and checks the
 // spoken text against it (R8 as written, earCheck). A status the answer
 // names as Dispatch writes it ("needs_review") is in words first, so the
-// model, the check and the room all have the words. The model is told the
-// issue key the question named; when its rewrite does not hold it, the key
-// is put in front, and the check reads the text with it. A rewrite that
-// fails the check, or a model that fails, gets one more try, told why; after
-// the second the voice says the fixed sentence. The log says only why, never
-// the words.
+// model, the check and the room all have the words; and so is one the
+// rewrite names, before the check, since the model may write it back. The
+// model is told the issue key the question named; when its rewrite does not
+// hold it, the key is put in front, and the check reads the text with it. A
+// rewrite that fails the check, or a model that fails, gets one more try,
+// told why; after the second the voice says the fixed sentence. The log says
+// only why, never the words.
 func (c *Concierge) rewrite(ctx context.Context, written, issueKey string) EarRewrite {
 	written = statusesInWords(written)
 	reason := ""
@@ -1142,6 +1143,7 @@ func (c *Concierge) rewrite(ctx context.Context, written, issueKey string) EarRe
 			reason = "the rewrite was empty or failed"
 			continue
 		}
+		text = statusesInWords(text)
 		if issueKey != "" && !set(earKey.FindAllString(text, -1))[issueKey] {
 			text = issueKey + ": " + text
 		}
@@ -1430,8 +1432,12 @@ func (s *sentences) flush(ctx context.Context) error {
 	return s.speak(ctx, rest)
 }
 
+// speak says one sentence of the model's, each status in it in words
+// ("needs review", not "needs_review"), within R8's bounds and once it holds
+// only what the source does. The words are counted, checked and said as the
+// room hears them.
 func (s *sentences) speak(ctx context.Context, sentence string) error {
-	sentence = strings.TrimSpace(sentence)
+	sentence = statusesInWords(strings.TrimSpace(sentence))
 	if sentence == "" {
 		return nil
 	}

@@ -93,6 +93,55 @@ func TestTheModelReadsNoStatusToken(t *testing.T) {
 	}
 }
 
+// TestAStatusTheModelWritesIsSpokenInWords (Sol's review of #194, O2): the
+// record gives the model "needs review", but a model that writes
+// "needs_review" anyway reached the room as written: a fast answer's
+// sentence, and an agent's answer as the rewrite for the ear gave it back.
+// It fails at 0081b237 unless both are said with the status in words.
+func TestAStatusTheModelWritesIsSpokenInWords(t *testing.T) {
+	r := newRig(t)
+	r.records.issues["INFRA-14"] = &dispatch.Issue{
+		Key: "INFRA-14", Title: "Pull-request watcher", Status: "needs_review",
+		UpdatedAt: testNow.Add(-12 * time.Minute),
+	}
+	r.model.turns = [][]*genai.GenerateContentResponse{{chunk(text("INFRA-14 needs_review."))}}
+	var spoken []said
+	err := r.concierge.Answer(context.Background(), &r.exchange, "what is the status of INFRA-14", recorder(&spoken))
+	if err != nil || !slices.ContainsFunc(spoken, func(s said) bool { return s.text == "INFRA-14 needs review." }) ||
+		slices.ContainsFunc(spoken, func(s said) bool { return strings.Contains(s.text, "needs_review") }) {
+		t.Errorf("Answer = %v, spoken %+v; want %q, and no status token", err, spoken, "INFRA-14 needs review.")
+	}
+
+	r = newRig(t)
+	r.model.turns = [][]*genai.GenerateContentResponse{{chunk(text("INFRA-14 is in needs_review."))}}
+	if said := r.concierge.forEar(context.Background(), "INFRA-14 is in needs review.", "INFRA-14"); said != "INFRA-14 is in needs review." {
+		t.Errorf("an agent's answer rewritten as %q is spoken %q; want %q", "INFRA-14 is in needs_review.", said, "INFRA-14 is in needs review.")
+	}
+}
+
+// TestARecordTitleSaysItsStatusInWords (Sol's review of #194, O2): a title
+// that names a status ("Move to needs_review") reached the model as written,
+// beside the issue's status in words. It fails at 0081b237 unless
+// read_issue and search_issues give each title with its statuses in words.
+func TestARecordTitleSaysItsStatusInWords(t *testing.T) {
+	r := newRig(t)
+	r.records.issues["INFRA-14"] = &dispatch.Issue{Key: "INFRA-14", Title: "Move to needs_review", Status: "needs_review", UpdatedAt: testNow.Add(-12 * time.Minute)}
+	if read := r.run(t, "read_issue", map[string]string{"key": "INFRA-14"}); read["title"] != "Move to needs review" || read["status"] != "needs review" {
+		t.Errorf("read_issue title %q, status %q; want both in words", read["title"], read["status"])
+	}
+	r = newRig(t)
+	r.records.hits = []dispatch.SearchHit{{Kind: "issue", IssueKey: "INFRA-14", Title: "Move to in_progress", Status: "in_progress", Score: 0.9}}
+	r.records.kwHits = slices.Clone(r.records.hits)
+	hits := r.run(t, "search_issues", map[string]string{"query": "move"})
+	issues, _ := hits["issues"].([]any)
+	if len(issues) == 0 {
+		t.Fatalf("search_issues returned no issues: %v", hits)
+	}
+	if first, _ := issues[0].(map[string]any); first["title"] != "Move to in progress" {
+		t.Errorf("search_issues first issue = %v, want its title in words", first)
+	}
+}
+
 // promptOf is the text of the model's first turn.
 func promptOf(contents []*genai.Content) string {
 	var b strings.Builder

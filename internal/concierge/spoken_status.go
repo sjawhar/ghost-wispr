@@ -21,8 +21,10 @@ var statusToken = regexp.MustCompile(`\b(?:in_progress|needs_review)\b`)
 
 // statusesInWords is text with each status token in it said in words
 // (spokenStatus): "moved to needs_review" is "moved to needs review". The
-// texts the tools give the model, and an agent's answer the voice speaks,
-// go through it, so no status token reaches the room.
+// texts the tools give the model (titles too), an agent's answer before and
+// after its rewrite for the ear, and each sentence of the model's before it
+// is counted, checked and said go through it, so no status token reaches the
+// room, even when the model writes one.
 func statusesInWords(text string) string {
 	return statusToken.ReplaceAllStringFunc(text, spokenStatus)
 }
