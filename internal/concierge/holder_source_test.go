@@ -218,6 +218,61 @@ func TestAnEarlierWorkerDoesNotHideTheCurrentOne(t *testing.T) {
 	}
 }
 
+// TestTheCurrentRoleThatWroteLastHolds (Sol's second review of #193, at
+// cdd3a93): one status is two Legion phases. needs_review is reviewing (the
+// reviewer) and the architect's acceptance; in_progress is planning and
+// implementing. Both workers stay live after their phase, so a fixed order
+// named the finished reviewer during acceptance. Among the running holders
+// of the status's roles, the one who wrote to the issue most recently holds
+// it.
+func TestTheCurrentRoleThatWroteLastHolds(t *testing.T) {
+	for _, c := range []struct {
+		name, status, newest, older string
+		roles                       []dispatch.RoleHolder
+	}{
+		{"acceptance after review", "needs_review", "arch-1", "rev-1", []dispatch.RoleHolder{{Role: "architect", Session: "arch-1"}, {Role: "reviewer", Session: "rev-1"}}},
+		{"review in progress", "needs_review", "rev-1", "arch-1", []dispatch.RoleHolder{{Role: "architect", Session: "arch-1"}, {Role: "reviewer", Session: "rev-1"}}},
+		{"planning in progress", "in_progress", "plan-1", "impl-1", []dispatch.RoleHolder{{Role: "planner", Session: "plan-1"}, {Role: "implementer", Session: "impl-1"}}},
+		{"implementing after planning", "in_progress", "impl-1", "plan-1", []dispatch.RoleHolder{{Role: "planner", Session: "plan-1"}, {Role: "implementer", Session: "impl-1"}}},
+	} {
+		r := newRig(t)
+		r.records.issues["ABC-12"] = &dispatch.Issue{Key: "ABC-12", Status: c.status}
+		r.records.roleHolders["ABC-12"] = c.roles
+		r.records.events["ABC-12"] = []dispatch.Event{
+			wrote("comment.created", testNow.Add(-time.Minute), c.newest, "Newest"),
+			wrote("comment.created", testNow.Add(-time.Hour), c.older, "Older"),
+		}
+		for _, h := range c.roles {
+			r.agents.states[h.Session] = live(h.Session)
+		}
+		if got := r.run(t, "issue_holder", map[string]string{"key": "ABC-12"}); got["session"] != c.newest || got["live"] != true {
+			t.Errorf("%s: issue_holder = %v, want %s, the current role's holder who wrote last", c.name, got, c.newest)
+		}
+	}
+}
+
+// TestAnAskDuringAcceptanceGoesToTheArchitect (Sol's probe): "ask the agent
+// on ABC-12 …" on an unclaimed issue in needs_review, whose architect is
+// accepting it after the review, goes to the architect, not the reviewer.
+func TestAnAskDuringAcceptanceGoesToTheArchitect(t *testing.T) {
+	r := newRig(t)
+	r.records.issues["ABC-12"] = &dispatch.Issue{Key: "ABC-12", Title: "Offline mode", Status: "needs_review"}
+	r.records.roleHolders["ABC-12"] = []dispatch.RoleHolder{{Role: "architect", Session: "architect"}, {Role: "reviewer", Session: "reviewer"}}
+	r.records.events["ABC-12"] = []dispatch.Event{
+		{Type: "comment.created", CreatedAt: testNow.Add(-time.Minute), Actor: actor("session", "architect", "Legion architect"), Payload: json.RawMessage(`{"body":"Review passed. I am accepting this head now."}`)},
+		{Type: "comment.created", CreatedAt: testNow.Add(-time.Hour), Actor: actor("session", "reviewer", "Legion reviewer"), Payload: json.RawMessage(`{"body":"My phase is complete."}`)},
+	}
+	r.agents.states["architect"], r.agents.states["reviewer"] = live("architect"), live("reviewer")
+	r.model.turns = [][]*genai.GenerateContentResponse{{chunk(text("ABC-12: the review passed."))}}
+	answerTurn(t, r, "ask the agent on ABC-12 which scope decision the architect still needs from me")
+	r.agents.mu.Lock()
+	sent := slices.Clone(r.agents.sent)
+	r.agents.mu.Unlock()
+	if len(sent) != 1 || sent[0].Target != "architect" {
+		t.Errorf("sent %+v, want one question to the architect", sent)
+	}
+}
+
 // TestAPersonsClaimIsThePerson fails if a person's claim, whose holder_state
 // Dispatch leaves null, is read as Dispatch giving no liveness: no Envoy
 // lookup, no role holder, no session of the events is the holder.

@@ -666,33 +666,34 @@ func (r *runner) claimHolder(ctx context.Context, issue *dispatch.Issue) map[str
 	return r.sessionHolder(ctx, claimant.ID, claimant.Origin.SessionTitle)
 }
 
-// phaseRoles are the Legion roles that work an issue in each Dispatch status,
-// the later phase first. Legion's workflow writes in_progress for planning
-// and implementing, testing for testing, needs_review for reviewing and the
+// phaseRoles are the Legion roles whose phases a Dispatch status holds: a
+// set, not an order. Legion's workflow writes in_progress for planning and
+// implementing, testing for testing, needs_review for reviewing and the
 // architect's acceptance, and retro for retro and merging (its
 // workflow/table.go); each phase's role is its phase.RoleFor.
 var phaseRoles = map[string][]string{
-	"in_progress":  {"implementer", "planner"},
+	"in_progress":  {"planner", "implementer"},
 	"testing":      {"tester"},
 	"needs_review": {"reviewer", "architect"},
-	"retro":        {"merger", "implementer"},
+	"retro":        {"implementer", "merger"},
 }
 
 // workerHolder is the holder of an issue nobody claims: the session that
-// works it now. The current phase decides: the Legion role holder the daemon
-// publishes for the role that works the issue's status (phaseRoles); then the
-// newest session that wrote to the issue; then the other role holders, the
-// implementer first, and the sessions that set the issue's status, newest
-// first. A session of an earlier phase never beats a newer writer that runs:
-// an issue in testing named its previous implementer over its live tester
-// (Sol's review of #193). The first candidate Envoy knows running, live or
-// unresponsive, is the holder; one Envoy calls gone is passed over, since
-// Envoy calls a restarting Legion session gone for under a second. None
-// running: nobody is on the issue. An id that is no agent session's, this
-// unit's, or one Envoy's registry refuses (400) is no candidate. Measured on
-// 2026-11-25 over 2069 open issues, this names the current phase's running
-// role holder on all 293 unclaimed issues that have one (244 before, 93 on
-// main), and a running role holder on 297 of the 299 with any.
+// works it now. The current phase decides. Among the Legion role holders the
+// daemon publishes for the roles of the issue's status (phaseRoles), the one
+// who wrote to the issue most recently holds it: one status holds two
+// phases, and both workers stay live after theirs, so an order named the
+// finished reviewer during the architect's acceptance (Sol's second review of
+// #193). Then the newest session that wrote to the issue; then the other role
+// holders, the implementer first, and the sessions that set the issue's
+// status, newest first. A session of an earlier phase never beats a newer
+// writer that runs: an issue in testing named its previous implementer over
+// its live tester (Sol's first review). The first candidate Envoy knows
+// running, live or unresponsive, is the holder; one Envoy calls gone is
+// passed over, since Envoy calls a restarting Legion session gone for under a
+// second. None running: nobody is on the issue. An id that is no agent
+// session's, this unit's, or one Envoy's registry refuses (400) is no
+// candidate.
 func (r *runner) workerHolder(ctx context.Context, records Records, issue *dispatch.Issue) (map[string]any, error) {
 	agents := r.c.currentAgents()
 	own := ""
@@ -759,18 +760,32 @@ func (r *runner) workerHolder(ctx context.Context, records Records, issue *dispa
 			r.c.logger.Warn("concierge could not read an issue's role holders", "issue", issue.Key, "error", err)
 		}
 	}
-	// The role holder of the current phase, the later phase first.
-	for _, role := range phaseRoles[issue.Status] {
-		for _, holder := range holders {
-			if holder.Role == role {
-				if answer, _ := look(holder.Session, ""); answer != nil {
-					return answer, nil
-				}
-			}
+	// The current roles' holders. Two or more are ranked by who wrote last,
+	// which waits for the events; one is tried at once, and the events read
+	// stops if it holds.
+	var current []string
+	for _, holder := range holders {
+		if slices.Contains(phaseRoles[issue.Status], holder.Role) && !slices.Contains(current, holder.Session) {
+			current = append(current, holder.Session)
 		}
 	}
-	got := <-read
-	if got.err != nil {
+	var got eventsRead
+	waited := false
+	events := func() eventsRead {
+		if !waited {
+			got, waited = <-read, true
+		}
+		return got
+	}
+	if len(current) > 1 {
+		rankByNewest(current, events().events)
+	}
+	for _, session := range current {
+		if answer, _ := look(session, ""); answer != nil {
+			return answer, nil
+		}
+	}
+	if events().err != nil {
 		return nil, got.err
 	}
 	// The newest writer: the first candidate of the events, newest first.
@@ -804,6 +819,33 @@ func (r *runner) workerHolder(ctx context.Context, records Records, issue *dispa
 		}
 	}
 	return noHolder(issue), nil
+}
+
+// rankByNewest orders sessions by who wrote to the issue most recently, in
+// events newest first; one that never wrote goes after any that did, in the
+// order given.
+func rankByNewest(sessions []string, events []dispatch.Event) {
+	newest := map[string]int{}
+	for i := range events {
+		if actor := &events[i].Actor; actor.Kind == "session" {
+			if _, seen := newest[actor.ID]; !seen {
+				newest[actor.ID] = i
+			}
+		}
+	}
+	slices.SortStableFunc(sessions, func(a, b string) int {
+		at, aWrote := newest[a]
+		bt, bWrote := newest[b]
+		switch {
+		case aWrote && bWrote:
+			return cmp.Compare(at, bt)
+		case aWrote:
+			return -1
+		case bWrote:
+			return 1
+		}
+		return 0
+	})
 }
 
 // setsStatus reports whether event set its issue's status: an issue.updated
