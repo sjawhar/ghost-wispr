@@ -58,6 +58,11 @@ const (
 	// spend the answer's 8 s (R6, R10).
 	lookupBound = 2 * time.Second
 	callBound   = 3 * time.Second
+	// holderBound bounds issue_holder's whole read of an unclaimed issue:
+	// its role holders, its events a page at a time, and Envoy's lookups.
+	// The first fact waits for the holder, so the holder waits no longer
+	// than one Dispatch read may.
+	holderBound = callBound
 	// searchBound bounds one search. Dispatch's normal search took 1.0 to
 	// 6.4 s live on 2026-11-19 (median 1.2 s, p90 2.2 s), and 3.3 to 5.0 s
 	// on 2026-11-24 (20 runs from the devbox: median 3.9 to 4.2 s, p90 4.3

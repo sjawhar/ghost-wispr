@@ -59,16 +59,13 @@ type fakeRecords struct {
 	// projectsBlock, when set, holds each Projects call until it is closed
 	// or the call's context ends.
 	projectsBlock chan struct{}
-	// holderEventsErr, when set, is the answer of issue_holder's read of
-	// events (holderEvents), and of no other read.
-	holderEventsErr error
+	// holderEventsErr, when set, is the answer of issue_holder's reads of
+	// events (holderPage), and of no other read; holderEventsDelay holds
+	// each such read that long, or until its context ends.
+	holderEventsErr   error
+	holderEventsDelay time.Duration
 	// roleHoldersErr, when set, is the answer of every RoleHolders read.
 	roleHoldersErr error
-	// holderEventsSlow, when set, holds issue_holder's read of events until
-	// its context ends, and ends it 200 ms later, as a read on the wire ends
-	// a while after it is stopped; holderEventsOpen counts those not ended.
-	holderEventsSlow bool
-	holderEventsOpen int
 	// docBlock, when set, holds each DocumentText call (a spec read) until
 	// it is closed or the call's context ends: a slow read_issue.
 	docBlock chan struct{}
@@ -167,41 +164,42 @@ func (f *fakeRecords) calls() []string {
 	return append([]string(nil), f.issueCalls...)
 }
 
-func (f *fakeRecords) Events(ctx context.Context, key string, limit int) ([]dispatch.Event, error) {
+// Events gives key's events newest first, paged as Dispatch pages them: an
+// event with no sequence number is numbered by its place, the oldest 1.
+func (f *fakeRecords) Events(ctx context.Context, key string, before int64, limit int) ([]dispatch.Event, error) {
 	f.mu.Lock()
 	f.limits = append(f.limits, limit)
-	err, holderErr, events := f.err, f.holderEventsErr, f.events[key]
-	slow := limit == holderEvents && f.holderEventsSlow
-	if slow {
-		f.holderEventsOpen++
-	}
+	err, holderErr, delay, all := f.err, f.holderEventsErr, f.holderEventsDelay, f.events[key]
 	f.mu.Unlock()
-	if slow {
-		select {
-		case <-ctx.Done():
-		case <-time.After(5 * time.Second):
-		}
-		time.Sleep(200 * time.Millisecond)
-		f.mu.Lock()
-		f.holderEventsOpen--
-		f.mu.Unlock()
-		return nil, context.Canceled
-	}
 	if err != nil {
 		return nil, err
 	}
-	if limit == holderEvents && holderErr != nil {
+	if limit == holderPage && delay > 0 {
+		select {
+		case <-time.After(delay):
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	if limit == holderPage && holderErr != nil {
 		return nil, holderErr
 	}
-	return events, nil
-}
-
-// openHolderEvents is how many of issue_holder's slow reads of events have
-// not ended.
-func (f *fakeRecords) openHolderEvents() int {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	return f.holderEventsOpen
+	var page []dispatch.Event
+	for i := range all {
+		seq := all[i].Seq
+		if seq == 0 {
+			seq = int64(len(all) - i)
+		}
+		if before > 0 && seq >= before {
+			continue
+		}
+		if limit > 0 && len(page) == limit {
+			break
+		}
+		page = append(page, all[i])
+		page[len(page)-1].Seq = seq
+	}
+	return page, nil
 }
 
 func (f *fakeRecords) RoleHolders(_ context.Context, key string) ([]dispatch.RoleHolder, error) {

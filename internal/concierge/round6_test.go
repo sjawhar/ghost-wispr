@@ -118,8 +118,8 @@ func TestFastAnswerFactsHaveSourcesAndAges(t *testing.T) {
 	if spoken[0].text != fixedSentence {
 		t.Fatalf("spoken = %+v, want the fixed sentence first", spoken)
 	}
-	if limits := r.records.eventLimits(); !slices.Contains(limits, recentEvents) || slices.ContainsFunc(limits, func(n int) bool { return n != recentEvents && n != holderEvents }) {
-		t.Errorf("event reads asked for %v, want read_issue's 10 (beside issue_holder's 50)", limits)
+	if limits := r.records.eventLimits(); !slices.Contains(limits, recentEvents) || slices.ContainsFunc(limits, func(n int) bool { return n != recentEvents && n != holderPage }) {
+		t.Errorf("event reads asked for %v, want read_issue's 10 (beside issue_holder's pages of %d)", limits, holderPage)
 	}
 	prompt := r.model.requests[0][0].Parts[0].Text
 	if !strings.Contains(prompt, `"updated_ago":"2 hours ago"`) || !strings.Contains(prompt, `"when":"5 minutes ago"`) {

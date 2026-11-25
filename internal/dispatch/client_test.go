@@ -196,23 +196,40 @@ func TestAnIssueKeyMustLookLikeOne(t *testing.T) {
 func TestEventsAsksForTheNewestFirst(t *testing.T) {
 	fake, client := newFakeDispatch(t)
 	fake.answer("/api/v1/issues/ABC-12/events", `[
-		{"type":"comment.created","created_at":"2026-11-19T05:44:31Z","actor":{"kind":"session","id":"s-2","origin":{"session_title":"Worker"},"owner":"person@example.com"},"payload":{"body":"Merged PR 80."}},
-		{"type":"issue.updated","created_at":"2026-11-19T05:40:00Z","actor":{"kind":"user","id":"person@example.com"},"payload":{}}
+		{"seq":7,"type":"comment.created","created_at":"2026-11-19T05:44:31Z","actor":{"kind":"session","id":"s-2","origin":{"session_title":"Worker"},"owner":"person@example.com"},"payload":{"body":"Merged PR 80."}},
+		{"seq":6,"type":"issue.updated","created_at":"2026-11-19T05:40:00Z","actor":{"kind":"user","id":"person@example.com"},"payload":{}}
 	]`)
 
-	events, err := client.Events(context.Background(), "ABC-12", 20)
+	events, err := client.Events(context.Background(), "ABC-12", 0, 20)
 	if err != nil {
 		t.Fatalf("Events: %v", err)
 	}
 	query := fake.last().URL.Query()
-	if query.Get("order") != "desc" || query.Get("limit") != "20" {
+	if query.Get("order") != "desc" || query.Get("limit") != "20" || query.Has("before") {
 		t.Errorf("events query = %v", query)
 	}
 	if len(events) != 2 || events[0].Type != "comment.created" || events[0].Actor.ID != "s-2" || events[0].Actor.Kind != "session" || events[1].Actor.Kind != "user" {
 		t.Fatalf("events = %+v", events)
 	}
+	if events[0].Seq != 7 || events[1].Seq != 6 {
+		t.Errorf("sequence numbers = %d, %d, want 7, 6", events[0].Seq, events[1].Seq)
+	}
 	if !strings.Contains(string(events[0].Payload), "Merged PR 80.") {
 		t.Errorf("payload = %s", events[0].Payload)
+	}
+}
+
+// TestEventsPagesBeforeASequenceNumber fails if a read of the events older
+// than an event does not ask Dispatch for those before its sequence number,
+// newest first, as GET /api/v1/issues/{key}/events pages them.
+func TestEventsPagesBeforeASequenceNumber(t *testing.T) {
+	fake, client := newFakeDispatch(t)
+	fake.answer("/api/v1/issues/ABC-12/events", `[]`)
+	if _, err := client.Events(context.Background(), "ABC-12", 51, 50); err != nil {
+		t.Fatalf("Events: %v", err)
+	}
+	if query := fake.last().URL.Query(); query.Get("order") != "desc" || query.Get("limit") != "50" || query.Get("before") != "51" {
+		t.Errorf("events query = %v, want order desc, limit 50, before 51", query)
 	}
 }
 
@@ -324,7 +341,7 @@ func TestAnErrorNamesTheRouteNotTheKey(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = unreachable.Events(context.Background(), "LAST-24", 5)
+	_, err = unreachable.Events(context.Background(), "LAST-24", 0, 5)
 	if !errors.Is(err, ErrUnreachable) || strings.Contains(err.Error(), "LAST") {
 		t.Fatalf("an unreachable read of LAST-24 = %v", err)
 	}

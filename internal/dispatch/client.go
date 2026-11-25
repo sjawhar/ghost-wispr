@@ -252,16 +252,20 @@ func (c *Client) Issue(ctx context.Context, key string) (*Issue, error) {
 	return &issue, nil
 }
 
-// Event is one event of an issue's log.
+// Event is one event of an issue's log. Seq is its place in the issue's
+// event sequence, from 1.
 type Event struct {
+	Seq       int64           `json:"seq"`
 	Type      string          `json:"type"`
 	CreatedAt time.Time       `json:"created_at"`
 	Actor     Actor           `json:"actor"`
 	Payload   json.RawMessage `json:"payload"`
 }
 
-// Events reads an issue's newest limit events, newest first.
-func (c *Client) Events(ctx context.Context, key string, limit int) ([]Event, error) {
+// Events reads an issue's newest limit events, newest first, before the
+// event whose sequence number is before; 0 is the newest of all. Dispatch
+// gives at most 200 a read.
+func (c *Client) Events(ctx context.Context, key string, before int64, limit int) ([]Event, error) {
 	key, err := NormalizeIssueKey(key)
 	if err != nil {
 		return nil, err
@@ -269,6 +273,9 @@ func (c *Client) Events(ctx context.Context, key string, limit int) ([]Event, er
 	params := url.Values{"order": {"desc"}}
 	if limit > 0 {
 		params.Set("limit", strconv.Itoa(limit))
+	}
+	if before > 0 {
+		params.Set("before", strconv.FormatInt(before, 10))
 	}
 	var events []Event
 	if err := c.get(ctx, "events", "/api/v1/issues/"+key+"/events", params, &events); err != nil {

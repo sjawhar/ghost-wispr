@@ -64,9 +64,9 @@ func (b boundedRecords) Issue(ctx context.Context, key string) (issue *dispatch.
 	return issue, err
 }
 
-func (b boundedRecords) Events(ctx context.Context, key string, limit int) (events []dispatch.Event, err error) {
+func (b boundedRecords) Events(ctx context.Context, key string, before int64, limit int) (events []dispatch.Event, err error) {
 	err = b.within(ctx, func(ctx context.Context) error {
-		events, err = b.inner.Events(ctx, key, limit)
+		events, err = b.inner.Events(ctx, key, before, limit)
 		return err
 	})
 	return events, err
