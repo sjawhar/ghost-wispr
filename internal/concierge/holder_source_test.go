@@ -356,26 +356,29 @@ func TestAClaimByNoAgentSessionIsUnknownWhateverDispatchSays(t *testing.T) {
 	}
 }
 
-// TestASessionDispatchReadsLiveIsAsked fails if ask_agent refuses a claim's
-// session that Dispatch read live because Envoy's registry calls it gone, as
-// it does for under a second while a Legion session restarts: the room heard
-// "I could not ask the agent on ABC-12." A session Envoy alone judged gone is
-// still not asked.
-func TestASessionDispatchReadsLiveIsAsked(t *testing.T) {
-	r := newRig(t)
-	heldIssue(r, "session", false)
-	r.records.issues["ABC-12"].HolderState = "live"
-	delete(r.agents.states, "agent-7")
-	r.model.turns = [][]*genai.GenerateContentResponse{{chunk(text("ABC-12: PR 80 is in review."))}}
-	spoken := answerTurn(t, r, "ask the agent on ABC-12 whether the tap is merged")
-	if len(r.agents.sent) != 1 || r.agents.sent[0].Target != "agent-7" {
-		t.Errorf("sent %+v, want the question to agent-7", r.agents.sent)
-	}
-	if !slices.ContainsFunc(spoken, func(s said) bool { return strings.HasPrefix(s.text, "I asked the agent on ABC-12.") }) {
-		t.Errorf("spoken = %+v, want that the agent on ABC-12 was asked", spoken)
+// TestASessionDispatchReadsRunningIsAsked fails if ask_agent refuses a
+// claim's session that Dispatch read running, live or unresponsive, because
+// Envoy's registry calls it gone, as it does for under a second while a
+// Legion session restarts: the room heard "I could not ask the agent on
+// ABC-12." Envoy stores the question for an unresponsive session. A session
+// Envoy alone judged gone is still not asked.
+func TestASessionDispatchReadsRunningIsAsked(t *testing.T) {
+	for _, state := range []string{"live", "unresponsive"} {
+		r := newRig(t)
+		heldIssue(r, "session", false)
+		r.records.issues["ABC-12"].HolderState = state
+		delete(r.agents.states, "agent-7")
+		r.model.turns = [][]*genai.GenerateContentResponse{{chunk(text("ABC-12: PR 80 is in review."))}}
+		spoken := answerTurn(t, r, "ask the agent on ABC-12 whether the tap is merged")
+		if len(r.agents.sent) != 1 || r.agents.sent[0].Target != "agent-7" {
+			t.Errorf("Dispatch read it %s: sent %+v, want the question to agent-7", state, r.agents.sent)
+		}
+		if !slices.ContainsFunc(spoken, func(s said) bool { return strings.HasPrefix(s.text, "I asked the agent on ABC-12.") }) {
+			t.Errorf("Dispatch read it %s: spoken = %+v, want that the agent on ABC-12 was asked", state, spoken)
+		}
 	}
 
-	r = newRig(t)
+	r := newRig(t)
 	heldIssue(r, "session", false)
 	delete(r.agents.states, "agent-7")
 	if holder := r.run(t, "issue_holder", map[string]string{"key": "ABC-12"}); holder["state"] != "gone" {
@@ -387,12 +390,12 @@ func TestASessionDispatchReadsLiveIsAsked(t *testing.T) {
 }
 
 // TestTheAssigneeIsNotTheHolder (a live run of the real Concierge on
-// 2026-11-25): asked "Who holds INFRA-3173?", the voice said
-// "sami@theorem.dev holds INFRA-3173": the model took read_issue's assignee
-// for the holder, while issue_holder named the issue's Legion architect,
-// gone. read_issue and issue_holder name the person an issue is assigned to
-// as such, never as a holder, and the model is told that the holder comes
-// only from issue_holder.
+// 2026-11-25): asked "Who holds INFRA-3173?", the voice named the person
+// the issue is assigned to as its holder: the model took read_issue's
+// assignee for the holder, while issue_holder named the issue's Legion
+// architect, gone. read_issue and issue_holder name the person an issue is
+// assigned to as such, never as a holder, and the model is told that the
+// holder comes only from issue_holder.
 func TestTheAssigneeIsNotTheHolder(t *testing.T) {
 	r := newRig(t)
 	issue := claimed("ABC-12", "session", "agent-7", "Legion architect")

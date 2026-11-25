@@ -830,7 +830,11 @@ func (r *runner) sessionHolder(ctx context.Context, id, title string) map[string
 // {unresponsive} with the state and when the session was last seen. It names
 // the session for ask_agent; byDispatch: Dispatch judged the state.
 func (r *runner) heldBy(id, title string, state envoy.SessionState, lastSeen time.Time, byDispatch bool) map[string]any {
-	r.c.remember(r.x, id, byDispatch && state == envoy.StateLive)
+	judged := envoy.SessionState("")
+	if byDispatch {
+		judged = state
+	}
+	r.c.remember(r.x, id, judged)
 	result := map[string]any{"session": id, "title": spokenName(title)}
 	if state == envoy.StateLive {
 		result["holder"], result["live"] = "session", true
@@ -846,7 +850,7 @@ func (r *runner) heldBy(id, title string, state envoy.SessionState, lastSeen tim
 // outOfReachHolder is the answer for agent session id when Envoy did not
 // answer, or the unit has no Envoy session: R10's error sound.
 func (r *runner) outOfReachHolder(id, title string) map[string]any {
-	r.c.remember(r.x, id, false)
+	r.c.remember(r.x, id, "")
 	return map[string]any{"holder": "unresponsive", "state": "unknown", "note": cannotReachEnvoy, "session": id, "title": spokenName(title)}
 }
 
@@ -890,11 +894,16 @@ func (r *runner) askAgent(ctx context.Context, session, question, issueKey strin
 		}
 		issueKey = normalized
 	}
-	// Dispatch's liveness wins: a session it read live when issue_holder
-	// named it is asked whatever Envoy's registry says, which calls a
-	// restarting Legion session gone for under a second. Envoy stores the
-	// question for it.
-	if !r.c.readLive(r.x, session) {
+	// Dispatch's judgment wins: a session it read running (live or
+	// unresponsive) when issue_holder named it is asked whatever Envoy's
+	// registry says, which calls a restarting Legion session gone for under
+	// a second. Envoy stores the question for an unresponsive session. Envoy
+	// is asked only for a session Dispatch judged none.
+	switch judged, _ := r.c.dispatchRead(r.x, session); judged {
+	case envoy.StateLive, envoy.StateUnresponsive:
+	case envoy.StateGone:
+		return nil, tell("That agent's session has ended, so it cannot be asked.")
+	default:
 		info, err := r.c.lookup(ctx, agents, session)
 		if err != nil {
 			return nil, tell(cannotReachEnvoy)
@@ -1162,7 +1171,7 @@ func (r *runner) listJoinedAgents() map[string]any {
 	agents := []map[string]any{}
 	if r.c.joined != nil {
 		for _, agent := range r.c.joined() {
-			r.c.remember(r.x, agent.SessionID, false)
+			r.c.remember(r.x, agent.SessionID, "")
 			agents = append(agents, map[string]any{"session": agent.SessionID, "title": spokenName(agent.Title), "issue_key": agent.IssueKey})
 		}
 	}
@@ -1207,11 +1216,11 @@ func (c *Concierge) joinedNumber(words string) string {
 // exchange: longer than any exchange.
 const namedFor = time.Hour
 
-// named is the agent sessions the tools named in one exchange, each with
-// whether Dispatch read it live when it was named.
+// named is the agent sessions the tools named in one exchange, each with the
+// state Dispatch judged it in, empty where Dispatch judged none.
 type named struct {
 	at       time.Time
-	sessions map[string]bool
+	sessions map[string]envoy.SessionState
 }
 
 // exchangeKey names one exchange: its meeting and its wake.
@@ -1220,10 +1229,11 @@ func exchangeKey(x *voice.Exchange) string {
 }
 
 // remember makes session askable in x: issue_holder or list_joined_agents
-// named it there; readLive: Dispatch read it live. An exchange heard before
-// its recording session existed keeps its names under no session id;
-// wasNamed and readLive read both.
-func (c *Concierge) remember(x *voice.Exchange, session string, readLive bool) {
+// named it there; judged is the state Dispatch read it in, empty where
+// Dispatch judged none. An exchange heard before its recording session
+// existed keeps its names under no session id; wasNamed and dispatchRead
+// read both.
+func (c *Concierge) remember(x *voice.Exchange, session string, judged envoy.SessionState) {
 	if x.SessionID == "" && x.WakeAt.IsZero() {
 		return // no exchange, as IssueHolder's
 	}
@@ -1241,10 +1251,10 @@ func (c *Concierge) remember(x *voice.Exchange, session string, readLive bool) {
 	key := exchangeKey(x)
 	entry, ok := c.named[key]
 	if !ok {
-		entry = &named{at: now, sessions: map[string]bool{}}
+		entry = &named{at: now, sessions: map[string]envoy.SessionState{}}
 		c.named[key] = entry
 	}
-	entry.sessions[session] = entry.sessions[session] || readLive
+	entry.sessions[session] = cmp.Or(judged, entry.sessions[session])
 }
 
 // wasNamed reports whether the tools named session in x, so ask_agent may ask
@@ -1252,28 +1262,23 @@ func (c *Concierge) remember(x *voice.Exchange, session string, readLive bool) {
 // wake alone. Room speech, an issue's text or an agent's answer cannot name a
 // session to ask; only the record's holder or a joined agent is asked.
 func (c *Concierge) wasNamed(x *voice.Exchange, session string) bool {
-	return c.namedAs(x, session, func(bool) bool { return true })
+	_, named := c.dispatchRead(x, session)
+	return named
 }
 
-// readLive reports whether Dispatch read session live when the tools named
-// it in x.
-func (c *Concierge) readLive(x *voice.Exchange, session string) bool {
-	return c.namedAs(x, session, func(live bool) bool { return live })
-}
-
-// namedAs reports whether the tools named session in x with a liveness that
-// holds.
-func (c *Concierge) namedAs(x *voice.Exchange, session string, holds func(readLive bool) bool) bool {
+// dispatchRead is the state Dispatch read session in when the tools named it
+// in x, empty where Dispatch judged none, and whether they named it at all.
+func (c *Concierge) dispatchRead(x *voice.Exchange, session string) (envoy.SessionState, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	for _, key := range []string{exchangeKey(x), exchangeKey(&voice.Exchange{WakeAt: x.WakeAt})} {
 		if entry, ok := c.named[key]; ok {
-			if live, named := entry.sessions[session]; named && holds(live) {
-				return true
+			if judged, named := entry.sessions[session]; named {
+				return judged, true
 			}
 		}
 	}
-	return false
+	return "", false
 }
 
 // sending counts the questions on their way to agent session session.
