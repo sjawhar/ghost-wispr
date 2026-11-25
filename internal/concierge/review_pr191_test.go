@@ -167,6 +167,13 @@ type cutRig struct {
 // the model answers with turns.
 func newCutRig(t *testing.T, turns ...[]*genai.GenerateContentResponse) *cutRig {
 	t.Helper()
+	return newCutRigOpening(t, []string{"Wispr, what is happening with ABC-12?"}, true, turns...)
+}
+
+// newCutRigOpening is newCutRig opening with finals, each a final result;
+// each ends its utterance when endpoints, else the last alone.
+func newCutRigOpening(t *testing.T, finals []string, endpoints bool, turns ...[]*genai.GenerateContentResponse) *cutRig {
+	t.Helper()
 	r := &cutRig{rig: newRig(t), speaker: &cutSpeaker{}}
 	t.Cleanup(r.concierge.Stop)
 	heldIssue(r.rig, "session", false)
@@ -192,7 +199,9 @@ func newCutRig(t *testing.T, turns ...[]*genai.GenerateContentResponse) *cutRig 
 		Logf:         t.Logf,
 	})
 	t.Cleanup(r.sup.Close)
-	r.wakeEnd = r.hear("Wispr, what is happening with ABC-12?", true, nil)
+	for i, final := range finals {
+		r.wakeEnd = r.hearEnding(final, true, endpoints || i == len(finals)-1, nil)
+	}
 	select {
 	case r.sess = <-driver.opened:
 	case <-time.After(r7Deadline):
@@ -741,6 +750,82 @@ func TestASplitKeyTheRecordLacksIsHeardAsNoIssue(t *testing.T) {
 			r7Until(t, "the no-issue line spoken", func() bool {
 				return slices.ContainsFunc(r.driver.said(), func(s r7Said) bool { return s.text == noIssueFound })
 			})
+		})
+	}
+}
+
+// TestWhereTheTwoRulesMeet (Main, on rebasing #191 onto #194): #194's rules
+// and #191's meet where a reply to Wispr's question holds a decline, a key
+// of one digit, a spelled key or more keys than a read tries. It fails if
+// "no, not ABC-12" after an offer is no decline, or leaves a read a next
+// question takes; if a key of one digit, or a spelled offered key, said
+// after a take-back is not the one read; or if a key said before a take-back
+// is read while the keys after it are held to the read's limit.
+func TestWhereTheTwoRulesMeet(t *testing.T) {
+	t.Run("no, not ABC-12 after an offer", func(t *testing.T) {
+		r, got := answerAfterOfferReply(t, "no, not ABC-12", "no, not ABC-12")
+		if got.err != nil || len(got.spoken) != 1 || got.spoken[0].text != "Okay." || got.reads+got.full+got.keyword+got.sent != 0 {
+			t.Fatalf("Answer = %v, spoken %+v, read %d, searched %d, sent %d; want only \"Okay.\"", got.err, got.spoken, got.reads, got.full+got.keyword, got.sent)
+		}
+		r.exchange.Reply = ""
+		// No search finds an issue: only a read of the declined key could.
+		r.records.mu.Lock()
+		r.records.hits, r.records.kwHits = nil, nil
+		r.records.mu.Unlock()
+		var spoken []said
+		err := r.concierge.Answer(context.Background(), &r.exchange, "ask the agent whether the schedule is ready", recorder(&spoken))
+		if r.exchange.IssueKey == "ABC-12" {
+			t.Errorf("the next question named the declined ABC-12 (Answer = %v, spoken %+v)", err, spoken)
+		}
+	})
+	// OPS is a project the list does not hold: only the offer's own view
+	// (offeredView) reads "O P S thirteen" as OPS-13. The keys of the limit's
+	// row name no issue, so a read tries each of them.
+	opsOffered := []candidate{{"OPS-13", "Wake word"}, {"OPS-14", "Realtime voice"}}
+	for _, tc := range []struct {
+		name, reply, want string
+		cancelled         string
+		offered           []candidate
+	}{
+		{"a key of one digit after a take-back", "what about ABC-42? never mind. what about INFRA-7?", "INFRA-7", "ABC-42", twoOffered},
+		{"a key of one digit said in words after a take-back", "what about ABC-42? never mind. what about infra seven?", "INFRA-7", "ABC-42", twoOffered},
+		{"an offered key spelled after a take-back", "what about ABC-42? never mind. A B C thirteen", "ABC-13", "ABC-42", twoOffered},
+		{"an offered key of a project the list lacks, spelled after a take-back", "what about ABC-42? never mind. O P S thirteen", "OPS-13", "ABC-42", opsOffered},
+		{"more keys than a read tries after a take-back", "what about XYZ-15? never mind. what about ABC-97 and ABC-98 and DEF-99 and XYZ-96?", "", "XYZ-15", twoOffered},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := newRig(t)
+			r.exchange.Reply = tc.reply
+			heldIssue(r, "session", false)
+			oneDigitIssue(r)
+			r.records.mu.Lock()
+			for _, key := range []string{"ABC-13", "ABC-42", "OPS-13", "OPS-14", "XYZ-15"} {
+				r.records.issues[key] = &dispatch.Issue{Key: key, Title: "Recorder " + key, Status: "todo", UpdatedAt: testNow}
+			}
+			r.records.mu.Unlock()
+			r.model.turns = [][]*genai.GenerateContentResponse{{chunk(text("It is in progress."))}}
+			r.concierge.offerPick(&r.exchange, twoOfferedTurn, tc.offered)
+			var spoken []said
+			err := r.concierge.Answer(context.Background(), &r.exchange, tc.reply, recorder(&spoken))
+			calls := r.records.calls()
+			if slices.Contains(calls, tc.cancelled) || strings.Contains(lastPrompt(r), tc.cancelled) {
+				t.Errorf("the cancelled %s was read or given to the model: reads %q", tc.cancelled, calls)
+			}
+			r.agents.mu.Lock()
+			for _, m := range r.agents.sent {
+				if strings.Contains(m.Message, tc.cancelled) {
+					t.Errorf("a holder was sent the cancelled %s: %q", tc.cancelled, m.Message)
+				}
+			}
+			r.agents.mu.Unlock()
+			if tc.want != "" && r.exchange.IssueKey != tc.want {
+				t.Errorf("Answer = %v, took %q, spoken %+v, reads %q; want %s", err, r.exchange.IssueKey, spoken, calls, tc.want)
+			}
+			tried := slices.Clone(calls)
+			slices.Sort(tried)
+			if tried = slices.Compact(tried); len(tried) > maxKeys {
+				t.Errorf("a read tried %q, want at most %d keys", tried, maxKeys)
+			}
 		})
 	}
 }
