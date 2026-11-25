@@ -677,20 +677,19 @@ func TestAnAnswerTakesNoReadOfTheAnswerBefore(t *testing.T) {
 	}
 }
 
-// TestAMisheardNameOpeningTheTurnGoesWithTheWake (Sol's review of #192): a
-// turn sometimes opens with a form Deepgram wrote for the name that the
-// wake detector refuses — a person's address, which it never counts as a
-// call — because the final said so, but an interim named Wispr at that
-// place and the exchange took the turn (sinceWakeLocked). It fails if the
-// form stays in what the full search gets; the control shows the same form
-// inside the question stays.
-func TestAMisheardNameOpeningTheTurnGoesWithTheWake(t *testing.T) {
+// TestAPersonNamedFirstStaysInTheQuestion (Sol's review of #192 at
+// 4e52421): a question may open with a person's name ("Wispr, Miss Burr
+// fixed the realtime voice"), and the Supervisor hands it on without the
+// wake it recognised. It fails if the full search loses the name, which main
+// kept; where a final lost the wake, the Supervisor begins the turn after
+// it (sinceWakeLocked), so no name list strips the question's first words.
+func TestAPersonNamedFirstStaysInTheQuestion(t *testing.T) {
 	for _, tc := range []struct{ query, full string }{
-		{"Mister, what is happening with the realtime voice?", "what is happening with the realtime voice"},
-		{"Miss Burr, what is happening with the realtime voice?", "what is happening with the realtime voice"},
-		{"Miss Murray, what is happening with the realtime voice?", "what is happening with the realtime voice"},
-		// Control: the same words inside the question are not stripped.
-		{"what did Mister Lopez say about the realtime voice?", "what did mister lopez say about the realtime voice"},
+		{"Miss Burr fixed the realtime voice. What changed?", "miss burr fixed the realtime voice what changed"},
+		{"Miss Murray fixed the realtime voice. What changed?", "miss murray fixed the realtime voice what changed"},
+		{"Mister Lopez fixed the realtime voice. What changed?", "mister lopez fixed the realtime voice what changed"},
+		{"What did Miss Burr say about the realtime voice?", "what did miss burr say about the realtime voice"},
+		{"What did Mister Lopez say about the realtime voice?", "what did mister lopez say about the realtime voice"},
 	} {
 		r := newRig(t)
 		r.run(t, "search_issues", map[string]string{"query": tc.query})

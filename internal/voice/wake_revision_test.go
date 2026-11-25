@@ -3,14 +3,13 @@ package voice
 import (
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/sjawhar/ghost-wispr/internal/monoclock"
 )
 
 // timedWords is a transcript of text whose words are apart seconds, the first
-// at start: a room's words have 0.3 s or more between them, and the words
-// before a wake phrase must be far enough from it to be told apart (the
-// final may move the wake by finalMoves).
+// at start, each 0.2 s long.
 func timedWords(text string, start, apart float64, final bool) Transcript {
 	now := monoclock.Now()
 	t := Transcript{Text: text, IsFinal: final, SpeechFinal: final, GateOpen: true, At: now.Wall, Mono: now.Mono}
@@ -21,38 +20,89 @@ func timedWords(text string, start, apart float64, final bool) Transcript {
 	return t
 }
 
-// TestAFinalThatDroppedTheNameKeepsOnlyWhatFollowedIt (Sol's review of #192):
-// Deepgram's final sometimes revises an utterance whose interim held the wake
-// phrase, and writes the name differently ("Mister") or not at all. The turn
-// then held everything the final said, the speech before the wake included,
-// and that speech went whole to Dispatch's search and its embedding vendor.
-// It fails if the turn the Concierge is told holds a word said before the
-// wake phrase, or loses a word said after it.
-func TestAFinalThatDroppedTheNameKeepsOnlyWhatFollowedIt(t *testing.T) {
+// TestAFinalThatLostTheWakeKeepsOnlyWhatFollowedIt (Sol's reviews of #192 at
+// 4ff5250 and 4e52421): Deepgram's final sometimes revises an utterance
+// whose interim held the wake phrase, and writes the name otherwise
+// ("Mister") or not at all. The turn then held what the final said before
+// the wake too, and it went whole to Dispatch's search, its embedding vendor
+// and the model. A window in time around the wake's start let the word just
+// before it in ("today", "private"). The turn now begins where the words
+// that followed the wake in the interim begin in the final; with none of
+// them there, at the end of the wake. It fails if the turn holds a word said
+// before the wake, or loses one said after it; the controls show a final that
+// keeps the wake, and a name the person said after it, untouched.
+func TestAFinalThatLostTheWakeKeepsOnlyWhatFollowedIt(t *testing.T) {
 	const question = "what is happening with the realtime voice?"
-	for _, tc := range []struct{ name, final, want string }{
-		{"the name is dropped", "She is not here today. " + question, question},
-		{"a person's address in its place", "She is not here today. Mister, " + question, "Mister, " + question},
+	const several = "Alice left. Bob is away. Carol is not here today. "
+	for _, tc := range []struct {
+		name, interim, final, want string
+		apart, previousShift       float64
+	}{
+		{"several sentences, the wake kept", "", several + "Wispr, " + question, question, 0.5, 0},
+		{"several sentences, the name dropped, slow", several + "Wispr, what is happening", several + question, question, 0.5, 0},
+		{"several sentences, Mister, slow", several + "Wispr, what is happening", several + "Mister, " + question, question, 0.5, 0},
+		{"several sentences, the name dropped", several + "Wispr, what is happening", several + question, question, 0.2, 0},
+		{"several sentences, Mister", several + "Wispr, what is happening", several + "Mister, " + question, question, 0.2, 0},
+		{"one sentence, the name dropped", "She is not here today. Wispr, what is happening", "She is not here today. " + question, question, 0.2, 0},
+		{"the word before, private", "Her diagnosis is private. Wispr, what is happening", "Her diagnosis is private. " + question, question, 0.2, 0},
+		{"the word before moved 150 ms", "Her diagnosis is private. Wispr, what is happening", "Her diagnosis is private. " + question, question, 0.4, 0.15},
+		{"so, the wake kept", "", "so Wispr " + question, question, 0.2, 0},
+		{"so, the name dropped", "so Wispr what is happening", "so " + question, question, 0.2, 0},
+		{"so Mister in place of the wake", "Wispr what is happening", "so Mister " + question, question, 0.2, 0},
+		// The words after the wake no longer read as the interim's: the
+		// turn begins after the wake's end, and nothing before it is kept.
+		{"the words after it revised", "Her diagnosis is private. Wispr, what's going", "Her diagnosis is private. Mister, what is happening with the realtime voice?", "what is happening with the realtime voice?", 0.2, 0},
+		// Controls: a name the person said after the wake stays.
+		{"Miss Burr after the wake", "", "Wispr, Miss Burr fixed the realtime voice. What changed?", "Miss Burr fixed the realtime voice. What changed?", 0.2, 0},
+		{"Mister Lopez after the wake", "", "Wispr, Mister Lopez fixed the realtime voice. What changed?", "Mister Lopez fixed the realtime voice. What changed?", 0.2, 0},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			c := newFakeConcierge("ABC-12 is in progress.")
-			r := newRig(t, c)
-			// The wake phrase is said 2.5 s in, after a sentence of five
-			// words the room said to each other.
-			interim := timedWords("Wispr, "+question, 2.5, 0.5, false)
-			r.s.OnTranscript(&interim)
-			r.waitSession()
-			final := timedWords(tc.final, 0, 0.5, true)
+			c := newFakeConcierge()
+			r := newRigWith(t, c, func(cfg *SupervisorConfig, _ *rig) { cfg.TurnWait = time.Hour })
+			if tc.interim != "" {
+				interim := timedWords(tc.interim, 0, tc.apart, false)
+				r.s.OnTranscript(&interim)
+				r.waitSession()
+			}
+			final := timedWords(tc.final, 0, tc.apart, true)
+			final.SpeechFinal = false
+			if tc.previousShift != 0 {
+				final.Words[3].Start += tc.previousShift
+				final.Words[3].End += tc.previousShift
+			}
 			r.s.OnTranscript(&final)
-			got := r.waitTurn()
-			if got != tc.want {
+			calls := c.heardCalls()
+			if len(calls) == 0 {
+				t.Fatal("UNKNOWN: the Concierge was told no turn")
+			}
+			if got := calls[len(calls)-1].words; got != tc.want {
 				t.Fatalf("the turn = %q, want %q", got, tc.want)
 			}
-			for _, h := range c.heardCalls() {
-				if strings.Contains(h.words, "here today") {
-					t.Fatalf("the Concierge read for %q, which holds words said before the wake phrase", h.words)
-				}
-			}
 		})
+	}
+}
+
+// TestALaterResultOfTheTurnIsKeptWhole: a result said after the wake, in a
+// later segment of the same turn, holds no word from before it, and is kept
+// whole, though its words repeat the ones that followed the wake. It fails
+// if it loses a word.
+func TestALaterResultOfTheTurnIsKeptWhole(t *testing.T) {
+	c := newFakeConcierge()
+	r := newRigWith(t, c, func(cfg *SupervisorConfig, _ *rig) { cfg.TurnWait = time.Hour })
+	interim := timedWords("Wispr, what is happening", 0, 0.2, false)
+	r.s.OnTranscript(&interim)
+	r.waitSession()
+	first := timedWords("Wispr, what is happening with the realtime voice?", 0, 0.2, true)
+	first.SpeechFinal = false
+	r.s.OnTranscript(&first)
+	later := timedWords("And what is happening with the wake word?", 5, 0.2, true)
+	later.SpeechFinal = false
+	r.s.OnTranscript(&later)
+	calls := c.heardCalls()
+	if len(calls) == 0 {
+		t.Fatal("UNKNOWN: the Concierge was told no turn")
+	}
+	if got, want := calls[len(calls)-1].words, "what is happening with the realtime voice? And what is happening with the wake word?"; got != want {
+		t.Fatalf("the turn = %q, want %q", got, want)
 	}
 }

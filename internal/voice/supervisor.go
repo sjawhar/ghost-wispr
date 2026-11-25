@@ -12,6 +12,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode"
 
 	"github.com/sjawhar/ghost-wispr/internal/audio"
 	"github.com/sjawhar/ghost-wispr/internal/monoclock"
@@ -392,14 +393,20 @@ type exchange struct {
 	cancel context.CancelFunc
 	// authority is ctx as an exchangeContext, which bindMeetingLocked binds
 	// to the recorder's meeting; nil for an exchange made otherwise.
-	authority    *exchangeContext
-	x            Exchange
-	session      Session
-	opened       chan struct{} // closed once Open returned, or failed
-	drives       bool          // the voice drives its own turn
-	answering    bool          // the turn went to the Concierge (or a held answer is spoken)
-	answer       *pendingAnswer
-	wakeStart    float64 // the wake word's start on the socket; later results of its utterance repeat it
+	authority *exchangeContext
+	x         Exchange
+	session   Session
+	opened    chan struct{} // closed once Open returned, or failed
+	drives    bool          // the voice drives its own turn
+	answering bool          // the turn went to the Concierge (or a held answer is spoken)
+	answer    *pendingAnswer
+	wakeStart float64 // the wake word's start on the socket; later results of its utterance repeat it
+	// wakeEnd is the end on the socket of the wake phrase's last word, and
+	// wakeAnchor the words that followed it as anchorWord reads them: where
+	// a later result of its utterance that lost the wake begins the turn
+	// (sinceWakeLocked).
+	wakeEnd      float64
+	wakeAnchor   []string
 	wakeAt       time.Time
 	turn         []string // final words of the asker's turn
 	interim      string   // the turn's words not final yet
@@ -1086,6 +1093,11 @@ func (s *Supervisor) onTranscriptLocked(t *Transcript) {
 			}
 			s.neverMindLocked(s.cfg.Session())
 		case same && !ex.answering:
+			// A later result of the call: the words after the wake read
+			// better as more of them come.
+			if end, anchor := wakeAfter(t, m); len(anchor) > 0 {
+				ex.wakeEnd, ex.wakeAnchor = end, anchor
+			}
 			if ex.drives {
 				// The wake is the call this exchange already took: a turn
 				// these words begin after the voice spoke does not follow it.
@@ -1117,6 +1129,7 @@ func (s *Supervisor) onTranscriptLocked(t *Transcript) {
 				ex.turnFrom = from // the voice answered this call before its result came
 			}
 			ex.wakeStart, ex.wakeSaid = wakeStart(t, m), wakeSaidAt(t, m)
+			ex.wakeEnd, ex.wakeAnchor = wakeAfter(t, m)
 			ex.turn, ex.interim, ex.turnFinal = nil, "", false
 			ex.followUpTurn, ex.turnByName = false, true // a call, with the wake phrase
 			cut := false
@@ -1191,28 +1204,98 @@ func (s *Supervisor) onTranscriptLocked(t *Transcript) {
 // place ("Mister"), which is no name of Wispr's (transcript.Find). The words
 // before it are speech the room did not address to Wispr, and they went to
 // Dispatch's search, its embedding vendor and the model with the question
-// (Sol's review of #192). The wake's place is where an interim heard it
-// (wakeStart), within the slack a final may move it by. A result with no
-// word times, or none left at that place, is taken as it came.
+// (Sol's reviews of #192). A window in time around the wake's start let the
+// word just before it in, so the turn begins at words: where the words that
+// followed the wake in the interim (wakeAnchor) begin again, within the
+// slack a final may move the wake by, which leaves the wake, however the
+// final wrote it, before them. A result that no longer holds those words
+// keeps only what began after the wake's end, never anything before it. A
+// result said wholly after the wake, and one with no word times that lacks
+// them, are taken as they came.
 func (s *Supervisor) sinceWakeLocked(ex *exchange, t *Transcript) string {
-	if !ex.turnByName || len(t.Words) == 0 {
+	if !ex.turnByName {
 		return t.Text
 	}
-	from := len(t.Words)
+	if len(t.Words) == 0 {
+		fields := strings.Fields(t.Text)
+		if i := anchorIn(fields, ex.wakeAnchor, func(int) bool { return true }); i >= 0 {
+			return strings.Join(fields[i:], " ")
+		}
+		return t.Text
+	}
+	// A nanosecond's slack keeps the edge, as moved does.
+	afterWake := func(i int) bool { return t.Words[i].Start >= ex.wakeEnd-1e-9 }
+	if afterWake(0) {
+		return t.Text
+	}
+	texts := make([]string, len(t.Words))
 	for i := range t.Words {
-		if t.Words[i].Start >= ex.wakeStart-finalMoves {
-			from = i
-			break
+		texts[i] = t.Words[i].Text
+	}
+	if i := anchorIn(texts, ex.wakeAnchor, func(i int) bool { return t.Words[i].Start >= ex.wakeStart-finalMoves }); i >= 0 {
+		return strings.Join(texts[i:], " ")
+	}
+	for i := range t.Words {
+		if afterWake(i) {
+			return strings.Join(texts[i:], " ")
 		}
 	}
-	if from == 0 || from == len(t.Words) {
-		return t.Text
+	return ""
+}
+
+// anchorWords is how many of the words after the wake phrase mark where a
+// later result of its utterance begins the turn (wakeAnchor).
+const anchorWords = 3
+
+// anchorIn is the first place in words, among those may admits, where the
+// words of anchor follow one another, as anchorWord reads them; -1 when
+// anchor is empty or not there.
+func anchorIn(words, anchor []string, may func(int) bool) int {
+	if len(anchor) == 0 {
+		return -1
 	}
-	words := make([]string, 0, len(t.Words)-from)
-	for _, w := range t.Words[from:] {
-		words = append(words, w.Text)
+	for i := 0; i+len(anchor) <= len(words); i++ {
+		if !may(i) {
+			continue
+		}
+		match := true
+		for j, a := range anchor {
+			if anchorWord(words[i+j]) != a {
+				match = false
+				break
+			}
+		}
+		if match {
+			return i
+		}
 	}
-	return strings.Join(words, " ")
+	return -1
+}
+
+// anchorWord is a word as a final and an interim both write it: lower case,
+// a curly apostrophe straight, without the punctuation around it.
+func anchorWord(word string) string {
+	word = strings.ToLower(strings.ReplaceAll(word, "’", "'"))
+	return strings.TrimFunc(word, func(r rune) bool { return !unicode.IsLetter(r) && !unicode.IsDigit(r) })
+}
+
+// wakeAfter is the end on the socket of t's wake phrase (m), 0 when t has no
+// word times, and the first anchorWords words after it (anchorWord).
+func wakeAfter(t *Transcript, m transcript.Match) (end float64, anchor []string) {
+	for _, w := range strings.Fields(m.Rest) {
+		if a := anchorWord(w); a != "" && len(anchor) < anchorWords {
+			anchor = append(anchor, a)
+		}
+	}
+	if len(t.Words) > 0 {
+		phrase := len(strings.Fields(m.Phrase))
+		i := len(t.Words) - len(strings.Fields(m.Rest)) - phrase
+		if i < 0 || i >= len(t.Words) {
+			i = 0
+		}
+		end = t.Words[min(i+max(phrase, 1)-1, len(t.Words)-1)].End
+	}
+	return end, anchor
 }
 
 // driverHeardLocked takes words, of t, into the turn of ex, whose voice
@@ -1487,6 +1570,7 @@ func (s *Supervisor) startLocked(t *Transcript, m transcript.Match) {
 	// session, the exchange's is the start after that count (sessionLocked).
 	sessionID, starts := s.sessionMark()
 	ex := &exchange{ctx: ctx, cancel: ctx.cancel, authority: ctx, opened: make(chan struct{}), wakeStart: wakeStart(t, m), wakeSaid: wakeSaidAt(t, m), wakeAt: t.At, openSeq: starts, notified: map[string]bool{}, times: &exchangeTimes{wakeAt: t.At}, turnByName: true}
+	ex.wakeEnd, ex.wakeAnchor = wakeAfter(t, m)
 	s.capExchange(ex)
 	if d, ok := voice.(TurnDriver); ok && d.DrivesTurn() {
 		ex.drives = true
