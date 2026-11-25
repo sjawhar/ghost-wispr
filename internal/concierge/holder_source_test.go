@@ -110,7 +110,7 @@ func TestALegionDaemonIsNeverTheHolder(t *testing.T) {
 
 	// The session that worked it is gone: no agent is on the issue.
 	r = setup()
-	if got, want := r.run(t, "issue_holder", map[string]string{"key": "INFRA-1508"}), map[string]any{"holder": "none", "assignee": "lead@example.com"}; !maps.Equal(got, want) {
+	if got, want := r.run(t, "issue_holder", map[string]string{"key": "INFRA-1508"}), map[string]any{"holder": "none", "assigned_to": "lead@example.com"}; !maps.Equal(got, want) {
 		t.Errorf("issue_holder = %v, want %v", got, want)
 	}
 	r.model.turns = [][]*genai.GenerateContentResponse{{chunk(text("INFRA-1508 is in testing."))}}
@@ -135,7 +135,7 @@ func TestNoClaimAndNoSessionIsNobody(t *testing.T) {
 		wrote("child.status", testNow.Add(-time.Hour), "legion-daemon:ABC", ""),
 		{Type: "comment.created", CreatedAt: testNow.Add(-2 * time.Hour), Actor: actor("user", "lead@example.com", "")},
 	}
-	if got, want := r.run(t, "issue_holder", map[string]string{"key": "ABC-12"}), map[string]any{"holder": "none", "assignee": "lead@example.com"}; !maps.Equal(got, want) {
+	if got, want := r.run(t, "issue_holder", map[string]string{"key": "ABC-12"}), map[string]any{"holder": "none", "assigned_to": "lead@example.com"}; !maps.Equal(got, want) {
 		t.Errorf("issue_holder = %v, want %v", got, want)
 	}
 }
@@ -317,7 +317,7 @@ func TestAnEnvoyGoneWorkerDoesNotEndTheSearch(t *testing.T) {
 				wrote("artifact.version", testNow.Add(-time.Minute), "arch-1", "Legion architect · ABC-12"),
 				wrote("comment.created", testNow.Add(-time.Hour), "passer-1", "Passer"),
 			},
-			[]string{"passer-1"}, map[string]any{"holder": "none", "assignee": "lead@example.com"}, 1},
+			[]string{"passer-1"}, map[string]any{"holder": "none", "assigned_to": "lead@example.com"}, 1},
 	} {
 		r := newRig(t)
 		r.records.issues["ABC-12"] = &dispatch.Issue{Key: "ABC-12", Status: "in_progress", Assignee: "lead@example.com"}
@@ -383,5 +383,29 @@ func TestASessionDispatchReadsLiveIsAsked(t *testing.T) {
 	}
 	if asked := r.run(t, "ask_agent", map[string]string{"session": "agent-7", "question": "Is the tap merged?", "issue_key": "ABC-12"}); asked["error"] == nil || len(r.agents.sent) != 0 {
 		t.Errorf("ask_agent = %v, sent %d; want a session Envoy alone calls gone not asked", asked, len(r.agents.sent))
+	}
+}
+
+// TestTheAssigneeIsNotTheHolder (a live run of the real Concierge on
+// 2026-11-25): asked "Who holds INFRA-3173?", the voice said
+// "sami@theorem.dev holds INFRA-3173": the model took read_issue's assignee
+// for the holder, while issue_holder named the issue's Legion architect,
+// gone. read_issue and issue_holder name the person an issue is assigned to
+// as such, never as a holder, and the model is told that the holder comes
+// only from issue_holder.
+func TestTheAssigneeIsNotTheHolder(t *testing.T) {
+	r := newRig(t)
+	issue := claimed("ABC-12", "session", "agent-7", "Legion architect")
+	issue.Assignee, issue.HolderState = "lead@example.com", "gone"
+	r.records.issues["ABC-12"] = issue
+	r.records.issues["ABC-13"] = &dispatch.Issue{Key: "ABC-13", Status: "todo", Assignee: "lead@example.com"}
+	for _, c := range []struct{ tool, key string }{{"read_issue", "ABC-12"}, {"issue_holder", "ABC-13"}} {
+		got := r.run(t, c.tool, map[string]string{"key": c.key})
+		if _, named := got["assignee"]; named || got["assigned_to"] != "lead@example.com" {
+			t.Errorf("%s(%s) = %v, want the person it is assigned to as assigned_to, and no assignee", c.tool, c.key, got)
+		}
+	}
+	if !strings.Contains(systemPrompt, "Who holds an issue comes only from issue_holder") {
+		t.Error("the system prompt does not say that the holder comes only from issue_holder")
 	}
 }

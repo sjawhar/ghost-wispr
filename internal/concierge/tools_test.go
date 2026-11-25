@@ -191,7 +191,7 @@ func TestIssueHolderCases(t *testing.T) {
 	r.records.issues["ABC-14"] = &dispatch.Issue{Key: "ABC-14", Status: "backlog", Assignee: "lead@example.com"}
 	r.records.events["ABC-14"] = []dispatch.Event{{Type: "issue.created", Actor: actor("user", "lead@example.com", "")}}
 	result = r.run(t, "issue_holder", map[string]string{"key": "ABC-14"})
-	if result["holder"] != "none" || result["assignee"] != "lead@example.com" {
+	if result["holder"] != "none" || result["assigned_to"] != "lead@example.com" {
 		t.Fatalf("no holder = %v", result)
 	}
 }

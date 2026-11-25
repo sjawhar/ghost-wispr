@@ -1858,13 +1858,13 @@ def binary(args):
             "live-1": {"holder": "session", "live": True, "session": "agent-live", "title": "the agent"},
             "stopped-2": {"holder": "unresponsive", "state": "gone", "session": "agent-stopped"},
             "person-3": {"holder": "person", "person": "a-person"},
-            "none-4": {"holder": "none", "assignee": ""},
+            "none-4": {"holder": "none", "assigned_to": ""},
         }
         if "holder-stopped" in SCENARIO:
             answers["live-1"] = {"holder": "unresponsive", "state": "gone", "session": "agent-live"}
         if "holder-live-none" in SCENARIO:
-            answers["live-1"] = {"holder": "none", "assignee": ""}
-        print(json.dumps(answers.get(args[1], {"holder": "none", "assignee": ""})))
+            answers["live-1"] = {"holder": "none", "assigned_to": ""}
+        print(json.dumps(answers.get(args[1], {"holder": "none", "assigned_to": ""})))
         return 0
     if command == "tts-first-audio":
         # ghost-wispr tts-first-audio [--model provider/model] [--voice VOICE] [--clip]: the driver

@@ -524,9 +524,12 @@ func (r *runner) readIssue(ctx context.Context, key string) (map[string]any, err
 		return nil, err
 	}
 	now := r.c.now()
+	// The person the issue is assigned to is named as such: the model took
+	// a field named "assignee" for who holds the issue, which only
+	// issue_holder says.
 	result := map[string]any{
 		"key": issue.Key, "title": issue.Title, "status": issue.Status, "priority": issue.Priority,
-		"assignee": issue.Assignee, "parent": issue.Parent, "open_asks": issue.OpenAsks,
+		"assigned_to": issue.Assignee, "parent": issue.Parent, "open_asks": issue.OpenAsks,
 	}
 	if !issue.UpdatedAt.IsZero() {
 		result["updated_ago"] = ago(now, issue.UpdatedAt)
@@ -854,9 +857,10 @@ func unknownHolder() map[string]any {
 	return map[string]any{"holder": "unknown"}
 }
 
-// noHolder is R5's {none}: no session is on the issue right now.
+// noHolder is R5's {none}: no session is on the issue right now. It names
+// the person the issue is assigned to, who is not its holder.
 func noHolder(issue *dispatch.Issue) map[string]any {
-	return map[string]any{"holder": "none", "assignee": issue.Assignee}
+	return map[string]any{"holder": "none", "assigned_to": issue.Assignee}
 }
 
 func (r *runner) askAgent(ctx context.Context, session, question, issueKey string) (map[string]any, error) {
