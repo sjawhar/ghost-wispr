@@ -172,15 +172,21 @@ func TestOnlyAVoiceThatDrivesItsTurnGetsRoomAudio(t *testing.T) {
 // TestAFinalThatDropsTheNameKeepsTheCall fails if a final result that no
 // longer holds the name the interim heard, as Deepgram's live finals sometimes
 // drop it ("Wispr, tell me everything …" finalised as "Tell me everything …"),
-// ends the exchange instead of handing the question over.
+// ends the exchange instead of handing the question over. The final keeps
+// its other words' times, as Deepgram does; the turn is the interim's words
+// after the wake, then the final's words that follow them (sinceWakeLocked,
+// Sol's reviews of #192), where it was the final's text whole before.
 func TestAFinalThatDropsTheNameKeepsTheCall(t *testing.T) {
 	c := newFakeConcierge("fact")
 	r := newRig(t, c)
 	r.heard("Wispr, tell me", false, false)
 	r.waitSession()
-	r.heard("Tell me everything about the voice issue.", true, true)
-	if got := r.waitTurn(); got != "Tell me everything about the voice issue." {
-		t.Fatalf("turn %q, want the final's question", got)
+	final := transcriptOf("Wispr, Tell me everything about the voice issue.", 0, true, true, 0)
+	final.Words = final.Words[1:]
+	final.Text = "Tell me everything about the voice issue."
+	r.s.OnTranscript(&final)
+	if got, want := r.waitTurn(), "tell me everything about the voice issue."; got != want {
+		t.Fatalf("turn %q, want %q", got, want)
 	}
 }
 
