@@ -898,8 +898,11 @@ func (c *Concierge) facts(ctx context.Context, tools *runner, view projectsView,
 	reason := ""
 	for try := 1; try <= earTries; try++ {
 		note := ""
-		if said := sp.said(); len(said) > 0 {
-			note += "\n\nAlready said to the room: " + strings.Join(said, " ")
+		if heard := sp.said(); len(heard) > 0 {
+			// Named one a line, each said once: the model's next try says
+			// what they leave out, not them in other words, which no check
+			// of words can tell from a new fact (saidBefore).
+			note += "\n\nAlready said to the room, one a line. Say none of them again, in these words or in others:\n- " + strings.Join(heard, "\n- ") + "\n"
 		}
 		if reason != "" {
 			note += "\n\nYour last answer failed R8's check: " + reason + ". Answer again from the record only, in the form asked."
@@ -1450,11 +1453,9 @@ func (s *sentences) speak(ctx context.Context, sentence string) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	// A retry may start with a sentence the room already heard.
-	for _, heard := range s.sp.said() {
-		if strings.EqualFold(strings.TrimSpace(heard), sentence) {
-			return nil
-		}
+	// A retry may start with a sentence the room already heard (saidBefore).
+	if saidBefore(sentence, s.sp.said()) {
+		return nil
 	}
 	words := len(strings.Fields(sentence))
 	if s.spoken >= maxFactSentences || s.words+words > maxFactWords {
@@ -1475,4 +1476,20 @@ func (s *sentences) speak(ctx context.Context, sentence string) error {
 	s.spoken++
 	s.words += words
 	return nil
+}
+
+// saidBefore reports whether sentence is one of heard word for word, with its
+// punctuation, in any case or spacing: a retry may begin with the sentence
+// its first try said. Nothing short of that is dropped: a part of a heard
+// sentence, its words in another order or with other punctuation can each
+// say something new ("XYZ-7 is done." after "Sam said ABC-12 is open and
+// XYZ-7 is done.", "No, tests failed." after "No tests failed.", "XYZ-7 is
+// done." after "XYZ-7 is done?"; Sol's reviews of #197). A repeat in other
+// words is said, if the model writes it though the retry's prompt names each
+// sentence the room heard and asks for none of them again (facts).
+func saidBefore(sentence string, heard []string) bool {
+	sentence = strings.Join(strings.Fields(sentence), " ")
+	return slices.ContainsFunc(heard, func(line string) bool {
+		return strings.EqualFold(strings.Join(strings.Fields(line), " "), sentence)
+	})
 }
