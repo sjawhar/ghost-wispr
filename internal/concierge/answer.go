@@ -204,6 +204,12 @@ func (c *Concierge) answer(parent context.Context, x *voice.Exchange, turn strin
 	target := ""
 	if asked, key, ok := c.takePick(x, turn); ok {
 		if key == "" {
+			// A declined offer's reads are dropped, as an answer's are
+			// (takeAheadSearches): the read ahead of "no, not ABC-12" read
+			// the issue the room turned down, and a next keyless question
+			// took it through AskerTurn and asked its holder (Sol's review
+			// of #194 at e5cf4d6, R6). Main does so for a key of two digits.
+			c.takeAheadSearches(x)
 			return sp.sayText(ctx, "Okay.", voice.Ack)
 		}
 		turn, target = asked, "keys:"+key

@@ -88,18 +88,17 @@ func TestAOneDigitKeyInSpeechIsSpeech(t *testing.T) {
 // hands it over: word by word to the read-ahead (Heard), then whole to
 // Answer, each time through transcript.WriteKeys. It fails unless the answer
 // to each turn reads none of them, names none, says none and sends nothing,
-// and its words are searched. The read-ahead reads as main's does, the words
-// so far: while "ops 1" is the whole turn it is a bare reference, so the
-// read-ahead reads OPS-1, and the answer to "ops 1 and 2" must not use that
-// read; the other turns read nothing ahead. A control turn that names BET-5
-// as the question's object reads it and asks its holder, so the probe can
-// see a read and a send.
+// and its words are searched. The read-ahead reads no key of one digit
+// (Main's rule after Sol's round 5), so none of these turns reads anything
+// ahead: not "ops 1" while it is the whole turn either. A control turn that
+// names BET-5 as the question's object reads it and asks its holder, so the
+// probe can see a read and a send.
 func TestSpeechReadsNoIssueAndAsksNoOne(t *testing.T) {
 	speech := map[string]struct{ word, ahead string }{
 		"I bet 5":           {word: "bet"},
 		"I'd bet 2 of them": {word: "bet"},
 		"the infra 3 times": {word: "infra"},
-		"ops 1 and 2":       {word: "ops", ahead: "OPS-1"},
+		"ops 1 and 2":       {word: "ops"},
 	}
 	keys := []string{"BET-5", "BET-2", "INFRA-3", "OPS-1"}
 	for turn, tc := range speech {
@@ -161,31 +160,29 @@ func sayTurn(r *rig, turn string, say voice.SayFunc) error {
 	return r.concierge.Answer(context.Background(), &r.exchange, transcript.WriteKeys(turn, speechProjects), say)
 }
 
-// TestAOneDigitKeyAtTheEndStopsTheSearchOfOlderWords: "what about infra"
-// settles into a search of "infra"; "7" makes it "what about infra 7", a
-// key, so the read-ahead reads INFRA-7, and the search of the older words is
-// stale: it stops before it reaches Dispatch, as for any new target. The
-// answer reads INFRA-7 and searches nothing. It fails if the older search
-// reaches Dispatch.
-func TestAOneDigitKeyAtTheEndStopsTheSearchOfOlderWords(t *testing.T) {
+// TestAOneDigitKeyAfterOlderWordsIsReadByTheAnswer: "what about infra"
+// settles into a search of "infra"; "7" makes it "what about infra 7", whose
+// key of one digit the read-ahead does not read. The answer reads INFRA-7
+// from the turn's final words and names it; the read-ahead's search of the
+// older words, which may reach Dispatch as main's search of the turn does,
+// is not the answer. It fails if INFRA-7 is read before the answer, or if the
+// answer names any other issue than INFRA-7.
+func TestAOneDigitKeyAfterOlderWordsIsReadByTheAnswer(t *testing.T) {
 	r := speechRig(t)
+	r.concierge.searchSettle = 50 * time.Millisecond
 	r.records.issues["INFRA-7"] = &dispatch.Issue{Key: "INFRA-7", Title: "Realtime voice", Status: "todo", UpdatedAt: testNow.Add(-time.Hour)}
 	r.concierge.Heard(context.Background(), &r.exchange, "what about infra")
-	time.Sleep(50 * time.Millisecond)
+	time.Sleep(20 * time.Millisecond)
 	r.concierge.Heard(context.Background(), &r.exchange, "what about infra 7")
-	time.Sleep(2 * r.concierge.searchSettle)
-	searched := func() []string {
-		r.records.mu.Lock()
-		defer r.records.mu.Unlock()
-		return append(slices.Clone(r.records.queries), r.records.kwQueries...)
-	}
-	if queries := searched(); len(queries) != 0 {
-		t.Fatalf("the read-ahead searched %q after the turn named INFRA-7 at its end, want no search", queries)
+	time.Sleep(4 * r.concierge.searchSettle)
+	if calls := r.records.calls(); slices.Contains(calls, "INFRA-7") {
+		t.Fatalf("the read-ahead read %q, want no read of INFRA-7 before the answer", calls)
 	}
 	r.model.turns = [][]*genai.GenerateContentResponse{{chunk(text("INFRA-7 is todo."))}}
+	r.exchange.AskerTurn = "what about infra 7"
 	answerTurn(t, r, "what about infra 7")
-	if calls, queries := r.records.calls(), searched(); !slices.Contains(calls, "INFRA-7") || len(queries) != 0 {
-		t.Fatalf("the answer read %q and searched %q; want INFRA-7 read and no search", calls, queries)
+	if calls := r.records.calls(); !slices.Contains(calls, "INFRA-7") || r.exchange.IssueKey != "INFRA-7" {
+		t.Fatalf("the answer read %q and named %q; want INFRA-7", calls, r.exchange.IssueKey)
 	}
 }
 

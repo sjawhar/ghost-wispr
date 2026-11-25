@@ -248,6 +248,22 @@ func (v projectsView) issueKeys(words string) []string {
 	return keys
 }
 
+// oneDigitKeys is the keys of one digit the view reads in words
+// (oneDigitKey), upper-cased.
+func (v projectsView) oneDigitKeys(words string) map[string]bool {
+	keys := map[string]bool{}
+	text := v.spokenKeys(words)
+	for _, m := range anyDigitsKey.FindAllStringSubmatchIndex(text, -1) {
+		if !v.oneDigitKey(text, m) {
+			continue
+		}
+		if key, err := dispatch.NormalizeIssueKey(text[m[2]:m[3]] + "-" + keyGroups.Replace(text[m[4]:m[5]])); err == nil {
+			keys[key] = true
+		}
+	}
+	return keys
+}
+
 // withoutOneDigitKeys is words with each key of one digit the view reads
 // (oneDigitKey) taken out, with the possessive said after it ("INFRA-7's"),
 // so the turn's search words hold no such key's project, as they hold none
@@ -396,6 +412,34 @@ func (c *Concierge) readTarget(v projectsView, words string) string {
 	return ""
 }
 
+// aheadTarget is what the read-ahead reads of words, the turn so far: what
+// readTarget reads, but no key of one digit (Main's rule after Sol's review
+// of #194 at e5cf4d6). Every read ahead of one, held for the turn's end or
+// cancelled and read again for a late transcript, read an issue the room did
+// not mean (Sol's R2 to R5); main reads none at all. A key of one digit is
+// read only by the answer, from the turn's final words (readTarget). Words
+// that hold one are read ahead for their other keys alone, as main reads
+// them, and are not searched, since the answer reads the key first; with no
+// other key nothing is read ahead. Words with no key of one digit are read
+// as main reads them.
+func (c *Concierge) aheadTarget(v projectsView, words string) string {
+	target := c.readTarget(v, words)
+	oneDigit := v.oneDigitKeys(words)
+	if len(oneDigit) == 0 {
+		return target
+	}
+	var keys []string
+	for _, key := range strings.Split(keysOf(target), ",") {
+		if key != "" && !oneDigit[key] {
+			keys = append(keys, key)
+		}
+	}
+	if len(keys) == 0 {
+		return ""
+	}
+	return "keys:" + strings.Join(keys, ",")
+}
+
 // searchOf is what target's search sends Dispatch: the question for its
 // full search and the words for its keyword search; both empty when target
 // searches nothing. Neither keys nor the words that name work hold a "|".
@@ -477,10 +521,11 @@ func (c *Concierge) Heard(ctx context.Context, x *voice.Exchange, words string) 
 	if unread {
 		return
 	}
-	target := c.readTarget(view, words)
+	target := c.aheadTarget(view, words)
 	// A number-only turn (no key, no work words) skips the read-ahead: it
 	// goes straight to the bare-number candidate lookup. A turn with words
-	// beyond the number keeps its search.
+	// beyond the number keeps its search. A turn whose only key has one
+	// digit skips it too: the answer reads that key (aheadTarget).
 	if target == "" {
 		return
 	}
@@ -603,11 +648,12 @@ func (c *Concierge) readFor(ctx context.Context, x *voice.Exchange, view project
 	}
 	// Voices B and C answer a question in their vendor's words, while the
 	// read-ahead read the unit's own transcript of the turn, AskerTurn
-	// (found in review on 2026-11-24).
+	// (found in review on 2026-11-24): its read is looked up as the
+	// read-ahead made it (aheadTarget), with no key of one digit.
 	asked := ""
 	if x.AskerTurn != "" && x.AskerTurn != turn {
 		if words, unread := view.readSpelledKeys(x.AskerTurn); !unread {
-			asked = c.readTarget(view, words)
+			asked = c.aheadTarget(view, words)
 		}
 	}
 	c.mu.Lock()
