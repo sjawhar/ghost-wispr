@@ -99,12 +99,14 @@ func (g genaiGenerator) GenerateContentStream(ctx context.Context, model string,
 
 // Records is Dispatch's record as the tools read it; *dispatch.Client is one.
 // Search is Dispatch's normal search, words and meaning; SearchKeywords its
-// words leg alone, far faster.
+// words leg alone, far faster. RoleHolders are the sessions the Legion daemon
+// publishes for an issue's roles.
 type Records interface {
 	Search(ctx context.Context, query string, limit int) ([]dispatch.SearchHit, error)
 	SearchKeywords(ctx context.Context, query string, limit int) ([]dispatch.SearchHit, error)
 	Issue(ctx context.Context, key string) (*dispatch.Issue, error)
-	Events(ctx context.Context, key string, limit int) ([]dispatch.Event, error)
+	Events(ctx context.Context, key string, before int64, limit int) ([]dispatch.Event, error)
+	RoleHolders(ctx context.Context, key string) ([]dispatch.RoleHolder, error)
 	DocumentText(ctx context.Context, key, slug string) (string, error)
 	Projects(ctx context.Context) ([]string, error)
 }
@@ -252,14 +254,15 @@ type Concierge struct {
 	projectsBusy bool
 	// projectsDown: the last read of the projects failed.
 	projectsDown bool
-	// fastBound, knownBound, lookupBound, callBound, searchBound,
-	// searchSettle and routingAfter are the constants of those names
-	// (fastAnswerBound for fastBound, knownAfter for knownBound); a test
-	// shortens them.
+	// fastBound, knownBound, lookupBound, callBound, holderBound,
+	// searchBound, searchSettle and routingAfter are the constants of those
+	// names (fastAnswerBound for fastBound, knownAfter for knownBound); a
+	// test shortens them.
 	fastBound    time.Duration
 	knownBound   time.Duration
 	lookupBound  time.Duration
 	callBound    time.Duration
+	holderBound  time.Duration
 	searchBound  time.Duration
 	searchSettle time.Duration
 	fullWait     time.Duration
@@ -313,6 +316,7 @@ func New(cfg *Config) (*Concierge, error) {
 		knownBound:   knownAfter,
 		lookupBound:  lookupBound,
 		callBound:    callBound,
+		holderBound:  holderBound,
 		searchBound:  searchBound,
 		searchSettle: searchSettle,
 		fullWait:     fullWaitAfterTurn,

@@ -64,12 +64,20 @@ func (b boundedRecords) Issue(ctx context.Context, key string) (issue *dispatch.
 	return issue, err
 }
 
-func (b boundedRecords) Events(ctx context.Context, key string, limit int) (events []dispatch.Event, err error) {
+func (b boundedRecords) Events(ctx context.Context, key string, before int64, limit int) (events []dispatch.Event, err error) {
 	err = b.within(ctx, func(ctx context.Context) error {
-		events, err = b.inner.Events(ctx, key, limit)
+		events, err = b.inner.Events(ctx, key, before, limit)
 		return err
 	})
 	return events, err
+}
+
+func (b boundedRecords) RoleHolders(ctx context.Context, key string) (holders []dispatch.RoleHolder, err error) {
+	err = b.within(ctx, func(ctx context.Context) error {
+		holders, err = b.inner.RoleHolders(ctx, key)
+		return err
+	})
+	return holders, err
 }
 
 func (b boundedRecords) DocumentText(ctx context.Context, key, slug string) (text string, err error) {

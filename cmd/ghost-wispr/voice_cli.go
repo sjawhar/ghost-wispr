@@ -360,7 +360,8 @@ func runIssueHolderCommand(ctx context.Context, args []string, configPath string
 		return fail(err)
 	}
 	defer c.Stop()
-	// Without an Envoy URL, the tool answers that it cannot reach the agents.
+	// Without an Envoy URL, the tool answers that it cannot reach the agents
+	// for every holder whose liveness Dispatch does not give.
 	if cfg.Concierge.EnvoyURL != "" {
 		listener, err := envoy.NewListener(cfg.Concierge.EnvoyURL, nil)
 		if err != nil {

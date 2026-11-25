@@ -29,13 +29,13 @@ func (r pendingSendSlowRecords) DocumentText(ctx context.Context, _, _ string) (
 	return "", ctx.Err()
 }
 
-func (r pendingSendSlowRecords) Events(ctx context.Context, key string, limit int) ([]dispatch.Event, error) {
+func (r pendingSendSlowRecords) Events(ctx context.Context, key string, before int64, limit int) ([]dispatch.Event, error) {
 	select {
 	case <-time.After(3 * time.Second):
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}
-	return r.Records.Events(ctx, key, limit)
+	return r.Records.Events(ctx, key, before, limit)
 }
 
 // TestPendingSendMatrix keeps the fast answer inside its bound while Envoy's

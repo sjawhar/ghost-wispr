@@ -28,15 +28,17 @@ var testNow = time.Date(2026, 11, 19, 10, 0, 0, 0, time.UTC)
 var meetingStart = testNow.Add(-20 * time.Minute)
 
 type fakeRecords struct {
-	mu         sync.Mutex
-	hits       []dispatch.SearchHit
-	issues     map[string]*dispatch.Issue
-	events     map[string][]dispatch.Event
-	docs       map[string]string
-	err        error
-	queries    []string
-	issueCalls []string
-	limits     []int
+	mu     sync.Mutex
+	hits   []dispatch.SearchHit
+	issues map[string]*dispatch.Issue
+	events map[string][]dispatch.Event
+	// roleHolders are the Legion role holders Dispatch names per issue.
+	roleHolders map[string][]dispatch.RoleHolder
+	docs        map[string]string
+	err         error
+	queries     []string
+	issueCalls  []string
+	limits      []int
 	// block, when set, holds each Issue call (of blockKey only, when that is
 	// set) until it is closed or the call's context ends.
 	block    chan struct{}
@@ -57,9 +59,13 @@ type fakeRecords struct {
 	// projectsBlock, when set, holds each Projects call until it is closed
 	// or the call's context ends.
 	projectsBlock chan struct{}
-	// holderEventsErr, when set, is the answer of issue_holder's read of
-	// events (holderEvents), and of no other read.
-	holderEventsErr error
+	// holderEventsErr, when set, is the answer of issue_holder's reads of
+	// events (holderPage), and of no other read; holderEventsDelay holds
+	// each such read that long, or until its context ends.
+	holderEventsErr   error
+	holderEventsDelay time.Duration
+	// roleHoldersErr, when set, is the answer of every RoleHolders read.
+	roleHoldersErr error
 	// docBlock, when set, holds each DocumentText call (a spec read) until
 	// it is closed or the call's context ends: a slow read_issue.
 	docBlock chan struct{}
@@ -158,18 +164,54 @@ func (f *fakeRecords) calls() []string {
 	return append([]string(nil), f.issueCalls...)
 }
 
-func (f *fakeRecords) Events(_ context.Context, key string, limit int) ([]dispatch.Event, error) {
+// Events gives key's events newest first, paged as Dispatch pages them: an
+// event with no sequence number is numbered by its place, the oldest 1.
+func (f *fakeRecords) Events(ctx context.Context, key string, before int64, limit int) ([]dispatch.Event, error) {
 	f.mu.Lock()
 	f.limits = append(f.limits, limit)
-	holderErr := f.holderEventsErr
+	err, holderErr, delay, all := f.err, f.holderEventsErr, f.holderEventsDelay, f.events[key]
 	f.mu.Unlock()
+	if err != nil {
+		return nil, err
+	}
+	if limit == holderPage && delay > 0 {
+		select {
+		case <-time.After(delay):
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	if limit == holderPage && holderErr != nil {
+		return nil, holderErr
+	}
+	var page []dispatch.Event
+	for i := range all {
+		seq := all[i].Seq
+		if seq == 0 {
+			seq = int64(len(all) - i)
+		}
+		if before > 0 && seq >= before {
+			continue
+		}
+		if limit > 0 && len(page) == limit {
+			break
+		}
+		page = append(page, all[i])
+		page[len(page)-1].Seq = seq
+	}
+	return page, nil
+}
+
+func (f *fakeRecords) RoleHolders(_ context.Context, key string) ([]dispatch.RoleHolder, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	if f.err != nil {
 		return nil, f.err
 	}
-	if limit == holderEvents && holderErr != nil {
-		return nil, holderErr
+	if f.roleHoldersErr != nil {
+		return nil, f.roleHoldersErr
 	}
-	return f.events[key], nil
+	return f.roleHolders[key], nil
 }
 
 // eventLimits is a copy of the limits Events was called with.
@@ -230,6 +272,9 @@ type fakeAgents struct {
 	// lookupHang makes every Lookup wait for its context, as a hub that
 	// takes the connection and never answers.
 	lookupHang bool
+	// refused are the ids Envoy's registry refuses as keys (400), beside any
+	// id with a ":".
+	refused map[string]bool
 }
 
 func (f *fakeAgents) ID() string { return f.id }
@@ -250,15 +295,26 @@ func (f *fakeAgents) Lookup(ctx context.Context, id string) (envoy.SessionInfo, 
 	if failing {
 		return envoy.SessionInfo{}, f.lookupErr
 	}
-	// Envoy's registry answers 400 for an id that is no NATS key, as it did
-	// live for "legion-daemon:INFRA".
-	if strings.ContainsAny(id, ": ") || envoy.ValidSessionID(id) != nil {
+	// The client refuses an id it would not send, as envoy.Listener.Lookup
+	// does, with no answer of Envoy's; Envoy's registry answers 400 for an
+	// id that is no NATS key, as it did live for "legion-daemon:INFRA".
+	if err := envoy.ValidSessionID(id); err != nil {
+		return envoy.SessionInfo{}, err
+	}
+	if strings.Contains(id, ":") || f.refused[id] {
 		return envoy.SessionInfo{}, &envoy.ListenerError{Path: "/v1/registry/" + id, Status: 400, Message: "invalid key"}
 	}
 	if info, ok := f.states[id]; ok {
 		return info, nil
 	}
 	return envoy.SessionInfo{SessionID: id, State: envoy.StateGone}, nil
+}
+
+// lookupCount is how many times Lookup was called.
+func (f *fakeAgents) lookupCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.lookups
 }
 
 func (f *fakeAgents) Send(ctx context.Context, request *envoy.SendRequest) (envoy.SendResult, error) {
@@ -396,7 +452,7 @@ func newLoggedRig(t *testing.T, logger *slog.Logger) *rig {
 		t.Fatal(err)
 	}
 	r := &rig{
-		records: &fakeRecords{issues: map[string]*dispatch.Issue{}, events: map[string][]dispatch.Event{}, docs: map[string]string{}, projects: []string{"ABC", "XYZ", "DEF", "INFRA"}},
+		records: &fakeRecords{issues: map[string]*dispatch.Issue{}, events: map[string][]dispatch.Event{}, roleHolders: map[string][]dispatch.RoleHolder{}, docs: map[string]string{}, projects: []string{"ABC", "XYZ", "DEF", "INFRA"}},
 		agents:  &fakeAgents{id: "unit-session", states: map[string]envoy.SessionInfo{}},
 		model:   &scriptedModel{},
 		store:   store,

@@ -36,14 +36,14 @@ func TestAReadBeforeTheSessionExistsIsUsed(t *testing.T) {
 
 // TestAnAskTurnAsksOnceTheHolderIsKnown: an explicit ask goes out after the
 // holder read, even if the rest of the record is slow. An unresponsive holder
-// also hears that it is not running.
+// hears that its question was left for it.
 func TestAnAskTurnAsksOnceTheHolderIsKnown(t *testing.T) {
 	for _, c := range []struct {
 		state envoy.SessionState
 		want  string
 	}{
 		{envoy.StateLive, "I asked the agent on ABC-12."},
-		{envoy.StateUnresponsive, "ABC-12's agent is not running now."},
+		{envoy.StateUnresponsive, "ABC-12's agent isn't answering now; I left the question for it."},
 	} {
 		t.Run(string(c.state), func(t *testing.T) {
 			r := newRig(t)

@@ -1,12 +1,14 @@
 package concierge
 
 import (
+	"cmp"
 	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
+	"slices"
 	"strings"
 	"time"
 	"unicode"
@@ -23,6 +25,11 @@ import (
 // cannotReachDispatch is what a tool answers when Dispatch does not answer,
 // or the unit has no token for it: words the voice can say as they are.
 const cannotReachDispatch = "I cannot reach Dispatch yet."
+
+// holderUnread is issue_holder's answer when the history it needs to name
+// the holder could not be read in time: no holder is named, nobody is asked,
+// and the voice says it could not read who holds the issue (R8).
+const holderUnread = "I could not read who works on that issue."
 
 // cannotReachEnvoy is a tool's answer when the unit has no Envoy session, or
 // Envoy does not answer a lookup.
@@ -43,8 +50,12 @@ const (
 	recentEvents = 10
 	// eventTextChars bounds each event's text.
 	eventTextChars = 240
-	// holderEvents is how far back issue_holder looks for a session.
-	holderEvents = 50
+	// holderPage is how many events issue_holder reads at a time:
+	// Dispatch's largest page.
+	holderPage = 200
+	// holderPages bounds how many pages issue_holder reads: 600 events, the
+	// whole history of 1880 of the 2069 open issues read on 2026-11-25.
+	holderPages = 3
 	// maxQuestionChars bounds an ask_agent question, the room's words that
 	// leave the unit (R7).
 	maxQuestionChars = 300
@@ -92,7 +103,7 @@ func ToolSpecs() []ToolSpec {
 		},
 		{
 			Name:        "issue_holder",
-			Description: "Find who works on an issue: a live agent session that can be asked, an agent session that is not answering, a person, or nobody.",
+			Description: "Find who works on an issue: a live agent session that can be asked, an agent session that is not answering, a person, nobody, or a holder nobody knows.",
 			Parameters:  object([]string{"key"}, map[string]any{"key": stringArg("The issue key, such as ABC-12.")}),
 		},
 		{
@@ -521,9 +532,12 @@ func (r *runner) readIssue(ctx context.Context, key string) (map[string]any, err
 		return nil, err
 	}
 	now := r.c.now()
+	// The person the issue is assigned to is named as such: the model took
+	// a field named "assignee" for who holds the issue, which only
+	// issue_holder says.
 	result := map[string]any{
 		"key": issue.Key, "title": issue.Title, "status": issue.Status, "priority": issue.Priority,
-		"assignee": issue.Assignee, "parent": issue.Parent, "open_asks": issue.OpenAsks,
+		"assigned_to": issue.Assignee, "parent": issue.Parent, "open_asks": issue.OpenAsks,
 	}
 	if !issue.UpdatedAt.IsZero() {
 		result["updated_ago"] = ago(now, issue.UpdatedAt)
@@ -539,7 +553,7 @@ func (r *runner) readIssue(ctx context.Context, key string) (map[string]any, err
 			r.c.logger.Warn("concierge could not read an issue's spec", "issue", issue.Key, "error", err)
 		}
 	}
-	events, err := records.Events(ctx, issue.Key, recentEvents)
+	events, err := records.Events(ctx, issue.Key, 0, recentEvents)
 	if err != nil {
 		return nil, err
 	}
@@ -612,6 +626,8 @@ func cut(s string, max int) string {
 	return s[:end] + "…"
 }
 
+// issueHolder is R5's holder of key: an agent that joined the meeting on it
+// (R17), else its claim's holder, else the session that works it.
 func (r *runner) issueHolder(ctx context.Context, key string) (map[string]any, error) {
 	records, err := r.recordsOrTell()
 	if err != nil {
@@ -621,8 +637,6 @@ func (r *runner) issueHolder(ctx context.Context, key string) (map[string]any, e
 	if err != nil {
 		return nil, err
 	}
-	// An agent that joined the meeting on the issue is the one to ask, before
-	// the issue's claim (R17).
 	if agent, ok := r.c.joinedOn(key); ok {
 		return r.sessionHolder(ctx, agent.SessionID, agent.Title), nil
 	}
@@ -631,67 +645,308 @@ func (r *runner) issueHolder(ctx context.Context, key string) (map[string]any, e
 		return nil, err
 	}
 	if issue.Claim != nil {
-		if issue.Claim.Actor.Kind == "session" {
-			return r.sessionHolder(ctx, issue.Claim.Actor.ID, issue.Claim.Actor.Origin.SessionTitle), nil
-		}
-		return map[string]any{"holder": "person", "person": issue.Claim.Actor.ID}, nil
+		return r.claimHolder(ctx, issue), nil
 	}
-	// No claim: the agent on the work is the newest session that wrote to
-	// the issue, other than this unit.
-	events, err := records.Events(ctx, issue.Key, holderEvents)
-	if err != nil {
-		return nil, err
-	}
-	own := ""
-	if agents := r.c.currentAgents(); agents != nil {
-		own = agents.ID()
-	}
-	for i := range events {
-		if actor := &events[i].Actor; actor.Kind == "session" && actor.ID != "" && actor.ID != own {
-			return r.sessionHolder(ctx, actor.ID, actor.Origin.SessionTitle), nil
-		}
-	}
-	return map[string]any{"holder": "none", "assignee": issue.Assignee}, nil
+	return r.workerHolder(ctx, records, issue)
 }
 
-// sessionHolder says whether agent session id can be asked now, from Envoy's
-// registry.
+// claimHolder is the holder of issue's claim: a person, or a session as
+// Dispatch judged it (holder_state, last_seen): live, unresponsive or gone.
+// Envoy's registry is asked only when Dispatch could not judge (unknown, or a
+// Dispatch that names no holder_state). A claim by an id that is no agent
+// session's, such as the Legion daemon's, is a holder nobody knows.
+func (r *runner) claimHolder(ctx context.Context, issue *dispatch.Issue) map[string]any {
+	claimant := &issue.Claim.Actor
+	switch {
+	case claimant.Kind != "session":
+		return map[string]any{"holder": "person", "person": claimant.ID}
+	case !agentSession(claimant.ID):
+		return unknownHolder()
+	}
+	switch state := envoy.SessionState(issue.HolderState); state {
+	case envoy.StateLive, envoy.StateUnresponsive, envoy.StateGone:
+		var lastSeen time.Time
+		if issue.LastSeen != nil {
+			lastSeen = *issue.LastSeen
+		}
+		return r.heldBy(claimant.ID, claimant.Origin.SessionTitle, state, lastSeen, true)
+	}
+	return r.sessionHolder(ctx, claimant.ID, claimant.Origin.SessionTitle)
+}
+
+// workerHolder is the holder of an issue nobody claims: of the sessions that
+// work it, the one that runs and wrote to it most recently. They are its
+// Legion role holders, all of them, and every session that set its status or
+// claimed it. A session that is none of these and wrote to the issue in
+// passing (another issue's agent, a coordinator) never holds it. An issue
+// with no such session at all falls back to the newest session that wrote
+// to it and runs, as main did. A session runs when Envoy knows it live or
+// unresponsive; one Envoy calls gone, or refuses as no session it can hold
+// (400), is passed over. A role holder that never wrote holds the issue only
+// when it is the one that runs; two cannot be ranked. None runs: nobody is on
+// the issue.
+//
+// Three earlier rules ranked roles by the issue's phase, and each opened a
+// path to the wrong session (Sol's reviews of #193): a fixed order, a phase
+// table, and a ranking on events never read.
+//
+// The events are read newest first, holderPage at a time, until the answer
+// cannot change: a session that set the status long ago may still write, so
+// a running writer that works no role is placed only once the history read
+// says whether it set the status. At most holderPages pages are read, within
+// holderBound. A read that fails, or the bound reached first, means the
+// holder could not be read: the voice says so, as for any holder read that
+// fails (R8), and asks nobody. It never ranks on history it did not read.
+func (r *runner) workerHolder(ctx context.Context, records Records, issue *dispatch.Issue) (map[string]any, error) {
+	search, cancel := context.WithTimeout(ctx, r.c.holderBound)
+	defer cancel()
+	cannotTell := func(why string, err error) (map[string]any, error) {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		r.c.logger.Warn("concierge cannot tell who works an issue", "issue", issue.Key, "why", why, "error", err)
+		return nil, tell(holderUnread)
+	}
+	agents := r.c.currentAgents()
+	own := ""
+	if agents != nil {
+		own = agents.ID()
+	}
+	isSession := func(id string) bool { return id != "" && id != own && agentSession(id) }
+	holders, err := records.RoleHolders(search, issue.Key)
+	if err != nil {
+		return cannotTell("the role holders could not be read", err)
+	}
+	working := map[string]bool{}
+	for _, holder := range holders {
+		if isSession(holder.Session) {
+			working[holder.Session] = true
+		}
+	}
+	type writer struct{ id, title string }
+	type looked struct {
+		info  envoy.SessionInfo
+		title string
+		state lookState
+	}
+	var writers []writer
+	wrote := map[string]bool{}
+	seen := map[string]looked{}
+	look := func(id, title string) looked {
+		if done, ok := seen[id]; ok {
+			return done
+		}
+		done := looked{title: title, state: lookRuns}
+		switch info, err := r.liveness(search, agents, id); {
+		case err == nil:
+			done.info = info
+			if info.State == envoy.StateGone {
+				done.state = lookGone
+			}
+		case search.Err() != nil:
+			done.state = lookCut
+		case refusedID(err):
+			done.state = lookRefused
+		default:
+			r.c.logger.Warn("concierge could not read an agent's liveness", "session", id, "error", err)
+			done.state = lookOutOfReach
+		}
+		seen[id] = done
+		return done
+	}
+	// held answers for a session look found running, or out of reach; nil
+	// when the bound cut its lookup.
+	held := func(id string, found looked) map[string]any {
+		switch found.state {
+		case lookRuns:
+			return r.heldBy(id, cmp.Or(found.title, found.info.Title), found.info.State, found.info.LastSeen, false)
+		case lookOutOfReach:
+			return r.outOfReachHolder(id, found.title)
+		}
+		return nil
+	}
+	// decide answers once the events read so far settle the holder: nil
+	// when the bound cut a lookup it needed.
+	decide := func(complete bool) (map[string]any, bool) {
+		fallback := complete && len(working) == 0
+		for _, w := range writers {
+			candidate := working[w.id] || fallback
+			if !candidate && complete {
+				continue // in passing
+			}
+			found := look(w.id, w.title)
+			switch {
+			case found.state == lookGone, found.state == lookRefused:
+				continue
+			case !candidate:
+				return nil, false // it may have set the status in an event not read yet
+			}
+			return held(w.id, found), true
+		}
+		if !complete {
+			return nil, false
+		}
+		// No session that works the issue wrote to it and runs. Of the role
+		// holders that never wrote, the one that runs holds it; two that run
+		// cannot be ranked.
+		var silent []string
+		for _, holder := range holders {
+			if !working[holder.Session] || wrote[holder.Session] || slices.Contains(silent, holder.Session) {
+				continue
+			}
+			switch look(holder.Session, "").state {
+			case lookGone, lookRefused:
+			case lookCut:
+				return nil, true
+			default:
+				silent = append(silent, holder.Session)
+			}
+		}
+		switch len(silent) {
+		case 0:
+			return noHolder(issue), true
+		case 1:
+			return held(silent[0], seen[silent[0]]), true
+		}
+		return unknownHolder(), true
+	}
+	var before int64
+	for range holderPages {
+		events, err := records.Events(search, issue.Key, before, holderPage)
+		if err != nil {
+			return cannotTell("its events could not be read", err)
+		}
+		for i := range events {
+			event := &events[i]
+			if actor := &event.Actor; actor.Kind == "session" && isSession(actor.ID) {
+				if setsStatus(event) || event.Type == "issue.claimed" {
+					working[actor.ID] = true
+				}
+				if !wrote[actor.ID] {
+					wrote[actor.ID] = true
+					writers = append(writers, writer{actor.ID, actor.Origin.SessionTitle})
+				}
+			}
+		}
+		complete := len(events) < holderPage || events[len(events)-1].Seq <= 1
+		if answer, ok := decide(complete); ok {
+			if answer == nil {
+				return cannotTell("the bound ended a lookup", search.Err())
+			}
+			return answer, nil
+		}
+		before = events[len(events)-1].Seq
+	}
+	return cannotTell("its history is longer than the events read", nil)
+}
+
+// lookState is what Envoy's registry says of a session issue_holder weighs.
+type lookState int
+
+const (
+	lookRuns       lookState = iota // live or unresponsive
+	lookGone                        // the registry holds no live session
+	lookRefused                     // the registry refused the id (400)
+	lookOutOfReach                  // Envoy did not answer
+	lookCut                         // issue_holder's own bound ended the read
+)
+
+// liveness reads session id's state from Envoy's registry; with no Envoy
+// session of the unit's, Envoy is out of reach.
+func (r *runner) liveness(ctx context.Context, agents Agents, id string) (envoy.SessionInfo, error) {
+	if agents == nil {
+		return envoy.SessionInfo{}, errors.New("concierge: the unit has no Envoy session")
+	}
+	return r.c.lookup(ctx, agents, id)
+}
+
+// setsStatus reports whether event set its issue's status: an issue.updated
+// whose changed fields name it.
+func setsStatus(event *dispatch.Event) bool {
+	if event.Type != "issue.updated" {
+		return false
+	}
+	var payload struct {
+		Changed []string `json:"changed"`
+	}
+	return json.Unmarshal(event.Payload, &payload) == nil && slices.Contains(payload.Changed, "status")
+}
+
+// agentSession reports whether id can be a session in Envoy's registry: one
+// the Envoy client sends (envoy.ValidSessionID), with no ":", which no
+// registry key holds. The Legion daemon's own writer, legion-daemon:<PROJECT>,
+// is such an id: Envoy's registry answered 400 for it.
+func agentSession(id string) bool {
+	return envoy.ValidSessionID(id) == nil && !strings.Contains(id, ":")
+}
+
+// refusedID reports whether a lookup's error is Envoy's registry refusing the
+// id as no session it can hold (400). A 401, 403 or 429 refuses the unit, so
+// the agents are out of reach.
+func refusedID(err error) bool {
+	var refusal *envoy.ListenerError
+	return errors.As(err, &refusal) && refusal.Status == http.StatusBadRequest
+}
+
+// sessionHolder is R5's answer for agent session id from Envoy's registry,
+// for a holder Dispatch gave no liveness of. An id the registry refuses is a
+// holder nobody knows.
 func (r *runner) sessionHolder(ctx context.Context, id, title string) map[string]any {
-	r.c.remember(r.x, id)
-	result := map[string]any{"session": id, "title": spokenName(title)}
 	agents := r.c.currentAgents()
 	if agents == nil {
-		result["holder"], result["state"] = "unresponsive", "unknown"
-		result["note"] = cannotReachEnvoy
-		return result
+		return r.outOfReachHolder(id, title)
 	}
 	info, err := r.c.lookup(ctx, agents, id)
 	if err != nil {
 		r.c.logger.Warn("concierge could not read an agent's liveness", "session", id, "error", err)
-		var refused *envoy.ListenerError
-		if errors.As(err, &refused) && refused.Status == http.StatusBadRequest {
-			// Envoy's registry refused the id: the holder is no session it
-			// can hold, such as a daemon's actor. It cannot be asked, and
-			// nothing is out of reach. A 401, 403 or 429 refuses the unit.
-			result["holder"], result["state"] = "unresponsive", "not an agent session"
-			return result
+		if refusedID(err) {
+			return unknownHolder()
 		}
-		result["holder"], result["state"] = "unresponsive", "unknown"
-		result["note"] = cannotReachEnvoy
-		return result
+		return r.outOfReachHolder(id, title)
 	}
-	if title == "" {
-		result["title"] = spokenName(info.Title)
+	return r.heldBy(id, cmp.Or(title, info.Title), info.State, info.LastSeen, false)
+}
+
+// heldBy is R5's answer for agent session id in state: {session, live}, else
+// {unresponsive} with the state and when the session was last seen. It names
+// the session for ask_agent; byDispatch: Dispatch judged the state.
+func (r *runner) heldBy(id, title string, state envoy.SessionState, lastSeen time.Time, byDispatch bool) map[string]any {
+	judged := envoy.SessionState("")
+	if byDispatch {
+		judged = state
 	}
-	if info.State == envoy.StateLive {
+	r.c.remember(r.x, id, judged)
+	result := map[string]any{"session": id, "title": spokenName(title)}
+	if state == envoy.StateLive {
 		result["holder"], result["live"] = "session", true
 		return result
 	}
-	result["holder"], result["state"] = "unresponsive", string(info.State)
-	if !info.LastSeen.IsZero() {
-		result["last_seen"] = ago(r.c.now(), info.LastSeen)
+	result["holder"], result["state"] = "unresponsive", string(state)
+	if !lastSeen.IsZero() {
+		result["last_seen"] = ago(r.c.now(), lastSeen)
 	}
 	return result
+}
+
+// outOfReachHolder is the answer for agent session id when Envoy did not
+// answer, or the unit has no Envoy session: R10's error sound.
+func (r *runner) outOfReachHolder(id, title string) map[string]any {
+	r.c.remember(r.x, id, "")
+	return map[string]any{"holder": "unresponsive", "state": "unknown", "note": cannotReachEnvoy, "session": id, "title": spokenName(title)}
+}
+
+// unknownHolder is the answer when nobody can tell who works the issue: a
+// holder that is no session Envoy can hold, or a history that could not be
+// read. It names no session, so nobody is asked, and it is neither out of
+// reach nor not answering, so the voice says nothing of it.
+func unknownHolder() map[string]any {
+	return map[string]any{"holder": "unknown"}
+}
+
+// noHolder is R5's {none}: no session is on the issue right now. It names
+// the person the issue is assigned to, who is not its holder.
+func noHolder(issue *dispatch.Issue) map[string]any {
+	return map[string]any{"holder": "none", "assigned_to": issue.Assignee}
 }
 
 func (r *runner) askAgent(ctx context.Context, session, question, issueKey string) (map[string]any, error) {
@@ -721,12 +976,23 @@ func (r *runner) askAgent(ctx context.Context, session, question, issueKey strin
 		}
 		issueKey = normalized
 	}
-	info, err := r.c.lookup(ctx, agents, session)
-	if err != nil {
-		return nil, tell(cannotReachEnvoy)
-	}
-	if info.State == envoy.StateGone {
+	// Dispatch's judgment wins: a session it read running (live or
+	// unresponsive) when issue_holder named it is asked whatever Envoy's
+	// registry says, which calls a restarting Legion session gone for under
+	// a second. Envoy stores the question for an unresponsive session. Envoy
+	// is asked only for a session Dispatch judged none.
+	switch judged, _ := r.c.dispatchRead(r.x, session); judged {
+	case envoy.StateLive, envoy.StateUnresponsive:
+	case envoy.StateGone:
 		return nil, tell("That agent's session has ended, so it cannot be asked.")
+	default:
+		info, err := r.c.lookup(ctx, agents, session)
+		if err != nil {
+			return nil, tell(cannotReachEnvoy)
+		}
+		if info.State == envoy.StateGone {
+			return nil, tell("That agent's session has ended, so it cannot be asked.")
+		}
 	}
 
 	// A new question to the same holder in the same exchange replaces the
@@ -987,7 +1253,7 @@ func (r *runner) listJoinedAgents() map[string]any {
 	agents := []map[string]any{}
 	if r.c.joined != nil {
 		for _, agent := range r.c.joined() {
-			r.c.remember(r.x, agent.SessionID)
+			r.c.remember(r.x, agent.SessionID, "")
 			agents = append(agents, map[string]any{"session": agent.SessionID, "title": spokenName(agent.Title), "issue_key": agent.IssueKey})
 		}
 	}
@@ -1032,10 +1298,11 @@ func (c *Concierge) joinedNumber(words string) string {
 // exchange: longer than any exchange.
 const namedFor = time.Hour
 
-// named is the agent sessions the tools named in one exchange.
+// named is the agent sessions the tools named in one exchange, each with the
+// state Dispatch judged it in, empty where Dispatch judged none.
 type named struct {
 	at       time.Time
-	sessions map[string]bool
+	sessions map[string]envoy.SessionState
 }
 
 // exchangeKey names one exchange: its meeting and its wake.
@@ -1044,9 +1311,11 @@ func exchangeKey(x *voice.Exchange) string {
 }
 
 // remember makes session askable in x: issue_holder or list_joined_agents
-// named it there. An exchange heard before its recording session existed
-// keeps its names under no session id; wasNamed reads both.
-func (c *Concierge) remember(x *voice.Exchange, session string) {
+// named it there; judged is the state Dispatch read it in, empty where
+// Dispatch judged none. An exchange heard before its recording session
+// existed keeps its names under no session id; wasNamed and dispatchRead
+// read both.
+func (c *Concierge) remember(x *voice.Exchange, session string, judged envoy.SessionState) {
 	if x.SessionID == "" && x.WakeAt.IsZero() {
 		return // no exchange, as IssueHolder's
 	}
@@ -1064,10 +1333,10 @@ func (c *Concierge) remember(x *voice.Exchange, session string) {
 	key := exchangeKey(x)
 	entry, ok := c.named[key]
 	if !ok {
-		entry = &named{at: now, sessions: map[string]bool{}}
+		entry = &named{at: now, sessions: map[string]envoy.SessionState{}}
 		c.named[key] = entry
 	}
-	entry.sessions[session] = true
+	entry.sessions[session] = cmp.Or(judged, entry.sessions[session])
 }
 
 // wasNamed reports whether the tools named session in x, so ask_agent may ask
@@ -1075,14 +1344,23 @@ func (c *Concierge) remember(x *voice.Exchange, session string) {
 // wake alone. Room speech, an issue's text or an agent's answer cannot name a
 // session to ask; only the record's holder or a joined agent is asked.
 func (c *Concierge) wasNamed(x *voice.Exchange, session string) bool {
+	_, named := c.dispatchRead(x, session)
+	return named
+}
+
+// dispatchRead is the state Dispatch read session in when the tools named it
+// in x, empty where Dispatch judged none, and whether they named it at all.
+func (c *Concierge) dispatchRead(x *voice.Exchange, session string) (envoy.SessionState, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	for _, key := range []string{exchangeKey(x), exchangeKey(&voice.Exchange{WakeAt: x.WakeAt})} {
-		if entry, ok := c.named[key]; ok && entry.sessions[session] {
-			return true
+		if entry, ok := c.named[key]; ok {
+			if judged, named := entry.sessions[session]; named {
+				return judged, true
+			}
 		}
 	}
-	return false
+	return "", false
 }
 
 // sending counts the questions on their way to agent session session.

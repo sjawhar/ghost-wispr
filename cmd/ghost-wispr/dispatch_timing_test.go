@@ -59,6 +59,7 @@ func TestDispatchRoutes(t *testing.T) {
 		"/api/v1/search/results":                 "search_keywords",
 		"/api/v1/issues/ABC-12":                  "issue",
 		"/api/v1/issues/ABC-12/events":           "events",
+		"/api/v1/issues/ABC-12/role-holders":     "role_holders",
 		"/api/v1/issues/ABC-12/artifacts/s/text": "document",
 		"/api/v1/issues/ABC-12/claims":           "other",
 		"/health":                                "other",

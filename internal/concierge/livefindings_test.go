@@ -33,7 +33,9 @@ func TestAKeyWithADecimalPointIsOneKey(t *testing.T) {
 // claim by an actor whose id is no Envoy session id, such as a Legion
 // daemon's "legion-daemon:INFRA", cannot be looked up, and Envoy says so; the
 // voice said "I cannot reach INFRA-45's agent yet." with the error sound.
-// The holder is no agent the Concierge can ask, which is no outage.
+// The holder is no agent the Concierge can ask, which is no outage; and it
+// is no agent that is not answering either (INFRA-1508 on 2026-11-25), but a
+// holder nobody knows, of which the voice says nothing.
 func TestAHolderThatIsNoEnvoySessionIsNoOutage(t *testing.T) {
 	for _, c := range []struct {
 		name, id  string
@@ -46,8 +48,8 @@ func TestAHolderThatIsNoEnvoySessionIsNoOutage(t *testing.T) {
 		r.records.issues["ABC-12"] = claimed("ABC-12", "session", c.id, "")
 		r.agents.lookupErr = c.lookupErr
 		holder := r.run(t, "issue_holder", map[string]string{"key": "ABC-12"})
-		if holder["holder"] != "unresponsive" || holder["note"] != nil {
-			t.Errorf("%s: issue_holder = %v, want unresponsive with no out-of-reach note", c.name, holder)
+		if holder["holder"] != "unknown" || holder["note"] != nil {
+			t.Errorf("%s: issue_holder = %v, want an unknown holder with no out-of-reach note", c.name, holder)
 		}
 		r.model.turns = [][]*genai.GenerateContentResponse{{chunk(text("ABC-12 is in progress."))}}
 		var spoken []said
@@ -55,8 +57,8 @@ func TestAHolderThatIsNoEnvoySessionIsNoOutage(t *testing.T) {
 		if errors.Is(err, voice.ErrUnreachable) {
 			t.Errorf("%s: Answer = %v, want no error sound", c.name, err)
 		}
-		if !slices.Contains(spoken, said{"ABC-12's agent is not answering.", voice.Fact}) {
-			t.Errorf("%s: spoken = %+v, want the not-answering line", c.name, spoken)
+		if !slices.Equal(spoken, []said{{"ABC-12 is in progress.", voice.Fact}}) {
+			t.Errorf("%s: spoken = %+v, want the facts and no holder line", c.name, spoken)
 		}
 	}
 }

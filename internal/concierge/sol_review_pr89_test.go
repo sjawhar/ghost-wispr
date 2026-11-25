@@ -82,7 +82,7 @@ func TestSolExplicitAskReachesUnresponsiveHolder(t *testing.T) {
 				t.Fatalf("task = %+v, %v; want the working task for the meeting and holder", task, err)
 			}
 			if state == envoy.StateUnresponsive {
-				if !slices.ContainsFunc(got, func(s said) bool { return s.text == "I asked the agent on ABC-12. The message waits until it runs." }) {
+				if !slices.ContainsFunc(got, func(s said) bool { return s.text == "ABC-12's agent isn't answering now; I left the question for it." }) {
 					t.Fatalf("spoken = %+v, want the queued-message line", got)
 				}
 			}

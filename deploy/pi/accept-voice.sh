@@ -2161,11 +2161,12 @@ task_field() {
 
 # issue_holder KEY: run ghost-wispr issue-holder, which prints the Concierge's issue_holder tool
 # answer as it is: {"holder":"session","live":true,...}, {"holder":"unresponsive",...},
-# {"holder":"person",...} or {"holder":"none",...}. A refused read (Dispatch out of reach, a bad
-# token) prints nothing, exits 1, and writes the Concierge's JSON log line with the error, then
-# "issue-holder KEY: I cannot reach Dispatch yet.", on stderr. It sets holder_json and holder_kind
-# (session_live, unresponsive, person, none, or the holder as written), or holder_error with the
-# refusal.
+# {"holder":"person",...}, {"holder":"none",...} or {"holder":"unknown"}. A refused read (Dispatch
+# out of reach, a bad token) prints nothing, exits 1, and writes the Concierge's JSON log line with
+# the error, then "issue-holder KEY: I cannot reach Dispatch yet.", on stderr; an issue history
+# it could not read far enough to name the holder does the same with "issue-holder KEY: I could
+# not read who works on that issue.". It sets holder_json and holder_kind (session_live,
+# unresponsive, person, none, or the holder as written), or holder_error with the refusal.
 holder_json=
 holder_kind=
 holder_error=

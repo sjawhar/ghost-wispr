@@ -115,7 +115,11 @@ func (f *claimedRecords) Issue(_ context.Context, key string) (*dispatch.Issue, 
 	return issue, nil
 }
 
-func (f *claimedRecords) Events(context.Context, string, int) ([]dispatch.Event, error) {
+func (f *claimedRecords) Events(context.Context, string, int64, int) ([]dispatch.Event, error) {
+	return nil, nil
+}
+
+func (f *claimedRecords) RoleHolders(context.Context, string) ([]dispatch.RoleHolder, error) {
 	return nil, nil
 }
 

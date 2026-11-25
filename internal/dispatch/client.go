@@ -64,10 +64,10 @@ func NewClient(baseURL, token string, httpClient *http.Client) (*Client, error) 
 
 // APIError is an answer that is no success. Code is Dispatch's error code
 // (NOT_FOUND, NO_IDENTITY, ...), which callers branch on. Route names the
-// call (search, issue, events, document). An error reaches the log, and both
-// Dispatch's own text and the request's path can hold words said in the room
-// (a search's words; a key such as LAST-24 heard in "the last 24 hours"), so
-// Error gives neither.
+// call (search, issue, events, role_holders, document). An error reaches the
+// log, and both Dispatch's own text and the request's path can hold words
+// said in the room (a search's words; a key such as LAST-24 heard in "the
+// last 24 hours"), so Error gives neither.
 type APIError struct {
 	Status  int
 	Code    string
@@ -197,7 +197,12 @@ type Claim struct {
 	At    time.Time `json:"at"`
 }
 
-// Issue is what the Concierge reads of an issue.
+// Issue is what the Concierge reads of an issue. HolderState is Dispatch's
+// judgment of a session claim's holder, named as Envoy names a session's
+// state: live, unresponsive, or gone when the session is in no list the
+// listener gave Dispatch; or unknown when the listener gave it no list. It
+// is empty for no claim and for a person's claim. LastSeen is when the
+// listener last saw that session, nil when it is in no list.
 type Issue struct {
 	Key         string     `json:"key"`
 	Title       string     `json:"title"`
@@ -247,16 +252,20 @@ func (c *Client) Issue(ctx context.Context, key string) (*Issue, error) {
 	return &issue, nil
 }
 
-// Event is one event of an issue's log.
+// Event is one event of an issue's log. Seq is its place in the issue's
+// event sequence, from 1.
 type Event struct {
+	Seq       int64           `json:"seq"`
 	Type      string          `json:"type"`
 	CreatedAt time.Time       `json:"created_at"`
 	Actor     Actor           `json:"actor"`
 	Payload   json.RawMessage `json:"payload"`
 }
 
-// Events reads an issue's newest limit events, newest first.
-func (c *Client) Events(ctx context.Context, key string, limit int) ([]Event, error) {
+// Events reads an issue's newest limit events, newest first, before the
+// event whose sequence number is before; 0 is the newest of all. Dispatch
+// gives at most 200 a read.
+func (c *Client) Events(ctx context.Context, key string, before int64, limit int) ([]Event, error) {
 	key, err := NormalizeIssueKey(key)
 	if err != nil {
 		return nil, err
@@ -265,11 +274,38 @@ func (c *Client) Events(ctx context.Context, key string, limit int) ([]Event, er
 	if limit > 0 {
 		params.Set("limit", strconv.Itoa(limit))
 	}
+	if before > 0 {
+		params.Set("before", strconv.FormatInt(before, 10))
+	}
 	var events []Event
 	if err := c.get(ctx, "events", "/api/v1/issues/"+key+"/events", params, &events); err != nil {
 		return nil, err
 	}
 	return events, nil
+}
+
+// RoleHolder is the session that holds one Legion role of an issue
+// (architect, planner, implementer, tester, reviewer or merger).
+type RoleHolder struct {
+	Role    string `json:"role"`
+	Session string `json:"session"`
+}
+
+// RoleHolders reads the sessions that hold an issue's Legion roles, as the
+// Legion daemon last published them, in workflow order; none when no session
+// holds a role, as for an issue Legion does not run.
+func (c *Client) RoleHolders(ctx context.Context, key string) ([]RoleHolder, error) {
+	key, err := NormalizeIssueKey(key)
+	if err != nil {
+		return nil, err
+	}
+	var answer struct {
+		Holders []RoleHolder `json:"holders"`
+	}
+	if err := c.get(ctx, "role_holders", "/api/v1/issues/"+key+"/role-holders", nil, &answer); err != nil {
+		return nil, err
+	}
+	return answer.Holders, nil
 }
 
 // DocumentText reads an issue document's markdown by its slug.

@@ -31,6 +31,7 @@ The recorder tells the room who holds the issue when that matters, and asks the 
 
 How you answer:
 - Say the facts of the record that answer the question, the conclusion first. Do not say who holds the issue unless the question asks who holds it.
+- Who holds an issue comes only from issue_holder: an agent session, named by its title, whether it runs or not; a person; or nobody, only when issue_holder says none. The person an issue is assigned to (assigned_to) is not its holder. Leave whether the agent is running to the recorder.
 - Say how old the fact is, using the ages the tools give, such as "updated two hours ago".
 - Use the record you are given. Call a tool only for what it does not hold. Call list_joined_agents only when the question asks which agents joined this meeting.
 - Speak for the ear: one to three short sentences, at most 50 words, and at most 20 words a sentence. No lists, tables, file paths, links, code or markdown.
@@ -57,6 +58,11 @@ const (
 	// spend the answer's 8 s (R6, R10).
 	lookupBound = 2 * time.Second
 	callBound   = 3 * time.Second
+	// holderBound bounds issue_holder's whole read of an unclaimed issue:
+	// its role holders, its events a page at a time, and Envoy's lookups.
+	// The first fact waits for the holder, so the holder waits no longer
+	// than one Dispatch read may.
+	holderBound = callBound
 	// searchBound bounds one search. Dispatch's normal search took 1.0 to
 	// 6.4 s live on 2026-11-19 (median 1.2 s, p90 2.2 s), and 3.3 to 5.0 s
 	// on 2026-11-24 (20 runs from the devbox: median 3.9 to 4.2 s, p90 4.3
@@ -386,7 +392,10 @@ func (c *Concierge) answer(parent context.Context, x *voice.Exchange, turn strin
 			err = c.failed(parent, sp, err)
 		}
 	}
-	if holderCase != "" {
+	// An ask to an unresponsive holder says the holder's case with its own
+	// result: left for it, one line; failed, the case and the failure.
+	askedUnresponsive := askStarted.Load() && unresponsiveHolder(found)
+	if holderCase != "" && !askedUnresponsive {
 		// R6: after the facts, only when it changes what happens next.
 		if sayErr := sp.sayText(parent, holderCase, voice.Fact); sayErr != nil {
 			return errors.Join(err, sayErr)
@@ -406,7 +415,15 @@ func (c *Concierge) answer(parent context.Context, x *voice.Exchange, turn strin
 			default:
 				if key := askingKey.Load(); key != nil {
 					result.line = "I asked the agent on " + *key + ". " + usualWait
+					if askedUnresponsive {
+						result.line = leftQuestion(*key)
+					}
 				}
+			}
+		}
+		if result.holderCase != "" {
+			if sayErr := sp.sayText(parent, result.holderCase, voice.Fact); sayErr != nil {
+				return errors.Join(err, sayErr)
 			}
 		}
 		asked, unreachable = result.line, unreachable || result.unreachable
@@ -516,7 +533,7 @@ func spokenLine(full, short string) string {
 }
 
 // holderLine is issue_holder's answer for key in at most 8 words, for the
-// answers R6 speaks; "" for a live session.
+// answers R6 speaks; "" for a live session and for a holder nobody knows.
 func holderLine(key string, holder map[string]any) string {
 	switch holder["holder"] {
 	case "unresponsive":
@@ -535,7 +552,7 @@ func holderLine(key string, holder map[string]any) string {
 		}
 		return spokenLine(full, key+" is held by a person.")
 	case "none":
-		return "No agent session is on " + key + "."
+		return "No agent is on " + key + " right now."
 	}
 	return ""
 }
@@ -607,25 +624,40 @@ func (c *Concierge) askPlan(turn string, found *reading, followUp bool) string {
 
 // ask sends the question to the holder, session, and says how it went. An
 // ask that a stop or the bound cut says nothing: whether it was sent is
-// unknown.
+// unknown. A question for an unresponsive holder is left for it: Envoy stores
+// it and delivers it when the session comes back, and the room hears that in
+// one line (leftQuestion). An ask to such a holder that failed says the
+// holder's case too.
 func (c *Concierge) ask(ctx context.Context, x *voice.Exchange, session, turn string, found *reading) askResult {
 	result, err := (&runner{c: c, x: x}).call(ctx, "ask_agent", map[string]any{"session": session, "question": fewestWords(turn), "issue_key": found.key})
+	holderCase := ""
+	if unresponsiveHolder(found) {
+		holderCase = found.holderCase()
+	}
 	switch {
 	case err != nil:
 		return askResult{}
 	case outOfReach(result):
-		return askResult{line: "I could not ask the agent on " + found.key + ": " + cannotReachEnvoy, unreachable: true}
+		return askResult{line: "I could not ask the agent on " + found.key + ": " + cannotReachEnvoy, holderCase: holderCase, unreachable: true}
 	case result["error"] != nil:
-		return askResult{line: "I could not ask the agent on " + found.key + "."}
+		return askResult{line: "I could not ask the agent on " + found.key + ".", holderCase: holderCase}
+	case unresponsiveHolder(found):
+		return askResult{line: leftQuestion(found.key)}
 	default:
-		line := "I asked the agent on " + found.key + ". " + usualWait
-		holderCase := ""
-		if found.holder["state"] == string(envoy.StateUnresponsive) {
-			line = "I asked the agent on " + found.key + ". The message waits until it runs."
-			holderCase = found.holderCase()
-		}
-		return askResult{line: line, holderCase: holderCase}
+		return askResult{line: "I asked the agent on " + found.key + ". " + usualWait}
 	}
+}
+
+// unresponsiveHolder reports whether found's holder is a session that is not
+// answering now, whose question Envoy stores.
+func unresponsiveHolder(found *reading) bool {
+	return found.holder["holder"] == "unresponsive" && found.holder["state"] == string(envoy.StateUnresponsive)
+}
+
+// leftQuestion is what the room hears of a question left for key's
+// unresponsive agent.
+func leftQuestion(key string) string {
+	return key + "'s agent isn't answering now; I left the question for it."
 }
 
 // aboutStatus reports whether turn asks about status. "Going to" speaks of
