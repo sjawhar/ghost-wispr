@@ -167,6 +167,40 @@ func TestAPendingOfferChangesNoNewQuestion(t *testing.T) {
 	}
 }
 
+// lateFullSearch is records whose full search reaches its fake only after
+// delay: the goroutine searchBoth starts for the full search, run late, as the
+// Go scheduler may run it.
+type lateFullSearch struct {
+	Records
+	delay time.Duration
+}
+
+func (l lateFullSearch) Search(ctx context.Context, query string, limit int) ([]dispatch.SearchHit, error) {
+	time.Sleep(l.delay)
+	return l.Records.Search(ctx, query, limit)
+}
+
+// TestAnOutcomeHoldsEveryFullSearchTheAnswerStarted (Sol's review of #197 at
+// 7791198, I2): searchBoth starts the full search on a goroutine of its own and
+// can return the keyword result before that goroutine reaches the fake, so an
+// outcome read at once may hold no full search. In a suite run
+// TestAPendingOfferChangesNoNewQuestion failed so: one outcome held the full
+// search and the other did not, with the same words spoken and the same
+// issue taken. It fails unless outcomeOf holds every full search the answer
+// started, here one that reaches the fake 200 ms late.
+func TestAnOutcomeHoldsEveryFullSearchTheAnswerStarted(t *testing.T) {
+	const turn = "what changed on the realtime voice in the last 30 days"
+	late := func(r *rig) {
+		r.concierge.mu.Lock()
+		r.concierge.records = lateFullSearch{Records: r.concierge.records, delay: 200 * time.Millisecond}
+		r.concierge.mu.Unlock()
+	}
+	onTime, late200 := outcomeOf(t, false, nil, turn), outcomeOf(t, false, late, turn)
+	if len(onTime.Full) == 0 || !reflect.DeepEqual(onTime, late200) {
+		t.Errorf("the full search on time: %+v\nthe full search 200 ms late: %+v\nwant the same, with the full search", onTime, late200)
+	}
+}
+
 // outcome is what an answer did, as the room and Dispatch saw it.
 type outcome struct {
 	Spoken        []string
@@ -180,7 +214,11 @@ type outcome struct {
 // outcomeOf answers turn on a follow-up turn, the project list unable to
 // tell, ABC-12 and ABC-13 offered when pending, and both searches finding
 // ABC-12, "Realtime voice", unless setup changes the fakes. The read-ahead
-// hears the turn first, as the Supervisor makes it.
+// hears the turn first, as the Supervisor makes it. The outcome holds every
+// search the answer and its read-ahead started: searchBoth starts each full
+// search on a goroutine of its own beside its keyword search, and may return
+// the keyword result before that goroutine reaches the fake (Sol's review of
+// #197, I2), so outcomeOf waits until each keyword search has its full one.
 func outcomeOf(t *testing.T, pending bool, setup func(*rig), turn string) outcome {
 	t.Helper()
 	r := newRig(t)
@@ -208,6 +246,11 @@ func outcomeOf(t *testing.T, pending bool, setup func(*rig), turn string) outcom
 	for _, s := range spoken {
 		got.Spoken = append(got.Spoken, s.text)
 	}
+	eventually(t, "every full search the answer started to reach the fake", func() bool {
+		r.records.mu.Lock()
+		defer r.records.mu.Unlock()
+		return len(r.records.queries) >= len(r.records.kwQueries)
+	})
 	r.records.mu.Lock()
 	got.Full, got.Keyword = slices.Clone(r.records.queries), slices.Clone(r.records.kwQueries)
 	r.records.mu.Unlock()
