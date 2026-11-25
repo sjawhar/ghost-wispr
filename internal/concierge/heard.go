@@ -250,9 +250,10 @@ func (v projectsView) issueKeys(words string) []string {
 }
 
 // withoutOneDigitKeys is words with each key of one digit the view reads
-// (oneDigitKey) taken out, so the turn's search words hold no such key's
-// project, as they hold none of a longer key's (searchTerms). A project
-// word and one digit that are speech stay: "I bet 5" searches "bet".
+// (oneDigitKey) taken out, with the possessive said after it ("INFRA-7's"),
+// so the turn's search words hold no such key's project, as they hold none
+// of a longer key's (searchTerms, possessiveKey). A project word and one
+// digit that are speech stay: "I bet 5" searches "bet".
 func (v projectsView) withoutOneDigitKeys(words string) string {
 	text := v.spokenKeys(words)
 	var b strings.Builder
@@ -261,23 +262,30 @@ func (v projectsView) withoutOneDigitKeys(words string) string {
 		if v.oneDigitKey(text, m) {
 			b.WriteString(text[last:m[0]])
 			b.WriteString(" ")
-			last = m[1]
+			last = m[1] + len(possessiveTail.FindString(text[m[1]:]))
 		}
 	}
 	b.WriteString(text[last:])
 	return b.String()
 }
 
-// endsInOneDigitKey reports whether words, a turn so far, end in a key of one
-// digit the view reads (oneDigitKey), which more words may make speech.
-func (v projectsView) endsInOneDigitKey(words string) bool {
+// possessiveTail is the possessive said after a key ("INFRA-7's").
+var possessiveTail = regexp.MustCompile(`^['’]s\b`)
+
+// beforeTrailingOneDigitKey is words, a turn so far, up to the key of one
+// digit the view reads (oneDigitKey) that ends them, and whether one ends
+// them: more words may make it speech ("ops 1", then "and 2").
+func (v projectsView) beforeTrailingOneDigitKey(words string) (string, bool) {
 	text := v.spokenKeys(words)
 	matches := anyDigitsKey.FindAllStringSubmatchIndex(text, -1)
 	if len(matches) == 0 {
-		return false
+		return words, false
 	}
 	last := matches[len(matches)-1]
-	return v.oneDigitKey(text, last) && strings.IndexFunc(text[last[1]:], func(r rune) bool { return unicode.IsLetter(r) || unicode.IsDigit(r) }) < 0
+	if !v.oneDigitKey(text, last) || strings.IndexFunc(text[last[1]:], func(r rune) bool { return unicode.IsLetter(r) || unicode.IsDigit(r) }) >= 0 {
+		return words, false
+	}
+	return text[:last[0]], true
 }
 
 // read is one read of the record for a target. complete is set when it ran
@@ -504,19 +512,23 @@ func (c *Concierge) Heard(ctx context.Context, x *voice.Exchange, words string) 
 	}
 	// A key of one digit that ends the words so far is a key only if the
 	// turn ends there: "ops 1" goes on "and 2", which is speech, and reads
-	// no issue. For such words the read-ahead reads nothing and stops the
-	// read of older words, which they made stale, as a new target does; the
-	// answer reads the final turn.
-	hold := view.endsInOneDigitKey(words)
+	// no issue. The read-ahead holds that key alone: it reads the keys said
+	// before it, alone ("what about ABC-12 and INFRA-7" reads ABC-12), and
+	// searches nothing, or with no key before it reads nothing; either way
+	// it stops a read of older words still running, which the new words
+	// made stale, as a new target does. The answer reads the final turn, and
+	// reads the room's keys a vendor's wording leaves out (readFor).
+	before, hold := view.beforeTrailingOneDigitKey(words)
 	target := ""
-	if !hold {
-		target = c.readTarget(view, words)
+	if hold {
+		if keys := keysOf(c.readTarget(view, before)); keys != "" {
+			target = "keys:" + keys
+		}
+	} else if target = c.readTarget(view, words); target == "" {
 		// A number-only turn (no key, no work words) skips the read-ahead:
 		// it goes straight to the bare-number candidate lookup. A turn with
 		// words beyond the number keeps its search.
-		if target == "" {
-			return
-		}
+		return
 	}
 	exchange := *x
 	now := c.now()
@@ -533,10 +545,10 @@ func (c *Concierge) Heard(ctx context.Context, x *voice.Exchange, words string) 
 	}
 	key := exchangeKey(&exchange)
 	p := c.prefetchLocked(&exchange)
-	if hold {
-		if p != nil {
-			p.stopCurrent()
-		}
+	if hold && p != nil && p.current != target {
+		p.stopCurrent()
+	}
+	if target == "" {
 		return
 	}
 	if p == nil {
@@ -647,7 +659,8 @@ func (c *Concierge) readFor(ctx context.Context, x *voice.Exchange, view project
 	var pending *read
 	searchAgain, sameTerms := false, false
 	aheadWords, finalWords, held := 0, 0, 0
-	if p := c.prefetchLocked(x); p != nil {
+	p := c.prefetchLocked(x)
+	if p != nil {
 		keys := keysOf(target)
 		pending, target = p.aheadFor(target)
 		// The unit's own transcript stands in for the vendor's wording when
@@ -686,6 +699,26 @@ func (c *Concierge) readFor(ctx context.Context, x *voice.Exchange, view project
 			slices.Sort(finalSorted)
 			searchAgain, sameTerms, aheadWords, finalWords = true, slices.Equal(aheadSorted, finalSorted), len(ahead), len(final)
 		}
+	}
+	// The room's keys (AskerTurn) that a vendor's wording leaves out, and
+	// that no read took ahead, are read now: the read-ahead holds a key of
+	// one digit that ends the words said (Heard), so the room's "what about
+	// INFRA-7" can have no read ahead when the vendor answers "what about the
+	// realtime voice" (Sol's review of #194, R2). A read of them that failed
+	// or that an answer took stays as #192 left it: the vendor's wording is
+	// read, for voices B and C can leave the turn before as AskerTurn.
+	if keys := keysOf(asked); pending == nil && keys != "" && keysOf(target) == "" && (p == nil || p.reads["keys:"+keys] == nil) {
+		target = "keys:" + keys + "|" + strings.TrimPrefix(target, "search:")
+	}
+	// Keys the answer reads itself are spent with it (takeAheadSearches), as
+	// a read ahead is: no later answer reads them for the turn before, and no
+	// later words read them ahead.
+	if keys := keysOf(target); pending == nil && keys != "" {
+		if p == nil {
+			p = &prefetch{at: c.now(), reads: map[string]*read{}}
+			c.prefetches[exchangeKey(x)] = p
+		}
+		p.reads["keys:"+keys] = spent
 	}
 	c.mu.Unlock()
 	if searchAgain { // logged without c.mu: a log write can wait
