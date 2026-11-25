@@ -77,8 +77,9 @@ func TestATurnTheConciergeAnsweredIsLogged(t *testing.T) {
 	c.outcome, c.issueKey = OutcomeAnswered, "ABC-12"
 	r, log := newQuestionRig(t, c, false)
 	before := time.Now()
-	r.ask("what is happening with ABC-12?")
-	r.waitSpeaking()
+	sess := r.ask("what is happening with ABC-12?")
+	waitSaid(t, sess)
+	waitSaid(t, sess) // both lines written: the speaker has them to play
 	log.none(t, "the question was logged while its answer still played", 150*time.Millisecond)
 	r.speaker.finish(audio.InputVoice)
 	q := log.next(t)
@@ -212,15 +213,15 @@ func TestEachTurnOfAnExchangeIsLoggedAndNothingElse(t *testing.T) {
 	c := newFakeConcierge("PR 80 is in review.")
 	c.outcome = OutcomeAnswered
 	r, log := newQuestionRig(t, c, false)
-	r.ask("what is happening with ABC-12?")
-	r.waitSpeaking()
+	sess := r.ask("what is happening with ABC-12?")
+	waitSaid(t, sess)
 	r.speaker.finish(audio.InputVoice)
 	if q := log.next(t); q.Heard != "what is happening with ABC-12?" {
 		t.Fatalf("the first turn logged %+v", q)
 	}
 	r.heard("And who holds it?", true, true)
 	r.waitTurn()
-	r.waitSpeaking()
+	waitSaid(t, sess) // its frame is written: the speaker has it to play
 	r.speaker.finish(audio.InputVoice)
 	if q := log.next(t); q.Heard != "And who holds it?" || q.Outcome != OutcomeAnswered {
 		t.Fatalf("the follow-up logged %+v", q)
@@ -242,14 +243,14 @@ func TestAFollowUpAnsweredInTheSameSpeechHasItsFirstAudio(t *testing.T) {
 	c.outcome = OutcomeAnswered
 	r, log := newQuestionRig(t, c, false)
 	sess := r.ask("what is happening with ABC-12?")
-	r.waitSpeaking()
+	waitSaid(t, sess)
 	r.speaker.drain(audio.InputVoice) // played; the speech has not ended
 	if q := log.next(t); q.FirstAudio == nil {
 		t.Fatalf("the first turn logged %+v, want its first audio", q)
 	}
 	r.heard("And who holds it?", true, true)
 	r.waitTurn()
-	eventually(t, "the follow-up's answer said", func() bool { return len(sess.saysCopy()) == 2 })
+	waitSaid(t, sess) // its frame is written, in the speech still playing
 	r.speaker.finish(audio.InputVoice)
 	q := log.next(t)
 	if q.Heard != "And who holds it?" || q.FirstAudio == nil || *q.FirstAudio < 0 || q.Took < *q.FirstAudio {
@@ -265,8 +266,8 @@ func TestASpeechStartReportedLateIsNoFirstAudio(t *testing.T) {
 	c := newFakeConcierge("PR 80 is in review.")
 	c.outcome = OutcomeAnswered
 	r, log := newQuestionRig(t, c, false)
-	r.ask("what is happening with ABC-12?")
-	r.waitSpeaking()
+	sess := r.ask("what is happening with ABC-12?")
+	waitSaid(t, sess)
 	r.speaker.finish(audio.InputVoice)
 	log.next(t)
 	gate := make(chan struct{})
@@ -284,7 +285,7 @@ func TestASpeechStartReportedLateIsNoFirstAudio(t *testing.T) {
 	r.speaker.emit(&audio.SpeechEvent{Input: audio.InputVoice, Started: false, At: past.Add(time.Second), Owner: ex})
 	r.speaker.FlushSpeech()
 	close(gate)
-	r.waitSpeaking()
+	waitSaid(t, sess) // its frame is written: the speaker has it to play
 	r.speaker.finish(audio.InputVoice)
 	q := log.next(t)
 	if q.Heard != "And who holds it?" || q.FirstAudio == nil || *q.FirstAudio <= 0 {

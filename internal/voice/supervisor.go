@@ -2613,6 +2613,9 @@ func (s *Supervisor) finish(ex *exchange, sessionID string) bool {
 		}
 	}
 	played := unplayed == nil
+	// The speaker's queued speech events first, so the question log has the
+	// start of a speech whose report still waits (openQuestion.firstAudio).
+	s.cfg.Speaker.FlushSpeech()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.ex != ex || ex.ended {
