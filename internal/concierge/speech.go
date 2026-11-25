@@ -145,10 +145,7 @@ var (
 
 // withoutWake is words, lower case and without punctuation, without the
 // wake phrase they open with, after at most one opener ("hey wispr"):
-// "wispr" or "ghost wispr", the name as Deepgram may spell it. A final that
-// wrote the name otherwise ("Mister") reaches here without it: the
-// Supervisor begins the turn after the wake (sinceWakeLocked), so a
-// person's name that opens the question stays (Sol's review of #192).
+// "wispr" or "ghost wispr", the name as Deepgram may spell it.
 func withoutWake(words []string) []string {
 	rest := words
 	if len(rest) > 1 && wakeOpeners[rest[0]] {

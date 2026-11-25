@@ -392,22 +392,14 @@ type exchange struct {
 	cancel context.CancelFunc
 	// authority is ctx as an exchangeContext, which bindMeetingLocked binds
 	// to the recorder's meeting; nil for an exchange made otherwise.
-	authority *exchangeContext
-	x         Exchange
-	session   Session
-	opened    chan struct{} // closed once Open returned, or failed
-	drives    bool          // the voice drives its own turn
-	answering bool          // the turn went to the Concierge (or a held answer is spoken)
-	answer    *pendingAnswer
-	wakeStart float64 // the wake word's start on the socket; later results of its utterance repeat it
-	// wakeRest is the words after the wake phrase in the latest result of its
-	// utterance that held it, and restEnd the end on the socket of that
-	// result's last word: what a result that lost the wake keeps
-	// (sinceWakeLocked). Once a final took the turn's first words (restTaken),
-	// restEnd is the end of the last final word the turn holds.
-	wakeRest     string
-	restEnd      float64
-	restTaken    bool
+	authority    *exchangeContext
+	x            Exchange
+	session      Session
+	opened       chan struct{} // closed once Open returned, or failed
+	drives       bool          // the voice drives its own turn
+	answering    bool          // the turn went to the Concierge (or a held answer is spoken)
+	answer       *pendingAnswer
+	wakeStart    float64 // the wake word's start on the socket; later results of its utterance repeat it
 	wakeAt       time.Time
 	turn         []string // final words of the asker's turn
 	interim      string   // the turn's words not final yet
@@ -1094,11 +1086,6 @@ func (s *Supervisor) onTranscriptLocked(t *Transcript) {
 			}
 			s.neverMindLocked(s.cfg.Session())
 		case same && !ex.answering:
-			// A later result of the call: the words after the wake read
-			// better as more of them come.
-			if !ex.restTaken {
-				ex.wakeHeard(t, m)
-			}
 			if ex.drives {
 				// The wake is the call this exchange already took: a turn
 				// these words begin after the voice spoke does not follow it.
@@ -1130,8 +1117,7 @@ func (s *Supervisor) onTranscriptLocked(t *Transcript) {
 				ex.turnFrom = from // the voice answered this call before its result came
 			}
 			ex.wakeStart, ex.wakeSaid = wakeStart(t, m), wakeSaidAt(t, m)
-			ex.wakeHeard(t, m)
-			ex.turn, ex.interim, ex.turnFinal, ex.restTaken = nil, "", false, false
+			ex.turn, ex.interim, ex.turnFinal = nil, "", false
 			ex.followUpTurn, ex.turnByName = false, true // a call, with the wake phrase
 			cut := false
 			if ex.drives {
@@ -1188,65 +1174,15 @@ func (s *Supervisor) onTranscriptLocked(t *Transcript) {
 		return
 	}
 	if ex.drives && ex.answer == nil {
-		s.driverHeardLocked(ex, t, s.sinceWakeLocked(ex, t))
+		s.driverHeardLocked(ex, t, t.Text)
 	}
 	if !ex.answering && !ex.drives {
 		if !ex.stale(t) { // else a late result of a turn answered already
-			s.turnLocked(ex, t, s.sinceWakeLocked(ex, t))
+			s.turnLocked(ex, t, t.Text)
 		}
 		return
 	}
 	s.bargeInLocked(ex, t, now)
-}
-
-// sinceWakeLocked is t's words for the turn of ex, which began at the wake
-// phrase (turnByName), when t no longer holds it: Deepgram's final sometimes
-// revises the utterance and writes the name otherwise ("Mister") or drops
-// it. The words before the wake are speech the room did not address to
-// Wispr, and they went with the question to Dispatch's search, its
-// embedding vendor and the model (Sol's reviews of #192). Finding the wake's
-// place in the revised final, by a window in time and then by matching
-// words, let a word from before it in each time, so the turn does not look
-// for it. It is the words that followed the wake in the latest result that
-// held it (wakeRest), which were said after the wake, then t's words that
-// start after that result's last word ends (restEnd): those came later, so
-// no word from before the wake is in it. With no word after the wake there,
-// that is t's words from the wake's end on. A result split in two reads the
-// same way: the first final that lost the wake takes wakeRest, and each
-// final after it only its words after the last final word the turn holds.
-// The cost is in the fail-safe direction: Deepgram's corrections of wakeRest
-// are lost ("Alex" for "Alice"), a final whose word times moved earlier
-// loses a word that moved before restEnd, and one whose times moved later
-// repeats a word that moved past it. A result wholly after restEnd, as a
-// later segment of the turn is, and one with no word times, are taken as
-// they came.
-func (s *Supervisor) sinceWakeLocked(ex *exchange, t *Transcript) string {
-	// A nanosecond's slack keeps the edge, as moved does.
-	after := func(w *Word) bool { return w.Start >= ex.restEnd-1e-9 }
-	if !ex.turnByName || len(t.Words) == 0 || after(&t.Words[0]) {
-		return t.Text
-	}
-	var words []string
-	if !ex.restTaken && ex.wakeRest != "" {
-		words = append(words, ex.wakeRest)
-	}
-	for i := range t.Words {
-		if after(&t.Words[i]) {
-			words = append(words, t.Words[i].Text)
-		}
-	}
-	return strings.Join(words, " ")
-}
-
-// wakeHeard keeps the words after the wake phrase (m) in t, a result of the
-// wake's utterance that holds it, and the end of t's last word: the latest
-// reading of what followed the wake (sinceWakeLocked). With no word times,
-// the end is 0, and a later result is taken as it came.
-func (ex *exchange) wakeHeard(t *Transcript, m transcript.Match) {
-	ex.wakeRest, ex.restEnd = strings.TrimSpace(m.Rest), 0
-	if n := len(t.Words); n > 0 {
-		ex.restEnd = t.Words[n-1].End
-	}
 }
 
 // driverHeardLocked takes words, of t, into the turn of ex, whose voice
@@ -1521,7 +1457,6 @@ func (s *Supervisor) startLocked(t *Transcript, m transcript.Match) {
 	// session, the exchange's is the start after that count (sessionLocked).
 	sessionID, starts := s.sessionMark()
 	ex := &exchange{ctx: ctx, cancel: ctx.cancel, authority: ctx, opened: make(chan struct{}), wakeStart: wakeStart(t, m), wakeSaid: wakeSaidAt(t, m), wakeAt: t.At, openSeq: starts, notified: map[string]bool{}, times: &exchangeTimes{wakeAt: t.At}, turnByName: true}
-	ex.wakeHeard(t, m)
 	s.capExchange(ex)
 	if d, ok := voice.(TurnDriver); ok && d.DrivesTurn() {
 		ex.drives = true
@@ -1831,14 +1766,6 @@ func (s *Supervisor) turnLocked(ex *exchange, t *Transcript, words string) {
 		}
 		ex.interim = ""
 		ex.turnFinal = true
-		if ex.turnByName {
-			// The turn's first words are final: a later result adds only
-			// its words after this one's (sinceWakeLocked).
-			ex.restTaken = true
-			if n := len(t.Words); n > 0 {
-				ex.restEnd = max(ex.restEnd, t.Words[n-1].End)
-			}
-		}
 		if ex.drives {
 			ex.times.lastTurnEnd = time.Now()
 			ex.turnSaidAt = ex.times.lastTurnEnd

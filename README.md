@@ -682,8 +682,10 @@ What the voice hears, and where the room's words go:
   Deepgram hears someone start to speak over the voice, the frames still waiting are dropped. Model
   audio that comes more than 250 ms before its own text would play. The probe measured that lead at
   24 ms at most, over 146 sentences in 28 real sessions. The wait makes each answer start 250 ms later.
-- Dispatch's search gets the question as spoken, without the wake phrase. Each search runs two of
-  Dispatch's searches at once:
+- Dispatch's search gets the question as spoken, without the wake phrase. When Deepgram's final
+  result drops the name or writes it otherwise ("Mister"), the turn is that result whole, so words
+  said just before the wake can go with the question. Each search runs two of Dispatch's searches
+  at once:
   - Its search by words and meaning gets the question whole: in lower case, without the
     punctuation around each word, a name spelled letter by letter written as the word it spells,
     and an issue key left out (a key of one of Dispatch's projects, or, while the unit cannot tell

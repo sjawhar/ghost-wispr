@@ -681,8 +681,7 @@ func TestAnAnswerTakesNoReadOfTheAnswerBefore(t *testing.T) {
 // 4e52421): a question may open with a person's name ("Wispr, Miss Burr
 // fixed the realtime voice"), and the Supervisor hands it on without the
 // wake it recognised. It fails if the full search loses the name, which main
-// kept; where a final lost the wake, the Supervisor begins the turn after
-// it (sinceWakeLocked), so no name list strips the question's first words.
+// kept: no list of names strips the question's first words.
 func TestAPersonNamedFirstStaysInTheQuestion(t *testing.T) {
 	for _, tc := range []struct{ query, full string }{
 		{"Miss Burr fixed the realtime voice. What changed?", "miss burr fixed the realtime voice what changed"},
