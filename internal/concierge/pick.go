@@ -219,6 +219,16 @@ func afterTakeBack(reply string) string {
 	return strings.TrimSpace(rest)
 }
 
+// takesItBack reports whether reply, the room's finals one a line, holds a
+// take-back (afterTakeBack). Found on the raw finals, a take-back that the
+// end of a final ends is a clause of its own; in a turn the Supervisor joined
+// with spaces it is not ("what about ABC-42? never mind what about ABC-12?"),
+// so the answer reads the raw cut (replyText), never the joined turn (Sol's
+// eighth review of #191).
+func takesItBack(reply string) bool {
+	return afterTakeBack(reply) != strings.TrimSpace(reply)
+}
+
 // takesBack reports whether clause, with no question mark, is a take-back
 // phrase after the words that may open a clause (afterTakeBack).
 func takesBack(clause string) bool {

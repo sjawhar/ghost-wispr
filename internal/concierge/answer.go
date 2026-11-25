@@ -207,9 +207,14 @@ func (c *Concierge) answer(parent context.Context, x *voice.Exchange, turn strin
 	// (takeKey). A question is read exactly as with no offer pending; when
 	// the question was said before the turn, the whole reply is read
 	// (readsReply). Nothing said before the reply's last take-back is read,
-	// searched, sent or given to the model: a take-back inside the turn's
-	// own final cuts the turn too ("what about ABC-42? never mind. what
-	// about ABC-12?" is "what about ABC-12?"; Sol's seventh review of #191).
+	// searched, sent or given to the model: when the reply holds a
+	// take-back, found on the raw finals, the answer reads what follows it
+	// (said), never a cut of the turn, where the Supervisor joined the
+	// finals with spaces and a take-back that a final's end closed is no
+	// clause of its own ("what about ABC-42? never mind" / "what about
+	// ABC-12?" is "what about ABC-12?"; Sol's seventh and eighth reviews of
+	// #191). With no reply (no question of Wispr's pending a reply, or a
+	// voice that does not drive its turn), the take-back is found on the turn.
 	offer, offered := c.pendingOffer(x)
 	reply := x.Reply
 	if strings.TrimSpace(reply) == "" {
@@ -221,13 +226,8 @@ func (c *Concierge) answer(parent context.Context, x *voice.Exchange, turn strin
 		c.logger.Info("concierge took a reply to its own question for side talk: it picks nothing, says no key and asks nothing, or takes itself back")
 		return errSideTalk
 	}
-	if offered {
-		if rest := afterTakeBack(turn); rest != "" {
-			turn = rest
-		}
-		if strings.TrimSpace(x.Reply) != "" && offer.readsReply(view, turn, said) {
-			turn = said
-		}
+	if offered && (takesItBack(reply) || strings.TrimSpace(x.Reply) != "" && offer.readsReply(view, turn, said)) {
+		turn = said
 	}
 	// A key said letter by letter is read here, once, so the pick, the
 	// routing line, the search and the ask all see it.

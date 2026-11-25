@@ -653,15 +653,31 @@ func TestAKeySplitAcrossFinalsIsReadWhole(t *testing.T) {
 // final went to the model and the holder; main does the same. Controls: the
 // question alone; the take-back in a final of its own; the same final then
 // "okay sure", answered from what follows the take-back.
+//
+// The rows with no endpoint come from Sol's eighth review of #191 (his
+// TestSol191R8RawCancellationBoundary). When the end of a final, not a stop,
+// ends the take-back, and no endpoint ends the turn there, the turn joins
+// the finals with a space ("what about ABC-42? never mind what about
+// ABC-12?"), where "never mind" is no clause of its own. At 720839d the
+// answer cut that joined turn, found no take-back, and sent the holder "What
+// about ABC-42? never mind what about ABC-12?". The answer text is the cut
+// the raw finals give.
 func TestATakeBackCancelsWhatCameBeforeItInTheSameFinal(t *testing.T) {
 	for _, tc := range []struct {
-		name   string
-		finals []string
+		name      string
+		finals    []string
+		endpoints bool // every final ends its utterance, not only the last
 	}{
-		{"one final", []string{"what about ABC-42? never mind. what about ABC-12?"}},
-		{"control: the question alone", []string{"what about ABC-12?"}},
-		{"control: the take-back a final of its own", []string{"what about ABC-42?", "never mind", "what about ABC-12?"}},
-		{"control: one final, then okay sure", []string{"what about ABC-42? never mind. what about ABC-12?", "okay sure"}},
+		{"one final", []string{"what about ABC-42? never mind. what about ABC-12?"}, true},
+		{"control: the question alone", []string{"what about ABC-12?"}, true},
+		{"control: the take-back a final of its own", []string{"what about ABC-42?", "never mind", "what about ABC-12?"}, true},
+		{"control: one final, then okay sure", []string{"what about ABC-42? never mind. what about ABC-12?", "okay sure"}, true},
+		{"a take-back ends its final, no endpoint", []string{"what about ABC-42? never mind", "what about ABC-12?"}, false},
+		{"a take-back a final of its own, no endpoint", []string{"what about ABC-42?", "never mind", "what about ABC-12?"}, false},
+		{"a comma, a take-back ends its final, no endpoint", []string{"what about ABC-42, never mind", "what about ABC-12?"}, false},
+		{"control: one final, no endpoint", []string{"what about ABC-42? never mind. what about ABC-12?"}, false},
+		{"control: a take-back ends its final, an endpoint", []string{"what about ABC-42? never mind", "what about ABC-12?"}, true},
+		{"control: a stop after the take-back, no endpoint", []string{"what about ABC-42? never mind.", "what about ABC-12?"}, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			r := askedBackRig(t)
@@ -669,8 +685,8 @@ func TestATakeBackCancelsWhatCameBeforeItInTheSameFinal(t *testing.T) {
 			r.agents.mu.Lock()
 			sent := len(r.agents.sent)
 			r.agents.mu.Unlock()
-			for _, final := range tc.finals {
-				r.hearEnding(final, true, true, nil)
+			for i, final := range tc.finals {
+				r.hearEnding(final, true, tc.endpoints || i == len(tc.finals)-1, nil)
 			}
 			out := r.answer(t, "take-back", strings.Join(tc.finals, " "))
 			r.agents.mu.Lock()
