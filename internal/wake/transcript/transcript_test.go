@@ -621,6 +621,14 @@ func TestSpokenKeysAreWritten(t *testing.T) {
 		// twenty seven" as a date.
 		"what's the status of infra 10/27?": "what's the status of INFRA-1027?",
 		"What's the status of INFRA 10/27?": "What's the status of INFRA-1027?",
+		// A key of one digit (live on 2026-11-25): as the voice says
+		// INFRA-7. "One" after a project is a pronoun as often as a
+		// number, so it is no key of one digit; a longer number that
+		// starts with it still is.
+		"who is working on infra seven": "who is working on INFRA-7",
+		"the infra one":                 "the infra one",
+		"is INFRA one of them":          "is INFRA one of them",
+		"what about infra one oh five":  "what about INFRA-105",
 	} {
 		if got := WriteKeys(text, projects); got != want {
 			t.Errorf("WriteKeys(%q) = %q, want %q", text, got, want)

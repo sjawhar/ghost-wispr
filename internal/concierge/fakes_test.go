@@ -44,8 +44,10 @@ type fakeRecords struct {
 	block    chan struct{}
 	blockKey string
 	// searchDelay, when set, is how long each Search takes, or until its
-	// context ends.
+	// context ends; searchErr, when set, is Search's failure, and no other
+	// read's.
 	searchDelay time.Duration
+	searchErr   error
 	// kwHits are SearchKeywords' answer, kwQueries its queries; kwErr, when
 	// set, its failure; kwDelay, when set, how long it takes, or until its
 	// context ends.
@@ -94,6 +96,9 @@ func (f *fakeRecords) Search(ctx context.Context, query string, _ int) ([]dispat
 	f.mu.Lock()
 	f.queries = append(f.queries, query)
 	delay, hits, err := f.searchDelay, f.hits, f.err
+	if f.searchErr != nil {
+		err = f.searchErr
+	}
 	f.mu.Unlock()
 	if delay > 0 {
 		select {

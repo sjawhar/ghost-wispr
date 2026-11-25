@@ -628,7 +628,11 @@ when the microphone read them: the question it answers, or one asked in a pause,
 when the live transcript sends that question's words late, up to about 8 minutes of audio. Other speech (`POST /api/tts/speak`) waits in
 its queue while the voice speaks. Two more sounds: a single high note when capture starts
 recording, and a falling two-note sound when Wispr cannot do what was asked (Dispatch or Envoy out
-of reach, a voice that fails, or a failed red check).
+of reach, a voice that fails, or a failed red check). A Dispatch search that finds nothing in its
+time is no outage: Wispr says "Dispatch's search is slow right now." with no error sound; a search
+Dispatch refuses is an outage. A key with a one-digit number ("INFRA-7", "Infra seven") is read as
+a key only when its project is one of Dispatch's; "the last 7 days" is speech, and so is "one"
+after a project ("the Infra one"). Wispr says an issue's status in words ("needs review").
 
 The settings page turns the voice on or off and picks the voice and the text-to-speech provider, with no restart; the change
 applies from the next exchange. With the voice off, the unit reads no wake phrase and runs no

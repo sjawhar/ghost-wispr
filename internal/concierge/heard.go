@@ -34,15 +34,17 @@ const (
 
 // spokenKey is an issue key as a transcript writes it: ABC-12, "infra 4592"
 // as said aloud, or "infra 10/27", a number said in two groups that smart
-// formatting writes as a date. A single digit is too often a plain number.
+// formatting writes as a date. A single digit is too often a plain number
+// ("room 2 is free"); only the turn's view reads one (issueKeys).
 var spokenKey = regexp.MustCompile(`\b([A-Za-z][A-Za-z0-9]*)[- ](\d+(?:/\d+)+|\d{2,})\b`)
 
 // keyNumber is an issue number after its project: after a pause ("INFRA?
 // 4592."), split by a thousands comma, a decimal point or a date's slash
 // ("INFRA 4,592", "INFRA 45.92", "INFRA 10/27"), or in words ("INFRA four
 // thousand five hundred and ninety two", "INFRA forty-five ninety-two"). Its
-// group 1 is the number in digits, group 2 in words.
-const keyNumber = `[?.,:;!]?[\s-]+(?:(\d+(?:[.,/]\d+)+|\d{2,})\b|((?:(?i:zero|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety|hundred|thousand)\b[\s-]*(?:(?i:and)\s+)?)+))`
+// group 1 is the number in digits, group 2 in words. A number of one digit
+// is a key only of a project the turn's view holds (writtenKey).
+const keyNumber = `[?.,:;!]?[\s-]+(?:(\d+(?:[.,/]\d+)+|\d+)\b|((?:(?i:zero|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety|hundred|thousand)\b[\s-]*(?:(?i:and)\s+)?)+))`
 
 // keytermKey is an issue key as Deepgram writes one whose project is a
 // keyterm, so in capitals, with its number as keyNumber reads it.
@@ -63,8 +65,11 @@ var keyGroups = strings.NewReplacer(",", "", ".", "", "/", "")
 
 // writtenKey is the key a match of re (keytermKey or spelledKey) reads, in
 // its written form, "INFRA-4592", and the space the match took after it;
-// ok is false for a number of one digit.
-func writtenKey(re *regexp.Regexp, match string) (key, trail string, ok bool) {
+// after is the text after the match. ok is false for a number of one digit
+// unless held reports true for the key's project, and for one said in words
+// that may be no number: "one", as often a pronoun ("the INFRA one"), or a
+// word before "oh", the start of a longer number ("INFRA one oh five").
+func writtenKey(re *regexp.Regexp, match, after string, held func(string) bool) (key, trail string, ok bool) {
 	parts := re.FindStringSubmatch(match)
 	digits := keyGroups.Replace(parts[2])
 	if parts[3] != "" {
@@ -73,18 +78,40 @@ func writtenKey(re *regexp.Regexp, match string) (key, trail string, ok bool) {
 			trail = " "
 		}
 	}
-	if len(digits) < 2 {
+	project := spelledProject.Replace(parts[1])
+	next, _, _ := strings.Cut(strings.ToLower(strings.TrimSpace(after)), " ")
+	switch {
+	case digits == "":
+		return "", "", false
+	case len(digits) >= 2:
+	case !held(project),
+		parts[3] != "" && (strings.EqualFold(strings.TrimSpace(parts[3]), "one") || strings.Trim(next, ",.;:?!") == "oh"):
 		return "", "", false
 	}
-	return spelledProject.Replace(parts[1]) + "-" + digits, trail, true
+	return project + "-" + digits, trail, true
+}
+
+// rewriteKeys rewrites each match of re in words with write, which gets the
+// match and the text after it.
+func rewriteKeys(re *regexp.Regexp, words string, write func(match, after string) string) string {
+	var b strings.Builder
+	last := 0
+	for _, at := range re.FindAllStringIndex(words, -1) {
+		b.WriteString(words[last:at[0]])
+		b.WriteString(write(words[at[0]:at[1]], words[at[1]:]))
+		last = at[1]
+	}
+	b.WriteString(words[last:])
+	return b.String()
 }
 
 // spokenKeys rewrites each key keytermKey reads to its written form,
 // "INFRA-4592", so the rest of the turn reads as before. A number of one
-// digit stays as said.
-func spokenKeys(words string) string {
-	return keytermKey.ReplaceAllStringFunc(words, func(match string) string {
-		if key, trail, ok := writtenKey(keytermKey, match); ok {
+// digit is a key only when the view holds its project ("INFRA seven" is
+// INFRA-7); else it stays as said. The zero view holds none.
+func (v projectsView) spokenKeys(words string) string {
+	return rewriteKeys(keytermKey, words, func(match, after string) string {
+		if key, trail, ok := writtenKey(keytermKey, match, after, v.holds); ok {
 			return key + trail
 		}
 		return match
@@ -95,12 +122,14 @@ func spokenKeys(words string) string {
 // letter (spelledKey) to its written form, "ABC-13", when the view holds the
 // project; other letters stay as said. unread reports a run of letters that
 // could be a key while the view cannot tell (the list never read, or its read
-// failed): such a turn is neither a pick nor words to search. A turn goes
-// through it once, where it enters the Concierge (Heard, answer), so every
-// reading of the turn after sees the key.
+// failed): such a turn is neither a pick nor words to search. Letters before
+// a number of one digit are such a run only when the view holds their
+// project: "I O U 5 dollars" is speech. A turn goes through it once, where it
+// enters the Concierge (Heard, answer), so every reading of the turn after
+// sees the key.
 func (v projectsView) readSpelledKeys(words string) (read string, unread bool) {
-	read = spelledKey.ReplaceAllStringFunc(words, func(match string) string {
-		key, trail, ok := writtenKey(spelledKey, match)
+	read = rewriteKeys(spelledKey, words, func(match, after string) string {
+		key, trail, ok := writtenKey(spelledKey, match, after, v.holds)
 		if !ok {
 			return match
 		}
@@ -154,15 +183,59 @@ func keyDigits(said string) string {
 	return digits.String()
 }
 
-// issueKeysIn lists the issue keys words name, in order, upper-cased.
+// issueKeysIn lists the issue keys of two or more digits words name, in
+// order, upper-cased, as a reading with no view of the project list does
+// (issueKeys reads one of one digit too).
 func issueKeysIn(words string) []string {
 	var keys []string
-	for _, match := range spokenKey.FindAllStringSubmatch(spokenKeys(words), -1) {
+	for _, match := range spokenKey.FindAllStringSubmatch(projectsView{}.spokenKeys(words), -1) {
 		if key, err := dispatch.NormalizeIssueKey(match[1] + "-" + keyGroups.Replace(match[2])); err == nil {
 			keys = append(keys, key)
 		}
 	}
 	return keys
+}
+
+// anyDigitsKey is spokenKey with a number of any length, "INFRA-7" and
+// "infra 7" too. Group 3 is a decimal or thousands part after the number
+// ("6.8", "7,500"): a number so written is no key of one digit.
+var anyDigitsKey = regexp.MustCompile(`\b([A-Za-z][A-Za-z0-9]*)[- ](\d+(?:/\d+)+|\d+)((?:[.,]\d+)*)\b`)
+
+// heldOneDigit reports whether match, a match of anyDigitsKey, is a key of
+// one digit whose project the view holds.
+func (v projectsView) heldOneDigit(match []string) bool {
+	return len(keyGroups.Replace(match[2])) == 1 && match[3] == "" && v.holds(match[1])
+}
+
+// issueKeys is the issue keys words name as the turn's view reads them, in
+// order, upper-cased: every key issueKeysIn reads, and a key of one digit
+// whose project the view holds ("INFRA-7", "infra 7", "INFRA seven"). A
+// number of one digit after any other word is speech ("the last 7 days",
+// "room 2 is free"), as is one with a decimal or thousands part ("Linux
+// 6.8", "infra 7,500").
+func (v projectsView) issueKeys(words string) []string {
+	var keys []string
+	for _, match := range anyDigitsKey.FindAllStringSubmatch(v.spokenKeys(words), -1) {
+		if len(keyGroups.Replace(match[2])) < 2 && !v.heldOneDigit(match) {
+			continue
+		}
+		if key, err := dispatch.NormalizeIssueKey(match[1] + "-" + keyGroups.Replace(match[2])); err == nil {
+			keys = append(keys, key)
+		}
+	}
+	return keys
+}
+
+// withoutOneDigitKeys is words with each key of one digit the view holds
+// taken out, so the turn's search words hold no such key's project, as they
+// hold none of a longer key's (searchTerms).
+func (v projectsView) withoutOneDigitKeys(words string) string {
+	return anyDigitsKey.ReplaceAllStringFunc(v.spokenKeys(words), func(match string) string {
+		if v.heldOneDigit(anyDigitsKey.FindStringSubmatch(match)) {
+			return " "
+		}
+		return match
+	})
 }
 
 // read is one read of the record for a target. complete is set when it ran
@@ -206,6 +279,9 @@ type reading struct {
 	noResult bool
 	// clear: the search had one clear match (R5).
 	clear bool
+	// slow: a search ran past its bound (searchBound). Neither an issue nor
+	// a Dispatch outage; the room hears that the search is slow.
+	slow bool
 	// key, title and status name the chosen issue; empty when none was read.
 	key, title, status string
 	// candidates are a search's top two issues, best first.
@@ -258,7 +334,7 @@ func (p *prefetch) cancelAll() {
 // reused for the same target alone, so for the same two.
 func (c *Concierge) readTarget(v projectsView, words string) string {
 	var keys []string
-	for _, key := range issueKeysIn(words) {
+	for _, key := range v.issueKeys(words) {
 		project, _, _ := strings.Cut(key, "-")
 		if v.holds(project) {
 			keys = append(keys, key)
@@ -271,8 +347,11 @@ func (c *Concierge) readTarget(v projectsView, words string) string {
 			keys = append(keys, key)
 		}
 	}
-	question := v.searchQuestion(words)
-	search := question + "|" + searchTerms(words)
+	// A key of one digit the view reads is read, not searched: the turn's
+	// search holds no such key's words, as it holds none of a longer key's.
+	rest := v.withoutOneDigitKeys(words)
+	question := v.searchQuestion(rest)
+	search := question + "|" + searchTerms(rest)
 	if len(keys) > 0 {
 		slices.Reverse(keys)
 		keys = slices.Compact(keys)
@@ -748,10 +827,16 @@ func (c *Concierge) readRecord(ctx context.Context, x *voice.Exchange, view proj
 		// record's. Found in review on 2026-11-24.
 		var hits map[string]any
 		if result, err := tools.call(ctx, "search_issues", map[string]any{"query": words}); err == nil {
-			hits = record("search_issues", map[string]any{"query": searchTerms(words)}, result, true)
+			hits = record("search_issues", map[string]any{"query": searchTerms(view.withoutOneDigitKeys(words))}, result, true)
 		}
 		issues, _ := hits["issues"].([]map[string]any)
 		if hits == nil || hits["error"] != nil {
+			return
+		}
+		if slow, _ := hits["slow"].(bool); slow {
+			// A search that ran past its bound is slow, not an outage: the
+			// voice says the search is slow (searchIsSlow).
+			found.slow = true
 			return
 		}
 		if len(issues) == 0 {

@@ -61,10 +61,17 @@ func (c *Concierge) takePick(x *voice.Exchange, turn string) (asked, key string,
 	if !offered {
 		return "", "", false
 	}
+	// An offered issue is real, whatever the project list says: its key,
+	// said letter by letter ("A B C seven") or of one digit ("INFRA-7"),
+	// is a key of the reply. A no is a no whatever word and number of one
+	// digit it names: "no, not INFRA-7".
+	view := offeredView(p.candidates)
+	turn, _ = view.readSpelledKeys(turn)
+	reply := view.withoutOneDigitKeys(turn)
 	switch {
-	case declines(turn):
+	case declines(withoutOneDigitWords(reply)):
 		return p.turn, "", true
-	case !confirms(turn):
+	case !confirms(reply):
 		return "", "", false
 	}
 	if picked := pickIn(p.candidates, turn); picked != "" {
@@ -79,6 +86,28 @@ func (c *Concierge) dropPick(x *voice.Exchange) {
 	c.mu.Lock()
 	delete(c.picks, wakeKey(x))
 	c.mu.Unlock()
+}
+
+// offeredView is a view of the projects of the offered issues, the keys of
+// which are Dispatch's: a key of one digit of one of them reads as a key.
+func offeredView(candidates []candidate) projectsView {
+	view := projectsView{known: map[string]bool{}, sure: true}
+	for _, candidate := range candidates {
+		project, _, _ := strings.Cut(candidate.key, "-")
+		view.known[strings.ToUpper(project)] = true
+	}
+	return view
+}
+
+// withoutOneDigitWords is turn with each word before a number of one digit
+// taken out, whatever the word: "no, not INFRA-7" is "no, not".
+func withoutOneDigitWords(turn string) string {
+	return anyDigitsKey.ReplaceAllStringFunc(turn, func(match string) string {
+		if parts := anyDigitsKey.FindStringSubmatch(match); len(keyGroups.Replace(parts[2])) == 1 && parts[3] == "" {
+			return " "
+		}
+		return match
+	})
 }
 
 var (
@@ -115,7 +144,7 @@ var (
 // replyWords are turn's words, lower case, its issue keys and the fillers it
 // begins with left out; an apostrophe stays in its word ("that's").
 func replyWords(turn string) []string {
-	rest := compound.ReplaceAllString(spokenKey.ReplaceAllString(spokenKeys(turn), " "), "realtime")
+	rest := compound.ReplaceAllString(spokenKey.ReplaceAllString(projectsView{}.spokenKeys(turn), " "), "realtime")
 	words := strings.FieldsFunc(strings.ToLower(strings.ReplaceAll(rest, "’", "'")), func(r rune) bool {
 		return !unicode.IsLetter(r) && !unicode.IsDigit(r) && r != '\''
 	})
@@ -161,11 +190,14 @@ func confirms(turn string) bool {
 // offered issues pick none, whatever else the reply holds. A reply with a cue
 // picks only when it is a selection (isSelection): nothing but its cues and
 // words that frame a pick. Of one issue offered, a reply with no cue picks it
-// when it is a yes form ("yes", "yeah, that one", "sure, that's it").
+// when it is a yes form ("yes", "yeah, that one", "sure, that's it"). A key
+// of one digit ("INFRA-7", "infra 7") of an offered issue's project is a key
+// (offeredView).
 func pickIn(candidates []candidate, turn string) string {
-	words := replyWords(turn)
+	offered := offeredView(candidates)
+	words := replyWords(offered.withoutOneDigitKeys(turn))
 	cue := ""
-	for _, named := range issueKeysIn(turn) {
+	for _, named := range offered.issueKeys(turn) {
 		if !slices.ContainsFunc(candidates, func(c candidate) bool { return c.key == named }) || (cue != "" && cue != named) {
 			return ""
 		}

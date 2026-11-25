@@ -303,7 +303,9 @@ func issueKeys(text string, afterName bool) []string {
 
 // WriteKeys writes each key of projects that text says in a spoken form as
 // the key ("in for forty five ninety two" as INFRA-4592), so the Concierge
-// and Dispatch read it; other words stay as they were.
+// and Dispatch read it; other words stay as they were. "One" after a
+// project is as often a pronoun as a number ("the INFRA one", "is INFRA one
+// of them"), so a key of one digit said so is not written.
 func WriteKeys(text string, projects []string) string { return writeKeys(text, projects, false) }
 
 // WriteKeysAfterName is WriteKeys for text said right after the wake phrase
@@ -323,6 +325,9 @@ func writeKeys(text string, projects []string, afterName bool) string {
 	for _, span := range keySpans(tokens, afterName) {
 		project, _, _ := strings.Cut(span.key, "-")
 		if !known[project] {
+			continue
+		}
+		if _, number, _ := strings.Cut(span.key, "-"); len(number) == 1 && normalise(tokens[span.to-1].text) == "one" {
 			continue
 		}
 		out = append(out, joinTokens(tokens[next:span.from])...)

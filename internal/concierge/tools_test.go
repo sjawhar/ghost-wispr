@@ -102,7 +102,9 @@ func TestReadIssueGivesStatusSpecSummaryAndRecentEvents(t *testing.T) {
 	}
 
 	result := r.run(t, "read_issue", map[string]string{"key": "abc-12"})
-	if result["key"] != "ABC-12" || result["status"] != "in_progress" || result["updated_ago"] != "2 hours ago" || result["open_asks"] != float64(1) {
+	// Status comes out in spoken form (spokenStatus), so the model's
+	// fast-path input and the voice's fixed lines all agree.
+	if result["key"] != "ABC-12" || result["status"] != "in progress" || result["updated_ago"] != "2 hours ago" || result["open_asks"] != float64(1) {
 		t.Errorf("issue = %v", result)
 	}
 	spec, _ := result["spec_summary"].(string)

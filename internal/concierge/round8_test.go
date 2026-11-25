@@ -85,7 +85,7 @@ func TestTheHolderGetsACleanQuestion(t *testing.T) {
 		"please ask the agent on INFRA 4592. When slice one will be ready to try.",
 		"please ask the agent on INFRA-4592. When slice one will be ready to try.",
 	} {
-		if got, want := fewestWords(turn), "When will slice one be ready to try?"; got != want {
+		if got, want := fewestWords(projectsView{}, turn), "When will slice one be ready to try?"; got != want {
 			t.Errorf("fewestWords(%q) = %q, want %q", turn, got, want)
 		}
 	}

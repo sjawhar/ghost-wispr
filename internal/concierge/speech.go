@@ -193,19 +193,21 @@ func searchTerms(words string) string {
 // for words said in the room: the question as said after the wake phrase,
 // whole, in lower case and without the punctuation around its words; a name
 // spelled out is the one word it spells (spelledOut), "real time" is
-// "realtime" (compound), and an issue key is left out, since a read tries it
-// as a key: a key of a project the view holds, or any word that reads as a
-// key while the view cannot tell. A question that still opens with the wake
-// phrase, as the model may search one, is sent without it. Empty when none
-// of the words names work (searchTerms). Live on 2026-11-24 the question put
-// the issue meant first for 8 of 10 questions, against 4 of 10 for its first
-// five words that name work and 5 of 10 for all of them; a key in it put the
-// issue meant second.
+// "realtime" (compound), and an issue key of two digits or more is left
+// out, since a read tries it as a key: a key of a project the view holds,
+// or any word that reads as a key while the view cannot tell. A key of one
+// digit the view reads is not here: its caller left it out
+// (withoutOneDigitKeys). A question that still opens with the wake phrase,
+// as the model may search one, is sent without it. Empty when none of the
+// words names work (searchTerms). Live on 2026-11-24 the question put the
+// issue meant first for 8 of 10 questions, against 4 of 10 for its first
+// five words that name work and 5 of 10 for all of them; a key in it put
+// the issue meant second.
 func (v projectsView) searchQuestion(words string) string {
 	if searchTerms(words) == "" {
 		return ""
 	}
-	text := possessiveKey.ReplaceAllStringFunc(spokenKeys(spelledOut(words)), func(key string) string {
+	text := possessiveKey.ReplaceAllStringFunc(v.spokenKeys(spelledOut(words)), func(key string) string {
 		if !v.sure || v.holds(possessiveKey.FindStringSubmatch(key)[1]) {
 			return " "
 		}
@@ -458,7 +460,7 @@ func sayLastPair(pair string) string {
 func namingWords(text string) []string {
 	var words []string
 	seen := map[string]bool{}
-	rest := compound.ReplaceAllString(spokenKey.ReplaceAllString(spokenKeys(spelledOut(text)), " "), "realtime")
+	rest := compound.ReplaceAllString(spokenKey.ReplaceAllString(projectsView{}.spokenKeys(spelledOut(text)), " "), "realtime")
 	for _, word := range strings.FieldsFunc(strings.ToLower(rest), func(r rune) bool {
 		return !unicode.IsLetter(r) && !unicode.IsDigit(r) && r != '\''
 	}) {
