@@ -206,19 +206,28 @@ func (c *Concierge) answer(parent context.Context, x *voice.Exchange, turn strin
 	// alone (saysKey) answers the question first asked, about that key
 	// (takeKey). A question is read exactly as with no offer pending; when
 	// the question was said before the turn, the whole reply is read
-	// (readsReply).
+	// (readsReply). Nothing said before the reply's last take-back is read,
+	// searched, sent or given to the model: a take-back inside the turn's
+	// own final cuts the turn too ("what about ABC-42? never mind. what
+	// about ABC-12?" is "what about ABC-12?"; Sol's seventh review of #191).
 	offer, offered := c.pendingOffer(x)
 	reply := x.Reply
 	if strings.TrimSpace(reply) == "" {
 		reply = turn
 	}
-	if offered && offer.sideTalkOn(view, reply) {
+	said := view.replyText(reply)
+	if offered && offer.sideTalkOn(view, said) {
 		c.dropPick(x)
 		c.logger.Info("concierge took a reply to its own question for side talk: it picks nothing, says no key and asks nothing, or takes itself back")
 		return errSideTalk
 	}
-	if whole, ok := offer.readsReply(turn, x.Reply); offered && ok {
-		turn = whole
+	if offered {
+		if rest := afterTakeBack(turn); rest != "" {
+			turn = rest
+		}
+		if strings.TrimSpace(x.Reply) != "" && offer.readsReply(view, turn, said) {
+			turn = said
+		}
 	}
 	// A key said letter by letter is read here, once, so the pick, the
 	// routing line, the search and the ask all see it.

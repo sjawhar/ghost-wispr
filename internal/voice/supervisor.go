@@ -1890,16 +1890,16 @@ func (s *Supervisor) turnOf(ex *exchange) string {
 }
 
 // replyOf is ex's reply as the Concierge reads it (Exchange.Reply): the
-// room's finals since the voice last spoke, one a line, so a take-back
-// said as its own utterance ("okay, never mind" then "okay, sure") stays a
-// clause of its own though Deepgram put no stop after it. A key said in a
-// spoken form is written as the key in each final, as in a turn (turnOf).
-func (s *Supervisor) replyOf(ex *exchange) string {
+// room's finals since the voice last spoke, as Deepgram wrote them, one a
+// line, so a take-back said as its own utterance ("okay, never mind" then
+// "okay, sure") stays a clause of its own though Deepgram put no stop after
+// it. No key is written here: a key split across finals ("ABC forty" /
+// "two") would be written in halves. The Concierge writes keys over what
+// the reply says after its last take-back, joined as a turn is (Main, after
+// Sol's seventh review of #191).
+func replyOf(ex *exchange) string {
 	finals := make([]string, 0, len(ex.reply))
 	for _, final := range ex.reply {
-		if s.cfg.ProjectKeys != nil {
-			final = transcript.WriteKeys(final, s.cfg.ProjectKeys())
-		}
 		finals = append(finals, strings.TrimSpace(final))
 	}
 	return strings.Join(finals, "\n")
@@ -3332,7 +3332,7 @@ func (t exchangeTools) Run(ctx context.Context, c ToolCall) (json.RawMessage, er
 	x = t.ex.x
 	x.FollowUpTurn = t.ex.followUpTurn
 	if askedBack {
-		x.Reply = s.replyOf(t.ex)
+		x.Reply = replyOf(t.ex)
 	}
 	s.mu.Unlock()
 	var (

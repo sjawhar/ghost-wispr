@@ -8,6 +8,7 @@ import (
 	"unicode"
 
 	"github.com/sjawhar/ghost-wispr/internal/voice"
+	"github.com/sjawhar/ghost-wispr/internal/wake/transcript"
 )
 
 // offeredPick is what an answer asked the room after it (R5): with no one
@@ -117,43 +118,71 @@ func sideTalk(turn string) bool {
 	return !asks(turn) && !saysKey(turn)
 }
 
-// sideTalkOn reports whether reply, the room's words in answer to p, is side
-// talk: what it says after its last take-back (afterTakeBack) is nothing, or
-// picks nothing (pick) and is sideTalk. Letters the view cannot tell are
-// read as the key they may be (everySpelledKey). reply is every final the
-// room said since the voice asked (voice.Exchange.Reply), so an endpoint
-// inside a statement cannot leave it only the statement's end, "can wait" of
-// "okay, ABC-12 can wait", which on its own asks; and a reply that holds a
-// question anywhere is a question, unless it then takes it back (Main, after
-// Sol's fifth review of #191). A vendor's text is never read: it could
-// neither be trusted to make a reply side talk nor to make it a question.
-func (p *offeredPick) sideTalkOn(view projectsView, reply string) bool {
-	written, unread := view.readSpelledKeys(reply)
+// sideTalkOn reports whether said, what the room's reply to p says after its
+// last take-back (replyText), is side talk: it is nothing, or it picks
+// nothing (pick) and is sideTalk. Letters the view cannot tell are read as
+// the key they may be (everySpelledKey). The reply is every final the room
+// said since the voice asked (voice.Exchange.Reply), so an endpoint inside a
+// statement cannot leave it only the statement's end, "can wait" of "okay,
+// ABC-12 can wait", which on its own asks; and a reply that holds a question
+// anywhere is a question, unless it then takes it back (Main, after Sol's
+// fifth review of #191). A vendor's text is never read: it could neither be
+// trusted to make a reply side talk nor to make it a question.
+func (p *offeredPick) sideTalkOn(view projectsView, said string) bool {
+	if said == "" {
+		return true
+	}
+	written, unread := view.readSpelledKeys(said)
 	if unread {
 		written = everySpelledKey(written)
 	}
-	rest := afterTakeBack(written)
-	if strings.TrimSpace(rest) == "" {
-		return true
-	}
-	_, picks := p.pick(rest)
-	return !picks && sideTalk(rest)
+	_, picks := p.pick(written)
+	return !picks && sideTalk(written)
 }
 
 // readsReply reports whether the answer to turn, a reply to p that is not
-// side talk, reads reply, the room's whole reply after its last take-back
-// (afterTakeBack), rather than turn, and returns it: the turn is the
-// reply's last part and picks nothing, says no key and asks nothing, so the
-// question the reply holds was said before it. "What about the budget?"
-// then "okay, sure" is answered as the question, not as "okay, sure" (Main,
-// before Sol's sixth review of #191).
-func (p *offeredPick) readsReply(turn, reply string) (string, bool) {
-	reply = afterTakeBack(reply)
-	if strings.TrimSpace(reply) == "" || asks(turn) || saysKey(turn) {
-		return "", false
+// side talk, reads said, what the room's whole reply says after its last
+// take-back (replyText), rather than turn: the turn is the reply's last part
+// and picks nothing, says no key and asks nothing, while the reply asks or
+// says a key alone, which was said before the turn or across its start.
+// "What about the budget?" then "okay, sure" is answered as the question,
+// not as "okay, sure" (Main, before Sol's sixth review of #191); "ABC
+// forty", an endpoint, then "two" is the key ABC-42, not "two" (Sol's
+// seventh review). Letters the view can tell are read as their key first.
+func (p *offeredPick) readsReply(view projectsView, turn, said string) bool {
+	if said == "" || asks(turn) || saysKey(turn) {
+		return false
 	}
-	_, picks := p.pick(turn)
-	return strings.Join(strings.Fields(reply), " "), !picks && asks(reply)
+	if _, picks := p.pick(turn); picks {
+		return false
+	}
+	read, _ := view.readSpelledKeys(said)
+	return asks(read) || saysKey(read)
+}
+
+// replyText is what reply, the room's finals one a line, says after its
+// last take-back (afterTakeBack), found on the finals as Deepgram wrote
+// them; then joined as a turn is, and its keys written over the whole
+// (writeKeys), so a key split across finals ("ABC forty" / "two") is one key
+// (Main, after Sol's seventh review of #191). Nothing said before the
+// take-back is in it: it is what the side-talk decision, the answer and any
+// question to a holder read.
+func (v projectsView) replyText(reply string) string {
+	return v.writeKeys(strings.Join(strings.Fields(afterTakeBack(reply)), " "))
+}
+
+// writeKeys writes the keys of the view's projects said in a spoken form
+// ("ABC forty two") as keys, as the Supervisor writes a turn's
+// (transcript.WriteKeys). With no project known it writes none.
+func (v projectsView) writeKeys(text string) string {
+	if text == "" || len(v.known) == 0 {
+		return text
+	}
+	projects := make([]string, 0, len(v.known))
+	for project := range v.known {
+		projects = append(projects, project)
+	}
+	return transcript.WriteKeys(text, projects)
 }
 
 // takeBacks are the clauses that take back what was said before them, as

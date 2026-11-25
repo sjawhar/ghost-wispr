@@ -157,6 +157,7 @@ type cutRig struct {
 	speaker *cutSpeaker
 	sup     *voice.Supervisor
 	sess    *cutSession
+	driver  *cutDriver
 	// wakeEnd is when the exchange's opening question's last word ended,
 	// by capture: the position of its UtteranceEnd.
 	wakeEnd time.Time
@@ -177,11 +178,13 @@ func newCutRig(t *testing.T, turns ...[]*genai.GenerateContentResponse) *cutRig 
 	r.model.turns = turns
 	r.seen = &turnsSeen{Concierge: r.concierge}
 	driver := &cutDriver{opened: make(chan *cutSession, 1)}
+	r.driver = driver
 	r.sup = voice.NewSupervisor(&voice.SupervisorConfig{
 		Voice:        func() (voice.Voice, error) { return driver, nil },
 		Concierge:    r.seen,
 		Speaker:      r.speaker,
 		WakePhrases:  []string{"Wispr"},
+		ProjectKeys:  func() []string { return []string{"ABC", "XYZ", "DEF", "INFRA"} },
 		Session:      func() string { return "meeting-1" },
 		Red:          func() bool { return true },
 		IdleWait:     time.Minute,
@@ -470,6 +473,8 @@ func TestTheRoomsWholeReplyDecidesSideTalk(t *testing.T) {
 		{"a question, then a clause that starts with never mind", "never mind the budget.", "what about the realtime voice budget? never mind the budget.", "answered", "what about the realtime voice budget? never mind the budget."},
 		{"control: a question, then that's all", "that's all.", "what about the realtime voice budget? that's all.", "side talk", ""},
 		{"control: never mind, then a question", "what about the realtime voice budget?", "never mind. what about the realtime voice budget?", "answered", "what about the realtime voice budget?"},
+		{"a take-back inside the turn's own final", "what about the wake word? never mind. what about the realtime voice budget?", "what about the wake word? never mind. what about the realtime voice budget?", "answered", "what about the realtime voice budget?"},
+		{"a take-back inside the turn, no whole reply", "what about the wake word? never mind. what about the realtime voice budget?", "", "answered", "what about the realtime voice budget?"},
 		{"control: a question, then a pick", "the first one", "what about the realtime voice budget? the first one", "picked", ""},
 		{"control: the tail with no whole reply", "can wait", "", "answered", "can wait"},
 		{"control: a question in one final", "what about the realtime voice budget", "what about the realtime voice budget", "answered", "what about the realtime voice budget"},
@@ -580,6 +585,146 @@ func TestTheVendorsTextDecidesNoReplyToWisprsQuestion(t *testing.T) {
 			if len(searches)+len(calls)+len(messages) != 0 || out.Say != "" {
 				t.Errorf("the room's statement was searched %q, read %q, sent %+v and said %q; want nothing", searches, calls, messages, out.Say)
 			}
+		})
+	}
+}
+
+// askedBackRig is a cutRig after the model asked the room "Do you mean its
+// status or its holder?", its voice speaking, with ABC-42, "A different
+// issue", in the record beside ABC-12; the model answers each later turn.
+func askedBackRig(t *testing.T) *cutRig {
+	t.Helper()
+	turns := [][]*genai.GenerateContentResponse{{chunk(text("ABC-12 is in progress. Do you mean its status or its holder?"))}}
+	for range 4 {
+		turns = append(turns, []*genai.GenerateContentResponse{chunk(text("ABC-12 is in progress."))})
+	}
+	r := newCutRig(t, turns...)
+	r.records.mu.Lock()
+	r.records.issues["ABC-42"] = &dispatch.Issue{Key: "ABC-42", Title: "A different issue", Status: "todo", UpdatedAt: testNow}
+	r.records.mu.Unlock()
+	if initial := r.answer(t, "initial", ""); !strings.HasSuffix(initial.Say, "?") {
+		t.Fatalf("control: the first answer asks nothing: %q", initial.Say)
+	}
+	r.speak(t)
+	return r
+}
+
+// TestAKeySplitAcrossFinalsIsReadWhole (Sol's seventh review of #191 at
+// 5611ca1a, TestSol191R7NumberSplit): after Wispr's question, "ABC forty"
+// and "two" in two finals are the key ABC-42, as main reads them, whether
+// an endpoint falls between them or not; so are "A B C" and "forty two". At
+// 5611ca1 the reply wrote keys final by final, "ABC-40\ntwo", and took the
+// key for side talk: nothing was read or said. Across an endpoint the turn
+// is "two" alone, so the answer reads the reply, a key said alone. Keys are
+// written over the whole reply, as over a turn; final ends only mark where
+// a take-back ends (Main).
+func TestAKeySplitAcrossFinalsIsReadWhole(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		finals    []string
+		endpoints bool
+	}{
+		{"ABC forty / two, no endpoint between", []string{"ABC forty", "two"}, false},
+		{"ABC forty / two, across an endpoint", []string{"ABC forty", "two"}, true},
+		{"A B C / forty two, across an endpoint", []string{"A B C", "forty two"}, true},
+		{"control: ABC forty two, one final", []string{"ABC forty two"}, false},
+		{"control: ABC-42, one final", []string{"ABC-42"}, false},
+		{"control: A B C forty two, one final", []string{"A B C forty two"}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := askedBackRig(t)
+			read := len(r.records.calls())
+			for i, final := range tc.finals {
+				r.hearEnding(final, true, tc.endpoints || i == len(tc.finals)-1, nil)
+			}
+			out := r.answer(t, "split key", strings.Join(tc.finals, " "))
+			calls := r.records.calls()[read:]
+			if !slices.Contains(calls, "ABC-42") || out.IssueKey != "ABC-42" || out.Say == "" {
+				t.Errorf("read %q, took %q, said %q; want ABC-42 read and answered", calls, out.IssueKey, out.Say)
+			}
+		})
+	}
+}
+
+// TestATakeBackCancelsWhatCameBeforeItInTheSameFinal (Sol's seventh review
+// of #191, TestSol191R7CanceledKey): "what about ABC-42? never mind. what
+// about ABC-12?" in one final answers only "what about ABC-12?": ABC-42 is
+// neither read nor named to the holder or the model. At 5611ca1 the whole
+// final went to the model and the holder; main does the same. Controls: the
+// question alone; the take-back in a final of its own; the same final then
+// "okay sure", answered from what follows the take-back.
+func TestATakeBackCancelsWhatCameBeforeItInTheSameFinal(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		finals []string
+	}{
+		{"one final", []string{"what about ABC-42? never mind. what about ABC-12?"}},
+		{"control: the question alone", []string{"what about ABC-12?"}},
+		{"control: the take-back a final of its own", []string{"what about ABC-42?", "never mind", "what about ABC-12?"}},
+		{"control: one final, then okay sure", []string{"what about ABC-42? never mind. what about ABC-12?", "okay sure"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := askedBackRig(t)
+			read := len(r.records.calls())
+			r.agents.mu.Lock()
+			sent := len(r.agents.sent)
+			r.agents.mu.Unlock()
+			for _, final := range tc.finals {
+				r.hearEnding(final, true, true, nil)
+			}
+			out := r.answer(t, "take-back", strings.Join(tc.finals, " "))
+			r.agents.mu.Lock()
+			messages := slices.Clone(r.agents.sent[sent:])
+			r.agents.mu.Unlock()
+			if calls := r.records.calls()[read:]; slices.Contains(calls, "ABC-42") {
+				t.Errorf("the cancelled issue was read: %q", calls)
+			}
+			for _, m := range messages {
+				if strings.Contains(m.Message, "ABC-42") {
+					t.Errorf("the holder was sent the cancelled question: %q", m.Message)
+				}
+			}
+			if prompt := lastPrompt(r.rig); strings.Contains(prompt, "ABC-42") {
+				t.Errorf("the model was given the cancelled question:\n%s", prompt)
+			}
+			if out.IssueKey != "ABC-12" || out.Say == "" {
+				t.Errorf("took %q, said %q; want the question after the take-back answered about ABC-12", out.IssueKey, out.Say)
+			}
+		})
+	}
+}
+
+// TestASplitKeyTheRecordLacksIsHeardAsNoIssue (Sol's seventh review of #191,
+// TestSol191R7SplitKeys's "ABC ten" / "two" rows): the reply's keys are
+// written over the whole reply (Main's rule), so "ABC ten" and "two" are
+// ABC-102, as one final "ABC ten two" is. The record has no ABC-102: the
+// room hears "I found no issue for that. What is its key?", which the voice
+// speaks itself as the answer's lead line, so the answer tool's own words
+// are empty. Main read the first final's ABC-10 instead. Control: the same
+// words in one final.
+func TestASplitKeyTheRecordLacksIsHeardAsNoIssue(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		finals    []string
+		endpoints bool
+	}{
+		{"ABC ten / two, no endpoint between", []string{"ABC ten", "two"}, false},
+		{"ABC ten / two, across an endpoint", []string{"ABC ten", "two"}, true},
+		{"control: ABC ten two, one final", []string{"ABC ten two"}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := askedBackRig(t)
+			read := len(r.records.calls())
+			for i, final := range tc.finals {
+				r.hearEnding(final, true, tc.endpoints || i == len(tc.finals)-1, nil)
+			}
+			r.answer(t, "split key", strings.Join(tc.finals, " "))
+			if calls := r.records.calls()[read:]; !slices.Contains(calls, "ABC-102") {
+				t.Errorf("read %q, want ABC-102", calls)
+			}
+			r7Until(t, "the no-issue line spoken", func() bool {
+				return slices.ContainsFunc(r.driver.said(), func(s r7Said) bool { return s.text == noIssueFound })
+			})
 		})
 	}
 }
