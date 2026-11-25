@@ -564,7 +564,7 @@ func (r *runner) readIssue(ctx context.Context, key string) (map[string]any, err
 		if event.CreatedAt.After(newest) {
 			newest = event.CreatedAt
 		}
-		entry := map[string]any{"type": event.Type, "when": ago(now, event.CreatedAt), "by": spokenName(event.Actor.Title())}
+		entry := map[string]any{"type": event.Type, "when": ago(now, event.CreatedAt), "by": sessionName(event.Actor.Title(), issue.Key)}
 		if text := eventText(event.Payload); text != "" {
 			entry["text"] = cut(text, eventTextChars)
 		}
@@ -638,7 +638,7 @@ func (r *runner) issueHolder(ctx context.Context, key string) (map[string]any, e
 		return nil, err
 	}
 	if agent, ok := r.c.joinedOn(key); ok {
-		return r.sessionHolder(ctx, agent.SessionID, agent.Title), nil
+		return r.sessionHolder(ctx, key, agent.SessionID, agent.Title), nil
 	}
 	issue, err := records.Issue(ctx, key)
 	if err != nil {
@@ -669,9 +669,9 @@ func (r *runner) claimHolder(ctx context.Context, issue *dispatch.Issue) map[str
 		if issue.LastSeen != nil {
 			lastSeen = *issue.LastSeen
 		}
-		return r.heldBy(claimant.ID, claimant.Origin.SessionTitle, state, lastSeen, true)
+		return r.heldBy(issue.Key, claimant.ID, claimant.Origin.SessionTitle, state, lastSeen, true)
 	}
-	return r.sessionHolder(ctx, claimant.ID, claimant.Origin.SessionTitle)
+	return r.sessionHolder(ctx, issue.Key, claimant.ID, claimant.Origin.SessionTitle)
 }
 
 // workerHolder is the holder of an issue nobody claims: of the sessions that
@@ -759,9 +759,9 @@ func (r *runner) workerHolder(ctx context.Context, records Records, issue *dispa
 	held := func(id string, found looked) map[string]any {
 		switch found.state {
 		case lookRuns:
-			return r.heldBy(id, cmp.Or(found.title, found.info.Title), found.info.State, found.info.LastSeen, false)
+			return r.heldBy(issue.Key, id, cmp.Or(found.title, found.info.Title), found.info.State, found.info.LastSeen, false)
 		case lookOutOfReach:
-			return r.outOfReachHolder(id, found.title)
+			return r.outOfReachHolder(issue.Key, id, found.title)
 		}
 		return nil
 	}
@@ -889,12 +889,12 @@ func refusedID(err error) bool {
 }
 
 // sessionHolder is R5's answer for agent session id from Envoy's registry,
-// for a holder Dispatch gave no liveness of. An id the registry refuses is a
-// holder nobody knows.
-func (r *runner) sessionHolder(ctx context.Context, id, title string) map[string]any {
+// for a holder Dispatch gave no liveness of, on issue key. An id the
+// registry refuses is a holder nobody knows.
+func (r *runner) sessionHolder(ctx context.Context, key, id, title string) map[string]any {
 	agents := r.c.currentAgents()
 	if agents == nil {
-		return r.outOfReachHolder(id, title)
+		return r.outOfReachHolder(key, id, title)
 	}
 	info, err := r.c.lookup(ctx, agents, id)
 	if err != nil {
@@ -902,21 +902,22 @@ func (r *runner) sessionHolder(ctx context.Context, id, title string) map[string
 		if refusedID(err) {
 			return unknownHolder()
 		}
-		return r.outOfReachHolder(id, title)
+		return r.outOfReachHolder(key, id, title)
 	}
-	return r.heldBy(id, cmp.Or(title, info.Title), info.State, info.LastSeen, false)
+	return r.heldBy(key, id, cmp.Or(title, info.Title), info.State, info.LastSeen, false)
 }
 
 // heldBy is R5's answer for agent session id in state: {session, live}, else
 // {unresponsive} with the state and when the session was last seen. It names
-// the session for ask_agent; byDispatch: Dispatch judged the state.
-func (r *runner) heldBy(id, title string, state envoy.SessionState, lastSeen time.Time, byDispatch bool) map[string]any {
+// the session for ask_agent, and its title as said of issue key
+// (sessionName); byDispatch: Dispatch judged the state.
+func (r *runner) heldBy(key, id, title string, state envoy.SessionState, lastSeen time.Time, byDispatch bool) map[string]any {
 	judged := envoy.SessionState("")
 	if byDispatch {
 		judged = state
 	}
 	r.c.remember(r.x, id, judged)
-	result := map[string]any{"session": id, "title": spokenName(title)}
+	result := map[string]any{"session": id, "title": sessionName(title, key)}
 	if state == envoy.StateLive {
 		result["holder"], result["live"] = "session", true
 		return result
@@ -928,11 +929,11 @@ func (r *runner) heldBy(id, title string, state envoy.SessionState, lastSeen tim
 	return result
 }
 
-// outOfReachHolder is the answer for agent session id when Envoy did not
-// answer, or the unit has no Envoy session: R10's error sound.
-func (r *runner) outOfReachHolder(id, title string) map[string]any {
+// outOfReachHolder is the answer for agent session id on issue key when
+// Envoy did not answer, or the unit has no Envoy session: R10's error sound.
+func (r *runner) outOfReachHolder(key, id, title string) map[string]any {
 	r.c.remember(r.x, id, "")
-	return map[string]any{"holder": "unresponsive", "state": "unknown", "note": cannotReachEnvoy, "session": id, "title": spokenName(title)}
+	return map[string]any{"holder": "unresponsive", "state": "unknown", "note": cannotReachEnvoy, "session": id, "title": sessionName(title, key)}
 }
 
 // unknownHolder is the answer when nobody can tell who works the issue: a
@@ -1254,7 +1255,7 @@ func (r *runner) listJoinedAgents() map[string]any {
 	if r.c.joined != nil {
 		for _, agent := range r.c.joined() {
 			r.c.remember(r.x, agent.SessionID, "")
-			agents = append(agents, map[string]any{"session": agent.SessionID, "title": spokenName(agent.Title), "issue_key": agent.IssueKey})
+			agents = append(agents, map[string]any{"session": agent.SessionID, "title": sessionName(agent.Title, agent.IssueKey), "issue_key": agent.IssueKey})
 		}
 	}
 	return map[string]any{"agents": agents}

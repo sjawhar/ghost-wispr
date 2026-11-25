@@ -1,6 +1,7 @@
 package audio
 
 import (
+	"errors"
 	"io"
 	"sync"
 	"testing"
@@ -42,13 +43,36 @@ func TestMicCloseEndsAStreamThatBeganWhileCloseWaited(t *testing.T) {
 				pa := mic.paLock()
 				pa <- struct{}{} // a PortAudio call under way holds pa
 				go func() { closed <- mic.Close() }()
-				// Close has looked for a Stream to stop, found none, and
-				// waits for pa.
+				// Close looks for a Stream to stop, finds none, and waits
+				// for pa; Stream then registers its own stopping channel and
+				// waits for pa too. The test releases pa once Stream is in
+				// one of the two states Close must end it from: registered
+				// and waiting, or, if Close's first look came after Stream
+				// registered, already stopped by it and returned. The
+				// condition is checked before each wait, so neither state
+				// is missed; a wait on the registration alone timed out when
+				// Stream had already ended (Sol's review of #198, round 2,
+				// R1). Either way Stream must end with errMicClosed and call
+				// no closed stream, which the checks below and the cleanup
+				// read.
 				time.Sleep(50 * time.Millisecond)
 				go func() { streamed <- mic.Stream(io.Discard) }()
-				// Stream has taken the stream and registered its own
-				// stopping channel, and waits for pa too.
-				time.Sleep(50 * time.Millisecond)
+				var early error
+				ended := false
+				waitUntil(t, "Stream to register, or to end", func() bool {
+					select {
+					case early = <-streamed:
+						ended = true
+						return true
+					default:
+					}
+					mic.mu.Lock()
+					defer mic.mu.Unlock()
+					return mic.reading != nil
+				})
+				if ended {
+					streamed <- early // for the cleanup's check
+				}
 				<-pa
 			} else {
 				go func() { streamed <- mic.Stream(io.Discard) }()
@@ -59,7 +83,10 @@ func TestMicCloseEndsAStreamThatBeganWhileCloseWaited(t *testing.T) {
 				_ = mic.Close() // ends a Stream the first Close missed
 				stream.abandon()
 				select {
-				case <-streamed:
+				case err := <-streamed:
+					if !errors.Is(err, errMicClosed) {
+						t.Errorf("Stream after Close = %v, want errMicClosed", err)
+					}
 				case <-time.After(time.Second):
 					t.Error("Stream still running after the cleanup's Close")
 				}

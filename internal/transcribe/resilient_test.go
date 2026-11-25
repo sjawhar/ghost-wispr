@@ -952,8 +952,8 @@ func TestResilientClient_FinalizeWaitsForTheChunkBeingDrained(t *testing.T) {
 	finalized := make(chan error, 1)
 	go func() { finalized <- rc.Finalize() }()
 	select {
-	case <-finalized:
-		t.Fatal("Finalize returned while a drained chunk was still being written")
+	case err := <-finalized:
+		t.Fatalf("Finalize returned (%v) while a drained chunk was still being written", err)
 	case <-time.After(50 * time.Millisecond):
 	}
 	close(client.release)

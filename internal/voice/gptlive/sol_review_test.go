@@ -30,7 +30,9 @@ func TestSolReviewRoomAudioWhileCloseWaits(t *testing.T) {
 	case <-time.After(30 * time.Millisecond):
 	}
 	c.closed()
-	<-done
+	if err := <-done; err != nil {
+		t.Fatalf("Close after the server's session.closed: %v", err)
+	}
 	// Control: audio queued after Close returns cannot reach the vendor.
 	tap <- audio.Frame{PCM: ramp(9000, 4000), Rate: 16000, Channels: 1}
 	c.noAudio(50 * time.Millisecond)

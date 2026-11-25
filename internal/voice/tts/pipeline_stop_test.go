@@ -14,17 +14,35 @@ import (
 
 // genOutput is the speaker output as audio.Output behaves: Cancel ends the
 // playbacks begun before it, and a playback begun after Cancel plays. It
-// counts, by text, the frames written to a playback begun after the cancel.
+// counts, by text, the frames written to a playback begun after the cancel,
+// and closes first[b] once a frame of the text that starts with b is written.
 type genOutput struct {
 	mu        sync.Mutex
 	gen       int
 	cancelled map[int]chan struct{}
 	after     map[byte]int // frames written to a playback begun after a cancel
 	written   map[byte]int
+	first     map[byte]chan struct{}
 }
 
 func newGenOutput() *genOutput {
-	return &genOutput{cancelled: map[int]chan struct{}{0: make(chan struct{})}, after: map[byte]int{}, written: map[byte]int{}}
+	return &genOutput{cancelled: map[int]chan struct{}{0: make(chan struct{})}, after: map[byte]int{}, written: map[byte]int{}, first: map[byte]chan struct{}{}}
+}
+
+// firstFrame is closed once a frame of the text that starts with b is
+// written. o.mu is held.
+func (o *genOutput) firstFrame(b byte) chan struct{} {
+	if o.first[b] == nil {
+		o.first[b] = make(chan struct{})
+	}
+	return o.first[b]
+}
+
+// wrote is closed once a frame of the text that starts with b is written.
+func (o *genOutput) wrote(b byte) <-chan struct{} {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return o.firstFrame(b)
 }
 
 func (o *genOutput) Begin() voice.Playback {
@@ -61,6 +79,9 @@ func (p *genPlayback) Write(ctx context.Context, frame []byte, _ audio.AudioForm
 		return err
 	}
 	o.mu.Lock()
+	if o.written[frame[0]] == 0 {
+		close(o.firstFrame(frame[0]))
+	}
 	o.written[frame[0]]++
 	if p.gen > 0 {
 		o.after[frame[0]]++
@@ -130,20 +151,25 @@ func TestAStopCutsTheSentenceSynthesisedAhead(t *testing.T) {
 			if err := <-said; err != nil {
 				t.Fatalf("the first Say: %v", err)
 			}
-			time.Sleep(300 * time.Millisecond)
-			if tc.stop != nil {
-				tc.stop(s, out, cancelExchange)
-			}
-			time.Sleep(2500 * time.Millisecond)
-			out.mu.Lock()
-			after, b := out.after['b'], out.written['b']
-			out.mu.Unlock()
 			if tc.wantAfter {
-				if b == 0 {
-					t.Fatal("the count saw no frame of the second sentence")
+				// The control waits for the second sentence's first frame, not
+				// for a time: it plays after the first sentence's 2 s of audio,
+				// and a run that shares its CPUs with other packages' tests
+				// got it later than the 2.8 s this control once waited. Only
+				// the bound, far past that, fails it.
+				select {
+				case <-out.wrote('b'):
+				case <-time.After(30 * time.Second):
+					t.Fatal("the count saw no frame of the second sentence in 30 s")
 				}
 				return
 			}
+			time.Sleep(300 * time.Millisecond)
+			tc.stop(s, out, cancelExchange)
+			time.Sleep(2500 * time.Millisecond)
+			out.mu.Lock()
+			after := out.after['b']
+			out.mu.Unlock()
 			if after > 0 {
 				t.Fatalf("%d frames (%d ms) of the second sentence reached a playback begun after the stop", after, after*20)
 			}

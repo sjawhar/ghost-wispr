@@ -412,9 +412,12 @@ func TestAPauseDoesNotWaitForAPatternCheck(t *testing.T) {
 					break
 				}
 			}
-			<-done
+			// The check's own result is not this test's subject: the pause
+			// comes during it, so a tickle's or a red confirmation's check
+			// reports the pattern not yet checked black. A failure says it.
+			checked := <-done
 			if off < 0 || off > 500*time.Millisecond {
-				t.Fatalf("a pause during %s's pattern check turned the light off after %v (-1ns: not within 1s), want within 500ms", tc.name, off)
+				t.Fatalf("a pause during %s's pattern check turned the light off after %v (-1ns: not within 1s), want within 500ms (the check returned %v)", tc.name, off, checked)
 			}
 		})
 	}

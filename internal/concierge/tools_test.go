@@ -113,8 +113,10 @@ func TestReadIssueGivesStatusSpecSummaryAndRecentEvents(t *testing.T) {
 	if len(events) != 2 {
 		t.Fatalf("recent events = %v", result["recent_events"])
 	}
+	// The author is said of the issue the record names (sessionName): "Worker
+	// on ABC-12" is "Worker".
 	first, _ := events[0].(map[string]any)
-	if first["type"] != "comment.created" || first["when"] != "30 minutes ago" || first["by"] != "Worker on ABC-12" || first["text"] != "PR 80 merged; the tap is next." {
+	if first["type"] != "comment.created" || first["when"] != "30 minutes ago" || first["by"] != "Worker" || first["text"] != "PR 80 merged; the tap is next." {
 		t.Errorf("first event = %v", first)
 	}
 	second, _ := events[1].(map[string]any)

@@ -149,11 +149,14 @@ func TestCloseStopsWaitingForANATSCloseAtItsDeadline(t *testing.T) {
 			closed := make(chan error, 1)
 			go func() { closed <- session.Close(ctx) }()
 			select {
-			case <-closed:
+			case err := <-closed:
+				if err != nil && !errors.Is(err, context.Canceled) {
+					t.Errorf("Close, its deadline passed = %v, want nil or its context's cause", err)
+				}
 			case <-time.After(300 * time.Millisecond):
 				t.Error("Close, its deadline passed, waited for the NATS close behind a write to a peer that stopped reading")
 				_ = peer.Close()
-				<-closed
+				t.Logf("Close returned %v once the peer closed", <-closed)
 			}
 			unblock()
 			select {
