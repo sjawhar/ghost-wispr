@@ -373,21 +373,37 @@ func TestAFastAnswerWithALiveHolderRequiresTheQuestionsKey(t *testing.T) {
 }
 
 // TestAnExplicitAskQueuesForAnUnresponsiveHolder: Envoy stores an
-// unresponsive session's question. The Concierge sends it and says the agent
-// is not running now, instead of dropping the explicit ask.
+// unresponsive session's question and delivers it when the session comes
+// back. The Concierge sends it, and the room hears that once, in one line:
+// "ABC-12's agent isn't answering now; I left the question for it." It does
+// not hear that the agent is not running and, separately, that it was asked.
 func TestAnExplicitAskQueuesForAnUnresponsiveHolder(t *testing.T) {
-	r := newRig(t)
-	heldIssue(r, "session", false)
-	r.agents.states["agent-7"] = envoy.SessionInfo{SessionID: "agent-7", State: envoy.StateUnresponsive}
-	r.model.turns = [][]*genai.GenerateContentResponse{{chunk(text("ABC-12 is in review."))}}
-	spoken := answerTurn(t, r, "ask the agent on ABC-12 whether the tap is merged")
-	r.agents.mu.Lock()
-	sent := slices.Clone(r.agents.sent)
-	r.agents.mu.Unlock()
-	if len(sent) != 1 || sent[0].Target != "agent-7" {
-		t.Fatalf("sent = %+v, want one question to the unresponsive holder", sent)
-	}
-	if !slices.ContainsFunc(spoken, func(s said) bool { return s.text == "ABC-12's agent is not running now." }) {
-		t.Fatalf("spoken = %+v, want the unresponsive-holder line", spoken)
+	for _, judge := range []string{"Envoy", "Dispatch"} {
+		r := newRig(t)
+		heldIssue(r, "session", false)
+		if judge == "Envoy" {
+			r.agents.states["agent-7"] = envoy.SessionInfo{SessionID: "agent-7", State: envoy.StateUnresponsive}
+		} else {
+			r.records.issues["ABC-12"].HolderState = "unresponsive"
+			delete(r.agents.states, "agent-7") // Envoy calls it gone; Dispatch's judgment wins.
+		}
+		r.model.turns = [][]*genai.GenerateContentResponse{{chunk(text("ABC-12 is in review."))}}
+		spoken := answerTurn(t, r, "ask the agent on ABC-12 whether the tap is merged")
+		r.agents.mu.Lock()
+		sent := slices.Clone(r.agents.sent)
+		r.agents.mu.Unlock()
+		if len(sent) != 1 || sent[0].Target != "agent-7" {
+			t.Fatalf("%s: sent = %+v, want one question to the unresponsive holder", judge, sent)
+		}
+		const left = "ABC-12's agent isn't answering now; I left the question for it."
+		var lines []string
+		for _, s := range spoken {
+			if s.text == left || strings.Contains(s.text, "not running") || strings.Contains(s.text, "I asked the agent") {
+				lines = append(lines, s.text)
+			}
+		}
+		if !slices.Equal(lines, []string{left}) {
+			t.Errorf("%s: spoken = %+v, want %q once and no other line about the agent", judge, spoken, left)
+		}
 	}
 }

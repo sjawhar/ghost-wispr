@@ -160,38 +160,61 @@ func TestARestartedLegionWorkerIsItsRoleHolder(t *testing.T) {
 }
 
 // TestAPassingReviewerIsNotTheHolder fails if, with no claim, the newest
-// session to write, a reviewer, is the holder over the issue's worker: the
-// implementer among the Legion role holders, else the newest session that set
-// the issue's status. On the 479 open issues a session claimed on 2026-11-25,
-// the claim hidden, the newest session was the claim's session for 256; the
-// role holders, else the newest session that set the status, else the
-// newest, for 322.
+// session to write, a passing reviewer, is the holder over the Legion role
+// holder of the issue's current phase: the implementer while the issue is in
+// progress, the tester while it is in testing.
 func TestAPassingReviewerIsNotTheHolder(t *testing.T) {
-	r := newRig(t)
-	r.records.issues["ABC-12"] = &dispatch.Issue{Key: "ABC-12", Status: "in_progress"}
-	r.records.events["ABC-12"] = []dispatch.Event{
-		wrote("handoff.recorded", testNow.Add(-5*time.Minute), "rev-1", "Legion reviewer · ABC-12"),
-		wrote("result.recorded", testNow.Add(-time.Hour), "test-1", "Legion tester · ABC-12"),
+	for _, c := range []struct{ status, want string }{{"in_progress", "impl-1"}, {"testing", "test-1"}} {
+		r := newRig(t)
+		r.records.issues["ABC-12"] = &dispatch.Issue{Key: "ABC-12", Status: c.status}
+		r.records.events["ABC-12"] = []dispatch.Event{
+			wrote("handoff.recorded", testNow.Add(-5*time.Minute), "rev-1", "Legion reviewer · ABC-12"),
+			wrote("result.recorded", testNow.Add(-time.Hour), "test-1", "Legion tester · ABC-12"),
+		}
+		r.records.roleHolders["ABC-12"] = []dispatch.RoleHolder{{Role: "architect", Session: "arch-1"}, {Role: "implementer", Session: "impl-1"}, {Role: "tester", Session: "test-1"}, {Role: "reviewer", Session: "rev-1"}}
+		for _, id := range []string{"arch-1", "impl-1", "test-1", "rev-1"} {
+			r.agents.states[id] = live(id)
+		}
+		if got := r.run(t, "issue_holder", map[string]string{"key": "ABC-12"}); got["session"] != c.want || got["live"] != true {
+			t.Errorf("%s: issue_holder = %v, want %s, the role holder of the current phase", c.status, got, c.want)
+		}
 	}
-	r.records.roleHolders["ABC-12"] = []dispatch.RoleHolder{{Role: "architect", Session: "arch-1"}, {Role: "implementer", Session: "impl-1"}, {Role: "tester", Session: "test-1"}, {Role: "reviewer", Session: "rev-1"}}
-	for _, id := range []string{"arch-1", "impl-1", "test-1", "rev-1"} {
-		r.agents.states[id] = live(id)
-	}
-	if got := r.run(t, "issue_holder", map[string]string{"key": "ABC-12"}); got["session"] != "impl-1" || got["live"] != true {
-		t.Errorf("with role holders: issue_holder = %v, want impl-1, the implementer", got)
-	}
+}
 
-	r = newRig(t)
-	r.records.issues["ABC-13"] = &dispatch.Issue{Key: "ABC-13", Status: "in_progress"}
-	r.records.events["ABC-13"] = []dispatch.Event{
-		wrote("comment.created", testNow.Add(-5*time.Minute), "rev-2", "Reviewer"),
-		wrote("artifact.version", testNow.Add(-time.Hour), "worker-2", "Worker"),
-		statusSet(testNow.Add(-2*time.Hour), "worker-2", "Worker", "in_progress"),
-		statusSet(testNow.Add(-50*time.Hour), "queue-2", "Queue", "todo"),
-	}
-	r.agents.states["rev-2"], r.agents.states["worker-2"], r.agents.states["queue-2"] = live("rev-2"), live("worker-2"), live("queue-2")
-	if got := r.run(t, "issue_holder", map[string]string{"key": "ABC-13"}); got["session"] != "worker-2" || got["live"] != true {
-		t.Errorf("with no role holders: issue_holder = %v, want worker-2, the newest session that set the status", got)
+// TestAnEarlierWorkerDoesNotHideTheCurrentOne (Sol's review of #193 at
+// 4788285): with no claim, a session that worked an earlier phase, while it
+// still runs, hid the session working now. An issue in testing named its
+// previous implementer, live or unresponsive, over its live tester, who
+// wrote the newest event; an old controller that set the status hid the
+// worker who wrote since. The current phase's role holder decides, then the
+// newest writer; an earlier role holder or status setter never beats a newer
+// running writer.
+func TestAnEarlierWorkerDoesNotHideTheCurrentOne(t *testing.T) {
+	for _, old := range []envoy.SessionState{envoy.StateLive, envoy.StateUnresponsive, envoy.StateGone} {
+		r := newRig(t)
+		r.records.issues["ABC-12"] = &dispatch.Issue{Key: "ABC-12", Status: "testing"}
+		r.records.roleHolders["ABC-12"] = []dispatch.RoleHolder{{Role: "implementer", Session: "previous-impl"}, {Role: "tester", Session: "current-tester"}}
+		r.records.events["ABC-12"] = []dispatch.Event{
+			wrote("comment.created", testNow.Add(-time.Minute), "current-tester", "Current tester"),
+			wrote("comment.created", testNow.Add(-time.Hour), "previous-impl", "Previous implementer"),
+		}
+		r.agents.states["previous-impl"] = envoy.SessionInfo{SessionID: "previous-impl", State: old}
+		r.agents.states["current-tester"] = envoy.SessionInfo{SessionID: "current-tester", State: envoy.StateLive}
+		if got := r.run(t, "issue_holder", map[string]string{"key": "ABC-12"}); got["session"] != "current-tester" || got["live"] != true {
+			t.Errorf("previous implementer %s: issue_holder = %v, want current-tester", old, got)
+		}
+
+		r = newRig(t)
+		r.records.issues["ABC-12"] = &dispatch.Issue{Key: "ABC-12", Status: "in_progress"}
+		r.records.events["ABC-12"] = []dispatch.Event{
+			wrote("comment.created", testNow.Add(-time.Minute), "current-worker", "Current worker"),
+			statusSet(testNow.Add(-24*time.Hour), "old-controller", "Project controller", "in_progress"),
+		}
+		r.agents.states["current-worker"] = envoy.SessionInfo{SessionID: "current-worker", State: envoy.StateLive}
+		r.agents.states["old-controller"] = envoy.SessionInfo{SessionID: "old-controller", State: old}
+		if got := r.run(t, "issue_holder", map[string]string{"key": "ABC-12"}); got["session"] != "current-worker" || got["live"] != true {
+			t.Errorf("old controller %s: issue_holder = %v, want current-worker", old, got)
+		}
 	}
 }
 
@@ -277,16 +300,12 @@ func TestNoEventsReadOutlivesTheHolder(t *testing.T) {
 
 // TestAnEnvoyGoneWorkerDoesNotEndTheSearch fails if, with no claim, one
 // session Envoy's registry calls gone ends the search with nobody on the
-// issue while another session Dispatch names as its worker runs: a Legion
-// role holder, or a session that set the issue's status. Envoy calls a
-// restarting Legion session gone for under a second (4 times in 52 sweeps of
-// 355 live claims on 2026-11-25). Past every such worker, the newest session
-// that wrote to the issue decides, gone or not: measured on the 479 claimed
-// issues with the claim hidden, this named the claim's running session for
-// 262 of the 355 Dispatch read live and named no other running session for
-// 91 of the 124 it read gone, against 255 and 97 when the first candidate
-// decides, 273 and 51 when every gone one is passed over, and 201 and 98 on
-// main.
+// issue while another session Dispatch names as a worker runs: a Legion role
+// holder, or a session that set the issue's status. Envoy calls a restarting
+// Legion session gone for under a second (4 times in 52 sweeps of 355 live
+// claims on 2026-11-25). Past the current phase's role holder, the newest
+// writer decides when it runs; when it is gone, the other role holders and
+// the status setters are tried; none running, nobody is on the issue.
 func TestAnEnvoyGoneWorkerDoesNotEndTheSearch(t *testing.T) {
 	for _, c := range []struct {
 		name    string
@@ -299,20 +318,19 @@ func TestAnEnvoyGoneWorkerDoesNotEndTheSearch(t *testing.T) {
 		{"a gone implementer, a running tester", []dispatch.RoleHolder{{Role: "implementer", Session: "impl-1"}, {Role: "tester", Session: "test-1"}},
 			[]dispatch.Event{wrote("artifact.version", testNow.Add(-time.Minute), "impl-1", "Legion implementer · ABC-12")},
 			[]string{"test-1"}, map[string]any{"holder": "session", "live": true, "session": "test-1", "title": ""}, 2},
-		{"a gone status setter, an older running one", nil,
+		{"a gone newest writer, a running status setter", nil,
+			[]dispatch.Event{
+				wrote("comment.created", testNow.Add(-time.Minute), "rev-2", "Reviewer"),
+				statusSet(testNow.Add(-2*time.Hour), "worker-2", "Worker", "in_progress"),
+			},
+			[]string{"worker-2"}, map[string]any{"holder": "session", "live": true, "session": "worker-2", "title": "Worker"}, 2},
+		{"a gone phase worker: the newest writer, running", []dispatch.RoleHolder{{Role: "implementer", Session: "impl-1"}},
 			[]dispatch.Event{
 				wrote("comment.created", testNow.Add(-time.Minute), "rev-2", "Reviewer"),
 				statusSet(testNow.Add(-time.Hour), "worker-old", "Worker", "in_progress"),
-				statusSet(testNow.Add(-2*time.Hour), "worker-2", "Worker", "todo"),
 			},
-			[]string{"rev-2", "worker-2"}, map[string]any{"holder": "session", "live": true, "session": "worker-2", "title": "Worker"}, 2},
-		{"every worker gone: the newest writer decides, running", []dispatch.RoleHolder{{Role: "implementer", Session: "impl-1"}},
-			[]dispatch.Event{
-				wrote("comment.created", testNow.Add(-time.Minute), "rev-2", "Reviewer"),
-				statusSet(testNow.Add(-time.Hour), "worker-old", "Worker", "in_progress"),
-			},
-			[]string{"rev-2"}, map[string]any{"holder": "session", "live": true, "session": "rev-2", "title": "Reviewer"}, 3},
-		{"every worker gone: the newest writer decides, gone", []dispatch.RoleHolder{{Role: "architect", Session: "arch-1"}},
+			[]string{"rev-2"}, map[string]any{"holder": "session", "live": true, "session": "rev-2", "title": "Reviewer"}, 2},
+		{"nothing Dispatch names runs, the newest writer gone: nobody", []dispatch.RoleHolder{{Role: "architect", Session: "arch-1"}},
 			[]dispatch.Event{
 				wrote("artifact.version", testNow.Add(-time.Minute), "arch-1", "Legion architect · ABC-12"),
 				wrote("comment.created", testNow.Add(-time.Hour), "passer-1", "Passer"),
@@ -363,18 +381,21 @@ func TestAClaimByNoAgentSessionIsUnknownWhateverDispatchSays(t *testing.T) {
 // ABC-12." Envoy stores the question for an unresponsive session. A session
 // Envoy alone judged gone is still not asked.
 func TestASessionDispatchReadsRunningIsAsked(t *testing.T) {
-	for _, state := range []string{"live", "unresponsive"} {
+	for _, c := range []struct{ state, said string }{
+		{"live", "I asked the agent on ABC-12."},
+		{"unresponsive", "ABC-12's agent isn't answering now; I left the question for it."},
+	} {
 		r := newRig(t)
 		heldIssue(r, "session", false)
-		r.records.issues["ABC-12"].HolderState = state
+		r.records.issues["ABC-12"].HolderState = c.state
 		delete(r.agents.states, "agent-7")
 		r.model.turns = [][]*genai.GenerateContentResponse{{chunk(text("ABC-12: PR 80 is in review."))}}
 		spoken := answerTurn(t, r, "ask the agent on ABC-12 whether the tap is merged")
 		if len(r.agents.sent) != 1 || r.agents.sent[0].Target != "agent-7" {
-			t.Errorf("Dispatch read it %s: sent %+v, want the question to agent-7", state, r.agents.sent)
+			t.Errorf("Dispatch read it %s: sent %+v, want the question to agent-7", c.state, r.agents.sent)
 		}
-		if !slices.ContainsFunc(spoken, func(s said) bool { return strings.HasPrefix(s.text, "I asked the agent on ABC-12.") }) {
-			t.Errorf("Dispatch read it %s: spoken = %+v, want that the agent on ABC-12 was asked", state, spoken)
+		if !slices.ContainsFunc(spoken, func(s said) bool { return strings.HasPrefix(s.text, c.said) }) {
+			t.Errorf("Dispatch read it %s: spoken = %+v, want %q", c.state, spoken, c.said)
 		}
 	}
 
