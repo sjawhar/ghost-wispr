@@ -217,8 +217,8 @@ func (c *Concierge) answer(parent context.Context, x *voice.Exchange, turn strin
 		c.logger.Info("concierge took a reply to its own question for side talk: it picks nothing, says no key and asks nothing, or takes itself back")
 		return errSideTalk
 	}
-	if offered && offer.readsReply(turn, x.Reply) {
-		turn = x.Reply
+	if whole, ok := offer.readsReply(turn, x.Reply); offered && ok {
+		turn = whole
 	}
 	// A key said letter by letter is read here, once, so the pick, the
 	// routing line, the search and the ask all see it.

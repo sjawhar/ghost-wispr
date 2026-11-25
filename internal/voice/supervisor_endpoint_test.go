@@ -216,8 +216,8 @@ func TestTheAnswerToolHandsTheRoomsWholeReply(t *testing.T) {
 		turn, reply string
 		vendor      string
 	}{
-		{"a statement split by a speech_final", []string{"okay, the budget", "can wait"}, "can wait", "okay, the budget can wait", "Okay, the budget can be postponed."},
-		{"a statement, then a question", []string{"okay, the budget can wait.", "what about the wake word?"}, "what about the wake word?", "okay, the budget can wait. what about the wake word?", "The user asked about the wake word."},
+		{"a statement split by a speech_final", []string{"okay, the budget", "can wait"}, "can wait", "okay, the budget\ncan wait", "Okay, the budget can be postponed."},
+		{"a statement, then a question", []string{"okay, the budget can wait.", "what about the wake word?"}, "what about the wake word?", "okay, the budget can wait.\nwhat about the wake word?", "The user asked about the wake word."},
 		{"control: one final", []string{"what about the wake word?"}, "what about the wake word?", "what about the wake word?", "What about the wake word?"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

@@ -1890,14 +1890,19 @@ func (s *Supervisor) turnOf(ex *exchange) string {
 }
 
 // replyOf is ex's reply as the Concierge reads it (Exchange.Reply): the
-// room's finals since the voice last spoke, a key said in a spoken form
-// written as the key, as in a turn (turnOf).
+// room's finals since the voice last spoke, one a line, so a take-back
+// said as its own utterance ("okay, never mind" then "okay, sure") stays a
+// clause of its own though Deepgram put no stop after it. A key said in a
+// spoken form is written as the key in each final, as in a turn (turnOf).
 func (s *Supervisor) replyOf(ex *exchange) string {
-	reply := strings.TrimSpace(strings.Join(ex.reply, " "))
-	if s.cfg.ProjectKeys != nil {
-		reply = transcript.WriteKeys(reply, s.cfg.ProjectKeys())
+	finals := make([]string, 0, len(ex.reply))
+	for _, final := range ex.reply {
+		if s.cfg.ProjectKeys != nil {
+			final = transcript.WriteKeys(final, s.cfg.ProjectKeys())
+		}
+		finals = append(finals, strings.TrimSpace(final))
 	}
-	return reply
+	return strings.Join(finals, "\n")
 }
 
 // isQuestion reports whether Deepgram punctuated turn as a question.

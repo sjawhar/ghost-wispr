@@ -8,7 +8,6 @@ import (
 	"unicode"
 
 	"github.com/sjawhar/ghost-wispr/internal/voice"
-	"github.com/sjawhar/ghost-wispr/internal/wake/transcript"
 )
 
 // offeredPick is what an answer asked the room after it (R5): with no one
@@ -119,64 +118,86 @@ func sideTalk(turn string) bool {
 }
 
 // sideTalkOn reports whether reply, the room's words in answer to p, is side
-// talk: it takes itself back (retracts), or it picks nothing (pick) and is
-// sideTalk. Letters the view cannot tell are read as the key they may be
-// (everySpelledKey). reply is every final the room said since the voice
-// asked (voice.Exchange.Reply), so an endpoint inside a statement cannot
-// leave it only the statement's end, "can wait" of "okay, ABC-12 can wait",
-// which on its own asks; and a reply that holds a question anywhere is a
-// question, unless it then takes it back (Main, after Sol's fifth review of
-// #191). A vendor's text is never read: it could neither be trusted to make
-// a reply side talk nor to make it a question.
+// talk: what it says after its last take-back (afterTakeBack) is nothing, or
+// picks nothing (pick) and is sideTalk. Letters the view cannot tell are
+// read as the key they may be (everySpelledKey). reply is every final the
+// room said since the voice asked (voice.Exchange.Reply), so an endpoint
+// inside a statement cannot leave it only the statement's end, "can wait" of
+// "okay, ABC-12 can wait", which on its own asks; and a reply that holds a
+// question anywhere is a question, unless it then takes it back (Main, after
+// Sol's fifth review of #191). A vendor's text is never read: it could
+// neither be trusted to make a reply side talk nor to make it a question.
 func (p *offeredPick) sideTalkOn(view projectsView, reply string) bool {
 	written, unread := view.readSpelledKeys(reply)
 	if unread {
 		written = everySpelledKey(written)
 	}
-	if retracts(written) {
+	rest := afterTakeBack(written)
+	if strings.TrimSpace(rest) == "" {
 		return true
 	}
-	_, picks := p.pick(written)
-	return !picks && sideTalk(written)
+	_, picks := p.pick(rest)
+	return !picks && sideTalk(rest)
 }
 
 // readsReply reports whether the answer to turn, a reply to p that is not
-// side talk, reads reply, the room's whole reply, rather than turn: the turn
-// is the reply's last part and picks nothing, says no key and asks nothing,
-// so the question the reply holds was said before it. "What about the
-// budget?" then "okay, sure" is answered as the question, not as "okay,
-// sure" (Main, before Sol's sixth review of #191).
-func (p *offeredPick) readsReply(turn, reply string) bool {
+// side talk, reads reply, the room's whole reply after its last take-back
+// (afterTakeBack), rather than turn, and returns it: the turn is the
+// reply's last part and picks nothing, says no key and asks nothing, so the
+// question the reply holds was said before it. "What about the budget?"
+// then "okay, sure" is answered as the question, not as "okay, sure" (Main,
+// before Sol's sixth review of #191).
+func (p *offeredPick) readsReply(turn, reply string) (string, bool) {
+	reply = afterTakeBack(reply)
 	if strings.TrimSpace(reply) == "" || asks(turn) || saysKey(turn) {
-		return false
+		return "", false
 	}
 	_, picks := p.pick(turn)
-	return !picks && asks(reply)
+	return strings.Join(strings.Fields(reply), " "), !picks && asks(reply)
 }
 
-// retracts reports whether reply ends by taking itself back: its last
-// clause, after the words that may open one (clauseOpeners, replyFillers, a
-// no), is a stop or a never mind as the voice's commands read them
-// (transcript.CommandOf: "stop", "cancel", "enough", "never mind", "forget
-// it"). It answers nothing, as "Wispr, never mind" answers nothing; a
-// question said after it is the reply's last clause, and is answered.
-func retracts(reply string) bool {
-	clauses := strings.FieldsFunc(reply, func(r rune) bool { return strings.ContainsRune(",;:.!?", r) })
-	for i := len(clauses) - 1; i >= 0; i-- {
-		words := lowerWords(clauses[i])
-		if len(words) == 0 {
-			continue
+// takeBacks are the clauses that take back what was said before them, as
+// "Wispr, never mind" does, after the words that may open a clause.
+var takeBacks = set([]string{"stop", "never mind", "nevermind", "cancel", "forget it", "enough", "that's all", "thats all"})
+
+// afterTakeBack is what reply says after its last take-back: a clause (cut
+// at a stop, a comma or a line; each final of the room's reply is a line,
+// voice.Exchange.Reply) that, after the words that may open one
+// (clauseOpeners, replyFillers, a no: "okay", "actually", "no", "uh", "so",
+// "well"), is exactly a take-back phrase (takeBacks) and nothing else, and
+// ends in no question mark. A take-back cancels what was said before it:
+// "what about ABC-12? okay, never mind" says nothing after it, and answers
+// nothing, as "Wispr, never mind" answers nothing; "never mind. what about
+// ABC-12?" says the question. A clause with any other word, a question word
+// or a question mark is no take-back: "stop the rollout?", "never mind the
+// budget what about ABC-12?" (Sol's sixth review of #191, where a prefix
+// match took them for take-backs). With no take-back, it is reply.
+func afterTakeBack(reply string) string {
+	rest := reply
+	for clause := reply; clause != ""; {
+		end := strings.IndexAny(clause, ",;:.!?\n")
+		next := ""
+		if end < 0 {
+			end = len(clause)
+		} else {
+			next = clause[end+1:]
 		}
-		for len(words) > 0 && (clauseOpeners[words[0]] || replyFillers[words[0]] || noWords[words[0]]) {
-			words = words[1:]
+		if (end == len(clause) || clause[end] != '?') && takesBack(clause[:end]) {
+			rest = next
 		}
-		switch transcript.CommandOf(strings.Join(words, " ")) {
-		case transcript.Stop, transcript.NeverMind:
-			return len(words) > 0
-		}
-		return false
+		clause = next
 	}
-	return false
+	return strings.TrimSpace(rest)
+}
+
+// takesBack reports whether clause, with no question mark, is a take-back
+// phrase after the words that may open a clause (afterTakeBack).
+func takesBack(clause string) bool {
+	words := lowerWords(clause)
+	for len(words) > 0 && (clauseOpeners[words[0]] || replyFillers[words[0]] || noWords[words[0]]) {
+		words = words[1:]
+	}
+	return len(words) > 0 && takeBacks[strings.Join(words, " ")]
 }
 
 // keyWords may frame a key said for "What is its key?", beside the words

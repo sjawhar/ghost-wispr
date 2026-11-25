@@ -40,12 +40,12 @@ type Exchange struct {
 	// deliver after it, reads nothing.
 	Turn uint64
 	// Reply is, after Wispr asked the room a question, the room's own words
-	// since that question ended: every final since then, joined in order,
-	// through the turn answered (AskerTurn, Answer's turn). The Concierge
-	// decides on it whether the reply is side talk, never on a vendor's
-	// text; it picks and answers from the turn. An endpoint inside the reply
-	// ("okay, ABC-12" … "can wait") leaves the turn only its end. Empty when
-	// Wispr asked nothing.
+	// since that question ended: every final since then, in order, one a
+	// line, through the turn answered (AskerTurn, Answer's turn). The
+	// Concierge decides on it whether the reply is side talk, never on a
+	// vendor's text, and answers from it when the turn holds no question of
+	// its own. An endpoint inside the reply ("okay, ABC-12" … "can wait")
+	// leaves the turn only its end. Empty when Wispr asked nothing.
 	Reply string
 }
 

@@ -441,7 +441,12 @@ func TestAStatementAfterWisprsQuestionStaysSideTalkAtAnyEndpoint(t *testing.T) {
 // never mind", "stop" or "forget it", is answered not at all, as "Wispr,
 // never mind" answers nothing; a question said after that is answered. At
 // e7f3bad the question before "okay, never mind" was answered as "okay,
-// never mind".
+// never mind". A take-back is a clause that is a take-back phrase and
+// nothing else: "stop the rollout?", "what about ABC-12, stop the
+// rollout?" and "never mind the budget what about ABC-12?" are questions,
+// which c69af0c took for take-backs and left unanswered (Sol's sixth
+// review). A take-back cancels what was said before it, so "okay, sure"
+// after "okay, never mind" does not bring the question back.
 func TestTheRoomsWholeReplyDecidesSideTalk(t *testing.T) {
 	for _, tc := range []struct {
 		name, turn, whole, want string // want: "side talk", "answered" or "picked"
@@ -455,6 +460,15 @@ func TestTheRoomsWholeReplyDecidesSideTalk(t *testing.T) {
 		{"a question, then stop", "stop.", "what about the realtime voice budget? stop.", "side talk", ""},
 		{"a question, then actually, forget it", "actually, forget it", "what about the realtime voice budget? actually, forget it", "side talk", ""},
 		{"a pick, then never mind", "never mind", "the first one, never mind", "side talk", ""},
+		{"a question, never mind, then a statement", "okay, sure", "what about the realtime voice budget? okay, never mind. okay, sure", "side talk", ""},
+		{"stop as a question's verb", "stop the rollout?", "stop the rollout?", "answered", "stop the rollout?"},
+		{"stop in a question's last clause", "what about ABC-12, stop the rollout?", "what about ABC-12, stop the rollout?", "answered", "what about ABC-12, stop the rollout?"},
+		{"never mind before a question, no comma", "never mind the budget what about ABC-12?", "never mind the budget what about ABC-12?", "answered", "never mind the budget what about ABC-12?"},
+		{"never mind before a question, a comma", "never mind the budget, what about ABC-12?", "never mind the budget, what about ABC-12?", "answered", "never mind the budget, what about ABC-12?"},
+		{"stop as a question", "stop?", "stop?", "answered", "stop?"},
+		{"a question, then a clause that starts with stop", "stop the rollout.", "what about the realtime voice budget? stop the rollout.", "answered", "what about the realtime voice budget? stop the rollout."},
+		{"a question, then a clause that starts with never mind", "never mind the budget.", "what about the realtime voice budget? never mind the budget.", "answered", "what about the realtime voice budget? never mind the budget."},
+		{"control: a question, then that's all", "that's all.", "what about the realtime voice budget? that's all.", "side talk", ""},
 		{"control: never mind, then a question", "what about the realtime voice budget?", "never mind. what about the realtime voice budget?", "answered", "what about the realtime voice budget?"},
 		{"control: a question, then a pick", "the first one", "what about the realtime voice budget? the first one", "picked", ""},
 		{"control: the tail with no whole reply", "can wait", "", "answered", "can wait"},
@@ -519,6 +533,12 @@ func TestTheVendorsTextDecidesNoReplyToWisprsQuestion(t *testing.T) {
 		{"a question, then okay, never mind", []string{"what about the realtime voice budget?", "okay, never mind"}, true, "Never mind.", false, ""},
 		{"side talk, then a question as its own turn", []string{"okay, ABC-12 can wait.", "what about the realtime voice budget?"}, true, "What about the realtime voice budget?", true, ""},
 		{"a question, then a statement", []string{"what about the realtime voice budget?", "okay, sure"}, true, "Okay, sure.", true, "realtime voice budget"},
+		{"Sol R6: stop the rollout?", []string{"stop the rollout?"}, true, "Stop the rollout?", true, ""},
+		{"Sol R6: what about ABC-12, stop the rollout?", []string{"what about ABC-12, stop the rollout?"}, true, "What about ABC-12, stop the rollout?", true, ""},
+		{"Sol R6: never mind the budget what about ABC-12?", []string{"never mind the budget what about ABC-12?"}, true, "What about ABC-12?", true, ""},
+		{"control: actually, stop", []string{"what about the realtime voice budget?", "actually, stop"}, true, "Stop.", false, ""},
+		{"control: never mind, then a question", []string{"never mind.", "what about the realtime voice budget?"}, true, "What about the realtime voice budget?", true, ""},
+		{"a question, never mind, then a statement", []string{"what about the realtime voice budget?", "okay, never mind", "okay, sure"}, true, "Okay, sure.", false, ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			r := newCutRig(t,
