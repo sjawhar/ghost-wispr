@@ -10,6 +10,7 @@ import (
 	"google.golang.org/genai"
 
 	"github.com/sjawhar/ghost-wispr/internal/dispatch"
+	"github.com/sjawhar/ghost-wispr/internal/wake/transcript"
 )
 
 // heldKeyRig is a rig with ABC-12 and INFRA-7, no search hit, and the unit's
@@ -25,14 +26,14 @@ func heldKeyRig(t *testing.T, unit string) *rig {
 }
 
 // TestAHeldKeyIsReadForTheVendorsWording (Sol's review of #194 at 8998810,
-// R2): the read-ahead holds a key of one digit that ends the words so far,
-// and a vendor's wording that leaves the room's keys out found no read of
-// them: "what about ABC-12 and INFRA-7" said, "what about the realtime
-// voice" answered, and the room heard "I found no issue for that". Main read
-// ABC-12. A vendor can answer before the unit's transcript ends the turn, so
-// no read at the turn's end is made yet. It fails unless the answer reads the
-// key the read-ahead holds for the turn, so it names the issue the room
-// said. "What about ABC-12" is the control, read ahead as on main.
+// R2): voices B and C answer in their vendor's words, which can leave the
+// room's keys out: "what about ABC-12 and INFRA-7" said, "what about the
+// realtime voice" answered. At 8998810 the read-ahead held INFRA-7 for the
+// turn's end, the answer found no read, and the room heard "I found no issue
+// for that". The read-ahead now reads the words so far as main's does, so
+// the answer finds the read of the room's keys (AskerTurn, #192) and names
+// the issue the room said. "What about ABC-12" is the control, a key of two
+// digits, read ahead as on main.
 func TestAHeldKeyIsReadForTheVendorsWording(t *testing.T) {
 	for unit, want := range map[string]string{
 		"what about ABC-12":             "ABC-12",
@@ -54,25 +55,29 @@ func TestAHeldKeyIsReadForTheVendorsWording(t *testing.T) {
 	}
 }
 
-// TestTheHoldHoldsOnlyTheLastKey (Sol's review of #194, R2): the read-ahead
-// holds only the key of one digit that ends the words so far, which more
-// words may make speech; the keys before it are read ahead. It fails if
-// "what about ABC-12 and INFRA-7" reads no key ahead, or reads INFRA-7
-// before the turn ends.
-func TestTheHoldHoldsOnlyTheLastKey(t *testing.T) {
-	r := heldKeyRig(t, "")
-	r.concierge.Heard(context.Background(), &r.exchange, "what about ABC-12 and INFRA-7")
-	eventually(t, "the read ahead of ABC-12", func() bool { return slices.Contains(r.records.calls(), "ABC-12") })
-	time.Sleep(100 * time.Millisecond)
-	if calls := r.records.calls(); slices.Contains(calls, "INFRA-7") {
-		t.Fatalf("the read-ahead read %q; want INFRA-7 held until the turn ends", calls)
+// TestAOneDigitKeyIsReadAheadAsItIsSaid: the read-ahead reads a key of one
+// digit in the words so far, as main's reads one of two digits, so the
+// answer finds its read. "What about INFRA-7" reads INFRA-7 before the
+// answer; "what about ABC-12 and INFRA-7" reads both. It fails if the
+// read-ahead does not read the key while it is said.
+func TestAOneDigitKeyIsReadAheadAsItIsSaid(t *testing.T) {
+	for unit, want := range map[string][]string{
+		"what about INFRA-7":            {"INFRA-7"},
+		"what about infra 7":            {"INFRA-7"},
+		"what about ABC-12 and INFRA-7": {"INFRA-7"},
+	} {
+		r := heldKeyRig(t, unit)
+		r.concierge.Heard(context.Background(), &r.exchange, unit)
+		for _, key := range want {
+			eventually(t, "the read ahead of "+key+" for "+unit, func() bool { return slices.Contains(r.records.calls(), key) })
+		}
 	}
 }
 
 // TestAnAnswersOwnKeyIsNotReadForTheNextTurn: voices B and C can leave the
-// turn before as the exchange's AskerTurn (#192). The answer that read the
-// key the read-ahead held ended the hold: a next turn whose vendor wording
-// names no key reads it not again. It fails if the hold outlives its turn.
+// turn before as the exchange's AskerTurn (#192). The answer that took the
+// read ahead of INFRA-7 spent it: a next turn whose vendor wording names no
+// key reads it not again. It fails if the read outlives its answer.
 func TestAnAnswersOwnKeyIsNotReadForTheNextTurn(t *testing.T) {
 	const unit = "what about infra 7"
 	r := heldKeyRig(t, unit)
@@ -157,40 +162,53 @@ func TestAnEarlierAskerTurnsKeyIsNotReadAgain(t *testing.T) {
 	})
 }
 
-// TestAHeldKeyIsReadWhenTheTurnEnds: the read-ahead holds a key of one digit
-// that ends the words so far, since more words may make it speech, and reads
-// it once the turn ends (Exchange.TurnEnded, Deepgram's endpoint), as main
-// read a longer key while it was said: "what about INFRA-7" said alone reads
-// INFRA-7 before the answer. "ops 1 and 2" reads nothing when its turn ends,
-// and the hold "ops 1" had is gone with the words after it.
-func TestAHeldKeyIsReadWhenTheTurnEnds(t *testing.T) {
-	r := heldKeyRig(t, "")
-	say := func(words string, ended bool) {
-		x := r.exchange
-		x.AskerTurn, x.TurnEnded = words, ended
-		r.concierge.Heard(context.Background(), &x, words)
-	}
-	say("what about", false)
-	say("what about INFRA-7", false)
-	time.Sleep(100 * time.Millisecond)
-	if calls := r.records.calls(); slices.Contains(calls, "INFRA-7") {
-		t.Fatalf("INFRA-7 read %q before the turn ended", calls)
-	}
-	say("what about INFRA-7", true)
-	eventually(t, "the read of INFRA-7 at the turn's end", func() bool { return slices.Contains(r.records.calls(), "INFRA-7") })
-
-	r = speechRig(t)
-	x := r.exchange
-	for _, words := range []string{"ops", "ops 1", "ops 1 and", "ops 1 and 2"} {
-		x.AskerTurn, x.TurnEnded = words, words == "ops 1 and 2"
-		r.concierge.Heard(context.Background(), &x, words)
-		time.Sleep(20 * time.Millisecond)
-	}
-	r.exchange.AskerTurn = "ops 1 and 2"
-	var spoken []said
-	_ = r.concierge.Answer(context.Background(), &r.exchange, "what about the ops work", recorder(&spoken))
-	if calls := r.records.calls(); len(calls) != 0 || r.agents.asked() != 0 {
-		t.Fatalf("\"ops 1 and 2\" read %q and sent %d questions; want none", calls, r.agents.asked())
+// TestAReadOfAKeyThatBecameSpeechReachesNoAnswer: while "ops 1" is the whole
+// turn it is a bare reference, so the read-ahead reads OPS-1, as main's
+// read-ahead reads any key in the words so far; "and 2" makes it speech.
+// That read says and sends nothing, and no answer uses it: not the answer
+// to "ops 1 and 2", in the unit's words or a vendor's, and not the next
+// turn's, whose AskerTurn may still be "ops 1 and 2", or even "ops 1". It
+// fails if OPS-1 reaches an answer's record, its words, its issue key or a
+// send. The read ahead of OPS-1 is its control: the probe can see it.
+func TestAReadOfAKeyThatBecameSpeechReachesNoAnswer(t *testing.T) {
+	for _, tc := range []struct{ name, answered string }{
+		{"the unit's words", "ops 1 and 2"},
+		{"a vendor's words", "what about the ops work"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := speechRig(t)
+			r.model.turns = [][]*genai.GenerateContentResponse{{chunk(text("Nothing names it."))}, {chunk(text("Nothing names it."))}, {chunk(text("Nothing names it."))}}
+			heardTurn(r, "ops 1 and 2")
+			if calls := r.records.calls(); !slices.Contains(calls, "OPS-1") {
+				t.Fatalf("control: the read-ahead read %q, want OPS-1 while \"ops 1\" was the turn", calls)
+			}
+			ahead := len(r.records.calls())
+			noOPS1 := func(stage string, spoken []said, err error) {
+				t.Helper()
+				if calls := r.records.calls()[ahead:]; slices.Contains(calls, "OPS-1") || r.exchange.IssueKey != "" || r.agents.asked() != 0 {
+					t.Fatalf("%s: read %q, named %q, sent %d (Answer = %v, spoken %+v); want no OPS-1", stage, calls, r.exchange.IssueKey, r.agents.asked(), err, spoken)
+				}
+				for _, s := range spoken {
+					if strings.Contains(s.text, "OPS-1") {
+						t.Fatalf("%s said %q", stage, s.text)
+					}
+				}
+				for _, request := range r.model.requests {
+					if strings.Contains(promptOf(request), "OPS-1") {
+						t.Fatalf("%s: the model's record names OPS-1", stage)
+					}
+				}
+			}
+			var spoken []said
+			err := r.concierge.Answer(context.Background(), &r.exchange, tc.answered, recorder(&spoken))
+			noOPS1("the answer", spoken, err)
+			for _, stale := range []string{"ops 1 and 2", transcript.WriteKeys("ops 1", speechProjects)} {
+				r.exchange.AskerTurn, r.exchange.FollowUpTurn = stale, true
+				spoken = nil
+				err = r.concierge.Answer(context.Background(), &r.exchange, "and what about the schedule", recorder(&spoken))
+				noOPS1("the next turn, AskerTurn "+stale, spoken, err)
+			}
+		})
 	}
 }
 

@@ -1784,13 +1784,9 @@ func (s *Supervisor) turnLocked(ex *exchange, t *Transcript, words string) {
 	turn := s.turnOf(ex)
 	ex.x.AskerTurn = turn
 	// A follow-up with no wake phrase may be side talk, which leaves the
-	// unit for nothing: it is read for only once it is the next turn. The
-	// result that ends the turn (Deepgram's endpoint) says so, so the
-	// read-ahead reads what it held for more words.
+	// unit for nothing: it is read for only once it is the next turn.
 	if turn != "" && !ex.followUpTurn {
-		x := ex.x
-		x.TurnEnded = t.IsFinal && t.SpeechFinal
-		s.heard = append(s.heard, heardCall{ctx: ex.ctx, x: x, words: turn})
+		s.heard = append(s.heard, heardCall{ctx: ex.ctx, x: ex.x, words: turn})
 	}
 	if ex.drives {
 		return // the vendor drives the turn

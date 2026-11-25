@@ -86,31 +86,49 @@ func TestAOneDigitKeyInSpeechIsSpeech(t *testing.T) {
 // so did "I'd bet 2 of them" (BET-2), "the infra 3 times" (INFRA-3) and
 // "ops 1" inside other words (OPS-1). Each turn comes as the Supervisor
 // hands it over: word by word to the read-ahead (Heard), then whole to
-// Answer, each time through transcript.WriteKeys. The live run of the fix
-// found the read-ahead reading OPS-1 while the turn so far was "ops 1". It
-// fails unless no turn reads any of them, while said or after, or sends
-// anything, and its words are searched. A control turn that names BET-5 as
-// the question's object reads it and asks its holder, so the probe can see
-// a read and a send.
+// Answer, each time through transcript.WriteKeys. It fails unless the answer
+// to each turn reads none of them, names none, says none and sends nothing,
+// and its words are searched. The read-ahead reads as main's does, the words
+// so far: while "ops 1" is the whole turn it is a bare reference, so the
+// read-ahead reads OPS-1, and the answer to "ops 1 and 2" must not use that
+// read; the other turns read nothing ahead. A control turn that names BET-5
+// as the question's object reads it and asks its holder, so the probe can
+// see a read and a send.
 func TestSpeechReadsNoIssueAndAsksNoOne(t *testing.T) {
-	speech := map[string]string{
-		"I bet 5":           "bet",
-		"I'd bet 2 of them": "bet",
-		"the infra 3 times": "infra",
-		"ops 1 and 2":       "ops",
+	speech := map[string]struct{ word, ahead string }{
+		"I bet 5":           {word: "bet"},
+		"I'd bet 2 of them": {word: "bet"},
+		"the infra 3 times": {word: "infra"},
+		"ops 1 and 2":       {word: "ops", ahead: "OPS-1"},
 	}
-	for turn, word := range speech {
+	keys := []string{"BET-5", "BET-2", "INFRA-3", "OPS-1"}
+	for turn, tc := range speech {
 		r := speechRig(t)
+		heardTurn(r, turn)
+		ahead := r.records.calls()
+		if tc.ahead == "" && len(ahead) != 0 || tc.ahead != "" && !slices.Contains(ahead, tc.ahead) {
+			t.Errorf("%q read %q ahead, want %q", turn, ahead, tc.ahead)
+		}
 		var spoken []said
-		err := sayTurn(r, turn, recorder(&spoken))
-		if calls := r.records.calls(); len(calls) != 0 {
-			t.Errorf("%q read issues %q, want none (Answer = %v, spoken %+v)", turn, calls, err, spoken)
+		err := r.concierge.Answer(context.Background(), &r.exchange, transcript.WriteKeys(turn, speechProjects), recorder(&spoken))
+		if calls := r.records.calls()[len(ahead):]; len(calls) != 0 || r.exchange.IssueKey != "" {
+			t.Errorf("%q: the answer read issues %q and named %q, want none (Answer = %v, spoken %+v)", turn, calls, r.exchange.IssueKey, err, spoken)
+		}
+		for _, s := range spoken {
+			if slices.ContainsFunc(keys, func(key string) bool { return strings.Contains(s.text, key) }) {
+				t.Errorf("%q said %q, want no key", turn, s.text)
+			}
+		}
+		for _, request := range r.model.requests {
+			if record := promptOf(request); slices.ContainsFunc(keys, func(key string) bool { return strings.Contains(record, key) }) {
+				t.Errorf("%q: the model's record names a key:\n%s", turn, record)
+			}
 		}
 		if sent := r.agents.asked(); sent != 0 {
 			t.Errorf("%q sent %d questions, want none", turn, sent)
 		}
-		if searches := r.records.searches(); !slices.ContainsFunc(searches, func(q string) bool { return slices.Contains(strings.Fields(q), word) }) {
-			t.Errorf("%q searched %q, want a search that keeps %q", turn, searches, word)
+		if searches := r.records.searches(); !slices.ContainsFunc(searches, func(q string) bool { return slices.Contains(strings.Fields(q), tc.word) }) {
+			t.Errorf("%q searched %q, want a search that keeps %q", turn, searches, tc.word)
 		}
 	}
 	r := speechRig(t)
@@ -124,25 +142,31 @@ func TestSpeechReadsNoIssueAndAsksNoOne(t *testing.T) {
 	}
 }
 
-// sayTurn says turn as the Supervisor hands it over, the keys of
-// speechProjects written (transcript.WriteKeys): word by word to the
-// read-ahead, each word 50 ms after the last, then whole to Answer.
-func sayTurn(r *rig, turn string, say voice.SayFunc) error {
+// heardTurn says turn to the read-ahead as the Supervisor hands it over, the
+// keys of speechProjects written (transcript.WriteKeys): word by word, each
+// word 50 ms after the last, and AskerTurn the words so far.
+func heardTurn(r *rig, turn string) {
 	words := strings.Fields(turn)
 	for i := range words {
-		r.concierge.Heard(context.Background(), &r.exchange, transcript.WriteKeys(strings.Join(words[:i+1], " "), speechProjects))
+		r.exchange.AskerTurn = transcript.WriteKeys(strings.Join(words[:i+1], " "), speechProjects)
+		r.concierge.Heard(context.Background(), &r.exchange, r.exchange.AskerTurn)
 		time.Sleep(50 * time.Millisecond)
 	}
+}
+
+// sayTurn says turn as the Supervisor hands it over (heardTurn), then whole
+// to Answer.
+func sayTurn(r *rig, turn string, say voice.SayFunc) error {
+	heardTurn(r, turn)
 	return r.concierge.Answer(context.Background(), &r.exchange, transcript.WriteKeys(turn, speechProjects), say)
 }
 
 // TestAOneDigitKeyAtTheEndStopsTheSearchOfOlderWords: "what about infra"
 // settles into a search of "infra"; "7" makes it "what about infra 7", a
-// key the read-ahead holds for the next word, since more words may make it
-// speech. The search of the older words is stale, so it stops, as when new
-// words name a new target, and the answer reads INFRA-7 and searches
-// nothing. The live run of the fix saw the stale search reach Dispatch. It
-// fails if the held words leave the older search running.
+// key, so the read-ahead reads INFRA-7, and the search of the older words is
+// stale: it stops before it reaches Dispatch, as for any new target. The
+// answer reads INFRA-7 and searches nothing. It fails if the older search
+// reaches Dispatch.
 func TestAOneDigitKeyAtTheEndStopsTheSearchOfOlderWords(t *testing.T) {
 	r := speechRig(t)
 	r.records.issues["INFRA-7"] = &dispatch.Issue{Key: "INFRA-7", Title: "Realtime voice", Status: "todo", UpdatedAt: testNow.Add(-time.Hour)}
