@@ -196,15 +196,17 @@ func (c *Concierge) answer(parent context.Context, x *voice.Exchange, turn strin
 	// mean …?", "What is its key?", or the model's own) is decided first,
 	// before anything is said or read, on the room's whole reply: every
 	// final it said since the voice asked (voice.Exchange.Reply), or the
-	// turn when there is none. Side talk (sideTalkOn): nothing is said,
-	// read, searched or sent, and the Supervisor closes the exchange as it
-	// closes side talk in the follow-up window (Main's rule on R5's rewrite,
-	// and after Sol's fifth review of #191). Else, from the turn: a pick
-	// answers the question first asked, about that issue (R5); a key the
-	// voice offered picks it whatever the list says: that issue is real, the
-	// voice just offered it. A key said alone (saysKey) answers the question
-	// first asked, about that key (takeKey). A question is read exactly as
-	// with no offer pending.
+	// turn when there is none. Side talk (sideTalkOn), a reply that takes
+	// itself back included: nothing is said, read, searched or sent, and the
+	// Supervisor closes the exchange as it closes side talk in the follow-up
+	// window (Main's rule on R5's rewrite, and after Sol's fifth review of
+	// #191). Else, from the turn: a pick answers the question first asked,
+	// about that issue (R5); a key the voice offered picks it whatever the
+	// list says: that issue is real, the voice just offered it. A key said
+	// alone (saysKey) answers the question first asked, about that key
+	// (takeKey). A question is read exactly as with no offer pending; when
+	// the question was said before the turn, the whole reply is read
+	// (readsReply).
 	offer, offered := c.pendingOffer(x)
 	reply := x.Reply
 	if strings.TrimSpace(reply) == "" {
@@ -212,8 +214,11 @@ func (c *Concierge) answer(parent context.Context, x *voice.Exchange, turn strin
 	}
 	if offered && offer.sideTalkOn(view, reply) {
 		c.dropPick(x)
-		c.logger.Info("concierge took a reply to its own question for side talk: it picks nothing, says no key and asks nothing")
+		c.logger.Info("concierge took a reply to its own question for side talk: it picks nothing, says no key and asks nothing, or takes itself back")
 		return errSideTalk
+	}
+	if offered && offer.readsReply(turn, x.Reply) {
+		turn = x.Reply
 	}
 	// A key said letter by letter is read here, once, so the pick, the
 	// routing line, the search and the ask all see it.

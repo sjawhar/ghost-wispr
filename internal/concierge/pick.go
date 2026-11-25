@@ -8,6 +8,7 @@ import (
 	"unicode"
 
 	"github.com/sjawhar/ghost-wispr/internal/voice"
+	"github.com/sjawhar/ghost-wispr/internal/wake/transcript"
 )
 
 // offeredPick is what an answer asked the room after it (R5): with no one
@@ -118,12 +119,13 @@ func sideTalk(turn string) bool {
 }
 
 // sideTalkOn reports whether reply, the room's words in answer to p, is side
-// talk: it picks nothing (pick) and is sideTalk. Letters the view cannot
-// tell are read as the key they may be (everySpelledKey). reply is every
-// final the room said since the voice asked (voice.Exchange.Reply), so an
-// endpoint inside a statement cannot leave it only the statement's end, "can
-// wait" of "okay, ABC-12 can wait", which on its own asks; and a reply that
-// holds a question anywhere is a question (Main, after Sol's fifth review of
+// talk: it takes itself back (retracts), or it picks nothing (pick) and is
+// sideTalk. Letters the view cannot tell are read as the key they may be
+// (everySpelledKey). reply is every final the room said since the voice
+// asked (voice.Exchange.Reply), so an endpoint inside a statement cannot
+// leave it only the statement's end, "can wait" of "okay, ABC-12 can wait",
+// which on its own asks; and a reply that holds a question anywhere is a
+// question, unless it then takes it back (Main, after Sol's fifth review of
 // #191). A vendor's text is never read: it could neither be trusted to make
 // a reply side talk nor to make it a question.
 func (p *offeredPick) sideTalkOn(view projectsView, reply string) bool {
@@ -131,8 +133,50 @@ func (p *offeredPick) sideTalkOn(view projectsView, reply string) bool {
 	if unread {
 		written = everySpelledKey(written)
 	}
+	if retracts(written) {
+		return true
+	}
 	_, picks := p.pick(written)
 	return !picks && sideTalk(written)
+}
+
+// readsReply reports whether the answer to turn, a reply to p that is not
+// side talk, reads reply, the room's whole reply, rather than turn: the turn
+// is the reply's last part and picks nothing, says no key and asks nothing,
+// so the question the reply holds was said before it. "What about the
+// budget?" then "okay, sure" is answered as the question, not as "okay,
+// sure" (Main, before Sol's sixth review of #191).
+func (p *offeredPick) readsReply(turn, reply string) bool {
+	if strings.TrimSpace(reply) == "" || asks(turn) || saysKey(turn) {
+		return false
+	}
+	_, picks := p.pick(turn)
+	return !picks && asks(reply)
+}
+
+// retracts reports whether reply ends by taking itself back: its last
+// clause, after the words that may open one (clauseOpeners, replyFillers, a
+// no), is a stop or a never mind as the voice's commands read them
+// (transcript.CommandOf: "stop", "cancel", "enough", "never mind", "forget
+// it"). It answers nothing, as "Wispr, never mind" answers nothing; a
+// question said after it is the reply's last clause, and is answered.
+func retracts(reply string) bool {
+	clauses := strings.FieldsFunc(reply, func(r rune) bool { return strings.ContainsRune(",;:.!?", r) })
+	for i := len(clauses) - 1; i >= 0; i-- {
+		words := lowerWords(clauses[i])
+		if len(words) == 0 {
+			continue
+		}
+		for len(words) > 0 && (clauseOpeners[words[0]] || replyFillers[words[0]] || noWords[words[0]]) {
+			words = words[1:]
+		}
+		switch transcript.CommandOf(strings.Join(words, " ")) {
+		case transcript.Stop, transcript.NeverMind:
+			return len(words) > 0
+		}
+		return false
+	}
+	return false
 }
 
 // keyWords may frame a key said for "What is its key?", beside the words
