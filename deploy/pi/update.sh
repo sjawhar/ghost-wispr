@@ -598,24 +598,45 @@ leave_if_busy_before_restart() {
   exit 0
 }
 
+# timestamp_us TIMESTAMP prints a time that systemctl --timestamp=us+utc printed ("Wed 2026-11-25
+# 16:00:16.493752 UTC") in microseconds since the epoch, and file_time_us FILE the time FILE was
+# last written. Each reads the fraction itself, with date for the whole seconds alone: uutils date
+# (Ubuntu 26.04's date) prints %6N wrong for a fraction under 0.1 s, without its leading zeros
+# (0.050 s prints 500000).
+timestamp_us() {
+  local fraction seconds
+  [[ $1 =~ ^[A-Za-z]{3}\ ([0-9]{4}-[0-9]{2}-[0-9]{2}\ [0-9]{2}:[0-9]{2}:[0-9]{2})\.([0-9]{6})\ UTC$ ]] || return 1
+  fraction=${BASH_REMATCH[2]}
+  seconds=$(date -u -d "${BASH_REMATCH[1]} UTC" +%s 2>/dev/null) || return 1
+  [[ $seconds =~ ^[0-9]+$ ]] || return 1
+  printf '%s\n' "$((seconds * 1000000 + 10#$fraction))"
+}
+file_time_us() {
+  local stamp seconds fraction
+  stamp=$(LC_ALL=C find "$1" -maxdepth 0 -printf '%T@' 2>/dev/null) || return 1
+  [[ $stamp =~ ^([0-9]+)(\.([0-9]+))?$ ]] || return 1
+  seconds=${BASH_REMATCH[1]} fraction=${BASH_REMATCH[3]}000000
+  printf '%s\n' "$((seconds * 1000000 + 10#${fraction:0:6}))"
+}
+
 # restart_for_files_since_start restarts the recorder, once it is free, when .env or device.crt is
-# newer than the start of its main process (systemd's ExecMainStartTimestamp): a run cut short
-# after a refresh's swap and before its restart left the recorder on the old ones, and the next
-# runs find the files current. It checks the recorder's version as a refresh does, and rolls those
-# files back from their .prev copies when the recorder does not answer.
+# newer than the start of its main process (systemd's ExecMainStartTimestamp), to the microsecond:
+# a run cut short after a refresh's swap and before its restart left the recorder on the old ones,
+# and the next runs find the files current. It checks the recorder's version as a refresh does, and
+# rolls those files back from their .prev copies when the recorder does not answer.
 restart_for_files_since_start() {
   local started start_us name path mtime newer=()
   recorder_active || return 0
   started=$(systemctl --user show -p ExecMainStartTimestamp --timestamp=us+utc --value ghost-wispr.service 2>/dev/null) \
     || started=''
-  if [[ -z $started ]] || ! start_us=$(date -u -d "$started" +%s%6N 2>/dev/null) || [[ ! $start_us =~ ^[0-9]+$ ]]; then
+  if ! start_us=$(timestamp_us "$started"); then
     printf 'ghost-wispr update: could not read when ghost-wispr.service started (%s), so it is not restarted for an .env or a certificate installed since\n' \
       "${started:-no ExecMainStartTimestamp}"
     return 0
   fi
   for name in .env device.crt; do
     path=$(installed_path "$name")
-    if [[ -f $path ]] && mtime=$(date -r "$path" +%s%6N 2>/dev/null) && [[ $mtime =~ ^[0-9]+$ ]] && ((mtime > start_us)); then
+    if [[ -f $path ]] && mtime=$(file_time_us "$path") && ((mtime > start_us)); then
       newer+=("$name")
     fi
   done
