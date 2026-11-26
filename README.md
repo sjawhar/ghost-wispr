@@ -807,10 +807,31 @@ again.
 
 ## Deployment
 
-The office recorder runs a verified arm64 release binary on a Raspberry Pi 5. The Pi is
-provisioned from `deploy/pi/` and is managed through its user services and nightly updater.
-Follow the [office recorder Pi runbook](docs/pi-setup.md) for the required infrastructure
-outputs, credential bundle, provisioning command, tailnet join, and acceptance checks.
+The office recorder runs a Ghost Wispr release on a Raspberry Pi 5. Each release has the arm64
+binary and the Pi's deploy set, `ghost-wispr-pi-deploy.tar.gz`: the Pi's config, its deployment
+settings (`pi.env`), its units, its update scripts and `provision.sh`, with a `manifest.json` that
+gives the SHA-256 of each file and of the binary. `deploy/pi/build-deploy-tarball.sh` builds it in
+the release workflow.
+
+- A person provisions a new Pi on the Pi, from the release. `provision.sh --key` makes the Pi's key
+  and prints its certificate request. Once the infrastructure repository signs the request,
+  `provision.sh --certificate FILE` installs the certificate, and `provision.sh` writes the Google
+  credential files, installs the nightly update and joins the tailnet.
+- Each night from 03:30 to 06:00, while the recorder is free, the nightly update installs the latest
+  release's binary and config together, and puts the whole previous set back when the new release
+  does not answer. A launcher runs it under a 45-minute time limit. The update prints a line for each
+  install, hold and failure, and a drift line when a provisioning file or Tailscale Serve differs
+  from the release.
+- The Pi's Deepgram key and Dispatch token are in Secret Manager. The update and each start of the
+  recorder read them with `ghost-wispr pi-secrets`, and the settings page cannot change the
+  Deepgram key (`auth.read_only`).
+- Settings saved on the page stay in `ghost-wispr.local.yaml` ("Configuration"), which no release
+  changes.
+- `deploy/pi/check-deploy.sh`, run from a tailnet member device, checks that the Pi runs the latest
+  release and that the timer installed it.
+
+Follow the [office recorder Pi runbook](docs/pi-setup.md) for the infrastructure the Pi needs, the
+provisioning steps, the update's lines and the acceptance checks.
 
 ## API
 
