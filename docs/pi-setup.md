@@ -415,11 +415,14 @@ the latest version of the secret and up to nine versions under it, newest first,
 version that is disabled, destroyed or absent. It takes the newest version that is one PEM
 certificate, has the public key of the Pi's `key.pem`, ends later than the installed `device.crt`,
 and signs in to Google. `update.sh` installs that version while the recorder is free, with its
-version number in `/opt/ghost-wispr/device.crt.version`. It keeps `device.crt.prev` and
-`device.crt.version.prev`, restarts the recorder, and prints
+version number in `/opt/ghost-wispr/device.crt.version`. It keeps `device.crt.prev`, and
+`device.crt.version.prev` when the Pi has a version file, restarts the recorder, and prints
 `ghost-wispr update: installed certificate version <n>, not after <date>`. When the recorder does
-not answer after the restart, it puts both `.prev` copies back and exits 10. A rollback of a later
-release install leaves this certificate in place ("Update and inspect", step 6).
+not answer after the restart, it puts `device.crt.prev` back and exits 10. It puts
+`device.crt.version.prev` back with it, or, on a Pi that had no version file before, as before its
+first renewal (`provision.sh --certificate` writes none), it removes the new `device.crt.version`.
+A rollback of a later release install leaves this certificate in place ("Update and inspect",
+step 6).
 
 `update.sh` gives `pi-secrets` the installed version from `device.crt.version`, as
 `--installed-certificate-version`. When `latest` cannot be read because it is disabled, destroyed
