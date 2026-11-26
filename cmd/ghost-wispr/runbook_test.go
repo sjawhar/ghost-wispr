@@ -128,8 +128,10 @@ func TestRunbookClaimsTheNameFromAPersonsOwnDevice(t *testing.T) {
 // follow-up fix merges, or still says that a provisioning run rewrites .env.
 // It also fails if the release section does not say what a release does to
 // the Pi's .env override (the nightly update keeps every other line of .env),
-// or checks for the button off; or if "Pause and resume at the unit" drops the
-// rule that no other program opens the Jabra while the button is on.
+// does not check the value the recorder runs with (runbook_blocks_test.sh's
+// running-settings block) for jabra_mute_button: true, or checks for the
+// button off; or if "Pause and resume at the unit" drops the rule that no
+// other program opens the Jabra while the button is on.
 func TestTheJabraButtonIsOnInTheTemplateAndTheRunbook(t *testing.T) {
 	raw, err := os.ReadFile(filepath.Join("..", "..", "deploy", "pi", "files", "ghost-wispr.yaml"))
 	if err != nil {
@@ -152,7 +154,7 @@ func TestTheJabraButtonIsOnInTheTemplateAndTheRunbook(t *testing.T) {
 			}
 		}
 	}
-	for _, words := range []string{"GHOST_WISPR_JABRA_MUTE_BUTTON", "keeps every other line of `.env`", "jabra_mute_button: true", "ends in `true`"} {
+	for _, words := range []string{"GHOST_WISPR_JABRA_MUTE_BUTTON", "keeps every other line of `.env`", "`jabra_mute_button: true`", "<!-- runbook_blocks_test.sh: running-settings -->"} {
 		if !strings.Contains(release, words) {
 			t.Errorf("the runbook's %q does not say %q", releaseSection, words)
 		}
@@ -186,12 +188,20 @@ func TestRunbookInjectsSpeechThroughMicDevice(t *testing.T) {
 
 // TestRunbookChecksTheMicDeviceAfterARelease fails if the runbook's section on
 // a release that changes config does not name mic_device among the keys a
-// release changes, and its check: the Pi's config holds mic_device: J75.
+// release changes, or does not check the value the recorder runs with:
+// GHOST_WISPR_MIC_DEVICE in the recorder's environment, else the local
+// settings file, else the installed config, which runbook_blocks_test.sh's
+// running-settings block prints and which must read mic_device: J75. It also
+// fails if the section still greps ghost-wispr.yaml alone for mic_device,
+// which misses a value saved on the page or set in .env.
 func TestRunbookChecksTheMicDeviceAfterARelease(t *testing.T) {
 	section := runbookSection(t, releaseSection)
-	for _, words := range []string{"`mic_device`", "mic_device: J75"} {
+	for _, words := range []string{"`mic_device`", "`mic_device: J75`", "<!-- runbook_blocks_test.sh: running-settings -->", "GHOST_WISPR_MIC_DEVICE", "ghost-wispr.local.yaml"} {
 		if !strings.Contains(section, words) {
 			t.Errorf("the runbook's %q does not say %q", releaseSection, words)
 		}
+	}
+	if strings.Contains(section, "grep '^mic_device:' /opt/ghost-wispr/ghost-wispr.yaml") {
+		t.Errorf("the runbook's %q still reads mic_device from ghost-wispr.yaml alone", releaseSection)
 	}
 }
