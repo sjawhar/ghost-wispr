@@ -660,7 +660,12 @@ func TestAnUnreadSpelledKeyInSideTalkSaysNothing(t *testing.T) {
 // 1cbcb494): the Supervisor starts an answer and tells the read-ahead of the
 // same turn apart, so the read-ahead can come once the answer took its
 // count. It must then do nothing: one question makes at most maxSearches
-// searches, the answer's and the model's here.
+// searches, the answer's and the model's here. Each search is a keyword and
+// a full one; the keyword search runs in line and the full one beside it, and
+// a clear keyword match returns without it, so the full search may not have
+// reached the fake by the time the answer ends. The keyword searches are the
+// count: exactly the answer's and the model's. The full ones are at most
+// those two.
 func TestALateReadAheadDoesNotSearchForTheTurnAnswered(t *testing.T) {
 	const turn = "what is happening with realtime voice budget"
 	r := newRig(t)
@@ -679,8 +684,21 @@ func TestALateReadAheadDoesNotSearchForTheTurnAnswered(t *testing.T) {
 		}
 	}
 	answerTurn(t, r, turn)
-	if searches := r.records.searches(); len(searches) != maxSearches || searches[1] != "voice budget" {
-		t.Errorf("searches %q, want the answer's and the model's, %d in all", searches, maxSearches)
+	r.records.mu.Lock()
+	keyword := slices.Clone(r.records.kwQueries)
+	r.records.mu.Unlock()
+	if len(keyword) != maxSearches || keyword[1] != "voice budget" {
+		t.Errorf("keyword searches %q, want the answer's and the model's, %d in all", keyword, maxSearches)
+	}
+	full := r.records.searches()
+	turns := 0
+	for _, q := range full {
+		if q == turn {
+			turns++
+		}
+	}
+	if len(full) > maxSearches || turns > 1 || slices.ContainsFunc(full, func(q string) bool { return q != turn && q != "voice budget" }) {
+		t.Errorf("full searches %q, want at most the answer's and the model's", full)
 	}
 }
 
