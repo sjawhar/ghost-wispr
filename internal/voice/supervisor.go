@@ -411,6 +411,7 @@ type exchange struct {
 	wakeAt       time.Time
 	turn         []string // final words of the asker's turn
 	turnSeqs     []uint64 // each final's entry in the room's recent words, 0 for none
+	replySeqs    []uint64 // the same for ex.reply
 	interim      string   // the turn's words not final yet
 	timer        *time.Timer
 	said         bool
@@ -433,6 +434,10 @@ type exchange struct {
 	// askedBack: Wispr's last line asked a question ("Did you mean A or
 	// B?"), so the next utterance answers it and continues the exchange.
 	askedBack bool
+	// handedTurn is ex.x.Turn+1 of the turn last handed to an answer, 0 for
+	// none: while that turn is current, its words are no later answer's, and
+	// AskerTurn and Finals stay clear (Sol's eleventh review of #191).
+	handedTurn uint64
 	// times are when its wake and last turn were: R7's t0 for an answer to a
 	// question it asked. The Supervisor keeps the newest exchange's after it
 	// ends, and they hold no words.
@@ -1131,6 +1136,9 @@ func (s *Supervisor) onTranscriptLocked(t *Transcript) {
 				return // once, on the final: it cancels a question
 			}
 			if ex != nil && ex.answer == nil {
+				// The question it cancels leaves the room's recent words,
+				// as a take-back's does (Sol's eleventh review of #191).
+				s.neverMindTurnLocked(ex)
 				s.endLocked(ex, true, "Wispr, never mind")
 			}
 			s.neverMindLocked(s.cfg.Session())
@@ -1846,10 +1854,12 @@ func (s *Supervisor) turnLocked(ex *exchange, t *Transcript, words string) {
 			}
 			keep := min(len(ex.turnSeqs), len(ex.turn)-1)
 			ex.turnSeqs = append(ex.turnSeqs[len(ex.turnSeqs)-keep:], seq)
-			s.takeBackLocked(ex)
 			if ex.drives {
 				ex.reply = append(ex.reply, words)
+				keep = min(len(ex.replySeqs), len(ex.reply)-1)
+				ex.replySeqs = append(ex.replySeqs[len(ex.replySeqs)-keep:], seq)
 			}
+			s.takeBackLocked(ex)
 		}
 		ex.interim = ""
 		ex.turnFinal = true
@@ -1868,7 +1878,9 @@ func (s *Supervisor) turnLocked(ex *exchange, t *Transcript, words string) {
 	// takes its id as soon as there is one.
 	s.sessionLocked(ex)
 	turn := s.turnOf(ex)
-	ex.x.AskerTurn, ex.x.Finals = turn, finalsOf(ex)
+	if ex.handedTurn != ex.x.Turn+1 {
+		ex.x.AskerTurn, ex.x.Finals = turn, finalsOf(ex)
+	}
 	// A follow-up with no wake phrase may be side talk, which leaves the
 	// unit for nothing: it is read for only once it is the next turn.
 	if turn != "" && !ex.followUpTurn {
@@ -2050,7 +2062,7 @@ func (s *Supervisor) handTurnLocked(ex *exchange, signal turnSignal) {
 	x := ex.x
 	// A handed turn's words are no later answer's (Sol's tenth review of
 	// #191): a take-back in them cuts that turn alone.
-	ex.x.AskerTurn, ex.x.Finals = "", ""
+	ex.x.AskerTurn, ex.x.Finals, ex.handedTurn = "", "", ex.x.Turn+1
 	s.spawn(func() { s.answer(ex, &x, turn) })
 }
 
@@ -2969,11 +2981,17 @@ func (s *Supervisor) keepRecentLocked(t *Transcript, now time.Time) {
 // exchange's: no later answer, of this turn or of the next, hears words the
 // room cancelled (Main, after Sol's tenth review of #191). The final that
 // holds the take-back keeps what follows it; the finals after it stay.
+//
+// The words it cuts are the answer's (cutWords): after Wispr's question,
+// the room's whole reply since it, across the endpoints inside it, else the
+// turn. Only those finals' own entries change, never another speaker's or
+// another turn's matching words (Sol's eleventh review of #191).
 func (s *Supervisor) takeBackLocked(ex *exchange) {
 	if s.cfg.TakeBack == nil {
 		return
 	}
-	rest, taken := s.cfg.TakeBack(strings.Join(ex.turn, "\n"))
+	lines, seqs := ex.cutWords()
+	rest, taken := s.cfg.TakeBack(strings.Join(lines, "\n"))
 	if !taken {
 		return
 	}
@@ -2981,9 +2999,9 @@ func (s *Supervisor) takeBackLocked(ex *exchange) {
 	if rest != "" {
 		kept = len(strings.Split(rest, "\n"))
 	}
-	first := len(ex.turn) - kept // the final that holds the take-back
+	first := len(lines) - kept // the final that holds the take-back
 	texts := map[uint64]string{}
-	for i, seq := range ex.turnSeqs {
+	for i, seq := range seqs {
 		switch {
 		case seq == 0:
 		case i < first:
@@ -2992,8 +3010,45 @@ func (s *Supervisor) takeBackLocked(ex *exchange) {
 			texts[seq], _, _ = strings.Cut(rest, "\n")
 		}
 	}
+	s.dropRecentLocked(ex, texts)
+}
+
+// neverMindTurnLocked drops from the room's recent words the question
+// "Wispr, never mind" cancels: ex's turn not yet answered, whose finals the
+// answer would have read (cutWords).
+func (s *Supervisor) neverMindTurnLocked(ex *exchange) {
+	if ex.newTurn {
+		return // the voice spoke since: that turn was answered
+	}
+	_, seqs := ex.cutWords()
+	texts := map[uint64]string{}
+	for _, seq := range seqs {
+		if seq != 0 {
+			texts[seq] = ""
+		}
+	}
+	s.dropRecentLocked(ex, texts)
+}
+
+// dropRecentLocked gives the room's recent words, the Supervisor's and ex's,
+// the texts texts names (withTexts).
+func (s *Supervisor) dropRecentLocked(ex *exchange, texts map[uint64]string) {
+	if len(texts) == 0 {
+		return
+	}
 	s.recent = withTexts(s.recent, texts)
 	ex.x.Recent = withTexts(ex.x.Recent, texts)
+}
+
+// cutWords is the room's finals the answer cuts at a take-back, one an
+// element, and each one's entry in the room's recent words: after Wispr's
+// own question, for a voice that drives its turn, the whole reply since it
+// (Exchange.Reply), else the turn.
+func (ex *exchange) cutWords() ([]string, []uint64) {
+	if ex.drives && ex.askedBack && len(ex.reply) > 0 {
+		return ex.reply, ex.replySeqs
+	}
+	return ex.turn, ex.turnSeqs
 }
 
 // withTexts is recent, a new slice, with each entry texts names given its
@@ -3414,10 +3469,14 @@ func (t exchangeTools) Run(ctx context.Context, c ToolCall) (json.RawMessage, er
 	// followUpTurn waited for it.
 	s.mu.Lock()
 	x = t.ex.x
+	// The room's recent words as they are now, aged and cut: the exchange's
+	// copy is as old as the exchange (Sol's eleventh review of #191).
+	x.Recent = s.recentLocked()
 	// A handed turn's words are no later answer's: a vendor that asks again
 	// before the room's next words would get them, and a take-back in them
-	// would cut its new question (Sol's tenth review of #191).
-	t.ex.x.AskerTurn, t.ex.x.Finals = "", ""
+	// would cut its new question (Sol's tenth review of #191). They stay
+	// clear while that turn is current (handedTurn).
+	t.ex.x.AskerTurn, t.ex.x.Finals, t.ex.handedTurn = "", "", t.ex.x.Turn+1
 	x.FollowUpTurn = t.ex.followUpTurn
 	if askedBack {
 		x.Reply = replyOf(t.ex)

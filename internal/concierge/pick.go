@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 	"unicode"
+	"unicode/utf8"
 
 	"github.com/sjawhar/ghost-wispr/internal/voice"
 	"github.com/sjawhar/ghost-wispr/internal/wake/transcript"
@@ -200,23 +201,26 @@ var takeBacks = set([]string{"stop", "never mind", "nevermind", "cancel", "forge
 // ABC-12?" says the question. A clause with any other word, a question word
 // or a question mark is no take-back: "stop the rollout?", "never mind the
 // budget what about ABC-12?" (Sol's sixth review of #191, where a prefix
-// match took them for take-backs). Nor is a clause that holds a quote mark:
-// a quoted word is what the room is talking about, `did ABC-12, "Cancel",
-// ship?` (Sol's tenth review of #191). With no take-back, it is reply.
+// match took them for take-backs). Nor is a clause inside a quotation: a
+// quoted word or passage is what the room is talking about, `did ABC-12,
+// "Cancel", ship?` and `does ABC-12 show "Please, cancel, then retry"?`
+// (Sol's tenth and eleventh reviews of #191). Quotations are found over the
+// whole reply first (quotedSpans), across commas and finals, and a
+// take-back is a clause wholly outside them that holds no quote mark. With
+// no take-back, it is reply.
 func afterTakeBack(reply string) string {
+	quoted := quotedSpans(reply)
 	rest := reply
-	for clause := reply; clause != ""; {
-		end := strings.IndexAny(clause, ",;:.!?\n")
-		next := ""
-		if end < 0 {
-			end = len(clause)
-		} else {
-			next = clause[end+1:]
+	for start := 0; start < len(reply); {
+		end, next := len(reply), len(reply)
+		if i := strings.IndexAny(reply[start:], ",;:.!?\n"); i >= 0 {
+			end, next = start+i, start+i+1
 		}
-		if (end == len(clause) || clause[end] != '?') && !quotes(clause[:end]) && takesBack(clause[:end]) {
-			rest = next
+		clause := reply[start:end]
+		if (end == len(reply) || reply[end] != '?') && !inSpans(quoted, start, end) && !quotes(clause) && takesBack(clause) {
+			rest = reply[next:]
 		}
-		clause = next
+		start = next
 	}
 	return strings.TrimSpace(rest)
 }
@@ -240,16 +244,69 @@ func TakeBack(finals string) (rest string, taken bool) {
 	return rest, rest != strings.TrimSpace(finals)
 }
 
-// quotes reports whether clause holds a quote mark, straight or curly: a
-// double one anywhere, or a single one that opens or closes a word, not the
-// apostrophe inside one ("that's all").
-func quotes(clause string) bool {
-	if strings.ContainsAny(clause, "\"“”„«»") {
-		return true
+// quoteMark reports whether r is a quotation mark in Unicode's terms: the
+// Quotation_Mark property, or an initial or final punctuation mark (Pi,
+// Pf). That holds "“”‘’«»‹›„‚‟‛「」『』＂＇〝〞" and the rest.
+func quoteMark(r rune) bool {
+	return unicode.In(r, unicode.Quotation_Mark, unicode.Pi, unicode.Pf)
+}
+
+// quoteAt reports whether the mark at text[i:i+size] quotes, rather than
+// being an apostrophe inside a word ("that's", "don’t"), and whether it can
+// open a quotation: a word follows it.
+func quoteAt(text string, i, size int) (quotes, opens bool) {
+	prev, _ := utf8.DecodeLastRuneInString(text[:i])
+	next, nextSize := utf8.DecodeRuneInString(text[i+size:])
+	inWord := func(r rune) bool { return unicode.IsLetter(r) || unicode.IsDigit(r) }
+	if inWord(prev) && inWord(next) {
+		return false, false
 	}
-	for _, word := range strings.Fields(clause) {
-		for _, mark := range []string{"'", "‘", "’"} {
-			if strings.HasPrefix(word, mark) || strings.HasSuffix(word, mark) {
+	return true, nextSize > 0 && !unicode.IsSpace(next)
+}
+
+// quotedSpans are text's quotations, as byte ranges from the opening mark
+// through the closing one: a mark a word follows opens one, and the next
+// mark closes it, across commas, stops and lines. One left open runs to
+// text's end.
+func quotedSpans(text string) [][2]int {
+	var spans [][2]int
+	open := -1
+	for i, r := range text {
+		if !quoteMark(r) {
+			continue
+		}
+		size := utf8.RuneLen(r)
+		quotes, opens := quoteAt(text, i, size)
+		switch {
+		case !quotes:
+		case open >= 0:
+			spans, open = append(spans, [2]int{open, i + size}), -1
+		case opens:
+			open = i
+		}
+	}
+	if open >= 0 {
+		spans = append(spans, [2]int{open, len(text)})
+	}
+	return spans
+}
+
+// inSpans reports whether text[start:end] overlaps any of spans.
+func inSpans(spans [][2]int, start, end int) bool {
+	for _, span := range spans {
+		if start < span[1] && span[0] < end {
+			return true
+		}
+	}
+	return false
+}
+
+// quotes reports whether clause holds a quote mark (quoteMark) that is not
+// an apostrophe inside a word ("that's all").
+func quotes(clause string) bool {
+	for i, r := range clause {
+		if quoteMark(r) {
+			if quotes, _ := quoteAt(clause, i, utf8.RuneLen(r)); quotes {
 				return true
 			}
 		}
@@ -258,17 +315,17 @@ func quotes(clause string) bool {
 }
 
 // roomFinals is the room's raw words that a take-back is found on: the reply
-// to Wispr's question (voice.Exchange.Reply), else the turn's own finals
-// (voice.Exchange.Finals) when turn is that turn (AskerTurn), one a line,
-// else turn. A vendor's new question, asked before the room's next words,
-// is never cut by the take-back of the turn before (Sol's tenth review of
-// #191).
+// to Wispr's question (voice.Exchange.Reply), else the current turn's own
+// finals (voice.Exchange.Finals), one a line, else turn. The current turn's
+// finals decide even when a vendor words its question otherwise (Sol's
+// eleventh review of #191); the Supervisor clears them once it hands the
+// turn to an answer, so a vendor's next question is never cut by the turn
+// before (Sol's tenth review).
 func roomFinals(x *voice.Exchange, turn string) string {
-	if strings.TrimSpace(x.Reply) != "" {
-		return x.Reply
-	}
-	if strings.TrimSpace(x.Finals) != "" && strings.TrimSpace(turn) == strings.TrimSpace(x.AskerTurn) {
-		return x.Finals
+	for _, finals := range []string{x.Reply, x.Finals} {
+		if strings.TrimSpace(finals) != "" {
+			return finals
+		}
 	}
 	return turn
 }

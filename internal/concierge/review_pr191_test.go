@@ -110,16 +110,20 @@ func (d *cutDriver) Open(ctx context.Context, x *voice.Exchange) (voice.Session,
 	return s, nil
 }
 
-// turnsSeen is a Concierge that keeps the exchange of each Heard and Answer.
+// turnsSeen is a Concierge that keeps the exchange of each Heard and Answer,
+// and the words each Heard was given: a handed turn's late words come with
+// its AskerTurn cleared (Sol's eleventh review of #191).
 type turnsSeen struct {
 	*Concierge
 	mu              sync.Mutex
 	heard, answered []voice.Exchange
+	heardWords      []string
 }
 
 func (c *turnsSeen) Heard(ctx context.Context, x *voice.Exchange, words string) {
 	c.mu.Lock()
 	c.heard = append(c.heard, *x)
+	c.heardWords = append(c.heardWords, words)
 	c.mu.Unlock()
 	c.Concierge.Heard(ctx, x, words)
 }
@@ -137,7 +141,7 @@ func (c *turnsSeen) turns(words string) (heard, answered []uint64) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	for i := range c.heard {
-		if said := c.heard[i].AskerTurn; said != "" && strings.HasPrefix(words, strings.TrimRight(said, "?")) {
+		if said := c.heardWords[i]; said != "" && strings.HasPrefix(words, strings.TrimRight(said, "?")) {
 			heard = append(heard, c.heard[i].Turn)
 		}
 	}
