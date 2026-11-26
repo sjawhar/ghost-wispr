@@ -213,12 +213,12 @@ jobs:
       - name: Deploy script tests
         timeout-minutes: 20
         run: |
-          # provision.sh stages the bundle in the service user's runtime directory.
+          # provision.sh renders the credential files in the service user's runtime directory.
           sudo install -d -o "$(id -u)" -g "$(id -g)" -m 0700 "/run/user/$(id -u)"
-          for test in deploy/pi/provision_bundle_test.sh deploy/pi/provision_run_test.sh \
-            deploy/pi/provision_models_test.sh deploy/pi/update_test.sh deploy/pi/release_publish_test.sh \
+          for test in deploy/pi/update_test.sh deploy/pi/provision_run_test.sh deploy/pi/provision_models_test.sh \
+            deploy/pi/release_publish_test.sh deploy/pi/check_deploy_test.sh deploy/pi/runbook_blocks_test.sh \
             deploy/pi/accept_slice2_test.sh deploy/pi/workflow_pins_test.sh deploy/pi/claim_tailnet_name_test.sh \
             deploy/pi/accept_slice1_test.sh deploy/pi/wait_for_time_sync_test.sh deploy/pi/recording_times_test.sh \
-            deploy/pi/accept_voice_test.sh deploy/pi/rollout_test.sh; do
+            deploy/pi/accept_voice_test.sh; do
             bash "$test"
           done
