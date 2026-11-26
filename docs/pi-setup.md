@@ -303,7 +303,8 @@ restarts the recorder, and a restart ends a conversation that is being recorded.
    not change that. Give the tagged device its name with `deploy/pi/claim-tailnet-name.sh`, which
    needs `curl` and `jq`, and a Tailscale API access token. A tailnet admin makes the token on the
    [Keys](https://console.tailscale.com/admin/settings/keys) page of Tailscale's admin console,
-   with an expiry of 1 day. The block reads the token without showing it and gives it to that one
+   with an expiry of 1 day. Run the block in bash, as the blocks of "The Pi's secrets": zsh reads
+   `read -p` another way. The block reads the token without showing it and gives it to that one
    command alone, in its environment:
 
    <!-- runbook_blocks_test.sh: claim-name -->
@@ -938,11 +939,13 @@ A run of `update.sh`:
 
 1. Installs nothing and restarts nothing while the recorder is busy: while `/api/status` has a
    non-empty `active_session_id`, or a `call` whose `state` is not `none` (a Meet call that the call
-   bridge of dispatch://INFRA-5904 links to the Pi). Only the start of the run above can change a
-   file then. It reads the status before any change and again just before it swaps a file or
-   restarts the recorder, and prints
+   bridge of dispatch://INFRA-5904 links to the Pi). It reads the status before any change and again
+   just before it swaps a file or restarts the recorder, and prints
    `ghost-wispr update: active session; leaving the current release in place` (or the call's
-   state in place of `active session`). A later run of the night tries again.
+   state in place of `active session`). A later run of the night tries again. Two things can still
+   change a file while the recorder is busy: the start of the run above, and a run whose status
+   read just before the restart finds a session or a call. That run puts back the files it swapped
+   in, restarts nothing, and leaves the recorder running on the files it started with (step 6).
 2. Downloads the release's tarball, checks it against its `.sha256`, and checks each file against
    `manifest.json` and the manifest against the release's commit. It installs nothing when one does
    not match.
