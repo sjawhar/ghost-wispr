@@ -193,11 +193,13 @@ restartable() {
 }
 
 # wait_for_commit COMMIT returns once the recorder answers /api/version with COMMIT and /api/status
-# with a status that recorder_status accepts and busy_reason can read, a session or a call
-# included, within 120 s. A release whose state the update cannot read (no status, or a call it
-# cannot read) would stop each later run at its first status read, before it could install a fix.
+# with a status that recorder_status accepts, whose call is absent or an object with a state,
+# whether or not a session is in progress (R8), within 120 s. A release whose state the update
+# cannot read (no status, or a call it cannot read) would stop each later run at its first status
+# read, before it could install a fix. It reads the call itself: busy_reason reads the session
+# first, and so never reads the call during a session.
 wait_for_commit() {
-  local deadline answer commit status reason
+  local deadline answer commit status
   deadline=$(($(date +%s) + 120))
   while (($(date +%s) < deadline)); do
     answer=$(curl --connect-timeout 5 --max-time 10 --fail --silent --show-error "$VERSION_URL" 2>/dev/null) || answer=''
@@ -205,8 +207,8 @@ wait_for_commit() {
       commit=$(jq -r '.commit // empty' <<<"$answer" 2>/dev/null) || commit=''
       if [[ $commit == "$1" ]]; then
         status=$(recorder_status)
-        reason=$(busy_reason "$status")
-        if [[ -n $status && $reason != 'call unknown' && $reason != 'status unreadable' ]]; then
+        if [[ -n $status ]] && jq -e '.call == null or ((.call | type) == "object" and (.call.state | type) == "string")' \
+          >/dev/null 2>&1 <<<"$status"; then
           return 0
         fi
       fi
