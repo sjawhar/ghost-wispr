@@ -942,10 +942,12 @@ A run of `update.sh`:
    bridge of dispatch://INFRA-5904 links to the Pi). It reads the status before any change and again
    just before it swaps a file or restarts the recorder, and prints
    `ghost-wispr update: active session; leaving the current release in place` (or the call's
-   state in place of `active session`). A later run of the night tries again. Two things can still
-   change a file while the recorder is busy: the start of the run above, and a run whose status
-   read just before the restart finds a session or a call. That run puts back the files it swapped
-   in, restarts nothing, and leaves the recorder running on the files it started with (step 6).
+   state in place of `active session`). A later run of the night tries again. Three things can
+   still change a file while the recorder is busy: the start of the run above; a run whose status
+   read just before the restart finds a session or a call, which puts back the files it swapped in,
+   restarts nothing, and leaves the recorder running on the files it started with; and a rollback
+   after the restarted release fails its check, which puts the files back but does not restart a
+   recorder that reports a session or a call (step 6).
 2. Downloads the release's tarball, checks it against its `.sha256`, and checks each file against
    `manifest.json` and the manifest against the release's commit. It installs nothing when one does
    not match.
