@@ -300,8 +300,10 @@ restarts the recorder, and a restart ends a conversation that is being recorded.
      run installs the release's whole deploy set and reads the Pi's secrets ("Update and inspect").
      `provision.sh` prints the run's journal lines, and stops when the run failed;
    - enables `ghost-wispr.service`;
-   - applies each line of the release's `serve.conf` with `tailscale serve --bg --https`, and turns
-     off each live Serve HTTPS port that `serve.conf` does not list;
+   - applies each line of the release's `serve.conf` with `tailscale serve --bg --https`. It turns
+     off each live Serve HTTPS port that `serve.conf` does not list, and each mount other than `/`
+     on a port that it lists. Then it reads Serve again, and stops before the join when Serve still
+     holds a part that `serve.conf` does not, such as a TCP forward or Funnel;
    - starts the tagged tailnet join as a detached unit, with `PI_TAILNET_CLIENT_ID` and
      `PI_SERVICE_ACCOUNT_UNIQUE_ID`, or stops after "already joined" on a Pi that is joined as
      `tag:ghost-wispr` already.
@@ -347,9 +349,9 @@ restarts the recorder, and a restart ends a conversation that is being recorded.
 
    The status must show exactly `Tags: ["tag:ghost-wispr"]` and
    `DNSName: "ghost-wispr.tail12ec1c.ts.net."`, and `curl` must print the release's commit over a
-   valid certificate. If the certificate check fails, run `./provision.sh` again in the directory of
-   the release the Pi runs ("Update and inspect", "Apply a provisioning change"), which applies
-   `serve.conf` and stops after "already joined", and run `curl` again.
+   valid certificate. If the certificate check fails, run `./provision.sh` again ("Update and
+   inspect", "Apply a provisioning change"), which applies `serve.conf` and stops after "already
+   joined", and run `curl` again.
 
    `jq` prints `RouteAll`, the Pi's Tailscale setting that `--accept-routes` controls. It must read
    `true` after the join's route check accepted the routes, and `false` after the check refused
@@ -592,8 +594,10 @@ makes the same checks ("Update and inspect"). Remove the drop-in and run the ste
 
 Run it only from the release the Pi runs, which can be older than the latest release: the models
 step installs that release's `ghost-wispr.yaml`, and the Pi's binary must not run on a newer
-release's config. Enter that release's directory on the Pi as "Update and inspect", "The release
-the Pi runs" says. Then, in that release directory, run the models step with the shared drive's ID:
+release's config. `provision.sh --models` refuses the directory of another release than the one
+`deploy.verified` names, and names the commit the Pi runs. Enter that release's directory on the Pi
+as "Update and inspect", "The release the Pi runs" says. Then, in that release directory, run the
+models step with the shared drive's ID:
 
 <!-- runbook_blocks_test.sh: models -->
 ```bash
@@ -1006,11 +1010,11 @@ ssh ghost-wispr@ghost-wispr 'XDG_RUNTIME_DIR=/run/user/$(id -u) systemctl --user
 
 ### The release the Pi runs
 
-The models step and a provisioning change run `provision.sh` from the release the Pi runs, which
-can be older than the latest release: a busy night, a held release or a failed install leaves the
-Pi on an older one. When check 1 of `check-deploy.sh` passes, the Pi runs the latest release, and
-the directory of "Provision", step 1, is that release. Otherwise, on the Pi as `ghost-wispr`,
-download the release whose commit `/api/version` names:
+The models step runs `provision.sh --models` from the release the Pi runs ("Enable models and Drive
+sync"), which can be older than the latest release: a busy night, a held release or a failed install
+leaves the Pi on an older one. When check 1 of `check-deploy.sh` passes, the Pi runs the latest
+release, and the directory of "Provision", step 1, is that release. Otherwise, on the Pi as
+`ghost-wispr`, download the release whose commit `/api/version` names:
 
 <!-- runbook_blocks_test.sh: download-commit -->
 ```bash
@@ -1045,18 +1049,27 @@ repeats the page before it. When no release names the commit, it prints
 
 ### Apply a provisioning change
 
-On the Pi, enter the directory of the release the Pi runs ("The release the Pi runs"), and run
-`./provision.sh` there. Run it from no other release. `provision.sh` installs its own release's
-`update.sh`, `pi-lib.sh` and `pi.env` before it starts the update. From a newer release, those files
-would no longer be the set that `deploy.verified` lists, so the update would keep the older `.prev`
-copies, and a failed install of the newer release would roll the Pi back two releases. So
-`provision.sh` refuses when `deploy.verified` names another commit than its own release's, and a
-provisioning change of a new release is applied after the nightly update installs that release.
+On the Pi, download the release that carries the change, normally the latest ("Provision", step 1),
+and run `./provision.sh` in its directory. On a provisioned Pi it does what step 5 of "Provision"
+says: it writes no credential file and prints `credentials: same as pi.env renders`, or the names of
+the fields that differ. It installs the launcher, the update unit and timer, and the release's
+`update.sh`, `pi-lib.sh` and `pi.env`, starts the nightly update once, applies `serve.conf`, and
+stops after "already joined".
 
-On a provisioned Pi, `provision.sh` does what step 5 of "Provision" says: it writes no credential
-file and prints `credentials: same as pi.env renders`, or the names of the fields that differ. It
-installs the launcher, the update unit and timer, and the release's `update.sh`, `pi-lib.sh` and
-`pi.env`, starts the nightly update once, applies `serve.conf`, and stops after "already joined".
+The release can be newer than the one the Pi runs, as when it fixes a launcher, unit or timer that
+kept the nightly update from installing it. The nightly update keeps `.prev` copies only of the set
+that `deploy.verified` lists, and `provision.sh` installs its own release's files before it starts
+the update. So when it would replace `update.sh`, `pi-lib.sh` or `pi.env`, and the installed files
+are the set `deploy.verified` lists, `provision.sh` first copies that set and `.env` to their
+`.prev` copies, and prints
+`ghost-wispr provision: kept the set of commit <sha>, which the Pi runs, as its .prev copies, so a failed install of this release rolls back to it`.
+A failed install of the newer release then rolls back to the release the Pi runs. When the installed
+files are not that set, as after an install cut short, it prints
+`ghost-wispr provision: the installed files are not the set /opt/ghost-wispr/deploy.verified lists (<file> differs), so its .prev copies stay as they are`:
+those copies already hold the set verified last.
+
+The models step is the one exception: `provision.sh --models` runs only from the release the Pi runs
+("Enable models and Drive sync").
 
 ## A release that changes config
 
@@ -1083,9 +1096,8 @@ variables Ghost Wispr no longer reads, so that line stays through each release. 
 
 A release that changes a provisioning file (the launcher, `ghost-wispr-update.service`,
 `ghost-wispr-update.timer` or `serve.conf`) reaches the Pi only when a person runs that release's
-`provision.sh`, once the Pi runs that release ("Update and inspect", "Apply a provisioning
-change"). Until then, each night's run prints its drift line, and check 7 of `check-deploy.sh`
-fails.
+`provision.sh` ("Update and inspect", "Apply a provisioning change"). Until then, each night's run
+prints its drift line, and check 7 of `check-deploy.sh` fails.
 
 The morning after the release publishes, check it from a tailnet member device, in a checkout:
 
