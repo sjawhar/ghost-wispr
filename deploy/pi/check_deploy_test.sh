@@ -429,18 +429,18 @@ grep -qx 'BatchMode=yes' "$log/ssh-options" && grep -q '^ConnectTimeout=' "$log/
   || fail "the driver's ssh has no BatchMode=yes and ConnectTimeout: $(cat -- "$log/ssh-options" 2>/dev/null)"
 
 # S1's control: the Pi has the old commit and the old rule text, and the latest release changes a
-# recording rule. Check 1 (the commit) and check 2 (the rule text) both print FAIL in the one run.
-# Breaks it catches: a driver that stops at its first failing check, as rollout.sh check did, so
-# check 2 never prints; one that compares the running rules with the checkout's template, or with
-# the config installed on the Pi, which both hold the old text, instead of the release's tarball.
+# recording rule. Check 1 (the commit) and check 2 (the rule text) both print FAIL in the one run;
+# check 5 finds no install of the new commit, and the rest pass. Breaks it catches: a driver that
+# stops at its first failing check, as rollout.sh check did, so check 2 never prints; one that
+# compares the running rules with the checkout's template, or with the config installed on the Pi,
+# which both hold the old text, instead of the release's tarball.
 new_case "S1's control: the old commit and the old rule text"
 on_old
 run_driver
+expect_verdicts FAIL FAIL PASS PASS UNKNOWN PASS PASS
 expect 1 FAIL "$old" "$new"
 expect 2 FAIL recording_rules
 expect 5 UNKNOWN "$new"
-((rc == 1)) || fail "exit $rc, want 1: $out"
-[[ $(grep -cE '^check [0-9]+ (PASS|FAIL|UNKNOWN): ' <<<"$out") == 7 ]] || fail "the run did not print all seven checks: $out"
 
 # --release names the release to check instead of the latest. Break it catches: a driver that
 # ignores --release and checks the latest release, which a Pi that is meant to be on an older one
@@ -517,6 +517,21 @@ if not_root; then
   expect_verdicts PASS UNKNOWN PASS PASS PASS PASS PASS
   expect 2 UNKNOWN ghost-wispr.local.yaml
 fi
+# A model that differs is a FAIL even when check 2 cannot read another of its inputs, here recording
+# rules in the local settings file whose one rule runs onto a second line; the line names both. The
+# control is the same Pi with the model the template gives, whose check 2 is UNKNOWN. Breaks it
+# catches: a driver that prints UNKNOWN and so hides a difference it found; one that passes rules it
+# could not read.
+new_case 'a model that differs, and recording rules that cannot be read'
+printf 'recording_rules:\n    - A rule that runs\n      onto a second line.\n' >"$deploy/ghost-wispr.local.yaml"
+jq -c '.models.embedding = "vertex/other-embedding"' <<<"$new_config" >"$state/config.json"
+run_driver
+expect_verdicts PASS FAIL PASS PASS PASS PASS PASS
+expect 2 FAIL 'embedding runs' vertex/other-embedding 'cannot read recording_rules'
+printf '%s\n' "$new_config" >"$state/config.json"
+run_driver
+expect_verdicts PASS UNKNOWN PASS PASS PASS PASS PASS
+expect 2 UNKNOWN 'cannot read recording_rules'
 
 # Check 3: a provider that did not sign in, and one the template does not name, each fail. Breaks
 # it catches: a driver that lists the providers without reading ok; one that checks only the
@@ -531,13 +546,26 @@ jq -c '.providers += [{name: "gateway", ok: true, message: "works"}]' <<<"$good_
 run_driver
 expect_verdicts PASS PASS FAIL PASS PASS PASS PASS
 expect 3 FAIL gateway
-# A provider saved on the page is in the local settings file, and passes. Break it catches: a driver
-# whose check 3 fails for good on a Pi where a person added a provider on the page.
-new_case 'a provider saved on the page'
+# A provider the local settings file adds runs, since the recorder reads that file over the
+# template, and passes. Break it catches: a driver whose check 3 fails for good on a Pi whose local
+# settings file adds a provider.
+new_case 'a provider added to the local settings file'
 printf 'providers:\n    gateway:\n        api: openai\n' >"$deploy/ghost-wispr.local.yaml"
 jq -c '.providers += [{name: "gateway", ok: true, message: "works"}]' <<<"$good_providers" >"$state/providers.json"
 run_driver
 expect_verdicts PASS PASS PASS PASS PASS PASS PASS
+# The local settings file sets to null each provider the template names, and the Pi lists none: no
+# provider is left to check, which is no pass. Break it catches: a driver that applies the nulls and
+# then passes an empty list against an empty list.
+new_case 'a local settings file that removes every provider'
+{
+  echo 'providers:'
+  template_providers "$new_template" | sed 's/^/    /; s/$/: null/'
+} >"$deploy/ghost-wispr.local.yaml"
+printf '{"providers":[]}\n' >"$state/providers.json"
+run_driver
+expect_verdicts PASS PASS UNKNOWN PASS PASS PASS PASS
+expect 3 UNKNOWN 'no provider' ghost-wispr.local.yaml
 new_case 'GET /api/providers does not answer'
 rm -f -- "$state/providers.json"
 run_driver
@@ -719,10 +747,10 @@ expect_verdicts PASS UNKNOWN UNKNOWN PASS PASS PASS UNKNOWN
 expect 2 UNKNOWN ghost-wispr-pi-deploy.tar.gz
 
 # The driver runs from a tailnet member device and names no devbox: the box that once ran the Pi's
-# procedures is no part of them. Break it catches: a driver that reaches the Pi or a secret through
-# that box or its identity.
+# procedures is no part of them. The pattern is built from parts, so this file names none of them.
+# Break it catches: a driver that reaches the Pi or a secret through that box or its identity.
 name='no devbox'
 [[ -f $driver ]] || fail "no $driver"
-! grep -niE 'sami-devbox|dev-sjawhar@|devbox identity' -- "$driver" || fail "$driver names the devbox"
+! grep -niE 'sami''-devbox|dev''-sjawhar@|devbox identity' -- "$driver" || fail "$driver names the devbox"
 
 printf 'check-deploy tests passed\n'

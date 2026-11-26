@@ -198,7 +198,7 @@ readonly MODEL_SETTINGS=(
 
 # --- The release: its commit, and its deploy set, checked against its .sha256 and its manifest.
 
-commit=$release_commit release_json= release_error= tag=
+commit=$release_commit release_json='' release_error='' tag=''
 if [[ -n $release_commit ]]; then
   if list=$(curl -fsS --max-time 30 "$RELEASES_API?per_page=100" 2>"$tmp/release.err"); then
     release_json=$(jq -c --arg commit "$release_commit" 'if type == "array" then (map(select(.target_commitish == $commit)) | .[0] // empty) else error("not a list") end' \
@@ -224,7 +224,7 @@ readonly release_name="release ${tag:-of commit ${commit:-<unknown>}}"
 
 # load_deploy_set sets set_dir to the release's deploy set, unpacked and checked, or set_error to
 # why there is none.
-set_dir= set_error=
+set_dir='' set_error=''
 asset_url() { jq -r --arg name "$1" 'first(.assets[]? | select(.name == $name) | .browser_download_url) // ""' <<<"$release_json" 2>/dev/null; }
 load_deploy_set() {
   local tarball_url sum_url want got dir sum name bad=()
@@ -291,7 +291,7 @@ template() {
 
 # --- The Pi's local settings file, which checks 2 and 3 read: local_state is read, absent or error.
 
-local_settings= local_state= local_error=
+local_settings='' local_state='' local_error=''
 read_local_settings() {
   local status=0
   local_settings=$(pi "f=$(printf %q "$LOCAL_SETTINGS"); [ -e \"\$f\" ] || exit 3; cat -- \"\$f\"" 2>"$tmp/local.err") || status=$?
@@ -336,7 +336,7 @@ check_commit() {
 
 check_settings() {
   local config template_text template_flat local_flat entry role setting raw source want got status=0
-  local differences=() from_local=()
+  local differences=() unread=() from_local=()
   if [[ -z $set_dir ]]; then
     unknown 2 "no release template to compare the running settings with: $set_error"
     return 0
@@ -360,6 +360,7 @@ check_settings() {
   template_flat=$(flatten_yaml <<<"$template_text")
   local_flat=$(flatten_yaml <<<"$local_settings")
 
+  # Each model setting, from the local settings file when it sets it, else from the template.
   for entry in "${MODEL_SETTINGS[@]}"; do
     role=${entry%%=*} setting=${entry#*=}
     if [[ -n $local_flat ]] && has_setting "$local_flat" "$setting"; then
@@ -370,8 +371,8 @@ check_settings() {
       raw=$(setting_value "$template_flat" "$setting")
       source=template
       if [[ -z $raw ]]; then
-        unknown 2 "$release_name's template sets no $setting to compare the running $role with"
-        return 0
+        unread+=("$release_name's template sets no $setting to compare the running $role with")
+        continue
       fi
     fi
     want=$(yaml_scalar_json "$raw")
@@ -379,31 +380,33 @@ check_settings() {
     [[ $got == "$want" ]] || differences+=("$role runs $got, but the $source names $want ($setting)")
   done
 
+  # The recording rules, from the local settings file when it sets them, else from the template.
   source='local settings file'
   want=$(yaml_list recording_rules <<<"$local_settings") || status=$?
   if ((status == 3)); then
     source=template status=0
     want=$(yaml_list recording_rules <<<"$template_text") || status=$?
-    if ((status == 0)) && [[ $want == '[]' ]]; then
-      unknown 2 "$release_name's template has no recording rule to compare the running ones with"
-      return 0
-    fi
-  else
-    from_local+=(recording_rules)
   fi
   if ((status != 0)); then
-    unknown 2 "cannot read recording_rules in the $source item by item, one plain or quoted rule a line"
-    return 0
-  fi
-  got=$(jq -c '.recording_rules' <<<"$config")
-  if [[ $got != "$want" ]]; then
-    differences+=("recording_rules differ from the $source's: $(rules_difference "$got" "$want" "$source")")
+    unread+=("cannot read recording_rules in the $source item by item, one plain or quoted rule a line")
+  elif [[ $source == template && $want == '[]' ]]; then
+    unread+=("$release_name's template has no recording rule to compare the running ones with")
+  else
+    [[ $source == template ]] || from_local+=(recording_rules)
+    got=$(jq -c '.recording_rules' <<<"$config")
+    [[ $got == "$want" ]] \
+      || differences+=("recording_rules differ from the $source's: $(rules_difference "$got" "$want" "$source")")
   fi
 
-  local named=''
+  # A difference is a FAIL even when another setting could not be read: the line names both, as
+  # check 7's does. UNKNOWN only when nothing it read differs.
+  local named='' also=''
   ((${#from_local[@]} == 0)) || named=", with $(joined "${from_local[@]}") from the local settings file"
+  ((${#unread[@]} == 0)) || also="; and $(joined "${unread[@]}")"
   if ((${#differences[@]} > 0)); then
-    fails 2 "$(joined "${differences[@]}")$named"
+    fails 2 "$(joined "${differences[@]}")$named$also"
+  elif ((${#unread[@]} > 0)); then
+    unknown 2 "$(joined "${unread[@]}")$named"
   else
     pass 2 "each model setting and the recording rules run as $release_name's template gives them$named"
   fi
@@ -432,11 +435,17 @@ check_providers() {
     unknown 3 "$release_name's template names no provider"
     return 0
   fi
-  # The local settings file adds the providers saved on the page, and a null takes one away.
+  # The recorder reads the local settings file over the template (D13), so a provider it adds runs,
+  # and a null takes one away.
   if [[ $local_state == read ]]; then
     local_added=$(flatten_yaml <<<"$local_settings" | sed -nE 's/^providers\.([^.:]+):$/\1/p' | LC_ALL=C sort -u)
     local_removed=$(flatten_yaml <<<"$local_settings" | sed -nE 's/^providers\.([^.:]+): (null|~)$/\1/p' | LC_ALL=C sort -u)
     want=$(printf '%s\n' "$want" "$local_added" | grep . | LC_ALL=C sort -u | LC_ALL=C comm -23 - <(printf '%s\n' "$local_removed" | grep . || true))
+  fi
+  # An empty set to compare with is no pass, even when the Pi lists no provider either.
+  if [[ -z $want ]]; then
+    unknown 3 "no provider is left to check: the local settings file $LOCAL_SETTINGS sets to null each provider $release_name's template names"
+    return 0
   fi
   names=$(jq -r '.providers[].name' <<<"$providers" | LC_ALL=C sort -u)
   not_ok=$(jq -r '.providers[] | select(.ok != true) | "\(.name) did not sign in (\(.message // "no message"))"' <<<"$providers")
