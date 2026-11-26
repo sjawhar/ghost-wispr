@@ -94,12 +94,11 @@ func TestASavedConfigKeepsItsRecordingRules(t *testing.T) {
 	}
 }
 
-// TestASaveWritesTheRulesOverrideIntoTheLocalSettingsFile fails if a config
-// API save does not write the rules GHOST_WISPR_RECORDING_RULES gives into the
-// local settings file, where they stay once the variable is removed, as the
-// README, the examples and the OpenAPI spec say. The release config must not
-// change.
-func TestASaveWritesTheRulesOverrideIntoTheLocalSettingsFile(t *testing.T) {
+// TestASaveWritesTheRulesOverrideIntoTheFile fails if a config API save does
+// not write the rules GHOST_WISPR_RECORDING_RULES gives into the local
+// settings file, where they stay once the variable is removed, as the README,
+// the examples and the OpenAPI spec say. The release config must not change.
+func TestASaveWritesTheRulesOverrideIntoTheFile(t *testing.T) {
 	clearEnv(t)
 	path := writeConfig(t, "recording_rules:\n  - File rule.\n")
 	release, err := os.ReadFile(path)

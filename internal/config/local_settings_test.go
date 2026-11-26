@@ -142,7 +142,9 @@ func TestAPageSaveComparesWithTheReleaseConfigTheStoreLoaded(t *testing.T) {
 }
 
 // TestASaveEqualToTheReleaseConfigLeavesNoLocalSettings fails if a no-op page
-// save creates a local override that can hide a later release value.
+// save creates a local override that can hide a later release value, or if a
+// save that sets the last saved setting back to the release's value leaves the
+// local settings file in place.
 func TestASaveEqualToTheReleaseConfigLeavesNoLocalSettings(t *testing.T) {
 	clearEnv(t)
 	path := writeConfig(t, "silence_timeout: 30s\n")
@@ -155,6 +157,25 @@ func TestASaveEqualToTheReleaseConfigLeavesNoLocalSettings(t *testing.T) {
 	}
 	if _, err := os.Stat(LocalSettingsPath(path)); !os.IsNotExist(err) {
 		t.Fatalf("an equal page save created local settings: %v", err)
+	}
+
+	// A local settings file that exists: the store reads 45s from it, and a
+	// save of the release's 30s leaves no difference.
+	if err := os.WriteFile(LocalSettingsPath(path), []byte("silence_timeout: 45s\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	reopened, _, err := NewStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := reopened.Get().SilenceTimeout; got != "45s" {
+		t.Fatalf("silence_timeout from the local settings file = %q, want 45s", got)
+	}
+	if err := reopened.Update(func(c *Config) { c.SilenceTimeout = "30s" }); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(LocalSettingsPath(path)); !os.IsNotExist(err) {
+		t.Fatalf("a save equal to the release config left the local settings file: %v", err)
 	}
 }
 
