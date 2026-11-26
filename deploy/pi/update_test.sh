@@ -1685,17 +1685,15 @@ what='partial-install, cut short after the binary and the certificate, then a re
 rolled_back "$what" "$(printf 'sleep 2\n%.0s' {1..60} | head -c -1)" "$last_verified_line"
 expect_installed_is "$what" "$work_dir/before-a" device.crt device.crt.version
 cmp -s -- "$work_dir/verified-a" "$opt/deploy.verified" || fail "$what: changed deploy.verified"
-for busy in 'SESSION|active session'; do
-  what="partial-install, cut short after the binary and the certificate, then ${busy#*|} during the retry's reloads"
-  cut_short_pi
-  printf '%s\n' "${busy%%|*}" >"$state/status.after-system-reload"
-  release=b run_update
-  expect_run "$what" 10
-  expect_line_like "$what" "ghost-wispr update: ${busy#*|}; restored the last verified set, the one deploy\\.verified lists.*"
-  [[ $(restarts) == 0 ]] || fail "$what: restarted the recorder: $(<"$state/systemctl.log")"
-  expect_installed_is "$what" "$work_dir/before-a" "${set_files[@]}" .env ghost-wispr device.crt device.crt.version
-  cmp -s -- "$work_dir/verified-a" "$opt/deploy.verified" || fail "$what: changed deploy.verified"
-done
+what="partial-install, cut short after the binary and the certificate, then a session during the retry's reloads"
+cut_short_pi
+printf 'SESSION\n' >"$state/status.after-system-reload"
+release=b run_update
+expect_run "$what" 10
+expect_line_like "$what" 'ghost-wispr update: active session; restored the last verified set, the one deploy\.verified lists.*'
+[[ $(restarts) == 0 ]] || fail "$what: restarted the recorder: $(<"$state/systemctl.log")"
+expect_installed_is "$what" "$work_dir/before-a" "${set_files[@]}" .env ghost-wispr device.crt device.crt.version
+cmp -s -- "$work_dir/verified-a" "$opt/deploy.verified" || fail "$what: changed deploy.verified"
 
 begin same-commit-different-set
 # same-commit-different-set: deploy.verified names the release's commit, but an installed file of
