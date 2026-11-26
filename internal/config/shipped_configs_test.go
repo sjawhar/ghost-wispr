@@ -1,6 +1,7 @@
 package config
 
 import (
+	"encoding/json"
 	"maps"
 	"os"
 	"path/filepath"
@@ -46,6 +47,28 @@ func TestTheShippedConfigsLoadWithNoWarning(t *testing.T) {
 				t.Fatalf("%s loaded no providers or roles: %+v", path, cfg.Providers)
 			}
 		})
+	}
+}
+
+// TestThePiConfigMakesDeepgramsKeyDeploymentOwned fails if the Pi's loaded
+// provider configuration cannot serve Deepgram's api_key auth as read_only:
+// the settings page could offer to replace the Secret Manager key.
+func TestThePiConfigMakesDeepgramsKeyDeploymentOwned(t *testing.T) {
+	clearVoiceEnv(t)
+	cfg, _, err := Load(piConfigPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := json.Marshal(cfg.Providers["deepgram"].Auth)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var auth map[string]any
+	if err := json.Unmarshal(raw, &auth); err != nil {
+		t.Fatal(err)
+	}
+	if auth["kind"] != AuthAPIKey || auth["env"] != EnvPrefix+"DEEPGRAM_API_KEY" || auth["read_only"] != true {
+		t.Errorf("the Pi's served Deepgram auth = %s, want api_key from %sDEEPGRAM_API_KEY with read_only true", raw, EnvPrefix)
 	}
 }
 

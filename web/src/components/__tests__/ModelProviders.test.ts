@@ -29,6 +29,23 @@ function shownTime(at: string): string {
   return new Date(at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
 }
 
+// withDeepgramKeyReadOnly gives each render its own config, with the API's
+// read_only field explicit for the state it tests.
+function withDeepgramKeyReadOnly(readOnly: boolean): ConfigResponse {
+  const config: ConfigResponse = {
+    ...unitConfig,
+    providers: {
+      ...unitConfig.providers,
+      deepgram: {
+        ...unitConfig.providers.deepgram,
+        auth: { ...unitConfig.providers.deepgram.auth },
+      },
+    },
+  }
+  Object.assign(config.providers.deepgram.auth, { read_only: readOnly })
+  return config
+}
+
 describe('ModelProviders', () => {
   afterEach(() => {
     vi.unstubAllGlobals()
@@ -54,9 +71,9 @@ describe('ModelProviders', () => {
     }
   })
 
-  it('shows a key field only for a provider that signs in with a key, and why it fails', async () => {
+  it('shows an editable key field for a writable key provider, and why it fails', async () => {
     stubFetch()
-    render(ModelProviders, { config: unitConfig })
+    render(ModelProviders, { config: withDeepgramKeyReadOnly(false) })
 
     const r = await row('deepgram')
     expect(within(r).getByText('API key from EXAMPLE_DEEPGRAM_KEY')).toBeTruthy()
@@ -65,6 +82,20 @@ describe('ModelProviders', () => {
     expect(key.type).toBe('password')
     expect(key.placeholder).toBe('Not set')
     expect(screen.getAllByLabelText(/^Key for/)).toHaveLength(1)
+  })
+
+  it('says a deployment-owned key cannot be changed, with no key input', async () => {
+    stubFetch()
+    render(ModelProviders, { config: withDeepgramKeyReadOnly(true) })
+
+    const r = await row('deepgram')
+    expect(
+      within(r).getByText(
+        'This unit reads its key from its deployment. It cannot be changed here.',
+      ),
+    ).toBeTruthy()
+    expect(within(r).queryByLabelText('Key for deepgram')).toBeNull()
+    expect(within(r).queryByRole('button', { name: 'Save key' })).toBeNull()
   })
 
   it('says Works for a provider that answered the read its check made', async () => {
