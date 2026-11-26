@@ -187,7 +187,7 @@ has no providers.
 | `project`, `location` | Vertex AI only: the Google Cloud project (by default the project of a service-account credential file), and the location: `global` (the default), `us`, `eu` or a region such as `us-central1` |
 | `labels` | Vertex AI only: request labels, such as `owner: example-owner`, that each Gemini generate call on the provider carries (`generateContent` and `streamGenerateContent`: summaries, the Concierge and Gemini TTS); Vertex AI copies them into Cloud Billing for pay-as-you-go traffic. Each provider carries its own. Embeddings and the provider check carry none. Google's rules allow a key of 1 to 63 lowercase or international letters, digits, `_` or `-` that starts with a letter, a value of up to 63 of them, and at most 64 labels a call. Labels that break these rules warn at start, and are sent as written: Vertex AI answers such a call, but Cloud Billing may not attribute spend by them. Labels on another API warn at start, and its calls carry none |
 | `auth.kind` | How Ghost Wispr signs in, one of the kinds below |
-| `auth.read_only` | `api_key` only: `true` means the deployment owns the `auth.env` key. The settings page does not offer a key input, and a `provider_keys` PATCH for it returns 400 |
+| `auth.read_only` | `api_key` only: `true` means the deployment owns the `auth.env` key. The settings page does not offer a key input, and a `provider_keys` PATCH for it returns 400. On another `auth.kind` it does nothing, and the start warns |
 
 | `auth.kind` | What Ghost Wispr sends | Its settings |
 |-------------|------------------------|--------------|

@@ -120,7 +120,8 @@ type ProviderAuth struct {
 	// Env is the environment variable that holds an api_key provider's key.
 	Env string `yaml:"env,omitempty" json:"env,omitempty"`
 	// ReadOnly leaves an api_key provider's deployment-owned key out of
-	// settings changes.
+	// settings changes. Another kind holds no key, so there it does nothing,
+	// and validateProviders warns.
 	ReadOnly bool `yaml:"read_only,omitempty" json:"read_only,omitempty"`
 	// Audience is a google_id_token provider's ID token audience.
 	Audience string `yaml:"audience,omitempty" json:"audience,omitempty"`
@@ -432,6 +433,9 @@ func validateProviders(providers map[string]Provider) []string {
 			}
 		default:
 			warnings = append(warnings, fmt.Sprintf("%s.auth.kind %q is not a sign-in this build knows — use one of: %s.", at, a.Kind, strings.Join(AuthKinds, ", ")))
+		}
+		if a.ReadOnly && a.Kind != "" && a.Kind != AuthAPIKey {
+			warnings = append(warnings, fmt.Sprintf("%s.auth.read_only does nothing: only an api_key provider holds a key the settings could change, and %s signs in with %s — remove it.", at, at, a.Kind))
 		}
 	}
 	return warnings
