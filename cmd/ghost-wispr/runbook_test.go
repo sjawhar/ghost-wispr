@@ -198,9 +198,10 @@ func TestRunbookSaysHowThePiFindsARenewedCertificate(t *testing.T) {
 // also fails if "The Pi's secrets" still says that update.sh secrets changes
 // nothing but the four lines of .env, or does not say that it puts right a
 // certificate swap cut short, and if "Update and inspect" says a busy recorder
-// changes nothing, which the start-of-run repair does change, or does not say
-// that a session or a call found just before the restart puts the swapped
-// files back with no restart, which changes files while the recorder is busy.
+// changes nothing, which the start-of-run repair does change, or does not name
+// the two rollbacks that change files while the recorder is busy: a session
+// or a call found just before the restart, and a restarted release that fails
+// its check while a session runs, whose recorder the rollback does not restart.
 func TestRunbookSaysTheCertificatePairChangesAsOne(t *testing.T) {
 	section := runbookSection(t, "## Renew the X.509 certificate")
 	for _, words := range []string{"`/opt/ghost-wispr/device.crt.version.new`", "Then it renames the certificate over `device.crt`, then writes or removes `device.crt.version`, and then removes the journal", "A rollback puts the pair back the same way", "`update.sh secrets` too", "ghost-wispr update: finished the certificate swap that a run cut short: device.crt.version is <version>", "ghost-wispr update: removed /opt/ghost-wispr/device.crt.version.new, of a run cut short before its certificate went in; device.crt and device.crt.version stay as they are", "stages no certificate that does not end later than the installed `device.crt`"} {
@@ -228,8 +229,10 @@ func TestRunbookSaysTheCertificatePairChangesAsOne(t *testing.T) {
 	if strings.Contains(update, "Only the start of the run above can change a file then") {
 		t.Error(`the runbook's "Update and inspect" says only the start of a run changes a file while the recorder is busy; a run that finds a session or a call before its restart puts its swapped files back`)
 	}
-	if !strings.Contains(update, "a run whose status read just before the restart finds a session or a call") {
-		t.Error(`the runbook's "Update and inspect" does not say that a run whose status read just before the restart finds a session or a call changes files while the recorder is busy`)
+	for _, words := range []string{"Three things can still change a file while the recorder is busy", "a run whose status read just before the restart finds a session or a call", "a rollback after the restarted release fails its check"} {
+		if !strings.Contains(update, words) {
+			t.Errorf("the runbook's \"Update and inspect\" does not say %q", words)
+		}
 	}
 }
 
