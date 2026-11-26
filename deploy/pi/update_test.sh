@@ -1644,6 +1644,34 @@ restart_fails fail UNREADABLE IDLE
 rolled_back 'a new release that answers idle again' $'sleep 120\nsleep 120'
 restart_fails fail-stop STOPPED
 rolled_back 'a new release whose unit stopped' ''
+# The version check needs a status too: within the same 120 s, /api/status answers a status whose
+# call the update can read. A new release that answers its commit, but whose status holds a call
+# that is not an object, or whose /api/status fails, is rolled back: every file back, and
+# deploy.verified as it was. Break it catches: a check of /api/version alone, so deploy.verified
+# names a release whose state no later run can read, and each later run stops at its first status
+# read (a call it cannot read is busy, a status that fails a failure) before it could install a fix.
+for answer in '{"paused":false,"capture_state":"capturing","active_session_id":"","call":"live"}|a call that is not an object' \
+  'UNREADABLE|a failing /api/status'; do
+  what="rollback-whole-set (a new release that answers its commit, with ${answer#*|})"
+  new_pi
+  install_set a
+  save_installed "$work_dir/before-a"
+  cp -- "$opt/deploy.verified" "$work_dir/verified-a"
+  printf '%s\n' "${answer%%|*}" >"$state/status.after-restart"
+  release=b run_update
+  expect_run "$what" 10
+  expect_line_like "$what" "ghost-wispr update: the new release did not answer /api/version with commit $commit_b and /api/status with a status it could read within 120 s; restored the previous release's files, .*"
+  expect_no_output "$what" 'installed commit'
+  expect_installed_is "$what" "$work_dir/before-a"
+  cmp -s -- "$work_dir/verified-a" "$opt/deploy.verified" || fail "$what: changed deploy.verified"
+done
+# Control: a recorder that answers a session once it runs the new release gives a status the update
+# reads, and the release verifies.
+new_pi
+install_set a
+printf 'SESSION\n' >"$state/status.after-restart"
+release=b run_update
+expect_run 'rollback-whole-set control (a session after the restart)' 0 "ghost-wispr update: installed commit $commit_b (invocation test-invocation-7)"
 
 begin partial-install
 # partial-install: an update cut short mid-swap (a power cut, or the launcher's time limit) leaves
@@ -1673,10 +1701,11 @@ release=broken run_update
 rolled_back 'partial-install, then a release that fails' "$(printf 'sleep 2\n%.0s' {1..60} | head -c -1)" "$last_verified_line"
 # An install of b cut short after it swapped in the binary and a new certificate, with its version
 # file: the retry stages no certificate (pi-secrets finds the installed one current) and swaps in
-# neither, so a rollback of this run's swaps alone would leave a certificate that nothing verified.
-# A retry that finds the set not the verified one restores every file with a .prev copy, the
-# certificate and its version file included, and a busy Pi gets the same; each run exits 10 and
-# says the last verified set went back.
+# neither. A retry that finds the set not the verified one restores every file of the set and .env
+# that has a .prev copy, and a busy Pi gets the same; each run exits 10 and says the last verified
+# set went back. The certificate and its version file stay: a run puts them back only to undo its
+# own swap of them, and pi-secrets found this one newer and signing in. Break it catches: a rollback
+# that puts back device.crt.prev for a run that never swapped device.crt.
 cut_short_pi() {
   local file
   new_pi
@@ -1696,7 +1725,8 @@ touch -- "$state/version-mute.after-restart"
 release=b run_update
 what='partial-install, cut short after the binary and the certificate, then a retry that fails'
 rolled_back "$what" "$(printf 'sleep 2\n%.0s' {1..60} | head -c -1)" "$last_verified_line"
-expect_installed_is "$what" "$work_dir/before-a" device.crt device.crt.version
+[[ $(<"$opt/device.crt") == 'NEW CERTIFICATE' ]] && cmp -s -- <(printf '2\n') "$opt/device.crt.version" \
+  || fail "$what: device.crt is [$(<"$opt/device.crt")] and device.crt.version [$(<"$opt/device.crt.version")]; want the cut-short run's NEW CERTIFICATE and 2, which this run never swapped"
 cmp -s -- "$work_dir/verified-a" "$opt/deploy.verified" || fail "$what: changed deploy.verified"
 what="partial-install, cut short after the binary and the certificate, then a session during the retry's reloads"
 cut_short_pi
@@ -1705,8 +1735,36 @@ release=b run_update
 expect_run "$what" 10
 expect_line_like "$what" 'ghost-wispr update: active session; restored the last verified set, the one deploy\.verified lists.*'
 [[ $(restarts) == 0 ]] || fail "$what: restarted the recorder: $(<"$state/systemctl.log")"
-expect_installed_is "$what" "$work_dir/before-a" "${set_files[@]}" .env ghost-wispr device.crt device.crt.version
+expect_installed_is "$what" "$work_dir/before-a" "${set_files[@]}" .env ghost-wispr
+[[ $(<"$opt/device.crt") == 'NEW CERTIFICATE' ]] && cmp -s -- <(printf '2\n') "$opt/device.crt.version" \
+  || fail "$what: device.crt is [$(<"$opt/device.crt")] and device.crt.version [$(<"$opt/device.crt.version")]; want the cut-short run's NEW CERTIFICATE and 2, which this run never swapped"
 cmp -s -- "$work_dir/verified-a" "$opt/deploy.verified" || fail "$what: changed deploy.verified"
+# A run that the launcher's limit killed, with SIGKILL past its 60 s grace, leaves its staging
+# directory in the deploy directory, which can hold the secrets that run read. Each run removes, at
+# its start, such a directory older than 46 minutes, the launcher's limit and its grace; a younger
+# one may belong to a run still going, such as update.sh secrets in a start of the recorder, and
+# stays, as does an old directory of another name. Breaks they catch: no clean-up, so each killed
+# run leaves its secrets on the Pi for good; a clean-up that removes a directory a live run uses.
+# stale_stages_pi makes a Pi on release b with a staging directory 47 minutes old that holds a
+# secrets.env, one 45 minutes old, and a directory of another name 400 days old.
+stale_stages_pi() {
+  local now=${EPOCHREALTIME%[.,]*}
+  new_pi
+  install_set b
+  mkdir -p -- "$opt/.ghost-wispr-update.K1lled/secrets" "$opt/.ghost-wispr-update.K1lled/new" \
+    "$opt/.ghost-wispr-update.Y0ung1/new" "$opt/notes-2025"
+  printf '%s\n' GHOST_WISPR_DEEPGRAM_API_KEY=dg-stale >"$opt/.ghost-wispr-update.K1lled/secrets/secrets.env"
+  touch -d "@$((now - 47 * 60))" -- "$opt/.ghost-wispr-update.K1lled"
+  touch -d "@$((now - 45 * 60))" -- "$opt/.ghost-wispr-update.Y0ung1"
+  touch -d "@$((now - 400 * 24 * 3600))" -- "$opt/notes-2025"
+}
+stale_stages_pi
+release=b run_update
+expect_run 'partial-install, staging directories left behind' 0 "ghost-wispr update: already current at commit $commit_b"
+[[ ! -e $opt/.ghost-wispr-update.K1lled ]] \
+  || fail 'partial-install: kept a staging directory 47 minutes old, with the secrets of the run that left it'
+[[ -d $opt/.ghost-wispr-update.Y0ung1 && -d $opt/notes-2025 ]] \
+  || fail "partial-install: removed a staging directory 45 minutes old, which a live run may use, or a directory of another name: $(cd -- "$opt" && find . -maxdepth 1 -type d | LC_ALL=C sort | paste -sd ' ')"
 
 begin same-commit-different-set
 # same-commit-different-set: deploy.verified names the release's commit, but an installed file of
@@ -1795,6 +1853,34 @@ release=b run_update
 expect_run 'transition, a second try' 0 "ghost-wispr update: installed commit $commit_b (invocation test-invocation-7)"
 [[ $(<"$opt/ghost-wispr.yaml.before-release-config") == 'the config before the first try' ]] \
   || fail 'transition, a second try: replaced the before-release-config a first try kept'
+# The first run with no deploy.verified and the recorder stopped (a Pi that rebooted into a failed
+# start, or a person's stop) cannot read which image runs. When ghost-wispr.verified, the old
+# update.sh's record, names the installed binary, that binary ran and answered its commit, and the
+# old update.sh's ghost-wispr.prev is the binary before it: the installed files are kept as the
+# .prev copies, as for a recorder that runs the installed binary, and a rollback puts them back.
+# When it names another binary, nothing shows which binary ghost-wispr.prev is: it goes before the
+# swap, and a rollback leaves the binary as installed. Break it catches: a rollback that restores
+# the old update.sh's leftover ghost-wispr.prev, a binary older than the one the Pi ran.
+old_pi
+rm -f -- "$state/active"
+save_installed "$work_dir/before-old"
+release=broken run_update
+what='transition, the recorder stopped and ghost-wispr.verified naming the installed binary, then a release that fails'
+cmp -s -- "$work_dir/before-old/ghost-wispr" "$opt/ghost-wispr" \
+  || fail "$what: the installed binary is not the one the Pi had: $(head -n 3 -- "$opt/ghost-wispr" | paste -sd ' ')"
+expect_run "$what" 10
+expect_line_like "$what" 'ghost-wispr update: .*; restored the previous release'
+expect_installed_is "$what" "$work_dir/before-old"
+old_pi
+rm -f -- "$state/active"
+sha "$releases/a/ghost-wispr-linux-arm64" >"$opt/ghost-wispr.verified"
+release=broken run_update
+what='transition, the recorder stopped and ghost-wispr.verified naming another binary, then a release that fails'
+[[ ! -e $opt/ghost-wispr.prev ]] && cmp -s -- "$releases/broken/ghost-wispr-linux-arm64" "$opt/ghost-wispr" \
+  || fail "$what: want ghost-wispr.prev gone and the release's binary left installed; the installed binary: $(head -n 3 -- "$opt/ghost-wispr" | paste -sd ' ')"
+expect_run "$what" 10
+expect_line_like "$what" 'ghost-wispr update: ghost-wispr\.service is stopped, and .*/ghost-wispr\.verified does not name the installed binary, .*ghost-wispr\.prev.*'
+expect_line_like "$what" 'ghost-wispr update: .*no previous release to restore.*'
 
 begin no-binary-yet
 # no-binary-yet: a new Pi as provision.sh leaves it before its first update: update.sh, pi-lib.sh,
@@ -1837,17 +1923,20 @@ expect_set_of 'no-binary-yet, a binary that never answers' broken
 [[ $(restarts) == 1 ]] || fail "no-binary-yet, a binary that never answers: restarted the recorder again with nothing restored: $(<"$state/systemctl.log")"
 
 begin prev-copy-by-rename
-# prev-copy-by-rename: the launcher runs update.sh.prev when update.sh is broken, and that run
-# replaces update.sh.prev with the set it keeps. bash reads a script while it runs it, so a copy
-# over update.sh.prev in place would have the running copy go on in the middle of other text; a
-# rename leaves it reading its own file to its last line.
+# prev-copy-by-rename: bash reads a script while it runs it, so a file that a run replaces while a
+# copy of it runs goes in place by a rename, which leaves the running copy reading its own file to
+# its last line. The fallback, update.sh.prev, which the launcher runs when update.sh breaks,
+# replaces neither update.sh.prev nor pi-lib.sh.prev (see the launcher case), and reads its own file
+# to its end as it installs a release. update.sh itself reads its own file to its last line while
+# the install renames the release's update.sh over it, and keeps the update.sh that ran as
+# update.sh.prev, by a copy to a temporary name and a rename.
 new_pi
 make_release long "$commit_a"
 {
   head -n1 "$repo_root/deploy/pi/update.sh"
   for ((i = 0; i < 400; i++)); do printf '# a longer update.sh than the copy that runs\n'; done
   tail -n +2 "$repo_root/deploy/pi/update.sh"
-  printf '# release long\n'
+  printf '%s\n' "printf 'update.sh: ran to its own last line\\n'" '# release long'
 } >"$releases/long/ghost-wispr-pi-deploy/update.sh"
 pack_release long
 install_set long
@@ -1855,14 +1944,25 @@ cp -- "$repo_root/deploy/pi/update.sh" "$opt/update.sh.prev"
 printf '%s\n' "printf 'update.sh.prev: ran to its own last line\\n'" >>"$opt/update.sh.prev"
 chmod 0755 "$opt/update.sh.prev"
 cp -p -- "$opt/pi-lib.sh" "$opt/pi-lib.sh.prev"
+cp -p -- "$opt/update.sh.prev" "$work_dir/fallback-update.sh"
+cp -p -- "$opt/pi-lib.sh.prev" "$work_dir/fallback-pi-lib.sh"
 updater=$opt/update.sh.prev release=b run_update
 expect_run prev-copy-by-rename 0 "ghost-wispr update: installed commit $commit_b (invocation test-invocation-7)"
 [[ $(tail -n1 <<<"$out") == 'update.sh.prev: ran to its own last line' && $(grep -c 'installed commit' <<<"$out") == 1 ]] \
   || fail "prev-copy-by-rename: the running update.sh.prev did not read its own file to its end: $out"
 expect_no_output prev-copy-by-rename 'already current'
+cmp -s -- "$work_dir/fallback-update.sh" "$opt/update.sh.prev" && cmp -s -- "$work_dir/fallback-pi-lib.sh" "$opt/pi-lib.sh.prev" \
+  || fail 'prev-copy-by-rename: the fallback replaced update.sh.prev or pi-lib.sh.prev, the scripts that ran'
+expect_set_of prev-copy-by-rename b
+new_pi
+install_set long
+release=b run_update
+expect_run 'prev-copy-by-rename (update.sh)' 0 "ghost-wispr update: installed commit $commit_b (invocation test-invocation-7)"
+[[ $(tail -n1 <<<"$out") == 'update.sh: ran to its own last line' ]] \
+  || fail "prev-copy-by-rename: the running update.sh did not read its own file to its end: $out"
 cmp -s -- "$releases/long/ghost-wispr-pi-deploy/update.sh" "$opt/update.sh.prev" \
   || fail 'prev-copy-by-rename: update.sh.prev is not the update.sh installed before'
-expect_set_of prev-copy-by-rename b
+expect_set_of 'prev-copy-by-rename (update.sh)' b
 
 # ---------------------------------------------------------------------------------------------------
 # busy-session and busy-call: while the recorder records a session, or holds a call (INFRA-5904's
@@ -1978,6 +2078,48 @@ held_control 'no link_versions in the manifest' "$link_status" ''
 held_control 'no call in the status' IDLE '[1]'
 held_control 'no link versions in the call' \
   '{"paused":false,"capture_state":"capturing","active_session_id":"","call":{"state":"none","link_versions":[]}}' '[1]'
+# A held release still lets the release the Pi runs take new secrets and a renewed certificate (R9,
+# R11): the run refreshes them as for the release it runs, the one deploy.verified names, and
+# changes no file of the deploy set. Break it catches: a hold that ends the run at once, so a Pi
+# whose bridge waits for a newer release keeps a replaced key, or its certificate to its end.
+new_pi
+install_set a
+printf '1\n' >"$opt/device.crt.version"
+printf '%s\n' "$link_status" >"$state/status"
+printf '%s\n' GHOST_WISPR_DEEPGRAM_API_KEY=dg-test-2 GHOST_WISPR_DISPATCH_TOKEN=tok-test-2 >"$state/secrets"
+printf 'NEW CERTIFICATE\n' >"$state/certificate"
+link_versions='[1]' pack_release linked
+save_installed "$work_dir/before-a"
+cp -- "$opt/deploy.verified" "$work_dir/verified-a"
+release=linked run_update
+what='held-link-versions, new secrets and a newer certificate'
+expect_run "$what" 0 'ghost-wispr update: held: the bridge accepts link versions [2], this release [1]' \
+  'ghost-wispr update: installed secrets' 'ghost-wispr update: installed certificate version 2, not after 2027-11-26T00:00:00Z'
+expect_no_output "$what" 'installed commit'
+expect_installed_is "$what" "$work_dir/before-a" "${set_files[@]}" ghost-wispr
+cmp -s -- "$work_dir/verified-a" "$opt/deploy.verified" || fail "$what: changed deploy.verified"
+expect_env "$what" GHOST_WISPR_ADDR=127.0.0.1:8080 GOOGLE_API_USE_CLIENT_CERTIFICATE=false \
+  GHOST_WISPR_DEEPGRAM_API_KEY=dg-test-2 GHOST_WISPR_DISPATCH_TOKEN=tok-test-2 GHOST_WISPR_JABRA_MUTE_BUTTON=false
+[[ $(<"$opt/device.crt") == 'NEW CERTIFICATE' ]] && cmp -s -- <(printf '2\n') "$opt/device.crt.version" \
+  || fail "$what: did not install the newer certificate with its version"
+[[ $(restarts) == 1 ]] && grep -Fqx "restart binary=$(sha "$opt/ghost-wispr") env=$(sha "$opt/.env") config=$(sha "$opt/ghost-wispr.yaml") crt=$(sha "$opt/device.crt")" "$state/systemctl.log" \
+  || fail "$what: did not restart the recorder once on the new .env and certificate: $(<"$state/systemctl.log")"
+grep -Fqx "binary $opt/ghost-wispr" "$state/pi-secrets.log" \
+  || fail "$what: pi-secrets did not run from the installed binary: $(<"$state/pi-secrets.log")"
+# A drop-in refuses that refresh as it refuses an install (R7), and nothing changes.
+new_pi
+install_set a
+mkdir -p -- "$units/ghost-wispr.service.d"
+printf '[Service]\nEnvironment=GHOST_WISPR_CONFIG=/tmp/other.yaml\n' >"$units/ghost-wispr.service.d/override.conf"
+printf '%s\n' "$link_status" >"$state/status"
+printf '%s\n' GHOST_WISPR_DEEPGRAM_API_KEY=dg-test-2 GHOST_WISPR_DISPATCH_TOKEN=tok-test-2 >"$state/secrets"
+link_versions='[1]' pack_release linked
+before=$(snapshot)
+release=linked run_update
+what='held-link-versions, new secrets and a drop-in'
+expect_run "$what" 10 "ghost-wispr update: ghost-wispr.service has a drop-in ($units/ghost-wispr.service.d/override.conf); nothing was installed"
+expect_unchanged "$what" "$before"
+[[ $(restarts) == 0 ]] || fail "$what: restarted the recorder"
 
 begin bad-manifest
 # bad-manifest: a release that does not verify installs nothing and fails: a file whose SHA-256 is
@@ -2310,6 +2452,49 @@ expect_installed_is 'release-and-certificate, a release that fails' "$work_dir/b
 [[ $(<"$opt/device.crt") == 'INSTALLED CERTIFICATE' ]] || fail 'a release that fails: did not restore device.crt with the set'
 expect_installed_is 'release-and-certificate, a release that fails' "$work_dir/before-a" device.crt.version
 [[ $(restarts) == 2 ]] || fail "a release that fails: want the install's and the rollback's restarts: $(<"$state/systemctl.log")"
+# A certificate goes back from device.crt.prev only to undo the run's own swap of it. A refresh of
+# the release the Pi runs installed C1, with C0, the certificate before it, as device.crt.prev; then
+# a newer release fails its version check, from a set that deploy.verified lists, and from one it
+# does not (pi.env edited on the Pi), whose rollback restores each file of the set that has a .prev
+# copy: device.crt stays C1, and device.crt.version 2. When that release stages C2 too, its rollback
+# puts back C1, the certificate installed before it, not C0. Breaks they catch: a rollback that puts
+# back device.crt.prev for a run that never swapped device.crt, so the Pi goes back to C0, the older
+# certificate, nearer its end; a staged certificate that leaves an older device.crt.prev as it is.
+# refreshed_certificate_pi WHAT: a Pi on release a, with .prev copies of its set as an install keeps
+# them, whose refresh installed C1 (version 2) over C0 (version 1).
+refreshed_certificate_pi() {
+  local file
+  new_pi
+  install_set a
+  printf '1\n' >"$opt/device.crt.version"
+  for file in "${set_files[@]}" .env ghost-wispr; do
+    cp -p -- "$(installed_path "$file")" "$opt/$file.prev"
+  done
+  printf 'C1\n' >"$state/certificate"
+  release=a run_update
+  expect_run "$1 (the refresh)" 0 'ghost-wispr update: installed certificate version 2, not after 2027-11-26T00:00:00Z'
+  [[ $(<"$opt/device.crt") == C1 && $(<"$opt/device.crt.prev") == 'INSTALLED CERTIFICATE' ]] \
+    || fail "$1: the refresh did not install C1 with C0 as device.crt.prev"
+  rm -f -- "$state/certificate"
+}
+for history in 'a set that deploy.verified lists' 'a set that deploy.verified does not list'; do
+  what="release-and-certificate, a refresh of C1, then a release that fails, from $history"
+  refreshed_certificate_pi "$what"
+  if [[ $history == *'does not list' ]]; then printf '# edited on the Pi\n' >>"$opt/pi.env"; fi
+  release=broken run_update
+  expect_run "$what" 10
+  expect_line_like "$what" 'ghost-wispr update: .*; restored .*'
+  [[ $(<"$opt/device.crt") == C1 ]] && cmp -s -- <(printf '2\n') "$opt/device.crt.version" \
+    || fail "$what: device.crt is [$(<"$opt/device.crt")] and device.crt.version [$(<"$opt/device.crt.version")]; want C1 and 2, which the refresh installed"
+done
+what='release-and-certificate, a refresh of C1, then a release that stages C2 and fails, from a set that deploy.verified does not list'
+refreshed_certificate_pi "$what"
+printf '# edited on the Pi\n' >>"$opt/pi.env"
+printf 'C2\n' >"$state/certificate"
+release=broken run_update
+expect_run "$what" 10
+[[ $(<"$opt/device.crt") == C1 ]] && cmp -s -- <(printf '2\n') "$opt/device.crt.version" \
+  || fail "$what: device.crt is [$(<"$opt/device.crt")] and device.crt.version [$(<"$opt/device.crt.version")]; want C1 and 2, the certificate installed before the release"
 
 begin secrets-mode
 # secrets-mode: `update.sh secrets`, the recorder unit's ExecStartPre, writes the secret lines
@@ -2330,6 +2515,13 @@ expect_env secrets-mode GHOST_WISPR_ADDR=127.0.0.1:8080 GOOGLE_API_USE_CLIENT_CE
 grep -Fqx "binary $opt/ghost-wispr" "$state/pi-secrets.log" && grep -Fqx 'timeout 60s kill-after 5s' "$state/pi-secrets.log" \
   || fail "secrets-mode: pi-secrets did not run from the installed binary under its bound: $(<"$state/pi-secrets.log")"
 expect_secrets_flag secrets-mode --credentials "$opt/google-credentials.json"
+# It removes a staging directory older than 46 minutes at its start too, and no younger one (see
+# partial-install).
+stale_stages_pi
+run_update secrets
+expect_run 'secrets-mode, staging directories left behind' 0
+[[ ! -e $opt/.ghost-wispr-update.K1lled && -d $opt/.ghost-wispr-update.Y0ung1 && -d $opt/notes-2025 ]] \
+  || fail "secrets-mode: did not remove the staging directory 47 minutes old alone: $(cd -- "$opt" && find . -maxdepth 1 -type d | LC_ALL=C sort | paste -sd ' ')"
 new_pi
 install_set b
 echo fail >"$state/pi-secrets-mode"
@@ -2596,6 +2788,39 @@ release=b run_launcher
   || fail "after an exit 2: exit $status, output $out; want update.sh.prev run on pi-lib.sh.prev"
 [[ $(<"$state/launcher.log") == update.sh && $(failed_runs) == 0 ]] \
   || fail "after an exit 2: ran $(<"$state/launcher.log"), count $(failed_runs)"
+# Two releases in a row whose update.sh breaks (exit 2 at once): the fallback, the update.sh.prev
+# of the release before them, installs the first, then the second, and stays the update.sh.prev,
+# with its pi-lib.sh.prev. Break it catches: a fallback that replaces update.sh.prev and
+# pi-lib.sh.prev with the copies it keeps, so the first bad release's update.sh becomes the
+# fallback, and once the second installs no update runs at all.
+commit_bad1=$(printf 'e%.0s' {1..40})
+commit_bad2=$(printf 'f%.0s' {1..40})
+make_release bad1 "$commit_bad1"
+printf '%s\n' '#!/usr/bin/env bash' '# release bad1, whose update.sh breaks at once' 'exit 2' >"$releases/bad1/ghost-wispr-pi-deploy/update.sh"
+pack_release bad1
+make_release bad2 "$commit_bad2"
+printf '%s\n' '#!/usr/bin/env bash' '# release bad2, whose update.sh breaks at once' 'exit 2' >"$releases/bad2/ghost-wispr-pi-deploy/update.sh"
+pack_release bad2
+new_pi
+install_set bad1
+install -m 0755 -- "$launcher_file" "$opt/ghost-wispr-update-launcher.sh"
+cp -p -- "$releases/a/ghost-wispr-pi-deploy/update.sh" "$opt/update.sh.prev"
+cp -p -- "$releases/a/ghost-wispr-pi-deploy/pi-lib.sh" "$opt/pi-lib.sh.prev"
+release=bad2 run_launcher
+what='two bad releases in a row, the first night'
+[[ $status == 0 && $out == *'ghost-wispr launcher: update.sh exited 2; running update.sh.prev'* ]] \
+  && grep -Fqx "ghost-wispr update: installed commit $commit_bad2 (invocation test-invocation-9)" <<<"$out" \
+  || fail "$what: exit $status, output $out; want update.sh.prev to install release bad2"
+cmp -s -- "$releases/a/ghost-wispr-pi-deploy/update.sh" "$opt/update.sh.prev" \
+  && cmp -s -- "$releases/a/ghost-wispr-pi-deploy/pi-lib.sh" "$opt/pi-lib.sh.prev" \
+  || fail "$what: the fallback replaced update.sh.prev or pi-lib.sh.prev; update.sh.prev now ends: $(tail -n 2 -- "$opt/update.sh.prev" | paste -sd ' ')"
+expect_set_of "$what" bad2
+release=b run_launcher
+what='two bad releases in a row, the second night'
+[[ $status == 0 && $out == *'ghost-wispr launcher: update.sh exited 2; running update.sh.prev'* ]] \
+  && grep -Fqx "ghost-wispr update: installed commit $commit_b (invocation test-invocation-9)" <<<"$out" \
+  || fail "$what: exit $status, output $out; want update.sh.prev to install release b"
+expect_set_of "$what" b
 # An update.sh that exits 10 on every run: the run at which the count reaches 11 runs update.sh.prev
 # once, and the count goes back to 0, whatever update.sh.prev returned.
 launcher_pi
