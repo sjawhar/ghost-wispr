@@ -97,13 +97,14 @@ const pisReleaseSection = "### The release the Pi runs"
 
 // TestRunbookRunsTheModelsStepFromTheReleaseThePiRuns fails if "Enable models
 // and Drive sync" does not say to run provision.sh --models only from the
-// release the Pi runs, with its block, or if "The release the Pi runs" does
-// not say how to get that release: check 1 of check-deploy.sh, or the download
-// block of the release whose commit /api/version names, which
-// runbook_blocks_test.sh runs.
+// release the Pi runs, with its block, and that provision.sh --models refuses
+// another release's directory; or if "The release the Pi runs" does not say how
+// to get that release (check 1 of check-deploy.sh, or the download block of the
+// release whose commit /api/version names, which runbook_blocks_test.sh runs),
+// or still says that a provisioning change needs that release.
 func TestRunbookRunsTheModelsStepFromTheReleaseThePiRuns(t *testing.T) {
 	section := runbookSection(t, "## Enable models and Drive sync")
-	for _, words := range []string{"only from the release the Pi runs", `"The release the Pi runs"`, "<!-- runbook_blocks_test.sh: models -->"} {
+	for _, words := range []string{"only from the release the Pi runs", `"The release the Pi runs"`, "<!-- runbook_blocks_test.sh: models -->", "`provision.sh --models` refuses"} {
 		if !strings.Contains(section, words) {
 			t.Errorf("the runbook's \"Enable models and Drive sync\" does not say %q", words)
 		}
@@ -114,28 +115,52 @@ func TestRunbookRunsTheModelsStepFromTheReleaseThePiRuns(t *testing.T) {
 			t.Errorf("the runbook's %q does not say %q", pisReleaseSection, words)
 		}
 	}
+	if strings.Contains(release, "a provisioning change run") {
+		t.Errorf("the runbook's %q still says that a provisioning change needs the release the Pi runs", pisReleaseSection)
+	}
 }
 
-// TestRunbookAppliesAProvisioningChangeFromTheReleaseThePiRuns fails if "Apply
-// a provisioning change" runs provision.sh from the latest release instead of
-// the release the Pi runs, or does not say why: provision.sh installs its
-// release's update.sh, pi-lib.sh and pi.env before it starts the update, so a
-// newer release's would leave the .prev copies of an older set, a failed
-// install would roll back two releases, and provision.sh refuses when
-// deploy.verified names another commit. It also fails if "Provision" still
-// reruns provision.sh from a fresh download of the latest release.
-func TestRunbookAppliesAProvisioningChangeFromTheReleaseThePiRuns(t *testing.T) {
+// TestRunbookAppliesAProvisioningChangeFromTheReleaseThatCarriesIt fails if
+// "Apply a provisioning change" does not run provision.sh from the release that
+// carries the change, downloaded as "Provision", step 1 does, or does not say
+// what provision.sh does when the Pi runs an older release: it keeps the set the
+// Pi runs as its .prev copies, with its line, so a failed install of the newer
+// release rolls back to that set; or, when the installed files are not the
+// verified set, leaves the .prev copies as they are. It also fails if the
+// runbook still says that provision.sh refuses another release, that a
+// provisioning change waits until the Pi runs its release, or if "Provision"
+// reruns provision.sh in another way than this section's.
+func TestRunbookAppliesAProvisioningChangeFromTheReleaseThatCarriesIt(t *testing.T) {
 	section := runbookSection(t, "### Apply a provisioning change")
-	for _, words := range []string{`"The release the Pi runs"`, "deploy.verified", "two releases", "`update.sh`, `pi-lib.sh` and `pi.env`"} {
+	for _, words := range []string{`("Provision", step 1)`, "kept the set of commit", "rolls back to", "so its .prev copies stay as they are", "`update.sh`, `pi-lib.sh` or `pi.env`", "only from the release the Pi runs"} {
 		if !strings.Contains(section, words) {
 			t.Errorf("the runbook's \"Apply a provisioning change\" does not say %q", words)
 		}
 	}
-	if strings.Contains(section, `download the release ("Provision", step 1)`) {
-		t.Error(`the runbook's "Apply a provisioning change" still downloads the latest release`)
+	for _, stale := range []string{"Run it from no other release", "two releases", "refuses when `deploy.verified` names another commit"} {
+		if strings.Contains(section, stale) {
+			t.Errorf("the runbook's \"Apply a provisioning change\" still says %q", stale)
+		}
 	}
-	if strings.Contains(runbookSection(t, "## Provision"), "provision.sh` again (steps 1 and 5)") {
-		t.Error(`"Provision" still reruns provision.sh from a fresh download of the latest release`)
+	if strings.Contains(runbookSection(t, releaseSection), "once the Pi runs that release") {
+		t.Errorf("the runbook's %q still waits for the Pi to run a release before its provisioning change", releaseSection)
+	}
+	provision := runbookSection(t, "## Provision")
+	if !strings.Contains(provision, `("Update and inspect", "Apply a provisioning change")`) || strings.Contains(provision, "in the directory of the release the Pi runs") {
+		t.Error(`"Provision" does not rerun provision.sh as "Apply a provisioning change" says`)
+	}
+}
+
+// TestRunbookProvisionGivesServeExactlyServeConf fails if "Provision" does not
+// say that provision.sh turns off each Serve mount other than / on a port that
+// serve.conf lists, and stops before the join when Serve then holds a part
+// serve.conf does not, such as a TCP forward.
+func TestRunbookProvisionGivesServeExactlyServeConf(t *testing.T) {
+	section := runbookSection(t, "## Provision")
+	for _, words := range []string{"each mount other than `/`", "TCP forward", "before the join"} {
+		if !strings.Contains(section, words) {
+			t.Errorf("the runbook's \"Provision\" does not say %q", words)
+		}
 	}
 }
 
