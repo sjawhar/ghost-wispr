@@ -175,7 +175,7 @@ assert_models() {
 }
 
 # The committed template names the approved providers and models, keeps sync and GC off, and turns
-# Envoy on at the hub's listener, for events and for the Concierge.
+# Envoy on at the hub's listener, for events and for the Concierge, which reads one Dispatch server.
 assert_models "$template"
 for line in \
   'google_credentials_file: /opt/ghost-wispr/google-credentials.json' \
@@ -186,13 +186,13 @@ for line in \
   'envoy_enabled: true' \
   "envoy_hub_url: $hub_url" \
   "  envoy_url: $hub_url" \
-  "  dispatch_url: $PI_DISPATCH_URL" \
   'jabra_mute_button: true' \
   'mic_device: J75' \
   'speaker_device: J75'; do
   assert_line "$line" "$template"
 done
 assert_count '^gdrive_folder_id:' 0 "$template"
+assert_count '^  dispatch_url: https://[A-Za-z0-9.-][A-Za-z0-9.-]*$' 1 "$template"
 # The template's public_url is the Pi's tailnet name, which the tailnet join checks it has.
 assert_line "public_url: https://$PI_HOST" "$template"
 assert_count '^public_url:' 1 "$template"
