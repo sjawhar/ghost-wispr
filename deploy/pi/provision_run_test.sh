@@ -1067,8 +1067,9 @@ said 'so its .prev copies stay as they are' || fail "provision.sh did not say it
 # keeps the Pi's certificate and its version file with the set: otherwise those copies still hold
 # the certificate before it, and a failed install would put that one back. Where the Pi has no
 # device.crt.version, as before its first nightly certificate, a stale device.crt.version.prev goes,
-# as update.sh's keep_previous removes the .prev copy of a file the Pi does not have. Release d's
-# binary stages certificate version 8 and never answers its commit.
+# as update.sh's keep_previous removes the .prev copy of a file the Pi does not have, and the
+# rollback removes the device.crt.version that the failed install put in, so the Pi has no version
+# file again. Release d's binary stages certificate version 8 and never answers its commit.
 begin newer-release-certificate
 readonly commit_d=dddddddddddddddddddddddddddddddddddddddd
 make_release d "$commit_d" "$wrong_commit" 8
@@ -1088,10 +1089,11 @@ for history in 'with a version file' 'with no version file'; do
   printf 'certificate version 7\n' >"$deploy/device.crt"
   printf 'certificate version 6\n' >"$deploy/device.crt.prev"
   printf '6\n' >"$deploy/device.crt.version.prev"
-  want_version_prev=missing
+  # The Pi's version file before release d: what it and its .prev copy must hold after the rollback.
+  pi_version=missing
   if [[ $history == 'with a version file' ]]; then
     printf '7\n' >"$deploy/device.crt.version"
-    want_version_prev=7
+    pi_version=7
   fi
   release_a=$(installed_set)
   real_provision d
@@ -1107,11 +1109,10 @@ for history in 'with a version file' 'with no version file'; do
     || fail "after the failed install of release d, $history, device.crt is [$(certificate_file device.crt)], not certificate version 7, which the Pi ran"
   [[ $(certificate_file device.crt.prev) == 'certificate version 7' ]] \
     || fail "provision.sh did not keep the Pi's certificate as device.crt.prev, $history: [$(certificate_file device.crt.prev)]"
-  [[ $(certificate_file device.crt.version.prev) == "$want_version_prev" ]] \
-    || fail "device.crt.version.prev is [$(certificate_file device.crt.version.prev)], want [$want_version_prev], $history"
-  if [[ $history == 'with a version file' && $(certificate_file device.crt.version) != 7 ]]; then
-    fail "after the failed install of release d, device.crt.version is [$(certificate_file device.crt.version)], not 7"
-  fi
+  [[ $(certificate_file device.crt.version.prev) == "$pi_version" ]] \
+    || fail "device.crt.version.prev is [$(certificate_file device.crt.version.prev)], want [$pi_version], $history"
+  [[ $(certificate_file device.crt.version) == "$pi_version" ]] \
+    || fail "after the failed install of release d, $history, device.crt.version is [$(certificate_file device.crt.version)], want [$pi_version]"
 done
 
 # bootstrap-repair: a bootstrap file that is broken on a Pi that runs release a, here an update unit
