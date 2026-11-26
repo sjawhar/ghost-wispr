@@ -414,6 +414,8 @@ type exchange struct {
 	replySeqs    []uint64 // the same for ex.reply
 	interim      string   // the turn's words not final yet
 	roomRevision uint64   // each new final: a fresh RoomView (Exchange.Room)
+	takeBacks    uint64   // every take-back of this exchange, for RoomView
+	takeBackCut  string   // raw words through the last take-back counted
 	timer        *time.Timer
 	said         bool
 	spokeAt      time.Time  // when its speech first started
@@ -1864,6 +1866,7 @@ func (s *Supervisor) turnLocked(ex *exchange, t *Transcript, words string) {
 				keep = min(len(ex.replySeqs), len(ex.reply)-1)
 				ex.replySeqs = append(ex.replySeqs[len(ex.replySeqs)-keep:], seq)
 			}
+			s.noteTakeBackLocked(ex)
 		}
 		ex.interim = ""
 		ex.turnFinal = true
@@ -3057,7 +3060,7 @@ func (s *Supervisor) roomOf(ex *exchange) func() RoomView {
 		if asker := s.askerNowLocked(ex); asker != "" {
 			x.AskerTurn = asker
 		}
-		return RoomView{Asker: x.AskerTurn, Recent: x.Recent, Revision: ex.roomRevision}
+		return RoomView{Asker: x.AskerTurn, Recent: x.Recent, Revision: ex.roomRevision, TakeBacks: ex.takeBacks}
 	}
 }
 
@@ -3070,6 +3073,31 @@ func (s *Supervisor) askerNowLocked(ex *exchange) string {
 		}
 	}
 	return s.turnOf(ex)
+}
+
+// noteTakeBackLocked records a new take-back in ex's raw finals for
+// RoomView.TakeBacks. The cut through it is stable as later finals add what
+// follows it: TrimSpace makes a whole-turn take-back's later newline no new
+// take-back. A later distinct take-back changes the cut and counts once.
+func (s *Supervisor) noteTakeBackLocked(ex *exchange) {
+	if s.cfg.TakeBack == nil {
+		return
+	}
+	finals := finalsOf(ex)
+	rest, taken := s.cfg.TakeBack(finals)
+	if !taken {
+		ex.takeBackCut = ""
+		return
+	}
+	cut := finals
+	if rest != "" {
+		cut = strings.TrimSuffix(finals, rest)
+	}
+	cut = strings.TrimSpace(cut)
+	if cut != "" && cut != ex.takeBackCut {
+		ex.takeBacks++
+		ex.takeBackCut = cut
+	}
 }
 
 // modelViewLocked is a copy of from, an exchange of ex, as every model and

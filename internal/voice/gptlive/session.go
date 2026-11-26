@@ -285,23 +285,23 @@ type session struct {
 	facts      []*factAudit
 	factErrors atomic.Int64
 
-	mu              sync.Mutex
-	closing         bool
-	release         func() bool // stops the close on the exchange's end
-	over            bool        // the session ended and said so on Events
-	nextID          int
-	pending         map[string]chan error // acknowledgements awaited, by client event id
-	pendingDone     bool
-	delegations     map[string]bool
-	asked           bool            // a delegation has taken the asker's words
-	openingRevision uint64          // RoomView revision when the session opened
-	roomVersion     uint64          // RoomView revision of the last delegation
-	vendorWords     string          // what GPT-Live heard with no current Room asker
-	turn            strings.Builder // heard since the last EventUserTurn
-	sinceAsk        strings.Builder // heard since the last delegation
-	heardAt         time.Time       // when GPT-Live last heard the room say something
-	heardWake       chan struct{}   // signalled at each word GPT-Live hears
-	dialogue        []dialogueLine  // what was heard and said in this session
+	mu                      sync.Mutex
+	closing                 bool
+	release                 func() bool // stops the close on the exchange's end
+	over                    bool        // the session ended and said so on Events
+	nextID                  int
+	pending                 map[string]chan error // acknowledgements awaited, by client event id
+	pendingDone             bool
+	delegations             map[string]bool
+	asked                   bool            // a delegation has taken the asker's words
+	lastAppliedRevision     uint64          // newest RoomView revision a delegation applied
+	lastDelegationTakeBacks uint64          // RoomView.TakeBacks at the last delegation
+	vendorWords             string          // what GPT-Live heard for the last delegation
+	turn                    strings.Builder // heard since the last EventUserTurn
+	sinceAsk                strings.Builder // heard since the last delegation
+	heardAt                 time.Time       // when GPT-Live last heard the room say something
+	heardWake               chan struct{}   // signalled at each word GPT-Live hears
+	dialogue                []dialogueLine  // what was heard and said in this session
 }
 
 type dialogueLine struct {
@@ -333,7 +333,7 @@ func newSession(ctx context.Context, cfg Config, x *voice.Exchange, conn *websoc
 		heardWake:    make(chan struct{}, 1),
 	}
 	if x.Room != nil {
-		s.openingRevision = x.Room().Revision
+		s.lastAppliedRevision = x.Room().Revision
 	}
 	s.player = newPlayer(s)
 	s.wg.Add(4)
@@ -920,15 +920,21 @@ func (s *session) ask(id string) {
 	// The room's words as a model may read them now, read before s.mu:
 	// Room locks the Supervisor (voice.Exchange.Room).
 	room := s.room()
-	// An empty live Room means its exchange ended or was cancelled
-	// (voice.Exchange.Room): it sends no old vendor words after it.
-	if s.x.Room != nil && strings.TrimSpace(room.Asker) == "" && len(room.Recent) == 0 {
+	if s.x.Room != nil && room.Revision == 0 {
+		// An ended exchange returns the zero RoomView. It has no question
+		// or tool call, but its outstanding vendor delegation still gets a
+		// silent function result (Main, after Sol's seventeenth review).
+		s.completeSilently(id)
 		return
 	}
 	s.mu.Lock()
-	question := s.questionLocked(room)
+	question, silent := s.questionLocked(room)
 	transcript := s.transcriptLocked(room)
 	s.mu.Unlock()
+	if silent && s.x.Room != nil {
+		s.completeSilently(id)
+		return
+	}
 	s.flushTurn()
 
 	args, err := json.Marshal(voice.AnswerArgs{Question: question, Transcript: transcript})
@@ -982,42 +988,54 @@ func (s *session) room() voice.RoomView {
 	return voice.RoomView{Asker: s.x.AskerTurn, Recent: s.x.Recent}
 }
 
-// questionLocked is the question for a delegation. A newer room final
-// (RoomView.Revision) makes Room's asker words the question alone: a
-// take-back or replacement since the last delegation wins over every vendor
-// word it heard before (Main, after Sol's sixteenth review of #191). With no
-// newer room final, vendor words heard since the last delegation are a normal
-// follow-up. With neither, it repeats the current asker, or its last vendor
-// words when the Room never named a current turn.
-func (s *session) questionLocked(room voice.RoomView) string {
+// questionLocked returns a delegation's question, or silent when the live
+// Room holds no usable question. A revision older than one a newer
+// delegation already applied is silent: its stale snapshot must not reach the
+// Concierge after the newer answer (Main, after Sol's seventeenth review of
+// #191). A take-back since the last delegation (room.TakeBacks changed) makes
+// every vendor transcript of this gap unusable, canceled and re-heard alike:
+// the question is then Room's current asker words, the meeting's last line,
+// or silent for a whole-turn take-back with no history. With no take-back,
+// fresh vendor words stamped at the current TakeBacks are the follow-up, as
+// on main.
+func (s *session) questionLocked(room voice.RoomView) (question string, silent bool) {
+	if room.Revision != 0 && room.Revision < s.lastAppliedRevision {
+		return "", true
+	}
+	s.lastAppliedRevision = max(s.lastAppliedRevision, room.Revision)
+	noCancelSince := room.TakeBacks == s.lastDelegationTakeBacks
+	s.lastDelegationTakeBacks = room.TakeBacks
 	heard := strings.TrimSpace(s.sinceAsk.String())
 	s.sinceAsk.Reset()
 	asker := strings.TrimSpace(room.Asker)
+	fresh := heard != "" && noCancelSince
 	wasAsked := s.asked
-	changed := room.Revision != s.roomVersion
-	firstChanged := !wasAsked && room.Revision != s.openingRevision
-	s.asked, s.roomVersion = true, room.Revision
+	s.asked = true
 	switch {
-	case asker != "" && (wasAsked && changed || firstChanged):
-		s.vendorWords = ""
-		return asker
-	case !wasAsked && asker != "" && heard != "" && !strings.Contains(words(heard), words(asker)):
+	case fresh && !wasAsked && asker != "" && !strings.Contains(words(heard), words(asker)):
+		// GPT-Live's first heard turn extends, rather than replaces, the
+		// wake's asker words (the ordinary main behavior).
 		s.vendorWords = heard
-		return strings.TrimSpace(asker + " " + heard)
-	case heard != "":
+		return strings.TrimSpace(asker + " " + heard), false
+	case fresh:
 		s.vendorWords = heard
-		return heard
+		return heard, false
 	case asker != "":
-		return asker
-	case s.vendorWords != "":
-		return s.vendorWords
+		return asker, false
+	case noCancelSince && s.vendorWords != "":
+		return s.vendorWords, false
 	}
-	for i := len(room.Recent) - 1; i >= 0; i-- {
-		if question := strings.Join(strings.Fields(room.Recent[i].Text), " "); question != "" {
-			return question
+	// With no take-back, a delegation that heard nothing asks the meeting's
+	// last line, so a question never goes out empty (main parity). After a
+	// take-back that left no question, it completes silently instead.
+	if noCancelSince {
+		for i := len(room.Recent) - 1; i >= 0; i-- {
+			if question := strings.Join(strings.Fields(room.Recent[i].Text), " "); question != "" {
+				return question, false
+			}
 		}
 	}
-	return ""
+	return "", true
 }
 func words(s string) string {
 	return strings.Join(strings.FieldsFunc(strings.ToLower(s), func(r rune) bool {
@@ -1027,6 +1045,21 @@ func words(s string) string {
 
 // answer runs the answer tool for call and returns its result on the
 // delegation.
+
+const withdrawnQuestion = "The question was withdrawn. Do not say anything."
+
+// completeSilently completes a live delegation whose room question was
+// withdrawn, with thinking only: no tool call and no commentary or spoken
+// line. An empty AnswerResult would make deliver send nothingFound instead.
+func (s *session) completeSilently(id string) {
+	result, err := json.Marshal(voice.AnswerResult{Context: withdrawnQuestion})
+	if err != nil {
+		return
+	}
+	if err := s.deliver(s.ctx, id, result); err != nil && s.ctx.Err() == nil {
+		s.log.Warn("gptlive: complete a withdrawn delegation", "delegation", id, "error", err)
+	}
+}
 func (s *session) answer(call voice.ToolCall) {
 	result, err := s.x.Tools.Run(s.ctx, call)
 	if s.ctx.Err() != nil {
