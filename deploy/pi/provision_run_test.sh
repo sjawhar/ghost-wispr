@@ -1041,7 +1041,9 @@ expect_refused 'release b, whose binary never answers its commit' 'the nightly u
 [[ ! -s $TEST_LOG.errors ]] || fail "release b: $(<"$TEST_LOG.errors")"
 said "kept the set of commit $commit_a, which the Pi runs, as its .prev copies" \
   || fail "provision.sh did not keep release a's set before it replaced update.sh: $(<"$work_dir/out")"
-if ! said "did not answer /api/version with commit $commit_b" || ! said 'restored the previous release'; then
+# The update finds the installed set not the verified one, since provision.sh installed release b's
+# update.sh, pi-lib.sh and pi.env, so it rolls back every file that has a .prev copy.
+if ! said "did not answer /api/version with commit $commit_b" || ! said 'restored the last verified set, the one deploy.verified lists'; then
   fail "the update did not install release b and roll it back: $(<"$work_dir/out")"
 fi
 [[ $(installed_set) == "$release_a" ]] \
@@ -1097,7 +1099,7 @@ for history in 'with a version file' 'with no version file'; do
   [[ ! -s $TEST_LOG.errors ]] || fail "release d, $history: $(<"$TEST_LOG.errors")"
   said 'pi-secrets: certificate version 8, not after 2027-12-01T00:00:00Z: newer and signs in' \
     || fail "control, $history: pi-secrets staged no certificate: $(<"$work_dir/out")"
-  if ! said "did not answer /api/version with commit $commit_d" || ! said 'restored'; then
+  if ! said "did not answer /api/version with commit $commit_d" || ! said 'restored the last verified set, the one deploy.verified lists'; then
     fail "the update did not install release d and roll it back, $history: $(<"$work_dir/out")"
   fi
   [[ $(installed_set) == "$release_a" ]] || fail "after the failed install of release d, $history, the Pi is not on release a's set"
