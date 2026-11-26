@@ -68,7 +68,7 @@ config_override_variables=(
   GHOST_WISPR_TTS_VOICE
 )
 # The variables of the settings that providers replaced (internal/config, removedEnvironment), which
-# provision.sh --models removes from .env: a start that finds one warns.
+# the nightly update removes from .env: a start that finds one warns.
 removed_variables=(
   GHOST_WISPR_GCP_PROJECT GHOST_WISPR_GCP_LOCATION GHOST_WISPR_GENAI_BACKEND GHOST_WISPR_EMBEDDING_BACKEND
   GHOST_WISPR_EMBEDDING_LOCATION GHOST_WISPR_DEEPGRAM_MODEL GHOST_WISPR_BATCH_TRANSCRIPTION_PROVIDER
@@ -393,7 +393,7 @@ assert_no_removed_variables() {
   local names=$1 variable
   for variable in "${removed_variables[@]}"; do
     if grep -Fqx -- "$variable" <<<"$names"; then
-      printf '%s is set, but providers replaced its setting; provision.sh --models removes it from .env\n' "$variable" >&2
+      printf '%s is set, but providers replaced its setting; the nightly update removes it from .env\n' "$variable" >&2
       return 1
     fi
   done
