@@ -47,6 +47,14 @@ func TestGetConfigReportsTheLocalSettingsTheStoreApplied(t *testing.T) {
 				}
 			},
 		},
+		"unknown keys": {
+			local: "silence_timeout: 45s\nprovider_keys: {deepgram: dg-typed-by-hand}\ndispatch_token: token-typed-by-hand\napplied: false\n",
+			check: func(t *testing.T, _ map[string]string, report json.RawMessage) {
+				if string(report) != `{"silence_timeout":"45s"}` {
+					t.Errorf(`local_settings = %s, want {"silence_timeout":"45s"}: a key the config does not read is served`, report)
+				}
+			},
+		},
 		"not applied": {
 			local: "silence_timeout: [\n",
 			check: func(t *testing.T, _ map[string]string, report json.RawMessage) {

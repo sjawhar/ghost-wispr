@@ -79,6 +79,35 @@ func TestTheStoreReportsTheLocalSettingsItApplied(t *testing.T) {
 	}
 }
 
+// TestTheLocalSettingsReportHoldsOnlyTheSettingsTheConfigReads fails if the
+// report holds a key of the local settings file that the config does not read.
+// GET /api/config serves the report to every tailnet client, so a key typed
+// there by hand, such as provider_keys or dispatch_token, would be served
+// though the config never reads it; and an applied: false would make
+// deploy/pi/check-deploy.sh read the report as a file not applied. Each
+// provider's auth stays out too. The control: the store applied the file, and
+// runs its known settings.
+func TestTheLocalSettingsReportHoldsOnlyTheSettingsTheConfigReads(t *testing.T) {
+	store, _ := reportStore(t, "silence_timeout: 45s\n"+
+		"provider_keys: {deepgram: dg-typed-by-hand}\n"+
+		"dispatch_token: token-typed-by-hand\n"+
+		"applied: false\n"+
+		"error: typed by hand\n"+
+		"summarization: {model: vertex/gemini-saved, api_key: key-typed-by-hand}\n"+
+		"providers: {vertex-eu: {api: vertex, secret: secret-typed-by-hand, labels: {owner: example-owner}, auth: {kind: google}}}\n")
+	cfg, _, report := store.GetWithLocalSettings()
+	if report.Err != nil {
+		t.Fatalf("control: the store did not apply the file: %v", report.Err)
+	}
+	if cfg.SilenceTimeout != "45s" || cfg.Summarization.Model != "vertex/gemini-saved" {
+		t.Errorf("control: the running config has silence_timeout %q and summarization model %q, want the file's", cfg.SilenceTimeout, cfg.Summarization.Model)
+	}
+	want := `{"providers":{"vertex-eu":{"api":"vertex","labels":{"owner":"example-owner"}}},"silence_timeout":"45s","summarization":{"model":"vertex/gemini-saved"}}`
+	if got := reportJSON(t, report); got != want {
+		t.Errorf("the report holds %s, want %s: the settings the config reads, with no key it does not read and no provider's auth", got, want)
+	}
+}
+
 // TestTheLocalSettingsReportIsACopy fails if a change to the report reaches
 // the store: GET /api/config hands the report to each request.
 func TestTheLocalSettingsReportIsACopy(t *testing.T) {

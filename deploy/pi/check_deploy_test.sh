@@ -691,16 +691,22 @@ expect_verdicts PASS UNKNOWN UNKNOWN PASS PASS PASS PASS
 expect 2 UNKNOWN local_settings
 
 # The recorder did not apply the local settings file (it does not parse): it runs the release's
-# config alone, and its report says so, with why. Checks 2 and 3 compare with the template alone
-# and name the file the recorder did not apply, and why. Breaks it catches: a driver that reads that
-# report as settings (the keys applied and error), or that hides that the file was not applied.
+# config alone, and its report says so, with why. Checks 2 and 3 compare with the template alone,
+# pass, and name the file the recorder did not apply, and why. The recorder also warns of that file
+# in /api/status (each warning of its config's load goes there, cmd/ghost-wispr/main.go's
+# warningRegistry), so check 4 fails, and the run with it. Breaks it catches: a driver that reads
+# that report as settings (the keys applied and error), or that hides that the file was not
+# applied; a run that passes on a Pi whose page saves are not applied.
 new_case 'a local settings file the recorder did not apply'
 printf 'summarization: [\n' >"$deploy/ghost-wispr.local.yaml"
 recorder_applies '{"applied":false,"error":"yaml: line 2: did not find expected node content"}'
+jq -c --arg warning "$deploy/ghost-wispr.local.yaml: yaml: line 2: did not find expected node content; settings saved on the page are not applied" \
+  '.warnings = [$warning]' <<<"$idle_status" >"$state/status.json"
 run_driver
-expect_verdicts PASS PASS PASS PASS PASS PASS PASS
+expect_verdicts PASS PASS PASS FAIL PASS PASS PASS
 expect 2 PASS 'did not apply' 'did not find expected node content'
 expect 3 PASS 'did not apply'
+expect 4 FAIL 'ghost-wispr.local.yaml' 'settings saved on the page are not applied'
 
 # A model that differs is a FAIL even when check 2 cannot read another of its inputs, here
 # recording rules that the report gives as no list of text; the line names both. The control is the

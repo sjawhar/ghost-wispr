@@ -205,6 +205,20 @@ func TestRunbookSaysWhatTheUpdateRefusesAndRepairs(t *testing.T) {
 	}
 }
 
+// TestRunbookSaysCheck3FailsAProviderThatDidNotSignInWithNoReport fails if
+// "Update and inspect" does not say that check-deploy.sh's check 3 still
+// fails for a provider that did not sign in when the recorder's /api/config
+// has no local_settings report, which leaves the check UNKNOWN otherwise: a
+// reader could take UNKNOWN for all that a recorder with no report gets.
+func TestRunbookSaysCheck3FailsAProviderThatDidNotSignInWithNoReport(t *testing.T) {
+	section := runbookSection(t, "## Update and inspect")
+	for _, words := range []string{"A recorder with no such report gives `UNKNOWN` for checks 2 and 3", "Check 3 still prints `FAIL` for a provider that did not sign in, with or without that report"} {
+		if !strings.Contains(section, words) {
+			t.Errorf("the runbook's \"Update and inspect\" does not say %q", words)
+		}
+	}
+}
+
 // TestRunbookSaysWhatTheUpdateDoesWhileHeldAndAfterARestart fails if "Update
 // and inspect" does not say that a held release still refreshes the secrets
 // and the certificate of the release the Pi runs; that the 120 s check after a
