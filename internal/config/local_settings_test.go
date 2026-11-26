@@ -2,6 +2,7 @@ package config
 
 import (
 	"bytes"
+	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
@@ -73,10 +74,9 @@ func TestAPageSaveSurvivesANewReleaseConfig(t *testing.T) {
 }
 
 // TestAPageSaveOfABuiltInPresetKeepsItsOtherFields fails if a save that
-// changes one field of a preset the release config does not name writes that
-// field alone: the next start decodes the entry into an empty preset, and the
-// built-in default preset loses its user template, which carries the
-// transcript, and its description.
+// changes one field of the built-in default preset, which the release config
+// does not name, loses the preset's other fields at the next start: its user
+// template, which carries the transcript, and its description.
 func TestAPageSaveOfABuiltInPresetKeepsItsOtherFields(t *testing.T) {
 	clearEnv(t)
 	path := writeConfig(t, "silence_timeout: 30s\n")
@@ -103,6 +103,73 @@ func TestAPageSaveOfABuiltInPresetKeepsItsOtherFields(t *testing.T) {
 	}
 	if got, ok := reopened.Get().Summarization.Presets["default"]; !ok || got != want {
 		t.Errorf("the default preset after a restart = %+v (held: %t), want %+v", got, ok, want)
+	}
+}
+
+// TestAPageSaveOfAPresetFieldKeepsANewReleasesOtherFields fails if a save
+// that changes one field of a preset writes the preset's other fields too:
+// those fields then hide what a new release config changes in them, as here
+// the new release's user template. Maps merge key by key, presets too.
+func TestAPageSaveOfAPresetFieldKeepsANewReleasesOtherFields(t *testing.T) {
+	clearEnv(t)
+	const preset = "summarization:\n  presets:\n    standup:\n      description: Stand-up\n      system_prompt: Summarize briefly\n      user_template: \"%s: {{transcript}}\"\n"
+	path := writeConfig(t, fmt.Sprintf(preset, "Old"))
+	store, _, err := NewStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Update(func(c *Config) {
+		standup := c.Summarization.Presets["standup"]
+		standup.SystemPrompt = "Give the decisions first."
+		c.Summarization.Presets["standup"] = standup
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, fmt.Appendf(nil, preset, "New"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, _, err := NewStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := Preset{Description: "Stand-up", SystemPrompt: "Give the decisions first.", UserTemplate: "New: {{transcript}}"}
+	if got, ok := reopened.Get().Summarization.Presets["standup"]; !ok || got != want {
+		t.Errorf("the standup preset after a new release = %+v (held: %t), want %+v", got, ok, want)
+	}
+}
+
+// TestADeletedBuiltInPresetStaysDeleted fails if the built-in default preset,
+// deleted on the page, comes back at the next start because the defaults hold
+// it. The same save adds a standup preset: it must be there after the
+// restart, so the check reads a store that applied the local settings file.
+func TestADeletedBuiltInPresetStaysDeleted(t *testing.T) {
+	clearEnv(t)
+	path := writeConfig(t, "silence_timeout: 30s\n")
+	store, _, err := NewStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := store.Get().Summarization.Presets["default"]; !ok {
+		t.Fatal("the store holds no built-in default preset to delete")
+	}
+	if err := store.Update(func(c *Config) {
+		delete(c.Summarization.Presets, "default")
+		c.Summarization.Presets["standup"] = Preset{Description: "Stand-up", UserTemplate: "{{transcript}}"}
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, _, err := NewStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	presets := reopened.Get().Summarization.Presets
+	if _, ok := presets["standup"]; !ok {
+		t.Fatalf("after a restart the presets are %v: the saved standup preset is missing", presets)
+	}
+	if preset, ok := presets["default"]; ok {
+		t.Errorf("after a restart the deleted default preset is back: %+v", preset)
 	}
 }
 
@@ -391,5 +458,49 @@ func TestAProviderKeySaveWritesNoProvidersToTheLocalSettingsFile(t *testing.T) {
 	}
 	if data, _ := os.ReadFile(LocalSettingsPath(path)); strings.Contains(string(data), "dg-saved") {
 		t.Errorf("the local settings file holds the saved key:\n%s", data)
+	}
+}
+
+// TestAProjectFromGoogleApplicationCredentialsIsSavedLikeAnEnvironmentOverride
+// fails if the release config a save compares with reads
+// GOOGLE_APPLICATION_CREDENTIALS. That release config has no environment, so
+// the Vertex AI project the variable's credential file gives is a value from
+// the environment: a save writes it to the local settings file, and it stays
+// after the variable is removed.
+func TestAProjectFromGoogleApplicationCredentialsIsSavedLikeAnEnvironmentOverride(t *testing.T) {
+	clearVoiceEnv(t)
+	dir := t.TempDir()
+	credentials := filepath.Join(dir, "service-account.json")
+	if err := os.WriteFile(credentials, []byte(`{"type": "service_account", "project_id": "env-project"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GOOGLE_APPLICATION_CREDENTIALS", credentials)
+	path := filepath.Join(dir, "ghost-wispr.yaml")
+	if err := os.WriteFile(path, []byte("providers:\n  vertex: {api: vertex, auth: {kind: google}}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	store, _, err := NewStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := store.Get().Providers["vertex"].Project; got != "env-project" {
+		t.Fatalf("vertex's project with GOOGLE_APPLICATION_CREDENTIALS set = %q, want env-project: the check below could not see the variable's project", got)
+	}
+	if err := store.Update(func(c *Config) { c.SilenceTimeout = "45s" }); err != nil {
+		t.Fatal(err)
+	}
+
+	providers, _ := savedConfig(t, LocalSettingsPath(path))["providers"].(map[string]any)
+	vertex, _ := providers["vertex"].(map[string]any)
+	if vertex["project"] != "env-project" {
+		t.Errorf("the local settings file holds providers %v, want vertex's project env-project", providers)
+	}
+	t.Setenv("GOOGLE_APPLICATION_CREDENTIALS", "")
+	reopened, _, err := NewStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := reopened.Get().Providers["vertex"].Project; got != "env-project" {
+		t.Errorf("vertex's project after the variable is removed = %q, want env-project", got)
 	}
 }
