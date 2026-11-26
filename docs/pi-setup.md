@@ -663,10 +663,10 @@ config"), so a key added to the template reaches the Pi with its release. Settin
 page stay in the local settings file through each release. To turn the Jabra's button off or on
 without a release, put `GHOST_WISPR_JABRA_MUTE_BUTTON=false` or `GHOST_WISPR_JABRA_MUTE_BUTTON=true`
 in `/opt/ghost-wispr/.env`, which overrides the YAML, and restart `ghost-wispr.service`. The nightly
-update keeps that line. A settings save on the page while that line is set writes its value to the
-local settings file, where it stays after the line is removed. Turn it off while recording, or
-unplug the Jabra and plug it in again afterwards: Ghost Wispr leaves the Jabra's light as it last
-set it.
+update keeps that line. A settings save on the page never writes that line's value to the local
+settings file, so once the line is removed, the template's setting applies. Turn it off while
+recording, or unplug the Jabra and plug it in again afterwards: Ghost Wispr leaves the Jabra's
+light as it last set it.
 
 The Jabra's mute light is on while recording is paused and off otherwise, whichever control
 paused it. Ghost Wispr never changes it while any of the Jabra's streams is open, its microphone

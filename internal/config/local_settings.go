@@ -167,49 +167,49 @@ func checkNulls(path []string, settings map[string]any) error {
 	return nil
 }
 
-// settingsDifference returns the values of current that differ from release,
+// settingsDifference returns the values of current that differ from previous,
 // in the form mergeSettings reads: a map holds only its keys that differ, a
 // summary preset's fields too. An entry of a map setting that current does not
 // have is null. A struct field that current does not have, because the config
 // omits it when empty, holds its zero value.
-func settingsDifference(current, release map[string]any) map[string]any {
-	return differenceAt(nil, current, release)
+func settingsDifference(current, previous map[string]any) map[string]any {
+	return differenceAt(nil, current, previous)
 }
 
-func differenceAt(path []string, current, release map[string]any) map[string]any {
+func differenceAt(path []string, current, previous map[string]any) map[string]any {
 	difference := make(map[string]any)
 	for key, currentValue := range current {
-		releaseValue, inRelease := release[key]
+		previousValue, inPrevious := previous[key]
 		currentMap, currentIsMap := currentValue.(map[string]any)
-		releaseMap, releaseIsMap := releaseValue.(map[string]any)
+		previousMap, previousIsMap := previousValue.(map[string]any)
 		switch {
-		case currentIsMap && releaseIsMap:
-			if nested := differenceAt(append(slices.Clip(path), key), currentMap, releaseMap); len(nested) != 0 {
+		case currentIsMap && previousIsMap:
+			if nested := differenceAt(append(slices.Clip(path), key), currentMap, previousMap); len(nested) != 0 {
 				difference[key] = nested
 			}
-		case !inRelease:
+		case !inPrevious:
 			if currentValue != nil {
 				difference[key] = currentValue
 			}
-		case !reflect.DeepEqual(currentValue, releaseValue):
+		case !reflect.DeepEqual(currentValue, previousValue):
 			difference[key] = currentValue
 		}
 	}
-	for key, releaseValue := range release {
-		if _, inCurrent := current[key]; inCurrent || releaseValue == nil {
+	for key, previousValue := range previous {
+		if _, inCurrent := current[key]; inCurrent || previousValue == nil {
 			continue
 		}
 		if isMapSetting(path) {
 			difference[key] = nil
 			continue
 		}
-		if releaseMap, ok := releaseValue.(map[string]any); ok {
-			if nested := differenceAt(append(slices.Clip(path), key), map[string]any{}, releaseMap); len(nested) != 0 {
+		if previousMap, ok := previousValue.(map[string]any); ok {
+			if nested := differenceAt(append(slices.Clip(path), key), map[string]any{}, previousMap); len(nested) != 0 {
 				difference[key] = nested
 			}
 			continue
 		}
-		difference[key] = reflect.Zero(reflect.TypeOf(releaseValue)).Interface()
+		difference[key] = reflect.Zero(reflect.TypeOf(previousValue)).Interface()
 	}
 	return difference
 }
@@ -251,31 +251,98 @@ func removeSettingsFile(path string) error {
 	return nil
 }
 
-// writeLocalSettings writes the settings that differ from the release config
-// the store loaded to the local settings file, with logLevel as the saved
-// log_level. It never writes the release config, and never reads it again: a
-// release file replaced under a running store would make each setting the new
-// release changed differ, and the save would keep the old release's value.
-// When no setting differs, no local settings file is left.
-func (s *Store) writeLocalSettings(logLevel string) error {
-	written := s.cfg
-	written.LogLevel = logLevel
-	current, err := configSettings(&written)
+// writeLocalSettings writes the settings that this change set, from prev to
+// the running config, into the local settings file as it was before the
+// change, local. It writes no other setting: a value that an environment
+// variable gives is the same before and after the change, so a save never
+// writes it, and the release config's value applies again once the variable
+// is removed. The other settings of the local settings file stay. A setting
+// set back to the release config's value leaves the file, and the file is
+// removed when no setting is left. It never writes the release config, and
+// compares with the release config the store loaded, not the file on disk.
+func (s *Store) writeLocalSettings(prev *Config, local localSettingsFile) error {
+	before, err := configSettings(prev)
 	if err != nil {
 		return err
 	}
+	after, err := configSettings(&s.cfg)
+	if err != nil {
+		return err
+	}
+	changes := settingsDifference(after, before)
+	if len(changes) == 0 {
+		return nil
+	}
+	saved := make(map[string]any)
+	if local.found {
+		if saved, err = yamlSettings(local.data); err != nil {
+			return fmt.Errorf("read %s: %w", local.path, err)
+		}
+	}
+	applyChanges(nil, saved, changes, s.releaseSettings)
+	if len(saved) == 0 {
+		return removeSettingsFile(local.path)
+	}
+	data, err := yaml.Marshal(saved)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(local.path), 0o755); err != nil {
+		return err
+	}
+	return atomicWriteFile(local.path, data, 0o644)
+}
 
-	path := LocalSettingsPath(s.path)
-	local := settingsDifference(current, s.releaseSettings)
-	if len(local) == 0 {
-		return removeSettingsFile(path)
+// applyChanges writes changes, as settingsDifference gives them, into saved,
+// the local settings file's map at path. release is the release config's map
+// at the same path. A changed value equal to the release config's leaves
+// saved, and a map left empty leaves it too. An entry of a map setting that
+// the release config does not have, such as a preset made on the page, lives
+// only in saved: its fields are written as they are, and it stays whole.
+func applyChanges(path []string, saved, changes, release map[string]any) {
+	for key, change := range changes {
+		releaseValue, inRelease := release[key]
+		changeMap, isMap := change.(map[string]any)
+		if isMap && isMapSetting(path) && !inRelease {
+			entry, _ := saved[key].(map[string]any)
+			if entry == nil {
+				entry = make(map[string]any)
+			}
+			saved[key] = mergeSettings(entry, changeMap)
+			continue
+		}
+		if isMap {
+			savedMap, _ := saved[key].(map[string]any)
+			if savedMap == nil {
+				savedMap = make(map[string]any)
+			}
+			releaseMap, _ := releaseValue.(map[string]any)
+			applyChanges(append(slices.Clip(path), key), savedMap, changeMap, releaseMap)
+			if len(savedMap) == 0 {
+				delete(saved, key)
+			} else {
+				saved[key] = savedMap
+			}
+			continue
+		}
+		if equalsRelease(path, change, releaseValue, inRelease) {
+			delete(saved, key)
+		} else {
+			saved[key] = change
+		}
 	}
-	data, err := yaml.Marshal(local)
-	if err != nil {
-		return err
+}
+
+// equalsRelease says whether value, at a key below path, is the release
+// config's. A key the release config does not have is a deleted entry when it
+// is an entry of a map setting, and otherwise a struct field the config omits
+// when it holds its zero value.
+func equalsRelease(path []string, value, releaseValue any, inRelease bool) bool {
+	if inRelease {
+		return reflect.DeepEqual(value, releaseValue)
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return err
+	if value == nil {
+		return true
 	}
-	return atomicWriteFile(path, data, 0o644)
+	return !isMapSetting(path) && reflect.ValueOf(value).IsZero()
 }

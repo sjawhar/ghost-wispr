@@ -266,37 +266,29 @@ func PathFromEnvironment() string {
 // read or parsed. A local settings file that cannot be parsed gives a warning,
 // and the release config stays in effect.
 func Load(path string) (Config, []string, error) {
-	cfg, _, warnings, err := load(path, nil)
-	return cfg, warnings, err
-}
-
-// load is Load that also returns the log_level the release config and local
-// settings name, or the default: GHOST_WISPR_LOG_LEVEL overrides it in memory
-// only, so a settings change writes this one back. envFile is a .env file's
-// entries, which give a provider its key when the environment does not.
-func load(path string, envFile map[string]string) (cfg Config, fileLogLevel string, warnings []string, err error) {
-	l, err := loadConfig(path, envFile)
-	return l.cfg, l.fileLogLevel, l.warnings, err
+	l, err := loadConfig(path, nil)
+	return l.cfg, l.warnings, err
 }
 
 // loaded is what loadConfig reads.
 type loaded struct {
-	cfg          Config
-	fileLogLevel string
-	warnings     []string
+	cfg      Config
+	warnings []string
 	// releaseSettings is the release config alone, as the YAML map a config
 	// file holds: the running config as it would be with no local settings
-	// file and no environment. A settings save writes only the values that
-	// differ from it.
+	// file and no environment. A save removes from the local settings file
+	// each setting it sets back to the value here.
 	releaseSettings map[string]any
 	// localSettingsErr is why the local settings file was not applied, or
 	// nil when it was applied or there is none.
 	localSettingsErr error
 }
 
-// loadConfig is load that also returns the release config alone and why the
-// local settings file was not applied. Both configs come from one read of the
-// release file, so a file replaced after the read changes neither.
+// loadConfig is Load that also returns the release config alone and why the
+// local settings file was not applied. envFile is a .env file's entries,
+// which give a provider its key when the environment does not. Both configs
+// come from one read of the release file, so a file replaced after the read
+// changes neither.
 func loadConfig(path string, envFile map[string]string) (l loaded, err error) {
 	var releaseData []byte
 	var releaseFound bool
@@ -345,7 +337,6 @@ func loadConfig(path string, envFile map[string]string) (l loaded, err error) {
 	l.warnings = append(l.warnings, deprecatedEnvoyConfigWarnings(fileData)...)
 	l.warnings = append(l.warnings, removedSettingWarnings(fileData)...)
 
-	l.fileLogLevel = cfg.LogLevel
 	l.warnings = append(l.warnings, applyEnvOverrides(&cfg)...)
 	normalizeFileSettings(&cfg)
 	// An unknown light fails closed: dropping the setting would turn the light

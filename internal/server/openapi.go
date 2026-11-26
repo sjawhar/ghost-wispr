@@ -114,7 +114,7 @@ var configSchema = map[string]any{
 			"type":        "array",
 			"readOnly":    true,
 			"items":       map[string]any{"type": "string"},
-			"description": "GET only: the rules the web UI shows under Recording rules, each as written in recording_rules. GHOST_WISPR_RECORDING_RULES overrides it with a JSON list of strings. A settings save (any PATCH /api/config) then writes the override's rules into the local settings file, ghost-wispr.local.yaml beside the release config. The rules stay there after the variable is removed. Empty when none are set; the page then shows no Recording rules button. A PATCH cannot set it.",
+			"description": "GET only: the rules the web UI shows under Recording rules, each as written in recording_rules. GHOST_WISPR_RECORDING_RULES overrides it with a JSON list of strings while the variable is set. A settings save (any PATCH /api/config) never writes the override's rules into the local settings file, ghost-wispr.local.yaml beside the release config: once the variable is removed, the config's rules apply. Empty when none are set; the page then shows no Recording rules button. A PATCH cannot set it.",
 		},
 		"voice": map[string]any{
 			"type":        "object",

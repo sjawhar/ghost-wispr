@@ -34,21 +34,14 @@ func newRun() string {
 }
 
 // Store holds mutable config with thread-safe access. A change writes the
-// settings that differ from the release config to the local settings file.
+// settings it changed into the local settings file.
 type Store struct {
 	mu  sync.RWMutex
 	cfg Config
-	// writtenLogLevel is the log_level a settings change writes back: the
-	// one the release config and local settings give, or the one a change
-	// set. GHOST_WISPR_LOG_LEVEL's override stays in memory, so a level set
-	// for one run does not stay in a file. A change counts as setting the
-	// level when it changes the running one, so a change to the level
-	// already running writes nothing new; no settings field sets the level
-	// today.
-	writtenLogLevel string
 	// releaseSettings is the release config alone, as the YAML map a config
 	// file holds, read when the store loaded, with no local settings and no
-	// environment: a change writes the settings that differ from it.
+	// environment: a change that sets a setting back to its value here
+	// removes that setting from the local settings file.
 	releaseSettings map[string]any
 	// localSettingsRefusal refuses each change while the local settings file
 	// that the start could not apply is in place: a change would replace that
@@ -93,7 +86,6 @@ func newStore(path, envPath string, envSecrets map[string]string) (*Store, []str
 	}
 	store := &Store{
 		cfg:             l.cfg,
-		writtenLogLevel: l.fileLogLevel,
 		releaseSettings: l.releaseSettings,
 		path:            path,
 		envPath:         envPath,
@@ -155,10 +147,6 @@ func (s *Store) TryUpdate(fn func(*Config) error) error {
 		return err
 	}
 
-	writtenLogLevel := s.writtenLogLevel
-	if s.cfg.LogLevel != prev.LogLevel {
-		writtenLogLevel = s.cfg.LogLevel
-	}
 	providerKeysChanged := !maps.Equal(s.cfg.ProviderKeys, prev.ProviderKeys) ||
 		!maps.Equal(s.cfg.keysSet, prev.keysSet)
 	var previousLocal localSettingsFile
@@ -169,7 +157,7 @@ func (s *Store) TryUpdate(fn func(*Config) error) error {
 			s.mu.Unlock()
 			return fmt.Errorf("read local settings: %w", err)
 		}
-		if err := s.writeLocalSettings(writtenLogLevel); err != nil {
+		if err := s.writeLocalSettings(&prev, previousLocal); err != nil {
 			s.cfg = prev
 			s.mu.Unlock()
 			return fmt.Errorf("write local settings: %w", err)
@@ -189,7 +177,6 @@ func (s *Store) TryUpdate(fn func(*Config) error) error {
 			return err
 		}
 	}
-	s.writtenLogLevel = writtenLogLevel
 	s.revision.Count++
 
 	current := s.copyConfig()
