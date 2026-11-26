@@ -15,8 +15,10 @@ import (
 // issues whose own title holds a word of the search, a stem's plural form
 // included: two such issues are offered, one is offered alone, and with none
 // the full search, past its bound, is a slow search. A full result in time
-// is offered as it came.
+// is offered as it came. Each row has a rig of its own, so the rows run in
+// parallel.
 func TestTheKeywordFallbackOffersOnlyIssuesItsTitleNames(t *testing.T) {
+	t.Parallel()
 	var (
 		contracts = dispatch.SearchHit{Kind: "issue", IssueKey: "ABC-41", Title: "Parser eval contracts", Score: 0.0104}
 		stateFile = dispatch.SearchHit{Kind: "document", IssueKey: "ABC-7", Title: "Team state file", Score: 0.0102}
@@ -41,6 +43,7 @@ func TestTheKeywordFallbackOffersOnlyIssuesItsTitleNames(t *testing.T) {
 	} {
 		for _, fallback := range []string{"the full search missed its mark", "the full search failed"} {
 			t.Run(tc.name+", "+fallback, func(t *testing.T) {
+				t.Parallel()
 				r := newRig(t)
 				if fallback == "the full search failed" {
 					r.concierge.searchBound = 200 * time.Millisecond
@@ -64,6 +67,7 @@ func TestTheKeywordFallbackOffersOnlyIssuesItsTitleNames(t *testing.T) {
 		}
 	}
 	t.Run("control: a full result in time is offered as it came", func(t *testing.T) {
+		t.Parallel()
 		r := newRig(t)
 		r.records.searchDelay = 20 * time.Millisecond
 		r.records.hits = []dispatch.SearchHit{stateFile, roadmap}
@@ -79,8 +83,10 @@ func TestTheKeywordFallbackOffersOnlyIssuesItsTitleNames(t *testing.T) {
 // that offered one issue takes a whole reply that confirms, a yes form or the
 // issue's key, as that issue, for the question first asked; a no as no pick;
 // and anything else, such as side talk with "first" in it, as a question of
-// its own. Live, "Yeah, that one." was searched as a question.
+// its own. Live, "Yeah, that one." was searched as a question. Each reply has
+// a rig of its own, so the replies run in parallel.
 func TestAPickOfTheOneIssueOfferedAnswersTheQuestion(t *testing.T) {
+	t.Parallel()
 	for reply, want := range map[string]struct {
 		key string
 		ok  bool
@@ -96,19 +102,22 @@ func TestAPickOfTheOneIssueOfferedAnswersTheQuestion(t *testing.T) {
 		"what about the tests": {"", false},
 		"yes and no":           {"", false},
 	} {
-		r := newRig(t)
-		r.concierge.fullWait = 200 * time.Millisecond
-		r.records.searchDelay = time.Hour
-		r.records.kwHits = []dispatch.SearchHit{
-			{Kind: "issue", IssueKey: "ABC-41", Title: "Parser eval contracts", Score: 0.0104},
-			{Kind: "document", IssueKey: "ABC-7", Title: "Team state file", Score: 0.0102},
-		}
-		if spoken := answerTurn(t, r, "what is happening with the parser evals"); len(spoken) != 1 || spoken[0].text != "Did you mean A B C forty-one?" {
-			t.Fatalf("spoken = %+v, want the one issue offered", spoken)
-		}
-		asked, key, ok := r.concierge.takePick(&r.exchange, reply)
-		if key != want.key || ok != want.ok || (ok && asked != "what is happening with the parser evals") {
-			t.Errorf("takePick(%q) = %q, %q, %v; want key %q, ok %v, for the question first asked", reply, asked, key, ok, want.key, want.ok)
-		}
+		t.Run(reply, func(t *testing.T) {
+			t.Parallel()
+			r := newRig(t)
+			r.concierge.fullWait = 200 * time.Millisecond
+			r.records.searchDelay = time.Hour
+			r.records.kwHits = []dispatch.SearchHit{
+				{Kind: "issue", IssueKey: "ABC-41", Title: "Parser eval contracts", Score: 0.0104},
+				{Kind: "document", IssueKey: "ABC-7", Title: "Team state file", Score: 0.0102},
+			}
+			if spoken := answerTurn(t, r, "what is happening with the parser evals"); len(spoken) != 1 || spoken[0].text != "Did you mean A B C forty-one?" {
+				t.Fatalf("spoken = %+v, want the one issue offered", spoken)
+			}
+			asked, key, ok := r.concierge.takePick(&r.exchange, reply)
+			if key != want.key || ok != want.ok || (ok && asked != "what is happening with the parser evals") {
+				t.Errorf("takePick(%q) = %q, %q, %v; want key %q, ok %v, for the question first asked", reply, asked, key, ok, want.key, want.ok)
+			}
+		})
 	}
 }

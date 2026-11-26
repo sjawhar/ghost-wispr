@@ -97,7 +97,9 @@ func (s *markerStream) played(marker int16) int {
 // does not reach the speaker, or if the exchange ends before the person can
 // pick an issue with no wake phrase. On the Pi the room heard "Reading the
 // record." and then nothing: Answer's return cancelled the context the
-// question was still playing under, and the exchange ended.
+// question was still playing under, and the exchange ended. Each exchange has
+// a Concierge, a Supervisor and a speaker of its own, so the two run in
+// parallel.
 func TestTheLastLineOfAnAnswerPlaysToItsEndOnVoiceA(t *testing.T) {
 	const (
 		routingMarker  int16 = 0x1111
@@ -120,6 +122,7 @@ func TestTheLastLineOfAnAnswerPlaysToItsEndOnVoiceA(t *testing.T) {
 		{name: "alone", searchBound: 300 * time.Millisecond},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 			logs := &lockedBuffer{}
 			t.Cleanup(func() {
 				if t.Failed() {

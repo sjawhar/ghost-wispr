@@ -40,8 +40,9 @@ func heldKeyRig(t *testing.T, unit string) *rig {
 // fails if a key of one digit is read, or if ABC-12 is not named where the
 // room said it. At 8998810 the mixed turn heard "I found no issue for that";
 // at e5cf4d6 it named INFRA-7; at 07cc6a5 the two rows of four keys asked for
-// the key.
+// the key. Each row has a rig of its own, so the rows run in parallel.
 func TestAVendorsWordingReadsWhatMainReads(t *testing.T) {
+	t.Parallel()
 	for unit, want := range map[string]string{
 		"what about ABC-12":                                     "ABC-12",
 		"what about ABC-12 and INFRA-7":                         "ABC-12",
@@ -51,6 +52,7 @@ func TestAVendorsWordingReadsWhatMainReads(t *testing.T) {
 		"what about ABC-12 and ABC-13 and ABC-14 and INFRA-7":   "ABC-12",
 	} {
 		t.Run(unit, func(t *testing.T) {
+			t.Parallel()
 			r := heldKeyRig(t, unit)
 			r.concierge.Heard(context.Background(), &r.exchange, unit)
 			time.Sleep(150 * time.Millisecond)
@@ -101,8 +103,10 @@ func TestTheReadAheadKeepsMainsKeysUnderItsLimit(t *testing.T) {
 // It fails if a key of one digit is read before the answer, if the read-ahead
 // searches a turn whose key of one digit the answer reads, or if the answer
 // to "what about INFRA-7" does not read it. "What about ABC-12" is the
-// control: its key is read ahead, so the probe can see a read ahead.
+// control: its key is read ahead, so the probe can see a read ahead. Each row
+// has a rig of its own, so the rows run in parallel.
 func TestTheReadAheadReadsNoOneDigitKey(t *testing.T) {
+	t.Parallel()
 	for unit, want := range map[string][]string{
 		"what about ABC-12":             {"ABC-12"},
 		"what about ABC-12 and INFRA-7": {"ABC-12"},
@@ -114,6 +118,7 @@ func TestTheReadAheadReadsNoOneDigitKey(t *testing.T) {
 		"what is blocking INFRA-7's realtime voice": nil,
 	} {
 		t.Run(unit, func(t *testing.T) {
+			t.Parallel()
 			r := speechRig(t)
 			r.concierge.searchSettle = 50 * time.Millisecond
 			r.records.issues["ABC-12"] = &dispatch.Issue{Key: "ABC-12", Title: "Realtime voice", Status: "todo", UpdatedAt: testNow}

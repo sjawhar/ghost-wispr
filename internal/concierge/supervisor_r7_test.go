@@ -52,9 +52,12 @@ const (
 // over a real Concierge. A holder's answer plays the answer sound once, at a
 // gap of SoundGap with no transcript word. With a room word since t0 it waits
 // for "Wispr, go ahead"; with none and the light red it is spoken at once; with
-// the light not red nothing is spoken.
+// the light not red nothing is spoken. Each case has a rig of its own, so the
+// cases run in parallel.
 func TestAnswerSoundAndInvitation(t *testing.T) {
+	t.Parallel()
 	t.Run("a word since t0", func(t *testing.T) {
+		t.Parallel()
 		r := newR7Rig(t)
 		r.askHolder()
 		r.waitExchangeEnded()
@@ -89,6 +92,7 @@ func TestAnswerSoundAndInvitation(t *testing.T) {
 	})
 
 	t.Run("no word since t0, light red", func(t *testing.T) {
+		t.Parallel()
 		r := newR7Rig(t)
 		r.askHolder()
 		r.waitExchangeEnded()
@@ -102,6 +106,7 @@ func TestAnswerSoundAndInvitation(t *testing.T) {
 	})
 
 	t.Run("the light not red", func(t *testing.T) {
+		t.Parallel()
 		r := newR7Rig(t)
 		r.askHolder()
 		r.waitExchangeEnded()
@@ -120,9 +125,12 @@ func TestAnswerSoundAndInvitation(t *testing.T) {
 // gate closing, a pause or light hold, ends the meeting's session. An answer
 // of that ended session is never spoken: not by itself and not on "Wispr, go
 // ahead", and no answer sound plays after the gate opens; its written answer
-// stays in the ledger, for the session's page.
+// stays in the ledger, for the session's page. Each case has a rig of its
+// own, so the cases run in parallel.
 func TestAnswerWhileGateClosedStaysSilent(t *testing.T) {
+	t.Parallel()
 	t.Run("pause, the answer before it", func(t *testing.T) {
+		t.Parallel()
 		r := newR7Rig(t)
 		r.askHolder()
 		r.waitExchangeEnded()
@@ -137,6 +145,7 @@ func TestAnswerWhileGateClosedStaysSilent(t *testing.T) {
 	})
 
 	t.Run("pause, the answer after it", func(t *testing.T) {
+		t.Parallel()
 		r := newR7Rig(t)
 		r.askHolder()
 		r.waitExchangeEnded()
@@ -151,6 +160,7 @@ func TestAnswerWhileGateClosedStaysSilent(t *testing.T) {
 	})
 
 	t.Run("light hold, then red and go ahead", func(t *testing.T) {
+		t.Parallel()
 		r := newR7Rig(t)
 		r.askHolder()
 		r.waitExchangeEnded()
@@ -166,6 +176,7 @@ func TestAnswerWhileGateClosedStaysSilent(t *testing.T) {
 	})
 
 	t.Run("light hold, the answer before it", func(t *testing.T) {
+		t.Parallel()
 		r := newR7Rig(t)
 		r.askHolder()
 		r.waitExchangeEnded()

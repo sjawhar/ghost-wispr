@@ -40,8 +40,12 @@ func (r pendingSendSlowRecords) Events(ctx context.Context, key string, before i
 
 // TestPendingSendMatrix keeps the fast answer inside its bound while Envoy's
 // send runs beside it. The line about the ask and the named key do not depend
-// on which completes first.
+// on which completes first. The answer's bound is 2 s here, not 8, so a send
+// of 3 s outlasts it as one of 9 s outlasts the 8 s bound. Each row has a rig
+// of its own, so the rows run in parallel.
 func TestPendingSendMatrix(t *testing.T) {
+	t.Parallel()
+	const bound = 2 * time.Second
 	for _, send := range []struct {
 		name  string
 		delay time.Duration
@@ -49,7 +53,7 @@ func TestPendingSendMatrix(t *testing.T) {
 	}{
 		{"send_in_10_ms", 10 * time.Millisecond, false},
 		{"send_in_400_ms", 400 * time.Millisecond, false},
-		{"send_in_9_s", 9 * time.Second, false},
+		{"send_in_3_s", bound + time.Second, false},
 		{"send_failure", 0, true},
 	} {
 		for _, keyless := range []bool{false, true} {
@@ -58,9 +62,11 @@ func TestPendingSendMatrix(t *testing.T) {
 				name = send.name + "/keyless_first_then_valid_second"
 			}
 			t.Run(name, func(t *testing.T) {
+				t.Parallel()
 				r := newRig(t)
 				heldIssue(r, "session", false)
 				r.concierge.knownBound = 20 * time.Second
+				r.concierge.fastBound = bound
 				finished := make(chan struct{})
 				r.agents.onSend = func(ctx context.Context, _ string) error {
 					defer close(finished)
@@ -115,11 +121,15 @@ func TestPendingSendMatrix(t *testing.T) {
 }
 
 // TestPendingSendRetryProviderFailureReturnsError: a provider failure on the
-// second R8 attempt stays an error even after the first fact was spoken.
+// second R8 attempt stays an error even after the first fact was spoken. The
+// send is still pending when the answer's bound ends; the answer waits for it
+// that long, so a bound of 2 s, not the 8 s one, ends the test sooner.
 func TestPendingSendRetryProviderFailureReturnsError(t *testing.T) {
+	t.Parallel()
 	r := newRig(t)
 	heldIssue(r, "session", false)
 	r.concierge.knownBound = 20 * time.Second
+	r.concierge.fastBound = 2 * time.Second
 	release := make(chan struct{})
 	r.agents.onSend = func(context.Context, string) error {
 		<-release
@@ -142,9 +152,12 @@ func TestPendingSendRetryProviderFailureReturnsError(t *testing.T) {
 
 // TestPendingSendMatrixSlowRecord: a slow record read consumes the whole fast
 // answer bound. The answer returns then, without waiting for Envoy's send.
+// Each row has a rig of its own, so the rows run in parallel.
 func TestPendingSendMatrixSlowRecord(t *testing.T) {
+	t.Parallel()
 	for _, delay := range []time.Duration{10 * time.Millisecond, 9 * time.Second} {
 		t.Run(delay.String(), func(t *testing.T) {
+			t.Parallel()
 			r := newRig(t)
 			heldIssue(r, "session", false)
 			issue := r.records.issues["ABC-12"]

@@ -193,7 +193,9 @@ func TestHolderCaseOnlyWhenItChangesWhatHappensNext(t *testing.T) {
 
 // TestTheRoutingLineSaysTheAsk (c-fast-answer, R6): with no fact 1.5 s after
 // the turn, the routing line says the Concierge is asking the live holder
-// when it is, and otherwise names the issue it reads.
+// when it is, and otherwise names the issue it reads. The model answers once
+// the voice says a line, so nothing else is said before the routing line,
+// whose mark is 500 ms here: the 1.5 s one is TestRoutingLineAt1500ms's.
 func TestTheRoutingLineSaysTheAsk(t *testing.T) {
 	for _, c := range []struct{ turn, want string }{
 		{"ask the agent on ABC-12 whether the tap is merged", "Asking the agent on ABC-12."},
@@ -201,13 +203,19 @@ func TestTheRoutingLineSaysTheAsk(t *testing.T) {
 	} {
 		r := newRig(t)
 		heldIssue(r, "session", false)
+		r.concierge.routingAfter = 500 * time.Millisecond
 		r.model.block = make(chan struct{})
-		go func() {
-			time.Sleep(2200 * time.Millisecond)
-			close(r.model.block)
-		}()
+		release := sync.OnceFunc(func() { close(r.model.block) })
 		r.model.turns = [][]*genai.GenerateContentResponse{{chunk(text("ABC-12: PR 80 is in review."))}}
-		spoken := answerTurn(t, r, c.turn)
+		var spoken []said
+		record := recorder(&spoken)
+		say := func(ctx context.Context, text string, mode voice.SayMode) error {
+			release()
+			return record(ctx, text, mode)
+		}
+		if err := r.concierge.Answer(context.Background(), &r.exchange, c.turn, say); err != nil {
+			t.Fatalf("Answer(%q): %v", c.turn, err)
+		}
 		if len(spoken) == 0 || spoken[0].text != c.want || spoken[0].mode != voice.Ack {
 			t.Errorf("%q: spoken = %+v, want the routing line %q first", c.turn, spoken, c.want)
 		}
@@ -383,17 +391,19 @@ func TestTheAskRunsBesideTheFacts(t *testing.T) {
 
 // TestTheRoutingLineOnlyWhenNothingWasSaid (c-fast-answer, R6): a fact said
 // before 1.5 s keeps the routing line silent, however long the rest of the
-// answer then takes.
+// answer then takes. The mark is 500 ms here, and the rest of the answer
+// takes a second past it.
 func TestTheRoutingLineOnlyWhenNothingWasSaid(t *testing.T) {
 	r := newRig(t)
 	heldIssue(r, "none", false)
+	r.concierge.routingAfter = 500 * time.Millisecond
 	r.model.turns = [][]*genai.GenerateContentResponse{
 		{chunk(text("PR 80 is in review."), call("c1", "read_issue", map[string]any{"key": "ABC-12"}, ""))},
 		{chunk(text("It is open."))},
 	}
 	r.model.onCall = func(call int) {
 		if call == 1 {
-			time.Sleep(2200 * time.Millisecond)
+			time.Sleep(r.concierge.routingAfter + time.Second)
 		}
 	}
 	for _, s := range answerTurn(t, r, "what is happening with ABC-12") {

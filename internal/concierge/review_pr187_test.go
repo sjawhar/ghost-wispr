@@ -128,6 +128,7 @@ func TestReview187TimelyFullResultControl(t *testing.T) {
 // the key included, picks none; a question, a number or any other word makes
 // the turn a new question.
 func TestReview187OneIssueReplies(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		reply, key string
 		ok         bool
@@ -205,10 +206,13 @@ func TestReview187AKeyQuestionKeepsItsWords(t *testing.T) {
 
 // TestReview187SideTalkSendsNoQuestion (finding 1): through the real
 // Supervisor, after the one-issue confirmation of a bare number, only a yes
-// sends the question first asked.
+// sends the question first asked. Each reply has a rig of its own, so the
+// replies run in parallel.
 func TestReview187SideTalkSendsNoQuestion(t *testing.T) {
+	t.Parallel()
 	for _, reply := range []string{"yes", "the first item in our budget is rent", "No, not ABC-4592.", "Is that right?", "That's 100, right?"} {
 		t.Run(reply, func(t *testing.T) {
+			t.Parallel()
 			r := newR7Rig(t)
 			records := r.c.records.(*fakeRecords)
 			records.mu.Lock()

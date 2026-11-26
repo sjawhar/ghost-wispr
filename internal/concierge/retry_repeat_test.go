@@ -61,6 +61,7 @@ func TestARetryDropsASentenceSaidWordForWord(t *testing.T) {
 // of words, and 7791198 as a clause of a heard sentence with its punctuation
 // gone; each dropped some of these. It fails unless each is said.
 func TestARetryKeepsWhatChangesMeaning(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		heard []string
 		next  string

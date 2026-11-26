@@ -96,8 +96,10 @@ func TestAClearKeywordMatchMustBeNamedByItsTitle(t *testing.T) {
 // for the full search, which reads the meaning, up to its own bound, and
 // offers its result as it came, after the routing line; it says no issue was
 // found only when the full search also fails or finds nothing. A kept keyword
-// issue is still offered at once.
+// issue is still offered at once. Each row has a rig of its own, so the rows
+// run in parallel.
 func TestAnEmptyKeywordFallbackWaitsForTheFullSearch(t *testing.T) {
+	t.Parallel()
 	settings := dispatch.SearchHit{Kind: "document", IssueKey: "ABC-50", Title: "Provider settings page", Score: 0.02}
 	gateway := dispatch.SearchHit{Kind: "document", IssueKey: "ABC-52", Title: "Model gateway sign-in", Score: 0.005}
 	roadmap := dispatch.SearchHit{Kind: "document", IssueKey: "ABC-9", Title: "Roadmap: one grader", Score: 0.0007}
@@ -169,6 +171,7 @@ func TestAnEmptyKeywordFallbackWaitsForTheFullSearch(t *testing.T) {
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 			r := newRig(t)
 			if tc.fullWait > 0 {
 				r.concierge.fullWait = tc.fullWait
