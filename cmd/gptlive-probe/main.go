@@ -30,6 +30,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"log/slog"
 	"math"
 	"net/http"
 	"os"
@@ -134,6 +135,38 @@ const (
 	observeSpoken    = "spoken"
 	defaultRoomAsker = "Wispr, what is the probe's verification key?"
 )
+
+// delegationLog is the session's logger: it keeps when the first client
+// delegation reached us, so a probe can time the vendor's own acknowledgement
+// against it, and passes every record on to the default logger. The session
+// logs no words of the room.
+type delegationLog struct {
+	mu    sync.Mutex
+	first time.Time
+}
+
+func (l *delegationLog) Enabled(context.Context, slog.Level) bool { return true }
+
+func (l *delegationLog) Handle(ctx context.Context, r slog.Record) error {
+	if r.Message == "gptlive: delegation reached the client" {
+		l.mu.Lock()
+		if l.first.IsZero() {
+			l.first = r.Time
+		}
+		l.mu.Unlock()
+	}
+	return slog.Default().Handler().Handle(ctx, r)
+}
+
+func (l *delegationLog) WithAttrs([]slog.Attr) slog.Handler { return l }
+func (l *delegationLog) WithGroup(string) slog.Handler      { return l }
+
+// arrivedAt is when the first client delegation reached us, if one did.
+func (l *delegationLog) arrivedAt() (time.Time, bool) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.first, !l.first.IsZero()
+}
 
 // delegationEvidence is the answer's code-like fact. GPT-Live's
 // instructions preserve keys and figures exactly, so the probe can require
@@ -295,7 +328,8 @@ func probe(ctx context.Context, cfg *probeConfig, out io.Writer) error {
 	}
 	printf(out, "token exchange: ok (%v)\n", time.Since(begin).Round(time.Millisecond))
 
-	v, err := gptlive.New(gptlive.Config{URL: cfg.LiveURL, Voice: cfg.Voice, Token: tokens.Token})
+	arrivals := &delegationLog{}
+	v, err := gptlive.New(gptlive.Config{URL: cfg.LiveURL, Voice: cfg.Voice, Token: tokens.Token, Logger: slog.New(arrivals)})
 	if err != nil {
 		return err
 	}
@@ -351,7 +385,7 @@ func probe(ctx context.Context, cfg *probeConfig, out io.Writer) error {
 		}
 	}
 	if cfg.Observe != "" {
-		if err := observeDelegation(ctx, cfg, in, tools, rec, seen, out); err != nil {
+		if err := observeDelegation(ctx, cfg, in, tools, rec, seen, arrivals, out); err != nil {
 			return err
 		}
 		printf(out, "result: PASS\n")
@@ -721,7 +755,7 @@ const observeWindow = 20 * time.Second
 // before it (the run of 2026-11-26). It asserts nothing: it records what the
 // real vendor did, so the silent ending can be judged against a spoken
 // control.
-func observeDelegation(ctx context.Context, cfg *probeConfig, in *feeder, tools *probeTools, rec *recording, seen *events, out io.Writer) error {
+func observeDelegation(ctx context.Context, cfg *probeConfig, in *feeder, tools *probeTools, rec *recording, seen *events, arrivals *delegationLog, out io.Writer) error {
 	in.ask <- cfg.Ask
 	var ended time.Time
 	select {
@@ -742,8 +776,17 @@ func observeDelegation(ctx context.Context, cfg *probeConfig, in *feeder, tools 
 	if spoke < 0 {
 		spoke = 0
 	}
+	arrived, gotDelegation := arrivals.arrivedAt()
+	if gotDelegation {
+		printf(out, "observe: the delegation reached the client %v after the question ended\n", arrived.Sub(ended).Round(time.Millisecond))
+	} else {
+		printf(out, "observe: no delegation reached the client\n")
+	}
 	if at, ok := rec.firstAfter(ended); ok {
 		printf(out, "observe: GPT-Live spoke %v of audio, beginning %v after the question ended\n", spoke, at.Sub(ended).Round(time.Millisecond))
+		if gotDelegation {
+			printf(out, "observe: that speech began %v after the delegation reached the client\n", at.Sub(arrived).Round(time.Millisecond))
+		}
 	} else {
 		printf(out, "observe: GPT-Live spoke no audio in the window\n")
 	}

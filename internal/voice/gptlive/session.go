@@ -903,6 +903,9 @@ func (s *session) onDelegation(ev *serverEvent) {
 		s.log.Warn("gptlive: delegation not for the client", "has_id", id != "")
 		return
 	}
+	// Logged so a probe can time the vendor's own acknowledgement against the
+	// moment the delegation reached us. It carries no words of the room.
+	s.log.Info("gptlive: delegation reached the client", "delegation", id)
 	s.mu.Lock()
 	if s.closing {
 		s.mu.Unlock()
