@@ -1015,8 +1015,19 @@ download the release whose commit `/api/version` names:
 <!-- runbook_blocks_test.sh: download-commit -->
 ```bash
 c=$(curl -fsS http://127.0.0.1:8080/api/version | jq -er .commit) &&
-t=$(curl -fsS 'https://api.github.com/repos/sjawhar/ghost-wispr/releases?per_page=100' |
-  jq -er --arg c "$c" '[.[] | select(.target_commitish == $c)][0].tag_name') &&
+t='' p=1 prev='' &&
+while [ -z "$t" ]; do
+  r=$(curl -fsS "https://api.github.com/repos/sjawhar/ghost-wispr/releases?per_page=100&page=$p") &&
+    t=$(jq -r --arg c "$c" 'first(.[] | select(.target_commitish == $c) | .tag_name) // ""' <<<"$r") &&
+    n=$(jq length <<<"$r") && first=$(jq -c '.[0]' <<<"$r") || break
+  [ -z "$t" ] || break
+  if [ "$n" -lt 100 ] || [ "$first" = "$prev" ]; then
+    echo "no release names commit $c" >&2
+    break
+  fi
+  prev=$first p=$((p + 1))
+done &&
+[ -n "$t" ] &&
 d=$(mktemp -d) && cd "$d" &&
 u="https://github.com/sjawhar/ghost-wispr/releases/download/$t" &&
 curl -fsSLO "$u/ghost-wispr-pi-deploy.tar.gz" &&
@@ -1026,9 +1037,11 @@ tar -xzf ghost-wispr-pi-deploy.tar.gz &&
 cd ghost-wispr-pi-deploy
 ```
 
-`sha256sum` must print `ghost-wispr-pi-deploy.tar.gz: OK`. The block looks for the commit among
-the latest 100 releases, and stops before it makes a directory when none of them has it. The shell
-is then in that release's directory, in `/tmp`.
+`sha256sum` must print `ghost-wispr-pi-deploy.tar.gz: OK`, and the shell is then in that release's
+directory, in `/tmp`. The block reads GitHub's release list, newest first, 100 releases a page,
+until a page holds the release of the commit, or holds fewer than 100 releases (the last page), or
+repeats the page before it. When no release names the commit, it prints
+`no release names commit <commit>` and stops before it makes a directory.
 
 ### Apply a provisioning change
 
