@@ -11,8 +11,12 @@ ExecStartPre=/opt/ghost-wispr/wait-for-network.sh
 # A user unit cannot be ordered after the system's time-sync.target: this
 # waits for the clock to be synchronized itself, giving up after 120 s.
 ExecStartPre=/opt/ghost-wispr/wait-for-time-sync.sh
+# The secret lines of .env from Secret Manager, which systemd reads for ExecStart after this step
+# ends. The - lets the start go on when the read fails, on the secret lines .env has.
+ExecStartPre=-/opt/ghost-wispr/update.sh secrets
 ExecStart=/opt/ghost-wispr/ghost-wispr
-# Longer than both waits together; the user manager's default is 90 s.
+# Longer than both waits and the secrets step together (60 s, 120 s and 65 s); the user manager's
+# default is 90 s.
 TimeoutStartSec=5min
 ExecStopPost=/opt/ghost-wispr/ghost-wispr light-off
 EnvironmentFile=/opt/ghost-wispr/.env

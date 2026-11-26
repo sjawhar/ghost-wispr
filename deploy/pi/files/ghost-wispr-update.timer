@@ -2,7 +2,11 @@
 Description=Nightly Ghost Wispr release update
 
 [Timer]
-OnCalendar=*-*-* 03:30:00
+# 03:30, 03:45, then every 15 minutes to 06:00: 11 runs a night, so a run that finds the recorder
+# busy is tried again 15 minutes later. A start while a run goes on joins that run.
+OnCalendar=*-*-* 03:30,45:00
+OnCalendar=*-*-* 04,05:00,15,30,45:00
+OnCalendar=*-*-* 06:00:00
 Persistent=true
 
 [Install]
