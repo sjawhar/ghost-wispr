@@ -503,6 +503,53 @@ func TestPiSecretsSkipsNotFoundCertificateVersions(t *testing.T) {
 	})
 }
 
+// TestPiSecretsStopsTheWalkOnPermissionDenied catches a version walk that
+// skips a refused version as if it were disabled or deleted: only
+// FAILED_PRECONDITION and NOT_FOUND are skipped. Version 3 holds a certificate
+// that would sign in, so a walk that continued past the 403 would stage it.
+func TestPiSecretsStopsTheWalkOnPermissionDenied(t *testing.T) {
+	fixture := newCertificateFixture(t)
+	installedBefore, err := os.ReadFile(fixture.installed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	badCA, badCAKey := newUntrustedCertificateAuthority(t)
+	badNewer := certificateForKey(t, badCA, badCAKey, fixture.key, time.Now().Add(72*time.Hour))
+	goodOlder := certificateForKey(t, fixture.ca, fixture.caKey, fixture.key, time.Now().Add(60*time.Hour))
+	denied := newSecretManagerError(http.StatusForbidden, []byte(`{"error":{"code":403,"message":"Permission denied on resource","status":"PERMISSION_DENIED"}}`))
+	reader := &fakeSecretReader{replies: map[string]secretReply{
+		secretReplyKey(fixture.secret, "latest"): {value: secretVersion{Version: 5, Data: badNewer}},
+		secretReplyKey(fixture.secret, "4"):      {err: denied},
+		secretReplyKey(fixture.secret, "3"):      {value: secretVersion{Version: 3, Data: goodOlder}},
+	}}
+	var output bytes.Buffer
+
+	code := runPiSecrets(
+		context.Background(),
+		fixture.args(),
+		&output,
+		defaultCredentials(fixture.credentials),
+		readerFactory(t, reader, fixture.credentials),
+		productionSignInCheck,
+	)
+	if code != 0 {
+		t.Fatalf("runPiSecrets exit = %d, want 0", code)
+	}
+	requireFileAbsent(t, filepath.Join(fixture.outDir, "device.crt"))
+	requireKeptCertificate(t, output.String(), 5, badNewer, "candidate does not sign in")
+	requireAccesses(t, reader, []secretAccess{
+		{project: fixture.project, secret: fixture.secret, version: "latest"},
+		{project: fixture.project, secret: fixture.secret, version: "4"},
+	})
+	installedAfter, err := os.ReadFile(fixture.installed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(installedAfter, installedBefore) {
+		t.Error("the installed certificate changed")
+	}
+}
+
 // TestPiSecretsLooksBackOnlyNineCertificateVersions catches a reader that
 // accesses version N-10 or below after the documented nine-version recovery
 // window ends.
