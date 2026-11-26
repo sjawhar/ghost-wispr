@@ -9,6 +9,7 @@ import (
 	"reflect"
 	"slices"
 	"strings"
+	"sync"
 
 	"gopkg.in/yaml.v3"
 )
@@ -100,23 +101,29 @@ type AppliedLocalSettings struct {
 	// Settings are the settings the running config took from the local
 	// settings file, as that file writes them: those the start applied, as
 	// each page save has changed them since. A null is an entry of a map
-	// setting that they delete, such as a provider. Each provider's auth is
-	// left out. Nil when the store applied no local settings file: there is
-	// none, or the start did not apply it (Err).
+	// setting that they delete, such as a provider. It holds only the keys the
+	// config reads, and each provider's auth is left out. Nil when the store
+	// applied no local settings file: there is none, or the start did not
+	// apply it (Err).
 	Settings map[string]any
 	// Err is why the start did not apply the local settings file, or nil.
 	Err error
 }
 
-// reportedSettings is a copy of settings for AppliedLocalSettings, with each
-// provider's auth left out, and each value in a form encoding/json writes: a
-// mapping YAML decoded with keys that are not all strings gets string keys,
-// and a float JSON cannot hold (.inf, .nan) becomes its text.
+// reportedSettings is a copy of settings for AppliedLocalSettings. It holds
+// only the keys the config reads (knownSettings): a key the file holds that
+// the config does not read, such as a provider_keys or dispatch_token typed
+// there by hand, is no setting, and GET /api/config serves the report to
+// every tailnet client. Each provider's auth is left out. Each value is in a
+// form encoding/json writes: a mapping YAML decoded with keys that are not all
+// strings gets string keys, and a float JSON cannot hold (.inf, .nan) becomes
+// its text.
 func reportedSettings(settings map[string]any) map[string]any {
 	if settings == nil {
 		return nil
 	}
-	reported, _ := reportedValue(settings).(map[string]any)
+	normalized, _ := reportedValue(settings).(map[string]any)
+	reported := knownSettings(configType, normalized)
 	if providers, ok := reported["providers"].(map[string]any); ok {
 		for _, provider := range providers {
 			if fields, ok := provider.(map[string]any); ok {
@@ -125,6 +132,87 @@ func reportedSettings(settings map[string]any) map[string]any {
 		}
 	}
 	return reported
+}
+
+// configType is the type a config file decodes into.
+var configType = reflect.TypeFor[Config]()
+
+// knownSettings is settings, a config file's map for a value of the struct
+// type t, with only the keys a field of t reads, by the name yaml.v3 decodes
+// it under, and below each key only what its field's type reads in turn: the
+// fields of a struct, and every entry of a map, whatever its name, as its
+// value's type reads it. Any other value is kept as it is.
+func knownSettings(t reflect.Type, settings map[string]any) map[string]any {
+	fields := yamlFields(t)
+	known := make(map[string]any, len(settings))
+	for key, value := range settings {
+		if fieldType, ok := fields[key]; ok {
+			known[key] = knownValue(fieldType, value)
+		}
+	}
+	return known
+}
+
+func knownValue(t reflect.Type, value any) any {
+	for t.Kind() == reflect.Pointer {
+		t = t.Elem()
+	}
+	settings, isMap := value.(map[string]any)
+	switch {
+	case !isMap:
+		return value
+	case t.Kind() == reflect.Struct:
+		return knownSettings(t, settings)
+	case t.Kind() == reflect.Map:
+		entries := make(map[string]any, len(settings))
+		for name, entry := range settings {
+			entries[name] = knownValue(t.Elem(), entry)
+		}
+		return entries
+	default:
+		return value
+	}
+}
+
+// yamlFieldsByType holds yamlFields of each struct type it has read, since a
+// type's fields never change and GET /api/config reads them for each request.
+var yamlFieldsByType sync.Map // reflect.Type → map[string]reflect.Type
+
+// yamlFields is the type of each field of the struct type t by the key
+// yaml.v3 reads it under: the name its yaml tag gives, else the field's name
+// in lower case; an inline struct's fields as t's own; no field tagged "-" and
+// no unexported field. The map it returns is shared: never change it.
+func yamlFields(t reflect.Type) map[string]reflect.Type {
+	if cached, ok := yamlFieldsByType.Load(t); ok {
+		return cached.(map[string]reflect.Type)
+	}
+	fields := make(map[string]reflect.Type, t.NumField())
+	for i := range t.NumField() {
+		field := t.Field(i)
+		if !field.IsExported() {
+			continue
+		}
+		name, options, _ := strings.Cut(field.Tag.Get("yaml"), ",")
+		if name == "-" {
+			continue
+		}
+		if slices.Contains(strings.Split(options, ","), "inline") {
+			inline := field.Type
+			for inline.Kind() == reflect.Pointer {
+				inline = inline.Elem()
+			}
+			if inline.Kind() == reflect.Struct {
+				maps.Copy(fields, yamlFields(inline))
+			}
+			continue
+		}
+		if name == "" {
+			name = strings.ToLower(field.Name)
+		}
+		fields[name] = field.Type
+	}
+	yamlFieldsByType.Store(t, fields)
+	return fields
 }
 
 func reportedValue(value any) any {

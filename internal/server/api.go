@@ -1717,8 +1717,9 @@ type configResponse struct {
 	Voice          configVoiceResponse `json:"voice"`
 	// LocalSettings is the store's report of the local settings file,
 	// ghost-wispr.local.yaml: the settings the running config took from it
-	// (each provider's auth left out), {"applied": false, "error": ...} for
-	// a file the start did not apply, or null for none. Read-only.
+	// (only the keys the config reads, and each provider's auth left out),
+	// {"applied": false, "error": ...} for a file the start did not apply, or
+	// null for none. Read-only.
 	LocalSettings any `json:"local_settings"`
 	// Revision is the state of the config this answer holds. Read-only: a
 	// page that sends two saves keeps the answer with the later revision,

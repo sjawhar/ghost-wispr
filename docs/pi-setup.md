@@ -1033,7 +1033,8 @@ the check's input. It exits 1 when one check is not `PASS`.
    the line names it. The recorder reports those settings in `/api/config` as `local_settings`; the
    check reads that report, not the file. A recorder with no such report gives `UNKNOWN` for checks
    2 and 3.
-3. Each provider of that config, with those the local settings add or remove, signs in.
+3. Each provider of that config, with those the local settings add or remove, signs in. Check 3
+   still prints `FAIL` for a provider that did not sign in, with or without that report.
 4. `/api/status` has no warning.
 5. The timer started the run that printed `installed commit` for that commit: `FAIL` for a run
    started by hand.
