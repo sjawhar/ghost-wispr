@@ -297,11 +297,19 @@ func loadConfig(path string, envFile map[string]string) (cfg Config, fileLogLeve
 		return release, "", nil, nil, err
 	}
 	// The effective release config: the release file over the defaults, as a
-	// config file. The local settings file merges over it key by key.
+	// config file. The local settings file merges over it key by key. It
+	// holds no provider default: a Vertex AI provider with no project must
+	// take the project of the credential file the running config signs in
+	// with, which an environment override can name.
 	baseData, err := yaml.Marshal(&release)
 	if err != nil {
 		return release, "", nil, nil, fmt.Errorf("read the release config: %w", err)
 	}
+	// The release config a save compares with gets the provider defaults
+	// from the release file's own credential file alone, never from
+	// GOOGLE_APPLICATION_CREDENTIALS: a Vertex AI project that the variable's
+	// file gives is a value from the environment, which a save writes.
+	applyProviderDefaults(&release, inspectGoogleCredentialFile(release.GoogleCredentialsFile).serviceAccountProject)
 	validate(&release)
 	if releaseSettings, err = configSettings(&release); err != nil {
 		return release, "", nil, nil, fmt.Errorf("read the release config: %w", err)
@@ -310,20 +318,13 @@ func loadConfig(path string, envFile map[string]string) (cfg Config, fileLogLeve
 	warnings = deprecatedEnvoyEnvironmentWarnings()
 	// data is the config to decode. fileData is the config as its files
 	// write it, for the warnings about a removed setting.
-	data, fileData, applied := baseData, releaseData, false
+	data, fileData := baseData, releaseData
 	if path != "" {
 		var localWarnings []string
-		data, fileData, applied, localWarnings = applyLocalSettings(LocalSettingsPath(path), baseData, releaseData)
+		data, fileData, localWarnings = applyLocalSettings(LocalSettingsPath(path), baseData, releaseData)
 		warnings = append(warnings, localWarnings...)
 	}
-	cfg, err = decodeEffectiveConfig(data)
-	if err != nil && applied {
-		// A value of the local settings file that does not fit its setting.
-		warnings = append(warnings, localSettingsWarning(LocalSettingsPath(path), err))
-		fileData = releaseData
-		cfg, err = decodeEffectiveConfig(baseData)
-	}
-	if err != nil {
+	if cfg, err = decodeEffectiveConfig(data); err != nil {
 		return cfg, "", nil, nil, fmt.Errorf("parse config file: %w", err)
 	}
 	warnings = append(warnings, deprecatedEnvoyConfigWarnings(fileData)...)
@@ -349,9 +350,7 @@ func loadConfig(path string, envFile map[string]string) (cfg Config, fileLogLeve
 }
 
 // releaseConfig decodes the release config file over the defaults, with no
-// environment: no override, and no credential file that only
-// GOOGLE_APPLICATION_CREDENTIALS names. A Vertex AI project that such a file
-// gives is a value from the environment, which a settings save writes.
+// environment override and no provider default.
 func releaseConfig(data []byte, found bool) (Config, error) {
 	cfg := defaults()
 	if found {
@@ -368,7 +367,6 @@ func releaseConfig(data []byte, found bool) (Config, error) {
 		}
 	}
 	normalizeFileSettings(&cfg)
-	applyProviderDefaults(&cfg, inspectGoogleCredentialFile(cfg.GoogleCredentialsFile).serviceAccountProject)
 	return cfg, nil
 }
 

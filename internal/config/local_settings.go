@@ -36,27 +36,34 @@ func readSettingsFile(path string) (data []byte, found bool, err error) {
 
 // applyLocalSettings merges the local settings file at localPath over the
 // effective release config, baseData, and over the release file as written,
-// releaseData. It returns both merged configs, and whether it applied the
-// file. When the file cannot be read or parsed, it returns baseData and
-// releaseData, and a warning.
-func applyLocalSettings(localPath string, baseData, releaseData []byte) (data, fileData []byte, applied bool, warnings []string) {
+// releaseData, and returns both merged configs. When the file cannot be read
+// or parsed, or a value of it does not fit its setting, it returns baseData
+// and releaseData, and a warning.
+func applyLocalSettings(localPath string, baseData, releaseData []byte) (data, fileData []byte, warnings []string) {
 	localData, found, err := readSettingsFile(localPath)
 	if err == nil && !found {
-		return baseData, releaseData, false, nil
+		return baseData, releaseData, nil
 	}
 	if err == nil {
 		data, fileData, err = mergeLocalSettings(localData, baseData, releaseData)
 	}
 	if err != nil {
-		return baseData, releaseData, false, []string{localSettingsWarning(localPath, err)}
+		return baseData, releaseData, []string{localSettingsWarning(localPath, err)}
 	}
-	return data, fileData, true, nil
+	return data, fileData, nil
 }
 
 // mergeLocalSettings merges the local settings file's YAML over baseData, for
 // the running config, and over releaseData, for the warnings about a removed
-// setting.
+// setting. It first decodes the local settings file alone: a value that does
+// not fit its setting fails there, with the local file's own line. Each value
+// of the merged config is then a value of baseData or of the local file at
+// the same key, so the merged config decodes.
 func mergeLocalSettings(localData, baseData, releaseData []byte) (data, fileData []byte, err error) {
+	var typed Config
+	if err := yaml.Unmarshal(localData, &typed); err != nil {
+		return nil, nil, err
+	}
 	local, err := yamlSettings(localData)
 	if err != nil {
 		return nil, nil, err
