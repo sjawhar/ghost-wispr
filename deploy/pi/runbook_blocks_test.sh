@@ -30,8 +30,8 @@
 # of a release block passes no argument or a flag of provision.sh's case statement. The release
 # directory and the published files are what deploy/pi/build-deploy-tarball.sh writes. The blocks
 # read the neutral deployment settings in deploy/pi/test-pi.env. The fakes stand in for GitHub, the
-# Pi's ip, tailscale and recorder, the Tailscale API, Secret Manager and the driver, so a pass does
-# not show that a procedure works on the Pi.
+# Pi's ip, tailscale, sudo and recorder, the Tailscale API, Secret Manager and the driver, so a pass
+# does not show that a procedure works on the Pi.
 set -euo pipefail
 
 repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -494,6 +494,9 @@ run_secret_block() {
 }
 for name in deepgram-key dispatch-token; do
   value=${value_of[$name]} secret_name=${secret_of[$name]} case_dir="$work_dir/$name"
+  # The blocks read the value from stdin here, where no terminal echoes it, so only the block's text
+  # shows that a person's terminal does not show the value as they type it.
+  [[ $(block "$name") == *"IFS= read -r -s -p "* ]] || fail "the $name block reads the value without read -s, so the terminal shows it"
   run_secret_block "$name" "$case_dir" "$value"
   [[ $secret_exit == 0 ]] || fail "the $name block failed: $(grep -vF "$value" "$case_dir/out")"
   [[ $(versions "$case_dir") == 1 ]] || fail "the $name block added $(versions "$case_dir") versions, not 1"
@@ -786,6 +789,11 @@ run_token_check "$work_dir/token-check-equal" "$dispatch_value" "$dispatch_value
 # The secret holds another value: the hashes differ, so the reading can fail.
 run_token_check "$work_dir/token-check-different" another-test-value "$dispatch_value"
 [[ ${check_lines[0]} != "${check_lines[1]}" ]] || fail "the token-check block printed equal hashes for two tokens"
+# The secret's latest version ends in a line feed, as a value saved from a file can, and as pi-secrets
+# drops before it writes .env: the hashes are still equal.
+run_token_check "$work_dir/token-check-secret-line-feed" "$dispatch_value"$'\n' "$dispatch_value"
+[[ ${check_lines[0]} == "${check_lines[1]}" ]] \
+  || fail "the token-check block printed different hashes for a secret that only ends in a line feed: ${check_lines[*]}"
 # The Pi has no token line, or the secret's latest version is empty: that side's hash is the hash of
 # nothing, which the runbook says neither hash may be.
 run_token_check "$work_dir/token-check-pi-empty" "$dispatch_value" ''

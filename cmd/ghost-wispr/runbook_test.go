@@ -192,16 +192,22 @@ func TestRunbookSaysHowThePiFindsARenewedCertificate(t *testing.T) {
 // device.crt.version as one change: the journal device.crt.version.new first,
 // then the certificate, then the version file, then the journal's removal, a
 // rollback the same way; and what each run, update.sh secrets too, does with a
-// journal that a run cut short left, with both lines it prints. It also fails
-// if "The Pi's secrets" still says that update.sh secrets changes nothing but
-// the four lines of .env, or does not say that it puts right a certificate swap
-// cut short.
+// journal that a run cut short left, with both lines it prints; and that
+// pi-secrets stages no certificate that does not end later than the installed
+// device.crt, the comparison it makes, not one with the installed version. It
+// also fails if "The Pi's secrets" still says that update.sh secrets changes
+// nothing but the four lines of .env, or does not say that it puts right a
+// certificate swap cut short, and if "Update and inspect" says a busy recorder
+// changes nothing, which the start-of-run repair does change.
 func TestRunbookSaysTheCertificatePairChangesAsOne(t *testing.T) {
 	section := runbookSection(t, "## Renew the X.509 certificate")
-	for _, words := range []string{"`/opt/ghost-wispr/device.crt.version.new`", "Then it renames the certificate over `device.crt`, then writes or removes `device.crt.version`, and then removes the journal", "A rollback puts the pair back the same way", "`update.sh secrets` too", "ghost-wispr update: finished the certificate swap that a run cut short: device.crt.version is <version>", "ghost-wispr update: removed /opt/ghost-wispr/device.crt.version.new, of a run cut short before its certificate went in; device.crt and device.crt.version stay as they are"} {
+	for _, words := range []string{"`/opt/ghost-wispr/device.crt.version.new`", "Then it renames the certificate over `device.crt`, then writes or removes `device.crt.version`, and then removes the journal", "A rollback puts the pair back the same way", "`update.sh secrets` too", "ghost-wispr update: finished the certificate swap that a run cut short: device.crt.version is <version>", "ghost-wispr update: removed /opt/ghost-wispr/device.crt.version.new, of a run cut short before its certificate went in; device.crt and device.crt.version stay as they are", "stages no certificate that does not end later than the installed `device.crt`"} {
 		if !strings.Contains(section, words) {
 			t.Errorf("the runbook's \"Renew the X.509 certificate\" does not say %q", words)
 		}
+	}
+	if strings.Contains(section, "not newer than the installed version") {
+		t.Error(`the runbook's "Renew the X.509 certificate" says pi-secrets compares a certificate with the installed version; it compares end dates with the installed device.crt`)
 	}
 	secrets := runbookSection(t, "## The Pi's secrets")
 	if strings.Contains(secrets, "writes the four lines and changes nothing else") {
@@ -210,26 +216,35 @@ func TestRunbookSaysTheCertificatePairChangesAsOne(t *testing.T) {
 	if !strings.Contains(secrets, "a certificate swap that a run cut short") {
 		t.Error(`the runbook's "The Pi's secrets" does not say that update.sh secrets puts right a certificate swap that a run cut short`)
 	}
+	update := runbookSection(t, "## Update and inspect")
+	if strings.Contains(update, "Changes nothing while the recorder is busy") {
+		t.Error(`the runbook's "Update and inspect" says a run changes nothing while the recorder is busy; its start-of-run repair can write device.crt.version then`)
+	}
+	if !strings.Contains(update, "Installs nothing and restarts nothing while the recorder is busy") {
+		t.Error(`the runbook's "Update and inspect" does not say that a run installs nothing and restarts nothing while the recorder is busy`)
+	}
 }
 
 // TestRunbookSaysTheSecretsHoldThePisOwnValues fails if "The Pi's secrets"
-// does not say that the two secrets hold the Pi's current values, copied once
-// from the Pi's own .env; where a person gets a replacement Dispatch token (a
-// no-scope agent token from Dispatch, Settings → Agent tokens); and that the
-// check's two hashes must be equal and neither may be the hash of nothing. It
-// also fails if the runbook still mints a token, reads whoami, compares the
-// recorder's start, or revokes a Dispatch token.
+// does not say that each secret's first version was copied once from the Pi's
+// own .env; that the blocks run in bash; where a person gets a replacement
+// Dispatch token (a no-scope agent token from Dispatch, Settings → Agent
+// tokens) and that the form's two ticked boxes must be cleared, since a new
+// token gets both scopes unless they are; and that the check's two hashes must
+// be equal and neither may be the hash of nothing. It also fails if the
+// runbook still mints a token, reads whoami, compares the recorder's start,
+// revokes a Dispatch token, or says the form makes a no-scope token by itself.
 func TestRunbookSaysTheSecretsHoldThePisOwnValues(t *testing.T) {
 	section := runbookSection(t, "## The Pi's secrets")
-	for _, words := range []string{"hold the Pi's current values", "copied once from the Pi's own `.env`", "Settings → Agent tokens", "no-scope agent token", "must be equal", "neither may be `e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855`"} {
+	for _, words := range []string{"first version was copied once from the Pi's own `.env`", "Run each block in bash", "Settings → Agent tokens", "no-scope agent token", "clear both boxes", "Act as you", "Approve and control credentials", "leave Read only clear", "must be equal", "neither may be `e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855`"} {
 		if !strings.Contains(section, words) {
 			t.Errorf("the runbook's \"The Pi's secrets\" does not say %q", words)
 		}
 	}
 	words := strings.Join(strings.Fields(readRunbook(t)), " ")
-	for _, stale := range []string{"/api/v1/me/", "whoami", "mints a new", "mint it into its secret", "DISPATCH_TOKEN_FILE", "revoke the old token", "the recorder started at <time>"} {
+	for _, stale := range []string{"/api/v1/me/", "whoami", "mints a new", "mint it into its secret", "DISPATCH_TOKEN_FILE", "revoke the old token", "Revoke the token that the Pi used before", "Dispatch shows a token only in the answer to its mint", "the recorder started at <time>", "Agent tokens, with no scope"} {
 		if strings.Contains(words, stale) {
-			t.Errorf("the runbook still mints, checks or revokes a Dispatch token: %q", stale)
+			t.Errorf("the runbook still mints, checks or revokes a Dispatch token, or trusts the form's scopes: %q", stale)
 		}
 	}
 }

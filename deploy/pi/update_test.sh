@@ -1036,6 +1036,11 @@ expect_line_like() {
   grep -Eqx -- "$2" <<<"$out" || fail "$1: printed no line like $2; output: $out"
 }
 
+# expect_line WHAT LINE: update.sh printed LINE, whole, whatever its exit.
+expect_line() {
+  grep -Fqx -- "$2" <<<"$out" || fail "$1: printed no line \"$2\"; output: $out"
+}
+
 # expect_no_output WHAT TEXT: update.sh printed TEXT nowhere.
 expect_no_output() {
   if grep -Fq -- "$2" <<<"$out"; then
@@ -2622,6 +2627,7 @@ release=b run_update
 what='certificate, a refresh killed after the certificate went in, then a run'
 expect_pair "$what" 'NEW CERTIFICATE' 2
 expect_run "$what" 0 'ghost-wispr update: the recorder started before the installed device.crt; restarting it'
+expect_line "$what" 'ghost-wispr update: finished the certificate swap that a run cut short: device.crt.version is 2'
 expect_secrets_flag "$what" --installed-certificate-version 2
 [[ $journal == "$(printf 'version 2\nsha256 %s' "$(sha "$work_dir/pair-new.crt")")" ]] \
   || fail "$what: the kill left the journal [$journal]; want version 2 and the new certificate's SHA-256"
@@ -2630,6 +2636,7 @@ release=b run_update
 what='certificate, a refresh killed before the certificate went in, then a run'
 expect_pair "$what" 'INSTALLED CERTIFICATE' 1
 expect_run "$what" 0 "ghost-wispr update: already current at commit $commit_b"
+expect_line "$what" "ghost-wispr update: removed $opt/device.crt.version.new, of a run cut short before its certificate went in; device.crt and device.crt.version stay as they are"
 [[ $(restarts) == 0 ]] || fail "$what: restarted the recorder: $(<"$state/systemctl.log")"
 [[ $journal != none ]] || fail "$what: the kill left no journal"
 killed_refresh device.crt.version.new 1
@@ -2640,11 +2647,14 @@ release=b run_update
 what="certificate, a rollback killed after the old certificate went back, then a run"
 expect_pair "$what" 'INSTALLED CERTIFICATE' 1
 expect_run "$what" 0 'ghost-wispr update: the recorder started before the installed device.crt; restarting it'
+expect_line "$what" 'ghost-wispr update: finished the certificate swap that a run cut short: device.crt.version is 1'
 [[ $journal == "$(printf 'version 1\nsha256 %s' "$(sha "$work_dir/pair-installed.crt")")" ]] \
   || fail "$what: the kill left the journal [$journal]; want version 1 and the old certificate's SHA-256"
 mute=1 killed_refresh device.crt 2
 release=b run_update
-expect_pair 'certificate, a rollback killed before the old certificate went back, then a run' 'NEW CERTIFICATE' 2
+what='certificate, a rollback killed before the old certificate went back, then a run'
+expect_pair "$what" 'NEW CERTIFICATE' 2
+expect_line "$what" "ghost-wispr update: removed $opt/device.crt.version.new, of a run cut short before its certificate went in; device.crt and device.crt.version stay as they are"
 mute=1 killed_refresh device.crt.version.new 2
 release=b run_update
 expect_pair "certificate, a rollback killed before its journal, then a run" 'NEW CERTIFICATE' 2
@@ -2657,6 +2667,7 @@ printf 'version none\nsha256 %s\n' "$(sha "$opt/device.crt")" >"$opt/device.crt.
 release=b run_update
 what='certificate, a journal of a restore to no version file'
 expect_run "$what" 0
+expect_line "$what" 'ghost-wispr update: finished the certificate swap that a run cut short: device.crt.version is none'
 expect_pair "$what" 'INSTALLED CERTIFICATE' missing
 # release-and-certificate: a certificate staged while a release installs goes in with the set, and
 # the release's one restart serves both (R11); when that release's version check fails, the old
