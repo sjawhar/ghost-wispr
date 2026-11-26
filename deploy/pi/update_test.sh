@@ -137,10 +137,11 @@ cat >"$bin/curl" <<'EOF'
 # recorder's /api/status answers the status program $TEST_STATE/status, one line a read and its
 # last line for every read after: a keyword below or a JSON object. /api/version answers the commit
 # that the running image names in its "# answers commit" line. Neither answers while the
-# recorder's unit is not active. Each call's --max-time and URL go to $TEST_STATE/curl.log. With
-# TEST_SLOW=1 each call takes all of its --max-time on the test's clock, as a call at its worst;
-# each call to a URL that the glob TEST_CURL_FAIL matches fails as curl does on a network fault
-# (exit 6, the host could not be resolved).
+# recorder's unit is not active. Each call's --max-time and URL go to $TEST_STATE/curl.log, and each
+# status read the .env and certificate it found to $TEST_STATE/status-reads.log. With TEST_SLOW=1
+# each call takes all of its --max-time on the test's clock, as a call at its worst; each call to a
+# URL that the glob TEST_CURL_FAIL matches fails as curl does on a network fault (exit 6, the host
+# could not be resolved).
 set -euo pipefail
 state=${TEST_STATE:?}
 output='' url='' max_time=''
@@ -174,6 +175,10 @@ status_answer() {
   local reads line
   reads=$(($(cat -- "$state/status.reads" 2>/dev/null || echo 0) + 1))
   echo "$reads" >"$state/status.reads"
+  # What the recorder's .env and certificate were at this read: a read just before a restart sees the
+  # files the restart would start on.
+  printf 'status-read env=%s crt=%s\n' "$(sum "${GHOST_WISPR_DEPLOY_DIR:?}/.env")" \
+    "$(sum "$GHOST_WISPR_DEPLOY_DIR/device.crt")" >>"$state/status-reads.log"
   line=$(sed -n "${reads}p" "$state/status" 2>/dev/null || true)
   if [[ -z $line ]]; then
     line=$(sed -n '$p' "$state/status" 2>/dev/null || true)
@@ -195,6 +200,11 @@ status_answer() {
       exit 2
       ;;
   esac
+}
+
+sum() {
+  local s
+  if [[ -f $1 ]] && s=$(sha256sum -- "$1"); then printf '%s\n' "${s%% *}"; else echo none; fi
 }
 
 version_answer() {
@@ -233,18 +243,22 @@ cat >"$bin/systemctl" <<'EOF'
 # The fake systemctl --user of ghost-wispr's user manager.
 # - is-active: the recorder's unit is active while $TEST_STATE/active exists.
 # - show: MainPID ($TEST_STATE/main-pid, 4242 by default, 0 while the unit is not active),
-#   LoadState (loaded while the unit file is in the unit directory, else not-found) and DropInPaths
-#   (each *.conf in the unit's .d directory there), as NAME=VALUE lines or, with --value, values.
+#   LoadState (loaded while the unit file is in the unit directory, else not-found), DropInPaths
+#   (each *.conf in the unit's .d directory there) and ExecMainStartTimestamp ($TEST_STATE/main-start,
+#   the real time the recorder's main process started, as --timestamp=us+utc prints it; empty while
+#   the unit is not active), as NAME=VALUE lines or, with --value, values.
 # - show-environment: $TEST_STATE/manager-env, else a manager's few variables; it exits
 #   $TEST_STATE/manager-env-exit (0 by default).
-# - daemon-reload logs the recorder's unit file as it reads it.
+# - daemon-reload logs the recorder's unit file as it reads it. The Nth one fails, once, when
+#   $TEST_STATE/fail-daemon-reload-at says N.
 # - restart ghost-wispr.service logs the .env its start job begins on, then runs the installed
 #   unit's ExecStartPre lines (run_start_pre), and logs what the recorder starts on after them (the
 #   binary, .env, config and certificate). It takes TEST_RESTART_SECONDS of the test's clock,
 #   starts the installed binary (its running image) and makes the unit active, then is the event
-#   "restart". The Nth restart does what $TEST_STATE/restart-N says: ok (the default); fail, a
-#   start job that fails while the unit stays active; fail-stop, one whose unit stops; busy-exec, a
-#   start job that fails while the installed binary runs on as a real process.
+#   "restart". The recorder's main process starts after the ExecStartPre lines, at the real time it
+#   writes to $TEST_STATE/main-start. The Nth restart does what $TEST_STATE/restart-N says: ok (the
+#   default); fail, a start job that fails while the unit stays active; fail-stop, one whose unit
+#   stops; busy-exec, a start job that fails while the installed binary runs on as a real process.
 # Every other call is logged as it is.
 set -euo pipefail
 state=${TEST_STATE:?}
@@ -307,12 +321,13 @@ case ${1:-} in
     ;;
   show)
     shift
-    props=() value=false unit=''
+    props=() value=false unit='' timestamp=pretty
     while (($#)); do
       case $1 in
         -p | --property) IFS=, read -ra more <<<"$2"; props+=("${more[@]}"); shift 2 ;;
         --property=*) IFS=, read -ra more <<<"${1#--property=}"; props+=("${more[@]}"); shift ;;
         --value) value=true; shift ;;
+        --timestamp=*) timestamp=${1#--timestamp=}; shift ;;
         -*) unexpected show "$@" ;;
         *) unit=$1; shift ;;
       esac
@@ -333,12 +348,25 @@ case ${1:-} in
             if [[ -e $dropin ]]; then v+="${v:+ }$dropin"; fi
           done
           ;;
+        ExecMainStartTimestamp)
+          # update.sh compares it with file times to the microsecond, in UTC.
+          [[ $timestamp == us+utc ]] || unexpected show "$prop with --timestamp=$timestamp"
+          v=''
+          if [[ -e $state/active ]]; then v=$(cat -- "$state/main-start" 2>/dev/null || true); fi
+          ;;
         *) unexpected show "$prop" ;;
       esac
       if $value; then printf '%s\n' "$v"; else printf '%s=%s\n' "$prop" "$v"; fi
     done
     ;;
   daemon-reload)
+    n=$(($(cat -- "$state/daemon-reloads" 2>/dev/null || echo 0) + 1))
+    echo "$n" >"$state/daemon-reloads"
+    if [[ $(cat -- "$state/fail-daemon-reload-at" 2>/dev/null || true) == "$n" ]]; then
+      rm -f -- "$state/fail-daemon-reload-at"
+      printf 'daemon-reload failed (made to fail)\n' >>"$state/systemctl.log"
+      exit 1
+    fi
     printf 'daemon-reload unit=%s\n' "$(sum "$units/ghost-wispr.service")" >>"$state/systemctl.log"
     ;;
   restart)
@@ -356,6 +384,7 @@ case ${1:-} in
     if [[ -f $deploy/ghost-wispr ]]; then
       cp -- "$deploy/ghost-wispr" "$state/running-image"
     fi
+    /bin/date -u '+%a %Y-%m-%d %H:%M:%S.%6N UTC' >"$state/main-start"
     touch -- "$state/active"
     "${TEST_FAKES:?}/after" restart
     case $(cat -- "$state/restart-$n" 2>/dev/null || echo ok) in
@@ -384,7 +413,8 @@ cat >"$bin/sudo" <<'EOF'
 # type one. It runs install for real, into GHOST_WISPR_SYSTEM_ROOT alone, and tailscale (the fake),
 # and logs every call with the timeout it runs under, udevadm with the udev rule it would read and
 # the logind restart with the logind setting, in $TEST_STATE/sudo.log. Each udevadm call and each
-# logind restart is the event "system-reload".
+# logind restart is the event "system-reload". The call that $TEST_STATE/fail-sudo names, as its
+# log line names it after the timeout (such as "udevadm control --reload"), fails, once.
 set -euo pipefail
 state=${TEST_STATE:?}
 system_root=${GHOST_WISPR_SYSTEM_ROOT:?}
@@ -396,6 +426,14 @@ unexpected() {
   printf 'fake sudo: unexpected sudo -n %s\n' "$*" >>"$state/errors"
   exit 1
 }
+# made_to_fail LINE ends the call with exit 1, once, when $TEST_STATE/fail-sudo names LINE.
+made_to_fail() {
+  if [[ -f $state/fail-sudo && $(<"$state/fail-sudo") == "$1" ]]; then
+    rm -f -- "$state/fail-sudo"
+    printf 'timeout=%s %s (made to fail)\n' "$under" "$1" >>"$state/sudo.log"
+    exit 1
+  fi
+}
 if [[ ${1:-} != -n ]]; then
   printf 'sudo without -n: sudo %s\n' "$*" >>"$state/errors"
   exit 1
@@ -406,15 +444,18 @@ case ${1:-} in
   install)
     destination=${!#}
     [[ $destination == "$system_root"/* ]] || unexpected "$@"
+    made_to_fail "install ${destination#"$system_root"}"
     printf 'timeout=%s install %s\n' "$under" "${destination#"$system_root"}" >>"$state/sudo.log"
     exec install "${@:2}"
     ;;
   udevadm)
+    made_to_fail "udevadm ${*:2}"
     printf 'timeout=%s udevadm %s rules=%s\n' "$under" "${*:2}" "$(sum "$system_root/etc/udev/rules.d/99-ghost-wispr.rules")" >>"$state/sudo.log"
     "${TEST_FAKES:?}/after" system-reload
     ;;
   systemctl)
     [[ ${*:2} == 'restart systemd-logind' ]] || unexpected "$@"
+    made_to_fail 'systemctl restart systemd-logind'
     printf 'timeout=%s systemctl restart systemd-logind logind=%s\n' "$under" \
       "$(sum "$system_root/etc/systemd/logind.conf.d/50-ghost-wispr-power-key.conf")" >>"$state/sudo.log"
     "${TEST_FAKES:?}/after" system-reload
@@ -537,7 +578,8 @@ cat >"$fakes/pi-secrets" <<'EOF'
 # --out/device.crt when that file exists, and prints C4's lines, never a value. It is the event
 # "secrets". $TEST_STATE/pi-secrets-mode "fail" makes it fail as a key read failure does (R10): no
 # secrets.env and exit 1, after the certificate step has still staged $TEST_STATE/certificate, when
-# that exists; "hang" makes it hang until a timeout ends it.
+# that exists; "hang" makes it hang until a timeout ends it. Its certificate lines are the real
+# pi-secrets' (cmd/ghost-wispr/pi_secrets.go).
 set -euo pipefail
 state=${TEST_STATE:?}
 binary=$1
@@ -605,7 +647,7 @@ if $certificate; then
     cp -- "$state/certificate" "$out/device.crt"
     printf 'pi-secrets: certificate version 2, not after 2027-11-26T00:00:00Z: newer and signs in\n'
   else
-    printf 'pi-secrets: certificate version 1 kept: not newer than the installed certificate\n'
+    printf 'pi-secrets: certificate version 1 kept: not newer\n'
   fi
 fi
 EOF
@@ -755,20 +797,36 @@ new_pi() {
   printf 'DEVICE KEY\n' >"$device_key"
   printf '{"type":"external_account"}\n' >"$opt/google-credentials.json"
   printf 'INSTALLED CERTIFICATE\n' >"$opt/device.crt"
+  mark_recorder_started
   printf 'IDLE\n' >"$state/status"
   touch -- "$state/active" "$state/systemctl.log" "$state/sudo.log" "$state/sleep.log" "$state/curl.log" \
     "$state/timeout.log" "$state/pi-secrets.log" "$state/start-pi-secrets.log" "$state/journal.log" \
-    "$state/clock-synchronized"
+    "$state/clock-synchronized" "$state/status-reads.log"
   serve_json_for "$repo_root/deploy/pi/files/serve.conf" >"$state/serve.json"
   printf '%s\n' GHOST_WISPR_DEEPGRAM_API_KEY=dg-test-1 GHOST_WISPR_DISPATCH_TOKEN=tok-test-1 >"$state/secrets"
   echo 1000 >"$state/clock"
+}
+
+# mark_recorder_started notes now as the start of the recorder's main process, as the fake restart
+# does: each file written before is one it started on.
+mark_recorder_started() {
+  date -u '+%a %Y-%m-%d %H:%M:%S.%6N UTC' >"$state/main-start"
+}
+
+# written_after_start FILE... gives each FILE the time 1 ms after the recorder's start, as a file that
+# an update installed and then never restarted the recorder for. Any later restart is later still.
+written_after_start() {
+  local start
+  start=$(date -u -d "$(<"$state/main-start")" +%s%6N)
+  start=$((start + 1000))
+  touch -d "@${start:0:-6}.${start: -6}" -- "$@"
 }
 
 # install_set NAME [DRIVE] puts release NAME's deploy set in place on the fake Pi as update.sh
 # leaves a set it installed and verified: each file where C2 puts it, the config rendered with the
 # shared drive DRIVE when given, an .env of the four owned lines and one operator line, the
 # bootstrap files as provision.sh installs them, deploy.verified naming the set, and the recorder
-# running the installed binary.
+# running the installed binary, started after each of these files was written.
 install_set() {
   local name=$1 drive=${2:-} deploy=$releases/$1/ghost-wispr-pi-deploy file
   for file in "${set_files[@]}" "${bootstrap_files[@]}"; do
@@ -782,16 +840,23 @@ install_set() {
     GHOST_WISPR_DEEPGRAM_API_KEY=dg-test-1 GHOST_WISPR_DISPATCH_TOKEN=tok-test-1 GHOST_WISPR_JABRA_MUTE_BUTTON=false
   record_verified "$name"
   cp -- "$opt/ghost-wispr" "$state/running-image"
+  mark_recorder_started
 }
 
 # save_installed DIR copies what the fake Pi has installed of the deploy set, its rendered config,
-# .env and binary included, into DIR, one file a name.
+# .env and binary included, and the certificate and its version file when it has them, into DIR,
+# one file a name.
 save_installed() {
   local dir=$1 file
   rm -rf -- "${dir:?}"
   mkdir -p -- "$dir"
   for file in "${set_files[@]}" .env ghost-wispr; do
     cp -p -- "$(installed_path "$file")" "$dir/$file"
+  done
+  for file in device.crt device.crt.version; do
+    if [[ -e $opt/$file ]]; then
+      cp -p -- "$opt/$file" "$dir/$file"
+    fi
   done
 }
 
@@ -1090,6 +1155,38 @@ diff <(printf '%s\n' "${kept_lines[@]}") "$work_dir/kept.env" >&2 \
 if lib env_kept_lines "$work_dir/missing.env" >/dev/null 2>&1; then
   fail 'env_kept_lines succeeded without a deployed .env'
 fi
+# A line counts as systemd's EnvironmentFile= parser reads it (src/basic/env-file.c), which the
+# recorder's environment comes from: past leading spaces and tabs, with spaces or tabs before the =,
+# and after a carriage return, which ends a line as a line feed does. systemd keeps a variable's
+# last value, so an indented GHOST_WISPR_ADDR=0.0.0.0:8080 kept after update.sh's own line would
+# have the recorder listen past loopback, and an indented old key would be the key it uses. A
+# comment, and a line inside another variable's quoted value, set nothing and stay. Breaks they
+# catch: a filter that reads a line from its first byte, so an indented or a CR-joined line of an
+# owned or a removed variable stays; one that reads each line alone, so it drops a line of a quoted
+# value, and the lines after it then join that value.
+printf '%s\n' '# an operator note' '  GHOST_WISPR_ADDR=0.0.0.0:8080' $'\tGHOST_WISPR_DEEPGRAM_API_KEY=dg-old' \
+  'GHOST_WISPR_DISPATCH_TOKEN =tok-old' $' GHOST_WISPR_GCP_PROJECT\t= old-project' \
+  $'GHOST_WISPR_MIC_DEVICE=hw:1\rGHOST_WISPR_ADDR=0.0.0.0:9090' '  # GHOST_WISPR_ADDR=0.0.0.0:7070, a comment' \
+  'GHOST_WISPR_NOTE="a note' 'GHOST_WISPR_ADDR=inside the note"' 'GHOST_WISPR_JABRA_MUTE_BUTTON=true' >"$work_dir/indented.env"
+lib env_kept_lines "$work_dir/indented.env" >"$work_dir/kept.env" || fail 'env_kept_lines refused an .env with indented lines'
+# The CR-joined line keeps the microphone setting and its CR, which ends it as before.
+printf '%s' '# an operator note' $'\n' 'GHOST_WISPR_MIC_DEVICE=hw:1' $'\r' '  # GHOST_WISPR_ADDR=0.0.0.0:7070, a comment' \
+  $'\n' 'GHOST_WISPR_NOTE="a note' $'\n' 'GHOST_WISPR_ADDR=inside the note"' $'\n' 'GHOST_WISPR_JABRA_MUTE_BUTTON=true' \
+  $'\n' >"$work_dir/kept.want"
+cmp -s -- "$work_dir/kept.want" "$work_dir/kept.env" \
+  || fail "env_kept_lines did not drop exactly the owned and removed variables systemd reads: $(od -c "$work_dir/kept.env")"
+# env_secret_lines prints the two secret lines that systemd reads from an .env, each the last one of
+# its variable, Deepgram's first: the lines a failed pi-secrets read keeps (R9).
+lib env_secret_lines "$work_dir/indented.env" >"$work_dir/secret-lines" || fail 'env_secret_lines refused an .env'
+diff <(printf '%s\n' GHOST_WISPR_DEEPGRAM_API_KEY=dg-old 'GHOST_WISPR_DISPATCH_TOKEN =tok-old') "$work_dir/secret-lines" >&2 \
+  || fail 'env_secret_lines did not print the secret lines systemd reads (diff above)'
+printf '%s\n' GHOST_WISPR_DISPATCH_TOKEN=tok-first GHOST_WISPR_DEEPGRAM_API_KEY=dg-first '  GHOST_WISPR_DEEPGRAM_API_KEY=dg-last' \
+  'GHOST_WISPR_NOTE="x' 'GHOST_WISPR_DISPATCH_TOKEN=inside the note"' >"$work_dir/twice.env"
+diff <(printf '%s\n' GHOST_WISPR_DEEPGRAM_API_KEY=dg-last GHOST_WISPR_DISPATCH_TOKEN=tok-first) <(lib env_secret_lines "$work_dir/twice.env") >&2 \
+  || fail 'env_secret_lines did not print the last secret line of each variable that systemd reads (diff above)'
+if lib env_secret_lines "$work_dir/missing.env" >/dev/null 2>&1; then
+  fail 'env_secret_lines succeeded without a deployed .env'
+fi
 
 # ---------------------------------------------------------------------------------------------------
 begin whole-set
@@ -1245,7 +1342,8 @@ make_release b "$commit_b" && pack_release b
 install_set a
 write_env "$opt/.env" '# set by the operator' GHOST_WISPR_DEEPGRAM_API_KEY=dg-old GHOST_WISPR_JABRA_MUTE_BUTTON=false \
   GHOST_WISPR_EMBEDDING_LOCATION=global GHOST_WISPR_ADDR=0.0.0.0:8080 GOOGLE_API_USE_CLIENT_CERTIFICATE=true \
-  GHOST_WISPR_DISPATCH_TOKEN=tok-old GHOST_WISPR_MIC_DEVICE=hw:Loopback
+  GHOST_WISPR_DISPATCH_TOKEN=tok-old GHOST_WISPR_MIC_DEVICE=hw:Loopback '  GHOST_WISPR_ADDR=0.0.0.0:9090' \
+  $'\tGHOST_WISPR_DEEPGRAM_API_KEY=dg-older'
 printf '%s\n' GHOST_WISPR_DEEPGRAM_API_KEY=dg-test-2 GHOST_WISPR_DISPATCH_TOKEN=tok-test-2 >"$state/secrets"
 release=b run_update
 expect_run env-lines 0 "ghost-wispr update: installed commit $commit_b (invocation test-invocation-7)"
@@ -1327,6 +1425,16 @@ printf '%s\n' MY_GHOST_WISPR_CONFIG=/x >>"$opt/.env"
 printf '%s\n' HOME=/home/ghost-wispr PATH=/usr/bin:/bin MY_GHOST_WISPR_CONFIG=/x >"$state/manager-env"
 release=b run_update
 expect_run 'override-refused control' 0 "ghost-wispr update: installed commit $commit_b (invocation test-invocation-7)"
+# The release current, with new secrets and a newer certificate to install: that refresh installs
+# files and restarts the recorder too, so the refusal holds for it as for a release (R7). Break it
+# catches: a refusal on the install path alone, so a refresh restarts the recorder on another config.
+new_pi
+install_set b
+printf '%s\n' GHOST_WISPR_CONFIG=/x >>"$opt/.env"
+mark_recorder_started
+printf '%s\n' GHOST_WISPR_DEEPGRAM_API_KEY=dg-test-2 GHOST_WISPR_DISPATCH_TOKEN=tok-test-2 >"$state/secrets"
+printf 'NEW CERTIFICATE\n' >"$state/certificate"
+override_refused 'override-refused (the release current, new secrets and a certificate to install)' GHOST_WISPR_CONFIG
 
 begin drop-in-refused
 # drop-in-refused: a drop-in of ghost-wispr.service or ghost-wispr-update.service can set the
@@ -1350,6 +1458,21 @@ install_set a
 mkdir -p -- "$units/ghost-wispr.service.d"
 release=b run_update
 expect_run 'drop-in-refused control' 0 "ghost-wispr update: installed commit $commit_b (invocation test-invocation-7)"
+# The release current, with new secrets and a newer certificate to install: refused as well (R7).
+for unit in ghost-wispr.service ghost-wispr-update.service; do
+  what="drop-in-refused ($unit, the release current, new secrets and a certificate to install)"
+  new_pi
+  install_set b
+  mkdir -p -- "$units/$unit.d"
+  printf '[Service]\nEnvironment=GHOST_WISPR_LOG_LEVEL=debug\n' >"$units/$unit.d/override.conf"
+  printf '%s\n' GHOST_WISPR_DEEPGRAM_API_KEY=dg-test-2 GHOST_WISPR_DISPATCH_TOKEN=tok-test-2 >"$state/secrets"
+  printf 'NEW CERTIFICATE\n' >"$state/certificate"
+  before=$(snapshot)
+  release=b run_update
+  expect_run "$what" 10 "ghost-wispr update: $unit has a drop-in ($units/$unit.d/override.conf); nothing was installed"
+  expect_unchanged "$what" "$before"
+  [[ $(restarts) == 0 ]] || fail "$what: restarted the recorder"
+done
 
 # ---------------------------------------------------------------------------------------------------
 begin rollback-whole-set
@@ -1405,6 +1528,45 @@ for path in /etc/udev/rules.d/99-ghost-wispr.rules /etc/systemd/logind.conf.d/50
     || fail "rollback-whole-set: sudo -n install did not install $path for the release and again for the rollback, each under its 30 s bound: $(<"$state/sudo.log")"
 done
 
+# A step after the swap that fails rolls the set back as a failed version check does: the install
+# of a later file (the logind setting, after the udev rule and the user unit), the user manager's
+# reload, udev's reload and logind's restart. Each run exits 10 with every file back byte for byte,
+# deploy.verified as it was, no installed line, and udev, logind and the user manager reading the
+# restored files again before the recorder restarts on them. Breaks they catch: an update that goes
+# on after such a step failed, so the recorder runs a set the system never read and deploy.verified
+# names it; a rollback that leaves the files swapped before the failed one.
+# step_fails STEP FILE CONTENT WHY: $state/FILE holding CONTENT makes STEP fail once; the run fails
+# with WHY.
+step_fails() {
+  local what="rollback-whole-set (the $1 fails)" last_logind
+  new_pi
+  install_set a
+  save_installed "$work_dir/before-a"
+  cp -- "$opt/deploy.verified" "$work_dir/verified-a"
+  printf '%s\n' "$3" >"$state/$2"
+  release=b run_update
+  [[ ! -e $state/$2 ]] || fail "$what: the update never ran the step made to fail"
+  expect_run "$what" 10 "ghost-wispr update: $4; restored the previous release"
+  expect_no_output "$what" 'installed commit'
+  expect_installed_is "$what" "$work_dir/before-a"
+  cmp -s -- "$work_dir/verified-a" "$opt/deploy.verified" || fail "$what: changed deploy.verified"
+  [[ $(restarts) == 1 && $(grep '^restart ' "$state/systemctl.log") == "restart binary=$(sha "$opt/ghost-wispr") env=$(sha "$opt/.env") config=$(sha "$opt/ghost-wispr.yaml") crt=$(sha "$opt/device.crt")" ]] \
+    || fail "$what: did not restart the recorder once, on the restored set: $(<"$state/systemctl.log")"
+  # The logind setting's install that fails leaves its file as it was, and logind restarts for
+  # neither the release nor the rollback.
+  last_logind=$(grep -v 'made to fail' "$state/sudo.log" | grep 'systemd-logind' | tail -n1 || true)
+  [[ $(grep '^daemon-reload unit=' "$state/systemctl.log" | tail -n1) == "daemon-reload unit=$(sha "$units/ghost-wispr.service")" \
+    && $(grep 'udevadm trigger' "$state/sudo.log" | tail -n1) == "timeout=30s udevadm trigger rules=$(sha "$(installed_path 99-ghost-wispr.rules)")" \
+    && (-z $last_logind || $last_logind == "timeout=30s systemctl restart systemd-logind logind=$(sha "$(installed_path logind-power-key.conf)")") ]] \
+    || fail "$what: the user manager, udev and logind did not read the restored files: $(cat -- "$state/systemctl.log" "$state/sudo.log")"
+}
+step_fails 'install of the logind setting' fail-sudo 'install /etc/systemd/logind.conf.d/50-ghost-wispr-power-key.conf' \
+  "could not install the release's files"
+# The first daemon-reload is the refusal check's, before any change; the second follows the swap.
+step_fails "user manager's reload" fail-daemon-reload-at 2 'could not reload the user manager'
+step_fails "udev reload" fail-sudo 'udevadm control --reload' 'could not reload udev or restart logind'
+step_fails "logind restart" fail-sudo 'systemctl restart systemd-logind' 'could not reload udev or restart logind'
+
 # A rollback puts the old binary back while the new one still runs: a copy over a file that is
 # executing fails with "Text file busy", which would leave the new binary in place. The new binary
 # here is a real executable that its failed start leaves running.
@@ -1448,10 +1610,11 @@ left_running() {
   [[ $(<"$state/sleep.log") == "$3" && $(cat -- "$state/status.reads" 2>/dev/null || echo 0) == "$4" ]] \
     || fail "$1: read the status $(cat -- "$state/status.reads" 2>/dev/null || echo 0) times after waits $(printf %q "$(<"$state/sleep.log")"); want $4 reads after $(printf %q "$3")"
 }
-# rolled_back WHAT SLEEPS
+# rolled_back WHAT SLEEPS [LINE]: the run failed with a line like LINE, by default one that names the
+# previous release restored, restored the set, and restarted the recorder after waits SLEEPS.
 rolled_back() {
   expect_run "$1" 10
-  expect_line_like "$1" 'ghost-wispr update: .*; restored the previous release'
+  expect_line_like "$1" "${3:-ghost-wispr update: .*; restored the previous release}"
   expect_installed_is "$1" "$work_dir/before-a"
   [[ $(restarts) == 2 ]] || fail "$1: want the rollback's restart: $(<"$state/systemctl.log")"
   [[ $(<"$state/sleep.log") == "$2" ]] || fail "$1: waited $(printf %q "$(<"$state/sleep.log")"), want $(printf %q "$2")"
@@ -1473,7 +1636,7 @@ begin partial-install
 # partial-install: an update cut short mid-swap (a power cut, or the launcher's time limit) leaves
 # part of the new set installed while deploy.verified names the set before. The next run keeps the
 # .prev copies of that verified set as they are, not the half-swapped files, and installs the whole
-# set; a rollback then restores the verified set, not a mix.
+# set; a rollback then restores the verified set, not a mix, and says so.
 partial_pi() {
   local file
   new_pi
@@ -1491,9 +1654,48 @@ expect_run partial-install 0 "ghost-wispr update: installed commit $commit_b (in
 expect_set_of partial-install b
 expect_verified partial-install b
 expect_prev_is partial-install "$work_dir/before-a"
+readonly last_verified_line='ghost-wispr update: .*; restored the last verified set, the one deploy\.verified lists'
 partial_pi broken
 release=broken run_update
-rolled_back 'partial-install, then a release that fails' "$(printf 'sleep 2\n%.0s' {1..60} | head -c -1)"
+rolled_back 'partial-install, then a release that fails' "$(printf 'sleep 2\n%.0s' {1..60} | head -c -1)" "$last_verified_line"
+# An install of b cut short after it swapped in the binary and a new certificate, with its version
+# file: the retry stages no certificate (pi-secrets finds the installed one current) and swaps in
+# neither, so a rollback of this run's swaps alone would leave a certificate that nothing verified.
+# A retry that finds the set not the verified one restores every file with a .prev copy, the
+# certificate and its version file included, and a busy Pi gets the same; each run exits 10 and
+# says the last verified set went back.
+cut_short_pi() {
+  local file
+  new_pi
+  install_set a
+  printf '1\n' >"$opt/device.crt.version"
+  save_installed "$work_dir/before-a"
+  cp -- "$opt/deploy.verified" "$work_dir/verified-a"
+  for file in "${set_files[@]}" .env ghost-wispr device.crt device.crt.version; do
+    cp -p -- "$(installed_path "$file")" "$opt/$file.prev"
+  done
+  cp -- "$releases/b/ghost-wispr-linux-arm64" "$opt/ghost-wispr"
+  printf 'NEW CERTIFICATE\n' >"$opt/device.crt"
+  printf '2\n' >"$opt/device.crt.version"
+}
+cut_short_pi
+touch -- "$state/version-mute.after-restart"
+release=b run_update
+what='partial-install, cut short after the binary and the certificate, then a retry that fails'
+rolled_back "$what" "$(printf 'sleep 2\n%.0s' {1..60} | head -c -1)" "$last_verified_line"
+expect_installed_is "$what" "$work_dir/before-a" device.crt device.crt.version
+cmp -s -- "$work_dir/verified-a" "$opt/deploy.verified" || fail "$what: changed deploy.verified"
+for busy in 'SESSION|active session'; do
+  what="partial-install, cut short after the binary and the certificate, then ${busy#*|} during the retry's reloads"
+  cut_short_pi
+  printf '%s\n' "${busy%%|*}" >"$state/status.after-system-reload"
+  release=b run_update
+  expect_run "$what" 10
+  expect_line_like "$what" "ghost-wispr update: ${busy#*|}; restored the last verified set, the one deploy\\.verified lists.*"
+  [[ $(restarts) == 0 ]] || fail "$what: restarted the recorder: $(<"$state/systemctl.log")"
+  expect_installed_is "$what" "$work_dir/before-a" "${set_files[@]}" .env ghost-wispr device.crt device.crt.version
+  cmp -s -- "$work_dir/verified-a" "$opt/deploy.verified" || fail "$what: changed deploy.verified"
+done
 
 begin same-commit-different-set
 # same-commit-different-set: deploy.verified names the release's commit, but an installed file of
@@ -1837,6 +2039,90 @@ for hook in status status.after-secrets; do
   expect_unchanged "secrets-only-change, busy ($hook)" "$before"
   [[ $(restarts) == 0 ]] || fail "secrets-only-change, busy ($hook): restarted the recorder"
 done
+# A session or a call that starts during the swap of the new .env and certificate, after the read
+# just before it, stops the run just before the restart (R7): the status read there, which sees the
+# new files in place, finds it. The files go back from their .prev copies, the recorder runs on,
+# unrestarted, and the run exits 0. Break it catches: a refresh that reads the status before its
+# swap alone, and restarts the recorder mid-session or mid-call.
+write_env "$work_dir/refreshed.env" GHOST_WISPR_ADDR=127.0.0.1:8080 GOOGLE_API_USE_CLIENT_CERTIFICATE=false \
+  GHOST_WISPR_DEEPGRAM_API_KEY=dg-test-2 GHOST_WISPR_DISPATCH_TOKEN=tok-test-2 GHOST_WISPR_JABRA_MUTE_BUTTON=false
+printf 'NEW CERTIFICATE\n' >"$work_dir/new.crt"
+for busy in "${busy_cases[@]:0:2}"; do
+  what="secrets-only-change, ${busy#*|} during the swap"
+  new_pi
+  install_set b
+  printf '1\n' >"$opt/device.crt.version"
+  save_installed "$work_dir/before-b"
+  printf '%s\n' GHOST_WISPR_DEEPGRAM_API_KEY=dg-test-2 GHOST_WISPR_DISPATCH_TOKEN=tok-test-2 >"$state/secrets"
+  cp -- "$work_dir/new.crt" "$state/certificate"
+  # The run's first read and the read just before the swap find the Pi free; the next one, busy.
+  printf '%s\n' IDLE IDLE "${busy%%|*}" >"$state/status"
+  release=b run_update
+  expect_run "$what" 0 "ghost-wispr update: ${busy#*|}; leaving the current release in place"
+  [[ $(restarts) == 0 ]] || fail "$what: restarted the recorder: $(<"$state/systemctl.log")"
+  [[ $(tail -n1 "$state/status-reads.log") == "status-read env=$(sha "$work_dir/refreshed.env") crt=$(sha "$work_dir/new.crt")" ]] \
+    || fail "$what: the last status read was not just before the restart, with the new files in place: $(<"$state/status-reads.log")"
+  expect_installed_is "$what" "$work_dir/before-b" .env device.crt device.crt.version
+  expect_no_output "$what" 'installed secrets'
+  expect_no_output "$what" 'installed certificate'
+done
+# A run killed after a refresh put in .env or the certificate, before the restart, leaves the
+# recorder on the old ones, and the next run finds the files current. A run that finds .env or the
+# certificate newer than the recorder's start (systemd's ExecMainStartTimestamp) restarts the
+# recorder on them once it is free, and checks its version as a refresh does. Breaks they catch: a
+# refresh whose cut-short swap leaves the recorder on an old key, or an old certificate, for good.
+cut_short_refresh() {
+  new_pi
+  install_set b
+  printf '1\n' >"$opt/device.crt.version"
+  cp -p -- "$opt/.env" "$opt/.env.prev"
+  cp -p -- "$opt/device.crt" "$opt/device.crt.prev"
+  cp -p -- "$opt/device.crt.version" "$opt/device.crt.version.prev"
+  save_installed "$work_dir/before-b"
+  # pi-secrets reads what the cut-short refresh installed, so this run has nothing new to install.
+  printf '%s\n' GHOST_WISPR_DEEPGRAM_API_KEY=dg-test-2 GHOST_WISPR_DISPATCH_TOKEN=tok-test-2 >"$state/secrets"
+  cp -p -- "$work_dir/refreshed.env" "$opt/.env"
+  written_after_start "$opt/.env"
+}
+cut_short_refresh
+release=b run_update
+what='secrets-only-change, a refresh cut short before its restart'
+expect_run "$what" 0 "ghost-wispr update: already current at commit $commit_b" \
+  'ghost-wispr update: the recorder started before the installed .env; restarting it'
+[[ $(restarts) == 1 ]] && grep -Fqx "restart binary=$(sha "$opt/ghost-wispr") env=$(sha "$work_dir/refreshed.env") config=$(sha "$opt/ghost-wispr.yaml") crt=$(sha "$opt/device.crt")" "$state/systemctl.log" \
+  || fail "$what: did not restart the recorder once on the installed .env: $(<"$state/systemctl.log")"
+cmp -s -- "$work_dir/refreshed.env" "$opt/.env" || fail "$what: changed .env"
+# Once it restarted, the next run has nothing to do.
+mark_recorder_started
+: >"$state/systemctl.log"
+rm -f -- "$state/restarts"
+release=b run_update
+expect_run "$what, the next run" 0 "ghost-wispr update: already current at commit $commit_b"
+[[ $(restarts) == 0 ]] || fail "$what, the next run: restarted the recorder again"
+# Busy: nothing changes, and the run exits 0.
+cut_short_refresh
+printf '%s\n' IDLE SESSION >"$state/status"
+before=$(snapshot)
+release=b run_update
+expect_run "$what, busy" 0 'ghost-wispr update: active session; leaving the current release in place'
+expect_unchanged "$what, busy" "$before"
+[[ $(restarts) == 0 ]] || fail "$what, busy: restarted the recorder"
+# The certificate too; when the recorder does not answer after that restart, the certificate, its
+# version file and .env go back from their .prev copies and the run fails.
+cut_short_refresh
+cp -p -- "$work_dir/new.crt" "$opt/device.crt"
+printf '2\n' >"$opt/device.crt.version"
+written_after_start "$opt/device.crt"
+touch -- "$state/version-mute.after-restart"
+release=b run_update
+expect_run "$what, then no answer" 10 \
+  'ghost-wispr update: the recorder started before the installed .env device.crt; restarting it'
+expect_line_like "$what, then no answer" 'ghost-wispr update: .*; restored the previous release'
+expect_installed_is "$what, then no answer" "$work_dir/before-b" device.crt device.crt.version
+# .env is the .prev copy when the rollback's restart begins; that restart's own secrets step then
+# writes the secret lines pi-secrets gives, as each start does (R9).
+[[ $(grep '^start-pre ' "$state/systemctl.log" | tail -n1) == "start-pre env=$(sha "$work_dir/before-b/.env")" ]] \
+  || fail "$what, then no answer: .env was not its .prev copy when the rollback's restart began: $(<"$state/systemctl.log")"
 
 begin secrets-read-fails
 # secrets-read-fails: pi-secrets fails (Secret Manager down, or a grant gone): .env keeps the secret
@@ -1850,6 +2136,19 @@ expect_run secrets-read-fails 10 "ghost-wispr update: installed commit $commit_b
 expect_set_of secrets-read-fails b
 expect_env secrets-read-fails GHOST_WISPR_ADDR=127.0.0.1:8080 GOOGLE_API_USE_CLIENT_CERTIFICATE=false \
   GHOST_WISPR_DEEPGRAM_API_KEY=dg-test-1 GHOST_WISPR_DISPATCH_TOKEN=tok-test-1 GHOST_WISPR_JABRA_MUTE_BUTTON=false
+# The secret lines it keeps are the ones systemd reads from .env: the last line of each variable,
+# an indented one too. Break it catches: a fallback that keeps the first unindented line, so a key
+# the recorder never used becomes the one it uses.
+new_pi
+install_set a
+write_env "$opt/.env" GHOST_WISPR_ADDR=127.0.0.1:8080 GOOGLE_API_USE_CLIENT_CERTIFICATE=false \
+  GHOST_WISPR_DEEPGRAM_API_KEY=dg-test-1 GHOST_WISPR_DISPATCH_TOKEN=tok-test-1 GHOST_WISPR_JABRA_MUTE_BUTTON=false \
+  '  GHOST_WISPR_DEEPGRAM_API_KEY=dg-indented'
+echo fail >"$state/pi-secrets-mode"
+release=b run_update
+expect_run 'secrets-read-fails, an indented key' 10 "ghost-wispr update: installed commit $commit_b (invocation test-invocation-7)"
+expect_env 'secrets-read-fails, an indented key' GHOST_WISPR_ADDR=127.0.0.1:8080 GOOGLE_API_USE_CLIENT_CERTIFICATE=false \
+  GHOST_WISPR_DEEPGRAM_API_KEY=dg-indented GHOST_WISPR_DISPATCH_TOKEN=tok-test-1 GHOST_WISPR_JABRA_MUTE_BUTTON=false
 # The release current: nothing changes, and the run fails.
 new_pi
 install_set b
@@ -1900,11 +2199,17 @@ begin certificate
 # certificate: pi-secrets stages a newer certificate that signs in: it is installed with the old
 # one as device.crt.prev, and the recorder restarts on it. When the recorder does not answer after
 # that restart, the old certificate is put back and the run fails: a certificate that cannot sign in
-# would cut the recorder off from every Google service.
+# would cut the recorder off from every Google service. Beside device.crt, device.crt.version holds
+# the version installed, which goes to pi-secrets as --installed-certificate-version (T1.1's
+# contract), and goes in and back with the certificate. Breaks they catch: a version file left at an
+# old version, so pi-secrets stages the installed certificate again each night; one a rollback does
+# not restore, so pi-secrets takes the certificate that failed as installed.
 new_pi
 install_set b
+printf '1\n' >"$opt/device.crt.version"
 printf 'NEW CERTIFICATE\n' >"$state/certificate"
 release=b run_update
+expect_secrets_flag certificate --installed-certificate-version 1
 expect_run certificate 0 "ghost-wispr update: already current at commit $commit_b" \
   'ghost-wispr update: installed certificate version 2, not after 2027-11-26T00:00:00Z'
 [[ $(<"$opt/device.crt") == 'NEW CERTIFICATE' && $(<"$opt/device.crt.prev") == 'INSTALLED CERTIFICATE' ]] \
@@ -1912,14 +2217,31 @@ expect_run certificate 0 "ghost-wispr update: already current at commit $commit_
 [[ $(restarts) == 1 ]] && grep -Fq "crt=$(sha "$opt/device.crt")" "$state/systemctl.log" \
   || fail "certificate: did not restart the recorder once on the new certificate: $(<"$state/systemctl.log")"
 expect_no_output certificate 'installed secrets'
+cmp -s -- <(printf '2\n') "$opt/device.crt.version" && cmp -s -- <(printf '1\n') "$opt/device.crt.version.prev" \
+  && [[ $(stat -c %a -- "$opt/device.crt.version") == 644 ]] \
+  || fail "certificate: device.crt.version is not 2, mode 644, with 1 as its .prev: $(cat -A -- "$opt/device.crt.version"*)"
+# A version file that does not hold one positive integer passes no version: pi-secrets then reads
+# the installed certificate alone.
+for version in missing '' 0 01 abc '1 2' $'1\n2' -3; do
+  new_pi
+  install_set b
+  if [[ $version != missing ]]; then printf '%s\n' "$version" >"$opt/device.crt.version"; fi
+  release=b run_update
+  expect_run "certificate (version file $(printf %q "$version"))" 0 "ghost-wispr update: already current at commit $commit_b"
+  if secrets_args | grep -Fqx -- --installed-certificate-version; then
+    fail "certificate (version file $(printf %q "$version")): passed --installed-certificate-version: $(secrets_args | paste -sd ' ')"
+  fi
+done
 new_pi
 install_set b
+printf '1\n' >"$opt/device.crt.version"
 printf 'NEW CERTIFICATE\n' >"$state/certificate"
 touch -- "$state/version-mute.after-restart"
 release=b run_update
 expect_run 'certificate, the recorder does not answer' 10
 expect_line_like 'certificate, the recorder does not answer' 'ghost-wispr update: .*; restored the previous release'
 [[ $(<"$opt/device.crt") == 'INSTALLED CERTIFICATE' ]] || fail 'certificate, the recorder does not answer: did not put the old certificate back'
+cmp -s -- <(printf '1\n') "$opt/device.crt.version" || fail 'certificate, the recorder does not answer: did not put device.crt.version back'
 [[ $(restarts) == 2 ]] || fail "certificate, the recorder does not answer: want the rollback's restart: $(<"$state/systemctl.log")"
 # release-and-certificate: a certificate staged while a release installs goes in with the set, and
 # the release's one restart serves both (R11); when that release's version check fails, the old
@@ -1927,16 +2249,20 @@ expect_line_like 'certificate, the recorder does not answer' 'ghost-wispr update
 begin release-and-certificate
 new_pi
 install_set a
+printf '1\n' >"$opt/device.crt.version"
 printf 'NEW CERTIFICATE\n' >"$state/certificate"
 release=b run_update
 expect_run release-and-certificate 0 "ghost-wispr update: installed commit $commit_b (invocation test-invocation-7)" \
   'ghost-wispr update: installed certificate version 2, not after 2027-11-26T00:00:00Z'
 [[ $(<"$opt/device.crt") == 'NEW CERTIFICATE' && $(<"$opt/device.crt.prev") == 'INSTALLED CERTIFICATE' ]] \
   || fail 'did not install the staged certificate with the old one as device.crt.prev'
+cmp -s -- <(printf '2\n') "$opt/device.crt.version" && cmp -s -- <(printf '1\n') "$opt/device.crt.version.prev" \
+  || fail 'release-and-certificate: did not install device.crt.version 2 with the release, with 1 as its .prev'
 [[ $(restarts) == 1 ]] && grep -Fqx "restart binary=$(sha "$opt/ghost-wispr") env=$(sha "$opt/.env") config=$(sha "$opt/ghost-wispr.yaml") crt=$(sha "$opt/device.crt")" \
   "$state/systemctl.log" || fail "the release and the certificate did not share one restart: $(<"$state/systemctl.log")"
 new_pi
 install_set a
+printf '1\n' >"$opt/device.crt.version"
 save_installed "$work_dir/before-a"
 printf 'NEW CERTIFICATE\n' >"$state/certificate"
 release=broken run_update
@@ -1944,6 +2270,7 @@ expect_run 'release-and-certificate, a release that fails' 10
 expect_line_like 'release-and-certificate, a release that fails' 'ghost-wispr update: .*; restored the previous release'
 expect_installed_is 'release-and-certificate, a release that fails' "$work_dir/before-a"
 [[ $(<"$opt/device.crt") == 'INSTALLED CERTIFICATE' ]] || fail 'a release that fails: did not restore device.crt with the set'
+expect_installed_is 'release-and-certificate, a release that fails' "$work_dir/before-a" device.crt.version
 [[ $(restarts) == 2 ]] || fail "a release that fails: want the install's and the rollback's restarts: $(<"$state/systemctl.log")"
 
 begin secrets-mode
@@ -2117,13 +2444,15 @@ launcher_file=$repo_root/deploy/pi/files/ghost-wispr-update-launcher.sh
 # The Pi's /bin/sh is dash: the launcher runs under it here.
 launcher_shell=$(command -v dash || command -v sh)
 # fake_update FILE NAME writes a fake update.sh at FILE that logs NAME in launcher.log and exits
-# $TEST_STATE/NAME.exit (0 by default), or hangs when that file says hang.
+# $TEST_STATE/NAME.exit (0 by default), or hangs when that file says hang, or hangs and ignores
+# SIGTERM when it says deaf.
 fake_update() {
   cat >"$1" <<EOF
 #!/usr/bin/env bash
 printf '%s\n' '$2' >>"\$TEST_STATE/launcher.log"
 code=\$(cat -- "\$TEST_STATE/$2.exit" 2>/dev/null || echo 0)
 if [[ \$code == hang ]]; then exec /bin/sleep 60; fi
+if [[ \$code == deaf ]]; then trap '' TERM; exec /bin/sleep 120; fi
 exit "\$code"
 EOF
   chmod 0755 "$1"
@@ -2138,14 +2467,16 @@ launcher_pi() {
 }
 # run_launcher runs the installed launcher as ghost-wispr-update.service does, under $launcher_cmd
 # (the Pi's sh by default), with the timer's TRIGGER_UNIT and TRIGGER_TIMER_REALTIME_USEC when
-# $trigger is set, and the real timeout; $out and $status as run_update's, and $elapsed, the real
+# $trigger is set, GHOST_WISPR_UPDATE_LIMIT=$limit when $limit is set, and the real timeout, or the
+# fake one when $fake_timeout is set; $out and $status as run_update's, and $elapsed, the real
 # seconds it took.
 run_launcher() {
   local started=$SECONDS
   echo 1000 >"$state/clock"
   status=0
   # shellcheck disable=SC2086 # Each trigger word is one assignment or none.
-  out=$(cd -- "$opt" && env -u TRIGGER_UNIT -u TRIGGER_TIMER_REALTIME_USEC PATH="$bin:$PATH" \
+  out=$(cd -- "$opt" && env -u TRIGGER_UNIT -u TRIGGER_TIMER_REALTIME_USEC -u GHOST_WISPR_UPDATE_LIMIT \
+    PATH="$bin:${fake_timeout:+$timeout_bin:}$PATH" TEST_REAL_TIMEOUT="$real_timeout" \
     TEST_STATE="$state" TEST_RELEASES="$releases" TEST_RELEASE="${release:-none}" TEST_FAKES="$fakes" \
     TEST_PI_SECRETS="$fakes/pi-secrets" TEST_BUSY_PID="$work_dir/busy.pid" TEST_CURL_FAIL="${curl_fail:-}" \
     INVOCATION_ID=test-invocation-9 ${trigger:+TRIGGER_UNIT=ghost-wispr-update.timer} \
@@ -2155,7 +2486,7 @@ run_launcher() {
     GHOST_WISPR_RELEASE_API=https://test.invalid/releases/latest \
     GHOST_WISPR_STATUS_URL=http://127.0.0.1:8080/api/status \
     GHOST_WISPR_VERSION_URL=http://127.0.0.1:8080/api/version \
-    GHOST_WISPR_UPDATE_LIMIT="${limit:-45m}" \
+    ${limit:+GHOST_WISPR_UPDATE_LIMIT=$limit} \
     "${launcher_cmd:-$launcher_shell}" "$opt/ghost-wispr-update-launcher.sh" 2>&1) || status=$?
   elapsed=$((SECONDS - started))
   if [[ -s $state/errors ]]; then
@@ -2255,6 +2586,22 @@ echo hang >"$state/update.sh.exit"
 limit=2s run_launcher
 [[ $status == 0 && $(paste -sd ' ' "$state/launcher.log") == 'update.sh update.sh.prev' ]] && ((elapsed < 30)) \
   || fail "a hung update.sh: exit $status after $elapsed s, ran $(paste -sd ' ' "$state/launcher.log")"
+# An update.sh that ignores the limit's SIGTERM (a step that traps it, or one stuck where no signal
+# but SIGKILL reaches it): the 60 s grace of --kill-after=60s ends it with SIGKILL, exit 137, and
+# update.sh.prev runs at once. Break it catches: a launcher with no grace, whose run never ends, so
+# each later start of the timer joins it and no update runs again.
+launcher_pi
+echo deaf >"$state/update.sh.exit"
+limit=1s run_launcher
+[[ $status == 0 && $(paste -sd ' ' "$state/launcher.log") == 'update.sh update.sh.prev' \
+  && $out == *'ghost-wispr launcher: update.sh exited 137; running update.sh.prev'* ]] && ((elapsed >= 60 && elapsed < 90)) \
+  || fail "an update.sh that ignores SIGTERM: exit $status after $elapsed s, ran $(paste -sd ' ' "$state/launcher.log"), output $out"
+# The production limit: with no GHOST_WISPR_UPDATE_LIMIT set, as the update unit runs the launcher,
+# update.sh runs under 45 minutes and the 60 s grace (R8), which the fake timeout logs.
+launcher_pi
+fake_timeout=1 run_launcher
+[[ $status == 0 ]] && grep -Fqx "kill-after=60s 45m $opt/update.sh" "$state/timeout.log" \
+  || fail "the launcher with no GHOST_WISPR_UPDATE_LIMIT: exit $status, ran $(<"$state/timeout.log"); want timeout --kill-after=60s 45m"
 # With no update.sh.prev, the launcher exits with update.sh's code; at 11 failed runs the count still
 # goes back to 0 (R8), so each night counts its own runs.
 launcher_pi
@@ -2282,6 +2629,26 @@ limits=$(grep -E '^[[:space:]]*[A-Za-z]*(Timeout|RuntimeMax)[A-Za-z]*[[:space:]]
   || fail "the update unit's time limits are $(printf %q "$limits"); want TimeoutStartSec=infinity alone"
 [[ $(sed -n 's/^ExecStart=//p' "$update_unit") == /opt/ghost-wispr/ghost-wispr-update-launcher.sh ]] \
   || fail "the update unit runs $(sed -n 's/^ExecStart=//p' "$update_unit"), not the launcher"
+# The update unit is Type=oneshot as systemd itself reads the file, so `systemctl start` (which
+# provision.sh runs) waits for the whole run, and a start during a run joins it (R7). systemd's
+# test mode loads the unit from a directory of its own and prints each setting as it reads it.
+# Break it catches: a unit that runs the launcher as Type=simple, or with no Type, whose start
+# returns at once while the update runs on.
+systemd_binary=''
+for candidate in /usr/lib/systemd/systemd /lib/systemd/systemd; do
+  if [[ -x $candidate ]]; then systemd_binary=$candidate && break; fi
+done
+[[ -n $systemd_binary ]] || fail 'systemd (/usr/lib/systemd/systemd) is needed to read the update unit as systemd does'
+mkdir -p -- "$work_dir/unit-dump"
+cp -- "$update_unit" "$work_dir/unit-dump/"
+SYSTEMD_UNIT_PATH="$work_dir/unit-dump:" "$systemd_binary" --test --system --no-pager --unit=ghost-wispr-update.service \
+  >"$work_dir/unit-dump.out" 2>"$work_dir/unit-dump.err" \
+  || fail "systemd --test could not read the update unit: $(<"$work_dir/unit-dump.err")"
+unit_dump=$(awk '/-> Unit ghost-wispr-update\.service:$/ { on = 1; next } on && /-> Unit / { exit } on' "$work_dir/unit-dump.out")
+grep -Fqx -- $'\t\tFragment Path: '"$work_dir/unit-dump/ghost-wispr-update.service" <<<"$unit_dump" \
+  || fail "systemd --test did not read the update unit from $work_dir/unit-dump: $(grep -F 'Fragment Path' <<<"$unit_dump" || echo 'no unit')"
+grep -Fqx -- $'\t\tType: oneshot' <<<"$unit_dump" && grep -Fqx -- $'\t\tTimeoutStartSec: infinity' <<<"$unit_dump" \
+  || fail "systemd reads the update unit as $(grep -E '^[[:space:]]+(Type|TimeoutStartSec):' <<<"$unit_dump" | paste -sd ' '); want Type: oneshot and TimeoutStartSec: infinity"
 recorder_unit=$repo_root/deploy/pi/files/ghost-wispr.service
 mapfile -t pre < <(sed -n 's/^ExecStartPre=//p' "$recorder_unit")
 [[ ${#pre[@]} == 3 && ${pre[0]} == /opt/ghost-wispr/wait-for-network.sh && ${pre[1]} == /opt/ghost-wispr/wait-for-time-sync.sh \
