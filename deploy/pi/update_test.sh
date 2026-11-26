@@ -2641,7 +2641,9 @@ expect_line "$what" "ghost-wispr update: removed $opt/device.crt.version.new, of
 [[ $journal != none ]] || fail "$what: the kill left no journal"
 killed_refresh device.crt.version.new 1
 release=b run_update
-expect_pair 'certificate, a refresh killed before its journal, then a run' 'INSTALLED CERTIFICATE' 1
+what='certificate, a refresh killed before its journal, then a run'
+expect_pair "$what" 'INSTALLED CERTIFICATE' 1
+expect_no_output "$what" 'cut short'
 mute=1 killed_refresh device.crt.version 2
 release=b run_update
 what="certificate, a rollback killed after the old certificate went back, then a run"
@@ -2657,7 +2659,9 @@ expect_pair "$what" 'NEW CERTIFICATE' 2
 expect_line "$what" "ghost-wispr update: removed $opt/device.crt.version.new, of a run cut short before its certificate went in; device.crt and device.crt.version stay as they are"
 mute=1 killed_refresh device.crt.version.new 2
 release=b run_update
-expect_pair "certificate, a rollback killed before its journal, then a run" 'NEW CERTIFICATE' 2
+what='certificate, a rollback killed before its journal, then a run'
+expect_pair "$what" 'NEW CERTIFICATE' 2
+expect_no_output "$what" 'cut short'
 # A journal that names no version file, from a restore to a Pi that had none, cut short after its
 # certificate went back: the next run removes the version file the refresh had put in.
 new_pi

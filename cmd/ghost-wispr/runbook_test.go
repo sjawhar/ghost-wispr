@@ -198,7 +198,9 @@ func TestRunbookSaysHowThePiFindsARenewedCertificate(t *testing.T) {
 // also fails if "The Pi's secrets" still says that update.sh secrets changes
 // nothing but the four lines of .env, or does not say that it puts right a
 // certificate swap cut short, and if "Update and inspect" says a busy recorder
-// changes nothing, which the start-of-run repair does change.
+// changes nothing, which the start-of-run repair does change, or does not say
+// that a session or a call found just before the restart puts the swapped
+// files back with no restart, which changes files while the recorder is busy.
 func TestRunbookSaysTheCertificatePairChangesAsOne(t *testing.T) {
 	section := runbookSection(t, "## Renew the X.509 certificate")
 	for _, words := range []string{"`/opt/ghost-wispr/device.crt.version.new`", "Then it renames the certificate over `device.crt`, then writes or removes `device.crt.version`, and then removes the journal", "A rollback puts the pair back the same way", "`update.sh secrets` too", "ghost-wispr update: finished the certificate swap that a run cut short: device.crt.version is <version>", "ghost-wispr update: removed /opt/ghost-wispr/device.crt.version.new, of a run cut short before its certificate went in; device.crt and device.crt.version stay as they are", "stages no certificate that does not end later than the installed `device.crt`"} {
@@ -222,6 +224,12 @@ func TestRunbookSaysTheCertificatePairChangesAsOne(t *testing.T) {
 	}
 	if !strings.Contains(update, "Installs nothing and restarts nothing while the recorder is busy") {
 		t.Error(`the runbook's "Update and inspect" does not say that a run installs nothing and restarts nothing while the recorder is busy`)
+	}
+	if strings.Contains(update, "Only the start of the run above can change a file then") {
+		t.Error(`the runbook's "Update and inspect" says only the start of a run changes a file while the recorder is busy; a run that finds a session or a call before its restart puts its swapped files back`)
+	}
+	if !strings.Contains(update, "a run whose status read just before the restart finds a session or a call") {
+		t.Error(`the runbook's "Update and inspect" does not say that a run whose status read just before the restart finds a session or a call changes files while the recorder is busy`)
 	}
 }
 
@@ -353,7 +361,8 @@ func TestRunbookSaysWhichSecretValuesThePiRefuses(t *testing.T) {
 // TestRunbookClaimsTheNameFromAPersonsOwnDevice fails if the runbook still
 // runs a step under the agents' secrets broker (secret-run, a broker grant),
 // which no person's own device has, or if "Provision" does not claim the
-// tailnet name with the block runbook_blocks_test.sh runs.
+// tailnet name with the block runbook_blocks_test.sh runs, in bash, whose
+// read -p zsh reads another way.
 func TestRunbookClaimsTheNameFromAPersonsOwnDevice(t *testing.T) {
 	words := strings.Join(strings.Fields(readRunbook(t)), " ")
 	for _, stale := range []string{"secret-run", "secrets-broker", "broker page"} {
@@ -361,8 +370,12 @@ func TestRunbookClaimsTheNameFromAPersonsOwnDevice(t *testing.T) {
 			t.Errorf("the runbook still runs a step under the agents' secrets broker: %q", stale)
 		}
 	}
-	if !strings.Contains(runbookSection(t, "## Provision"), "<!-- runbook_blocks_test.sh: claim-name -->") {
+	provision := runbookSection(t, "## Provision")
+	if !strings.Contains(provision, "<!-- runbook_blocks_test.sh: claim-name -->") {
 		t.Error(`"Provision" has no claim-name block for runbook_blocks_test.sh`)
+	}
+	if !strings.Contains(provision, "Run the block in bash") {
+		t.Error(`"Provision" does not say to run the claim-name block in bash`)
 	}
 }
 
