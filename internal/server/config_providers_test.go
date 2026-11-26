@@ -122,11 +122,11 @@ func TestPatchConfigSavesAProviderKey(t *testing.T) {
 	}
 }
 
-// TestPatchConfigRefusesADeploymentOwnedProviderKey fails if an api_key
-// provider marked auth.read_only is absent from GET /api/config, accepts
-// provider_keys, changes its config or .env, or announces a change. That
-// would let the settings page replace the deployment's Secret Manager key.
-func TestPatchConfigRefusesADeploymentOwnedProviderKey(t *testing.T) {
+// TestPatchConfigRefusesAReadOnlyKey fails if an api_key provider marked
+// auth.read_only is absent from GET /api/config, accepts provider_keys, changes
+// its config or .env, or announces a change. That would let the settings page
+// replace the deployment's Secret Manager key.
+func TestPatchConfigRefusesAReadOnlyKey(t *testing.T) {
 	path := writeProvidersConfig(t)
 	readOnlyConfig := strings.Replace(
 		providersYAML,

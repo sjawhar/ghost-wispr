@@ -50,10 +50,10 @@ func TestTheShippedConfigsLoadWithNoWarning(t *testing.T) {
 	}
 }
 
-// TestThePiConfigMakesDeepgramsKeyDeploymentOwned fails if the Pi's loaded
+// TestShippedPiConfigMakesDeepgramsKeyReadOnly fails if the Pi's loaded
 // provider configuration cannot serve Deepgram's api_key auth as read_only:
 // the settings page could offer to replace the Secret Manager key.
-func TestThePiConfigMakesDeepgramsKeyDeploymentOwned(t *testing.T) {
+func TestShippedPiConfigMakesDeepgramsKeyReadOnly(t *testing.T) {
 	clearVoiceEnv(t)
 	cfg, _, err := Load(piConfigPath)
 	if err != nil {

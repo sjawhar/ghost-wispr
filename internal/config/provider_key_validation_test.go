@@ -46,11 +46,11 @@ func TestAProviderKeyCannotAddAnEnvSetting(t *testing.T) {
 	}
 }
 
-// TestADeploymentOwnedProviderKeyCannotBeSaved fails if SetAPIKey treats an
-// api_key provider marked auth.read_only as writable: the deployment's Secret
-// Manager key would reach .env. Its writable OpenAI control fails if the
-// refusal applies to every api_key provider.
-func TestADeploymentOwnedProviderKeyCannotBeSaved(t *testing.T) {
+// TestAReadOnlyProviderKeyIsRefused fails if SetAPIKey treats an api_key
+// provider marked auth.read_only as writable: the deployment's Secret Manager
+// key would reach .env. Its writable OpenAI control fails if the refusal
+// applies to every api_key provider.
+func TestAReadOnlyProviderKeyIsRefused(t *testing.T) {
 	clearVoiceEnv(t)
 	path := writeConfig(t, `
 providers:
