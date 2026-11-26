@@ -38,7 +38,9 @@ func TestAStaleRoomSnapshotCompletesSilently(t *testing.T) {
 				reads++
 				n := reads
 				mu.Unlock()
-				if n == 2 { // read 1 is newSession's opening revision
+				// Read 1 is newSession's opening revision, read 2 the older
+				// delegation's arrival (onDelegation), read 3 its worker's.
+				if n == 3 {
 					close(captured)
 					<-release
 				}

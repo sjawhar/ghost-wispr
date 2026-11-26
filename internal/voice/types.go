@@ -45,13 +45,13 @@ type Exchange struct {
 	// Supervisor, means AskerTurn and Recent as they are.
 	Room func() RoomView
 	// Claim commits a request a voice read from Room (RoomView.Request) to
-	// the backend: it reports whether the finals of turn up to revision are
-	// still the room's current, unclaimed request, and marks them claimed if
-	// so. A voice sends a request only after Claim returned true, so two
-	// delegations waiting on one final ask it once, and a snapshot overtaken
-	// by a take-back or a newer final is read again rather than sent (Main,
-	// after Sol's nineteenth review of #191). nil, outside a Supervisor,
-	// claims every request.
+	// the backend: it reports whether the view of turn at revision is still
+	// the room's current request, and if so marks the exact spans of the
+	// finals it holds as sent. A voice sends a request only after Claim
+	// returned true, so two delegations waiting on one final ask it once, and
+	// a snapshot overtaken by a final, a take-back or a new turn is read again
+	// rather than sent (Main, after Sol's nineteenth and twentieth reviews of
+	// #191). nil, outside a Supervisor, claims every request.
 	Claim func(turn, revision uint64) bool
 	Tap   <-chan audio.Frame // room audio from the wake on, 16 kHz mono, only while the capture gate is open
 	Out   Output             // the speaker output's "voice" input
@@ -90,15 +90,21 @@ type Exchange struct {
 // vendor delegations. TakeBacks increments once per take-back, counted on the
 // final with its obsolete interim removed.
 //
-// Request is the room's current request, owned by final identity rather than
-// by text: the surviving words, after the take-back rule, of turn Turn's
-// finals that no request has claimed yet (Exchange.Claim), keys written. It
-// holds no interim, which is not yet the room's word, and never a turn's
-// words a delegation already asked, so a follow-up is asked alone, while a
-// new turn is asked whole even when it repeats the last one word for word
-// (Main, after Sol's nineteenth review of #191). Changed closes at the next
-// change to the view: a final, a claim, or the exchange's end. A view and its
-// Changed are read together, so no change falls between them.
+// Request is the room's current request, owned by final and by span rather
+// than by text: the words of the exchange's finals that survive the
+// take-back rule and that no claimed request sent (Exchange.Claim), in order
+// and keys written. Each turn is parsed for take-backs on its own finals; a
+// take-back also withdraws every earlier turn's words no request asked yet.
+// A turn's unsent words stay pending when a new turn begins, so a question
+// no delegation asked before the next utterance is still asked, each turn's
+// text whole; an earlier turn made only of backchannel words ("okay") is
+// left out. A request holds no interim, which is not yet the room's word, and
+// never words a claim already sent, while words a closing quote restores
+// from a provisional take-back were never sent and are asked (Main, after
+// Sol's nineteenth and twentieth reviews of #191). Changed closes at the
+// next change to the view: a final, a claim, a new turn or the exchange's
+// end. A view and its Changed are read together, so no change falls between
+// them.
 type RoomView struct {
 	Live      bool
 	Asker     string

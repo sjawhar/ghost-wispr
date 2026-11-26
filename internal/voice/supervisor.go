@@ -414,13 +414,11 @@ type exchange struct {
 	replySeqs    []uint64 // the same for ex.reply
 	interim      string   // the turn's words not final yet
 	roomRevision uint64   // each new final: a fresh RoomView (Exchange.Room)
-	// claimedTurn and claimedRev mark the request a voice last committed to
-	// the backend (Exchange.Claim): the finals of turn claimedTurn up to
-	// revision claimedRev are no later request's. A final's identity is its
-	// revision: each final of a turn bumps roomRevision once, in order, so the
-	// i-th of n finals in ex.turn has revision roomRevision-(n-1-i).
-	claimedTurn uint64
-	claimedRev  uint64
+	// owned holds the exchange's finals, every turn's, in order, as its
+	// requests own them (Exchange.Room's Request, Exchange.Claim). A new
+	// turn keeps them: a turn's words no request asked stay pending
+	// (requestSpansLocked).
+	owned []ownedFinal
 	// roomChanged closes at the next change to the room's view (a final, a
 	// claim, the exchange's end) and is then replaced (RoomView.Changed).
 	roomChanged  chan struct{}
@@ -1192,6 +1190,7 @@ func (s *Supervisor) onTranscriptLocked(t *Transcript) {
 			ex.followUpTurn, ex.turnByName = false, true // a call, with the wake phrase
 			if !stale {
 				ex.x.Turn++ // a new call; a late result keeps the turn it completes
+				s.roomChangedLocked(ex)
 			}
 			cut := false
 			if ex.drives {
@@ -1284,6 +1283,7 @@ func (s *Supervisor) driverHeardLocked(ex *exchange, t *Transcript, words string
 			ex.turn, ex.interim, ex.turnFinal, ex.uttered, ex.heardTo = nil, "", false, false, time.Time{}
 			ex.followUpTurn, ex.turnByName = ex.followUpTimer != nil && !ex.askedBack, false
 			ex.x.Turn++
+			s.roomChangedLocked(ex) // the request's current turn moved (Exchange.Claim)
 		}
 		s.disarmFollowUpLocked(ex)
 		s.turnLocked(ex, t, words)
@@ -1300,6 +1300,7 @@ func (s *Supervisor) driverHeardLocked(ex *exchange, t *Transcript, words string
 		ex.turn, ex.interim, ex.turnFinal, ex.uttered, ex.heardTo, ex.reply = nil, "", false, false, time.Time{}, nil
 		ex.followUpTurn, ex.turnByName = ex.followUpTimer != nil && !ex.askedBack, false
 		ex.x.Turn++
+		s.roomChangedLocked(ex)
 		s.turnLocked(ex, t, words)
 	} else if ex.ofTurn(t) {
 		s.turnLocked(ex, t, words)
@@ -1866,6 +1867,7 @@ func (s *Supervisor) turnLocked(ex *exchange, t *Transcript, words string) {
 		ex.interim = ""
 		if words != "" {
 			ex.turn = append(ex.turn, words)
+			ex.owned = append(ex.owned, ownedFinal{turn: ex.x.Turn, text: words, sent: len(words)})
 			ex.roomRevision++
 			defer s.roomChangedLocked(ex) // after the take-back below is counted
 			// ex.turnSeqs keeps ex.turn's last entries, one a final: a
@@ -2233,6 +2235,7 @@ func (s *Supervisor) followUpLocked(ex *exchange) {
 	s.turnEndsLocked(ex, true)
 	ex.turn, ex.interim, ex.turnByName, ex.heardTo = nil, "", false, time.Time{}
 	ex.x.Turn++
+	s.roomChangedLocked(ex)
 	ex.said, ex.last = false, nil
 	delete(ex.notified, EventSpoken) // each spoken answer reports itself
 	if ex.timer != nil {
@@ -3083,66 +3086,117 @@ func (s *Supervisor) roomOf(ex *exchange) func() RoomView {
 	}
 }
 
-// claimOf is ex's Exchange.Claim: it commits the request of turn up to
-// revision, if that is still ex's current, unclaimed request. A view read
-// before a later final, a take-back or another delegation's claim no longer
-// matches, so it claims nothing and its voice reads the room again.
+// claimOf is ex's Exchange.Claim: it commits the request of turn at
+// revision, if that is still ex's current request, and marks the exact spans
+// of the finals it holds as sent. A view read before a later final, a
+// take-back, a new turn or another delegation's claim no longer matches, so
+// it claims nothing and its voice reads the room again.
 func (s *Supervisor) claimOf(ex *exchange) func(turn, revision uint64) bool {
 	return func(turn, revision uint64) bool {
 		s.mu.Lock()
 		defer s.mu.Unlock()
-		if ex.ended || ex.ctx.Err() != nil || turn != ex.x.Turn || revision != ex.roomRevision || s.requestLocked(ex) == "" {
+		if ex.ended || ex.ctx.Err() != nil || turn != ex.x.Turn || revision != ex.roomRevision {
 			return false
 		}
-		ex.claimedTurn, ex.claimedRev = turn, revision
+		spans := s.requestSpansLocked(ex)
+		if len(spans) == 0 {
+			return false
+		}
+		for _, sp := range spans {
+			ex.owned[sp.final].sent = sp.from
+		}
 		s.roomChangedLocked(ex)
 		return true
 	}
 }
 
-// requestLocked is ex's current request (RoomView.Request): what survives the
-// take-back rule of the current turn's finals that no request claimed,
-// joined and keys written. Ownership is by final identity, never by text: a
-// turn's finals a claim covered are left out whatever they say, and a new
-// turn's finals are all in, even when the new turn repeats the last one word
-// for word (Sol's nineteenth review of #191, finding 3). The take-back is
-// found on the whole turn's raw finals, as the Concierge finds it, and then
-// mapped onto each final by its place in them.
+// ownedFinal is one of the exchange's finals as its requests own it: its
+// turn, its words, and how much of them a claimed request already sent.
+type ownedFinal struct {
+	turn uint64
+	text string
+	// sent is where the words a claimed request sent begin: text[sent:] was
+	// sent, text[:sent] was not. len(text) when none of it was sent. A
+	// request sends a final's surviving words up to sent, which is always a
+	// suffix of what survives, so one number keeps the whole record.
+	sent int
+}
+
+// requestSpan is the part of ex.owned[final] a request asks: text[from:sent].
+type requestSpan struct{ final, from int }
+
+// requestLocked is ex's current request (RoomView.Request): the words of its
+// finals that survive the take-back rule and that no claimed request sent,
+// joined in order and keys written (requestSpansLocked).
 func (s *Supervisor) requestLocked(ex *exchange) string {
-	n := len(ex.turn)
-	if n == 0 {
-		return ""
-	}
-	first := 0 // the first final no claim covers
-	if ex.claimedTurn == ex.x.Turn {
-		for i := range n {
-			if ex.roomRevision-uint64(n-1-i) <= ex.claimedRev {
-				first = i + 1
-			}
-		}
-	}
-	if first == n {
-		return ""
-	}
-	finals := strings.Join(ex.turn, "\n")
-	cut := 0 // where the words after the turn's last take-back begin
-	if s.cfg.TakeBack != nil {
-		if rest, taken := s.cfg.TakeBack(finals); taken {
-			if !strings.HasSuffix(finals, rest) {
-				return "" // a cut the finals cannot place owns nothing
-			}
-			cut = len(finals) - len(rest)
-		}
-	}
 	var words []string
-	for i, at := 0, 0; i < n; i++ {
-		end := at + len(ex.turn[i])
-		if i >= first && end > cut {
-			words = append(words, strings.TrimSpace(finals[max(at, cut):end]))
-		}
-		at = end + 1 // past the newline
+	for _, sp := range s.requestSpansLocked(ex) {
+		f := ex.owned[sp.final]
+		words = append(words, f.text[sp.from:f.sent])
 	}
 	return s.withKeys(ex, strings.Join(strings.Fields(strings.Join(words, " ")), " "))
+}
+
+// requestSpansLocked is what ex's next request asks, owned by final and by
+// span, never by text (Sol's nineteenth and twentieth reviews of #191):
+//
+//   - Each turn is parsed for take-backs on its own finals, as the Concierge
+//     parses them, and the cut is mapped back onto each final by its place,
+//     so a take-back never reaches into another turn's words by position.
+//   - A take-back in a later turn also withdraws every earlier turn's words
+//     that no request asked yet ("what about ABC-12?", an endpoint, "never
+//     mind" asks nothing); words a request already sent stay sent (Main).
+//   - Words a claimed request sent are never asked again. Words the rule
+//     restores later, when a closing quote turns a provisional take-back
+//     back into quoted text, were never sent, so they are asked
+//     (TestSol191R20QuoteRestoresClaimedSpan).
+//   - An earlier turn's unsent words stay pending, in order, when a new turn
+//     begins: a question no delegation asked before the next utterance is
+//     still asked, each turn's text whole (TestSol191R20UnclaimedEarlierTurn).
+//     The one filter is the Supervisor's own backchannel list, the words
+//     that never stop the voice: an earlier turn made only of them ("okay")
+//     is no request.
+func (s *Supervisor) requestSpansLocked(ex *exchange) []requestSpan {
+	var spans []requestSpan
+	for start := 0; start < len(ex.owned); {
+		turn := ex.owned[start].turn
+		end := start
+		texts := []string{}
+		for end < len(ex.owned) && ex.owned[end].turn == turn {
+			texts = append(texts, ex.owned[end].text)
+			end++
+		}
+		finals := strings.Join(texts, "\n")
+		cut := 0 // where the words after this turn's last take-back begin
+		if s.cfg.TakeBack != nil {
+			if rest, taken := s.cfg.TakeBack(finals); taken {
+				spans = spans[:0] // withdraws the earlier turns no request asked
+				cut = len(finals)
+				if strings.HasSuffix(finals, rest) {
+					cut = len(finals) - len(rest)
+				}
+			}
+		}
+		var own []requestSpan
+		backchannel := true
+		for i, at := start, 0; i < end; i++ {
+			f := ex.owned[i]
+			if from := max(at, cut) - at; from < f.sent {
+				own = append(own, requestSpan{final: i, from: from})
+				for _, w := range strings.Fields(f.text[from:f.sent]) {
+					if n := normWord(w); n != "" && !backchannels[n] {
+						backchannel = false
+					}
+				}
+			}
+			at += len(f.text) + 1 // past the newline
+		}
+		if turn == ex.x.Turn || !backchannel {
+			spans = append(spans, own...)
+		}
+		start = end
+	}
+	return spans
 }
 
 // roomChangesLocked is the channel that closes at ex's next room change.

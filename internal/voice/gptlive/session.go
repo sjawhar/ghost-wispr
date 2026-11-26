@@ -876,6 +876,11 @@ func (s *session) onDelegation(ev *serverEvent) {
 	// Logged so a probe can time the vendor's own acknowledgement against the
 	// moment the delegation reached us. It carries no words of the room.
 	s.log.Info("gptlive: delegation reached the client", "delegation", id)
+	// The room as the delegation arrived, read here, before the worker runs
+	// and outside the session's lock: a take-back between the arrival and
+	// the worker's first read must end this delegation, not become the
+	// state it waits from (Sol's twentieth review of #191, finding 2).
+	arrival := s.room()
 	s.mu.Lock()
 	if s.closing {
 		s.mu.Unlock()
@@ -884,7 +889,7 @@ func (s *session) onDelegation(ev *serverEvent) {
 	s.delegations[id] = true
 	s.wg.Add(1)
 	s.mu.Unlock()
-	go s.ask(id)
+	go s.ask(id, &arrival)
 }
 
 // ask builds delegation id's question from the room, then reports the tool
@@ -895,10 +900,10 @@ func (s *session) onDelegation(ev *serverEvent) {
 // it plays as on main (Main, after Sol's nineteenth review of #191).
 // resolveQuestion is the only wait; the user-turn record is flushed once a
 // question is in hand.
-func (s *session) ask(id string) {
+func (s *session) ask(id string, arrival *voice.RoomView) {
 	defer s.wg.Done()
 	s.suppressAck(id)
-	question, room, ok := s.resolveQuestion(id)
+	question, room, ok := s.resolveQuestion(id, arrival)
 	if !ok {
 		return
 	}
@@ -938,10 +943,10 @@ func (s *session) room() voice.RoomView {
 // another delegation's claim of the same words, so the room is read again
 // rather than sent. The wait ends, completing the delegation silently, when
 // the exchange ends (RoomView.Live false), when a newer delegation already
-// applied a later revision, or when a final comes while it waits and the
-// room still asks nothing: that final took the request back.
-func (s *session) resolveQuestion(id string) (question string, room voice.RoomView, ok bool) {
-	arrived, first := uint64(0), true
+// applied a later revision, or when the room asks nothing though it changed
+// since arrival, the room as onDelegation read it: a later final or
+// take-back that leaves no request took it back.
+func (s *session) resolveQuestion(id string, arrival *voice.RoomView) (question string, room voice.RoomView, ok bool) {
 	for {
 		room = s.room()
 		if s.x.Room != nil && !room.Live {
@@ -958,16 +963,13 @@ func (s *session) resolveQuestion(id string) (question string, room voice.RoomVi
 			s.completeSilently(id)
 			return "", room, false
 		}
-		if first {
-			arrived, first = room.Revision, false
-		}
 		if request := strings.TrimSpace(room.Request); request != "" {
 			if s.x.Claim == nil || s.x.Claim(room.Turn, room.Revision) {
 				return request, room, true
 			}
 			// The room moved on between the read and the claim: wait for
 			// that change, then read it again.
-		} else if s.x.Room == nil || room.Revision > arrived {
+		} else if s.x.Room == nil || room.Revision > arrival.Revision || room.TakeBacks > arrival.TakeBacks {
 			s.completeSilently(id)
 			return "", room, false
 		}

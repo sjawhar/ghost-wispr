@@ -33,6 +33,12 @@ func TestAWaitingDelegationOutlastsTheFollowUpTurnRule(t *testing.T) {
 			woke := time.Now().Add(-4 * time.Second)
 			r.s.OnTranscript(timedResult("Wispr, what about ABC-42?", 192.93, true, from(woke)))
 			sess := r.waitSession()
+			// Voice B's first delegation claims the opening before it is
+			// answered; a claim nobody made would leave it pending, and the
+			// next request would ask it again.
+			if open := sess.x.Room(); open.Request == "" || !sess.x.Claim(open.Turn, open.Revision) {
+				t.Fatalf("the opening request %+v could not be claimed", open)
+			}
 			speakAs(t, sess, "ABC-42 is in review.")
 			waitSpeechAfter(t, r, time.Time{})
 			r.speaker.finish(audio.InputVoice) // the answer plays out: the follow-up window opens
