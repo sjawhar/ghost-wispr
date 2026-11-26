@@ -93,7 +93,9 @@ esac
 EOF
 
 # ssh to the fake Pi: runs the remote command under sh in ghost-wispr's home, with the fakes on
-# PATH. state/ssh-down stands for a Pi that does not answer on port 22 (ssh exits 255).
+# PATH. state/ssh-down stands for a Pi that does not answer on port 22 (ssh exits 255), and
+# state/ssh-lost-on for a connection lost during the one remote command that holds its text (ssh
+# exits 255, and notes it in state/ssh-lost-fired).
 cat >"$bin/ssh" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -111,6 +113,11 @@ done
 shift
 if [[ -e $FAKE_STATE/ssh-down ]]; then
   echo "ssh: connect to host $FAKE_PI_HOST port 22: Connection timed out" >&2
+  exit 255
+fi
+if [[ -s $FAKE_STATE/ssh-lost-on && $* == *"$(<"$FAKE_STATE/ssh-lost-on")"* ]]; then
+  : >"$FAKE_STATE/ssh-lost-fired"
+  echo "ssh: connection to $FAKE_PI_HOST lost: Broken pipe" >&2
   exit 255
 fi
 printf '%s\n' "$*" >>"$FAKE_LOG/ssh"
@@ -270,7 +277,8 @@ readonly model_settings=(
   tts=tts.model tts_voice=tts.voice gptlive=voice.gptlive.model dgagent_provider=voice.dgagent.provider
 )
 # running_config FILE: what GET /api/config answers on a recorder that runs FILE: the model of each
-# role of model_settings and the recording rules.
+# role of model_settings, the recording rules, and local_settings null, the report of a recorder
+# that applied no local settings file.
 running_config() {
   local entry value args=()
   for entry in "${model_settings[@]}"; do
@@ -279,7 +287,7 @@ running_config() {
     args+=(--arg "${entry%%=*}" "$value")
   done
   jq -cn "${args[@]}" --argjson rules "$(template_rules "$1")" \
-    '{models: ($ARGS.named | del(.rules)), recording_rules: $rules}'
+    '{models: ($ARGS.named | del(.rules)), recording_rules: $rules, local_settings: null}'
 }
 old_config=$(running_config "$old_template")
 new_config=$(running_config "$new_template")
@@ -367,6 +375,14 @@ filler_releases() {
 }
 # release_pages: the pages of the releases list the run asked for, in order, one line.
 release_pages() { paste -sd ' ' - <"$log/release-pages" 2>/dev/null || true; }
+
+# recorder_applies JSON: GET /api/config's local_settings becomes JSON, the recorder's report of the
+# local settings file: the settings it applied from it, null for no file, or {"applied": false,
+# "error": ...} for a file it did not apply. The case's other answers stay as they are.
+recorder_applies() {
+  jq -c --argjson local "$1" '.local_settings = $local' "$state/config.json" >"$state/config.json.new"
+  mv -f -- "$state/config.json.new" "$state/config.json"
+}
 
 # --- Cases.
 
@@ -583,59 +599,123 @@ jq -c '.models.concierge = ""' <<<"$new_config" >"$state/config.json"
 run_driver
 expect_verdicts PASS FAIL PASS PASS PASS PASS PASS
 expect 2 FAIL 'concierge runs ""' '(concierge.model)'
-# A model saved on the page lives in the local settings file; check 2 compares the running model with
-# that value instead, and names the setting. The control is the same Pi with no local settings file,
-# whose check 2 fails. Breaks it catches: a driver that reads no local settings file, so every page
-# save fails it; one that reads it and does not say which settings it took from there.
+# The local settings come from the recorder's own report, GET /api/config's local_settings: the
+# settings it applied from ghost-wispr.local.yaml, as JSON. The driver reads no YAML of that file.
+# Each case below writes the file on the fake Pi as the recorder read it, and the report the
+# recorder gives of it.
+#
+# A model saved on the page: check 2 compares the running model with the report's value, and names
+# the setting. The control is the same Pi whose recorder reports no local settings, whose check 2
+# fails. Breaks it catches: a driver that reads no local settings, so every page save fails it; one
+# that reads them and does not say which settings it took from there.
 new_case 'a model saved on the page'
 printf 'summarization:\n    model: vertex/gemini-saved-on-the-page\n' >"$deploy/ghost-wispr.local.yaml"
 jq -c '.models.summarization = "vertex/gemini-saved-on-the-page"' <<<"$new_config" >"$state/config.json"
+recorder_applies '{"summarization":{"model":"vertex/gemini-saved-on-the-page"}}'
 run_driver
 expect_verdicts PASS PASS PASS PASS PASS PASS PASS
 expect 2 PASS summarization.model
 rm -f -- "$deploy/ghost-wispr.local.yaml"
+recorder_applies null
 run_driver
 expect_verdicts PASS FAIL PASS PASS PASS PASS PASS
 expect 2 FAIL summarization vertex/gemini-saved-on-the-page
-# Recording rules in the local settings file (where a save writes GHOST_WISPR_RECORDING_RULES's) are
-# a list, written with the 4-space indents the recorder's YAML writer uses. Break it catches: a
-# driver that flattens the local settings file the way it flattens one setting a line, which drops
-# the list's items.
-new_case 'recording rules in the local settings file'
+
+# Sol's cases (GPT-6.1 Sol's review of PR #201 at 6c53026b, finding 1): a local settings file in
+# YAML's flow style, which the recorder applies as it applies the block style. With the release's
+# model still running, check 2 fails; with the saved model running, all seven pass, and the driver
+# read no local settings file over SSH; with the block style and the release's model running,
+# check 2 fails too, the control. Breaks they catch: a driver that reads the file with a reader that
+# skips the flow style, so a stale model passes and the right one fails.
+new_case 'a flow-style local settings file, and the release model running'
+printf 'summarization: {model: vertex/gemini-saved-on-the-page}\n' >"$deploy/ghost-wispr.local.yaml"
+recorder_applies '{"summarization":{"model":"vertex/gemini-saved-on-the-page"}}'
+run_driver
+expect_verdicts PASS FAIL PASS PASS PASS PASS PASS
+expect 2 FAIL summarization vertex/gemini-saved-on-the-page
+new_case 'a flow-style local settings file, and its model running'
+printf 'summarization: {model: vertex/gemini-saved-on-the-page}\n' >"$deploy/ghost-wispr.local.yaml"
+jq -c '.models.summarization = "vertex/gemini-saved-on-the-page"' <<<"$new_config" >"$state/config.json"
+recorder_applies '{"summarization":{"model":"vertex/gemini-saved-on-the-page"}}'
+run_driver
+expect_verdicts PASS PASS PASS PASS PASS PASS PASS
+expect 2 PASS summarization.model
+[[ -s $log/ssh ]] || fail "the driver made no SSH call, so its SSH log shows nothing: $out"
+! grep -q 'ghost-wispr\.local\.yaml' "$log/ssh" \
+  || fail "the driver read the local settings file over SSH: $(grep 'ghost-wispr\.local\.yaml' "$log/ssh")"
+new_case 'a block-style local settings file, and the release model running'
+printf 'summarization:\n    model: vertex/gemini-saved-on-the-page\n' >"$deploy/ghost-wispr.local.yaml"
+recorder_applies '{"summarization":{"model":"vertex/gemini-saved-on-the-page"}}'
+run_driver
+expect_verdicts PASS FAIL PASS PASS PASS PASS PASS
+expect 2 FAIL summarization vertex/gemini-saved-on-the-page
+
+# Recording rules the recorder took from the local settings file (an older build saved
+# GHOST_WISPR_RECORDING_RULES there) are a list in its report. Break it catches: a driver that
+# compares the running rules with the template's when the report gives its own.
+new_case 'recording rules in the local settings'
 printf 'recording_rules:\n    - A rule from the environment, saved.\n' >"$deploy/ghost-wispr.local.yaml"
 jq -c '.recording_rules = ["A rule from the environment, saved."]' <<<"$new_config" >"$state/config.json"
+recorder_applies '{"recording_rules":["A rule from the environment, saved."]}'
 run_driver
 expect_verdicts PASS PASS PASS PASS PASS PASS PASS
 expect 2 PASS recording_rules
-# Check 2 cannot read its input: GET /api/config does not answer, or the local settings file is
-# there and ghost-wispr cannot read it. Break it catches: a driver that passes check 2 on a config
-# it never read, or compares with the template alone when it cannot tell what was saved on the page.
+
+# Checks 2 and 3 cannot read their input: GET /api/config does not answer, or it answers with no
+# local_settings field (a recorder from before the field), or with one that is neither null nor an
+# object. A provider that did not sign in still fails check 3, and the line names what it could not
+# read too. Breaks it catches: a driver that passes check 2 on a config it never read, or compares
+# with the template alone when it cannot tell what the recorder applied; one whose check 3 passes
+# with no word of the providers the local settings add or remove.
 new_case 'GET /api/config does not answer'
 rm -f -- "$state/config.json"
 run_driver
-expect_verdicts PASS UNKNOWN PASS PASS PASS PASS PASS
+expect_verdicts PASS UNKNOWN UNKNOWN PASS PASS PASS PASS
 expect 2 UNKNOWN /api/config
-new_case 'an unreadable local settings file'
-printf 'summarization:\n    model: vertex/gemini-saved-on-the-page\n' >"$deploy/ghost-wispr.local.yaml"
-unreadable "$deploy/ghost-wispr.local.yaml"
+expect 3 UNKNOWN /api/config
+new_case 'a recorder that reports no local_settings'
+jq -c 'del(.local_settings)' <<<"$new_config" >"$state/config.json"
 run_driver
-expect_verdicts PASS UNKNOWN PASS PASS PASS PASS PASS
-expect 2 UNKNOWN ghost-wispr.local.yaml
-# A model that differs is a FAIL even when check 2 cannot read another of its inputs, here recording
-# rules in the local settings file whose one rule runs onto a second line; the line names both. The
-# control is the same Pi with the model the template gives, whose check 2 is UNKNOWN. Breaks it
-# catches: a driver that prints UNKNOWN and so hides a difference it found; one that passes rules it
-# could not read.
+expect_verdicts PASS UNKNOWN UNKNOWN PASS PASS PASS PASS
+expect 2 UNKNOWN local_settings
+expect 3 UNKNOWN local_settings
+jq -c '.providers[0].ok = false | .providers[0].message = "401 Unauthorized"' <<<"$good_providers" >"$state/providers.json"
+run_driver
+expect_verdicts PASS UNKNOWN FAIL PASS PASS PASS PASS
+expect 3 FAIL "$first_provider" local_settings
+printf '%s\n' "$good_providers" >"$state/providers.json"
+recorder_applies '"summarization"'
+run_driver
+expect_verdicts PASS UNKNOWN UNKNOWN PASS PASS PASS PASS
+expect 2 UNKNOWN local_settings
+
+# The recorder did not apply the local settings file (it does not parse): it runs the release's
+# config alone, and its report says so, with why. Checks 2 and 3 compare with the template alone
+# and name the file the recorder did not apply, and why. Breaks it catches: a driver that reads that
+# report as settings (the keys applied and error), or that hides that the file was not applied.
+new_case 'a local settings file the recorder did not apply'
+printf 'summarization: [\n' >"$deploy/ghost-wispr.local.yaml"
+recorder_applies '{"applied":false,"error":"yaml: line 2: did not find expected node content"}'
+run_driver
+expect_verdicts PASS PASS PASS PASS PASS PASS PASS
+expect 2 PASS 'did not apply' 'did not find expected node content'
+expect 3 PASS 'did not apply'
+
+# A model that differs is a FAIL even when check 2 cannot read another of its inputs, here
+# recording rules that the report gives as no list of text; the line names both. The control is the
+# same Pi with the model the template gives, whose check 2 is UNKNOWN. Breaks it catches: a driver
+# that prints UNKNOWN and so hides a difference it found; one that passes rules it could not read.
 new_case 'a model that differs, and recording rules that cannot be read'
-printf 'recording_rules:\n    - A rule that runs\n      onto a second line.\n' >"$deploy/ghost-wispr.local.yaml"
 jq -c '.models.embedding = "vertex/other-embedding"' <<<"$new_config" >"$state/config.json"
+recorder_applies '{"recording_rules":"A rule, not a list."}'
 run_driver
 expect_verdicts PASS FAIL PASS PASS PASS PASS PASS
-expect 2 FAIL 'embedding runs' vertex/other-embedding 'cannot read recording_rules'
+expect 2 FAIL 'embedding runs' vertex/other-embedding 'local_settings gives recording_rules'
 printf '%s\n' "$new_config" >"$state/config.json"
+recorder_applies '{"recording_rules":"A rule, not a list."}'
 run_driver
 expect_verdicts PASS UNKNOWN PASS PASS PASS PASS PASS
-expect 2 UNKNOWN 'cannot read recording_rules'
+expect 2 UNKNOWN 'local_settings gives recording_rules'
 
 # Check 3: a provider that did not sign in, one the template does not name, and one the template
 # names that the Pi does not list each fail, and the line names it. Breaks it catches: a driver that
@@ -657,22 +737,24 @@ jq -c 'del(.providers[-1])' <<<"$good_providers" >"$state/providers.json"
 run_driver
 expect_verdicts PASS PASS FAIL PASS PASS PASS PASS
 expect 3 FAIL "the Pi lists no $missing_provider"
-# A provider the local settings file adds runs, since the recorder reads that file over the
-# template, and passes. Break it catches: a driver whose check 3 fails for good on a Pi whose local
-# settings file adds a provider.
-new_case 'a provider added to the local settings file'
+# A provider the local settings add runs, since the recorder applies them over the template, and
+# passes. Break it catches: a driver whose check 3 fails for good on a Pi whose local settings file
+# adds a provider.
+new_case 'a provider added to the local settings'
 printf 'providers:\n    gateway:\n        api: openai\n' >"$deploy/ghost-wispr.local.yaml"
+recorder_applies '{"providers":{"gateway":{"api":"openai"}}}'
 jq -c '.providers += [{name: "gateway", ok: true, message: "works"}]' <<<"$good_providers" >"$state/providers.json"
 run_driver
 expect_verdicts PASS PASS PASS PASS PASS PASS PASS
-# The local settings file sets to null each provider the template names, and the Pi lists none: no
+# The local settings set to null each provider the template names, and the Pi lists none: no
 # provider is left to check, which is no pass. Break it catches: a driver that applies the nulls and
 # then passes an empty list against an empty list.
-new_case 'a local settings file that removes every provider'
+new_case 'local settings that remove every provider'
 {
   echo 'providers:'
   template_providers "$new_template" | sed 's/^/    /; s/$/: null/'
 } >"$deploy/ghost-wispr.local.yaml"
+recorder_applies "$(template_providers "$new_template" | jq -Rcn '{providers: (reduce inputs as $name ({}; .[$name] = null))}')"
 printf '{"providers":[]}\n' >"$state/providers.json"
 run_driver
 expect_verdicts PASS PASS UNKNOWN PASS PASS PASS PASS
@@ -750,13 +832,14 @@ expect 5 UNKNOWN sudo
 expect 7 UNKNOWN sudo
 
 # SSH does not reach the Pi: every check that reads over SSH is UNKNOWN and says so; the checks over
-# Serve still run. Break it catches: a driver that stops at the first SSH failure, or that takes
-# ssh's exit 255 for a mismatch or for a clean answer.
+# Serve still run, checks 2 and 3 among them, which read the recorder's report and no file of the
+# Pi. Break it catches: a driver that stops at the first SSH failure, or that takes ssh's exit 255
+# for a mismatch or for a clean answer.
 new_case 'ssh unreachable'
 : >"$state/ssh-down"
 run_driver
-expect_verdicts PASS UNKNOWN PASS PASS UNKNOWN UNKNOWN UNKNOWN
-for n in 2 5 6 7; do expect "$n" UNKNOWN SSH; done
+expect_verdicts PASS PASS PASS PASS UNKNOWN UNKNOWN UNKNOWN
+for n in 5 6 7; do expect "$n" UNKNOWN SSH; done
 
 # Check 6: a protected recording changed, and a list that names none. Breaks it catches: a driver
 # that does not hash the recordings; one that passes a list that names no recording.
@@ -791,6 +874,18 @@ rm -f -- "$deploy/ghost-wispr-update-launcher.sh"
 run_driver
 expect_verdicts PASS PASS PASS PASS PASS PASS FAIL
 expect 7 FAIL ghost-wispr-update-launcher.sh
+# Sol's case (GPT-6.1 Sol's review of PR #201 at 6c53026b, finding 4): the launcher is missing, and
+# SSH is lost while the driver reads the next bootstrap file. The absence that the first read found
+# is a FAIL whatever the later reads give, and the line names the missing launcher and the lost
+# SSH. Break it catches: a driver that keeps a file it found absent only when every later read
+# succeeds, so a lost connection turns a known difference into UNKNOWN.
+new_case 'a missing launcher, then SSH lost'
+rm -f -- "$deploy/ghost-wispr-update-launcher.sh"
+printf '%s' '.config/systemd/user/ghost-wispr-update.service' >"$state/ssh-lost-on"
+run_driver
+[[ -e $state/ssh-lost-fired ]] || fail "SSH was never lost: the driver did not read ghost-wispr-update.service: $out"
+expect_verdicts PASS PASS PASS PASS PASS PASS FAIL
+expect 7 FAIL ghost-wispr-update-launcher.sh SSH
 new_case 'a Serve target that differs'
 jq -c '.Web[].Handlers["/"].Proxy = "http://127.0.0.1:9090"' <<<"$good_serve" >"$state/serve.json"
 run_driver
