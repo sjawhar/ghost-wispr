@@ -83,11 +83,10 @@ type session struct {
 	heldAnswer   held          // an answer Deepgram refused, to hand over when the room is done
 	retry        *time.Timer
 	asker        *time.Timer // sends the asker's words as text if Deepgram hears no turn
-	// room is the asker's words and the room's recent words as a model may
-	// read them now (voice.Exchange.Room): the asker timer reads it as it
-	// fires, never the words of the session's opening (Sol's fifteenth
-	// review of #191).
-	room func() (string, []voice.TurnText)
+	// room is the room's words as a model may read them now
+	// (voice.Exchange.Room): the asker timer reads it as it fires, never the
+	// words of the session's opening (Sol's fifteenth review of #191).
+	room func() voice.RoomView
 	// abandoned holds the words of injections the session gave up on while
 	// Deepgram may still speak them: they are not played when it does.
 	abandoned [][]string
@@ -168,7 +167,7 @@ func start(cfg *Config, conn *websocket.Conn, x *voice.Exchange) *session {
 		s.room = x.Room
 		if s.room == nil {
 			asker, recent := x.AskerTurn, x.Recent
-			s.room = func() (string, []voice.TurnText) { return asker, recent }
+			s.room = func() voice.RoomView { return voice.RoomView{Asker: asker, Recent: recent} }
 		}
 		s.asker = time.AfterFunc(cfg.askerWait, s.askIfUnheard)
 	}
@@ -637,7 +636,8 @@ func (s *session) askIfUnheard() {
 	if heard || s.ctx.Err() != nil {
 		return
 	}
-	words, _ := s.room() // with no lock of the session's held: it locks the Supervisor
+	room := s.room() // with no lock of the session's held: it locks the Supervisor
+	words := room.Asker
 	if words = strings.TrimSpace(words); words == "" {
 		return
 	}

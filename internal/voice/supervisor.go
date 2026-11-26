@@ -413,6 +413,7 @@ type exchange struct {
 	turnSeqs     []uint64 // each final's entry in the room's recent words, 0 for none
 	replySeqs    []uint64 // the same for ex.reply
 	interim      string   // the turn's words not final yet
+	roomRevision uint64   // each new final: a fresh RoomView (Exchange.Room)
 	timer        *time.Timer
 	said         bool
 	spokeAt      time.Time  // when its speech first started
@@ -1849,6 +1850,7 @@ func (s *Supervisor) turnLocked(ex *exchange, t *Transcript, words string) {
 	if t.IsFinal {
 		if words != "" {
 			ex.turn = append(ex.turn, words)
+			ex.roomRevision++
 			// ex.turnSeqs keeps ex.turn's last entries, one a final: a
 			// reset of ex.turn drops the rest of them here.
 			seq := uint64(0)
@@ -3044,15 +3046,18 @@ func (s *Supervisor) takenTexts(ex *exchange) map[uint64]string {
 // (modelViewLocked); the asker's words are ex's current turn after its last
 // take-back (askerNowLocked), also once that turn was handed to an answer:
 // a voice that asks it again replays that turn, as the room said it.
-func (s *Supervisor) roomOf(ex *exchange) func() (string, []TurnText) {
-	return func() (string, []TurnText) {
+func (s *Supervisor) roomOf(ex *exchange) func() RoomView {
+	return func() RoomView {
 		s.mu.Lock()
 		defer s.mu.Unlock()
+		if ex.ended || ex.ctx.Err() != nil {
+			return RoomView{}
+		}
 		x := s.modelViewLocked(ex, &ex.x)
 		if asker := s.askerNowLocked(ex); asker != "" {
 			x.AskerTurn = asker
 		}
-		return x.AskerTurn, x.Recent
+		return RoomView{Asker: x.AskerTurn, Recent: x.Recent, Revision: ex.roomRevision}
 	}
 }
 

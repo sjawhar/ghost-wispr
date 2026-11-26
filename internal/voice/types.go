@@ -34,15 +34,16 @@ type Exchange struct {
 	// Recent is up to the last 2 minutes of labelled final segments, with
 	// the words a take-back cancelled left out (Config.TakeBack).
 	Recent []TurnText
-	// Room is the asker's words (AskerTurn) and the room's recent words
-	// (Recent) as a model may read them now, with the current turn's
-	// take-back applied, though the room said it after this copy was made
-	// (Supervisor.modelViewLocked). A voice reads AskerTurn and Recent once,
-	// as it opens; every send after that calls Room, never a copy it kept
-	// (Main, after Sol's fifteenth review of #191). Room locks the
-	// Supervisor: call it with no lock of the voice's own held. nil, outside
-	// a Supervisor: AskerTurn and Recent as they are.
-	Room  func() (asker string, recent []TurnText)
+	// Room is the room's words as a model may read them now, with the
+	// current turn's take-back applied (RoomView). A voice reads AskerTurn
+	// and Recent once as it opens; every send after that calls Room, never a
+	// copy it kept (Main, after Sol's fifteenth review of #191). Room locks
+	// the Supervisor: call it with no lock of the voice's own held. Once the
+	// exchange ended or its context was cancelled, it returns an empty view:
+	// an unpublished Open and its workers send nothing after the capture
+	// gate closed (Sol's sixteenth review of #191). nil, outside a
+	// Supervisor, means AskerTurn and Recent as they are.
+	Room  func() RoomView
 	Tap   <-chan audio.Frame // room audio from the wake on, 16 kHz mono, only while the capture gate is open
 	Out   Output             // the speaker output's "voice" input
 	Tools ToolRunner         // the Concierge
@@ -69,6 +70,16 @@ type Exchange struct {
 	// with spaces, and nothing said before it is read, searched or sent. A
 	// question other than AskerTurn, a vendor's new one, is not cut by them.
 	Finals string
+}
+
+// RoomView is the room's words a vendor may read now (Exchange.Room). Asker
+// and Recent are the current cut view; Revision changes whenever the
+// exchange gets a new final, so a vendor can tell a new room question or
+// take-back from its own later words without retaining those room words.
+type RoomView struct {
+	Asker    string
+	Recent   []TurnText
+	Revision uint64
 }
 
 // TurnText is one final transcript segment.
