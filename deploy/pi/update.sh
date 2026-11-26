@@ -113,6 +113,15 @@ make_stage() {
   mkdir -- "$stage/new" || fail "cannot make a staging directory in $DEPLOY_DIR"
 }
 
+# remove_stale_stages removes each staging directory of an earlier run that is older than 46
+# minutes, the launcher's 45-minute limit and its 60 s grace: a run that limit killed left it, and
+# it can hold the secrets that run read. A younger one may belong to a run still going, and stays.
+# A failure here only leaves those directories, and the run goes on.
+remove_stale_stages() {
+  find "$DEPLOY_DIR" -mindepth 1 -maxdepth 1 -type d -name '.ghost-wispr-update.*' -mmin +46 -exec rm -rf -- {} + \
+    || printf 'ghost-wispr update: could not remove each staging directory older than 46 minutes in %s\n' "$DEPLOY_DIR"
+}
+
 recorder_active() {
   systemctl --user is-active --quiet ghost-wispr.service
 }
@@ -183,16 +192,23 @@ restartable() {
   done
 }
 
-# wait_for_commit COMMIT returns once the recorder answers /api/version with COMMIT, within 120 s.
+# wait_for_commit COMMIT returns once the recorder answers /api/version with COMMIT and /api/status
+# with a status that recorder_status accepts and busy_reason can read, a session or a call
+# included, within 120 s. A release whose state the update cannot read (no status, or a call it
+# cannot read) would stop each later run at its first status read, before it could install a fix.
 wait_for_commit() {
-  local deadline answer commit
+  local deadline answer commit status reason
   deadline=$(($(date +%s) + 120))
   while (($(date +%s) < deadline)); do
     answer=$(curl --connect-timeout 5 --max-time 10 --fail --silent --show-error "$VERSION_URL" 2>/dev/null) || answer=''
     if [[ -n $answer ]]; then
       commit=$(jq -r '.commit // empty' <<<"$answer" 2>/dev/null) || commit=''
       if [[ $commit == "$1" ]]; then
-        return 0
+        status=$(recorder_status)
+        reason=$(busy_reason "$status")
+        if [[ -n $status && $reason != 'call unknown' && $reason != 'status unreadable' ]]; then
+          return 0
+        fi
       fi
     fi
     sleep 2
@@ -431,12 +447,28 @@ running_image_is_installed() {
   return 1
 }
 
+# old_record_names_binary: ghost-wispr.verified, the record of the update.sh before the deploy set,
+# names the installed binary by its SHA-256: that update.sh saw the binary run and answer its commit.
+old_record_names_binary() {
+  local want have
+  [[ -f $OLD_VERIFIED && -f $BINARY ]] || return 1
+  want=$(<"$OLD_VERIFIED") || return 1
+  have=$(sum "$BINARY") || return 1
+  [[ $want =~ ^[0-9a-f]{64}$ && $want == "$have" ]]
+}
+
 # keep_previous NAME... copies each installed file NAME to NAME.prev in DEPLOY_DIR, by a copy to a
-# temporary name and a rename, so a running update.sh.prev keeps reading its own file. A NAME the Pi
-# does not have loses its old copy, so the .prev copies are one set.
+# temporary name and a rename, so a kill leaves the old copy or the new one. A NAME the Pi does not
+# have loses its old copy, so the .prev copies are one set. While this script runs as
+# update.sh.prev, the launcher's fallback after a release's update.sh broke, it keeps
+# update.sh.prev and pi-lib.sh.prev as they are: they are the scripts that run, and a copy of the
+# broken update.sh there would leave no update that runs once a second such release installs.
 keep_previous() {
   local name path
   for name in "$@"; do
+    if [[ $self_name == update.sh.prev && ($name == update.sh || $name == pi-lib.sh) ]]; then
+      continue
+    fi
     path=$(installed_path "$name")
     if [[ -f $path ]]; then
       cp --preserve=mode -- "$path" "$DEPLOY_DIR/.$name.prev.tmp" || fail "could not keep $path as $DEPLOY_DIR/$name.prev"
@@ -507,17 +539,18 @@ swap_in() {
 }
 
 # restore_previous WHY puts back each file this run swapped in from its .prev copy, byte for byte,
-# and, when restore_all is set, every other file of the set, .env, the certificate and its version
-# file that has a .prev copy. Then it reloads the user units, and reloads udev or restarts logind
-# when their file changed. It sets restore_problems to what it could not do: a reload, or a file
-# swapped in with no .prev copy, which stays as installed; and restore_note to what went back. When
-# no file has a .prev copy it fails with WHY: no previous release to restore (R6). It writes no
-# deploy.verified.
+# and, when restore_all is set, every other file of the set and .env that has a .prev copy. The
+# certificate and its version file go back only when this run swapped them in: one that an earlier
+# run installed passed pi-secrets' checks, and its .prev copy is an older certificate. Then it
+# reloads the user units, and reloads udev or restarts logind when their file changed. It sets
+# restore_problems to what it could not do: a reload, or a file swapped in with no .prev copy, which
+# stays as installed; and restore_note to what went back. When no file has a .prev copy it fails
+# with WHY: no previous release to restore (R6). It writes no deploy.verified.
 restore_previous() {
   local why=$1 name path prev names=("${swapped[@]}") restored=() missing=() system=()
   restore_problems='' restore_note='restored the previous release'
   if $restore_all; then
-    for name in "${SET_FILES[@]}" ghost-wispr .env device.crt device.crt.version; do
+    for name in "${SET_FILES[@]}" ghost-wispr .env; do
       [[ " ${names[*]} " == *" $name "* ]] || names+=("$name")
     done
   fi
@@ -649,7 +682,7 @@ restart_for_files_since_start() {
   fi
   systemctl --user restart ghost-wispr.service || rollback "the recorder did not start on the installed ${newer[*]}"
   wait_for_commit "$release_commit" \
-    || rollback "the recorder did not answer /api/version with commit $release_commit within 120 s of its restart on the installed ${newer[*]}"
+    || rollback "the recorder did not answer /api/version with commit $release_commit and /api/status with a status it could read within 120 s of its restart on the installed ${newer[*]}"
 }
 
 # refuse_override WHERE NAMES fails while NAMES, the override variables WHERE sets, is not empty.
@@ -748,7 +781,7 @@ refresh_current() {
   leave_if_busy_before_restart
   systemctl --user restart ghost-wispr.service || rollback "the recorder did not start on the new ${changes[*]}"
   wait_for_commit "$release_commit" \
-    || rollback "the recorder did not answer /api/version with commit $release_commit within 120 s of its restart on the new ${changes[*]}"
+    || rollback "the recorder did not answer /api/version with commit $release_commit and /api/status with a status it could read within 120 s of its restart on the new ${changes[*]}"
   if [[ " ${changes[*]} " == *' .env '* ]]; then
     printf 'ghost-wispr update: installed secrets\n'
   fi
@@ -794,16 +827,33 @@ install_release() {
     else
       printf 'ghost-wispr update: the installed files are not the set %s lists, so the .prev copies stay as they are\n' "$VERIFIED"
     fi
-  elif running_image_is_installed; then
+  elif recorder_active; then
+    if running_image_is_installed; then
+      keep=true
+    fi
+  elif old_record_names_binary; then
+    # The recorder is stopped, so no image shows which binary ran; the old update.sh's record does.
+    printf 'ghost-wispr update: ghost-wispr.service is stopped, and %s names the installed binary, so the installed files are kept as the previous release\n' \
+      "$OLD_VERIFIED"
     keep=true
+  elif [[ -e $DEPLOY_DIR/ghost-wispr.prev ]]; then
+    # Nothing shows that the old update.sh's ghost-wispr.prev is not older than the installed
+    # binary, so no rollback may put it back.
+    printf 'ghost-wispr update: ghost-wispr.service is stopped, and %s does not name the installed binary, so %s, which may be older than that binary, is removed, and the installed files are not kept as the previous release\n' \
+      "$OLD_VERIFIED" "$DEPLOY_DIR/ghost-wispr.prev"
+    rm -f -- "$DEPLOY_DIR/ghost-wispr.prev" || fail "could not remove $DEPLOY_DIR/ghost-wispr.prev; nothing was installed"
+  elif [[ -f $BINARY ]]; then
+    printf 'ghost-wispr update: ghost-wispr.service is stopped, and %s does not name the installed binary, so the installed files are not kept as the previous release\n' \
+      "$OLD_VERIFIED"
   fi
-  # The .prev copies are one set: the certificate and its version file are kept with it, staged or
-  # not, so a rollback never puts back a certificate older than the set's.
+  # With the set, the certificate and its version file are kept, staged or not. Without it, a staged
+  # certificate keeps the installed one, the certificate before this run, for its rollback; a
+  # rollback puts the certificate back only to undo this run's swap of it (restore_previous).
   if $keep; then
     keep_previous "${SET_FILES[@]}" ghost-wispr .env device.crt device.crt.version
   else
     restore_all=true
-    if [[ -n $certificate_staged && ! -e $DEPLOY_DIR/device.crt.prev ]]; then
+    if [[ -n $certificate_staged ]]; then
       keep_previous device.crt device.crt.version
     fi
   fi
@@ -823,7 +873,8 @@ install_release() {
   # previous release's files back.
   leave_if_busy_before_restart
   systemctl --user restart ghost-wispr.service || rollback "the new release did not start"
-  wait_for_commit "$release_commit" || rollback "the new release did not answer /api/version with commit $release_commit within 120 s"
+  wait_for_commit "$release_commit" \
+    || rollback "the new release did not answer /api/version with commit $release_commit and /api/status with a status it could read within 120 s"
   write_verified || fail "the new release runs, but $VERIFIED could not be written; the next run installs it again"
   rm -f -- "$OLD_VERIFIED"
   printf 'ghost-wispr update: installed commit %s (invocation %s)\n' "$release_commit" "${INVOCATION_ID:-none}"
@@ -834,7 +885,8 @@ install_release() {
 }
 
 nightly() {
-  local held
+  local held verified_line
+  remove_stale_stages
   leave_if_busy
 
   release_json=$(curl --connect-timeout 5 --max-time 30 --fail --silent --show-error "$RELEASE_API") \
@@ -872,6 +924,14 @@ nightly() {
       else empty end') || fail "could not compare the bridge's link versions with the release's"
   if [[ -n $held ]]; then
     printf '%s\n' "$held"
+    # The release the Pi runs still takes new secrets and a renewed certificate while a newer one
+    # waits, as when it is current: the commit deploy.verified names is the one it answers.
+    if installed_set_is_verified; then
+      verified_line=$(head -n1 -- "$VERIFIED")
+      release_commit=${verified_line#commit }
+      require_no_override
+      refresh_current
+    fi
     exit 0
   fi
 
@@ -882,6 +942,7 @@ nightly() {
 }
 
 secrets_mode() {
+  remove_stale_stages
   [[ -x $BINARY ]] || fail "there is no installed binary at $BINARY to read the secrets with"
   make_stage
   read_secrets "$BINARY"
