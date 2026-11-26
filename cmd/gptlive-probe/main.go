@@ -137,20 +137,22 @@ const (
 )
 
 // delegationLog is the session's logger: it keeps when the first client
-// delegation reached us and how much of the model's audio the client withheld
-// from the speaker while one was outstanding, so a probe can report what
-// GPT-Live sent against what the room would have heard. It passes every
-// record on to the default logger. The session logs no words of the room.
+// delegation reached us and the session's own account of where every sample
+// the model sent went, so the probe can report measured figures rather than
+// figures derived from one another. It passes every record on to the default
+// logger. The session logs no words of the room.
 type delegationLog struct {
-	mu       sync.Mutex
-	first    time.Time
-	withheld time.Duration
-	// sent and toSpeaker are the session's own counts, each taken where it
-	// happens. The probe never derives one from the other: a derived figure
-	// is equal by construction and could not show the client duplicating a
-	// stretch of the model's audio.
+	mu    sync.Mutex
+	first time.Time
+	// Each is the session's own count, taken where it happens. sent must
+	// equal the sum of the rest; the probe checks that rather than assuming
+	// it, because a figure derived from the others cannot disagree with them.
 	sent      time.Duration
 	toSpeaker time.Duration
+	withheld  time.Duration
+	muted     time.Duration
+	quiet     time.Duration
+	afterStop time.Duration
 }
 
 func (l *delegationLog) Enabled(context.Context, slog.Level) bool { return true }
@@ -163,24 +165,23 @@ func (l *delegationLog) Handle(ctx context.Context, r slog.Record) error {
 			l.first = r.Time
 		}
 		l.mu.Unlock()
-	case "gptlive: withheld the model's audio while a delegation was outstanding":
-		r.Attrs(func(a slog.Attr) bool {
-			if a.Key == "ms" {
-				l.mu.Lock()
-				l.withheld += time.Duration(a.Value.Int64()) * time.Millisecond
-				l.mu.Unlock()
-				return false
-			}
-			return true
-		})
 	case "gptlive: the model's audio this session":
 		l.mu.Lock()
 		r.Attrs(func(a slog.Attr) bool {
+			d := time.Duration(a.Value.Int64()) * time.Millisecond
 			switch a.Key {
 			case "sent_ms":
-				l.sent = time.Duration(a.Value.Int64()) * time.Millisecond
+				l.sent = d
 			case "to_speaker_ms":
-				l.toSpeaker = time.Duration(a.Value.Int64()) * time.Millisecond
+				l.toSpeaker = d
+			case "held_ms":
+				l.withheld = d
+			case "muted_ms":
+				l.muted = d
+			case "quiet_ms":
+				l.quiet = d
+			case "stopped_ms":
+				l.afterStop = d
 			}
 			return true
 		})
@@ -199,19 +200,11 @@ func (l *delegationLog) arrivedAt() (time.Time, bool) {
 	return l.first, !l.first.IsZero()
 }
 
-// heldBack is how much of the model's audio never reached the speaker.
-func (l *delegationLog) heldBack() time.Duration {
+// audio is the session's account of where every sample the model sent went.
+func (l *delegationLog) audio() (sent, toSpeaker, withheld, muted, quiet, afterStop time.Duration) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	return l.withheld
-}
-
-// audio is the session's own counts of what the model sent and what reached
-// the speaker, each measured where it happens.
-func (l *delegationLog) audio() (sent, toSpeaker time.Duration) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	return l.sent, l.toSpeaker
+	return l.sent, l.toSpeaker, l.withheld, l.muted, l.quiet, l.afterStop
 }
 
 // delegationEvidence is the answer's code-like fact. GPT-Live's
@@ -828,15 +821,18 @@ func observeDelegation(ctx context.Context, cfg *probeConfig, in *feeder, tools 
 	} else {
 		printf(out, "observe: no delegation reached the client\n")
 	}
-	held := arrivals.heldBack()
-	sent, toSpeaker := arrivals.audio()
-	// sent and toSpeaker are the session's own counts, taken where each
-	// happens; spoke is what this sink received. Three independent figures, so
-	// the client duplicating a stretch of audio would show as a gap between
-	// them rather than cancelling out.
-	printf(out, "observe: GPT-Live sent %v of audio; the client queued %v for the speaker and withheld %v while a delegation was outstanding; this sink received %v\n", sent, toSpeaker, held, spoke)
-	if sent > 0 && toSpeaker > spoke+200*time.Millisecond {
-		printf(out, "observe: WARNING the client queued %v but the sink received %v\n", toSpeaker, spoke)
+	sent, toSpeaker, held, muted, quiet, afterStop := arrivals.audio()
+	// Each figure is counted where it happens, none derived from another, so
+	// the identity below can fail. A path that dropped the model's audio with
+	// no counter of its own shows as the difference.
+	printf(out, "observe: GPT-Live sent %v of audio; the client queued %v for the speaker, withheld %v while a delegation was outstanding, muted %v, dropped %v of silence outside a speech and %v after the session closed\n",
+		sent, toSpeaker, held, muted, quiet, afterStop)
+	printf(out, "observe: this sink received %v\n", spoke)
+	if accounted := toSpeaker + held + muted + quiet + afterStop; sent != accounted {
+		printf(out, "observe: WARNING GPT-Live sent %v but only %v is accounted for; %v went down a path with no counter\n", sent, accounted, sent-accounted)
+	}
+	if toSpeaker > spoke+200*time.Millisecond {
+		printf(out, "observe: WARNING the client queued %v for the speaker but the sink received %v\n", toSpeaker, spoke)
 	}
 	if at, ok := rec.firstAfter(ended); ok {
 		printf(out, "observe: the speaker heard %v of audio, beginning %v after the question ended\n", spoke, at.Sub(ended).Round(time.Millisecond))

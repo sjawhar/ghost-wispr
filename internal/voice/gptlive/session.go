@@ -1248,14 +1248,20 @@ type player struct {
 	holds      int       // delegations outstanding: the model's audio reaches no speaker
 	heldAt     time.Time // when the first of those delegations arrived
 	heldFrames int       // samples withheld since that delegation arrived
-	// recvFrames and playedFrames are counted where each happens, never one
-	// from the other: a figure derived from the other cannot show a
-	// difference between them.
-	recvFrames   int // samples the model has sent, held or not
-	playedFrames int // samples queued for the speaker
-	begun        int // speeches begun
-	ended        int // speeches ended
-	changed      chan struct{}
+	// Every sample the model sends is counted once on arrival and once again
+	// on the path it takes, each where it happens, never derived from the
+	// others: recvFrames must equal the sum of the rest, and a path that
+	// dropped audio without a counter of its own would show as the gap. The
+	// run of 2026-11-26 at c9052e6 had 5.1 s in no bucket at all.
+	recvFrames    int // every sample the model sent
+	playedFrames  int // queued for the speaker
+	heldTotal     int // dropped while a delegation was outstanding
+	mutedFrames   int // dropped as the rest of a cut or acknowledged speech
+	quietFrames   int // silence outside a speech, which never plays
+	stoppedFrames int // arrived after the session closed
+	begun         int // speeches begun
+	ended         int // speeches ended
+	changed       chan struct{}
 }
 
 func newPlayer(s *session) *player {
@@ -1286,18 +1292,36 @@ func (p *player) release() {
 	if p.holds > 0 {
 		p.holds--
 	}
-	if p.holds == 0 {
+	done := p.holds == 0
+	if done {
 		if !p.last.IsZero() && time.Since(p.last) < speechGap {
 			p.muted = true
-		}
-		if p.heldFrames > 0 {
-			p.s.log.Info("gptlive: withheld the model's audio while a delegation was outstanding",
-				"samples", p.heldFrames, "ms", p.heldFrames*1000/SampleRate)
 		}
 		p.heldAt, p.heldFrames = time.Time{}, 0
 	}
 	p.mu.Unlock()
+	if done {
+		// Reported here as well as at a speech end: a withdrawn delegation
+		// begins no speech, so a report only at a speech end left the whole
+		// silent run unaccounted (the office Pi, 2026-11-26 at c9052e6).
+		p.reportAudio()
+	}
 	signal(p.wake)
+}
+
+// reportAudio logs every sample the model has sent this session and where
+// each went, from one snapshot under the lock. sent_ms must equal the sum of
+// the rest; a path that dropped audio with no counter of its own shows as the
+// difference, which is how 5.1 s of the control's audio was found missing.
+func (p *player) reportAudio() {
+	p.mu.Lock()
+	recv, played, held := p.recvFrames, p.playedFrames, p.heldTotal
+	muted, quiet, stopped := p.mutedFrames, p.quietFrames, p.stoppedFrames
+	p.mu.Unlock()
+	ms := func(n int) int { return n * 1000 / SampleRate }
+	p.s.log.Info("gptlive: the model's audio this session",
+		"sent_ms", ms(recv), "to_speaker_ms", ms(played), "held_ms", ms(held),
+		"muted_ms", ms(muted), "quiet_ms", ms(quiet), "stopped_ms", ms(stopped))
 }
 
 // heldLocked reports whether the model's audio is held now. The hold is
@@ -1314,6 +1338,7 @@ func (p *player) push(pcm []int16, now time.Time) bool {
 	defer p.mu.Unlock()
 	p.recvFrames += len(pcm)
 	if p.stopped {
+		p.stoppedFrames += len(pcm)
 		return false
 	}
 	if p.heldLocked(now) {
@@ -1326,12 +1351,19 @@ func (p *player) push(pcm []int16, now time.Time) bool {
 			p.last = now
 		}
 		p.heldFrames += len(pcm)
+		p.heldTotal += len(pcm)
 		return false
 	}
 	inSpeech := !p.last.IsZero() && now.Sub(p.last) < speechGap
 	if !audible(pcm) {
-		if inSpeech && !p.muted {
+		switch {
+		case inSpeech && !p.muted:
 			p.enqueueLocked(pcm)
+		case inSpeech:
+			p.mutedFrames += len(pcm)
+		default:
+			// Silence outside a speech never plays.
+			p.quietFrames += len(pcm)
 		}
 		return false
 	}
@@ -1339,6 +1371,8 @@ func (p *player) push(pcm []int16, now time.Time) bool {
 	if inSpeech {
 		if !p.muted {
 			p.enqueueLocked(pcm)
+		} else {
+			p.mutedFrames += len(pcm)
 		}
 		return false
 	}
@@ -1406,11 +1440,10 @@ func (p *player) speaking() bool {
 	return begun != ended
 }
 
-// count records a speech beginning or ending. At each end it reports how much
-// audio the model has sent this session against how much reached the speaker,
-// both counted where they happen, so a probe can tell the model repeating
-// itself from the client duplicating a stretch. Deriving one from the other
-// would make them equal whatever happened.
+// count records a speech beginning or ending. At each end it reports where
+// every sample the model has sent this session went (reportAudio), so a probe
+// can tell the model repeating itself from the client dropping or duplicating
+// a stretch.
 func (p *player) count(began bool) {
 	p.mu.Lock()
 	if began {
@@ -1420,11 +1453,9 @@ func (p *player) count(began bool) {
 	}
 	close(p.changed)
 	p.changed = make(chan struct{})
-	recv, played := p.recvFrames, p.playedFrames
 	p.mu.Unlock()
 	if !began {
-		p.s.log.Info("gptlive: the model's audio this session",
-			"sent_ms", recv*1000/SampleRate, "to_speaker_ms", played*1000/SampleRate)
+		p.reportAudio()
 	}
 }
 
