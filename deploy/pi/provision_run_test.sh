@@ -31,8 +31,8 @@ trap 'rm -rf -- "$work_dir"' EXIT
 # The cases of this test, each of which begin names.
 readonly case_names=(bundle-refused not-a-release first-run one-update-start release-files-first
   credentials-written bootstrap-files no-env-no-system-files groups-and-linger join-command idempotent
-  credentials-same credentials-differ client-id release-the-pi-runs serve update-fails recorder-unit join
-  route-check manager-env key certificate models)
+  credentials-same credentials-differ client-id newer-release bootstrap-repair serve update-fails
+  recorder-unit join route-check manager-env key certificate models)
 current_case=setup
 ran_cases=' '
 
@@ -56,19 +56,29 @@ readonly uid runtime_dir="/run/user/$uid"
 [[ -d $runtime_dir ]] || fail "this test needs $runtime_dir, where provision.sh renders the credential files"
 
 readonly bin=$work_dir/bin join=$work_dir/join pi=$work_dir/pi stage=$work_dir/stage first_join=$work_dir/first-join
-readonly deploy=$pi/opt units=$pi/units key_dir=$pi/identity
+readonly deploy=$pi/opt units=$pi/units key_dir=$pi/identity sysroot=$pi/root state=$pi/state
 readonly key=$key_dir/key.pem
 readonly release_commit=0123456789abcdef0123456789abcdef01234567
+# The commits of the releases that the real nightly update installs here, the commit a binary
+# answers when it never reports its own, and a commit that no release here has.
+readonly commit_a=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa commit_b=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb \
+  commit_c=cccccccccccccccccccccccccccccccccccccccc wrong_commit=0000000000000000000000000000000000000000 \
+  other_commit=89abcdef0123456789abcdef0123456789abcdef
 # What test-pi.env sets as PI_TAILNET_CLIENT_ID and PI_SERVICE_ACCOUNT_UNIQUE_ID, written out here.
 readonly client_id=k-test-client-id subject=123456789012345678901
 real_date=$(command -v date)
-readonly real_date
+real_sleep=$(command -v sleep)
+readonly real_date real_sleep
+# The release API and the recorder's two answers, as the real nightly update reads them here.
+readonly release_api=https://api.test.invalid/releases/latest status_url=http://recorder.test.invalid/api/status \
+  version_url=http://recorder.test.invalid/api/version
 export TEST_LOG="$work_dir/log" TEST_UID="$uid" TEST_RUNTIME_DIR="$runtime_dir" TEST_DEPLOY="$deploy" \
   TEST_UNIT_DIR="$units" TEST_BINARY="$work_dir/recorder-binary" \
   TEST_RECORDER_UNIT="$repo_root/deploy/pi/files/ghost-wispr.service" TEST_SERVE_STATE="$work_dir/serve.json" \
   TEST_SERVE_HOST=ghost-wispr.example-tailnet.ts.net TEST_ROUTE_ALL="$work_dir/route-all" TEST_SUBJECT="$subject" \
-  TEST_REAL_DATE="$real_date"
-mkdir -p -- "$bin" "$join" "$first_join"
+  TEST_REAL_DATE="$real_date" TEST_REAL_SLEEP="$real_sleep" TEST_STATE="$state" TEST_RELEASES="$work_dir/releases" \
+  TEST_CLOCK="$work_dir/clock"
+mkdir -p -- "$bin" "$join" "$first_join" "$TEST_RELEASES"
 
 cat >"$bin/id" <<'EOF'
 #!/usr/bin/env bash
@@ -85,11 +95,36 @@ EOF
 # prints $TEST_JOURNAL for journalctl; keeps systemd-run's command, and its whole line, to run the
 # join below; and runs nothing else. provision.sh installs its own files as ghost-wispr, and the
 # nightly update the system files: any other install with sudo, any udevadm call and a logind
-# restart are errors that the test reports.
+# restart are errors that the test reports. The nightly update's own calls each have -n: it
+# installs the system files under GHOST_WISPR_SYSTEM_ROOT, reloads udev and restarts logind, which
+# the log records, and reads Serve's setting.
 cat >"$bin/sudo" <<'EOF'
 #!/usr/bin/env bash
 printf 'sudo %s\n' "$*" >>"$TEST_LOG"
 error() { printf 'fake sudo: %s: sudo %s\n' "$1" "${*:2}" >>"$TEST_LOG.errors"; }
+if [[ ${1:-} == -n ]]; then
+  shift
+  case $1 in
+    install)
+      if [[ ${!#} != "$GHOST_WISPR_SYSTEM_ROOT"/* ]]; then
+        error 'a system file installed outside the system root' -n "$@"
+        exit 1
+      fi
+      shift
+      exec install "$@"
+      ;;
+    udevadm | systemctl) ;;
+    tailscale)
+      shift
+      exec tailscale "$@"
+      ;;
+    *)
+      error 'an unexpected call' -n "$@"
+      exit 1
+      ;;
+  esac
+  exit 0
+fi
 case $1 in
   install)
     if [[ " $* " == *' /dev/stdin '* ]]; then
@@ -133,16 +168,22 @@ EOF
 # The fake systemctl is ghost-wispr's user manager. It logs each call. A call without --user, or
 # whose XDG_RUNTIME_DIR is not the user's runtime directory, is an error the test reports.
 # - daemon-reload moves the file TEST_MANAGER_ENV_PENDING names, when it exists, over
-#   TEST_MANAGER_ENV: an environment.d line written since the last reload counts from the next.
+#   TEST_MANAGER_ENV: an environment.d line written since the last reload counts from the next. It
+#   loads ghost-wispr-update.service as its file is then, $TEST_LOG.loaded-update-unit.
 # - show-environment prints the manager's environment: the file TEST_MANAGER_ENV names when it
 #   exists, else the few variables a manager has; it exits TEST_MANAGER_ENV_EXIT (0 by default).
 # - show -p LoadState -p DropInPaths UNIT prints the unit's load state from $TEST_UNITS/load-UNIT
-#   (loaded when absent) and its drop-ins from $TEST_UNITS/dropins-UNIT.
+#   (loaded when absent) and its drop-ins from $TEST_UNITS/dropins-UNIT; show -p DropInPaths
+#   --value prints none, and show -p MainPID --value prints 0, a recorder with no image to read.
 # - enable fails, as systemctl does, for a unit with no file in TEST_UNIT_DIR.
 # - start ghost-wispr-update.service is the nightly update. It writes to $TEST_LOG.start the
 #   SHA-256 of each file the update runs on, or "missing". With TEST_UPDATE_EXIT it fails as a
 #   failed oneshot unit does; otherwise it installs what the update installs and provision.sh then
-#   uses: the binary and ghost-wispr.service.
+#   uses: the binary and ghost-wispr.service. With TEST_REAL_UPDATE=1 it runs the ExecStart of the
+#   update unit it loaded instead, the real launcher and update.sh in the deploy directory, into
+#   the journal $TEST_JOURNAL, and fails as systemd does when that program fails or is no program.
+# - restart ghost-wispr.service starts the recorder, with TEST_REAL_UPDATE=1: it answers the commit
+#   that the installed binary's "# answers commit" line names, and is-active says it runs.
 cat >"$bin/systemctl" <<'EOF'
 #!/usr/bin/env bash
 printf 'systemctl %s\n' "$*" >>"$TEST_LOG"
@@ -164,10 +205,18 @@ case "$*" in
   daemon-reload)
     # What the manager loads at this reload: the timer's SHA-256, in the order of the run's events.
     printf 'reload timer=%s\n' "$(sum_or_missing "$TEST_UNIT_DIR/ghost-wispr-update.timer")" >>"$TEST_LOG.events"
+    if [[ -f $TEST_UNIT_DIR/ghost-wispr-update.service ]]; then
+      cp -- "$TEST_UNIT_DIR/ghost-wispr-update.service" "$TEST_LOG.loaded-update-unit"
+    else
+      rm -f -- "$TEST_LOG.loaded-update-unit"
+    fi
     if [[ -f ${TEST_MANAGER_ENV_PENDING:-} ]]; then
       mv -f -- "$TEST_MANAGER_ENV_PENDING" "$TEST_MANAGER_ENV"
     fi
     ;;
+  'is-active --quiet ghost-wispr.service') [[ -f $TEST_STATE/active ]] ;;
+  'show -p MainPID --value ghost-wispr.service') printf '0\n' ;;
+  'show -p DropInPaths --value '*) printf '\n' ;;
   show-environment)
     if [[ -f ${TEST_MANAGER_ENV:-} ]]; then
       cat -- "$TEST_MANAGER_ENV"
@@ -188,6 +237,23 @@ case "$*" in
     fi
     ;;
   'start ghost-wispr-update.service')
+    if [[ ${TEST_REAL_UPDATE:-} == 1 ]]; then
+      [[ -f $TEST_LOG.loaded-update-unit ]] || { printf 'Unit ghost-wispr-update.service not found.\n' >&2; exit 5; }
+      program=$(sed -n 's/^ExecStart=//p' "$TEST_LOG.loaded-update-unit")
+      program=${program/#\/opt\/ghost-wispr\//$TEST_DEPLOY/}
+      if [[ -z $program || ! -x $program ]]; then
+        printf 'ghost-wispr-update.service: Failed at step EXEC spawning %s: No such file or directory (status=203/EXEC)\n' "$program" >>"$TEST_JOURNAL"
+        printf 'Job for ghost-wispr-update.service failed because the control process exited with error code.\n' >&2
+        exit 1
+      fi
+      status=0
+      INVOCATION_ID=test-invocation-real "$program" >>"$TEST_JOURNAL" 2>&1 || status=$?
+      if ((status != 0)); then
+        printf 'Job for ghost-wispr-update.service failed because the control process exited with error code.\n' >&2
+        exit 1
+      fi
+      exit 0
+    fi
     {
       for name in update.sh pi-lib.sh pi.env ghost-wispr-update-launcher.sh google-credentials.json certificate_config.json; do
         printf '%s %s\n' "$(sum_or_missing "$TEST_DEPLOY/$name")" "$name"
@@ -203,7 +269,15 @@ case "$*" in
     install -m 0755 -- "$TEST_BINARY" "$TEST_DEPLOY/ghost-wispr"
     install -m 0644 -- "$TEST_RECORDER_UNIT" "$TEST_UNIT_DIR/ghost-wispr.service"
     ;;
-  'restart ghost-wispr.service') ;;
+  'restart ghost-wispr.service')
+    if [[ ${TEST_REAL_UPDATE:-} == 1 ]]; then
+      rm -f -- "$TEST_STATE/active"
+      commit=$(sed -n 's/^# answers commit //p' "$TEST_DEPLOY/ghost-wispr" 2>/dev/null) || commit=''
+      [[ -n $commit ]] || { printf 'ghost-wispr.service: status=203/EXEC\n' >&2; exit 1; }
+      printf '%s\n' "$commit" >"$TEST_STATE/running-commit"
+      : >"$TEST_STATE/active"
+    fi
+    ;;
   *)
     error 'an unexpected call' --user "$@"
     exit 1
@@ -222,9 +296,11 @@ EOF
 #   `set --accept-routes=false` sets it false;
 # - `status --self --json` prints the node's own reading, TEST_SELF_STATUS when it is set;
 # - `status --json` prints the status fixture $TEST_STATUS, or fails with TEST_STATUS_EXIT;
-# - `serve --bg --https PORT TARGET` exits TEST_SERVE_EXIT (0 by default), and on 0 serves TARGET on
-#   the HTTPS port PORT; `serve --https=PORT off` serves nothing there; `serve status --json` prints
-#   the setting, or fails with TEST_SERVE_STATUS_EXIT;
+# - `serve --bg --https PORT TARGET` exits TEST_SERVE_EXIT (0 by default), and on 0 serves TARGET at
+#   the mount / of the HTTPS port PORT, and keeps each other mount of that port, as tailscale's
+#   SetWebHandler does (ipn/serve.go, v1.104); `serve --https=PORT off` serves nothing there;
+#   `serve --https=PORT --set-path=MOUNT off` removes that mount, and the port with its last one;
+#   `serve status --json` prints the setting, or fails with TEST_SERVE_STATUS_EXIT;
 # - `debug prefs` prints RouteAll.
 cat >"$bin/tailscale" <<'EOF'
 #!/usr/bin/env bash
@@ -297,10 +373,19 @@ case $1 in
         code=${TEST_SERVE_EXIT:-0}
         if [[ $code == 0 ]]; then
           jq --arg port "$4" --arg target "$5" --arg host "$TEST_SERVE_HOST" \
-            '.TCP[$port] = {HTTPS: true} | .Web["\($host):\($port)"] = {Handlers: {"/": {Proxy: $target}}}' \
+            '.TCP[$port] = {HTTPS: true} | .Web["\($host):\($port)"].Handlers["/"] = {Proxy: $target}' \
             "$state" >"$state.new" && mv -f -- "$state.new" "$state"
         fi
         exit "$code"
+        ;;
+      --https=[0-9]*' --set-path='*' off')
+        (($# == 4)) || unexpected "$@"
+        port=${2#--https=} mount=${3#--set-path=}
+        jq --arg port "$port" --arg mount "$mount" '
+          reduce ((.Web // {}) | keys[] | select(endswith(":" + $port))) as $key (.;
+            del(.Web[$key].Handlers[$mount])
+            | if (.Web[$key].Handlers | length) == 0 then del(.Web[$key]) | del(.TCP[$port]) else . end)' \
+          "$state" >"$state.new" && mv -f -- "$state.new" "$state"
         ;;
       --https=[0-9]*' off')
         (($# == 3)) || unexpected "$@"
@@ -333,12 +418,44 @@ cat -- "$TEST_NETWORKS"
 EOF
 
 # provision.sh reads nothing over HTTP. update.sh and the launcher do, so a curl call means
-# provision.sh ran one of them itself, not through systemd: an error the test reports.
+# provision.sh ran one of them itself, not through systemd: an error the test reports. With
+# TEST_REAL_UPDATE=1, the nightly update runs through the fake systemctl, and curl answers it: the
+# release API with $TEST_RELEASES/latest.json, each asset URL with its file under $TEST_RELEASES,
+# and the recorder's /api/status (free) and /api/version (the commit it runs) while it runs.
 cat >"$bin/curl" <<'EOF'
 #!/usr/bin/env bash
 printf 'curl %s\n' "$*" >>"$TEST_LOG"
-printf 'fake curl: a call, so provision.sh ran update.sh or the launcher itself: curl %s\n' "$*" >>"$TEST_LOG.errors"
-exit 7
+if [[ ${TEST_REAL_UPDATE:-} != 1 ]]; then
+  printf 'fake curl: a call, so provision.sh ran update.sh or the launcher itself: curl %s\n' "$*" >>"$TEST_LOG.errors"
+  exit 7
+fi
+output='' url=''
+while (($#)); do
+  case $1 in
+    --output) output=$2 && shift ;;
+    --connect-timeout | --max-time) shift ;;
+    -*) ;;
+    *) url=$1 ;;
+  esac
+  shift
+done
+case $url in
+  "$GHOST_WISPR_STATUS_URL")
+    [[ -f $TEST_STATE/active ]] || exit 7
+    printf '{"active_session_id":"","paused":false,"capture_state":"idle"}\n'
+    ;;
+  "$GHOST_WISPR_VERSION_URL")
+    [[ -f $TEST_STATE/active ]] || exit 7
+    printf '{"commit":"%s"}\n' "$(<"$TEST_STATE/running-commit")"
+    ;;
+  "$GHOST_WISPR_RELEASE_API") cat -- "$TEST_RELEASES/latest.json" ;;
+  https://assets.test.invalid/*)
+    file=$TEST_RELEASES/${url#https://assets.test.invalid/}
+    [[ -f $file && -n $output ]] || exit 22
+    cp -- "$file" "$output"
+    ;;
+  *) exit 6 ;;
+esac
 EOF
 
 # The release binary that the nightly update installs. Its google-id-token logs how it was run and
@@ -366,13 +483,26 @@ exit 2
 EOF
 
 # date logs each call for the time now in seconds to $TEST_LOG.events, in order with the user
-# manager's reloads, and answers as the real date.
+# manager's reloads, and answers as the real date; while $TEST_CLOCK exists, from that clock. sleep
+# moves that clock instead of waiting, so the update's 120 s version wait takes no time.
 cat >"$bin/date" <<'EOF'
 #!/usr/bin/env bash
 if [[ $* == +%s ]]; then
   printf 'date +%%s\n' >>"$TEST_LOG.events"
+  if [[ -f ${TEST_CLOCK:-} ]]; then
+    cat -- "$TEST_CLOCK"
+    exit 0
+  fi
 fi
 exec "$TEST_REAL_DATE" "$@"
+EOF
+cat >"$bin/sleep" <<'EOF'
+#!/usr/bin/env bash
+if [[ -f ${TEST_CLOCK:-} && $# == 1 && $1 =~ ^[0-9]+$ ]]; then
+  printf '%s\n' "$(($(<"$TEST_CLOCK") + $1))" >"$TEST_CLOCK"
+  exit 0
+fi
+exec "$TEST_REAL_SLEEP" "$@"
 EOF
 chmod +x "$bin/"* "$TEST_BINARY" "$work_dir/release-binary"
 
@@ -404,10 +534,10 @@ make_stage() {
 
 # new_pi makes the fake Pi as provision.sh --key and --certificate leave it: the key and the first
 # certificate, and no other file of Ghost Wispr. Serve serves nothing, the node has not joined yet,
-# and each log starts empty.
+# no recorder runs, and each log starts empty.
 new_pi() {
   rm -rf -- "$pi"
-  mkdir -p -- "$deploy" "$units" "$key_dir"
+  mkdir -p -- "$deploy" "$units" "$key_dir" "$sysroot" "$state"
   printf 'the key\n' >"$key"
   printf 'the certificate\n' >"$deploy/device.crt"
   rm -f -- "$TEST_LOG" "$TEST_LOG".*
@@ -424,8 +554,90 @@ run_provision() {
   shift
   rc=0
   env -u XDG_RUNTIME_DIR PATH="$bin:$PATH" GHOST_WISPR_DEPLOY_DIR="$deploy" GHOST_WISPR_UNIT_DIR="$units" \
-    GHOST_WISPR_IDENTITY_KEY="$key" GHOST_WISPR_JOIN_DIR="$join" \
+    GHOST_WISPR_IDENTITY_KEY="$key" GHOST_WISPR_JOIN_DIR="$join" GHOST_WISPR_SYSTEM_ROOT="$sysroot" \
+    GHOST_WISPR_RELEASE_API="$release_api" GHOST_WISPR_STATUS_URL="$status_url" GHOST_WISPR_VERSION_URL="$version_url" \
     bash "$dir/provision.sh" "$@" <"${RUN_INPUT:-/dev/null}" >"$work_dir/out" 2>&1 || rc=$?
+}
+
+# make_release NAME COMMIT ANSWER publishes the fake release NAME of COMMIT, whose binary answers
+# /api/version with ANSWER once it runs, and answers pi-secrets with two secret lines. Each file of
+# its deploy set but provision.sh and serve.conf ends with the line "# release NAME", so the files of
+# two releases differ. provision.sh runs from $TEST_RELEASES/NAME/ghost-wispr-pi-deploy, which
+# build-deploy-tarball.sh --stage writes; the tarball of that directory, the binary and their
+# .sha256 files are the assets of $TEST_RELEASES/NAME/release.json.
+make_release() {
+  local name=$1 commit=$2 answer=$3 dir=$TEST_RELEASES/$1 file
+  rm -rf -- "$dir"
+  mkdir -p -- "$dir"
+  {
+    printf '#!/usr/bin/env bash\n# answers commit %s\n' "$answer"
+    cat <<'EOF'
+case ${1:-} in
+  link-versions)
+    printf 'unknown subcommand "link-versions"\n' >&2
+    exit 2
+    ;;
+  pi-secrets)
+    out=''
+    while (($#)); do
+      [[ $1 != --out ]] || out=$2
+      shift
+    done
+    [[ -d $out ]] || exit 1
+    printf '%s\n' GHOST_WISPR_DEEPGRAM_API_KEY=test-key GHOST_WISPR_DISPATCH_TOKEN=test-token >"$out/secrets.env"
+    chmod 0600 "$out/secrets.env"
+    printf 'pi-secrets: read the two secrets\n'
+    ;;
+  *) exit 3 ;;
+esac
+EOF
+  } >"$dir/ghost-wispr-linux-arm64"
+  chmod 0755 "$dir/ghost-wispr-linux-arm64"
+  bash "$repo_root/deploy/pi/build-deploy-tarball.sh" --stage "$commit" "$dir/ghost-wispr-linux-arm64" "$dir/ghost-wispr-pi-deploy" \
+    >"$work_dir/build.out" 2>&1 || fail "build-deploy-tarball.sh --stage failed for release $name: $(<"$work_dir/build.out")"
+  restage "$dir/ghost-wispr-pi-deploy" pi.env "$script_dir/test-pi.env"
+  for file in ghost-wispr.yaml pi.env update.sh pi-lib.sh wait-for-network.sh wait-for-time-sync.sh ghost-wispr.service \
+    99-ghost-wispr.rules logind-power-key.conf ghost-wispr-update-launcher.sh ghost-wispr-update.service ghost-wispr-update.timer; do
+    { cat -- "$dir/ghost-wispr-pi-deploy/$file" && printf '# release %s\n' "$name"; } >"$work_dir/marked"
+    restage "$dir/ghost-wispr-pi-deploy" "$file" "$work_dir/marked"
+  done
+  tar -C "$dir" -czf "$dir/ghost-wispr-pi-deploy.tar.gz" ghost-wispr-pi-deploy
+  (cd -- "$dir" && sha256sum ghost-wispr-pi-deploy.tar.gz >ghost-wispr-pi-deploy.tar.gz.sha256 \
+    && sha256sum ghost-wispr-linux-arm64 >ghost-wispr-linux-arm64.sha256) || fail "could not sum release $name's assets"
+  jq -n --arg commit "$commit" --arg base "https://assets.test.invalid/$name" '{target_commitish: $commit,
+    assets: [("ghost-wispr-linux-arm64", "ghost-wispr-linux-arm64.sha256", "ghost-wispr-pi-deploy.tar.gz",
+      "ghost-wispr-pi-deploy.tar.gz.sha256") | {name: ., browser_download_url: "\($base)/\(.)"}]}' >"$dir/release.json"
+}
+
+# real_provision NAME runs the provision.sh of release NAME, now the latest release, on the fake Pi,
+# joined to the tailnet, with the real nightly update behind the update unit's start: the real
+# launcher and update.sh run against the fake release API, recorder, systemd, sudo and Tailscale,
+# on a clock that sleep moves. The update's lines go to the journal that provision.sh prints.
+real_provision() {
+  cp -- "$TEST_RELEASES/$1/release.json" "$TEST_RELEASES/latest.json"
+  : >"$TEST_LOG"
+  rm -f -- "$TEST_LOG.errors"
+  : >"$work_dir/journal"
+  printf '1000\n' >"$TEST_CLOCK"
+  TEST_REAL_UPDATE=1 TEST_JOURNAL=$work_dir/journal TEST_SELF_STATUS=$joined_status \
+    run_provision "$TEST_RELEASES/$1/ghost-wispr-pi-deploy"
+  rm -f -- "$TEST_CLOCK"
+}
+
+# installed_set prints the SHA-256 of each installed file of the deploy set, the binary, .env and
+# deploy.verified, or "missing", and the commit the recorder answers.
+installed_set() {
+  local path
+  for path in "$deploy"/{ghost-wispr.yaml,pi.env,update.sh,pi-lib.sh,wait-for-network.sh,wait-for-time-sync.sh} \
+    "$units/ghost-wispr.service" "$sysroot/etc/udev/rules.d/99-ghost-wispr.rules" \
+    "$sysroot/etc/systemd/logind.conf.d/50-ghost-wispr-power-key.conf" "$deploy"/{ghost-wispr,.env,deploy.verified}; do
+    if [[ -f $path ]]; then
+      printf '%s %s\n' "$(sha "$path")" "${path#"$pi"/}"
+    else
+      printf 'missing %s\n' "${path#"$pi"/}"
+    fi
+  done
+  printf 'the recorder answers %s\n' "$(cat -- "$state/running-commit" 2>/dev/null || echo nothing)"
 }
 
 # expect_ran WHAT fails unless the run exited 0, printed no bash error, and broke no rule of a fake.
@@ -781,49 +993,112 @@ TEST_SELF_STATUS=$joined_status run_provision "$stage"
 expect_ran 'no client id kept'
 ! said 'tailnet client id' || fail "provision.sh compared a client id the Pi does not keep: $(<"$work_dir/out")"
 
-# release-the-pi-runs: provision.sh runs only from the release the Pi runs, once a release has been
-# installed and verified. It installs its own update.sh, pi-lib.sh and pi.env before the update
-# starts, so another release's would leave the Pi's set not the one deploy.verified lists: the
-# update would keep no .prev copy of it, and a failed install would roll the Pi back past the
-# release it runs. So where deploy.verified names another commit, it refuses before it runs any
-# command and names both commits. A Pi with no deploy.verified, a new Pi or the office Pi at P2, is
-# not refused (first-run), and neither is a Pi whose deploy.verified names this release's commit.
-begin release-the-pi-runs
-readonly other_commit=89abcdef0123456789abcdef0123456789abcdef
-for verified_commit in "$other_commit" "$release_commit"; do
-  printf '%s\n' "commit $verified_commit" "$(sha "$stage/update.sh")  update.sh" >"$deploy/deploy.verified"
-  before=$(pi_files)
-  : >"$TEST_LOG"
-  TEST_SELF_STATUS=$joined_status run_provision "$stage"
-  if [[ $verified_commit == "$other_commit" ]]; then
-    expect_refused 'deploy.verified names another commit' "$other_commit"
-    said "$release_commit" || fail "provision.sh did not name the release's commit: $(<"$work_dir/out")"
-    said 'The release the Pi runs' || fail "provision.sh did not say where to get the release the Pi runs: $(<"$work_dir/out")"
-    [[ ! -s $TEST_LOG ]] || fail "provision.sh ran commands before it refused another release: $(<"$TEST_LOG")"
-    [[ $(pi_files) == "$before" ]] || fail 'provision.sh changed a file before it refused another release'
-  else
-    expect_ran "deploy.verified names the release's commit"
-    said 'already joined' || fail "provision.sh stopped before the join on the release the Pi runs: $(<"$work_dir/out")"
-  fi
+# ---------------------------------------------------------------------------------------------------
+# newer-release: provision.sh from a newer release than the one the Pi runs, as a person runs it to
+# apply a changed bootstrap file. It installs its update.sh, pi-lib.sh and pi.env before the update
+# starts, so the update finds the installed set not the one deploy.verified lists, and keeps no
+# .prev copy of it. So, where the installed set is the one deploy.verified lists and provision.sh
+# would replace one of those three files, it first copies that set to its .prev copies, as
+# update.sh does, and a failed install of the newer release rolls the Pi back to the release it
+# runs. The update here is the real launcher and update.sh, against a fake release API, recorder,
+# systemd and Tailscale. The Pi gets release a on a new Pi, release a again, which keeps the .prev
+# copies as they are, then release b, whose binary never answers its commit.
+begin newer-release
+make_release a "$commit_a" "$commit_a"
+make_release b "$commit_b" "$wrong_commit"
+make_release c "$commit_c" "$commit_c"
+new_pi
+real_provision a
+expect_ran 'release a on a new Pi'
+said "ghost-wispr update: installed commit $commit_a" || fail "the update did not install release a: $(<"$work_dir/out")"
+[[ $(head -n 1 "$deploy/deploy.verified") == "commit $commit_a" ]] || fail "deploy.verified does not name release a: $(<"$deploy/deploy.verified")"
+release_a=$(installed_set)
+[[ $release_a != *missing* && $release_a == *"answers $commit_a" ]] || fail "release a is not installed whole: $release_a"
+real_provision a
+expect_ran 'release a again'
+said "ghost-wispr update: already current at commit $commit_a" || fail "the update did not find release a current: $(<"$work_dir/out")"
+[[ -z $(find "$deploy" -maxdepth 1 -name '*.prev') ]] \
+  || fail "a run of the release the Pi runs made .prev copies: $(find "$deploy" -maxdepth 1 -name '*.prev')"
+[[ $(installed_set) == "$release_a" ]] || fail 'a run of the release the Pi runs changed its set'
+real_provision b
+expect_refused 'release b, whose binary never answers its commit' 'the nightly update failed'
+[[ ! -s $TEST_LOG.errors ]] || fail "release b: $(<"$TEST_LOG.errors")"
+said "kept the set of commit $commit_a, which the Pi runs, as its .prev copies" \
+  || fail "provision.sh did not keep release a's set before it replaced update.sh: $(<"$work_dir/out")"
+if ! said "did not answer /api/version with commit $commit_b" || ! said 'restored the previous release'; then
+  fail "the update did not install release b and roll it back: $(<"$work_dir/out")"
+fi
+[[ $(installed_set) == "$release_a" ]] \
+  || fail "after the failed install of release b, the Pi is not on release a's set: $(diff <(printf '%s\n' "$release_a") <(installed_set) || true)"
+for file in ghost-wispr-update.service ghost-wispr-update.timer; do
+  cmp -s -- "$TEST_RELEASES/b/ghost-wispr-pi-deploy/$file" "$units/$file" || fail "$file is not release b's, which provision.sh installed"
 done
-rm -- "$deploy/deploy.verified"
+# Where the installed set is not the one deploy.verified lists, as after a swap that a kill cut
+# short, the .prev copies hold the set verified last, and provision.sh leaves them as they are.
+printf '# changed after the install\n' >>"$deploy/wait-for-network.sh"
+prev_copies=$(cd -- "$deploy" && sha256sum -- *.prev)
+: >"$TEST_LOG"
+TEST_SELF_STATUS=$joined_status run_provision "$TEST_RELEASES/c/ghost-wispr-pi-deploy"
+expect_ran 'release c on a set that deploy.verified does not list'
+said 'so its .prev copies stay as they are' || fail "provision.sh did not say it kept the .prev copies as they are: $(<"$work_dir/out")"
+[[ $(cd -- "$deploy" && sha256sum -- *.prev) == "$prev_copies" ]] || fail 'provision.sh changed the .prev copies of the set verified last'
+
+# bootstrap-repair: a bootstrap file that is broken on a Pi that runs release a, here an update unit
+# whose ExecStart names no program, so no nightly run starts and no release can install a fix. The
+# release that fixes it is a later one, c: provision.sh from c installs c's update unit, and its
+# start runs c's launcher, whose update installs c.
+begin bootstrap-repair
+new_pi
+real_provision a
+expect_ran 'release a on a new Pi'
+printf '%s\n' '[Service]' 'Type=oneshot' 'TimeoutStartSec=infinity' 'ExecStart=/opt/ghost-wispr/no-such-launcher.sh' \
+  >"$units/ghost-wispr-update.service"
+# The control: with that unit loaded, the update does not start.
+status=0
+XDG_RUNTIME_DIR=$runtime_dir TEST_REAL_UPDATE=1 TEST_JOURNAL=$work_dir/journal PATH="$bin:$PATH" \
+  systemctl --user daemon-reload || status=$?
+XDG_RUNTIME_DIR=$runtime_dir TEST_REAL_UPDATE=1 TEST_JOURNAL=$work_dir/journal PATH="$bin:$PATH" \
+  systemctl --user start ghost-wispr-update.service 2>/dev/null || status=$?
+if ((status == 0)) || ! grep -q 'status=203/EXEC' "$work_dir/journal"; then
+  fail "control: the broken update unit started the update: $(<"$work_dir/journal")"
+fi
+real_provision c
+expect_ran 'release c on a Pi whose update unit is broken'
+cmp -s -- "$TEST_RELEASES/c/ghost-wispr-pi-deploy/ghost-wispr-update.service" "$units/ghost-wispr-update.service" \
+  || fail "provision.sh did not install release c's update unit: $(<"$units/ghost-wispr-update.service")"
+said "ghost-wispr update: installed commit $commit_c" || fail "the update did not install release c: $(<"$work_dir/out")"
+[[ $(head -n 1 "$deploy/deploy.verified") == "commit $commit_c" ]] || fail "deploy.verified does not name release c: $(<"$deploy/deploy.verified")"
+said 'already joined' || fail "provision.sh stopped before the join: $(<"$work_dir/out")"
 
 # ---------------------------------------------------------------------------------------------------
-# serve: serve.conf is the one source of Serve's setting. provision.sh applies each of its lines, and
-# turns off each live Serve HTTPS port it does not list; each line is also a literal call in the
-# join's command. When it cannot read Serve's setting, it stops before the join.
+# serve: serve.conf is the one source of Serve's setting. provision.sh applies each of its lines,
+# turns off each live Serve HTTPS port it does not list, and on each port it lists, each mount
+# other than /: tailscale serve --bg sets the mount / and keeps the others, so a mount left there
+# would show as drift each night. Each line is also a literal call in the join's command. When it
+# cannot read Serve's setting, or the setting is not serve.conf's after it applied it, it stops
+# before the join.
 begin serve
 new_pi
 jq -n --arg host "$TEST_SERVE_HOST" '{TCP: {"443": {HTTPS: true}, "8443": {HTTPS: true}},
-  Web: {"\($host):443": {Handlers: {"/": {Proxy: "http://127.0.0.1:9999"}}},
+  Web: {"\($host):443": {Handlers: {"/": {Proxy: "http://127.0.0.1:9999"}, "/debug": {Proxy: "http://127.0.0.1:8082"}}},
     "\($host):8443": {Handlers: {"/": {Proxy: "http://127.0.0.1:8081"}}}}}' >"$TEST_SERVE_STATE"
 run_provision "$stage"
-expect_ran 'a live port that serve.conf does not list'
-[[ $(serve_now) == '443 http://127.0.0.1:8080' ]] || fail "Serve is [$(serve_now | paste -sd ';' -)], want [443 http://127.0.0.1:8080]"
+expect_ran 'a live port and a mount that serve.conf does not list'
+readonly want_serve='{"TCP":{"443":{"HTTPS":true}},"Web":{"ghost-wispr.example-tailnet.ts.net:443":{"Handlers":{"/":{"Proxy":"http://127.0.0.1:8080"}}}}}'
+[[ $(jq -cS . "$TEST_SERVE_STATE") == "$want_serve" ]] || fail "Serve is $(jq -cS . "$TEST_SERVE_STATE"), want $want_serve"
 logged 'sudo tailscale serve --bg --https 443 http://127.0.0.1:8080' || fail "provision.sh did not apply serve.conf's line: $(<"$TEST_LOG")"
 logged 'sudo tailscale serve --https=8443 off' || fail "provision.sh did not turn off port 8443: $(<"$TEST_LOG")"
 said 'turned off Serve port 8443' || fail "provision.sh did not say it turned off port 8443: $(<"$work_dir/out")"
+logged 'sudo tailscale serve --https=443 --set-path=/debug off' || fail "provision.sh did not turn off the mount /debug of port 443: $(<"$TEST_LOG")"
+said 'turned off the Serve mount /debug of port 443' || fail "provision.sh did not say it turned off /debug: $(<"$work_dir/out")"
 ! grep -q 'serve --https=443 off' "$TEST_LOG" || fail "provision.sh turned off the port serve.conf lists: $(<"$TEST_LOG")"
+# A Serve that provision.sh does not manage, a TCP forward, stays and is named: the run stops before
+# the join, as the nightly drift line would say Serve: UNKNOWN.
+new_pi
+printf '%s\n' '{"TCP":{"2222":{"TCPForward":"127.0.0.1:22"}}}' >"$TEST_SERVE_STATE"
+run_provision "$stage"
+expect_refused 'a TCP forward' "is not serve.conf's"
+[[ ! -e $TEST_LOG.join ]] || fail "provision.sh started the join although Serve is not serve.conf's"
 rm -rf -- "$work_dir/two-ports-stage"
 cp -a -- "$stage" "$work_dir/two-ports-stage"
 printf '%s\n' '# The page, and a second port.' '443 http://127.0.0.1:8080' '8443 http://127.0.0.1:8081' >"$work_dir/serve.conf"
