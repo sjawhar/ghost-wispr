@@ -491,19 +491,20 @@ check_providers() {
   not_ok=$(jq -r '.providers[] | select(.ok != true) | "\(.name) did not sign in (\(.message // "no message"))"' <<<"$providers")
   missing=$(LC_ALL=C comm -23 <(printf '%s\n' "$want") <(printf '%s\n' "$names") | paste -sd ' ' -)
   extra=$(LC_ALL=C comm -13 <(printf '%s\n' "$want") <(printf '%s\n' "$names") | grep . | paste -sd ' ' - || true)
+  # What the Pi's providers are compared with, for the line.
+  local config_name="$release_name's template"
+  [[ $local_state != read ]] || config_name+=" with the local settings file over it"
   if [[ -n $not_ok ]]; then
     fails 3 "$not_ok"
   elif [[ $local_state == error && ( -n $missing || -n $extra ) ]]; then
     unknown 3 "the Pi's providers ($(paste -sd ' ' - <<<"$names")) are not the template's ($(paste -sd ' ' - <<<"$want")), and the local settings file that could add or remove one cannot be read: $local_error"
   elif [[ -n $missing || -n $extra ]]; then
-    local config_name="$release_name's template"
-    [[ $local_state != read ]] || config_name+=" with the local settings file over it"
     unexplained=()
     [[ -z $missing ]] || unexplained+=("the Pi lists no $missing, which $config_name names")
     [[ -z $extra ]] || unexplained+=("the Pi lists $extra, which $config_name does not name")
     fails 3 "$(joined "${unexplained[@]}")"
   else
-    pass 3 "the Pi lists the $(grep -c . <<<"$names") providers of $release_name's template and its local settings file ($(paste -sd ' ' - <<<"$names")), each signed in"
+    pass 3 "the Pi lists the $(grep -c . <<<"$names") providers of $config_name ($(paste -sd ' ' - <<<"$names")), each signed in"
   fi
 }
 
