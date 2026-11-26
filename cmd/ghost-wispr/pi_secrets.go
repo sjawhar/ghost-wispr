@@ -22,14 +22,13 @@ import (
 	"time"
 
 	"github.com/sjawhar/ghost-wispr/internal/googleauth"
-	"google.golang.org/api/googleapi"
 )
 
-const (
-	piSecretsCommand          = "pi-secrets"
-	piSecretsClientCertificate = "GOOGLE_API_USE_CLIENT_CERTIFICATE"
-	secretManagerAccessBase   = "https://secretmanager.googleapis.com/v1"
-)
+const piSecretsCommand = "pi-secrets"
+
+const piSecretsClientCertificate = "GOOGLE_API_USE_CLIENT_CERTIFICATE"
+
+const secretManagerAccessBase = "https://secretmanager.googleapis.com/v1"
 
 // secretVersion is one Secret Manager version read through its access endpoint.
 // Version is the numeric version Secret Manager named in its response.
@@ -312,7 +311,7 @@ func certificateCandidateReason(data []byte, publicKey crypto.PublicKey, install
 		return "candidate public key does not match --key"
 	}
 	if !candidate.NotAfter.After(installed.NotAfter) {
-		return "candidate is not newer than the installed certificate"
+		return "not newer"
 	}
 	return ""
 }
@@ -381,7 +380,7 @@ func certificateSignsIn(ctx context.Context, credentialsFile string, candidate [
 	if err != nil {
 		return "candidate sign-in could not start"
 	}
-	defer os.RemoveAll(dir)
+	defer func() { _ = os.RemoveAll(dir) }()
 
 	candidatePath := filepath.Join(dir, "candidate.pem")
 	if err := os.WriteFile(candidatePath, candidate, 0o600); err != nil {
@@ -479,7 +478,7 @@ func (reader *secretManagerReader) Access(ctx context.Context, project, secret, 
 	if err != nil {
 		return secretVersion{}, err
 	}
-	defer response.Body.Close()
+	defer func() { _ = response.Body.Close() }()
 	body, err := io.ReadAll(io.LimitReader(response.Body, 1<<20))
 	if err != nil {
 		return secretVersion{}, err
@@ -508,7 +507,7 @@ func (reader *secretManagerReader) Access(ctx context.Context, project, secret, 
 	}
 	wantCRC, err := strconv.ParseUint(payload.Payload.DataCRC32C, 10, 32)
 	if err != nil || uint32(wantCRC) != crc32.Checksum(data, crc32.MakeTable(crc32.Castagnoli)) {
-		return secretVersion{}, errors.New("Secret Manager payload CRC32C did not match")
+		return secretVersion{}, errors.New("secret manager payload CRC32C did not match")
 	}
 	return secretVersion{Version: versionNumber, Data: data}, nil
 }
@@ -517,11 +516,11 @@ func secretManagerVersion(name string) (int, error) {
 	const marker = "/versions/"
 	index := strings.LastIndex(name, marker)
 	if index < 0 {
-		return 0, errors.New("Secret Manager access response omitted its version")
+		return 0, errors.New("secret manager access response omitted its version")
 	}
 	version, err := strconv.Atoi(name[index+len(marker):])
 	if err != nil || version < 1 {
-		return 0, errors.New("Secret Manager access response has an invalid version")
+		return 0, errors.New("secret manager access response has an invalid version")
 	}
 	return version, nil
 }
@@ -535,7 +534,7 @@ func (err *secretManagerAPIError) Error() string {
 	if err.code != "" {
 		return err.code
 	}
-	return fmt.Sprintf("Secret Manager answered HTTP %d", err.status)
+	return fmt.Sprintf("secret manager answered HTTP %d", err.status)
 }
 
 func newSecretManagerError(status int, body []byte) error {
@@ -559,15 +558,6 @@ func secretVersionErrorCode(err error) string {
 	var secretError *secretManagerAPIError
 	if errors.As(err, &secretError) {
 		return secretError.code
-	}
-	var googleError *googleapi.Error
-	if errors.As(err, &googleError) {
-		for _, item := range googleError.Errors {
-			if item.Reason == "FAILED_PRECONDITION" || item.Reason == "NOT_FOUND" {
-				return item.Reason
-			}
-		}
-		return googleError.Message
 	}
 	return ""
 }

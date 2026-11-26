@@ -7,12 +7,15 @@ import (
 	"crypto/rsa"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"hash/crc32"
 	"io"
 	"math/big"
+	"net/http"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -21,8 +24,7 @@ import (
 	"time"
 
 	"github.com/sjawhar/ghost-wispr/internal/googleauthtest"
-	"google.golang.org/api/googleapi"
-)
+}
 
 type secretAccess struct {
 	project string
@@ -280,7 +282,7 @@ func newCertificateFixture(t *testing.T) certificateFixture {
 	}
 }
 
-func (f certificateFixture) args() []string {
+func (f *certificateFixture) args() []string {
 	return []string{
 		"pi-secrets",
 		"--project", f.project,
@@ -304,7 +306,7 @@ func certificateForKey(t *testing.T, ca *x509.Certificate, caKey *rsa.PrivateKey
 	t.Helper()
 	der, err := x509.CreateCertificate(rand.Reader, &x509.Certificate{
 		SerialNumber: big.NewInt(notAfter.UnixNano()),
-		Subject:      pkix.Name{CommonName: "test-device"},
+		Subject:      pkix.Name{CommonName: "ghost-wispr"},
 		NotBefore:    time.Now().Add(-time.Hour),
 		NotAfter:     notAfter,
 		KeyUsage:     x509.KeyUsageDigitalSignature,
@@ -332,59 +334,47 @@ func writeTestFile(t *testing.T, path string, data []byte) {
 	}
 }
 
-func signInWithCandidate(t *testing.T, originalCredentials, wantKeyPath string, decide func([]byte) error, workspace *string) signInCheck {
+func newUntrustedCertificateAuthority(t *testing.T) (*x509.Certificate, *rsa.PrivateKey) {
 	t.Helper()
-	return func(_ context.Context, credentialsFile string) error {
-		if credentialsFile == originalCredentials {
-			return errors.New("certificate sign-in used the original credential file")
-		}
+	key := newRSAKey(t)
+	now := time.Now()
+	der, err := x509.CreateCertificate(rand.Reader, &x509.Certificate{
+		SerialNumber:          big.NewInt(now.UnixNano()),
+		Subject:               pkix.Name{CommonName: "test certificate authority"},
+		NotBefore:             now.Add(-time.Hour),
+		NotAfter:              now.Add(time.Hour),
+		IsCA:                  true,
+		BasicConstraintsValid: true,
+		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageDigitalSignature,
+	}, &x509.Certificate{
+		SerialNumber:          big.NewInt(now.UnixNano()),
+		Subject:               pkix.Name{CommonName: "test certificate authority"},
+		NotBefore:             now.Add(-time.Hour),
+		NotAfter:              now.Add(time.Hour),
+		IsCA:                  true,
+		BasicConstraintsValid: true,
+		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageDigitalSignature,
+	}, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	certificate, err := x509.ParseCertificate(der)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return certificate, key
+}
+
+func signInWithClientCertificateEnvironment(t *testing.T, want string, workspace *string) signInCheck {
+	t.Helper()
+	return func(ctx context.Context, credentialsFile string) error {
 		if workspace != nil {
 			*workspace = filepath.Dir(credentialsFile)
 		}
-
-		credentialBytes, err := os.ReadFile(credentialsFile)
-		if err != nil {
-			return fmt.Errorf("read temporary credential file: %w", err)
+		if got := os.Getenv(piSecretsClientCertificate); got != want {
+			return fmt.Errorf("%s = %q, want %q", piSecretsClientCertificate, got, want)
 		}
-		var credentials struct {
-			CredentialSource struct {
-				Certificate struct {
-					CertificateConfigLocation string `json:"certificate_config_location"`
-				} `json:"certificate"`
-			} `json:"credential_source"`
-		}
-		if err := json.Unmarshal(credentialBytes, &credentials); err != nil {
-			return fmt.Errorf("decode temporary credential file: %w", err)
-		}
-		if credentials.CredentialSource.Certificate.CertificateConfigLocation == "" {
-			return errors.New("temporary credential file has no certificate config")
-		}
-
-		configBytes, err := os.ReadFile(credentials.CredentialSource.Certificate.CertificateConfigLocation)
-		if err != nil {
-			return fmt.Errorf("read temporary certificate config: %w", err)
-		}
-		var config struct {
-			CertConfigs map[string]struct {
-				CertPath string `json:"cert_path"`
-				KeyPath  string `json:"key_path"`
-			} `json:"cert_configs"`
-		}
-		if err := json.Unmarshal(configBytes, &config); err != nil {
-			return fmt.Errorf("decode temporary certificate config: %w", err)
-		}
-		workload, ok := config.CertConfigs["workload"]
-		if !ok {
-			return errors.New("temporary certificate config has no workload certificate")
-		}
-		if workload.KeyPath != wantKeyPath {
-			return fmt.Errorf("temporary key path = %q, want %q", workload.KeyPath, wantKeyPath)
-		}
-		candidate, err := os.ReadFile(workload.CertPath)
-		if err != nil {
-			return fmt.Errorf("read temporary candidate certificate: %w", err)
-		}
-		return decide(candidate)
+		return productionSignInCheck(ctx, credentialsFile)
 	}
 }
 
@@ -413,8 +403,8 @@ func requireCertificateStaged(t *testing.T, output *bytes.Buffer, outDir string,
 }
 
 // TestPiSecretsStagesANewerCertificateThatSignsIn catches a certificate
-// installer that accepts a stale certificate, a different key, or a sign-in
-// which did not use the candidate certificate and supplied private key.
+// installer that accepts a stale certificate, a different key, or a candidate
+// that cannot complete the real X.509 federation sign-in.
 func TestPiSecretsStagesANewerCertificateThatSignsIn(t *testing.T) {
 	fixture := newCertificateFixture(t)
 	reader := certificateReader(fixture.secret, 3, fixture.candidate)
@@ -427,12 +417,13 @@ func TestPiSecretsStagesANewerCertificateThatSignsIn(t *testing.T) {
 		&output,
 		defaultCredentials(fixture.credentials),
 		readerFactory(t, reader, fixture.credentials),
-		signInWithCandidate(t, fixture.credentials, fixture.keyPath, func(candidate []byte) error {
-			if !bytes.Equal(candidate, fixture.candidate) {
-				return errors.New("candidate certificate did not reach sign-in")
+		func(ctx context.Context, credentialsFile string) error {
+			if credentialsFile == fixture.credentials {
+				return errors.New("sign-in did not use temporary credentials")
 			}
-			return nil
-		}, &workspace),
+			workspace = filepath.Dir(credentialsFile)
+			return productionSignInCheck(ctx, credentialsFile)
+		},
 	)
 	if code != 0 {
 		t.Fatalf("runPiSecrets exit = %d, want 0", code)
@@ -447,10 +438,11 @@ func TestPiSecretsStagesANewerCertificateThatSignsIn(t *testing.T) {
 
 // TestPiSecretsFindsTheRealCertificateBehindABadNewerOne catches a renewal
 // reader that stops at an unusable latest version, reads a version list, or
-// stages a candidate that failed its sign-in check.
+// stages a candidate that failed its real sign-in check.
 func TestPiSecretsFindsTheRealCertificateBehindABadNewerOne(t *testing.T) {
 	fixture := newCertificateFixture(t)
-	badNewer := certificateForKey(t, fixture.ca, fixture.caKey, fixture.key, time.Now().Add(72*time.Hour))
+	badCA, badCAKey := newUntrustedCertificateAuthority(t)
+	badNewer := certificateForKey(t, badCA, badCAKey, fixture.key, time.Now().Add(72*time.Hour))
 	goodOlder := certificateForKey(t, fixture.ca, fixture.caKey, fixture.key, time.Now().Add(60*time.Hour))
 	reader := &fakeSecretReader{replies: map[string]secretReply{
 		secretReplyKey(fixture.secret, "latest"): {value: secretVersion{Version: 7, Data: badNewer}},
@@ -465,16 +457,7 @@ func TestPiSecretsFindsTheRealCertificateBehindABadNewerOne(t *testing.T) {
 		&output,
 		defaultCredentials(fixture.credentials),
 		readerFactory(t, reader, fixture.credentials),
-		signInWithCandidate(t, fixture.credentials, fixture.keyPath, func(candidate []byte) error {
-			switch {
-			case bytes.Equal(candidate, badNewer):
-				return errors.New("newer certificate was refused")
-			case bytes.Equal(candidate, goodOlder):
-				return nil
-			default:
-				return errors.New("unexpected certificate reached sign-in")
-			}
-		}, nil),
+		productionSignInCheck,
 	)
 	if code != 0 {
 		t.Fatalf("runPiSecrets exit = %d, want 0", code)
@@ -491,7 +474,8 @@ func TestPiSecretsFindsTheRealCertificateBehindABadNewerOne(t *testing.T) {
 // treats a deleted version as terminal instead of finding the next candidate.
 func TestPiSecretsSkipsNotFoundCertificateVersions(t *testing.T) {
 	fixture := newCertificateFixture(t)
-	badNewer := certificateForKey(t, fixture.ca, fixture.caKey, fixture.key, time.Now().Add(72*time.Hour))
+	badCA, badCAKey := newUntrustedCertificateAuthority(t)
+	badNewer := certificateForKey(t, badCA, badCAKey, fixture.key, time.Now().Add(72*time.Hour))
 	goodOlder := certificateForKey(t, fixture.ca, fixture.caKey, fixture.key, time.Now().Add(60*time.Hour))
 	reader := &fakeSecretReader{replies: map[string]secretReply{
 		secretReplyKey(fixture.secret, "latest"): {value: secretVersion{Version: 3, Data: badNewer}},
@@ -506,15 +490,7 @@ func TestPiSecretsSkipsNotFoundCertificateVersions(t *testing.T) {
 		&output,
 		defaultCredentials(fixture.credentials),
 		readerFactory(t, reader, fixture.credentials),
-		signInWithCandidate(t, fixture.credentials, fixture.keyPath, func(candidate []byte) error {
-			if bytes.Equal(candidate, badNewer) {
-				return errors.New("newer certificate was refused")
-			}
-			if bytes.Equal(candidate, goodOlder) {
-				return nil
-			}
-			return errors.New("unexpected certificate reached sign-in")
-		}, nil),
+		productionSignInCheck,
 	)
 	if code != 0 {
 		t.Fatalf("runPiSecrets exit = %d, want 0", code)
@@ -528,16 +504,16 @@ func TestPiSecretsSkipsNotFoundCertificateVersions(t *testing.T) {
 }
 
 // TestPiSecretsLooksBackOnlyNineCertificateVersions catches a reader that
-// probes version zero or an older version after the documented nine-version
-// recovery window ends.
+// accesses version N-10 or below after the documented nine-version recovery
+// window ends.
 func TestPiSecretsLooksBackOnlyNineCertificateVersions(t *testing.T) {
 	fixture := newCertificateFixture(t)
 	mismatchedKey := newRSAKey(t)
 	mismatchedCertificate := certificateForKey(t, fixture.ca, fixture.caKey, mismatchedKey, time.Now().Add(72*time.Hour))
 	reader := &fakeSecretReader{replies: map[string]secretReply{
-		secretReplyKey(fixture.secret, "latest"): {value: secretVersion{Version: 10, Data: mismatchedCertificate}},
+		secretReplyKey(fixture.secret, "latest"): {value: secretVersion{Version: 12, Data: mismatchedCertificate}},
 	}}
-	for version := 9; version >= 1; version-- {
+	for version := 11; version >= 3; version-- {
 		reader.replies[secretReplyKey(fixture.secret, fmt.Sprint(version))] = secretReply{err: secretManagerStatus("NOT_FOUND")}
 	}
 	var output bytes.Buffer
@@ -557,87 +533,61 @@ func TestPiSecretsLooksBackOnlyNineCertificateVersions(t *testing.T) {
 		t.Fatalf("runPiSecrets exit = %d, want 0", code)
 	}
 	requireFileAbsent(t, filepath.Join(fixture.outDir, "device.crt"))
-	requireKeptCertificate(t, output.String(), 10, mismatchedCertificate)
+	requireKeptCertificate(t, output.String(), 12, mismatchedCertificate, "candidate public key does not match --key")
 
 	want := make([]secretAccess, 0, 10)
 	want = append(want, secretAccess{project: fixture.project, secret: fixture.secret, version: "latest"})
-	for version := 9; version >= 1; version-- {
+	for version := 11; version >= 3; version-- {
 		want = append(want, secretAccess{project: fixture.project, secret: fixture.secret, version: fmt.Sprint(version)})
 	}
 	requireAccesses(t, reader, want)
 }
 
 // TestPiSecretsKeepsTheInstalledCertificate catches each rejection path that
-// would overwrite a working installed certificate or omit a reason for keeping
-// it. TestPiSecretsStagesANewerCertificateThatSignsIn is this test's passing
-// control.
+// would overwrite a working installed certificate or report the wrong reason
+// for keeping it. TestPiSecretsStagesANewerCertificateThatSignsIn is this
+// test's passing control.
 func TestPiSecretsKeepsTheInstalledCertificate(t *testing.T) {
 	for _, tc := range []struct {
 		name      string
 		candidate func(t *testing.T, f certificateFixture) []byte
-		signIn    func(t *testing.T, f certificateFixture) signInCheck
+		reason    string
 	}{
 		{
 			name: "not newer",
 			candidate: func(t *testing.T, f certificateFixture) []byte {
 				return certificateForKey(t, f.ca, f.caKey, f.key, time.Now().Add(12*time.Hour))
 			},
-			signIn: func(t *testing.T, _ certificateFixture) signInCheck {
-				return func(context.Context, string) error {
-					t.Fatal("certificate that is not newer signed in")
-					return nil
-				}
-			},
+			reason: "not newer",
 		},
 		{
 			name: "another key",
 			candidate: func(t *testing.T, f certificateFixture) []byte {
 				return certificateForKey(t, f.ca, f.caKey, newRSAKey(t), time.Now().Add(72*time.Hour))
 			},
-			signIn: func(t *testing.T, _ certificateFixture) signInCheck {
-				return func(context.Context, string) error {
-					t.Fatal("certificate for another key signed in")
-					return nil
-				}
-			},
+			reason: "candidate public key does not match --key",
 		},
 		{
 			name: "sign-in failure",
 			candidate: func(t *testing.T, f certificateFixture) []byte {
-				return f.candidate
+				ca, caKey := newUntrustedCertificateAuthority(t)
+				return certificateForKey(t, ca, caKey, f.key, time.Now().Add(72*time.Hour))
 			},
-			signIn: func(t *testing.T, f certificateFixture) signInCheck {
-				return signInWithCandidate(t, f.credentials, f.keyPath, func(candidate []byte) error {
-					if !bytes.Equal(candidate, f.candidate) {
-						return errors.New("unexpected certificate reached sign-in")
-					}
-					return errors.New("sign-in refused the candidate")
-				}, nil)
-			},
+			reason: "candidate does not sign in",
 		},
 		{
 			name: "not PEM",
 			candidate: func(*testing.T, certificateFixture) []byte {
 				return []byte("not a PEM certificate")
 			},
-			signIn: func(t *testing.T, _ certificateFixture) signInCheck {
-				return func(context.Context, string) error {
-					t.Fatal("non-PEM certificate signed in")
-					return nil
-				}
-			},
+			reason: "candidate is not exactly one PEM certificate",
 		},
 		{
 			name: "multiple certificates",
 			candidate: func(t *testing.T, f certificateFixture) []byte {
 				return append(append([]byte(nil), f.candidate...), f.candidate...)
 			},
-			signIn: func(t *testing.T, _ certificateFixture) signInCheck {
-				return func(context.Context, string) error {
-					t.Fatal("certificate bundle signed in")
-					return nil
-				}
-			},
+			reason: "candidate is not exactly one PEM certificate",
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -652,23 +602,23 @@ func TestPiSecretsKeepsTheInstalledCertificate(t *testing.T) {
 				&output,
 				defaultCredentials(fixture.credentials),
 				readerFactory(t, reader, fixture.credentials),
-				tc.signIn(t, fixture),
+				productionSignInCheck,
 			)
 			if code != 0 {
 				t.Fatalf("runPiSecrets exit = %d, want 0", code)
 			}
 			requireFileAbsent(t, filepath.Join(fixture.outDir, "device.crt"))
-			requireKeptCertificate(t, output.String(), 1, candidate)
+			requireKeptCertificate(t, output.String(), 1, candidate, tc.reason)
 			requireAccesses(t, reader, []secretAccess{{project: fixture.project, secret: fixture.secret, version: "latest"}})
 		})
 	}
 }
 
-func requireKeptCertificate(t *testing.T, output string, version int, candidate []byte) {
+func requireKeptCertificate(t *testing.T, output string, version int, candidate []byte, reason string) {
 	t.Helper()
-	prefix := fmt.Sprintf("pi-secrets: certificate version %d kept: ", version)
-	if !strings.HasPrefix(output, prefix) || strings.TrimSpace(strings.TrimPrefix(output, prefix)) == "" {
-		t.Errorf("certificate stdout = %q, want a nonempty kept reason after %q", output, prefix)
+	want := fmt.Sprintf("pi-secrets: certificate version %d kept: %s\n", version, reason)
+	if output != want {
+		t.Errorf("certificate stdout = %q, want %q", output, want)
 	}
 	if strings.Contains(output, string(candidate)) {
 		t.Errorf("certificate stdout contains the candidate value")
@@ -676,10 +626,115 @@ func requireKeptCertificate(t *testing.T, output string, version int, candidate 
 }
 
 func secretManagerStatus(code string) error {
-	return &googleapi.Error{
-		Code:    400,
-		Message: code,
-		Errors:  []googleapi.ErrorItem{{Reason: code}},
+	return newSecretManagerError(http.StatusBadRequest, []byte(fmt.Sprintf(`{"error":{"status":%q}}`, code)))
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) {
+	return f(request)
+}
+
+func newTestSecretManagerReader(transport roundTripFunc) *secretManagerReader {
+	return &secretManagerReader{
+		token: func(context.Context) (string, error) { return "access-token", nil },
+		client: &http.Client{Transport: transport},
+	}
+}
+
+// TestSecretManagerReaderAccess catches a reader that sends the wrong access
+// request, omits its bearer token, accepts a bad checksum, or trusts a version
+// other than the one in Secret Manager's response name.
+func TestSecretManagerReaderAccess(t *testing.T) {
+	data := []byte("secret-value")
+	crc := crc32.Checksum(data, crc32.MakeTable(crc32.Castagnoli))
+	body, err := json.Marshal(map[string]any{
+		"name": "projects/example-project/secrets/environment-secret/versions/9",
+		"payload": map[string]string{
+			"data":       base64.StdEncoding.EncodeToString(data),
+			"dataCrc32c": fmt.Sprint(crc),
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader := newTestSecretManagerReader(func(request *http.Request) (*http.Response, error) {
+		if request.Method != http.MethodGet {
+			t.Errorf("method = %s, want GET", request.Method)
+		}
+		if request.URL.String() != secretManagerAccessBase+"/projects/example-project/secrets/environment-secret/versions/latest:access" {
+			t.Errorf("URL = %s", request.URL)
+		}
+		if got := request.Header.Get("Authorization"); got != "Bearer access-token" {
+			t.Errorf("Authorization = %q, want bearer token", got)
+		}
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(bytes.NewReader(body)), Header: make(http.Header)}, nil
+	})
+
+	got, err := reader.Access(context.Background(), "example-project", "environment-secret", "latest")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Version != 9 || !bytes.Equal(got.Data, data) {
+		t.Errorf("Access = %#v, want version 9 and %q", got, data)
+	}
+}
+
+// TestSecretManagerReaderRejectsWrongChecksum catches a reader that accepts a
+// Secret Manager payload whose CRC32C does not match its decoded bytes.
+func TestSecretManagerReaderRejectsWrongChecksum(t *testing.T) {
+	body := []byte(`{"name":"projects/example-project/secrets/environment-secret/versions/2","payload":{"data":"Y2hlY2tzdW0=","dataCrc32c":"0"}}`)
+	reader := newTestSecretManagerReader(func(*http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(bytes.NewReader(body)), Header: make(http.Header)}, nil
+	})
+
+	_, err := reader.Access(context.Background(), "example-project", "environment-secret", "latest")
+	if err == nil || !strings.Contains(err.Error(), "CRC32C") {
+		t.Errorf("Access error = %v, want CRC32C failure", err)
+	}
+}
+
+// TestSecretManagerReaderClassifiesUnavailableVersions catches error parsing
+// that fails to continue past disabled or deleted certificate versions.
+func TestSecretManagerReaderClassifiesUnavailableVersions(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		status int
+		code   string
+	}{
+		{name: "disabled", status: http.StatusBadRequest, code: "FAILED_PRECONDITION"},
+		{name: "deleted", status: http.StatusNotFound, code: "NOT_FOUND"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			body := []byte(fmt.Sprintf(`{"error":{"status":%q}}`, tc.code))
+			reader := newTestSecretManagerReader(func(*http.Request) (*http.Response, error) {
+				return &http.Response{StatusCode: tc.status, Body: io.NopCloser(bytes.NewReader(body)), Header: make(http.Header)}, nil
+			})
+
+			_, err := reader.Access(context.Background(), "example-project", "certificate-secret", "2")
+			var apiError *secretManagerAPIError
+			if !errors.As(err, &apiError) || apiError.status != tc.status || apiError.code != tc.code {
+				t.Fatalf("Access error = %#v, want %d %s secretManagerAPIError", err, tc.status, tc.code)
+			}
+			if !secretVersionUnavailable(err) {
+				t.Errorf("secretVersionUnavailable(%v) = false", err)
+			}
+		})
+	}
+}
+
+// TestProductionSignInCheckUsesTheCandidateCertificate catches a sign-in
+// check that accepts a certificate from an untrusted CA or does not obtain an
+// access token from the temporary credentials file.
+func TestProductionSignInCheckUsesTheCandidateCertificate(t *testing.T) {
+	fixture := newCertificateFixture(t)
+	if reason := certificateSignsIn(context.Background(), fixture.credentials, fixture.candidate, fixture.keyPath, productionSignInCheck); reason != "" {
+		t.Fatalf("fixture certificate sign-in reason = %q, want success", reason)
+	}
+	untrustedCA, untrustedCAKey := newUntrustedCertificateAuthority(t)
+	untrustedCandidate := certificateForKey(t, untrustedCA, untrustedCAKey, fixture.key, time.Now().Add(72*time.Hour))
+	if reason := certificateSignsIn(context.Background(), fixture.credentials, untrustedCandidate, fixture.keyPath, productionSignInCheck); reason != "candidate does not sign in" {
+		t.Fatalf("untrusted certificate sign-in reason = %q, want candidate does not sign in", reason)
 	}
 }
 
@@ -747,7 +802,6 @@ func TestPiSecretsWithCredentialsNeverLoadsTheConfig(t *testing.T) {
 // TestPiSecretsTurnsClientCertificatesOff catches a command that inherits an
 // unset client-certificate policy instead of disabling it, or overwrites a
 // policy deliberately supplied by its caller.
-
 func TestPiSecretsTurnsClientCertificatesOff(t *testing.T) {
 	for _, tc := range []struct {
 		name      string
@@ -760,9 +814,9 @@ func TestPiSecretsTurnsClientCertificatesOff(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if !tc.presetSet {
-				unsetEnvironment(t, "GOOGLE_API_USE_CLIENT_CERTIFICATE")
+				unsetEnvironment(t, piSecretsClientCertificate)
 			} else {
-				t.Setenv("GOOGLE_API_USE_CLIENT_CERTIFICATE", tc.preset)
+				t.Setenv(piSecretsClientCertificate, tc.preset)
 			}
 
 			fixture := newCertificateFixture(t)
@@ -774,23 +828,15 @@ func TestPiSecretsTurnsClientCertificatesOff(t *testing.T) {
 				&output,
 				defaultCredentials(fixture.credentials),
 				readerFactory(t, reader, fixture.credentials),
-				signInWithCandidate(t, fixture.credentials, fixture.keyPath, func(candidate []byte) error {
-					if got := os.Getenv("GOOGLE_API_USE_CLIENT_CERTIFICATE"); got != tc.want {
-						return fmt.Errorf("GOOGLE_API_USE_CLIENT_CERTIFICATE = %q, want %q", got, tc.want)
-					}
-					if !bytes.Equal(candidate, fixture.candidate) {
-						return errors.New("unexpected certificate reached sign-in")
-					}
-					return nil
-				}, nil),
+				signInWithClientCertificateEnvironment(t, tc.want, nil),
 			)
 			if code != 0 {
 				t.Fatalf("runPiSecrets exit = %d, want 0", code)
 			}
+			requireCertificateStaged(t, &output, fixture.outDir, 1, fixture.candidate)
 		})
 	}
 }
-
 
 func unsetEnvironment(t *testing.T, key string) {
 	t.Helper()
