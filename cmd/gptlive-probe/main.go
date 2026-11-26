@@ -145,6 +145,12 @@ type delegationLog struct {
 	mu       sync.Mutex
 	first    time.Time
 	withheld time.Duration
+	// sent and toSpeaker are the session's own counts, each taken where it
+	// happens. The probe never derives one from the other: a derived figure
+	// is equal by construction and could not show the client duplicating a
+	// stretch of the model's audio.
+	sent      time.Duration
+	toSpeaker time.Duration
 }
 
 func (l *delegationLog) Enabled(context.Context, slog.Level) bool { return true }
@@ -167,6 +173,18 @@ func (l *delegationLog) Handle(ctx context.Context, r slog.Record) error {
 			}
 			return true
 		})
+	case "gptlive: the model's audio this session":
+		l.mu.Lock()
+		r.Attrs(func(a slog.Attr) bool {
+			switch a.Key {
+			case "sent_ms":
+				l.sent = time.Duration(a.Value.Int64()) * time.Millisecond
+			case "to_speaker_ms":
+				l.toSpeaker = time.Duration(a.Value.Int64()) * time.Millisecond
+			}
+			return true
+		})
+		l.mu.Unlock()
 	}
 	return slog.Default().Handler().Handle(ctx, r)
 }
@@ -186,6 +204,14 @@ func (l *delegationLog) heldBack() time.Duration {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	return l.withheld
+}
+
+// audio is the session's own counts of what the model sent and what reached
+// the speaker, each measured where it happens.
+func (l *delegationLog) audio() (sent, toSpeaker time.Duration) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.sent, l.toSpeaker
 }
 
 // delegationEvidence is the answer's code-like fact. GPT-Live's
@@ -803,7 +829,15 @@ func observeDelegation(ctx context.Context, cfg *probeConfig, in *feeder, tools 
 		printf(out, "observe: no delegation reached the client\n")
 	}
 	held := arrivals.heldBack()
-	printf(out, "observe: GPT-Live sent %v of audio; the client passed %v on to the speaker and withheld %v while a delegation was outstanding\n", spoke+held, spoke, held)
+	sent, toSpeaker := arrivals.audio()
+	// sent and toSpeaker are the session's own counts, taken where each
+	// happens; spoke is what this sink received. Three independent figures, so
+	// the client duplicating a stretch of audio would show as a gap between
+	// them rather than cancelling out.
+	printf(out, "observe: GPT-Live sent %v of audio; the client queued %v for the speaker and withheld %v while a delegation was outstanding; this sink received %v\n", sent, toSpeaker, held, spoke)
+	if sent > 0 && toSpeaker > spoke+200*time.Millisecond {
+		printf(out, "observe: WARNING the client queued %v but the sink received %v\n", toSpeaker, spoke)
+	}
 	if at, ok := rec.firstAfter(ended); ok {
 		printf(out, "observe: the speaker heard %v of audio, beginning %v after the question ended\n", spoke, at.Sub(ended).Round(time.Millisecond))
 		if gotDelegation {

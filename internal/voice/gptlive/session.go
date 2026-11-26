@@ -1248,9 +1248,14 @@ type player struct {
 	holds      int       // delegations outstanding: the model's audio reaches no speaker
 	heldAt     time.Time // when the first of those delegations arrived
 	heldFrames int       // samples withheld since that delegation arrived
-	begun      int       // speeches begun
-	ended      int       // speeches ended
-	changed    chan struct{}
+	// recvFrames and playedFrames are counted where each happens, never one
+	// from the other: a figure derived from the other cannot show a
+	// difference between them.
+	recvFrames   int // samples the model has sent, held or not
+	playedFrames int // samples queued for the speaker
+	begun        int // speeches begun
+	ended        int // speeches ended
+	changed      chan struct{}
 }
 
 func newPlayer(s *session) *player {
@@ -1307,6 +1312,7 @@ func (p *player) push(pcm []int16, now time.Time) bool {
 	p.mu.Lock()
 	defer signal(p.wake)
 	defer p.mu.Unlock()
+	p.recvFrames += len(pcm)
 	if p.stopped {
 		return false
 	}
@@ -1342,6 +1348,7 @@ func (p *player) push(pcm []int16, now time.Time) bool {
 }
 
 func (p *player) enqueueLocked(pcm []int16) {
+	p.playedFrames += len(pcm)
 	p.queue = append(p.queue, pcm...)
 	if over := len(p.queue) - maxQueuedAudio; over > 0 {
 		p.queue = p.queue[over:]
@@ -1399,7 +1406,11 @@ func (p *player) speaking() bool {
 	return begun != ended
 }
 
-// count records a speech beginning or ending.
+// count records a speech beginning or ending. At each end it reports how much
+// audio the model has sent this session against how much reached the speaker,
+// both counted where they happen, so a probe can tell the model repeating
+// itself from the client duplicating a stretch. Deriving one from the other
+// would make them equal whatever happened.
 func (p *player) count(began bool) {
 	p.mu.Lock()
 	if began {
@@ -1409,7 +1420,12 @@ func (p *player) count(began bool) {
 	}
 	close(p.changed)
 	p.changed = make(chan struct{})
+	recv, played := p.recvFrames, p.playedFrames
 	p.mu.Unlock()
+	if !began {
+		p.s.log.Info("gptlive: the model's audio this session",
+			"sent_ms", recv*1000/SampleRate, "to_speaker_ms", played*1000/SampleRate)
+	}
 }
 
 func (p *player) run() {
