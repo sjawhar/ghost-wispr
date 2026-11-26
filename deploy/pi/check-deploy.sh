@@ -204,15 +204,44 @@ readonly MODEL_SETTINGS=(
 
 # --- The release: its commit, and its deploy set, checked against its .sha256 and its manifest.
 
+# find_release COMMIT sets release_json to COMMIT's release, read page by page from the releases
+# list (newest first, RELEASES_PAGE a page, GitHub's largest), or release_error to why there is
+# none. It reads until a page holds the release, or until a page holds fewer than RELEASES_PAGE
+# releases, which is the last. A page that starts with the release the page before it started with
+# is the API answering one page again, which would never end, so it stops there too.
+readonly RELEASES_PAGE=100
+find_release() {
+  local page=1 seen=0 body count first previous=''
+  while :; do
+    if ! body=$(curl -fsS --max-time 30 "$RELEASES_API?per_page=$RELEASES_PAGE&page=$page" 2>"$tmp/release.err"); then
+      release_error="cannot read page $page of the releases at $RELEASES_API: $(error_of "$tmp/release.err")"
+      return 0
+    fi
+    if ! count=$(jq 'if type == "array" then length else error("not a list") end' <<<"$body" 2>/dev/null) \
+      || ! release_json=$(jq -c --arg commit "$1" 'first(.[] | select(type == "object" and .target_commitish == $commit)) // empty' <<<"$body" 2>/dev/null); then
+      release_json=''
+      release_error="page $page of the releases at $RELEASES_API is not a list of releases"
+      return 0
+    fi
+    [[ -z $release_json ]] || return 0
+    seen=$((seen + count))
+    if ((count < RELEASES_PAGE)); then
+      release_error="no release of commit $1 among the $seen releases at $RELEASES_API"
+      return 0
+    fi
+    first=$(jq -c '.[0]' <<<"$body")
+    if [[ $first == "$previous" ]]; then
+      release_error="the releases API at $RELEASES_API answered page $page with the releases of page $((page - 1)), so no release past them can be read; no release of commit $1 among the $((seen - count)) it read"
+      return 0
+    fi
+    previous=$first
+    page=$((page + 1))
+  done
+}
+
 commit=$release_commit release_json='' release_error='' tag=''
 if [[ -n $release_commit ]]; then
-  if list=$(curl -fsS --max-time 30 "$RELEASES_API?per_page=100" 2>"$tmp/release.err"); then
-    release_json=$(jq -c --arg commit "$release_commit" 'if type == "array" then (map(select(.target_commitish == $commit)) | .[0] // empty) else error("not a list") end' \
-      <<<"$list" 2>/dev/null) || release_json=
-    [[ -n $release_json ]] || release_error="no release of commit $release_commit among the latest 100 at $RELEASES_API"
-  else
-    release_error="cannot read the releases at $RELEASES_API: $(error_of "$tmp/release.err")"
-  fi
+  find_release "$release_commit"
 elif release_json=$(curl -fsS --max-time 30 "$RELEASES_API/latest" 2>"$tmp/release.err"); then
   commit=$(jq -r 'if type == "object" then (.target_commitish // "") else "" end' <<<"$release_json" 2>/dev/null) || commit=
   if [[ ! $commit =~ ^[0-9a-f]{40}$ ]]; then
