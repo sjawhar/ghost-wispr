@@ -20,10 +20,12 @@
 # routes prints route_overlap_check_script from it.
 set -euo pipefail
 
-# GHOST_WISPR_DEPLOY_DIR, GHOST_WISPR_UNIT_DIR, GHOST_WISPR_IDENTITY_KEY and GHOST_WISPR_JOIN_DIR
-# exist for provision_run_test.sh, as update.sh's do for update_test.sh.
+# GHOST_WISPR_DEPLOY_DIR, GHOST_WISPR_UNIT_DIR, GHOST_WISPR_SYSTEM_ROOT, GHOST_WISPR_IDENTITY_KEY and
+# GHOST_WISPR_JOIN_DIR exist for provision_run_test.sh, as update.sh's do for update_test.sh.
 readonly DEPLOY_DIR="${GHOST_WISPR_DEPLOY_DIR:-/opt/ghost-wispr}"
 readonly UNIT_DIR="${GHOST_WISPR_UNIT_DIR:-/home/ghost-wispr/.config/systemd/user}"
+# The root under which the nightly update installs the udev rule and the logind setting.
+readonly SYSTEM_ROOT="${GHOST_WISPR_SYSTEM_ROOT:-/}"
 readonly IDENTITY_KEY="${GHOST_WISPR_IDENTITY_KEY:-/home/ghost-wispr/.config/ghost-wispr-identity/key.pem}"
 readonly JOIN_DIR="${GHOST_WISPR_JOIN_DIR:-/var/lib/ghost-wispr-join}"
 readonly JOIN_ROUTE_CHECK="$JOIN_DIR/route-overlap-check"
@@ -105,12 +107,10 @@ check_release_directory() {
 
 # require_release_the_pi_runs fails, before anything changes, while DEPLOY_DIR/deploy.verified, the
 # set the nightly update installed and verified last, names another commit than this release's
-# manifest.json. provision.sh installs its update.sh, pi-lib.sh and pi.env before the update
-# starts, and --models its config, so another release's would leave the Pi a set that
-# deploy.verified does not list: the update would keep no .prev copy of the set the Pi runs, and a
-# failed install would roll the Pi back past it. A Pi with no deploy.verified, a new Pi or the
-# office Pi before its first update of this kind, passes. A Pi that has deploy.verified ran the
-# update, which needs jq, so jq is there to read the manifest.
+# manifest.json. --models calls it: it installs this release's config for the binary the Pi runs,
+# and another release's config on that binary is a set that no release holds. A Pi with no
+# deploy.verified passes. A Pi that has deploy.verified ran the update, which needs jq, so jq is
+# there to read the manifest.
 require_release_the_pi_runs() {
   local verified=$DEPLOY_DIR/deploy.verified line installed release
   [[ -e $verified ]] || return 0
@@ -120,7 +120,73 @@ require_release_the_pi_runs() {
   release=$(jq -er '.commit | strings' "$script_dir/manifest.json" 2>/dev/null) \
     || fail "$script_dir/manifest.json names no commit, so it is no release's directory: nothing was changed"
   [[ $release == "$installed" ]] \
-    || fail "the Pi runs commit $installed ($verified), and this is the release of commit $release: nothing was changed. provision.sh installs its own update.sh, pi-lib.sh and pi.env, so another release's would let a failed install roll the Pi back past the release it runs. Download the release of commit $installed (docs/pi-setup.md, \"The release the Pi runs\") and run its provision.sh"
+    || fail "the Pi runs commit $installed ($verified), and this is the release of commit $release: nothing was changed. --models installs a release's config for the binary the Pi runs, so it runs from that binary's release. Download the release of commit $installed (docs/pi-setup.md, \"The release the Pi runs\") and run its provision.sh --models"
+}
+
+# set_file_path NAME prints where the Pi keeps the file NAME of the deploy set, the binary
+# (ghost-wispr) or .env, as update.sh's installed_path does (the plan's contract C2): the recorder's
+# unit in UNIT_DIR, the udev rule and the logind setting under SYSTEM_ROOT, each other in DEPLOY_DIR.
+set_file_path() {
+  case $1 in
+    ghost-wispr.service) printf '%s\n' "$UNIT_DIR/$1" ;;
+    99-ghost-wispr.rules) printf '%s\n' "${SYSTEM_ROOT%/}/etc/udev/rules.d/99-ghost-wispr.rules" ;;
+    logind-power-key.conf) printf '%s\n' "${SYSTEM_ROOT%/}/etc/systemd/logind.conf.d/50-ghost-wispr-power-key.conf" ;;
+    *) printf '%s\n' "$DEPLOY_DIR/$1" ;;
+  esac
+}
+
+# keep_verified_set keeps the set the Pi runs as its .prev copies, as update.sh's keep_previous does
+# before a swap, when this run replaces the installed update.sh, pi-lib.sh or pi.env and the
+# installed set is the one DEPLOY_DIR/deploy.verified lists. The nightly update keeps .prev copies
+# only of a set that deploy.verified lists, and a newer release's update.sh, pi-lib.sh or pi.env
+# makes the installed set another, so without these copies a failed install of this release would
+# have nothing to roll back to. Each copy goes to a temporary name and then a rename, so a running
+# update.sh.prev reads its own file to its end. Where the installed set is not the one
+# deploy.verified lists, its .prev copies already hold the set verified last, and stay. A Pi with no
+# deploy.verified has no verified set to keep.
+keep_verified_set() {
+  local verified=$DEPLOY_DIR/deploy.verified name line want path have commit replaces=false
+  local -a lines verified_names=()
+  [[ -e $verified ]] || return 0
+  for name in update.sh pi-lib.sh pi.env; do
+    cmp -s -- "$script_dir/$name" "$DEPLOY_DIR/$name" || replaces=true
+  done
+  $replaces || return 0
+  mapfile -t lines <"$verified" || fail "cannot read $verified: nothing was changed"
+  [[ ${lines[0]:-} =~ ^commit\ ([0-9a-f]{40})$ ]] || fail "$verified names no commit on its first line: nothing was changed"
+  commit=${BASH_REMATCH[1]}
+  for line in "${lines[@]:1}"; do
+    want=${line%%  *} name=${line#*  }
+    [[ $want =~ ^[0-9a-f]{64}$ && $line == "$want  $name" && $name =~ ^[A-Za-z0-9_][A-Za-z0-9._-]*$ ]] \
+      || fail "$verified has a line that is not '<sha256>  <name>': $line; nothing was changed"
+    verified_names+=("$name")
+    # The installed config is rendered from the release's, whose SHA-256 deploy.verified lists.
+    [[ $name != ghost-wispr.yaml ]] || continue
+    path=$(set_file_path "$name")
+    have=''
+    if [[ -f $path ]]; then
+      have=$(sha256sum -- "$path") || fail "cannot read $path: nothing was changed"
+      have=${have%% *}
+    fi
+    if [[ $have != "$want" ]]; then
+      printf 'ghost-wispr provision: the installed files are not the set %s lists (%s differs), so its .prev copies stay as they are\n' \
+        "$verified" "$name"
+      return 0
+    fi
+  done
+  for name in ghost-wispr update.sh pi-lib.sh pi.env; do
+    [[ " ${verified_names[*]} " == *" $name "* ]] || fail "$verified does not list $name: nothing was changed"
+  done
+  for name in "${verified_names[@]}" .env; do
+    path=$(set_file_path "$name")
+    if [[ -f $path ]]; then
+      { cp --preserve=mode -- "$path" "$DEPLOY_DIR/.$name.prev.tmp" && mv -f -- "$DEPLOY_DIR/.$name.prev.tmp" "$DEPLOY_DIR/$name.prev"; } \
+        || fail "could not keep $path as $DEPLOY_DIR/$name.prev"
+    else
+      rm -f -- "$DEPLOY_DIR/$name.prev" || fail "could not remove $DEPLOY_DIR/$name.prev"
+    fi
+  done
+  printf 'ghost-wispr provision: kept the set of commit %s, which the Pi runs, as its .prev copies, so a failed install of this release rolls back to it\n' "$commit"
 }
 
 # read_pi_env reads the release's pi.env, the Pi's public settings, and fails unless it sets the
@@ -229,37 +295,64 @@ compare_client_id() {
   fi
 }
 
-# live_https_ports JSON prints each HTTPS port that JSON, the answer of `tailscale serve status
-# --json` (tailscale's ipn.ServeConfig), serves: a TCP entry with HTTPS, or a Web entry
-# "<host>:<port>". It fails on an answer that is not a JSON object.
-live_https_ports() {
+# live_serve_entries JSON prints what JSON, the answer of `tailscale serve status --json`
+# (tailscale's ipn.ServeConfig), serves over HTTPS: "port <port>" for each HTTPS port, a TCP entry
+# with HTTPS or a Web entry "<host>:<port>", and then "mount <port> <path>" for each handler of each
+# Web entry, the path as a JSON string. It fails on an answer that is not a JSON object.
+live_serve_entries() {
   [[ -n $1 ]] || return 1
   jq -r 'if type != "object" then error("not a ServeConfig") else
-      [((.TCP // {}) | to_entries[] | select((.value | type) == "object" and .value.HTTPS == true) | .key),
-       ((.Web // {}) | keys[] | split(":") | last)] | unique[]
+      ([((.TCP // {}) | to_entries[] | select((.value | type) == "object" and .value.HTTPS == true) | .key),
+        ((.Web // {}) | keys[] | split(":") | last)] | unique[] | "port \(.)"),
+      ((.Web // {}) | to_entries[] | (.key | split(":") | last) as $port
+        | .value.Handlers | objects | keys[] | "mount \($port) \(@json)")
     end' <<<"$1" 2>/dev/null
 }
 
-# apply_serve gives Tailscale Serve serve.conf's setting: it applies each line, then turns off each
-# live HTTPS port that serve.conf does not list. The nightly update only compares Serve with the
+# apply_serve gives Tailscale Serve serve.conf's setting. It applies each line, which sets the mount /
+# of its port and keeps each other mount there (tailscale's SetWebHandler, ipn/serve.go, v1.104).
+# Then it turns off each live HTTPS port that serve.conf does not list, and each mount other than /
+# of a port that it lists. Last it reads Serve again, as the nightly drift check reads it (pi-lib.sh's
+# serve_lines_from_status), and fails unless that is serve.conf: a part it does not manage, such as
+# a TCP forward, would show as drift each night. The nightly update only compares Serve with the
 # release's serve.conf.
 apply_serve() {
-  local port target live ports
+  local port target live entries kind rest mount have
   while read -r port target; do
     if [[ -n $port ]]; then
-      sudo tailscale serve --bg --https "$port" "$target"
+      sudo tailscale serve --bg --https "$port" "$target" </dev/null
     fi
   done <<<"$serve_lines"
   live=$(sudo tailscale serve status --json) \
-    || fail "could not read Tailscale Serve's setting (tailscale serve status --json), so the ports that serve.conf does not list may still be served"
-  ports=$(live_https_ports "$live") \
-    || fail "tailscale serve status --json gave no Serve setting that provision.sh can read, so the ports that serve.conf does not list may still be served"
-  while IFS= read -r port; do
-    if [[ -n $port ]] && ! grep -q "^$port " <<<"$serve_lines"; then
-      sudo tailscale serve --https="$port" off
-      printf 'ghost-wispr provision: turned off Serve port %s, which serve.conf does not list\n' "$port"
-    fi
-  done <<<"$ports"
+    || fail "could not read Tailscale Serve's setting (tailscale serve status --json), so the ports and mounts that serve.conf does not list may still be served"
+  entries=$(live_serve_entries "$live") \
+    || fail "tailscale serve status --json gave no Serve setting that provision.sh can read, so the ports and mounts that serve.conf does not list may still be served"
+  while read -r kind port rest; do
+    case $kind in
+      port)
+        if ! grep -q "^$port " <<<"$serve_lines"; then
+          sudo tailscale serve --https="$port" off </dev/null
+          printf 'ghost-wispr provision: turned off Serve port %s, which serve.conf does not list\n' "$port"
+        fi
+        ;;
+      mount)
+        # A port that serve.conf does not list went whole above.
+        grep -q "^$port " <<<"$serve_lines" || continue
+        mount=$(jq -r . <<<"$rest") || fail "cannot read the Serve mount $rest of port $port"
+        [[ $mount != / ]] || continue
+        [[ $mount == /* && $mount != *[[:cntrl:]]* ]] \
+          || fail "Tailscale Serve has the mount $rest on port $port, which provision.sh cannot name as it is: remove it (tailscale serve --https=$port --set-path=PATH off) and run provision.sh again"
+        sudo tailscale serve --https="$port" --set-path="$mount" off </dev/null
+        printf 'ghost-wispr provision: turned off the Serve mount %s of port %s, which serve.conf does not list\n' "$mount" "$port"
+        ;;
+    esac
+  done <<<"$entries"
+  live=$(sudo tailscale serve status --json) \
+    || fail "could not read Tailscale Serve's setting (tailscale serve status --json) after provision.sh applied serve.conf"
+  have=$(serve_lines_from_status "$live") \
+    || fail "Tailscale Serve holds a part that provision.sh does not manage, such as a TCP forward or Funnel, so its setting is not serve.conf's: read it with tailscale serve status, remove that part, and run provision.sh again"
+  [[ $have == "$serve_lines" ]] \
+    || fail "Tailscale Serve's setting is not serve.conf's after provision.sh applied it: want [$(paste -sd ';' <<<"$serve_lines")], have [$(paste -sd ';' <<<"$have")]"
 }
 
 # refuse_overrides WHERE HOW NAMES: fails while NAMES, the variables of PI_LIB_CONFIG_FILE_VARIABLE
@@ -513,7 +606,6 @@ refuse_input
 use_runtime_dir
 [[ -f $IDENTITY_KEY ]] || fail "there is no key at $IDENTITY_KEY: run provision.sh --key, then provision.sh --certificate FILE, first"
 [[ -f $DEPLOY_DIR/device.crt ]] || fail "there is no certificate at $DEPLOY_DIR/device.crt: run provision.sh --certificate FILE first"
-require_release_the_pi_runs
 
 # The recorder inherits its user manager's environment. Reload the manager first, so that an
 # environment.d or user.conf line written since its last reload counts.
@@ -544,6 +636,8 @@ for group in plugdev input audio; do
     groups_changed=true
   fi
 done
+
+keep_verified_set
 
 # The bootstrap files, and the release's update.sh, pi-lib.sh and pi.env, which the update that
 # provision.sh starts below runs on. That update installs the rest of the release's deploy set, the
