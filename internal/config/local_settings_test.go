@@ -505,3 +505,82 @@ func TestAProjectFromGoogleApplicationCredentialsIsSavedLikeAnEnvironmentOverrid
 		t.Errorf("vertex's project after the variable is removed = %q, want env-project", got)
 	}
 }
+
+// TestAGoogleCredentialsFileOverrideGivesItsOwnVertexProject fails if the
+// effective release config holds the Vertex AI project of the release file's
+// own credential file: a provider with no project of its own must take the
+// project of the credential file it signs in with, and
+// GHOST_WISPR_GOOGLE_CREDENTIALS_FILE names another one.
+func TestAGoogleCredentialsFileOverrideGivesItsOwnVertexProject(t *testing.T) {
+	clearVoiceEnv(t)
+	dir := t.TempDir()
+	credentials := func(name, project string) string {
+		path := filepath.Join(dir, name)
+		if err := os.WriteFile(path, fmt.Appendf(nil, `{"type": "service_account", "project_id": %q}`, project), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+	releaseCredentials := credentials("release.json", "release-project")
+	overrideCredentials := credentials("override.json", "override-project")
+	path := filepath.Join(dir, "ghost-wispr.yaml")
+	if err := os.WriteFile(path, fmt.Appendf(nil, "google_credentials_file: %q\nproviders:\n  vertex: {api: vertex, auth: {kind: google}}\n", releaseCredentials), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, _, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := cfg.Providers["vertex"].Project; got != "release-project" {
+		t.Fatalf("vertex's project from the release file's credential file = %q, want release-project", got)
+	}
+	t.Setenv(EnvPrefix+"GOOGLE_CREDENTIALS_FILE", overrideCredentials)
+	cfg, _, err = Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.GoogleCredentialsFile != overrideCredentials {
+		t.Fatalf("google_credentials_file with %sGOOGLE_CREDENTIALS_FILE set = %q, want %q", EnvPrefix, cfg.GoogleCredentialsFile, overrideCredentials)
+	}
+	if got := cfg.Providers["vertex"].Project; got != "override-project" {
+		t.Errorf("vertex's project with %sGOOGLE_CREDENTIALS_FILE set = %q, want override-project, the project of the file it signs in with", EnvPrefix, got)
+	}
+}
+
+// TestALocalValueThatDoesNotFitItsSettingWarnsByTheLocalFilesLine fails if a
+// local settings file whose value does not fit its setting stops the start,
+// is applied in part, or gives a warning that names a line of another
+// document than the local settings file: here line 4 holds the bad value.
+func TestALocalValueThatDoesNotFitItsSettingWarnsByTheLocalFilesLine(t *testing.T) {
+	clearEnv(t)
+	path := writeConfig(t, "silence_timeout: 30s\ngc_max_age_days: 14\n")
+	localPath := LocalSettingsPath(path)
+	if err := os.WriteFile(localPath, []byte("silence_timeout: 45s\nrecording_rules:\n  - Saved rule.\ngc_max_age_days: many\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, warnings, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load returned an error for a local value that does not fit its setting: %v", err)
+	}
+	if cfg.GCMaxAgeDays != 14 || cfg.SilenceTimeout != "30s" || len(cfg.RecordingRules) != 0 {
+		t.Errorf("gc_max_age_days %d, silence_timeout %q, recording_rules %q; want the release config's 14, 30s and no rules", cfg.GCMaxAgeDays, cfg.SilenceTimeout, cfg.RecordingRules)
+	}
+	var local []string
+	for _, warning := range warnings {
+		if strings.HasPrefix(warning, localPath+": ") {
+			local = append(local, warning)
+		}
+	}
+	if len(local) != 1 {
+		t.Fatalf("warnings %q, want one about %s", warnings, localPath)
+	}
+	warning := local[0]
+	if !strings.HasSuffix(warning, "; settings saved on the page are not applied") || !strings.Contains(warning, "`many`") {
+		t.Errorf("warning %q does not name the bad value and the skipped page saves", warning)
+	}
+	if !strings.Contains(warning, "line 4:") || strings.Count(warning, "line ") != 1 {
+		t.Errorf("warning %q does not name line 4 of the local settings file alone", warning)
+	}
+}
