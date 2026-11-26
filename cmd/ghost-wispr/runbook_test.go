@@ -60,14 +60,16 @@ func TestRunbookSaysWhatToDoWhenDeleteWaitsForDrive(t *testing.T) {
 // settings saved on the page stay in ghost-wispr.local.yaml; that the update
 // leaves a busy recorder alone and restores the previous release when the new
 // one does not answer; that a changed provisioning file needs the release's
-// provision.sh; and that deploy/pi/check-deploy.sh is the check. It also fails
+// provision.sh; that deploy/pi/check-deploy.sh is the check; and that a release
+// that answers its commit but fails a check is reverted on main, whose release
+// the next update installs, with no .prev copy put back by hand. It also fails
 // if that section still orders a rollout by hand (the models step, update.sh
 // by hand, a step before the merge), if the runbook still has a section that
 // starts "## Roll out", or if it still says that the nightly update replaces
 // only the binary.
 func TestRunbookSaysAReleaseInstallsItsConfigWithItsBinary(t *testing.T) {
 	section := runbookSection(t, releaseSection)
-	for _, words := range []string{"whole deploy set", "together", "`ghost-wispr.yaml`", "never starts on an old config", "ghost-wispr.local.yaml", "leaving the current release in place", "restored the previous release", "`provision.sh`", "deploy/pi/check-deploy.sh"} {
+	for _, words := range []string{"whole deploy set", "together", "`ghost-wispr.yaml`", "never starts on an old config", "ghost-wispr.local.yaml", "leaving the current release in place", "restored the previous release", "`provision.sh`", "deploy/pi/check-deploy.sh", "revert the change on `main`", "systemctl --user start ghost-wispr-update.service", "Do not restore the `.prev` copies by hand"} {
 		if !strings.Contains(section, words) {
 			t.Errorf("the runbook's %q does not say %q", releaseSection, words)
 		}
@@ -86,6 +88,36 @@ func TestRunbookSaysAReleaseInstallsItsConfigWithItsBinary(t *testing.T) {
 		if strings.Contains(words, stale) {
 			t.Errorf("the runbook still says that the nightly update %s", stale)
 		}
+	}
+}
+
+// TestRunbookRunsTheModelsStepFromTheReleaseThePiRuns fails if "Enable models
+// and Drive sync" does not say to run provision.sh --models only from the
+// release the Pi runs, which may be older than the latest release, and how to
+// get that release: check 1 of check-deploy.sh, or the download block of the
+// release whose commit /api/version names, which runbook_blocks_test.sh runs.
+func TestRunbookRunsTheModelsStepFromTheReleaseThePiRuns(t *testing.T) {
+	section := runbookSection(t, "## Enable models and Drive sync")
+	for _, words := range []string{"only from the release the Pi runs", "check 1", "/api/version", "<!-- runbook_blocks_test.sh: download-commit -->", "<!-- runbook_blocks_test.sh: models -->"} {
+		if !strings.Contains(section, words) {
+			t.Errorf("the runbook's \"Enable models and Drive sync\" does not say %q", words)
+		}
+	}
+}
+
+// TestRunbookClaimsTheNameFromAPersonsOwnDevice fails if the runbook still
+// runs a step under the agents' secrets broker (secret-run, a broker grant),
+// which no person's own device has, or if "Provision" does not claim the
+// tailnet name with the block runbook_blocks_test.sh runs.
+func TestRunbookClaimsTheNameFromAPersonsOwnDevice(t *testing.T) {
+	words := strings.Join(strings.Fields(readRunbook(t)), " ")
+	for _, stale := range []string{"secret-run", "secrets-broker", "broker page"} {
+		if strings.Contains(words, stale) {
+			t.Errorf("the runbook still runs a step under the agents' secrets broker: %q", stale)
+		}
+	}
+	if !strings.Contains(runbookSection(t, "## Provision"), "<!-- runbook_blocks_test.sh: claim-name -->") {
+		t.Error(`"Provision" has no claim-name block for runbook_blocks_test.sh`)
 	}
 }
 
