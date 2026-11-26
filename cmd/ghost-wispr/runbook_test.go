@@ -169,13 +169,21 @@ func TestRunbookProvisionGivesServeExactlyServeConf(t *testing.T) {
 // version in device.crt.version, with its .prev copy beside device.crt.prev,
 // and gives it to pi-secrets, which walks up from it by number when latest
 // cannot be read, skips a disabled version and stops at an absent one; or does
-// not quote the line pi-secrets prints when that walk finds nothing.
+// not quote the line pi-secrets prints when that walk finds nothing. It also
+// fails if the section does not give both cases of a failed certificate
+// install's rollback: device.crt.version.prev goes back with device.crt.prev,
+// or, on a Pi that had no version file before (provision.sh --certificate
+// writes none), the new device.crt.version is removed; or if it still says
+// that the rollback always puts both .prev copies back.
 func TestRunbookSaysHowThePiFindsARenewedCertificate(t *testing.T) {
 	section := runbookSection(t, "## Renew the X.509 certificate")
-	for _, words := range []string{"`/opt/ghost-wispr/device.crt.version`", "`device.crt.version.prev`", "--installed-certificate-version", "skips a disabled", "stops at the first version that does not exist", "pi-secrets: certificate kept: latest certificate cannot be read: <code>; no readable version above <n>"} {
+	for _, words := range []string{"`/opt/ghost-wispr/device.crt.version`", "`device.crt.version.prev`", "--installed-certificate-version", "skips a disabled", "stops at the first version that does not exist", "pi-secrets: certificate kept: latest certificate cannot be read: <code>; no readable version above <n>", "puts `device.crt.version.prev` back with it", "it removes the new `device.crt.version`", "`provision.sh --certificate` writes none"} {
 		if !strings.Contains(section, words) {
 			t.Errorf("the runbook's \"Renew the X.509 certificate\" does not say %q", words)
 		}
+	}
+	if strings.Contains(section, "puts both `.prev` copies back") {
+		t.Error(`the runbook's "Renew the X.509 certificate" still says that a rollback always puts both .prev copies back`)
 	}
 }
 
