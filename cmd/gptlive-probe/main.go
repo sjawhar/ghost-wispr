@@ -157,6 +157,7 @@ type delegationLog struct {
 
 func (l *delegationLog) Enabled(context.Context, slog.Level) bool { return true }
 
+//nolint:gocritic // slog.Handler's Handle takes the record by value.
 func (l *delegationLog) Handle(ctx context.Context, r slog.Record) error {
 	switch r.Message {
 	case "gptlive: delegation reached the client":
