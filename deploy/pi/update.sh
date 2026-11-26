@@ -68,7 +68,10 @@ trap 'if [[ -n $stage ]]; then rm -rf -- "$stage"; fi' EXIT
 status_json='' release_json='' release_commit='' set_dir='' manifest_json='' binary_sha256=''
 tarball_url='' tarball_checksum_url='' binary_url='' binary_checksum_url=''
 secrets_file='' secrets_failure='' certificate_staged='' certificate_version='' certificate_end=''
-swapped=() changed_system=() restore_problems=''
+swapped=() changed_system=() restore_problems='' restore_note=''
+# A release install whose installed set is not the one deploy.verified lists (a run cut short)
+# keeps no .prev copies, and a rollback of it restores every file that has one (restore_previous).
+restore_all=false
 
 fail() {
   printf 'ghost-wispr update: %s\n' "$*" >&2
@@ -222,17 +225,25 @@ secret_lines_valid() {
 # certificate_staged to a newer certificate that signs in, with its version and end date. A failed
 # key read (exit 1) still lets pi-secrets' certificate step run (R10), so a certificate it staged
 # and named counts after an exit 0 or 1; one that a timeout cut short never does. A failure here
-# keeps the secret lines .env has; the caller decides what else it means.
+# keeps the secret lines .env has; the caller decides what else it means. When device.crt.version
+# holds the installed certificate's version, one positive integer, pi-secrets gets it (T1.1's
+# --installed-certificate-version).
 read_secrets() {
-  local binary=$1 out=$stage/secrets output status=0 line version='' end=''
+  local binary=$1 out=$stage/secrets output status=0 line version='' end='' installed_version='' version_args=()
   load_pi_env
   mkdir -m 0700 -- "$out" || fail "cannot make $out"
+  if [[ -f $DEPLOY_DIR/device.crt.version ]]; then
+    installed_version=$(<"$DEPLOY_DIR/device.crt.version") || installed_version=''
+  fi
+  if [[ $installed_version =~ ^[1-9][0-9]{0,9}$ ]]; then
+    version_args=(--installed-certificate-version "$installed_version")
+  fi
   output=$(timeout --kill-after=5s 60s "$binary" pi-secrets --project "$PI_GCP_PROJECT" \
     --credentials "$DEPLOY_DIR/google-credentials.json" \
     --env-secret GHOST_WISPR_DEEPGRAM_API_KEY="$PI_DEEPGRAM_SECRET" \
     --env-secret GHOST_WISPR_DISPATCH_TOKEN="$PI_DISPATCH_TOKEN_SECRET" \
     --certificate-secret "$PI_CERTIFICATE_SECRET" --key "$IDENTITY_KEY" \
-    --installed-certificate "$DEPLOY_DIR/device.crt" --out "$out" 2>&1) || status=$?
+    --installed-certificate "$DEPLOY_DIR/device.crt" "${version_args[@]}" --out "$out" 2>&1) || status=$?
   if [[ -n $output ]]; then
     printf '%s\n' "$output"
   fi
@@ -262,9 +273,9 @@ read_secrets() {
 }
 
 # render_env OUT writes the .env to install (R9), mode 0600: GHOST_WISPR_ADDR and
-# GOOGLE_API_USE_CLIENT_CERTIFICATE, then the two secret lines pi-secrets wrote, or the current
-# .env's when it failed, then every other line of the current .env but the variables Ghost Wispr no
-# longer reads.
+# GOOGLE_API_USE_CLIENT_CERTIFICATE, then the two secret lines pi-secrets wrote, or the ones systemd
+# reads from the current .env when it failed, then every other line of the current .env but the
+# variables Ghost Wispr no longer reads.
 render_env() {
   local out=$1 env=$DEPLOY_DIR/.env
   printf '%s\n' GHOST_WISPR_ADDR=127.0.0.1:8080 GOOGLE_API_USE_CLIENT_CERTIFICATE=false >"$out" || return 1
@@ -272,10 +283,20 @@ render_env() {
   if [[ -n $secrets_file ]]; then
     cat -- "$secrets_file" >>"$out" || return 1
   elif [[ -f $env ]]; then
-    awk '/^(GHOST_WISPR_DEEPGRAM_API_KEY|GHOST_WISPR_DISPATCH_TOKEN)=/' "$env" >>"$out" || return 1
+    env_secret_lines "$env" >>"$out" || return 1
   fi
   if [[ -f $env ]]; then
     env_kept_lines "$env" >>"$out" || return 1
+  fi
+}
+
+# stage_certificate puts the certificate pi-secrets staged in the staging directory as device.crt,
+# and its version, the one pi-secrets named, as device.crt.version; the two install and roll back
+# together.
+stage_certificate() {
+  install -m 0644 -- "$certificate_staged" "$stage/new/device.crt" || fail "could not stage the new certificate"
+  if ! printf '%s\n' "$certificate_version" >"$stage/new/device.crt.version" || ! chmod 0644 "$stage/new/device.crt.version"; then
+    fail "could not stage the new certificate's version"
   fi
 }
 
@@ -486,18 +507,27 @@ swap_in() {
 }
 
 # restore_previous WHY puts back each file this run swapped in from its .prev copy, byte for byte,
-# reloads the user units, and reloads udev or restarts logind when their file changed. It sets
-# restore_problems to what it could not do: a reload, or a file with no .prev copy, which stays as
-# installed. When no file has a .prev copy it fails with WHY: no previous release to restore (R6).
-# It writes no deploy.verified.
+# and, when restore_all is set, every other file of the set, .env, the certificate and its version
+# file that has a .prev copy. Then it reloads the user units, and reloads udev or restarts logind
+# when their file changed. It sets restore_problems to what it could not do: a reload, or a file
+# swapped in with no .prev copy, which stays as installed; and restore_note to what went back. When
+# no file has a .prev copy it fails with WHY: no previous release to restore (R6). It writes no
+# deploy.verified.
 restore_previous() {
-  local why=$1 name path prev restored=() missing=() system=()
-  restore_problems=''
-  for name in "${swapped[@]}"; do
+  local why=$1 name path prev names=("${swapped[@]}") restored=() missing=() system=()
+  restore_problems='' restore_note='restored the previous release'
+  if $restore_all; then
+    for name in "${SET_FILES[@]}" ghost-wispr .env device.crt device.crt.version; do
+      [[ " ${names[*]} " == *" $name "* ]] || names+=("$name")
+    done
+  fi
+  for name in "${names[@]}"; do
     path=$(installed_path "$name")
     prev=$DEPLOY_DIR/$name.prev
     if [[ ! -f $prev ]]; then
-      missing+=("$name")
+      if [[ " ${swapped[*]} " == *" $name "* ]]; then
+        missing+=("$name")
+      fi
       continue
     fi
     if is_system_file "$name"; then
@@ -519,6 +549,13 @@ restore_previous() {
   if ((${#missing[@]})); then
     restore_problems+="; no previous release to restore for ${missing[*]}, which stay as installed"
   fi
+  if $restore_all; then
+    if installed_set_is_verified; then
+      restore_note='restored the last verified set, the one deploy.verified lists'
+    else
+      restore_note='restored each file that has a .prev copy, but they are not the set deploy.verified lists'
+    fi
+  fi
 }
 
 # rollback WHY restores the previous release's files (restore_previous), then restarts the recorder
@@ -530,18 +567,19 @@ rollback() {
   if recorder_active; then
     restartable "$why"
   fi
-  systemctl --user restart ghost-wispr.service || fail "$why; restored the previous release but could not restart ghost-wispr.service"
-  fail "$why; restored the previous release"
+  systemctl --user restart ghost-wispr.service || fail "$why; $restore_note but could not restart ghost-wispr.service"
+  fail "$why; $restore_note"
 }
 
-# leave_if_busy_before_restart reads the recorder's status again just before a release's restart
-# (R7): a session or a call can start during the swap and the reloads after it. While the recorder
-# records a session or holds a call, it puts back the previous release's files (restore_previous)
-# and leaves the recorder running, unrestarted, on the files it started on. So the Pi is as it was,
-# and the run ends with exit 0, as leave_if_busy ends it, unless a file could not go back. While the
-# recorder runs but gives no status, it does the same and fails.
+# leave_if_busy_before_restart reads the recorder's status again just before a restart on files
+# this run swapped in (R7): a session or a call can start during the swap and the reloads after it.
+# While the recorder records a session or holds a call, it puts back the previous files
+# (restore_previous) and leaves the recorder running, unrestarted, on the files it started on. So
+# the Pi is as it was, and the run ends with exit 0, as leave_if_busy ends it, unless a file could
+# not go back, or the run found the installed set not the verified one (restore_all), which it
+# reports. While the recorder runs but gives no status, it does the same and fails.
 leave_if_busy_before_restart() {
-  local reason kept="restored the previous release's files and left the recorder running on the files it started on"
+  local reason kept
   status_json=$(recorder_status)
   reason=$(busy_reason "$status_json")
   if [[ -z $reason ]]; then
@@ -549,13 +587,48 @@ leave_if_busy_before_restart() {
       return 0
     fi
     reason='ghost-wispr.service is active but /api/status gave no status'
-    restore_previous "$reason"
-    fail "$reason$restore_problems; $kept"
   fi
   restore_previous "$reason"
-  [[ -z $restore_problems ]] || fail "$reason$restore_problems; $kept"
+  if $restore_all; then kept=$restore_note; else kept="restored the previous release's files"; fi
+  kept+=', and left the recorder running on the files it started on'
+  if [[ -z $status_json || -n $restore_problems ]] || $restore_all; then
+    fail "$reason$restore_problems; $kept"
+  fi
   printf 'ghost-wispr update: %s; leaving the current release in place\n' "$reason"
   exit 0
+}
+
+# restart_for_files_since_start restarts the recorder, once it is free, when .env or device.crt is
+# newer than the start of its main process (systemd's ExecMainStartTimestamp): a run cut short
+# after a refresh's swap and before its restart left the recorder on the old ones, and the next
+# runs find the files current. It checks the recorder's version as a refresh does, and rolls those
+# files back from their .prev copies when the recorder does not answer.
+restart_for_files_since_start() {
+  local started start_us name path mtime newer=()
+  recorder_active || return 0
+  started=$(systemctl --user show -p ExecMainStartTimestamp --timestamp=us+utc --value ghost-wispr.service 2>/dev/null) \
+    || started=''
+  if [[ -z $started ]] || ! start_us=$(date -u -d "$started" +%s%6N 2>/dev/null) || [[ ! $start_us =~ ^[0-9]+$ ]]; then
+    printf 'ghost-wispr update: could not read when ghost-wispr.service started (%s), so it is not restarted for an .env or a certificate installed since\n' \
+      "${started:-no ExecMainStartTimestamp}"
+    return 0
+  fi
+  for name in .env device.crt; do
+    path=$(installed_path "$name")
+    if [[ -f $path ]] && mtime=$(date -r "$path" +%s%6N 2>/dev/null) && [[ $mtime =~ ^[0-9]+$ ]] && ((mtime > start_us)); then
+      newer+=("$name")
+    fi
+  done
+  ((${#newer[@]})) || return 0
+  leave_if_busy
+  printf 'ghost-wispr update: the recorder started before the installed %s; restarting it\n' "${newer[*]}"
+  swapped=("${newer[@]}")
+  if [[ " ${newer[*]} " == *' device.crt '* ]]; then
+    swapped+=(device.crt.version)
+  fi
+  systemctl --user restart ghost-wispr.service || rollback "the recorder did not start on the installed ${newer[*]}"
+  wait_for_commit "$release_commit" \
+    || rollback "the recorder did not answer /api/version with commit $release_commit within 120 s of its restart on the installed ${newer[*]}"
 }
 
 # refuse_override WHERE NAMES fails while NAMES, the override variables WHERE sets, is not empty.
@@ -629,6 +702,8 @@ print_installed_certificate() {
 
 # refresh_current: the release is current. A change of the secret lines, or a newer certificate that
 # signs in, installs, with its .prev copy kept, and the recorder restarts on it while it is not busy.
+# With neither, a recorder that started before the installed .env or certificate restarts on them
+# (restart_for_files_since_start).
 refresh_current() {
   local changes=()
   read_secrets "$BINARY"
@@ -637,16 +712,19 @@ refresh_current() {
     changes+=(.env)
   fi
   if [[ -n $certificate_staged ]]; then
-    install -m 0644 -- "$certificate_staged" "$stage/new/device.crt" || fail "could not stage the new certificate"
-    changes+=(device.crt)
+    stage_certificate
+    changes+=(device.crt device.crt.version)
   fi
   if ((${#changes[@]} == 0)); then
+    restart_for_files_since_start
     [[ -z $secrets_failure ]] || fail "$secrets_failure; .env keeps its secret lines"
     return 0
   fi
   leave_if_busy
   keep_previous "${changes[@]}"
   swap_in "${changes[@]}" || rollback "could not install ${changes[*]}"
+  # A session or a call that started during the swap stops the run here, with the files back.
+  leave_if_busy_before_restart
   systemctl --user restart ghost-wispr.service || rollback "the recorder did not start on the new ${changes[*]}"
   wait_for_commit "$release_commit" \
     || rollback "the recorder did not answer /api/version with commit $release_commit within 120 s of its restart on the new ${changes[*]}"
@@ -683,8 +761,8 @@ install_release() {
   fi
   install_names=("${SET_FILES[@]}" ghost-wispr .env)
   if [[ -n $certificate_staged ]]; then
-    install -m 0644 -- "$certificate_staged" "$stage/new/device.crt" || fail "could not stage the new certificate"
-    install_names+=(device.crt)
+    stage_certificate
+    install_names+=(device.crt device.crt.version)
   fi
 
   # A session or a call that started during the download stops the run here.
@@ -698,11 +776,15 @@ install_release() {
   elif running_image_is_installed; then
     keep=true
   fi
+  # The .prev copies are one set: the certificate and its version file are kept with it, staged or
+  # not, so a rollback never puts back a certificate older than the set's.
   if $keep; then
-    keep_previous "${SET_FILES[@]}" ghost-wispr .env
-  fi
-  if [[ -n $certificate_staged ]]; then
-    keep_previous device.crt
+    keep_previous "${SET_FILES[@]}" ghost-wispr .env device.crt device.crt.version
+  else
+    restore_all=true
+    if [[ -n $certificate_staged && ! -e $DEPLOY_DIR/device.crt.prev ]]; then
+      keep_previous device.crt device.crt.version
+    fi
   fi
   # The first install by this script keeps the config it replaces, where a person finds a setting
   # saved on the page before the local settings file (D13). A second try keeps the first copy.
@@ -753,6 +835,8 @@ nightly() {
   if release_is_current; then
     printf 'ghost-wispr update: already current at commit %s\n' "$release_commit"
     report_drift
+    # A refresh installs files and restarts the recorder too: the refusal holds for it (R7).
+    require_no_override
     refresh_current
     return 0
   fi

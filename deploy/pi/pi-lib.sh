@@ -81,13 +81,98 @@ render_config() {
   render_config_with_drive "$pl_template" "$pl_drive_id"
 }
 
-# env_kept_lines ENV_FILE prints each line of the .env file ENV_FILE, in order, but the four lines
-# update.sh owns and the lines of variables Ghost Wispr no longer reads. It fails when it cannot read
+# env_entries MODE ENV_FILE reads the .env file ENV_FILE as systemd's EnvironmentFile= parser does
+# (parse_env_file_internal, src/basic/env-file.c), which the recorder's environment comes from, and
+# which keeps the last value of a variable. An entry starts at its key, past spaces, tabs and line
+# breaks, and ends at the line break after its value. A line break is a line feed or a carriage
+# return, a key ends at its = with spaces and tabs stripped, a backslash escapes the next byte, a
+# line break included, and a value in single or double quotes runs on across line breaks to its
+# closing quote. A line that starts with # or ; is a comment, and so is a key with no =. With MODE
+# kept it prints ENV_FILE byte for byte but the entries of the four variables update.sh owns and of
+# the variables Ghost Wispr no longer reads, each from the start of its line to its line break,
+# that included. With MODE secrets it prints the last entry of GHOST_WISPR_DEEPGRAM_API_KEY and
+# of GHOST_WISPR_DISPATCH_TOKEN, in that order, each from its key to its value's end and then a
+# line feed. It fails when it cannot read ENV_FILE.
+env_entries() {
+  local pl_content
+  [[ -r $2 ]] || return 1
+  # The x keeps the file's last line breaks, which $( ) would drop; awk drops it again.
+  pl_content=$(cat -- "$2" && printf x) || return 1
+  LC_ALL=C awk -v mode="$1" -v drop="^($PI_LIB_OWNED_ENV_VARIABLES|GHOST_WISPR_($PI_LIB_REMOVED_ENV_VARIABLES))\$" '
+    function entry(end) {
+      sub(/[ \t]+$/, "", key)
+      count++
+      entry_start[count] = start; entry_key_start[count] = key_start; entry_end[count] = end; entry_key[count] = key
+    }
+    { text = (NR > 1 ? text "\n" : "") $0 }
+    END {
+      text = substr(text, 1, length(text) - 1)
+      n = length(text); state = "pre_key"; start = 1; count = 0
+      for (i = 1; i <= n; i++) {
+        c = substr(text, i, 1)
+        line_break = (c == "\n" || c == "\r")
+        if (state == "pre_key") {
+          if (c == "#" || c == ";") state = "comment"
+          else if (line_break) start = i + 1
+          else if (c != " " && c != "\t") { state = "key"; key_start = i; key = c }
+        } else if (state == "key") {
+          if (line_break) { state = "pre_key"; start = i + 1 }
+          else if (c == "=") state = "pre_value"
+          else key = key c
+        } else if (state == "pre_value" || state == "value") {
+          if (line_break) { entry(i); state = "pre_key"; start = i + 1 }
+          else if (c == "\\") state = "value_escape"
+          else if (state == "pre_value" && c == "\047") state = "single_quote"
+          else if (state == "pre_value" && c == "\"") state = "double_quote"
+          else if (state == "pre_value" && c != " " && c != "\t") state = "value"
+        } else if (state == "value_escape") state = "value"
+        else if (state == "single_quote") { if (c == "\047") state = "pre_value" }
+        else if (state == "double_quote") {
+          if (c == "\"") state = "pre_value"
+          else if (c == "\\") state = "double_quote_escape"
+        } else if (state == "double_quote_escape") state = "double_quote"
+        else if (state == "comment") {
+          if (c == "\\") state = "comment_escape"
+          else if (line_break) { state = "pre_key"; start = i + 1 }
+        } else if (state == "comment_escape") {
+          if (line_break) { state = "pre_key"; start = i + 1 }
+          else state = "comment"
+        }
+      }
+      if (state ~ /^(pre_value|value|value_escape|single_quote|double_quote|double_quote_escape)$/) entry(n + 1)
+      if (mode == "kept") {
+        out = ""; at = 1
+        for (k = 1; k <= count; k++) {
+          if (entry_key[k] ~ drop) {
+            out = out substr(text, at, entry_start[k] - at)
+            at = entry_end[k] + 1
+          }
+        }
+        printf "%s", out substr(text, at)
+      } else {
+        split("GHOST_WISPR_DEEPGRAM_API_KEY GHOST_WISPR_DISPATCH_TOKEN", secret, " ")
+        for (s = 1; s <= 2; s++) {
+          last = 0
+          for (k = 1; k <= count; k++) if (entry_key[k] == secret[s]) last = k
+          if (last) printf "%s\n", substr(text, entry_key_start[last], entry_end[last] - entry_key_start[last])
+        }
+      }
+    }' <<<"$pl_content"
+}
+
+# env_kept_lines ENV_FILE prints the .env file ENV_FILE, byte for byte, but the entries systemd
+# reads of the four lines update.sh owns and of the variables Ghost Wispr no longer reads (an
+# indented one and one after a carriage return too: see env_entries). It fails when it cannot read
 # ENV_FILE.
 env_kept_lines() {
-  [[ -r $1 ]] || return 1
-  awk -v removed="^GHOST_WISPR_($PI_LIB_REMOVED_ENV_VARIABLES)=" -v owned="^($PI_LIB_OWNED_ENV_VARIABLES)=" \
-    '$0 !~ removed && $0 !~ owned' "$1"
+  env_entries kept "$1"
+}
+
+# env_secret_lines ENV_FILE prints the two secret lines that systemd reads from the .env file
+# ENV_FILE, each the last of its variable, the Deepgram key's first: the lines a failed pi-secrets
+# read keeps (R9). It fails when it cannot read ENV_FILE.
+env_secret_lines() {
+  env_entries secrets "$1"
 }
 
 # config_override_names ENV_FILE prints, one a line, each variable of PI_LIB_CONFIG_FILE_VARIABLE
