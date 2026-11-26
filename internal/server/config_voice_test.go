@@ -185,6 +185,7 @@ func TestPatchConfigRefusesAnUnknownVoice(t *testing.T) {
 			if after, err := os.ReadFile(path); err != nil || !bytes.Equal(after, before) {
 				t.Errorf("a refused PATCH rewrote the config file (%v):\n%s", err, after)
 			}
+			assertNoLocalSettings(t, path)
 			if n := announced.Load(); n != 0 {
 				t.Errorf("a refused PATCH announced %d config changes", n)
 			}

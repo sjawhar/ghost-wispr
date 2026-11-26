@@ -88,7 +88,9 @@ The web UI is available at `http://localhost:8080`.
 
 ## Configuration
 
-Settings live in `ghost-wispr.yaml` (see `ghost-wispr.yaml.example`). Environment variables with the `GHOST_WISPR_` prefix override them, and a model provider's key is read only from the environment variable its `auth.env` names ([Model providers](#model-providers)). See `.env.example` for the full list.
+Settings live in `ghost-wispr.yaml`, the release config (see `ghost-wispr.yaml.example`). Environment variables with the `GHOST_WISPR_` prefix override them, and a model provider's key is read only from the environment variable its `auth.env` names ([Model providers](#model-providers)). See `.env.example` for the full list.
+
+The settings page saves its changes in the local settings file, `ghost-wispr.local.yaml`, beside `ghost-wispr.yaml`. For `GHOST_WISPR_CONFIG=/srv/unit.yaml`, the file is `/srv/unit.local.yaml`. The file holds only the settings that differ from the release config, and Ghost Wispr reads it over the release config: a map merges key by key, and any other value, a list too, replaces the release value. A save never writes `ghost-wispr.yaml`, so a new release config keeps the saved settings. A save also writes each setting that an environment variable overrides, except `GHOST_WISPR_LOG_LEVEL`, and that setting stays after the variable is removed. To remove the saved settings, delete `ghost-wispr.local.yaml` and restart Ghost Wispr. When Ghost Wispr cannot read or parse `ghost-wispr.local.yaml`, it warns at start and in `GET /api/status`, and uses the release config alone.
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
@@ -97,12 +99,12 @@ Settings live in `ghost-wispr.yaml` (see `ghost-wispr.yaml.example`). Environmen
 | `GHOST_WISPR_DB_PATH` | No | `data/ghost-wispr.db` | SQLite database path |
 | `GHOST_WISPR_AUDIO_DIR` | No | `data/audio` | Directory for audio files |
 | `GHOST_WISPR_SILENCE_TIMEOUT` | No | `30s` | Silence duration to end a session |
-| `GHOST_WISPR_LOG_LEVEL` | No | `info` | Log level (`log_level`): `debug`, `info`, `warn` (or `warning`) or `error`, in any case. Another value logs at `info`, with a warning at start and in `GET /api/status`. The variable overrides the file for the run only: a settings save writes the file's `log_level` back, not the variable's |
+| `GHOST_WISPR_LOG_LEVEL` | No | `info` | Log level (`log_level`): `debug`, `info`, `warn` (or `warning`) or `error`, in any case. Another value logs at `info`, with a warning at start and in `GET /api/status`. The variable overrides the config for the run only: a settings save never writes the variable's level to `ghost-wispr.local.yaml` |
 | `GHOST_WISPR_MIC_SAMPLE_RATE` | No | `16000` | Preferred microphone sample rate |
 | `GHOST_WISPR_MIC_SAMPLE_RATES` | No | `48000,44100,32000,24000` | Fallback sample rates to try |
 | `GHOST_WISPR_GDRIVE_FOLDER_ID` | No | — | Google Drive folder for audio sync |
 | `GHOST_WISPR_PUBLIC_URL` | No | — | The unit's own HTTPS address (`public_url`), such as its tailnet name: pages there may use the API, and Envoy events link to sessions under it |
-| `GHOST_WISPR_RECORDING_RULES` | No | — | The rules the web UI shows under Recording rules (`recording_rules`), as a JSON list of strings. A settings save writes them into `ghost-wispr.yaml`, where they stay after the variable is removed |
+| `GHOST_WISPR_RECORDING_RULES` | No | — | The rules the web UI shows under Recording rules (`recording_rules`), as a JSON list of strings. A settings save writes them into `ghost-wispr.local.yaml`, where they stay after the variable is removed |
 | `GHOST_WISPR_ENVOY_ENABLED`, `GHOST_WISPR_ENVOY_HUB_URL` | No | `false`, — | Publish session events to the Envoy hub's listener (`envoy_enabled`, `envoy_hub_url`; [Envoy events](#envoy-events)). It turns only the events on or off: the meeting voice's own Envoy session follows `concierge.envoy_url` alone |
 | `google_credentials_file` | No | — | Authoritative Google credential file, for Google Drive and each provider that signs in with Google; when empty, Application Default Credentials are used |
 

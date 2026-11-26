@@ -303,8 +303,8 @@ if provisioner_function render_models_env "$work_dir/missing.env" >/dev/null 2>&
 fi
 
 for file in "$provisioner" "$test_root/docs/pi-setup.md"; do
-  grep -Fq -- 'replaces settings saved in the UI' "$file" \
-    || fail "$file does not say --models replaces settings saved in the UI"
+  grep -Fq -- 'Settings saved on the page stay in the local settings file' "$file" \
+    || fail "$file does not say settings saved on the page stay in the local settings file"
 done
 
 printf 'provision models test passed\n'

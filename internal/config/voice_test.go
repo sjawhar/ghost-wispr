@@ -98,14 +98,16 @@ dispatch_token: from-the-file
 	if err := store.Update(func(c *Config) { c.LogLevel = "debug" }); err != nil {
 		t.Fatal(err)
 	}
-	saved, err := os.ReadFile(path)
+	restarted, _, err := NewStore(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"model: deepgram/aura-2-thalia-en", "dispatch_url: https://dispatch.example.test"} {
-		if !strings.Contains(string(saved), want) {
-			t.Errorf("a settings save dropped %q:\n%s", want, saved)
-		}
+	if got := restarted.Get(); got.TTS.Model != "deepgram/aura-2-thalia-en" || got.Concierge.DispatchURL != "https://dispatch.example.test" {
+		t.Errorf("after a settings save tts.model %q, concierge.dispatch_url %q; want the file's", got.TTS.Model, got.Concierge.DispatchURL)
+	}
+	saved, err := os.ReadFile(LocalSettingsPath(path))
+	if err != nil {
+		t.Fatal(err)
 	}
 	if strings.Contains(string(saved), "from-the-env") {
 		t.Errorf("a settings save wrote the Dispatch token:\n%s", saved)
@@ -157,7 +159,7 @@ func TestThePausedListenerComesFromTheEnvironmentForAnAcceptanceRun(t *testing.T
 	if err := store.Update(func(c *Config) { c.LogLevel = "debug" }); err != nil {
 		t.Fatal(err)
 	}
-	saved, err := os.ReadFile(path)
+	saved, err := os.ReadFile(LocalSettingsPath(path))
 	if err != nil {
 		t.Fatal(err)
 	}

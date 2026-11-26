@@ -72,8 +72,8 @@ func TestGetConfigServesTheRecordingRules(t *testing.T) {
 
 // TestOpenAPISpecSaysASaveWritesTheRulesOverride fails if the OpenAPI spec's
 // recording_rules does not say that a settings save writes the rules
-// GHOST_WISPR_RECORDING_RULES gives into the config file, where they stay
-// once the variable is removed.
+// GHOST_WISPR_RECORDING_RULES gives into the local settings file, where they
+// stay once the variable is removed.
 func TestOpenAPISpecSaysASaveWritesTheRulesOverride(t *testing.T) {
 	raw, err := OpenAPISpecJSON()
 	if err != nil {
@@ -85,7 +85,7 @@ func TestOpenAPISpecSaysASaveWritesTheRulesOverride(t *testing.T) {
 	}
 	description, _ := dig(t, spec, "paths", "/api/config", "get", "responses", "200", "content", "application/json",
 		"schema", "properties", "recording_rules", "description").(string)
-	for _, words := range []string{"PATCH /api/config", "writes the override's rules into the config file", "after the variable is removed"} {
+	for _, words := range []string{"PATCH /api/config", "writes the override's rules into the local settings file", "ghost-wispr.local.yaml", "after the variable is removed"} {
 		if !strings.Contains(description, words) {
 			t.Errorf("recording_rules description %q does not say %q", description, words)
 		}

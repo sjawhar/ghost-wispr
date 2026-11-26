@@ -185,6 +185,7 @@ func TestPatchConfigRefusesAReadOnlyKey(t *testing.T) {
 		if after, err := os.ReadFile(path); err != nil || !bytes.Equal(after, beforeConfig) {
 			t.Errorf("a refused PATCH rewrote the config file (%v)", err)
 		}
+		assertNoLocalSettings(t, path)
 		if after, err := os.ReadFile(envPath); err != nil || string(after) != originalEnv {
 			t.Errorf("a refused PATCH rewrote .env to %q (%v), want %q", after, err, originalEnv)
 		}
@@ -234,6 +235,7 @@ func TestPatchConfigRefusesAKeyForAProviderThatSignsInAnotherWay(t *testing.T) {
 			if after, err := os.ReadFile(path); err != nil || !bytes.Equal(after, before) {
 				t.Errorf("a refused PATCH rewrote the config file (%v)", err)
 			}
+			assertNoLocalSettings(t, path)
 			if n := announced.Load(); n != 0 {
 				t.Errorf("a refused PATCH announced %d config changes", n)
 			}
@@ -370,6 +372,7 @@ func TestPatchConfigRefusesTheRemovedFields(t *testing.T) {
 			if after, err := os.ReadFile(path); err != nil || !bytes.Equal(after, before) {
 				t.Errorf("a refused PATCH rewrote the config file (%v)", err)
 			}
+			assertNoLocalSettings(t, path)
 			if n := announced.Load(); n != 0 {
 				t.Errorf("a refused PATCH announced %d config changes", n)
 			}

@@ -29,8 +29,8 @@ func TestLocalSettingsPath(t *testing.T) {
 
 // TestAPageSaveSurvivesANewReleaseConfig fails if a settings save rewrites the
 // release template: replacing that template would lose the saved timeout and
-// leave its new rules unavailable. Before local settings existed, writeYAML
-// caused that loss by writing the timeout into the release config itself.
+// leave its new rules unavailable. Control: a store that writes the whole
+// config into the release file loses 45s when the new template replaces it.
 func TestAPageSaveSurvivesANewReleaseConfig(t *testing.T) {
 	clearEnv(t)
 	path := writeConfig(t, "silence_timeout: 30s\nrecording_rules:\n  - First release rule.\n")
@@ -214,4 +214,50 @@ func TestABrokenLocalSettingsFileWarnsAndUsesTheReleaseConfig(t *testing.T) {
 		}
 	}
 	t.Errorf("warnings %q do not name the broken local settings file and skipped page saves", warnings)
+}
+
+// TestAnEnvFailureRestoresTheLocalSettingsFile fails if a save that cannot
+// write .env leaves its own values in the local settings file, or touches the
+// release config while it rolls back.
+func TestAnEnvFailureRestoresTheLocalSettingsFile(t *testing.T) {
+	clearEnv(t)
+	path := writeConfig(t, "silence_timeout: 30s\n")
+	release, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	localPath := LocalSettingsPath(path)
+	localBefore := []byte("gc_max_age_days: 7\n")
+	if err := os.WriteFile(localPath, localBefore, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// A directory where .env must be: the rename of the new .env over it fails.
+	envPath := filepath.Join(filepath.Dir(path), ".env")
+	if err := os.Mkdir(envPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(envPath, "keep"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	store, _, err := NewStoreWithEnv(path, envPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = store.Update(func(c *Config) {
+		c.SilenceTimeout = "45s"
+		_ = c.SetAPIKey("openai", "sk-example")
+	})
+	if err == nil {
+		t.Fatal("a save whose .env write failed succeeded")
+	}
+	if got := store.Get().SilenceTimeout; got != "30s" {
+		t.Errorf("silence_timeout after the failed save = %q, want 30s", got)
+	}
+	if after, _ := os.ReadFile(localPath); !bytes.Equal(after, localBefore) {
+		t.Errorf("the failed save left the local settings file as:\n%s\nwant:\n%s", after, localBefore)
+	}
+	if after, _ := os.ReadFile(path); !bytes.Equal(after, release) {
+		t.Errorf("the failed save changed the release config:\n%s", after)
+	}
 }

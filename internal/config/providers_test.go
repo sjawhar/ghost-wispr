@@ -417,7 +417,8 @@ func TestRoleModelsComeFromTheEnvironment(t *testing.T) {
 }
 
 // TestASettingsSaveKeepsTheProviders fails if a settings save drops a provider,
-// its sign-in or its labels from the file, or writes a key into it.
+// its sign-in or its labels after a restart, or writes a key into the local
+// settings file.
 func TestASettingsSaveKeepsTheProviders(t *testing.T) {
 	clearVoiceEnv(t)
 	t.Setenv(EnvPrefix+"DEEPGRAM_API_KEY", "dg-secret-example")
@@ -429,12 +430,12 @@ func TestASettingsSaveKeepsTheProviders(t *testing.T) {
 	if err := store.Update(func(c *Config) { c.SilenceTimeout = "45s" }); err != nil {
 		t.Fatal(err)
 	}
-	data, err := os.ReadFile(path)
+	data, err := os.ReadFile(LocalSettingsPath(path))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if strings.Contains(string(data), "dg-secret-example") {
-		t.Fatalf("the saved file holds the Deepgram key:\n%s", data)
+		t.Fatalf("the local settings file holds the Deepgram key:\n%s", data)
 	}
 	reloaded, _, err := Load(path)
 	if err != nil {
@@ -478,7 +479,8 @@ func TestASettingsChangeRefusesAModelItsProviderCannotServe(t *testing.T) {
 
 // TestASavedProviderKeyGoesToTheEnvFile fails if a key saved for a provider
 // that signs in with one is not written to .env under the variable its
-// auth.env names, or is written into the YAML file.
+// auth.env names, or is written into the release config or the local
+// settings file.
 func TestASavedProviderKeyGoesToTheEnvFile(t *testing.T) {
 	clearVoiceEnv(t)
 	dir := t.TempDir()
@@ -500,9 +502,14 @@ func TestASavedProviderKeyGoesToTheEnvFile(t *testing.T) {
 	if !strings.Contains(string(env), "GHOST_WISPR_DEEPGRAM_API_KEY=dg-saved\n") || !strings.Contains(string(env), "GHOST_WISPR_DISPATCH_TOKEN=kept\n") {
 		t.Errorf(".env after the save:\n%s\nwant the Deepgram key under its variable and the other entries kept", env)
 	}
-	yamlData, _ := os.ReadFile(path)
-	if strings.Contains(string(yamlData), "dg-saved") {
-		t.Errorf("the key reached the YAML file:\n%s", yamlData)
+	for _, yamlPath := range []string{path, LocalSettingsPath(path)} {
+		yamlData, err := os.ReadFile(yamlPath)
+		if err != nil && !os.IsNotExist(err) {
+			t.Fatal(err)
+		}
+		if strings.Contains(string(yamlData), "dg-saved") {
+			t.Errorf("the key reached %s:\n%s", yamlPath, yamlData)
+		}
 	}
 	reopened, _, err := NewStoreWithEnv(path, envPath)
 	if err != nil {

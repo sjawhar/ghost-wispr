@@ -455,13 +455,15 @@ and the gateway check in `deploy/pi/provision_models_test.sh`, and `internal/con
 ## Enable models and Drive sync
 
 Run the models step after the shared drive exists and its members are added. It takes the
-shared-drive ID and rejects an absent or malformed one. It replaces settings saved in the UI
-with `deploy/pi/files/ghost-wispr.yaml` rendered with that ID,
+shared-drive ID and rejects an absent or malformed one. It renders
+`deploy/pi/files/ghost-wispr.yaml` with that ID,
 `gdrive_sync_enabled: true` and `gc_enabled: true`, installs the result over
 `/opt/ghost-wispr/ghost-wispr.yaml`, removes from `/opt/ghost-wispr/.env` each variable Ghost Wispr
 no longer reads (an old Envoy webhook signing key, and those of the settings that providers
 replaced: README, "Removed settings"), and
-restarts Ghost Wispr. The credential files from the full provisioner stay as they are. A later
+restarts Ghost Wispr. Settings saved on the page stay in the local settings file,
+`/opt/ghost-wispr/ghost-wispr.local.yaml`, and apply over the installed config (README,
+"Configuration"). The credential files from the full provisioner stay as they are. A later
 full-provisioner run keeps the drive ID and both enablements. The models step refuses before it
 writes anything if a line of `.env`, or the environment of `ghost-wispr`'s user manager, could set
 `GHOST_WISPR_CONFIG`, which would have the recorder load another file than the config it installs,
@@ -524,11 +526,13 @@ them resumes a pause made by any other, and a resume from a button checks the re
 one from the web page does. A long press of the power button is left to the Pi, which powers off.
 
 `update.sh` replaces only the binary, so a provisioned unit gets a key added to the template only
-at its next `provision.sh` run, or its next `provision.sh --models` run, which also replaces
-settings saved in the UI. To turn the Jabra's button off or on without either, put
-`GHOST_WISPR_JABRA_MUTE_BUTTON=false` or `GHOST_WISPR_JABRA_MUTE_BUTTON=true` in
-`/opt/ghost-wispr/.env`, which overrides the YAML, and restart `ghost-wispr.service`. A full
-`provision.sh` run rewrites `.env`, and the template's setting applies again. Turn it off while
+at its next `provision.sh` run, or its next `provision.sh --models` run. Settings saved on the page
+stay in the local settings file through both runs. To turn the Jabra's button off or on without
+either, put `GHOST_WISPR_JABRA_MUTE_BUTTON=false` or `GHOST_WISPR_JABRA_MUTE_BUTTON=true` in
+`/opt/ghost-wispr/.env`, which overrides the YAML, and restart `ghost-wispr.service`. A settings
+save on the page while that line is set writes its value to the local settings file, where it
+stays after the line is removed. A full `provision.sh` run rewrites `.env`, and the template's
+setting applies again unless the local settings file sets it. Turn it off while
 recording, or unplug the Jabra and plug it in again afterwards: Ghost Wispr leaves the Jabra's
 light as it last set it.
 

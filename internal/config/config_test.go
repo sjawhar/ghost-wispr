@@ -153,8 +153,8 @@ func TestGCLimitsZeroMeansNoLimit(t *testing.T) {
 	}
 }
 
-// "No limit" set in the settings page survives a restart: the config file
-// it writes reads back as 0, not as the default.
+// "No limit" set in the settings page survives a restart: the local settings
+// file it writes reads back as 0, not as the default.
 func TestGCNoLimitSurvivesARestart(t *testing.T) {
 	clearEnv(t)
 	path := writeConfig(t, "gc_max_age_days: 30\n")
@@ -175,11 +175,17 @@ func TestGCNoLimitSurvivesARestart(t *testing.T) {
 	}
 }
 
-// A mutation TryUpdate refuses is rolled back whole: nothing written, no
-// callback, even for the fields set before it refused.
+// A mutation TryUpdate refuses is rolled back whole: neither the release
+// config nor the local settings file changes, and no callback fires, even for
+// the fields set before it refused.
 func TestTryUpdateRollsBackARefusedMutation(t *testing.T) {
 	clearEnv(t)
 	path := writeConfig(t, "gc_max_age_days: 30\n")
+	localPath := LocalSettingsPath(path)
+	localBefore := []byte("gc_max_audio_size_mb: 512\n")
+	if err := os.WriteFile(localPath, localBefore, 0o644); err != nil {
+		t.Fatal(err)
+	}
 	store, _, err := NewStore(path)
 	if err != nil {
 		t.Fatal(err)
@@ -202,7 +208,10 @@ func TestTryUpdateRollsBackARefusedMutation(t *testing.T) {
 		t.Errorf("refused mutation kept: gc_enabled %v, gc_max_age_days %d", cfg.GCEnabled, cfg.GCMaxAgeDays)
 	}
 	if after, _ := os.ReadFile(path); !bytes.Equal(after, before) {
-		t.Errorf("refused mutation rewrote the config file:\n%s", after)
+		t.Errorf("refused mutation rewrote the release config:\n%s", after)
+	}
+	if after, _ := os.ReadFile(localPath); !bytes.Equal(after, localBefore) {
+		t.Errorf("refused mutation rewrote the local settings file:\n%s", after)
 	}
 	if called {
 		t.Error("refused mutation fired a change callback")
