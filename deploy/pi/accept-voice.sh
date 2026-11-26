@@ -899,8 +899,8 @@ setting() {
 
 # provider_api NAME: the api of provider NAME in the release config (providers.NAME.api), read at
 # the provider's own level, from a config written one setting a line, as the template writes it. A
-# settings save writes no provider to the local settings file. It fails when the config names no
-# such provider, or none with an api.
+# settings save never writes a provider's api to the local settings file. It fails when the config
+# names no such provider, or none with an api.
 provider_api() {
   awk -v name="$1" '
     /^[^[:space:]#]/ { inside = ($0 ~ /^providers:[[:space:]]*$/); entry_indent = ""; entry = ""; next }

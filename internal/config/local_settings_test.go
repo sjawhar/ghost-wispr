@@ -426,9 +426,10 @@ func TestAnEnvFailureRestoresTheLocalSettingsFile(t *testing.T) {
 
 // TestAProviderKeySaveWritesNoProvidersToTheLocalSettingsFile fails if a page
 // save of a provider key writes a providers entry to the local settings file:
-// the key goes to .env, and a providers entry there would replace the release
-// config's provider from then on. The save also changes silence_timeout, so
-// the local settings file exists and the check reads a file the save wrote.
+// the key goes to .env, and a providers entry there would hide what a new
+// release config changes in that provider. The save also changes
+// silence_timeout, so the local settings file exists and the check reads a
+// file the save wrote.
 func TestAProviderKeySaveWritesNoProvidersToTheLocalSettingsFile(t *testing.T) {
 	clearVoiceEnv(t)
 	dir := t.TempDir()
