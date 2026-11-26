@@ -304,6 +304,7 @@ Moving the role back to a direct provider is the same change.
 The settings page lists each provider: its API, address and sign-in, the roles that use it, and
 whether it signed in when last checked; an `api_key` provider whose `auth.read_only` is not true has
 a field for its key. A deployment-owned key says it cannot be changed there. The check signs in, and
+where the API has a cheap read the credential must pass (a model list,
 Deepgram's projects, the ElevenLabs user, Cloud Text-to-Speech's voices, or for Vertex AI a count
 of a short text's tokens on each model the roles call there, which costs nothing and needs only the
 predict permission), makes it; a Vertex AI refusal or 404 (no such model or location) of any of
