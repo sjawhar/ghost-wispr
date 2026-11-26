@@ -135,10 +135,12 @@ read_serve_conf() {
 }
 
 # render_credentials DIR writes into DIR the two credential files that pi.env renders: the fields
-# that gcloud's create-cred-config writes for an X.509 credential, with the paths of the Pi.
+# that gcloud's create-cred-config writes for an X.509 credential, with the paths of the Pi. With an
+# X.509 credential, gcloud impersonates through the mTLS endpoint, iamcredentials.mtls.googleapis.com
+# (the office Pi's google-credentials.json holds it so).
 render_credentials() {
   jq -n --arg audience "//iam.googleapis.com/$PI_WORKLOAD_PROVIDER" \
-    --arg impersonation "https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/$PI_SERVICE_ACCOUNT:generateAccessToken" \
+    --arg impersonation "https://iamcredentials.mtls.googleapis.com/v1/projects/-/serviceAccounts/$PI_SERVICE_ACCOUNT:generateAccessToken" \
     --arg config "$CREDENTIAL_CONFIG" '{
       universe_domain: "googleapis.com",
       type: "external_account",
