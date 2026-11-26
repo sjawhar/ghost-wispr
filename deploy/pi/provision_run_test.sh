@@ -31,8 +31,8 @@ trap 'rm -rf -- "$work_dir"' EXIT
 # The cases of this test, each of which begin names.
 readonly case_names=(bundle-refused not-a-release first-run one-update-start release-files-first
   credentials-written bootstrap-files no-env-no-system-files groups-and-linger join-command idempotent
-  credentials-same credentials-differ client-id newer-release bootstrap-repair serve update-fails
-  recorder-unit join route-check manager-env key certificate models)
+  credentials-same credentials-differ client-id newer-release newer-release-certificate bootstrap-repair
+  serve update-fails recorder-unit join route-check manager-env key certificate models)
 current_case=setup
 ran_cases=' '
 
@@ -559,18 +559,20 @@ run_provision() {
     bash "$dir/provision.sh" "$@" <"${RUN_INPUT:-/dev/null}" >"$work_dir/out" 2>&1 || rc=$?
 }
 
-# make_release NAME COMMIT ANSWER publishes the fake release NAME of COMMIT, whose binary answers
-# /api/version with ANSWER once it runs, and answers pi-secrets with two secret lines. Each file of
-# its deploy set but provision.sh and serve.conf ends with the line "# release NAME", so the files of
-# two releases differ. provision.sh runs from $TEST_RELEASES/NAME/ghost-wispr-pi-deploy, which
+# make_release NAME COMMIT ANSWER [CERTIFICATE] publishes the fake release NAME of COMMIT, whose
+# binary answers /api/version with ANSWER once it runs, and answers pi-secrets with two secret lines
+# and, given CERTIFICATE, a version number, a newer certificate of that version, staged as the real
+# pi-secrets stages one ("certificate version N" in device.crt). Each file of its deploy set but
+# provision.sh and serve.conf ends with the line "# release NAME", so the files of two releases
+# differ. provision.sh runs from $TEST_RELEASES/NAME/ghost-wispr-pi-deploy, which
 # build-deploy-tarball.sh --stage writes; the tarball of that directory, the binary and their
 # .sha256 files are the assets of $TEST_RELEASES/NAME/release.json.
 make_release() {
-  local name=$1 commit=$2 answer=$3 dir=$TEST_RELEASES/$1 file
+  local name=$1 commit=$2 answer=$3 certificate=${4:-} dir=$TEST_RELEASES/$1 file
   rm -rf -- "$dir"
   mkdir -p -- "$dir"
   {
-    printf '#!/usr/bin/env bash\n# answers commit %s\n' "$answer"
+    printf '#!/usr/bin/env bash\n# answers commit %s\ncertificate=%s\n' "$answer" "$certificate"
     cat <<'EOF'
 case ${1:-} in
   link-versions)
@@ -587,6 +589,10 @@ case ${1:-} in
     printf '%s\n' GHOST_WISPR_DEEPGRAM_API_KEY=test-key GHOST_WISPR_DISPATCH_TOKEN=test-token >"$out/secrets.env"
     chmod 0600 "$out/secrets.env"
     printf 'pi-secrets: read the two secrets\n'
+    if [[ -n $certificate ]]; then
+      printf 'certificate version %s\n' "$certificate" >"$out/device.crt"
+      printf 'pi-secrets: certificate version %s, not after 2027-12-01T00:00:00Z: newer and signs in\n' "$certificate"
+    fi
     ;;
   *) exit 3 ;;
 esac
@@ -1042,6 +1048,59 @@ TEST_SELF_STATUS=$joined_status run_provision "$TEST_RELEASES/c/ghost-wispr-pi-d
 expect_ran 'release c on a set that deploy.verified does not list'
 said 'so its .prev copies stay as they are' || fail "provision.sh did not say it kept the .prev copies as they are: $(<"$work_dir/out")"
 [[ $(cd -- "$deploy" && sha256sum -- *.prev) == "$prev_copies" ]] || fail 'provision.sh changed the .prev copies of the set verified last'
+
+# newer-release-certificate: the certificate the Pi runs goes back with its set. The nightly update
+# installs each newer certificate with device.crt.version, its version, and a failed install puts
+# both back from device.crt.prev and device.crt.version.prev. So provision.sh from a newer release
+# keeps the Pi's certificate and its version file with the set: otherwise those copies still hold
+# the certificate before it, and a failed install would put that one back. Where the Pi has no
+# device.crt.version, as before its first nightly certificate, a stale device.crt.version.prev goes,
+# as update.sh's keep_previous removes the .prev copy of a file the Pi does not have. Release d's
+# binary stages certificate version 8 and never answers its commit.
+begin newer-release-certificate
+readonly commit_d=dddddddddddddddddddddddddddddddddddddddd
+make_release d "$commit_d" "$wrong_commit" 8
+# certificate_file NAME prints the content of DEPLOY_DIR/NAME, or "missing".
+certificate_file() {
+  if [[ -f $deploy/$1 ]]; then
+    printf '%s\n' "$(<"$deploy/$1")"
+  else
+    printf 'missing\n'
+  fi
+}
+for history in 'with a version file' 'with no version file'; do
+  new_pi
+  real_provision a
+  expect_ran "release a on a new Pi, $history"
+  # Certificate version 7 runs; an earlier nightly install kept version 6 as the .prev copies.
+  printf 'certificate version 7\n' >"$deploy/device.crt"
+  printf 'certificate version 6\n' >"$deploy/device.crt.prev"
+  printf '6\n' >"$deploy/device.crt.version.prev"
+  want_version_prev=missing
+  if [[ $history == 'with a version file' ]]; then
+    printf '7\n' >"$deploy/device.crt.version"
+    want_version_prev=7
+  fi
+  release_a=$(installed_set)
+  real_provision d
+  expect_refused "release d with certificate version 8, $history" 'the nightly update failed'
+  [[ ! -s $TEST_LOG.errors ]] || fail "release d, $history: $(<"$TEST_LOG.errors")"
+  said 'pi-secrets: certificate version 8, not after 2027-12-01T00:00:00Z: newer and signs in' \
+    || fail "control, $history: pi-secrets staged no certificate: $(<"$work_dir/out")"
+  if ! said "did not answer /api/version with commit $commit_d" || ! said 'restored'; then
+    fail "the update did not install release d and roll it back, $history: $(<"$work_dir/out")"
+  fi
+  [[ $(installed_set) == "$release_a" ]] || fail "after the failed install of release d, $history, the Pi is not on release a's set"
+  [[ $(certificate_file device.crt) == 'certificate version 7' ]] \
+    || fail "after the failed install of release d, $history, device.crt is [$(certificate_file device.crt)], not certificate version 7, which the Pi ran"
+  [[ $(certificate_file device.crt.prev) == 'certificate version 7' ]] \
+    || fail "provision.sh did not keep the Pi's certificate as device.crt.prev, $history: [$(certificate_file device.crt.prev)]"
+  [[ $(certificate_file device.crt.version.prev) == "$want_version_prev" ]] \
+    || fail "device.crt.version.prev is [$(certificate_file device.crt.version.prev)], want [$want_version_prev], $history"
+  if [[ $history == 'with a version file' && $(certificate_file device.crt.version) != 7 ]]; then
+    fail "after the failed install of release d, device.crt.version is [$(certificate_file device.crt.version)], not 7"
+  fi
+done
 
 # bootstrap-repair: a bootstrap file that is broken on a Pi that runs release a, here an update unit
 # whose ExecStart names no program, so no nightly run starts and no release can install a fix. The
