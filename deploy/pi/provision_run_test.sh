@@ -183,7 +183,9 @@ EOF
 #   update unit it loaded instead, the real launcher and update.sh in the deploy directory, into
 #   the journal $TEST_JOURNAL, and fails as systemd does when that program fails or is no program.
 # - restart ghost-wispr.service starts the recorder, with TEST_REAL_UPDATE=1: it answers the commit
-#   that the installed binary's "# answers commit" line names, and is-active says it runs.
+#   that the installed binary's "# answers commit" line names, and is-active says it runs. show -p
+#   ExecMainStartTimestamp --timestamp=us+utc --value prints the real time of that start, as systemd
+#   prints it, or nothing while no recorder runs.
 cat >"$bin/systemctl" <<'EOF'
 #!/usr/bin/env bash
 printf 'systemctl %s\n' "$*" >>"$TEST_LOG"
@@ -216,6 +218,13 @@ case "$*" in
     ;;
   'is-active --quiet ghost-wispr.service') [[ -f $TEST_STATE/active ]] ;;
   'show -p MainPID --value ghost-wispr.service') printf '0\n' ;;
+  'show -p ExecMainStartTimestamp --timestamp=us+utc --value ghost-wispr.service')
+    if [[ -f $TEST_STATE/active ]]; then
+      cat -- "$TEST_STATE/main-start"
+    else
+      printf '\n'
+    fi
+    ;;
   'show -p DropInPaths --value '*) printf '\n' ;;
   show-environment)
     if [[ -f ${TEST_MANAGER_ENV:-} ]]; then
@@ -275,6 +284,7 @@ case "$*" in
       commit=$(sed -n 's/^# answers commit //p' "$TEST_DEPLOY/ghost-wispr" 2>/dev/null) || commit=''
       [[ -n $commit ]] || { printf 'ghost-wispr.service: status=203/EXEC\n' >&2; exit 1; }
       printf '%s\n' "$commit" >"$TEST_STATE/running-commit"
+      "$TEST_REAL_DATE" -u '+%a %Y-%m-%d %H:%M:%S.%6N UTC' >"$TEST_STATE/main-start"
       : >"$TEST_STATE/active"
     fi
     ;;
