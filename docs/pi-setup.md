@@ -106,6 +106,7 @@ Add each version on your own device, in a Ghost Wispr checkout, with your own Go
 in a mode-0600 file that it removes, never in a command argument, and adds no version for an empty
 value. The Deepgram key, which the block reads without showing it:
 
+<!-- runbook_blocks_test.sh: deepgram-key -->
 ```bash
 (source "${GHOST_WISPR_PI_ENV:-deploy/pi/files/pi.env}" && umask 077 &&
   f=$(mktemp) && trap 'rm -f -- "$f"' EXIT &&
@@ -134,10 +135,21 @@ adds the new token as the secret's latest version:
 
 It prints the new token's id, its name and `"scopes":[]`, and the version that it added, never the
 token: Dispatch shows a token only in the answer to its mint. Revoke the token that the Pi used
-before only once the Pi uses the new one: the two hashes that the block below prints are equal,
-neither is `e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855` (the hash of
-nothing), and the `whoami` read prints `{"scopes":[]}`. The read sends the Pi's token on standard
-input, on the Pi. Run the block on your own device, in a checkout, with your own Google login:
+before only once the Pi runs with the new one. Run the block below on your own device, in a
+checkout, with your own Google login; the revoke waits for all three of its readings:
+
+1. The two hashes it prints are equal, and neither is
+   `e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855` (the hash of nothing): the
+   Pi's `.env` holds the secret's latest version.
+2. The recorder started after the update wrote that `.env`. The block reads the recorder's last
+   start line (`… web UI on …`) in its journal of this boot (`journalctl --boot=0`) and the time
+   `.env` was written, and prints `the recorder started at <time>, after .env was written at
+   <time>`. It stops when the start came first, or when the journal of this boot has no start. The
+   update writes `.env` before it restarts the recorder, and prints its `installed commit` or
+   `installed secrets` line after the restart, so the start is compared with `.env`, not with that
+   line.
+3. The `whoami` read prints `{"scopes":[]}`: Dispatch accepts the Pi's token. The read sends the
+   token on standard input, on the Pi.
 
 <!-- runbook_blocks_test.sh: token-check -->
 ```bash
@@ -146,6 +158,13 @@ input, on the Pi. Run the block on your own device, in a checkout, with your own
     tr -d '\n' | shasum -a 256 &&
   gcloud secrets versions access latest --secret="$PI_DISPATCH_TOKEN_SECRET" --project="$PI_GCP_PROJECT" |
     tr -d '\n' | shasum -a 256 &&
+  ssh "ghost-wispr@$PI_HOST" 'w=$(stat -c %.6Y /opt/ghost-wispr/.env) &&
+    s=$(sudo -n journalctl _SYSTEMD_USER_UNIT=ghost-wispr.service --boot=0 -o short-unix --no-pager |
+      grep "web UI on" | tail -n 1 | cut -d " " -f 1) &&
+    { [ -n "$s" ] || { echo "found no recorder start in the journal of this boot" >&2; false; }; } &&
+    if awk -v s="$s" -v w="$w" "BEGIN { exit !(s > w) }"; then
+      echo "the recorder started at $s, after .env was written at $w"
+    else echo "the recorder started at $s, before .env was written at $w" >&2; false; fi' &&
   ssh "ghost-wispr@$PI_HOST" "sed -n 's/^GHOST_WISPR_DISPATCH_TOKEN[=]/Authorization: Bearer /p' /opt/ghost-wispr/.env |
     curl -fsS -H @- '$PI_DISPATCH_URL/api/v1/whoami' | jq -c '{scopes}'")
 ```
@@ -1046,14 +1065,45 @@ deploy/pi/check-deploy.sh
 ```
 
 Each of its seven checks must print `PASS` ("Update and inspect"). For a release that changes
-`mic_device` or the Jabra's Mute button, also check the Pi: the config must hold `mic_device: J75`,
-`/api/status` no `No microphone found` warning, and `capture_state` must be `capturing` or
-`paused`. The Jabra's Mute button must be on: each line the last `grep` prints ends in `true`.
+`mic_device` or the Jabra's Mute button, also check the Pi: `/api/status` must hold no
+`No microphone found` warning, and `capture_state` must be `capturing` or `paused`:
 
 ```bash
 curl -fsS https://ghost-wispr.tail12ec1c.ts.net/api/status | jq '{capture_state, warnings}'
-ssh ghost-wispr@ghost-wispr "grep '^mic_device:' /opt/ghost-wispr/ghost-wispr.yaml"
-ssh ghost-wispr@ghost-wispr "grep -s -E '^(jabra_mute_button:|GHOST_WISPR_JABRA_MUTE_BUTTON=)' /opt/ghost-wispr/ghost-wispr.yaml /opt/ghost-wispr/.env /opt/ghost-wispr/ghost-wispr.local.yaml"
+```
+
+Then check the two values the recorder runs with. `/api/config` shows neither, so the block below
+reads each as the recorder resolves it: `GHOST_WISPR_MIC_DEVICE` or `GHOST_WISPR_JABRA_MUTE_BUTTON`
+in the running process's environment (from `.env` or its user manager), else the local settings
+file `ghost-wispr.local.yaml`, else the installed `ghost-wispr.yaml`. It prints those two settings
+alone, never the process's other variables, which hold the Pi's secrets. Its lines must read
+`mic_device: J75` and `jabra_mute_button: true`, each with where its value comes from.
+
+<!-- runbook_blocks_test.sh: running-settings -->
+```bash
+(source "${GHOST_WISPR_PI_ENV:-deploy/pi/files/pi.env}" &&
+  ssh "ghost-wispr@$PI_HOST" 'bash -s' <<'EOF'
+d=/opt/ghost-wispr
+pid=$(XDG_RUNTIME_DIR=/run/user/$(id -u) systemctl --user show -p MainPID --value ghost-wispr.service)
+[ "${pid:-0}" != 0 ] || { echo 'ghost-wispr.service runs no process' >&2; exit 1; }
+environment=$(tr '\0' '\n' <"/proc/$pid/environ") || exit 1
+for setting in mic_device:GHOST_WISPR_MIC_DEVICE jabra_mute_button:GHOST_WISPR_JABRA_MUTE_BUTTON; do
+  key=${setting%%:*} variable=${setting#*:}
+  value=$(sed -n "s/^$variable=//p" <<<"$environment" | tail -n 1)
+  from="$variable in the recorder's environment"
+  if [ -n "$value" ] && [ "$key" = jabra_mute_button ]; then
+    case ${value,,} in true | 1) value=true ;; *) value=false ;; esac
+  fi
+  if [ -z "$value" ]; then
+    value=$(sed -n "s/^$key: *//p" "$d/ghost-wispr.local.yaml" 2>/dev/null) from=ghost-wispr.local.yaml
+  fi
+  if [ -z "$value" ]; then
+    value=$(sed -n "s/^$key: *//p" "$d/ghost-wispr.yaml") from=ghost-wispr.yaml
+  fi
+  echo "$key: ${value:-unset} (from $from)"
+done
+EOF
+)
 ```
 
 When the new release answers its commit but check 2, 3 or 4 fails, revert the change on `main`. The
