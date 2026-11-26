@@ -2134,26 +2134,31 @@ expect_installed_is "$what, then no answer" "$work_dir/before-b" device.crt devi
 # writes the secret lines pi-secrets gives, as each start does (R9).
 [[ $(grep '^start-pre ' "$state/systemctl.log" | tail -n1) == "start-pre env=$(sha "$work_dir/before-b/.env")" ]] \
   || fail "$what, then no answer: .env was not its .prev copy when the rollback's restart began: $(<"$state/systemctl.log")"
-# The start and the file times 0.05 s into one second: update.sh compares them to the microsecond,
-# so a .env 1 ms after the start restarts the recorder, and one 1 ms before it does not. Break it
-# catches: a reading of the times through date's %6N, which uutils date (Ubuntu 26.04's date, and
-# the GitHub runner's) prints wrong for a fraction under 0.1 s: there both read as the whole second.
+# The start and the file times 1 ms apart on either side of a tenth of a second: update.sh compares
+# them to the microsecond, so a .env 1 ms after the start restarts the recorder, and one 1 ms before
+# it does not. Break it catches: a reading of the times through date's %6N, which uutils date
+# (Ubuntu 26.04's date, and the GitHub runner's) prints wrong for a fraction under 0.1 s: it drops
+# the fraction's leading zeros, so 0.099500 s reads as .995000 and 0.100500 s as .100500, and each
+# of the two comparisons comes out the wrong way. (Two times with the same number of leading zeros,
+# such as 0.050 s and 0.051 s, still compare the right way through it.)
+# in_one_second START ENV: the recorder started START microseconds into a second, and .env was
+# written ENV microseconds into the same second; device.crt a second before.
 in_one_second() {
   local second
   new_pi
   install_set b
   second=$((${EPOCHREALTIME%[.,]*} - 100))
-  set_recorder_start "$second" 050000
+  set_recorder_start "$second" "$1"
   touch -d "@$((second - 1)).000000" -- "$opt/device.crt"
-  touch -d "@$second.$1" -- "$opt/.env"
+  touch -d "@$second.$2" -- "$opt/.env"
   release=b run_update
 }
-in_one_second 051000
-expect_run 'secrets-only-change, .env 1 ms after the start, 0.05 s into its second' 0 \
+in_one_second 099500 100500
+expect_run 'secrets-only-change, .env 1 ms after the start, across a tenth of a second' 0 \
   "ghost-wispr update: already current at commit $commit_b" 'ghost-wispr update: the recorder started before the installed .env; restarting it'
 [[ $(restarts) == 1 ]] || fail "secrets-only-change, .env 1 ms after the start: restarted the recorder $(restarts) times, want 1"
-in_one_second 049000
-expect_run 'secrets-only-change, .env 1 ms before the start, 0.05 s into its second' 0 "ghost-wispr update: already current at commit $commit_b"
+in_one_second 100500 099500
+expect_run 'secrets-only-change, .env 1 ms before the start, across a tenth of a second' 0 "ghost-wispr update: already current at commit $commit_b"
 expect_no_output 'secrets-only-change, .env 1 ms before the start' 'restarting it'
 [[ $(restarts) == 0 ]] || fail "secrets-only-change, .env 1 ms before the start: restarted a recorder that started on it"
 
