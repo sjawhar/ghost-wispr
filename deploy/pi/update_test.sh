@@ -116,8 +116,8 @@ mkdir -p -- "$bin" "$timeout_bin" "$fakes" "$releases"
 cat >"$fakes/after" <<'EOF'
 #!/usr/bin/env bash
 # after EVENT puts each $TEST_STATE/NAME.after-EVENT in place of $TEST_STATE/NAME, once: the fake
-# Pi's state changes at that event (download, secrets or restart). A new status program starts again
-# at its first line.
+# Pi's state changes at that event (download, secrets, system-reload or restart). A new status
+# program starts again at its first line.
 set -euo pipefail
 state=${TEST_STATE:?}
 for file in "$state"/*.after-"$1"; do
@@ -238,12 +238,13 @@ cat >"$bin/systemctl" <<'EOF'
 # - show-environment: $TEST_STATE/manager-env, else a manager's few variables; it exits
 #   $TEST_STATE/manager-env-exit (0 by default).
 # - daemon-reload logs the recorder's unit file as it reads it.
-# - restart ghost-wispr.service logs what the recorder starts on (the binary, .env, config and
-#   certificate), takes TEST_RESTART_SECONDS of the test's clock, starts the installed binary
-#   (its running image) and makes the unit active, then is the event "restart". The Nth restart
-#   does what $TEST_STATE/restart-N says: ok (the default); fail, a start job that fails while
-#   the unit stays active; fail-stop, one whose unit stops; busy-exec, a start job that fails while
-#   the installed binary runs on as a real process.
+# - restart ghost-wispr.service logs the .env its start job begins on, then runs the installed
+#   unit's ExecStartPre lines (run_start_pre), and logs what the recorder starts on after them (the
+#   binary, .env, config and certificate). It takes TEST_RESTART_SECONDS of the test's clock,
+#   starts the installed binary (its running image) and makes the unit active, then is the event
+#   "restart". The Nth restart does what $TEST_STATE/restart-N says: ok (the default); fail, a
+#   start job that fails while the unit stays active; fail-stop, one whose unit stops; busy-exec, a
+#   start job that fails while the installed binary runs on as a real process.
 # Every other call is logged as it is.
 set -euo pipefail
 state=${TEST_STATE:?}
@@ -256,6 +257,34 @@ sum() {
 unexpected() {
   printf 'fake systemctl: unexpected systemctl --user %s\n' "$*" >>"$state/errors"
   exit 1
+}
+# run_start_pre runs each ExecStartPre line of the installed ghost-wispr.service in order, as its
+# start job does: from the deploy directory, which stands for /opt/ghost-wispr, on the fake Pi's
+# network, which is up (the fake timeout answers wait-for-network.sh's probe), and with its clock
+# synchronized ($TEST_STATE/clock-synchronized is systemd-timesyncd's mark). The steps' output goes
+# to $TEST_STATE/journal.log, and the pi-secrets a step runs logs to
+# $TEST_STATE/start-pi-secrets.log, apart from update.sh's own reads. A step that fails fails the
+# start, unless its line starts with -.
+run_start_pre() {
+  local unit=$units/ghost-wispr.service line ignore command
+  [[ -f $unit ]] || return 0
+  while IFS= read -r line; do
+    ignore=false
+    if [[ $line == -* ]]; then
+      ignore=true line=${line#-}
+    fi
+    if [[ $line != /opt/ghost-wispr/* ]]; then
+      printf 'fake systemctl: ExecStartPre=%s runs no command in /opt/ghost-wispr\n' "$line" >>"$state/errors"
+      return 1
+    fi
+    read -ra command <<<"$deploy/${line#/opt/ghost-wispr/}"
+    printf 'start-pre %s\n' "$line" >>"$state/journal.log"
+    if ! (cd -- "$deploy" && TEST_PI_SECRETS_LOG="$state/start-pi-secrets.log" \
+      GHOST_WISPR_TIMESYNC_MARK="$state/clock-synchronized" GHOST_WISPR_TIMESYNC_WAITED="$state/time-sync-gave-up" \
+      "${command[@]}") >>"$state/journal.log" 2>&1; then
+      $ignore || return 1
+    fi
+  done < <(sed -n 's/^ExecStartPre=//p' "$unit")
 }
 if [[ ${1:-} != --user ]]; then
   printf 'systemctl without --user, which reaches the system manager: systemctl %s\n' "$*" >>"$state/errors"
@@ -316,6 +345,11 @@ case ${1:-} in
     [[ $* == 'restart ghost-wispr.service' ]] || unexpected "$@"
     n=$(($(cat -- "$state/restarts" 2>/dev/null || echo 0) + 1))
     echo "$n" >"$state/restarts"
+    printf 'start-pre env=%s\n' "$(sum "$deploy/.env")" >>"$state/systemctl.log"
+    if ! run_start_pre; then
+      rm -f -- "$state/active"
+      exit 1
+    fi
     printf 'restart binary=%s env=%s config=%s crt=%s\n' "$(sum "$deploy/ghost-wispr")" "$(sum "$deploy/.env")" \
       "$(sum "$deploy/ghost-wispr.yaml")" "$(sum "$deploy/device.crt")" >>"$state/systemctl.log"
     echo $(($(<"$state/clock") + ${TEST_RESTART_SECONDS:-0})) >"$state/clock"
@@ -349,7 +383,8 @@ cat >"$bin/sudo" <<'EOF'
 # The fake sudo. It refuses a call without -n, which would wait for a password where nobody can
 # type one. It runs install for real, into GHOST_WISPR_SYSTEM_ROOT alone, and tailscale (the fake),
 # and logs every call with the timeout it runs under, udevadm with the udev rule it would read and
-# the logind restart with the logind setting, in $TEST_STATE/sudo.log.
+# the logind restart with the logind setting, in $TEST_STATE/sudo.log. Each udevadm call and each
+# logind restart is the event "system-reload".
 set -euo pipefail
 state=${TEST_STATE:?}
 system_root=${GHOST_WISPR_SYSTEM_ROOT:?}
@@ -376,11 +411,13 @@ case ${1:-} in
     ;;
   udevadm)
     printf 'timeout=%s udevadm %s rules=%s\n' "$under" "${*:2}" "$(sum "$system_root/etc/udev/rules.d/99-ghost-wispr.rules")" >>"$state/sudo.log"
+    "${TEST_FAKES:?}/after" system-reload
     ;;
   systemctl)
     [[ ${*:2} == 'restart systemd-logind' ]] || unexpected "$@"
     printf 'timeout=%s systemctl restart systemd-logind logind=%s\n' "$under" \
       "$(sum "$system_root/etc/systemd/logind.conf.d/50-ghost-wispr-power-key.conf")" >>"$state/sudo.log"
+    "${TEST_FAKES:?}/after" system-reload
     ;;
   tailscale)
     printf 'timeout=%s tailscale %s\n' "$under" "${*:2}" >>"$state/sudo.log"
@@ -445,7 +482,8 @@ cat >"$timeout_bin/timeout" <<'EOF'
 # TEST_TIMEOUT_DURATION and TEST_TIMEOUT_KILL_AFTER which bound it runs under. When the real timeout
 # ends a command that hung (124, or 137 after its kill), the test's clock moves on by the bound
 # asked for, and by the kill's grace for a 137, as the real bound would have taken. Each call goes
-# to $TEST_STATE/timeout.log.
+# to $TEST_STATE/timeout.log. The fake Pi's network is up: wait-for-network.sh's probe of a TCP
+# port connects at once, and the test opens no connection.
 set -uo pipefail
 state=${TEST_STATE:?}
 kill_after=''
@@ -476,6 +514,9 @@ grace=$(seconds "${kill_after:-0}")
 cap=${TEST_TIMEOUT_REAL:-3}
 real=$((want < cap ? want : cap))
 printf 'kill-after=%s %s %s\n' "${kill_after:-none}" "$duration" "$*" >>"$state/timeout.log"
+if [[ ${1:-} == bash && ${2:-} == -c && ${3:-} == 'exec 3<>/dev/tcp/'* ]]; then
+  exit 0
+fi
 TEST_TIMEOUT_DURATION=$duration TEST_TIMEOUT_KILL_AFTER=${kill_after:-none} \
   "${TEST_REAL_TIMEOUT:?}" --kill-after=1 "$real" "$@"
 status=$?
@@ -489,14 +530,14 @@ EOF
 cat >"$fakes/pi-secrets" <<'EOF'
 #!/usr/bin/env bash
 # The fake pi-secrets, which the fake release binary runs: $1 is the binary as update.sh ran it, the
-# rest the binary's arguments. Each call goes to $TEST_STATE/pi-secrets.log: the binary, its
-# SHA-256, the timeout it runs under and each argument. As C4's pi-secrets does, it writes
-# --out/secrets.env, one --env-secret VARIABLE=SECRET a line in flag order (each VARIABLE's value
-# from $TEST_STATE/secrets), stages $TEST_STATE/certificate as --out/device.crt when that file
-# exists, and prints C4's lines, never a value. It is the event "secrets". $TEST_STATE/pi-secrets-mode
-# "fail" makes it fail as a key read failure does (R10): no secrets.env and exit 1, after the
-# certificate step has still staged $TEST_STATE/certificate, when that exists; "hang" makes it hang
-# until a timeout ends it.
+# rest the binary's arguments. Each call goes to $TEST_PI_SECRETS_LOG ($TEST_STATE/pi-secrets.log
+# by default): the binary, its SHA-256, the timeout it runs under and each argument. As C4's
+# pi-secrets does, it writes --out/secrets.env, one --env-secret VARIABLE=SECRET a line in flag
+# order (each VARIABLE's value from $TEST_STATE/secrets), stages $TEST_STATE/certificate as
+# --out/device.crt when that file exists, and prints C4's lines, never a value. It is the event
+# "secrets". $TEST_STATE/pi-secrets-mode "fail" makes it fail as a key read failure does (R10): no
+# secrets.env and exit 1, after the certificate step has still staged $TEST_STATE/certificate, when
+# that exists; "hang" makes it hang until a timeout ends it.
 set -euo pipefail
 state=${TEST_STATE:?}
 binary=$1
@@ -513,7 +554,7 @@ binary_sum=$(sha256sum -- "$binary")
   printf 'binary-sha %s\n' "${binary_sum%% *}"
   printf 'timeout %s kill-after %s\n' "${TEST_TIMEOUT_DURATION:-none}" "${TEST_TIMEOUT_KILL_AFTER:-none}"
   printf 'arg %s\n' "$@"
-} >>"$state/pi-secrets.log"
+} >>"${TEST_PI_SECRETS_LOG:-$state/pi-secrets.log}"
 out='' certificate=false env_secrets=()
 while (($#)); do
   case $1 in
@@ -716,7 +757,8 @@ new_pi() {
   printf 'INSTALLED CERTIFICATE\n' >"$opt/device.crt"
   printf 'IDLE\n' >"$state/status"
   touch -- "$state/active" "$state/systemctl.log" "$state/sudo.log" "$state/sleep.log" "$state/curl.log" \
-    "$state/timeout.log" "$state/pi-secrets.log"
+    "$state/timeout.log" "$state/pi-secrets.log" "$state/start-pi-secrets.log" "$state/journal.log" \
+    "$state/clock-synchronized"
   serve_json_for "$repo_root/deploy/pi/files/serve.conf" >"$state/serve.json"
   printf '%s\n' GHOST_WISPR_DEEPGRAM_API_KEY=dg-test-1 GHOST_WISPR_DISPATCH_TOKEN=tok-test-1 >"$state/secrets"
   echo 1000 >"$state/clock"
@@ -762,13 +804,15 @@ expect_prev_is() {
   done
 }
 
-# expect_installed_is WHAT DIR: each file of the deploy set, .env and the binary included, is
-# installed again as save_installed copied it into DIR, byte for byte.
+# expect_installed_is WHAT DIR [NAME...]: each file NAME, by default each file of the deploy set,
+# .env and the binary, is installed again as save_installed copied it into DIR, byte for byte.
 expect_installed_is() {
-  local file path
-  for file in "${set_files[@]}" .env ghost-wispr; do
+  local what=$1 dir=$2 file path
+  shift 2
+  (($#)) || set -- "${set_files[@]}" .env ghost-wispr
+  for file in "$@"; do
     path=$(installed_path "$file")
-    cmp -s -- "$2/$file" "$path" || fail "$1: $path is not, byte for byte, the $file installed before"
+    cmp -s -- "$dir/$file" "$path" || fail "$what: $path is not, byte for byte, the $file installed before"
   done
 }
 
@@ -923,7 +967,7 @@ expect_secrets_flag() {
 }
 
 # The removed .env variables of internal/config's removedEnvironment, each of which a start warns
-# about (provision.sh's REMOVED_ENV_VARIABLES).
+# about (pi-lib.sh's PI_LIB_REMOVED_ENV_VARIABLES).
 readonly removed_variables=(GCP_PROJECT GCP_LOCATION GENAI_BACKEND EMBEDDING_BACKEND EMBEDDING_LOCATION
   DEEPGRAM_MODEL BATCH_TRANSCRIPTION_PROVIDER TTS_PROVIDER TTS_API_KEY VOICE_TTS_ENGINE VOICE_TTS_MODEL
   VOICE_TTS_VOICE VOICE_TTS_LOCATION ENVOY_WEBHOOK_SECRET)
@@ -944,7 +988,7 @@ begin whole-set
 
 # It defines no fail and makes no variable readonly: update.sh and provision.sh each define their own
 # fail and a readonly DEPLOY_DIR, so a library that defined either would break whichever script
-# sourced it (the reason rollout.sh could not source provision.sh).
+# sourced it.
 if ! sourced=$(
   exec 2>&1
   DEPLOY_DIR=/opt/example
@@ -963,9 +1007,9 @@ if ! sourced=$(
 fi
 [[ $sourced == "the caller's fail" ]] || fail "pi-lib.sh changed its caller's fail or variables: $sourced"
 
-# The config renderer, moved from provision.sh's render_models_config and deployed_drive_id. With a
-# shared drive it keeps every template setting but the drive's three, adds the quoted drive ID, and
-# turns sync and GC on: GC removes only local audio that Drive holds a copy of.
+# The config renderer: pi-lib.sh's render_config_with_drive, render_config and deployed_drive_id.
+# With a shared drive it keeps every template setting but the drive's three, adds the quoted drive
+# ID, and turns sync and GC on: GC removes only local audio that Drive holds a copy of.
 with_drive=$work_dir/with-drive.yaml
 lib render_config_with_drive "$template" "$drive_id" >"$with_drive" \
   || fail 'render_config_with_drive refused a valid shared-drive ID'
@@ -999,8 +1043,8 @@ done
 if lib render_config_with_drive "$work_dir/missing.yaml" "$drive_id" >/dev/null 2>&1; then
   fail 'render_config_with_drive succeeded without a template'
 fi
-# render_config keeps the drive the deployed config names, as render_models_config or yaml.v3 wrote
-# it, so a release does not turn Drive sync and GC off.
+# render_config keeps the drive the deployed config names, as render_config_with_drive or yaml.v3
+# wrote it, so a release does not turn Drive sync and GC off.
 deployed=$work_dir/deployed.yaml
 for line in "gdrive_folder_id: \"$drive_id\"" "gdrive_folder_id: $drive_id"; do
   printf '%s\n' 'silence_timeout: 45s' "$line" 'gdrive_sync_enabled: true' >"$deployed"
@@ -1026,10 +1070,10 @@ for deployed in "$work_dir/two-drives.yaml" "$work_dir/bad-drive.yaml"; do
 done
 
 begin env-lines
-# env_kept_lines, moved from provision.sh's render_models_env, keeps every line of a deployed .env
-# in order, comments included, but the four lines update.sh owns (C3) and the variables Ghost Wispr
-# no longer reads, each of which would warn at every start. It keeps the role overrides that share
-# words with removed ones, and the operator's Jabra button line (docs/pi-setup.md).
+# env_kept_lines, pi-lib.sh's .env filter, keeps every line of a deployed .env in order, comments
+# included, but the four lines update.sh owns (C3) and the variables Ghost Wispr no longer reads,
+# each of which would warn at every start. It keeps the role overrides that share words with removed
+# ones, and the operator's Jabra button line (docs/pi-setup.md).
 kept_lines=('# an operator note' GHOST_WISPR_JABRA_MUTE_BUTTON=true GHOST_WISPR_TTS_VOICE=Kore
   GHOST_WISPR_TTS_MODEL=vertex/tts-1 GHOST_WISPR_EMBEDDING_MODEL=vertex/embed-1
   GHOST_WISPR_BATCH_TRANSCRIPTION_MODEL=deepgram/nova-3 GHOST_WISPR_VOICE_ENGINE=tts)
@@ -1084,7 +1128,7 @@ last_reload=$(awk '/^restart / { exit } /^daemon-reload / { line = $0 } END { pr
 [[ $last_reload == "daemon-reload unit=$(sha "$units/ghost-wispr.service")" ]] \
   || fail "whole-set: the user manager did not read the new ghost-wispr.service before the restart: $(<"$state/systemctl.log")"
 # The udev rule and the logind setting install with sudo -n, and udev reloads and logind restarts,
-# each under its 30 s bound, after its file (provision.sh's sequence).
+# each under its 30 s bound, after its file: udevadm control --reload before udevadm trigger.
 rules_sum=$(sha "$(installed_path 99-ghost-wispr.rules)")
 logind_sum=$(sha "$(installed_path logind-power-key.conf)")
 for line in "timeout=30s udevadm control --reload rules=$rules_sum" "timeout=30s udevadm trigger rules=$rules_sum" \
@@ -1323,7 +1367,21 @@ release=broken run_update
 expect_run rollback-whole-set 10
 expect_line_like rollback-whole-set 'ghost-wispr update: .*; restored the previous release'
 expect_no_output rollback-whole-set 'installed commit'
-expect_installed_is rollback-whole-set "$work_dir/before-a"
+expect_installed_is rollback-whole-set "$work_dir/before-a" "${set_files[@]}" ghost-wispr
+# .env goes back byte for byte too (R6), before the rollback's restart. That restart's
+# ExecStartPre, update.sh secrets, then writes the secret lines pi-secrets gives, read with the
+# restored binary (R9), and keeps every other line of the restored .env: the recorder starts on a
+# key a person replaced in Secret Manager, and on no line of the release rolled back.
+[[ $(grep '^start-pre ' "$state/systemctl.log" | tail -n1) == "start-pre env=$(sha "$work_dir/before-a/.env")" ]] \
+  || fail "rollback-whole-set: .env was not, byte for byte, the .env installed before when the rollback's restart began: $(<"$state/systemctl.log")"
+secret_pattern='^(GHOST_WISPR_DEEPGRAM_API_KEY|GHOST_WISPR_DISPATCH_TOKEN)='
+diff <(grep -Ev "$secret_pattern" "$work_dir/before-a/.env") <(grep -Ev "$secret_pattern" "$opt/.env") >&2 \
+  || fail 'rollback-whole-set: the restart changed a line of the restored .env other than its secret lines (diff above)'
+diff "$state/secrets" <(grep -E "$secret_pattern" "$opt/.env") >&2 \
+  || fail 'rollback-whole-set: the secret lines of .env after the restart are not the ones pi-secrets gives (diff above)'
+[[ $(stat -c %a -- "$opt/.env") == 600 ]] || fail "rollback-whole-set: .env is mode $(stat -c %a -- "$opt/.env"), want 600"
+[[ $(awk '/^binary-sha / { sum = $2 } END { print sum }' "$state/start-pi-secrets.log") == "$(sha "$work_dir/before-a/ghost-wispr")" ]] \
+  || fail "rollback-whole-set: the rollback's restart did not read the secrets with the restored binary: $(<"$state/start-pi-secrets.log")"
 cmp -s -- "$work_dir/verified-a" "$opt/deploy.verified" || fail 'rollback-whole-set: changed deploy.verified'
 [[ $(restarts) == 2 ]] || fail "rollback-whole-set: restarted the recorder $(restarts) times, want the install's and the rollback's"
 # The rollback's restart runs the old set, after the user manager read the old unit again, and udev
@@ -1643,6 +1701,39 @@ for busy in "${busy_cases[@]:0:2}"; do
   expect_unchanged "busy-during-download (${busy#*|})" "$before"
   [[ $(restarts) == 0 ]] || fail "busy-during-download (${busy#*|}): restarted the recorder"
 done
+# One that starts during the swap or the reloads after it stops the run just before the restart:
+# the status read there finds it (R7). Every file swapped in goes back as a rollback puts it, the
+# user manager, udev and logind read the restored files again, and the recorder runs on,
+# unrestarted: the Pi is as it was, the run exits 0, and the timer tries again. A recorder that runs
+# but gives no status there may be recording too: the same, and the run fails. Breaks they catch: an
+# update that reads the status before the swap alone, and restarts the recorder mid-session after
+# the logind restart or the udev trigger; one that leaves the new files for the recorder's next
+# start without deploy.verified.
+for busy in "${busy_cases[@]:0:2}" 'UNREADABLE|ghost-wispr.service is active but /api/status gave no status'; do
+  what="busy-during-download (${busy#*|}, during the reloads)"
+  new_pi
+  install_set a "$drive_id"
+  save_installed "$work_dir/before-a"
+  cp -- "$opt/deploy.verified" "$work_dir/verified-a"
+  printf '%s\n' "${busy%%|*}" >"$state/status.after-system-reload"
+  release=b run_update
+  if [[ ${busy%%|*} == UNREADABLE ]]; then
+    expect_run "$what" 10
+    expect_line_like "$what" "ghost-wispr update: ${busy#*|}; restored the previous release's files.*"
+  else
+    expect_run "$what" 0 "ghost-wispr update: ${busy#*|}; leaving the current release in place"
+  fi
+  expect_no_output "$what" 'installed commit'
+  [[ $(restarts) == 0 ]] || fail "$what: restarted the recorder: $(<"$state/systemctl.log")"
+  expect_installed_is "$what" "$work_dir/before-a"
+  cmp -s -- "$work_dir/verified-a" "$opt/deploy.verified" || fail "$what: changed deploy.verified"
+  [[ $(grep -c 'udevadm control --reload' "$state/sudo.log") == 2 && $(grep -c 'restart systemd-logind' "$state/sudo.log") == 2 \
+    && $(grep 'udevadm trigger' "$state/sudo.log" | tail -n1) == "timeout=30s udevadm trigger rules=$(sha "$(installed_path 99-ghost-wispr.rules)")" \
+    && $(grep 'systemd-logind' "$state/sudo.log" | tail -n1) == "timeout=30s systemctl restart systemd-logind logind=$(sha "$(installed_path logind-power-key.conf)")" ]] \
+    || fail "$what: udev and logind did not read the restored files again: $(<"$state/sudo.log")"
+  [[ $(grep '^daemon-reload ' "$state/systemctl.log" | tail -n1) == "daemon-reload unit=$(sha "$units/ghost-wispr.service")" ]] \
+    || fail "$what: the user manager did not read the restored unit again: $(<"$state/systemctl.log")"
+done
 
 begin held-link-versions
 # held-link-versions: a release whose link versions (manifest link_versions) share none with the
@@ -1920,8 +2011,18 @@ printf '# edited on the Pi\n' >>"$units/ghost-wispr-update.timer"
 release=b run_update
 expect_run 'drift (after an install)' 0 "ghost-wispr update: installed commit $commit_b (invocation test-invocation-7)" \
   "ghost-wispr update: provisioning file ghost-wispr-update.timer differs from the release; run the release's provision.sh"
-# Serve that proxies to another target, or serves nothing, differs; so does a handler that is no
-# proxy. Serve is never changed: no sudo tailscale call but the read.
+# Serve that proxies to another target, or serves nothing, differs. So does every other handler of
+# an HTTPS port, each a line of its own (R16): files at /, files on another port too, a proxy at
+# another path too, and a proxy at / that forwards peer capabilities. Breaks they catch: a Serve
+# reader that reads the proxy at / alone, so a port or a path someone served by hand matches.
+# Serve is never changed: no sudo tailscale call but the read.
+[[ ${#serve_lines[@]} == 1 && ${serve_lines[0]} == '443 '* ]] \
+  || fail "drift: the Serve cases below want serve.conf to name port 443 alone, not ${serve_lines[*]}"
+good_serve_json=$(serve_json_for "$repo_root/deploy/pi/files/serve.conf")
+# serve_with FILTER prints the repository's Serve with the jq FILTER applied; $host is the node.
+serve_with() {
+  jq -c --arg host ghost-wispr.example-tailnet.ts.net "$1" <<<"$good_serve_json"
+}
 printf '443 http://127.0.0.1:9999\n' >"$work_dir/other-serve.conf"
 serve_drift() {
   new_pi
@@ -1934,7 +2035,16 @@ serve_drift() {
 }
 serve_drift 'with another target' "$(serve_json_for "$work_dir/other-serve.conf")" '443 http://127.0.0.1:9999'
 serve_drift 'serving nothing' '{}' none
-serve_drift 'with no proxy' '{"Web":{"ghost-wispr.example-tailnet.ts.net:443":{"Handlers":{"/":{"Path":"/var/www"}}}}}' none
+serve_drift 'with files at /' "$(serve_with '.Web[$host + ":443"].Handlers["/"] = {Path: "/var/www"}')" '443 "/" path "/var/www"'
+serve_drift 'with files on 8443 too' \
+  "$(serve_with '.TCP["8443"] = {HTTPS: true} | .Web[$host + ":8443"] = {Handlers: {"/": {Path: "/srv/www"}}}')" \
+  "$want_serve; 8443 \"/\" path \"/srv/www\""
+serve_drift 'with a proxy at another path too' \
+  "$(serve_with '.Web[$host + ":443"].Handlers["/admin"] = {Proxy: "http://127.0.0.1:9000"}')" \
+  "443 \"/admin\" proxy \"http://127.0.0.1:9000\"; $want_serve"
+serve_drift 'whose proxy forwards peer capabilities' \
+  "$(serve_with '.Web[$host + ":443"].Handlers["/"].AcceptAppCaps = ["example.com/cap/admin"]')" \
+  "443 \"/\" proxy \"${serve_lines[0]#* }\" accept-app-caps [\"example.com/cap/admin\"]"
 # A release whose serve.conf has two lines matches a Serve of both, and differs from a Serve of one.
 make_release two-ports "$commit_b"
 printf '9443 http://127.0.0.1:9081\n' >>"$releases/two-ports/ghost-wispr-pi-deploy/serve.conf"
@@ -1951,8 +2061,12 @@ release=two-ports run_update
 mapfile -t two_lines < <(grep -Ev '^[[:space:]]*(#|$)' "$releases/two-ports/ghost-wispr-pi-deploy/serve.conf" | LC_ALL=C sort)
 printf -v want_two '%s; ' "${two_lines[@]}"
 expect_run 'drift (one of two Serve lines)' 0 "ghost-wispr update: Serve differs from the release: want ${want_two%; }, have $want_serve"
-# A Serve status it cannot read (tailscale fails, answers what is not a ServeConfig, or hangs past
-# its 10 s bound) is UNKNOWN, never a match.
+# A Serve status it cannot read (tailscale fails, answers what is not one ServeConfig, or hangs past
+# its 10 s bound) is UNKNOWN, never a match. So is a Serve of a shape the reader does not know: a
+# handler that is no object, one of two kinds, a Web entry on a port that serves no HTTPS, an HTTPS
+# port with no handler, a TCP forward, Funnel, a foreground Serve and a service. Breaks they catch:
+# a reader that skips a handler it cannot read, so a Serve with one more port matches; one that
+# reads the Web handlers alone, so a port forwarded, or opened to the internet, matches.
 serve_unknown() {
   expect_run "drift (Serve $1)" 0
   expect_line_like "drift (Serve $1)" 'ghost-wispr update: Serve: UNKNOWN \(.+\)'
@@ -1963,7 +2077,19 @@ install_set b
 echo 1 >"$state/serve-exit"
 release=b run_update
 serve_unknown 'failing'
-for answer in 'not json' '[]'; do
+unknown_answers=('not json' '[]')
+for filter in \
+  '.TCP["8443"] = {HTTPS: true} | .Web[$host + ":8443"] = {Handlers: {"/": "http://127.0.0.1:8081"}}' \
+  '.Web[$host + ":443"].Handlers["/"].Path = "/srv/www"' \
+  'del(.TCP)' \
+  '.TCP["8443"] = {HTTPS: true}' \
+  '.TCP["2222"] = {TCPForward: "127.0.0.1:22"}' \
+  '.AllowFunnel = {($host + ":443"): true}' \
+  '.Foreground = {"session-1": .}' \
+  '.Services = {"svc:ghost-wispr": {Tun: true}}'; do
+  unknown_answers+=("$(serve_with "$filter")")
+done
+for answer in "${unknown_answers[@]}"; do
   new_pi
   install_set b
   printf '%s\n' "$answer" >"$state/serve.json"
