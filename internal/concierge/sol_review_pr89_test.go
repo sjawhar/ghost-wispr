@@ -143,12 +143,14 @@ func TestSolExplicitAskKeepsKeyWhenSendOutlastsAnswer(t *testing.T) {
 }
 
 func TestSolPendingAskRetriesBeforeFixedSentence(t *testing.T) {
+	t.Parallel()
 	for _, keyless := range []bool{false, true} {
 		name := "control_keyed_first_attempt"
 		if keyless {
 			name = "keyless_first_then_valid_second"
 		}
 		t.Run(name, func(t *testing.T) {
+			t.Parallel()
 			r := newRig(t)
 			heldIssue(r, "session", false)
 			r.concierge.fastBound = time.Second

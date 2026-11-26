@@ -18,6 +18,7 @@ import (
 // opener too, whatever the titles say; "let's do the first one" is a new
 // question by design; the framing words that stay still frame a pick.
 func TestReview187R6AQuestionVerbAnywhereIsAQuestion(t *testing.T) {
+	t.Parallel()
 	titled := []candidate{{"ABC-12", "Is the voice ready"}, {"ABC-13", "Voice has a PR"}}
 	for _, tc := range []struct {
 		candidates []candidate

@@ -2,9 +2,13 @@ package concierge
 
 import (
 	"encoding/json"
+	"fmt"
 	"math/rand/v2"
+	"runtime"
 	"slices"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 	"unicode"
@@ -205,13 +209,19 @@ func TestASessionNameIsItsWords(t *testing.T) {
 // spacing, sessionName's output holds no separator and no word made only of
 // punctuation ("-", "·", "()"), which the voice would read out. The seed is
 // fixed, so a failure repeats; it prints the title. It fails if a run of
-// separators, or a key in brackets, leaves a mark to say.
+// separators, or a key in brackets, leaves a mark to say. sessionName
+// compiles its key's patterns on each call, which under the race detector
+// takes milliseconds, so each title drawn is checked once (16,891 of the
+// 20,000 draws are new), on every CPU, and the first in the seed's order
+// that fails is the one printed.
 func TestNoTitleSaysAMarkAlone(t *testing.T) {
 	words := []string{"Worker", "release", "notes", "Parser-evals", "night-shift", "(reviewer)", "OWNER:", "Legion", "architect", "merge", "queue", "🔑"}
 	keys := []string{"INFRA-17", "infra-17", "INFRA-17's", "(INFRA-17)", "[INFRA-17]", "INFRA-12", "INFRA-170", "XINFRA-17"}
 	separators := []string{"·", "•", "‧", "∙", "|", "—", "–", "-", "--", "- -", "· -"}
 	spaces := []string{"", " ", "  ", "\t"}
 	rng := rand.New(rand.NewPCG(194, 198))
+	var titles []string
+	drawn := map[string]bool{}
 	for range 20000 {
 		var b strings.Builder
 		for n := rng.IntN(7); n >= 0; n-- {
@@ -225,17 +235,44 @@ func TestNoTitleSaysAMarkAlone(t *testing.T) {
 			}
 			b.WriteString(spaces[rng.IntN(len(spaces))])
 		}
-		title := b.String()
-		got := sessionName(title, "INFRA-17")
-		if strings.ContainsAny(got, "·•‧∙|—–") {
-			t.Fatalf("sessionName(%q) = %q, which holds a separator", title, got)
-		}
-		for _, word := range strings.FieldsFunc(got, func(r rune) bool { return r == ',' || unicode.IsSpace(r) }) {
-			if !strings.ContainsFunc(word, func(r rune) bool { return unicode.IsLetter(r) || unicode.IsDigit(r) }) {
-				t.Fatalf("sessionName(%q) = %q: %q is punctuation alone", title, got, word)
-			}
+		if title := b.String(); !drawn[title] {
+			drawn[title] = true
+			titles = append(titles, title)
 		}
 	}
+	// failures[i] is what is wrong with sessionName's output for titles[i],
+	// "" when nothing is.
+	failures := make([]string, len(titles))
+	var next atomic.Int64
+	var workers sync.WaitGroup
+	for range runtime.GOMAXPROCS(0) {
+		workers.Go(func() {
+			for i := int(next.Add(1)) - 1; i < len(titles); i = int(next.Add(1)) - 1 {
+				failures[i] = markAlone(titles[i], sessionName(titles[i], "INFRA-17"))
+			}
+		})
+	}
+	workers.Wait()
+	for _, failure := range failures {
+		if failure != "" {
+			t.Fatal(failure)
+		}
+	}
+}
+
+// markAlone says what of got, sessionName's output for title, the voice
+// would read out as a mark: a separator, or a word of punctuation alone. It
+// is "" when there is none.
+func markAlone(title, got string) string {
+	if strings.ContainsAny(got, "·•‧∙|—–") {
+		return fmt.Sprintf("sessionName(%q) = %q, which holds a separator", title, got)
+	}
+	for _, word := range strings.FieldsFunc(got, func(r rune) bool { return r == ',' || unicode.IsSpace(r) }) {
+		if !strings.ContainsFunc(word, func(r rune) bool { return unicode.IsLetter(r) || unicode.IsDigit(r) }) {
+			return fmt.Sprintf("sessionName(%q) = %q: %q is punctuation alone", title, got, word)
+		}
+	}
+	return ""
 }
 
 // TestTheHolderToolSaysTheTitlesWords (Sol's review of #198, O2 and O3):

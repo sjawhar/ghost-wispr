@@ -57,8 +57,10 @@ var (
 // other, is an outage, with the error sound (voice.ErrUnreachable), and so is
 // a 503 whose body stalls past the bound. A full search that answered decides
 // even when the keyword search was refused. At 0081b237 the stalled 503s
-// were "slow" with no error: those rows fail there.
+// were "slow" with no error: those rows fail there. Each row has a rig and a
+// server of its own, so the rows run in parallel.
 func TestASearchFailsOnlyWhenDispatchRefuses(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name          string
 		full, keyword searchLeg
@@ -77,6 +79,7 @@ func TestASearchFailsOnlyWhenDispatchRefuses(t *testing.T) {
 		{"full past its bound, keyword refused with its body stalled", noAnswer, refusedStalled, cannotReachDispatch, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 			r := newRig(t)
 			r.concierge.searchBound = 300 * time.Millisecond
 			mux := http.NewServeMux()
