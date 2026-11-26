@@ -1228,4 +1228,266 @@ mkdir -p -- "$units/ghost-wispr.service.d"
 release=b run_update
 expect_run 'drop-in-refused control' 0 "ghost-wispr update: installed commit $commit_b (invocation test-invocation-7)"
 
+# ---------------------------------------------------------------------------------------------------
+# rollback-whole-set: a new binary that never answers its commit is rolled back with its whole set:
+# every file, the rendered config, .env, the unit and both system files back byte for byte, the user
+# manager and udev reloaded and logind restarted again, and deploy.verified still the old set. A
+# rollback of the binary alone would run the old binary on the new release's config, units and
+# udev rule.
+new_pi
+install_set a "$drive_id"
+printf '%s\n' GHOST_WISPR_DEEPGRAM_API_KEY=dg-test-2 GHOST_WISPR_DISPATCH_TOKEN=tok-test-2 >"$state/secrets"
+save_installed "$work_dir/before-a"
+cp -- "$opt/deploy.verified" "$work_dir/verified-a"
+release=broken run_update
+expect_run rollback-whole-set 10
+expect_line_like rollback-whole-set 'ghost-wispr update: .*; restored the previous release'
+expect_no_output rollback-whole-set 'installed commit'
+expect_installed_is rollback-whole-set "$work_dir/before-a"
+cmp -s -- "$work_dir/verified-a" "$opt/deploy.verified" || fail 'rollback-whole-set: changed deploy.verified'
+[[ $(restarts) == 2 ]] || fail "rollback-whole-set: restarted the recorder $(restarts) times, want the install's and the rollback's"
+# The rollback's restart runs the old set, after the user manager read the old unit again, and udev
+# and logind read the old system files again.
+[[ $(grep '^restart ' "$state/systemctl.log" | tail -n1) == "restart binary=$(sha "$opt/ghost-wispr") env=$(sha "$opt/.env") config=$(sha "$opt/ghost-wispr.yaml") crt=$(sha "$opt/device.crt")" ]] \
+  || fail "rollback-whole-set: the rollback's restart did not run the restored set: $(<"$state/systemctl.log")"
+awk -v want="daemon-reload unit=$(sha "$units/ghost-wispr.service")" \
+  '/^daemon-reload / { reload = $0 } /^restart / { last = reload } END { exit !(last == want) }' "$state/systemctl.log" \
+  || fail "rollback-whole-set: the user manager did not read the restored unit before the rollback's restart: $(<"$state/systemctl.log")"
+rules_sum=$(sha "$(installed_path 99-ghost-wispr.rules)")
+logind_sum=$(sha "$(installed_path logind-power-key.conf)")
+[[ $(grep -c 'udevadm control --reload' "$state/sudo.log") == 2 && $(grep -c 'systemctl restart systemd-logind' "$state/sudo.log") == 2 ]] \
+  || fail "rollback-whole-set: did not reload udev and restart logind for the install and again for the rollback: $(<"$state/sudo.log")"
+[[ $(grep 'udevadm control --reload' "$state/sudo.log" | tail -n1) == "timeout=30s udevadm control --reload rules=$rules_sum" \
+  && $(grep 'udevadm trigger' "$state/sudo.log" | tail -n1) == "timeout=30s udevadm trigger rules=$rules_sum" \
+  && $(grep 'systemd-logind' "$state/sudo.log" | tail -n1) == "timeout=30s systemctl restart systemd-logind logind=$logind_sum" ]] \
+  || fail "rollback-whole-set: udev and logind did not read the restored files: $(<"$state/sudo.log")"
+
+# A rollback puts the old binary back while the new one still runs: a copy over a file that is
+# executing fails with "Text file busy", which would leave the new binary in place. The new binary
+# here is a real executable that its failed start leaves running.
+new_pi
+make_release busy "$commit_c"
+cp -- /bin/sleep "$releases/busy/ghost-wispr-linux-arm64"
+pack_release busy
+install_set a
+save_installed "$work_dir/before-a"
+echo busy-exec >"$state/restart-1"
+release=busy run_update
+stop_busy_binary
+expect_run 'rollback over a running binary' 10
+expect_line_like 'rollback over a running binary' 'ghost-wispr update: .*; restored the previous release'
+expect_installed_is 'rollback over a running binary' "$work_dir/before-a"
+
+# A new release whose start job fails while its unit stays active, and whose /api/status then
+# answers that it records a session or holds a call, is left running: a restart for the rollback
+# would end that recording or call. One whose status cannot be read (no answer, or an answer that is
+# not a status) may be recording too: the rollback reads it again every 2 minutes and after the
+# third read leaves it running. One that answers idle on two reads 2 minutes apart is rolled back,
+# and one whose unit stopped is rolled back at once, with no read.
+# restart_fails HOW STATUS... runs release b on a Pi that runs a, whose first restart does HOW, and
+# whose status program after it is STATUS.
+restart_fails() {
+  new_pi
+  install_set a
+  save_installed "$work_dir/before-a"
+  echo "$1" >"$state/restart-1"
+  shift
+  printf '%s\n' "$@" >"$state/status.after-restart"
+  release=b run_update
+}
+# left_running WHAT REASON SLEEPS READS
+left_running() {
+  expect_run "$1" 10
+  [[ $out == *"$2"* && $out == *'left running'* ]] || fail "$1: want a failure naming \"$2\" that leaves it running; output: $out"
+  expect_no_output "$1" 'restored the previous release'
+  expect_set_of "$1" b
+  [[ $(restarts) == 1 ]] || fail "$1: restarted the recorder again: $(<"$state/systemctl.log")"
+  [[ $(<"$state/sleep.log") == "$3" && $(cat -- "$state/status.reads" 2>/dev/null || echo 0) == "$4" ]] \
+    || fail "$1: read the status $(cat -- "$state/status.reads" 2>/dev/null || echo 0) times after waits $(printf %q "$(<"$state/sleep.log")"); want $4 reads after $(printf %q "$3")"
+}
+# rolled_back WHAT SLEEPS
+rolled_back() {
+  expect_run "$1" 10
+  expect_line_like "$1" 'ghost-wispr update: .*; restored the previous release'
+  expect_installed_is "$1" "$work_dir/before-a"
+  [[ $(restarts) == 2 ]] || fail "$1: want the rollback's restart: $(<"$state/systemctl.log")"
+  [[ $(<"$state/sleep.log") == "$2" ]] || fail "$1: waited $(printf %q "$(<"$state/sleep.log")"), want $(printf %q "$2")"
+}
+restart_fails fail SESSION
+left_running 'a new release that records a session' 'active session' '' 1
+restart_fails fail '{"paused":false,"capture_state":"capturing","active_session_id":"","call":{"state":"live"}}'
+left_running 'a new release that holds a call' 'call live' '' 1
+restart_fails fail UNREADABLE
+left_running 'a new release that does not answer' 'could not be read' $'sleep 120\nsleep 120' 3
+restart_fails fail GARBAGE
+left_running 'a new release that answers no status' 'could not be read' $'sleep 120\nsleep 120' 3
+restart_fails fail UNREADABLE IDLE
+rolled_back 'a new release that answers idle again' $'sleep 120\nsleep 120'
+restart_fails fail-stop STOPPED
+rolled_back 'a new release whose unit stopped' ''
+
+# partial-install: an update cut short mid-swap (a power cut, or the launcher's time limit) leaves
+# part of the new set installed while deploy.verified names the set before. The next run keeps the
+# .prev copies of that verified set as they are, not the half-swapped files, and installs the whole
+# set; a rollback then restores the verified set, not a mix.
+partial_pi() {
+  local file
+  new_pi
+  install_set a
+  save_installed "$work_dir/before-a"
+  for file in "${set_files[@]}" .env ghost-wispr; do
+    cp -p -- "$(installed_path "$file")" "$opt/$file.prev"
+  done
+  # The swap had replaced the binary alone; the recorder still runs the old one.
+  cp -- "$releases/$1/ghost-wispr-linux-arm64" "$opt/ghost-wispr"
+}
+partial_pi b
+release=b run_update
+expect_run partial-install 0 "ghost-wispr update: installed commit $commit_b (invocation test-invocation-7)"
+expect_set_of partial-install b
+expect_verified partial-install b
+expect_prev_is partial-install "$work_dir/before-a"
+partial_pi broken
+release=broken run_update
+rolled_back 'partial-install, then a release that fails' "$(printf 'sleep 2\n%.0s' {1..60} | head -c -1)"
+
+# same-commit-different-set: deploy.verified names the release's commit, but an installed file of
+# the set is not the one it lists (here pi.env, edited on the Pi): the release is not current, and
+# the whole set installs again, so the Pi runs what the release says.
+new_pi
+install_set b
+printf '# edited on the Pi\n' >>"$opt/pi.env"
+release=b run_update
+expect_run same-commit-different-set 0 "ghost-wispr update: installed commit $commit_b (invocation test-invocation-7)"
+expect_set_of same-commit-different-set b
+# Control: the installed config alone differs from its template, which it does on every Pi with a
+# shared drive, since it is rendered: the release is current, and nothing changes.
+new_pi
+install_set b "$drive_id"
+before=$(snapshot)
+release=b run_update
+expect_run 'same-commit-different-set control' 0 "ghost-wispr update: already current at commit $commit_b"
+expect_no_output 'same-commit-different-set control' 'installed'
+expect_unchanged 'same-commit-different-set control' "$before"
+[[ $(restarts) == 0 ]] || fail 'same-commit-different-set control: restarted a current recorder'
+
+# transition: the office Pi's first run of this update.sh, after P2's provision.sh, finds no
+# deploy.verified. Its old update.sh installed each release's binary nightly, so the binary may
+# already answer the release's commit: the whole set installs all the same. The files it had become
+# the .prev copies only when the recorder's running image is the installed binary, the one that
+# answered its commit; its old config is kept as ghost-wispr.yaml.before-release-config, where a
+# person finds a setting saved on the page before slice 1 (D13); and the old record
+# ghost-wispr.verified goes.
+old_pi() {
+  local file
+  new_pi
+  # P2's provision.sh installed release b's update.sh, pi-lib.sh, pi.env and bootstrap files.
+  install_set b
+  rm -f -- "$opt/deploy.verified"
+  # The old provisioner's config, with a page save in it, and its .env and other files.
+  printf '%s\n' 'recording_rules:' '  - An old rule.' 'silence_timeout: 45s' "gdrive_folder_id: \"$drive_id\"" \
+    'gdrive_sync_enabled: true' 'gc_enabled: true' >"$opt/ghost-wispr.yaml"
+  write_env "$opt/.env" GHOST_WISPR_ADDR=127.0.0.1:8080 GOOGLE_API_USE_CLIENT_CERTIFICATE=false \
+    GHOST_WISPR_DEEPGRAM_API_KEY=dg-test-1 GHOST_WISPR_EMBEDDING_LOCATION=global
+  for file in wait-for-network.sh wait-for-time-sync.sh ghost-wispr.service 99-ghost-wispr.rules logind-power-key.conf; do
+    printf '# the old %s\n' "$file" >"$(installed_path "$file")"
+  done
+  printf 'the binary the old update.sh verified last\n' >"$opt/ghost-wispr.prev"
+  sha "$opt/ghost-wispr" >"$opt/ghost-wispr.verified"
+  cp -p -- "$opt/ghost-wispr.yaml" "$work_dir/old-config.yaml"
+}
+old_pi
+save_installed "$work_dir/before-old"
+release=b run_update
+expect_run transition 0 "ghost-wispr update: installed commit $commit_b (invocation test-invocation-7)"
+expect_set_of transition b
+expect_config_with_drive transition "$releases/b/ghost-wispr-pi-deploy/ghost-wispr.yaml"
+expect_prev_is transition "$work_dir/before-old"
+cmp -s -- "$work_dir/old-config.yaml" "$opt/ghost-wispr.yaml.before-release-config" \
+  || fail 'transition: did not keep the old config as ghost-wispr.yaml.before-release-config'
+[[ ! -e $opt/ghost-wispr.verified ]] || fail 'transition: left the old ghost-wispr.verified'
+expect_verified transition b
+[[ $(restarts) == 1 ]] || fail "transition: restarted the recorder $(restarts) times"
+# When the installed binary is not the image the recorder runs (an old update cut short after its
+# swap), or that image cannot be read (no main process), nothing shows the installed files worked:
+# the .prev copies stay as they are, and update.sh says why. The release still installs.
+for main_pid in 4242 0; do
+  old_pi
+  if [[ $main_pid == 4242 ]]; then
+    cp -- "$releases/a/ghost-wispr-linux-arm64" "$state/running-image"
+  fi
+  echo "$main_pid" >"$state/main-pid"
+  release=b run_update
+  what="transition, the running image not the installed binary (main process $main_pid)"
+  expect_run "$what" 0 "ghost-wispr update: installed commit $commit_b (invocation test-invocation-7)"
+  [[ $out == *"is not the image the recorder runs (main process $main_pid)"* ]] || fail "$what: did not say why it kept no .prev: $out"
+  [[ $(<"$opt/ghost-wispr.prev") == 'the binary the old update.sh verified last' ]] || fail "$what: replaced ghost-wispr.prev"
+  for file in "${set_files[@]}" .env; do
+    [[ ! -e $opt/$file.prev ]] || fail "$what: kept $file.prev from files nothing verified"
+  done
+  cmp -s -- "$work_dir/old-config.yaml" "$opt/ghost-wispr.yaml.before-release-config" \
+    || fail "$what: did not keep the old config as ghost-wispr.yaml.before-release-config"
+done
+# A before-release-config a first try kept stays: a second try, after that one failed, must not
+# replace the person's old settings with the release's config.
+old_pi
+printf 'the config before the first try\n' >"$opt/ghost-wispr.yaml.before-release-config"
+release=b run_update
+expect_run 'transition, a second try' 0 "ghost-wispr update: installed commit $commit_b (invocation test-invocation-7)"
+[[ $(<"$opt/ghost-wispr.yaml.before-release-config") == 'the config before the first try' ]] \
+  || fail 'transition, a second try: replaced the before-release-config a first try kept'
+
+# no-binary-yet: a new Pi as provision.sh leaves it before its first update: update.sh, pi-lib.sh,
+# pi.env and the bootstrap files, the credentials and the certificate, and no binary, config, .env
+# or ghost-wispr.service, with no recorder running. pi-secrets runs from the staged binary with the
+# credential file; the drop-in check passes the unit that is not found yet; the whole set installs,
+# the unit included.
+new_pi
+rm -f -- "$state/active"
+for file in update.sh pi-lib.sh pi.env "${bootstrap_files[@]}"; do
+  install -D -m "$(file_mode "$file")" -- "$releases/b/ghost-wispr-pi-deploy/$file" "$(installed_path "$file")"
+done
+release=b run_update
+expect_run no-binary-yet 0 "ghost-wispr update: installed commit $commit_b (invocation test-invocation-7)" \
+  'pi-secrets: GHOST_WISPR_DEEPGRAM_API_KEY from example-deepgram-secret version 3'
+expect_set_of no-binary-yet b
+cmp -s -- "$releases/b/ghost-wispr-pi-deploy/ghost-wispr.yaml" "$opt/ghost-wispr.yaml" \
+  || fail 'no-binary-yet: the config is not the template as it is, with no shared drive yet'
+expect_env no-binary-yet GHOST_WISPR_ADDR=127.0.0.1:8080 GOOGLE_API_USE_CLIENT_CERTIFICATE=false \
+  GHOST_WISPR_DEEPGRAM_API_KEY=dg-test-1 GHOST_WISPR_DISPATCH_TOKEN=tok-test-1
+expect_verified no-binary-yet b
+grep -Fqx "binary-sha $(sha "$releases/b/ghost-wispr-linux-arm64")" "$state/pi-secrets.log" \
+  || fail "no-binary-yet: pi-secrets did not run from the staged binary: $(<"$state/pi-secrets.log")"
+expect_secrets_flag no-binary-yet --credentials "$opt/google-credentials.json"
+[[ $(restarts) == 1 ]] || fail "no-binary-yet: started the recorder $(restarts) times"
+[[ -z $(find "$opt" -name '*.prev') && ! -e $opt/ghost-wispr.yaml.before-release-config ]] \
+  || fail "no-binary-yet: kept copies of files the Pi never had: $(find "$opt" -name '*.prev' -o -name '*.before-release-config')"
+
+# prev-copy-by-rename: the launcher runs update.sh.prev when update.sh is broken, and that run
+# replaces update.sh.prev with the set it keeps. bash reads a script while it runs it, so a copy
+# over update.sh.prev in place would have the running copy go on in the middle of other text; a
+# rename leaves it reading its own file to its last line.
+new_pi
+make_release long "$commit_a"
+{
+  head -n1 "$repo_root/deploy/pi/update.sh"
+  for ((i = 0; i < 400; i++)); do printf '# a longer update.sh than the copy that runs\n'; done
+  tail -n +2 "$repo_root/deploy/pi/update.sh"
+  printf '# release long\n'
+} >"$releases/long/ghost-wispr-pi-deploy/update.sh"
+pack_release long
+install_set long
+cp -- "$repo_root/deploy/pi/update.sh" "$opt/update.sh.prev"
+printf '%s\n' "printf 'update.sh.prev: ran to its own last line\\n'" >>"$opt/update.sh.prev"
+chmod 0755 "$opt/update.sh.prev"
+cp -p -- "$opt/pi-lib.sh" "$opt/pi-lib.sh.prev"
+updater=$opt/update.sh.prev release=b run_update
+expect_run prev-copy-by-rename 0 "ghost-wispr update: installed commit $commit_b (invocation test-invocation-7)"
+[[ $(tail -n1 <<<"$out") == 'update.sh.prev: ran to its own last line' && $(grep -c 'installed commit' <<<"$out") == 1 ]] \
+  || fail "prev-copy-by-rename: the running update.sh.prev did not read its own file to its end: $out"
+expect_no_output prev-copy-by-rename 'already current'
+cmp -s -- "$releases/long/ghost-wispr-pi-deploy/update.sh" "$opt/update.sh.prev" \
+  || fail 'prev-copy-by-rename: update.sh.prev is not the update.sh installed before'
+expect_set_of prev-copy-by-rename b
+
 printf 'update tests passed\n'
