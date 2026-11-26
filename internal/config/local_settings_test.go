@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -37,12 +38,19 @@ func TestLocalSettingsPath(t *testing.T) {
 func TestAPageSaveSurvivesANewReleaseConfig(t *testing.T) {
 	clearEnv(t)
 	path := writeConfig(t, "silence_timeout: 30s\nrecording_rules:\n  - First release rule.\n")
+	release, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
 	store, _, err := NewStore(path)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := store.Update(func(c *Config) { c.SilenceTimeout = "45s" }); err != nil {
 		t.Fatal(err)
+	}
+	if afterSave, err := os.ReadFile(path); err != nil || !bytes.Equal(afterSave, release) {
+		t.Errorf("the page save changed the release config (%v):\n%s", err, afterSave)
 	}
 
 	newRelease := []byte("silence_timeout: 30s\nrecording_rules:\n  - New release rule.\n  - Second new release rule.\ngc_max_age_days: 14\nrelease_only_key: new value\n")
@@ -378,49 +386,310 @@ func TestABrokenLocalSettingsFileWarnsAndUsesTheReleaseConfig(t *testing.T) {
 	t.Errorf("warnings %q do not name the broken local settings file and skipped page saves", warnings)
 }
 
+// fileState is a path as a test compares it before and after a save: absent,
+// a directory, or a file with its bytes.
+func fileState(t *testing.T, path string) string {
+	t.Helper()
+	info, err := os.Stat(path)
+	switch {
+	case os.IsNotExist(err):
+		return "absent"
+	case err != nil:
+		t.Fatal(err)
+	case info.IsDir():
+		return "a directory"
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return "a file holding " + strconv.Quote(string(data))
+}
+
+// failedSaveChangedNothing fails t when the failed save err left a trace: no
+// error, a revision or a change callback, or a change to the release config or
+// the local settings file.
+func failedSaveChangedNothing(t *testing.T, store *Store, err error, revision uint64, callbacks int, files map[string]string) {
+	t.Helper()
+	if err == nil {
+		t.Fatal("the save succeeded")
+	}
+	if _, got := store.GetRevision(); got.Count != revision {
+		t.Errorf("the failed save moved the revision from %d to %d", revision, got.Count)
+	}
+	if callbacks != 0 {
+		t.Errorf("the failed save fired %d change callbacks", callbacks)
+	}
+	for path, before := range files {
+		if after := fileState(t, path); after != before {
+			t.Errorf("the failed save left %s as %s, want %s", path, after, before)
+		}
+	}
+}
+
 // TestAnEnvFailureRestoresTheLocalSettingsFile fails if a save that cannot
-// write .env leaves its own values in the local settings file, or touches the
-// release config while it rolls back.
+// write .env leaves its own values in the local settings file, as a file that
+// was there before or as a new one, touches the release config, moves the
+// revision or fires a change callback.
 func TestAnEnvFailureRestoresTheLocalSettingsFile(t *testing.T) {
+	for name, local := range map[string]string{
+		"a local settings file before the save":  "gc_max_age_days: 7\n",
+		"no local settings file before the save": "",
+	} {
+		t.Run(name, func(t *testing.T) {
+			clearEnv(t)
+			path := writeConfig(t, "silence_timeout: 30s\n")
+			localPath := LocalSettingsPath(path)
+			if local != "" {
+				if err := os.WriteFile(localPath, []byte(local), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			// A directory where .env must be: the rename of the new .env over it fails.
+			envPath := filepath.Join(filepath.Dir(path), ".env")
+			if err := os.Mkdir(envPath, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(envPath, "keep"), nil, 0o644); err != nil {
+				t.Fatal(err)
+			}
+			store, _, err := NewStoreWithEnv(path, envPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			files := map[string]string{path: fileState(t, path), localPath: fileState(t, localPath)}
+			_, revision := store.GetRevision()
+			callbacks := 0
+			store.OnChange(func(Config) { callbacks++ })
+
+			err = store.Update(func(c *Config) {
+				c.SilenceTimeout = "45s"
+				_ = c.SetAPIKey("openai", "sk-example")
+			})
+			failedSaveChangedNothing(t, store, err, revision.Count, callbacks, files)
+			if got := store.Get(); got.SilenceTimeout != "30s" || got.APIKey("openai") != "" {
+				t.Errorf("after the failed save silence_timeout %q, the openai key set: %t; want 30s and no key", got.SilenceTimeout, got.APIKey("openai") != "")
+			}
+		})
+	}
+}
+
+// TestALocalSettingsFileFailureChangesNothing fails if a save whose read,
+// write or removal of the local settings file fails keeps its change in
+// memory, changes a file, moves the revision or fires a change callback.
+func TestALocalSettingsFileFailureChangesNothing(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		// local is the local settings file the store loads, "" for none.
+		local string
+		// breakFile makes the save's step on the local settings file fail,
+		// after the store loaded.
+		breakFile  func(t *testing.T, localPath string)
+		save, want string // the silence_timeout the save sets, and the one it must leave
+	}{
+		{
+			name: "read",
+			breakFile: func(t *testing.T, localPath string) {
+				if err := os.Mkdir(localPath, 0o755); err != nil {
+					t.Fatal(err)
+				}
+			},
+			save: "45s", want: "30s",
+		},
+		{
+			name:  "write",
+			local: "gc_max_age_days: 7\n",
+			// atomicWriteFile writes the file's .tmp first: a directory there
+			// fails the write, for root too.
+			breakFile: func(t *testing.T, localPath string) {
+				if err := os.Mkdir(localPath+".tmp", 0o755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(localPath+".tmp", "keep"), nil, 0o644); err != nil {
+					t.Fatal(err)
+				}
+			},
+			save: "45s", want: "30s",
+		},
+		{
+			name:  "removal",
+			local: "silence_timeout: 45s\n",
+			// A save of the release's 30s removes the local settings file; a
+			// directory that refuses writes refuses the removal.
+			breakFile: func(t *testing.T, localPath string) {
+				dir := filepath.Dir(localPath)
+				if err := os.Chmod(dir, 0o555); err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(func() { _ = os.Chmod(dir, 0o755) })
+				if err := os.WriteFile(filepath.Join(dir, "probe"), nil, 0o644); err == nil {
+					t.Skip("this user writes into a directory with mode 0555 (root), so the removal cannot fail here")
+				}
+			},
+			save: "30s", want: "45s",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			clearEnv(t)
+			path := writeConfig(t, "silence_timeout: 30s\n")
+			localPath := LocalSettingsPath(path)
+			if tc.local != "" {
+				if err := os.WriteFile(localPath, []byte(tc.local), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			store, _, err := NewStore(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := store.Get().SilenceTimeout; got != tc.want {
+				t.Fatalf("silence_timeout before the save = %q, want %q", got, tc.want)
+			}
+			tc.breakFile(t, localPath)
+			files := map[string]string{path: fileState(t, path), localPath: fileState(t, localPath)}
+			_, revision := store.GetRevision()
+			callbacks := 0
+			store.OnChange(func(Config) { callbacks++ })
+
+			err = store.Update(func(c *Config) { c.SilenceTimeout = tc.save })
+			failedSaveChangedNothing(t, store, err, revision.Count, callbacks, files)
+			if got := store.Get().SilenceTimeout; got != tc.want {
+				t.Errorf("silence_timeout after the failed save = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestASaveOverALocalSettingsFileThatWasNotAppliedIsRefused fails if a save,
+// while the local settings file that the start could not apply is in place,
+// replaces that file: each setting saved in it would be lost with no message.
+// The save must be refused with an error that names the file and what to do.
+func TestASaveOverALocalSettingsFileThatWasNotAppliedIsRefused(t *testing.T) {
+	for name, local := range map[string]string{
+		"does not parse":             "silence_timeout: [\n",
+		"a value that does not fit":  "silence_timeout: 45s\ngc_max_age_days: many\n",
+		"a null on a struct setting": "silence_timeout: 45s\nvoice: null\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			clearEnv(t)
+			path := writeConfig(t, "silence_timeout: 30s\n")
+			localPath := LocalSettingsPath(path)
+			if err := os.WriteFile(localPath, []byte(local), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			store, _, err := NewStore(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			files := map[string]string{path: fileState(t, path), localPath: fileState(t, localPath)}
+			_, revision := store.GetRevision()
+			callbacks := 0
+			store.OnChange(func(Config) { callbacks++ })
+
+			err = store.Update(func(c *Config) { c.GCMaxAgeDays = 3 })
+			failedSaveChangedNothing(t, store, err, revision.Count, callbacks, files)
+			if !strings.Contains(err.Error(), localPath) || !strings.Contains(err.Error(), "restart") {
+				t.Errorf("the refusal %q does not name %s and the restart", err, localPath)
+			}
+			if got := store.Get(); got.GCMaxAgeDays != 30 || got.SilenceTimeout != "30s" {
+				t.Errorf("after the refused save gc_max_age_days %d, silence_timeout %q; want the release config's 30 and 30s", got.GCMaxAgeDays, got.SilenceTimeout)
+			}
+		})
+	}
+}
+
+// TestAnEmptyRecordingRulesOverrideIsSavedAsNoRules fails if a save made
+// while GHOST_WISPR_RECORDING_RULES is [] keeps the release config's rules
+// once the variable is removed: an empty list is a value, as R13 says of each
+// value from the environment.
+func TestAnEmptyRecordingRulesOverrideIsSavedAsNoRules(t *testing.T) {
 	clearEnv(t)
-	path := writeConfig(t, "silence_timeout: 30s\n")
-	release, err := os.ReadFile(path)
+	path := writeConfig(t, "recording_rules:\n  - First release rule.\n  - Second release rule.\n")
+	t.Setenv(EnvPrefix+"RECORDING_RULES", "[]")
+	store, _, err := NewStore(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	localPath := LocalSettingsPath(path)
-	localBefore := []byte("gc_max_age_days: 7\n")
-	if err := os.WriteFile(localPath, localBefore, 0o644); err != nil {
-		t.Fatal(err)
+	if got := store.Get().RecordingRules; len(got) != 0 {
+		t.Fatalf("recording_rules with %sRECORDING_RULES=[] = %q, want none", EnvPrefix, got)
 	}
-	// A directory where .env must be: the rename of the new .env over it fails.
-	envPath := filepath.Join(filepath.Dir(path), ".env")
-	if err := os.Mkdir(envPath, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(envPath, "keep"), nil, 0o644); err != nil {
-		t.Fatal(err)
-	}
-	store, _, err := NewStoreWithEnv(path, envPath)
-	if err != nil {
+	if err := store.Update(func(c *Config) { c.GCMaxAgeDays = 7 }); err != nil {
 		t.Fatal(err)
 	}
 
-	err = store.Update(func(c *Config) {
-		c.SilenceTimeout = "45s"
-		_ = c.SetAPIKey("openai", "sk-example")
-	})
-	if err == nil {
-		t.Fatal("a save whose .env write failed succeeded")
+	t.Setenv(EnvPrefix+"RECORDING_RULES", "")
+	reopened, _, err := NewStore(path)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if got := store.Get().SilenceTimeout; got != "30s" {
-		t.Errorf("silence_timeout after the failed save = %q, want 30s", got)
+	if got := reopened.Get().RecordingRules; len(got) != 0 {
+		t.Errorf("recording_rules after the variable is removed = %q, want none", got)
 	}
-	if after, _ := os.ReadFile(localPath); !bytes.Equal(after, localBefore) {
-		t.Errorf("the failed save left the local settings file as:\n%s\nwant:\n%s", after, localBefore)
+}
+
+// TestAHandWrittenNullOnAStructSettingIsNotApplied fails if a null that a
+// person wrote on a setting that is not an entry of a map (providers,
+// summarization.presets, a provider's labels) zeroes that setting: the local
+// settings file must give a warning that names the setting, and none of it
+// applies.
+func TestAHandWrittenNullOnAStructSettingIsNotApplied(t *testing.T) {
+	for _, tc := range []struct{ local, setting string }{
+		{"silence_timeout: 45s\nvoice: null\n", "voice"},
+		{"silence_timeout: 45s\nsummarization:\n  presets: null\n", "summarization.presets"},
+	} {
+		t.Run(tc.setting, func(t *testing.T) {
+			clearEnv(t)
+			path := writeConfig(t, "silence_timeout: 30s\nspeaker_enabled: true\nvoice:\n  enabled: true\n  engine: dgagent\n")
+			localPath := LocalSettingsPath(path)
+			if err := os.WriteFile(localPath, []byte(tc.local), 0o644); err != nil {
+				t.Fatal(err)
+			}
+
+			cfg, warnings, err := Load(path)
+			if err != nil {
+				t.Fatalf("Load returned an error for a null on %s: %v", tc.setting, err)
+			}
+			if cfg.SilenceTimeout != "30s" || !cfg.Voice.Enabled || cfg.Voice.Engine != VoiceEngineDGAgent {
+				t.Errorf("silence_timeout %q, voice %+v; want the release config's 30s and its voice", cfg.SilenceTimeout, cfg.Voice)
+			}
+			if _, ok := cfg.Summarization.Presets["default"]; !ok {
+				t.Errorf("the presets %v lost the built-in default preset", cfg.Summarization.Presets)
+			}
+			if !slices.ContainsFunc(warnings, func(w string) bool {
+				return strings.HasPrefix(w, localPath+": "+tc.setting+": ") && strings.HasSuffix(w, "; settings saved on the page are not applied")
+			}) {
+				t.Errorf("warnings %q do not name %s in %s", warnings, tc.setting, localPath)
+			}
+		})
 	}
-	if after, _ := os.ReadFile(path); !bytes.Equal(after, release) {
-		t.Errorf("the failed save changed the release config:\n%s", after)
+}
+
+// TestASaveThatClearsAnOmittedSettingKeepsTheLocalSettingsFileApplied fails
+// if a save that sets a setting the config file omits when empty
+// (deepgram_buffer_size) back to its zero value writes a null for it: a null
+// on a setting that is not a map's entry makes the next start skip the whole
+// local settings file.
+func TestASaveThatClearsAnOmittedSettingKeepsTheLocalSettingsFileApplied(t *testing.T) {
+	clearEnv(t)
+	t.Setenv(EnvPrefix+"DEEPGRAM_BUFFER_SIZE", "")
+	path := writeConfig(t, "deepgram_buffer_size: 1000000\n")
+	store, _, err := NewStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Update(func(c *Config) { c.DeepgramBufferSize, c.SilenceTimeout = 0, "45s" }); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, warnings, err := NewStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if slices.ContainsFunc(warnings, func(w string) bool { return strings.HasPrefix(w, LocalSettingsPath(path)+": ") }) {
+		t.Errorf("the start skipped the local settings file the save wrote: %q", warnings)
+	}
+	if got := reopened.Get(); got.DeepgramBufferSize != 0 || got.SilenceTimeout != "45s" {
+		t.Errorf("after a restart deepgram_buffer_size %d, silence_timeout %q; want 0 and 45s", got.DeepgramBufferSize, got.SilenceTimeout)
 	}
 }
 

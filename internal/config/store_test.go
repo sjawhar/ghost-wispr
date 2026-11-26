@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -225,15 +226,20 @@ func TestStore_Get_ReturnsCopyOfPresets(t *testing.T) {
 	}
 }
 
+// TestStore_ConcurrentAccess fails if concurrent saves lose one another's
+// change, in memory or in the local settings file: each adds its own preset,
+// and a store reopened from the files must hold all of them.
 func TestStore_ConcurrentAccess(t *testing.T) {
 	clearEnv(t)
-	store, _, err := NewStore("")
+	path := writeConfig(t, "silence_timeout: 30s\n")
+	store, _, err := NewStore(path)
 	if err != nil {
 		t.Fatalf("NewStore failed: %v", err)
 	}
 
+	const writers = 50
 	var wg sync.WaitGroup
-	for i := 0; i < 50; i++ {
+	for i := range writers {
 		wg.Add(2)
 		go func() {
 			defer wg.Done()
@@ -241,10 +247,28 @@ func TestStore_ConcurrentAccess(t *testing.T) {
 		}()
 		go func() {
 			defer wg.Done()
-			_ = store.Update(func(c *Config) { c.SilenceTimeout = "30s" })
+			name := fmt.Sprintf("preset-%02d", i)
+			if err := store.Update(func(c *Config) {
+				c.Summarization.Presets[name] = Preset{Description: name, UserTemplate: "{{transcript}}"}
+			}); err != nil {
+				t.Errorf("save of %s: %v", name, err)
+			}
 		}()
 	}
 	wg.Wait()
+
+	reopened, _, err := NewStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, presets := range map[string]map[string]Preset{"in memory": store.Get().Summarization.Presets, "after a restart": reopened.Get().Summarization.Presets} {
+		for i := range writers {
+			preset := fmt.Sprintf("preset-%02d", i)
+			if presets[preset].Description != preset {
+				t.Errorf("%s the presets lack %s: %d presets held", name, preset, len(presets))
+			}
+		}
+	}
 }
 
 func TestNewStoreWithEnv_LoadsSecretsFromEnvFile(t *testing.T) {
