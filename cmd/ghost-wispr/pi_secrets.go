@@ -126,9 +126,26 @@ func runPiSecrets(ctx context.Context, args []string, stdout io.Writer, defaultC
 	if err != nil {
 		return piSecretsFail(stdout, "could not create Secret Manager reader")
 	}
+	code := 0
+	if len(environment) != 0 {
+		code = stageEnvironment(ctx, stdout, reader, *project, *outDir, environment)
+	}
+	// A failed read or check of an environment secret leaves the certificate
+	// step to run: the two are independent, and only the environment sets the
+	// exit code.
+	if hasCertificate {
+		stageCertificate(ctx, stdout, reader, signIn, credentialFile, *project, *certificateSecret, *keyFile, *installedCertificate, *outDir)
+	}
+	return code
+}
+
+// stageEnvironment reads and checks each environment secret, then writes
+// secrets.env with every value, in flag order. It writes nothing when one read
+// or check fails, and returns the exit code.
+func stageEnvironment(ctx context.Context, stdout io.Writer, reader secretReader, project, outDir string, environment []environmentSecret) int {
 	for index := range environment {
 		secret := &environment[index]
-		version, err := reader.Access(ctx, *project, secret.secret, "latest")
+		version, err := reader.Access(ctx, project, secret.secret, "latest")
 		if err != nil {
 			return piSecretsFail(stdout, "could not read %s from %s", secret.variable, secret.secret)
 		}
@@ -139,26 +156,19 @@ func runPiSecrets(ctx context.Context, args []string, stdout io.Writer, defaultC
 		secret.value = value
 		secret.version = version.Version
 	}
-	if len(environment) != 0 {
-		contents := make([]byte, 0)
-		for _, secret := range environment {
-			contents = append(contents, secret.variable...)
-			contents = append(contents, '=')
-			contents = append(contents, secret.value...)
-			contents = append(contents, '\n')
-		}
-		if err := writePrivateFile(*outDir, "secrets.env", contents); err != nil {
-			return piSecretsFail(stdout, "could not write secrets.env")
-		}
-		for _, secret := range environment {
-			_, _ = fmt.Fprintf(stdout, "pi-secrets: %s from %s version %d\n", secret.variable, secret.secret, secret.version)
-		}
+	contents := make([]byte, 0)
+	for _, secret := range environment {
+		contents = append(contents, secret.variable...)
+		contents = append(contents, '=')
+		contents = append(contents, secret.value...)
+		contents = append(contents, '\n')
 	}
-	if !hasCertificate {
-		return 0
+	if err := writePrivateFile(outDir, "secrets.env", contents); err != nil {
+		return piSecretsFail(stdout, "could not write secrets.env")
 	}
-
-	stageCertificate(ctx, stdout, reader, signIn, credentialFile, *project, *certificateSecret, *keyFile, *installedCertificate, *outDir)
+	for _, secret := range environment {
+		_, _ = fmt.Fprintf(stdout, "pi-secrets: %s from %s version %d\n", secret.variable, secret.secret, secret.version)
+	}
 	return 0
 }
 
