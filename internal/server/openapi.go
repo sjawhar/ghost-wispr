@@ -34,6 +34,7 @@ var providerSchema = map[string]any{
 					"description": "How the unit signs in: api_key (a key from the variable env names), google (a Google access token, by workload identity or Application Default Credentials), google_id_token (a Google ID token for audience) or openai_wif (an OpenAI access token in exchange for the unit's Google ID token)",
 				},
 				"env":                  map[string]any{"type": "string", "description": "api_key: the environment variable that holds the key; the key itself is never served"},
+				"read_only":            map[string]any{"type": "boolean", "description": "api_key: the deployment owns the key, so settings cannot replace it"},
 				"audience":             map[string]any{"type": "string", "description": "google_id_token: the ID token's audience"},
 				"identity_provider_id": map[string]any{"type": "string", "description": "openai_wif: OpenAI's identity provider id, not a secret"},
 				"service_account_id":   map[string]any{"type": "string", "description": "openai_wif: OpenAI's service account id, not a secret"},
@@ -91,7 +92,7 @@ var configSchema = map[string]any{
 		"provider_keys": map[string]any{
 			"type":                 "object",
 			"writeOnly":            true,
-			"description":          "PATCH only: the key of each named provider that signs in with one (auth.kind api_key), saved under the variable its auth.env names, in the unit's .env file. A provider that signs in another way takes no key: the PATCH is refused with 400. GET never serves a key.",
+			"description":          "PATCH only: the key of each named provider that signs in with one (auth.kind api_key), saved under the variable its auth.env names, in the unit's .env file. A provider that signs in another way, or whose auth.read_only is true, takes no settings key: the PATCH is refused with 400. GET never serves a key.",
 			"additionalProperties": map[string]any{"type": "string"},
 		},
 		"summarization": map[string]any{
