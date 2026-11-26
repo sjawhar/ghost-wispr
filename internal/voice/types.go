@@ -34,9 +34,18 @@ type Exchange struct {
 	// Recent is up to the last 2 minutes of labelled final segments, with
 	// the words a take-back cancelled left out (Config.TakeBack).
 	Recent []TurnText
-	Tap    <-chan audio.Frame // room audio from the wake on, 16 kHz mono, only while the capture gate is open
-	Out    Output             // the speaker output's "voice" input
-	Tools  ToolRunner         // the Concierge
+	// Room is the asker's words (AskerTurn) and the room's recent words
+	// (Recent) as a model may read them now, with the current turn's
+	// take-back applied, though the room said it after this copy was made
+	// (Supervisor.modelViewLocked). A voice reads AskerTurn and Recent once,
+	// as it opens; every send after that calls Room, never a copy it kept
+	// (Main, after Sol's fifteenth review of #191). Room locks the
+	// Supervisor: call it with no lock of the voice's own held. nil, outside
+	// a Supervisor: AskerTurn and Recent as they are.
+	Room  func() (asker string, recent []TurnText)
+	Tap   <-chan audio.Frame // room audio from the wake on, 16 kHz mono, only while the capture gate is open
+	Out   Output             // the speaker output's "voice" input
+	Tools ToolRunner         // the Concierge
 	// Turn numbers the asker's turns in the exchange: the Heard calls of a
 	// turn and its Answer carry one number, and a later turn a greater one.
 	// Once the Concierge begins to answer a turn, a Heard of that turn or an

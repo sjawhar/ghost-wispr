@@ -61,7 +61,7 @@ func history(x *voice.Exchange) []initialItem {
 	var tail string
 	switch asker := strings.TrimSpace(x.AskerTurn); {
 	case asker == "":
-	case askerInRecent(x):
+	case askerInRecent(asker, x.Recent):
 		tail = "The last line above is the person calling you."
 	default:
 		tail = "The person calling you has said so far: " + truncate(asker, historyBudget/2)
@@ -103,15 +103,16 @@ func history(x *voice.Exchange) []initialItem {
 	return []initialItem{userMessage(b.String())}
 }
 
-// askerInRecent reports whether x's newest transcript line already holds
-// the asker's words: the Supervisor's Recent ends with the wake sentence.
-func askerInRecent(x *voice.Exchange) bool {
-	asker := words(x.AskerTurn)
+// askerInRecent reports whether recent's newest transcript line already
+// holds the asker's words: the Supervisor's Recent ends with the wake
+// sentence.
+func askerInRecent(asker string, recent []voice.TurnText) bool {
+	asker = words(asker)
 	if asker == "" {
 		return false
 	}
-	for i := len(x.Recent) - 1; i >= 0; i-- {
-		if text := words(x.Recent[i].Text); text != "" {
+	for i := len(recent) - 1; i >= 0; i-- {
+		if text := words(recent[i].Text); text != "" {
 			return strings.Contains(text, asker)
 		}
 	}

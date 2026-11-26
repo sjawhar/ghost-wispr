@@ -83,6 +83,11 @@ type session struct {
 	heldAnswer   held          // an answer Deepgram refused, to hand over when the room is done
 	retry        *time.Timer
 	asker        *time.Timer // sends the asker's words as text if Deepgram hears no turn
+	// room is the asker's words and the room's recent words as a model may
+	// read them now (voice.Exchange.Room): the asker timer reads it as it
+	// fires, never the words of the session's opening (Sol's fifteenth
+	// review of #191).
+	room func() (string, []voice.TurnText)
 	// abandoned holds the words of injections the session gave up on while
 	// Deepgram may still speak them: they are not played when it does.
 	abandoned [][]string
@@ -160,7 +165,12 @@ func start(cfg *Config, conn *websocket.Conn, x *voice.Exchange) *session {
 	go s.read()
 	go s.play()
 	if words := strings.TrimSpace(x.AskerTurn); words != "" {
-		s.asker = time.AfterFunc(cfg.askerWait, func() { s.askIfUnheard(words) })
+		s.room = x.Room
+		if s.room == nil {
+			asker, recent := x.AskerTurn, x.Recent
+			s.room = func() (string, []voice.TurnText) { return asker, recent }
+		}
+		s.asker = time.AfterFunc(cfg.askerWait, s.askIfUnheard)
 	}
 	s.workers.Add(2)
 	go s.pump()
@@ -613,19 +623,25 @@ func (s *session) retryRefused() {
 	_ = s.await(s.ctx, w)
 }
 
-// askIfUnheard hands Deepgram the asker's words at the wake as the room's
-// text when it has heard no turn of the room's since the session opened:
-// the live transcript can lag the mic by more than the tap holds, and the
-// question's audio is then gone before the session opens (the end-to-end
-// proof at ace991b saw a 10 s lag, and the exchange ended in silence).
-func (s *session) askIfUnheard(words string) {
+// askIfUnheard hands Deepgram the asker's words as the room's text when it
+// has heard no turn of the room's since the session opened: the live
+// transcript can lag the mic by more than the tap holds, and the question's
+// audio is then gone before the session opens (the end-to-end proof at
+// ace991b saw a 10 s lag, and the exchange ended in silence). The words are
+// the asker's as a model may read them now (room): a take-back said since
+// the session opened leaves out what it cancelled.
+func (s *session) askIfUnheard() {
 	s.mu.Lock()
 	heard := s.userTurns > 0
 	s.mu.Unlock()
 	if heard || s.ctx.Err() != nil {
 		return
 	}
-	s.log.Info("Deepgram heard no turn; the asker's words at the wake go to it as text")
+	words, _ := s.room() // with no lock of the session's held: it locks the Supervisor
+	if words = strings.TrimSpace(words); words == "" {
+		return
+	}
+	s.log.Info("Deepgram heard no turn; the asker's words go to it as text")
 	if err := s.writeJSON(injectUserMessage{Type: "InjectUserMessage", Content: words}); err != nil {
 		s.log.Info("the asker's words could not be sent", "reason", err)
 	}

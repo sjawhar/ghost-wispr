@@ -1544,7 +1544,7 @@ func (s *Supervisor) startLocked(t *Transcript, m transcript.Match) {
 		Tap:       s.tapFor(voice, wakeLag(t, m)),
 		Out:       exchangeOutput{s: s, ex: ex},
 	}
-	ex.x.Tools = exchangeTools{s: s, ex: ex}
+	ex.x.Tools, ex.x.Room = exchangeTools{s: s, ex: ex}, s.roomOf(ex)
 	s.exTimingLocked(ex, "wake_heard", monoclock.Stamp{Wall: t.At, Mono: t.Mono})
 	s.noteLocked(ex, EventWakeHeard, sessionID)
 	s.turnLocked(ex, t, m.Rest)
@@ -2272,7 +2272,7 @@ func (s *Supervisor) speakLocked(p *pendingAnswer, turnAt time.Time) {
 	}
 	ex.openSeq = starts
 	ex.x = Exchange{SessionID: sessionID, WakeAt: time.Now(), IssueKey: p.IssueKey, Recent: s.recentLocked(), Tap: s.tapFor(voice, 0), Out: exchangeOutput{s: s, ex: ex}}
-	ex.x.Tools = exchangeTools{s: s, ex: ex}
+	ex.x.Tools, ex.x.Room = exchangeTools{s: s, ex: ex}, s.roomOf(ex)
 	s.bindMeetingLocked(ex, sessionID)
 	x := s.modelViewLocked(ex, &ex.x)
 	sayCtx, release := context.Context(ex.ctx), func() {}
@@ -3037,6 +3037,36 @@ func (s *Supervisor) takenTexts(ex *exchange) map[uint64]string {
 	return texts
 }
 
+// roomOf is ex's Exchange.Room: the asker's words and the room's recent
+// words as a model may read them when a voice calls it, under s.mu, so a
+// send after Open never repeats words the room took back since (Main, after
+// Sol's fifteenth review of #191). The recent words are ex's current view
+// (modelViewLocked); the asker's words are ex's current turn after its last
+// take-back (askerNowLocked), also once that turn was handed to an answer:
+// a voice that asks it again replays that turn, as the room said it.
+func (s *Supervisor) roomOf(ex *exchange) func() (string, []TurnText) {
+	return func() (string, []TurnText) {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		x := s.modelViewLocked(ex, &ex.x)
+		if asker := s.askerNowLocked(ex); asker != "" {
+			x.AskerTurn = asker
+		}
+		return x.AskerTurn, x.Recent
+	}
+}
+
+// askerNowLocked is ex's current turn as a model may read it: its words
+// after the last take-back of its raw finals, keys written (turnOf).
+func (s *Supervisor) askerNowLocked(ex *exchange) string {
+	if finals := finalsOf(ex); s.cfg.TakeBack != nil && finals != "" {
+		if rest, taken := s.cfg.TakeBack(finals); taken {
+			return s.withKeys(ex, strings.Join(strings.Fields(rest), " "))
+		}
+	}
+	return s.turnOf(ex)
+}
+
 // modelViewLocked is a copy of from, an exchange of ex, as every model and
 // vendor reads it: the room's recent words (Recent) and the asker's words
 // (AskerTurn) with what ex's current turn took back left out, though the
@@ -3044,9 +3074,9 @@ func (s *Supervisor) takenTexts(ex *exchange) map[uint64]string {
 // fourteenth review of #191). The retained history and the raw finals
 // (Finals, Reply) stay as they were until the turn is complete
 // (takeBackLocked): a quotation still open may close and make its "cancel"
-// no take-back. Every copy of an
-// exchange the Supervisor hands out is this view: a voice's Open, the
-// Concierge's Heard and Answer, and the answer tool.
+// no take-back. Every copy of an exchange the Supervisor hands out is this
+// view: a voice's Open, the Concierge's Heard and Answer, and the answer
+// tool; a voice's later sends read it through Exchange.Room (roomOf).
 func (s *Supervisor) modelViewLocked(ex *exchange, from *Exchange) Exchange {
 	x := *from
 	if s.cfg.TakeBack == nil {

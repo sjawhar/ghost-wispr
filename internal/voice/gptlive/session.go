@@ -285,21 +285,22 @@ type session struct {
 	facts      []*factAudit
 	factErrors atomic.Int64
 
-	mu           sync.Mutex
-	closing      bool
-	release      func() bool // stops the close on the exchange's end
-	over         bool        // the session ended and said so on Events
-	nextID       int
-	pending      map[string]chan error // acknowledgements awaited, by client event id
-	pendingDone  bool
-	delegations  map[string]bool
-	asked        bool            // a delegation has taken the asker's words
-	lastQuestion string          // the last delegation's question
-	turn         strings.Builder // heard since the last EventUserTurn
-	sinceAsk     strings.Builder // heard since the last delegation
-	heardAt      time.Time       // when GPT-Live last heard the room say something
-	heardWake    chan struct{}   // signalled at each word GPT-Live hears
-	dialogue     []dialogueLine  // what was heard and said in this session
+	mu          sync.Mutex
+	closing     bool
+	release     func() bool // stops the close on the exchange's end
+	over        bool        // the session ended and said so on Events
+	nextID      int
+	pending     map[string]chan error // acknowledgements awaited, by client event id
+	pendingDone bool
+	delegations map[string]bool
+	asked       bool            // a delegation has taken the asker's words
+	lastHeard   string          // what GPT-Live heard for the last delegation, never the Supervisor's words
+	lastLed     bool            // the asker's words led the last delegation's question
+	turn        strings.Builder // heard since the last EventUserTurn
+	sinceAsk    strings.Builder // heard since the last delegation
+	heardAt     time.Time       // when GPT-Live last heard the room say something
+	heardWake   chan struct{}   // signalled at each word GPT-Live hears
+	dialogue    []dialogueLine  // what was heard and said in this session
 }
 
 type dialogueLine struct {
@@ -912,9 +913,12 @@ func (s *session) ask(id string) {
 	if !s.awaitQuestion() {
 		return
 	}
+	// The room's words as a model may read them now, read before s.mu:
+	// Room locks the Supervisor (voice.Exchange.Room).
+	asker, recent := s.room()
 	s.mu.Lock()
-	question := s.questionLocked()
-	transcript := s.transcriptLocked()
+	question := s.questionLocked(asker, recent)
+	transcript := s.transcriptLocked(asker, recent)
 	s.mu.Unlock()
 	s.flushTurn()
 
@@ -958,27 +962,42 @@ func (s *session) awaitQuestion() bool {
 	}
 }
 
+// room is the asker's words and the room's recent words as a model may read
+// them now (voice.Exchange.Room), or, with no Room, as the session opened
+// with them. Every send after Open reads them here, never a copy the session
+// kept (Main, after Sol's fifteenth review of #191).
+func (s *session) room() (string, []voice.TurnText) {
+	if s.x.Room != nil {
+		return s.x.Room()
+	}
+	return s.x.AskerTurn, s.x.Recent
+}
+
 // questionLocked is the question for a delegation: what GPT-Live heard
-// since the last one, with the asker's words at the wake before it on the
-// first unless it heard them too. A delegation that heard nothing new asks
-// the last question again; with none yet, nothing was heard at all, and it
-// asks the meeting's last line, so a question never goes out empty.
-func (s *session) questionLocked() string {
-	question := strings.TrimSpace(s.sinceAsk.String())
+// since the last one, with asker, the asker's words now (room), before it
+// on the first unless it heard them too. A delegation that heard nothing
+// new asks the last question again, made again of what GPT-Live heard for
+// it and, if it led it, the asker's words now: the session keeps no words
+// the Supervisor gave it, so a take-back said since leaves them out (Sol's
+// fifteenth review of #191). With none yet, nothing was heard at all, and
+// it asks the meeting's last line in recent, so a question never goes out
+// empty.
+func (s *session) questionLocked(asker string, recent []voice.TurnText) string {
+	heard := strings.TrimSpace(s.sinceAsk.String())
 	s.sinceAsk.Reset()
-	if !s.asked {
-		s.asked = true
-		if asker := strings.TrimSpace(s.x.AskerTurn); asker != "" && !strings.Contains(words(question), words(asker)) {
-			question = strings.TrimSpace(asker + " " + question)
-		}
+	led := !s.asked
+	if heard == "" && s.asked {
+		heard, led = s.lastHeard, s.lastLed
 	}
-	if question == "" {
-		question = s.lastQuestion
+	s.asked = true
+	s.lastHeard, s.lastLed = heard, led
+	question := heard
+	if asker = strings.TrimSpace(asker); led && asker != "" && !strings.Contains(words(question), words(asker)) {
+		question = strings.TrimSpace(asker + " " + question)
 	}
-	for i := len(s.x.Recent) - 1; question == "" && i >= 0; i-- {
-		question = strings.Join(strings.Fields(s.x.Recent[i].Text), " ")
+	for i := len(recent) - 1; question == "" && i >= 0; i-- {
+		question = strings.Join(strings.Fields(recent[i].Text), " ")
 	}
-	s.lastQuestion = question
 	return question
 }
 
@@ -1009,16 +1028,17 @@ func (s *session) answer(call voice.ToolCall) {
 }
 
 // transcriptLocked is the meeting before the call, labelled by speaker, the
-// asker's words at the call, then what was heard and said since.
-func (s *session) transcriptLocked() string {
+// asker's words at the call, both as a model may read them now (room), then
+// what was heard and said since.
+func (s *session) transcriptLocked(asker string, recent []voice.TurnText) string {
 	var b strings.Builder
-	for _, t := range s.x.Recent {
+	for _, t := range recent {
 		if line := turnLine(t); line != "" {
 			b.WriteString(line)
 			b.WriteByte('\n')
 		}
 	}
-	if asker := strings.TrimSpace(s.x.AskerTurn); asker != "" && !askerInRecent(&s.x) {
+	if asker = strings.TrimSpace(asker); asker != "" && !askerInRecent(asker, recent) {
 		b.WriteString("Asker, calling Wispr: ")
 		b.WriteString(asker)
 		b.WriteByte('\n')
