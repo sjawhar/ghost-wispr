@@ -187,6 +187,44 @@ func TestRunbookSaysHowThePiFindsARenewedCertificate(t *testing.T) {
 	}
 }
 
+// TestRunbookSaysTheCertificatePairChangesAsOne fails if "Renew the X.509
+// certificate" does not say how update.sh installs device.crt and
+// device.crt.version as one change: the journal device.crt.version.new first,
+// then the certificate, then the version file, then the journal's removal, a
+// rollback the same way; and what each run, update.sh secrets too, does with a
+// journal that a run cut short left, with both lines it prints. It also fails
+// if "The Pi's secrets" still says that update.sh secrets changes nothing but
+// the four lines of .env, or does not say that it puts right a certificate swap
+// cut short.
+func TestRunbookSaysTheCertificatePairChangesAsOne(t *testing.T) {
+	section := runbookSection(t, "## Renew the X.509 certificate")
+	for _, words := range []string{"`/opt/ghost-wispr/device.crt.version.new`", "Then it renames the certificate over `device.crt`, then writes or removes `device.crt.version`, and then removes the journal", "A rollback puts the pair back the same way", "`update.sh secrets` too", "ghost-wispr update: finished the certificate swap that a run cut short: device.crt.version is <version>", "ghost-wispr update: removed /opt/ghost-wispr/device.crt.version.new, of a run cut short before its certificate went in; device.crt and device.crt.version stay as they are"} {
+		if !strings.Contains(section, words) {
+			t.Errorf("the runbook's \"Renew the X.509 certificate\" does not say %q", words)
+		}
+	}
+	secrets := runbookSection(t, "## The Pi's secrets")
+	if strings.Contains(secrets, "writes the four lines and changes nothing else") {
+		t.Error(`the runbook's "The Pi's secrets" still says that update.sh secrets changes nothing but the four lines of .env`)
+	}
+	if !strings.Contains(secrets, "a certificate swap that a run cut short") {
+		t.Error(`the runbook's "The Pi's secrets" does not say that update.sh secrets puts right a certificate swap that a run cut short`)
+	}
+}
+
+// TestRunbookSaysTheBridgeIsReadAgainBeforeTheSwap fails if "Update and
+// inspect" does not say that the update compares the call bridge's link
+// versions at the first status read and again at the read just before the
+// swap, and that a hold at either read changes no file of the deploy set.
+func TestRunbookSaysTheBridgeIsReadAgainBeforeTheSwap(t *testing.T) {
+	section := runbookSection(t, "## Update and inspect")
+	for _, words := range []string{"at the first status read, and again at the status read just before the swap", "A hold at either read changes no file of the deploy set"} {
+		if !strings.Contains(section, words) {
+			t.Errorf("the runbook's \"Update and inspect\" does not say %q", words)
+		}
+	}
+}
+
 // TestRunbookSaysWhatTheUpdateRefusesAndRepairs fails if "Update and inspect"
 // does not say that the refusal of an override or a drop-in holds for new
 // secrets and a renewed certificate too, that the update restarts a recorder
