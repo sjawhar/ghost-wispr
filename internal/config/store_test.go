@@ -95,7 +95,7 @@ func TestStore_Update_ValidationRejectsInvalidModel(t *testing.T) {
 	}
 }
 
-func TestStore_Update_WritesYAML(t *testing.T) {
+func TestStore_Update_WritesLocalSettingsYAML(t *testing.T) {
 	clearEnv(t)
 
 	dir := t.TempDir()
@@ -113,12 +113,12 @@ func TestStore_Update_WritesYAML(t *testing.T) {
 		t.Fatalf("Update failed: %v", err)
 	}
 
-	data, err := os.ReadFile(configPath)
+	data, err := os.ReadFile(LocalSettingsPath(configPath))
 	if err != nil {
-		t.Fatalf("read config: %v", err)
+		t.Fatalf("read local settings: %v", err)
 	}
 	if !strings.Contains(string(data), "45s") {
-		t.Fatalf("expected YAML to contain 45s, got:\n%s", data)
+		t.Fatalf("expected local settings to contain 45s, got:\n%s", data)
 	}
 }
 
@@ -141,12 +141,12 @@ func TestStore_Update_DoesNotWriteSecretsToYAML(t *testing.T) {
 		t.Fatalf("Update failed: %v", err)
 	}
 
-	data, err := os.ReadFile(configPath)
+	data, err := os.ReadFile(LocalSettingsPath(configPath))
 	if err != nil {
-		t.Fatalf("read config: %v", err)
+		t.Fatalf("read local settings: %v", err)
 	}
 	if strings.Contains(string(data), "sk-secret-key") {
-		t.Fatal("secrets should not be written to YAML")
+		t.Fatal("secrets should not be written to local settings YAML")
 	}
 }
 
@@ -329,10 +329,17 @@ func TestStore_Update_WritesSecretsToEnvFile(t *testing.T) {
 		t.Fatalf("expected .env to contain OpenAI key, got:\n%s", data)
 	}
 
-	// Verify secret NOT in YAML
-	yamlData, _ := os.ReadFile(configPath)
-	if strings.Contains(string(yamlData), "sk-test-key") {
-		t.Fatal("secret should not appear in YAML file")
+	for _, yamlPath := range []string{configPath, LocalSettingsPath(configPath)} {
+		yamlData, err := os.ReadFile(yamlPath)
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			t.Fatalf("read %s: %v", yamlPath, err)
+		}
+		if strings.Contains(string(yamlData), "sk-test-key") {
+			t.Fatalf("secret should not appear in YAML file %s", yamlPath)
+		}
 	}
 }
 

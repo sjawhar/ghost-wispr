@@ -3,7 +3,6 @@ package config
 import (
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 )
 
@@ -11,8 +10,8 @@ import (
 // sound card the microphone opens, is not read from ghost-wispr.yaml, is not
 // overridden by GHOST_WISPR_MIC_DEVICE (as an injected-audio acceptance run
 // sets it to Loopback for its run), or is lost when a settings save writes
-// the config back. Unset, it is empty: the microphone opens the default
-// input, as before the setting existed.
+// another setting to local settings. Unset, it is empty: the microphone opens
+// the default input, as before the setting existed.
 func TestMicDeviceComesFromTheConfigAndTheEnvironment(t *testing.T) {
 	clearEnv(t)
 	t.Setenv(EnvPrefix+"MIC_DEVICE", "")
@@ -51,15 +50,14 @@ func TestMicDeviceComesFromTheConfigAndTheEnvironment(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewStore: %v", err)
 	}
-	// A settings save, here of another key, writes the whole config back.
 	if err := store.Update(func(c *Config) { c.SpeakerEnabled = true }); err != nil {
 		t.Fatalf("Update: %v", err)
 	}
-	saved, err := os.ReadFile(path)
+	restarted, _, err := NewStore(path)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("NewStore after a settings save: %v", err)
 	}
-	if !strings.Contains(string(saved), "mic_device: Jabra") {
-		t.Fatalf("a settings save dropped mic_device:\n%s", saved)
+	if got := restarted.Get().MicDevice; got != "Jabra" {
+		t.Fatalf("a settings save dropped mic_device: %q", got)
 	}
 }
