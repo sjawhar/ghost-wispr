@@ -183,10 +183,11 @@ has no providers.
 | `project`, `location` | Vertex AI only: the Google Cloud project (by default the project of a service-account credential file), and the location: `global` (the default), `us`, `eu` or a region such as `us-central1` |
 | `labels` | Vertex AI only: request labels, such as `owner: example-owner`, that each Gemini generate call on the provider carries (`generateContent` and `streamGenerateContent`: summaries, the Concierge and Gemini TTS); Vertex AI copies them into Cloud Billing for pay-as-you-go traffic. Each provider carries its own. Embeddings and the provider check carry none. Google's rules allow a key of 1 to 63 lowercase or international letters, digits, `_` or `-` that starts with a letter, a value of up to 63 of them, and at most 64 labels a call. Labels that break these rules warn at start, and are sent as written: Vertex AI answers such a call, but Cloud Billing may not attribute spend by them. Labels on another API warn at start, and its calls carry none |
 | `auth.kind` | How Ghost Wispr signs in, one of the kinds below |
+| `auth.read_only` | `api_key` only: `true` means the deployment owns the `auth.env` key. The settings page does not offer a key input, and a `provider_keys` PATCH for it returns 400 |
 
 | `auth.kind` | What Ghost Wispr sends | Its settings |
 |-------------|------------------------|--------------|
-| `api_key` | The key in the environment variable `auth.env`, or in `.env`, where the settings page saves it | `env` |
+| `api_key` | The key in the environment variable `auth.env`, or in `.env`, where the settings page saves it unless `auth.read_only` is true | `env`; `read_only` |
 | `google` | A Google access token from `google_credentials_file` (workload identity federation or a service-account file), else from Application Default Credentials. Vertex AI and Cloud Text-to-Speech only | — |
 | `google_id_token` | A Google ID token for `auth.audience`, minted from `google_credentials_file`, else from Application Default Credentials: an external-account credential (workload identity federation) by impersonating the service account it names, a service-account key file, or on a Compute Engine VM with neither, the VM's service account from its metadata server. For an endpoint that admits Google ID tokens, such as a model gateway, at its `url` | `audience` |
 | `openai_wif` | An OpenAI access token that OpenAI's workload identity federation gives in exchange for a Google ID token, minted as for `google_id_token`. The OpenAI API only | `identity_provider_id`, `service_account_id` (ids, not secrets) |
@@ -301,8 +302,8 @@ Moving the role back to a direct provider is the same change.
 ### The settings page and the API
 
 The settings page lists each provider: its API, address and sign-in, the roles that use it, and
-whether it signed in when last checked; an `api_key` provider also has a field for its key. The
-check signs in, and where the API has a cheap read the credential must pass (a model list,
+whether it signed in when last checked; an `api_key` provider whose `auth.read_only` is not true has
+a field for its key. A deployment-owned key says it cannot be changed there. The check signs in, and
 Deepgram's projects, the ElevenLabs user, Cloud Text-to-Speech's voices, or for Vertex AI a count
 of a short text's tokens on each model the roles call there, which costs nothing and needs only the
 predict permission), makes it; a Vertex AI refusal or 404 (no such model or location) of any of
@@ -356,9 +357,9 @@ began with a key a save has since replaced is not kept as the provider's last ch
   field nobody is typing in shows the config the page last took. A config with another value for a
   field being typed in ends that edit for good; the field shows the new value and says "Changed on
   the unit or in another tab; your edit was replaced." until the next input in it.
-- `PATCH /api/config` takes `provider_keys: {"<provider>": "<key>"}` for `api_key` providers and
-  writes each key into `.env` under the provider's `auth.env`; any other provider or a key containing
-  control characters is a 400. It also takes `tts: {model, voice}`, `summarization: {model, presets}`
+- `PATCH /api/config` takes `provider_keys: {"<provider>": "<key>"}` for `api_key` providers whose
+  `auth.read_only` is not true and writes each key into `.env` under the provider's `auth.env`; any
+  other provider, a read-only provider, or a key containing control characters is a 400. It also takes `tts: {model, voice}`, `summarization: {model, presets}`
   and `voice: {enabled, engine}` among its other fields, refuses a summarization or text-to-speech
   model that no provider serves, and answers 400 to a field it does not know. A preset in
   `summarization.presets` changes only the fields the patch names, `null` deletes it, and a preset

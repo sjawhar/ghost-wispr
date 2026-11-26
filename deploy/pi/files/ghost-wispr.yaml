@@ -90,8 +90,9 @@ embedding:
   # to the gateway is `model: gateway/gemini-embedding-2`, with the gateway entry under providers
   # uncommented (docs/pi-setup.md, "The model gateway").
   model: vertex/gemini-embedding-2
-# provision.sh --models <shared-drive-id> adds gdrive_folder_id and turns gdrive_sync_enabled
-# and gc_enabled on; GC removes only local audio that Drive holds a copy of.
+# provision.sh --models <shared-drive-id> establishes gdrive_folder_id; update.sh keeps that drive
+# ID in releases and turns gdrive_sync_enabled and gc_enabled on. GC removes only local audio that
+# Drive holds a copy of.
 gdrive_sync_enabled: false
 gc_enabled: false
 gc_max_age_days: 0
@@ -137,8 +138,8 @@ voice:
   dgagent:
     provider: deepgram
 # The Concierge answers on Gemini on Vertex AI. It reads Dispatch with the Pi's own no-scope token
-# (GHOST_WISPR_DISPATCH_TOKEN, the credential bundle's dispatch-token) and asks an issue's agent
-# through the Envoy listener.
+# (GHOST_WISPR_DISPATCH_TOKEN, Secret Manager's operator-only-ghost-wispr-dispatch-token, which
+# update.sh reads) and asks an issue's agent through the Envoy listener.
 concierge:
   model: vertex/gemini-3.5-flash-lite
   dispatch_url: https://dispatch.tail12ec1c.ts.net

@@ -130,6 +130,8 @@ func (s *Store) TryUpdate(fn func(*Config) error) error {
 	if s.cfg.LogLevel != prev.LogLevel {
 		writtenLogLevel = s.cfg.LogLevel
 	}
+	providerKeysChanged := !maps.Equal(s.cfg.ProviderKeys, prev.ProviderKeys) ||
+		!maps.Equal(s.cfg.keysSet, prev.keysSet)
 	if s.path != "" {
 		if err := s.writeYAML(writtenLogLevel); err != nil {
 			s.cfg = prev
@@ -138,7 +140,7 @@ func (s *Store) TryUpdate(fn func(*Config) error) error {
 		}
 	}
 
-	if s.envPath != "" {
+	if s.envPath != "" && providerKeysChanged {
 		if err := s.writeEnvFile(); err != nil {
 			s.cfg = prev
 			if s.path != "" {
