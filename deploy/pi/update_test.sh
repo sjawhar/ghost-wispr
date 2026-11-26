@@ -22,9 +22,28 @@ readonly releases="$work_dir/releases" bin="$work_dir/bin" timeout_bin="$work_di
 real_timeout=$(command -v timeout)
 readonly real_timeout
 
+# The cases of the spec's check c-update (dispatch://INFRA-5935/spec v5), each of which begin names.
+readonly case_names=(whole-set system-files-unchanged env-lines local-settings-untouched override-refused
+  drop-in-refused rollback-whole-set partial-install same-commit-different-set transition no-binary-yet
+  prev-copy-by-rename busy-session busy-call busy-during-download held-link-versions bad-manifest
+  secrets-only-change secrets-read-fails pi-secrets-hangs certificate release-and-certificate secrets-mode
+  drift launcher unit-limits)
+current_case=setup
+ran_cases=' '
+
 fail() {
-  printf 'update test FAILED: %s\n' "$*" >&2
+  printf 'update test FAILED (%s): %s\n' "$current_case" "$*" >&2
   exit 1
+}
+
+# begin NAME starts the case NAME of c-update, which each failure then names.
+begin() {
+  [[ " ${case_names[*]} " == *" $1 "* ]] || fail "begin: $1 is not a case of the check c-update"
+  current_case=$1
+  if [[ $ran_cases != *" $1 "* ]]; then
+    ran_cases+="$1 "
+    printf 'update test: %s\n' "$1"
+  fi
 }
 
 # A release binary that a fake restart left running (busy-exec below).
@@ -894,7 +913,9 @@ lib() {
 }
 
 # ---------------------------------------------------------------------------------------------------
-# pi-lib.sh: update.sh and provision.sh both source it.
+# whole-set, first: pi-lib.sh, which update.sh and provision.sh both source, and the renderer by
+# whose rule the set's config installs (R6).
+begin whole-set
 
 # It defines no fail and makes no variable readonly: update.sh and provision.sh each define their own
 # fail and a readonly DEPLOY_DIR, so a library that defined either would break whichever script
@@ -979,6 +1000,7 @@ for deployed in "$work_dir/two-drives.yaml" "$work_dir/bad-drive.yaml"; do
   fi
 done
 
+begin env-lines
 # env_kept_lines, moved from provision.sh's render_models_env, keeps every line of a deployed .env
 # in order, comments included, but the four lines update.sh owns (C3) and the variables Ghost Wispr
 # no longer reads, each of which would warn at every start. It keeps the role overrides that share
@@ -1001,6 +1023,7 @@ if lib env_kept_lines "$work_dir/missing.env" >/dev/null 2>&1; then
 fi
 
 # ---------------------------------------------------------------------------------------------------
+begin whole-set
 # whole-set: a new release installs every file of its deploy set as one unit. A set installed in
 # part would run a binary on another release's config, units or udev rule.
 new_pi
@@ -1102,6 +1125,7 @@ for kind in status version release tarball tarball-checksum binary binary-checks
   [[ ${!seen} == 1 ]] || fail "whole-set: made no $kind call: $(<"$state/curl.log")"
 done
 
+begin system-files-unchanged
 # system-files-unchanged: a release whose udev rule and logind setting are the installed ones
 # installs neither and reloads neither: a udev trigger replays the device events, and a logind
 # restart is a restart of the Pi's login manager, each for no change.
@@ -1116,6 +1140,7 @@ if grep -Eq 'udevadm|systemd-logind| install ' "$state/sudo.log"; then
   fail "system-files-unchanged: installed or reloaded an unchanged system file: $(<"$state/sudo.log")"
 fi
 
+begin env-lines
 # env-lines: update.sh owns four .env lines, first and in C3's order; it keeps every operator line
 # (the Jabra button switch, a microphone override) and drops the variables Ghost Wispr no longer
 # reads, so an operator's override survives each release and no removed setting warns.
@@ -1133,6 +1158,7 @@ expect_env env-lines GHOST_WISPR_ADDR=127.0.0.1:8080 GOOGLE_API_USE_CLIENT_CERTI
   GHOST_WISPR_DEEPGRAM_API_KEY=dg-test-2 GHOST_WISPR_DISPATCH_TOKEN=tok-test-2 '# set by the operator' \
   GHOST_WISPR_JABRA_MUTE_BUTTON=false GHOST_WISPR_MIC_DEVICE=hw:Loopback
 
+begin local-settings-untouched
 # local-settings-untouched: the local settings file holds what people saved on the Pi's page (D13).
 # The release never ships it, and neither an install nor a rollback changes it or keeps a copy: a
 # rollback that restored an older copy would undo a save.
@@ -1159,6 +1185,7 @@ if [[ -n $(find "$pi" -name '*local*' ! -path "$opt/ghost-wispr.local.yaml") ]];
   fail "local-settings-untouched: copied the local settings file: $(find "$pi" -name '*local*')"
 fi
 
+begin override-refused
 # override-refused: a .env line, or the user manager's environment, that sets GHOST_WISPR_CONFIG or
 # an Envoy variable would override the release's config, so the Pi would not run what the release
 # says; update.sh refuses to install, changing nothing. The .env check reads a line past leading
@@ -1206,6 +1233,7 @@ printf '%s\n' HOME=/home/ghost-wispr PATH=/usr/bin:/bin MY_GHOST_WISPR_CONFIG=/x
 release=b run_update
 expect_run 'override-refused control' 0 "ghost-wispr update: installed commit $commit_b (invocation test-invocation-7)"
 
+begin drop-in-refused
 # drop-in-refused: a drop-in of ghost-wispr.service or ghost-wispr-update.service can set the
 # recorder's environment past every check, or give the update a time limit that kills it mid-swap;
 # update.sh refuses to install while one exists, changing nothing.
@@ -1229,6 +1257,7 @@ release=b run_update
 expect_run 'drop-in-refused control' 0 "ghost-wispr update: installed commit $commit_b (invocation test-invocation-7)"
 
 # ---------------------------------------------------------------------------------------------------
+begin rollback-whole-set
 # rollback-whole-set: a new binary that never answers its commit is rolled back with its whole set:
 # every file, the rendered config, .env, the unit and both system files back byte for byte, the user
 # manager and udev reloaded and logind restarted again, and deploy.verified still the old set. A
@@ -1278,12 +1307,13 @@ expect_run 'rollback over a running binary' 10
 expect_line_like 'rollback over a running binary' 'ghost-wispr update: .*; restored the previous release'
 expect_installed_is 'rollback over a running binary' "$work_dir/before-a"
 
-# A new release whose start job fails while its unit stays active, and whose /api/status then
-# answers that it records a session or holds a call, is left running: a restart for the rollback
-# would end that recording or call. One whose status cannot be read (no answer, or an answer that is
-# not a status) may be recording too: the rollback reads it again every 2 minutes and after the
-# third read leaves it running. One that answers idle on two reads 2 minutes apart is rolled back,
-# and one whose unit stopped is rolled back at once, with no read.
+# A new release whose start job fails while its unit stays active: the rollback restores every file
+# of the set (R6), and then restarts the recorder only when the rule restartable allows it. A
+# recorder that answers that it records a session or holds a call is left running, on the files it
+# read at its start: a restart would end that recording or call. One whose status cannot be read (no
+# answer, or an answer that is not a status) may be recording too: the rollback reads it again every
+# 2 minutes and after the third read leaves it running. One that answers idle on two reads 2 minutes
+# apart restarts on the restored set, and one whose unit stopped restarts at once, with no read.
 # restart_fails HOW STATUS... runs release b on a Pi that runs a, whose first restart does HOW, and
 # whose status program after it is STATUS.
 restart_fails() {
@@ -1299,8 +1329,7 @@ restart_fails() {
 left_running() {
   expect_run "$1" 10
   [[ $out == *"$2"* && $out == *'left running'* ]] || fail "$1: want a failure naming \"$2\" that leaves it running; output: $out"
-  expect_no_output "$1" 'restored the previous release'
-  expect_set_of "$1" b
+  expect_installed_is "$1" "$work_dir/before-a"
   [[ $(restarts) == 1 ]] || fail "$1: restarted the recorder again: $(<"$state/systemctl.log")"
   [[ $(<"$state/sleep.log") == "$3" && $(cat -- "$state/status.reads" 2>/dev/null || echo 0) == "$4" ]] \
     || fail "$1: read the status $(cat -- "$state/status.reads" 2>/dev/null || echo 0) times after waits $(printf %q "$(<"$state/sleep.log")"); want $4 reads after $(printf %q "$3")"
@@ -1326,6 +1355,7 @@ rolled_back 'a new release that answers idle again' $'sleep 120\nsleep 120'
 restart_fails fail-stop STOPPED
 rolled_back 'a new release whose unit stopped' ''
 
+begin partial-install
 # partial-install: an update cut short mid-swap (a power cut, or the launcher's time limit) leaves
 # part of the new set installed while deploy.verified names the set before. The next run keeps the
 # .prev copies of that verified set as they are, not the half-swapped files, and installs the whole
@@ -1351,6 +1381,7 @@ partial_pi broken
 release=broken run_update
 rolled_back 'partial-install, then a release that fails' "$(printf 'sleep 2\n%.0s' {1..60} | head -c -1)"
 
+begin same-commit-different-set
 # same-commit-different-set: deploy.verified names the release's commit, but an installed file of
 # the set is not the one it lists (here pi.env, edited on the Pi): the release is not current, and
 # the whole set installs again, so the Pi runs what the release says.
@@ -1371,6 +1402,7 @@ expect_no_output 'same-commit-different-set control' 'installed'
 expect_unchanged 'same-commit-different-set control' "$before"
 [[ $(restarts) == 0 ]] || fail 'same-commit-different-set control: restarted a current recorder'
 
+begin transition
 # transition: the office Pi's first run of this update.sh, after P2's provision.sh, finds no
 # deploy.verified. Its old update.sh installed each release's binary nightly, so the binary may
 # already answer the release's commit: the whole set installs all the same. The files it had become
@@ -1437,6 +1469,7 @@ expect_run 'transition, a second try' 0 "ghost-wispr update: installed commit $c
 [[ $(<"$opt/ghost-wispr.yaml.before-release-config") == 'the config before the first try' ]] \
   || fail 'transition, a second try: replaced the before-release-config a first try kept'
 
+begin no-binary-yet
 # no-binary-yet: a new Pi as provision.sh leaves it before its first update: update.sh, pi-lib.sh,
 # pi.env and the bootstrap files, the credentials and the certificate, and no binary, config, .env
 # or ghost-wispr.service, with no recorder running. pi-secrets runs from the staged binary with the
@@ -1462,7 +1495,21 @@ expect_secrets_flag no-binary-yet --credentials "$opt/google-credentials.json"
 [[ $(restarts) == 1 ]] || fail "no-binary-yet: started the recorder $(restarts) times"
 [[ -z $(find "$opt" -name '*.prev') && ! -e $opt/ghost-wispr.yaml.before-release-config ]] \
   || fail "no-binary-yet: kept copies of files the Pi never had: $(find "$opt" -name '*.prev' -o -name '*.before-release-config')"
+# When that first install's binary never answers its commit, no file of the set has a .prev copy:
+# each file stays as installed, no deploy.verified is written, and the run fails and says so (R6).
+new_pi
+rm -f -- "$state/active"
+for file in update.sh pi-lib.sh pi.env "${bootstrap_files[@]}"; do
+  install -D -m "$(file_mode "$file")" -- "$releases/b/ghost-wispr-pi-deploy/$file" "$(installed_path "$file")"
+done
+release=broken run_update
+expect_run 'no-binary-yet, a binary that never answers' 10
+expect_line_like 'no-binary-yet, a binary that never answers' 'ghost-wispr update: .*no previous release to restore.*'
+[[ ! -e $opt/deploy.verified ]] || fail 'no-binary-yet, a binary that never answers: wrote deploy.verified'
+expect_set_of 'no-binary-yet, a binary that never answers' broken
+[[ $(restarts) == 1 ]] || fail "no-binary-yet, a binary that never answers: restarted the recorder again with nothing restored: $(<"$state/systemctl.log")"
 
+begin prev-copy-by-rename
 # prev-copy-by-rename: the launcher runs update.sh.prev when update.sh is broken, and that run
 # replaces update.sh.prev with the set it keeps. bash reads a script while it runs it, so a copy
 # over update.sh.prev in place would have the running copy go on in the middle of other text; a
@@ -1490,4 +1537,587 @@ cmp -s -- "$releases/long/ghost-wispr-pi-deploy/update.sh" "$opt/update.sh.prev"
   || fail 'prev-copy-by-rename: update.sh.prev is not the update.sh installed before'
 expect_set_of prev-copy-by-rename b
 
-printf 'update tests passed\n'
+# ---------------------------------------------------------------------------------------------------
+# busy-session and busy-call: while the recorder records a session, or holds a call (INFRA-5904's
+# call.state checking or live), a restart would end it. Nothing changes, and the run exits 0, so the
+# timer tries again 15 minutes later.
+busy_cases=(
+  'SESSION|active session'
+  '{"paused":false,"capture_state":"capturing","active_session_id":"","call":{"state":"live"}}|call live'
+  '{"paused":false,"capture_state":"capturing","active_session_id":"","call":{"state":"checking"}}|call checking'
+)
+for busy in "${busy_cases[@]}"; do
+  if [[ ${busy#*|} == 'active session' ]]; then begin busy-session; else begin busy-call; fi
+  new_pi
+  install_set a
+  printf '%s\n' "${busy%%|*}" >"$state/status"
+  before=$(snapshot)
+  release=b run_update
+  expect_run "${busy#*|}" 0 "ghost-wispr update: ${busy#*|}; leaving the current release in place"
+  expect_unchanged "${busy#*|}" "$before"
+  [[ $(restarts) == 0 ]] || fail "${busy#*|}: restarted the recorder"
+done
+# Control: a call whose state is none holds nothing, and the release installs.
+begin busy-call
+new_pi
+install_set a
+printf '%s\n' '{"paused":false,"capture_state":"capturing","active_session_id":"","call":{"state":"none"}}' >"$state/status"
+release=b run_update
+expect_run 'control, call none' 0 "ghost-wispr update: installed commit $commit_b (invocation test-invocation-7)"
+# A recorder that runs but gives no status may be recording: the run fails and changes nothing.
+begin busy-session
+new_pi
+install_set a
+printf 'UNREADABLE\n' >"$state/status"
+before=$(snapshot)
+release=b run_update
+expect_run 'no status' 10
+expect_unchanged 'no status' "$before"
+
+begin busy-during-download
+# busy-during-download: a session or a call that starts while the release downloads stops the run
+# before the swap: the second status read, just before it, finds it, and nothing is installed.
+for busy in "${busy_cases[@]:0:2}"; do
+  new_pi
+  install_set a
+  printf '%s\n' "${busy%%|*}" >"$state/status.after-download"
+  before=$(snapshot)
+  release=b run_update
+  expect_run "busy-during-download (${busy#*|})" 0 "ghost-wispr update: ${busy#*|}; leaving the current release in place"
+  expect_unchanged "busy-during-download (${busy#*|})" "$before"
+  [[ $(restarts) == 0 ]] || fail "busy-during-download (${busy#*|}): restarted the recorder"
+done
+
+begin held-link-versions
+# held-link-versions: a release whose link versions (manifest link_versions) share none with the
+# versions the call bridge accepts (/api/status call.link_versions) could not link to the bridge:
+# it is held, with nothing changed, and the run exits 0 (C6).
+make_release linked "$commit_c"
+link_status='{"paused":false,"capture_state":"capturing","active_session_id":"","call":{"state":"none","link_versions":[2]}}'
+new_pi
+install_set a
+printf '%s\n' "$link_status" >"$state/status"
+link_versions='[1]' pack_release linked
+before=$(snapshot)
+release=linked run_update
+expect_run held-link-versions 0 'ghost-wispr update: held: the bridge accepts link versions [2], this release [1]'
+expect_unchanged held-link-versions "$before"
+[[ $(restarts) == 0 ]] || fail 'held-link-versions: restarted the recorder'
+# Controls: a release that shares a version, one whose manifest has no link_versions, a status with
+# no call, and a call with no link versions yet each hold nothing.
+held_control() {
+  new_pi
+  install_set a
+  printf '%s\n' "$2" >"$state/status"
+  link_versions=$3 pack_release linked
+  release=linked run_update
+  expect_run "held-link-versions control ($1)" 0 "ghost-wispr update: installed commit $commit_c (invocation test-invocation-7)"
+}
+held_control 'a shared version' "$link_status" '[1,2]'
+held_control 'no link_versions in the manifest' "$link_status" ''
+held_control 'no call in the status' IDLE '[1]'
+held_control 'no link versions in the call' \
+  '{"paused":false,"capture_state":"capturing","active_session_id":"","call":{"state":"none","link_versions":[]}}' '[1]'
+
+begin bad-manifest
+# bad-manifest: a release that does not verify installs nothing and fails: a file whose SHA-256 is
+# not the manifest's, a file the manifest does not name, a manifest of another format or of another
+# commit than the release's, a binary whose SHA-256 is not binary_sha256, a checksum asset that does
+# not match its asset, or a release with no immutable commit. Any of them could install a set nobody
+# built for this release.
+zeros=$(printf '0%.0s' {1..64})
+bad_manifest() {
+  local what="bad-manifest ($1)" before
+  before=$(snapshot)
+  release=bad run_update
+  expect_run "$what" 10
+  expect_unchanged "$what" "$before"
+  [[ $(restarts) == 0 ]] || fail "$what: restarted the recorder"
+}
+for filter in ".files[\"pi.env\"] = \"$zeros\"" 'del(.files["serve.conf"])' '.format = 2' ".commit = \"$commit_a\"" \
+  ".binary_sha256 = \"$zeros\""; do
+  new_pi
+  install_set a
+  make_release bad "$commit_c"
+  manifest_filter=$filter pack_release bad
+  bad_manifest "$filter"
+done
+for asset in ghost-wispr-pi-deploy.tar.gz ghost-wispr-linux-arm64; do
+  new_pi
+  install_set a
+  make_release bad "$commit_c"
+  pack_release bad
+  printf '%s  %s\n' "$zeros" "$asset" >"$releases/bad/$asset.sha256"
+  bad_manifest "a $asset.sha256 that does not match"
+done
+new_pi
+install_set a
+make_release bad "$commit_c"
+pack_release bad
+jq '.target_commitish = "main"' "$releases/bad/release.json" >"$releases/bad/release.json.new"
+mv -f -- "$releases/bad/release.json.new" "$releases/bad/release.json"
+bad_manifest 'a release whose target is a branch'
+
+begin secrets-only-change
+# secrets-only-change: the release is current, and pi-secrets reads new values (a key a person
+# replaced in Secret Manager): .env gets them, its other lines kept and its old copy as .env.prev,
+# and the recorder restarts to read them, once it is idle.
+new_pi
+install_set b
+save_installed "$work_dir/before-b"
+printf '%s\n' GHOST_WISPR_DEEPGRAM_API_KEY=dg-test-2 GHOST_WISPR_DISPATCH_TOKEN=tok-test-2 >"$state/secrets"
+release=b run_update
+expect_run secrets-only-change 0 "ghost-wispr update: already current at commit $commit_b" 'ghost-wispr update: installed secrets'
+expect_env secrets-only-change GHOST_WISPR_ADDR=127.0.0.1:8080 GOOGLE_API_USE_CLIENT_CERTIFICATE=false \
+  GHOST_WISPR_DEEPGRAM_API_KEY=dg-test-2 GHOST_WISPR_DISPATCH_TOKEN=tok-test-2 GHOST_WISPR_JABRA_MUTE_BUTTON=false
+cmp -s -- "$work_dir/before-b/.env" "$opt/.env.prev" || fail 'secrets-only-change: .env.prev is not the .env before'
+expect_set_of secrets-only-change b
+[[ $(restarts) == 1 ]] && grep -Fq "env=$(sha "$opt/.env")" "$state/systemctl.log" \
+  || fail "secrets-only-change: did not restart the recorder once on the new .env: $(<"$state/systemctl.log")"
+# The release is current, so the installed binary reads the secrets.
+grep -Fqx "binary $opt/ghost-wispr" "$state/pi-secrets.log" \
+  || fail "secrets-only-change: pi-secrets did not run from the installed binary: $(<"$state/pi-secrets.log")"
+expect_secrets_flag secrets-only-change --credentials "$opt/google-credentials.json"
+# Busy when the run starts, or when the secrets are read: nothing changes, exit 0.
+for hook in status status.after-secrets; do
+  new_pi
+  install_set b
+  printf '%s\n' GHOST_WISPR_DEEPGRAM_API_KEY=dg-test-2 GHOST_WISPR_DISPATCH_TOKEN=tok-test-2 >"$state/secrets"
+  printf 'SESSION\n' >"$state/$hook"
+  before=$(snapshot)
+  release=b run_update
+  expect_run "secrets-only-change, busy ($hook)" 0 'ghost-wispr update: active session; leaving the current release in place'
+  expect_unchanged "secrets-only-change, busy ($hook)" "$before"
+  [[ $(restarts) == 0 ]] || fail "secrets-only-change, busy ($hook): restarted the recorder"
+done
+
+begin secrets-read-fails
+# secrets-read-fails: pi-secrets fails (Secret Manager down, or a grant gone): .env keeps the secret
+# lines it has, a new release still installs, and the run fails, so the failure shows.
+new_pi
+install_set a
+echo fail >"$state/pi-secrets-mode"
+release=b run_update
+expect_run secrets-read-fails 10 "ghost-wispr update: installed commit $commit_b (invocation test-invocation-7)" \
+  'pi-secrets: could not read GHOST_WISPR_DEEPGRAM_API_KEY from example-deepgram-secret'
+expect_set_of secrets-read-fails b
+expect_env secrets-read-fails GHOST_WISPR_ADDR=127.0.0.1:8080 GOOGLE_API_USE_CLIENT_CERTIFICATE=false \
+  GHOST_WISPR_DEEPGRAM_API_KEY=dg-test-1 GHOST_WISPR_DISPATCH_TOKEN=tok-test-1 GHOST_WISPR_JABRA_MUTE_BUTTON=false
+# The release current: nothing changes, and the run fails.
+new_pi
+install_set b
+echo fail >"$state/pi-secrets-mode"
+before=$(snapshot)
+release=b run_update
+expect_run 'secrets-read-fails, current' 10
+expect_unchanged 'secrets-read-fails, current' "$before"
+[[ $(restarts) == 0 ]] || fail 'secrets-read-fails, current: restarted the recorder'
+
+begin pi-secrets-hangs
+# pi-secrets-hangs: a pi-secrets that hangs (a stalled connection) is killed by its bound, 60 s and
+# a 5 s grace, and reported through fail; .env keeps its lines. With no bound it would hold the
+# whole run until the launcher's limit.
+new_pi
+install_set b
+echo hang >"$state/pi-secrets-mode"
+before=$(snapshot)
+release=b run_update
+expect_run pi-secrets-hangs 10
+expect_unchanged pi-secrets-hangs "$before"
+[[ $(restarts) == 0 ]] || fail 'pi-secrets-hangs: restarted the recorder'
+elapsed=$(($(<"$state/clock") - 1000))
+((elapsed >= 60 && elapsed <= 65)) || fail "pi-secrets-hangs: the run took $elapsed s of the test's clock, want 60 to 65"
+grep -Eq '^kill-after=5s 60s .* pi-secrets ' "$state/timeout.log" \
+  || fail "pi-secrets-hangs: pi-secrets did not run under timeout --kill-after=5s 60s: $(<"$state/timeout.log")"
+
+begin certificate
+# certificate: pi-secrets stages a newer certificate that signs in: it is installed with the old
+# one as device.crt.prev, and the recorder restarts on it. When the recorder does not answer after
+# that restart, the old certificate is put back and the run fails: a certificate that cannot sign in
+# would cut the recorder off from every Google service.
+new_pi
+install_set b
+printf 'NEW CERTIFICATE\n' >"$state/certificate"
+release=b run_update
+expect_run certificate 0 "ghost-wispr update: already current at commit $commit_b" \
+  'ghost-wispr update: installed certificate version 2, not after 2027-11-26T00:00:00Z'
+[[ $(<"$opt/device.crt") == 'NEW CERTIFICATE' && $(<"$opt/device.crt.prev") == 'INSTALLED CERTIFICATE' ]] \
+  || fail 'certificate: did not install the staged certificate with the old one as device.crt.prev'
+[[ $(restarts) == 1 ]] && grep -Fq "crt=$(sha "$opt/device.crt")" "$state/systemctl.log" \
+  || fail "certificate: did not restart the recorder once on the new certificate: $(<"$state/systemctl.log")"
+expect_no_output certificate 'installed secrets'
+new_pi
+install_set b
+printf 'NEW CERTIFICATE\n' >"$state/certificate"
+touch -- "$state/version-mute.after-restart"
+release=b run_update
+expect_run 'certificate, the recorder does not answer' 10
+expect_line_like 'certificate, the recorder does not answer' 'ghost-wispr update: .*; restored the previous release'
+[[ $(<"$opt/device.crt") == 'INSTALLED CERTIFICATE' ]] || fail 'certificate, the recorder does not answer: did not put the old certificate back'
+[[ $(restarts) == 2 ]] || fail "certificate, the recorder does not answer: want the rollback's restart: $(<"$state/systemctl.log")"
+# release-and-certificate: a certificate staged while a release installs goes in with the set, and
+# the release's one restart serves both (R11); when that release's version check fails, the old
+# certificate comes back with the old set.
+begin release-and-certificate
+new_pi
+install_set a
+printf 'NEW CERTIFICATE\n' >"$state/certificate"
+release=b run_update
+expect_run release-and-certificate 0 "ghost-wispr update: installed commit $commit_b (invocation test-invocation-7)" \
+  'ghost-wispr update: installed certificate version 2, not after 2027-11-26T00:00:00Z'
+[[ $(<"$opt/device.crt") == 'NEW CERTIFICATE' && $(<"$opt/device.crt.prev") == 'INSTALLED CERTIFICATE' ]] \
+  || fail 'did not install the staged certificate with the old one as device.crt.prev'
+[[ $(restarts) == 1 ]] && grep -Fqx "restart binary=$(sha "$opt/ghost-wispr") env=$(sha "$opt/.env") config=$(sha "$opt/ghost-wispr.yaml") crt=$(sha "$opt/device.crt")" \
+  "$state/systemctl.log" || fail "the release and the certificate did not share one restart: $(<"$state/systemctl.log")"
+new_pi
+install_set a
+save_installed "$work_dir/before-a"
+printf 'NEW CERTIFICATE\n' >"$state/certificate"
+release=broken run_update
+expect_run 'release-and-certificate, a release that fails' 10
+expect_line_like 'release-and-certificate, a release that fails' 'ghost-wispr update: .*; restored the previous release'
+expect_installed_is 'release-and-certificate, a release that fails' "$work_dir/before-a"
+[[ $(<"$opt/device.crt") == 'INSTALLED CERTIFICATE' ]] || fail 'a release that fails: did not restore device.crt with the set'
+[[ $(restarts) == 2 ]] || fail "a release that fails: want the install's and the rollback's restarts: $(<"$state/systemctl.log")"
+
+begin secrets-mode
+# secrets-mode: `update.sh secrets`, the recorder unit's ExecStartPre, writes the secret lines
+# into .env and installs nothing else: no restart and no reload (the recorder is starting), no
+# status or release read, no certificate. On a read failure it keeps .env and exits 10, and the
+# recorder starts on the lines it has.
+new_pi
+install_set b
+printf '%s\n' GHOST_WISPR_DEEPGRAM_API_KEY=dg-test-2 GHOST_WISPR_DISPATCH_TOKEN=tok-test-2 >"$state/secrets"
+printf 'NEW CERTIFICATE\n' >"$state/certificate"
+run_update secrets
+expect_run secrets-mode 0 'ghost-wispr update: installed secrets'
+expect_env secrets-mode GHOST_WISPR_ADDR=127.0.0.1:8080 GOOGLE_API_USE_CLIENT_CERTIFICATE=false \
+  GHOST_WISPR_DEEPGRAM_API_KEY=dg-test-2 GHOST_WISPR_DISPATCH_TOKEN=tok-test-2 GHOST_WISPR_JABRA_MUTE_BUTTON=false
+[[ ! -s $state/systemctl.log && ! -s $state/curl.log && ! -s $state/sudo.log ]] \
+  || fail "secrets-mode: did more than write .env: $(cat -- "$state/systemctl.log" "$state/curl.log" "$state/sudo.log")"
+[[ $(<"$opt/device.crt") == 'INSTALLED CERTIFICATE' ]] || fail 'secrets-mode: installed a certificate'
+grep -Fqx "binary $opt/ghost-wispr" "$state/pi-secrets.log" && grep -Fqx 'timeout 60s kill-after 5s' "$state/pi-secrets.log" \
+  || fail "secrets-mode: pi-secrets did not run from the installed binary under its bound: $(<"$state/pi-secrets.log")"
+expect_secrets_flag secrets-mode --credentials "$opt/google-credentials.json"
+new_pi
+install_set b
+echo fail >"$state/pi-secrets-mode"
+before=$(snapshot)
+run_update secrets
+expect_run 'secrets-mode, a read failure' 10
+expect_unchanged 'secrets-mode, a read failure' "$before"
+[[ ! -s $state/systemctl.log ]] || fail "secrets-mode, a read failure: called systemctl: $(<"$state/systemctl.log")"
+
+begin drift
+# drift (D4): the bootstrap files and Serve are provision.sh's alone. Each run compares them with the
+# release and says which differ, so a person sees that the Pi needs the release's provision.sh; it
+# never changes them, and a difference changes no exit code.
+mapfile -t serve_lines < <(grep -Ev '^[[:space:]]*(#|$)' "$repo_root/deploy/pi/files/serve.conf" | LC_ALL=C sort)
+printf -v want_serve '%s; ' "${serve_lines[@]}"
+want_serve=${want_serve%; }
+new_pi
+install_set b
+release=b run_update
+expect_run 'drift (none)' 0 "ghost-wispr update: already current at commit $commit_b"
+expect_no_output 'drift (none)' 'differs from the release'
+expect_no_output 'drift (none)' 'Serve'
+for file in "${bootstrap_files[@]}"; do
+  new_pi
+  install_set b
+  printf '# edited on the Pi\n' >>"$(installed_path "$file")"
+  cp -p -- "$(installed_path "$file")" "$work_dir/edited"
+  release=b run_update
+  expect_run "drift ($file)" 0 "ghost-wispr update: provisioning file $file differs from the release; run the release's provision.sh"
+  [[ $(grep -c 'differs from the release; run' <<<"$out") == 1 ]] || fail "drift ($file): named another file: $out"
+  cmp -s -- "$work_dir/edited" "$(installed_path "$file")" || fail "drift ($file): changed the bootstrap file"
+done
+new_pi
+install_set b
+rm -f -- "$opt/ghost-wispr-update-launcher.sh"
+release=b run_update
+expect_run 'drift (no launcher)' 0 \
+  "ghost-wispr update: provisioning file ghost-wispr-update-launcher.sh differs from the release; run the release's provision.sh"
+[[ ! -e $opt/ghost-wispr-update-launcher.sh ]] || fail 'drift (no launcher): installed the launcher'
+# After an install too.
+new_pi
+install_set a
+printf '# edited on the Pi\n' >>"$units/ghost-wispr-update.timer"
+release=b run_update
+expect_run 'drift (after an install)' 0 "ghost-wispr update: installed commit $commit_b (invocation test-invocation-7)" \
+  "ghost-wispr update: provisioning file ghost-wispr-update.timer differs from the release; run the release's provision.sh"
+# Serve that proxies to another target, or serves nothing, differs; so does a handler that is no
+# proxy. Serve is never changed: no sudo tailscale call but the read.
+printf '443 http://127.0.0.1:9999\n' >"$work_dir/other-serve.conf"
+serve_drift() {
+  new_pi
+  install_set b
+  printf '%s\n' "$2" >"$state/serve.json"
+  release=b run_update
+  expect_run "drift (Serve $1)" 0 "ghost-wispr update: Serve differs from the release: want $want_serve, have $3"
+  [[ $(grep -c tailscale "$state/sudo.log") == 1 ]] && grep -Fqx 'timeout=10s tailscale serve status --json' "$state/sudo.log" \
+    || fail "drift (Serve $1): ran tailscale other than to read Serve under its 10 s bound: $(<"$state/sudo.log")"
+}
+serve_drift 'with another target' "$(serve_json_for "$work_dir/other-serve.conf")" '443 http://127.0.0.1:9999'
+serve_drift 'serving nothing' '{}' none
+serve_drift 'with no proxy' '{"Web":{"ghost-wispr.example-tailnet.ts.net:443":{"Handlers":{"/":{"Path":"/var/www"}}}}}' none
+# A release whose serve.conf has two lines matches a Serve of both, and differs from a Serve of one.
+make_release two-ports "$commit_b"
+printf '9443 http://127.0.0.1:9081\n' >>"$releases/two-ports/ghost-wispr-pi-deploy/serve.conf"
+pack_release two-ports
+new_pi
+install_set two-ports
+serve_json_for "$releases/two-ports/ghost-wispr-pi-deploy/serve.conf" >"$state/serve.json"
+release=two-ports run_update
+expect_run 'drift (two Serve lines)' 0 "ghost-wispr update: already current at commit $commit_b"
+expect_no_output 'drift (two Serve lines)' 'Serve'
+new_pi
+install_set two-ports
+release=two-ports run_update
+mapfile -t two_lines < <(grep -Ev '^[[:space:]]*(#|$)' "$releases/two-ports/ghost-wispr-pi-deploy/serve.conf" | LC_ALL=C sort)
+printf -v want_two '%s; ' "${two_lines[@]}"
+expect_run 'drift (one of two Serve lines)' 0 "ghost-wispr update: Serve differs from the release: want ${want_two%; }, have $want_serve"
+# A Serve status it cannot read (tailscale fails, answers what is not a ServeConfig, or hangs past
+# its 10 s bound) is UNKNOWN, never a match.
+serve_unknown() {
+  expect_run "drift (Serve $1)" 0
+  expect_line_like "drift (Serve $1)" 'ghost-wispr update: Serve: UNKNOWN \(.+\)'
+  expect_no_output "drift (Serve $1)" 'Serve differs'
+}
+new_pi
+install_set b
+echo 1 >"$state/serve-exit"
+release=b run_update
+serve_unknown 'failing'
+for answer in 'not json' '[]'; do
+  new_pi
+  install_set b
+  printf '%s\n' "$answer" >"$state/serve.json"
+  release=b run_update
+  serve_unknown "answering $answer"
+done
+new_pi
+install_set b
+touch -- "$state/serve-hang"
+release=b run_update
+serve_unknown 'hanging'
+(($(<"$state/clock") - 1000 == 10)) || fail "drift (Serve hanging): the Serve read took $(($(<"$state/clock") - 1000)) s of the test's clock, want its 10 s bound"
+
+# ---------------------------------------------------------------------------------------------------
+# launcher: the fixed start of each update (R8). It prints the run's invocation and trigger, runs
+# update.sh under its limit, and counts failed runs in update.failed-runs. It runs update.sh.prev at
+# once when update.sh broke (an exit other than 0 or 10: a shell error, or the limit's 124 or 137),
+# and once when the count of failed runs reaches 11, one night of the timer's runs; never after one
+# exit 10, so a single network fault runs no update.sh.prev.
+begin launcher
+launcher_file=$repo_root/deploy/pi/files/ghost-wispr-update-launcher.sh
+[[ $(head -n1 "$launcher_file") == '#!/bin/sh' ]] || fail 'the launcher does not start with #!/bin/sh'
+(($(wc -l <"$launcher_file") < 50)) \
+  || fail "the launcher has $(wc -l <"$launcher_file") lines, want fewer than 50: it is the one part of the update no release can fix"
+# The Pi's /bin/sh is dash: the launcher runs under it here.
+launcher_shell=$(command -v dash || command -v sh)
+# fake_update FILE NAME writes a fake update.sh at FILE that logs NAME in launcher.log and exits
+# $TEST_STATE/NAME.exit (0 by default), or hangs when that file says hang.
+fake_update() {
+  cat >"$1" <<EOF
+#!/usr/bin/env bash
+printf '%s\n' '$2' >>"\$TEST_STATE/launcher.log"
+code=\$(cat -- "\$TEST_STATE/$2.exit" 2>/dev/null || echo 0)
+if [[ \$code == hang ]]; then exec /bin/sleep 60; fi
+exit "\$code"
+EOF
+  chmod 0755 "$1"
+}
+# launcher_pi makes a fake Pi with the launcher and a fake update.sh and update.sh.prev.
+launcher_pi() {
+  new_pi
+  install -m 0755 -- "$launcher_file" "$opt/ghost-wispr-update-launcher.sh"
+  fake_update "$opt/update.sh" update.sh
+  fake_update "$opt/update.sh.prev" update.sh.prev
+  : >"$state/launcher.log"
+}
+# run_launcher runs the installed launcher as ghost-wispr-update.service does, under $launcher_cmd
+# (the Pi's sh by default), with the timer's TRIGGER_UNIT and TRIGGER_TIMER_REALTIME_USEC when
+# $trigger is set, and the real timeout; $out and $status as run_update's, and $elapsed, the real
+# seconds it took.
+run_launcher() {
+  local started=$SECONDS
+  echo 1000 >"$state/clock"
+  status=0
+  # shellcheck disable=SC2086 # Each trigger word is one assignment or none.
+  out=$(cd -- "$opt" && env -u TRIGGER_UNIT -u TRIGGER_TIMER_REALTIME_USEC PATH="$bin:$PATH" \
+    TEST_STATE="$state" TEST_RELEASES="$releases" TEST_RELEASE="${release:-none}" TEST_FAKES="$fakes" \
+    TEST_PI_SECRETS="$fakes/pi-secrets" TEST_BUSY_PID="$work_dir/busy.pid" TEST_CURL_EXIT="${curl_exit:-}" \
+    INVOCATION_ID=test-invocation-9 ${trigger:+TRIGGER_UNIT=ghost-wispr-update.timer} \
+    ${trigger:+TRIGGER_TIMER_REALTIME_USEC=$trigger} \
+    GHOST_WISPR_DEPLOY_DIR="$opt" GHOST_WISPR_UNIT_DIR="$units" GHOST_WISPR_SYSTEM_ROOT="$root" \
+    GHOST_WISPR_PROC_DIR="$pi/proc" GHOST_WISPR_IDENTITY_KEY="$key" \
+    GHOST_WISPR_RELEASE_API=https://test.invalid/releases/latest \
+    GHOST_WISPR_STATUS_URL=http://127.0.0.1:8080/api/status \
+    GHOST_WISPR_VERSION_URL=http://127.0.0.1:8080/api/version \
+    GHOST_WISPR_UPDATE_LIMIT="${limit:-45m}" \
+    "${launcher_cmd:-$launcher_shell}" "$opt/ghost-wispr-update-launcher.sh" 2>&1) || status=$?
+  elapsed=$((SECONDS - started))
+  if [[ -s $state/errors ]]; then
+    fail "the fakes saw what the update must never do: $(<"$state/errors"); its output: $out"
+  fi
+}
+failed_runs() {
+  cat -- "$opt/update.failed-runs" 2>/dev/null || echo none
+}
+# Its invocation line names the timer's trigger, or none for a start by hand; it exits as update.sh
+# did, runs no update.sh.prev after an exit 0, and sets the count to 0.
+launcher_pi
+trigger=1764127800000000 run_launcher
+[[ $status == 0 ]] && grep -Fqx 'ghost-wispr launcher: invocation test-invocation-9 trigger ghost-wispr-update.timer at 1764127800000000' <<<"$out" \
+  || fail "a timer's run: exit $status, output $out"
+[[ $(<"$state/launcher.log") == update.sh && $(failed_runs) == 0 ]] \
+  || fail "a timer's run: ran $(<"$state/launcher.log") and left the count $(failed_runs)"
+launcher_pi
+run_launcher
+grep -Fqx 'ghost-wispr launcher: invocation test-invocation-9 trigger none at none' <<<"$out" \
+  || fail "a run by hand did not print trigger none at none: $out"
+# Run as the unit runs it, by its #! line.
+launcher_pi
+launcher_cmd=env run_launcher
+[[ $status == 0 && $(<"$state/launcher.log") == update.sh ]] || fail "run by its #! line: exit $status, output $out"
+# An exit 10 is a failure update.sh found and reported: the launcher exits 10, counts it, and runs no
+# update.sh.prev.
+launcher_pi
+echo 10 >"$state/update.sh.exit"
+run_launcher
+[[ $status == 10 && $(<"$state/launcher.log") == update.sh && $(failed_runs) == 1 ]] \
+  || fail "after an exit 10: exit $status, ran $(<"$state/launcher.log"), count $(failed_runs)"
+# The real update.sh, whose curl fails as on a network fault, exits 10: no update.sh.prev runs.
+new_pi
+install_set b
+install -m 0755 -- "$launcher_file" "$opt/ghost-wispr-update-launcher.sh"
+fake_update "$opt/update.sh.prev" update.sh.prev
+: >"$state/launcher.log"
+curl_exit=22 release=b run_launcher
+[[ $status == 10 && ! -s $state/launcher.log && $(failed_runs) == 1 && $out == *'ghost-wispr update: '* ]] \
+  || fail "a network fault: exit $status, ran $(<"$state/launcher.log"), count $(failed_runs), output $out"
+# update.sh broke (exit 2, a shell error): update.sh.prev runs at once, and sources pi-lib.sh.prev,
+# not the new pi-lib.sh.
+new_pi
+install_set b
+install -m 0755 -- "$launcher_file" "$opt/ghost-wispr-update-launcher.sh"
+cp -p -- "$opt/update.sh" "$opt/update.sh.prev"
+{
+  cat -- "$opt/pi-lib.sh"
+  printf '%s\n' "printf 'pi-lib.sh.prev was sourced\\n'"
+} >"$opt/pi-lib.sh.prev"
+printf '%s\n' "printf 'pi-lib.sh was sourced\\n'" >>"$opt/pi-lib.sh"
+fake_update "$opt/update.sh" update.sh
+echo 2 >"$state/update.sh.exit"
+printf 'SESSION\n' >"$state/status"
+: >"$state/launcher.log"
+release=b run_launcher
+[[ $status == 0 && $out == *'pi-lib.sh.prev was sourced'* && $out != *'pi-lib.sh was sourced'* \
+  && $out == *'ghost-wispr update: active session; leaving the current release in place'* ]] \
+  || fail "after an exit 2: exit $status, output $out; want update.sh.prev run on pi-lib.sh.prev"
+[[ $(<"$state/launcher.log") == update.sh && $(failed_runs) == 0 ]] \
+  || fail "after an exit 2: ran $(<"$state/launcher.log"), count $(failed_runs)"
+# An update.sh that exits 10 on every run: the run at which the count reaches 11 runs update.sh.prev
+# once, and the count goes back to 0, whatever update.sh.prev returned.
+launcher_pi
+echo 10 >"$state/update.sh.exit"
+echo 10 >"$state/update.sh.prev.exit"
+for ((run = 1; run <= 10; run++)); do
+  run_launcher
+  [[ $status == 10 && $(failed_runs) == "$run" ]] && ! grep -qx update.sh.prev "$state/launcher.log" \
+    || fail "failed run $run: exit $status, count $(failed_runs), ran $(paste -sd ' ' "$state/launcher.log")"
+done
+run_launcher
+[[ $(grep -cx update.sh "$state/launcher.log") == 11 && $(grep -cx update.sh.prev "$state/launcher.log") == 1 \
+  && $(tail -n1 "$state/launcher.log") == update.sh.prev && $(failed_runs) == 0 ]] \
+  || fail "the 11th failed run: count $(failed_runs), ran $(paste -sd ' ' "$state/launcher.log"); want update.sh.prev once and the count 0"
+run_launcher
+[[ $(failed_runs) == 1 && $(grep -cx update.sh.prev "$state/launcher.log") == 1 ]] \
+  || fail "the run after: count $(failed_runs), ran $(paste -sd ' ' "$state/launcher.log")"
+# An exit 0 sets the count to 0.
+launcher_pi
+echo 5 >"$opt/update.failed-runs"
+run_launcher
+[[ $status == 0 && $(failed_runs) == 0 ]] || fail "an exit 0 after 5 failed runs: exit $status, count $(failed_runs)"
+# An update.sh that hangs: the limit (2 s here) ends it with 124, and update.sh.prev runs at once.
+launcher_pi
+echo hang >"$state/update.sh.exit"
+limit=2s run_launcher
+[[ $status == 0 && $(paste -sd ' ' "$state/launcher.log") == 'update.sh update.sh.prev' ]] && ((elapsed < 30)) \
+  || fail "a hung update.sh: exit $status after $elapsed s, ran $(paste -sd ' ' "$state/launcher.log")"
+# With no update.sh.prev, the launcher exits with update.sh's code, and the count goes on past 11.
+launcher_pi
+rm -f -- "$opt/update.sh.prev"
+echo 2 >"$state/update.sh.exit"
+run_launcher
+[[ $status == 2 && $(failed_runs) == 1 ]] || fail "no update.sh.prev, an exit 2: exit $status, count $(failed_runs)"
+launcher_pi
+rm -f -- "$opt/update.sh.prev"
+echo 10 >"$state/update.sh.exit"
+echo 10 >"$opt/update.failed-runs"
+run_launcher
+[[ $status == 10 && $(failed_runs) == 11 ]] || fail "no update.sh.prev, the 11th failed run: exit $status, count $(failed_runs)"
+
+# ---------------------------------------------------------------------------------------------------
+# unit-limits: the update unit's one time limit is TimeoutStartSec=infinity, and it runs the
+# launcher, whose limit is the one bound on a whole run (R8); a unit limit would kill update.sh
+# mid-swap. The recorder unit reads the secrets after its two waits, and goes on when that step
+# fails (the -), within its own start limit. The timer runs 11 times a night, 03:30 to 06:00.
+begin unit-limits
+update_unit=$repo_root/deploy/pi/files/ghost-wispr-update.service
+limits=$(grep -E '^[[:space:]]*[A-Za-z]*(Timeout|RuntimeMax)[A-Za-z]*[[:space:]]*=' "$update_unit" || true)
+[[ $limits == 'TimeoutStartSec=infinity' ]] \
+  || fail "the update unit's time limits are $(printf %q "$limits"); want TimeoutStartSec=infinity alone"
+[[ $(sed -n 's/^ExecStart=//p' "$update_unit") == /opt/ghost-wispr/ghost-wispr-update-launcher.sh ]] \
+  || fail "the update unit runs $(sed -n 's/^ExecStart=//p' "$update_unit"), not the launcher"
+recorder_unit=$repo_root/deploy/pi/files/ghost-wispr.service
+mapfile -t pre < <(sed -n 's/^ExecStartPre=//p' "$recorder_unit")
+[[ ${#pre[@]} == 3 && ${pre[0]} == /opt/ghost-wispr/wait-for-network.sh && ${pre[1]} == /opt/ghost-wispr/wait-for-time-sync.sh \
+  && ${pre[2]} == '-/opt/ghost-wispr/update.sh secrets' ]] \
+  || fail "the recorder unit's ExecStartPre lines are $(printf '%q ' "${pre[@]}"); want the two waits, then -/opt/ghost-wispr/update.sh secrets"
+start_limit=$(sed -n 's/^TimeoutStartSec=//p' "$recorder_unit")
+case $start_limit in
+  *min) start_seconds=$((${start_limit%min} * 60)) ;;
+  *s) start_seconds=${start_limit%s} ;;
+  *) start_seconds=$start_limit ;;
+esac
+network_wait=$(sed -n 's/.*GHOST_WISPR_NETWAIT_TIMEOUT:-\([0-9]*\).*/\1/p' "$repo_root/wait-for-network.sh")
+sync_wait=$(sed -n 's/.*GHOST_WISPR_TIMESYNC_TIMEOUT:-\([0-9]*\).*/\1/p' "$repo_root/deploy/pi/files/wait-for-time-sync.sh")
+[[ $start_seconds =~ ^[0-9]+$ && $network_wait =~ ^[0-9]+$ && $sync_wait =~ ^[0-9]+$ ]] \
+  || fail "could not read the recorder's start limit ($start_limit) or its waits ($network_wait, $sync_wait)"
+# The network wait can end 5 s past its deadline (a 3 s probe and a 2 s pause), and the secrets step
+# takes 65 s at most (60 s and the kill's 5 s).
+((start_seconds >= network_wait + 5 + sync_wait + 65)) \
+  || fail "the recorder's start limit, $start_seconds s, is shorter than its waits and the secrets step"
+timer=$repo_root/deploy/pi/files/ghost-wispr-update.timer
+mapfile -t calendars < <(sed -n 's/^OnCalendar=//p' "$timer")
+((${#calendars[@]})) || fail 'the update timer has no OnCalendar'
+command -v systemd-analyze >/dev/null || fail 'systemd-analyze is needed to read the timer schedule'
+if ! analyzed=$(for calendar in "${calendars[@]}"; do TZ=UTC systemd-analyze calendar --iterations=40 "$calendar" || exit 1; done); then
+  fail "systemd-analyze could not read the timer's OnCalendar lines: $(printf '%q ' "${calendars[@]}")"
+fi
+fires=$(awk '/(Next elapse|Iter(\.|ation) #[0-9]+):/ { print $(NF - 1) }' <<<"$analyzed" | LC_ALL=C sort -u)
+want_fires=$(printf '%s\n' 03:30:00 03:45:00 04:00:00 04:15:00 04:30:00 04:45:00 05:00:00 05:15:00 05:30:00 05:45:00 06:00:00)
+[[ $fires == "$want_fires" ]] || fail "the timer fires at $(paste -sd ' ' <<<"$fires"); want $(paste -sd ' ' <<<"$want_fires")"
+grep -qx 'Persistent=true' "$timer" || fail 'the update timer is not Persistent=true'
+# A restart that takes 10 hours, with every other step at its worst too, is never cut off: update.sh
+# has a bound on each step and none on a whole run. It installs and verifies, or, when the new
+# binary never reports its commit, rolls back once the recorder answers again.
+new_pi
+install_set a
+slow=1 restart_seconds=36000 release=b run_update
+expect_run 'a 10-hour restart' 0 "ghost-wispr update: installed commit $commit_b (invocation test-invocation-7)"
+(($(<"$state/clock") - 1000 > 36000)) || fail "control: the 10-hour restart took $(($(<"$state/clock") - 1000)) s of the clock"
+new_pi
+install_set a
+save_installed "$work_dir/before-a"
+printf '%s\n' UNREADABLE IDLE >"$state/status.after-restart"
+slow=1 restart_seconds=36000 release=broken run_update
+# The version wait's ten 2 s pauses between its 10 s reads, then the rollback's two status waits.
+rolled_back 'a 10-hour restart, then a release that never reports its commit' \
+  "$(printf 'sleep 2\n%.0s' {1..10}; printf 'sleep 120\nsleep 120')"
+
+for name in "${case_names[@]}"; do
+  [[ $ran_cases == *" $name "* ]] || fail "the case $name of c-update never ran"
+done
+printf 'update tests passed: %d cases\n' "${#case_names[@]}"
