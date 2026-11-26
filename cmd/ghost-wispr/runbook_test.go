@@ -9,21 +9,31 @@ import (
 	"github.com/sjawhar/ghost-wispr/internal/storage"
 )
 
-// runbookSection returns the section of docs/pi-setup.md under heading, its
-// words joined by single spaces, so a quote the Markdown wraps still matches.
-func runbookSection(t *testing.T, heading string) string {
+// readRunbook returns docs/pi-setup.md.
+func readRunbook(t *testing.T) string {
 	t.Helper()
 	runbook, err := os.ReadFile(filepath.Join("..", "..", "docs", "pi-setup.md"))
 	if err != nil {
 		t.Fatalf("read the Pi runbook: %v", err)
 	}
-	_, section, found := strings.Cut(string(runbook), "\n"+heading+"\n")
+	return string(runbook)
+}
+
+// runbookSection returns the section of docs/pi-setup.md under heading, its
+// words joined by single spaces, so a quote the Markdown wraps still matches.
+func runbookSection(t *testing.T, heading string) string {
+	t.Helper()
+	_, section, found := strings.Cut(readRunbook(t), "\n"+heading+"\n")
 	if !found {
 		t.Fatalf("the Pi runbook has no %q section", heading)
 	}
 	section, _, _ = strings.Cut(section, "\n## ")
 	return strings.Join(strings.Fields(section), " ")
 }
+
+// releaseSection is the runbook's one section on a release that changes the
+// Pi's config.
+const releaseSection = "## A release that changes config"
 
 // TestRunbookSaysWhatToDoWhenDeleteWaitsForDrive fails if the runbook's remedy
 // for a session kept on this unit only, DELETE /api/sessions/{id}, does not
@@ -43,48 +53,51 @@ func TestRunbookSaysWhatToDoWhenDeleteWaitsForDrive(t *testing.T) {
 	}
 }
 
-// TestRunbookOrdersARolloutThatAddsAConfigKey fails if the runbook does not
-// give the order for a release that reads a new key from the Pi's config:
-// install the template with the models step just before the merge, merge,
-// run update.sh by hand once the release is published, then check GET
-// /api/config. It also fails if the runbook does not say why: the nightly
-// update replaces only the binary, and a settings save of the old binary
-// drops a key that binary does not know. And it fails if a step can fail
-// without anyone noticing: the runbook must say where the shared-drive ID
-// comes from, to save no settings until the check, that update.sh is done
-// only when it says it installed the commit and does nothing during an active
-// session, what to do when the check fails, and that restarts end a meeting.
-func TestRunbookOrdersARolloutThatAddsAConfigKey(t *testing.T) {
-	section := runbookSection(t, "## Roll out a release that adds a config key")
-	rest := section
-	for _, step := range []string{"1. Just before you merge", "provision.sh --models", "2. Merge", "3. As soon as", "update.sh", "4. Check", "/api/config"} {
-		_, after, found := strings.Cut(rest, step)
-		if !found {
-			t.Fatalf("the runbook's rollout order is missing %q, or has it out of order: %s", step, section)
-		}
-		rest = after
-	}
-	for _, why := range []string{"replaces only the binary", "drops"} {
-		if !strings.Contains(section, why) {
-			t.Errorf("the runbook's rollout order does not say why: no %q", why)
+// TestRunbookSaysAReleaseInstallsItsConfigWithItsBinary fails if the
+// runbook's section on a release that changes config does not say that the
+// nightly update installs the release's whole deploy set together, the config
+// with the binary, so a new binary never starts on an old config; that
+// settings saved on the page stay in ghost-wispr.local.yaml; that the update
+// leaves a busy recorder alone and restores the previous release when the new
+// one does not answer; that a changed provisioning file needs the release's
+// provision.sh; and that deploy/pi/check-deploy.sh is the check. It also fails
+// if that section still orders a rollout by hand (the models step, update.sh
+// by hand, a step before the merge), if the runbook still has a section that
+// starts "## Roll out", or if it still says that the nightly update replaces
+// only the binary.
+func TestRunbookSaysAReleaseInstallsItsConfigWithItsBinary(t *testing.T) {
+	section := runbookSection(t, releaseSection)
+	for _, words := range []string{"whole deploy set", "together", "`ghost-wispr.yaml`", "never starts on an old config", "ghost-wispr.local.yaml", "leaving the current release in place", "restored the previous release", "`provision.sh`", "deploy/pi/check-deploy.sh"} {
+		if !strings.Contains(section, words) {
+			t.Errorf("the runbook's %q does not say %q", releaseSection, words)
 		}
 	}
-	for _, safeguard := range []string{"gdrive_folder_id", "Save no settings", "installed commit", "active session", "models step again", "outside meetings", "only the full provisioner installs"} {
-		if !strings.Contains(section, safeguard) {
-			t.Errorf("the runbook's rollout order does not say %q", safeguard)
+	for _, stale := range []string{"--models", "update.sh` by hand", "before you merge"} {
+		if strings.Contains(section, stale) {
+			t.Errorf("the runbook's %q still orders a rollout by hand: %q", releaseSection, stale)
+		}
+	}
+	runbook := readRunbook(t)
+	if strings.Contains(runbook, "\n## Roll out ") {
+		t.Error(`the runbook still has a section that starts "## Roll out"`)
+	}
+	words := strings.Join(strings.Fields(runbook), " ")
+	for _, stale := range []string{"replaces only the binary", "replaces the binary alone", "installs only the binary"} {
+		if strings.Contains(words, stale) {
+			t.Errorf("the runbook still says that the nightly update %s", stale)
 		}
 	}
 }
 
 // TestTheJabraButtonIsOnInTheTemplateAndTheRunbook fails if the office Pi's
 // template does not turn the Jabra's Mute button on, or if the template, the
-// rollout order or "Pause and resume at the unit" still keeps the button off
-// until a person's taps pass or until a follow-up fix merges: Sami turned it
-// on on the office Pi (2026-11-18), and the full provisioner rewrites .env,
-// so the template's setting is the Pi's. It also fails if the rollout order
-// does not say what its steps do to the Pi's .env override, or checks for the
-// button off; or if "Pause and resume at the unit" drops the rule that no
-// other program opens the Jabra while the button is on.
+// runbook's section on a release that changes config or "Pause and resume at
+// the unit" still keeps the button off until a person's taps pass or until a
+// follow-up fix merges, or still says that a provisioning run rewrites .env.
+// It also fails if the release section does not say what a release does to
+// the Pi's .env override (the nightly update keeps every other line of .env),
+// or checks for the button off; or if "Pause and resume at the unit" drops the
+// rule that no other program opens the Jabra while the button is on.
 func TestTheJabraButtonIsOnInTheTemplateAndTheRunbook(t *testing.T) {
 	raw, err := os.ReadFile(filepath.Join("..", "..", "deploy", "pi", "files", "ghost-wispr.yaml"))
 	if err != nil {
@@ -94,26 +107,26 @@ func TestTheJabraButtonIsOnInTheTemplateAndTheRunbook(t *testing.T) {
 	if !strings.Contains(template, "\njabra_mute_button: true\n") || strings.Contains(template, "jabra_mute_button: false") {
 		t.Error("the Pi's config template does not turn the Jabra's Mute button on")
 	}
-	rollout := runbookSection(t, "## Roll out a release that adds a config key")
+	release := runbookSection(t, releaseSection)
 	pause := runbookSection(t, "## Pause and resume at the unit")
 	for name, text := range map[string]string{
-		"the rollout order":              rollout,
+		"the release section":            release,
 		`"Pause and resume at the unit"`: pause,
 		"the Pi's config template":       strings.ReplaceAll(strings.Join(strings.Fields(template), " "), "# ", ""),
 	} {
-		for _, stale := range []string{"real taps", "before the recording light reads red", "stays off either way", "until a person", "follow-up fix", "keeps `jabra_mute_button: false`"} {
+		for _, stale := range []string{"real taps", "before the recording light reads red", "stays off either way", "until a person", "follow-up fix", "keeps `jabra_mute_button: false`", "full provisioning run rewrites", "full provisioner rewrites"} {
 			if strings.Contains(text, stale) {
-				t.Errorf("%s still keeps the Jabra's button off: %q", name, stale)
+				t.Errorf("%s still keeps the Jabra's button off, or says a provisioning run rewrites .env: %q", name, stale)
 			}
 		}
 	}
-	for _, words := range []string{"GHOST_WISPR_JABRA_MUTE_BUTTON", "keeps every `.env` line", "rewrites `.env`", "jabra_mute_button: true", "ends in `true`"} {
-		if !strings.Contains(rollout, words) {
-			t.Errorf("the runbook's rollout order does not say %q", words)
+	for _, words := range []string{"GHOST_WISPR_JABRA_MUTE_BUTTON", "keeps every other line of `.env`", "jabra_mute_button: true", "ends in `true`"} {
+		if !strings.Contains(release, words) {
+			t.Errorf("the runbook's %q does not say %q", releaseSection, words)
 		}
 	}
-	if strings.Contains(rollout, "ends in `false`") {
-		t.Error("the runbook's rollout order checks that the Jabra's Mute button is off")
+	if strings.Contains(release, "ends in `false`") {
+		t.Errorf("the runbook's %q checks that the Jabra's Mute button is off", releaseSection)
 	}
 	if !strings.Contains(pause, "Do not open the Jabra's microphone or speaker with another program") {
 		t.Error(`"Pause and resume at the unit" no longer says that no other program may open the Jabra while the button is on`)
@@ -139,14 +152,14 @@ func TestRunbookInjectsSpeechThroughMicDevice(t *testing.T) {
 	}
 }
 
-// TestRunbookRolloutChecksTheMicDevice fails if the rollout order does not
-// name mic_device among the keys a release adds, and its check: the Pi's
-// config holds mic_device: J75.
-func TestRunbookRolloutChecksTheMicDevice(t *testing.T) {
-	section := runbookSection(t, "## Roll out a release that adds a config key")
+// TestRunbookChecksTheMicDeviceAfterARelease fails if the runbook's section on
+// a release that changes config does not name mic_device among the keys a
+// release changes, and its check: the Pi's config holds mic_device: J75.
+func TestRunbookChecksTheMicDeviceAfterARelease(t *testing.T) {
+	section := runbookSection(t, releaseSection)
 	for _, words := range []string{"`mic_device`", "mic_device: J75"} {
 		if !strings.Contains(section, words) {
-			t.Errorf("the runbook's rollout order does not say %q", words)
+			t.Errorf("the runbook's %q does not say %q", releaseSection, words)
 		}
 	}
 }
