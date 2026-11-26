@@ -2642,9 +2642,12 @@ cp -- "$update_unit" "$work_dir/unit-dump/"
 SYSTEMD_UNIT_PATH="$work_dir/unit-dump:" "$systemd_binary" --test --system --no-pager --unit=ghost-wispr-update.service \
   >"$work_dir/unit-dump.out" 2>"$work_dir/unit-dump.err" \
   || fail "systemd --test could not read the update unit: $(<"$work_dir/unit-dump.err")"
-unit_dump=$(awk '/-> Unit ghost-wispr-update\.service:$/ { on = 1; next } on && /-> Unit / { exit } on' "$work_dir/unit-dump.out")
+# The dump heads each unit's section with a tab, an arrow and "Unit NAME:", and starts each line of
+# the section with two tabs. The arrow is "->" or "→" by systemd's version and locale: systemd 255
+# (Ubuntu 24.04) printed "->" here, and systemd 259 (Ubuntu 26.04, the GitHub runner) prints "→".
+unit_dump=$(awk '/^\t(->|→) Unit ghost-wispr-update\.service:$/ { on = 1; next } on && !/^\t\t/ { exit } on' "$work_dir/unit-dump.out")
 grep -Fqx -- $'\t\tFragment Path: '"$work_dir/unit-dump/ghost-wispr-update.service" <<<"$unit_dump" \
-  || fail "systemd --test did not read the update unit from $work_dir/unit-dump: $(grep -F 'Fragment Path' <<<"$unit_dump" || echo 'no unit')"
+  || fail "systemd --test dumped no section of the update unit read from $work_dir/unit-dump: lines that name the unit: $(grep -n 'Unit ghost-wispr-update\.service:' "$work_dir/unit-dump.out" || echo none); Fragment Path lines that name the copy: $(grep -nF "$work_dir/unit-dump/" "$work_dir/unit-dump.out" || echo none); systemd's last lines: $(tail -n 5 "$work_dir/unit-dump.err")"
 grep -Fqx -- $'\t\tType: oneshot' <<<"$unit_dump" && grep -Fqx -- $'\t\tTimeoutStartSec: infinity' <<<"$unit_dump" \
   || fail "systemd reads the update unit as $(grep -E '^[[:space:]]+(Type|TimeoutStartSec):' <<<"$unit_dump" | paste -sd ' '); want Type: oneshot and TimeoutStartSec: infinity"
 recorder_unit=$repo_root/deploy/pi/files/ghost-wispr.service
