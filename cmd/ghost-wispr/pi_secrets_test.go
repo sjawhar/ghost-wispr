@@ -637,7 +637,7 @@ func (f roundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) 
 
 func newTestSecretManagerReader(transport roundTripFunc) *secretManagerReader {
 	return &secretManagerReader{
-		token: func(context.Context) (string, error) { return "access-token", nil },
+		token:  func(context.Context) (string, error) { return "access-token", nil },
 		client: &http.Client{Transport: transport},
 	}
 }
