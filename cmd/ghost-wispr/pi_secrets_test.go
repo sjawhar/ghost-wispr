@@ -21,6 +21,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/sjawhar/ghost-wispr/internal/googleauthtest"
@@ -140,84 +141,19 @@ func TestPiSecretsWritesEachEnvSecretAndPrintsNoValue(t *testing.T) {
 	})
 }
 
-// TestPiSecretsRefusesAValueThatWouldAddASetting catches validation that lets
-// CR, LF, or NUL turn a secret into additional environment settings.
-func TestPiSecretsRefusesAValueThatWouldAddASetting(t *testing.T) {
-	for _, tc := range []struct {
-		name  string
-		value []byte
-	}{
-		{name: "LF", value: []byte("value\nINJECTED=1")},
-		{name: "CR", value: []byte("value\rINJECTED=1")},
-		{name: "NUL", value: []byte("value\x00INJECTED=1")},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			reader := &fakeSecretReader{replies: map[string]secretReply{
-				secretReplyKey("injected-secret", "latest"): {value: secretVersion{Version: 1, Data: tc.value}},
-			}}
-			outDir := t.TempDir()
-			var output bytes.Buffer
-			code := runPiSecrets(
-				context.Background(),
-				[]string{"pi-secrets", "--project", "example-project", "--out", outDir, "--env-secret", "SAFE=injected-secret"},
-				&output,
-				defaultCredentials("credential-file"),
-				readerFactory(t, reader, "credential-file"),
-				func(context.Context, string) error { return nil },
-			)
-			if code != 1 {
-				t.Fatalf("runPiSecrets exit = %d, want 1", code)
-			}
-			requireFileAbsent(t, filepath.Join(outDir, "secrets.env"))
-			if bytes.Contains(output.Bytes(), tc.value) {
-				t.Errorf("stdout contains refused secret value %q", tc.value)
-			}
-		})
-	}
-
-	// This control catches a test that refuses every value instead of only the
-	// values that could change the generated environment file.
+// requireEnvironmentValueRefused runs pi-secrets on one environment secret
+// whose value is value. It fails t unless the command exits 1, writes no
+// secrets.env, and prints no marker, a word of the value.
+func requireEnvironmentValueRefused(t *testing.T, value []byte, marker string) {
+	t.Helper()
 	reader := &fakeSecretReader{replies: map[string]secretReply{
-		secretReplyKey("ordinary-secret", "latest"): {value: secretVersion{Version: 1, Data: []byte("ordinary-value")}},
+		secretReplyKey("environment-secret", "latest"): {value: secretVersion{Version: 1, Data: value}},
 	}}
 	outDir := t.TempDir()
 	var output bytes.Buffer
 	code := runPiSecrets(
 		context.Background(),
-		[]string{"pi-secrets", "--project", "example-project", "--out", outDir, "--env-secret", "SAFE=ordinary-secret"},
-		&output,
-		defaultCredentials("credential-file"),
-		readerFactory(t, reader, "credential-file"),
-		func(context.Context, string) error { return nil },
-	)
-	if code != 0 {
-		t.Fatalf("ordinary value exit = %d, want 0", code)
-	}
-	got, err := os.ReadFile(filepath.Join(outDir, "secrets.env"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(got) != "SAFE=ordinary-value\n" {
-		t.Errorf("ordinary value file = %q", got)
-	}
-	if strings.Contains(output.String(), "ordinary-value") {
-		t.Errorf("ordinary value appears on stdout: %q", output.String())
-	}
-}
-
-// TestPiSecretsWritesNothingWhenOneReadFails catches a writer that commits an
-// incomplete environment file after an earlier Secret Manager read succeeded.
-func TestPiSecretsWritesNothingWhenOneReadFails(t *testing.T) {
-	reader := &fakeSecretReader{replies: map[string]secretReply{
-		secretReplyKey("first-secret", "latest"):  {value: secretVersion{Version: 1, Data: []byte("first-value")}},
-		secretReplyKey("second-secret", "latest"): {err: errors.New("second secret unavailable")},
-	}}
-	outDir := t.TempDir()
-	var output bytes.Buffer
-
-	code := runPiSecrets(
-		context.Background(),
-		[]string{"pi-secrets", "--project", "example-project", "--out", outDir, "--env-secret", "FIRST=first-secret", "--env-secret", "SECOND=second-secret"},
+		[]string{"pi-secrets", "--project", "example-project", "--out", outDir, "--env-secret", "SAFE=environment-secret"},
 		&output,
 		defaultCredentials("credential-file"),
 		readerFactory(t, reader, "credential-file"),
@@ -227,12 +163,254 @@ func TestPiSecretsWritesNothingWhenOneReadFails(t *testing.T) {
 		t.Fatalf("runPiSecrets exit = %d, want 1", code)
 	}
 	requireFileAbsent(t, filepath.Join(outDir, "secrets.env"))
-	if strings.Contains(output.String(), "first-value") {
-		t.Errorf("stdout contains a value from a partially read environment: %q", output.String())
+	if marker != "" && strings.Contains(output.String(), marker) {
+		t.Errorf("stdout contains the refused value's %q: %q", marker, output.String())
 	}
-	requireAccesses(t, reader, []secretAccess{
-		{project: "example-project", secret: "first-secret", version: "latest"},
-		{project: "example-project", secret: "second-secret", version: "latest"},
+}
+
+// requireEnvironmentValueAccepted runs pi-secrets on one environment secret
+// whose value is value. It fails t unless the command exits 0, writes
+// secrets.env as want, and prints no marker, a word of the value.
+func requireEnvironmentValueAccepted(t *testing.T, value []byte, want, marker string) {
+	t.Helper()
+	reader := &fakeSecretReader{replies: map[string]secretReply{
+		secretReplyKey("environment-secret", "latest"): {value: secretVersion{Version: 1, Data: value}},
+	}}
+	outDir := t.TempDir()
+	var output bytes.Buffer
+	code := runPiSecrets(
+		context.Background(),
+		[]string{"pi-secrets", "--project", "example-project", "--out", outDir, "--env-secret", "SAFE=environment-secret"},
+		&output,
+		defaultCredentials("credential-file"),
+		readerFactory(t, reader, "credential-file"),
+		func(context.Context, string) error { return nil },
+	)
+	if code != 0 {
+		t.Fatalf("runPiSecrets exit = %d, want 0", code)
+	}
+	got, err := os.ReadFile(filepath.Join(outDir, "secrets.env"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != want {
+		t.Errorf("secrets.env = %q, want %q", got, want)
+	}
+	if strings.Contains(output.String(), marker) {
+		t.Errorf("stdout contains the value's %q: %q", marker, output.String())
+	}
+}
+
+// TestPiSecretsRefusesAValueThatWouldAddASetting catches validation that lets
+// a line feed inside a value start a second line of secrets.env, which the
+// unit would read as another setting. The ordinary value is its control: a
+// check that refused every value would fail it.
+func TestPiSecretsRefusesAValueThatWouldAddASetting(t *testing.T) {
+	requireEnvironmentValueRefused(t, []byte("injected-value\nGHOST_WISPR_CONFIG=/tmp/x"), "injected-value")
+	requireEnvironmentValueAccepted(t, []byte("ordinary-value"), "SAFE=ordinary-value\n", "ordinary-value")
+}
+
+// TestPiSecretsRefusesAnEmptyOrControlValue catches validation that writes an
+// empty setting, checks for emptiness before it removes the final line feed,
+// or keeps a carriage return or a NUL in a value. A value whose one line feed
+// is its last byte is the control: pi-secrets removes that line feed and
+// accepts the value.
+func TestPiSecretsRefusesAnEmptyOrControlValue(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		value  []byte
+		marker string
+	}{
+		{name: "empty", value: []byte("")},
+		{name: "only a line feed", value: []byte("\n")},
+		{name: "carriage return", value: []byte("control-value\r\n"), marker: "control-value"},
+		{name: "NUL", value: []byte("control-value\x00"), marker: "control-value"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			requireEnvironmentValueRefused(t, tc.value, tc.marker)
+		})
+	}
+	t.Run("a final line feed alone", func(t *testing.T) {
+		requireEnvironmentValueAccepted(t, []byte("control-value\n"), "SAFE=control-value\n", "control-value")
+	})
+}
+
+// TestPiSecretsRefusesABadChecksum catches a reader or a command that writes a
+// value whose CRC32C does not match the checksum Secret Manager sent with it.
+// It runs the real Secret Manager reader over a fake transport. The same
+// answer with its right checksum is the control.
+func TestPiSecretsRefusesABadChecksum(t *testing.T) {
+	data := []byte("checksum-value")
+	crc := crc32.Checksum(data, crc32.MakeTable(crc32.Castagnoli))
+	for _, tc := range []struct {
+		name     string
+		checksum uint32
+		wantCode int
+	}{
+		{name: "wrong checksum", checksum: crc + 1, wantCode: 1},
+		{name: "right checksum", checksum: crc, wantCode: 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			body, err := json.Marshal(map[string]any{
+				"name": "projects/example-project/secrets/checksum-secret/versions/4",
+				"payload": map[string]string{
+					"data":       base64.StdEncoding.EncodeToString(data),
+					"dataCrc32c": fmt.Sprint(tc.checksum),
+				},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			reader := newTestSecretManagerReader(func(*http.Request) (*http.Response, error) {
+				return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(bytes.NewReader(body)), Header: make(http.Header)}, nil
+			})
+			outDir := t.TempDir()
+			var output bytes.Buffer
+
+			code := runPiSecrets(
+				context.Background(),
+				[]string{"pi-secrets", "--project", "example-project", "--out", outDir, "--env-secret", "SAFE=checksum-secret"},
+				&output,
+				defaultCredentials("credential-file"),
+				func(context.Context, string) (secretReader, error) { return reader, nil },
+				func(context.Context, string) error { return nil },
+			)
+			if code != tc.wantCode {
+				t.Fatalf("runPiSecrets exit = %d, want %d", code, tc.wantCode)
+			}
+			if strings.Contains(output.String(), "checksum-value") {
+				t.Errorf("stdout contains the secret value: %q", output.String())
+			}
+			path := filepath.Join(outDir, "secrets.env")
+			if tc.wantCode != 0 {
+				requireFileAbsent(t, path)
+				return
+			}
+			got, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(got) != "SAFE=checksum-value\n" {
+				t.Errorf("secrets.env = %q, want SAFE=checksum-value", got)
+			}
+		})
+	}
+}
+
+// TestPiSecretsWritesNothingWhenOneReadFails catches a writer that commits an
+// incomplete secrets.env after an earlier read succeeded, and a failed read or
+// check that skips the certificate step: R10 keeps that step running, so the
+// newer certificate that signs in is still staged while the exit code stays 1.
+func TestPiSecretsWritesNothingWhenOneReadFails(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		second secretReply
+	}{
+		{name: "a read fails", second: secretReply{err: errors.New("second secret unavailable")}},
+		{name: "a check fails", second: secretReply{value: secretVersion{Version: 2, Data: []byte("second-value\nINJECTED=1")}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fixture := newCertificateFixture(t)
+			reader := &fakeSecretReader{replies: map[string]secretReply{
+				secretReplyKey("first-secret", "latest"):  {value: secretVersion{Version: 1, Data: []byte("first-value")}},
+				secretReplyKey("second-secret", "latest"): tc.second,
+				secretReplyKey(fixture.secret, "latest"):  {value: secretVersion{Version: 3, Data: fixture.candidate}},
+			}}
+			args := append(fixture.args(), "--env-secret", "FIRST=first-secret", "--env-secret", "SECOND=second-secret")
+			var output bytes.Buffer
+
+			code := runPiSecrets(
+				context.Background(),
+				args,
+				&output,
+				defaultCredentials(fixture.credentials),
+				readerFactory(t, reader, fixture.credentials),
+				productionSignInCheck,
+			)
+			if code != 1 {
+				t.Fatalf("runPiSecrets exit = %d, want 1", code)
+			}
+			requireFileAbsent(t, filepath.Join(fixture.outDir, "secrets.env"))
+			for _, value := range []string{"first-value", "second-value"} {
+				if strings.Contains(output.String(), value) {
+					t.Errorf("stdout contains secret value %q: %q", value, output.String())
+				}
+			}
+			staged, err := os.ReadFile(filepath.Join(fixture.outDir, "device.crt"))
+			if err != nil {
+				t.Fatalf("the certificate step did not stage the newer certificate: %v", err)
+			}
+			if !bytes.Equal(staged, fixture.candidate) {
+				t.Errorf("device.crt = %q, want certificate version 3", staged)
+			}
+			requireOneOutputLine(t, output.String(), "pi-secrets: certificate version 3, not after ", ": newer and signs in")
+		})
+	}
+}
+
+// requireOneOutputLine fails t unless exactly one line of output starts with
+// prefix and ends with suffix.
+func requireOneOutputLine(t *testing.T, output, prefix, suffix string) {
+	t.Helper()
+	matches := 0
+	for line := range strings.SplitSeq(output, "\n") {
+		if strings.HasPrefix(line, prefix) && strings.HasSuffix(line, suffix) {
+			matches++
+		}
+	}
+	if matches != 1 {
+		t.Errorf("stdout has %d lines %q...%q, want 1: %q", matches, prefix, suffix, output)
+	}
+}
+
+// secretReaderFunc is a secretReader made of one function, for a reader whose
+// answer depends on the context it gets.
+type secretReaderFunc func(ctx context.Context, project, secret, version string) (secretVersion, error)
+
+func (f secretReaderFunc) Access(ctx context.Context, project, secret, version string) (secretVersion, error) {
+	return f(ctx, project, secret, version)
+}
+
+// TestPiSecretsEndsWithin30s catches a command with no bound of its own: a
+// Secret Manager read that never answers would hold update.sh's run. The
+// reader blocks until its context ends, and the test's context has no
+// deadline, so only pi-secrets' own bound can end the read. A reader still
+// blocked after a minute gives up and fails the test. The test runs in a
+// synctest bubble, whose fake clock passes the 30 s at once.
+func TestPiSecretsEndsWithin30s(t *testing.T) {
+	outDir := t.TempDir()
+	synctest.Test(t, func(t *testing.T) {
+		var ended error
+		reader := secretReaderFunc(func(ctx context.Context, _, _, _ string) (secretVersion, error) {
+			select {
+			case <-ctx.Done():
+				ended = ctx.Err()
+			case <-time.After(time.Minute):
+				ended = errors.New("no bound ended the read within a minute")
+			}
+			return secretVersion{}, ended
+		})
+		start := time.Now()
+
+		code := runPiSecrets(
+			context.Background(),
+			[]string{"pi-secrets", "--project", "example-project", "--out", outDir, "--env-secret", "SAFE=hanging-secret"},
+			io.Discard,
+			defaultCredentials("credential-file"),
+			func(context.Context, string) (secretReader, error) { return reader, nil },
+			func(context.Context, string) error { return nil },
+		)
+		elapsed := time.Since(start)
+		if !errors.Is(ended, context.DeadlineExceeded) {
+			t.Errorf("the hanging read ended with %v, want pi-secrets' own deadline", ended)
+		}
+		if elapsed > 30*time.Second {
+			t.Errorf("pi-secrets ran %v, want at most 30s", elapsed)
+		}
+		if code != 1 {
+			t.Errorf("runPiSecrets exit = %d, want 1", code)
+		}
+		requireFileAbsent(t, filepath.Join(outDir, "secrets.env"))
 	})
 }
 
@@ -437,8 +615,9 @@ func TestPiSecretsStagesANewerCertificateThatSignsIn(t *testing.T) {
 }
 
 // TestPiSecretsFindsTheRealCertificateBehindABadNewerOne catches a renewal
-// reader that stops at an unusable latest version, reads a version list, or
-// stages a candidate that failed its real sign-in check.
+// reader that stops at an unusable latest version, treats a disabled
+// (FAILED_PRECONDITION) or absent (NOT_FOUND) version as the end of the walk,
+// reads a version list, or stages a candidate that failed its real sign-in.
 func TestPiSecretsFindsTheRealCertificateBehindABadNewerOne(t *testing.T) {
 	fixture := newCertificateFixture(t)
 	badCA, badCAKey := newUntrustedCertificateAuthority(t)
@@ -447,7 +626,8 @@ func TestPiSecretsFindsTheRealCertificateBehindABadNewerOne(t *testing.T) {
 	reader := &fakeSecretReader{replies: map[string]secretReply{
 		secretReplyKey(fixture.secret, "latest"): {value: secretVersion{Version: 7, Data: badNewer}},
 		secretReplyKey(fixture.secret, "6"):      {err: secretManagerStatus("FAILED_PRECONDITION")},
-		secretReplyKey(fixture.secret, "5"):      {value: secretVersion{Version: 5, Data: goodOlder}},
+		secretReplyKey(fixture.secret, "5"):      {err: secretManagerStatus("NOT_FOUND")},
+		secretReplyKey(fixture.secret, "4"):      {value: secretVersion{Version: 4, Data: goodOlder}},
 	}}
 	var output bytes.Buffer
 
@@ -462,44 +642,12 @@ func TestPiSecretsFindsTheRealCertificateBehindABadNewerOne(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("runPiSecrets exit = %d, want 0", code)
 	}
-	requireCertificateStaged(t, &output, fixture.outDir, 5, goodOlder)
+	requireCertificateStaged(t, &output, fixture.outDir, 4, goodOlder)
 	requireAccesses(t, reader, []secretAccess{
 		{project: fixture.project, secret: fixture.secret, version: "latest"},
 		{project: fixture.project, secret: fixture.secret, version: "6"},
 		{project: fixture.project, secret: fixture.secret, version: "5"},
-	})
-}
-
-// TestPiSecretsSkipsNotFoundCertificateVersions catches a version walk that
-// treats a deleted version as terminal instead of finding the next candidate.
-func TestPiSecretsSkipsNotFoundCertificateVersions(t *testing.T) {
-	fixture := newCertificateFixture(t)
-	badCA, badCAKey := newUntrustedCertificateAuthority(t)
-	badNewer := certificateForKey(t, badCA, badCAKey, fixture.key, time.Now().Add(72*time.Hour))
-	goodOlder := certificateForKey(t, fixture.ca, fixture.caKey, fixture.key, time.Now().Add(60*time.Hour))
-	reader := &fakeSecretReader{replies: map[string]secretReply{
-		secretReplyKey(fixture.secret, "latest"): {value: secretVersion{Version: 3, Data: badNewer}},
-		secretReplyKey(fixture.secret, "2"):      {err: secretManagerStatus("NOT_FOUND")},
-		secretReplyKey(fixture.secret, "1"):      {value: secretVersion{Version: 1, Data: goodOlder}},
-	}}
-	var output bytes.Buffer
-
-	code := runPiSecrets(
-		context.Background(),
-		fixture.args(),
-		&output,
-		defaultCredentials(fixture.credentials),
-		readerFactory(t, reader, fixture.credentials),
-		productionSignInCheck,
-	)
-	if code != 0 {
-		t.Fatalf("runPiSecrets exit = %d, want 0", code)
-	}
-	requireCertificateStaged(t, &output, fixture.outDir, 1, goodOlder)
-	requireAccesses(t, reader, []secretAccess{
-		{project: fixture.project, secret: fixture.secret, version: "latest"},
-		{project: fixture.project, secret: fixture.secret, version: "2"},
-		{project: fixture.project, secret: fixture.secret, version: "1"},
+		{project: fixture.project, secret: fixture.secret, version: "4"},
 	})
 }
 
@@ -550,10 +698,10 @@ func TestPiSecretsStopsTheWalkOnPermissionDenied(t *testing.T) {
 	}
 }
 
-// TestPiSecretsLooksBackOnlyNineCertificateVersions catches a reader that
-// accesses version N-10 or below after the documented nine-version recovery
-// window ends.
-func TestPiSecretsLooksBackOnlyNineCertificateVersions(t *testing.T) {
+// TestPiSecretsReadsAtMostTenCertificateVersions catches a walk that reads
+// more than the latest version and the nine under it. Latest is version 12
+// and versions 11 to 3 are absent, so an eleventh read, of version 2, fails it.
+func TestPiSecretsReadsAtMostTenCertificateVersions(t *testing.T) {
 	fixture := newCertificateFixture(t)
 	mismatchedKey := newRSAKey(t)
 	mismatchedCertificate := certificateForKey(t, fixture.ca, fixture.caKey, mismatchedKey, time.Now().Add(72*time.Hour))
@@ -615,7 +763,7 @@ func TestPiSecretsKeepsTheInstalledCertificate(t *testing.T) {
 			reason: "candidate public key does not match --key",
 		},
 		{
-			name: "sign-in failure",
+			name: "fails the sign-in",
 			candidate: func(t *testing.T, f certificateFixture) []byte {
 				ca, caKey := newUntrustedCertificateAuthority(t)
 				return certificateForKey(t, ca, caKey, f.key, time.Now().Add(72*time.Hour))
@@ -690,8 +838,8 @@ func newTestSecretManagerReader(transport roundTripFunc) *secretManagerReader {
 }
 
 // TestSecretManagerReaderAccess catches a reader that sends the wrong access
-// request, omits its bearer token, accepts a bad checksum, or trusts a version
-// other than the one in Secret Manager's response name.
+// request, omits its bearer token, decodes the payload wrongly, or trusts a
+// version other than the one in Secret Manager's response name.
 func TestSecretManagerReaderAccess(t *testing.T) {
 	data := []byte("secret-value")
 	crc := crc32.Checksum(data, crc32.MakeTable(crc32.Castagnoli))
@@ -724,20 +872,6 @@ func TestSecretManagerReaderAccess(t *testing.T) {
 	}
 	if got.Version != 9 || !bytes.Equal(got.Data, data) {
 		t.Errorf("Access = %#v, want version 9 and %q", got, data)
-	}
-}
-
-// TestSecretManagerReaderRejectsWrongChecksum catches a reader that accepts a
-// Secret Manager payload whose CRC32C does not match its decoded bytes.
-func TestSecretManagerReaderRejectsWrongChecksum(t *testing.T) {
-	body := []byte(`{"name":"projects/example-project/secrets/environment-secret/versions/2","payload":{"data":"Y2hlY2tzdW0=","dataCrc32c":"0"}}`)
-	reader := newTestSecretManagerReader(func(*http.Request) (*http.Response, error) {
-		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(bytes.NewReader(body)), Header: make(http.Header)}, nil
-	})
-
-	_, err := reader.Access(context.Background(), "example-project", "environment-secret", "latest")
-	if err == nil || !strings.Contains(err.Error(), "CRC32C") {
-		t.Errorf("Access error = %v, want CRC32C failure", err)
 	}
 }
 
