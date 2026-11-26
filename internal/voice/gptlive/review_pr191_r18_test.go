@@ -114,3 +114,59 @@ func TestADelegationCancelsItsAcknowledgementAtOnce(t *testing.T) {
 		})
 	}
 }
+
+// TestADelegationsAcknowledgementReachesNoSpeaker guards the office Pi run of
+// 2026-11-26 at 66f73dc: GPT-Live speaks an acknowledgement of its own
+// ("Let me check that.", 498 ms after the delegation reached the client) and
+// no instruction stops it. Its audio reaches the room only through us, so the
+// client holds the speaker from the delegation's arrival until it resolves.
+// A withdrawn delegation passes on nothing at all; an answered one passes on
+// the answer.
+func TestADelegationsAcknowledgementReachesNoSpeaker(t *testing.T) {
+	for _, answered := range []bool{false, true} {
+		name := "withdrawn: the room hears nothing"
+		if answered {
+			name = "control: the answer still plays"
+		}
+		t.Run(name, func(t *testing.T) {
+			out := newFakeOutput()
+			tools := newFakeTools(voice.AnswerResult{Say: "ABC-42 is in review."})
+			x := testExchange(out, tools)
+			asker := ""
+			if answered {
+				asker = "what about ABC-42?"
+			}
+			x.Room = func() voice.RoomView {
+				return voice.RoomView{Live: true, Asker: asker, Revision: 1}
+			}
+			srv := newLiveServer(t)
+			s, c, _ := openSession(t, srv, x)
+
+			c.delegate("item_hold")
+			// The acknowledgement GPT-Live speaks after delegating.
+			c.audioDelta(ramp(1000, SampleRate/2))
+			if !answered {
+				if first := c.expect(evThinkingAppend); first.Content != "" {
+					t.Fatalf("silent completion content %q", first.Content)
+				}
+				// Nothing GPT-Live sent while the delegation was outstanding
+				// may reach the speaker.
+				time.Sleep(200 * time.Millisecond)
+				if n := len(out.samples()); n != 0 {
+					t.Errorf("the room heard %d samples of the acknowledgement, want none", n)
+				}
+				return
+			}
+			waitEvent(t, s, voice.EventToolCall)
+			tools.call(t)
+			if n := len(out.samples()); n != 0 {
+				t.Errorf("the room heard %d samples of the acknowledgement, want none", n)
+			}
+			// The answer, a speech of its own once the hold is released,
+			// plays.
+			time.Sleep(speechGap + 100*time.Millisecond)
+			c.audioDelta(ramp(5000, 2400))
+			out.nextSpeech(t).waitSamples(t, 2400)
+		})
+	}
+}

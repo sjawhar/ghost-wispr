@@ -137,23 +137,36 @@ const (
 )
 
 // delegationLog is the session's logger: it keeps when the first client
-// delegation reached us, so a probe can time the vendor's own acknowledgement
-// against it, and passes every record on to the default logger. The session
-// logs no words of the room.
+// delegation reached us and how much of the model's audio the client withheld
+// from the speaker while one was outstanding, so a probe can report what
+// GPT-Live sent against what the room would have heard. It passes every
+// record on to the default logger. The session logs no words of the room.
 type delegationLog struct {
-	mu    sync.Mutex
-	first time.Time
+	mu       sync.Mutex
+	first    time.Time
+	withheld time.Duration
 }
 
 func (l *delegationLog) Enabled(context.Context, slog.Level) bool { return true }
 
 func (l *delegationLog) Handle(ctx context.Context, r slog.Record) error {
-	if r.Message == "gptlive: delegation reached the client" {
+	switch r.Message {
+	case "gptlive: delegation reached the client":
 		l.mu.Lock()
 		if l.first.IsZero() {
 			l.first = r.Time
 		}
 		l.mu.Unlock()
+	case "gptlive: withheld the model's audio while a delegation was outstanding":
+		r.Attrs(func(a slog.Attr) bool {
+			if a.Key == "ms" {
+				l.mu.Lock()
+				l.withheld += time.Duration(a.Value.Int64()) * time.Millisecond
+				l.mu.Unlock()
+				return false
+			}
+			return true
+		})
 	}
 	return slog.Default().Handler().Handle(ctx, r)
 }
@@ -166,6 +179,13 @@ func (l *delegationLog) arrivedAt() (time.Time, bool) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	return l.first, !l.first.IsZero()
+}
+
+// heldBack is how much of the model's audio never reached the speaker.
+func (l *delegationLog) heldBack() time.Duration {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.withheld
 }
 
 // delegationEvidence is the answer's code-like fact. GPT-Live's
@@ -782,13 +802,15 @@ func observeDelegation(ctx context.Context, cfg *probeConfig, in *feeder, tools 
 	} else {
 		printf(out, "observe: no delegation reached the client\n")
 	}
+	held := arrivals.heldBack()
+	printf(out, "observe: GPT-Live sent %v of audio; the client passed %v on to the speaker and withheld %v while a delegation was outstanding\n", spoke+held, spoke, held)
 	if at, ok := rec.firstAfter(ended); ok {
-		printf(out, "observe: GPT-Live spoke %v of audio, beginning %v after the question ended\n", spoke, at.Sub(ended).Round(time.Millisecond))
+		printf(out, "observe: the speaker heard %v of audio, beginning %v after the question ended\n", spoke, at.Sub(ended).Round(time.Millisecond))
 		if gotDelegation {
 			printf(out, "observe: that speech began %v after the delegation reached the client\n", at.Sub(arrived).Round(time.Millisecond))
 		}
 	} else {
-		printf(out, "observe: GPT-Live spoke no audio in the window\n")
+		printf(out, "observe: the speaker heard no audio in the window\n")
 	}
 	if called, ok := tools.firstCall(); ok {
 		printf(out, "observe: the backend was called %v after the question ended\n", called.Sub(ended).Round(time.Millisecond))

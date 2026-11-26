@@ -87,6 +87,12 @@ const (
 	roomWait = 2 * time.Second
 	// roomPoll is how often a waiting delegation re-reads the room.
 	roomPoll = 40 * time.Millisecond
+	// holdCap is the longest the model's audio is held back from the speaker
+	// while a delegation is outstanding. A delegation resolves within
+	// roomWait, and an answer tool that is slow has already been reported, so
+	// this only bounds the damage of one that never resolves: past it the
+	// voice speaks again rather than staying silent for the meeting.
+	holdCap = 10 * time.Second
 	// nothingFound answers a delegation the Concierge had nothing to say on.
 	nothingFound = "There is nothing to report on this. Say so in one short sentence."
 	// lookupFailed closes a delegation whose answer tool failed, as silent
@@ -906,9 +912,14 @@ func (s *session) onDelegation(ev *serverEvent) {
 	// Logged so a probe can time the vendor's own acknowledgement against the
 	// moment the delegation reached us. It carries no words of the room.
 	s.log.Info("gptlive: delegation reached the client", "delegation", id)
+	// The room hears nothing from GPT-Live until this delegation resolves:
+	// it acknowledges in its own words after delegating, and no instruction
+	// stops it, but its audio reaches the room only through us.
+	s.player.hold()
 	s.mu.Lock()
 	if s.closing {
 		s.mu.Unlock()
+		s.player.release()
 		return
 	}
 	s.delegations[id] = true
@@ -919,12 +930,13 @@ func (s *session) onDelegation(ev *serverEvent) {
 
 // ask builds delegation id's question from the room, then reports the tool
 // call and runs it. It first cancels GPT-Live's automatic acknowledgement,
-// which otherwise plays while the question is resolved: the real-vendor probe
-// of 2026-11-26 heard "I'll check on that." in the room because nothing was
-// sent until the silent ending, two seconds later. resolveQuestion is the
-// only wait; the user-turn record is flushed once a question is in hand.
+// the documented way, and releases the speaker hold when the delegation
+// resolves: the acknowledgement GPT-Live speaks anyway is dropped with it,
+// and the answer that follows plays. resolveQuestion is the only wait; the
+// user-turn record is flushed once a question is in hand.
 func (s *session) ask(id string) {
 	defer s.wg.Done()
+	defer s.player.release()
 	s.suppressAck(id)
 	question, room, ok := s.resolveQuestion(id)
 	if !ok {
@@ -1227,19 +1239,67 @@ type player struct {
 	s    *session
 	wake chan struct{}
 
-	mu      sync.Mutex
-	queue   []int16
-	last    time.Time // when the model's last audible audio arrived
-	muted   bool      // drop the model's audio until it pauses: an interrupted speech
-	cut     bool      // end the speech under way now
-	stopped bool      // the session closed: nothing more plays
-	begun   int       // speeches begun
-	ended   int       // speeches ended
-	changed chan struct{}
+	mu         sync.Mutex
+	queue      []int16
+	last       time.Time // when the model's last audible audio arrived
+	muted      bool      // drop the model's audio until it pauses: an interrupted speech
+	cut        bool      // end the speech under way now
+	stopped    bool      // the session closed: nothing more plays
+	holds      int       // delegations outstanding: the model's audio reaches no speaker
+	heldAt     time.Time // when the first of those delegations arrived
+	heldFrames int       // samples withheld since that delegation arrived
+	begun      int       // speeches begun
+	ended      int       // speeches ended
+	changed    chan struct{}
 }
 
 func newPlayer(s *session) *player {
 	return &player{s: s, wake: make(chan struct{}, 1), changed: make(chan struct{})}
+}
+
+// hold stops the model's audio from reaching the speaker: a delegation has
+// arrived and has not been resolved. GPT-Live acknowledges a delegation in
+// its own words after raising it, and no instruction stops it (the office
+// Pi, 2026-11-26: "Let me check that.", 498 ms after the delegation reached
+// the client), but its audio reaches the room only through us. Holds nest,
+// so concurrent delegations each release their own.
+func (p *player) hold() {
+	p.mu.Lock()
+	if p.holds == 0 {
+		p.heldAt, p.heldFrames = time.Now(), 0
+	}
+	p.holds++
+	p.mu.Unlock()
+}
+
+// release ends one delegation's hold. What was held is already dropped; if
+// the model is still mid-acknowledgement, the rest of it is muted, so a
+// speech cut in half does not reach the room either. The answer that follows
+// begins a speech of its own and plays.
+func (p *player) release() {
+	p.mu.Lock()
+	if p.holds > 0 {
+		p.holds--
+	}
+	if p.holds == 0 {
+		if !p.last.IsZero() && time.Since(p.last) < speechGap {
+			p.muted = true
+		}
+		if p.heldFrames > 0 {
+			p.s.log.Info("gptlive: withheld the model's audio while a delegation was outstanding",
+				"samples", p.heldFrames, "ms", p.heldFrames*1000/SampleRate)
+		}
+		p.heldAt, p.heldFrames = time.Time{}, 0
+	}
+	p.mu.Unlock()
+	signal(p.wake)
+}
+
+// heldLocked reports whether the model's audio is held now. The hold is
+// capped at holdCap: a delegation that never resolves must not silence the
+// voice for the rest of the meeting.
+func (p *player) heldLocked(now time.Time) bool {
+	return p.holds > 0 && !p.heldAt.IsZero() && now.Sub(p.heldAt) < holdCap
 }
 
 // push queues the model's audio and reports whether it starts a speech.
@@ -1248,6 +1308,18 @@ func (p *player) push(pcm []int16, now time.Time) bool {
 	defer signal(p.wake)
 	defer p.mu.Unlock()
 	if p.stopped {
+		return false
+	}
+	if p.heldLocked(now) {
+		// A delegation is outstanding: GPT-Live speaks an acknowledgement of
+		// its own after it delegates, whatever its instructions say (the
+		// office Pi, 2026-11-26), and the room must not hear it. The audio
+		// reaches no speaker and is dropped; the time is still kept, so
+		// release knows a speech is under way and mutes the rest of it.
+		if audible(pcm) {
+			p.last = now
+		}
+		p.heldFrames += len(pcm)
 		return false
 	}
 	inSpeech := !p.last.IsZero() && now.Sub(p.last) < speechGap
