@@ -7,7 +7,9 @@ import (
 	"fmt"
 	"iter"
 	"log/slog"
+	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -448,11 +450,7 @@ func newRig(t *testing.T) *rig {
 // newLoggedRig is newRig with the Concierge's logger; nil is slog's default.
 func newLoggedRig(t *testing.T, logger *slog.Logger) *rig {
 	t.Helper()
-	store, err := storage.NewSQLiteStore(filepath.Join(t.TempDir(), "unit.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = store.Close() })
+	store := freshStore(t)
 	if err := store.CreateSession("meeting-1", meetingStart); err != nil {
 		t.Fatal(err)
 	}
@@ -467,6 +465,7 @@ func newLoggedRig(t *testing.T, logger *slog.Logger) *rig {
 			AskerTurn: "what is happening with the voice work",
 		},
 	}
+	var err error
 	r.concierge, err = New(&Config{
 		Model:     "test-model",
 		Generator: r.model,
@@ -486,6 +485,121 @@ func newLoggedRig(t *testing.T, logger *slog.Logger) *rig {
 		return r.concierge.projects != nil
 	})
 	return r
+}
+
+// freshStores are empty stores, each in a directory of its own, opened ahead
+// of the rigs that take them (freshStore). Under the race detector a new
+// store takes about 200 ms, most of it CPU, and the package's 792 rigs
+// made theirs one after another: 119 of the package's 249 CPU-seconds, while
+// the other CPUs sat idle. TestMain closes the ones left (close).
+var freshStores storePool
+
+type storePool struct {
+	once  sync.Once
+	root  string
+	ready chan pooledStore
+	stop  chan struct{}
+	makes sync.WaitGroup
+}
+
+// pooledStore is a store opened ahead, in dir, or the error that opened none.
+type pooledStore struct {
+	store *storage.SQLiteStore
+	dir   string
+	err   error
+}
+
+// freshStore is an empty store of t's alone, which storage.NewSQLiteStore
+// opened in a new directory (start). It closes, and its directory goes, when
+// t ends.
+func freshStore(t *testing.T) *storage.SQLiteStore {
+	t.Helper()
+	p := &freshStores
+	p.once.Do(p.start)
+	made := <-p.ready
+	if made.err != nil {
+		t.Fatal(made.err)
+	}
+	t.Cleanup(func() {
+		_ = made.store.Close()
+		if err := os.RemoveAll(made.dir); err != nil {
+			t.Errorf("remove the store's directory: %v", err)
+		}
+	})
+	return made.store
+}
+
+// start opens stores on every CPU but the one the tests run on, each as
+// soon as a rig took the one opened before it. Each opens a copy of one
+// store made first and closed, which costs less CPU than making one: under
+// the race detector a test binary that opened 40 copies took 5.5 to 6.0
+// CPU-seconds, one that made 40 stores 7.1 to 7.4. An opening is also what
+// the unit does at each start after its first.
+func (p *storePool) start() {
+	makers := max(1, runtime.GOMAXPROCS(0)-1)
+	p.ready = make(chan pooledStore, makers)
+	p.stop = make(chan struct{})
+	root, err := os.MkdirTemp("", "concierge-stores-")
+	p.root = root
+	var made []byte
+	if err == nil {
+		made, err = madeStore(filepath.Join(root, "made"))
+	}
+	for range makers {
+		p.makes.Go(func() {
+			for {
+				next := pooledStore{err: err}
+				if err == nil {
+					next.dir, next.err = os.MkdirTemp(root, "store-")
+				}
+				path := filepath.Join(next.dir, "unit.db")
+				if next.err == nil {
+					next.err = os.WriteFile(path, made, 0o600)
+				}
+				if next.err == nil {
+					next.store, next.err = storage.NewSQLiteStore(path)
+				}
+				select {
+				case p.ready <- next:
+				case <-p.stop:
+					if next.store != nil {
+						_ = next.store.Close()
+					}
+					return
+				}
+			}
+		})
+	}
+}
+
+// madeStore makes a new store in dir, closes it, and returns its database
+// file.
+func madeStore(dir string) ([]byte, error) {
+	path := filepath.Join(dir, "unit.db")
+	store, err := storage.NewSQLiteStore(path)
+	if err != nil {
+		return nil, err
+	}
+	if err := store.Close(); err != nil {
+		return nil, err
+	}
+	return os.ReadFile(path)
+}
+
+// close stops the making, and closes and removes every store no rig took.
+func (p *storePool) close() {
+	if p.stop == nil {
+		return
+	}
+	close(p.stop)
+	p.makes.Wait()
+	close(p.ready)
+	for made := range p.ready {
+		if made.store != nil {
+			_ = made.store.Close()
+		}
+	}
+	_ = os.RemoveAll(p.root)
 }
 
 // run calls one tool through the exchange's runner and decodes its result. An
