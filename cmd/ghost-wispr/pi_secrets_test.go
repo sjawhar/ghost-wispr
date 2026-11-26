@@ -371,47 +371,98 @@ func (f secretReaderFunc) Access(ctx context.Context, project, secret, version s
 	return f(ctx, project, secret, version)
 }
 
-// TestPiSecretsEndsWithin30s catches a command with no bound of its own: a
-// Secret Manager read that never answers would hold update.sh's run. The
-// reader blocks until its context ends, and the test's context has no
-// deadline, so only pi-secrets' own bound can end the read. A reader still
-// blocked after a minute gives up and fails the test. The test runs in a
-// synctest bubble, whose fake clock passes the 30 s at once.
+// TestPiSecretsEndsWithin30s catches a command with no bound of its own, and a
+// bound that covers the key reads but not the certificate step: a Secret
+// Manager read that never answers would hold update.sh's run. Each read blocks
+// until its context ends, and the test's context has no deadline, so only
+// pi-secrets' own bound can end it. A read still blocked after a minute gives
+// up and fails the test. Each case runs in a synctest bubble, whose fake clock
+// passes the 30 s at once. The key file and the installed certificate are made
+// outside the bubbles.
 func TestPiSecretsEndsWithin30s(t *testing.T) {
-	outDir := t.TempDir()
-	synctest.Test(t, func(t *testing.T) {
-		var ended error
-		reader := secretReaderFunc(func(ctx context.Context, _, _, _ string) (secretVersion, error) {
-			select {
-			case <-ctx.Done():
-				ended = ctx.Err()
-			case <-time.After(time.Minute):
-				ended = errors.New("no bound ended the read within a minute")
-			}
-			return secretVersion{}, ended
-		})
-		start := time.Now()
+	ca, caKey, _ := googleauthtest.NewCA(t)
+	key := newRSAKey(t)
+	dir := t.TempDir()
+	keyPath := filepath.Join(dir, "device.key")
+	writePrivateKey(t, keyPath, key)
+	installedPath := filepath.Join(dir, "installed.crt")
+	writeTestFile(t, installedPath, certificateForKey(t, ca, caKey, key, time.Now().Add(24*time.Hour)))
 
-		code := runPiSecrets(
-			context.Background(),
-			[]string{"pi-secrets", "--project", "example-project", "--out", outDir, "--env-secret", "SAFE=hanging-secret"},
-			io.Discard,
-			defaultCredentials("credential-file"),
-			func(context.Context, string) (secretReader, error) { return reader, nil },
-			func(context.Context, string) error { return nil },
-		)
-		elapsed := time.Since(start)
-		if !errors.Is(ended, context.DeadlineExceeded) {
-			t.Errorf("the hanging read ended with %v, want pi-secrets' own deadline", ended)
-		}
-		if elapsed > 30*time.Second {
-			t.Errorf("pi-secrets ran %v, want at most 30s", elapsed)
-		}
-		if code != 1 {
-			t.Errorf("runPiSecrets exit = %d, want 1", code)
-		}
-		requireFileAbsent(t, filepath.Join(outDir, "secrets.env"))
-	})
+	for _, tc := range []struct {
+		name         string
+		certificate  []string
+		wantAccesses []secretAccess
+		wantLine     string
+	}{
+		{
+			name:         "a key read",
+			wantAccesses: []secretAccess{{project: "example-project", secret: "hanging-secret", version: "latest"}},
+		},
+		{
+			name:        "a key read and the certificate step",
+			certificate: []string{"--certificate-secret", "hanging-certificate", "--key", keyPath, "--installed-certificate", installedPath},
+			wantAccesses: []secretAccess{
+				{project: "example-project", secret: "hanging-secret", version: "latest"},
+				{project: "example-project", secret: "hanging-certificate", version: "latest"},
+			},
+			wantLine: "pi-secrets: certificate kept: latest certificate cannot be read\n",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			outDir := t.TempDir()
+			args := append([]string{"pi-secrets", "--project", "example-project", "--out", outDir, "--env-secret", "SAFE=hanging-secret"}, tc.certificate...)
+			synctest.Test(t, func(t *testing.T) {
+				var accesses []secretAccess
+				var ended []error
+				reader := secretReaderFunc(func(ctx context.Context, project, secret, version string) (secretVersion, error) {
+					accesses = append(accesses, secretAccess{project: project, secret: secret, version: version})
+					var err error
+					select {
+					case <-ctx.Done():
+						err = ctx.Err()
+					case <-time.After(time.Minute):
+						err = errors.New("no bound ended the read within a minute")
+					}
+					ended = append(ended, err)
+					return secretVersion{}, err
+				})
+				var output bytes.Buffer
+				start := time.Now()
+
+				code := runPiSecrets(
+					context.Background(),
+					args,
+					&output,
+					defaultCredentials("credential-file"),
+					func(context.Context, string) (secretReader, error) { return reader, nil },
+					func(context.Context, string) error {
+						t.Error("a certificate that no read returned reached the sign-in")
+						return nil
+					},
+				)
+				elapsed := time.Since(start)
+				if elapsed > 30*time.Second {
+					t.Errorf("pi-secrets ran %v, want at most 30s", elapsed)
+				}
+				if code != 1 {
+					t.Errorf("runPiSecrets exit = %d, want 1", code)
+				}
+				if !reflect.DeepEqual(accesses, tc.wantAccesses) {
+					t.Errorf("secret accesses = %#v, want %#v", accesses, tc.wantAccesses)
+				}
+				for i, err := range ended {
+					if !errors.Is(err, context.DeadlineExceeded) {
+						t.Errorf("read %d ended with %v, want pi-secrets' own deadline", i+1, err)
+					}
+				}
+				if tc.wantLine != "" && strings.Count(output.String(), tc.wantLine) != 1 {
+					t.Errorf("stdout = %q, want the line %q once", output.String(), tc.wantLine)
+				}
+				requireFileAbsent(t, filepath.Join(outDir, "secrets.env"))
+				requireFileAbsent(t, filepath.Join(outDir, "device.crt"))
+			})
+		})
+	}
 }
 
 type certificateFixture struct {
