@@ -43,6 +43,14 @@ type Store struct {
 	// environment: a change that sets a setting back to its value here
 	// removes that setting from the local settings file.
 	releaseSettings map[string]any
+	// localSettings are the settings the running config holds from the local
+	// settings file: those the start applied, as each change since has
+	// changed them, in the form that file writes them. Nil when it holds
+	// none.
+	localSettings map[string]any
+	// localSettingsErr is why the start did not apply the local settings
+	// file, or nil.
+	localSettingsErr error
 	// localSettingsRefusal refuses each change while the local settings file
 	// that the start could not apply is in place: a change would replace that
 	// file, and the settings saved in it would be lost. Nil when the start
@@ -85,11 +93,13 @@ func newStore(path, envPath string, envSecrets map[string]string) (*Store, []str
 		return nil, l.warnings, err
 	}
 	store := &Store{
-		cfg:             l.cfg,
-		releaseSettings: l.releaseSettings,
-		path:            path,
-		envPath:         envPath,
-		revision:        Revision{Run: newRun()},
+		cfg:              l.cfg,
+		releaseSettings:  l.releaseSettings,
+		localSettings:    l.localSettings,
+		localSettingsErr: l.localSettingsErr,
+		path:             path,
+		envPath:          envPath,
+		revision:         Revision{Run: newRun()},
 	}
 	if l.localSettingsErr != nil {
 		store.localSettingsRefusal = fmt.Errorf("settings not saved: Ghost Wispr did not apply %s at start (%v). Correct or remove that file, then restart Ghost Wispr. A save now would replace the settings in it", LocalSettingsPath(path), l.localSettingsErr)
@@ -110,6 +120,15 @@ func (s *Store) GetRevision() (Config, Revision) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.copyConfig(), s.revision
+}
+
+// GetWithLocalSettings returns, from one state of the store, a snapshot copy
+// of the current config, the revision it is, and the local settings it holds,
+// as copies.
+func (s *Store) GetWithLocalSettings() (Config, Revision, AppliedLocalSettings) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.copyConfig(), s.revision, AppliedLocalSettings{Settings: reportedSettings(s.localSettings), Err: s.localSettingsErr}
 }
 
 // Update applies a mutation to the config, validates the result, writes the
@@ -150,6 +169,7 @@ func (s *Store) TryUpdate(fn func(*Config) error) error {
 	providerKeysChanged := !maps.Equal(s.cfg.ProviderKeys, prev.ProviderKeys) ||
 		!maps.Equal(s.cfg.keysSet, prev.keysSet)
 	var previousLocal localSettingsFile
+	var localChanges map[string]any
 	if s.path != "" {
 		var err error
 		if previousLocal, err = readLocalSettingsFile(s.path); err != nil {
@@ -157,7 +177,7 @@ func (s *Store) TryUpdate(fn func(*Config) error) error {
 			s.mu.Unlock()
 			return fmt.Errorf("read local settings: %w", err)
 		}
-		if err := s.writeLocalSettings(&prev, previousLocal); err != nil {
+		if localChanges, err = s.writeLocalSettings(&prev, previousLocal); err != nil {
 			s.cfg = prev
 			s.mu.Unlock()
 			return fmt.Errorf("write local settings: %w", err)
@@ -177,6 +197,7 @@ func (s *Store) TryUpdate(fn func(*Config) error) error {
 			return err
 		}
 	}
+	s.applyLocalChanges(localChanges)
 	s.revision.Count++
 
 	current := s.copyConfig()

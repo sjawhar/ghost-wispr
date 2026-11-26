@@ -1029,9 +1029,11 @@ the check's input. It exits 1 when one check is not `PASS`.
 
 1. `/api/version` answers the release's commit.
 2. Each model setting and `recording_rules` runs as the release's `ghost-wispr.yaml` gives it. A
-   setting that the local settings file sets is compared with that file's value, and the line names
-   it.
-3. Each provider of that config signs in.
+   setting that the recorder applied from the local settings file is compared with that value, and
+   the line names it. The recorder reports those settings in `/api/config` as `local_settings`; the
+   check reads that report, not the file. A recorder with no such report gives `UNKNOWN` for checks
+   2 and 3.
+3. Each provider of that config, with those the local settings add or remove, signs in.
 4. `/api/status` has no warning.
 5. The timer started the run that printed `installed commit` for that commit: `FAIL` for a run
    started by hand.
@@ -1213,8 +1215,10 @@ over the release's config (README, "Configuration"). A save writes only the sett
 never a value that `.env` gives, such as the Jabra's `GHOST_WISPR_JABRA_MUTE_BUTTON` line: once that
 line is removed, the saved setting or the template applies. A setting saved back to the template's
 value leaves the file, and the file goes when no setting is left. No release holds the file, and the
-nightly update never changes it, so a saved setting stays through each release. Check 2 of
-`check-deploy.sh` compares a setting that the file sets with the file's value, and names it.
+nightly update never changes it, so a saved setting stays through each release. `/api/config`
+reports the settings the recorder applied from the file as `local_settings`, or that it did not
+apply the file, and why. Check 2 of `check-deploy.sh` compares a setting that the recorder applied
+from the file with that value, and names it.
 Recording rules cannot be changed on the page.
 
 To drop every saved setting, remove the file and restart the recorder:

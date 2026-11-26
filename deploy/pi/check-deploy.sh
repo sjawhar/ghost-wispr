@@ -16,10 +16,11 @@
 #   1  GET /api/version over Serve answers the release's commit.
 #   2  Each setting of MODEL_SETTINGS, and recording_rules, runs as the release's template gives it.
 #      The template is the ghost-wispr.yaml of the release's ghost-wispr-pi-deploy.tar.gz, checked
-#      against its .sha256 and its manifest. A setting the Pi's local settings file sets (the
-#      settings saved on the page) is compared with that file's value instead, and the line names it.
-#   3  GET /api/providers?refresh=1 over Serve lists the template's providers, and those the local
-#      settings file adds, and each signed in.
+#      against its .sha256 and its manifest. A setting that the recorder's local settings give (the
+#      settings it applied from ghost-wispr.local.yaml, which GET /api/config reports as
+#      local_settings) is compared with that value instead, and the line names it.
+#   3  GET /api/providers?refresh=1 over Serve lists the template's providers, with those the
+#      recorder's local settings add or remove, and each signed in.
 #   4  GET /api/status over Serve has no warning.
 #   5  In the update unit's journal, ghost-wispr-update.timer started the run that printed
 #      "installed commit <commit> (invocation <id>)": the launcher line of the same invocation id
@@ -76,7 +77,8 @@ readonly PI="ghost-wispr@$PI_HOST" SERVE="https://$PI_HOST"
 # GHOST_WISPR_DEPLOY_DIR and GHOST_WISPR_RELEASES_API exist for check_deploy_test.sh.
 readonly DEPLOY_DIR="${GHOST_WISPR_DEPLOY_DIR:-/opt/ghost-wispr}"
 readonly RELEASES_API="${GHOST_WISPR_RELEASES_API:-https://api.github.com/repos/sjawhar/ghost-wispr/releases}"
-readonly LOCAL_SETTINGS="$DEPLOY_DIR/ghost-wispr.local.yaml"
+# The settings saved on the page are in ghost-wispr.local.yaml on the Pi. The driver reads no YAML
+# of that file: it reads the recorder's report of what it applied from it (read_config).
 # The bootstrap files: the three files that install every later release, which only provision.sh
 # installs, so a release that changes one reaches the Pi only when a person runs its provision.sh.
 readonly BOOTSTRAP_FILES=(ghost-wispr-update-launcher.sh ghost-wispr-update.service ghost-wispr-update.timer)
@@ -133,9 +135,7 @@ flatten_yaml() {
     }
   '
 }
-# has_setting FLAT PATH: FLAT (flatten_yaml's output) sets PATH.
-has_setting() { awk -v path="$2" 'index($0, path ": ") == 1 || $0 == path ":" { found = 1; exit } END { exit !found }' <<<"$1"; }
-# setting_value FLAT PATH: the value FLAT gives PATH, as written.
+# setting_value FLAT PATH: the value FLAT (flatten_yaml's output) gives PATH, as written.
 setting_value() { awk -v prefix="$2: " 'index($0, prefix) == 1 { print substr($0, length(prefix) + 1); exit }' <<<"$1"; }
 # yaml_scalar_json VALUE: a YAML scalar as written, as a JSON string: a double-quoted one decoded
 # (its escapes are JSON's for the text a setting holds), a single-quoted one with '' as ', a plain
@@ -187,12 +187,13 @@ yaml_list() {
 }
 
 # rules_difference RUNNING WANT SOURCE: the first rule that differs between two JSON lists of
-# rules, the running one and the one SOURCE gives, and how many rules each holds.
+# rules, the running one and the one SOURCE ("the template", say) gives, and how many rules each
+# holds.
 rules_difference() {
   jq -rn --argjson got "$1" --argjson want "$2" --arg source "$3" '
     ([range(0; [($got | length), ($want | length)] | max)] | map(select($got[.] != $want[.])) | .[0] // 0) as $i
-    | "rule \($i + 1) runs \($got[$i] // "<none>" | tojson), the \($source) has \($want[$i] // "<none>" | tojson); "
-      + "the Pi runs \($got | length) rules, the \($source) names \($want | length)"'
+    | "rule \($i + 1) runs \($got[$i] // "<none>" | tojson), \($source) gives \($want[$i] // "<none>" | tojson); "
+      + "the Pi runs \($got | length) rules, \($source) gives \($want | length)"'
 }
 
 # Each role /api/config reports under "models", and the template setting that names it.
@@ -324,27 +325,77 @@ template() {
   cat -- "$set_dir/ghost-wispr.yaml"
 }
 
-# --- The Pi's local settings file, which checks 2 and 3 read: local_state is read, absent or error.
+# --- The recorder's config, which checks 2 and 3 read: GET /api/config over Serve, whose
+# local_settings is the recorder's report of ghost-wispr.local.yaml: the settings it applied from
+# that file, as JSON, with no provider's auth; {"applied": false, "error": ...} for a file it did not
+# apply; or null for none. local_state is then applied (local_json holds them), none, not-applied
+# (local_error says why), or unknown (config_unread says why).
 
-local_settings='' local_state='' local_error=''
-read_local_settings() {
-  local status=0
-  local_settings=$(pi "f=$(printf %q "$LOCAL_SETTINGS"); [ -e \"\$f\" ] || exit 3; cat -- \"\$f\"" 2>"$tmp/local.err") || status=$?
-  case $status in
-    0) local_state='read' ;;
-    3)
-      local_state=absent
-      local_settings=
+config='' config_unread='' local_state='' local_json='null' local_error=''
+read_config() {
+  local kind
+  if ! config=$(curl -fsS --max-time 10 "$SERVE/api/config" 2>"$tmp/config.err"); then
+    local_state='unknown'
+    config_unread="cannot read GET $SERVE/api/config over Serve: $(error_of "$tmp/config.err")"
+    return 0
+  fi
+  kind=$(jq -r 'if type != "object" then "no object"
+    elif has("local_settings") | not then "absent"
+    elif .local_settings == null then "none"
+    elif (.local_settings | type) != "object" then "other"
+    elif .local_settings.applied == false then "not-applied"
+    else "applied" end' <<<"$config" 2>/dev/null) || kind='no object'
+  case $kind in
+    none) local_state='none' ;;
+    applied)
+      local_state='applied'
+      local_json=$(jq -c '.local_settings' <<<"$config")
       ;;
-    255)
-      local_state=error
-      local_error="cannot reach $PI over SSH to read the local settings file $LOCAL_SETTINGS: $(error_of "$tmp/local.err")"
+    not-applied)
+      local_state='not-applied'
+      local_error=$(jq -r '.local_settings.error // "it gives no reason"' <<<"$config")
+      ;;
+    absent)
+      local_state='unknown'
+      config_unread="GET $SERVE/api/config has no local_settings field, the recorder's report of the settings it applied from ghost-wispr.local.yaml, so what those settings change cannot be told"
+      ;;
+    other)
+      local_state='unknown'
+      config_unread="GET $SERVE/api/config gives local_settings $(jq -c '.local_settings' <<<"$config"), neither null nor an object, so what the recorder applied from ghost-wispr.local.yaml cannot be told"
       ;;
     *)
-      local_state=error
-      local_error="cannot read the local settings file $LOCAL_SETTINGS on the Pi over SSH (exit $status): $(error_of "$tmp/local.err")"
+      local_state='unknown'
+      config_unread="GET $SERVE/api/config over Serve answered no JSON object"
       ;;
   esac
+}
+# not_applied_note: for a line of check 2 or 3, that the recorder did not apply its local settings
+# file, and why; nothing when it did, or has none.
+not_applied_note() {
+  [[ $local_state != not-applied ]] \
+    || printf '; the recorder did not apply ghost-wispr.local.yaml (%s), so the template alone applies' "$local_error"
+}
+# local_setting PATH: the value the recorder's local settings give the dotted setting PATH, as a JSON
+# string; a number or a boolean as its text, as the config reads one into a text setting. It prints
+# nothing when they give PATH none, and fails on a value that is no text, or on a key above PATH
+# that is no map.
+local_setting() {
+  jq -c --arg path "$1" '
+    reduce ($path | split("."))[] as $key (.;
+      if type == "object" then .[$key] elif . == null then null else error("no map") end)
+    | if . == null then empty
+      elif type == "string" then .
+      elif type == "number" or type == "boolean" then tostring
+      else error("no text") end' <<<"$local_json" 2>/dev/null
+}
+# local_rules: the recording rules the recorder's local settings give, as a JSON list less the blank
+# ones, which the recorder drops; nothing when they give none. It fails on a value that is no list
+# of text.
+local_rules() {
+  jq -c 'if type == "object" and has("recording_rules") then .recording_rules
+      | if type == "array" and all(.[]; type == "string") then map(select(test("^\\s*$") | not))
+        else error("no list of text") end
+    else empty end' <<<"$local_json" 2>/dev/null
 }
 
 # --- The checks.
@@ -370,7 +421,7 @@ check_commit() {
 }
 
 check_settings() {
-  local config template_text template_flat local_flat entry role setting raw source want got status=0
+  local template_text template_flat entry role setting raw source want got status=0
   local differences=() unread=() from_local=()
   if [[ -z $set_dir ]]; then
     unknown 2 "no release template to compare the running settings with: $set_error"
@@ -380,80 +431,83 @@ check_settings() {
     unknown 2 "the manifest of $release_name's deploy tarball names no ghost-wispr.yaml"
     return 0
   fi
-  if ! config=$(curl -fsS --max-time 10 "$SERVE/api/config" 2>"$tmp/config.err"); then
-    unknown 2 "cannot read GET $SERVE/api/config over Serve: $(error_of "$tmp/config.err")"
+  if [[ $local_state == unknown ]]; then
+    unknown 2 "$config_unread"
     return 0
   fi
-  if ! jq -e 'type == "object" and (.models | type == "object") and (.recording_rules | type == "array")' >/dev/null 2>&1 <<<"$config"; then
+  if ! jq -e '(.models | type == "object") and (.recording_rules | type == "array")' >/dev/null 2>&1 <<<"$config"; then
     unknown 2 "GET $SERVE/api/config over Serve answered no models and recording_rules"
     return 0
   fi
-  if [[ $local_state == error ]]; then
-    unknown 2 "$local_error"
-    return 0
-  fi
   template_flat=$(flatten_yaml <<<"$template_text")
-  local_flat=$(flatten_yaml <<<"$local_settings")
 
-  # Each model setting, from the local settings file when it sets it, else from the template.
+  # Each model setting, from the recorder's local settings when they give it, else from the template.
   for entry in "${MODEL_SETTINGS[@]}"; do
     role=${entry%%=*} setting=${entry#*=}
-    if [[ -n $local_flat ]] && has_setting "$local_flat" "$setting"; then
-      raw=$(setting_value "$local_flat" "$setting")
-      source='local settings file'
+    if ! want=$(local_setting "$setting"); then
+      unread+=("local_settings gives $setting no text, so the running $role cannot be compared")
+      continue
+    fi
+    if [[ -n $want ]]; then
+      source="the recorder's local settings give"
       from_local+=("$setting")
     else
       raw=$(setting_value "$template_flat" "$setting")
-      source=template
+      source='the template names'
       if [[ -z $raw ]]; then
         unread+=("$release_name's template sets no $setting to compare the running $role with")
         continue
       fi
+      want=$(yaml_scalar_json "$raw")
     fi
-    want=$(yaml_scalar_json "$raw")
     # The recorder reports every role (internal/server, GET /api/config), "" for a role with no
     # model. An answer without the role, or with no string for it, does not show what it runs.
     if ! got=$(jq -ce --arg role "$role" '.models[$role] | strings' <<<"$config" 2>/dev/null); then
       unread+=("GET $SERVE/api/config reports no $role model, so the running $setting cannot be compared")
       continue
     fi
-    [[ $got == "$want" ]] || differences+=("$role runs $got, but the $source names $want ($setting)")
+    [[ $got == "$want" ]] || differences+=("$role runs $got, but $source $want ($setting)")
   done
 
-  # The recording rules, from the local settings file when it sets them, else from the template.
-  source='local settings file'
-  want=$(yaml_list recording_rules <<<"$local_settings") || status=$?
-  if ((status == 3)); then
-    source=template status=0
-    want=$(yaml_list recording_rules <<<"$template_text") || status=$?
-  fi
-  if ((status != 0)); then
-    unread+=("cannot read recording_rules in the $source item by item, one plain or quoted rule a line")
-  elif [[ $source == template && $want == '[]' ]]; then
-    unread+=("$release_name's template has no recording rule to compare the running ones with")
+  # The recording rules, from the recorder's local settings when they give them, else from the
+  # template.
+  if ! want=$(local_rules); then
+    unread+=("local_settings gives recording_rules $(jq -c '.recording_rules' <<<"$local_json"), which is no list of text")
   else
-    [[ $source == template ]] || from_local+=(recording_rules)
-    got=$(jq -c '.recording_rules' <<<"$config")
-    [[ $got == "$want" ]] \
-      || differences+=("recording_rules differ from the $source's: $(rules_difference "$got" "$want" "$source")")
+    source="the recorder's local settings"
+    if [[ -z $want ]]; then
+      source='the template'
+      want=$(yaml_list recording_rules <<<"$template_text") || status=$?
+    fi
+    if ((status != 0)); then
+      unread+=("cannot read recording_rules in $release_name's template item by item, one plain or quoted rule a line")
+    elif [[ $source == 'the template' && $want == '[]' ]]; then
+      unread+=("$release_name's template has no recording rule to compare the running ones with")
+    else
+      [[ $source == 'the template' ]] || from_local+=(recording_rules)
+      got=$(jq -c '.recording_rules' <<<"$config")
+      [[ $got == "$want" ]] \
+        || differences+=("recording_rules differ from those $source gives: $(rules_difference "$got" "$want" "$source")")
+    fi
   fi
 
   # A difference is a FAIL even when another setting could not be read: the line names both, as
   # check 7's does. UNKNOWN only when nothing it read differs.
-  local named='' also=''
-  ((${#from_local[@]} == 0)) || named=", with $(joined "${from_local[@]}") from the local settings file"
+  local named='' also='' note
+  note=$(not_applied_note)
+  ((${#from_local[@]} == 0)) || named=", with $(joined "${from_local[@]}") from the recorder's local settings (ghost-wispr.local.yaml)"
   ((${#unread[@]} == 0)) || also="; and $(joined "${unread[@]}")"
   if ((${#differences[@]} > 0)); then
-    fails 2 "$(joined "${differences[@]}")$named$also"
+    fails 2 "$(joined "${differences[@]}")$named$also$note"
   elif ((${#unread[@]} > 0)); then
-    unknown 2 "$(joined "${unread[@]}")$named"
+    unknown 2 "$(joined "${unread[@]}")$named$note"
   else
-    pass 2 "each model setting and the recording rules run as $release_name's template gives them$named"
+    pass 2 "each model setting and the recording rules run as $release_name's template gives them$named$note"
   fi
 }
 
 check_providers() {
-  local template_text providers want names not_ok missing extra local_added local_removed unexplained
+  local template_text providers want names not_ok missing extra local_providers local_added local_removed unexplained config_name note
   if [[ -z $set_dir ]]; then
     unknown 3 "no release template to compare the providers with: $set_error"
     return 0
@@ -470,41 +524,59 @@ check_providers() {
     unknown 3 "GET $SERVE/api/providers?refresh=1 over Serve answered no list of named providers"
     return 0
   fi
+  names=$(jq -r '.providers[].name' <<<"$providers" | LC_ALL=C sort -u)
+  not_ok=$(jq -r '.providers[] | select(.ok != true) | "\(.name) did not sign in (\(.message // "no message"))"' <<<"$providers")
+  # Which providers the recorder runs depends on its local settings too: with no report of them,
+  # only a provider that did not sign in is known to fail.
+  if [[ $local_state == unknown ]]; then
+    if [[ -n $not_ok ]]; then
+      fails 3 "$not_ok; and $config_unread"
+    else
+      unknown 3 "$config_unread"
+    fi
+    return 0
+  fi
   want=$(flatten_yaml <<<"$template_text" | sed -nE 's/^providers\.([^.:]+):$/\1/p' | LC_ALL=C sort -u)
   if [[ -z $want ]]; then
     unknown 3 "$release_name's template names no provider"
     return 0
   fi
-  # The recorder reads the local settings file over the template (D13), so a provider it adds runs,
+  # The recorder applies its local settings over the template (D13), so a provider they add runs,
   # and a null takes one away.
-  if [[ $local_state == read ]]; then
-    local_added=$(flatten_yaml <<<"$local_settings" | sed -nE 's/^providers\.([^.:]+):$/\1/p' | LC_ALL=C sort -u)
-    local_removed=$(flatten_yaml <<<"$local_settings" | sed -nE 's/^providers\.([^.:]+): (null|~)$/\1/p' | LC_ALL=C sort -u)
+  config_name="$release_name's template"
+  note=$(not_applied_note)
+  if [[ $local_state == applied ]]; then
+    if ! local_providers=$(jq -r '(.providers // {})
+        | if type == "object" then to_entries[] | "\(if .value == null then "-" else "+" end) \(.key)"
+          else error("no map") end' <<<"$local_json" 2>/dev/null); then
+      if [[ -n $not_ok ]]; then
+        fails 3 "$not_ok; and local_settings gives providers no map, so the providers the recorder runs cannot be told"
+      else
+        unknown 3 "local_settings gives providers $(jq -c '.providers' <<<"$local_json"), no map, so the providers the recorder runs cannot be told"
+      fi
+      return 0
+    fi
+    local_added=$(sed -n 's/^+ //p' <<<"$local_providers" | LC_ALL=C sort -u)
+    local_removed=$(sed -n 's/^- //p' <<<"$local_providers" | LC_ALL=C sort -u)
     want=$(printf '%s\n' "$want" "$local_added" | grep . | LC_ALL=C sort -u | LC_ALL=C comm -23 - <(printf '%s\n' "$local_removed" | grep . || true))
+    config_name+=" with the recorder's local settings over it"
   fi
   # An empty set to compare with is no pass, even when the Pi lists no provider either.
   if [[ -z $want ]]; then
-    unknown 3 "no provider is left to check: the local settings file $LOCAL_SETTINGS sets to null each provider $release_name's template names"
+    unknown 3 "no provider is left to check: the recorder's local settings (ghost-wispr.local.yaml) set to null each provider $release_name's template names"
     return 0
   fi
-  names=$(jq -r '.providers[].name' <<<"$providers" | LC_ALL=C sort -u)
-  not_ok=$(jq -r '.providers[] | select(.ok != true) | "\(.name) did not sign in (\(.message // "no message"))"' <<<"$providers")
   missing=$(LC_ALL=C comm -23 <(printf '%s\n' "$want") <(printf '%s\n' "$names") | paste -sd ' ' -)
   extra=$(LC_ALL=C comm -13 <(printf '%s\n' "$want") <(printf '%s\n' "$names") | grep . | paste -sd ' ' - || true)
-  # What the Pi's providers are compared with, for the line.
-  local config_name="$release_name's template"
-  [[ $local_state != read ]] || config_name+=" with the local settings file over it"
   if [[ -n $not_ok ]]; then
-    fails 3 "$not_ok"
-  elif [[ $local_state == error && ( -n $missing || -n $extra ) ]]; then
-    unknown 3 "the Pi's providers ($(paste -sd ' ' - <<<"$names")) are not the template's ($(paste -sd ' ' - <<<"$want")), and the local settings file that could add or remove one cannot be read: $local_error"
+    fails 3 "$not_ok$note"
   elif [[ -n $missing || -n $extra ]]; then
     unexplained=()
     [[ -z $missing ]] || unexplained+=("the Pi lists no $missing, which $config_name names")
     [[ -z $extra ]] || unexplained+=("the Pi lists $extra, which $config_name does not name")
-    fails 3 "$(joined "${unexplained[@]}")"
+    fails 3 "$(joined "${unexplained[@]}")$note"
   else
-    pass 3 "the Pi lists the $(grep -c . <<<"$names") providers of $config_name ($(paste -sd ' ' - <<<"$names")), each signed in"
+    pass 3 "the Pi lists the $(grep -c . <<<"$names") providers of $config_name ($(paste -sd ' ' - <<<"$names")), each signed in$note"
   fi
 }
 
@@ -655,6 +727,10 @@ check_bootstrap() {
         ;;
     esac
   done
+  # A file a read found absent is a difference, whatever a later read gives (R17).
+  for name in ${missing[@]+"${missing[@]}"}; do
+    differences+=("provisioning file $name is missing on the Pi; run the release's provision.sh")
+  done
   if [[ $reached == yes ]]; then
     status=0
     drift=$(bootstrap_drift "$set_dir/manifest.json" "$tmp/bootstrap/deploy" "$tmp/bootstrap/units") || status=$?
@@ -662,13 +738,10 @@ check_bootstrap() {
       unread+=("bootstrap_drift (pi-lib.sh) cannot compare the bootstrap files with $release_name's manifest (exit $status)")
     else
       while IFS= read -r name; do
-        if [[ -z $name ]] || listed "$name" ${unreadable[@]+"${unreadable[@]}"}; then
+        if [[ -z $name ]] || listed "$name" ${unreadable[@]+"${unreadable[@]}"} ${missing[@]+"${missing[@]}"}; then
           continue
-        elif listed "$name" ${missing[@]+"${missing[@]}"}; then
-          differences+=("provisioning file $name is missing on the Pi; run the release's provision.sh")
-        else
-          differences+=("provisioning file $name differs from the release; run the release's provision.sh")
         fi
+        differences+=("provisioning file $name differs from the release; run the release's provision.sh")
       done <<<"$drift"
     fi
   fi
@@ -706,7 +779,7 @@ check_bootstrap() {
 }
 
 check_commit
-read_local_settings
+read_config
 check_settings
 check_providers
 check_status

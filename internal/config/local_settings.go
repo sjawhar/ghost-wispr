@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"maps"
+	"math"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -38,57 +39,122 @@ func readSettingsFile(path string) (data []byte, found bool, err error) {
 
 // applyLocalSettings merges the local settings file at localPath over the
 // effective release config, baseData, and over the release file as written,
-// releaseData, and returns both merged configs. When the file cannot be read
+// releaseData, and returns both merged configs and the settings it took from
+// the file, local. With no file, local is nil. When the file cannot be read
 // or parsed, or a value of it does not fit its setting, it returns baseData
-// and releaseData, and why it did not apply the file.
-func applyLocalSettings(localPath string, baseData, releaseData []byte) (data, fileData []byte, err error) {
+// and releaseData, no settings, and why it did not apply the file.
+func applyLocalSettings(localPath string, baseData, releaseData []byte) (data, fileData []byte, local map[string]any, err error) {
 	localData, found, err := readSettingsFile(localPath)
 	if err == nil && !found {
-		return baseData, releaseData, nil
+		return baseData, releaseData, nil, nil
 	}
 	if err == nil {
-		data, fileData, err = mergeLocalSettings(localData, baseData, releaseData)
+		data, fileData, local, err = mergeLocalSettings(localData, baseData, releaseData)
 	}
 	if err != nil {
-		return baseData, releaseData, err
+		return baseData, releaseData, nil, err
 	}
-	return data, fileData, nil
+	return data, fileData, local, nil
 }
 
 // mergeLocalSettings merges the local settings file's YAML over baseData, for
 // the running config, and over releaseData, for the warnings about a removed
-// setting. It first decodes the local settings file alone: a value that does
-// not fit its setting fails there, with the local file's own line. It then
-// refuses a null anywhere but on an entry of a map setting. Each value of the
-// merged config is then a value of baseData or of the local file at the same
-// key, so the merged config decodes.
-func mergeLocalSettings(localData, baseData, releaseData []byte) (data, fileData []byte, err error) {
+// setting, and returns the file's settings too. It first decodes the local
+// settings file alone: a value that does not fit its setting fails there,
+// with the local file's own line. It then refuses a null anywhere but on an
+// entry of a map setting. Each value of the merged config is then a value of
+// baseData or of the local file at the same key, so the merged config decodes.
+func mergeLocalSettings(localData, baseData, releaseData []byte) (data, fileData []byte, local map[string]any, err error) {
 	var typed Config
 	if err := yaml.Unmarshal(localData, &typed); err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
-	local, err := yamlSettings(localData)
+	local, err = yamlSettings(localData)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	if err := checkNulls(nil, local); err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	base, err := yamlSettings(baseData)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	release, err := yamlSettings(releaseData)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	if data, err = yaml.Marshal(mergeSettings(base, local)); err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	if fileData, err = yaml.Marshal(mergeSettings(release, local)); err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
-	return data, fileData, nil
+	return data, fileData, local, nil
+}
+
+// AppliedLocalSettings is the local settings file as the running config holds
+// it, which GET /api/config reports, so that a reader such as
+// deploy/pi/check-deploy.sh need not read the file's YAML itself.
+type AppliedLocalSettings struct {
+	// Settings are the settings the running config took from the local
+	// settings file, as that file writes them: those the start applied, as
+	// each page save has changed them since. A null is an entry of a map
+	// setting that they delete, such as a provider. Each provider's auth is
+	// left out. Nil when the store applied no local settings file: there is
+	// none, or the start did not apply it (Err).
+	Settings map[string]any
+	// Err is why the start did not apply the local settings file, or nil.
+	Err error
+}
+
+// reportedSettings is a copy of settings for AppliedLocalSettings, with each
+// provider's auth left out, and each value in a form encoding/json writes: a
+// mapping YAML decoded with keys that are not all strings gets string keys,
+// and a float JSON cannot hold (.inf, .nan) becomes its text.
+func reportedSettings(settings map[string]any) map[string]any {
+	if settings == nil {
+		return nil
+	}
+	reported, _ := reportedValue(settings).(map[string]any)
+	if providers, ok := reported["providers"].(map[string]any); ok {
+		for _, provider := range providers {
+			if fields, ok := provider.(map[string]any); ok {
+				delete(fields, "auth")
+			}
+		}
+	}
+	return reported
+}
+
+func reportedValue(value any) any {
+	switch v := value.(type) {
+	case map[string]any:
+		out := make(map[string]any, len(v))
+		for key, item := range v {
+			out[key] = reportedValue(item)
+		}
+		return out
+	case map[any]any:
+		out := make(map[string]any, len(v))
+		for key, item := range v {
+			out[fmt.Sprint(key)] = reportedValue(item)
+		}
+		return out
+	case []any:
+		out := make([]any, len(v))
+		for i, item := range v {
+			out[i] = reportedValue(item)
+		}
+		return out
+	case float64:
+		if math.IsInf(v, 0) || math.IsNaN(v) {
+			return fmt.Sprint(v)
+		}
+		return v
+	default:
+		return v
+	}
 }
 
 func localSettingsWarning(path string, err error) string {
@@ -259,38 +325,56 @@ func removeSettingsFile(path string) error {
 // is removed. The other settings of the local settings file stay. A setting
 // set back to the release config's value leaves the file, and the file is
 // removed when no setting is left. It never writes the release config, and
-// compares with the release config the store loaded, not the file on disk.
-func (s *Store) writeLocalSettings(prev *Config, local localSettingsFile) error {
+// compares with the release config the store loaded, not the file on disk. It
+// returns the changes it wrote, as settingsDifference gives them, or none when
+// the change set no setting.
+func (s *Store) writeLocalSettings(prev *Config, local localSettingsFile) (map[string]any, error) {
 	before, err := configSettings(prev)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	after, err := configSettings(&s.cfg)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	changes := settingsDifference(after, before)
 	if len(changes) == 0 {
-		return nil
+		return nil, nil
 	}
 	saved := make(map[string]any)
 	if local.found {
 		if saved, err = yamlSettings(local.data); err != nil {
-			return fmt.Errorf("read %s: %w", local.path, err)
+			return nil, fmt.Errorf("read %s: %w", local.path, err)
 		}
 	}
 	applyChanges(nil, saved, changes, s.releaseSettings)
 	if len(saved) == 0 {
-		return removeSettingsFile(local.path)
+		return changes, removeSettingsFile(local.path)
 	}
 	data, err := yaml.Marshal(saved)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if err := os.MkdirAll(filepath.Dir(local.path), 0o755); err != nil {
-		return err
+		return nil, err
 	}
-	return atomicWriteFile(local.path, data, 0o644)
+	return changes, atomicWriteFile(local.path, data, 0o644)
+}
+
+// applyLocalChanges puts changes, as writeLocalSettings wrote them into the
+// local settings file, into the settings the running config holds from that
+// file, as applyChanges puts them into the file's.
+func (s *Store) applyLocalChanges(changes map[string]any) {
+	if len(changes) == 0 {
+		return
+	}
+	if s.localSettings == nil {
+		s.localSettings = make(map[string]any)
+	}
+	applyChanges(nil, s.localSettings, changes, s.releaseSettings)
+	if len(s.localSettings) == 0 {
+		s.localSettings = nil
+	}
 }
 
 // applyChanges writes changes, as settingsDifference gives them, into saved,

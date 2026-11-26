@@ -80,6 +80,15 @@ var configSchema = map[string]any{
 			"description":          "GET only: the model providers the configuration names (providers:), by name. Each role's provider/model names one. No secret: an api_key provider names the variable that holds its key. A PATCH cannot set it; GET /api/providers says whether each one signs in.",
 			"additionalProperties": providerSchema,
 		},
+		"local_settings": map[string]any{
+			"type":     []string{"object", "null"},
+			"readOnly": true,
+			"description": "GET only: the store's report of the local settings file, ghost-wispr.local.yaml beside the release config. " +
+				"An object of the settings the running configuration took from that file, by their keys in a config file: those the start applied, as each settings save has changed them since. " +
+				"A null in it is an entry of a map setting that the file deletes, such as a provider. Each provider's auth is left out. " +
+				`When the start did not apply the file (it does not parse, or a value does not fit its setting), {"applied": false, "error": "<why>"}: the release config applies alone, and each PATCH is refused. ` +
+				"null when there is no local settings file. deploy/pi/check-deploy.sh takes the local settings from this report, not from the file. A PATCH cannot set it.",
+		},
 		"revision": map[string]any{
 			"type":        "object",
 			"readOnly":    true,

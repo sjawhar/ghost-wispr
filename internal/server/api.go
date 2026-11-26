@@ -1715,10 +1715,29 @@ type configResponse struct {
 	// as written in recording_rules; empty when there are none. Read-only.
 	RecordingRules []string            `json:"recording_rules"`
 	Voice          configVoiceResponse `json:"voice"`
+	// LocalSettings is the store's report of the local settings file,
+	// ghost-wispr.local.yaml: the settings the running config took from it
+	// (each provider's auth left out), {"applied": false, "error": ...} for
+	// a file the start did not apply, or null for none. Read-only.
+	LocalSettings any `json:"local_settings"`
 	// Revision is the state of the config this answer holds. Read-only: a
 	// page that sends two saves keeps the answer with the later revision,
 	// whichever order the answers land in.
 	Revision config.Revision `json:"revision"`
+}
+
+// localSettingsResponse is local_settings of GET /api/config for local, the
+// store's report: the applied settings, the form of a file not applied, or
+// nil, which JSON writes as null.
+func localSettingsResponse(local config.AppliedLocalSettings) any {
+	switch {
+	case local.Err != nil:
+		return map[string]any{"applied": false, "error": local.Err.Error()}
+	case local.Settings != nil:
+		return local.Settings
+	default:
+		return nil
+	}
 }
 
 type configSummarizationResponse struct {
@@ -1759,7 +1778,7 @@ type configVoiceResponse struct {
 
 func handleGetConfig(cfgStore *config.Store) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		cfg, revision := cfgStore.GetRevision()
+		cfg, revision, local := cfgStore.GetWithLocalSettings()
 		resp := configResponse{
 			SilenceTimeout:     cfg.SilenceTimeout,
 			MinSessionSegments: cfg.MinSessionSegments,
@@ -1799,7 +1818,8 @@ func handleGetConfig(cfgStore *config.Store) http.HandlerFunc {
 				Enabled: cfg.Voice.Enabled,
 				Engine:  cfg.Voice.Engine,
 			},
-			Revision: revision,
+			LocalSettings: localSettingsResponse(local),
+			Revision:      revision,
 		}
 		if resp.Summarization.Presets == nil {
 			resp.Summarization.Presets = map[string]config.Preset{}

@@ -279,6 +279,9 @@ type loaded struct {
 	// file and no environment. A save removes from the local settings file
 	// each setting it sets back to the value here.
 	releaseSettings map[string]any
+	// localSettings are the settings the running config took from the local
+	// settings file, nil when there is none or it was not applied.
+	localSettings map[string]any
 	// localSettingsErr is why the local settings file was not applied, or
 	// nil when it was applied or there is none.
 	localSettingsErr error
@@ -326,7 +329,7 @@ func loadConfig(path string, envFile map[string]string) (l loaded, err error) {
 	data, fileData := baseData, releaseData
 	if path != "" {
 		localPath := LocalSettingsPath(path)
-		if data, fileData, l.localSettingsErr = applyLocalSettings(localPath, baseData, releaseData); l.localSettingsErr != nil {
+		if data, fileData, l.localSettings, l.localSettingsErr = applyLocalSettings(localPath, baseData, releaseData); l.localSettingsErr != nil {
 			l.warnings = append(l.warnings, localSettingsWarning(localPath, l.localSettingsErr))
 		}
 	}
