@@ -73,7 +73,9 @@ commit_b=$(printf 'b%.0s' {1..40})
 commit_c=$(printf 'c%.0s' {1..40})
 # What a release binary answers when it never reports its own commit.
 wrong_commit=$(printf '0%.0s' {1..40})
-readonly commit_a commit_b commit_c wrong_commit
+# The commit of the release that the real build-deploy-tarball.sh builds.
+commit_d=$(printf 'd%.0s' {1..40})
+readonly commit_a commit_b commit_c commit_d wrong_commit
 readonly drive_id='0AAbCdEf_Gh-Ij'
 readonly template="$repo_root/deploy/pi/files/ghost-wispr.yaml"
 
@@ -137,7 +139,8 @@ cat >"$bin/curl" <<'EOF'
 # that the running image names in its "# answers commit" line. Neither answers while the
 # recorder's unit is not active. Each call's --max-time and URL go to $TEST_STATE/curl.log. With
 # TEST_SLOW=1 each call takes all of its --max-time on the test's clock, as a call at its worst;
-# TEST_CURL_EXIT makes every call exit with that code.
+# each call to a URL that the glob TEST_CURL_FAIL matches fails as curl does on a network fault
+# (exit 6, the host could not be resolved).
 set -euo pipefail
 state=${TEST_STATE:?}
 output='' url='' max_time=''
@@ -158,8 +161,10 @@ while (($#)); do
   esac
 done
 printf '%s %s\n' "${max_time:-none}" "$url" >>"$state/curl.log"
-if [[ -n ${TEST_CURL_EXIT:-} ]]; then
-  exit "$TEST_CURL_EXIT"
+if [[ -n ${TEST_CURL_FAIL:-} && $url == $TEST_CURL_FAIL ]]; then
+  host=${url#*://}
+  printf 'curl: (6) Could not resolve host: %s\n' "${host%%/*}" >&2
+  exit 6
 fi
 if [[ ${TEST_SLOW:-} == 1 && $max_time =~ ^[0-9]+$ ]]; then
   echo $(($(<"$state/clock") + max_time)) >"$state/clock"
@@ -578,10 +583,18 @@ EOF
 }
 
 # fake_binary COMMIT NAME prints a release binary that answers COMMIT once it runs (the fake
-# /api/version reads its "# answers commit" line) and runs the fake pi-secrets for pi-secrets.
+# /api/version reads its "# answers commit" line), runs the fake pi-secrets for pi-secrets, and
+# answers link-versions as today's binary does, which has no such subcommand (exit 2).
 fake_binary() {
   printf '#!/usr/bin/env bash\n# answers commit %s\n# release %s\n' "$1" "$2"
-  printf '%s\n' 'if [[ ${1:-} == pi-secrets ]]; then exec "${TEST_PI_SECRETS:?}" "$0" "$@"; fi' 'exit 0'
+  cat <<'EOF'
+if [[ ${1:-} == pi-secrets ]]; then exec "${TEST_PI_SECRETS:?}" "$0" "$@"; fi
+if [[ ${1:-} == link-versions ]]; then
+  printf '%s\n' 'unknown subcommand "link-versions"' 'usage: ghost-wispr <command>' >&2
+  exit 2
+fi
+exit 0
+EOF
 }
 
 # make_release NAME COMMIT stages release NAME of commit COMMIT in $releases/NAME: its binary, and
@@ -615,8 +628,8 @@ make_release() {
 
 # pack_release NAME writes release NAME's manifest.json (C2: format 1, its commit, binary_sha256,
 # the SHA-256 of every other file, and link_versions when $link_versions holds a JSON array), with
-# the jq filter $manifest_filter applied last; then its tarball, the two checksum assets, and the
-# release API's answer, whose asset URLs the fake curl serves.
+# the jq filter $manifest_filter applied last; then its tarball, its checksum asset, and what
+# publish_release writes.
 pack_release() {
   local name=$1 dir=$releases/$1 deploy file files='{}' commit
   deploy=$dir/ghost-wispr-pi-deploy
@@ -631,8 +644,15 @@ pack_release() {
       + (if \$link == null then {} else {link_versions: \$link} end) | ${manifest_filter:-.}" >"$deploy/manifest.json"
   tar -C "$dir" -czf "$dir/ghost-wispr-pi-deploy.tar.gz" ghost-wispr-pi-deploy
   printf '%s  %s\n' "$(sha "$dir/ghost-wispr-pi-deploy.tar.gz")" ghost-wispr-pi-deploy.tar.gz >"$dir/ghost-wispr-pi-deploy.tar.gz.sha256"
+  publish_release "$name"
+}
+
+# publish_release NAME writes, beside release NAME's binary and tarball, the binary's checksum asset
+# and the release API's answer, whose asset URLs the fake curl serves.
+publish_release() {
+  local name=$1 dir=$releases/$1
   printf '%s  %s\n' "$(sha "$dir/ghost-wispr-linux-arm64")" ghost-wispr-linux-arm64 >"$dir/ghost-wispr-linux-arm64.sha256"
-  jq -n --arg commit "$commit" --arg base "https://test.invalid/assets/$name" '{target_commitish: $commit, assets: [
+  jq -n --arg commit "$(<"$dir/commit")" --arg base "https://test.invalid/assets/$name" '{target_commitish: $commit, assets: [
       "ghost-wispr-linux-arm64", "ghost-wispr-linux-arm64.sha256", "ghost-wispr-pi-deploy.tar.gz",
       "ghost-wispr-pi-deploy.tar.gz.sha256", "THIRD_PARTY_NOTICES.md"
       | {name: ., browser_download_url: ($base + "/" + .)}]}' >"$dir/release.json"
@@ -1071,9 +1091,11 @@ for line in "timeout=30s udevadm control --reload rules=$rules_sum" "timeout=30s
   "timeout=30s systemctl restart systemd-logind logind=$logind_sum" 'timeout=10s tailscale serve status --json'; do
   grep -Fqx -- "$line" "$state/sudo.log" || fail "whole-set: sudo ran no $line: $(<"$state/sudo.log")"
 done
-grep -Eq '^timeout=[^ ]+ install /etc/udev/rules.d/99-ghost-wispr.rules$' "$state/sudo.log" \
-  && grep -Eq '^timeout=[^ ]+ install /etc/systemd/logind.conf.d/50-ghost-wispr-power-key.conf$' "$state/sudo.log" \
-  || fail "whole-set: the system files were not installed through sudo -n install: $(<"$state/sudo.log")"
+# Each sudo -n install runs under its 30 s bound, as each sudo -n call does (R8).
+for path in /etc/udev/rules.d/99-ghost-wispr.rules /etc/systemd/logind.conf.d/50-ghost-wispr-power-key.conf; do
+  [[ $(grep -cFx -- "timeout=30s install $path" "$state/sudo.log") == 1 ]] \
+    || fail "whole-set: sudo -n install did not install $path once, under its 30 s bound: $(<"$state/sudo.log")"
+done
 awk '/udevadm control --reload/ { r = NR } /udevadm trigger/ { t = NR } END { exit !(r && t && r < t) }' "$state/sudo.log" \
   || fail "whole-set: udev was not reloaded before its trigger: $(<"$state/sudo.log")"
 # pi-secrets ran once, from the staged binary (the release's, checked against binary_sha256, not
@@ -1129,6 +1151,30 @@ for kind in status version release tarball tarball-checksum binary binary-checks
   seen="seen_${kind//-/_}"
   [[ ${!seen} == 1 ]] || fail "whole-set: made no $kind call: $(<"$state/curl.log")"
 done
+
+# The release as release.yml builds it: the real build-deploy-tarball.sh, run from a copy of the
+# files it reads, as release_publish_test.sh runs it, packs the set that update.sh installs.
+# make_release lays out each other release by this test's own list, so only here would update.sh
+# and the builder disagree on the name of a file of the set; the Pi would then refuse each release.
+mkdir -p -- "$work_dir/repo-copy/deploy" "$releases/built"
+cp -pR -- "$repo_root/deploy/pi" "$work_dir/repo-copy/deploy/pi"
+cp -p -- "$repo_root/wait-for-network.sh" "$work_dir/repo-copy/"
+fake_binary "$commit_d" built >"$releases/built/ghost-wispr-linux-arm64"
+chmod 0755 "$releases/built/ghost-wispr-linux-arm64"
+printf '%s\n' "$commit_d" >"$releases/built/commit"
+bash "$work_dir/repo-copy/deploy/pi/build-deploy-tarball.sh" "$commit_d" "$releases/built/ghost-wispr-linux-arm64" \
+  "$releases/built" >"$work_dir/build.log" 2>&1 || fail "whole-set: build-deploy-tarball.sh failed: $(<"$work_dir/build.log")"
+publish_release built
+# The test's own checks read the set as the tarball holds it; update.sh reads the tarball.
+tar -xzf "$releases/built/ghost-wispr-pi-deploy.tar.gz" -C "$releases/built"
+new_pi
+install_set a "$drive_id"
+release=built run_update
+expect_run 'whole-set (the built release)' 0 "ghost-wispr update: installed commit $commit_d (invocation test-invocation-7)"
+expect_set_of 'whole-set (the built release)' built
+expect_config_with_drive 'whole-set (the built release)' "$releases/built/ghost-wispr-pi-deploy/ghost-wispr.yaml"
+expect_verified 'whole-set (the built release)' built
+expect_no_output 'whole-set (the built release)' 'differs from the release'
 
 begin system-files-unchanged
 # system-files-unchanged: a release whose udev rule and logind setting are the installed ones
@@ -1295,6 +1341,11 @@ logind_sum=$(sha "$(installed_path logind-power-key.conf)")
   && $(grep 'udevadm trigger' "$state/sudo.log" | tail -n1) == "timeout=30s udevadm trigger rules=$rules_sum" \
   && $(grep 'systemd-logind' "$state/sudo.log" | tail -n1) == "timeout=30s systemctl restart systemd-logind logind=$logind_sum" ]] \
   || fail "rollback-whole-set: udev and logind did not read the restored files: $(<"$state/sudo.log")"
+# Each sudo -n install, the release's and the rollback's, ran under its 30 s bound.
+for path in /etc/udev/rules.d/99-ghost-wispr.rules /etc/systemd/logind.conf.d/50-ghost-wispr-power-key.conf; do
+  [[ $(grep -cFx -- "timeout=30s install $path" "$state/sudo.log") == 2 ]] \
+    || fail "rollback-whole-set: sudo -n install did not install $path for the release and again for the rollback, each under its 30 s bound: $(<"$state/sudo.log")"
+done
 
 # A rollback puts the old binary back while the new one still runs: a copy over a file that is
 # executing fails with "Text file busy", which would leave the new binary in place. The new binary
@@ -1970,7 +2021,7 @@ run_launcher() {
   # shellcheck disable=SC2086 # Each trigger word is one assignment or none.
   out=$(cd -- "$opt" && env -u TRIGGER_UNIT -u TRIGGER_TIMER_REALTIME_USEC PATH="$bin:$PATH" \
     TEST_STATE="$state" TEST_RELEASES="$releases" TEST_RELEASE="${release:-none}" TEST_FAKES="$fakes" \
-    TEST_PI_SECRETS="$fakes/pi-secrets" TEST_BUSY_PID="$work_dir/busy.pid" TEST_CURL_EXIT="${curl_exit:-}" \
+    TEST_PI_SECRETS="$fakes/pi-secrets" TEST_BUSY_PID="$work_dir/busy.pid" TEST_CURL_FAIL="${curl_fail:-}" \
     INVOCATION_ID=test-invocation-9 ${trigger:+TRIGGER_UNIT=ghost-wispr-update.timer} \
     ${trigger:+TRIGGER_TIMER_REALTIME_USEC=$trigger} \
     GHOST_WISPR_DEPLOY_DIR="$opt" GHOST_WISPR_UNIT_DIR="$units" GHOST_WISPR_SYSTEM_ROOT="$root" \
@@ -2011,15 +2062,24 @@ echo 10 >"$state/update.sh.exit"
 run_launcher
 [[ $status == 10 && $(<"$state/launcher.log") == update.sh && $(failed_runs) == 1 ]] \
   || fail "after an exit 10: exit $status, ran $(<"$state/launcher.log"), count $(failed_runs)"
-# The real update.sh, whose curl fails as on a network fault, exits 10: no update.sh.prev runs.
-new_pi
-install_set b
-install -m 0755 -- "$launcher_file" "$opt/ghost-wispr-update-launcher.sh"
-fake_update "$opt/update.sh.prev" update.sh.prev
-: >"$state/launcher.log"
-curl_exit=22 release=b run_launcher
-[[ $status == 10 && ! -s $state/launcher.log && $(failed_runs) == 1 && $out == *'ghost-wispr update: '* ]] \
-  || fail "a network fault: exit $status, ran $(<"$state/launcher.log"), count $(failed_runs), output $out"
+# network_fault WHAT GLOB LINE: the real update.sh, on an idle recorder whose status it reads, finds
+# each call to a URL that GLOB matches failing as on a network fault. It prints LINE and exits 10;
+# the launcher counts the run and runs no update.sh.prev, and nothing restarts.
+network_fault() {
+  new_pi
+  install_set b
+  install -m 0755 -- "$launcher_file" "$opt/ghost-wispr-update-launcher.sh"
+  fake_update "$opt/update.sh.prev" update.sh.prev
+  : >"$state/launcher.log"
+  curl_fail=$2 release=b run_launcher
+  [[ $status == 10 && ! -s $state/launcher.log && $(failed_runs) == 1 && $(restarts) == 0 ]] \
+    || fail "$1: exit $status, ran $(<"$state/launcher.log"), count $(failed_runs), $(restarts) restarts, output $out"
+  grep -Fqx -- "$3" <<<"$out" || fail "$1: printed no line \"$3\"; output: $out"
+}
+network_fault 'the release API unreachable' 'https://test.invalid/*' \
+  'ghost-wispr update: could not read the latest release from https://test.invalid/releases/latest'
+network_fault 'the tarball download failing' 'https://test.invalid/assets/*/ghost-wispr-pi-deploy.tar.gz' \
+  'ghost-wispr update: could not download https://test.invalid/assets/b/ghost-wispr-pi-deploy.tar.gz'
 # update.sh broke (exit 2, a shell error): update.sh.prev runs at once, and sources pi-lib.sh.prev,
 # not the new pi-lib.sh.
 new_pi
@@ -2069,7 +2129,8 @@ echo hang >"$state/update.sh.exit"
 limit=2s run_launcher
 [[ $status == 0 && $(paste -sd ' ' "$state/launcher.log") == 'update.sh update.sh.prev' ]] && ((elapsed < 30)) \
   || fail "a hung update.sh: exit $status after $elapsed s, ran $(paste -sd ' ' "$state/launcher.log")"
-# With no update.sh.prev, the launcher exits with update.sh's code, and the count goes on past 11.
+# With no update.sh.prev, the launcher exits with update.sh's code; at 11 failed runs the count still
+# goes back to 0 (R8), so each night counts its own runs.
 launcher_pi
 rm -f -- "$opt/update.sh.prev"
 echo 2 >"$state/update.sh.exit"
@@ -2080,7 +2141,8 @@ rm -f -- "$opt/update.sh.prev"
 echo 10 >"$state/update.sh.exit"
 echo 10 >"$opt/update.failed-runs"
 run_launcher
-[[ $status == 10 && $(failed_runs) == 11 ]] || fail "no update.sh.prev, the 11th failed run: exit $status, count $(failed_runs)"
+[[ $status == 10 && $(failed_runs) == 0 && $out != *'running update.sh.prev'* ]] \
+  || fail "no update.sh.prev, the 11th failed run: exit $status, count $(failed_runs), output $out; want exit 10 and the count 0"
 
 # ---------------------------------------------------------------------------------------------------
 # unit-limits: the update unit's one time limit is TimeoutStartSec=infinity, and it runs the
