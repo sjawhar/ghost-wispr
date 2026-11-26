@@ -1174,6 +1174,7 @@ func (s *Supervisor) onTranscriptLocked(t *Transcript) {
 				ex.turnFrom = from // the voice answered this call before its result came
 			}
 			ex.wakeStart, ex.wakeSaid = wakeStart(t, m), wakeSaidAt(t, m)
+			s.turnEndsLocked(ex, true)
 			ex.turn, ex.interim, ex.turnFinal, ex.uttered, ex.heardTo, ex.reply = nil, "", false, false, time.Time{}, nil
 			ex.followUpTurn, ex.turnByName = false, true // a call, with the wake phrase
 			if !stale {
@@ -1262,6 +1263,7 @@ func (s *Supervisor) onTranscriptLocked(t *Transcript) {
 func (s *Supervisor) driverHeardLocked(ex *exchange, t *Transcript, words string) {
 	if !ex.stale(t) {
 		if ex.newTurn || ex.uttered {
+			s.turnEndsLocked(ex, ex.newTurn)
 			if ex.newTurn {
 				ex.reply = nil // the voice spoke: a new reply begins
 			}
@@ -1281,6 +1283,7 @@ func (s *Supervisor) driverHeardLocked(ex *exchange, t *Transcript, words string
 		// The voice's speeches since answer it: the room's next words are
 		// still a new turn.
 		ex.turnFrom = from
+		s.turnEndsLocked(ex, true)
 		ex.turn, ex.interim, ex.turnFinal, ex.uttered, ex.heardTo, ex.reply = nil, "", false, false, time.Time{}, nil
 		ex.followUpTurn, ex.turnByName = ex.followUpTimer != nil && !ex.askedBack, false
 		ex.x.Turn++
@@ -1859,7 +1862,6 @@ func (s *Supervisor) turnLocked(ex *exchange, t *Transcript, words string) {
 				keep = min(len(ex.replySeqs), len(ex.reply)-1)
 				ex.replySeqs = append(ex.replySeqs[len(ex.replySeqs)-keep:], seq)
 			}
-			s.takeBackLocked(ex)
 		}
 		ex.interim = ""
 		ex.turnFinal = true
@@ -2055,6 +2057,7 @@ func (s *Supervisor) handTurnLocked(ex *exchange, signal turnSignal) {
 	turn := s.turnOf(ex)
 	ex.x.AskerTurn, ex.x.Finals = turn, finalsOf(ex)
 	s.sessionLocked(ex)
+	s.takeBackLocked(ex) // the turn is complete: its take-back cuts the history now
 	ex.x.Recent = s.recentLocked()
 	s.exTimingLocked(ex, "turn_signal", signal.at, "kind", signal.kind)
 	s.exTimingLocked(ex, "turn_end", turnEnd)
@@ -2202,6 +2205,7 @@ func (s *Supervisor) followUpLocked(ex *exchange) {
 	ex.followUp = true
 	ex.followUpTurn = !ex.askedBack // an answer to Wispr's own question needs none
 	ex.answering = false
+	s.turnEndsLocked(ex, true)
 	ex.turn, ex.interim, ex.turnByName, ex.heardTo = nil, "", false, time.Time{}
 	ex.x.Turn++
 	ex.said, ex.last = false, nil
@@ -2575,6 +2579,7 @@ func (s *Supervisor) endLocked(ex *exchange, cut bool, reason string) {
 	if ex.ended {
 		return
 	}
+	s.turnEndsLocked(ex, true)
 	silence := cut || ex.ctx.Err() != nil
 	// Its session settles as it ends: the start it waited for, if that start
 	// has settled by now, is its, whatever session is current. One that never
@@ -2985,7 +2990,12 @@ func (s *Supervisor) keepRecentLocked(t *Transcript, now time.Time) {
 // The words it cuts are the answer's (cutWords): after Wispr's question,
 // the room's whole reply since it, across the endpoints inside it, else the
 // turn. Only those finals' own entries change, never another speaker's or
-// another turn's matching words (Sol's eleventh review of #191).
+// another turn's matching words (Sol's eleventh review of #191). It runs
+// once those words are complete, when the turn is handed to an answer or
+// ends (turnEndsLocked), never on each final: a quotation still open when
+// its "cancel" is heard may close later, and the words it quoted are no
+// take-back (Main, after Sol's thirteenth review of #191). Running it again
+// over the same words changes nothing.
 func (s *Supervisor) takeBackLocked(ex *exchange) {
 	if s.cfg.TakeBack == nil {
 		return
@@ -3011,6 +3021,19 @@ func (s *Supervisor) takeBackLocked(ex *exchange) {
 		}
 	}
 	s.dropRecentLocked(ex, texts)
+}
+
+// turnEndsLocked cuts the room's recent words at ex's turn's take-back
+// (takeBackLocked) as the turn ends with no answer handed it: a new turn
+// or call begins, the answer is over, or the exchange ends. After Wispr's
+// question the cut is the whole reply's, which goes on past an endpoint
+// inside it: it waits for the reply's end (replyEnds, the voice spoke since
+// or a new call began) or the answer's handoff.
+func (s *Supervisor) turnEndsLocked(ex *exchange, replyEnds bool) {
+	if !replyEnds && ex.drives && ex.askedBack && len(ex.reply) > 0 {
+		return
+	}
+	s.takeBackLocked(ex)
 }
 
 // neverMindTurnLocked drops from the room's recent words the question
@@ -3470,7 +3493,9 @@ func (t exchangeTools) Run(ctx context.Context, c ToolCall) (json.RawMessage, er
 	s.mu.Lock()
 	x = t.ex.x
 	// The room's recent words as they are now, aged and cut: the exchange's
-	// copy is as old as the exchange (Sol's eleventh review of #191).
+	// copy is as old as the exchange (Sol's eleventh review of #191). The
+	// turn handed now is complete, so its take-back cuts them first.
+	s.takeBackLocked(t.ex)
 	x.Recent = s.recentLocked()
 	// A handed turn's words are no later answer's: a vendor that asks again
 	// before the room's next words would get them, and a take-back in them
