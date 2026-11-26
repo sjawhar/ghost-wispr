@@ -489,8 +489,9 @@ cat >"$fakes/pi-secrets" <<'EOF'
 # --out/secrets.env, one --env-secret VARIABLE=SECRET a line in flag order (each VARIABLE's value
 # from $TEST_STATE/secrets), stages $TEST_STATE/certificate as --out/device.crt when that file
 # exists, and prints C4's lines, never a value. It is the event "secrets". $TEST_STATE/pi-secrets-mode
-# "fail" makes it fail as a read failure does (exit 1, no file); "hang" makes it hang until a
-# timeout ends it.
+# "fail" makes it fail as a key read failure does (R10): no secrets.env and exit 1, after the
+# certificate step has still staged $TEST_STATE/certificate, when that exists; "hang" makes it hang
+# until a timeout ends it.
 set -euo pipefail
 state=${TEST_STATE:?}
 binary=$1
@@ -526,6 +527,10 @@ case $(cat -- "$state/pi-secrets-mode" 2>/dev/null || echo ok) in
     ;;
   fail)
     printf 'pi-secrets: could not read %s from %s\n' "${env_secrets[0]%%=*}" "${env_secrets[0]#*=}"
+    if $certificate && [[ -f $state/certificate ]]; then
+      cp -- "$state/certificate" "$out/device.crt"
+      printf 'pi-secrets: certificate version 2, not after 2027-11-26T00:00:00Z: newer and signs in\n'
+    fi
     exit 1
     ;;
 esac
@@ -1398,7 +1403,7 @@ install_set b "$drive_id"
 before=$(snapshot)
 release=b run_update
 expect_run 'same-commit-different-set control' 0 "ghost-wispr update: already current at commit $commit_b"
-expect_no_output 'same-commit-different-set control' 'installed'
+expect_no_output 'same-commit-different-set control' 'ghost-wispr update: installed'
 expect_unchanged 'same-commit-different-set control' "$before"
 [[ $(restarts) == 0 ]] || fail 'same-commit-different-set control: restarted a current recorder'
 
@@ -1712,6 +1717,25 @@ release=b run_update
 expect_run 'secrets-read-fails, current' 10
 expect_unchanged 'secrets-read-fails, current' "$before"
 [[ $(restarts) == 0 ]] || fail 'secrets-read-fails, current: restarted the recorder'
+# A failed key read still lets the certificate step run (R10): a certificate it staged installs,
+# with the release or alone, while .env keeps its secret lines and the run still fails.
+for pi_release in a b; do
+  what="secrets-read-fails, a certificate staged, the Pi on release $pi_release"
+  new_pi
+  install_set "$pi_release"
+  echo fail >"$state/pi-secrets-mode"
+  printf 'NEW CERTIFICATE\n' >"$state/certificate"
+  release=b run_update
+  expect_run "$what" 10 'pi-secrets: could not read GHOST_WISPR_DEEPGRAM_API_KEY from example-deepgram-secret' \
+    'ghost-wispr update: installed certificate version 2, not after 2027-11-26T00:00:00Z'
+  [[ $(<"$opt/device.crt") == 'NEW CERTIFICATE' && $(<"$opt/device.crt.prev") == 'INSTALLED CERTIFICATE' ]] \
+    || fail "$what: did not install the staged certificate with the old one as device.crt.prev"
+  expect_env "$what" GHOST_WISPR_ADDR=127.0.0.1:8080 GOOGLE_API_USE_CLIENT_CERTIFICATE=false \
+    GHOST_WISPR_DEEPGRAM_API_KEY=dg-test-1 GHOST_WISPR_DISPATCH_TOKEN=tok-test-1 GHOST_WISPR_JABRA_MUTE_BUTTON=false
+  expect_set_of "$what" b
+  [[ $(restarts) == 1 ]] && grep -Fq "crt=$(sha "$opt/device.crt")" "$state/systemctl.log" \
+    || fail "$what: did not restart the recorder once on the new certificate: $(<"$state/systemctl.log")"
+done
 
 begin pi-secrets-hangs
 # pi-secrets-hangs: a pi-secrets that hangs (a stalled connection) is killed by its bound, 60 s and
