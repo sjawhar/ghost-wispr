@@ -91,17 +91,51 @@ func TestRunbookSaysAReleaseInstallsItsConfigWithItsBinary(t *testing.T) {
 	}
 }
 
+// pisReleaseSection is the runbook's one section on getting the release the Pi
+// runs, which may be older than the latest release.
+const pisReleaseSection = "### The release the Pi runs"
+
 // TestRunbookRunsTheModelsStepFromTheReleaseThePiRuns fails if "Enable models
 // and Drive sync" does not say to run provision.sh --models only from the
-// release the Pi runs, which may be older than the latest release, and how to
-// get that release: check 1 of check-deploy.sh, or the download block of the
-// release whose commit /api/version names, which runbook_blocks_test.sh runs.
+// release the Pi runs, with its block, or if "The release the Pi runs" does
+// not say how to get that release: check 1 of check-deploy.sh, or the download
+// block of the release whose commit /api/version names, which
+// runbook_blocks_test.sh runs.
 func TestRunbookRunsTheModelsStepFromTheReleaseThePiRuns(t *testing.T) {
 	section := runbookSection(t, "## Enable models and Drive sync")
-	for _, words := range []string{"only from the release the Pi runs", "check 1", "/api/version", "<!-- runbook_blocks_test.sh: download-commit -->", "<!-- runbook_blocks_test.sh: models -->"} {
+	for _, words := range []string{"only from the release the Pi runs", `"The release the Pi runs"`, "<!-- runbook_blocks_test.sh: models -->"} {
 		if !strings.Contains(section, words) {
 			t.Errorf("the runbook's \"Enable models and Drive sync\" does not say %q", words)
 		}
+	}
+	release := runbookSection(t, pisReleaseSection)
+	for _, words := range []string{"check 1", "/api/version", "<!-- runbook_blocks_test.sh: download-commit -->"} {
+		if !strings.Contains(release, words) {
+			t.Errorf("the runbook's %q does not say %q", pisReleaseSection, words)
+		}
+	}
+}
+
+// TestRunbookAppliesAProvisioningChangeFromTheReleaseThePiRuns fails if "Apply
+// a provisioning change" runs provision.sh from the latest release instead of
+// the release the Pi runs, or does not say why: provision.sh installs its
+// release's update.sh, pi-lib.sh and pi.env before it starts the update, so a
+// newer release's would leave the .prev copies of an older set, a failed
+// install would roll back two releases, and provision.sh refuses when
+// deploy.verified names another commit. It also fails if "Provision" still
+// reruns provision.sh from a fresh download of the latest release.
+func TestRunbookAppliesAProvisioningChangeFromTheReleaseThePiRuns(t *testing.T) {
+	section := runbookSection(t, "### Apply a provisioning change")
+	for _, words := range []string{`"The release the Pi runs"`, "deploy.verified", "two releases", "`update.sh`, `pi-lib.sh` and `pi.env`"} {
+		if !strings.Contains(section, words) {
+			t.Errorf("the runbook's \"Apply a provisioning change\" does not say %q", words)
+		}
+	}
+	if strings.Contains(section, `download the release ("Provision", step 1)`) {
+		t.Error(`the runbook's "Apply a provisioning change" still downloads the latest release`)
+	}
+	if strings.Contains(runbookSection(t, "## Provision"), "provision.sh` again (steps 1 and 5)") {
+		t.Error(`"Provision" still reruns provision.sh from a fresh download of the latest release`)
 	}
 }
 
