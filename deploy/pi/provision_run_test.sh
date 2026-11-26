@@ -1018,6 +1018,7 @@ manager_expansion() {
         [[ $char != '$' ]] || state=dollar
         ;;
       dollar)
+        # shellcheck disable=SC2016 # '${' is the two characters, as the manager reads them
         case $char in
           '{') out+=${word%?} word='${' state=variable ;;
           '$') out+=$word word='' state=word ;;
