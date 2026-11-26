@@ -14,14 +14,20 @@ import (
 // from Sol's probes, through the real Supervisor, Concierge and GPT-Live
 // client, with the R15 loopback socket.
 
-// TestVoiceBsFreshFollowupSurvivesAnUnrelatedFinal (Sol's seventeenth
-// review #191, P2 1): a final such as "okay, sure", with no take-back or
-// replacement question, advances Room's revision but must not discard a
-// fresh vendor follow-up. At a8f712e the model got "what about ABC-42? okay,
-// sure". Controls: no final, and a repeated original question final.
-func TestVoiceBsFreshFollowupSurvivesAnUnrelatedFinal(t *testing.T) {
-	for _, final := range []string{"", "okay, sure", "what about ABC-42?"} {
-		t.Run(final, func(t *testing.T) {
+// A follow-up the room says, as a local final, is the next delegation's
+// question; GPT-Live's own transcript is never the question (Main, after
+// Sol's eighteenth review of #191). A driving voice keeps one turn for the
+// whole exchange, so the room's asker grows; the delegation asks what the
+// room has said since the last one, never the question already answered.
+// Controls: no intervening final, an unrelated one, and the room repeating
+// the original question, each of which the room genuinely said.
+func TestVoiceBsRoomFollowupReachesTheTool(t *testing.T) {
+	for _, tc := range []struct{ final, want string }{
+		{"", "when will ABC-12 ship?"},
+		{"okay, sure", "okay, sure when will ABC-12 ship?"},
+		{"what about ABC-42?", "what about ABC-42? when will ABC-12 ship?"},
+	} {
+		t.Run(tc.final, func(t *testing.T) {
 			url, conns := loopbackVendor(t, false)
 			live, err := gptlive.New(gptlive.Config{URL: url, Token: func(context.Context) (string, error) { return "loopback-not-a-secret", nil }})
 			if err != nil {
@@ -36,14 +42,16 @@ func TestVoiceBsFreshFollowupSurvivesAnUnrelatedFinal(t *testing.T) {
 			w.next(t, "session.start")
 			within(t, v.opened, "opened voice")
 			delegate(t, w, v, r, "first", 1000)
-			if final != "" {
-				r.hearNow(final, false)
+			if tc.final != "" {
+				r.hearNow(tc.final, false)
 			}
-			fresh := "when will ABC-12 ship?"
-			w.send(map[string]any{"type": "session.input_transcript.delta", "event_id": "fresh", "delta": fresh, "start_ms": 0, "end_ms": 100})
+			// GPT-Live's own transcript of a follow-up is ignored; only the
+			// room's local final gives the next question.
+			w.send(map[string]any{"type": "session.input_transcript.delta", "event_id": "heard", "delta": "when will ABC-12 ship?", "start_ms": 0, "end_ms": 100})
+			r.hearNow("Wispr, when will ABC-12 ship?", false)
 			question, _ := delegate(t, w, v, r, "fresh", 2000)
-			if question != fresh || modelQuestion(r) != fresh {
-				t.Errorf("fresh vendor question lost after %q: tool %q, model %q; want %q", final, question, modelQuestion(r), fresh)
+			if question != tc.want || modelQuestion(r) != tc.want {
+				t.Errorf("room follow-up after %q: tool %q, model %q; want %q", tc.final, question, modelQuestion(r), tc.want)
 			}
 		})
 	}
@@ -107,7 +115,7 @@ func TestVoiceBsWholeTakebackCompletesSilently(t *testing.T) {
 			id := "whole-takeback"
 			w.send(map[string]any{"type": "session.delegation.created", "event_id": "delegate", "offset_ms": 1000, "delegation": map[string]any{"id": id, "type": "delegation", "target": "client"}})
 			if cut {
-				if got := completion(t, w, id); got != "The question was withdrawn. Do not say anything." {
+				if got := completion(t, w, id); got != "" {
 					t.Errorf("silent completion %q", got)
 				}
 				if len(v.calls) != 0 {

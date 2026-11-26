@@ -33,7 +33,7 @@ func TestSolR5AuditUsesTheCurrentFollowUpKey(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			x := testExchange(newFakeOutput(), solR5CurrentQuestionTools{})
-			x.AskerTurn = "What is happening with ABC-123?"
+			rs := withRoom(x, "What is happening with ABC-123?")
 			srv := newLiveServer(t)
 			s, c, _ := openSession(t, srv, x)
 			c.heard("What is happening with ABC-123?")
@@ -46,6 +46,7 @@ func TestSolR5AuditUsesTheCurrentFollowUpKey(t *testing.T) {
 			if n := waitFactCheck(t, s); n != 0 {
 				t.Fatalf("initial unchanged key control failures=%d", n)
 			}
+			rs.set(voice.RoomView{Live: true, Asker: "What is happening with XYZ-456?", Revision: 2})
 			c.heard("What is happening with XYZ-456?")
 			c.delegate("followup")
 			next := c.expect(evCommentaryAppend)

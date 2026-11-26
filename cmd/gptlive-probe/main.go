@@ -103,6 +103,15 @@ type probeConfig struct {
 	// DelegateWait is how long the probe waits for GPT-Live to delegate the
 	// question; 0 means delegateWait.
 	DelegateWait time.Duration
+	// RoomAsker is the asker the probe's Exchange.Room returns, as the
+	// Supervisor would: empty means a live room with no current question, so
+	// a delegation completes with the silent ending.
+	RoomAsker string
+	// Observe, when set to "silent" or "spoken", makes the probe open a real
+	// session, raise one delegation, answer it (silently or with a spoken
+	// result), and record for observeWindow after: every event, the audio,
+	// and any further function call.
+	Observe string
 }
 
 // defaultStatusURL is the unit's local status endpoint. The probe refuses to
@@ -139,6 +148,8 @@ func run() int {
 	wav := flag.String("wav", "", "write GPT-Live's speech to this WAV file")
 	turns := flag.Int("turns", probeTurns, "text turns to send; each speech's lead is measured")
 	ask := flag.String("ask", "", "a spoken question, a 16 kHz mono 16-bit WAV, for GPT-Live to delegate to the probe's backend")
+	observe := flag.String("observe-delegation", "", "instead of the strict round-trip, raise one delegation and record for 20s: \"silent\" leaves the room with no asker (the silent ending), \"spoken\" gives the room an asker (a spoken control)")
+	roomAsker := flag.String("room-asker", "Wispr, what is the probe's verification key?", "the asker the probe's room reports, as the Supervisor would; the silent observe mode forces it empty")
 	statusURL := flag.String("status-url", defaultStatusURL, "the office unit's local /api/status endpoint; it must say paused, not capturing and no active session")
 	timeout := flag.Duration("timeout", 3*time.Minute, "give up after this long")
 	flag.Parse()
@@ -161,6 +172,19 @@ func run() int {
 			return 2
 		}
 	}
+	asker := *roomAsker
+	switch *observe {
+	case "", "spoken":
+	case "silent":
+		asker = ""
+	default:
+		printf(os.Stderr, "gptlive-probe: --observe-delegation must be \"silent\" or \"spoken\"\n")
+		return 2
+	}
+	if *observe != "" && len(question) == 0 {
+		printf(os.Stderr, "gptlive-probe: --observe-delegation needs a spoken question in --ask\n")
+		return 2
+	}
 	err := probe(ctx, &probeConfig{
 		StatusURL:          *statusURL,
 		IdentityProviderID: *provider,
@@ -168,12 +192,14 @@ func run() int {
 		Subject: func(ctx context.Context, audience string) (string, error) {
 			return googleauth.IDToken(ctx, *credentials, audience)
 		},
-		Text:     *text,
-		Voice:    *voiceName,
-		MinAudio: time.Second,
-		Turns:    *turns,
-		Ask:      question,
-		WAV:      *wav,
+		Text:      *text,
+		Voice:     *voiceName,
+		MinAudio:  time.Second,
+		Turns:     *turns,
+		Ask:       question,
+		WAV:       *wav,
+		RoomAsker: asker,
+		Observe:   *observe,
 	}, os.Stdout)
 	if err != nil {
 		printf(os.Stdout, "result: FAIL: %v\n", err)
@@ -273,7 +299,9 @@ func probe(ctx context.Context, cfg *probeConfig, out io.Writer) error {
 	rec := &recording{}
 	tools := &probeTools{called: make(chan time.Time, 1)}
 	begin = time.Now()
-	s, err := v.Open(ctx, &voice.Exchange{SessionID: "gptlive-probe", WakeAt: begin, Tap: tap, Out: rec, Tools: tools})
+	s, err := v.Open(ctx, &voice.Exchange{SessionID: "gptlive-probe", WakeAt: begin, Tap: tap, Out: rec, Tools: tools, Room: func() voice.RoomView {
+		return voice.RoomView{Live: true, Asker: cfg.RoomAsker, Revision: 1}
+	}})
 	if err != nil {
 		return fmt.Errorf("session: %w", err)
 	}
@@ -293,7 +321,7 @@ func probe(ctx context.Context, cfg *probeConfig, out io.Writer) error {
 	if turns <= 0 {
 		turns = probeTurns
 	}
-	for i := range turns {
+	for i := 0; cfg.Observe == "" && i < turns; i++ {
 		// Say returns once GPT-Live has spoken the turn's answer and it
 		// played.
 		turn := time.Now()
@@ -306,6 +334,13 @@ func probe(ctx context.Context, cfg *probeConfig, out io.Writer) error {
 		if err := listen(ctx, rec, settle); err != nil {
 			return err
 		}
+	}
+	if cfg.Observe != "" {
+		if err := observeDelegation(ctx, cfg, in, tools, rec, seen, out); err != nil {
+			return err
+		}
+		printf(out, "result: PASS\n")
+		return nil
 	}
 	if len(cfg.Ask) > 0 {
 		if err := delegation(ctx, cfg, in, tools, rec, seen, out); err != nil {
@@ -657,6 +692,78 @@ func evidenceTokens(text string) []string {
 	})
 }
 
+// observeWindow is how long observeDelegation watches GPT-Live after a
+// delegation, for speech, a further function call, or any other event.
+const observeWindow = 20 * time.Second
+
+// observeDelegation opens one real delegation, lets the session answer it
+// (silently when the room has no asker, with a spoken result when it does),
+// and then reports for observeWindow every event, the audio, and any further
+// function call. It asserts nothing: it records what the real vendor did so
+// the silent ending can be judged against a spoken control.
+func observeDelegation(ctx context.Context, cfg *probeConfig, in *feeder, tools *probeTools, rec *recording, seen *events, out io.Writer) error {
+	wait := cfg.DelegateWait
+	if wait <= 0 {
+		wait = delegateWait
+	}
+	in.ask <- cfg.Ask
+	var ended time.Time
+	select {
+	case ended = <-in.ended:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	printf(out, "question: %.2f s of audio sent (mode: %s, room asker: %q)\n", float64(len(cfg.Ask))/16000, cfg.Observe, cfg.RoomAsker)
+	// Let the delegation land: a spoken control calls the backend; a silent
+	// run never does, so wait roomWait plus a margin for the session's bounded
+	// wait and the silent ending before the window opens.
+	landed := time.Now().Add(wait)
+	for time.Now().Before(landed) {
+		if n, _ := tools.calls(); n > 0 {
+			break
+		}
+		select {
+		case <-time.After(100 * time.Millisecond):
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	startCalls, _ := tools.calls()
+	startAudio := rec.duration()
+	startWords := seen.words()
+	begin := time.Now()
+	printf(out, "observe: watching %v after the delegation (delegated %v after the question)\n", observeWindow, begin.Sub(ended).Round(time.Millisecond))
+	select {
+	case <-time.After(observeWindow):
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	endCalls, questions := tools.calls()
+	spoke := rec.duration() - startAudio
+	if spoke < 0 {
+		spoke = 0
+	}
+	if _, ok := rec.firstAfter(begin); ok {
+		printf(out, "observe: GPT-Live spoke %v of audio in the window\n", spoke)
+	} else {
+		printf(out, "observe: GPT-Live spoke no audio in the window\n")
+	}
+	printf(out, "observe: function calls %d->%d over the window; questions seen: %v\n", startCalls, endCalls, questions)
+	printf(out, "observe: words before the window: %q\n", startWords)
+	printf(out, "observe: words after the window:  %q\n", seen.words())
+	printf(out, "observe: spoken-fact errors: %d\n", seen.factErrors())
+	if err := seen.failure(); err != nil {
+		printf(out, "observe: session reported: %v\n", err)
+	}
+	if cfg.WAV != "" {
+		if err := os.WriteFile(cfg.WAV, rec.wav(), 0o600); err != nil {
+			return fmt.Errorf("write %s: %w", cfg.WAV, err)
+		}
+		printf(out, "wav: %s\n", cfg.WAV)
+	}
+	return nil
+}
+
 // readQuestion reads a spoken question from a WAV file: mono PCM16 at 16 kHz.
 func readQuestion(path string) ([]int16, error) {
 	data, err := os.ReadFile(path)
@@ -697,18 +804,38 @@ func readQuestion(path string) ([]int16, error) {
 	return out, nil
 }
 
-// probeTools is the probe's backend: it answers a delegation, and says when.
-type probeTools struct{ called chan time.Time }
+// probeTools is the probe's backend: it answers a delegation, counts the
+// calls, and says when.
+type probeTools struct {
+	called    chan time.Time
+	mu        sync.Mutex
+	count     int
+	questions []string
+}
 
 func (t *probeTools) Run(_ context.Context, c voice.ToolCall) (json.RawMessage, error) {
 	if c.Name != voice.AnswerTool {
 		return nil, fmt.Errorf("the probe has no tool %q", c.Name)
 	}
+	var args voice.AnswerArgs
+	_ = json.Unmarshal(c.Args, &args)
+	t.mu.Lock()
+	t.count++
+	t.questions = append(t.questions, args.Question)
+	t.mu.Unlock()
 	select {
 	case t.called <- time.Now():
 	default:
 	}
 	return json.Marshal(voice.AnswerResult{Say: delegationAnswer})
+}
+
+// calls is how many delegations the backend has answered, and their
+// questions.
+func (t *probeTools) calls() (int, []string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.count, append([]string(nil), t.questions...)
 }
 
 // recording is the speaker output for the probe: it keeps the speech, and

@@ -59,11 +59,12 @@ func TestTheSpeechAfterACutOneKeepsItsWords(t *testing.T) {
 	}
 }
 
-// N1: a delegation that heard nothing new asks the last question again, not
-// everything heard since Wispr last spoke.
-func TestADelegationWithNothingNewAsksTheLastQuestion(t *testing.T) {
+// N1: a delegation re-asks the room's current asker; GPT-Live's own
+// transcript heard between delegations is never the question (Main, after
+// Sol's eighteenth review of #191).
+func TestADelegationWithNothingNewAsksTheRoomsAsker(t *testing.T) {
 	x := testExchange(newFakeOutput(), newFakeTools(voice.AnswerResult{Say: "x"}))
-	x.AskerTurn = ""
+	rs := withRoom(x, "What is PR 81?")
 	srv := newLiveServer(t)
 	s, c, _ := openSession(t, srv, x)
 
@@ -72,6 +73,7 @@ func TestADelegationWithNothingNewAsksTheLastQuestion(t *testing.T) {
 	if q := answerArgs(t, waitEvent(t, s, voice.EventToolCall).Call.Args).Question; q != "What is PR 81?" {
 		t.Fatalf("first question %q", q)
 	}
+	rs.set(voice.RoomView{Live: true, Asker: "And who holds it?", Revision: 2})
 	c.heard(" And who holds it?")
 	c.delegate("item_2")
 	if q := answerArgs(t, waitEvent(t, s, voice.EventToolCall).Call.Args).Question; q != "And who holds it?" {
@@ -79,7 +81,7 @@ func TestADelegationWithNothingNewAsksTheLastQuestion(t *testing.T) {
 	}
 	c.delegate("item_3")
 	if q := answerArgs(t, waitEvent(t, s, voice.EventToolCall).Call.Args).Question; q != "And who holds it?" {
-		t.Fatalf("question with nothing new heard %q, want the last question", q)
+		t.Fatalf("question with nothing new %q, want the room's asker again", q)
 	}
 }
 
@@ -140,10 +142,11 @@ func TestADelegationDuringCloseRunsNoTool(t *testing.T) {
 	}
 }
 
-// Na2: the question waits for its fragments to settle.
-func TestTheQuestionWaitsForTheTranscriptToSettle(t *testing.T) {
+// Na2: the question is the room's asker, independent of GPT-Live's transcript
+// fragments (Main, after Sol's eighteenth review of #191).
+func TestTheQuestionIsTheRoomsAsker(t *testing.T) {
 	x := testExchange(newFakeOutput(), newFakeTools(voice.AnswerResult{Say: "It is in review."}))
-	x.AskerTurn = ""
+	withRoom(x, "Wispr, what is the status of ABC-123?")
 	srv := newLiveServer(t)
 	s, c, _ := openSession(t, srv, x)
 	c.delegate("item_s")
@@ -156,7 +159,7 @@ func TestTheQuestionWaitsForTheTranscriptToSettle(t *testing.T) {
 		t.Fatal(err)
 	}
 	if args.Question != "Wispr, what is the status of ABC-123?" {
-		t.Fatalf("question %q, want both fragments", args.Question)
+		t.Fatalf("question %q, want the room's asker", args.Question)
 	}
 }
 

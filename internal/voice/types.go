@@ -73,12 +73,15 @@ type Exchange struct {
 }
 
 // RoomView is the room's words a vendor may read now (Exchange.Room). Asker
-// and Recent are the current cut view. Revision increments at each final,
-// solely to order concurrent vendor delegations. TakeBacks increments at
-// each take-back, whole-turn ones too: a vendor transcript stamped before a
-// later take-back is no longer safe to use (Main, after Sol's seventeenth
-// review of #191).
+// is the current turn's words after its last take-back, the only source of a
+// delegation's question; Recent is the cut recent view. Live is true for a
+// live exchange and false only for the ended or cancelled view, so revision
+// zero on a live view is a normal opening before the first final, not an end
+// (Main, after Sol's eighteenth review of #191). Revision increments at each
+// final, solely to order concurrent vendor delegations. TakeBacks increments
+// once per take-back, counted on the final with its obsolete interim removed.
 type RoomView struct {
+	Live      bool
 	Asker     string
 	Recent    []TurnText
 	Revision  uint64

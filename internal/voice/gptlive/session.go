@@ -79,8 +79,14 @@ const (
 	// GPT-Live heard before it takes them as the question: its transcript can
 	// arrive after the delegation, a fragment at a time.
 	transcriptSettle = 250 * time.Millisecond
-	// questionWait is the longest a delegation waits for those words.
-	questionWait = 1500 * time.Millisecond
+	// roomWait is the longest a delegation waits for the room's next local
+	// final to give it a question, when the room has none yet. Deepgram
+	// finalizes a turn within about 1 s of its end (endpointing ~300 ms plus
+	// the live stream's lag, measured against the voice-A suites' finals), so
+	// 2 s covers it with margin; past it, the delegation completes silently.
+	roomWait = 2 * time.Second
+	// roomPoll is how often a waiting delegation re-reads the room.
+	roomPoll = 40 * time.Millisecond
 	// nothingFound answers a delegation the Concierge had nothing to say on.
 	nothingFound = "There is nothing to report on this. Say so in one short sentence."
 	// lookupFailed closes a delegation whose answer tool failed, as silent
@@ -285,23 +291,20 @@ type session struct {
 	facts      []*factAudit
 	factErrors atomic.Int64
 
-	mu                      sync.Mutex
-	closing                 bool
-	release                 func() bool // stops the close on the exchange's end
-	over                    bool        // the session ended and said so on Events
-	nextID                  int
-	pending                 map[string]chan error // acknowledgements awaited, by client event id
-	pendingDone             bool
-	delegations             map[string]bool
-	asked                   bool            // a delegation has taken the asker's words
-	lastAppliedRevision     uint64          // newest RoomView revision a delegation applied
-	lastDelegationTakeBacks uint64          // RoomView.TakeBacks at the last delegation
-	vendorWords             string          // what GPT-Live heard for the last delegation
-	turn                    strings.Builder // heard since the last EventUserTurn
-	sinceAsk                strings.Builder // heard since the last delegation
-	heardAt                 time.Time       // when GPT-Live last heard the room say something
-	heardWake               chan struct{}   // signalled at each word GPT-Live hears
-	dialogue                []dialogueLine  // what was heard and said in this session
+	mu                  sync.Mutex
+	closing             bool
+	release             func() bool // stops the close on the exchange's end
+	over                bool        // the session ended and said so on Events
+	nextID              int
+	pending             map[string]chan error // acknowledgements awaited, by client event id
+	pendingDone         bool
+	delegations         map[string]bool
+	lastAppliedRevision uint64          // newest RoomView revision a delegation applied
+	lastAsked           string          // the room's asker a delegation last answered
+	turn                strings.Builder // heard since the last EventUserTurn, for the record only
+	heardAt             time.Time       // when GPT-Live last heard the room say something
+	heardWake           chan struct{}   // signalled at each word GPT-Live hears
+	dialogue            []dialogueLine  // what was heard and said in this session
 }
 
 type dialogueLine struct {
@@ -833,11 +836,12 @@ func (s *session) onAudio(delta string) {
 	}
 }
 
-// onHeard keeps what GPT-Live heard the room say.
+// onHeard keeps what GPT-Live heard the room say, for the user-turn record
+// and transcript only; it is never a delegation's question text (Main, after
+// Sol's eighteenth review of #191).
 func (s *session) onHeard(delta string) {
 	s.mu.Lock()
 	s.turn.WriteString(delta)
-	s.sinceAsk.WriteString(delta)
 	s.heardAt = time.Now()
 	s.noteLocked(false, delta)
 	s.mu.Unlock()
@@ -910,32 +914,19 @@ func (s *session) onDelegation(ev *serverEvent) {
 	go s.ask(id)
 }
 
-// ask builds delegation id's question once the transcript has settled, then
-// reports the tool call and runs it.
+// ask builds delegation id's question from the room, then reports the tool
+// call and runs it. resolveQuestion is the only wait; the user-turn record is
+// flushed once a question is in hand.
 func (s *session) ask(id string) {
 	defer s.wg.Done()
-	if !s.awaitQuestion() {
-		return
-	}
-	// The room's words as a model may read them now, read before s.mu:
-	// Room locks the Supervisor (voice.Exchange.Room).
-	room := s.room()
-	if s.x.Room != nil && room.Revision == 0 {
-		// An ended exchange returns the zero RoomView. It has no question
-		// or tool call, but its outstanding vendor delegation still gets a
-		// silent function result (Main, after Sol's seventeenth review).
-		s.completeSilently(id)
-		return
-	}
-	s.mu.Lock()
-	question, silent := s.questionLocked(room)
-	transcript := s.transcriptLocked(room)
-	s.mu.Unlock()
-	if silent && s.x.Room != nil {
-		s.completeSilently(id)
+	question, room, ok := s.resolveQuestion(id)
+	if !ok {
 		return
 	}
 	s.flushTurn()
+	s.mu.Lock()
+	transcript := s.transcriptLocked(room)
+	s.mu.Unlock()
 
 	args, err := json.Marshal(voice.AnswerArgs{Question: question, Transcript: transcript})
 	if err != nil {
@@ -947,36 +938,6 @@ func (s *session) ask(id string) {
 	go s.answer(call)
 }
 
-// awaitQuestion waits until GPT-Live has heard something since the last
-// delegation and then nothing for transcriptSettle, or questionWait has
-// passed. It reports false when the session closed meanwhile.
-func (s *session) awaitQuestion() bool {
-	limit := time.NewTimer(questionWait)
-	defer limit.Stop()
-	settle := time.NewTimer(time.Hour)
-	defer settle.Stop()
-	for {
-		s.mu.Lock()
-		heard := strings.TrimSpace(s.sinceAsk.String()) != ""
-		quiet := time.Since(s.heardAt)
-		s.mu.Unlock()
-		if heard && quiet >= transcriptSettle {
-			return true
-		}
-		if heard {
-			settle.Reset(transcriptSettle - quiet)
-		}
-		select {
-		case <-s.heardWake:
-		case <-settle.C:
-		case <-limit.C:
-			return true
-		case <-s.ctx.Done():
-			return false
-		}
-	}
-}
-
 // room is the room's words as a model may read them now (voice.Exchange.Room),
 // or, with no Room, as the session opened with them. Every send after Open
 // reads them here, never a copy the session kept (Main, after Sol's fifteenth
@@ -985,79 +946,99 @@ func (s *session) room() voice.RoomView {
 	if s.x.Room != nil {
 		return s.x.Room()
 	}
-	return voice.RoomView{Asker: s.x.AskerTurn, Recent: s.x.Recent}
+	return voice.RoomView{Live: true, Asker: s.x.AskerTurn, Recent: s.x.Recent}
 }
 
-// questionLocked returns a delegation's question, or silent when the live
-// Room holds no usable question. A revision older than one a newer
-// delegation already applied is silent: its stale snapshot must not reach the
-// Concierge after the newer answer (Main, after Sol's seventeenth review of
-// #191). A take-back since the last delegation (room.TakeBacks changed) makes
-// every vendor transcript of this gap unusable, canceled and re-heard alike:
-// the question is then Room's current asker words, the meeting's last line,
-// or silent for a whole-turn take-back with no history. With no take-back,
-// fresh vendor words stamped at the current TakeBacks are the follow-up, as
-// on main.
-func (s *session) questionLocked(room voice.RoomView) (question string, silent bool) {
-	if room.Revision != 0 && room.Revision < s.lastAppliedRevision {
-		return "", true
-	}
-	s.lastAppliedRevision = max(s.lastAppliedRevision, room.Revision)
-	noCancelSince := room.TakeBacks == s.lastDelegationTakeBacks
-	s.lastDelegationTakeBacks = room.TakeBacks
-	heard := strings.TrimSpace(s.sinceAsk.String())
-	s.sinceAsk.Reset()
-	asker := strings.TrimSpace(room.Asker)
-	fresh := heard != "" && noCancelSince
-	wasAsked := s.asked
-	s.asked = true
-	switch {
-	case fresh && !wasAsked && asker != "" && !strings.Contains(words(heard), words(asker)):
-		// GPT-Live's first heard turn extends, rather than replaces, the
-		// wake's asker words (the ordinary main behavior).
-		s.vendorWords = heard
-		return strings.TrimSpace(asker + " " + heard), false
-	case fresh:
-		s.vendorWords = heard
-		return heard, false
-	case asker != "":
-		return asker, false
-	case noCancelSince && s.vendorWords != "":
-		return s.vendorWords, false
-	}
-	// With no take-back, a delegation that heard nothing asks the meeting's
-	// last line, so a question never goes out empty (main parity). After a
-	// take-back that left no question, it completes silently instead.
-	if noCancelSince {
-		for i := len(room.Recent) - 1; i >= 0; i-- {
-			if question := strings.Join(strings.Fields(room.Recent[i].Text), " "); question != "" {
-				return question, false
-			}
+// resolveQuestion is delegation id's question, taken only from the room
+// (Exchange.Room); GPT-Live's own transcript is never question text (Main,
+// after Sol's eighteenth review of #191). When the room has no current asker
+// it waits, bounded by roomWait, for the next local final of this exchange,
+// so a follow-up the room says reaches the tool. It returns ok false, after
+// completing the delegation silently, when the exchange ended (RoomView.Live
+// false), a newer delegation already applied a later revision, or no asker
+// arrives within the bound. There is no history or vendor-word fallback: with
+// no outstanding question a retry stays silent.
+func (s *session) resolveQuestion(id string) (question string, room voice.RoomView, ok bool) {
+	deadline := time.Now().Add(roomWait)
+	for {
+		room = s.room()
+		if s.x.Room != nil && !room.Live {
+			s.completeSilently(id)
+			return "", room, false
+		}
+		s.mu.Lock()
+		stale := room.Revision != 0 && room.Revision < s.lastAppliedRevision
+		if !stale {
+			s.lastAppliedRevision = max(s.lastAppliedRevision, room.Revision)
+		}
+		s.mu.Unlock()
+		if stale {
+			s.completeSilently(id)
+			return "", room, false
+		}
+		if asker := strings.TrimSpace(room.Asker); asker != "" {
+			return s.sinceLastAsked(asker), room, true
+		}
+		if s.x.Room == nil || !time.Now().Before(deadline) {
+			s.completeSilently(id)
+			return "", room, false
+		}
+		select {
+		case <-time.After(roomPoll):
+		case <-s.ctx.Done():
+			return "", room, false
 		}
 	}
-	return "", true
 }
+
+// sinceLastAsked is what the room has said since the last delegation this
+// session answered. A driving voice keeps one turn for the whole exchange
+// (the Supervisor opens no follow-up turn for it), so the room's asker grows
+// by each new final and still holds a question already answered. Asking the
+// appended words alone keeps a follow-up from carrying the answered question
+// back to the Concierge, while a retry with nothing new replays the asker
+// whole, as the room said it. Only room words are kept here: GPT-Live's
+// transcript is never question text.
+func (s *session) sinceLastAsked(asker string) string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	question := asker
+	if s.lastAsked != "" && strings.HasPrefix(asker, s.lastAsked) {
+		if rest := strings.TrimSpace(asker[len(s.lastAsked):]); rest != "" {
+			question = rest
+		}
+	}
+	s.lastAsked = asker
+	return question
+}
+
 func words(s string) string {
 	return strings.Join(strings.FieldsFunc(strings.ToLower(s), func(r rune) bool {
 		return !unicode.IsLetter(r) && !unicode.IsDigit(r)
 	}), " ")
 }
 
-// answer runs the answer tool for call and returns its result on the
-// delegation.
+// silentInstruction directs the model to say nothing for a withdrawn
+// delegation. A thinking append cancels the automatic acknowledgement but
+// confirms context delivery, not silence (OpenAI's live-delegation guide),
+// so completeSilently also sends this session instruction.
+const silentInstruction = "There is nothing to report for that request. Do not say anything; wait for the next thing the room says."
 
-const withdrawnQuestion = "The question was withdrawn. Do not say anything."
-
-// completeSilently completes a live delegation whose room question was
-// withdrawn, with thinking only: no tool call and no commentary or spoken
-// line. An empty AnswerResult would make deliver send nothingFound instead.
+// completeSilently ends delegation id with no speech: its room question was
+// withdrawn or never arrived. It cancels the delegation's pending automatic
+// acknowledgement with an empty thinking append (the documented way), then
+// directs the model to stay silent with a session instruction. The Supervisor
+// plays only what it forwards, so a stray word reaches no one; the real-vendor
+// probe records whether this ends the call with no speech and no retry.
 func (s *session) completeSilently(id string) {
-	result, err := json.Marshal(voice.AnswerResult{Context: withdrawnQuestion})
-	if err != nil {
+	if err := s.appendAll(s.ctx, &id, []appendItem{{typ: evThinkingAppend, content: ""}}); err != nil {
+		if s.ctx.Err() == nil {
+			s.log.Warn("gptlive: acknowledge a withdrawn delegation", "delegation", id, "error", err)
+		}
 		return
 	}
-	if err := s.deliver(s.ctx, id, result); err != nil && s.ctx.Err() == nil {
-		s.log.Warn("gptlive: complete a withdrawn delegation", "delegation", id, "error", err)
+	if err := s.appendAll(s.ctx, nil, []appendItem{{typ: evInstructionsAppend, content: silentInstruction}}); err != nil && s.ctx.Err() == nil {
+		s.log.Warn("gptlive: direct silence on a withdrawn delegation", "delegation", id, "error", err)
 	}
 }
 func (s *session) answer(call voice.ToolCall) {

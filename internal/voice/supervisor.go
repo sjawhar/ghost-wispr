@@ -1850,6 +1850,10 @@ func (s *Supervisor) turnLocked(ex *exchange, t *Transcript, words string) {
 	endpoint := t.IsFinal && t.SpeechFinal && ex.endsTurn(t.endsAt())
 	words = strings.TrimSpace(words)
 	if t.IsFinal {
+		// The new final supersedes the pending interim: a take-back counted
+		// on the final must not also see the interim's obsolete copy
+		// (finding 5, Sol's eighteenth review of #191).
+		ex.interim = ""
 		if words != "" {
 			ex.turn = append(ex.turn, words)
 			ex.roomRevision++
@@ -1868,7 +1872,6 @@ func (s *Supervisor) turnLocked(ex *exchange, t *Transcript, words string) {
 			}
 			s.noteTakeBackLocked(ex)
 		}
-		ex.interim = ""
 		ex.turnFinal = true
 		if ex.drives {
 			ex.times.lastTurnEnd = time.Now()
@@ -3060,7 +3063,7 @@ func (s *Supervisor) roomOf(ex *exchange) func() RoomView {
 		if asker := s.askerNowLocked(ex); asker != "" {
 			x.AskerTurn = asker
 		}
-		return RoomView{Asker: x.AskerTurn, Recent: x.Recent, Revision: ex.roomRevision, TakeBacks: ex.takeBacks}
+		return RoomView{Live: true, Asker: x.AskerTurn, Recent: x.Recent, Revision: ex.roomRevision, TakeBacks: ex.takeBacks}
 	}
 }
 
