@@ -493,8 +493,9 @@ $before
 after
 $(pi_tree)"
 [[ ! -s $log/systemctl ]] || fail "the driver ran systemctl: $(<"$log/systemctl")"
-grep -qx 'BatchMode=yes' "$log/ssh-options" && grep -q '^ConnectTimeout=' "$log/ssh-options" \
-  || fail "the driver's ssh has no BatchMode=yes and ConnectTimeout: $(cat -- "$log/ssh-options" 2>/dev/null)"
+if ! grep -qx 'BatchMode=yes' "$log/ssh-options" || ! grep -q '^ConnectTimeout=' "$log/ssh-options"; then
+  fail "the driver's ssh has no BatchMode=yes and ConnectTimeout: $(cat -- "$log/ssh-options" 2>/dev/null)"
+fi
 
 # S1's control: the Pi has the old commit and the old rule text, and the latest release changes a
 # recording rule. Check 1 (the commit) and check 2 (the rule text) both print FAIL in the one run;

@@ -88,6 +88,7 @@ readonly BOOTSTRAP_FILES=(ghost-wispr-update-launcher.sh ghost-wispr-update.serv
 # on a password prompt.
 readonly SSH_OPTIONS=(-o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=4)
 pi() { ssh -n "${SSH_OPTIONS[@]}" "$PI" "$@"; }
+# shellcheck disable=SC2029 # The driver builds each remote command here; the Pi's shell runs it.
 pi_in() { ssh "${SSH_OPTIONS[@]}" "$PI" "$@"; }
 
 tmp=$(mktemp -d)
