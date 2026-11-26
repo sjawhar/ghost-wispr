@@ -384,7 +384,11 @@ case ${1:-} in
     if [[ -f $deploy/ghost-wispr ]]; then
       cp -- "$deploy/ghost-wispr" "$state/running-image"
     fi
-    /bin/date -u '+%a %Y-%m-%d %H:%M:%S.%6N UTC' >"$state/main-start"
+    # The start's time from bash's clock, formatted here: uutils date (Ubuntu 26.04's date) prints
+    # %6N wrong for a fraction under 0.1 s.
+    now=$EPOCHREALTIME
+    printf '%s.%s UTC\n' "$(/bin/date -u -d "@${now%[.,]*}" '+%a %Y-%m-%d %H:%M:%S')" "${now#*[.,]}" >"$state/main-start"
+    printf '%s\n' "${now//[!0-9]/}" >"$state/main-start.us"
     touch -- "$state/active"
     "${TEST_FAKES:?}/after" restart
     case $(cat -- "$state/restart-$n" 2>/dev/null || echo ok) in
@@ -807,18 +811,27 @@ new_pi() {
   echo 1000 >"$state/clock"
 }
 
+# set_recorder_start SECONDS MICROSECONDS notes that time, MICROSECONDS as six digits, as the start
+# of the recorder's main process: $state/main-start as systemctl --timestamp=us+utc prints it, and
+# $state/main-start.us in microseconds. The fraction is written here, not with date's %6N, which
+# uutils date (Ubuntu 26.04's date) prints wrong for a fraction under 0.1 s.
+set_recorder_start() {
+  printf '%s.%s UTC\n' "$(date -u -d "@$1" '+%a %Y-%m-%d %H:%M:%S')" "$2" >"$state/main-start"
+  printf '%s%s\n' "$1" "$2" >"$state/main-start.us"
+}
+
 # mark_recorder_started notes now as the start of the recorder's main process, as the fake restart
 # does: each file written before is one it started on.
 mark_recorder_started() {
-  date -u '+%a %Y-%m-%d %H:%M:%S.%6N UTC' >"$state/main-start"
+  local now=$EPOCHREALTIME
+  set_recorder_start "${now%[.,]*}" "${now#*[.,]}"
 }
 
 # written_after_start FILE... gives each FILE the time 1 ms after the recorder's start, as a file that
 # an update installed and then never restarted the recorder for. Any later restart is later still.
 written_after_start() {
   local start
-  start=$(date -u -d "$(<"$state/main-start")" +%s%6N)
-  start=$((start + 1000))
+  start=$(($(<"$state/main-start.us") + 1000))
   touch -d "@${start:0:-6}.${start: -6}" -- "$@"
 }
 
@@ -2121,6 +2134,28 @@ expect_installed_is "$what, then no answer" "$work_dir/before-b" device.crt devi
 # writes the secret lines pi-secrets gives, as each start does (R9).
 [[ $(grep '^start-pre ' "$state/systemctl.log" | tail -n1) == "start-pre env=$(sha "$work_dir/before-b/.env")" ]] \
   || fail "$what, then no answer: .env was not its .prev copy when the rollback's restart began: $(<"$state/systemctl.log")"
+# The start and the file times 0.05 s into one second: update.sh compares them to the microsecond,
+# so a .env 1 ms after the start restarts the recorder, and one 1 ms before it does not. Break it
+# catches: a reading of the times through date's %6N, which uutils date (Ubuntu 26.04's date, and
+# the GitHub runner's) prints wrong for a fraction under 0.1 s: there both read as the whole second.
+in_one_second() {
+  local second
+  new_pi
+  install_set b
+  second=$((${EPOCHREALTIME%[.,]*} - 100))
+  set_recorder_start "$second" 050000
+  touch -d "@$((second - 1)).000000" -- "$opt/device.crt"
+  touch -d "@$second.$1" -- "$opt/.env"
+  release=b run_update
+}
+in_one_second 051000
+expect_run 'secrets-only-change, .env 1 ms after the start, 0.05 s into its second' 0 \
+  "ghost-wispr update: already current at commit $commit_b" 'ghost-wispr update: the recorder started before the installed .env; restarting it'
+[[ $(restarts) == 1 ]] || fail "secrets-only-change, .env 1 ms after the start: restarted the recorder $(restarts) times, want 1"
+in_one_second 049000
+expect_run 'secrets-only-change, .env 1 ms before the start, 0.05 s into its second' 0 "ghost-wispr update: already current at commit $commit_b"
+expect_no_output 'secrets-only-change, .env 1 ms before the start' 'restarting it'
+[[ $(restarts) == 0 ]] || fail "secrets-only-change, .env 1 ms before the start: restarted a recorder that started on it"
 
 begin secrets-read-fails
 # secrets-read-fails: pi-secrets fails (Secret Manager down, or a grant gone): .env keeps the secret
