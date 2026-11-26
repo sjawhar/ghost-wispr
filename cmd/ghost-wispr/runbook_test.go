@@ -227,7 +227,7 @@ func TestRunbookSaysTheSecretsHoldThePisOwnValues(t *testing.T) {
 		}
 	}
 	words := strings.Join(strings.Fields(readRunbook(t)), " ")
-	for _, stale := range []string{"agent-tokens", "ghost-wispr-office-pi-secret-manager", "whoami", "mints a new", "mint it into its secret", "DISPATCH_TOKEN_FILE", "revoke the old token", "the recorder started at <time>"} {
+	for _, stale := range []string{"/api/v1/me/", "whoami", "mints a new", "mint it into its secret", "DISPATCH_TOKEN_FILE", "revoke the old token", "the recorder started at <time>"} {
 		if strings.Contains(words, stale) {
 			t.Errorf("the runbook still mints, checks or revokes a Dispatch token: %q", stale)
 		}
