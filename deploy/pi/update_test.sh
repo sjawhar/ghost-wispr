@@ -2423,6 +2423,37 @@ expect_line_like 'certificate, the recorder does not answer' 'ghost-wispr update
 [[ $(<"$opt/device.crt") == 'INSTALLED CERTIFICATE' ]] || fail 'certificate, the recorder does not answer: did not put the old certificate back'
 cmp -s -- <(printf '1\n') "$opt/device.crt.version" || fail 'certificate, the recorder does not answer: did not put device.crt.version back'
 [[ $(restarts) == 2 ]] || fail "certificate, the recorder does not answer: want the rollback's restart: $(<"$state/systemctl.log")"
+# The first renewal on a Pi with no device.crt.version, as provision.sh --certificate leaves it:
+# device.crt and its version file are kept and swapped together, so device.crt.prev with no
+# device.crt.version.prev means the Pi had no version file. Putting the Pi back removes the version
+# file that run installed: a rollback after a recorder that does not answer, and a session that
+# starts during the swap, which leaves the Pi as it was and exits 0 (R7). Breaks they catch: a
+# rollback that leaves device.crt.version naming the certificate it took back, so pi-secrets takes
+# the failed certificate as installed and never stages it again; a restore that counts the version
+# file as a file it could not restore, so the busy run exits 10.
+new_pi
+install_set b
+printf 'NEW CERTIFICATE\n' >"$state/certificate"
+touch -- "$state/version-mute.after-restart"
+release=b run_update
+what='certificate, no version file before, the recorder does not answer'
+expect_run "$what" 10
+expect_line_like "$what" 'ghost-wispr update: .*; restored the previous release'
+expect_no_output "$what" 'no previous release to restore'
+[[ $(<"$opt/device.crt") == 'INSTALLED CERTIFICATE' && ! -e $opt/device.crt.version ]] \
+  || fail "$what: device.crt is [$(<"$opt/device.crt")], device.crt.version $(cat -- "$opt/device.crt.version" 2>/dev/null || echo missing); want the old certificate and no version file"
+[[ $(restarts) == 2 ]] || fail "$what: want the rollback's restart: $(<"$state/systemctl.log")"
+new_pi
+install_set b
+printf 'NEW CERTIFICATE\n' >"$state/certificate"
+# The run's first read and the read just before the swap find the Pi free; the next one, busy.
+printf '%s\n' IDLE IDLE SESSION >"$state/status"
+release=b run_update
+what='certificate, no version file before, a session during the swap'
+expect_run "$what" 0 'ghost-wispr update: active session; leaving the current release in place'
+[[ $(restarts) == 0 ]] || fail "$what: restarted the recorder: $(<"$state/systemctl.log")"
+[[ $(<"$opt/device.crt") == 'INSTALLED CERTIFICATE' && ! -e $opt/device.crt.version ]] \
+  || fail "$what: device.crt is [$(<"$opt/device.crt")], device.crt.version $(cat -- "$opt/device.crt.version" 2>/dev/null || echo missing); want the old certificate and no version file"
 # release-and-certificate: a certificate staged while a release installs goes in with the set, and
 # the release's one restart serves both (R11); when that release's version check fails, the old
 # certificate comes back with the old set.
@@ -2452,6 +2483,19 @@ expect_installed_is 'release-and-certificate, a release that fails' "$work_dir/b
 [[ $(<"$opt/device.crt") == 'INSTALLED CERTIFICATE' ]] || fail 'a release that fails: did not restore device.crt with the set'
 expect_installed_is 'release-and-certificate, a release that fails' "$work_dir/before-a" device.crt.version
 [[ $(restarts) == 2 ]] || fail "a release that fails: want the install's and the rollback's restarts: $(<"$state/systemctl.log")"
+# The same with no device.crt.version before, as the office Pi's first renewal may come with a
+# release: the rollback removes the version file the release's swap installed (see certificate).
+new_pi
+install_set a
+save_installed "$work_dir/before-a"
+printf 'NEW CERTIFICATE\n' >"$state/certificate"
+release=broken run_update
+what='release-and-certificate, no version file before, a release that fails'
+expect_run "$what" 10
+expect_no_output "$what" 'no previous release to restore'
+expect_installed_is "$what" "$work_dir/before-a"
+[[ $(<"$opt/device.crt") == 'INSTALLED CERTIFICATE' && ! -e $opt/device.crt.version ]] \
+  || fail "$what: device.crt is [$(<"$opt/device.crt")], device.crt.version $(cat -- "$opt/device.crt.version" 2>/dev/null || echo missing); want the old certificate and no version file"
 # A certificate goes back from device.crt.prev only to undo the run's own swap of it. A refresh of
 # the release the Pi runs installed C1, with C0, the certificate before it, as device.crt.prev; then
 # a newer release fails its version check, from a set that deploy.verified lists, and from one it
