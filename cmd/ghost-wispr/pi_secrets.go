@@ -21,6 +21,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/sjawhar/ghost-wispr/internal/config"
 	"github.com/sjawhar/ghost-wispr/internal/googleauth"
 )
 
@@ -61,6 +62,21 @@ type environmentSecret struct {
 	secret   string
 	value    []byte
 	version  int
+}
+
+// runPiSecretsCommand is ghost-wispr pi-secrets as main runs it. It reads the
+// config at configPath for google_credentials_file only when --credentials is
+// absent, reads Secret Manager over HTTPS, and checks a candidate certificate
+// by a real sign-in.
+func runPiSecretsCommand(ctx context.Context, args []string, stdout io.Writer, configPath string) int {
+	defaultCredentials := func() (string, error) {
+		cfg, _, err := config.Load(configPath)
+		if err != nil {
+			return "", err
+		}
+		return cfg.GoogleCredentialsFile, nil
+	}
+	return runPiSecrets(ctx, args, stdout, defaultCredentials, newSecretManagerReader, productionSignInCheck)
 }
 
 // runPiSecrets reads the requested deployment secrets without printing their

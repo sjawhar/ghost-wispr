@@ -995,24 +995,7 @@ func main() {
 		return
 	}
 	if len(os.Args) > 1 && os.Args[1] == "pi-secrets" {
-		exitCode := runPiSecrets(
-			context.Background(),
-			os.Args[1:],
-			os.Stdout,
-			func() (string, error) {
-				cfg, _, err := config.Load(configPath)
-				if err != nil {
-					return "", err
-				}
-				return cfg.GoogleCredentialsFile, nil
-			},
-			newSecretManagerReader,
-			productionSignInCheck,
-		)
-		if exitCode != 0 {
-			os.Exit(exitCode)
-		}
-		return
+		os.Exit(runPiSecretsCommand(context.Background(), os.Args[1:], os.Stdout, configPath))
 	}
 	if len(os.Args) > 1 && os.Args[1] == "seed-paused-state" {
 		if len(os.Args) != 2 {
