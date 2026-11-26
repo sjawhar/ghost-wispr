@@ -240,13 +240,19 @@ func TestADelegationRunsTheAnswerToolAndSpeaksItsResult(t *testing.T) {
 		t.Errorf("the tool ran %+v, not the call the session reported", run)
 	}
 
+	// The delegation's automatic acknowledgement is cancelled as it arrives
+	// (suppressAck), so an empty thinking append on item_1 comes first.
+	ack := c.next()
 	thinking := c.next()
 	commentary := c.next()
+	if ack.Type != evThinkingAppend || ack.DelegationID == nil || *ack.DelegationID != "item_1" || ack.Content != "" {
+		t.Errorf("first append %s, want the acknowledgement cancelled on item_1", ack.raw)
+	}
 	if thinking.Type != evThinkingAppend || thinking.DelegationID == nil || *thinking.DelegationID != "item_1" || thinking.Content != "The holder is the recorder agent, live." {
-		t.Errorf("first append %s, want the result's silent context on item_1", thinking.raw)
+		t.Errorf("second append %s, want the result's silent context on item_1", thinking.raw)
 	}
 	if commentary.Type != evCommentaryAppend || commentary.DelegationID == nil || *commentary.DelegationID != "item_1" || commentary.Content != "ABC-123 is in review, and PR 42 waits on CI." {
-		t.Errorf("second append %s, want the result to say on item_1", commentary.raw)
+		t.Errorf("third append %s, want the result to say on item_1", commentary.raw)
 	}
 }
 

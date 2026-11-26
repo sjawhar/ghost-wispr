@@ -915,10 +915,14 @@ func (s *session) onDelegation(ev *serverEvent) {
 }
 
 // ask builds delegation id's question from the room, then reports the tool
-// call and runs it. resolveQuestion is the only wait; the user-turn record is
-// flushed once a question is in hand.
+// call and runs it. It first cancels GPT-Live's automatic acknowledgement,
+// which otherwise plays while the question is resolved: the real-vendor probe
+// of 2026-11-26 heard "I'll check on that." in the room because nothing was
+// sent until the silent ending, two seconds later. resolveQuestion is the
+// only wait; the user-turn record is flushed once a question is in hand.
 func (s *session) ask(id string) {
 	defer s.wg.Done()
+	s.suppressAck(id)
 	question, room, ok := s.resolveQuestion(id)
 	if !ok {
 		return
@@ -1024,23 +1028,50 @@ func words(s string) string {
 // so completeSilently also sends this session instruction.
 const silentInstruction = "There is nothing to report for that request. Do not say anything; wait for the next thing the room says."
 
-// completeSilently ends delegation id with no speech: its room question was
-// withdrawn or never arrived. It cancels the delegation's pending automatic
-// acknowledgement with an empty thinking append (the documented way), then
-// directs the model to stay silent with a session instruction. The Supervisor
-// plays only what it forwards, so a stray word reaches no one; the real-vendor
-// probe records whether this ends the call with no speech and no retry.
-func (s *session) completeSilently(id string) {
-	if err := s.appendAll(s.ctx, &id, []appendItem{{typ: evThinkingAppend, content: ""}}); err != nil {
+// suppressAck cancels delegation id's pending automatic acknowledgement with
+// an empty thinking append, the way OpenAI's live-delegation guide documents
+// ("Suppress automatic acknowledgments while tools run"). It is sent as the
+// delegation arrives, before the question is resolved: the Supervisor says
+// its own routing line, and on 2026-11-26 the real vendor spoke "I'll check
+// on that." into the room in the two seconds a withdrawn delegation took to
+// reach its silent ending. The guide allows more updates for the same
+// delegation afterwards, so this never closes it. The frame goes out in
+// order, before any result, but its acknowledgement is awaited in the
+// background: a server slow to acknowledge must not hold up the answer.
+func (s *session) suppressAck(id string) {
+	eventID, ack := s.track()
+	if err := s.send(contextAppend{Type: evThinkingAppend, EventID: eventID, DelegationID: &id, Content: ""}); err != nil {
+		s.resolve(eventID, nil)
 		if s.ctx.Err() == nil {
-			s.log.Warn("gptlive: acknowledge a withdrawn delegation", "delegation", id, "error", err)
+			s.log.Warn("gptlive: cancel a delegation's automatic acknowledgement", "delegation", id, "error", err)
 		}
 		return
 	}
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		select {
+		case err := <-ack:
+			if err != nil && s.ctx.Err() == nil {
+				s.log.Warn("gptlive: cancel a delegation's automatic acknowledgement", "delegation", id, "error", err)
+			}
+		case <-s.ctx.Done():
+		}
+	}()
+}
+
+// completeSilently ends delegation id with no speech: its room question was
+// withdrawn or never arrived. ask has already cancelled the delegation's
+// automatic acknowledgement (suppressAck), so this directs the model to stay
+// silent with a session instruction. The Supervisor plays only what it
+// forwards, so a stray word reaches no one; the real-vendor probe records
+// whether this ends the call with no speech and no retry.
+func (s *session) completeSilently(id string) {
 	if err := s.appendAll(s.ctx, nil, []appendItem{{typ: evInstructionsAppend, content: silentInstruction}}); err != nil && s.ctx.Err() == nil {
 		s.log.Warn("gptlive: direct silence on a withdrawn delegation", "delegation", id, "error", err)
 	}
 }
+
 func (s *session) answer(call voice.ToolCall) {
 	result, err := s.x.Tools.Run(s.ctx, call)
 	if s.ctx.Err() != nil {

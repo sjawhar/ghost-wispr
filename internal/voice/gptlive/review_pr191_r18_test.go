@@ -79,3 +79,38 @@ func TestADelegationOnALiveOpeningRunsTheTool(t *testing.T) {
 		})
 	}
 }
+
+// TestADelegationCancelsItsAcknowledgementAtOnce guards the real-vendor run of
+// 2026-11-26: a withdrawn delegation reached its silent ending roomWait later,
+// and in that gap GPT-Live spoke its automatic acknowledgement ("I'll check on
+// that.") into the room. The empty thinking append that cancels it must go out
+// as the delegation arrives, well before the question is resolved, whether the
+// room has an asker or not.
+func TestADelegationCancelsItsAcknowledgementAtOnce(t *testing.T) {
+	for _, asker := range []string{"", "what about ABC-42?"} {
+		name := "no asker, the question is still being waited for"
+		if asker != "" {
+			name = "control: the room has an asker"
+		}
+		t.Run(name, func(t *testing.T) {
+			tools := newFakeTools(voice.AnswerResult{Say: "x"})
+			x := testExchange(newFakeOutput(), tools)
+			x.Room = func() voice.RoomView {
+				return voice.RoomView{Live: true, Asker: asker, Revision: 1}
+			}
+			srv := newLiveServer(t)
+			_, c, _ := openSession(t, srv, x)
+
+			begin := time.Now()
+			c.delegate("item_ack")
+			first := c.expect(evThinkingAppend)
+			took := time.Since(begin)
+			if first.DelegationID == nil || *first.DelegationID != "item_ack" || first.Content != "" {
+				t.Fatalf("first frame for the delegation %+v, want an empty thinking append", first)
+			}
+			if took >= roomWait/2 {
+				t.Errorf("the acknowledgement was cancelled %v after the delegation, want well inside roomWait (%v): the vendor speaks in that gap", took, roomWait)
+			}
+		})
+	}
+}

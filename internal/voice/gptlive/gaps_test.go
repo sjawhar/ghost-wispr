@@ -219,6 +219,11 @@ func TestAFailedAnswerToolClosesItsDelegationSilently(t *testing.T) {
 	_, c, _ := openSession(t, srv, testExchange(newFakeOutput(), tools))
 
 	c.delegate("item_f")
+	// The acknowledgement is cancelled as the delegation arrives, then the
+	// failure's silent context follows.
+	if ack := c.next(); ack.Type != evThinkingAppend || ack.DelegationID == nil || *ack.DelegationID != "item_f" || ack.Content != "" {
+		t.Fatalf("first append %s, want the acknowledgement cancelled on item_f", ack.raw)
+	}
 	ev := c.next()
 	if ev.Type != evThinkingAppend || ev.DelegationID == nil || *ev.DelegationID != "item_f" || ev.Content != lookupFailed {
 		t.Fatalf("append %s, want silent context on item_f that the lookup failed", ev.raw)
