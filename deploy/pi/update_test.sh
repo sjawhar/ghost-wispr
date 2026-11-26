@@ -1645,17 +1645,23 @@ rolled_back 'a new release that answers idle again' $'sleep 120\nsleep 120'
 restart_fails fail-stop STOPPED
 rolled_back 'a new release whose unit stopped' ''
 # The version check needs a status too: within the same 120 s, /api/status answers a status whose
-# call is absent or an object with a state, whether or not a session is in progress. A new release
-# that answers its commit, but whose status holds a call that is not an object, or an object with no
-# state, with no session or during one, or whose /api/status fails, is rolled back: every file back,
-# and deploy.verified as it was. Breaks they catch: a check of /api/version alone, so deploy.verified
-# names a release whose state no later run can read, and each later run stops at its first status
-# read (a call it cannot read is busy, a status that fails a failure) before it could install a fix;
-# a check that reads the session first, as busy_reason does, and so never reads the call while a
-# session is in progress.
+# call is absent or an object whose state is none, checking or live (INFRA-5904's status contract),
+# whether or not a session is in progress. A new release that answers its commit, but whose status
+# holds a call that is not an object, an object with no state, a state that is empty, not in that
+# list or not a string, with no session or during one, or whose /api/status fails, is rolled back:
+# every file back, and deploy.verified as it was. Breaks they catch: a check of /api/version alone,
+# so deploy.verified names a release whose state no later run can read, and each later run stops at
+# its first status read (a call it cannot read is busy, a status that fails a failure) before it
+# could install a fix; a check that reads the session first, as busy_reason does, and so never reads
+# the call while a session is in progress; a check that takes any string as a state, so a release
+# whose call reports a state no consumer knows verifies.
 for answer in '{"paused":false,"capture_state":"capturing","active_session_id":"","call":"live"}|a call that is not an object' \
   '{"paused":false,"capture_state":"recording","active_session_id":"session-1","call":"live"}|a session and a call that is not an object' \
   '{"paused":false,"capture_state":"recording","active_session_id":"session-1","call":{"link_versions":[1]}}|a session and a call with no state' \
+  '{"paused":false,"capture_state":"capturing","active_session_id":"","call":{"state":""}}|a call whose state is empty' \
+  '{"paused":false,"capture_state":"capturing","active_session_id":"","call":{"state":"ringing"}}|a call whose state is not in the list' \
+  '{"paused":false,"capture_state":"recording","active_session_id":"session-1","call":{"state":"ringing"}}|a session and a call whose state is not in the list' \
+  '{"paused":false,"capture_state":"recording","active_session_id":"session-1","call":{"state":1}}|a session and a call whose state is not a string' \
   'UNREADABLE|a failing /api/status'; do
   what="rollback-whole-set (a new release that answers its commit, with ${answer#*|})"
   new_pi
@@ -1670,10 +1676,12 @@ for answer in '{"paused":false,"capture_state":"capturing","active_session_id":"
   expect_installed_is "$what" "$work_dir/before-a"
   cmp -s -- "$work_dir/verified-a" "$opt/deploy.verified" || fail "$what: changed deploy.verified"
 done
-# Controls: a recorder that answers a session once it runs the new release, with no call, or with a
-# call that is an object with a state, gives a status the update reads, and the release verifies.
+# Controls: a recorder that answers, once it runs the new release, a session with no call, a session
+# with a live call, or a call that is checking, gives a status the update reads, and the release
+# verifies. (A call that is none verifies in busy-call's control.)
 for answer in 'SESSION|a session and no call' \
-  '{"paused":false,"capture_state":"recording","active_session_id":"session-1","call":{"state":"live","link_versions":[1]}}|a session and a call with a state'; do
+  '{"paused":false,"capture_state":"recording","active_session_id":"session-1","call":{"state":"live","link_versions":[1]}}|a session and a live call' \
+  '{"paused":false,"capture_state":"capturing","active_session_id":"","call":{"state":"checking"}}|a call that is checking'; do
   new_pi
   install_set a
   printf '%s\n' "${answer%%|*}" >"$state/status.after-restart"
