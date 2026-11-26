@@ -222,8 +222,10 @@ for key in envoy_webhook_url envoy_webhook_secret_name; do
 done
 assert_count '__[A-Z_]*__' 0 "$template"
 
+# The sentence can wrap in the runbook, so each line break reads as a space.
 for file in "$provisioner" "$test_root/docs/pi-setup.md"; do
-  grep -Fq -- 'Settings saved on the page stay in the local settings file' "$file" \
+  text=$(tr -s '\n' ' ' <"$file") || fail "cannot read $file"
+  [[ $text == *'Settings saved on the page stay in the local settings file'* ]] \
     || fail "$file does not say settings saved on the page stay in the local settings file"
 done
 
