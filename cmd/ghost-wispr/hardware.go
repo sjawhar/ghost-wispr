@@ -128,6 +128,7 @@ func runLightState(stdout io.Writer) error {
 const commandsUsage = `usage: ghost-wispr [SUBCOMMAND]
 With no subcommand, ghost-wispr runs the recorder. Subcommands:
   google-id-token    print a Google ID token for --audience AUDIENCE, signed in by google_credentials_file or --credentials FILE
+  pi-secrets         read named deployment secrets and a newer device certificate from Secret Manager
   seed-paused-state  save capture as paused in the recorder's database, and print the database's path
   tts-first-audio    time each sentence on stdin to its first text-to-speech audio (--model, --voice, --clip)
   issue-holder KEY   print the Concierge's issue_holder answer for Dispatch issue KEY
