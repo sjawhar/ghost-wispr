@@ -14,11 +14,10 @@
 #                    API access token read into its environment alone
 #   deepgram-key     on a person's own device, in a checkout: add the Deepgram key, read without
 #                    showing it, as a version of its Secret Manager secret
-#   dispatch-token   on a person's own device, in a checkout: mint the Pi's Dispatch token and add it
-#                    as a version of its Secret Manager secret
+#   dispatch-token   on a person's own device, in a checkout: add a Dispatch token, read without
+#                    showing it, as a version of its Secret Manager secret
 #   token-check      on a person's own device, in a checkout: the hashes of the Pi's token and the
-#                    secret's, the recorder's last start of this boot after .env was written, and
-#                    Dispatch's whoami with the Pi's token
+#                    secret's latest version
 #   running-settings on a person's own device, in a checkout: mic_device and jabra_mute_button as
 #                    the recorder runs them, from its environment, the local settings file or the
 #                    installed config
@@ -31,8 +30,8 @@
 # of a release block passes no argument or a flag of provision.sh's case statement. The release
 # directory and the published files are what deploy/pi/build-deploy-tarball.sh writes. The blocks
 # read the neutral deployment settings in deploy/pi/test-pi.env. The fakes stand in for GitHub, the
-# Pi's ip, tailscale, sudo and recorder, the Tailscale API, Dispatch, Secret Manager and the driver,
-# so a pass does not show that a procedure works on the Pi.
+# Pi's ip, tailscale and recorder, the Tailscale API, Secret Manager and the driver, so a pass does
+# not show that a procedure works on the Pi.
 set -euo pipefail
 
 repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -429,123 +428,105 @@ if [[ $route_step_exit == 0 ]] || grep -qx true "$work_dir/routes-set-failed/out
   fail "the route block reported success although tailscale set failed: $(<"$work_dir/routes-set-failed/out")"
 fi
 
-# --- dispatch-token: on a person's own device, in a checkout.
+# --- deepgram-key and dispatch-token: on a person's own device, in a checkout.
 
-# The neutral settings the block reads, which the fakes check its calls against.
+# The neutral settings the blocks read, which the fakes check their calls against.
 # shellcheck source=/dev/null
 source "$test_env"
-export PI_DISPATCH_URL PI_GCP_PROJECT PI_DISPATCH_TOKEN_SECRET
-readonly DISPATCH_SECRET=dispatch-token-secret-value-0123456789abcdef
-readonly OPERATOR_DISPATCH_SECRET=operator-dispatch-secret-value-0123456789abcdef
-readonly TOKEN_NAME=ghost-wispr-office-pi-secret-manager
-export DISPATCH_SECRET OPERATOR_DISPATCH_SECRET TOKEN_NAME
+export PI_GCP_PROJECT PI_DEEPGRAM_SECRET PI_DISPATCH_TOKEN_SECRET
+# The values a person types, and the names of the .env lines the Pi holds them in. No value is a
+# real credential.
+readonly deepgram_value=test-value-of-the-deepgram-setting dispatch_value=test-value-of-the-dispatch-setting
+readonly dispatch_variable=GHOST_WISPR_DISPATCH_TOKEN deepgram_variable=GHOST_WISPR_DEEPGRAM_API_KEY
+declare -A secret_of=([deepgram-key]=$PI_DEEPGRAM_SECRET [dispatch-token]=$PI_DISPATCH_TOKEN_SECRET)
+declare -A value_of=([deepgram-key]=$deepgram_value [dispatch-token]=$dispatch_value)
 
-mkdir -p "$work_dir/bin"
-# curl answers as Dispatch does to the mint of an agent token, whose answer is the one place the new
-# token shows: only for the person's own token, given as a header on stdin, and only for a no-scope
-# token named TOKEN_NAME. TEST_MINT_TOKEN replaces the token in the answer.
-cat >"$work_dir/bin/curl" <<'EOF'
-#!/usr/bin/env bash
-set -euo pipefail
-printf 'curl %s\n' "$*" >>"$TEST_ARGV_LOG"
-args=("$@")
-data=''
-for ((i = 0; i < ${#args[@]} - 1; i++)); do
-  [[ ${args[i]} != --data ]] || data=${args[i + 1]}
-done
-[[ ${args[-1]} == "$PI_DISPATCH_URL/api/v1/me/agent-tokens" ]] || { printf 'fake curl: unexpected URL %s\n' "${args[-1]}" >&2; exit 2; }
-[[ " $* " == *' -H @- '* && " $* " =~ \ -[A-Za-z]*f ]] || { printf 'fake curl: no -f or no header on stdin: %s\n' "$*" >&2; exit 2; }
-jq -e --arg name "$TOKEN_NAME" '. == {name: $name, scopes: []}' >/dev/null 2>&1 <<<"$data" \
-  || { printf 'fake curl: the mint asks for %s, not a no-scope token named %s\n' "$data" "$TOKEN_NAME" >&2; exit 2; }
-[[ $(cat) == "Authorization: Bearer $OPERATOR_DISPATCH_SECRET" ]] || { printf 'curl: (22) The requested URL returned error: 401\n' >&2; exit 22; }
-jq -n --arg token "${TEST_MINT_TOKEN-$DISPATCH_SECRET}" --arg name "$TOKEN_NAME" \
-  '{id: "00000000-0000-4000-8000-000000000002", name: $name, prefix: "dispatch", scopes: [], token: $token}'
-EOF
-# gcloud adds a version of the Pi's Dispatch token secret as Secret Manager does, from a file alone:
-# it keeps the file's bytes and mode in $TEST_SECRETS. TEST_GCLOUD_FAIL refuses.
-cat >"$work_dir/bin/gcloud" <<'EOF'
+# gcloud adds a version of one of the Pi's two secrets as Secret Manager does, from a file alone: it
+# records its arguments, refuses an empty file, and keeps the file's bytes and mode in
+# $TEST_SECRETS. TEST_GCLOUD_FAIL refuses every call. curl logs its call and fails: no secret block
+# calls a web API.
+mkdir -p "$work_dir/secret-bin"
+cat >"$work_dir/secret-bin/gcloud" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 printf 'gcloud %s\n' "$*" >>"$TEST_ARGV_LOG"
-[[ $# == 6 && $1 == secrets && $2 == versions && $3 == add && $4 == "$PI_DISPATCH_TOKEN_SECRET" \
+[[ $# == 6 && $1 == secrets && $2 == versions && $3 == add && ($4 == "$PI_DEEPGRAM_SECRET" || $4 == "$PI_DISPATCH_TOKEN_SECRET") \
   && $5 == "--project=$PI_GCP_PROJECT" && $6 == --data-file=* ]] \
   || { printf 'fake gcloud: unexpected call: gcloud %s\n' "$*" >&2; exit 2; }
 [[ -z ${TEST_GCLOUD_FAIL:-} ]] || { printf 'ERROR: (gcloud.secrets.versions.add) PERMISSION_DENIED\n' >&2; exit 1; }
 file=${6#--data-file=}
-[[ -f $file ]] || { printf 'fake gcloud: no file %s\n' "$file" >&2; exit 1; }
-count=$(find "$TEST_SECRETS" -name "$4.*.data" | wc -l)
-version=$((count + 1))
+[[ -s $file ]] || { printf 'ERROR: (gcloud.secrets.versions.add) INVALID_ARGUMENT: the data file %s is empty\n' "$file" >&2; exit 1; }
+version=$(($(find "$TEST_SECRETS" -name "$4.*.data" | wc -l) + 1))
 cp -- "$file" "$TEST_SECRETS/$4.$version.data"
 stat -c %a -- "$file" >"$TEST_SECRETS/$4.$version.mode"
 printf 'Created version [%s] of the secret [%s].\n' "$version" "$4" >&2
 EOF
-chmod +x "$work_dir/bin/"*
+cat >"$work_dir/secret-bin/curl" <<'EOF'
+#!/usr/bin/env bash
+printf 'curl %s\n' "$*" >>"$TEST_ARGV_LOG"
+exit 7
+EOF
+chmod +x "$work_dir/secret-bin/"*
 
-block dispatch-token >"$work_dir/dispatch-token.sh"
-# The person's own Dispatch token, in the file DISPATCH_TOKEN_FILE names.
-(umask 077 && printf '%s\n' "$OPERATOR_DISPATCH_SECRET" >"$work_dir/operator-dispatch-token")
-(umask 077 && printf '%s\n' wrong-operator-token >"$work_dir/wrong-dispatch-token")
-# run_token_step CASE TOKEN_FILE runs the block as a person pastes it, with plain bash, in the
-# checkout, with HOME and TMPDIR in CASE and the token file given second ('' leaves
-# DISPATCH_TOKEN_FILE unset). It keeps the exit status in token_step_exit, the output in
-# <case>/out, the calls in <case>/argv.log, and the secret's versions in <case>/secrets.
-run_token_step() {
-  local case_dir=$1 token_file=$2
-  mkdir -p "$case_dir/home" "$case_dir/tmp" "$case_dir/secrets"
-  : >"$case_dir/argv.log"
-  token_step_exit=0
-  (
-    cd "$repo_root"
-    unset DISPATCH_TOKEN_FILE
-    [[ -z $token_file ]] || export DISPATCH_TOKEN_FILE=$token_file
-    HOME="$case_dir/home" TMPDIR="$case_dir/tmp" GHOST_WISPR_PI_ENV="$test_env" TEST_ARGV_LOG="$case_dir/argv.log" \
-      TEST_SECRETS="$case_dir/secrets" PATH="$work_dir/bin:$PATH" bash "$work_dir/dispatch-token.sh"
-  ) >"$case_dir/out" 2>&1 || token_step_exit=$?
-}
 # versions CASE prints how many versions the block added in CASE.
 versions() { find "$1/secrets" -name '*.data' | wc -l; }
 # left_behind CASE prints each file the block left in CASE's TMPDIR and HOME.
 left_behind() { find "$1/tmp" "$1/home" -mindepth 1 -print; }
-
-run_token_step "$work_dir/token" "$work_dir/operator-dispatch-token"
-token_out=$(<"$work_dir/token/out")
-[[ $token_step_exit == 0 ]] || fail "the dispatch-token block failed: $token_out"
-[[ $(versions "$work_dir/token") == 1 ]] \
-  || fail "the dispatch-token block added $(versions "$work_dir/token") versions of the secret, not 1: $token_out"
-version_file="$work_dir/token/secrets/$PI_DISPATCH_TOKEN_SECRET.1.data"
-cmp -s "$version_file" <(printf '%s' "$DISPATCH_SECRET") || cmp -s "$version_file" <(printf '%s\n' "$DISPATCH_SECRET") \
-  || fail "the secret's new version is not the minted token with at most one final line feed"
-[[ $(<"$work_dir/token/secrets/$PI_DISPATCH_TOKEN_SECRET.1.mode") == 600 ]] \
-  || fail "the token reached gcloud in a file of mode $(<"$work_dir/token/secrets/$PI_DISPATCH_TOKEN_SECRET.1.mode"), not 0600"
-grep -Fqx "{\"id\":\"00000000-0000-4000-8000-000000000002\",\"name\":\"$TOKEN_NAME\",\"scopes\":[]}" <<<"$token_out" \
-  || fail "the dispatch-token block did not print the new token's id, name and scopes: $token_out"
-grep -Fq "Created version [1] of the secret [$PI_DISPATCH_TOKEN_SECRET]" <<<"$token_out" \
-  || fail "the dispatch-token block did not show the version it added: $token_out"
-if grep -F -e "$DISPATCH_SECRET" -e "$OPERATOR_DISPATCH_SECRET" <<<"$token_out" >/dev/null; then
-  fail "the dispatch-token block printed a Dispatch token"
-fi
-[[ -z $(left_behind "$work_dir/token") ]] || fail "the dispatch-token block left files behind: $(left_behind "$work_dir/token")"
-
-# Dispatch refuses the person's token, the mint answers an empty token, the person's token file is
-# not named, or Secret Manager refuses: no version is added, and nothing is left behind.
-for failure in refused empty unnamed gcloud; do
-  case_dir="$work_dir/token-$failure"
-  case $failure in
-    refused) run_token_step "$case_dir" "$work_dir/wrong-dispatch-token" ;;
-    empty) TEST_MINT_TOKEN='' run_token_step "$case_dir" "$work_dir/operator-dispatch-token" ;;
-    unnamed) run_token_step "$case_dir" '' ;;
-    gcloud) TEST_GCLOUD_FAIL=1 run_token_step "$case_dir" "$work_dir/operator-dispatch-token" ;;
-  esac
-  [[ $token_step_exit != 0 ]] || fail "the dispatch-token block succeeded although $failure: $(<"$case_dir/out")"
-  [[ $(versions "$case_dir") == 0 ]] || fail "the dispatch-token block added a version although $failure"
-  [[ -z $(left_behind "$case_dir") ]] || fail "the dispatch-token block left files behind when $failure: $(left_behind "$case_dir")"
+# run_secret_block NAME CASE INPUT runs the block NAME as a person pastes it, with plain bash, in the
+# checkout, with INPUT as what the person types and HOME and TMPDIR in CASE, then prints each shell
+# variable that still holds NAME's value. It keeps the exit status in secret_exit, the output in
+# <case>/out, the calls in <case>/argv.log and the secret's versions in <case>/secrets.
+run_secret_block() {
+  local name=$1 case_dir=$2 input=$3
+  mkdir -p "$case_dir/home" "$case_dir/tmp" "$case_dir/secrets"
+  : >"$case_dir/argv.log"
+  # shellcheck disable=SC2016 # The lines are block text, expanded when the block runs.
+  { block "$name"; printf '%s\n' 'rc=$?' \
+    'for v in $(compgen -v); do [ "$v" = TEST_VALUE ] && continue; case ${!v-} in *"$TEST_VALUE"*) echo "left:$v" ;; esac; done' \
+    'exit "$rc"'; } >"$case_dir/run.sh"
+  secret_exit=0
+  (
+    cd "$repo_root"
+    HOME="$case_dir/home" TMPDIR="$case_dir/tmp" GHOST_WISPR_PI_ENV="$test_env" TEST_ARGV_LOG="$case_dir/argv.log" \
+      TEST_SECRETS="$case_dir/secrets" TEST_VALUE="${value_of[$name]}" PATH="$work_dir/secret-bin:$PATH" \
+      bash "$case_dir/run.sh" <<<"$input"
+  ) >"$case_dir/out" 2>&1 || secret_exit=$?
+}
+for name in deepgram-key dispatch-token; do
+  value=${value_of[$name]} secret_name=${secret_of[$name]} case_dir="$work_dir/$name"
+  run_secret_block "$name" "$case_dir" "$value"
+  [[ $secret_exit == 0 ]] || fail "the $name block failed: $(grep -vF "$value" "$case_dir/out")"
+  [[ $(versions "$case_dir") == 1 ]] || fail "the $name block added $(versions "$case_dir") versions, not 1"
+  cmp -s "$case_dir/secrets/$secret_name.1.data" <(printf '%s' "$value") \
+    || fail "the new version of $secret_name is not the typed value, byte for byte"
+  [[ $(<"$case_dir/secrets/$secret_name.1.mode") == 600 ]] \
+    || fail "the $name block gave gcloud the value in a file of mode $(<"$case_dir/secrets/$secret_name.1.mode"), not 0600"
+  grep -Fq "Created version [1] of the secret [$secret_name]" "$case_dir/out" || fail "the $name block did not show the version it added"
+  if grep -qF "$value" "$case_dir/argv.log" "$case_dir/out"; then
+    fail "the $name block put the value in an argument or in its output"
+  fi
+  [[ -z $(left_behind "$case_dir") ]] || fail "the $name block left files behind: $(left_behind "$case_dir")"
+  # The person types nothing, or Secret Manager refuses: no version, and nothing left behind. An empty
+  # read reaches no gcloud call at all.
+  for failure in empty gcloud; do
+    if [[ $failure == empty ]]; then
+      run_secret_block "$name" "$case_dir-$failure" ''
+    else
+      TEST_GCLOUD_FAIL=1 run_secret_block "$name" "$case_dir-$failure" "$value"
+    fi
+    [[ $secret_exit != 0 ]] || fail "the $name block succeeded although $failure"
+    [[ $(versions "$case_dir-$failure") == 0 ]] || fail "the $name block added a version although $failure"
+    [[ -z $(left_behind "$case_dir-$failure") ]] \
+      || fail "the $name block left files behind when $failure: $(left_behind "$case_dir-$failure")"
+  done
+  ! grep -q '^gcloud ' "$case_dir-empty/argv.log" || fail "the $name block called gcloud with an empty value: $(<"$case_dir-empty/argv.log")"
+  if grep -q '^curl ' "$case_dir"*/argv.log; then
+    fail "the $name block called a web API: $(grep -h '^curl ' "$case_dir"*/argv.log | paste -sd ' ')"
+  fi
+  if grep -q '^left:' "$case_dir"*/out; then
+    fail "the $name block left the value in the shell: $(grep -h '^left:' "$case_dir"*/out | paste -sd ' ')"
+  fi
 done
-if grep -q '^gcloud ' "$work_dir/token-refused/argv.log" "$work_dir/token-empty/argv.log" "$work_dir/token-unnamed/argv.log"; then
-  fail "the dispatch-token block called gcloud with no token to add"
-fi
-if grep -q '^curl ' "$work_dir/token-unnamed/argv.log"; then
-  fail "the dispatch-token block called Dispatch with no token file named"
-fi
 
 # --- accept: on a person's own device, in a checkout.
 
@@ -750,19 +731,16 @@ cmp -s "$work_dir/claim-empty/before.json" "$work_dir/claim-empty/state.json" ||
 
 # --- token-check: on a person's own device, in a checkout.
 
-# ssh reaches the fake Pi: it runs the command with the Pi's .env at $TEST_PI_ENV_FILE and the Pi's
-# curl, sudo and journalctl first on PATH. gcloud prints the latest version of the Pi's Dispatch
-# token secret, $TEST_SECRET_VALUE. The Pi's curl answers as Dispatch's whoami does, for the Pi's
-# token alone, given as a header on stdin. The Pi's journalctl prints $TEST_JOURNAL, the recorder's
-# journal of this boot.
+# ssh reaches the fake Pi: it runs the command with the Pi's .env at $TEST_PI_ENV_FILE. gcloud prints
+# the latest version of the Pi's Dispatch token secret, $TEST_SECRET_VALUE.
 export PI_HOST
-mkdir -p "$work_dir/check-bin" "$work_dir/check-pi-bin"
+mkdir -p "$work_dir/check-bin"
 cat >"$work_dir/check-bin/ssh" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 printf 'ssh %s\n' "$*" >>"$TEST_ARGV_LOG"
 [[ $# == 2 && $1 == "ghost-wispr@$PI_HOST" ]] || { printf 'fake ssh: unexpected call: ssh %s\n' "$*" >&2; exit 255; }
-PATH="$TEST_PI_BIN:$PATH" bash -c "${2//\/opt\/ghost-wispr\/.env/$TEST_PI_ENV_FILE}"
+bash -c "${2//\/opt\/ghost-wispr\/.env/$TEST_PI_ENV_FILE}"
 EOF
 cat >"$work_dir/check-bin/gcloud" <<'EOF'
 #!/usr/bin/env bash
@@ -772,167 +750,50 @@ printf 'gcloud %s\n' "$*" >>"$TEST_ARGV_LOG"
   || { printf 'fake gcloud: unexpected call: gcloud %s\n' "$*" >&2; exit 2; }
 printf '%s' "$TEST_SECRET_VALUE"
 EOF
-cat >"$work_dir/check-pi-bin/curl" <<'EOF'
-#!/usr/bin/env bash
-set -euo pipefail
-printf 'pi curl %s\n' "$*" >>"$TEST_ARGV_LOG"
-[[ ${*: -1} == "$PI_DISPATCH_URL/api/v1/whoami" && " $* " == *' -H @- '* ]] \
-  || { printf 'fake curl: unexpected call: curl %s\n' "$*" >&2; exit 2; }
-[[ $(cat) == "Authorization: Bearer $DISPATCH_SECRET" ]] || { printf 'curl: (22) The requested URL returned error: 401\n' >&2; exit 22; }
-printf '{"id":"00000000-0000-4000-8000-000000000002","scopes":[]}\n'
-EOF
-cat >"$work_dir/check-pi-bin/sudo" <<'EOF'
-#!/usr/bin/env bash
-[[ $1 == -n ]] || { printf 'fake sudo: no -n\n' >&2; exit 1; }
-shift
-exec "$@"
-EOF
-cat >"$work_dir/check-pi-bin/journalctl" <<'EOF'
-#!/usr/bin/env bash
-set -euo pipefail
-printf 'pi journalctl %s\n' "$*" >>"$TEST_ARGV_LOG"
-[[ " $* " == *' _SYSTEMD_USER_UNIT=ghost-wispr.service '* && " $* " == *' --boot=0 '* && " $* " == *' -o short-unix '* ]] \
-  || { printf 'fake journalctl: unexpected call: journalctl %s\n' "$*" >&2; exit 2; }
-cat -- "$TEST_JOURNAL"
-EOF
-chmod +x "$work_dir/check-bin/"* "$work_dir/check-pi-bin/"*
+chmod +x "$work_dir/check-bin/"*
 block token-check >"$work_dir/token-check.sh"
-readonly empty_sha256=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
-# The Pi's .env is written at env_written; the recorder's journal of this boot has a start line
-# (its "web UI on" line) after that, in journal-started, and only one before it in journal-stale.
-readonly env_written=1764214200
-printf '%s\n' '1764214100.250000 ghost-wispr ghost-wispr[900]: {"level":"INFO","msg":"ghost-wispr v1 (commit=aaa built=x): web UI on http://127.0.0.1:8080"}' \
-  '1764214205.000000 ghost-wispr ghost-wispr[900]: {"level":"INFO","msg":"microphone started at 16000 Hz"}' >"$work_dir/journal-stale"
-{ cat "$work_dir/journal-stale"
-  printf '%s\n' '1764214260.500000 ghost-wispr ghost-wispr[950]: {"level":"INFO","msg":"ghost-wispr v1 (commit=bbb built=x): web UI on http://127.0.0.1:8080"}'
-} >"$work_dir/journal-started"
-printf '%s\n' '1764214205.000000 ghost-wispr ghost-wispr[900]: {"level":"INFO","msg":"microphone started at 16000 Hz"}' >"$work_dir/journal-none"
-# run_token_check CASE SECRET ENV_LINE runs the block as a person pastes it, with plain bash, in the
-# checkout: SECRET is the secret's latest version, and ENV_LINE the Pi's token line of its .env.
-# TEST_JOURNAL_FILE names the recorder's journal (journal-started by default).
+readonly empty_sha256='e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  -'
+# run_token_check CASE SECRET_VALUE PI_VALUE runs the block as a person pastes it, with plain bash, in
+# the checkout: SECRET_VALUE is the secret's latest version, and PI_VALUE the value of the Pi's
+# Dispatch token line in its .env (no such line when empty). It fails unless the block prints exactly
+# two SHA-256 lines and neither value, and keeps them in check_lines.
 run_token_check() {
-  local case_dir=$1
+  local case_dir=$1 secret_value=$2 pi_value=$3
   mkdir -p "$case_dir"
   : >"$case_dir/argv.log"
-  printf 'GHOST_WISPR_ADDR=127.0.0.1:8080\n%s\nGHOST_WISPR_JABRA_MUTE_BUTTON=true\n' "$3" >"$case_dir/pi.env-file"
-  touch -d "@$env_written" "$case_dir/pi.env-file"
+  {
+    printf 'GHOST_WISPR_ADDR=127.0.0.1:8080\n'
+    [[ -z $pi_value ]] || printf '%s=%s\n' "$dispatch_variable" "$pi_value"
+    printf 'GHOST_WISPR_JABRA_MUTE_BUTTON=true\n'
+  } >"$case_dir/pi.env-file"
   token_check_exit=0
   (
     cd "$repo_root"
-    GHOST_WISPR_PI_ENV="$test_env" TEST_ARGV_LOG="$case_dir/argv.log" TEST_SECRET_VALUE="$2" \
-      TEST_PI_ENV_FILE="$case_dir/pi.env-file" TEST_PI_BIN="$work_dir/check-pi-bin" \
-      TEST_JOURNAL="${TEST_JOURNAL_FILE:-$work_dir/journal-started}" PATH="$work_dir/check-bin:$PATH" \
-      bash "$work_dir/token-check.sh"
+    GHOST_WISPR_PI_ENV="$test_env" TEST_ARGV_LOG="$case_dir/argv.log" TEST_SECRET_VALUE="$secret_value" \
+      TEST_PI_ENV_FILE="$case_dir/pi.env-file" PATH="$work_dir/check-bin:$PATH" bash "$work_dir/token-check.sh"
   ) >"$case_dir/out" 2>&1 || token_check_exit=$?
+  mapfile -t check_lines <"$case_dir/out"
+  [[ $token_check_exit == 0 && ${#check_lines[@]} == 2 && ${check_lines[0]} =~ ^[0-9a-f]{64}\ \ -$ && ${check_lines[1]} =~ ^[0-9a-f]{64}\ \ -$ ]] \
+    || fail "the token-check block did not print exactly two hashes in $case_dir: $(<"$case_dir/out")"
+  if grep -qF -e "$dispatch_value" -e another-test-value "$case_dir/out" "$case_dir/argv.log"; then
+    fail "the token-check block put a token in its output or an argument in $case_dir"
+  fi
 }
-run_token_check "$work_dir/token-check" "$DISPATCH_SECRET" "GHOST_WISPR_DISPATCH_TOKEN=$DISPATCH_SECRET"
-mapfile -t check_lines <"$work_dir/token-check/out"
-[[ $token_check_exit == 0 && ${#check_lines[@]} == 4 ]] \
-  || fail "the token-check block did not print two hashes, the recorder's start and the whoami answer: $(<"$work_dir/token-check/out")"
-[[ ${check_lines[0]} =~ ^[0-9a-f]{64}\ \ -$ && ${check_lines[0]} == "${check_lines[1]}" && ${check_lines[0]} != "$empty_sha256"* ]] \
-  || fail "the token-check block's hashes of the same token are not equal, or are the hash of nothing: $(<"$work_dir/token-check/out")"
-[[ ${check_lines[2]} == "the recorder started at 1764214260.500000, after .env was written at $env_written"* ]] \
-  || fail "the token-check block did not say that the recorder's last start of this boot came after .env was written: ${check_lines[2]}"
-[[ ${check_lines[3]} == '{"scopes":[]}' ]] || fail "the token-check block's whoami printed ${check_lines[3]}, not {\"scopes\":[]}"
-# The secret holds another token: the two hashes differ, so the reading can fail.
-run_token_check "$work_dir/token-check-other" other-token-value "GHOST_WISPR_DISPATCH_TOKEN=$DISPATCH_SECRET"
-mapfile -t check_lines <"$work_dir/token-check-other/out"
-[[ ${check_lines[0]-} != "${check_lines[1]-}" ]] || fail "the token-check block printed equal hashes for two tokens"
-# The Pi has no token line: its hash is the hash of nothing, and whoami prints no scopes.
-run_token_check "$work_dir/token-check-no-token" "$DISPATCH_SECRET" ''
-[[ $(head -n 1 "$work_dir/token-check-no-token/out") == "$empty_sha256"* ]] \
-  || fail "the token-check block did not print the hash of nothing for a Pi with no token: $(<"$work_dir/token-check-no-token/out")"
-! grep -Fqx '{"scopes":[]}' "$work_dir/token-check-no-token/out" \
-  || fail "the token-check block's whoami printed scopes for a Pi with no token"
-# The recorder's last start of this boot came before .env was written, or the journal of this boot
-# has no start: the block stops with a line that says so, and reads no whoami.
-for journal in stale none; do
-  TEST_JOURNAL_FILE="$work_dir/journal-$journal" run_token_check "$work_dir/token-check-$journal" "$DISPATCH_SECRET" \
-    "GHOST_WISPR_DISPATCH_TOKEN=$DISPATCH_SECRET"
-  [[ $token_check_exit != 0 ]] || fail "the token-check block passed with a recorder journal that is $journal: $(<"$work_dir/token-check-$journal/out")"
-  ! grep -Fqx '{"scopes":[]}' "$work_dir/token-check-$journal/out" \
-    || fail "the token-check block went on to whoami with a recorder journal that is $journal"
-done
-grep -Fq "the recorder started at 1764214100.250000, before .env was written at $env_written" "$work_dir/token-check-stale/out" \
-  || fail "the token-check block did not say the recorder started before .env was written: $(<"$work_dir/token-check-stale/out")"
-grep -Fq 'found no recorder start in the journal of this boot' "$work_dir/token-check-none/out" \
-  || fail "the token-check block did not say it found no recorder start: $(<"$work_dir/token-check-none/out")"
-
-# --- deepgram-key: on a person's own device, in a checkout.
-
-# gcloud adds a version of the Pi's Deepgram key secret as Secret Manager does, from a file alone:
-# it records its arguments, refuses an empty file, and keeps the file's bytes and mode in
-# $TEST_SECRETS. TEST_GCLOUD_FAIL refuses every call.
-export PI_DEEPGRAM_SECRET
-readonly DEEPGRAM_SECRET=deepgram-key-value-0123456789abcdef
-mkdir -p "$work_dir/deepgram-bin"
-cat >"$work_dir/deepgram-bin/gcloud" <<'EOF'
-#!/usr/bin/env bash
-set -euo pipefail
-printf 'gcloud %s\n' "$*" >>"$TEST_ARGV_LOG"
-[[ $# == 6 && $1 == secrets && $2 == versions && $3 == add && $4 == "$PI_DEEPGRAM_SECRET" \
-  && $5 == "--project=$PI_GCP_PROJECT" && $6 == --data-file=* ]] \
-  || { printf 'fake gcloud: unexpected call: gcloud %s\n' "$*" >&2; exit 2; }
-[[ -z ${TEST_GCLOUD_FAIL:-} ]] || { printf 'ERROR: (gcloud.secrets.versions.add) PERMISSION_DENIED\n' >&2; exit 1; }
-file=${6#--data-file=}
-[[ -s $file ]] || { printf 'ERROR: (gcloud.secrets.versions.add) INVALID_ARGUMENT: the data file %s is empty\n' "$file" >&2; exit 1; }
-version=$(($(find "$TEST_SECRETS" -name "$4.*.data" | wc -l) + 1))
-cp -- "$file" "$TEST_SECRETS/$4.$version.data"
-stat -c %a -- "$file" >"$TEST_SECRETS/$4.$version.mode"
-printf 'Created version [%s] of the secret [%s].\n' "$version" "$4" >&2
-EOF
-chmod +x "$work_dir/deepgram-bin/gcloud"
-block deepgram-key >"$work_dir/deepgram-block.sh"
-# run_deepgram CASE INPUT runs the block as a person pastes it, with plain bash, in the checkout,
-# with INPUT as what the person types and HOME and TMPDIR in CASE, then prints each shell variable
-# that still holds the key. It keeps the exit status in deepgram_exit, the output in <case>/out,
-# the calls in <case>/argv.log and the secret's versions in <case>/secrets.
-run_deepgram() {
-  local case_dir=$1 input=$2
-  mkdir -p "$case_dir/home" "$case_dir/tmp" "$case_dir/secrets"
-  : >"$case_dir/argv.log"
-  # shellcheck disable=SC2016 # The lines are block text, expanded when the block runs.
-  { cat "$work_dir/deepgram-block.sh"; printf '%s\n' 'rc=$?' \
-    'for v in $(compgen -v); do [ "$v" = TEST_DEEPGRAM ] && continue; case ${!v-} in *"$TEST_DEEPGRAM"*) echo "left:$v" ;; esac; done' \
-    'exit "$rc"'; } >"$case_dir/run.sh"
-  deepgram_exit=0
-  (
-    cd "$repo_root"
-    HOME="$case_dir/home" TMPDIR="$case_dir/tmp" GHOST_WISPR_PI_ENV="$test_env" TEST_ARGV_LOG="$case_dir/argv.log" \
-      TEST_SECRETS="$case_dir/secrets" TEST_DEEPGRAM="$DEEPGRAM_SECRET" PATH="$work_dir/deepgram-bin:$PATH" \
-      bash "$case_dir/run.sh" <<<"$input"
-  ) >"$case_dir/out" 2>&1 || deepgram_exit=$?
-}
-run_deepgram "$work_dir/deepgram" "$DEEPGRAM_SECRET"
-[[ $deepgram_exit == 0 ]] || fail "the deepgram-key block failed: $(grep -vF "$DEEPGRAM_SECRET" "$work_dir/deepgram/out")"
-[[ $(versions "$work_dir/deepgram") == 1 ]] || fail "the deepgram-key block added $(versions "$work_dir/deepgram") versions, not 1"
-cmp -s "$work_dir/deepgram/secrets/$PI_DEEPGRAM_SECRET.1.data" <(printf '%s' "$DEEPGRAM_SECRET") \
-  || fail "the Deepgram key's new version is not the typed key, byte for byte"
-[[ $(<"$work_dir/deepgram/secrets/$PI_DEEPGRAM_SECRET.1.mode") == 600 ]] \
-  || fail "the Deepgram key reached gcloud in a file of mode $(<"$work_dir/deepgram/secrets/$PI_DEEPGRAM_SECRET.1.mode"), not 0600"
-grep -Fq "Created version [1] of the secret [$PI_DEEPGRAM_SECRET]" "$work_dir/deepgram/out" \
-  || fail "the deepgram-key block did not show the version it added"
-if grep -qF "$DEEPGRAM_SECRET" "$work_dir/deepgram/argv.log" "$work_dir/deepgram/out"; then
-  fail "the deepgram-key block put the key in an argument or in its output"
-fi
-[[ -z $(left_behind "$work_dir/deepgram") ]] || fail "the deepgram-key block left files behind: $(left_behind "$work_dir/deepgram")"
-# The person types nothing, or Secret Manager refuses: no version, and nothing left behind. An empty
-# read reaches no gcloud call at all.
-for failure in empty gcloud; do
-  case_dir="$work_dir/deepgram-$failure"
-  case $failure in
-    empty) run_deepgram "$case_dir" '' ;;
-    gcloud) TEST_GCLOUD_FAIL=1 run_deepgram "$case_dir" "$DEEPGRAM_SECRET" ;;
-  esac
-  [[ $deepgram_exit != 0 ]] || fail "the deepgram-key block succeeded although $failure"
-  [[ $(versions "$case_dir") == 0 ]] || fail "the deepgram-key block added a version although $failure"
-  [[ -z $(left_behind "$case_dir") ]] || fail "the deepgram-key block left files behind when $failure: $(left_behind "$case_dir")"
-done
-! grep -q '^gcloud ' "$work_dir/deepgram-empty/argv.log" \
-  || fail "the deepgram-key block called gcloud with an empty key: $(<"$work_dir/deepgram-empty/argv.log")"
-if grep -q '^left:' "$work_dir"/deepgram*/out; then
-  fail "the deepgram-key block left the key in the shell: $(grep -h '^left:' "$work_dir"/deepgram*/out | paste -sd ' ')"
-fi
+# The Pi runs with the secret's latest version: two equal hashes, the hash of that value.
+run_token_check "$work_dir/token-check-equal" "$dispatch_value" "$dispatch_value"
+[[ ${check_lines[0]} == "$(printf '%s' "$dispatch_value" | sha256sum)" && ${check_lines[1]} == "${check_lines[0]}" ]] \
+  || fail "the token-check block's hashes of the same token are not equal, or are not its SHA-256: ${check_lines[*]}"
+# The secret holds another value: the hashes differ, so the reading can fail.
+run_token_check "$work_dir/token-check-different" another-test-value "$dispatch_value"
+[[ ${check_lines[0]} != "${check_lines[1]}" ]] || fail "the token-check block printed equal hashes for two tokens"
+# The Pi has no token line, or the secret's latest version is empty: that side's hash is the hash of
+# nothing, which the runbook says neither hash may be.
+run_token_check "$work_dir/token-check-pi-empty" "$dispatch_value" ''
+[[ ${check_lines[0]} == "$empty_sha256" && ${check_lines[1]} != "$empty_sha256" ]] \
+  || fail "the token-check block did not print the hash of nothing for a Pi with no token: ${check_lines[*]}"
+run_token_check "$work_dir/token-check-secret-empty" '' "$dispatch_value"
+[[ ${check_lines[1]} == "$empty_sha256" && ${check_lines[0]} != "$empty_sha256" ]] \
+  || fail "the token-check block did not print the hash of nothing for an empty secret: ${check_lines[*]}"
 
 # --- running-settings: on a person's own device, in a checkout.
 
@@ -966,7 +827,7 @@ run_settings() {
   : >"$case_dir/argv.log"
   cp -- "$repo_root/deploy/pi/files/ghost-wispr.yaml" "$case_dir/opt/ghost-wispr.yaml"
   [[ -z $local_settings ]] || printf '%s\n' "$local_settings" >"$case_dir/opt/ghost-wispr.local.yaml"
-  printf '%s\0' "GHOST_WISPR_DEEPGRAM_API_KEY=$DEEPGRAM_SECRET" "$@" >"$case_dir/proc/4242/environ"
+  printf '%s\0' "${deepgram_variable}=$deepgram_value" "$@" >"$case_dir/proc/4242/environ"
   settings_exit=0
   (
     cd "$repo_root"
@@ -979,8 +840,8 @@ run_settings() {
 check_settings() {
   local case_dir=$1
   shift
-  [[ $settings_exit == 0 ]] || fail "the running-settings block failed in $case_dir: $(grep -vF "$DEEPGRAM_SECRET" "$case_dir/out")"
-  ! grep -qF "$DEEPGRAM_SECRET" "$case_dir/out" || fail "the running-settings block printed the recorder's Deepgram key"
+  [[ $settings_exit == 0 ]] || fail "the running-settings block failed in $case_dir: $(grep -vF "$deepgram_value" "$case_dir/out")"
+  ! grep -qF "$deepgram_value" "$case_dir/out" || fail "the running-settings block printed the recorder's Deepgram key"
   [[ $(<"$case_dir/out") == "$(printf '%s\n' "$@")" ]] \
     || fail "the running-settings block printed [$(<"$case_dir/out")] in $case_dir, not [$(printf '%s\n' "$@")]"
 }
@@ -1005,8 +866,5 @@ TEST_MAIN_PID_VALUE=0 run_settings "$work_dir/settings-stopped" ''
 grep -Fq 'ghost-wispr.service runs no process' "$work_dir/settings-stopped/out" \
   || fail "the running-settings block did not say the recorder runs no process: $(<"$work_dir/settings-stopped/out")"
 
-if grep -F -e "$DISPATCH_SECRET" -e "$OPERATOR_DISPATCH_SECRET" "$work_dir"/token*/argv.log >/dev/null; then
-  fail "a Dispatch token was passed as a command argument"
-fi
-printf 'runbook blocks test passed: %d blocks, %d release files, %d provision.sh commands, 7 download cases, 6 route cases, 2 claim cases, 3 Deepgram cases, 5 token cases, 5 token-check cases, 5 settings cases, the slice 1 driver\n' \
+printf 'runbook blocks test passed: %d blocks, %d release files, %d provision.sh commands, 7 download cases, 6 route cases, 2 claim cases, 3 cases of each secret block, 4 token-check cases, 5 settings cases, the slice 1 driver\n' \
   "${#blocks[@]}" "$(wc -l <<<"$release_files")" "$provision_commands"

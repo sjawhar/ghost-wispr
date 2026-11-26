@@ -212,6 +212,28 @@ func TestRunbookSaysTheCertificatePairChangesAsOne(t *testing.T) {
 	}
 }
 
+// TestRunbookSaysTheSecretsHoldThePisOwnValues fails if "The Pi's secrets"
+// does not say that the two secrets hold the Pi's current values, copied once
+// from the Pi's own .env; where a person gets a replacement Dispatch token (a
+// no-scope agent token from Dispatch, Settings → Agent tokens); and that the
+// check's two hashes must be equal and neither may be the hash of nothing. It
+// also fails if the runbook still mints a token, reads whoami, compares the
+// recorder's start, or revokes a Dispatch token.
+func TestRunbookSaysTheSecretsHoldThePisOwnValues(t *testing.T) {
+	section := runbookSection(t, "## The Pi's secrets")
+	for _, words := range []string{"hold the Pi's current values", "copied once from the Pi's own `.env`", "Settings → Agent tokens", "no-scope agent token", "must be equal", "neither may be `e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855`"} {
+		if !strings.Contains(section, words) {
+			t.Errorf("the runbook's \"The Pi's secrets\" does not say %q", words)
+		}
+	}
+	words := strings.Join(strings.Fields(readRunbook(t)), " ")
+	for _, stale := range []string{"agent-tokens", "ghost-wispr-office-pi-secret-manager", "whoami", "mints a new", "mint it into its secret", "DISPATCH_TOKEN_FILE", "revoke the old token", "the recorder started at <time>"} {
+		if strings.Contains(words, stale) {
+			t.Errorf("the runbook still mints, checks or revokes a Dispatch token: %q", stale)
+		}
+	}
+}
+
 // TestRunbookSaysTheBridgeIsReadAgainBeforeTheSwap fails if "Update and
 // inspect" does not say that the update compares the call bridge's link
 // versions at the first status read and again at the read just before the
