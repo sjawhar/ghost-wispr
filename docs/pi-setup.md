@@ -134,14 +134,20 @@ adds the new token as the secret's latest version:
 
 It prints the new token's id, its name and `"scopes":[]`, and the version that it added, never the
 token: Dispatch shows a token only in the answer to its mint. Revoke the token that the Pi used
-before only once the Pi uses the new one: the two hashes below are equal, neither is
-`e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855` (the hash of nothing), and the
-`whoami` read prints `{"scopes":[]}`. The read sends the Pi's token on standard input, on the Pi.
+before only once the Pi uses the new one: the two hashes that the block below prints are equal,
+neither is `e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855` (the hash of
+nothing), and the `whoami` read prints `{"scopes":[]}`. The read sends the Pi's token on standard
+input, on the Pi. Run the block on your own device, in a checkout, with your own Google login:
 
+<!-- runbook_blocks_test.sh: token-check -->
 ```bash
-ssh ghost-wispr@ghost-wispr "sed -n 's/^GHOST_WISPR_DISPATCH_TOKEN[=]//p' /opt/ghost-wispr/.env" | tr -d '\n' | shasum -a 256
-gcloud secrets versions access latest --secret=operator-only-ghost-wispr-dispatch-token --project=theorem-agent-infra | tr -d '\n' | shasum -a 256
-ssh ghost-wispr@ghost-wispr "sed -n 's/^GHOST_WISPR_DISPATCH_TOKEN[=]/Authorization: Bearer /p' /opt/ghost-wispr/.env | curl -fsS -H @- https://dispatch.tail12ec1c.ts.net/api/v1/whoami | jq -c '{scopes}'"
+(source "${GHOST_WISPR_PI_ENV:-deploy/pi/files/pi.env}" &&
+  ssh "ghost-wispr@$PI_HOST" "sed -n 's/^GHOST_WISPR_DISPATCH_TOKEN[=]//p' /opt/ghost-wispr/.env" |
+    tr -d '\n' | shasum -a 256 &&
+  gcloud secrets versions access latest --secret="$PI_DISPATCH_TOKEN_SECRET" --project="$PI_GCP_PROJECT" |
+    tr -d '\n' | shasum -a 256 &&
+  ssh "ghost-wispr@$PI_HOST" "sed -n 's/^GHOST_WISPR_DISPATCH_TOKEN[=]/Authorization: Bearer /p' /opt/ghost-wispr/.env |
+    curl -fsS -H @- '$PI_DISPATCH_URL/api/v1/whoami' | jq -c '{scopes}'")
 ```
 
 Then revoke the old token with your own Dispatch token (`DELETE /api/v1/me/agent-tokens/{id}`, with
@@ -199,6 +205,7 @@ restarts the recorder, and a restart ends a conversation that is being recorded.
 
 1. On the Pi, download the latest release's deploy set and check it:
 
+   <!-- runbook_blocks_test.sh: download-latest -->
    ```bash
    d=$(mktemp -d) && cd "$d" &&
    u=https://github.com/sjawhar/ghost-wispr/releases/latest/download &&
@@ -214,6 +221,7 @@ restarts the recorder, and a restart ends a conversation that is being recorded.
    empties: in a new SSH session, or after a reboot, run this block again.
 2. On the Pi, make its key:
 
+   <!-- runbook_blocks_test.sh: provision-key -->
    ```bash
    ./provision.sh --key
    ```
@@ -226,19 +234,20 @@ restarts the recorder, and a restart ends a conversation that is being recorded.
    certificate goes to `ghost-wispr-device-certificate`. When the pull request merges, the
    `bootstrap` apply signs the request with the certificate authority `ghost-wispr-ca` and adds the
    certificate as the latest version of that secret.
-4. On your own device, with your own Google login, read the certificate and copy it to the Pi. The
-   certificate is not a secret.
+4. On your own device, in a checkout, with your own Google login, read the certificate and copy it
+   to the Pi as `~/device.crt`. The certificate is not a secret.
 
    ```bash
-   gcloud secrets versions access latest --secret=ghost-wispr-device-certificate \
-     --project=theorem-agent-infra >device.crt &&
-   openssl x509 -in device.crt -noout -subject -nameopt RFC2253 -enddate &&
-   scp device.crt ghost-wispr@ghost-wispr.tail12ec1c.ts.net:
+   (source "${GHOST_WISPR_PI_ENV:-deploy/pi/files/pi.env}" && f=$(mktemp) && trap 'rm -f -- "$f"' EXIT &&
+     gcloud secrets versions access latest --secret="$PI_CERTIFICATE_SECRET" --project="$PI_GCP_PROJECT" >"$f" &&
+     openssl x509 -in "$f" -noout -subject -nameopt RFC2253 -enddate &&
+     scp "$f" "ghost-wispr@$PI_HOST:device.crt")
    ```
 
    `openssl` must print `subject=CN=ghost-wispr` and an end date one year after the apply. Then,
    on the Pi, in the release directory, install it:
 
+   <!-- runbook_blocks_test.sh: provision-certificate -->
    ```bash
    ./provision.sh --certificate ~/device.crt
    ```
@@ -248,6 +257,7 @@ restarts the recorder, and a restart ends a conversation that is being recorded.
    certificate ("Renew the X.509 certificate").
 5. On the Pi, in the release directory, provision:
 
+   <!-- runbook_blocks_test.sh: provision -->
    ```bash
    ./provision.sh
    ```
@@ -288,23 +298,25 @@ restarts the recorder, and a restart ends a conversation that is being recorded.
    makes a new Tailscale device. The temporary device you joined as your own still holds the name
    `ghost-wispr`, so Tailscale names the tagged one `ghost-wispr-1`, and
    `ghost-wispr.tail12ec1c.ts.net` does not reach the recorder. A new run of `provision.sh` does
-   not change that. Give the tagged device its name with `deploy/pi/claim-tailnet-name.sh`, under a
-   secrets-broker grant of `TAILSCALE_API_KEY` that Sami approves on the broker page:
+   not change that. Give the tagged device its name with `deploy/pi/claim-tailnet-name.sh`, which
+   needs `curl` and `jq`, and a Tailscale API access token. A tailnet admin makes the token on the
+   [Keys](https://console.tailscale.com/admin/settings/keys) page of Tailscale's admin console,
+   with an expiry of 1 day. The block reads the token without showing it and gives it to that one
+   command alone, in its environment:
 
+   <!-- runbook_blocks_test.sh: claim-name -->
    ```bash
-   secret-run --register --wait 12h \
-     --reason 'Ghost Wispr (docs/pi-setup.md): give the tagged recorder the tailnet name ghost-wispr' \
-     TAILSCALE_API_KEY -- deploy/pi/claim-tailnet-name.sh
+   (IFS= read -r -s -p 'Tailscale API access token: ' key && echo &&
+     TAILSCALE_API_KEY=$key deploy/pi/claim-tailnet-name.sh)
    ```
 
    It removes the temporary device only when that device is the one device other than the tagged
    one that holds the name, has an id that is a string of digits, has the hostname `ghost-wispr`,
    has a user owner and no tag, and is offline. Then it renames the tagged device and reads the
    name back. It refuses any other holder, or more than one, before it changes anything. When the
-   tagged device has the name already, it does nothing. The key reaches `curl` on stdin, never as
-   an argument, and goes only to `https://api.tailscale.com`. On a device with no secrets broker,
-   run the script with an API access token of a tailnet admin in `TAILSCALE_API_KEY`: the script
-   reads the key from its environment alone.
+   tagged device has the name already, it does nothing. The token reaches `curl` on stdin, never as
+   an argument, and goes only to `https://api.tailscale.com`. Revoke the token on the Keys page
+   afterwards.
 7. From a tailnet member device, check the join and the name:
 
    ```bash
@@ -558,9 +570,31 @@ manager, and refuses while `ghost-wispr.service` or `ghost-wispr-update.service`
 naming it, since a drop-in can set the recorder's environment past both checks; the nightly update
 makes the same checks ("Update and inspect"). Remove the drop-in and run the step again.
 
-Run it on the Pi as `ghost-wispr`, in the release directory ("Provision", step 1), with the
-shared drive's ID:
+Run it only from the release the Pi runs, which can be older than the latest release: the models
+step installs that release's `ghost-wispr.yaml`, and the Pi's binary must not run on a newer
+release's config. When check 1 of `check-deploy.sh` passes ("Update and inspect"), the Pi runs the
+latest release, and the release directory of "Provision", step 1, is that release. Otherwise, on
+the Pi as `ghost-wispr`, download the release whose commit `/api/version` names:
 
+<!-- runbook_blocks_test.sh: download-commit -->
+```bash
+c=$(curl -fsS http://127.0.0.1:8080/api/version | jq -er .commit) &&
+t=$(curl -fsS 'https://api.github.com/repos/sjawhar/ghost-wispr/releases?per_page=100' |
+  jq -er --arg c "$c" '[.[] | select(.target_commitish == $c)][0].tag_name') &&
+d=$(mktemp -d) && cd "$d" &&
+u="https://github.com/sjawhar/ghost-wispr/releases/download/$t" &&
+curl -fsSLO "$u/ghost-wispr-pi-deploy.tar.gz" &&
+curl -fsSLO "$u/ghost-wispr-pi-deploy.tar.gz.sha256" &&
+sha256sum -c ghost-wispr-pi-deploy.tar.gz.sha256 &&
+tar -xzf ghost-wispr-pi-deploy.tar.gz &&
+cd ghost-wispr-pi-deploy
+```
+
+`sha256sum` must print `ghost-wispr-pi-deploy.tar.gz: OK`. The block looks for the commit among
+the latest 100 releases, and stops before it makes a directory when none of them has it. Then, in
+that release directory, run the models step with the shared drive's ID:
+
+<!-- runbook_blocks_test.sh: models -->
 ```bash
 ./provision.sh --models '<shared-drive-id>'
 ```
@@ -1022,6 +1056,17 @@ ssh ghost-wispr@ghost-wispr "grep '^mic_device:' /opt/ghost-wispr/ghost-wispr.ya
 ssh ghost-wispr@ghost-wispr "grep -s -E '^(jabra_mute_button:|GHOST_WISPR_JABRA_MUTE_BUTTON=)' /opt/ghost-wispr/ghost-wispr.yaml /opt/ghost-wispr/.env /opt/ghost-wispr/ghost-wispr.local.yaml"
 ```
 
+When the new release answers its commit but check 2, 3 or 4 fails, revert the change on `main`. The
+revert publishes a new release, which the nightly update installs that night, or at once when you
+start the update by hand:
+
+```bash
+ssh ghost-wispr@ghost-wispr 'XDG_RUNTIME_DIR=/run/user/$(id -u) systemctl --user start ghost-wispr-update.service'
+```
+
+Do not restore the `.prev` copies by hand: the next run finds installed files that differ from the
+set `deploy.verified` lists, and installs the latest release again.
+
 ## Settings saved on the page
 
 A setting saved on the web UI's settings page goes to the local settings file,
@@ -1146,8 +1191,8 @@ the unit.
    is applied; until then the voice answers "I cannot reach Dispatch yet", and the log warns every
    minute that the Envoy session did not open, with no restart needed once it can. The template
    sets `envoy_enabled: true`, and `envoy_hub_url` and `concierge.envoy_url` to the hub's listener.
-   A `.env` line overrides the YAML, so the nightly update and the models step
-   (`provision.sh --models`) each refuse, and change nothing, while a line of the Pi's `.env`
+   A `.env` line overrides the YAML, so the nightly update refuses to install a release, and the
+   models step (`provision.sh --models`) refuses and changes nothing, while a line of the Pi's `.env`
    could set `GHOST_WISPR_ENVOY_ENABLED`, `GHOST_WISPR_ENVOY_HUB_URL` or
    `GHOST_WISPR_CONCIERGE_ENVOY_URL`, or `GHOST_WISPR_CONFIG`, which would have the recorder load
    another file than the installed config and so replace every setting, Envoy's included: a line
@@ -1163,12 +1208,14 @@ the unit.
    manager's start-up environment (`/etc/environment`, a `user@.service` drop-in) goes once you
    remove it and restart `user@<uid>.service`. Each reloads the manager before it reads, so a newly
    written `environment.d` line counts. `provision.sh` refuses the same way while the manager's
-   environment sets one of them, before it changes anything. They name the variable and why, and
-   `GHOST_WISPR_CONFIG` first. While a config names a hub with Envoy off, the web page shows a
-   notice under the warnings, and `/api/status` gives it in `notices`, never in `warnings`, which
-   check 4 of `check-deploy.sh` needs empty: no session event goes to the hub, each completed
-   summary waits until Envoy is on again, and, with no `concierge.envoy_url`, the voice cannot ask
-   an issue's agent.
+   environment sets one of them, before it changes anything. The models step and `provision.sh`
+   name `GHOST_WISPR_CONFIG` first, with why; the nightly update names each variable it found.
+   While the installed release is current, the nightly update still installs new secret values and
+   a renewed certificate. While a config names a hub with Envoy off, the web page shows a notice
+   under the warnings, and `/api/status` gives it in `notices`, never in `warnings`, which check 4
+   of `check-deploy.sh` needs empty: no session event goes to the hub, each completed summary waits
+   until Envoy is on again, and, with no `concierge.envoy_url`, the voice cannot ask an issue's
+   agent.
 2. The Pi's Dispatch token: a no-scope agent token, never a person's, which the nightly update
    reads from Secret Manager into `.env` as `GHOST_WISPR_DISPATCH_TOKEN`. "The Pi's secrets" says
    how to mint it into its secret, and how to replace it. Without it the voice answers "I cannot
