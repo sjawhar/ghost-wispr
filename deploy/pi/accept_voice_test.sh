@@ -2914,7 +2914,8 @@ launch cancel-late-apply long,asound,stop-rounds-2,late-apply yes -- $cancel_arg
 # whole-clip control; the unit's tts.model alone, its control too close to tell (the negative
 # control); Aura with one request and with every request lacking mip_opt_out; the unit's model past
 # the bound; a model of a provider the unit does not name; the voice flag --engine, which the step
-# does not take; a build without the subcommand.
+# does not take; a build without the subcommand; and the unit's tts.model saved on the page, in
+# ghost-wispr.local.yaml, which the unit reads over ghost-wispr.yaml.
 launch first-audio pass '' -- --step tts-first-audio --model vertex-us/gemini-3.8-flash-tts \
   --model vertex/gemini-3.8-flash-tts --model deepgram/aura-2-thalia-en --clip --sentences 3
 launch first-audio-close clip-close '' -- --step tts-first-audio --clip --sentences 3
@@ -2924,6 +2925,11 @@ launch first-audio-slow slow-first-frame '' -- --step tts-first-audio --sentence
 launch first-audio-no-provider pass '' -- --step tts-first-audio --model nowhere/tts-1 --sentences 3
 launch first-audio-engine pass '' -- --step tts-first-audio --engine gemini --sentences 3
 launch first-audio-missing tts-missing '' -- --step tts-first-audio --sentences 3
+# new_case keeps a file the case's deploy directory holds before launch: here the local settings
+# file, as a settings save writes it (yaml.v3, four spaces).
+mkdir -p "$root/first-audio-local/deploy"
+printf 'tts:\n    model: vertex/gemini-3.8-flash-tts\n' >"$root/first-audio-local/deploy/ghost-wispr.local.yaml"
+launch first-audio-local pass '' -- --step tts-first-audio --sentences 3
 # joined (c-joined-live): a pass; a pointer that names another meeting; the agent told its words
 # were spoken before the go-ahead; voice_spoken with another session's id; the meeting's only
 # voice_spoken while the go-ahead still plays; and the go-ahead followed by the wake sound alone, no
@@ -4027,6 +4033,13 @@ expect_rc first-audio-engine 1
 expect_line first-audio-engine 'tts-first-audio takes --model PROVIDER/MODEL'
 expect_rc first-audio-missing 2
 expect_line first-audio-missing 'UNKNOWN: tts-first-audio: this build has no ghost-wispr tts-first-audio'
+# The page's tts.model wins over the release's: the step times vertex/, not vertex-us/.
+expect_rc first-audio-local 0
+expect_line first-audio-local "PASS: tts-first-audio vertex/gemini-3.8-flash-tts (the unit's tts.model): median 451 ms to the first frame, at most 700 ms"
+grep -Fqx 'tts-first-audio --model vertex/gemini-3.8-flash-tts' "$root/first-audio-local/state/binary.log" \
+  || check_failed "first-audio-local: the step did not time the tts.model of ghost-wispr.local.yaml"
+expect_no_line first-audio-local 'vertex-us/gemini-3.8-flash-tts'
+expect_untouched first-audio-local
 
 # joined.
 # joined_onset NAME: the early and late bounds of the words' onset, in ms from the end of the

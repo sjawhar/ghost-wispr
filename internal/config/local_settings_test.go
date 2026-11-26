@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -28,9 +29,10 @@ func TestLocalSettingsPath(t *testing.T) {
 }
 
 // TestAPageSaveSurvivesANewReleaseConfig fails if a settings save rewrites the
-// release template: replacing that template would lose the saved timeout and
-// leave its new rules unavailable. Control: a store that writes the whole
-// config into the release file loses 45s when the new template replaces it.
+// release template: replacing that template would lose the saved timeout, and
+// keep the new release's rules and its new gc_max_age_days from the unit.
+// Control: a store that writes the whole config into the release file loses
+// 45s when the new template replaces it.
 func TestAPageSaveSurvivesANewReleaseConfig(t *testing.T) {
 	clearEnv(t)
 	path := writeConfig(t, "silence_timeout: 30s\nrecording_rules:\n  - First release rule.\n")
@@ -42,7 +44,7 @@ func TestAPageSaveSurvivesANewReleaseConfig(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	newRelease := []byte("silence_timeout: 30s\nrecording_rules:\n  - New release rule.\nrelease_only_key: new value\n")
+	newRelease := []byte("silence_timeout: 30s\nrecording_rules:\n  - New release rule.\n  - Second new release rule.\ngc_max_age_days: 14\nrelease_only_key: new value\n")
 	if err := os.WriteFile(path, newRelease, 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -55,8 +57,11 @@ func TestAPageSaveSurvivesANewReleaseConfig(t *testing.T) {
 	if cfg.SilenceTimeout != "45s" {
 		t.Errorf("silence_timeout after the release replacement = %q, want 45s", cfg.SilenceTimeout)
 	}
-	if len(cfg.RecordingRules) != 1 || cfg.RecordingRules[0] != "New release rule." {
-		t.Errorf("recording_rules after the release replacement = %q, want the new release rule", cfg.RecordingRules)
+	if want := []string{"New release rule.", "Second new release rule."}; !slices.Equal(cfg.RecordingRules, want) {
+		t.Errorf("recording_rules after the release replacement = %q, want %q", cfg.RecordingRules, want)
+	}
+	if cfg.GCMaxAgeDays != 14 {
+		t.Errorf("gc_max_age_days after the release replacement = %d, want the new release's 14", cfg.GCMaxAgeDays)
 	}
 	gotRelease, err := os.ReadFile(path)
 	if err != nil {
@@ -64,6 +69,75 @@ func TestAPageSaveSurvivesANewReleaseConfig(t *testing.T) {
 	}
 	if !bytes.Equal(gotRelease, newRelease) {
 		t.Errorf("the page save changed the replacement release config:\n%s", gotRelease)
+	}
+}
+
+// TestAPageSaveOfABuiltInPresetKeepsItsOtherFields fails if a save that
+// changes one field of a preset the release config does not name writes that
+// field alone: the next start decodes the entry into an empty preset, and the
+// built-in default preset loses its user template, which carries the
+// transcript, and its description.
+func TestAPageSaveOfABuiltInPresetKeepsItsOtherFields(t *testing.T) {
+	clearEnv(t)
+	path := writeConfig(t, "silence_timeout: 30s\n")
+	store, _, err := NewStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Update(func(c *Config) {
+		preset := c.Summarization.Presets["default"]
+		preset.SystemPrompt = "Give the decisions first."
+		c.Summarization.Presets["default"] = preset
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, _, err := NewStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := Preset{
+		Description:  "General-purpose summary adapted to content depth",
+		SystemPrompt: "Give the decisions first.",
+		UserTemplate: "{{transcript}}",
+	}
+	if got, ok := reopened.Get().Summarization.Presets["default"]; !ok || got != want {
+		t.Errorf("the default preset after a restart = %+v (held: %t), want %+v", got, ok, want)
+	}
+}
+
+// TestAPageSaveComparesWithTheReleaseConfigTheStoreLoaded fails if a save
+// made after a new release config replaced the file under a running store
+// compares with the file on disk: each setting the new release changed then
+// differs from the running config, and the save writes the old release's
+// value as a page save, which hides the new release's value from then on.
+func TestAPageSaveComparesWithTheReleaseConfigTheStoreLoaded(t *testing.T) {
+	clearEnv(t)
+	path := writeConfig(t, "silence_timeout: 30s\ngc_max_age_days: 30\n")
+	store, _, err := NewStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("silence_timeout: 30s\ngc_max_age_days: 60\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Update(func(c *Config) { c.SilenceTimeout = "45s" }); err != nil {
+		t.Fatal(err)
+	}
+
+	local := savedConfig(t, LocalSettingsPath(path))
+	if value, ok := local["gc_max_age_days"]; ok {
+		t.Errorf("the save wrote the old release's gc_max_age_days %v to the local settings file", value)
+	}
+	if local["silence_timeout"] != "45s" {
+		t.Errorf("the local settings file holds silence_timeout %v, want 45s", local["silence_timeout"])
+	}
+	reopened, _, err := NewStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg := reopened.Get(); cfg.GCMaxAgeDays != 60 || cfg.SilenceTimeout != "45s" {
+		t.Errorf("after a restart gc_max_age_days %d, silence_timeout %q; want the new release's 60, and 45s", cfg.GCMaxAgeDays, cfg.SilenceTimeout)
 	}
 }
 
