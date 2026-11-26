@@ -26,7 +26,7 @@ func TestAStaleRoomSnapshotCompletesSilently(t *testing.T) {
 			tools := newFakeTools(voice.AnswerResult{Say: "The answer is available."})
 			x := testExchange(newFakeOutput(), tools)
 			var mu sync.Mutex
-			room := voice.RoomView{Live: true, Asker: "what about ABC-42?", Revision: 1}
+			room := voice.RoomView{Live: true, Asker: "what about ABC-42?", Request: "what about ABC-42?", Revision: 1}
 			reads := 0
 			captured := make(chan struct{})
 			release := make(chan struct{})
@@ -55,7 +55,7 @@ func TestAStaleRoomSnapshotCompletesSilently(t *testing.T) {
 			}
 			if changed {
 				mu.Lock()
-				room = voice.RoomView{Live: true, Asker: "what about ABC-12?", Revision: 2, TakeBacks: 1}
+				room = voice.RoomView{Live: true, Asker: "what about ABC-12?", Request: "what about ABC-12?", Revision: 2, TakeBacks: 1}
 				mu.Unlock()
 			}
 			c.delegate("newer")

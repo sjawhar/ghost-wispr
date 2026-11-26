@@ -14,6 +14,7 @@ type roomStub struct {
 	view voice.RoomView
 }
 
+//nolint:gocritic // The stub keeps a copy of the view, as Exchange.Room returns one by value.
 func (r *roomStub) set(v voice.RoomView) {
 	r.mu.Lock()
 	r.view = v
@@ -29,7 +30,7 @@ func (r *roomStub) get() voice.RoomView {
 // withRoom gives x a settable Room starting at a live view with asker and
 // revision 1, and returns the stub.
 func withRoom(x *voice.Exchange, asker string) *roomStub {
-	r := &roomStub{view: voice.RoomView{Live: true, Asker: asker, Revision: 1}}
+	r := &roomStub{view: voice.RoomView{Live: true, Asker: asker, Request: asker, Revision: 1}}
 	x.Room = r.get
 	return r
 }

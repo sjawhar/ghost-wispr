@@ -151,7 +151,7 @@ func TestADelegationForAnotherTargetRunsNoTool(t *testing.T) {
 	select {
 	case got := <-tools.calls:
 		t.Fatalf("a delegation for responses ran the answer tool: %+v", got)
-	case <-time.After(transcriptSettle + 400*time.Millisecond):
+	case <-time.After(650 * time.Millisecond):
 	}
 	result, _ := json.Marshal(voice.AnswerResult{Say: "late"})
 	if err := s.Deliver(context.Background(), "resp_1", result); !errors.Is(err, ErrUnknownCall) {
@@ -262,7 +262,7 @@ func TestASecondDelegationAsksTheRoomsCurrentAsker(t *testing.T) {
 	if q := answerArgs(t, waitEvent(t, s, voice.EventToolCall).Call.Args).Question; q != "Tell me about ABC-7." {
 		t.Fatalf("first question %q, want the room's asker", q)
 	}
-	rs.set(voice.RoomView{Live: true, Asker: "And ABC-8?", Revision: 2})
+	rs.set(voice.RoomView{Live: true, Asker: "And ABC-8?", Request: "And ABC-8?", Revision: 2})
 	c.heard("And ABC-8?")
 	c.delegate("item_2")
 	if q := answerArgs(t, waitEvent(t, s, voice.EventToolCall).Call.Args).Question; q != "And ABC-8?" {

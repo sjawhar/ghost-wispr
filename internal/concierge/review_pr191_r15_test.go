@@ -193,15 +193,15 @@ func TestVoiceCsLateAskerWordsLeaveOutATakeBack(t *testing.T) {
 }
 
 // TestVoiceBsNextDelegationLeavesOutATakeBack (Sol's fifteenth review of
-// #191, P2 2): voice B asks its last question again when a delegation heard
-// nothing new. At 3646053 that question was kept whole, the asker's words of
-// its opening "what about ABC-42?" included, and the next delegation after
-// "never mind. what about ABC-12?" asked the model and the holder "what
-// about ABC-42? what about ABC-12?". The session now keeps only what
-// GPT-Live heard and reads the asker's words when it asks. A take-back said
-// between the two delegations, GPT-Live having heard nothing, leaves the
-// second without ABC-42 too. Control: with no take-back, the question keeps
-// ABC-42.
+// #191, P2 2): at 3646053 a delegation that heard nothing new asked its last
+// question again, whole, the asker's words of its opening "what about
+// ABC-42?" included, and the next delegation after "never mind. what about
+// ABC-12?" asked the model and the holder "what about ABC-42? what about
+// ABC-12?". A question is now the room's own request, owned by final: a
+// delegation that heard nothing new asks nothing and waits (Main, after
+// Sol's nineteenth review of #191), and a take-back said between the two
+// delegations, a final of its own, leaves the second without ABC-42. Control:
+// with no take-back, the question keeps ABC-42.
 func TestVoiceBsNextDelegationLeavesOutATakeBack(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
@@ -240,6 +240,13 @@ func TestVoiceBsNextDelegationLeavesOutATakeBack(t *testing.T) {
 				}
 				sent := len(holderMessages(r))
 				w.send(map[string]any{"type": "session.delegation.created", "event_id": "delegate-" + id, "offset_ms": 1000 * (i + 1), "delegation": map[string]any{"id": id, "type": "delegation", "target": "client"}})
+				if i == 1 && tc.after == "" {
+					// No new final: the room has nothing for d2 to ask.
+					if q := toolWithin(t, v, 600*time.Millisecond); q != "" {
+						t.Errorf("delegation d2 asked %q with no new final of the room's", q)
+					}
+					continue
+				}
 				within(t, v.calls, "delegation "+id)
 				within(t, v.results, "answer to "+id)
 				if got := strings.Contains(modelQuestion(r), "ABC-42"); got == tc.cut[i] {

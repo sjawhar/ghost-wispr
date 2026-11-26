@@ -1484,6 +1484,19 @@ It exits nonzero if the unit stops being paused and idle, the backend answer
 is not spoken, or a speech's first word reaches the own-speech filter more
 than 300 ms after its audio starts. Remove the private directory afterwards.
 
+`--observe-delegation spoken` or `--observe-delegation silent` replaces the
+round trip with one delegation watched for 20 s from the question's end: the
+room the probe reports has a question (`--room-asker`) or none. It records
+rather than asserts, and prints when the delegation reached the client, when
+speech began, when the backend was called, and the session's own account of
+the model's audio: what GPT-Live sent and where each part went (queued for the
+speaker, muted, silence outside a speech, after close), with a WARNING when
+those do not add up and UNKNOWN when the session gave no account. Its room is
+fixed, not Deepgram's finals, so it cannot measure how late a real final
+comes; in the silent mode the delegation waits for a final that never comes,
+as voice B does in the office until the exchange ends. `--wav` keeps the
+speech it received.
+
 ## Accept the meeting voice
 
 `deploy/pi/accept-voice.sh` runs slice 1 of the meeting voice on the loopback, so nothing plays in

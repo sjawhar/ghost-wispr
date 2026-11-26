@@ -414,8 +414,18 @@ type exchange struct {
 	replySeqs    []uint64 // the same for ex.reply
 	interim      string   // the turn's words not final yet
 	roomRevision uint64   // each new final: a fresh RoomView (Exchange.Room)
-	takeBacks    uint64   // every take-back of this exchange, for RoomView
-	takeBackCut  string   // raw words through the last take-back counted
+	// claimedTurn and claimedRev mark the request a voice last committed to
+	// the backend (Exchange.Claim): the finals of turn claimedTurn up to
+	// revision claimedRev are no later request's. A final's identity is its
+	// revision: each final of a turn bumps roomRevision once, in order, so the
+	// i-th of n finals in ex.turn has revision roomRevision-(n-1-i).
+	claimedTurn uint64
+	claimedRev  uint64
+	// roomChanged closes at the next change to the room's view (a final, a
+	// claim, the exchange's end) and is then replaced (RoomView.Changed).
+	roomChanged  chan struct{}
+	takeBacks    uint64 // every take-back of this exchange, for RoomView
+	takeBackCut  string // raw words through the last take-back counted
 	timer        *time.Timer
 	said         bool
 	spokeAt      time.Time  // when its speech first started
@@ -1547,7 +1557,7 @@ func (s *Supervisor) startLocked(t *Transcript, m transcript.Match) {
 		Tap:       s.tapFor(voice, wakeLag(t, m)),
 		Out:       exchangeOutput{s: s, ex: ex},
 	}
-	ex.x.Tools, ex.x.Room = exchangeTools{s: s, ex: ex}, s.roomOf(ex)
+	ex.x.Tools, ex.x.Room, ex.x.Claim = exchangeTools{s: s, ex: ex}, s.roomOf(ex), s.claimOf(ex)
 	s.exTimingLocked(ex, "wake_heard", monoclock.Stamp{Wall: t.At, Mono: t.Mono})
 	s.noteLocked(ex, EventWakeHeard, sessionID)
 	s.turnLocked(ex, t, m.Rest)
@@ -1857,6 +1867,7 @@ func (s *Supervisor) turnLocked(ex *exchange, t *Transcript, words string) {
 		if words != "" {
 			ex.turn = append(ex.turn, words)
 			ex.roomRevision++
+			defer s.roomChangedLocked(ex) // after the take-back below is counted
 			// ex.turnSeqs keeps ex.turn's last entries, one a final: a
 			// reset of ex.turn drops the rest of them here.
 			seq := uint64(0)
@@ -2280,7 +2291,7 @@ func (s *Supervisor) speakLocked(p *pendingAnswer, turnAt time.Time) {
 	}
 	ex.openSeq = starts
 	ex.x = Exchange{SessionID: sessionID, WakeAt: time.Now(), IssueKey: p.IssueKey, Recent: s.recentLocked(), Tap: s.tapFor(voice, 0), Out: exchangeOutput{s: s, ex: ex}}
-	ex.x.Tools, ex.x.Room = exchangeTools{s: s, ex: ex}, s.roomOf(ex)
+	ex.x.Tools, ex.x.Room, ex.x.Claim = exchangeTools{s: s, ex: ex}, s.roomOf(ex), s.claimOf(ex)
 	s.bindMeetingLocked(ex, sessionID)
 	x := s.modelViewLocked(ex, &ex.x)
 	sayCtx, release := context.Context(ex.ctx), func() {}
@@ -2604,6 +2615,7 @@ func (s *Supervisor) endLocked(ex *exchange, cut bool, reason string) {
 		s.logf("voice: the exchange ended before its recording session (start %d) settled; its %d held timing lines name no session, as its session is unknown", ex.openSeq+1, len(ex.unsent))
 	}
 	ex.ended = true
+	s.roomChangedLocked(ex) // a delegation waiting for a final ends its wait
 	if ex.unbindMeeting != nil {
 		ex.unbindMeeting()
 	}
@@ -3050,8 +3062,9 @@ func (s *Supervisor) takenTexts(ex *exchange) map[uint64]string {
 // send after Open never repeats words the room took back since (Main, after
 // Sol's fifteenth review of #191). The recent words are ex's current view
 // (modelViewLocked); the asker's words are ex's current turn after its last
-// take-back (askerNowLocked), also once that turn was handed to an answer:
-// a voice that asks it again replays that turn, as the room said it.
+// take-back (askerNowLocked). The request is the turn's unclaimed finals
+// (requestLocked), read with the Changed that closes at the view's next
+// change, so no change falls between the two.
 func (s *Supervisor) roomOf(ex *exchange) func() RoomView {
 	return func() RoomView {
 		s.mu.Lock()
@@ -3063,7 +3076,88 @@ func (s *Supervisor) roomOf(ex *exchange) func() RoomView {
 		if asker := s.askerNowLocked(ex); asker != "" {
 			x.AskerTurn = asker
 		}
-		return RoomView{Live: true, Asker: x.AskerTurn, Recent: x.Recent, Revision: ex.roomRevision, TakeBacks: ex.takeBacks}
+		return RoomView{
+			Live: true, Asker: x.AskerTurn, Recent: x.Recent, Revision: ex.roomRevision, TakeBacks: ex.takeBacks,
+			Turn: ex.x.Turn, Request: s.requestLocked(ex), Changed: s.roomChangesLocked(ex),
+		}
+	}
+}
+
+// claimOf is ex's Exchange.Claim: it commits the request of turn up to
+// revision, if that is still ex's current, unclaimed request. A view read
+// before a later final, a take-back or another delegation's claim no longer
+// matches, so it claims nothing and its voice reads the room again.
+func (s *Supervisor) claimOf(ex *exchange) func(turn, revision uint64) bool {
+	return func(turn, revision uint64) bool {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		if ex.ended || ex.ctx.Err() != nil || turn != ex.x.Turn || revision != ex.roomRevision || s.requestLocked(ex) == "" {
+			return false
+		}
+		ex.claimedTurn, ex.claimedRev = turn, revision
+		s.roomChangedLocked(ex)
+		return true
+	}
+}
+
+// requestLocked is ex's current request (RoomView.Request): what survives the
+// take-back rule of the current turn's finals that no request claimed,
+// joined and keys written. Ownership is by final identity, never by text: a
+// turn's finals a claim covered are left out whatever they say, and a new
+// turn's finals are all in, even when the new turn repeats the last one word
+// for word (Sol's nineteenth review of #191, finding 3). The take-back is
+// found on the whole turn's raw finals, as the Concierge finds it, and then
+// mapped onto each final by its place in them.
+func (s *Supervisor) requestLocked(ex *exchange) string {
+	n := len(ex.turn)
+	if n == 0 {
+		return ""
+	}
+	first := 0 // the first final no claim covers
+	if ex.claimedTurn == ex.x.Turn {
+		for i := range n {
+			if ex.roomRevision-uint64(n-1-i) <= ex.claimedRev {
+				first = i + 1
+			}
+		}
+	}
+	if first == n {
+		return ""
+	}
+	finals := strings.Join(ex.turn, "\n")
+	cut := 0 // where the words after the turn's last take-back begin
+	if s.cfg.TakeBack != nil {
+		if rest, taken := s.cfg.TakeBack(finals); taken {
+			if !strings.HasSuffix(finals, rest) {
+				return "" // a cut the finals cannot place owns nothing
+			}
+			cut = len(finals) - len(rest)
+		}
+	}
+	var words []string
+	for i, at := 0, 0; i < n; i++ {
+		end := at + len(ex.turn[i])
+		if i >= first && end > cut {
+			words = append(words, strings.TrimSpace(finals[max(at, cut):end]))
+		}
+		at = end + 1 // past the newline
+	}
+	return s.withKeys(ex, strings.Join(strings.Fields(strings.Join(words, " ")), " "))
+}
+
+// roomChangesLocked is the channel that closes at ex's next room change.
+func (s *Supervisor) roomChangesLocked(ex *exchange) <-chan struct{} {
+	if ex.roomChanged == nil {
+		ex.roomChanged = make(chan struct{})
+	}
+	return ex.roomChanged
+}
+
+// roomChangedLocked tells every reader of ex's room that it changed.
+func (s *Supervisor) roomChangedLocked(ex *exchange) {
+	if ex.roomChanged != nil {
+		close(ex.roomChanged)
+		ex.roomChanged = nil
 	}
 }
 

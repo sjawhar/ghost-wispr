@@ -650,7 +650,7 @@ func TestADelegationBeforeTheRoomsFinalWaitsForIt(t *testing.T) {
 
 	c.delegate("item_q")
 	time.Sleep(100 * time.Millisecond)
-	rs.set(voice.RoomView{Live: true, Asker: "Wispr, what is the status of ABC-123?", Revision: 1})
+	rs.set(voice.RoomView{Live: true, Asker: "Wispr, what is the status of ABC-123?", Request: "Wispr, what is the status of ABC-123?", Revision: 1})
 	c.heard("Wispr, what is the status of ABC-123?")
 	ev := waitEvent(t, s, voice.EventToolCall)
 	var args voice.AnswerArgs

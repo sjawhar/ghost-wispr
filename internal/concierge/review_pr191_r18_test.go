@@ -60,35 +60,46 @@ func toolWithin(t *testing.T, v *watchedVoice, d time.Duration) string {
 }
 
 // TestVoiceBsRetryAfterWholeTakebackNeverRestoresTheQuestion (finding 1): a
-// whole-turn take-back empties the room's asker; later delegations with no new
-// room question never resurrect the canceled one. At 377b117 a second retry's
-// cached vendor words restored ABC-42. Control: with no take-back the room's
-// asker is answered.
+// whole-turn take-back empties the room's request; later delegations with no
+// new room question never resurrect the canceled one. At 377b117 a second
+// retry's cached vendor words restored ABC-42. A retry is a vendor event, not
+// a new request: with no new final it runs nothing, also with no take-back
+// (Main, after Sol's nineteenth review of #191). Control: the room says the
+// question again, a final of its own, and that is asked, so the check that
+// ABC-42 never comes back can see it when it does.
 func TestVoiceBsRetryAfterWholeTakebackNeverRestoresTheQuestion(t *testing.T) {
-	for _, cut := range []bool{true, false} {
-		name := "control: no take-back"
-		if cut {
-			name = "whole turn taken back"
-		}
-		t.Run(name, func(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		cut, says bool
+	}{
+		{"whole turn taken back", true, false},
+		{"no take-back, nothing new", false, false},
+		{"control: the room asks it again", false, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
 			r, v, w := openVoiceB(t)
 			if q, _ := delegate(t, w, v, r, "d1", 1000); q != "what about ABC-42?" {
 				t.Fatalf("first question %q, want the room's asker", q)
 			}
-			if cut {
+			if tc.cut {
 				r.hearNow("never mind", false)
 			}
+			if tc.says {
+				r.hearNow("what about ABC-42?", false)
+			}
 			for i, id := range []string{"d2", "d3"} {
-				// GPT-Live re-hears the canceled question; its transcript is
-				// never the question, so no retry resurrects it.
+				// GPT-Live re-hears the question; its transcript is never the
+				// question, so no retry resurrects it.
 				w.send(map[string]any{"type": "session.input_transcript.delta", "event_id": "heard-" + id, "delta": "what about ABC-42?", "start_ms": 0, "end_ms": 100})
 				sendDelegation(w, id, 2000+i*1000)
-				q := toolWithin(t, v, 2500*time.Millisecond)
-				if cut && strings.Contains(q, "ABC-42") {
-					t.Errorf("retry %s restored the canceled question: %q", id, q)
-				}
-				if !cut && q != "what about ABC-42?" {
-					t.Errorf("control retry %s %q, want the room's asker", id, q)
+				q := toolWithin(t, v, 1500*time.Millisecond)
+				switch {
+				case tc.says && i == 0:
+					if q != "what about ABC-42?" {
+						t.Errorf("control: the room's new final reached the tool as %q", q)
+					}
+				case strings.Contains(q, "ABC-42"):
+					t.Errorf("retry %s asked %q, with no new final of the room's", id, q)
 				}
 			}
 		})

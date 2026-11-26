@@ -73,7 +73,7 @@ func TestADelegationWithNothingNewAsksTheRoomsAsker(t *testing.T) {
 	if q := answerArgs(t, waitEvent(t, s, voice.EventToolCall).Call.Args).Question; q != "What is PR 81?" {
 		t.Fatalf("first question %q", q)
 	}
-	rs.set(voice.RoomView{Live: true, Asker: "And who holds it?", Revision: 2})
+	rs.set(voice.RoomView{Live: true, Asker: "And who holds it?", Request: "And who holds it?", Revision: 2})
 	c.heard(" And who holds it?")
 	c.delegate("item_2")
 	if q := answerArgs(t, waitEvent(t, s, voice.EventToolCall).Call.Args).Question; q != "And who holds it?" {
@@ -129,7 +129,7 @@ func TestADelegationDuringCloseRunsNoTool(t *testing.T) {
 	srv := newLiveServer(t)
 	s, c, _ := openSession(t, srv, testExchange(newFakeOutput(), tools))
 	c.heard("Wispr, what about ABC-123?")
-	time.Sleep(transcriptSettle + 50*time.Millisecond)
+	time.Sleep(300 * time.Millisecond)
 	closed := make(chan struct{})
 	go func() { _ = s.Close(); close(closed) }()
 	c.expect(evSessionClose)

@@ -46,7 +46,7 @@ func TestSolR5AuditUsesTheCurrentFollowUpKey(t *testing.T) {
 			if n := waitFactCheck(t, s); n != 0 {
 				t.Fatalf("initial unchanged key control failures=%d", n)
 			}
-			rs.set(voice.RoomView{Live: true, Asker: "What is happening with XYZ-456?", Revision: 2})
+			rs.set(voice.RoomView{Live: true, Asker: "What is happening with XYZ-456?", Request: "What is happening with XYZ-456?", Revision: 2})
 			c.heard("What is happening with XYZ-456?")
 			c.delegate("followup")
 			next := c.expect(evCommentaryAppend)

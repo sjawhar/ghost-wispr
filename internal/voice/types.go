@@ -43,7 +43,16 @@ type Exchange struct {
 	// an unpublished Open and its workers send nothing after the capture
 	// gate closed (Sol's sixteenth review of #191). nil, outside a
 	// Supervisor, means AskerTurn and Recent as they are.
-	Room  func() RoomView
+	Room func() RoomView
+	// Claim commits a request a voice read from Room (RoomView.Request) to
+	// the backend: it reports whether the finals of turn up to revision are
+	// still the room's current, unclaimed request, and marks them claimed if
+	// so. A voice sends a request only after Claim returned true, so two
+	// delegations waiting on one final ask it once, and a snapshot overtaken
+	// by a take-back or a newer final is read again rather than sent (Main,
+	// after Sol's nineteenth review of #191). nil, outside a Supervisor,
+	// claims every request.
+	Claim func(turn, revision uint64) bool
 	Tap   <-chan audio.Frame // room audio from the wake on, 16 kHz mono, only while the capture gate is open
 	Out   Output             // the speaker output's "voice" input
 	Tools ToolRunner         // the Concierge
@@ -73,19 +82,32 @@ type Exchange struct {
 }
 
 // RoomView is the room's words a vendor may read now (Exchange.Room). Asker
-// is the current turn's words after its last take-back, the only source of a
-// delegation's question; Recent is the cut recent view. Live is true for a
-// live exchange and false only for the ended or cancelled view, so revision
-// zero on a live view is a normal opening before the first final, not an end
-// (Main, after Sol's eighteenth review of #191). Revision increments at each
-// final, solely to order concurrent vendor delegations. TakeBacks increments
-// once per take-back, counted on the final with its obsolete interim removed.
+// is the current turn's words after its last take-back; Recent is the cut
+// recent view. Live is true for a live exchange and false only for the ended
+// or cancelled view, so revision zero on a live view is a normal opening
+// before the first final, not an end (Main, after Sol's eighteenth review of
+// #191). Revision increments at each final, solely to order concurrent
+// vendor delegations. TakeBacks increments once per take-back, counted on the
+// final with its obsolete interim removed.
+//
+// Request is the room's current request, owned by final identity rather than
+// by text: the surviving words, after the take-back rule, of turn Turn's
+// finals that no request has claimed yet (Exchange.Claim), keys written. It
+// holds no interim, which is not yet the room's word, and never a turn's
+// words a delegation already asked, so a follow-up is asked alone, while a
+// new turn is asked whole even when it repeats the last one word for word
+// (Main, after Sol's nineteenth review of #191). Changed closes at the next
+// change to the view: a final, a claim, or the exchange's end. A view and its
+// Changed are read together, so no change falls between them.
 type RoomView struct {
 	Live      bool
 	Asker     string
 	Recent    []TurnText
 	Revision  uint64
 	TakeBacks uint64
+	Turn      uint64
+	Request   string
+	Changed   <-chan struct{}
 }
 
 // TurnText is one final transcript segment.

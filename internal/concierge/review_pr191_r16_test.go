@@ -32,8 +32,10 @@ func delegate(t *testing.T, w *vendorWire, v *watchedVoice, r *cutRig, id string
 // #191, P2 1): GPT-Live heard ABC-42 before the room took it back. Its first
 // delegation correctly used Room's "what about ABC-12?", then the old
 // lastHeard won when the second delegation heard nothing new and brought
-// ABC-42 back to the model and holder. A delegation now uses Room's current
-// asker words whenever the room has them. Control: no take-back keeps ABC-42.
+// ABC-42 back to the model and holder. The first delegation uses the room's
+// request; the second, with no new final of the room's, has no request and
+// asks nothing at all (Main, after Sol's nineteenth review of #191), so the
+// old vendor words can win nothing. Control: no take-back keeps ABC-42.
 func TestVoiceBsCurrentQuestionWinsOverOldVendorWords(t *testing.T) {
 	for _, cut := range []bool{true, false} {
 		t.Run(fmt.Sprintf("take-back %v", cut), func(t *testing.T) {
@@ -57,12 +59,13 @@ func TestVoiceBsCurrentQuestionWinsOverOldVendorWords(t *testing.T) {
 			}
 			// GPT-Live heard only the question it has now lost or had replaced.
 			w.send(map[string]any{"type": "session.input_transcript.delta", "event_id": "old", "delta": "what about ABC-42?", "start_ms": 0, "end_ms": 100})
-			for i, id := range []string{"first", "second"} {
-				question, _ := delegate(t, w, v, r, id, 1000*(i+1))
-				contains := strings.Contains(question, "ABC-42")
-				if contains != !cut {
-					t.Errorf("delegation %s asked %q; ABC-42 present %v, want %v", id, question, contains, !cut)
-				}
+			question, _ := delegate(t, w, v, r, "first", 1000)
+			if contains := strings.Contains(question, "ABC-42"); contains != !cut {
+				t.Errorf("delegation first asked %q; ABC-42 present %v, want %v", question, contains, !cut)
+			}
+			sendDelegation(w, "second", 2000)
+			if q := toolWithin(t, v, 600*time.Millisecond); q != "" {
+				t.Errorf("delegation second asked %q with no new final of the room's", q)
 			}
 		})
 	}

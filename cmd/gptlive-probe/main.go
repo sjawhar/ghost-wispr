@@ -147,9 +147,11 @@ type delegationLog struct {
 	// Each is the session's own count, taken where it happens. sent must
 	// equal the sum of the rest; the probe checks that rather than assuming
 	// it, because a figure derived from the others cannot disagree with them.
+	// reported says the session gave an account at all: with none, every
+	// figure is its zero value, which is no measurement.
+	reported  bool
 	sent      time.Duration
 	toSpeaker time.Duration
-	withheld  time.Duration
 	muted     time.Duration
 	quiet     time.Duration
 	afterStop time.Duration
@@ -168,6 +170,7 @@ func (l *delegationLog) Handle(ctx context.Context, r slog.Record) error {
 		l.mu.Unlock()
 	case "gptlive: the model's audio this session":
 		l.mu.Lock()
+		l.reported = true
 		r.Attrs(func(a slog.Attr) bool {
 			d := time.Duration(a.Value.Int64()) * time.Millisecond
 			switch a.Key {
@@ -175,8 +178,6 @@ func (l *delegationLog) Handle(ctx context.Context, r slog.Record) error {
 				l.sent = d
 			case "to_speaker_ms":
 				l.toSpeaker = d
-			case "held_ms":
-				l.withheld = d
 			case "muted_ms":
 				l.muted = d
 			case "quiet_ms":
@@ -201,11 +202,12 @@ func (l *delegationLog) arrivedAt() (time.Time, bool) {
 	return l.first, !l.first.IsZero()
 }
 
-// audio is the session's account of where every sample the model sent went.
-func (l *delegationLog) audio() (sent, toSpeaker, withheld, muted, quiet, afterStop time.Duration) {
+// audio is the session's account of where every sample the model sent went,
+// and whether it gave one.
+func (l *delegationLog) audio() (reported bool, sent, toSpeaker, muted, quiet, afterStop time.Duration) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	return l.sent, l.toSpeaker, l.withheld, l.muted, l.quiet, l.afterStop
+	return l.reported, l.sent, l.toSpeaker, l.muted, l.quiet, l.afterStop
 }
 
 // delegationEvidence is the answer's code-like fact. GPT-Live's
@@ -389,7 +391,7 @@ func probe(ctx context.Context, cfg *probeConfig, out io.Writer) error {
 	}
 	begin = time.Now()
 	s, err := v.Open(ctx, &voice.Exchange{SessionID: "gptlive-probe", WakeAt: begin, Tap: tap, Out: rec, Tools: tools, Room: func() voice.RoomView {
-		return voice.RoomView{Live: true, Asker: asker, Revision: 1}
+		return voice.RoomView{Live: true, Asker: asker, Request: asker, Revision: 1}
 	}})
 	if err != nil {
 		return fmt.Errorf("session: %w", err)
@@ -822,17 +824,21 @@ func observeDelegation(ctx context.Context, cfg *probeConfig, in *feeder, tools 
 	} else {
 		printf(out, "observe: no delegation reached the client\n")
 	}
-	sent, toSpeaker, held, muted, quiet, afterStop := arrivals.audio()
+	reported, sent, toSpeaker, muted, quiet, afterStop := arrivals.audio()
 	// Each figure is counted where it happens, none derived from another, so
 	// the identity below can fail. A path that dropped the model's audio with
 	// no counter of its own shows as the difference.
-	printf(out, "observe: GPT-Live sent %v of audio; the client queued %v for the speaker, withheld %v while a delegation was outstanding, muted %v, dropped %v of silence outside a speech and %v after the session closed\n",
-		sent, toSpeaker, held, muted, quiet, afterStop)
-	printf(out, "observe: this sink received %v\n", spoke)
-	if accounted := toSpeaker + held + muted + quiet + afterStop; sent != accounted {
-		printf(out, "observe: WARNING GPT-Live sent %v but only %v is accounted for; %v went down a path with no counter\n", sent, accounted, sent-accounted)
+	if !reported {
+		printf(out, "observe: UNKNOWN the session gave no account of the model's audio: it ended no speech in the window\n")
+	} else {
+		printf(out, "observe: GPT-Live sent %v of audio; the client queued %v for the speaker, muted %v, dropped %v of silence outside a speech and %v after the session closed\n",
+			sent, toSpeaker, muted, quiet, afterStop)
+		if accounted := toSpeaker + muted + quiet + afterStop; sent != accounted {
+			printf(out, "observe: WARNING GPT-Live sent %v but only %v is accounted for; %v went down a path with no counter\n", sent, accounted, sent-accounted)
+		}
 	}
-	if toSpeaker > spoke+200*time.Millisecond {
+	printf(out, "observe: this sink received %v\n", spoke)
+	if reported && toSpeaker > spoke+200*time.Millisecond {
 		printf(out, "observe: WARNING the client queued %v for the speaker but the sink received %v\n", toSpeaker, spoke)
 	}
 	if at, ok := rec.firstAfter(ended); ok {
