@@ -106,6 +106,23 @@ differences() {
     "$(LC_ALL=C comm -13 <(printf '%s\n' "$1") <(printf '%s\n' "$2") | paste -sd ' ')"
 }
 
+name="the test's table is update.sh's SET_FILES and PROVISIONING_FILES"
+# update.sh's two lists, from a shell that runs their declarations alone: update.sh itself is not
+# sourced. The table's first nine files are the deploy set and its last five the provisioning files.
+declarations=$(awk '
+  /^readonly (SET_FILES|PROVISIONING_FILES)=\(/ { take = 1 }
+  take { print }
+  take && /\)/ { take = 0 }' "$repo_root/deploy/pi/update.sh")
+update_lists=$(bash --noprofile --norc -euc "$declarations"'
+  ((${#SET_FILES[@]} > 0 && ${#PROVISIONING_FILES[@]} > 0))
+  printf "set %s\n" "${SET_FILES[@]}"
+  printf "provisioning %s\n" "${PROVISIONING_FILES[@]}"' 2>&1) \
+  || fail "cannot read SET_FILES and PROVISIONING_FILES from deploy/pi/update.sh: $update_lists"
+update_lists=$(LC_ALL=C sort <<<"$update_lists")
+table_lists=$(printf 'set %s\n' "${names[@]:0:9}" && printf 'provisioning %s\n' "${names[@]:9}")
+table_lists=$(LC_ALL=C sort <<<"$table_lists")
+[[ $update_lists == "$table_lists" ]] || fail "update.sh's lists $(differences "$table_lists" "$update_lists")"
+
 # check_members TARBALL: the entries of TARBALL are ghost-wispr-pi-deploy/, the 14 files in it, and
 # its manifest.json, and nothing else.
 check_members() {
