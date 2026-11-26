@@ -34,52 +34,52 @@ func readSettingsFile(path string) (data []byte, found bool, err error) {
 	return data, true, nil
 }
 
-// applyLocalSettings returns the release config's YAML with the local
-// settings file's values over it. When the local settings file cannot be
-// read or parsed, it returns the release config's YAML and a warning.
-func applyLocalSettings(configPath string, releaseData []byte, releaseFound bool) (data []byte, found bool, warnings []string, err error) {
-	localPath := LocalSettingsPath(configPath)
-	localData, localFound, err := readSettingsFile(localPath)
+// applyLocalSettings merges the local settings file at localPath over the
+// effective release config, baseData, and over the release file as written,
+// releaseData. It returns both merged configs, and whether it applied the
+// file. When the file cannot be read or parsed, it returns baseData and
+// releaseData, and a warning.
+func applyLocalSettings(localPath string, baseData, releaseData []byte) (data, fileData []byte, applied bool, warnings []string) {
+	localData, found, err := readSettingsFile(localPath)
+	if err == nil && !found {
+		return baseData, releaseData, false, nil
+	}
+	if err == nil {
+		data, fileData, err = mergeLocalSettings(localData, baseData, releaseData)
+	}
 	if err != nil {
-		return releaseData, releaseFound, []string{localSettingsWarning(localPath, err)}, nil
+		return baseData, releaseData, false, []string{localSettingsWarning(localPath, err)}
 	}
-	if !localFound {
-		return releaseData, releaseFound, nil, nil
-	}
-	local, err := parseLocalSettings(localData)
-	if err != nil {
-		return releaseData, releaseFound, []string{localSettingsWarning(localPath, err)}, nil
-	}
+	return data, fileData, true, nil
+}
 
-	release := make(map[string]any)
-	if releaseFound {
-		if release, err = yamlSettings(releaseData); err != nil {
-			return nil, false, nil, fmt.Errorf("parse config file: %w", err)
-		}
-	}
-	merged, err := yaml.Marshal(mergeSettings(release, local))
+// mergeLocalSettings merges the local settings file's YAML over baseData, for
+// the running config, and over releaseData, for the warnings about a removed
+// setting.
+func mergeLocalSettings(localData, baseData, releaseData []byte) (data, fileData []byte, err error) {
+	local, err := yamlSettings(localData)
 	if err != nil {
-		return nil, false, nil, fmt.Errorf("merge local settings: %w", err)
+		return nil, nil, err
 	}
-	return merged, true, nil, nil
+	base, err := yamlSettings(baseData)
+	if err != nil {
+		return nil, nil, err
+	}
+	release, err := yamlSettings(releaseData)
+	if err != nil {
+		return nil, nil, err
+	}
+	if data, err = yaml.Marshal(mergeSettings(base, local)); err != nil {
+		return nil, nil, err
+	}
+	if fileData, err = yaml.Marshal(mergeSettings(release, local)); err != nil {
+		return nil, nil, err
+	}
+	return data, fileData, nil
 }
 
 func localSettingsWarning(path string, err error) string {
 	return fmt.Sprintf("%s: %v; settings saved on the page are not applied", path, err)
-}
-
-// parseLocalSettings parses a local settings file, and refuses one whose
-// values do not fit the config, so that the release config stays in effect.
-func parseLocalSettings(data []byte) (map[string]any, error) {
-	settings, err := yamlSettings(data)
-	if err != nil {
-		return nil, err
-	}
-	var typed Config
-	if err := yaml.Unmarshal(data, &typed); err != nil {
-		return nil, err
-	}
-	return settings, nil
 }
 
 func yamlSettings(data []byte) (map[string]any, error) {
@@ -93,10 +93,11 @@ func yamlSettings(data []byte) (map[string]any, error) {
 	return settings, nil
 }
 
-// mergeSettings puts the local values over the release values. Maps merge
-// key by key. A null local value removes the key, as when a summary preset
-// was deleted on the page. Each other local value, a list included, replaces
-// the release value.
+// mergeSettings puts the local values over the release values, in release.
+// Maps merge key by key, a summary preset's fields too. A null local value
+// removes the key, as when a preset was deleted on the page, the built-in
+// default preset included. Each other local value, a list included, replaces
+// the release value. It does not change local.
 func mergeSettings(release, local map[string]any) map[string]any {
 	for key, localValue := range local {
 		if localValue == nil {
@@ -116,37 +117,18 @@ func mergeSettings(release, local map[string]any) map[string]any {
 	return release
 }
 
-// wholeEntryMaps are the maps of struct entries, by their path in the config
-// file, whose entries a save writes whole. yaml.v3 decodes each entry of such
-// a map into a new zero struct, not over the entry the defaults hold, so an
-// entry written in part, such as a field of the built-in default preset,
-// would lose its other fields at the next start. Provider entries stay
-// partial: no settings save changes one, since a save of provider_keys goes
-// to .env.
-var wholeEntryMaps = map[string]bool{"summarization.presets": true}
-
 // settingsDifference returns the values of current that differ from release,
-// in the form mergeSettings reads: a map holds only its keys that differ, but
-// an entry of a wholeEntryMaps map that differs is whole, and a key that
-// current does not have is null.
+// in the form mergeSettings reads: a map holds only its keys that differ, a
+// summary preset's fields too, and a key that current does not have is null.
 func settingsDifference(current, release map[string]any) map[string]any {
-	return differenceAt("", current, release)
-}
-
-func differenceAt(path string, current, release map[string]any) map[string]any {
-	whole := wholeEntryMaps[path]
 	difference := make(map[string]any)
 	for key, currentValue := range current {
 		releaseValue, inRelease := release[key]
 		currentMap, currentIsMap := currentValue.(map[string]any)
 		releaseMap, releaseIsMap := releaseValue.(map[string]any)
 		switch {
-		case currentIsMap && releaseIsMap && !whole:
-			keyPath := key
-			if path != "" {
-				keyPath = path + "." + key
-			}
-			if nested := differenceAt(keyPath, currentMap, releaseMap); len(nested) != 0 {
+		case currentIsMap && releaseIsMap:
+			if nested := settingsDifference(currentMap, releaseMap); len(nested) != 0 {
 				difference[key] = nested
 			}
 		case !inRelease:

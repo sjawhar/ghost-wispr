@@ -275,48 +275,85 @@ func Load(path string) (Config, []string, error) {
 // only, so a settings change writes this one back. envFile is a .env file's
 // entries, which give a provider its key when the environment does not.
 func load(path string, envFile map[string]string) (cfg Config, fileLogLevel string, warnings []string, err error) {
-	cfg, fileLogLevel, warnings, _, err = loadConfig(path, envFile, false)
+	cfg, fileLogLevel, warnings, _, err = loadConfig(path, envFile)
 	return cfg, fileLogLevel, warnings, err
 }
 
-// loadConfig is load that, with withRelease, also returns the release config
-// alone: no local settings and no environment overrides. A settings save
-// writes only the values that differ from it. Both come from one read of the
-// release file, so a file replaced after the read changes neither.
-func loadConfig(path string, envFile map[string]string, withRelease bool) (cfg Config, fileLogLevel string, warnings []string, release Config, err error) {
-	var data []byte
-	var found bool
+// loadConfig is load that also returns the release config alone, as the YAML
+// map a config file holds: the running config as it would be with no local
+// settings file and no environment. A settings save writes only the values
+// that differ from it. Both come from one read of the release file, so a file
+// replaced after the read changes neither.
+func loadConfig(path string, envFile map[string]string) (cfg Config, fileLogLevel string, warnings []string, releaseSettings map[string]any, err error) {
+	var releaseData []byte
+	var releaseFound bool
 	if path != "" {
-		if data, found, err = readSettingsFile(path); err != nil {
-			return defaults(), "", nil, Config{}, fmt.Errorf("read config file: %w", err)
+		if releaseData, releaseFound, err = readSettingsFile(path); err != nil {
+			return defaults(), "", nil, nil, fmt.Errorf("read config file: %w", err)
 		}
 	}
-	if withRelease {
-		if release, _, _, err = decodeConfig(data, found, nil, false, nil); err != nil {
-			return release, "", nil, Config{}, err
-		}
+	release, err := releaseConfig(releaseData, releaseFound)
+	if err != nil {
+		return release, "", nil, nil, err
 	}
-	var localWarnings []string
+	// The effective release config: the release file over the defaults, as a
+	// config file. The local settings file merges over it key by key.
+	baseData, err := yaml.Marshal(&release)
+	if err != nil {
+		return release, "", nil, nil, fmt.Errorf("read the release config: %w", err)
+	}
+	validate(&release)
+	if releaseSettings, err = configSettings(&release); err != nil {
+		return release, "", nil, nil, fmt.Errorf("read the release config: %w", err)
+	}
+
+	warnings = deprecatedEnvoyEnvironmentWarnings()
+	// data is the config to decode. fileData is the config as its files
+	// write it, for the warnings about a removed setting.
+	data, fileData, applied := baseData, releaseData, false
 	if path != "" {
-		if data, found, localWarnings, err = applyLocalSettings(path, data, found); err != nil {
-			return defaults(), "", nil, Config{}, err
-		}
+		var localWarnings []string
+		data, fileData, applied, localWarnings = applyLocalSettings(LocalSettingsPath(path), baseData, releaseData)
+		warnings = append(warnings, localWarnings...)
 	}
-	cfg, fileLogLevel, warnings, err = decodeConfig(data, found, envFile, true, localWarnings)
-	return cfg, fileLogLevel, warnings, release, err
+	cfg, err = decodeEffectiveConfig(data)
+	if err != nil && applied {
+		// A value of the local settings file that does not fit its setting.
+		warnings = append(warnings, localSettingsWarning(LocalSettingsPath(path), err))
+		fileData = releaseData
+		cfg, err = decodeEffectiveConfig(baseData)
+	}
+	if err != nil {
+		return cfg, "", nil, nil, fmt.Errorf("parse config file: %w", err)
+	}
+	warnings = append(warnings, deprecatedEnvoyConfigWarnings(fileData)...)
+	warnings = append(warnings, removedSettingWarnings(fileData)...)
+
+	fileLogLevel = cfg.LogLevel
+	warnings = append(warnings, applyEnvOverrides(&cfg)...)
+	normalizeFileSettings(&cfg)
+	// An unknown light fails closed: dropping the setting would turn the light
+	// check off and let the recorder capture with no light on.
+	if cfg.IndicatorLight != "" && cfg.IndicatorLight != IndicatorLightBlink1 {
+		return cfg, "", warnings, nil, fmt.Errorf("indicator_light %q is not a known light: set it to %q, or leave it unset for a recorder with no light", cfg.IndicatorLight, IndicatorLightBlink1)
+	}
+	credentialPath := cfg.GoogleCredentialsFile
+	if credentialPath == "" {
+		credentialPath = os.Getenv("GOOGLE_APPLICATION_CREDENTIALS")
+	}
+	applyProviderDefaults(&cfg, inspectGoogleCredentialFile(credentialPath).serviceAccountProject)
+	loadSecrets(&cfg, envFile)
+	warnings = append(warnings, removedEnvironmentWarnings(&cfg, envFile)...)
+	warnings = append(warnings, validate(&cfg)...)
+	return cfg, fileLogLevel, warnings, releaseSettings, nil
 }
 
-// decodeConfig decodes a config file's YAML over the defaults. For the running
-// config, it also applies the environment overrides and loads the secrets,
-// and localWarnings follow the environment's warnings. For the release config
-// alone, it does neither: the result is only what a save compares with.
-func decodeConfig(data []byte, found bool, envFile map[string]string, runningConfig bool, localWarnings []string) (cfg Config, fileLogLevel string, warnings []string, err error) {
-	cfg = defaults()
-	if runningConfig {
-		warnings = deprecatedEnvoyEnvironmentWarnings()
-	}
-	warnings = append(warnings, localWarnings...)
-
+// releaseConfig decodes the release config file over the defaults, with no
+// environment: no override, and no credential file that only
+// GOOGLE_APPLICATION_CREDENTIALS names. A Vertex AI project that such a file
+// gives is a value from the environment, which a settings save writes.
+func releaseConfig(data []byte, found bool) (Config, error) {
+	cfg := defaults()
 	if found {
 		// A file that names its providers names its roles' models too: the
 		// defaults that name the default providers do not apply, and its
@@ -327,41 +364,37 @@ func decodeConfig(data []byte, found bool, envFile map[string]string, runningCon
 			clearQuickstartModels(&cfg)
 		}
 		if err := yaml.Unmarshal(data, &cfg); err != nil {
-			return cfg, "", nil, fmt.Errorf("parse config file: %w", err)
+			return cfg, fmt.Errorf("parse config file: %w", err)
 		}
-		warnings = append(warnings, deprecatedEnvoyConfigWarnings(data)...)
-		warnings = append(warnings, removedSettingWarnings(data)...)
 	}
+	normalizeFileSettings(&cfg)
+	applyProviderDefaults(&cfg, inspectGoogleCredentialFile(cfg.GoogleCredentialsFile).serviceAccountProject)
+	return cfg, nil
+}
 
-	fileLogLevel = cfg.LogLevel
-	if runningConfig {
-		warnings = append(warnings, applyEnvOverrides(&cfg)...)
+// decodeEffectiveConfig decodes the effective release config, with the local
+// settings file merged over it, into a zero Config, not over the defaults:
+// the data holds the defaults already, and a key the local settings file
+// deleted, such as the built-in default preset, must stay deleted.
+func decodeEffectiveConfig(data []byte) (Config, error) {
+	var cfg Config
+	if err := yaml.Unmarshal(data, &cfg); err != nil {
+		return Config{}, err
 	}
-	// A settings save under a build before the default followed the
-	// microphone's rate wrote its default, 60 s at 16000 Hz, into the file;
-	// read it as the default it was meant to be.
+	// A config file never holds the spotter's threads.
+	cfg.Voice.PausedListenerThreads = defaults().Voice.PausedListenerThreads
+	return cfg, nil
+}
+
+// normalizeFileSettings reads two settings as they are meant. A settings save
+// under a build before the default followed the microphone's rate wrote its
+// default, 60 s at 16000 Hz, into the file: it is the default it was meant to
+// be. The indicator light's name is in any case.
+func normalizeFileSettings(cfg *Config) {
 	if cfg.DeepgramBufferSize == oldDefaultDeepgramBufferSize {
 		cfg.DeepgramBufferSize = 0
 	}
-	// An unknown light fails closed: dropping the setting would turn the light
-	// check off and let the recorder capture with no light on. The release
-	// config alone is only a comparison, so an environment override can still
-	// correct its light.
 	cfg.IndicatorLight = strings.ToLower(strings.TrimSpace(cfg.IndicatorLight))
-	if runningConfig && cfg.IndicatorLight != "" && cfg.IndicatorLight != IndicatorLightBlink1 {
-		return cfg, "", warnings, fmt.Errorf("indicator_light %q is not a known light: set it to %q, or leave it unset for a recorder with no light", cfg.IndicatorLight, IndicatorLightBlink1)
-	}
-	credentialPath := cfg.GoogleCredentialsFile
-	if credentialPath == "" {
-		credentialPath = os.Getenv("GOOGLE_APPLICATION_CREDENTIALS")
-	}
-	applyProviderDefaults(&cfg, inspectGoogleCredentialFile(credentialPath).serviceAccountProject)
-	if runningConfig {
-		loadSecrets(&cfg, envFile)
-		warnings = append(warnings, removedEnvironmentWarnings(&cfg, envFile)...)
-	}
-	warnings = append(warnings, validate(&cfg)...)
-	return cfg, fileLogLevel, warnings, nil
 }
 
 // removedEnvoyKeys are the settings of the Envoy paths Ghost Wispr no longer

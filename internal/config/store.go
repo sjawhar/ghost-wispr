@@ -46,8 +46,8 @@ type Store struct {
 	// today.
 	writtenLogLevel string
 	// releaseSettings is the release config alone, as the YAML map a config
-	// file holds, read when the store loaded: a change writes the settings
-	// that differ from it. Nil when the store has no path.
+	// file holds, read when the store loaded, with no local settings and no
+	// environment: a change writes the settings that differ from it.
 	releaseSettings map[string]any
 	path            string
 	envPath         string
@@ -81,15 +81,9 @@ func NewStoreWithEnv(yamlPath, envPath string) (*Store, []string, error) {
 }
 
 func newStore(path, envPath string, envSecrets map[string]string) (*Store, []string, error) {
-	cfg, fileLogLevel, warnings, release, err := loadConfig(path, envSecrets, path != "")
+	cfg, fileLogLevel, warnings, releaseSettings, err := loadConfig(path, envSecrets)
 	if err != nil {
 		return nil, warnings, err
-	}
-	var releaseSettings map[string]any
-	if path != "" {
-		if releaseSettings, err = configSettings(&release); err != nil {
-			return nil, warnings, fmt.Errorf("read the release config: %w", err)
-		}
 	}
 	return &Store{
 		cfg:             cfg,
