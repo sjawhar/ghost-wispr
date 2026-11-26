@@ -57,6 +57,8 @@ readonly PROVISIONING_FILES=(provision.sh ghost-wispr-update-launcher.sh ghost-w
 readonly NAME_PATTERN='^[A-Za-z0-9_][A-Za-z0-9._-]*$'
 readonly COMMIT_PATTERN='^commit [0-9a-f]{40}$'
 readonly CERTIFICATE_PATTERN='^pi-secrets: certificate version ([0-9]+), not after ([^ ]+): newer and signs in$'
+# The states a call of /api/status can have (INFRA-5904's status contract), as a JSON array.
+readonly CALL_STATES='["none","checking","live"]'
 # Each step that waits has a bound of its own: each curl its --max-time, pi-secrets 60 s and a 5 s
 # grace, each sudo -n call 30 s, the Serve read 10 s, the version wait 120 s, and a rollback's
 # ROLLBACK_READS status reads. A restart of the recorder ends within its unit's own timeouts. The
@@ -193,11 +195,11 @@ restartable() {
 }
 
 # wait_for_commit COMMIT returns once the recorder answers /api/version with COMMIT and /api/status
-# with a status that recorder_status accepts, whose call is absent or an object with a state,
-# whether or not a session is in progress (R8), within 120 s. A release whose state the update
-# cannot read (no status, or a call it cannot read) would stop each later run at its first status
-# read, before it could install a fix. It reads the call itself: busy_reason reads the session
-# first, and so never reads the call during a session.
+# with a status that recorder_status accepts, whose call is absent or an object whose state is one
+# of CALL_STATES, whether or not a session is in progress (R8), within 120 s. A release whose state
+# the update cannot read (no status, or a call it cannot read) would stop each later run at its
+# first status read, before it could install a fix. It reads the call itself: busy_reason reads the
+# session first, and so never reads the call during a session.
 wait_for_commit() {
   local deadline answer commit status
   deadline=$(($(date +%s) + 120))
@@ -207,7 +209,8 @@ wait_for_commit() {
       commit=$(jq -r '.commit // empty' <<<"$answer" 2>/dev/null) || commit=''
       if [[ $commit == "$1" ]]; then
         status=$(recorder_status)
-        if [[ -n $status ]] && jq -e '.call == null or ((.call | type) == "object" and (.call.state | type) == "string")' \
+        if [[ -n $status ]] && jq -e --argjson states "$CALL_STATES" \
+          '.call == null or ((.call | type) == "object" and (.call.state as $state | any($states[]; . == $state)))' \
           >/dev/null 2>&1 <<<"$status"; then
           return 0
         fi
