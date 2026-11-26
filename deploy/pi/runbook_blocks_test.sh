@@ -118,6 +118,7 @@ for control in 'release bash deploy/pi/provision.sh --models' 'release ./provisi
     fail "the file check passed a $where block that it must refuse: $text"
   fi
 done
+# shellcheck disable=SC2016 # The text is block text, never expanded here.
 check_named control release 'source "${GHOST_WISPR_PI_ENV:-pi.env}" && ./provision.sh --key' \
   || fail 'the file check refused a release block that names only pi.env and provision.sh'
 
@@ -142,8 +143,8 @@ for name in "${blocks[@]}"; do
     pi_env=$repo_root/deploy/pi/files/pi.env
   fi
   for env_file in "$pi_env" "$test_env"; do
-    missing=$(unset_in "$env_file" "${variables[@]}")
-    [[ -z $missing ]] || fail "the $name block reads $(paste -sd ' ' <<<"$missing"), which $env_file does not set"
+    unset_names=$(unset_in "$env_file" "${variables[@]}")
+    [[ -z $unset_names ]] || fail "the $name block reads $(paste -sd ' ' <<<"$unset_names"), which $env_file does not set"
   done
 done
 
@@ -332,7 +333,7 @@ fi
 # --- dispatch-token: on a person's own device, in a checkout.
 
 # The neutral settings the block reads, which the fakes check its calls against.
-# shellcheck source=test-pi.env
+# shellcheck source=/dev/null
 source "$test_env"
 export PI_DISPATCH_URL PI_GCP_PROJECT PI_DISPATCH_TOKEN_SECRET
 readonly DISPATCH_SECRET=dispatch-token-secret-value-0123456789abcdef
