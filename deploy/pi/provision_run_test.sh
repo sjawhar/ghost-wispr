@@ -1225,8 +1225,8 @@ rm -f -- "$TEST_MANAGER_ENV" "$TEST_MANAGER_ENV_PENDING"
 
 # ---------------------------------------------------------------------------------------------------
 # key: provision.sh --key makes the Pi's P-256 key, mode 0600 in a directory of mode 0700, and
-# prints its certificate request for CN=ghost-wispr, for agent-infra's bootstrap. The key never
-# leaves the Pi, so a second --key refuses and keeps it.
+# prints its certificate request for CN=ghost-wispr, for the infrastructure's bootstrap. The key
+# never leaves the Pi, so a second --key refuses and keeps it.
 begin key
 new_pi
 rm -rf -- "$key_dir"
