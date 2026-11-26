@@ -46,6 +46,9 @@ readonly VERIFIED="$DEPLOY_DIR/deploy.verified"
 # The record of the update.sh before the deploy set, which installed the binary alone. The first
 # install of a set removes it.
 readonly OLD_VERIFIED="$DEPLOY_DIR/ghost-wispr.verified"
+# The journal of a swap of the certificate pair, device.crt and device.crt.version: the version the
+# pair gets (or none) and the SHA-256 of the certificate it installs (install_certificate_pair).
+readonly CERTIFICATE_JOURNAL="$DEPLOY_DIR/device.crt.version.new"
 # A rollback reads the status of a recorder whose state it could not read again every RECHECK_EVERY
 # seconds, and at most ROLLBACK_READS times.
 readonly RECHECK_EVERY=120 ROLLBACK_READS=3
@@ -311,14 +314,10 @@ render_env() {
   fi
 }
 
-# stage_certificate puts the certificate pi-secrets staged in the staging directory as device.crt,
-# and its version, the one pi-secrets named, as device.crt.version; the two install and roll back
-# together.
+# stage_certificate puts the certificate pi-secrets staged in the staging directory as device.crt;
+# swap_in installs it with its version, the one pi-secrets named, as device.crt.version.
 stage_certificate() {
   install -m 0644 -- "$certificate_staged" "$stage/new/device.crt" || fail "could not stage the new certificate"
-  if ! printf '%s\n' "$certificate_version" >"$stage/new/device.crt.version" || ! chmod 0644 "$stage/new/device.crt.version"; then
-    fail "could not stage the new certificate's version"
-  fi
 }
 
 # asset_url VARIABLE NAME sets VARIABLE to the URL of the latest release's asset NAME.
@@ -499,6 +498,61 @@ put_in_place() {
   mv -f -- "$dir/.${path##*/}.new" "$path"
 }
 
+# install_certificate_pair FILE VERSION installs FILE as device.crt, and VERSION (a number, or none
+# for no version file) as device.crt.version, as one change that a kill cannot split: it writes the
+# journal CERTIFICATE_JOURNAL first, then renames FILE over device.crt, then writes or removes the
+# version file (finish_certificate_pair). A run cut short in between leaves the journal, which the
+# next run finishes or drops (reconcile_certificate_journal). Each step is a rename or a removal.
+install_certificate_pair() {
+  local file=$1 version=$2 sha
+  sha=$(sum "$file") || return 1
+  printf 'version %s\nsha256 %s\n' "$version" "$sha" >"$DEPLOY_DIR/.device.crt.version.new.tmp" || return 1
+  chmod 0644 "$DEPLOY_DIR/.device.crt.version.new.tmp" || return 1
+  mv -f -- "$DEPLOY_DIR/.device.crt.version.new.tmp" "$CERTIFICATE_JOURNAL" || return 1
+  put_in_place "$file" "$DEPLOY_DIR/device.crt" || return 1
+  finish_certificate_pair "$version"
+}
+
+# finish_certificate_pair VERSION makes device.crt.version VERSION, mode 0644, by a rename, or
+# removes it for none, then removes the journal.
+finish_certificate_pair() {
+  local tmp=$DEPLOY_DIR/.device.crt.version.tmp
+  if [[ $1 == none ]]; then
+    rm -f -- "$DEPLOY_DIR/device.crt.version" || return 1
+  elif ! { printf '%s\n' "$1" >"$tmp" && chmod 0644 "$tmp" && mv -f -- "$tmp" "$DEPLOY_DIR/device.crt.version"; }; then
+    rm -f -- "$tmp"
+    return 1
+  fi
+  rm -f -- "$CERTIFICATE_JOURNAL"
+}
+
+# reconcile_certificate_journal puts right a certificate pair that a run cut short left: with the
+# journal's certificate installed, it finishes the pair; with any other, the certificate never went
+# in, and it removes the journal, so the pair before stays. A journal it cannot read is removed too.
+# Each run does this first: pi-secrets reads the installed version from device.crt.version, and
+# stages no certificate that is not newer, so no later read would correct a mismatched pair.
+reconcile_certificate_journal() {
+  local -a lines=()
+  local version='' sha=''
+  [[ -e $CERTIFICATE_JOURNAL ]] || return 0
+  mapfile -t lines <"$CERTIFICATE_JOURNAL" || lines=()
+  if ((${#lines[@]} == 2)) && [[ ${lines[0]} =~ ^version\ ([0-9]+|none)$ ]]; then
+    version=${BASH_REMATCH[1]}
+    if [[ ${lines[1]} =~ ^sha256\ ([0-9a-f]{64})$ ]]; then
+      sha=${BASH_REMATCH[1]}
+    fi
+  fi
+  if [[ -n $sha && -f $DEPLOY_DIR/device.crt && $(sum "$DEPLOY_DIR/device.crt") == "$sha" ]]; then
+    finish_certificate_pair "$version" \
+      || fail "could not finish the certificate swap that a run cut short ($CERTIFICATE_JOURNAL)"
+    printf 'ghost-wispr update: finished the certificate swap that a run cut short: device.crt.version is %s\n' "$version"
+    return 0
+  fi
+  rm -f -- "$CERTIFICATE_JOURNAL" || fail "could not remove $CERTIFICATE_JOURNAL"
+  printf 'ghost-wispr update: removed %s, of a run cut short before its certificate went in; device.crt and device.crt.version stay as they are\n' \
+    "$CERTIFICATE_JOURNAL"
+}
+
 # sudo_install SOURCE PATH installs a system file with sudo -n, under its bound.
 sudo_install() {
   timeout 30s sudo -n install -D -m 0644 -- "$1" "$2"
@@ -524,12 +578,18 @@ reload_system() {
 
 # swap_in NAME... puts each staged file NAME ($stage/new/NAME) in place, and notes it in swapped,
 # and each system file that changed in changed_system. A system file equal to the installed one is
-# left as it is. It returns non-zero at the first file it could not install.
+# left as it is. device.crt goes in with its version file, device.crt.version, as one change
+# (install_certificate_pair). It returns non-zero at the first file it could not install.
 swap_in() {
   local name path
   for name in "$@"; do
     path=$(installed_path "$name")
-    if is_system_file "$name"; then
+    if [[ $name == device.crt.version ]]; then
+      continue
+    elif [[ $name == device.crt ]]; then
+      swapped+=(device.crt device.crt.version)
+      install_certificate_pair "$stage/new/device.crt" "$certificate_version" || return 1
+    elif is_system_file "$name"; then
       if [[ -f $path ]] && cmp -s -- "$stage/new/$name" "$path"; then
         continue
       fi
@@ -546,16 +606,16 @@ swap_in() {
 # restore_previous WHY puts back each file this run swapped in from its .prev copy, byte for byte,
 # and, when restore_all is set, every other file of the set and .env that has a .prev copy. The
 # certificate and its version file go back only when this run swapped them in: one that an earlier
-# run installed passed pi-secrets' checks, and its .prev copy is an older certificate. The two are
-# kept and swapped together, so device.crt.prev with no device.crt.version.prev means the Pi had no
-# version file (provision.sh --certificate writes none): the version file this run swapped in goes,
-# and counts as restored. Then it reloads the user units, and reloads udev or restarts logind when
-# their file changed. It sets restore_problems to what it could not do: a reload, or a file swapped
-# in with no .prev copy, which stays as installed; and restore_note to what went back. When no file
-# has a .prev copy it fails with WHY: no previous release to restore (R6). It writes no
-# deploy.verified.
+# run installed passed pi-secrets' checks, and its .prev copy is an older certificate. The two go
+# back as one change (install_certificate_pair), from device.crt.prev and the number in
+# device.crt.version.prev; device.crt.prev with no device.crt.version.prev means the Pi had no
+# version file (provision.sh --certificate writes none), and the version file this run swapped in
+# goes. Then it reloads the user units, and reloads udev or restarts logind when their file
+# changed. It sets restore_problems to what it could not do: a reload, or a file swapped in with no
+# .prev copy, which stays as installed; and restore_note to what went back. When no file has a
+# .prev copy it fails with WHY: no previous release to restore (R6). It writes no deploy.verified.
 restore_previous() {
-  local why=$1 name path prev names=("${swapped[@]}") restored=() missing=() system=()
+  local why=$1 name path prev version names=("${swapped[@]}") restored=() missing=() system=()
   restore_problems='' restore_note='restored the previous release'
   if $restore_all; then
     for name in "${SET_FILES[@]}" ghost-wispr .env; do
@@ -565,13 +625,30 @@ restore_previous() {
   for name in "${names[@]}"; do
     path=$(installed_path "$name")
     prev=$DEPLOY_DIR/$name.prev
+    if [[ $name == device.crt.version ]]; then
+      continue
+    fi
     if [[ ! -f $prev ]]; then
-      if [[ $name == device.crt.version && -f $DEPLOY_DIR/device.crt.prev ]]; then
-        rm -f -- "$path" || fail "$why; could not remove $path, which the Pi did not have before"
-        restored+=("$name")
-      elif [[ " ${swapped[*]} " == *" $name "* ]]; then
+      if [[ " ${swapped[*]} " == *" $name "* ]]; then
         missing+=("$name")
+        if [[ $name == device.crt ]]; then
+          missing+=(device.crt.version)
+        fi
       fi
+      continue
+    fi
+    if [[ $name == device.crt ]]; then
+      # A version file that does not hold one number goes back as none: pi-secrets passes no
+      # version for either.
+      version=none
+      if [[ -f $DEPLOY_DIR/device.crt.version.prev ]]; then
+        version=$(<"$DEPLOY_DIR/device.crt.version.prev") || version=none
+        [[ $version =~ ^[0-9]+$ ]] || version=none
+      fi
+      cp --preserve=mode -- "$prev" "$DEPLOY_DIR/.device.crt.rollback" || fail "$why; could not restore $path from $prev"
+      install_certificate_pair "$DEPLOY_DIR/.device.crt.rollback" "$version" \
+        || fail "$why; could not restore $path and its version file from $prev and $DEPLOY_DIR/device.crt.version.prev"
+      restored+=(device.crt device.crt.version)
       continue
     fi
     if is_system_file "$name"; then
@@ -830,8 +907,10 @@ install_release() {
     install_names+=(device.crt device.crt.version)
   fi
 
-  # A session or a call that started during the download stops the run here.
+  # A session or a call that started during the download stops the run here, and so does a bridge
+  # that stopped accepting the release while it downloaded.
   leave_if_busy
+  hold_if_bridge_rejects
   if [[ -f $VERIFIED ]]; then
     if installed_set_is_verified; then
       keep=true
@@ -895,8 +974,40 @@ install_release() {
   fi
 }
 
-nightly() {
+# hold_if_bridge_rejects compares the call bridge's link versions, in the status read last
+# (status_json), with the release's (C6). A release that shares none with the bridge could not link
+# to it, and waits: the run prints both lists, refreshes the secrets and a renewed certificate of
+# the release the Pi runs (R7), as when it is current, when the installed set is the one
+# deploy.verified lists, and ends with exit 0. It runs at the first status read, and again at the
+# read just before the swap, since the bridge can change its list while the release downloads; the
+# refresh drops what the run staged for the release before it reads the secrets again with the
+# installed binary.
+hold_if_bridge_rejects() {
   local held verified_line
+  held=$(jq -nr --argjson status "${status_json:-null}" --slurpfile manifest "$manifest_json" '
+    ($status.call.link_versions? // null) as $bridge | ($manifest[0].link_versions // null) as $release
+    | if ($bridge | type) == "array" and ($bridge | length) > 0 and ($release | type) == "array"
+        and ([$bridge[] as $b | $release[] | select(. == $b)] | length) == 0
+      then "ghost-wispr update: held: the bridge accepts link versions \($bridge | tojson), this release \($release | tojson)"
+      else empty end') || fail "could not compare the bridge's link versions with the release's"
+  [[ -n $held ]] || return 0
+  printf '%s\n' "$held"
+  if installed_set_is_verified; then
+    # The commit deploy.verified names is the one the running release answers.
+    verified_line=$(head -n1 -- "$VERIFIED")
+    release_commit=${verified_line#commit }
+    if ! { rm -rf -- "$stage/secrets" "$stage/new" && mkdir -- "$stage/new"; }; then
+      fail "could not empty the staging directory $stage for the refresh of the release the Pi runs"
+    fi
+    secrets_file='' secrets_failure='' certificate_staged='' certificate_version='' certificate_end=''
+    require_no_override
+    refresh_current
+  fi
+  exit 0
+}
+
+nightly() {
+  reconcile_certificate_journal
   remove_stale_stages
   leave_if_busy
 
@@ -925,26 +1036,8 @@ nightly() {
     return 0
   fi
 
-  # The call bridge's link versions and the release's (C6): a release that shares none with the
-  # bridge could not link to it, and waits.
-  held=$(jq -nr --argjson status "${status_json:-null}" --slurpfile manifest "$manifest_json" '
-    ($status.call.link_versions? // null) as $bridge | ($manifest[0].link_versions // null) as $release
-    | if ($bridge | type) == "array" and ($bridge | length) > 0 and ($release | type) == "array"
-        and ([$bridge[] as $b | $release[] | select(. == $b)] | length) == 0
-      then "ghost-wispr update: held: the bridge accepts link versions \($bridge | tojson), this release \($release | tojson)"
-      else empty end') || fail "could not compare the bridge's link versions with the release's"
-  if [[ -n $held ]]; then
-    printf '%s\n' "$held"
-    # The release the Pi runs still takes new secrets and a renewed certificate while a newer one
-    # waits, as when it is current: the commit deploy.verified names is the one it answers.
-    if installed_set_is_verified; then
-      verified_line=$(head -n1 -- "$VERIFIED")
-      release_commit=${verified_line#commit }
-      require_no_override
-      refresh_current
-    fi
-    exit 0
-  fi
+  # The call bridge's link versions and the release's, from the first status read.
+  hold_if_bridge_rejects
 
   require_no_override
   install_release
@@ -953,6 +1046,7 @@ nightly() {
 }
 
 secrets_mode() {
+  reconcile_certificate_journal
   remove_stale_stages
   [[ -x $BINARY ]] || fail "there is no installed binary at $BINARY to read the secrets with"
   make_stage
