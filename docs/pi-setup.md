@@ -58,7 +58,8 @@ A new Pi needs these before `provision.sh` runs. Each is in place for the office
 4. The tailnet policy gives `tag:ghost-wispr` the Envoy hub's 4222 and 9020
    (theorem-labs/agent-infra#4761, `seed`'s `root` job). Ghost Wispr publishes its events to the
    hub's listener, `envoy_hub_url` in `ghost-wispr.yaml`, over the tailnet with no credential;
-   until the policy applies, the events wait on the Pi and go out with the first sweep after it.
+   until the policy applies, the events wait on the Pi, and the publisher's five-minute sweep sends
+   them once the hub takes them (README, "Envoy events").
 5. The latest Ghost Wispr release has `ghost-wispr-pi-deploy.tar.gz` and its `.sha256`.
 
 The Pi's certificate is signed after the Pi makes its key ("Provision", steps 2 to 4).
@@ -772,9 +773,9 @@ off at once, as the button counts the unit as resumed, though the blink(1) stays
 confirmed; if the light refuses the resume, the ring shows Muted again. Other programs
 that open the blink(1), such as `blink1-tool`, do not take the lock: do not run them while the
 recorder runs, since their own colour read can still answer the recorder's. A process stopped while
-it holds the lock (`kill -STOP`) keeps it;
-the slice 1 driver's Light hang step therefore stops the recorder with `flock` on the node, between
-two of its commands.
+it holds the lock (`kill -STOP`) keeps it. So the Light hang step of `deploy/pi/accept-slice1.sh`
+("Accept slice 1"), which stops the recorder and requires the blink(1) dark within 3 seconds, stops
+it with `flock` on the node, between two of its commands.
 
 Do not open the Jabra's microphone or speaker with another program, such as `arecord`, `aplay` or
 a second Ghost Wispr, while the unit runs with the Jabra button on. Ghost Wispr cannot see that
@@ -1233,8 +1234,20 @@ than 300 ms after its audio starts. Remove the private directory afterwards.
 ## Accept the meeting voice
 
 `deploy/pi/accept-voice.sh` runs slice 1 of the meeting voice on the loopback, so nothing plays in
-the room and nothing of the room is recorded. Run it on the Pi as `ghost-wispr`, outside meetings,
-with the unit paused and no session active:
+the room and nothing of the room is recorded. The Pi's release does not hold the driver, so copy it
+to the Pi from a tailnet member device, in a checkout of the commit the Pi runs (its
+`/api/version`), with `recording-times.awk`, which the driver reads beside itself:
+
+```bash
+d=$(ssh ghost-wispr@ghost-wispr 'mktemp -d') &&
+scp deploy/pi/accept-voice.sh deploy/pi/recording-times.awk "ghost-wispr@ghost-wispr:$d/" &&
+printf '%s\n' "$d"
+```
+
+Run the steps below on the Pi as `ghost-wispr`, in the directory that the block printed, outside
+meetings, with the unit paused and no session active. The driver needs `curl`, `jq` and `python3`
+on the Pi, and refuses when one is missing. Remove the directory afterwards
+(`ssh ghost-wispr@ghost-wispr "rm -r -- '$d'"`).
 
 1. `sudo modprobe snd-aloop`, as in "Inject speech for acceptance".
 2. Make a WAV of the question, such as "Wispr, what is happening with the issue about the meeting
@@ -1477,9 +1490,11 @@ deploy/pi/accept-slice2.sh --self-test
 deploy/pi/accept-slice2.sh --drive-members "$members_file" --readers-group "$readers_group" --cert-test
 ```
 
-`--drive-members FILE` is the shared drive's member list from the Drive owner, one
+`--drive-members FILE` is the shared drive's member list, as the drive's Manager reads it on its
+"Manage members" page in Google Drive (the app's `drive.file` scope cannot read it), one
 `email|role` line each with Drive API role names (`organizer`, `fileOrganizer`, `writer`,
-`commenter`, `reader`). `--readers-group EMAIL` is the approved readers group from Task 2.4.
+`commenter`, `reader`). `--readers-group EMAIL` is the readers' Google group that the drive's
+Manager added as its one Viewer.
 `--cert-test` reads `/api/status` from a test instance on the Pi
 at `127.0.0.1:8081`. The binary has no `--config` flag. Put the test credential file and
 its certificate config in a private temporary directory, point the copied certificate config
