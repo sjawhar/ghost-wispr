@@ -382,23 +382,41 @@ workflow_block() {
     END { exit !(found && ended) }' "$workflow"
 }
 
+# job_block NAME prints the lines of the job NAME of release.yml, after its "  NAME:" line.
+job_block() {
+  awk -v job="  $1:" '
+    $0 == job { inside = 1; found = 1; next }
+    /^  [A-Za-z0-9_-]+:$/ { inside = 0 }
+    inside { print }
+    END { exit !found }' "$workflow"
+}
+
 name='the release job runs the build on the arm64 runner'
 workflow_block deploy-tarball-command >"$work/build-step.sh" \
   || fail "release.yml has no command between '# deploy-tarball-command:start' and '# deploy-tarball-command:end'"
-release_job=$(awk '/^  release:$/ { job = 1; next } /^  [A-Za-z0-9_-]+:$/ { job = 0 } job' "$workflow")
+release_job=$(job_block release) || fail 'release.yml has no release job'
 [[ $release_job == *'# deploy-tarball-command:start'* ]] || fail 'the build command is not a step of the release job'
 grep -qx '    runs-on: ubuntu-24.04-arm' <<<"$release_job" || fail 'the release job does not run on ubuntu-24.04-arm'
 
-# step_holding TEXT prints the step of the release job that holds TEXT, from its "- " line.
+# step_holding TEXT [JOB] prints the step of JOB, the release job by default, that holds TEXT, from
+# its "- " line.
 step_holding() {
   awk -v text="$1" '
     /^      - / { if (found) exit; step = "" }
     { step = step $0 "\n" }
     index($0, text) { found = 1 }
-    END { if (found) printf "%s", step; exit !found }' <<<"$release_job"
+    END { if (found) printf "%s", step; exit !found }' <<<"${2:-$release_job}"
 }
 # line_of TEXT prints the number of the first line of the release job that holds TEXT.
 line_of() { grep -nF -m1 -- "$1" <<<"$release_job" | cut -d: -f1; }
+# with_value STEP KEY prints the value of KEY in the with: block of STEP, and fails when it sets none.
+with_value() {
+  awk -v key="$2:" '
+    /^ *with:$/ { match($0, /^ */); indent = RLENGTH; inside = 1; next }
+    inside { match($0, /^ */); if (RLENGTH <= indent) inside = 0 }
+    inside && $1 == key { sub(/^ *[^ ]+ */, ""); print; found = 1 }
+    END { exit !found }' <<<"$1"
+}
 
 name="the release job builds the tarball after the binary's self-test and uploads it after"
 selftest_line=$(line_of 'kws-selftest') || fail 'the release job runs no kws-selftest'
@@ -432,14 +450,40 @@ step_dir=$(unpack "$checkout/ghost-wispr-pi-deploy.tar.gz" "$work/step.unpacked"
 check_set "$step_dir" || fail "the files of the step's tarball are not the deploy set"
 check_manifest "$step_dir" "$commit" "$checkout/ghost-wispr-linux-arm64" || fail "the step's manifest does not match"
 
+name="the publish job needs the release job and downloads its artifact"
+publish_job=$(job_block publish) || fail 'release.yml has no publish job'
+needs=$(grep -x '    needs: .*' <<<"$publish_job") || fail 'the publish job has no needs: line'
+# One job (needs: release) or a flow list (needs: [lint, release]).
+needs=${needs#*needs: } && needs=${needs#'['} && needs=${needs%']'}
+[[ ",${needs// /}," == *,release,* ]] || fail "the publish job needs [$needs], not the release job"
+uploads=$(grep -cF 'uses: actions/upload-artifact@' <<<"$release_job") || uploads=0
+downloads=$(grep -cF 'uses: actions/download-artifact@' <<<"$publish_job") || downloads=0
+((uploads == 1 && downloads == 1)) \
+  || fail "the release job has $uploads upload-artifact steps and the publish job $downloads download-artifact steps, not one each"
+upload_step=$(step_holding 'uses: actions/upload-artifact@')
+download_step=$(step_holding 'uses: actions/download-artifact@' "$publish_job")
+upload_name=$(with_value "$upload_step" name) || fail 'the upload step names no artifact'
+download_name=$(with_value "$download_step" name) \
+  || fail 'the download step names no artifact, so it would put each artifact in a directory of its own'
+[[ $download_name == "$upload_name" ]] \
+  || fail "the publish job downloads the artifact $download_name, but the release job uploads $upload_name"
+if download_path=$(with_value "$download_step" path); then
+  fail "the download step sets path: $download_path, but the publish command reads the assets from the job's working directory"
+fi
+if grep -q 'working-directory:' <<<"$publish_job"; then
+  fail "the publish job sets a working-directory, but the download step puts the assets in the job's working directory"
+fi
+
 name='the release job uploads the five assets to the publish job'
 upload_paths=$(awk '
-  /uses: actions\/upload-artifact@/ { step = 1; next }
-  step && /^ *path: [|]$/ { paths = 1; match($0, /^ */); indent = RLENGTH; next }
-  paths { match($0, /^ */); if (RLENGTH <= indent) exit; sub(/^ +/, ""); print }' "$workflow")
+  /^ *path: [|]$/ { paths = 1; match($0, /^ */); indent = RLENGTH; next }
+  paths { match($0, /^ */); if (RLENGTH <= indent) exit; sub(/^ +/, ""); print }' <<<"$upload_step")
 [[ $(sorted_lines "$upload_paths") == "$(sorted_lines "${expected_assets[@]}")" ]] \
   || fail "the upload step $(differences "$(sorted_lines "${expected_assets[@]}")" "$(sorted_lines "$upload_paths")")"
-# The publish job's directory holds what the upload step names, as download-artifact gives it.
+# This copy stands in for the handoff between the two jobs, which the test cannot run: the release
+# job's upload-artifact step and the publish job's download-artifact step. The checks above are what
+# makes the copy faithful: the publish job needs the release job, downloads the artifact of the
+# upload's name with no path, and runs the publish command in the directory the download fills.
 publish=$work/publish
 mkdir -- "$publish"
 while IFS= read -r path; do
