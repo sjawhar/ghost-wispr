@@ -347,8 +347,9 @@ restarts the recorder, and a restart ends a conversation that is being recorded.
 
    The status must show exactly `Tags: ["tag:ghost-wispr"]` and
    `DNSName: "ghost-wispr.tail12ec1c.ts.net."`, and `curl` must print the release's commit over a
-   valid certificate. If the certificate check fails, run the release's `provision.sh` again (steps
-   1 and 5), which applies `serve.conf` and stops after "already joined", and run `curl` again.
+   valid certificate. If the certificate check fails, run `./provision.sh` again in the directory of
+   the release the Pi runs ("Update and inspect", "Apply a provisioning change"), which applies
+   `serve.conf` and stops after "already joined", and run `curl` again.
 
    `jq` prints `RouteAll`, the Pi's Tailscale setting that `--accept-routes` controls. It must read
    `true` after the join's route check accepted the routes, and `false` after the check refused
@@ -591,27 +592,8 @@ makes the same checks ("Update and inspect"). Remove the drop-in and run the ste
 
 Run it only from the release the Pi runs, which can be older than the latest release: the models
 step installs that release's `ghost-wispr.yaml`, and the Pi's binary must not run on a newer
-release's config. When check 1 of `check-deploy.sh` passes ("Update and inspect"), the Pi runs the
-latest release, and the release directory of "Provision", step 1, is that release. Otherwise, on
-the Pi as `ghost-wispr`, download the release whose commit `/api/version` names:
-
-<!-- runbook_blocks_test.sh: download-commit -->
-```bash
-c=$(curl -fsS http://127.0.0.1:8080/api/version | jq -er .commit) &&
-t=$(curl -fsS 'https://api.github.com/repos/sjawhar/ghost-wispr/releases?per_page=100' |
-  jq -er --arg c "$c" '[.[] | select(.target_commitish == $c)][0].tag_name') &&
-d=$(mktemp -d) && cd "$d" &&
-u="https://github.com/sjawhar/ghost-wispr/releases/download/$t" &&
-curl -fsSLO "$u/ghost-wispr-pi-deploy.tar.gz" &&
-curl -fsSLO "$u/ghost-wispr-pi-deploy.tar.gz.sha256" &&
-sha256sum -c ghost-wispr-pi-deploy.tar.gz.sha256 &&
-tar -xzf ghost-wispr-pi-deploy.tar.gz &&
-cd ghost-wispr-pi-deploy
-```
-
-`sha256sum` must print `ghost-wispr-pi-deploy.tar.gz: OK`. The block looks for the commit among
-the latest 100 releases, and stops before it makes a directory when none of them has it. Then, in
-that release directory, run the models step with the shared drive's ID:
+release's config. Enter that release's directory on the Pi as "Update and inspect", "The release
+the Pi runs" says. Then, in that release directory, run the models step with the shared drive's ID:
 
 <!-- runbook_blocks_test.sh: models -->
 ```bash
@@ -1022,10 +1004,43 @@ ssh ghost-wispr@ghost-wispr 'curl -fsS http://127.0.0.1:8080/api/version'
 ssh ghost-wispr@ghost-wispr 'XDG_RUNTIME_DIR=/run/user/$(id -u) systemctl --user list-timers ghost-wispr-update.timer'
 ```
 
+### The release the Pi runs
+
+The models step and a provisioning change run `provision.sh` from the release the Pi runs, which
+can be older than the latest release: a busy night, a held release or a failed install leaves the
+Pi on an older one. When check 1 of `check-deploy.sh` passes, the Pi runs the latest release, and
+the directory of "Provision", step 1, is that release. Otherwise, on the Pi as `ghost-wispr`,
+download the release whose commit `/api/version` names:
+
+<!-- runbook_blocks_test.sh: download-commit -->
+```bash
+c=$(curl -fsS http://127.0.0.1:8080/api/version | jq -er .commit) &&
+t=$(curl -fsS 'https://api.github.com/repos/sjawhar/ghost-wispr/releases?per_page=100' |
+  jq -er --arg c "$c" '[.[] | select(.target_commitish == $c)][0].tag_name') &&
+d=$(mktemp -d) && cd "$d" &&
+u="https://github.com/sjawhar/ghost-wispr/releases/download/$t" &&
+curl -fsSLO "$u/ghost-wispr-pi-deploy.tar.gz" &&
+curl -fsSLO "$u/ghost-wispr-pi-deploy.tar.gz.sha256" &&
+sha256sum -c ghost-wispr-pi-deploy.tar.gz.sha256 &&
+tar -xzf ghost-wispr-pi-deploy.tar.gz &&
+cd ghost-wispr-pi-deploy
+```
+
+`sha256sum` must print `ghost-wispr-pi-deploy.tar.gz: OK`. The block looks for the commit among
+the latest 100 releases, and stops before it makes a directory when none of them has it. The shell
+is then in that release's directory, in `/tmp`.
+
 ### Apply a provisioning change
 
-On the Pi, download the release ("Provision", step 1), then run `./provision.sh` in the release
-directory. On a provisioned Pi it does what step 5 of "Provision" says: it writes no credential
+On the Pi, enter the directory of the release the Pi runs ("The release the Pi runs"), and run
+`./provision.sh` there. Run it from no other release. `provision.sh` installs its own release's
+`update.sh`, `pi-lib.sh` and `pi.env` before it starts the update. From a newer release, those files
+would no longer be the set that `deploy.verified` lists, so the update would keep the older `.prev`
+copies, and a failed install of the newer release would roll the Pi back two releases. So
+`provision.sh` refuses when `deploy.verified` names another commit than its own release's, and a
+provisioning change of a new release is applied after the nightly update installs that release.
+
+On a provisioned Pi, `provision.sh` does what step 5 of "Provision" says: it writes no credential
 file and prints `credentials: same as pi.env renders`, or the names of the fields that differ. It
 installs the launcher, the update unit and timer, and the release's `update.sh`, `pi-lib.sh` and
 `pi.env`, starts the nightly update once, applies `serve.conf`, and stops after "already joined".
@@ -1055,8 +1070,9 @@ variables Ghost Wispr no longer reads, so that line stays through each release. 
 
 A release that changes a provisioning file (the launcher, `ghost-wispr-update.service`,
 `ghost-wispr-update.timer` or `serve.conf`) reaches the Pi only when a person runs that release's
-`provision.sh` ("Update and inspect", "Apply a provisioning change"). Until then, each night's run
-prints its drift line, and check 7 of `check-deploy.sh` fails.
+`provision.sh`, once the Pi runs that release ("Update and inspect", "Apply a provisioning
+change"). Until then, each night's run prints its drift line, and check 7 of `check-deploy.sh`
+fails.
 
 The morning after the release publishes, check it from a tailnet member device, in a checkout:
 
