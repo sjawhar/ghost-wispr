@@ -113,13 +113,17 @@ jq -n --arg a "$commit_a" --arg ta "$tag_a" --arg b "$commit_b" --arg tb "$tag_b
 
 # named_files prints each file the text on stdin names: each word that ends in a file suffix, less a
 # leading ./, and not an absolute path, a path under ~ or a path under a variable. The path in the
-# default of ${VARIABLE:-path} counts.
+# default of ${VARIABLE:-path} counts. A word ending in .service or .timer with no / is a systemd
+# unit's name, not a file, and the body of a here-document is the script ssh sends to the Pi, which
+# names the Pi's files.
 named_files() {
-  sed -E 's/\$\{[A-Za-z_][A-Za-z0-9_]*:-/ /g
+  awk '/<<.?EOF.?$/ { print; body = 1; next } body && $0 == "EOF" { body = 0; next } !body { print }' \
+    | sed -E 's/\$\{[A-Za-z_][A-Za-z0-9_]*:-/ /g
     s/\$\{?[A-Za-z_][A-Za-z0-9_]*\}?\/[^[:space:]"'\'')]*//g
     s/\$\{?[A-Za-z_][A-Za-z0-9_]*\}?//g' \
     | { grep -oE '[~A-Za-z0-9._/-]+' || true; } \
     | { grep -E '^[A-Za-z0-9_.][A-Za-z0-9._/-]*\.(sh|env|conf|yaml|yml|json|service|timer|rules|gz|sha256|crt|pem|awk|txt)$' || true; } \
+    | { grep -vE '^[^/]*\.(service|timer)$' || true; } \
     | sed 's#^\./##' | LC_ALL=C sort -u
 }
 
@@ -164,6 +168,12 @@ done
 # shellcheck disable=SC2016 # The text is block text, never expanded here.
 check_named control release 'source "${GHOST_WISPR_PI_ENV:-pi.env}" && ./provision.sh --key' \
   || fail 'the file check refused a release block that names only pi.env and provision.sh'
+# A unit's name and the script a here-document sends to the Pi are not the checkout's files; a name
+# after the here-document is.
+remote_text=$'source deploy/pi/files/pi.env && systemctl --user show ghost-wispr.service &&\nssh pi \'bash -s\' <<\'EOF\'\ncat ghost-wispr.local.yaml\nEOF'
+check_named control checkout "$remote_text" || fail 'the file check refused a unit name or a remote script'
+check_named control checkout "$remote_text"$'\nsource deploy/pi/no-such-settings.env' 2>/dev/null \
+  && fail 'the file check passed a name that comes after a here-document'
 
 # pi_variables prints each PI_ variable the text on stdin reads.
 pi_variables() {
