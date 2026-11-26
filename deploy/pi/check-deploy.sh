@@ -411,7 +411,12 @@ check_settings() {
       fi
     fi
     want=$(yaml_scalar_json "$raw")
-    got=$(jq -c --arg role "$role" '.models[$role] // null' <<<"$config")
+    # The recorder reports every role (internal/server, GET /api/config), "" for a role with no
+    # model. An answer without the role, or with no string for it, does not show what it runs.
+    if ! got=$(jq -ce --arg role "$role" '.models[$role] | strings' <<<"$config" 2>/dev/null); then
+      unread+=("GET $SERVE/api/config reports no $role model, so the running $setting cannot be compared")
+      continue
+    fi
     [[ $got == "$want" ]] || differences+=("$role runs $got, but the $source names $want ($setting)")
   done
 
@@ -491,9 +496,11 @@ check_providers() {
   elif [[ $local_state == error && ( -n $missing || -n $extra ) ]]; then
     unknown 3 "the Pi's providers ($(paste -sd ' ' - <<<"$names")) are not the template's ($(paste -sd ' ' - <<<"$want")), and the local settings file that could add or remove one cannot be read: $local_error"
   elif [[ -n $missing || -n $extra ]]; then
+    local config_name="$release_name's template"
+    [[ $local_state != read ]] || config_name+=" with the local settings file over it"
     unexplained=()
-    [[ -z $missing ]] || unexplained+=("the Pi lists no $missing, which the template names")
-    [[ -z $extra ]] || unexplained+=("the Pi lists $extra, which neither the template nor the local settings file names")
+    [[ -z $missing ]] || unexplained+=("the Pi lists no $missing, which $config_name names")
+    [[ -z $extra ]] || unexplained+=("the Pi lists $extra, which $config_name does not name")
     fails 3 "$(joined "${unexplained[@]}")"
   else
     pass 3 "the Pi lists the $(grep -c . <<<"$names") providers of $release_name's template and its local settings file ($(paste -sd ' ' - <<<"$names")), each signed in"
