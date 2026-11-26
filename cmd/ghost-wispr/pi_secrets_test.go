@@ -237,25 +237,29 @@ func TestPiSecretsRefusesAnEmptyOrControlValue(t *testing.T) {
 
 // TestPiSecretsRefusesABadChecksum catches a reader or a command that writes a
 // value whose CRC32C does not match the checksum Secret Manager sent with it.
-// It runs the real Secret Manager reader over a fake transport. The same
-// answer with its right checksum is the control.
+// It runs the real Secret Manager reader over a fake transport. A checksum of
+// the right CRC32C plus 2^32 catches a compare that truncates the checksum to
+// 32 bits, and the right CRC32C with a minus sign catches a parse that drops
+// the sign. The same answer with its right checksum is the control.
 func TestPiSecretsRefusesABadChecksum(t *testing.T) {
 	data := []byte("checksum-value")
 	crc := crc32.Checksum(data, crc32.MakeTable(crc32.Castagnoli))
 	for _, tc := range []struct {
 		name     string
-		checksum uint32
+		checksum string
 		wantCode int
 	}{
-		{name: "wrong checksum", checksum: crc + 1, wantCode: 1},
-		{name: "right checksum", checksum: crc, wantCode: 0},
+		{name: "wrong checksum", checksum: fmt.Sprint(crc ^ 1), wantCode: 1},
+		{name: "right checksum plus 2^32", checksum: fmt.Sprint(uint64(crc) + 1<<32), wantCode: 1},
+		{name: "negative right checksum", checksum: "-" + fmt.Sprint(crc), wantCode: 1},
+		{name: "right checksum", checksum: fmt.Sprint(crc), wantCode: 0},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			body, err := json.Marshal(map[string]any{
 				"name": "projects/example-project/secrets/checksum-secret/versions/4",
 				"payload": map[string]string{
 					"data":       base64.StdEncoding.EncodeToString(data),
-					"dataCrc32c": fmt.Sprint(tc.checksum),
+					"dataCrc32c": tc.checksum,
 				},
 			})
 			if err != nil {
