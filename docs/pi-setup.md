@@ -91,8 +91,10 @@ read such a value in `.env` otherwise than it was written. When a read fails or 
 The update reads the secrets at two times:
 
 - before each start of the recorder: after its two waits, `ghost-wispr.service` runs
-  `update.sh secrets`, which writes the four lines and changes nothing else. When that read fails,
-  the recorder still starts, on the lines that `.env` has;
+  `update.sh secrets`. It first puts right a certificate swap that a run cut short ("Renew the X.509
+  certificate") and removes old staging directories ("Update and inspect"). Then it writes the four
+  lines of `.env`; it installs no release and no certificate. When that read fails, the recorder
+  still starts, on the lines that `.env` has;
 - in each nightly run: when a value changed, it installs the new `.env` while the recorder is free,
   restarts the recorder, and prints `ghost-wispr update: installed secrets`. It refuses while an
   override or a drop-in is set ("Update and inspect", step 5).
@@ -423,6 +425,21 @@ not answer after the restart, it puts `device.crt.prev` back and exits 10. It pu
 first renewal (`provision.sh --certificate` writes none), it removes the new `device.crt.version`.
 A rollback of a later release install leaves this certificate in place ("Update and inspect",
 step 6).
+
+The certificate and its version file change as one. A run cut short between the two would leave a
+certificate with another certificate's version, and `pi-secrets` stages no certificate that is not
+newer than the installed version, so no later run would put the pair right. So `update.sh` first
+writes the journal `/opt/ghost-wispr/device.crt.version.new`, which holds the version the pair gets
+(or `none`, for no version file) and the SHA-256 of the new certificate. Then it renames the
+certificate over `device.crt`, then writes or removes `device.crt.version`, and then removes the
+journal. A rollback puts the pair back the same way, from `device.crt.prev` and the number in
+`device.crt.version.prev`. At its start, each run, `update.sh secrets` too, reads a journal that a
+run cut short left. When the installed `device.crt` has the journal's SHA-256, the run finishes the
+pair, and prints
+`ghost-wispr update: finished the certificate swap that a run cut short: device.crt.version is <version>`.
+Otherwise the certificate never went in: the run removes the journal, a journal it cannot read too,
+and prints
+`ghost-wispr update: removed /opt/ghost-wispr/device.crt.version.new, of a run cut short before its certificate went in; device.crt and device.crt.version stay as they are`.
 
 `update.sh` gives `pi-secrets` the installed version from `device.crt.version`, as
 `--installed-certificate-version`. When `latest` cannot be read because it is disabled, destroyed
@@ -935,7 +952,8 @@ runs no `update.sh.prev`. A fallback run of `update.sh.prev` that installs a rel
 `update.sh.prev` and `pi-lib.sh.prev` as they are: they are the scripts that run, and a copy of the
 broken `update.sh` there would leave no update that runs once a second such release installs.
 
-At its start, each run, `update.sh secrets` too, removes each staging directory
+At its start, each run, `update.sh secrets` too, puts right a certificate swap that a run cut short
+("Renew the X.509 certificate"). Then it removes each staging directory
 `/opt/ghost-wispr/.ghost-wispr-update.*` older than 46 minutes, the launcher's limit and its grace:
 a run that limit killed left it, and it can hold the secrets that run read. A younger one may
 belong to a run still going, and stays.
@@ -961,11 +979,14 @@ A run of `update.sh`:
    `ghost-wispr update: the recorder started before the installed <files>; restarting it`.
 4. Otherwise, holds a release whose link versions the call bridge does not accept. The bridge's
    list is `call.link_versions` in `/api/status`, and the release's is `link_versions` in its
-   manifest. When both lists are there and share no number, it prints
-   `ghost-wispr update: held: ...` with both lists. When the installed files are the set
-   `deploy.verified` lists, it then refreshes the secrets and the certificate of the release the Pi
-   runs, as in step 3, so the Pi keeps taking them while a newer release waits. It exits 0, or 10
-   when step 5 refuses that refresh or the refresh fails.
+   manifest. The run compares them at the first status read, and again at the status read just
+   before the swap, since the bridge can change its list while the release downloads. When both
+   lists are there and share no number, it prints `ghost-wispr update: held: ...` with both lists.
+   A hold at either read changes no file of the deploy set. When the installed files are the set
+   `deploy.verified` lists, the run then drops what it staged for the release, and refreshes the
+   secrets and the certificate of the release the Pi runs, as in step 3, so the Pi keeps taking
+   them while a newer release waits. It exits 0, or 10 when step 5 refuses that refresh or the
+   refresh fails.
 5. Refuses to install a release, new secrets or a renewed certificate, and exits 10, while `.env`
    or the environment of `ghost-wispr`'s user manager sets `GHOST_WISPR_CONFIG` or an Envoy override
    variable ("Turn on the meeting voice", step 1), or while `ghost-wispr.service` or
