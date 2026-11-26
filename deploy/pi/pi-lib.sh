@@ -4,8 +4,10 @@
 # files and Tailscale Serve. Each script sources the pi-lib.sh beside it, and update.sh.prev sources
 # pi-lib.sh.prev, so an old script never runs on a new library. Sourcing it runs nothing. It defines
 # no fail and makes no variable readonly, since each script that sources it defines its own fail and
-# readonly settings. The checks that read ghost-wispr's user manager run systemctl --user, so they
-# need the user's XDG_RUNTIME_DIR.
+# readonly settings. Each local variable of its functions starts with pl_: bash refuses a local
+# whose name is readonly in the caller ("local: NAME: readonly variable"), and provision.sh makes
+# lower-case names readonly. The checks that read ghost-wispr's user manager run systemctl --user,
+# so they need the user's XDG_RUNTIME_DIR.
 
 # The .env variables Ghost Wispr no longer reads, each of which a start warns about: the Envoy
 # webhook signing key an earlier provisioner wrote, and the variables of the settings that providers
@@ -32,11 +34,11 @@ valid_drive_id() {
 # GC removes only local audio that Drive holds a copy of. It fails, and prints no partial config, on
 # an invalid drive ID or a template it cannot read.
 render_config_with_drive() {
-  local template=$1 drive_id=$2
-  valid_drive_id "$drive_id" || return 1
-  [[ -f $template ]] || return 1
-  awk '!/^(gdrive_folder_id|gdrive_sync_enabled|gc_enabled):/' "$template" || return 1
-  printf 'gdrive_folder_id: "%s"\n' "$drive_id"
+  local pl_template=$1 pl_drive_id=$2
+  valid_drive_id "$pl_drive_id" || return 1
+  [[ -f $pl_template ]] || return 1
+  awk '!/^(gdrive_folder_id|gdrive_sync_enabled|gc_enabled):/' "$pl_template" || return 1
+  printf 'gdrive_folder_id: "%s"\n' "$pl_drive_id"
   printf '%s\n' 'gdrive_sync_enabled: true' 'gc_enabled: true'
 }
 
@@ -45,14 +47,14 @@ render_config_with_drive() {
 # that every config API save writes without a folder, and fails on any other gdrive_folder_id
 # line, or two.
 deployed_drive_id() {
-  local config=$1 line status=0
-  local quoted_pattern='^gdrive_folder_id: "([A-Za-z0-9_-]+)"$'
-  local unquoted_pattern='^gdrive_folder_id: ([A-Za-z0-9_-]+)$'
-  line=$(grep '^gdrive_folder_id:' "$config") || status=$?
-  ((status != 1)) || return 0
-  ((status == 0)) || return 1
-  [[ $line != 'gdrive_folder_id: ""' ]] || return 0
-  if [[ $line =~ $quoted_pattern || $line =~ $unquoted_pattern ]]; then
+  local pl_config=$1 pl_line pl_status=0
+  local pl_quoted='^gdrive_folder_id: "([A-Za-z0-9_-]+)"$'
+  local pl_unquoted='^gdrive_folder_id: ([A-Za-z0-9_-]+)$'
+  pl_line=$(grep '^gdrive_folder_id:' "$pl_config") || pl_status=$?
+  ((pl_status != 1)) || return 0
+  ((pl_status == 0)) || return 1
+  [[ $pl_line != 'gdrive_folder_id: ""' ]] || return 0
+  if [[ $pl_line =~ $pl_quoted || $pl_line =~ $pl_unquoted ]]; then
     printf '%s' "${BASH_REMATCH[1]}"
     return 0
   fi
@@ -65,18 +67,18 @@ deployed_drive_id() {
 # gdrive_folder_id line it cannot read, rather than install a config that drops or changes the
 # drive.
 render_config() {
-  local template=$1 deployed=$2 drive_id
-  [[ -f $template ]] || return 1
-  if [[ ! -e $deployed ]]; then
-    cat -- "$template"
+  local pl_template=$1 pl_deployed=$2 pl_drive_id
+  [[ -f $pl_template ]] || return 1
+  if [[ ! -e $pl_deployed ]]; then
+    cat -- "$pl_template"
     return
   fi
-  drive_id=$(deployed_drive_id "$deployed") || return 1
-  if [[ -z $drive_id ]]; then
-    cat -- "$template"
+  pl_drive_id=$(deployed_drive_id "$pl_deployed") || return 1
+  if [[ -z $pl_drive_id ]]; then
+    cat -- "$pl_template"
     return
   fi
-  render_config_with_drive "$template" "$drive_id"
+  render_config_with_drive "$pl_template" "$pl_drive_id"
 }
 
 # env_kept_lines ENV_FILE prints each line of the .env file ENV_FILE, in order, but the four lines
@@ -95,11 +97,11 @@ env_kept_lines() {
 # src/basic/env-file.c), so tr turns each CR into a line feed first. A match inside a multi-line
 # value counts too. It reads no value, and fails when it cannot read ENV_FILE.
 config_override_names() {
-  local found status=0
+  local pl_found pl_status=0
   [[ -r $1 ]] || return 1
-  found=$(tr '\r' '\n' <"$1" | grep -oE "^[[:space:]]*(export[[:space:]]+)?($PI_LIB_CONFIG_FILE_VARIABLE|$PI_LIB_ENVOY_OVERRIDE_VARIABLES)[[:space:]]*=") || status=$?
-  ((status <= 1)) || return 1
-  [[ -z $found ]] || grep -oE "$PI_LIB_CONFIG_FILE_VARIABLE|$PI_LIB_ENVOY_OVERRIDE_VARIABLES" <<<"$found" | sort -u
+  pl_found=$(tr '\r' '\n' <"$1" | grep -oE "^[[:space:]]*(export[[:space:]]+)?($PI_LIB_CONFIG_FILE_VARIABLE|$PI_LIB_ENVOY_OVERRIDE_VARIABLES)[[:space:]]*=") || pl_status=$?
+  ((pl_status <= 1)) || return 1
+  [[ -z $pl_found ]] || grep -oE "$PI_LIB_CONFIG_FILE_VARIABLE|$PI_LIB_ENVOY_OVERRIDE_VARIABLES" <<<"$pl_found" | sort -u
 }
 
 # manager_override_names prints, one a line, each variable of PI_LIB_CONFIG_FILE_VARIABLE and
@@ -112,12 +114,12 @@ config_override_names() {
 # always sets PATH, so an empty reading is a blind one. Read it after a reload of the manager, so
 # that an environment.d or user.conf line written since the last reload counts.
 manager_override_names() {
-  local environment found status=0
-  environment=$(systemctl --user show-environment) || return 1
-  [[ -n $environment ]] || return 1
-  found=$(grep -oE "^($PI_LIB_CONFIG_FILE_VARIABLE|$PI_LIB_ENVOY_OVERRIDE_VARIABLES)=" <<<"$environment") || status=$?
-  ((status <= 1)) || return 1
-  [[ -z $found ]] || grep -oE "$PI_LIB_CONFIG_FILE_VARIABLE|$PI_LIB_ENVOY_OVERRIDE_VARIABLES" <<<"$found" | sort -u
+  local pl_environment pl_found pl_status=0
+  pl_environment=$(systemctl --user show-environment) || return 1
+  [[ -n $pl_environment ]] || return 1
+  pl_found=$(grep -oE "^($PI_LIB_CONFIG_FILE_VARIABLE|$PI_LIB_ENVOY_OVERRIDE_VARIABLES)=" <<<"$pl_environment") || pl_status=$?
+  ((pl_status <= 1)) || return 1
+  [[ -z $pl_found ]] || grep -oE "$PI_LIB_CONFIG_FILE_VARIABLE|$PI_LIB_ENVOY_OVERRIDE_VARIABLES" <<<"$pl_found" | sort -u
 }
 
 # unit_drop_ins UNIT prints the drop-ins of ghost-wispr's user unit UNIT, space-separated, as
@@ -132,10 +134,10 @@ unit_drop_ins() {
 # serve_conf_lines SERVE_CONF prints the Serve lines of SERVE_CONF (deploy/pi/files/serve.conf),
 # "<port> <proxy target>", sorted, with no comment or blank line.
 serve_conf_lines() {
-  local lines
-  lines=$(awk 'NF && $1 !~ /^#/ { print $1, $2 }' "$1") || return 1
-  if [[ -n $lines ]]; then
-    LC_ALL=C sort <<<"$lines"
+  local pl_lines
+  pl_lines=$(awk 'NF && $1 !~ /^#/ { print $1, $2 }' "$1") || return 1
+  if [[ -n $pl_lines ]]; then
+    LC_ALL=C sort <<<"$pl_lines"
   fi
 }
 
@@ -145,9 +147,9 @@ serve_conf_lines() {
 # sorted. JSON is tailscale's ipn.ServeConfig. It fails on an empty answer or on one that is not a
 # JSON object, so a caller can tell an answer it cannot read from a Serve that serves nothing.
 serve_lines_from_status() {
-  local lines
+  local pl_lines
   [[ -n $1 ]] || return 1
-  lines=$(jq -r 'if type != "object" then error("not a ServeConfig") else
+  pl_lines=$(jq -r 'if type != "object" then error("not a ServeConfig") else
       (.Web // {}) | to_entries[]
       | select(.value | type == "object")
       | select(.value.Handlers | type == "object")
@@ -155,8 +157,8 @@ serve_lines_from_status() {
       | select(.value.Handlers["/"].Proxy | type == "string")
       | "\(.key | split(":") | last) \(.value.Handlers["/"].Proxy)"
     end' <<<"$1" 2>/dev/null) || return 1
-  if [[ -n $lines ]]; then
-    LC_ALL=C sort <<<"$lines"
+  if [[ -n $pl_lines ]]; then
+    LC_ALL=C sort <<<"$pl_lines"
   fi
 }
 
@@ -167,20 +169,21 @@ serve_lines_from_status() {
 # UNIT_DIR (~/.config/systemd/user). It fails when MANIFEST names no SHA-256 for one of them, or
 # when it cannot read an installed copy.
 bootstrap_drift() {
-  local manifest=$1 deploy_dir=${2:-/opt/ghost-wispr} unit_dir=${3:-$HOME/.config/systemd/user} name path want have
-  for name in ghost-wispr-update-launcher.sh ghost-wispr-update.service ghost-wispr-update.timer; do
-    want=$(jq -er --arg name "$name" '.files[$name] | strings' "$manifest") || return 1
-    path=$unit_dir/$name
-    if [[ $name == *.sh ]]; then
-      path=$deploy_dir/$name
+  local pl_manifest=$1 pl_deploy_dir=${2:-/opt/ghost-wispr} pl_unit_dir=${3:-$HOME/.config/systemd/user}
+  local pl_name pl_path pl_want pl_have
+  for pl_name in ghost-wispr-update-launcher.sh ghost-wispr-update.service ghost-wispr-update.timer; do
+    pl_want=$(jq -er --arg name "$pl_name" '.files[$name] | strings' "$pl_manifest") || return 1
+    pl_path=$pl_unit_dir/$pl_name
+    if [[ $pl_name == *.sh ]]; then
+      pl_path=$pl_deploy_dir/$pl_name
     fi
-    have=''
-    if [[ -f $path ]]; then
-      have=$(sha256sum -- "$path") || return 1
-      have=${have%% *}
+    pl_have=''
+    if [[ -f $pl_path ]]; then
+      pl_have=$(sha256sum -- "$pl_path") || return 1
+      pl_have=${pl_have%% *}
     fi
-    if [[ $have != "$want" ]]; then
-      printf '%s\n' "$name"
+    if [[ $pl_have != "$pl_want" ]]; then
+      printf '%s\n' "$pl_name"
     fi
   done
 }

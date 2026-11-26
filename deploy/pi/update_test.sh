@@ -17,7 +17,7 @@ readonly repo_root
 work_dir=$(mktemp -d)
 readonly work_dir
 readonly pi="$work_dir/pi"
-readonly opt="$pi/opt" units="$pi/units" root="$pi/root" state="$pi/state" key="$pi/key.pem"
+readonly opt="$pi/opt" units="$pi/units" root="$pi/root" state="$pi/state" device_key="$pi/key.pem"
 readonly releases="$work_dir/releases" bin="$work_dir/bin" timeout_bin="$work_dir/timeout-bin" fakes="$work_dir/fakes"
 real_timeout=$(command -v timeout)
 readonly real_timeout
@@ -691,7 +691,7 @@ new_pi() {
   rm -rf -- "${pi:?}"
   mkdir -p -- "$opt" "$units" "$root/etc/udev/rules.d" "$root/etc/systemd/logind.conf.d" "$state" "$pi/proc/4242"
   ln -s -- "$state/running-image" "$pi/proc/4242/exe"
-  printf 'DEVICE KEY\n' >"$key"
+  printf 'DEVICE KEY\n' >"$device_key"
   printf '{"type":"external_account"}\n' >"$opt/google-credentials.json"
   printf 'INSTALLED CERTIFICATE\n' >"$opt/device.crt"
   printf 'IDLE\n' >"$state/status"
@@ -839,7 +839,7 @@ run_update() {
     TEST_SLOW="${slow:-}" TEST_RESTART_SECONDS="${restart_seconds:-0}" \
     INVOCATION_ID=test-invocation-7 \
     GHOST_WISPR_DEPLOY_DIR="$opt" GHOST_WISPR_UNIT_DIR="$units" GHOST_WISPR_SYSTEM_ROOT="$root" \
-    GHOST_WISPR_PROC_DIR="$pi/proc" GHOST_WISPR_IDENTITY_KEY="$key" \
+    GHOST_WISPR_PROC_DIR="$pi/proc" GHOST_WISPR_IDENTITY_KEY="$device_key" \
     GHOST_WISPR_RELEASE_API=https://test.invalid/releases/latest \
     GHOST_WISPR_STATUS_URL=http://127.0.0.1:8080/api/status \
     GHOST_WISPR_VERSION_URL=http://127.0.0.1:8080/api/version \
@@ -1091,7 +1091,7 @@ expect_secrets_flag whole-set --project example-project
 expect_secrets_flag whole-set --env-secret "GHOST_WISPR_DEEPGRAM_API_KEY""=example-deepgram-secret"
 expect_secrets_flag whole-set --env-secret "GHOST_WISPR_DISPATCH_TOKEN""=example-dispatch-token-secret"
 expect_secrets_flag whole-set --certificate-secret example-device-certificate
-expect_secrets_flag whole-set --key "$key"
+expect_secrets_flag whole-set --key "$device_key"
 expect_secrets_flag whole-set --installed-certificate "$opt/device.crt"
 grep -Fqx 'arg --out' "$state/pi-secrets.log" || fail 'whole-set: pi-secrets ran with no --out'
 # No secret value reaches update.sh's output or an argument.
@@ -1974,7 +1974,7 @@ run_launcher() {
     INVOCATION_ID=test-invocation-9 ${trigger:+TRIGGER_UNIT=ghost-wispr-update.timer} \
     ${trigger:+TRIGGER_TIMER_REALTIME_USEC=$trigger} \
     GHOST_WISPR_DEPLOY_DIR="$opt" GHOST_WISPR_UNIT_DIR="$units" GHOST_WISPR_SYSTEM_ROOT="$root" \
-    GHOST_WISPR_PROC_DIR="$pi/proc" GHOST_WISPR_IDENTITY_KEY="$key" \
+    GHOST_WISPR_PROC_DIR="$pi/proc" GHOST_WISPR_IDENTITY_KEY="$device_key" \
     GHOST_WISPR_RELEASE_API=https://test.invalid/releases/latest \
     GHOST_WISPR_STATUS_URL=http://127.0.0.1:8080/api/status \
     GHOST_WISPR_VERSION_URL=http://127.0.0.1:8080/api/version \
