@@ -31,8 +31,8 @@ trap 'rm -rf -- "$work_dir"' EXIT
 # The cases of this test, each of which begin names.
 readonly case_names=(bundle-refused not-a-release first-run one-update-start release-files-first
   credentials-written bootstrap-files no-env-no-system-files groups-and-linger join-command idempotent
-  credentials-same credentials-differ client-id serve update-fails recorder-unit join route-check
-  manager-env key certificate models)
+  credentials-same credentials-differ client-id release-the-pi-runs serve update-fails recorder-unit join
+  route-check manager-env key certificate models)
 current_case=setup
 ran_cases=' '
 
@@ -61,10 +61,13 @@ readonly key=$key_dir/key.pem
 readonly release_commit=0123456789abcdef0123456789abcdef01234567
 # What test-pi.env sets as PI_TAILNET_CLIENT_ID and PI_SERVICE_ACCOUNT_UNIQUE_ID, written out here.
 readonly client_id=k-test-client-id subject=123456789012345678901
+real_date=$(command -v date)
+readonly real_date
 export TEST_LOG="$work_dir/log" TEST_UID="$uid" TEST_RUNTIME_DIR="$runtime_dir" TEST_DEPLOY="$deploy" \
   TEST_UNIT_DIR="$units" TEST_BINARY="$work_dir/recorder-binary" \
   TEST_RECORDER_UNIT="$repo_root/deploy/pi/files/ghost-wispr.service" TEST_SERVE_STATE="$work_dir/serve.json" \
-  TEST_SERVE_HOST=ghost-wispr.example-tailnet.ts.net TEST_ROUTE_ALL="$work_dir/route-all" TEST_SUBJECT="$subject"
+  TEST_SERVE_HOST=ghost-wispr.example-tailnet.ts.net TEST_ROUTE_ALL="$work_dir/route-all" TEST_SUBJECT="$subject" \
+  TEST_REAL_DATE="$real_date"
 mkdir -p -- "$bin" "$join" "$first_join"
 
 cat >"$bin/id" <<'EOF'
@@ -159,6 +162,8 @@ sum_or_missing() {
 }
 case "$*" in
   daemon-reload)
+    # What the manager loads at this reload: the timer's SHA-256, in the order of the run's events.
+    printf 'reload timer=%s\n' "$(sum_or_missing "$TEST_UNIT_DIR/ghost-wispr-update.timer")" >>"$TEST_LOG.events"
     if [[ -f ${TEST_MANAGER_ENV_PENDING:-} ]]; then
       mv -f -- "$TEST_MANAGER_ENV_PENDING" "$TEST_MANAGER_ENV"
     fi
@@ -359,6 +364,16 @@ cat >"$work_dir/release-binary" <<'EOF'
 printf 'unknown subcommand "link-versions"\n' >&2
 exit 2
 EOF
+
+# date logs each call for the time now in seconds to $TEST_LOG.events, in order with the user
+# manager's reloads, and answers as the real date.
+cat >"$bin/date" <<'EOF'
+#!/usr/bin/env bash
+if [[ $* == +%s ]]; then
+  printf 'date +%%s\n' >>"$TEST_LOG.events"
+fi
+exec "$TEST_REAL_DATE" "$@"
+EOF
 chmod +x "$bin/"* "$TEST_BINARY" "$work_dir/release-binary"
 
 sha() {
@@ -508,17 +523,20 @@ expect_nothing_installed 'pi-lib.sh missing'
 # ---------------------------------------------------------------------------------------------------
 # first-run: provision.sh on the office Pi before its first run of this provisioner, from P2's
 # temporary copy of the release's directory. An older provisioner left an older update.sh, which
-# installed the binary alone.
+# installed the binary alone, and a timer that starts it at 03:30 alone.
 begin first-run
 new_pi
 rm -rf -- "$work_dir/p2-stage"
 cp -a -- "$stage" "$work_dir/p2-stage"
 printf '#!/bin/sh\n# an older update.sh, which installed the binary alone\n' >"$deploy/update.sh"
+printf '%s\n' '[Timer]' 'OnCalendar=*-*-* 03:30:00' 'Persistent=true' '[Install]' 'WantedBy=timers.target' \
+  >"$units/ghost-wispr-update.timer"
 printf '%s\n' 'ghost-wispr launcher: invocation test-invocation trigger none at none' \
   "ghost-wispr update: installed commit $release_commit (invocation test-invocation)" >"$work_dir/journal"
 TEST_JOURNAL=$work_dir/journal run_provision "$work_dir/p2-stage"
 cp -- "$TEST_LOG" "$work_dir/first.log"
 cp -- "$work_dir/out" "$work_dir/first.out"
+cp -- "$TEST_LOG.events" "$work_dir/first.events"
 for file in join systemd-run installed-route-overlap-check; do
   if [[ -f $TEST_LOG.$file ]]; then
     cp -- "$TEST_LOG.$file" "$first_join/${file#installed-}"
@@ -542,6 +560,22 @@ start_at=$(line_of 'systemctl --user start ghost-wispr-update.service' "$work_di
 enable_at=$(line_of 'systemctl --user enable ghost-wispr.service' "$work_dir/first.log")
 [[ -n $timer_at && -n $enable_at && $timer_at -lt $start_at && $start_at -lt $enable_at ]] \
   || fail "provision.sh did not turn the timer on before the start and enable ghost-wispr.service after it: $(<"$work_dir/first.log")"
+# The journal it prints starts before the user manager loads the release's timer: its schedule has
+# times the old one lacks, such as 03:45, and a reload can start the update at once
+# (systemd#16732), before a time read after it. The first time read comes before that reload.
+release_timer=$(sha "$work_dir/stage/ghost-wispr-update.timer")
+mapfile -t events <"$work_dir/first.events"
+since_at='' loaded_at=''
+for i in "${!events[@]}"; do
+  if [[ -z $since_at && ${events[i]} == 'date +%s' ]]; then
+    since_at=$i
+  fi
+  if [[ -z $loaded_at && ${events[i]} == "reload timer=$release_timer" ]]; then
+    loaded_at=$i
+  fi
+done
+[[ -n $since_at && -n $loaded_at && $since_at -lt $loaded_at ]] \
+  || fail "provision.sh read the time for the update's journal after the user manager loaded the release's timer: $(paste -sd ';' "$work_dir/first.events")"
 
 # release-files-first: when the update starts, the release's update.sh, pi-lib.sh and pi.env, the
 # bootstrap files and the credential files are in place, so the update that runs is the release's,
@@ -746,6 +780,33 @@ rm -- "$deploy/tailscale-client-id"
 TEST_SELF_STATUS=$joined_status run_provision "$stage"
 expect_ran 'no client id kept'
 ! said 'tailnet client id' || fail "provision.sh compared a client id the Pi does not keep: $(<"$work_dir/out")"
+
+# release-the-pi-runs: provision.sh runs only from the release the Pi runs, once a release has been
+# installed and verified. It installs its own update.sh, pi-lib.sh and pi.env before the update
+# starts, so another release's would leave the Pi's set not the one deploy.verified lists: the
+# update would keep no .prev copy of it, and a failed install would roll the Pi back past the
+# release it runs. So where deploy.verified names another commit, it refuses before it runs any
+# command and names both commits. A Pi with no deploy.verified, a new Pi or the office Pi at P2, is
+# not refused (first-run), and neither is a Pi whose deploy.verified names this release's commit.
+begin release-the-pi-runs
+readonly other_commit=89abcdef0123456789abcdef0123456789abcdef
+for verified_commit in "$other_commit" "$release_commit"; do
+  printf '%s\n' "commit $verified_commit" "$(sha "$stage/update.sh")  update.sh" >"$deploy/deploy.verified"
+  before=$(pi_files)
+  : >"$TEST_LOG"
+  TEST_SELF_STATUS=$joined_status run_provision "$stage"
+  if [[ $verified_commit == "$other_commit" ]]; then
+    expect_refused 'deploy.verified names another commit' "$other_commit"
+    said "$release_commit" || fail "provision.sh did not name the release's commit: $(<"$work_dir/out")"
+    said 'The release the Pi runs' || fail "provision.sh did not say where to get the release the Pi runs: $(<"$work_dir/out")"
+    [[ ! -s $TEST_LOG ]] || fail "provision.sh ran commands before it refused another release: $(<"$TEST_LOG")"
+    [[ $(pi_files) == "$before" ]] || fail 'provision.sh changed a file before it refused another release'
+  else
+    expect_ran "deploy.verified names the release's commit"
+    said 'already joined' || fail "provision.sh stopped before the join on the release the Pi runs: $(<"$work_dir/out")"
+  fi
+done
+rm -- "$deploy/deploy.verified"
 
 # ---------------------------------------------------------------------------------------------------
 # serve: serve.conf is the one source of Serve's setting. provision.sh applies each of its lines, and
@@ -1367,6 +1428,21 @@ fi
 grep -qF 'manifest.json' "$work_dir/out" || fail "--models did not say a checkout has no manifest.json: $(<"$work_dir/out")"
 [[ ! -s $TEST_LOG ]] || fail "--models changed the Pi before it refused a checkout: $(<"$TEST_LOG")"
 [[ $(models_files) == "$before" ]] || fail '--models changed a file when it refused a checkout'
+# --models runs only from the release the Pi runs, as provision.sh does: another release's config
+# on this release's binary is a set that no release holds. Where deploy.verified names another
+# commit, it refuses before it runs any command. The control below runs it with deploy.verified
+# naming the release's commit.
+printf '%s\n' "commit $other_commit" >"$models_dir/deploy.verified"
+before=$(models_files)
+if run_models; then
+  fail "--models installed the config of another release than the one the Pi runs: $(<"$work_dir/out")"
+fi
+if ! grep -qF "$other_commit" "$work_dir/out" || ! grep -qF 'The release the Pi runs' "$work_dir/out"; then
+  fail "--models did not name the commit the Pi runs and where to get its release: $(<"$work_dir/out")"
+fi
+[[ ! -s $TEST_LOG ]] || fail "--models changed the Pi before it refused another release: $(<"$TEST_LOG")"
+[[ $(models_files) == "$before" ]] || fail '--models changed a file when it refused another release'
+printf '%s\n' "commit $release_commit" >"$models_dir/deploy.verified"
 # An unreadable .env stops --models too, before it writes anything: the check cannot say it sets no
 # override, and a read through a pipe must not pass for a clean one.
 chmod 000 "$models_dir/.env"

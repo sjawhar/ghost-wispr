@@ -14,8 +14,9 @@ import (
 // companyLiterals are the names that tie this public repository to the company
 // that runs the office Pi: the company itself (its name, its domain and its
 // GitHub organization), its tailnet, its infrastructure repository, its Google
-// project's number, and its cloud resources, the Pi's Secret Manager secrets
-// among them. Each is split so this file does not hold the name it looks for.
+// project's number, and its cloud resources, the Pi's Secret Manager secrets,
+// its service account's unique ID and its Tailscale client id among them. Each
+// is split so this file does not hold the name it looks for.
 var companyLiterals = []string{
 	"theo" + "rem",
 	"tail12" + "ec1c",
@@ -24,6 +25,8 @@ var companyLiterals = []string{
 	"envoy-ghostwispr" + "-signing-secret",
 	"ghost-wispr-device" + "-certificate",
 	"operator-only-ghost" + "-wispr",
+	"1148810755" + "58003314337",
+	"TWbBfz7fqc11" + "CNTRL-kX7aTA7yJt11CNTRL",
 	"envoy-webhook" + "-relay",
 	"envoy" + "-hub",
 	"envoy" + "-cluster",
