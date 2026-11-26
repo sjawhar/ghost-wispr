@@ -106,11 +106,13 @@ ends a conversation that is being recorded:
 ssh ghost-wispr@ghost-wispr 'XDG_RUNTIME_DIR=/run/user/$(id -u) systemctl --user restart ghost-wispr.service'
 ```
 
-Add each version on your own device, in a Ghost Wispr checkout, with your own Google login
-(`gcloud auth login`). The blocks read the names from `deploy/pi/files/pi.env`
-(`GHOST_WISPR_PI_ENV` names another file, as the tests do). Each block gives the value to `gcloud`
-in a mode-0600 file that it removes, never in a command argument, and adds no version for an empty
-value. The Deepgram key, which the block reads without showing it:
+The two secrets hold the Pi's current values: their first versions were copied once from the Pi's
+own `.env`. To replace a value, add a new version on your own device, in a Ghost Wispr checkout,
+with your own Google login (`gcloud auth login`). The blocks read the names from
+`deploy/pi/files/pi.env` (`GHOST_WISPR_PI_ENV` names another file, as the tests do). Each block
+reads the value at a prompt without showing it, gives it to `gcloud` in a mode-0600 file that it
+removes, never in a command argument, and adds no version for an empty value. It prints the version
+that it added, never the value. The Deepgram key:
 
 <!-- runbook_blocks_test.sh: deepgram-key -->
 ```bash
@@ -121,41 +123,24 @@ value. The Deepgram key, which the block reads without showing it:
   gcloud secrets versions add "$PI_DEEPGRAM_SECRET" --project="$PI_GCP_PROJECT" --data-file="$f")
 ```
 
-The Dispatch token: the block mints a new no-scope agent token with your own Dispatch token, which
-must hold the `person` and `approve` scopes, in the file that `DISPATCH_TOKEN_FILE` names. Then it
-adds the new token as the secret's latest version:
+The Dispatch token. A replacement is a no-scope agent token, never a person's: make one in Dispatch,
+under Settings → Agent tokens, with no scope.
 
 <!-- runbook_blocks_test.sh: dispatch-token -->
 ```bash
 (source "${GHOST_WISPR_PI_ENV:-deploy/pi/files/pi.env}" && umask 077 &&
-  [ -s "${DISPATCH_TOKEN_FILE:?}" ] &&
-  m=$(mktemp) && f=$(mktemp) && trap 'rm -f -- "$m" "$f"' EXIT &&
-  sed 's/^/Authorization: Bearer /' "$DISPATCH_TOKEN_FILE" |
-  curl -fsS -H @- -H 'Content-Type: application/json' \
-    --data '{"name":"ghost-wispr-office-pi-secret-manager","scopes":[]}' \
-    "$PI_DISPATCH_URL/api/v1/me/agent-tokens" >"$m" &&
-  jq -c '{id, name, scopes}' "$m" &&
-  jq -jer .token "$m" >"$f" && [ -s "$f" ] &&
+  f=$(mktemp) && trap 'rm -f -- "$f"' EXIT &&
+  IFS= read -r -s -p 'Dispatch token: ' token && echo &&
+  printf '%s' "$token" >"$f" && [ -s "$f" ] &&
   gcloud secrets versions add "$PI_DISPATCH_TOKEN_SECRET" --project="$PI_GCP_PROJECT" --data-file="$f")
 ```
 
-It prints the new token's id, its name and `"scopes":[]`, and the version that it added, never the
-token: Dispatch shows a token only in the answer to its mint. Revoke the token that the Pi used
-before only once the Pi runs with the new one. Run the block below on your own device, in a
-checkout, with your own Google login; the revoke waits for all three of its readings:
-
-1. The two hashes it prints are equal, and neither is
-   `e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855` (the hash of nothing): the
-   Pi's `.env` holds the secret's latest version.
-2. The recorder started after the update wrote that `.env`. The block reads the recorder's last
-   start line (`… web UI on …`) in its journal of this boot (`journalctl --boot=0`) and the time
-   `.env` was written, and prints `the recorder started at <time>, after .env was written at
-   <time>`. It stops when the start came first, or when the journal of this boot has no start. The
-   update writes `.env` before it restarts the recorder, and prints its `installed commit` or
-   `installed secrets` line after the restart, so the start is compared with `.env`, not with that
-   line.
-3. The `whoami` read prints `{"scopes":[]}`: Dispatch accepts the Pi's token. The read sends the
-   token on standard input, on the Pi.
+Check that the Pi runs with the secret's latest Dispatch token, on your own device, in a checkout,
+with your own Google login. The block prints two hashes: the SHA-256 of the Pi's token, read on the
+Pi from its `.env`, and the SHA-256 of the secret's latest version. They must be equal, and neither
+may be `e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855`, the hash of nothing,
+which an empty or unread value gives. After you add a version, they are equal once the version has
+reached the Pi (above).
 
 <!-- runbook_blocks_test.sh: token-check -->
 ```bash
@@ -163,21 +148,8 @@ checkout, with your own Google login; the revoke waits for all three of its read
   ssh "ghost-wispr@$PI_HOST" "sed -n 's/^GHOST_WISPR_DISPATCH_TOKEN[=]//p' /opt/ghost-wispr/.env" |
     tr -d '\n' | shasum -a 256 &&
   gcloud secrets versions access latest --secret="$PI_DISPATCH_TOKEN_SECRET" --project="$PI_GCP_PROJECT" |
-    tr -d '\n' | shasum -a 256 &&
-  ssh "ghost-wispr@$PI_HOST" 'w=$(stat -c %.6Y /opt/ghost-wispr/.env) &&
-    s=$(sudo -n journalctl _SYSTEMD_USER_UNIT=ghost-wispr.service --boot=0 -o short-unix --no-pager |
-      grep "web UI on" | tail -n 1 | cut -d " " -f 1) &&
-    { [ -n "$s" ] || { echo "found no recorder start in the journal of this boot" >&2; false; }; } &&
-    if awk -v s="$s" -v w="$w" "BEGIN { exit !(s > w) }"; then
-      echo "the recorder started at $s, after .env was written at $w"
-    else echo "the recorder started at $s, before .env was written at $w" >&2; false; fi' &&
-  ssh "ghost-wispr@$PI_HOST" "sed -n 's/^GHOST_WISPR_DISPATCH_TOKEN[=]/Authorization: Bearer /p' /opt/ghost-wispr/.env |
-    curl -fsS -H @- '$PI_DISPATCH_URL/api/v1/whoami' | jq -c '{scopes}'")
+    tr -d '\n' | shasum -a 256)
 ```
-
-Then revoke the old token with your own Dispatch token (`DELETE /api/v1/me/agent-tokens/{id}`, with
-the id that its mint printed), and run the `whoami` read again: it must still print
-`{"scopes":[]}`.
 
 ## Flash the card
 
@@ -1386,8 +1358,8 @@ the unit.
    agent.
 2. The Pi's Dispatch token: a no-scope agent token, never a person's, which the nightly update
    reads from Secret Manager into `.env` as `GHOST_WISPR_DISPATCH_TOKEN`. "The Pi's secrets" says
-   how to mint it into its secret, and how to replace it. Without it the voice answers "I cannot
-   reach Dispatch yet".
+   how to replace it, and how to check that the Pi runs with the secret's latest version. Without
+   it the voice answers "I cannot reach Dispatch yet".
 3. After the deploy, `/api/status` must hold no `voice` warning, and the running process must
    have logged `voice: ready (wake phrases ["Wispr" "Ghost Wispr"]; ...)` and
    `concierge: the Envoy session is open`. The service writes JSON records, so the journal holds
