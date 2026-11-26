@@ -335,3 +335,40 @@ func TestAnEnvFailureRestoresTheLocalSettingsFile(t *testing.T) {
 		t.Errorf("the failed save changed the release config:\n%s", after)
 	}
 }
+
+// TestAProviderKeySaveWritesNoProvidersToTheLocalSettingsFile fails if a page
+// save of a provider key writes a providers entry to the local settings file:
+// the key goes to .env, and a providers entry there would replace the release
+// config's provider from then on. The save also changes silence_timeout, so
+// the local settings file exists and the check reads a file the save wrote.
+func TestAProviderKeySaveWritesNoProvidersToTheLocalSettingsFile(t *testing.T) {
+	clearVoiceEnv(t)
+	dir := t.TempDir()
+	path, envPath := filepath.Join(dir, "ghost-wispr.yaml"), filepath.Join(dir, ".env")
+	if err := os.WriteFile(path, []byte(examplePi), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	store, _, err := NewStoreWithEnv(path, envPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Update(func(c *Config) {
+		c.SilenceTimeout = "45s"
+		if err := c.SetAPIKey("deepgram", "dg-saved"); err != nil {
+			t.Errorf("SetAPIKey(deepgram): %v", err)
+		}
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	local := savedConfig(t, LocalSettingsPath(path))
+	if local["silence_timeout"] != "45s" {
+		t.Errorf("the local settings file holds silence_timeout %v, want 45s", local["silence_timeout"])
+	}
+	if providers, ok := local["providers"]; ok {
+		t.Errorf("a provider key save wrote providers to the local settings file: %v", providers)
+	}
+	if data, _ := os.ReadFile(LocalSettingsPath(path)); strings.Contains(string(data), "dg-saved") {
+		t.Errorf("the local settings file holds the saved key:\n%s", data)
+	}
+}
