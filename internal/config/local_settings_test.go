@@ -289,44 +289,135 @@ func TestAFalseSavedOverATrueTemplateStays(t *testing.T) {
 	}
 }
 
-// TestAnEnvironmentOverrideIsSavedToTheLocalSettingsFile fails if a page save
-// writes an environment override into the release config or loses it when the
-// override is removed before the next start.
-func TestAnEnvironmentOverrideIsSavedToTheLocalSettingsFile(t *testing.T) {
+// localKeys returns the local settings file beside path as a map, and fails
+// t when the file is missing.
+func localKeys(t *testing.T, path string) map[string]any {
+	t.Helper()
+	return savedConfig(t, LocalSettingsPath(path))
+}
+
+// TestAnEnvironmentOverrideIsNotSavedByAnotherSetting fails if a page save of
+// one setting writes a value that an environment variable gives another
+// setting. Such a value would hide the setting of each later release config,
+// as .env's GHOST_WISPR_JABRA_MUTE_BUTTON=false did on the office Pi: the
+// release's value must take effect once the variable is removed, and the local
+// settings file must hold only the setting the save changed.
+func TestAnEnvironmentOverrideIsNotSavedByAnotherSetting(t *testing.T) {
+	for _, tc := range []struct {
+		name, variable, value      string
+		release, newRelease        string
+		overridden, releaseApplied func(Config) bool
+	}{
+		{
+			name: "jabra_mute_button", variable: "JABRA_MUTE_BUTTON", value: "false",
+			release:        "jabra_mute_button: true\n",
+			newRelease:     "jabra_mute_button: true\nrecording_rules:\n  - New release rule.\n",
+			overridden:     func(c Config) bool { return !c.JabraMuteButton },
+			releaseApplied: func(c Config) bool { return c.JabraMuteButton },
+		},
+		{
+			name: "mic_device", variable: "MIC_DEVICE", value: "Loopback",
+			release:        "mic_device: J75\n",
+			newRelease:     "mic_device: Jabra\n",
+			overridden:     func(c Config) bool { return c.MicDevice == "Loopback" },
+			releaseApplied: func(c Config) bool { return c.MicDevice == "Jabra" },
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			clearEnv(t)
+			path := writeConfig(t, tc.release)
+			release, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv(EnvPrefix+tc.variable, tc.value)
+			store, _, err := NewStore(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !tc.overridden(store.Get()) {
+				t.Fatalf("%s%s=%s did not override %s: the check below could not see a saved override", EnvPrefix, tc.variable, tc.value, tc.name)
+			}
+			if err := store.Update(func(c *Config) { c.SilenceTimeout = "45s" }); err != nil {
+				t.Fatal(err)
+			}
+			if local := localKeys(t, path); len(local) != 1 || local["silence_timeout"] != "45s" {
+				t.Errorf("the local settings file holds %v, want silence_timeout 45s alone", local)
+			}
+			if after, err := os.ReadFile(path); err != nil || !bytes.Equal(after, release) {
+				t.Errorf("the save changed the release config (%v):\n%s", err, after)
+			}
+
+			t.Setenv(EnvPrefix+tc.variable, "")
+			if err := os.WriteFile(path, []byte(tc.newRelease), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			reopened, _, err := NewStore(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := reopened.Get(); !tc.releaseApplied(got) || got.SilenceTimeout != "45s" {
+				t.Errorf("after a new release with %s%s removed: jabra_mute_button %t, mic_device %q, silence_timeout %q; want the new release's %s and 45s",
+					EnvPrefix, tc.variable, got.JabraMuteButton, got.MicDevice, got.SilenceTimeout, tc.name)
+			}
+		})
+	}
+}
+
+// TestASaveBackToTheReleaseValueRemovesOnlyThatKey fails if a save drops a
+// setting an earlier save wrote, if a save that sets a setting back to the
+// release config's value leaves that setting in the local settings file, or if
+// the file stays when no saved setting is left.
+func TestASaveBackToTheReleaseValueRemovesOnlyThatKey(t *testing.T) {
 	clearEnv(t)
-	path := writeConfig(t, "recording_rules:\n  - Release rule.\n")
-	original, err := os.ReadFile(path)
+	path := writeConfig(t, "silence_timeout: 30s\ngc_max_age_days: 30\n")
+	store, _, err := NewStore(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Setenv(EnvPrefix+"RECORDING_RULES", `["Environment rule."]`)
-	store, _, err := NewStore(path)
-	if err != nil {
+	if err := store.Update(func(c *Config) { c.SilenceTimeout = "45s" }); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.Update(func(c *Config) { c.GCMaxAgeDays = 7 }); err != nil {
 		t.Fatal(err)
 	}
-	localRules, ok := savedConfig(t, LocalSettingsPath(path))["recording_rules"].([]any)
-	if !ok || len(localRules) != 1 || localRules[0] != "Environment rule." {
-		t.Errorf("local recording_rules = %v, want [Environment rule.]", localRules)
-	}
-	gotRelease, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !bytes.Equal(gotRelease, original) {
-		t.Errorf("the environment override changed the release config:\n%s", gotRelease)
+	if local := localKeys(t, path); len(local) != 2 || local["silence_timeout"] != "45s" || local["gc_max_age_days"] != 7 {
+		t.Fatalf("after two saves the local settings file holds %v, want silence_timeout 45s and gc_max_age_days 7", local)
 	}
 
-	t.Setenv(EnvPrefix+"RECORDING_RULES", "")
-	reopened, _, err := NewStore(path)
+	if err := store.Update(func(c *Config) { c.SilenceTimeout = "30s" }); err != nil {
+		t.Fatal(err)
+	}
+	if local := localKeys(t, path); len(local) != 1 || local["gc_max_age_days"] != 7 {
+		t.Errorf("after silence_timeout went back to the release's 30s, the local settings file holds %v, want gc_max_age_days 7 alone", local)
+	}
+
+	if err := store.Update(func(c *Config) { c.GCMaxAgeDays = 30 }); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(LocalSettingsPath(path)); !os.IsNotExist(err) {
+		t.Errorf("with no saved setting left, the local settings file is still there (%v)", err)
+	}
+}
+
+// TestASaveKeepsTheOtherKeysOfTheLocalSettingsFile fails if a save writes the
+// local settings file from the running config, not into the file as it is: a
+// setting a person wrote into the file after the start would be lost.
+func TestASaveKeepsTheOtherKeysOfTheLocalSettingsFile(t *testing.T) {
+	clearEnv(t)
+	path := writeConfig(t, "silence_timeout: 30s\n")
+	store, _, err := NewStore(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	rules := reopened.Get().RecordingRules
-	if len(rules) != 1 || rules[0] != "Environment rule." {
-		t.Errorf("recording_rules after removing the environment override = %q, want [Environment rule.]", rules)
+	if err := os.WriteFile(LocalSettingsPath(path), []byte("min_session_segments: 4\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Update(func(c *Config) { c.SilenceTimeout = "45s" }); err != nil {
+		t.Fatal(err)
+	}
+	if local := localKeys(t, path); len(local) != 2 || local["min_session_segments"] != 4 || local["silence_timeout"] != "45s" {
+		t.Errorf("the local settings file holds %v, want min_session_segments 4 and silence_timeout 45s", local)
 	}
 }
 
@@ -598,35 +689,6 @@ func TestASaveOverALocalSettingsFileThatWasNotAppliedIsRefused(t *testing.T) {
 	}
 }
 
-// TestAnEmptyRecordingRulesOverrideIsSavedAsNoRules fails if a save made
-// while GHOST_WISPR_RECORDING_RULES is [] keeps the release config's rules
-// once the variable is removed: an empty list is a value, as R13 says of each
-// value from the environment.
-func TestAnEmptyRecordingRulesOverrideIsSavedAsNoRules(t *testing.T) {
-	clearEnv(t)
-	path := writeConfig(t, "recording_rules:\n  - First release rule.\n  - Second release rule.\n")
-	t.Setenv(EnvPrefix+"RECORDING_RULES", "[]")
-	store, _, err := NewStore(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := store.Get().RecordingRules; len(got) != 0 {
-		t.Fatalf("recording_rules with %sRECORDING_RULES=[] = %q, want none", EnvPrefix, got)
-	}
-	if err := store.Update(func(c *Config) { c.GCMaxAgeDays = 7 }); err != nil {
-		t.Fatal(err)
-	}
-
-	t.Setenv(EnvPrefix+"RECORDING_RULES", "")
-	reopened, _, err := NewStore(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := reopened.Get().RecordingRules; len(got) != 0 {
-		t.Errorf("recording_rules after the variable is removed = %q, want none", got)
-	}
-}
-
 // TestAHandWrittenNullOnAStructSettingIsNotApplied fails if a null that a
 // person wrote on a setting that is not an entry of a map (providers,
 // summarization.presets, a provider's labels) zeroes that setting: the local
@@ -731,47 +793,65 @@ func TestAProviderKeySaveWritesNoProvidersToTheLocalSettingsFile(t *testing.T) {
 	}
 }
 
-// TestAProjectFromGoogleApplicationCredentialsIsSavedLikeAnEnvironmentOverride
-// fails if the release config a save compares with reads
-// GOOGLE_APPLICATION_CREDENTIALS. That release config has no environment, so
-// the Vertex AI project the variable's credential file gives is a value from
-// the environment: a save writes it to the local settings file, and it stays
-// after the variable is removed.
-func TestAProjectFromGoogleApplicationCredentialsIsSavedLikeAnEnvironmentOverride(t *testing.T) {
-	clearVoiceEnv(t)
-	dir := t.TempDir()
-	credentials := filepath.Join(dir, "service-account.json")
-	if err := os.WriteFile(credentials, []byte(`{"type": "service_account", "project_id": "env-project"}`), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("GOOGLE_APPLICATION_CREDENTIALS", credentials)
-	path := filepath.Join(dir, "ghost-wispr.yaml")
-	if err := os.WriteFile(path, []byte("providers:\n  vertex: {api: vertex, auth: {kind: google}}\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	store, _, err := NewStore(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := store.Get().Providers["vertex"].Project; got != "env-project" {
-		t.Fatalf("vertex's project with GOOGLE_APPLICATION_CREDENTIALS set = %q, want env-project: the check below could not see the variable's project", got)
-	}
-	if err := store.Update(func(c *Config) { c.SilenceTimeout = "45s" }); err != nil {
-		t.Fatal(err)
-	}
+// TestAVertexProjectFromTheEnvironmentIsNotSavedByAnotherSetting fails if an
+// unrelated page save writes the Vertex AI project, or the credential file,
+// that the environment gives: GOOGLE_APPLICATION_CREDENTIALS when the release
+// config names no credential file, or GHOST_WISPR_GOOGLE_CREDENTIALS_FILE over
+// the one it names. Once the variable is removed, the project must again be
+// the one the release config gives.
+func TestAVertexProjectFromTheEnvironmentIsNotSavedByAnotherSetting(t *testing.T) {
+	for _, tc := range []struct {
+		name, variable string
+		// releaseCredentials says whether the release config names its own
+		// credential file.
+		releaseCredentials bool
+		afterRemoval       string // vertex's project once the variable is removed
+	}{
+		{name: "GOOGLE_APPLICATION_CREDENTIALS", variable: "GOOGLE_APPLICATION_CREDENTIALS", afterRemoval: ""},
+		{name: "GHOST_WISPR_GOOGLE_CREDENTIALS_FILE", variable: EnvPrefix + "GOOGLE_CREDENTIALS_FILE", releaseCredentials: true, afterRemoval: "release-project"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			clearVoiceEnv(t)
+			dir := t.TempDir()
+			credentials := func(name, project string) string {
+				path := filepath.Join(dir, name)
+				if err := os.WriteFile(path, fmt.Appendf(nil, `{"type": "service_account", "project_id": %q}`, project), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				return path
+			}
+			release := "providers:\n  vertex: {api: vertex, auth: {kind: google}}\n"
+			if tc.releaseCredentials {
+				release = fmt.Sprintf("google_credentials_file: %q\n", credentials("release.json", "release-project")) + release
+			}
+			path := filepath.Join(dir, "ghost-wispr.yaml")
+			if err := os.WriteFile(path, []byte(release), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv(tc.variable, credentials("environment.json", "env-project"))
+			store, _, err := NewStore(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := store.Get().Providers["vertex"].Project; got != "env-project" {
+				t.Fatalf("vertex's project with %s set = %q, want env-project: the check below could not see the variable's project", tc.variable, got)
+			}
+			if err := store.Update(func(c *Config) { c.SilenceTimeout = "45s" }); err != nil {
+				t.Fatal(err)
+			}
+			if local := localKeys(t, path); len(local) != 1 || local["silence_timeout"] != "45s" {
+				t.Errorf("the local settings file holds %v, want silence_timeout 45s alone", local)
+			}
 
-	providers, _ := savedConfig(t, LocalSettingsPath(path))["providers"].(map[string]any)
-	vertex, _ := providers["vertex"].(map[string]any)
-	if vertex["project"] != "env-project" {
-		t.Errorf("the local settings file holds providers %v, want vertex's project env-project", providers)
-	}
-	t.Setenv("GOOGLE_APPLICATION_CREDENTIALS", "")
-	reopened, _, err := NewStore(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := reopened.Get().Providers["vertex"].Project; got != "env-project" {
-		t.Errorf("vertex's project after the variable is removed = %q, want env-project", got)
+			t.Setenv(tc.variable, "")
+			reopened, _, err := NewStore(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := reopened.Get().Providers["vertex"].Project; got != tc.afterRemoval {
+				t.Errorf("vertex's project after %s is removed = %q, want %q", tc.variable, got, tc.afterRemoval)
+			}
+		})
 	}
 }
 

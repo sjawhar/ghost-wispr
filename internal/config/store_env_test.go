@@ -10,9 +10,9 @@ import (
 )
 
 // A settings change does not write GHOST_WISPR_LOG_LEVEL's override into the
-// local settings file: the override stays in memory. Another override is
-// written to the local settings file, as the example config and the API spec
-// say of GHOST_WISPR_RECORDING_RULES. The release config does not change.
+// local settings file: the override stays in memory. It writes no other
+// override either, such as GHOST_WISPR_AUDIO_DIR's: only the setting it
+// changed. The release config does not change.
 func TestASettingsChangeKeepsTheLogLevelOverrideInMemory(t *testing.T) {
 	clearEnv(t)
 	path := writeConfig(t, "log_level: info\naudio_dir: /file/audio\nsilence_timeout: 30s\n")
@@ -35,8 +35,8 @@ func TestASettingsChangeKeepsTheLogLevelOverrideInMemory(t *testing.T) {
 		t.Errorf("in memory: log_level %q, silence_timeout %q; want debug, 45s", got.LogLevel, got.SilenceTimeout)
 	}
 	saved := savedConfig(t, LocalSettingsPath(path))
-	if level, ok := saved["log_level"]; ok || saved["silence_timeout"] != "45s" || saved["audio_dir"] != "/env/audio" {
-		t.Errorf("the local settings file says log_level %v (set: %t), silence_timeout %v, audio_dir %v; want no log_level, 45s, /env/audio", level, ok, saved["silence_timeout"], saved["audio_dir"])
+	if len(saved) != 1 || saved["silence_timeout"] != "45s" {
+		t.Errorf("the local settings file holds %v, want silence_timeout 45s alone: no log_level and no audio_dir", saved)
 	}
 	if after, err := os.ReadFile(path); err != nil || !bytes.Equal(after, release) {
 		t.Errorf("a settings change changed the release config (%v):\n%s", err, after)
