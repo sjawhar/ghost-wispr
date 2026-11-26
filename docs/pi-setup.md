@@ -418,7 +418,8 @@ and signs in to Google. `update.sh` installs that version while the recorder is 
 version number in `/opt/ghost-wispr/device.crt.version`. It keeps `device.crt.prev` and
 `device.crt.version.prev`, restarts the recorder, and prints
 `ghost-wispr update: installed certificate version <n>, not after <date>`. When the recorder does
-not answer after the restart, it puts both `.prev` copies back and exits 10.
+not answer after the restart, it puts both `.prev` copies back and exits 10. A rollback of a later
+release install leaves this certificate in place ("Update and inspect", step 6).
 
 `update.sh` gives `pi-secrets` the installed version from `device.crt.version`, as
 `--installed-certificate-version`. When `latest` cannot be read because it is disabled, destroyed
@@ -664,9 +665,9 @@ page stay in the local settings file through each release. To turn the Jabra's b
 without a release, put `GHOST_WISPR_JABRA_MUTE_BUTTON=false` or `GHOST_WISPR_JABRA_MUTE_BUTTON=true`
 in `/opt/ghost-wispr/.env`, which overrides the YAML, and restart `ghost-wispr.service`. The nightly
 update keeps that line. A settings save on the page never writes that line's value to the local
-settings file, so once the line is removed, the template's setting applies. Turn it off while
-recording, or unplug the Jabra and plug it in again afterwards: Ghost Wispr leaves the Jabra's
-light as it last set it.
+settings file, so once the line is removed, the button the page saved, or else the template's,
+applies ("Settings saved on the page"). Turn it off while recording, or unplug the Jabra and plug
+it in again afterwards: Ghost Wispr leaves the Jabra's light as it last set it.
 
 The Jabra's mute light is on while recording is paused and off otherwise, whichever control
 paused it. Ghost Wispr never changes it while any of the Jabra's streams is open, its microphone
@@ -927,7 +928,14 @@ the launcher then runs `/opt/ghost-wispr/update.sh.prev`, the previous release's
 file exists, under the same limit. The launcher counts the runs that failed in a row in
 `/opt/ghost-wispr/update.failed-runs`. When the count reaches 11, one night of runs, it runs
 `update.sh.prev` once and sets the count to 0; an exit 0 also sets it to 0. So one network fault
-runs no `update.sh.prev`.
+runs no `update.sh.prev`. A fallback run of `update.sh.prev` that installs a release keeps
+`update.sh.prev` and `pi-lib.sh.prev` as they are: they are the scripts that run, and a copy of the
+broken `update.sh` there would leave no update that runs once a second such release installs.
+
+At its start, each run, `update.sh secrets` too, removes each staging directory
+`/opt/ghost-wispr/.ghost-wispr-update.*` older than 46 minutes, the launcher's limit and its grace:
+a run that limit killed left it, and it can hold the secrets that run read. A younger one may
+belong to a run still going, and stays.
 
 A run of `update.sh`:
 
@@ -951,7 +959,10 @@ A run of `update.sh`:
 4. Otherwise, holds a release whose link versions the call bridge does not accept. The bridge's
    list is `call.link_versions` in `/api/status`, and the release's is `link_versions` in its
    manifest. When both lists are there and share no number, it prints
-   `ghost-wispr update: held: ...` with both lists, and exits 0.
+   `ghost-wispr update: held: ...` with both lists. When the installed files are the set
+   `deploy.verified` lists, it then refreshes the secrets and the certificate of the release the Pi
+   runs, as in step 3, so the Pi keeps taking them while a newer release waits. It exits 0, or 10
+   when step 5 refuses that refresh or the refresh fails.
 5. Refuses to install a release, new secrets or a renewed certificate, and exits 10, while `.env`
    or the environment of `ghost-wispr`'s user manager sets `GHOST_WISPR_CONFIG` or an Envoy override
    variable ("Turn on the meeting voice", step 1), or while `ghost-wispr.service` or
@@ -965,11 +976,13 @@ A run of `update.sh`:
    each installed file of the set that `deploy.verified` lists. It installs the two system files
    with `sudo -n`, only when they change. Then it reloads the user units, reloads udev or restarts
    logind when their file changed, restarts the recorder, and waits up to 120 s for `/api/version`
-   to answer the release's commit. Then it writes `deploy.verified` and prints
-   `ghost-wispr update: installed commit <sha> (invocation <id>)`. When that answer does not come,
-   it puts back each file from its `.prev` copy, byte for byte, and prints
-   `ghost-wispr update: <why>; restored the previous release`. It restarts the recorder for that
-   rollback only while the recorder reports no session and no call, and leaves it running
+   to answer the release's commit and for `/api/status` to answer a status it can read, whose
+   `call`, when it has one, is an object: a release whose status the update cannot read would stop
+   each later run at its first status read, before it could install a fix. Then it writes
+   `deploy.verified` and prints `ghost-wispr update: installed commit <sha> (invocation <id>)`.
+   When either answer does not come, it puts back each file from its `.prev` copy, byte for byte,
+   and prints `ghost-wispr update: <why>; restored the previous release`. It restarts the recorder
+   for that rollback only while the recorder reports no session and no call, and leaves it running
    otherwise. A file with no `.prev` copy stays as installed, and the line says
    `no previous release to restore`. When the installed files were not the set `deploy.verified`
    lists, as after an install cut short, the run keeps no new `.prev` copies, since those it has
@@ -977,6 +990,9 @@ A run of `update.sh`:
    `ghost-wispr update: <why>; restored the last verified set, the one deploy.verified lists`, and
    exits 10, also when a session starts during the swap. When those copies are not that set, the
    line says `restored each file that has a .prev copy, but they are not the set deploy.verified lists`.
+   In each rollback, the certificate and its version file go back only when that run swapped them
+   in: a certificate that an earlier run installed passed `pi-secrets`' checks, and its `.prev` copy
+   is older.
 7. After an install, or with the release current, compares the three provisioning files that the
    nightly update does not install (the launcher, `ghost-wispr-update.service` and
    `ghost-wispr-update.timer`) with the manifest, and the live Tailscale Serve setting with the
@@ -1113,8 +1129,8 @@ saved on the page stay in `/opt/ghost-wispr/ghost-wispr.local.yaml`, which no re
 The update restarts the recorder only while it is free. While a session or a call goes on, it
 prints `ghost-wispr update: active session; leaving the current release in place` (or the call's
 state), and a later run of the night tries again. When the new release does not answer its commit
-within 120 s, the update puts back the whole set that ran before and prints
-`...; restored the previous release`. A later run tries the release again.
+and a status the update can read within 120 s, the update puts back the whole set that ran before
+and prints `...; restored the previous release`. A later run tries the release again.
 
 A setting in `/opt/ghost-wispr/.env` overrides the YAML. The office Pi can set the Jabra's Mute
 button there, with `GHOST_WISPR_JABRA_MUTE_BUTTON` ("Pause and resume at the unit"). The nightly
@@ -1190,8 +1206,11 @@ set `deploy.verified` lists, and installs the latest release again.
 
 A setting saved on the web UI's settings page goes to the local settings file,
 `/opt/ghost-wispr/ghost-wispr.local.yaml`, never to `ghost-wispr.yaml`. Ghost Wispr reads that file
-over the release's config (README, "Configuration"). No release holds the file, and the nightly
-update never changes it, so a saved setting stays through each release. Check 2 of
+over the release's config (README, "Configuration"). A save writes only the settings it changes, and
+never a value that `.env` gives, such as the Jabra's `GHOST_WISPR_JABRA_MUTE_BUTTON` line: once that
+line is removed, the saved setting or the template applies. A setting saved back to the template's
+value leaves the file, and the file goes when no setting is left. No release holds the file, and the
+nightly update never changes it, so a saved setting stays through each release. Check 2 of
 `check-deploy.sh` compares a setting that the file sets with the file's value, and names it.
 Recording rules cannot be changed on the page.
 
