@@ -251,10 +251,11 @@ restarts the recorder, and a restart ends a conversation that is being recorded.
    ./provision.sh
    ```
 
-   `provision.sh` runs as `ghost-wispr`, with passwordless sudo, and reads nothing on standard
-   input. Before it changes anything, it refuses while the environment of `ghost-wispr`'s user
-   manager sets `GHOST_WISPR_CONFIG` or an Envoy variable, which the recorder would inherit ("Turn
-   on the meeting voice", step 1). Then it:
+   `provision.sh` runs as `ghost-wispr`, with passwordless sudo, and refuses data on standard
+   input. It refuses a directory whose files do not match its `manifest.json`, such as a checkout's
+   `deploy/pi/`. Before it changes anything, it refuses while the environment of `ghost-wispr`'s
+   user manager sets `GHOST_WISPR_CONFIG` or an Envoy variable, which the recorder would inherit
+   ("Turn on the meeting voice", step 1). Then it:
 
    - installs `libportaudio2`, `ffmpeg`, `lame`, `jq` and `curl`;
    - writes `/opt/ghost-wispr/google-credentials.json` and `/opt/ghost-wispr/certificate_config.json`
@@ -262,10 +263,12 @@ restarts the recorder, and a restart ends a conversation that is being recorded.
      `credentials: same as pi.env renders` or the names of the fields that differ. Where
      `/opt/ghost-wispr/tailscale-client-id` exists, it prints whether that ID equals
      `PI_TAILNET_CLIENT_ID`;
-   - installs the launcher, `ghost-wispr-update.service` and `ghost-wispr-update.timer`, and the
-     release's `update.sh`, `pi-lib.sh` and `pi.env`, and enables the timer;
+   - adds `ghost-wispr` to the groups `plugdev`, `input` and `audio`, and installs the launcher,
+     `ghost-wispr-update.service` and `ghost-wispr-update.timer`, and the release's `update.sh`,
+     `pi-lib.sh` and `pi.env`. It turns on lingering for `ghost-wispr` and enables the timer;
    - starts the nightly update once, with `systemctl --user start ghost-wispr-update.service`. That
-     run installs the release's whole deploy set and reads the Pi's secrets ("Update and inspect");
+     run installs the release's whole deploy set and reads the Pi's secrets ("Update and inspect").
+     `provision.sh` prints the run's journal lines, and stops when the run failed;
    - enables `ghost-wispr.service`;
    - applies each line of the release's `serve.conf` with `tailscale serve --bg --https`, and turns
      off each live Serve HTTPS port that `serve.conf` does not list;
@@ -273,14 +276,13 @@ restarts the recorder, and a restart ends a conversation that is being recorded.
      `PI_SERVICE_ACCOUNT_UNIQUE_ID`, or stops after "already joined" on a Pi that is joined as
      `tag:ghost-wispr` already.
 
-   Its last line says what it did: it started the tagged tailnet join as a detached unit, which it
-   names, or it found the Pi already joined and started none. The SSH session can end while
-   Tailscale re-authenticates (exit 255). The join unit's command line holds each
-   `tailscale serve` call of `serve.conf`, so the join reads no file of the release directory. The
-   join runs `tailscale up` with `--accept-routes=false`, so the Pi joins with the tailnet's subnet
-   routes off. Then it runs the route check of "Accept the tailnet's subnet routes", and accepts
-   the routes (`tailscale set --accept-routes`) only when no peer's `PrimaryRoutes` overlaps a
-   network of the Pi.
+   It ends with `already joined as tag:ghost-wispr`, or with the line that names the detached join
+   unit it started. The SSH session can end while Tailscale re-authenticates (exit 255). The join
+   unit's command line holds each `tailscale serve` call of `serve.conf`, so the join reads no file
+   of the release directory. The join runs `tailscale up` with `--accept-routes=false`, so the Pi
+   joins with the tailnet's subnet routes off. Then it runs the route check of "Accept the tailnet's
+   subnet routes", and accepts the routes (`tailscale set --accept-routes`) only when no peer's
+   `PrimaryRoutes` overlaps a network of the Pi.
 6. On your own device, in a Ghost Wispr checkout, give the tagged device its name. The tagged join
    makes a new Tailscale device. The temporary device you joined as your own still holds the name
    `ghost-wispr`, so Tailscale names the tagged one `ghost-wispr-1`, and
