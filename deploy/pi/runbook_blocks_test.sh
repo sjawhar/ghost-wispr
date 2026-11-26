@@ -874,5 +874,5 @@ TEST_MAIN_PID_VALUE=0 run_settings "$work_dir/settings-stopped" ''
 grep -Fq 'ghost-wispr.service runs no process' "$work_dir/settings-stopped/out" \
   || fail "the running-settings block did not say the recorder runs no process: $(<"$work_dir/settings-stopped/out")"
 
-printf 'runbook blocks test passed: %d blocks, %d release files, %d provision.sh commands, 7 download cases, 6 route cases, 2 claim cases, 3 cases of each secret block, 4 token-check cases, 5 settings cases, the slice 1 driver\n' \
+printf 'runbook blocks test passed: %d blocks, %d release files, %d provision.sh commands, 7 download cases, 6 route cases, 2 claim cases, 3 cases of each secret block, 5 token-check cases, 5 settings cases, the slice 1 driver\n' \
   "${#blocks[@]}" "$(wc -l <<<"$release_files")" "$provision_commands"
