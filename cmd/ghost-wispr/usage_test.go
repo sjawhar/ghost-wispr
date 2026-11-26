@@ -17,7 +17,7 @@ func TestHelpListsEverySubcommand(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	subcommands := []string{"light-off", "light-state"}
+	subcommands := []string{"light-off", "light-state", "pi-secrets"}
 	named := regexp.MustCompile(`os\.Args\[1\] == "([a-z-]+)"`).FindAllSubmatch(source, -1)
 	// main.go ran 4 subcommands of its own when this test was written: fewer
 	// means the pattern no longer finds them, not that they are gone.
