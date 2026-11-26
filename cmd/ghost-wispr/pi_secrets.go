@@ -150,7 +150,7 @@ func stageEnvironment(ctx context.Context, stdout io.Writer, reader secretReader
 			return piSecretsFail(stdout, "could not read %s from %s", secret.variable, secret.secret)
 		}
 		value := trimOneTrailingLineFeed(version.Data)
-		if len(value) == 0 || bytes.IndexAny(value, "\r\n\x00") >= 0 {
+		if len(value) == 0 || bytes.ContainsAny(value, "\r\n\x00") {
 			return piSecretsFail(stdout, "value for %s from %s is not safe for an environment file", secret.variable, secret.secret)
 		}
 		secret.value = value
@@ -515,8 +515,8 @@ func (reader *secretManagerReader) Access(ctx context.Context, project, secret, 
 	if err != nil {
 		return secretVersion{}, err
 	}
-	wantCRC, err := strconv.ParseUint(payload.Payload.DataCRC32C, 10, 32)
-	if err != nil || uint32(wantCRC) != crc32.Checksum(data, crc32.MakeTable(crc32.Castagnoli)) {
+	wantCRC, err := strconv.ParseUint(payload.Payload.DataCRC32C, 10, 64)
+	if err != nil || uint64(crc32.Checksum(data, crc32.MakeTable(crc32.Castagnoli))) != wantCRC {
 		return secretVersion{}, errors.New("secret manager payload CRC32C did not match")
 	}
 	return secretVersion{Version: versionNumber, Data: data}, nil
