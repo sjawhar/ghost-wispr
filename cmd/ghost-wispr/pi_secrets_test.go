@@ -24,7 +24,7 @@ import (
 	"time"
 
 	"github.com/sjawhar/ghost-wispr/internal/googleauthtest"
-}
+)
 
 type secretAccess struct {
 	project string
