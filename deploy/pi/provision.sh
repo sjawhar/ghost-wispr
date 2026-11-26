@@ -140,8 +140,12 @@ set_file_path() {
 # installed set is the one DEPLOY_DIR/deploy.verified lists. The nightly update keeps .prev copies
 # only of a set that deploy.verified lists, and a newer release's update.sh, pi-lib.sh or pi.env
 # makes the installed set another, so without these copies a failed install of this release would
-# have nothing to roll back to. Each copy goes to a temporary name and then a rename, so a running
-# update.sh.prev reads its own file to its end. Where the installed set is not the one
+# have nothing to roll back to. The copies are of each file deploy.verified names, .env, and the
+# certificate with its version file: a failed install that staged a newer certificate puts back
+# device.crt.prev, which must be the certificate the Pi runs, not the one before it. A file the Pi
+# does not have, such as device.crt.version before its first nightly certificate, loses its old
+# copy, so the .prev copies are one set. Each copy goes to a temporary name and then a rename, so a
+# running update.sh.prev reads its own file to its end. Where the installed set is not the one
 # deploy.verified lists, its .prev copies already hold the set verified last, and stay. A Pi with no
 # deploy.verified has no verified set to keep.
 keep_verified_set() {
@@ -177,7 +181,7 @@ keep_verified_set() {
   for name in ghost-wispr update.sh pi-lib.sh pi.env; do
     [[ " ${verified_names[*]} " == *" $name "* ]] || fail "$verified does not list $name: nothing was changed"
   done
-  for name in "${verified_names[@]}" .env; do
+  for name in "${verified_names[@]}" .env device.crt device.crt.version; do
     path=$(set_file_path "$name")
     if [[ -f $path ]]; then
       { cp --preserve=mode -- "$path" "$DEPLOY_DIR/.$name.prev.tmp" && mv -f -- "$DEPLOY_DIR/.$name.prev.tmp" "$DEPLOY_DIR/$name.prev"; } \
