@@ -142,21 +142,53 @@ serve_conf_lines() {
 }
 
 # serve_lines_from_status JSON prints the Serve setting that JSON, the answer of
-# `tailscale serve status --json`, holds, as serve_conf_lines prints serve.conf: one
-# "<port> <proxy target>" line for each Web entry ("<host>:<port>") whose handler / names a Proxy,
-# sorted. JSON is tailscale's ipn.ServeConfig. It fails on an empty answer or on one that is not a
-# JSON object, so a caller can tell an answer it cannot read from a Serve that serves nothing.
+# `tailscale serve status --json` (tailscale's ipn.ServeConfig), holds: one line for each handler of
+# each HTTPS port, sorted. A proxy at / prints as serve_conf_lines prints a line of serve.conf,
+# "<port> <proxy target>". Each other handler (files, a text, a redirect, a proxy at another path,
+# or a proxy that forwards peer capabilities) prints as "<port> <path> <kind> <value>", the path and
+# the value as JSON strings: three fields or more, which no line of serve.conf equals. {} serves
+# nothing, and prints nothing. It fails on an empty answer, on one that is not one JSON object, and
+# on a Serve of a shape it does not know: a key, a port, a handler or a value of another type, a
+# Web entry on a port that serves no HTTPS, an HTTPS port with no handler, a TCP forward or plain
+# HTTP, Funnel, a service or a foreground Serve. So a caller can tell a Serve it cannot read from one
+# that matches serve.conf, and never reads a part it does not know as a match.
 serve_lines_from_status() {
   local pl_lines
   [[ -n $1 ]] || return 1
-  pl_lines=$(jq -r 'if type != "object" then error("not a ServeConfig") else
-      (.Web // {}) | to_entries[]
-      | select(.value | type == "object")
-      | select(.value.Handlers | type == "object")
-      | select(.value.Handlers["/"] | type == "object")
-      | select(.value.Handlers["/"].Proxy | type == "string")
-      | "\(.key | split(":") | last) \(.value.Handlers["/"].Proxy)"
-    end' <<<"$1" 2>/dev/null) || return 1
+  pl_lines=$(jq -rs '
+    def check(cond; why): if cond then . else error(why) end;
+    def kinds: "Path", "Proxy", "Text", "Redirect";
+    check(length == 1; "not one JSON value") | .[0]
+    | check(type == "object"; "not a ServeConfig")
+    | check(keys - ["TCP", "Web", "AllowFunnel", "Services", "Foreground"] == []; "a key it does not know")
+    | check(all(.Services, .Foreground; . == null or . == {}); "a service or a foreground Serve")
+    | check(.AllowFunnel | . == null or (type == "object" and all(.[]; . == false)); "Funnel")
+    | (.TCP // {}) as $tcp | (.Web // {}) as $web
+    | check(($tcp | type) == "object" and ($web | type) == "object"; "TCP or Web is no object")
+    | check(all($tcp | to_entries[]; (.key | test("^[1-9][0-9]{0,4}$")) and .value == {HTTPS: true});
+        "a TCP port that does not serve HTTPS")
+    | [$web | to_entries[]
+        | check(.key | test("^[^:]+:[1-9][0-9]{0,4}$"); "a Web key that is not <host>:<port>")
+        | (.key | split(":")[1]) as $port
+        | check($tcp | has($port); "a Web entry on a port that serves no HTTPS")
+        | check(.value | type == "object" and keys == ["Handlers"] and (.Handlers | type == "object" and length > 0);
+            "a Web entry that is not a set of handlers")
+        | .value.Handlers | to_entries[]
+        | .key as $path | .value as $handler
+        | check(($path | startswith("/")) and ($handler | type == "object"); "a handler it does not know")
+        | [$handler | to_entries[] | select(.key != "AcceptAppCaps")] as $kind
+        | check(($kind | length == 1) and any(kinds; . == $kind[0].key)
+            and ($kind[0].value | type == "string" and length > 0)
+            and ($handler.AcceptAppCaps | . == null or (type == "array" and all(.[]; type == "string")));
+            "a handler it does not know")
+        | $kind[0]
+        | if $path == "/" and .key == "Proxy" and $handler.AcceptAppCaps == null and (.value | test("^\\S+$"))
+          then "\($port) \(.value)"
+          else "\($port) \($path | @json) \(.key | ascii_downcase) \(.value | @json)"
+            + if $handler.AcceptAppCaps == null then "" else " accept-app-caps \($handler.AcceptAppCaps | @json)" end
+          end]
+    | check(all($tcp | keys[]; . as $port | any($web | keys[]; endswith(":" + $port))); "an HTTPS port with no handler")
+    | .[]' <<<"$1" 2>/dev/null) || return 1
   if [[ -n $pl_lines ]]; then
     LC_ALL=C sort <<<"$pl_lines"
   fi

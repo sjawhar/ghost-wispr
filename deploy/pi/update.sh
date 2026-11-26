@@ -68,7 +68,7 @@ trap 'if [[ -n $stage ]]; then rm -rf -- "$stage"; fi' EXIT
 status_json='' release_json='' release_commit='' set_dir='' manifest_json='' binary_sha256=''
 tarball_url='' tarball_checksum_url='' binary_url='' binary_checksum_url=''
 secrets_file='' secrets_failure='' certificate_staged='' certificate_version='' certificate_end=''
-swapped=() changed_system=()
+swapped=() changed_system=() restore_problems=''
 
 fail() {
   printf 'ghost-wispr update: %s\n' "$*" >&2
@@ -138,7 +138,8 @@ busy_reason() {
 
 # leave_if_busy reads the recorder's status into status_json. While the recorder records a session or
 # holds a call, it ends the run with exit 0, changing nothing; while the recorder runs but gives no
-# status, it fails. It runs before any change, and again just before each swap or restart.
+# status, it fails. It runs before any change, and again just before each swap; after a release's
+# swap, leave_if_busy_before_restart reads the status again just before its restart.
 leave_if_busy() {
   local reason
   status_json=$(recorder_status)
@@ -446,7 +447,8 @@ sudo_install() {
 }
 
 # reload_system NAME... reloads udev after the udev rule changed, and restarts logind after the
-# logind setting changed, each sudo -n call under its bound (provision.sh's sequence).
+# logind setting changed, each sudo -n call under its bound: udevadm control --reload, then udevadm
+# trigger.
 reload_system() {
   local name
   for name in "$@"; do
@@ -483,12 +485,14 @@ swap_in() {
   done
 }
 
-# rollback WHY puts back each file this run swapped in from its .prev copy, byte for byte, reloads
-# the user units, and reloads udev or restarts logind when their file changed; then restarts the
-# recorder when restartable allows it, and fails with WHY. A file with no .prev copy stays as
-# installed. It writes no deploy.verified.
-rollback() {
+# restore_previous WHY puts back each file this run swapped in from its .prev copy, byte for byte,
+# reloads the user units, and reloads udev or restarts logind when their file changed. It sets
+# restore_problems to what it could not do: a reload, or a file with no .prev copy, which stays as
+# installed. When no file has a .prev copy it fails with WHY: no previous release to restore (R6).
+# It writes no deploy.verified.
+restore_previous() {
   local why=$1 name path prev restored=() missing=() system=()
+  restore_problems=''
   for name in "${swapped[@]}"; do
     path=$(installed_path "$name")
     prev=$DEPLOY_DIR/$name.prev
@@ -510,16 +514,48 @@ rollback() {
   if ((${#restored[@]} == 0)); then
     fail "$why; no previous release to restore, so the new files stay installed"
   fi
-  systemctl --user daemon-reload || why+="; could not reload the user manager"
-  reload_system "${system[@]}" || why+="; could not reload udev or restart logind"
+  systemctl --user daemon-reload || restore_problems+='; could not reload the user manager'
+  reload_system "${system[@]}" || restore_problems+='; could not reload udev or restart logind'
   if ((${#missing[@]})); then
-    why+="; no previous release to restore for ${missing[*]}, which stay as installed"
+    restore_problems+="; no previous release to restore for ${missing[*]}, which stay as installed"
   fi
+}
+
+# rollback WHY restores the previous release's files (restore_previous), then restarts the recorder
+# when restartable allows it, and fails with WHY.
+rollback() {
+  local why=$1
+  restore_previous "$why"
+  why+=$restore_problems
   if recorder_active; then
     restartable "$why"
   fi
   systemctl --user restart ghost-wispr.service || fail "$why; restored the previous release but could not restart ghost-wispr.service"
   fail "$why; restored the previous release"
+}
+
+# leave_if_busy_before_restart reads the recorder's status again just before a release's restart
+# (R7): a session or a call can start during the swap and the reloads after it. While the recorder
+# records a session or holds a call, it puts back the previous release's files (restore_previous)
+# and leaves the recorder running, unrestarted, on the files it started on. So the Pi is as it was,
+# and the run ends with exit 0, as leave_if_busy ends it, unless a file could not go back. While the
+# recorder runs but gives no status, it does the same and fails.
+leave_if_busy_before_restart() {
+  local reason kept="restored the previous release's files and left the recorder running on the files it started on"
+  status_json=$(recorder_status)
+  reason=$(busy_reason "$status_json")
+  if [[ -z $reason ]]; then
+    if [[ -n $status_json ]] || ! recorder_active; then
+      return 0
+    fi
+    reason='ghost-wispr.service is active but /api/status gave no status'
+    restore_previous "$reason"
+    fail "$reason$restore_problems; $kept"
+  fi
+  restore_previous "$reason"
+  [[ -z $restore_problems ]] || fail "$reason$restore_problems; $kept"
+  printf 'ghost-wispr update: %s; leaving the current release in place\n' "$reason"
+  exit 0
 }
 
 # refuse_override WHERE NAMES fails while NAMES, the override variables WHERE sets, is not empty.
@@ -680,6 +716,9 @@ install_release() {
   swap_in "${install_names[@]}" || rollback "could not install the release's files"
   systemctl --user daemon-reload || rollback "could not reload the user manager"
   reload_system "${changed_system[@]}" || rollback "could not reload udev or restart logind"
+  # A session or a call that started during the swap or the reloads stops the run here, with the
+  # previous release's files back.
+  leave_if_busy_before_restart
   systemctl --user restart ghost-wispr.service || rollback "the new release did not start"
   wait_for_commit "$release_commit" || rollback "the new release did not answer /api/version with commit $release_commit within 120 s"
   write_verified || fail "the new release runs, but $VERIFIED could not be written; the next run installs it again"
