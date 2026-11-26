@@ -106,13 +106,14 @@ ends a conversation that is being recorded:
 ssh ghost-wispr@ghost-wispr 'XDG_RUNTIME_DIR=/run/user/$(id -u) systemctl --user restart ghost-wispr.service'
 ```
 
-The two secrets hold the Pi's current values: their first versions were copied once from the Pi's
-own `.env`. To replace a value, add a new version on your own device, in a Ghost Wispr checkout,
-with your own Google login (`gcloud auth login`). The blocks read the names from
-`deploy/pi/files/pi.env` (`GHOST_WISPR_PI_ENV` names another file, as the tests do). Each block
-reads the value at a prompt without showing it, gives it to `gcloud` in a mode-0600 file that it
-removes, never in a command argument, and adds no version for an empty value. It prints the version
-that it added, never the value. The Deepgram key:
+Each secret's first version was copied once from the Pi's own `.env`, so it holds the value that
+the Pi ran with before. To replace a value, add a new version on your own device, in a Ghost Wispr
+checkout, with your own Google login (`gcloud auth login`). Run each block in bash: zsh, the default
+shell of macOS, reads `read -p` another way, and the block then adds no version. The blocks read
+the names from `deploy/pi/files/pi.env` (`GHOST_WISPR_PI_ENV` names another file, as the tests do).
+Each block reads the value at a prompt without showing it, gives it to `gcloud` in a mode-0600 file
+that it removes, never in a command argument, and adds no version for an empty value. It prints the
+version that it added, never the value. The Deepgram key:
 
 <!-- runbook_blocks_test.sh: deepgram-key -->
 ```bash
@@ -124,7 +125,9 @@ that it added, never the value. The Deepgram key:
 ```
 
 The Dispatch token. A replacement is a no-scope agent token, never a person's: make one in Dispatch,
-under Settings → Agent tokens, with no scope.
+under Settings → Agent tokens. The form ticks two boxes for a new token, Act as you and Approve and
+control credentials: clear both boxes, and leave Read only clear. A token made with the boxes as the
+form sets them could approve and control credentials as the person who made it.
 
 <!-- runbook_blocks_test.sh: dispatch-token -->
 ```bash
@@ -399,12 +402,13 @@ A rollback of a later release install leaves this certificate in place ("Update 
 step 6).
 
 The certificate and its version file change as one. A run cut short between the two would leave a
-certificate with another certificate's version, and `pi-secrets` stages no certificate that is not
-newer than the installed version, so no later run would put the pair right. So `update.sh` first
-writes the journal `/opt/ghost-wispr/device.crt.version.new`, which holds the version the pair gets
-(or `none`, for no version file) and the SHA-256 of the new certificate. Then it renames the
-certificate over `device.crt`, then writes or removes `device.crt.version`, and then removes the
-journal. A rollback puts the pair back the same way, from `device.crt.prev` and the number in
+certificate with another certificate's version. `pi-secrets` stages no certificate that does not end
+later than the installed `device.crt`, so it would never stage the installed certificate again, and
+no later run would put the pair right. So `update.sh` first writes the journal
+`/opt/ghost-wispr/device.crt.version.new`, which holds the version the pair gets (or `none`, for no
+version file) and the SHA-256 of the new certificate. Then it renames the certificate over
+`device.crt`, then writes or removes `device.crt.version`, and then removes the journal. A rollback
+puts the pair back the same way, from `device.crt.prev` and the number in
 `device.crt.version.prev`. At its start, each run, `update.sh secrets` too, reads a journal that a
 run cut short left. When the installed `device.crt` has the journal's SHA-256, the run finishes the
 pair, and prints
@@ -932,10 +936,11 @@ belong to a run still going, and stays.
 
 A run of `update.sh`:
 
-1. Changes nothing while the recorder is busy: while `/api/status` has a non-empty
-   `active_session_id`, or a `call` whose `state` is not `none` (a Meet call that the call bridge of
-   dispatch://INFRA-5904 links to the Pi). It reads the status before any change and again just
-   before it swaps a file or restarts the recorder, and prints
+1. Installs nothing and restarts nothing while the recorder is busy: while `/api/status` has a
+   non-empty `active_session_id`, or a `call` whose `state` is not `none` (a Meet call that the call
+   bridge of dispatch://INFRA-5904 links to the Pi). Only the start of the run above can change a
+   file then. It reads the status before any change and again just before it swaps a file or
+   restarts the recorder, and prints
    `ghost-wispr update: active session; leaving the current release in place` (or the call's
    state in place of `active session`). A later run of the night tries again.
 2. Downloads the release's tarball, checks it against its `.sha256`, and checks each file against

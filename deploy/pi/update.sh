@@ -529,8 +529,8 @@ finish_certificate_pair() {
 # reconcile_certificate_journal puts right a certificate pair that a run cut short left: with the
 # journal's certificate installed, it finishes the pair; with any other, the certificate never went
 # in, and it removes the journal, so the pair before stays. A journal it cannot read is removed too.
-# Each run does this first: pi-secrets reads the installed version from device.crt.version, and
-# stages no certificate that is not newer, so no later read would correct a mismatched pair.
+# Each run does this first: pi-secrets stages no certificate that does not end later than the
+# installed device.crt, so no later read would correct a mismatched pair.
 reconcile_certificate_journal() {
   local -a lines=()
   local version='' sha=''
