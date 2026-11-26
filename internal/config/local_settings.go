@@ -116,18 +116,37 @@ func mergeSettings(release, local map[string]any) map[string]any {
 	return release
 }
 
+// wholeEntryMaps are the maps of struct entries, by their path in the config
+// file, whose entries a save writes whole. yaml.v3 decodes each entry of such
+// a map into a new zero struct, not over the entry the defaults hold, so an
+// entry written in part, such as a field of the built-in default preset,
+// would lose its other fields at the next start. Provider entries stay
+// partial: no settings save changes one, since a save of provider_keys goes
+// to .env.
+var wholeEntryMaps = map[string]bool{"summarization.presets": true}
+
 // settingsDifference returns the values of current that differ from release,
-// in the form mergeSettings reads: a map holds only its keys that differ, and
-// a key that current does not have is null.
+// in the form mergeSettings reads: a map holds only its keys that differ, but
+// an entry of a wholeEntryMaps map that differs is whole, and a key that
+// current does not have is null.
 func settingsDifference(current, release map[string]any) map[string]any {
+	return differenceAt("", current, release)
+}
+
+func differenceAt(path string, current, release map[string]any) map[string]any {
+	whole := wholeEntryMaps[path]
 	difference := make(map[string]any)
 	for key, currentValue := range current {
 		releaseValue, inRelease := release[key]
 		currentMap, currentIsMap := currentValue.(map[string]any)
 		releaseMap, releaseIsMap := releaseValue.(map[string]any)
 		switch {
-		case currentIsMap && releaseIsMap:
-			if nested := settingsDifference(currentMap, releaseMap); len(nested) != 0 {
+		case currentIsMap && releaseIsMap && !whole:
+			keyPath := key
+			if path != "" {
+				keyPath = path + "." + key
+			}
+			if nested := differenceAt(keyPath, currentMap, releaseMap); len(nested) != 0 {
 				difference[key] = nested
 			}
 		case !inRelease:
@@ -184,27 +203,21 @@ func removeSettingsFile(path string) error {
 }
 
 // writeLocalSettings writes the settings that differ from the release config
-// to the local settings file, with logLevel as the saved log_level. It never
-// writes the release config. When no setting differs, no local settings file
-// is left.
+// the store loaded to the local settings file, with logLevel as the saved
+// log_level. It never writes the release config, and never reads it again: a
+// release file replaced under a running store would make each setting the new
+// release changed differ, and the save would keep the old release's value.
+// When no setting differs, no local settings file is left.
 func (s *Store) writeLocalSettings(logLevel string) error {
-	release, err := loadReleaseSettings(s.path)
-	if err != nil {
-		return fmt.Errorf("read the release config: %w", err)
-	}
 	written := s.cfg
 	written.LogLevel = logLevel
 	current, err := configSettings(&written)
 	if err != nil {
 		return err
 	}
-	baseline, err := configSettings(&release)
-	if err != nil {
-		return err
-	}
 
 	path := LocalSettingsPath(s.path)
-	local := settingsDifference(current, baseline)
+	local := settingsDifference(current, s.releaseSettings)
 	if len(local) == 0 {
 		return removeSettingsFile(path)
 	}

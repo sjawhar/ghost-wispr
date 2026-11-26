@@ -45,6 +45,10 @@ type Store struct {
 	// already running writes nothing new; no settings field sets the level
 	// today.
 	writtenLogLevel string
+	// releaseSettings is the release config alone, as the YAML map a config
+	// file holds, read when the store loaded: a change writes the settings
+	// that differ from it. Nil when the store has no path.
+	releaseSettings map[string]any
 	path            string
 	envPath         string
 	onChange        []func(Config)
@@ -55,12 +59,7 @@ type Store struct {
 // settings file (if they exist), applies env overrides, loads secrets,
 // validates, and returns a mutable store.
 func NewStore(path string) (*Store, []string, error) {
-	cfg, fileLogLevel, warnings, err := load(path, nil)
-	if err != nil {
-		return nil, warnings, err
-	}
-
-	return &Store{cfg: cfg, writtenLogLevel: fileLogLevel, path: path, revision: Revision{Run: newRun()}}, warnings, nil
+	return newStore(path, "", nil)
 }
 
 // NewStoreWithEnv loads config from the release YAML and its local settings,
@@ -68,8 +67,7 @@ func NewStore(path string) (*Store, []string, error) {
 // returns a mutable store.
 func NewStoreWithEnv(yamlPath, envPath string) (*Store, []string, error) {
 	envSecrets := loadEnvFile(envPath)
-
-	cfg, fileLogLevel, warnings, err := load(yamlPath, envSecrets)
+	store, warnings, err := newStore(yamlPath, envPath, envSecrets)
 	if err != nil {
 		return nil, warnings, err
 	}
@@ -79,8 +77,28 @@ func NewStoreWithEnv(yamlPath, envPath string) (*Store, []string, error) {
 	if envSecrets[EnvPrefix+"ENVOY_WEBHOOK_SECRET"] != "" && os.Getenv(EnvPrefix+"ENVOY_WEBHOOK_SECRET") == "" {
 		warnings = append(warnings, leftoverEnvoyWebhookSecretWarning)
 	}
+	return store, warnings, nil
+}
 
-	return &Store{cfg: cfg, writtenLogLevel: fileLogLevel, path: yamlPath, envPath: envPath, revision: Revision{Run: newRun()}}, warnings, nil
+func newStore(path, envPath string, envSecrets map[string]string) (*Store, []string, error) {
+	cfg, fileLogLevel, warnings, release, err := loadConfig(path, envSecrets, path != "")
+	if err != nil {
+		return nil, warnings, err
+	}
+	var releaseSettings map[string]any
+	if path != "" {
+		if releaseSettings, err = configSettings(&release); err != nil {
+			return nil, warnings, fmt.Errorf("read the release config: %w", err)
+		}
+	}
+	return &Store{
+		cfg:             cfg,
+		writtenLogLevel: fileLogLevel,
+		releaseSettings: releaseSettings,
+		path:            path,
+		envPath:         envPath,
+		revision:        Revision{Run: newRun()},
+	}, warnings, nil
 }
 
 // Get returns a snapshot copy of the current config.
