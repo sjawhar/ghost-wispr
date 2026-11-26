@@ -103,6 +103,26 @@ check_release_directory() {
   done <<<"$names"
 }
 
+# require_release_the_pi_runs fails, before anything changes, while DEPLOY_DIR/deploy.verified, the
+# set the nightly update installed and verified last, names another commit than this release's
+# manifest.json. provision.sh installs its update.sh, pi-lib.sh and pi.env before the update
+# starts, and --models its config, so another release's would leave the Pi a set that
+# deploy.verified does not list: the update would keep no .prev copy of the set the Pi runs, and a
+# failed install would roll the Pi back past it. A Pi with no deploy.verified, a new Pi or the
+# office Pi before its first update of this kind, passes. A Pi that has deploy.verified ran the
+# update, which needs jq, so jq is there to read the manifest.
+require_release_the_pi_runs() {
+  local verified=$DEPLOY_DIR/deploy.verified line installed release
+  [[ -e $verified ]] || return 0
+  line=$(head -n 1 -- "$verified") || fail "cannot read $verified: nothing was changed"
+  [[ $line =~ ^commit\ ([0-9a-f]{40})$ ]] || fail "$verified names no commit on its first line: nothing was changed"
+  installed=${BASH_REMATCH[1]}
+  release=$(jq -er '.commit | strings' "$script_dir/manifest.json" 2>/dev/null) \
+    || fail "$script_dir/manifest.json names no commit, so it is no release's directory: nothing was changed"
+  [[ $release == "$installed" ]] \
+    || fail "the Pi runs commit $installed ($verified), and this is the release of commit $release: nothing was changed. provision.sh installs its own update.sh, pi-lib.sh and pi.env, so another release's would let a failed install roll the Pi back past the release it runs. Download the release of commit $installed (docs/pi-setup.md, \"The release the Pi runs\") and run its provision.sh"
+}
+
 # read_pi_env reads the release's pi.env, the Pi's public settings, and fails unless it sets the
 # values that the credential files and the tailnet join need, each in the form they take.
 read_pi_env() {
@@ -359,6 +379,7 @@ provision_models() {
     || fail "shared-drive ID must be non-empty and contain only letters, numbers, hyphens, and underscores"
   require_service_user
   check_release_directory
+  require_release_the_pi_runs
   use_runtime_dir
   [[ -f "$DEPLOY_DIR/ghost-wispr.yaml" && -f "$DEPLOY_DIR/.env" ]] \
     || fail "missing $DEPLOY_DIR/ghost-wispr.yaml or $DEPLOY_DIR/.env; run provision.sh first"
@@ -492,6 +513,7 @@ refuse_input
 use_runtime_dir
 [[ -f $IDENTITY_KEY ]] || fail "there is no key at $IDENTITY_KEY: run provision.sh --key, then provision.sh --certificate FILE, first"
 [[ -f $DEPLOY_DIR/device.crt ]] || fail "there is no certificate at $DEPLOY_DIR/device.crt: run provision.sh --certificate FILE first"
+require_release_the_pi_runs
 
 # The recorder inherits its user manager's environment. Reload the manager first, so that an
 # environment.d or user.conf line written since its last reload counts.
@@ -525,7 +547,10 @@ done
 
 # The bootstrap files, and the release's update.sh, pi-lib.sh and pi.env, which the update that
 # provision.sh starts below runs on. That update installs the rest of the release's deploy set, the
-# udev rule, the logind setting and .env among them.
+# udev rule, the logind setting and .env among them. The update's journal is printed from the time
+# before the release's timer is installed: its schedule can have a time the installed timer lacks,
+# such as 03:45, and the reload that loads it can start the update at once (systemd#16732).
+update_started=$(date +%s)
 install -d -m 0755 -- "$UNIT_DIR"
 put_file "$script_dir/ghost-wispr-update-launcher.sh" "$DEPLOY_DIR/ghost-wispr-update-launcher.sh" 0755 \
   || fail "could not install the launcher"
@@ -549,7 +574,6 @@ systemctl --user enable --now ghost-wispr-update.timer
 # systemd joins it with a start of the timer at the same moment. The unit's lines are in the system
 # journal: the Pi keeps no user journal.
 printf 'ghost-wispr provision: starting the nightly update now (systemctl --user start ghost-wispr-update.service)\n'
-update_started=$(date +%s)
 update_status=0
 systemctl --user start ghost-wispr-update.service || update_status=$?
 printf 'ghost-wispr provision: the journal of ghost-wispr-update.service for this run:\n'
