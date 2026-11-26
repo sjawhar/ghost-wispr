@@ -291,8 +291,14 @@ type session struct {
 	pending             map[string]chan error // acknowledgements awaited, by client event id
 	pendingDone         bool
 	delegations         map[string]bool
-	lastAppliedRevision uint64          // newest RoomView revision a delegation applied
-	turn                strings.Builder // heard since the last EventUserTurn, for the record only
+	lastAppliedRevision uint64 // newest RoomView revision a delegation applied
+	// openDelegations counts delegations from arrival until they resolve,
+	// silently or with their result, and causedSpeech says the client did
+	// something since the last speech began that can explain the next one
+	// (speechStarted).
+	openDelegations int
+	causedSpeech    bool
+	turn            strings.Builder // heard since the last EventUserTurn, for the record only
 }
 
 var _ voice.Session = (*session)(nil)
@@ -335,6 +341,7 @@ func newSession(ctx context.Context, cfg Config, x *voice.Exchange, conn *websoc
 // quiet. The server's acknowledgement says only that the text reached the
 // model, so an exchange that ended on it would cut the speech.
 func (s *session) Say(ctx context.Context, text string, mode voice.SayMode) error {
+	s.caused()
 	items := make([]appendItem, 0, 1)
 	for _, c := range chunks(text) {
 		items = append(items, appendItem{typ: evCommentaryAppend, content: c})
@@ -400,6 +407,7 @@ func (s *session) Deliver(ctx context.Context, callID string, result json.RawMes
 }
 
 func (s *session) deliver(ctx context.Context, callID string, result json.RawMessage) error {
+	s.caused()
 	var r voice.AnswerResult
 	if err := json.Unmarshal(result, &r); err != nil {
 		return fmt.Errorf("gptlive: result for %q is not an answer result: %w", callID, err)
@@ -441,6 +449,7 @@ func (s *session) Interrupt() {
 	s.wg.Add(1)
 	s.mu.Unlock()
 	s.player.interrupt()
+	s.caused()
 	go func() {
 		defer s.wg.Done()
 		if err := s.send(contextAppend{Type: evInstructionsAppend, EventID: id, Content: stopInstruction}); err != nil {
@@ -813,9 +822,50 @@ func (s *session) onAudio(delta string) {
 	for i := range pcm {
 		pcm[i] = int16(binary.LittleEndian.Uint16(data[2*i:]))
 	}
-	if s.player.push(pcm, time.Now()) {
+	now := time.Now()
+	if s.player.push(pcm, now) {
 		s.flushTurn()
+		if s.speechStarted() && s.x.Answered != nil {
+			s.x.Answered(now) // outside the session's lock: it locks the Supervisor
+		}
 	}
+}
+
+// caused records that the client did something that can explain GPT-Live's
+// next speech: a delegation arrived, closed or got its result, a holder's
+// late answer or a line of the Supervisor's was sent, or the voice was
+// stopped.
+func (s *session) caused() {
+	s.mu.Lock()
+	s.causedSpeech = true
+	s.mu.Unlock()
+}
+
+// resolved records that a delegation ended, silently or with its result. It
+// marks no cause: the frame that ended it already did, before it was sent
+// (deliver, completeSilently). Marking one here, after the send, would land
+// after the speech that frame caused had begun and been counted, and the next
+// speech, GPT-Live's own, would inherit it.
+func (s *session) resolved() {
+	s.mu.Lock()
+	s.openDelegations--
+	s.mu.Unlock()
+}
+
+// speechStarted reports whether the speech beginning now is GPT-Live acting
+// on its own: no delegation is open, and the client caused nothing since the
+// last speech began (caused). Only then did it answer by itself what the room
+// said before (Exchange.Answered). GPT-Live's audio names no response, so a
+// speech's cause is read only from what the client knows it did: the answer
+// to a delegation, a late holder answer, a Supervisor line and a withdrawn
+// delegation's late acknowledgement each have one, and retire nothing (Main,
+// after Sol's twenty-first review of #191).
+func (s *session) speechStarted() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	own := s.openDelegations == 0 && !s.causedSpeech
+	s.causedSpeech = false
+	return own
 }
 
 // onHeard keeps what GPT-Live heard the room say, for the user-turn record
@@ -887,6 +937,8 @@ func (s *session) onDelegation(ev *serverEvent) {
 		return
 	}
 	s.delegations[id] = true
+	s.openDelegations++
+	s.causedSpeech = true
 	s.wg.Add(1)
 	s.mu.Unlock()
 	go s.ask(id, &arrival)
@@ -902,6 +954,12 @@ func (s *session) onDelegation(ev *serverEvent) {
 // question is in hand.
 func (s *session) ask(id string, arrival *voice.RoomView) {
 	defer s.wg.Done()
+	handed := false
+	defer func() {
+		if !handed {
+			s.resolved()
+		}
+	}()
 	s.suppressAck(id)
 	question, room, ok := s.resolveQuestion(id, arrival)
 	if !ok {
@@ -915,6 +973,7 @@ func (s *session) ask(id string, arrival *voice.RoomView) {
 	}
 	call := voice.ToolCall{ID: id, Name: voice.AnswerTool, Args: args}
 	s.emit(&voice.Event{Kind: voice.EventToolCall, Call: call})
+	handed = true
 	go s.answer(call)
 }
 
@@ -963,13 +1022,22 @@ func (s *session) resolveQuestion(id string, arrival *voice.RoomView) (question 
 			s.completeSilently(id)
 			return "", room, false
 		}
+		if s.x.Room != nil && room.TakeBacks > arrival.TakeBacks {
+			// A take-back came after this delegation arrived: it withdrew
+			// what the delegation was raised for, whatever the room asks
+			// now. A question said after the take-back is the room's new
+			// request, and GPT-Live raises a delegation of its own for it
+			// (Sol's twenty-first review of #191, finding 2).
+			s.completeSilently(id)
+			return "", room, false
+		}
 		if request := strings.TrimSpace(room.Request); request != "" {
 			if s.x.Claim == nil || s.x.Claim(room.Turn, room.Revision) {
 				return request, room, true
 			}
 			// The room moved on between the read and the claim: wait for
 			// that change, then read it again.
-		} else if s.x.Room == nil || room.Revision > arrival.Revision || room.TakeBacks > arrival.TakeBacks {
+		} else if s.x.Room == nil || room.Revision > arrival.Revision {
 			s.completeSilently(id)
 			return "", room, false
 		}
@@ -1035,12 +1103,14 @@ func (s *session) suppressAck(id string) {
 // review of #191). What GPT-Live may still say of its own is its own
 // acknowledgement, which carries no words of the room.
 func (s *session) completeSilently(id string) {
+	s.caused() // before the close is sent: GPT-Live's late acknowledgement may follow it
 	if err := s.appendAll(s.ctx, &id, []appendItem{{typ: evThinkingAppend, content: ""}}); err != nil && s.ctx.Err() == nil {
 		s.log.Warn("gptlive: close a withdrawn delegation", "delegation", id, "error", err)
 	}
 }
 
 func (s *session) answer(call voice.ToolCall) {
+	defer s.resolved() // deliver marked its result's cause before sending it
 	result, err := s.x.Tools.Run(s.ctx, call)
 	if s.ctx.Err() != nil {
 		return
