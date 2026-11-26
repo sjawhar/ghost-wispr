@@ -108,8 +108,15 @@ asset_files=$(find "$work_dir/assets/latest" -mindepth 1 -maxdepth 1 -type f -pr
   || fail "cannot list the published files"
 grep -Fqx ghost-wispr-pi-deploy.tar.gz <<<"$asset_files" \
   || fail "UNKNOWN: build-deploy-tarball.sh wrote no ghost-wispr-pi-deploy.tar.gz, so the test cannot tell what a release publishes: $(paste -sd ' ' <<<"$asset_files")"
-jq -n --arg a "$commit_a" --arg ta "$tag_a" --arg b "$commit_b" --arg tb "$tag_b" \
-  '[{tag_name: $tb, target_commitish: $b}, {tag_name: $ta, target_commitish: $a}]' >"$work_dir/releases.json"
+# GitHub's release list, newest first, 100 a page: page 1 holds commit B's release and 99 releases of
+# other commits, which publish no asset here; page 2, a short page and so the last, holds commit A's.
+# So commit A's release is found only by a block that reads past page 1.
+mkdir -p "$work_dir/releases"
+jq -n --arg b "$commit_b" --arg tb "$tag_b" \
+  '[{tag_name: $tb, target_commitish: $b}] + [range(1; 100) | {tag_name: "v2026.11.26-filler\(.)", target_commitish: ("f" * 39 + (. % 10 | tostring))}]' \
+  >"$work_dir/releases/page-1.json"
+jq -n --arg a "$commit_a" --arg ta "$tag_a" '[{tag_name: $ta, target_commitish: $a}]' >"$work_dir/releases/page-2.json"
+[[ $(jq length "$work_dir/releases/page-1.json") == 100 ]] || fail "the test's own release list has no full first page"
 
 # named_files prints each file the text on stdin names: each word that ends in a file suffix, less a
 # leading ./, and not an absolute path, a path under ~ or a path under a variable. The path in the
@@ -570,7 +577,9 @@ mkdir -p "$work_dir/accept/home"
 # curl answers as GitHub and the Pi's recorder do. With -O it writes a release asset into the
 # working directory; otherwise it prints the answer. It serves the assets of a tag from
 # $TEST_ASSETS/<tag> and those of the latest release from $TEST_ASSETS/latest, the release list
-# from $TEST_RELEASES, and /api/version with the commit $TEST_RUNNING_COMMIT.
+# from $TEST_RELEASES/page-<N>.json (page 1 when the request names no page, and an empty list past
+# the last page, or page 1 for every page under TEST_RELEASES_REPEAT, as an API that answers one page
+# again), and /api/version with the commit $TEST_RUNNING_COMMIT.
 mkdir -p "$work_dir/download-bin"
 cat >"$work_dir/download-bin/curl" <<'EOF'
 #!/usr/bin/env bash
@@ -588,7 +597,13 @@ github=https://github.com/sjawhar/ghost-wispr/releases
 file='' body=''
 case $url in
   http://127.0.0.1:8080/api/version) body=$(jq -cn --arg c "$TEST_RUNNING_COMMIT" '{commit: $c}') ;;
-  'https://api.github.com/repos/sjawhar/ghost-wispr/releases?per_page=100') body=$(<"$TEST_RELEASES") ;;
+  'https://api.github.com/repos/sjawhar/ghost-wispr/releases?per_page=100' | \
+    'https://api.github.com/repos/sjawhar/ghost-wispr/releases?per_page=100&page='[1-9]*)
+    page=1
+    [[ $url != *'&page='* ]] || page=${url##*&page=}
+    [[ -z ${TEST_RELEASES_REPEAT:-} ]] || page=1
+    if [[ -f $TEST_RELEASES/page-$page.json ]]; then body=$(<"$TEST_RELEASES/page-$page.json"); else body='[]'; fi
+    ;;
   "$github"/latest/download/*) file=$TEST_ASSETS/latest/${url##*/} ;;
   "$github"/download/*/*) tag=${url#"$github"/download/}; file=$TEST_ASSETS/${tag%%/*}/${url##*/} ;;
   *) printf 'curl: (6) Could not resolve the host of %s\n' "$url" >&2; exit 6 ;;
@@ -617,8 +632,9 @@ run_download() {
   (
     cd "$case_dir/home"
     HOME="$case_dir/home" TMPDIR="$case_dir/tmp" TEST_ARGV_LOG="$case_dir/argv.log" \
-      TEST_ASSETS="${TEST_ASSETS_DIR:-$work_dir/assets}" TEST_RELEASES="$work_dir/releases.json" \
-      TEST_RUNNING_COMMIT="${TEST_RUNNING:-$commit_a}" PATH="$work_dir/download-bin:$PATH" bash "$case_dir/run.sh"
+      TEST_ASSETS="${TEST_ASSETS_DIR:-$work_dir/assets}" TEST_RELEASES="$work_dir/releases" \
+      TEST_RUNNING_COMMIT="${TEST_RUNNING:-$commit_a}" PATH="$work_dir/download-bin:$PATH" \
+      timeout 60 bash "$case_dir/run.sh"
   ) >"$case_dir/out" 2>&1 || download_exit=$?
 }
 # check_download CASE COMMIT: the block ran, checked the tarball, and left the shell in the release
@@ -636,14 +652,38 @@ run_download "$work_dir/download-latest" download-latest
 check_download "$work_dir/download-latest" "$commit_b"
 run_download "$work_dir/download-commit-a" download-commit
 check_download "$work_dir/download-commit-a" "$commit_a"
+# Commit A's release is on page 2 of the release list, so the block read past page 1.
+grep -Fq 'releases?per_page=100&page=2' "$work_dir/download-commit-a/argv.log" \
+  || fail "the download-commit block did not read page 2 of the releases: $(grep 'api.github.com' "$work_dir/download-commit-a/argv.log")"
 TEST_RUNNING=$commit_b run_download "$work_dir/download-commit-b" download-commit
 check_download "$work_dir/download-commit-b" "$commit_b"
+! grep -Fq 'page=2' "$work_dir/download-commit-b/argv.log" \
+  || fail "the download-commit block read page 2 although page 1 holds the release"
 
-# The recorder runs a commit that no release has: the block stops before it makes a directory.
-TEST_RUNNING=cccccccccccccccccccccccccccccccccccccccc run_download "$work_dir/download-no-release" download-commit
-[[ $download_exit != 0 ]] || fail "the download-commit block succeeded for a commit no release has: $(<"$work_dir/download-no-release/out")"
-[[ -z $(find "$work_dir/download-no-release/tmp" -mindepth 1 -print -quit) ]] \
-  || fail "the download-commit block made a directory for a commit no release has"
+# The recorder runs a commit that no release has: the block reads every page, says that no release
+# names the commit, and stops before it makes a directory. An API that answers page 1 for every page
+# ends the block the same way, so the search cannot run forever.
+readonly commit_c=cccccccccccccccccccccccccccccccccccccccc
+for case_name in no-release repeat; do
+  case_dir="$work_dir/download-$case_name"
+  if [[ $case_name == no-release ]]; then
+    want=$commit_c
+    TEST_RUNNING=$want run_download "$case_dir" download-commit
+  else
+    want=$commit_a
+    TEST_RUNNING=$want TEST_RELEASES_REPEAT=1 run_download "$case_dir" download-commit
+  fi
+  [[ $download_exit != 0 ]] || fail "the download-commit block succeeded for a commit no release names ($case_name): $(<"$case_dir/out")"
+  [[ $download_exit != 124 ]] || fail "the download-commit block did not end within 60 s ($case_name)"
+  grep -Fq "no release names commit $want" "$case_dir/out" \
+    || fail "the download-commit block did not say that no release names commit $want ($case_name): $(<"$case_dir/out")"
+  [[ -z $(find "$case_dir/tmp" -mindepth 1 -print -quit) ]] \
+    || fail "the download-commit block made a directory for a commit no release names ($case_name)"
+done
+grep -Fq 'releases?per_page=100&page=2' "$work_dir/download-no-release/argv.log" \
+  || fail "the download-commit block gave up on commit $commit_c before it read page 2"
+! grep -Fq 'page=3' "$work_dir/download-no-release/argv.log" \
+  || fail "the download-commit block read past page 2, a short page and so the last"
 
 # A tarball that does not match its .sha256: each block stops before it unpacks the tarball.
 cp -R -- "$work_dir/assets" "$work_dir/tampered-assets"
@@ -968,5 +1008,5 @@ grep -Fq 'ghost-wispr.service runs no process' "$work_dir/settings-stopped/out" 
 if grep -F -e "$DISPATCH_SECRET" -e "$OPERATOR_DISPATCH_SECRET" "$work_dir"/token*/argv.log >/dev/null; then
   fail "a Dispatch token was passed as a command argument"
 fi
-printf 'runbook blocks test passed: %d blocks, %d release files, %d provision.sh commands, 6 download cases, 6 route cases, 2 claim cases, 3 Deepgram cases, 5 token cases, 5 token-check cases, 5 settings cases, the slice 1 driver\n' \
+printf 'runbook blocks test passed: %d blocks, %d release files, %d provision.sh commands, 7 download cases, 6 route cases, 2 claim cases, 3 Deepgram cases, 5 token cases, 5 token-check cases, 5 settings cases, the slice 1 driver\n' \
   "${#blocks[@]}" "$(wc -l <<<"$release_files")" "$provision_commands"
