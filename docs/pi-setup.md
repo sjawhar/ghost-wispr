@@ -82,8 +82,11 @@ Concierge reads Dispatch with it ("Turn on the meeting voice").
 `.env`, such as a person's `GHOST_WISPR_JABRA_MUTE_BUTTON` or `GHOST_WISPR_MIC_DEVICE` line, and
 drops the variables Ghost Wispr no longer reads (README, "Removed settings"). It reads the values
 with `ghost-wispr pi-secrets`, signed in as `PI_SERVICE_ACCOUNT` with the Pi's certificate, which
-prints the name and version of each secret it read, never a value. When a read fails, `.env` keeps
-its secret lines, and the run exits 10.
+prints the name and version of each secret it read, never a value. It removes one final line feed
+from a value, and then refuses a value that is empty, that holds a carriage return, a line feed or a
+NUL, or a backslash, that starts with a quote, or that has white space at either end: systemd would
+read such a value in `.env` otherwise than it was written. When a read fails or a value is refused,
+`.env` keeps its secret lines, and the run exits 10.
 
 The update reads the secrets at two times:
 
@@ -91,7 +94,8 @@ The update reads the secrets at two times:
   `update.sh secrets`, which writes the four lines and changes nothing else. When that read fails,
   the recorder still starts, on the lines that `.env` has;
 - in each nightly run: when a value changed, it installs the new `.env` while the recorder is free,
-  restarts the recorder, and prints `ghost-wispr update: installed secrets`.
+  restarts the recorder, and prints `ghost-wispr update: installed secrets`. It refuses while an
+  override or a drop-in is set ("Update and inspect", step 5).
 
 So a new version reaches the Pi the next night, or at the next restart of the recorder. A restart
 ends a conversation that is being recorded:
@@ -407,13 +411,27 @@ than 45 days left. A failed run posts one alert to `#fleet-alerts` that names th
 the days left and the end date.
 
 The Pi installs a renewed certificate itself. Each nightly update runs `pi-secrets`, which reads
-the latest version of the secret and up to nine versions under it, newest first. It takes the
-newest version that is one PEM certificate, has the public key of the Pi's `key.pem`, ends later
-than the installed `device.crt`, and signs in to Google. `update.sh` installs that version while
-the recorder is free, keeps `device.crt.prev`, restarts the recorder, and prints
+the latest version of the secret and up to nine versions under it, newest first, and skips a
+version that is disabled, destroyed or absent. It takes the newest version that is one PEM
+certificate, has the public key of the Pi's `key.pem`, ends later than the installed `device.crt`,
+and signs in to Google. `update.sh` installs that version while the recorder is free, with its
+version number in `/opt/ghost-wispr/device.crt.version`. It keeps `device.crt.prev` and
+`device.crt.version.prev`, restarts the recorder, and prints
 `ghost-wispr update: installed certificate version <n>, not after <date>`. When the recorder does
-not answer after the restart, it puts `device.crt.prev` back and exits 10. When no version passes,
-it keeps the installed certificate, and a `pi-secrets: certificate` line says why.
+not answer after the restart, it puts both `.prev` copies back and exits 10.
+
+`update.sh` gives `pi-secrets` the installed version from `device.crt.version`, as
+`--installed-certificate-version`. When `latest` cannot be read because it is disabled, destroyed
+or absent, `pi-secrets` reads the versions above the installed one by number instead, oldest first
+and at most ten: it skips a disabled or destroyed version, stops at the first version that does not
+exist, and takes the newest version read that passes. So a renewal under a disabled `latest` still
+reaches the Pi. Until the update installs its first certificate, the Pi has no
+`device.crt.version`, and a `latest` that cannot be read keeps the installed certificate.
+
+When no version passes, `pi-secrets` keeps the installed certificate, and a line that starts
+`pi-secrets: certificate` says why. For one, the walk up that found no version prints
+`pi-secrets: certificate kept: latest certificate cannot be read: <code>; no readable version above <n>`.
+A certificate that is kept changes no exit code.
 
 Ghost Wispr warns on its status page and in `/api/status` when the certificate has fewer than 30
 days left, or when it cannot read the certificate. Then start the workflow by hand, and read the
@@ -924,17 +942,22 @@ A run of `update.sh`:
    not match.
 3. When the release is current, prints `ghost-wispr update: already current at commit <sha>`. The
    release is current when `/opt/ghost-wispr/deploy.verified` names its commit and each installed
-   file but `ghost-wispr.yaml` has the SHA-256 that `deploy.verified` lists. Then it reads the Pi's
-   secrets and a renewed certificate, and installs a change while the recorder is free ("The Pi's
-   secrets", "Renew the X.509 certificate").
+   file but `ghost-wispr.yaml` has the SHA-256 that `deploy.verified` lists. Then, unless step 5
+   refuses, it reads the Pi's secrets and a renewed certificate, and installs a change while the
+   recorder is free ("The Pi's secrets", "Renew the X.509 certificate"). When nothing changed, it
+   restarts a recorder that started before the installed `.env` or `device.crt`, as after a run cut
+   short between a refresh's swap and its restart, and prints
+   `ghost-wispr update: the recorder started before the installed <files>; restarting it`.
 4. Otherwise, holds a release whose link versions the call bridge does not accept. The bridge's
    list is `call.link_versions` in `/api/status`, and the release's is `link_versions` in its
    manifest. When both lists are there and share no number, it prints
    `ghost-wispr update: held: ...` with both lists, and exits 0.
-5. Refuses to install, and exits 10, while `.env` or the environment of `ghost-wispr`'s user manager
-   sets `GHOST_WISPR_CONFIG` or an Envoy override variable ("Turn on the meeting voice", step 1), or
-   while `ghost-wispr.service` or `ghost-wispr-update.service` has a drop-in. Its line names the
-   variable or the drop-in. Remove it, and the next run installs.
+5. Refuses to install a release, new secrets or a renewed certificate, and exits 10, while `.env`
+   or the environment of `ghost-wispr`'s user manager sets `GHOST_WISPR_CONFIG` or an Envoy override
+   variable ("Turn on the meeting voice", step 1), or while `ghost-wispr.service` or
+   `ghost-wispr-update.service` has a drop-in. Its line names the variable or the drop-in. Remove
+   it, and the next run installs. The refresh at each start of the recorder (`update.sh secrets`)
+   still writes the four lines of `.env`.
 6. Installs the whole set, also when the running binary already answers the release's commit: the
    binary and the nine files, `ghost-wispr.service`, the udev rule and the logind setting included.
    It renders `ghost-wispr.yaml` with the shared drive of the installed config ("Enable models and
@@ -948,7 +971,12 @@ A run of `update.sh`:
    `ghost-wispr update: <why>; restored the previous release`. It restarts the recorder for that
    rollback only while the recorder reports no session and no call, and leaves it running
    otherwise. A file with no `.prev` copy stays as installed, and the line says
-   `no previous release to restore`.
+   `no previous release to restore`. When the installed files were not the set `deploy.verified`
+   lists, as after an install cut short, the run keeps no new `.prev` copies, since those it has
+   hold the set verified last. A rollback then puts back each file that has a `.prev` copy, prints
+   `ghost-wispr update: <why>; restored the last verified set, the one deploy.verified lists`, and
+   exits 10, also when a session starts during the swap. When those copies are not that set, the
+   line says `restored each file that has a .prev copy, but they are not the set deploy.verified lists`.
 7. After an install, or with the release current, compares the three provisioning files that the
    nightly update does not install (the launcher, `ghost-wispr-update.service` and
    `ghost-wispr-update.timer`) with the manifest, and the live Tailscale Serve setting with the
@@ -1282,9 +1310,10 @@ the unit.
    is applied; until then the voice answers "I cannot reach Dispatch yet", and the log warns every
    minute that the Envoy session did not open, with no restart needed once it can. The template
    sets `envoy_enabled: true`, and `envoy_hub_url` and `concierge.envoy_url` to the hub's listener.
-   A `.env` line overrides the YAML, so the nightly update refuses to install a release, and the
-   models step (`provision.sh --models`) refuses and changes nothing, while a line of the Pi's `.env`
-   could set `GHOST_WISPR_ENVOY_ENABLED`, `GHOST_WISPR_ENVOY_HUB_URL` or
+   A `.env` line overrides the YAML, so the nightly update refuses to install a release, new secrets
+   or a renewed certificate, and the models step (`provision.sh --models`) refuses and changes
+   nothing, while a line of the Pi's `.env` could set `GHOST_WISPR_ENVOY_ENABLED`,
+   `GHOST_WISPR_ENVOY_HUB_URL` or
    `GHOST_WISPR_CONCIERGE_ENVOY_URL`, or `GHOST_WISPR_CONFIG`, which would have the recorder load
    another file than the installed config and so replace every setting, Envoy's included: a line
    that, past leading space and an `export`, starts with the name and `=`, where a carriage return
@@ -1301,8 +1330,8 @@ the unit.
    written `environment.d` line counts. `provision.sh` refuses the same way while the manager's
    environment sets one of them, before it changes anything. The models step and `provision.sh`
    name `GHOST_WISPR_CONFIG` first, with why; the nightly update names each variable it found.
-   While the installed release is current, the nightly update still installs new secret values and
-   a renewed certificate. While a config names a hub with Envoy off, the web page shows a notice
+   The refresh at each start of the recorder (`update.sh secrets`) still writes the four lines of
+   `.env`. While a config names a hub with Envoy off, the web page shows a notice
    under the warnings, and `/api/status` gives it in `notices`, never in `warnings`, which check 4
    of `check-deploy.sh` needs empty: no session event goes to the hub, each completed summary waits
    until Envoy is on again, and, with no `concierge.envoy_url`, the voice cannot ask an issue's
