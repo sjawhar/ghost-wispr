@@ -296,7 +296,7 @@ read_local_settings() {
   local status=0
   local_settings=$(pi "f=$(printf %q "$LOCAL_SETTINGS"); [ -e \"\$f\" ] || exit 3; cat -- \"\$f\"" 2>"$tmp/local.err") || status=$?
   case $status in
-    0) local_state=read ;;
+    0) local_state='read' ;;
     3)
       local_state=absent
       local_settings=
