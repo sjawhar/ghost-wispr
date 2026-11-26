@@ -149,9 +149,18 @@ func (p *offeredPick) sideTalkOn(view projectsView, said string) bool {
 // "What about the budget?" then "okay, sure" is answered as the question,
 // not as "okay, sure" (Main, before Sol's sixth review of #191); "ABC
 // forty", an endpoint, then "two" is the key ABC-42, not "two" (Sol's
-// seventh review). Letters the view can tell are read as their key first.
+// seventh review). Letters the view can tell are read as their key first. A
+// turn a quotation of the reply runs into is a part of it, read with the
+// rest: `does ABC-12 show "Please`, "cancel", `then retry" in the tooltip?`
+// asks the whole (Sol's twelfth review of #191).
 func (p *offeredPick) readsReply(view projectsView, turn, said string) bool {
-	if said == "" || asks(turn) || saysKey(turn) {
+	if said == "" {
+		return false
+	}
+	if quotedInto(said, turn) {
+		return true
+	}
+	if asks(turn) || saysKey(turn) {
 		return false
 	}
 	if _, picks := p.pick(turn); picks {
@@ -159,6 +168,21 @@ func (p *offeredPick) readsReply(view projectsView, turn, said string) bool {
 	}
 	read, _ := view.readSpelledKeys(said)
 	return asks(read) || saysKey(read)
+}
+
+// quotedInto reports whether a quotation of said (quotedSpans) opens before
+// turn, the last part of said, and runs into it.
+func quotedInto(said, turn string) bool {
+	at := strings.LastIndex(said, strings.Join(strings.Fields(turn), " "))
+	if at <= 0 {
+		return false
+	}
+	for _, span := range quotedSpans(said) {
+		if span[0] < at && at < span[1] {
+			return true
+		}
+	}
+	return false
 }
 
 // replyText is what reply, the room's finals one a line, says after its
@@ -251,44 +275,119 @@ func quoteMark(r rune) bool {
 	return unicode.In(r, unicode.Quotation_Mark, unicode.Pi, unicode.Pf)
 }
 
+// inWord reports whether r is a letter or a digit.
+func inWord(r rune) bool { return unicode.IsLetter(r) || unicode.IsDigit(r) }
+
 // quoteAt reports whether the mark at text[i:i+size] quotes, rather than
 // being an apostrophe inside a word ("that's", "don’t"), and whether it can
 // open a quotation: a word follows it.
 func quoteAt(text string, i, size int) (quotes, opens bool) {
 	prev, _ := utf8.DecodeLastRuneInString(text[:i])
 	next, nextSize := utf8.DecodeRuneInString(text[i+size:])
-	inWord := func(r rune) bool { return unicode.IsLetter(r) || unicode.IsDigit(r) }
 	if inWord(prev) && inWord(next) {
 		return false, false
 	}
 	return true, nextSize > 0 && !unicode.IsSpace(next)
 }
 
+// quoteKind is the kind of quotation a mark belongs to, which only a mark of
+// the same kind closes, and whether the mark may open and close one.
+type quoteKind struct {
+	kind        string
+	open, close bool
+}
+
+// quoteKinds are the kinds of the marks people pair. A double mark closes
+// any double quotation (“…”, „…“, “…" as speech-to-text mixes them), a single
+// mark any single one, a guillemet any guillemet quotation (« », and » « as
+// some languages write them); corner brackets pair only as opener and
+// closer. Any other quotation mark (quoteMark) is its own kind: an initial
+// mark (Pi) opens, a final one (Pf) closes, and one that is neither does both.
+var quoteKinds = map[rune]quoteKind{
+	'"': {"double", true, true}, '＂': {"double", true, true},
+	'“': {"double", true, true}, '”': {"double", true, true},
+	'„': {"double", true, false}, '‟': {"double", true, false},
+	'〝': {"double", true, false}, '〞': {"double", false, true}, '〟': {"double", false, true},
+	'\'': {"single", true, true}, '＇': {"single", true, true},
+	'‘': {"single", true, true}, '’': {"single", true, true},
+	'‚': {"single", true, false}, '‛': {"single", true, false},
+	'«': {"guillemet", true, true}, '»': {"guillemet", true, true},
+	'‹': {"single guillemet", true, true}, '›': {"single guillemet", true, true},
+	'「': {"corner", true, false}, '」': {"corner", false, true},
+	'『': {"white corner", true, false}, '』': {"white corner", false, true},
+	'﹁': {"vertical corner", true, false}, '﹂': {"vertical corner", false, true},
+	'﹃': {"vertical white corner", true, false}, '﹄': {"vertical white corner", false, true},
+}
+
+// kindOf is the quotation kind of r, a quotation mark (quoteMark).
+func kindOf(r rune) quoteKind {
+	if k, ok := quoteKinds[r]; ok {
+		return k
+	}
+	switch {
+	case unicode.Is(unicode.Pi, r):
+		return quoteKind{"other", true, false}
+	case unicode.Is(unicode.Pf, r):
+		return quoteKind{"other", false, true}
+	}
+	return quoteKind{string(r), true, true}
+}
+
 // quotedSpans are text's quotations, as byte ranges from the opening mark
-// through the closing one: a mark a word follows opens one, and the next
-// mark closes it, across commas, stops and lines. One left open runs to
-// text's end.
+// through the closing one, across commas, stops and lines (Main, after Sol's
+// twelfth review of #191):
+//   - A mark closes the innermost open quotation of its own kind
+//     (quoteKinds) and every quotation opened inside it; any other mark a
+//     word follows opens one, so quotations nest: "Press 'Retry' now".
+//   - A single mark after a letter or a digit is an apostrophe ("the
+//     users' option"), never an opener or a closer, unless it closes an
+//     open single quotation; a mark inside a word ("don’t") is one too.
+//   - A quotation never closed is no quotation: its opener is a mark like
+//     any other, and a take-back after it still takes back (`does ABC-42
+//     show "Retry?` then "never mind").
 func quotedSpans(text string) [][2]int {
 	var spans [][2]int
-	open := -1
+	var open []quoteOpener
 	for i, r := range text {
 		if !quoteMark(r) {
 			continue
 		}
 		size := utf8.RuneLen(r)
 		quotes, opens := quoteAt(text, i, size)
-		switch {
-		case !quotes:
-		case open >= 0:
-			spans, open = append(spans, [2]int{open, i + size}), -1
-		case opens:
-			open = i
+		if !quotes {
+			continue
+		}
+		k := kindOf(r)
+		if at := innermost(open, k.kind); k.close && at >= 0 {
+			spans = append(spans, [2]int{open[at].at, i + size})
+			open = open[:at]
+			continue
+		}
+		prev, _ := utf8.DecodeLastRuneInString(text[:i])
+		if k.kind == "single" && inWord(prev) {
+			continue // an apostrophe after a word
+		}
+		if k.open && opens {
+			open = append(open, quoteOpener{k.kind, i})
 		}
 	}
-	if open >= 0 {
-		spans = append(spans, [2]int{open, len(text)})
-	}
 	return spans
+}
+
+// quoteOpener is a quotation's opening mark: its kind and where it is.
+type quoteOpener struct {
+	kind string
+	at   int
+}
+
+// innermost is the index of the last opener of kind in open, -1 for none.
+func innermost(open []quoteOpener, kind string) int {
+	for j := len(open) - 1; j >= 0; j-- {
+		if open[j].kind == kind {
+			return j
+		}
+	}
+	return -1
 }
 
 // inSpans reports whether text[start:end] overlaps any of spans.

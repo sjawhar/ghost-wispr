@@ -13,8 +13,8 @@ import (
 // (https://github.com/sjawhar/ghost-wispr/pull/191#pullrequestreview-6066661854),
 // from Sol's probes, through the real Supervisor and Concierge.
 
-// question is what the model was asked in its last prompt.
-func question(r *cutRig) string {
+// modelQuestion is what the model was asked in its last prompt.
+func modelQuestion(r *cutRig) string {
 	_, q, _ := strings.Cut(lastPrompt(r.rig), "The question to answer, said after the wake word: ")
 	q, _, _ = strings.Cut(q, "\n")
 	return q
@@ -120,7 +120,7 @@ func TestAQuotedPassageHoldsNoTakeBack(t *testing.T) {
 			if out.Say == "" {
 				t.Fatal("the question was not answered")
 			}
-			if got := question(r); got != tc.want {
+			if got := modelQuestion(r); got != tc.want {
 				t.Errorf("the model was asked %q, want %q", got, tc.want)
 			}
 			if !slices.ContainsFunc(holderMessages(r), func(m string) bool { return strings.Contains(strings.ToLower(m), strings.ToLower(tc.want)) }) {
@@ -162,7 +162,7 @@ func TestAQuotedPassageHoldsNoTakeBack(t *testing.T) {
 				if out := r.answer(t, "reply", strings.Join(tc.finals, " ")); out.Say == "" {
 					t.Fatal("the reply was not answered")
 				}
-				if got := question(r); got != tc.want {
+				if got := modelQuestion(r); got != tc.want {
 					t.Errorf("the model was asked %q, want %q", got, tc.want)
 				}
 			})
@@ -183,7 +183,7 @@ func TestEveryQuoteMarkIsAQuote(t *testing.T) {
 			if out := r.answer(t, "quoted", words); out.Say == "" {
 				t.Fatal("the question was not answered")
 			}
-			if got := question(r); got != words {
+			if got := modelQuestion(r); got != words {
 				t.Errorf("the model was asked %q, want %q", got, words)
 			}
 		})
