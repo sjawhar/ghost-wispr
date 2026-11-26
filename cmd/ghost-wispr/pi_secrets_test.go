@@ -1633,14 +1633,16 @@ func TestPiSecretsWithAP256Key(t *testing.T) {
 			t.Run("another key's certificate", func(t *testing.T) {
 				fixture := newCertificateFixtureForKey(t, key, file.pem)
 				other := certificateForKey(t, fixture.ca, fixture.caKey, newP256Key(t), time.Now().Add(72*time.Hour))
-				reader := certificateReader(fixture.secret, 3, other)
+				// Version 1, so the walk reads no older version.
+				reader := certificateReader(fixture.secret, 1, other)
 				var output bytes.Buffer
 				code := runPiSecrets(context.Background(), fixture.args(), &output, defaultCredentials(fixture.credentials), readerFactory(t, reader, fixture.credentials), productionSignInCheck)
 				if code != 0 {
 					t.Fatalf("runPiSecrets exit = %d, want 0", code)
 				}
 				requireFileAbsent(t, filepath.Join(fixture.outDir, "device.crt"))
-				requireKeptCertificate(t, output.String(), 3, other, "candidate public key does not match --key")
+				requireKeptCertificate(t, output.String(), 1, other, "candidate public key does not match --key")
+				requireAccesses(t, reader, []secretAccess{{project: fixture.project, secret: fixture.secret, version: "latest"}})
 			})
 		})
 	}
