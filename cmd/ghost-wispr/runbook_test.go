@@ -197,6 +197,48 @@ func TestRunbookSaysWhatTheUpdateRefusesAndRepairs(t *testing.T) {
 	}
 }
 
+// TestRunbookSaysWhatTheUpdateDoesWhileHeldAndAfterARestart fails if "Update
+// and inspect" does not say that a held release still refreshes the secrets
+// and the certificate of the release the Pi runs; that the 120 s check after a
+// restart needs a status the update can read, besides the commit; that a
+// rollback puts the certificate back only when that run swapped it in; that a
+// fallback run of update.sh.prev keeps update.sh.prev and pi-lib.sh.prev; and
+// that each run removes the staging directories a killed run left. It also
+// fails if "A release that changes config" still rolls back on the commit
+// alone.
+func TestRunbookSaysWhatTheUpdateDoesWhileHeldAndAfterARestart(t *testing.T) {
+	section := runbookSection(t, "## Update and inspect")
+	for _, words := range []string{"refreshes the secrets and the certificate of the release the Pi runs", "and for `/api/status` to answer a status it can read", "go back only when that run swapped them in", "keeps `update.sh.prev` and `pi-lib.sh.prev` as they are", "older than 46 minutes"} {
+		if !strings.Contains(section, words) {
+			t.Errorf("the runbook's \"Update and inspect\" does not say %q", words)
+		}
+	}
+	release := runbookSection(t, releaseSection)
+	if !strings.Contains(release, "a status the update can read") {
+		t.Errorf("the runbook's %q does not say that the new release must answer a status the update can read", releaseSection)
+	}
+	if strings.Contains(release, "does not answer its commit within 120 s") {
+		t.Errorf("the runbook's %q still rolls back on the commit alone", releaseSection)
+	}
+}
+
+// TestRunbookSaysWhatAPageSaveWrites fails if "Settings saved on the page"
+// does not say that a save writes only the settings it changes, never a value
+// that .env gives, and drops a setting saved back to the template's value; or
+// if the runbook still says that a save writes an .env value into the local
+// settings file, where it stays.
+func TestRunbookSaysWhatAPageSaveWrites(t *testing.T) {
+	section := runbookSection(t, "## Settings saved on the page")
+	for _, words := range []string{"A save writes only the settings it changes", "never a value that `.env` gives", "saved back to the template's value leaves the file"} {
+		if !strings.Contains(section, words) {
+			t.Errorf("the runbook's \"Settings saved on the page\" does not say %q", words)
+		}
+	}
+	if words := strings.Join(strings.Fields(readRunbook(t)), " "); strings.Contains(words, "where it stays after") {
+		t.Error("the runbook still says that a save writes an .env value into the local settings file, where it stays")
+	}
+}
+
 // TestRunbookSaysWhichSecretValuesThePiRefuses fails if "The Pi's secrets"
 // does not say which values pi-secrets refuses, so that a person who adds a
 // version knows why the Pi keeps its old one: a value systemd would read
