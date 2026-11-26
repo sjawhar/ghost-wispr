@@ -170,15 +170,17 @@ func (p *offeredPick) readsReply(view projectsView, turn, said string) bool {
 	return asks(read) || saysKey(read)
 }
 
-// quotedInto reports whether a quotation of said (quotedSpans) opens before
-// turn, the last part of said, and runs into it.
+// quotedInto reports whether a quotation of said (quotedSpans) runs into
+// turn, the last part of said: it opens before turn or where turn begins,
+// after something said before it (Sol's fourteenth review of #191:
+// "does ABC-12 show" / `”no, cancel, then retry” in the tooltip?`).
 func quotedInto(said, turn string) bool {
 	at := strings.LastIndex(said, strings.Join(strings.Fields(turn), " "))
 	if at <= 0 {
 		return false
 	}
 	for _, span := range quotedSpans(said) {
-		if span[0] < at && at < span[1] {
+		if span[0] <= at && at < span[1] {
 			return true
 		}
 	}

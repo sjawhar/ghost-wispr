@@ -1548,7 +1548,7 @@ func (s *Supervisor) startLocked(t *Transcript, m transcript.Match) {
 	s.exTimingLocked(ex, "wake_heard", monoclock.Stamp{Wall: t.At, Mono: t.Mono})
 	s.noteLocked(ex, EventWakeHeard, sessionID)
 	s.turnLocked(ex, t, m.Rest)
-	x := ex.x
+	x := s.modelViewLocked(ex, &ex.x)
 	s.spawn(func() { s.open(ex, voice, &x, true) })
 }
 
@@ -1886,7 +1886,7 @@ func (s *Supervisor) turnLocked(ex *exchange, t *Transcript, words string) {
 	// A follow-up with no wake phrase may be side talk, which leaves the
 	// unit for nothing: it is read for only once it is the next turn.
 	if turn != "" && !ex.followUpTurn {
-		s.heard = append(s.heard, heardCall{ctx: ex.ctx, x: ex.x, words: turn})
+		s.heard = append(s.heard, heardCall{ctx: ex.ctx, x: s.modelViewLocked(ex, &ex.x), words: turn})
 	}
 	if ex.drives {
 		// The vendor drives the turn. Deepgram's endpoint ends it all the
@@ -1910,7 +1910,13 @@ func (s *Supervisor) turnLocked(ex *exchange, t *Transcript, words string) {
 // spoken form ("in for forty five ninety two"), whose words may come in two
 // results, is written as the key, which the Concierge reads (R4).
 func (s *Supervisor) turnOf(ex *exchange) string {
-	turn := strings.TrimSpace(strings.Join(append(ex.turn[:len(ex.turn):len(ex.turn)], ex.interim), " "))
+	return s.withKeys(ex, strings.Join(append(ex.turn[:len(ex.turn):len(ex.turn)], ex.interim), " "))
+}
+
+// withKeys is turn, trimmed, with the keys of Dispatch's projects said in a
+// spoken form written as keys, as ex's turn writes them (turnOf).
+func (s *Supervisor) withKeys(ex *exchange, turn string) string {
+	turn = strings.TrimSpace(turn)
 	if s.cfg.ProjectKeys != nil {
 		if ex.turnByName {
 			turn = transcript.WriteKeysAfterName(turn, s.cfg.ProjectKeys())
@@ -2062,7 +2068,7 @@ func (s *Supervisor) handTurnLocked(ex *exchange, signal turnSignal) {
 	s.exTimingLocked(ex, "turn_signal", signal.at, "kind", signal.kind)
 	s.exTimingLocked(ex, "turn_end", turnEnd)
 	s.noteLocked(ex, EventExchangeStarted, ex.x.SessionID)
-	x := ex.x
+	x := s.modelViewLocked(ex, &ex.x)
 	// A handed turn's words are no later answer's (Sol's tenth review of
 	// #191): a take-back in them cuts that turn alone.
 	ex.x.AskerTurn, ex.x.Finals, ex.handedTurn = "", "", ex.x.Turn+1
@@ -2268,7 +2274,7 @@ func (s *Supervisor) speakLocked(p *pendingAnswer, turnAt time.Time) {
 	ex.x = Exchange{SessionID: sessionID, WakeAt: time.Now(), IssueKey: p.IssueKey, Recent: s.recentLocked(), Tap: s.tapFor(voice, 0), Out: exchangeOutput{s: s, ex: ex}}
 	ex.x.Tools = exchangeTools{s: s, ex: ex}
 	s.bindMeetingLocked(ex, sessionID)
-	x := ex.x
+	x := s.modelViewLocked(ex, &ex.x)
 	sayCtx, release := context.Context(ex.ctx), func() {}
 	if p.hand != nil && p.hand.Context != nil {
 		// A hand's words run under a context done once their exchange or the
@@ -2997,20 +3003,28 @@ func (s *Supervisor) keepRecentLocked(t *Transcript, now time.Time) {
 // take-back (Main, after Sol's thirteenth review of #191). Running it again
 // over the same words changes nothing.
 func (s *Supervisor) takeBackLocked(ex *exchange) {
+	s.dropRecentLocked(ex, s.takenTexts(ex))
+}
+
+// takenTexts is what ex's take-back makes of the room's recent words
+// (withTexts): the entries of the finals the answer cuts (cutWords) said
+// before it, "", and the final that holds it, what follows it there. With
+// no take-back it is empty.
+func (s *Supervisor) takenTexts(ex *exchange) map[uint64]string {
+	texts := map[uint64]string{}
 	if s.cfg.TakeBack == nil {
-		return
+		return texts
 	}
 	lines, seqs := ex.cutWords()
 	rest, taken := s.cfg.TakeBack(strings.Join(lines, "\n"))
 	if !taken {
-		return
+		return texts
 	}
 	kept := 0
 	if rest != "" {
 		kept = len(strings.Split(rest, "\n"))
 	}
 	first := len(lines) - kept // the final that holds the take-back
-	texts := map[uint64]string{}
 	for i, seq := range seqs {
 		switch {
 		case seq == 0:
@@ -3020,7 +3034,31 @@ func (s *Supervisor) takeBackLocked(ex *exchange) {
 			texts[seq], _, _ = strings.Cut(rest, "\n")
 		}
 	}
-	s.dropRecentLocked(ex, texts)
+	return texts
+}
+
+// modelViewLocked is a copy of from, an exchange of ex, as every model and
+// vendor reads it: the room's recent words (Recent) and the asker's words
+// (AskerTurn) with what ex's current turn took back left out, though the
+// turn is not complete and its history not yet cut (Main, after Sol's
+// fourteenth review of #191). The retained history and the raw finals
+// (Finals, Reply) stay as they were until the turn is complete
+// (takeBackLocked): a quotation still open may close and make its "cancel"
+// no take-back. Every copy of an
+// exchange the Supervisor hands out is this view: a voice's Open, the
+// Concierge's Heard and Answer, and the answer tool.
+func (s *Supervisor) modelViewLocked(ex *exchange, from *Exchange) Exchange {
+	x := *from
+	if s.cfg.TakeBack == nil {
+		return x
+	}
+	x.Recent = withTexts(x.Recent, s.takenTexts(ex))
+	if finals := finalsOf(ex); x.AskerTurn != "" && finals != "" {
+		if rest, taken := s.cfg.TakeBack(finals); taken {
+			x.AskerTurn = s.withKeys(ex, strings.Join(strings.Fields(rest), " "))
+		}
+	}
+	return x
 }
 
 // turnEndsLocked cuts the room's recent words at ex's turn's take-back
@@ -3497,6 +3535,7 @@ func (t exchangeTools) Run(ctx context.Context, c ToolCall) (json.RawMessage, er
 	// turn handed now is complete, so its take-back cuts them first.
 	s.takeBackLocked(t.ex)
 	x.Recent = s.recentLocked()
+	x = s.modelViewLocked(t.ex, &x)
 	// A handed turn's words are no later answer's: a vendor that asks again
 	// before the room's next words would get them, and a take-back in them
 	// would cut its new question (Sol's tenth review of #191). They stay
