@@ -520,6 +520,36 @@ cat >"$bin/date" <<'EOF'
 cat -- "${TEST_STATE:?}/clock"
 EOF
 
+cat >"$bin/mv" <<'EOF'
+#!/usr/bin/env bash
+# The fake mv: the real one, but for a rename onto $GHOST_WISPR_DEPLOY_DIR/NAME (its last argument).
+# $TEST_STATE/fail-rename holding NAME makes that rename fail, once. $TEST_STATE/kill-at-rename
+# holding "NAME N" makes the Nth rename onto NAME of a run kill the script that runs mv with
+# SIGKILL instead, as the launcher's limit or a power cut ends a run: that rename does not happen.
+set -euo pipefail
+state=${TEST_STATE:-} deploy=${GHOST_WISPR_DEPLOY_DIR:-} target=${!#}
+if [[ -n $state && -n $deploy && $target == "$deploy"/* ]]; then
+  name=${target#"$deploy"/}
+  if [[ -f $state/fail-rename && $(<"$state/fail-rename") == "$name" ]]; then
+    /bin/rm -f -- "$state/fail-rename"
+    exit 1
+  fi
+  if [[ -f $state/kill-at-rename ]]; then
+    read -r kill_name kill_at <"$state/kill-at-rename"
+    if [[ $kill_name == "$name" ]]; then
+      count=$(($(cat -- "$state/renames-onto-$name" 2>/dev/null || echo 0) + 1))
+      echo "$count" >"$state/renames-onto-$name"
+      if ((count == kill_at)); then
+        /bin/rm -f -- "$state/kill-at-rename"
+        kill -KILL "$PPID"
+        exit 1
+      fi
+    fi
+  fi
+fi
+exec /bin/mv "$@"
+EOF
+
 cat >"$timeout_bin/timeout" <<'EOF'
 #!/usr/bin/env bash
 # The fake timeout. It runs the command under the real timeout ($TEST_REAL_TIMEOUT), for at most
@@ -1579,6 +1609,25 @@ step_fails 'install of the logind setting' fail-sudo 'install /etc/systemd/login
 step_fails "user manager's reload" fail-daemon-reload-at 2 'could not reload the user manager'
 step_fails "udev reload" fail-sudo 'udevadm control --reload' 'could not reload udev or restart logind'
 step_fails "logind restart" fail-sudo 'systemctl restart systemd-logind' 'could not reload udev or restart logind'
+# A rename of the swap that fails, the certificate's version file's or .env's, rolls the set back
+# as a failed step does: each file back, the certificate pair as it was (here, no version file), and
+# one restart, the rollback's.
+for name in device.crt.version .env; do
+  what="rollback-whole-set (the rename onto $name fails)"
+  new_pi
+  install_set a
+  save_installed "$work_dir/before-a"
+  if [[ $name == device.crt.version ]]; then printf 'CANDIDATE CERTIFICATE\n' >"$state/certificate"; fi
+  printf '%s\n' "$name" >"$state/fail-rename"
+  release=b run_update
+  [[ ! -e $state/fail-rename ]] || fail "$what: the update never renamed a file onto $name"
+  expect_run "$what" 10
+  expect_line_like "$what" "ghost-wispr update: could not install the release's files; restored the previous release"
+  expect_installed_is "$what" "$work_dir/before-a"
+  [[ $(<"$opt/device.crt") == 'INSTALLED CERTIFICATE' && ! -e $opt/device.crt.version ]] \
+    || fail "$what: changed the certificate pair: device.crt is [$(<"$opt/device.crt")], device.crt.version $(cat -- "$opt/device.crt.version" 2>/dev/null || echo missing)"
+  [[ $(restarts) == 1 ]] || fail "$what: did not restart once, on the restored release: $(<"$state/systemctl.log")"
+done
 
 # A rollback puts the old binary back while the new one still runs: a copy over a file that is
 # executing fails with "Text file busy", which would leave the new binary in place. The new binary
@@ -2136,6 +2185,50 @@ what='held-link-versions, new secrets and a drop-in'
 expect_run "$what" 10 "ghost-wispr update: ghost-wispr.service has a drop-in ($units/ghost-wispr.service.d/override.conf); nothing was installed"
 expect_unchanged "$what" "$before"
 [[ $(restarts) == 0 ]] || fail "$what: restarted the recorder"
+# The bridge's list is read again with the status read just before the swap: a bridge whose link
+# versions changed during the download to share no number with the release's holds the release as
+# the first read would have (R7), the Pi's files as they were, and the run refreshes the secrets of
+# the release the Pi runs. Break it catches: a hold read from the first status alone, so a release
+# that the bridge stopped accepting while it downloaded installs, and the next call cannot link.
+bridge_changes() {
+  new_pi
+  install_set a
+  printf '%s\n' '{"paused":true,"capture_state":"listening","active_session_id":"","call":{"state":"none","link_versions":[2]}}' >"$state/status"
+  printf '%s\n' "{\"paused\":true,\"capture_state\":\"listening\",\"active_session_id\":\"\",\"call\":{\"state\":\"none\",\"link_versions\":$1}}" \
+    >"$state/status.after-download"
+  link_versions='[2]' pack_release linked
+  save_installed "$work_dir/before-a"
+  cp -- "$opt/deploy.verified" "$work_dir/verified-a"
+}
+bridge_changes '[1]'
+release=linked run_update
+what='held-link-versions, the bridge changed during the download'
+expect_run "$what" 0 'ghost-wispr update: held: the bridge accepts link versions [1], this release [2]'
+expect_no_output "$what" 'installed commit'
+expect_set_of "$what" a
+expect_installed_is "$what" "$work_dir/before-a"
+cmp -s -- "$work_dir/verified-a" "$opt/deploy.verified" || fail "$what: changed deploy.verified"
+[[ $(restarts) == 0 ]] || fail "$what: restarted the recorder: $(<"$state/systemctl.log")"
+bridge_changes '[1]'
+printf '%s\n' GHOST_WISPR_DEEPGRAM_API_KEY=dg-test-2 GHOST_WISPR_DISPATCH_TOKEN=tok-test-2 >"$state/secrets"
+release=linked run_update
+what='held-link-versions, the bridge changed during the download, new secrets'
+expect_run "$what" 0 'ghost-wispr update: held: the bridge accepts link versions [1], this release [2]' \
+  'ghost-wispr update: installed secrets'
+expect_no_output "$what" 'installed commit'
+expect_installed_is "$what" "$work_dir/before-a" "${set_files[@]}" ghost-wispr
+cmp -s -- "$work_dir/verified-a" "$opt/deploy.verified" || fail "$what: changed deploy.verified"
+expect_env "$what" GHOST_WISPR_ADDR=127.0.0.1:8080 GOOGLE_API_USE_CLIENT_CERTIFICATE=false \
+  GHOST_WISPR_DEEPGRAM_API_KEY=dg-test-2 GHOST_WISPR_DISPATCH_TOKEN=tok-test-2 GHOST_WISPR_JABRA_MUTE_BUTTON=false
+[[ $(restarts) == 1 ]] && grep -Fqx "restart binary=$(sha "$opt/ghost-wispr") env=$(sha "$opt/.env") config=$(sha "$opt/ghost-wispr.yaml") crt=$(sha "$opt/device.crt")" "$state/systemctl.log" \
+  || fail "$what: did not restart the recorder once on the new .env: $(<"$state/systemctl.log")"
+[[ $(awk '/^binary / { binary = $2 } END { print binary }' "$state/pi-secrets.log") == "$opt/ghost-wispr" ]] \
+  || fail "$what: the refresh's pi-secrets did not run from the installed binary: $(<"$state/pi-secrets.log")"
+# Control: a list that still shares a number with the release's after the download installs it.
+bridge_changes '[3,2]'
+release=linked run_update
+expect_run 'held-link-versions control (the bridge still accepts the release after the download)' 0 \
+  "ghost-wispr update: installed commit $commit_c (invocation test-invocation-7)"
 
 begin bad-manifest
 # bad-manifest: a release that does not verify installs nothing and fails: a file whose SHA-256 is
@@ -2235,6 +2328,19 @@ for busy in "${busy_cases[@]:0:2}"; do
   expect_no_output "$what" 'installed secrets'
   expect_no_output "$what" 'installed certificate'
 done
+# A recorder that gives no status at the read just before the restart, after the swap, may be
+# recording: .env goes back, nothing restarts, and the run fails.
+new_pi
+install_set b
+save_installed "$work_dir/before-b"
+printf '%s\n' GHOST_WISPR_DEEPGRAM_API_KEY=dg-test-2 GHOST_WISPR_DISPATCH_TOKEN=tok-test-2 >"$state/secrets"
+printf '%s\n' IDLE IDLE UNREADABLE >"$state/status"
+release=b run_update
+what='secrets-only-change, no status just before the restart'
+expect_run "$what" 10
+expect_line_like "$what" "ghost-wispr update: ghost-wispr.service is active but /api/status gave no status; restored the previous release's files, and left the recorder running on the files it started on"
+expect_installed_is "$what" "$work_dir/before-b"
+[[ $(restarts) == 0 ]] || fail "$what: restarted the recorder: $(<"$state/systemctl.log")"
 # A run killed after a refresh put in .env or the certificate, before the restart, leaves the
 # recorder on the old ones, and the next run finds the files current. A run that finds .env or the
 # certificate newer than the recorder's start (systemd's ExecMainStartTimestamp) restarts the
@@ -2470,6 +2576,88 @@ expect_run "$what" 0 'ghost-wispr update: active session; leaving the current re
 [[ $(restarts) == 0 ]] || fail "$what: restarted the recorder: $(<"$state/systemctl.log")"
 [[ $(<"$opt/device.crt") == 'INSTALLED CERTIFICATE' && ! -e $opt/device.crt.version ]] \
   || fail "$what: device.crt is [$(<"$opt/device.crt")], device.crt.version $(cat -- "$opt/device.crt.version" 2>/dev/null || echo missing); want the old certificate and no version file"
+# A run killed between the renames of the certificate pair (the launcher's limit, or a power cut)
+# leaves a pair that the next run puts right: the certificate with the version that pi-secrets named
+# for it, or the pair before. No later read corrects a mismatch: pi-secrets stages nothing, since the
+# installed certificate is not older than the latest version, and it reads versions above the number
+# that device.crt.version gives. The run journals the pair first, in device.crt.version.new (the
+# version and the SHA-256 of the certificate it installs), then renames the certificate in, then the
+# version file, then removes the journal; each run, update.sh secrets too, first finishes a journal
+# whose certificate is the installed one, and removes any other. The kills hit the renames onto the
+# version file, the certificate and the journal, of a refresh, and then of its rollback's restore.
+# Breaks they catch: a pair renamed with no journal, so a kill between the two renames leaves the
+# new certificate with the old number; a run that does not finish a journal; a journal finished
+# whatever certificate is installed; the version file renamed before the certificate.
+printf 'NEW CERTIFICATE\n' >"$work_dir/pair-new.crt"
+printf 'INSTALLED CERTIFICATE\n' >"$work_dir/pair-installed.crt"
+# killed_refresh NAME N: on release b with certificate version 1, a refresh stages NEW CERTIFICATE,
+# version 2, and is killed at its Nth rename onto /opt/ghost-wispr/NAME. With $mute set, the recorder
+# does not answer after the restart, so the rollback's restore makes the second renames. $journal is
+# the journal the kill left, or "none".
+killed_refresh() {
+  new_pi
+  install_set b
+  printf '1\n' >"$opt/device.crt.version"
+  printf 'NEW CERTIFICATE\n' >"$state/certificate"
+  if [[ -n ${mute:-} ]]; then touch -- "$state/version-mute.after-restart"; fi
+  printf '%s %s\n' "$1" "$2" >"$state/kill-at-rename"
+  release=b run_update
+  [[ $status == 137 && ! -e $state/kill-at-rename ]] \
+    || fail "certificate, killed at rename $2 onto $1: the run was not killed there: exit $status; output: $out"
+  journal=$(cat -- "$opt/device.crt.version.new" 2>/dev/null || echo none)
+  # The next run: pi-secrets stages nothing, and the recorder answers.
+  rm -f -- "$state/certificate" "$state/version-mute"
+  : >"$state/pi-secrets.log"
+  : >"$state/systemctl.log"
+}
+# expect_pair WHAT CERTIFICATE VERSION: device.crt holds CERTIFICATE and device.crt.version
+# VERSION (or is missing), and no journal is left.
+expect_pair() {
+  [[ $(<"$opt/device.crt") == "$2" && $(cat -- "$opt/device.crt.version" 2>/dev/null || echo missing) == "$3" \
+    && ! -e $opt/device.crt.version.new ]] \
+    || fail "$1: device.crt is [$(<"$opt/device.crt")], device.crt.version [$(cat -- "$opt/device.crt.version" 2>/dev/null || echo missing)], journal [$(cat -- "$opt/device.crt.version.new" 2>/dev/null || echo none)]; want [$2] and [$3], and no journal"
+}
+killed_refresh device.crt.version 1
+release=b run_update
+what='certificate, a refresh killed after the certificate went in, then a run'
+expect_pair "$what" 'NEW CERTIFICATE' 2
+expect_run "$what" 0 'ghost-wispr update: the recorder started before the installed device.crt; restarting it'
+expect_secrets_flag "$what" --installed-certificate-version 2
+[[ $journal == "$(printf 'version 2\nsha256 %s' "$(sha "$work_dir/pair-new.crt")")" ]] \
+  || fail "$what: the kill left the journal [$journal]; want version 2 and the new certificate's SHA-256"
+killed_refresh device.crt 1
+release=b run_update
+what='certificate, a refresh killed before the certificate went in, then a run'
+expect_pair "$what" 'INSTALLED CERTIFICATE' 1
+expect_run "$what" 0 "ghost-wispr update: already current at commit $commit_b"
+[[ $(restarts) == 0 ]] || fail "$what: restarted the recorder: $(<"$state/systemctl.log")"
+[[ $journal != none ]] || fail "$what: the kill left no journal"
+killed_refresh device.crt.version.new 1
+release=b run_update
+expect_pair 'certificate, a refresh killed before its journal, then a run' 'INSTALLED CERTIFICATE' 1
+mute=1 killed_refresh device.crt.version 2
+release=b run_update
+what="certificate, a rollback killed after the old certificate went back, then a run"
+expect_pair "$what" 'INSTALLED CERTIFICATE' 1
+expect_run "$what" 0 'ghost-wispr update: the recorder started before the installed device.crt; restarting it'
+[[ $journal == "$(printf 'version 1\nsha256 %s' "$(sha "$work_dir/pair-installed.crt")")" ]] \
+  || fail "$what: the kill left the journal [$journal]; want version 1 and the old certificate's SHA-256"
+mute=1 killed_refresh device.crt 2
+release=b run_update
+expect_pair 'certificate, a rollback killed before the old certificate went back, then a run' 'NEW CERTIFICATE' 2
+mute=1 killed_refresh device.crt.version.new 2
+release=b run_update
+expect_pair "certificate, a rollback killed before its journal, then a run" 'NEW CERTIFICATE' 2
+# A journal that names no version file, from a restore to a Pi that had none, cut short after its
+# certificate went back: the next run removes the version file the refresh had put in.
+new_pi
+install_set b
+printf '2\n' >"$opt/device.crt.version"
+printf 'version none\nsha256 %s\n' "$(sha "$opt/device.crt")" >"$opt/device.crt.version.new"
+release=b run_update
+what='certificate, a journal of a restore to no version file'
+expect_run "$what" 0
+expect_pair "$what" 'INSTALLED CERTIFICATE' missing
 # release-and-certificate: a certificate staged while a release installs goes in with the set, and
 # the release's one restart serves both (R11); when that release's version check fails, the old
 # certificate comes back with the old set.
@@ -2582,6 +2770,14 @@ run_update secrets
 expect_run 'secrets-mode, staging directories left behind' 0
 [[ ! -e $opt/.ghost-wispr-update.K1lled && -d $opt/.ghost-wispr-update.Y0ung1 && -d $opt/notes-2025 ]] \
   || fail "secrets-mode: did not remove the staging directory 47 minutes old alone: $(cd -- "$opt" && find . -maxdepth 1 -type d | LC_ALL=C sort | paste -sd ' ')"
+# It finishes a journal that a run left, before it reads the secrets (see certificate).
+killed_refresh device.crt.version 1
+run_update secrets
+what='secrets-mode, after a refresh killed after the certificate went in'
+expect_run "$what" 0
+expect_pair "$what" 'NEW CERTIFICATE' 2
+expect_secrets_flag "$what" --installed-certificate-version 2
+[[ ! -s $state/systemctl.log ]] || fail "$what: called systemctl: $(<"$state/systemctl.log")"
 new_pi
 install_set b
 echo fail >"$state/pi-secrets-mode"
