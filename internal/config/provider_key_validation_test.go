@@ -71,7 +71,8 @@ providers:
 	if err == nil || !strings.Contains(err.Error(), "read_only") {
 		t.Errorf("SetAPIKey(deepgram) = %v, want refusal naming read_only", err)
 	}
-	if got := store.Get().APIKey("deepgram"); got != "" {
+	cfg := store.Get()
+	if got := cfg.APIKey("deepgram"); got != "" {
 		t.Errorf("deepgram's key after refusal = %q, want none", got)
 	}
 	if after, err := os.ReadFile(envPath); err != nil || string(after) != original {
@@ -81,7 +82,8 @@ providers:
 	if err := store.TryUpdate(func(c *Config) error { return c.SetAPIKey("openai", "sk-writable") }); err != nil {
 		t.Fatalf("SetAPIKey(openai): %v", err)
 	}
-	if got := store.Get().APIKey("openai"); got != "sk-writable" {
+	cfg = store.Get()
+	if got := cfg.APIKey("openai"); got != "sk-writable" {
 		t.Errorf("openai's key = %q, want sk-writable", got)
 	}
 	saved := loadEnvFile(envPath)

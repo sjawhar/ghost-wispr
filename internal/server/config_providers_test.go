@@ -178,7 +178,8 @@ func TestPatchConfigRefusesADeploymentOwnedProviderKey(t *testing.T) {
 		if err := json.Unmarshal(rr.Body.Bytes(), &refusal); err != nil || len(refusal) != 1 || !strings.Contains(refusal["error"], "deepgram") || !strings.Contains(refusal["error"], "read_only") {
 			t.Errorf("refusal %s (%v), want {\"error\": ...} naming deepgram and read_only", rr.Body.String(), err)
 		}
-		if got := cfgStore.Get().APIKey("deepgram"); got != "" {
+		cfg := cfgStore.Get()
+		if got := cfg.APIKey("deepgram"); got != "" {
 			t.Errorf("a refused PATCH set deepgram's key to %q", got)
 		}
 		if after, err := os.ReadFile(path); err != nil || !bytes.Equal(after, beforeConfig) {
