@@ -541,11 +541,14 @@ swap_in() {
 # restore_previous WHY puts back each file this run swapped in from its .prev copy, byte for byte,
 # and, when restore_all is set, every other file of the set and .env that has a .prev copy. The
 # certificate and its version file go back only when this run swapped them in: one that an earlier
-# run installed passed pi-secrets' checks, and its .prev copy is an older certificate. Then it
-# reloads the user units, and reloads udev or restarts logind when their file changed. It sets
-# restore_problems to what it could not do: a reload, or a file swapped in with no .prev copy, which
-# stays as installed; and restore_note to what went back. When no file has a .prev copy it fails
-# with WHY: no previous release to restore (R6). It writes no deploy.verified.
+# run installed passed pi-secrets' checks, and its .prev copy is an older certificate. The two are
+# kept and swapped together, so device.crt.prev with no device.crt.version.prev means the Pi had no
+# version file (provision.sh --certificate writes none): the version file this run swapped in goes,
+# and counts as restored. Then it reloads the user units, and reloads udev or restarts logind when
+# their file changed. It sets restore_problems to what it could not do: a reload, or a file swapped
+# in with no .prev copy, which stays as installed; and restore_note to what went back. When no file
+# has a .prev copy it fails with WHY: no previous release to restore (R6). It writes no
+# deploy.verified.
 restore_previous() {
   local why=$1 name path prev names=("${swapped[@]}") restored=() missing=() system=()
   restore_problems='' restore_note='restored the previous release'
@@ -558,7 +561,10 @@ restore_previous() {
     path=$(installed_path "$name")
     prev=$DEPLOY_DIR/$name.prev
     if [[ ! -f $prev ]]; then
-      if [[ " ${swapped[*]} " == *" $name "* ]]; then
+      if [[ $name == device.crt.version && -f $DEPLOY_DIR/device.crt.prev ]]; then
+        rm -f -- "$path" || fail "$why; could not remove $path, which the Pi did not have before"
+        restored+=("$name")
+      elif [[ " ${swapped[*]} " == *" $name "* ]]; then
         missing+=("$name")
       fi
       continue
