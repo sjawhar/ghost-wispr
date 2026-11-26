@@ -571,9 +571,10 @@ grep -Eq '^sudo journalctl _SYSTEMD_USER_UNIT=ghost-wispr-update\.service --sinc
 
 # credentials-written: where the Pi has no credential files, provision.sh writes them from pi.env
 # with each field that gcloud's create-cred-config writes for an X.509 credential, naming the Pi's
-# own paths, mode 0644.
+# own paths, mode 0644. gcloud (as the office Pi's files hold it) impersonates through the mTLS
+# endpoint, iamcredentials.mtls.googleapis.com.
 begin credentials-written
-readonly want_google_credentials='{"audience":"//iam.googleapis.com/projects/123/locations/global/workloadIdentityPools/ghost-wispr/providers/ghost-wispr","credential_source":{"certificate":{"certificate_config_location":"/opt/ghost-wispr/certificate_config.json"}},"service_account_impersonation_url":"https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/ghost-wispr@example-project.iam.gserviceaccount.com:generateAccessToken","subject_token_type":"urn:ietf:params:oauth:token-type:mtls","token_url":"https://sts.mtls.googleapis.com/v1/token","type":"external_account","universe_domain":"googleapis.com"}'
+readonly want_google_credentials='{"audience":"//iam.googleapis.com/projects/123/locations/global/workloadIdentityPools/ghost-wispr/providers/ghost-wispr","credential_source":{"certificate":{"certificate_config_location":"/opt/ghost-wispr/certificate_config.json"}},"service_account_impersonation_url":"https://iamcredentials.mtls.googleapis.com/v1/projects/-/serviceAccounts/ghost-wispr@example-project.iam.gserviceaccount.com:generateAccessToken","subject_token_type":"urn:ietf:params:oauth:token-type:mtls","token_url":"https://sts.mtls.googleapis.com/v1/token","type":"external_account","universe_domain":"googleapis.com"}'
 readonly want_certificate_config='{"cert_configs":{"workload":{"cert_path":"/opt/ghost-wispr/device.crt","key_path":"/home/ghost-wispr/.config/ghost-wispr-identity/key.pem"}}}'
 for entry in "google-credentials.json $want_google_credentials" "certificate_config.json $want_certificate_config"; do
   name=${entry%% *} want=${entry#* }
@@ -654,22 +655,52 @@ if grep -Eq 'systemd-run|route-overlap-check|tailscale set' "$TEST_LOG"; then
 fi
 
 # credentials-same: where the credential files exist, provision.sh compares them with what pi.env
-# renders, field by field, and changes nothing. gcloud wrote the office Pi's files in its own layout,
-# so the same fields in another order and indentation are the same.
+# renders, field by field, and changes nothing. gcloud wrote the office Pi's files in its own layout:
+# its key order, and certificate_config.json with no final line feed, as below with test-pi.env's
+# values. Those, and the same fields in another order and indentation, are the same.
 begin credentials-same
 said 'credentials: same as pi.env renders' || fail "a second run did not say the credentials are the same: $(<"$work_dir/out")"
 if said 'credentials: wrote' || said 'credentials: differ'; then
   fail "a second run wrote or found different credential files: $(<"$work_dir/out")"
 fi
-for name in google-credentials.json certificate_config.json; do
-  jq -S --indent 4 . "$work_dir/$name" >"$deploy/$name"
+cat >"$work_dir/gcloud-google-credentials.json" <<'EOF'
+{
+  "universe_domain": "googleapis.com",
+  "type": "external_account",
+  "audience": "//iam.googleapis.com/projects/123/locations/global/workloadIdentityPools/ghost-wispr/providers/ghost-wispr",
+  "subject_token_type": "urn:ietf:params:oauth:token-type:mtls",
+  "token_url": "https://sts.mtls.googleapis.com/v1/token",
+  "credential_source": {
+    "certificate": {
+      "certificate_config_location": "/opt/ghost-wispr/certificate_config.json"
+    }
+  },
+  "service_account_impersonation_url": "https://iamcredentials.mtls.googleapis.com/v1/projects/-/serviceAccounts/ghost-wispr@example-project.iam.gserviceaccount.com:generateAccessToken"
+}
+EOF
+printf '%s' '{
+  "cert_configs": {
+    "workload": {
+      "cert_path": "/opt/ghost-wispr/device.crt",
+      "key_path": "/home/ghost-wispr/.config/ghost-wispr-identity/key.pem"
+    }
+  }
+}' >"$work_dir/gcloud-certificate_config.json"
+for layout in gcloud reordered; do
+  for name in google-credentials.json certificate_config.json; do
+    if [[ $layout == gcloud ]]; then
+      cp -- "$work_dir/gcloud-$name" "$deploy/$name"
+    else
+      jq -S --indent 4 . "$work_dir/$name" >"$deploy/$name"
+    fi
+  done
+  before=$(pi_files)
+  : >"$TEST_LOG"
+  TEST_SELF_STATUS=$joined_status run_provision "$stage"
+  expect_ran "credential files in the $layout layout"
+  said 'credentials: same as pi.env renders' || fail "the same fields in the $layout layout were not the same: $(<"$work_dir/out")"
+  [[ $(pi_files) == "$before" ]] || fail "provision.sh rewrote credential files in the $layout layout that it found the same"
 done
-before=$(pi_files)
-: >"$TEST_LOG"
-TEST_SELF_STATUS=$joined_status run_provision "$stage"
-expect_ran 'credential files in another layout'
-said 'credentials: same as pi.env renders' || fail "the same fields in another layout were not the same: $(<"$work_dir/out")"
-[[ $(pi_files) == "$before" ]] || fail 'provision.sh rewrote credential files that it found the same'
 
 # credentials-differ: a field that differs, one that the render does not write, and one that it
 # writes but the file lacks, are each named, by file and field, and the files are kept byte for
