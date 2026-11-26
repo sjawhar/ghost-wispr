@@ -164,6 +164,53 @@ func TestRunbookProvisionGivesServeExactlyServeConf(t *testing.T) {
 	}
 }
 
+// TestRunbookSaysHowThePiFindsARenewedCertificate fails if "Renew the X.509
+// certificate" does not say that the update keeps the installed certificate's
+// version in device.crt.version, with its .prev copy beside device.crt.prev,
+// and gives it to pi-secrets, which walks up from it by number when latest
+// cannot be read, skips a disabled version and stops at an absent one; or does
+// not quote the line pi-secrets prints when that walk finds nothing.
+func TestRunbookSaysHowThePiFindsARenewedCertificate(t *testing.T) {
+	section := runbookSection(t, "## Renew the X.509 certificate")
+	for _, words := range []string{"`/opt/ghost-wispr/device.crt.version`", "`device.crt.version.prev`", "--installed-certificate-version", "skips a disabled", "stops at the first version that does not exist", "pi-secrets: certificate kept: latest certificate cannot be read: <code>; no readable version above <n>"} {
+		if !strings.Contains(section, words) {
+			t.Errorf("the runbook's \"Renew the X.509 certificate\" does not say %q", words)
+		}
+	}
+}
+
+// TestRunbookSaysWhatTheUpdateRefusesAndRepairs fails if "Update and inspect"
+// does not say that the refusal of an override or a drop-in holds for new
+// secrets and a renewed certificate too, that the update restarts a recorder
+// that started before the installed .env or certificate, and what a rollback
+// of an install cut short prints; or if "Turn on the meeting voice" still says
+// that the update installs new secrets while an override is set.
+func TestRunbookSaysWhatTheUpdateRefusesAndRepairs(t *testing.T) {
+	section := runbookSection(t, "## Update and inspect")
+	for _, words := range []string{"new secrets or a renewed certificate", "ghost-wispr update: the recorder started before the installed", "restored the last verified set, the one deploy.verified lists"} {
+		if !strings.Contains(section, words) {
+			t.Errorf("the runbook's \"Update and inspect\" does not say %q", words)
+		}
+	}
+	if strings.Contains(runbookSection(t, "## Turn on the meeting voice"), "still installs new secret values") {
+		t.Error(`"Turn on the meeting voice" still says that the nightly update installs new secrets while an override is set`)
+	}
+}
+
+// TestRunbookSaysWhichSecretValuesThePiRefuses fails if "The Pi's secrets"
+// does not say which values pi-secrets refuses, so that a person who adds a
+// version knows why the Pi keeps its old one: a value systemd would read
+// otherwise than written, with a backslash, a leading quote or white space at
+// either end, besides an empty value and a line break or NUL.
+func TestRunbookSaysWhichSecretValuesThePiRefuses(t *testing.T) {
+	section := runbookSection(t, "## The Pi's secrets")
+	for _, words := range []string{"a backslash", "starts with a quote", "white space at either end", "a carriage return, a line feed or a NUL"} {
+		if !strings.Contains(section, words) {
+			t.Errorf("the runbook's \"The Pi's secrets\" does not say %q", words)
+		}
+	}
+}
+
 // TestRunbookClaimsTheNameFromAPersonsOwnDevice fails if the runbook still
 // runs a step under the agents' secrets broker (secret-run, a broker grant),
 // which no person's own device has, or if "Provision" does not claim the
