@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"maps"
 	"os"
@@ -49,10 +50,15 @@ type Store struct {
 	// file holds, read when the store loaded, with no local settings and no
 	// environment: a change writes the settings that differ from it.
 	releaseSettings map[string]any
-	path            string
-	envPath         string
-	onChange        []func(Config)
-	revision        Revision
+	// localSettingsRefusal refuses each change while the local settings file
+	// that the start could not apply is in place: a change would replace that
+	// file, and the settings saved in it would be lost. Nil when the start
+	// applied the file or found none.
+	localSettingsRefusal error
+	path                 string
+	envPath              string
+	onChange             []func(Config)
+	revision             Revision
 }
 
 // NewStore loads config from the given release YAML path and its local
@@ -81,18 +87,22 @@ func NewStoreWithEnv(yamlPath, envPath string) (*Store, []string, error) {
 }
 
 func newStore(path, envPath string, envSecrets map[string]string) (*Store, []string, error) {
-	cfg, fileLogLevel, warnings, releaseSettings, err := loadConfig(path, envSecrets)
+	l, err := loadConfig(path, envSecrets)
 	if err != nil {
-		return nil, warnings, err
+		return nil, l.warnings, err
 	}
-	return &Store{
-		cfg:             cfg,
-		writtenLogLevel: fileLogLevel,
-		releaseSettings: releaseSettings,
+	store := &Store{
+		cfg:             l.cfg,
+		writtenLogLevel: l.fileLogLevel,
+		releaseSettings: l.releaseSettings,
 		path:            path,
 		envPath:         envPath,
 		revision:        Revision{Run: newRun()},
-	}, warnings, nil
+	}
+	if l.localSettingsErr != nil {
+		store.localSettingsRefusal = fmt.Errorf("settings not saved: Ghost Wispr did not apply %s at start (%v). Correct or remove that file, then restart Ghost Wispr. A save now would replace the settings in it", LocalSettingsPath(path), l.localSettingsErr)
+	}
+	return store, l.warnings, nil
 }
 
 // Get returns a snapshot copy of the current config.
@@ -122,9 +132,15 @@ func (s *Store) Update(fn func(*Config)) error {
 
 // TryUpdate is Update with a mutation that can refuse: when fn returns an
 // error, the mutation is rolled back, nothing is written and no callback
-// fires, and TryUpdate returns that error.
+// fires, and TryUpdate returns that error. While the local settings file
+// that the start could not apply is in place, TryUpdate refuses each change
+// before fn runs.
 func (s *Store) TryUpdate(fn func(*Config) error) error {
 	s.mu.Lock()
+	if s.localSettingsRefusal != nil {
+		s.mu.Unlock()
+		return s.localSettingsRefusal
+	}
 
 	prev := s.copyConfig()
 	if err := fn(&s.cfg); err != nil {
@@ -163,11 +179,14 @@ func (s *Store) TryUpdate(fn func(*Config) error) error {
 	if s.envPath != "" && providerKeysChanged {
 		if err := s.writeEnvFile(); err != nil {
 			s.cfg = prev
+			err = fmt.Errorf("write .env: %w", err)
 			if s.path != "" {
-				_ = previousLocal.restore() // best-effort rollback of the local settings file
+				if restoreErr := previousLocal.restore(); restoreErr != nil {
+					err = errors.Join(err, fmt.Errorf("put back the local settings file: %w", restoreErr))
+				}
 			}
 			s.mu.Unlock()
-			return fmt.Errorf("write .env: %w", err)
+			return err
 		}
 	}
 	s.writtenLogLevel = writtenLogLevel

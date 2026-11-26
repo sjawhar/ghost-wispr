@@ -275,26 +275,39 @@ func Load(path string) (Config, []string, error) {
 // only, so a settings change writes this one back. envFile is a .env file's
 // entries, which give a provider its key when the environment does not.
 func load(path string, envFile map[string]string) (cfg Config, fileLogLevel string, warnings []string, err error) {
-	cfg, fileLogLevel, warnings, _, err = loadConfig(path, envFile)
-	return cfg, fileLogLevel, warnings, err
+	l, err := loadConfig(path, envFile)
+	return l.cfg, l.fileLogLevel, l.warnings, err
 }
 
-// loadConfig is load that also returns the release config alone, as the YAML
-// map a config file holds: the running config as it would be with no local
-// settings file and no environment. A settings save writes only the values
-// that differ from it. Both come from one read of the release file, so a file
-// replaced after the read changes neither.
-func loadConfig(path string, envFile map[string]string) (cfg Config, fileLogLevel string, warnings []string, releaseSettings map[string]any, err error) {
+// loaded is what loadConfig reads.
+type loaded struct {
+	cfg          Config
+	fileLogLevel string
+	warnings     []string
+	// releaseSettings is the release config alone, as the YAML map a config
+	// file holds: the running config as it would be with no local settings
+	// file and no environment. A settings save writes only the values that
+	// differ from it.
+	releaseSettings map[string]any
+	// localSettingsErr is why the local settings file was not applied, or
+	// nil when it was applied or there is none.
+	localSettingsErr error
+}
+
+// loadConfig is load that also returns the release config alone and why the
+// local settings file was not applied. Both configs come from one read of the
+// release file, so a file replaced after the read changes neither.
+func loadConfig(path string, envFile map[string]string) (l loaded, err error) {
 	var releaseData []byte
 	var releaseFound bool
 	if path != "" {
 		if releaseData, releaseFound, err = readSettingsFile(path); err != nil {
-			return defaults(), "", nil, nil, fmt.Errorf("read config file: %w", err)
+			return loaded{cfg: defaults()}, fmt.Errorf("read config file: %w", err)
 		}
 	}
 	release, err := releaseConfig(releaseData, releaseFound)
 	if err != nil {
-		return release, "", nil, nil, err
+		return loaded{cfg: release}, err
 	}
 	// The effective release config: the release file over the defaults, as a
 	// config file. The local settings file merges over it key by key. It
@@ -303,7 +316,7 @@ func loadConfig(path string, envFile map[string]string) (cfg Config, fileLogLeve
 	// with, which an environment override can name.
 	baseData, err := yaml.Marshal(&release)
 	if err != nil {
-		return release, "", nil, nil, fmt.Errorf("read the release config: %w", err)
+		return loaded{cfg: release}, fmt.Errorf("read the release config: %w", err)
 	}
 	// The release config a save compares with gets the provider defaults
 	// from the release file's own credential file alone, never from
@@ -311,32 +324,34 @@ func loadConfig(path string, envFile map[string]string) (cfg Config, fileLogLeve
 	// file gives is a value from the environment, which a save writes.
 	applyProviderDefaults(&release, inspectGoogleCredentialFile(release.GoogleCredentialsFile).serviceAccountProject)
 	validate(&release)
-	if releaseSettings, err = configSettings(&release); err != nil {
-		return release, "", nil, nil, fmt.Errorf("read the release config: %w", err)
+	if l.releaseSettings, err = configSettings(&release); err != nil {
+		return loaded{cfg: release}, fmt.Errorf("read the release config: %w", err)
 	}
 
-	warnings = deprecatedEnvoyEnvironmentWarnings()
+	l.warnings = deprecatedEnvoyEnvironmentWarnings()
 	// data is the config to decode. fileData is the config as its files
 	// write it, for the warnings about a removed setting.
 	data, fileData := baseData, releaseData
 	if path != "" {
-		var localWarnings []string
-		data, fileData, localWarnings = applyLocalSettings(LocalSettingsPath(path), baseData, releaseData)
-		warnings = append(warnings, localWarnings...)
+		localPath := LocalSettingsPath(path)
+		if data, fileData, l.localSettingsErr = applyLocalSettings(localPath, baseData, releaseData); l.localSettingsErr != nil {
+			l.warnings = append(l.warnings, localSettingsWarning(localPath, l.localSettingsErr))
+		}
 	}
-	if cfg, err = decodeEffectiveConfig(data); err != nil {
-		return cfg, "", nil, nil, fmt.Errorf("parse config file: %w", err)
+	cfg, err := decodeEffectiveConfig(data)
+	if err != nil {
+		return loaded{cfg: cfg}, fmt.Errorf("parse config file: %w", err)
 	}
-	warnings = append(warnings, deprecatedEnvoyConfigWarnings(fileData)...)
-	warnings = append(warnings, removedSettingWarnings(fileData)...)
+	l.warnings = append(l.warnings, deprecatedEnvoyConfigWarnings(fileData)...)
+	l.warnings = append(l.warnings, removedSettingWarnings(fileData)...)
 
-	fileLogLevel = cfg.LogLevel
-	warnings = append(warnings, applyEnvOverrides(&cfg)...)
+	l.fileLogLevel = cfg.LogLevel
+	l.warnings = append(l.warnings, applyEnvOverrides(&cfg)...)
 	normalizeFileSettings(&cfg)
 	// An unknown light fails closed: dropping the setting would turn the light
 	// check off and let the recorder capture with no light on.
 	if cfg.IndicatorLight != "" && cfg.IndicatorLight != IndicatorLightBlink1 {
-		return cfg, "", warnings, nil, fmt.Errorf("indicator_light %q is not a known light: set it to %q, or leave it unset for a recorder with no light", cfg.IndicatorLight, IndicatorLightBlink1)
+		return loaded{cfg: cfg, warnings: l.warnings}, fmt.Errorf("indicator_light %q is not a known light: set it to %q, or leave it unset for a recorder with no light", cfg.IndicatorLight, IndicatorLightBlink1)
 	}
 	credentialPath := cfg.GoogleCredentialsFile
 	if credentialPath == "" {
@@ -344,9 +359,10 @@ func loadConfig(path string, envFile map[string]string) (cfg Config, fileLogLeve
 	}
 	applyProviderDefaults(&cfg, inspectGoogleCredentialFile(credentialPath).serviceAccountProject)
 	loadSecrets(&cfg, envFile)
-	warnings = append(warnings, removedEnvironmentWarnings(&cfg, envFile)...)
-	warnings = append(warnings, validate(&cfg)...)
-	return cfg, fileLogLevel, warnings, releaseSettings, nil
+	l.warnings = append(l.warnings, removedEnvironmentWarnings(&cfg, envFile)...)
+	l.warnings = append(l.warnings, validate(&cfg)...)
+	l.cfg = cfg
+	return l, nil
 }
 
 // releaseConfig decodes the release config file over the defaults, with no
