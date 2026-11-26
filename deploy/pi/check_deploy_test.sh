@@ -250,7 +250,8 @@ readonly old_config new_config
 good_providers=$(template_providers "$new_template" | jq -Rcn '{providers: [inputs | {name: ., ok: true, message: "works"}]}')
 readonly good_providers
 [[ $(jq '.providers | length' <<<"$good_providers") -ge 4 ]] || fail "read too few providers from the template: $good_providers"
-readonly first_provider=$(jq -r '.providers[0].name' <<<"$good_providers")
+first_provider=$(jq -er '.providers[0].name' <<<"$good_providers") || fail "read no provider name from $good_providers"
+readonly first_provider
 readonly idle_status='{"paused":false,"capture_state":"capturing","active_session_id":"","warnings":[]}'
 good_serve=$(jq -cn --arg host "$PI_HOST" \
   '{TCP: {"443": {HTTPS: true}}, Web: {($host + ":443"): {Handlers: {"/": {Proxy: "http://127.0.0.1:8080"}}}}}')
@@ -356,14 +357,14 @@ on_old() {
   printf '%s\n' "$old_journal" >"$state/journal-ghost-wispr-update.service"
 }
 
-# run_driver [ARGS]: runs the driver from deploy/pi against this case's fake Pi and release; its
-# output is in $out, its exit status in $rc.
+# run_driver [ARGS]: runs the driver from deploy/pi, or from driver_copy when a case sets it,
+# against this case's fake Pi and release; its output is in $out, its exit status in $rc.
 run_driver() {
   rc=0
   out=$(PATH="$bin:$PATH" FAKE_HOME="$home" FAKE_STATE="$state" FAKE_GITHUB="$github" FAKE_LOG="$log" \
     FAKE_PI_HOST="$PI_HOST" FAKE_RELEASES_API="$releases_api" FAKE_REAL_CURL="$real_curl" \
     GHOST_WISPR_PI_ENV="$env_file" GHOST_WISPR_DEPLOY_DIR="$deploy" GHOST_WISPR_RELEASES_API="$releases_api" \
-    bash "$driver" "$@" 2>&1) || rc=$?
+    bash "${driver_copy:-$driver}" "$@" 2>&1) || rc=$?
 }
 
 # verdict_line N: the one line the run printed for check N.
@@ -703,6 +704,33 @@ if not_root; then
   expect_verdicts PASS PASS PASS PASS PASS PASS UNKNOWN
   expect 7 UNKNOWN ghost-wispr-update.service
 fi
+
+# The driver reads the bootstrap files and Serve with the functions of the pi-lib.sh beside it,
+# bootstrap_drift, serve_conf_lines and serve_lines_from_status, which update.sh's nightly drift
+# rule runs, so the two cannot read them two ways. Here it runs from a copy of deploy/pi whose
+# pi-lib.sh is the repository's, with bootstrap_drift and serve_lines_from_status replaced by ones
+# that name a timer and a Serve line the fake Pi does not have: check 7 fails with both. The same
+# copy with no pi-lib.sh stops with a usage error that names it, and prints no check. Breaks it
+# catches: a driver that keeps its own drift rule or Serve parser; one that sources a pi-lib.sh
+# other than its sibling; one that runs its checks without the library.
+new_case "the driver reads with its sibling pi-lib.sh"
+lib_tree=$case_dir/tree
+mkdir -p "$lib_tree"
+cp -- "$driver" "$lib_tree/"
+{
+  cat -- "$script_dir/pi-lib.sh"
+  printf '%s\n' \
+    "bootstrap_drift() { printf 'ghost-wispr-update.timer\\n'; }" \
+    "serve_lines_from_status() { printf '443 http://127.0.0.1:7777\\n'; }"
+} >"$lib_tree/pi-lib.sh"
+driver_copy=$lib_tree/check-deploy.sh run_driver
+expect_verdicts PASS PASS PASS PASS PASS PASS FAIL
+expect 7 FAIL 'provisioning file ghost-wispr-update.timer' 'have 443 http://127.0.0.1:7777'
+rm -f -- "$lib_tree/pi-lib.sh"
+driver_copy=$lib_tree/check-deploy.sh run_driver
+((rc == 2)) || fail "with no pi-lib.sh the driver exited $rc, want 2: $out"
+! grep -qE '^check [0-9]+ (PASS|FAIL|UNKNOWN): ' <<<"$out" || fail "with no pi-lib.sh the driver printed a check: $out"
+[[ $out == *pi-lib.sh* ]] || fail "with no pi-lib.sh the driver did not name it: $out"
 
 # The release cannot be read: the checks that compare with it are UNKNOWN; the status and the
 # protected recordings still run. Break it catches: a driver that compares with the checkout's files

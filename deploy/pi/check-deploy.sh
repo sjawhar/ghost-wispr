@@ -66,6 +66,12 @@ pi_env=${GHOST_WISPR_PI_ENV:-$script_dir/files/pi.env}
 readonly pi_env
 # shellcheck source=files/pi.env
 source "$pi_env" || usage_error "cannot read the Pi deployment settings in $pi_env"
+# The functions the driver shares with update.sh (deploy/pi/pi-lib.sh): check 7 reads the bootstrap
+# files and Serve with them, so it and the nightly drift rule read them one way. The driver runs
+# from a checkout, so it sources the pi-lib.sh beside it; what it compares with is the release's.
+[[ -r $script_dir/pi-lib.sh ]] || usage_error "cannot read $script_dir/pi-lib.sh, the functions the driver shares with update.sh"
+# shellcheck source=/dev/null
+source "$script_dir/pi-lib.sh"
 readonly PI="ghost-wispr@$PI_HOST" SERVE="https://$PI_HOST"
 # GHOST_WISPR_DEPLOY_DIR and GHOST_WISPR_RELEASES_API exist for check_deploy_test.sh.
 readonly DEPLOY_DIR="${GHOST_WISPR_DEPLOY_DIR:-/opt/ghost-wispr}"
@@ -550,18 +556,31 @@ check_protected() {
   fi
 }
 
-# serve_lines prints Serve's setting from `tailscale serve status --json` on stdin (tailscale's
-# ipn.ServeConfig) as serve.conf writes it: "<port> <proxy target>", one line for each Web entry
-# whose handler "/" names a Proxy, sorted. It fails on an answer it cannot read that way.
-serve_lines() {
-  jq -r 'if type == "object" and ((.Web // {}) | type == "object") then
-      (.Web // {}) | to_entries[] | (.key | capture(":(?<port>[0-9]+)$").port) as $port
-      | (.value.Handlers["/"].Proxy // empty) | "\($port) \(.)"
-    else error("not a Serve config") end' | LC_ALL=C sort
+# pi_copy REMOTE_PATH OUT copies one file of the Pi to OUT on this device with cat over SSH, and
+# writes nothing on the Pi. REMOTE_PATH is shell text that the Pi's shell expands, so $HOME is
+# ghost-wispr's. It returns 0 when it copied the file, 3 when the Pi has no such file (OUT is then
+# removed), 255 when SSH cannot reach the Pi, and another status when the Pi cannot read the file.
+# The error output is in $tmp/copy.err.
+pi_copy() {
+  local status=0
+  pi "f=$1; [ -e \"\$f\" ] || exit 3; cat -- \"\$f\"" >"$2" 2>"$tmp/copy.err" || status=$?
+  if ((status == 3)); then
+    rm -f -- "$2"
+  fi
+  return "$status"
+}
+# listed ITEM LIST...: ITEM is one of LIST.
+listed() {
+  local item=$1 each
+  shift
+  for each in "$@"; do
+    [[ $each != "$item" ]] || return 0
+  done
+  return 1
 }
 readonly SERVE_READ='timeout 10s sudo -n tailscale serve status --json'
 check_bootstrap() {
-  local differences=() unread=() out status=0 sum path name want serve have
+  local differences=() unread=() missing=() unreadable=() reached=yes status=0 name remote copy drift want serve have
   if [[ -z $set_dir ]]; then
     unknown 7 "no release manifest and serve.conf to compare the Pi's bootstrap files and Serve with: $set_error"
     return 0
@@ -573,44 +592,69 @@ check_bootstrap() {
     fi
   done
 
-  # The installed bootstrap files, by sha256; a file the Pi does not have is a difference, one it
-  # cannot read is unknown.
-  out=$(pi "for f in $(printf %q "$DEPLOY_DIR/ghost-wispr-update-launcher.sh") \"\$HOME/.config/systemd/user/ghost-wispr-update.service\" \"\$HOME/.config/systemd/user/ghost-wispr-update.timer\"; do
-  if [ ! -e \"\$f\" ]; then echo \"missing \$f\"
-  elif s=\$(sha256sum 2>/dev/null <\"\$f\"); then echo \"\${s%% *} \$f\"
-  else echo \"unreadable \$f\"; fi
-done" 2>"$tmp/bootstrap.err") || status=$?
-  if ((status == 255)); then
-    unread+=("cannot reach $PI over SSH to hash the bootstrap files: $(error_of "$tmp/bootstrap.err")")
-  elif ((status != 0)) || [[ $(grep -c . <<<"$out") != "${#BOOTSTRAP_FILES[@]}" ]]; then
-    unread+=("cannot hash the bootstrap files on the Pi over SSH (exit $status): $(error_of "$tmp/bootstrap.err")")
-  else
-    while read -r sum path; do
-      name=${path##*/}
-      want=$(manifest_sum "$name")
-      case $sum in
-        missing) differences+=("provisioning file $name is missing on the Pi ($path); run the release's provision.sh") ;;
-        unreadable) unread+=("cannot read $name on the Pi ($path)") ;;
-        "$want") ;;
-        *) differences+=("provisioning file $name ($path) differs from the release: sha256 $sum, the manifest's $want; run the release's provision.sh") ;;
-      esac
-    done <<<"$out"
+  # The bootstrap files, copied from the Pi into a mirror of their two directories, where
+  # bootstrap_drift (pi-lib.sh) compares them with the release's manifest as update.sh's drift rule
+  # does on the Pi. A file the Pi does not have is a difference; one it cannot read is unknown.
+  mkdir -p -- "$tmp/bootstrap/deploy" "$tmp/bootstrap/units"
+  for name in "${BOOTSTRAP_FILES[@]}"; do
+    if [[ $name == *.sh ]]; then
+      remote=$(printf %q "$DEPLOY_DIR/$name") copy=$tmp/bootstrap/deploy/$name
+    else
+      remote="\"\$HOME/.config/systemd/user/$name\"" copy=$tmp/bootstrap/units/$name
+    fi
+    status=0
+    pi_copy "$remote" "$copy" || status=$?
+    case $status in
+      0) ;;
+      3) missing+=("$name") ;;
+      255)
+        reached=no
+        unread+=("cannot reach $PI over SSH to read the bootstrap files: $(error_of "$tmp/copy.err")")
+        break
+        ;;
+      *)
+        unreadable+=("$name")
+        unread+=("cannot read $name on the Pi (exit $status): $(error_of "$tmp/copy.err")")
+        ;;
+    esac
+  done
+  if [[ $reached == yes ]]; then
+    status=0
+    drift=$(bootstrap_drift "$set_dir/manifest.json" "$tmp/bootstrap/deploy" "$tmp/bootstrap/units") || status=$?
+    if ((status != 0)); then
+      unread+=("bootstrap_drift (pi-lib.sh) cannot compare the bootstrap files with $release_name's manifest (exit $status)")
+    else
+      while IFS= read -r name; do
+        if [[ -z $name ]] || listed "$name" ${unreadable[@]+"${unreadable[@]}"}; then
+          continue
+        elif listed "$name" ${missing[@]+"${missing[@]}"}; then
+          differences+=("provisioning file $name is missing on the Pi; run the release's provision.sh")
+        else
+          differences+=("provisioning file $name differs from the release; run the release's provision.sh")
+        fi
+      done <<<"$drift"
+    fi
   fi
 
-  # Serve's setting against the release's serve.conf, read as the nightly drift rule reads it.
-  want=$(awk 'NF && $1 !~ /^#/ { print $1, $2 }' "$set_dir/serve.conf" | LC_ALL=C sort)
+  # Serve's setting against the release's serve.conf, both read with pi-lib.sh's functions, as
+  # update.sh's drift rule reads them.
   status=0
-  serve=$(pi "$SERVE_READ" 2>"$tmp/serve.err") || status=$?
-  if [[ -z $want ]]; then
+  want=$(serve_conf_lines "$set_dir/serve.conf") || status=$?
+  if ((status != 0)); then
+    unread+=("cannot read $release_name's serve.conf")
+  elif [[ -z $want ]]; then
     unread+=("$release_name's serve.conf names no port")
-  elif ((status == 255)); then
-    unread+=("cannot reach $PI over SSH to read Serve's setting: $(error_of "$tmp/serve.err")")
-  elif ((status != 0)); then
-    unread+=("cannot read Serve's setting on the Pi ($SERVE_READ, exit $status): $(error_of "$tmp/serve.err")")
-  elif [[ -z $serve ]] || ! have=$(serve_lines <<<"$serve" 2>/dev/null); then
-    unread+=("cannot read Serve's setting from $SERVE_READ on the Pi: it answered no Serve config")
-  elif [[ $have != "$want" ]]; then
-    differences+=("Serve differs from the release's serve.conf: want $(paste -sd ',' - <<<"$want"), have $(paste -sd ',' - <<<"${have:-none}")")
+  else
+    serve=$(pi "$SERVE_READ" 2>"$tmp/serve.err") || status=$?
+    if ((status == 255)); then
+      unread+=("cannot reach $PI over SSH to read Serve's setting: $(error_of "$tmp/serve.err")")
+    elif ((status != 0)); then
+      unread+=("cannot read Serve's setting on the Pi ($SERVE_READ, exit $status): $(error_of "$tmp/serve.err")")
+    elif ! have=$(serve_lines_from_status "$serve"); then
+      unread+=("cannot read Serve's setting from $SERVE_READ on the Pi: it answered no Serve config")
+    elif [[ $have != "$want" ]]; then
+      differences+=("Serve differs from the release's serve.conf: want $(paste -sd ',' - <<<"$want"), have $(paste -sd ',' - <<<"${have:-none}")")
+    fi
   fi
 
   if ((${#differences[@]} > 0)); then
@@ -620,7 +664,7 @@ done" 2>"$tmp/bootstrap.err") || status=$?
   elif ((${#unread[@]} > 0)); then
     unknown 7 "$(joined "${unread[@]}")"
   else
-    pass 7 "the bootstrap files ($(joined "${BOOTSTRAP_FILES[@]}")) have the sha256 of $release_name's manifest, and Serve matches its serve.conf ($(paste -sd ',' - <<<"$want"))"
+    pass 7 "the bootstrap files ($(joined "${BOOTSTRAP_FILES[@]}")) match $release_name's manifest, and Serve matches its serve.conf ($(paste -sd ',' - <<<"$want"))"
   fi
 }
 
