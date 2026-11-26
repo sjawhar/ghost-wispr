@@ -261,13 +261,19 @@ template_rules() {
 template_providers() {
   awk '/^providers:/ { on = 1; next } on && /^[^ #]/ { exit } on && /^  [A-Za-z0-9_-]+:$/ { sub(/^  /, ""); sub(/:$/, ""); print }' "$1"
 }
+# Each role GET /api/config reports under "models", and the template setting that names it: the
+# driver's MODEL_SETTINGS, listed here apart from the driver, so a driver that drops or misnames one
+# fails that role's case below.
+readonly model_settings=(
+  live_transcription=transcription.model batch_transcription=batch_transcription.model
+  summarization=summarization.model embedding=embedding.model concierge=concierge.model
+  tts=tts.model tts_voice=tts.voice gptlive=voice.gptlive.model dgagent_provider=voice.dgagent.provider
+)
 # running_config FILE: what GET /api/config answers on a recorder that runs FILE: the model of each
-# role the driver compares (its MODEL_SETTINGS) and the recording rules.
+# role of model_settings and the recording rules.
 running_config() {
   local entry value args=()
-  for entry in live_transcription=transcription.model batch_transcription=batch_transcription.model \
-    summarization=summarization.model embedding=embedding.model concierge=concierge.model \
-    tts=tts.model tts_voice=tts.voice gptlive=voice.gptlive.model dgagent_provider=voice.dgagent.provider; do
+  for entry in "${model_settings[@]}"; do
     value=$(template_setting "$1" "${entry#*=}")
     [[ -n $value ]] || fail "the template $1 sets no ${entry#*=}"
     args+=(--arg "${entry%%=*}" "$value")
@@ -547,13 +553,36 @@ printf '{"version":"dev"}\n' >"$state/version.json"
 run_driver
 expect_verdicts UNKNOWN PASS PASS PASS PASS PASS PASS
 
-# Check 2: a model the template names differs from the running one. Break it catches: a driver that
-# compares the recording rules alone.
-new_case 'another embedding model'
-jq -c '.models.embedding = "vertex/other-embedding"' <<<"$new_config" >"$state/config.json"
+# Check 2: each model setting, run with a value the template does not give it, fails, and the line
+# names that role, its setting and the value it runs, and no other difference. One case a role.
+# Breaks it catches: a driver that compares the recording rules alone, or skips a role; one that
+# compares a role with another role's setting.
+for entry in "${model_settings[@]}"; do
+  role=${entry%%=*} setting=${entry#*=}
+  new_case "a running $role that the template does not name"
+  jq -c --arg role "$role" '.models[$role] = "other/\($role)-value"' <<<"$new_config" >"$state/config.json"
+  run_driver
+  expect_verdicts PASS FAIL PASS PASS PASS PASS PASS
+  expect 2 FAIL "$role runs \"other/$role-value\"" "($setting)"
+  [[ $(grep -o 'but the template names' <<<"$(verdict_line 2)" | grep -c .) == 1 ]] \
+    || fail "check 2 names a difference besides $role's: $(verdict_line 2)"
+done
+# A role the running config does not report at all was not read: the recorder reports all nine
+# (internal/server's GET /api/config), so an answer without one cannot show what that role runs.
+# Check 2 is UNKNOWN and names it, never a model named null, and never the template's model. The
+# control: the same role reported as an empty model is a value the driver read, and differs: FAIL.
+# Breaks it catches: a driver that reads a missing model as a difference, as the model null, or as
+# the template's model; one that reads an empty model as missing.
+new_case 'a running config that reports no concierge model'
+jq -c 'del(.models.concierge)' <<<"$new_config" >"$state/config.json"
+run_driver
+expect_verdicts PASS UNKNOWN PASS PASS PASS PASS PASS
+expect 2 UNKNOWN 'reports no concierge model' concierge.model
+[[ $(verdict_line 2) != *null* ]] || fail "check 2 calls the missing model null: $(verdict_line 2)"
+jq -c '.models.concierge = ""' <<<"$new_config" >"$state/config.json"
 run_driver
 expect_verdicts PASS FAIL PASS PASS PASS PASS PASS
-expect 2 FAIL embedding vertex/other-embedding
+expect 2 FAIL 'concierge runs ""' '(concierge.model)'
 # A model saved on the page lives in the local settings file; check 2 compares the running model with
 # that value instead, and names the setting. The control is the same Pi with no local settings file,
 # whose check 2 fails. Breaks it catches: a driver that reads no local settings file, so every page
@@ -608,9 +637,10 @@ run_driver
 expect_verdicts PASS UNKNOWN PASS PASS PASS PASS PASS
 expect 2 UNKNOWN 'cannot read recording_rules'
 
-# Check 3: a provider that did not sign in, and one the template does not name, each fail. Breaks
-# it catches: a driver that lists the providers without reading ok; one that checks only the
-# template's providers are there.
+# Check 3: a provider that did not sign in, one the template does not name, and one the template
+# names that the Pi does not list each fail, and the line names it. Breaks it catches: a driver that
+# lists the providers without reading ok; one that checks only that the template's providers are
+# there; one that checks only that the Pi lists no provider the template does not name.
 new_case 'a provider that did not sign in'
 jq -c '.providers[0].ok = false | .providers[0].message = "401 Unauthorized"' <<<"$good_providers" >"$state/providers.json"
 run_driver
@@ -621,6 +651,12 @@ jq -c '.providers += [{name: "gateway", ok: true, message: "works"}]' <<<"$good_
 run_driver
 expect_verdicts PASS PASS FAIL PASS PASS PASS PASS
 expect 3 FAIL gateway
+new_case 'a provider the template names that the Pi does not list'
+missing_provider=$(jq -er '.providers[-1].name' <<<"$good_providers") || fail "read no provider name from $good_providers"
+jq -c 'del(.providers[-1])' <<<"$good_providers" >"$state/providers.json"
+run_driver
+expect_verdicts PASS PASS FAIL PASS PASS PASS PASS
+expect 3 FAIL "the Pi lists no $missing_provider"
 # A provider the local settings file adds runs, since the recorder reads that file over the
 # template, and passes. Break it catches: a driver whose check 3 fails for good on a Pi whose local
 # settings file adds a provider.
