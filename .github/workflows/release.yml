@@ -19,10 +19,24 @@ jobs:
       github.event.workflow_run.head_branch == 'main' &&
       github.event.workflow_run.head_repository.full_name == github.repository)
     runs-on: ubuntu-24.04-arm
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           ref: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}
+
+      # The release's tag, named once: the publish job and the bridge-images job each read this job's
+      # output, so jobs that run on either side of midnight UTC give the release and its images one
+      # tag (deploy/bridge/release_images_test.sh).
+      - name: Name the release
+        id: tag
+        env:
+          BUILD_SHA: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}
+        run: |
+          # release-tag-command:start
+          echo "tag=v$(date -u +%Y.%m.%d)-${BUILD_SHA:0:7}" >>"$GITHUB_OUTPUT"
+          # release-tag-command:end
 
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
@@ -155,11 +169,11 @@ jobs:
 
   # The call bridge's two images (dispatch://INFRA-5904): ghost-wispr-bridge, the release build, and
   # ghost-wispr-bridge-test, the callfault build that the test pool runs. Each run builds both from
-  # deploy/bridge/Dockerfile, and the workflow_run of main pushes both to ghcr.io with the release's
-  # tag. This job names that tag, once: the publish job needs this job, so a release exists only once
-  # both its images do, and creates the release with this job's tag, so jobs that run on either side
-  # of midnight UTC give the release and its images one tag (deploy/bridge/release_images_test.sh).
+  # deploy/bridge/Dockerfile, and the workflow_run of main pushes both to ghcr.io with the release
+  # job's tag. The publish job does not need this job: a failed push of the images does not hold back
+  # the Pi's release (deploy/bridge/release_images_test.sh).
   bridge-images:
+    needs: release
     if: >-
       github.event_name == 'pull_request' ||
       (github.event.workflow_run.event == 'push' &&
@@ -170,26 +184,15 @@ jobs:
     permissions:
       contents: read
       packages: write
-    outputs:
-      tag: ${{ steps.tag.outputs.tag }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           ref: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}
 
-      - name: Name the release
-        id: tag
-        env:
-          BUILD_SHA: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}
-        run: |
-          # release-tag-command:start
-          echo "tag=v$(date -u +%Y.%m.%d)-${BUILD_SHA:0:7}" >>"$GITHUB_OUTPUT"
-          # release-tag-command:end
-
       - name: Build the bridge's images
         env:
           BUILD_SHA: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}
-          TAG: ${{ steps.tag.outputs.tag }}
+          TAG: ${{ needs.release.outputs.tag }}
         run: |
           # bridge-images-build-command:start
           images=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}
@@ -205,7 +208,7 @@ jobs:
         if: github.event_name == 'workflow_run'
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ steps.tag.outputs.tag }}
+          TAG: ${{ needs.release.outputs.tag }}
         run: |
           # bridge-images-push-command:start
           images=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}
@@ -215,7 +218,7 @@ jobs:
           # bridge-images-push-command:end
 
   publish:
-    needs: [release, bridge-images]
+    needs: release
     if: >-
       github.event.workflow_run.event == 'push' &&
       github.event.workflow_run.conclusion == 'success' &&
@@ -234,7 +237,7 @@ jobs:
           BUILD_SHA: ${{ github.event.workflow_run.head_sha }}
           GH_REPO: ${{ github.repository }}
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ needs.bridge-images.outputs.tag }}
+          TAG: ${{ needs.release.outputs.tag }}
         run: |
           # release-publish-command:start
           gh release create "$TAG" \

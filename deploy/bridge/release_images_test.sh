@@ -5,11 +5,12 @@
 # that the test pool runs: its binary holds the run spec's reader, the fake Pi and the network probe.
 #
 # The job builds both images on each pull request and on the workflow_run of main, and pushes both
-# to ghcr.io only on that workflow_run. It names the release's tag in one step, and its build, its
-# push and the publish job's gh release create read that step's output, so jobs that run on either
-# side of midnight UTC give the release and its two images one tag. The publish job needs the job,
-# so a release exists only once both its images do. The Dockerfile starts from images pinned by
-# digest, builds with go.mod's Go, and runs the bridge as the user nonroot.
+# to ghcr.io only on that workflow_run. The release job names the release's tag in one step, and the
+# job's build and push and the publish job's gh release create read that step's output, so jobs
+# that run on either side of midnight UTC give the release and its two images one tag. The job and
+# the publish job each need only the release job: a failed push of the images does not hold back the
+# Pi's release. The Dockerfile starts from images pinned by digest, builds with go.mod's Go, and
+# runs the bridge as the user nonroot.
 #
 # docker, gh and date are fakes that record their arguments, so a pass shows no image built and none
 # pushed. Each check also runs against a copy with the fault it must see, and must fail there.
@@ -176,11 +177,22 @@ calls() {
 
 # --- The checks.
 
-# check_wiring WORKFLOW: the bridge-images job builds the commit the release job builds, and names
-# the release's tag in one step, whose output the job gives, its build and push steps read, and
-# the publish job, which needs the job, reads.
+# job_needs JOB prints the jobs that JOB needs, separated by commas, or nothing.
+job_needs() {
+  local needs
+  needs=$(grep -x '    needs: .*' <<<"$1") || return 0
+  needs=${needs#*needs: } && needs=${needs#'['} && needs=${needs%']'}
+  printf '%s\n' "${needs// /}"
+}
+
+# check_wiring WORKFLOW: the release job names the release's tag in one step, from the commit it
+# builds and on each run of the job, and gives that step's output as its own. The bridge-images job
+# and the publish job each need the release job and read that output, and the publish job does not
+# need the bridge-images job. The bridge-images job builds the commit the release job builds.
 check_wiring() {
   local wf=$1 job release publish step id want_sha want_ref value marker needs
+  # shellcheck disable=SC2016 # The workflow's expression, which GitHub expands.
+  local -r want_tag='${{ needs.release.outputs.tag }}'
   job=$(job_block "$wf" bridge-images) || why 'release.yml has no bridge-images job' || return 1
   release=$(job_block "$wf" release) || why 'release.yml has no release job' || return 1
   publish=$(job_block "$wf" publish) || why 'release.yml has no publish job' || return 1
@@ -192,39 +204,44 @@ check_wiring() {
   value=$(step_map "$step" with ref) || value=
   [[ $value == "$want_ref" ]] || why "the bridge-images job checks out [$value], not the release job's [$want_ref]" || return 1
 
-  step=$(step_holding "$job" '# release-tag-command:start') \
-    || why "the bridge-images job has no step that names the release's tag (# release-tag-command)" || return 1
+  step=$(step_holding "$release" '# release-tag-command:start') \
+    || why "the release job has no step that names the release's tag (# release-tag-command)" || return 1
   id=$(step_key "$step" id) || why "the step that names the release's tag has no id" || return 1
+  if value=$(step_key "$step" if); then
+    why "the step that names the release's tag runs only on [$value], not on every run of the release job" || return 1
+  fi
   value=$(step_map "$step" env BUILD_SHA) || value=
   [[ $value == "$want_sha" ]] \
     || why "the step that names the release's tag sets BUILD_SHA [$value], not the release job's [$want_sha]" || return 1
-  value=$(job_key "$job" outputs) || value=
+  value=$(job_key "$release" outputs) || value=
   [[ $value == "    outputs:"$'\n'"      tag: \${{ steps.$id.outputs.tag }}" ]] \
-    || why "the bridge-images job's outputs are [${value//$'\n'/ }], not the tag of its step $id alone" || return 1
+    || why "the release job's outputs are [${value//$'\n'/ }], not the tag of its step $id alone" || return 1
+
+  needs=$(job_needs "$job")
+  [[ ",$needs," == *,release,* ]] || why "the bridge-images job needs [$needs], not the release job, whose tag it reads" || return 1
   for marker in bridge-images-build-command bridge-images-push-command; do
     step=$(step_holding "$job" "# $marker:start") \
       || why "the bridge-images job has no command between '# $marker:start' and '# $marker:end'" || return 1
     value=$(step_map "$step" env TAG) || value=
-    [[ $value == "\${{ steps.$id.outputs.tag }}" ]] || why "the step of $marker sets TAG [$value], not the output of the step $id" || return 1
+    [[ $value == "$want_tag" ]] || why "the step of $marker sets TAG [$value], not the release job's output" || return 1
   done
   value=$(step_map "$(step_holding "$job" '# bridge-images-build-command:start')" env BUILD_SHA) || value=
   [[ $value == "$want_sha" ]] || why "the build step sets BUILD_SHA [$value], not the release job's [$want_sha]" || return 1
 
-  needs=$(grep -x '    needs: .*' <<<"$publish") || why 'the publish job has no needs: line' || return 1
-  needs=${needs#*needs: } && needs=${needs#'['} && needs=${needs%']'}
-  [[ ",${needs// /}," == *,bridge-images,* ]] \
-    || why "the publish job needs [$needs], not the bridge-images job: a release could exist without its images" || return 1
+  needs=$(job_needs "$publish")
+  [[ ",$needs," == *,release,* ]] || why "the publish job needs [$needs], not the release job" || return 1
+  [[ ",$needs," != *,bridge-images,* ]] \
+    || why "the publish job needs [$needs]: a failed push of the images would hold back the Pi's release" || return 1
   step=$(step_holding "$publish" '# release-publish-command:start') || why 'the publish job has no publish command' || return 1
   value=$(step_map "$step" env TAG) || value=
-  [[ $value == "\${{ needs.bridge-images.outputs.tag }}" ]] \
-    || why "the publish step sets TAG [$value], not the bridge-images job's output" || return 1
+  [[ $value == "$want_tag" ]] || why "the publish step sets TAG [$value], not the release job's output" || return 1
 }
 
-# run_commands WORKFLOW DIR runs the commands of the bridge-images job and of the publish job in DIR,
-# each with what its step sets: the tag's in the last second of 2026-11-26 UTC, each other in the
-# first second of 2026-11-27, given the tag the first wrote, as check_wiring requires. DIR/tag
-# holds the tag, DIR/build and DIR/push the docker calls of the build and of the push, and
-# DIR/gh.args gh's arguments.
+# run_commands WORKFLOW DIR runs the tag command, the commands of the bridge-images job and the
+# publish command in DIR, each with what its step sets: the tag's in the last second of 2026-11-26
+# UTC, each other in the first second of 2026-11-27, given the tag the first wrote, as check_wiring
+# requires. DIR/tag holds the tag, DIR/build and DIR/push the docker calls of the build and of the
+# push, and DIR/gh.args gh's arguments.
 run_commands() {
   local wf=$1 dir=$2 tag
   mkdir -p -- "$dir/build" "$dir/push"
@@ -273,11 +290,11 @@ check_builds() {
 }
 
 # check_push WORKFLOW DIR: the job runs on the release job's condition, so on pull requests and on
-# the workflow_run of main alone. It names the tag and builds on both, and pushes only on the
-# workflow_run: its steps are the checkout and the three commands, and only the push step has an if:.
-# The push signs in to ghcr.io with the token on stdin, and pushes the two images the build made.
+# the workflow_run of main alone. It builds on both, and pushes only on the workflow_run: its steps
+# are the checkout and the two commands, and only the push step has an if:. The push signs in to
+# ghcr.io with the token on stdin, and pushes the two images the build made.
 check_push() {
-  local wf=$1 dir=$2 job release step value marker have want
+  local wf=$1 dir=$2 job release step value have want
   job=$(job_block "$wf" bridge-images) || why 'release.yml has no bridge-images job' || return 1
   release=$(job_block "$wf" release) || why 'release.yml has no release job' || return 1
   have=$(job_key "$job" if) || have=
@@ -286,17 +303,15 @@ check_push() {
   step=$(step_holding "$job" '# bridge-images-push-command:start') || why 'the bridge-images job has no push command' || return 1
   value=$(step_key "$step" if) || value=
   [[ $value == "github.event_name == 'workflow_run'" ]] || why "the push step runs on [$value], not only on the workflow_run" || return 1
-  for marker in release-tag-command bridge-images-build-command; do
-    step=$(step_holding "$job" "# $marker:start") || why "the bridge-images job has no command $marker" || return 1
-    if value=$(step_key "$step" if); then
-      why "the step of $marker runs only on [$value], not on every run of the job" || return 1
-    fi
-  done
+  step=$(step_holding "$job" '# bridge-images-build-command:start') || why 'the bridge-images job has no build command' || return 1
+  if value=$(step_key "$step" if); then
+    why "the build step runs only on [$value], not on every run of the job" || return 1
+  fi
   # Each step is "- uses: ..." or "- name: ..." with a run: below it.
   have=$(awk '/^      - / { n++ } /^      - uses: |^        uses: / { sub(/@.*/, ""); sub(/^ *-? *uses: /, ""); print "uses " $0 }
     /^        run: / { print "run" } END { print n " steps" }' <<<"$job" | paste -sd ' ')
-  [[ $have == 'uses actions/checkout run run run 4 steps' ]] \
-    || why "the bridge-images job's steps are [$have], not the checkout and the three commands" || return 1
+  [[ $have == 'uses actions/checkout run run 3 steps' ]] \
+    || why "the bridge-images job's steps are [$have], not the checkout and the two commands" || return 1
 
   have=$(calls "$dir/push")
   want="login ghcr.io --username sjawhar-agent --password-stdin"$'\n'"push $release_image"$'\n'"push $test_image"
@@ -381,10 +396,10 @@ check_dockerfile() {
 
 # --- The workflow and the Dockerfile.
 
-name="the job names the release's tag in one step, which its build, its push and the publish job read"
+name="the release job names the release's tag in one step, which the images' build and push and the publish job read"
 check_wiring "$workflow" || fail 'the tag does not come from one step'
 
-name="the job's commands and the publish command run"
+name="the tag command, the job's commands and the publish command run"
 run_commands "$workflow" "$work/run" || fail 'a command failed'
 
 name='the release and both images carry the tag named before midnight, though they run after it'
@@ -444,8 +459,10 @@ expect_control workflow 'a build step that pushes' 'which is not a docker build'
   's|# bridge-images-build-command:start|&\n          docker push "ghcr.io/sjawhar/ghost-wispr-bridge:$TAG"|'
 expect_control workflow 'a push step on every run' 'the push step runs on []' \
   "/^        if: github.event_name == 'workflow_run'\$/d"
-expect_control workflow 'a release that does not wait for its images' 'not the bridge-images job' \
-  's|^    needs: \[release, bridge-images\]$|    needs: release|'
+expect_control workflow 'a publish job that waits for the images' 'would hold back the Pi' \
+  '/^  publish:$/,/^    needs:/ s|^    needs: release$|    needs: [release, bridge-images]|'
+expect_control workflow 'an images job that does not need the release job' 'not the release job, whose tag it reads' \
+  '/^  bridge-images:$/,/^    needs:/ { /^    needs: release$/d }'
 expect_control workflow 'packages: write for the whole workflow' 'outside the bridge-images job' \
   's|^  contents: read$|&\n  packages: write|'
 expect_control dockerfile 'an image not pinned by digest' 'is not pinned by digest' \

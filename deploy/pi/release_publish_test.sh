@@ -500,7 +500,7 @@ EOF
 chmod 0755 "$work/bin/gh"
 workflow_block release-publish-command >"$work/publish.sh" \
   || fail "release.yml has no command between '# release-publish-command:start' and '# release-publish-command:end'"
-# The publish command creates the release with the tag the bridge-images job names, which
+# The publish command creates the release with the tag that the release job names, which
 # deploy/bridge/release_images_test.sh tests.
 readonly release_tag=v2026.11.26-0123456
 (
