@@ -468,8 +468,11 @@ type exchange struct {
 	// the wake was heard but no call ("Whisper. No. Oh, yeah,"). The
 	// exchange stays open for TurnWait from that final; until then only a
 	// final that asks (Config.Asks) is the asker's turn, and when none comes,
-	// the exchange ends as a misheard wake (misheardWaited).
+	// the exchange ends as a misheard wake (holdExpired).
 	misheardHold bool
+	// holdGen numbers the holds begun: an expiry carries the number of the
+	// hold it was set for, and ends no later hold (holdExpired).
+	holdGen int
 	// roomChanged closes at the next change to the room's view (a final, a
 	// claim, the exchange's end) and is then replaced (RoomView.Changed).
 	roomChanged  chan struct{}
@@ -1238,6 +1241,11 @@ func (s *Supervisor) onTranscriptLocked(t *Transcript) {
 			ex.wakeStart, ex.wakeSaid = wakeStart(t, m), wakeSaidAt(t, m)
 			ex.turn, ex.interim, ex.turnFinal, ex.uttered, ex.heardTo, ex.reply = nil, "", false, false, time.Time{}, nil
 			ex.followUpTurn, ex.turnByName = false, true // a call, with the wake phrase
+			// A call ends the misheard-name hold: it addresses Wispr by name,
+			// so its continuation ("Wispr, send these notes", "to Raj.") is its
+			// turn without the hold's question gate, and the hold's expiry, if
+			// already queued, ends nothing (Sol's twenty-fourth review of #191).
+			s.endHoldLocked(ex)
 			if !stale {
 				ex.x.Turn++ // a new call; a late result keeps the turn it completes
 				s.roomChangedLocked(ex)
@@ -1298,10 +1306,12 @@ func (s *Supervisor) onTranscriptLocked(t *Transcript) {
 		// a wake for a first word, and ends as misheard only if none asks.
 		if t.IsFinal && !ex.misheardHold {
 			ex.misheardHold = true
+			ex.holdGen++
 			if ex.timer != nil {
 				ex.timer.Stop()
 			}
-			ex.timer = time.AfterFunc(s.cfg.TurnWait, func() { s.misheardWaited(ex) })
+			gen := ex.holdGen
+			ex.timer = time.AfterFunc(s.cfg.TurnWait, func() { s.holdExpired(ex, gen) })
 		}
 		return
 	}
@@ -1315,10 +1325,7 @@ func (s *Supervisor) onTranscriptLocked(t *Transcript) {
 			if !t.IsFinal || !s.asks(t.Text) {
 				return
 			}
-			ex.misheardHold = false
-			if ex.timer != nil {
-				ex.timer.Stop()
-			}
+			s.endHoldLocked(ex)
 		}
 		if !ex.stale(t) { // else a late result of a turn answered already
 			s.turnLocked(ex, t, t.Text)
@@ -2031,15 +2038,19 @@ func (s *Supervisor) turnOf(ex *exchange) string {
 // withKeys is turn, trimmed, with the keys of Dispatch's projects said in a
 // spoken form written as keys, as ex's turn writes them (turnOf).
 func (s *Supervisor) withKeys(ex *exchange, turn string) string {
-	turn = strings.TrimSpace(turn)
-	if s.cfg.ProjectKeys != nil {
-		if ex.turnByName {
-			turn = transcript.WriteKeysAfterName(turn, s.cfg.ProjectKeys())
-		} else {
-			turn = transcript.WriteKeys(turn, s.cfg.ProjectKeys())
-		}
+	if s.cfg.ProjectKeys == nil {
+		return strings.TrimSpace(turn)
 	}
-	return turn
+	return writeKeysOf(ex, turn, s.cfg.ProjectKeys())
+}
+
+// writeKeysOf is withKeys with the project keys given: one snapshot of them.
+func writeKeysOf(ex *exchange, turn string, keys []string) string {
+	turn = strings.TrimSpace(turn)
+	if ex.turnByName {
+		return transcript.WriteKeysAfterName(turn, keys)
+	}
+	return transcript.WriteKeys(turn, keys)
 }
 
 // keysMemo keeps one withKeys result: out for raw, written with keys and
@@ -2053,14 +2064,21 @@ type keysMemo struct {
 // ex.turnByName change. Writing the keys reads the whole text, and every Room
 // read writes the request and the asker's words, under s.mu, which a speech's
 // start waits for (Sol's twenty-third review of #191); comparing the inputs
-// costs less than writing them.
+// costs less than writing them. The project keys are read once, and that one
+// snapshot is both the memo's key and the keys written, so a refresh between
+// two reads of them cannot file one set's words under the other (Sol's
+// twenty-fourth review of #191).
 func (s *Supervisor) keysOfLocked(ex *exchange, m *keysMemo, raw string) string {
-	var keys string
-	if s.cfg.ProjectKeys != nil {
-		keys = strings.Join(s.cfg.ProjectKeys(), "\n")
+	if s.cfg.ProjectKeys == nil {
+		if !m.set || m.raw != raw || m.keys != "" || m.byName != ex.turnByName {
+			*m = keysMemo{raw: raw, byName: ex.turnByName, set: true, out: strings.TrimSpace(raw)}
+		}
+		return m.out
 	}
+	snapshot := s.cfg.ProjectKeys()
+	keys := strings.Join(snapshot, "\n")
 	if !m.set || m.raw != raw || m.keys != keys || m.byName != ex.turnByName {
-		*m = keysMemo{raw: raw, keys: keys, byName: ex.turnByName, set: true, out: s.withKeys(ex, raw)}
+		*m = keysMemo{raw: raw, keys: keys, byName: ex.turnByName, set: true, out: writeKeysOf(ex, raw, snapshot)}
 	}
 	return m.out
 }
@@ -2179,17 +2197,33 @@ func (s *Supervisor) turnWaited(ex *exchange) {
 	s.handTurnLocked(ex, turnSignal{kind: signalTurnWait, at: ranOut})
 }
 
-// misheardWaited ends, as a misheard wake, an exchange whose final held the
-// name but no call, once TurnWait passed with no final that asks
-// (misheardHold). A final that asked in that time took the hold away, and the
-// exchange goes on as any other.
-func (s *Supervisor) misheardWaited(ex *exchange) {
+// holdExpired ends, as a misheard wake, an exchange whose final held the name
+// but no call, once TurnWait passed with no final that asks (misheardHold).
+// gen is the hold the expiry was set for: a final that asked in that time, or
+// a call, ended that hold (endHoldLocked), and its expiry, even one already
+// waiting for s.mu, ends nothing, nor a hold begun after it (Sol's
+// twenty-fourth review of #191).
+func (s *Supervisor) holdExpired(ex *exchange, gen int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.ex != ex || ex.ended || !ex.misheardHold {
+	if s.ex != ex || ex.ended || !ex.misheardHold || ex.holdGen != gen {
 		return
 	}
 	s.endLocked(ex, true, "the wake was misheard")
+}
+
+// endHoldLocked ends ex's misheard-name hold, if it holds one: a final that
+// asks, or a call, addressed Wispr. Its timer stops, and an expiry already
+// waiting for s.mu finds no hold, or a later one, and ends nothing
+// (holdExpired; Sol's twenty-fourth review of #191).
+func (s *Supervisor) endHoldLocked(ex *exchange) {
+	if !ex.misheardHold {
+		return
+	}
+	ex.misheardHold = false
+	if ex.timer != nil {
+		ex.timer.Stop()
+	}
 }
 
 // voiceSpokeLocked judges the transcript of a speech of the voice's own
