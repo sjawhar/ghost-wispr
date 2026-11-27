@@ -17,7 +17,6 @@ import (
 	"github.com/sjawhar/ghost-wispr/internal/jabra"
 	"github.com/sjawhar/ghost-wispr/internal/server"
 	"github.com/sjawhar/ghost-wispr/internal/session"
-	"github.com/sjawhar/ghost-wispr/internal/stopping"
 	"github.com/sjawhar/ghost-wispr/internal/storage"
 	"github.com/sjawhar/ghost-wispr/internal/wake/local"
 )
@@ -348,28 +347,31 @@ func startMicStatesRig(t *testing.T, opts statesOptions) *micStatesRig {
 	lightCheckEvery = 20 * time.Millisecond
 	lightRetryEvery = 5 * time.Millisecond
 	ctx, cancel := context.WithCancel(context.Background())
+	// work runs the gate's openings and the paused listener as work the
+	// cleanup waits for: both open the light (openBlink1), which the cleanup
+	// restores. On goroutines of their own they outlived the cleanup and
+	// read openBlink1 as it was restored (Sol's reviews of #205: the
+	// listener with shuffle seed 2879465102281603987, an opening through
+	// ReleaseLightHold with a delayed light check).
+	work := &joinedWork{ctx: ctx, t: t}
 	if opts.sessions {
 		_, r.sessions = storeSessions(t)
 		r.capture = newSessionCaptureGate(ctx, r.sessions, fakePreroll{newCallLog()}, func() deepgramFinalizer { return nil }, time.Hour, testEndRetry, nopLogf)
 	} else {
 		r.capture = newCaptureGate(nil, nil, nil)
 	}
+	r.capture.background = work
 	saved, err := restorePause(r.store, r.capture)
 	if err != nil {
 		cancel()
 		t.Fatal(err)
 	}
 	var loops sync.WaitGroup
-	// listener runs the paused listener as work the cleanup waits for: it
-	// opens the light (openBlink1), which the cleanup restores. On its own
-	// goroutine it outlived the cleanup and read openBlink1 as it was
-	// restored (Sol's shuffled run on #205, seed 2879465102281603987).
-	listener := &joinedWork{ctx: ctx}
 	t.Cleanup(func() {
 		cancel()
 		_ = r.recMic.Close()
 		loops.Wait()
-		listener.stop()
+		work.stop()
 		r.hardware.Stop()
 		<-r.hardware.Done()
 		openBlink1, lightCheckEvery, lightRetryEvery = originalOpen, originalCheck, originalRetry
@@ -416,7 +418,7 @@ func startMicStatesRig(t *testing.T, opts statesOptions) *micStatesRig {
 	r.cfgStore = cfgStore
 	startPausedListener(ctx, cfgStore, &pausedListenerUnit{
 		capture: r.capture, controls: r.controls, hooks: r.hooks, device: r.device,
-		wake: r.hardware.Wake, warnings: r.warnings, restored: saved, built: !opts.notBuilt, background: listener,
+		wake: r.hardware.Wake, warnings: r.warnings, restored: saved, built: !opts.notBuilt, background: work,
 		newDetector: func() (*local.Detector, error) { return local.NewDetectorOf(r.spotter, startVerifier{}), nil },
 		openCapture: func() (local.Capture, error) {
 			if r.openFails.Load() {
@@ -849,49 +851,4 @@ func TestSavedStateRestores(t *testing.T) {
 		t.Cleanup(func() { cancel(); <-done })
 		r.requireState(t, micListening, "the Jabra's button attaching to a saved listening")
 	})
-}
-
-// joinedWork admits work as the session manager does (backgroundWork), and
-// stop refuses any more and waits for what it admitted. Admitting and
-// refusing share one lock, so no work starts after stop returns.
-type joinedWork struct {
-	ctx     context.Context // the context Go's work runs under
-	mu      sync.Mutex
-	stopped bool
-	running sync.WaitGroup
-}
-
-func (w *joinedWork) admit() bool {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	if w.stopped {
-		return false
-	}
-	w.running.Add(1)
-	return true
-}
-
-func (w *joinedWork) Go(f func(ctx context.Context)) {
-	if w.admit() {
-		go func() {
-			defer w.running.Done()
-			f(w.ctx)
-		}()
-	}
-}
-
-func (w *joinedWork) Run(ctx context.Context, f func(ctx context.Context) error) error {
-	if !w.admit() {
-		return stopping.ErrStopped
-	}
-	defer w.running.Done()
-	return f(ctx)
-}
-
-// stop refuses more work and waits for the work it admitted.
-func (w *joinedWork) stop() {
-	w.mu.Lock()
-	w.stopped = true
-	w.mu.Unlock()
-	w.running.Wait()
 }

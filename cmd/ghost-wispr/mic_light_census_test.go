@@ -73,15 +73,21 @@ func startLightRig(t *testing.T, paused bool) *lightRig {
 	openBlink1 = func(string, string) (indicator.Light, error) { return device, nil }
 	lightCheckEvery = time.Hour
 	lightRetryEvery = 5 * time.Millisecond
+	ctx, cancel := context.WithCancel(context.Background())
+	// The gate's openings read openBlink1 in their light check; they run as
+	// work the cleanup waits for before it restores it (joinedWork). The gate
+	// takes the work before anything runs on it: a pause's settling reads it.
+	openings := &joinedWork{ctx: ctx, t: t}
 	r := &lightRig{device: device, capture: newCaptureGate(nil, nil, nil), mic: &openMicFake{}, warnings: newWarningsRegistry()}
+	r.capture.background = openings
 	if paused {
 		r.capture.Pause()
 	}
-	ctx, cancel := context.WithCancel(context.Background())
 	r.hardware = startHardware(ctx, &config.Config{IndicatorLight: config.IndicatorLightBlink1}, r.capture, r.mic, r.warnings, server.NewHub())
 	t.Cleanup(func() {
 		r.hardware.Stop()
 		cancel()
+		openings.stop()
 		<-r.hardware.Done()
 		openBlink1, lightCheckEvery, lightRetryEvery = originalOpen, originalCheck, originalRetry
 	})
