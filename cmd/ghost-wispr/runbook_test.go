@@ -185,7 +185,8 @@ func TestRunbookProvisionGivesServeExactlyServeConf(t *testing.T) {
 		"confirms `inactive`", "`/run/ghost-wispr-join`", "`ExecStopPost`",
 		"the transient system unit `ghost-wispr-provision`", "`ghost-wispr-provision-join`", "when it became active and its main PID",
 		"`sudo systemctl stop ghost-wispr-provision ghost-wispr-provision-join`", "An SSH session that ends does not end a run",
-		"`sudo journalctl -u ghost-wispr-provision-join`", "its control group", "`systemctl reset-failed`", "checks the join again"} {
+		"`sudo journalctl -u ghost-wispr-provision-join`", "its control group", "`systemctl reset-failed`", "checks the join again",
+		"the last 20 lines of its journal", "starts by hand with systemd"} {
 		if !strings.Contains(section, words) {
 			t.Errorf("the runbook's \"Provision\" does not say %q", words)
 		}
