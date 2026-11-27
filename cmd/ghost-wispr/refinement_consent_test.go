@@ -10,6 +10,7 @@ import (
 )
 
 func TestRestoreRefinementRefusesWhileDriveReplacementIsOwed(t *testing.T) {
+	runParallel(t)
 	for name, hold := range map[string]func(*testing.T, *storage.SQLiteStore){
 		"session replacement pending": func(t *testing.T, store *storage.SQLiteStore) {
 			if _, err := store.DB().Exec(`UPDATE sessions SET drive_replace_pending = 1 WHERE id = ?`, "session"); err != nil {

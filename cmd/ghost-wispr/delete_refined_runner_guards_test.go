@@ -106,6 +106,7 @@ func TestDeleteRefinedAudioChecksHashBeforeSplice(t *testing.T) {
 }
 
 func TestDeleteRefinedTextRefusesRecovery(t *testing.T) {
+	runParallel(t)
 	fixture := newRefinedRunnerFixture(t)
 	runner := fixture.runner()
 	runner.locks.setRecovering("s", true)
@@ -115,6 +116,7 @@ func TestDeleteRefinedTextRefusesRecovery(t *testing.T) {
 }
 
 func TestDeleteRefinedTextRefusesRecoveryWithoutWaitingForTheRecoveryLock(t *testing.T) {
+	runParallel(t)
 	fixture := newRefinedRunnerFixture(t)
 	runner := fixture.runner()
 	runner.locks.setRecovering("s", true)

@@ -456,6 +456,7 @@ func TestARetiredResultAfterItsWaitIsDroppedAndLogged(t *testing.T) {
 // reading, until that write's own 10 s limit: a retired socket can be on such
 // a peer, and must not outlive its wait.
 func TestAGracefulCloseEndsWithinItsWaitWhileAWriteIsStuck(t *testing.T) {
+	runParallel(t)
 	peerDone := make(chan struct{})
 	upgrader := websocket.Upgrader{}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

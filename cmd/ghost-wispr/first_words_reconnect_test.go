@@ -165,9 +165,13 @@ func (c *listenedConn) result(t *testing.T, isFinal, speechFinal bool, start, du
 	}
 }
 
+// waitUntil waits for done, at most testWait, the package's bound for every
+// wait for the code under test. It waited 5 s, and on a loaded sami-devbox,
+// with three tests running beside it, a refused backfill's warning took
+// longer (TestAGoodIndexAfterARefusalIndexesTheSessionsMissed).
 func waitUntil(t *testing.T, what string, done func() bool) {
 	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(testWait)
 	for !done() {
 		if time.Now().After(deadline) {
 			t.Fatalf("timed out waiting for %s", what)

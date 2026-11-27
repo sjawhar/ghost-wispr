@@ -74,6 +74,7 @@ func r12AllRemovedMerge(t *testing.T) (*storage.SQLiteStore, string, []string) {
 // can finish its fenced write and then lose its recordings to the other
 // restore's cleanup defer.
 func TestR12ConcurrentRestoresKeepTheRecordings(t *testing.T) {
+	runParallel(t)
 	store, dir, ids := r12AllRemovedMerge(t)
 	source := &r12GatedDrive{files: map[string][]byte{}, entered: make(chan struct{}), release: make(chan struct{})}
 	for _, id := range ids {
@@ -118,6 +119,7 @@ func TestR12ConcurrentRestoresKeepTheRecordings(t *testing.T) {
 // TestR12SamePathRestoreKeepsTheRecording fails if the fast path that leaves
 // audio_path unchanged returns before it claims its downloaded recording.
 func TestR12SamePathRestoreKeepsTheRecording(t *testing.T) {
+	runParallel(t)
 	dir := t.TempDir()
 	store, err := storage.NewSQLiteStore(filepath.Join(t.TempDir(), "same-path.db"))
 	if err != nil {

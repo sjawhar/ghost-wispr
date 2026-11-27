@@ -32,6 +32,7 @@ func (d *r11ObservedDownloadDrive) DownloadRecording(_ context.Context, _ string
 // TestR11DeletionRestoreStagesBeforeInstall fails if the Delete text and audio
 // restore writes a Drive recording to its real path before its hash is checked.
 func TestR11DeletionRestoreStagesBeforeInstall(t *testing.T) {
+	runParallel(t)
 	fixture := newR9MergedCutFixture(t)
 	postCut := []byte("recording C after cut")
 	files := append([]*drive.File(nil), fixture.drive.files...)

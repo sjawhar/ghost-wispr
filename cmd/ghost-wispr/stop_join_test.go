@@ -150,6 +150,7 @@ func TestRunPassesEndsWhenTheStopRefusesAPass(t *testing.T) {
 // starts it, or the start's recovery of pending splices, does its store work
 // outside the work the stop cuts off and waits for.
 func TestTheDeletionsBackgroundWorkRunsAsWorkTheStopWaitsFor(t *testing.T) {
+	runParallel(t)
 	store, err := storage.NewSQLiteStore(filepath.Join(t.TempDir(), "retry.db"))
 	if err != nil {
 		t.Fatal(err)

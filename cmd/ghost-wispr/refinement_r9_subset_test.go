@@ -53,6 +53,7 @@ func r9MergedRestoreSession(t *testing.T, audioPath string) (*storage.SQLiteStor
 // recording remains missing. The audio-removed marker is the guard that keeps
 // the persisted refined words from being rebuilt without that source.
 func TestR9SubsetRestoreDoesNotClearTheMarker(t *testing.T) {
+	runParallel(t)
 	dir := t.TempDir()
 	store, session, names := r9MergedRestoreSession(t, "")
 	restored := []string{filepath.Join(dir, names[0]), filepath.Join(dir, names[2])}
@@ -80,6 +81,7 @@ func TestR9SubsetRestoreDoesNotClearTheMarker(t *testing.T) {
 // recording through a moved audio directory makes its new path look like a
 // full restore and clears the marker for the other missing source recordings.
 func TestR9MovedAudioDirDoesNotClearTheMarker(t *testing.T) {
+	runParallel(t)
 	oldDir, newDir := t.TempDir(), t.TempDir()
 	store, session, names := r9MergedRestoreSession(t, filepath.Join(oldDir, "20261113110000.mp3"))
 	survivor := filepath.Join(newDir, names[2])

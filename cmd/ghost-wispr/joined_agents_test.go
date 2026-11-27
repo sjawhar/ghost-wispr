@@ -163,6 +163,7 @@ func TestAJoinedAgentsHandReachesTheVoice(t *testing.T) {
 // TestSessionChangesReachTheJoinedAgents fails if a session end or delete,
 // wired as main wires them, does not reach the roster.
 func TestSessionChangesReachTheJoinedAgents(t *testing.T) {
+	runParallel(t)
 	var link voiceLink
 	link.set(&forgetting{})
 	var hooks conciergeHooks
@@ -201,6 +202,7 @@ func TestSessionChangesReachTheJoinedAgents(t *testing.T) {
 // do not list the meeting's joined agents, refuse a bad key as one, or give a
 // join message naming the unit's Envoy session.
 func TestTheAPIListsJoinedAgentsAndGivesTheJoinMessage(t *testing.T) {
+	runParallel(t)
 	var link voiceLink
 	roster := testRoster(t, &link)
 	hooks := &server.ControlHooks{}

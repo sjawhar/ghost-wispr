@@ -94,6 +94,7 @@ func (m slowManager) UtteranceEnd(*api.UtteranceEndResponse) error {
 // delivered the signal (TestASlowCallbackDelaysTheNextStamp shows a slow
 // earlier callback delays it).
 func TestTheVoiceHearsEachSignalWhenItsCallbackBegins(t *testing.T) {
+	runParallel(t)
 	const work = 200 * time.Millisecond
 	heard := &heardTranscripts{}
 	cb := transcriptCallback{manager: slowManager{d: work}, voice: heard}
@@ -128,6 +129,7 @@ func TestTheVoiceHearsEachSignalWhenItsCallbackBegins(t *testing.T) {
 // turn_signal is the unit's own work after the callback began, and must not be
 // read as Deepgram's delay.
 func TestASlowCallbackDelaysTheNextStamp(t *testing.T) {
+	runParallel(t)
 	const work = 200 * time.Millisecond
 	heard := &heardTranscripts{}
 	cb := transcriptCallback{manager: slowManager{d: work}, voice: heard}

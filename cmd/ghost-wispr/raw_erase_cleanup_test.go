@@ -15,6 +15,7 @@ import (
 )
 
 func TestStartupCleanupLeavesReservedRawEraseOutsideTheAudioDirectory(t *testing.T) {
+	runParallel(t)
 	audioDir, rawDir := t.TempDir(), t.TempDir()
 	store, err := storage.NewSQLiteStore(filepath.Join(t.TempDir(), "ghost-wispr.db"))
 	if err != nil {
@@ -119,6 +120,7 @@ func TestCleanupSpliceTempCopies(t *testing.T) {
 }
 
 func TestStartupCleanupReachesRecordingsOutsideTheAudioDirectory(t *testing.T) {
+	runParallel(t)
 	audioDir, elsewhere := t.TempDir(), t.TempDir()
 	recording := filepath.Join(elsewhere, "recording.mp3")
 	if err := os.WriteFile(recording, []byte("recording"), 0o600); err != nil {
@@ -155,6 +157,7 @@ func TestStartupCleanupReachesRecordingsOutsideTheAudioDirectory(t *testing.T) {
 }
 
 func TestStartupFinishesAnEraseCutOffAfterItsSessionWasDeleted(t *testing.T) {
+	runParallel(t)
 	audioDir, elsewhere := t.TempDir(), t.TempDir()
 	recording := filepath.Join(elsewhere, "recording.mp3")
 	audio := []byte("the deleted session's audio")
@@ -254,6 +257,7 @@ func TestStartupCleanupNamesTheAudioDirectoryAsAnAbsolutePath(t *testing.T) {
 }
 
 func TestStartupCleanupKeepsAnEraseDirectoryThatIsNotThere(t *testing.T) {
+	runParallel(t)
 	audioDir := t.TempDir()
 	unplugged := filepath.Join(t.TempDir(), "usb")
 	if err := os.Mkdir(unplugged, 0o700); err != nil {
@@ -283,6 +287,7 @@ func TestStartupCleanupKeepsAnEraseDirectoryThatIsNotThere(t *testing.T) {
 }
 
 func TestStartupRecordsTheAudioDirectoryForALaterStart(t *testing.T) {
+	runParallel(t)
 	store, err := storage.NewSQLiteStore(filepath.Join(t.TempDir(), "cleanup.db"))
 	if err != nil {
 		t.Fatal(err)
@@ -315,6 +320,7 @@ func TestStartupRecordsTheAudioDirectoryForALaterStart(t *testing.T) {
 }
 
 func TestStartupResplicesAnInterruptedDeletion(t *testing.T) {
+	runParallel(t)
 	recording := filepath.Join(t.TempDir(), "recording.mp3")
 	original := []byte("original")
 	if err := os.WriteFile(recording, original, 0o600); err != nil {

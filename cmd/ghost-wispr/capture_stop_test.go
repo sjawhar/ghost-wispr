@@ -30,6 +30,7 @@ import (
 // #138): its refusal comes after main closed the store, and the store refuses
 // the write itself. From review 6005005351 of #138.
 func TestAStoppedGateOpeningSavesNothing(t *testing.T) {
+	runParallel(t)
 	for _, joined := range []bool{true, false} {
 		name := "the stop cuts the opening off"
 		if !joined {
@@ -136,6 +137,7 @@ func bufferedFinal(t *testing.T, text string) *api.MessageResponse {
 // active, for the next start to end (storage's RecoverStaleSessions). From
 // review 6005005351 of #138.
 func TestAPausesSettlementIsWorkTheStopWaitsFor(t *testing.T) {
+	runParallel(t)
 	for _, withinDeadline := range []bool{true, false} {
 		name := "the flush ends within the stop's deadline"
 		if !withinDeadline {

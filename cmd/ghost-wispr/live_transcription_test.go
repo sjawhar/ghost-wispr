@@ -752,6 +752,7 @@ func startCloseStreamPeer(t *testing.T, final string, delay time.Duration) *clos
 // results: that stream is finished, so the audio would be lost. The write
 // must fail, for the transcription client to send it on the next socket.
 func TestAGracefullyEndedSocketRefusesLaterAudio(t *testing.T) {
+	runParallel(t)
 	peer := startCloseStreamPeer(t, "Finally.", 300*time.Millisecond)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

@@ -12,6 +12,7 @@ import (
 )
 
 func TestR4RecoveryKeepsRecordingWhenResplicedHashDiffers(t *testing.T) {
+	runParallel(t)
 	store, recording, _ := r4PendingStore(t)
 	wrongSplice := func(_ context.Context, path string, _, _ float64) (string, error) {
 		if err := os.WriteFile(path, []byte("different-cut"), 0o600); err != nil {
@@ -37,6 +38,7 @@ func TestR4RecoveryKeepsRecordingWhenResplicedHashDiffers(t *testing.T) {
 // downloaded from Drive (the unspliced original, deleted segment included) at
 // the recording's path.
 func TestR4RecoveryRemovesItsDownloadWhenResplicedHashDiffers(t *testing.T) {
+	runParallel(t)
 	store, recording, _ := r4PendingStore(t)
 	if _, err := store.DB().Exec(`UPDATE sessions SET gdrive_folder_id = 'folder' WHERE id = 'session'`); err != nil {
 		t.Fatal(err)

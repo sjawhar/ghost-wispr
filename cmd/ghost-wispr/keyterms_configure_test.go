@@ -111,6 +111,7 @@ func dialConfigureEndpoint(t *testing.T) (*configureEndpoint, *transcript.LiveKe
 // Deepgram answered the first (Deepgram refuses it, CONFIGURE_ALREADY_PENDING)
 // rather than the newest list once it answers.
 func TestAJoinConfiguresTheLiveStream(t *testing.T) {
+	runParallel(t)
 	fake, host := startConfigureEndpoint(t)
 	keyterms := transcript.NewLiveKeyterms([]string{"Wispr", "Ghost Wispr"}, func() []string { return []string{"INFRA"} })
 	factory := makeDeepgramClientFactory(context.Background(), fixedKey("test-key"),
@@ -165,6 +166,7 @@ func TestAJoinConfiguresTheLiveStream(t *testing.T) {
 // keyterms, so the list must go once more after a short wait, count as the
 // stream's once Deepgram takes it, and then not go again for the same join.
 func TestARefusedConfigureIsSentAgain(t *testing.T) {
+	runParallel(t)
 	fake, keyterms := dialConfigureEndpoint(t)
 	joined := []string{"Wispr", "Whisper", "Ghost Wispr", "ABC-12", "INFRA"}
 	keyterms.SetJoined([]string{"ABC-12"})
@@ -187,6 +189,7 @@ func TestARefusedConfigureIsSentAgain(t *testing.T) {
 // that keeps refusing), or if the next join or leave does not send it again
 // because it was sent before.
 func TestASecondRefusalWaitsForTheNextChange(t *testing.T) {
+	runParallel(t)
 	fake, keyterms := dialConfigureEndpoint(t)
 	joined := []string{"Wispr", "Whisper", "Ghost Wispr", "ABC-12", "INFRA"}
 	keyterms.SetJoined([]string{"ABC-12"})
@@ -210,6 +213,7 @@ func TestASecondRefusalWaitsForTheNextChange(t *testing.T) {
 // warn once Deepgram refused a join's keyterms, or still warns once Deepgram
 // took them.
 func TestARefusedConfigureWarnsUntilOneIsTaken(t *testing.T) {
+	runParallel(t)
 	fake, keyterms := dialConfigureEndpoint(t)
 	warnings := newWarningsRegistry()
 	keyterms.SetRefusalHook(keytermsRefusedWarning(warnings))

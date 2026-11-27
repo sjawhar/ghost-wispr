@@ -15,6 +15,7 @@ import (
 )
 
 func TestRetryRestoresAnUnrefinedRemovedSourceFromItsOwnFolder(t *testing.T) {
+	runParallel(t)
 	dir := t.TempDir()
 	store, err := storage.NewSQLiteStore(filepath.Join(t.TempDir(), "unrefined-retry.db"))
 	if err != nil {
@@ -73,6 +74,7 @@ func TestRetryRestoresAnUnrefinedRemovedSourceFromItsOwnFolder(t *testing.T) {
 }
 
 func TestRetryRestoresPartlyRemovedMergedSourceFromItsFolder(t *testing.T) {
+	runParallel(t)
 	dir := t.TempDir()
 	store, err := storage.NewSQLiteStore(filepath.Join(t.TempDir(), "partial-retry.db"))
 	if err != nil {

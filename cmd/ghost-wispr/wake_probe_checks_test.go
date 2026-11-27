@@ -193,6 +193,7 @@ func TestAMIUtterancesSplitOnARealPause(t *testing.T) {
 // utterance (Sol's review of #135 at 21bbef7). The speech is cached, so no
 // request goes out.
 func TestProbeMeetingInsertsBySpokenAudio(t *testing.T) {
+	runParallel(t)
 	dir := t.TempDir()
 	words := filepath.Join(dir, "words")
 	for _, sub := range []string{"corpus", "tts", "words"} {

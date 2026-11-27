@@ -370,6 +370,7 @@ func TestAResumeBeforeTheLoopWaitsAgainStartsTheMicrophone(t *testing.T) {
 // time out under load while its start reported itself before its pause: the
 // test's resume ran first, found the switch on and did nothing.
 func TestAPauseAfterTheLastResumeKeepsACancelledStartClosed(t *testing.T) {
+	runParallel(t)
 	for _, tc := range pauseCancelledStartLoops {
 		t.Run(tc.name, func(t *testing.T) {
 			capture := newCaptureGate(nil, nil, nil)
@@ -446,6 +447,7 @@ func TestAPauseWhileAStartWaitsForTheHardwareStartsAtTheNextResume(t *testing.T)
 // pause; one during that confirmation stops the start under the red hold.
 // The next resume starts the microphone.
 func TestAPauseJustBeforeAStartOpensNothing(t *testing.T) {
+	runParallel(t)
 	for _, during := range []string{"after the hardware is ready", "during the red confirmation"} {
 		for _, tc := range resumeStartLoops {
 			t.Run(during+"/"+tc.name, func(t *testing.T) {

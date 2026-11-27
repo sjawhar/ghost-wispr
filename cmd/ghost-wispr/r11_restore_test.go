@@ -35,6 +35,7 @@ func (d *r11FolderDrive) DownloadRecording(_ context.Context, folderID, name, de
 // TestR11RestoreFindsPreMergeSourceFolder fails if a recording removed before
 // merge is not restored from its source session's own Drive folder.
 func TestR11RestoreFindsPreMergeSourceFolder(t *testing.T) {
+	runParallel(t)
 	dir := t.TempDir()
 	store, err := storage.NewSQLiteStore(filepath.Join(t.TempDir(), "source-folder.db"))
 	if err != nil {
@@ -97,6 +98,7 @@ func TestR11RestoreFindsPreMergeSourceFolder(t *testing.T) {
 }
 
 func TestR14NestedRestoreUsesOriginalSourceFolders(t *testing.T) {
+	runParallel(t)
 	dir := t.TempDir()
 	store, err := storage.NewSQLiteStore(filepath.Join(t.TempDir(), "nested-source-folders.db"))
 	if err != nil {
@@ -165,6 +167,7 @@ func TestR14NestedRestoreUsesOriginalSourceFolders(t *testing.T) {
 }
 
 func TestR12RestoreSkipsLeafFolderWhenMergedFolderHasRecording(t *testing.T) {
+	runParallel(t)
 	dir := t.TempDir()
 	store, err := storage.NewSQLiteStore(filepath.Join(t.TempDir(), "source-folder-skip.db"))
 	if err != nil {

@@ -737,6 +737,7 @@ func TestPausedMicIsNotReopenedAfterOverflow(t *testing.T) {
 // passes. The red confirmation is the gate's own (beforeMicStart, the unit's
 // recording light); each one is a "red" event among the device's calls.
 func TestARestartRaceOpensTheMicOnlyUnderRed(t *testing.T) {
+	runParallel(t)
 	for _, refused := range []bool{true, false} {
 		t.Run(fmt.Sprintf("red refused %v", refused), func(t *testing.T) {
 			capture := newCaptureGate(nil, nil, nil)
@@ -1813,6 +1814,7 @@ func expectOnlySessionEnded(t *testing.T, store *storage.SQLiteStore, manager *s
 // Pause is called. The pause then ends that session once it has started, and
 // no other session opens.
 func TestPauseShutsTheGateWhileASessionStartWaits(t *testing.T) {
+	runParallel(t)
 	store, manager := storeSessions(t)
 	capture := newSessionCaptureGate(context.Background(), manager, fakePreroll{newCallLog()}, func() deepgramFinalizer { return nil }, time.Hour, testEndRetry, nopLogf)
 	recorded := &lockedBuffer{}
@@ -1854,6 +1856,7 @@ func TestPauseShutsTheGateWhileASessionStartWaits(t *testing.T) {
 // stalled, not paused or capturing, and the gate opens once the database is
 // free.
 func TestStuckDatabaseKeepsTheGateClosedAndReportsStalled(t *testing.T) {
+	runParallel(t)
 	for _, tc := range []struct {
 		name          string
 		startInFlight bool // the database is busy from before the session start, not only at its end
@@ -1966,6 +1969,7 @@ func speechFinal(t *testing.T, text string) *api.MessageResponse {
 // Once the end succeeds, the session is ended with its recording, the gate
 // opens, and speech after the resume starts a new session.
 func TestFailedSessionEndKeepsTheGateClosedUntilItSucceeds(t *testing.T) {
+	runParallel(t)
 	for _, tc := range []struct {
 		name string
 		fail func(t *testing.T, store *refusingStore, audioDir, id string) (restore func())
@@ -2043,6 +2047,7 @@ func TestFailedSessionEndKeepsTheGateClosedUntilItSucceeds(t *testing.T) {
 // and the gate opens onto no session: speech after the resume starts a new
 // one, never the session from before the pause.
 func TestPauseEndsASessionWhoseRecordingCannotBeSaved(t *testing.T) {
+	runParallel(t)
 	db, err := storage.NewSQLiteStore(filepath.Join(t.TempDir(), "ghost-wispr.db"))
 	if err != nil {
 		t.Fatalf("open store: %v", err)

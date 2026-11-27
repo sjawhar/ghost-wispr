@@ -172,6 +172,7 @@ func (m *stallingMic) expect(t *testing.T, want ...string) {
 // closed and the light went off with it, leads a recording that starts after
 // the microphone opens again under red.
 func TestAudioFromBeforeAMicStallNeverLeadsARecording(t *testing.T) {
+	runParallel(t)
 	r := newHeldAudioRig(t)
 	r.capture.audioStall = 300 * time.Millisecond
 	r.capture.finishMicStart() // the start arms the stall timer

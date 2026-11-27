@@ -45,6 +45,7 @@ func (s *foreverHeldAppendStore) AppendSegment(sessionID string, seg transcribe.
 // its end stretched over the downtime (GPT-6.1 Sol's probe at 8c38d80e).
 // The shutdown runs in a process of its own, which exits as the app does.
 func TestARecoveredSessionEndsWhenItsRecordingClosed(t *testing.T) {
+	runParallel(t)
 	type record struct {
 		ID           string
 		Before, Stop time.Time

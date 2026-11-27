@@ -63,23 +63,43 @@ func passIt(mu *sync.Mutex) {
 	mu.Unlock()
 }
 
-// crowd keeps the mixer runnable but not run for about d: sixteen goroutines
-// for each of Go's processors, computing until d is up, and the mixer
-// yielding to them over and over, each time to the back of the queue. It
-// leaves GOMAXPROCS alone: changing it stops the world under the trace.
-func crowd(d time.Duration) {
-	deadline := time.Now().Add(d)
+// crowd readies a crowd that keeps the mixer runnable but not run for about
+// d, once the stall it returns runs: sixteen goroutines for each of Go's
+// processors, computing until d is up, beside the mixer, which computes a
+// millisecond at a time and yields after each. With the crowd the mixer waits
+// behind it for a processor after each yield, runnable, for most of the
+// stall; with no crowd it computes nearly all of it, which the reader names
+// running, so its runnable time comes from the crowd. Two other mixers fail
+// one way or the other: one that yields at once in a loop has a turn mostly
+// runnable with no crowd at all, from its own scheduling; one that computes
+// without yielding holds a processor for Go's whole 10 ms slice each time,
+// and under load Linux took its thread away for long enough to make the turn
+// mostly running. The goroutines start here, before the trace, and wait for
+// the stall: started inside it, they were the mixer computing, 4,608 of them
+// on sami-devbox's 288 processors, and at a load of 400 a turn that failed
+// spent 94 of its 188 ms running. It leaves GOMAXPROCS alone: changing it
+// stops the world under the trace.
+func crowd(d time.Duration) (stall func()) {
+	start := make(chan struct{})
+	var deadline time.Time
 	var spinning sync.WaitGroup
 	for range 16 * runtime.GOMAXPROCS(0) {
 		spinning.Go(func() {
+			<-start
 			for time.Now().Before(deadline) {
 			}
 		})
 	}
-	for time.Now().Before(deadline) {
-		runtime.Gosched()
+	return func() {
+		deadline = time.Now().Add(d)
+		close(start)
+		for time.Now().Before(deadline) {
+			for end := time.Now().Add(time.Millisecond); time.Now().Before(end); {
+			}
+			runtime.Gosched()
+		}
+		spinning.Wait()
 	}
-	spinning.Wait()
 }
 
 // liveHeap is a heap that takes long to mark: eight arrays of a million
@@ -128,28 +148,36 @@ func TestReadNamesWhatHeldTheMixer(t *testing.T) {
 	for _, tc := range []struct {
 		name  string
 		stall func(mu *sync.Mutex)
+		// ready, when set, readies the stall before the trace starts, and
+		// returns it.
+		ready func() (stall func())
 		want  []string
 	}{
-		{"the lock held", func(mu *sync.Mutex) {
+		{name: "the lock held", stall: func(mu *sync.Mutex) {
 			locked := make(chan struct{})
 			go holdIt(mu, 150*time.Millisecond, locked)
 			<-locked // the next turn's take of the lock waits
-		}, []string{"the Output's lock", "holdIt"}},
-		{"the lock held, passed on by a waiter", func(mu *sync.Mutex) {
+		}, want: []string{"the Output's lock", "holdIt"}},
+		{name: "the lock held, passed on by a waiter", stall: func(mu *sync.Mutex) {
 			locked := make(chan struct{})
 			go holdIt(mu, 250*time.Millisecond, locked)
 			<-locked
 			go passIt(mu)
 			time.Sleep(20 * time.Millisecond) // passIt queues for the lock before the mixer does
-		}, []string{"the Output's lock", "passIt", "holdIt"}},
-		{"a sleep in the write", func(*sync.Mutex) { time.Sleep(150 * time.Millisecond) }, []string{"a sleep inside " + regionFault}},
-		{"no processor free", func(*sync.Mutex) { crowd(150 * time.Millisecond) }, []string{"runnable but not run", "inside " + regionFault}},
-		{"garbage collection", func(*sync.Mutex) { collect(150 * time.Millisecond) }, []string{"garbage collection", "inside " + regionFault, "the collector marked for"}},
+		}, want: []string{"the Output's lock", "passIt", "holdIt"}},
+		{name: "a sleep in the write", stall: func(*sync.Mutex) { time.Sleep(150 * time.Millisecond) }, want: []string{"a sleep inside " + regionFault}},
+		{name: "no processor free", ready: func() func() { return crowd(150 * time.Millisecond) }, want: []string{"runnable but not run", "inside " + regionFault}},
+		{name: "garbage collection", stall: func(*sync.Mutex) { collect(150 * time.Millisecond) }, want: []string{"garbage collection", "inside " + regionFault, "the collector marked for"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			liveHeap() // built before the stall, not in it
+			stall := tc.stall
+			if tc.ready != nil {
+				ready := tc.ready()
+				stall = func(*sync.Mutex) { ready() }
+			}
 			var mu sync.Mutex
-			buf := traced(t, func() { fakeMixer(&mu, func() { tc.stall(&mu) }) })
+			buf := traced(t, func() { fakeMixer(&mu, func() { stall(&mu) }) })
 			cycles, err := Read(buf, slow)
 			if err != nil {
 				t.Fatal(err)

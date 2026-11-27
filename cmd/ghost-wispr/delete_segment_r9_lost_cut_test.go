@@ -15,6 +15,7 @@ import (
 // its pre-cut copy, spliced again, checked against its stored post-cut hash,
 // and sent through the pending refinement path.
 func TestR9RecoversLostSplicedRecordingForPendingReplacement(t *testing.T) {
+	runParallel(t)
 	fixture := newR9MergedCutFixture(t)
 	after := []byte("recording C after cut")
 	refined := false

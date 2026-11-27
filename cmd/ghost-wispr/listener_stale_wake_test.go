@@ -224,6 +224,7 @@ func (r *staleRig) saved() string {
 // listening cannot tell from the old one. Control: with no change of state,
 // the same phrase resumes, so the rig hears it.
 func TestAPhraseFromAnEndedStretchResumesNothing(t *testing.T) {
+	runParallel(t)
 	for _, tc := range []struct {
 		name              string
 		holdRead, holdHit bool
@@ -286,6 +287,7 @@ func TestAPhraseFromAnEndedStretchResumesNothing(t *testing.T) {
 // followed it. Control: with no change of state, the failure closes the
 // microphone, since nothing listens.
 func TestAFailureFromAnEndedStretchClosesNothing(t *testing.T) {
+	runParallel(t)
 	t.Run("a close and a new stretch during the read", func(t *testing.T) {
 		r := startStaleRig(t, true, false, true)
 		r.held(t)
@@ -311,6 +313,7 @@ func TestAFailureFromAnEndedStretchClosesNothing(t *testing.T) {
 // itself can see that the stretch ended. Control: with no change during the
 // check, the same resume records.
 func TestAStretchThatEndsDuringTheLightCheckWins(t *testing.T) {
+	runParallel(t)
 	for _, detach := range []bool{true, false} {
 		t.Run(fmt.Sprintf("detach during the check %t", detach), func(t *testing.T) {
 			inCheck, releaseCheck := make(chan struct{}), make(chan struct{})

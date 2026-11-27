@@ -515,6 +515,7 @@ func TestPersistentControlsAnnounceHTTPAndPowerTransitions(t *testing.T) {
 }
 
 func TestSeedPausedStatePersistsBeforeTestInstanceStarts(t *testing.T) {
+	runParallel(t)
 	dbPath := filepath.Join(t.TempDir(), "ghost-wispr.db")
 	configPath := filepath.Join(t.TempDir(), "ghost-wispr.yaml")
 	if err := os.WriteFile(configPath, []byte("db_path: "+dbPath+"\n"), 0o600); err != nil {

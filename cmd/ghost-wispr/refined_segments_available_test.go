@@ -93,6 +93,7 @@ func startedRetry(t *testing.T, retried <-chan string, sessionID string, want bo
 // nowhere is refused with why; a failed or running refinement is refused and
 // starts nothing.
 func TestADeletionAnswersEachRefinementState(t *testing.T) {
+	runParallel(t)
 	runner, retried := refinementStatesRunner(t)
 	for _, tc := range []struct {
 		session string

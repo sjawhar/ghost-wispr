@@ -970,6 +970,7 @@ func TestARestoredBackupKeepsTheAudioRecordedSinceIt(t *testing.T) {
 // erases, which wait for a person. A raw recording the next pass erases, and
 // the one under way, are not counted.
 func TestKeptRawCensusTellsTheKindsApart(t *testing.T) {
+	runParallel(t)
 	store := openKeptStore(t)
 	audioDir := t.TempDir()
 	recorder := audio.NewRecorder(audioDir)

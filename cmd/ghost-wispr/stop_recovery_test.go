@@ -192,6 +192,7 @@ func retryWarning(warnings *warningsRegistry, id string) string {
 // refinement, which completes, and stops on time; the second retries nothing.
 // A completed refinement is left alone throughout.
 func TestARefinementAStopCutOffRunsAgainOnce(t *testing.T) {
+	runParallel(t)
 	dir := t.TempDir()
 	db := filepath.Join(dir, "resume.db")
 	store := openResumeStore(t, db)
@@ -321,6 +322,7 @@ func TestAStopDuringARetryEndsOnTimeAndTheRetryIsNotRunAgain(t *testing.T) {
 // it cancelled is still writing: the database closes after the stop, under
 // it. The retry's transcription takes 100 ms to give up once cancelled.
 func TestTheStopWaitsForARetryItCancels(t *testing.T) {
+	runParallel(t)
 	dir := t.TempDir()
 	store := openResumeStore(t, filepath.Join(dir, "cancel.db"))
 	const id = "20261120080131"
@@ -393,6 +395,7 @@ func (s *heldSummarizer) Summarize(ctx context.Context, _, _ string) (string, st
 // cut off is recorded failed, or not left for the next start's backfill, or if
 // a session end after the stop starts a summary.
 func TestTheStopWaitsForASessionEndsSummary(t *testing.T) {
+	runParallel(t)
 	dir := t.TempDir()
 	store := openResumeStore(t, filepath.Join(dir, "summary.db"))
 	summarizer := &heldSummarizer{entered: make(chan struct{}), stall: 100 * time.Millisecond}
@@ -737,6 +740,7 @@ func TestAutomaticRefinementRetryCrashChild(t *testing.T) {
 // Retry's warning and runs nothing, and so does every start after it, until a
 // person's Retry runs it.
 func TestAnAutomaticRetryThatCrashesTheProcessRunsOnce(t *testing.T) {
+	runParallel(t)
 	dir := t.TempDir()
 	db := filepath.Join(dir, "restart.db")
 	store := openResumeStore(t, db)
@@ -810,6 +814,7 @@ func TestAnAutomaticRetryThatCrashesTheProcessRunsOnce(t *testing.T) {
 // reached: they must run at the next start. The retry the stop cut off is not
 // run again on its own.
 func TestAStopDuringTheStartsRetriesKeepsTheRest(t *testing.T) {
+	runParallel(t)
 	dir := t.TempDir()
 	db := filepath.Join(dir, "queue.db")
 	store := openResumeStore(t, db)
@@ -867,6 +872,7 @@ func TestAStopDuringTheStartsRetriesKeepsTheRest(t *testing.T) {
 // automatic retry refines a session deleted since the stop, or brings back a
 // segment deleted since; a session kept is the control, and is refined.
 func TestTheStartsRetriesSkipDeletedSessionsAndSegments(t *testing.T) {
+	runParallel(t)
 	dir := t.TempDir()
 	db := filepath.Join(dir, "privacy.db")
 	store := openResumeStore(t, db)
@@ -915,6 +921,7 @@ func TestTheStartsRetriesSkipDeletedSessionsAndSegments(t *testing.T) {
 // the transcriber hears them again, and the stored transcript must not have
 // them. Without the deletion, the control keeps them.
 func TestTheStartsRetryKeepsATextDeletion(t *testing.T) {
+	runParallel(t)
 	for _, deleteText := range []bool{false, true} {
 		t.Run(map[bool]string{false: "control", true: "deleted"}[deleteText], func(t *testing.T) {
 			dir := t.TempDir()
@@ -972,6 +979,7 @@ func TestTheStartsRetryKeepsATextDeletion(t *testing.T) {
 // it, it must end the retry the same way. The real merge of a session without
 // a recording and one with; the control, not deleted from, is retried.
 func TestADeletionWhileARetryIsOwedCancelsIt(t *testing.T) {
+	runParallel(t)
 	for _, mode := range []string{"control-not-deleted", "deleted-while-running", "deleted-while-owed"} {
 		t.Run(mode, func(t *testing.T) {
 			dir := t.TempDir()
@@ -1028,6 +1036,7 @@ func TestADeletionWhileARetryIsOwedCancelsIt(t *testing.T) {
 // action restores the recording from Drive and runs it, as a pressed Retry
 // does. The control keeps its recording.
 func TestAnOwedRetryRunsAfterGCTookTheRecording(t *testing.T) {
+	runParallel(t)
 	for _, collected := range []bool{false, true} {
 		t.Run(map[bool]string{false: "control-recording-kept", true: "recording-taken"}[collected], func(t *testing.T) {
 			dir := t.TempDir()

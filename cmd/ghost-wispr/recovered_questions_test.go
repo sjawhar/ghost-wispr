@@ -11,6 +11,7 @@ import (
 // recovery ends keeps a question working: its late answer would then be
 // announced in a later meeting.
 func TestARecoveredSessionsQuestionsAreCancelled(t *testing.T) {
+	runParallel(t)
 	store := conciergeStore(t)
 	at := time.Date(2026, 11, 19, 9, 0, 0, 0, time.UTC)
 	for _, id := range []string{"recovered", "other"} {

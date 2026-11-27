@@ -11,6 +11,7 @@ import (
 // downloaded pre-cut recording at its real path before the checked re-splice
 // result atomically replaces it.
 func TestR10LostCutKeepsPrecutBytesOffTheRecordingPath(t *testing.T) {
+	runParallel(t)
 	fixture := newR9MergedCutFixture(t)
 	precut := []byte("recording C before cut")
 	after := []byte("recording C after cut")

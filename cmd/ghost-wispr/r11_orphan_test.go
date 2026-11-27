@@ -32,6 +32,7 @@ func (d *failLaterDownloadDrive) DownloadRecording(_ context.Context, _ string, 
 // TestR11RefusedRestoreRemovesDownloads fails if a rejected subset leaves
 // recordings on the unit after the session keeps its empty audio path.
 func TestR11RefusedRestoreRemovesDownloads(t *testing.T) {
+	runParallel(t)
 	dir := t.TempDir()
 	store, session, names := r9MergedRestoreSession(t, "")
 	if _, err := store.DB().Exec(`UPDATE sessions SET gdrive_folder_id = 'folder', sync_status = ?, sync_state = ? WHERE id = 'merged'`, storage.SyncSynced, storage.SyncStateSynced); err != nil {

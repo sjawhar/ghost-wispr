@@ -135,6 +135,7 @@ func TestR9DeleteAudioDoesNotRestorePrecutMergedRecording(t *testing.T) {
 // recovery downloads an owed recording's pre-cut Drive copy while recovering a
 // different recording in the same merged session.
 func TestR9PendingSpliceDoesNotRestorePrecutMergedRecording(t *testing.T) {
+	runParallel(t)
 	fixture := newR9MergedCutFixture(t)
 	aBefore, err := fileSHA256(fixture.audioA)
 	if err != nil {

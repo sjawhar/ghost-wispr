@@ -42,6 +42,7 @@ func (alphaOnlyModel) CompleteJSON(_ context.Context, messages []llm.Message, _ 
 // the session keeps with the reason it stored in summary_error. Without
 // them the page shows a new summary, or why one failed, only after a reload.
 func TestABacklogSummaryReachesThePage(t *testing.T) {
+	runParallel(t)
 	cfg := config.Config{
 		Providers:    map[string]config.Provider{"fake": {API: config.APIOpenAI, Auth: config.ProviderAuth{Kind: config.AuthAPIKey, Env: "EXAMPLE_KEY"}}},
 		ProviderKeys: map[string]string{"EXAMPLE_KEY": "k-1"},

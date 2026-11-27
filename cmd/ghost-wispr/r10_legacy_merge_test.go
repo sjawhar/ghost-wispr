@@ -13,6 +13,7 @@ import (
 // TestR10OldMergeSubsetRestoreKeepsMarker confirms that a database
 // without recording_sources refuses rather than guessing its recordings.
 func TestR10OldMergeSubsetRestoreKeepsMarker(t *testing.T) {
+	runParallel(t)
 	dir := t.TempDir()
 	store, session, names := r9MergedRestoreSession(t, "")
 	if _, err := store.DB().Exec(`DELETE FROM recording_sources`); err != nil {
@@ -46,6 +47,7 @@ func TestR10OldMergeSubsetRestoreKeepsMarker(t *testing.T) {
 // provenance is discarded. A source recording need not use its session
 // identifier as its basename.
 func TestR10RecordingSourcesPrecedeLegacyNames(t *testing.T) {
+	runParallel(t)
 	store, err := storage.NewSQLiteStore(filepath.Join(t.TempDir(), "source-names.db"))
 	if err != nil {
 		t.Fatal(err)

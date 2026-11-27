@@ -18,6 +18,7 @@ import (
 // removes m2's audio. m3 = merge(m2, D). Retrying m3 must restore A and B
 // from folder-m2, two merges above them.
 func TestReviewR19FolderTwoLevelsUp(t *testing.T) {
+	runParallel(t)
 	dir := t.TempDir()
 	store, err := storage.NewSQLiteStore(filepath.Join(t.TempDir(), "f.db"))
 	if err != nil {

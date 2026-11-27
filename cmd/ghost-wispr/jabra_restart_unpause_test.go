@@ -38,6 +38,7 @@ import (
 // after the close must leave the unit paused; a person's tap after that must
 // still resume it.
 func TestAPausedUnitStaysPausedWhenTheJabraReportsMuteOnItsOwn(t *testing.T) {
+	runParallel(t)
 	rig := newJabraRig(true) // the unit starts paused, as restorePause leaves it
 	rig.openMic(t)           // a microphone stream is open on the Jabra as the button connects
 	rig.start(t)

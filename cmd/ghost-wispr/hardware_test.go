@@ -160,6 +160,7 @@ func TestLightFollowsTheGateAndTheMic(t *testing.T) {
 // TestTapTogglesAndPersists fails if hardware control bypasses the same
 // durable controls used by the HTTP pause and resume routes.
 func TestTapTogglesAndPersists(t *testing.T) {
+	runParallel(t)
 	store, err := storage.NewSQLiteStore(t.TempDir() + "/state.db")
 	if err != nil {
 		t.Fatal(err)
@@ -658,6 +659,7 @@ func TestMicStatusEventKeepsRedHold(t *testing.T) {
 // TestResumeRequiresRedBeforeOpeningCapture fails if a resume can open capture
 // after the light refuses its red confirmation.
 func TestResumeRequiresRedBeforeOpeningCapture(t *testing.T) {
+	runParallel(t)
 	store, err := storage.NewSQLiteStore(t.TempDir() + "/state.db")
 	if err != nil {
 		t.Fatal(err)

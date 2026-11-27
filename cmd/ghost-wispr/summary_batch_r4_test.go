@@ -69,6 +69,7 @@ func r4BatchState(t *testing.T, store *storage.SQLiteStore, batchName, sessionID
 }
 
 func TestR4FailedBatchMarksEverySessionFailed(t *testing.T) {
+	runParallel(t)
 	store, _, batchName, _ := r4BatchStore(t, "a", "b")
 	_, failed, err := applySummaryBatchResults(store, nil, nil, batchName, nil)
 	if err != nil || failed != 2 {
@@ -83,6 +84,7 @@ func TestR4FailedBatchMarksEverySessionFailed(t *testing.T) {
 }
 
 func TestR4PartialBatchMarksUnreturnedSessionFailed(t *testing.T) {
+	runParallel(t)
 	store, _, batchName, _ := r4BatchStore(t, "a", "b")
 	succeeded, failed, err := applySummaryBatchResults(store, nil, nil, batchName, []summary.BatchResult{{SessionID: "a", Title: "A", Summary: "A summary", PresetName: "default", SpeakerNames: "{}"}})
 	if err != nil || succeeded != 1 || failed != 1 {
@@ -97,6 +99,7 @@ func TestR4PartialBatchMarksUnreturnedSessionFailed(t *testing.T) {
 }
 
 func TestR4BatchStatesSurviveRestartBeforePoll(t *testing.T) {
+	runParallel(t)
 	store, path, batchName, _ := r4BatchStore(t, "a")
 	if err := store.Close(); err != nil {
 		t.Fatal(err)
@@ -115,6 +118,7 @@ func TestR4BatchStatesSurviveRestartBeforePoll(t *testing.T) {
 }
 
 func TestR4BatchSubmitReadRefusesDeleteBetweenReadAndSubmit(t *testing.T) {
+	runParallel(t)
 	store, _, _, _ := r4BatchStore(t, "a")
 	sessions, generations, _, err := readBatchSummarySessions(store, []string{"a"})
 	if err != nil || len(sessions) != 1 || sessions[0].Transcript == "" {
@@ -136,6 +140,7 @@ func TestR4BatchSubmitReadRefusesDeleteBetweenReadAndSubmit(t *testing.T) {
 }
 
 func TestR4StaleBatchResultIsNotBroadcast(t *testing.T) {
+	runParallel(t)
 	store, _, batchName, _ := r4BatchStore(t, "a")
 	segments, err := store.GetSegments("a")
 	if err != nil {
@@ -164,6 +169,7 @@ func TestR4StaleBatchResultIsNotBroadcast(t *testing.T) {
 // TestBatchResultStoresTheModelItReports fails if a batch summary stored at
 // its submitted generation drops the model the provider reported for it.
 func TestBatchResultStoresTheModelItReports(t *testing.T) {
+	runParallel(t)
 	store, _, batchName, _ := r4BatchStore(t, "a")
 	succeeded, _, err := applySummaryBatchResults(store, nil, nil, batchName, []summary.BatchResult{{SessionID: "a", Title: "A", Summary: "A summary", PresetName: "default", SpeakerNames: "{}", Model: "provider-batch-model"}})
 	if err != nil || succeeded != 1 {

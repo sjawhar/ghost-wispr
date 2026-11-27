@@ -114,6 +114,7 @@ func (noCutsGuard) RefinementRecordingSources(string) ([]storage.RefinementRecor
 // "Delete text and audio" with no transcription to check each cut, or with
 // any other dependency missing: the runner is refused when it is built.
 func TestADeleteRunnerWithoutACutCheckDoesNotStart(t *testing.T) {
+	runParallel(t)
 	store, err := storage.NewSQLiteStore(filepath.Join(t.TempDir(), "runner.db"))
 	if err != nil {
 		t.Fatal(err)

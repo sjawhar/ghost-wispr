@@ -403,6 +403,7 @@ func TestAFailedResumeCheckDoesNotSayPausedWhileRecording(t *testing.T) {
 // recording unit (red team, review 5967147417 of #79). Controls: the Jabra
 // itself unmutes, and an unmute elsewhere with no own report before it.
 func TestAJabraMuteAfterAResumeElsewherePauses(t *testing.T) {
+	runParallel(t)
 	for _, tc := range []struct {
 		name         string
 		ownReport    bool
@@ -490,6 +491,7 @@ func (r *countingToggleRig) press(t *testing.T) {
 // resume and paused the paused unit instead (review 5967147417 of #79).
 // Control: after a resume that worked, the next press pauses.
 func TestAButtonPressAfterARefusedResumeTriesAgain(t *testing.T) {
+	runParallel(t)
 	for _, tc := range []struct {
 		name    string
 		refuse  func(r *countingToggleRig)
