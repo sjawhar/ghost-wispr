@@ -155,6 +155,11 @@ type Transcript struct {
 	GateOpen     bool      // the capture gate was open when it arrived
 	At           time.Time // when the unit's transcript callback began handling it, before the session manager's work on it
 	Mono         int64     // CLOCK_MONOTONIC read with At (monoclock), for the timing log
+	// From is when the result's audio began, by capture: Deepgram's start of
+	// the result, which an interim and the final that replaces it share
+	// while their first words can move (Sol's twenty-eighth review of #191);
+	// zero when the stream gave no capture time.
+	From time.Time
 }
 
 // Word is one word of a Transcript, with Deepgram's speaker label and its
@@ -407,21 +412,24 @@ type exchange struct {
 	cancel context.CancelFunc
 	// authority is ctx as an exchangeContext, which bindMeetingLocked binds
 	// to the recorder's meeting; nil for an exchange made otherwise.
-	authority    *exchangeContext
-	x            Exchange
-	session      Session
-	opened       chan struct{} // closed once Open returned, or failed
-	drives       bool          // the voice drives its own turn
-	answering    bool          // the turn went to the Concierge (or a held answer is spoken)
-	answer       *pendingAnswer
-	wakeStart    float64 // the wake word's start on the socket; later results of its utterance repeat it
-	wakeAt       time.Time
-	turn         []string  // final words of the asker's turn
-	turnSeqs     []uint64  // each final's entry in the room's recent words, 0 for none
-	replySeqs    []uint64  // the same for ex.reply
-	interim      string    // the turn's words not final yet
-	interimFrom  time.Time // when the interim's first word was said, by capture; zero untimed
-	roomRevision uint64    // each new final: a fresh RoomView (Exchange.Room)
+	authority   *exchangeContext
+	x           Exchange
+	session     Session
+	opened      chan struct{} // closed once Open returned, or failed
+	drives      bool          // the voice drives its own turn
+	answering   bool          // the turn went to the Concierge (or a held answer is spoken)
+	answer      *pendingAnswer
+	wakeStart   float64 // the wake word's start on the socket; later results of its utterance repeat it
+	wakeAt      time.Time
+	turn        []string  // final words of the asker's turn
+	turnSeqs    []uint64  // each final's entry in the room's recent words, 0 for none
+	replySeqs   []uint64  // the same for ex.reply
+	interim     string    // the turn's words not final yet
+	interimFrom time.Time // when the interim's result began, by capture (Transcript.startOf); zero untimed
+	// interimByResult: interimFrom is the result's own start, not its first
+	// word's.
+	interimByResult bool
+	roomRevision    uint64 // each new final: a fresh RoomView (Exchange.Room)
 	// owned holds the exchange's finals, every turn's, in order, as its
 	// requests own them (Exchange.Room's Request, Exchange.Claim). A new
 	// turn keeps them: a turn's words no request asked stay pending
@@ -1122,22 +1130,38 @@ func (ex *exchange) endsTurn(end time.Time) bool {
 }
 
 // sameResult is how far apart, by capture, two results' first words may
-// start and still be one result of Deepgram's: an interim and the final
-// that replaces it share the result's start.
+// start and still be taken for one result of Deepgram's, when a result
+// carries no start of its own (Transcript.From): an interim and the final
+// that replaces it share the result's start, but their first words can move
+// (Sol's twenty-eighth review of #191), so first words stand in for it only
+// where nothing else does.
 const sameResult = time.Millisecond
 
+// startOf is when t's result began, by capture: its own start (From), and
+// byResult, or else its first word's capture time; zero when untimed.
+func (t *Transcript) startOf() (at time.Time, byResult bool) {
+	if !t.From.IsZero() {
+		return t.From, true
+	}
+	if len(t.Words) > 0 {
+		return t.Words[0].At, false
+	}
+	return time.Time{}, false
+}
+
 // supersedes reports whether t, a final, replaces the words now pending in
-// ex's turn: the pending interim, when t starts where it started
-// (sameResult), even if t is shorter, as a correction that drops words is
-// ("Wispr, send these notes" finalized as "Whisper. No. Wait,"); else, as
-// endpoints are placed, when no word of the turn began after t ended
-// (endsTurn). A final that ended before the pending words began is older,
-// sent late, and replaces nothing. Untimed results, whose words carry no
-// capture time, are placed by arrival, as before (Sol's twenty-seventh
-// review of #191).
+// ex's turn: the pending interim, when t is the same result, even if it is
+// shorter, as a correction that drops words is ("Wispr, send these notes"
+// finalized as "Whisper. No. Wait,"); else, as endpoints are placed, when no
+// word of the turn began after t ended (endsTurn). Results are the same when
+// their starts are equal, or, with no result start, when their first words
+// start within sameResult. A final that ended before the pending words began
+// is older, sent late, and replaces nothing. Untimed results, whose words
+// carry no capture time, are placed by arrival, as before (Sol's
+// twenty-seventh and twenty-eighth reviews of #191).
 func (ex *exchange) supersedes(t *Transcript) bool {
-	if ex.interim != "" && !ex.interimFrom.IsZero() && len(t.Words) > 0 && !t.Words[0].At.IsZero() {
-		if t.Words[0].At.Sub(ex.interimFrom).Abs() <= sameResult {
+	if from, byResult := t.startOf(); ex.interim != "" && !ex.interimFrom.IsZero() && !from.IsZero() && byResult == ex.interimByResult {
+		if byResult && from.Equal(ex.interimFrom) || !byResult && from.Sub(ex.interimFrom).Abs() <= sameResult {
 			return true
 		}
 	}
@@ -1150,6 +1174,13 @@ func (ex *exchange) supersedes(t *Transcript) bool {
 // untimed interim is placed by nothing, so no call is older than it.
 func (ex *exchange) olderThanInterim(t *Transcript) bool {
 	return ex.interim != "" && !ex.interimFrom.IsZero() && !t.endsAt().After(ex.interimFrom)
+}
+
+// calledBefore reports whether t's call was said before the call ex now
+// answers, by capture: another, older call, not this call's own result.
+func (ex *exchange) calledBefore(t *Transcript, m transcript.Match) bool {
+	said := wakeSaidAt(t, m)
+	return !said.IsZero() && !ex.wakeSaid.IsZero() && said.Before(ex.wakeSaid)
 }
 
 // OnTranscript reads one Deepgram result: the wake phrase, the asker's turn,
@@ -1267,29 +1298,41 @@ func (s *Supervisor) onTranscriptLocked(t *Transcript) {
 				s.bargeInLocked(ex, t, now)
 				break
 			}
-			// A call that ended at or before the pending interim began
-			// ("Wispr, check the budget" at 5 s, sent after "Can you send
-			// these notes?" at 10 s) is older than the turn now heard: it
-			// begins no new turn and resets nothing, and its words join the
-			// turn as the final they are, before the newer interim (Sol's
-			// twenty-seventh review of #191).
-			if !ex.olderThanInterim(t) {
+			older := ex.olderThanInterim(t)
+			if older && ex.calledBefore(t, m) {
+				// Another call, said before the call the exchange now hears
+				// and sent after that call's interim ("Wispr, what is the
+				// budget?" at 2 s, after "Wispr, can you send these notes?"
+				// at 10 s): it stands apart. The later call is the turn, and
+				// the older call's words are the room's history only (Sol's
+				// twenty-eighth review of #191).
+				s.bargeInLocked(ex, t, now)
+				break
+			}
+			// A call that ended at or before the pending interim began, the
+			// call of words heard first ("Wispr, send these notes to Raj."
+			// sent after its continuation "and to Lee."), resets nothing:
+			// its words join the turn as the final they are, before the
+			// interim (Sol's twenty-seventh review of #191). It is a call all
+			// the same, so the turn is by name and no follow-up's (Sol's
+			// twenty-eighth).
+			if !older {
 				if from, ok := ex.answeredUnheard(t); stale && ok {
 					ex.turnFrom = from // the voice answered this call before its result came
 				}
-				ex.wakeStart, ex.wakeSaid = wakeStart(t, m), wakeSaidAt(t, m)
 				ex.turn, ex.interim, ex.turnFinal, ex.uttered, ex.heardTo, ex.reply = nil, "", false, false, time.Time{}, nil
-				ex.followUpTurn, ex.turnByName = false, true // a call, with the wake phrase
-				// A call ends the misheard-name hold: it addresses Wispr by
-				// name, so its continuation ("Wispr, send these notes", "to
-				// Raj.") is its turn without the hold's question gate, and
-				// the hold's expiry, if already queued, ends nothing (Sol's
-				// twenty-fourth review of #191).
-				s.endHoldLocked(ex)
-				if !stale {
-					ex.x.Turn++ // a new call; a late result keeps the turn it completes
-					s.roomChangedLocked(ex)
-				}
+			}
+			ex.wakeStart, ex.wakeSaid = wakeStart(t, m), wakeSaidAt(t, m)
+			ex.followUpTurn, ex.turnByName = false, true // a call, with the wake phrase
+			// A call ends the misheard-name hold: it addresses Wispr by name,
+			// so its continuation ("Wispr, send these notes", "to Raj.") is
+			// its turn without the hold's question gate, and the hold's
+			// expiry, if already queued, ends nothing (Sol's twenty-fourth
+			// review of #191).
+			s.endHoldLocked(ex)
+			if !stale && !older {
+				ex.x.Turn++ // a new call; a late result keeps the turn it completes
+				s.roomChangedLocked(ex)
 			}
 			cut := false
 			if ex.drives {
@@ -2063,10 +2106,8 @@ func (s *Supervisor) turnLocked(ex *exchange, t *Transcript, words string) {
 			}
 		}
 	} else {
-		ex.interim, ex.interimFrom = words, time.Time{}
-		if len(t.Words) > 0 {
-			ex.interimFrom = t.Words[0].At
-		}
+		ex.interim = words
+		ex.interimFrom, ex.interimByResult = t.startOf()
 	}
 	// The recording session starts when Deepgram's first speech_final or
 	// UtteranceEnd flushes its finals, often after the wake: the exchange

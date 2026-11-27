@@ -519,6 +519,14 @@ func voiceTranscript(mr *api.MessageResponse, at monoclock.Stamp, stamp func() (
 	if stamp != nil {
 		t.Closings, t.GateOpen = stamp()
 	}
+	if heardAt != nil {
+		// The result's own start, which an interim and the final that
+		// replaces it share while their first words can move: the voice
+		// tells which interim a final replaces by it.
+		if at, ok := heardAt(time.Duration(math.Round(mr.Start * float64(time.Second)))); ok {
+			t.From = at
+		}
+	}
 	for i := range alt.Words {
 		w := &alt.Words[i]
 		speaker := -1

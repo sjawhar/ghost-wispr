@@ -9,7 +9,10 @@
 //     overlap_contains_newer_question and missing_capture_times, which withdraw the
 //     question at the baseline too, by the inclusive span rule of endpoints or, with
 //     no capture times, by arrival; Main kept those outcomes.
-// Every other row and check is Sol's.
+// Every other row and check is Sol's. Since Sol's twenty-eighth review,
+// r27Hear also gives each result its own start (Transcript.From) where its
+// first word starts, as the live stream does; Sol's first-word-only results
+// stay covered by TestAFirstWordStandsInForAMissingResultStart.
 
 package voice
 
@@ -28,6 +31,7 @@ func r27Hear(r *rig, captured time.Time, text string, start float64, final, endp
 		tr.Words[i].Speaker = speaker
 		tr.Words[i].At = captured.Add(time.Duration(tr.Words[i].Start * float64(time.Second)))
 	}
+	tr.From = captured.Add(time.Duration(start * float64(time.Second)))
 	r.s.OnTranscript(&tr)
 	return tr
 }
