@@ -11,9 +11,10 @@
 # the Google credential files from pi.env where they are missing and only compares them where they
 # exist; installs the bootstrap files and the release's update.sh, pi-lib.sh and pi.env before it
 # starts the nightly update, once and through systemd; writes no .env and installs no system file
-# itself; applies serve.conf and turns off each other Serve port; and joins the tailnet with the
-# client id and the subject of pi.env, in a join command that holds each Serve call as text and
-# reads no file of the release's directory. The detached join accepts the tailnet's subnet routes
+# itself; makes Serve serve.conf's for the device's name, with tailscale serve reset when it is not;
+# and joins the tailnet with the client id and the subject of pi.env, in a join command that resets
+# Serve, holds each Serve call as text and reads no file of the release's directory. The detached
+# join accepts the tailnet's subnet routes
 # only when the route check that provision.sh installs beside the token finds that no peer's route
 # overlaps a network of the Pi; the check runs alone on the Pi's networks and on tailnet statuses of
 # each kind. It also runs provision.sh --key, --certificate and --models. The fakes are no Pi, so a

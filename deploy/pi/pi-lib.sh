@@ -226,21 +226,33 @@ serve_conf_lines() {
   fi
 }
 
-# serve_lines_from_status JSON prints the Serve setting that JSON, the answer of
+# device_tailnet_name STATUS prints the device's tailnet name that STATUS, the answer of
+# `tailscale status --self --json`, gives as Self.DNSName, without its final dot. It fails on an
+# answer it cannot read and on a name that is empty or not a DNS name.
+device_tailnet_name() {
+  jq -er '.Self.DNSName | strings | select(test("^[A-Za-z0-9-]+(\\.[A-Za-z0-9-]+)*\\.$")) | rtrimstr(".")' \
+    <<<"$1" 2>/dev/null
+}
+
+# serve_lines_from_status JSON NAME prints the Serve setting that JSON, the answer of
 # `tailscale serve status --json` (tailscale's ipn.ServeConfig), holds: one line for each handler of
-# each HTTPS port, sorted. A proxy at / prints as serve_conf_lines prints a line of serve.conf,
-# "<port> <proxy target>". Each other handler (files, a text, a redirect, a proxy at another path,
-# or a proxy that forwards peer capabilities) prints as "<port> <path> <kind> <value>", the path and
-# the value as JSON strings: three fields or more, which no line of serve.conf equals. {} serves
-# nothing, and prints nothing. It fails on an empty answer, on one that is not one JSON object, and
-# on a Serve of a shape it does not know: a key, a port, a handler or a value of another type, a
-# Web entry on a port that serves no HTTPS, an HTTPS port with no handler, a TCP forward or plain
-# HTTP, Funnel, a service or a foreground Serve. So a caller can tell a Serve it cannot read from one
-# that matches serve.conf, and never reads a part it does not know as a match.
+# each HTTPS port, sorted. NAME is the device's tailnet name (device_tailnet_name). A proxy at / of
+# NAME prints as serve_conf_lines prints a line of serve.conf, "<port> <proxy target>". Each other
+# handler (files, a text, a redirect, a proxy at another path, or a proxy that forwards peer
+# capabilities) prints as "<port> <path> <kind> <value>", the path and the value as JSON strings:
+# three fields or more, which no line of serve.conf equals. A Web entry of another name than NAME,
+# such as the one a device renamed after its Serve was set keeps under its name before, prints each
+# of its lines with " on <name>" after it, so that it differs from serve.conf and names the name,
+# and never reads as a second line of NAME's port. {} serves nothing, and prints nothing. It fails
+# on an empty answer or NAME, on one that is not one JSON object, and on a Serve of a shape it does
+# not know: a key, a port, a handler or a value of another type, a Web entry on a port that serves
+# no HTTPS, an HTTPS port with no handler, a TCP forward or plain HTTP, Funnel, a service or a
+# foreground Serve. So a caller can tell a Serve it cannot read from one that matches serve.conf,
+# and never reads a part it does not know as a match.
 serve_lines_from_status() {
   local pl_lines
-  [[ -n $1 ]] || return 1
-  pl_lines=$(jq -rs '
+  [[ -n $1 && -n ${2:-} ]] || return 1
+  pl_lines=$(jq -rs --arg name "$2" '
     def check(cond; why): if cond then . else error(why) end;
     def kinds: "Path", "Proxy", "Text", "Redirect";
     check(length == 1; "not one JSON value") | .[0]
@@ -254,7 +266,8 @@ serve_lines_from_status() {
         "a TCP port that does not serve HTTPS")
     | [$web | to_entries[]
         | check(.key | test("^[^:]+:[1-9][0-9]{0,4}$"); "a Web key that is not <host>:<port>")
-        | (.key | split(":")[1]) as $port
+        | (.key | split(":")) as [$host, $port]
+        | (if $host == $name then "" else " on \($host)" end) as $on
         | check($tcp | has($port); "a Web entry on a port that serves no HTTPS")
         | check(.value | type == "object" and keys == ["Handlers"] and (.Handlers | type == "object" and length > 0);
             "a Web entry that is not a set of handlers")
@@ -271,7 +284,8 @@ serve_lines_from_status() {
           then "\($port) \(.value)"
           else "\($port) \($path | @json) \(.key | ascii_downcase) \(.value | @json)"
             + if $handler.AcceptAppCaps == null then "" else " accept-app-caps \($handler.AcceptAppCaps | @json)" end
-          end]
+          end
+        | . + $on]
     | check(all($tcp | keys[]; . as $port | any($web | keys[]; endswith(":" + $port))); "an HTTPS port with no handler")
     | .[]' <<<"$1" 2>/dev/null) || return 1
   if [[ -n $pl_lines ]]; then

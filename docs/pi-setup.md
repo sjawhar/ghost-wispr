@@ -281,21 +281,29 @@ restarts the recorder, and a restart ends a conversation that is being recorded.
      run installs the release's whole deploy set and reads the Pi's secrets ("Update and inspect").
      `provision.sh` prints the run's journal lines, and stops when the run failed;
    - enables `ghost-wispr.service`;
-   - applies each line of the release's `serve.conf` with `tailscale serve --bg --https`. It turns
-     off each live Serve HTTPS port that `serve.conf` does not list, and each mount other than `/`
-     on a port that it lists. Then it reads Serve again, and stops before the join when Serve still
-     holds a part that `serve.conf` does not, such as a TCP forward or Funnel;
+   - makes Tailscale Serve exactly the release's `serve.conf` for the device's tailnet name now, as
+     `tailscale status --self --json` gives it. A Serve that is that already stays as it is. Any
+     other it clears with `tailscale serve reset`, Tailscale's documented way to clear Serve
+     ([tailscale serve](https://tailscale.com/kb/1242/tailscale-serve), "Reset Tailscale Serve"),
+     and then it applies each line of `serve.conf` with `tailscale serve --bg --https`. The reset
+     also clears the entry of a name the device had before a rename, which tailscaled keeps beside
+     the entry of its name now and which no `tailscale serve --https=<port> off` reaches, and a
+     port, a mount, a TCP forward or Funnel that `serve.conf` does not hold. From the reset until
+     the last line is applied, the page is not served, a moment that a page open in a browser shows
+     as a lost connection. Then it reads Serve again, and stops before the join when Serve is not
+     `serve.conf`'s;
    - starts the tagged tailnet join as a detached unit, with `PI_TAILNET_CLIENT_ID` and
      `PI_SERVICE_ACCOUNT_UNIQUE_ID`, or stops after "already joined" on a Pi that is joined as
      `tag:ghost-wispr` already.
 
    It ends with `already joined as tag:ghost-wispr`, or with the line that names the detached join
    unit it started. The SSH session can end while Tailscale re-authenticates (exit 255). The join
-   unit's command line holds each `tailscale serve` call of `serve.conf`, so the join reads no file
-   of the release directory. The join runs `tailscale up` with `--accept-routes=false`, so the Pi
-   joins with the tailnet's subnet routes off. Then it runs the route check of "Accept the tailnet's
-   subnet routes", and accepts the routes (`tailscale set --accept-routes`) only when no peer's
-   `PrimaryRoutes` overlaps a network of the Pi.
+   unit's command line holds `tailscale serve reset` and each `tailscale serve` call of
+   `serve.conf`, so the join reads no file of the release directory. The join runs `tailscale up`
+   with `--accept-routes=false`, so the Pi joins with the tailnet's subnet routes off. Then it runs
+   the route check of "Accept the tailnet's subnet routes", and accepts the routes
+   (`tailscale set --accept-routes`) only when no peer's `PrimaryRoutes` overlaps a network of the
+   Pi.
 6. On your own device, in a Ghost Wispr checkout, give the tagged device its name. The tagged join
    makes a new Tailscale device. The temporary device you joined as your own still holds the name
    `ghost-wispr`, so Tailscale names the tagged one `ghost-wispr-1`, and
@@ -1002,10 +1010,14 @@ A run of `update.sh`:
 7. After an install, or with the release current, compares the three provisioning files that the
    nightly update does not install (the launcher, `ghost-wispr-update.service` and
    `ghost-wispr-update.timer`) with the manifest, and the live Tailscale Serve setting with the
-   release's `serve.conf`. It prints one drift line for each difference:
+   release's `serve.conf`, for the device's tailnet name as `tailscale status --self --json` gives
+   it. A Serve entry of another name, such as the one tailscaled keeps under the device's name
+   before a rename, is a line `<port> <proxy target> on <name>`. It prints one drift line for each
+   difference:
    - `ghost-wispr update: provisioning file <name> differs from the release; run the release's provision.sh`
    - `ghost-wispr update: Serve differs from the release: want <lines>, have <lines>`
-   - `ghost-wispr update: Serve: UNKNOWN (<why>)`, when it cannot read or parse Serve's setting
+   - `ghost-wispr update: Serve: UNKNOWN (<why>)`, when it cannot read or parse Serve's setting, or
+     read the device's name
 
    A difference changes no exit code. Apply it with one run of the release's `provision.sh`
    ("Apply a provisioning change", below).

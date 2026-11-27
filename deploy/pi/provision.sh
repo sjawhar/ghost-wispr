@@ -299,62 +299,48 @@ compare_client_id() {
   fi
 }
 
-# live_serve_entries JSON prints what JSON, the answer of `tailscale serve status --json`
-# (tailscale's ipn.ServeConfig), serves over HTTPS: "port <port>" for each HTTPS port, a TCP entry
-# with HTTPS or a Web entry "<host>:<port>", and then "mount <port> <path>" for each handler of each
-# Web entry, the path as a JSON string. It fails on an answer that is not a JSON object.
-live_serve_entries() {
-  [[ -n $1 ]] || return 1
-  jq -r 'if type != "object" then error("not a ServeConfig") else
-      ([((.TCP // {}) | to_entries[] | select((.value | type) == "object" and .value.HTTPS == true) | .key),
-        ((.Web // {}) | keys[] | split(":") | last)] | unique[] | "port \(.)"),
-      ((.Web // {}) | to_entries[] | (.key | split(":") | last) as $port
-        | .value.Handlers | objects | keys[] | "mount \($port) \(@json)")
-    end' <<<"$1" 2>/dev/null
-}
-
-# apply_serve gives Tailscale Serve serve.conf's setting. It applies each line, which sets the mount /
-# of its port and keeps each other mount there (tailscale's SetWebHandler, ipn/serve.go, v1.104).
-# Then it turns off each live HTTPS port that serve.conf does not list, and each mount other than /
-# of a port that it lists. Last it reads Serve again, as the nightly drift check reads it (pi-lib.sh's
-# serve_lines_from_status), and fails unless that is serve.conf: a part it does not manage, such as
-# a TCP forward, would show as drift each night. The nightly update only compares Serve with the
-# release's serve.conf.
+# apply_serve makes Tailscale Serve exactly serve.conf's setting for this device's tailnet name, as
+# `tailscale status --self --json` gives it: the release owns Serve whole. A Serve that is that
+# already stays as it is. Any other it clears with `tailscale serve reset`, Tailscale's documented
+# way to clear the Serve setting (https://tailscale.com/kb/1242/tailscale-serve, "Reset Tailscale
+# Serve"), and then it applies each line. The reset also clears the Web entry of a name the device
+# had before a rename, which tailscaled keeps beside the entry of its name now and which no
+# `tailscale serve --https=PORT off` reaches, as those act on the device's name now; and a port, a
+# mount, a TCP forward or Funnel that serve.conf does not hold. From the reset until the last line
+# is applied, the page is not served: a page open in a browser loses its connection and makes it
+# again. Last it reads Serve again, as the nightly drift check reads it (pi-lib.sh's
+# serve_lines_from_status), and fails unless it is serve.conf's. It changes nothing in Serve when it
+# cannot read the device's name or Serve.
 apply_serve() {
-  local port target live entries kind rest mount have
+  local self name live have state port target
+  if ! self=$(tailscale status --self --json) || ! name=$(device_tailnet_name "$self"); then
+    fail "could not read this device's tailnet name (tailscale status --self --json), for which Serve must be serve.conf's: nothing in Serve was changed"
+  fi
+  live=$(sudo tailscale serve status --json) \
+    || fail "could not read Tailscale Serve's setting (tailscale serve status --json): nothing in Serve was changed"
+  if have=$(serve_lines_from_status "$live" "$name"); then
+    if [[ $have == "$serve_lines" ]]; then
+      printf "ghost-wispr provision: Tailscale Serve is serve.conf's already for %s\n" "$name"
+      return 0
+    fi
+    state=${have:-none}
+  else
+    state="a setting it cannot read, such as a TCP forward or Funnel"
+  fi
+  printf "ghost-wispr provision: Tailscale Serve for %s is [%s], not serve.conf's: resetting it (tailscale serve reset) and applying serve.conf; the page is not served until the last line is applied\n" \
+    "$name" "$(paste -sd ';' <<<"$state")"
+  sudo tailscale serve reset </dev/null \
+    || fail "tailscale serve reset failed, so Serve may be cleared in part: run provision.sh again"
   while read -r port target; do
     if [[ -n $port ]]; then
-      sudo tailscale serve --bg --https "$port" "$target" </dev/null
+      sudo tailscale serve --bg --https "$port" "$target" </dev/null \
+        || fail "tailscale serve --bg --https $port $target failed after the reset of Serve, so the page may not be served: run provision.sh again"
     fi
   done <<<"$serve_lines"
   live=$(sudo tailscale serve status --json) \
-    || fail "could not read Tailscale Serve's setting (tailscale serve status --json), so the ports and mounts that serve.conf does not list may still be served"
-  entries=$(live_serve_entries "$live") \
-    || fail "tailscale serve status --json gave no Serve setting that provision.sh can read, so the ports and mounts that serve.conf does not list may still be served"
-  while read -r kind port rest; do
-    case $kind in
-      port)
-        if ! grep -q "^$port " <<<"$serve_lines"; then
-          sudo tailscale serve --https="$port" off </dev/null
-          printf 'ghost-wispr provision: turned off Serve port %s, which serve.conf does not list\n' "$port"
-        fi
-        ;;
-      mount)
-        # A port that serve.conf does not list went whole above.
-        grep -q "^$port " <<<"$serve_lines" || continue
-        mount=$(jq -r . <<<"$rest") || fail "cannot read the Serve mount $rest of port $port"
-        [[ $mount != / ]] || continue
-        [[ $mount == /* && $mount != *[[:cntrl:]]* ]] \
-          || fail "Tailscale Serve has the mount $rest on port $port, which provision.sh cannot name as it is: remove it (tailscale serve --https=$port --set-path=PATH off) and run provision.sh again"
-        sudo tailscale serve --https="$port" --set-path="$mount" off </dev/null
-        printf 'ghost-wispr provision: turned off the Serve mount %s of port %s, which serve.conf does not list\n' "$mount" "$port"
-        ;;
-    esac
-  done <<<"$entries"
-  live=$(sudo tailscale serve status --json) \
     || fail "could not read Tailscale Serve's setting (tailscale serve status --json) after provision.sh applied serve.conf"
-  have=$(serve_lines_from_status "$live") \
-    || fail "Tailscale Serve holds a part that provision.sh does not manage, such as a TCP forward or Funnel, so its setting is not serve.conf's: read it with tailscale serve status, remove that part, and run provision.sh again"
+  have=$(serve_lines_from_status "$live" "$name") \
+    || fail "Tailscale Serve holds a part that provision.sh cannot read after it reset Serve and applied serve.conf: read it with tailscale serve status"
   [[ $have == "$serve_lines" ]] \
     || fail "Tailscale Serve's setting is not serve.conf's after provision.sh applied it: want [$(paste -sd ';' <<<"$serve_lines")], have [$(paste -sd ';' <<<"$have")]"
 }
@@ -725,10 +711,12 @@ join_unit="ghost-wispr-tailnet-join-$(date +%s)"
 # `tailscale set --accept-routes` once it passed. The check runs even when Serve failed, as the
 # routes do not depend on Serve, and the unit ends failed when up, serve or set failed or the check
 # refused. Serve is set above for a node that is joined already, and again after the
-# re-authentication: the join can start a new login profile, which would not carry the setting over.
-# The command holds each line of serve.conf as a tailscale serve call: the join runs after P2's
-# command has removed the release's directory, so it reads no file of it.
-join_serve=''
+# re-authentication: the join can start a new login profile, which would not carry the setting over,
+# and a profile it keeps would keep the entries of the name the node had before. So the join resets
+# Serve first, as apply_serve does, and then applies each line of serve.conf as a tailscale serve
+# call: the join runs after P2's command has removed the release's directory, so it reads no file of
+# it.
+join_serve=" tailscale serve reset || rc=\$?;"
 while read -r port target; do
   if [[ -n $port ]]; then
     join_serve+=" tailscale serve --bg --https $port $target || rc=\$?;"

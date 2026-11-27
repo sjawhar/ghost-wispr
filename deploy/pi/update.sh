@@ -807,9 +807,10 @@ join_lines() {
 }
 
 # report_drift prints a line for each bootstrap file that is not the release's, and for a Serve
-# setting that is not the release's serve.conf (D4, R16). It changes nothing, and no exit code.
+# setting that is not the release's serve.conf for the device's tailnet name (D4, R16). It changes
+# nothing, and no exit code.
 report_drift() {
-  local names name want have serve
+  local names name want have serve self device
   if names=$(bootstrap_drift "$manifest_json" "$DEPLOY_DIR" "$UNIT_DIR"); then
     while IFS= read -r name; do
       if [[ -n $name ]]; then
@@ -827,7 +828,13 @@ report_drift() {
     printf 'ghost-wispr update: Serve: UNKNOWN (tailscale serve status --json failed or did not answer within 10 s)\n'
     return 0
   fi
-  if ! have=$(serve_lines_from_status "$serve"); then
+  # The device's name tells its own Web entries from those of another name, such as the one a
+  # rename leaves.
+  if ! self=$(timeout 10s tailscale status --self --json 2>/dev/null) || ! device=$(device_tailnet_name "$self"); then
+    printf "ghost-wispr update: Serve: UNKNOWN (tailscale status --self --json failed, did not answer within 10 s, or gave no DNSName, the device's name)\n"
+    return 0
+  fi
+  if ! have=$(serve_lines_from_status "$serve" "$device"); then
     printf 'ghost-wispr update: Serve: UNKNOWN (tailscale serve status --json gave no Serve setting it could read)\n'
     return 0
   fi

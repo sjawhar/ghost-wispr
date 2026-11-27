@@ -689,8 +689,10 @@ listed() {
   return 1
 }
 readonly SERVE_READ='timeout 10s sudo -n tailscale serve status --json'
+# The Pi's tailnet name, which tells its own Serve entries from those of another name.
+readonly SELF_READ='timeout 10s tailscale status --self --json'
 check_bootstrap() {
-  local differences=() unread=() missing=() unreadable=() reached=yes status=0 name remote copy drift want serve have
+  local differences=() unread=() missing=() unreadable=() reached=yes status=0 name remote copy drift want serve have self device
   if [[ -z $set_dir ]]; then
     unknown 7 "no release manifest and serve.conf to compare the Pi's bootstrap files and Serve with: $set_error"
     return 0
@@ -761,7 +763,11 @@ check_bootstrap() {
       unread+=("cannot reach $PI over SSH to read Serve's setting: $(error_of "$tmp/serve.err")")
     elif ((status != 0)); then
       unread+=("cannot read Serve's setting on the Pi ($SERVE_READ, exit $status): $(error_of "$tmp/serve.err")")
-    elif ! have=$(serve_lines_from_status "$serve"); then
+    elif ! self=$(pi "$SELF_READ" 2>"$tmp/self.err"); then
+      unread+=("cannot read the Pi's tailnet name, which its Serve entries are read for ($SELF_READ): $(error_of "$tmp/self.err")")
+    elif ! device=$(device_tailnet_name "$self"); then
+      unread+=("cannot read the Pi's tailnet name, which its Serve entries are read for: $SELF_READ gave no DNSName")
+    elif ! have=$(serve_lines_from_status "$serve" "$device"); then
       unread+=("cannot read Serve's setting from $SERVE_READ on the Pi: it answered no Serve config")
     elif [[ $have != "$want" ]]; then
       differences+=("Serve differs from the release's serve.conf: want $(paste -sd ',' - <<<"$want"), have $(paste -sd ',' - <<<"${have:-none}")")
