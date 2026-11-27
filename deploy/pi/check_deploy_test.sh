@@ -699,12 +699,12 @@ expect 2 UNKNOWN local_settings
 # applied; a run that passes on a Pi whose page saves are not applied.
 new_case 'a local settings file the recorder did not apply'
 printf 'summarization: [\n' >"$deploy/ghost-wispr.local.yaml"
-recorder_applies '{"applied":false,"error":"yaml: line 2: did not find expected node content"}'
-jq -c --arg warning "$deploy/ghost-wispr.local.yaml: yaml: line 2: did not find expected node content; settings saved on the page are not applied" \
+recorder_applies '{"applied":false,"error":"not valid YAML near line 2"}'
+jq -c --arg warning "$deploy/ghost-wispr.local.yaml: not valid YAML near line 2; settings saved on the page are not applied" \
   '.warnings = [$warning]' <<<"$idle_status" >"$state/status.json"
 run_driver
 expect_verdicts PASS PASS PASS FAIL PASS PASS PASS
-expect 2 PASS 'did not apply' 'did not find expected node content'
+expect 2 PASS 'did not apply' 'not valid YAML near line 2'
 expect 3 PASS 'did not apply'
 expect 4 FAIL 'ghost-wispr.local.yaml' 'settings saved on the page are not applied'
 

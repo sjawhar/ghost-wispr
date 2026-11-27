@@ -692,12 +692,13 @@ func TestASaveOverALocalSettingsFileThatWasNotAppliedIsRefused(t *testing.T) {
 // TestAHandWrittenNullOnAStructSettingIsNotApplied fails if a null that a
 // person wrote on a setting that is not an entry of a map (providers,
 // summarization.presets, a provider's labels) zeroes that setting: the local
-// settings file must give a warning that names the setting, and none of it
-// applies.
+// settings file must give a warning that names the null's line, and none of
+// it applies. The warning names no key of the file: GET /api/status serves it
+// to any client that reaches the recorder.
 func TestAHandWrittenNullOnAStructSettingIsNotApplied(t *testing.T) {
-	for _, tc := range []struct{ local, setting string }{
-		{"silence_timeout: 45s\nvoice: null\n", "voice"},
-		{"silence_timeout: 45s\nsummarization:\n  presets: null\n", "summarization.presets"},
+	for _, tc := range []struct{ local, setting, line string }{
+		{"silence_timeout: 45s\nvoice: null\n", "voice", "2"},
+		{"silence_timeout: 45s\nsummarization:\n  presets: null\n", "summarization.presets", "3"},
 	} {
 		t.Run(tc.setting, func(t *testing.T) {
 			clearEnv(t)
@@ -717,10 +718,9 @@ func TestAHandWrittenNullOnAStructSettingIsNotApplied(t *testing.T) {
 			if _, ok := cfg.Summarization.Presets["default"]; !ok {
 				t.Errorf("the presets %v lost the built-in default preset", cfg.Summarization.Presets)
 			}
-			if !slices.ContainsFunc(warnings, func(w string) bool {
-				return strings.HasPrefix(w, localPath+": "+tc.setting+": ") && strings.HasSuffix(w, "; settings saved on the page are not applied")
-			}) {
-				t.Errorf("warnings %q do not name %s in %s", warnings, tc.setting, localPath)
+			want := localPath + ": a null at line " + tc.line + " that deletes no entry: a null deletes only an entry of providers, summarization.presets or a provider's labels; settings saved on the page are not applied"
+			if !slices.Contains(warnings, want) {
+				t.Errorf("warnings %q do not hold %q", warnings, want)
 			}
 		})
 	}
@@ -900,7 +900,9 @@ func TestAGoogleCredentialsFileOverrideGivesItsOwnVertexProject(t *testing.T) {
 // TestALocalValueThatDoesNotFitItsSettingWarnsByTheLocalFilesLine fails if a
 // local settings file whose value does not fit its setting stops the start,
 // is applied in part, or gives a warning that names a line of another
-// document than the local settings file: here line 4 holds the bad value.
+// document than the local settings file: here line 4 holds the bad value. The
+// warning names the line, not the value: GET /api/status serves it to any
+// client that reaches the recorder.
 func TestALocalValueThatDoesNotFitItsSettingWarnsByTheLocalFilesLine(t *testing.T) {
 	clearEnv(t)
 	path := writeConfig(t, "silence_timeout: 30s\ngc_max_age_days: 14\n")
@@ -926,10 +928,10 @@ func TestALocalValueThatDoesNotFitItsSettingWarnsByTheLocalFilesLine(t *testing.
 		t.Fatalf("warnings %q, want one about %s", warnings, localPath)
 	}
 	warning := local[0]
-	if !strings.HasSuffix(warning, "; settings saved on the page are not applied") || !strings.Contains(warning, "`many`") {
-		t.Errorf("warning %q does not name the bad value and the skipped page saves", warning)
+	if !strings.HasSuffix(warning, "; settings saved on the page are not applied") || strings.Contains(warning, "many") {
+		t.Errorf("warning %q does not name the skipped page saves, or holds the bad value", warning)
 	}
-	if !strings.Contains(warning, "line 4:") || strings.Count(warning, "line ") != 1 {
+	if !strings.Contains(warning, "a value that does not fit its setting at line 4;") || strings.Count(warning, "line ") != 1 {
 		t.Errorf("warning %q does not name line 4 of the local settings file alone", warning)
 	}
 }

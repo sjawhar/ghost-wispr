@@ -123,16 +123,16 @@ func TestTheLocalSettingsReportIsACopy(t *testing.T) {
 
 // TestTheLocalSettingsReportNamesAFileTheStoreDidNotApply fails if the store
 // reports settings from a local settings file that it did not apply, or does
-// not say why; or reports any for no file. The control: the running config is
-// the release config's.
+// not say why, as the kind of fault and its line; or reports any for no file.
+// The control: the running config is the release config's.
 func TestTheLocalSettingsReportNamesAFileTheStoreDidNotApply(t *testing.T) {
 	store, _ := reportStore(t, "silence_timeout: [\n")
 	cfg, _, report := store.GetWithLocalSettings()
 	if cfg.SilenceTimeout != "30s" {
 		t.Errorf("control: the running silence_timeout is %q, want the release's 30s", cfg.SilenceTimeout)
 	}
-	if report.Settings != nil || report.Err == nil || !strings.Contains(report.Err.Error(), "yaml:") {
-		t.Errorf("the report of a file that does not parse is %s, error %v; want no settings and the parse error", reportJSON(t, report), report.Err)
+	if report.Settings != nil || report.Err == nil || report.Err.Error() != "not valid YAML near line 1" {
+		t.Errorf("the report of a file that does not parse is %s, error %v; want no settings and not valid YAML near line 1", reportJSON(t, report), report.Err)
 	}
 
 	none, _ := reportStore(t, "")
