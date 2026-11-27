@@ -24,7 +24,6 @@ func conciergeStore(t *testing.T) *storage.SQLiteStore {
 // or start-up waits, when the unit has no Dispatch token, or cannot reach
 // Envoy: the voice must still answer, saying it cannot reach Dispatch yet.
 func TestTheConciergeStartsWithoutReach(t *testing.T) {
-	runParallel(t)
 	withToken := func(cfg config.Config, concierge config.Concierge) config.Config {
 		cfg.DispatchToken = "token"
 		concierge.Model = cfg.Concierge.Model
@@ -58,7 +57,6 @@ func TestTheConciergeStartsWithoutReach(t *testing.T) {
 // TestTheConciergeNeedsAModel fails if a Concierge starts with no way to call
 // its model: no concierge.model, or a provider whose key is not set.
 func TestTheConciergeNeedsAModel(t *testing.T) {
-	runParallel(t)
 	noModel := geminiKeyConfig("test")
 	noModel.Concierge.Model = ""
 	for name, cfg := range map[string]config.Config{"no model": noModel, "no key": geminiKeyConfig("")} {
@@ -72,7 +70,6 @@ func TestTheConciergeNeedsAModel(t *testing.T) {
 // TestTheConciergeNeedsAModelControl fails if the same config with a key and
 // a model does not start, so the refusals above prove nothing.
 func TestTheConciergeNeedsAModelControl(t *testing.T) {
-	runParallel(t)
 	cfg := geminiKeyConfig("test")
 	_, stop, err := startConcierge(t.Context(), &cfg, conciergeStore(t), discardLogger, nil, nil)
 	if err != nil {
@@ -86,7 +83,6 @@ func TestTheConciergeNeedsAModelControl(t *testing.T) {
 // question) is not passed to the hook main connects to the voice_tasks_changed
 // event, so an open session page would never show it.
 func TestTheConciergeTellsTheSessionPageOfChanges(t *testing.T) {
-	runParallel(t)
 	cfg := geminiKeyConfig("test")
 	store := conciergeStore(t)
 	at := time.Date(2026, 11, 19, 9, 0, 0, 0, time.UTC)

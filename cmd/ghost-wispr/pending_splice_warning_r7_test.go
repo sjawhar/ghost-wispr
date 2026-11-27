@@ -15,7 +15,6 @@ import (
 )
 
 func TestR7PendingSpliceRecoveryUsesEachSpansWarningKeyThroughStatus(t *testing.T) {
-	runParallel(t)
 	store, first, _ := r4PendingStore(t)
 	second := filepath.Join(filepath.Dir(first), "second.mp3")
 	if err := addPendingSpliceRow(store, "session", second); err != nil {

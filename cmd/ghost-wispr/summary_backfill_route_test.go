@@ -72,7 +72,6 @@ func (h *heldModel) count(word string) int {
 // claimed it, was summarized twice. The route must claim each summary as
 // the backlogs do.
 func TestTheOnlineBackfillRouteSummarizesAClaimedSessionOnce(t *testing.T) {
-	runParallel(t)
 	cfg := config.Config{
 		Providers:    map[string]config.Provider{"fake": {API: config.APIOpenAI, Auth: config.ProviderAuth{Kind: config.AuthAPIKey, Env: "EXAMPLE_KEY"}}},
 		ProviderKeys: map[string]string{"EXAMPLE_KEY": "k-1"},

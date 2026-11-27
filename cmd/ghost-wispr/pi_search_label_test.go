@@ -35,7 +35,6 @@ func (c *countedEmbeddings) Embed(_ context.Context, texts []string, _ embedding
 // session indexed under the role's provider/model as its label, is embedded
 // again, so the count can see a second embedding.
 func TestThePiConfigEmbedsNoStoredSessionAgain(t *testing.T) {
-	runParallel(t)
 	pi, _, err := config.Load(filepath.Join("..", "..", "deploy", "pi", "files", "ghost-wispr.yaml"))
 	if err != nil {
 		t.Fatal(err)

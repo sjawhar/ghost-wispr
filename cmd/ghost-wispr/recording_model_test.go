@@ -77,7 +77,6 @@ func segmentSaying(t *testing.T, store *storage.SQLiteStore, sessionID, text str
 }
 
 func TestDeletedWordsStayGoneAfterAModelChangeMergeAndCut(t *testing.T) {
-	runParallel(t)
 	dir := t.TempDir()
 	store, err := storage.NewSQLiteStore(filepath.Join(t.TempDir(), "ghost-wispr.db"))
 	if err != nil {

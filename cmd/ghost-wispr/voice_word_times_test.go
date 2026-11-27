@@ -19,7 +19,6 @@ import (
 // holds a final that ends in a spoken number), after the voice began to
 // answer it.
 func TestTheVoiceGetsWhenEachWordWasCaptured(t *testing.T) {
-	runParallel(t)
 	peer, host := startListeningDeepgram(t)
 	heard := &heardTranscripts{}
 	ctx, cancel := context.WithCancel(context.Background())

@@ -83,7 +83,6 @@ func (m *summarizerSlot) current() (session.Summarizer, int) {
 // tracker (OnResult); or if any of them still summarizes once summaries are
 // off.
 func TestEverySummaryPathFollowsTheSettingsSavedLast(t *testing.T) {
-	runParallel(t)
 	const keyEnv = "EXAMPLE_SUMMARY_KEY"
 	api := startChatAPI(t)
 	cfgStore, _, err := config.NewStore("")

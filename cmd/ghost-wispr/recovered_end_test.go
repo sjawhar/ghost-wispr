@@ -31,7 +31,6 @@ func (h *countingHub) RoundTrip(req *http.Request) (*http.Response, error) {
 // control has Envoy events off, and queues nothing. From review 6006372566
 // of #138.
 func TestARecoveredEndKeepsItsEventThroughAStopBeforeItsSend(t *testing.T) {
-	runParallel(t)
 	for _, on := range []bool{false, true} {
 		name := "control: Envoy events are off"
 		if on {

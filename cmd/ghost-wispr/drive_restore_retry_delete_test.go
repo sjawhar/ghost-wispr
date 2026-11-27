@@ -44,7 +44,6 @@ func restoringRunnerServer(t *testing.T, store *storage.SQLiteStore, audioDir st
 }
 
 func TestDriveRestoredSessionCanRetryBeforeDeletion(t *testing.T) {
-	runParallel(t)
 	store, err := storage.NewSQLiteStore(filepath.Join(t.TempDir(), "restore.db"))
 	if err != nil {
 		t.Fatal(err)
@@ -110,7 +109,6 @@ func TestDriveRestoredSessionWithoutAudioDoesNotClaimGarbageCollectionRemovedIt(
 }
 
 func TestDeleteNoAudioDoesNotPromiseUnavailableDriveRestore(t *testing.T) {
-	runParallel(t)
 	store, err := storage.NewSQLiteStore(filepath.Join(t.TempDir(), "unavailable.db"))
 	if err != nil {
 		t.Fatal(err)

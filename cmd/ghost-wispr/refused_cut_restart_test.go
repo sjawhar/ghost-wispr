@@ -100,7 +100,6 @@ func isRefusedCutWarning(warning string) bool {
 // gone after the unit restarts while the words are still in the recording;
 // or if "Delete text" through that server does not clear it, for good.
 func TestRefusedCutWarningSurvivesARestart(t *testing.T) {
-	runParallel(t)
 	dbPath, recording, segmentID, revision := refusedCutDatabase(t)
 	handler := unitServer(t, openTestStore(t, dbPath), recording)
 
@@ -134,7 +133,6 @@ func TestRefusedCutWarningSurvivesARestart(t *testing.T) {
 // cut's status warning stays after its session is deleted: the recording and
 // the words in it are gone with the session.
 func TestRefusedCutWarningClearsWhenItsSessionIsDeleted(t *testing.T) {
-	runParallel(t)
 	dbPath, recording, segmentID, revision := refusedCutDatabase(t)
 	store := openTestStore(t, dbPath)
 	handler := unitServer(t, store, recording)
@@ -161,7 +159,6 @@ func TestRefusedCutWarningClearsWhenItsSessionIsDeleted(t *testing.T) {
 // warning, or loses it on a restart: the words are still in the recording,
 // as after any refused cut.
 func TestUncheckedCutRefusalWarnsOnTheStatusPage(t *testing.T) {
-	runParallel(t)
 	// "Then" at 64.6 s is within 0.5 s of the cut, which ends at 64.85 s, and
 	// not wholly inside it, so the check must hear a word at the cut point,
 	// about 62.55 s into the cut recording.
@@ -186,7 +183,6 @@ func TestUncheckedCutRefusalWarnsOnTheStatusPage(t *testing.T) {
 // refused cut's warning while the segment's words are still in the
 // recording, instead of trimming its span.
 func TestTouchingNeighbourCutTrimsARefusedCut(t *testing.T) {
-	runParallel(t)
 	dbPath, recording, segmentID, revision := refusedCutDatabaseThen(t, 64.6)
 	store := openTestStore(t, dbPath)
 	handler := unitServer(t, store, recording)
@@ -234,7 +230,6 @@ func TestTouchingNeighbourCutTrimsARefusedCut(t *testing.T) {
 // another segment there drops the source's refined words, while the refused
 // segment's words are still in the recording.
 func TestRefusedCutWarningFollowsAMerge(t *testing.T) {
-	runParallel(t)
 	dbPath, recording, segmentID, revision := refusedCutDatabase(t)
 	store := openTestStore(t, dbPath)
 	handler := unitServer(t, store, recording)

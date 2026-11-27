@@ -453,7 +453,6 @@ func TestAShutdownWaitsForATurnOffUnderWay(t *testing.T) {
 // 6004998055 of #132; the control is the same turn-off with the connection
 // free, which cancels the question before the shutdown returns.
 func TestATurnOffHeldInTheStoreDoesNotHoldTheShutdownPastItsDeadline(t *testing.T) {
-	runParallel(t)
 	for _, held := range []bool{false, true} {
 		name := "control: the store's connection is free"
 		if held {
@@ -566,7 +565,6 @@ func TestATurnOffHeldInTheStoreDoesNotHoldTheShutdownPastItsDeadline(t *testing.
 // control is the same call with the connection free, which lands before the
 // shutdown.
 func TestARunningConciergeStopsWithinTheShutdownsDeadline(t *testing.T) {
-	runParallel(t)
 	for _, held := range []bool{false, true} {
 		name := "control: the store's connection is free"
 		if held {

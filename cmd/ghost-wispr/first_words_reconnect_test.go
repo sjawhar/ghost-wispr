@@ -312,7 +312,6 @@ func opensAPrerollBefore(t *testing.T, got []uint16, speech, latency int) {
 // so the first words of a meeting that began during the outage were in the
 // live transcript and not in the recording, nor in the refined transcript.
 func TestFirstWordsDeepgramHearsAfterAReconnectAreAllInTheRecording(t *testing.T) {
-	runParallel(t)
 	opensAPrerollBefore(t, outageRecording(t, 9, 12, 2), 12, 2)
 }
 
@@ -323,6 +322,5 @@ func TestFirstWordsDeepgramHearsAfterAReconnectAreAllInTheRecording(t *testing.T
 // Deepgram's first result came out of the 5 s before the words, and past 5 s
 // out of the words.
 func TestFirstWordsAfterALongOutageAreAllInTheRecording(t *testing.T) {
-	runParallel(t)
 	opensAPrerollBefore(t, outageRecording(t, 9, 55, 12), 55, 12)
 }

@@ -42,7 +42,6 @@ func indexed(t *testing.T, store *storage.SQLiteStore, id string) bool {
 // It also fails if a refused question does not warn, or a good one does not
 // clear that warning.
 func TestAGoodQuestionLeavesTheIndexWarning(t *testing.T) {
-	runParallel(t)
 	var refuse atomic.Bool
 	refuse.Store(true)
 	client, model, ref := refusingGateway(t, &refuse)
@@ -81,7 +80,6 @@ func TestAGoodQuestionLeavesTheIndexWarning(t *testing.T) {
 // sessions that backfill missed stay out of search until a restart, or the
 // index warning clears before they are indexed.
 func TestAGoodIndexAfterARefusalIndexesTheSessionsMissed(t *testing.T) {
-	runParallel(t)
 	var refuse atomic.Bool
 	refuse.Store(true)
 	client, model, ref := refusingGateway(t, &refuse)

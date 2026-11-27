@@ -109,7 +109,6 @@ func newR9MergedCutFixture(t *testing.T) r9MergedCutFixture {
 // TestR9DeleteAudioDoesNotRestorePrecutMergedRecording fails if deleting a
 // segment from A downloads Drive's pre-cut C while C's replacement is owed.
 func TestR9DeleteAudioDoesNotRestorePrecutMergedRecording(t *testing.T) {
-	runParallel(t)
 	fixture := newR9MergedCutFixture(t)
 	runner := testDeleteRunner(t, &segmentDeleteRunner{
 		store:    fixture.store,

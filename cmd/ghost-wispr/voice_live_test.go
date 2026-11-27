@@ -259,7 +259,6 @@ func TestAFailedRedCheckPlaysTheErrorSound(t *testing.T) {
 // off at start-up starts before a call needs it, starts twice, or does not
 // pass its answers on once started.
 func TestTheConciergeStartsOnFirstUse(t *testing.T) {
-	runParallel(t)
 	cfg := geminiKeyConfig("test")
 	store := conciergeStore(t)
 	starts := 0

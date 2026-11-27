@@ -84,7 +84,6 @@ func finalResult(text string, at float64) []byte {
 // the audio after the hole: the session stores both, captured at 10 ms and at
 // 266 ms. From the seventh review of #130, whose probe this is.
 func TestAnOverflowDuringADrainKeepsTheSocketAndItsResults(t *testing.T) {
-	runParallel(t)
 	for _, delay := range []time.Duration{100 * time.Millisecond, 1300 * time.Millisecond} {
 		t.Run(delay.String(), func(t *testing.T) { overflowKeepsTheSocket(t, delay) })
 	}

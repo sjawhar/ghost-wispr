@@ -491,7 +491,6 @@ func TestTheStopWaitsForAHandlerThatOutlastsTheHTTPWait(t *testing.T) {
 // late write itself (stopping.ErrStopped), so the title stays as it was. From
 // review 6004998055 of #132.
 func TestAHandlerPastTheShutdownsDeadlineNeverWritesTheClosedStore(t *testing.T) {
-	runParallel(t)
 	path := filepath.Join(t.TempDir(), "deadline.db")
 	db := openResumeStore(t, path)
 	const id = "20261120090000"

@@ -21,7 +21,6 @@ import (
 // timeout) followed whichever callback finished last, which was not always
 // the last change saved. They now follow the last change saved.
 func TestSettingsFollowTheLastOfTwoConcurrentChanges(t *testing.T) {
-	runParallel(t)
 	cfgStore, _, err := config.NewStore("")
 	if err != nil {
 		t.Fatalf("config store: %v", err)

@@ -53,7 +53,6 @@ func (r *recordingBroadcaster) BroadcastSummaryFailed(sessionID, title, summary,
 // change, so it stays synced, and the last announcement of its summary says
 // what it keeps.
 func TestAFailedResummarizeKeepsTheLastGoodSummaryAndTitle(t *testing.T) {
-	runParallel(t)
 	for _, preset := range []string{"", "detailed"} {
 		t.Run("preset "+preset, func(t *testing.T) {
 			store, err := storage.NewSQLiteStore(filepath.Join(t.TempDir(), "ghost-wispr.db"))

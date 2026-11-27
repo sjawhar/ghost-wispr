@@ -66,7 +66,6 @@ func naming(warnings []string, id string) []string {
 // back, not a cut "Delete text and audio" refused. Another session's warnings
 // stay.
 func TestADeletedSessionLeavesNoStatusWarningNamingIt(t *testing.T) {
-	runParallel(t)
 	const (
 		sourceA = "20261116140449"
 		sourceB = "20261116141316"
@@ -221,7 +220,6 @@ func TestWarningSessionReadsTheSessionOfEachKey(t *testing.T) {
 // TestAGCAgeDeleteLeavesNoStatusWarningNamingTheSession: GC's age policy
 // deletes a session for good; it leaves no warning that names it.
 func TestAGCAgeDeleteLeavesNoStatusWarningNamingTheSession(t *testing.T) {
-	runParallel(t)
 	const id = "20261001130000"
 	store, cfg := recordingMismatchSession(t, id)
 	registry := newWarningsRegistry()

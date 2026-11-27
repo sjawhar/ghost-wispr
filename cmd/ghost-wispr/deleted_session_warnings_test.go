@@ -20,7 +20,6 @@ import (
 // the reservation's hidden file, not the session, which is gone; the raw
 // recording of a session that stays is still named by its session.
 func TestARawEraseLeftForADeletedSessionIsNotNamedByIt(t *testing.T) {
-	runParallel(t)
 	const gone, kept = "20261116090000", "20261116100000"
 	store, err := storage.NewSQLiteStore(filepath.Join(t.TempDir(), "ghost-wispr.db"))
 	if err != nil {

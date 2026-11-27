@@ -45,7 +45,6 @@ func countingLazyConcierge(t *testing.T) (lazy *lazyConcierge, counts func() (st
 // off, no Concierge runs), or if turning it on again does not start a new
 // one.
 func TestTheConciergeStopsWhenTheVoiceIsTurnedOff(t *testing.T) {
-	runParallel(t)
 	lazy, counts := countingLazyConcierge(t)
 	first, err := lazy.start()
 	if err != nil || first == nil {
@@ -91,7 +90,6 @@ func TestTheConciergeStopsWhenTheVoiceIsTurnedOff(t *testing.T) {
 // is on again), or if a shutdown cancels it (the unit's Envoy session is the
 // same after a restart, so its reply can still land).
 func TestTurningTheVoiceOffCancelsTheQuestionsAShutdownKeeps(t *testing.T) {
-	runParallel(t)
 	cfg := geminiKeyConfig(strings.Repeat("k", 8))
 	store := conciergeStore(t)
 	at := time.Now()
@@ -125,7 +123,6 @@ func TestTurningTheVoiceOffCancelsTheQuestionsAShutdownKeeps(t *testing.T) {
 // hook of voice.enabled, as main wires it, does not tell the voice (which
 // stops at once) and stop the Concierge.
 func TestTurningTheVoiceOffReachesTheVoiceAndTheConcierge(t *testing.T) {
-	runParallel(t)
 	var link voiceLink
 	heard := &closingsHeard{}
 	link.set(heard)

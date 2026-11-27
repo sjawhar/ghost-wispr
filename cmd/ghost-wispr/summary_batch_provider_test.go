@@ -51,7 +51,6 @@ func geminiBatches(t *testing.T) (url string, gets *atomic.Int32) {
 // is gone, or cannot sign in, its sessions must fail with the reason and go
 // back to the backlog, and the start's poll of it must stop.
 func TestABatchJobIsPolledWithTheProviderThatTookIt(t *testing.T) {
-	runParallel(t)
 	for _, tc := range []struct {
 		name   string
 		change func(c *config.Config)

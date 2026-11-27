@@ -242,7 +242,6 @@ func (l *heldReadLight) ReadRGB() (r, g, b uint8, err error) {
 // stays red with no microphone. The control, with no stop, opens the gate
 // and ends the hold. From review 6005610488 of #138.
 func TestAnOpeningTheStopOvertakesOpensNothing(t *testing.T) {
-	runParallel(t)
 	for _, stop := range []string{"", "the manager's stop during the red check", "the gate's stop during the red check", "the gate's stop during beforeResume"} {
 		name := stop
 		if stop == "" {
@@ -324,7 +323,6 @@ func TestAnOpeningTheStopOvertakesOpensNothing(t *testing.T) {
 // stopped. The control, with no shutdown, opens the gate. From review
 // 6005610488 of #138.
 func TestAShutdownKeepsAnAcceptedResumesSavedState(t *testing.T) {
-	runParallel(t)
 	for _, from := range []micState{micClosed, micListening} {
 		for _, shutdown := range []string{"", "the app stops", "the app and the light stop"} {
 			name := shutdown

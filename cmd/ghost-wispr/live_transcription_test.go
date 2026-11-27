@@ -170,7 +170,6 @@ func notConnectedWarning(warnings *warningsRegistry) bool {
 // Deepgram drops later, or that dies right after a reconnect opens it, must
 // show it until a socket is connected again, and then clear it.
 func TestDeepgramWarningFollowsLaterDisconnects(t *testing.T) {
-	runParallel(t)
 	peer, host := startSwitchableDeepgram(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -237,7 +236,6 @@ func hubDeepgramStatus(hub *server.Hub) string {
 // 2026-11-20 the hub sent connected and then draining, so the page and the
 // acceptance driver read "draining" for as long as Deepgram stayed connected.
 func TestTheHubsDeepgramStatusEndsAtTheClientsState(t *testing.T) {
-	runParallel(t)
 	peer, host := startSwitchableDeepgram(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -429,7 +427,6 @@ func (s firstStoreSignals) StoreEvent(ctx context.Context, eventType, payload st
 // (stateCallbackStopWait), and the store ends, stored or failed, within
 // busy_timeout (5 s) of its start, with the lock held throughout.
 func TestCloseIsBoundedWhileAStoreWaitsOnAnotherConnectionsWriteLock(t *testing.T) {
-	runParallel(t)
 	var storeStart time.Time
 	_, host := startSwitchableDeepgram(t)
 	path := filepath.Join(t.TempDir(), "busy.db")
@@ -493,7 +490,6 @@ func TestCloseIsBoundedWhileAStoreWaitsOnAnotherConnectionsWriteLock(t *testing.
 // began. In #109's first version they cleared the warning and told the pages
 // connected; on main the warning stayed but the pages were told connected.
 func TestALateConnectedNeverHidesACurrentOutage(t *testing.T) {
-	runParallel(t)
 	peer, host := startSwitchableDeepgram(t)
 	store := blockingStatusStore{
 		reconnecting: make(chan struct{}), connected: make(chan struct{}),

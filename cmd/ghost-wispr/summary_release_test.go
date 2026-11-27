@@ -53,7 +53,6 @@ func (panickingSummarizer) SummarizeReported(context.Context, string, string) (s
 // a restart recovers it. The summary must go back to pending, and the next
 // backlog, wired as main wires it, make it.
 func TestASummaryWhoseEndWasNotStoredIsTakenAgainInThisRun(t *testing.T) {
-	runParallel(t)
 	const id = "20261122090000"
 	hub, publish := &recordingBroadcaster{}, func(string) {}
 	for _, tc := range []struct {

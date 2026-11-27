@@ -108,7 +108,6 @@ func expectRecordingMismatchWarning(t *testing.T, registry *warningsRegistry, id
 // UI, and a hold that goes on keeps the time it began; a pass that does not
 // hold back clears it.
 func TestAGCPassThatCannotCheckDriveIsRecordedWithTheDiskUse(t *testing.T) {
-	runParallel(t)
 	store, err := storage.NewSQLiteStore(filepath.Join(t.TempDir(), "ghost-wispr.db"))
 	if err != nil {
 		t.Fatalf("open store: %v", err)
@@ -171,7 +170,6 @@ func TestAGCPassThatCannotCheckDriveIsRecordedWithTheDiskUse(t *testing.T) {
 }
 
 func TestGCPassReportsAndClearsRecordingChecksumMismatchThroughStatus(t *testing.T) {
-	runParallel(t)
 	const id = "20261001130000"
 	store, cfg := recordingMismatchSession(t, id)
 	syncer := &recordingMismatchSyncer{}
@@ -196,7 +194,6 @@ func TestGCPassReportsAndClearsRecordingChecksumMismatchThroughStatus(t *testing
 }
 
 func TestGCPassClearsRecordingChecksumMismatchWhenDriveMatchesAndKeepsSession(t *testing.T) {
-	runParallel(t)
 	const id = "20261001130100"
 	store, cfg := recordingMismatchSession(t, id)
 	syncer := &recordingMismatchSyncer{}
@@ -232,7 +229,6 @@ func TestGCPassClearsRecordingChecksumMismatchWhenDriveMatchesAndKeepsSession(t 
 // folder is gone: the session is retained locally as REMOTE_DELETED, so there
 // is no Drive recording left to compare.
 func TestGCPassClearsRecordingChecksumMismatchWhenDriveFolderIsGone(t *testing.T) {
-	runParallel(t)
 	const id = "20261001140000"
 	store, cfg := recordingMismatchSession(t, id)
 	warnings := newWarningsRegistry()
@@ -257,7 +253,6 @@ func TestGCPassClearsRecordingChecksumMismatchWhenDriveFolderIsGone(t *testing.T
 }
 
 func TestGCPassPrunesRecordingMismatchWarningsForSessionsGCWillNeverCheckAgain(t *testing.T) {
-	runParallel(t)
 	for _, tc := range []struct {
 		name string
 		end  func(*storage.SQLiteStore, string) error
@@ -300,7 +295,6 @@ func TestGCPassPrunesRecordingMismatchWarningsForSessionsGCWillNeverCheckAgain(t
 // when only the folder is removed), and undoing it lets the next pass remove
 // the audio Drive verifies again.
 func TestGCPassHoldsAudioWhenConfigAPIStopsDriveSync(t *testing.T) {
-	runParallel(t)
 	for _, tc := range []struct {
 		name, stop, resume string
 	}{

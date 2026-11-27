@@ -231,7 +231,6 @@ collect:
 // peer, which never answers CloseStream; or if the first socket stays open
 // past its 1 s wait, so stalled sockets would pile up.
 func TestARetiredSocketWhosePeerNeverAnswersDoesNotHoldUpItsSuccessor(t *testing.T) {
-	runParallel(t)
 	var handshakes atomic.Int32
 	var closeStreamAt atomic.Int64
 	firstEnded := make(chan struct{})
@@ -319,7 +318,6 @@ func (m *slowOldManager) heard() ([]string, time.Time) {
 // socket answers CloseStream with "old", which the session holds, and "late";
 // the next socket's peer answers its audio with "next".
 func TestASlowRetiredResultHoldsTheNextSocketsAtMostItsWait(t *testing.T) {
-	runParallel(t)
 	manager := &slowOldManager{entered: make(chan struct{}), release: make(chan struct{})}
 	release := sync.OnceFunc(func() { close(manager.release) })
 	var handshakes atomic.Int32

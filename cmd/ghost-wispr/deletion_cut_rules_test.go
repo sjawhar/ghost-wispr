@@ -110,7 +110,6 @@ func filesBeside(t *testing.T, recording string) []string {
 // cannot say the deleted words are gone. Each pad's check is retried once,
 // and the deletion is refused after the widest.
 func TestCutCheckRefusesAnEmptyTranscription(t *testing.T) {
-	runParallel(t)
 	words, selected := cutRuleWords()
 	a := &answers{}
 	runner, recording := cutCheckRunner(t, a)
@@ -129,7 +128,6 @@ func TestCutCheckRefusesAnEmptyTranscription(t *testing.T) {
 // TestCutCheckRetriesAnEmptyTranscription fails if one empty transcription
 // refuses a cut that a second transcription finds clean.
 func TestCutCheckRetriesAnEmptyTranscription(t *testing.T) {
-	runParallel(t)
 	words, selected := cutRuleWords()
 	start, _ := refinedSpliceBoundsWithPad(words, &selected, deletionAudioPad)
 	a := &answers{heard: [][]transcribe.TimestampedWord{nil, {{Text: "Then", Start: start + 0.65, End: start + 0.95}}}}
@@ -170,7 +168,6 @@ var farFromTheCut = []transcribe.TimestampedWord{{Text: "Hello", Start: 0.1, End
 // cannot say they are gone. Each pad's check is retried once, and the
 // deletion is refused after the widest.
 func TestCutCheckRefusesATranscriptionDeafAtTheCut(t *testing.T) {
-	runParallel(t)
 	for name, heard := range map[string][]transcribe.TimestampedWord{
 		"words only far from the cut":          farFromTheCut,
 		"a word just outside the 0.5 s window": append(slices.Clone(farFromTheCut), transcribe.TimestampedWord{Text: "Then", Start: 3.1, End: 3.4}),
@@ -196,7 +193,6 @@ func TestCutCheckRefusesATranscriptionDeafAtTheCut(t *testing.T) {
 // TestCutCheckRetriesATranscriptionDeafAtTheCut fails if one check deaf at
 // the cut refuses a cut that a second check hears clean.
 func TestCutCheckRetriesATranscriptionDeafAtTheCut(t *testing.T) {
-	runParallel(t)
 	words, selected := windowNeighbourWords()
 	a := &answers{heard: [][]transcribe.TimestampedWord{farFromTheCut, {{Text: "we", Start: 2.15, End: 2.4}, {Text: "Then", Start: 2.6, End: 2.9}}}}
 	runner, recording := cutCheckRunner(t, a)
@@ -215,7 +211,6 @@ func TestCutCheckRetriesATranscriptionDeafAtTheCut(t *testing.T) {
 // as a cut with a heard word is: the deletion is refused only after the
 // widest pad.
 func TestCutCheckWidensACutItCouldNotConfirm(t *testing.T) {
-	runParallel(t)
 	words, selected := windowNeighbourWords()
 	wideStart, wideEnd := refinedSpliceBoundsWithPad(words, &selected, deletionCutPads[1])
 	// Deaf twice at the 0.45 s cut; at the 0.6 s cut it hears "we", the
@@ -241,7 +236,6 @@ func TestCutCheckWidensACutItCouldNotConfirm(t *testing.T) {
 // nothing there for the check to hear. The "um" right after the segment is
 // inside the cut, so it is not there either.
 func TestCutCheckWithNoNeighbourAtTheCutAcceptsWordsElsewhere(t *testing.T) {
-	runParallel(t)
 	word := func(ordinal int, text string, start, end float64) storage.RefinedWord {
 		return storage.RefinedWord{RecordingPath: "rec.mp3", RecordingSHA256: "sha", Ordinal: ordinal, Text: text, Start: start, End: end}
 	}
@@ -345,7 +339,6 @@ func openTestStore(t *testing.T, dbPath string) *storage.SQLiteStore {
 // quotes the words the person asked to delete rather than naming the session
 // and the segment's time, or if it stays once "Delete text" removes them.
 func TestRefusedCutShowsOnTheStatusPageWithoutItsWords(t *testing.T) {
-	runParallel(t)
 	store, recording, segmentID, revision := refusedCutFixture(t)
 	refused := newRefusedCuts(store)
 	registry := newWarningsRegistry()
@@ -395,7 +388,6 @@ func TestRefusedCutShowsOnTheStatusPageWithoutItsWords(t *testing.T) {
 // through the deletion runner, so the store moves the refused cut in the
 // splice's own transaction.
 func TestRefusedCutWarningMovesWithALaterCut(t *testing.T) {
-	runParallel(t)
 	store, recording, segmentID, revision := refusedCutFixture(t)
 	refused := newRefusedCuts(store)
 	heard := []transcribe.TimestampedWord{{Text: "tractor", Start: 62.4, End: 62.7}}

@@ -78,7 +78,6 @@ func TestDeleteRefinedTextUsesStoredWordOccurrence(t *testing.T) {
 }
 
 func TestDeleteRefinedAudioSplicesWithFFmpegAndShiftsWords(t *testing.T) {
-	runParallel(t)
 	recording := filepath.Join(t.TempDir(), "recording.wav")
 	if output, err := exec.Command("ffmpeg", "-y", "-f", "lavfi", "-i", "sine=frequency=440:duration=2", recording).CombinedOutput(); err != nil {
 		t.Fatalf("create test recording: %v: %s", err, output)

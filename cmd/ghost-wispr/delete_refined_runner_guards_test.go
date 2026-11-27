@@ -67,7 +67,6 @@ func (f refinedRunnerFixture) runner() *segmentDeleteRunner {
 }
 
 func TestDeleteRefinedAudioRefusesPendingSplice(t *testing.T) {
-	runParallel(t)
 	fixture := newRefinedRunnerFixture(t)
 	before, err := fileSHA256(fixture.recording)
 	if err != nil {
@@ -84,7 +83,6 @@ func TestDeleteRefinedAudioRefusesPendingSplice(t *testing.T) {
 }
 
 func TestDeleteRefinedAudioChecksHashBeforeSplice(t *testing.T) {
-	runParallel(t)
 	fixture := newRefinedRunnerFixture(t)
 	if err := os.WriteFile(fixture.recording, []byte("changed"), 0o600); err != nil {
 		t.Fatal(err)
@@ -139,7 +137,6 @@ func TestDeleteRefinedTextRefusesRecoveryWithoutWaitingForTheRecoveryLock(t *tes
 }
 
 func TestDeleteRefinedAudioRefusesRecoveryWithoutWaitingForTheRecoveryLock(t *testing.T) {
-	runParallel(t)
 	fixture := newRefinedRunnerFixture(t)
 	runner := fixture.runner()
 	runner.locks.setRecovering("s", true)
@@ -164,7 +161,6 @@ func TestDeleteRefinedAudioRefusesRecoveryWithoutWaitingForTheRecoveryLock(t *te
 }
 
 func TestDeleteRefinedAudioRefusesKeptRawRecording(t *testing.T) {
-	runParallel(t)
 	fixture := newRefinedRunnerFixture(t)
 	audioDir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(audioDir, "s.pcm"), []byte("raw"), 0o600); err != nil {
@@ -178,7 +174,6 @@ func TestDeleteRefinedAudioRefusesKeptRawRecording(t *testing.T) {
 }
 
 func TestDeleteRefinedAudioRemovesDownloadedRecordingAfterRefusal(t *testing.T) {
-	runParallel(t)
 	fixture := newRefinedRunnerFixture(t)
 	downloaded := filepath.Join(t.TempDir(), "downloaded.mp3")
 	if err := os.WriteFile(downloaded, []byte("changed"), 0o600); err != nil {

@@ -48,7 +48,6 @@ func statusGCHold(t *testing.T, health *gcHealth) string {
 // sync off, waits for the first hourly GC pass before GET /api/status says
 // GC keeps the recordings on the unit.
 func TestGCReportsItsHoldAsItStarts(t *testing.T) {
-	runParallel(t)
 	store, err := storage.NewSQLiteStore(filepath.Join(t.TempDir(), "ghost-wispr.db"))
 	if err != nil {
 		t.Fatalf("open store: %v", err)

@@ -22,7 +22,6 @@ func r10Warning(t *testing.T) (*warningsRegistry, *storage.SQLiteStore) {
 // A recovered refined deletion has already rebuilt its transcript. Retrying
 // refinement is a no-op and clears the stale recovery warning.
 func TestR10RetrySkipsCompletedRefinedDeletion(t *testing.T) {
-	runParallel(t)
 	registry, store := r10Warning(t)
 	sess, _ := store.GetSession("session")
 	if err := retryRefinementWithWarningClear(context.Background(), registry, store, "session", func(context.Context, string, string, time.Time) error { return nil }); err != nil {
@@ -38,7 +37,6 @@ func TestR10RetrySkipsCompletedRefinedDeletion(t *testing.T) {
 
 // A retry for a session that is not in the registry is a no-op.
 func TestR10RetryForUnrelatedSessionLeavesOtherWarnings(t *testing.T) {
-	runParallel(t)
 	registry, store := r10Warning(t)
 	registry.Set("other-key", "other warning")
 	_ = setRefinementStatusForWarningTest(store, storage.RefinementCompleted)

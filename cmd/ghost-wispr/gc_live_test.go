@@ -136,7 +136,6 @@ func TestGCNeverTouchesTheLiveRecording(t *testing.T) {
 // sessions never backed up, and later deleted the synced ones without asking
 // Drive.
 func TestGCStaysDriveGatedWhenSyncIsNotRunning(t *testing.T) {
-	runParallel(t)
 	store, err := storage.NewSQLiteStore(filepath.Join(t.TempDir(), "ghost-wispr.db"))
 	if err != nil {
 		t.Fatalf("open store: %v", err)

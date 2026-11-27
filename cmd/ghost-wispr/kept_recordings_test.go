@@ -147,7 +147,6 @@ func openKeptStore(t *testing.T) *storage.SQLiteStore {
 // MP3, Drive sync uploads it, and the raw recording is erased only once Drive
 // has it.
 func TestARecordingTheAppStoppedInsideIsSavedSyncedThenErased(t *testing.T) {
-	runParallel(t)
 	requireMP3Encoder(t)
 	store := openKeptStore(t)
 	audioDir := t.TempDir()
@@ -238,7 +237,6 @@ func syncingDrive(t *testing.T, store *storage.SQLiteStore, audioDir, raw string
 // for its sync or its retry), the raw recording stays beside it until Drive
 // has it.
 func TestAKeptRecordingStaysRawWhileDriveWillTakeIt(t *testing.T) {
-	runParallel(t)
 	requireMP3Encoder(t)
 	for _, state := range []string{storage.SyncStateSynced, storage.SyncStatePending, storage.SyncStateRetryScheduled} {
 		t.Run(state, func(t *testing.T) {
@@ -271,7 +269,6 @@ func TestAKeptRecordingStaysRawWhileDriveWillTakeIt(t *testing.T) {
 // a raw recording kept beside it would refuse "Delete text and audio" for
 // good. Drive can still get the saved recording later.
 func TestAKeptRecordingIsErasedOnceSavedWhenDriveCannotTakeIt(t *testing.T) {
-	runParallel(t)
 	requireMP3Encoder(t)
 	for _, tc := range []struct {
 		name   string
@@ -324,7 +321,6 @@ func (refusingKeptStore) RecordKeptRecording(string, string, func() error) (bool
 // raw recording was being saved) belongs to no session: it is erased, and the
 // raw recording is left as it is.
 func TestARecordingSavedForASessionThatChangedIsErased(t *testing.T) {
-	runParallel(t)
 	requireMP3Encoder(t)
 	store := openKeptStore(t)
 	audioDir := t.TempDir()
@@ -351,7 +347,6 @@ func TestARecordingSavedForASessionThatChangedIsErased(t *testing.T) {
 // session row names, and no delete recorded, is neither saved nor erased: it
 // waits for a person (a restored database backup leaves such captures).
 func TestOnlyTheRecordingsOfEndedSessionsAreSaved(t *testing.T) {
-	runParallel(t)
 	requireMP3Encoder(t)
 	store := openKeptStore(t)
 	audioDir := t.TempDir()
@@ -390,7 +385,6 @@ func TestOnlyTheRecordingsOfEndedSessionsAreSaved(t *testing.T) {
 // recording. A saved recording of a session that has one, or of a session
 // still recording, is left as it is.
 func TestASavedRecordingNoSessionNamesIsGivenToItsSession(t *testing.T) {
-	runParallel(t)
 	store := openKeptStore(t)
 	audioDir := t.TempDir()
 	started := time.Date(2026, 11, 6, 14, 9, 30, 0, time.UTC)
@@ -484,7 +478,6 @@ func restoreFromDrive(t *testing.T, store *storage.SQLiteStore, id string) {
 // and queues it for Drive. A session deleted the same way with no save under
 // way is the control.
 func TestADeletedSessionLeavesNoSavedRecordingToRestore(t *testing.T) {
-	runParallel(t)
 	requireMP3Encoder(t)
 	store := openKeptStore(t)
 	audioDir := t.TempDir()
@@ -594,7 +587,6 @@ func TestAHoldStopsASaveOfTheSessionAndNothingIsRecorded(t *testing.T) {
 // It then clears the record. A file of a session with no row that no delete
 // recorded is left, and so is every file of a session that has a row.
 func TestThePassErasesTheAudioOfARecordedDelete(t *testing.T) {
-	runParallel(t)
 	store := openKeptStore(t)
 	audioDir := t.TempDir()
 	const deleted, namedElsewhere, other, unrecorded, kept = "20261106140930", "20261106150000", "20261106160000", "20261106170000", "20261106180000"
@@ -663,7 +655,6 @@ func TestThePassErasesTheAudioOfARecordedDelete(t *testing.T) {
 // was never asked about stays (with no row and no record: accepted, the safe
 // direction for an age delete).
 func TestThePassErasesOnlyTheFilesAnAgeDeleteListed(t *testing.T) {
-	runParallel(t)
 	store := openKeptStore(t)
 	audioDir := t.TempDir()
 	const id = "20261001110000"
@@ -730,7 +721,6 @@ func (s *laterNamingStore) NamedAudio(audioDir string) ([]string, error) {
 // session's files are erased, not once as the pass starts: a session that
 // starts to name one of those files meanwhile keeps it.
 func TestThePassReadsWhatSessionsNameJustBeforeItErases(t *testing.T) {
-	runParallel(t)
 	store := openKeptStore(t)
 	audioDir := t.TempDir()
 	const first, second = "20261106140000", "20261106150000"
@@ -769,7 +759,6 @@ func TestThePassReadsWhatSessionsNameJustBeforeItErases(t *testing.T) {
 // upload it into the source's Drive folder, where a later cut on the merged
 // session never replaces it. The raw recording stays, named for a person.
 func TestASaveOrAdoptionLeavesAFileAnotherSessionNames(t *testing.T) {
-	runParallel(t)
 	requireMP3Encoder(t)
 	store := openKeptStore(t)
 	audioDir := t.TempDir()
@@ -865,7 +854,6 @@ func TestASavedRecordingIsOnTheDiskBeforeTheSessionTakesIt(t *testing.T) {
 // refinement names it for that session later, so the source session with
 // the same id must not take it first.
 func TestAnAdoptionLeavesARestoredSessionsRecording(t *testing.T) {
-	runParallel(t)
 	store := openKeptStore(t)
 	audioDir := t.TempDir()
 	const source, restoredID = "20261106140000", "20261106160000"
@@ -915,7 +903,6 @@ func copyFile(t *testing.T, from, to string) {
 // a crash session's only raw capture included, and the status names that
 // capture as one for a person.
 func TestARestoredBackupKeepsTheAudioRecordedSinceIt(t *testing.T) {
-	runParallel(t)
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "ghost-wispr.db")
 	audioDir := t.TempDir()

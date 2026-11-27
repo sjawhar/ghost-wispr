@@ -584,7 +584,6 @@ func TestEnsureRedRequiresReadback(t *testing.T) {
 // TestWireLightConsentRequiresRedBeforeStartOrResume fails if recorder wiring
 // bypasses the configured indicator's red confirmation.
 func TestWireLightConsentRequiresRedBeforeStartOrResume(t *testing.T) {
-	runParallel(t)
 	store, err := storage.NewSQLiteStore(t.TempDir() + "/state.db")
 	if err != nil {
 		t.Fatal(err)
@@ -698,7 +697,6 @@ func TestResumeRequiresRedBeforeOpeningCapture(t *testing.T) {
 // TestResumeClearsForcedRedWhenMicUnavailable fails if resuming with no
 // microphone leaves the indicator red while no audio can flow.
 func TestResumeClearsForcedRedWhenMicUnavailable(t *testing.T) {
-	runParallel(t)
 	device := &operationLightFake{}
 	hardware := &hardwareControl{
 		light: &reconnectingLight{light: device, warnings: newWarningsRegistry()},
@@ -817,7 +815,6 @@ func TestEnsureRedOutlastsAStaleOffDecision(t *testing.T) {
 // TestResumeReleasesRedHoldAfterGateOpens fails if a short pause leaves the
 // confirmation hold set after the microphone resumes without restarting.
 func TestResumeReleasesRedHoldAfterGateOpens(t *testing.T) {
-	runParallel(t)
 	device := &operationLightFake{}
 	capture := newCaptureGate(nil, nil, nil)
 	capture.Pause()
@@ -863,7 +860,6 @@ func TestResumeReleasesRedHoldAfterGateOpens(t *testing.T) {
 // TestResumeReleasesOnlyItsOwnRedHold fails if opening the gate consumes a
 // second start attempt's red hold.
 func TestResumeReleasesOnlyItsOwnRedHold(t *testing.T) {
-	runParallel(t)
 	device := &operationLightFake{}
 	hardware := &hardwareControl{
 		light: &reconnectingLight{light: device, warnings: newWarningsRegistry()},
@@ -947,7 +943,6 @@ func TestLightCommandRejectsExtraArgument(t *testing.T) {
 // TestResumeDoesNotLightBeforeGateOpens fails if the request-time confirmation
 // leaves its red hold set while a paused session is still settling.
 func TestResumeDoesNotLightBeforeGateOpens(t *testing.T) {
-	runParallel(t)
 	settled := make(chan struct{})
 	capture := newCaptureGate(nil, func() { <-settled }, nil)
 	device := &operationLightFake{}
@@ -1009,7 +1004,6 @@ func (*redThenOffLight) Close() error                   { return nil }
 // TestResumeKeepsGateClosedWhenLightFailsDuringSettle fails if a later light
 // failure opens the gate onto an active microphone.
 func TestResumeKeepsGateClosedWhenLightFailsDuringSettle(t *testing.T) {
-	runParallel(t)
 	settled := make(chan struct{})
 	capture := newCaptureGate(nil, func() { <-settled }, nil)
 	mic := &openMicFake{}
