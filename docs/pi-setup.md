@@ -263,7 +263,21 @@ restarts the recorder, and a restart ends a conversation that is being recorded.
    ```
 
    `provision.sh` runs as `ghost-wispr`, with passwordless sudo, and refuses data on standard
-   input. It refuses a directory whose files do not match its `manifest.json`, such as a checkout's
+   input. Each run, of each mode, is the transient system unit `ghost-wispr-provision`, which
+   `provision.sh` starts as root for `ghost-wispr` and waits for: its lines reach you as it runs,
+   and its exit status is the run's. The unit gets `PATH` and the provisioning settings alone, never
+   a credential that your shell exports, as any local user can read a unit's settings. One run at
+   a time: while that unit or the join a run starts, `ghost-wispr-provision-join`, is active, a
+   second run fails at once, names the unit, when it became active and its main PID, and changes
+   nothing. The run checks the join again in its own unit, before it changes a file, as a join can
+   become active in between; and a run whose start loses to another's gives the same refusal. A
+   unit of either name that systemd keeps failed would take the name, so a run first resets it
+   with `systemctl reset-failed` and says so. To end a run, and its join, run
+   `sudo systemctl stop ghost-wispr-provision ghost-wispr-provision-join`, which ends every
+   process in the run's unit, its control group, and makes the run fail (exit 143); a root process
+   that moves itself to another unit leaves that boundary. An SSH session that ends does not
+   end a run: over Tailscale SSH the session's processes and the unit stay until the run ends. It
+   refuses a directory whose files do not match its `manifest.json`, such as a checkout's
    `deploy/pi/`. Before it changes anything, it refuses while the environment of `ghost-wispr`'s
    user manager sets `GHOST_WISPR_CONFIG` or an Envoy variable, which the recorder would inherit
    ("Turn on the meeting voice", step 1). Then it:
@@ -281,21 +295,59 @@ restarts the recorder, and a restart ends a conversation that is being recorded.
      run installs the release's whole deploy set and reads the Pi's secrets ("Update and inspect").
      `provision.sh` prints the run's journal lines, and stops when the run failed;
    - enables `ghost-wispr.service`;
-   - applies each line of the release's `serve.conf` with `tailscale serve --bg --https`. It turns
-     off each live Serve HTTPS port that `serve.conf` does not list, and each mount other than `/`
-     on a port that it lists. Then it reads Serve again, and stops before the join when Serve still
-     holds a part that `serve.conf` does not, such as a TCP forward or Funnel;
+   - makes Tailscale Serve exactly the release's `serve.conf` for the device's tailnet name now, as
+     `tailscale status --self --json` gives it. A Serve that is that already stays as it is. Any
+     other it gives to `serve-apply`, which runs as root in a systemd unit of its own, apart from
+     `provision.sh`, which waits for it and prints its lines. The unit and its `serve-apply` are the
+     run's own, named by its run id, and `serve-apply` removes itself when it ends, so no run
+     removes another run's. `serve-apply` reads the recorder's `/api/status` immediately before the
+     reset. While the recorder records a conversation (a non-empty `active_session_id`) or holds a
+     call whose `state` is not `none`, it resets nothing, and `provision.sh` stops and says that
+     nothing in Serve was changed: run it again after the meeting. With no status that it can
+     read, it goes on only when `ghost-wispr`'s user manager confirms `inactive` for
+     `ghost-wispr.service` within 30 s; a manager that does not answer, a read that fails, or any
+     other state refuses the same way. The read is a snapshot: a session that starts after that
+     read, in the fraction of a second before the reset, is not seen, so provision outside
+     meetings. Otherwise
+     it clears Serve with `tailscale serve reset`, Tailscale's documented way to clear Serve
+     ([tailscale serve](https://tailscale.com/kb/1242/tailscale-serve), "Reset Tailscale Serve"),
+     and then it applies each line of `serve.conf` with `tailscale serve --bg --https`. Each
+     tailscale call ends after 30 s, so a call that hangs fails, and when a call fails, it applies
+     `serve.conf` again, up to 4 tries 2 s apart. The unit's `RuntimeMaxSec` ends it when it runs
+     longer than those steps can. The reset also clears the entry of a name the device had before
+     a rename, which tailscaled keeps beside the entry of its name now and which no
+     `tailscale serve --https=<port> off` reaches, and a port, a mount, a TCP forward or Funnel that
+     `serve.conf` does not hold. From the reset until the last line is applied, the page and
+     `/call` are not served. A kill of `provision.sh` or a lost SSH session does not stop the unit,
+     so the apply still ends. When the unit fails or does not end in time, `provision.sh` prints
+     `Serve is now [<lines>]`, or `[none]` when the page is not served, and the command to run.
+     When every try failed, or the Pi lost power during the apply, Serve stays empty, and only
+     another run of `./provision.sh` puts it back: the nightly update never changes Serve, and
+     check 7 of `check-deploy.sh` fails with `have none` and names that command. Then
+     `provision.sh` reads Serve again, and stops before the join when Serve is not `serve.conf`'s;
    - starts the tagged tailnet join as a detached unit, with `PI_TAILNET_CLIENT_ID` and
      `PI_SERVICE_ACCOUNT_UNIQUE_ID`, or stops after "already joined" on a Pi that is joined as
      `tag:ghost-wispr` already.
 
-   It ends with `already joined as tag:ghost-wispr`, or with the line that names the detached join
-   unit it started. The SSH session can end while Tailscale re-authenticates (exit 255). The join
-   unit's command line holds each `tailscale serve` call of `serve.conf`, so the join reads no file
-   of the release directory. The join runs `tailscale up` with `--accept-routes=false`, so the Pi
-   joins with the tailnet's subnet routes off. Then it runs the route check of "Accept the tailnet's
-   subnet routes", and accepts the routes (`tailscale set --accept-routes`) only when no peer's
-   `PrimaryRoutes` overlaps a network of the Pi.
+   It ends with `already joined as tag:ghost-wispr`, or with the lines that name the detached join
+   unit it started and the command that shows its lines, a login URL of `tailscale up` among them:
+   `sudo journalctl -u ghost-wispr-provision-join`. Its read of whether the Pi is joined ends after
+   30 s too. The SSH session can end while Tailscale re-authenticates (exit 255). The join is the
+   unit `ghost-wispr-provision-join`, apart from the run's, so the run's end does not stop it, and
+   a later run refuses while it is active; its `RuntimeMaxSec` of 15 minutes keeps a join that
+   hangs from refusing every later run for good. The join's token, route check and `serve-apply`
+   are in the run's directory under `/run/ghost-wispr-join`, a tmpfs that a boot clears. The join
+   removes the token as soon as `tailscale up` ends, and the unit's `ExecStopPost` removes the
+   run's directory whatever stopped the join: its end, a failure, a kill or its `RuntimeMaxSec`.
+   When the join unit does not start, `provision.sh` removes the directory itself and fails. The
+   join unit's command line runs the run's `serve-apply` with each line of `serve.conf` as its
+   arguments, so the join reads no file of the release directory. The join runs the same apply
+   after the re-authentication, with the same status read: while the recorder is busy, it resets
+   nothing in Serve, and the join unit ends failed with exit 75. The join runs `tailscale up`
+   with `--accept-routes=false`, so the Pi joins with the tailnet's subnet routes off. Then it runs
+   the route check of "Accept the tailnet's subnet routes", and accepts the routes
+   (`tailscale set --accept-routes`) only when no peer's `PrimaryRoutes` overlaps a network of the
+   Pi.
 6. On your own device, in a Ghost Wispr checkout, give the tagged device its name. The tagged join
    makes a new Tailscale device. The temporary device you joined as your own still holds the name
    `ghost-wispr`, so Tailscale names the tagged one `ghost-wispr-1`, and
@@ -324,7 +376,7 @@ restarts the recorder, and a restart ends a conversation that is being recorded.
 
    ```bash
    ssh ghost-wispr@ghost-wispr 'tailscale status --self --json'
-   ssh ghost-wispr@ghost-wispr 'sudo journalctl -u "ghost-wispr-tailnet-join-*"'
+   ssh ghost-wispr@ghost-wispr 'sudo journalctl -u ghost-wispr-provision-join'
    ssh ghost-wispr@ghost-wispr 'tailscale debug prefs' | jq .RouteAll
    curl -fsS https://ghost-wispr.tail12ec1c.ts.net/api/version
    ```
@@ -475,7 +527,7 @@ The detached join of "Provision" uses the check:
 
 When the check refuses, the join unit ends failed. The Pi stays in the tailnet, with `RouteAll`
 false. The check's lines are in the unit's journal. Read them on the Pi with
-`sudo journalctl -u 'ghost-wispr-tailnet-join-*'`. To fix an overlap, remove the route or change
+`sudo journalctl -u ghost-wispr-provision-join`. To fix an overlap, remove the route or change
 the office network's range. Then run the block below.
 
 A new run of `provision.sh` on a Pi already joined as `tag:ghost-wispr` exits before the join. So
@@ -1002,10 +1054,14 @@ A run of `update.sh`:
 7. After an install, or with the release current, compares the three provisioning files that the
    nightly update does not install (the launcher, `ghost-wispr-update.service` and
    `ghost-wispr-update.timer`) with the manifest, and the live Tailscale Serve setting with the
-   release's `serve.conf`. It prints one drift line for each difference:
+   release's `serve.conf`, for the device's tailnet name as `tailscale status --self --json` gives
+   it. A Serve entry of another name, such as the one tailscaled keeps under the device's name
+   before a rename, is a line `<port> <proxy target> on <name>`. It prints one drift line for each
+   difference:
    - `ghost-wispr update: provisioning file <name> differs from the release; run the release's provision.sh`
    - `ghost-wispr update: Serve differs from the release: want <lines>, have <lines>`
-   - `ghost-wispr update: Serve: UNKNOWN (<why>)`, when it cannot read or parse Serve's setting
+   - `ghost-wispr update: Serve: UNKNOWN (<why>)`, when it cannot read or parse Serve's setting, or
+     read the device's name
 
    A difference changes no exit code. Apply it with one run of the release's `provision.sh`
    ("Apply a provisioning change", below).

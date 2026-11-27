@@ -24,6 +24,84 @@ PI_LIB_CONFIG_FILE_VARIABLE='GHOST_WISPR_CONFIG'
 # The variables that would override the config's Envoy settings, envoy_enabled, envoy_hub_url and
 # concierge.envoy_url: each variable internal/config's applyEnvOverrides reads for an Envoy setting.
 PI_LIB_ENVOY_OVERRIDE_VARIABLES='GHOST_WISPR_ENVOY_ENABLED|GHOST_WISPR_ENVOY_HUB_URL|GHOST_WISPR_CONCIERGE_ENVOY_URL'
+# The jq filter that is true for an answer of the recorder's /api/status: an object with
+# active_session_id, paused and capture_state.
+# shellcheck disable=SC2034 # update.sh and provision.sh, which source this file, read it.
+PI_LIB_RECORDER_STATUS_FILTER='type == "object" and (.active_session_id | type == "string") and (.paused | type == "boolean") and (.capture_state | type == "string")'
+# The jq filter that prints, from such a status, why the recorder is busy: it records a session, or
+# it holds a call whose state is not none (a Meet call that INFRA-5904's call bridge links to the
+# Pi). It prints nothing when the recorder is free. A busy recorder may not restart (update.sh), and
+# Serve, which carries the page and /call, may not be reset under it (provision.sh's Serve apply).
+# shellcheck disable=SC2034 # update.sh and provision.sh, which source this file, read it.
+PI_LIB_BUSY_REASON_FILTER='if .active_session_id != "" then "active session" elif .call == null then empty elif (.call | type) != "object" then "call unknown" elif .call.state != "none" then "call \(.call.state // "unknown")" else empty end'
+# The transient system units that a provisioning run is (provision.sh): the run itself, and the
+# detached tailnet join it starts. systemd starts a unit of each name once at a time, so a second
+# run cannot start while the first runs, and the end of a run, however it comes, ends every process
+# of its unit.
+# shellcheck disable=SC2034 # provision.sh and provision_unit_test.sh, which source this file, read it.
+PI_LIB_PROVISION_UNIT=ghost-wispr-provision
+# shellcheck disable=SC2034 # provision.sh and provision_unit_test.sh, which source this file, read it.
+PI_LIB_PROVISION_JOIN_UNIT=ghost-wispr-provision-join
+
+# provision_unit_command UNIT USER sets the array pl_unit_command to the systemd-run command, less its
+# settings and program, that runs a provisioning run as the transient system unit UNIT, as USER. The
+# run's output reaches the caller (--pipe, which a plain SSH session takes, where --pty hangs), the
+# caller waits for its end and gets its exit status (--wait), a failed run leaves no unit behind
+# (--collect), and its end, by any cause, ends every process of the unit (KillMode=control-group),
+# with SIGKILL 10 s after SIGTERM. The caller runs it as root: sudo "${pl_unit_command[@]}" ...
+provision_unit_command() {
+  # shellcheck disable=SC2034 # The caller reads it.
+  pl_unit_command=(systemd-run "--unit=$1" --pipe --wait --collect --quiet --property=KillMode=control-group
+    --property=TimeoutStopSec=10s "--uid=$2")
+}
+
+# The caller's settings that a run's unit gets: provision.sh's own and those of the nightly update it
+# starts, never a credential. A unit's Environment property is readable by any local user, so a
+# GHOST_WISPR_DISPATCH_TOKEN or GHOST_WISPR_DEEPGRAM_API_KEY that the caller exports stays out
+# (GPT-6.1 Sol's review of #203, round 6).
+# shellcheck disable=SC2034 # provision.sh, which sources this file, reads it.
+PI_LIB_PROVISION_SETTINGS=(GHOST_WISPR_DEPLOY_DIR GHOST_WISPR_UNIT_DIR GHOST_WISPR_SYSTEM_ROOT GHOST_WISPR_IDENTITY_KEY
+  GHOST_WISPR_JOIN_DIR GHOST_WISPR_STATUS_URL GHOST_WISPR_TAILSCALE_CALL_TIMEOUT GHOST_WISPR_RELEASE_API
+  GHOST_WISPR_VERSION_URL)
+
+# provision_unit_settings sets the array pl_unit_settings to the --setenv options of a run's unit:
+# PATH, and each setting of PI_LIB_PROVISION_SETTINGS that the caller sets.
+provision_unit_settings() {
+  local pl_name
+  # shellcheck disable=SC2034 # The caller reads it.
+  pl_unit_settings=("--setenv=PATH=$PATH")
+  for pl_name in "${PI_LIB_PROVISION_SETTINGS[@]}"; do
+    if [[ -n ${!pl_name+set} ]]; then
+      pl_unit_settings+=("--setenv=$pl_name=${!pl_name}")
+    fi
+  done
+}
+
+# provision_units_busy UNIT... prints a line for each UNIT.service that systemd has in another state
+# than inactive or failed: "UNIT.service is STATE since TIME, main PID N". It fails when it cannot
+# read a unit's state.
+provision_units_busy() {
+  local pl_unit pl_show pl_state pl_since pl_main
+  for pl_unit; do
+    pl_show=$(systemctl show -p ActiveState -p ActiveEnterTimestamp -p MainPID "$pl_unit.service") || return 1
+    pl_state=$(sed -n 's/^ActiveState=//p' <<<"$pl_show")
+    pl_since=$(sed -n 's/^ActiveEnterTimestamp=//p' <<<"$pl_show")
+    pl_main=$(sed -n 's/^MainPID=//p' <<<"$pl_show")
+    case $pl_state in
+      inactive | failed) ;;
+      '') return 1 ;;
+      *) printf '%s.service is %s since %s, main PID %s\n' "$pl_unit" "$pl_state" "${pl_since:-an unknown time}" "${pl_main:-unknown}" ;;
+    esac
+  done
+}
+
+# provision_stop_traps makes a run that systemd stops end failed. systemd counts an end by SIGTERM,
+# which systemctl stop sends, or by SIGHUP as clean, and systemd-run --wait then gives the caller 0;
+# with these traps the run exits 143 or 129 instead, once the command it waits for has ended.
+provision_stop_traps() {
+  trap 'exit 143' TERM
+  trap 'exit 129' HUP
+}
 
 valid_drive_id() {
   [[ $1 =~ ^[A-Za-z0-9_-]+$ ]]
@@ -226,21 +304,33 @@ serve_conf_lines() {
   fi
 }
 
-# serve_lines_from_status JSON prints the Serve setting that JSON, the answer of
+# device_tailnet_name STATUS prints the device's tailnet name that STATUS, the answer of
+# `tailscale status --self --json`, gives as Self.DNSName, without its final dot. It fails on an
+# answer it cannot read and on a name that is empty or not a DNS name.
+device_tailnet_name() {
+  jq -er '.Self.DNSName | strings | select(test("^[A-Za-z0-9-]+(\\.[A-Za-z0-9-]+)*\\.$")) | rtrimstr(".")' \
+    <<<"$1" 2>/dev/null
+}
+
+# serve_lines_from_status JSON NAME prints the Serve setting that JSON, the answer of
 # `tailscale serve status --json` (tailscale's ipn.ServeConfig), holds: one line for each handler of
-# each HTTPS port, sorted. A proxy at / prints as serve_conf_lines prints a line of serve.conf,
-# "<port> <proxy target>". Each other handler (files, a text, a redirect, a proxy at another path,
-# or a proxy that forwards peer capabilities) prints as "<port> <path> <kind> <value>", the path and
-# the value as JSON strings: three fields or more, which no line of serve.conf equals. {} serves
-# nothing, and prints nothing. It fails on an empty answer, on one that is not one JSON object, and
-# on a Serve of a shape it does not know: a key, a port, a handler or a value of another type, a
-# Web entry on a port that serves no HTTPS, an HTTPS port with no handler, a TCP forward or plain
-# HTTP, Funnel, a service or a foreground Serve. So a caller can tell a Serve it cannot read from one
-# that matches serve.conf, and never reads a part it does not know as a match.
+# each HTTPS port, sorted. NAME is the device's tailnet name (device_tailnet_name). A proxy at / of
+# NAME prints as serve_conf_lines prints a line of serve.conf, "<port> <proxy target>". Each other
+# handler (files, a text, a redirect, a proxy at another path, or a proxy that forwards peer
+# capabilities) prints as "<port> <path> <kind> <value>", the path and the value as JSON strings:
+# three fields or more, which no line of serve.conf equals. A Web entry of another name than NAME,
+# such as the one a device renamed after its Serve was set keeps under its name before, prints each
+# of its lines with " on <name>" after it, so that it differs from serve.conf and names the name,
+# and never reads as a second line of NAME's port. {} serves nothing, and prints nothing. It fails
+# on an empty answer or NAME, on one that is not one JSON object, and on a Serve of a shape it does
+# not know: a key, a port, a handler or a value of another type, a Web entry on a port that serves
+# no HTTPS, an HTTPS port with no handler, a TCP forward or plain HTTP, Funnel, a service or a
+# foreground Serve. So a caller can tell a Serve it cannot read from one that matches serve.conf,
+# and never reads a part it does not know as a match.
 serve_lines_from_status() {
   local pl_lines
-  [[ -n $1 ]] || return 1
-  pl_lines=$(jq -rs '
+  [[ -n $1 && -n ${2:-} ]] || return 1
+  pl_lines=$(jq -rs --arg name "$2" '
     def check(cond; why): if cond then . else error(why) end;
     def kinds: "Path", "Proxy", "Text", "Redirect";
     check(length == 1; "not one JSON value") | .[0]
@@ -254,7 +344,8 @@ serve_lines_from_status() {
         "a TCP port that does not serve HTTPS")
     | [$web | to_entries[]
         | check(.key | test("^[^:]+:[1-9][0-9]{0,4}$"); "a Web key that is not <host>:<port>")
-        | (.key | split(":")[1]) as $port
+        | (.key | split(":")) as [$host, $port]
+        | (if $host == $name then "" else " on \($host)" end) as $on
         | check($tcp | has($port); "a Web entry on a port that serves no HTTPS")
         | check(.value | type == "object" and keys == ["Handlers"] and (.Handlers | type == "object" and length > 0);
             "a Web entry that is not a set of handlers")
@@ -271,7 +362,8 @@ serve_lines_from_status() {
           then "\($port) \(.value)"
           else "\($port) \($path | @json) \(.key | ascii_downcase) \(.value | @json)"
             + if $handler.AcceptAppCaps == null then "" else " accept-app-caps \($handler.AcceptAppCaps | @json)" end
-          end]
+          end
+        | . + $on]
     | check(all($tcp | keys[]; . as $port | any($web | keys[]; endswith(":" + $port))); "an HTTPS port with no handler")
     | .[]' <<<"$1" 2>/dev/null) || return 1
   if [[ -n $pl_lines ]]; then

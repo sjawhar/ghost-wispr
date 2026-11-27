@@ -132,25 +132,20 @@ recorder_active() {
 }
 
 # recorder_status prints the recorder's /api/status, or nothing when it does not answer, or answers
-# something that is not its status (an object with active_session_id, paused and capture_state).
+# something that is not its status (pi-lib.sh's PI_LIB_RECORDER_STATUS_FILTER).
 recorder_status() {
   local answer
   answer=$(curl --connect-timeout 5 --max-time 10 --fail --silent --show-error "$STATUS_URL" 2>/dev/null) || return 0
-  jq -e 'type == "object" and (.active_session_id | type == "string") and (.paused | type == "boolean") and (.capture_state | type == "string")' \
-    >/dev/null 2>&1 <<<"$answer" || return 0
+  jq -e "$PI_LIB_RECORDER_STATUS_FILTER" >/dev/null 2>&1 <<<"$answer" || return 0
   printf '%s' "$answer"
 }
 
-# busy_reason STATUS prints why the recorder may not restart, from its /api/status (STATUS): it
-# records a session, or it holds a call (call.state is not none). It prints nothing when it may
-# restart, or when it gave no status.
+# busy_reason STATUS prints why the recorder may not restart, from its /api/status (STATUS), with
+# pi-lib.sh's PI_LIB_BUSY_REASON_FILTER: it records a session, or it holds a call (call.state is not
+# none). It prints nothing when it may restart, or when it gave no status.
 busy_reason() {
   [[ -n $1 ]] || return 0
-  jq -r 'if .active_session_id != "" then "active session"
-    elif .call == null then empty
-    elif (.call | type) != "object" then "call unknown"
-    elif .call.state != "none" then "call \(.call.state // "unknown")"
-    else empty end' <<<"$1" 2>/dev/null || printf 'status unreadable'
+  jq -r "$PI_LIB_BUSY_REASON_FILTER" <<<"$1" 2>/dev/null || printf 'status unreadable'
 }
 
 # leave_if_busy reads the recorder's status into status_json. While the recorder records a session or
@@ -807,9 +802,10 @@ join_lines() {
 }
 
 # report_drift prints a line for each bootstrap file that is not the release's, and for a Serve
-# setting that is not the release's serve.conf (D4, R16). It changes nothing, and no exit code.
+# setting that is not the release's serve.conf for the device's tailnet name (D4, R16). It changes
+# nothing, and no exit code.
 report_drift() {
-  local names name want have serve
+  local names name want have serve self device
   if names=$(bootstrap_drift "$manifest_json" "$DEPLOY_DIR" "$UNIT_DIR"); then
     while IFS= read -r name; do
       if [[ -n $name ]]; then
@@ -827,7 +823,13 @@ report_drift() {
     printf 'ghost-wispr update: Serve: UNKNOWN (tailscale serve status --json failed or did not answer within 10 s)\n'
     return 0
   fi
-  if ! have=$(serve_lines_from_status "$serve"); then
+  # The device's name tells its own Web entries from those of another name, such as the one a
+  # rename leaves.
+  if ! self=$(timeout 10s tailscale status --self --json 2>/dev/null) || ! device=$(device_tailnet_name "$self"); then
+    printf "ghost-wispr update: Serve: UNKNOWN (tailscale status --self --json failed, did not answer within 10 s, or gave no DNSName, the device's name)\n"
+    return 0
+  fi
+  if ! have=$(serve_lines_from_status "$serve" "$device"); then
     printf 'ghost-wispr update: Serve: UNKNOWN (tailscale serve status --json gave no Serve setting it could read)\n'
     return 0
   fi

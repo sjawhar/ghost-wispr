@@ -2,22 +2,26 @@
 # Runs deploy/pi/provision.sh from a release's deploy set, the directory that
 # deploy/pi/build-deploy-tarball.sh --stage writes as release.yml builds it, on a fake Pi: its deploy
 # directory, its user unit directory and its key, under one temporary directory
-# (dispatch://INFRA-5935/spec R14 and R16, check c-provision). Fakes stand in for sudo, systemctl
-# --user, id, ip, curl, journalctl (through sudo) and tailscale with its Serve setting, and for the
-# release binary that the nightly update installs. The release's pi.env is deploy/pi/test-pi.env,
+# (dispatch://INFRA-5935/spec R14 and R16, check c-provision). Fakes stand in for sudo, systemd's
+# system manager with the transient units that a run and its join are, systemctl --user, id, ip,
+# curl, jq, install, openssl, journalctl (through sudo) and tailscale with its Serve setting, and for
+# the release binary that the nightly update installs. The release's pi.env is deploy/pi/test-pi.env,
 # with the SHA-256 the manifest gives it, so no case reads the office Pi's settings.
 #
 # It checks that provision.sh reads no bundle; refuses a directory that is not a release's; writes
 # the Google credential files from pi.env where they are missing and only compares them where they
 # exist; installs the bootstrap files and the release's update.sh, pi-lib.sh and pi.env before it
 # starts the nightly update, once and through systemd; writes no .env and installs no system file
-# itself; applies serve.conf and turns off each other Serve port; and joins the tailnet with the
-# client id and the subject of pi.env, in a join command that holds each Serve call as text and
-# reads no file of the release's directory. The detached join accepts the tailnet's subnet routes
+# itself; makes Serve serve.conf's for the device's name, with tailscale serve reset when it is not;
+# and joins the tailnet with the client id and the subject of pi.env, in a join command that resets
+# Serve, holds each Serve call as text and reads no file of the release's directory. The detached
+# join accepts the tailnet's subnet routes
 # only when the route check that provision.sh installs beside the token finds that no peer's route
 # overlaps a network of the Pi; the check runs alone on the Pi's networks and on tailnet statuses of
-# each kind. It also runs provision.sh --key, --certificate and --models. The fakes are no Pi, so a
-# pass does not show one.
+# each kind. It runs each run as one transient system unit, which a second run is refused while it
+# or its join is active and whose stop ends every command of it. It also runs provision.sh --key,
+# --certificate and --models. The fakes are no Pi, so a pass does not show one; the unit's real
+# systemd behavior is deploy/pi/provision_unit_test.sh's.
 set -euo pipefail
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -32,7 +36,7 @@ trap 'rm -rf -- "$work_dir"' EXIT
 readonly case_names=(bundle-refused not-a-release first-run one-update-start release-files-first
   credentials-written bootstrap-files no-env-no-system-files groups-and-linger join-command idempotent
   credentials-same credentials-differ client-id newer-release newer-release-certificate bootstrap-repair
-  serve update-fails recorder-unit join route-check manager-env key certificate models)
+  serve provision-unit update-fails recorder-unit join route-check manager-env key certificate models)
 current_case=setup
 ran_cases=' '
 
@@ -68,39 +72,104 @@ readonly commit_a=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa commit_b=bbbbbbbbbbbb
 readonly client_id=k-test-client-id subject=123456789012345678901
 real_date=$(command -v date)
 real_sleep=$(command -v sleep)
-readonly real_date real_sleep
+real_jq=$(command -v jq)
+real_install=$(command -v install)
+real_openssl=$(command -v openssl)
+readonly real_date real_sleep real_jq real_install real_openssl
 # The release API and the recorder's two answers, as the real nightly update reads them here.
 readonly release_api=https://api.test.invalid/releases/latest status_url=http://recorder.test.invalid/api/status \
   version_url=http://recorder.test.invalid/api/version
+# The bound of each tailscale call of the Serve apply: 5 s here, where a call that hangs must end
+# soon, and a fake call on a loaded dev box still ends in time. A run's id, which names its Serve
+# unit and its directory under the join directory, is a UUID.
+readonly tailscale_call_timeout=5 \
+  uuid_re='[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
+# The fake system manager's transient units: a file NAME.service for each active one
+# (start_system_unit), which the fake systemctl reads and stops.
+readonly system_units=$work_dir/system-units
 export TEST_LOG="$work_dir/log" TEST_UID="$uid" TEST_RUNTIME_DIR="$runtime_dir" TEST_DEPLOY="$deploy" \
   TEST_UNIT_DIR="$units" TEST_BINARY="$work_dir/recorder-binary" \
   TEST_RECORDER_UNIT="$repo_root/deploy/pi/files/ghost-wispr.service" TEST_SERVE_STATE="$work_dir/serve.json" \
   TEST_SERVE_HOST=ghost-wispr.example-tailnet.ts.net TEST_ROUTE_ALL="$work_dir/route-all" TEST_SUBJECT="$subject" \
   TEST_REAL_DATE="$real_date" TEST_REAL_SLEEP="$real_sleep" TEST_STATE="$state" TEST_RELEASES="$work_dir/releases" \
-  TEST_CLOCK="$work_dir/clock"
-mkdir -p -- "$bin" "$join" "$first_join" "$TEST_RELEASES"
+  TEST_CLOCK="$work_dir/clock" TEST_SYSTEM_UNITS="$system_units" TEST_REAL_JQ="$real_jq" \
+  TEST_REAL_INSTALL="$real_install" TEST_REAL_OPENSSL="$real_openssl"
+mkdir -p -- "$bin" "$join" "$first_join" "$TEST_RELEASES" "$system_units"
 
+# hang WHAT: what each fake does in place of a command that never ends. It writes its PID to
+# $TEST_LOG.hung-WHAT, and then waits 600 s.
+cat >"$bin/hang" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$$" >"$TEST_LOG.hung-$1"
+exec "$TEST_REAL_SLEEP" 600
+EOF
+
+# id answers as for ghost-wispr; with TEST_ID_HANG, id -nG ghost-wispr, the groups pipeline's first
+# command, never ends.
 cat >"$bin/id" <<'EOF'
 #!/usr/bin/env bash
 case "$*" in
   -un) printf 'ghost-wispr\n' ;;
   '-u ghost-wispr') printf '%s\n' "$TEST_UID" ;;
-  '-nG ghost-wispr') printf 'ghost-wispr sudo plugdev input\n' ;;
+  '-nG ghost-wispr')
+    [[ -z ${TEST_ID_HANG:-} ]] || exec hang id
+    printf 'ghost-wispr sudo plugdev input\n'
+    ;;
   *) printf 'fake id: %s\n' "$*" >&2; exit 1 ;;
 esac
 EOF
 
+# jq, install and openssl are the real ones, but for one call each that never ends: with
+# TEST_JQ_HANG, jq's read of the names that the release's manifest lists; with TEST_INSTALL_HANG, the
+# install of the user unit directory; with TEST_OPENSSL_HANG, provision.sh --key's openssl req.
+cat >"$bin/jq" <<'EOF'
+#!/usr/bin/env bash
+if [[ -n ${TEST_JQ_HANG:-} && " $* " == *' .files | objects | keys[] '* ]]; then
+  exec hang jq
+fi
+exec "$TEST_REAL_JQ" "$@"
+EOF
+cat >"$bin/install" <<'EOF'
+#!/usr/bin/env bash
+if [[ -n ${TEST_INSTALL_HANG:-} && $* == "-d -m 0755 -- $TEST_UNIT_DIR" ]]; then
+  exec hang install
+fi
+exec "$TEST_REAL_INSTALL" "$@"
+EOF
+cat >"$bin/openssl" <<'EOF'
+#!/usr/bin/env bash
+if [[ -n ${TEST_OPENSSL_HANG:-} && ${1:-} == req ]]; then
+  exec hang openssl
+fi
+exec "$TEST_REAL_OPENSSL" "$@"
+EOF
+
 # The fake sudo logs each command. It runs install -d, less -o and -g, which need root; keeps what is
 # installed from standard input as $TEST_LOG.installed-NAME; runs tailscale through the fake below;
-# prints $TEST_JOURNAL for journalctl; keeps systemd-run's command, and its whole line, to run the
-# join below; and runs nothing else. provision.sh installs its own files as ghost-wispr, and the
-# nightly update the system files: any other install with sudo, any udevadm call and a logind
-# restart are errors that the test reports. The nightly update's own calls each have -n: it
-# installs the system files under GHOST_WISPR_SYSTEM_ROOT, reloads udev and restarts logind, which
-# the log records, and reads Serve's setting.
+# prints $TEST_JOURNAL for journalctl, or for journalctl -u of a Serve unit that unit's lines. Of
+# systemd-run it starts the run's unit, ghost-wispr-provision, with system-unit below; keeps the
+# join's command, and its whole line, to run the join below; and runs a systemd-run --wait unit,
+# provision.sh's Serve apply, on the serve-apply that provision.sh installed, with its lines in
+# $TEST_LOG.serve-journal, and marks its end with $TEST_LOG.serve-unit-done; and runs nothing else.
+# provision.sh installs its own files as ghost-wispr, and the nightly update the system files: any
+# other install with sudo, any udevadm call and a logind restart are errors that the test reports.
+# The nightly update's own calls each have -n: it installs the system files under
+# GHOST_WISPR_SYSTEM_ROOT, reloads udev and restarts logind, which the log records, and reads Serve's
+# setting.
 cat >"$bin/sudo" <<'EOF'
 #!/usr/bin/env bash
-printf 'sudo %s\n' "$*" >>"$TEST_LOG"
+# The start of the run's own unit is logged apart, in $TEST_LOG.provision-units: $TEST_LOG holds what
+# the run does on the Pi.
+[[ $* == 'systemd-run --unit=ghost-wispr-provision '* ]] || printf 'sudo %s\n' "$*" >>"$TEST_LOG"
+# Real sudo closes each descriptor above 2 (sudoers' closefrom, 3 by default).
+for fd in 3 4 5 6 7 8 9; do
+  eval "exec $fd>&-"
+done 2>/dev/null
+# unit_is_active NAME: the fake system manager has NAME.service active, with a main process alive.
+unit_is_active() {
+  local main
+  main=$(sed -n 's/^MainPID=//p' "$TEST_SYSTEM_UNITS/$1.service" 2>/dev/null) && [[ -n $main ]] && kill -0 "$main" 2>/dev/null
+}
 error() { printf 'fake sudo: %s: sudo %s\n' "$1" "${*:2}" >>"$TEST_LOG.errors"; }
 if [[ ${1:-} == -n ]]; then
   shift
@@ -129,6 +198,10 @@ case $1 in
   install)
     if [[ " $* " == *' /dev/stdin '* ]]; then
       cat >"$TEST_LOG.installed-$(basename -- "${!#}")"
+      # A file of a run's directory under the join directory lands there too, as root's files do.
+      if [[ ${!#} == "$GHOST_WISPR_JOIN_DIR"/*/* && -d ${!#%/*} ]]; then
+        cp -- "$TEST_LOG.installed-$(basename -- "${!#}")" "${!#}"
+      fi
     elif [[ ${2:-} == -d ]]; then
       arguments=()
       while (($# > 1)); do
@@ -148,30 +221,210 @@ case $1 in
     exec tailscale "$@"
     ;;
   journalctl)
-    if [[ -f ${TEST_JOURNAL:-} ]]; then
+    if [[ " $* " == *' -u ghost-wispr-serve-'* ]]; then
+      cat -- "$TEST_LOG.serve-journal" 2>/dev/null
+    elif [[ -f ${TEST_JOURNAL:-} ]]; then
       cat -- "$TEST_JOURNAL"
     fi
     ;;
   systemd-run)
+    # The options before the program, as systemd-run reads them.
+    unit='' limit=infinity directory=/ setenv=()
+    arguments=("${@:2}")
+    first=0
+    while [[ ${arguments[first]:-} == --* ]]; do
+      case ${arguments[first]} in
+        --unit=*) unit=${arguments[first]#--unit=} ;;
+        --property=RuntimeMaxSec=*) limit=${arguments[first]#--property=RuntimeMaxSec=} ;;
+        --setenv=*) setenv+=("${arguments[first]#--setenv=}") ;;
+        --working-directory=*) directory=${arguments[first]#--working-directory=} ;;
+      esac
+      first=$((first + 1))
+    done
+    program=("${arguments[@]:first}")
+    if [[ $unit == ghost-wispr-provision ]]; then
+      printf '%s\n' "$*" >>"$TEST_LOG.provision-units"
+      # With TEST_PROVISION_START_HOLD, the start waits while that file exists, after the run's
+      # checks and before systemd takes the unit's name: another run can start and end there.
+      if [[ -n ${TEST_PROVISION_START_HOLD:-} ]]; then
+        : >"$TEST_LOG.start-held"
+        while [[ -f $TEST_PROVISION_START_HOLD ]]; do
+          "$TEST_REAL_SLEEP" 0.1
+        done
+      fi
+      exec system-unit "$unit" "$directory" "${setenv[@]}" -- "${program[@]}"
+    fi
+    if [[ " $* " == *' --wait '* ]]; then
+      # The unit runs apart from provision.sh, in its own session as in its own control group: the
+      # end of provision.sh's unit does not stop it. It runs the serve-apply that provision.sh
+      # installed, at the path that the unit names, and ends after its RuntimeMaxSec, as systemd
+      # stops a unit that runs longer.
+      printf '%s\n' "$*" >>"$TEST_LOG.serve-units"
+      if [[ ${program[1]:-} == "$GHOST_WISPR_JOIN_DIR"/* && ${program[1]} == */serve-apply ]]; then
+        mkdir -p -- "${program[1]%/*}"
+        cp -- "$TEST_LOG.installed-serve-apply" "${program[1]}"
+      fi
+      # shellcheck disable=SC2016 # The unit's shell expands its own arguments.
+      exec setsid -w bash -c '
+        limit=$1
+        shift
+        status=0
+        if [[ $limit == infinity ]]; then
+          "$@" >>"$TEST_LOG.serve-journal" 2>&1 || status=$?
+        else
+          timeout --kill-after=1s "${limit}s" "$@" >>"$TEST_LOG.serve-journal" 2>&1 || status=$?
+        fi
+        # What the unit left when it ended, before a join'"'"'s files go into the same run'"'"'s directory.
+        if [[ -e ${2:-} || -d ${2%/*} ]]; then
+          printf "%s\n" "$2" >>"$TEST_LOG.serve-apply-left"
+        fi
+        : >"$TEST_LOG.serve-unit-done"
+        exit "$status"' sh "$limit" "${program[@]}"
+    fi
+    # The join: its command and its whole line, and each argument on a line of its own, from which
+    # run_join reads the unit's RuntimeMaxSec and ExecStopPost. It does not start while a join
+    # registered as active runs, nor with TEST_JOIN_START_EXIT, as systemd-run fails when it cannot.
+    if [[ $unit == ghost-wispr-provision-join ]] && unit_is_active "$unit"; then
+      printf 'Failed to start transient service unit: Unit %s.service was already loaded or has a fragment file.\n' "$unit" >&2
+      exit 1
+    fi
+    if [[ ${TEST_JOIN_START_EXIT:-0} != 0 ]]; then
+      printf 'Failed to start transient service unit: Unit %s.service was already loaded or has a fragment file.\n' "$unit" >&2
+      exit "$TEST_JOIN_START_EXIT"
+    fi
     printf '%s' "${!#}" >"$TEST_LOG.join"
     printf '%s\n' "$*" >"$TEST_LOG.systemd-run"
+    printf '%s\n' "${@:2}" >"$TEST_LOG.systemd-run-args"
+    ;;
+  rm)
+    # The run's own files under the join directory, which provision.sh removes as root.
+    [[ ${!#} == "$GHOST_WISPR_JOIN_DIR"/* ]] || { error 'a removal outside the join directory' "$@"; exit 1; }
+    exec rm "${@:2}"
     ;;
   udevadm) error 'a udev call' "$@" ;;
   systemctl)
     if [[ $* == *systemd-logind* || $* == *' --user '* ]]; then
       error 'a system file reload or a user call through sudo' "$@"
     fi
+    # reset-failed is the system manager's: the fake systemctl holds the run's units.
+    if [[ ${2:-} == reset-failed ]]; then
+      exec systemctl "${@:2}"
+    fi
     ;;
 esac
 EOF
 
-# The fake systemctl is ghost-wispr's user manager. It logs each call. A call without --user, or
-# whose XDG_RUNTIME_DIR is not the user's runtime directory, is an error the test reports.
+# session-signal SIGNAL SID sends SIGNAL to every process of the session SID, the fake unit's
+# control group, and fails when the session has none. A process group would not do: timeout, which
+# runs each tailscale call, moves itself and its command to a group of their own, which only a
+# control group or a session still holds.
+cat >"$bin/session-signal" <<'EOF'
+#!/usr/bin/env bash
+found=1
+while read -r pid sid; do
+  if [[ $sid == "$2" ]]; then
+    found=0
+    kill -s "$1" "$pid" 2>/dev/null
+  fi
+done < <(ps -eo pid=,sid=)
+exit "$found"
+EOF
+
+# system-unit NAME DIRECTORY [NAME=VALUE...] -- PROGRAM... is the transient system unit NAME as
+# systemd-run --pipe --wait starts it, its control group a session of its own: while a unit of that
+# name is active it refuses, with systemd-run's line; otherwise it runs PROGRAM in DIRECTORY, with
+# standard input and output passed through, in systemd's clean environment of HOME, USER, LOGNAME,
+# an INVOCATION_ID, the NAME=VALUE settings and the test's own TEST_ variables, which the fakes it
+# runs read. It notes the unit as active with its start time and main PID in
+# $TEST_SYSTEM_UNITS/NAME.service. Once the main process ends, by any cause, it ends each process
+# left in the session, as KillMode=control-group does (SIGTERM, then SIGKILL 10 s later), and exits
+# as systemd-run --wait does: with the main process's exit status, 0 when a signal that systemd
+# counts as a clean end (SIGHUP, SIGINT, SIGTERM, SIGPIPE) ended it, and 255 when another signal did,
+# as systemd 255 on a dev box answered. perl waits for the main process, as bash's wait could not
+# tell an exit 143 from an end by SIGTERM.
+cat >"$bin/system-unit" <<'EOF'
+#!/usr/bin/env bash
+set -u
+name=$1 directory=$2
+shift 2
+settings=()
+while [[ $1 != -- ]]; do
+  settings+=("$1")
+  shift
+done
+shift
+unit_file=$TEST_SYSTEM_UNITS/$name.service
+main=$(sed -n 's/^MainPID=//p' "$unit_file" 2>/dev/null) || main=
+# A unit of the name that is active, or failed and kept, as systemd keeps a failed unit that has no
+# --collect, takes the name: the start fails, as systemd's does.
+if { [[ -n $main ]] && kill -0 "$main" 2>/dev/null; } || grep -qx 'ActiveState=failed' "$unit_file" 2>/dev/null; then
+  printf 'Failed to start transient service unit: Unit %s.service was already loaded or has a fragment file.\n' "$name" >&2
+  exit 1
+fi
+kept=()
+while IFS= read -r variable; do
+  kept+=("$variable=${!variable}")
+done < <(compgen -e TEST_)
+exec 3<&0
+main_file=$(mktemp)
+UNIT_MAIN_FILE=$main_file UNIT_DIRECTORY=$directory perl -e '
+  use POSIX ();
+  my $pid = fork() // die "system-unit: fork: $!\n";
+  if ($pid == 0) {
+    POSIX::setsid();
+    chdir $ENV{UNIT_DIRECTORY} or exit 200;
+    exec { $ARGV[0] } @ARGV;
+    exit 127;
+  }
+  open(my $file, ">", $ENV{UNIT_MAIN_FILE}) or die "system-unit: $!\n";
+  print $file "$pid\n";
+  close $file;
+  waitpid($pid, 0);
+  my $status = $?;
+  if ($status & 127) {
+    my $signal = $status & 127;
+    exit(($signal == 1 || $signal == 2 || $signal == 13 || $signal == 15) ? 0 : 255);
+  }
+  exit($status >> 8);' env -i HOME="$HOME" USER=ghost-wispr LOGNAME=ghost-wispr \
+  INVOCATION_ID=test-provision-invocation "${kept[@]}" "${settings[@]}" "$@" <&3 3<&- &
+waiter=$!
+exec 3<&-
+main=
+# perl writes the main PID once it has forked; on a loaded dev box a fork can take seconds, so this
+# waits up to 30 s for it.
+for _ in {1..600}; do
+  main=$(cat -- "$main_file" 2>/dev/null) && [[ -n $main ]] && break
+  "$TEST_REAL_SLEEP" 0.05
+done
+rm -f -- "$main_file"
+printf 'ActiveState=active\nActiveEnterTimestamp=%s\nMainPID=%s\n' \
+  "$("$TEST_REAL_DATE" -u '+%a %Y-%m-%d %H:%M:%S UTC')" "$main" >"$unit_file"
+status=0
+wait "$waiter" || status=$?
+"${0%/*}/session-signal" TERM "$main"
+for _ in {1..100}; do
+  "${0%/*}/session-signal" 0 "$main" || break
+  "$TEST_REAL_SLEEP" 0.1
+done
+"${0%/*}/session-signal" KILL "$main"
+rm -f -- "$unit_file"
+exit "$status"
+EOF
+
+# The fake systemctl is ghost-wispr's user manager, and the system manager's view of the transient
+# units in $TEST_SYSTEM_UNITS. It logs each call. A user call whose XDG_RUNTIME_DIR is not the
+# user's runtime directory, and any other system call, is an error the test reports.
+# - show UNIT, without --user, prints UNIT's ActiveState, ActiveEnterTimestamp and MainPID: those
+#   that system-unit noted while its main process lives, else inactive, no time and 0.
+# - stop UNIT..., without --user, sends SIGTERM to each active UNIT's session, as
+#   KillMode=control-group does, and SIGKILL 10 s later, and returns once each has ended; kill
+#   --signal=SIGNAL UNIT sends SIGNAL to the session.
 # - daemon-reload moves the file TEST_MANAGER_ENV_PENDING names, when it exists, over
 #   TEST_MANAGER_ENV: an environment.d line written since the last reload counts from the next. It
 #   loads ghost-wispr-update.service as its file is then, $TEST_LOG.loaded-update-unit.
 # - show-environment prints the manager's environment: the file TEST_MANAGER_ENV names when it
 #   exists, else the few variables a manager has; it exits TEST_MANAGER_ENV_EXIT (0 by default).
+#   With TEST_MANAGER_ENV_HANG, it never ends.
 # - show -p LoadState -p DropInPaths UNIT prints the unit's load state from $TEST_UNITS/load-UNIT
 #   (loaded when absent) and its drop-ins from $TEST_UNITS/dropins-UNIT; show -p DropInPaths
 #   --value prints none, and show -p MainPID --value prints 0, a recorder with no image to read.
@@ -182,17 +435,99 @@ EOF
 #   uses: the binary and ghost-wispr.service. With TEST_REAL_UPDATE=1 it runs the ExecStart of the
 #   update unit it loaded instead, the real launcher and update.sh in the deploy directory, into
 #   the journal $TEST_JOURNAL, and fails as systemd does when that program fails or is no program.
+#   With TEST_BUSY_AFTER_UPDATE, the recorder's status becomes that text once the update ended.
 # - restart ghost-wispr.service starts the recorder, with TEST_REAL_UPDATE=1: it answers the commit
 #   that the installed binary's "# answers commit" line names, and is-active says it runs. show -p
 #   ExecMainStartTimestamp --timestamp=us+utc --value prints the real time of that start, as systemd
 #   prints it, or nothing while no recorder runs.
+# - --machine=ghost-wispr@ is-active ghost-wispr.service is how root, in the unit of provision.sh's
+#   Serve apply, asks ghost-wispr's manager whether the recorder runs: it prints active (exit 0)
+#   while the recorder runs, else inactive (exit 3). TEST_SERVICE_STATE is the line it prints
+#   instead (exit 3); then, with TEST_SERVICE_STATE_HANG, it never ends, as a manager that does not
+#   answer; and with TEST_SERVICE_STATE_EXIT it exits that code, with no line of its own.
 cat >"$bin/systemctl" <<'EOF'
 #!/usr/bin/env bash
-printf 'systemctl %s\n' "$*" >>"$TEST_LOG"
+# The system manager's calls, which read and stop the run's own units, go to $TEST_LOG.system-calls:
+# $TEST_LOG holds what the run does on the Pi.
+if [[ ${1:-} == --user ]]; then
+  printf 'systemctl %s\n' "$*" >>"$TEST_LOG"
+else
+  printf 'systemctl %s\n' "$*" >>"$TEST_LOG.system-calls"
+fi
 error() { printf 'fake systemctl: %s: systemctl %s\n' "$1" "${*:2}" >>"$TEST_LOG.errors"; }
 if [[ ${1:-} != --user ]]; then
-  error 'a call without --user' "$@"
-  exit 1
+  # The fakes' own directory, which the test's own calls do not have on their PATH.
+  session_signal=${0%/*}/session-signal
+  main_of() { sed -n 's/^MainPID=//p' "$TEST_SYSTEM_UNITS/${1%.service}.service" 2>/dev/null; }
+  alive() { [[ -n $1 ]] && kill -0 "$1" 2>/dev/null; }
+  case ${1:-} in
+    show)
+      unit=${!#}
+      main=$(main_of "$unit")
+      if alive "$main" || grep -qx 'ActiveState=failed' "$TEST_SYSTEM_UNITS/${unit%.service}.service" 2>/dev/null; then
+        shown=$(cat -- "$TEST_SYSTEM_UNITS/${unit%.service}.service")
+      else
+        shown=$(printf 'ActiveState=inactive\nActiveEnterTimestamp=\nMainPID=0\n')
+      fi
+      # show -p PROPERTY --value prints that property's value alone, as systemctl does.
+      if [[ " $* " == *' --value '* && ${2:-} == -p ]]; then
+        sed -n "s/^$3=//p" <<<"$shown"
+      else
+        printf '%s\n' "$shown"
+      fi
+      ;;
+    reset-failed)
+      for unit in "${@:2}"; do
+        if grep -qx 'ActiveState=failed' "$TEST_SYSTEM_UNITS/${unit%.service}.service" 2>/dev/null; then
+          rm -f -- "$TEST_SYSTEM_UNITS/${unit%.service}.service"
+        fi
+      done
+      ;;
+    stop)
+      for unit in "${@:2}"; do
+        main=$(main_of "$unit")
+        alive "$main" || continue
+        "$session_signal" TERM "$main"
+        for _ in {1..100}; do
+          "$session_signal" 0 "$main" || break
+          "$TEST_REAL_SLEEP" 0.1
+        done
+        "$session_signal" KILL "$main"
+        for _ in {1..300}; do
+          alive "$main" || continue 2
+          "$TEST_REAL_SLEEP" 0.1
+        done
+        error "the main process $main of $unit outlived its SIGKILL by 30 s" "$@"
+        exit 1
+      done
+      ;;
+    kill)
+      [[ ${2:-} == --signal=* ]] || { error 'an unexpected call' "$@"; exit 1; }
+      main=$(main_of "${!#}")
+      alive "$main" && "$session_signal" "${2#--signal=}" "$main"
+      ;;
+    *)
+      error 'an unexpected system call' "$@"
+      exit 1
+      ;;
+  esac
+  exit 0
+fi
+if [[ ${2:-} == --machine=ghost-wispr@ ]]; then
+  [[ ${*:3} == 'is-active ghost-wispr.service' ]] || { error 'an unexpected call' "$@"; exit 1; }
+  [[ -z ${TEST_SERVICE_STATE:-} ]] || printf '%s\n' "$TEST_SERVICE_STATE"
+  [[ -z ${TEST_SERVICE_STATE_HANG:-} ]] || exec "$TEST_REAL_SLEEP" 600
+  if [[ ${TEST_SERVICE_STATE_EXIT:-0} != 0 ]]; then
+    [[ -n ${TEST_SERVICE_STATE:-} ]] || printf 'Failed to connect to bus: Connection refused\n' >&2
+    exit "$TEST_SERVICE_STATE_EXIT"
+  fi
+  [[ -z ${TEST_SERVICE_STATE:-} ]] || exit 3
+  if [[ -f $TEST_STATE/active ]]; then
+    printf 'active\n'
+    exit 0
+  fi
+  printf 'inactive\n'
+  exit 3
 fi
 [[ ${XDG_RUNTIME_DIR:-} == "$TEST_RUNTIME_DIR" ]] || error "XDG_RUNTIME_DIR is ${XDG_RUNTIME_DIR:-unset}" "$@"
 shift
@@ -227,6 +562,7 @@ case "$*" in
     ;;
   'show -p DropInPaths --value '*) printf '\n' ;;
   show-environment)
+    [[ -z ${TEST_MANAGER_ENV_HANG:-} ]] || exec hang show-environment
     if [[ -f ${TEST_MANAGER_ENV:-} ]]; then
       cat -- "$TEST_MANAGER_ENV"
     else
@@ -260,6 +596,9 @@ case "$*" in
       if ((status != 0)); then
         printf 'Job for ghost-wispr-update.service failed because the control process exited with error code.\n' >&2
         exit 1
+      fi
+      if [[ -n ${TEST_BUSY_AFTER_UPDATE:-} ]]; then
+        printf '%s\n' "$TEST_BUSY_AFTER_UPDATE" >"$TEST_STATE/status.json"
       fi
       exit 0
     fi
@@ -301,16 +640,24 @@ EOF
 # - `up` exits TEST_UP_EXIT (0 by default), and on 0 sets RouteAll as its --accept-routes flag says.
 #   Without the flag, while RouteAll is true, it refuses as up.go's check of settings left out does
 #   (Tailscale v1.104.1, cmd/tailscale/cli/up.go:1013-1105) and exits 1. It keeps its exit code in
-#   $TEST_LOG.up-exit;
+#   $TEST_LOG.up-exit. While the file TEST_UP_HOLD names exists, it waits first, as a
+#   re-authentication that takes its time;
 # - `set --accept-routes` exits TEST_SET_EXIT (0 by default), and on 0 sets RouteAll true;
 #   `set --accept-routes=false` sets it false;
-# - `status --self --json` prints the node's own reading, TEST_SELF_STATUS when it is set;
+# - `status --self --json` prints the node's own reading, TEST_SELF_STATUS when it is set, or fails
+#   with TEST_SELF_STATUS_EXIT; from its TEST_SELF_STATUS_HANG_FROM-th call on, it hangs (hang self);
 # - `status --json` prints the status fixture $TEST_STATUS, or fails with TEST_STATUS_EXIT;
-# - `serve --bg --https PORT TARGET` exits TEST_SERVE_EXIT (0 by default), and on 0 serves TARGET at
-#   the mount / of the HTTPS port PORT, and keeps each other mount of that port, as tailscale's
+# - `serve --bg --https PORT TARGET` exits TEST_SERVE_EXIT (0 by default), or 1 for each of its
+#   first TEST_SERVE_FAIL_TIMES calls, or never ends in each of its first TEST_SERVE_HANG_TIMES
+#   calls, and on 0 serves TARGET at the mount / of the HTTPS port PORT
+#   of the name TEST_SERVE_HOST, and keeps each other mount of that port, as tailscale's
 #   SetWebHandler does (ipn/serve.go, v1.104); `serve --https=PORT off` serves nothing there;
 #   `serve --https=PORT --set-path=MOUNT off` removes that mount, and the port with its last one;
-#   `serve status --json` prints the setting, or fails with TEST_SERVE_STATUS_EXIT;
+#   `serve reset` clears the whole setting, every name's entries, a TCP forward and Funnel too
+#   (tailscale's `serve reset`, an empty ipn.ServeConfig), and with TEST_KILL_AFTER_RESET it then
+#   kills the run, the main process of its unit ghost-wispr-provision, by its exact PID, as GPT-6.1
+#   Sol's review of #203 did; `serve status --json` prints the setting, or fails with
+#   TEST_SERVE_STATUS_EXIT;
 # - `debug prefs` prints RouteAll.
 cat >"$bin/tailscale" <<'EOF'
 #!/usr/bin/env bash
@@ -322,6 +669,9 @@ unexpected() {
 route_all=$(cat -- "$TEST_ROUTE_ALL" 2>/dev/null) || route_all=false
 case $1 in
   up)
+    while [[ -n ${TEST_UP_HOLD:-} && -f $TEST_UP_HOLD ]]; do
+      "$TEST_REAL_SLEEP" 0.1
+    done
     code=${TEST_UP_EXIT:-0} flag=
     for argument in "${@:2}"; do
       case $argument in
@@ -351,6 +701,17 @@ case $1 in
   status)
     case ${*:2} in
       '--self --json')
+        if [[ -n ${TEST_SELF_STATUS_HANG_FROM:-} ]]; then
+          calls=$(($(cat -- "$TEST_LOG.self-calls" 2>/dev/null || echo 0) + 1))
+          printf '%s\n' "$calls" >"$TEST_LOG.self-calls"
+          if ((calls >= TEST_SELF_STATUS_HANG_FROM)); then
+            exec hang self
+          fi
+        fi
+        if [[ ${TEST_SELF_STATUS_EXIT:-0} != 0 ]]; then
+          printf 'failed to connect to the local Tailscale daemon\n' >&2
+          exit "$TEST_SELF_STATUS_EXIT"
+        fi
         if [[ -n ${TEST_SELF_STATUS:-} ]]; then
           printf '%s\n' "$TEST_SELF_STATUS"
         else
@@ -378,9 +739,29 @@ case $1 in
         fi
         cat -- "$state"
         ;;
+      reset)
+        printf '{}\n' >"$state"
+        if [[ -n ${TEST_KILL_AFTER_RESET:-} ]]; then
+          kill -KILL "$(sed -n 's/^MainPID=//p' "$TEST_SYSTEM_UNITS/ghost-wispr-provision.service")"
+        fi
+        ;;
       '--bg --https '*)
         (($# == 5)) || unexpected "$@"
         code=${TEST_SERVE_EXIT:-0}
+        if ((${TEST_SERVE_HANG_TIMES:-0} > 0)); then
+          hung=$(cat -- "$TEST_LOG.serve-hung" 2>/dev/null) || hung=0
+          if ((hung < TEST_SERVE_HANG_TIMES)); then
+            printf '%s\n' "$((hung + 1))" >"$TEST_LOG.serve-hung"
+            exec "$TEST_REAL_SLEEP" 600
+          fi
+        fi
+        if ((${TEST_SERVE_FAIL_TIMES:-0} > 0)); then
+          failed=$(cat -- "$TEST_LOG.serve-failed" 2>/dev/null) || failed=0
+          if ((failed < TEST_SERVE_FAIL_TIMES)); then
+            printf '%s\n' "$((failed + 1))" >"$TEST_LOG.serve-failed"
+            code=1
+          fi
+        fi
         if [[ $code == 0 ]]; then
           jq --arg port "$4" --arg target "$5" --arg host "$TEST_SERVE_HOST" \
             '.TCP[$port] = {HTTPS: true} | .Web["\($host):\($port)"].Handlers["/"] = {Proxy: $target}' \
@@ -427,18 +808,19 @@ fi
 cat -- "$TEST_NETWORKS"
 EOF
 
-# provision.sh reads nothing over HTTP. update.sh and the launcher do, so a curl call means
-# provision.sh ran one of them itself, not through systemd: an error the test reports. With
-# TEST_REAL_UPDATE=1, the nightly update runs through the fake systemctl, and curl answers it: the
-# release API with $TEST_RELEASES/latest.json, each asset URL with its file under $TEST_RELEASES,
-# and the recorder's /api/status (free) and /api/version (the commit it runs) while it runs.
+# The recorder's /api/status: provision.sh's Serve apply reads it, as the nightly update does. While
+# the recorder runs ($TEST_STATE/active), it answers $TEST_STATE/status.json when that file exists,
+# else a free recorder's status, or curl fails with TEST_STATUS_CURL_EXIT, as for a recorder that
+# does not answer in time (28); while none runs, curl cannot connect (7). provision.sh reads nothing
+# else over HTTP. update.sh and the launcher do, so another call means provision.sh ran one of them
+# itself, not through systemd: an error the test reports. With TEST_REAL_UPDATE=1, the nightly
+# update runs through the fake systemctl, and curl answers it: the release API with
+# $TEST_RELEASES/latest.json, each asset URL with its file under $TEST_RELEASES, and the recorder's
+# /api/version (the commit it runs) while it runs.
 cat >"$bin/curl" <<'EOF'
 #!/usr/bin/env bash
 printf 'curl %s\n' "$*" >>"$TEST_LOG"
-if [[ ${TEST_REAL_UPDATE:-} != 1 ]]; then
-  printf 'fake curl: a call, so provision.sh ran update.sh or the launcher itself: curl %s\n' "$*" >>"$TEST_LOG.errors"
-  exit 7
-fi
+arguments="$*"
 output='' url=''
 while (($#)); do
   case $1 in
@@ -449,11 +831,21 @@ while (($#)); do
   esac
   shift
 done
-case $url in
-  "$GHOST_WISPR_STATUS_URL")
-    [[ -f $TEST_STATE/active ]] || exit 7
+if [[ $url == "${GHOST_WISPR_STATUS_URL:-}" ]]; then
+  [[ -f $TEST_STATE/active ]] || exit 7
+  [[ ${TEST_STATUS_CURL_EXIT:-0} == 0 ]] || exit "$TEST_STATUS_CURL_EXIT"
+  if [[ -f $TEST_STATE/status.json ]]; then
+    cat -- "$TEST_STATE/status.json"
+  else
     printf '{"active_session_id":"","paused":false,"capture_state":"idle"}\n'
-    ;;
+  fi
+  exit 0
+fi
+if [[ ${TEST_REAL_UPDATE:-} != 1 ]]; then
+  printf 'fake curl: a call, so provision.sh ran update.sh or the launcher itself: curl %s\n' "$arguments" >>"$TEST_LOG.errors"
+  exit 7
+fi
+case $url in
   "$GHOST_WISPR_VERSION_URL")
     [[ -f $TEST_STATE/active ]] || exit 7
     printf '{"commit":"%s"}\n' "$(<"$TEST_STATE/running-commit")"
@@ -554,11 +946,12 @@ new_pi() {
   : >"$TEST_LOG"
   printf '{}\n' >"$TEST_SERVE_STATE"
   printf 'false\n' >"$TEST_ROUTE_ALL"
+  rm -f -- "$system_units"/*.service
 }
 
 # run_provision DIR [ARGUMENT...] runs DIR/provision.sh as ghost-wispr on the fake Pi, with no input
 # and no XDG_RUNTIME_DIR of its own; RUN_INPUT names a file to give it as input instead. Its output
-# goes to $work_dir/out, and its exit code to rc.
+# goes to $work_dir/out, or the file RUN_OUT names, and its exit code to rc.
 run_provision() {
   local dir=$1
   shift
@@ -566,7 +959,8 @@ run_provision() {
   env -u XDG_RUNTIME_DIR PATH="$bin:$PATH" GHOST_WISPR_DEPLOY_DIR="$deploy" GHOST_WISPR_UNIT_DIR="$units" \
     GHOST_WISPR_IDENTITY_KEY="$key" GHOST_WISPR_JOIN_DIR="$join" GHOST_WISPR_SYSTEM_ROOT="$sysroot" \
     GHOST_WISPR_RELEASE_API="$release_api" GHOST_WISPR_STATUS_URL="$status_url" GHOST_WISPR_VERSION_URL="$version_url" \
-    bash "$dir/provision.sh" "$@" <"${RUN_INPUT:-/dev/null}" >"$work_dir/out" 2>&1 || rc=$?
+    GHOST_WISPR_TAILSCALE_CALL_TIMEOUT="${CALL_TIMEOUT:-$tailscale_call_timeout}" \
+    bash "$dir/provision.sh" "$@" <"${RUN_INPUT:-/dev/null}" >"${RUN_OUT:-$work_dir/out}" 2>&1 || rc=$?
 }
 
 # make_release NAME COMMIT ANSWER [CERTIFICATE] publishes the fake release NAME of COMMIT, whose
@@ -765,7 +1159,7 @@ TEST_JOURNAL=$work_dir/journal run_provision "$work_dir/p2-stage"
 cp -- "$TEST_LOG" "$work_dir/first.log"
 cp -- "$work_dir/out" "$work_dir/first.out"
 cp -- "$TEST_LOG.events" "$work_dir/first.events"
-for file in join systemd-run installed-route-overlap-check; do
+for file in join systemd-run systemd-run-args installed-route-overlap-check installed-serve-apply provision-units; do
   if [[ -f $TEST_LOG.$file ]]; then
     cp -- "$TEST_LOG.$file" "$first_join/${file#installed-}"
   fi
@@ -773,14 +1167,16 @@ done
 
 # one-update-start: the update runs as one systemctl --user start of ghost-wispr-update.service, so
 # systemd joins it with a start of the timer at the same moment, and never as a run of the launcher
-# or update.sh by provision.sh itself. The timer is on before the start, and the recorder's unit,
-# which the update installs, is enabled after it.
+# or update.sh by provision.sh itself: no curl call but the Serve apply's read of the recorder's
+# status. The timer is on before the start, and the recorder's unit, which the update installs, is
+# enabled after it.
 begin one-update-start
 starts=$(grep -c '^systemctl --user start ' "$work_dir/first.log" || true)
 if [[ $starts != 1 ]] || ! logged 'systemctl --user start ghost-wispr-update.service' "$work_dir/first.log"; then
   fail "provision.sh started the update $starts times, not once with systemctl --user start ghost-wispr-update.service: $(<"$work_dir/first.log")"
 fi
-if grep -q '^curl ' "$work_dir/first.log" || grep -q 'ghost-wispr launcher:' <(grep -v 'invocation test-invocation' "$work_dir/first.out"); then
+if grep '^curl ' "$work_dir/first.log" | grep -qv -F " $status_url" \
+  || grep -q 'ghost-wispr launcher:' <(grep -v 'invocation test-invocation' "$work_dir/first.out"); then
   fail "provision.sh ran the launcher or update.sh itself: $(<"$work_dir/first.log")"
 fi
 timer_at=$(line_of 'systemctl --user enable --now ghost-wispr-update.timer' "$work_dir/first.log")
@@ -885,20 +1281,52 @@ fi
 # join-command: the node had not joined, so provision.sh starts the detached join. It joins with
 # pi.env's client id and a token for pi.env's subject, from the binary the update installed, and the
 # join's command holds Serve's call as text: the join runs after P2's command removed the release's
-# directory, so it reads no file of it.
+# directory, so it reads no file of it. The join is the transient unit ghost-wispr-provision-join,
+# and the run itself, which started it, the unit ghost-wispr-provision: one systemd-run line,
+# whose output reaches the person (--pipe), whose end the person's command waits for and gets
+# (--wait), which leaves no failed unit behind (--collect), and whose end ends every command of it
+# (KillMode=control-group, and SIGKILL 10 s after SIGTERM). It runs as ghost-wispr, in the directory
+# the person ran provision.sh in, with this test's GHOST_WISPR_ settings and PATH.
 begin join-command
+[[ $(grep -c . "$first_join/provision-units") == 1 ]] || fail "the first run is not one start of its unit: $(cat -- "$first_join/provision-units" 2>/dev/null)"
+run_unit=$(<"$first_join/provision-units")
+[[ $run_unit == "systemd-run --unit=ghost-wispr-provision --pipe --wait --collect --quiet --property=KillMode=control-group --property=TimeoutStopSec=10s --uid=ghost-wispr "* ]] \
+  || fail "the run is not the unit ghost-wispr-provision as ghost-wispr, with its output passed through, waited for, collected and ended whole: $run_unit"
+for setting in --setenv=GHOST_WISPR_PROVISION_IN_UNIT=1 "--setenv=PATH=$bin:" "--setenv=GHOST_WISPR_DEPLOY_DIR=$deploy" \
+  "--setenv=GHOST_WISPR_PROVISION_STARTED=" "--working-directory=$PWD /bin/bash $work_dir/p2-stage/provision.sh"; do
+  [[ $run_unit == *" $setting"* ]] || fail "the run's unit has no $setting: $run_unit"
+done
 [[ -s $first_join/join ]] || fail 'provision.sh started no detached join'
 join_command=$(<"$first_join/join")
 [[ $join_command == *"--client-id='$client_id?ephemeral=false&preauthorized=true'"* ]] \
   || fail "the join does not use pi.env's client id: $join_command"
-[[ $join_command == *'tailscale serve --bg --https 443 http://127.0.0.1:8080 || rc=$?;'* ]] \
-  || fail "the join does not hold serve.conf's line as a tailscale serve call: $join_command"
+[[ $join_command =~ /bin/sh\ $join/($uuid_re)/serve-apply\ $status_url\ 443\ http://127\.0\.0\.1:8080\ \|\|\ rc=\$\?\; ]] \
+  || fail "the join does not run the Serve apply of its own run's directory on serve.conf's line: $join_command"
+join_run_id=${BASH_REMATCH[1]}
+stop_post=$(sed -n 's/^--property=ExecStopPost=//p' "$first_join/systemd-run-args")
+[[ $stop_post == "/bin/rm -rf -- $join/$join_run_id" ]] \
+  || fail "the join's unit does not remove its run's directory, the token's, when it stops for any reason (ExecStopPost): ${stop_post:-none}"
+[[ $join_command == *"rm -f $join/$join_run_id/token;"* ]] || fail "the join does not remove its token as soon as tailscale up ends: $join_command"
+[[ $join_command == 'tailscale up '* ]] || fail "the join does not start with tailscale up: $join_command"
+[[ $join_command != *flock* && $join_command != *'9>'* ]] || fail "the join takes a lock of its own: $join_command"
+[[ $(<"$first_join/systemd-run") == *"--unit=ghost-wispr-provision-join --collect --property=RuntimeMaxSec=900 "* ]] \
+  || fail "the join's unit is not ghost-wispr-provision-join, collected, with a RuntimeMaxSec of 900 s: $(<"$first_join/systemd-run")"
+# The join's token is on a tmpfs, so a reboot clears a token whose unit could not (Sol's review of
+# #203, round 3): the join directory, unless a test names another, is under /run.
+default_join_dir=$(env -u GHOST_WISPR_JOIN_DIR bash -c 'source "$1" && printf "%s" "$JOIN_DIR"' sh "$stage/provision.sh")
+[[ $default_join_dir == /run/* ]] || fail "the join directory is not on /run, a tmpfs: $default_join_dir"
+[[ $join_command == *"--id-token=file:$join/$join_run_id/token "* ]] || fail "the join does not read its run's own token: $join_command"
+[[ -s $first_join/serve-apply ]] || fail 'provision.sh installed no Serve apply for the join'
 [[ $join_command != *"$work_dir/p2-stage"* && $join_command != *serve.conf* ]] \
   || fail "the join reads the release's directory: $join_command"
 logged "ghost-wispr google-id-token --credentials $deploy/google-credentials.json --audience api.tailscale.com/$client_id" \
   "$work_dir/first.log" || fail "provision.sh did not ask the installed binary for a token for pi.env's client id: $(<"$work_dir/first.log")"
-grep -Fq 'starting the tagged tailnet join as ghost-wispr-tailnet-join-' "$work_dir/first.out" \
-  || fail "provision.sh did not name the join it started: $(<"$work_dir/first.out")"
+# The join's lines, a login URL of tailscale up among them, go to its unit's journal, and the SSH
+# session can end in its re-authentication: the run names the journal to read.
+for line in 'ghost-wispr provision: starting the tagged tailnet join as ghost-wispr-provision-join' \
+  'ghost-wispr provision: reconnect with Tailscale SSH, then check tailscale status and the join'"'"'s lines, a login URL of tailscale up among them, with: sudo journalctl -u ghost-wispr-provision-join'; do
+  grep -Fqx -- "$line" "$work_dir/first.out" || fail "provision.sh did not print '$line': $(<"$work_dir/first.out")"
+done
 
 # ---------------------------------------------------------------------------------------------------
 # idempotent: a second run of the same release, on the Pi the first run left, now joined, changes
@@ -1143,34 +1571,298 @@ said "ghost-wispr update: installed commit $commit_c" || fail "the update did no
 said 'already joined' || fail "provision.sh stopped before the join: $(<"$work_dir/out")"
 
 # ---------------------------------------------------------------------------------------------------
-# serve: serve.conf is the one source of Serve's setting. provision.sh applies each of its lines,
-# turns off each live Serve HTTPS port it does not list, and on each port it lists, each mount
-# other than /: tailscale serve --bg sets the mount / and keeps the others, so a mount left there
-# would show as drift each night. Each line is also a literal call in the join's command. When it
-# cannot read Serve's setting, or the setting is not serve.conf's after it applied it, it stops
-# before the join.
+# serve: the release owns Serve whole, and serve.conf is its one source. provision.sh reads the
+# device's tailnet name (tailscale status --self --json) and Serve. When Serve is serve.conf's for
+# that name already, it changes nothing. Otherwise it starts its Serve apply, serve-apply, in a
+# systemd unit of its own and waits for it: the apply reads the recorder's status immediately before
+# it clears Serve with tailscale serve reset, and refuses while the recorder is busy; then it applies
+# each line, again when a call failed. A Web entry of another name, as a rename leaves, a port or a
+# mount serve.conf does not list, a TCP forward, all go. The join runs the same apply after its
+# re-authentication. When provision.sh cannot read Serve or the name, or Serve is not serve.conf's
+# after the apply, it stops before the join.
 begin serve
+readonly want_serve='{"TCP":{"443":{"HTTPS":true}},"Web":{"ghost-wispr.example-tailnet.ts.net:443":{"Handlers":{"/":{"Proxy":"http://127.0.0.1:8080"}}}}}'
+readonly renamed=$script_dir/testdata/serve-status-after-rename.json
+# serve_is WHAT WANT fails unless Serve is WANT, the JSON of tailscale serve status --json.
+serve_is() {
+  [[ $(jq -cS . "$TEST_SERVE_STATE") == "$(jq -cS . <<<"$2")" ]] || fail "$1: Serve is $(jq -cS . "$TEST_SERVE_STATE"), want $(jq -cS . <<<"$2")"
+}
+# no_serve_change WHAT fails unless the run reset and set nothing in Serve.
+no_serve_change() {
+  ! grep -Eq '^(sudo )?tailscale serve (reset|--bg)' "$TEST_LOG" || fail "$1: provision.sh reset or set Serve: $(<"$TEST_LOG")"
+}
+# The office Pi's Serve of 2026-11-27, after its device was renamed from ghost-wispr-1 (the neutral
+# tailnet's names): the entry of the old name stayed beside that of the new one. The run before this
+# fix turned off ports alone, kept the old name's entry, and stopped at its own check. Break it
+# catches: a provision.sh that turns off what serve.conf does not list by port, which no name but
+# the device's own reaches. No recorder runs, so the status read cannot connect, and the apply
+# goes on: the control of the busy cases below.
 new_pi
-jq -n --arg host "$TEST_SERVE_HOST" '{TCP: {"443": {HTTPS: true}, "8443": {HTTPS: true}},
+cp -- "$renamed" "$TEST_SERVE_STATE"
+run_provision "$stage"
+expect_ran 'a Serve entry of the name the device had before a rename'
+serve_is 'a Serve entry of the name the device had before a rename' "$want_serve"
+said 'on ghost-wispr-1.example-tailnet.ts.net' || fail "provision.sh did not name the old name's entry it reset: $(<"$work_dir/out")"
+grep -q '^sudo systemd-run --wait .*--unit=ghost-wispr-serve-' "$TEST_LOG" \
+  || fail "provision.sh did not run its Serve apply in a unit of its own (systemd-run --wait): $(<"$TEST_LOG")"
+status_read=$(grep -n -F "curl --connect-timeout 5 --max-time 10 --fail --silent $status_url" "$TEST_LOG" | tail -n1 | cut -d: -f1)
+reset_line=$(grep -n '^tailscale serve reset$' "$TEST_LOG" | head -n1 | cut -d: -f1)
+apply_line=$(grep -n '^tailscale serve --bg --https 443 ' "$TEST_LOG" | head -n1 | cut -d: -f1)
+[[ -n $status_read && -n $reset_line && -n $apply_line ]] && ((status_read < reset_line && reset_line < apply_line)) \
+  || fail "the Serve apply did not read the recorder's status, then reset Serve, then apply serve.conf: $(<"$TEST_LOG")"
+said 'ghost-wispr serve: resetting Serve (tailscale serve reset) and applying serve.conf' \
+  || fail "provision.sh did not print the lines of its Serve unit: $(<"$work_dir/out")"
+# The run's apply has a unit and a serve-apply of its own, both named by the run's id, never by the
+# time (GPT-6.1 Sol's review of #203, round 2: two runs in one second shared a unit name), and a
+# RuntimeMaxSec: the status read (20 s), the reset and 4 tries of serve.conf's one line, each call
+# bounded to 5 s and 5 s more to kill it, 3 pauses of 2 s and 30 s to spare, 106 s. serve-apply
+# removes itself and its run's directory when it ends.
+serve_unit=$(grep -m1 '^sudo systemd-run --wait ' "$TEST_LOG")
+[[ $serve_unit =~ --unit=ghost-wispr-serve-($uuid_re)\ --property=RuntimeMaxSec=106\ /bin/sh\ $join/($uuid_re)/serve-apply\  ]] \
+  && [[ ${BASH_REMATCH[1]} == "${BASH_REMATCH[2]}" ]] \
+  || fail "the Serve apply's unit and serve-apply are not named by one run id, or its RuntimeMaxSec is not 106 s: $serve_unit"
+first_run_id=${BASH_REMATCH[1]}
+[[ ! -e $TEST_LOG.serve-apply-left ]] || fail "serve-apply left itself or its run's directory when its unit ended: $(<"$TEST_LOG.serve-apply-left")"
+# Another run's serve-apply, which a join still to come needs, stays: a run removes only its own
+# (Sol's reproduction: a second run removed the shared serve-apply, and the first run's join, once
+# its re-authentication ended, exited 2 with Serve {}). Break it catches: one serve-apply for every
+# run, at one path.
+readonly other_run=$join/00000000-0000-4000-8000-000000000000
+mkdir -p -- "$other_run"
+printf '# the serve-apply of another run\n' >"$other_run/serve-apply"
+# A port and a mount that serve.conf does not list, and a TCP forward: the reset clears them all.
+new_pi
+jq -n --arg host "$TEST_SERVE_HOST" '{TCP: {"443": {HTTPS: true}, "8443": {HTTPS: true}, "2222": {TCPForward: "127.0.0.1:22"}},
   Web: {"\($host):443": {Handlers: {"/": {Proxy: "http://127.0.0.1:9999"}, "/debug": {Proxy: "http://127.0.0.1:8082"}}},
     "\($host):8443": {Handlers: {"/": {Proxy: "http://127.0.0.1:8081"}}}}}' >"$TEST_SERVE_STATE"
 run_provision "$stage"
-expect_ran 'a live port and a mount that serve.conf does not list'
-readonly want_serve='{"TCP":{"443":{"HTTPS":true}},"Web":{"ghost-wispr.example-tailnet.ts.net:443":{"Handlers":{"/":{"Proxy":"http://127.0.0.1:8080"}}}}}'
-[[ $(jq -cS . "$TEST_SERVE_STATE") == "$want_serve" ]] || fail "Serve is $(jq -cS . "$TEST_SERVE_STATE"), want $want_serve"
-logged 'sudo tailscale serve --bg --https 443 http://127.0.0.1:8080' || fail "provision.sh did not apply serve.conf's line: $(<"$TEST_LOG")"
-logged 'sudo tailscale serve --https=8443 off' || fail "provision.sh did not turn off port 8443: $(<"$TEST_LOG")"
-said 'turned off Serve port 8443' || fail "provision.sh did not say it turned off port 8443: $(<"$work_dir/out")"
-logged 'sudo tailscale serve --https=443 --set-path=/debug off' || fail "provision.sh did not turn off the mount /debug of port 443: $(<"$TEST_LOG")"
-said 'turned off the Serve mount /debug of port 443' || fail "provision.sh did not say it turned off /debug: $(<"$work_dir/out")"
-! grep -q 'serve --https=443 off' "$TEST_LOG" || fail "provision.sh turned off the port serve.conf lists: $(<"$TEST_LOG")"
-# A Serve that provision.sh does not manage, a TCP forward, stays and is named: the run stops before
-# the join, as the nightly drift line would say Serve: UNKNOWN.
+expect_ran 'a live port, a mount and a TCP forward that serve.conf does not list'
+serve_is 'a live port, a mount and a TCP forward' "$want_serve"
+logged 'tailscale serve reset' || fail "provision.sh did not reset Serve: $(<"$TEST_LOG")"
+logged 'tailscale serve --bg --https 443 http://127.0.0.1:8080' || fail "provision.sh did not apply serve.conf's line: $(<"$TEST_LOG")"
+[[ $(<"$other_run/serve-apply") == '# the serve-apply of another run' ]] || fail "a run removed or replaced another run's serve-apply"
+serve_unit=$(grep -m1 '^sudo systemd-run --wait ' "$TEST_LOG")
+[[ $serve_unit =~ --unit=ghost-wispr-serve-($uuid_re) && ${BASH_REMATCH[1]} != "$first_run_id" ]] \
+  || fail "two runs share the run id $first_run_id: $serve_unit"
+rm -rf -- "$other_run"
+# The second read of the device's tailnet status, just before the join, never ends (Sol's review of
+# #203, round 3): it ends after its bound, the run fails and names the read, and starts no join.
+# Break it catches: a read with no bound, where the run waits for good.
 new_pi
-printf '%s\n' '{"TCP":{"2222":{"TCPForward":"127.0.0.1:22"}}}' >"$TEST_SERVE_STATE"
+TEST_SELF_STATUS_HANG_FROM=2 run_provision "$stage"
+expect_refused 'a second read of the tailnet status that never ends' \
+  "could not read this device's tailnet status (tailscale status --self --json) before the join"
+[[ ! -e $TEST_LOG.join ]] || fail 'provision.sh started the join although it could not read the tailnet status'
+
+# ---------------------------------------------------------------------------------------------------
+# provision-unit: a run is the transient system unit ghost-wispr-provision, which systemd starts
+# once at a time, and its join the unit ghost-wispr-provision-join. While either is active, a second
+# run fails at once, names the unit, when it became active and its main PID, and the command that
+# ends a run, says that an SSH session that ends does not, and changes nothing. A stopped run ends
+# every command of it, whichever it waits in, and never as a success: GPT-6.1 Sol's review of #203,
+# round 5, found each command of this table keeping the run's lock, a descriptor it inherited, after
+# the run died. The fake units here end their sessions as KillMode=control-group ends a control
+# group; deploy/pi/provision_unit_test.sh checks that systemd does.
+begin provision-unit
+# start_hung_run WHAT [ARGUMENT...] starts provision.sh [ARGUMENT...] in the background, with the
+# caller's TEST_ setting under which WHAT hangs (hang), and waits until WHAT hangs. It sets hung_run,
+# the background job; main_pid, the main PID of the run's unit; and hung_pid, WHAT's PID. The run's
+# output goes to $work_dir/hung-out, and its exit code to $work_dir/hung-rc.
+start_hung_run() {
+  local what=$1
+  shift
+  rm -f -- "$TEST_LOG.hung-$what" "$work_dir/hung-rc"
+  (
+    RUN_OUT=$work_dir/hung-out run_provision "$stage" "$@"
+    printf '%s\n' "$rc" >"$work_dir/hung-rc"
+  ) &
+  hung_run=$!
+  # The run reaches its hang, and system-unit notes its main PID, in either order.
+  main_pid=''
+  for _ in {1..300}; do
+    main_pid=$(sed -n 's/^MainPID=//p' "$system_units/ghost-wispr-provision.service" 2>/dev/null) || main_pid=
+    [[ ! -s $TEST_LOG.hung-$what || -z $main_pid ]] || break
+    sleep 0.1
+  done
+  [[ -s $TEST_LOG.hung-$what ]] || fail "control: the run never reached its $what: $(cat -- "$work_dir/hung-out" 2>/dev/null)"
+  hung_pid=$(<"$TEST_LOG.hung-$what")
+  if [[ -z $main_pid ]] || ! kill -0 "$main_pid" 2>/dev/null; then
+    fail "control: the run's unit has no main process while its $what hangs"
+  fi
+}
+# expect_contender_refused WHAT UNIT MAIN: a run while UNIT is active with the main PID MAIN fails,
+# names UNIT, the time it became active and MAIN, the command that ends a run, says that an SSH
+# session that ends does not end it, and starts no unit.
+expect_contender_refused() {
+  local since units_before
+  since=$(sed -n 's/^ActiveEnterTimestamp=//p' "$system_units/$2.service")
+  units_before=$(grep -c . "$TEST_LOG.provision-units" 2>/dev/null || true)
+  run_provision "$stage" --key
+  expect_refused "$1: a second run" "another provisioning run is going on: $2.service is active since $since, main PID $3"
+  said 'sudo systemctl stop ghost-wispr-provision ghost-wispr-provision-join' \
+    || fail "$1: the second run did not name the command that ends a run: $(<"$work_dir/out")"
+  said 'An SSH session that ends does not end a run' || fail "$1: the second run did not say that an SSH drop does not end a run: $(<"$work_dir/out")"
+  said 'nothing was changed' || fail "$1: the second run did not say it changed nothing: $(<"$work_dir/out")"
+  [[ $(grep -c . "$TEST_LOG.provision-units" 2>/dev/null || true) == "$units_before" ]] \
+    || fail "$1: the second run started a unit: $(<"$TEST_LOG.provision-units")"
+}
+# expect_run_ended WHAT RC: the hung run ended with the exit code RC, and 0.5 s later its unit is
+# not active, no process of it is left, WHAT's among them, and a new run is not refused.
+expect_run_ended() {
+  wait "$hung_run" || true
+  [[ $(cat -- "$work_dir/hung-rc" 2>/dev/null) == "$2" ]] \
+    || fail "$1: the run ended $(cat -- "$work_dir/hung-rc" 2>/dev/null), want $2: $(cat -- "$work_dir/hung-out")"
+  sleep 0.5
+  [[ $("$bin/systemctl" show ghost-wispr-provision.service | sed -n 's/^ActiveState=//p') == inactive ]] \
+    || fail "$1: the run's unit is active 0.5 s after the run ended"
+  ! "$bin/session-signal" 0 "$main_pid" \
+    || fail "$1: processes of the run are left 0.5 s after it ended: $(ps -eo pid=,sid=,args= | awk -v s="$main_pid" '$2 == s')"
+  ! kill -0 "$hung_pid" 2>/dev/null || fail "$1: its hung $1, PID $hung_pid, is left 0.5 s after the run ended"
+  run_provision "$stage" --key
+  ! said 'another provisioning run is going on' || fail "$1: the run after it was refused: $(<"$work_dir/out")"
+  said 'nothing was changed. A new key needs a new certificate request' \
+    || fail "control: $1: the run after it did not reach provision.sh --key's own check: $(<"$work_dir/out")"
+}
+# Sol's table, row by row: a run that hangs in each command, stopped by the command the runbook
+# gives. Each run ends 143, which no clean SIGTERM end gives. Breaks they catch: a run outside a
+# unit, which no second run sees and whose children outlive its stop; and one with no SIGTERM trap,
+# whose stop reads as a success.
+for row in 'manager read|TEST_MANAGER_ENV_HANG|show-environment|' 'groups pipeline|TEST_ID_HANG|id|' \
+  'manifest read|TEST_JQ_HANG|jq|' 'local install|TEST_INSTALL_HANG|install|' "key's openssl|TEST_OPENSSL_HANG|openssl|--key"; do
+  IFS='|' read -r what setting command argument <<<"$row"
+  new_pi
+  if [[ $argument == --key ]]; then
+    rm -f -- "$key"
+  fi
+  export "$setting=1"
+  start_hung_run "$command" ${argument:+"$argument"}
+  unset "$setting"
+  expect_contender_refused "a hung $what" ghost-wispr-provision "$main_pid"
+  "$bin/systemctl" stop ghost-wispr-provision ghost-wispr-provision-join
+  printf 'the key\n' >"$key"
+  expect_run_ended "$command" 143
+done
+# SIGHUP, which systemctl kill --signal=HUP sends to every process of the unit, ends a run 129.
+new_pi
+export TEST_MANAGER_ENV_HANG=1
+start_hung_run show-environment
+unset TEST_MANAGER_ENV_HANG
+"$bin/systemctl" kill --signal=HUP ghost-wispr-provision
+expect_run_ended show-environment 129
+# The run's main process killed by its exact PID while the second tailscale read hangs, in a bound
+# of 30 s: the read and the rest of the run end with it, 0.5 s later.
+new_pi
+export TEST_SELF_STATUS_HANG_FROM=2
+CALL_TIMEOUT=30 start_hung_run self
+unset TEST_SELF_STATUS_HANG_FROM
+expect_contender_refused 'a hung second tailscale read' ghost-wispr-provision "$main_pid"
+kill -KILL "$main_pid"
+expect_run_ended self 255
+# The join of an earlier run still active: a run fails, names the join, and changes nothing. The
+# join here is a sleep, noted as the unit's main process.
+new_pi
+"$real_sleep" 600 &
+join_main=$!
+printf 'ActiveState=active\nActiveEnterTimestamp=Thu 2026-11-27 13:00:00 UTC\nMainPID=%s\n' "$join_main" \
+  >"$system_units/ghost-wispr-provision-join.service"
+cp -- "$renamed" "$TEST_SERVE_STATE"
+expect_contender_refused 'an active join' ghost-wispr-provision-join "$join_main"
+cmp -s -- "$renamed" "$TEST_SERVE_STATE" || fail "a run while a join is active changed Serve"
+kill "$join_main"
+wait "$join_main" 2>/dev/null || true
+rm -f -- "$system_units/ghost-wispr-provision-join.service"
+
+# The handoff (GPT-6.1 Sol's review of #203, round 6): a run reads both units as inactive, then
+# another run takes the run's name, starts its join and ends, and the first run's unit starts while
+# that join is active. The run checks the join again in its own unit, before any mode changes a
+# file, and refuses with the whole message; here its --key would create a key. Break it catches: a
+# run that checks the join only before its unit starts.
+# hold_start: provision.sh --key runs in the background, held after its checks, before its unit
+# starts; held_run is the job.
+hold_start() {
+  rm -f -- "$TEST_LOG.start-held"
+  : >"$work_dir/start-hold"
+  (
+    TEST_PROVISION_START_HOLD=$work_dir/start-hold RUN_OUT=$work_dir/held-out run_provision "$stage" --key
+    printf '%s\n' "$rc" >"$work_dir/held-rc"
+  ) &
+  held_run=$!
+  for _ in {1..300}; do
+    [[ ! -f $TEST_LOG.start-held ]] || break
+    sleep 0.1
+  done
+  [[ -f $TEST_LOG.start-held ]] || fail "control: the run never reached the start of its unit: $(cat -- "$work_dir/held-out" 2>/dev/null)"
+}
+new_pi
+rm -f -- "$key"
+hold_start
+"$real_sleep" 600 &
+join_main=$!
+printf 'ActiveState=active\nActiveEnterTimestamp=Thu 2026-11-27 14:00:00 UTC\nMainPID=%s\n' "$join_main" \
+  >"$system_units/ghost-wispr-provision-join.service"
+rm -f -- "$work_dir/start-hold"
+wait "$held_run" || true
+[[ $(cat -- "$work_dir/held-rc") == 1 ]] || fail "a run whose unit started while a join is active ended $(cat -- "$work_dir/held-rc"): $(<"$work_dir/held-out")"
+grep -Fq "another provisioning run is going on: ghost-wispr-provision-join.service is active since Thu 2026-11-27 14:00:00 UTC, main PID $join_main; nothing was changed." "$work_dir/held-out" \
+  || fail "a run whose unit started while a join is active did not refuse with the whole message: $(<"$work_dir/held-out")"
+grep -Fq 'sudo systemctl stop ghost-wispr-provision ghost-wispr-provision-join' "$work_dir/held-out" \
+  || fail "the in-unit refusal did not name the stop command: $(<"$work_dir/held-out")"
+[[ ! -e $key ]] || fail "a run whose unit started while a join is active created a key"
+kill "$join_main"
+wait "$join_main" 2>/dev/null || true
+rm -f -- "$system_units/ghost-wispr-provision-join.service"
+# The loser of two starts at once (Sol's round 6): a run that passed its checks finds the run's name
+# taken when its unit starts. It refuses with the whole message, not systemd's bare line. Break it
+# catches: a run that gives the person systemd-run's own error.
+new_pi
+hold_start
+"$real_sleep" 600 &
+other_main=$!
+printf 'ActiveState=active\nActiveEnterTimestamp=Thu 2026-11-27 14:01:00 UTC\nMainPID=%s\n' "$other_main" \
+  >"$system_units/ghost-wispr-provision.service"
+rm -f -- "$work_dir/start-hold"
+wait "$held_run" || true
+[[ $(cat -- "$work_dir/held-rc") == 1 ]] || fail "the loser of two starts ended $(cat -- "$work_dir/held-rc"): $(<"$work_dir/held-out")"
+grep -Fq "another provisioning run is going on: ghost-wispr-provision.service is active since Thu 2026-11-27 14:01:00 UTC, main PID $other_main; nothing was changed." "$work_dir/held-out" \
+  || fail "the loser of two starts did not refuse with the whole message: $(<"$work_dir/held-out")"
+kill "$other_main"
+wait "$other_main" 2>/dev/null || true
+rm -f -- "$system_units/ghost-wispr-provision.service"
+# A failed unit that systemd keeps takes the run's name (Sol's round 6): the run resets it, says so,
+# and goes on. Break it catches: a run that leaves a kept failed unit, whose start then fails.
+new_pi
+printf 'ActiveState=failed\nActiveEnterTimestamp=Thu 2026-11-27 14:02:00 UTC\nMainPID=0\n' >"$system_units/ghost-wispr-provision.service"
+run_provision "$stage" --key
+said 'ghost-wispr provision: reset the failed unit ghost-wispr-provision.service, which a run that failed left' \
+  || fail "a run did not reset and name a kept failed unit: $(<"$work_dir/out")"
+said 'nothing was changed. A new key needs a new certificate request' \
+  || fail "a run after a kept failed unit did not reach provision.sh --key's own check: $(<"$work_dir/out")"
+# Credentials in the caller's environment stay out of the unit's settings, which any local user can
+# read (systemctl show -p Environment; Sol's round 6): only PATH and the provisioning settings go.
+# Break it catches: a run that forwards every GHOST_WISPR_ variable.
+new_pi
+# The two credential names the recorder's deployment exports, each given a dummy value.
+credential_names=(GHOST_WISPR_DISPATCH_TOKEN GHOST_WISPR_DEEPGRAM_API_KEY)
+(
+  export "${credential_names[0]}=dummy-dispatch-canary" "${credential_names[1]}=dummy-deepgram-canary"
+  run_provision "$stage" --key
+)
+unit_line=$(tail -n 1 "$TEST_LOG.provision-units")
+[[ $unit_line != *canary* ]] || fail "the run's unit carries a credential of the caller's environment: $unit_line"
+[[ $unit_line == *"--setenv=GHOST_WISPR_DEPLOY_DIR=$deploy "* ]] || fail "control: the run's unit lost a provisioning setting: $unit_line"
+
+begin serve
+# Serve that is serve.conf's already for the device's name is left as it is: a reset would stop the
+# page for a moment for nothing. The control of the cases above.
+new_pi
+printf '%s\n' "$want_serve" >"$TEST_SERVE_STATE"
 run_provision "$stage"
-expect_refused 'a TCP forward' "is not serve.conf's"
-[[ ! -e $TEST_LOG.join ]] || fail "provision.sh started the join although Serve is not serve.conf's"
+expect_ran "Serve that is serve.conf's already"
+# The join's command, which the fake sudo logs whole with systemd-run, holds the calls as text: the
+# check reads the calls that ran.
+no_serve_change "Serve that was serve.conf's already"
+said "Tailscale Serve is serve.conf's already for ghost-wispr.example-tailnet.ts.net" \
+  || fail "provision.sh did not say Serve was serve.conf's already: $(<"$work_dir/out")"
 rm -rf -- "$work_dir/two-ports-stage"
 cp -a -- "$stage" "$work_dir/two-ports-stage"
 printf '%s\n' '# The page, and a second port.' '443 http://127.0.0.1:8080' '8443 http://127.0.0.1:8081' >"$work_dir/serve.conf"
@@ -1181,14 +1873,139 @@ expect_ran 'serve.conf with two lines'
 [[ $(serve_now) == $'443 http://127.0.0.1:8080\n8443 http://127.0.0.1:8081' ]] \
   || fail "Serve is [$(serve_now | paste -sd ';' -)], want both lines of serve.conf"
 join_command=$(<"$TEST_LOG.join")
-for line in '443 http://127.0.0.1:8080' '8443 http://127.0.0.1:8081'; do
-  [[ $join_command == *"tailscale serve --bg --https $line || rc=\$?;"* ]] \
-    || fail "the join does not hold the Serve call for '$line': $join_command"
-done
+[[ $join_command =~ /bin/sh\ $join/$uuid_re/serve-apply\ $status_url\ 443\ http://127\.0\.0\.1:8080\ 8443\ http://127\.0\.0\.1:8081\ \|\|\ rc=\$\?\; ]] \
+  || fail "the join does not run the Serve apply on each line: $join_command"
 new_pi
 TEST_SERVE_STATUS_EXIT=1 run_provision "$stage"
 expect_refused 'an unreadable Serve setting' 'tailscale serve status'
 [[ ! -e $TEST_LOG.join ]] || fail 'provision.sh started the join although it could not read Serve'
+no_serve_change 'an unreadable Serve setting'
+new_pi
+TEST_SELF_STATUS_EXIT=1 run_provision "$stage"
+expect_refused "an unreadable tailnet name" 'tailscale status --self --json'
+[[ ! -e $TEST_LOG.join ]] || fail "provision.sh started the join although it could not read the device's name"
+no_serve_change 'an unreadable tailnet name'
+
+# A busy recorder (GPT-6.1 Sol's review of #203 at 79181fbd, P1): a reset of Serve during a meeting
+# cuts the page and /call, and an update that finds the recorder busy exits 0. So the Serve apply
+# reads the recorder's status immediately before its reset, and refuses with exit 75, changing
+# nothing in Serve, while the recorder records a session or holds a call whose state is not none.
+# Sol's two cases, with the real launcher and update.sh: the update leaves the release in place and
+# exits 0. Break it catches: a provision.sh that resets Serve on the update's exit 0.
+for busy in 'active session|{"active_session_id":"meeting-123","paused":false,"capture_state":"recording"}' \
+  'call live|{"active_session_id":"","paused":false,"capture_state":"idle","call":{"state":"live"}}'; do
+  reason=${busy%%|*}
+  new_pi
+  real_provision a
+  expect_ran "release a on a new Pi, before the recorder holds $reason"
+  cp -- "$renamed" "$TEST_SERVE_STATE"
+  printf '%s\n' "${busy#*|}" >"$state/status.json"
+  real_provision a
+  expect_refused "a recorder that holds $reason" "ghost-wispr serve: $reason; Serve was not reset"
+  said "ghost-wispr update: $reason; leaving the current release in place" \
+    || fail "control: the update did not find the recorder holding $reason: $(<"$work_dir/out")"
+  said 'nothing in Serve was changed' || fail "a recorder that holds $reason: provision.sh did not say Serve is unchanged: $(<"$work_dir/out")"
+  cmp -s -- "$renamed" "$TEST_SERVE_STATE" || fail "provision.sh changed Serve while the recorder held $reason: $(<"$TEST_SERVE_STATE")"
+  no_serve_change "a recorder that holds $reason"
+done
+# The recorder becomes busy after the update ended, which found it free: the read immediately before
+# the reset finds the session. Break it catches: a provision.sh that reads the status before the
+# update, or takes the update's reading.
+new_pi
+real_provision a
+expect_ran 'release a on a new Pi, before the recorder becomes busy after the update'
+cp -- "$renamed" "$TEST_SERVE_STATE"
+TEST_BUSY_AFTER_UPDATE='{"active_session_id":"meeting-456","paused":false,"capture_state":"recording"}' real_provision a
+expect_refused 'a recorder that became busy after the update' 'ghost-wispr serve: active session; Serve was not reset'
+said "ghost-wispr update: already current at commit $commit_a" \
+  || fail "control: the update did not find the recorder free: $(<"$work_dir/out")"
+cmp -s -- "$renamed" "$TEST_SERVE_STATE" || fail "provision.sh changed Serve while the recorder became busy: $(<"$TEST_SERVE_STATE")"
+no_serve_change 'a recorder that became busy after the update'
+# A running recorder whose status cannot be read: an answer that is not its status, and a read that
+# does not end in time. Its state is unknown, so the apply refuses. Break it catches: an apply that
+# takes no status for a free recorder.
+for unreadable in 'an answer that is not a status' 'a read that does not end in time'; do
+  new_pi
+  cp -- "$renamed" "$TEST_SERVE_STATE"
+  : >"$state/active"
+  if [[ $unreadable == 'an answer that is not a status' ]]; then
+    printf 'not a status\n' >"$state/status.json"
+    run_provision "$stage"
+  else
+    TEST_STATUS_CURL_EXIT=28 run_provision "$stage"
+  fi
+  expect_refused "a running recorder with $unreadable" 'ghost-wispr serve: ghost-wispr.service is active, and /api/status gave no status; Serve was not reset'
+  cmp -s -- "$renamed" "$TEST_SERVE_STATE" || fail "provision.sh changed Serve with $unreadable: $(<"$TEST_SERVE_STATE")"
+  no_serve_change "a running recorder with $unreadable"
+  [[ ! -e $TEST_LOG.join ]] || fail "provision.sh started the join with $unreadable"
+done
+# No status, and no confirmed stopped recorder (Sol's review of #203, round 3): the recorder gives
+# no status, and its manager does not answer within the call bound, answers nothing, or answers a
+# state other than inactive. Only "inactive" lets the reset go on, as in the rename case above; any
+# other answer refuses with exit 75, names the reason, and changes nothing. Sol's reproduction is
+# the manager that hangs: the reset went on after 10 s, like the inactive control. Breaks they catch:
+# an apply that takes a timed-out, failed or other answer for a stopped recorder.
+for manager in 'a manager that does not answer|TEST_SERVICE_STATE_HANG=1|the state of ghost-wispr.service did not come within 5 s' \
+  'a manager that prints inactive and then does not end|TEST_SERVICE_STATE=inactive TEST_SERVICE_STATE_HANG=1|the state of ghost-wispr.service did not come within 5 s' \
+  'a manager read that fails|TEST_SERVICE_STATE_EXIT=1|the state of ghost-wispr.service could not be read (systemctl exit 1)' \
+  'a manager read that prints inactive and fails|TEST_SERVICE_STATE=inactive TEST_SERVICE_STATE_EXIT=1|the state of ghost-wispr.service could not be read (systemctl exit 1)' \
+  'a recorder that is starting|TEST_SERVICE_STATE=activating|ghost-wispr.service is activating'; do
+  IFS='|' read -r what settings reason <<<"$manager"
+  new_pi
+  cp -- "$renamed" "$TEST_SERVE_STATE"
+  for setting in $settings; do
+    export "${setting?}"
+  done
+  run_provision "$stage"
+  for setting in $settings; do
+    unset "${setting%%=*}"
+  done
+  expect_refused "$what" "ghost-wispr serve: $reason, and /api/status gave no status; Serve was not reset"
+  cmp -s -- "$renamed" "$TEST_SERVE_STATE" || fail "$what: provision.sh changed Serve: $(<"$TEST_SERVE_STATE")"
+  no_serve_change "$what"
+done
+
+# An apply cut short (Sol's review of #203, "Reset scope and interrupted-run recovery"). Sol's case:
+# provision.sh is killed, by its exact PID, right after the reset. The reset and the apply run in a
+# unit of their own, which the kill does not stop, so Serve is serve.conf's again with no person.
+# Break it catches: a provision.sh that resets and applies Serve itself, where the kill leaves {}.
+new_pi
+cp -- "$renamed" "$TEST_SERVE_STATE"
+TEST_KILL_AFTER_RESET=1 run_provision "$stage"
+((rc == 255)) || fail "control: provision.sh was not killed after the reset (exit $rc): $(<"$work_dir/out")"
+for _ in {1..100}; do
+  [[ ! -f $TEST_LOG.serve-unit-done ]] || break
+  sleep 0.1
+done
+serve_is 'provision.sh killed right after the reset' "$want_serve"
+# A tailscale serve call that fails once after the reset: the apply applies serve.conf again, and
+# Serve is serve.conf's, with no person. Break it catches: an apply that stops at the first failure.
+new_pi
+cp -- "$renamed" "$TEST_SERVE_STATE"
+TEST_SERVE_FAIL_TIMES=1 run_provision "$stage"
+expect_ran 'a Serve call that fails once after the reset'
+serve_is 'a Serve call that fails once after the reset' "$want_serve"
+said 'ghost-wispr serve: a tailscale serve call failed or did not end within 5 s after the reset; applying serve.conf again (try 2 of 4)' \
+  || fail "the apply did not say it applied serve.conf again: $(<"$work_dir/out")"
+# A tailscale serve call that never ends after a reset that did (Sol's review of #203, round 2: the
+# first apply hung, the try did not end, and provision.sh waited for good): each call ends after
+# 5 s, here, and its failure takes a try. Break it catches: a call with no bound, which the unit's
+# RuntimeMaxSec then ends after 106 s, with Serve {}.
+new_pi
+cp -- "$renamed" "$TEST_SERVE_STATE"
+TEST_SERVE_HANG_TIMES=1 run_provision "$stage"
+expect_ran 'a Serve call that never ends after the reset'
+serve_is 'a Serve call that never ends after the reset' "$want_serve"
+said 'did not end within 5 s after the reset; applying serve.conf again (try 2 of 4)' \
+  || fail "the apply did not say a call did not end and that it applied serve.conf again: $(<"$work_dir/out")"
+# A call that fails on every try: the apply ends failed after 4 tries, and provision.sh says that the
+# page is not served and what to run, and stops before the join.
+new_pi
+TEST_SERVE_EXIT=1 run_provision "$stage"
+expect_refused 'a Serve line that tailscale refuses on every try' "Serve is now [none], so the page is not served: run the release's ./provision.sh again"
+[[ $(grep -c '^tailscale serve --bg --https 443 ' "$TEST_LOG") == 4 ]] \
+  || fail "the apply tried serve.conf's line $(grep -c '^tailscale serve --bg --https 443 ' "$TEST_LOG") times, want 4"
+[[ ! -e $TEST_LOG.join ]] || fail "provision.sh started the join although Serve is not serve.conf's"
 
 # ---------------------------------------------------------------------------------------------------
 # update-fails: when the update fails, provision.sh prints that run's lines from the journal and
@@ -1445,43 +2262,80 @@ manager_expansion() {
   printf '%s' "$out$word"
 }
 
-# run_join runs the first run's join command as its unit does, on F-ip-pi and the status fixture
-# given second, with RouteAll set to the first argument beforehand. It starts a fresh log, writes a
-# token, and puts the route check provision.sh installed back, each at the path the command names,
-# because the command removes both. When the systemd-run line lacks --expand-environment=no, the
-# command first gets the service manager's expansion. The exit status is kept in join_exit, stdout
-# and stderr in $work_dir/join.out.
-run_join() {
-  local command options
+# prepare_join ROUTE_ALL [STATUS] readies the first run's join command to run as its unit does:
+# RouteAll set to ROUTE_ALL; with STATUS, a recorder runs and answers it as its /api/status, and
+# without, none runs. It starts a fresh log, and puts a token, the route check and the Serve apply
+# that provision.sh installed in the run's directory that the command names, join_run_dir, because
+# the command removes them. When the systemd-run line lacks --expand-environment=no, the command,
+# kept in command, first gets the service manager's expansion.
+prepare_join() {
+  local options
   printf '%s\n' "$1" >"$TEST_ROUTE_ALL"
   [[ -f $first_join/route-overlap-check ]] \
     || fail "provision.sh installed no route check: $first_join/route-overlap-check is missing"
-  cp -- "$first_join/route-overlap-check" "$join/route-overlap-check"
-  printf 'id-token' >"$join/token"
-  rm -f -- "$TEST_LOG.up-exit"
-  : >"$TEST_LOG"
+  [[ -f $first_join/serve-apply ]] || fail "provision.sh installed no Serve apply: $first_join/serve-apply is missing"
   command=$(<"$first_join/join")
+  [[ $command =~ $join/($uuid_re)/token ]] || fail "the join's command names no run directory under $join: $command"
+  join_run_dir=$join/${BASH_REMATCH[1]}
+  mkdir -p -- "$join_run_dir"
+  cp -- "$first_join/route-overlap-check" "$join_run_dir/route-overlap-check"
+  cp -- "$first_join/serve-apply" "$join_run_dir/serve-apply"
+  printf 'id-token' >"$join_run_dir/token"
+  mkdir -p -- "$state"
+  rm -f -- "$TEST_LOG.up-exit" "$state/active" "$state/status.json"
+  if (($# > 1)); then
+    : >"$state/active"
+    printf '%s\n' "$2" >"$state/status.json"
+  fi
+  : >"$TEST_LOG"
   options=$(<"$first_join/systemd-run")
   options=${options%"$command"}
   [[ " $options " == *' --expand-environment=no '* ]] || command=$(manager_expansion "$command")
+}
+
+# join_stop_post runs the first run's join unit's ExecStopPost, as systemd runs it once the unit's
+# main process has ended, whatever ended it: a normal end, a failure, a kill or RuntimeMaxSec. With
+# no ExecStopPost, it runs nothing.
+join_stop_post() {
+  local stop_post words
+  stop_post=$(sed -n 's/^--property=ExecStopPost=//p' "$first_join/systemd-run-args")
+  [[ -n $stop_post ]] || return 0
+  read -ra words <<<"$stop_post"
+  "${words[@]}"
+}
+
+# run_join ROUTE_ALL STATUS_FIXTURE [STATUS] runs the first run's join command as its unit does, on
+# F-ip-pi and the status fixture STATUS_FIXTURE, as prepare_join readies it: ended after the unit's
+# RuntimeMaxSec, or after RUN_JOIN_LIMIT seconds when that is set, then its ExecStopPost. The exit
+# status is kept in join_exit (124 when the limit ended it), stdout and stderr in $work_dir/join.out.
+run_join() {
+  local limit
+  prepare_join "$1" "${@:3}"
+  limit=${RUN_JOIN_LIMIT:-$(sed -n 's/^--property=RuntimeMaxSec=//p' "$first_join/systemd-run-args")}
   join_exit=0
-  TEST_NETWORKS="$fixtures/F-ip-pi" TEST_STATUS=$2 PATH="$bin:$PATH" \
-    /bin/sh -c "$command" >"$work_dir/join.out" 2>&1 || join_exit=$?
+  TEST_NETWORKS="$fixtures/F-ip-pi" TEST_STATUS=$2 PATH="$bin:$PATH" GHOST_WISPR_STATUS_URL="$status_url" \
+    timeout --kill-after=1s "${limit:-infinity}" /bin/sh -c "$command" >"$work_dir/join.out" 2>&1 || join_exit=$?
+  join_stop_post
+  rm -f -- "$state/active" "$state/status.json"
 }
 
 # J1: no route overlaps a network of the Pi, so the join accepts the routes once the check passed.
-# It removes the route check and the token.
+# Its Serve apply reads the recorder's status, finds none running, resets Serve and applies
+# serve.conf's line. The join removes its run's route check, Serve apply, token and directory.
 run_join false "$fixtures/F-status-router"
 j1="the join did not accept the tailnet's subnet routes although no route overlaps the Pi's networks: $(<"$work_dir/join.out")"
-mapfile -t calls <"$TEST_LOG"
-[[ $join_exit == 0 && ${#calls[@]} == 4 && ${calls[0]} == 'tailscale up '* \
-  && ${calls[1]} == 'tailscale serve --bg --https 443 http://127.0.0.1:8080' \
-  && ${calls[2]} == 'tailscale status --json' && ${calls[3]} == 'tailscale set --accept-routes' ]] || fail "$j1"
+mapfile -t calls < <(grep '^tailscale ' "$TEST_LOG")
+[[ $join_exit == 0 && ${#calls[@]} == 5 && ${calls[0]} == 'tailscale up '* \
+  && ${calls[1]} == 'tailscale serve reset' && ${calls[2]} == 'tailscale serve --bg --https 443 http://127.0.0.1:8080' \
+  && ${calls[3]} == 'tailscale status --json' && ${calls[4]} == 'tailscale set --accept-routes' ]] || fail "$j1 (calls: ${calls[*]})"
+status_read=$(grep -n -F "$status_url" "$TEST_LOG" | head -n1 | cut -d: -f1)
+reset_line=$(grep -n '^tailscale serve reset$' "$TEST_LOG" | head -n1 | cut -d: -f1)
+[[ -n $status_read ]] && ((status_read < reset_line)) || fail "the join's Serve apply did not read the recorder's status before its reset: $(<"$TEST_LOG")"
+[[ ! -e $join_run_dir ]] || fail "the join left its run's directory: $(ls -la "$join_run_dir")"
 [[ $(<"$TEST_ROUTE_ALL") == true ]] || fail "$j1"
 accepted=$(grep -e "^$accepted_prefix" "$work_dir/join.out") || fail "$j1"
 [[ $accepted == *'wlan0 192.168.1.136/24'* && $accepted == *'10.1.0.0/16'* ]] || fail "$j1"
-[[ ! -e $work_dir/join/route-overlap-check ]] || fail "$j1"
-[[ ! -e $work_dir/join/token ]] || fail "the join left the token in the join directory (J1)"
+[[ ! -e $join_run_dir/route-overlap-check && ! -e $join_run_dir/token ]] || fail "the join left the route check or the token (J1)"
 
 # J2: office-router's route holds wlan0's network, so the join refuses: it runs no `tailscale set`,
 # leaves RouteAll false, ends failed, and names the overlap.
@@ -1520,7 +2374,7 @@ TEST_UP_EXIT=1 run_join false "$fixtures/F-status-router"
 if [[ $join_exit == 0 ]] || grep -q -e '^tailscale serve' -e '^tailscale status --json$' -e '^tailscale set' "$TEST_LOG"; then
   fail "the join went on after tailscale up failed: $(<"$TEST_LOG")"
 fi
-[[ ! -e $work_dir/join/token ]] || fail "the join left the token in the join directory after tailscale up failed (J5)"
+[[ ! -e $join_run_dir ]] || fail "the join left its run's directory after tailscale up failed (J5): $(ls -la "$join_run_dir")"
 
 # J6: accepting the routes does not depend on Serve, so a failed `tailscale serve` still runs the
 # check and accepts the routes, and the join ends failed.
@@ -1539,6 +2393,89 @@ fi
 # J8: a failed `tailscale set` ends the join failed.
 TEST_SET_EXIT=1 run_join false "$fixtures/F-status-router"
 [[ $join_exit != 0 ]] || fail "the join reported success although tailscale set failed"
+
+# J9: the join's Serve apply reads the recorder's status immediately before its reset, as
+# provision.sh's does (Sol's review of #203, P1): while the recorder records a session, it resets
+# and sets nothing in Serve. The route check still runs, as it does not depend on Serve, and the
+# join ends failed with the apply's exit 75. Break it catches: a join that resets Serve after its
+# re-authentication with no status read.
+run_join false "$fixtures/F-status-router" '{"active_session_id":"meeting-789","paused":false,"capture_state":"recording"}'
+j9="the join's Serve apply did not refuse a recorder that records a session: exit $join_exit: $(<"$work_dir/join.out")"
+[[ $join_exit == 75 ]] || fail "$j9"
+! grep -Eq '^tailscale serve (reset|--bg)' "$TEST_LOG" || fail "$j9 (calls: $(<"$TEST_LOG"))"
+grep -Fxq 'tailscale set --accept-routes' "$TEST_LOG" || fail "the join's busy Serve apply stopped the route check: $(<"$TEST_LOG")"
+grep -Fq 'ghost-wispr serve: active session; Serve was not reset' "$work_dir/join.out" || fail "$j9"
+
+# J10: GPT-6.1 Sol's reproduction (review of #203, round 2, P2): a join waits in its
+# re-authentication while another provisioning run starts. The join's unit is active, so the second
+# run fails, names the join's unit, and changes nothing. The join then runs its own run's
+# serve-apply: it ends 0, and Serve, which the re-authentication left empty, is serve.conf's. Break
+# it catches: a run that removes the serve-apply of another run's join, or one that does not look
+# for an active join.
+printf '{}\n' >"$TEST_SERVE_STATE"
+: >"$work_dir/up-hold"
+prepare_join false
+TEST_UP_HOLD=$work_dir/up-hold TEST_NETWORKS="$fixtures/F-ip-pi" TEST_STATUS="$fixtures/F-status-router" PATH="$bin:$PATH" \
+  GHOST_WISPR_STATUS_URL="$status_url" /bin/sh -c "$command" >"$work_dir/join.out" 2>&1 &
+join_pid=$!
+printf 'ActiveState=active\nActiveEnterTimestamp=Thu 2026-11-27 13:01:00 UTC\nMainPID=%s\n' "$join_pid" \
+  >"$system_units/ghost-wispr-provision-join.service"
+for _ in {1..100}; do
+  ! grep -q '^tailscale up ' "$TEST_LOG" || break
+  sleep 0.1
+done
+run_provision "$stage"
+rm -f -- "$work_dir/up-hold"
+join_exit=0
+wait "$join_pid" || join_exit=$?
+join_stop_post
+rm -f -- "$system_units/ghost-wispr-provision-join.service"
+expect_refused 'a run while a join waits in its re-authentication' \
+  "another provisioning run is going on: ghost-wispr-provision-join.service is active since Thu 2026-11-27 13:01:00 UTC, main PID $join_pid"
+! grep -q '^sudo ' "$TEST_LOG" || fail "a run while a join is active ran sudo: $(<"$TEST_LOG")"
+[[ $join_exit == 0 ]] || fail "the join that waited in its re-authentication ended $join_exit: $(<"$work_dir/join.out")"
+serve_is 'the join that waited in its re-authentication' "$want_serve"
+[[ ! -e $join_run_dir ]] || fail "the join that waited left its run's directory: $(ls -la "$join_run_dir")"
+
+# J11 and J12, Sol's cases (review of #203, round 3): a join that stops before its own cleanup
+# leaves no token. The unit's ExecStopPost removes the run's directory, the token's, whatever stopped
+# it; J1 and J5 are the normal end and a returned failure. Breaks they catch: a join unit with no
+# ExecStopPost, whose token stays on disk.
+# J11: the join's main process is killed, by its exact PID, inside tailscale up.
+: >"$work_dir/up-hold"
+prepare_join false
+TEST_UP_HOLD=$work_dir/up-hold TEST_NETWORKS="$fixtures/F-ip-pi" TEST_STATUS="$fixtures/F-status-router" PATH="$bin:$PATH" \
+  GHOST_WISPR_STATUS_URL="$status_url" /bin/sh -c "$command" >"$work_dir/join.out" 2>&1 &
+join_pid=$!
+for _ in {1..100}; do
+  ! grep -q '^tailscale up ' "$TEST_LOG" || break
+  sleep 0.1
+done
+grep -q '^tailscale up ' "$TEST_LOG" || fail 'control: J11: the join never reached tailscale up'
+kill -KILL "$join_pid"
+wait "$join_pid" || true
+rm -f -- "$work_dir/up-hold"
+join_stop_post
+[[ ! -e $join_run_dir ]] || fail "J11: a join killed inside tailscale up left its token: $(ls -la "$join_run_dir")"
+sleep 0.5
+# J12: RuntimeMaxSec ends the join inside tailscale up.
+: >"$work_dir/up-hold"
+TEST_UP_HOLD=$work_dir/up-hold RUN_JOIN_LIMIT=2 run_join false "$fixtures/F-status-router"
+rm -f -- "$work_dir/up-hold"
+[[ $join_exit == 124 ]] && grep -q '^tailscale up ' "$TEST_LOG" || fail "control: J12: the limit did not end the join inside tailscale up: exit $join_exit"
+[[ ! -e $join_run_dir ]] || fail "J12: a join that its limit ended inside tailscale up left its token"
+sleep 0.5
+# A join unit that does not start (systemd-run fails): provision.sh removes the run's directory, the
+# token's, itself, and fails. Break it catches: a run that leaves the token when its join never ran.
+new_pi
+TEST_JOIN_START_EXIT=1 run_provision "$stage"
+expect_refused 'a join unit that does not start' 'could not start the join unit ghost-wispr-provision-join'
+failed_token=$(grep -o -E -m1 "id-token=file:$join/$uuid_re/token" "$TEST_LOG" | head -n1)
+[[ -n $failed_token ]] || fail "control: the run whose join unit did not start named no token of a run directory: $(<"$TEST_LOG")"
+failed_run_dir=${failed_token#id-token=file:}
+failed_run_dir=${failed_run_dir%/token}
+[[ -d $join && $failed_run_dir =~ ^$join/$uuid_re$ ]] || fail "control: the failed run's directory is not one run directory: $failed_run_dir"
+[[ ! -e $failed_run_dir ]] || fail "a run whose join unit did not start left its token: $(ls -la "$failed_run_dir")"
 
 # route-check: route_row runs the route check provision.sh installed as the join unit runs it,
 # /bin/sh on the file, on the network fixture and the status fixture given third and fourth. It

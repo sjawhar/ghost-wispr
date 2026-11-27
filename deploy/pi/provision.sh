@@ -20,17 +20,36 @@
 # routes prints route_overlap_check_script from it.
 set -euo pipefail
 
-# GHOST_WISPR_DEPLOY_DIR, GHOST_WISPR_UNIT_DIR, GHOST_WISPR_SYSTEM_ROOT, GHOST_WISPR_IDENTITY_KEY and
-# GHOST_WISPR_JOIN_DIR exist for provision_run_test.sh, as update.sh's do for update_test.sh.
+# GHOST_WISPR_DEPLOY_DIR, GHOST_WISPR_UNIT_DIR, GHOST_WISPR_SYSTEM_ROOT, GHOST_WISPR_IDENTITY_KEY,
+# GHOST_WISPR_JOIN_DIR, GHOST_WISPR_STATUS_URL and GHOST_WISPR_TAILSCALE_CALL_TIMEOUT exist for
+# provision_run_test.sh, as update.sh's do for update_test.sh; the run's unit gets each GHOST_WISPR_
+# setting of its caller (start_provision_unit).
 readonly DEPLOY_DIR="${GHOST_WISPR_DEPLOY_DIR:-/opt/ghost-wispr}"
 readonly UNIT_DIR="${GHOST_WISPR_UNIT_DIR:-/home/ghost-wispr/.config/systemd/user}"
 # The root under which the nightly update installs the udev rule and the logind setting.
 readonly SYSTEM_ROOT="${GHOST_WISPR_SYSTEM_ROOT:-/}"
 readonly IDENTITY_KEY="${GHOST_WISPR_IDENTITY_KEY:-/home/ghost-wispr/.config/ghost-wispr-identity/key.pem}"
-readonly JOIN_DIR="${GHOST_WISPR_JOIN_DIR:-/var/lib/ghost-wispr-join}"
-readonly JOIN_ROUTE_CHECK="$JOIN_DIR/route-overlap-check"
-readonly JOIN_TOKEN="$JOIN_DIR/token"
+# The recorder's status, which the Serve apply reads immediately before its reset.
+readonly STATUS_URL="${GHOST_WISPR_STATUS_URL:-http://127.0.0.1:8080/api/status}"
+# Root's directory for what the join and the Serve apply run. Each run has a directory of its own in
+# it, RUN_DIR, named by its run id, for the join's token and route check and the run's serve-apply
+# (serve_apply_script), so no run replaces or removes a file of another run's join. It is on /run, a
+# tmpfs, so a boot clears a token that a stopped join could not remove (Sol's review of #203, round
+# 3); the join unit's ExecStopPost removes it in every other case.
+readonly JOIN_DIR="${GHOST_WISPR_JOIN_DIR:-/run/ghost-wispr-join}"
 readonly SERVICE_USER=ghost-wispr
+# What serve-apply's refusal of a busy recorder exits with.
+readonly SERVE_APPLY_BUSY=75
+# How long each tailscale call of provision.sh and of serve-apply may take, and serve-apply's read
+# of ghost-wispr.service's state: TAILSCALE_CALL_TIMEOUT s, then 5 s more before a kill. Each is a
+# local request to tailscaled or to the user manager over its socket, which answers in well under a
+# second (GPT-6.1 Sol's runs of the reset on a loaded dev box took 138 to 375 ms from the status
+# read). 30 s leaves room for a loaded Pi or a tailscaled that restarts, and keeps 4 tries of one
+# line within about 2.5 minutes.
+readonly TAILSCALE_CALL_TIMEOUT="${GHOST_WISPR_TAILSCALE_CALL_TIMEOUT:-30}"
+# The join unit's RuntimeMaxSec, 15 minutes: tailscale up's re-authentication with an ID token takes
+# seconds, and the limit keeps a join that hangs from refusing every later run for good.
+readonly JOIN_RUNTIME_MAX=900
 # The paths that the credential files name: where the recorder and pi-secrets find the certificate,
 # its config and the key on the Pi, as gcloud's create-cred-config wrote them for the office Pi.
 readonly CREDENTIAL_CERTIFICATE=/opt/ghost-wispr/device.crt
@@ -58,6 +77,96 @@ source "$script_dir/pi-lib.sh"
 
 require_service_user() {
   [[ $(id -un) == "$SERVICE_USER" ]] || fail "run as $SERVICE_USER"
+}
+
+# busy_runs_message [UNIT...] prints why a run may not go on, or nothing: a line for each UNIT, by
+# default PI_LIB_PROVISION_UNIT and then PI_LIB_PROVISION_JOIN_UNIT, that systemd has active. It reads
+# the run's unit first, so a join that a run starts between the two reads is seen: the run is then
+# still active, or it has started the join. It fails when it cannot read a unit.
+busy_runs_message() {
+  local busy
+  (($#)) || set -- "$PI_LIB_PROVISION_UNIT" "$PI_LIB_PROVISION_JOIN_UNIT"
+  busy=$(provision_units_busy "$@") || return 1
+  [[ -n $busy ]] || return 0
+  printf 'another provisioning run is going on: %s; nothing was changed. Run provision.sh again once it has ended, or end it with: sudo systemctl stop %s %s. An SSH session that ends does not end a run.\n' \
+    "$(paste -sd ';' <<<"$busy" | sed 's/;/; /g')" "$PI_LIB_PROVISION_UNIT" "$PI_LIB_PROVISION_JOIN_UNIT"
+}
+
+# refuse_busy [UNIT...] fails, with busy_runs_message's whole line, while a UNIT is active.
+refuse_busy() {
+  local busy
+  busy=$(busy_runs_message "$@") \
+    || fail "could not read whether another provisioning run is going on (systemctl show $PI_LIB_PROVISION_UNIT.service $PI_LIB_PROVISION_JOIN_UNIT.service): nothing was changed"
+  [[ -z $busy ]] || fail "$busy"
+}
+
+# reset_failed_units resets each unit of a run that systemd keeps failed, which would take the
+# unit's name from the next start (Sol's review of #203, round 6), and says so. A run with --collect
+# leaves none; a unit kept by hand, or by an older provision.sh, can.
+reset_failed_units() {
+  local unit
+  for unit in "$PI_LIB_PROVISION_UNIT" "$PI_LIB_PROVISION_JOIN_UNIT"; do
+    if [[ $(systemctl show -p ActiveState --value "$unit.service" 2>/dev/null) == failed ]]; then
+      sudo systemctl reset-failed "$unit.service" || fail "could not reset the failed unit $unit.service: nothing was changed"
+      printf 'ghost-wispr provision: reset the failed unit %s.service, which a run that failed left\n' "$unit"
+    fi
+  done
+}
+
+# start_provision_unit ARGUMENT... runs this script again with ARGUMENT..., as the transient system
+# unit PI_LIB_PROVISION_UNIT (pi-lib.sh's provision_unit_command), as SERVICE_USER, in the caller's
+# directory, with the caller's PATH and provisioning settings (pi-lib.sh's provision_unit_settings,
+# never a credential), and exits with the run's exit status. systemd starts one unit of that name at
+# a time, and while the run or the join it started, PI_LIB_PROVISION_JOIN_UNIT, is active, this
+# fails first, names it, and changes nothing. The run checks the join again in its unit (the main
+# path below), as a join can become active between this check and the start. When the start itself
+# loses to another run's, it gives the same refusal, not systemd-run's line: the run marks its start
+# in the file GHOST_WISPR_PROVISION_STARTED names, so a run that never started is told from one that
+# failed. The run's end, by systemctl stop, a kill of its main process or its own end, ends every
+# process in its unit's control group: each command of the run that stays in it (GPT-6.1 Sol's
+# review of #203, round 5, where a lock descriptor stayed with each command that inherited it). A
+# root process that moves itself to another unit leaves that boundary. An SSH session that ends
+# does not end the run: over Tailscale SSH, the session's processes and the unit stay. Before it
+# starts the unit, a run with no argument refuses data on its standard input.
+start_provision_unit() {
+  local started status=0
+  check_usage "$@"
+  if (($# == 0)); then
+    refuse_input
+  fi
+  require_service_user
+  reset_failed_units
+  refuse_busy
+  provision_unit_settings
+  provision_unit_command "$PI_LIB_PROVISION_UNIT" "$SERVICE_USER"
+  started=$(mktemp) || fail 'could not make the file that marks the run'"'"'s start: nothing was changed'
+  # shellcheck disable=SC2154 # pi-lib.sh's provision_unit_command and provision_unit_settings set them.
+  sudo "${pl_unit_command[@]}" "${pl_unit_settings[@]}" --setenv=GHOST_WISPR_PROVISION_IN_UNIT=1 \
+    "--setenv=GHOST_WISPR_PROVISION_STARTED=$started" "--working-directory=$PWD" \
+    /bin/bash "$script_dir/provision.sh" "$@" || status=$?
+  if ((status != 0)) && [[ ! -s $started ]]; then
+    rm -f -- "$started"
+    refuse_busy
+    fail "the run's unit $PI_LIB_PROVISION_UNIT did not start (systemd-run exit $status): nothing was changed. Run provision.sh again, or end a run that holds the name with: sudo systemctl stop $PI_LIB_PROVISION_UNIT $PI_LIB_PROVISION_JOIN_UNIT. An SSH session that ends does not end a run."
+  fi
+  rm -f -- "$started"
+  exit "$status"
+}
+
+# check_usage ARGUMENT... fails, with the usage of the mode, on arguments that no mode takes, before
+# a run checks its user or starts its unit, so a wrong command says first what it lacks. Each mode
+# checks its arguments again in the unit.
+check_usage() {
+  case ${1:-} in
+    --models)
+      (($# == 2)) || fail "usage: provision.sh --models <shared-drive-id>"
+      valid_drive_id "$2" \
+        || fail "shared-drive ID must be non-empty and contain only letters, numbers, hyphens, and underscores"
+      ;;
+    --key) (($# == 1)) || fail 'usage: provision.sh --key' ;;
+    --certificate) (($# == 2)) || fail 'usage: provision.sh --certificate FILE' ;;
+    *) (($# == 0)) || fail "$USAGE" ;;
+  esac
 }
 
 # refuse_input fails while standard input holds data, such as the credential bundle that an older
@@ -208,16 +317,21 @@ read_pi_env() {
 }
 
 # read_serve_conf reads the release's serve.conf into serve_lines, "<port> <proxy target>" sorted
-# (pi-lib.sh's serve_conf_lines). It fails on a line of another form, on a port twice, and on a
-# port or a target that it would not write into the join's command as it is.
+# (pi-lib.sh's serve_conf_lines), and into serve_words, each port and target one word, the arguments
+# of serve-apply. It fails on a line of another form, on a port twice, and on a port or a target
+# that it would not write into the join's command as it is.
 read_serve_conf() {
   local conf=$script_dir/serve.conf bad port target
   bad=$(awk 'NF && $1 !~ /^#/ && NF != 2' "$conf") || fail "cannot read $conf"
   [[ -z $bad ]] || fail "serve.conf has a line that is not '<port> <proxy target>': $bad; nothing was installed"
   serve_lines=$(serve_conf_lines "$conf") || fail "cannot read $conf"
+  serve_words=()
   while read -r port target; do
     if [[ -n $port ]] && ! [[ $port =~ ^[1-9][0-9]{0,4}$ && $target =~ ^https?://[A-Za-z0-9.:/_-]+$ ]]; then
       fail "serve.conf has the line '$port $target', not an HTTPS port and a proxy target; nothing was installed"
+    fi
+    if [[ -n $port ]]; then
+      serve_words+=("$port" "$target")
     fi
   done <<<"$serve_lines"
   bad=$(cut -d' ' -f1 <<<"$serve_lines" | uniq -d)
@@ -299,62 +413,167 @@ compare_client_id() {
   fi
 }
 
-# live_serve_entries JSON prints what JSON, the answer of `tailscale serve status --json`
-# (tailscale's ipn.ServeConfig), serves over HTTPS: "port <port>" for each HTTPS port, a TCP entry
-# with HTTPS or a Web entry "<host>:<port>", and then "mount <port> <path>" for each handler of each
-# Web entry, the path as a JSON string. It fails on an answer that is not a JSON object.
-live_serve_entries() {
-  [[ -n $1 ]] || return 1
-  jq -r 'if type != "object" then error("not a ServeConfig") else
-      ([((.TCP // {}) | to_entries[] | select((.value | type) == "object" and .value.HTTPS == true) | .key),
-        ((.Web // {}) | keys[] | split(":") | last)] | unique[] | "port \(.)"),
-      ((.Web // {}) | to_entries[] | (.key | split(":") | last) as $port
-        | .value.Handlers | objects | keys[] | "mount \($port) \(@json)")
-    end' <<<"$1" 2>/dev/null
+# serve_apply_script prints serve-apply, the program that makes Tailscale Serve serve.conf's setting.
+# Root runs it in a systemd unit of its own: apply_serve starts it with systemd-run --wait, and the
+# join's unit runs it after the re-authentication. `sh serve-apply STATUS_URL PORT TARGET...`, with
+# one PORT TARGET pair a line of serve.conf:
+# - reads the recorder's status at STATUS_URL immediately before the reset, with update.sh's rules
+#   (pi-lib.sh's PI_LIB_RECORDER_STATUS_FILTER and PI_LIB_BUSY_REASON_FILTER), and exits
+#   SERVE_APPLY_BUSY, changing nothing, while the recorder records a session or holds a call whose
+#   state is not none: a reset would cut the page and /call under a meeting (GPT-6.1 Sol's review of
+#   PR #203). With no status it can read, it asks ghost-wispr's manager for ghost-wispr.service's
+#   state, and goes on only when the manager answers "inactive" in time; a manager that does not
+#   answer, a read that fails, or any other state refuses too (round 3: a manager that hung let the
+#   reset go on). The read is a snapshot: a session that starts after it, in the fraction of a
+#   second before the reset, is not seen;
+# - then clears Serve with `tailscale serve reset`, Tailscale's documented way to clear the Serve
+#   setting (https://tailscale.com/kb/1242/tailscale-serve, "Reset Tailscale Serve"), and applies
+#   each pair with `tailscale serve --bg --https`. Each tailscale call ends after
+#   TAILSCALE_CALL_TIMEOUT s, and is killed 5 s later, so a call that hangs fails. When a call fails,
+#   it applies every pair again, up to 4 tries 2 s apart, and exits 1 when a call still fails. It
+#   exits 1 when the reset failed too;
+# - removes itself and its run's directory, once that is empty, when it ends: no other run removes
+#   it.
+# As a unit of its own, it goes on when provision.sh is killed or its SSH session ends between the
+# reset and the last pair, so neither leaves Serve empty.
+serve_apply_script() {
+  cat <<'APPLY'
+# Ghost Wispr's Serve apply, printed by serve_apply_script in deploy/pi/provision.sh.
+trap 'rm -f -- "$0"; rmdir -- "${0%/*}" 2>/dev/null' EXIT
+trap 'exit 143' TERM
+status_url=$1
+shift
+APPLY
+  printf "status_filter='%s'\nbusy_filter='%s'\nbusy_exit=%s\ncall_timeout=%s\n" \
+    "$PI_LIB_RECORDER_STATUS_FILTER" "$PI_LIB_BUSY_REASON_FILTER" "$SERVE_APPLY_BUSY" "$TAILSCALE_CALL_TIMEOUT"
+  cat <<'APPLY'
+why=
+status=$(curl --connect-timeout 5 --max-time 10 --fail --silent "$status_url" 2>/dev/null) || status=
+if [ -n "$status" ] && printf '%s' "$status" | jq -e "$status_filter" >/dev/null 2>&1; then
+  why=$(printf '%s' "$status" | jq -r "$busy_filter" 2>/dev/null) || why='status unreadable'
+else
+  read_rc=0
+  state=$(timeout --kill-after=5s "${call_timeout}s" systemctl --user --machine=ghost-wispr@ is-active ghost-wispr.service 2>/dev/null) || read_rc=$?
+  # The exit status first: only exit 3, which is-active gives for a unit that is not active, with
+  # exactly "inactive" lets the reset go on. A line from a read that timed out (124, 137) or failed
+  # is no answer (Sol's review of #203, round 4: "inactive" then a stall reset Serve).
+  case $read_rc:$state in
+    3:inactive) ;;
+    124:* | 137:*) why="the state of ghost-wispr.service did not come within $call_timeout s, and /api/status gave no status" ;;
+    0:?* | 3:?*) why="ghost-wispr.service is $state, and /api/status gave no status" ;;
+    *) why="the state of ghost-wispr.service could not be read (systemctl exit $read_rc), and /api/status gave no status" ;;
+  esac
+fi
+if [ -n "$why" ]; then
+  printf 'ghost-wispr serve: %s; Serve was not reset\n' "$why"
+  exit "$busy_exit"
+fi
+call() {
+  timeout --kill-after=5s "${call_timeout}s" tailscale "$@"
+}
+apply() {
+  port=
+  for word do
+    if [ -z "$port" ]; then
+      port=$word
+    else
+      call serve --bg --https "$port" "$word" || return 1
+      port=
+    fi
+  done
+}
+rc=0
+printf 'ghost-wispr serve: resetting Serve (tailscale serve reset) and applying serve.conf\n'
+call serve reset || rc=1
+tries=1
+until apply "$@"; do
+  if [ "$tries" -ge 4 ]; then
+    printf 'ghost-wispr serve: serve.conf could not be applied after the reset in %s tries: the page is not served\n' "$tries"
+    exit 1
+  fi
+  tries=$((tries + 1))
+  printf 'ghost-wispr serve: a tailscale serve call failed or did not end within %s s after the reset; applying serve.conf again (try %s of 4)\n' "$call_timeout" "$tries"
+  sleep 2
+done
+exit "$rc"
+APPLY
 }
 
-# apply_serve gives Tailscale Serve serve.conf's setting. It applies each line, which sets the mount /
-# of its port and keeps each other mount there (tailscale's SetWebHandler, ipn/serve.go, v1.104).
-# Then it turns off each live HTTPS port that serve.conf does not list, and each mount other than /
-# of a port that it lists. Last it reads Serve again, as the nightly drift check reads it (pi-lib.sh's
-# serve_lines_from_status), and fails unless that is serve.conf: a part it does not manage, such as
-# a TCP forward, would show as drift each night. The nightly update only compares Serve with the
-# release's serve.conf.
+# install_serve_apply installs serve-apply in this run's directory, root's alone, for apply_serve
+# and the join.
+install_serve_apply() {
+  sudo install -d -o root -g root -m 0700 "$JOIN_DIR" "$RUN_DIR"
+  serve_apply_script | sudo install -o root -g root -m 0700 /dev/stdin "$SERVE_APPLY"
+}
+
+# serve_status_json prints Tailscale Serve's setting, `tailscale serve status --json`, in at most
+# TAILSCALE_CALL_TIMEOUT s.
+serve_status_json() {
+  timeout --kill-after=5s "${TAILSCALE_CALL_TIMEOUT}s" sudo tailscale serve status --json
+}
+
+# apply_serve makes Tailscale Serve exactly serve.conf's setting for this device's tailnet name, as
+# `tailscale status --self --json` gives it: the release owns Serve whole. A Serve that is that
+# already stays as it is. Any other it gives to serve-apply (serve_apply_script), in a unit of its
+# own, named by the run's id, and waits for it: the reset also clears the Web entry of a name the
+# device had before a rename, which tailscaled keeps beside the entry of its name now and which no
+# `tailscale serve --https=PORT off` reaches, as those act on the device's name now; and a port, a
+# mount, a TCP forward or Funnel that serve.conf does not hold. It fails, and nothing in Serve was
+# changed, when the recorder is busy. From the reset until the last line is applied, the page is not
+# served. The unit's RuntimeMaxSec is the longest that serve-apply's bounded steps take, and 30 s to
+# spare: the status read (10 s), the service-state read, the reset and 4 tries of each line
+# (TAILSCALE_CALL_TIMEOUT s and 5 s each) and 3 pauses of 2 s. The unit's serve-apply removes
+# itself, and this run removes it too once the unit has ended, as a unit that did not start leaves
+# it. When the unit fails or does not end in time, it says what Serve is now
+# and the command to run. Last it prints the unit's lines, reads Serve again, as the nightly drift
+# check reads it (pi-lib.sh's serve_lines_from_status), and fails unless it is serve.conf's. It
+# changes nothing in Serve when it cannot read the device's name or Serve.
 apply_serve() {
-  local port target live entries kind rest mount have
-  while read -r port target; do
-    if [[ -n $port ]]; then
-      sudo tailscale serve --bg --https "$port" "$target" </dev/null
+  local self name live have state unit limit now status=0
+  if ! self=$(timeout --kill-after=5s "${TAILSCALE_CALL_TIMEOUT}s" tailscale status --self --json) \
+    || ! name=$(device_tailnet_name "$self"); then
+    fail "could not read this device's tailnet name (tailscale status --self --json), for which Serve must be serve.conf's: nothing in Serve was changed"
+  fi
+  live=$(serve_status_json) \
+    || fail "could not read Tailscale Serve's setting (tailscale serve status --json): nothing in Serve was changed"
+  if have=$(serve_lines_from_status "$live" "$name"); then
+    if [[ $have == "$serve_lines" ]]; then
+      printf "ghost-wispr provision: Tailscale Serve is serve.conf's already for %s\n" "$name"
+      return 0
     fi
-  done <<<"$serve_lines"
-  live=$(sudo tailscale serve status --json) \
-    || fail "could not read Tailscale Serve's setting (tailscale serve status --json), so the ports and mounts that serve.conf does not list may still be served"
-  entries=$(live_serve_entries "$live") \
-    || fail "tailscale serve status --json gave no Serve setting that provision.sh can read, so the ports and mounts that serve.conf does not list may still be served"
-  while read -r kind port rest; do
-    case $kind in
-      port)
-        if ! grep -q "^$port " <<<"$serve_lines"; then
-          sudo tailscale serve --https="$port" off </dev/null
-          printf 'ghost-wispr provision: turned off Serve port %s, which serve.conf does not list\n' "$port"
-        fi
-        ;;
-      mount)
-        # A port that serve.conf does not list went whole above.
-        grep -q "^$port " <<<"$serve_lines" || continue
-        mount=$(jq -r . <<<"$rest") || fail "cannot read the Serve mount $rest of port $port"
-        [[ $mount != / ]] || continue
-        [[ $mount == /* && $mount != *[[:cntrl:]]* ]] \
-          || fail "Tailscale Serve has the mount $rest on port $port, which provision.sh cannot name as it is: remove it (tailscale serve --https=$port --set-path=PATH off) and run provision.sh again"
-        sudo tailscale serve --https="$port" --set-path="$mount" off </dev/null
-        printf 'ghost-wispr provision: turned off the Serve mount %s of port %s, which serve.conf does not list\n' "$mount" "$port"
-        ;;
-    esac
-  done <<<"$entries"
-  live=$(sudo tailscale serve status --json) \
+    state=${have:-none}
+  else
+    state="a setting it cannot read, such as a TCP forward or Funnel"
+  fi
+  unit="ghost-wispr-serve-$RUN_ID"
+  limit=$((10 + (TAILSCALE_CALL_TIMEOUT + 5) * (2 + 4 * ${#serve_words[@]} / 2) + 3 * 2 + 30))
+  printf "ghost-wispr provision: Tailscale Serve for %s is [%s], not serve.conf's: resetting it and applying serve.conf in %s, a unit of its own, which finishes the apply even if this run or its SSH session ends\n" \
+    "$name" "$(paste -sd ';' <<<"$state")" "$unit"
+  install_serve_apply
+  sudo systemd-run --wait --quiet --collect --expand-environment=no --unit="$unit" --property=RuntimeMaxSec="$limit" \
+    /bin/sh "$SERVE_APPLY" "$STATUS_URL" "${serve_words[@]}" </dev/null || status=$?
+  printf 'ghost-wispr provision: the journal of %s:\n' "$unit"
+  sudo journalctl -u "$unit" --no-pager --output=cat || printf 'ghost-wispr provision: could not read the journal of %s\n' "$unit"
+  sudo rm -f -- "$SERVE_APPLY"
+  if ((status == SERVE_APPLY_BUSY)); then
+    fail "the recorder records a conversation, holds a call or gives no status (its line is above), so Serve was not reset and nothing in Serve was changed: run provision.sh again when no conversation is recorded and no call is live"
+  fi
+  if ((status != 0)); then
+    if live=$(serve_status_json) && now=$(serve_lines_from_status "$live" "$name"); then
+      if [[ -z $now ]]; then
+        now='Serve is now [none], so the page is not served'
+      else
+        now="Serve is now [$(paste -sd ';' <<<"$now")], not serve.conf's"
+      fi
+    else
+      now='Serve cannot be read now, so the page may not be served'
+    fi
+    fail "the reset and apply of Serve in $unit failed or did not end within $limit s (exit $status, its lines are above). $now: run the release's ./provision.sh again (docs/pi-setup.md, \"Apply a provisioning change\")"
+  fi
+  live=$(serve_status_json) \
     || fail "could not read Tailscale Serve's setting (tailscale serve status --json) after provision.sh applied serve.conf"
-  have=$(serve_lines_from_status "$live") \
-    || fail "Tailscale Serve holds a part that provision.sh does not manage, such as a TCP forward or Funnel, so its setting is not serve.conf's: read it with tailscale serve status, remove that part, and run provision.sh again"
+  have=$(serve_lines_from_status "$live" "$name") \
+    || fail "Tailscale Serve holds a part that provision.sh cannot read after it reset Serve and applied serve.conf: read it with tailscale serve status"
   [[ $have == "$serve_lines" ]] \
     || fail "Tailscale Serve's setting is not serve.conf's after provision.sh applied it: want [$(paste -sd ';' <<<"$serve_lines")], have [$(paste -sd ';' <<<"$have")]"
 }
@@ -586,6 +805,20 @@ CHECK
 if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
   return 0
 fi
+# Each mode runs as the transient system unit of a run (start_provision_unit); in it, systemd has
+# set INVOCATION_ID, and a stop ends the run failed (pi-lib.sh's provision_stop_traps).
+if [[ ${GHOST_WISPR_PROVISION_IN_UNIT:-} != 1 || -z ${INVOCATION_ID:-} ]]; then
+  start_provision_unit "$@"
+fi
+provision_stop_traps
+# The run's start, which start_provision_unit reads to tell a run that failed from one that never
+# started.
+if [[ -n ${GHOST_WISPR_PROVISION_STARTED:-} ]]; then
+  printf 'started\n' >"$GHOST_WISPR_PROVISION_STARTED"
+fi
+# The join again, now that this run holds the run's name: a join can have become active after the
+# check before the start (GPT-6.1 Sol's review of #203, round 6). Before any mode changes a file.
+refuse_busy "$PI_LIB_PROVISION_JOIN_UNIT"
 case ${1:-} in
   --models)
     shift
@@ -606,7 +839,13 @@ esac
 
 (($# == 0)) || fail "$USAGE"
 require_service_user
-refuse_input
+# The run's id, which names its Serve unit and its directory under JOIN_DIR: two runs never share
+# one, as two runs in one second shared a name made of the time (Sol's review of #203, round 2).
+RUN_ID=$(cat /proc/sys/kernel/random/uuid) && [[ $RUN_ID =~ ^[0-9a-f-]{36}$ ]] \
+  || fail "could not read a run id from /proc/sys/kernel/random/uuid: nothing was changed"
+readonly RUN_ID
+readonly RUN_DIR="$JOIN_DIR/$RUN_ID"
+readonly JOIN_TOKEN="$RUN_DIR/token" JOIN_ROUTE_CHECK="$RUN_DIR/route-overlap-check" SERVE_APPLY="$RUN_DIR/serve-apply"
 use_runtime_dir
 [[ -f $IDENTITY_KEY ]] || fail "there is no key at $IDENTITY_KEY: run provision.sh --key, then provision.sh --certificate FILE, first"
 [[ -f $DEPLOY_DIR/device.crt ]] || fail "there is no certificate at $DEPLOY_DIR/device.crt: run provision.sh --certificate FILE first"
@@ -683,7 +922,12 @@ systemctl --user enable ghost-wispr.service
 
 apply_serve
 
-self_status=$(tailscale status --self --json)
+# Whether the node is joined already, read in TAILSCALE_CALL_TIMEOUT s like each tailscale call: a
+# read that hangs would hold the run, and refuse every later one, for good (Sol's review of #203,
+# round 3).
+if ! self_status=$(timeout --kill-after=5s "${TAILSCALE_CALL_TIMEOUT}s" tailscale status --self --json); then
+  fail "could not read this device's tailnet status (tailscale status --self --json) before the join, in $TAILSCALE_CALL_TIMEOUT s: no join was started; run provision.sh again"
+fi
 if jq -e --arg hostname "$TAILSCALE_HOSTNAME" '
   .Self.Tags == ["tag:ghost-wispr"] and .Self.DNSName == $hostname
 ' <<<"$self_status" >/dev/null; then
@@ -714,36 +958,45 @@ if ! jq -e --arg subject "$PI_SERVICE_ACCOUNT_UNIQUE_ID" --arg audience "$token_
   fail "Google ID token subject or audience does not match the expected Tailscale identity"
 fi
 
-sudo install -d -o root -g root -m 0700 "$JOIN_DIR"
+sudo install -d -o root -g root -m 0700 "$JOIN_DIR" "$RUN_DIR"
 printf '%s' "$id_token" | sudo install -m 0600 /dev/stdin "$JOIN_TOKEN"
 route_overlap_check_script | sudo install -o root -g root -m 0700 /dev/stdin "$JOIN_ROUTE_CHECK"
-join_unit="ghost-wispr-tailnet-join-$(date +%s)"
+install_serve_apply
+join_unit=$PI_LIB_PROVISION_JOIN_UNIT
 # The join brings the node up with the tailnet's subnet routes off, `--accept-routes=false`:
 # `tailscale up` refuses to leave out a setting that is not the default (tailscale v1.104.1,
 # cmd/tailscale/cli/up.go, checkForAccidentalSettingReverts), and a re-join must not accept a route
 # that now overlaps a network of the Pi. So only the route check turns the routes on, through
 # `tailscale set --accept-routes` once it passed. The check runs even when Serve failed, as the
-# routes do not depend on Serve, and the unit ends failed when up, serve or set failed or the check
-# refused. Serve is set above for a node that is joined already, and again after the
-# re-authentication: the join can start a new login profile, which would not carry the setting over.
-# The command holds each line of serve.conf as a tailscale serve call: the join runs after P2's
-# command has removed the release's directory, so it reads no file of it.
-join_serve=''
-while read -r port target; do
-  if [[ -n $port ]]; then
-    join_serve+=" tailscale serve --bg --https $port $target || rc=\$?;"
-  fi
-done <<<"$serve_lines"
+# routes do not depend on Serve, and the unit ends failed when up, the Serve apply or set failed or
+# the check refused. Serve is set above for a node that is joined already, and again after the
+# re-authentication: the join can start a new login profile, which would not carry the setting over,
+# and a profile it keeps would keep the entries of the name the node had before. So the join runs
+# serve-apply, as apply_serve does, which reads the recorder's status immediately before its reset,
+# with each line of serve.conf as its arguments: the join runs after P2's command has removed the
+# release's directory, so it reads no file of it. The join is the transient unit
+# PI_LIB_PROVISION_JOIN_UNIT, outside this run's unit, so this run's end does not stop it, and a
+# later run refuses while it is active (start_provision_unit). Its RuntimeMaxSec keeps a join that
+# hangs from refusing every later run for good. It removes the token as soon as tailscale up ends,
+# and its ExecStopPost removes the run's directory, the token's among its files, whatever stopped the
+# unit: its end, a failure, a kill or its RuntimeMaxSec (Sol's review of #203, round 3: a killed or
+# timed-out join left its token).
 join_command="tailscale up --force-reauth --client-id='$PI_TAILNET_CLIENT_ID?ephemeral=false&preauthorized=true'"
 join_command+=" --id-token=file:$JOIN_TOKEN --advertise-tags=tag:ghost-wispr --hostname=ghost-wispr --ssh --accept-routes=false;"
 join_command+=" rc=\$?; rm -f $JOIN_TOKEN;"
 join_command+=" if [ \$rc -eq 0 ]; then"
-join_command+="$join_serve"
+join_command+=" /bin/sh $SERVE_APPLY $STATUS_URL ${serve_words[*]} || rc=\$?;"
 join_command+=" if /bin/sh $JOIN_ROUTE_CHECK; then tailscale set --accept-routes || rc=\$?; else rc=\$?; fi;"
-join_command+=" fi; rm -f $JOIN_ROUTE_CHECK; exit \$rc"
+join_command+=" fi; exit \$rc"
+# The join's lines, a login URL that tailscale up prints among them, go to its unit's journal, and
+# its re-authentication can end the SSH session: so the run names the journal before it starts it.
 printf 'ghost-wispr provision: starting the tagged tailnet join as %s\n' "$join_unit"
+printf "ghost-wispr provision: reconnect with Tailscale SSH, then check tailscale status and the join's lines, a login URL of tailscale up among them, with: sudo journalctl -u %s\n" "$join_unit"
 # systemd-run(1): the service manager expands ${NAME} and $$ in the command's arguments unless
 # --expand-environment=no, which systemd 254 added (Raspberry Pi OS Trixie has 257). The join
 # command is shell code for the unit's /bin/sh, which must get it as written.
-sudo systemd-run --expand-environment=no --unit="$join_unit" /bin/sh -c "$join_command"
-printf 'ghost-wispr provision: reconnect with Tailscale SSH, then check tailscale status and sudo journalctl -u %s.\n' "$join_unit"
+if ! sudo systemd-run --expand-environment=no --unit="$join_unit" --collect --property=RuntimeMaxSec="$JOIN_RUNTIME_MAX" \
+  --property=ExecStopPost="/bin/rm -rf -- $RUN_DIR" /bin/sh -c "$join_command"; then
+  sudo rm -rf -- "$RUN_DIR"
+  fail "could not start the join unit $join_unit (systemd-run failed): its token is removed, and the Pi did not join; run provision.sh again"
+fi
