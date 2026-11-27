@@ -283,23 +283,35 @@ restarts the recorder, and a restart ends a conversation that is being recorded.
    - enables `ghost-wispr.service`;
    - makes Tailscale Serve exactly the release's `serve.conf` for the device's tailnet name now, as
      `tailscale status --self --json` gives it. A Serve that is that already stays as it is. Any
-     other it clears with `tailscale serve reset`, Tailscale's documented way to clear Serve
+     other it gives to `serve-apply`, which runs as root in a systemd unit of its own, apart from
+     `provision.sh`, which waits for it and prints its lines. `serve-apply` reads the recorder's
+     `/api/status` immediately before the reset. While the recorder records a conversation (a
+     non-empty `active_session_id`), holds a call whose `state` is not `none`, or runs and gives no
+     status that it can read, it resets nothing, and `provision.sh` stops and says that nothing in
+     Serve was changed: run it again after the meeting. Otherwise it clears Serve with
+     `tailscale serve reset`, Tailscale's documented way to clear Serve
      ([tailscale serve](https://tailscale.com/kb/1242/tailscale-serve), "Reset Tailscale Serve"),
-     and then it applies each line of `serve.conf` with `tailscale serve --bg --https`. The reset
-     also clears the entry of a name the device had before a rename, which tailscaled keeps beside
-     the entry of its name now and which no `tailscale serve --https=<port> off` reaches, and a
-     port, a mount, a TCP forward or Funnel that `serve.conf` does not hold. From the reset until
-     the last line is applied, the page is not served, a moment that a page open in a browser shows
-     as a lost connection. Then it reads Serve again, and stops before the join when Serve is not
-     `serve.conf`'s;
+     and then it applies each line of `serve.conf` with `tailscale serve --bg --https`. When a call
+     fails, it applies `serve.conf` again, up to 4 tries 2 s apart. The reset also clears the entry
+     of a name the device had before a rename, which tailscaled keeps beside the entry of its name
+     now and which no `tailscale serve --https=<port> off` reaches, and a port, a mount, a TCP
+     forward or Funnel that `serve.conf` does not hold. From the reset until the last line is
+     applied, the page and `/call` are not served. A kill of `provision.sh` or a lost SSH session
+     does not stop the unit, so the apply still ends. When every try failed, or the Pi lost power
+     during the apply, Serve stays empty, and only another run of `./provision.sh` puts it back:
+     the nightly update never changes Serve, and check 7 of `check-deploy.sh` fails with
+     `have none` and names that command. Then `provision.sh` reads Serve again, and stops before
+     the join when Serve is not `serve.conf`'s;
    - starts the tagged tailnet join as a detached unit, with `PI_TAILNET_CLIENT_ID` and
      `PI_SERVICE_ACCOUNT_UNIQUE_ID`, or stops after "already joined" on a Pi that is joined as
      `tag:ghost-wispr` already.
 
    It ends with `already joined as tag:ghost-wispr`, or with the line that names the detached join
    unit it started. The SSH session can end while Tailscale re-authenticates (exit 255). The join
-   unit's command line holds `tailscale serve reset` and each `tailscale serve` call of
-   `serve.conf`, so the join reads no file of the release directory. The join runs `tailscale up`
+   unit's command line runs `serve-apply` with each line of `serve.conf` as its arguments, so the
+   join reads no file of the release directory. The join runs the same apply after the
+   re-authentication, with the same status read: while the recorder is busy, it resets nothing in
+   Serve, and the join unit ends failed with exit 75. The join runs `tailscale up`
    with `--accept-routes=false`, so the Pi joins with the tailnet's subnet routes off. Then it runs
    the route check of "Accept the tailnet's subnet routes", and accepts the routes
    (`tailscale set --accept-routes`) only when no peer's `PrimaryRoutes` overlaps a network of the

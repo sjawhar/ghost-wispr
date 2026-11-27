@@ -24,6 +24,16 @@ PI_LIB_CONFIG_FILE_VARIABLE='GHOST_WISPR_CONFIG'
 # The variables that would override the config's Envoy settings, envoy_enabled, envoy_hub_url and
 # concierge.envoy_url: each variable internal/config's applyEnvOverrides reads for an Envoy setting.
 PI_LIB_ENVOY_OVERRIDE_VARIABLES='GHOST_WISPR_ENVOY_ENABLED|GHOST_WISPR_ENVOY_HUB_URL|GHOST_WISPR_CONCIERGE_ENVOY_URL'
+# The jq filter that is true for an answer of the recorder's /api/status: an object with
+# active_session_id, paused and capture_state.
+# shellcheck disable=SC2034 # update.sh and provision.sh, which source this file, read it.
+PI_LIB_RECORDER_STATUS_FILTER='type == "object" and (.active_session_id | type == "string") and (.paused | type == "boolean") and (.capture_state | type == "string")'
+# The jq filter that prints, from such a status, why the recorder is busy: it records a session, or
+# it holds a call whose state is not none (a Meet call that INFRA-5904's call bridge links to the
+# Pi). It prints nothing when the recorder is free. A busy recorder may not restart (update.sh), and
+# Serve, which carries the page and /call, may not be reset under it (provision.sh's Serve apply).
+# shellcheck disable=SC2034 # update.sh and provision.sh, which source this file, read it.
+PI_LIB_BUSY_REASON_FILTER='if .active_session_id != "" then "active session" elif .call == null then empty elif (.call | type) != "object" then "call unknown" elif .call.state != "none" then "call \(.call.state // "unknown")" else empty end'
 
 valid_drive_id() {
   [[ $1 =~ ^[A-Za-z0-9_-]+$ ]]

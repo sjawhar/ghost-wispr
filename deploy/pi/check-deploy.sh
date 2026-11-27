@@ -769,8 +769,11 @@ check_bootstrap() {
       unread+=("cannot read the Pi's tailnet name, which its Serve entries are read for: $SELF_READ gave no DNSName")
     elif ! have=$(serve_lines_from_status "$serve" "$device"); then
       unread+=("cannot read Serve's setting from $SERVE_READ on the Pi: it answered no Serve config")
+    elif [[ -z $have ]]; then
+      # The nightly update never changes Serve (spec R16), so nothing but a person's run puts it back.
+      differences+=("Serve differs from the release's serve.conf: want $(paste -sd ',' - <<<"$want"), have none: Serve is empty, so the Pi serves no page; run the release's ./provision.sh on the Pi (docs/pi-setup.md, \"Apply a provisioning change\")")
     elif [[ $have != "$want" ]]; then
-      differences+=("Serve differs from the release's serve.conf: want $(paste -sd ',' - <<<"$want"), have $(paste -sd ',' - <<<"${have:-none}")")
+      differences+=("Serve differs from the release's serve.conf: want $(paste -sd ',' - <<<"$want"), have $(paste -sd ',' - <<<"$have")")
     fi
   fi
 

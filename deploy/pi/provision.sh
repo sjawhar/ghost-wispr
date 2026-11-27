@@ -20,17 +20,25 @@
 # routes prints route_overlap_check_script from it.
 set -euo pipefail
 
-# GHOST_WISPR_DEPLOY_DIR, GHOST_WISPR_UNIT_DIR, GHOST_WISPR_SYSTEM_ROOT, GHOST_WISPR_IDENTITY_KEY and
-# GHOST_WISPR_JOIN_DIR exist for provision_run_test.sh, as update.sh's do for update_test.sh.
+# GHOST_WISPR_DEPLOY_DIR, GHOST_WISPR_UNIT_DIR, GHOST_WISPR_SYSTEM_ROOT, GHOST_WISPR_IDENTITY_KEY,
+# GHOST_WISPR_JOIN_DIR and GHOST_WISPR_STATUS_URL exist for provision_run_test.sh, as update.sh's do
+# for update_test.sh.
 readonly DEPLOY_DIR="${GHOST_WISPR_DEPLOY_DIR:-/opt/ghost-wispr}"
 readonly UNIT_DIR="${GHOST_WISPR_UNIT_DIR:-/home/ghost-wispr/.config/systemd/user}"
 # The root under which the nightly update installs the udev rule and the logind setting.
 readonly SYSTEM_ROOT="${GHOST_WISPR_SYSTEM_ROOT:-/}"
 readonly IDENTITY_KEY="${GHOST_WISPR_IDENTITY_KEY:-/home/ghost-wispr/.config/ghost-wispr-identity/key.pem}"
+# The recorder's status, which the Serve apply reads immediately before its reset.
+readonly STATUS_URL="${GHOST_WISPR_STATUS_URL:-http://127.0.0.1:8080/api/status}"
+# Root's directory for what the join and the Serve apply run: the join's token and route check, and
+# serve-apply (serve_apply_script).
 readonly JOIN_DIR="${GHOST_WISPR_JOIN_DIR:-/var/lib/ghost-wispr-join}"
 readonly JOIN_ROUTE_CHECK="$JOIN_DIR/route-overlap-check"
 readonly JOIN_TOKEN="$JOIN_DIR/token"
+readonly SERVE_APPLY="$JOIN_DIR/serve-apply"
 readonly SERVICE_USER=ghost-wispr
+# What serve-apply's refusal of a busy recorder exits with.
+readonly SERVE_APPLY_BUSY=75
 # The paths that the credential files name: where the recorder and pi-secrets find the certificate,
 # its config and the key on the Pi, as gcloud's create-cred-config wrote them for the office Pi.
 readonly CREDENTIAL_CERTIFICATE=/opt/ghost-wispr/device.crt
@@ -208,16 +216,21 @@ read_pi_env() {
 }
 
 # read_serve_conf reads the release's serve.conf into serve_lines, "<port> <proxy target>" sorted
-# (pi-lib.sh's serve_conf_lines). It fails on a line of another form, on a port twice, and on a
-# port or a target that it would not write into the join's command as it is.
+# (pi-lib.sh's serve_conf_lines), and into serve_words, each port and target one word, the arguments
+# of serve-apply. It fails on a line of another form, on a port twice, and on a port or a target
+# that it would not write into the join's command as it is.
 read_serve_conf() {
   local conf=$script_dir/serve.conf bad port target
   bad=$(awk 'NF && $1 !~ /^#/ && NF != 2' "$conf") || fail "cannot read $conf"
   [[ -z $bad ]] || fail "serve.conf has a line that is not '<port> <proxy target>': $bad; nothing was installed"
   serve_lines=$(serve_conf_lines "$conf") || fail "cannot read $conf"
+  serve_words=()
   while read -r port target; do
     if [[ -n $port ]] && ! [[ $port =~ ^[1-9][0-9]{0,4}$ && $target =~ ^https?://[A-Za-z0-9.:/_-]+$ ]]; then
       fail "serve.conf has the line '$port $target', not an HTTPS port and a proxy target; nothing was installed"
+    fi
+    if [[ -n $port ]]; then
+      serve_words+=("$port" "$target")
     fi
   done <<<"$serve_lines"
   bad=$(cut -d' ' -f1 <<<"$serve_lines" | uniq -d)
@@ -299,20 +312,88 @@ compare_client_id() {
   fi
 }
 
+# serve_apply_script prints serve-apply, the program that makes Tailscale Serve serve.conf's setting.
+# Root runs it in a systemd unit of its own: apply_serve starts it with systemd-run --wait, and the
+# join's unit runs it after the re-authentication. `sh serve-apply STATUS_URL PORT TARGET...`, with
+# one PORT TARGET pair a line of serve.conf:
+# - reads the recorder's status at STATUS_URL immediately before the reset, with update.sh's rules
+#   (pi-lib.sh's PI_LIB_RECORDER_STATUS_FILTER and PI_LIB_BUSY_REASON_FILTER), and exits
+#   SERVE_APPLY_BUSY, changing nothing, while the recorder records a session or holds a call whose
+#   state is not none, or while ghost-wispr.service is active and gives no status it can read: a
+#   reset would cut the page and /call under a meeting (GPT-6.1 Sol's review of PR #203);
+# - then clears Serve with `tailscale serve reset`, Tailscale's documented way to clear the Serve
+#   setting (https://tailscale.com/kb/1242/tailscale-serve, "Reset Tailscale Serve"), and applies
+#   each pair with `tailscale serve --bg --https`. When a call fails, it applies every pair again, up
+#   to 4 tries 2 s apart, and exits 1 when a call still fails. It exits 1 when the reset failed too.
+# As a unit of its own, it goes on when provision.sh is killed or its SSH session ends between the
+# reset and the last pair, so neither leaves Serve empty.
+serve_apply_script() {
+  cat <<'APPLY'
+# Ghost Wispr's Serve apply, printed by serve_apply_script in deploy/pi/provision.sh.
+status_url=$1
+shift
+APPLY
+  printf "status_filter='%s'\nbusy_filter='%s'\nbusy_exit=%s\n" \
+    "$PI_LIB_RECORDER_STATUS_FILTER" "$PI_LIB_BUSY_REASON_FILTER" "$SERVE_APPLY_BUSY"
+  cat <<'APPLY'
+why=
+status=$(curl --connect-timeout 5 --max-time 10 --fail --silent "$status_url" 2>/dev/null) || status=
+if [ -n "$status" ] && printf '%s' "$status" | jq -e "$status_filter" >/dev/null 2>&1; then
+  why=$(printf '%s' "$status" | jq -r "$busy_filter" 2>/dev/null) || why='status unreadable'
+elif systemctl --user --machine=ghost-wispr@ is-active --quiet ghost-wispr.service; then
+  why='ghost-wispr.service is active but /api/status gave no status'
+fi
+if [ -n "$why" ]; then
+  printf 'ghost-wispr serve: %s; Serve was not reset\n' "$why"
+  exit "$busy_exit"
+fi
+apply() {
+  port=
+  for word do
+    if [ -z "$port" ]; then
+      port=$word
+    else
+      tailscale serve --bg --https "$port" "$word" || return 1
+      port=
+    fi
+  done
+}
+rc=0
+printf 'ghost-wispr serve: resetting Serve (tailscale serve reset) and applying serve.conf\n'
+tailscale serve reset || rc=1
+tries=1
+until apply "$@"; do
+  if [ "$tries" -ge 4 ]; then
+    printf 'ghost-wispr serve: serve.conf could not be applied after the reset in %s tries: the page is not served\n' "$tries"
+    exit 1
+  fi
+  tries=$((tries + 1))
+  printf 'ghost-wispr serve: a tailscale serve call failed after the reset; applying serve.conf again (try %s of 4)\n' "$tries"
+  sleep 2
+done
+exit "$rc"
+APPLY
+}
+
+# install_serve_apply installs serve-apply, root's alone, for apply_serve and the join.
+install_serve_apply() {
+  sudo install -d -o root -g root -m 0700 "$JOIN_DIR"
+  serve_apply_script | sudo install -o root -g root -m 0700 /dev/stdin "$SERVE_APPLY"
+}
+
 # apply_serve makes Tailscale Serve exactly serve.conf's setting for this device's tailnet name, as
 # `tailscale status --self --json` gives it: the release owns Serve whole. A Serve that is that
-# already stays as it is. Any other it clears with `tailscale serve reset`, Tailscale's documented
-# way to clear the Serve setting (https://tailscale.com/kb/1242/tailscale-serve, "Reset Tailscale
-# Serve"), and then it applies each line. The reset also clears the Web entry of a name the device
-# had before a rename, which tailscaled keeps beside the entry of its name now and which no
+# already stays as it is. Any other it gives to serve-apply (serve_apply_script), in a unit of its
+# own, and waits for it: the reset also clears the Web entry of a name the device had before a
+# rename, which tailscaled keeps beside the entry of its name now and which no
 # `tailscale serve --https=PORT off` reaches, as those act on the device's name now; and a port, a
-# mount, a TCP forward or Funnel that serve.conf does not hold. From the reset until the last line
-# is applied, the page is not served: a page open in a browser loses its connection and makes it
-# again. Last it reads Serve again, as the nightly drift check reads it (pi-lib.sh's
-# serve_lines_from_status), and fails unless it is serve.conf's. It changes nothing in Serve when it
-# cannot read the device's name or Serve.
+# mount, a TCP forward or Funnel that serve.conf does not hold. It fails, and nothing in Serve was
+# changed, when the recorder is busy. From the reset until the last line is applied, the page is not
+# served. Last it prints the unit's lines, reads Serve again, as the nightly drift check reads it
+# (pi-lib.sh's serve_lines_from_status), and fails unless it is serve.conf's. It changes nothing in
+# Serve when it cannot read the device's name or Serve.
 apply_serve() {
-  local self name live have state port target
+  local self name live have state unit status=0
   if ! self=$(tailscale status --self --json) || ! name=$(device_tailnet_name "$self"); then
     fail "could not read this device's tailnet name (tailscale status --self --json), for which Serve must be serve.conf's: nothing in Serve was changed"
   fi
@@ -327,16 +408,20 @@ apply_serve() {
   else
     state="a setting it cannot read, such as a TCP forward or Funnel"
   fi
-  printf "ghost-wispr provision: Tailscale Serve for %s is [%s], not serve.conf's: resetting it (tailscale serve reset) and applying serve.conf; the page is not served until the last line is applied\n" \
-    "$name" "$(paste -sd ';' <<<"$state")"
-  sudo tailscale serve reset </dev/null \
-    || fail "tailscale serve reset failed, so Serve may be cleared in part: run provision.sh again"
-  while read -r port target; do
-    if [[ -n $port ]]; then
-      sudo tailscale serve --bg --https "$port" "$target" </dev/null \
-        || fail "tailscale serve --bg --https $port $target failed after the reset of Serve, so the page may not be served: run provision.sh again"
-    fi
-  done <<<"$serve_lines"
+  unit="ghost-wispr-serve-$(date +%s)"
+  printf "ghost-wispr provision: Tailscale Serve for %s is [%s], not serve.conf's: resetting it and applying serve.conf in %s, a unit of its own, which finishes the apply even if this run or its SSH session ends\n" \
+    "$name" "$(paste -sd ';' <<<"$state")" "$unit"
+  install_serve_apply
+  sudo systemd-run --wait --quiet --collect --expand-environment=no --unit="$unit" \
+    /bin/sh "$SERVE_APPLY" "$STATUS_URL" "${serve_words[@]}" </dev/null || status=$?
+  printf 'ghost-wispr provision: the journal of %s:\n' "$unit"
+  sudo journalctl -u "$unit" --no-pager --output=cat || printf 'ghost-wispr provision: could not read the journal of %s\n' "$unit"
+  sudo rm -f -- "$SERVE_APPLY"
+  if ((status == SERVE_APPLY_BUSY)); then
+    fail "the recorder records a conversation, holds a call or gives no status (its line is above), so Serve was not reset and nothing in Serve was changed: run provision.sh again when no conversation is recorded and no call is live"
+  fi
+  ((status == 0)) \
+    || fail "the reset and apply of Serve in $unit failed (exit $status, its lines are above), so the page may not be served: run provision.sh again"
   live=$(sudo tailscale serve status --json) \
     || fail "could not read Tailscale Serve's setting (tailscale serve status --json) after provision.sh applied serve.conf"
   have=$(serve_lines_from_status "$live" "$name") \
@@ -703,32 +788,27 @@ fi
 sudo install -d -o root -g root -m 0700 "$JOIN_DIR"
 printf '%s' "$id_token" | sudo install -m 0600 /dev/stdin "$JOIN_TOKEN"
 route_overlap_check_script | sudo install -o root -g root -m 0700 /dev/stdin "$JOIN_ROUTE_CHECK"
+install_serve_apply
 join_unit="ghost-wispr-tailnet-join-$(date +%s)"
 # The join brings the node up with the tailnet's subnet routes off, `--accept-routes=false`:
 # `tailscale up` refuses to leave out a setting that is not the default (tailscale v1.104.1,
 # cmd/tailscale/cli/up.go, checkForAccidentalSettingReverts), and a re-join must not accept a route
 # that now overlaps a network of the Pi. So only the route check turns the routes on, through
 # `tailscale set --accept-routes` once it passed. The check runs even when Serve failed, as the
-# routes do not depend on Serve, and the unit ends failed when up, serve or set failed or the check
-# refused. Serve is set above for a node that is joined already, and again after the
+# routes do not depend on Serve, and the unit ends failed when up, the Serve apply or set failed or
+# the check refused. Serve is set above for a node that is joined already, and again after the
 # re-authentication: the join can start a new login profile, which would not carry the setting over,
-# and a profile it keeps would keep the entries of the name the node had before. So the join resets
-# Serve first, as apply_serve does, and then applies each line of serve.conf as a tailscale serve
-# call: the join runs after P2's command has removed the release's directory, so it reads no file of
-# it.
-join_serve=" tailscale serve reset || rc=\$?;"
-while read -r port target; do
-  if [[ -n $port ]]; then
-    join_serve+=" tailscale serve --bg --https $port $target || rc=\$?;"
-  fi
-done <<<"$serve_lines"
+# and a profile it keeps would keep the entries of the name the node had before. So the join runs
+# serve-apply, as apply_serve does, which reads the recorder's status immediately before its reset,
+# with each line of serve.conf as its arguments: the join runs after P2's command has removed the
+# release's directory, so it reads no file of it.
 join_command="tailscale up --force-reauth --client-id='$PI_TAILNET_CLIENT_ID?ephemeral=false&preauthorized=true'"
 join_command+=" --id-token=file:$JOIN_TOKEN --advertise-tags=tag:ghost-wispr --hostname=ghost-wispr --ssh --accept-routes=false;"
 join_command+=" rc=\$?; rm -f $JOIN_TOKEN;"
 join_command+=" if [ \$rc -eq 0 ]; then"
-join_command+="$join_serve"
+join_command+=" /bin/sh $SERVE_APPLY $STATUS_URL ${serve_words[*]} || rc=\$?;"
 join_command+=" if /bin/sh $JOIN_ROUTE_CHECK; then tailscale set --accept-routes || rc=\$?; else rc=\$?; fi;"
-join_command+=" fi; rm -f $JOIN_ROUTE_CHECK; exit \$rc"
+join_command+=" fi; rm -f $JOIN_ROUTE_CHECK $SERVE_APPLY; exit \$rc"
 printf 'ghost-wispr provision: starting the tagged tailnet join as %s\n' "$join_unit"
 # systemd-run(1): the service manager expands ${NAME} and $$ in the command's arguments unless
 # --expand-environment=no, which systemd 254 added (Raspberry Pi OS Trixie has 257). The join

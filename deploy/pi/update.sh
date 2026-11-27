@@ -132,25 +132,20 @@ recorder_active() {
 }
 
 # recorder_status prints the recorder's /api/status, or nothing when it does not answer, or answers
-# something that is not its status (an object with active_session_id, paused and capture_state).
+# something that is not its status (pi-lib.sh's PI_LIB_RECORDER_STATUS_FILTER).
 recorder_status() {
   local answer
   answer=$(curl --connect-timeout 5 --max-time 10 --fail --silent --show-error "$STATUS_URL" 2>/dev/null) || return 0
-  jq -e 'type == "object" and (.active_session_id | type == "string") and (.paused | type == "boolean") and (.capture_state | type == "string")' \
-    >/dev/null 2>&1 <<<"$answer" || return 0
+  jq -e "$PI_LIB_RECORDER_STATUS_FILTER" >/dev/null 2>&1 <<<"$answer" || return 0
   printf '%s' "$answer"
 }
 
-# busy_reason STATUS prints why the recorder may not restart, from its /api/status (STATUS): it
-# records a session, or it holds a call (call.state is not none). It prints nothing when it may
-# restart, or when it gave no status.
+# busy_reason STATUS prints why the recorder may not restart, from its /api/status (STATUS), with
+# pi-lib.sh's PI_LIB_BUSY_REASON_FILTER: it records a session, or it holds a call (call.state is not
+# none). It prints nothing when it may restart, or when it gave no status.
 busy_reason() {
   [[ -n $1 ]] || return 0
-  jq -r 'if .active_session_id != "" then "active session"
-    elif .call == null then empty
-    elif (.call | type) != "object" then "call unknown"
-    elif .call.state != "none" then "call \(.call.state // "unknown")"
-    else empty end' <<<"$1" 2>/dev/null || printf 'status unreadable'
+  jq -r "$PI_LIB_BUSY_REASON_FILTER" <<<"$1" 2>/dev/null || printf 'status unreadable'
 }
 
 # leave_if_busy reads the recorder's status into status_json. While the recorder records a session or
