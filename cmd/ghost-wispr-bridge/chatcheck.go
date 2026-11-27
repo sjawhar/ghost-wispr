@@ -54,20 +54,17 @@ func (lb *liveBot) noteLine(m chatMessage, at time.Time) {
 // judgeCheck decides a pending check, and reports whether it did. The echo is
 // a line of the notice's exact text from a sender never in the roster, timed
 // from the first consent post (or, for a bot a restarted bridge found, its
-// admission) to 30 s after the admission. It reads the lines once the Pi's
-// texts give the notice: without the texts no bot was made, or a restarted
-// bridge waits for them. A roster or chat lines a restarted bridge has not
-// read yet stop a pass but not the deadline (checkDeadline): a check that
-// has not passed by then fails (R2).
+// admission) to 30 s after the admission. A pass needs the notice, which the
+// Pi's texts give: a restarted bridge has none until the Pi's hello. The
+// texts, the roster and the chat lines a restarted bridge has not read yet
+// stop a pass but not the deadline (checkDeadline): a check that has not
+// passed by then fails (R2). A pass the event's record holds for this bot
+// has no deadline (restoreBot).
 func (b *bridge) judgeCheck(lb *liveBot, now time.Time) bool {
 	if lb.check.state != checkPending || lb.admitted.IsZero() {
 		return false
 	}
-	texts := b.texts()
-	if texts == nil {
-		return false
-	}
-	if window := lb.admitted.Add(chatCheckWindow); !lb.needRoster && !lb.needChat {
+	if texts, window := b.texts(), lb.admitted.Add(chatCheckWindow); texts != nil && !lb.needRoster && !lb.needChat {
 		for _, l := range lb.check.lines {
 			if l.text == texts.Consent && l.sender != "" && !lb.seen[l.sender] &&
 				!lb.echoFrom.IsZero() && !l.at.Before(lb.echoFrom) && !l.at.After(window) {

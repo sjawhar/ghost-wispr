@@ -103,6 +103,44 @@ func TestAChatCheckFailsAtItsDeadlineWhileARestartsReadsFail(t *testing.T) {
 	}
 }
 
+// R2: a pass needs the Pi's texts, which give the notice; the deadline does
+// not. A restarted bridge has a new link, with no hello until the Pi
+// connects. With no texts and every roster and chat read failing, a check
+// that has not passed still fails at its deadline, so the bot leaves by 40 s
+// after its admission; the control is the Pi connecting at the restart. A
+// pass recorded for this bot still applies no deadline. (Sol's second review
+// of #202 at 2e217ba6, TestReviewFreshRestartWithoutPiTextsStillFailsUnpassedCheck.)
+func TestAChatCheckFailsAtItsDeadlineBeforeThePisTexts(t *testing.T) {
+	for _, tc := range []struct {
+		name            string
+		passed, connect bool
+		leaves          int
+	}{
+		{"no texts since the restart", false, false, 1},
+		{"the Pi connects at the restart (control)", false, true, 1},
+		{"no texts since the restart, the pass recorded for this bot", true, false, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h, id := joinOneBot(t)
+			if tc.passed {
+				h.inCall()
+			} else {
+				h.admit(id)
+			}
+			h.api.fail(func(a *fakeAttendee) { a.participantFails, a.chatReadFails = 1000, 1000 })
+			h.link = newFakeLink() // a new bridge process's link: no hello yet
+			restartBridge(h)
+			if tc.connect {
+				h.linkUp(botPiHello(botTexts()))
+			}
+			h.advance(41 * time.Second)
+			if leaves := h.api.callsOf("Leave"); len(leaves) != tc.leaves {
+				t.Fatalf("Leave calls 41 s after the admission = %v, want %d", leaves, tc.leaves)
+			}
+		})
+	}
+}
+
 // R2: the bridge records its bot's passed chat check, with the echo's
 // sender, on the event's record when the check passes. A restarted bridge
 // that reads its own bot's pass there applies no chat-check deadline: with
