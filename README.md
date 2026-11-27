@@ -743,9 +743,14 @@ What the voice hears, and where the room's words go:
   (`answered`, `asked_back`, `picked`, `side_talk`, `outage`, `asked_agent`, `stopped`,
   `never_mind` or `failed`), when its words were said, and the time to its first audio and to its
   end. A reply to Wispr's own question that asks nothing is kept as `side_talk`; other side talk,
-  and a wake with no question, are not kept. A segment delete erases each question whose words
-  were said within a second of the segment's span. `ghost-wispr voice questions [--since DATE]
-  [--json]` prints the log, read without writing to the database.
+  and a wake with no question, are not kept. Words the room takes back are never kept: a turn
+  keeps only what follows its last take-back, with no vendor wording, and a question "Wispr,
+  never mind" cancels is kept as `never_mind` with its times and no words.
+  A segment delete erases each question whose words were said within a second of the segment's
+  span, placed by when the words were said, also after an earlier "Delete text and audio"
+  shortened the recording, and a question the unit writes after that delete is not kept.
+  `ghost-wispr voice questions [--since DATE] [--json]` prints the log, read without writing to
+  the database.
 - The `voice_tasks` ledger of questions sent to agents holds none of the room's words: it holds
   the issue, the holder, the state and the agent's written answer, which the session's page shows
   under "Questions to agents". Deleting a session erases its questions and the answers the agents

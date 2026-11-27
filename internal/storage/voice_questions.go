@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"slices"
 	"time"
 
@@ -84,9 +85,14 @@ const voiceQuestionColumns = `id, session_id, asked_at, heard_from, heard_to, he
 // question log: a build before it made the database.
 var ErrNoQuestionLog = errors.New("the database has no question log (voice_questions): the build that made it keeps no questions")
 
+// ErrVoiceQuestionErased is RecordVoiceQuestion's error for a question whose
+// words were heard in a segment a person deleted before the write came.
+var ErrVoiceQuestionErased = errors.New("its words were heard in a segment deleted since")
+
 // RecordVoiceQuestion records one question. Its session must exist, and its
 // outcome be one of VoiceQuestionOutcomes. Times keep the nanosecond and
-// durations the millisecond.
+// durations the millisecond. A question heard in a span a segment deletion
+// erased (eraseQuestionsHeardIn) is not stored: ErrVoiceQuestionErased.
 func (s *SQLiteStore) RecordVoiceQuestion(q *VoiceQuestion) error {
 	if !slices.Contains(VoiceQuestionOutcomes, q.Outcome) {
 		return fmt.Errorf("record a question of session %s: outcome %q is none the log keeps", q.SessionID, q.Outcome)
@@ -95,11 +101,21 @@ func (s *SQLiteStore) RecordVoiceQuestion(q *VoiceQuestion) error {
 	if q.FirstAudio != nil {
 		firstAudio = q.FirstAudio.Milliseconds()
 	}
-	if _, err := s.db.Exec(`INSERT INTO voice_questions(session_id, asked_at, heard_from, heard_to, heard, vendor_wording, engine, issue_key, outcome, answer, first_audio_ms, took_ms)
-		VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		q.SessionID, questionTime(q.AskedAt), questionTime(q.HeardFrom), questionTime(q.HeardTo),
-		q.Heard, q.VendorWording, q.Engine, q.IssueKey, q.Outcome, q.Answer, firstAudio, q.Took.Milliseconds()); err != nil {
+	from, to := questionTime(q.HeardFrom), questionTime(q.HeardTo)
+	// One statement: a deletion commits wholly before it or after it.
+	result, err := s.db.Exec(`INSERT INTO voice_questions(session_id, asked_at, heard_from, heard_to, heard, vendor_wording, engine, issue_key, outcome, answer, first_audio_ms, took_ms)
+		SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+		WHERE NOT EXISTS (SELECT 1 FROM voice_question_erasures WHERE session_id = ? AND heard_from <= ? AND heard_to >= ?)`,
+		q.SessionID, questionTime(q.AskedAt), from, to,
+		q.Heard, q.VendorWording, q.Engine, q.IssueKey, q.Outcome, q.Answer, firstAudio, q.Took.Milliseconds(),
+		q.SessionID, to, from)
+	if err != nil {
 		return fmt.Errorf("record a question of session %s: %w", q.SessionID, err)
+	}
+	if n, err := result.RowsAffected(); err != nil {
+		return fmt.Errorf("record a question of session %s: %w", q.SessionID, err)
+	} else if n == 0 {
+		return fmt.Errorf("record a question of session %s: %w", q.SessionID, ErrVoiceQuestionErased)
 	}
 	return nil
 }
@@ -165,18 +181,29 @@ func ReadVoiceQuestions(db *sql.DB, since time.Time) ([]VoiceQuestion, error) {
 // segment's edge goes with it.
 const questionHeardSlack = time.Second
 
-// untimedSegmentLag is how long after its last word an untimed segment, of a
-// merged source with no recording, can have been stored: its timestamp is
-// when its live result was stored, after Deepgram's endpoint or utterance end
-// (400 ms and 1000 ms on the unit) and the result's own way back.
+// untimedSegmentLag is how long before an untimed segment's flush the words
+// of the flush can have begun after the flush before it ended: a flush
+// stores the words Deepgram finalized since the last, after the endpoint or
+// utterance end (400 ms and 1000 ms on the unit) and the result's own way
+// back.
 const untimedSegmentLag = 3 * time.Second
 
 // eraseQuestionsHeardIn deletes, in tx, the question log's rows of sessions
 // whose heard span overlaps from to to, widened by questionHeardSlack: the
-// questions whose words a segment deletion took off the unit.
+// questions whose words a segment deletion took off the unit. It records the
+// span, with no words, for each session (voice_question_erasures), so a
+// question whose write lands after the deletion is refused
+// (RecordVoiceQuestion): the log writes apart from the answer, and can come
+// late.
 func eraseQuestionsHeardIn(tx *sql.Tx, sessions []string, from, to time.Time) error {
+	from, to = from.Add(-questionHeardSlack), to.Add(questionHeardSlack)
+	for _, session := range sessions {
+		if _, err := tx.Exec(`INSERT INTO voice_question_erasures(session_id, heard_from, heard_to) VALUES(?, ?, ?)`, session, questionTime(from), questionTime(to)); err != nil {
+			return fmt.Errorf("record the erased span of the deleted segment's questions: %w", err)
+		}
+	}
 	placeholders, args := placeholderList(sessions)
-	args = append(args, questionTime(to.Add(questionHeardSlack)), questionTime(from.Add(-questionHeardSlack)))
+	args = append(args, questionTime(to), questionTime(from))
 	if _, err := tx.Exec(`DELETE FROM voice_questions WHERE session_id IN (`+placeholders+`) AND heard_from <= ? AND heard_to >= ?`, args...); err != nil {
 		return fmt.Errorf("erase the questions heard in the deleted segment: %w", err)
 	}
@@ -185,16 +212,124 @@ func eraseQuestionsHeardIn(tx *sql.Tx, sessions []string, from, to time.Time) er
 
 // eraseQuestionsHeardInRecording erases, in tx, the questions of sessions
 // heard from start to end seconds into recording, a recording of session
-// sessionID (eraseQuestionsHeardIn).
-func eraseQuestionsHeardInRecording(tx *sql.Tx, sessionID, recording string, start, end float64, sessions []string) error {
+// sessionID whose bytes hash to sha (eraseQuestionsHeardIn). The times are on
+// the recording as it is now: each "Delete text and audio" cut before it
+// moved the words after its span earlier (unsplice), and the questions were
+// timed as their words were said.
+func eraseQuestionsHeardInRecording(tx *sql.Tx, sessionID, recording, sha string, start, end float64, sessions []string) error {
 	began, err := recordingStart(tx, sessionID, recording)
 	if err != nil {
 		return err
 	}
-	return eraseQuestionsHeardIn(tx, sessions, began.Add(seconds(start)), began.Add(seconds(end)))
+	original, err := unsplice(tx, recording, sha)
+	if err != nil {
+		return err
+	}
+	return eraseQuestionsHeardIn(tx, sessions, began.Add(seconds(original(start))), began.Add(seconds(original(end))))
 }
 
 func seconds(s float64) time.Duration { return time.Duration(s * float64(time.Second)) }
+
+// untimedFlushGap is how far apart two untimed segments' stored times must
+// be for the earlier to be a flush of its own: the segments of one flush are
+// stored within milliseconds of each other.
+const untimedFlushGap = time.Second
+
+// untimedHeardFrom is the earliest the words of an untimed segment of
+// session sessionID, stored at storedAt, can have been said: the latest
+// flush of the same source before the segment's (its untimed segments
+// stored at least untimedFlushGap earlier), or, with none, the start of the
+// source session, then untimedSegmentLag before. sourceID names the source
+// (segments.untimed_source_id); "" is sessionID itself.
+func untimedHeardFrom(tx *sql.Tx, sessionID, sourceID string, storedAt time.Time) (time.Time, error) {
+	rows, err := tx.Query(`SELECT timestamp FROM segments WHERE session_id = ? AND untimed = 1 AND untimed_source_id = ?`, sessionID, sourceID)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("read the untimed segments of session %s: %w", sessionID, err)
+	}
+	var earlier time.Time
+	for rows.Next() {
+		var stored string
+		if err := rows.Scan(&stored); err != nil {
+			_ = rows.Close()
+			return time.Time{}, fmt.Errorf("read the untimed segments of session %s: %w", sessionID, err)
+		}
+		at, err := time.Parse(time.RFC3339Nano, stored)
+		if err != nil {
+			_ = rows.Close()
+			return time.Time{}, fmt.Errorf("read an untimed segment's time in session %s: %w", sessionID, err)
+		}
+		if at.Before(storedAt.Add(-untimedFlushGap)) && at.After(earlier) {
+			earlier = at
+		}
+	}
+	if err := errors.Join(rows.Err(), rows.Close()); err != nil {
+		return time.Time{}, fmt.Errorf("read the untimed segments of session %s: %w", sessionID, err)
+	}
+	if earlier.IsZero() {
+		source := sourceID
+		if source == "" {
+			source = sessionID
+		}
+		session, err := getSession(tx, source)
+		if err != nil {
+			return time.Time{}, fmt.Errorf("read the session an untimed segment came from: %w", err)
+		}
+		earlier = session.StartedAt
+	}
+	return earlier.Add(-untimedSegmentLag), nil
+}
+
+// unsplice maps a time on recording as its bytes are now (hash sha) to the
+// time on the recording as it was captured: back through each completed cut
+// that made those bytes, newest first, found by the hash each cut made, a
+// time at or after a cut's start moves later by the cut's length.
+func unsplice(tx *sql.Tx, recording, sha string) (func(float64) float64, error) {
+	type cut struct{ start, end float64 }
+	rows, err := tx.Query(`SELECT audio_path, start, end, sha256_before, sha256_after FROM deleted_segments WHERE splice_complete = 1`)
+	if err != nil {
+		return nil, fmt.Errorf("read the cuts of recording %s: %w", recording, err)
+	}
+	byAfter := map[string]struct {
+		cut
+		before string
+	}{}
+	name := filepath.Base(recording)
+	for rows.Next() {
+		var path, before, after string
+		var c cut
+		if err := rows.Scan(&path, &c.start, &c.end, &before, &after); err != nil {
+			_ = rows.Close()
+			return nil, fmt.Errorf("read the cuts of recording %s: %w", recording, err)
+		}
+		if filepath.Base(path) == name {
+			byAfter[after] = struct {
+				cut
+				before string
+			}{c, before}
+		}
+	}
+	if err := errors.Join(rows.Err(), rows.Close()); err != nil {
+		return nil, fmt.Errorf("read the cuts of recording %s: %w", recording, err)
+	}
+	var cuts []cut // newest first
+	for seen := map[string]bool{}; !seen[sha]; {
+		seen[sha] = true
+		made, ok := byAfter[sha]
+		if !ok {
+			break
+		}
+		cuts = append(cuts, made.cut)
+		sha = made.before
+	}
+	return func(t float64) float64 {
+		for _, c := range cuts {
+			if t >= c.start {
+				t += c.end - c.start
+			}
+		}
+		return t
+	}, nil
+}
 
 // recordingStart is when recording, a recording of session sessionID, began
 // on the wall clock: the started_at of the session that recorded it, found

@@ -38,19 +38,22 @@ func (s *SQLiteStore) deleteUntimedSegmentText(sessionID string, segmentID int64
 		return ErrSegmentSessionActive
 	}
 	var untimedSourceID, stored string
-	var start, end float64
-	if err := tx.QueryRow(`SELECT untimed_source_id, timestamp, start_time, end_time FROM segments WHERE id = ? AND session_id = ? AND untimed = 1`, segmentID, sessionID).Scan(&untimedSourceID, &stored, &start, &end); err != nil {
+	if err := tx.QueryRow(`SELECT untimed_source_id, timestamp FROM segments WHERE id = ? AND session_id = ? AND untimed = 1`, segmentID, sessionID).Scan(&untimedSourceID, &stored); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return ErrSegmentNotFound
 		}
 		return fmt.Errorf("read untimed segment %d: %w", segmentID, err)
 	}
-	// An untimed segment holds when its live result was stored, just after
-	// its words: they were said up to its length and untimedSegmentLag
-	// before.
+	// An untimed segment holds when its live result was stored, which waits
+	// for the end of the utterance: its words were said after the flush
+	// before it (untimedHeardFrom) and before it was stored.
 	storedAt, err := time.Parse(time.RFC3339Nano, stored)
 	if err != nil {
 		return fmt.Errorf("read untimed segment %d's time: %w", segmentID, err)
+	}
+	heardFrom, err := untimedHeardFrom(tx, sessionID, untimedSourceID, storedAt)
+	if err != nil {
+		return err
 	}
 	if _, err := tx.Exec(`DELETE FROM segments WHERE id = ? AND session_id = ? AND untimed = 1`, segmentID, sessionID); err != nil {
 		return fmt.Errorf("remove untimed segment %d: %w", segmentID, err)
@@ -109,7 +112,7 @@ func (s *SQLiteStore) deleteUntimedSegmentText(sessionID string, segmentID int64
 	if err != nil {
 		return err
 	}
-	if err := eraseQuestionsHeardIn(tx, owners, storedAt.Add(-seconds(end-start)-untimedSegmentLag), storedAt); err != nil {
+	if err := eraseQuestionsHeardIn(tx, owners, heardFrom, storedAt); err != nil {
 		return err
 	}
 	owed, earlierOwed, err := recordOwedErase(tx)
@@ -236,7 +239,7 @@ func (s *SQLiteStore) deleteRefinedSegment(sessionID string, segmentID int64, re
 	if err != nil {
 		return err
 	}
-	if err := eraseQuestionsHeardInRecording(tx, sessionID, selected.RecordingPath, selected.Start, selected.End, owners); err != nil {
+	if err := eraseQuestionsHeardInRecording(tx, sessionID, selected.RecordingPath, selected.RecordingSHA256, selected.Start, selected.End, owners); err != nil {
 		return err
 	}
 	if keepAudio {

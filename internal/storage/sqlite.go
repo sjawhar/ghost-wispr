@@ -1015,6 +1015,21 @@ func (s *SQLiteStore) init(dbPath string) error {
 	`); err != nil {
 		return fmt.Errorf("create voice_questions table: %w", err)
 	}
+	// voice_question_erasures: each span a segment deletion erased questions
+	// in, for each session, with no words (eraseQuestionsHeardIn), so a
+	// question whose write lands after the deletion is refused. The foreign
+	// key deletes a session's rows with it.
+	if _, err := s.db.Exec(`
+		CREATE TABLE IF NOT EXISTS voice_question_erasures (
+			session_id TEXT NOT NULL,
+			heard_from TEXT NOT NULL,
+			heard_to TEXT NOT NULL,
+			FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
+		);
+		CREATE INDEX IF NOT EXISTS idx_voice_question_erasures_session_id ON voice_question_erasures(session_id);
+	`); err != nil {
+		return fmt.Errorf("create voice_question_erasures table: %w", err)
+	}
 
 	if _, err := s.db.Exec("CREATE INDEX IF NOT EXISTS idx_sessions_started_at ON sessions(started_at)"); err != nil {
 		return fmt.Errorf("create sessions index: %w", err)

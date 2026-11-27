@@ -29,7 +29,9 @@ type questionStore interface {
 // goroutine of its own, after the answer, so nothing here reaches the room. A
 // question with no recording session (its exchange ended before its session
 // settled) or one the store refuses is left out with a warning that names
-// the session and the outcome, never the room's words.
+// the session and the outcome, never the room's words; one whose words a
+// segment deletion erased before the write came is left out as it should be,
+// with a note.
 func recordQuestion(store questionStore, logger *slog.Logger) func(*voice.Question) {
 	return func(q *voice.Question) {
 		if q.SessionID == "" {
@@ -40,7 +42,9 @@ func recordQuestion(store questionStore, logger *slog.Logger) func(*voice.Questi
 			SessionID: q.SessionID, AskedAt: q.AskedAt, HeardFrom: q.HeardFrom, HeardTo: q.HeardTo,
 			Heard: q.Heard, VendorWording: q.VendorWording, Engine: q.Engine, IssueKey: q.IssueKey,
 			Outcome: storage.VoiceQuestionOutcome(q.Outcome), Answer: q.Answer, FirstAudio: q.FirstAudio, Took: q.Took,
-		}); err != nil {
+		}); errors.Is(err, storage.ErrVoiceQuestionErased) {
+			logger.Info("voice: a question heard in a segment deleted since is left out of the question log", "session", q.SessionID, "outcome", q.Outcome)
+		} else if err != nil {
 			logger.Warn("voice: the question log could not keep a question", "session", q.SessionID, "outcome", q.Outcome, "error", err)
 		}
 	}

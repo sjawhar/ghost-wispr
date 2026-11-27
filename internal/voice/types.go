@@ -101,6 +101,13 @@ type Exchange struct {
 	// outage are told by Answer's error. The Supervisor keeps it in the
 	// question log (Question).
 	Outcome QuestionOutcome
+	// Asked is the room's words of the turn as the question log keeps them,
+	// never words the room took back. The Supervisor sets it to the turn
+	// past its last take-back before it calls Answer; when Answer reads the
+	// room's words otherwise, past a take-back of its own finding or the
+	// whole reply to Wispr's question, it sets the words it read, "" when the
+	// turn took itself back whole.
+	Asked string
 }
 
 // RoomView is the room's words a vendor may read now (Exchange.Room). Asker

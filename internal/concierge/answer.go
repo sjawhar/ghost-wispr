@@ -158,9 +158,11 @@ var errSideTalk = fmt.Errorf("concierge: %w", voice.ErrSideTalk)
 // voice.ErrUnreachable, for R10's error sound. A reply to "Did you mean …?"
 // that picks nothing and asks nothing is side talk: the voice says nothing
 // and the error wraps voice.ErrSideTalk. Before it returns, it sets
-// x.Outcome to how the turn ended, for the question log. An answer, and an
-// ask it leaves running, is work Stop waits for; after Stop, Answer answers
-// nothing and its error wraps voice.ErrUnreachable.
+// x.Outcome to how the turn ended, for the question log, and x.Asked to the
+// room's words it read when it read them past a take-back or as the whole
+// reply. An answer, and an ask it leaves running, is work Stop waits for;
+// after Stop, Answer answers nothing and its error wraps
+// voice.ErrUnreachable.
 func (c *Concierge) Answer(parent context.Context, x *voice.Exchange, turn string, say voice.SayFunc) error {
 	work, leave, ok := c.enter(parent)
 	if !ok {
@@ -231,6 +233,11 @@ func (c *Concierge) answer(parent context.Context, x *voice.Exchange, turn strin
 	offer, offered := c.pendingOffer(x)
 	reply := roomFinals(x, turn)
 	said := view.replyText(reply)
+	// The question log keeps the room's words this answer reads, never
+	// those a take-back cancelled (voice.Exchange.Asked).
+	if takesItBack(reply) {
+		x.Asked = said
+	}
 	if offered && offer.sideTalkOn(view, said) {
 		c.dropPick(x)
 		c.logger.Info("concierge took a reply to its own question for side talk: it picks nothing, says no key and asks nothing, or takes itself back")
@@ -245,7 +252,7 @@ func (c *Concierge) answer(parent context.Context, x *voice.Exchange, turn strin
 	case takesItBack(reply):
 		turn = said
 	case offered && strings.TrimSpace(x.Reply) != "" && offer.readsReply(view, turn, said):
-		turn = said
+		turn, x.Asked = said, said
 	}
 	// A key said letter by letter is read here, once, so the pick, the
 	// routing line, the search and the ask all see it.

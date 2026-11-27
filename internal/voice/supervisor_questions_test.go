@@ -129,7 +129,8 @@ func TestATurnsWordsAreTimedByTheirCapture(t *testing.T) {
 // outcome other than how it ended: the Concierge's own (answered, asked back,
 // picked, asked an agent, a "no" to its offer), Answer's error (an outage, a
 // failure), a voice that cannot speak, or a stop, a barge-in and "Wispr,
-// never mind" that cut the answer.
+// never mind" that cut the answer; or if a turn "Wispr, never mind"
+// cancelled keeps any word, the room's, its answer's or its issue's.
 func TestEachOutcomeIsLogged(t *testing.T) {
 	for _, tc := range []struct {
 		name    string
@@ -139,6 +140,7 @@ func TestEachOutcomeIsLogged(t *testing.T) {
 		answer  string
 		spoken  bool // the answer plays to its end
 		noAudio bool
+		noWords bool // the row keeps no words
 	}{
 		{name: "answered", setup: func(c *fakeConcierge, r *rig) { c.outcome = OutcomeAnswered }, want: OutcomeAnswered, answer: "PR 80 is in review.", spoken: true},
 		{name: "asked back", setup: func(c *fakeConcierge, r *rig) { c.outcome = OutcomeAskedBack }, want: OutcomeAskedBack, answer: "PR 80 is in review.", spoken: true},
@@ -157,7 +159,7 @@ func TestEachOutcomeIsLogged(t *testing.T) {
 		}, want: OutcomeFailed, noAudio: true},
 		{name: "Wispr, stop", setup: func(c *fakeConcierge, r *rig) { c.outcome, c.hold = OutcomeAnswered, true }, cut: "Wispr, stop.", want: OutcomeStopped, answer: "PR 80 is in review."},
 		{name: "barge-in", setup: func(c *fakeConcierge, r *rig) { c.outcome, c.hold = OutcomeAnswered, true }, cut: "no no that is the wrong one", want: OutcomeStopped, answer: "PR 80 is in review."},
-		{name: "Wispr, never mind", setup: func(c *fakeConcierge, r *rig) { c.outcome, c.hold = OutcomeAskedAgent, true }, cut: "Wispr, never mind.", want: OutcomeNeverMind, answer: "PR 80 is in review."},
+		{name: "Wispr, never mind", setup: func(c *fakeConcierge, r *rig) { c.outcome, c.issueKey, c.hold = OutcomeAskedAgent, "ABC-12", true }, cut: "Wispr, never mind.", want: OutcomeNeverMind, noWords: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			c := newFakeConcierge("PR 80 is in review.")
@@ -173,8 +175,12 @@ func TestEachOutcomeIsLogged(t *testing.T) {
 				r.speaker.finish(audio.InputVoice)
 			}
 			q := log.next(t)
-			if q.Outcome != tc.want || q.Answer != tc.answer || q.Heard != "what is happening with ABC-12?" {
-				t.Errorf("logged %+v; want outcome %q, answer %q", q, tc.want, tc.answer)
+			heard := "what is happening with ABC-12?"
+			if tc.noWords {
+				heard = ""
+			}
+			if q.Outcome != tc.want || q.Answer != tc.answer || q.Heard != heard || tc.noWords && (q.VendorWording != "" || q.IssueKey != "") {
+				t.Errorf("logged %+v; want outcome %q, heard %q, answer %q", q, tc.want, heard, tc.answer)
 			}
 			if (q.FirstAudio == nil) != tc.noAudio {
 				t.Errorf("first audio %v, want it only when the voice spoke", q.FirstAudio)
