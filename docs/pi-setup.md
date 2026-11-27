@@ -263,10 +263,12 @@ restarts the recorder, and a restart ends a conversation that is being recorded.
    ```
 
    `provision.sh` runs as `ghost-wispr`, with passwordless sudo, and refuses data on standard
-   input. It refuses a directory whose files do not match its `manifest.json`, such as a checkout's
-   `deploy/pi/`. Before it changes anything, it refuses while the environment of `ghost-wispr`'s
-   user manager sets `GHOST_WISPR_CONFIG` or an Envoy variable, which the recorder would inherit
-   ("Turn on the meeting voice", step 1). Then it:
+   input. One provisioning run at a time: each run, with the join it starts, holds
+   `/run/lock/ghost-wispr-provision.lock`, and a second run fails, names the run or the join that
+   holds it, and changes nothing. It refuses a directory whose files do not match its
+   `manifest.json`, such as a checkout's `deploy/pi/`. Before it changes anything, it refuses while
+   the environment of `ghost-wispr`'s user manager sets `GHOST_WISPR_CONFIG` or an Envoy variable,
+   which the recorder would inherit ("Turn on the meeting voice", step 1). Then it:
 
    - installs `libportaudio2`, `ffmpeg`, `lame`, `jq` and `curl`;
    - writes `/opt/ghost-wispr/google-credentials.json` and `/opt/ghost-wispr/certificate_config.json`
@@ -284,34 +286,43 @@ restarts the recorder, and a restart ends a conversation that is being recorded.
    - makes Tailscale Serve exactly the release's `serve.conf` for the device's tailnet name now, as
      `tailscale status --self --json` gives it. A Serve that is that already stays as it is. Any
      other it gives to `serve-apply`, which runs as root in a systemd unit of its own, apart from
-     `provision.sh`, which waits for it and prints its lines. `serve-apply` reads the recorder's
-     `/api/status` immediately before the reset. While the recorder records a conversation (a
-     non-empty `active_session_id`), holds a call whose `state` is not `none`, or runs and gives no
-     status that it can read, it resets nothing, and `provision.sh` stops and says that nothing in
-     Serve was changed: run it again after the meeting. Otherwise it clears Serve with
-     `tailscale serve reset`, Tailscale's documented way to clear Serve
+     `provision.sh`, which waits for it and prints its lines. The unit and its `serve-apply` are the
+     run's own, named by its run id, and `serve-apply` removes itself when it ends, so no run
+     removes another run's. `serve-apply` reads the recorder's `/api/status` immediately before the
+     reset. While the recorder records a conversation (a non-empty `active_session_id`), holds a
+     call whose `state` is not `none`, or runs and gives no status that it can read, it resets
+     nothing, and `provision.sh` stops and says that nothing in Serve was changed: run it again
+     after the meeting. The read is a snapshot: a session that starts after that read, in the
+     fraction of a second before the reset, is not seen, so provision outside meetings. Otherwise
+     it clears Serve with `tailscale serve reset`, Tailscale's documented way to clear Serve
      ([tailscale serve](https://tailscale.com/kb/1242/tailscale-serve), "Reset Tailscale Serve"),
-     and then it applies each line of `serve.conf` with `tailscale serve --bg --https`. When a call
-     fails, it applies `serve.conf` again, up to 4 tries 2 s apart. The reset also clears the entry
-     of a name the device had before a rename, which tailscaled keeps beside the entry of its name
-     now and which no `tailscale serve --https=<port> off` reaches, and a port, a mount, a TCP
-     forward or Funnel that `serve.conf` does not hold. From the reset until the last line is
-     applied, the page and `/call` are not served. A kill of `provision.sh` or a lost SSH session
-     does not stop the unit, so the apply still ends. When every try failed, or the Pi lost power
-     during the apply, Serve stays empty, and only another run of `./provision.sh` puts it back:
-     the nightly update never changes Serve, and check 7 of `check-deploy.sh` fails with
-     `have none` and names that command. Then `provision.sh` reads Serve again, and stops before
-     the join when Serve is not `serve.conf`'s;
+     and then it applies each line of `serve.conf` with `tailscale serve --bg --https`. Each
+     tailscale call ends after 30 s, so a call that hangs fails, and when a call fails, it applies
+     `serve.conf` again, up to 4 tries 2 s apart. The unit's `RuntimeMaxSec` ends it when it runs
+     longer than those steps can. The reset also clears the entry of a name the device had before
+     a rename, which tailscaled keeps beside the entry of its name now and which no
+     `tailscale serve --https=<port> off` reaches, and a port, a mount, a TCP forward or Funnel that
+     `serve.conf` does not hold. From the reset until the last line is applied, the page and
+     `/call` are not served. A kill of `provision.sh` or a lost SSH session does not stop the unit,
+     so the apply still ends. When the unit fails or does not end in time, `provision.sh` prints
+     `Serve is now [<lines>]`, or `[none]` when the page is not served, and the command to run.
+     When every try failed, or the Pi lost power during the apply, Serve stays empty, and only
+     another run of `./provision.sh` puts it back: the nightly update never changes Serve, and
+     check 7 of `check-deploy.sh` fails with `have none` and names that command. Then
+     `provision.sh` reads Serve again, and stops before the join when Serve is not `serve.conf`'s;
    - starts the tagged tailnet join as a detached unit, with `PI_TAILNET_CLIENT_ID` and
      `PI_SERVICE_ACCOUNT_UNIQUE_ID`, or stops after "already joined" on a Pi that is joined as
      `tag:ghost-wispr` already.
 
    It ends with `already joined as tag:ghost-wispr`, or with the line that names the detached join
    unit it started. The SSH session can end while Tailscale re-authenticates (exit 255). The join
-   unit's command line runs `serve-apply` with each line of `serve.conf` as its arguments, so the
-   join reads no file of the release directory. The join runs the same apply after the
-   re-authentication, with the same status read: while the recorder is busy, it resets nothing in
-   Serve, and the join unit ends failed with exit 75. The join runs `tailscale up`
+   unit first takes `/run/lock/ghost-wispr-provision.lock`, which it gets once `provision.sh` has
+   ended, and holds it to its own end; its `RuntimeMaxSec` of 15 minutes keeps a join that hangs
+   from holding it for good. The join unit's command line runs the run's `serve-apply` with each
+   line of `serve.conf` as its arguments, so the join reads no file of the release directory. The
+   join runs the same apply after the re-authentication, with the same status read: while the
+   recorder is busy, it resets nothing in Serve, and the join unit ends failed with exit 75. The
+   join runs `tailscale up`
    with `--accept-routes=false`, so the Pi joins with the tailnet's subnet routes off. Then it runs
    the route check of "Accept the tailnet's subnet routes", and accepts the routes
    (`tailscale set --accept-routes`) only when no peer's `PrimaryRoutes` overlaps a network of the
