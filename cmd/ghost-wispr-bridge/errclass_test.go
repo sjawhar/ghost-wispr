@@ -12,6 +12,8 @@ import (
 	"testing"
 	"time"
 
+	"cloud.google.com/go/auth"
+	"golang.org/x/oauth2"
 	"google.golang.org/api/googleapi"
 )
 
@@ -40,6 +42,17 @@ func TestAnErrorIsLoggedByItsClassAlone(t *testing.T) {
 		{"a JSON value of another type", fmt.Errorf("attendee: GET /bots/%s: %w", errclassSentinel, typeErr), "status=none reason=malformed"},
 		{"any other error", errors.New(errclassSentinel), "status=none reason=other"},
 		{"an HTTP status beside a deadline", fmt.Errorf("%s %w: %w", errclassSentinel, &attendeeStatusError{Status: http.StatusBadRequest}, context.DeadlineExceeded), "status=400"},
+		// A refused credential comes inside the *url.Error net/http makes of
+		// any transport failure, which is a net.Error: it is a sign-in's
+		// refusal all the same, not a network failure.
+		{"a token endpoint's refusal", &url.Error{Op: "Get", URL: "https://x/" + errclassSentinel,
+			Err: &oauth2.RetrieveError{Response: &http.Response{StatusCode: http.StatusBadRequest}, Body: []byte(errclassSentinel), ErrorCode: "invalid_grant"}},
+			"status=400 reason=auth"},
+		{"a token provider's refusal", &url.Error{Op: "Get", URL: "https://x/" + errclassSentinel,
+			Err: &auth.Error{Response: &http.Response{StatusCode: http.StatusUnauthorized}, Body: []byte(errclassSentinel)}},
+			"status=401 reason=auth"},
+		{"a refusal with no response", &url.Error{Op: "Get", URL: "https://x/" + errclassSentinel, Err: &oauth2.RetrieveError{ErrorCode: "invalid_grant"}},
+			"status=none reason=auth"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if !strings.Contains(tc.err.Error(), errclassSentinel) {

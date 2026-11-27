@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	"github.com/sjawhar/ghost-wispr/internal/calendar"
@@ -41,6 +42,7 @@ func (b *bridge) restore(ctx context.Context) {
 	}
 	held := map[string]bool{} // events with a bot in Attendee's list
 	var current *bot          // the record of b.bot
+	acted := 0                // the bots this restart acts on, each with its RESTART-BOT line
 	for i := range bots {
 		bt := &bots[i]
 		if bt.EventID == "" {
@@ -51,6 +53,16 @@ func (b *bridge) restore(ctx context.Context) {
 		if !found {
 			ev = calendar.Event{ID: bt.EventID} // no longer a call's event: its end has passed, or it is gone
 		}
+		// The newest bot of an event in the calendar decides the event, also
+		// when upkeep deleted its data: Attendee keeps its events. An older
+		// bot's end was decided when the newer bot was made. A data_deleted
+		// bot that decides nothing needs nothing more, and gets no line:
+		// Attendee keeps every bot of the day until the instance stops.
+		superseded := newest[bt.EventID] != i || !found || ev.Done
+		if superseded && bt.State == stateDataDeleted {
+			continue
+		}
+		acted++
 		lb := newLiveBot(bt.ID, bt.Nonce, &ev, now)
 		lb.adopted, lb.state = true, bt.State
 		// A bot whose record holds no event yet (one Attendee scheduled for
@@ -62,13 +74,7 @@ func (b *bridge) restore(ctx context.Context) {
 		}
 		b.log.Info("RESTART-BOT bot=" + bt.ID + " event=" + bt.EventID + " state=" + bt.State)
 		if finalState(bt.State) {
-			// The newest bot of an event in the calendar decides the event,
-			// also when upkeep deleted its data: Attendee keeps its events.
-			// An older bot's end was decided when the newer bot was made.
-			lb.superseded = newest[bt.EventID] != i || !found || ev.Done
-			if lb.superseded && bt.State == stateDataDeleted {
-				continue
-			}
+			lb.superseded = superseded
 			b.others[bt.ID] = lb
 			b.endBot(ctx, lb, bt)
 			continue
@@ -83,6 +89,7 @@ func (b *bridge) restore(ctx context.Context) {
 			b.addExtra(ctx, lb)
 		}
 	}
+	b.log.Info(fmt.Sprintf("RESTART-COUNT bots=%d acted=%d", len(bots), acted))
 	if lb := b.bot; lb != nil {
 		if lb.nonce != "" {
 			b.sockets.Register(lb.nonce)

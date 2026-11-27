@@ -3,8 +3,10 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -27,13 +29,19 @@ const (
 
 // dwdGoogle answers, in process, the three Google endpoints the delegated
 // sign-in reaches: the metadata server, the IAM Credentials API's signJwt,
-// and the OAuth token endpoint; it keeps what each was asked.
+// and the OAuth token endpoint; it keeps what each was asked. A test may
+// make signJwt or the token exchange refuse with a status, or signJwt
+// unreachable.
 type dwdGoogle struct {
 	mu       sync.Mutex
 	metadata []*http.Request
 	signJWT  []string // the path of each signJwt request
 	claims   []map[string]any
 	exchange []url.Values
+
+	signJWTStatus  int  // nonzero: signJwt answers this status
+	signJWTDown    bool // signJwt cannot be reached
+	exchangeStatus int  // nonzero: the token exchange answers this status
 }
 
 func (g *dwdGoogle) RoundTrip(r *http.Request) (*http.Response, error) {
@@ -56,6 +64,12 @@ func (g *dwdGoogle) RoundTrip(r *http.Request) (*http.Response, error) {
 		return answer(http.StatusOK, dwdAccount)
 	case r.URL.Host == "iamcredentials.googleapis.com" && strings.HasSuffix(r.URL.Path, ":signJwt"):
 		g.signJWT = append(g.signJWT, r.URL.Path)
+		if g.signJWTDown {
+			return nil, &net.OpError{Op: "dial", Net: "tcp", Err: errors.New("connect: connection refused")}
+		}
+		if g.signJWTStatus != 0 {
+			return answer(g.signJWTStatus, `{"error":{"code":403,"message":"Permission 'iam.serviceAccounts.signJwt' denied","status":"PERMISSION_DENIED"}}`)
+		}
 		var req struct{ Payload string }
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			return answer(http.StatusBadRequest, `{"error":{"code":400}}`)
@@ -70,6 +84,11 @@ func (g *dwdGoogle) RoundTrip(r *http.Request) (*http.Response, error) {
 		body, _ := io.ReadAll(r.Body)
 		form, _ := url.ParseQuery(string(body))
 		g.exchange = append(g.exchange, form)
+		if g.exchangeStatus != 0 {
+			// Google's answer for a subject the account has no domain-wide
+			// delegation for.
+			return answer(g.exchangeStatus, `{"error":"unauthorized_client","error_description":"Client is unauthorized to retrieve access tokens using this method, or client not authorized for any of the scopes requested."}`)
+		}
 		return answer(http.StatusOK, fmt.Sprintf(`{"access_token":%q,"token_type":"Bearer","expires_in":3600}`, "delegated-token"))
 	default:
 		return answer(http.StatusNotFound, fmt.Sprintf(`{"error":{"code":404,"message":"no %s %s%s here"}}`, r.Method, r.URL.Host, r.URL.Path))
@@ -127,5 +146,47 @@ func TestTheCalendarSignsInAsTheBotUserThroughTheInstancesOwnAccount(t *testing.
 	}
 	if len(authorization) != 1 || authorization[0] != "Bearer delegated-token" {
 		t.Errorf("the calendar was called with Authorization %q, want [\"Bearer delegated-token\"]", authorization)
+	}
+}
+
+// D5: a refused delegated sign-in, by the token exchange (no domain-wide
+// delegation for the bot user) or by signJwt (no permission on the account),
+// is logged as its HTTP status and reason=auth, so a reader of
+// RESTART-READ-FAILED or WATCHER-READ-FAILED sees the missing delegation. A
+// signJwt that cannot be reached stays a network failure.
+func TestARefusedDelegatedSignInIsLoggedAsAuth(t *testing.T) {
+	t.Setenv("GCE_METADATA_HOST", "")
+	for _, tc := range []struct {
+		name   string
+		google *dwdGoogle
+		want   string
+	}{
+		{"the token exchange refuses the bot user", &dwdGoogle{exchangeStatus: http.StatusUnauthorized}, "status=401 reason=auth"},
+		{"signJwt refuses the account", &dwdGoogle{signJWTStatus: http.StatusForbidden}, "status=403 reason=auth"},
+		{"signJwt cannot be reached (control)", &dwdGoogle{signJWTDown: true}, "status=none reason=network"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			google := tc.google
+			cal := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, `{"kind":"calendar#events","items":[]}`)
+			}))
+			t.Cleanup(cal.Close)
+			ctx := context.Background()
+			svc, err := delegatedCalendarVia(ctx, metadata.NewClient(&http.Client{Transport: google}),
+				calendarapi.CalendarReadonlyScope, dwdBotUser,
+				[]option.ClientOption{option.WithHTTPClient(&http.Client{Transport: google})},
+				[]option.ClientOption{option.WithEndpoint(cal.URL + "/calendar/v3/")})
+			if err != nil {
+				t.Fatalf("delegatedCalendarVia: %v", err)
+			}
+			_, err = svc.Events.List("primary").Context(ctx).Do()
+			if err == nil {
+				t.Fatal("the calendar answered through a sign-in that failed")
+			}
+			if got := errorClass(err); got != tc.want {
+				t.Fatalf("errorClass = %q, want %q", got, tc.want)
+			}
+		})
 	}
 }

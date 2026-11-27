@@ -414,3 +414,44 @@ func TestAFailedRestartReadIsTriedEvery30s(t *testing.T) {
 		t.Fatalf("calendar reads of the restart in 70 s = %d, want 3: at the start, 30 s and 60 s", n)
 	}
 }
+
+// O4: Attendee keeps every bot of the day until the instance stops. A
+// restart logs RESTART-BOT only for a bot it acts on: one it adopts, makes
+// leave, or ends and deletes the data of; not for a data_deleted bot whose
+// event a newer bot or its done mark decided. One RESTART-COUNT line gives
+// the counts, so the lines do not grow with the day's bots.
+func TestARestartLogsOnlyTheBotsItActsOn(t *testing.T) {
+	done := botCalEvent("ev1", botT0.Add(-3*time.Hour), botT0.Add(-2*time.Hour))
+	done.Done, done.Joins = true, 1
+	ev2 := restartInProgress("ev2")
+	ev2.Joins = 2
+	h := newBotHarness(t, done, ev2)
+	h.api.bots = append(h.api.bots,
+		&bot{ID: "bot_1", State: "data_deleted", EventID: "ev1", Nonce: "nonce-1",
+			Events: botRecord(botT0.Add(-3*time.Hour), "join_requested", "joined_meeting", "meeting_ended", "data_deleted")},
+		&bot{ID: "bot_2", State: "data_deleted", EventID: "ev0", Nonce: "nonce-2", // an event the read no longer holds
+			Events: botRecord(botT0.Add(-6*time.Hour), "join_requested", "joined_meeting", "meeting_ended", "data_deleted")},
+		&bot{ID: "bot_3", State: "fatal_error", EventID: "ev2", Nonce: "nonce-3", Events: restartRecord("fatal_error/process_terminated")},
+		&bot{ID: "bot_4", State: "joining", EventID: "ev2", Nonce: "nonce-4", Events: botRecord(botT0.Add(-time.Minute), "join_requested")},
+		&bot{ID: "bot_5", State: "ended", Nonce: "nonce-5"}) // not a bot of ours: no event id
+	h.start()
+	var restartBots []string
+	for _, m := range h.logs.messages(t) {
+		if strings.HasPrefix(m, "RESTART-BOT ") {
+			restartBots = append(restartBots, m)
+		}
+	}
+	want := []string{
+		"RESTART-BOT bot=bot_3 event=ev2 state=fatal_error",
+		"RESTART-BOT bot=bot_4 event=ev2 state=joining",
+	}
+	if !slices.Equal(restartBots, want) {
+		t.Fatalf("RESTART-BOT lines = %q, want %q: the bots the restart acts on", restartBots, want)
+	}
+	if !slices.Contains(h.logs.messages(t), "RESTART-COUNT bots=5 acted=2") {
+		t.Fatalf("no RESTART-COUNT bots=5 acted=2 line in %q", h.logs.messages(t))
+	}
+	if deletes := h.api.callsOf("DeleteData"); len(deletes) != 1 || deletes[0].ID != "bot_3" {
+		t.Fatalf("DeleteData calls %+v, want bot_3's alone", deletes)
+	}
+}
