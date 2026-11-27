@@ -419,6 +419,65 @@ func TestASecondCopyTheFitCannotTellReadsUnknown(t *testing.T) {
 	}
 }
 
+// c-once, from Sol's review of PR 202
+// (TestReviewPartiallyCollinearFitDoesNotInventSecondCopy, and its control
+// TestReviewNonperiodicFitSeparatesSecondCopy): a reference that repeats
+// itself holds the same copy at lags a period apart, so the direct copy's
+// path can reproduce lags of the second path whole. A reference of one
+// sample of 0.5 every 400 samples, its direct copy 800 samples early at gain
+// 0.5 and a second 420 early at gain 1/64, -30.1 dB against it: with
+// -max-lag 50ms, 60 of the second path's 160 lags are lags of the direct
+// path 400 samples on, the direct copy's among them. The fit, loaded so that
+// it is never singular, split the direct copy between the two paths and
+// read copy_vs_direct_db=0.0; the second path's other 100 lags left it 62.5 %
+// of its lags' energy, over minOwn. It reads copy=UNKNOWN, or the copy's
+// level. The control, a reference of ±0.5 at random, reads -30.1 dB within
+// 1 dB.
+func TestAReferenceThatRepeatsItselfInventsNoSecondCopy(t *testing.T) {
+	const rate = 16000
+	periodic := make([]float64, rate)
+	for i := 0; i < len(periodic); i += 400 {
+		periodic[i] = 0.5
+	}
+	random := make([]float64, rate)
+	seed := uint32(9031)
+	for i := range random {
+		seed = seed*1664525 + 1013904223
+		random[i] = 0.5
+		if seed>>31 == 1 {
+			random[i] = -0.5
+		}
+	}
+	want := 20 * math.Log10((1.0/64)/0.5)
+	for _, tc := range []struct {
+		name    string
+		source  []float64
+		unknown bool // copy=UNKNOWN passes too
+	}{
+		{"a reference that repeats every 400 samples", periodic, true},
+		{"control: a reference at random", random, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			rec := make([]float64, rate/2)
+			addCopy(rec, tc.source, -800, 0.5)
+			addCopy(rec, tc.source, -420, 1.0/64)
+			out, errOut, code := callprobe(t, "", "analyze", "echo", "-max-lag", "50ms", "-path", "10ms", "-second-after", "20ms",
+				"-ref", writeWAV(t, dir, "reference.wav", rate, tc.source), "-in", writeWAV(t, dir, "recording.wav", rate, rec))
+			if code != 0 {
+				t.Fatalf("analyze echo exited %d: %s%s", code, out, errOut)
+			}
+			t.Logf("%s", out)
+			if got, _ := value(out, "copy"); tc.unknown && got == "UNKNOWN" {
+				return
+			}
+			if got, err := parseNumber(out, "copy_vs_direct_db"); err != nil || math.Abs(got-want) > 1 {
+				t.Errorf("copy_vs_direct_db=%v (%v), want %.1f within 1 dB:\n%s", got, err, want, out)
+			}
+		})
+	}
+}
+
 // c-once: a recording that ends with the reference holds only part of a
 // late copy, and the level of each copy is against the reference's energy
 // the recording holds at that copy's lag. A reference of 1 s of noise, its

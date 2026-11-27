@@ -257,7 +257,9 @@ func fitPath(ref []float32, cross []float64) ([]float64, error) {
 // path reproduces, and a constant delayed is the same constant: below this
 // share, what tells the two paths apart is the small rest, and where the
 // files start and end. A steady tone of 30 % of the reference's power
-// leaves 70 %; a constant leaves about 2 %.
+// leaves 70 %; a second of a constant, with paths of 10 ms, leaves 9 %. A
+// share over all the second path's lags can pass with some of them
+// reproduced whole, which findSecond rejects lag by lag.
 const minOwn = 0.5
 
 // findSecond finds the second copy for FindCopy, into c: the loudest copy at
@@ -282,9 +284,15 @@ const minOwn = 0.5
 // The second copy is UNKNOWN, with no level and the floor no bound on it,
 // when the fit cannot tell it: when the recording holds so little of the
 // reference's copy at some lag searched that a copy as loud as the floor
-// would not stand out there, when the two paths' fit is singular, or when
-// the first path's lags can reproduce most of what the reference gives the
-// second's (minOwn).
+// would not stand out there; when the first path's lags can reproduce a
+// lag of the second's all but a share so small that noise alone, through
+// that lag, would stand out as a copy, as a reference that repeats itself
+// between the two paths' lags has lags they both reproduce whole; when they
+// can reproduce most of what the reference gives the second's lags
+// (minOwn); or when the two paths' fit is singular. Both shares are judged
+// on the normal equations as they are, before the loading that makes them
+// solvable: where both paths' lags reproduce one copy, it is the loading
+// that would choose how much of it each path takes.
 func findSecond(ref, rec Audio, c *Copy, k, lag, first int, h []float64, after int) error {
 	x, y := ref.Samples, rec.Samples
 	taps := len(h)
@@ -339,6 +347,34 @@ func findSecond(ref, rec Audio, c *Copy, k, lag, first int, h []float64, after i
 		c.Second.Unknown = "the recording holds too little of the reference's copy at some lag searched for a copy as loud as the noise floor to stand out there"
 		return nil
 	}
+	// own is what the first path's lags cannot reproduce of each second-path
+	// lag's column, in the normal equations as they are. A lag left a share
+	// s of its own has its tap set by that share alone: noise of energy σ² a
+	// sample moves the tap's copy by at least about σ²/s, and below
+	// minShare, 1/(foundFactor·(taps + 2·ln K)), that alone is foundFactor
+	// times what noise fits into a path (noise, per sample of the fit), as
+	// much as a copy that stands out of it. A copy at a lag both paths hold
+	// whole has no share at all.
+	own := ownEnergies(g, taps)
+	minShare, shared := 1/(foundFactor*noise*float64(m1-m0)), 0
+	var mine, all float64
+	for j, e := range own {
+		col := g[(taps+j)*n+taps+j]
+		mine, all = mine+e, all+col
+		if col > 0 && e < minShare*col {
+			shared++
+		}
+	}
+	if shared > 0 {
+		c.Second.Unknown = fmt.Sprintf("the direct copy's path can reproduce %d of the second copy's %d lags so nearly that noise alone could stand out as a copy through them, "+
+			"as it can a reference's that repeats itself between the two copies, so the fit cannot tell the two copies apart", shared, taps)
+		return nil
+	}
+	if share := mine / all; !(share >= minOwn) {
+		c.Second.Unknown = fmt.Sprintf("the direct copy's path can reproduce %.0f %% of what the reference gives the second copy's lags, "+
+			"as it can a steady tone's or a constant's, so the fit cannot tell the two copies apart", 100*(1-share))
+		return nil
+	}
 	cross := append(sums(y[m0:m1], x, m0, first, taps), sums(y[m0:m1], x, m0, second, taps)...)
 	normal := slices.Clone(g)
 	for i := range n {
@@ -347,11 +383,6 @@ func findSecond(ref, rec Audio, c *Copy, k, lag, first int, h []float64, after i
 	paths, err := solveSPD(normal, cross)
 	if err != nil {
 		c.Second.Unknown = "the two copies' paths have no least-squares fit: " + err.Error()
-		return nil
-	}
-	if own := ownShare(normal, g, taps); !(own >= minOwn) {
-		c.Second.Unknown = fmt.Sprintf("the direct copy's path can reproduce %.0f %% of what the reference gives the second copy's lags, "+
-			"as it can a steady tone's or a constant's, so the fit cannot tell the two copies apart", 100*(1-own))
 		return nil
 	}
 	var fitted float64
@@ -433,23 +464,55 @@ func eachHeld(x []float32, ny, lo, hi int, f func(lag int, held float64, overlap
 	}
 }
 
-// ownShare is, of the energy that the reference gives the second path's lags
-// in the normal equations, the share that the first path's lags cannot
-// reproduce: the trace of the second block once the first path is fitted
-// (its Schur complement), against the block's own trace in g. l is the
-// normal equations' Cholesky factor, which solveSPD leaves: the complement
-// is the product of the factor's second diagonal block with its transpose,
-// whose trace is the sum of that block's squares.
-func ownShare(l, g []float64, taps int) float64 {
+// ownEnergies is, for each lag of the second path, the energy of its column
+// of g, the normal equations of two paths of taps each, that the first
+// path's lags cannot reproduce: its diagonal entry once the first path is
+// fitted (the Schur complement's), from g as it is, unloaded. The first
+// path's block is factored by Cholesky with each lag left out whose column
+// the lags before it reproduce within 1e-9 of its energy, the loading's
+// scale, as a reference that repeats itself within the path has: the lags
+// kept reproduce all that the first path's lags do.
+func ownEnergies(g []float64, taps int) []float64 {
 	n := 2 * taps
-	var own, all float64
-	for i := taps; i < n; i++ {
-		for j := taps; j <= i; j++ {
-			own += l[i*n+j] * l[i*n+j]
+	l := make([]float64, taps*taps) // the first block's factor, row-major: 0 in each column left out
+	for j := range taps {
+		d := g[j*n+j]
+		for k := range j {
+			d -= l[j*taps+k] * l[j*taps+k]
 		}
-		all += g[i*n+i]
+		if d <= 1e-9*g[j*n+j] {
+			continue
+		}
+		d = math.Sqrt(d)
+		l[j*taps+j] = d
+		for i := j + 1; i < taps; i++ {
+			s := g[i*n+j]
+			for k := range j {
+				s -= l[i*taps+k] * l[j*taps+k]
+			}
+			l[i*taps+j] = s / d
+		}
 	}
-	return own / all
+	own := make([]float64, taps)
+	z := make([]float64, taps) // the second path's lag's column against the factor's: l·z is its row of the first block
+	for j := range own {
+		row := g[(taps+j)*n : (taps+j)*n+taps]
+		e := g[(taps+j)*n+taps+j]
+		for i := range taps {
+			z[i] = 0
+			if l[i*taps+i] == 0 {
+				continue
+			}
+			s := row[i]
+			for k := range i {
+				s -= l[i*taps+k] * z[k]
+			}
+			z[i] = s / l[i*taps+i]
+			e -= z[i] * z[i]
+		}
+		own[j] = max(e, 0)
+	}
+	return own
 }
 
 // gram is the matrix of the normal equations of two paths of taps each,
