@@ -523,9 +523,11 @@ install_serve_apply() {
 }
 
 # serve_status_json prints Tailscale Serve's setting, `tailscale serve status --json`, in at most
-# TAILSCALE_CALL_TIMEOUT s.
+# TAILSCALE_CALL_TIMEOUT s. Like each tailscale call of a run, its stderr goes nowhere: a run copies
+# no tailscale output into its own, which a person can capture or share (GPT-6.1 Sol's review of
+# #208, round 2: a logged-out node's tailscale prints its login URL).
 serve_status_json() {
-  timeout --kill-after=5s "${TAILSCALE_CALL_TIMEOUT}s" sudo tailscale serve status --json
+  timeout --kill-after=5s "${TAILSCALE_CALL_TIMEOUT}s" sudo tailscale serve status --json 2>/dev/null
 }
 
 # apply_serve makes Tailscale Serve exactly serve.conf's setting for this device's tailnet name, as
@@ -541,12 +543,14 @@ serve_status_json() {
 # (TAILSCALE_CALL_TIMEOUT s and 5 s each) and 3 pauses of 2 s. The unit's serve-apply removes
 # itself, and this run removes it too once the unit has ended, as a unit that did not start leaves
 # it. When the unit fails or does not end in time, it says what Serve is now
-# and the command to run. Last it prints the unit's lines, reads Serve again, as the nightly drift
+# and the command to run. Of the unit it prints only how it ended, its exit, and the command that
+# reads its lines, never the lines: tailscale serve prints a login URL when the node is logged out
+# (GPT-6.1 Sol's review of #208, round 2). Then it reads Serve again, as the nightly drift
 # check reads it (pi-lib.sh's serve_lines_from_status), and fails unless it is serve.conf's. It
 # changes nothing in Serve when it cannot read the device's name or Serve.
 apply_serve() {
-  local self name live have state unit limit now status=0
-  if ! self=$(timeout --kill-after=5s "${TAILSCALE_CALL_TIMEOUT}s" tailscale status --self --json) \
+  local self name live have state unit limit now result status=0
+  if ! self=$(timeout --kill-after=5s "${TAILSCALE_CALL_TIMEOUT}s" tailscale status --self --json 2>/dev/null) \
     || ! name=$(device_tailnet_name "$self"); then
     fail "could not read this device's tailnet name (tailscale status --self --json), for which Serve must be serve.conf's: nothing in Serve was changed"
   fi
@@ -568,11 +572,13 @@ apply_serve() {
   install_serve_apply
   sudo systemd-run --wait --quiet --collect --expand-environment=no --unit="$unit" --property=RuntimeMaxSec="$limit" \
     /bin/sh "$SERVE_APPLY" "$STATUS_URL" "${serve_words[@]}" </dev/null || status=$?
-  printf 'ghost-wispr provision: the journal of %s:\n' "$unit"
-  sudo journalctl -u "$unit" --no-pager --output=cat || printf 'ghost-wispr provision: could not read the journal of %s\n' "$unit"
+  result=succeeded
+  ((status == 0)) || result=failed
+  printf 'ghost-wispr provision: %s.service, the Serve apply, %s (exit %s); read its lines, which can hold a tailscale login URL, with: sudo journalctl -u %s.service\n' \
+    "$unit" "$result" "$status" "$unit"
   sudo rm -f -- "$SERVE_APPLY"
   if ((status == SERVE_APPLY_BUSY)); then
-    fail "the recorder records a conversation, holds a call or gives no status (its line is above), so Serve was not reset and nothing in Serve was changed: run provision.sh again when no conversation is recorded and no call is live"
+    fail "the recorder records a conversation, holds a call or gives no status, so Serve was not reset and nothing in Serve was changed; its journal says why: sudo journalctl -u $unit.service. Run provision.sh again when no conversation is recorded and no call is live"
   fi
   if ((status != 0)); then
     if live=$(serve_status_json) && now=$(serve_lines_from_status "$live" "$name"); then
@@ -584,7 +590,7 @@ apply_serve() {
     else
       now='Serve cannot be read now, so the page may not be served'
     fi
-    fail "the reset and apply of Serve in $unit failed or did not end within $limit s (exit $status, its lines are above). $now: run the release's ./provision.sh again (docs/pi-setup.md, \"Apply a provisioning change\")"
+    fail "the reset and apply of Serve in $unit failed or did not end within $limit s (exit $status). $now: run the release's ./provision.sh again (docs/pi-setup.md, \"Apply a provisioning change\")"
   fi
   live=$(serve_status_json) \
     || fail "could not read Tailscale Serve's setting (tailscale serve status --json) after provision.sh applied serve.conf"
@@ -927,15 +933,16 @@ systemctl --user enable --now ghost-wispr-update.timer
 # The nightly update, now: it installs the latest release's whole deploy set and its secrets, and
 # restarts the recorder on them. A start of the unit, never a run of the launcher or update.sh, so
 # systemd joins it with a start of the timer at the same moment. The unit's lines are in the system
-# journal: the Pi keeps no user journal.
+# journal: the Pi keeps no user journal. The run says how the update ended and names the command
+# that reads this run's lines, as it copies no unit's lines into its own (GPT-6.1 Sol's review of
+# #208, round 2).
 printf 'ghost-wispr provision: starting the nightly update now (systemctl --user start ghost-wispr-update.service)\n'
 update_status=0
 systemctl --user start ghost-wispr-update.service || update_status=$?
-printf 'ghost-wispr provision: the journal of ghost-wispr-update.service for this run:\n'
-sudo journalctl _SYSTEMD_USER_UNIT=ghost-wispr-update.service --since="@$update_started" --no-pager --output=cat \
-  || printf 'ghost-wispr provision: could not read the journal of ghost-wispr-update.service\n'
+update_journal="sudo journalctl _SYSTEMD_USER_UNIT=ghost-wispr-update.service --since=@$update_started"
 ((update_status == 0)) \
-  || fail "the nightly update failed (systemctl --user start ghost-wispr-update.service exited $update_status): its lines are above; fix the cause and run provision.sh again"
+  || fail "the nightly update failed (systemctl --user start ghost-wispr-update.service exited $update_status); read this run's lines with: $update_journal; fix the cause and run provision.sh again"
+printf "ghost-wispr provision: ghost-wispr-update.service, the nightly update, succeeded (exit 0); read this run's lines with: %s\n" "$update_journal"
 systemctl --user enable ghost-wispr.service
 
 apply_serve
@@ -943,7 +950,7 @@ apply_serve
 # Whether the node is joined already, read in TAILSCALE_CALL_TIMEOUT s like each tailscale call: a
 # read that hangs would hold the run, and refuse every later one, for good (Sol's review of #203,
 # round 3).
-if ! self_status=$(timeout --kill-after=5s "${TAILSCALE_CALL_TIMEOUT}s" tailscale status --self --json); then
+if ! self_status=$(timeout --kill-after=5s "${TAILSCALE_CALL_TIMEOUT}s" tailscale status --self --json 2>/dev/null); then
   fail "could not read this device's tailnet status (tailscale status --self --json) before the join, in $TAILSCALE_CALL_TIMEOUT s: no join was started; run provision.sh again"
 fi
 if jq -e --arg hostname "$TAILSCALE_HOSTNAME" '

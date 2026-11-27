@@ -277,8 +277,10 @@ restarts the recorder, and a restart ends a conversation that is being recorded.
    first prints why it failed, its `ActiveState`, `Result` and `ExecMainStatus`, and the command
    that shows its journal, `sudo journalctl -u <unit>.service -n 20`, but not the journal's lines:
    the join's hold the lines of `tailscale up`, its login URL among them. Then it resets the unit
-   with `systemctl reset-failed`, which leaves its journal, and says so. To end a run, and its
-   join, run
+   with `systemctl reset-failed`, which leaves its journal, and says so. A run copies no unit's
+   lines, and no output of a tailscale command, into its own: both can hold a login URL of
+   Tailscale, such as the one `tailscale serve` prints when the device is logged out. It says how a
+   unit ended and names the command that reads its lines. To end a run, and its join, run
    `sudo systemctl stop ghost-wispr-provision ghost-wispr-provision-join`, which ends every
    process in the run's unit, its control group, and makes the run fail (exit 143); a root process
    that moves itself to another unit leaves that boundary. An SSH session that ends does not
@@ -299,17 +301,22 @@ restarts the recorder, and a restart ends a conversation that is being recorded.
      `pi-lib.sh` and `pi.env`. It turns on lingering for `ghost-wispr` and enables the timer;
    - starts the nightly update once, with `systemctl --user start ghost-wispr-update.service`. That
      run installs the release's whole deploy set and reads the Pi's secrets ("Update and inspect").
-     `provision.sh` prints the run's journal lines, and stops when the run failed;
+     `provision.sh` says whether the run succeeded, with its exit, and names the command that
+     reads that run's lines,
+     `sudo journalctl _SYSTEMD_USER_UNIT=ghost-wispr-update.service --since=@<start>`, and stops
+     when the run failed;
    - enables `ghost-wispr.service`;
    - makes Tailscale Serve exactly the release's `serve.conf` for the device's tailnet name now, as
      `tailscale status --self --json` gives it. A Serve that is that already stays as it is. Any
      other it gives to `serve-apply`, which runs as root in a systemd unit of its own, apart from
-     `provision.sh`, which waits for it and prints its lines. The unit and its `serve-apply` are the
-     run's own, named by its run id, and `serve-apply` removes itself when it ends, so no run
-     removes another run's. `serve-apply` reads the recorder's `/api/status` immediately before the
-     reset. While the recorder records a conversation (a non-empty `active_session_id`) or holds a
-     call whose `state` is not `none`, it resets nothing, and `provision.sh` stops and says that
-     nothing in Serve was changed: run it again after the meeting. With no status that it can
+     `provision.sh`, which waits for it, then says whether it succeeded, with its exit, and names
+     the command that reads its lines, `sudo journalctl -u ghost-wispr-serve-<run id>.service`. The
+     unit and its `serve-apply` are the run's own, named by its run id, and `serve-apply` removes
+     itself when it ends, so no run removes another run's. `serve-apply` reads the recorder's
+     `/api/status` immediately before the reset. While the recorder records a conversation (a
+     non-empty `active_session_id`) or holds a call whose `state` is not `none`, it resets nothing,
+     and `provision.sh` stops and says that nothing in Serve was changed, and the unit's journal
+     says why: run it again after the meeting. With no status that it can
      read, it goes on only when `ghost-wispr`'s user manager confirms `inactive` for
      `ghost-wispr.service` within 30 s; a manager that does not answer, a read that fails, or any
      other state refuses the same way. The read is a snapshot: a session that starts after that
