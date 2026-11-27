@@ -102,11 +102,19 @@ refuse_busy() {
 
 # reset_failed_units resets each unit of a run that systemd keeps failed, which would take the
 # unit's name from the next start (Sol's review of #203, round 6), and says so. A run with --collect
-# leaves none; a unit kept by hand, or by an older provision.sh, can.
+# leaves none; a unit kept by hand, or by an older provision.sh, can. Before the reset, which leaves
+# the unit's state to no one, it prints why the unit failed: its ActiveState, Result and
+# ExecMainStatus, and the last 20 lines of its journal (Sol's review of #203, round 7).
 reset_failed_units() {
-  local unit
+  local unit show
   for unit in "$PI_LIB_PROVISION_UNIT" "$PI_LIB_PROVISION_JOIN_UNIT"; do
     if [[ $(systemctl show -p ActiveState --value "$unit.service" 2>/dev/null) == failed ]]; then
+      show=$(systemctl show -p ActiveState -p Result -p ExecMainStatus "$unit.service" 2>/dev/null) || show=
+      printf 'ghost-wispr provision: %s.service failed: ActiveState=%s, Result=%s, ExecMainStatus=%s; the last 20 lines of its journal:\n' \
+        "$unit" "$(sed -n 's/^ActiveState=//p' <<<"$show")" "$(sed -n 's/^Result=//p' <<<"$show")" \
+        "$(sed -n 's/^ExecMainStatus=//p' <<<"$show")"
+      sudo journalctl -u "$unit.service" -n 20 --no-pager --output=short-iso \
+        || printf 'ghost-wispr provision: could not read the journal of %s.service\n' "$unit"
       sudo systemctl reset-failed "$unit.service" || fail "could not reset the failed unit $unit.service: nothing was changed"
       printf 'ghost-wispr provision: reset the failed unit %s.service, which a run that failed left\n' "$unit"
     fi
@@ -122,14 +130,16 @@ reset_failed_units() {
 # path below), as a join can become active between this check and the start. When the start itself
 # loses to another run's, it gives the same refusal, not systemd-run's line: the run marks its start
 # in the file GHOST_WISPR_PROVISION_STARTED names, so a run that never started is told from one that
-# failed. The run's end, by systemctl stop, a kill of its main process or its own end, ends every
+# failed. The marker goes when this caller ends, also by a signal, which ends it 130, 143 or 129
+# (Sol's review of #203, round 7): the run's unit, which does not depend on this caller, goes on. The
+# run's end, by systemctl stop, a kill of its main process or its own end, ends every
 # process in its unit's control group: each command of the run that stays in it (GPT-6.1 Sol's
 # review of #203, round 5, where a lock descriptor stayed with each command that inherited it). A
 # root process that moves itself to another unit leaves that boundary. An SSH session that ends
 # does not end the run: over Tailscale SSH, the session's processes and the unit stay. Before it
 # starts the unit, a run with no argument refuses data on its standard input.
 start_provision_unit() {
-  local started status=0
+  local status=0 unit_pid
   check_usage "$@"
   if (($# == 0)); then
     refuse_input
@@ -139,17 +149,23 @@ start_provision_unit() {
   refuse_busy
   provision_unit_settings
   provision_unit_command "$PI_LIB_PROVISION_UNIT" "$SERVICE_USER"
-  started=$(mktemp) || fail 'could not make the file that marks the run'"'"'s start: nothing was changed'
+  provision_started=$(mktemp) || fail 'could not make the file that marks the run'"'"'s start: nothing was changed'
+  trap 'rm -f -- "$provision_started"' EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  trap 'exit 129' HUP
+  # The start runs in the background, its input passed through, and the caller waits for it: a wait
+  # ends at a signal, where a command in the foreground would hold the trap until it ends.
   # shellcheck disable=SC2154 # pi-lib.sh's provision_unit_command and provision_unit_settings set them.
   sudo "${pl_unit_command[@]}" "${pl_unit_settings[@]}" --setenv=GHOST_WISPR_PROVISION_IN_UNIT=1 \
-    "--setenv=GHOST_WISPR_PROVISION_STARTED=$started" "--working-directory=$PWD" \
-    /bin/bash "$script_dir/provision.sh" "$@" || status=$?
-  if ((status != 0)) && [[ ! -s $started ]]; then
-    rm -f -- "$started"
+    "--setenv=GHOST_WISPR_PROVISION_STARTED=$provision_started" "--working-directory=$PWD" \
+    /bin/bash "$script_dir/provision.sh" "$@" 0<&0 &
+  unit_pid=$!
+  wait "$unit_pid" || status=$?
+  if ((status != 0)) && [[ ! -s $provision_started ]]; then
     refuse_busy
     fail "the run's unit $PI_LIB_PROVISION_UNIT did not start (systemd-run exit $status): nothing was changed. Run provision.sh again, or end a run that holds the name with: sudo systemctl stop $PI_LIB_PROVISION_UNIT $PI_LIB_PROVISION_JOIN_UNIT. An SSH session that ends does not end a run."
   fi
-  rm -f -- "$started"
   exit "$status"
 }
 
@@ -812,8 +828,9 @@ if [[ ${GHOST_WISPR_PROVISION_IN_UNIT:-} != 1 || -z ${INVOCATION_ID:-} ]]; then
 fi
 provision_stop_traps
 # The run's start, which start_provision_unit reads to tell a run that failed from one that never
-# started.
-if [[ -n ${GHOST_WISPR_PROVISION_STARTED:-} ]]; then
+# started. Only while the caller's marker is there: a caller that a signal ended removed it, and the
+# run makes no file in its place.
+if [[ -n ${GHOST_WISPR_PROVISION_STARTED:-} && -f $GHOST_WISPR_PROVISION_STARTED ]]; then
   printf 'started\n' >"$GHOST_WISPR_PROVISION_STARTED"
 fi
 # The join again, now that this run holds the run's name: a join can have become active after the
