@@ -1304,7 +1304,17 @@ func (s *Supervisor) onTranscriptLocked(t *Transcript) {
 		// numbers (the office, 2026-11-27, dispatch://INFRA-4592): the
 		// exchange waits TurnWait for them, the wait it gives any asker after
 		// a wake for a first word, and ends as misheard only if none asks.
-		if t.IsFinal && ex.interim != "" {
+		if !t.IsFinal || !ex.endsTurn(t.endsAt()) {
+			// An interim, or a final that ended before a word of the turn
+			// now heard began: a late final of an older utterance ("Whisper
+			// networks are a problem." after the call "Wispr." and the
+			// interim "Can you send these notes?") replaces none of the
+			// turn's words, so it withdraws nothing and holds nothing (the
+			// span rule of endpoints, endsTurn; Sol's twenty-sixth review of
+			// #191).
+			return
+		}
+		if ex.interim != "" {
 			// The final replaces the interim it was heard from ("Wispr,
 			// send these notes" became "Whisper networks are a problem."):
 			// those words were never said, so they are no turn's, and no
@@ -1316,7 +1326,7 @@ func (s *Supervisor) onTranscriptLocked(t *Transcript) {
 			}
 			s.roomChangedLocked(ex)
 		}
-		if t.IsFinal && !ex.misheardHold {
+		if !ex.misheardHold {
 			ex.misheardHold = true
 			ex.holdGen++
 			if ex.timer != nil {
