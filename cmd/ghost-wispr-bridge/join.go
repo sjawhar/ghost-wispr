@@ -162,7 +162,7 @@ func (b *bridge) resolveAttempt(ctx context.Context) bool {
 		b.bot = lb
 		b.log.Info(fmt.Sprintf("BOT-FOUND bot=%s event=%s joins=%d", bt.ID, at.event.ID, at.joins))
 		b.sendCall(&at.event, botJoining)
-		if b.clearLeave(at.event.ID) {
+		if b.clearBot(at.event.ID) {
 			b.writeRecord(ctx, at.event.ID)
 		}
 		return false
@@ -217,7 +217,7 @@ func (b *bridge) createBot(ctx context.Context, ev *calendar.Event, texts *call.
 	b.bot = lb
 	b.log.Info(fmt.Sprintf("BOT-CREATED bot=%s event=%s joins=%d", bt.ID, ev.ID, joins))
 	b.sendCall(ev, botJoining)
-	if b.clearLeave(ev.ID) {
+	if b.clearBot(ev.ID) {
 		b.writeRecord(ctx, ev.ID)
 	}
 }

@@ -2,9 +2,20 @@ package main
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
+
+	"github.com/sjawhar/ghost-wispr/internal/calendar"
+	"github.com/sjawhar/ghost-wispr/internal/call"
 )
+
+// lifecycleUnrecorded is the bot's calendar refusing every pending record.
+type lifecycleUnrecorded struct{ calendar.Reader }
+
+func (lifecycleUnrecorded) SetPending(context.Context, string, calendar.Pending) error {
+	return errors.New("calendar write unavailable")
+}
 
 // lifecycleSlowRead is Attendee's API whose reads of a bot take delay on the
 // bridge's clock, as a request that takes its time.
@@ -54,8 +65,9 @@ func TestDeleteDataCountsItsDeadlineFromTheBotsEnd(t *testing.T) {
 // R2: a chat check that has not passed fails at its deadline also when a
 // restarted bridge cannot read the roster: an input it lacks stops a pass,
 // never the deadline, so the bot leaves by 40 s after its admission. A
-// restart long after the admission gives its reads one call's bound before
-// the check fails. (Sol's review of #202 at c8f9db27, the first two cases:
+// restart long after the admission, whose bot's pass the calendar did not
+// record, gives its reads one call's bound before the check fails. (Sol's
+// review of #202 at c8f9db27, the first two cases:
 // TestReviewRestartCannotWaitPastAnUnpassedChatCheck.)
 func TestAChatCheckFailsAtItsDeadlineWhileARestartsReadsFail(t *testing.T) {
 	for _, tc := range []struct {
@@ -70,6 +82,9 @@ func TestAChatCheckFailsAtItsDeadlineWhileARestartsReadsFail(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			h, id := joinOneBot(t)
+			if tc.before > 0 {
+				h.b.cal = lifecycleUnrecorded{Reader: h.cal} // the pass is not recorded
+			}
 			h.admit(id)
 			if tc.before > 0 {
 				h.chat(id, "bot-device", botTexts().Consent) // the check passed before the restart
@@ -83,6 +98,51 @@ func TestAChatCheckFailsAtItsDeadlineWhileARestartsReadsFail(t *testing.T) {
 			h.advance(tc.within)
 			if leaves := h.api.callsOf("Leave"); len(leaves) != 1 {
 				t.Fatalf("Leave calls %v after the restart = %v, want one: the check has not passed", tc.within, leaves)
+			}
+		})
+	}
+}
+
+// R2: the bridge records its bot's passed chat check, with the echo's
+// sender, on the event's record when the check passes. A restarted bridge
+// that reads its own bot's pass there applies no chat-check deadline: with
+// every roster and chat read failing it keeps the bot, with no leave and no
+// failed chat_check. A pass recorded for another bot is no pass of this one,
+// so the deadline holds and the bot leaves within the reads' 10 s and R2's
+// 10 s.
+func TestARestartAfterARecordedPassKeepsTheBotWhileItsReadsFail(t *testing.T) {
+	for _, otherBot := range []bool{false, true} {
+		name := "the pass recorded for this bot"
+		if otherBot {
+			name = "a pass recorded for another bot"
+		}
+		t.Run(name, func(t *testing.T) {
+			h, id := joinOneBot(t)
+			h.inCall()
+			if got, want := h.cal.event("ev1").Pending, (calendar.Pending{Passed: id, Sender: "bot-device"}); got != want {
+				t.Fatalf("the record after the passed check = %+v, want %+v", got, want)
+			}
+			h.advance(5 * time.Minute)
+			if otherBot {
+				h.cal.change("ev1", func(e *calendar.Event) { e.Pending.Passed = "bot_other" })
+			}
+			h.api.fail(func(a *fakeAttendee) { a.participantFails, a.chatReadFails = 1000, 1000 })
+			n := len(h.link.sentOf(call.TypeChatCheck))
+			restartBridge(h)
+			h.linkUp(botPiHello(botTexts()))
+			h.advance(time.Minute)
+			var failed int
+			for _, c := range h.link.sentOf(call.TypeChatCheck)[n:] {
+				if c.ChatCheck.Result == "failed" {
+					failed++
+				}
+			}
+			leaves := len(h.api.callsOf("Leave"))
+			switch {
+			case !otherBot && (leaves != 0 || failed != 0):
+				t.Fatalf("after the restart with every read failing: Leave calls %d, failed chat_checks %d; want none: the pass is recorded", leaves, failed)
+			case otherBot && (leaves != 1 || failed != 1):
+				t.Fatalf("after the restart with every read failing: Leave calls %d, failed chat_checks %d; want one each: no pass is recorded for this bot", leaves, failed)
 			}
 		})
 	}

@@ -642,14 +642,14 @@ func TestTheLeaveReasonIsOnRecordFromBeforeTheLeaveUntilTheEndIsDecided(t *testi
 		name     string
 		kind     calendar.BotEnd
 		leave    func(h *botHarness, id string)
-		owes     calendar.Pending // what the record owes beside the reason when the bridge leaves
+		owes     calendar.Pending // what the record holds beside the reason when the bridge leaves: an owed check, or the bot's passed one
 		linkDown bool             // the link is down at the bot's end
 		newBot   bool
 	}{
 		{"the leave rule", calendar.EndLeaveRule, func(h *botHarness, _ string) {
 			h.inCall()
 			h.advanceTo(botT0.Add(33 * time.Minute))
-		}, calendar.Pending{}, false, false},
+		}, calendar.Pending{Passed: "bot_1", Sender: "bot-device"}, false, false},
 		{"a failed chat check, the link down", calendar.EndChatCheckFailed, func(h *botHarness, id string) {
 			h.admit(id)
 			h.linkDown()
@@ -661,13 +661,13 @@ func TestTheLeaveReasonIsOnRecordFromBeforeTheLeaveUntilTheEndIsDecided(t *testi
 			h.advance(2 * time.Minute)
 			h.b.leave(h.ctx, calendar.EndLinkLost)
 			h.settle()
-		}, calendar.Pending{}, true, true},
+		}, calendar.Pending{Passed: "bot_1", Sender: "bot-device"}, true, true},
 		{"a failed socket", calendar.EndSocketFailed, func(h *botHarness, _ string) {
 			h.inCall()
 			h.sockets.setClosed(true)
 			h.advance(time.Second)
 			h.advance(300 * time.Second)
-		}, calendar.Pending{}, false, true},
+		}, calendar.Pending{Passed: "bot_1", Sender: "bot-device"}, false, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			h := newBotHarness(t, botCalEvent("ev1", botT0.Add(2*time.Minute), botT0.Add(32*time.Minute)))

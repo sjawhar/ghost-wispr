@@ -902,7 +902,7 @@ func (b *bridge) deleteData(ctx context.Context, id string) {
 
 // endOf reads how a bot ended from its record, oldest event first, by the
 // spec's table of ends. own is the bridge's reason when it asked the bot to
-// leave; a restarted bridge reads it from the event's record (restoreLeave),
+// leave; a restarted bridge reads it from the event's record (restoreBot),
 // and takes the leave rule when the record names none for the bot.
 // MEETING_ENDED's remover is only in the webhook's event metadata, and a
 // removal is Done as an end of the meeting is.

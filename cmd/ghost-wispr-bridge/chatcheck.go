@@ -105,8 +105,10 @@ func (b *bridge) evalCheck(ctx context.Context, lb *liveBot, now time.Time) {
 // announceCheck acts on a decided check: the log line, the link's chat_check
 // (kept until the link takes it, so the Pi can publish call_not_recorded) and
 // call messages, and on a failure the leave (R2), whose record holds the
-// failed chat_check until a link keeps it. A passed check under long_lines
-// posts the test lines.
+// failed chat_check until a link keeps it. A passed check goes on the
+// event's record with its bot and the echo's sender, so a restart applies
+// that bot no deadline. A passed check under long_lines posts the test
+// lines.
 func (b *bridge) announceCheck(ctx context.Context, lb *liveBot) {
 	result := checkResultPassed
 	if lb.check.state == checkFailed {
@@ -120,6 +122,9 @@ func (b *bridge) announceCheck(ctx context.Context, lb *liveBot) {
 		b.writeRecord(ctx, lb.event.ID) // the owed check, when the leave has not written it
 		return
 	}
+	r := b.record(lb.event.ID)
+	r.want.Passed, r.want.Sender = lb.id, lb.check.sender
+	b.writeRecord(ctx, lb.event.ID)
 	b.sendCall(&lb.event, botInCall)
 	if b.faults.LongLines && !lb.adopted {
 		for _, n := range longLineLengths {

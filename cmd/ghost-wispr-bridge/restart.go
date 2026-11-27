@@ -69,7 +69,7 @@ func (b *bridge) restore(ctx context.Context) {
 		acted++
 		lb := newLiveBot(bt.ID, bt.Nonce, &ev, now)
 		lb.adopted, lb.state, lb.leaving = true, bt.State, leavingState(bt.State)
-		b.restoreLeave(lb)
+		b.restoreBot(lb)
 		// A bot whose record holds no event yet (one Attendee scheduled for
 		// its join_at) counts from the bridge's start, the first time this
 		// bridge knows.

@@ -515,13 +515,15 @@ func TestThePendingRecordIsWrittenAndClearedOnTheBotsCopyOfTheOccurrence(t *test
 		}
 		return out
 	}
-	const botID = "bot_Ab12Cd34Ef56Gh78"
+	const botID, sender = "bot_Ab12Cd34Ef56Gh78", "spaces/AAQAbc123/devices/42"
 	for _, p := range []Pending{
 		{Leave: EndLeaveRule, Bot: botID},
 		{Leave: EndChatCheckFailed, Bot: botID, ChatCheckFailed: true},
 		{Leave: EndLinkLost, Bot: botID},
 		{Leave: EndSocketFailed, Bot: botID, Busy: true},
 		{Busy: true, ChatCheckFailed: true},
+		{Passed: botID, Sender: sender},
+		{Leave: EndLinkLost, Bot: botID, Passed: botID},
 		{},
 	} {
 		if err := r.SetPending(ctx, second, p); err != nil {
@@ -551,8 +553,8 @@ func TestThePendingRecordIsWrittenAndClearedOnTheBotsCopyOfTheOccurrence(t *test
 	if got := read()[second]; !got.Done || got.Joins != 1 || got.Pending != owed {
 		t.Errorf("after the done mark: done %v, joins %d, pending %+v; want done, joins 1, the owed busy", got.Done, got.Joins, got.Pending)
 	}
-	if len(f.patches) != 9 {
-		t.Fatalf("%d patches, want 9 (a join, seven records and the done mark)", len(f.patches))
+	if len(f.patches) != 11 {
+		t.Fatalf("%d patches, want 11 (a join, nine records and the done mark)", len(f.patches))
 	}
 	for i, p := range f.patches {
 		if p.id != second {
@@ -587,6 +589,10 @@ func TestAnUnreadablePendingRecordMakesNoNewBotAndReplaysNothing(t *testing.T) {
 		`{"leave":"link_lost","bot":"bot 1"}`,
 		`{"leave":"link_lost","bot":"` + strings.Repeat("b", 65) + `"}`,
 		`{"chat_check":"passed"}`,
+		`{"sender":"spaces/a/devices/1"}`,
+		`{"passed":"bot 1"}`,
+		`{"passed":"bot_1","sender":"a\"b"}`,
+		`{"passed":"bot_1","sender":"` + strings.Repeat("s", 129) + `"}`,
 		(`{"leave":"link_lost","bot":"bot_1","busy":true,"pad":"` + strings.Repeat("x", 2000) + `"}`)[:1024],
 	}
 	const readable = `{"leave":"link_lost","bot":"bot_1","busy":true}`
@@ -630,7 +636,8 @@ func TestAnUnreadablePendingRecordMakesNoNewBotAndReplaysNothing(t *testing.T) {
 // (Calendar API guide "Extended properties", Limits). A record that would not
 // fit, or that is not one, is refused before it is written.
 func TestTheLongestPendingRecordFitsTheCalendarsValueLimit(t *testing.T) {
-	longest := Pending{Leave: EndChatCheckFailed, Bot: strings.Repeat("b", maxBotID), Busy: true, ChatCheckFailed: true}
+	longest := Pending{Leave: EndChatCheckFailed, Bot: strings.Repeat("b", maxBotID), Busy: true, ChatCheckFailed: true,
+		Passed: strings.Repeat("b", maxBotID), Sender: strings.Repeat("s", maxSenderID)}
 	v, err := encodePending(longest)
 	if err != nil {
 		t.Fatalf("encodePending(the longest record): %v", err)
@@ -644,6 +651,10 @@ func TestTheLongestPendingRecordFitsTheCalendarsValueLimit(t *testing.T) {
 		{Leave: EndLinkLost},
 		{Bot: "bot_1"},
 		{Leave: EndMeetingEnded, Bot: "bot_1"},
+		{Passed: "bot 1"},
+		{Sender: "spaces/a/devices/1"},
+		{Passed: "bot_1", Sender: strings.Repeat("s", maxSenderID+1)},
+		{Passed: "bot_1", Sender: `a"b`},
 	} {
 		if v, err := encodePending(p); err == nil {
 			t.Errorf("encodePending(%+v) = %q, want it refused", p, v)

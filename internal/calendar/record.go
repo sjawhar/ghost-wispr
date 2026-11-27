@@ -21,12 +21,14 @@ const (
 // maxPropertyValue is the Calendar API's bound on a property's value: "The
 // maximum size of a property's value is 1024 characters, and properties with
 // longer values will be silently truncated" (Calendar API guide "Extended
-// properties", Limits). maxBotID bounds the one free field of a pending
-// record, its bot's id (Attendee's ids are "bot_" and 16 letters and
-// digits), so the longest record is 136 characters.
+// properties", Limits). maxBotID and maxSenderID bound the free fields of a
+// pending record, its bots' ids (Attendee's ids are "bot_" and 16 letters
+// and digits) and the echo's Meet sender id, so the longest record is 352
+// characters.
 const (
 	maxPropertyValue = 1024
 	maxBotID         = 64
+	maxSenderID      = 128
 )
 
 // leaveNames name the leave reasons a pending record holds: the bridge's own
@@ -39,17 +41,20 @@ var leaveNames = map[BotEnd]string{
 }
 
 // chatCheckFailed is the one result a pending record's chat_check holds: the
-// Pi publishes call_not_recorded from a failed check alone, and a restart
-// reads a passed check again from the chat.
+// Pi publishes call_not_recorded from a failed check alone; a passed check
+// is recorded apart, as the bot whose check passed.
 const chatCheckFailed = "failed"
 
 // pendingValue is a Pending as ghostWisprPending holds it, for example
-// {"leave":"link_lost","bot":"bot_Ab12Cd34Ef56Gh78","busy":true,"chat_check":"failed"}.
+// {"leave":"link_lost","bot":"bot_Ab12Cd34Ef56Gh78","busy":true,"chat_check":"failed",
+// "passed":"bot_Ab12Cd34Ef56Gh78","sender":"spaces/AAQAbc123/devices/42"}.
 type pendingValue struct {
 	Leave     string `json:"leave,omitempty"`
 	Bot       string `json:"bot,omitempty"`
 	Busy      bool   `json:"busy,omitempty"`
 	ChatCheck string `json:"chat_check,omitempty"`
+	Passed    string `json:"passed,omitempty"`
+	Sender    string `json:"sender,omitempty"`
 }
 
 var errNotPending = errors.New("not a pending record")
@@ -87,15 +92,16 @@ func readJoins(private map[string]string) int {
 }
 
 // encodePending gives p as ghostWisprPending holds it. It refuses a record
-// that is not one: a leave with no bot or with a bot id of other than 1 to
-// maxBotID letters, digits, "_" and "-", a bot with no leave, or a reason
-// that is not one of the bridge's leaves; so every record it gives fits
-// maxPropertyValue whole.
+// that is not one: a leave or a passed check with no bot or with a bot id of
+// other than 1 to maxBotID letters, digits, "_" and "-", a bot with no leave,
+// a reason that is not one of the bridge's leaves, or a sender with no
+// passed check or of other than 1 to maxSenderID characters that JSON writes
+// as they are; so every record it gives fits maxPropertyValue whole.
 func encodePending(p Pending) (string, error) {
 	if !validPending(p) {
 		return "", errNotPending
 	}
-	v := pendingValue{Leave: leaveNames[p.Leave], Bot: p.Bot, Busy: p.Busy}
+	v := pendingValue{Leave: leaveNames[p.Leave], Bot: p.Bot, Busy: p.Busy, Passed: p.Passed, Sender: p.Sender}
 	if p.ChatCheckFailed {
 		v.ChatCheck = chatCheckFailed
 	}
@@ -122,7 +128,7 @@ func decodePending(s string) (Pending, bool) {
 	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
 		return Pending{}, false
 	}
-	p := Pending{Bot: v.Bot, Busy: v.Busy, ChatCheckFailed: v.ChatCheck == chatCheckFailed}
+	p := Pending{Bot: v.Bot, Busy: v.Busy, ChatCheckFailed: v.ChatCheck == chatCheckFailed, Passed: v.Passed, Sender: v.Sender}
 	if v.ChatCheck != "" && !p.ChatCheckFailed {
 		return Pending{}, false
 	}
@@ -140,15 +146,31 @@ func decodePending(s string) (Pending, bool) {
 }
 
 func validPending(p Pending) bool {
-	if p.Leave == 0 {
+	switch {
+	case p.Passed == "" && p.Sender != "",
+		p.Passed != "" && !validBotID(p.Passed),
+		len(p.Sender) > maxSenderID || strings.IndexFunc(p.Sender, notLiteralRune) >= 0:
+		return false
+	case p.Leave == 0:
 		return p.Bot == ""
 	}
 	_, ok := leaveNames[p.Leave]
-	return ok && p.Bot != "" && len(p.Bot) <= maxBotID && strings.IndexFunc(p.Bot, notIDRune) < 0
+	return ok && validBotID(p.Bot)
+}
+
+func validBotID(id string) bool {
+	return id != "" && len(id) <= maxBotID && strings.IndexFunc(id, notIDRune) < 0
 }
 
 func notIDRune(r rune) bool {
 	return (r < '0' || r > '9') && (r < 'a' || r > 'z') && (r < 'A' || r > 'Z') && r != '-' && r != '_'
+}
+
+// notLiteralRune: a rune JSON does not write as it is (json.Marshal escapes
+// control characters, '"', '\\', '<', '>' and '&', and non-ASCII may be
+// long), so a sender of such runes could outgrow its bound once written.
+func notLiteralRune(r rune) bool {
+	return r <= ' ' || r >= 0x7f || strings.ContainsRune(`"\<>&`, r)
 }
 
 // withDone, withJoins and withPending give a copy of private with the

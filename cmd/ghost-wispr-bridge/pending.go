@@ -97,7 +97,8 @@ func (b *bridge) writePending(ctx context.Context, id string, p calendar.Pending
 
 // writeDone writes the event's done mark. Once it lands, or the calendar no
 // longer has the event, the delete_data that waited for it runs, and the
-// leave reason, which decides nothing more, is cleared.
+// last bot's leave reason and passed check, which decide nothing more, are
+// cleared.
 func (b *bridge) writeDone(ctx context.Context, id string) {
 	b.writing[id] = true
 	cal := b.cal
@@ -117,7 +118,7 @@ func (b *bridge) writeDone(ctx context.Context, id string) {
 				b.deleteData(ctx, d.bot)
 			}
 			delete(b.deleteOwed, id)
-			b.clearLeave(id)
+			b.clearBot(id)
 			b.recordWritten(ctx, id)
 		}
 	})
@@ -140,15 +141,16 @@ func (b *bridge) recordWritten(ctx context.Context, id string) {
 	}
 }
 
-// clearLeave takes the leave reason off the event's wanted record once the
-// end it decides has taken effect: the event's done mark landed, or its next
-// bot was made. It reports whether the record changed; the caller writes it.
-func (b *bridge) clearLeave(id string) bool {
+// clearBot takes the event's last bot off its wanted record, its leave
+// reason and its passed check, once the end that bot's reason decides has
+// taken effect: the event's done mark landed, or its next bot was made. It
+// reports whether the record changed; the caller writes it.
+func (b *bridge) clearBot(id string) bool {
 	r := b.records[id]
-	if r == nil || r.want.Leave == 0 {
+	if r == nil || (r.want.Leave == 0 && r.want.Passed == "") {
 		return false
 	}
-	r.want.Leave, r.want.Bot = 0, ""
+	r.want.Leave, r.want.Bot, r.want.Passed, r.want.Sender = 0, "", "", ""
 	return true
 }
 
@@ -183,7 +185,7 @@ func (b *bridge) recordLeave(ctx context.Context, lb *liveBot, until time.Time) 
 // control it owes waits for the link, after the bridge's hello, as one no
 // link has kept. An event that owes one is done, as a busy and a failed chat
 // check each end it, so a pass does not find its busy again; and a done
-// event's leave reason, which decides nothing more, is cleared.
+// event's last bot, which decides nothing more, is cleared.
 func (b *bridge) restoreRecord(ctx context.Context, e *calendar.Event) {
 	p := e.Pending
 	if p == (calendar.Pending{}) {
@@ -199,18 +201,26 @@ func (b *bridge) restoreRecord(ctx context.Context, e *calendar.Event) {
 	switch {
 	case p.Owes() && !e.Done:
 		b.markDone(ctx, e.ID)
-	case e.Done && b.clearLeave(e.ID):
+	case e.Done && b.clearBot(e.ID):
 		b.writeRecord(ctx, e.ID)
 	}
 }
 
-// restoreLeave gives a bot a restarted bridge found the leave its event's
-// record names for it: the bridge asked it to leave before the restart, for
-// that reason, so the bot's end is decided by it, the leave is asked again
-// until Attendee takes it, and a failed chat check is not judged again.
-func (b *bridge) restoreLeave(lb *liveBot) {
+// restoreBot gives a bot a restarted bridge found what its event's record
+// names for it. A passed chat check: the check stays passed, with its echo's
+// sender, and no deadline applies to it. A leave: the bridge asked the bot
+// to leave before the restart, for that reason, so the bot's end is decided
+// by it, the leave is asked again until Attendee takes it, and a failed chat
+// check is not judged again.
+func (b *bridge) restoreBot(lb *liveBot) {
 	r := b.records[lb.event.ID]
-	if r == nil || r.held.Leave == 0 || r.held.Bot != lb.id {
+	if r == nil {
+		return
+	}
+	if r.held.Passed == lb.id {
+		lb.check.state, lb.check.sender = checkPassed, r.held.Sender
+	}
+	if r.held.Leave == 0 || r.held.Bot != lb.id {
 		return
 	}
 	lb.leaveKind, lb.leaveAsked = r.held.Leave, b.clock.Now()

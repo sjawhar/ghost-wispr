@@ -21,13 +21,16 @@ type Event struct {
 
 // Pending is what the bridge still owes for an event, on the calendar so a
 // restart of the bridge does not forget it: the reason it asked the event's
-// bot Bot to leave, and each control for the event that the Pi has not
-// received, from which the Pi publishes call_not_recorded (R2, R14).
+// bot Bot to leave, each control for the event that the Pi has not
+// received, from which the Pi publishes call_not_recorded (R2, R14), and the
+// bot whose chat check passed, so a restart applies that bot no deadline.
 type Pending struct {
 	Leave           BotEnd // EndLeaveRule, EndChatCheckFailed, EndLinkLost or EndSocketFailed; 0 when the bridge asked no bot to leave
 	Bot             string // the bot Leave is for
 	Busy            bool   // a busy for the event
 	ChatCheckFailed bool   // a chat_check with the result failed for the event
+	Passed          string // the bot whose chat check passed; "" when none
+	Sender          string // that check's echo's Meet sender id: the bot's own in the chat (R2)
 }
 
 // Owes reports whether p holds a control the Pi has not received.
