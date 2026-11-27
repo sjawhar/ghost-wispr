@@ -84,21 +84,23 @@ require_service_user() {
 
 # take_provision_lock WHAT takes the provisioning lock, PROVISION_LOCK, for the rest of this run, and
 # writes WHAT, with this run's PID, as its holder. One provisioning run, or the detached join that a
-# run starts, holds it at a time: a run while another holds it fails, names the holder, and changes
-# nothing; when the named holder has exited, it says so. The join takes the lock when its run ends,
-# and holds it to its own end (GPT-6.1 Sol's review of #203, round 2: a second run removed the
-# serve-apply of a join still waiting in its re-authentication). The lock's descriptor is not this
-# shell's: a holder process, flock -o around tail --pid, holds it and ends within 0.1 s of this run,
-# so no command that this run starts inherits it, and none that outlives the run keeps the lock
-# (round 3: a hung read inherited the descriptor and kept the lock after its run was killed). A run
-# waits up to 2 s for the lock, so a run that starts just after another ended gets it.
+# run starts, holds it at a time: a run while another holds it waits up to 2 s, then fails, names
+# the holder, and changes nothing; when the named holder has exited, it says so. The join takes the
+# lock when its run ends, and holds it to its own end (GPT-6.1 Sol's review of #203, round 2: a
+# second run removed the serve-apply of a join still waiting in its re-authentication).
+# The lock's descriptor, 9, is this shell's own, so the lock lives exactly as long as this run: there
+# is no holder process that can end before the run, nor a PID to poll (round 4: the holder of round
+# 3 died of SIGPIPE when the run closed its pipe, and freed the lock while the run lived). The
+# commands that can block on another program, sudo, systemctl and timeout (which runs each tailscale
+# call), run through the wrappers below, and the google-id-token call likewise: each closes 9 for
+# the command, and, when it runs in a subshell of this run, such as a $(...) or a part of a
+# pipeline, for that whole subshell, which would otherwise hold 9 while it waits. So none of them,
+# should it outlive the run, keeps the lock (round 3: a hung read kept it after its run was killed).
+# The other commands are local filters, such as jq and awk, which end at once.
 take_provision_lock() {
-  local answer='' holder
-  # shellcheck disable=SC2016 # sh expands "$1", this run's PID, which it gets as its argument.
-  exec 8< <(flock -w 2 -o "$PROVISION_LOCK" sh -c 'echo held; exec tail --pid="$1" -s 0.1 -f /dev/null' sh "$$" 2>/dev/null)
-  read -r -t 10 answer <&8 || answer=''
-  exec 8<&-
-  if [[ $answer != held ]]; then
+  local holder
+  exec 9>>"$PROVISION_LOCK" || fail "cannot open the provisioning lock $PROVISION_LOCK: nothing was changed"
+  if ! flock -w 2 9; then
     holder=$(cat -- "$PROVISION_LOCK" 2>/dev/null) || holder=
     if [[ $holder =~ ,\ PID\ ([0-9]+)$ && ! -d /proc/${BASH_REMATCH[1]} ]]; then
       holder="held by a process that exited: $holder"
@@ -106,6 +108,20 @@ take_provision_lock() {
     fail "another provisioning run holds $PROVISION_LOCK (${holder:-it names no holder}): nothing was changed; run provision.sh again once it has ended"
   fi
   printf '%s, PID %s\n' "$1" "$$" >"$PROVISION_LOCK"
+  sudo() { without_lock sudo "$@"; }
+  # shellcheck disable=SC2032 # sudo systemctl runs the program as root, not this wrapper.
+  systemctl() { without_lock systemctl "$@"; }
+  timeout() { without_lock timeout "$@"; }
+}
+
+# without_lock COMMAND ARGUMENT... runs COMMAND without the provisioning lock's descriptor 9. In a
+# subshell of the run ($BASHPID is not $$), it first closes 9 for the whole subshell, which is its
+# own process: the run's shell keeps 9.
+without_lock() {
+  if ((BASHPID != $$)); then
+    exec 9>&-
+  fi
+  command "$@" 9>&-
 }
 
 # refuse_input fails while standard input holds data, such as the credential bundle that an older
@@ -393,11 +409,14 @@ if [ -n "$status" ] && printf '%s' "$status" | jq -e "$status_filter" >/dev/null
 else
   read_rc=0
   state=$(timeout --kill-after=5s "${call_timeout}s" systemctl --user --machine=ghost-wispr@ is-active ghost-wispr.service 2>/dev/null) || read_rc=$?
+  # The exit status first: only exit 3, which is-active gives for a unit that is not active, with
+  # exactly "inactive" lets the reset go on. A line from a read that timed out (124, 137) or failed
+  # is no answer (Sol's review of #203, round 4: "inactive" then a stall reset Serve).
   case $read_rc:$state in
-    *:inactive) ;;
+    3:inactive) ;;
     124:* | 137:*) why="the state of ghost-wispr.service did not come within $call_timeout s, and /api/status gave no status" ;;
-    *:) why="the state of ghost-wispr.service could not be read (systemctl exit $read_rc), and /api/status gave no status" ;;
-    *) why="ghost-wispr.service is $state, and /api/status gave no status" ;;
+    0:?* | 3:?*) why="ghost-wispr.service is $state, and /api/status gave no status" ;;
+    *) why="the state of ghost-wispr.service could not be read (systemctl exit $read_rc), and /api/status gave no status" ;;
   esac
 fi
 if [ -n "$why" ]; then
@@ -825,10 +844,13 @@ put_file "$script_dir/update.sh" "$DEPLOY_DIR/update.sh" 0755 || fail "could not
 put_file "$script_dir/pi-lib.sh" "$DEPLOY_DIR/pi-lib.sh" 0755 || fail "could not install pi-lib.sh"
 put_file "$script_dir/pi.env" "$DEPLOY_DIR/pi.env" 0644 || fail "could not install pi.env"
 
+# sudo runs the systemctl program here, as root, not take_provision_lock's wrapper of it.
 if $groups_changed; then
+  # shellcheck disable=SC2033
   sudo systemctl restart "user@$(id -u "$SERVICE_USER").service"
 fi
 sudo loginctl enable-linger "$SERVICE_USER"
+# shellcheck disable=SC2033
 sudo systemctl start "user@$(id -u "$SERVICE_USER").service"
 systemctl --user daemon-reload
 systemctl --user enable --now ghost-wispr-update.timer
@@ -862,7 +884,8 @@ if jq -e --arg hostname "$TAILSCALE_HOSTNAME" '
 fi
 
 readonly token_audience="api.tailscale.com/$PI_TAILNET_CLIENT_ID"
-id_token=$(env \
+# A network call, so neither it nor its subshell holds the lock's descriptor (take_provision_lock).
+id_token=$(exec 9>&-; env \
   GOOGLE_API_USE_CLIENT_CERTIFICATE=false \
   "$DEPLOY_DIR/ghost-wispr" google-id-token --credentials "$DEPLOY_DIR/google-credentials.json" --audience "$token_audience")
 [[ "$id_token" != *$'\n'* && "$id_token" == *.*.* ]] || fail "google-id-token did not return a JWT"
@@ -902,18 +925,21 @@ join_unit="ghost-wispr-tailnet-join-$RUN_ID"
 # with each line of serve.conf as its arguments: the join runs after P2's command has removed the
 # release's directory, so it reads no file of it. First the join takes the provisioning lock, which
 # it gets once this run ends, and names itself and its PID its holder, so no later run starts before
-# it ends. Its RuntimeMaxSec keeps a join that hangs from holding the lock for good. It removes the
-# token as soon as tailscale up ends, and its ExecStopPost removes the run's directory, the token's
-# among its files, whatever stopped the unit: its end, a failure, a kill or its RuntimeMaxSec (Sol's
-# review of #203, round 3: a killed or timed-out join left its token).
+# it ends. The lock is on the join's own shell, descriptor 9, as in take_provision_lock, and each
+# command the join starts gets 9>&-: none of them keeps the lock, should it outlive the join, and
+# the lock does not rest on systemd's stop of the unit's cgroup. Its RuntimeMaxSec keeps a join that
+# hangs from holding the lock for good. It removes the token as soon as tailscale up ends, and its
+# ExecStopPost removes the run's directory, the token's among its files, whatever stopped the unit:
+# its end, a failure, a kill or its RuntimeMaxSec (Sol's review of #203, round 3: a killed or
+# timed-out join left its token).
 join_command="exec 9>>$PROVISION_LOCK && flock 9 || exit 1;"
 join_command+=" printf '%s, PID %s\\n' 'the join unit $join_unit of provision.sh run $RUN_ID' \$\$ >$PROVISION_LOCK;"
 join_command+=" tailscale up --force-reauth --client-id='$PI_TAILNET_CLIENT_ID?ephemeral=false&preauthorized=true'"
-join_command+=" --id-token=file:$JOIN_TOKEN --advertise-tags=tag:ghost-wispr --hostname=ghost-wispr --ssh --accept-routes=false;"
+join_command+=" --id-token=file:$JOIN_TOKEN --advertise-tags=tag:ghost-wispr --hostname=ghost-wispr --ssh --accept-routes=false 9>&-;"
 join_command+=" rc=\$?; rm -f $JOIN_TOKEN;"
 join_command+=" if [ \$rc -eq 0 ]; then"
-join_command+=" /bin/sh $SERVE_APPLY $STATUS_URL ${serve_words[*]} || rc=\$?;"
-join_command+=" if /bin/sh $JOIN_ROUTE_CHECK; then tailscale set --accept-routes || rc=\$?; else rc=\$?; fi;"
+join_command+=" /bin/sh $SERVE_APPLY $STATUS_URL ${serve_words[*]} 9>&- || rc=\$?;"
+join_command+=" if /bin/sh $JOIN_ROUTE_CHECK 9>&-; then tailscale set --accept-routes 9>&- || rc=\$?; else rc=\$?; fi;"
 join_command+=" fi; exit \$rc"
 printf 'ghost-wispr provision: starting the tagged tailnet join as %s\n' "$join_unit"
 # systemd-run(1): the service manager expands ${NAME} and $$ in the command's arguments unless

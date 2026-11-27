@@ -266,11 +266,13 @@ restarts the recorder, and a restart ends a conversation that is being recorded.
    input. One provisioning run at a time: each run, with the join it starts, holds
    `/run/lock/ghost-wispr-provision.lock`, and a second run waits up to 2 s, then fails, names the
    run or the join that holds it, and changes nothing; when that holder has ended, it says the lock
-   is held by a process that exited. No command a run starts holds the lock, so none that outlives
-   its run keeps it. It refuses a directory whose files do not match its
-   `manifest.json`, such as a checkout's `deploy/pi/`. Before it changes anything, it refuses while
-   the environment of `ghost-wispr`'s user manager sets `GHOST_WISPR_CONFIG` or an Envoy variable,
-   which the recorder would inherit ("Turn on the meeting voice", step 1). Then it:
+   is held by a process that exited. The run's own shell holds the lock for the whole run, and
+   each command of the run that can outlive it, such as `sudo` or a tailscale call, runs without
+   the lock's descriptor, so none that outlives its run keeps it. It refuses a directory whose
+   files do not match its `manifest.json`, such as a checkout's `deploy/pi/`. Before it changes
+   anything, it refuses while the environment of `ghost-wispr`'s user manager sets
+   `GHOST_WISPR_CONFIG` or an Envoy variable, which the recorder would inherit ("Turn on the meeting
+   voice", step 1). Then it:
 
    - installs `libportaudio2`, `ffmpeg`, `lame`, `jq` and `curl`;
    - writes `/opt/ghost-wispr/google-credentials.json` and `/opt/ghost-wispr/certificate_config.json`
@@ -323,7 +325,8 @@ restarts the recorder, and a restart ends a conversation that is being recorded.
    unit it started. Its read of whether the Pi is joined ends after 30 s too. The SSH session can
    end while Tailscale re-authenticates (exit 255). The join unit first takes
    `/run/lock/ghost-wispr-provision.lock`, which it gets once `provision.sh` has ended, and holds it
-   to its own end; its `RuntimeMaxSec` of 15 minutes keeps a join that hangs from holding it for
+   to its own end on its own shell; each command the join starts runs without the lock's
+   descriptor. Its `RuntimeMaxSec` of 15 minutes keeps a join that hangs from holding it for
    good. The join's token, route check and `serve-apply` are in the run's directory under
    `/run/ghost-wispr-join`, a tmpfs that a boot clears. The join removes the token as soon as
    `tailscale up` ends, and the unit's `ExecStopPost` removes the run's directory whatever stopped
