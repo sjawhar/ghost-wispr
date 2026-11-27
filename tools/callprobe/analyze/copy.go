@@ -30,7 +30,7 @@ type Copy struct {
 	Found   bool          // a copy stands out of the cross-correlation's noise at a lag held
 	Lag     time.Duration // the recording holds the copy this much later (Found only)
 	LevelDB float64       // the copy (Found only): with a Second told, the first path's of the two fitted at once
-	FloorDB float64       // the rest of the recording, its noise floor (not Silent): with a Second told, what neither path explains
+	FloorDB float64       // the noise floor, which bounds each path at the lags held (pathFloor; not Silent): with a Second told, each path at the lags searched for it, with what neither path explains
 	Second  *SecondCopy   // with CopyOptions.SecondAfter, when the first copy was found above the floor
 }
 
@@ -77,11 +77,14 @@ const heldShare = 0.5
 // whose copy rec holds there, so that a louder copy rec holds in part is not
 // passed over for a quieter one it holds whole. The copy's level is the
 // energy the path carries, so an echo spread over several paths reads as
-// their sum, and the noise floor is the energy of rec the path does not
-// explain, which an echo the fit misses (one that changes, or is not
-// linear) raises. The floor bounds a copy only at the lags held, Held; with
-// no lag held, or when the files overlap too little for a copy as loud as
-// the floor to stand out at each lag held, the copy is Unknown.
+// their sum. The noise floor bounds each path of o.Path at the lags held
+// with what of rec the fitted path does not explain (pathFloor): each copy
+// at a lag held that the path misses raises it to the copy's level,
+// wherever in rec its sound is, as an echo the fit misses (one that
+// changes, or is not linear) raises it. The floor bounds a copy only at the
+// lags held, Held; with no lag held, or when the files overlap too little
+// for a copy as loud as the floor to stand out at each lag held, the copy
+// is Unknown.
 func FindCopy(ref, rec Audio, o CopyOptions) (Copy, error) {
 	if o.MaxLag < 0 || o.Path <= 0 || o.SecondAfter < 0 || (o.SecondAfter > 0 && o.SecondAfter < o.Path) {
 		return Copy{}, errors.New("max-lag must be non-negative, path positive, and second-after 0 or at least the path")
@@ -103,11 +106,12 @@ func FindCopy(ref, rec Audio, o CopyOptions) (Copy, error) {
 	}
 	r := correlate(x, y, -k, k)
 	// The lags held, each run of them as the first lag and the last; among
-	// them the loudest copy's, and the least energy held, which the floor's
-	// bound needs. A lag held also overlaps by four path lengths, the least
-	// a path is fitted over.
+	// them the loudest copy's; and the energy held at each and the least of
+	// it, which the floor and the floor's bound need. A lag held also
+	// overlaps by four path lengths, the least a path is fitted over.
 	var runs [][2]int
 	best := loudest{gain: -1}
+	heldAt := make([]float64, 2*k+1) // from lag -k
 	least, searched := math.Inf(1), 0
 	eachHeld(x, len(y), -k, k, func(l int, held float64, overlaps int) {
 		if held < heldShare*whole || overlaps < 4*taps {
@@ -119,6 +123,7 @@ func FindCopy(ref, rec Audio, o CopyOptions) (Copy, error) {
 			runs = append(runs, [2]int{l, l})
 		}
 		searched++
+		heldAt[l+k] = held
 		least = min(least, held)
 		best.offer(l, r[l+k], held)
 	})
@@ -155,7 +160,15 @@ func FindCopy(ref, rec Audio, o CopyOptions) (Copy, error) {
 		fitted += h * cross[i]
 	}
 	rest := max(recEnergy-fitted, 0)
-	c := Copy{FloorDB: 10 * math.Log10(rest/refEnergy), Held: make([]LagRange, len(runs))}
+	left := filter(x, path, first, len(y))
+	for i, v := range y {
+		left[i] = v - left[i] // the recording less the copy
+	}
+	var floor float64
+	for _, run := range runs {
+		floor = max(floor, pathFloor(len(x), left, heldAt[run[0]+k:run[1]+k+1], run[0], taps))
+	}
+	c := Copy{FloorDB: 10 * math.Log10(floor), Held: make([]LagRange, len(runs))}
 	for i, run := range runs {
 		c.Held[i] = LagRange{ref.At(run[0]) - ref.Start, ref.At(run[1]) - ref.Start}
 	}
@@ -177,6 +190,46 @@ func FindCopy(ref, rec Audio, o CopyOptions) (Copy, error) {
 // overlap is where x overlaps y when y holds x lag samples later: x[from:to].
 func overlap(x, y []float32, lag int) (from, to int) {
 	return max(0, -lag), min(len(x), len(y)-lag)
+}
+
+// pathFloor is the noise floor that bounds each path of up to taps lags
+// among the lags from lo, at which the recording holds the energy held[i]
+// of the copy of a reference of nx samples at lag lo+i: the greatest, over
+// each such path, of the energy of rest, the recording less what the fit
+// explains, at the samples that a copy at the path's lags reaches, against
+// the least energy held at those lags. A copy at those lags that the fit
+// does not explain puts all the energy it holds into rest at those
+// samples, wherever in the recording its sound is, so the floor is at least
+// its level; and noise alone puts in its own level. A copy at the lags l
+// reaches the samples from l to nx+l-1: one lag later, each end of a path's
+// samples is one sample later, or stays.
+func pathFloor(nx int, rest []float32, held []float64, lo, taps int) float64 {
+	w := min(taps, len(held))
+	clamp := func(i int) int { return min(max(i, 0), len(rest)) }
+	var worst, before, upTo float64 // before and upTo, the energy of rest before each end of the path's samples
+	from, to := 0, 0
+	var least []int // the path's lags from the one held least, each held less than those after it, by index into held
+	for i, h := range held {
+		for len(least) > 0 && held[least[len(least)-1]] >= h {
+			least = least[:len(least)-1]
+		}
+		least = append(least, i)
+		f := i - w + 1 // the path's first lag, from lo; its last is i
+		if f < 0 {
+			continue
+		}
+		if least[0] < f {
+			least = least[1:]
+		}
+		for end := clamp(lo + f); from < end; from++ {
+			before += float64(rest[from]) * float64(rest[from])
+		}
+		for end := clamp(nx + lo + i); to < end; to++ {
+			upTo += float64(rest[to]) * float64(rest[to])
+		}
+		worst = max(worst, (upTo-before)/held[least[0]])
+	}
+	return worst
 }
 
 // fitPath fits, by least squares, the echo path whose cross-correlations
@@ -220,10 +273,11 @@ const minOwn = 0.5
 // that either path reaches with a sample of the reference, the reference
 // taken as silence outside its own: from the first copy's start to the
 // second's end, past the reference's end, which is where the copy of a
-// sound at the reference's end is. The levels and the floor are the
-// energies of each path's copy and of what neither explains, over those
-// samples, against the reference's energy that the recording holds at
-// each copy's lag.
+// sound at the reference's end is. The levels are the energies of each
+// path's copy over those samples, against the reference's energy that the
+// recording holds at each copy's lag. The floor bounds each path at the
+// lags searched, from lag+after, with what neither path explains
+// (pathFloor): a copy there past the fit's samples raises it too.
 //
 // The second copy is UNKNOWN, with no level and the floor no bound on it,
 // when the fit cannot tell it: when the recording holds so little of the
@@ -244,11 +298,13 @@ func findSecond(ref, rec Audio, c *Copy, k, lag, first int, h []float64, after i
 		left[i] = v - left[i] // the recording less the first copy
 	}
 	r := correlate(x, left, lo, k)
-	// The loudest copy from lag+after, and the least energy the recording
-	// holds of the reference's copy at any of those lags, which the floor's
-	// bound needs.
+	// The loudest copy from lag+after; and the energy the recording holds of
+	// the reference's copy at each of those lags and the least of it, which
+	// the floor and the floor's bound need.
 	best, least := loudest{lag: lag + after, gain: -1}, math.Inf(1)
+	heldAt := make([]float64, 0, k-lag-after+1)
 	eachHeld(x, len(y), lag+after, k, func(l int, held float64, _ int) {
+		heldAt = append(heldAt, held)
 		least = min(least, held)
 		if held > 0 {
 			best.offer(l, r[l-lo], held)
@@ -314,7 +370,11 @@ func findSecond(ref, rec Audio, c *Copy, k, lag, first int, h []float64, after i
 	}
 	unexplained := max(energy(y[m0:m1])-fitted, 0)
 	c.LevelDB = 10 * math.Log10(pathEnergy(0)/refEnergy)
-	c.FloorDB = 10 * math.Log10(unexplained/refEnergy)
+	rest, later := filter(x, paths[:taps], first, len(y)), filter(x, paths[taps:], second, len(y))
+	for i, v := range y {
+		rest[i] = v - rest[i] - later[i] // the recording less both copies
+	}
+	c.FloorDB = 10 * math.Log10(pathFloor(len(x), rest, heldAt, lag+after, taps))
 	copied := pathEnergy(1)
 	if copied <= foundFactor*noise*unexplained {
 		return nil

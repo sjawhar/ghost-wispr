@@ -531,6 +531,112 @@ func TestTheEchoFloorCoversOnlyTheLagsTheRecordingHolds(t *testing.T) {
 	}
 }
 
+// readsAtLeast fails the test unless the reading in out bounds the echo at
+// least, for c-once: with the level its key level gives, or else with the
+// floor its key floor gives. A reading of neither bounds it with no number,
+// and fails too: the analysis must measure what it was given.
+func readsAtLeast(t *testing.T, out, level, floor string, least float64) {
+	t.Helper()
+	l, err := parseNumber(out, level)
+	f, floorErr := parseNumber(out, floor)
+	if (err != nil || l < least) && (floorErr != nil || f < least) {
+		t.Errorf("%s=%v (%v) and %s=%v (%v): the reading bounds the echo below %.1f dB:\n%s", level, l, err, floor, f, floorErr, least, out)
+	}
+}
+
+// c-once, from Sol's review of PR 202
+// (TestReviewPlainEchoCountsLateDistributedPath, and its control
+// TestReviewPlainEchoControlHoldsDistributedPath): each copy at the lags held
+// that the fitted path does not explain is in the noise floor, wherever in
+// the recording its sound is. The reference is 1 s, silent but for one
+// sample of 0.5 at 912.5 ms. The recording of 1.5 s holds a path of 160 lags
+// from 300 ms, each at gain 1/1024, which carries 160/1024² of the
+// reference's energy, -38.2 dB; and, but in the control, a copy 100 ms later
+// at gain 1/512, -54.2 dB, the loudest by its gain. The path's sound is past
+// the samples where the copy's lag overlaps the reference, which were the
+// floor's: echo_db=-54.2 with a floor of -144.2 dB read the echo as the copy
+// alone, and passed c-once's 46 dB. The echo or its floor reads the path's
+// level within 1 dB; the path alone reads at least -46 dB.
+func TestTheEchoFloorHoldsAPathPastTheLoudestCopysOverlap(t *testing.T) {
+	const rate = 16000
+	source := make([]float64, rate)
+	source[14600] = 0.5
+	path := 10 * math.Log10(160.0/(1024*1024))
+	for _, tc := range []struct {
+		name     string
+		withCopy bool    // the copy 100 ms later
+		least    float64 // the least the echo or its floor reads
+	}{
+		{"a path past the loudest copy's overlap", true, path - 1},
+		{"control: the path alone", false, -46},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			rec := make([]float64, 3*rate/2)
+			if tc.withCopy {
+				addCopy(rec, source, rate/10, 1.0/512)
+			}
+			for j := range 160 {
+				addCopy(rec, source, 3*rate/10+j, 1.0/1024)
+			}
+			out, errOut, code := callprobe(t, "", "analyze", "echo", "-max-lag", "500ms",
+				"-ref", writeWAV(t, dir, "reference.wav", rate, source), "-in", writeWAV(t, dir, "recording.wav", rate, rec))
+			if code != 0 {
+				t.Fatalf("analyze echo exited %d: %s%s", code, out, errOut)
+			}
+			t.Logf("%s", out)
+			readsAtLeast(t, out, "echo_db", "noise_floor_db", tc.least)
+		})
+	}
+}
+
+// c-once: the same for echo -second-after, whose floor bounds each copy at
+// the lags searched after the direct one. The reference is that of
+// TestTheEchoFloorHoldsAPathPastTheLoudestCopysOverlap; the recording holds
+// the direct copy 100 ms later at gain 0.5, the path of 160 lags from 300 ms
+// at gain 1/2048 each, -38.2 dB against the direct copy, and, but in the
+// control, a copy 125 ms later at gain 1/1024, -54.2 dB, the loudest after
+// the direct one by its gain. The two paths' fit ended where the second
+// path reaches the reference's end, before the path's sound:
+// copy_vs_direct_db=-54.2 read the copy alone. The copy or the floor reads
+// the path's level within 1 dB; the path alone reads at least -46 dB.
+func TestTheSecondCopysFloorHoldsAPathPastTheFit(t *testing.T) {
+	const rate = 16000
+	source := make([]float64, rate)
+	source[14600] = 0.5
+	path := 10 * math.Log10(160.0/(2048*2048)/0.25)
+	for _, tc := range []struct {
+		name     string
+		withCopy bool    // the copy 125 ms later
+		least    float64 // the least the copy or its floor reads, against the direct copy
+	}{
+		{"a path past the second copy's fit", true, path - 1},
+		{"control: the path alone", false, -46},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			rec := make([]float64, 3*rate/2)
+			addCopy(rec, source, rate/10, 0.5)
+			if tc.withCopy {
+				addCopy(rec, source, rate/8, 1.0/1024)
+			}
+			for j := range 160 {
+				addCopy(rec, source, 3*rate/10+j, 1.0/2048)
+			}
+			out, errOut, code := callprobe(t, "", "analyze", "echo", "-max-lag", "500ms", "-second-after", "20ms",
+				"-ref", writeWAV(t, dir, "reference.wav", rate, source), "-in", writeWAV(t, dir, "recording.wav", rate, rec))
+			if code != 0 {
+				t.Fatalf("analyze echo exited %d: %s%s", code, out, errOut)
+			}
+			t.Logf("%s", out)
+			if got := number(t, out, "direct_delay_ms"); math.Abs(got-100) > 2 {
+				t.Errorf("direct_delay_ms=%v, want 100 within 2 ms:\n%s", got, out)
+			}
+			readsAtLeast(t, out, "copy_vs_direct_db", "floor_vs_direct_db", tc.least)
+		})
+	}
+}
+
 // c-once: the echo is the loudest copy at the lags held, not the one the
 // cross-correlation shows most of. In a recording of the same 1 s as the
 // reference, a copy 50 ms later at gain 0.05, held 95 %, correlates more
