@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 )
@@ -300,5 +301,199 @@ func TestAControlWithoutExactlyItsRowIsNotWritten(t *testing.T) {
 				t.Errorf("MarshalJSON wrote %s; want an error", b)
 			}
 		})
+	}
+}
+
+// From Sol's review of PR 202 (TestReviewControlRejectsMalformedKnownRows):
+// a known row that decodes but breaks C2's table is refused, and a valid one,
+// the control, is taken.
+func TestParseControlRefusesAKnownRowOutsideC2(t *testing.T) {
+	if _, err := ParseControl([]byte(`{"type":"state","state":"listening","closings":0,"pause_source":"chat","hears_room":false}`)); err != nil {
+		t.Fatalf("valid state control refused: %v", err)
+	}
+	for _, body := range []string{
+		`{"type":"state"}`,
+		`{"type":"state","state":"unknown","closings":-1,"pause_source":"chat","hears_room":false}`,
+		`{"type":"cancel","input":"office","generation":0}`,
+		`{"type":"chat_check","result":"maybe","event":"event1"}`,
+		`{"type":"pause","chat_time":"not-a-time"}`,
+		`{"type":"hello","build":"unknown","link_versions":[0,-1]}`,
+	} {
+		t.Run(body, func(t *testing.T) {
+			if c, err := ParseControl([]byte(body)); err == nil {
+				t.Fatalf("malformed known control accepted: %+v", c)
+			}
+		})
+	}
+}
+
+// The parts of the messages below that C2's table allows.
+const (
+	validState  = `"state":{"state":"listening","closings":0,"pause_source":"office_control","hears_room":false}`
+	validBridge = `"paused":false,"pause_chat_time":"","event":null,"bot_state":""`
+	validTexts  = `"texts":{"bot_name":"b","consent":"c","paused_open":"po","paused_closed":"pc","starts_paused":"sp",` +
+		`"starts_closed":"sc","resume_hint":"rh","office_only":"oo","resumed":"r","lost":"l"}`
+)
+
+// TestParseControlRefusesEachRowOutsideC2 holds C2's table for each row: a
+// field it lacks, a null where C2 has a value, a value outside an enum, a
+// count below its bound, a time that is not RFC 3339, an empty id, and an
+// event that ends before it starts are each refused. json.Unmarshal takes
+// each of them, so it fails if ParseControl checks no more than the JSON
+// types: a pong without paused, for one, would read as not paused.
+func TestParseControlRefusesEachRowOutsideC2(t *testing.T) {
+	// The controls: each part above is taken.
+	for _, body := range []string{
+		`{"type":"hello","build":"release","link_versions":[1],` + validTexts + `,"jitter_target_ms":80,` + validState + `}`,
+		`{"type":"hello","build":"callfault","link_versions":[1,2],` + validBridge + `}`,
+	} {
+		if _, err := ParseControl([]byte(body)); err != nil {
+			t.Fatalf("ParseControl(%s): %v", body, err)
+		}
+	}
+	for _, tc := range []struct{ name, body string }{
+		{"a hello with no build", `{"type":"hello","link_versions":[1],` + validBridge + `}`},
+		{"a hello of another build", `{"type":"hello","build":"debug","link_versions":[1],` + validBridge + `}`},
+		{"a hello with no link versions", `{"type":"hello","build":"release","link_versions":[],` + validBridge + `}`},
+		{"a hello whose link versions are null", `{"type":"hello","build":"release","link_versions":null,` + validBridge + `}`},
+		{"a hello with link version 0", `{"type":"hello","build":"release","link_versions":[0,1],` + validBridge + `}`},
+		{"a hello with both sides' fields", `{"type":"hello","build":"release","link_versions":[1],"texts":null,"jitter_target_ms":80,` + validState +
+			`,"paused":false,"pause_chat_time":"","event":null,"bot_state":"in_call"}`},
+		{"the Pi's hello with no texts", `{"type":"hello","build":"release","link_versions":[1],"jitter_target_ms":80,` + validState + `}`},
+		{"the Pi's hello whose texts lack a notice", `{"type":"hello","build":"release","link_versions":[1],"jitter_target_ms":80,` + validState + `,` +
+			`"texts":{"bot_name":"b","consent":"c","paused_open":"po","paused_closed":"pc","starts_paused":"sp","starts_closed":"sc","resume_hint":"rh","office_only":"oo","resumed":"r"}}`},
+		{"the Pi's hello with no jitter target", `{"type":"hello","build":"release","link_versions":[1],"texts":null,` + validState + `}`},
+		{"the Pi's hello with a jitter target of 0", `{"type":"hello","build":"release","link_versions":[1],"texts":null,"jitter_target_ms":0,` + validState + `}`},
+		{"the Pi's hello whose state is null", `{"type":"hello","build":"release","link_versions":[1],"texts":null,"jitter_target_ms":80,"state":null}`},
+		{"the Pi's hello in a state outside C2", `{"type":"hello","build":"release","link_versions":[1],"texts":null,"jitter_target_ms":80,` +
+			`"state":{"state":"muted","closings":0,"pause_source":"none","hears_room":true}}`},
+		{"the bridge's hello with no paused", `{"type":"hello","build":"release","link_versions":[1],"pause_chat_time":"","event":null,"bot_state":""}`},
+		{"the bridge's hello with a pause time that is no time", `{"type":"hello","build":"release","link_versions":[1],"paused":true,"pause_chat_time":"15:04","event":null,"bot_state":""}`},
+		{"the bridge's hello with a bot state outside C2", `{"type":"hello","build":"release","link_versions":[1],"paused":false,"pause_chat_time":"","event":` + testEventJSON + `,"bot_state":"waiting"}`},
+		{"the bridge's hello with an event with no id", `{"type":"hello","build":"release","link_versions":[1],"paused":false,"pause_chat_time":"",` +
+			`"event":{"id":"","organizer":"lead@example.com","start":"2026-11-26T15:00:00Z","end":"2026-11-26T16:00:00Z"},"bot_state":"in_call"}`},
+		{"state with no closings", `{"type":"state","state":"recording","pause_source":"none","hears_room":true}`},
+		{"state whose hears_room is null", `{"type":"state","state":"recording","closings":0,"pause_source":"none","hears_room":null}`},
+		{"state with closings below 0", `{"type":"state","state":"recording","closings":-1,"pause_source":"none","hears_room":true}`},
+		{"state in a state outside C2", `{"type":"state","state":"paused","closings":0,"pause_source":"none","hears_room":true}`},
+		{"state with a pause source outside C2", `{"type":"state","state":"listening","closings":0,"pause_source":"phone","hears_room":true}`},
+		{"post with no key", `{"type":"post"}`},
+		{"post with a key outside C2", `{"type":"post","key":"starts_open"}`},
+		{"cancel with no generation", `{"type":"cancel","input":"voice"}`},
+		{"cancel of an input outside C2", `{"type":"cancel","input":"office","generation":1}`},
+		{"ping with no clock", `{"type":"ping","seq":1}`},
+		{"ping whose seq is null", `{"type":"ping","seq":null,"pi_clock_us":2}`},
+		{"pong with no paused", `{"type":"pong","seq":1,"pi_clock_us":2,"bridge_clock_us":3,"pause_chat_time":""}`},
+		{"pong with a pause time that is no time", `{"type":"pong","seq":1,"pi_clock_us":2,"bridge_clock_us":3,"paused":true,"pause_chat_time":"later"}`},
+		{"call with a bot state outside C2", `{"type":"call","event":` + testEventJSON + `,"bot_state":"gone"}`},
+		{"call whose event is null", `{"type":"call","event":null,"bot_state":"joining"}`},
+		{"call whose event has no end", `{"type":"call","event":{"id":"evt-0001","organizer":"lead@example.com","start":"2026-11-26T15:00:00Z"},"bot_state":"joining"}`},
+		{"call whose event has no organizer", `{"type":"call","event":{"id":"evt-0001","organizer":"","start":"2026-11-26T15:00:00Z","end":"2026-11-26T16:00:00Z"},"bot_state":"joining"}`},
+		{"call whose event ends before it starts", `{"type":"call","event":{"id":"evt-0001","organizer":"lead@example.com","start":"2026-11-26T16:00:00Z","end":"2026-11-26T15:00:00Z"},"bot_state":"joining"}`},
+		{"chat_check with no event", `{"type":"chat_check","result":"passed"}`},
+		{"chat_check naming no event", `{"type":"chat_check","result":"passed","event":""}`},
+		{"chat_check with a result outside C2", `{"type":"chat_check","result":"maybe","event":"evt-0001"}`},
+		{"pause with no time", `{"type":"pause"}`},
+		{"pause with an empty time", `{"type":"pause","chat_time":""}`},
+		{"resume with a time that is not RFC 3339", `{"type":"resume","chat_time":"2026-11-26 15:12:00"}`},
+		{"busy whose event has no id", `{"type":"busy","event":{"organizer":"lead@example.com","start":"2026-11-26T15:00:00Z","end":"2026-11-26T16:00:00Z"}}`},
+		{"busy whose event has no start", `{"type":"busy","event":{"id":"evt-0001","organizer":"lead@example.com","start":"0001-01-01T00:00:00Z","end":"2026-11-26T16:00:00Z"}}`},
+		{"rate_fault with no rate", `{"type":"rate_fault"}`},
+		{"rate_fault below 0", `{"type":"rate_fault","samples_per_second":-1}`},
+		{"roster whose participants are null", `{"type":"roster","participants":null}`},
+		{"roster with a participant with no name", `{"type":"roster","participants":[{"index":0,"id":"spaces/a/devices/1"}]}`},
+		{"roster with a participant with no id", `{"type":"roster","participants":[{"index":0,"id":"","name":"Ada"}]}`},
+		{"roster with one index twice", `{"type":"roster","participants":[{"index":3,"id":"spaces/a/devices/1","name":"Ada"},{"index":3,"id":"spaces/a/devices/2","name":"Grace"}]}`},
+		{"join with no index", `{"type":"join","id":"spaces/a/devices/3","name":"Grace"}`},
+		{"join with no id", `{"type":"join","index":3,"id":"","name":"Grace"}`},
+		{"leave with no id", `{"type":"leave","index":3,"name":"Grace"}`},
+		{"chat with no text", `{"type":"chat","sender_id":"spaces/a/devices/3","chat_time":"2026-11-26T15:10:00Z"}`},
+		{"chat with no sender", `{"type":"chat","sender_id":"","text":"hi","chat_time":"2026-11-26T15:10:00Z"}`},
+		{"chat with a time that is no time", `{"type":"chat","sender_id":"spaces/a/devices/3","text":"hi","chat_time":"yesterday"}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if c, err := ParseControl([]byte(tc.body)); err == nil {
+				t.Errorf("ParseControl(%s) = %+v, nil; want an error", tc.body, c)
+			}
+		})
+	}
+}
+
+// TestMarshalJSONRefusesWhatParseControlRefuses holds that a side writes no
+// control message the other side refuses: each value outside C2's table is
+// refused by MarshalJSON too. It fails if MarshalJSON checks only which row
+// is set.
+func TestMarshalJSONRefusesWhatParseControlRefuses(t *testing.T) {
+	piHello := func(s State, jitter int) Control {
+		return Control{Type: TypeHello, Hello: &Hello{Build: BuildRelease, LinkVersions: []int{1}, JitterTargetMS: jitter, State: &s}}
+	}
+	bridgeHello := func(h Hello) Control {
+		h.Build, h.LinkVersions = BuildRelease, []int{1}
+		return Control{Type: TypeHello, Hello: &h}
+	}
+	recording := State{State: "recording", PauseSource: "none"}
+	noID := testEvent
+	noID.ID = ""
+	backwards := testEvent
+	backwards.Start, backwards.End = testEvent.End, testEvent.Start
+	for _, tc := range []struct {
+		name string
+		c    Control
+	}{
+		{"a hello of no build", Control{Type: TypeHello, Hello: &Hello{LinkVersions: []int{1}}}},
+		{"a hello with link version 0", Control{Type: TypeHello, Hello: &Hello{Build: BuildRelease, LinkVersions: []int{0}}}},
+		{"the Pi's hello with a jitter target below 0", piHello(recording, -1)},
+		{"the Pi's hello in a state outside C2", piHello(State{State: "muted", PauseSource: "none"}, 80)},
+		{"the bridge's hello with a pause time that is no time", bridgeHello(Hello{Paused: true, PauseChatTime: "now"})},
+		{"the bridge's hello with a bot state outside C2", bridgeHello(Hello{Event: &testEvent, BotState: "waiting"})},
+		{"the bridge's hello with an event with no id", bridgeHello(Hello{Event: &noID, BotState: "in_call"})},
+		{"state with closings below 0", Control{Type: TypeState, State: &State{State: "closed", Closings: -1, PauseSource: "office_close"}}},
+		{"state with no pause source", Control{Type: TypeState, State: &State{State: "recording"}}},
+		{"post with no key", Control{Type: TypePost, Post: &Post{}}},
+		{"cancel of no input", Control{Type: TypeCancel, Cancel: &Cancel{Generation: 1}}},
+		{"pong with a pause time that is no time", Control{Type: TypePong, Pong: &Pong{Paused: true, PauseChatTime: "later"}}},
+		{"call with no bot state", Control{Type: TypeCall, Call: &Call{Event: testEvent}}},
+		{"call whose event ends before it starts", Control{Type: TypeCall, Call: &Call{Event: backwards, BotState: "joining"}}},
+		{"chat_check with a result outside C2", Control{Type: TypeChatCheck, ChatCheck: &ChatCheck{Result: "maybe", Event: "evt-0001"}}},
+		{"chat_check naming no event", Control{Type: TypeChatCheck, ChatCheck: &ChatCheck{Result: "failed"}}},
+		{"pause with no time", Control{Type: TypePause, Pause: &ChatTime{}}},
+		{"resume with a time that is no time", Control{Type: TypeResume, Resume: &ChatTime{ChatTime: "x"}}},
+		{"busy of the zero event", Control{Type: TypeBusy, Busy: &Busy{}}},
+		{"rate_fault below 0", Control{Type: TypeRateFault, RateFault: &RateFault{SamplesPerSecond: -1}}},
+		{"roster with a participant with no id", Control{Type: TypeRoster, Roster: &Roster{Participants: []Participant{{Index: 0, Name: "Ada"}}}}},
+		{"roster with one index twice", Control{Type: TypeRoster, Roster: &Roster{Participants: []Participant{
+			{Index: 3, ID: "spaces/a/devices/1", Name: "Ada"}, {Index: 3, ID: "spaces/a/devices/2", Name: "Grace"},
+		}}}},
+		{"join with no id", Control{Type: TypeJoin, Join: &Participant{Index: 3, Name: "Grace"}}},
+		{"leave with no id", Control{Type: TypeLeave, Leave: &Participant{Index: 3}}},
+		{"chat with no sender", Control{Type: TypeChat, Chat: &Chat{Text: "hi", ChatTime: "2026-11-26T15:10:00Z"}}},
+		{"chat with a time that is no time", Control{Type: TypeChat, Chat: &Chat{SenderID: "spaces/a/devices/3", Text: "hi", ChatTime: "yesterday"}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if b, err := tc.c.MarshalJSON(); err == nil {
+				t.Errorf("MarshalJSON wrote %s; want an error", b)
+			}
+		})
+	}
+}
+
+// TestALaterVersionsHelloIsReadForItsVersionsAlone holds R15's upgrade path
+// when a later link version changed a field of the hello: a hello that names
+// no version this build accepts is read for its build and its versions
+// alone, so this side still learns which versions the other accepts. Its
+// control, the same hello naming version 1 as well, is version 1's, and is
+// refused. It fails if ParseControl reads a later version's fields as
+// version 1's.
+func TestALaterVersionsHelloIsReadForItsVersionsAlone(t *testing.T) {
+	const later = `{"type":"hello","build":"release","link_versions":[2],"texts":{"bot_name":7},"jitter_target_ms":"80ms","state":{"state":"muted"}}`
+	c, err := ParseControl([]byte(later))
+	if err != nil {
+		t.Fatalf("ParseControl of a later version's hello: %v", err)
+	}
+	if want := (Control{Type: TypeHello, Hello: &Hello{Build: BuildRelease, LinkVersions: []int{2}}}); !reflect.DeepEqual(c, want) {
+		t.Errorf("ParseControl gave %+v; want %+v, the build and the versions alone", c.Hello, want.Hello)
+	}
+	if c, err := ParseControl([]byte(strings.Replace(later, `[2]`, `[1,2]`, 1))); err == nil {
+		t.Errorf("ParseControl of a hello that names version 1 with fields version 1 does not allow = %+v, nil; want an error", c.Hello)
 	}
 }

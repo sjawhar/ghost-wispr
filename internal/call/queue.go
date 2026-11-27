@@ -60,14 +60,11 @@ func NewSendQueue(maxFrames int) *SendQueue {
 }
 
 // Send queues a control message. A hello is the link's first message,
-// whenever it is sent. Send refuses a hello that names no link version, a
-// second hello, and a control message MarshalJSON refuses. It keeps no
+// whenever it is sent. Send refuses a second hello, and a control message
+// MarshalJSON refuses, as a hello that names no link version. It keeps no
 // reference to c.
 func (q *SendQueue) Send(c *Control) error {
 	isHello := c.Type == TypeHello
-	if isHello && c.Hello != nil && len(c.Hello.LinkVersions) == 0 {
-		return errors.New("call: a hello names the link versions its side accepts")
-	}
 	b, err := c.MarshalJSON()
 	if err != nil {
 		return err

@@ -4,6 +4,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"reflect"
+	"slices"
+	"strings"
 	"time"
 )
 
@@ -65,7 +68,10 @@ type State struct {
 // state, which it must have. Any other hello is the bridge's: it is written
 // with build, link_versions, paused, pause_chat_time, event (null when Event
 // is nil) and bot_state. MarshalJSON refuses a hello that sets fields of both
-// sides, so neither side's fields are dropped unseen.
+// sides, so neither side's fields are dropped unseen. Each hello names its
+// build and at least one link version, each from 1. One that names a version
+// this build accepts holds that version's values; one that names none is
+// checked, and read, for its build and its versions alone.
 type Hello struct {
 	Build        string // BuildRelease | BuildCallfault
 	LinkVersions []int
@@ -109,6 +115,13 @@ type bridgeHello struct {
 	PauseChatTime string `json:"pause_chat_time"`
 	Event         *Event `json:"event"`
 	BotState      string `json:"bot_state"`
+}
+
+// helloVersions is what a side reads of a hello that names no link version
+// it accepts.
+type helloVersions struct {
+	Build        string `json:"build"`
+	LinkVersions []int  `json:"link_versions"`
 }
 
 // Post asks the bridge to post a notice in the chat.
@@ -207,13 +220,14 @@ type Control struct {
 	Chat      *Chat
 }
 
-// row returns the value of c's row, after it checks that Type names a row and
-// that its field, and no other, is set.
+// row returns the value of c's row, after it checks that Type names a row,
+// that its field, and no other, is set, and that the row holds values C2's
+// table allows (check).
 func (c *Control) row() (any, error) {
 	rows := [...]struct {
 		typ string
 		set bool
-		v   any
+		v   checker
 	}{
 		{TypeHello, c.Hello != nil, c.Hello},
 		{TypeState, c.State != nil, c.State},
@@ -232,7 +246,7 @@ func (c *Control) row() (any, error) {
 		{TypeLeave, c.Leave != nil, c.Leave},
 		{TypeChat, c.Chat != nil, c.Chat},
 	}
-	var row any
+	var row checker
 	set := 0
 	for _, r := range &rows {
 		if r.set {
@@ -251,11 +265,15 @@ func (c *Control) row() (any, error) {
 	if set != 1 {
 		return nil, fmt.Errorf("call: a %q control with %d rows set; want its own alone", c.Type, set)
 	}
+	if err := row.check(); err != nil {
+		return nil, fmt.Errorf("call: %s control: %w", c.Type, err)
+	}
 	return row, nil
 }
 
 // MarshalJSON writes c as one flat JSON object: "type", then its row's fields
-// under C2's names, zero values included.
+// under C2's names, zero values included. It refuses a row with a value C2's
+// table does not allow, so a side writes nothing that ParseControl refuses.
 //
 //nolint:gocritic // hugeParam: the contract passes Control by value; json.Marshal of a value must use MarshalJSON.
 func (c Control) MarshalJSON() ([]byte, error) {
@@ -265,9 +283,7 @@ func (c Control) MarshalJSON() ([]byte, error) {
 	}
 	switch c.Type {
 	case TypeHello:
-		if row, err = c.Hello.wire(); err != nil {
-			return nil, err
-		}
+		row = c.Hello.wire()
 	case TypeRoster:
 		if c.Roster.Participants == nil {
 			row = Roster{Participants: []Participant{}}
@@ -287,31 +303,34 @@ func (c Control) MarshalJSON() ([]byte, error) {
 	return append(out, body[1:]...), nil
 }
 
-// wire returns the side's form of h.
-func (h *Hello) wire() (any, error) {
-	pi := h.Texts != nil || h.JitterTargetMS != 0 || h.State != nil
-	bridge := h.Paused || h.PauseChatTime != "" || h.Event != nil || h.BotState != ""
-	switch {
-	case pi && bridge:
-		return nil, errors.New("call: a hello with both the Pi's and the bridge's fields")
-	case !pi:
-		return bridgeHello{
-			Build: h.Build, LinkVersions: h.LinkVersions,
-			Paused: h.Paused, PauseChatTime: h.PauseChatTime, Event: h.Event, BotState: h.BotState,
-		}, nil
-	case h.State == nil:
-		return nil, errors.New("call: the Pi's hello has no state")
-	}
-	return piHello{
-		Build: h.Build, LinkVersions: h.LinkVersions,
-		Texts: h.Texts, JitterTargetMS: h.JitterTargetMS, State: h.State,
-	}, nil
+// sides says whether h sets any of the Pi's fields, and any of the bridge's.
+func (h *Hello) sides() (pi, bridge bool) {
+	return h.Texts != nil || h.JitterTargetMS != 0 || h.State != nil,
+		h.Paused || h.PauseChatTime != "" || h.Event != nil || h.BotState != ""
 }
 
-// ParseControl reads one control message. It refuses an unknown type and a
-// body that does not decode into its row. It takes fields it does not know,
-// so a side still reads the hello of a later link version and learns which
-// versions the other side accepts.
+// wire returns the side's form of h, a hello that check found to be one
+// side's.
+func (h *Hello) wire() any {
+	if pi, _ := h.sides(); pi {
+		return piHello{
+			Build: h.Build, LinkVersions: h.LinkVersions,
+			Texts: h.Texts, JitterTargetMS: h.JitterTargetMS, State: h.State,
+		}
+	}
+	return bridgeHello{
+		Build: h.Build, LinkVersions: h.LinkVersions,
+		Paused: h.Paused, PauseChatTime: h.PauseChatTime, Event: h.Event, BotState: h.BotState,
+	}
+}
+
+// ParseControl reads one control message. It refuses an unknown type, a
+// body that does not decode into its row, a row that lacks one of its fields
+// or holds null for one (a pointer's may be null), and a row with a value
+// C2's table does not allow. It takes fields it does not know, and reads a
+// hello that names no link version this build accepts for its build and its
+// versions alone, so a side still reads the hello of a later link version
+// and learns which versions the other side accepts.
 func ParseControl(b []byte) (Control, error) {
 	var head struct {
 		Type string `json:"type"`
@@ -323,9 +342,7 @@ func ParseControl(b []byte) (Control, error) {
 	var err error
 	switch head.Type {
 	case TypeHello:
-		var w *helloWire
-		w, err = decodeRow[helloWire](b)
-		c.Hello = (*Hello)(w)
+		c.Hello, err = parseHello(b)
 	case TypeState:
 		c.State, err = decodeRow[State](b)
 	case TypePost:
@@ -362,15 +379,286 @@ func ParseControl(b []byte) (Control, error) {
 	if err != nil {
 		return Control{}, fmt.Errorf("call: %s control: %w", head.Type, err)
 	}
+	if _, err := c.row(); err != nil {
+		return Control{}, err
+	}
 	return c, nil
 }
 
-// decodeRow decodes a flat control message into its row; the "type" field is
-// not a field of any row, so it is passed over.
+// parseHello reads a hello. One that names a link version this build
+// accepts is that version's, with each field of its side's hello. One that
+// names none is read for its build and versions alone, which is all this
+// side needs of it, whatever the later version changed of the rest.
+func parseHello(b []byte) (*Hello, error) {
+	v, err := decodeRow[helloVersions](b)
+	if err != nil {
+		return nil, err
+	}
+	if _, ok := Choose(Accepted, v.LinkVersions); !ok {
+		return &Hello{Build: v.Build, LinkVersions: v.LinkVersions}, nil
+	}
+	w := new(helloWire)
+	if err := json.Unmarshal(b, w); err != nil {
+		return nil, err
+	}
+	h := (*Hello)(w)
+	if err := requireFields(b, reflect.TypeOf(h.wire())); err != nil {
+		return nil, err
+	}
+	return h, nil
+}
+
+// decodeRow decodes a flat control message into its row, which must have
+// each of its fields; the "type" field is not a field of any row, so it is
+// passed over.
 func decodeRow[T any](b []byte) (*T, error) {
 	v := new(T)
 	if err := json.Unmarshal(b, v); err != nil {
 		return nil, err
 	}
+	if err := requireFields(b, reflect.TypeFor[T]()); err != nil {
+		return nil, err
+	}
 	return v, nil
+}
+
+// unmarshaler is the type of a value that reads its own JSON, as a
+// time.Time does: requireFields does not look inside one.
+var unmarshaler = reflect.TypeFor[json.Unmarshaler]()
+
+// requireFields checks that raw, JSON that decoded as a t, has each field of
+// t: each field of an object, of each object it holds, and of each object in
+// a list, none of them null unless its Go field is a pointer, which C2 writes
+// as null when there is none. json.Unmarshal leaves a field it does not find
+// at its zero value, which C2 gives a meaning: a pong without paused would
+// read as not paused.
+func requireFields(raw json.RawMessage, t reflect.Type) error {
+	if reflect.PointerTo(t).Implements(unmarshaler) {
+		return nil
+	}
+	switch t.Kind() {
+	case reflect.Pointer:
+		if string(raw) == "null" {
+			return nil
+		}
+		return requireFields(raw, t.Elem())
+	case reflect.Slice:
+		if k := t.Elem().Kind(); k != reflect.Struct && k != reflect.Pointer && k != reflect.Slice {
+			return nil
+		}
+		var items []json.RawMessage
+		if err := json.Unmarshal(raw, &items); err != nil {
+			return err
+		}
+		for i, item := range items {
+			if err := requireFields(item, t.Elem()); err != nil {
+				return fmt.Errorf("item %d: %w", i, err)
+			}
+		}
+	case reflect.Struct:
+		var fields map[string]json.RawMessage
+		if err := json.Unmarshal(raw, &fields); err != nil {
+			return err
+		}
+		for i := range t.NumField() {
+			f := t.Field(i)
+			name, _, _ := strings.Cut(f.Tag.Get("json"), ",")
+			v, ok := fields[name]
+			switch {
+			case !ok:
+				return fmt.Errorf("no %s", name)
+			case string(v) == "null" && f.Type.Kind() != reflect.Pointer:
+				return fmt.Errorf("%s is null", name)
+			}
+			if err := requireFields(v, f.Type); err != nil {
+				return fmt.Errorf("%s: %w", name, err)
+			}
+		}
+	}
+	return nil
+}
+
+// A checker is a row of C2's table: check says whether each of its values is
+// one the table allows, each enum's, each count's bound, each time's form,
+// and each id that names something.
+type checker interface{ check() error }
+
+// The values of C2's enums.
+var (
+	builds       = []string{BuildRelease, BuildCallfault}
+	gateStates   = []string{"recording", "listening", "closed"}
+	pauseSources = []string{"none", "office_control", "office_close", "chat"}
+	postKeys     = []string{"starts_paused", "starts_closed"}
+	inputs       = []string{"voice", "chime"}
+	botStates    = []string{"joining", "admitted", "in_call", "left"}
+	results      = []string{"passed", "failed"}
+)
+
+// oneOf checks that field holds one of values.
+func oneOf(field, v string, values []string) error {
+	if slices.Contains(values, v) {
+		return nil
+	}
+	return fmt.Errorf("%s %q is not one of %s", field, v, strings.Join(values, ", "))
+}
+
+// rfc3339 checks that field holds an RFC 3339 time.
+func rfc3339(field, v string) error {
+	if _, err := time.Parse(time.RFC3339, v); err != nil {
+		return fmt.Errorf("%s %q is not an RFC 3339 time", field, v)
+	}
+	return nil
+}
+
+// check checks a hello: each hello's build and versions, that it holds one
+// side's fields, and, when it names a version this build accepts, the
+// values of that side's fields.
+func (h *Hello) check() error {
+	pi, bridge := h.sides()
+	switch {
+	case pi && bridge:
+		return errors.New("a hello with both the Pi's and the bridge's fields")
+	case pi && h.State == nil:
+		return errors.New("the Pi's hello has no state")
+	case len(h.LinkVersions) == 0:
+		return errors.New("a hello names the link versions its side accepts")
+	}
+	if err := oneOf("build", h.Build, builds); err != nil {
+		return err
+	}
+	for _, v := range h.LinkVersions {
+		if v < 1 {
+			return fmt.Errorf("link version %d is not a whole number from 1", v)
+		}
+	}
+	if _, ok := Choose(Accepted, h.LinkVersions); !ok {
+		return nil // a later version's hello: this side reads its versions alone
+	}
+	if pi {
+		if h.JitterTargetMS <= 0 {
+			return fmt.Errorf("jitter_target_ms %d is not above 0", h.JitterTargetMS)
+		}
+		if err := h.State.check(); err != nil {
+			return fmt.Errorf("state: %w", err)
+		}
+		return nil
+	}
+	if h.PauseChatTime != "" {
+		if err := rfc3339("pause_chat_time", h.PauseChatTime); err != nil {
+			return err
+		}
+	}
+	if h.Event != nil {
+		if err := h.Event.check(); err != nil {
+			return fmt.Errorf("event: %w", err)
+		}
+	}
+	if h.BotState != "" {
+		return oneOf("bot_state", h.BotState, botStates)
+	}
+	return nil
+}
+
+func (s *State) check() error {
+	if err := oneOf("state", s.State, gateStates); err != nil {
+		return err
+	}
+	if s.Closings < 0 {
+		return fmt.Errorf("closings %d is below 0", s.Closings)
+	}
+	return oneOf("pause_source", s.PauseSource, pauseSources)
+}
+
+func (p *Post) check() error { return oneOf("key", p.Key, postKeys) }
+
+func (c *Cancel) check() error { return oneOf("input", c.Input, inputs) }
+
+// check allows every ping: C2 bounds neither its seq nor its clock.
+func (*Ping) check() error { return nil }
+
+func (p *Pong) check() error {
+	if p.PauseChatTime == "" {
+		return nil
+	}
+	return rfc3339("pause_chat_time", p.PauseChatTime)
+}
+
+func (c *Call) check() error {
+	if err := c.Event.check(); err != nil {
+		return fmt.Errorf("event: %w", err)
+	}
+	return oneOf("bot_state", c.BotState, botStates)
+}
+
+func (c *ChatCheck) check() error {
+	if err := oneOf("result", c.Result, results); err != nil {
+		return err
+	}
+	if c.Event == "" {
+		return errors.New("a chat_check that names no event")
+	}
+	return nil
+}
+
+func (c *ChatTime) check() error { return rfc3339("chat_time", c.ChatTime) }
+
+func (b *Busy) check() error {
+	if err := b.Event.check(); err != nil {
+		return fmt.Errorf("event: %w", err)
+	}
+	return nil
+}
+
+func (r *RateFault) check() error {
+	if r.SamplesPerSecond < 0 {
+		return fmt.Errorf("samples_per_second %d is below 0", r.SamplesPerSecond)
+	}
+	return nil
+}
+
+// check checks each participant, and that no two share an index, which maps
+// a participant's frames to its id.
+func (r *Roster) check() error {
+	var taken [256]bool
+	for i := range r.Participants {
+		p := &r.Participants[i]
+		if err := p.check(); err != nil {
+			return fmt.Errorf("participant %d: %w", i, err)
+		}
+		if taken[p.Index] {
+			return fmt.Errorf("participant %d: index %d is another participant's", i, p.Index)
+		}
+		taken[p.Index] = true
+	}
+	return nil
+}
+
+func (p *Participant) check() error {
+	if p.ID == "" {
+		return errors.New("a participant with no id")
+	}
+	return nil
+}
+
+func (c *Chat) check() error {
+	if c.SenderID == "" {
+		return errors.New("a chat line with no sender_id")
+	}
+	return rfc3339("chat_time", c.ChatTime)
+}
+
+// check checks an event: its id and organizer, which name it, and a start
+// and an end, the end not before the start.
+func (e *Event) check() error {
+	switch {
+	case e.ID == "":
+		return errors.New("an event with no id")
+	case e.Organizer == "":
+		return errors.New("an event with no organizer")
+	case e.Start.IsZero() || e.End.IsZero():
+		return errors.New("an event with no start or no end")
+	case e.End.Before(e.Start):
+		return errors.New("an event that ends before it starts")
+	}
+	return nil
 }
