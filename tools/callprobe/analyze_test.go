@@ -2,6 +2,7 @@ package main
 
 import (
 	"math"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -232,7 +233,7 @@ func TestFindsAnEchoAtMinus46AndMinus52dBWithin1dB(t *testing.T) {
 // c-once: the loopback holds Wispr's voice twice, the copy Ghost Wispr sends
 // and a later one through the office's microphone, and the later one must be
 // at least 46 dB below the first (R11). echo -second-after takes the
-// strongest copy as the direct one, finds the strongest copy at least that
+// loudest copy as the direct one, finds the loudest copy at least that
 // long after it, fits the two paths together, and gives each level and the
 // second's against the first. A search of the cross-correlation alone fails
 // here: over 5 s of white noise the direct copy's own correlation noise is
@@ -453,6 +454,135 @@ func TestASecondCopyTheRecordingHoldsInPartReadsItsLevel(t *testing.T) {
 	}
 }
 
+// heldRange reads lags_held_ms, which must name one range of lags, from..to.
+func heldRange(t *testing.T, out string) (from, to float64) {
+	t.Helper()
+	v, ok := value(out, "lags_held_ms")
+	lo, hi, one := strings.Cut(v, "..")
+	if !ok || !one || strings.Contains(hi, ",") {
+		t.Fatalf("lags_held_ms=%q, want one range from..to:\n%s", v, out)
+	}
+	from, err := strconv.ParseFloat(lo, 64)
+	if err != nil {
+		t.Fatalf("lags_held_ms=%q: %v", v, err)
+	}
+	to, err = strconv.ParseFloat(hi, 64)
+	if err != nil {
+		t.Fatalf("lags_held_ms=%q: %v", v, err)
+	}
+	return from, to
+}
+
+// c-once: echo=none bounds the echo only at the lags where the recording
+// holds at least half of the reference's copy, which lags_held_ms names, and
+// a recording that holds that much at no lag asked reads UNKNOWN with no
+// floor. The reference of TestFindsASecondCopyThatComesAfterTheReferencesEnd,
+// its sound from 900 to 980 ms, has a copy 300 ms later in a recording that
+// ends 1150 ms after its start, which holds none of that copy: echo=none
+// within ±500 ms said the echo was at most the floor there too. Here the lags
+// held end at 210 ms, where the recording still holds half of the sound: up
+// to 940 ms of it, 1150 ms less 210 ms. A recording of 1.5 s holds at most
+// 38 % of a reference of 4 s, at any lag. And two files of 1000 samples,
+// searched within ±500 samples, overlap too little for a copy as loud as the
+// floor to stand out at each lag held: noise alone fits a 10 ms path with
+// about 17 % of the rest, and four times that is more than the share of the
+// rest that such a copy puts in at the last lag held.
+func TestTheEchoFloorCoversOnlyTheLagsTheRecordingHolds(t *testing.T) {
+	const rate = 16000
+	dir := t.TempDir()
+	atTheEnd := make([]float64, rate)
+	copy(atTheEnd[9*rate/10:], noise(8*rate/100, -18, 9201))
+	cut := noise(23*rate/20, -90, 9202)
+	addCopy(cut, atTheEnd, 3*rate/10, 0.1) // after the recording's end
+	t.Run("a copy at a lag the recording does not hold", func(t *testing.T) {
+		out, errOut, code := callprobe(t, "", "analyze", "echo", "-max-lag", "500ms",
+			"-ref", writeWAV(t, dir, "at-the-end.wav", rate, atTheEnd), "-in", writeWAV(t, dir, "cut.wav", rate, cut))
+		if code != 0 {
+			t.Fatalf("analyze echo exited %d: %s%s", code, out, errOut)
+		}
+		if from, to := heldRange(t, out); from != -500 || math.Abs(to-210) > 5 {
+			t.Errorf("lags_held_ms=%v..%v, want -500 to 210 within 5 ms, where the recording holds half of the sound, before the copy's 300 ms:\n%s", from, to, out)
+		}
+	})
+	for _, tc := range []struct {
+		name, maxLag string
+		ref, in      []float64
+	}{
+		{"a recording that holds less than half of the reference", "500ms", noise(4*rate, -20, 9205), noise(3*rate/2, -90, 9206)},
+		{"files that overlap too little for the floor to bound each lag held", "31.25ms", noise(1000, -20, 9211), noise(1000, -90, 9212)},
+	} {
+		ref, in := writeWAV(t, dir, tc.name+"-ref.wav", rate, tc.ref), writeWAV(t, dir, tc.name+"-in.wav", rate, tc.in)
+		for _, analysis := range []string{"echo", "delay"} {
+			t.Run(tc.name+": "+analysis, func(t *testing.T) {
+				out, errOut, code := callprobe(t, "", "analyze", analysis, "-max-lag", tc.maxLag, "-ref", ref, "-in", in)
+				if code != 0 {
+					t.Fatalf("analyze %s exited %d: %s%s", analysis, code, out, errOut)
+				}
+				if got, _ := value(out, analysis); got != "UNKNOWN" {
+					t.Errorf("%s=%q, want UNKNOWN:\n%s", analysis, got, out)
+				}
+				for _, key := range []string{"noise_floor_db", "echo_db", "delay_ms", "lags_held_ms"} {
+					if v, ok := value(out, key); ok {
+						t.Errorf("%s=%s where the floor bounds no lag, want no %s:\n%s", key, v, key, out)
+					}
+				}
+			})
+		}
+	}
+}
+
+// c-once: the echo is the loudest copy at the lags held, not the one the
+// cross-correlation shows most of. In a recording of the same 1 s as the
+// reference, a copy 50 ms later at gain 0.05, held 95 %, correlates more
+// than one 400 ms later at gain 0.07, held 60 %: the echo is the second, at
+// -23.1 dB, above the first's -26 dB.
+func TestTheEchoIsTheLoudestCopyNotTheMostHeld(t *testing.T) {
+	const rate = 16000
+	dir := t.TempDir()
+	source := noise(rate, -18, 9207)
+	rec := noise(rate, -90, 9208)
+	addCopy(rec, source, rate/20, 0.05)
+	addCopy(rec, source, 4*rate/10, 0.07)
+	out, errOut, code := callprobe(t, "", "analyze", "echo", "-max-lag", "450ms",
+		"-ref", writeWAV(t, dir, "reference.wav", rate, source), "-in", writeWAV(t, dir, "recording.wav", rate, rec))
+	if code != 0 {
+		t.Fatalf("analyze echo exited %d: %s%s", code, out, errOut)
+	}
+	if got := number(t, out, "delay_ms"); math.Abs(got-400) > 2 {
+		t.Errorf("delay_ms=%v, want the louder copy's 400 within 2 ms:\n%s", got, out)
+	}
+	if got, want := number(t, out, "echo_db"), 20*math.Log10(0.07); math.Abs(got-want) > 1 {
+		t.Errorf("echo_db=%v, want %v within 1 dB:\n%s", got, want, out)
+	}
+}
+
+// c-once: the second copy is the loudest at least -second-after after the
+// direct one, not the one the cross-correlation shows most of. In a
+// recording of the same 1 s as the reference, its direct copy 100 ms later
+// at gain 0.5, a copy 200 ms later at gain 0.05, held 80 %, correlates more
+// than one 700 ms later at gain 0.1, held 30 %: the second copy is the one
+// at 700 ms, 14 dB below the direct one.
+func TestTheSecondCopyIsTheLoudestNotTheMostHeld(t *testing.T) {
+	const rate = 16000
+	dir := t.TempDir()
+	source := noise(rate, -18, 9209)
+	rec := noise(rate, -90, 9210)
+	addCopy(rec, source, rate/10, 0.5)
+	addCopy(rec, source, 2*rate/10, 0.05)
+	addCopy(rec, source, 7*rate/10, 0.1)
+	out, errOut, code := callprobe(t, "", "analyze", "echo", "-max-lag", "800ms", "-second-after", "20ms",
+		"-ref", writeWAV(t, dir, "reference.wav", rate, source), "-in", writeWAV(t, dir, "recording.wav", rate, rec))
+	if code != 0 {
+		t.Fatalf("analyze echo exited %d: %s%s", code, out, errOut)
+	}
+	if got := number(t, out, "copy_delay_ms"); math.Abs(got-700) > 2 {
+		t.Errorf("copy_delay_ms=%v, want the louder copy's 700 within 2 ms:\n%s", got, out)
+	}
+	if got, want := number(t, out, "copy_vs_direct_db"), 20*math.Log10(0.1/0.5); math.Abs(got-want) > 1 {
+		t.Errorf("copy_vs_direct_db=%v, want %v within 1 dB:\n%s", got, want, out)
+	}
+}
+
 // c-rig: an echo below the recording's noise floor reads UNKNOWN, never a
 // level: at -52 dB in a floor at -40 dB, the copy is there, and no number
 // says how loud.
@@ -497,11 +627,17 @@ func TestReportsUnknownForASilentRecording(t *testing.T) {
 
 // c-rig's negative control: each analysis, given a file in which nothing was
 // injected, reports none, so a tool that always finds something fails here.
+// The reference is 12 s and the recordings 12.5 s, so that the recording
+// holds more than half of the reference's copy at each lag of the default
+// -max-lag of 5 s, and delay=none and echo=none cover each lag asked:
+// lags_held_ms is the whole of ±5 s. With a 5 s reference, the copy at -5 s
+// is not in the recording at all.
 func TestReportsNoDelayAndNoEchoWhenNoneWasInjected(t *testing.T) {
 	const rate = 16000
+	const asked = "-5000.0..5000.0"
 	dir := t.TempDir()
-	quiet := writeWAV(t, dir, "quiet.wav", rate, noise(5*rate+rate/2, -90, 11))
-	source := writeWAV(t, dir, "source.wav", rate, noise(5*rate, -20, 12))
+	quiet := writeWAV(t, dir, "quiet.wav", rate, noise(12*rate+rate/2, -90, 11))
+	source := writeWAV(t, dir, "source.wav", rate, noise(12*rate, -20, 12))
 	clicks := noise(14*rate, -70, 13)
 	for i := range 5 {
 		click(clicks, rate/4+i*5*rate/2, 0.8)
@@ -514,14 +650,15 @@ func TestReportsNoDelayAndNoEchoWhenNoneWasInjected(t *testing.T) {
 		none  string   // the field that says none
 		want  string   // its value
 		never []string // fields that only a finding has
+		held  string   // lags_held_ms, the lags none covers; "" where the analysis has no lags
 	}{
-		{"cross-correlation", []string{"delay", "-ref", source, "-in", quiet}, "delay", "none", []string{"delay_ms"}},
-		{"click times against a reference", []string{"clicks", "-ref", clicked, "-in", quiet}, "pairs", "0", []string{"median_ms", "p90_ms", "delay_ms"}},
-		{"click times", []string{"clicks", "-in", quiet}, "clicks", "0", []string{"at_ms"}},
-		{"sound ends", []string{"ends", "-in", quiet}, "sounds", "0", []string{"start_ms", "end_ms"}},
-		{"echo level", []string{"echo", "-ref", source, "-in", quiet}, "echo", "none", []string{"echo_db", "delay_ms"}},
+		{"cross-correlation", []string{"delay", "-ref", source, "-in", quiet}, "delay", "none", []string{"delay_ms"}, asked},
+		{"click times against a reference", []string{"clicks", "-ref", clicked, "-in", quiet}, "pairs", "0", []string{"median_ms", "p90_ms", "delay_ms"}, ""},
+		{"click times", []string{"clicks", "-in", quiet}, "clicks", "0", []string{"at_ms"}, ""},
+		{"sound ends", []string{"ends", "-in", quiet}, "sounds", "0", []string{"start_ms", "end_ms"}, ""},
+		{"echo level", []string{"echo", "-ref", source, "-in", quiet}, "echo", "none", []string{"echo_db", "delay_ms"}, asked},
 		{"echo level in a loud floor", []string{"echo", "-ref", source, "-in",
-			writeWAV(t, dir, "loud.wav", rate, noise(5*rate+rate/2, -60, 14))}, "echo", "none", []string{"echo_db", "delay_ms"}},
+			writeWAV(t, dir, "loud.wav", rate, noise(12*rate+rate/2, -60, 14))}, "echo", "none", []string{"echo_db", "delay_ms"}, asked},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			out, errOut, code := callprobe(t, "", append([]string{"analyze"}, tc.args...)...)
@@ -535,6 +672,9 @@ func TestReportsNoDelayAndNoEchoWhenNoneWasInjected(t *testing.T) {
 				if v, ok := value(out, key); ok {
 					t.Errorf("%s=%s where nothing was injected, want no %s:\n%s", key, v, key, out)
 				}
+			}
+			if got, _ := value(out, "lags_held_ms"); tc.held != "" && got != tc.held {
+				t.Errorf("lags_held_ms=%q, want %s, each lag asked:\n%s", got, tc.held, out)
 			}
 		})
 	}

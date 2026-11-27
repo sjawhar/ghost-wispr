@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/sjawhar/ghost-wispr/tools/callprobe/analyze"
@@ -217,8 +218,8 @@ func findCopy(name string, args []string, stdout, stderr io.Writer) (analyze.Cop
 	var f files
 	var o analyze.CopyOptions
 	fs := f.flags(name, stderr, true)
-	fs.DurationVar(&o.MaxLag, "max-lag", 5*time.Second, "how far before and after -ref the copy is looked for")
-	fs.DurationVar(&o.Path, "path", 10*time.Millisecond, "the length of echo path fitted around the copy's strongest lag")
+	fs.DurationVar(&o.MaxLag, "max-lag", 5*time.Second, "how far before and after -ref the copy is looked for, at each lag where -in holds at least half of -ref's copy")
+	fs.DurationVar(&o.Path, "path", 10*time.Millisecond, "the length of echo path fitted around the loudest copy's lag")
 	if name == "echo" {
 		fs.DurationVar(&o.SecondAfter, "second-after", 0,
 			"also find a second copy at least this long after the first, the direct copy, and give its level against the direct one; at least -path")
@@ -249,10 +250,12 @@ func analyzeDelay(args []string, stdout, stderr io.Writer) error {
 		return err
 	case c.Silent:
 		_, _ = fmt.Fprintln(stdout, "delay=none (-in is digital silence where it overlaps -ref)")
+	case c.Unknown != "":
+		_, _ = fmt.Fprintf(stdout, "delay=UNKNOWN (%s: no copy of -ref can be looked for)\n", c.Unknown)
 	case !c.Found:
-		_, _ = fmt.Fprintf(stdout, "delay=none (no copy of -ref stands out of the cross-correlation's noise within ±%v)\n", o.MaxLag)
+		_, _ = fmt.Fprintf(stdout, "delay=none %s (no copy of -ref stands out of the cross-correlation's noise at the lags held within ±%v)\n", heldLags(&c), o.MaxLag)
 	default:
-		_, _ = fmt.Fprintf(stdout, "delay_ms=%s\n", ms(c.Lag))
+		_, _ = fmt.Fprintf(stdout, "delay_ms=%s %s\n", ms(c.Lag), heldLags(&c))
 	}
 	return nil
 }
@@ -263,41 +266,63 @@ func analyzeEcho(args []string, stdout, stderr io.Writer) error {
 	case err != nil:
 		return err
 	case o.SecondAfter > 0:
-		printSecondCopy(stdout, c, o)
+		printSecondCopy(stdout, &c, o)
 	case c.Silent:
 		_, _ = fmt.Fprintln(stdout, "echo_db=UNKNOWN (-in is digital silence where it overlaps -ref: it cannot show that an echo is absent)")
+	case c.Unknown != "":
+		_, _ = fmt.Fprintf(stdout, "echo=UNKNOWN (dB against -ref; %s: no level of an echo within ±%v is known, and no floor bounds it)\n", c.Unknown, o.MaxLag)
 	case !c.Found:
-		_, _ = fmt.Fprintf(stdout, "echo=none noise_floor_db=%s (dB against -ref; no copy of -ref stands out of the cross-correlation's noise within ±%v: the echo is at most the floor)\n",
-			db(c.FloorDB), o.MaxLag)
+		_, _ = fmt.Fprintf(stdout, "echo=none noise_floor_db=%s %s (dB against -ref; no copy of -ref stands out of the cross-correlation's noise at the lags held within ±%v: the echo at those lags is at most the floor)\n",
+			db(c.FloorDB), heldLags(&c), o.MaxLag)
 	case c.BelowFloor():
-		_, _ = fmt.Fprintf(stdout, "delay_ms=%s echo_db=UNKNOWN noise_floor_db=%s (dB against -ref; a copy of -ref is in -in below its noise floor: the echo is at most the floor)\n",
-			ms(c.Lag), db(c.FloorDB))
+		_, _ = fmt.Fprintf(stdout, "delay_ms=%s echo_db=UNKNOWN noise_floor_db=%s %s (dB against -ref; a copy of -ref is in -in below its noise floor: the echo at the lags held is at most the floor)\n",
+			ms(c.Lag), db(c.FloorDB), heldLags(&c))
 	default:
-		_, _ = fmt.Fprintf(stdout, "delay_ms=%s echo_db=%s noise_floor_db=%s (dB against -ref)\n", ms(c.Lag), db(c.LevelDB), db(c.FloorDB))
+		_, _ = fmt.Fprintf(stdout, "delay_ms=%s echo_db=%s noise_floor_db=%s %s (dB against -ref; the loudest copy at the lags held)\n",
+			ms(c.Lag), db(c.LevelDB), db(c.FloorDB), heldLags(&c))
 	}
 	return nil
 }
 
+// heldLags is the lags_held_ms field: the lags FindCopy searched, where -in
+// holds at least half of -ref's copy, as each range of them, from..to.
+func heldLags(c *analyze.Copy) string {
+	var b strings.Builder
+	b.WriteString("lags_held_ms=")
+	for i, h := range c.Held {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		b.WriteString(ms(h.From))
+		b.WriteString("..")
+		b.WriteString(ms(h.To))
+	}
+	return b.String()
+}
+
 // printSecondCopy prints what echo -second-after found: the direct copy,
-// the strongest, then the strongest copy at least -second-after later, each
+// the loudest, then the loudest copy at least -second-after later, each
 // against -ref, and the second copy and the floor against the direct one. A
 // second copy the fit cannot tell prints copy=UNKNOWN and no floor, which
 // would be no bound on it.
-func printSecondCopy(w io.Writer, c analyze.Copy, o analyze.CopyOptions) {
+func printSecondCopy(w io.Writer, c *analyze.Copy, o analyze.CopyOptions) {
 	switch {
 	case c.Silent:
 		_, _ = fmt.Fprintln(w, "direct_db=UNKNOWN (-in is digital silence where it overlaps -ref: it cannot show that a copy is absent)")
 		return
+	case c.Unknown != "":
+		_, _ = fmt.Fprintf(w, "direct=UNKNOWN (%s: no direct copy to measure a second against)\n", c.Unknown)
+		return
 	case !c.Found:
-		_, _ = fmt.Fprintf(w, "direct=none noise_floor_db=%s (dB against -ref; no copy of -ref stands out of the cross-correlation's noise within ±%v: no direct copy to measure a second against)\n",
-			db(c.FloorDB), o.MaxLag)
+		_, _ = fmt.Fprintf(w, "direct=none noise_floor_db=%s %s (dB against -ref; no copy of -ref stands out of the cross-correlation's noise at the lags held within ±%v: no direct copy to measure a second against)\n",
+			db(c.FloorDB), heldLags(c), o.MaxLag)
 		return
 	case c.BelowFloor():
-		_, _ = fmt.Fprintf(w, "direct_delay_ms=%s direct_db=UNKNOWN noise_floor_db=%s (dB against -ref; the direct copy is below the noise floor: no second copy can be measured against it)\n",
-			ms(c.Lag), db(c.FloorDB))
+		_, _ = fmt.Fprintf(w, "direct_delay_ms=%s direct_db=UNKNOWN noise_floor_db=%s %s (dB against -ref; the direct copy is below the noise floor: no second copy can be measured against it)\n",
+			ms(c.Lag), db(c.FloorDB), heldLags(c))
 		return
 	}
-	direct := fmt.Sprintf("direct_delay_ms=%s direct_db=%s", ms(c.Lag), db(c.LevelDB))
+	direct := fmt.Sprintf("direct_delay_ms=%s direct_db=%s %s", ms(c.Lag), db(c.LevelDB), heldLags(c))
 	floor := fmt.Sprintf("noise_floor_db=%s floor_vs_direct_db=%s", db(c.FloorDB), db(c.FloorDB-c.LevelDB))
 	switch s := c.Second; {
 	case s.Unknown != "":
