@@ -177,10 +177,13 @@ func TestRunbookAppliesAProvisioningChangeFromTheReleaseThatCarriesIt(t *testing
 // ExecStopPost removes it whatever stops the join; that the join's lines are
 // read with sudo journalctl -u ghost-wispr-provision-join; that a failed unit
 // is named with the command that shows its journal, not the journal's lines;
-// or if it still says that provision.sh turns parts off one by one, which
-// reaches no other name, that the page is lost for a moment only, that the
-// token is under /var/lib, that a run holds a lock file, or that a run prints
-// the last 20 lines of a failed unit's journal.
+// that a run copies no unit's lines and no tailscale command's output into its
+// own, and names the commands that read the nightly update's and the Serve
+// apply's lines; or if it still says that provision.sh turns parts off one by
+// one, which reaches no other name, that the page is lost for a moment only,
+// that the token is under /var/lib, that a run holds a lock file, or that a
+// run prints the last 20 lines of a failed unit's journal, the update's
+// journal lines or the Serve unit's lines.
 func TestRunbookProvisionGivesServeExactlyServeConf(t *testing.T) {
 	section := runbookSection(t, "## Provision")
 	for _, words := range []string{"`tailscale serve reset`", "a name the device had before a rename", "a systemd unit of its own", "a lost SSH session", "applies `serve.conf` again", "immediately before the reset", "a call whose `state` is not `none`", "nothing in Serve was changed", "The join runs the same apply", "only another run of `./provision.sh` puts it back", "check 7", "before the join", "a session that starts after that read", "ends after 30 s", "`RuntimeMaxSec`", "Serve is now",
@@ -188,12 +191,16 @@ func TestRunbookProvisionGivesServeExactlyServeConf(t *testing.T) {
 		"the transient system unit `ghost-wispr-provision`", "`ghost-wispr-provision-join`", "when it became active and its main PID",
 		"`sudo systemctl stop ghost-wispr-provision ghost-wispr-provision-join`", "An SSH session that ends does not end a run",
 		"`sudo journalctl -u ghost-wispr-provision-join`", "its control group", "`systemctl reset-failed`", "checks the join again",
-		"`sudo journalctl -u <unit>.service -n 20`", "not the journal's lines", "starts by hand with systemd"} {
+		"`sudo journalctl -u <unit>.service -n 20`", "not the journal's lines", "starts by hand with systemd",
+		"copies no unit's lines, and no output of a tailscale command, into its own",
+		"`sudo journalctl _SYSTEMD_USER_UNIT=ghost-wispr-update.service --since=@<start>`",
+		"`sudo journalctl -u ghost-wispr-serve-<run id>.service`"} {
 		if !strings.Contains(section, words) {
 			t.Errorf("the runbook's \"Provision\" does not say %q", words)
 		}
 	}
-	for _, stale := range []string{"each mount other than `/`", "a moment that a page open in a browser shows", "/var/lib/ghost-wispr-join", "ghost-wispr-provision.lock", "ghost-wispr-tailnet-join", "ends every command of the run with it", "the last 20 lines of its journal"} {
+	for _, stale := range []string{"each mount other than `/`", "a moment that a page open in a browser shows", "/var/lib/ghost-wispr-join", "ghost-wispr-provision.lock", "ghost-wispr-tailnet-join", "ends every command of the run with it", "the last 20 lines of its journal",
+		"prints the run's journal lines", "waits for it and prints its lines"} {
 		if strings.Contains(section, stale) {
 			t.Errorf("the runbook's \"Provision\" still says %q", stale)
 		}

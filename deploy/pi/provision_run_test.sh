@@ -667,9 +667,14 @@ EOF
 #   Sol's review of #203 did; `serve status --json` prints the setting, or fails with
 #   TEST_SERVE_STATUS_EXIT;
 # - `debug prefs` prints RouteAll.
+# With TEST_TAILSCALE_STDERR set, each call first prints that text on stderr. With
+# TEST_SERVE_NEEDS_LOGIN=1, `serve --bg` finds the node logged out: it prints the login URL
+# TEST_SERVE_LOGIN_URL as Tailscale v1.104.1 does (cmd/tailscale/cli/serve_legacy.go:206-216, with
+# isRunningOrStarting of status.go:262-285: "Logged out." and "Log in at: URL", on stderr) and exits 1.
 cat >"$bin/tailscale" <<'EOF'
 #!/usr/bin/env bash
 printf 'tailscale %s\n' "$*" >>"$TEST_LOG"
+[[ -z ${TEST_TAILSCALE_STDERR:-} ]] || printf '%s\n' "$TEST_TAILSCALE_STDERR" >&2
 unexpected() {
   printf 'fake tailscale: unexpected call: tailscale %s\n' "$*" >&2
   exit 2
@@ -755,6 +760,10 @@ case $1 in
         ;;
       '--bg --https '*)
         (($# == 5)) || unexpected "$@"
+        if [[ ${TEST_SERVE_NEEDS_LOGIN:-} == 1 ]]; then
+          printf 'Logged out.\nLog in at: %s\n' "$TEST_SERVE_LOGIN_URL" >&2
+          exit 1
+        fi
         code=${TEST_SERVE_EXIT:-0}
         if ((${TEST_SERVE_HANG_TIMES:-0} > 0)); then
           hung=$(cat -- "$TEST_LOG.serve-hung" 2>/dev/null) || hung=0
@@ -1030,11 +1039,12 @@ EOF
 # real_provision NAME runs the provision.sh of release NAME, now the latest release, on the fake Pi,
 # joined to the tailnet, with the real nightly update behind the update unit's start: the real
 # launcher and update.sh run against the fake release API, recorder, systemd, sudo and Tailscale,
-# on a clock that sleep moves. The update's lines go to the journal that provision.sh prints.
+# on a clock that sleep moves. The update's lines go to the journal $work_dir/journal, and the Serve
+# unit's to $TEST_LOG.serve-journal, which provision.sh names but never prints.
 real_provision() {
   cp -- "$TEST_RELEASES/$1/release.json" "$TEST_RELEASES/latest.json"
   : >"$TEST_LOG"
-  rm -f -- "$TEST_LOG.errors"
+  rm -f -- "$TEST_LOG.errors" "$TEST_LOG.serve-journal"
   : >"$work_dir/journal"
   printf '1000\n' >"$TEST_CLOCK"
   TEST_REAL_UPDATE=1 TEST_JOURNAL=$work_dir/journal TEST_SELF_STATUS=$joined_status \
@@ -1061,6 +1071,7 @@ installed_set() {
 # expect_ran WHAT fails unless the run exited 0, printed no bash error, and broke no rule of a fake.
 expect_ran() {
   ((rc == 0)) || fail "$1: provision.sh exited $rc: $(<"$work_dir/out")"
+  read_no_journal "$1"
   if grep -E 'provision\.sh: line [0-9]+: ' "$work_dir/out" >&2; then
     fail "$1: provision.sh printed a bash error (above)"
   fi
@@ -1071,9 +1082,31 @@ expect_ran() {
 expect_refused() {
   ((rc != 0)) || fail "$1: provision.sh exited 0: $(<"$work_dir/out")"
   grep -Fq -- "$2" "$work_dir/out" || fail "$1: provision.sh did not say '$2': $(<"$work_dir/out")"
+  read_no_journal "$1"
+}
+
+# read_no_journal WHAT fails when the run read the journal of a unit, the Serve apply's, the nightly
+# update's or a run's, or printed a line of the Serve unit: a unit's lines can hold a login URL of
+# tailscale (GPT-6.1 Sol's review of #208, rounds 1 and 2), so a run names the command that reads
+# them and never copies them into its own output.
+read_no_journal() {
+  ! grep -Eq '^sudo journalctl .*(-u ghost-wispr-|_SYSTEMD_USER_UNIT=)' "$TEST_LOG" \
+    || fail "$1: provision.sh read a unit's journal: $(grep -E '^sudo journalctl ' "$TEST_LOG")"
+  ! grep -Fq 'ghost-wispr serve: ' "$work_dir/out" || fail "$1: provision.sh printed its Serve unit's lines: $(<"$work_dir/out")"
 }
 
 said() { grep -Fq -- "$1" "$work_dir/out"; }
+# serve_journaled TEXT: the Serve unit's journal holds TEXT. update_journaled TEXT: the nightly
+# update's journal does.
+serve_journaled() { grep -Fq -- "$1" "$TEST_LOG.serve-journal" 2>/dev/null; }
+update_journaled() { grep -Fq -- "$1" "$work_dir/journal" 2>/dev/null; }
+# expect_busy WHAT WHY: the run refused a busy recorder in its own words and named the Serve unit's
+# journal, whose line, not the run's output, says WHY.
+expect_busy() {
+  expect_refused "$1" 'so Serve was not reset and nothing in Serve was changed'
+  said 'its journal says why: sudo journalctl -u ghost-wispr-serve-' || fail "$1: provision.sh did not name the Serve unit's journal: $(<"$work_dir/out")"
+  serve_journaled "ghost-wispr serve: $2; Serve was not reset" || fail "$1: the Serve unit did not say '$2': $(cat -- "$TEST_LOG.serve-journal" 2>/dev/null)"
+}
 logged() { grep -Fxq -- "$1" "${2:-$TEST_LOG}"; }
 
 # line_of LINE [LOG] prints the number of the first line of LOG that is LINE, or nothing.
@@ -1230,10 +1263,11 @@ want_start=$(
 
 begin first-run
 expect_ran 'the first run'
-said "ghost-wispr update: installed commit $release_commit (invocation test-invocation)" \
-  || fail "provision.sh did not print the update's lines from its journal: $(<"$work_dir/out")"
-grep -Eq '^sudo journalctl _SYSTEMD_USER_UNIT=ghost-wispr-update\.service --since=@[0-9]+ --no-pager --output=cat$' \
-  "$work_dir/first.log" || fail "provision.sh did not read this run's lines of the update from the journal: $(<"$work_dir/first.log")"
+# The update's lines stay in its journal (GPT-6.1 Sol's review of #208, round 2): the run says how
+# the update ended and names the command that reads this run's lines, and prints none of them.
+! said "ghost-wispr update: installed commit" || fail "provision.sh printed the update's lines from its journal: $(<"$work_dir/out")"
+grep -Eq "^ghost-wispr provision: ghost-wispr-update\.service, the nightly update, succeeded \(exit 0\); read this run's lines with: sudo journalctl _SYSTEMD_USER_UNIT=ghost-wispr-update\.service --since=@[0-9]+$" \
+  "$work_dir/out" || fail "provision.sh did not name the command that reads this run's lines of the update: $(<"$work_dir/out")"
 
 # credentials-written: where the Pi has no credential files, provision.sh writes them from pi.env
 # with each field that gcloud's create-cred-config writes for an X.509 credential, naming the Pi's
@@ -1462,13 +1496,13 @@ make_release c "$commit_c" "$commit_c"
 new_pi
 real_provision a
 expect_ran 'release a on a new Pi'
-said "ghost-wispr update: installed commit $commit_a" || fail "the update did not install release a: $(<"$work_dir/out")"
+update_journaled "ghost-wispr update: installed commit $commit_a" || fail "the update did not install release a: $(<"$work_dir/journal")"
 [[ $(head -n 1 "$deploy/deploy.verified") == "commit $commit_a" ]] || fail "deploy.verified does not name release a: $(<"$deploy/deploy.verified")"
 release_a=$(installed_set)
 [[ $release_a != *missing* && $release_a == *"answers $commit_a" ]] || fail "release a is not installed whole: $release_a"
 real_provision a
 expect_ran 'release a again'
-said "ghost-wispr update: already current at commit $commit_a" || fail "the update did not find release a current: $(<"$work_dir/out")"
+update_journaled "ghost-wispr update: already current at commit $commit_a" || fail "the update did not find release a current: $(<"$work_dir/journal")"
 [[ -z $(find "$deploy" -maxdepth 1 -name '*.prev') ]] \
   || fail "a run of the release the Pi runs made .prev copies: $(find "$deploy" -maxdepth 1 -name '*.prev')"
 [[ $(installed_set) == "$release_a" ]] || fail 'a run of the release the Pi runs changed its set'
@@ -1479,8 +1513,8 @@ said "kept the set of commit $commit_a, which the Pi runs, as its .prev copies" 
   || fail "provision.sh did not keep release a's set before it replaced update.sh: $(<"$work_dir/out")"
 # The update finds the installed set not the verified one, since provision.sh installed release b's
 # update.sh, pi-lib.sh and pi.env, so it rolls back every file that has a .prev copy.
-if ! said "did not answer /api/version with commit $commit_b" || ! said 'restored the last verified set, the one deploy.verified lists'; then
-  fail "the update did not install release b and roll it back: $(<"$work_dir/out")"
+if ! update_journaled "did not answer /api/version with commit $commit_b" || ! update_journaled 'restored the last verified set, the one deploy.verified lists'; then
+  fail "the update did not install release b and roll it back: $(<"$work_dir/journal")"
 fi
 [[ $(installed_set) == "$release_a" ]] \
   || fail "after the failed install of release b, the Pi is not on release a's set: $(diff <(printf '%s\n' "$release_a") <(installed_set) || true)"
@@ -1535,10 +1569,10 @@ for history in 'with a version file' 'with no version file'; do
   real_provision d
   expect_refused "release d with certificate version 8, $history" 'the nightly update failed'
   [[ ! -s $TEST_LOG.errors ]] || fail "release d, $history: $(<"$TEST_LOG.errors")"
-  said 'pi-secrets: certificate version 8, not after 2027-12-01T00:00:00Z: newer and signs in' \
-    || fail "control, $history: pi-secrets staged no certificate: $(<"$work_dir/out")"
-  if ! said "did not answer /api/version with commit $commit_d" || ! said 'restored the last verified set, the one deploy.verified lists'; then
-    fail "the update did not install release d and roll it back, $history: $(<"$work_dir/out")"
+  update_journaled 'pi-secrets: certificate version 8, not after 2027-12-01T00:00:00Z: newer and signs in' \
+    || fail "control, $history: pi-secrets staged no certificate: $(<"$work_dir/journal")"
+  if ! update_journaled "did not answer /api/version with commit $commit_d" || ! update_journaled 'restored the last verified set, the one deploy.verified lists'; then
+    fail "the update did not install release d and roll it back, $history: $(<"$work_dir/journal")"
   fi
   [[ $(installed_set) == "$release_a" ]] || fail "after the failed install of release d, $history, the Pi is not on release a's set"
   [[ $(certificate_file device.crt) == 'certificate version 7' ]] \
@@ -1574,7 +1608,7 @@ real_provision c
 expect_ran 'release c on a Pi whose update unit is broken'
 cmp -s -- "$TEST_RELEASES/c/ghost-wispr-pi-deploy/ghost-wispr-update.service" "$units/ghost-wispr-update.service" \
   || fail "provision.sh did not install release c's update unit: $(<"$units/ghost-wispr-update.service")"
-said "ghost-wispr update: installed commit $commit_c" || fail "the update did not install release c: $(<"$work_dir/out")"
+update_journaled "ghost-wispr update: installed commit $commit_c" || fail "the update did not install release c: $(<"$work_dir/journal")"
 [[ $(head -n 1 "$deploy/deploy.verified") == "commit $commit_c" ]] || fail "deploy.verified does not name release c: $(<"$deploy/deploy.verified")"
 said 'already joined' || fail "provision.sh stopped before the join: $(<"$work_dir/out")"
 
@@ -1618,8 +1652,10 @@ reset_line=$(grep -n '^tailscale serve reset$' "$TEST_LOG" | head -n1 | cut -d: 
 apply_line=$(grep -n '^tailscale serve --bg --https 443 ' "$TEST_LOG" | head -n1 | cut -d: -f1)
 [[ -n $status_read && -n $reset_line && -n $apply_line ]] && ((status_read < reset_line && reset_line < apply_line)) \
   || fail "the Serve apply did not read the recorder's status, then reset Serve, then apply serve.conf: $(<"$TEST_LOG")"
-said 'ghost-wispr serve: resetting Serve (tailscale serve reset) and applying serve.conf' \
-  || fail "provision.sh did not print the lines of its Serve unit: $(<"$work_dir/out")"
+serve_journaled 'ghost-wispr serve: resetting Serve (tailscale serve reset) and applying serve.conf' \
+  || fail "the Serve unit did not say that it resets Serve and applies serve.conf: $(cat -- "$TEST_LOG.serve-journal" 2>/dev/null)"
+grep -Eq "^ghost-wispr provision: ghost-wispr-serve-$uuid_re\.service, the Serve apply, succeeded \(exit 0\); read its lines, which can hold a tailscale login URL, with: sudo journalctl -u ghost-wispr-serve-$uuid_re\.service$" \
+  "$work_dir/out" || fail "provision.sh did not say how its Serve unit ended and name its journal: $(<"$work_dir/out")"
 # The run's apply has a unit and a serve-apply of its own, both named by the run's id, never by the
 # time (GPT-6.1 Sol's review of #203, round 2: two runs in one second shared a unit name), and a
 # RuntimeMaxSec: the status read (20 s), the reset and 4 tries of serve.conf's one line, each call
@@ -2012,9 +2048,9 @@ for busy in 'active session|{"active_session_id":"meeting-123","paused":false,"c
   cp -- "$renamed" "$TEST_SERVE_STATE"
   printf '%s\n' "${busy#*|}" >"$state/status.json"
   real_provision a
-  expect_refused "a recorder that holds $reason" "ghost-wispr serve: $reason; Serve was not reset"
-  said "ghost-wispr update: $reason; leaving the current release in place" \
-    || fail "control: the update did not find the recorder holding $reason: $(<"$work_dir/out")"
+  expect_busy "a recorder that holds $reason" "$reason"
+  update_journaled "ghost-wispr update: $reason; leaving the current release in place" \
+    || fail "control: the update did not find the recorder holding $reason: $(<"$work_dir/journal")"
   said 'nothing in Serve was changed' || fail "a recorder that holds $reason: provision.sh did not say Serve is unchanged: $(<"$work_dir/out")"
   cmp -s -- "$renamed" "$TEST_SERVE_STATE" || fail "provision.sh changed Serve while the recorder held $reason: $(<"$TEST_SERVE_STATE")"
   no_serve_change "a recorder that holds $reason"
@@ -2027,9 +2063,9 @@ real_provision a
 expect_ran 'release a on a new Pi, before the recorder becomes busy after the update'
 cp -- "$renamed" "$TEST_SERVE_STATE"
 TEST_BUSY_AFTER_UPDATE='{"active_session_id":"meeting-456","paused":false,"capture_state":"recording"}' real_provision a
-expect_refused 'a recorder that became busy after the update' 'ghost-wispr serve: active session; Serve was not reset'
-said "ghost-wispr update: already current at commit $commit_a" \
-  || fail "control: the update did not find the recorder free: $(<"$work_dir/out")"
+expect_busy 'a recorder that became busy after the update' 'active session'
+update_journaled "ghost-wispr update: already current at commit $commit_a" \
+  || fail "control: the update did not find the recorder free: $(<"$work_dir/journal")"
 cmp -s -- "$renamed" "$TEST_SERVE_STATE" || fail "provision.sh changed Serve while the recorder became busy: $(<"$TEST_SERVE_STATE")"
 no_serve_change 'a recorder that became busy after the update'
 # A running recorder whose status cannot be read: an answer that is not its status, and a read that
@@ -2045,7 +2081,7 @@ for unreadable in 'an answer that is not a status' 'a read that does not end in 
   else
     TEST_STATUS_CURL_EXIT=28 run_provision "$stage"
   fi
-  expect_refused "a running recorder with $unreadable" 'ghost-wispr serve: ghost-wispr.service is active, and /api/status gave no status; Serve was not reset'
+  expect_busy "a running recorder with $unreadable" 'ghost-wispr.service is active, and /api/status gave no status'
   cmp -s -- "$renamed" "$TEST_SERVE_STATE" || fail "provision.sh changed Serve with $unreadable: $(<"$TEST_SERVE_STATE")"
   no_serve_change "a running recorder with $unreadable"
   [[ ! -e $TEST_LOG.join ]] || fail "provision.sh started the join with $unreadable"
@@ -2071,7 +2107,7 @@ for manager in 'a manager that does not answer|TEST_SERVICE_STATE_HANG=1|the sta
   for setting in $settings; do
     unset "${setting%%=*}"
   done
-  expect_refused "$what" "ghost-wispr serve: $reason, and /api/status gave no status; Serve was not reset"
+  expect_busy "$what" "$reason, and /api/status gave no status"
   cmp -s -- "$renamed" "$TEST_SERVE_STATE" || fail "$what: provision.sh changed Serve: $(<"$TEST_SERVE_STATE")"
   no_serve_change "$what"
 done
@@ -2096,8 +2132,8 @@ cp -- "$renamed" "$TEST_SERVE_STATE"
 TEST_SERVE_FAIL_TIMES=1 run_provision "$stage"
 expect_ran 'a Serve call that fails once after the reset'
 serve_is 'a Serve call that fails once after the reset' "$want_serve"
-said 'ghost-wispr serve: a tailscale serve call failed or did not end within 5 s after the reset; applying serve.conf again (try 2 of 4)' \
-  || fail "the apply did not say it applied serve.conf again: $(<"$work_dir/out")"
+serve_journaled 'ghost-wispr serve: a tailscale serve call failed or did not end within 5 s after the reset; applying serve.conf again (try 2 of 4)' \
+  || fail "the apply did not say it applied serve.conf again: $(cat -- "$TEST_LOG.serve-journal" 2>/dev/null)"
 # A tailscale serve call that never ends after a reset that did (Sol's review of #203, round 2: the
 # first apply hung, the try did not end, and provision.sh waited for good): each call ends after
 # 5 s, here, and its failure takes a try. Break it catches: a call with no bound, which the unit's
@@ -2107,8 +2143,24 @@ cp -- "$renamed" "$TEST_SERVE_STATE"
 TEST_SERVE_HANG_TIMES=1 run_provision "$stage"
 expect_ran 'a Serve call that never ends after the reset'
 serve_is 'a Serve call that never ends after the reset' "$want_serve"
-said 'did not end within 5 s after the reset; applying serve.conf again (try 2 of 4)' \
-  || fail "the apply did not say a call did not end and that it applied serve.conf again: $(<"$work_dir/out")"
+serve_journaled 'did not end within 5 s after the reset; applying serve.conf again (try 2 of 4)' \
+  || fail "the apply did not say a call did not end and that it applied serve.conf again: $(cat -- "$TEST_LOG.serve-journal" 2>/dev/null)"
+# A node that Tailscale logs out during the apply (GPT-6.1 Sol's review of #208, round 2, with
+# Tailscale 1.104.4): each tailscale serve --bg after the reset prints "Logged out." and the login
+# URL, and fails. The run says that the apply failed, its exit and the command that reads its
+# journal, and prints no line of that journal. Break it catches: a run that copies its Serve unit's
+# lines into its own output, as the run did four times with the URL in Sol's reproduction.
+new_pi
+login_url=https://login.tailscale.com/a/dummy-serve-login-canary
+TEST_SERVE_NEEDS_LOGIN=1 TEST_SERVE_LOGIN_URL=$login_url run_provision "$stage"
+[[ $(grep -c -F "Log in at: $login_url" "$TEST_LOG.serve-journal" 2>/dev/null) == 4 ]] \
+  || fail "control: the Serve unit's journal does not hold the login URL of 4 tries: $(cat -- "$TEST_LOG.serve-journal" 2>/dev/null)"
+! grep -Eq 'dummy-serve-login-canary|Log in at|Logged out' "$work_dir/out" \
+  || fail "a run printed the login URL of a node logged out during the Serve apply: $(<"$work_dir/out")"
+expect_refused 'a node logged out during the Serve apply' "Serve is now [none], so the page is not served: run the release's ./provision.sh again"
+grep -Eq "^ghost-wispr provision: ghost-wispr-serve-$uuid_re\.service, the Serve apply, failed \(exit 1\); read its lines, which can hold a tailscale login URL, with: sudo journalctl -u ghost-wispr-serve-$uuid_re\.service$" \
+  "$work_dir/out" || fail "provision.sh did not say that its Serve unit failed and name its journal: $(<"$work_dir/out")"
+[[ ! -e $TEST_LOG.join ]] || fail "provision.sh started the join although the node is logged out"
 # A call that fails on every try: the apply ends failed after 4 tries, and provision.sh says that the
 # page is not served and what to run, and stops before the join.
 new_pi
@@ -2117,18 +2169,31 @@ expect_refused 'a Serve line that tailscale refuses on every try' "Serve is now 
 [[ $(grep -c '^tailscale serve --bg --https 443 ' "$TEST_LOG") == 4 ]] \
   || fail "the apply tried serve.conf's line $(grep -c '^tailscale serve --bg --https 443 ' "$TEST_LOG") times, want 4"
 [[ ! -e $TEST_LOG.join ]] || fail "provision.sh started the join although Serve is not serve.conf's"
+# No tailscale call's output reaches a run's output (Sol's review of #208, round 2): each call prints
+# a canary on stderr, the run's own reads of the node's status and of Serve, and its Serve unit's
+# reset and apply. Break it catches: a run that passes a tailscale call's stderr through.
+new_pi
+cp -- "$renamed" "$TEST_SERVE_STATE"
+TEST_SELF_STATUS=$joined_status TEST_TAILSCALE_STDERR=tailscale-stderr-canary run_provision "$stage"
+expect_ran 'tailscale calls that print on stderr'
+for call in 'tailscale status --self --json' 'tailscale serve status --json' 'tailscale serve reset'; do
+  logged "$call" || fail "control: the run made no call '$call': $(<"$TEST_LOG")"
+done
+serve_journaled tailscale-stderr-canary || fail "control: the Serve unit's journal does not hold the canary: $(cat -- "$TEST_LOG.serve-journal" 2>/dev/null)"
+! said tailscale-stderr-canary || fail "a run printed a tailscale call's stderr: $(<"$work_dir/out")"
 
 # ---------------------------------------------------------------------------------------------------
-# update-fails: when the update fails, provision.sh prints that run's lines from the journal and
-# fails, before it enables the recorder, touches Serve or joins.
+# update-fails: when the update fails, provision.sh says so and names the command that reads that
+# run's lines from the journal, prints none of them, and fails, before it enables the recorder,
+# touches Serve or joins.
 begin update-fails
 new_pi
 printf '%s\n' 'ghost-wispr launcher: invocation test-invocation trigger none at none' \
   'ghost-wispr update: could not read the latest release from https://api.github.com/repos/sjawhar/ghost-wispr/releases/latest' \
   >"$work_dir/journal"
 TEST_UPDATE_EXIT=1 TEST_JOURNAL=$work_dir/journal run_provision "$stage"
-expect_refused 'a failed update' 'could not read the latest release'
-said 'ghost-wispr-update.service' || fail "provision.sh did not name the update that failed: $(<"$work_dir/out")"
+expect_refused 'a failed update' "the nightly update failed (systemctl --user start ghost-wispr-update.service exited 1); read this run's lines with: sudo journalctl _SYSTEMD_USER_UNIT=ghost-wispr-update.service --since=@"
+! said 'could not read the latest release' || fail "provision.sh printed the failed update's lines from its journal: $(<"$work_dir/out")"
 if grep -Eq 'enable ghost-wispr\.service|tailscale serve|systemd-run' "$TEST_LOG"; then
   fail "provision.sh went on after the update failed: $(<"$TEST_LOG")"
 fi
