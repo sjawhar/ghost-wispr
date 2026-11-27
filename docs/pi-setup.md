@@ -264,8 +264,10 @@ restarts the recorder, and a restart ends a conversation that is being recorded.
 
    `provision.sh` runs as `ghost-wispr`, with passwordless sudo, and refuses data on standard
    input. One provisioning run at a time: each run, with the join it starts, holds
-   `/run/lock/ghost-wispr-provision.lock`, and a second run fails, names the run or the join that
-   holds it, and changes nothing. It refuses a directory whose files do not match its
+   `/run/lock/ghost-wispr-provision.lock`, and a second run waits up to 2 s, then fails, names the
+   run or the join that holds it, and changes nothing; when that holder has ended, it says the lock
+   is held by a process that exited. No command a run starts holds the lock, so none that outlives
+   its run keeps it. It refuses a directory whose files do not match its
    `manifest.json`, such as a checkout's `deploy/pi/`. Before it changes anything, it refuses while
    the environment of `ghost-wispr`'s user manager sets `GHOST_WISPR_CONFIG` or an Envoy variable,
    which the recorder would inherit ("Turn on the meeting voice", step 1). Then it:
@@ -289,11 +291,14 @@ restarts the recorder, and a restart ends a conversation that is being recorded.
      `provision.sh`, which waits for it and prints its lines. The unit and its `serve-apply` are the
      run's own, named by its run id, and `serve-apply` removes itself when it ends, so no run
      removes another run's. `serve-apply` reads the recorder's `/api/status` immediately before the
-     reset. While the recorder records a conversation (a non-empty `active_session_id`), holds a
-     call whose `state` is not `none`, or runs and gives no status that it can read, it resets
-     nothing, and `provision.sh` stops and says that nothing in Serve was changed: run it again
-     after the meeting. The read is a snapshot: a session that starts after that read, in the
-     fraction of a second before the reset, is not seen, so provision outside meetings. Otherwise
+     reset. While the recorder records a conversation (a non-empty `active_session_id`) or holds a
+     call whose `state` is not `none`, it resets nothing, and `provision.sh` stops and says that
+     nothing in Serve was changed: run it again after the meeting. With no status that it can
+     read, it goes on only when `ghost-wispr`'s user manager confirms `inactive` for
+     `ghost-wispr.service` within 30 s; a manager that does not answer, a read that fails, or any
+     other state refuses the same way. The read is a snapshot: a session that starts after that
+     read, in the fraction of a second before the reset, is not seen, so provision outside
+     meetings. Otherwise
      it clears Serve with `tailscale serve reset`, Tailscale's documented way to clear Serve
      ([tailscale serve](https://tailscale.com/kb/1242/tailscale-serve), "Reset Tailscale Serve"),
      and then it applies each line of `serve.conf` with `tailscale serve --bg --https`. Each
@@ -315,14 +320,19 @@ restarts the recorder, and a restart ends a conversation that is being recorded.
      `tag:ghost-wispr` already.
 
    It ends with `already joined as tag:ghost-wispr`, or with the line that names the detached join
-   unit it started. The SSH session can end while Tailscale re-authenticates (exit 255). The join
-   unit first takes `/run/lock/ghost-wispr-provision.lock`, which it gets once `provision.sh` has
-   ended, and holds it to its own end; its `RuntimeMaxSec` of 15 minutes keeps a join that hangs
-   from holding it for good. The join unit's command line runs the run's `serve-apply` with each
-   line of `serve.conf` as its arguments, so the join reads no file of the release directory. The
-   join runs the same apply after the re-authentication, with the same status read: while the
-   recorder is busy, it resets nothing in Serve, and the join unit ends failed with exit 75. The
-   join runs `tailscale up`
+   unit it started. Its read of whether the Pi is joined ends after 30 s too. The SSH session can
+   end while Tailscale re-authenticates (exit 255). The join unit first takes
+   `/run/lock/ghost-wispr-provision.lock`, which it gets once `provision.sh` has ended, and holds it
+   to its own end; its `RuntimeMaxSec` of 15 minutes keeps a join that hangs from holding it for
+   good. The join's token, route check and `serve-apply` are in the run's directory under
+   `/run/ghost-wispr-join`, a tmpfs that a boot clears. The join removes the token as soon as
+   `tailscale up` ends, and the unit's `ExecStopPost` removes the run's directory whatever stopped
+   the join: its end, a failure, a kill or its `RuntimeMaxSec`. When the join unit does not start,
+   `provision.sh` removes the directory itself and fails. The join unit's command line runs the
+   run's `serve-apply` with each line of `serve.conf` as its arguments, so the join reads no file of
+   the release directory. The join runs the same apply after the re-authentication, with the same
+   status read: while the recorder is busy, it resets nothing in Serve, and the join unit ends
+   failed with exit 75. The join runs `tailscale up`
    with `--accept-routes=false`, so the Pi joins with the tailnet's subnet routes off. Then it runs
    the route check of "Accept the tailnet's subnet routes", and accepts the routes
    (`tailscale set --accept-routes`) only when no peer's `PrimaryRoutes` overlaps a network of the

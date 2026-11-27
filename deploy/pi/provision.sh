@@ -22,7 +22,7 @@ set -euo pipefail
 
 # GHOST_WISPR_DEPLOY_DIR, GHOST_WISPR_UNIT_DIR, GHOST_WISPR_SYSTEM_ROOT, GHOST_WISPR_IDENTITY_KEY,
 # GHOST_WISPR_JOIN_DIR, GHOST_WISPR_STATUS_URL, GHOST_WISPR_PROVISION_LOCK and
-# GHOST_WISPR_SERVE_CALL_TIMEOUT exist for provision_run_test.sh, as update.sh's do for
+# GHOST_WISPR_TAILSCALE_CALL_TIMEOUT exist for provision_run_test.sh, as update.sh's do for
 # update_test.sh.
 readonly DEPLOY_DIR="${GHOST_WISPR_DEPLOY_DIR:-/opt/ghost-wispr}"
 readonly UNIT_DIR="${GHOST_WISPR_UNIT_DIR:-/home/ghost-wispr/.config/systemd/user}"
@@ -33,20 +33,23 @@ readonly IDENTITY_KEY="${GHOST_WISPR_IDENTITY_KEY:-/home/ghost-wispr/.config/gho
 readonly STATUS_URL="${GHOST_WISPR_STATUS_URL:-http://127.0.0.1:8080/api/status}"
 # Root's directory for what the join and the Serve apply run. Each run has a directory of its own in
 # it, RUN_DIR, named by its run id, for the join's token and route check and the run's serve-apply
-# (serve_apply_script), so no run replaces or removes a file of another run's join.
-readonly JOIN_DIR="${GHOST_WISPR_JOIN_DIR:-/var/lib/ghost-wispr-join}"
+# (serve_apply_script), so no run replaces or removes a file of another run's join. It is on /run, a
+# tmpfs, so a boot clears a token that a stopped join could not remove (Sol's review of #203, round
+# 3); the join unit's ExecStopPost removes it in every other case.
+readonly JOIN_DIR="${GHOST_WISPR_JOIN_DIR:-/run/ghost-wispr-join}"
 # The provisioning lock (take_provision_lock). /run/lock is the system's directory for lock files,
 # which every user may write and a boot empties.
 readonly PROVISION_LOCK="${GHOST_WISPR_PROVISION_LOCK:-/run/lock/ghost-wispr-provision.lock}"
 readonly SERVICE_USER=ghost-wispr
 # What serve-apply's refusal of a busy recorder exits with.
 readonly SERVE_APPLY_BUSY=75
-# How long each tailscale call of serve-apply, and provision.sh's reads of Serve and of the device's
-# name, may take: SERVE_CALL_TIMEOUT s, then 5 s more before a kill. Each is a local request to
-# tailscaled over its socket, which answers in well under a second (GPT-6.1 Sol's runs of the reset
-# on a loaded dev box took 138 to 375 ms from the status read). 30 s leaves room for a loaded Pi or
-# a tailscaled that restarts, and keeps 4 tries of one line within about 2.5 minutes.
-readonly SERVE_CALL_TIMEOUT="${GHOST_WISPR_SERVE_CALL_TIMEOUT:-30}"
+# How long each tailscale call of provision.sh and of serve-apply may take, and serve-apply's read
+# of ghost-wispr.service's state: TAILSCALE_CALL_TIMEOUT s, then 5 s more before a kill. Each is a
+# local request to tailscaled or to the user manager over its socket, which answers in well under a
+# second (GPT-6.1 Sol's runs of the reset on a loaded dev box took 138 to 375 ms from the status
+# read). 30 s leaves room for a loaded Pi or a tailscaled that restarts, and keeps 4 tries of one
+# line within about 2.5 minutes.
+readonly TAILSCALE_CALL_TIMEOUT="${GHOST_WISPR_TAILSCALE_CALL_TIMEOUT:-30}"
 # The join unit's RuntimeMaxSec, 15 minutes: tailscale up's re-authentication with an ID token takes
 # seconds, and the limit keeps a join that hangs from holding the provisioning lock for good.
 readonly JOIN_RUNTIME_MAX=900
@@ -79,18 +82,27 @@ require_service_user() {
   [[ $(id -un) == "$SERVICE_USER" ]] || fail "run as $SERVICE_USER"
 }
 
-# take_provision_lock WHAT takes the provisioning lock, PROVISION_LOCK, on file descriptor 9 for the
-# rest of this run, and writes WHAT, with this run's PID, as its holder. One provisioning run, or the
-# detached join that a run starts, holds it at a time: a run while another holds it fails, names the
-# holder, and changes nothing. The join takes the lock when its run ends, and holds it to its own
-# end (GPT-6.1 Sol's review of #203, round 2: a second run removed the serve-apply of a join still
-# waiting in its re-authentication). The commands this run gives to sudo do not hold it: sudo
-# closes each descriptor above 2.
+# take_provision_lock WHAT takes the provisioning lock, PROVISION_LOCK, for the rest of this run, and
+# writes WHAT, with this run's PID, as its holder. One provisioning run, or the detached join that a
+# run starts, holds it at a time: a run while another holds it fails, names the holder, and changes
+# nothing; when the named holder has exited, it says so. The join takes the lock when its run ends,
+# and holds it to its own end (GPT-6.1 Sol's review of #203, round 2: a second run removed the
+# serve-apply of a join still waiting in its re-authentication). The lock's descriptor is not this
+# shell's: a holder process, flock -o around tail --pid, holds it and ends within 0.1 s of this run,
+# so no command that this run starts inherits it, and none that outlives the run keeps the lock
+# (round 3: a hung read inherited the descriptor and kept the lock after its run was killed). A run
+# waits up to 2 s for the lock, so a run that starts just after another ended gets it.
 take_provision_lock() {
-  local holder
-  exec 9>>"$PROVISION_LOCK" || fail "cannot open the provisioning lock $PROVISION_LOCK: nothing was changed"
-  if ! flock -n 9; then
+  local answer='' holder
+  # shellcheck disable=SC2016 # sh expands "$1", this run's PID, which it gets as its argument.
+  exec 8< <(flock -w 2 -o "$PROVISION_LOCK" sh -c 'echo held; exec tail --pid="$1" -s 0.1 -f /dev/null' sh "$$" 2>/dev/null)
+  read -r -t 10 answer <&8 || answer=''
+  exec 8<&-
+  if [[ $answer != held ]]; then
     holder=$(cat -- "$PROVISION_LOCK" 2>/dev/null) || holder=
+    if [[ $holder =~ ,\ PID\ ([0-9]+)$ && ! -d /proc/${BASH_REMATCH[1]} ]]; then
+      holder="held by a process that exited: $holder"
+    fi
     fail "another provisioning run holds $PROVISION_LOCK (${holder:-it names no holder}): nothing was changed; run provision.sh again once it has ended"
   fi
   printf '%s, PID %s\n' "$1" "$$" >"$PROVISION_LOCK"
@@ -347,16 +359,18 @@ compare_client_id() {
 # - reads the recorder's status at STATUS_URL immediately before the reset, with update.sh's rules
 #   (pi-lib.sh's PI_LIB_RECORDER_STATUS_FILTER and PI_LIB_BUSY_REASON_FILTER), and exits
 #   SERVE_APPLY_BUSY, changing nothing, while the recorder records a session or holds a call whose
-#   state is not none, or while ghost-wispr.service is active and gives no status it can read: a
-#   reset would cut the page and /call under a meeting (GPT-6.1 Sol's review of PR #203). The read
-#   is a snapshot: a session that starts after it, in the fraction of a second before the reset, is
-#   not seen;
+#   state is not none: a reset would cut the page and /call under a meeting (GPT-6.1 Sol's review of
+#   PR #203). With no status it can read, it asks ghost-wispr's manager for ghost-wispr.service's
+#   state, and goes on only when the manager answers "inactive" in time; a manager that does not
+#   answer, a read that fails, or any other state refuses too (round 3: a manager that hung let the
+#   reset go on). The read is a snapshot: a session that starts after it, in the fraction of a
+#   second before the reset, is not seen;
 # - then clears Serve with `tailscale serve reset`, Tailscale's documented way to clear the Serve
 #   setting (https://tailscale.com/kb/1242/tailscale-serve, "Reset Tailscale Serve"), and applies
-#   each pair with `tailscale serve --bg --https`. Each tailscale call ends after SERVE_CALL_TIMEOUT
-#   s, and is killed 5 s later, so a call that hangs fails. When a call fails, it applies every pair
-#   again, up to 4 tries 2 s apart, and exits 1 when a call still fails. It exits 1 when the reset
-#   failed too;
+#   each pair with `tailscale serve --bg --https`. Each tailscale call ends after
+#   TAILSCALE_CALL_TIMEOUT s, and is killed 5 s later, so a call that hangs fails. When a call fails,
+#   it applies every pair again, up to 4 tries 2 s apart, and exits 1 when a call still fails. It
+#   exits 1 when the reset failed too;
 # - removes itself and its run's directory, once that is empty, when it ends: no other run removes
 #   it.
 # As a unit of its own, it goes on when provision.sh is killed or its SSH session ends between the
@@ -370,14 +384,21 @@ status_url=$1
 shift
 APPLY
   printf "status_filter='%s'\nbusy_filter='%s'\nbusy_exit=%s\ncall_timeout=%s\n" \
-    "$PI_LIB_RECORDER_STATUS_FILTER" "$PI_LIB_BUSY_REASON_FILTER" "$SERVE_APPLY_BUSY" "$SERVE_CALL_TIMEOUT"
+    "$PI_LIB_RECORDER_STATUS_FILTER" "$PI_LIB_BUSY_REASON_FILTER" "$SERVE_APPLY_BUSY" "$TAILSCALE_CALL_TIMEOUT"
   cat <<'APPLY'
 why=
 status=$(curl --connect-timeout 5 --max-time 10 --fail --silent "$status_url" 2>/dev/null) || status=
 if [ -n "$status" ] && printf '%s' "$status" | jq -e "$status_filter" >/dev/null 2>&1; then
   why=$(printf '%s' "$status" | jq -r "$busy_filter" 2>/dev/null) || why='status unreadable'
-elif timeout 10s systemctl --user --machine=ghost-wispr@ is-active --quiet ghost-wispr.service; then
-  why='ghost-wispr.service is active but /api/status gave no status'
+else
+  read_rc=0
+  state=$(timeout --kill-after=5s "${call_timeout}s" systemctl --user --machine=ghost-wispr@ is-active ghost-wispr.service 2>/dev/null) || read_rc=$?
+  case $read_rc:$state in
+    *:inactive) ;;
+    124:* | 137:*) why="the state of ghost-wispr.service did not come within $call_timeout s, and /api/status gave no status" ;;
+    *:) why="the state of ghost-wispr.service could not be read (systemctl exit $read_rc), and /api/status gave no status" ;;
+    *) why="ghost-wispr.service is $state, and /api/status gave no status" ;;
+  esac
 fi
 if [ -n "$why" ]; then
   printf 'ghost-wispr serve: %s; Serve was not reset\n' "$why"
@@ -422,9 +443,9 @@ install_serve_apply() {
 }
 
 # serve_status_json prints Tailscale Serve's setting, `tailscale serve status --json`, in at most
-# SERVE_CALL_TIMEOUT s.
+# TAILSCALE_CALL_TIMEOUT s.
 serve_status_json() {
-  timeout --kill-after=5s "${SERVE_CALL_TIMEOUT}s" sudo tailscale serve status --json
+  timeout --kill-after=5s "${TAILSCALE_CALL_TIMEOUT}s" sudo tailscale serve status --json
 }
 
 # apply_serve makes Tailscale Serve exactly serve.conf's setting for this device's tailnet name, as
@@ -436,14 +457,16 @@ serve_status_json() {
 # mount, a TCP forward or Funnel that serve.conf does not hold. It fails, and nothing in Serve was
 # changed, when the recorder is busy. From the reset until the last line is applied, the page is not
 # served. The unit's RuntimeMaxSec is the longest that serve-apply's bounded steps take, and 30 s to
-# spare: the status read (20 s), the reset and 4 tries of each line (SERVE_CALL_TIMEOUT s and 5 s
-# each) and 3 pauses of 2 s. When the unit fails or does not end in time, it says what Serve is now
+# spare: the status read (10 s), the service-state read, the reset and 4 tries of each line
+# (TAILSCALE_CALL_TIMEOUT s and 5 s each) and 3 pauses of 2 s. The unit's serve-apply removes
+# itself, and this run removes it too once the unit has ended, as a unit that did not start leaves
+# it. When the unit fails or does not end in time, it says what Serve is now
 # and the command to run. Last it prints the unit's lines, reads Serve again, as the nightly drift
 # check reads it (pi-lib.sh's serve_lines_from_status), and fails unless it is serve.conf's. It
 # changes nothing in Serve when it cannot read the device's name or Serve.
 apply_serve() {
   local self name live have state unit limit now status=0
-  if ! self=$(timeout --kill-after=5s "${SERVE_CALL_TIMEOUT}s" tailscale status --self --json) \
+  if ! self=$(timeout --kill-after=5s "${TAILSCALE_CALL_TIMEOUT}s" tailscale status --self --json) \
     || ! name=$(device_tailnet_name "$self"); then
     fail "could not read this device's tailnet name (tailscale status --self --json), for which Serve must be serve.conf's: nothing in Serve was changed"
   fi
@@ -459,7 +482,7 @@ apply_serve() {
     state="a setting it cannot read, such as a TCP forward or Funnel"
   fi
   unit="ghost-wispr-serve-$RUN_ID"
-  limit=$((20 + (SERVE_CALL_TIMEOUT + 5) * (1 + 4 * ${#serve_words[@]} / 2) + 3 * 2 + 30))
+  limit=$((10 + (TAILSCALE_CALL_TIMEOUT + 5) * (2 + 4 * ${#serve_words[@]} / 2) + 3 * 2 + 30))
   printf "ghost-wispr provision: Tailscale Serve for %s is [%s], not serve.conf's: resetting it and applying serve.conf in %s, a unit of its own, which finishes the apply even if this run or its SSH session ends\n" \
     "$name" "$(paste -sd ';' <<<"$state")" "$unit"
   install_serve_apply
@@ -467,6 +490,7 @@ apply_serve() {
     /bin/sh "$SERVE_APPLY" "$STATUS_URL" "${serve_words[@]}" </dev/null || status=$?
   printf 'ghost-wispr provision: the journal of %s:\n' "$unit"
   sudo journalctl -u "$unit" --no-pager --output=cat || printf 'ghost-wispr provision: could not read the journal of %s\n' "$unit"
+  sudo rm -f -- "$SERVE_APPLY"
   if ((status == SERVE_APPLY_BUSY)); then
     fail "the recorder records a conversation, holds a call or gives no status (its line is above), so Serve was not reset and nothing in Serve was changed: run provision.sh again when no conversation is recorded and no call is live"
   fi
@@ -825,7 +849,11 @@ systemctl --user enable ghost-wispr.service
 
 apply_serve
 
-self_status=$(tailscale status --self --json)
+# Whether the node is joined already, read in TAILSCALE_CALL_TIMEOUT s like each tailscale call: a
+# read that hangs would hold the run, and its lock, for good (Sol's review of #203, round 3).
+if ! self_status=$(timeout --kill-after=5s "${TAILSCALE_CALL_TIMEOUT}s" tailscale status --self --json); then
+  fail "could not read this device's tailnet status (tailscale status --self --json) before the join, in $TAILSCALE_CALL_TIMEOUT s: no join was started; run provision.sh again"
+fi
 if jq -e --arg hostname "$TAILSCALE_HOSTNAME" '
   .Self.Tags == ["tag:ghost-wispr"] and .Self.DNSName == $hostname
 ' <<<"$self_status" >/dev/null; then
@@ -873,21 +901,27 @@ join_unit="ghost-wispr-tailnet-join-$RUN_ID"
 # serve-apply, as apply_serve does, which reads the recorder's status immediately before its reset,
 # with each line of serve.conf as its arguments: the join runs after P2's command has removed the
 # release's directory, so it reads no file of it. First the join takes the provisioning lock, which
-# it gets once this run ends, and names itself its holder, so no later run starts before it ends.
-# Its RuntimeMaxSec keeps a join that hangs from holding the lock for good. It removes its run's
-# files and directory at its end.
+# it gets once this run ends, and names itself and its PID its holder, so no later run starts before
+# it ends. Its RuntimeMaxSec keeps a join that hangs from holding the lock for good. It removes the
+# token as soon as tailscale up ends, and its ExecStopPost removes the run's directory, the token's
+# among its files, whatever stopped the unit: its end, a failure, a kill or its RuntimeMaxSec (Sol's
+# review of #203, round 3: a killed or timed-out join left its token).
 join_command="exec 9>>$PROVISION_LOCK && flock 9 || exit 1;"
-join_command+=" printf '%s\\n' 'the join unit $join_unit of provision.sh run $RUN_ID' >$PROVISION_LOCK;"
+join_command+=" printf '%s, PID %s\\n' 'the join unit $join_unit of provision.sh run $RUN_ID' \$\$ >$PROVISION_LOCK;"
 join_command+=" tailscale up --force-reauth --client-id='$PI_TAILNET_CLIENT_ID?ephemeral=false&preauthorized=true'"
 join_command+=" --id-token=file:$JOIN_TOKEN --advertise-tags=tag:ghost-wispr --hostname=ghost-wispr --ssh --accept-routes=false;"
 join_command+=" rc=\$?; rm -f $JOIN_TOKEN;"
 join_command+=" if [ \$rc -eq 0 ]; then"
 join_command+=" /bin/sh $SERVE_APPLY $STATUS_URL ${serve_words[*]} || rc=\$?;"
 join_command+=" if /bin/sh $JOIN_ROUTE_CHECK; then tailscale set --accept-routes || rc=\$?; else rc=\$?; fi;"
-join_command+=" fi; rm -f $JOIN_ROUTE_CHECK $SERVE_APPLY; rmdir $RUN_DIR; exit \$rc"
+join_command+=" fi; exit \$rc"
 printf 'ghost-wispr provision: starting the tagged tailnet join as %s\n' "$join_unit"
 # systemd-run(1): the service manager expands ${NAME} and $$ in the command's arguments unless
 # --expand-environment=no, which systemd 254 added (Raspberry Pi OS Trixie has 257). The join
 # command is shell code for the unit's /bin/sh, which must get it as written.
-sudo systemd-run --expand-environment=no --unit="$join_unit" --property=RuntimeMaxSec="$JOIN_RUNTIME_MAX" /bin/sh -c "$join_command"
+if ! sudo systemd-run --expand-environment=no --unit="$join_unit" --property=RuntimeMaxSec="$JOIN_RUNTIME_MAX" \
+  --property=ExecStopPost="/bin/rm -rf -- $RUN_DIR" /bin/sh -c "$join_command"; then
+  sudo rm -rf -- "$RUN_DIR"
+  fail "could not start the join unit $join_unit (systemd-run failed): its token is removed, and the Pi did not join; run provision.sh again"
+fi
 printf 'ghost-wispr provision: reconnect with Tailscale SSH, then check tailscale status and sudo journalctl -u %s.\n' "$join_unit"
