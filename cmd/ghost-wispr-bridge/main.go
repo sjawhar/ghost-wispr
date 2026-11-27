@@ -24,6 +24,7 @@ import (
 	calendarapi "google.golang.org/api/calendar/v3"
 
 	"github.com/sjawhar/ghost-wispr/internal/calendar"
+	"github.com/sjawhar/ghost-wispr/internal/logging"
 )
 
 const usage = `usage: ghost-wispr-bridge <mode>
@@ -43,6 +44,12 @@ func main() {
 // run dispatches on the mode and gives the exit code: 2 for a usage or
 // settings error, 1 for a failure after the start.
 func run(ctx context.Context, args []string, getenv func(string) string, stdout, stderr io.Writer) int {
+	// Before any Google client is built: GOOGLE_SDK_GO_LOGGING_LEVEL turns on
+	// the SDK's own logger, which writes each request and answer whole to
+	// stderr, around the marked lines, and a calendar read's answer holds
+	// each event's title and description (logging.WithholdGoogleSDKLogging).
+	// The SDK reads the process's environment, not getenv.
+	logging.WithholdGoogleSDKLogging()
 	if len(args) != 1 {
 		_, _ = fmt.Fprint(stderr, usage)
 		return 2

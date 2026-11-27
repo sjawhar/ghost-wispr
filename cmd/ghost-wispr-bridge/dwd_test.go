@@ -10,6 +10,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
+	"os/exec"
 	"strings"
 	"sync"
 	"testing"
@@ -186,6 +188,108 @@ func TestARefusedDelegatedSignInIsLoggedAsAuth(t *testing.T) {
 			}
 			if got := errorClass(err); got != tc.want {
 				t.Fatalf("errorClass = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// sdkLogChildMode is set in the environment of each process that
+// TestGoogleSDKLoggingIsWithheldAtEachModesStart starts: the mode whose start
+// TestGoogleSDKLoggingChild runs first, "" for none.
+const sdkLogChildMode = "GHOST_WISPR_TEST_SDK_LOG_MODE"
+
+// The words of the one event the child's fake calendar answers with: in the
+// process's output, only Google's SDK logger writes them.
+const (
+	sdkLogTitle       = "quokka-meeting-title-canary"
+	sdkLogDescription = "quokka-meeting-description-canary"
+)
+
+// TestGoogleSDKLoggingChild is the process that
+// TestGoogleSDKLoggingIsWithheldAtEachModesStart starts. It runs the mode
+// sdkLogChildMode names with no settings, through run, which ends at the
+// settings' refusal; then it reads a calendar of one event through the
+// delegated sign-in, and prints "SDK-LOG-CHILD listed".
+func TestGoogleSDKLoggingChild(t *testing.T) {
+	mode, ok := os.LookupEnv(sdkLogChildMode)
+	if !ok {
+		t.Skip("the process that TestGoogleSDKLoggingIsWithheldAtEachModesStart starts")
+	}
+	if mode != "" {
+		var stdout, stderr strings.Builder
+		if code := run(t.Context(), []string{mode}, func(string) string { return "" }, &stdout, &stderr); code != 2 || !strings.Contains(stdout.String(), "SETTINGS-REFUSED") {
+			t.Fatalf("the %s mode with no settings exited %d, want 2 at SETTINGS-REFUSED; stdout %q stderr %q", mode, code, stdout.String(), stderr.String())
+		}
+	}
+	t.Setenv("GCE_METADATA_HOST", "")
+	google := &dwdGoogle{}
+	cal := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprintf(w, `{"kind":"calendar#events","items":[{"id":"event1","summary":%q,"description":%q}]}`, sdkLogTitle, sdkLogDescription)
+	}))
+	defer cal.Close()
+	ctx := context.Background()
+	svc, err := delegatedCalendarVia(ctx, metadata.NewClient(&http.Client{Transport: google}),
+		calendarapi.CalendarReadonlyScope, dwdBotUser,
+		[]option.ClientOption{option.WithHTTPClient(&http.Client{Transport: google})},
+		[]option.ClientOption{option.WithEndpoint(cal.URL + "/calendar/v3/")})
+	if err != nil {
+		t.Fatalf("delegatedCalendarVia: %v", err)
+	}
+	evs, err := svc.Events.List("primary").Context(ctx).Do()
+	if err != nil {
+		t.Fatalf("list the calendar: %v", err)
+	}
+	if len(evs.Items) != 1 || evs.Items[0].Summary != sdkLogTitle {
+		t.Fatalf("the calendar gave %d events, want the fake's one", len(evs.Items))
+	}
+	fmt.Println("SDK-LOG-CHILD listed")
+}
+
+// GOOGLE_SDK_GO_LOGGING_LEVEL=debug makes Google's SDK logger write each
+// answer whole to stderr, around the marked lines: an event's title and
+// description. Each mode's start, run, turns that logging off before the
+// mode reads its settings, and so before any Google client. Each case is a
+// process of its own, as the SDK reads the variable when a client is built.
+// The controls: with no mode's start, the SDK at debug writes both words;
+// with its logging off, neither. (Sol's second review of #202 at 2e217ba6,
+// TestReviewCalendarDebugLogsNeverExposeMeetingWords.)
+func TestGoogleSDKLoggingIsWithheldAtEachModesStart(t *testing.T) {
+	for _, tc := range []struct {
+		name, level, mode string
+		words             bool // the SDK's logger writes the event's words
+	}{
+		{"SDK debug, no mode's start (control)", "debug", "", true},
+		{"SDK logging off (control)", "", "", false},
+		{"bridge mode at SDK debug", "debug", "bridge", false},
+		{"watch mode at SDK debug", "debug", "watch", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cmd := exec.Command(os.Args[0], "-test.run=^TestGoogleSDKLoggingChild$")
+			for _, kv := range os.Environ() {
+				if !strings.HasPrefix(kv, "GOOGLE_SDK_GO_LOGGING_LEVEL=") && !strings.HasPrefix(kv, sdkLogChildMode+"=") {
+					cmd.Env = append(cmd.Env, kv)
+				}
+			}
+			cmd.Env = append(cmd.Env, sdkLogChildMode+"="+tc.mode, "GOOGLE_SDK_GO_LOGGING_LEVEL="+tc.level)
+			out, err := cmd.CombinedOutput()
+			if err != nil || !strings.Contains(string(out), "SDK-LOG-CHILD listed") {
+				t.Fatalf("the process read no calendar (%v):\n%s", err, out)
+			}
+			var withWords []string
+			title, description := false, false
+			for line := range strings.Lines(string(out)) {
+				if strings.Contains(line, sdkLogTitle) || strings.Contains(line, sdkLogDescription) {
+					withWords = append(withWords, line)
+					title = title || strings.Contains(line, sdkLogTitle)
+					description = description || strings.Contains(line, sdkLogDescription)
+				}
+			}
+			switch {
+			case tc.words && (!title || !description):
+				t.Fatalf("control: the SDK at debug wrote title %v, description %v; the check cannot see its logger:\n%s", title, description, out)
+			case !tc.words && len(withWords) > 0:
+				t.Fatalf("the SDK's logger wrote the event's words around the marked lines:\n%s", strings.Join(withWords, ""))
 			}
 		})
 	}
