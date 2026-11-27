@@ -24,7 +24,8 @@ const soundStreamRate = 48000
 // the mixer cannot run ahead of the writer: on a stream that never waits it
 // may run outputAhead ahead, and a writer the machine held back that long
 // leaves a gap inside the sound. It keeps every sample written, the device it
-// was opened on, how often it was opened, and whether it closed. With
+// was opened on, how often it was opened, whether it closed, and when the
+// last write that held sound returned and when it closed. With
 // failAfterSound, the fifth frame of silence after the sound fails, as a
 // device unplugged during the Output's idle frames would: by then Drain has
 // returned. With closeErr, Close fails with it and leaves the stream open.
@@ -32,13 +33,15 @@ type soundStream struct {
 	failAfterSound bool
 	closeErr       error
 
-	mu      sync.Mutex
-	device  string
-	opens   int
-	samples []int16
-	closed  bool
-	heard   bool
-	quiet   int // frames of silence written since the sound
+	mu       sync.Mutex
+	device   string
+	opens    int
+	samples  []int16
+	closed   bool
+	heard    bool
+	quiet    int // frames of silence written since the sound
+	soundAt  time.Time
+	closedAt time.Time
 }
 
 func (s *soundStream) open(device string) (audio.PlaybackStream, int, error) {
@@ -59,7 +62,7 @@ func (s *soundStream) Write(frame []int16) error {
 		silent = silent && v == 0
 	}
 	if !silent {
-		s.heard, s.quiet = true, 0
+		s.heard, s.quiet, s.soundAt = true, 0, time.Now()
 	} else if s.heard {
 		s.quiet++
 	}
@@ -77,22 +80,23 @@ func (s *soundStream) Close() error {
 	if s.closeErr != nil {
 		return s.closeErr
 	}
-	s.closed = true
+	s.closed, s.closedAt = true, time.Now()
 	return nil
 }
 
 // streamState is a soundStream as it was at one moment.
 type streamState struct {
-	device  string
-	opens   int
-	samples []int16
-	closed  bool
+	device            string
+	opens             int
+	samples           []int16
+	closed            bool
+	soundAt, closedAt time.Time
 }
 
 func (s *soundStream) state() streamState {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return streamState{device: s.device, opens: s.opens, samples: append([]int16(nil), s.samples...), closed: s.closed}
+	return streamState{device: s.device, opens: s.opens, samples: append([]int16(nil), s.samples...), closed: s.closed, soundAt: s.soundAt, closedAt: s.closedAt}
 }
 
 // playSoundUnit writes a unit's ghost-wispr.yaml holding yaml, with no
@@ -126,9 +130,13 @@ func runPlaySound(t *testing.T, configPath string, stream *soundStream, args ...
 // by itself, IdleClose after the sound: Drain returns once the stream has
 // taken the last frame, and a Close then drops what the device still holds,
 // the end of the sound the rig microphone must hear. A command that closed
-// the Output after Drain would leave about a frame of silence after the
-// sound, not half of IdleClose. It also fails if the line it prints does not
-// name the sound, its length and the device.
+// the Output after Drain would close the stream about a frame after the
+// sound, not half of IdleClose. The time is the clock's, from the write of
+// the sound's last frame to the close, as the Output's IdleClose is: on a
+// loaded machine each frame's write took longer than the frame, and counted
+// in frames written the 300 ms of IdleClose were as few as 79 ms. It also
+// fails if the line it prints does not name the sound, its length and the
+// device.
 func TestPlaySoundPlaysTheWholeSoundAndWaitsForTheStreamToClose(t *testing.T) {
 	configPath := playSoundUnit(t, "speaker_enabled: true\nspeaker_device: J75\n")
 	sounds := map[string][]byte{"wake": voice.WakeChime(), "answer": voice.AnswerChime(), "start": voice.StartChime(), "error": voice.ErrorChime()}
@@ -163,9 +171,8 @@ func TestPlaySoundPlaysTheWholeSoundAndWaitsForTheStreamToClose(t *testing.T) {
 			if span := last - first + 1; span < want-tolerance || span > want+tolerance {
 				t.Errorf("the sound spans %d samples at %d Hz, want %d (the %s sound's %d at %d Hz), give or take %d", span, soundStreamRate, want, name, frames, voice.ChimeFormat.SampleRate, tolerance)
 			}
-			after := time.Duration(len(at.samples)-1-last) * time.Second / soundStreamRate
-			if after < audio.OutputIdleClose/2 {
-				t.Errorf("the stream closed %v after the sound, want at least %v: the Output's own close comes IdleClose (%v) after it", after, audio.OutputIdleClose/2, audio.OutputIdleClose)
+			if after := at.closedAt.Sub(at.soundAt); after < audio.OutputIdleClose/2 {
+				t.Errorf("the stream closed %v after the write of the sound's last frame, want at least %v: the Output's own close comes IdleClose (%v) after it", after, audio.OutputIdleClose/2, audio.OutputIdleClose)
 			}
 			lines := strings.Split(strings.TrimSuffix(run.stdout, "\n"), "\n")
 			var printed playedSound
