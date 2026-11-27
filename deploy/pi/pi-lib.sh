@@ -34,6 +34,52 @@ PI_LIB_RECORDER_STATUS_FILTER='type == "object" and (.active_session_id | type =
 # Serve, which carries the page and /call, may not be reset under it (provision.sh's Serve apply).
 # shellcheck disable=SC2034 # update.sh and provision.sh, which source this file, read it.
 PI_LIB_BUSY_REASON_FILTER='if .active_session_id != "" then "active session" elif .call == null then empty elif (.call | type) != "object" then "call unknown" elif .call.state != "none" then "call \(.call.state // "unknown")" else empty end'
+# The transient system units that a provisioning run is (provision.sh): the run itself, and the
+# detached tailnet join it starts. systemd starts a unit of each name once at a time, so a second
+# run cannot start while the first runs, and the end of a run, however it comes, ends every process
+# of its unit.
+# shellcheck disable=SC2034 # provision.sh and provision_unit_test.sh, which source this file, read it.
+PI_LIB_PROVISION_UNIT=ghost-wispr-provision
+# shellcheck disable=SC2034 # provision.sh and provision_unit_test.sh, which source this file, read it.
+PI_LIB_PROVISION_JOIN_UNIT=ghost-wispr-provision-join
+
+# provision_unit_command UNIT USER sets the array pl_unit_command to the systemd-run command, less its
+# settings and program, that runs a provisioning run as the transient system unit UNIT, as USER. The
+# run's output reaches the caller (--pipe, which a plain SSH session takes, where --pty hangs), the
+# caller waits for its end and gets its exit status (--wait), a failed run leaves no unit behind
+# (--collect), and its end, by any cause, ends every process of the unit (KillMode=control-group),
+# with SIGKILL 10 s after SIGTERM. The caller runs it as root: sudo "${pl_unit_command[@]}" ...
+provision_unit_command() {
+  # shellcheck disable=SC2034 # The caller reads it.
+  pl_unit_command=(systemd-run "--unit=$1" --pipe --wait --collect --quiet --property=KillMode=control-group
+    --property=TimeoutStopSec=10s "--uid=$2")
+}
+
+# provision_units_busy UNIT... prints a line for each UNIT.service that systemd has in another state
+# than inactive or failed: "UNIT.service is STATE since TIME, main PID N". It fails when it cannot
+# read a unit's state.
+provision_units_busy() {
+  local pl_unit pl_show pl_state pl_since pl_main
+  for pl_unit; do
+    pl_show=$(systemctl show -p ActiveState -p ActiveEnterTimestamp -p MainPID "$pl_unit.service") || return 1
+    pl_state=$(sed -n 's/^ActiveState=//p' <<<"$pl_show")
+    pl_since=$(sed -n 's/^ActiveEnterTimestamp=//p' <<<"$pl_show")
+    pl_main=$(sed -n 's/^MainPID=//p' <<<"$pl_show")
+    case $pl_state in
+      inactive | failed) ;;
+      '') return 1 ;;
+      *) printf '%s.service is %s since %s, main PID %s\n' "$pl_unit" "$pl_state" "${pl_since:-an unknown time}" "${pl_main:-unknown}" ;;
+    esac
+  done
+}
+
+# provision_stop_traps makes a run that systemd stops end failed. systemd counts an end by SIGTERM,
+# which systemctl stop sends, or by SIGHUP as clean, and systemd-run --wait then gives the caller 0;
+# with these traps the run exits 143 or 129 instead, once the command it waits for has ended.
+provision_stop_traps() {
+  trap 'exit 143' TERM
+  trap 'exit 129' HUP
+}
 
 valid_drive_id() {
   [[ $1 =~ ^[A-Za-z0-9_-]+$ ]]

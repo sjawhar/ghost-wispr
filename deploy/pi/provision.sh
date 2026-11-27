@@ -21,9 +21,9 @@
 set -euo pipefail
 
 # GHOST_WISPR_DEPLOY_DIR, GHOST_WISPR_UNIT_DIR, GHOST_WISPR_SYSTEM_ROOT, GHOST_WISPR_IDENTITY_KEY,
-# GHOST_WISPR_JOIN_DIR, GHOST_WISPR_STATUS_URL, GHOST_WISPR_PROVISION_LOCK and
-# GHOST_WISPR_TAILSCALE_CALL_TIMEOUT exist for provision_run_test.sh, as update.sh's do for
-# update_test.sh.
+# GHOST_WISPR_JOIN_DIR, GHOST_WISPR_STATUS_URL and GHOST_WISPR_TAILSCALE_CALL_TIMEOUT exist for
+# provision_run_test.sh, as update.sh's do for update_test.sh; the run's unit gets each GHOST_WISPR_
+# setting of its caller (start_provision_unit).
 readonly DEPLOY_DIR="${GHOST_WISPR_DEPLOY_DIR:-/opt/ghost-wispr}"
 readonly UNIT_DIR="${GHOST_WISPR_UNIT_DIR:-/home/ghost-wispr/.config/systemd/user}"
 # The root under which the nightly update installs the udev rule and the logind setting.
@@ -37,9 +37,6 @@ readonly STATUS_URL="${GHOST_WISPR_STATUS_URL:-http://127.0.0.1:8080/api/status}
 # tmpfs, so a boot clears a token that a stopped join could not remove (Sol's review of #203, round
 # 3); the join unit's ExecStopPost removes it in every other case.
 readonly JOIN_DIR="${GHOST_WISPR_JOIN_DIR:-/run/ghost-wispr-join}"
-# The provisioning lock (take_provision_lock). /run/lock is the system's directory for lock files,
-# which every user may write and a boot empties.
-readonly PROVISION_LOCK="${GHOST_WISPR_PROVISION_LOCK:-/run/lock/ghost-wispr-provision.lock}"
 readonly SERVICE_USER=ghost-wispr
 # What serve-apply's refusal of a busy recorder exits with.
 readonly SERVE_APPLY_BUSY=75
@@ -51,7 +48,7 @@ readonly SERVE_APPLY_BUSY=75
 # line within about 2.5 minutes.
 readonly TAILSCALE_CALL_TIMEOUT="${GHOST_WISPR_TAILSCALE_CALL_TIMEOUT:-30}"
 # The join unit's RuntimeMaxSec, 15 minutes: tailscale up's re-authentication with an ID token takes
-# seconds, and the limit keeps a join that hangs from holding the provisioning lock for good.
+# seconds, and the limit keeps a join that hangs from refusing every later run for good.
 readonly JOIN_RUNTIME_MAX=900
 # The paths that the credential files name: where the recorder and pi-secrets find the certificate,
 # its config and the key on the Pi, as gcloud's create-cred-config wrote them for the office Pi.
@@ -82,46 +79,63 @@ require_service_user() {
   [[ $(id -un) == "$SERVICE_USER" ]] || fail "run as $SERVICE_USER"
 }
 
-# take_provision_lock WHAT takes the provisioning lock, PROVISION_LOCK, for the rest of this run, and
-# writes WHAT, with this run's PID, as its holder. One provisioning run, or the detached join that a
-# run starts, holds it at a time: a run while another holds it waits up to 2 s, then fails, names
-# the holder, and changes nothing; when the named holder has exited, it says so. The join takes the
-# lock when its run ends, and holds it to its own end (GPT-6.1 Sol's review of #203, round 2: a
-# second run removed the serve-apply of a join still waiting in its re-authentication).
-# The lock's descriptor, 9, is this shell's own, so the lock lives exactly as long as this run: there
-# is no holder process that can end before the run, nor a PID to poll (round 4: the holder of round
-# 3 died of SIGPIPE when the run closed its pipe, and freed the lock while the run lived). The
-# commands that can block on another program, sudo, systemctl and timeout (which runs each tailscale
-# call), run through the wrappers below, and the google-id-token call likewise: each closes 9 for
-# the command, and, when it runs in a subshell of this run, such as a $(...) or a part of a
-# pipeline, for that whole subshell, which would otherwise hold 9 while it waits. So none of them,
-# should it outlive the run, keeps the lock (round 3: a hung read kept it after its run was killed).
-# The other commands are local filters, such as jq and awk, which end at once.
-take_provision_lock() {
-  local holder
-  exec 9>>"$PROVISION_LOCK" || fail "cannot open the provisioning lock $PROVISION_LOCK: nothing was changed"
-  if ! flock -w 2 9; then
-    holder=$(cat -- "$PROVISION_LOCK" 2>/dev/null) || holder=
-    if [[ $holder =~ ,\ PID\ ([0-9]+)$ && ! -d /proc/${BASH_REMATCH[1]} ]]; then
-      holder="held by a process that exited: $holder"
-    fi
-    fail "another provisioning run holds $PROVISION_LOCK (${holder:-it names no holder}): nothing was changed; run provision.sh again once it has ended"
-  fi
-  printf '%s, PID %s\n' "$1" "$$" >"$PROVISION_LOCK"
-  sudo() { without_lock sudo "$@"; }
-  # shellcheck disable=SC2032 # sudo systemctl runs the program as root, not this wrapper.
-  systemctl() { without_lock systemctl "$@"; }
-  timeout() { without_lock timeout "$@"; }
+# busy_runs_message prints why a run may not start now, or nothing: a line for each unit of a run,
+# PI_LIB_PROVISION_UNIT and then PI_LIB_PROVISION_JOIN_UNIT, that systemd has active. It reads the
+# run's unit first, so a join that a run starts between the two reads is seen: the run is then still
+# active, or it has started the join. It fails when it cannot read a unit.
+busy_runs_message() {
+  local busy
+  busy=$(provision_units_busy "$PI_LIB_PROVISION_UNIT" "$PI_LIB_PROVISION_JOIN_UNIT") || return 1
+  [[ -n $busy ]] || return 0
+  printf 'another provisioning run is going on: %s; nothing was changed. Run provision.sh again once it has ended, or end it with: sudo systemctl stop %s %s. An SSH session that ends does not end a run.\n' \
+    "$(paste -sd ';' <<<"$busy" | sed 's/;/; /g')" "$PI_LIB_PROVISION_UNIT" "$PI_LIB_PROVISION_JOIN_UNIT"
 }
 
-# without_lock COMMAND ARGUMENT... runs COMMAND without the provisioning lock's descriptor 9. In a
-# subshell of the run ($BASHPID is not $$), it first closes 9 for the whole subshell, which is its
-# own process: the run's shell keeps 9.
-without_lock() {
-  if ((BASHPID != $$)); then
-    exec 9>&-
+# start_provision_unit ARGUMENT... runs this script again with ARGUMENT..., as the transient system
+# unit PI_LIB_PROVISION_UNIT (pi-lib.sh's provision_unit_command), as SERVICE_USER, in the caller's
+# directory, with the caller's PATH and GHOST_WISPR_ settings, and does not return: its exit status
+# is the run's. systemd starts one unit of that name at a time, and while the run or the join it
+# started, PI_LIB_PROVISION_JOIN_UNIT, is active, this fails first, names it, and changes nothing.
+# The run's end, by systemctl stop, a kill of its main process or its own end, ends every command of
+# it, as its unit's control group ends: no command of a run outlives it (GPT-6.1 Sol's review of
+# #203, round 5, where a lock descriptor stayed with each command that inherited it). An SSH session
+# that ends does not end the run: over Tailscale SSH, the session's processes and the unit stay.
+# Before it starts the unit, a run with no argument refuses data on its standard input.
+start_provision_unit() {
+  local busy name settings=()
+  check_usage "$@"
+  if (($# == 0)); then
+    refuse_input
   fi
-  command "$@" 9>&-
+  require_service_user
+  busy=$(busy_runs_message) \
+    || fail "could not read whether another provisioning run is going on (systemctl show $PI_LIB_PROVISION_UNIT.service $PI_LIB_PROVISION_JOIN_UNIT.service): nothing was changed"
+  [[ -z $busy ]] || fail "$busy"
+  settings=(--setenv=GHOST_WISPR_PROVISION_IN_UNIT=1 "--setenv=PATH=$PATH")
+  while IFS= read -r name; do
+    if [[ -n $name && $name != GHOST_WISPR_PROVISION_IN_UNIT ]]; then
+      settings+=("--setenv=$name=${!name}")
+    fi
+  done < <(compgen -e GHOST_WISPR_ || true)
+  provision_unit_command "$PI_LIB_PROVISION_UNIT" "$SERVICE_USER"
+  # shellcheck disable=SC2154 # pi-lib.sh's provision_unit_command sets it.
+  exec sudo "${pl_unit_command[@]}" "${settings[@]}" "--working-directory=$PWD" /bin/bash "$script_dir/provision.sh" "$@"
+}
+
+# check_usage ARGUMENT... fails, with the usage of the mode, on arguments that no mode takes, before
+# a run checks its user or starts its unit, so a wrong command says first what it lacks. Each mode
+# checks its arguments again in the unit.
+check_usage() {
+  case ${1:-} in
+    --models)
+      (($# == 2)) || fail "usage: provision.sh --models <shared-drive-id>"
+      valid_drive_id "$2" \
+        || fail "shared-drive ID must be non-empty and contain only letters, numbers, hyphens, and underscores"
+      ;;
+    --key) (($# == 1)) || fail 'usage: provision.sh --key' ;;
+    --certificate) (($# == 2)) || fail 'usage: provision.sh --certificate FILE' ;;
+    *) (($# == 0)) || fail "$USAGE" ;;
+  esac
 }
 
 # refuse_input fails while standard input holds data, such as the credential bundle that an older
@@ -600,7 +614,6 @@ make_staging_dir() {
 provision_key() {
   (($# == 0)) || fail 'usage: provision.sh --key'
   require_service_user
-  take_provision_lock 'provision.sh --key'
   local dir
   [[ ! -e $IDENTITY_KEY && ! -L $IDENTITY_KEY ]] \
     || fail "$IDENTITY_KEY exists: the Pi has its key, and nothing was changed. A new key needs a new certificate request in the infrastructure's bootstrap"
@@ -621,7 +634,6 @@ provision_key() {
 provision_certificate() {
   (($# == 1)) || fail 'usage: provision.sh --certificate FILE'
   require_service_user
-  take_provision_lock 'provision.sh --certificate'
   local file=$1 count certificate_key key end
   [[ -f $IDENTITY_KEY ]] || fail "there is no key at $IDENTITY_KEY: run provision.sh --key first"
   [[ ! -e $DEPLOY_DIR/device.crt ]] \
@@ -651,7 +663,6 @@ provision_models() {
   valid_drive_id "$drive_id" \
     || fail "shared-drive ID must be non-empty and contain only letters, numbers, hyphens, and underscores"
   require_service_user
-  take_provision_lock 'provision.sh --models'
   check_release_directory
   require_release_the_pi_runs
   use_runtime_dir
@@ -763,6 +774,12 @@ CHECK
 if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
   return 0
 fi
+# Each mode runs as the transient system unit of a run (start_provision_unit); in it, systemd has
+# set INVOCATION_ID, and a stop ends the run failed (pi-lib.sh's provision_stop_traps).
+if [[ ${GHOST_WISPR_PROVISION_IN_UNIT:-} != 1 || -z ${INVOCATION_ID:-} ]]; then
+  start_provision_unit "$@"
+fi
+provision_stop_traps
 case ${1:-} in
   --models)
     shift
@@ -783,15 +800,13 @@ esac
 
 (($# == 0)) || fail "$USAGE"
 require_service_user
-# The run's id, which names its units and its directory under JOIN_DIR: two runs never share one,
-# as two runs in one second shared a name made of the time (Sol's review of #203, round 2).
+# The run's id, which names its Serve unit and its directory under JOIN_DIR: two runs never share
+# one, as two runs in one second shared a name made of the time (Sol's review of #203, round 2).
 RUN_ID=$(cat /proc/sys/kernel/random/uuid) && [[ $RUN_ID =~ ^[0-9a-f-]{36}$ ]] \
   || fail "could not read a run id from /proc/sys/kernel/random/uuid: nothing was changed"
 readonly RUN_ID
-take_provision_lock "provision.sh run $RUN_ID"
 readonly RUN_DIR="$JOIN_DIR/$RUN_ID"
 readonly JOIN_TOKEN="$RUN_DIR/token" JOIN_ROUTE_CHECK="$RUN_DIR/route-overlap-check" SERVE_APPLY="$RUN_DIR/serve-apply"
-refuse_input
 use_runtime_dir
 [[ -f $IDENTITY_KEY ]] || fail "there is no key at $IDENTITY_KEY: run provision.sh --key, then provision.sh --certificate FILE, first"
 [[ -f $DEPLOY_DIR/device.crt ]] || fail "there is no certificate at $DEPLOY_DIR/device.crt: run provision.sh --certificate FILE first"
@@ -844,13 +859,10 @@ put_file "$script_dir/update.sh" "$DEPLOY_DIR/update.sh" 0755 || fail "could not
 put_file "$script_dir/pi-lib.sh" "$DEPLOY_DIR/pi-lib.sh" 0755 || fail "could not install pi-lib.sh"
 put_file "$script_dir/pi.env" "$DEPLOY_DIR/pi.env" 0644 || fail "could not install pi.env"
 
-# sudo runs the systemctl program here, as root, not take_provision_lock's wrapper of it.
 if $groups_changed; then
-  # shellcheck disable=SC2033
   sudo systemctl restart "user@$(id -u "$SERVICE_USER").service"
 fi
 sudo loginctl enable-linger "$SERVICE_USER"
-# shellcheck disable=SC2033
 sudo systemctl start "user@$(id -u "$SERVICE_USER").service"
 systemctl --user daemon-reload
 systemctl --user enable --now ghost-wispr-update.timer
@@ -872,7 +884,8 @@ systemctl --user enable ghost-wispr.service
 apply_serve
 
 # Whether the node is joined already, read in TAILSCALE_CALL_TIMEOUT s like each tailscale call: a
-# read that hangs would hold the run, and its lock, for good (Sol's review of #203, round 3).
+# read that hangs would hold the run, and refuse every later one, for good (Sol's review of #203,
+# round 3).
 if ! self_status=$(timeout --kill-after=5s "${TAILSCALE_CALL_TIMEOUT}s" tailscale status --self --json); then
   fail "could not read this device's tailnet status (tailscale status --self --json) before the join, in $TAILSCALE_CALL_TIMEOUT s: no join was started; run provision.sh again"
 fi
@@ -884,8 +897,7 @@ if jq -e --arg hostname "$TAILSCALE_HOSTNAME" '
 fi
 
 readonly token_audience="api.tailscale.com/$PI_TAILNET_CLIENT_ID"
-# A network call, so neither it nor its subshell holds the lock's descriptor (take_provision_lock).
-id_token=$(exec 9>&-; env \
+id_token=$(env \
   GOOGLE_API_USE_CLIENT_CERTIFICATE=false \
   "$DEPLOY_DIR/ghost-wispr" google-id-token --credentials "$DEPLOY_DIR/google-credentials.json" --audience "$token_audience")
 [[ "$id_token" != *$'\n'* && "$id_token" == *.*.* ]] || fail "google-id-token did not return a JWT"
@@ -911,7 +923,7 @@ sudo install -d -o root -g root -m 0700 "$JOIN_DIR" "$RUN_DIR"
 printf '%s' "$id_token" | sudo install -m 0600 /dev/stdin "$JOIN_TOKEN"
 route_overlap_check_script | sudo install -o root -g root -m 0700 /dev/stdin "$JOIN_ROUTE_CHECK"
 install_serve_apply
-join_unit="ghost-wispr-tailnet-join-$RUN_ID"
+join_unit=$PI_LIB_PROVISION_JOIN_UNIT
 # The join brings the node up with the tailnet's subnet routes off, `--accept-routes=false`:
 # `tailscale up` refuses to leave out a setting that is not the default (tailscale v1.104.1,
 # cmd/tailscale/cli/up.go, checkForAccidentalSettingReverts), and a re-join must not accept a route
@@ -923,31 +935,29 @@ join_unit="ghost-wispr-tailnet-join-$RUN_ID"
 # and a profile it keeps would keep the entries of the name the node had before. So the join runs
 # serve-apply, as apply_serve does, which reads the recorder's status immediately before its reset,
 # with each line of serve.conf as its arguments: the join runs after P2's command has removed the
-# release's directory, so it reads no file of it. First the join takes the provisioning lock, which
-# it gets once this run ends, and names itself and its PID its holder, so no later run starts before
-# it ends. The lock is on the join's own shell, descriptor 9, as in take_provision_lock, and each
-# command the join starts gets 9>&-: none of them keeps the lock, should it outlive the join, and
-# the lock does not rest on systemd's stop of the unit's cgroup. Its RuntimeMaxSec keeps a join that
-# hangs from holding the lock for good. It removes the token as soon as tailscale up ends, and its
-# ExecStopPost removes the run's directory, the token's among its files, whatever stopped the unit:
-# its end, a failure, a kill or its RuntimeMaxSec (Sol's review of #203, round 3: a killed or
+# release's directory, so it reads no file of it. The join is the transient unit
+# PI_LIB_PROVISION_JOIN_UNIT, outside this run's unit, so this run's end does not stop it, and a
+# later run refuses while it is active (start_provision_unit). Its RuntimeMaxSec keeps a join that
+# hangs from refusing every later run for good. It removes the token as soon as tailscale up ends,
+# and its ExecStopPost removes the run's directory, the token's among its files, whatever stopped the
+# unit: its end, a failure, a kill or its RuntimeMaxSec (Sol's review of #203, round 3: a killed or
 # timed-out join left its token).
-join_command="exec 9>>$PROVISION_LOCK && flock 9 || exit 1;"
-join_command+=" printf '%s, PID %s\\n' 'the join unit $join_unit of provision.sh run $RUN_ID' \$\$ >$PROVISION_LOCK;"
-join_command+=" tailscale up --force-reauth --client-id='$PI_TAILNET_CLIENT_ID?ephemeral=false&preauthorized=true'"
-join_command+=" --id-token=file:$JOIN_TOKEN --advertise-tags=tag:ghost-wispr --hostname=ghost-wispr --ssh --accept-routes=false 9>&-;"
+join_command="tailscale up --force-reauth --client-id='$PI_TAILNET_CLIENT_ID?ephemeral=false&preauthorized=true'"
+join_command+=" --id-token=file:$JOIN_TOKEN --advertise-tags=tag:ghost-wispr --hostname=ghost-wispr --ssh --accept-routes=false;"
 join_command+=" rc=\$?; rm -f $JOIN_TOKEN;"
 join_command+=" if [ \$rc -eq 0 ]; then"
-join_command+=" /bin/sh $SERVE_APPLY $STATUS_URL ${serve_words[*]} 9>&- || rc=\$?;"
-join_command+=" if /bin/sh $JOIN_ROUTE_CHECK 9>&-; then tailscale set --accept-routes 9>&- || rc=\$?; else rc=\$?; fi;"
+join_command+=" /bin/sh $SERVE_APPLY $STATUS_URL ${serve_words[*]} || rc=\$?;"
+join_command+=" if /bin/sh $JOIN_ROUTE_CHECK; then tailscale set --accept-routes || rc=\$?; else rc=\$?; fi;"
 join_command+=" fi; exit \$rc"
+# The join's lines, a login URL that tailscale up prints among them, go to its unit's journal, and
+# its re-authentication can end the SSH session: so the run names the journal before it starts it.
 printf 'ghost-wispr provision: starting the tagged tailnet join as %s\n' "$join_unit"
+printf "ghost-wispr provision: reconnect with Tailscale SSH, then check tailscale status and the join's lines, a login URL of tailscale up among them, with: sudo journalctl -u %s\n" "$join_unit"
 # systemd-run(1): the service manager expands ${NAME} and $$ in the command's arguments unless
 # --expand-environment=no, which systemd 254 added (Raspberry Pi OS Trixie has 257). The join
 # command is shell code for the unit's /bin/sh, which must get it as written.
-if ! sudo systemd-run --expand-environment=no --unit="$join_unit" --property=RuntimeMaxSec="$JOIN_RUNTIME_MAX" \
+if ! sudo systemd-run --expand-environment=no --unit="$join_unit" --collect --property=RuntimeMaxSec="$JOIN_RUNTIME_MAX" \
   --property=ExecStopPost="/bin/rm -rf -- $RUN_DIR" /bin/sh -c "$join_command"; then
   sudo rm -rf -- "$RUN_DIR"
   fail "could not start the join unit $join_unit (systemd-run failed): its token is removed, and the Pi did not join; run provision.sh again"
 fi
-printf 'ghost-wispr provision: reconnect with Tailscale SSH, then check tailscale status and sudo journalctl -u %s.\n' "$join_unit"

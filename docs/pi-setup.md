@@ -263,16 +263,18 @@ restarts the recorder, and a restart ends a conversation that is being recorded.
    ```
 
    `provision.sh` runs as `ghost-wispr`, with passwordless sudo, and refuses data on standard
-   input. One provisioning run at a time: each run, with the join it starts, holds
-   `/run/lock/ghost-wispr-provision.lock`, and a second run waits up to 2 s, then fails, names the
-   run or the join that holds it, and changes nothing; when that holder has ended, it says the lock
-   is held by a process that exited. The run's own shell holds the lock for the whole run, and
-   each command of the run that can outlive it, such as `sudo` or a tailscale call, runs without
-   the lock's descriptor, so none that outlives its run keeps it. It refuses a directory whose
-   files do not match its `manifest.json`, such as a checkout's `deploy/pi/`. Before it changes
-   anything, it refuses while the environment of `ghost-wispr`'s user manager sets
-   `GHOST_WISPR_CONFIG` or an Envoy variable, which the recorder would inherit ("Turn on the meeting
-   voice", step 1). Then it:
+   input. Each run, of each mode, is the transient system unit `ghost-wispr-provision`, which
+   `provision.sh` starts as root for `ghost-wispr` and waits for: its lines reach you as it runs,
+   and its exit status is the run's. One run at a time: while that unit or the join a run starts,
+   `ghost-wispr-provision-join`, is active, a second run fails at once, names the unit, when it
+   became active and its main PID, and changes nothing. To end a run, and its join, run
+   `sudo systemctl stop ghost-wispr-provision ghost-wispr-provision-join`, which ends every
+   command of the run with it and makes the run fail (exit 143). An SSH session that ends does not
+   end a run: over Tailscale SSH the session's processes and the unit stay until the run ends. It
+   refuses a directory whose files do not match its `manifest.json`, such as a checkout's
+   `deploy/pi/`. Before it changes anything, it refuses while the environment of `ghost-wispr`'s
+   user manager sets `GHOST_WISPR_CONFIG` or an Envoy variable, which the recorder would inherit
+   ("Turn on the meeting voice", step 1). Then it:
 
    - installs `libportaudio2`, `ffmpeg`, `lame`, `jq` and `curl`;
    - writes `/opt/ghost-wispr/google-credentials.json` and `/opt/ghost-wispr/certificate_config.json`
@@ -321,21 +323,21 @@ restarts the recorder, and a restart ends a conversation that is being recorded.
      `PI_SERVICE_ACCOUNT_UNIQUE_ID`, or stops after "already joined" on a Pi that is joined as
      `tag:ghost-wispr` already.
 
-   It ends with `already joined as tag:ghost-wispr`, or with the line that names the detached join
-   unit it started. Its read of whether the Pi is joined ends after 30 s too. The SSH session can
-   end while Tailscale re-authenticates (exit 255). The join unit first takes
-   `/run/lock/ghost-wispr-provision.lock`, which it gets once `provision.sh` has ended, and holds it
-   to its own end on its own shell; each command the join starts runs without the lock's
-   descriptor. Its `RuntimeMaxSec` of 15 minutes keeps a join that hangs from holding it for
-   good. The join's token, route check and `serve-apply` are in the run's directory under
-   `/run/ghost-wispr-join`, a tmpfs that a boot clears. The join removes the token as soon as
-   `tailscale up` ends, and the unit's `ExecStopPost` removes the run's directory whatever stopped
-   the join: its end, a failure, a kill or its `RuntimeMaxSec`. When the join unit does not start,
-   `provision.sh` removes the directory itself and fails. The join unit's command line runs the
-   run's `serve-apply` with each line of `serve.conf` as its arguments, so the join reads no file of
-   the release directory. The join runs the same apply after the re-authentication, with the same
-   status read: while the recorder is busy, it resets nothing in Serve, and the join unit ends
-   failed with exit 75. The join runs `tailscale up`
+   It ends with `already joined as tag:ghost-wispr`, or with the lines that name the detached join
+   unit it started and the command that shows its lines, a login URL of `tailscale up` among them:
+   `sudo journalctl -u ghost-wispr-provision-join`. Its read of whether the Pi is joined ends after
+   30 s too. The SSH session can end while Tailscale re-authenticates (exit 255). The join is the
+   unit `ghost-wispr-provision-join`, apart from the run's, so the run's end does not stop it, and
+   a later run refuses while it is active; its `RuntimeMaxSec` of 15 minutes keeps a join that
+   hangs from refusing every later run for good. The join's token, route check and `serve-apply`
+   are in the run's directory under `/run/ghost-wispr-join`, a tmpfs that a boot clears. The join
+   removes the token as soon as `tailscale up` ends, and the unit's `ExecStopPost` removes the
+   run's directory whatever stopped the join: its end, a failure, a kill or its `RuntimeMaxSec`.
+   When the join unit does not start, `provision.sh` removes the directory itself and fails. The
+   join unit's command line runs the run's `serve-apply` with each line of `serve.conf` as its
+   arguments, so the join reads no file of the release directory. The join runs the same apply
+   after the re-authentication, with the same status read: while the recorder is busy, it resets
+   nothing in Serve, and the join unit ends failed with exit 75. The join runs `tailscale up`
    with `--accept-routes=false`, so the Pi joins with the tailnet's subnet routes off. Then it runs
    the route check of "Accept the tailnet's subnet routes", and accepts the routes
    (`tailscale set --accept-routes`) only when no peer's `PrimaryRoutes` overlaps a network of the
@@ -368,7 +370,7 @@ restarts the recorder, and a restart ends a conversation that is being recorded.
 
    ```bash
    ssh ghost-wispr@ghost-wispr 'tailscale status --self --json'
-   ssh ghost-wispr@ghost-wispr 'sudo journalctl -u "ghost-wispr-tailnet-join-*"'
+   ssh ghost-wispr@ghost-wispr 'sudo journalctl -u ghost-wispr-provision-join'
    ssh ghost-wispr@ghost-wispr 'tailscale debug prefs' | jq .RouteAll
    curl -fsS https://ghost-wispr.tail12ec1c.ts.net/api/version
    ```
@@ -519,7 +521,7 @@ The detached join of "Provision" uses the check:
 
 When the check refuses, the join unit ends failed. The Pi stays in the tailnet, with `RouteAll`
 false. The check's lines are in the unit's journal. Read them on the Pi with
-`sudo journalctl -u 'ghost-wispr-tailnet-join-*'`. To fix an overlap, remove the route or change
+`sudo journalctl -u ghost-wispr-provision-join`. To fix an overlap, remove the route or change
 the office network's range. Then run the block below.
 
 A new run of `provision.sh` on a Pi already joined as `tag:ghost-wispr` exits before the join. So
