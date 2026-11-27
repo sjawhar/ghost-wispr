@@ -62,7 +62,7 @@ trap cleanup EXIT
 # Every file of C2's tarball has its source in the repository.
 for file in deploy/pi/update.sh deploy/pi/pi-lib.sh deploy/pi/provision.sh wait-for-network.sh \
   deploy/pi/files/ghost-wispr.yaml deploy/pi/files/wait-for-time-sync.sh deploy/pi/files/ghost-wispr.service \
-  deploy/pi/files/99-ghost-wispr.rules deploy/pi/files/logind-power-key.conf \
+  deploy/pi/files/99-ghost-wispr.rules deploy/pi/files/logind-power-key.conf deploy/pi/files/journald-ghost-wispr.conf \
   deploy/pi/files/ghost-wispr-update-launcher.sh deploy/pi/files/ghost-wispr-update.service \
   deploy/pi/files/ghost-wispr-update.timer deploy/pi/files/serve.conf; do
   [[ -f $repo_root/$file ]] || fail "$file is missing: the release's deploy set and the launcher need it"
@@ -81,7 +81,7 @@ readonly template="$repo_root/deploy/pi/files/ghost-wispr.yaml"
 
 # The deploy set (C2): the files update.sh installs, with the binary, and rolls back as one unit.
 readonly set_files=(ghost-wispr.yaml pi.env update.sh pi-lib.sh wait-for-network.sh wait-for-time-sync.sh
-  ghost-wispr.service 99-ghost-wispr.rules logind-power-key.conf)
+  ghost-wispr.service 99-ghost-wispr.rules logind-power-key.conf journald-ghost-wispr.conf)
 # The bootstrap files (D4), which only provision.sh installs, and which update.sh only compares.
 readonly bootstrap_files=(ghost-wispr-update-launcher.sh ghost-wispr-update.service ghost-wispr-update.timer)
 
@@ -91,6 +91,7 @@ installed_path() {
     ghost-wispr.service | ghost-wispr-update.service | ghost-wispr-update.timer) printf '%s\n' "$units/$1" ;;
     99-ghost-wispr.rules) printf '%s\n' "$root/etc/udev/rules.d/99-ghost-wispr.rules" ;;
     logind-power-key.conf) printf '%s\n' "$root/etc/systemd/logind.conf.d/50-ghost-wispr-power-key.conf" ;;
+    journald-ghost-wispr.conf) printf '%s\n' "$root/etc/systemd/journald.conf.d/90-ghost-wispr.conf" ;;
     *) printf '%s\n' "$opt/$1" ;;
   esac
 }
@@ -415,10 +416,11 @@ cat >"$bin/sudo" <<'EOF'
 #!/usr/bin/env bash
 # The fake sudo. It refuses a call without -n, which would wait for a password where nobody can
 # type one. It runs install for real, into GHOST_WISPR_SYSTEM_ROOT alone, and tailscale (the fake),
-# and logs every call with the timeout it runs under, udevadm with the udev rule it would read and
-# the logind restart with the logind setting, in $TEST_STATE/sudo.log. Each udevadm call and each
-# logind restart is the event "system-reload". The call that $TEST_STATE/fail-sudo names, as its
-# log line names it after the timeout (such as "udevadm control --reload"), fails, once.
+# and logs every call with the timeout it runs under, udevadm with the udev rule it would read, the
+# logind restart with the logind setting, and the journald restart and the journal's flush with the
+# journald setting, in $TEST_STATE/sudo.log. Each udevadm call, each restart and each flush is the
+# event "system-reload". The call that $TEST_STATE/fail-sudo names, as its log line names it after
+# the timeout (such as "udevadm control --reload"), fails, once.
 set -euo pipefail
 state=${TEST_STATE:?}
 system_root=${GHOST_WISPR_SYSTEM_ROOT:?}
@@ -458,10 +460,26 @@ case ${1:-} in
     "${TEST_FAKES:?}/after" system-reload
     ;;
   systemctl)
-    [[ ${*:2} == 'restart systemd-logind' ]] || unexpected "$@"
-    made_to_fail 'systemctl restart systemd-logind'
-    printf 'timeout=%s systemctl restart systemd-logind logind=%s\n' "$under" \
-      "$(sum "$system_root/etc/systemd/logind.conf.d/50-ghost-wispr-power-key.conf")" >>"$state/sudo.log"
+    case ${*:2} in
+      'restart systemd-logind')
+        made_to_fail 'systemctl restart systemd-logind'
+        printf 'timeout=%s systemctl restart systemd-logind logind=%s\n' "$under" \
+          "$(sum "$system_root/etc/systemd/logind.conf.d/50-ghost-wispr-power-key.conf")" >>"$state/sudo.log"
+        ;;
+      'restart systemd-journald')
+        made_to_fail 'systemctl restart systemd-journald'
+        printf 'timeout=%s systemctl restart systemd-journald journald=%s\n' "$under" \
+          "$(sum "$system_root/etc/systemd/journald.conf.d/90-ghost-wispr.conf")" >>"$state/sudo.log"
+        ;;
+      *) unexpected "$@" ;;
+    esac
+    "${TEST_FAKES:?}/after" system-reload
+    ;;
+  journalctl)
+    [[ ${*:2} == --flush ]] || unexpected "$@"
+    made_to_fail 'journalctl --flush'
+    printf 'timeout=%s journalctl --flush journald=%s\n' "$under" \
+      "$(sum "$system_root/etc/systemd/journald.conf.d/90-ghost-wispr.conf")" >>"$state/sudo.log"
     "${TEST_FAKES:?}/after" system-reload
     ;;
   tailscale)
@@ -727,9 +745,9 @@ EOF
 # make_release NAME COMMIT stages release NAME of commit COMMIT in $releases/NAME: its binary, and
 # ghost-wispr-pi-deploy/ with every file of C2 from the repository. Each file of the deploy set ends
 # with a line naming NAME, so the sets of two releases differ in every file; with
-# same_system_files=1 the udev rule and the logind setting are the repository's, the same in every
-# release. The provisioning files are the repository's in every release. Edit the files, then
-# pack_release.
+# same_system_files=1 the udev rule, the logind setting and the journald setting are the
+# repository's, the same in every release. The provisioning files are the repository's in every
+# release. Edit the files, then pack_release.
 make_release() {
   local name=$1 commit=$2 dir=$releases/$1 deploy file
   deploy=$dir/ghost-wispr-pi-deploy
@@ -737,13 +755,14 @@ make_release() {
   mkdir -p -- "$deploy"
   cp -- "$repo_root/deploy/pi/files/ghost-wispr.yaml" "$repo_root/deploy/pi/files/wait-for-time-sync.sh" \
     "$repo_root/deploy/pi/files/ghost-wispr.service" "$repo_root/deploy/pi/files/99-ghost-wispr.rules" \
-    "$repo_root/deploy/pi/files/logind-power-key.conf" "$repo_root/deploy/pi/files/ghost-wispr-update-launcher.sh" \
+    "$repo_root/deploy/pi/files/logind-power-key.conf" "$repo_root/deploy/pi/files/journald-ghost-wispr.conf" \
+    "$repo_root/deploy/pi/files/ghost-wispr-update-launcher.sh" \
     "$repo_root/deploy/pi/files/ghost-wispr-update.service" "$repo_root/deploy/pi/files/ghost-wispr-update.timer" \
     "$repo_root/deploy/pi/files/serve.conf" "$repo_root/deploy/pi/update.sh" "$repo_root/deploy/pi/pi-lib.sh" \
     "$repo_root/deploy/pi/provision.sh" "$repo_root/wait-for-network.sh" "$deploy/"
   test_pi_env >"$deploy/pi.env"
   for file in "${set_files[@]}"; do
-    if [[ ${same_system_files:-} == 1 && ($file == 99-ghost-wispr.rules || $file == logind-power-key.conf) ]]; then
+    if [[ ${same_system_files:-} == 1 && ($file == 99-ghost-wispr.rules || $file == logind-power-key.conf || $file == journald-ghost-wispr.conf) ]]; then
       continue
     fi
     printf '# release %s\n' "$name" >>"$deploy/$file"
@@ -1283,21 +1302,29 @@ grep -Fqx "restart binary=$(sha "$opt/ghost-wispr") env=$(sha "$opt/.env") confi
 last_reload=$(awk '/^restart / { exit } /^daemon-reload / { line = $0 } END { print line }' "$state/systemctl.log")
 [[ $last_reload == "daemon-reload unit=$(sha "$units/ghost-wispr.service")" ]] \
   || fail "whole-set: the user manager did not read the new ghost-wispr.service before the restart: $(<"$state/systemctl.log")"
-# The udev rule and the logind setting install with sudo -n, and udev reloads and logind restarts,
-# each under its 30 s bound, after its file: udevadm control --reload before udevadm trigger.
+# The udev rule, the logind setting and the journald setting install with sudo -n, and udev
+# reloads, logind restarts and journald restarts and flushes the boot's journal to the card, each
+# under its 30 s bound, after its file: udevadm control --reload before udevadm trigger, and the
+# journald restart before the flush, which only a journald that runs the setting does.
 rules_sum=$(sha "$(installed_path 99-ghost-wispr.rules)")
 logind_sum=$(sha "$(installed_path logind-power-key.conf)")
+journald_sum=$(sha "$(installed_path journald-ghost-wispr.conf)")
 for line in "timeout=30s udevadm control --reload rules=$rules_sum" "timeout=30s udevadm trigger rules=$rules_sum" \
-  "timeout=30s systemctl restart systemd-logind logind=$logind_sum" 'timeout=10s tailscale serve status --json'; do
+  "timeout=30s systemctl restart systemd-logind logind=$logind_sum" \
+  "timeout=30s systemctl restart systemd-journald journald=$journald_sum" \
+  "timeout=30s journalctl --flush journald=$journald_sum" 'timeout=10s tailscale serve status --json'; do
   grep -Fqx -- "$line" "$state/sudo.log" || fail "whole-set: sudo ran no $line: $(<"$state/sudo.log")"
 done
 # Each sudo -n install runs under its 30 s bound, as each sudo -n call does (R8).
-for path in /etc/udev/rules.d/99-ghost-wispr.rules /etc/systemd/logind.conf.d/50-ghost-wispr-power-key.conf; do
+for path in /etc/udev/rules.d/99-ghost-wispr.rules /etc/systemd/logind.conf.d/50-ghost-wispr-power-key.conf \
+  /etc/systemd/journald.conf.d/90-ghost-wispr.conf; do
   [[ $(grep -cFx -- "timeout=30s install $path" "$state/sudo.log") == 1 ]] \
     || fail "whole-set: sudo -n install did not install $path once, under its 30 s bound: $(<"$state/sudo.log")"
 done
 awk '/udevadm control --reload/ { r = NR } /udevadm trigger/ { t = NR } END { exit !(r && t && r < t) }' "$state/sudo.log" \
   || fail "whole-set: udev was not reloaded before its trigger: $(<"$state/sudo.log")"
+awk '/restart systemd-journald/ { r = NR } /journalctl --flush/ { f = NR } END { exit !(r && f && r < f) }' "$state/sudo.log" \
+  || fail "whole-set: journald did not restart before the journal's flush: $(<"$state/sudo.log")"
 # pi-secrets ran once, from the staged binary (the release's, checked against binary_sha256, not
 # the installed one), with the credential file and the Pi's secret names, under its 60 s bound.
 [[ $(grep -c '^call$' "$state/pi-secrets.log") == 1 ]] || fail "whole-set: pi-secrets ran $(grep -c '^call$' "$state/pi-secrets.log") times"
@@ -1377,9 +1404,10 @@ expect_verified 'whole-set (the built release)' built
 expect_no_output 'whole-set (the built release)' 'differs from the release'
 
 begin system-files-unchanged
-# system-files-unchanged: a release whose udev rule and logind setting are the installed ones
-# installs neither and reloads neither: a udev trigger replays the device events, and a logind
-# restart is a restart of the Pi's login manager, each for no change.
+# system-files-unchanged: a release whose udev rule, logind setting and journald setting are the
+# installed ones installs none and reloads none: a udev trigger replays the device events, a logind
+# restart is a restart of the Pi's login manager, and a journald restart reopens the journal, each
+# for no change.
 new_pi
 same_system_files=1 make_release a "$commit_a" && pack_release a
 same_system_files=1 make_release b "$commit_b" && pack_release b
@@ -1387,7 +1415,7 @@ install_set a
 release=b run_update
 expect_run system-files-unchanged 0 "ghost-wispr update: installed commit $commit_b (invocation test-invocation-7)"
 expect_set_of system-files-unchanged b
-if grep -Eq 'udevadm|systemd-logind| install ' "$state/sudo.log"; then
+if grep -Eq 'udevadm|systemd-logind|systemd-journald|journalctl| install ' "$state/sudo.log"; then
   fail "system-files-unchanged: installed or reloaded an unchanged system file: $(<"$state/sudo.log")"
 fi
 
@@ -1536,10 +1564,10 @@ done
 # ---------------------------------------------------------------------------------------------------
 begin rollback-whole-set
 # rollback-whole-set: a new binary that never answers its commit is rolled back with its whole set:
-# every file, the rendered config, .env, the unit and both system files back byte for byte, the user
-# manager and udev reloaded and logind restarted again, and deploy.verified still the old set. A
-# rollback of the binary alone would run the old binary on the new release's config, units and
-# udev rule.
+# every file, the rendered config, .env, the unit and the three system files back byte for byte,
+# the user manager and udev reloaded and logind and journald restarted again, the journal flushed
+# again, and deploy.verified still the old set. A rollback of the binary alone would run the old
+# binary on the new release's config, units and udev rule.
 new_pi
 install_set a "$drive_id"
 printf '%s\n' GHOST_WISPR_DEEPGRAM_API_KEY=dg-test-2 GHOST_WISPR_DISPATCH_TOKEN=tok-test-2 >"$state/secrets"
@@ -1566,8 +1594,8 @@ diff "$state/secrets" <(grep -E "$secret_pattern" "$opt/.env") >&2 \
   || fail "rollback-whole-set: the rollback's restart did not read the secrets with the restored binary: $(<"$state/start-pi-secrets.log")"
 cmp -s -- "$work_dir/verified-a" "$opt/deploy.verified" || fail 'rollback-whole-set: changed deploy.verified'
 [[ $(restarts) == 2 ]] || fail "rollback-whole-set: restarted the recorder $(restarts) times, want the install's and the rollback's"
-# The rollback's restart runs the old set, after the user manager read the old unit again, and udev
-# and logind read the old system files again.
+# The rollback's restart runs the old set, after the user manager read the old unit again, and udev,
+# logind and journald read the old system files again.
 [[ $(grep '^restart ' "$state/systemctl.log" | tail -n1) == "restart binary=$(sha "$opt/ghost-wispr") env=$(sha "$opt/.env") config=$(sha "$opt/ghost-wispr.yaml") crt=$(sha "$opt/device.crt")" ]] \
   || fail "rollback-whole-set: the rollback's restart did not run the restored set: $(<"$state/systemctl.log")"
 awk -v want="daemon-reload unit=$(sha "$units/ghost-wispr.service")" \
@@ -1575,29 +1603,35 @@ awk -v want="daemon-reload unit=$(sha "$units/ghost-wispr.service")" \
   || fail "rollback-whole-set: the user manager did not read the restored unit before the rollback's restart: $(<"$state/systemctl.log")"
 rules_sum=$(sha "$(installed_path 99-ghost-wispr.rules)")
 logind_sum=$(sha "$(installed_path logind-power-key.conf)")
-[[ $(grep -c 'udevadm control --reload' "$state/sudo.log") == 2 && $(grep -c 'systemctl restart systemd-logind' "$state/sudo.log") == 2 ]] \
-  || fail "rollback-whole-set: did not reload udev and restart logind for the install and again for the rollback: $(<"$state/sudo.log")"
+journald_sum=$(sha "$(installed_path journald-ghost-wispr.conf)")
+[[ $(grep -c 'udevadm control --reload' "$state/sudo.log") == 2 && $(grep -c 'systemctl restart systemd-logind' "$state/sudo.log") == 2 \
+  && $(grep -c 'systemctl restart systemd-journald' "$state/sudo.log") == 2 && $(grep -c 'journalctl --flush' "$state/sudo.log") == 2 ]] \
+  || fail "rollback-whole-set: did not reload udev and restart logind and journald for the install and again for the rollback: $(<"$state/sudo.log")"
 [[ $(grep 'udevadm control --reload' "$state/sudo.log" | tail -n1) == "timeout=30s udevadm control --reload rules=$rules_sum" \
   && $(grep 'udevadm trigger' "$state/sudo.log" | tail -n1) == "timeout=30s udevadm trigger rules=$rules_sum" \
-  && $(grep 'systemd-logind' "$state/sudo.log" | tail -n1) == "timeout=30s systemctl restart systemd-logind logind=$logind_sum" ]] \
-  || fail "rollback-whole-set: udev and logind did not read the restored files: $(<"$state/sudo.log")"
+  && $(grep 'systemd-logind' "$state/sudo.log" | tail -n1) == "timeout=30s systemctl restart systemd-logind logind=$logind_sum" \
+  && $(grep 'systemd-journald' "$state/sudo.log" | tail -n1) == "timeout=30s systemctl restart systemd-journald journald=$journald_sum" \
+  && $(grep 'journalctl --flush' "$state/sudo.log" | tail -n1) == "timeout=30s journalctl --flush journald=$journald_sum" ]] \
+  || fail "rollback-whole-set: udev, logind and journald did not read the restored files: $(<"$state/sudo.log")"
 # Each sudo -n install, the release's and the rollback's, ran under its 30 s bound.
-for path in /etc/udev/rules.d/99-ghost-wispr.rules /etc/systemd/logind.conf.d/50-ghost-wispr-power-key.conf; do
+for path in /etc/udev/rules.d/99-ghost-wispr.rules /etc/systemd/logind.conf.d/50-ghost-wispr-power-key.conf \
+  /etc/systemd/journald.conf.d/90-ghost-wispr.conf; do
   [[ $(grep -cFx -- "timeout=30s install $path" "$state/sudo.log") == 2 ]] \
     || fail "rollback-whole-set: sudo -n install did not install $path for the release and again for the rollback, each under its 30 s bound: $(<"$state/sudo.log")"
 done
 
 # A step after the swap that fails rolls the set back as a failed version check does: the install
-# of a later file (the logind setting, after the udev rule and the user unit), the user manager's
-# reload, udev's reload and logind's restart. Each run exits 10 with every file back byte for byte,
-# deploy.verified as it was, no installed line, and udev, logind and the user manager reading the
-# restored files again before the recorder restarts on them. Breaks they catch: an update that goes
-# on after such a step failed, so the recorder runs a set the system never read and deploy.verified
-# names it; a rollback that leaves the files swapped before the failed one.
+# of a later file (the logind setting, after the udev rule and the user unit; the journald setting,
+# the last), the user manager's reload, udev's reload, logind's and journald's restarts and the
+# journal's flush. Each run exits 10 with every file back byte for byte, deploy.verified as it was,
+# no installed line, and udev, logind, journald and the user manager reading the restored files
+# again before the recorder restarts on them. Breaks they catch: an update that goes on after such a
+# step failed, so the recorder runs a set the system never read and deploy.verified names it; a
+# rollback that leaves the files swapped before the failed one.
 # step_fails STEP FILE CONTENT WHY: $state/FILE holding CONTENT makes STEP fail once; the run fails
 # with WHY.
 step_fails() {
-  local what="rollback-whole-set (the $1 fails)" last_logind
+  local what="rollback-whole-set (the $1 fails)" last_logind last_journald
   new_pi
   install_set a
   save_installed "$work_dir/before-a"
@@ -1611,20 +1645,26 @@ step_fails() {
   cmp -s -- "$work_dir/verified-a" "$opt/deploy.verified" || fail "$what: changed deploy.verified"
   [[ $(restarts) == 1 && $(grep '^restart ' "$state/systemctl.log") == "restart binary=$(sha "$opt/ghost-wispr") env=$(sha "$opt/.env") config=$(sha "$opt/ghost-wispr.yaml") crt=$(sha "$opt/device.crt")" ]] \
     || fail "$what: did not restart the recorder once, on the restored set: $(<"$state/systemctl.log")"
-  # The logind setting's install that fails leaves its file as it was, and logind restarts for
+  # A system setting's install that fails leaves its file as it was, and its daemon restarts for
   # neither the release nor the rollback.
   last_logind=$(grep -v 'made to fail' "$state/sudo.log" | grep 'systemd-logind' | tail -n1 || true)
+  last_journald=$(grep -v 'made to fail' "$state/sudo.log" | grep 'journalctl --flush' | tail -n1 || true)
   [[ $(grep '^daemon-reload unit=' "$state/systemctl.log" | tail -n1) == "daemon-reload unit=$(sha "$units/ghost-wispr.service")" \
     && $(grep 'udevadm trigger' "$state/sudo.log" | tail -n1) == "timeout=30s udevadm trigger rules=$(sha "$(installed_path 99-ghost-wispr.rules)")" \
-    && (-z $last_logind || $last_logind == "timeout=30s systemctl restart systemd-logind logind=$(sha "$(installed_path logind-power-key.conf)")") ]] \
-    || fail "$what: the user manager, udev and logind did not read the restored files: $(cat -- "$state/systemctl.log" "$state/sudo.log")"
+    && (-z $last_logind || $last_logind == "timeout=30s systemctl restart systemd-logind logind=$(sha "$(installed_path logind-power-key.conf)")") \
+    && (-z $last_journald || $last_journald == "timeout=30s journalctl --flush journald=$(sha "$(installed_path journald-ghost-wispr.conf)")") ]] \
+    || fail "$what: the user manager, udev, logind and journald did not read the restored files: $(cat -- "$state/systemctl.log" "$state/sudo.log")"
 }
 step_fails 'install of the logind setting' fail-sudo 'install /etc/systemd/logind.conf.d/50-ghost-wispr-power-key.conf' \
   "could not install the release's files"
+step_fails 'install of the journald setting' fail-sudo 'install /etc/systemd/journald.conf.d/90-ghost-wispr.conf' \
+  "could not install the release's files"
 # The first daemon-reload is the refusal check's, before any change; the second follows the swap.
 step_fails "user manager's reload" fail-daemon-reload-at 2 'could not reload the user manager'
-step_fails "udev reload" fail-sudo 'udevadm control --reload' 'could not reload udev or restart logind'
-step_fails "logind restart" fail-sudo 'systemctl restart systemd-logind' 'could not reload udev or restart logind'
+step_fails "udev reload" fail-sudo 'udevadm control --reload' 'could not reload udev, or restart logind or journald'
+step_fails "logind restart" fail-sudo 'systemctl restart systemd-logind' 'could not reload udev, or restart logind or journald'
+step_fails "journald restart" fail-sudo 'systemctl restart systemd-journald' 'could not reload udev, or restart logind or journald'
+step_fails "journal's flush" fail-sudo 'journalctl --flush' 'could not reload udev, or restart logind or journald'
 # A rename of the swap that fails, the certificate's version file's or .env's, rolls the set back
 # as a failed step does: each file back, the certificate pair as it was (here, no version file), and
 # one restart, the rollback's.
@@ -2122,9 +2162,11 @@ for busy in "${busy_cases[@]:0:2}" 'UNREADABLE|ghost-wispr.service is active but
   expect_installed_is "$what" "$work_dir/before-a"
   cmp -s -- "$work_dir/verified-a" "$opt/deploy.verified" || fail "$what: changed deploy.verified"
   [[ $(grep -c 'udevadm control --reload' "$state/sudo.log") == 2 && $(grep -c 'restart systemd-logind' "$state/sudo.log") == 2 \
+    && $(grep -c 'restart systemd-journald' "$state/sudo.log") == 2 && $(grep -c 'journalctl --flush' "$state/sudo.log") == 2 \
     && $(grep 'udevadm trigger' "$state/sudo.log" | tail -n1) == "timeout=30s udevadm trigger rules=$(sha "$(installed_path 99-ghost-wispr.rules)")" \
-    && $(grep 'systemd-logind' "$state/sudo.log" | tail -n1) == "timeout=30s systemctl restart systemd-logind logind=$(sha "$(installed_path logind-power-key.conf)")" ]] \
-    || fail "$what: udev and logind did not read the restored files again: $(<"$state/sudo.log")"
+    && $(grep 'systemd-logind' "$state/sudo.log" | tail -n1) == "timeout=30s systemctl restart systemd-logind logind=$(sha "$(installed_path logind-power-key.conf)")" \
+    && $(grep 'systemd-journald' "$state/sudo.log" | tail -n1) == "timeout=30s systemctl restart systemd-journald journald=$(sha "$(installed_path journald-ghost-wispr.conf)")" ]] \
+    || fail "$what: udev, logind and journald did not read the restored files again: $(<"$state/sudo.log")"
   [[ $(grep '^daemon-reload ' "$state/systemctl.log" | tail -n1) == "daemon-reload unit=$(sha "$units/ghost-wispr.service")" ]] \
     || fail "$what: the user manager did not read the restored unit again: $(<"$state/systemctl.log")"
 done

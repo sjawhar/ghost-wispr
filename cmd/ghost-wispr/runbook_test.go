@@ -529,3 +529,24 @@ func TestRunbookChecksTheMicDeviceAfterARelease(t *testing.T) {
 		t.Errorf("the runbook's %q still reads mic_device from ghost-wispr.yaml alone", releaseSection)
 	}
 }
+
+// TestRunbookReadsTheLogsOfAnEarlierBoot fails if the runbook does not say
+// that the Pi's journal outlives a reboot, with the drop-in the nightly update
+// installs, its cap, and the command that reads the recorder's lines of the
+// boot before: sudo journalctl -b -1 with _SYSTEMD_USER_UNIT, since the
+// recorder is ghost-wispr's user unit, which -u ghost-wispr does not match; or
+// if the deploy set's table lacks the journald setting and where it goes.
+func TestRunbookReadsTheLogsOfAnEarlierBoot(t *testing.T) {
+	section := runbookSection(t, "## The Pi's journal")
+	for _, words := range []string{"`/etc/systemd/journald.conf.d/90-ghost-wispr.conf`", "`40-rpi-volatile-storage.conf`",
+		"`Storage=persistent`", "`SystemMaxUse=1G`", "`SystemKeepFree=5G`", "sudo -n journalctl --list-boots",
+		"sudo -n journalctl -b -1 _SYSTEMD_USER_UNIT=ghost-wispr.service", "`-u ghost-wispr`", "check 8"} {
+		if !strings.Contains(section, words) {
+			t.Errorf("the runbook's \"The Pi's journal\" does not say %q", words)
+		}
+	}
+	row := "| `journald-ghost-wispr.conf` | the nightly update | `/etc/systemd/journald.conf.d/90-ghost-wispr.conf` |"
+	if !strings.Contains(readRunbook(t), row) {
+		t.Errorf("the runbook's deploy set table has no row %q", row)
+	}
+}

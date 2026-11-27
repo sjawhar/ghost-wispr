@@ -214,8 +214,8 @@ EOF
 # provision.sh installs its own files as ghost-wispr, and the nightly update the system files: any
 # other install with sudo, any udevadm call and a logind restart are errors that the test reports.
 # The nightly update's own calls each have -n: it installs the system files under
-# GHOST_WISPR_SYSTEM_ROOT, reloads udev and restarts logind, which the log records, and reads Serve's
-# setting.
+# GHOST_WISPR_SYSTEM_ROOT, reloads udev, restarts logind and journald and flushes the journal, which
+# the log records, and reads Serve's setting.
 cat >"$bin/sudo" <<'EOF'
 #!/usr/bin/env bash
 # The start of the run's own unit is logged apart, in $TEST_LOG.provision-units: $TEST_LOG holds what
@@ -242,7 +242,7 @@ if [[ ${1:-} == -n ]]; then
       shift
       exec install "$@"
       ;;
-    udevadm | systemctl) ;;
+    udevadm | systemctl | journalctl) ;;
     tailscale)
       shift
       exec tailscale "$@"
@@ -1098,7 +1098,8 @@ EOF
     >"$work_dir/build.out" 2>&1 || fail "build-deploy-tarball.sh --stage failed for release $name: $(<"$work_dir/build.out")"
   restage "$dir/ghost-wispr-pi-deploy" pi.env "$script_dir/test-pi.env"
   for file in ghost-wispr.yaml pi.env update.sh pi-lib.sh wait-for-network.sh wait-for-time-sync.sh ghost-wispr.service \
-    99-ghost-wispr.rules logind-power-key.conf ghost-wispr-update-launcher.sh ghost-wispr-update.service ghost-wispr-update.timer; do
+    99-ghost-wispr.rules logind-power-key.conf journald-ghost-wispr.conf ghost-wispr-update-launcher.sh ghost-wispr-update.service \
+    ghost-wispr-update.timer; do
     { cat -- "$dir/ghost-wispr-pi-deploy/$file" && printf '# release %s\n' "$name"; } >"$work_dir/marked"
     restage "$dir/ghost-wispr-pi-deploy" "$file" "$work_dir/marked"
   done
@@ -1132,7 +1133,8 @@ installed_set() {
   local path
   for path in "$deploy"/{ghost-wispr.yaml,pi.env,update.sh,pi-lib.sh,wait-for-network.sh,wait-for-time-sync.sh} \
     "$units/ghost-wispr.service" "$sysroot/etc/udev/rules.d/99-ghost-wispr.rules" \
-    "$sysroot/etc/systemd/logind.conf.d/50-ghost-wispr-power-key.conf" "$deploy"/{ghost-wispr,.env,deploy.verified}; do
+    "$sysroot/etc/systemd/logind.conf.d/50-ghost-wispr-power-key.conf" "$sysroot/etc/systemd/journald.conf.d/90-ghost-wispr.conf" \
+    "$deploy"/{ghost-wispr,.env,deploy.verified}; do
     if [[ -f $path ]]; then
       printf '%s %s\n' "$(sha "$path")" "${path#"$pi"/}"
     else
@@ -1468,13 +1470,14 @@ for entry in "ghost-wispr-update-launcher.sh $deploy 755" "ghost-wispr-update.se
   [[ $(stat -c %a -- "$dir/$name") == "$mode" ]] || fail "$dir/$name has mode $(stat -c %a -- "$dir/$name"), not $mode"
 done
 
-# no-env-no-system-files: the nightly update owns .env, the config, the udev rule and the logind
-# setting. provision.sh writes none of them, and reloads neither udev nor logind.
+# no-env-no-system-files: the nightly update owns .env, the config, the udev rule, the logind
+# setting and the journald setting. provision.sh writes none of them, and reloads none of udev,
+# logind and journald.
 begin no-env-no-system-files
 for name in .env ghost-wispr.yaml; do
   [[ ! -e $deploy/$name ]] || fail "provision.sh wrote $deploy/$name"
 done
-if grep -E 'udev|logind|99-ghost-wispr\.rules|logind-power-key' "$work_dir/first.log" >&2; then
+if grep -E 'udev|logind|journald|99-ghost-wispr\.rules|logind-power-key|journald-ghost-wispr' "$work_dir/first.log" >&2; then
   fail 'provision.sh installed or reloaded a system file itself (above)'
 fi
 

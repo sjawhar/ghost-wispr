@@ -7,10 +7,11 @@
 # the config template, serve.conf and the three bootstrap files. The Pi answers Serve
 # (https://PI_HOST/api/...) from fixture JSON, and SSH (ghost-wispr@PI_HOST) by running each remote
 # command here, under sh, in a sandbox that stands for its deploy directory and home, with fakes of
-# sudo, journalctl, tailscale and timeout. Each case says which break of the driver it catches.
+# sudo, journalctl, systemd-analyze, tailscale and timeout. Each case says which break of the driver
+# it catches.
 #
-# The driver prints one line for each of its seven checks, "check N PASS: ...", "check N FAIL: ..."
-# or "check N UNKNOWN: ...", and exits 0 when all seven PASS, else 1.
+# The driver prints one line for each of its eight checks, "check N PASS: ...", "check N FAIL: ..."
+# or "check N UNKNOWN: ...", and exits 0 when all eight PASS, else 1.
 set -euo pipefail
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -35,8 +36,8 @@ readonly old=1111111111111111111111111111111111111111 new=2222222222222222222222
 readonly run_old=0000000000000000000000000000000a run_new=0000000000000000000000000000000b
 readonly run_current=0000000000000000000000000000000c run_by_hand=0000000000000000000000000000000d
 mkdir -p "$bin" "$releases"
-real_curl=$(command -v curl) real_cat=$(command -v cat) real_timeout=$(command -v timeout)
-readonly real_curl real_cat real_timeout
+real_curl=$(command -v curl) real_cat=$(command -v cat) real_timeout=$(command -v timeout) real_find=$(command -v find)
+readonly real_curl real_cat real_timeout real_find
 
 # --- The fakes.
 
@@ -144,6 +145,18 @@ fi
 exec "${FAKE_REAL_CAT:?}" "$@"
 EOF
 
+# find. On the fake Pi it refuses each call while state/find-refused exists, as the Pi refuses
+# ghost-wispr a directory it may not read, whatever user runs this test; every other call is the
+# real find.
+cat >"$bin/find" <<'EOF'
+#!/usr/bin/env bash
+if [[ ${FAKE_ON_PI:-} == 1 && -e ${FAKE_STATE:-}/find-refused ]]; then
+  printf "find: '%s': Permission denied\n" "${1:-.}" >&2
+  exit 1
+fi
+exec "${FAKE_REAL_FIND:?}" "$@"
+EOF
+
 # sudo on the fake Pi: ghost-wispr's passwordless sudo, which the driver must call with -n, as no
 # terminal can answer a password prompt. state/sudo-refused stands for a Pi where sudo asks for a
 # password, which -n refuses.
@@ -214,6 +227,43 @@ fi
 [[ ${FAKE_SUDO:-} == 1 ]] || refuse 'Access denied: serve config denied'
 [[ -f $FAKE_STATE/serve.json ]] || refuse 'failed to connect to local tailscaled'
 cat -- "$FAKE_STATE/serve.json"
+EOF
+
+# systemd-analyze on the fake Pi: `cat-config systemd/journald.conf` prints journald's setting as
+# systemd 257 prints it, from the files under the Pi's root, pi/root: /etc/systemd/journald.conf,
+# then each drop-in of /etc, /run and /usr/lib/systemd/journald.conf.d/ in the order of its file
+# name, an /etc file hiding one of the same name in /run or /usr/lib. Each file follows a line
+# "# <path>", and a blank line comes before each but the first. state/systemd-analyze-fails stands
+# for a Pi where it cannot read the setting.
+cat >"$bin/systemd-analyze" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+[[ $* == 'cat-config systemd/journald.conf' ]] || { printf 'fake systemd-analyze: unexpected arguments: %s\n' "$*" >&2; exit 1; }
+if [[ -e $FAKE_STATE/systemd-analyze-fails ]]; then
+  echo 'Failed to read configuration file: Permission denied' >&2
+  exit 1
+fi
+root=$FAKE_ROOT
+first=true
+show() {
+  $first || echo
+  first=false
+  printf '# %s\n' "$1"
+  cat -- "$root$1"
+}
+[[ ! -f $root/etc/systemd/journald.conf ]] || show /etc/systemd/journald.conf
+names=$(for dir in /etc /run /usr/lib; do
+  [[ ! -d $root$dir/systemd/journald.conf.d ]] \
+    || "$FAKE_REAL_FIND" "$root$dir/systemd/journald.conf.d" -mindepth 1 -maxdepth 1 -name '*.conf' -printf '%f\n'
+done | LC_ALL=C sort -u)
+for name in $names; do
+  for dir in /etc /run /usr/lib; do
+    if [[ -f $root$dir/systemd/journald.conf.d/$name ]]; then
+      show "$dir/systemd/journald.conf.d/$name"
+      break
+    fi
+  done
+done
 EOF
 
 # timeout [OPTIONS] DURATION COMMAND: runs COMMAND; no fake here hangs.
@@ -337,15 +387,16 @@ readonly old_journal good_journal
 # --- The releases.
 
 # make_release COMMIT TEMPLATE: builds COMMIT's deploy tarball and its .sha256 in releases/COMMIT,
-# from TEMPLATE, the repository's update unit and timer, and a launcher and serve.conf of their own.
-# The flat directory stays in releases/COMMIT/stage/ghost-wispr-pi-deploy.
+# from TEMPLATE, the repository's update unit, timer and journald setting, and a launcher and
+# serve.conf of their own. The flat directory stays in releases/COMMIT/stage/ghost-wispr-pi-deploy.
 make_release() {
   local dir=$releases/$1 stage
   stage=$dir/stage/ghost-wispr-pi-deploy
   mkdir -p "$stage"
   cp -- "$2" "$stage/ghost-wispr.yaml"
   cp -- "$script_dir/test-pi.env" "$stage/pi.env"
-  cp -- "$script_dir/files/ghost-wispr-update.service" "$script_dir/files/ghost-wispr-update.timer" "$stage/"
+  cp -- "$script_dir/files/ghost-wispr-update.service" "$script_dir/files/ghost-wispr-update.timer" \
+    "$script_dir/files/journald-ghost-wispr.conf" "$stage/"
   printf '443 http://127.0.0.1:8080\n' >"$stage/serve.conf"
   printf '#!/bin/sh\n# The launcher: runs update.sh under its time limit.\nexec timeout 45m /opt/ghost-wispr/update.sh\n' \
     >"$stage/ghost-wispr-update-launcher.sh"
@@ -399,15 +450,31 @@ recorder_applies() {
 # --- Cases.
 
 # new_case NAME: a fresh fake Pi on the new release, installed by the timer at 03:30, every check's
-# input as it should be, and the latest release the new one.
+# input as it should be, and the latest release the new one. Its journald files are the office
+# Pi's of 2026-11-27 (systemd 257, Raspberry Pi OS): an /etc/systemd/journald.conf with no setting,
+# raspberrypi-sys-mods' 40-rpi-volatile-storage.conf and systemd's syslog.conf, with the release's
+# setting installed as 90-ghost-wispr.conf, and journald writing its journal under
+# /var/log/journal.
 case_count=0
 new_case() {
   name=$1
   case_count=$((case_count + 1))
   case_dir=$work/case-$case_count
   deploy=$case_dir/pi/opt home=$case_dir/pi/home state=$case_dir/state github=$case_dir/github log=$case_dir/log
+  root=$case_dir/pi/root
   units=$home/.config/systemd/user
-  mkdir -p "$deploy" "$units" "$state" "$github" "$log"
+  mkdir -p "$deploy" "$units" "$state" "$github" "$log" "$root/etc/systemd/journald.conf.d" \
+    "$root/usr/lib/systemd/journald.conf.d" "$root/var/log/journal/31e1ef849026403294ddccad747a7e62"
+  printf '%s\n' '#  This file is part of systemd.' '#' '# Entries in this file show the compile time defaults. Local configuration' \
+    '# should be created by either modifying this file (or a copy of it placed in' \
+    '# /etc/ if the original file is shipped in /usr/), or by creating "drop-ins" in' \
+    '# the /etc/systemd/journald.conf.d/ directory.' '' '[Journal]' '#Storage=auto' '#SystemMaxUse=' \
+    >"$root/etc/systemd/journald.conf"
+  printf '[Journal]\nStorage=volatile\n' >"$root/usr/lib/systemd/journald.conf.d/40-rpi-volatile-storage.conf"
+  printf '%s\n' '# This file is part of systemd.' '' '[Journal]' 'ForwardToSyslog=yes' \
+    >"$root/usr/lib/systemd/journald.conf.d/syslog.conf"
+  cp -- "$script_dir/files/journald-ghost-wispr.conf" "$root/etc/systemd/journald.conf.d/90-ghost-wispr.conf"
+  printf 'LPKSHHRH the journal\n' >"$root/var/log/journal/31e1ef849026403294ddccad747a7e62/system.journal"
   local stage=$releases/$new/stage/ghost-wispr-pi-deploy
   cp -- "$stage/ghost-wispr-update-launcher.sh" "$deploy/"
   cp -- "$stage/ghost-wispr-update.service" "$stage/ghost-wispr-update.timer" "$units/"
@@ -444,7 +511,8 @@ run_driver() {
   rc=0
   out=$(PATH="$bin:$PATH" FAKE_HOME="$home" FAKE_STATE="$state" FAKE_GITHUB="$github" FAKE_LOG="$log" \
     FAKE_PI_HOST="$PI_HOST" FAKE_RELEASES_API="$releases_api" FAKE_REAL_CURL="$real_curl" FAKE_REAL_CAT="$real_cat" \
-    GHOST_WISPR_PI_ENV="$env_file" GHOST_WISPR_DEPLOY_DIR="$deploy" GHOST_WISPR_RELEASES_API="$releases_api" \
+    FAKE_REAL_FIND="$real_find" FAKE_ROOT="$root" GHOST_WISPR_PI_ENV="$env_file" GHOST_WISPR_DEPLOY_DIR="$deploy" \
+    GHOST_WISPR_JOURNAL_DIR="$root/var/log/journal" GHOST_WISPR_RELEASES_API="$releases_api" \
     "$real_timeout" 120 bash "${driver_copy:-$driver}" "$@" 2>&1) || rc=$?
 }
 
@@ -466,8 +534,8 @@ expect() {
     [[ $got == *"$words"* ]] || fail "check $n's line does not say \"$words\": $got"
   done
 }
-# expect_verdicts V1 ... V7: the seven checks printed these verdicts, in order, seven check lines in
-# all, and the run exited 0 if all seven are PASS, else 1.
+# expect_verdicts V1 ... V8: the eight checks printed these verdicts, in order, eight check lines in
+# all, and the run exited 0 if all eight are PASS, else 1.
 expect_verdicts() {
   local n=0 verdict total
   for verdict in "$@"; do
@@ -475,7 +543,7 @@ expect_verdicts() {
     expect "$n" "$verdict"
   done
   total=$(grep -cE '^check [0-9]+ (PASS|FAIL|UNKNOWN): ' <<<"$out" || true)
-  [[ $total == 7 ]] || fail "the run printed $total check lines, want 7: $out"
+  [[ $total == 8 ]] || fail "the run printed $total check lines, want 8: $out"
   if [[ " $* " == *' FAIL '* || " $* " == *' UNKNOWN '* ]]; then
     ((rc == 1)) || fail "exit $rc with a check not PASS, want 1: $out"
   else
@@ -498,7 +566,7 @@ unreadable() { printf '%s\n' "$@" >>"$state/unreadable"; }
 new_case 'the good run'
 before=$(pi_tree)
 run_driver
-expect_verdicts PASS PASS PASS PASS PASS PASS PASS
+expect_verdicts PASS PASS PASS PASS PASS PASS PASS PASS
 expect 1 PASS "$new"
 expect 5 PASS ghost-wispr-update.timer "$new" "$run_new"
 [[ $(pi_tree) == "$before" ]] || fail "the driver changed the Pi: before
@@ -519,7 +587,7 @@ fi
 new_case "S1's control: the old commit and the old rule text"
 on_old
 run_driver
-expect_verdicts FAIL FAIL PASS PASS UNKNOWN PASS PASS
+expect_verdicts FAIL FAIL PASS PASS UNKNOWN PASS PASS PASS
 expect 1 FAIL "$old" "$new"
 expect 2 FAIL recording_rules
 expect 5 UNKNOWN "$new"
@@ -530,7 +598,7 @@ expect 5 UNKNOWN "$new"
 new_case '--release an older release'
 on_old
 run_driver --release "$old"
-expect_verdicts PASS PASS PASS PASS PASS PASS PASS
+expect_verdicts PASS PASS PASS PASS PASS PASS PASS PASS
 expect 1 PASS "$old"
 # A --release that names no commit is refused before any check runs. Break it catches: a driver that
 # compares the Pi with a branch name or an empty commit.
@@ -546,7 +614,7 @@ new_case '--release a release on the second page'
 on_old
 jq -c --argjson old "$(release_json "$old")" '. + [$old]' <<<"$(filler_releases 100)" >"$github/releases.json"
 run_driver --release "$old"
-expect_verdicts PASS PASS PASS PASS PASS PASS PASS
+expect_verdicts PASS PASS PASS PASS PASS PASS PASS PASS
 expect 1 PASS "$old"
 [[ $(release_pages) == '1 2' ]] || fail "the driver read the pages $(release_pages) of the releases, want 1 2"
 # A commit no release has: the driver reads every page, up to the first with fewer than 100
@@ -556,7 +624,7 @@ new_case '--release a commit no release has'
 filler_releases 150 >"$github/releases.json"
 unreleased=3333333333333333333333333333333333333333
 run_driver --release "$unreleased"
-expect_verdicts FAIL UNKNOWN UNKNOWN PASS UNKNOWN PASS UNKNOWN
+expect_verdicts FAIL UNKNOWN UNKNOWN PASS UNKNOWN PASS UNKNOWN UNKNOWN
 expect 2 UNKNOWN "no release of commit $unreleased among the 150 releases"
 [[ $(release_pages) == '1 2' ]] || fail "the driver read the pages $(release_pages) of the releases, want 1 2"
 # An API that answers page 2 with page 1's releases would be read for ever: the driver stops at the
@@ -567,7 +635,7 @@ on_old
 jq -c --argjson old "$(release_json "$old")" '. + [$old]' <<<"$(filler_releases 100)" >"$github/releases.json"
 : >"$github/pages-ignored"
 run_driver --release "$old"
-expect_verdicts PASS UNKNOWN UNKNOWN PASS PASS PASS UNKNOWN
+expect_verdicts PASS UNKNOWN UNKNOWN PASS PASS PASS UNKNOWN UNKNOWN
 expect 2 UNKNOWN 'page 2'
 [[ $(release_pages) == '1 2' ]] || fail "the driver read the pages $(release_pages) of the releases, want 1 2"
 
@@ -576,12 +644,12 @@ expect 2 UNKNOWN 'page 2'
 new_case 'Serve does not answer'
 rm -f -- "$state/version.json" "$state/status.json" "$state/config.json" "$state/providers.json"
 run_driver
-expect_verdicts UNKNOWN UNKNOWN UNKNOWN UNKNOWN PASS PASS PASS
+expect_verdicts UNKNOWN UNKNOWN UNKNOWN UNKNOWN PASS PASS PASS PASS
 expect 1 UNKNOWN /api/version
 new_case 'a version with no commit'
 printf '{"version":"dev"}\n' >"$state/version.json"
 run_driver
-expect_verdicts UNKNOWN PASS PASS PASS PASS PASS PASS
+expect_verdicts UNKNOWN PASS PASS PASS PASS PASS PASS PASS
 
 # Check 2: each model setting, run with a value the template does not give it, fails, and the line
 # names that role, its setting and the value it runs, and no other difference. One case a role.
@@ -592,7 +660,7 @@ for entry in "${model_settings[@]}"; do
   new_case "a running $role that the template does not name"
   jq -c --arg role "$role" '.models[$role] = "other/\($role)-value"' <<<"$new_config" >"$state/config.json"
   run_driver
-  expect_verdicts PASS FAIL PASS PASS PASS PASS PASS
+  expect_verdicts PASS FAIL PASS PASS PASS PASS PASS PASS
   expect 2 FAIL "$role runs \"other/$role-value\"" "($setting)"
   [[ $(grep -o 'but the template names' <<<"$(verdict_line 2)" | grep -c .) == 1 ]] \
     || fail "check 2 names a difference besides $role's: $(verdict_line 2)"
@@ -606,12 +674,12 @@ done
 new_case 'a running config that reports no concierge model'
 jq -c 'del(.models.concierge)' <<<"$new_config" >"$state/config.json"
 run_driver
-expect_verdicts PASS UNKNOWN PASS PASS PASS PASS PASS
+expect_verdicts PASS UNKNOWN PASS PASS PASS PASS PASS PASS
 expect 2 UNKNOWN 'reports no concierge model' concierge.model
 [[ $(verdict_line 2) != *null* ]] || fail "check 2 calls the missing model null: $(verdict_line 2)"
 jq -c '.models.concierge = ""' <<<"$new_config" >"$state/config.json"
 run_driver
-expect_verdicts PASS FAIL PASS PASS PASS PASS PASS
+expect_verdicts PASS FAIL PASS PASS PASS PASS PASS PASS
 expect 2 FAIL 'concierge runs ""' '(concierge.model)'
 # The local settings come from the recorder's own report, GET /api/config's local_settings: the
 # settings it applied from ghost-wispr.local.yaml, as JSON. The driver reads no YAML of that file.
@@ -627,12 +695,12 @@ printf 'summarization:\n    model: vertex/gemini-saved-on-the-page\n' >"$deploy/
 jq -c '.models.summarization = "vertex/gemini-saved-on-the-page"' <<<"$new_config" >"$state/config.json"
 recorder_applies '{"summarization":{"model":"vertex/gemini-saved-on-the-page"}}'
 run_driver
-expect_verdicts PASS PASS PASS PASS PASS PASS PASS
+expect_verdicts PASS PASS PASS PASS PASS PASS PASS PASS
 expect 2 PASS summarization.model
 rm -f -- "$deploy/ghost-wispr.local.yaml"
 recorder_applies null
 run_driver
-expect_verdicts PASS FAIL PASS PASS PASS PASS PASS
+expect_verdicts PASS FAIL PASS PASS PASS PASS PASS PASS
 expect 2 FAIL summarization vertex/gemini-saved-on-the-page
 
 # Sol's cases (GPT-6.1 Sol's review of PR #201 at 6c53026b, finding 1): a local settings file in
@@ -645,14 +713,14 @@ new_case 'a flow-style local settings file, and the release model running'
 printf 'summarization: {model: vertex/gemini-saved-on-the-page}\n' >"$deploy/ghost-wispr.local.yaml"
 recorder_applies '{"summarization":{"model":"vertex/gemini-saved-on-the-page"}}'
 run_driver
-expect_verdicts PASS FAIL PASS PASS PASS PASS PASS
+expect_verdicts PASS FAIL PASS PASS PASS PASS PASS PASS
 expect 2 FAIL summarization vertex/gemini-saved-on-the-page
 new_case 'a flow-style local settings file, and its model running'
 printf 'summarization: {model: vertex/gemini-saved-on-the-page}\n' >"$deploy/ghost-wispr.local.yaml"
 jq -c '.models.summarization = "vertex/gemini-saved-on-the-page"' <<<"$new_config" >"$state/config.json"
 recorder_applies '{"summarization":{"model":"vertex/gemini-saved-on-the-page"}}'
 run_driver
-expect_verdicts PASS PASS PASS PASS PASS PASS PASS
+expect_verdicts PASS PASS PASS PASS PASS PASS PASS PASS
 expect 2 PASS summarization.model
 [[ -s $log/ssh ]] || fail "the driver made no SSH call, so its SSH log shows nothing: $out"
 ! grep -q 'ghost-wispr\.local\.yaml' "$log/ssh" \
@@ -661,7 +729,7 @@ new_case 'a block-style local settings file, and the release model running'
 printf 'summarization:\n    model: vertex/gemini-saved-on-the-page\n' >"$deploy/ghost-wispr.local.yaml"
 recorder_applies '{"summarization":{"model":"vertex/gemini-saved-on-the-page"}}'
 run_driver
-expect_verdicts PASS FAIL PASS PASS PASS PASS PASS
+expect_verdicts PASS FAIL PASS PASS PASS PASS PASS PASS
 expect 2 FAIL summarization vertex/gemini-saved-on-the-page
 
 # Recording rules the recorder took from the local settings file (an older build saved
@@ -672,7 +740,7 @@ printf 'recording_rules:\n    - A rule from the environment, saved.\n' >"$deploy
 jq -c '.recording_rules = ["A rule from the environment, saved."]' <<<"$new_config" >"$state/config.json"
 recorder_applies '{"recording_rules":["A rule from the environment, saved."]}'
 run_driver
-expect_verdicts PASS PASS PASS PASS PASS PASS PASS
+expect_verdicts PASS PASS PASS PASS PASS PASS PASS PASS
 expect 2 PASS recording_rules
 
 # Checks 2 and 3 cannot read their input: GET /api/config does not answer, or it answers with no
@@ -684,23 +752,23 @@ expect 2 PASS recording_rules
 new_case 'GET /api/config does not answer'
 rm -f -- "$state/config.json"
 run_driver
-expect_verdicts PASS UNKNOWN UNKNOWN PASS PASS PASS PASS
+expect_verdicts PASS UNKNOWN UNKNOWN PASS PASS PASS PASS PASS
 expect 2 UNKNOWN /api/config
 expect 3 UNKNOWN /api/config
 new_case 'a recorder that reports no local_settings'
 jq -c 'del(.local_settings)' <<<"$new_config" >"$state/config.json"
 run_driver
-expect_verdicts PASS UNKNOWN UNKNOWN PASS PASS PASS PASS
+expect_verdicts PASS UNKNOWN UNKNOWN PASS PASS PASS PASS PASS
 expect 2 UNKNOWN local_settings
 expect 3 UNKNOWN local_settings
 jq -c '.providers[0].ok = false | .providers[0].message = "401 Unauthorized"' <<<"$good_providers" >"$state/providers.json"
 run_driver
-expect_verdicts PASS UNKNOWN FAIL PASS PASS PASS PASS
+expect_verdicts PASS UNKNOWN FAIL PASS PASS PASS PASS PASS
 expect 3 FAIL "$first_provider" local_settings
 printf '%s\n' "$good_providers" >"$state/providers.json"
 recorder_applies '"summarization"'
 run_driver
-expect_verdicts PASS UNKNOWN UNKNOWN PASS PASS PASS PASS
+expect_verdicts PASS UNKNOWN UNKNOWN PASS PASS PASS PASS PASS
 expect 2 UNKNOWN local_settings
 
 # The recorder did not apply the local settings file (it does not parse): it runs the release's
@@ -716,7 +784,7 @@ recorder_applies '{"applied":false,"error":"not valid YAML near line 2"}'
 jq -c --arg warning "$deploy/ghost-wispr.local.yaml: not valid YAML near line 2; settings saved on the page are not applied" \
   '.warnings = [$warning]' <<<"$idle_status" >"$state/status.json"
 run_driver
-expect_verdicts PASS PASS PASS FAIL PASS PASS PASS
+expect_verdicts PASS PASS PASS FAIL PASS PASS PASS PASS
 expect 2 PASS 'did not apply' 'not valid YAML near line 2'
 expect 3 PASS 'did not apply'
 expect 4 FAIL 'ghost-wispr.local.yaml' 'settings saved on the page are not applied'
@@ -729,12 +797,12 @@ new_case 'a model that differs, and recording rules that cannot be read'
 jq -c '.models.embedding = "vertex/other-embedding"' <<<"$new_config" >"$state/config.json"
 recorder_applies '{"recording_rules":"A rule, not a list."}'
 run_driver
-expect_verdicts PASS FAIL PASS PASS PASS PASS PASS
+expect_verdicts PASS FAIL PASS PASS PASS PASS PASS PASS
 expect 2 FAIL 'embedding runs' vertex/other-embedding 'local_settings gives recording_rules'
 printf '%s\n' "$new_config" >"$state/config.json"
 recorder_applies '{"recording_rules":"A rule, not a list."}'
 run_driver
-expect_verdicts PASS UNKNOWN PASS PASS PASS PASS PASS
+expect_verdicts PASS UNKNOWN PASS PASS PASS PASS PASS PASS
 expect 2 UNKNOWN 'local_settings gives recording_rules'
 
 # Check 3: a provider that did not sign in, one the template does not name, and one the template
@@ -744,18 +812,18 @@ expect 2 UNKNOWN 'local_settings gives recording_rules'
 new_case 'a provider that did not sign in'
 jq -c '.providers[0].ok = false | .providers[0].message = "401 Unauthorized"' <<<"$good_providers" >"$state/providers.json"
 run_driver
-expect_verdicts PASS PASS FAIL PASS PASS PASS PASS
+expect_verdicts PASS PASS FAIL PASS PASS PASS PASS PASS
 expect 3 FAIL "$first_provider"
 new_case 'a provider the template does not name'
 jq -c '.providers += [{name: "gateway", ok: true, message: "works"}]' <<<"$good_providers" >"$state/providers.json"
 run_driver
-expect_verdicts PASS PASS FAIL PASS PASS PASS PASS
+expect_verdicts PASS PASS FAIL PASS PASS PASS PASS PASS
 expect 3 FAIL gateway
 new_case 'a provider the template names that the Pi does not list'
 missing_provider=$(jq -er '.providers[-1].name' <<<"$good_providers") || fail "read no provider name from $good_providers"
 jq -c 'del(.providers[-1])' <<<"$good_providers" >"$state/providers.json"
 run_driver
-expect_verdicts PASS PASS FAIL PASS PASS PASS PASS
+expect_verdicts PASS PASS FAIL PASS PASS PASS PASS PASS
 expect 3 FAIL "the Pi lists no $missing_provider"
 # A provider the local settings add runs, since the recorder applies them over the template, and
 # passes. Break it catches: a driver whose check 3 fails for good on a Pi whose local settings file
@@ -765,7 +833,7 @@ printf 'providers:\n    gateway:\n        api: openai\n' >"$deploy/ghost-wispr.l
 recorder_applies '{"providers":{"gateway":{"api":"openai"}}}'
 jq -c '.providers += [{name: "gateway", ok: true, message: "works"}]' <<<"$good_providers" >"$state/providers.json"
 run_driver
-expect_verdicts PASS PASS PASS PASS PASS PASS PASS
+expect_verdicts PASS PASS PASS PASS PASS PASS PASS PASS
 # The local settings set to null each provider the template names, and the Pi lists none: no
 # provider is left to check, which is no pass. Break it catches: a driver that applies the nulls and
 # then passes an empty list against an empty list.
@@ -777,12 +845,12 @@ new_case 'local settings that remove every provider'
 recorder_applies "$(template_providers "$new_template" | jq -Rcn '{providers: (reduce inputs as $name ({}; .[$name] = null))}')"
 printf '{"providers":[]}\n' >"$state/providers.json"
 run_driver
-expect_verdicts PASS PASS UNKNOWN PASS PASS PASS PASS
+expect_verdicts PASS PASS UNKNOWN PASS PASS PASS PASS PASS
 expect 3 UNKNOWN 'no provider' ghost-wispr.local.yaml
 new_case 'GET /api/providers does not answer'
 rm -f -- "$state/providers.json"
 run_driver
-expect_verdicts PASS PASS UNKNOWN PASS PASS PASS PASS
+expect_verdicts PASS PASS UNKNOWN PASS PASS PASS PASS PASS
 expect 3 UNKNOWN /api/providers
 
 # Check 4: a warning fails; a status with no warnings list is not a pass. Break it catches: a driver
@@ -790,12 +858,12 @@ expect 3 UNKNOWN /api/providers
 new_case 'a warning'
 jq -c '.warnings = ["Search cannot index sessions"]' <<<"$idle_status" >"$state/status.json"
 run_driver
-expect_verdicts PASS PASS PASS FAIL PASS PASS PASS
+expect_verdicts PASS PASS PASS FAIL PASS PASS PASS PASS
 expect 4 FAIL 'Search cannot index sessions'
 new_case 'a status with no warnings list'
 printf '{"paused":false,"capture_state":"capturing"}\n' >"$state/status.json"
 run_driver
-expect_verdicts PASS PASS PASS UNKNOWN PASS PASS PASS
+expect_verdicts PASS PASS PASS UNKNOWN PASS PASS PASS PASS
 
 # Check 5: the run that installed the commit was started by hand, and the timer's runs after it find
 # it current. Breaks it catches: a driver that reads the last launcher line, or the first, instead of
@@ -807,7 +875,7 @@ printf '%s\n' "$old_journal" \
   "$(launcher "$run_current" ghost-wispr-update.timer 1795664700000000)" \
   "ghost-wispr update: already current at commit $new" >"$state/journal-ghost-wispr-update.service"
 run_driver
-expect_verdicts PASS PASS PASS PASS FAIL PASS PASS
+expect_verdicts PASS PASS PASS PASS FAIL PASS PASS PASS
 expect 5 FAIL "$run_by_hand" none
 # The journal has no install line for the commit (rotated away, or the Pi was installed another
 # way), or the install line's run has no launcher line. Break it catches: a driver that passes
@@ -818,12 +886,12 @@ printf '%s\n' "$old_journal" \
   "$(launcher "$run_current" ghost-wispr-update.timer 1795664700000000)" \
   "ghost-wispr update: already current at commit $new" >"$state/journal-ghost-wispr-update.service"
 run_driver
-expect_verdicts PASS PASS PASS PASS UNKNOWN PASS PASS
+expect_verdicts PASS PASS PASS PASS UNKNOWN PASS PASS PASS
 expect 5 UNKNOWN "installed commit $new"
 new_case 'an install line whose run has no launcher line'
 printf '%s\n' "$old_journal" "$(installed "$new" "$run_new")" >"$state/journal-ghost-wispr-update.service"
 run_driver
-expect_verdicts PASS PASS PASS PASS UNKNOWN PASS PASS
+expect_verdicts PASS PASS PASS PASS UNKNOWN PASS PASS PASS
 expect 5 UNKNOWN "$run_new"
 # A launcher line with no invocation id (INVOCATION_ID unset), and so an install line with none.
 # Break it catches: a driver that pairs the empty id of the install line with the empty id of a
@@ -833,13 +901,13 @@ printf '%s\n' "$old_journal" \
   "$(launcher '' ghost-wispr-update.timer 1795663800000000)" \
   "$(installed "$new" '')" >"$state/journal-ghost-wispr-update.service"
 run_driver
-expect_verdicts PASS PASS PASS PASS UNKNOWN PASS PASS
+expect_verdicts PASS PASS PASS PASS UNKNOWN PASS PASS PASS
 # An empty journal is no pass. Break it catches: a driver that reads journalctl's "-- No entries --"
 # or an empty answer as a journal it searched.
 new_case 'an empty journal'
 : >"$state/journal-ghost-wispr-update.service"
 run_driver
-expect_verdicts PASS PASS PASS PASS UNKNOWN PASS PASS
+expect_verdicts PASS PASS PASS PASS UNKNOWN PASS PASS PASS
 expect 5 UNKNOWN ghost-wispr-update.service
 
 # sudo -n refused: the journal and the Serve status cannot be read. Break it catches: a driver that
@@ -847,7 +915,7 @@ expect 5 UNKNOWN ghost-wispr-update.service
 new_case 'sudo -n refused'
 : >"$state/sudo-refused"
 run_driver
-expect_verdicts PASS PASS PASS PASS UNKNOWN PASS UNKNOWN
+expect_verdicts PASS PASS PASS PASS UNKNOWN PASS UNKNOWN PASS
 expect 5 UNKNOWN sudo
 expect 7 UNKNOWN sudo
 
@@ -858,20 +926,20 @@ expect 7 UNKNOWN sudo
 new_case 'ssh unreachable'
 : >"$state/ssh-down"
 run_driver
-expect_verdicts PASS PASS PASS PASS UNKNOWN UNKNOWN UNKNOWN
-for n in 5 6 7; do expect "$n" UNKNOWN SSH; done
+expect_verdicts PASS PASS PASS PASS UNKNOWN UNKNOWN UNKNOWN UNKNOWN
+for n in 5 6 7 8; do expect "$n" UNKNOWN SSH; done
 
 # Check 6: a protected recording changed, and a list that names none. Breaks it catches: a driver
 # that does not hash the recordings; one that passes a list that names no recording.
 new_case 'a changed protected recording'
 printf 'edited\n' >>"$home/meeting-b.wav"
 run_driver
-expect_verdicts PASS PASS PASS PASS PASS FAIL PASS
+expect_verdicts PASS PASS PASS PASS PASS FAIL PASS PASS
 expect 6 FAIL meeting-b.wav
 new_case 'no protected recording named'
 printf '%s\n' "$(<"$script_dir/test-pi.env")" "PI_PROTECTED_RECORDINGS=''" >"$env_file"
 run_driver
-expect_verdicts PASS PASS PASS PASS PASS UNKNOWN PASS
+expect_verdicts PASS PASS PASS PASS PASS UNKNOWN PASS PASS
 expect 6 UNKNOWN PI_PROTECTED_RECORDINGS
 
 # Check 7: a bootstrap file that differs from the release's manifest, one that is missing, and a
@@ -885,14 +953,14 @@ expect 6 UNKNOWN PI_PROTECTED_RECORDINGS
 new_case 'a changed timer file'
 printf '# edited on the Pi\n' >>"$units/ghost-wispr-update.timer"
 run_driver
-expect_verdicts PASS PASS PASS PASS PASS PASS FAIL
+expect_verdicts PASS PASS PASS PASS PASS PASS FAIL PASS
 expect 7 FAIL ghost-wispr-update.timer
 [[ $(verdict_line 7) != *ghost-wispr-update.service* && $(verdict_line 7) != *ghost-wispr-update-launcher.sh* ]] \
   || fail "check 7 names a bootstrap file that matches: $(verdict_line 7)"
 new_case 'a missing launcher'
 rm -f -- "$deploy/ghost-wispr-update-launcher.sh"
 run_driver
-expect_verdicts PASS PASS PASS PASS PASS PASS FAIL
+expect_verdicts PASS PASS PASS PASS PASS PASS FAIL PASS
 expect 7 FAIL ghost-wispr-update-launcher.sh
 # Sol's case (GPT-6.1 Sol's review of PR #201 at 6c53026b, finding 4): the launcher is missing, and
 # SSH is lost while the driver reads the next bootstrap file. The absence that the first read found
@@ -904,7 +972,7 @@ rm -f -- "$deploy/ghost-wispr-update-launcher.sh"
 printf '%s' '.config/systemd/user/ghost-wispr-update.service' >"$state/ssh-lost-on"
 run_driver
 [[ -e $state/ssh-lost-fired ]] || fail "SSH was never lost: the driver did not read ghost-wispr-update.service: $out"
-expect_verdicts PASS PASS PASS PASS PASS PASS FAIL
+expect_verdicts PASS PASS PASS PASS PASS PASS FAIL PASS
 expect 7 FAIL ghost-wispr-update-launcher.sh SSH
 # A Serve that differs: check 7 names each handler of the Pi's Serve by its port, path and kind,
 # never by its value, and the command that shows the whole setting (GPT-6.1 Sol's review of #208,
@@ -912,7 +980,7 @@ expect 7 FAIL ghost-wispr-update-launcher.sh SSH
 new_case 'a Serve target that differs'
 jq -c '.Web[].Handlers["/"].Proxy = "http://127.0.0.1:9090"' <<<"$good_serve" >"$state/serve.json"
 run_driver
-expect_verdicts PASS PASS PASS PASS PASS PASS FAIL
+expect_verdicts PASS PASS PASS PASS PASS PASS FAIL PASS
 expect 7 FAIL Serve 'have 443 "/" proxy' 'http://127.0.0.1:8080' 'read the whole setting on the Pi with: sudo tailscale serve status'
 [[ $(verdict_line 7) != *9090* ]] || fail "check 7 names the Pi's proxy target: $(verdict_line 7)"
 # Handlers that hold text someone set, each with a canary: a Text body, a redirect and a proxy
@@ -925,7 +993,7 @@ jq -c --arg host "$PI_HOST" '.Web[$host + ":443"].Handlers["/"].Proxy = "http://
   <<<"$good_serve" >"$state/serve.json"
 [[ $(grep -o 'dummy-serve-[a-z]*-canary' "$state/serve.json" | grep -c .) == 3 ]] || fail "control: the Serve status holds no three canaries: $(<"$state/serve.json")"
 run_driver
-expect_verdicts PASS PASS PASS PASS PASS PASS FAIL
+expect_verdicts PASS PASS PASS PASS PASS PASS FAIL PASS
 expect 7 FAIL 'have 443 "/" proxy,443 "/note" text,8443 "/" redirect'
 ! grep -q 'dummy-serve-[a-z]*-canary' <<<"$out" || fail "the driver printed what a Serve handler holds: $out"
 # An empty Serve, as a Serve apply cut short after its reset leaves it (GPT-6.1 Sol's review of #203):
@@ -935,7 +1003,7 @@ expect 7 FAIL 'have 443 "/" proxy,443 "/note" text,8443 "/" redirect'
 new_case 'an empty Serve'
 printf '{}\n' >"$state/serve.json"
 run_driver
-expect_verdicts PASS PASS PASS PASS PASS PASS FAIL
+expect_verdicts PASS PASS PASS PASS PASS PASS FAIL PASS
 expect 7 FAIL 'have none' 'Serve is empty, so the Pi serves no page' "run the release's ./provision.sh on the Pi"
 # Check 7 cannot read its input: a Serve status that is not the JSON it reads, tailscaled not
 # answering, or a bootstrap file it cannot read. Break it catches: a driver that reads an unreadable
@@ -943,17 +1011,17 @@ expect 7 FAIL 'have none' 'Serve is empty, so the Pi serves no page' "run the re
 new_case 'an unreadable Serve status'
 printf 'tailscaled is starting\n' >"$state/serve.json"
 run_driver
-expect_verdicts PASS PASS PASS PASS PASS PASS UNKNOWN
+expect_verdicts PASS PASS PASS PASS PASS PASS UNKNOWN PASS
 expect 7 UNKNOWN 'tailscale serve status'
 new_case 'tailscaled does not answer'
 rm -f -- "$state/serve.json"
 run_driver
-expect_verdicts PASS PASS PASS PASS PASS PASS UNKNOWN
+expect_verdicts PASS PASS PASS PASS PASS PASS UNKNOWN PASS
 expect 7 UNKNOWN 'tailscale serve status'
 new_case 'an unreadable bootstrap file'
 unreadable "$units/ghost-wispr-update.service"
 run_driver
-expect_verdicts PASS PASS PASS PASS PASS PASS UNKNOWN
+expect_verdicts PASS PASS PASS PASS PASS PASS UNKNOWN PASS
 expect 7 UNKNOWN ghost-wispr-update.service
 # A device renamed after its Serve was set keeps the Web entry of the name it had before
 # (deploy/pi/testdata/serve-status-after-rename.json, the office Pi's answer of 2026-11-27 with the
@@ -964,12 +1032,12 @@ expect 7 UNKNOWN ghost-wispr-update.service
 new_case 'a Serve entry of the name the Pi had before a rename'
 cp -- "$script_dir/testdata/serve-status-after-rename.json" "$state/serve.json"
 run_driver
-expect_verdicts PASS PASS PASS PASS PASS PASS FAIL
+expect_verdicts PASS PASS PASS PASS PASS PASS FAIL PASS
 expect 7 FAIL Serve '443 "/" proxy on ghost-wispr-1.example-tailnet.ts.net'
 new_case "the Pi's tailnet name cannot be read"
 rm -f -- "$state/self.json"
 run_driver
-expect_verdicts PASS PASS PASS PASS PASS PASS UNKNOWN
+expect_verdicts PASS PASS PASS PASS PASS PASS UNKNOWN PASS
 expect 7 UNKNOWN 'tailscale status --self --json'
 # A failed read of Serve or of the device's name whose error output holds a login URL, as tailscale
 # prints one for a logged-out device (GPT-6.1 Sol's review of #208, round 4). Check 7 names the
@@ -984,7 +1052,7 @@ for read in serve self; do
   cp -- "$work/tailscale-stderr" "$state/tailscale-stderr"
   rm -f -- "$state/$read.json"
   run_driver
-  expect_verdicts PASS PASS PASS PASS PASS PASS UNKNOWN
+  expect_verdicts PASS PASS PASS PASS PASS PASS UNKNOWN PASS
   if [[ $read == serve ]]; then
     expect 7 UNKNOWN 'timeout 10s sudo -n tailscale serve status --json, exit 1' 'run it on the Pi to see why: sudo tailscale serve status --json'
   else
@@ -1012,7 +1080,7 @@ cp -- "$driver" "$lib_tree/"
     "serve_lines_from_status() { printf '443 http://127.0.0.1:7777\\n'; }"
 } >"$lib_tree/pi-lib.sh"
 driver_copy=$lib_tree/check-deploy.sh run_driver
-expect_verdicts PASS PASS PASS PASS PASS PASS FAIL
+expect_verdicts PASS PASS PASS PASS PASS PASS FAIL PASS
 expect 7 FAIL 'provisioning file ghost-wispr-update.timer' 'have 443 http://127.0.0.1:7777'
 rm -f -- "$lib_tree/pi-lib.sh"
 driver_copy=$lib_tree/check-deploy.sh run_driver
@@ -1026,7 +1094,7 @@ driver_copy=$lib_tree/check-deploy.sh run_driver
 new_case 'the releases API does not answer'
 rm -f -- "$github/latest.json"
 run_driver
-expect_verdicts UNKNOWN UNKNOWN UNKNOWN PASS UNKNOWN PASS UNKNOWN
+expect_verdicts UNKNOWN UNKNOWN UNKNOWN PASS UNKNOWN PASS UNKNOWN UNKNOWN
 # The tarball does not match its .sha256, its files do not match its manifest, its manifest names
 # another commit, or the release has no tarball (a release from before the deploy set): the checks
 # that read the template, serve.conf or the manifest are UNKNOWN; the commit check still runs.
@@ -1038,7 +1106,7 @@ cp -- "$releases/$new/ghost-wispr-pi-deploy.tar.gz" "$case_dir/release/"
 printf '%064d  ghost-wispr-pi-deploy.tar.gz\n' 0 >"$case_dir/release/ghost-wispr-pi-deploy.tar.gz.sha256"
 release_json "$new" "$case_dir/release" >"$github/latest.json"
 run_driver
-expect_verdicts PASS UNKNOWN UNKNOWN PASS PASS PASS UNKNOWN
+expect_verdicts PASS UNKNOWN UNKNOWN PASS PASS PASS UNKNOWN UNKNOWN
 expect 2 UNKNOWN .sha256
 new_case 'a template that does not match the manifest'
 mkdir -p "$case_dir/release/stage"
@@ -1049,17 +1117,17 @@ tar -C "$case_dir/release/stage" -czf "$case_dir/release/ghost-wispr-pi-deploy.t
 (cd -- "$case_dir/release" && sha256sum ghost-wispr-pi-deploy.tar.gz >ghost-wispr-pi-deploy.tar.gz.sha256)
 release_json "$new" "$case_dir/release" >"$github/latest.json"
 run_driver
-expect_verdicts PASS UNKNOWN UNKNOWN PASS PASS PASS UNKNOWN
+expect_verdicts PASS UNKNOWN UNKNOWN PASS PASS PASS UNKNOWN UNKNOWN
 expect 2 UNKNOWN manifest
 new_case "a release that carries another commit's deploy set"
 release_json "$new" "$releases/$old" >"$github/latest.json"
 run_driver
-expect_verdicts PASS UNKNOWN UNKNOWN PASS PASS PASS UNKNOWN
+expect_verdicts PASS UNKNOWN UNKNOWN PASS PASS PASS UNKNOWN UNKNOWN
 expect 2 UNKNOWN manifest
 new_case 'a release with no deploy tarball'
 jq -c '.assets |= map(select(.name | startswith("ghost-wispr-pi-deploy") | not))' <<<"$(release_json "$new")" >"$github/latest.json"
 run_driver
-expect_verdicts PASS UNKNOWN UNKNOWN PASS PASS PASS UNKNOWN
+expect_verdicts PASS UNKNOWN UNKNOWN PASS PASS PASS UNKNOWN UNKNOWN
 expect 2 UNKNOWN ghost-wispr-pi-deploy.tar.gz
 
 # The driver runs from a tailnet member device and names no devbox: the box that once ran the Pi's
@@ -1079,14 +1147,81 @@ jq -c --arg host "$PI_HOST" \
   '.TCP["8443"] = {HTTPS: true} | .Web[$host + ":8443"] = {Handlers: {"/": {Path: "/home/ghost-wispr/public"}}}' \
   <<<"$good_serve" >"$state/serve.json"
 run_driver
-expect_verdicts PASS PASS PASS PASS PASS PASS FAIL
+expect_verdicts PASS PASS PASS PASS PASS PASS FAIL PASS
 expect 7 FAIL Serve 8443
 new_case 'a Serve handler that cannot be read'
 jq -c --arg host "$PI_HOST" \
   '.TCP["8443"] = {HTTPS: true} | .Web[$host + ":8443"] = {Handlers: {"/": "http://127.0.0.1:8081"}}' \
   <<<"$good_serve" >"$state/serve.json"
 run_driver
-expect_verdicts PASS PASS PASS PASS PASS PASS UNKNOWN
+expect_verdicts PASS PASS PASS PASS PASS PASS UNKNOWN PASS
 expect 7 UNKNOWN 'tailscale serve status'
+
+# Check 8: journald runs the release's journald setting, so the journal is persistent and capped,
+# and journald writes it to the card. The fake Pi's journald files are the office Pi's (new_case),
+# on which raspberrypi-sys-mods' 40-rpi-volatile-storage.conf sets Storage=volatile: the release's
+# 90-ghost-wispr.conf comes after it in the order of file names, so its values are the ones journald
+# runs. Breaks they catch: a driver that takes the first value of a setting, not the last, or reads
+# the release's file alone, so the vendor's volatile storage or an older cap passes; one that passes
+# a setting with no journal on the card, which a journald not restarted since the setting went in
+# leaves; one that takes an unreadable setting or directory for a pass.
+journal_file=31e1ef849026403294ddccad747a7e62/system.journal
+new_case 'the journald setting as the release gives it'
+run_driver
+expect_verdicts PASS PASS PASS PASS PASS PASS PASS PASS
+expect 8 PASS 'Storage=persistent' 'SplitMode=none' 'SystemMaxUse=1G' 'SystemKeepFree=5G' 'SystemMaxFileSize=64M' \
+  'SyncIntervalSec=5m' "$root/var/log/journal/$journal_file"
+new_case "no journald setting of the release installed"
+rm -f -- "$root/etc/systemd/journald.conf.d/90-ghost-wispr.conf"
+run_driver
+expect_verdicts PASS PASS PASS PASS PASS PASS PASS FAIL
+expect 8 FAIL 'Storage is volatile, from /usr/lib/systemd/journald.conf.d/40-rpi-volatile-storage.conf' \
+  "journald-ghost-wispr.conf gives persistent" 'SystemMaxUse is not set'
+new_case "a drop-in after the release's setting that sets volatile storage"
+printf '[Journal]\nStorage=volatile\n' >"$root/usr/lib/systemd/journald.conf.d/95-rpi-volatile.conf"
+run_driver
+expect_verdicts PASS PASS PASS PASS PASS PASS PASS FAIL
+expect 8 FAIL 'Storage is volatile, from /usr/lib/systemd/journald.conf.d/95-rpi-volatile.conf'
+[[ $(verdict_line 8) != *SystemMaxUse* ]] || fail "check 8 names a setting that journald runs as the release gives it: $(verdict_line 8)"
+new_case 'an older journald setting installed'
+awk '{ print /^SystemMaxUse=/ ? "SystemMaxUse=4G" : $0 }' "$script_dir/files/journald-ghost-wispr.conf" \
+  >"$root/etc/systemd/journald.conf.d/90-ghost-wispr.conf"
+run_driver
+expect_verdicts PASS PASS PASS PASS PASS PASS PASS FAIL
+expect 8 FAIL 'SystemMaxUse is 4G, from /etc/systemd/journald.conf.d/90-ghost-wispr.conf' 'gives 1G'
+new_case 'no journal on the card'
+rm -f -- "$root/var/log/journal/$journal_file"
+run_driver
+expect_verdicts PASS PASS PASS PASS PASS PASS PASS FAIL
+expect 8 FAIL 'no system.journal' 'in /run'
+new_case 'no journal directory'
+rm -rf -- "$root/var/log/journal"
+run_driver
+expect_verdicts PASS PASS PASS PASS PASS PASS PASS FAIL
+expect 8 FAIL "$root/var/log/journal does not exist"
+new_case 'the journald setting cannot be read'
+: >"$state/systemd-analyze-fails"
+run_driver
+expect_verdicts PASS PASS PASS PASS PASS PASS PASS UNKNOWN
+expect 8 UNKNOWN 'systemd-analyze cat-config systemd/journald.conf' 'Permission denied'
+new_case 'the journal directory cannot be read'
+: >"$state/find-refused"
+run_driver
+expect_verdicts PASS PASS PASS PASS PASS PASS PASS UNKNOWN
+expect 8 UNKNOWN "$root/var/log/journal" 'Permission denied'
+new_case 'SSH lost while the driver reads the journald setting'
+printf 'systemd-analyze\n' >"$state/ssh-lost-on"
+run_driver
+expect_verdicts PASS PASS PASS PASS PASS PASS PASS UNKNOWN
+expect 8 UNKNOWN SSH
+new_case 'a release with no journald setting'
+mkdir -p "$case_dir/release/stage"
+cp -R -- "$releases/$new/stage/ghost-wispr-pi-deploy" "$case_dir/release/stage/"
+rm -f -- "$case_dir/release/stage/ghost-wispr-pi-deploy/journald-ghost-wispr.conf"
+pack_release "$new" "$case_dir/release"
+release_json "$new" "$case_dir/release" >"$github/latest.json"
+run_driver
+expect_verdicts PASS PASS PASS PASS PASS PASS PASS UNKNOWN
+expect 8 UNKNOWN 'names no journald-ghost-wispr.conf'
 
 printf 'check-deploy tests passed\n'
