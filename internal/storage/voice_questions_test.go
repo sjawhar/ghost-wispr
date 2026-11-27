@@ -208,14 +208,14 @@ func TestWALEraseCoversVoiceQuestions(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	askVoiceQuestion(t, store, "deleted", "private question token", started, started.Add(time.Second))
+	askVoiceQuestion(t, store, "deleted", "deleted question words", started, started.Add(time.Second))
 	askVoiceQuestion(t, store, "kept", "kept question words", started, started.Add(time.Second))
 	log, err := os.ReadFile(path + "-wal")
 	if err != nil {
 		t.Fatal(err)
 	}
 	for _, column := range []string{"heard", "vendor", "answer"} {
-		if !bytes.Contains(log, []byte(column+" private question token")) {
+		if !bytes.Contains(log, []byte(column+" deleted question words")) {
 			t.Fatalf("control: the write-ahead log does not hold the %s text before the delete", column)
 		}
 	}
@@ -224,7 +224,7 @@ func TestWALEraseCoversVoiceQuestions(t *testing.T) {
 		t.Fatalf("DeleteSession: %v", err)
 	}
 	for _, column := range []string{"heard", "vendor", "answer"} {
-		assertDatabaseFilesLack(t, path, column+" private question token", column+" kept question words")
+		assertDatabaseFilesLack(t, path, column+" deleted question words", column+" kept question words")
 	}
 }
 
@@ -242,13 +242,13 @@ func TestSegmentDeleteErasesTheQuestionsHeardInIt(t *testing.T) {
 				t.Fatal(err)
 			}
 			t.Cleanup(func() { _ = store.Close() })
-			// "private deletion token" is heard 10:00:02 to 10:00:04, "after
+			// "deleted segment words" is heard 10:00:02 to 10:00:04, "after
 			// bridge" 10:00:04 to 10:00:06.
 			segmentTestSessionWith(t, store, "s", func(started time.Time) {
-				askVoiceQuestion(t, store, "s", "private question token", started.Add(2500*time.Millisecond), started.Add(3500*time.Millisecond))
+				askVoiceQuestion(t, store, "s", "deleted question words", started.Add(2500*time.Millisecond), started.Add(3500*time.Millisecond))
 				askVoiceQuestion(t, store, "s", "kept question words", started.Add(5500*time.Millisecond), started.Add(5900*time.Millisecond))
 			})
-			deleted := segmentID(t, store, "s", "private deletion token")
+			deleted := segmentID(t, store, "s", "deleted segment words")
 			if deletion == "text" {
 				err = deleteRefinedTextTestSegment(t, store, "s", deleted, TextDeletionSpan{AudioPath: "recording.mp3", Start: 2, End: 4, SHA256: "b"})
 			} else {
@@ -261,7 +261,7 @@ func TestSegmentDeleteErasesTheQuestionsHeardInIt(t *testing.T) {
 				t.Fatalf("questions after the delete = %q, want only the one heard after it", got)
 			}
 			for _, column := range []string{"heard", "vendor", "answer"} {
-				assertDatabaseFilesLack(t, path, column+" private question token", column+" kept question words")
+				assertDatabaseFilesLack(t, path, column+" deleted question words", column+" kept question words")
 			}
 		})
 	}
@@ -412,7 +412,7 @@ func segmentTestSessionWith(t *testing.T, store *SQLiteStore, id string, during 
 	if err := store.CreateSession(id, started); err != nil {
 		t.Fatalf("create session: %v", err)
 	}
-	for i, text := range []string{"before bridge", "private deletion token", "after bridge"} {
+	for i, text := range []string{"before bridge", "deleted segment words", "after bridge"} {
 		segment := transcribeSegment(text, i, started)
 		segment.Speaker = i % 2
 		if err := store.AppendSegment(id, segment); err != nil {

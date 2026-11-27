@@ -101,7 +101,7 @@ func TestReview195DelayedInsertCannotRestoreDeletedSegment(t *testing.T) {
 			Heard: "late " + words, VendorWording: "vendor late " + words, Answer: "answer late " + words, Outcome: VoiceQuestionStopped,
 		}
 	}
-	if err := deleteRefinedTextTestSegment(t, store, "s", segmentID(t, store, "s", "private deletion token"), TextDeletionSpan{AudioPath: "recording.mp3", Start: 2, End: 4, SHA256: "b"}); err != nil {
+	if err := deleteRefinedTextTestSegment(t, store, "s", segmentID(t, store, "s", "deleted segment words"), TextDeletionSpan{AudioPath: "recording.mp3", Start: 2, End: 4, SHA256: "b"}); err != nil {
 		t.Fatal(err)
 	}
 	if got := voiceQuestionHeard(t, store); len(got) != 0 {
