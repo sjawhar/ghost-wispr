@@ -278,7 +278,12 @@ func TestAFailedChatCheckLeavesWithin10sWhileACallStalls(t *testing.T) {
 			ctx, cancel := context.WithCancel(t.Context())
 			ran := make(chan error, 1)
 			go func() { ran <- runBridge(ctx, botSettingsForTest(), deps) }()
-			defer func() { cancel(); <-ran }()
+			defer func() {
+				cancel()
+				if err := <-ran; err != nil {
+					t.Errorf("runBridge: %v", err)
+				}
+			}()
 			// step moves the clock one tick once the loop waits for it.
 			step := func() {
 				clk.BlockUntil(t, 1)

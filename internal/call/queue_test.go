@@ -46,7 +46,11 @@ func serve(t *testing.T, q *SendQueue, end *fakeEnd) {
 		}
 		cancel()
 		end.close()
-		<-ended
+		// Serve ends with the cancel or the closed end, whichever it meets
+		// first; anything else is a writer that failed on its own.
+		if err := <-ended; !errors.Is(err, context.Canceled) && !errors.Is(err, errFakeClosed) {
+			t.Errorf("the writer ended with %v; want the cancel or the closed end", err)
+		}
 	})
 }
 
