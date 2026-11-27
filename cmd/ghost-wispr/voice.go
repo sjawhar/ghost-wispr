@@ -211,6 +211,7 @@ type voiceDeps struct {
 	notify      func(kind, sessionID string)
 	projects    func() []string                               // Dispatch's project keys, for spoken keys
 	takeBack    func(finals string) (rest string, taken bool) // the Concierge's take-back rule (concierge.TakeBack)
+	asks        func(turn string) bool                        // the Concierge's question gate (concierge.Asks)
 	waiting     voice.WaitingLight                            // shows that something waits for a person; nil shows nothing
 	// segment and handDone reach the joined agents' roster: the room's
 	// final segments, and how each raised hand came down.
@@ -249,6 +250,7 @@ func startVoice(deps *voiceDeps) error {
 		Notify:         deps.notify,
 		ProjectKeys:    deps.projects,
 		TakeBack:       deps.takeBack,
+		Asks:           deps.asks,
 		WaitingLight:   deps.waiting,
 		Tap:            deps.tap,
 		Segment:        deps.segment,

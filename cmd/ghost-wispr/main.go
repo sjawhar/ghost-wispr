@@ -1972,6 +1972,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 			notify:      hub.BroadcastVoiceEvent,
 			projects:    dispatchProjects.Get,
 			takeBack:    concierge.TakeBack,
+			asks:        concierge.Asks,
 			segment:     joinedLink.OnSegment,
 			handDone:    joinedLink.HandDone,
 			waiting:     waitingLED{hardware},

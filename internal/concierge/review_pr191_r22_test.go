@@ -48,8 +48,17 @@ func TestSol191R22ClarificationKeyReply(t *testing.T) {
 			if prompt == "" {
 				t.Fatalf("model not called: result=%s", result)
 			}
-			if !strings.Contains(prompt, question) {
-				t.Errorf("original question missing from model history: %s", prompt)
+			// The explicit question the model is asked, not only words
+			// somewhere in its prompt, which the history satisfies anyway
+			// (Sol's twenty-third review of #191): a key said alone answers
+			// the question GPT-Live's own question followed; a question is
+			// asked as itself.
+			want := question
+			if reply != "ABC-12" {
+				want = reply
+			}
+			if got := modelQuestion(r); got != want {
+				t.Errorf("the model was asked %q, want %q", got, want)
 			}
 		})
 	}

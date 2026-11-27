@@ -611,6 +611,11 @@ func declines(turn string) bool {
 // about the budget", "and when does it land".
 var clauseOpeners = set(strings.Fields("uh um oh well hmm mm okay ok so and but then also right yeah yes actually"))
 
+// Asks reports whether turn is a question (asks): the Supervisor's gate for
+// the finals after a chime whose final held the name but no call, which wait
+// for one that asks (voice.SupervisorConfig.Asks; dispatch://INFRA-4592).
+func Asks(turn string) bool { return asks(turn) }
+
 // asks reports whether turn is a question: it holds a question mark, or a
 // clause of it starts, after the words that may open one (clauseOpeners),
 // with a question word or a verb a question puts first (questionWords,
