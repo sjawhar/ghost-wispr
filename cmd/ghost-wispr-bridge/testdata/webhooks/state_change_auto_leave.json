@@ -1,0 +1,5 @@
+{
+ "secret": "TzM+bJBu4w5rygTVnBniZjN3vTSYa2dVUPKXhCrCtH4=",
+ "signature": "15oYF0LwzhCZ0VWS5Lhuysviby0VCAC+SkslEoDSDKs=",
+ "body": "{\"idempotency_key\": \"0a9b8c7d-6e5f-4a3b-8c2d-1e0f9a8b7c6d\", \"bot_id\": \"bot_Ab12Cd34Ef56Gh78\", \"bot_metadata\": {\"nonce\": \"9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08\", \"event_id\": \"evt0001_20261201T170000Z\"}, \"trigger\": \"bot.state_change\", \"data\": {\"new_state\": \"leaving\", \"old_state\": \"joined_recording\", \"created_at\": \"2026-12-01T21:00:41.000007+00:00\", \"event_type\": \"leave_requested\", \"event_metadata\": {}, \"event_sub_type\": \"auto_leave_silence\"}}"
+}
