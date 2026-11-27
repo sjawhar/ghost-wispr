@@ -78,6 +78,14 @@ type Exchange struct {
 	// its own. An endpoint inside the reply ("okay, ABC-12" … "can wait")
 	// leaves the turn only its end. Empty when Wispr asked nothing.
 	Reply string
+	// VoiceAsked is the room's question that the voice's own last question
+	// followed, when the voice asked one by itself (GPT-Live's own "What is
+	// its key?"), not a line of the Concierge's; empty otherwise. The reply is
+	// addressed to the voice, as a reply to Wispr's own question is, so the
+	// Concierge reads it as a reply to an offer of that question (Main, after
+	// Sol's twenty-second review of #191): a key said alone answers it about
+	// that key, a question is read as one, and side talk is not answered.
+	VoiceAsked string
 	// Finals is the turn's own words (AskerTurn) as Deepgram wrote them,
 	// each final, and the interim after them, one a line, keys unwritten.
 	// The Concierge finds a take-back on them in the turn they are of: a
@@ -101,18 +109,20 @@ type Exchange struct {
 // than by text: the words of the exchange's finals that survive the
 // take-back rule and that no claimed request sent (Exchange.Claim) and the
 // voice did not answer by itself (Exchange.Answered), in order and keys
-// written. The take-back and quotation rule runs once over every final a
-// request still owns, turn endpoints being final boundaries, so a quotation
+// written. The take-back and quotation rule runs once over every final the
+// exchange holds, turn endpoints being final boundaries, so a quotation
 // spanning turns keeps its words quoted and a take-back in a later turn
 // withdraws every earlier word no request asked, from the request and from
-// the history alike. A turn's unsent words stay pending when a new turn
-// begins, each turn whole; an earlier turn made only of backchannel words
-// ("okay") is left out. A request holds no interim, which is not yet the
-// room's word, and never words a claim already sent, while words a closing
-// quote restores from a provisional take-back were never sent and are asked
-// (Main, after Sol's nineteenth to twenty-first reviews of #191). Changed
-// closes at the next change to the view: a final, a claim, a direct answer,
-// a new turn or the exchange's end. A view and its Changed are read
+// the history alike; the history (Recent) is a view derived from that same
+// parse each time it is read, never a deletion, so words a closing quote
+// restores come back to both. A turn's unsent words stay pending when a new
+// turn begins, each turn whole; an earlier turn made only of backchannel
+// words ("okay") is left out. A request holds no interim, which is not yet
+// the room's word, and never words a claim already sent, while words a
+// closing quote restores from a provisional take-back were never sent and are
+// asked (Main, after Sol's nineteenth to twenty-second reviews of #191).
+// Changed closes at the next change to the view: a final, a claim, a direct
+// answer, a new turn or the exchange's end. A view and its Changed are read
 // together, so no change falls between them.
 type RoomView struct {
 	Live      bool

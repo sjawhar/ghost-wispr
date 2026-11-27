@@ -216,6 +216,16 @@ func (c *Concierge) answer(parent context.Context, x *voice.Exchange, turn strin
 	// ABC-12?" is "what about ABC-12?"; Sol's seventh and eighth reviews of
 	// #191). A turn that takes itself back whole answers nothing, as
 	// "Wispr, never mind" answers nothing.
+	// A reply to a question the voice asked by itself (GPT-Live's own "What
+	// is its key?") is addressed to the voice, as a reply to Wispr's own is:
+	// with no offer of the Concierge's pending, the question the voice's
+	// followed is kept as one (askBack), and the reply is read by the same
+	// rule (Main, after Sol's twenty-second review of #191).
+	if x.VoiceAsked != "" {
+		if _, pending := c.pendingOffer(x); !pending {
+			c.askBack(x, x.VoiceAsked)
+		}
+	}
 	offer, offered := c.pendingOffer(x)
 	reply := roomFinals(x, turn)
 	said := view.replyText(reply)
