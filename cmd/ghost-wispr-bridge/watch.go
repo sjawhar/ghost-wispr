@@ -174,10 +174,11 @@ type watcher struct {
 // pass reads the calendar and the pool's count, sets the count the events
 // want, names each event that ended unserved, and logs WATCHER-PASS with the
 // count Cloud Run reports, read back after a change, whether the change was
-// made or not. A read that fails, of the calendar or of the pool's count,
-// before or after a change, logs WATCHER-READ-FAILED and no pass; one before
-// a change changes no count, so an outage never stops a call, and "Watcher
-// silent" opens while it lasts.
+// made or not, and the number of done events that keep the pool up. A read
+// that fails, of the calendar or of the pool's count, before or after a
+// change, logs WATCHER-READ-FAILED and no pass; one before a change changes
+// no count, so an outage never stops a call, and "Watcher silent" opens while
+// it lasts.
 func (w *watcher) pass(ctx context.Context) {
 	ctx, cancel := context.WithTimeout(ctx, watchPassTimeout)
 	defer cancel()
@@ -207,7 +208,7 @@ func (w *watcher) pass(ctx context.Context) {
 		}
 	}
 	w.nameUnserved(evs, now)
-	w.deps.Log.Log(ctx, LevelNotice, fmt.Sprintf("WATCHER-PASS count=%d next_start=%s events=%s", count, nextStart(evs, now), eventList(evs)))
+	w.deps.Log.Log(ctx, LevelNotice, fmt.Sprintf("WATCHER-PASS count=%d owed=%d next_start=%s events=%s", count, owedCount(evs, now), nextStart(evs, now), eventList(evs)))
 }
 
 // wantedCount is 1 when an event keeps the pool up at now, else 0.
@@ -218,6 +219,19 @@ func wantedCount(evs []calendar.Event, now time.Time) int64 {
 		}
 	}
 	return 0
+}
+
+// owedCount gives the number of done events that keep the pool up at now:
+// each still owes the unit a message (a busy, or a failed chat_check, the
+// link has not taken), the reason the pool is up with every event done.
+func owedCount(evs []calendar.Event, now time.Time) int {
+	n := 0
+	for i := range evs {
+		if evs[i].Done && calendar.KeepsPoolUp(evs[i], now) {
+			n++
+		}
+	}
+	return n
 }
 
 // nameUnserved logs EVENT-UNSERVED, once, for each event whose end has

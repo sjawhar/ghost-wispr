@@ -246,7 +246,7 @@ func TestAFailedReadChangesNoCountAndLogsNoPass(t *testing.T) {
 		if got := r.pool.patchList(); len(got) != 1 {
 			t.Fatalf("after a good read of no event: %d count changes, want 1", len(got))
 		}
-		r.wantMessages("WATCHER-PASS", "WATCHER-PASS count=0 next_start=none events=")
+		r.wantMessages("WATCHER-PASS", "WATCHER-PASS count=0 owed=0 next_start=none events=")
 	})
 	t.Run("the pool", func(t *testing.T) {
 		cal := &watchCalendar{events: []calendar.Event{watchEvent("b", "2026-12-01T17:00:00Z", "2026-12-01T17:30:00Z", false, 0)}}
@@ -267,7 +267,7 @@ func TestThePassLogsTheCountTheNextStartAndEachEvent(t *testing.T) {
 		watchEvent("c", "2026-12-01T18:00:00Z", "2026-12-01T18:45:00Z", false, 0),
 	}}
 	r := startWatch(t, watchStart, cal, 0)
-	r.wantMessages("WATCHER-PASS", "WATCHER-PASS count=1 next_start=2026-12-01T17:00:00Z events=early:true:1,b:false:0,c:false:0")
+	r.wantMessages("WATCHER-PASS", "WATCHER-PASS count=1 owed=0 next_start=2026-12-01T17:00:00Z events=early:true:1,b:false:0,c:false:0")
 
 	reads := cal.readList()
 	if len(reads) != 1 {
@@ -291,12 +291,39 @@ func TestThePassLogsTheCountTheNextStartAndEachEvent(t *testing.T) {
 	cal.set(nil, nil)
 	r.pass()
 	r.wantMessages("WATCHER-PASS",
-		"WATCHER-PASS count=1 next_start=2026-12-01T17:00:00Z events=early:true:1,b:false:0,c:false:0",
-		"WATCHER-PASS count=1 next_start=2026-12-01T16:30:00Z events=early:true:1,under-way:false:1",
-		"WATCHER-PASS count=0 next_start=none events=",
+		"WATCHER-PASS count=1 owed=0 next_start=2026-12-01T17:00:00Z events=early:true:1,b:false:0,c:false:0",
+		"WATCHER-PASS count=1 owed=0 next_start=2026-12-01T16:30:00Z events=early:true:1,under-way:false:1",
+		"WATCHER-PASS count=0 owed=0 next_start=none events=",
 	)
 	if got := r.pool.patchList(); len(got) != 2 {
 		t.Errorf("%d count changes, want 2 (to 1, then to 0): the count is set only when it differs", len(got))
+	}
+}
+
+// WATCHER-PASS gives owed, the number of done events that still owe the unit
+// a message (a busy, or a failed chat_check, the link has not taken): such an
+// event keeps the pool up while done, so owed is the reason for a count of 1
+// with every event done. It fails if owed counts every done event, or misses
+// the one that owes.
+func TestThePassLogsTheDoneEventsThatOweAMessage(t *testing.T) {
+	served := watchEvent("served", "2026-12-01T15:00:00Z", "2026-12-01T15:30:00Z", true, 1)
+	busy := watchEvent("busy", "2026-12-01T16:00:00Z", "2026-12-01T16:30:00Z", true, 0)
+	busy.Pending = calendar.Pending{Busy: true}
+	later := watchEvent("later", "2026-12-01T19:00:00Z", "2026-12-01T19:30:00Z", false, 0)
+	cal := &watchCalendar{events: []calendar.Event{served, busy, later}}
+	r := startWatch(t, watchStart, cal, 0)
+
+	// The control: once a link took the busy, no event owes and the pool goes
+	// down.
+	busy.Pending = calendar.Pending{}
+	cal.set([]calendar.Event{served, busy, later}, nil)
+	r.pass()
+	r.wantMessages("WATCHER-PASS",
+		"WATCHER-PASS count=1 owed=1 next_start=2026-12-01T19:00:00Z events=served:true:1,busy:true:0,later:false:0",
+		"WATCHER-PASS count=0 owed=0 next_start=2026-12-01T19:00:00Z events=served:true:1,busy:true:0,later:false:0",
+	)
+	if got := r.pool.patchList(); len(got) != 2 {
+		t.Errorf("%d count changes, want 2 (to 1 for the owed busy alone, then to 0)", len(got))
 	}
 }
 
@@ -326,14 +353,14 @@ func TestARefusedCountChangeIsLoggedAndNotPassedAsDone(t *testing.T) {
 			t.Errorf("POOL-PATCH-FAILED at severity %s, want ERROR: %s", l.Severity, l.raw)
 		}
 	}
-	r.wantMessages("WATCHER-PASS", "WATCHER-PASS count=0 next_start=2026-12-01T17:00:00Z events=b:false:0")
+	r.wantMessages("WATCHER-PASS", "WATCHER-PASS count=0 owed=0 next_start=2026-12-01T17:00:00Z events=b:false:0")
 
 	// The control: once Cloud Run takes the change, the pass gives 1.
 	r.pool.set(func(f *fakePoolServer) { f.refuse = "" })
 	r.pass()
 	r.wantMessages("WATCHER-PASS",
-		"WATCHER-PASS count=0 next_start=2026-12-01T17:00:00Z events=b:false:0",
-		"WATCHER-PASS count=1 next_start=2026-12-01T17:00:00Z events=b:false:0",
+		"WATCHER-PASS count=0 owed=0 next_start=2026-12-01T17:00:00Z events=b:false:0",
+		"WATCHER-PASS count=1 owed=0 next_start=2026-12-01T17:00:00Z events=b:false:0",
 	)
 }
 
@@ -348,8 +375,8 @@ func TestAPassLogsTheCountCloudRunReports(t *testing.T) {
 		return &watchCalendar{events: []calendar.Event{watchEvent("b", "2026-12-01T17:00:00Z", "2026-12-01T17:30:00Z", false, 0)}}
 	}
 	const (
-		pass0 = "WATCHER-PASS count=0 next_start=2026-12-01T17:00:00Z events=b:false:0"
-		pass1 = "WATCHER-PASS count=1 next_start=2026-12-01T17:00:00Z events=b:false:0"
+		pass0 = "WATCHER-PASS count=0 owed=0 next_start=2026-12-01T17:00:00Z events=b:false:0"
+		pass1 = "WATCHER-PASS count=1 owed=0 next_start=2026-12-01T17:00:00Z events=b:false:0"
 	)
 	t.Run("an operation still pending", func(t *testing.T) {
 		r := startWatchWith(t, watchStart, event(), 0, func(f *fakePoolServer) { f.hold = true })
@@ -534,7 +561,7 @@ func TestTheWatcherSendsZeroAsACount(t *testing.T) {
 	if err := json.Unmarshal([]byte(p.body), &body); err != nil || len(body) != 1 || body["scaling"] == nil {
 		t.Errorf("the patch's body %s, want only scaling (err %v)", p.body, err)
 	}
-	r.wantMessages("WATCHER-PASS", "WATCHER-PASS count=0 next_start=none events=")
+	r.wantMessages("WATCHER-PASS", "WATCHER-PASS count=0 owed=0 next_start=none events=")
 	var count int64
 	r.pool.set(func(f *fakePoolServer) { count = f.count })
 	if count != 0 {
@@ -709,7 +736,7 @@ func TestTheWatchModeReadsTheCalendarReadOnlyAsTheBotUser(t *testing.T) {
 		t.Fatal("the watch mode did not return after its context ended")
 	}
 
-	if got, want := stdout.messages(t, "WATCHER-PASS"), fmt.Sprintf("WATCHER-PASS count=1 next_start=%s events=tester-call:false:0", start.Format(time.RFC3339)); len(got) != 1 || got[0] != want {
+	if got, want := stdout.messages(t, "WATCHER-PASS"), fmt.Sprintf("WATCHER-PASS count=1 owed=0 next_start=%s events=tester-call:false:0", start.Format(time.RFC3339)); len(got) != 1 || got[0] != want {
 		t.Errorf("WATCHER-PASS lines %q, want [%q]: only the tester's event counts", got, want)
 	}
 	if got := stdout.messages(t, "WATCHER-START"); len(got) != 1 || got[0] != "WATCHER-START pool="+fakePoolName+" org_domains=2 testers=1" {
