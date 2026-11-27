@@ -313,6 +313,146 @@ func TestFindsASecondCopyAtMinus46AndMinus52dBBelowTheDirectCopy(t *testing.T) {
 	}
 }
 
+// c-once, from Sol's review of PR 202 (TestReviewSecondCopyNearReferenceTail):
+// the office microphone's copy of a sound at the reference's end comes after
+// the reference's end. A reference of 1 s whose sound is from 900 to 980 ms,
+// a direct copy 100 ms later at gain 0.5, and a second 300 ms later at gain
+// 0.1: the second reads 14 dB below the direct one within 1 dB, as it does
+// when the sound fills the reference (the control). A fit that ends where the
+// first path reaches the reference's end holds none of the second copy: it
+// read copy=none, with the floor 56 dB below the direct copy.
+func TestFindsASecondCopyThatComesAfterTheReferencesEnd(t *testing.T) {
+	const rate = 16000
+	for _, late := range []bool{false, true} {
+		name := "control_broadband_whole_reference"
+		source := noise(rate, -18, 9201)
+		if late {
+			name = "speech_at_reference_tail"
+			source = make([]float64, rate)
+			copy(source[9*rate/10:], noise(8*rate/100, -18, 9201))
+		}
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			rec := noise(3*rate/2, -90, 9202)
+			addCopy(rec, source, rate/10, 0.5)
+			addCopy(rec, source, 3*rate/10, 0.1)
+			out, stderr, code := callprobe(t, "", "analyze", "echo", "-max-lag", "500ms", "-second-after", "20ms",
+				"-ref", writeWAV(t, dir, "reference.wav", rate, source), "-in", writeWAV(t, dir, "recording.wav", rate, rec))
+			if code != 0 {
+				t.Fatalf("analysis failed: %s%s", out, stderr)
+			}
+			level, err := parseNumber(out, "copy_vs_direct_db")
+			if err != nil || math.Abs(level-20*math.Log10(0.1/0.5)) > 1 {
+				t.Fatalf("a real -14dB second copy was not measured: err=%v\n%s%s", err, out, stderr)
+			}
+		})
+	}
+}
+
+// From Sol's review of PR 202 (TestReviewSingularReferenceDoesNotInventSecondCopy):
+// a constant delayed is the same constant, so a constant reference's direct
+// path reproduces any second copy of it, and a recording of the direct copy
+// alone read a second copy at 0 dB. No level is printed for a second copy
+// the fit cannot tell.
+func TestAConstantReferenceInventsNoSecondCopy(t *testing.T) {
+	const rate = 16000
+	source := make([]float64, rate)
+	for i := range source {
+		source[i] = 0.1
+	}
+	dir := t.TempDir()
+	path := writeWAV(t, dir, "constant.wav", rate, source)
+	out, stderr, code := callprobe(t, "", "analyze", "echo", "-max-lag", "100ms", "-second-after", "20ms", "-ref", path, "-in", path)
+	t.Logf("constant direct-only observation: exit=%d\n%s%s", code, out, stderr)
+	if code == 0 && strings.Contains(out, "copy_vs_direct_db=") && !strings.Contains(out, "copy_vs_direct_db=UNKNOWN") {
+		t.Fatalf("unidentifiable second copy reported numerically:\n%s", out)
+	}
+}
+
+// c-once: a second copy the fit cannot tell from the direct one reads
+// copy=UNKNOWN with no level and no floor, so neither copy_vs_direct_db nor
+// floor_vs_direct_db can pass the 46 dB bound. The recording that ends 150 ms
+// after the reference of TestFindsASecondCopyThatComesAfterTheReferencesEnd
+// holds its direct copy and not its second, so a copy at any level could be
+// past its end. A constant reference's second copy is what its direct path
+// reproduces.
+func TestASecondCopyTheFitCannotTellReadsUnknown(t *testing.T) {
+	const rate = 16000
+	dir := t.TempDir()
+	atTheEnd := make([]float64, rate)
+	copy(atTheEnd[9*rate/10:], noise(8*rate/100, -18, 9201))
+	cut := noise(23*rate/20, -90, 9202)
+	addCopy(cut, atTheEnd, rate/10, 0.5)
+	addCopy(cut, atTheEnd, 3*rate/10, 0.1) // after the recording's end
+	constant := make([]float64, rate)
+	for i := range constant {
+		constant[i] = 0.1
+	}
+	for _, tc := range []struct {
+		name     string
+		ref, in  []float64
+		maxLag   string
+		directMS float64
+	}{
+		{"a recording that ends before the second copy", atTheEnd, cut, "500ms", 100},
+		{"a constant reference", constant, constant, "100ms", 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			out, errOut, code := callprobe(t, "", "analyze", "echo", "-max-lag", tc.maxLag, "-second-after", "20ms",
+				"-ref", writeWAV(t, dir, tc.name+"-ref.wav", rate, tc.ref), "-in", writeWAV(t, dir, tc.name+"-in.wav", rate, tc.in))
+			if code != 0 {
+				t.Fatalf("analyze echo exited %d: %s%s", code, out, errOut)
+			}
+			if got := number(t, out, "direct_delay_ms"); math.Abs(got-tc.directMS) > 2 {
+				t.Errorf("direct_delay_ms=%v, want %v within 2 ms:\n%s", got, tc.directMS, out)
+			}
+			if got, _ := value(out, "copy"); got != "UNKNOWN" {
+				t.Errorf("copy=%q, want UNKNOWN:\n%s", got, out)
+			}
+			for _, key := range []string{"copy_delay_ms", "copy_db", "copy_vs_direct_db", "noise_floor_db", "floor_vs_direct_db"} {
+				if v, ok := value(out, key); ok {
+					t.Errorf("%s=%s for a second copy the fit cannot tell, want no %s:\n%s", key, v, key, out)
+				}
+			}
+		})
+	}
+}
+
+// c-once: a recording that ends with the reference holds only part of a
+// late copy, and the level of each copy is against the reference's energy
+// the recording holds at that copy's lag. A reference of 1 s of noise, its
+// direct copy 100 ms later at gain 0.5 and a second copy 600 ms later at gain
+// 0.1, in a recording of the same 1 s: it holds 90 % of the direct copy and
+// 40 % of the second, and the second still reads 14 dB below the direct one
+// within 1 dB, not 3.5 dB lower still.
+func TestASecondCopyTheRecordingHoldsInPartReadsItsLevel(t *testing.T) {
+	const rate = 16000
+	dir := t.TempDir()
+	source := noise(rate, -18, 9203)
+	rec := noise(rate, -90, 9204)
+	addCopy(rec, source, rate/10, 0.5)
+	addCopy(rec, source, 6*rate/10, 0.1)
+	out, errOut, code := callprobe(t, "", "analyze", "echo", "-max-lag", "800ms", "-second-after", "20ms",
+		"-ref", writeWAV(t, dir, "reference.wav", rate, source), "-in", writeWAV(t, dir, "recording.wav", rate, rec))
+	if code != 0 {
+		t.Fatalf("analyze echo exited %d: %s%s", code, out, errOut)
+	}
+	for _, c := range []struct {
+		key       string
+		want, tol float64
+	}{
+		{"direct_delay_ms", 100, 2},
+		{"copy_delay_ms", 600, 2},
+		{"direct_db", 20 * math.Log10(0.5), 1},
+		{"copy_db", 20 * math.Log10(0.1), 1},
+		{"copy_vs_direct_db", 20 * math.Log10(0.1/0.5), 1},
+	} {
+		if got := number(t, out, c.key); math.Abs(got-c.want) > c.tol {
+			t.Errorf("%s=%v, want %v within %v:\n%s", c.key, got, c.want, c.tol, out)
+		}
+	}
+}
+
 // c-rig: an echo below the recording's noise floor reads UNKNOWN, never a
 // level: at -52 dB in a floor at -40 dB, the copy is there, and no number
 // says how loud.

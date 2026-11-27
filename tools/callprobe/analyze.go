@@ -280,7 +280,9 @@ func analyzeEcho(args []string, stdout, stderr io.Writer) error {
 
 // printSecondCopy prints what echo -second-after found: the direct copy,
 // the strongest, then the strongest copy at least -second-after later, each
-// against -ref, and the second copy and the floor against the direct one.
+// against -ref, and the second copy and the floor against the direct one. A
+// second copy the fit cannot tell prints copy=UNKNOWN and no floor, which
+// would be no bound on it.
 func printSecondCopy(w io.Writer, c analyze.Copy, o analyze.CopyOptions) {
 	switch {
 	case c.Silent:
@@ -298,6 +300,9 @@ func printSecondCopy(w io.Writer, c analyze.Copy, o analyze.CopyOptions) {
 	direct := fmt.Sprintf("direct_delay_ms=%s direct_db=%s", ms(c.Lag), db(c.LevelDB))
 	floor := fmt.Sprintf("noise_floor_db=%s floor_vs_direct_db=%s", db(c.FloorDB), db(c.FloorDB-c.LevelDB))
 	switch s := c.Second; {
+	case s.Unknown != "":
+		_, _ = fmt.Fprintf(w, "%s copy=UNKNOWN (dB against -ref; %s: no level of a copy of -ref %v or more after the direct one within ±%v is known, and the floor is no bound on it)\n",
+			direct, s.Unknown, o.SecondAfter, o.MaxLag)
 	case !s.Found:
 		_, _ = fmt.Fprintf(w, "%s copy=none %s (dB against -ref, and against the direct copy; no copy of -ref %v or more after the direct one stands out of the cross-correlation's noise within ±%v: the copy is at most the floor)\n",
 			direct, floor, o.SecondAfter, o.MaxLag)
