@@ -500,13 +500,17 @@ EOF
 chmod 0755 "$work/bin/gh"
 workflow_block release-publish-command >"$work/publish.sh" \
   || fail "release.yml has no command between '# release-publish-command:start' and '# release-publish-command:end'"
+# The publish command creates the release with the tag that the release job names, which
+# deploy/bridge/release_images_test.sh tests.
+readonly release_tag=v2026.11.26-0123456
 (
   cd -- "$publish"
-  GH_REPO=sjawhar/ghost-wispr GH_TOKEN=test BUILD_SHA=$commit FAKE_GH_ARGS=$work/gh.args PATH="$work/bin:$PATH" \
-    bash --noprofile --norc -eo pipefail "$work/publish.sh"
+  GH_REPO=sjawhar/ghost-wispr GH_TOKEN=test BUILD_SHA=$commit TAG=$release_tag FAKE_GH_ARGS=$work/gh.args \
+    PATH="$work/bin:$PATH" bash --noprofile --norc -eo pipefail "$work/publish.sh"
 ) || fail "the publish command exited $?"
 mapfile -t gh_args <"$work/gh.args"
 [[ ${gh_args[0]:-} == release && ${gh_args[1]:-} == create ]] || fail "the publish command ran gh ${gh_args[*]}, not gh release create"
+[[ ${gh_args[2]:-} == "$release_tag" ]] || fail "the publish command names the release [${gh_args[2]:-}], not its TAG $release_tag"
 published=()
 for ((i = 3; i < ${#gh_args[@]}; i++)); do
   [[ ${gh_args[i]} != -* ]] || break

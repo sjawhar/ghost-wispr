@@ -1,0 +1,5 @@
+{
+ "secret": "TzM+bJBu4w5rygTVnBniZjN3vTSYa2dVUPKXhCrCtH4=",
+ "signature": "ljCaahwx4v+aMeQkLCkemFl0WHbXrd2h58wBWbrhrPo=",
+ "body": "{\"idempotency_key\": \"9e8d7c6b-5a4f-4e3d-9c2b-1a0f9e8d7c6b\", \"bot_id\": \"bot_Ab12Cd34Ef56Gh78\", \"bot_metadata\": {\"nonce\": \"9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08\", \"event_id\": \"evt0001_20261201T170000Z\"}, \"trigger\": \"chat_messages.update\", \"data\": {\"id\": \"msg_Zx98Yw76Vu54Ts32\", \"to\": \"everyone\", \"text\": \"Zo\\u00eb: <b>wispr pause</b> & \\\"now\\\" \\\\ \\u2028second\\u2029third\\nfourth\\tfifth \\u007f \\ud83d\\ude00 \\u674e\", \"timestamp\": 1764608523, \"sender_name\": \"Zo\\u00eb \\u00c5ngstr\\u00f6m <\\u674e\\u96f7> & co\", \"sender_uuid\": \"spaces/AAQAbc123/devices/42\", \"timestamp_ms\": 1764608523000, \"additional_data\": {\"big\": 12345678901234567890, \"tiny\": 1e-05, \"huge\": 1e+16, \"tenth\": 0.1, \"whole\": 2.0, \"neg_zero\": -0.0, \"exponent\": -2.5e-07}, \"sender_user_uuid\": null}}"
+}

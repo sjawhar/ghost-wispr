@@ -4,6 +4,7 @@ go 1.25.0
 
 require (
 	cloud.google.com/go/auth v0.23.3
+	cloud.google.com/go/compute/metadata v0.9.0
 	github.com/anthropics/anthropic-sdk-go v1.26.0
 	github.com/cenkalti/backoff/v5 v5.0.3
 	github.com/deepgram/deepgram-go-sdk/v3 v3.5.0
@@ -15,6 +16,7 @@ require (
 	github.com/nats-io/nats.go v1.53.1
 	github.com/sashabaranov/go-openai v1.41.2
 	golang.org/x/exp v0.0.0-20260709172345-9ea1abe57597
+	golang.org/x/oauth2 v0.36.0
 	golang.org/x/sys v0.47.0
 	google.golang.org/api v0.287.1
 	google.golang.org/genai v1.79.1
@@ -25,7 +27,6 @@ require (
 require (
 	cloud.google.com/go v0.116.0 // indirect
 	cloud.google.com/go/auth/oauth2adapt v0.2.8 // indirect
-	cloud.google.com/go/compute/metadata v0.9.0 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/dustin/go-humanize v1.0.1 // indirect
 	github.com/fatih/color v1.15.0 // indirect
@@ -56,7 +57,6 @@ require (
 	go.opentelemetry.io/otel/trace v1.44.0 // indirect
 	golang.org/x/crypto v0.55.0 // indirect
 	golang.org/x/net v0.58.0 // indirect
-	golang.org/x/oauth2 v0.36.0 // indirect
 	golang.org/x/sync v0.22.0 // indirect
 	golang.org/x/text v0.41.0 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260630182238-925bb5da69e7 // indirect

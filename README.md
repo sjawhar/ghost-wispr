@@ -38,6 +38,9 @@ Microphone → Deepgram WebSocket → Session Manager → SQLite
 - `internal/voice/` — the meeting voice: the Supervisor, the room-audio tap, the chimes; `internal/voice/tts/` is voice A, `internal/voice/gptlive/` voice B, `internal/voice/dgagent/` voice C
 - `internal/wake/transcript/` — the wake phrase on the live transcript
 - `internal/concierge/`, `internal/dispatch/`, `internal/envoy/` — the Concierge, its Dispatch client and the unit's Envoy session
+- `cmd/ghost-wispr-bridge/` — the call bridge, which runs beside the Attendee meeting bot in a cloud instance (mode `bridge`), and the watcher, which starts and stops that instance from the bot's calendar (mode `watch`); its `callfault` build is the test instance's
+- `internal/call/` — the link between the call bridge and the unit: audio frames, control messages, link versions; `internal/calendar/` — which calendar events bring the bot, and when
+- `tools/callprobe/` — the measuring tool for a test call: delay, echo and the link's ping times
 
 **Frontend** (Svelte 5):
 - PWA with offline support
@@ -831,6 +834,12 @@ the release workflow.
   changes.
 - `deploy/pi/check-deploy.sh`, run from a tailnet member device, checks that the Pi runs the latest
   release and that the timer installed it.
+
+The release workflow also pushes the call bridge's two images to GitHub's container registry, tagged
+with the release's tag: `ghcr.io/sjawhar/ghost-wispr-bridge`, the release build, and
+`ghcr.io/sjawhar/ghost-wispr-bridge-test`, the `callfault` build that the test instance runs.
+`deploy/bridge/Dockerfile` builds both, also for each pull request. The release does not wait for
+the images: when their push fails, the Pi still gets its release.
 
 Follow the [office recorder Pi runbook](docs/pi-setup.md) for the infrastructure the Pi needs, the
 provisioning steps, the update's lines and the acceptance checks.

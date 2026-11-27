@@ -130,12 +130,20 @@ jobs:
       - name: Format
         run: golangci-lint fmt ./... --diff
 
+      # The call bridge's callfault files, which the kws build above does not compile.
+      - name: Lint the call bridge's fault build
+        run: golangci-lint run --build-tags callfault ./cmd/ghost-wispr-bridge/...
+
       # A build without the listener is the two-state machine, and must still build and vet.
       - name: Vet the build without the listener
         run: go vet ./...
 
       - name: Test
         run: go test -race -tags kws ./...
+
+      # The test pool's bridge: the callfault build, its run spec and its faults.
+      - name: Test the call bridge's fault build
+        run: go test -race -tags callfault ./cmd/ghost-wispr-bridge/...
 
   # The speaker writes its traces with the unit's Go (speaker_trace_dir), and a Go release that
   # changes the trace format needs a newer golang.org/x/exp to read them (internal/speakertrace).
@@ -220,6 +228,6 @@ jobs:
             deploy/pi/release_publish_test.sh deploy/pi/check_deploy_test.sh deploy/pi/runbook_blocks_test.sh \
             deploy/pi/accept_slice2_test.sh deploy/pi/workflow_pins_test.sh deploy/pi/claim_tailnet_name_test.sh \
             deploy/pi/accept_slice1_test.sh deploy/pi/wait_for_time_sync_test.sh deploy/pi/recording_times_test.sh \
-            deploy/pi/accept_voice_test.sh; do
+            deploy/pi/accept_voice_test.sh deploy/bridge/release_images_test.sh; do
             bash "$test"
           done

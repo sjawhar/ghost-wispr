@@ -1,0 +1,5 @@
+{
+ "secret": "TzM+bJBu4w5rygTVnBniZjN3vTSYa2dVUPKXhCrCtH4=",
+ "signature": "h29YiFb+9JaFWUVxF+Kc9/FRItYJJuoVvgsW2f7xceE=",
+ "body": "{\"idempotency_key\": \"2c3d4e5f-6a7b-4c8d-9e0f-1a2b3c4d5e6f\", \"bot_id\": \"bot_Ab12Cd34Ef56Gh78\", \"bot_metadata\": {\"nonce\": \"9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08\", \"event_id\": \"evt0001_20261201T170000Z\"}, \"trigger\": \"participant_events.join_leave\", \"data\": {\"id\": \"pe_Yz90Ab12Cd34Ef56\", \"event_data\": {}, \"event_type\": \"leave\", \"timestamp_ms\": 1764611999870, \"participant_name\": \"\\u00c9lodie \\u2028Bront\\u00eb\", \"participant_uuid\": \"spaces/AAQAbc123/devices/77\", \"participant_is_host\": false, \"participant_user_uuid\": null}}"
+}

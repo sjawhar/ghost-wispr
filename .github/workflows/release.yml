@@ -19,10 +19,24 @@ jobs:
       github.event.workflow_run.head_branch == 'main' &&
       github.event.workflow_run.head_repository.full_name == github.repository)
     runs-on: ubuntu-24.04-arm
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           ref: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}
+
+      # The release's tag, named once: the publish job and the bridge-images job each read this job's
+      # output, so jobs that run on either side of midnight UTC give the release and its images one
+      # tag (deploy/bridge/release_images_test.sh).
+      - name: Name the release
+        id: tag
+        env:
+          BUILD_SHA: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}
+        run: |
+          # release-tag-command:start
+          echo "tag=v$(date -u +%Y.%m.%d)-${BUILD_SHA:0:7}" >>"$GITHUB_OUTPUT"
+          # release-tag-command:end
 
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
@@ -153,6 +167,56 @@ jobs:
             THIRD_PARTY_NOTICES.md
           if-no-files-found: error
 
+  # The call bridge's two images (dispatch://INFRA-5904): ghost-wispr-bridge, the release build, and
+  # ghost-wispr-bridge-test, the callfault build that the test pool runs. Each run builds both from
+  # deploy/bridge/Dockerfile, and the workflow_run of main pushes both to ghcr.io with the release
+  # job's tag. The publish job does not need this job: a failed push of the images does not hold back
+  # the Pi's release (deploy/bridge/release_images_test.sh).
+  bridge-images:
+    needs: release
+    if: >-
+      github.event_name == 'pull_request' ||
+      (github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.head_branch == 'main' &&
+      github.event.workflow_run.head_repository.full_name == github.repository)
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}
+
+      - name: Build the bridge's images
+        env:
+          BUILD_SHA: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}
+          TAG: ${{ needs.release.outputs.tag }}
+        run: |
+          # bridge-images-build-command:start
+          images=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}
+          labels=(--label "org.opencontainers.image.source=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY"
+            --label "org.opencontainers.image.revision=$BUILD_SHA")
+          docker build --file deploy/bridge/Dockerfile --platform linux/amd64 "${labels[@]}" \
+            --tag "$images/ghost-wispr-bridge:$TAG" .
+          docker build --file deploy/bridge/Dockerfile --platform linux/amd64 "${labels[@]}" \
+            --build-arg BUILD_TAGS=callfault --tag "$images/ghost-wispr-bridge-test:$TAG" .
+          # bridge-images-build-command:end
+
+      - name: Push the bridge's images
+        if: github.event_name == 'workflow_run'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.release.outputs.tag }}
+        run: |
+          # bridge-images-push-command:start
+          images=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}
+          docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin <<<"$GH_TOKEN"
+          docker push "$images/ghost-wispr-bridge:$TAG"
+          docker push "$images/ghost-wispr-bridge-test:$TAG"
+          # bridge-images-push-command:end
+
   publish:
     needs: release
     if: >-
@@ -173,16 +237,16 @@ jobs:
           BUILD_SHA: ${{ github.event.workflow_run.head_sha }}
           GH_REPO: ${{ github.repository }}
           GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.release.outputs.tag }}
         run: |
           # release-publish-command:start
-          tag="v$(date -u +%Y.%m.%d)-${BUILD_SHA:0:7}"
-          gh release create "$tag" \
+          gh release create "$TAG" \
             ghost-wispr-linux-arm64 \
             ghost-wispr-linux-arm64.sha256 \
             ghost-wispr-pi-deploy.tar.gz \
             ghost-wispr-pi-deploy.tar.gz.sha256 \
             THIRD_PARTY_NOTICES.md \
             --target "$BUILD_SHA" \
-            --title "$tag" \
+            --title "$TAG" \
             --generate-notes
           # release-publish-command:end
