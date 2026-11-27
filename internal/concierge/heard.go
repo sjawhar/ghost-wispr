@@ -159,6 +159,20 @@ func (v projectsView) readSpelledKeys(words string) (read string, unread bool) {
 	return read, unread
 }
 
+// everySpelledKey rewrites each key of words said letter by letter to its
+// written form, whatever its project: the turn as it reads if its letters
+// are a key. A turn whose letters the view cannot tell (readSpelledKeys) is
+// read so to decide whether it is side talk, a pick or a key said alone,
+// before anything about it is said.
+func everySpelledKey(words string) string {
+	return rewriteKeys(spelledKey, words, func(before, match, after string) string {
+		if key, trail, ok := writtenKey(spelledKey, before, match, after, func(string) bool { return true }); ok {
+			return key + trail
+		}
+		return match
+	})
+}
+
 // keyDigits is an issue number said in words, in digits: a number with a
 // scale is its value ("four thousand five hundred and ninety two" is 4592);
 // one without is its groups in order ("forty-five ninety-two" and "four five
@@ -292,7 +306,8 @@ var possessiveTail = regexp.MustCompile(`^['’]s\b`)
 // closed once its issue's holder is known, which early then holds. A search
 // read waits for its words to settle, or for start, which an answer closes
 // (begin) when it needs the read now; cut closes (cutNow) when the answer
-// stops waiting for its full search.
+// stops waiting for its full search. turn is the exchange's turn it reads
+// for (voice.Exchange.Turn).
 type read struct {
 	done      chan struct{}
 	found     *reading
@@ -305,11 +320,22 @@ type read struct {
 	startOnce sync.Once
 	cut       chan struct{}
 	cutOnce   sync.Once
+	turn      uint64
 }
 
 // begin starts r now if it waits for its words to settle.
 func (r *read) begin() {
 	r.startOnce.Do(func() { close(r.start) })
+}
+
+// begun reports whether an answer began r (begin).
+func (r *read) begun() bool {
+	select {
+	case <-r.start:
+		return true
+	default:
+		return false
+	}
 }
 
 // cutNow stops r waiting for its full search (searchBoth).
@@ -354,12 +380,17 @@ type candidate struct{ key, title string }
 // prefetch is the record read for one exchange while its asker speaks. Each
 // new target replaces the read still running for an older one, which the
 // words since have made stale: at most one read runs. searches is how many
-// searches the read-ahead made since the exchange's last answer: at most one.
+// searches the read-ahead made since the exchange's last answer, at most
+// one, which the answer counts against the question's maxSearches
+// (aheadSearch); a read of keys alone searches nothing.
+// answered is one past the last turn an answer began for (answerBegins):
+// the read-ahead reads nothing more for that turn or an earlier one.
 type prefetch struct {
 	at       time.Time
 	reads    map[string]*read
 	current  string
 	searches int
+	answered uint64
 }
 
 // cancelAll ends every read of p still running.
@@ -519,12 +550,29 @@ func (c *Concierge) Heard(ctx context.Context, x *voice.Exchange, words string) 
 	if ctx.Err() != nil || c.records == nil {
 		return
 	}
+	// Only what the room said after its last take-back is read ahead
+	// (roomFinals; Main, after Sol's review of #191 at 31b6af9): "what
+	// about ABC-42? never mind" reads nothing ahead, and "what about ABC-12?"
+	// after it reads ABC-12 alone. A take-back that leaves nothing to read
+	// drops the read ahead of what it cancelled, which may wait to search
+	// (Sol's tenth review of #191); one that leaves words to read replaces it
+	// below, as a new reading of the turn does.
+	finals := roomFinals(x, words)
+	takenBack := takesItBack(finals)
+	if takenBack {
+		words = c.viewProjects().replyText(finals)
+	}
+	if words == "" {
+		c.dropAheadRead(x, takenBack)
+		return
+	}
 	// One reading of the project list decides the turn (projectsView). A run
 	// of letters that could be a key the list cannot tell yet is neither read
 	// nor searched (readSpelledKeys).
 	view := c.viewProjects()
 	words, unread := view.readSpelledKeys(words)
 	if unread {
+		c.dropAheadRead(x, takenBack)
 		return
 	}
 	target := c.aheadTarget(view, words)
@@ -533,6 +581,7 @@ func (c *Concierge) Heard(ctx context.Context, x *voice.Exchange, words string) 
 	// beyond the number keeps its search. A turn whose only key has one
 	// digit skips it too: the answer reads that key (aheadTarget).
 	if target == "" {
+		c.dropAheadRead(x, takenBack)
 		return
 	}
 	exchange := *x
@@ -540,6 +589,12 @@ func (c *Concierge) Heard(ctx context.Context, x *voice.Exchange, words string) 
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if closed, _ := c.closedLocked(exchange.SessionID); closed {
+		return
+	}
+	// While Wispr's own question waits for its reply, the read-ahead reads
+	// nothing: the answer decides whether the reply is side talk before any
+	// read, then reads a pick, a key or a question itself (Main on #191).
+	if _, offered := c.picks[wakeKey(&exchange)]; offered {
 		return
 	}
 	for key, p := range c.prefetches {
@@ -553,6 +608,14 @@ func (c *Concierge) Heard(ctx context.Context, x *voice.Exchange, words string) 
 	if p == nil {
 		p = &prefetch{at: now, reads: map[string]*read{}}
 		c.prefetches[key] = p
+	}
+	// The Supervisor tells the read-ahead of a turn apart from its answer,
+	// and can deliver it after the answer began, or ended: for a turn an
+	// answer began, it reads nothing. A read then would come after the side
+	// talk decision, or search beyond the question's limit, or spend the
+	// next question's (Sol's review of #191).
+	if exchange.Turn < p.answered {
+		return
 	}
 	// The read ahead of keys reads them alone, once (found in review on
 	// 2026-11-24): the target holds the turn's search, which each word
@@ -578,10 +641,10 @@ func (c *Concierge) Heard(ctx context.Context, x *voice.Exchange, words string) 
 		return
 	}
 	// A search waits for its words to settle, and the read-ahead makes one
-	// a turn: every search reaches Dispatch and its embedding model (R6). A
-	// reply to "Did you mean" picks; it is not searched.
+	// a question (aheadSearch): every search reaches Dispatch and its
+	// embedding model (R6).
 	search := strings.HasPrefix(target, "search:")
-	if _, offered := c.picks[wakeKey(&exchange)]; search && (p.searches > 0 || offered) {
+	if search && p.searches > 0 {
 		return
 	}
 	if running, ok := p.reads[p.current]; ok {
@@ -593,37 +656,88 @@ func (c *Concierge) Heard(ctx context.Context, x *voice.Exchange, words string) 
 		}
 	}
 	readCtx, cancel := context.WithTimeout(ctx, prefetchTimeout)
-	r := &read{done: make(chan struct{}), seen: make(chan struct{}), cancel: cancel, start: make(chan struct{}), cut: make(chan struct{})}
+	r := &read{done: make(chan struct{}), seen: make(chan struct{}), cancel: cancel, start: make(chan struct{}), cut: make(chan struct{}), turn: exchange.Turn}
 	p.reads[target], p.current = r, target
 	settle := c.searchSettle
 	go func() {
 		defer cancel()
 		defer close(r.done)
-		if search {
-			select {
-			case <-time.After(settle):
-			case <-r.start:
-			case <-readCtx.Done():
-				return
+		refused := false
+		maySearch := func() bool {
+			if !c.aheadSearch(readCtx, &exchange, p, r, settle) {
+				refused = true
+				return false
 			}
-			c.mu.Lock()
-			counted := p.searches == 0 && readCtx.Err() == nil
-			if counted {
-				p.searches++
-			}
-			c.mu.Unlock()
-			if !counted {
-				return
-			}
+			return true
 		}
-		found := c.readRecord(readCtx, &exchange, view, words, target, r.heldBy, r.cut)
-		if readCtx.Err() == nil {
-			// Only a counted search is the read-ahead's: a read of keys
-			// alone searches nothing.
+		found := c.readRecord(readCtx, &exchange, view, words, target, r.heldBy, r.cut, maySearch)
+		if readCtx.Err() == nil && !refused {
+			// Only a counted search is the read-ahead's (aheadSearch): a read
+			// of keys alone searches nothing. A read whose search it refused
+			// is no reading of its words: the answer reads them itself.
 			found.ahead = search
 			r.found, r.complete = found, true
 		}
 	}()
+}
+
+// dropAheadRead, when taken (the turn took back what came before), cancels
+// x's read ahead of the words it cancelled, running or waiting to search,
+// and forgets it: no answer takes it, and its search never reaches
+// Dispatch.
+func (c *Concierge) dropAheadRead(x *voice.Exchange, taken bool) {
+	if !taken {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	p := c.prefetchLocked(x)
+	if p == nil || p.current == "" {
+		return
+	}
+	if r := p.reads[p.current]; r != nil {
+		r.cancel()
+		delete(p.reads, p.current)
+	}
+	p.current = ""
+}
+
+// aheadSearch reports whether x's read-ahead read r may search now, and
+// counts the search when it may: once its words stayed the same for settle,
+// or the answer began it (begin), with no question of Wispr's waiting for
+// its reply (Heard) and no search made since the exchange's last answer. One
+// search a question is the read-ahead's, of maxSearches (R6). Once an answer
+// began for r's turn, r searches only when that answer began it: the answer
+// searches for itself otherwise.
+func (c *Concierge) aheadSearch(ctx context.Context, x *voice.Exchange, p *prefetch, r *read, settle time.Duration) bool {
+	select {
+	case <-time.After(settle):
+	case <-r.start:
+	case <-ctx.Done():
+		return false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	_, offered := c.picks[wakeKey(x)]
+	if p.searches > 0 || offered || ctx.Err() != nil || r.turn < p.answered && !r.begun() {
+		return false
+	}
+	p.searches++
+	return true
+}
+
+// answerBegins marks x's turn answered for its read-ahead: from now, a Heard
+// of that turn or an earlier one reads nothing, and a read of it that no
+// answer began searches nothing (Heard, aheadSearch).
+func (c *Concierge) answerBegins(x *voice.Exchange) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	p := c.prefetchLocked(x)
+	if p == nil {
+		p = &prefetch{at: c.now(), reads: map[string]*read{}}
+		c.prefetches[exchangeKey(x)] = p
+	}
+	p.answered = max(p.answered, x.Turn+1)
 }
 
 // heldBy keeps the issue and holder a read learned before it ended, for an
@@ -656,9 +770,15 @@ func (c *Concierge) readFor(ctx context.Context, x *voice.Exchange, view project
 	// read-ahead read the unit's own transcript of the turn, AskerTurn
 	// (found in review on 2026-11-24): its read is looked up as the
 	// read-ahead made it (aheadTarget), with no key of one digit.
+	// A take-back cuts it as it cuts the turn: nothing said before it is
+	// looked up (roomFinals).
+	asker := x.AskerTurn
+	if finals := roomFinals(x, asker); takesItBack(finals) {
+		asker = view.replyText(finals)
+	}
 	asked := ""
-	if x.AskerTurn != "" && x.AskerTurn != turn {
-		if words, unread := view.readSpelledKeys(x.AskerTurn); !unread {
+	if asker != "" && asker != turn {
+		if words, unread := view.readSpelledKeys(asker); !unread {
 			asked = c.aheadTarget(view, words)
 		}
 	}
@@ -756,7 +876,7 @@ func (c *Concierge) readFor(ctx context.Context, x *voice.Exchange, view project
 			return &reading{}
 		}
 	}
-	return c.readRecord(ctx, x, view, turn, target, onHolder, cut)
+	return c.readRecord(ctx, x, view, turn, target, onHolder, cut, nil)
 }
 
 // aheadFor is p's read ahead of what target asks, and the target the answer
@@ -801,8 +921,9 @@ func (c *Concierge) prefetchLocked(x *voice.Exchange) *prefetch {
 }
 
 // takeAheadSearches is how many searches x's read-ahead made since its last
-// answer, which count toward this answer's two (R6). The count starts over,
-// and a read still waiting or running ends: the answer has its reading.
+// answer, which count against the question's maxSearches (R6). The count
+// starts over, and a read still waiting or running ends: the answer has its
+// reading.
 func (c *Concierge) takeAheadSearches(x *voice.Exchange) int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -829,10 +950,11 @@ func (c *Concierge) takeAheadSearches(x *voice.Exchange) int {
 // is made. For a search, the top hit's issue is read with its holder, and
 // whether it is one clear match (R5) is kept: with none, the voice asks
 // which issue the person meant, and asks its holder nothing. cut, when it
-// closes, ends the search's wait for its full search. A failure other than
-// not-found, such as Dispatch out of reach, ends the read. view is the
-// turn's one reading of the project list, which the search reads its
-// question with.
+// closes, ends the search's wait for its full search. maySearch, when set,
+// is asked before the search and refuses it by false: the read-ahead's
+// count (aheadSearch). A failure other than not-found, such as Dispatch out
+// of reach, ends the read. view is the turn's one reading of the project
+// list, which the search reads its question with.
 //
 // words are the turn's, which target was read from (readTarget), and the
 // search is sent them, as the model would send them: search_issues reads
@@ -843,7 +965,7 @@ func (c *Concierge) takeAheadSearches(x *voice.Exchange) int {
 // realtime voice, is it close?" searched "realtime voice close"), and the
 // full search was not sent the question target holds ("X. V. 6" went as
 // "xv6"). Found in review on 2026-11-24.
-func (c *Concierge) readRecord(ctx context.Context, x *voice.Exchange, view projectsView, words, target string, onHolder func(*reading), cut <-chan struct{}) *reading {
+func (c *Concierge) readRecord(ctx context.Context, x *voice.Exchange, view projectsView, words, target string, onHolder func(*reading), cut <-chan struct{}, maySearch func() bool) *reading {
 	tools := &runner{c: c, x: x, view: &view, fullCut: cut}
 	found := &reading{}
 	var lines []string
@@ -904,6 +1026,9 @@ func (c *Concierge) readRecord(ctx context.Context, x *voice.Exchange, view proj
 		}
 	}
 	search := func() {
+		if maySearch != nil && !maySearch() {
+			return
+		}
 		found.searched = true
 		// The record's line holds the words searched by keyword (searchTerms),
 		// not the question: the record is R8's source, where a figure or key

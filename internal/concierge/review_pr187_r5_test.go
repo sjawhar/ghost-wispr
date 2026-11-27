@@ -121,7 +121,7 @@ func pendingSends(t *testing.T, candidates []candidate, reply string) int {
 	r.exchange.FollowUpTurn = true
 	r.model.turns = [][]*genai.GenerateContentResponse{{chunk(text("ABC-12: PR 80 is in review."))}}
 	r.concierge.offerPick(&r.exchange, twoOfferedTurn, candidates)
-	_ = answerTurn(t, r, reply)
+	_ = replyTurn(t, r, reply)
 	r.agents.mu.Lock()
 	sent := slices.Clone(r.agents.sent)
 	r.agents.mu.Unlock()

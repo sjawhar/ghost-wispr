@@ -79,7 +79,8 @@ const (
 	fullWaitAfterTurn = 2 * time.Second
 	// maxToolCalls bounds the model's tool calls in one fast answer (R6).
 	maxToolCalls = 6
-	// maxSearches bounds one answer's searches, the read's and the model's
+	// maxSearches bounds every search one question causes: the
+	// read-ahead's while it is asked, the answer's read and the model's,
 	// together (R6).
 	maxSearches = 2
 	// routingAfter is when the voice says a routing line if it has said
@@ -136,6 +137,10 @@ func (r *runner) offered() []ToolSpec {
 // errOutOfReach is Answer's error when Dispatch or Envoy did not answer.
 var errOutOfReach = fmt.Errorf("concierge: %w", voice.ErrUnreachable)
 
+// errSideTalk is Answer's error for side talk after an offer: it said
+// nothing.
+var errSideTalk = fmt.Errorf("concierge: %w", voice.ErrSideTalk)
+
 // Answer answers one turn of x, speaking through say as it goes (R5 to R8):
 //   - with no fact said 1.5 s after the turn, a routing line, which says the
 //     Concierge asks the holder when it does;
@@ -150,9 +155,11 @@ var errOutOfReach = fmt.Errorf("concierge: %w", voice.ErrUnreachable)
 // turn names that was not read yet is read first. One answer takes at most
 // 8 s and 6 tool calls of the model's. When Dispatch or Envoy did not answer
 // a read, a lookup or the ask, the voice says so and the error wraps
-// voice.ErrUnreachable, for R10's error sound. An answer, and an ask it
-// leaves running, is work Stop waits for; after Stop, Answer answers
-// nothing and its error wraps voice.ErrUnreachable.
+// voice.ErrUnreachable, for R10's error sound. A reply to "Did you mean …?"
+// that picks nothing and asks nothing is side talk: the voice says nothing
+// and the error wraps voice.ErrSideTalk. An answer, and an ask it leaves
+// running, is work Stop waits for; after Stop, Answer answers nothing and its
+// error wraps voice.ErrUnreachable.
 func (c *Concierge) Answer(parent context.Context, x *voice.Exchange, turn string, say voice.SayFunc) error {
 	work, leave, ok := c.enter(parent)
 	if !ok {
@@ -180,14 +187,70 @@ func (c *Concierge) answer(parent context.Context, x *voice.Exchange, turn strin
 	start := time.Now()
 	ctx, cancel := context.WithTimeout(parent, c.fastBound)
 	defer cancel()
+	// From now, the read-ahead reads nothing more for this turn.
+	c.answerBegins(x)
 	// One reading of the project list decides the turn (projectsView), never
-	// waiting for it. A key said letter by letter is read here, once, so the
-	// pick, the routing line, the search and the ask all see it. When the
-	// list cannot tell, Dispatch did not answer: letters that could be a key
-	// are neither read nor searched, no offered issue is picked, and the room
-	// hears so, with the error sound (R10).
+	// waiting for it.
 	view := c.viewProjects()
+	// A turn that replies to the question the last answer asked ("Did you
+	// mean …?", "What is its key?", or the model's own) is decided first,
+	// before anything is said or read, on the room's whole reply: every
+	// final it said since the voice asked (voice.Exchange.Reply), or the
+	// turn when there is none. Side talk (sideTalkOn), a reply that takes
+	// itself back included: nothing is said, read, searched or sent, and the
+	// Supervisor closes the exchange as it closes side talk in the follow-up
+	// window (Main's rule on R5's rewrite, and after Sol's fifth review of
+	// #191). Else, from the turn: a pick answers the question first asked,
+	// about that issue (R5); a key the voice offered picks it whatever the
+	// list says: that issue is real, the voice just offered it. A key said
+	// alone (saysKey) answers the question first asked, about that key
+	// (takeKey). A question is read exactly as with no offer pending; when
+	// the question was said before the turn, the whole reply is read
+	// (readsReply). In every turn, a reply to Wispr's question or not,
+	// nothing said before the room's last take-back is read, searched, sent
+	// or given to the model (Main, after Sol's review of #191 at 31b6af9):
+	// the answer reads what follows it (said), cut on the raw finals
+	// (roomFinals), never on the turn, where the Supervisor joined the
+	// finals with spaces and a take-back that a final's end closed is no
+	// clause of its own ("what about ABC-42? never mind" / "what about
+	// ABC-12?" is "what about ABC-12?"; Sol's seventh and eighth reviews of
+	// #191). A turn that takes itself back whole answers nothing, as
+	// "Wispr, never mind" answers nothing.
+	// A reply to a question the voice asked by itself (GPT-Live's own "What
+	// is its key?") is addressed to the voice, as a reply to Wispr's own is:
+	// with no offer of the Concierge's pending, the question the voice's
+	// followed is kept as one (askBack), and the reply is read by the same
+	// rule (Main, after Sol's twenty-second review of #191).
+	if x.VoiceAsked != "" {
+		if _, pending := c.pendingOffer(x); !pending {
+			c.askBack(x, x.VoiceAsked)
+		}
+	}
+	offer, offered := c.pendingOffer(x)
+	reply := roomFinals(x, turn)
+	said := view.replyText(reply)
+	if offered && offer.sideTalkOn(view, said) {
+		c.dropPick(x)
+		c.logger.Info("concierge took a reply to its own question for side talk: it picks nothing, says no key and asks nothing, or takes itself back")
+		return errSideTalk
+	}
+	switch {
+	case takesItBack(reply) && said == "":
+		c.dropPick(x)
+		c.takeAheadSearches(x) // the reads of what was taken back
+		c.logger.Info("concierge answered nothing: the turn took itself back")
+		return errSideTalk
+	case takesItBack(reply):
+		turn = said
+	case offered && strings.TrimSpace(x.Reply) != "" && offer.readsReply(view, turn, said):
+		turn = said
+	}
+	// A key said letter by letter is read here, once, so the pick, the
+	// routing line, the search and the ask all see it.
 	turn, unread := view.readSpelledKeys(turn)
+	// When the list cannot tell, Dispatch did not answer: letters that could
+	// be a key are neither read nor searched, no offered issue is picked, and
+	// the room hears so, with the error sound (R10).
 	if unread {
 		c.dropPick(x)
 		c.logger.Info("concierge could not read a key said letter by letter: Dispatch's projects are not known")
@@ -196,23 +259,37 @@ func (c *Concierge) answer(parent context.Context, x *voice.Exchange, turn strin
 		}
 		return errOutOfReach
 	}
-	// A turn that picks one of the issues the last answer offered answers
-	// the question first asked, about that issue (R5). A key the voice
-	// offered picks it whatever the list says: that issue is real, the voice
-	// just offered it. Any other turn is a new question, read exactly as with
-	// no offer pending.
-	target := ""
-	if asked, key, ok := c.takePick(x, turn); ok {
-		if key == "" {
-			// A declined offer's reads are dropped, as an answer's are
-			// (takeAheadSearches): the read ahead of "no, not ABC-12" read
-			// the issue the room turned down, and a next keyless question
-			// took it through AskerTurn and asked its holder (Sol's review
-			// of #194 at e5cf4d6, R6). Main does so for a key of two digits.
-			c.takeAheadSearches(x)
-			return sp.sayText(ctx, "Okay.", voice.Ack)
+	target, keyReply := "", false
+	_, picked, ok := c.takePick(x, turn)
+	// The Supervisor takes the next utterance after any line that ends in
+	// "?", whoever wrote it, with no question mark of its own (R10). A
+	// question the answer leaves last with no offer of its own, the model's,
+	// is kept as one (askBack), so the reply is read by the same rule.
+	defer func() {
+		if said := sp.said(); len(said) > 0 && strings.HasSuffix(strings.TrimSpace(said[len(said)-1]), "?") {
+			if _, pending := c.pendingOffer(x); !pending {
+				c.askBack(x, turn)
+			}
 		}
-		turn, target = asked, "keys:"+key
+	}()
+	switch {
+	case ok && picked == "":
+		// A declined offer's reads are dropped, as an answer's are
+		// (takeAheadSearches): the read ahead of "no, not ABC-12" read
+		// the issue the room turned down, and a next keyless question
+		// took it through AskerTurn and asked its holder (Sol's review
+		// of #194 at e5cf4d6, R6). Main does so for a key of two digits.
+		c.takeAheadSearches(x)
+		return sp.sayText(ctx, "Okay.", voice.Ack)
+	case ok:
+		turn, target = offer.turn, "keys:"+picked
+	case offered && saysKey(turn):
+		var done bool
+		var err error
+		if target, done, err = c.takeKey(ctx, x, view, offer.turn, turn, sp); done {
+			return err
+		}
+		turn, keyReply = offer.turn, true
 	}
 	// The ask runs beside the facts, so Envoy's time holds no fact back. A
 	// person's "ask" needs only the holder, so it goes out once the holder
@@ -266,17 +343,29 @@ func (c *Concierge) answer(parent context.Context, x *voice.Exchange, turn strin
 	var found *reading
 	switch {
 	case target != "":
-		found = c.readRecord(ctx, x, view, turn, target, onHolder, fullCut)
+		found = c.readRecord(ctx, x, view, turn, target, onHolder, fullCut, nil)
 	default:
 		found = c.readFor(ctx, x, view, turn, onHolder, fullCut)
 	}
-	// R6: at most two searches an answer, the read-ahead's counted; the count
-	// is taken here, so an answer that ends early starts it over too.
+	// R6: at most maxSearches searches a question, the read-ahead's, the
+	// read's and the model's together; the read-ahead's count is taken here,
+	// so an answer that ends early starts it over too.
 	aheadSearches := c.takeAheadSearches(x)
-	if found.key == "" && !found.unreachable && len(found.candidates) == 0 {
-		if candidates := c.bareNumberCandidates(ctx, view, turn); len(candidates) > 0 {
+	switch {
+	case keyReply && found.key == "" && !found.unreachable:
+		// The key said for "What is its key?" names no issue: the voice asks
+		// for the key of the question first asked again.
+		found.noResult = true
+	case found.key == "" && !found.unreachable && len(found.candidates) == 0:
+		candidates, untold := c.bareNumberCandidates(ctx, view, turn)
+		switch {
+		case len(candidates) > 0:
 			c.offerPick(x, turn, candidates)
 			return sp.sayText(ctx, didYouMean(candidates), voice.Ack)
+		case untold && !found.searched:
+			// A number with no words a search answered, which Dispatch did
+			// not let it look up: an outage, not "no issue" (R10).
+			found.unreachable = true
 		}
 	}
 	switch {
@@ -315,6 +404,7 @@ func (c *Concierge) answer(parent context.Context, x *voice.Exchange, turn strin
 		// error sound plays only when Dispatch itself did not answer.
 		return sp.sayText(ctx, searchIsSlow, voice.Ack)
 	case found.noResult:
+		// "What is its key?": the next turn answers it (askBack, above).
 		return sp.sayText(ctx, noIssueFound, voice.Ack)
 	case found.searched && !found.clear && len(found.candidates) > 0:
 		// R5: no one clear match. The voice asks which of the top two the
@@ -381,7 +471,7 @@ func (c *Concierge) answer(parent context.Context, x *voice.Exchange, turn strin
 			err = nil
 			mode, known := voice.Fact, found.known(c.now())
 			if found.key == "" {
-				mode = voice.Ack
+				mode = voice.Ack // noIssueFound
 			}
 			if found.key == "" && tools.searchSlow {
 				// The model's search found nothing in its time: no issue

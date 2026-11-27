@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/sjawhar/ghost-wispr/internal/audio"
 	"github.com/sjawhar/ghost-wispr/internal/config"
@@ -35,7 +36,7 @@ type voiceControl interface {
 	Started()
 	RedCheckFailed()
 	OnTranscript(t *voice.Transcript)
-	OnUtteranceEnd(closings int, gateOpen bool, at monoclock.Stamp)
+	OnUtteranceEnd(closings int, gateOpen bool, lastWordEnd time.Time, at monoclock.Stamp)
 	WithFloor(ctx context.Context, start func()) error
 	Close()
 }
@@ -100,9 +101,9 @@ func (l *voiceLink) OnTranscript(t *voice.Transcript) {
 	}
 }
 
-func (l *voiceLink) OnUtteranceEnd(closings int, gateOpen bool, at monoclock.Stamp) {
+func (l *voiceLink) OnUtteranceEnd(closings int, gateOpen bool, lastWordEnd time.Time, at monoclock.Stamp) {
 	if v := l.get(); v != nil {
-		v.OnUtteranceEnd(closings, gateOpen, at)
+		v.OnUtteranceEnd(closings, gateOpen, lastWordEnd, at)
 	}
 }
 
@@ -208,8 +209,10 @@ type voiceDeps struct {
 	meeting     func(string) context.Context // a session's meeting context, which the recorder ends with it
 	red         func() bool                  // the light reads red and audio passes the gate
 	notify      func(kind, sessionID string)
-	projects    func() []string    // Dispatch's project keys, for spoken keys
-	waiting     voice.WaitingLight // shows that something waits for a person; nil shows nothing
+	projects    func() []string                               // Dispatch's project keys, for spoken keys
+	takeBack    func(finals string) (rest string, taken bool) // the Concierge's take-back rule (concierge.TakeBack)
+	asks        func(turn string) bool                        // the Concierge's question gate (concierge.Asks)
+	waiting     voice.WaitingLight                            // shows that something waits for a person; nil shows nothing
 	// segment and handDone reach the joined agents' roster: the room's
 	// final segments, and how each raised hand came down.
 	segment  func(*voice.Segment)
@@ -246,6 +249,8 @@ func startVoice(deps *voiceDeps) error {
 		Enabled:        deps.enabled,
 		Notify:         deps.notify,
 		ProjectKeys:    deps.projects,
+		TakeBack:       deps.takeBack,
+		Asks:           deps.asks,
 		WaitingLight:   deps.waiting,
 		Tap:            deps.tap,
 		Segment:        deps.segment,

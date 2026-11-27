@@ -93,7 +93,7 @@ func TestReview187R3AConflictSendsNoPendingQuestion(t *testing.T) {
 	r.exchange.FollowUpTurn = true
 	r.model.turns = [][]*genai.GenerateContentResponse{{chunk(text("ABC-12: PR 80 is in review."))}}
 	r.concierge.offerPick(&r.exchange, twoOfferedTurn, []candidate{{"ABC-12", "Realtime voice conversation launch pipeline"}, {"ABC-13", "Wake word"}})
-	_ = answerTurn(t, r, "ABC-12, the realtime voice conversation launch pipeline and wake word one")
+	_ = replyTurn(t, r, "ABC-12, the realtime voice conversation launch pipeline and wake word one")
 	r.agents.mu.Lock()
 	defer r.agents.mu.Unlock()
 	for _, sent := range r.agents.sent {

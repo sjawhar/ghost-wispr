@@ -103,7 +103,7 @@ func TestTurnEndNamesTheSignalItActedOn(t *testing.T) {
 			r.heard("Wispr, what is happening?", true, false)
 			now := monoclock.Now()
 			at := monoclock.Stamp{Wall: now.Wall.Add(-150 * time.Millisecond), Mono: now.Mono - int64(150*time.Millisecond)}
-			r.s.OnUtteranceEnd(0, true, at)
+			r.s.OnUtteranceEnd(0, true, time.Now(), at)
 			return at.Wall
 		}},
 		{"turn_wait", func(r *rig) time.Time {

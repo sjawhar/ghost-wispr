@@ -329,11 +329,11 @@ func TestTheLastKeyThatNamesAnIssueIsRead(t *testing.T) {
 	}
 }
 
-// voiceIssue is ABC-12 as the fakes hold it.
+// voiceIssue is ABC-12 as the fakes hold it, a search's one clear match.
 func voiceIssue(r *rig) {
 	r.records.issues["ABC-12"] = &dispatch.Issue{Key: "ABC-12", Title: "Realtime voice", Status: "in_progress", UpdatedAt: testNow.Add(-2 * time.Hour)}
 	r.records.issues["ABC-13"] = &dispatch.Issue{Key: "ABC-13", Title: "Wake word", Status: "done", UpdatedAt: testNow.Add(-time.Hour)}
-	r.records.hits = []dispatch.SearchHit{{Kind: "issue", IssueKey: "ABC-12", Title: "Realtime voice", Status: "in_progress"}}
+	r.records.hits = []dispatch.SearchHit{{Kind: "issue", IssueKey: "ABC-12", Title: "Realtime voice", Status: "in_progress", Score: 0.9}}
 }
 
 // TestHeardReadsTheRecordBeforeTheTurnEnds: the issue named in the turn so far

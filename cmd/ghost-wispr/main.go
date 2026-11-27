@@ -403,10 +403,11 @@ type transcriptCallback struct {
 	// own.
 	keyterms *transcript.LiveKeyterms
 	// heardAt times a word for the voice: when the audio at a point of the
-	// live stream was captured (transcribe.ResilientClient.CapturedAt). nil,
-	// or a point it cannot time, leaves the word untimed. A socket's own
-	// stream times its words in its place, once it has one (stream).
-	heardAt func(at time.Duration) (time.Time, bool)
+	// live stream was captured, and whether exactly
+	// (transcribe.ResilientClient.CapturedAt). nil, or a point it cannot
+	// time, leaves the word untimed. A socket's own stream times its words
+	// in its place, once it has one (stream).
+	heardAt func(at time.Duration) (captured time.Time, exact, ok bool)
 	// stream is the stream of the socket whose messages this copy hands on,
 	// set once the resilient client gave it one (forStream); nil before.
 	stream *transcribe.Stream
@@ -440,7 +441,7 @@ func (c transcriptCallback) admit(kind string, streamSeconds float64) bool {
 // voice.Supervisor.
 type voiceListener interface {
 	OnTranscript(t *voice.Transcript)
-	OnUtteranceEnd(closings int, gateOpen bool, at monoclock.Stamp)
+	OnUtteranceEnd(closings int, gateOpen bool, lastWordEnd time.Time, at monoclock.Stamp)
 }
 
 // keptMessager is a session manager that takes each result with the stream
@@ -502,7 +503,7 @@ func (c transcriptCallback) Message(mr *api.MessageResponse) error {
 // reads it, or nil when it holds no text. heardAt, when set, times each word
 // by when its start was captured, which the voice's barge-in reads: a result
 // can come seconds after its words.
-func voiceTranscript(mr *api.MessageResponse, at monoclock.Stamp, stamp func() (int, bool), heardAt func(time.Duration) (time.Time, bool)) *voice.Transcript {
+func voiceTranscript(mr *api.MessageResponse, at monoclock.Stamp, stamp func() (int, bool), heardAt func(time.Duration) (time.Time, bool, bool)) *voice.Transcript {
 	if len(mr.Channel.Alternatives) == 0 || strings.TrimSpace(mr.Channel.Alternatives[0].Transcript) == "" {
 		return nil
 	}
@@ -519,6 +520,15 @@ func voiceTranscript(mr *api.MessageResponse, at monoclock.Stamp, stamp func() (
 	if stamp != nil {
 		t.Closings, t.GateOpen = stamp()
 	}
+	if heardAt != nil {
+		// The result's own start, which an interim and the final that
+		// replaces it share while their first words can move: the voice
+		// tells which interim a final replaces by it, when it was timed
+		// exactly (FromExact).
+		if at, exact, ok := heardAt(time.Duration(math.Round(mr.Start * float64(time.Second)))); ok {
+			t.From, t.FromExact = at, exact
+		}
+	}
 	for i := range alt.Words {
 		w := &alt.Words[i]
 		speaker := -1
@@ -533,7 +543,7 @@ func voiceTranscript(mr *api.MessageResponse, at monoclock.Stamp, stamp func() (
 		if heardAt != nil {
 			// Rounded, not truncated: 1.001 s is 1.000999999… in binary, and
 			// truncated would place the word a sample early.
-			if at, ok := heardAt(time.Duration(math.Round(w.Start * float64(time.Second)))); ok {
+			if at, _, ok := heardAt(time.Duration(math.Round(w.Start * float64(time.Second)))); ok {
 				word.At = at
 			}
 		}
@@ -556,8 +566,10 @@ func (c transcriptCallback) Metadata(*api.MetadataResponse) error { return nil }
 func (c transcriptCallback) SpeechStarted(*api.SpeechStartedResponse) error { return nil }
 
 // UtteranceEnd hands Deepgram's UtteranceEnd to the session manager, then to
-// the voice with the gate's stamp and the time this callback began handling it,
-// before the manager's work: callback-entry time, not Deepgram's transport time
+// the voice with the gate's stamp, when its last word ended by capture (its
+// last_word_end, timed as a result's words are; zero when that cannot be
+// timed), and the time this callback began handling it, before the
+// manager's work: callback-entry time, not Deepgram's transport time
 // (Message).
 func (c transcriptCallback) UtteranceEnd(ur *api.UtteranceEndResponse) error {
 	if !c.admit("utterance_end", ur.LastWordEnd) {
@@ -574,7 +586,17 @@ func (c transcriptCallback) UtteranceEnd(ur *api.UtteranceEndResponse) error {
 		err = c.manager.UtteranceEnd(ur)
 	}
 	if c.voice != nil {
-		c.voice.OnUtteranceEnd(closings, open, entered)
+		heardAt := c.heardAt
+		if c.stream != nil {
+			heardAt = c.stream.CapturedAt
+		}
+		var lastWordEnd time.Time
+		if heardAt != nil {
+			if at, _, ok := heardAt(time.Duration(math.Round(ur.LastWordEnd * float64(time.Second)))); ok {
+				lastWordEnd = at
+			}
+		}
+		c.voice.OnUtteranceEnd(closings, open, lastWordEnd, entered)
 	}
 	return err
 }
@@ -1959,6 +1981,8 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 			red:         func() bool { return capture.capturing(micStatus) },
 			notify:      hub.BroadcastVoiceEvent,
 			projects:    dispatchProjects.Get,
+			takeBack:    concierge.TakeBack,
+			asks:        concierge.Asks,
 			segment:     joinedLink.OnSegment,
 			handDone:    joinedLink.HandDone,
 			waiting:     waitingLED{hardware},

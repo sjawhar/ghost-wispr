@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/sjawhar/ghost-wispr/internal/audio"
+	"github.com/sjawhar/ghost-wispr/internal/monoclock"
 )
 
 // The question of the office runs of 2026-11-21, as Deepgram's live
@@ -400,6 +401,96 @@ func TestTheCallsInterruptionStartsANewTurn(t *testing.T) {
 	})
 	r.s.OnTranscript(timedResult("Wait, who signed off?", 1.0, true, over)) // the interruption's late final
 	eventually(t, "the exchange to end FollowUpWait after the answer", func() bool { _, _, closed := sess.state(); return closed })
+}
+
+// TestABargeInsTurnEndsWithItsUtterance fails if the turn of a person who
+// talks over a voice that drives its own turn does not end where Deepgram
+// ends the utterance, whatever the cut did (Main's rule after Sol's third
+// review of #191):
+//   - words said past the speaker's report of the cut, before the utterance
+//     ends, go on with the turn the interruption began, under its number
+//     (Exchange.Turn): on 308ad445 the final took a new number, and its
+//     read-ahead searched a third time for a question the vendor had already
+//     handed over (Sol's second review);
+//   - words said after the utterance ended, by its final's speech_final or by
+//     Deepgram's UtteranceEnd, begin the next turn with no playback between:
+//     on 71615902 a separate question was glued to the first under its
+//     number, and its read-ahead refused (Sol's third review);
+//   - words said once the voice spoke again begin the turn after that.
+func TestABargeInsTurnEndsWithItsUtterance(t *testing.T) {
+	const question = "what about the realtime voice budget"
+	for _, tc := range []struct {
+		name         string
+		utteranceEnd bool // Deepgram's UtteranceEnd ends the utterance, not its final's speech_final
+	}{
+		{"the final's speech_final ends the utterance", false},
+		{"Deepgram's UtteranceEnd ends the utterance", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := newFakeConcierge("It ships tomorrow.")
+			r := newDrivingRigWith(t, time.Minute, c)
+			r.s.cfg.FollowUpWait = time.Minute
+			r.heard("Wispr, what is happening?", true, true)
+			sess := r.waitSession()
+			speakAs(t, sess, "The issue is in review since this morning.")
+			first := waitSpeechAfter(t, r, time.Time{})
+			over := from(first.Add(50 * time.Millisecond))
+			time.Sleep(time.Until(over(4)) + 20*time.Millisecond)
+			r.s.OnTranscript(timedResult("what about the realtime voice", 10, false, over)) // talks over the voice
+			eventually(t, "the barge-in to cut the voice", func() bool { return voiceCutAfter(r, first) })
+			eventually(t, "the speaker's report of the cut", func() bool {
+				r.s.mu.Lock()
+				defer r.s.mu.Unlock()
+				return r.s.ex != nil && !r.s.ex.cutSpeech
+			})
+			last := time.Now().Add(20 * time.Millisecond) // the question's last word, past the report
+			time.Sleep(time.Until(last) + 20*time.Millisecond)
+			final := transcriptOf(question, 10, true, !tc.utteranceEnd, 0)
+			for i := range final.Words {
+				final.Words[i].At = over(i)
+			}
+			final.Words[5].At = last
+			r.s.OnTranscript(&final)
+			if tc.utteranceEnd {
+				r.s.OnUtteranceEnd(0, true, time.Now(), monoclock.Now()) // ends the utterance just heard
+			}
+			turnsOf := func(words string) []uint64 {
+				var turns []uint64
+				for _, h := range c.heardCalls() {
+					if h.words != "" && strings.HasPrefix(words, h.words) {
+						turns = append(turns, h.x.Turn)
+					}
+				}
+				return turns
+			}
+			turns := turnsOf(question)
+			if len(turns) != 2 || turns[0] != turns[1] {
+				t.Fatalf("the interruption's interim and final carry turns %v, want one number", turns)
+			}
+			// A separate utterance, with no playback since: the next turn.
+			separate := from(time.Now().Add(50 * time.Millisecond))
+			time.Sleep(time.Until(separate(4)) + 20*time.Millisecond)
+			const later = "and when does it ship"
+			r.s.OnTranscript(timedResult(later, 20, false, separate))
+			if got := turnsOf(later); len(got) != 1 || got[0] != turns[0]+1 {
+				r.s.mu.Lock()
+				heard := r.s.turnOf(r.s.ex)
+				r.s.mu.Unlock()
+				t.Errorf("a separate utterance after the first ended carries turns %v, want %d; the turn heard is %q", got, turns[0]+1, heard)
+			}
+			// Control: once the voice spoke again, the room's next words are
+			// the turn after that.
+			speakAs(t, sess, "Ada holds it.")
+			second := waitSpeechAfter(t, r, first)
+			next := from(second.Add(50 * time.Millisecond))
+			time.Sleep(time.Until(next(3)) + 20*time.Millisecond)
+			const after = "and who holds it"
+			r.s.OnTranscript(timedResult(after, 30, false, next))
+			if got := turnsOf(after); len(got) != 1 || got[0] != turns[0]+2 {
+				t.Errorf("the words after the voice spoke again carry turns %v, want %d", got, turns[0]+2)
+			}
+		})
+	}
 }
 
 // TestTheEndOfSpeechTheCallCutIsNotTheNewVoices fails if the end of other

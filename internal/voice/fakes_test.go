@@ -634,6 +634,9 @@ type fakeConcierge struct {
 	afterLines chan struct{}
 	// toolsUnreachable makes every tool answer as with Dispatch out of reach.
 	toolsUnreachable bool
+	// turnErrs, when set, is what Answer returns for each turn it holds,
+	// saying nothing, as the Concierge does for side talk.
+	turnErrs map[string]error
 }
 
 func (c *fakeConcierge) Heard(ctx context.Context, x *Exchange, words string) {
@@ -662,6 +665,12 @@ func (c *fakeConcierge) Answer(ctx context.Context, x *Exchange, turn string, sa
 	c.exchanges = append(c.exchanges, *x)
 	c.mu.Unlock()
 	c.asked <- turn
+	c.mu.Lock()
+	turnErr, saysNothing := c.turnErrs[turn]
+	c.mu.Unlock()
+	if saysNothing {
+		return turnErr
+	}
 	for _, a := range c.acks {
 		mode := Ack
 		if c.ackMode != 0 {

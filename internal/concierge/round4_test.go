@@ -188,7 +188,7 @@ func TestAnUnreachableDispatchEndsTheKeyReads(t *testing.T) {
 	r.records.err = fmt.Errorf("%w: dial tcp: no route to host", dispatch.ErrUnreachable)
 	view := r.concierge.viewProjects()
 	const words = "what about abc 12 and xyz 34 and def 56"
-	r.concierge.readRecord(context.Background(), &r.exchange, view, words, r.concierge.readTarget(view, words), nil, nil)
+	r.concierge.readRecord(context.Background(), &r.exchange, view, words, r.concierge.readTarget(view, words), nil, nil, nil)
 	// The first key's issue and holder are read side by side: one key, read
 	// once by each.
 	if calls := slices.Compact(r.records.calls()); len(calls) != 1 {

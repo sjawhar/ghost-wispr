@@ -230,8 +230,8 @@ func TestADelegationRunsTheAnswerToolAndSpeaksItsResult(t *testing.T) {
 	if err := json.Unmarshal(ev.Call.Args, &args); err != nil {
 		t.Fatalf("tool call args %s: %v", ev.Call.Args, err)
 	}
-	if !strings.Contains(args.Question, "what is happening with ABC-123") || !strings.Contains(args.Question, "what's the status of ABC-123?") {
-		t.Errorf("question %q holds neither the asker's words at the wake nor what the voice heard", args.Question)
+	if args.Question != "what is happening with ABC-123" {
+		t.Errorf("question %q, want the room's asker", args.Question)
 	}
 	if !strings.Contains(args.Transcript, "Speaker 0: Let's check on the recorder work.") {
 		t.Errorf("transcript %q does not hold the meeting before the wake", args.Transcript)
@@ -240,13 +240,19 @@ func TestADelegationRunsTheAnswerToolAndSpeaksItsResult(t *testing.T) {
 		t.Errorf("the tool ran %+v, not the call the session reported", run)
 	}
 
+	// The delegation's automatic acknowledgement is cancelled as it arrives
+	// (suppressAck), so an empty thinking append on item_1 comes first.
+	ack := c.next()
 	thinking := c.next()
 	commentary := c.next()
+	if ack.Type != evThinkingAppend || ack.DelegationID == nil || *ack.DelegationID != "item_1" || ack.Content != "" {
+		t.Errorf("first append %s, want the acknowledgement cancelled on item_1", ack.raw)
+	}
 	if thinking.Type != evThinkingAppend || thinking.DelegationID == nil || *thinking.DelegationID != "item_1" || thinking.Content != "The holder is the recorder agent, live." {
-		t.Errorf("first append %s, want the result's silent context on item_1", thinking.raw)
+		t.Errorf("second append %s, want the result's silent context on item_1", thinking.raw)
 	}
 	if commentary.Type != evCommentaryAppend || commentary.DelegationID == nil || *commentary.DelegationID != "item_1" || commentary.Content != "ABC-123 is in review, and PR 42 waits on CI." {
-		t.Errorf("second append %s, want the result to say on item_1", commentary.raw)
+		t.Errorf("third append %s, want the result to say on item_1", commentary.raw)
 	}
 }
 
@@ -635,50 +641,51 @@ func TestTapAudioHeldWhileStartingIsDroppedWhenTheExchangeEnds(t *testing.T) {
 // GPT-Live can delegate before its transcript of the question arrives: the
 // docs say transcript delivery can be uneven. The question must still carry
 // the asker's words.
-func TestADelegationBeforeTheTranscriptStillCarriesTheQuestion(t *testing.T) {
+func TestADelegationBeforeTheRoomsFinalWaitsForIt(t *testing.T) {
 	tools := newFakeTools(voice.AnswerResult{Say: "It is in review."})
 	x := testExchange(newFakeOutput(), tools)
-	x.AskerTurn = ""
+	rs := withRoom(x, "")
 	srv := newLiveServer(t)
 	s, c, _ := openSession(t, srv, x)
 
 	c.delegate("item_q")
 	time.Sleep(100 * time.Millisecond)
-	c.heard("Wispr, what is the status of ")
-	c.heard("ABC-123?")
+	rs.set(voice.RoomView{Live: true, Asker: "Wispr, what is the status of ABC-123?", Request: "Wispr, what is the status of ABC-123?", Revision: 1})
+	c.heard("Wispr, what is the status of ABC-123?")
 	ev := waitEvent(t, s, voice.EventToolCall)
 	var args voice.AnswerArgs
 	if err := json.Unmarshal(ev.Call.Args, &args); err != nil {
 		t.Fatalf("args %s: %v", ev.Call.Args, err)
 	}
 	if args.Question != "Wispr, what is the status of ABC-123?" {
-		t.Fatalf("question %q, want the words GPT-Live heard after it delegated", args.Question)
+		t.Fatalf("question %q, want the room's asker, awaited", args.Question)
 	}
 }
 
-// With no words heard at all, the question falls back to the meeting's last
-// line rather than going out empty.
-func TestADelegationWithNothingHeardAsksTheLastLine(t *testing.T) {
+// With a live room that gives no asker within the bound, the delegation
+// completes silently: there is no history fallback (Main, after Sol's
+// eighteenth review of #191).
+func TestADelegationWithNoRoomAskerCompletesSilently(t *testing.T) {
 	tools := newFakeTools(voice.AnswerResult{Say: "It is in review."})
 	x := testExchange(newFakeOutput(), tools)
-	x.AskerTurn = ""
+	withRoom(x, "")
 	srv := newLiveServer(t)
-	s, c, _ := openSession(t, srv, x)
+	_, c, _ := openSession(t, srv, x)
 
 	c.delegate("item_n")
-	ev := waitEvent(t, s, voice.EventToolCall)
-	var args voice.AnswerArgs
-	if err := json.Unmarshal(ev.Call.Args, &args); err != nil {
-		t.Fatalf("args %s: %v", ev.Call.Args, err)
+	if first := c.expect(evThinkingAppend); first.DelegationID == nil || *first.DelegationID != "item_n" || first.Content != "" {
+		t.Fatalf("silent completion %+v, want an empty thinking append for item_n", first)
 	}
-	if args.Question != "Wispr knows." {
-		t.Fatalf("question %q, want the meeting's last line", args.Question)
+	select {
+	case call := <-tools.calls:
+		t.Fatalf("a delegation with no room asker ran the tool: %s", call.ID)
+	case <-time.After(100 * time.Millisecond):
 	}
 }
 
-// The asker's words at the wake and GPT-Live's transcript of the same words
-// go in the question once.
-func TestTheQuestionHoldsTheAskersWordsOnce(t *testing.T) {
+// The question is the room's asker (testExchange's AskerTurn), not GPT-Live's
+// transcript of the same words (Main, after Sol's eighteenth review of #191).
+func TestTheQuestionIsTheRoomsAskerNotTheHeardCopy(t *testing.T) {
 	tools := newFakeTools(voice.AnswerResult{Say: "It is in review."})
 	srv := newLiveServer(t)
 	s, c, _ := openSession(t, srv, testExchange(newFakeOutput(), tools))
@@ -690,8 +697,8 @@ func TestTheQuestionHoldsTheAskersWordsOnce(t *testing.T) {
 	if err := json.Unmarshal(ev.Call.Args, &args); err != nil {
 		t.Fatalf("args %s: %v", ev.Call.Args, err)
 	}
-	if args.Question != "What is happening with ABC-123?" {
-		t.Fatalf("question %q, want the asker's words once", args.Question)
+	if args.Question != "what is happening with ABC-123" {
+		t.Fatalf("question %q, want the room's asker", args.Question)
 	}
 }
 

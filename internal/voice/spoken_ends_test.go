@@ -135,6 +135,22 @@ var spokenEnds = map[string]afterSpeech{
 			t.Fatalf("control: the side talk's answer is %s (%v), want nothing to say", out, err)
 		}
 	}, afterReport: "side talk ends an exchange only in the follow-up window, which opens on the speaker's report"},
+	"side talk after Wispr's question": {end: func(t *testing.T, _ *rig, c *fakeConcierge, sess *fakeSession) {
+		// The Concierge takes the reply for side talk (ErrSideTalk): the
+		// answer tool ends the exchange, the window open or not.
+		const reply = "okay, let's move on"
+		c.mu.Lock()
+		c.turnErrs = map[string]error{reply: ErrSideTalk}
+		c.mu.Unlock()
+		out, err := sess.x.Tools.Run(t.Context(), ToolCall{ID: "side", Name: AnswerTool, Args: json.RawMessage(`{"question":"` + reply + `"}`)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var result AnswerResult
+		if err := json.Unmarshal(out, &result); err != nil || result.Say != "" {
+			t.Fatalf("control: the side talk's answer is %s (%v), want nothing to say", out, err)
+		}
+	}},
 	"a holder's answer takes the floor": {end: func(t *testing.T, r *rig, c *fakeConcierge, _ *fakeSession) {
 		c.answers <- PendingAnswer{TaskID: "holder", SessionID: "sess-1", IssueKey: "ABC-12", Text: "It ships tomorrow.", AskedAt: time.Now()}
 		if got := waitSaid(t, r.waitSession()); got != "It ships tomorrow." {

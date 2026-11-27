@@ -22,7 +22,7 @@ func TestTheVoiceLinkIsInertUntilTheVoiceStarts(t *testing.T) {
 	link.GateClosed(1)
 	link.Stop("Jabra button")
 	link.OnTranscript(&voice.Transcript{Text: "Wispr, hello", GateOpen: true})
-	link.OnUtteranceEnd(0, true, monoclock.Now())
+	link.OnUtteranceEnd(0, true, time.Now(), monoclock.Now())
 	if err := link.WithFloor(t.Context(), func() {}); err != nil {
 		t.Fatalf("WithFloor with no voice: %v", err)
 	}
@@ -104,12 +104,12 @@ func (c *closingsHeard) Stop(reason string) {
 	defer c.mu.Unlock()
 	c.stops = append(c.stops, reason)
 }
-func (*closingsHeard) OnTranscript(*voice.Transcript)                  {}
-func (*closingsHeard) OnUtteranceEnd(int, bool, monoclock.Stamp)       {}
-func (*closingsHeard) WithFloor(_ context.Context, start func()) error { start(); return nil }
-func (*closingsHeard) Close()                                          {}
-func (*closingsHeard) SessionStarted(string, uint64)                   {}
-func (*closingsHeard) SessionEnded(string)                             {}
+func (*closingsHeard) OnTranscript(*voice.Transcript)                       {}
+func (*closingsHeard) OnUtteranceEnd(int, bool, time.Time, monoclock.Stamp) {}
+func (*closingsHeard) WithFloor(_ context.Context, start func()) error      { start(); return nil }
+func (*closingsHeard) Close()                                               {}
+func (*closingsHeard) SessionStarted(string, uint64)                        {}
+func (*closingsHeard) SessionEnded(string)                                  {}
 func (c *closingsHeard) EnabledChanged() {
 	c.mu.Lock()
 	defer c.mu.Unlock()

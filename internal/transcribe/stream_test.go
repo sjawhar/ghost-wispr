@@ -255,7 +255,7 @@ func TestCapturedAtTimesAPointByWhenItsAudioWasCaptured(t *testing.T) {
 	}
 	t.Run("before any audio", func(t *testing.T) {
 		rc := NewResilientClient(t.Context(), nil, ResilientConfig{}, nil, nil)
-		if at, ok := rc.CapturedAt(0); ok {
+		if at, _, ok := rc.CapturedAt(0); ok {
 			t.Fatalf("CapturedAt(0) = %v with no audio captured, want none", at)
 		}
 	})
@@ -271,11 +271,11 @@ func TestCapturedAtTimesAPointByWhenItsAudioWasCaptured(t *testing.T) {
 		_, _ = rc.Write(make([]byte, secondOfAudio)) // stream 1-2 s
 		hi2 := time.Now()
 		time.Sleep(50 * time.Millisecond) // a result that arrives later
-		at, ok := rc.CapturedAt(1500 * time.Millisecond)
+		at, _, ok := rc.CapturedAt(1500 * time.Millisecond)
 		within(t, "1.5s", at, ok, lo2.Add(-500*time.Millisecond), hi2.Add(-500*time.Millisecond))
-		at, ok = rc.CapturedAt(500 * time.Millisecond)
+		at, _, ok = rc.CapturedAt(500 * time.Millisecond)
 		within(t, "0.5s", at, ok, lo1.Add(-500*time.Millisecond), hi1.Add(-500*time.Millisecond))
-		if at, ok := rc.CapturedAt(2500 * time.Millisecond); ok {
+		if at, _, ok := rc.CapturedAt(2500 * time.Millisecond); ok {
 			t.Fatalf("CapturedAt(2.5s) = %v, after all the audio captured; want none", at)
 		}
 	})
@@ -297,7 +297,7 @@ func TestCapturedAtTimesAPointByWhenItsAudioWasCaptured(t *testing.T) {
 		}
 		time.Sleep(50 * time.Millisecond)
 		// 3.5 s into the stream, half a second before its buffer's end.
-		at, ok := rc.CapturedAt(3500 * time.Millisecond)
+		at, _, ok := rc.CapturedAt(3500 * time.Millisecond)
 		within(t, "3.5s", at, ok, lo.Add(-500*time.Millisecond), hi.Add(-500*time.Millisecond))
 	})
 	t.Run("a word after the send queue dropped audio", func(t *testing.T) {
@@ -333,7 +333,7 @@ func TestCapturedAtTimesAPointByWhenItsAudioWasCaptured(t *testing.T) {
 		_, _ = sender.Write(make([]byte, secondOfAudio)) // captured 6-7 s, stream 4-5 s
 		hi := time.Now()
 		<-socket.entered
-		at, ok := rc.CapturedAt(4500 * time.Millisecond)
+		at, _, ok := rc.CapturedAt(4500 * time.Millisecond)
 		within(t, "4.5s", at, ok, lo.Add(-500*time.Millisecond), hi.Add(-500*time.Millisecond))
 	})
 	t.Run("a later buffer held back", func(t *testing.T) {
@@ -350,7 +350,7 @@ func TestCapturedAtTimesAPointByWhenItsAudioWasCaptured(t *testing.T) {
 		hi := time.Now()
 		time.Sleep(time.Second)
 		_, _ = sender.Write(make([]byte, quarter)) // stream 0.25-0.5 s, a second late
-		at, ok := rc.CapturedAt(0)
+		at, _, ok := rc.CapturedAt(0)
 		within(t, "0s", at, ok, lo.Add(-250*time.Millisecond), hi.Add(-250*time.Millisecond))
 	})
 	t.Run("the first words after a gap in capture", func(t *testing.T) {
@@ -366,7 +366,7 @@ func TestCapturedAtTimesAPointByWhenItsAudioWasCaptured(t *testing.T) {
 		lo := time.Now()
 		_, _ = rc.Write(make([]byte, quarter)) // stream 0.25-0.5 s, after the resume
 		hi := time.Now()
-		at, ok := rc.CapturedAt(250 * time.Millisecond)
+		at, _, ok := rc.CapturedAt(250 * time.Millisecond)
 		within(t, "0.25s", at, ok, lo.Add(-250*time.Millisecond), hi.Add(-250*time.Millisecond))
 	})
 	t.Run("a buffer held back after its capture", func(t *testing.T) {
@@ -381,7 +381,7 @@ func TestCapturedAtTimesAPointByWhenItsAudioWasCaptured(t *testing.T) {
 		sender.MarkRead(read)
 		time.Sleep(time.Second) // a slow read of the light
 		_, _ = sender.Write(make([]byte, quarter))
-		at, ok := rc.CapturedAt(125 * time.Millisecond) // halfway through it
+		at, _, ok := rc.CapturedAt(125 * time.Millisecond) // halfway through it
 		within(t, "0.125s", at, ok, read.Add(-125*time.Millisecond), read.Add(-125*time.Millisecond))
 	})
 	t.Run("audio a full buffer evicted while a new socket drains it", func(t *testing.T) {
@@ -399,7 +399,7 @@ func TestCapturedAtTimesAPointByWhenItsAudioWasCaptured(t *testing.T) {
 		_, _ = rc.Write(make([]byte, 8192)) // B, buffered behind it: the full buffer evicts A's second half
 		hi := time.Now()
 		// The socket's 128 ms is B's start, 256 ms before B was captured.
-		at, ok := rc.CapturedAt(128 * time.Millisecond)
+		at, _, ok := rc.CapturedAt(128 * time.Millisecond)
 		within(t, "0.128s", at, ok, lo.Add(-256*time.Millisecond), hi.Add(-256*time.Millisecond))
 	})
 	t.Run("a Finalize after some audio was sent", func(t *testing.T) {
@@ -414,11 +414,11 @@ func TestCapturedAtTimesAPointByWhenItsAudioWasCaptured(t *testing.T) {
 		_, _ = rc.Buffer.Write(make([]byte, secondOfAudio)) // B, buffered, not yet sent
 		rc.accepted += secondOfAudio
 		rc.Mu.Unlock()
-		before, ok := rc.CapturedAt(500 * time.Millisecond)
+		before, _, ok := rc.CapturedAt(500 * time.Millisecond)
 		if err := rc.Finalize(); err != nil {
 			t.Fatal(err)
 		}
-		after, ok2 := rc.CapturedAt(500 * time.Millisecond)
+		after, _, ok2 := rc.CapturedAt(500 * time.Millisecond)
 		if !ok || !ok2 || !after.Equal(before) {
 			t.Fatalf("a word in A captured at %v before Finalize and %v after, want the same", before.Format(time.StampMicro), after.Format(time.StampMicro))
 		}
@@ -457,12 +457,12 @@ func TestAnOldPointKeepsItsTime(t *testing.T) {
 	for range 361 * 4 {
 		_, _ = rc.Write(make([]byte, secondOfAudio/4))
 	}
-	before, ok := rc.CapturedAt(500 * time.Millisecond)
+	before, _, ok := rc.CapturedAt(500 * time.Millisecond)
 	if !ok {
 		t.Fatal("control: the clock no longer times 0.5 s")
 	}
 	rc.sendQueueDropped(secondOfAudio / 4)
-	if after, ok := rc.CapturedAt(500 * time.Millisecond); !ok || !after.Equal(before) {
+	if after, _, ok := rc.CapturedAt(500 * time.Millisecond); !ok || !after.Equal(before) {
 		t.Fatalf("CapturedAt(500ms) = %v (%v) after a later drop, %v before; want it unchanged", after.Format(time.StampMicro), ok, before.Format(time.StampMicro))
 	}
 }
@@ -473,8 +473,10 @@ func TestAnOldPointKeepsItsTime(t *testing.T) {
 // question whose result comes more than captureStamps buffers late stops
 // its own answer (Sol's review of #133 at e6484db). It was captured before
 // the oldest audio kept, so it is timed by that audio, the latest it can
-// have been. The control: a point inside the oldest buffer kept is timed
-// exactly, by its place in that buffer.
+// have been, and that time is not exact: every point that old has it, so it
+// names none of them (Sol's twenty-ninth review of #191). The control: a
+// point inside the oldest buffer kept is timed exactly, by its place in that
+// buffer.
 func TestAWordOlderThanTheClocksHistoryIsTimedByItsOldestAudio(t *testing.T) {
 	socket := &mockWriter{}
 	rc := NewResilientClient(t.Context(), func(context.Context) (io.WriteCloser, error) { return socket, nil }, ResilientConfig{SampleRate: 16000}, nil, nil)
@@ -483,16 +485,16 @@ func TestAWordOlderThanTheClocksHistoryIsTimedByItsOldestAudio(t *testing.T) {
 	for range captureStamps + 8 { // the first 8 quarter seconds are no longer kept
 		_, _ = rc.Write(make([]byte, quarter))
 	}
-	oldest, ok := rc.CapturedAt(2 * time.Second)
-	if !ok {
-		t.Fatal("control: the clock no longer times the oldest buffer it keeps")
+	oldest, exact, ok := rc.CapturedAt(2 * time.Second)
+	if !ok || !exact {
+		t.Fatalf("control: the clock no longer times the oldest buffer it keeps exactly (exact %v, ok %v)", exact, ok)
 	}
-	if at, ok := rc.CapturedAt(2125 * time.Millisecond); !ok || !at.Equal(oldest.Add(125*time.Millisecond)) {
-		t.Fatalf("control: CapturedAt(2.125s) = %v (%v), want %v, 125 ms into the oldest buffer kept", at.Format(time.StampMicro), ok, oldest.Add(125*time.Millisecond).Format(time.StampMicro))
+	if at, exact, ok := rc.CapturedAt(2125 * time.Millisecond); !ok || !exact || !at.Equal(oldest.Add(125*time.Millisecond)) {
+		t.Fatalf("control: CapturedAt(2.125s) = %v (exact %v, ok %v), want %v exactly, 125 ms into the oldest buffer kept", at.Format(time.StampMicro), exact, ok, oldest.Add(125*time.Millisecond).Format(time.StampMicro))
 	}
 	for _, point := range []time.Duration{0, 1900 * time.Millisecond} {
-		if at, ok := rc.CapturedAt(point); !ok || !at.Equal(oldest) {
-			t.Errorf("CapturedAt(%v) = %v (%v), older than the clock's history; want %v, when its oldest audio was captured", point, at.Format(time.StampMicro), ok, oldest.Format(time.StampMicro))
+		if at, exact, ok := rc.CapturedAt(point); !ok || exact || !at.Equal(oldest) {
+			t.Errorf("CapturedAt(%v) = %v (exact %v, ok %v), older than the clock's history; want %v, when its oldest audio was captured, not exact", point, at.Format(time.StampMicro), exact, ok, oldest.Format(time.StampMicro))
 		}
 	}
 }

@@ -151,7 +151,7 @@ func TestADelegationForAnotherTargetRunsNoTool(t *testing.T) {
 	select {
 	case got := <-tools.calls:
 		t.Fatalf("a delegation for responses ran the answer tool: %+v", got)
-	case <-time.After(transcriptSettle + 400*time.Millisecond):
+	case <-time.After(650 * time.Millisecond):
 	}
 	result, _ := json.Marshal(voice.AnswerResult{Say: "late"})
 	if err := s.Deliver(context.Background(), "resp_1", result); !errors.Is(err, ErrUnknownCall) {
@@ -219,6 +219,11 @@ func TestAFailedAnswerToolClosesItsDelegationSilently(t *testing.T) {
 	_, c, _ := openSession(t, srv, testExchange(newFakeOutput(), tools))
 
 	c.delegate("item_f")
+	// The acknowledgement is cancelled as the delegation arrives, then the
+	// failure's silent context follows.
+	if ack := c.next(); ack.Type != evThinkingAppend || ack.DelegationID == nil || *ack.DelegationID != "item_f" || ack.Content != "" {
+		t.Fatalf("first append %s, want the acknowledgement cancelled on item_f", ack.raw)
+	}
 	ev := c.next()
 	if ev.Type != evThinkingAppend || ev.DelegationID == nil || *ev.DelegationID != "item_f" || ev.Content != lookupFailed {
 		t.Fatalf("append %s, want silent context on item_f that the lookup failed", ev.raw)
@@ -243,27 +248,32 @@ func TestADelegationReportsWhatWasHeardAsTheUserTurn(t *testing.T) {
 	}
 }
 
-func TestASecondDelegationAsksOnlyWhatWasHeardSince(t *testing.T) {
+// A follow-up the room says, as its current asker, is the next delegation's
+// question; GPT-Live's own transcript is never the question (Main, after
+// Sol's eighteenth review of #191).
+func TestASecondDelegationAsksTheRoomsCurrentAsker(t *testing.T) {
+	x := testExchange(newFakeOutput(), newFakeTools(voice.AnswerResult{Say: "x"}))
+	rs := withRoom(x, "Tell me about ABC-7.")
 	srv := newLiveServer(t)
-	s, c, _ := openSession(t, srv, testExchange(newFakeOutput(), newFakeTools(voice.AnswerResult{Say: "x"})))
+	s, c, _ := openSession(t, srv, x)
 
 	c.heard("Tell me about ABC-7.")
 	c.delegate("item_1")
-	if q := answerArgs(t, waitEvent(t, s, voice.EventToolCall).Call.Args).Question; !strings.Contains(q, "what is happening with ABC-123") {
-		t.Fatalf("first question %q lacks the asker's words at the wake", q)
+	if q := answerArgs(t, waitEvent(t, s, voice.EventToolCall).Call.Args).Question; q != "Tell me about ABC-7." {
+		t.Fatalf("first question %q, want the room's asker", q)
 	}
+	rs.set(voice.RoomView{Live: true, Asker: "And ABC-8?", Request: "And ABC-8?", Revision: 2})
 	c.heard("And ABC-8?")
 	c.delegate("item_2")
 	if q := answerArgs(t, waitEvent(t, s, voice.EventToolCall).Call.Args).Question; q != "And ABC-8?" {
-		t.Fatalf("second question %q, want only what was heard since the first", q)
+		t.Fatalf("second question %q, want the room's new asker", q)
 	}
 }
 
-// A second delegation straight after the first, with nothing new heard,
-// asks the first question again.
-func TestASecondDelegationWithNothingNewRepeatsTheFirstQuestion(t *testing.T) {
+// A second delegation with the room's asker unchanged re-asks it.
+func TestASecondDelegationWithNothingNewRepeatsTheRoomsAsker(t *testing.T) {
 	x := testExchange(newFakeOutput(), newFakeTools(voice.AnswerResult{Say: "x"}))
-	x.AskerTurn = ""
+	withRoom(x, "Is ABC-5 done?")
 	srv := newLiveServer(t)
 	s, c, _ := openSession(t, srv, x)
 
@@ -272,7 +282,7 @@ func TestASecondDelegationWithNothingNewRepeatsTheFirstQuestion(t *testing.T) {
 	waitEvent(t, s, voice.EventToolCall)
 	c.delegate("item_2")
 	if q := answerArgs(t, waitEvent(t, s, voice.EventToolCall).Call.Args).Question; q != "Is ABC-5 done?" {
-		t.Fatalf("question %q, want the first question again", q)
+		t.Fatalf("question %q, want the room's asker again", q)
 	}
 }
 

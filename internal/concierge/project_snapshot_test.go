@@ -80,29 +80,39 @@ func TestReadForDecidesFromTheTurnsView(t *testing.T) {
 
 // TestAnOfferedKeyPicksWhenTheListCannotTell (Sol on #190): with an offer
 // pending and the project list unable to tell, a key the voice offered still
-// picks: that issue is real, the voice just offered it. Any other turn is
-// read exactly as with no offer pending: a key the list cannot tell with no
-// other words to search is an outage of Dispatch's.
+// picks: that issue is real, the voice just offered it. A question, and a
+// key said alone that was not offered (Main on #191), are read from the
+// turn's project snapshot: a key it cannot tell with no other words to
+// search is an outage of Dispatch's. Any other reply, a key among other
+// words included, is side talk (Main's rule on R5's rewrite).
 func TestAnOfferedKeyPicksWhenTheListCannotTell(t *testing.T) {
 	for _, tc := range []struct {
 		reply   string
-		outage  bool
+		want    string // "pick", "outage" or "side talk"
 		pending int
 	}{
-		{"ABC-12", false, 1},
-		{"ABC-12, please", false, 1},
-		{"ABC-14", true, 0},
-		{"ABC-14, the first one", true, 0},
-		{"what changed in the last 30 days", true, 0},
+		{"ABC-12", "pick", 1},
+		{"ABC-12, please", "pick", 1},
+		{"ABC-14", "outage", 0},
+		{"ABC-14, the first one", "side talk", 0},
+		{"what about ABC-14", "outage", 0},
+		{"what changed in the last 30 days", "outage", 0},
 	} {
 		t.Run(tc.reply, func(t *testing.T) {
 			got := outcomeOf(t, true, nil, tc.reply)
-			if tc.outage {
+			switch tc.want {
+			case "outage":
 				if !slices.Equal(got.Spoken, []string{cannotReachDispatch}) || !got.Unreachable || len(got.Full)+len(got.Keyword) > 0 || got.Sent != 0 {
 					t.Errorf("%+v; want only %q, the error sound, no search and no send", got, cannotReachDispatch)
 				}
-			} else if got.Pending != tc.pending {
-				t.Errorf("%+v; want the question first asked sent %d times", got, tc.pending)
+			case "side talk":
+				if !got.SideTalk || len(got.Spoken) > 0 || got.Unreachable || len(got.Full)+len(got.Keyword) > 0 || got.Sent != 0 {
+					t.Errorf("%+v; want side talk: nothing said, searched or sent, no error sound", got)
+				}
+			default:
+				if got.Pending != tc.pending {
+					t.Errorf("%+v; want the question first asked sent %d times", got, tc.pending)
+				}
 			}
 		})
 	}
@@ -137,12 +147,14 @@ func TestANewQuestionWithAnOfferPendingIsSearched(t *testing.T) {
 	}
 }
 
-// TestAPendingOfferChangesNoNewQuestion (Main on #190): a turn that picks
-// no offered issue is answered exactly as with no offer pending: the same
-// lines, the same error, the same searches, the same issue and the same
-// sends. "ABC-14 rollout", a key the list cannot tell among other words, is
-// searched and answers about what the search finds, as on main.
-func TestAPendingOfferChangesNoNewQuestion(t *testing.T) {
+// TestAPendingOfferChangesNoQuestion (Main on #190, as Main's rule on R5's
+// rewrite narrows it): a question that picks no offered issue is answered
+// exactly as with no offer pending: the same lines, the same error, the same
+// searches, the same issue and the same sends. A reply that is no question
+// and no key said alone ("ABC-14 rollout", a key the list cannot tell among
+// other words) is side talk with an offer pending: nothing is said, searched
+// or sent.
+func TestAPendingOfferChangesNoQuestion(t *testing.T) {
 	noKeywordHit := func(r *rig) { r.records.kwHits = nil }
 	for _, tc := range []struct {
 		turn  string
@@ -152,16 +164,22 @@ func TestAPendingOfferChangesNoNewQuestion(t *testing.T) {
 		{"what changed on the realtime voice in the last 30 days?", nil},
 		{"what changed on the speech interface in the last 30 days", noKeywordHit},
 		{"what changed on the speech interface in the last 30 days?", noKeywordHit},
-		{"ABC-14 rollout", nil},
 		{"what is blocking ABC-14", nil},
-		{"ABC-14", nil},
-		{"ABC-14, the first one", nil},
 		{"what changed in the last 30 days", nil},
+		{"ABC-14 rollout?", nil},
 	} {
 		t.Run(tc.turn, func(t *testing.T) {
 			none, pending := outcomeOf(t, false, tc.setup, tc.turn), outcomeOf(t, true, tc.setup, tc.turn)
 			if !reflect.DeepEqual(none, pending) {
 				t.Errorf("with no offer:  %+v\nwith an offer: %+v\nwant the same", none, pending)
+			}
+		})
+	}
+	for _, turn := range []string{"ABC-14 rollout", "ABC-14, the first one"} {
+		t.Run("side talk: "+turn, func(t *testing.T) {
+			got := outcomeOf(t, true, nil, turn)
+			if !got.SideTalk || len(got.Spoken) > 0 || got.Unreachable || len(got.Full)+len(got.Keyword) > 0 || got.Sent != 0 || got.Took != "" {
+				t.Errorf("%+v; want side talk: nothing said, searched or sent", got)
 			}
 		})
 	}
@@ -203,12 +221,12 @@ func TestAnOutcomeHoldsEveryFullSearchTheAnswerStarted(t *testing.T) {
 
 // outcome is what an answer did, as the room and Dispatch saw it.
 type outcome struct {
-	Spoken        []string
-	Unreachable   bool
-	ErrNil        bool
-	Full, Keyword []string
-	Took          string
-	Sent, Pending int
+	Spoken                []string
+	Unreachable, SideTalk bool
+	ErrNil                bool
+	Full, Keyword         []string
+	Took                  string
+	Sent, Pending         int
 }
 
 // outcomeOf answers turn on a follow-up turn, the project list unable to
@@ -242,7 +260,7 @@ func outcomeOf(t *testing.T, pending bool, setup func(*rig), turn string) outcom
 	r.concierge.Heard(ctx, &r.exchange, turn)
 	var spoken []said
 	err := r.concierge.Answer(ctx, &r.exchange, turn, recorder(&spoken))
-	got := outcome{Unreachable: errors.Is(err, voice.ErrUnreachable), ErrNil: err == nil, Took: r.exchange.IssueKey}
+	got := outcome{Unreachable: errors.Is(err, voice.ErrUnreachable), SideTalk: errors.Is(err, voice.ErrSideTalk), ErrNil: err == nil, Took: r.exchange.IssueKey}
 	for _, s := range spoken {
 		got.Spoken = append(got.Spoken, s.text)
 	}

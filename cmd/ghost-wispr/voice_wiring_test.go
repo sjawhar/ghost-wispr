@@ -61,7 +61,7 @@ func (h *heardTranscripts) OnTranscript(t *voice.Transcript) {
 	h.got = append(h.got, *t)
 }
 
-func (h *heardTranscripts) OnUtteranceEnd(closings int, open bool, at monoclock.Stamp) {
+func (h *heardTranscripts) OnUtteranceEnd(closings int, open bool, _ time.Time, at monoclock.Stamp) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.ends = append(h.ends, open)

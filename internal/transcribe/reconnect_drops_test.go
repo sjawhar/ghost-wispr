@@ -53,7 +53,7 @@ func TestForgottenDropsKeepTheirPlaceAcrossAReconnect(t *testing.T) {
 	if got, want := rc.CapturedSince(1500*time.Millisecond), 1500*time.Millisecond; got != want {
 		t.Fatalf("CapturedSince(1.5s) = %v, want %v: the rest of C2 and E", got, want)
 	}
-	at, ok := rc.CapturedAt(2500 * time.Millisecond)
+	at, _, ok := rc.CapturedAt(2500 * time.Millisecond)
 	if !ok || at.Before(lo.Add(-500*time.Millisecond)) || at.After(hi.Add(-500*time.Millisecond)) {
 		t.Fatalf("CapturedAt(2.5s) = %v, %v; want E's write time less 0.5 s (%v to %v)", at.Format(time.StampMicro), ok, lo.Add(-500*time.Millisecond).Format(time.StampMicro), hi.Add(-500*time.Millisecond).Format(time.StampMicro))
 	}

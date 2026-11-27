@@ -347,13 +347,47 @@ func TestVoiceTimingIsLogged(t *testing.T) {
 // stampsHeard is the voice as the transcript callback feeds it, keeping what
 // it was given.
 type stampsHeard struct {
-	transcripts []*voice.Transcript
-	ends        []monoclock.Stamp
+	transcripts  []*voice.Transcript
+	ends         []monoclock.Stamp
+	lastWordEnds []time.Time
 }
 
 func (h *stampsHeard) OnTranscript(t *voice.Transcript) { h.transcripts = append(h.transcripts, t) }
-func (h *stampsHeard) OnUtteranceEnd(_ int, _ bool, at monoclock.Stamp) {
+func (h *stampsHeard) OnUtteranceEnd(_ int, _ bool, lastWordEnd time.Time, at monoclock.Stamp) {
 	h.ends = append(h.ends, at)
+	h.lastWordEnds = append(h.lastWordEnds, lastWordEnd)
+}
+
+// TestTheVoicesUtteranceEndCarriesItsLastWordsEnd fails if Deepgram's
+// UtteranceEnd reaches the voice without when its last word was captured to
+// have ended (last_word_end, on the clock the words of a result are timed
+// by), or with a time where that cannot be timed: the voice ends only a turn
+// no word of which began after it, so a late UtteranceEnd cannot cut the next
+// utterance (Sol's fourth review of #191).
+func TestTheVoicesUtteranceEndCarriesItsLastWordsEnd(t *testing.T) {
+	base := time.Date(2026, 11, 25, 7, 0, 0, 0, time.UTC)
+	timed := func(at time.Duration) (time.Time, bool, bool) { return base.Add(at), true, at < time.Minute }
+	for _, tc := range []struct {
+		name        string
+		heardAt     func(time.Duration) (time.Time, bool, bool)
+		lastWordEnd float64
+		want        time.Time
+	}{
+		{"timed", timed, 2.501, base.Add(2501 * time.Millisecond)},
+		{"past what the stream can time", timed, 90, time.Time{}},
+		{"no clock for the stream", nil, 2.5, time.Time{}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			heard := &stampsHeard{}
+			c := transcriptCallback{voice: heard, heardAt: tc.heardAt}
+			if err := c.UtteranceEnd(&api.UtteranceEndResponse{LastWordEnd: tc.lastWordEnd}); err != nil {
+				t.Fatal(err)
+			}
+			if len(heard.lastWordEnds) != 1 || !heard.lastWordEnds[0].Equal(tc.want) {
+				t.Fatalf("the voice's UtteranceEnd ended its words at %v, want %v", heard.lastWordEnds, tc.want)
+			}
+		})
+	}
 }
 
 // TestVoiceTranscriptCarriesTheMonotonicClockReadWithAt fails if the voice's

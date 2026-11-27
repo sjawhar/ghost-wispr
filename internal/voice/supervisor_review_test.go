@@ -22,7 +22,7 @@ func TestGoAheadAfterItsOwnInterimSpeaksTheAnswer(t *testing.T) {
 	r.heard("Wispr,", false, false)
 	wake := r.waitSession()
 	r.heard("Wispr, go ahead.", true, true)
-	r.s.OnUtteranceEnd(0, true, monoclock.Now())
+	r.s.OnUtteranceEnd(0, true, time.Now(), monoclock.Now())
 	answer := r.waitSession()
 	if got := waitSaid(t, answer); got != "It ships tomorrow." {
 		t.Fatalf("said %q, want the held answer", got)
