@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -40,21 +41,25 @@ func (r pendingSendSlowRecords) Events(ctx context.Context, key string, before i
 
 // TestPendingSendMatrix keeps the fast answer inside its bound while Envoy's
 // send runs beside it. The line about the ask and the named key do not depend
-// on which completes first. The answer's bound is 2 s here, not 8, so a send
-// of 3 s outlasts it as one of 9 s outlasts the 8 s bound. Each row has a rig
-// of its own, so the rows run in parallel.
+// on which completes first. The slow send is held until Answer has returned,
+// so it outlasts the answer however slowly the machine runs, and the bound is
+// the production 8 s, so a send that begins late still begins inside it. On
+// a loaded sami-devbox the question reached Envoy up to 1.6 s after the turn:
+// a send of 3 s then ended more than 2 s after a 2 s bound, and a failed send
+// came after it. Each row has a rig of its own, so the rows run in parallel.
 func TestPendingSendMatrix(t *testing.T) {
 	t.Parallel()
-	const bound = 2 * time.Second
 	for _, send := range []struct {
 		name  string
 		delay time.Duration
-		fail  bool
+		// held: the send returns only once Answer has returned.
+		held bool
+		fail bool
 	}{
-		{"send_in_10_ms", 10 * time.Millisecond, false},
-		{"send_in_400_ms", 400 * time.Millisecond, false},
-		{"send_in_3_s", bound + time.Second, false},
-		{"send_failure", 0, true},
+		{name: "send_in_10_ms", delay: 10 * time.Millisecond},
+		{name: "send_in_400_ms", delay: 400 * time.Millisecond},
+		{name: "send_after_the_answer", held: true},
+		{name: "send_failure", fail: true},
 	} {
 		for _, keyless := range []bool{false, true} {
 			name := send.name + "/keyed_first_fact"
@@ -66,12 +71,27 @@ func TestPendingSendMatrix(t *testing.T) {
 				r := newRig(t)
 				heldIssue(r, "session", false)
 				r.concierge.knownBound = 20 * time.Second
-				r.concierge.fastBound = bound
+				if r.concierge.fastBound != 8*time.Second {
+					t.Fatal("the matrix did not use the production answer bound")
+				}
+				answered := make(chan struct{})
+				release := sync.OnceFunc(func() { close(answered) })
+				// A test that fails before Answer returns releases the send,
+				// before the rig's cleanup waits for it.
+				t.Cleanup(release)
 				finished := make(chan struct{})
 				r.agents.onSend = func(ctx context.Context, _ string) error {
 					defer close(finished)
-					if send.fail {
+					switch {
+					case send.fail:
 						return errors.New("send failed")
+					case send.held:
+						select {
+						case <-answered:
+							return nil
+						case <-ctx.Done():
+							return ctx.Err()
+						}
 					}
 					select {
 					case <-time.After(send.delay):
@@ -88,14 +108,17 @@ func TestPendingSendMatrix(t *testing.T) {
 				var spoken []said
 				start := time.Now()
 				err := r.concierge.Answer(context.Background(), &r.exchange, "ask the agent on ABC-12 when it will be ready?", recorder(&spoken))
+				elapsed := time.Since(start)
+				release()
 				if err != nil && !send.fail {
 					t.Fatalf("Answer = %v", err)
 				}
-				elapsed := time.Since(start)
+				// The send ends by its own bound at the latest; this waits for
+				// it, and fails only if it never began.
 				select {
 				case <-finished:
-				case <-time.After(2 * time.Second):
-					t.Fatal("the send did not finish")
+				case <-time.After(sendTimeout):
+					t.Fatalf("the send did not finish within %v", sendTimeout)
 				}
 				text := make([]string, len(spoken))
 				for i := range spoken {
@@ -152,11 +175,20 @@ func TestPendingSendRetryProviderFailureReturnsError(t *testing.T) {
 
 // TestPendingSendMatrixSlowRecord: a slow record read consumes the whole fast
 // answer bound. The answer returns then, without waiting for Envoy's send.
-// Each row has a rig of its own, so the rows run in parallel.
+// The slow send is held until Answer has returned, so it outlasts the answer
+// however slowly the machine runs, as TestPendingSendMatrix's is. Each row
+// has a rig of its own, so the rows run in parallel.
 func TestPendingSendMatrixSlowRecord(t *testing.T) {
 	t.Parallel()
-	for _, delay := range []time.Duration{10 * time.Millisecond, 9 * time.Second} {
-		t.Run(delay.String(), func(t *testing.T) {
+	for _, send := range []struct {
+		name string
+		// held: the send returns only once Answer has returned.
+		held bool
+	}{
+		{name: "send_in_10_ms"},
+		{name: "send_after_the_answer", held: true},
+	} {
+		t.Run(send.name, func(t *testing.T) {
 			t.Parallel()
 			r := newRig(t)
 			heldIssue(r, "session", false)
@@ -170,11 +202,24 @@ func TestPendingSendMatrixSlowRecord(t *testing.T) {
 			if r.concierge.fastBound != 8*time.Second || r.concierge.callBound != 3*time.Second {
 				t.Fatal("the matrix did not use production read and answer bounds")
 			}
+			answered := make(chan struct{})
+			release := sync.OnceFunc(func() { close(answered) })
+			// A test that fails before Answer returns releases the send,
+			// before the rig's cleanup waits for it.
+			t.Cleanup(release)
 			finished := make(chan struct{})
 			r.agents.onSend = func(ctx context.Context, _ string) error {
 				defer close(finished)
+				if send.held {
+					select {
+					case <-answered:
+						return nil
+					case <-ctx.Done():
+						return ctx.Err()
+					}
+				}
 				select {
-				case <-time.After(delay):
+				case <-time.After(10 * time.Millisecond):
 					return nil
 				case <-ctx.Done():
 					return ctx.Err()
@@ -184,10 +229,13 @@ func TestPendingSendMatrixSlowRecord(t *testing.T) {
 			start := time.Now()
 			err := r.concierge.Answer(context.Background(), &r.exchange, "ask the agent on ABC-12 when it will be ready?", recorder(&spoken))
 			elapsed := time.Since(start)
+			release()
+			// The send ends by its own bound at the latest; this waits for
+			// it, and fails only if it never began.
 			select {
 			case <-finished:
-			case <-time.After(5 * time.Second):
-				t.Fatal("the send did not finish")
+			case <-time.After(sendTimeout):
+				t.Fatalf("the send did not finish within %v", sendTimeout)
 			}
 			r.agents.mu.Lock()
 			sends := len(r.agents.sent)

@@ -211,6 +211,13 @@ type r7Rig struct {
 
 func newR7Rig(t *testing.T) *r7Rig {
 	t.Helper()
+	return newR7RigFollowingUp(t, r7FollowUpWait)
+}
+
+// newR7RigFollowingUp is newR7Rig whose exchange stays open followUpWait
+// after Wispr's answer for a follow-up with no wake phrase.
+func newR7RigFollowingUp(t *testing.T, followUpWait time.Duration) *r7Rig {
+	t.Helper()
 	logs := &lockedBuffer{}
 	t.Cleanup(func() {
 		if t.Failed() {
@@ -292,7 +299,7 @@ func newR7Rig(t *testing.T) *r7Rig {
 		TurnWait:     r7TurnWait,
 		SilenceWait:  r7SilenceWait,
 		SoundGap:     r7SoundGap,
-		FollowUpWait: r7FollowUpWait,
+		FollowUpWait: followUpWait,
 		ReplayWindow: r7ReplayWindow,
 		Logf: func(format string, args ...any) {
 			_, _ = fmt.Fprintln(logs, "supervisor:", fmt.Sprintf(format, args...))

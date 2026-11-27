@@ -36,8 +36,11 @@ func TestAReadBeforeTheSessionExistsIsUsed(t *testing.T) {
 
 // TestAnAskTurnAsksOnceTheHolderIsKnown: an explicit ask goes out after the
 // holder read, even if the rest of the record is slow. An unresponsive holder
-// hears that its question was left for it. Each row has a rig of its own, so
-// the rows run in parallel.
+// hears that its question was left for it. The record's spec read never
+// answers, and its bound is longer than the answer's, so the answer ends at
+// its bound, the production 8 s: the ask's result must be in by then, and on
+// a loaded sami-devbox it was not by a 2 s one. Each row has a rig of its
+// own, so the rows run in parallel.
 func TestAnAskTurnAsksOnceTheHolderIsKnown(t *testing.T) {
 	t.Parallel()
 	for _, c := range []struct {
@@ -61,7 +64,10 @@ func TestAnAskTurnAsksOnceTheHolderIsKnown(t *testing.T) {
 			r.records.docs["ABC-12/spec"] = "## Summary\n\nBuild a voice for meetings."
 			r.records.docBlock = make(chan struct{})
 			t.Cleanup(func() { close(r.records.docBlock) })
-			r.concierge.fastBound = 2 * time.Second
+			if r.concierge.fastBound != 8*time.Second {
+				t.Fatal("the test did not use the production answer bound")
+			}
+			r.concierge.callBound = 20 * time.Second
 			r.model.turns = [][]*genai.GenerateContentResponse{{chunk(text("PR 80 is in review."))}}
 			var spoken []said
 			start := time.Now()
