@@ -163,7 +163,7 @@ type bridge struct {
 	startedAt   time.Time
 	restored    bool      // Attendee's bots were read; no bot is made before
 	lastRestore time.Time // the last try of the restart's reads
-	answered    bool      // the bridge answered the Pi's hello of this link
+	answered    uint64    // the link-up whose Pi's hello the bridge answered (call.PiLink's Generation); 0: none
 	bot         *liveBot  // the bot of this instance; nil when none
 	others      map[string]*liveBot
 	lastPass    time.Time
@@ -306,9 +306,6 @@ func logID(id string) string {
 // waiting deletions, and the pass every 30 s.
 func (b *bridge) tick(ctx context.Context) {
 	now := b.clock.Now()
-	if b.link == nil || !b.link.Up() {
-		b.answered = false
-	}
 	// A failed restart read waits for the join pass's period: each read of
 	// the calendar is a delegated sign-in.
 	if !b.restored && now.Sub(b.lastRestore) >= joinEvery {
@@ -718,11 +715,14 @@ func (b *bridge) onLink(ctx context.Context, m call.Message) {
 
 // sendHello answers the Pi's hello: the build, the link versions, the pause
 // state and the call (A1). The bridge keeps no pause state before the pause
-// work (T7), so it reports none.
+// work (T7), so it reports none. It answers the link-up the link is on
+// before the send: a link that comes back during the send is a new link-up,
+// whose hello the bridge answers when it takes it.
 func (b *bridge) sendHello() {
 	if b.link == nil {
 		return
 	}
+	gen := b.link.Generation()
 	h := call.Hello{Build: bridgeBuild, LinkVersions: call.Accepted, BotState: b.botState()}
 	if b.bot != nil {
 		ev := callEvent(&b.bot.event)
@@ -732,14 +732,17 @@ func (b *bridge) sendHello() {
 		b.log.Warn("LINK-SEND-FAILED type=hello", "error", errorClass(err))
 		return
 	}
-	b.answered = true
+	b.answered = gen
 }
 
-// linkReady: the link is up, the bridge answered its hello, and both sides
-// share a link version (R15). Only then does the bridge make a bot or send
-// more than its hello.
+// linkReady: the link is up on the link-up whose hello the bridge answered,
+// and both sides share a link version (R15). Only then does the bridge make
+// a bot or send more than its hello. A link that dropped and came back is
+// not ready before the bridge answers the new hello, which may still wait on
+// Recv while a tick runs, so the dropped link's owed controls are not counted
+// received on the new one (confirmSent).
 func (b *bridge) linkReady() bool {
-	if b.link == nil || !b.answered || !b.link.Up() {
+	if b.link == nil || !b.link.Up() || b.link.Generation() != b.answered {
 		return false
 	}
 	_, ok := call.Choose(call.Accepted, b.link.Hello().LinkVersions)

@@ -17,11 +17,14 @@ type Message struct {
 // the Pi's hello on Recv without waiting for the bridge's hello. The bridge
 // answers it with its own hello through Send, before any other message. A
 // link that writes through a SendQueue holds back whatever is sent before
-// that hello until the hello has gone.
+// that hello until the hello has gone. Generation tells the link-ups apart:
+// a link can drop and come back before the bridge takes the new hello, and
+// what the dropped link took may be lost.
 type PiLink interface {
 	Hello() Hello            // the Pi's last hello; the zero Hello (no LinkVersions) before the first
 	Send(c Control) error    // an error while the link is down
 	SendAudio(f Frame) error // an error while the link is down
 	Recv() <-chan Message    // the Pi's messages; after each link-up the first is the Pi's hello
 	Up() bool
+	Generation() uint64 // the link-ups so far: 0 before the first; one more at each link-up, before its hello is on Recv
 }

@@ -257,7 +257,10 @@ func owed(c *call.Control) (string, calendar.Pending, bool) {
 }
 
 // sentOwed is an owed control a link took at, which its event's record owes
-// until the link has stayed up confirmAfter since.
+// until the link has stayed up confirmAfter since, on the link-up that took
+// it. Each one in sent was taken on the link-up whose hello the bridge
+// answered last: each answer first puts them all back with the kept
+// messages (onLink).
 type sentOwed struct {
 	c  call.Control
 	at time.Time
@@ -296,10 +299,11 @@ func (b *bridge) flushKept() {
 	}
 }
 
-// confirmSent counts each owed control received that a link took
-// confirmAfter ago and has kept up since, and takes it off its event's
-// record. While the link is not ready, each goes back to the kept messages,
-// sent again on the next link after the bridge's hello.
+// confirmSent counts each owed control received that the link took
+// confirmAfter ago and has kept up since, on the same link-up, and takes it
+// off its event's record. While the link is not ready, down or up again on a
+// link-up whose hello the bridge has not answered yet (linkReady), each goes
+// back to the kept messages, sent again after the bridge's next hello.
 func (b *bridge) confirmSent(ctx context.Context, now time.Time) {
 	if !b.linkReady() {
 		b.resendSent()

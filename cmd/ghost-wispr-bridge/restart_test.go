@@ -819,3 +819,55 @@ func TestAnOwedBusyIsSentAgainWhenTheLinkDropsRightAfterTakingIt(t *testing.T) {
 		t.Fatalf("B's record once a link kept the busy = %+v, want nothing pending", got)
 	}
 }
+
+// A link that drops and comes back between two ticks can be up before the
+// bridge takes its hello: the hello waits on Recv while the loop runs a tick.
+// The busy the dropped link took is not counted received on that link-up:
+// the bridge sends nothing on a link-up whose hello it has not answered, so
+// the busy stays on B's record, goes again after the bridge's hello, and
+// leaves the record only once the new link kept it. The control takes the
+// hello before the tick. (Sol's second review of #202 at 2e217ba6,
+// TestReviewReconnectBeforeHelloCannotConfirmOldSend.)
+func TestAnOwedBusyIsNotConfirmedOnALinkUpWhoseHelloWaits(t *testing.T) {
+	for _, tickFirst := range []bool{true, false} {
+		name := "a tick before the new link's hello"
+		if !tickFirst {
+			name = "the new link's hello before a tick (control)"
+		}
+		t.Run(name, func(t *testing.T) {
+			ev := botCalEvent("evB", botT0.Add(-time.Minute), botT0.Add(time.Minute))
+			ev.Done, ev.Pending = true, calendar.Pending{Busy: true}
+			h := newBotHarness(t, ev)
+			h.start()
+			hello := botPiHello(botTexts())
+			h.linkUp(hello)
+			if n := len(h.link.sentOf(call.TypeBusy)); n != 1 {
+				t.Fatalf("busy sent %d times at the first link-up, want once", n)
+			}
+			h.advance(time.Second)
+			h.linkDown()
+			m := h.link.set(true, hello) // the new link is up; its hello waits on Recv
+			if tickFirst {
+				h.advance(time.Second) // confirmAfter since the dropped link took the busy
+				if got := h.cal.event("evB").Pending; !got.Busy {
+					t.Errorf("B's record after a tick before the new link's hello = %+v, want the busy still owed", got)
+				}
+			}
+			h.b.onLink(h.ctx, *m)
+			h.settle()
+			if n := len(h.link.sentOf(call.TypeBusy)); n != 2 {
+				t.Fatalf("busy sent %d times after the new link's hello, want twice: the dropped link may have lost it; B's record %+v", n, h.cal.event("evB").Pending)
+			}
+			if got := h.cal.event("evB").Pending; !got.Busy {
+				t.Fatalf("B's record right after the busy went again = %+v, want the busy still owed", got)
+			}
+			h.advance(confirmAfter + tickEvery)
+			if got := h.cal.event("evB").Pending; got != (calendar.Pending{}) {
+				t.Fatalf("B's record once the new link kept the busy = %+v, want nothing pending", got)
+			}
+			if n := len(h.link.sentOf(call.TypeBusy)); n != 2 {
+				t.Fatalf("busy sent %d times on a link that stayed up, want no more", n)
+			}
+		})
+	}
+}

@@ -484,10 +484,12 @@ func (c *fakeCalendar) callsOf(op string) []botCall {
 }
 
 // fakeLink is the bridge's link to the Pi: up or down, the Pi's last hello,
-// and every control message the bridge sent while it was up.
+// its link-ups so far, and every control message the bridge sent while it
+// was up.
 type fakeLink struct {
 	mu    sync.Mutex
 	up    bool
+	gen   uint64
 	hello call.Hello
 	sent  []call.Control
 	recv  chan call.Message
@@ -529,8 +531,14 @@ func (l *fakeLink) Up() bool {
 	return l.up
 }
 
-// set puts the link up or down with the Pi's hello, and gives the hello as
-// the link's next message when the link comes up.
+func (l *fakeLink) Generation() uint64 {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.gen
+}
+
+// set puts the link up or down with the Pi's hello. Up, it is a link-up,
+// and gives the hello as the link's next message.
 func (l *fakeLink) set(up bool, hello *call.Hello) *call.Message {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -539,6 +547,7 @@ func (l *fakeLink) set(up bool, hello *call.Hello) *call.Message {
 	if !up {
 		return nil
 	}
+	l.gen++
 	h := *hello
 	return &call.Message{Control: &call.Control{Type: call.TypeHello, Hello: &h}}
 }

@@ -72,6 +72,10 @@ func newFakePi(ctx context.Context, clk clock, log *slog.Logger) *fakePi {
 
 func (p *fakePi) Hello() call.Hello { return p.hello }
 
+// Generation is 1: the fake Pi links once, at its start, and a link it takes
+// down stays down.
+func (p *fakePi) Generation() uint64 { return 1 }
+
 // Send takes the bridge's control messages and drops them. A bridge hello
 // that names no version the fake Pi accepts takes the link down, as the
 // Pi's close with link_version does.
