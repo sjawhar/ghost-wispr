@@ -156,8 +156,8 @@ func TestBridgeModeWithABadSettingExits2(t *testing.T) {
 		t.Fatalf("the line is not JSON: %s", lines[0])
 	}
 	want := "SETTINGS-REFUSED BRIDGE_ATTENDEE_API_KEY=unset BRIDGE_WEBHOOK_PORT=malformed"
-	if line[componentKey] != "bridge" || line["severity"] != "ERROR" || line["message"] != want {
-		t.Fatalf("the line = %s, want an ERROR line of the bridge %q", lines[0], want)
+	if line["severity"] != "ERROR" || line["message"] != want || loglineMark(line, "bridge") != nil {
+		t.Fatalf("the line = %s, want a marked ERROR line of the bridge %q (%v)", lines[0], want, loglineMark(line, "bridge"))
 	}
 	if strings.Contains(stdout.String(), sentinel) {
 		t.Fatalf("the line holds the refused value: %s", lines[0])
@@ -202,8 +202,8 @@ func TestAServerFailureIsOneMarkedLine(t *testing.T) {
 	if len(lines) != 1 || json.Unmarshal([]byte(lines[0]), &line) != nil {
 		t.Fatalf("log = %q, want one JSON line", logs.String())
 	}
-	if line[componentKey] != "bridge" || line["message"] != "SERVER-ERROR server=audio_socket kind=tls_handshake" {
-		t.Fatalf("the line = %s, want the bridge's SERVER-ERROR of the audio socket's TLS handshake", lines[0])
+	if line["message"] != "SERVER-ERROR server=audio_socket kind=tls_handshake" || loglineMark(line, "bridge") != nil {
+		t.Fatalf("the line = %s, want the bridge's marked SERVER-ERROR of the audio socket's TLS handshake (%v)", lines[0], loglineMark(line, "bridge"))
 	}
 	for _, word := range []string{"127.0.0.1", "tls:", "handshake error"} {
 		if strings.Contains(lines[0], word) {
@@ -320,6 +320,12 @@ func TestEachServerWritesOnlyMarkedLines(t *testing.T) {
 	lines := strings.Split(strings.TrimSpace(logs.String()), "\n")
 	if last := lines[len(lines)-1]; !strings.Contains(last, `"message":"SERVER-ERROR server=health kind=tls_handshake"`) || strings.Contains(last, "192.0.2.7") {
 		t.Fatalf("the health server's line = %s, want its marked TLS handshake line with no address", last)
+	}
+	for _, raw := range lines {
+		var line map[string]any
+		if err := json.Unmarshal([]byte(raw), &line); err != nil || loglineMark(line, "bridge") != nil {
+			t.Fatalf("a server's line is not the bridge's marked line: %s (%v)", raw, loglineMark(line, "bridge"))
+		}
 	}
 }
 

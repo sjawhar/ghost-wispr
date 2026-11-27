@@ -3,14 +3,31 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"log/slog"
 	"strings"
 	"testing"
 )
 
+// loglineMark checks that a parsed log line carries its mark as Cloud
+// Logging's user labels, the object under "logging.googleapis.com/labels"
+// that Cloud Run's logging agent moves into LogEntry.labels, for component,
+// and not as the top-level field a log view's filter cannot read.
+func loglineMark(line map[string]any, component string) error {
+	labels, _ := line["logging.googleapis.com/labels"].(map[string]any)
+	if len(labels) != 2 || labels["ghost_wispr_marked"] != "true" || labels["ghost_wispr_component"] != component {
+		return fmt.Errorf("labels %v, want ghost_wispr_marked=true and ghost_wispr_component=%s alone", line["logging.googleapis.com/labels"], component)
+	}
+	if _, ok := line["ghost_wispr_component"]; ok {
+		return errors.New("the line keeps the top-level ghost_wispr_component")
+	}
+	return nil
+}
+
 // The watcher's alert counts WATCHER-PASS at severity NOTICE, so a NOTICE
 // line must read NOTICE, not slog's "INFO+2", and every line must carry its
-// component for the log exclusion to keep it.
+// mark as labels for the log exclusion and a log view to keep it.
 func TestTheLogLineMapsNoticeToItsSeverity(t *testing.T) {
 	var buf bytes.Buffer
 	log := newLogger(&buf, "watcher", slog.LevelDebug)
@@ -45,8 +62,8 @@ func TestTheLogLineMapsNoticeToItsSeverity(t *testing.T) {
 		if got["message"] != want[i].message {
 			t.Errorf("line %d: message %v, want %s", i, got["message"], want[i].message)
 		}
-		if got["ghost_wispr_component"] != "watcher" {
-			t.Errorf("line %d: ghost_wispr_component %v, want watcher", i, got["ghost_wispr_component"])
+		if err := loglineMark(got, "watcher"); err != nil {
+			t.Errorf("line %d: %v", i, err)
 		}
 		if got["n"] != want[i].n {
 			t.Errorf("line %d: attribute n %v, want %v", i, got["n"], want[i].n)

@@ -194,8 +194,8 @@ func TestTheBridgeLogsOnlyMarkedLines(t *testing.T) {
 		if err := json.Unmarshal([]byte(line), &m); err != nil {
 			t.Fatalf("a line is not one JSON object: %s", line)
 		}
-		if m[componentKey] != "bridge" {
-			t.Errorf("a line has no %s=bridge: %s", componentKey, line)
+		if err := loglineMark(m, "bridge"); err != nil {
+			t.Errorf("a line is not the bridge's marked line: %v: %s", err, line)
 		}
 		for _, word := range []string{sentinel, botMeetURL, botTexts().Consent, "organizer@example.com"} {
 			if strings.Contains(line, word) {

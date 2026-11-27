@@ -124,10 +124,17 @@ func (b *watchLogBuffer) Write(p []byte) (int, error) {
 
 // watchLine is one log line's fields the tests read.
 type watchLine struct {
-	Severity  string `json:"severity"`
-	Message   string `json:"message"`
-	Component string `json:"ghost_wispr_component"`
+	Severity  string            `json:"severity"`
+	Message   string            `json:"message"`
+	Labels    map[string]string `json:"logging.googleapis.com/labels"`
+	Unlabeled string            `json:"ghost_wispr_component"` // the old top-level mark, which no line may hold
 	raw       string
+}
+
+// marked reports whether the line carries component's mark as its labels
+// alone (loglineMark).
+func (l *watchLine) marked(component string) bool {
+	return len(l.Labels) == 2 && l.Labels["ghost_wispr_marked"] == "true" && l.Labels["ghost_wispr_component"] == component && l.Unlabeled == ""
 }
 
 func (b *watchLogBuffer) lines(t *testing.T) []watchLine {
@@ -492,8 +499,8 @@ func TestOnlyWatcherPassIsNotice(t *testing.T) {
 	for _, l := range r.logs.lines(t) {
 		kind, _, _ := strings.Cut(l.Message, " ")
 		seen[kind]++
-		if l.Component != "watcher" {
-			t.Errorf("a line without the watcher's component: %s", l.raw)
+		if !l.marked("watcher") {
+			t.Errorf("a line without the watcher's mark as its labels: %s", l.raw)
 		}
 		if (kind == "WATCHER-PASS") != (l.Severity == "NOTICE") {
 			t.Errorf("%s at severity %s: only WATCHER-PASS is NOTICE: %s", kind, l.Severity, l.raw)
@@ -613,7 +620,7 @@ func TestTheWatchModeRefusesAMissingSetting(t *testing.T) {
 				t.Errorf("stderr %q, want nothing: the watch mode writes only marked lines, on stdout", stderr.String())
 			}
 			lines := stdout.lines(t)
-			if len(lines) != 1 || lines[0].Message != tc.want || lines[0].Severity != "ERROR" || lines[0].Component != "watcher" {
+			if len(lines) != 1 || lines[0].Message != tc.want || lines[0].Severity != "ERROR" || !lines[0].marked("watcher") {
 				t.Errorf("stdout lines %+v, want one ERROR line of the watcher: %q", lines, tc.want)
 			}
 			if strings.Contains(stdout.buf.String()+stderr.String(), watchSentinel) {
