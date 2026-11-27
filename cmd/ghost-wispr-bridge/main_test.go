@@ -185,7 +185,12 @@ func TestAServerFailureIsOneMarkedLine(t *testing.T) {
 	done := make(chan error, 1)
 	sock := newAudioSocket([]byte(audiosocketKey), make(chan audioIn), time.Now)
 	go func() { done <- serveAudioSocket(ctx, ln, cert, sock, newLogger(logs, "bridge", slog.LevelDebug)) }()
-	defer func() { cancel(); <-done }()
+	defer func() {
+		cancel()
+		if err := <-done; err != nil {
+			t.Errorf("serveAudioSocket: %v", err)
+		}
+	}()
 
 	conn, err := tls.Dial("tcp", ln.Addr().String(), &tls.Config{ServerName: "localhost", RootCAs: x509.NewCertPool(), MinVersion: tls.VersionTLS12})
 	if err == nil {

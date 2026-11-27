@@ -44,6 +44,9 @@ func newFakeTransport(t *testing.T) (pi, bridge *fakeEnd) {
 	return pi, bridge
 }
 
+// errFakeClosed is what a write on a closed fake link returns.
+var errFakeClosed = errors.New("fake transport: closed")
+
 // close closes the link, so a write blocked on it returns an error.
 func (e *fakeEnd) close() {
 	e.link.once.Do(func() { close(e.link.done) })
@@ -56,7 +59,7 @@ func (e *fakeEnd) WriteMessage(kind int, data []byte) error {
 	case e.out <- fakeMessage{kind: kind, data: bytes.Clone(data)}:
 		return nil
 	case <-e.link.done:
-		return errors.New("fake transport: closed")
+		return errFakeClosed
 	}
 }
 
