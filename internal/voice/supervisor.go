@@ -1304,6 +1304,18 @@ func (s *Supervisor) onTranscriptLocked(t *Transcript) {
 		// numbers (the office, 2026-11-27, dispatch://INFRA-4592): the
 		// exchange waits TurnWait for them, the wait it gives any asker after
 		// a wake for a first word, and ends as misheard only if none asks.
+		if t.IsFinal && ex.interim != "" {
+			// The final replaces the interim it was heard from ("Wispr,
+			// send these notes" became "Whisper networks are a problem."):
+			// those words were never said, so they are no turn's, and no
+			// endpoint or timer may hand them over (Sol's twenty-fifth
+			// review of #191).
+			ex.interim = ""
+			if ex.handedTurn != ex.x.Turn+1 {
+				ex.x.AskerTurn, ex.x.Finals = s.turnOf(ex), finalsOf(ex)
+			}
+			s.roomChangedLocked(ex)
+		}
 		if t.IsFinal && !ex.misheardHold {
 			ex.misheardHold = true
 			ex.holdGen++
@@ -2183,8 +2195,8 @@ func (s *Supervisor) turnWaited(ex *exchange) {
 	ranOut := monoclock.Now()
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.ex != ex || ex.answering || ex.drives || s.offLocked() {
-		return
+	if s.ex != ex || ex.answering || ex.drives || ex.misheardHold || s.offLocked() {
+		return // a hold's own expiry, not the turn's wait, ends a held exchange
 	}
 	if s.turnOf(ex) == "" {
 		reason := "no question after the wake phrase"
@@ -2277,7 +2289,12 @@ func (s *Supervisor) asks(turn string) bool {
 
 // handTurnLocked hands the asker's turn to the Concierge, on signal.
 func (s *Supervisor) handTurnLocked(ex *exchange, signal turnSignal) {
-	if ex.answering || ex.drives || s.offLocked() {
+	// A misheard-name hold hands nothing over: only a call or a final that
+	// asks ends it (endHoldLocked), and then that turn is handed as any
+	// other. An endpoint, or a turn timer already queued, during the hold
+	// would hand words the hold was set because nobody addressed Wispr
+	// with (Sol's twenty-fifth review of #191).
+	if ex.answering || ex.drives || ex.misheardHold || s.offLocked() {
 		return
 	}
 	if ex.timer != nil {
