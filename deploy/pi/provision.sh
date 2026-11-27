@@ -104,17 +104,17 @@ refuse_busy() {
 # unit's name from the next start (Sol's review of #203, round 6), and says so. A run with --collect
 # leaves none; a unit kept by hand, or by an older provision.sh, can. Before the reset, which leaves
 # the unit's state to no one, it prints why the unit failed: its ActiveState, Result and
-# ExecMainStatus, and the last 20 lines of its journal (Sol's review of #203, round 7).
+# ExecMainStatus (Sol's review of #203, round 7), and the command that shows its journal, which the
+# reset leaves. Never the journal's lines: a join's hold tailscale up's, its login URL among them,
+# and a run's output can be captured or shared (GPT-6.1 Sol's review of #208).
 reset_failed_units() {
   local unit show
   for unit in "$PI_LIB_PROVISION_UNIT" "$PI_LIB_PROVISION_JOIN_UNIT"; do
     if [[ $(systemctl show -p ActiveState --value "$unit.service" 2>/dev/null) == failed ]]; then
       show=$(systemctl show -p ActiveState -p Result -p ExecMainStatus "$unit.service" 2>/dev/null) || show=
-      printf 'ghost-wispr provision: %s.service failed: ActiveState=%s, Result=%s, ExecMainStatus=%s; the last 20 lines of its journal:\n' \
+      printf 'ghost-wispr provision: %s.service failed: ActiveState=%s, Result=%s, ExecMainStatus=%s; its journal, which a reset leaves, shows why: sudo journalctl -u %s.service -n 20\n' \
         "$unit" "$(sed -n 's/^ActiveState=//p' <<<"$show")" "$(sed -n 's/^Result=//p' <<<"$show")" \
-        "$(sed -n 's/^ExecMainStatus=//p' <<<"$show")"
-      sudo journalctl -u "$unit.service" -n 20 --no-pager --output=short-iso \
-        || printf 'ghost-wispr provision: could not read the journal of %s.service\n' "$unit"
+        "$(sed -n 's/^ExecMainStatus=//p' <<<"$show")" "$unit"
       sudo systemctl reset-failed "$unit.service" || fail "could not reset the failed unit $unit.service: nothing was changed"
       printf 'ghost-wispr provision: reset the failed unit %s.service, which a run that failed left\n' "$unit"
     fi
@@ -828,10 +828,11 @@ if [[ ${GHOST_WISPR_PROVISION_IN_UNIT:-} != 1 || -z ${INVOCATION_ID:-} ]]; then
 fi
 provision_stop_traps
 # The run's start, which start_provision_unit reads to tell a run that failed from one that never
-# started. Only while the caller's marker is there: a caller that a signal ended removed it, and the
-# run makes no file in its place.
-if [[ -n ${GHOST_WISPR_PROVISION_STARTED:-} && -f $GHOST_WISPR_PROVISION_STARTED ]]; then
-  printf 'started\n' >"$GHOST_WISPR_PROVISION_STARTED"
+# started. dd's conv=nocreat opens the caller's marker without O_CREAT, so the run makes no file in
+# place of a marker that a caller removed when a signal ended it, and no check comes before the
+# write for a removal to fall after (GPT-6.1 Sol's review of #208). Bash's > and <> create a file.
+if [[ -n ${GHOST_WISPR_PROVISION_STARTED:-} ]]; then
+  printf 'started\n' | dd of="$GHOST_WISPR_PROVISION_STARTED" conv=nocreat,notrunc status=none 2>/dev/null || true
 fi
 # The join again, now that this run holds the run's name: a join can have become active after the
 # check before the start (GPT-6.1 Sol's review of #203, round 6). Before any mode changes a file.

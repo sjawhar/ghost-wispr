@@ -274,9 +274,11 @@ restarts the recorder, and a restart ends a conversation that is being recorded.
    check is a snapshot: a `ghost-wispr-provision-join` that someone starts by hand with systemd,
    outside `provision.sh`, after it runs beside the run, so start the join only through
    `provision.sh`. A unit of either name that systemd keeps failed would take the name, so a run
-   first prints why it failed, its `ActiveState`, `Result` and `ExecMainStatus` and the last 20
-   lines of its journal, then resets it with `systemctl reset-failed` and says so. To end a run,
-   and its join, run
+   first prints why it failed, its `ActiveState`, `Result` and `ExecMainStatus`, and the command
+   that shows its journal, `sudo journalctl -u <unit>.service -n 20`, but not the journal's lines:
+   the join's hold the lines of `tailscale up`, its login URL among them. Then it resets the unit
+   with `systemctl reset-failed`, which leaves its journal, and says so. To end a run, and its
+   join, run
    `sudo systemctl stop ghost-wispr-provision ghost-wispr-provision-join`, which ends every
    process in the run's unit, its control group, and makes the run fail (exit 143); a root process
    that moves itself to another unit leaves that boundary. An SSH session that ends does not
