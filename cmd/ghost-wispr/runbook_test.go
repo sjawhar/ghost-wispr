@@ -155,19 +155,27 @@ func TestRunbookAppliesAProvisioningChangeFromTheReleaseThatCarriesIt(t *testing
 // say that provision.sh makes Serve exactly serve.conf for the device's tailnet
 // name: it leaves a Serve that is that already, and otherwise clears Serve
 // with tailscale serve reset, which also removes the entry of a name the
-// device had before a rename, with what that costs, before it applies each
-// line; that the join resets Serve too; and that it stops before the join when
-// Serve is not serve.conf's then. It also fails if the section still says
-// that provision.sh turns parts off one by one, which reaches no other name.
+// device had before a rename, before it applies each line; that the reset and
+// the apply run in a unit of their own, which a kill of provision.sh or a lost
+// SSH session does not stop, and which applies serve.conf again when a call
+// fails; that the unit reads the recorder's status immediately before the
+// reset and refuses, changing nothing, while the recorder is busy; that the
+// join runs the same apply; that a Serve left empty is put back only by
+// another run of provision.sh, as check 7 says; and that it stops before the
+// join when Serve is not serve.conf's then. It also fails if the section still
+// says that provision.sh turns parts off one by one, which reaches no other
+// name, or that the page is lost for a moment only.
 func TestRunbookProvisionGivesServeExactlyServeConf(t *testing.T) {
 	section := runbookSection(t, "## Provision")
-	for _, words := range []string{"`tailscale serve reset`", "a name the device had before a rename", "the page is not served", "before the join", "`tailscale serve reset` and each `tailscale serve` call"} {
+	for _, words := range []string{"`tailscale serve reset`", "a name the device had before a rename", "a systemd unit of its own", "a lost SSH session", "applies `serve.conf` again", "immediately before the reset", "a call whose `state` is not `none`", "nothing in Serve was changed", "The join runs the same apply", "only another run of `./provision.sh` puts it back", "check 7", "before the join"} {
 		if !strings.Contains(section, words) {
 			t.Errorf("the runbook's \"Provision\" does not say %q", words)
 		}
 	}
-	if strings.Contains(section, "each mount other than `/`") {
-		t.Error(`the runbook's "Provision" still says provision.sh turns off each mount other than / one by one`)
+	for _, stale := range []string{"each mount other than `/`", "a moment that a page open in a browser shows"} {
+		if strings.Contains(section, stale) {
+			t.Errorf("the runbook's \"Provision\" still says %q", stale)
+		}
 	}
 }
 

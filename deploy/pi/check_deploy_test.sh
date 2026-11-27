@@ -904,6 +904,15 @@ jq -c '.Web[].Handlers["/"].Proxy = "http://127.0.0.1:9090"' <<<"$good_serve" >"
 run_driver
 expect_verdicts PASS PASS PASS PASS PASS PASS FAIL
 expect 7 FAIL Serve 'http://127.0.0.1:9090' 'http://127.0.0.1:8080'
+# An empty Serve, as a Serve apply cut short after its reset leaves it (GPT-6.1 Sol's review of #203):
+# the page is not served, and the nightly update never changes Serve (spec R16), so check 7 fails
+# and names the one command that applies serve.conf again. Break it catches: a check 7 whose line
+# does not say how to put Serve back.
+new_case 'an empty Serve'
+printf '{}\n' >"$state/serve.json"
+run_driver
+expect_verdicts PASS PASS PASS PASS PASS PASS FAIL
+expect 7 FAIL 'have none' 'Serve is empty, so the Pi serves no page' "run the release's ./provision.sh on the Pi"
 # Check 7 cannot read its input: a Serve status that is not the JSON it reads, tailscaled not
 # answering, or a bootstrap file it cannot read. Break it catches: a driver that reads an unreadable
 # answer as no Serve config, or as a match.
