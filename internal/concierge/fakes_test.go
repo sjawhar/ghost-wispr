@@ -39,8 +39,16 @@ type fakeRecords struct {
 	docs        map[string]string
 	err         error
 	queries     []string
-	issueCalls  []string
-	limits      []int
+	// sent counts the full searches made while their context was live:
+	// those a real Dispatch client sends. queries records every search,
+	// cancelled ones too, as tests that count the searches an answer starts
+	// need. searchBoth starts the full search beside the keyword one and
+	// cancels it when the keywords answer at once; under load its goroutine
+	// can run only after the answer returned, so a count of queries taken
+	// around the next answer can catch it (sentSearches).
+	sent       int
+	issueCalls []string
+	limits     []int
 	// block, when set, holds each Issue call (of blockKey only, when that is
 	// set) until it is closed or the call's context ends.
 	block    chan struct{}
@@ -97,6 +105,9 @@ func (f *fakeRecords) Projects(ctx context.Context) ([]string, error) {
 func (f *fakeRecords) Search(ctx context.Context, query string, _ int) ([]dispatch.SearchHit, error) {
 	f.mu.Lock()
 	f.queries = append(f.queries, query)
+	if ctx.Err() == nil {
+		f.sent++
+	}
 	delay, hits, err := f.searchDelay, f.hits, f.err
 	if f.searchErr != nil {
 		err = f.searchErr
@@ -162,6 +173,14 @@ func (f *fakeRecords) searches() []string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return append([]string(nil), f.queries...)
+}
+
+// sentSearches is how many full searches were made while their context was
+// live (sent).
+func (f *fakeRecords) sentSearches() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.sent
 }
 
 // calls is a copy of the keys Issue was called with.

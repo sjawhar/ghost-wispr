@@ -568,10 +568,13 @@ func TestAQuestionTheModelAsksIsAnsweredLikeWisprsOwn(t *testing.T) {
 			if spoken := answerTurn(t, r, asked); len(spoken) == 0 || !strings.HasSuffix(spoken[len(spoken)-1].text, "?") {
 				t.Fatalf("spoken %+v, want the model's question last", spoken)
 			}
-			searchedBefore := len(r.records.searches())
+			// Sent searches only: the first answer's full search, cancelled
+			// when its keywords answered at once, can be made only now, under
+			// load, and is no search of the reply's (sentSearches).
+			searchedBefore := r.records.sentSearches()
 			var spoken []said
 			err := r.concierge.Answer(context.Background(), &r.exchange, tc.reply, recorder(&spoken))
-			searched := len(r.records.searches()) - searchedBefore
+			searched := r.records.sentSearches() - searchedBefore
 			switch tc.want {
 			case "side talk":
 				if !errors.Is(err, voice.ErrSideTalk) || len(spoken) != 0 || searched != 0 {
