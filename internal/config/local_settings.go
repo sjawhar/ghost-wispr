@@ -1,15 +1,19 @@
 package config
 
 import (
+	"errors"
 	"fmt"
+	"io/fs"
 	"maps"
 	"math"
 	"os"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"slices"
 	"strings"
 	"sync"
+	"syscall"
 
 	"gopkg.in/yaml.v3"
 )
@@ -43,19 +47,155 @@ func readSettingsFile(path string) (data []byte, found bool, err error) {
 // releaseData, and returns both merged configs and the settings it took from
 // the file, local. With no file, local is nil. When the file cannot be read
 // or parsed, or a value of it does not fit its setting, it returns baseData
-// and releaseData, no settings, and why it did not apply the file.
+// and releaseData, no settings, and why it did not apply the file, as a
+// localSettingsError.
 func applyLocalSettings(localPath string, baseData, releaseData []byte) (data, fileData []byte, local map[string]any, err error) {
 	localData, found, err := readSettingsFile(localPath)
-	if err == nil && !found {
+	if err != nil {
+		return baseData, releaseData, nil, describeReadError(err)
+	}
+	if !found {
 		return baseData, releaseData, nil, nil
 	}
-	if err == nil {
-		data, fileData, local, err = mergeLocalSettings(localData, baseData, releaseData)
-	}
-	if err != nil {
-		return baseData, releaseData, nil, err
+	if data, fileData, local, err = mergeLocalSettings(localData, baseData, releaseData); err != nil {
+		return baseData, releaseData, nil, describeLocalSettingsError(err, localData)
 	}
 	return data, fileData, local, nil
+}
+
+// localSettingsError is why the local settings file was not applied, or could
+// not be read for a save, as a fixed description: the kind of fault and its
+// line, never a value or a key of the file. GET /api/config serves it to any
+// client that reaches the recorder, /api/status serves the warning that holds
+// it, and a refused save returns it, while a YAML error quotes the value, key
+// or anchor it failed on, a provider's auth included (GPT-6.1 Sol's review of
+// PR #201, round 2).
+type localSettingsError struct{ description string }
+
+func (e *localSettingsError) Error() string { return e.description }
+
+// nullDescription is why checkNulls refuses a null.
+const nullDescription = "a null deletes only an entry of providers, summarization.presets or a provider's labels"
+
+// nullSettingError is a null that checkNulls refused, at path, the file's own
+// keys; its text holds none of them.
+type nullSettingError struct{ path []string }
+
+func (e *nullSettingError) Error() string { return nullDescription }
+
+var (
+	// yamlSyntaxLine is the line of a yaml.v3 parse error, "yaml: line N: ...".
+	// The fault is near it, not always on it: a parser error names the line
+	// of the collection the fault is in.
+	yamlSyntaxLine = regexp.MustCompile(`^yaml: line ([0-9]+): `)
+	// yamlEntryLine is the line of an entry of a yaml.TypeError, "line N: ...".
+	yamlEntryLine = regexp.MustCompile(`^line ([0-9]+): `)
+)
+
+// describeReadError is a read of the local settings file that failed, as a
+// localSettingsError.
+func describeReadError(err error) error {
+	switch {
+	case errors.Is(err, fs.ErrPermission):
+		return &localSettingsError{"cannot be read: permission denied"}
+	case errors.Is(err, syscall.EISDIR):
+		return &localSettingsError{"cannot be read: it is a directory"}
+	}
+	return &localSettingsError{"cannot be read"}
+}
+
+// describeLocalSettingsError is err, from decoding or merging the local
+// settings file data, as a localSettingsError. It reads only the line numbers
+// of yaml.v3's messages, and the line of the key at a refused null from data.
+func describeLocalSettingsError(err error, data []byte) error {
+	var null *nullSettingError
+	if errors.As(err, &null) {
+		if line := settingLine(data, null.path); line > 0 {
+			return &localSettingsError{fmt.Sprintf("a null at line %d that deletes no entry: %s", line, nullDescription)}
+		}
+		return &localSettingsError{"a null that deletes no entry: " + nullDescription}
+	}
+	var typeErr *yaml.TypeError
+	if errors.As(err, &typeErr) {
+		return &localSettingsError{describeTypeError(typeErr)}
+	}
+	if m := yamlSyntaxLine.FindStringSubmatch(err.Error()); m != nil {
+		return &localSettingsError{"not valid YAML near line " + m[1]}
+	}
+	return &localSettingsError{"not valid YAML"}
+}
+
+// describeTypeError gives each kind of fault in typeErr with its lines. An
+// entry is "line N: cannot unmarshal <value> into <type>", "line N: mapping
+// key <key> already defined at line M" or, for a struct field, "line N: field
+// <name> already set in type <type>"; the part after its line is never read
+// into the description.
+func describeTypeError(typeErr *yaml.TypeError) string {
+	var kinds []string
+	lines := make(map[string][]string)
+	for _, entry := range typeErr.Errors {
+		kind, line := "a setting that cannot be read", ""
+		if m := yamlEntryLine.FindStringSubmatch(entry); m != nil {
+			line = m[1]
+			switch rest := entry[len(m[0]):]; {
+			case strings.HasPrefix(rest, "cannot unmarshal "):
+				kind = "a value that does not fit its setting"
+			case strings.HasPrefix(rest, "mapping key "), strings.HasPrefix(rest, "field "):
+				kind = "a key given twice"
+			}
+		}
+		if _, seen := lines[kind]; !seen {
+			kinds = append(kinds, kind)
+			lines[kind] = nil
+		}
+		if line != "" && !slices.Contains(lines[kind], line) {
+			lines[kind] = append(lines[kind], line)
+		}
+	}
+	parts := make([]string, 0, len(kinds))
+	for _, kind := range kinds {
+		switch at := lines[kind]; len(at) {
+		case 0:
+			parts = append(parts, kind)
+		case 1:
+			parts = append(parts, kind+" at line "+at[0])
+		default:
+			parts = append(parts, kind+" at lines "+strings.Join(at, ", "))
+		}
+	}
+	if len(parts) == 0 {
+		return "not valid YAML"
+	}
+	return strings.Join(parts, "; ")
+}
+
+// settingLine is the line of the key at path, by the keys of a config file,
+// in the YAML document data, or 0 when it has none.
+func settingLine(data []byte, path []string) int {
+	var doc yaml.Node
+	if yaml.Unmarshal(data, &doc) != nil || len(doc.Content) == 0 {
+		return 0
+	}
+	node, line := doc.Content[0], 0
+	for _, key := range path {
+		if node.Kind == yaml.AliasNode {
+			node = node.Alias
+		}
+		if node == nil || node.Kind != yaml.MappingNode {
+			return 0
+		}
+		var value *yaml.Node
+		for i := 0; i+1 < len(node.Content); i += 2 {
+			if node.Content[i].Value == key {
+				value, line = node.Content[i+1], node.Content[i].Line
+			}
+		}
+		if value == nil {
+			return 0
+		}
+		node = value
+	}
+	return line
 }
 
 // mergeLocalSettings merges the local settings file's YAML over baseData, for
@@ -106,7 +246,9 @@ type AppliedLocalSettings struct {
 	// applied no local settings file: there is none, or the start did not
 	// apply it (Err).
 	Settings map[string]any
-	// Err is why the start did not apply the local settings file, or nil.
+	// Err is why the start did not apply the local settings file, or nil: a
+	// fixed description of the kind of fault and its line, which holds no
+	// value or key of the file.
 	Err error
 }
 
@@ -310,7 +452,7 @@ func checkNulls(path []string, settings map[string]any) error {
 		switch value := settings[key].(type) {
 		case nil:
 			if !isMapSetting(path) {
-				return fmt.Errorf("%s: null deletes only an entry of providers, summarization.presets or a provider's labels", strings.Join(child, "."))
+				return &nullSettingError{path: child}
 			}
 		case map[string]any:
 			if err := checkNulls(child, value); err != nil {
@@ -432,7 +574,7 @@ func (s *Store) writeLocalSettings(prev *Config, local localSettingsFile) (map[s
 	saved := make(map[string]any)
 	if local.found {
 		if saved, err = yamlSettings(local.data); err != nil {
-			return nil, fmt.Errorf("read %s: %w", local.path, err)
+			return nil, fmt.Errorf("read %s: %w", local.path, describeLocalSettingsError(err, local.data))
 		}
 	}
 	applyChanges(nil, saved, changes, s.releaseSettings)

@@ -86,7 +86,7 @@ var configSchema = map[string]any{
 			"description": "GET only: the store's report of the local settings file, ghost-wispr.local.yaml beside the release config. " +
 				"An object of the settings the running configuration took from that file, by their keys in a config file: those the start applied, as each settings save has changed them since. " +
 				"A null in it is an entry of a map setting that the file deletes, such as a provider. It holds only the keys the configuration reads: a key of the file that no setting reads is left out. Each provider's auth is left out. " +
-				`When the start did not apply the file (it does not parse, or a value does not fit its setting), {"applied": false, "error": "<why>"}: the release config applies alone, and each PATCH is refused. ` +
+				`When the start did not apply the file (it does not parse, or a value does not fit its setting), {"applied": false, "error": "<why>"}, where why is the kind of fault and its line, never a value or a key of the file, such as "a value that does not fit its setting at line 4" or "not valid YAML near line 2": the release config applies alone, and each PATCH is refused. ` +
 				"null when there is no local settings file. deploy/pi/check-deploy.sh takes the local settings from this report, not from the file. A PATCH cannot set it.",
 		},
 		"revision": map[string]any{

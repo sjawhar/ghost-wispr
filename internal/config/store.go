@@ -175,7 +175,7 @@ func (s *Store) TryUpdate(fn func(*Config) error) error {
 		if previousLocal, err = readLocalSettingsFile(s.path); err != nil {
 			s.cfg = prev
 			s.mu.Unlock()
-			return fmt.Errorf("read local settings: %w", err)
+			return fmt.Errorf("read %s: %w", LocalSettingsPath(s.path), describeReadError(err))
 		}
 		if localChanges, err = s.writeLocalSettings(&prev, previousLocal); err != nil {
 			s.cfg = prev
