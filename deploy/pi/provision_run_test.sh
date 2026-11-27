@@ -1836,32 +1836,47 @@ grep -Fq "another provisioning run is going on: ghost-wispr-provision.service is
 kill "$other_main"
 wait "$other_main" 2>/dev/null || true
 rm -f -- "$system_units/ghost-wispr-provision.service"
-# A failed unit that systemd keeps takes the run's name (Sol's round 6): the run prints why it
-# failed, its ActiveState, Result and ExecMainStatus and the last 20 lines of its journal, which the
-# reset would leave a person no way to see but the journal (Sol's round 7), then resets it, says so,
-# and goes on. Breaks they catch: a run that leaves a kept failed unit, whose start then fails; and
-# one that resets it with no word of why it failed.
+# A failed unit that systemd keeps takes its name (Sol's round 6): the run prints why it failed,
+# its ActiveState, Result and ExecMainStatus, and the command that shows its journal, but never the
+# journal's lines (Sol's review of #208): a join's journal holds tailscale up's lines, its login URL
+# among them, and a run's output can be captured or shared. Then it resets the unit, says so, and
+# goes on. Breaks they catch: a run that leaves a kept failed unit, whose start then fails; one that
+# resets it with no word of why it failed; and one that prints the journal's lines.
 new_pi
 printf 'ActiveState=failed\nActiveEnterTimestamp=Thu 2026-11-27 14:02:00 UTC\nMainPID=0\nResult=exit-code\nExecMainStatus=42\n' \
   >"$system_units/ghost-wispr-provision.service"
-for line in {1..25}; do
-  printf 'journal line %s of the failed run\n' "$line"
-done >"$TEST_LOG.unit-journal-ghost-wispr-provision"
-run_provision "$stage" --key
-said 'ghost-wispr provision: reset the failed unit ghost-wispr-provision.service, which a run that failed left' \
-  || fail "a run did not reset and name a kept failed unit: $(<"$work_dir/out")"
-status_line='ghost-wispr provision: ghost-wispr-provision.service failed: ActiveState=failed, Result=exit-code, ExecMainStatus=42; the last 20 lines of its journal:'
-said "$status_line" || fail "a run did not print a kept failed unit's state before its reset: $(<"$work_dir/out")"
-status_at=$(grep -n -F -x -- "$status_line" "$work_dir/out" | head -n1 | cut -d: -f1)
-reset_at=$(grep -n -F 'reset the failed unit ghost-wispr-provision.service' "$work_dir/out" | head -n1 | cut -d: -f1)
-((status_at < reset_at)) || fail "a run printed the failed unit's state after its reset: $(<"$work_dir/out")"
-for line in 6 25; do
-  said "journal line $line of the failed run" || fail "a run did not print the failed unit's journal line $line: $(<"$work_dir/out")"
+printf 'ActiveState=failed\nActiveEnterTimestamp=Thu 2026-11-27 14:03:00 UTC\nMainPID=0\nResult=timeout\nExecMainStatus=0\n' \
+  >"$system_units/ghost-wispr-provision-join.service"
+for kept in ghost-wispr-provision ghost-wispr-provision-join; do
+  {
+    printf 'To authenticate, visit:\n'
+    printf '\thttps://login.tailscale.com/a/dummy-login-canary-%s\n' "$kept"
+    printf 'auth key: dummy-auth-canary-%s\n' "$kept"
+  } >"$TEST_LOG.unit-journal-$kept"
+  # The control: the command that the run names shows the planted lines.
+  planted=$(PATH="$bin:$PATH" sudo journalctl -u "$kept.service" -n 20 2>/dev/null)
+  [[ $planted == *"dummy-login-canary-$kept"* && $planted == *"dummy-auth-canary-$kept"* ]] \
+    || fail "control: sudo journalctl -u $kept.service -n 20 does not show the planted journal: $planted"
 done
-! said 'journal line 5 of the failed run' || fail "a run printed more than the last 20 journal lines of the failed unit: $(<"$work_dir/out")"
+grep -Eq '^sudo journalctl -u ghost-wispr-provision-join' "$TEST_LOG" || fail "control: a journal read is not logged: $(<"$TEST_LOG")"
+# The log starts empty again, so a journal read in it is the run's.
+: >"$TEST_LOG"
+run_provision "$stage" --key
+for entry in 'ghost-wispr-provision exit-code 42' 'ghost-wispr-provision-join timeout 0'; do
+  read -r kept kept_result kept_status <<<"$entry"
+  said "ghost-wispr provision: reset the failed unit $kept.service, which a run that failed left" \
+    || fail "a run did not reset and name the kept failed unit $kept: $(<"$work_dir/out")"
+  status_line="ghost-wispr provision: $kept.service failed: ActiveState=failed, Result=$kept_result, ExecMainStatus=$kept_status; its journal, which a reset leaves, shows why: sudo journalctl -u $kept.service -n 20"
+  said "$status_line" || fail "a run did not print the state and journal command of the kept failed unit $kept: $(<"$work_dir/out")"
+  status_at=$(grep -n -F -x -- "$status_line" "$work_dir/out" | head -n1 | cut -d: -f1)
+  reset_at=$(grep -n -F "reset the failed unit $kept.service" "$work_dir/out" | head -n1 | cut -d: -f1)
+  ((status_at < reset_at)) || fail "a run printed the state of the failed unit $kept after its reset: $(<"$work_dir/out")"
+done
+! grep -q canary "$work_dir/out" || fail "a run printed a failed unit's journal, a login URL among it: $(<"$work_dir/out")"
+! grep -q 'journalctl -u ghost-wispr-provision' "$TEST_LOG" || fail "a run read a failed unit's journal: $(<"$TEST_LOG")"
 said 'nothing was changed. A new key needs a new certificate request' \
   || fail "a run after a kept failed unit did not reach provision.sh --key's own check: $(<"$work_dir/out")"
-rm -f -- "$TEST_LOG.unit-journal-ghost-wispr-provision"
+rm -f -- "$TEST_LOG".unit-journal-*
 # The caller killed by its exact PID while its run's unit runs (Sol's review of #203, round 7): it
 # removes its start marker, and ends 143. The run's unit runs on, as a lost SSH session leaves it.
 # Break it catches: a caller with no trap, whose marker stays in its TMPDIR.
@@ -1894,6 +1909,45 @@ wait "$caller_job" || true
 # marker in place of the one the caller removed.
 "$bin/systemctl" stop ghost-wispr-provision ghost-wispr-provision-join
 [[ ! -e $marker ]] || fail "the killed caller left its start marker, or its stopped run made it again: $marker"
+# The caller killed before its unit enters provision.sh (GPT-6.1 Sol's review of #208): the unit
+# reaches its own work and makes no file in place of the empty marker the caller removed. Break it
+# catches: a marker write that creates the file, which the killed-after-start case above cannot see.
+new_pi
+mkdir -p -- "$caller_tmp"
+: >"$work_dir/start-hold"
+rm -f -- "$work_dir/early-caller-rc" "$TEST_LOG.hung-show-environment" "$TEST_LOG.start-held"
+(
+  TEST_PROVISION_START_HOLD=$work_dir/start-hold TEST_MANAGER_ENV_HANG=1 \
+    TMPDIR=$caller_tmp RUN_OUT=$work_dir/early-caller-out run_provision "$stage"
+  printf '%s\n' "$rc" >"$work_dir/early-caller-rc"
+) &
+caller_job=$!
+for _ in {1..300}; do
+  [[ ! -f $TEST_LOG.start-held ]] || break
+  sleep 0.1
+done
+[[ -f $TEST_LOG.start-held ]] || fail "control: the early caller never reached the held unit start"
+marker=$(tail -n 1 "$TEST_LOG.provision-units" | sed -n 's/.* --setenv=GHOST_WISPR_PROVISION_STARTED=\([^ ]*\) .*/\1/p')
+[[ $marker == "$caller_tmp"/* && -f $marker && ! -s $marker ]] \
+  || fail "control: the early caller has no empty start marker: ${marker:-none}"
+caller_pid=$(ps -eo pid=,ppid=,args= | awk -v p="$caller_job" '$2 == p && /provision\.sh/ { print $1 }')
+[[ $caller_pid =~ ^[0-9]+$ ]] || fail "control: no early caller process: ${caller_pid:-none}"
+kill -TERM "$caller_pid"
+wait "$caller_job" || true
+[[ $(cat -- "$work_dir/early-caller-rc" 2>/dev/null) == 143 ]] || fail "the early killed caller did not exit 143"
+[[ ! -e $marker ]] || fail "the early killed caller left its empty marker: $marker"
+rm -f -- "$work_dir/start-hold"
+for _ in {1..300}; do
+  [[ ! -s $TEST_LOG.hung-show-environment ]] || break
+  sleep 0.1
+done
+reached_work=false
+[[ ! -s $TEST_LOG.hung-show-environment ]] || reached_work=true
+recreated=false
+[[ ! -e $marker ]] || recreated=true
+"$bin/systemctl" stop ghost-wispr-provision ghost-wispr-provision-join
+[[ $reached_work == true ]] || fail "control: the orphaned unit never reached its manager read"
+[[ $recreated == false && ! -e $marker ]] || fail "the unit recreated the marker removed before its start: $marker"
 # Credentials in the caller's environment stay out of the unit's settings, which any local user can
 # read (systemctl show -p Environment; Sol's round 6): only PATH and the provisioning settings go.
 # Break it catches: a run that forwards every GHOST_WISPR_ variable.
