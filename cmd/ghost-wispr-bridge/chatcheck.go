@@ -55,30 +55,44 @@ func (lb *liveBot) noteLine(m chatMessage, at time.Time) {
 // a line of the notice's exact text from a sender never in the roster, timed
 // from the first consent post (or, for a bot a restarted bridge found, its
 // admission) to 30 s after the admission. It reads the lines once the Pi's
-// texts give the notice, and the roster and the lines are read, and fails the
-// check only then: without the texts no bot was made, or a restarted bridge
-// waits for them.
+// texts give the notice: without the texts no bot was made, or a restarted
+// bridge waits for them. A roster or chat lines a restarted bridge has not
+// read yet stop a pass but not the deadline (checkDeadline): a check that
+// has not passed by then fails (R2).
 func (b *bridge) judgeCheck(lb *liveBot, now time.Time) bool {
-	if lb.check.state != checkPending || lb.admitted.IsZero() || lb.needRoster || lb.needChat {
+	if lb.check.state != checkPending || lb.admitted.IsZero() {
 		return false
 	}
 	texts := b.texts()
 	if texts == nil {
 		return false
 	}
-	deadline := lb.admitted.Add(chatCheckWindow)
-	for _, l := range lb.check.lines {
-		if l.text == texts.Consent && l.sender != "" && !lb.seen[l.sender] &&
-			!lb.echoFrom.IsZero() && !l.at.Before(lb.echoFrom) && !l.at.After(deadline) {
-			lb.check.state, lb.check.sender, lb.check.lines = checkPassed, l.sender, nil
-			return true
+	if window := lb.admitted.Add(chatCheckWindow); !lb.needRoster && !lb.needChat {
+		for _, l := range lb.check.lines {
+			if l.text == texts.Consent && l.sender != "" && !lb.seen[l.sender] &&
+				!lb.echoFrom.IsZero() && !l.at.Before(lb.echoFrom) && !l.at.After(window) {
+				lb.check.state, lb.check.sender, lb.check.lines = checkPassed, l.sender, nil
+				return true
+			}
 		}
 	}
-	if now.Before(deadline) {
+	if now.Before(lb.checkDeadline()) {
 		return false
 	}
 	lb.check.state, lb.check.lines = checkFailed, nil
 	return true
+}
+
+// checkDeadline is when a check that has not passed fails: 30 s after the
+// admission, and for a bot a restarted bridge found in a call no sooner than
+// one call's bound after the restart's reads began, so the reads can still
+// show a check that passed before the restart.
+func (lb *liveBot) checkDeadline() time.Time {
+	d := lb.admitted.Add(chatCheckWindow)
+	if reads := lb.readsFrom.Add(callLimit); !lb.readsFrom.IsZero() && reads.After(d) {
+		return reads
+	}
+	return d
 }
 
 // evalCheck decides a pending check and acts on the result.

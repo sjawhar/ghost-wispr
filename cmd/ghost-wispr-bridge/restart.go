@@ -145,14 +145,14 @@ func (b *bridge) adoptInCall(ctx context.Context, lb *liveBot, bt *bot, now time
 	// Chat times have whole seconds: the echo of the notice posted after the
 	// admission may carry the admission's second.
 	lb.echoFrom = lb.admitted.Truncate(time.Second)
-	lb.needRoster, lb.needChat = true, true
+	lb.needRoster, lb.needChat, lb.readsFrom = true, true, now
 	b.readAdopted(ctx, lb)
 }
 
 // readAdopted reads, beside the loop, the roster and the chat lines that a
 // found bot's call still needs. A failed read is tried again at the next
-// tick; until both are read, the check is not judged and the leave rule does
-// not run (A3, R2).
+// tick; until both are read, no check passes and the leave rule does not run
+// (A3, R2), while the check's deadline holds (checkDeadline).
 func (b *bridge) readAdopted(ctx context.Context, lb *liveBot) {
 	api, id := b.api, lb.id
 	if lb.needRoster && !lb.rosterRead {

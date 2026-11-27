@@ -65,10 +65,15 @@ const (
 	// the call: a chat post, a leave, a removal. Attendee answers within
 	// about 1 s (attendeeTimeout).
 	loopCallLimit = 5 * time.Second
-	// doneWait is how long a Done end's delete_data waits for the done mark:
-	// delete_data comes within 60 s of the end whatever the calendar says
-	// (spec, "Deletion"), and the mark is tried again after it.
+	// doneWait is how long a Done end's delete_data waits for the done mark
+	// at most from the moment the bridge sees the end; the mark is tried
+	// again after it.
 	doneWait = 30 * time.Second
+	// deleteWithin is the spec's bound on delete_data after a bot's end
+	// (Limits, "Deletion"; R7), from the end in the bot's record: the bridge
+	// may see the end later, by a lost webhook's poll and its read, and then
+	// waits for the done mark only for what is left of it, less a tick.
+	deleteWithin = 60 * time.Second
 	// deleteDataLimit bounds delete_data's tries: R7's 10 minutes, after
 	// which upkeep's loop deletes the rows.
 	deleteDataLimit = 10 * time.Minute
@@ -185,11 +190,11 @@ type bridge struct {
 	bg       sync.WaitGroup
 }
 
-// owedDelete is a Done end's delete_data that waits for its done mark, at
-// most doneWait from since.
+// owedDelete is a Done end's delete_data that waits for its done mark until
+// due at most.
 type owedDelete struct {
-	bot   string
-	since time.Time
+	bot string
+	due time.Time
 }
 
 // createAttempt is a CreateBot that failed. Attendee may have made its bot,
@@ -218,8 +223,9 @@ type liveBot struct {
 	echoFrom   time.Time       // the earliest time of a line that may be the echo: the first consent post, or a found bot's admission
 	roster     map[string]bool // Meet participant ids in the call, not the bot's
 	seen       map[string]bool // every participant that was ever in the roster: a line of one is never the echo
-	needRoster bool            // a restarted bridge has not read the roster yet: no leave rule before
-	needChat   bool            // a restarted bridge has not read the chat lines yet: no check before
+	needRoster bool            // a restarted bridge has not read the roster yet: no leave rule and no passed check before
+	needChat   bool            // a restarted bridge has not read the chat lines yet: no passed check before
+	readsFrom  time.Time       // when a restarted bridge began those reads; zero for a bot it made
 	rosterRead bool            // the roster read runs beside the loop
 	chatRead   bool            // the chat read runs beside the loop
 	liveJoins  []participantEvent
@@ -465,7 +471,7 @@ func (b *bridge) leave(ctx context.Context, kind calendar.BotEnd) {
 	failedCheck := lb.leaveKind == calendar.EndChatCheckFailed
 	recordBy := lb.leaveAsked.Add(leaveRecordWait)
 	if failedCheck {
-		recordBy = lb.admitted.Add(chatCheckWindow + chatLeaveWithin - loopCallLimit)
+		recordBy = lb.checkDeadline().Add(chatLeaveWithin - loopCallLimit)
 	}
 	if !b.recordLeave(ctx, lb, recordBy) {
 		if b.clock.Now().Before(recordBy) {
@@ -475,7 +481,7 @@ func (b *bridge) leave(ctx context.Context, kind calendar.BotEnd) {
 	}
 	limit := loopCallLimit
 	if failedCheck {
-		if left := lb.admitted.Add(chatCheckWindow + chatLeaveWithin).Sub(b.clock.Now()); left > 0 && left < limit {
+		if left := lb.checkDeadline().Add(chatLeaveWithin).Sub(b.clock.Now()); left > 0 && left < limit {
 			limit = left
 		}
 	}
@@ -783,8 +789,9 @@ func (b *bridge) sendCall(ev *calendar.Event, state string) {
 
 // endBot takes the end of a bot's record by the table of ends. A Done end
 // marks the event done, and its delete_data waits for the mark at most
-// doneWait; the call's bot's end frees the call. A bot whose data upkeep
-// deleted first gets no delete_data.
+// doneWait, and never past deleteWithin after the bot's end; the call's
+// bot's end frees the call. A bot whose data upkeep deleted first gets no
+// delete_data.
 func (b *bridge) endBot(ctx context.Context, lb *liveBot, bt *bot) {
 	now := b.clock.Now()
 	kind := endOf(bt.Events, lb.leaveKind)
@@ -803,8 +810,12 @@ func (b *bridge) endBot(ctx context.Context, lb *liveBot, bt *bot) {
 		b.markDone(ctx, lb.event.ID)
 	}
 	if bt.State != stateDataDeleted {
-		if result == "done" && b.markOwed[lb.event.ID] {
-			b.deleteOwed[lb.event.ID] = append(b.deleteOwed[lb.event.ID], owedDelete{bot: lb.id, since: now})
+		due := now.Add(doneWait)
+		if last := endedAt(bt.Events, now).Add(deleteWithin - tickEvery); last.Before(due) {
+			due = last
+		}
+		if result == "done" && b.markOwed[lb.event.ID] && now.Before(due) {
+			b.deleteOwed[lb.event.ID] = append(b.deleteOwed[lb.event.ID], owedDelete{bot: lb.id, due: due})
 		} else {
 			b.deleteData(ctx, lb.id)
 		}
@@ -851,14 +862,14 @@ func (b *bridge) markDone(ctx context.Context, id string) {
 	b.writeRecord(ctx, id)
 }
 
-// deleteDue runs each delete_data that waited doneWait for its done mark:
+// deleteDue runs each delete_data whose wait for its done mark is over:
 // delete_data comes within 60 s of the end whatever the calendar says (spec,
 // "Deletion"), and the mark is tried again after it.
 func (b *bridge) deleteDue(ctx context.Context, now time.Time) {
 	for id, owed := range b.deleteOwed {
 		kept := owed[:0]
 		for _, d := range owed {
-			if now.Sub(d.since) >= doneWait {
+			if !now.Before(d.due) {
 				b.deleteData(ctx, d.bot)
 				continue
 			}
@@ -925,6 +936,16 @@ func admission(events []botEvent, fallback time.Time) time.Time {
 		}
 	}
 	return fallback
+}
+
+// endedAt is the time of a bot's end in its record: its newest event's, the
+// one that ended it. A record with no time, or one later than now, gives
+// now.
+func endedAt(events []botEvent, now time.Time) time.Time {
+	if n := len(events); n > 0 && !events[n-1].At.IsZero() && !events[n-1].At.After(now) {
+		return events[n-1].At
+	}
+	return now
 }
 
 // endName names a bot's end in a log line.
