@@ -37,6 +37,8 @@ export interface ProviderConfig {
     kind: string
     // api_key: the variable that holds the key.
     env?: string
+    // api_key: the deployment owns the key, so settings cannot change it.
+    read_only?: boolean
     audience?: string
     identity_provider_id?: string
     service_account_id?: string

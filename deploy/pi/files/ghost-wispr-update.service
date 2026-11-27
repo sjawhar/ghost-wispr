@@ -5,9 +5,10 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
-# No time limit: a limit's kill can land mid-swap, with the new binary in place and no rollback.
-# Each step update.sh waits on has a bound of its own (deploy/pi/update.sh), and
-# deploy/pi/update_test.sh checks this is the unit's only time limit.
+# No time limit here: a unit limit's kill could land mid-swap. The launcher runs update.sh under
+# timeout --kill-after=60s 45m, the one limit on a whole run, and the next run repairs a swap that
+# its kill cut short, since deploy.verified still names the set before. deploy/pi/update_test.sh
+# checks this is the unit's only time limit.
 TimeoutStartSec=infinity
 WorkingDirectory=/opt/ghost-wispr
-ExecStart=/opt/ghost-wispr/update.sh
+ExecStart=/opt/ghost-wispr/ghost-wispr-update-launcher.sh

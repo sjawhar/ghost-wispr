@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -95,7 +96,7 @@ func TestStore_Update_ValidationRejectsInvalidModel(t *testing.T) {
 	}
 }
 
-func TestStore_Update_WritesYAML(t *testing.T) {
+func TestStore_Update_WritesLocalSettingsYAML(t *testing.T) {
 	clearEnv(t)
 
 	dir := t.TempDir()
@@ -113,12 +114,12 @@ func TestStore_Update_WritesYAML(t *testing.T) {
 		t.Fatalf("Update failed: %v", err)
 	}
 
-	data, err := os.ReadFile(configPath)
+	data, err := os.ReadFile(LocalSettingsPath(configPath))
 	if err != nil {
-		t.Fatalf("read config: %v", err)
+		t.Fatalf("read local settings: %v", err)
 	}
 	if !strings.Contains(string(data), "45s") {
-		t.Fatalf("expected YAML to contain 45s, got:\n%s", data)
+		t.Fatalf("expected local settings to contain 45s, got:\n%s", data)
 	}
 }
 
@@ -141,12 +142,12 @@ func TestStore_Update_DoesNotWriteSecretsToYAML(t *testing.T) {
 		t.Fatalf("Update failed: %v", err)
 	}
 
-	data, err := os.ReadFile(configPath)
+	data, err := os.ReadFile(LocalSettingsPath(configPath))
 	if err != nil {
-		t.Fatalf("read config: %v", err)
+		t.Fatalf("read local settings: %v", err)
 	}
 	if strings.Contains(string(data), "sk-secret-key") {
-		t.Fatal("secrets should not be written to YAML")
+		t.Fatal("secrets should not be written to local settings YAML")
 	}
 }
 
@@ -225,15 +226,20 @@ func TestStore_Get_ReturnsCopyOfPresets(t *testing.T) {
 	}
 }
 
+// TestStore_ConcurrentAccess fails if concurrent saves lose one another's
+// change, in memory or in the local settings file: each adds its own preset,
+// and a store reopened from the files must hold all of them.
 func TestStore_ConcurrentAccess(t *testing.T) {
 	clearEnv(t)
-	store, _, err := NewStore("")
+	path := writeConfig(t, "silence_timeout: 30s\n")
+	store, _, err := NewStore(path)
 	if err != nil {
 		t.Fatalf("NewStore failed: %v", err)
 	}
 
+	const writers = 50
 	var wg sync.WaitGroup
-	for i := 0; i < 50; i++ {
+	for i := range writers {
 		wg.Add(2)
 		go func() {
 			defer wg.Done()
@@ -241,10 +247,28 @@ func TestStore_ConcurrentAccess(t *testing.T) {
 		}()
 		go func() {
 			defer wg.Done()
-			_ = store.Update(func(c *Config) { c.SilenceTimeout = "30s" })
+			name := fmt.Sprintf("preset-%02d", i)
+			if err := store.Update(func(c *Config) {
+				c.Summarization.Presets[name] = Preset{Description: name, UserTemplate: "{{transcript}}"}
+			}); err != nil {
+				t.Errorf("save of %s: %v", name, err)
+			}
 		}()
 	}
 	wg.Wait()
+
+	reopened, _, err := NewStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, presets := range map[string]map[string]Preset{"in memory": store.Get().Summarization.Presets, "after a restart": reopened.Get().Summarization.Presets} {
+		for i := range writers {
+			preset := fmt.Sprintf("preset-%02d", i)
+			if presets[preset].Description != preset {
+				t.Errorf("%s the presets lack %s: %d presets held", name, preset, len(presets))
+			}
+		}
+	}
 }
 
 func TestNewStoreWithEnv_LoadsSecretsFromEnvFile(t *testing.T) {
@@ -329,10 +353,17 @@ func TestStore_Update_WritesSecretsToEnvFile(t *testing.T) {
 		t.Fatalf("expected .env to contain OpenAI key, got:\n%s", data)
 	}
 
-	// Verify secret NOT in YAML
-	yamlData, _ := os.ReadFile(configPath)
-	if strings.Contains(string(yamlData), "sk-test-key") {
-		t.Fatal("secret should not appear in YAML file")
+	for _, yamlPath := range []string{configPath, LocalSettingsPath(configPath)} {
+		yamlData, err := os.ReadFile(yamlPath)
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			t.Fatalf("read %s: %v", yamlPath, err)
+		}
+		if strings.Contains(string(yamlData), "sk-test-key") {
+			t.Fatalf("secret should not appear in YAML file %s", yamlPath)
+		}
 	}
 }
 

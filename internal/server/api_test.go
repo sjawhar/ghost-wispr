@@ -2539,8 +2539,20 @@ func TestAPI_PatchConfig_RefusedPatchChangesNothing(t *testing.T) {
 	if after, err := os.ReadFile(path); err != nil || !bytes.Equal(after, before) {
 		t.Errorf("a refused PATCH rewrote the config file (%v):\n%s", err, after)
 	}
+	assertNoLocalSettings(t, path)
 	if n := announced.Load(); n != 0 {
 		t.Errorf("a refused PATCH announced %d config changes", n)
+	}
+}
+
+// assertNoLocalSettings fails t when a refused PATCH wrote the local settings
+// file beside the release config at path. A save writes only that file, so
+// it is the file a refusal must leave alone.
+func assertNoLocalSettings(t *testing.T, path string) {
+	t.Helper()
+	localPath := config.LocalSettingsPath(path)
+	if _, err := os.Stat(localPath); !os.IsNotExist(err) {
+		t.Errorf("a refused PATCH wrote %s (%v)", localPath, err)
 	}
 }
 

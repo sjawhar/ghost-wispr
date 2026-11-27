@@ -64,13 +64,14 @@ providers:
       kind: openai_wif
       identity_provider_id: idp_b2d6c7c4ac719ef0764eba89
       service_account_id: user-cd72c7d9a1bb41594ed3c6e7
-  # Deepgram streams live transcription and runs voice C. Deepgram has no workload identity, so it
-  # takes a key: provision.sh writes the credential bundle's deepgram-key into .env under this name.
+  # Deepgram streams live transcription and runs voice C. It has no workload identity, so update.sh
+  # reads its key from Secret Manager into .env. The settings page cannot replace that deployment key.
   deepgram:
     api: deepgram
     auth:
       kind: api_key
       env: GHOST_WISPR_DEEPGRAM_API_KEY
+      read_only: true
 transcription:
   model: deepgram/nova-3
 batch_transcription:
@@ -89,8 +90,9 @@ embedding:
   # to the gateway is `model: gateway/gemini-embedding-2`, with the gateway entry under providers
   # uncommented (docs/pi-setup.md, "The model gateway").
   model: vertex/gemini-embedding-2
-# provision.sh --models <shared-drive-id> adds gdrive_folder_id and turns gdrive_sync_enabled
-# and gc_enabled on; GC removes only local audio that Drive holds a copy of.
+# provision.sh --models <shared-drive-id> establishes gdrive_folder_id; update.sh keeps that drive
+# ID in releases and turns gdrive_sync_enabled and gc_enabled on. GC removes only local audio that
+# Drive holds a copy of.
 gdrive_sync_enabled: false
 gc_enabled: false
 gc_max_age_days: 0
@@ -112,8 +114,8 @@ indicator_light: blink1
 power_button: true
 # The Jabra's Mute button pauses and resumes, as the power button does (docs/pi-setup.md, "Pause
 # and resume at the unit"). A restart of a paused unit stays paused (defect D9, #75). The office
-# Pi's .env can override this line with GHOST_WISPR_JABRA_MUTE_BUTTON; a full provisioner run
-# rewrites .env without it.
+# Pi's .env can override this line with GHOST_WISPR_JABRA_MUTE_BUTTON; update.sh retains that line,
+# and provisioning does not rewrite .env.
 jabra_mute_button: true
 # Envoy events go to the Envoy hub's listener over the tailnet, with no credential (README "Envoy
 # events"). The hub is the NATS server pi.env's PI_NATS_SERVER names; its listener answers on 9020.
@@ -136,8 +138,8 @@ voice:
   dgagent:
     provider: deepgram
 # The Concierge answers on Gemini on Vertex AI. It reads Dispatch with the Pi's own no-scope token
-# (GHOST_WISPR_DISPATCH_TOKEN, the credential bundle's dispatch-token) and asks an issue's agent
-# through the Envoy listener.
+# (GHOST_WISPR_DISPATCH_TOKEN, Secret Manager's operator-only-ghost-wispr-dispatch-token, which
+# update.sh reads) and asks an issue's agent through the Envoy listener.
 concierge:
   model: vertex/gemini-3.5-flash-lite
   dispatch_url: https://dispatch.tail12ec1c.ts.net

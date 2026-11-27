@@ -220,26 +220,32 @@
           </dd>
         </dl>
         {#if provider.auth.kind === 'api_key'}
-          <div class="key-row">
-            <input
-              type="password"
-              autocomplete="off"
-              aria-label="Key for {name}"
-              placeholder={status ? (status.key_set ? '••••••••' : 'Not set') : ''}
-              bind:value={keyInputs[name]}
-            />
-            <button
-              class="save-btn"
-              type="button"
-              onclick={() => saveKey(name)}
-              disabled={keySaving[name] || !keyInputs[name]?.trim()}
-            >
-              {keySaving[name] ? '...' : 'Save key'}
-            </button>
-            {#if feedback}
-              <span class="feedback" class:error={feedback.error}>{feedback.text}</span>
-            {/if}
-          </div>
+          {#if provider.auth.read_only}
+            <p class="key-read-only">
+              This unit reads its key from its deployment. It cannot be changed here.
+            </p>
+          {:else}
+            <div class="key-row">
+              <input
+                type="password"
+                autocomplete="off"
+                aria-label="Key for {name}"
+                placeholder={status ? (status.key_set ? '••••••••' : 'Not set') : ''}
+                bind:value={keyInputs[name]}
+              />
+              <button
+                class="save-btn"
+                type="button"
+                onclick={() => saveKey(name)}
+                disabled={keySaving[name] || !keyInputs[name]?.trim()}
+              >
+                {keySaving[name] ? '...' : 'Save key'}
+              </button>
+              {#if feedback}
+                <span class="feedback" class:error={feedback.error}>{feedback.text}</span>
+              {/if}
+            </div>
+          {/if}
         {/if}
       </li>
     {/each}
@@ -367,6 +373,11 @@
     align-items: center;
     gap: 0.5rem;
     flex-wrap: wrap;
+  }
+
+  .key-read-only {
+    margin: 0;
+    color: var(--muted);
   }
 
   .key-row input {

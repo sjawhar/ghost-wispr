@@ -1,71 +1,86 @@
 #!/usr/bin/env bash
-# Runs the full deploy/pi/provision.sh on a credential bundle with fakes for sudo, id, ip and
-# tailscale, and checks what the Pi is told to do: the service user joins the audio group, the
-# update runs with the user's runtime directory, and the detached join brings the node up with the
-# tailnet's subnet routes off, sets Tailscale Serve again, and accepts the routes only when the route
-# check that provision.sh installs beside the token finds that no peer's route overlaps a network of
-# the Pi, on a re-join too. It runs that check alone on the Pi's networks and on tailnet statuses of
-# each kind, and checks that a Pi already joined gets no join and no route check.
+# Runs deploy/pi/provision.sh from a release's deploy set, the directory that
+# deploy/pi/build-deploy-tarball.sh --stage writes as release.yml builds it, on a fake Pi: its deploy
+# directory, its user unit directory and its key, under one temporary directory
+# (dispatch://INFRA-5935/spec R14 and R16, check c-provision). Fakes stand in for sudo, systemctl
+# --user, id, ip, curl, journalctl (through sudo) and tailscale with its Serve setting, and for the
+# release binary that the nightly update installs. The release's pi.env is deploy/pi/test-pi.env,
+# with the SHA-256 the manifest gives it, so no case reads the office Pi's settings.
+#
+# It checks that provision.sh reads no bundle; refuses a directory that is not a release's; writes
+# the Google credential files from pi.env where they are missing and only compares them where they
+# exist; installs the bootstrap files and the release's update.sh, pi-lib.sh and pi.env before it
+# starts the nightly update, once and through systemd; writes no .env and installs no system file
+# itself; applies serve.conf and turns off each other Serve port; and joins the tailnet with the
+# client id and the subject of pi.env, in a join command that holds each Serve call as text and
+# reads no file of the release's directory. The detached join accepts the tailnet's subnet routes
+# only when the route check that provision.sh installs beside the token finds that no peer's route
+# overlaps a network of the Pi; the check runs alone on the Pi's networks and on tailnet statuses of
+# each kind. It also runs provision.sh --key, --certificate and --models. The fakes are no Pi, so a
+# pass does not show one.
 set -euo pipefail
 
-repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+readonly script_dir
+repo_root="$(cd -- "$script_dir/../.." && pwd)"
 readonly repo_root
 work_dir=$(mktemp -d)
+readonly work_dir
 trap 'rm -rf -- "$work_dir"' EXIT
 
+# The cases of this test, each of which begin names.
+readonly case_names=(bundle-refused not-a-release first-run one-update-start release-files-first
+  credentials-written bootstrap-files no-env-no-system-files groups-and-linger join-command idempotent
+  credentials-same credentials-differ client-id newer-release newer-release-certificate bootstrap-repair
+  serve update-fails recorder-unit join route-check manager-env key certificate models)
+current_case=setup
+ran_cases=' '
+
 fail() {
-  printf 'provision run test FAILED: %s\n' "$*" >&2
+  printf 'provision run test FAILED (%s): %s\n' "$current_case" "$*" >&2
   exit 1
 }
 
-# The sha256 of the office Pi's recording_rules block in deploy/pi/files/ghost-wispr.yaml, which
-# its web UI shows under Recording rules, each as written and in this order (docs/pi-setup.md,
-# "Accept slice 1", A2). The test holds the hash, not the text, because the repository is public.
-# After a rule change, set it to the awk below run over the template, piped to sha256sum.
-readonly recording_rules_sha256=89f65b9df94d27abf6657ba13e183921b7c27e19d8ba5e90c189e4046c5c8040
-
-# assert_recording_rules fails unless the configuration provision.sh installed holds exactly the
-# office Pi's recording rules, once.
-assert_recording_rules() {
-  local config=$TEST_LOG.installed-ghost-wispr.yaml rules
-  rules=$(awk '/^recording_rules:/ { print; inside = 1; next } inside && /^  - / { print; next } { inside = 0 }' "$config" | sha256sum)
-  [[ $rules == "$recording_rules_sha256  -" ]] \
-    || fail "the $1 configuration does not hold the office Pi's five recording rules: $(<"$config")"
-}
-
-# assert_office_pi_devices fails unless the configuration provision.sh installed turns the Jabra's
-# Mute button on once, with no .env line to override it, and names the Jabra Speak2 75 by its ALSA
-# card id as the microphone's and the speaker's sound card once (mic_device and speaker_device: J75),
-# so another capture card, such as an ALSA loopback or a second Jabra device, never counts as the
-# microphone. The full provisioner rewrites .env, so the template's settings are the Pi's.
-assert_office_pi_devices() {
-  local config=$TEST_LOG.installed-ghost-wispr.yaml env=$TEST_LOG.installed-.env settings
-  settings=$(grep -E '^jabra_mute_button:' "$config") || true
-  [[ $settings == 'jabra_mute_button: true' ]] \
-    || fail "the $1 configuration does not turn the Jabra's Mute button on once: ${settings:-no jabra_mute_button line}"
-  if grep -Eq '^GHOST_WISPR_JABRA_MUTE_BUTTON=' "$env"; then
-    fail "the $1 .env sets the Jabra's Mute button: $(grep -E '^GHOST_WISPR_JABRA_MUTE_BUTTON=' "$env")"
+# begin NAME starts the case NAME, which each failure then names.
+begin() {
+  [[ " ${case_names[*]} " == *" $1 "* ]] || fail "begin: $1 is not a case of this test"
+  current_case=$1
+  if [[ $ran_cases != *" $1 "* ]]; then
+    ran_cases+="$1 "
+    printf 'provision run test: %s\n' "$1"
   fi
-  settings=$(grep -E '^mic_device:' "$config") || true
-  [[ $settings == 'mic_device: J75' ]] \
-    || fail "the $1 configuration does not name the Jabra as the microphone once: ${settings:-no mic_device line}"
-  settings=$(grep -E '^speaker_device:' "$config") || true
-  [[ $settings == 'speaker_device: J75' ]] \
-    || fail "the $1 configuration does not name the Jabra as the speaker once: ${settings:-no speaker_device line}"
 }
 
 uid=$(id -u)
 readonly uid runtime_dir="/run/user/$uid"
-[[ -d $runtime_dir ]] || fail "this test needs $runtime_dir, where provision.sh stages the bundle"
+[[ -d $runtime_dir ]] || fail "this test needs $runtime_dir, where provision.sh renders the credential files"
 
-readonly CLIENT_ID=k-test-client-id SUBJECT=123456789012345678901
-export CLIENT_ID SUBJECT TEST_LOG="$work_dir/log" TEST_UID="$uid" TEST_ROUTE_ALL="$work_dir/route-all"
-# The join's directory, where provision.sh installs the token and the route check: the fake sudo
-# creates nothing.
-mkdir -p "$work_dir/bin" "$work_dir/deploy" "$work_dir/bundle" "$work_dir/join"
-touch "$work_dir/key.pem"
+readonly bin=$work_dir/bin join=$work_dir/join pi=$work_dir/pi stage=$work_dir/stage first_join=$work_dir/first-join
+readonly deploy=$pi/opt units=$pi/units key_dir=$pi/identity sysroot=$pi/root state=$pi/state
+readonly key=$key_dir/key.pem
+readonly release_commit=0123456789abcdef0123456789abcdef01234567
+# The commits of the releases that the real nightly update installs here, the commit a binary
+# answers when it never reports its own, and a commit that no release here has.
+readonly commit_a=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa commit_b=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb \
+  commit_c=cccccccccccccccccccccccccccccccccccccccc wrong_commit=0000000000000000000000000000000000000000 \
+  other_commit=89abcdef0123456789abcdef0123456789abcdef
+# What test-pi.env sets as PI_TAILNET_CLIENT_ID and PI_SERVICE_ACCOUNT_UNIQUE_ID, written out here.
+readonly client_id=k-test-client-id subject=123456789012345678901
+real_date=$(command -v date)
+real_sleep=$(command -v sleep)
+readonly real_date real_sleep
+# The release API and the recorder's two answers, as the real nightly update reads them here.
+readonly release_api=https://api.test.invalid/releases/latest status_url=http://recorder.test.invalid/api/status \
+  version_url=http://recorder.test.invalid/api/version
+export TEST_LOG="$work_dir/log" TEST_UID="$uid" TEST_RUNTIME_DIR="$runtime_dir" TEST_DEPLOY="$deploy" \
+  TEST_UNIT_DIR="$units" TEST_BINARY="$work_dir/recorder-binary" \
+  TEST_RECORDER_UNIT="$repo_root/deploy/pi/files/ghost-wispr.service" TEST_SERVE_STATE="$work_dir/serve.json" \
+  TEST_SERVE_HOST=ghost-wispr.example-tailnet.ts.net TEST_ROUTE_ALL="$work_dir/route-all" TEST_SUBJECT="$subject" \
+  TEST_REAL_DATE="$real_date" TEST_REAL_SLEEP="$real_sleep" TEST_STATE="$state" TEST_RELEASES="$work_dir/releases" \
+  TEST_CLOCK="$work_dir/clock"
+mkdir -p -- "$bin" "$join" "$first_join" "$TEST_RELEASES"
 
-cat >"$work_dir/bin/id" <<'EOF'
+cat >"$bin/id" <<'EOF'
 #!/usr/bin/env bash
 case "$*" in
   -un) printf 'ghost-wispr\n' ;;
@@ -75,47 +90,214 @@ case "$*" in
 esac
 EOF
 
-# sudo records each command and runs none, but systemd-run's command is kept to run below, with the
-# whole systemd-run line, and what provision.sh installs from stdin or as the configuration is kept
-# to read. ghost-wispr's user manager:
-# - systemctl --user show-environment prints its environment: the file TEST_MANAGER_ENV names when
-#   it exists, else the few variables a manager has; it exits TEST_MANAGER_ENV_EXIT (0 by default).
-# - systemctl --user daemon-reload moves the file TEST_MANAGER_ENV_PENDING names, when it exists,
-#   over TEST_MANAGER_ENV: an environment.d line written since the last reload counts from the next.
-# - systemctl --user show -p LoadState -p DropInPaths UNIT prints the unit's load state from
-#   $TEST_UNITS/load-UNIT (loaded when absent) and its drop-ins from $TEST_UNITS/dropins-UNIT.
-cat >"$work_dir/bin/sudo" <<'EOF'
+# The fake sudo logs each command. It runs install -d, less -o and -g, which need root; keeps what is
+# installed from standard input as $TEST_LOG.installed-NAME; runs tailscale through the fake below;
+# prints $TEST_JOURNAL for journalctl; keeps systemd-run's command, and its whole line, to run the
+# join below; and runs nothing else. provision.sh installs its own files as ghost-wispr, and the
+# nightly update the system files: any other install with sudo, any udevadm call and a logind
+# restart are errors that the test reports. The nightly update's own calls each have -n: it
+# installs the system files under GHOST_WISPR_SYSTEM_ROOT, reloads udev and restarts logind, which
+# the log records, and reads Serve's setting.
+cat >"$bin/sudo" <<'EOF'
 #!/usr/bin/env bash
 printf 'sudo %s\n' "$*" >>"$TEST_LOG"
-if [[ " $* " == *' /dev/stdin '* ]]; then
-  cat >"$TEST_LOG.installed-$(basename -- "${!#}")"
-elif [[ $1 == install && ${!#} == */ghost-wispr.yaml ]]; then
-  cp -- "${@:$#-1:1}" "$TEST_LOG.installed-ghost-wispr.yaml"
+error() { printf 'fake sudo: %s: sudo %s\n' "$1" "${*:2}" >>"$TEST_LOG.errors"; }
+if [[ ${1:-} == -n ]]; then
+  shift
+  case $1 in
+    install)
+      if [[ ${!#} != "$GHOST_WISPR_SYSTEM_ROOT"/* ]]; then
+        error 'a system file installed outside the system root' -n "$@"
+        exit 1
+      fi
+      shift
+      exec install "$@"
+      ;;
+    udevadm | systemctl) ;;
+    tailscale)
+      shift
+      exec tailscale "$@"
+      ;;
+    *)
+      error 'an unexpected call' -n "$@"
+      exit 1
+      ;;
+  esac
+  exit 0
 fi
-if [[ $1 == systemd-run ]]; then
-  printf '%s' "${!#}" >"$TEST_LOG.join"
-  printf '%s\n' "$*" >"$TEST_LOG.systemd-run"
+case $1 in
+  install)
+    if [[ " $* " == *' /dev/stdin '* ]]; then
+      cat >"$TEST_LOG.installed-$(basename -- "${!#}")"
+    elif [[ ${2:-} == -d ]]; then
+      arguments=()
+      while (($# > 1)); do
+        shift
+        case $1 in
+          -o | -g) shift ;;
+          *) arguments+=("$1") ;;
+        esac
+      done
+      install "${arguments[@]}"
+    else
+      error 'a file installed as root' "$@"
+    fi
+    ;;
+  tailscale)
+    shift
+    exec tailscale "$@"
+    ;;
+  journalctl)
+    if [[ -f ${TEST_JOURNAL:-} ]]; then
+      cat -- "$TEST_JOURNAL"
+    fi
+    ;;
+  systemd-run)
+    printf '%s' "${!#}" >"$TEST_LOG.join"
+    printf '%s\n' "$*" >"$TEST_LOG.systemd-run"
+    ;;
+  udevadm) error 'a udev call' "$@" ;;
+  systemctl)
+    if [[ $* == *systemd-logind* || $* == *' --user '* ]]; then
+      error 'a system file reload or a user call through sudo' "$@"
+    fi
+    ;;
+esac
+EOF
+
+# The fake systemctl is ghost-wispr's user manager. It logs each call. A call without --user, or
+# whose XDG_RUNTIME_DIR is not the user's runtime directory, is an error the test reports.
+# - daemon-reload moves the file TEST_MANAGER_ENV_PENDING names, when it exists, over
+#   TEST_MANAGER_ENV: an environment.d line written since the last reload counts from the next. It
+#   loads ghost-wispr-update.service as its file is then, $TEST_LOG.loaded-update-unit.
+# - show-environment prints the manager's environment: the file TEST_MANAGER_ENV names when it
+#   exists, else the few variables a manager has; it exits TEST_MANAGER_ENV_EXIT (0 by default).
+# - show -p LoadState -p DropInPaths UNIT prints the unit's load state from $TEST_UNITS/load-UNIT
+#   (loaded when absent) and its drop-ins from $TEST_UNITS/dropins-UNIT; show -p DropInPaths
+#   --value prints none, and show -p MainPID --value prints 0, a recorder with no image to read.
+# - enable fails, as systemctl does, for a unit with no file in TEST_UNIT_DIR.
+# - start ghost-wispr-update.service is the nightly update. It writes to $TEST_LOG.start the
+#   SHA-256 of each file the update runs on, or "missing". With TEST_UPDATE_EXIT it fails as a
+#   failed oneshot unit does; otherwise it installs what the update installs and provision.sh then
+#   uses: the binary and ghost-wispr.service. With TEST_REAL_UPDATE=1 it runs the ExecStart of the
+#   update unit it loaded instead, the real launcher and update.sh in the deploy directory, into
+#   the journal $TEST_JOURNAL, and fails as systemd does when that program fails or is no program.
+# - restart ghost-wispr.service starts the recorder, with TEST_REAL_UPDATE=1: it answers the commit
+#   that the installed binary's "# answers commit" line names, and is-active says it runs. show -p
+#   ExecMainStartTimestamp --timestamp=us+utc --value prints the real time of that start, as systemd
+#   prints it, or nothing while no recorder runs.
+cat >"$bin/systemctl" <<'EOF'
+#!/usr/bin/env bash
+printf 'systemctl %s\n' "$*" >>"$TEST_LOG"
+error() { printf 'fake systemctl: %s: systemctl %s\n' "$1" "${*:2}" >>"$TEST_LOG.errors"; }
+if [[ ${1:-} != --user ]]; then
+  error 'a call without --user' "$@"
+  exit 1
 fi
-if [[ $* == *' systemctl --user daemon-reload' && -f ${TEST_MANAGER_ENV_PENDING:-} ]]; then
-  mv -f -- "$TEST_MANAGER_ENV_PENDING" "$TEST_MANAGER_ENV"
-fi
-if [[ $* == *' systemctl --user show -p LoadState -p DropInPaths '* ]]; then
-  unit=${!#} units=${TEST_UNITS:-/nonexistent}
-  printf 'LoadState=%s\nDropInPaths=%s\n' "$(cat -- "$units/load-$unit" 2>/dev/null || echo loaded)" \
-    "$(cat -- "$units/dropins-$unit" 2>/dev/null || true)"
-fi
-if [[ $* == *' systemctl --user show-environment' ]]; then
-  if [[ -f ${TEST_MANAGER_ENV:-} ]]; then
-    cat -- "$TEST_MANAGER_ENV"
+[[ ${XDG_RUNTIME_DIR:-} == "$TEST_RUNTIME_DIR" ]] || error "XDG_RUNTIME_DIR is ${XDG_RUNTIME_DIR:-unset}" "$@"
+shift
+sum_or_missing() {
+  if [[ -f $1 ]]; then
+    sha256sum <"$1" | cut -d' ' -f1
   else
-    printf '%s\n' HOME=/home/ghost-wispr LANG=C.UTF-8 PATH=/usr/local/bin:/usr/bin:/bin
+    printf 'missing\n'
   fi
-  exit "${TEST_MANAGER_ENV_EXIT:-0}"
-fi
+}
+case "$*" in
+  daemon-reload)
+    # What the manager loads at this reload: the timer's SHA-256, in the order of the run's events.
+    printf 'reload timer=%s\n' "$(sum_or_missing "$TEST_UNIT_DIR/ghost-wispr-update.timer")" >>"$TEST_LOG.events"
+    if [[ -f $TEST_UNIT_DIR/ghost-wispr-update.service ]]; then
+      cp -- "$TEST_UNIT_DIR/ghost-wispr-update.service" "$TEST_LOG.loaded-update-unit"
+    else
+      rm -f -- "$TEST_LOG.loaded-update-unit"
+    fi
+    if [[ -f ${TEST_MANAGER_ENV_PENDING:-} ]]; then
+      mv -f -- "$TEST_MANAGER_ENV_PENDING" "$TEST_MANAGER_ENV"
+    fi
+    ;;
+  'is-active --quiet ghost-wispr.service') [[ -f $TEST_STATE/active ]] ;;
+  'show -p MainPID --value ghost-wispr.service') printf '0\n' ;;
+  'show -p ExecMainStartTimestamp --timestamp=us+utc --value ghost-wispr.service')
+    if [[ -f $TEST_STATE/active ]]; then
+      cat -- "$TEST_STATE/main-start"
+    else
+      printf '\n'
+    fi
+    ;;
+  'show -p DropInPaths --value '*) printf '\n' ;;
+  show-environment)
+    if [[ -f ${TEST_MANAGER_ENV:-} ]]; then
+      cat -- "$TEST_MANAGER_ENV"
+    else
+      printf '%s\n' HOME=/home/ghost-wispr LANG=C.UTF-8 PATH=/usr/local/bin:/usr/bin:/bin
+    fi
+    exit "${TEST_MANAGER_ENV_EXIT:-0}"
+    ;;
+  'show -p LoadState -p DropInPaths '*)
+    unit=${!#} units=${TEST_UNITS:-/nonexistent}
+    printf 'LoadState=%s\nDropInPaths=%s\n' "$(cat -- "$units/load-$unit" 2>/dev/null || echo loaded)" \
+      "$(cat -- "$units/dropins-$unit" 2>/dev/null || true)"
+    ;;
+  'enable --now ghost-wispr-update.timer' | 'enable ghost-wispr.service')
+    if [[ ! -f $TEST_UNIT_DIR/${!#} ]]; then
+      printf 'Failed to enable unit: Unit file %s does not exist.\n' "${!#}" >&2
+      exit 1
+    fi
+    ;;
+  'start ghost-wispr-update.service')
+    if [[ ${TEST_REAL_UPDATE:-} == 1 ]]; then
+      [[ -f $TEST_LOG.loaded-update-unit ]] || { printf 'Unit ghost-wispr-update.service not found.\n' >&2; exit 5; }
+      program=$(sed -n 's/^ExecStart=//p' "$TEST_LOG.loaded-update-unit")
+      program=${program/#\/opt\/ghost-wispr\//$TEST_DEPLOY/}
+      if [[ -z $program || ! -x $program ]]; then
+        printf 'ghost-wispr-update.service: Failed at step EXEC spawning %s: No such file or directory (status=203/EXEC)\n' "$program" >>"$TEST_JOURNAL"
+        printf 'Job for ghost-wispr-update.service failed because the control process exited with error code.\n' >&2
+        exit 1
+      fi
+      status=0
+      INVOCATION_ID=test-invocation-real "$program" >>"$TEST_JOURNAL" 2>&1 || status=$?
+      if ((status != 0)); then
+        printf 'Job for ghost-wispr-update.service failed because the control process exited with error code.\n' >&2
+        exit 1
+      fi
+      exit 0
+    fi
+    {
+      for name in update.sh pi-lib.sh pi.env ghost-wispr-update-launcher.sh google-credentials.json certificate_config.json; do
+        printf '%s %s\n' "$(sum_or_missing "$TEST_DEPLOY/$name")" "$name"
+      done
+      for name in ghost-wispr-update.service ghost-wispr-update.timer; do
+        printf '%s %s\n' "$(sum_or_missing "$TEST_UNIT_DIR/$name")" "$name"
+      done
+    } >"$TEST_LOG.start"
+    if [[ ${TEST_UPDATE_EXIT:-0} != 0 ]]; then
+      printf 'Job for ghost-wispr-update.service failed because the control process exited with error code.\n' >&2
+      exit 1
+    fi
+    install -m 0755 -- "$TEST_BINARY" "$TEST_DEPLOY/ghost-wispr"
+    install -m 0644 -- "$TEST_RECORDER_UNIT" "$TEST_UNIT_DIR/ghost-wispr.service"
+    ;;
+  'restart ghost-wispr.service')
+    if [[ ${TEST_REAL_UPDATE:-} == 1 ]]; then
+      rm -f -- "$TEST_STATE/active"
+      commit=$(sed -n 's/^# answers commit //p' "$TEST_DEPLOY/ghost-wispr" 2>/dev/null) || commit=''
+      [[ -n $commit ]] || { printf 'ghost-wispr.service: status=203/EXEC\n' >&2; exit 1; }
+      printf '%s\n' "$commit" >"$TEST_STATE/running-commit"
+      "$TEST_REAL_DATE" -u '+%a %Y-%m-%d %H:%M:%S.%6N UTC' >"$TEST_STATE/main-start"
+      : >"$TEST_STATE/active"
+    fi
+    ;;
+  *)
+    error 'an unexpected call' --user "$@"
+    exit 1
+    ;;
+esac
 EOF
 
 # tailscale logs each call and keeps the accept-routes setting, RouteAll, in $TEST_ROUTE_ALL (false
-# when that file is absent):
+# when that file is absent), and the Serve setting, tailscale's ipn.ServeConfig, in
+# $TEST_SERVE_STATE:
 # - `up` exits TEST_UP_EXIT (0 by default), and on 0 sets RouteAll as its --accept-routes flag says.
 #   Without the flag, while RouteAll is true, it refuses as up.go's check of settings left out does
 #   (Tailscale v1.104.1, cmd/tailscale/cli/up.go:1013-1105) and exits 1. It keeps its exit code in
@@ -124,8 +306,13 @@ EOF
 #   `set --accept-routes=false` sets it false;
 # - `status --self --json` prints the node's own reading, TEST_SELF_STATUS when it is set;
 # - `status --json` prints the status fixture $TEST_STATUS, or fails with TEST_STATUS_EXIT;
-# - `serve` exits TEST_SERVE_EXIT (0 by default), and `debug prefs` prints RouteAll.
-cat >"$work_dir/bin/tailscale" <<'EOF'
+# - `serve --bg --https PORT TARGET` exits TEST_SERVE_EXIT (0 by default), and on 0 serves TARGET at
+#   the mount / of the HTTPS port PORT, and keeps each other mount of that port, as tailscale's
+#   SetWebHandler does (ipn/serve.go, v1.104); `serve --https=PORT off` serves nothing there;
+#   `serve --https=PORT --set-path=MOUNT off` removes that mount, and the port with its last one;
+#   `serve status --json` prints the setting, or fails with TEST_SERVE_STATUS_EXIT;
+# - `debug prefs` prints RouteAll.
+cat >"$bin/tailscale" <<'EOF'
 #!/usr/bin/env bash
 printf 'tailscale %s\n' "$*" >>"$TEST_LOG"
 unexpected() {
@@ -180,7 +367,46 @@ case $1 in
       *) unexpected "$@" ;;
     esac
     ;;
-  serve) exit "${TEST_SERVE_EXIT:-0}" ;;
+  serve)
+    state=$TEST_SERVE_STATE
+    [[ -f $state ]] || printf '{}\n' >"$state"
+    case ${*:2} in
+      'status --json')
+        if [[ ${TEST_SERVE_STATUS_EXIT:-0} != 0 ]]; then
+          printf 'failed to connect to the local Tailscale daemon\n' >&2
+          exit "$TEST_SERVE_STATUS_EXIT"
+        fi
+        cat -- "$state"
+        ;;
+      '--bg --https '*)
+        (($# == 5)) || unexpected "$@"
+        code=${TEST_SERVE_EXIT:-0}
+        if [[ $code == 0 ]]; then
+          jq --arg port "$4" --arg target "$5" --arg host "$TEST_SERVE_HOST" \
+            '.TCP[$port] = {HTTPS: true} | .Web["\($host):\($port)"].Handlers["/"] = {Proxy: $target}' \
+            "$state" >"$state.new" && mv -f -- "$state.new" "$state"
+        fi
+        exit "$code"
+        ;;
+      --https=[0-9]*' --set-path='*' off')
+        (($# == 4)) || unexpected "$@"
+        port=${2#--https=} mount=${3#--set-path=}
+        jq --arg port "$port" --arg mount "$mount" '
+          reduce ((.Web // {}) | keys[] | select(endswith(":" + $port))) as $key (.;
+            del(.Web[$key].Handlers[$mount])
+            | if (.Web[$key].Handlers | length) == 0 then del(.Web[$key]) | del(.TCP[$port]) else . end)' \
+          "$state" >"$state.new" && mv -f -- "$state.new" "$state"
+        ;;
+      --https=[0-9]*' off')
+        (($# == 3)) || unexpected "$@"
+        port=${2#--https=}
+        jq --arg port "$port" \
+          'del(.TCP[$port]) | .Web = ((.Web // {}) | with_entries(select(.key | endswith(":" + $port) | not)))' \
+          "$state" >"$state.new" && mv -f -- "$state.new" "$state"
+        ;;
+      *) unexpected "$@" ;;
+    esac
+    ;;
   debug)
     [[ $* == 'debug prefs' ]] || unexpected "$@"
     printf '{"RouteAll":%s}\n' "$route_all"
@@ -191,7 +417,7 @@ EOF
 
 # ip prints the case's networks, the fixture $TEST_NETWORKS, as `ip -4 -o addr` does, or fails with
 # TEST_IP_EXIT.
-cat >"$work_dir/bin/ip" <<'EOF'
+cat >"$bin/ip" <<'EOF'
 #!/usr/bin/env bash
 [[ $* == '-4 -o addr' ]] || { printf 'fake ip: unexpected call: ip %s\n' "$*" >&2; exit 2; }
 if [[ ${TEST_IP_EXIT:-0} != 0 ]]; then
@@ -201,129 +427,800 @@ fi
 cat -- "$TEST_NETWORKS"
 EOF
 
-# The release's update.sh and binary, as provision.sh runs them from the deploy directory. The real
-# update.sh reads /api/status once, and fails when the recorder runs but does not answer yet, as
-# it does right after a restart: so does this one when the recorder was restarted before it.
-cat >"$work_dir/deploy/update.sh" <<'EOF'
+# provision.sh reads nothing over HTTP. update.sh and the launcher do, so a curl call means
+# provision.sh ran one of them itself, not through systemd: an error the test reports. With
+# TEST_REAL_UPDATE=1, the nightly update runs through the fake systemctl, and curl answers it: the
+# release API with $TEST_RELEASES/latest.json, each asset URL with its file under $TEST_RELEASES,
+# and the recorder's /api/status (free) and /api/version (the commit it runs) while it runs.
+cat >"$bin/curl" <<'EOF'
 #!/usr/bin/env bash
-printf 'update.sh XDG_RUNTIME_DIR=%s\n' "${XDG_RUNTIME_DIR:-}" >>"$TEST_LOG"
-if grep -q 'systemctl --user try-restart ghost-wispr.service$' "$TEST_LOG"; then
-  printf 'ghost-wispr update: ghost-wispr is active but /api/status gave no status\n' >&2
-  exit 1
+printf 'curl %s\n' "$*" >>"$TEST_LOG"
+if [[ ${TEST_REAL_UPDATE:-} != 1 ]]; then
+  printf 'fake curl: a call, so provision.sh ran update.sh or the launcher itself: curl %s\n' "$*" >>"$TEST_LOG.errors"
+  exit 7
 fi
+output='' url=''
+while (($#)); do
+  case $1 in
+    --output) output=$2 && shift ;;
+    --connect-timeout | --max-time) shift ;;
+    -*) ;;
+    *) url=$1 ;;
+  esac
+  shift
+done
+case $url in
+  "$GHOST_WISPR_STATUS_URL")
+    [[ -f $TEST_STATE/active ]] || exit 7
+    printf '{"active_session_id":"","paused":false,"capture_state":"idle"}\n'
+    ;;
+  "$GHOST_WISPR_VERSION_URL")
+    [[ -f $TEST_STATE/active ]] || exit 7
+    printf '{"commit":"%s"}\n' "$(<"$TEST_STATE/running-commit")"
+    ;;
+  "$GHOST_WISPR_RELEASE_API") cat -- "$TEST_RELEASES/latest.json" ;;
+  https://assets.test.invalid/*)
+    file=$TEST_RELEASES/${url#https://assets.test.invalid/}
+    [[ -f $file && -n $output ]] || exit 22
+    cp -- "$file" "$output"
+    ;;
+  *) exit 6 ;;
+esac
 EOF
-cat >"$work_dir/deploy/ghost-wispr" <<'EOF'
+
+# The release binary that the nightly update installs. Its google-id-token logs how it was run and
+# prints a JWT for the subject TEST_SUBJECT and the audience it is asked for.
+cat >"$TEST_BINARY" <<'EOF'
 #!/usr/bin/env bash
-payload=$(printf '{"sub":"%s","aud":"api.tailscale.com/%s"}' "$SUBJECT" "$CLIENT_ID" | base64 -w0 | tr '+/' '-_' | tr -d '=')
+printf 'ghost-wispr %s\n' "$*" >>"$TEST_LOG"
+[[ ${1:-} == google-id-token ]] || exit 3
+audience=
+while (($#)); do
+  [[ $1 != --audience ]] || audience=$2
+  shift
+done
+payload=$(printf '{"sub":"%s","aud":"%s"}' "$TEST_SUBJECT" "$audience" | base64 -w0 | tr '+/' '-_' | tr -d '=')
 printf 'eyJhbGciOiJSUzI1NiJ9.%s.c2lnbmF0dXJl\n' "$payload"
 EOF
-chmod +x "$work_dir/bin/"* "$work_dir/deploy/update.sh" "$work_dir/deploy/ghost-wispr"
 
-printf 'CERTIFICATE\n' >"$work_dir/bundle/device.crt"
-printf '{"type":"external_account","credential_source":{"certificate":{"certificate_config_location":"/opt/ghost-wispr/certificate_config.json"}}}\n' \
-  >"$work_dir/bundle/google-credentials.json"
-printf '{}\n' >"$work_dir/bundle/certificate_config.json"
-printf '%s\n' "$CLIENT_ID" >"$work_dir/bundle/tailscale-client-id"
-printf '%s\n' "$SUBJECT" >"$work_dir/bundle/tailscale-subject"
-printf 'deepgram-key' >"$work_dir/bundle/deepgram-key"
+# The binary that build-deploy-tarball.sh builds the stage for: it answers link-versions as a
+# binary with no such subcommand does, so the manifest has no link_versions.
+cat >"$work_dir/release-binary" <<'EOF'
+#!/usr/bin/env bash
+[[ $* == link-versions ]] || exit 3
+printf 'unknown subcommand "link-versions"\n' >&2
+exit 2
+EOF
 
-# run_provision runs provision.sh on a bundle of the named files, with neutral deployment settings
-# and the join's directory in $work_dir/join.
-run_provision() {
-  tar -C "$work_dir/bundle" -cf - "$@" \
-    | env -u XDG_RUNTIME_DIR PATH="$work_dir/bin:$PATH" GHOST_WISPR_DEPLOY_DIR="$work_dir/deploy" \
-      GHOST_WISPR_IDENTITY_KEY="$work_dir/key.pem" GHOST_WISPR_PI_ENV="$repo_root/deploy/pi/test-pi.env" \
-      GHOST_WISPR_JOIN_DIR="$work_dir/join" bash "$repo_root/deploy/pi/provision.sh" >"$work_dir/out" 2>&1
-}
-readonly bundle_files=(device.crt google-credentials.json certificate_config.json tailscale-client-id
-  tailscale-subject deepgram-key)
-
-# The bundle holds no Envoy file: the recorder publishes to the Envoy hub with no credential, and
-# its config names the hub. A bundle that still carries a webhook file is refused before anything
-# is installed.
-for webhook_file in envoy-webhook-secret envoy-webhook-url; do
-  printf 'webhook\n' >"$work_dir/bundle/$webhook_file"
-  if run_provision "${bundle_files[@]}" "$webhook_file"; then
-    fail "provision.sh accepted a bundle with $webhook_file"
+# date logs each call for the time now in seconds to $TEST_LOG.events, in order with the user
+# manager's reloads, and answers as the real date; while $TEST_CLOCK exists, from that clock. sleep
+# moves that clock instead of waiting, so the update's 120 s version wait takes no time.
+cat >"$bin/date" <<'EOF'
+#!/usr/bin/env bash
+if [[ $* == +%s ]]; then
+  printf 'date +%%s\n' >>"$TEST_LOG.events"
+  if [[ -f ${TEST_CLOCK:-} ]]; then
+    cat -- "$TEST_CLOCK"
+    exit 0
   fi
-  grep -Fq "credential bundle contains unexpected path: $webhook_file" "$work_dir/out" \
-    || fail "provision.sh did not name $webhook_file when it refused the bundle: $(<"$work_dir/out")"
-  [[ ! -e $TEST_LOG ]] || fail "provision.sh ran commands for a refused bundle: $(<"$TEST_LOG")"
+fi
+exec "$TEST_REAL_DATE" "$@"
+EOF
+cat >"$bin/sleep" <<'EOF'
+#!/usr/bin/env bash
+if [[ -f ${TEST_CLOCK:-} && $# == 1 && $1 =~ ^[0-9]+$ ]]; then
+  printf '%s\n' "$(($(<"$TEST_CLOCK") + $1))" >"$TEST_CLOCK"
+  exit 0
+fi
+exec "$TEST_REAL_SLEEP" "$@"
+EOF
+chmod +x "$bin/"* "$TEST_BINARY" "$work_dir/release-binary"
+
+sha() {
+  local sum
+  sum=$(sha256sum -- "$1") || return 1
+  printf '%s\n' "${sum%% *}"
+}
+
+# restage DIR NAME SOURCE puts SOURCE in the release directory DIR as NAME, and gives manifest.json
+# its SHA-256, as a release built with that file would hold it.
+restage() {
+  local dir=$1 name=$2 sum
+  cp -- "$3" "$dir/$name"
+  sum=$(sha "$dir/$name")
+  jq --arg name "$name" --arg sum "$sum" '.files[$name] = $sum' "$dir/manifest.json" >"$dir/manifest.json.new"
+  mv -f -- "$dir/manifest.json.new" "$dir/manifest.json"
+}
+
+# make_stage DIR writes a release's deploy set into DIR with build-deploy-tarball.sh --stage, the
+# directory the release's tarball holds, with test-pi.env as its pi.env.
+make_stage() {
+  rm -rf -- "$1"
+  bash "$repo_root/deploy/pi/build-deploy-tarball.sh" --stage "$release_commit" "$work_dir/release-binary" "$1" \
+    >"$work_dir/build.out" 2>&1 || fail "build-deploy-tarball.sh --stage failed: $(<"$work_dir/build.out")"
+  [[ -f $1/manifest.json && -f $1/provision.sh ]] || fail "build-deploy-tarball.sh --stage wrote no release directory in $1"
+  restage "$1" pi.env "$script_dir/test-pi.env"
+}
+
+# new_pi makes the fake Pi as provision.sh --key and --certificate leave it: the key and the first
+# certificate, and no other file of Ghost Wispr. Serve serves nothing, the node has not joined yet,
+# no recorder runs, and each log starts empty.
+new_pi() {
+  rm -rf -- "$pi"
+  mkdir -p -- "$deploy" "$units" "$key_dir" "$sysroot" "$state"
+  printf 'the key\n' >"$key"
+  printf 'the certificate\n' >"$deploy/device.crt"
+  rm -f -- "$TEST_LOG" "$TEST_LOG".*
+  : >"$TEST_LOG"
+  printf '{}\n' >"$TEST_SERVE_STATE"
+  printf 'false\n' >"$TEST_ROUTE_ALL"
+}
+
+# run_provision DIR [ARGUMENT...] runs DIR/provision.sh as ghost-wispr on the fake Pi, with no input
+# and no XDG_RUNTIME_DIR of its own; RUN_INPUT names a file to give it as input instead. Its output
+# goes to $work_dir/out, and its exit code to rc.
+run_provision() {
+  local dir=$1
+  shift
+  rc=0
+  env -u XDG_RUNTIME_DIR PATH="$bin:$PATH" GHOST_WISPR_DEPLOY_DIR="$deploy" GHOST_WISPR_UNIT_DIR="$units" \
+    GHOST_WISPR_IDENTITY_KEY="$key" GHOST_WISPR_JOIN_DIR="$join" GHOST_WISPR_SYSTEM_ROOT="$sysroot" \
+    GHOST_WISPR_RELEASE_API="$release_api" GHOST_WISPR_STATUS_URL="$status_url" GHOST_WISPR_VERSION_URL="$version_url" \
+    bash "$dir/provision.sh" "$@" <"${RUN_INPUT:-/dev/null}" >"$work_dir/out" 2>&1 || rc=$?
+}
+
+# make_release NAME COMMIT ANSWER [CERTIFICATE] publishes the fake release NAME of COMMIT, whose
+# binary answers /api/version with ANSWER once it runs, and answers pi-secrets with two secret lines
+# and, given CERTIFICATE, a version number, a newer certificate of that version, staged as the real
+# pi-secrets stages one ("certificate version N" in device.crt). Each file of its deploy set but
+# provision.sh and serve.conf ends with the line "# release NAME", so the files of two releases
+# differ. provision.sh runs from $TEST_RELEASES/NAME/ghost-wispr-pi-deploy, which
+# build-deploy-tarball.sh --stage writes; the tarball of that directory, the binary and their
+# .sha256 files are the assets of $TEST_RELEASES/NAME/release.json.
+make_release() {
+  local name=$1 commit=$2 answer=$3 certificate=${4:-} dir=$TEST_RELEASES/$1 file
+  rm -rf -- "$dir"
+  mkdir -p -- "$dir"
+  {
+    printf '#!/usr/bin/env bash\n# answers commit %s\ncertificate=%s\n' "$answer" "$certificate"
+    cat <<'EOF'
+case ${1:-} in
+  link-versions)
+    printf 'unknown subcommand "link-versions"\n' >&2
+    exit 2
+    ;;
+  pi-secrets)
+    out=''
+    while (($#)); do
+      [[ $1 != --out ]] || out=$2
+      shift
+    done
+    [[ -d $out ]] || exit 1
+    printf '%s\n' GHOST_WISPR_DEEPGRAM_API_KEY=test-key GHOST_WISPR_DISPATCH_TOKEN=test-token >"$out/secrets.env"
+    chmod 0600 "$out/secrets.env"
+    printf 'pi-secrets: read the two secrets\n'
+    if [[ -n $certificate ]]; then
+      printf 'certificate version %s\n' "$certificate" >"$out/device.crt"
+      printf 'pi-secrets: certificate version %s, not after 2027-12-01T00:00:00Z: newer and signs in\n' "$certificate"
+    fi
+    ;;
+  *) exit 3 ;;
+esac
+EOF
+  } >"$dir/ghost-wispr-linux-arm64"
+  chmod 0755 "$dir/ghost-wispr-linux-arm64"
+  bash "$repo_root/deploy/pi/build-deploy-tarball.sh" --stage "$commit" "$dir/ghost-wispr-linux-arm64" "$dir/ghost-wispr-pi-deploy" \
+    >"$work_dir/build.out" 2>&1 || fail "build-deploy-tarball.sh --stage failed for release $name: $(<"$work_dir/build.out")"
+  restage "$dir/ghost-wispr-pi-deploy" pi.env "$script_dir/test-pi.env"
+  for file in ghost-wispr.yaml pi.env update.sh pi-lib.sh wait-for-network.sh wait-for-time-sync.sh ghost-wispr.service \
+    99-ghost-wispr.rules logind-power-key.conf ghost-wispr-update-launcher.sh ghost-wispr-update.service ghost-wispr-update.timer; do
+    { cat -- "$dir/ghost-wispr-pi-deploy/$file" && printf '# release %s\n' "$name"; } >"$work_dir/marked"
+    restage "$dir/ghost-wispr-pi-deploy" "$file" "$work_dir/marked"
+  done
+  tar -C "$dir" -czf "$dir/ghost-wispr-pi-deploy.tar.gz" ghost-wispr-pi-deploy
+  (cd -- "$dir" && sha256sum ghost-wispr-pi-deploy.tar.gz >ghost-wispr-pi-deploy.tar.gz.sha256 \
+    && sha256sum ghost-wispr-linux-arm64 >ghost-wispr-linux-arm64.sha256) || fail "could not sum release $name's assets"
+  jq -n --arg commit "$commit" --arg base "https://assets.test.invalid/$name" '{target_commitish: $commit,
+    assets: [("ghost-wispr-linux-arm64", "ghost-wispr-linux-arm64.sha256", "ghost-wispr-pi-deploy.tar.gz",
+      "ghost-wispr-pi-deploy.tar.gz.sha256") | {name: ., browser_download_url: "\($base)/\(.)"}]}' >"$dir/release.json"
+}
+
+# real_provision NAME runs the provision.sh of release NAME, now the latest release, on the fake Pi,
+# joined to the tailnet, with the real nightly update behind the update unit's start: the real
+# launcher and update.sh run against the fake release API, recorder, systemd, sudo and Tailscale,
+# on a clock that sleep moves. The update's lines go to the journal that provision.sh prints.
+real_provision() {
+  cp -- "$TEST_RELEASES/$1/release.json" "$TEST_RELEASES/latest.json"
+  : >"$TEST_LOG"
+  rm -f -- "$TEST_LOG.errors"
+  : >"$work_dir/journal"
+  printf '1000\n' >"$TEST_CLOCK"
+  TEST_REAL_UPDATE=1 TEST_JOURNAL=$work_dir/journal TEST_SELF_STATUS=$joined_status \
+    run_provision "$TEST_RELEASES/$1/ghost-wispr-pi-deploy"
+  rm -f -- "$TEST_CLOCK"
+}
+
+# installed_set prints the SHA-256 of each installed file of the deploy set, the binary, .env and
+# deploy.verified, or "missing", and the commit the recorder answers.
+installed_set() {
+  local path
+  for path in "$deploy"/{ghost-wispr.yaml,pi.env,update.sh,pi-lib.sh,wait-for-network.sh,wait-for-time-sync.sh} \
+    "$units/ghost-wispr.service" "$sysroot/etc/udev/rules.d/99-ghost-wispr.rules" \
+    "$sysroot/etc/systemd/logind.conf.d/50-ghost-wispr-power-key.conf" "$deploy"/{ghost-wispr,.env,deploy.verified}; do
+    if [[ -f $path ]]; then
+      printf '%s %s\n' "$(sha "$path")" "${path#"$pi"/}"
+    else
+      printf 'missing %s\n' "${path#"$pi"/}"
+    fi
+  done
+  printf 'the recorder answers %s\n' "$(cat -- "$state/running-commit" 2>/dev/null || echo nothing)"
+}
+
+# expect_ran WHAT fails unless the run exited 0, printed no bash error, and broke no rule of a fake.
+expect_ran() {
+  ((rc == 0)) || fail "$1: provision.sh exited $rc: $(<"$work_dir/out")"
+  if grep -E 'provision\.sh: line [0-9]+: ' "$work_dir/out" >&2; then
+    fail "$1: provision.sh printed a bash error (above)"
+  fi
+  [[ ! -s $TEST_LOG.errors ]] || fail "$1: $(<"$TEST_LOG.errors")"
+}
+
+# expect_refused WHAT TEXT fails unless the run exited non-zero and said TEXT.
+expect_refused() {
+  ((rc != 0)) || fail "$1: provision.sh exited 0: $(<"$work_dir/out")"
+  grep -Fq -- "$2" "$work_dir/out" || fail "$1: provision.sh did not say '$2': $(<"$work_dir/out")"
+}
+
+said() { grep -Fq -- "$1" "$work_dir/out"; }
+logged() { grep -Fxq -- "$1" "${2:-$TEST_LOG}"; }
+
+# line_of LINE [LOG] prints the number of the first line of LOG that is LINE, or nothing.
+line_of() {
+  grep -n -F -x -- "$1" "${2:-$TEST_LOG}" | head -n 1 | cut -d: -f1 || true
+}
+
+# pi_files prints the mode, the SHA-256 and the path of each file on the fake Pi.
+pi_files() {
+  local file
+  while IFS= read -r file; do
+    printf '%s %s %s\n' "$(stat -c %a -- "$pi/$file")" "$(sha "$pi/$file")" "$file"
+  done < <(cd -- "$pi" && find . -type f | LC_ALL=C sort)
+}
+
+# serve_now prints the fake Pi's Serve setting as serve.conf lines, "<port> <proxy target>", sorted:
+# each HTTPS port, with the proxy target of its handler / or "none".
+serve_now() {
+  jq -r '(.TCP // {} | to_entries[] | select(.value.HTTPS == true) | .key) as $port
+    | ([.Web // {} | to_entries[] | select(.key | endswith(":" + $port)) | .value.Handlers["/"].Proxy] | first // "none") as $target
+    | "\($port) \($target)"' "$TEST_SERVE_STATE" | LC_ALL=C sort
+}
+
+make_stage "$stage"
+readonly joined_status='{"Self":{"Tags":["tag:ghost-wispr"],"DNSName":"ghost-wispr.example-tailnet.ts.net."}}'
+
+# ---------------------------------------------------------------------------------------------------
+# bundle-refused: provision.sh reads no bundle. Input on standard input, such as the credential
+# bundle an older provisioner read there, is refused with a usage line before any command runs; so
+# is an argument it does not know.
+begin bundle-refused
+new_pi
+before=$(pi_files)
+tar -C "$script_dir" -cf "$work_dir/bundle.tar" test-pi.env
+RUN_INPUT=$work_dir/bundle.tar run_provision "$stage"
+expect_refused 'a bundle on standard input' 'usage: provision.sh'
+said 'standard input' || fail "provision.sh did not say why it refused its input: $(<"$work_dir/out")"
+[[ ! -s $TEST_LOG ]] || fail "provision.sh ran commands with a bundle on its input: $(<"$TEST_LOG")"
+[[ $(pi_files) == "$before" ]] || fail 'provision.sh changed a file with a bundle on its input'
+run_provision "$stage" --bundle
+expect_refused 'an argument it does not know' 'usage: provision.sh'
+[[ ! -s $TEST_LOG ]] || fail "provision.sh ran commands for an argument it does not know: $(<"$TEST_LOG")"
+
+# ---------------------------------------------------------------------------------------------------
+# not-a-release: provision.sh installs only a release's files. A checkout's deploy/pi/, which has
+# no manifest.json, a file changed after the release was built, and a file the manifest names that
+# is missing are each refused before any file is installed: the only commands run are the reads of
+# the user manager and the packages.
+begin not-a-release
+# expect_nothing_installed WHAT
+expect_nothing_installed() {
+  [[ $(pi_files) == "$before" ]] || fail "$1: provision.sh changed a file on the Pi"
+  if grep -vE '^(systemctl --user (daemon-reload|show-environment)|sudo apt-get .*)$' "$TEST_LOG" >&2; then
+    fail "$1: provision.sh ran more than the reads of the user manager and the packages (above)"
+  fi
+}
+new_pi
+before=$(pi_files)
+run_provision "$repo_root/deploy/pi"
+expect_refused "a checkout's deploy/pi/" 'manifest.json'
+expect_nothing_installed "a checkout's deploy/pi/"
+rm -rf -- "$work_dir/changed-stage"
+cp -a -- "$stage" "$work_dir/changed-stage"
+printf '# changed after the release was built\n' >>"$work_dir/changed-stage/update.sh"
+: >"$TEST_LOG"
+run_provision "$work_dir/changed-stage"
+expect_refused 'update.sh changed after the build' 'update.sh'
+expect_nothing_installed 'update.sh changed after the build'
+rm -rf -- "$work_dir/short-stage"
+cp -a -- "$stage" "$work_dir/short-stage"
+rm -- "$work_dir/short-stage/pi-lib.sh"
+: >"$TEST_LOG"
+run_provision "$work_dir/short-stage"
+expect_refused 'pi-lib.sh missing' 'pi-lib.sh'
+expect_nothing_installed 'pi-lib.sh missing'
+
+# ---------------------------------------------------------------------------------------------------
+# first-run: provision.sh on the office Pi before its first run of this provisioner, from P2's
+# temporary copy of the release's directory. An older provisioner left an older update.sh, which
+# installed the binary alone, and a timer that starts it at 03:30 alone.
+begin first-run
+new_pi
+rm -rf -- "$work_dir/p2-stage"
+cp -a -- "$stage" "$work_dir/p2-stage"
+printf '#!/bin/sh\n# an older update.sh, which installed the binary alone\n' >"$deploy/update.sh"
+printf '%s\n' '[Timer]' 'OnCalendar=*-*-* 03:30:00' 'Persistent=true' '[Install]' 'WantedBy=timers.target' \
+  >"$units/ghost-wispr-update.timer"
+printf '%s\n' 'ghost-wispr launcher: invocation test-invocation trigger none at none' \
+  "ghost-wispr update: installed commit $release_commit (invocation test-invocation)" >"$work_dir/journal"
+TEST_JOURNAL=$work_dir/journal run_provision "$work_dir/p2-stage"
+cp -- "$TEST_LOG" "$work_dir/first.log"
+cp -- "$work_dir/out" "$work_dir/first.out"
+cp -- "$TEST_LOG.events" "$work_dir/first.events"
+for file in join systemd-run installed-route-overlap-check; do
+  if [[ -f $TEST_LOG.$file ]]; then
+    cp -- "$TEST_LOG.$file" "$first_join/${file#installed-}"
+  fi
 done
 
-run_provision "${bundle_files[@]}" || fail "provision.sh failed: $(<"$work_dir/out")"
-# A run that works says no bash error.
-if grep -E 'provision\.sh: line [0-9]+: ' "$work_dir/out" >&2; then
-  fail "provision.sh printed a bash error (above)"
+# one-update-start: the update runs as one systemctl --user start of ghost-wispr-update.service, so
+# systemd joins it with a start of the timer at the same moment, and never as a run of the launcher
+# or update.sh by provision.sh itself. The timer is on before the start, and the recorder's unit,
+# which the update installs, is enabled after it.
+begin one-update-start
+starts=$(grep -c '^systemctl --user start ' "$work_dir/first.log" || true)
+if [[ $starts != 1 ]] || ! logged 'systemctl --user start ghost-wispr-update.service' "$work_dir/first.log"; then
+  fail "provision.sh started the update $starts times, not once with systemctl --user start ghost-wispr-update.service: $(<"$work_dir/first.log")"
 fi
-assert_recording_rules 'installed'
-assert_office_pi_devices 'installed'
-# The full provisioner installs the template as it is: the Envoy hub it names, no placeholder.
-cmp -s "$repo_root/deploy/pi/files/ghost-wispr.yaml" "$TEST_LOG.installed-ghost-wispr.yaml" \
-  || fail "the installed configuration is not deploy/pi/files/ghost-wispr.yaml"
+if grep -q '^curl ' "$work_dir/first.log" || grep -q 'ghost-wispr launcher:' <(grep -v 'invocation test-invocation' "$work_dir/first.out"); then
+  fail "provision.sh ran the launcher or update.sh itself: $(<"$work_dir/first.log")"
+fi
+timer_at=$(line_of 'systemctl --user enable --now ghost-wispr-update.timer' "$work_dir/first.log")
+start_at=$(line_of 'systemctl --user start ghost-wispr-update.service' "$work_dir/first.log")
+enable_at=$(line_of 'systemctl --user enable ghost-wispr.service' "$work_dir/first.log")
+[[ -n $timer_at && -n $enable_at && $timer_at -lt $start_at && $start_at -lt $enable_at ]] \
+  || fail "provision.sh did not turn the timer on before the start and enable ghost-wispr.service after it: $(<"$work_dir/first.log")"
+# The journal it prints starts before the user manager loads the release's timer: its schedule has
+# times the old one lacks, such as 03:45, and a reload can start the update at once
+# (systemd#16732), before a time read after it. The first time read comes before that reload.
+release_timer=$(sha "$work_dir/stage/ghost-wispr-update.timer")
+mapfile -t events <"$work_dir/first.events"
+since_at='' loaded_at=''
+for i in "${!events[@]}"; do
+  if [[ -z $since_at && ${events[i]} == 'date +%s' ]]; then
+    since_at=$i
+  fi
+  if [[ -z $loaded_at && ${events[i]} == "reload timer=$release_timer" ]]; then
+    loaded_at=$i
+  fi
+done
+[[ -n $since_at && -n $loaded_at && $since_at -lt $loaded_at ]] \
+  || fail "provision.sh read the time for the update's journal after the user manager loaded the release's timer: $(paste -sd ';' "$work_dir/first.events")"
 
-# The .env the recorder runs with holds the Deepgram key and no Envoy webhook signing key.
-env_file="$TEST_LOG.installed-.env"
-deepgram_key_name="DEEPGRAM""_API_KEY"
-grep -Fxq "GHOST_WISPR_$deepgram_key_name=deepgram-key" "$env_file" || fail "the installed .env has no Deepgram key"
-if grep -q 'ENVOY_WEBHOOK_SECRET' "$env_file"; then
-  fail "the installed .env still holds an Envoy webhook secret"
+# release-files-first: when the update starts, the release's update.sh, pi-lib.sh and pi.env, the
+# bootstrap files and the credential files are in place, so the update that runs is the release's,
+# on its own library and settings.
+begin release-files-first
+[[ -f $TEST_LOG.start ]] || fail 'the update never started'
+want_start=$(
+  for name in update.sh pi-lib.sh pi.env ghost-wispr-update-launcher.sh; do
+    printf '%s %s\n' "$(sha "$stage/$name")" "$name"
+  done
+  for name in google-credentials.json certificate_config.json; do
+    printf '%s %s\n' "$(sha "$deploy/$name")" "$name"
+  done
+  for name in ghost-wispr-update.service ghost-wispr-update.timer; do
+    printf '%s %s\n' "$(sha "$stage/$name")" "$name"
+  done
+)
+[[ $(<"$TEST_LOG.start") == "$want_start" ]] \
+  || fail "the update started on other files than the release's: got $(<"$TEST_LOG.start"), want $want_start"
+
+begin first-run
+expect_ran 'the first run'
+said "ghost-wispr update: installed commit $release_commit (invocation test-invocation)" \
+  || fail "provision.sh did not print the update's lines from its journal: $(<"$work_dir/out")"
+grep -Eq '^sudo journalctl _SYSTEMD_USER_UNIT=ghost-wispr-update\.service --since=@[0-9]+ --no-pager --output=cat$' \
+  "$work_dir/first.log" || fail "provision.sh did not read this run's lines of the update from the journal: $(<"$work_dir/first.log")"
+
+# credentials-written: where the Pi has no credential files, provision.sh writes them from pi.env
+# with each field that gcloud's create-cred-config writes for an X.509 credential, naming the Pi's
+# own paths, mode 0644. gcloud (as the office Pi's files hold it) impersonates through the mTLS
+# endpoint, iamcredentials.mtls.googleapis.com.
+begin credentials-written
+readonly want_google_credentials='{"audience":"//iam.googleapis.com/projects/123/locations/global/workloadIdentityPools/ghost-wispr/providers/ghost-wispr","credential_source":{"certificate":{"certificate_config_location":"/opt/ghost-wispr/certificate_config.json"}},"service_account_impersonation_url":"https://iamcredentials.mtls.googleapis.com/v1/projects/-/serviceAccounts/ghost-wispr@example-project.iam.gserviceaccount.com:generateAccessToken","subject_token_type":"urn:ietf:params:oauth:token-type:mtls","token_url":"https://sts.mtls.googleapis.com/v1/token","type":"external_account","universe_domain":"googleapis.com"}'
+readonly want_certificate_config='{"cert_configs":{"workload":{"cert_path":"/opt/ghost-wispr/device.crt","key_path":"/home/ghost-wispr/.config/ghost-wispr-identity/key.pem"}}}'
+for entry in "google-credentials.json $want_google_credentials" "certificate_config.json $want_certificate_config"; do
+  name=${entry%% *} want=${entry#* }
+  [[ -f $deploy/$name ]] || fail "provision.sh wrote no $name"
+  [[ $(jq -cS . "$deploy/$name") == "$want" ]] || fail "$name holds $(jq -cS . "$deploy/$name"), want $want"
+  [[ $(stat -c %a -- "$deploy/$name") == 644 ]] || fail "$name has mode $(stat -c %a -- "$deploy/$name"), not 644"
+  said "credentials: wrote $name from pi.env" || fail "provision.sh did not say it wrote $name: $(<"$work_dir/out")"
+done
+if said 'credentials: same' || said 'credentials: differ'; then
+  fail "provision.sh compared credential files that it wrote: $(<"$work_dir/out")"
 fi
-# The full provisioner writes .env anew, with only variables Ghost Wispr reads: no variable of a
-# setting that providers replaced, such as the Vertex embedding location, which a start warns about.
-env_names=$(cut -d= -f1 "$env_file" | LC_ALL=C sort | tr '\n' ' ')
-[[ $env_names == "GHOST_WISPR_ADDR GHOST_WISPR_$deepgram_key_name GOOGLE_API_USE_CLIENT_CERTIFICATE " ]] \
-  || fail "the installed .env sets $env_names, want GHOST_WISPR_ADDR, GHOST_WISPR_$deepgram_key_name and GOOGLE_API_USE_CLIENT_CERTIFICATE"
-# Without a dispatch-token in the bundle, the .env gives the meeting voice no Dispatch token.
-dispatch_token_name="DISPATCH""_TOKEN"
-if grep -q "^GHOST_WISPR_$dispatch_token_name=" "$env_file"; then
-  fail "the installed .env has a Dispatch token the bundle did not carry"
+cp -- "$deploy/google-credentials.json" "$work_dir/google-credentials.json"
+cp -- "$deploy/certificate_config.json" "$work_dir/certificate_config.json"
+
+# bootstrap-files: the launcher, the update unit and the timer come from the release's directory,
+# with update.sh, pi-lib.sh and pi.env, each byte for byte, with its mode.
+begin bootstrap-files
+for entry in "ghost-wispr-update-launcher.sh $deploy 755" "ghost-wispr-update.service $units 644" \
+  "ghost-wispr-update.timer $units 644" "update.sh $deploy 755" "pi-lib.sh $deploy 755" "pi.env $deploy 644"; do
+  read -r name dir mode <<<"$entry"
+  cmp -s -- "$stage/$name" "$dir/$name" || fail "$dir/$name is not the release's $name"
+  [[ $(stat -c %a -- "$dir/$name") == "$mode" ]] || fail "$dir/$name has mode $(stat -c %a -- "$dir/$name"), not $mode"
+done
+
+# no-env-no-system-files: the nightly update owns .env, the config, the udev rule and the logind
+# setting. provision.sh writes none of them, and reloads neither udev nor logind.
+begin no-env-no-system-files
+for name in .env ghost-wispr.yaml; do
+  [[ ! -e $deploy/$name ]] || fail "provision.sh wrote $deploy/$name"
+done
+if grep -E 'udev|logind|99-ghost-wispr\.rules|logind-power-key' "$work_dir/first.log" >&2; then
+  fail 'provision.sh installed or reloaded a system file itself (above)'
 fi
 
-# The unit's own Dispatch token, when the bundle carries one, reaches the .env for the Concierge,
-# and a token that is not one line is refused. Each run starts a fresh log, as a first run does.
+# groups-and-linger: a lingering user service has no seat, so only the audio group opens the ALSA
+# devices; the packages install, and the user manager lingers.
+begin groups-and-linger
+for line in 'sudo apt-get install -y --no-install-recommends libportaudio2 ffmpeg lame jq curl' \
+  'sudo usermod -aG audio ghost-wispr' 'sudo loginctl enable-linger ghost-wispr'; do
+  logged "$line" "$work_dir/first.log" || fail "provision.sh did not run $line: $(<"$work_dir/first.log")"
+done
+if grep -Eq '^sudo usermod -aG (plugdev|input) ' "$work_dir/first.log"; then
+  fail 'provision.sh re-added a group ghost-wispr already has'
+fi
+
+# join-command: the node had not joined, so provision.sh starts the detached join. It joins with
+# pi.env's client id and a token for pi.env's subject, from the binary the update installed, and the
+# join's command holds Serve's call as text: the join runs after P2's command removed the release's
+# directory, so it reads no file of it.
+begin join-command
+[[ -s $first_join/join ]] || fail 'provision.sh started no detached join'
+join_command=$(<"$first_join/join")
+[[ $join_command == *"--client-id='$client_id?ephemeral=false&preauthorized=true'"* ]] \
+  || fail "the join does not use pi.env's client id: $join_command"
+[[ $join_command == *'tailscale serve --bg --https 443 http://127.0.0.1:8080 || rc=$?;'* ]] \
+  || fail "the join does not hold serve.conf's line as a tailscale serve call: $join_command"
+[[ $join_command != *"$work_dir/p2-stage"* && $join_command != *serve.conf* ]] \
+  || fail "the join reads the release's directory: $join_command"
+logged "ghost-wispr google-id-token --credentials $deploy/google-credentials.json --audience api.tailscale.com/$client_id" \
+  "$work_dir/first.log" || fail "provision.sh did not ask the installed binary for a token for pi.env's client id: $(<"$work_dir/first.log")"
+grep -Fq 'starting the tagged tailnet join as ghost-wispr-tailnet-join-' "$work_dir/first.out" \
+  || fail "provision.sh did not name the join it started: $(<"$work_dir/first.out")"
+
+# ---------------------------------------------------------------------------------------------------
+# idempotent: a second run of the same release, on the Pi the first run left, now joined, changes
+# no file, starts the update once more, and stops after "already joined", with no join and no
+# route check.
+begin idempotent
+before=$(pi_files)
 : >"$TEST_LOG"
-printf 'dispatch-token-value' >"$work_dir/bundle/dispatch-token"
-run_provision "${bundle_files[@]}" dispatch-token || fail "provision.sh failed with a dispatch-token: $(<"$work_dir/out")"
-grep -Fxq "GHOST_WISPR_$dispatch_token_name=dispatch-token-value" "$TEST_LOG.installed-.env" \
-  || fail "the installed .env has no Dispatch token from the bundle's dispatch-token"
-printf 'two\nlines' >"$work_dir/bundle/dispatch-token"
-if run_provision "${bundle_files[@]}" dispatch-token; then
-  fail "provision.sh accepted a dispatch-token of two lines"
+TEST_SELF_STATUS=$joined_status run_provision "$stage"
+expect_ran 'a second run'
+[[ $(pi_files) == "$before" ]] || fail "a second run changed a file: $(diff <(printf '%s\n' "$before") <(pi_files) || true)"
+[[ $(grep -c '^systemctl --user start ' "$TEST_LOG" || true) == 1 ]] || fail "a second run did not start the update once: $(<"$TEST_LOG")"
+said 'already joined' || fail "a second run did not say the Pi had joined: $(<"$work_dir/out")"
+if grep -Eq 'systemd-run|route-overlap-check|tailscale set' "$TEST_LOG"; then
+  fail "a second run on a Pi already joined started a join or a route check: $(<"$TEST_LOG")"
 fi
-rm "$work_dir/bundle/dispatch-token"
-# A dispatch-token that is a link to nothing is refused, not skipped as absent.
-ln -s "$work_dir/no-such-token" "$work_dir/bundle/dispatch-token"
-if run_provision "${bundle_files[@]}" dispatch-token; then
-  fail "provision.sh accepted a dispatch-token that links to nothing"
-fi
-grep -q 'dispatch-token' "$work_dir/out" || fail "provision.sh refused the linked dispatch-token for another reason: $(<"$work_dir/out")"
-rm "$work_dir/bundle/dispatch-token"
 
-# A lingering user service has no seat, so only the audio group opens the ALSA devices.
-grep -Fxq 'sudo usermod -aG audio ghost-wispr' "$TEST_LOG" || fail "provision.sh does not add ghost-wispr to the audio group"
-if grep -Eq '^sudo usermod -aG (plugdev|input) ' "$TEST_LOG"; then
-  fail "provision.sh re-added a group ghost-wispr already has"
+# credentials-same: where the credential files exist, provision.sh compares them with what pi.env
+# renders, field by field, and changes nothing. gcloud wrote the office Pi's files in its own layout:
+# its key order, and certificate_config.json with no final line feed, as below with test-pi.env's
+# values. Those, and the same fields in another order and indentation, are the same.
+begin credentials-same
+said 'credentials: same as pi.env renders' || fail "a second run did not say the credentials are the same: $(<"$work_dir/out")"
+if said 'credentials: wrote' || said 'credentials: differ'; then
+  fail "a second run wrote or found different credential files: $(<"$work_dir/out")"
 fi
-# update.sh runs systemctl --user, which needs the user's runtime directory.
-grep -Fxq "update.sh XDG_RUNTIME_DIR=$runtime_dir" "$TEST_LOG" || fail "update.sh ran without XDG_RUNTIME_DIR=$runtime_dir"
-[[ -s $TEST_LOG.join ]] || fail "provision.sh started no detached join"
+cat >"$work_dir/gcloud-google-credentials.json" <<'EOF'
+{
+  "universe_domain": "googleapis.com",
+  "type": "external_account",
+  "audience": "//iam.googleapis.com/projects/123/locations/global/workloadIdentityPools/ghost-wispr/providers/ghost-wispr",
+  "subject_token_type": "urn:ietf:params:oauth:token-type:mtls",
+  "token_url": "https://sts.mtls.googleapis.com/v1/token",
+  "credential_source": {
+    "certificate": {
+      "certificate_config_location": "/opt/ghost-wispr/certificate_config.json"
+    }
+  },
+  "service_account_impersonation_url": "https://iamcredentials.mtls.googleapis.com/v1/projects/-/serviceAccounts/ghost-wispr@example-project.iam.gserviceaccount.com:generateAccessToken"
+}
+EOF
+printf '%s' '{
+  "cert_configs": {
+    "workload": {
+      "cert_path": "/opt/ghost-wispr/device.crt",
+      "key_path": "/home/ghost-wispr/.config/ghost-wispr-identity/key.pem"
+    }
+  }
+}' >"$work_dir/gcloud-certificate_config.json"
+for layout in gcloud reordered; do
+  for name in google-credentials.json certificate_config.json; do
+    if [[ $layout == gcloud ]]; then
+      cp -- "$work_dir/gcloud-$name" "$deploy/$name"
+    else
+      jq -S --indent 4 . "$work_dir/$name" >"$deploy/$name"
+    fi
+  done
+  before=$(pi_files)
+  : >"$TEST_LOG"
+  TEST_SELF_STATUS=$joined_status run_provision "$stage"
+  expect_ran "credential files in the $layout layout"
+  said 'credentials: same as pi.env renders' || fail "the same fields in the $layout layout were not the same: $(<"$work_dir/out")"
+  [[ $(pi_files) == "$before" ]] || fail "provision.sh rewrote credential files in the $layout layout that it found the same"
+done
 
-# The service starts only once the Pi's clock is synchronized, so no session is named or stamped
-# with the time a Pi with no battery-backed clock restores at boot. A user unit cannot be ordered
-# after the system's time-sync.target, so the unit waits in a start step: provision.sh installs it
-# beside the binary, the unit runs it after the network wait and before Ghost Wispr, and the unit's
-# start time limit is longer than both waits together, so a Pi whose clock never synchronizes still
-# starts once the wait gives up instead of being killed and restarted for good.
-grep -Fxq "sudo install -o ghost-wispr -g ghost-wispr -m 0755 $repo_root/deploy/pi/files/wait-for-time-sync.sh $work_dir/deploy/wait-for-time-sync.sh" "$TEST_LOG" \
-  || fail "provision.sh does not install wait-for-time-sync.sh beside the binary"
+# credentials-differ: a field that differs, one that the render does not write, and one that it
+# writes but the file lacks, are each named, by file and field, and the files are kept byte for
+# byte. P2's run reads this line.
+begin credentials-differ
+# expect_differ WANT: the run named the fields WANT ("FILE:FIELD ...") and kept every file.
+expect_differ() {
+  local line
+  : >"$TEST_LOG"
+  before=$(pi_files)
+  TEST_SELF_STATUS=$joined_status run_provision "$stage"
+  expect_ran "credentials that differ ($1)"
+  line=$(sed -n 's/^ghost-wispr provision: credentials: differ: \(.*\); the installed files were kept$/\1/p' "$work_dir/out")
+  [[ $line == "$1" ]] || fail "provision.sh named the fields [$line], want [$1]: $(<"$work_dir/out")"
+  ! said 'credentials: same' || fail "provision.sh also said the credentials are the same: $(<"$work_dir/out")"
+  [[ $(pi_files) == "$before" ]] || fail "provision.sh changed a credential file that differs ($1)"
+}
+jq '.audience = "//iam.googleapis.com/projects/999/locations/global/workloadIdentityPools/other/providers/other"' \
+  "$work_dir/google-credentials.json" >"$deploy/google-credentials.json"
+expect_differ 'google-credentials.json:audience'
+cp -- "$work_dir/google-credentials.json" "$deploy/google-credentials.json"
+jq 'del(.cert_configs.workload.key_path) | .extra = "a field gcloud does not write"' \
+  "$work_dir/certificate_config.json" >"$deploy/certificate_config.json"
+expect_differ 'certificate_config.json:cert_configs.workload.key_path certificate_config.json:extra'
+printf 'not JSON\n' >"$deploy/google-credentials.json"
+expect_differ 'google-credentials.json:(not JSON) certificate_config.json:cert_configs.workload.key_path certificate_config.json:extra'
+cp -- "$work_dir/google-credentials.json" "$work_dir/certificate_config.json" "$deploy/"
+
+# client-id: where the Pi keeps the client id of an earlier join, provision.sh says whether it is
+# pi.env's PI_TAILNET_CLIENT_ID, and keeps the file. Where it keeps none, it says nothing of it.
+begin client-id
+for entry in "$client_id matches" "another-client-id differs from"; do
+  printf '%s\n' "${entry%% *}" >"$deploy/tailscale-client-id"
+  : >"$TEST_LOG"
+  TEST_SELF_STATUS=$joined_status run_provision "$stage"
+  expect_ran "the client id ${entry%% *}"
+  said "tailnet client id: $deploy/tailscale-client-id ${entry#* } PI_TAILNET_CLIENT_ID" \
+    || fail "provision.sh did not say that $deploy/tailscale-client-id ${entry#* } PI_TAILNET_CLIENT_ID: $(<"$work_dir/out")"
+  [[ $(<"$deploy/tailscale-client-id") == "${entry%% *}" ]] || fail 'provision.sh changed tailscale-client-id'
+done
+rm -- "$deploy/tailscale-client-id"
+: >"$TEST_LOG"
+TEST_SELF_STATUS=$joined_status run_provision "$stage"
+expect_ran 'no client id kept'
+! said 'tailnet client id' || fail "provision.sh compared a client id the Pi does not keep: $(<"$work_dir/out")"
+
+# ---------------------------------------------------------------------------------------------------
+# newer-release: provision.sh from a newer release than the one the Pi runs, as a person runs it to
+# apply a changed bootstrap file. It installs its update.sh, pi-lib.sh and pi.env before the update
+# starts, so the update finds the installed set not the one deploy.verified lists, and keeps no
+# .prev copy of it. So, where the installed set is the one deploy.verified lists and provision.sh
+# would replace one of those three files, it first copies that set to its .prev copies, as
+# update.sh does, and a failed install of the newer release rolls the Pi back to the release it
+# runs. The update here is the real launcher and update.sh, against a fake release API, recorder,
+# systemd and Tailscale. The Pi gets release a on a new Pi, release a again, which keeps the .prev
+# copies as they are, then release b, whose binary never answers its commit.
+begin newer-release
+make_release a "$commit_a" "$commit_a"
+make_release b "$commit_b" "$wrong_commit"
+make_release c "$commit_c" "$commit_c"
+new_pi
+real_provision a
+expect_ran 'release a on a new Pi'
+said "ghost-wispr update: installed commit $commit_a" || fail "the update did not install release a: $(<"$work_dir/out")"
+[[ $(head -n 1 "$deploy/deploy.verified") == "commit $commit_a" ]] || fail "deploy.verified does not name release a: $(<"$deploy/deploy.verified")"
+release_a=$(installed_set)
+[[ $release_a != *missing* && $release_a == *"answers $commit_a" ]] || fail "release a is not installed whole: $release_a"
+real_provision a
+expect_ran 'release a again'
+said "ghost-wispr update: already current at commit $commit_a" || fail "the update did not find release a current: $(<"$work_dir/out")"
+[[ -z $(find "$deploy" -maxdepth 1 -name '*.prev') ]] \
+  || fail "a run of the release the Pi runs made .prev copies: $(find "$deploy" -maxdepth 1 -name '*.prev')"
+[[ $(installed_set) == "$release_a" ]] || fail 'a run of the release the Pi runs changed its set'
+real_provision b
+expect_refused 'release b, whose binary never answers its commit' 'the nightly update failed'
+[[ ! -s $TEST_LOG.errors ]] || fail "release b: $(<"$TEST_LOG.errors")"
+said "kept the set of commit $commit_a, which the Pi runs, as its .prev copies" \
+  || fail "provision.sh did not keep release a's set before it replaced update.sh: $(<"$work_dir/out")"
+# The update finds the installed set not the verified one, since provision.sh installed release b's
+# update.sh, pi-lib.sh and pi.env, so it rolls back every file that has a .prev copy.
+if ! said "did not answer /api/version with commit $commit_b" || ! said 'restored the last verified set, the one deploy.verified lists'; then
+  fail "the update did not install release b and roll it back: $(<"$work_dir/out")"
+fi
+[[ $(installed_set) == "$release_a" ]] \
+  || fail "after the failed install of release b, the Pi is not on release a's set: $(diff <(printf '%s\n' "$release_a") <(installed_set) || true)"
+for file in ghost-wispr-update.service ghost-wispr-update.timer; do
+  cmp -s -- "$TEST_RELEASES/b/ghost-wispr-pi-deploy/$file" "$units/$file" || fail "$file is not release b's, which provision.sh installed"
+done
+# Where the installed set is not the one deploy.verified lists, as after a swap that a kill cut
+# short, the .prev copies hold the set verified last, and provision.sh leaves them as they are.
+printf '# changed after the install\n' >>"$deploy/wait-for-network.sh"
+prev_copies=$(cd -- "$deploy" && sha256sum -- *.prev)
+: >"$TEST_LOG"
+TEST_SELF_STATUS=$joined_status run_provision "$TEST_RELEASES/c/ghost-wispr-pi-deploy"
+expect_ran 'release c on a set that deploy.verified does not list'
+said 'so its .prev copies stay as they are' || fail "provision.sh did not say it kept the .prev copies as they are: $(<"$work_dir/out")"
+[[ $(cd -- "$deploy" && sha256sum -- *.prev) == "$prev_copies" ]] || fail 'provision.sh changed the .prev copies of the set verified last'
+
+# newer-release-certificate: the certificate the Pi runs goes back with its set. The nightly update
+# installs each newer certificate with device.crt.version, its version, and a failed install puts
+# both back from device.crt.prev and device.crt.version.prev. So provision.sh from a newer release
+# keeps the Pi's certificate and its version file with the set: otherwise those copies still hold
+# the certificate before it, and a failed install would put that one back. Where the Pi has no
+# device.crt.version, as before its first nightly certificate, a stale device.crt.version.prev goes,
+# as update.sh's keep_previous removes the .prev copy of a file the Pi does not have, and the
+# rollback removes the device.crt.version that the failed install put in, so the Pi has no version
+# file again. Release d's binary stages certificate version 8 and never answers its commit.
+begin newer-release-certificate
+readonly commit_d=dddddddddddddddddddddddddddddddddddddddd
+make_release d "$commit_d" "$wrong_commit" 8
+# certificate_file NAME prints the content of DEPLOY_DIR/NAME, or "missing".
+certificate_file() {
+  if [[ -f $deploy/$1 ]]; then
+    printf '%s\n' "$(<"$deploy/$1")"
+  else
+    printf 'missing\n'
+  fi
+}
+for history in 'with a version file' 'with no version file'; do
+  new_pi
+  real_provision a
+  expect_ran "release a on a new Pi, $history"
+  # Certificate version 7 runs; an earlier nightly install kept version 6 as the .prev copies.
+  printf 'certificate version 7\n' >"$deploy/device.crt"
+  printf 'certificate version 6\n' >"$deploy/device.crt.prev"
+  printf '6\n' >"$deploy/device.crt.version.prev"
+  # The Pi's version file before release d: what it and its .prev copy must hold after the rollback.
+  pi_version=missing
+  if [[ $history == 'with a version file' ]]; then
+    printf '7\n' >"$deploy/device.crt.version"
+    pi_version=7
+  fi
+  release_a=$(installed_set)
+  real_provision d
+  expect_refused "release d with certificate version 8, $history" 'the nightly update failed'
+  [[ ! -s $TEST_LOG.errors ]] || fail "release d, $history: $(<"$TEST_LOG.errors")"
+  said 'pi-secrets: certificate version 8, not after 2027-12-01T00:00:00Z: newer and signs in' \
+    || fail "control, $history: pi-secrets staged no certificate: $(<"$work_dir/out")"
+  if ! said "did not answer /api/version with commit $commit_d" || ! said 'restored the last verified set, the one deploy.verified lists'; then
+    fail "the update did not install release d and roll it back, $history: $(<"$work_dir/out")"
+  fi
+  [[ $(installed_set) == "$release_a" ]] || fail "after the failed install of release d, $history, the Pi is not on release a's set"
+  [[ $(certificate_file device.crt) == 'certificate version 7' ]] \
+    || fail "after the failed install of release d, $history, device.crt is [$(certificate_file device.crt)], not certificate version 7, which the Pi ran"
+  [[ $(certificate_file device.crt.prev) == 'certificate version 7' ]] \
+    || fail "provision.sh did not keep the Pi's certificate as device.crt.prev, $history: [$(certificate_file device.crt.prev)]"
+  [[ $(certificate_file device.crt.version.prev) == "$pi_version" ]] \
+    || fail "device.crt.version.prev is [$(certificate_file device.crt.version.prev)], want [$pi_version], $history"
+  [[ $(certificate_file device.crt.version) == "$pi_version" ]] \
+    || fail "after the failed install of release d, $history, device.crt.version is [$(certificate_file device.crt.version)], want [$pi_version]"
+done
+
+# bootstrap-repair: a bootstrap file that is broken on a Pi that runs release a, here an update unit
+# whose ExecStart names no program, so no nightly run starts and no release can install a fix. The
+# release that fixes it is a later one, c: provision.sh from c installs c's update unit, and its
+# start runs c's launcher, whose update installs c.
+begin bootstrap-repair
+new_pi
+real_provision a
+expect_ran 'release a on a new Pi'
+printf '%s\n' '[Service]' 'Type=oneshot' 'TimeoutStartSec=infinity' 'ExecStart=/opt/ghost-wispr/no-such-launcher.sh' \
+  >"$units/ghost-wispr-update.service"
+# The control: with that unit loaded, the update does not start.
+status=0
+XDG_RUNTIME_DIR=$runtime_dir TEST_REAL_UPDATE=1 TEST_JOURNAL=$work_dir/journal PATH="$bin:$PATH" \
+  systemctl --user daemon-reload || status=$?
+XDG_RUNTIME_DIR=$runtime_dir TEST_REAL_UPDATE=1 TEST_JOURNAL=$work_dir/journal PATH="$bin:$PATH" \
+  systemctl --user start ghost-wispr-update.service 2>/dev/null || status=$?
+if ((status == 0)) || ! grep -q 'status=203/EXEC' "$work_dir/journal"; then
+  fail "control: the broken update unit started the update: $(<"$work_dir/journal")"
+fi
+real_provision c
+expect_ran 'release c on a Pi whose update unit is broken'
+cmp -s -- "$TEST_RELEASES/c/ghost-wispr-pi-deploy/ghost-wispr-update.service" "$units/ghost-wispr-update.service" \
+  || fail "provision.sh did not install release c's update unit: $(<"$units/ghost-wispr-update.service")"
+said "ghost-wispr update: installed commit $commit_c" || fail "the update did not install release c: $(<"$work_dir/out")"
+[[ $(head -n 1 "$deploy/deploy.verified") == "commit $commit_c" ]] || fail "deploy.verified does not name release c: $(<"$deploy/deploy.verified")"
+said 'already joined' || fail "provision.sh stopped before the join: $(<"$work_dir/out")"
+
+# ---------------------------------------------------------------------------------------------------
+# serve: serve.conf is the one source of Serve's setting. provision.sh applies each of its lines,
+# turns off each live Serve HTTPS port it does not list, and on each port it lists, each mount
+# other than /: tailscale serve --bg sets the mount / and keeps the others, so a mount left there
+# would show as drift each night. Each line is also a literal call in the join's command. When it
+# cannot read Serve's setting, or the setting is not serve.conf's after it applied it, it stops
+# before the join.
+begin serve
+new_pi
+jq -n --arg host "$TEST_SERVE_HOST" '{TCP: {"443": {HTTPS: true}, "8443": {HTTPS: true}},
+  Web: {"\($host):443": {Handlers: {"/": {Proxy: "http://127.0.0.1:9999"}, "/debug": {Proxy: "http://127.0.0.1:8082"}}},
+    "\($host):8443": {Handlers: {"/": {Proxy: "http://127.0.0.1:8081"}}}}}' >"$TEST_SERVE_STATE"
+run_provision "$stage"
+expect_ran 'a live port and a mount that serve.conf does not list'
+readonly want_serve='{"TCP":{"443":{"HTTPS":true}},"Web":{"ghost-wispr.example-tailnet.ts.net:443":{"Handlers":{"/":{"Proxy":"http://127.0.0.1:8080"}}}}}'
+[[ $(jq -cS . "$TEST_SERVE_STATE") == "$want_serve" ]] || fail "Serve is $(jq -cS . "$TEST_SERVE_STATE"), want $want_serve"
+logged 'sudo tailscale serve --bg --https 443 http://127.0.0.1:8080' || fail "provision.sh did not apply serve.conf's line: $(<"$TEST_LOG")"
+logged 'sudo tailscale serve --https=8443 off' || fail "provision.sh did not turn off port 8443: $(<"$TEST_LOG")"
+said 'turned off Serve port 8443' || fail "provision.sh did not say it turned off port 8443: $(<"$work_dir/out")"
+logged 'sudo tailscale serve --https=443 --set-path=/debug off' || fail "provision.sh did not turn off the mount /debug of port 443: $(<"$TEST_LOG")"
+said 'turned off the Serve mount /debug of port 443' || fail "provision.sh did not say it turned off /debug: $(<"$work_dir/out")"
+! grep -q 'serve --https=443 off' "$TEST_LOG" || fail "provision.sh turned off the port serve.conf lists: $(<"$TEST_LOG")"
+# A Serve that provision.sh does not manage, a TCP forward, stays and is named: the run stops before
+# the join, as the nightly drift line would say Serve: UNKNOWN.
+new_pi
+printf '%s\n' '{"TCP":{"2222":{"TCPForward":"127.0.0.1:22"}}}' >"$TEST_SERVE_STATE"
+run_provision "$stage"
+expect_refused 'a TCP forward' "is not serve.conf's"
+[[ ! -e $TEST_LOG.join ]] || fail "provision.sh started the join although Serve is not serve.conf's"
+rm -rf -- "$work_dir/two-ports-stage"
+cp -a -- "$stage" "$work_dir/two-ports-stage"
+printf '%s\n' '# The page, and a second port.' '443 http://127.0.0.1:8080' '8443 http://127.0.0.1:8081' >"$work_dir/serve.conf"
+restage "$work_dir/two-ports-stage" serve.conf "$work_dir/serve.conf"
+new_pi
+run_provision "$work_dir/two-ports-stage"
+expect_ran 'serve.conf with two lines'
+[[ $(serve_now) == $'443 http://127.0.0.1:8080\n8443 http://127.0.0.1:8081' ]] \
+  || fail "Serve is [$(serve_now | paste -sd ';' -)], want both lines of serve.conf"
+join_command=$(<"$TEST_LOG.join")
+for line in '443 http://127.0.0.1:8080' '8443 http://127.0.0.1:8081'; do
+  [[ $join_command == *"tailscale serve --bg --https $line || rc=\$?;"* ]] \
+    || fail "the join does not hold the Serve call for '$line': $join_command"
+done
+new_pi
+TEST_SERVE_STATUS_EXIT=1 run_provision "$stage"
+expect_refused 'an unreadable Serve setting' 'tailscale serve status'
+[[ ! -e $TEST_LOG.join ]] || fail 'provision.sh started the join although it could not read Serve'
+
+# ---------------------------------------------------------------------------------------------------
+# update-fails: when the update fails, provision.sh prints that run's lines from the journal and
+# fails, before it enables the recorder, touches Serve or joins.
+begin update-fails
+new_pi
+printf '%s\n' 'ghost-wispr launcher: invocation test-invocation trigger none at none' \
+  'ghost-wispr update: could not read the latest release from https://api.github.com/repos/sjawhar/ghost-wispr/releases/latest' \
+  >"$work_dir/journal"
+TEST_UPDATE_EXIT=1 TEST_JOURNAL=$work_dir/journal run_provision "$stage"
+expect_refused 'a failed update' 'could not read the latest release'
+said 'ghost-wispr-update.service' || fail "provision.sh did not name the update that failed: $(<"$work_dir/out")"
+if grep -Eq 'enable ghost-wispr\.service|tailscale serve|systemd-run' "$TEST_LOG"; then
+  fail "provision.sh went on after the update failed: $(<"$TEST_LOG")"
+fi
+
+# ---------------------------------------------------------------------------------------------------
+# recorder-unit: the recorder's unit, which the nightly update installs. The service starts only
+# once the Pi's clock is synchronized, so no session is named or stamped with the time a Pi with no
+# battery-backed clock restores at boot: a user unit cannot be ordered after the system's
+# time-sync.target, so the unit waits in a start step, after the network wait. Then it reads the
+# secret lines of .env from Secret Manager, and goes on when that read fails (the -). Its start
+# limit is longer than both waits, so a Pi whose clock never synchronizes still starts once the wait
+# gives up instead of being killed and restarted for good. The paused listener's ring of room audio
+# must not reach disk through a core dump or swap.
+begin recorder-unit
 unit="$repo_root/deploy/pi/files/ghost-wispr.service"
 mapfile -t start_steps < <(grep -E '^Exec(StartPre|Start)=' "$unit")
 want_steps=(ExecStartPre=/opt/ghost-wispr/wait-for-network.sh ExecStartPre=/opt/ghost-wispr/wait-for-time-sync.sh
-  ExecStart=/opt/ghost-wispr/ghost-wispr)
+  'ExecStartPre=-/opt/ghost-wispr/update.sh secrets' ExecStart=/opt/ghost-wispr/ghost-wispr)
 [[ "${start_steps[*]}" == "${want_steps[*]}" ]] \
   || fail "ghost-wispr.service starts with [${start_steps[*]}], want [${want_steps[*]}]"
-# The paused listener's ring of room audio must not reach disk through a core dump or swap.
 for limit in LimitCORE=0 MemorySwapMax=0; do
   grep -qx -- "$limit" "$unit" || fail "ghost-wispr.service does not set $limit"
 done
@@ -340,11 +1237,16 @@ esac
 ((start_limit >= network_wait + 5 + sync_wait + 30)) \
   || fail "ghost-wispr.service's TimeoutStartSec (${start_limit}s) does not cover the network wait (${network_wait}s) and the clock wait (${sync_wait}s)"
 
-# The detached join re-authenticates the node with `tailscale up` and the tailnet's subnet routes
-# off, sets Serve again, and runs the route check that provision.sh installed beside the token. It
-# accepts the routes (`tailscale set --accept-routes`) only when the check passed. The check compares
-# each IPv4 network of the Pi, tailscale0's excepted, with each peer's PrimaryRoutes: an accepted
-# route that overlaps a network of the Pi would take the Pi's own traffic for that network.
+# ---------------------------------------------------------------------------------------------------
+# join: the detached join that the first run started re-authenticates the node with `tailscale up`
+# and the tailnet's subnet routes off, sets Serve again, and runs the route check that provision.sh
+# installed beside the token. It accepts the routes (`tailscale set --accept-routes`) only when the
+# check passed. The check compares each IPv4 network of the Pi, tailscale0's excepted, with each
+# peer's PrimaryRoutes: an accepted route that overlaps a network of the Pi would take the Pi's own
+# traffic for that network. P2's command removes the release's directory before the join runs, and
+# so does this case.
+begin join
+rm -rf -- "$work_dir/p2-stage"
 readonly fixtures="$work_dir/fixtures"
 mkdir -p "$fixtures"
 
@@ -524,6 +1426,7 @@ manager_expansion() {
         [[ $char != '$' ]] || state=dollar
         ;;
       dollar)
+        # shellcheck disable=SC2016 # '${' is the two characters, as the manager reads them
         case $char in
           '{') out+=${word%?} word='${' state=variable ;;
           '$') out+=$word word='' state=word ;;
@@ -542,27 +1445,27 @@ manager_expansion() {
   printf '%s' "$out$word"
 }
 
-# run_join runs the join's command as its unit does, on F-ip-pi and the status fixture given second,
-# with RouteAll set to the first argument beforehand. It starts a fresh log, writes a token, and puts
-# the route check provision.sh installed back, each at the path the command names, because the
-# command removes both. When the systemd-run line lacks --expand-environment=no, the command first
-# gets the service manager's expansion. The exit status is kept in join_exit, stdout and stderr in
-# $work_dir/join.out.
+# run_join runs the first run's join command as its unit does, on F-ip-pi and the status fixture
+# given second, with RouteAll set to the first argument beforehand. It starts a fresh log, writes a
+# token, and puts the route check provision.sh installed back, each at the path the command names,
+# because the command removes both. When the systemd-run line lacks --expand-environment=no, the
+# command first gets the service manager's expansion. The exit status is kept in join_exit, stdout
+# and stderr in $work_dir/join.out.
 run_join() {
   local command options
   printf '%s\n' "$1" >"$TEST_ROUTE_ALL"
-  [[ -f $TEST_LOG.installed-route-overlap-check ]] \
-    || fail "provision.sh installed no route check: $TEST_LOG.installed-route-overlap-check is missing"
-  cp -- "$TEST_LOG.installed-route-overlap-check" "$work_dir/join/route-overlap-check"
-  printf 'id-token' >"$work_dir/join/token"
+  [[ -f $first_join/route-overlap-check ]] \
+    || fail "provision.sh installed no route check: $first_join/route-overlap-check is missing"
+  cp -- "$first_join/route-overlap-check" "$join/route-overlap-check"
+  printf 'id-token' >"$join/token"
   rm -f -- "$TEST_LOG.up-exit"
   : >"$TEST_LOG"
-  command=$(<"$TEST_LOG.join")
-  options=$(<"$TEST_LOG.systemd-run")
+  command=$(<"$first_join/join")
+  options=$(<"$first_join/systemd-run")
   options=${options%"$command"}
   [[ " $options " == *' --expand-environment=no '* ]] || command=$(manager_expansion "$command")
   join_exit=0
-  TEST_NETWORKS="$fixtures/F-ip-pi" TEST_STATUS=$2 PATH="$work_dir/bin:$PATH" \
+  TEST_NETWORKS="$fixtures/F-ip-pi" TEST_STATUS=$2 PATH="$bin:$PATH" \
     /bin/sh -c "$command" >"$work_dir/join.out" 2>&1 || join_exit=$?
 }
 
@@ -637,14 +1540,15 @@ fi
 TEST_SET_EXIT=1 run_join false "$fixtures/F-status-router"
 [[ $join_exit != 0 ]] || fail "the join reported success although tailscale set failed"
 
-# route_row runs the route check provision.sh installed as the join unit runs it, /bin/sh on the
-# file, on the network fixture and the status fixture given third and fourth. It fails unless the
-# check exits with the code given second and its output names each text given after the fixtures.
-# The first argument names the row.
+# route-check: route_row runs the route check provision.sh installed as the join unit runs it,
+# /bin/sh on the file, on the network fixture and the status fixture given third and fourth. It
+# fails unless the check exits with the code given second and its output names each text given
+# after the fixtures. The first argument names the row.
+begin route-check
 route_row() {
   local row=$1 want=$2 got=0 text
-  TEST_NETWORKS="$fixtures/$3" TEST_STATUS="$fixtures/$4" PATH="$work_dir/bin:$PATH" \
-    /bin/sh "$TEST_LOG.installed-route-overlap-check" >"$work_dir/check.out" 2>&1 || got=$?
+  TEST_NETWORKS="$fixtures/$3" TEST_STATUS="$fixtures/$4" PATH="$bin:$PATH" \
+    /bin/sh "$first_join/route-overlap-check" >"$work_dir/check.out" 2>&1 || got=$?
   [[ $got == "$want" ]] || fail "route check $row: exit $got, want $want: $(<"$work_dir/check.out")"
   shift 4
   for text in "$@"; do
@@ -703,68 +1607,30 @@ clean_route_row 'G27 control characters in a route that is no prefix' 2 F-ip-pi 
 clean_route_row 'G28 control characters in an interface name' 1 F-ip-control-name F-status-overlap \
   'wl?an0 192.168.1.136/24 overlaps'
 
-# J0: provision.sh on a Pi already joined as tag:ghost-wispr at $PI_HOST. exits before the join, so
-# it installs no route check and leaves the accept-routes setting as it is.
-pi_host=$(source "$repo_root/deploy/pi/test-pi.env" && printf '%s' "$PI_HOST")
-: >"$TEST_LOG"
-joined_exit=0
-TEST_SELF_STATUS=$(jq -nc --arg name "$pi_host." '{Self: {Tags: ["tag:ghost-wispr"], DNSName: $name}}') \
-  run_provision "${bundle_files[@]}" || joined_exit=$?
-if [[ $joined_exit != 0 ]] || ! grep -Fq 'already joined' "$work_dir/out" \
-  || grep -Eq 'systemd-run|route-overlap-check|tailscale set' "$TEST_LOG"; then
-  cat -- "$work_dir/out" >&2
-  fail "provision.sh on a Pi already joined started a join or a route check: $(<"$TEST_LOG")"
-fi
-
-# A rerun on a Pi that has a shared drive renders through render_models_config: it must keep the
-# drive and the template's Envoy hub, and say no bash error either.
-printf 'gdrive_folder_id: "drive-0123"\n' >"$work_dir/deploy/ghost-wispr.yaml"
-: >"$TEST_LOG"
-run_provision "${bundle_files[@]}" || fail "provision.sh failed on a rerun: $(<"$work_dir/out")"
-if grep -E 'provision\.sh: line [0-9]+: ' "$work_dir/out" >&2; then
-  fail "provision.sh printed a bash error on a rerun with a shared drive (above)"
-fi
-hub_line=$(grep '^envoy_hub_url: ' "$repo_root/deploy/pi/files/ghost-wispr.yaml")
-for line in 'gdrive_folder_id: "drive-0123"' 'gdrive_sync_enabled: true' "$hub_line"; do
-  grep -Fxq "$line" "$TEST_LOG.installed-ghost-wispr.yaml" \
-    || fail "the rerun's configuration lacks '$line': $(<"$TEST_LOG.installed-ghost-wispr.yaml")"
-done
-assert_recording_rules "rerun's"
-assert_office_pi_devices "rerun's"
-# The recorder reads its configuration only when it starts, and update.sh restarts nothing when the
-# Pi already runs the newest release: a rerun restarts a running recorder once the configuration is
-# installed, and try-restart starts none that is stopped.
-# grep finding no line is a failure this check reports, not one that stops the test silently.
-config_at=$(grep -n -E '^sudo install .*/ghost-wispr\.yaml$' "$TEST_LOG" | cut -d: -f1 | head -n 1) || true
-restart_at=$(grep -n -F -x -- "sudo -u ghost-wispr XDG_RUNTIME_DIR=$runtime_dir systemctl --user try-restart ghost-wispr.service" \
-  "$TEST_LOG" | cut -d: -f1 | head -n 1) || true
-[[ -n $config_at && -n $restart_at && $restart_at -gt $config_at ]] \
-  || fail "the rerun did not restart a running recorder after it installed the configuration: $(<"$TEST_LOG")"
-
-# ghost-wispr's user manager, as the fake sudo above stands for it. Each of its units inherits its
-# environment (systemctl --user set-environment or import-environment, an environment.d file,
-# DefaultEnvironment=, the manager's own start-up environment), ghost-wispr.service with it.
+# ---------------------------------------------------------------------------------------------------
+# manager-env: ghost-wispr's user manager, as the fake systemctl stands for it. Each of its units
+# inherits its environment (systemctl --user set-environment or import-environment, an environment.d
+# file, DefaultEnvironment=, the manager's own start-up environment), ghost-wispr.service with it.
+# provision.sh reloads the manager and reads its environment before it changes anything, and
+# refuses while the manager sets one of the variables that --models refuses in .env (below): the
+# recorder would inherit it. The reload comes first, so an environment.d line written since the
+# last reload counts, as it will at the recorder's next start. It names the variable and why, prints
+# no value, and refuses as well when it cannot read the environment or reads an empty one.
+begin manager-env
 export TEST_MANAGER_ENV="$work_dir/manager-env" TEST_MANAGER_ENV_PENDING="$work_dir/manager-env-pending"
 export TEST_UNITS="$work_dir/units"
-mkdir -p "$TEST_UNITS"
-readonly user_systemctl="sudo -u ghost-wispr XDG_RUNTIME_DIR=$runtime_dir systemctl --user"
-readonly reload="$user_systemctl daemon-reload" show_environment="$user_systemctl show-environment"
+mkdir -p -- "$TEST_UNITS"
+readonly reload='systemctl --user daemon-reload' show_environment='systemctl --user show-environment'
 # env_lines VARIABLE...: an environment as systemctl --user show-environment prints one, with these
 # VARIABLEs among the few a manager has.
 env_lines() { printf '%s\n' HOME=/home/ghost-wispr LANG=C.UTF-8 "$@" PATH=/usr/local/bin:/usr/bin:/bin; }
 manager_env() { env_lines "$@" >"$TEST_MANAGER_ENV"; }
-# The rerun above reloaded the manager and read its environment before its first change.
-reload_at=$(grep -n -F -x -- "$reload" "$TEST_LOG" | cut -d: -f1 | head -n 1) || true
-read_at=$(grep -n -F -x -- "$show_environment" "$TEST_LOG" | cut -d: -f1 | head -n 1) || true
-change_at=$(grep -n -F -x -- 'sudo apt-get update' "$TEST_LOG" | cut -d: -f1 | head -n 1) || true
+# The first run reloaded the manager and read its environment before its first change.
+reload_at=$(line_of "$reload" "$work_dir/first.log")
+read_at=$(line_of "$show_environment" "$work_dir/first.log")
+change_at=$(line_of 'sudo apt-get update' "$work_dir/first.log")
 [[ -n $reload_at && -n $read_at && -n $change_at && $reload_at -lt $read_at && $read_at -lt $change_at ]] \
-  || fail "the rerun did not reload the user manager and read its environment before it changed anything: $(<"$TEST_LOG")"
-# The full provisioner refuses, before it changes anything, while the manager sets one of the
-# variables the models step refuses in .env (below): a .env the full provisioner writes anew holds
-# none of them, but the recorder would still inherit the manager's. It reloads the manager first, so
-# an environment.d line written since its last reload counts, as it would at the provisioner's own
-# reload. It names the variable and why, prints no value, and refuses as well when it cannot read
-# the environment or reads an empty one.
+  || fail "the first run did not reload the user manager and read its environment before it changed anything: $(<"$work_dir/first.log")"
 # Each case is NAME|REASON|NOW|PENDING: the manager sets NOW now, and PENDING from its next reload.
 # With no NAME the manager's environment reads empty.
 for case in \
@@ -773,44 +1639,105 @@ for case in \
   'GHOST_WISPR_CONFIG|replace the installed config||GHOST_WISPR_CONFIG=/srv/elsewhere/ghost-wispr.yaml' \
   '|||'; do
   IFS='|' read -r name reason now pending <<<"$case"
+  new_pi
+  before=$(pi_files)
   manager_env ${now:+"$now"}
   [[ -n $name ]] || : >"$TEST_MANAGER_ENV"
   rm -f -- "$TEST_MANAGER_ENV_PENDING"
   [[ -z $pending ]] || env_lines "$pending" >"$TEST_MANAGER_ENV_PENDING"
   what=${name:-an empty environment}${pending:+ from an environment.d line since the last reload}
-  : >"$TEST_LOG"
-  if run_provision "${bundle_files[@]}"; then
-    fail "the full provisioner ran with $what in the user manager: $(<"$work_dir/out")"
-  fi
+  run_provision "$stage"
+  ((rc != 0)) || fail "provision.sh ran with $what in the user manager: $(<"$work_dir/out")"
   if [[ -n $name ]]; then
-    grep -qF "ghost-wispr's user manager sets $name, which would $reason" "$work_dir/out" \
-      || fail "the full provisioner did not name $name in the user manager's environment, and that it would $reason: $(<"$work_dir/out")"
+    said "ghost-wispr's user manager sets $name, which would $reason" \
+      || fail "provision.sh did not name $name in the user manager's environment, and that it would $reason: $(<"$work_dir/out")"
   else
-    grep -qF "could not read the environment of ghost-wispr's user manager" "$work_dir/out" \
-      || fail "the full provisioner did not say it could not read an empty user manager environment: $(<"$work_dir/out")"
+    said "could not read the environment of ghost-wispr's user manager" \
+      || fail "provision.sh did not say it could not read an empty user manager environment: $(<"$work_dir/out")"
   fi
   ! grep -qE 'hub\.example\.test|elsewhere' "$work_dir/out" \
-    || fail "the full provisioner printed a value from the user manager's environment: $(<"$work_dir/out")"
+    || fail "provision.sh printed a value from the user manager's environment: $(<"$work_dir/out")"
   [[ $(<"$TEST_LOG") == "$reload"$'\n'"$show_environment" ]] \
-    || fail "the full provisioner did more than reload the user manager and read its environment before it refused $what: $(<"$TEST_LOG")"
+    || fail "provision.sh did more than reload the user manager and read its environment before it refused $what: $(<"$TEST_LOG")"
+  [[ $(pi_files) == "$before" ]] || fail "provision.sh changed a file before it refused $what"
 done
 rm -f -- "$TEST_MANAGER_ENV" "$TEST_MANAGER_ENV_PENDING"
 
-# provision.sh --models, run by hand, refuses before it writes anything while a line of the deployed
-# .env could set GHOST_WISPR_CONFIG, which would replace the installed config with another file, or a
-# variable that would override the template's envoy_enabled, envoy_hub_url or concierge.envoy_url: a
-# line that, past leading space and an export, starts with the name and =. It names the variable and
+# ---------------------------------------------------------------------------------------------------
+# key: provision.sh --key makes the Pi's P-256 key, mode 0600 in a directory of mode 0700, and
+# prints its certificate request for CN=ghost-wispr, for the infrastructure's bootstrap. The key
+# never leaves the Pi, so a second --key refuses and keeps it.
+begin key
+new_pi
+rm -rf -- "$key_dir"
+run_provision "$stage" --key
+expect_ran 'provision.sh --key'
+[[ -f $key ]] || fail "provision.sh --key made no key at $key"
+[[ $(stat -c %a -- "$key") == 600 && $(stat -c %a -- "$key_dir") == 700 ]] \
+  || fail "the key has mode $(stat -c %a -- "$key") in a directory of mode $(stat -c %a -- "$key_dir"), not 600 in 700"
+sed -n '/^-----BEGIN CERTIFICATE REQUEST-----$/,/^-----END CERTIFICATE REQUEST-----$/p' "$work_dir/out" >"$work_dir/request.pem"
+[[ -s $work_dir/request.pem ]] || fail "provision.sh --key printed no certificate request: $(<"$work_dir/out")"
+openssl req -in "$work_dir/request.pem" -noout -verify >/dev/null 2>&1 || fail 'the certificate request does not verify'
+[[ $(openssl req -in "$work_dir/request.pem" -noout -subject -nameopt RFC2253) == 'subject=CN=ghost-wispr' ]] \
+  || fail "the certificate request is for $(openssl req -in "$work_dir/request.pem" -noout -subject -nameopt RFC2253), not CN=ghost-wispr"
+[[ $(openssl req -in "$work_dir/request.pem" -noout -pubkey) == "$(openssl pkey -in "$key" -pubout)" ]] \
+  || fail 'the certificate request is not for the key provision.sh --key made'
+key_text=$(openssl pkey -in "$key" -noout -text)
+[[ $key_text == *'ASN1 OID: prime256v1'* ]] || fail "the key is no P-256 key: $key_text"
+before=$(sha "$key")
+run_provision "$stage" --key
+expect_refused 'a second --key' "$key"
+[[ $(sha "$key") == "$before" ]] || fail 'a second --key changed the key'
+
+# ---------------------------------------------------------------------------------------------------
+# certificate: provision.sh --certificate FILE installs the Pi's first certificate, byte for byte
+# and mode 0644, once FILE is one PEM certificate whose public key is the key's; the deploy
+# directory need not exist yet. A certificate for another key, one that does not parse, two in one
+# file, and a second certificate are each refused, and install nothing. The nightly update installs
+# each renewed certificate.
+begin certificate
+rm -rf -- "$deploy"
+openssl req -x509 -new -key "$key" -subj /CN=ghost-wispr -days 2 -out "$work_dir/good.pem" >/dev/null 2>&1 \
+  || fail 'openssl could not make a certificate for the key'
+openssl req -x509 -new -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -keyout "$work_dir/other.key" \
+  -subj /CN=ghost-wispr -days 2 -out "$work_dir/other.pem" >/dev/null 2>&1 || fail 'openssl could not make another certificate'
+printf '%s\n' '-----BEGIN CERTIFICATE-----' 'bm90IGEgY2VydGlmaWNhdGU=' '-----END CERTIFICATE-----' >"$work_dir/bad.pem"
+cat -- "$work_dir/good.pem" "$work_dir/other.pem" >"$work_dir/two.pem"
+for entry in 'other.pem another key' 'bad.pem no PEM certificate' 'two.pem not one'; do
+  run_provision "$stage" --certificate "$work_dir/${entry%% *}"
+  expect_refused "the certificate ${entry%% *}" "${entry#* }"
+  [[ ! -e $deploy/device.crt ]] || fail "provision.sh --certificate installed ${entry%% *}"
+done
+run_provision "$stage" --certificate "$work_dir/good.pem"
+expect_ran 'provision.sh --certificate with the certificate for the key'
+cmp -s -- "$work_dir/good.pem" "$deploy/device.crt" || fail "$deploy/device.crt is not the certificate given"
+[[ $(stat -c %a -- "$deploy/device.crt") == 644 ]] || fail "device.crt has mode $(stat -c %a -- "$deploy/device.crt"), not 644"
+said 'not after' || fail "provision.sh --certificate did not say when the certificate ends: $(<"$work_dir/out")"
+run_provision "$stage" --certificate "$work_dir/good.pem"
+expect_refused 'a second certificate' 'exists'
+cmp -s -- "$work_dir/good.pem" "$deploy/device.crt" || fail 'a second --certificate changed device.crt'
+
+# ---------------------------------------------------------------------------------------------------
+# models: provision.sh --models DRIVE_ID, run by hand from the release's directory, installs the
+# release's config with the shared drive and restarts the recorder. It writes no .env, which the
+# nightly update owns. It refuses before it writes anything while a line of the deployed .env could
+# set GHOST_WISPR_CONFIG, which would replace the installed config with another file, or a variable
+# that would override the template's envoy_enabled, envoy_hub_url or concierge.envoy_url: a line
+# that, past leading space and an export, starts with the name and =. It names the variable and
 # why, prints no value, and leaves every file byte for byte as it was. GHOST_WISPR_CONFIG's reason
 # comes first when .env sets both kinds. A match inside a multi-line quoted value refuses too: a
 # false refusal only stops the step. systemd's EnvironmentFile= parser ends a line at a carriage
 # return as at a line feed (NEWLINE "\n\r", src/basic/env-file.c), so a bare CR starts a line too; a
 # case whose text holds CR LF is a CRLF file.
+begin models
 models_dir=$work_dir/models-deploy
-mkdir -p "$models_dir"
+mkdir -p -- "$models_dir"
+# run_models [DIR] runs DIR/provision.sh --models, the release's directory by default, on the deploy
+# directory models_dir.
 run_models() {
   : >"$TEST_LOG"
-  env -u XDG_RUNTIME_DIR PATH="$work_dir/bin:$PATH" GHOST_WISPR_DEPLOY_DIR="$models_dir" \
-    bash "$repo_root/deploy/pi/provision.sh" --models 0AAbCdEf_Gh-Ij >"$work_dir/out" 2>&1
+  env -u XDG_RUNTIME_DIR PATH="$bin:$PATH" GHOST_WISPR_DEPLOY_DIR="$models_dir" \
+    bash "${1:-$stage}/provision.sh" --models 0AAbCdEf_Gh-Ij >"$work_dir/out" 2>&1
 }
 models_files() { sha256sum "$models_dir/ghost-wispr.yaml" "$models_dir/.env"; }
 for case in \
@@ -837,15 +1764,38 @@ for case in \
   [[ ! -s $TEST_LOG ]] || fail "--models changed the Pi before it refused $name: $(<"$TEST_LOG")"
   [[ $(models_files) == "$before" ]] || fail "--models changed a file when it refused $name"
 done
-# An unreadable .env stops --models too, before it writes anything: the check cannot say it sets no
-# override, and a read through a pipe must not pass for a clean one.
+# A checkout's deploy/pi/ is no release: --models refuses it before it writes anything, so the
+# config it installs is always a release's, which the nightly update then keeps as current.
 printf 'old: config\n' >"$models_dir/ghost-wispr.yaml"
 printf '%s\n' GHOST_WISPR_DEEPGRAM_API_KEY=dg-1 >"$models_dir/.env"
 before=$(models_files)
+if run_models "$repo_root/deploy/pi"; then
+  fail "--models installed a checkout's config: $(<"$work_dir/out")"
+fi
+grep -qF 'manifest.json' "$work_dir/out" || fail "--models did not say a checkout has no manifest.json: $(<"$work_dir/out")"
+[[ ! -s $TEST_LOG ]] || fail "--models changed the Pi before it refused a checkout: $(<"$TEST_LOG")"
+[[ $(models_files) == "$before" ]] || fail '--models changed a file when it refused a checkout'
+# --models runs only from the release the Pi runs, as provision.sh does: another release's config
+# on this release's binary is a set that no release holds. Where deploy.verified names another
+# commit, it refuses before it runs any command. The control below runs it with deploy.verified
+# naming the release's commit.
+printf '%s\n' "commit $other_commit" >"$models_dir/deploy.verified"
+before=$(models_files)
+if run_models; then
+  fail "--models installed the config of another release than the one the Pi runs: $(<"$work_dir/out")"
+fi
+if ! grep -qF "$other_commit" "$work_dir/out" || ! grep -qF 'The release the Pi runs' "$work_dir/out"; then
+  fail "--models did not name the commit the Pi runs and where to get its release: $(<"$work_dir/out")"
+fi
+[[ ! -s $TEST_LOG ]] || fail "--models changed the Pi before it refused another release: $(<"$TEST_LOG")"
+[[ $(models_files) == "$before" ]] || fail '--models changed a file when it refused another release'
+printf '%s\n' "commit $release_commit" >"$models_dir/deploy.verified"
+# An unreadable .env stops --models too, before it writes anything: the check cannot say it sets no
+# override, and a read through a pipe must not pass for a clean one.
 chmod 000 "$models_dir/.env"
 status=0
 run_models || status=$?
-# The check itself fails, not only the later .env render, which would also stop the step.
+# The check itself fails, not only a later step, which would also stop the step.
 ! bash -c 'source "$1" && config_override_names "$2"' _ "$repo_root/deploy/pi/provision.sh" "$models_dir/.env" >/dev/null 2>&1 \
   || fail 'config_override_names read an unreadable .env as one that sets no override'
 chmod 600 "$models_dir/.env"
@@ -854,15 +1804,14 @@ grep -qF "could not read $models_dir/.env" "$work_dir/out" || fail "--models did
 [[ ! -s $TEST_LOG ]] || fail "--models changed the Pi before it refused an unreadable .env: $(<"$TEST_LOG")"
 [[ $(models_files) == "$before" ]] || fail "--models changed a file when it refused an unreadable .env"
 # --models refuses too, before it changes anything, while ghost-wispr's user manager sets one of
-# those variables in its own environment. Before it reads the environment it runs the check
-# rollout.sh install runs (require_unit_files): it reloads the manager, so an environment.d line
-# written since the last reload counts, as it will at the recorder's next start, and it refuses while
-# either unit is not loaded or has a drop-in, which can set the recorder's environment
-# (Environment=, EnvironmentFile=) past every file it checks. It reads the names from systemctl
-# --user show-environment, names the variable and why, and prints no value. It refuses as well when
-# it cannot read that environment, or reads an empty one: a user manager always holds some
-# variables, so an empty reading is a blind one.
-show_unit() { printf '%s show -p LoadState -p DropInPaths %s' "$user_systemctl" "$1"; }
+# those variables in its own environment. Before it reads the environment it reloads the manager, so
+# an environment.d line written since the last reload counts, as it will at the recorder's next
+# start, and it refuses while either unit is not loaded or has a drop-in, which can set the
+# recorder's environment (Environment=, EnvironmentFile=) past every file it checks. It reads the
+# names from systemctl --user show-environment, names the variable and why, and prints no value. It
+# refuses as well when it cannot read that environment, or reads an empty one: a user manager
+# always holds some variables, so an empty reading is a blind one.
+show_unit() { printf 'systemctl --user show -p LoadState -p DropInPaths %s' "$1"; }
 models_reads="$reload
 $(show_unit ghost-wispr.service)
 $(show_unit ghost-wispr-update.service)
@@ -949,15 +1898,33 @@ done
 # override commented out and longer names that start with one; the environment has those longer
 # names, a name inside another variable's value, and a value with a line break, quoted onto one line
 # as systemctl prints it. --models still reloaded the manager and read the units and the environment,
-# first.
+# first. The installed config is the release's template with the shared drive, mode 0640, and .env
+# is as it was.
 printf '%s\n' GHOST_WISPR_DEEPGRAM_API_KEY=dg-1 '# GHOST_WISPR_CONFIG=/srv/elsewhere/ghost-wispr.yaml' \
   '# GHOST_WISPR_ENVOY_HUB_URL=http://hub.example.test:9020' '# GHOST_WISPR_ENVOY_ENABLED=true' \
   '# GHOST_WISPR_CONCIERGE_ENVOY_URL=http://hub.example.test:9020' 'GHOST_WISPR_ENVOY_ENABLED_BEFORE=true' \
   'GHOST_WISPR_CONFIG_DIR=/srv/elsewhere' >"$models_dir/.env"
+cp -- "$models_dir/.env" "$work_dir/models.env"
 manager_env 'GHOST_WISPR_CONFIG_DIR=/srv/elsewhere' 'GHOST_WISPR_ENVOY_ENABLED_BEFORE=true' \
   'LESSOPEN=GHOST_WISPR_CONFIG=/srv/elsewhere' "GHOST_WISPR_DISPATCH_TOKEN=\$'first\\nGHOST_WISPR_CONFIG=x'"
+rm -f -- "$TEST_LOG.errors"
 run_models || fail "--models refused a .env and a user manager's environment that set no override: $(<"$work_dir/out")"
+[[ ! -s $TEST_LOG.errors ]] || fail "--models: $(<"$TEST_LOG.errors")"
 [[ $(head -n 4 "$TEST_LOG") == "$models_reads" ]] \
   || fail "--models installed without first reloading the user manager and reading it: $(<"$TEST_LOG")"
-grep -qE '^sudo install .*/ghost-wispr\.yaml$' "$TEST_LOG" || fail "--models did not install the config: $(<"$TEST_LOG")"
-printf 'provision run test passed\n'
+for line in 'gdrive_folder_id: "0AAbCdEf_Gh-Ij"' 'gdrive_sync_enabled: true' 'gc_enabled: true'; do
+  [[ $(grep -cFx -- "$line" "$models_dir/ghost-wispr.yaml" || true) == 1 ]] || fail "--models did not install the config with '$line' once"
+done
+diff <(awk '!/^(gdrive_folder_id|gdrive_sync_enabled|gc_enabled):/' "$stage/ghost-wispr.yaml") \
+  <(awk '!/^(gdrive_folder_id|gdrive_sync_enabled|gc_enabled):/' "$models_dir/ghost-wispr.yaml") >&2 \
+  || fail "--models did not install the release's template with the shared drive (diff above)"
+[[ $(stat -c %a -- "$models_dir/ghost-wispr.yaml") == 640 ]] || fail "the config has mode $(stat -c %a -- "$models_dir/ghost-wispr.yaml"), not 640"
+cmp -s -- "$work_dir/models.env" "$models_dir/.env" || fail '--models changed .env, which the nightly update owns'
+grep -Fxq 'systemctl --user restart ghost-wispr.service' "$TEST_LOG" || fail "--models did not restart the recorder: $(<"$TEST_LOG")"
+grep -qF 'Settings saved on the page stay in the local settings file' "$work_dir/out" \
+  || fail "--models did not say that settings saved on the page stay: $(<"$work_dir/out")"
+
+for name in "${case_names[@]}"; do
+  [[ $ran_cases == *" $name "* ]] || fail "the case $name never ran"
+done
+printf 'provision run tests passed: %d cases\n' "${#case_names[@]}"

@@ -34,6 +34,7 @@ var providerSchema = map[string]any{
 					"description": "How the unit signs in: api_key (a key from the variable env names), google (a Google access token, by workload identity or Application Default Credentials), google_id_token (a Google ID token for audience) or openai_wif (an OpenAI access token in exchange for the unit's Google ID token)",
 				},
 				"env":                  map[string]any{"type": "string", "description": "api_key: the environment variable that holds the key; the key itself is never served"},
+				"read_only":            map[string]any{"type": "boolean", "description": "api_key: the deployment owns the key, so settings cannot replace it"},
 				"audience":             map[string]any{"type": "string", "description": "google_id_token: the ID token's audience"},
 				"identity_provider_id": map[string]any{"type": "string", "description": "openai_wif: OpenAI's identity provider id, not a secret"},
 				"service_account_id":   map[string]any{"type": "string", "description": "openai_wif: OpenAI's service account id, not a secret"},
@@ -79,6 +80,15 @@ var configSchema = map[string]any{
 			"description":          "GET only: the model providers the configuration names (providers:), by name. Each role's provider/model names one. No secret: an api_key provider names the variable that holds its key. A PATCH cannot set it; GET /api/providers says whether each one signs in.",
 			"additionalProperties": providerSchema,
 		},
+		"local_settings": map[string]any{
+			"type":     []string{"object", "null"},
+			"readOnly": true,
+			"description": "GET only: the store's report of the local settings file, ghost-wispr.local.yaml beside the release config. " +
+				"An object of the settings the running configuration took from that file, by their keys in a config file: those the start applied, as each settings save has changed them since. " +
+				"A null in it is an entry of a map setting that the file deletes, such as a provider. It holds only the keys the configuration reads: a key of the file that no setting reads is left out. Each provider's auth is left out. " +
+				`When the start did not apply the file (it does not parse, or a value does not fit its setting), {"applied": false, "error": "<why>"}, where why is the kind of fault and its line, never a value or a key of the file, such as "a value that does not fit its setting at line 4" or "not valid YAML near line 2": the release config applies alone, and each PATCH is refused. ` +
+				"null when there is no local settings file. deploy/pi/check-deploy.sh takes the local settings from this report, not from the file. A PATCH cannot set it.",
+		},
 		"revision": map[string]any{
 			"type":        "object",
 			"readOnly":    true,
@@ -91,7 +101,7 @@ var configSchema = map[string]any{
 		"provider_keys": map[string]any{
 			"type":                 "object",
 			"writeOnly":            true,
-			"description":          "PATCH only: the key of each named provider that signs in with one (auth.kind api_key), saved under the variable its auth.env names, in the unit's .env file. A provider that signs in another way takes no key: the PATCH is refused with 400. GET never serves a key.",
+			"description":          "PATCH only: the key of each named provider that signs in with one (auth.kind api_key), saved under the variable its auth.env names, in the unit's .env file. A provider that signs in another way, or whose auth.read_only is true, takes no settings key: the PATCH is refused with 400. GET never serves a key.",
 			"additionalProperties": map[string]any{"type": "string"},
 		},
 		"summarization": map[string]any{
@@ -113,7 +123,7 @@ var configSchema = map[string]any{
 			"type":        "array",
 			"readOnly":    true,
 			"items":       map[string]any{"type": "string"},
-			"description": "GET only: the rules the web UI shows under Recording rules, each as written in recording_rules. GHOST_WISPR_RECORDING_RULES overrides it with a JSON list of strings, and a settings save (any PATCH /api/config) then writes the override's rules into the config file, where they stay after the variable is removed. Empty when none are set; the page then shows no Recording rules button. A PATCH cannot set it.",
+			"description": "GET only: the rules the web UI shows under Recording rules, each as written in recording_rules. GHOST_WISPR_RECORDING_RULES overrides it with a JSON list of strings while the variable is set. A settings save (any PATCH /api/config) never writes the override's rules into the local settings file, ghost-wispr.local.yaml beside the release config: once the variable is removed, the config's rules apply. Empty when none are set; the page then shows no Recording rules button. A PATCH cannot set it.",
 		},
 		"voice": map[string]any{
 			"type":        "object",
@@ -1129,7 +1139,7 @@ func OpenAPISpec() map[string]any {
 							},
 						},
 						"400": map[string]any{
-							"description": "An invalid setting, such as a negative GC limit, a key for a provider that does not sign in with one, a model no provider serves, or a field the settings do not have; nothing is changed",
+							"description": "An invalid setting, such as a negative GC limit, a key for a provider that does not sign in with one, a key for a provider whose auth.read_only is true, a model no provider serves, or a field the settings do not have; nothing is changed",
 						},
 						"404": map[string]any{
 							"description": "A change to a summarization preset the configuration does not hold that does not create it: a new preset names all four of its fields (description, system_prompt, user_template, model), with a user_template; anything less is an update to a preset deleted elsewhere. Nothing is changed",

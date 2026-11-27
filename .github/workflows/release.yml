@@ -129,6 +129,18 @@ jobs:
           ldd ghost-wispr-linux-arm64
           ./ghost-wispr-linux-arm64 kws-selftest internal/wake/local/testdata/*.wav
 
+      # The Pi's deploy set (dispatch://INFRA-5935/spec R5): the files the nightly update installs
+      # with this binary, the provisioning files, and a manifest that names this commit, this
+      # binary's SHA-256 and the link versions this binary accepts. The build asks the binary, so it
+      # runs here, on arm64, after the self-test.
+      - name: Build the Pi's deploy tarball
+        env:
+          BUILD_SHA: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}
+        run: |
+          # deploy-tarball-command:start
+          bash deploy/pi/build-deploy-tarball.sh "$BUILD_SHA" ./ghost-wispr-linux-arm64 .
+          # deploy-tarball-command:end
+
       - name: Upload arm64 artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
@@ -136,6 +148,8 @@ jobs:
           path: |
             ghost-wispr-linux-arm64
             ghost-wispr-linux-arm64.sha256
+            ghost-wispr-pi-deploy.tar.gz
+            ghost-wispr-pi-deploy.tar.gz.sha256
             THIRD_PARTY_NOTICES.md
           if-no-files-found: error
 
@@ -165,6 +179,8 @@ jobs:
           gh release create "$tag" \
             ghost-wispr-linux-arm64 \
             ghost-wispr-linux-arm64.sha256 \
+            ghost-wispr-pi-deploy.tar.gz \
+            ghost-wispr-pi-deploy.tar.gz.sha256 \
             THIRD_PARTY_NOTICES.md \
             --target "$BUILD_SHA" \
             --title "$tag" \

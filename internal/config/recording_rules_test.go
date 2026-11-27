@@ -1,6 +1,8 @@
 package config
 
 import (
+	"bytes"
+	"os"
 	"slices"
 	"strings"
 	"testing"
@@ -66,7 +68,7 @@ func TestRecordingRulesAreReadAsWritten(t *testing.T) {
 
 // TestASavedConfigKeepsItsRecordingRules fails if a snapshot of the store
 // shares the rules with the store, or if a config API save drops them from
-// the file.
+// the config a restart reads.
 func TestASavedConfigKeepsItsRecordingRules(t *testing.T) {
 	clearEnv(t)
 	path := writeConfig(t, "recording_rules:\n  - First rule.\n  - Second rule.\n")
@@ -92,28 +94,49 @@ func TestASavedConfigKeepsItsRecordingRules(t *testing.T) {
 	}
 }
 
-// TestASaveWritesTheRulesOverrideIntoTheFile fails if a config API save does
-// not write the rules GHOST_WISPR_RECORDING_RULES gives into the file, where
-// they stay once the variable is removed, as the README, the examples and the
-// OpenAPI spec say: every override is written back the same way.
-func TestASaveWritesTheRulesOverrideIntoTheFile(t *testing.T) {
-	clearEnv(t)
-	path := writeConfig(t, "recording_rules:\n  - File rule.\n")
-	t.Setenv(EnvPrefix+"RECORDING_RULES", `["Override rule."]`)
-	store, _, err := NewStore(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := store.Update(func(c *Config) { c.GCMaxAgeDays = 7 }); err != nil {
-		t.Fatal(err)
-	}
+// TestASaveDoesNotWriteTheRulesOverrideIntoTheFile fails if a config API save
+// writes the rules GHOST_WISPR_RECORDING_RULES gives, a list or an empty list,
+// into the local settings file: once the variable is removed, the rules of the
+// release config must apply, as the README, the examples and the OpenAPI spec
+// say. The release config must not change either.
+func TestASaveDoesNotWriteTheRulesOverrideIntoTheFile(t *testing.T) {
+	for name, override := range map[string]string{"a list": `["Override rule."]`, "an empty list": "[]"} {
+		t.Run(name, func(t *testing.T) {
+			clearEnv(t)
+			path := writeConfig(t, "recording_rules:\n  - File rule.\n")
+			release, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv(EnvPrefix+"RECORDING_RULES", override)
+			store, _, err := NewStore(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := store.Get().RecordingRules; slices.Equal(got, []string{"File rule."}) {
+				t.Fatalf("%sRECORDING_RULES=%s did not override the rules: the check below could not see a saved override", EnvPrefix, override)
+			}
+			if err := store.Update(func(c *Config) { c.GCMaxAgeDays = 7 }); err != nil {
+				t.Fatal(err)
+			}
 
-	t.Setenv(EnvPrefix+"RECORDING_RULES", "")
-	reloaded, _, err := Load(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if want := []string{"Override rule."}; !slices.Equal(reloaded.RecordingRules, want) {
-		t.Fatalf("after a save with the override set, the file holds recording_rules %q, want %q", reloaded.RecordingRules, want)
+			if saved := savedConfig(t, LocalSettingsPath(path)); len(saved) != 1 || saved["gc_max_age_days"] != 7 {
+				t.Errorf("the local settings file holds %v, want gc_max_age_days 7 alone", saved)
+			}
+			if after, err := os.ReadFile(path); err != nil || !bytes.Equal(after, release) {
+				t.Errorf("a save with the override set changed the release config (%v):\n%s", err, after)
+			}
+			t.Setenv(EnvPrefix+"RECORDING_RULES", "")
+			if err := os.WriteFile(path, []byte("recording_rules:\n  - New release rule.\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			reloaded, _, err := Load(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if want := []string{"New release rule."}; !slices.Equal(reloaded.RecordingRules, want) {
+				t.Errorf("after a new release with the variable removed, recording_rules %q, want %q", reloaded.RecordingRules, want)
+			}
+		})
 	}
 }

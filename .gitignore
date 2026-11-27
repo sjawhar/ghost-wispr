@@ -291,6 +291,7 @@ web/dist/
 cmd/ghost-wispr/static/
 mise.toml
 ghost-wispr.yaml
+ghost-wispr.local.yaml
 !deploy/pi/files/ghost-wispr.yaml
 # The paused listener's static libraries and model (deploy/sherpa/fetch.sh).
 /third_party/sherpa-onnx/

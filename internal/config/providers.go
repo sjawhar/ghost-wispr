@@ -119,6 +119,10 @@ type ProviderAuth struct {
 	Kind string `yaml:"kind" json:"kind"`
 	// Env is the environment variable that holds an api_key provider's key.
 	Env string `yaml:"env,omitempty" json:"env,omitempty"`
+	// ReadOnly leaves an api_key provider's deployment-owned key out of
+	// settings changes. Another kind holds no key, so there it does nothing,
+	// and validateProviders warns.
+	ReadOnly bool `yaml:"read_only,omitempty" json:"read_only,omitempty"`
 	// Audience is a google_id_token provider's ID token audience.
 	Audience string `yaml:"audience,omitempty" json:"audience,omitempty"`
 	// IdentityProviderID and ServiceAccountID are an openai_wif provider's
@@ -242,9 +246,8 @@ func (c *Config) APIKey(name string) string {
 
 // SetAPIKey sets the key of provider name, which a store with a .env file
 // writes there under the variable its auth.env names; a key it did not set is
-// not written. It refuses a provider that does not sign in with a key, or
-// names no variable to hold one: the key would live only until the next
-// start, or reach .env as a line nothing reads.
+// not written. It refuses a provider whose deployment owns its key, one that
+// does not sign in with a key, or one that names no variable to hold one.
 func (c *Config) SetAPIKey(name, key string) error {
 	p, ok := c.Providers[name]
 	if !ok {
@@ -252,6 +255,9 @@ func (c *Config) SetAPIKey(name, key string) error {
 	}
 	if p.Auth.Kind != AuthAPIKey {
 		return fmt.Errorf("provider %q signs in with %s, not a key", name, p.Auth.Kind)
+	}
+	if p.Auth.ReadOnly {
+		return fmt.Errorf("provider %q has auth.read_only, so its deployment owns its key", name)
 	}
 	if !envName.MatchString(p.Auth.Env) {
 		return fmt.Errorf("provider %q names no variable to hold its key — set its auth.env to one", name)
@@ -427,6 +433,9 @@ func validateProviders(providers map[string]Provider) []string {
 			}
 		default:
 			warnings = append(warnings, fmt.Sprintf("%s.auth.kind %q is not a sign-in this build knows — use one of: %s.", at, a.Kind, strings.Join(AuthKinds, ", ")))
+		}
+		if a.ReadOnly && a.Kind != "" && a.Kind != AuthAPIKey {
+			warnings = append(warnings, fmt.Sprintf("%s.auth.read_only does nothing: only an api_key provider holds a key the settings could change, and %s signs in with %s — remove it.", at, at, a.Kind))
 		}
 	}
 	return warnings

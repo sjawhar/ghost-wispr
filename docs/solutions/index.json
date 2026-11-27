@@ -61,5 +61,8 @@
   ],
   "internal/concierge": [
     "revised-final-wake-boundary.md"
+  ],
+  "deploy/pi": [
+    "deploy-pi-shell-on-the-ci-runner.md"
   ]
 }

@@ -13,7 +13,7 @@ audio_dir: data/audio
 silence_timeout: 30s
 # debug, info, warn (or warning) or error, in any case; another value logs at info, with a
 # warning. GHOST_WISPR_LOG_LEVEL overrides it for the run only: a settings save in the web UI
-# writes this value back, not the variable's.
+# never writes the variable's level to ghost-wispr.local.yaml.
 log_level: info
 
 # The unit's own HTTPS address, such as the name tailscale serve publishes. The web UI accepts
@@ -23,9 +23,9 @@ log_level: info
 
 # The rules people in the room agree to. The web UI shows a Recording rules button when there is
 # at least one, and its dialog shows each rule as written, as plain text. With none, there is no
-# button. GHOST_WISPR_RECORDING_RULES overrides the list with a JSON list of strings; a settings
-# save in the web UI then writes the override's rules into this file, where they stay after the
-# variable is removed.
+# button. GHOST_WISPR_RECORDING_RULES overrides the list with a JSON list of strings while it is
+# set. A settings save in the web UI never writes the override's rules into ghost-wispr.local.yaml,
+# the local settings file beside this file: once the variable is removed, these rules apply.
 # recording_rules:
 #   - Say so before the meeting if you do not want it recorded.
 #   - Anyone can pause the recorder, at any time.

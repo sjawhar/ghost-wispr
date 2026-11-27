@@ -43,7 +43,7 @@ for args in '--models' "--models $drive_id extra"; do
   if output=$(bash "$provisioner" $args 2>&1); then
     fail "provision.sh $args unexpectedly succeeded"
   fi
-  [[ "$output" == *'usage: deploy/pi/provision.sh --models <shared-drive-id>'* ]] \
+  [[ "$output" == *'usage: provision.sh --models <shared-drive-id>'* ]] \
     || fail "provision.sh $args did not explain its required input: $output"
 done
 for bad_id in '' 'drive id' 'drive/id' 'drive"id' "drive'id" 'drive:id' $'drive\nid'; do
@@ -64,6 +64,35 @@ hub_host=${PI_NATS_SERVER#nats://}
 hub_host=${hub_host%:4222}
 [[ $hub_host =~ ^[A-Za-z0-9.-]+$ ]] || fail "PI_NATS_SERVER names no hub host: $PI_NATS_SERVER"
 readonly hub_url="http://$hub_host:9020"
+
+# The Pi's two secrets in Secret Manager, which update.sh reads each night through these settings:
+# each name starts with operator-only-, the prefix that holds every box identity off a secret of the
+# project, so no box can read the Pi's Deepgram key or Dispatch token or add a version of either
+# (dispatch://INFRA-5935/spec R3). provision.sh joins the tailnet with the client id and the service
+# account's unique ID, each one token.
+for variable in PI_DEEPGRAM_SECRET PI_DISPATCH_TOKEN_SECRET; do
+  [[ ${!variable:-} =~ ^operator-only-[a-z0-9-]+$ ]] \
+    || fail "pi.env sets $variable to '${!variable:-}', not a name under operator-only-, the prefix that holds every box identity off it"
+done
+[[ ${PI_TAILNET_CLIENT_ID:-} =~ ^[A-Za-z0-9._:-]+$ ]] \
+  || fail "pi.env sets PI_TAILNET_CLIENT_ID to '${PI_TAILNET_CLIENT_ID:-}', not one client id"
+[[ ${PI_SERVICE_ACCOUNT_UNIQUE_ID:-} =~ ^[0-9]+$ ]] \
+  || fail "pi.env sets PI_SERVICE_ACCOUNT_UNIQUE_ID to '${PI_SERVICE_ACCOUNT_UNIQUE_ID:-}', not the service account's unique ID"
+
+# Each setting of pi.env has a reader: a deploy script or a runbook step, the tests left out. A
+# setting that only a deleted script read would stay in every release to mislead.
+mapfile -t settings < <(sed -n 's/^\(PI_[A-Z0-9_]*\)=.*/\1/p' "$test_root/deploy/pi/files/pi.env")
+((${#settings[@]} >= 10)) || fail "this reading of pi.env finds ${#settings[@]} settings: the reader check cannot see the file"
+for setting in "${settings[@]}"; do
+  status=0
+  git -C "$test_root" grep -q -w -F -e "$setting" -- deploy docs ':(exclude)deploy/pi/files/pi.env' \
+    ':(exclude)deploy/pi/test-pi.env' ':(exclude)*_test.sh' || status=$?
+  case $status in
+    0) ;;
+    1) fail "pi.env sets $setting, which no deploy script and no runbook step reads" ;;
+    *) fail "git grep could not search the repository for $setting (exit $status)" ;;
+  esac
+done
 
 # config_paths FILE prints each setting of FILE, a YAML file written one setting a line, as its
 # dotted path and value ("providers.vertex.location: global"), at any depth and any indentation, so
@@ -146,7 +175,7 @@ assert_models() {
 }
 
 # The committed template names the approved providers and models, keeps sync and GC off, and turns
-# Envoy on at the hub's listener, for events and for the Concierge.
+# Envoy on at the hub's listener, for events and for the Concierge, which reads one Dispatch server.
 assert_models "$template"
 for line in \
   'google_credentials_file: /opt/ghost-wispr/google-credentials.json' \
@@ -157,20 +186,16 @@ for line in \
   'envoy_enabled: true' \
   "envoy_hub_url: $hub_url" \
   "  envoy_url: $hub_url" \
-  "  dispatch_url: $PI_DISPATCH_URL" \
   'jabra_mute_button: true' \
   'mic_device: J75' \
   'speaker_device: J75'; do
   assert_line "$line" "$template"
 done
 assert_count '^gdrive_folder_id:' 0 "$template"
+assert_count '^  dispatch_url: https://[A-Za-z0-9.-][A-Za-z0-9.-]*$' 1 "$template"
 # The template's public_url is the Pi's tailnet name, which the tailnet join checks it has.
 assert_line "public_url: https://$PI_HOST" "$template"
 assert_count '^public_url:' 1 "$template"
-# The Deepgram provider reads its key from the variable the full provisioner writes the credential
-# bundle's deepgram-key into.
-grep -Fq "printf 'GHOST_WISPR_DEEPGRAM_API_KEY=%s\n' \"\$deepgram_key\"" "$provisioner" \
-  || fail 'the full provisioner does not write the Deepgram key into the variable providers.deepgram.auth.env names'
 
 # The check above sees a removed setting at any depth: each one planted in the template is refused,
 # for that setting.
@@ -190,121 +215,18 @@ for path in "${removed_settings[@]}"; do
   [[ $refusal == *"still sets $path,"* ]] || fail "the template check refused $path planted in it for another reason: $refusal"
 done
 
-# The template holds every setting the full provisioner installs: nothing is substituted, and no
-# Envoy webhook setting is left.
+# The template holds every setting the nightly update installs: nothing is substituted, and no Envoy
+# webhook setting is left.
 for key in envoy_webhook_url envoy_webhook_secret_name; do
   assert_count "^$key:" 0 "$template"
 done
 assert_count '__[A-Z_]*__' 0 "$template"
 
-# The models configuration: every template setting, the quoted drive ID, sync and GC on, each key once.
-models_config="$work_dir/models.yaml"
-provisioner_function render_models_config "$template" "$drive_id" >"$models_config" \
-  || fail 'the models renderer rejected a valid shared-drive ID'
-assert_models "$models_config"
-for line in \
-  'gc_max_age_days: 0' \
-  'gc_max_audio_size_mb: 20000' \
-  "envoy_hub_url: $hub_url" \
-  'envoy_enabled: true' \
-  "  envoy_url: $hub_url" \
-  "gdrive_folder_id: \"$drive_id\"" \
-  'gdrive_sync_enabled: true' \
-  'gc_enabled: true' \
-  'jabra_mute_button: true' \
-  'mic_device: J75' \
-  'speaker_device: J75'; do
-  assert_line "$line" "$models_config"
-done
-for key in gdrive_folder_id gdrive_sync_enabled gc_enabled envoy_enabled envoy_hub_url jabra_mute_button mic_device speaker_device providers; do
-  assert_count "^$key:" 1 "$models_config"
-done
-
-# A template that already names a drive loses the stale ID and settings.
-stale_template="$work_dir/stale-template.yaml"
-stale_config="$work_dir/stale.yaml"
-cat >"$stale_template" <<'EOF'
-existing_setting: retained
-gdrive_folder_id: "stale-id"
-gdrive_sync_enabled: false
-gc_enabled: false
-envoy_hub_url: http://hub.example.ts.net:9020
-EOF
-provisioner_function render_models_config "$stale_template" "$drive_id" >"$stale_config" \
-  || fail 'the models renderer rejected a template with stale Drive settings'
-assert_line 'existing_setting: retained' "$stale_config"
-assert_count 'stale-id' 0 "$stale_config"
-assert_line 'envoy_hub_url: http://hub.example.ts.net:9020' "$stale_config"
-assert_count 'false' 0 "$stale_config"
-for key in gdrive_folder_id gdrive_sync_enabled gc_enabled; do
-  assert_count "^$key:" 1 "$stale_config"
-done
-
-# Renderers fail, rather than print a partial configuration, on bad input.
-for bad_id in '' 'drive id' 'drive"id'; do
-  if provisioner_function render_models_config "$template" "$bad_id" >/dev/null; then
-    fail "the models renderer accepted the invalid shared-drive ID $(printf '%q' "$bad_id")"
-  fi
-done
-if provisioner_function render_models_config "$work_dir/missing.yaml" "$drive_id" >/dev/null 2>&1; then
-  fail 'the models renderer succeeded without a template'
-fi
-
-# The deployed shared drive carries over to --models and a rerun of the full provisioner.
-[[ $(provisioner_function deployed_drive_id "$models_config") == "$drive_id" ]] \
-  || fail 'the deployed shared-drive ID was not read back'
-drive_on_template=$(provisioner_function deployed_drive_id "$template") \
-  || fail 'a configuration without a shared drive was treated as invalid'
-[[ -z "$drive_on_template" ]] || fail "a configuration without a shared drive returned '$drive_on_template'"
-unquoted_drive="$work_dir/unquoted-drive.yaml"
-two_drives="$work_dir/two-drives.yaml"
-printf '%s\n' "gdrive_folder_id: $drive_id" >"$unquoted_drive"
-printf 'gdrive_folder_id: "%s"\n' "$drive_id" "$drive_id" >"$two_drives"
-[[ $(provisioner_function deployed_drive_id "$unquoted_drive") == "$drive_id" ]] \
-  || fail 'the deployed shared-drive ID was not read from yaml.v3 output'
-if provisioner_function deployed_drive_id "$two_drives" >/dev/null; then
-  fail "a shared-drive ID was read from $two_drives"
-fi
-# Every config API save writes yaml.v3 output, and yaml.v3 writes an empty folder as "".
-empty_drive="$work_dir/empty-drive.yaml"
-printf '%s\n' 'gdrive_folder_id: ""' >"$empty_drive"
-drive_on_empty=$(provisioner_function deployed_drive_id "$empty_drive") \
-  || fail 'a configuration the config API saved without a shared drive was treated as invalid'
-[[ -z "$drive_on_empty" ]] || fail "a configuration with an empty shared drive returned '$drive_on_empty'"
-
-# --models keeps every .env line but those of settings Ghost Wispr no longer reads, each of which a
-# start warns about: the Envoy webhook signing key an earlier provisioner wrote, and each variable
-# that providers replaced (internal/config, removedEnvironment), such as the Vertex embedding
-# location an earlier provisioner wrote. It keeps the role overrides that providers kept, whose
-# names share words with removed ones, and writes no line of its own. The office Pi turns the
-# Jabra's Mute button on in such a line too (docs/pi-setup.md, "Pause and resume at the unit"):
-# --models keeps it on, as it is.
-readonly removed_variables=(GCP_PROJECT GCP_LOCATION GENAI_BACKEND EMBEDDING_BACKEND EMBEDDING_LOCATION
-  DEEPGRAM_MODEL BATCH_TRANSCRIPTION_PROVIDER TTS_PROVIDER TTS_API_KEY VOICE_TTS_ENGINE VOICE_TTS_MODEL
-  VOICE_TTS_VOICE VOICE_TTS_LOCATION ENVOY_WEBHOOK_SECRET)
-readonly kept_lines=(GHOST_WISPR_ADDR=127.0.0.1:8080 GHOST_WISPR_DEEPGRAM_API_KEY=test-key
-  GHOST_WISPR_JABRA_MUTE_BUTTON=true GHOST_WISPR_TTS_VOICE=Kore GHOST_WISPR_TTS_MODEL=vertex/tts-1
-  GHOST_WISPR_EMBEDDING_MODEL=vertex/embed-1 GHOST_WISPR_BATCH_TRANSCRIPTION_MODEL=deepgram/nova-3
-  GHOST_WISPR_VOICE_ENGINE=tts)
-deployed_env="$work_dir/env"
-models_env="$work_dir/models.env"
-for ((i = 0; i < ${#removed_variables[@]} || i < ${#kept_lines[@]}; i++)); do
-  ((i >= ${#kept_lines[@]})) || printf '%s\n' "${kept_lines[i]}"
-  ((i >= ${#removed_variables[@]})) || printf 'GHOST_WISPR_%s=removed-value\n' "${removed_variables[i]}"
-done >"$deployed_env"
-provisioner_function render_models_env "$deployed_env" >"$models_env" \
-  || fail 'the .env renderer rejected a deployed .env'
-if ! diff <(printf '%s\n' "${kept_lines[@]}") "$models_env" >&2; then
-  fail "--models did not keep exactly the .env lines of settings Ghost Wispr reads, in order (diff above)"
-fi
-assert_count 'removed-value' 0 "$models_env"
-if provisioner_function render_models_env "$work_dir/missing.env" >/dev/null 2>&1; then
-  fail 'the .env renderer succeeded without a deployed .env'
-fi
-
+# The sentence can wrap in the runbook, so each line break reads as a space.
 for file in "$provisioner" "$test_root/docs/pi-setup.md"; do
-  grep -Fq -- 'replaces settings saved in the UI' "$file" \
-    || fail "$file does not say --models replaces settings saved in the UI"
+  text=$(tr -s '\n' ' ' <"$file") || fail "cannot read $file"
+  [[ $text == *'Settings saved on the page stay in the local settings file'* ]] \
+    || fail "$file does not say settings saved on the page stay in the local settings file"
 done
 
 printf 'provision models test passed\n'

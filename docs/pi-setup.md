@@ -1,40 +1,158 @@
 # Office recorder Pi runbook
 
 This runbook installs the Ghost Wispr office recorder on the Raspberry Pi 5 named
-`ghost-wispr`. The finished card has Raspberry Pi OS Lite, Tailscale, the Ghost Wispr
-release binary, and its runtime packages. It does not keep a source checkout, Go, or Node.js.
+`ghost-wispr`, and says how each release reaches it. The finished card has Raspberry Pi OS Lite,
+Tailscale, the deploy set of a Ghost Wispr release, and its runtime packages. It does not keep a
+source checkout, Go, or Node.js.
 
 The recorder is reachable only through Tailscale Serve at
 `https://ghost-wispr.tail12ec1c.ts.net`. Its application process listens on
 `127.0.0.1:8080`.
 
-## Prerequisites and release order
+## The release and its deploy set
 
-First flash and boot the Pi as described below, then create its key and certificate-signing request.
-The `bootstrap` identity apply signs that request, so it cannot run before those two steps.
+Each Ghost Wispr release has the binary `ghost-wispr-linux-arm64` and the Pi's deploy set,
+`ghost-wispr-pi-deploy.tar.gz`, each with its `.sha256`. The tarball has one directory,
+`ghost-wispr-pi-deploy/`, the release directory. It holds these files and `manifest.json`, which
+names the release's commit and the SHA-256 of the binary and of each other file:
 
-After the certificate-signing request exists, do these before provisioning:
+| Files | Installed by | On the Pi |
+| --- | --- | --- |
+| `ghost-wispr.yaml`, `pi.env`, `update.sh`, `pi-lib.sh`, `wait-for-network.sh`, `wait-for-time-sync.sh` | the nightly update, with the binary | `/opt/ghost-wispr/` |
+| `ghost-wispr.service` | the nightly update | `~/.config/systemd/user/` |
+| `99-ghost-wispr.rules` | the nightly update | `/etc/udev/rules.d/99-ghost-wispr.rules` |
+| `logind-power-key.conf` | the nightly update | `/etc/systemd/logind.conf.d/50-ghost-wispr-power-key.conf` |
+| `ghost-wispr-update-launcher.sh` | `provision.sh` only | `/opt/ghost-wispr/` |
+| `ghost-wispr-update.service`, `ghost-wispr-update.timer` | `provision.sh` only | `~/.config/systemd/user/` |
+| `serve.conf` | `provision.sh` only | Tailscale Serve's setting, one `<port> <proxy target>` line for each HTTPS port |
+| `provision.sh` | a person runs it from the release directory | not installed |
 
-1. Apply the approved `agent-infra` changes for the Google X.509 identity and the
-   `tag:ghost-wispr` Tailscale identity. Each value the bundle needs is then on `agent-infra`
-   `main`:
-   - the device certificate: the `bootstrap` apply publishes it as the latest version of Secret
-     Manager secret `ghost-wispr-device-certificate` (`bootstrap/README.md`);
-   - the Ghost Wispr Tailscale client ID: `root` creates the Tailscale identity `ghost-wispr-x509`
-     and prints its client ID as `ghostWisprTailnetClientId` in the log of the `seed` workflow's
-     `root` job that creates it. `tailscaleIds` has no entry for it;
-   - the service account's unique ID: `ghostWisprAccountUniqueId` in `root`'s prod
-     configuration (`root/Pulumi.prod.yaml`).
-2. Apply the tailnet policy that gives `tag:ghost-wispr` the Envoy hub's 4222 and 9020
+The nightly update installs the first nine files and the binary as one unit ("Update and
+inspect"); `provision.sh` also installs `update.sh`, `pi-lib.sh` and `pi.env`, so that its first
+update can run. The launcher, the update unit and timer, and `serve.conf` reach the Pi only when a
+person runs the release's `provision.sh`, so no release can break the path that installs the next
+one.
+`pi.env` holds the Pi's public deployment settings: its tailnet name, its Google project, service
+account and workload identity provider, the names of its Secret Manager secrets, its Tailscale
+client ID and the service account's unique ID, the Dispatch and Envoy hub addresses, and the
+recordings that no deploy step may change. No file of the release holds a secret, and no release
+holds the local settings file ("Settings saved on the page").
+
+## Prerequisites
+
+A new Pi needs these before `provision.sh` runs. Each is in place for the office Pi.
+
+1. agent-infra's `bootstrap` program declares the Pi's Google identity: the service account
+   `ghost-wispr@theorem-agent-infra.iam.gserviceaccount.com`, the workload identity provider
+   `ghost-wispr`, which trusts the certificate authority `ghost-wispr-ca`, and the Pi's three
+   Secret Manager secrets in `theorem-agent-infra`, with the account's read of each
+   (`bootstrap/ghostwispridentity.go`): `operator-only-ghost-wispr-deepgram-key`,
+   `operator-only-ghost-wispr-dispatch-token` ("The Pi's secrets") and
+   `ghost-wispr-device-certificate` ("Renew the X.509 certificate").
+2. Each `operator-only-` secret has a version ("The Pi's secrets").
+3. agent-infra's `root` program declares the Tailscale identity `ghost-wispr-x509`, with which the
+   Pi joins the tailnet as `tag:ghost-wispr`. `pi.env` holds its client ID, `PI_TAILNET_CLIENT_ID`,
+   and the service account's unique ID, `PI_SERVICE_ACCOUNT_UNIQUE_ID`, which the join uses. When
+   `root` makes the identity again, the `root` job of agent-infra's `seed` workflow prints the new
+   client ID as `ghostWisprTailnetClientId` in its log; a pull request puts it in `pi.env`.
+4. The tailnet policy gives `tag:ghost-wispr` the Envoy hub's 4222 and 9020
    (theorem-labs/agent-infra#4761, `seed`'s `root` job). Ghost Wispr publishes its events to the
-   hub's listener, `envoy_hub_url` in `deploy/pi/files/ghost-wispr.yaml`, over the tailnet with
-   no credential; until the policy applies, the events wait on the Pi and go out with the first
-   sweep after it.
-3. Wait for the Ghost Wispr release workflow to publish `ghost-wispr-linux-arm64` and
-   `ghost-wispr-linux-arm64.sha256`.
+   hub's listener, `envoy_hub_url` in `ghost-wispr.yaml`, over the tailnet with no credential;
+   until the policy applies, the events wait on the Pi, and the publisher's five-minute sweep sends
+   them once the hub takes them (README, "Envoy events").
+5. The latest Ghost Wispr release has `ghost-wispr-pi-deploy.tar.gz` and its `.sha256`.
 
-Do not provision before these are ready. Provisioning installs the release binary and joins
-Tailscale with the Pi's Google identity; it cannot make either dependency itself.
+The Pi's certificate is signed after the Pi makes its key ("Provision", steps 2 to 4).
+
+## The Pi's secrets
+
+The Pi reads two secrets from Secret Manager: its Deepgram key,
+`operator-only-ghost-wispr-deepgram-key`, and its own Dispatch token,
+`operator-only-ghost-wispr-dispatch-token`. `pi.env` names them as `PI_DEEPGRAM_SECRET` and
+`PI_DISPATCH_TOKEN_SECRET`. No release and no file that a person keeps holds them. No box
+identity, the Google identity that an agent's machine signs in with, can read them or add a
+version: the box identities' Secret Manager access holds off each name that begins
+`operator-only-`. The token is a no-scope agent token, never a person's; the meeting voice's
+Concierge reads Dispatch with it ("Turn on the meeting voice").
+
+`update.sh` writes the two values into `/opt/ghost-wispr/.env`, mode 0600, which
+`ghost-wispr.service` reads. The first four lines of `.env` are the update's, in this order:
+`GHOST_WISPR_ADDR=127.0.0.1:8080`, `GOOGLE_API_USE_CLIENT_CERTIFICATE=false`,
+`GHOST_WISPR_DEEPGRAM_API_KEY` and `GHOST_WISPR_DISPATCH_TOKEN`. It keeps every other line of
+`.env`, such as a person's `GHOST_WISPR_JABRA_MUTE_BUTTON` or `GHOST_WISPR_MIC_DEVICE` line, and
+drops the variables Ghost Wispr no longer reads (README, "Removed settings"). It reads the values
+with `ghost-wispr pi-secrets`, signed in as `PI_SERVICE_ACCOUNT` with the Pi's certificate, which
+prints the name and version of each secret it read, never a value. It removes one final line feed
+from a value, and then refuses a value that is empty, that holds a carriage return, a line feed or a
+NUL, or a backslash, that starts with a quote, or that has white space at either end: systemd would
+read such a value in `.env` otherwise than it was written. When a read fails or a value is refused,
+`.env` keeps its secret lines, and the run exits 10.
+
+The update reads the secrets at two times:
+
+- before each start of the recorder: after its two waits, `ghost-wispr.service` runs
+  `update.sh secrets`. It first puts right a certificate swap that a run cut short ("Renew the X.509
+  certificate") and removes old staging directories ("Update and inspect"). Then it writes the four
+  lines of `.env`; it installs no release and no certificate. When that read fails, the recorder
+  still starts, on the lines that `.env` has;
+- in each nightly run: when a value changed, it installs the new `.env` while the recorder is free,
+  restarts the recorder, and prints `ghost-wispr update: installed secrets`. It refuses while an
+  override or a drop-in is set ("Update and inspect", step 5).
+
+So a new version reaches the Pi the next night, or at the next restart of the recorder. A restart
+ends a conversation that is being recorded:
+
+```bash
+ssh ghost-wispr@ghost-wispr 'XDG_RUNTIME_DIR=/run/user/$(id -u) systemctl --user restart ghost-wispr.service'
+```
+
+Each secret's first version was copied once from the Pi's own `.env`, so it holds the value that
+the Pi ran with before. To replace a value, add a new version on your own device, in a Ghost Wispr
+checkout, with your own Google login (`gcloud auth login`). Run each block in bash: zsh, the default
+shell of macOS, reads `read -p` another way, and the block then adds no version. The blocks read
+the names from `deploy/pi/files/pi.env` (`GHOST_WISPR_PI_ENV` names another file, as the tests do).
+Each block reads the value at a prompt without showing it, gives it to `gcloud` in a mode-0600 file
+that it removes, never in a command argument, and adds no version for an empty value. It prints the
+version that it added, never the value. The Deepgram key:
+
+<!-- runbook_blocks_test.sh: deepgram-key -->
+```bash
+(source "${GHOST_WISPR_PI_ENV:-deploy/pi/files/pi.env}" && umask 077 &&
+  f=$(mktemp) && trap 'rm -f -- "$f"' EXIT &&
+  IFS= read -r -s -p 'Deepgram key: ' key && echo &&
+  printf '%s' "$key" >"$f" && [ -s "$f" ] &&
+  gcloud secrets versions add "$PI_DEEPGRAM_SECRET" --project="$PI_GCP_PROJECT" --data-file="$f")
+```
+
+The Dispatch token. A replacement is a no-scope agent token, never a person's: make one in Dispatch,
+under Settings → Agent tokens. The form ticks two boxes for a new token, Act as you and Approve and
+control credentials: clear both boxes, and leave Read only clear. A token made with the boxes as the
+form sets them could approve and control credentials as the person who made it.
+
+<!-- runbook_blocks_test.sh: dispatch-token -->
+```bash
+(source "${GHOST_WISPR_PI_ENV:-deploy/pi/files/pi.env}" && umask 077 &&
+  f=$(mktemp) && trap 'rm -f -- "$f"' EXIT &&
+  IFS= read -r -s -p 'Dispatch token: ' token && echo &&
+  printf '%s' "$token" >"$f" && [ -s "$f" ] &&
+  gcloud secrets versions add "$PI_DISPATCH_TOKEN_SECRET" --project="$PI_GCP_PROJECT" --data-file="$f")
+```
+
+Check that the Pi runs with the secret's latest Dispatch token, on your own device, in a checkout,
+with your own Google login. The block prints two hashes: the SHA-256 of the Pi's token, read on the
+Pi from its `.env`, and the SHA-256 of the secret's latest version. They must be equal, and neither
+may be `e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855`, the hash of nothing,
+which an empty or unread value gives. After you add a version, they are equal once the version has
+reached the Pi (above).
+
+<!-- runbook_blocks_test.sh: token-check -->
+```bash
+(source "${GHOST_WISPR_PI_ENV:-deploy/pi/files/pi.env}" &&
+  ssh "ghost-wispr@$PI_HOST" "sed -n 's/^GHOST_WISPR_DISPATCH_TOKEN[=]//p' /opt/ghost-wispr/.env" |
+    tr -d '\n' | shasum -a 256 &&
+  gcloud secrets versions access latest --secret="$PI_DISPATCH_TOKEN_SECRET" --project="$PI_GCP_PROJECT" |
+    tr -d '\n' | shasum -a 256)
+```
 
 ## Flash the card
 
@@ -71,166 +189,182 @@ and contain the operator's public SSH keys. Boot the Pi, confirm it joins `Theor
 connect as `ghost-wispr` over SSH.
 
 Install Tailscale through its normal package route if it is not already installed. The
-recorder's tested baseline has Tailscale 1.104.6. Join the tailnet temporarily as the
-operator's own device with Tailscale SSH off (`sudo tailscale up`) so the Pi remains reachable
-at `ghost-wispr.tail12ec1c.ts.net` off the office network. Provisioning replaces this
-temporary join with `tag:ghost-wispr`.
-
-## Create the Pi key and Google credential files
-
-The key is generated on the Pi and never leaves it. Run this once before the first
-`bootstrap` identity apply:
-
-```bash
-ssh ghost-wispr@ghost-wispr.tail12ec1c.ts.net \
-  'umask 077; mkdir -p ~/.config/ghost-wispr-identity && openssl req -new -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -keyout ~/.config/ghost-wispr-identity/key.pem -subj /CN=ghost-wispr'
-```
-
-Give the resulting certificate-signing request to the `bootstrap` apply. After the apply,
-create the Google external-account credential files on a development machine, never on the Pi,
-from a Ghost Wispr checkout. This block and the others the test `provision_bundle_test.sh` runs
-read the Pi's project, identities and resource names from `deploy/pi/files/pi.env`:
-
-<!-- provision_bundle_test.sh: credentials -->
-```bash
-source "${GHOST_WISPR_PI_ENV:-deploy/pi/files/pi.env}"
-d=$(mktemp -d)
-gcloud iam workload-identity-pools create-cred-config \
-  "$PI_WORKLOAD_PROVIDER" \
-  --service-account="$PI_SERVICE_ACCOUNT" \
-  --credential-cert-path=/opt/ghost-wispr/device.crt \
-  --credential-cert-private-key-path=/home/ghost-wispr/.config/ghost-wispr-identity/key.pem \
-  --credential-cert-configuration-output-file="$d/certificate_config.json" \
-  --output-file="$d/google-credentials.json"
-jq --arg path /opt/ghost-wispr/certificate_config.json \
-  '.credential_source.certificate.certificate_config_location = $path' \
-  "$d/google-credentials.json" >"$d/google-credentials.json.tmp"
-mv "$d/google-credentials.json.tmp" "$d/google-credentials.json"
-```
-
-`device.crt`, `google-credentials.json`, and `certificate_config.json` are not secrets. The
-private key stays at `/home/ghost-wispr/.config/ghost-wispr-identity/key.pem`. Do not set
-`GOOGLE_API_CERTIFICATE_CONFIG`: the certificate is for the Security Token Service exchange,
-not Google API mTLS.
-Ghost Wispr reads this credential through
-`google_credentials_file: /opt/ghost-wispr/google-credentials.json` in its YAML. The tailnet
-join passes the same path with `ghost-wispr google-id-token --credentials`; it does not set
-`GOOGLE_APPLICATION_CREDENTIALS`.
-
-
-## Renew the X.509 certificate
-
-Ghost Wispr warns on its status page when the certificate has fewer than 30 days left, or when it
-cannot read the certificate. The `bootstrap` apply renews the certificate and publishes it as the
-latest version of Secret Manager secret `ghost-wispr-device-certificate`; the Pi private key stays
-where it is. Apply `bootstrap` through its normal reviewed CI route. Then, from a Ghost Wispr
-checkout on a development machine whose `gcloud` is the devbox identity (the reader
-`bootstrap/README.md` names), read the new certificate, check it, install it on the Pi and restart
-Ghost Wispr:
-
-<!-- provision_bundle_test.sh: renew -->
-```bash
-source "${GHOST_WISPR_PI_ENV:-deploy/pi/files/pi.env}" &&
-crt=$(mktemp) &&
-gcloud secrets versions access latest --secret="$PI_CERTIFICATE_SECRET" --project="$PI_GCP_PROJECT" >"$crt" &&
-openssl x509 -in "$crt" -noout -subject -nameopt RFC2253 -enddate &&
-ssh "ghost-wispr@$PI_HOST" \
-  'sudo install -o ghost-wispr -g ghost-wispr -m 0644 /dev/stdin /opt/ghost-wispr/device.crt && XDG_RUNTIME_DIR=/run/user/$(id -u) systemctl --user restart ghost-wispr.service' <"$crt"
-rm -f -- "$crt"
-```
-
-`openssl` must print `subject=CN=ghost-wispr` and the new end date. The certificate is not a
-secret: if this machine cannot reach the Pi over SSH, copy `$crt` to one that can and run the
-`ssh` line there. Confirm that `https://ghost-wispr.tail12ec1c.ts.net/api/status` no longer
-reports the certificate warning. Do not regenerate the Pi key or the Google credential
-configuration for a normal certificate renewal.
-
-## Prepare the bundle's public files
-
-The credential bundle holds five public files and one or two secrets:
-
-| File | Source |
-| --- | --- |
-| `device.crt` | the latest version of Secret Manager secret `ghost-wispr-device-certificate` |
-| `google-credentials.json` and `certificate_config.json` | the rewritten files in `$d` from the `gcloud ... create-cred-config` command above |
-| `tailscale-client-id` | `ghostWisprTailnetClientId`, which `agent-infra`'s `seed` workflow printed in the log of the `root` job that created the Tailscale identity `ghost-wispr-x509` |
-| `tailscale-subject` | `ghostWisprAccountUniqueId` in `root/Pulumi.prod.yaml` on `agent-infra` `main` |
-| `deepgram-key` | `DEEPGRAM_API_KEY` from the operator's `secrets` store |
-| `dispatch-token` | the unit's own no-scope Dispatch token, for the meeting voice; optional, put in `$prepared` as "Turn on the meeting voice" says |
-
-The bundle holds no Envoy file: Ghost Wispr publishes to the Envoy hub over the tailnet with no
-credential, and `provision.sh` refuses a bundle that holds an `envoy-webhook-url` or
-`envoy-webhook-secret` from the webhook it used before.
-
-Make the five public files on the development machine where you ran `create-cred-config`, from a
-Ghost Wispr checkout. Its `gcloud` must be the devbox identity, its `gh` must read
-`theorem-labs/agent-infra`'s Actions logs, and it needs `agent-infra` checked out at
-`~/src/agent-infra`. The block reads no Pulumi state: the devbox identity cannot list the `root`
-state bucket (403). Each value comes from a source that identity reads, at
-the time you run the block:
-
-- `tailscale-subject` from `root/Pulumi.prod.yaml` on `agent-infra`'s `origin/main`.
-- `tailscale-client-id` from a `seed` run's log, with `deploy/pi/tailnet-client-id.sh`. It reads
-  the `seed` workflow's runs from the newest, and every attempt of a re-run run, and takes the
-  first `root` job whose log says that `ghost-wispr-x509` was created or replaced, so the newest
-  creation wins. It prints that job's link. It stops with an error, and writes no ID, when a
-  `root` job that ran is still running or its log cannot be read, because that job can hold a
-  newer ID; run it again. It reads the log with `gh api .../actions/jobs/<id>/logs`, because
-  `gh run view --job <id> --log` refuses while another job of the same run still waits for its
-  approval. It reads the runs of the last 90 days: `agent-infra` keeps run logs for 90 days
-  (`root/retention.json`). It makes one API call for each run it reads, so it takes about 15
-  minutes for each 1000 runs before the creation. When no run of the last 90 days made the
-  identity, it says so; then read the ID from `/opt/ghost-wispr/tailscale-client-id` on a Pi
-  provisioned before, or ask someone who can read `root`'s Pulumi state for
-  `pulumi stack output ghostWisprTailnetClientId --stack prod`.
-
-<!-- provision_bundle_test.sh: prepare -->
-```bash
-source "${GHOST_WISPR_PI_ENV:-deploy/pi/files/pi.env}"
-prepared=$(mktemp -d)
-gcloud secrets versions access latest --secret="$PI_CERTIFICATE_SECRET" --project="$PI_GCP_PROJECT" >"$prepared/device.crt"
-openssl x509 -in "$prepared/device.crt" -noout -subject -nameopt RFC2253 -enddate
-cp "$d/certificate_config.json" "$d/google-credentials.json" "$prepared/"
-git -C "$PI_INFRA_CHECKOUT" fetch --quiet origin main
-git -C "$PI_INFRA_CHECKOUT" show "origin/main:$PI_SUBJECT_FILE" \
-  | sed -n "s/^  $PI_SUBJECT_KEY: \"\{0,1\}\([0-9][0-9]*\)\"\{0,1\}\$/\1/p" >"$prepared/tailscale-subject"
-deploy/pi/tailnet-client-id.sh >"$prepared/tailscale-client-id"
-head "$prepared/tailscale-subject" "$prepared/tailscale-client-id"
-rm -rf -- "$d"
-```
-
-`openssl` must print `subject=CN=ghost-wispr`, and `head` one line for each of the two files:
-the subject is digits and the client ID one token. `provision-pi.sh` refuses an empty file, and
-`provision.sh` a file of another form. None of these five files is a secret: if another machine
-provisions the Pi, copy `$prepared` there before you add `dispatch-token`, which is one.
+recorder's tested baseline has Tailscale 1.104.6. When this card replaces the card of a Pi that is
+on the tailnet, first read that Pi's tagged device's IPv4 address on the Machines page of
+Tailscale's admin console, and keep it for "Provision", step 8. Then remove that device there:
+`deploy/pi/claim-tailnet-name.sh` refuses while a second tagged device has the hostname
+`ghost-wispr`. Join the tailnet temporarily as the operator's own device with Tailscale SSH off
+(`sudo tailscale up`) so the Pi remains reachable at `ghost-wispr.tail12ec1c.ts.net` off the
+office network. Provisioning replaces this temporary join with `tag:ghost-wispr`.
 
 ## Provision
 
-`deploy/pi/provision-pi.sh` reads the secrets, makes the bundle and runs
-`deploy/pi/provision.sh` on the Pi. Run it from a checkout of the release's commit, on the
-machine that reaches the Pi over SSH.
+A person provisions the Pi in these steps. Each step runs on the Pi as `ghost-wispr`, over SSH,
+unless it says where it runs. Provision outside meetings: step 5 starts the nightly update, which
+restarts the recorder, and a restart ends a conversation that is being recorded.
 
-- It reads `DEEPGRAM_API_KEY` with `secrets` on the provisioning machine, and the unit's Dispatch
-  token from `$prepared/dispatch-token` when that file exists. It refuses a `dispatch-token` that
-  is a link or empty, before it reaches the Pi.
-- The secrets reach the bundle only through a mode-0700 directory under `$XDG_RUNTIME_DIR` while
-  it makes the tar stream. It removes that directory as soon as `provision.sh` returns, also when
-  `provision.sh` fails, and on any exit. No secret goes in an argument.
-- It copies only the provisioning sources to a temporary directory on the Pi and removes it
-  afterwards, so the card keeps no source checkout.
+1. On the Pi, download the latest release's deploy set and check it:
 
-`provision.sh` runs as `ghost-wispr` with passwordless sudo. Before it changes anything, it reloads
-`ghost-wispr`'s user manager and refuses while the manager's own environment sets
-`GHOST_WISPR_CONFIG` or an Envoy variable, which the recorder would inherit ("Turn on the meeting
-voice", step 1); the `.env` it writes sets none of them. It installs `libportaudio2`,
-`ffmpeg`, `lame`, `jq`, and `curl`; copies the release runtime to `/opt/ghost-wispr`; installs
-the user services; verifies and installs the newest release; restarts a running recorder so it
-reads the configuration it installed; enables Tailscale Serve; and then starts the detached
-tagged-device join. The restart ends a conversation that is being recorded, so provision outside
-meetings. The detached join runs `tailscale up` with `--accept-routes=false`, so the Pi joins with
-the tailnet's subnet routes off. Then it runs the route check of "Accept the tailnet's subnet
-routes". It accepts the routes (`tailscale set --accept-routes`) only when no peer's
-`PrimaryRoutes` overlaps a network of the Pi.
+   <!-- runbook_blocks_test.sh: download-latest -->
+   ```bash
+   d=$(mktemp -d) && cd "$d" &&
+   u=https://github.com/sjawhar/ghost-wispr/releases/latest/download &&
+   curl -fsSLO "$u/ghost-wispr-pi-deploy.tar.gz" &&
+   curl -fsSLO "$u/ghost-wispr-pi-deploy.tar.gz.sha256" &&
+   sha256sum -c ghost-wispr-pi-deploy.tar.gz.sha256 &&
+   tar -xzf ghost-wispr-pi-deploy.tar.gz &&
+   cd ghost-wispr-pi-deploy
+   ```
+
+   `sha256sum` must print `ghost-wispr-pi-deploy.tar.gz: OK`. The shell is then in the release
+   directory, where each later step on the Pi runs. The directory is in `/tmp`, which a reboot
+   empties: in a new SSH session, or after a reboot, run this block again.
+2. On the Pi, make its key:
+
+   <!-- runbook_blocks_test.sh: provision-key -->
+   ```bash
+   ./provision.sh --key
+   ```
+
+   It makes `~/.config/ghost-wispr-identity/key.pem`, mode 0600, and prints the key's certificate
+   request, with the subject `CN=ghost-wispr`. It refuses when the key exists. The key never leaves
+   the Pi.
+3. Open a pull request in agent-infra that adds the request to `ghostWisprCSRs` in
+   `bootstrap/ghostwispridentity.go`, as the value of its `ghost-wispr` entry: only that entry's
+   certificate goes to `ghost-wispr-device-certificate`. When the pull request merges, the
+   `bootstrap` apply signs the request with the certificate authority `ghost-wispr-ca` and adds the
+   certificate as the latest version of that secret.
+4. On your own device, in a checkout, with your own Google login, read the certificate and copy it
+   to the Pi as `~/device.crt`. The certificate is not a secret.
+
+   ```bash
+   (source "${GHOST_WISPR_PI_ENV:-deploy/pi/files/pi.env}" && f=$(mktemp) && trap 'rm -f -- "$f"' EXIT &&
+     gcloud secrets versions access latest --secret="$PI_CERTIFICATE_SECRET" --project="$PI_GCP_PROJECT" >"$f" &&
+     openssl x509 -in "$f" -noout -subject -nameopt RFC2253 -enddate &&
+     scp "$f" "ghost-wispr@$PI_HOST:device.crt")
+   ```
+
+   `openssl` must print `subject=CN=ghost-wispr` and an end date one year after the apply. Then,
+   on the Pi, in the release directory, install it:
+
+   <!-- runbook_blocks_test.sh: provision-certificate -->
+   ```bash
+   ./provision.sh --certificate ~/device.crt
+   ```
+
+   It installs `/opt/ghost-wispr/device.crt` only when the certificate's public key is the public
+   key of `key.pem`. It refuses while `device.crt` exists: the nightly update installs each renewed
+   certificate ("Renew the X.509 certificate").
+5. On the Pi, in the release directory, provision:
+
+   <!-- runbook_blocks_test.sh: provision -->
+   ```bash
+   ./provision.sh
+   ```
+
+   `provision.sh` runs as `ghost-wispr`, with passwordless sudo, and refuses data on standard
+   input. It refuses a directory whose files do not match its `manifest.json`, such as a checkout's
+   `deploy/pi/`. Before it changes anything, it refuses while the environment of `ghost-wispr`'s
+   user manager sets `GHOST_WISPR_CONFIG` or an Envoy variable, which the recorder would inherit
+   ("Turn on the meeting voice", step 1). Then it:
+
+   - installs `libportaudio2`, `ffmpeg`, `lame`, `jq` and `curl`;
+   - writes `/opt/ghost-wispr/google-credentials.json` and `/opt/ghost-wispr/certificate_config.json`
+     from `pi.env`, where they are missing. Where they exist, it changes neither, and prints
+     `credentials: same as pi.env renders` or the names of the fields that differ. Where
+     `/opt/ghost-wispr/tailscale-client-id` exists, it prints whether that ID equals
+     `PI_TAILNET_CLIENT_ID`;
+   - adds `ghost-wispr` to the groups `plugdev`, `input` and `audio`, and installs the launcher,
+     `ghost-wispr-update.service` and `ghost-wispr-update.timer`, and the release's `update.sh`,
+     `pi-lib.sh` and `pi.env`. It turns on lingering for `ghost-wispr` and enables the timer;
+   - starts the nightly update once, with `systemctl --user start ghost-wispr-update.service`. That
+     run installs the release's whole deploy set and reads the Pi's secrets ("Update and inspect").
+     `provision.sh` prints the run's journal lines, and stops when the run failed;
+   - enables `ghost-wispr.service`;
+   - applies each line of the release's `serve.conf` with `tailscale serve --bg --https`. It turns
+     off each live Serve HTTPS port that `serve.conf` does not list, and each mount other than `/`
+     on a port that it lists. Then it reads Serve again, and stops before the join when Serve still
+     holds a part that `serve.conf` does not, such as a TCP forward or Funnel;
+   - starts the tagged tailnet join as a detached unit, with `PI_TAILNET_CLIENT_ID` and
+     `PI_SERVICE_ACCOUNT_UNIQUE_ID`, or stops after "already joined" on a Pi that is joined as
+     `tag:ghost-wispr` already.
+
+   It ends with `already joined as tag:ghost-wispr`, or with the line that names the detached join
+   unit it started. The SSH session can end while Tailscale re-authenticates (exit 255). The join
+   unit's command line holds each `tailscale serve` call of `serve.conf`, so the join reads no file
+   of the release directory. The join runs `tailscale up` with `--accept-routes=false`, so the Pi
+   joins with the tailnet's subnet routes off. Then it runs the route check of "Accept the tailnet's
+   subnet routes", and accepts the routes (`tailscale set --accept-routes`) only when no peer's
+   `PrimaryRoutes` overlaps a network of the Pi.
+6. On your own device, in a Ghost Wispr checkout, give the tagged device its name. The tagged join
+   makes a new Tailscale device. The temporary device you joined as your own still holds the name
+   `ghost-wispr`, so Tailscale names the tagged one `ghost-wispr-1`, and
+   `ghost-wispr.tail12ec1c.ts.net` does not reach the recorder. A new run of `provision.sh` does
+   not change that. Give the tagged device its name with `deploy/pi/claim-tailnet-name.sh`, which
+   needs `curl` and `jq`, and a Tailscale API access token. A tailnet admin makes the token on the
+   [Keys](https://console.tailscale.com/admin/settings/keys) page of Tailscale's admin console,
+   with an expiry of 1 day. Run the block in bash, as the blocks of "The Pi's secrets": zsh reads
+   `read -p` another way. The block reads the token without showing it and gives it to that one
+   command alone, in its environment:
+
+   <!-- runbook_blocks_test.sh: claim-name -->
+   ```bash
+   (IFS= read -r -s -p 'Tailscale API access token: ' key && echo &&
+     TAILSCALE_API_KEY=$key deploy/pi/claim-tailnet-name.sh)
+   ```
+
+   It removes the temporary device only when that device is the one device other than the tagged
+   one that holds the name, has an id that is a string of digits, has the hostname `ghost-wispr`,
+   has a user owner and no tag, and is offline. Then it renames the tagged device and reads the
+   name back. It refuses any other holder, or more than one, before it changes anything. When the
+   tagged device has the name already, it does nothing. The token reaches `curl` on stdin, never as
+   an argument, and goes only to `https://api.tailscale.com`. Revoke the token on the Keys page
+   afterwards.
+7. From a tailnet member device, check the join and the name:
+
+   ```bash
+   ssh ghost-wispr@ghost-wispr 'tailscale status --self --json'
+   ssh ghost-wispr@ghost-wispr 'sudo journalctl -u "ghost-wispr-tailnet-join-*"'
+   ssh ghost-wispr@ghost-wispr 'tailscale debug prefs' | jq .RouteAll
+   curl -fsS https://ghost-wispr.tail12ec1c.ts.net/api/version
+   ```
+
+   The status must show exactly `Tags: ["tag:ghost-wispr"]` and
+   `DNSName: "ghost-wispr.tail12ec1c.ts.net."`, and `curl` must print the release's commit over a
+   valid certificate. If the certificate check fails, run `./provision.sh` again ("Update and
+   inspect", "Apply a provisioning change"), which applies `serve.conf` and stops after "already
+   joined", and run `curl` again.
+
+   `jq` prints `RouteAll`, the Pi's Tailscale setting that `--accept-routes` controls. It must read
+   `true` after the join's route check accepted the routes, and `false` after the check refused
+   them. After a refusal, the journal says why. "Accept the tailnet's subnet routes" says how to fix
+   it.
+8. When this card replaces the card of a Pi that was on the tailnet, give the tagged device that
+   Pi's IPv4 address, which you read before the temporary join ("Flash the card"), so a client that
+   reaches the Pi by its address still reaches it. A tailnet admin sets it on the Machines page of
+   Tailscale's admin console, in the device's IPv4 edit dialog
+   ([IP pool](https://tailscale.com/docs/reference/ip-pool)). Then reboot the Pi once, and wait until
+   `curl` of step 7 answers again:
+
+   ```bash
+   ssh ghost-wispr@ghost-wispr 'sudo systemctl reboot'
+   ```
+
+   The reboot is needed because tailscaled keeps a Serve listener after the re-authentication. It
+   keeps the listener it opened on the temporary device's tailnet address, `<old 100.x
+   address>%tailscale0:443`, although that address is no longer on the interface. The listener
+   check of slice 1's A5 fails on it, because it is a listener outside loopback and Tailscale.
+
+`device.crt`, `google-credentials.json` and `certificate_config.json` are not secrets. The private
+key stays at `/home/ghost-wispr/.config/ghost-wispr-identity/key.pem`. `google-credentials.json` is
+an `external_account` credential for the workload identity provider `PI_WORKLOAD_PROVIDER`: it
+exchanges the certificate at `https://sts.mtls.googleapis.com/v1/token` and impersonates
+`PI_SERVICE_ACCOUNT`. `certificate_config.json` names `/opt/ghost-wispr/device.crt` and the key. Do
+not set `GOOGLE_API_CERTIFICATE_CONFIG`: the certificate is for the Security Token Service exchange,
+not Google API mTLS. Ghost Wispr reads this credential through
+`google_credentials_file: /opt/ghost-wispr/google-credentials.json` in its YAML. The tailnet join
+passes the same path with `ghost-wispr google-id-token --credentials`; it does not set
+`GOOGLE_APPLICATION_CREDENTIALS`.
 
 The Ghost Wispr user service starts only once the Pi's clock is synchronized. The Pi has no
 battery-backed clock, so at boot its clock is behind until a time server sets it, and a session
@@ -241,76 +375,77 @@ after the system's `time-sync.target`, so the service's start runs
 anyway, so a Pi that reaches no time server still records, its times possibly wrong. It waits
 those 120 s once per boot: once it gives up it leaves a mark in `/run/user/<uid>`, so a restart of
 the service in the same boot starts at once. While it waits nothing records and the light is off.
-A Pi with no network at all does not start: the network
-wait before it fails and systemd tries again. A unit change reaches a Pi only when `provision.sh`
-runs again; the nightly update replaces the binary alone.
+A Pi with no network at all does not start: the network wait before it fails and systemd tries
+again. The nightly update installs `ghost-wispr.service` and both waits with each release.
 
-Then run:
+## Renew the X.509 certificate
 
-<!-- provision_bundle_test.sh: provision -->
+The Pi's certificate, `/opt/ghost-wispr/device.crt`, lasts one year. A `bootstrap` apply in its last
+60 days signs the Pi's request again and adds the new certificate as the latest version of
+`ghost-wispr-device-certificate`; the Pi's key does not change. agent-infra's workflow
+`.github/workflows/ghost-wispr-certificate.yaml` asks for that apply each Monday at 10:00 UTC. Then
+it reads the newest version whose public key is the Pi's, and fails when that version has fewer
+than 45 days left. A failed run posts one alert to `#fleet-alerts` that names the step that failed,
+the days left and the end date.
+
+The Pi installs a renewed certificate itself. Each nightly update runs `pi-secrets`, which reads
+the latest version of the secret and up to nine versions under it, newest first, and skips a
+version that is disabled, destroyed or absent. It takes the newest version that is one PEM
+certificate, has the public key of the Pi's `key.pem`, ends later than the installed `device.crt`,
+and signs in to Google. `update.sh` installs that version while the recorder is free, with its
+version number in `/opt/ghost-wispr/device.crt.version`. It keeps `device.crt.prev`, and
+`device.crt.version.prev` when the Pi has a version file, restarts the recorder, and prints
+`ghost-wispr update: installed certificate version <n>, not after <date>`. When the recorder does
+not answer after the restart, it puts `device.crt.prev` back and exits 10. It puts
+`device.crt.version.prev` back with it, or, on a Pi that had no version file before, as before its
+first renewal (`provision.sh --certificate` writes none), it removes the new `device.crt.version`.
+A rollback of a later release install leaves this certificate in place ("Update and inspect",
+step 6).
+
+The certificate and its version file change as one. A run cut short between the two would leave a
+certificate with another certificate's version. `pi-secrets` stages no certificate that does not end
+later than the installed `device.crt`, so it would never stage the installed certificate again, and
+no later run would put the pair right. So `update.sh` first writes the journal
+`/opt/ghost-wispr/device.crt.version.new`, which holds the version the pair gets (or `none`, for no
+version file) and the SHA-256 of the new certificate. Then it renames the certificate over
+`device.crt`, then writes or removes `device.crt.version`, and then removes the journal. A rollback
+puts the pair back the same way, from `device.crt.prev` and the number in
+`device.crt.version.prev`. At its start, each run, `update.sh secrets` too, reads a journal that a
+run cut short left. When the installed `device.crt` has the journal's SHA-256, the run finishes the
+pair, and prints
+`ghost-wispr update: finished the certificate swap that a run cut short: device.crt.version is <version>`.
+Otherwise the certificate never went in: the run removes the journal, a journal it cannot read too,
+and prints
+`ghost-wispr update: removed /opt/ghost-wispr/device.crt.version.new, of a run cut short before its certificate went in; device.crt and device.crt.version stay as they are`.
+
+`update.sh` gives `pi-secrets` the installed version from `device.crt.version`, as
+`--installed-certificate-version`. When `latest` cannot be read because it is disabled, destroyed
+or absent, `pi-secrets` reads the versions above the installed one by number instead, oldest first
+and at most ten: it skips a disabled or destroyed version, stops at the first version that does not
+exist, and takes the newest version read that passes. So a renewal under a disabled `latest` still
+reaches the Pi. Until the update installs its first certificate, the Pi has no
+`device.crt.version`, and a `latest` that cannot be read keeps the installed certificate.
+
+When no version passes, `pi-secrets` keeps the installed certificate, and a line that starts
+`pi-secrets: certificate` says why. For one, the walk up that found no version prints
+`pi-secrets: certificate kept: latest certificate cannot be read: <code>; no readable version above <n>`.
+A certificate that is kept changes no exit code.
+
+Ghost Wispr warns on its status page and in `/api/status` when the certificate has fewer than 30
+days left, or when it cannot read the certificate. Then start the workflow by hand, and read the
+`bootstrap` run that it started, whose id its log prints:
+
 ```bash
-deploy/pi/provision-pi.sh --prepared "$prepared"
+gh workflow run ghost-wispr-certificate.yaml -R theorem-labs/agent-infra --ref main
 ```
 
-`provision-pi.sh`'s last line says what `provision.sh` did: it started the tagged tailnet join as
-a detached unit, which it names, or it found the Pi already joined and started none.
-`provision.sh` can end the SSH session while Tailscale re-authenticates; the script then says so
-(exit 255).
-
-The tagged join makes a new Tailscale device. The temporary device you joined as your own still
-holds the name `ghost-wispr`, so Tailscale names the tagged one `ghost-wispr-1`, and
-`ghost-wispr.tail12ec1c.ts.net` does not reach the recorder. Provisioning again does not fix
-that: `provision-pi.sh` reaches the Pi by that name. Give the tagged device its name with
-`deploy/pi/claim-tailnet-name.sh`, under a secrets-broker grant of `TAILSCALE_API_KEY` that Sami
-approves on the broker page:
+The next nightly update installs the new version. Read its line on the Pi:
 
 ```bash
-secret-run --register --wait 12h \
-  --reason 'Ghost Wispr (docs/pi-setup.md): give the tagged recorder the tailnet name ghost-wispr' \
-  TAILSCALE_API_KEY -- deploy/pi/claim-tailnet-name.sh
+ssh ghost-wispr@ghost-wispr 'sudo -n journalctl _SYSTEMD_USER_UNIT=ghost-wispr-update.service --since yesterday -o cat' | grep 'certificate'
 ```
 
-It removes the temporary device only when that device is the one device other than the tagged
-one that holds the name, has an id that is a string of digits, has the hostname `ghost-wispr`,
-has a user owner and no tag, and is offline. Then it renames the tagged device and reads the name
-back. It refuses any other holder, or more than one, before it changes anything. When the tagged
-device has the name already, it does nothing. The key reaches `curl` on stdin, never as an
-argument, and goes only to `https://api.tailscale.com`.
-
-If `provision-pi.sh` could not remove the sources directory on the Pi, run the `rm` command it
-printed now. That command reaches the Pi as `ghost-wispr.tail12ec1c.ts.net`, and before this step
-that name is the temporary device's, or no device's.
-
-Then check the join and the name:
-
-```bash
-ssh ghost-wispr@ghost-wispr 'tailscale status --self --json'
-ssh ghost-wispr@ghost-wispr 'sudo journalctl -u "ghost-wispr-tailnet-join-*"'
-ssh ghost-wispr@ghost-wispr 'tailscale debug prefs' | jq .RouteAll
-curl -fsS https://ghost-wispr.tail12ec1c.ts.net/api/version
-```
-
-The status must show exactly `Tags: ["tag:ghost-wispr"]` and
-`DNSName: "ghost-wispr.tail12ec1c.ts.net."`, and `curl` must print the release's commit over a
-valid certificate. If the certificate check fails, set Serve again
-(`ssh ghost-wispr@ghost-wispr 'sudo tailscale serve --bg --https 443 http://127.0.0.1:8080'`) and
-run `curl` again.
-
-`jq` prints `RouteAll`, the Pi's Tailscale setting that `--accept-routes` controls. It must read
-`true` after the join's route check accepted the routes, and `false` after the check refused them.
-After a refusal, the journal says why. "Accept the tailnet's subnet routes" says how to fix it.
-
-Then reboot the Pi once and wait until `curl` above answers again:
-
-```bash
-ssh ghost-wispr@ghost-wispr 'sudo systemctl reboot'
-```
-
-The reboot is needed because tailscaled keeps a Serve listener after the re-authentication. It
-keeps the listener it opened on the temporary device's tailnet address, `<old 100.x
-address>%tailscale0:443`, although that address is no longer on the interface. On the office Pi
-on 2026-11-16 this listener stayed until the reboot. The listener check of slice 1's A5 fails on
-it, because it is a listener outside loopback and Tailscale.
+Do not make a new Pi key or new Google credential files for a renewal.
 
 ## Accept the tailnet's subnet routes
 
@@ -353,44 +488,43 @@ Run the block below in these cases:
 - when someone adds a subnet route to the tailnet
 - when the Pi's network changes
 
-Run it on a machine that reaches the Pi over SSH. Run it from the root of a Ghost Wispr checkout
-that has the route check:
+Run it on the Pi as `ghost-wispr`, in the release directory ("Provision", step 1):
 
-<!-- provision_bundle_test.sh: accept-routes -->
+<!-- runbook_blocks_test.sh: accept-routes -->
 ```bash
-source "${GHOST_WISPR_PI_ENV:-deploy/pi/files/pi.env}" &&
-check=$(bash -c 'source deploy/pi/provision.sh && route_overlap_check_script') &&
+check=$(bash -c 'source ./provision.sh && route_overlap_check_script') &&
 [ -n "$check" ] &&
-verdict=$(printf '%s\n' "$check" | ssh "ghost-wispr@$PI_HOST" 'sh -s') &&
+verdict=$(printf '%s\n' "$check" | sh -s) &&
 printf '%s\n' "$verdict" &&
 case $verdict in "ghost-wispr routes: no route of a peer overlaps"*) ;; *) false ;; esac &&
-ssh "ghost-wispr@$PI_HOST" 'sudo tailscale set --accept-routes && tailscale debug prefs' | jq -e .RouteAll
+sudo tailscale set --accept-routes &&
+tailscale debug prefs | jq -e .RouteAll
 ```
 
-The block runs the route check on the Pi over SSH. On success, it prints the check's acceptance
-line, and then `true`. The acceptance line starts with
+The block runs the route check of the release's `provision.sh`. On success, it prints the check's
+acceptance line, and then `true`. The acceptance line starts with
 `ghost-wispr routes: no route of a peer overlaps a network of the Pi:`, and it names the networks
 and the routes that the check compared. `true` is the value of `RouteAll` after `tailscale set`.
 
 The block stops before `tailscale set` in each of these cases:
 
-- the checkout's `deploy/pi/provision.sh` has no `route_overlap_check_script`
+- the release's `provision.sh` has no `route_overlap_check_script`
 - `route_overlap_check_script` prints nothing
 - the check refuses
-- the check prints no acceptance line, as when the program reaches the Pi incomplete
+- the check prints no acceptance line, as when the program reaches `sh` incomplete
 
 It exits non-zero when `tailscale set` fails, or when `RouteAll` then reads `false`.
 
-These commands use the `PI_HOST` that the block read from `pi.env`. To read `RouteAll` on the Pi:
+To read `RouteAll` on the Pi:
 
 ```bash
-ssh "ghost-wispr@$PI_HOST" 'tailscale debug prefs' | jq .RouteAll
+tailscale debug prefs | jq .RouteAll
 ```
 
 If the check finds an overlap while `RouteAll` reads `true`, disable the routes on the Pi:
 
 ```bash
-ssh "ghost-wispr@$PI_HOST" 'sudo tailscale set --accept-routes=false'
+sudo tailscale set --accept-routes=false
 ```
 
 Then fix the overlap, as above. Run the block again after the fix.
@@ -415,8 +549,8 @@ The gateway serves the Pi `gemini-embedding-2` and no Gemini chat, text-to-speec
 audio model. So the Concierge and summaries call Gemini on Vertex AI directly, text-to-speech
 streams from Vertex AI's `us` multi-region, Deepgram takes its key, and GPT-Live signs in by OpenAI
 workload identity. Each of them is a named provider: moving a role to the gateway, once the gateway
-serves its model to the Pi, is a change of that role's provider/model in the template, rolled out
-by the models step.
+serves its model to the Pi, is a change of that role's provider/model in the template, which the
+nightly update installs with its release.
 
 The admission is one agent-infra change, theorem-labs/agent-infra#5187:
 
@@ -449,49 +583,48 @@ switch is the line `model: gateway/gemini-embedding-2` under `embedding`, with t
 `embedding_model` and a `gateway` row in `expected_running_providers` (its `url` and
 `auth.audience` compared with the template's) in `deploy/pi/accept-slice2.sh`, the embedding line
 and the gateway check in `deploy/pi/provision_models_test.sh`, and `internal/config`'s
-`TestThePiConfigSearchesOnVertexAIUntilTheGatewayAdmitsThePi`. Roll it out by the models step
-("Enable models and Drive sync"); the binary does not change.
+`TestThePiConfigSearchesOnVertexAIUntilTheGatewayAdmitsThePi`. The nightly update installs it with
+that release ("A release that changes config"); the Pi's credentials do not change.
 
 ## Enable models and Drive sync
 
-Run the models step after the shared drive exists and its members are added. It takes the
-shared-drive ID and rejects an absent or malformed one. It replaces settings saved in the UI
-with `deploy/pi/files/ghost-wispr.yaml` rendered with that ID,
-`gdrive_sync_enabled: true` and `gc_enabled: true`, installs the result over
-`/opt/ghost-wispr/ghost-wispr.yaml`, removes from `/opt/ghost-wispr/.env` each variable Ghost Wispr
-no longer reads (an old Envoy webhook signing key, and those of the settings that providers
-replaced: README, "Removed settings"), and
-restarts Ghost Wispr. The credential files from the full provisioner stay as they are. A later
-full-provisioner run keeps the drive ID and both enablements. The models step refuses before it
-writes anything if a line of `.env`, or the environment of `ghost-wispr`'s user manager, could set
-`GHOST_WISPR_CONFIG`, which would have the recorder load another file than the config it installs,
-or `GHOST_WISPR_ENVOY_ENABLED`, `GHOST_WISPR_ENVOY_HUB_URL` or `GHOST_WISPR_CONCIERGE_ENVOY_URL`,
-which override the template's `envoy_enabled`, `envoy_hub_url` and `concierge.envoy_url` ("Turn on
-the meeting voice", step 1), naming the variable. Set `GHOST_WISPR_CONFIG` only on a command line,
-as for the test instance ("Accept slice 2"). Before it reads the manager's environment it runs
-`rollout.sh install`'s unit check: it reloads the manager, and refuses while `ghost-wispr.service`
-or `ghost-wispr-update.service` is not loaded or has a drop-in, naming it, since a drop-in can set
-the recorder's environment past both checks. Remove the drop-in and run the step again; for a unit
-that is not loaded, run the full provisioner ("Provision"), which installs both.
+Run the models step once on a Pi, after the shared drive exists and its members are added. It
+takes the shared-drive ID and rejects an absent or malformed one. It renders the release's
+`ghost-wispr.yaml` with that ID, `gdrive_sync_enabled: true` and `gc_enabled: true`, installs the
+result over `/opt/ghost-wispr/ghost-wispr.yaml`, and restarts Ghost Wispr. It writes no `.env`
+line: the restart refreshes the update's four lines ("The Pi's secrets"). A restart ends a
+conversation that is being recorded, so run it outside meetings. Settings saved on the page stay in
+the local settings file, `/opt/ghost-wispr/ghost-wispr.local.yaml`, and apply over the installed
+config (README, "Configuration"). Each nightly install renders the release's config with the drive
+ID of the installed config's `gdrive_folder_id:` line and both enablements, so the Pi needs the
+step again only to change its shared drive. The models step refuses before it writes anything if a
+line of `.env`, or the environment of `ghost-wispr`'s user manager, could set `GHOST_WISPR_CONFIG`,
+which would have the recorder load another file than the config it installs, or
+`GHOST_WISPR_ENVOY_ENABLED`, `GHOST_WISPR_ENVOY_HUB_URL` or `GHOST_WISPR_CONCIERGE_ENVOY_URL`, which
+override the template's `envoy_enabled`, `envoy_hub_url` and `concierge.envoy_url` ("Turn on the
+meeting voice", step 1), naming the variable. Set `GHOST_WISPR_CONFIG` only on a command line, as
+for the test instance ("Accept slice 2"). Before it reads the manager's environment it reloads the
+manager, and refuses while `ghost-wispr.service` or `ghost-wispr-update.service` has a drop-in,
+naming it, since a drop-in can set the recorder's environment past both checks; the nightly update
+makes the same checks ("Update and inspect"). Remove the drop-in and run the step again.
 
+Run it only from the release the Pi runs, which can be older than the latest release: the models
+step installs that release's `ghost-wispr.yaml`, and the Pi's binary must not run on a newer
+release's config. `provision.sh --models` refuses the directory of another release than the one
+`deploy.verified` names, and names the commit the Pi runs. Enter that release's directory on the Pi
+as "Update and inspect", "The release the Pi runs" says. Then, in that release directory, run the
+models step with the shared drive's ID:
+
+<!-- runbook_blocks_test.sh: models -->
 ```bash
-(
-read -r -p 'Shared Drive ID: ' drive_id
-[[ "$drive_id" =~ ^[A-Za-z0-9_-]+$ ]] || { printf 'Invalid shared-drive ID\n' >&2; exit 1; }
-remote_dir=$(ssh ghost-wispr@ghost-wispr.tail12ec1c.ts.net \
-  'umask 077; mkdir -p ~/.local/share/ghost-wispr-provision; chmod 700 ~/.local/share/ghost-wispr-provision; mktemp -d ~/.local/share/ghost-wispr-provision/sources.XXXXXX')
-tar -C . -cf - deploy/pi/provision.sh deploy/pi/files/ghost-wispr.yaml \
-  | ssh ghost-wispr@ghost-wispr.tail12ec1c.ts.net "tar -xf - -C '$remote_dir'"
-ssh ghost-wispr@ghost-wispr.tail12ec1c.ts.net \
-  "$remote_dir/deploy/pi/provision.sh --models '$drive_id'"
-ssh ghost-wispr@ghost-wispr.tail12ec1c.ts.net "rm -rf -- '$remote_dir'"
-)
+./provision.sh --models '<shared-drive-id>'
 ```
 
 That YAML names the Pi's providers (README, "Model providers"): `vertex` and `vertex-us`, Vertex AI
 in `theorem-agent-infra` at `global` and at the `us` multi-region, signed in with the Pi's Google
-workload identity; `openai`, by OpenAI workload identity; and `deepgram`, by the key the full
-provisioner writes into `.env` as `GHOST_WISPR_DEEPGRAM_API_KEY`. Both Vertex AI providers carry
+workload identity; `openai`, by OpenAI workload identity; and `deepgram`, by the key that the
+nightly update reads from Secret Manager into `.env` as `GHOST_WISPR_DEEPGRAM_API_KEY` ("The Pi's
+secrets"). Both Vertex AI providers carry
 the labels `owner: sjawhar` and `stream: agents-no-stream`: every Gemini generate call (the
 Concierge, summaries, speech) sends them, and Vertex AI copies them into Cloud Billing, so the Pi's
 Gemini spend is attributed to its owner and stream (dispatch://INFRA-1027); search's embeddings
@@ -509,8 +642,8 @@ Nothing sets `GOOGLE_APPLICATION_CREDENTIALS`. Garbage collection keeps every se
 (`gc_max_age_days: 0`) and holds local audio to a 20000 MB budget
 (`gc_max_audio_size_mb: 20000`), removing only audio that Drive holds a copy of; the template
 ships GC off so it never runs before sync is on. It also holds the office's five recording rules
-(`recording_rules`), which the web UI shows under Recording rules; both the full provisioner and
-the models step install them with the rest of the template.
+(`recording_rules`), which the web UI shows under Recording rules; the nightly update and the
+models step install them with the rest of the template.
 
 ## Pause and resume at the unit
 
@@ -523,14 +656,15 @@ change the same pause switch as the web page, `POST /api/pause` and `POST /api/r
 them resumes a pause made by any other, and a resume from a button checks the recording light as
 one from the web page does. A long press of the power button is left to the Pi, which powers off.
 
-`update.sh` replaces only the binary, so a provisioned unit gets a key added to the template only
-at its next `provision.sh` run, or its next `provision.sh --models` run, which also replaces
-settings saved in the UI. To turn the Jabra's button off or on without either, put
-`GHOST_WISPR_JABRA_MUTE_BUTTON=false` or `GHOST_WISPR_JABRA_MUTE_BUTTON=true` in
-`/opt/ghost-wispr/.env`, which overrides the YAML, and restart `ghost-wispr.service`. A full
-`provision.sh` run rewrites `.env`, and the template's setting applies again. Turn it off while
-recording, or unplug the Jabra and plug it in again afterwards: Ghost Wispr leaves the Jabra's
-light as it last set it.
+The nightly update installs the template with the rest of each release ("A release that changes
+config"), so a key added to the template reaches the Pi with its release. Settings saved on the
+page stay in the local settings file through each release. To turn the Jabra's button off or on
+without a release, put `GHOST_WISPR_JABRA_MUTE_BUTTON=false` or `GHOST_WISPR_JABRA_MUTE_BUTTON=true`
+in `/opt/ghost-wispr/.env`, which overrides the YAML, and restart `ghost-wispr.service`. The nightly
+update keeps that line. A settings save on the page never writes that line's value to the local
+settings file, so once the line is removed, the button the page saved, or else the template's,
+applies ("Settings saved on the page"). Turn it off while recording, or unplug the Jabra and plug
+it in again afterwards: Ghost Wispr leaves the Jabra's light as it last set it.
 
 The Jabra's mute light is on while recording is paused and off otherwise, whichever control
 paused it. Ghost Wispr never changes it while any of the Jabra's streams is open, its microphone
@@ -616,10 +750,11 @@ Linux took off its processor, which a Go trace cannot tell apart.
 
 Every capture ends with the turn-off: remove `speaker_trace_dir`, and anything else added for the
 capture (a systemd drop-in, a `GODEBUG=gctrace=1` in `/opt/ghost-wispr/.env`), then restart the
-service. The trace costs CPU and memory while it runs. The full provisioner is not a turn-off: it
-installs the base unit only and keeps every drop-in under `ghost-wispr.service.d`, so a forgotten
-setting stays on after it. The models step and `rollout.sh install` refuse while a drop-in is
-there, but the models step keeps a `GODEBUG` line in `.env`, so that one stays on after it.
+service. The trace costs CPU and memory while it runs. No deploy step is a turn-off: the nightly
+update installs the release's `ghost-wispr.service` and keeps each `.env` line that it does not own
+but those of variables Ghost Wispr no longer reads, so a forgotten `GODEBUG` line stays on through
+it. While a drop-in is under `ghost-wispr.service.d`, the nightly update and the models step refuse
+to install anything, so the Pi stays on its release until the drop-in goes.
 
 The microphone is never open while the blink(1) is off: the blink(1) stays red while the microphone
 is open, and goes off only once Ghost Wispr has closed it. A pause closes it at once, also while
@@ -693,9 +828,9 @@ off at once, as the button counts the unit as resumed, though the blink(1) stays
 confirmed; if the light refuses the resume, the ring shows Muted again. Other programs
 that open the blink(1), such as `blink1-tool`, do not take the lock: do not run them while the
 recorder runs, since their own colour read can still answer the recorder's. A process stopped while
-it holds the lock (`kill -STOP`) keeps it;
-the slice 1 driver's Light hang step therefore stops the recorder with `flock` on the node, between
-two of its commands.
+it holds the lock (`kill -STOP`) keeps it. So the Light hang step of `deploy/pi/accept-slice1.sh`
+("Accept slice 1"), which stops the recorder and requires the blink(1) dark within 3 seconds, stops
+it with `flock` on the node, between two of its commands.
 
 Do not open the Jabra's microphone or speaker with another program, such as `arecord`, `aplay` or
 a second Ghost Wispr, while the unit runs with the Jabra button on. Ghost Wispr cannot see that
@@ -745,9 +880,9 @@ the Jabra's button on (the template's setting). Then:
 
 After each step the state stays as it is: nothing pauses or resumes by itself. If any step fails,
 turn the Jabra's button off with `GHOST_WISPR_JABRA_MUTE_BUTTON=false` as above, and the power
-button and the web page still pause and resume. A full provisioning run rewrites `.env` and turns
-the button on again, so also set `jabra_mute_button: false` in the template, in a pull request that
-also changes the deploy tests that pin it on.
+button and the web page still pause and resume. The nightly update keeps that `.env` line. To ship
+the button off, set `jabra_mute_button: false` in the template, in a pull request that also changes
+the deploy tests that pin it on.
 
 ## Restrict OpenSSH to loopback
 
@@ -773,35 +908,149 @@ Reconnect over Tailscale SSH once more after it succeeds.
 
 ## Update and inspect
 
-The user timer runs `/opt/ghost-wispr/update.sh` every day at 03:30 local time. It does
-nothing while `/api/status` reports an active session, and checks that again after the download,
-just before it replaces the binary. With `GHOST_WISPR_UPDATE_PAUSED_ONLY=1`, as
-`deploy/pi/rollout.sh` runs it, it also does nothing unless the recorder is paused. It verifies the
-GitHub release checksum, keeps `/opt/ghost-wispr/ghost-wispr.prev`, and restores that binary if the
-new process or `/api/version` check fails. Only the binary it last saw answer its commit becomes
-`ghost-wispr.prev`: it records that binary's sha256 in `/opt/ghost-wispr/ghost-wispr.verified`, so
-an update stopped after its swap (a power cut, or an operator's stop) never makes an unverified
-binary the one a rollback restores. Its first run, with no record yet, records the installed binary
-only when it is the image the recorder's main process runs (by sha256); otherwise, or when that
-image cannot be read, it records none, keeps `ghost-wispr.prev` and says so. It restarts the
-recorder for that rollback only when
-the unit has stopped, or when `/api/status` answers that it may restart. When the new process
-answers that it records a session (or, paused-only, that it is not paused), it leaves it running
-and fails. When `/api/status` gives no status (no answer, or an answer that is not a status), the
-recorder may be recording: it reads the status again every 2 minutes, as `pi-when-idle.sh` does,
-rolls back after two readable reads that allow the restart, and after three reads with no such
-pair leaves the new binary running and fails, saying so. It never restarts a recorder whose state
-it could not read.
+Each night the Pi installs the latest release's whole deploy set ("The release and its deploy
+set"), as one unit, with no person. `ghost-wispr-update.timer` starts `ghost-wispr-update.service`
+at 03:30, at 03:45, and then every 15 minutes to 06:00 local time: 11 runs a night. With
+`Persistent=true`, a start missed while the Pi was off runs once it is on again. A start during a
+run joins that run.
 
-`ghost-wispr-update.service` gives `update.sh` no time limit (`TimeoutStartSec=infinity`): a
-limit's kill could land mid-swap, with the new binary in place and no rollback. Each step it waits
-on has a bound of its own: each `curl` its `--max-time`, the version check 120 s, a rollback's
-status reads three, and each restart of the recorder the recorder unit's own timeouts.
+The unit runs the launcher, `/opt/ghost-wispr/ghost-wispr-update-launcher.sh`, which runs
+`/opt/ghost-wispr/update.sh` under `timeout --kill-after=60s 45m`. That is the one time limit on a
+whole run: the unit sets none (`TimeoutStartSec=infinity`), and each step of `update.sh` has a
+limit of its own (`pi-secrets` 60 s, each `sudo -n` call 30 s, the read of Serve 10 s, the version
+check 120 s). `update.sh` exits 0 when it installed, found the release current, held it or found
+the recorder busy, and 10 for each failure that it found and reported, a GitHub outage included.
+Any other exit code, the time limit's 124 and 137 among them, means that `update.sh` itself broke:
+the launcher then runs `/opt/ghost-wispr/update.sh.prev`, the previous release's, at once, when that
+file exists, under the same limit. The launcher counts the runs that failed in a row in
+`/opt/ghost-wispr/update.failed-runs`. When the count reaches 11, one night of runs, it runs
+`update.sh.prev` once and sets the count to 0; an exit 0 also sets it to 0. So one network fault
+runs no `update.sh.prev`. A fallback run of `update.sh.prev` that installs a release keeps
+`update.sh.prev` and `pi-lib.sh.prev` as they are: they are the scripts that run, and a copy of the
+broken `update.sh` there would leave no update that runs once a second such release installs.
 
-Run an update manually:
+At its start, each run, `update.sh secrets` too, puts right a certificate swap that a run cut short
+("Renew the X.509 certificate"). Then it removes each staging directory
+`/opt/ghost-wispr/.ghost-wispr-update.*` older than 46 minutes, the launcher's limit and its grace:
+a run that limit killed left it, and it can hold the secrets that run read. A younger one may
+belong to a run still going, and stays.
+
+A run of `update.sh`:
+
+1. Installs nothing and restarts nothing while the recorder is busy: while `/api/status` has a
+   non-empty `active_session_id`, or a `call` whose `state` is not `none` (a Meet call that the call
+   bridge of dispatch://INFRA-5904 links to the Pi). It reads the status before any change and again
+   just before it swaps a file or restarts the recorder, and prints
+   `ghost-wispr update: active session; leaving the current release in place` (or the call's
+   state in place of `active session`). A later run of the night tries again. Three things can
+   still change a file while the recorder is busy: the start of the run above; a run whose status
+   read just before the restart finds a session or a call, which puts back the files it swapped in,
+   restarts nothing, and leaves the recorder running on the files it started with; and a rollback
+   after the restarted release fails its check, which puts the files back but does not restart a
+   recorder that reports a session or a call (step 6).
+2. Downloads the release's tarball, checks it against its `.sha256`, and checks each file against
+   `manifest.json` and the manifest against the release's commit. It installs nothing when one does
+   not match.
+3. When the release is current, prints `ghost-wispr update: already current at commit <sha>`. The
+   release is current when `/opt/ghost-wispr/deploy.verified` names its commit and each installed
+   file but `ghost-wispr.yaml` has the SHA-256 that `deploy.verified` lists. Then, unless step 5
+   refuses, it reads the Pi's secrets and a renewed certificate, and installs a change while the
+   recorder is free ("The Pi's secrets", "Renew the X.509 certificate"). When nothing changed, it
+   restarts a recorder that started before the installed `.env` or `device.crt`, as after a run cut
+   short between a refresh's swap and its restart, and prints
+   `ghost-wispr update: the recorder started before the installed <files>; restarting it`.
+4. Otherwise, holds a release whose link versions the call bridge does not accept. The bridge's
+   list is `call.link_versions` in `/api/status`, and the release's is `link_versions` in its
+   manifest. The run compares them at the first status read, and again at the status read just
+   before the swap, since the bridge can change its list while the release downloads. When both
+   lists are there and share no number, it prints `ghost-wispr update: held: ...` with both lists.
+   A hold at either read changes no file of the deploy set. When the installed files are the set
+   `deploy.verified` lists, the run then drops what it staged for the release, and refreshes the
+   secrets and the certificate of the release the Pi runs, as in step 3, so the Pi keeps taking
+   them while a newer release waits. It exits 0, or 10 when step 5 refuses that refresh or the
+   refresh fails.
+5. Refuses to install a release, new secrets or a renewed certificate, and exits 10, while `.env`
+   or the environment of `ghost-wispr`'s user manager sets `GHOST_WISPR_CONFIG` or an Envoy override
+   variable ("Turn on the meeting voice", step 1), or while `ghost-wispr.service` or
+   `ghost-wispr-update.service` has a drop-in. Its line names the variable or the drop-in. Remove
+   it, and the next run installs. The refresh at each start of the recorder (`update.sh secrets`)
+   still writes the four lines of `.env`.
+6. Installs the whole set, also when the running binary already answers the release's commit: the
+   binary and the nine files, `ghost-wispr.service`, the udev rule and the logind setting included.
+   It renders `ghost-wispr.yaml` with the shared drive of the installed config ("Enable models and
+   Drive sync") and writes `.env` ("The Pi's secrets"). Before the swap it keeps a `.prev` copy of
+   each installed file of the set that `deploy.verified` lists. It installs the two system files
+   with `sudo -n`, only when they change. Then it reloads the user units, reloads udev or restarts
+   logind when their file changed, restarts the recorder, and waits up to 120 s for `/api/version`
+   to answer the release's commit and for `/api/status` to answer a status it can read, whose
+   `call`, when it has one, is an object: a release whose status the update cannot read would stop
+   each later run at its first status read, before it could install a fix. Then it writes
+   `deploy.verified` and prints `ghost-wispr update: installed commit <sha> (invocation <id>)`.
+   When either answer does not come, it puts back each file from its `.prev` copy, byte for byte,
+   and prints `ghost-wispr update: <why>; restored the previous release`. It restarts the recorder
+   for that rollback only while the recorder reports no session and no call, and leaves it running
+   otherwise. A file with no `.prev` copy stays as installed, and the line says
+   `no previous release to restore`. When the installed files were not the set `deploy.verified`
+   lists, as after an install cut short, the run keeps no new `.prev` copies, since those it has
+   hold the set verified last. A rollback then puts back each file that has a `.prev` copy, prints
+   `ghost-wispr update: <why>; restored the last verified set, the one deploy.verified lists`, and
+   exits 10, also when a session starts during the swap. When those copies are not that set, the
+   line says `restored each file that has a .prev copy, but they are not the set deploy.verified lists`.
+   In each rollback, the certificate and its version file go back only when that run swapped them
+   in: a certificate that an earlier run installed passed `pi-secrets`' checks, and its `.prev` copy
+   is older.
+7. After an install, or with the release current, compares the three provisioning files that the
+   nightly update does not install (the launcher, `ghost-wispr-update.service` and
+   `ghost-wispr-update.timer`) with the manifest, and the live Tailscale Serve setting with the
+   release's `serve.conf`. It prints one drift line for each difference:
+   - `ghost-wispr update: provisioning file <name> differs from the release; run the release's provision.sh`
+   - `ghost-wispr update: Serve differs from the release: want <lines>, have <lines>`
+   - `ghost-wispr update: Serve: UNKNOWN (<why>)`, when it cannot read or parse Serve's setting
+
+   A difference changes no exit code. Apply it with one run of the release's `provision.sh`
+   ("Apply a provisioning change", below).
+
+The Pi keeps no user journal: the lines of its user units are in the system journal. Before each
+run the launcher prints `ghost-wispr launcher: invocation <id> trigger <unit> at <time>`, where the
+trigger is `ghost-wispr-update.timer` for a run the timer started, and `none` for a run started by
+hand. Read the update's lines on the Pi:
 
 ```bash
-ssh ghost-wispr@ghost-wispr 'XDG_RUNTIME_DIR=/run/user/$(id -u) /opt/ghost-wispr/update.sh'
+ssh ghost-wispr@ghost-wispr 'sudo -n journalctl _SYSTEMD_USER_UNIT=ghost-wispr-update.service --since yesterday -o cat'
+```
+
+Check what the Pi runs from a tailnet member device, in a Ghost Wispr checkout:
+
+```bash
+deploy/pi/check-deploy.sh
+```
+
+It checks the latest release, or with `--release COMMIT` the release of that commit. It reads the
+release from GitHub, the recorder over Serve and the Pi over SSH, writes nothing on the Pi, and
+prints `PASS`, `FAIL` or `UNKNOWN` for each of seven checks. `UNKNOWN` means that it could not read
+the check's input. It exits 1 when one check is not `PASS`.
+
+1. `/api/version` answers the release's commit.
+2. Each model setting and `recording_rules` runs as the release's `ghost-wispr.yaml` gives it. A
+   setting that the recorder applied from the local settings file is compared with that value, and
+   the line names it. The recorder reports those settings in `/api/config` as `local_settings`; the
+   check reads that report, not the file. A recorder with no such report gives `UNKNOWN` for checks
+   2 and 3.
+3. Each provider of that config, with those the local settings add or remove, signs in. Check 3
+   still prints `FAIL` for a provider that did not sign in, with or without that report.
+4. `/api/status` has no warning.
+5. The timer started the run that printed `installed commit` for that commit: `FAIL` for a run
+   started by hand.
+6. The protected recordings, which no deploy step may change, still have the SHA-256 that
+   `PI_PROTECTED_RECORDINGS` in `pi.env` lists for them.
+7. The three provisioning files on the Pi and Serve's setting match the release.
+
+To run an update by hand, start its unit, so the launcher's time limit applies and a start of the
+timer joins it. The command returns when the run ends. Check 5 then fails for that install, which
+no timer started.
+
+```bash
+ssh ghost-wispr@ghost-wispr 'XDG_RUNTIME_DIR=/run/user/$(id -u) systemctl --user start ghost-wispr-update.service'
 ```
 
 Inspect the runtime:
@@ -812,166 +1061,181 @@ ssh ghost-wispr@ghost-wispr 'curl -fsS http://127.0.0.1:8080/api/version'
 ssh ghost-wispr@ghost-wispr 'XDG_RUNTIME_DIR=/run/user/$(id -u) systemctl --user list-timers ghost-wispr-update.timer'
 ```
 
-## Roll out a release that adds a config key
+### The release the Pi runs
 
-Follow this order for every release whose code reads a new key from
-`/opt/ghost-wispr/ghost-wispr.yaml`, such as `recording_rules`, `mic_device` or `envoy_hub_url`,
-or needs a key that used to have a default. The nightly update replaces only
-the binary: `update.sh` never writes the config, so a new binary that the timer installs starts
-on a config without the new key. The other order fails too: while the old binary runs on a config
-that has the key, a settings save drops the key, because the old binary writes back only the keys
-it knows.
+The models step runs `provision.sh --models` from the release the Pi runs ("Enable models and Drive
+sync"), which can be older than the latest release: a busy night, a held release or a failed install
+leaves the Pi on an older one. When check 1 of `check-deploy.sh` passes, the Pi runs the latest
+release, and the directory of "Provision", step 1, is that release. Otherwise, on the Pi as
+`ghost-wispr`, download the release whose commit `/api/version` names:
 
-The models step restarts the recorder, and so does `update.sh` when it installs a release: a
-restart ends a conversation that is being recorded and turns the light off, so run these steps
-outside meetings. Save no settings in the web UI from step 1 until step 4 passes.
-
-A setting the Pi holds in `/opt/ghost-wispr/.env` overrides its YAML, and the steps treat the two
-files differently. The office Pi can set the Jabra's Mute button there, with
-`GHOST_WISPR_JABRA_MUTE_BUTTON` ("Pause and resume at the unit"). The models step keeps every
-`.env` line but those of variables Ghost Wispr no longer reads, so that line stays as it is. The
-full provisioner rewrites `.env` without it, and the template's `jabra_mute_button: true` applies.
-
-1. Just before you merge, run the models step ("Enable models and Drive sync") from a checkout of
-   the pull request's head (`provision.sh --models <shared-drive-id>`). The shared-drive ID is the
-   one the Pi has now, on the `gdrive_folder_id:` line of its config:
-
-   ```bash
-   ssh ghost-wispr@ghost-wispr "grep '^gdrive_folder_id:' /opt/ghost-wispr/ghost-wispr.yaml"
-   ```
-
-   When that line is missing or empty, the Pi never ran the models step, and `--models` would
-   turn Drive sync and GC on: run the full provisioner ("Provision") from the head instead. The
-   models step installs only the YAML and `.env`. When the release also changes a file that only
-   the full provisioner installs (a unit file, `wait-for-time-sync.sh`, `update.sh`), run the full
-   provisioner from the head instead; it keeps the shared drive. The running binary ignores the new
-   key, and either step restarts it on the new config.
-2. Merge the pull request. The release workflow publishes a release for the merge commit.
-3. As soon as that release is published, run `update.sh` by hand ("Update and inspect"). Do not
-   wait for the timer: until the new binary runs, a settings save drops the new key. The step is
-   done only when `update.sh` prints `installed commit <merge commit>` (or `already on commit
-   <merge commit>`, when the timer was first). During an active session it prints `active
-   session; leaving the current binary in place` and changes nothing: run it again once the
-   session has ended.
-4. Check that the new binary reads the key. For `recording_rules`, the template's five rules must
-   come back; for `envoy_hub_url`, `/api/status` must hold no Envoy warning; for
-   `mic_device`, the config must hold `mic_device: J75`, `/api/status` no `No microphone found`
-   warning, and `capture_state` must be `capturing` or `paused`. The Jabra's Mute button must be on:
-   each line the last `grep` prints ends in `true`.
-
-   ```bash
-   curl -fsS https://ghost-wispr.tail12ec1c.ts.net/api/config | jq .recording_rules
-   curl -fsS https://ghost-wispr.tail12ec1c.ts.net/api/status | jq '{capture_state, warnings}'
-   ssh ghost-wispr@ghost-wispr "grep '^mic_device:' /opt/ghost-wispr/ghost-wispr.yaml"
-   ssh ghost-wispr@ghost-wispr "grep -E '^(jabra_mute_button:|GHOST_WISPR_JABRA_MUTE_BUTTON=)' /opt/ghost-wispr/ghost-wispr.yaml /opt/ghost-wispr/.env"
-   ```
-
-   When they do not, the config lacks the key: step 1 was skipped, or a settings save dropped the
-   key before step 3. Run the models step again (or the full provisioner, as in step 1), from the
-   merge commit; the new binary keeps the key on a save. Then run A2 of "Accept slice 1".
-
-## Roll out a release that replaces config keys
-
-A release that removes config keys and reads others in their place, as the model providers did
-(README, "Removed settings"), needs the new binary and the new config together, so neither order
-of "Roll out a release that adds a config key" works. The old binary ignores the new keys. The new
-binary on the old config warns about each removed key and turns off the role it set: with the
-providers release, live transcription still runs (a config with no `providers` section gets a
-`deepgram` provider with the Deepgram key), while batch refinement, summaries, search, the
-Concierge and the voice are off. The nightly update (`ghost-wispr-update.timer`) installs
-`releases/latest` and never writes the config, so it must not run between the merge and the
-models step, nor install the release again on the old config after a rollback.
-
-`deploy/pi/rollout.sh` runs the rollout from a tailnet member, in the steps below. Each step works
-on the Pi as `ghost-wispr` over ssh, with its user systemd (`XDG_RUNTIME_DIR` set). It refuses to
-start unless the Pi reads paused, with no session and no GPT-Live probe running (pause it outside a
-meeting), and checks that again before each restart. It checks the sha256 of each protected
-recording, `PI_PROTECTED_RECORDINGS` in `deploy/pi/files/pi.env`, before it changes anything and
-again at its end. It stops at the first check that fails. Save no settings in the web UI from
-`hold` until `check` passes.
-
-1. Before you merge, turn the nightly update off. `hold` disables and stops
-   `ghost-wispr-update.timer`, so a reboot does not start it again (the user manager starts an
-   enabled timer at boot, and `Persistent=true` then runs a missed update at once). It then waits
-   until an update the timer already started has ended (`ghost-wispr-update.service` inactive or
-   failed): stopping the timer does not stop that update, and it can still swap or roll back the
-   binary. It stops waiting at a deadline 35 minutes on by the Pi's uptime, more than an update
-   takes at its worst, however slow a poll is or however the clock is corrected. Each poll, and each
-   of the two reads of its report, gives up after 30 s (35 s with SIGKILL), so the step ends at most
-   about two minutes past that deadline. It then stops, naming the update's PID and since when it
-   runs (`unknown` for a read that gave nothing), and leaves it running: run `hold` again once it
-   ends. Nothing in the rollout kills an update, since a kill can land mid-swap.
-
-   ```bash
-   deploy/pi/rollout.sh hold
-   ```
-
-2. Merge the pull request. Once the release workflow publishes the merge commit's release, run
-   `install` from a clean checkout of the merge commit; it refuses while the latest release is
-   another commit's. It turns the nightly update off again, and keeps the Pi's binary, config, `.env`,
-   `update.sh` and the commit it runs in `~/.local/share/ghost-wispr-rollback/<merge commit>` on
-   the Pi, mode 0700 (a second run keeps the first copy). It installs the merge commit's
-   `update.sh`, `ghost-wispr-update.service` and `ghost-wispr.service` (only the full provisioner
-   installs them otherwise; the update unit gives `update.sh` no time limit) and reloads the user
-   units. Before it changes anything, and again once it has installed the units, it refuses while
-   either unit is not loaded on the Pi or has a drop-in there (a `ghost-wispr.service.d` file, such
-   as one left from a speaker trace), naming it: a drop-in can change how the units run, such as
-   give the update a time limit. Remove the drop-in and run `install` again. Before it changes
-   anything, it also refuses if a line of the Pi's `.env`, or the environment of `ghost-wispr`'s
-   user manager, could set `GHOST_WISPR_CONFIG`, which would replace the installed config with
-   another file, or `GHOST_WISPR_ENVOY_ENABLED`, `GHOST_WISPR_ENVOY_HUB_URL` or
-   `GHOST_WISPR_CONCIERGE_ENVOY_URL`, naming the variable ("Turn on the meeting voice", step 1).
-   Such a line overrides the template, and the models step keeps `.env`; the recorder inherits the
-   manager's environment. Remove the line, or unset the variable in the manager (step 1 there says
-   how), and run `install` again. It runs `update.sh`
-   paused-only ("Update and inspect"), so a resume during the download leaves the binary in place;
-   it must print `installed commit <merge commit>` or `already on commit <merge commit>`. Then, at
-   once, it runs
-   the models step ("Enable models and Drive sync") with the shared drive the Pi's config names:
-   that installs the new config, removes from `.env` the variables of removed settings (such as
-   the `GHOST_WISPR_EMBEDDING_LOCATION` an earlier provisioner wrote), and restarts the recorder on
-   both. When the Pi's config names no shared drive, it stops before it installs anything: run the
-   full provisioner ("Provision") from the merge commit instead.
-
-   ```bash
-   git checkout --detach "$merge" # merge: the merge commit's SHA
-   deploy/pi/rollout.sh install
-   ```
-
-   When it stops after `update.sh` installed the release, the Pi runs the new binary on its old
-   config, with the roles above off: run `install` again, or roll back.
-
-3. Check the result. `check` requires the merge commit in `/api/version`, no warning in
-   `/api/status`, each role's provider/model in `/api/config` as the template names it, and every
-   provider the template names, and no other, signed in (`GET /api/providers?refresh=1`). Only when
-   all of that holds does it enable and start the nightly update again; when a check fails, the
-   timer stays disabled. Then run A8 of "Accept slice 2".
-
-   ```bash
-   deploy/pi/rollout.sh check
-   ```
-
-To roll back, run `rollback` from the same checkout. It disables and stops the nightly update
-(`check` may have turned it on), puts back the kept binary, config, `.env` and `update.sh`, each by
-a rename (a copy over the binary the running process executes fails with "Text file busy"),
-restarts the recorder, and waits until `/api/version` names the kept commit. It runs when the
-recorder is paused and idle, or not running at all; a recorder that runs but whose `/api/status`
-cannot be read may be recording, so it changes nothing then.
-
+<!-- runbook_blocks_test.sh: download-commit -->
 ```bash
-deploy/pi/rollout.sh rollback
+c=$(curl -fsS http://127.0.0.1:8080/api/version | jq -er .commit) &&
+t='' p=1 prev='' &&
+while [ -z "$t" ]; do
+  r=$(curl -fsS "https://api.github.com/repos/sjawhar/ghost-wispr/releases?per_page=100&page=$p") &&
+    t=$(jq -r --arg c "$c" 'first(.[] | select(.target_commitish == $c) | .tag_name) // ""' <<<"$r") &&
+    n=$(jq length <<<"$r") && first=$(jq -c '.[0]' <<<"$r") || break
+  [ -z "$t" ] || break
+  if [ "$n" -lt 100 ] || [ "$first" = "$prev" ]; then
+    echo "no release names commit $c" >&2
+    break
+  fi
+  prev=$first p=$((p + 1))
+done &&
+[ -n "$t" ] &&
+d=$(mktemp -d) && cd "$d" &&
+u="https://github.com/sjawhar/ghost-wispr/releases/download/$t" &&
+curl -fsSLO "$u/ghost-wispr-pi-deploy.tar.gz" &&
+curl -fsSLO "$u/ghost-wispr-pi-deploy.tar.gz.sha256" &&
+sha256sum -c ghost-wispr-pi-deploy.tar.gz.sha256 &&
+tar -xzf ghost-wispr-pi-deploy.tar.gz &&
+cd ghost-wispr-pi-deploy
 ```
 
-The nightly update stays disabled, also across a reboot, or it would install the release again on
-the old config. Once the cause is fixed (the release reverted, or a release that runs on the old
-config published), turn it on again with the command `rollback` prints:
+`sha256sum` must print `ghost-wispr-pi-deploy.tar.gz: OK`, and the shell is then in that release's
+directory, in `/tmp`. The block reads GitHub's release list, newest first, 100 releases a page,
+until a page holds the release of the commit, or holds fewer than 100 releases (the last page), or
+repeats the page before it. When no release names the commit, it prints
+`no release names commit <commit>` and stops before it makes a directory.
+
+### Apply a provisioning change
+
+On the Pi, download the release that carries the change, normally the latest ("Provision", step 1),
+and run `./provision.sh` in its directory. On a provisioned Pi it does what step 5 of "Provision"
+says: it writes no credential file and prints `credentials: same as pi.env renders`, or the names of
+the fields that differ. It installs the launcher, the update unit and timer, and the release's
+`update.sh`, `pi-lib.sh` and `pi.env`, starts the nightly update once, applies `serve.conf`, and
+stops after "already joined".
+
+The release can be newer than the one the Pi runs, as when it fixes a launcher, unit or timer that
+kept the nightly update from installing it. The nightly update keeps `.prev` copies only of the set
+that `deploy.verified` lists, and `provision.sh` installs its own release's files before it starts
+the update. So when it would replace `update.sh`, `pi-lib.sh` or `pi.env`, and the installed files
+are the set `deploy.verified` lists, `provision.sh` first copies that set and `.env` to their
+`.prev` copies, and prints
+`ghost-wispr provision: kept the set of commit <sha>, which the Pi runs, as its .prev copies, so a failed install of this release rolls back to it`.
+A failed install of the newer release then rolls back to the release the Pi runs. When the installed
+files are not that set, as after an install cut short, it prints
+`ghost-wispr provision: the installed files are not the set /opt/ghost-wispr/deploy.verified lists (<file> differs), so its .prev copies stay as they are`:
+those copies already hold the set verified last.
+
+The models step is the one exception: `provision.sh --models` runs only from the release the Pi runs
+("Enable models and Drive sync").
+
+## A release that changes config
+
+A release carries its config. The nightly update installs the release's whole deploy set together
+("Update and inspect"): the binary, `ghost-wispr.yaml`, `ghost-wispr.service`, the udev rule, the
+logind setting and the rest of the set. So a release that adds, replaces or removes a config key,
+such as `recording_rules`, `mic_device`, `envoy_hub_url` or a model provider, needs no step of its
+own: merge it, and the Pi installs it in the first run of the night that finds the recorder free. A
+new binary never starts on an old config, and an old binary never runs on a new config. Settings
+saved on the page stay in `/opt/ghost-wispr/ghost-wispr.local.yaml`, which no release changes
+("Settings saved on the page").
+
+The update restarts the recorder only while it is free. While a session or a call goes on, it
+prints `ghost-wispr update: active session; leaving the current release in place` (or the call's
+state), and a later run of the night tries again. When the new release does not answer its commit
+and a status the update can read within 120 s, the update puts back the whole set that ran before
+and prints `...; restored the previous release`. A later run tries the release again.
+
+A setting in `/opt/ghost-wispr/.env` overrides the YAML. The office Pi can set the Jabra's Mute
+button there, with `GHOST_WISPR_JABRA_MUTE_BUTTON` ("Pause and resume at the unit"). The nightly
+update writes its own four lines of `.env` and keeps every other line of `.env` but those of
+variables Ghost Wispr no longer reads, so that line stays through each release. The template's
+`jabra_mute_button: true` applies while no such line and no saved setting sets the button.
+
+A release that changes a provisioning file (the launcher, `ghost-wispr-update.service`,
+`ghost-wispr-update.timer` or `serve.conf`) reaches the Pi only when a person runs that release's
+`provision.sh` ("Update and inspect", "Apply a provisioning change"). Until then, each night's run
+prints its drift line, and check 7 of `check-deploy.sh` fails.
+
+The morning after the release publishes, check it from a tailnet member device, in a checkout:
 
 ```bash
-ssh ghost-wispr@ghost-wispr 'XDG_RUNTIME_DIR=/run/user/$(id -u) systemctl --user enable --now ghost-wispr-update.timer'
+deploy/pi/check-deploy.sh
 ```
 
-The old binary reads the relabelled search vectors (the database relabels `gemini/<model>` to
-`<model>` once) as another model's, so it embeds a session again the next time it indexes it.
+Each of its seven checks must print `PASS` ("Update and inspect"). For a release that changes
+`mic_device` or the Jabra's Mute button, also check the Pi: `/api/status` must hold no
+`No microphone found` warning, and `capture_state` must be `capturing` or `paused`:
+
+```bash
+curl -fsS https://ghost-wispr.tail12ec1c.ts.net/api/status | jq '{capture_state, warnings}'
+```
+
+Then check the two values the recorder runs with. `/api/config` shows neither, so the block below
+reads each as the recorder resolves it: `GHOST_WISPR_MIC_DEVICE` or `GHOST_WISPR_JABRA_MUTE_BUTTON`
+in the running process's environment (from `.env` or its user manager), else the local settings
+file `ghost-wispr.local.yaml`, else the installed `ghost-wispr.yaml`. It prints those two settings
+alone, never the process's other variables, which hold the Pi's secrets. Its lines must read
+`mic_device: J75` and `jabra_mute_button: true`, each with where its value comes from.
+
+<!-- runbook_blocks_test.sh: running-settings -->
+```bash
+(source "${GHOST_WISPR_PI_ENV:-deploy/pi/files/pi.env}" &&
+  ssh "ghost-wispr@$PI_HOST" 'bash -s' <<'EOF'
+d=/opt/ghost-wispr
+pid=$(XDG_RUNTIME_DIR=/run/user/$(id -u) systemctl --user show -p MainPID --value ghost-wispr.service)
+[ "${pid:-0}" != 0 ] || { echo 'ghost-wispr.service runs no process' >&2; exit 1; }
+environment=$(tr '\0' '\n' <"/proc/$pid/environ") || exit 1
+for setting in mic_device:GHOST_WISPR_MIC_DEVICE jabra_mute_button:GHOST_WISPR_JABRA_MUTE_BUTTON; do
+  key=${setting%%:*} variable=${setting#*:}
+  value=$(sed -n "s/^$variable=//p" <<<"$environment" | tail -n 1)
+  from="$variable in the recorder's environment"
+  if [ -n "$value" ] && [ "$key" = jabra_mute_button ]; then
+    case ${value,,} in true | 1) value=true ;; *) value=false ;; esac
+  fi
+  if [ -z "$value" ]; then
+    value=$(sed -n "s/^$key: *//p" "$d/ghost-wispr.local.yaml" 2>/dev/null) from=ghost-wispr.local.yaml
+  fi
+  if [ -z "$value" ]; then
+    value=$(sed -n "s/^$key: *//p" "$d/ghost-wispr.yaml") from=ghost-wispr.yaml
+  fi
+  echo "$key: ${value:-unset} (from $from)"
+done
+EOF
+)
+```
+
+When the new release answers its commit but check 2, 3 or 4 fails, revert the change on `main`. The
+revert publishes a new release, which the nightly update installs that night, or at once when you
+start the update by hand:
+
+```bash
+ssh ghost-wispr@ghost-wispr 'XDG_RUNTIME_DIR=/run/user/$(id -u) systemctl --user start ghost-wispr-update.service'
+```
+
+Do not restore the `.prev` copies by hand: the next run finds installed files that differ from the
+set `deploy.verified` lists, and installs the latest release again.
+
+## Settings saved on the page
+
+A setting saved on the web UI's settings page goes to the local settings file,
+`/opt/ghost-wispr/ghost-wispr.local.yaml`, never to `ghost-wispr.yaml`. Ghost Wispr reads that file
+over the release's config (README, "Configuration"). A save writes only the settings it changes, and
+never a value that `.env` gives, such as the Jabra's `GHOST_WISPR_JABRA_MUTE_BUTTON` line: once that
+line is removed, the saved setting or the template applies. A setting saved back to the template's
+value leaves the file, and the file goes when no setting is left. No release holds the file, and the
+nightly update never changes it, so a saved setting stays through each release. `/api/config`
+reports the settings the recorder applied from the file as `local_settings`, or that it did not
+apply the file, and why. Check 2 of `check-deploy.sh` compares a setting that the recorder applied
+from the file with that value, and names it.
+Recording rules cannot be changed on the page.
+
+To drop every saved setting, remove the file and restart the recorder:
+
+```bash
+ssh ghost-wispr@ghost-wispr 'rm -- /opt/ghost-wispr/ghost-wispr.local.yaml && XDG_RUNTIME_DIR=/run/user/$(id -u) systemctl --user restart ghost-wispr.service'
+```
+
+The first install of a deploy set on a Pi, with no `/opt/ghost-wispr/deploy.verified`, replaces the
+config that the Pi had, and with it each setting that an older build saved into `ghost-wispr.yaml`
+before the local settings file existed. The update keeps that config as
+`/opt/ghost-wispr/ghost-wispr.yaml.before-release-config`. Read a lost setting there, and save it
+again on the page.
 
 ## The settings page's providers
 
@@ -980,9 +1244,10 @@ roles that use it and whether it signed in when last checked (README, "The setti
 API"): `vertex` and `vertex-us` with the Pi's Google workload identity, `openai` with OpenAI
 workload identity, and `deepgram` with its key from `GHOST_WISPR_DEEPGRAM_API_KEY`. Every provider
 must show that it signed in. A check is kept for 5 minutes; `GET /api/providers?refresh=1` checks
-every provider at once. Only `deepgram` has a key field: a key saved there goes into
-`/opt/ghost-wispr/.env`, and the next full provisioner run writes the credential bundle's
-`deepgram-key` over it.
+every provider at once. The `deepgram` key is read-only (`auth.read_only: true` in the template):
+the page shows no key field for it, only "This unit reads its key from its deployment. It cannot be
+changed here.", and `PATCH /api/config` with its key answers 400 and saves nothing. The key comes
+from Secret Manager, and a new version of it reaches the Pi as "The Pi's secrets" says.
 
 ## Recover a pending segment deletion
 
@@ -1075,9 +1340,10 @@ the unit.
    is applied; until then the voice answers "I cannot reach Dispatch yet", and the log warns every
    minute that the Envoy session did not open, with no restart needed once it can. The template
    sets `envoy_enabled: true`, and `envoy_hub_url` and `concierge.envoy_url` to the hub's listener.
-   A `.env` line overrides the YAML, so the models step (`provision.sh --models`) and
-   `deploy/pi/rollout.sh install` each refuse, and change nothing, while a line of the Pi's `.env`
-   could set `GHOST_WISPR_ENVOY_ENABLED`, `GHOST_WISPR_ENVOY_HUB_URL` or
+   A `.env` line overrides the YAML, so the nightly update refuses to install a release, new secrets
+   or a renewed certificate, and the models step (`provision.sh --models`) refuses and changes
+   nothing, while a line of the Pi's `.env` could set `GHOST_WISPR_ENVOY_ENABLED`,
+   `GHOST_WISPR_ENVOY_HUB_URL` or
    `GHOST_WISPR_CONCIERGE_ENVOY_URL`, or `GHOST_WISPR_CONFIG`, which would have the recorder load
    another file than the installed config and so replace every setting, Envoy's included: a line
    that, past leading space and an `export`, starts with the name and `=`, where a carriage return
@@ -1091,34 +1357,19 @@ the unit.
    line goes once you remove the line and run `systemctl --user daemon-reload`; one from the
    manager's start-up environment (`/etc/environment`, a `user@.service` drop-in) goes once you
    remove it and restart `user@<uid>.service`. Each reloads the manager before it reads, so a newly
-   written `environment.d` line counts. The full provisioner refuses the same way while the
-   manager's environment sets one of them, before it changes anything; the `.env` it writes sets
-   none. They name the variable and why, and `GHOST_WISPR_CONFIG` first. While a config names a
-   hub with Envoy off, the web page shows a notice under the warnings, and `/api/status` gives it in
-   `notices`, never in `warnings`, which `rollout.sh check` needs empty: no session event goes to
-   the hub, each completed summary waits until Envoy is on again, and, with no
-   `concierge.envoy_url`, the voice cannot ask an issue's agent.
-2. The Pi's Dispatch token: a no-scope agent token, never a person's. Before you run
-   `provision-pi.sh`, mint it into `$prepared/dispatch-token` with your own Dispatch token, which
-   must hold the `person` and `approve` scopes, in the file `DISPATCH_TOKEN_FILE` names:
-
-   <!-- provision_bundle_test.sh: dispatch-token -->
-   ```bash
-   (source "${GHOST_WISPR_PI_ENV:-deploy/pi/files/pi.env}" && umask 077 &&
-     trap 'rm -f -- "$prepared/mint.json"' EXIT &&
-     sed 's/^/Authorization: Bearer /' "${DISPATCH_TOKEN_FILE:?}" |
-     curl -fsS -H @- -H 'Content-Type: application/json' --data '{"name":"ghost-wispr-office-pi","scopes":[]}' \
-       "$PI_DISPATCH_URL/api/v1/me/agent-tokens" >"$prepared/mint.json" &&
-     jq -er .token "$prepared/mint.json" >"$prepared/dispatch-token" &&
-     jq -c '{id, name, scopes}' "$prepared/mint.json")
-   ```
-
-   It prints the new token's id, its name and `"scopes":[]`, never the token: Dispatch shows the
-   token only in the answer to the mint. `provision-pi.sh` carries the file in the credential
-   bundle, and the full provisioner writes it to `.env` as `GHOST_WISPR_DISPATCH_TOKEN`. Each full
-   provisioning rewrites `.env`, so give it `dispatch-token` each time: mint a new token, and revoke
-   the old one (`DELETE /api/v1/me/agent-tokens/{id}`). Without it the voice answers "I cannot reach
-   Dispatch yet".
+   written `environment.d` line counts. `provision.sh` refuses the same way while the manager's
+   environment sets one of them, before it changes anything. The models step and `provision.sh`
+   name `GHOST_WISPR_CONFIG` first, with why; the nightly update names each variable it found.
+   The refresh at each start of the recorder (`update.sh secrets`) still writes the four lines of
+   `.env`. While a config names a hub with Envoy off, the web page shows a notice
+   under the warnings, and `/api/status` gives it in `notices`, never in `warnings`, which check 4
+   of `check-deploy.sh` needs empty: no session event goes to the hub, each completed summary waits
+   until Envoy is on again, and, with no `concierge.envoy_url`, the voice cannot ask an issue's
+   agent.
+2. The Pi's Dispatch token: a no-scope agent token, never a person's, which the nightly update
+   reads from Secret Manager into `.env` as `GHOST_WISPR_DISPATCH_TOKEN`. "The Pi's secrets" says
+   how to replace it, and how to check that the Pi runs with the secret's latest version. Without
+   it the voice answers "I cannot reach Dispatch yet".
 3. After the deploy, `/api/status` must hold no `voice` warning, and the running process must
    have logged `voice: ready (wake phrases ["Wispr" "Ghost Wispr"]; ...)` and
    `concierge: the Envoy session is open`. The service writes JSON records, so the journal holds
@@ -1180,8 +1431,20 @@ than 300 ms after its audio starts. Remove the private directory afterwards.
 ## Accept the meeting voice
 
 `deploy/pi/accept-voice.sh` runs slice 1 of the meeting voice on the loopback, so nothing plays in
-the room and nothing of the room is recorded. Run it on the Pi as `ghost-wispr`, outside meetings,
-with the unit paused and no session active:
+the room and nothing of the room is recorded. The Pi's release does not hold the driver, so copy it
+to the Pi from a tailnet member device, in a checkout of the commit the Pi runs (its
+`/api/version`), with `recording-times.awk`, which the driver reads beside itself:
+
+```bash
+d=$(ssh ghost-wispr@ghost-wispr 'mktemp -d') &&
+scp deploy/pi/accept-voice.sh deploy/pi/recording-times.awk "ghost-wispr@ghost-wispr:$d/" &&
+printf '%s\n' "$d"
+```
+
+Run the steps below on the Pi as `ghost-wispr`, in the directory that the block printed, outside
+meetings, with the unit paused and no session active. The driver needs `curl`, `jq` and `python3`
+on the Pi, and refuses when one is missing. Remove the directory afterwards
+(`ssh ghost-wispr@ghost-wispr "rm -r -- '$d'"`).
 
 1. `sudo modprobe snd-aloop`, as in "Inject speech for acceptance".
 2. Make a WAV of the question, such as "Wispr, what is happening with the issue about the meeting
@@ -1342,12 +1605,12 @@ with the unit paused and no session active:
 
 ## Accept slice 1
 
-Run the acceptance driver from a tailnet member, after the tailnet policy of "Prerequisites and
-release order" applies.
+Run the acceptance driver from a tailnet member device, in a Ghost Wispr checkout, after the
+tailnet policy of "Prerequisites" (step 4) applies. The driver reads the Pi's settings from
+`deploy/pi/files/pi.env`.
 
-<!-- provision_bundle_test.sh: accept -->
+<!-- runbook_blocks_test.sh: accept -->
 ```bash
-source "${GHOST_WISPR_PI_ENV:-deploy/pi/files/pi.env}" &&
 deploy/pi/accept-slice1.sh
 ```
 
@@ -1372,7 +1635,7 @@ and confirm a real `session.started` and `session.ended` notification.
 
 A2 asks a person to open the unit's page and choose Recording rules. The page shows the rules
 under `recording_rules` in the Pi's config, `/opt/ghost-wispr/ghost-wispr.yaml`, which
-`provision.sh` renders from `deploy/pi/files/ghost-wispr.yaml`: each must appear verbatim and in
+the nightly update renders from the release's `ghost-wispr.yaml`: each must appear verbatim and in
 order. A unit whose config has no rules shows no Recording rules button.
 
 A5 asks a person to reach the recorder from a phone that is off the tailnet and from a device that
@@ -1424,9 +1687,11 @@ deploy/pi/accept-slice2.sh --self-test
 deploy/pi/accept-slice2.sh --drive-members "$members_file" --readers-group "$readers_group" --cert-test
 ```
 
-`--drive-members FILE` is the shared drive's member list from the Drive owner, one
+`--drive-members FILE` is the shared drive's member list, as the drive's Manager reads it on its
+"Manage members" page in Google Drive (the app's `drive.file` scope cannot read it), one
 `email|role` line each with Drive API role names (`organizer`, `fileOrganizer`, `writer`,
-`commenter`, `reader`). `--readers-group EMAIL` is the approved readers group from Task 2.4.
+`commenter`, `reader`). `--readers-group EMAIL` is the readers' Google group that the drive's
+Manager added as its one Viewer.
 `--cert-test` reads `/api/status` from a test instance on the Pi
 at `127.0.0.1:8081`. The binary has no `--config` flag. Put the test credential file and
 its certificate config in a private temporary directory, point the copied certificate config

@@ -29,6 +29,21 @@ function shownTime(at: string): string {
   return new Date(at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
 }
 
+// withDeepgramKeyReadOnly gives each render its own config, with the API's
+// read_only field explicit for the state it tests.
+function withDeepgramKeyReadOnly(readOnly: boolean): ConfigResponse {
+  return {
+    ...unitConfig,
+    providers: {
+      ...unitConfig.providers,
+      deepgram: {
+        ...unitConfig.providers.deepgram,
+        auth: { ...unitConfig.providers.deepgram.auth, read_only: readOnly },
+      },
+    },
+  }
+}
+
 describe('ModelProviders', () => {
   afterEach(() => {
     vi.unstubAllGlobals()
@@ -54,9 +69,9 @@ describe('ModelProviders', () => {
     }
   })
 
-  it('shows a key field only for a provider that signs in with a key, and why it fails', async () => {
+  it('shows an editable key field for a writable key provider, and why it fails', async () => {
     stubFetch()
-    render(ModelProviders, { config: unitConfig })
+    render(ModelProviders, { config: withDeepgramKeyReadOnly(false) })
 
     const r = await row('deepgram')
     expect(within(r).getByText('API key from EXAMPLE_DEEPGRAM_KEY')).toBeTruthy()
@@ -65,6 +80,56 @@ describe('ModelProviders', () => {
     expect(key.type).toBe('password')
     expect(key.placeholder).toBe('Not set')
     expect(screen.getAllByLabelText(/^Key for/)).toHaveLength(1)
+  })
+
+  it('says a deployment-owned key cannot be changed, with no key input', async () => {
+    stubFetch()
+    render(ModelProviders, { config: withDeepgramKeyReadOnly(true) })
+
+    const r = await row('deepgram')
+    expect(
+      within(r).getByText(
+        'This unit reads its key from its deployment. It cannot be changed here.',
+      ),
+    ).toBeTruthy()
+    expect(within(r).queryByLabelText('Key for deepgram')).toBeNull()
+    expect(within(r).queryByRole('button', { name: 'Save key' })).toBeNull()
+  })
+
+  it('decides a key is read-only by auth.read_only, whatever the provider is named', async () => {
+    // speech is read-only, and deepgram, the name the Pi's read-only provider
+    // has, is writable: the page must decide by auth.read_only, not by name.
+    const readOnlyText = 'This unit reads its key from its deployment. It cannot be changed here.'
+    const config = withDeepgramKeyReadOnly(false)
+    config.providers.speech = {
+      api: 'elevenlabs',
+      auth: { kind: 'api_key', env: 'EXAMPLE_SPEECH_KEY', read_only: true },
+    }
+    const speechStatus: ProviderStatus = {
+      name: 'speech',
+      api: 'elevenlabs',
+      url: 'https://api.elevenlabs.io',
+      auth: 'api_key',
+      sign_in: 'API key from EXAMPLE_SPEECH_KEY',
+      key_env: 'EXAMPLE_SPEECH_KEY',
+      key_set: true,
+      checked: true,
+      ok: true,
+      asked: false,
+      message: 'Signed in: api.elevenlabs.io accepted the credential.',
+      checked_at: checkedAt,
+      roles: [],
+    }
+    stubFetch({ config, providers: [...providerStatuses, speechStatus] })
+    render(ModelProviders, { config })
+
+    const speech = await row('speech')
+    expect(within(speech).getByText(readOnlyText)).toBeTruthy()
+    expect(within(speech).queryByLabelText('Key for speech')).toBeNull()
+    expect(within(speech).queryByRole('button', { name: 'Save key' })).toBeNull()
+    const deepgram = await row('deepgram')
+    expect(within(deepgram).getByLabelText('Key for deepgram')).toBeTruthy()
+    expect(within(deepgram).queryByText(readOnlyText)).toBeNull()
   })
 
   it('says Works for a provider that answered the read its check made', async () => {

@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"maps"
 	"os"
@@ -14,8 +15,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-
-	"gopkg.in/yaml.v3"
 )
 
 // Revision names a state of the config: Count rises by one with each change
@@ -34,41 +33,48 @@ func newRun() string {
 	return hex.EncodeToString(b)
 }
 
-// Store holds mutable config with thread-safe access and YAML write-back.
+// Store holds mutable config with thread-safe access. A change writes the
+// settings it changed into the local settings file.
 type Store struct {
 	mu  sync.RWMutex
 	cfg Config
-	// writtenLogLevel is the log_level a settings change writes back: the
-	// config file's, or the one a change set. GHOST_WISPR_LOG_LEVEL's override
-	// stays in memory, so a level set for one run does not stay in the file. A
-	// change counts as setting the level when it changes the running one, so a
-	// change to the level already running writes nothing new; no settings
-	// field sets the level today.
-	writtenLogLevel string
-	path            string
-	envPath         string
-	onChange        []func(Config)
-	revision        Revision
+	// releaseSettings is the release config alone, as the YAML map a config
+	// file holds, read when the store loaded, with no local settings and no
+	// environment: a change that sets a setting back to its value here
+	// removes that setting from the local settings file.
+	releaseSettings map[string]any
+	// localSettings are the settings the running config holds from the local
+	// settings file: those the start applied, as each change since has
+	// changed them, in the form that file writes them. Nil when it holds
+	// none.
+	localSettings map[string]any
+	// localSettingsErr is why the start did not apply the local settings
+	// file, or nil.
+	localSettingsErr error
+	// localSettingsRefusal refuses each change while the local settings file
+	// that the start could not apply is in place: a change would replace that
+	// file, and the settings saved in it would be lost. Nil when the start
+	// applied the file or found none.
+	localSettingsRefusal error
+	path                 string
+	envPath              string
+	onChange             []func(Config)
+	revision             Revision
 }
 
-// NewStore loads config from the given YAML path (if it exists),
-// applies env overrides, loads secrets, validates, and returns
-// a mutable store.
+// NewStore loads config from the given release YAML path and its local
+// settings file (if they exist), applies env overrides, loads secrets,
+// validates, and returns a mutable store.
 func NewStore(path string) (*Store, []string, error) {
-	cfg, fileLogLevel, warnings, err := load(path, nil)
-	if err != nil {
-		return nil, warnings, err
-	}
-
-	return &Store{cfg: cfg, writtenLogLevel: fileLogLevel, path: path, revision: Revision{Run: newRun()}}, warnings, nil
+	return newStore(path, "", nil)
 }
 
-// NewStoreWithEnv loads config from YAML, then provider keys from the .env
-// file where the environment sets none, and returns a mutable store.
+// NewStoreWithEnv loads config from the release YAML and its local settings,
+// then provider keys from the .env file where the environment sets none, and
+// returns a mutable store.
 func NewStoreWithEnv(yamlPath, envPath string) (*Store, []string, error) {
 	envSecrets := loadEnvFile(envPath)
-
-	cfg, fileLogLevel, warnings, err := load(yamlPath, envSecrets)
+	store, warnings, err := newStore(yamlPath, envPath, envSecrets)
 	if err != nil {
 		return nil, warnings, err
 	}
@@ -78,8 +84,27 @@ func NewStoreWithEnv(yamlPath, envPath string) (*Store, []string, error) {
 	if envSecrets[EnvPrefix+"ENVOY_WEBHOOK_SECRET"] != "" && os.Getenv(EnvPrefix+"ENVOY_WEBHOOK_SECRET") == "" {
 		warnings = append(warnings, leftoverEnvoyWebhookSecretWarning)
 	}
+	return store, warnings, nil
+}
 
-	return &Store{cfg: cfg, writtenLogLevel: fileLogLevel, path: yamlPath, envPath: envPath, revision: Revision{Run: newRun()}}, warnings, nil
+func newStore(path, envPath string, envSecrets map[string]string) (*Store, []string, error) {
+	l, err := loadConfig(path, envSecrets)
+	if err != nil {
+		return nil, l.warnings, err
+	}
+	store := &Store{
+		cfg:              l.cfg,
+		releaseSettings:  l.releaseSettings,
+		localSettings:    l.localSettings,
+		localSettingsErr: l.localSettingsErr,
+		path:             path,
+		envPath:          envPath,
+		revision:         Revision{Run: newRun()},
+	}
+	if l.localSettingsErr != nil {
+		store.localSettingsRefusal = fmt.Errorf("settings not saved: Ghost Wispr did not apply %s at start (%v). Correct or remove that file, then restart Ghost Wispr. A save now would replace the settings in it", LocalSettingsPath(path), l.localSettingsErr)
+	}
+	return store, l.warnings, nil
 }
 
 // Get returns a snapshot copy of the current config.
@@ -97,8 +122,17 @@ func (s *Store) GetRevision() (Config, Revision) {
 	return s.copyConfig(), s.revision
 }
 
-// Update applies a mutation to the config, validates the result,
-// writes back to YAML if a path is configured, and fires onChange callbacks.
+// GetWithLocalSettings returns, from one state of the store, a snapshot copy
+// of the current config, the revision it is, and the local settings it holds,
+// as copies.
+func (s *Store) GetWithLocalSettings() (Config, Revision, AppliedLocalSettings) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.copyConfig(), s.revision, AppliedLocalSettings{Settings: reportedSettings(s.localSettings), Err: s.localSettingsErr}
+}
+
+// Update applies a mutation to the config, validates the result, writes the
+// local settings file if a path is configured, and fires onChange callbacks.
 // If validation fails, the mutation is rolled back.
 func (s *Store) Update(fn func(*Config)) error {
 	return s.TryUpdate(func(c *Config) error {
@@ -109,9 +143,15 @@ func (s *Store) Update(fn func(*Config)) error {
 
 // TryUpdate is Update with a mutation that can refuse: when fn returns an
 // error, the mutation is rolled back, nothing is written and no callback
-// fires, and TryUpdate returns that error.
+// fires, and TryUpdate returns that error. While the local settings file
+// that the start could not apply is in place, TryUpdate refuses each change
+// before fn runs.
 func (s *Store) TryUpdate(fn func(*Config) error) error {
 	s.mu.Lock()
+	if s.localSettingsRefusal != nil {
+		s.mu.Unlock()
+		return s.localSettingsRefusal
+	}
 
 	prev := s.copyConfig()
 	if err := fn(&s.cfg); err != nil {
@@ -126,29 +166,38 @@ func (s *Store) TryUpdate(fn func(*Config) error) error {
 		return err
 	}
 
-	writtenLogLevel := s.writtenLogLevel
-	if s.cfg.LogLevel != prev.LogLevel {
-		writtenLogLevel = s.cfg.LogLevel
-	}
+	providerKeysChanged := !maps.Equal(s.cfg.ProviderKeys, prev.ProviderKeys) ||
+		!maps.Equal(s.cfg.keysSet, prev.keysSet)
+	var previousLocal localSettingsFile
+	var localChanges map[string]any
 	if s.path != "" {
-		if err := s.writeYAML(writtenLogLevel); err != nil {
+		var err error
+		if previousLocal, err = readLocalSettingsFile(s.path); err != nil {
 			s.cfg = prev
 			s.mu.Unlock()
-			return fmt.Errorf("write config: %w", err)
+			return fmt.Errorf("read %s: %w", LocalSettingsPath(s.path), describeReadError(err))
+		}
+		if localChanges, err = s.writeLocalSettings(&prev, previousLocal); err != nil {
+			s.cfg = prev
+			s.mu.Unlock()
+			return fmt.Errorf("write local settings: %w", err)
 		}
 	}
 
-	if s.envPath != "" {
+	if s.envPath != "" && providerKeysChanged {
 		if err := s.writeEnvFile(); err != nil {
 			s.cfg = prev
+			err = fmt.Errorf("write .env: %w", err)
 			if s.path != "" {
-				_ = s.writeYAML(s.writtenLogLevel) // best-effort rollback of YAML to prev values
+				if restoreErr := previousLocal.restore(); restoreErr != nil {
+					err = errors.Join(err, fmt.Errorf("put back the local settings file: %w", restoreErr))
+				}
 			}
 			s.mu.Unlock()
-			return fmt.Errorf("write .env: %w", err)
+			return err
 		}
 	}
-	s.writtenLogLevel = writtenLogLevel
+	s.applyLocalChanges(localChanges)
 	s.revision.Count++
 
 	current := s.copyConfig()
@@ -207,20 +256,6 @@ func (s *Store) validateForUpdate() error {
 	}
 
 	return nil
-}
-
-// writeYAML writes the config to the file, with logLevel as its log_level.
-func (s *Store) writeYAML(logLevel string) error {
-	if err := os.MkdirAll(filepath.Dir(s.path), 0o755); err != nil {
-		return err
-	}
-	written := s.cfg
-	written.LogLevel = logLevel
-	data, err := yaml.Marshal(&written)
-	if err != nil {
-		return err
-	}
-	return atomicWriteFile(s.path, data, 0o644)
 }
 
 // loadEnvFile reads KEY=VALUE pairs from a .env file.

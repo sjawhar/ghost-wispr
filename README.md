@@ -88,7 +88,11 @@ The web UI is available at `http://localhost:8080`.
 
 ## Configuration
 
-Settings live in `ghost-wispr.yaml` (see `ghost-wispr.yaml.example`). Environment variables with the `GHOST_WISPR_` prefix override them, and a model provider's key is read only from the environment variable its `auth.env` names ([Model providers](#model-providers)). See `.env.example` for the full list.
+Settings live in `ghost-wispr.yaml`, the release config (see `ghost-wispr.yaml.example`). Environment variables with the `GHOST_WISPR_` prefix override them, and a model provider's key is read only from the environment variable its `auth.env` names ([Model providers](#model-providers)). See `.env.example` for the full list.
+
+The settings page saves its changes in the local settings file, `ghost-wispr.local.yaml`, beside `ghost-wispr.yaml`. For `GHOST_WISPR_CONFIG=/srv/unit.yaml`, the file is `/srv/unit.local.yaml`. Ghost Wispr reads that file over the release config: a map merges key by key, and any other value, a list too, replaces the release value. A save writes only the settings it changes, into the file as it is: settings saved before stay. A setting saved back to the release config's value leaves the file, and the file goes when no setting is left. A summary preset is a map too: a save writes only the preset fields it changed, so a new release config can still change the preset's other fields. A preset deleted on the page stays deleted, the built-in `default` preset too. A save never writes `ghost-wispr.yaml`, so a new release config keeps the saved settings. A save never writes a value that an environment variable gives, such as `GHOST_WISPR_JABRA_MUTE_BUTTON` in `.env`: the variable applies while it is set, and once it is removed, the saved setting or the release config's applies. To remove the saved settings, delete `ghost-wispr.local.yaml` and restart Ghost Wispr.
+
+In `ghost-wispr.local.yaml`, `null` deletes an entry of `providers`, of `summarization.presets` or of a provider's `labels`. A `null` on another setting, such as `voice: null`, is an error. When Ghost Wispr cannot read or parse `ghost-wispr.local.yaml`, or a value in it does not fit its setting, it warns at start and in `GET /api/status`, and uses the release config alone. The warning, `local_settings` in `GET /api/config` and the refusal of a save give the kind of fault and, where yaml names one, its line, such as `a value that does not fit its setting at line 4` or `not valid YAML near line 2`, and never a value or a key of the file: any client that reaches the recorder can read the first two when `GHOST_WISPR_AUTH_TOKEN` is unset. Until you correct or remove that file and restart Ghost Wispr, each save on the settings page (`PATCH /api/config`) is refused with 400, so a save does not replace the settings in the file.
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
@@ -97,12 +101,12 @@ Settings live in `ghost-wispr.yaml` (see `ghost-wispr.yaml.example`). Environmen
 | `GHOST_WISPR_DB_PATH` | No | `data/ghost-wispr.db` | SQLite database path |
 | `GHOST_WISPR_AUDIO_DIR` | No | `data/audio` | Directory for audio files |
 | `GHOST_WISPR_SILENCE_TIMEOUT` | No | `30s` | Silence duration to end a session |
-| `GHOST_WISPR_LOG_LEVEL` | No | `info` | Log level (`log_level`): `debug`, `info`, `warn` (or `warning`) or `error`, in any case. Another value logs at `info`, with a warning at start and in `GET /api/status`. The variable overrides the file for the run only: a settings save writes the file's `log_level` back, not the variable's |
+| `GHOST_WISPR_LOG_LEVEL` | No | `info` | Log level (`log_level`): `debug`, `info`, `warn` (or `warning`) or `error`, in any case. Another value logs at `info`, with a warning at start and in `GET /api/status`. The variable overrides the config for the run only: a settings save never writes the variable's level to `ghost-wispr.local.yaml` |
 | `GHOST_WISPR_MIC_SAMPLE_RATE` | No | `16000` | Preferred microphone sample rate |
 | `GHOST_WISPR_MIC_SAMPLE_RATES` | No | `48000,44100,32000,24000` | Fallback sample rates to try |
 | `GHOST_WISPR_GDRIVE_FOLDER_ID` | No | — | Google Drive folder for audio sync |
 | `GHOST_WISPR_PUBLIC_URL` | No | — | The unit's own HTTPS address (`public_url`), such as its tailnet name: pages there may use the API, and Envoy events link to sessions under it |
-| `GHOST_WISPR_RECORDING_RULES` | No | — | The rules the web UI shows under Recording rules (`recording_rules`), as a JSON list of strings. A settings save writes them into `ghost-wispr.yaml`, where they stay after the variable is removed |
+| `GHOST_WISPR_RECORDING_RULES` | No | — | The rules the web UI shows under Recording rules (`recording_rules`), as a JSON list of strings. A settings save never writes them into `ghost-wispr.local.yaml`: once the variable is removed, the config's rules apply |
 | `GHOST_WISPR_ENVOY_ENABLED`, `GHOST_WISPR_ENVOY_HUB_URL` | No | `false`, — | Publish session events to the Envoy hub's listener (`envoy_enabled`, `envoy_hub_url`; [Envoy events](#envoy-events)). It turns only the events on or off: the meeting voice's own Envoy session follows `concierge.envoy_url` alone |
 | `google_credentials_file` | No | — | Authoritative Google credential file, for Google Drive and each provider that signs in with Google; when empty, Application Default Credentials are used |
 
@@ -183,10 +187,11 @@ has no providers.
 | `project`, `location` | Vertex AI only: the Google Cloud project (by default the project of a service-account credential file), and the location: `global` (the default), `us`, `eu` or a region such as `us-central1` |
 | `labels` | Vertex AI only: request labels, such as `owner: example-owner`, that each Gemini generate call on the provider carries (`generateContent` and `streamGenerateContent`: summaries, the Concierge and Gemini TTS); Vertex AI copies them into Cloud Billing for pay-as-you-go traffic. Each provider carries its own. Embeddings and the provider check carry none. Google's rules allow a key of 1 to 63 lowercase or international letters, digits, `_` or `-` that starts with a letter, a value of up to 63 of them, and at most 64 labels a call. Labels that break these rules warn at start, and are sent as written: Vertex AI answers such a call, but Cloud Billing may not attribute spend by them. Labels on another API warn at start, and its calls carry none |
 | `auth.kind` | How Ghost Wispr signs in, one of the kinds below |
+| `auth.read_only` | `api_key` only: `true` means the deployment owns the `auth.env` key. The settings page does not offer a key input, and a `provider_keys` PATCH for it returns 400. On another `auth.kind` it does nothing, and the start warns |
 
 | `auth.kind` | What Ghost Wispr sends | Its settings |
 |-------------|------------------------|--------------|
-| `api_key` | The key in the environment variable `auth.env`, or in `.env`, where the settings page saves it | `env` |
+| `api_key` | The key in the environment variable `auth.env`, or in `.env`, where the settings page saves it unless `auth.read_only` is true | `env`; `read_only` |
 | `google` | A Google access token from `google_credentials_file` (workload identity federation or a service-account file), else from Application Default Credentials. Vertex AI and Cloud Text-to-Speech only | — |
 | `google_id_token` | A Google ID token for `auth.audience`, minted from `google_credentials_file`, else from Application Default Credentials: an external-account credential (workload identity federation) by impersonating the service account it names, a service-account key file, or on a Compute Engine VM with neither, the VM's service account from its metadata server. For an endpoint that admits Google ID tokens, such as a model gateway, at its `url` | `audience` |
 | `openai_wif` | An OpenAI access token that OpenAI's workload identity federation gives in exchange for a Google ID token, minted as for `google_id_token`. The OpenAI API only | `identity_provider_id`, `service_account_id` (ids, not secrets) |
@@ -301,8 +306,9 @@ Moving the role back to a direct provider is the same change.
 ### The settings page and the API
 
 The settings page lists each provider: its API, address and sign-in, the roles that use it, and
-whether it signed in when last checked; an `api_key` provider also has a field for its key. The
-check signs in, and where the API has a cheap read the credential must pass (a model list,
+whether it signed in when last checked; an `api_key` provider whose `auth.read_only` is not true has
+a field for its key. A deployment-owned key says it cannot be changed there. The check signs in, and
+where the API has a cheap read the credential must pass (a model list,
 Deepgram's projects, the ElevenLabs user, Cloud Text-to-Speech's voices, or for Vertex AI a count
 of a short text's tokens on each model the roles call there, which costs nothing and needs only the
 predict permission), makes it; a Vertex AI refusal or 404 (no such model or location) of any of
@@ -356,9 +362,9 @@ began with a key a save has since replaced is not kept as the provider's last ch
   field nobody is typing in shows the config the page last took. A config with another value for a
   field being typed in ends that edit for good; the field shows the new value and says "Changed on
   the unit or in another tab; your edit was replaced." until the next input in it.
-- `PATCH /api/config` takes `provider_keys: {"<provider>": "<key>"}` for `api_key` providers and
-  writes each key into `.env` under the provider's `auth.env`; any other provider or a key containing
-  control characters is a 400. It also takes `tts: {model, voice}`, `summarization: {model, presets}`
+- `PATCH /api/config` takes `provider_keys: {"<provider>": "<key>"}` for `api_key` providers whose
+  `auth.read_only` is not true and writes each key into `.env` under the provider's `auth.env`; any
+  other provider, a read-only provider, or a key containing control characters is a 400. It also takes `tts: {model, voice}`, `summarization: {model, presets}`
   and `voice: {enabled, engine}` among its other fields, refuses a summarization or text-to-speech
   model that no provider serves, and answers 400 to a field it does not know. A preset in
   `summarization.presets` changes only the fields the patch names, `null` deletes it, and a preset
@@ -803,10 +809,31 @@ again.
 
 ## Deployment
 
-The office recorder runs a verified arm64 release binary on a Raspberry Pi 5. The Pi is
-provisioned from `deploy/pi/` and is managed through its user services and nightly updater.
-Follow the [office recorder Pi runbook](docs/pi-setup.md) for the required infrastructure
-outputs, credential bundle, provisioning command, tailnet join, and acceptance checks.
+The office recorder runs a Ghost Wispr release on a Raspberry Pi 5. Each release has the arm64
+binary and the Pi's deploy set, `ghost-wispr-pi-deploy.tar.gz`: the Pi's config, its deployment
+settings (`pi.env`), its units, its update scripts and `provision.sh`, with a `manifest.json` that
+gives the SHA-256 of each file and of the binary. `deploy/pi/build-deploy-tarball.sh` builds it in
+the release workflow.
+
+- A person provisions a new Pi on the Pi, from the release. `provision.sh --key` makes the Pi's key
+  and prints its certificate request. Once the infrastructure repository signs the request,
+  `provision.sh --certificate FILE` installs the certificate, and `provision.sh` writes the Google
+  credential files, installs the nightly update and joins the tailnet.
+- Each night from 03:30 to 06:00, while the recorder is free, the nightly update installs the latest
+  release's binary and config together, and puts the whole previous set back when the new release
+  does not answer. A launcher runs it under a 45-minute time limit. The update prints a line for each
+  install, hold and failure, and a drift line when a provisioning file or Tailscale Serve differs
+  from the release.
+- The Pi's Deepgram key and Dispatch token are in Secret Manager. The update and each start of the
+  recorder read them with `ghost-wispr pi-secrets`, and the settings page cannot change the
+  Deepgram key (`auth.read_only`).
+- Settings saved on the page stay in `ghost-wispr.local.yaml` ("Configuration"), which no release
+  changes.
+- `deploy/pi/check-deploy.sh`, run from a tailnet member device, checks that the Pi runs the latest
+  release and that the timer installed it.
+
+Follow the [office recorder Pi runbook](docs/pi-setup.md) for the infrastructure the Pi needs, the
+provisioning steps, the update's lines and the acceptance checks.
 
 ## API
 

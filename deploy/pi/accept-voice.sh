@@ -15,11 +15,14 @@ set -uo pipefail
 readonly unit=ghost-wispr.service
 readonly api=http://127.0.0.1:8080
 readonly ws_url=ws://127.0.0.1:8080/ws
-# The unit's directory (.env, ghost-wispr.yaml, the binary) and ALSA's card listing; the tests name
-# their own.
+# The unit's directory (.env, ghost-wispr.yaml, ghost-wispr.local.yaml, the binary) and ALSA's card
+# listing; the tests name their own.
 readonly deploy_dir=${GHOST_WISPR_DEPLOY_DIR:-/opt/ghost-wispr}
 readonly env_file=$deploy_dir/.env
 readonly config_file=$deploy_dir/ghost-wispr.yaml
+# The settings saved on the page, which the unit reads over ghost-wispr.yaml (README,
+# "Configuration").
+readonly local_config_file=$deploy_dir/ghost-wispr.local.yaml
 readonly binary=$deploy_dir/ghost-wispr
 readonly asound_root=${GHOST_WISPR_ASOUND_ROOT:-/proc/asound}
 # The run's sound: the microphone captures the loopback's device 0 (docs/pi-setup.md, "Inject
@@ -861,9 +864,17 @@ env_value() {
 }
 
 # yaml_value PARENT KEY: KEY's value in the unit's config, under the top-level PARENT, or at the top
-# level with PARENT empty. It fails when the config does not set it.
+# level with PARENT empty: the local settings file's value when it sets KEY, else the release
+# config's. It fails when neither sets it.
 yaml_value() {
-  awk -v parent="$1" -v key="$2" '
+  { [[ -f $local_config_file ]] && yaml_file_value "$local_config_file" "$1" "$2"; } \
+    || yaml_file_value "$config_file" "$1" "$2"
+}
+
+# yaml_file_value FILE PARENT KEY: KEY's value in FILE, as yaml_value reads it. It fails when FILE
+# does not set it.
+yaml_file_value() {
+  awk -v parent="$2" -v key="$3" '
     /^[^[:space:]#][^:]*:/ {
       current = $0; sub(/:.*/, "", current)
       if (parent == "" && current == key) { value = $0; sub(/^[^:]*:[[:space:]]*/, "", value); found = 1 }
@@ -877,17 +888,19 @@ yaml_value() {
       sub(/[[:space:]]+#.*$/, "", value)
       if (value ~ /^".*"$/ || value ~ /^\047.*\047$/) value = substr(value, 2, length(value) - 2)
       print value
-    }' "$config_file" 2>/dev/null
+    }' "$1" 2>/dev/null
 }
 
-# setting ENV_KEY PARENT KEY: a setting as the unit resolves it: the .env's override, else the config.
+# setting ENV_KEY PARENT KEY: a setting as the unit resolves it: the .env's override, else the local
+# settings file, else the release config.
 setting() {
   env_value "$1" 2>/dev/null || yaml_value "$2" "$3"
 }
 
-# provider_api NAME: the api of provider NAME in the unit's config (providers.NAME.api), read at the
-# provider's own level, from a config written one setting a line, as the template and a settings save
-# write it. It fails when the config names no such provider, or none with an api.
+# provider_api NAME: the api of provider NAME in the release config (providers.NAME.api), read at
+# the provider's own level, from a config written one setting a line, as the template writes it. A
+# settings save never writes a provider's api to the local settings file. It fails when the config
+# names no such provider, or none with an api.
 provider_api() {
   awk -v name="$1" '
     /^[^[:space:]#]/ { inside = ($0 ~ /^providers:[[:space:]]*$/); entry_indent = ""; entry = ""; next }

@@ -122,6 +122,79 @@ func TestPatchConfigSavesAProviderKey(t *testing.T) {
 	}
 }
 
+// TestPatchConfigRefusesAReadOnlyKey fails if an api_key provider marked
+// auth.read_only is absent from GET /api/config, accepts provider_keys, changes
+// its config or .env, or announces a change. That would let the settings page
+// replace the deployment's Secret Manager key.
+func TestPatchConfigRefusesAReadOnlyKey(t *testing.T) {
+	path := writeProvidersConfig(t)
+	readOnlyConfig := strings.Replace(
+		providersYAML,
+		"auth: {kind: api_key, env: GHOST_WISPR_DEEPGRAM_API_KEY}",
+		"auth: {kind: api_key, env: GHOST_WISPR_DEEPGRAM_API_KEY, read_only: true}",
+		1,
+	)
+	if readOnlyConfig == providersYAML {
+		t.Fatal("providersYAML has no Deepgram api_key auth to mark read_only")
+	}
+	if err := os.WriteFile(path, []byte(readOnlyConfig), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	envPath := filepath.Join(t.TempDir(), ".env")
+	const originalEnv = "UNCHANGED=kept\n"
+	if err := os.WriteFile(envPath, []byte(originalEnv), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfgStore, _, err := config.NewStoreWithEnv(path, envPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var announced atomic.Int32
+	cfgStore.OnChange(func(config.Config) { announced.Add(1) })
+	h := newConfigHandler(t, cfgStore, &ControlHooks{})
+
+	t.Run("GET serves read_only", func(t *testing.T) {
+		var response struct {
+			Providers map[string]struct {
+				Auth map[string]any `json:"auth"`
+			} `json:"providers"`
+		}
+		getJSON(t, h, "/api/config", &response)
+		if got := response.Providers["deepgram"].Auth["read_only"]; got != true {
+			t.Errorf("GET /api/config deepgram auth.read_only = %v, want true", got)
+		}
+	})
+
+	t.Run("PATCH refuses and preserves settings", func(t *testing.T) {
+		beforeConfig, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		rr := patchConfig(h, `{"provider_keys":{"deepgram":"dg-replacement"}}`)
+		if rr.Code != http.StatusBadRequest {
+			t.Errorf("PATCH provider_keys = %d %s, want 400", rr.Code, rr.Body.String())
+		}
+		var refusal map[string]string
+		if err := json.Unmarshal(rr.Body.Bytes(), &refusal); err != nil || len(refusal) != 1 || !strings.Contains(refusal["error"], "deepgram") || !strings.Contains(refusal["error"], "read_only") {
+			t.Errorf("refusal %s (%v), want {\"error\": ...} naming deepgram and read_only", rr.Body.String(), err)
+		}
+		cfg := cfgStore.Get()
+		if got := cfg.APIKey("deepgram"); got != "" {
+			t.Errorf("a refused PATCH set deepgram's key to %q", got)
+		}
+		if after, err := os.ReadFile(path); err != nil || !bytes.Equal(after, beforeConfig) {
+			t.Errorf("a refused PATCH rewrote the config file (%v)", err)
+		}
+		assertNoLocalSettings(t, path)
+		if after, err := os.ReadFile(envPath); err != nil || string(after) != originalEnv {
+			t.Errorf("a refused PATCH rewrote .env to %q (%v), want %q", after, err, originalEnv)
+		}
+		if n := announced.Load(); n != 0 {
+			t.Errorf("a refused PATCH announced %d config changes", n)
+		}
+	})
+}
+
 // TestPatchConfigRefusesAKeyForAProviderThatSignsInAnotherWay fails if PATCH
 // /api/config's provider_keys accepts a key for a provider that signs in by
 // Google, a Google ID token or OpenAI workload identity, or for no provider;
@@ -162,6 +235,7 @@ func TestPatchConfigRefusesAKeyForAProviderThatSignsInAnotherWay(t *testing.T) {
 			if after, err := os.ReadFile(path); err != nil || !bytes.Equal(after, before) {
 				t.Errorf("a refused PATCH rewrote the config file (%v)", err)
 			}
+			assertNoLocalSettings(t, path)
 			if n := announced.Load(); n != 0 {
 				t.Errorf("a refused PATCH announced %d config changes", n)
 			}
@@ -298,6 +372,7 @@ func TestPatchConfigRefusesTheRemovedFields(t *testing.T) {
 			if after, err := os.ReadFile(path); err != nil || !bytes.Equal(after, before) {
 				t.Errorf("a refused PATCH rewrote the config file (%v)", err)
 			}
+			assertNoLocalSettings(t, path)
 			if n := announced.Load(); n != 0 {
 				t.Errorf("a refused PATCH announced %d config changes", n)
 			}
@@ -547,8 +622,11 @@ func TestOpenAPISpecDocumentsTheProviders(t *testing.T) {
 		if got := properties(at("providers", "additionalProperties", "properties")); !slices.Equal(got, []string{"api", "auth", "labels", "location", "project", "url"}) {
 			t.Errorf("%v a provider's properties %v, want api, auth, labels, location, project, url", schema[:3], got)
 		}
-		if got := properties(at("providers", "additionalProperties", "properties", "auth", "properties")); !slices.Equal(got, []string{"audience", "env", "identity_provider_id", "kind", "service_account_id"}) {
-			t.Errorf("%v a provider's auth properties %v", schema[:3], got)
+		if got := properties(at("providers", "additionalProperties", "properties", "auth", "properties")); !slices.Equal(got, []string{"audience", "env", "identity_provider_id", "kind", "read_only", "service_account_id"}) {
+			t.Errorf("%v a provider's auth properties %v, want audience, env, identity_provider_id, kind, read_only, service_account_id", schema[:3], got)
+		}
+		if got := at("providers", "additionalProperties", "properties", "auth", "properties", "read_only", "type"); got != "boolean" {
+			t.Errorf("%v auth.read_only type = %v, want boolean", schema[:3], got)
 		}
 		if at("provider_keys", "writeOnly") != true {
 			t.Errorf("%v provider_keys is not writeOnly", schema[:3])
