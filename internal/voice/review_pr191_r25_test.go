@@ -16,24 +16,34 @@ import (
 // every part of the fix broken to fail; each test here holds one part.
 
 // r25WithdrawnHold opens the office hold, ends it with a second call heard as
-// an interim, and begins a second hold with the final that withdraws it.
+// an interim, and begins a second hold with the final that withdraws it. The
+// results carry capture times, as Deepgram's do: the call's interim at 5 s,
+// and its final from the same start, shorter than it ("Whisper. No. Wait,"
+// ends before "notes" began), so only the shared start says that the final
+// replaces it (Sol's twenty-seventh review of #191).
 func r25WithdrawnHold(t *testing.T) (*rig, *fakeConcierge, *fakeSession, *exchange) {
 	t.Helper()
 	c := newFakeConcierge()
 	c.hold = true
 	r := newRigWith(t, c, func(cfg *SupervisorConfig, _ *rig) { cfg.TurnWait = time.Hour })
-	sess := officeWake(t, r)
+	captured := time.Now().Add(-time.Minute)
+	r27Hear(r, captured, "Whisper", 0, false, false, 3)
+	sess := r.waitSession()
+	r27Hear(r, captured, "Whisper. No. Oh, yeah,", 0, true, true, 3)
 	r.s.mu.Lock()
 	ex := r.s.ex
 	r.s.mu.Unlock()
-	r.heardAs("Wispr, send these notes", false, false, 4)
+	interim := r27Hear(r, captured, "Wispr, send these notes", 5, false, false, 4)
 	r.s.mu.Lock()
 	before := r.s.turnOf(ex)
 	r.s.mu.Unlock()
 	if before != "send these notes" {
 		t.Fatalf("control: the second call's interim is not the turn: %q", before)
 	}
-	r.heardAs("Whisper networks are a problem.", true, true, 4)
+	final := r27Hear(r, captured, "Whisper. No. Wait,", 5, true, true, 4)
+	if !final.endsAt().Before(interim.Words[len(interim.Words)-1].At) {
+		t.Fatal("control: the final does not end before the interim's last word began")
+	}
 	r.s.mu.Lock()
 	held := ex.misheardHold && r.s.ex == ex
 	r.s.mu.Unlock()
