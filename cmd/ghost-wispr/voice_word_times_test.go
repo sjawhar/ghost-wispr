@@ -61,7 +61,7 @@ func TestTheVoiceGetsWhenEachWordWasCaptured(t *testing.T) {
 		t.Fatalf("the voice got words %+v, want 2", words)
 	}
 	exact := time.Duration(math.Round((first + 1.001) * float64(time.Second)))
-	if want, ok := rc.CapturedAt(exact); !ok || len(heard.got[1].Words) != 1 || !heard.got[1].Words[0].At.Equal(want) {
+	if want, _, ok := rc.CapturedAt(exact); !ok || len(heard.got[1].Words) != 1 || !heard.got[1].Words[0].At.Equal(want) {
 		t.Errorf("the word at %.3f s captured at %+v, want %v", first+1.001, heard.got[1].Words, want.Format(time.StampMicro))
 	}
 	// Each word starts its second's buffer: 1 s of audio before the time

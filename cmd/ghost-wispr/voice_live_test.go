@@ -366,10 +366,10 @@ func (h *stampsHeard) OnUtteranceEnd(_ int, _ bool, lastWordEnd time.Time, at mo
 // utterance (Sol's fourth review of #191).
 func TestTheVoicesUtteranceEndCarriesItsLastWordsEnd(t *testing.T) {
 	base := time.Date(2026, 11, 25, 7, 0, 0, 0, time.UTC)
-	timed := func(at time.Duration) (time.Time, bool) { return base.Add(at), at < time.Minute }
+	timed := func(at time.Duration) (time.Time, bool, bool) { return base.Add(at), true, at < time.Minute }
 	for _, tc := range []struct {
 		name        string
-		heardAt     func(time.Duration) (time.Time, bool)
+		heardAt     func(time.Duration) (time.Time, bool, bool)
 		lastWordEnd float64
 		want        time.Time
 	}{

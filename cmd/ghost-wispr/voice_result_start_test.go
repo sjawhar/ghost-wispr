@@ -13,25 +13,29 @@ import (
 // (Deepgram's start), timed by capture, reaches the voice as Transcript.From,
 // apart from its first word's, which can move between an interim and its
 // final while the result's start does not (Sol's twenty-eighth review of #191,
-// after https://developers.deepgram.com/docs/interim-results).
+// after https://developers.deepgram.com/docs/interim-results); and FromExact
+// says whether the capture clock timed it exactly, not clamped to the oldest
+// audio it holds (Sol's twenty-ninth review).
 func TestTheVoiceTranscriptCarriesTheResultsStart(t *testing.T) {
 	t.Parallel()
 	base := time.Now().Add(-time.Minute)
-	heardAt := func(offset time.Duration) (time.Time, bool) { return base.Add(offset), true }
 	var mr api.MessageResponse
 	mr.Start = 5
 	mr.Channel.Alternatives = []api.Alternative{{
 		Transcript: "Whisper. No. Wait,",
 		Words:      []api.Word{{Word: "whisper", PunctuatedWord: "Whisper.", Start: 5.00141402, End: 5.2}},
 	}}
-	tr := voiceTranscript(&mr, monoclock.Now(), nil, heardAt)
-	if want := base.Add(5 * time.Second); !tr.From.Equal(want) {
-		t.Fatalf("From = %v, want the result's start %v", tr.From.Sub(base), want.Sub(base))
+	for _, exact := range []bool{true, false} {
+		heardAt := func(offset time.Duration) (time.Time, bool, bool) { return base.Add(offset), exact, true }
+		tr := voiceTranscript(&mr, monoclock.Now(), nil, heardAt)
+		if want := base.Add(5 * time.Second); !tr.From.Equal(want) || tr.FromExact != exact {
+			t.Fatalf("From = %v (exact %v), want the result's start %v (exact %v)", tr.From.Sub(base), tr.FromExact, want.Sub(base), exact)
+		}
+		if want := base.Add(5001414020 * time.Nanosecond); !tr.Words[0].At.Equal(want) {
+			t.Fatalf("the first word's At = %v, want %v", tr.Words[0].At.Sub(base), want.Sub(base))
+		}
 	}
-	if want := base.Add(5001414020 * time.Nanosecond); !tr.Words[0].At.Equal(want) {
-		t.Fatalf("the first word's At = %v, want %v", tr.Words[0].At.Sub(base), want.Sub(base))
-	}
-	if untimed := voiceTranscript(&mr, monoclock.Now(), nil, nil); !untimed.From.IsZero() {
-		t.Fatalf("with no capture clock, From = %v, want zero", untimed.From)
+	if untimed := voiceTranscript(&mr, monoclock.Now(), nil, nil); !untimed.From.IsZero() || untimed.FromExact {
+		t.Fatalf("with no capture clock, From = %v (exact %v), want zero", untimed.From, untimed.FromExact)
 	}
 }

@@ -31,7 +31,7 @@ func r27Hear(r *rig, captured time.Time, text string, start float64, final, endp
 		tr.Words[i].Speaker = speaker
 		tr.Words[i].At = captured.Add(time.Duration(tr.Words[i].Start * float64(time.Second)))
 	}
-	tr.From = captured.Add(time.Duration(start * float64(time.Second)))
+	tr.From, tr.FromExact = captured.Add(time.Duration(start*float64(time.Second))), true
 	r.s.OnTranscript(&tr)
 	return tr
 }

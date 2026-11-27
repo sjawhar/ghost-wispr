@@ -414,7 +414,7 @@ func (s *Stream) CapturedBefore(at time.Duration) time.Duration {
 }
 
 // CapturedAt is ResilientClient.CapturedAt for a point of s.
-func (s *Stream) CapturedAt(at time.Duration) (time.Time, bool) {
+func (s *Stream) CapturedAt(at time.Duration) (captured time.Time, exact, ok bool) {
 	s.rc.Mu.Lock()
 	defer s.rc.Mu.Unlock()
 	origin, holes := s.streamLocked()
@@ -815,11 +815,13 @@ func (rc *ResilientClient) capturedBeforeLocked(origin int64, holes []streamDrop
 // asked, as when Deepgram's result for the point comes late. A point before
 // the oldest stamp kept (captureStamps) was captured before the oldest audio
 // the stamps hold, so it returns when that audio was captured: the latest
-// the point can have been, never the arrival of its result. It reports
-// false before any audio was stamped, for a point between two stamps, and
-// for a point after the latest. A socket's results come with its own
-// stream, whose CapturedAt times points of it (Stream).
-func (rc *ResilientClient) CapturedAt(at time.Duration) (time.Time, bool) {
+// the point can have been, never the arrival of its result, and exact is
+// false, since every point that old has that same time (Sol's twenty-ninth
+// review of #191). It reports ok false before any audio was stamped, for a
+// point between two stamps, and for a point after the latest. A socket's
+// results come with its own stream, whose CapturedAt times points of it
+// (Stream).
+func (rc *ResilientClient) CapturedAt(at time.Duration) (captured time.Time, exact, ok bool) {
 	rc.Mu.Lock()
 	defer rc.Mu.Unlock()
 	return rc.capturedAtLocked(rc.origin, rc.holes, at)
@@ -827,7 +829,7 @@ func (rc *ResilientClient) CapturedAt(at time.Duration) (time.Time, bool) {
 
 // capturedAtLocked is CapturedAt for the point at into the stream that
 // starts at origin and skips holes. It must be called with Mu held.
-func (rc *ResilientClient) capturedAtLocked(origin int64, holes []streamDrop, at time.Duration) (time.Time, bool) {
+func (rc *ResilientClient) capturedAtLocked(origin int64, holes []streamDrop, at time.Duration) (captured time.Time, exact, ok bool) {
 	point := rc.capturedBeforeLocked(origin, holes, at)
 	oldest := (rc.stampNext - rc.stampsN + captureStamps) % captureStamps
 	stamp := func(i int) captureStamp { return rc.stamps[(oldest+i)%captureStamps] }
@@ -835,13 +837,14 @@ func (rc *ResilientClient) capturedAtLocked(origin int64, holes []streamDrop, at
 	// that ends after the point holds it, if any does.
 	i := sort.Search(rc.stampsN, func(i int) bool { return stamp(i).to > point })
 	if i == rc.stampsN || i > 0 && stamp(i).from > point {
-		return time.Time{}, false
+		return time.Time{}, false, false
 	}
 	s := stamp(i)
-	if s.from > point {
+	exact = s.from <= point
+	if !exact {
 		point = s.from // older than the stamps kept: timed by their oldest audio
 	}
-	return s.at.Add(-rc.streamDuration(s.to - point)), true
+	return s.at.Add(-rc.streamDuration(s.to - point)), exact, true
 }
 
 // captureStamps is how many buffers CapturedAt times exactly: about 8.5

@@ -70,7 +70,7 @@ func TestTheMicLoopsWriterGivesTheLiveClientTheReadTime(t *testing.T) {
 	if _, err := writer.Write(make([]byte, 16000/4*2)); err != nil {
 		t.Fatal(err)
 	}
-	at, ok := rc.CapturedAt(125 * time.Millisecond) // halfway through the buffer
+	at, _, ok := rc.CapturedAt(125 * time.Millisecond) // halfway through the buffer
 	if want := read.Add(-125 * time.Millisecond); !ok || !at.Equal(want) {
 		t.Fatalf("a word halfway through the buffer captured at %v (%v), want %v", at.Format(time.StampMicro), ok, want.Format(time.StampMicro))
 	}

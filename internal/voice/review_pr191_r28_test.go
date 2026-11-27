@@ -16,7 +16,7 @@ func r28HearDrift(r *rig, captured time.Time, text string, resultStart, wordStar
 		tr.Words[i].Speaker = speaker
 		tr.Words[i].At = captured.Add(time.Duration(tr.Words[i].Start * float64(time.Second)))
 	}
-	tr.From = captured.Add(time.Duration(resultStart * float64(time.Second)))
+	tr.From, tr.FromExact = captured.Add(time.Duration(resultStart*float64(time.Second))), true
 	r.s.OnTranscript(&tr)
 	return tr
 }
