@@ -206,14 +206,16 @@ func TestReview187AKeyQuestionKeepsItsWords(t *testing.T) {
 
 // TestReview187SideTalkSendsNoQuestion (finding 1): through the real
 // Supervisor, after the one-issue confirmation of a bare number, only a yes
-// sends the question first asked. Each reply has a rig of its own, so the
-// replies run in parallel.
+// sends the question first asked. The exchange stays open a second after the
+// confirmation for the reply: on a loaded sami-devbox the r7 rig's 150 ms
+// closed before "yes" was heard, and it sent nothing. Each reply has a rig of
+// its own, so the replies run in parallel.
 func TestReview187SideTalkSendsNoQuestion(t *testing.T) {
 	t.Parallel()
 	for _, reply := range []string{"yes", "the first item in our budget is rent", "No, not ABC-4592.", "Is that right?", "That's 100, right?"} {
 		t.Run(reply, func(t *testing.T) {
 			t.Parallel()
-			r := newR7Rig(t)
+			r := newR7RigFollowingUp(t, time.Second)
 			records := r.c.records.(*fakeRecords)
 			records.mu.Lock()
 			records.issues["ABC-4592"] = &dispatch.Issue{Key: "ABC-4592", Title: "Realtime voice", Status: "in_progress", UpdatedAt: time.Now(), Claim: &dispatch.Claim{Actor: actor("session", "agent-7", "Worker")}}

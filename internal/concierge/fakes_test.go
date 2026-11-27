@@ -529,14 +529,14 @@ func freshStore(t *testing.T) *storage.SQLiteStore {
 	return made.store
 }
 
-// start opens stores on every CPU but the one the tests run on, each as
-// soon as a rig took the one opened before it. Each opens a copy of one
-// store made first and closed, which costs less CPU than making one: under
-// the race detector a test binary that opened 40 copies took 5.5 to 6.0
-// CPU-seconds, one that made 40 stores 7.1 to 7.4. An opening is also what
-// the unit does at each start after its first.
+// start opens stores on every CPU but the one the tests run on, at most
+// maxStoreMakers of them, each as soon as a rig took the one opened before
+// it. Each opens a copy of one store made first and closed, which costs less
+// CPU than making one: under the race detector a test binary that opened 40
+// copies took 5.5 to 6.0 CPU-seconds, one that made 40 stores 7.1 to 7.4. An
+// opening is also what the unit does at each start after its first.
 func (p *storePool) start() {
-	makers := max(1, runtime.GOMAXPROCS(0)-1)
+	makers := min(max(1, runtime.GOMAXPROCS(0)-1), maxStoreMakers)
 	p.ready = make(chan pooledStore, makers)
 	p.stop = make(chan struct{})
 	root, err := os.MkdirTemp("", "concierge-stores-")
@@ -571,6 +571,11 @@ func (p *storePool) start() {
 		})
 	}
 }
+
+// maxStoreMakers bounds the store pool's makers. On sami-devbox's 288 CPUs,
+// 287 makers opened 287 stores at once beside every parallel test, and a
+// test's question then reached Envoy up to 1.6 s after its turn.
+const maxStoreMakers = 8
 
 // madeStore makes a new store in dir, closes it, and returns its database
 // file.
