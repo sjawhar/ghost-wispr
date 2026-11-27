@@ -474,10 +474,20 @@ EOF
 
 cat >"$bin/tailscale" <<'EOF'
 #!/usr/bin/env bash
-# The fake tailscale: `serve status --json`, through sudo (C3), answers $TEST_STATE/serve.json, or
-# fails with exit $TEST_STATE/serve-exit, or hangs while $TEST_STATE/serve-hang exists.
+# The fake tailscale: `status --self --json`, which any user may run, answers $TEST_STATE/self.json,
+# the device's own status, or fails with exit $TEST_STATE/self-exit. `serve status --json`, through
+# sudo (C3), answers $TEST_STATE/serve.json, or fails with exit $TEST_STATE/serve-exit, or hangs
+# while $TEST_STATE/serve-hang exists.
 set -euo pipefail
 state=${TEST_STATE:?}
+if [[ $* == 'status --self --json' ]]; then
+  if [[ -f $state/self-exit ]]; then
+    printf 'fake tailscale: failed\n' >&2
+    exit "$(<"$state/self-exit")"
+  fi
+  cat -- "$state/self.json"
+  exit 0
+fi
 if [[ ${TEST_VIA_SUDO:-} != 1 ]]; then
   printf 'tailscale ran without sudo: tailscale %s\n' "$*" >>"$state/errors"
   exit 1
@@ -837,6 +847,7 @@ new_pi() {
     "$state/timeout.log" "$state/pi-secrets.log" "$state/start-pi-secrets.log" "$state/journal.log" \
     "$state/clock-synchronized" "$state/status-reads.log"
   serve_json_for "$repo_root/deploy/pi/files/serve.conf" >"$state/serve.json"
+  printf '{"Self":{"DNSName":"ghost-wispr.example-tailnet.ts.net."}}\n' >"$state/self.json"
   printf '%s\n' GHOST_WISPR_DEEPGRAM_API_KEY=dg-test-1 GHOST_WISPR_DISPATCH_TOKEN=tok-test-1 >"$state/secrets"
   echo 1000 >"$state/clock"
 }
@@ -2852,14 +2863,21 @@ serve_with() {
   jq -c --arg host ghost-wispr.example-tailnet.ts.net "$1" <<<"$good_serve_json"
 }
 printf '443 http://127.0.0.1:9999\n' >"$work_dir/other-serve.conf"
+# serve_drift WHAT SERVE HAVE [NAME]: with SERVE as the Serve status, and NAME (the fake Pi's own
+# name by default) as the device's tailnet name, the run prints Serve's drift line, HAVE as its have.
 serve_drift() {
   new_pi
   install_set b
   printf '%s\n' "$2" >"$state/serve.json"
+  if [[ -n ${4:-} ]]; then
+    printf '{"Self":{"DNSName":"%s."}}\n' "$4" >"$state/self.json"
+  fi
   release=b run_update
   expect_run "drift (Serve $1)" 0 "ghost-wispr update: Serve differs from the release: want $want_serve, have $3"
   [[ $(grep -c tailscale "$state/sudo.log") == 1 ]] && grep -Fqx 'timeout=10s tailscale serve status --json' "$state/sudo.log" \
     || fail "drift (Serve $1): ran tailscale other than to read Serve under its 10 s bound: $(<"$state/sudo.log")"
+  grep -Fqx 'kill-after=none 10s tailscale status --self --json' "$state/timeout.log" \
+    || fail "drift (Serve $1): did not read the device's name with tailscale status --self --json under its 10 s bound: $(<"$state/timeout.log")"
 }
 serve_drift 'with another target' "$(serve_json_for "$work_dir/other-serve.conf")" '443 http://127.0.0.1:9999'
 serve_drift 'serving nothing' '{}' none
@@ -2873,6 +2891,16 @@ serve_drift 'with a proxy at another path too' \
 serve_drift 'whose proxy forwards peer capabilities' \
   "$(serve_with '.Web[$host + ":443"].Handlers["/"].AcceptAppCaps = ["example.com/cap/admin"]')" \
   "443 \"/\" proxy \"${serve_lines[0]#* }\" accept-app-caps [\"example.com/cap/admin\"]"
+# A device renamed after its Serve was set: tailscaled keeps the Web entry of the name it had before,
+# beside the entry of its name now (deploy/pi/testdata/serve-status-after-rename.json, the office
+# Pi's answer of 2026-11-27 with the neutral tailnet's names). Serve differs, and the line names the
+# other name. The control: on a device that still has the old name, the line names the new one.
+# Break it catches: a reader that drops the host of a Web entry, so the old name's entry reads as a
+# second line of this device's port, or as nothing.
+renamed_serve=$(jq -c . "$repo_root/deploy/pi/testdata/serve-status-after-rename.json")
+serve_drift 'after a rename' "$renamed_serve" "$want_serve; $want_serve on ghost-wispr-1.example-tailnet.ts.net"
+serve_drift 'after a rename, read on the old name' "$renamed_serve" \
+  "$want_serve; $want_serve on ghost-wispr.example-tailnet.ts.net" ghost-wispr-1.example-tailnet.ts.net
 # A release whose serve.conf has two lines matches a Serve of both, and differs from a Serve of one.
 make_release two-ports "$commit_b"
 printf '9443 http://127.0.0.1:9081\n' >>"$releases/two-ports/ghost-wispr-pi-deploy/serve.conf"
@@ -2923,6 +2951,21 @@ for answer in "${unknown_answers[@]}"; do
   printf '%s\n' "$answer" >"$state/serve.json"
   release=b run_update
   serve_unknown "answering $answer"
+done
+# The device's own name, which tells its Web entries from another name's, cannot be read: tailscale
+# fails, or answers no DNSName. That is UNKNOWN too, never a match nor a drift of every entry. Break
+# it catches: a reader that takes an empty name, so each entry is another name's.
+new_pi
+install_set b
+echo 1 >"$state/self-exit"
+release=b run_update
+serve_unknown 'with the device name unreadable'
+for self in 'not json' '{"Self":{}}' '{"Self":{"DNSName":""}}'; do
+  new_pi
+  install_set b
+  printf '%s\n' "$self" >"$state/self.json"
+  release=b run_update
+  serve_unknown "with the device's status $self"
 done
 new_pi
 install_set b

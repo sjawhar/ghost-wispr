@@ -304,12 +304,15 @@ EOF
 #   $TEST_LOG.up-exit;
 # - `set --accept-routes` exits TEST_SET_EXIT (0 by default), and on 0 sets RouteAll true;
 #   `set --accept-routes=false` sets it false;
-# - `status --self --json` prints the node's own reading, TEST_SELF_STATUS when it is set;
+# - `status --self --json` prints the node's own reading, TEST_SELF_STATUS when it is set, or fails
+#   with TEST_SELF_STATUS_EXIT;
 # - `status --json` prints the status fixture $TEST_STATUS, or fails with TEST_STATUS_EXIT;
 # - `serve --bg --https PORT TARGET` exits TEST_SERVE_EXIT (0 by default), and on 0 serves TARGET at
-#   the mount / of the HTTPS port PORT, and keeps each other mount of that port, as tailscale's
-#   SetWebHandler does (ipn/serve.go, v1.104); `serve --https=PORT off` serves nothing there;
-#   `serve --https=PORT --set-path=MOUNT off` removes that mount, and the port with its last one;
+#   the mount / of the HTTPS port PORT of the name TEST_SERVE_HOST, and keeps each other mount of
+#   that port, as tailscale's SetWebHandler does (ipn/serve.go, v1.104); `serve --https=PORT off`
+#   serves nothing there; `serve --https=PORT --set-path=MOUNT off` removes that mount, and the
+#   port with its last one; `serve reset` clears the whole setting, every name's entries, a TCP
+#   forward and Funnel too (tailscale's `serve reset`, an empty ipn.ServeConfig);
 #   `serve status --json` prints the setting, or fails with TEST_SERVE_STATUS_EXIT;
 # - `debug prefs` prints RouteAll.
 cat >"$bin/tailscale" <<'EOF'
@@ -351,6 +354,10 @@ case $1 in
   status)
     case ${*:2} in
       '--self --json')
+        if [[ ${TEST_SELF_STATUS_EXIT:-0} != 0 ]]; then
+          printf 'failed to connect to the local Tailscale daemon\n' >&2
+          exit "$TEST_SELF_STATUS_EXIT"
+        fi
         if [[ -n ${TEST_SELF_STATUS:-} ]]; then
           printf '%s\n' "$TEST_SELF_STATUS"
         else
@@ -377,6 +384,9 @@ case $1 in
           exit "$TEST_SERVE_STATUS_EXIT"
         fi
         cat -- "$state"
+        ;;
+      reset)
+        printf '{}\n' >"$state"
         ;;
       '--bg --https '*)
         (($# == 5)) || unexpected "$@"
@@ -1143,34 +1153,50 @@ said "ghost-wispr update: installed commit $commit_c" || fail "the update did no
 said 'already joined' || fail "provision.sh stopped before the join: $(<"$work_dir/out")"
 
 # ---------------------------------------------------------------------------------------------------
-# serve: serve.conf is the one source of Serve's setting. provision.sh applies each of its lines,
-# turns off each live Serve HTTPS port it does not list, and on each port it lists, each mount
-# other than /: tailscale serve --bg sets the mount / and keeps the others, so a mount left there
-# would show as drift each night. Each line is also a literal call in the join's command. When it
-# cannot read Serve's setting, or the setting is not serve.conf's after it applied it, it stops
-# before the join.
+# serve: the release owns Serve whole, and serve.conf is its one source. provision.sh reads the
+# device's tailnet name (tailscale status --self --json) and Serve. When Serve is serve.conf's for
+# that name already, it changes nothing. Otherwise it clears Serve with tailscale serve reset, then
+# applies each line: a Web entry of another name, as a rename leaves, a port or a mount serve.conf
+# does not list, a TCP forward, all go. The join's command resets Serve and applies each line too,
+# each a literal call. When it cannot read Serve or the name, or Serve is not serve.conf's after it
+# applied it, it stops before the join.
 begin serve
+readonly want_serve='{"TCP":{"443":{"HTTPS":true}},"Web":{"ghost-wispr.example-tailnet.ts.net:443":{"Handlers":{"/":{"Proxy":"http://127.0.0.1:8080"}}}}}'
+# The office Pi's Serve of 2026-11-27, after its device was renamed from ghost-wispr-1 (the neutral
+# tailnet's names): the entry of the old name stayed beside that of the new one. The run before this
+# fix turned off ports alone, kept the old name's entry, and stopped at its own check. Break it
+# catches: a provision.sh that turns off what serve.conf does not list by port, which no name but
+# the device's own reaches.
 new_pi
-jq -n --arg host "$TEST_SERVE_HOST" '{TCP: {"443": {HTTPS: true}, "8443": {HTTPS: true}},
+cp -- "$script_dir/testdata/serve-status-after-rename.json" "$TEST_SERVE_STATE"
+run_provision "$stage"
+expect_ran 'a Serve entry of the name the device had before a rename'
+[[ $(jq -cS . "$TEST_SERVE_STATE") == "$want_serve" ]] || fail "Serve is $(jq -cS . "$TEST_SERVE_STATE"), want $want_serve"
+logged 'sudo tailscale serve reset' || fail "provision.sh did not reset Serve: $(<"$TEST_LOG")"
+said 'on ghost-wispr-1.example-tailnet.ts.net' || fail "provision.sh did not name the old name's entry it reset: $(<"$work_dir/out")"
+[[ $(grep -n '^sudo tailscale serve reset$' "$TEST_LOG" | head -n1 | cut -d: -f1) -lt $(grep -n '^sudo tailscale serve --bg --https 443 ' "$TEST_LOG" | head -n1 | cut -d: -f1) ]] \
+  || fail "provision.sh did not reset Serve before it applied serve.conf: $(<"$TEST_LOG")"
+# A port and a mount that serve.conf does not list, and a TCP forward: the reset clears them all.
+new_pi
+jq -n --arg host "$TEST_SERVE_HOST" '{TCP: {"443": {HTTPS: true}, "8443": {HTTPS: true}, "2222": {TCPForward: "127.0.0.1:22"}},
   Web: {"\($host):443": {Handlers: {"/": {Proxy: "http://127.0.0.1:9999"}, "/debug": {Proxy: "http://127.0.0.1:8082"}}},
     "\($host):8443": {Handlers: {"/": {Proxy: "http://127.0.0.1:8081"}}}}}' >"$TEST_SERVE_STATE"
 run_provision "$stage"
-expect_ran 'a live port and a mount that serve.conf does not list'
-readonly want_serve='{"TCP":{"443":{"HTTPS":true}},"Web":{"ghost-wispr.example-tailnet.ts.net:443":{"Handlers":{"/":{"Proxy":"http://127.0.0.1:8080"}}}}}'
+expect_ran 'a live port, a mount and a TCP forward that serve.conf does not list'
 [[ $(jq -cS . "$TEST_SERVE_STATE") == "$want_serve" ]] || fail "Serve is $(jq -cS . "$TEST_SERVE_STATE"), want $want_serve"
+logged 'sudo tailscale serve reset' || fail "provision.sh did not reset Serve: $(<"$TEST_LOG")"
 logged 'sudo tailscale serve --bg --https 443 http://127.0.0.1:8080' || fail "provision.sh did not apply serve.conf's line: $(<"$TEST_LOG")"
-logged 'sudo tailscale serve --https=8443 off' || fail "provision.sh did not turn off port 8443: $(<"$TEST_LOG")"
-said 'turned off Serve port 8443' || fail "provision.sh did not say it turned off port 8443: $(<"$work_dir/out")"
-logged 'sudo tailscale serve --https=443 --set-path=/debug off' || fail "provision.sh did not turn off the mount /debug of port 443: $(<"$TEST_LOG")"
-said 'turned off the Serve mount /debug of port 443' || fail "provision.sh did not say it turned off /debug: $(<"$work_dir/out")"
-! grep -q 'serve --https=443 off' "$TEST_LOG" || fail "provision.sh turned off the port serve.conf lists: $(<"$TEST_LOG")"
-# A Serve that provision.sh does not manage, a TCP forward, stays and is named: the run stops before
-# the join, as the nightly drift line would say Serve: UNKNOWN.
+# Serve that is serve.conf's already for the device's name is left as it is: a reset would stop the
+# page for a moment for nothing. The control of the cases above.
 new_pi
-printf '%s\n' '{"TCP":{"2222":{"TCPForward":"127.0.0.1:22"}}}' >"$TEST_SERVE_STATE"
+printf '%s\n' "$want_serve" >"$TEST_SERVE_STATE"
 run_provision "$stage"
-expect_refused 'a TCP forward' "is not serve.conf's"
-[[ ! -e $TEST_LOG.join ]] || fail "provision.sh started the join although Serve is not serve.conf's"
+expect_ran "Serve that is serve.conf's already"
+# The join's command, which the fake sudo logs whole with systemd-run, holds the calls as text: the
+# check reads the calls that ran.
+! grep -Eq '^(sudo )?tailscale serve (reset|--bg)' "$TEST_LOG" || fail "provision.sh changed a Serve that was serve.conf's already: $(<"$TEST_LOG")"
+said "Tailscale Serve is serve.conf's already for ghost-wispr.example-tailnet.ts.net" \
+  || fail "provision.sh did not say Serve was serve.conf's already: $(<"$work_dir/out")"
 rm -rf -- "$work_dir/two-ports-stage"
 cp -a -- "$stage" "$work_dir/two-ports-stage"
 printf '%s\n' '# The page, and a second port.' '443 http://127.0.0.1:8080' '8443 http://127.0.0.1:8081' >"$work_dir/serve.conf"
@@ -1181,14 +1207,23 @@ expect_ran 'serve.conf with two lines'
 [[ $(serve_now) == $'443 http://127.0.0.1:8080\n8443 http://127.0.0.1:8081' ]] \
   || fail "Serve is [$(serve_now | paste -sd ';' -)], want both lines of serve.conf"
 join_command=$(<"$TEST_LOG.join")
-for line in '443 http://127.0.0.1:8080' '8443 http://127.0.0.1:8081'; do
-  [[ $join_command == *"tailscale serve --bg --https $line || rc=\$?;"* ]] \
-    || fail "the join does not hold the Serve call for '$line': $join_command"
-done
+[[ $join_command == *"tailscale serve reset || rc=\$?; tailscale serve --bg --https 443 http://127.0.0.1:8080 || rc=\$?; tailscale serve --bg --https 8443 http://127.0.0.1:8081 || rc=\$?;"* ]] \
+  || fail "the join does not reset Serve and then hold the Serve call of each line: $join_command"
 new_pi
 TEST_SERVE_STATUS_EXIT=1 run_provision "$stage"
 expect_refused 'an unreadable Serve setting' 'tailscale serve status'
 [[ ! -e $TEST_LOG.join ]] || fail 'provision.sh started the join although it could not read Serve'
+! grep -Eq '^(sudo )?tailscale serve reset' "$TEST_LOG" || fail "provision.sh reset a Serve it could not read: $(<"$TEST_LOG")"
+new_pi
+TEST_SELF_STATUS_EXIT=1 run_provision "$stage"
+expect_refused "an unreadable tailnet name" 'tailscale status --self --json'
+[[ ! -e $TEST_LOG.join ]] || fail "provision.sh started the join although it could not read the device's name"
+! grep -Eq '^(sudo )?tailscale serve reset' "$TEST_LOG" || fail "provision.sh reset Serve with no device name to check it against: $(<"$TEST_LOG")"
+# serve --bg fails after the reset: the run stops at its check, before the join.
+new_pi
+TEST_SERVE_EXIT=1 run_provision "$stage"
+expect_refused 'a Serve line that tailscale refuses' "Serve"
+[[ ! -e $TEST_LOG.join ]] || fail "provision.sh started the join although Serve is not serve.conf's"
 
 # ---------------------------------------------------------------------------------------------------
 # update-fails: when the update fails, provision.sh prints that run's lines from the journal and
@@ -1470,13 +1505,13 @@ run_join() {
 }
 
 # J1: no route overlaps a network of the Pi, so the join accepts the routes once the check passed.
-# It removes the route check and the token.
+# It resets Serve before it applies serve.conf's line, and removes the route check and the token.
 run_join false "$fixtures/F-status-router"
 j1="the join did not accept the tailnet's subnet routes although no route overlaps the Pi's networks: $(<"$work_dir/join.out")"
 mapfile -t calls <"$TEST_LOG"
-[[ $join_exit == 0 && ${#calls[@]} == 4 && ${calls[0]} == 'tailscale up '* \
-  && ${calls[1]} == 'tailscale serve --bg --https 443 http://127.0.0.1:8080' \
-  && ${calls[2]} == 'tailscale status --json' && ${calls[3]} == 'tailscale set --accept-routes' ]] || fail "$j1"
+[[ $join_exit == 0 && ${#calls[@]} == 5 && ${calls[0]} == 'tailscale up '* \
+  && ${calls[1]} == 'tailscale serve reset' && ${calls[2]} == 'tailscale serve --bg --https 443 http://127.0.0.1:8080' \
+  && ${calls[3]} == 'tailscale status --json' && ${calls[4]} == 'tailscale set --accept-routes' ]] || fail "$j1 (calls: ${calls[*]})"
 [[ $(<"$TEST_ROUTE_ALL") == true ]] || fail "$j1"
 accepted=$(grep -e "^$accepted_prefix" "$work_dir/join.out") || fail "$j1"
 [[ $accepted == *'wlan0 192.168.1.136/24'* && $accepted == *'10.1.0.0/16'* ]] || fail "$j1"

@@ -152,14 +152,34 @@ func TestRunbookAppliesAProvisioningChangeFromTheReleaseThatCarriesIt(t *testing
 }
 
 // TestRunbookProvisionGivesServeExactlyServeConf fails if "Provision" does not
-// say that provision.sh turns off each Serve mount other than / on a port that
-// serve.conf lists, and stops before the join when Serve then holds a part
-// serve.conf does not, such as a TCP forward.
+// say that provision.sh makes Serve exactly serve.conf for the device's tailnet
+// name: it leaves a Serve that is that already, and otherwise clears Serve
+// with tailscale serve reset, which also removes the entry of a name the
+// device had before a rename, with what that costs, before it applies each
+// line; that the join resets Serve too; and that it stops before the join when
+// Serve is not serve.conf's then. It also fails if the section still says
+// that provision.sh turns parts off one by one, which reaches no other name.
 func TestRunbookProvisionGivesServeExactlyServeConf(t *testing.T) {
 	section := runbookSection(t, "## Provision")
-	for _, words := range []string{"each mount other than `/`", "TCP forward", "before the join"} {
+	for _, words := range []string{"`tailscale serve reset`", "a name the device had before a rename", "the page is not served", "before the join", "`tailscale serve reset` and each `tailscale serve` call"} {
 		if !strings.Contains(section, words) {
 			t.Errorf("the runbook's \"Provision\" does not say %q", words)
+		}
+	}
+	if strings.Contains(section, "each mount other than `/`") {
+		t.Error(`the runbook's "Provision" still says provision.sh turns off each mount other than / one by one`)
+	}
+}
+
+// TestRunbookSaysServeDriftNamesAnotherName fails if "Update and inspect"
+// does not say how the drift line shows a Serve entry of another name than
+// the device's, such as one a rename left, or that the device's name is read
+// with tailscale status --self --json.
+func TestRunbookSaysServeDriftNamesAnotherName(t *testing.T) {
+	section := runbookSection(t, "## Update and inspect")
+	for _, words := range []string{"`<port> <proxy target> on <name>`", "`tailscale status --self --json`"} {
+		if !strings.Contains(section, words) {
+			t.Errorf("the runbook's \"Update and inspect\" does not say %q", words)
 		}
 	}
 }

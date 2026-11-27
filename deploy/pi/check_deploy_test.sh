@@ -195,9 +195,14 @@ fi
 EOF
 
 # tailscale on the fake Pi: serve status --json prints state/serve.json, the Serve config as
-# tailscaled gives it, to root alone (sudo). With no state/serve.json, tailscaled does not answer.
+# tailscaled gives it, to root alone (sudo). status --self --json, which any user may run, prints
+# state/self.json, the device's own status. With no such file, tailscaled does not answer.
 cat >"$bin/tailscale" <<'EOF'
 #!/usr/bin/env bash
+if [[ $* == 'status --self --json' ]]; then
+  [[ -f $FAKE_STATE/self.json ]] || { echo 'failed to connect to local tailscaled' >&2; exit 1; }
+  exec cat -- "$FAKE_STATE/self.json"
+fi
 [[ $* == 'serve status --json' ]] || { printf 'fake tailscale: unexpected arguments: %s\n' "$*" >&2; exit 1; }
 [[ ${FAKE_SUDO:-} == 1 ]] || { echo 'Access denied: serve config denied' >&2; exit 1; }
 [[ -f $FAKE_STATE/serve.json ]] || { echo 'failed to connect to local tailscaled' >&2; exit 1; }
@@ -412,6 +417,7 @@ new_case() {
   printf '%s\n' "$good_providers" >"$state/providers.json"
   printf '%s\n' "$good_journal" >"$state/journal-ghost-wispr-update.service"
   printf '%s\n' "$good_serve" >"$state/serve.json"
+  jq -cn --arg name "$PI_HOST." '{Self: {DNSName: $name}}' >"$state/self.json"
   release_json "$new" >"$github/latest.json"
   jq -cn --argjson a "$(release_json "$new")" --argjson b "$(release_json "$old")" '[$a, $b]' >"$github/releases.json"
 }
@@ -916,6 +922,22 @@ unreadable "$units/ghost-wispr-update.service"
 run_driver
 expect_verdicts PASS PASS PASS PASS PASS PASS UNKNOWN
 expect 7 UNKNOWN ghost-wispr-update.service
+# A device renamed after its Serve was set keeps the Web entry of the name it had before
+# (deploy/pi/testdata/serve-status-after-rename.json, the office Pi's answer of 2026-11-27 with the
+# neutral tailnet's names). Check 7 fails and names that name. A device whose own name cannot be
+# read is UNKNOWN: which entry is its own cannot be told. Breaks they catch: a reader that drops the
+# host of a Web entry, so the old name's entry reads as a duplicate of the Pi's own line; one that
+# takes an empty name, so every entry is another name's.
+new_case 'a Serve entry of the name the Pi had before a rename'
+cp -- "$script_dir/testdata/serve-status-after-rename.json" "$state/serve.json"
+run_driver
+expect_verdicts PASS PASS PASS PASS PASS PASS FAIL
+expect 7 FAIL Serve 'http://127.0.0.1:8080 on ghost-wispr-1.example-tailnet.ts.net'
+new_case "the Pi's tailnet name cannot be read"
+rm -f -- "$state/self.json"
+run_driver
+expect_verdicts PASS PASS PASS PASS PASS PASS UNKNOWN
+expect 7 UNKNOWN 'tailscale status --self --json'
 
 # The driver reads the bootstrap files and Serve with the functions of the pi-lib.sh beside it,
 # bootstrap_drift, serve_conf_lines and serve_lines_from_status, which update.sh's nightly drift
