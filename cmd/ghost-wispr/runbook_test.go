@@ -166,18 +166,23 @@ func TestRunbookAppliesAProvisioningChangeFromTheReleaseThatCarriesIt(t *testing
 // not say that the status read is a snapshot, which a session that starts
 // after it is not in; that one provisioning run, with its join, holds
 // /run/lock/ghost-wispr-provision.lock, and a second run fails and names the
-// holder; that each tailscale call of the apply ends after 30 s and the unit
-// after its RuntimeMaxSec, with Serve's state and the command to run; or if it
-// still says that provision.sh turns parts off one by one, which reaches no
-// other name, or that the page is lost for a moment only.
+// holder, or that a holder that exited holds it no more; that each tailscale
+// call of the apply ends after 30 s and the unit after its RuntimeMaxSec, with
+// Serve's state and the command to run; that the apply resets only when the
+// recorder's manager confirms ghost-wispr.service inactive; that the join's
+// token is on /run, a tmpfs, and its unit's ExecStopPost removes it whatever
+// stops the join; or if it still says that provision.sh turns parts off one by
+// one, which reaches no other name, that the page is lost for a moment only,
+// or that the token is under /var/lib.
 func TestRunbookProvisionGivesServeExactlyServeConf(t *testing.T) {
 	section := runbookSection(t, "## Provision")
-	for _, words := range []string{"`tailscale serve reset`", "a name the device had before a rename", "a systemd unit of its own", "a lost SSH session", "applies `serve.conf` again", "immediately before the reset", "a call whose `state` is not `none`", "nothing in Serve was changed", "The join runs the same apply", "only another run of `./provision.sh` puts it back", "check 7", "before the join", "a session that starts after that read", "`/run/lock/ghost-wispr-provision.lock`", "names the run or the join that holds it", "ends after 30 s", "`RuntimeMaxSec`", "Serve is now"} {
+	for _, words := range []string{"`tailscale serve reset`", "a name the device had before a rename", "a systemd unit of its own", "a lost SSH session", "applies `serve.conf` again", "immediately before the reset", "a call whose `state` is not `none`", "nothing in Serve was changed", "The join runs the same apply", "only another run of `./provision.sh` puts it back", "check 7", "before the join", "a session that starts after that read", "`/run/lock/ghost-wispr-provision.lock`", "names the run or the join that holds it", "ends after 30 s", "`RuntimeMaxSec`", "Serve is now",
+		"held by a process that exited", "confirms `inactive`", "`/run/ghost-wispr-join`", "`ExecStopPost`"} {
 		if !strings.Contains(section, words) {
 			t.Errorf("the runbook's \"Provision\" does not say %q", words)
 		}
 	}
-	for _, stale := range []string{"each mount other than `/`", "a moment that a page open in a browser shows"} {
+	for _, stale := range []string{"each mount other than `/`", "a moment that a page open in a browser shows", "/var/lib/ghost-wispr-join"} {
 		if strings.Contains(section, stale) {
 			t.Errorf("the runbook's \"Provision\" still says %q", stale)
 		}

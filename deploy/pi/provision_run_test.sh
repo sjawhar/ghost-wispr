@@ -76,7 +76,7 @@ readonly release_api=https://api.test.invalid/releases/latest status_url=http://
 # The provisioning lock of each run, and the bound of each tailscale call of the Serve apply: 5 s
 # here, where a call that hangs must end soon, and a fake call on a loaded dev box still ends in
 # time. A run's id, which names its units and its directory under the join directory, is a UUID.
-readonly lock=$work_dir/provision.lock serve_call_timeout=5 \
+readonly lock=$work_dir/provision.lock tailscale_call_timeout=5 \
   uuid_re='[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
 export TEST_LOG="$work_dir/log" TEST_UID="$uid" TEST_RUNTIME_DIR="$runtime_dir" TEST_DEPLOY="$deploy" \
   TEST_UNIT_DIR="$units" TEST_BINARY="$work_dir/recorder-binary" \
@@ -143,6 +143,10 @@ case $1 in
   install)
     if [[ " $* " == *' /dev/stdin '* ]]; then
       cat >"$TEST_LOG.installed-$(basename -- "${!#}")"
+      # A file of a run's directory under the join directory lands there too, as root's files do.
+      if [[ ${!#} == "$GHOST_WISPR_JOIN_DIR"/*/* && -d ${!#%/*} ]]; then
+        cp -- "$TEST_LOG.installed-$(basename -- "${!#}")" "${!#}"
+      fi
     elif [[ ${2:-} == -d ]]; then
       arguments=()
       while (($# > 1)); do
@@ -201,8 +205,21 @@ case $1 in
       : >"$TEST_LOG.serve-unit-done"
       exit "$status"
     fi
+    # The join: its command and its whole line, and each argument on a line of its own, from which
+    # run_join reads the unit's RuntimeMaxSec and ExecStopPost. With TEST_JOIN_START_EXIT, the unit
+    # does not start, as systemd-run fails when it cannot.
+    if [[ ${TEST_JOIN_START_EXIT:-0} != 0 ]]; then
+      printf 'Failed to start transient service unit: Unit %s already exists.\n' "${*:2:1}" >&2
+      exit "$TEST_JOIN_START_EXIT"
+    fi
     printf '%s' "${!#}" >"$TEST_LOG.join"
     printf '%s\n' "$*" >"$TEST_LOG.systemd-run"
+    printf '%s\n' "${@:2}" >"$TEST_LOG.systemd-run-args"
+    ;;
+  rm)
+    # The run's own files under the join directory, which provision.sh removes as root.
+    [[ ${!#} == "$GHOST_WISPR_JOIN_DIR"/* ]] || { error 'a removal outside the join directory' "$@"; exit 1; }
+    exec rm "${@:2}"
     ;;
   udevadm) error 'a udev call' "$@" ;;
   systemctl)
@@ -235,8 +252,11 @@ EOF
 #   that the installed binary's "# answers commit" line names, and is-active says it runs. show -p
 #   ExecMainStartTimestamp --timestamp=us+utc --value prints the real time of that start, as systemd
 #   prints it, or nothing while no recorder runs.
-# - --machine=ghost-wispr@ is-active --quiet ghost-wispr.service is how root, in the unit of
-#   provision.sh's Serve apply, asks ghost-wispr's manager whether the recorder runs.
+# - --machine=ghost-wispr@ is-active ghost-wispr.service is how root, in the unit of provision.sh's
+#   Serve apply, asks ghost-wispr's manager whether the recorder runs: it prints active (exit 0)
+#   while the recorder runs, else inactive (exit 3); or TEST_SERVICE_STATE (exit 3); or prints
+#   nothing and exits TEST_SERVICE_STATE_EXIT; or, with TEST_SERVICE_STATE_HANG, never ends, as a
+#   manager that does not answer.
 cat >"$bin/systemctl" <<'EOF'
 #!/usr/bin/env bash
 printf 'systemctl %s\n' "$*" >>"$TEST_LOG"
@@ -246,9 +266,22 @@ if [[ ${1:-} != --user ]]; then
   exit 1
 fi
 if [[ ${2:-} == --machine=ghost-wispr@ ]]; then
-  [[ ${*:3} == 'is-active --quiet ghost-wispr.service' ]] || { error 'an unexpected call' "$@"; exit 1; }
-  [[ -f $TEST_STATE/active ]]
-  exit
+  [[ ${*:3} == 'is-active ghost-wispr.service' ]] || { error 'an unexpected call' "$@"; exit 1; }
+  [[ -z ${TEST_SERVICE_STATE_HANG:-} ]] || exec "$TEST_REAL_SLEEP" 600
+  if [[ ${TEST_SERVICE_STATE_EXIT:-0} != 0 ]]; then
+    printf 'Failed to connect to bus: Connection refused\n' >&2
+    exit "$TEST_SERVICE_STATE_EXIT"
+  fi
+  if [[ -n ${TEST_SERVICE_STATE:-} ]]; then
+    printf '%s\n' "$TEST_SERVICE_STATE"
+    exit 3
+  fi
+  if [[ -f $TEST_STATE/active ]]; then
+    printf 'active\n'
+    exit 0
+  fi
+  printf 'inactive\n'
+  exit 3
 fi
 [[ ${XDG_RUNTIME_DIR:-} == "$TEST_RUNTIME_DIR" ]] || error "XDG_RUNTIME_DIR is ${XDG_RUNTIME_DIR:-unset}" "$@"
 shift
@@ -365,7 +398,8 @@ EOF
 # - `set --accept-routes` exits TEST_SET_EXIT (0 by default), and on 0 sets RouteAll true;
 #   `set --accept-routes=false` sets it false;
 # - `status --self --json` prints the node's own reading, TEST_SELF_STATUS when it is set, or fails
-#   with TEST_SELF_STATUS_EXIT;
+#   with TEST_SELF_STATUS_EXIT; from its TEST_SELF_STATUS_HANG_FROM-th call on, it writes
+#   $TEST_LOG.self-hung and never ends;
 # - `status --json` prints the status fixture $TEST_STATUS, or fails with TEST_STATUS_EXIT;
 # - `serve --bg --https PORT TARGET` exits TEST_SERVE_EXIT (0 by default), or 1 for each of its
 #   first TEST_SERVE_FAIL_TIMES calls, or never ends in each of its first TEST_SERVE_HANG_TIMES
@@ -420,6 +454,14 @@ case $1 in
   status)
     case ${*:2} in
       '--self --json')
+        if [[ -n ${TEST_SELF_STATUS_HANG_FROM:-} ]]; then
+          calls=$(($(cat -- "$TEST_LOG.self-calls" 2>/dev/null || echo 0) + 1))
+          printf '%s\n' "$calls" >"$TEST_LOG.self-calls"
+          if ((calls >= TEST_SELF_STATUS_HANG_FROM)); then
+            : >"$TEST_LOG.self-hung"
+            exec "$TEST_REAL_SLEEP" 60
+          fi
+        fi
         if [[ ${TEST_SELF_STATUS_EXIT:-0} != 0 ]]; then
           printf 'failed to connect to the local Tailscale daemon\n' >&2
           exit "$TEST_SELF_STATUS_EXIT"
@@ -670,7 +712,7 @@ run_provision() {
   env -u XDG_RUNTIME_DIR PATH="$bin:$PATH" GHOST_WISPR_DEPLOY_DIR="$deploy" GHOST_WISPR_UNIT_DIR="$units" \
     GHOST_WISPR_IDENTITY_KEY="$key" GHOST_WISPR_JOIN_DIR="$join" GHOST_WISPR_SYSTEM_ROOT="$sysroot" \
     GHOST_WISPR_RELEASE_API="$release_api" GHOST_WISPR_STATUS_URL="$status_url" GHOST_WISPR_VERSION_URL="$version_url" \
-    GHOST_WISPR_PROVISION_LOCK="$lock" GHOST_WISPR_SERVE_CALL_TIMEOUT="$serve_call_timeout" \
+    GHOST_WISPR_PROVISION_LOCK="$lock" GHOST_WISPR_TAILSCALE_CALL_TIMEOUT="$tailscale_call_timeout" \
     bash "$dir/provision.sh" "$@" <"${RUN_INPUT:-/dev/null}" >"$work_dir/out" 2>&1 &
   pid=$!
   # The PID that the fake tailscale kills after its reset with TEST_KILL_AFTER_RESET.
@@ -874,7 +916,7 @@ TEST_JOURNAL=$work_dir/journal run_provision "$work_dir/p2-stage"
 cp -- "$TEST_LOG" "$work_dir/first.log"
 cp -- "$work_dir/out" "$work_dir/first.out"
 cp -- "$TEST_LOG.events" "$work_dir/first.events"
-for file in join systemd-run installed-route-overlap-check installed-serve-apply; do
+for file in join systemd-run systemd-run-args installed-route-overlap-check installed-serve-apply; do
   if [[ -f $TEST_LOG.$file ]]; then
     cp -- "$TEST_LOG.$file" "$first_join/${file#installed-}"
   fi
@@ -1005,12 +1047,18 @@ join_command=$(<"$first_join/join")
 [[ $join_command =~ /bin/sh\ $join/($uuid_re)/serve-apply\ $status_url\ 443\ http://127\.0\.0\.1:8080\ \|\|\ rc=\$\?\; ]] \
   || fail "the join does not run the Serve apply of its own run's directory on serve.conf's line: $join_command"
 join_run_id=${BASH_REMATCH[1]}
-[[ $join_command == *"rm -f $join/$join_run_id/route-overlap-check $join/$join_run_id/serve-apply; rmdir $join/$join_run_id;"* ]] \
-  || fail "the join does not remove its run's route check, Serve apply and directory: $join_command"
-[[ $join_command == "exec 9>>$lock && flock 9 || exit 1; printf '%s\\n' 'the join unit ghost-wispr-tailnet-join-$join_run_id of provision.sh run $join_run_id' >$lock; "* ]] \
-  || fail "the join does not take the provisioning lock and name itself as its holder first: $join_command"
+stop_post=$(sed -n 's/^--property=ExecStopPost=//p' "$first_join/systemd-run-args")
+[[ $stop_post == "/bin/rm -rf -- $join/$join_run_id" ]] \
+  || fail "the join's unit does not remove its run's directory, the token's, when it stops for any reason (ExecStopPost): ${stop_post:-none}"
+[[ $join_command == *"rm -f $join/$join_run_id/token;"* ]] || fail "the join does not remove its token as soon as tailscale up ends: $join_command"
+[[ $join_command == "exec 9>>$lock && flock 9 || exit 1; printf '%s, PID %s\\n' 'the join unit ghost-wispr-tailnet-join-$join_run_id of provision.sh run $join_run_id' \$\$ >$lock; "* ]] \
+  || fail "the join does not take the provisioning lock and name itself and its PID as its holder first: $join_command"
 [[ $(<"$first_join/systemd-run") == *"--unit=ghost-wispr-tailnet-join-$join_run_id --property=RuntimeMaxSec=900 "* ]] \
   || fail "the join's unit is not named by its run's id, or has no RuntimeMaxSec of 900 s: $(<"$first_join/systemd-run")"
+# The join's token is on a tmpfs, so a reboot clears a token whose unit could not (Sol's review of
+# #203, round 3): the join directory, unless a test names another, is under /run.
+default_join_dir=$(env -u GHOST_WISPR_JOIN_DIR bash -c 'source "$1" && printf "%s" "$JOIN_DIR"' sh "$stage/provision.sh")
+[[ $default_join_dir == /run/* ]] || fail "the join directory is not on /run, a tmpfs: $default_join_dir"
 [[ $join_command == *"--id-token=file:$join/$join_run_id/token "* ]] || fail "the join does not read its run's own token: $join_command"
 [[ -s $first_join/serve-apply ]] || fail 'provision.sh installed no Serve apply for the join'
 [[ $join_command != *"$work_dir/p2-stage"* && $join_command != *serve.conf* ]] \
@@ -1352,6 +1400,48 @@ said 'nothing was changed' || fail "a run while another holds the lock did not s
 cmp -s -- "$renamed" "$TEST_SERVE_STATE" || fail "a run while another holds the lock changed Serve"
 [[ $(<"$lock") == 'provision.sh run 11111111-1111-4111-8111-111111111111, PID 1' ]] \
   || fail "a refused run replaced the holder's line: $(<"$lock")"
+# A lock whose named holder has exited: the contender says so, so no one waits for a PID that is
+# gone (Sol's review of #203, round 3). Break it catches: a contender that names a dead PID as the
+# holder.
+sh -c 'exit 0' &
+dead_pid=$!
+wait "$dead_pid"
+exec 8>>"$lock"
+flock 8
+printf '%s\n' "provision.sh run 22222222-2222-4222-8222-222222222222, PID $dead_pid" >"$lock"
+run_provision "$stage" --key
+exec 8>&-
+expect_refused 'a lock whose holder has exited' \
+  "another provisioning run holds $lock (held by a process that exited: provision.sh run 22222222-2222-4222-8222-222222222222, PID $dead_pid)"
+# The second read of the device's tailnet status, just before the join, never ends (Sol's review of
+# #203, round 3): it ends after its bound, the run fails and names the read, and starts no join.
+# Break it catches: a read with no bound, where the run waits for good with the lock.
+new_pi
+TEST_SELF_STATUS_HANG_FROM=2 run_provision "$stage"
+expect_refused 'a second read of the tailnet status that never ends' \
+  "could not read this device's tailnet status (tailscale status --self --json) before the join"
+[[ ! -e $TEST_LOG.join ]] || fail 'provision.sh started the join although it could not read the tailnet status'
+# Only the run itself holds the lock: a command it started that outlives it does not (Sol's
+# reproduction, round 3: a child that inherited the lock's descriptor kept it after its parent was
+# killed, and contenders named the dead parent). provision.sh is killed, by its exact PID, while its
+# second tailscale read hangs; a run 2 s later gets the lock. Break it catches: a lock that a
+# command of the run inherits.
+new_pi
+rm -f -- "$TEST_LOG.self-hung" "$TEST_LOG.self-calls"
+TEST_SELF_STATUS_HANG_FROM=2 run_provision "$stage" &
+hung_run=$!
+for _ in {1..300}; do
+  [[ ! -f $TEST_LOG.self-hung ]] || break
+  sleep 0.1
+done
+[[ -f $TEST_LOG.self-hung ]] || fail 'control: the second tailscale read never started'
+kill -KILL "$(<"$TEST_LOG.provision-pid")"
+wait "$hung_run" || true
+sleep 2
+run_provision "$stage" --key
+! said 'another provisioning run holds' || fail "a command of a killed run kept the provisioning lock: $(<"$work_dir/out")"
+said 'nothing was changed. A new key needs a new certificate request' \
+  || fail "control: the run after the killed one did not reach provision.sh --key's own check: $(<"$work_dir/out")"
 # Serve that is serve.conf's already for the device's name is left as it is: a reset would stop the
 # page for a moment for nothing. The control of the cases above.
 new_pi
@@ -1434,10 +1524,29 @@ for unreadable in 'an answer that is not a status' 'a read that does not end in 
   else
     TEST_STATUS_CURL_EXIT=28 run_provision "$stage"
   fi
-  expect_refused "a running recorder with $unreadable" 'ghost-wispr.service is active but /api/status gave no status'
+  expect_refused "a running recorder with $unreadable" 'ghost-wispr serve: ghost-wispr.service is active, and /api/status gave no status; Serve was not reset'
   cmp -s -- "$renamed" "$TEST_SERVE_STATE" || fail "provision.sh changed Serve with $unreadable: $(<"$TEST_SERVE_STATE")"
   no_serve_change "a running recorder with $unreadable"
   [[ ! -e $TEST_LOG.join ]] || fail "provision.sh started the join with $unreadable"
+done
+# No status, and no confirmed stopped recorder (Sol's review of #203, round 3): the recorder gives
+# no status, and its manager does not answer within the call bound, answers nothing, or answers a
+# state other than inactive. Only "inactive" lets the reset go on, as in the rename case above; any
+# other answer refuses with exit 75, names the reason, and changes nothing. Sol's reproduction is
+# the manager that hangs: the reset went on after 10 s, like the inactive control. Breaks they catch:
+# an apply that takes a timed-out, failed or other answer for a stopped recorder.
+for manager in 'a manager that does not answer|TEST_SERVICE_STATE_HANG=1|the state of ghost-wispr.service did not come within 5 s' \
+  'a manager read that fails|TEST_SERVICE_STATE_EXIT=1|the state of ghost-wispr.service could not be read (systemctl exit 1)' \
+  'a recorder that is starting|TEST_SERVICE_STATE=activating|ghost-wispr.service is activating'; do
+  IFS='|' read -r what setting reason <<<"$manager"
+  new_pi
+  cp -- "$renamed" "$TEST_SERVE_STATE"
+  export "${setting?}"
+  run_provision "$stage"
+  unset "${setting%%=*}"
+  expect_refused "$what" "ghost-wispr serve: $reason, and /api/status gave no status; Serve was not reset"
+  cmp -s -- "$renamed" "$TEST_SERVE_STATE" || fail "$what: provision.sh changed Serve: $(<"$TEST_SERVE_STATE")"
+  no_serve_change "$what"
 done
 
 # An apply cut short (Sol's review of #203, "Reset scope and interrupted-run recovery"). Sol's case:
@@ -1768,14 +1877,29 @@ prepare_join() {
   [[ " $options " == *' --expand-environment=no '* ]] || command=$(manager_expansion "$command")
 }
 
+# join_stop_post runs the first run's join unit's ExecStopPost, as systemd runs it once the unit's
+# main process has ended, whatever ended it: a normal end, a failure, a kill or RuntimeMaxSec. With
+# no ExecStopPost, it runs nothing.
+join_stop_post() {
+  local stop_post words
+  stop_post=$(sed -n 's/^--property=ExecStopPost=//p' "$first_join/systemd-run-args")
+  [[ -n $stop_post ]] || return 0
+  read -ra words <<<"$stop_post"
+  "${words[@]}"
+}
+
 # run_join ROUTE_ALL STATUS_FIXTURE [STATUS] runs the first run's join command as its unit does, on
-# F-ip-pi and the status fixture STATUS_FIXTURE, as prepare_join readies it. The exit status is kept
-# in join_exit, stdout and stderr in $work_dir/join.out.
+# F-ip-pi and the status fixture STATUS_FIXTURE, as prepare_join readies it: ended after the unit's
+# RuntimeMaxSec, or after RUN_JOIN_LIMIT seconds when that is set, then its ExecStopPost. The exit
+# status is kept in join_exit (124 when the limit ended it), stdout and stderr in $work_dir/join.out.
 run_join() {
+  local limit
   prepare_join "$1" "${@:3}"
+  limit=${RUN_JOIN_LIMIT:-$(sed -n 's/^--property=RuntimeMaxSec=//p' "$first_join/systemd-run-args")}
   join_exit=0
   TEST_NETWORKS="$fixtures/F-ip-pi" TEST_STATUS=$2 PATH="$bin:$PATH" GHOST_WISPR_STATUS_URL="$status_url" \
-    /bin/sh -c "$command" >"$work_dir/join.out" 2>&1 || join_exit=$?
+    timeout --kill-after=1s "${limit:-infinity}" /bin/sh -c "$command" >"$work_dir/join.out" 2>&1 || join_exit=$?
+  join_stop_post
   rm -f -- "$state/active" "$state/status.json"
 }
 
@@ -1793,8 +1917,8 @@ status_read=$(grep -n -F "$status_url" "$TEST_LOG" | head -n1 | cut -d: -f1)
 reset_line=$(grep -n '^tailscale serve reset$' "$TEST_LOG" | head -n1 | cut -d: -f1)
 [[ -n $status_read ]] && ((status_read < reset_line)) || fail "the join's Serve apply did not read the recorder's status before its reset: $(<"$TEST_LOG")"
 [[ ! -e $join_run_dir ]] || fail "the join left its run's directory: $(ls -la "$join_run_dir")"
-[[ $(<"$lock") == "the join unit ghost-wispr-tailnet-join-${join_run_dir##*/} of provision.sh run ${join_run_dir##*/}" ]] \
-  || fail "the join did not name itself in the provisioning lock: $(<"$lock")"
+[[ $(<"$lock") =~ ^the\ join\ unit\ ghost-wispr-tailnet-join-${join_run_dir##*/}\ of\ provision\.sh\ run\ ${join_run_dir##*/},\ PID\ [0-9]+$ ]] \
+  || fail "the join did not name itself and its PID in the provisioning lock: $(<"$lock")"
 [[ $(<"$TEST_ROUTE_ALL") == true ]] || fail "$j1"
 accepted=$(grep -e "^$accepted_prefix" "$work_dir/join.out") || fail "$j1"
 [[ $accepted == *'wlan0 192.168.1.136/24'* && $accepted == *'10.1.0.0/16'* ]] || fail "$j1"
@@ -1890,12 +2014,60 @@ run_provision "$stage"
 rm -f -- "$work_dir/up-hold"
 join_exit=0
 wait "$join_pid" || join_exit=$?
+join_stop_post
 expect_refused 'a run while a join waits in its re-authentication' \
-  "another provisioning run holds $lock (the join unit ghost-wispr-tailnet-join-${join_run_dir##*/} of provision.sh run ${join_run_dir##*/})"
+  "another provisioning run holds $lock (the join unit ghost-wispr-tailnet-join-${join_run_dir##*/} of provision.sh run ${join_run_dir##*/}, PID $join_pid)"
 ! grep -q '^sudo ' "$TEST_LOG" || fail "a run while a join holds the lock ran sudo: $(<"$TEST_LOG")"
 [[ $join_exit == 0 ]] || fail "the join that waited in its re-authentication ended $join_exit: $(<"$work_dir/join.out")"
 serve_is 'the join that waited in its re-authentication' "$want_serve"
 [[ ! -e $join_run_dir ]] || fail "the join that waited left its run's directory: $(ls -la "$join_run_dir")"
+
+# J11 to J13, Sol's cases (review of #203, round 3): a join that stops before its own cleanup leaves
+# no token. The unit's ExecStopPost removes the run's directory, the token's, whatever stopped it;
+# J1 and J5 are the normal end and a returned failure. Breaks they catch: a join unit with no
+# ExecStopPost, whose token stays on disk.
+# J11: the join's main process is killed, by its exact PID, inside tailscale up.
+: >"$work_dir/up-hold"
+prepare_join false
+TEST_UP_HOLD=$work_dir/up-hold TEST_NETWORKS="$fixtures/F-ip-pi" TEST_STATUS="$fixtures/F-status-router" PATH="$bin:$PATH" \
+  GHOST_WISPR_STATUS_URL="$status_url" /bin/sh -c "$command" >"$work_dir/join.out" 2>&1 &
+join_pid=$!
+for _ in {1..100}; do
+  ! grep -q '^tailscale up ' "$TEST_LOG" || break
+  sleep 0.1
+done
+grep -q '^tailscale up ' "$TEST_LOG" || fail 'control: J11: the join never reached tailscale up'
+kill -KILL "$join_pid"
+wait "$join_pid" || true
+rm -f -- "$work_dir/up-hold"
+join_stop_post
+[[ ! -e $join_run_dir ]] || fail "J11: a join killed inside tailscale up left its token: $(ls -la "$join_run_dir")"
+sleep 0.5
+# J12: RuntimeMaxSec ends the join while it waits for the lock, which another run holds.
+exec 8>>"$lock"
+flock 8
+RUN_JOIN_LIMIT=2 run_join false "$fixtures/F-status-router"
+exec 8>&-
+[[ $join_exit == 124 ]] || fail "control: J12: the join did not wait for the lock until its limit: exit $join_exit"
+! grep -q '^tailscale up ' "$TEST_LOG" || fail 'control: J12: the join ran tailscale up without the lock'
+[[ ! -e $join_run_dir ]] || fail "J12: a join that its limit ended while it waited for the lock left its token"
+# J13: RuntimeMaxSec ends the join inside tailscale up.
+: >"$work_dir/up-hold"
+TEST_UP_HOLD=$work_dir/up-hold RUN_JOIN_LIMIT=2 run_join false "$fixtures/F-status-router"
+rm -f -- "$work_dir/up-hold"
+[[ $join_exit == 124 ]] && grep -q '^tailscale up ' "$TEST_LOG" || fail "control: J13: the limit did not end the join inside tailscale up: exit $join_exit"
+[[ ! -e $join_run_dir ]] || fail "J13: a join that its limit ended inside tailscale up left its token"
+sleep 0.5
+# A join unit that does not start (systemd-run fails): provision.sh removes the run's directory, the
+# token's, itself, and fails. Break it catches: a run that leaves the token when its join never ran.
+new_pi
+TEST_JOIN_START_EXIT=1 run_provision "$stage"
+expect_refused 'a join unit that does not start' 'could not start the join unit'
+failed_unit=$(grep -o -E "ghost-wispr-tailnet-join-$uuid_re" "$TEST_LOG" | head -n1)
+[[ -n $failed_unit ]] || fail "control: the run whose join unit did not start named no join unit: $(<"$TEST_LOG")"
+failed_run_dir=$join/${failed_unit#ghost-wispr-tailnet-join-}
+[[ -d $join && $failed_run_dir =~ ^$join/$uuid_re$ ]] || fail "control: the failed run's directory is not one run directory: $failed_run_dir"
+[[ ! -e $failed_run_dir ]] || fail "a run whose join unit did not start left its token: $(ls -la "$failed_run_dir")"
 
 # route-check: route_row runs the route check provision.sh installed as the join unit runs it,
 # /bin/sh on the file, on the network fixture and the status fixture given third and fourth. It
