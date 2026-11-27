@@ -205,6 +205,7 @@ func TestAnOldBatchJobLeavesTheSummaryMadeAfterARestart(t *testing.T) {
 // did submit answers 200, with the summarization model since moved off the
 // Gemini API.
 func TestPollingAJobThisUnitNeverSubmittedAnswers404(t *testing.T) {
+	runParallel(t)
 	u := newBatchClaimUnit(t)
 	batch := u.submit(t)
 	u.held.change(func(c *config.Config) { c.Summarization.Model = "gateway/chat-example" })

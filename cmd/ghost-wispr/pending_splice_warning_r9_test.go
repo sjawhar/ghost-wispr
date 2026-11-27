@@ -47,6 +47,7 @@ func TestR9RefinementWarningShowsNoProviderMessage(t *testing.T) {
 }
 
 func TestR9RetryThatLeavesRefinementFailedKeepsStatusWarning(t *testing.T) {
+	runParallel(t)
 	store, recording, _ := r4PendingStore(t)
 	registry := newWarningsRegistry()
 	span := storage.DeletedSpan{SessionID: "session", AudioPath: recording}
@@ -70,6 +71,7 @@ func TestR9RetryThatLeavesRefinementFailedKeepsStatusWarning(t *testing.T) {
 }
 
 func TestR9MergedRefinementRetryClearsSessionWarning(t *testing.T) {
+	runParallel(t)
 	store, recording, _ := r4PendingStore(t)
 	const mergedAudio = "first.mp3,second.mp3"
 	if _, err := store.DB().Exec(`UPDATE sessions SET audio_path = ? WHERE id = ?`, mergedAudio, "session"); err != nil {

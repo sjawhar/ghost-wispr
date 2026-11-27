@@ -93,6 +93,7 @@ func startedRetry(t *testing.T, retried <-chan string, sessionID string, want bo
 // nowhere is refused with why; a failed or running refinement is refused and
 // starts nothing.
 func TestADeletionAnswersEachRefinementState(t *testing.T) {
+	runParallel(t)
 	runner, retried := refinementStatesRunner(t)
 	for _, tc := range []struct {
 		session string
@@ -127,6 +128,7 @@ func TestADeletionAnswersEachRefinementState(t *testing.T) {
 // route answered it before the runner made the decision; a refined session
 // under recovery is still refused as restoring.
 func TestAnUnrefinedSessionUnderRecoveryIsToldItIsNotRefined(t *testing.T) {
+	runParallel(t)
 	runner, retried := refinementStatesRunner(t)
 	ctx := context.Background()
 	for _, id := range []string{"running", "refined"} {
@@ -149,6 +151,7 @@ func TestAnUnrefinedSessionUnderRecoveryIsToldItIsNotRefined(t *testing.T) {
 // directly instead of starting Retry refinement, which restores its
 // recording from Drive first.
 func TestADeletionFromALiveOnlySessionRestoresBeforeRefining(t *testing.T) {
+	runParallel(t)
 	runner, retried := refinementStatesRunner(t)
 	if err := runner.DeleteRefinedAudio(context.Background(), "live-only", 1, 1); !errors.Is(err, storage.ErrRefinedSegmentsUnavailable) {
 		t.Fatalf("Delete text and audio in a live-only session = %v, want not refined", err)

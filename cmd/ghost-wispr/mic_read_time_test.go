@@ -31,6 +31,7 @@ func (r *readTimes) Write(p []byte) (int, error) {
 // read of the light then made every word in the buffer look said later, and
 // the voice took the end of the question it answers for talk-over.
 func TestTheMicrophonesReadTimeIsMarkedBeforeTheLightCheck(t *testing.T) {
+	runParallel(t)
 	capture := newCaptureGate(nil, nil, nil)
 	var lightAt time.Time
 	capture.checkLight = func() { lightAt = time.Now(); time.Sleep(300 * time.Millisecond) } // a slow read of the light

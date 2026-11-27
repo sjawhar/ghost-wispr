@@ -121,6 +121,7 @@ func envoyConfig(hubURL string) *config.Config {
 // with envoy_hub_url does not publish its events there, or sends any
 // credential: the hub takes a tailnet client's publish with none.
 func TestEnvoyEventsReachTheHubWithNoCredential(t *testing.T) {
+	runParallel(t)
 	hub := newEnvoyHub(t)
 	publishing, warnings := testEnvoyPublishing(t)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -149,6 +150,7 @@ func TestEnvoyEventsReachTheHubWithNoCredential(t *testing.T) {
 // a sweep in between, such as the one configure starts, publishes it again.
 // The control checks that the sweep did publish it a second time.
 func TestASweepDuringAPublishSendsTheEventOnce(t *testing.T) {
+	runParallel(t)
 	hub := newEnvoyHub(t)
 	arrived, release := hub.holdFirstPost(t)
 	publishing, _ := testEnvoyPublishing(t)
@@ -182,6 +184,7 @@ func TestASweepDuringAPublishSendsTheEventOnce(t *testing.T) {
 // envoy_hub_url builds a publisher, or if turning Envoy off leaves the one a
 // settings change built in place.
 func TestEnvoyWithNoHubURLSendsNothing(t *testing.T) {
+	runParallel(t)
 	hub := newEnvoyHub(t)
 	publishing, _ := testEnvoyPublishing(t)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -210,6 +213,7 @@ func TestEnvoyWithNoHubURLSendsNothing(t *testing.T) {
 // publisher that reports itself enabled while every send fails, instead of a
 // /api/status warning.
 func TestANonHTTPHubURLWarnsAndSendsNothing(t *testing.T) {
+	runParallel(t)
 	publishing, warnings := testEnvoyPublishing(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

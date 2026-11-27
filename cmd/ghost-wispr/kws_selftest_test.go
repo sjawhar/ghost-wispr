@@ -18,6 +18,7 @@ const kwsClips = "../../internal/wake/local/testdata"
 // build with no listener it must fail and say so: the release builds with the
 // listener, and a release without it must not pass.
 func TestKWSSelfTestHearsOnlyTheStartPhrase(t *testing.T) {
+	runParallel(t)
 	clips, err := filepath.Glob(filepath.Join(kwsClips, "*.wav"))
 	if err != nil || len(clips) < 9 {
 		t.Fatalf("UNKNOWN: %d stored clips (%v), want 9", len(clips), err)

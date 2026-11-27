@@ -35,6 +35,7 @@ func recorderMeeting(t *testing.T) (meeting func(string) context.Context, end co
 // give the roster the recorder's meeting context, so a membership outlives
 // the recorder's end of its meeting until a hook runs.
 func TestTheRosterReadsTheRecordersMeeting(t *testing.T) {
+	runParallel(t)
 	meeting, end := recorderMeeting(t)
 	roster := startJoinedAgents(t.Context(), &joinedDeps{
 		session:   func() string { return "meeting" },

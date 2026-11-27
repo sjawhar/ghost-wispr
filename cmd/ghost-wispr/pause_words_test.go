@@ -25,6 +25,7 @@ import (
 // the resume run as the capture gate runs them (settleCapturePause, then
 // DiscardPreroll and ResumeCapture).
 func TestWordsFromBeforeAPauseAfterALongOutageDoNotReachTheNextSession(t *testing.T) {
+	runParallel(t)
 	peer, host := startListeningDeepgram(t)
 	store, err := storage.NewSQLiteStore(filepath.Join(t.TempDir(), "ghost-wispr.db"))
 	if err != nil {

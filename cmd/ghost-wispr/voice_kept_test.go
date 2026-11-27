@@ -27,6 +27,7 @@ type plainManager struct{ session.LifecycleManager }
 // resume must reach it. The control, a manager with no MessageKept, lets the
 // late wake through, so the check can fail.
 func TestALateWakeFromBeforeAPauseDoesNotReachTheVoice(t *testing.T) {
+	runParallel(t)
 	for _, tc := range []struct {
 		name     string
 		hideKept bool

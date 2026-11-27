@@ -71,6 +71,7 @@ func TestAnUnsubmittedBatchClaimWhoseFailureWasNotStoredIsTakenAgainInThisRun(t 
 // its results), leaves the session's summary running when its failure write
 // is refused too.
 func TestABatchJobThatWasNotRecordedIsTakenAgainInThisRun(t *testing.T) {
+	runParallel(t)
 	u := newBatchClaimUnit(t)
 	if _, err := u.store.DB().Exec(`CREATE TEMP TRIGGER test_refuse_batch_record BEFORE INSERT ON summary_batches
 		BEGIN SELECT RAISE(ABORT, 'planted: the store refused the batch record'); END`); err != nil {
@@ -92,6 +93,7 @@ func TestABatchJobThatWasNotRecordedIsTakenAgainInThisRun(t *testing.T) {
 // stores its result, and a backlog must not summarize the session again in
 // the meantime.
 func TestARecordedBatchJobKeepsItsClaim(t *testing.T) {
+	runParallel(t)
 	u := newBatchClaimUnit(t)
 	u.submit(t)
 	if got := refinementOf(t, u.store, "session"); got.SummaryStatus != storage.SummaryRunning {

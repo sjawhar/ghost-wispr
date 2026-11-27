@@ -17,6 +17,7 @@ import (
 // (a new registry over the same database); stay off for a replacement owed
 // briefly; and come off once nothing is owed.
 func TestDriveReplacementWarningsComeFromTheStore(t *testing.T) {
+	runParallel(t)
 	path := filepath.Join(t.TempDir(), "ghost-wispr.db")
 	store, err := storage.NewSQLiteStore(path)
 	if err != nil {

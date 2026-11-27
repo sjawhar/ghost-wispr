@@ -56,6 +56,7 @@ func survivorRemovedSourceMerge(t *testing.T) (store *storage.SQLiteStore, dir, 
 // whose recordings could not be restored reading failed, so the page offers
 // Retry refinement.
 func TestMergeHookRecordsAnUnrestorableRefinementAsFailed(t *testing.T) {
+	runParallel(t)
 	store, dir, _ := survivorRemovedSourceMerge(t)
 	source := &r11FolderDrive{files: map[string][]*drive.File{"folder-s": {}}}
 	refine := suiteTwoWordRefine(store)
@@ -77,6 +78,7 @@ func TestMergeHookRecordsAnUnrestorableRefinementAsFailed(t *testing.T) {
 // A merge whose audio was removed before it had a folder of its own still
 // opens Drive, to restore each source's recording from the source's folder.
 func TestEnsureDeletionRecordingsOpensDriveForARemovedMergeWithoutAFolder(t *testing.T) {
+	runParallel(t)
 	store, dir, sPath := survivorRemovedSourceMerge(t)
 	merged, err := store.GetSession("merged")
 	if err != nil {
@@ -106,6 +108,7 @@ func TestEnsureDeletionRecordingsOpensDriveForARemovedMergeWithoutAFolder(t *tes
 // merge checks Drive's copy against the source's own latest cut hash, so a
 // copy from before the cut, which still holds the deleted audio, is refused.
 func TestRestoreChecksTheProvenanceSourcesCutHash(t *testing.T) {
+	runParallel(t)
 	store, dir, sPath := survivorRemovedSourceMerge(t)
 	if _, err := store.DB().Exec(`INSERT INTO deleted_segments(session_id, audio_path, start, end, sha256_before, sha256_after, splice_complete, deleted_at)
 		VALUES('20261113090000', ?, 1, 2, 'before-cut', 'after-cut', 1, '2026-11-13T10:00:00Z')`, sPath); err != nil {

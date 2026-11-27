@@ -62,6 +62,7 @@ func refusingGateway(t *testing.T, refuse *atomic.Bool) (client embedding.Client
 // worked; or if the next index that works leaves it once the backfill it
 // asks for finds no session missing.
 func TestARefusedSearchIndexWarnsOnTheStatusPage(t *testing.T) {
+	runParallel(t)
 	var refuse atomic.Bool
 	refuse.Store(true)
 	client, model, ref := refusingGateway(t, &refuse)

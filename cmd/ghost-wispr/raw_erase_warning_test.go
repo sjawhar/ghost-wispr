@@ -11,6 +11,7 @@ import (
 )
 
 func TestRawEraseReservationWarningAppearsAndClears(t *testing.T) {
+	runParallel(t)
 	store, err := storage.NewSQLiteStore(filepath.Join(t.TempDir(), "ghost-wispr.db"))
 	if err != nil {
 		t.Fatal(err)

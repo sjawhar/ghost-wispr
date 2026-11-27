@@ -46,6 +46,7 @@ func mixerTrace(t *testing.T, stall time.Duration) string {
 // cycle, which shows nothing. The second capture is read with a bound no
 // cycle reaches, since a loaded machine can make a 5 ms turn slow.
 func TestSpeakerTraceCommandPrintsTheSlowCycles(t *testing.T) {
+	runParallel(t)
 	var out, errs bytes.Buffer
 	before := time.Now()
 	path := mixerTrace(t, 300*time.Millisecond)

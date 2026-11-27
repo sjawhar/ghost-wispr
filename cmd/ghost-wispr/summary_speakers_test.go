@@ -93,6 +93,7 @@ func speakerSessionStore(t *testing.T) *storage.SQLiteStore {
 // so the speaker ids it names are guesses from turn order; or if the session
 // it stores the summary for gains the labels in its canonical transcript.
 func TestEverySummaryPathReadsTheSpeakers(t *testing.T) {
+	runParallel(t)
 	presets := map[string]config.Preset{"default": {Description: "general", UserTemplate: "{{transcript}}"}}
 	cfg := config.Summarization{Model: "gemini/gemini-4-carbon", Presets: presets}
 	for _, tc := range []struct {

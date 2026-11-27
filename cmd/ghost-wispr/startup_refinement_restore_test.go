@@ -15,6 +15,7 @@ import (
 )
 
 func TestRefineUnfinishedDeletionRestoresPartialAudio(t *testing.T) {
+	runParallel(t)
 	store, err := storage.NewSQLiteStore(filepath.Join(t.TempDir(), "startup.db"))
 	if err != nil {
 		t.Fatal(err)
@@ -58,6 +59,7 @@ func TestRefineUnfinishedDeletionRestoresPartialAudio(t *testing.T) {
 }
 
 func TestRefineUnfinishedDeletionKeepsMarkerWhenDriveLacksRemovedAudio(t *testing.T) {
+	runParallel(t)
 	store, err := storage.NewSQLiteStore(filepath.Join(t.TempDir(), "startup-missing.db"))
 	if err != nil {
 		t.Fatal(err)

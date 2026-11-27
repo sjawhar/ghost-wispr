@@ -25,6 +25,7 @@ import (
 // record must be done; the session must be backfillable again; and the
 // start's poll of the job must stop.
 func TestABatchJobThatEndsUnsuccessfullyFailsItsSessions(t *testing.T) {
+	runParallel(t)
 	const batchName = "batches/b-1"
 	for _, tc := range []struct {
 		batchState string

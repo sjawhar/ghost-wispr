@@ -13,6 +13,7 @@ import (
 )
 
 func TestR8RecoveryResultsClearPendingWarningThroughStatus(t *testing.T) {
+	runParallel(t)
 	store, recording, _ := r4PendingStore(t)
 	registry := newWarningsRegistry()
 	failSplice := func(context.Context, string, float64, float64) (string, error) {
@@ -39,6 +40,7 @@ func TestR8RecoveryResultsClearPendingWarningThroughStatus(t *testing.T) {
 }
 
 func TestR8RefinementFailureUsesItsOwnStatusWarning(t *testing.T) {
+	runParallel(t)
 	store, recording, _ := r4PendingStore(t)
 	registry := newWarningsRegistry()
 	refinementErr := fmt.Errorf("refine recording 123: %w", errors.New("batch transcription not configured"))
@@ -58,6 +60,7 @@ func TestR8RefinementFailureUsesItsOwnStatusWarning(t *testing.T) {
 }
 
 func TestR8SuccessfulRefinementRetryClearsItsStatusWarning(t *testing.T) {
+	runParallel(t)
 	registry := newWarningsRegistry()
 	span := storage.DeletedSpan{SessionID: "session", AudioPath: "/recordings/session.mp3"}
 	applyPendingSpliceRecoveryWarnings(registry, []pendingSpliceOutcome{{

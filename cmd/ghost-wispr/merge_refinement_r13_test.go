@@ -19,6 +19,7 @@ import (
 // TestR13MergeRouteRefinesBeforeDeletion fails if a normal merge route leaves
 // the new conversation pending forever instead of producing deletable segments.
 func TestR13MergeRouteRefinesBeforeDeletion(t *testing.T) {
+	runParallel(t)
 	store, err := storage.NewSQLiteStore(filepath.Join(t.TempDir(), "merge-route.db"))
 	if err != nil {
 		t.Fatal(err)

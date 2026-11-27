@@ -74,6 +74,7 @@ func (s *refusingDrain) Close() error { return nil }
 // 60.25 s and at 120.002 s, and the review of #130, whose recording at 120 s
 // did not hold it.
 func TestARefusedChunkIsRecordedThroughALongOutage(t *testing.T) {
+	runParallel(t)
 	for _, c := range []struct {
 		name          string
 		outage, late  time.Duration

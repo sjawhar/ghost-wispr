@@ -809,6 +809,7 @@ func TestMicLoopRunsInTheShutdownGroup(t *testing.T) {
 // hung recording write cannot hang the status. The warning size is a tenth of
 // the audio budget.
 func TestRefreshKeptRawRecordings(t *testing.T) {
+	runParallel(t)
 	dir := t.TempDir()
 	store := openKeptStore(t)
 	started := time.Date(2026, 11, 6, 10, 0, 0, 0, time.UTC)
@@ -862,6 +863,7 @@ func TestRefreshKeptRawRecordings(t *testing.T) {
 // kept recording raised the warning. With no budget (0) it warns at once:
 // nothing removes kept recordings.
 func TestKeptRawWarningSizeNeverWraps(t *testing.T) {
+	runParallel(t)
 	if strconv.IntSize < 64 {
 		t.Skip("budgets past 2^31 MB need a 64-bit int")
 	}

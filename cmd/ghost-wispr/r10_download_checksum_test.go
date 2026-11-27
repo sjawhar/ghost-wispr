@@ -13,6 +13,7 @@ import (
 // not; the downloaded pre-cut copy must be removed rather than used for A's
 // deletion.
 func TestR10RejectsDownloadWhoseBytesDifferFromDriveChecksum(t *testing.T) {
+	runParallel(t)
 	fixture := newR9MergedCutFixture(t)
 	fixture.drive.files[1].Sha256Checksum = fixture.deletedC.SHA256After
 	runner := testDeleteRunner(t, &segmentDeleteRunner{

@@ -63,6 +63,7 @@ func (folderBackUploader) DeleteFile(context.Context, string) error { return err
 // while it lasts, and stops once a retry syncs the session into its folder,
 // back on Drive.
 func TestStatusWarnsWhileASessionIsKeptOnThisUnitOnly(t *testing.T) {
+	runParallel(t)
 	const id = "20261001130000"
 	const warning = "1 session is kept on this unit only, because its Drive folder is gone or unreadable; retry sync once the folder is back, or, if its Drive folder was deleted on purpose, remove the session from this unit"
 	store, cfg := recordingMismatchSession(t, id)

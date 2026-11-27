@@ -91,6 +91,7 @@ func (w *writeHookStore) UpdateSummaryAtGeneration(sessionID, title, summary, st
 // still has the transcript generation it read with the text, so a stale one
 // is refused and not published.
 func TestASummaryOfTheTextBeforeADeletionIsNotStored(t *testing.T) {
+	runParallel(t)
 	const id = "session"
 	for _, writer := range []struct {
 		name string
@@ -147,6 +148,7 @@ func TestASummaryOfTheTextBeforeADeletionIsNotStored(t *testing.T) {
 // refused summary nor a failed model call marks the newer run failed, which
 // would let a Drive replacement go ahead before the newer summary is stored.
 func TestAStaleSummaryRunLeavesTheNewerRunRunning(t *testing.T) {
+	runParallel(t)
 	const id = "session"
 	modelDown := errors.New("summarize: model unavailable (503)")
 	for _, writer := range []struct {
@@ -200,6 +202,7 @@ func TestAStaleSummaryRunLeavesTheNewerRunRunning(t *testing.T) {
 // its own summary run started, the empty completion is refused: it would
 // mark the newer run completed before it stored anything.
 func TestAnEmptyBatchSummaryLeavesARunStartedSinceRunning(t *testing.T) {
+	runParallel(t)
 	store, err := storage.NewSQLiteStore(filepath.Join(t.TempDir(), "empty.db"))
 	if err != nil {
 		t.Fatalf("open store: %v", err)
@@ -243,6 +246,7 @@ func TestAnEmptyBatchSummaryLeavesARunStartedSinceRunning(t *testing.T) {
 // summary write after a deletion is refused because its writer did not first
 // bind the empty run to the deletion's generation.
 func TestEmptySummaryWritesStartAtTheDeletionGeneration(t *testing.T) {
+	runParallel(t)
 	const id = "empty-after-delete"
 	newStore := func(t *testing.T) *storage.SQLiteStore {
 		t.Helper()
@@ -306,6 +310,7 @@ func TestEmptySummaryWritesStartAtTheDeletionGeneration(t *testing.T) {
 // completion that read an earlier generation reopens a summary the deletion
 // already completed at its newer generation.
 func TestAStaleEmptyCompletionLeavesANewerCompletedSummary(t *testing.T) {
+	runParallel(t)
 	store, err := storage.NewSQLiteStore(filepath.Join(t.TempDir(), "stale-empty.db"))
 	if err != nil {
 		t.Fatal(err)
@@ -353,6 +358,7 @@ func TestAStaleEmptyCompletionLeavesANewerCompletedSummary(t *testing.T) {
 // TestStartupBackfillCompletesAnEmptySummaryLeftRunning fails if a stop left
 // an empty summary running and startup refuses to finish that same generation.
 func TestStartupBackfillCompletesAnEmptySummaryLeftRunning(t *testing.T) {
+	runParallel(t)
 	store, err := storage.NewSQLiteStore(filepath.Join(t.TempDir(), "running-empty.db"))
 	if err != nil {
 		t.Fatal(err)

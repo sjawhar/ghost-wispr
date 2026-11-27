@@ -47,6 +47,7 @@ func (g *gatedManager) MessageKeptOn(stream session.LiveStream, mr *api.MessageR
 // the client held its lock while the socket's close waited for the reader,
 // and the reader waited for that lock to time the words (CapturedSince).
 func TestClosingLiveTranscriptionWhileItHandsOnAResultReturns(t *testing.T) {
+	runParallel(t)
 	peer, host := startListeningDeepgram(t)
 	store, err := storage.NewSQLiteStore(filepath.Join(t.TempDir(), "ghost-wispr.db"))
 	if err != nil {

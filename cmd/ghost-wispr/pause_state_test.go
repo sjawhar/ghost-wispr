@@ -163,6 +163,7 @@ func TestAStoreWriteFailureIsReported(t *testing.T) {
 // TestPauseHTTPPersists fails if the public pause route bypasses the durable
 // controls that the physical button uses.
 func TestPauseHTTPPersists(t *testing.T) {
+	runParallel(t)
 	store, err := storage.NewSQLiteStore(t.TempDir() + "/state.db")
 	if err != nil {
 		t.Fatal(err)
@@ -338,6 +339,7 @@ func TestAPauseDuringAStartsOpenCancelsTheStart(t *testing.T) {
 // TestRefusedResumeHTTPReturns500 fails if the public resume route reports
 // success after the pre-resume light confirmation refuses it.
 func TestRefusedResumeHTTPReturns500(t *testing.T) {
+	runParallel(t)
 	store, err := storage.NewSQLiteStore(t.TempDir() + "/state.db")
 	if err != nil {
 		t.Fatal(err)
@@ -515,6 +517,7 @@ func TestPersistentControlsAnnounceHTTPAndPowerTransitions(t *testing.T) {
 }
 
 func TestSeedPausedStatePersistsBeforeTestInstanceStarts(t *testing.T) {
+	runParallel(t)
 	dbPath := filepath.Join(t.TempDir(), "ghost-wispr.db")
 	configPath := filepath.Join(t.TempDir(), "ghost-wispr.yaml")
 	if err := os.WriteFile(configPath, []byte("db_path: "+dbPath+"\n"), 0o600); err != nil {

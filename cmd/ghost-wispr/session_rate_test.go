@@ -51,6 +51,7 @@ func setRate(t *testing.T, recorder interface{ SetSampleRate(int) error }, rate 
 // the light refused, then a retry that opened at 16000 Hz. The control sets
 // the rate before the session starts.
 func TestASessionStartedBeforeTheMicOpensIsSavedAtTheMicsRate(t *testing.T) {
+	runParallel(t)
 	for _, tool := range []string{"ffmpeg", "ffprobe"} {
 		if _, err := exec.LookPath(tool); err != nil {
 			t.Skipf("%s is not installed: %v", tool, err)

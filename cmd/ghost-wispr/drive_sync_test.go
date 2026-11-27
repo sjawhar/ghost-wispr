@@ -87,6 +87,7 @@ func (*countingSyncer) RecordingsMatch(context.Context, string, map[string]strin
 // sweep keeps running through sync turned off and on, and syncs nothing while
 // it is off.
 func TestDriveSyncSweepSurvivesSyncTurnedOffAndOn(t *testing.T) {
+	runParallel(t)
 	drive := &driveSync{}
 	syncer := &countingSyncer{}
 	drive.Set(syncer)
@@ -130,6 +131,7 @@ func TestDriveSyncSweepSurvivesSyncTurnedOffAndOn(t *testing.T) {
 // and GC, which follows the config, ran ungated beside it. The running sync
 // now follows the last config saved.
 func TestDriveSyncFollowsTheLastOfTwoConcurrentSettingsChanges(t *testing.T) {
+	runParallel(t)
 	cfgStore, _, err := config.NewStore("")
 	if err != nil {
 		t.Fatalf("config store: %v", err)

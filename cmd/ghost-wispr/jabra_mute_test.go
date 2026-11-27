@@ -619,6 +619,7 @@ func TestOpenJabraOpensTheNodeToWrite(t *testing.T) {
 // each recent operation's cover must hold for a report stamped in it, not only
 // the latest one's. The control has no later operation.
 func TestJabraOwnReportReadLateStaysCovered(t *testing.T) {
+	runParallel(t)
 	for _, speechEnds := range []bool{false, true} {
 		name := "control, no later operation"
 		if speechEnds {
@@ -659,6 +660,7 @@ func TestJabraOwnReportReadLateStaysCovered(t *testing.T) {
 // that resumes returns before its resume ends (buttonToggle), so the tap's
 // resume is waited for.
 func TestAResumeTapCostsNoReopen(t *testing.T) {
+	runParallel(t)
 	for _, statusWrite := range []time.Duration{0, 30 * time.Millisecond} {
 		name := "control, the status write is quicker than the red confirmation"
 		if statusWrite > 0 {

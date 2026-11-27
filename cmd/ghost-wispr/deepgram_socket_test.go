@@ -144,6 +144,7 @@ func dialDeepgramEndpoint(t *testing.T, host string, manager *recordingManager) 
 // KeepAlive: Deepgram closes a socket that gets no audio and no KeepAlive for
 // about 10 s, as it does across a pause in speech.
 func TestDeepgramSocketSendsKeepAliveWhileIdle(t *testing.T) {
+	runParallel(t)
 	fake, host := startDeepgramEndpoint(t)
 	dialDeepgramEndpoint(t, host, nil)
 	fake.waitFor(t, deepgramKeepAliveEvery+2*time.Second, "KeepAlive")

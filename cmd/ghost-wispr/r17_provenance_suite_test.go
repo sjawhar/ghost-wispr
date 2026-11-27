@@ -106,12 +106,14 @@ func suiteProvenanceDelete(t *testing.T, refinedFirst bool) string {
 }
 
 func TestSuiteR17ProvenanceDeleteRefinedSourceControl(t *testing.T) {
+	runParallel(t)
 	if got := suiteProvenanceDelete(t, true); !strings.Contains(got, "second-20261113090000") {
 		t.Errorf("control: refined source lost its other words: %q", got)
 	}
 }
 
 func TestSuiteR17ProvenanceDeleteUnrefinedSource(t *testing.T) {
+	runParallel(t)
 	if got := suiteProvenanceDelete(t, false); !strings.Contains(got, "second-20261113090000") {
 		t.Errorf("an unrefined restored source lost its other words on a delete: %q", got)
 	}

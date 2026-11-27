@@ -105,12 +105,14 @@ func reviewR19RestoredThenMergedDelete(t *testing.T, throughRestore bool) string
 }
 
 func TestReviewR19RestoredSourceDeleteControl(t *testing.T) {
+	runParallel(t)
 	if got := reviewR19RestoredThenMergedDelete(t, false); !strings.Contains(got, "second-20261113090000") {
 		t.Errorf("control: R lost its other words without recorded file names: %q", got)
 	}
 }
 
 func TestReviewR19RestoredSourceDeleteThroughRestore(t *testing.T) {
+	runParallel(t)
 	if got := reviewR19RestoredThenMergedDelete(t, true); !strings.Contains(got, "second-20261113090000") {
 		t.Errorf("a restored source lost all its words on one delete: %q", got)
 	}
@@ -120,6 +122,7 @@ func TestReviewR19RestoredSourceDeleteThroughRestore(t *testing.T) {
 // retry must restore the restored merge's recordings, whose names only the
 // Drive restore saw.
 func TestReviewR19RestoredMergeThenMergedAgain(t *testing.T) {
+	runParallel(t)
 	dir := t.TempDir()
 	store, err := storage.NewSQLiteStore(filepath.Join(t.TempDir(), "r.db"))
 	if err != nil {
@@ -188,6 +191,7 @@ func TestReviewR19RestoredMergeThenMergedAgain(t *testing.T) {
 // lost one of the two recordings the restore saw, so the retry must refuse
 // and name it rather than refine half the conversation.
 func TestReviewR19RestoredMergeRetryNamesAMissingRecording(t *testing.T) {
+	runParallel(t)
 	dir := t.TempDir()
 	store, err := storage.NewSQLiteStore(filepath.Join(t.TempDir(), "missing.db"))
 	if err != nil {
@@ -231,6 +235,7 @@ func TestReviewR19RestoredMergeRetryNamesAMissingRecording(t *testing.T) {
 // transaction: when the names cannot be written, the session is not imported
 // either, so the next restore imports it with its names rather than skip it.
 func TestImportRestoredDriveSessionIsAllOrNothing(t *testing.T) {
+	runParallel(t)
 	store, err := storage.NewSQLiteStore(filepath.Join(t.TempDir(), "atomic.db"))
 	if err != nil {
 		t.Fatal(err)
@@ -273,6 +278,7 @@ func TestImportRestoredDriveSessionIsAllOrNothing(t *testing.T) {
 // A Drive restore records each file name directly in restored_recordings,
 // never in recording_sources: the latter is only merge provenance.
 func TestImportRestoredDriveSessionKeepsNamesOutOfMergeProvenance(t *testing.T) {
+	runParallel(t)
 	store, err := storage.NewSQLiteStore(filepath.Join(t.TempDir(), "names.db"))
 	if err != nil {
 		t.Fatal(err)

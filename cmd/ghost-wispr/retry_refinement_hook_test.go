@@ -21,6 +21,7 @@ import (
 )
 
 func TestRetryRefinementHookRestoresThenEnablesDeletion(t *testing.T) {
+	runParallel(t)
 	store, err := storage.NewSQLiteStore(filepath.Join(t.TempDir(), "retry.db"))
 	if err != nil {
 		t.Fatal(err)
@@ -109,6 +110,7 @@ func TestRetryRefinementHookRestoresThenEnablesDeletion(t *testing.T) {
 }
 
 func TestRetryRefinementHookWarnsWhenRestoreFails(t *testing.T) {
+	runParallel(t)
 	store, err := storage.NewSQLiteStore(filepath.Join(t.TempDir(), "warning.db"))
 	if err != nil {
 		t.Fatal(err)

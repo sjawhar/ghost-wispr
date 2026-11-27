@@ -27,6 +27,7 @@ func (f failingReportedSummarizer) SummarizeReported(context.Context, string, st
 // away the session's last good summary. The session is the one the
 // re-proof of 2026-11-20 planted: a last good summary, its summary failed.
 func TestABackfilledSummaryThatFailsSaysWhy(t *testing.T) {
+	runParallel(t)
 	store := summaryStore(t, "We agreed on the launch date and the docking fix for the warehouse robot this week.")
 	if _, err := store.DB().Exec(`UPDATE sessions SET title = 'Planted', summary = 'Last good summary.', summary_status = ? WHERE id = ?`, storage.SummaryFailed, summarySessionID); err != nil {
 		t.Fatal(err)

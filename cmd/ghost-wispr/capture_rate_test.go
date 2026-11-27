@@ -20,6 +20,7 @@ import (
 // database, so that the next start saves a raw recording the stop kept at the
 // rate it was captured at. Before, 2 s captured at 48000 Hz were saved as 6 s.
 func TestARawKeptAfterAStopIsSavedAtItsTrueDuration(t *testing.T) {
+	runParallel(t)
 	for _, tool := range []string{"ffmpeg", "ffprobe"} {
 		if _, err := exec.LookPath(tool); err != nil {
 			t.Skipf("%s is not installed: %v", tool, err)

@@ -62,6 +62,7 @@ func TestAGateClosingReachesTheConcierge(t *testing.T) {
 // through the API or the GC, does not reach the Concierge once it runs, or
 // does anything but nothing before it runs.
 func TestConciergeSessionHooks(t *testing.T) {
+	runParallel(t)
 	var hooks conciergeHooks
 	hooks.SessionEnded("before")
 	hooks.SessionsDeleted([]string{"before"})

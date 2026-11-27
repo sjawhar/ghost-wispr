@@ -215,6 +215,7 @@ func TestDeletionCutFixturesBackThePadComment(t *testing.T) {
 // left a deleted word heard next to it is accepted, or if the check does not
 // widen to the next pad and accept that cut when it is clean.
 func TestDeletionCutCheckCatchesALeftoverAndWidens(t *testing.T) {
+	runParallel(t)
 	fixtures := loadDeletionCutFixtures(t)
 	cases := 0
 	for i := range fixtures {
@@ -276,6 +277,7 @@ func TestDeletionCutCheckRefuses(t *testing.T) {
 // TestDeletionCutCheckAcceptsACleanCut fails if a recorded cut that left no
 // deleted word heard is not accepted at once.
 func TestDeletionCutCheckAcceptsACleanCut(t *testing.T) {
+	runParallel(t)
 	fixtures := loadDeletionCutFixtures(t)
 	for i := range fixtures {
 		f := &fixtures[i]

@@ -15,6 +15,7 @@ import (
 // its pre-cut copy, spliced again, checked against its stored post-cut hash,
 // and sent through the pending refinement path.
 func TestR9RecoversLostSplicedRecordingForPendingReplacement(t *testing.T) {
+	runParallel(t)
 	fixture := newR9MergedCutFixture(t)
 	after := []byte("recording C after cut")
 	refined := false
@@ -60,6 +61,7 @@ func TestR9RecoversLostSplicedRecordingForPendingReplacement(t *testing.T) {
 // re-splice does not reproduce the recorded hash leaves the pre-cut bytes on
 // disk, clears the Drive replacement debt, or omits the session from status.
 func TestR9LostCutRecoveryWarnsAndKeepsReplacementOwed(t *testing.T) {
+	runParallel(t)
 	fixture := newR9MergedCutFixture(t)
 	outcomes, err := recoveryRunner(fixture.store, fixture.dir, func(_ context.Context, path string, _, _ float64) (string, error) {
 		if err := os.WriteFile(path, []byte("wrong cut"), 0o600); err != nil {
