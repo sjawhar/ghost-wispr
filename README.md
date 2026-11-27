@@ -38,6 +38,9 @@ Microphone → Deepgram WebSocket → Session Manager → SQLite
 - `internal/voice/` — the meeting voice: the Supervisor, the room-audio tap, the chimes; `internal/voice/tts/` is voice A, `internal/voice/gptlive/` voice B, `internal/voice/dgagent/` voice C
 - `internal/wake/transcript/` — the wake phrase on the live transcript
 - `internal/concierge/`, `internal/dispatch/`, `internal/envoy/` — the Concierge, its Dispatch client and the unit's Envoy session
+- `cmd/ghost-wispr-bridge/` — the call bridge, which runs beside the Attendee meeting bot in a cloud instance (mode `bridge`), and the watcher, which starts and stops that instance from the bot's calendar (mode `watch`); its `callfault` build is the test instance's
+- `internal/call/` — the link between the call bridge and the unit: audio frames, control messages, link versions; `internal/calendar/` — which calendar events bring the bot, and when
+- `tools/callprobe/` — the measuring tool for a test call: delay, echo and the link's ping times
 
 **Frontend** (Svelte 5):
 - PWA with offline support
