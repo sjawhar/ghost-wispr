@@ -173,9 +173,11 @@ func TestEachBotFaultSetsOnlyItsFlag(t *testing.T) {
 
 // A test bridge that starts with a run spec whose end time has passed makes
 // no bot and no link, so a count set to 1 by hand replays nothing (spec, "The
-// test pool"); it stays up, idle, until its context ends. The control, the
-// same start with an end time ahead, makes the run spec's bot through the
-// fake Pi: so the test sees a bot and a link when there is one.
+// test pool"); it stays up, idle, until its context ends. It still logs
+// BRIDGE-START with its instance first, which c-cloudrun-first reads. The
+// control, the same start with an end time ahead, makes the run spec's bot
+// through the fake Pi, and logs BRIDGE-START once: so the test sees a bot and
+// a link when there is one.
 func TestAnExpiredRunSpecMakesNoBotAndNoLink(t *testing.T) {
 	for _, tc := range []struct {
 		name string
@@ -189,7 +191,8 @@ func TestAnExpiredRunSpecMakesNoBotAndNoLink(t *testing.T) {
 			clk := newFakeClock(faultStart)
 			api := newFakeAttendee(clk)
 			log := &faultLog{}
-			s := settings{RunSpecFile: faultWriteSpec(t, faultSpec(tc.end, "fake_pi")), BridgeKey: []byte("bridge-key")}
+			s := settings{RunSpecFile: faultWriteSpec(t, faultSpec(tc.end, "fake_pi")), BridgeKey: []byte("bridge-key"),
+				MetadataURL: botLifeMetadata(t, "faultinstance7")}
 			deps := bridgeDeps{API: api, Clock: clk, Log: log.logger(), Sockets: &botSockets{}}
 
 			b := faultStartBridge(t, &s, &deps)
@@ -207,8 +210,8 @@ func TestAnExpiredRunSpecMakesNoBotAndNoLink(t *testing.T) {
 					t.Fatalf("an expired run spec: bots %+v, Attendee calls %v, link %v; want none", created, api.allCalls(), deps.Link)
 				}
 				lines := log.lines(t)
-				if len(lines) != 1 || lines[0].Message != "RUN-SPEC-REFUSED reason=expired" {
-					t.Fatalf("log = %v, want the one RUN-SPEC-REFUSED reason=expired line", lines)
+				if len(lines) != 2 || lines[0].Message != "BRIDGE-START instance=faultinstance7" || lines[1].Message != "RUN-SPEC-REFUSED reason=expired" {
+					t.Fatalf("log = %v, want BRIDGE-START with the instance, then RUN-SPEC-REFUSED reason=expired", lines)
 				}
 				return
 			}
@@ -217,6 +220,13 @@ func TestAnExpiredRunSpecMakesNoBotAndNoLink(t *testing.T) {
 			}
 			if len(created) != 1 || created[0].MeetingURL != faultMeetURL || created[0].BotName != "Ghost Wispr test (recording)" {
 				t.Fatalf("bots made = %+v, want one bot of the run spec's Meet link named by the fake Pi", created)
+			}
+			var msgs []string
+			for _, l := range log.lines(t) {
+				msgs = append(msgs, l.Message)
+			}
+			if len(msgs) == 0 || msgs[0] != "BRIDGE-START instance=faultinstance7" || botLifeStartLines(msgs) != 1 {
+				t.Fatalf("log = %q, want BRIDGE-START with the instance first and once", msgs)
 			}
 			faultNoMeetURL(t, log)
 		})

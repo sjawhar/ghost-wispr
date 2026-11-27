@@ -676,11 +676,13 @@ func (h *botHarness) deps() bridgeDeps {
 	return d
 }
 
-// start makes a new bridge on the fakes and runs its start.
+// start makes a new bridge on the fakes and runs its start, after the
+// BRIDGE-START line that startBridge logs, as a process of the bridge does.
 func (h *botHarness) start() {
 	h.t.Helper()
 	s := h.s
 	d := h.deps()
+	logBridgeStart(h.ctx, s.MetadataURL, d.Log)
 	h.b = newBridge(&s, &d)
 	h.b.start(h.ctx)
 	h.settle()

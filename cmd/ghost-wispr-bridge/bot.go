@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -268,40 +267,12 @@ func (b *bridge) take(apply func()) {
 	apply()
 }
 
-// start logs the instance, reads Attendee's bots, and makes a first pass.
+// start reads Attendee's bots and makes a first pass. startBridge logged
+// BRIDGE-START before it.
 func (b *bridge) start(ctx context.Context) {
 	b.startedAt = b.clock.Now()
-	b.log.Info("BRIDGE-START instance=" + b.instanceID(ctx))
 	b.restore(ctx)
 	b.joinPass(ctx)
-}
-
-// instanceID reads Cloud Run's id of this instance from the metadata server,
-// so a check can tell a container's restart from the instance's.
-func (b *bridge) instanceID(ctx context.Context) string {
-	if b.s.MetadataURL == "" {
-		return "unknown"
-	}
-	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, b.s.MetadataURL+"/computeMetadata/v1/instance/id", http.NoBody)
-	if err != nil {
-		return "unknown"
-	}
-	req.Header.Set("Metadata-Flavor", "Google")
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		b.log.Warn("INSTANCE-READ-FAILED", "error", errorClass(err))
-		return "unknown"
-	}
-	defer func() { _ = resp.Body.Close() }()
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 256))
-	id := strings.TrimSpace(string(body))
-	if err != nil || resp.StatusCode != http.StatusOK || id == "" || strings.IndexFunc(id, notIDRune) >= 0 {
-		b.log.Warn("INSTANCE-READ-FAILED", "status", resp.StatusCode)
-		return "unknown"
-	}
-	return id
 }
 
 func notIDRune(r rune) bool {

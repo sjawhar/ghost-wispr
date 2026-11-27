@@ -149,11 +149,12 @@ func serveBridge(ctx context.Context, s *settings, log *slog.Logger) error {
 	)
 }
 
-// startBridge applies the test pool's faults, then runs the bridge until ctx
-// ends. A run spec that applyFaults refuses makes no bot and no link; the
-// health server stays up, so Cloud Run does not restart the container in a
-// loop.
+// startBridge logs BRIDGE-START, applies the test pool's faults, then runs
+// the bridge until ctx ends. A run spec that applyFaults refuses makes no bot
+// and no link; the health server stays up, so Cloud Run does not restart the
+// container in a loop.
 func startBridge(ctx context.Context, s *settings, deps *bridgeDeps) error {
+	logBridgeStart(ctx, s.MetadataURL, deps.Log)
 	stop, err := applyFaults(ctx, *s, deps)
 	if err != nil {
 		return &partError{"faults", err}
@@ -163,6 +164,42 @@ func startBridge(ctx context.Context, s *settings, deps *bridgeDeps) error {
 		return nil
 	}
 	return runBridge(ctx, *s, *deps)
+}
+
+// logBridgeStart logs BRIDGE-START with this instance's id once, at the
+// bridge's start and before its run spec is read, so a bridge that refuses
+// its run spec names its instance too (spec, "The call bridge";
+// c-cloudrun-first tells a container's restart from the instance's by it).
+func logBridgeStart(ctx context.Context, metadataURL string, log *slog.Logger) {
+	log.Info("BRIDGE-START instance=" + instanceID(ctx, metadataURL, log))
+}
+
+// instanceID reads Cloud Run's id of this instance from the metadata server
+// at metadataURL; "unknown" when it is not set or the read fails.
+func instanceID(ctx context.Context, metadataURL string, log *slog.Logger) string {
+	if metadataURL == "" {
+		return "unknown"
+	}
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, metadataURL+"/computeMetadata/v1/instance/id", http.NoBody)
+	if err != nil {
+		return "unknown"
+	}
+	req.Header.Set("Metadata-Flavor", "Google")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		log.Warn("INSTANCE-READ-FAILED", "error", errorClass(err))
+		return "unknown"
+	}
+	defer func() { _ = resp.Body.Close() }()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 256))
+	id := strings.TrimSpace(string(body))
+	if err != nil || resp.StatusCode != http.StatusOK || id == "" || strings.IndexFunc(id, notIDRune) >= 0 {
+		log.Warn("INSTANCE-READ-FAILED", "status", resp.StatusCode)
+		return "unknown"
+	}
+	return id
 }
 
 // runAll runs each part until ctx ends; the first part to fail stops the

@@ -205,8 +205,10 @@ func TestTheBridgeLogsOnlyMarkedLines(t *testing.T) {
 	}
 }
 
-func TestTheBridgeLogsItsInstanceAtStart(t *testing.T) {
-	const instance = "0069c7a988e1d4fe5e2f00a1"
+// botLifeMetadata is Cloud Run's metadata server for the instance id alone,
+// and gives its URL.
+func botLifeMetadata(t *testing.T, instance string) string {
+	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Metadata-Flavor") != "Google" {
 			http.Error(w, "missing Metadata-Flavor", http.StatusForbidden)
@@ -218,12 +220,46 @@ func TestTheBridgeLogsItsInstanceAtStart(t *testing.T) {
 		}
 		_, _ = fmt.Fprint(w, instance)
 	}))
-	defer srv.Close()
-	h := newBotHarness(t)
-	h.s.MetadataURL = srv.URL
-	h.start()
-	if msgs := h.logs.messages(t); len(msgs) == 0 || msgs[0] != "BRIDGE-START instance="+instance {
-		t.Fatalf("first log line = %q, want BRIDGE-START with the instance id", msgs)
+	t.Cleanup(srv.Close)
+	return srv.URL
+}
+
+// botLifeStartLines counts the log's BRIDGE-START lines.
+func botLifeStartLines(msgs []string) int {
+	n := 0
+	for _, m := range msgs {
+		if strings.HasPrefix(m, "BRIDGE-START") {
+			n++
+		}
+	}
+	return n
+}
+
+// The bridge's first line is BRIDGE-START with Cloud Run's instance id, once,
+// through main's own path, startBridge: in the release build before the
+// bridge reads Attendee's bots, and in the callfault build also when it
+// refuses its run spec (here none is set), which c-cloudrun-first reads.
+func TestTheBridgeLogsItsInstanceAtStart(t *testing.T) {
+	const instance = "0069c7a988e1d4fe5e2f00a1"
+	clk := newFakeClock(botT0)
+	api := newFakeAttendee(clk)
+	logs := &botLogs{}
+	s := botSettingsForTest()
+	s.MetadataURL = botLifeMetadata(t, instance)
+	deps := bridgeDeps{API: api, Calendar: newFakeCalendar(clk), Clock: clk, Log: newLogger(logs, "bridge", slog.LevelDebug), Sockets: &botSockets{}}
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() { done <- startBridge(ctx, &s, &deps) }()
+	clockWaitFor(t, func() bool {
+		return len(api.callsOf("Bots")) == 1 || strings.Contains(logs.String(), "RUN-SPEC-REFUSED")
+	}, "the bridge's read of Attendee's bots, or its refusal of the run spec")
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("startBridge: %v", err)
+	}
+	msgs := logs.messages(t)
+	if len(msgs) == 0 || msgs[0] != "BRIDGE-START instance="+instance || botLifeStartLines(msgs) != 1 {
+		t.Fatalf("log = %q, want BRIDGE-START with the instance id first and once", msgs)
 	}
 }
 
