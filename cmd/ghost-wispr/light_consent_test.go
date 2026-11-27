@@ -84,7 +84,10 @@ func (l *pluggableLight) isRed() bool {
 
 // startTestLight starts the recording light as the recorder does, on device,
 // checking it every checkEvery and retrying a lost device every few
-// milliseconds.
+// milliseconds. Unless the test gave capture work to run its openings on, it
+// runs them as work the cleanup waits for (joinedWork): their light check
+// reads openBlink1, which the cleanup restores. capture must have nothing
+// running on it yet, no pause or resume: a pause's settling reads the work.
 func startTestLight(t *testing.T, device *pluggableLight, checkEvery time.Duration, capture *captureGate, mic interface{ IsOpen() bool }, warnings *warningsRegistry) *hardwareControl {
 	t.Helper()
 	originalOpen, originalCheck, originalRetry := openBlink1, lightCheckEvery, lightRetryEvery
@@ -99,12 +102,17 @@ func startTestLight(t *testing.T, device *pluggableLight, checkEvery time.Durati
 	lightCheckEvery = checkEvery
 	lightRetryEvery = 5 * time.Millisecond
 	ctx, cancel := context.WithCancel(context.Background())
+	openings := &joinedWork{ctx: ctx, t: t}
+	if capture.background == nil {
+		capture.background = openings
+	}
 	hardware := startHardware(ctx, &config.Config{IndicatorLight: config.IndicatorLightBlink1}, capture, mic, warnings, server.NewHub())
 	t.Cleanup(func() {
 		// Stop first, so a reopening still settling cannot reach openBlink1
 		// once the controller has closed the device.
 		hardware.Stop()
 		cancel()
+		openings.stop()
 		<-hardware.Done()
 		openBlink1, lightCheckEvery, lightRetryEvery = originalOpen, originalCheck, originalRetry
 	})
