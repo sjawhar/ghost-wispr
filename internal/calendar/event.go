@@ -14,9 +14,24 @@ import (
 type Event struct {
 	ID, Organizer, MeetURL string
 	Start, End             time.Time
-	Done                   bool // extendedProperties.private ghostWisprDone
-	Joins                  int  // extendedProperties.private ghostWisprJoins; 0 when unset
+	Done                   bool    // extendedProperties.private ghostWisprDone
+	Joins                  int     // extendedProperties.private ghostWisprJoins; 0 when unset
+	Pending                Pending // extendedProperties.private ghostWisprPending; zero when unset
 }
+
+// Pending is what the bridge still owes for an event, on the calendar so a
+// restart of the bridge does not forget it: the reason it asked the event's
+// bot Bot to leave, and each control for the event that the Pi has not
+// received, from which the Pi publishes call_not_recorded (R2, R14).
+type Pending struct {
+	Leave           BotEnd // EndLeaveRule, EndChatCheckFailed, EndLinkLost or EndSocketFailed; 0 when the bridge asked no bot to leave
+	Bot             string // the bot Leave is for
+	Busy            bool   // a busy for the event
+	ChatCheckFailed bool   // a chat_check with the result failed for the event
+}
+
+// Owes reports whether p holds a control the Pi has not received.
+func (p Pending) Owes() bool { return p.Busy || p.ChatCheckFailed }
 
 // Reader reads the bot user's calendar. Events returns only a call's events
 // (Filter applied), each occurrence of a recurring event its own Event,
@@ -25,6 +40,9 @@ type Reader interface {
 	Events(ctx context.Context, from, to time.Time) ([]Event, error)
 	MarkDone(ctx context.Context, id string) error
 	AddJoin(ctx context.Context, id string) (int, error) // the new count
+	// SetPending writes p as the event's ghostWisprPending; the zero Pending
+	// is the record that owes nothing.
+	SetPending(ctx context.Context, id string, p Pending) error
 }
 
 // Filter says which events are a call's: an organizer whose email domain is

@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -453,5 +454,368 @@ func TestARestartLogsOnlyTheBotsItActsOn(t *testing.T) {
 	}
 	if deletes := h.api.callsOf("DeleteData"); len(deletes) != 1 || deletes[0].ID != "bot_3" {
 		t.Fatalf("DeleteData calls %+v, want bot_3's alone", deletes)
+	}
+}
+
+// restartSentAfterHello gives the control messages the link took from n on,
+// and fails unless the first is the bridge's hello (A1).
+func restartSentAfterHello(t *testing.T, h *botHarness, n int) []call.Control {
+	t.Helper()
+	after := slices.Clone(h.link.sent[n:])
+	if len(after) == 0 || after[0].Type != call.TypeHello {
+		t.Fatalf("messages after the link-up = %+v, want the bridge's hello first", after)
+	}
+	return after
+}
+
+// An owed busy survives a restart of the bridge (R14, spec "One call at a
+// time"): B's end passes while A's bot is on and the link is down, and the
+// bridge stops right after B's done mark. The restarted bridge sends one busy
+// for B, with B's organizer, start and end, once the link is up and after
+// its hello; a second restart sends none.
+func TestAnOwedBusyIsSentOnceAfterABridgeRestart(t *testing.T) {
+	startA := botT0.Add(2 * time.Minute)
+	evB := botCalEvent("evB", startA.Add(10*time.Minute), startA.Add(20*time.Minute))
+	h := newBotHarness(t, botCalEvent("evA", startA, startA.Add(60*time.Minute)), evB)
+	h.start()
+	h.linkUp(botPiHello(botTexts()))
+	h.inCall()
+	h.advanceTo(startA.Add(15 * time.Minute))
+	h.linkDown()
+	// The bridge stops at B's done mark: that write takes effect, and no
+	// later call of the calendar or of Attendee does.
+	stop := &botStopper{armed: true}
+	h.api.stop, h.cal.stop = stop, stop
+	h.advanceTo(startA.Add(21 * time.Minute))
+	if !stop.isDead() || !h.cal.event("evB").Done {
+		t.Fatalf("B's end passed during A's call: stopped %v, B done %v; want B's done mark", stop.isDead(), h.cal.event("evB").Done)
+	}
+	stop.revive()
+	restartBridge(h)
+	h.advance(time.Minute)
+	if n := len(h.link.sentOf(call.TypeBusy)); n != 0 {
+		t.Fatalf("busy sent %d times while the link was down", n)
+	}
+	n := len(h.link.sent)
+	h.linkUp(botPiHello(botTexts()))
+	restartSentAfterHello(t, h, n)
+	busy := h.link.sentOf(call.TypeBusy)
+	if len(busy) != 1 {
+		t.Fatalf("busy controls after the restarted bridge's link-up = %+v, want one for evB", busy)
+	}
+	if got := busy[0].Busy.Event; got.ID != "evB" || got.Organizer != evB.Organizer || !got.Start.Equal(evB.Start) || !got.End.Equal(evB.End) {
+		t.Fatalf("the busy names %+v, want evB's id, organizer, start and end", got)
+	}
+	h.advance(time.Minute)
+	restartBridge(h)
+	h.linkUp(botPiHello(botTexts()))
+	h.advance(time.Minute)
+	if n := len(h.link.sentOf(call.TypeBusy)); n != 1 {
+		t.Fatalf("busy sent %d times over two restarts, want once", n)
+	}
+}
+
+// An owed failed chat_check survives a restart of the bridge (R2): the check
+// fails while the link is down, the bot leaves, and the bridge restarts
+// before the bot's end is seen. The restarted bridge ends the event as Done
+// with no new bot, and sends one failed chat_check once the link is up and
+// after its hello; a second restart sends none.
+func TestAnOwedChatCheckFailureIsSentOnceAfterABridgeRestart(t *testing.T) {
+	h, id := joinOneBot(t)
+	h.admit(id)
+	h.linkDown()
+	h.advance(31 * time.Second)
+	if n := len(h.api.callsOf("Leave")); n != 1 {
+		t.Fatalf("Leave calls after the failed check = %d, want 1", n)
+	}
+	restartBridge(h)
+	h.end(id, "ended", botRecord(h.clk.Now(), "left_meeting", "post_processing_completed")...)
+	h.advance(time.Minute)
+	if checks := h.link.sentOf(call.TypeChatCheck); len(checks) != 0 {
+		t.Fatalf("chat_check sent while the link was down: %+v", checks)
+	}
+	if done, made := h.cal.event("ev1").Done, len(h.api.callsOf("CreateBot")); !done || made != 1 {
+		t.Fatalf("after the failed check's bot ended: done %v, bots made %d; want done and no new bot", done, made)
+	}
+	n := len(h.link.sent)
+	h.linkUp(botPiHello(botTexts()))
+	restartSentAfterHello(t, h, n)
+	checks := h.link.sentOf(call.TypeChatCheck)
+	if len(checks) != 1 || *checks[0].ChatCheck != (call.ChatCheck{Result: "failed", Event: "ev1"}) {
+		t.Fatalf("chat_check controls after the restarted bridge's link-up = %+v, want one failed for ev1", checks)
+	}
+	h.advance(time.Minute)
+	restartBridge(h)
+	h.linkUp(botPiHello(botTexts()))
+	h.advance(time.Minute)
+	if n := len(h.link.sentOf(call.TypeChatCheck)); n != 1 {
+		t.Fatalf("chat_check sent %d times over two restarts, want once", n)
+	}
+}
+
+// The bridge's own leave survives a restart of the bridge before the bot's
+// end is seen (spec, the table of ends): after a leave for a lost link or for
+// a failed socket the end gives a new bot once the link is back, and a leave
+// by the leave rule in the lost link's place stays Done.
+func TestABridgesOwnLeaveSurvivesARestartBeforeTheBotsEnd(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		leave  func(h *botHarness)
+		newBot bool
+	}{
+		{"a leave for a lost link", func(h *botHarness) {
+			h.linkDown()
+			h.advance(2 * time.Minute)
+			h.b.leave(h.ctx, calendar.EndLinkLost)
+			h.settle()
+		}, true},
+		{"a leave for a failed socket", func(h *botHarness) {
+			h.sockets.setClosed(true)
+			h.advance(time.Second)
+			h.advance(300 * time.Second)
+		}, true},
+		{"a leave by the leave rule, in the lost link's place", func(h *botHarness) {
+			h.linkDown()
+			h.advance(2 * time.Minute)
+			h.b.leave(h.ctx, calendar.EndLeaveRule)
+			h.settle()
+		}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h, id := joinOneBot(t)
+			h.inCall()
+			tc.leave(h)
+			if n := len(h.api.callsOf("Leave")); n != 1 {
+				t.Fatalf("Leave calls = %d, want 1", n)
+			}
+			restartBridge(h)
+			h.end(id, "ended", botRecord(h.clk.Now(), "left_meeting", "post_processing_completed")...)
+			h.linkUp(botPiHello(botTexts()))
+			h.advance(time.Minute)
+			made, done := len(h.api.callsOf("CreateBot")), h.cal.event("ev1").Done
+			switch {
+			case tc.newBot && (made != 2 || done):
+				t.Fatalf("after the restart and the bot's end: bots made %d, done %v; want a new bot and the event open", made, done)
+			case !tc.newBot && (made != 1 || !done):
+				t.Fatalf("after the restart and the bot's end: bots made %d, done %v; want no new bot and the event done", made, done)
+			}
+		})
+	}
+}
+
+// restartRecordCalendar is the bot's calendar that keeps each pending record
+// the bridge wrote, with the count of Attendee's Leave calls before it.
+type restartRecordCalendar struct {
+	*fakeCalendar
+	api    *fakeAttendee
+	mu     sync.Mutex
+	writes []restartRecordWrite
+}
+
+type restartRecordWrite struct {
+	p      calendar.Pending
+	leaves int
+}
+
+func (c *restartRecordCalendar) SetPending(ctx context.Context, id string, p calendar.Pending) error {
+	leaves := len(c.api.callsOf("Leave"))
+	c.mu.Lock()
+	c.writes = append(c.writes, restartRecordWrite{p: p, leaves: leaves})
+	c.mu.Unlock()
+	return c.fakeCalendar.SetPending(ctx, id, p)
+}
+
+func (c *restartRecordCalendar) written() []restartRecordWrite {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return slices.Clone(c.writes)
+}
+
+// The bridge writes why it leaves on the event's record before it asks
+// Attendee for the leave, with a failed chat_check the link has not taken, and
+// the record keeps the reason until the bot's end is decided: a Done end
+// clears it after the done mark; a new bot's end keeps it until the new bot
+// is made, so a restart in between still gives the new bot. An owed control
+// is cleared once the link took it.
+func TestTheLeaveReasonIsOnRecordFromBeforeTheLeaveUntilTheEndIsDecided(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		kind     calendar.BotEnd
+		leave    func(h *botHarness, id string)
+		owes     calendar.Pending // what the record owes beside the reason when the bridge leaves
+		linkDown bool             // the link is down at the bot's end
+		newBot   bool
+	}{
+		{"the leave rule", calendar.EndLeaveRule, func(h *botHarness, _ string) {
+			h.inCall()
+			h.advanceTo(botT0.Add(33 * time.Minute))
+		}, calendar.Pending{}, false, false},
+		{"a failed chat check, the link down", calendar.EndChatCheckFailed, func(h *botHarness, id string) {
+			h.admit(id)
+			h.linkDown()
+			h.advance(31 * time.Second)
+		}, calendar.Pending{ChatCheckFailed: true}, true, false},
+		{"a lost link", calendar.EndLinkLost, func(h *botHarness, _ string) {
+			h.inCall()
+			h.linkDown()
+			h.advance(2 * time.Minute)
+			h.b.leave(h.ctx, calendar.EndLinkLost)
+			h.settle()
+		}, calendar.Pending{}, true, true},
+		{"a failed socket", calendar.EndSocketFailed, func(h *botHarness, _ string) {
+			h.inCall()
+			h.sockets.setClosed(true)
+			h.advance(time.Second)
+			h.advance(300 * time.Second)
+		}, calendar.Pending{}, false, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newBotHarness(t, botCalEvent("ev1", botT0.Add(2*time.Minute), botT0.Add(32*time.Minute)))
+			cal := &restartRecordCalendar{fakeCalendar: h.cal, api: h.api}
+			h.calendar = cal
+			h.start()
+			h.linkUp(botPiHello(botTexts()))
+			id := h.api.callsOf("CreateBot")[0].ID
+			tc.leave(h, id)
+			if n := len(h.api.callsOf("Leave")); n != 1 {
+				t.Fatalf("Leave calls = %d, want 1", n)
+			}
+			want := tc.owes
+			want.Leave, want.Bot = tc.kind, id
+			if !slices.Contains(cal.written(), restartRecordWrite{p: want, leaves: 0}) {
+				t.Fatalf("pending records written %+v, want %+v before Attendee's Leave", cal.written(), want)
+			}
+			h.end(id, "ended", botRecord(h.clk.Now(), "left_meeting", "post_processing_completed")...)
+			if tc.linkDown {
+				kept := tc.owes
+				if tc.newBot {
+					kept = want
+				}
+				if got := h.cal.event("ev1").Pending; got != kept {
+					t.Fatalf("the record after the bot's end, the link down = %+v, want %+v", got, kept)
+				}
+				h.linkUp(botPiHello(botTexts()))
+			}
+			h.advance(confirmAfter + tickEvery) // a link keeps what the record owed
+			if made, done := len(h.api.callsOf("CreateBot")), h.cal.event("ev1").Done; (made == 2) != tc.newBot || done == tc.newBot {
+				t.Fatalf("after the bot's end: bots made %d, done %v; want a new bot %v", made, done, tc.newBot)
+			}
+			if got := h.cal.event("ev1").Pending; got != (calendar.Pending{}) {
+				t.Fatalf("the record once the end is decided and the link took what it owed = %+v, want nothing pending", got)
+			}
+		})
+	}
+}
+
+// A restart of the instance loses Attendee's bots with it (A2). The leave
+// the bridge recorded for its bot still decides the event: after a failed
+// chat check the event is done, with no new bot, and an owed chat_check is
+// sent once the link is up; after a lost link a new bot comes, as for a bot
+// that went with the instance.
+func TestARestartWithNoBotLeftKeepsItsRecordedLeave(t *testing.T) {
+	t.Run("a failed chat check that the Pi had", func(t *testing.T) {
+		ev := restartInProgress("ev1")
+		ev.Pending = calendar.Pending{Leave: calendar.EndChatCheckFailed, Bot: "bot_9"}
+		h := newBotHarness(t, ev)
+		h.start()
+		h.linkUp(botPiHello(botTexts()))
+		h.advance(time.Minute)
+		if done, made := h.cal.event("ev1").Done, len(h.api.callsOf("CreateBot")); !done || made != 0 {
+			t.Fatalf("done %v, bots made %d; want done and no new bot after a failed chat check", done, made)
+		}
+		if checks := h.link.sentOf(call.TypeChatCheck); len(checks) != 0 {
+			t.Fatalf("chat_check controls = %+v, want none: the record owed none", checks)
+		}
+	})
+	t.Run("a failed chat check", func(t *testing.T) {
+		ev := restartInProgress("ev1")
+		ev.Pending = calendar.Pending{Leave: calendar.EndChatCheckFailed, Bot: "bot_9", ChatCheckFailed: true}
+		h := newBotHarness(t, ev)
+		h.start()
+		h.linkUp(botPiHello(botTexts()))
+		h.advance(time.Minute)
+		if done, made := h.cal.event("ev1").Done, len(h.api.callsOf("CreateBot")); !done || made != 0 {
+			t.Fatalf("done %v, bots made %d; want done and no new bot after a failed chat check", done, made)
+		}
+		if checks := h.link.sentOf(call.TypeChatCheck); len(checks) != 1 || *checks[0].ChatCheck != (call.ChatCheck{Result: "failed", Event: "ev1"}) {
+			t.Fatalf("chat_check controls = %+v, want one failed for ev1", checks)
+		}
+	})
+	t.Run("a lost link", func(t *testing.T) {
+		ev := restartInProgress("ev1")
+		ev.Pending = calendar.Pending{Leave: calendar.EndLinkLost, Bot: "bot_9"}
+		h := newBotHarness(t, ev)
+		h.start()
+		h.linkUp(botPiHello(botTexts()))
+		if done, made := h.cal.event("ev1").Done, len(h.api.callsOf("CreateBot")); done || made != 1 {
+			t.Fatalf("done %v, bots made %d; want a new bot after a lost link", done, made)
+		}
+	})
+}
+
+// A restart that finds a busy on record whose done mark had not landed sends
+// it once: the restart marks the event done, so its pass does not find the
+// same busy again.
+func TestAnOwedBusyWhoseDoneMarkDidNotLandIsSentOnce(t *testing.T) {
+	evB := botCalEvent("evB", botT0.Add(-8*time.Minute), botT0.Add(-time.Minute))
+	evB.Pending = calendar.Pending{Busy: true}
+	h := newBotHarness(t, restartInProgress("evA"), evB)
+	h.api.bots = append(h.api.bots, &bot{ID: "bot_1", State: "joined_recording", EventID: "evA", Nonce: "nonce-1", Events: restartRecord()})
+	h.api.chats["bot_1"] = []chatMessage{{ID: "c1", SenderID: "bot-device", Text: botTexts().Consent, At: botT0.Add(-5*time.Minute + 2*time.Second)}}
+	h.start()
+	h.linkUp(botPiHello(botTexts()))
+	h.advance(time.Minute)
+	if busy := h.link.sentOf(call.TypeBusy); len(busy) != 1 || busy[0].Busy.Event.ID != "evB" {
+		t.Fatalf("busy controls = %+v, want one for evB", busy)
+	}
+	if !h.cal.event("evB").Done {
+		t.Fatal("evB is not done after its busy")
+	}
+}
+
+// A link's send queue takes a control before its writer writes it (C2's
+// queue), so a link that drops right after it took an owed busy may have
+// lost it: the busy stays on B's record, the bridge sends it again on the
+// next link after its hello, and takes it off the record only once a link
+// stayed up a while after taking it. The Pi drops a repeat by its event id.
+func TestAnOwedBusyIsSentAgainWhenTheLinkDropsRightAfterTakingIt(t *testing.T) {
+	startA := botT0.Add(2 * time.Minute)
+	h := newBotHarness(t,
+		botCalEvent("evA", startA, startA.Add(60*time.Minute)),
+		botCalEvent("evB", startA.Add(10*time.Minute), startA.Add(20*time.Minute)))
+	h.start()
+	h.linkUp(botPiHello(botTexts()))
+	h.inCall()
+	h.advanceTo(startA.Add(15 * time.Minute))
+	h.linkDown()
+	h.advanceTo(startA.Add(30 * time.Minute))
+	h.linkUp(botPiHello(botTexts()))
+	if n := len(h.link.sentOf(call.TypeBusy)); n != 1 {
+		t.Fatalf("busy sent %d times at the link-up, want once", n)
+	}
+	h.linkDown()
+	h.advance(time.Second)
+	if !h.cal.event("evB").Pending.Busy {
+		t.Fatalf("B's record after the link dropped = %+v, want the busy still owed", h.cal.event("evB").Pending)
+	}
+	n := len(h.link.sent)
+	h.linkUp(botPiHello(botTexts()))
+	restartSentAfterHello(t, h, n)
+	if busy := h.link.sentOf(call.TypeBusy); len(busy) != 2 || busy[1].Busy.Event.ID != "evB" {
+		t.Fatalf("busy controls after the next link-up = %+v, want B's again", busy)
+	}
+	// A link that drops and comes back between two ticks: its hello ends
+	// the link that took the busy.
+	h.linkDown()
+	h.linkUp(botPiHello(botTexts()))
+	if n := len(h.link.sentOf(call.TypeBusy)); n != 3 {
+		t.Fatalf("busy sent %d times after a link-up with no tick since the drop, want 3", n)
+	}
+	h.advance(time.Minute)
+	if n := len(h.link.sentOf(call.TypeBusy)); n != 3 {
+		t.Fatalf("busy sent %d times on a link that stayed up, want no more", n)
+	}
+	if got := h.cal.event("evB").Pending; got != (calendar.Pending{}) {
+		t.Fatalf("B's record once a link kept the busy = %+v, want nothing pending", got)
 	}
 }

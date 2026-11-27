@@ -15,9 +15,12 @@ const (
 
 // KeepsPoolUp reports whether e keeps the call pool up at now: from PoolLead
 // before its start until it is done, or until PoolHold after its end,
-// whichever comes first.
+// whichever comes first. An event that owes the Pi a control (a busy, or a
+// failed chat_check, the link has not taken) keeps it up also while it is
+// done, until PoolHold after its end, so the bridge sends it once the link is
+// back and the Pi publishes call_not_recorded (R2, R14).
 //
 //nolint:gocritic // hugeParam: the contract passes Event by value
 func KeepsPoolUp(e Event, now time.Time) bool {
-	return !e.Done && !now.Before(e.Start.Add(-PoolLead)) && now.Before(e.End.Add(PoolHold))
+	return (!e.Done || e.Pending.Owes()) && !now.Before(e.Start.Add(-PoolLead)) && now.Before(e.End.Add(PoolHold))
 }

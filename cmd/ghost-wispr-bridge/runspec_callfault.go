@@ -162,8 +162,9 @@ func isMeetLink(s string) bool {
 
 // runSpecCalendar is the test bridge's calendar: one event, the run spec's
 // Meet link from the bridge's start to the run spec's end time, so the
-// bridge's own join rules apply to it. Its record (done, joins) lives in the
-// bridge's memory.
+// bridge's own join rules apply to it. Its record (done, joins, pending)
+// lives in the bridge's memory, so a restart of the test bridge starts it
+// again.
 type runSpecCalendar struct {
 	mu    sync.Mutex
 	event calendar.Event
@@ -212,4 +213,14 @@ func (c *runSpecCalendar) AddJoin(_ context.Context, id string) (int, error) {
 	}
 	c.event.Joins++
 	return c.event.Joins, nil
+}
+
+func (c *runSpecCalendar) SetPending(_ context.Context, id string, p calendar.Pending) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if id != c.event.ID {
+		return errEventGone
+	}
+	c.event.Pending = p
+	return nil
 }

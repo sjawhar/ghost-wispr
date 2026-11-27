@@ -14,9 +14,10 @@ func NextToJoin(evs []Event, now time.Time, linkUp, textsGiven, piBuildOK, botIn
 	if !linkUp || !textsGiven || !piBuildOK || botInCall {
 		return Event{}, false
 	}
-	for _, e := range evs {
-		if KeepsPoolUp(e, now) && now.Before(e.End) && e.Start.Sub(now) <= CreateLead && e.Joins < MaxJoins {
-			return e, true
+	for i := range evs {
+		e := &evs[i]
+		if KeepsPoolUp(*e, now) && !e.Done && now.Before(e.End) && e.Start.Sub(now) <= CreateLead && e.Joins < MaxJoins {
+			return *e, true
 		}
 	}
 	return Event{}, false

@@ -11,9 +11,12 @@ import (
 // restore rebuilds the bridge's state from Attendee and the calendar at its
 // start, as it keeps none on disk (spec, "A restart of the bridge"): each
 // bot's event and socket secret, the end of an event whose newest bot ended,
-// and for a bot in a call its roster and whether its chat check passed. It
-// posts no notice before the Pi's texts. On a failed read it tries again
-// after joinEvery, and makes no bot before.
+// and for a bot in a call its roster and whether its chat check passed. Each
+// event's pending record gives the controls the Pi has not received, sent
+// once the link is up, and why the bridge asked its bot to leave, which
+// decides that bot's end (pending.go). It posts no notice before the Pi's
+// texts. On a failed read it tries again after joinEvery, and makes no bot
+// before.
 func (b *bridge) restore(ctx context.Context) {
 	b.lastRestore = b.clock.Now()
 	cctx, cancel := context.WithTimeout(ctx, callLimit)
@@ -31,8 +34,9 @@ func (b *bridge) restore(ctx context.Context) {
 	}
 	b.restored = true
 	events := make(map[string]calendar.Event, len(evs))
-	for _, e := range evs {
-		events[e.ID] = e
+	for i := range evs {
+		events[evs[i].ID] = evs[i]
+		b.restoreRecord(ctx, &evs[i])
 	}
 	// Attendee lists the bots oldest first: an event's newest bot is its
 	// last.
@@ -64,7 +68,8 @@ func (b *bridge) restore(ctx context.Context) {
 		}
 		acted++
 		lb := newLiveBot(bt.ID, bt.Nonce, &ev, now)
-		lb.adopted, lb.state = true, bt.State
+		lb.adopted, lb.state, lb.leaving = true, bt.State, leavingState(bt.State)
+		b.restoreLeave(lb)
 		// A bot whose record holds no event yet (one Attendee scheduled for
 		// its join_at) counts from the bridge's start, the first time this
 		// bridge knows.
@@ -100,28 +105,35 @@ func (b *bridge) restore(ctx context.Context) {
 	}
 	// A2: an event in progress whose bot went with the instance gets a new
 	// bot through the pass, or at its join limit is done, so the pool can
-	// stop.
-	for _, e := range evs {
-		if e.Done || e.Joins == 0 || held[e.ID] || now.Before(e.Start) || !now.Before(e.End) {
+	// stop. A leave the bridge had asked of that bot still decides by its
+	// reason on record.
+	for i := range evs {
+		e := &evs[i]
+		if e.Done || b.done[e.ID] || e.Joins == 0 || held[e.ID] || now.Before(e.Start) || !now.Before(e.End) {
 			continue
 		}
-		if calendar.EndResult(calendar.EndInstanceRestarted, e, now) == calendar.Done {
-			b.log.Info("BOT-END event=" + e.ID + " end=instance_restarted result=done")
+		kind := calendar.EndInstanceRestarted
+		if r := b.records[e.ID]; r != nil && r.held.Leave != 0 {
+			kind = r.held.Leave
+		}
+		if calendar.EndResult(kind, *e, now) == calendar.Done {
+			b.log.Info("BOT-END event=" + e.ID + " end=" + endName(kind) + " result=done")
 			b.markDone(ctx, e.ID)
 		}
 	}
 }
+
+// leavingState: Attendee took a leave of the bot, which it is carrying out.
+func leavingState(s string) bool { return s == "leaving" || s == "post_processing" }
 
 // addExtra holds a second live bot that a restarted bridge found: one call
 // at a time, so it leaves, and its socket secret is not taken (PC14).
 func (b *bridge) addExtra(ctx context.Context, lb *liveBot) {
 	lb.extra = true
 	b.others[lb.id] = lb
-	if lb.state == "leaving" || lb.state == "post_processing" {
-		lb.leaving = true
-		return
+	if !lb.leaving {
+		b.departOther(ctx, lb)
 	}
-	b.departOther(ctx, lb)
 }
 
 // adoptInCall rebuilds a joined bot's call: its admission from its record,

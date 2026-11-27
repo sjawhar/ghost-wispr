@@ -17,12 +17,18 @@ const joinEvery = 30 * time.Second
 // link-up and at each bot's end, beside the loop: then it marks an event busy
 // whose end passed during another call, removes a bot whose event no longer
 // asks for it, and makes the next event's bot (R14). It first tries again
-// each done mark that has not landed.
+// each write of an event's record that has not landed: a done mark, or a
+// pending record.
 func (b *bridge) joinPass(ctx context.Context) {
 	now := b.clock.Now()
 	b.lastPass = now
 	for id := range b.markOwed {
-		b.markDone(ctx, id)
+		b.writeRecord(ctx, id)
+	}
+	for id, r := range b.records {
+		if r.want != r.held {
+			b.writeRecord(ctx, id)
+		}
 	}
 	if !b.restored || b.idle {
 		return
@@ -84,18 +90,21 @@ func (b *bridge) takePass(ctx context.Context, evs []calendar.Event, err error) 
 }
 
 // markBusy marks each event done whose end passed while this bot was on, and
-// keeps its busy message until the link takes it: one call at a time.
+// keeps its busy message until a link keeps it: one call at a time. The busy
+// goes on the event's record before its done mark.
 func (b *bridge) markBusy(ctx context.Context, evs []calendar.Event, now time.Time, lb *liveBot) {
 	if lb == nil {
 		return
 	}
-	for _, e := range evs {
+	for i := range evs {
+		e := &evs[i]
 		if e.Done || e.ID == lb.event.ID || !e.End.After(lb.created) || now.Before(e.End) {
 			continue
 		}
 		b.log.Info("BUSY event=" + e.ID)
+		busy := busyControl(e)
+		b.keep(&busy)
 		b.markDone(ctx, e.ID)
-		b.keep(&call.Control{Type: call.TypeBusy, Busy: &call.Busy{Event: callEvent(&e)}})
 	}
 }
 
@@ -153,6 +162,9 @@ func (b *bridge) resolveAttempt(ctx context.Context) bool {
 		b.bot = lb
 		b.log.Info(fmt.Sprintf("BOT-FOUND bot=%s event=%s joins=%d", bt.ID, at.event.ID, at.joins))
 		b.sendCall(&at.event, botJoining)
+		if b.clearLeave(at.event.ID) {
+			b.writeRecord(ctx, at.event.ID)
+		}
 		return false
 	}
 	b.sockets.Retire(at.nonce)
@@ -165,8 +177,16 @@ func (b *bridge) resolveAttempt(ctx context.Context) bool {
 
 // createBot makes the event's bot: its socket secret registered and its join
 // counted before Attendee makes it. A CreateBot that fails is kept, since
-// Attendee may have made the bot.
+// Attendee may have made the bot. The event's earlier bot's leave reason is
+// cleared once the new bot is made: until then a restart still decides that
+// bot's end by it.
 func (b *bridge) createBot(ctx context.Context, ev *calendar.Event, texts *call.Texts, now time.Time) {
+	if b.writing[ev.ID] {
+		// AddJoin sends the event's whole map of private properties, so it
+		// waits for the write of the event's record that runs.
+		b.passAfterWrite = true
+		return
+	}
 	nonce, err := newNonce()
 	if err != nil {
 		b.log.Error("BOT-CREATE-FAILED event="+ev.ID, "error", errorClass(err))
@@ -197,4 +217,7 @@ func (b *bridge) createBot(ctx context.Context, ev *calendar.Event, texts *call.
 	b.bot = lb
 	b.log.Info(fmt.Sprintf("BOT-CREATED bot=%s event=%s joins=%d", bt.ID, ev.ID, joins))
 	b.sendCall(ev, botJoining)
+	if b.clearLeave(ev.ID) {
+		b.writeRecord(ctx, ev.ID)
+	}
 }

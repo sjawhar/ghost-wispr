@@ -167,12 +167,18 @@ type bridge struct {
 	endedBot    *liveBot       // the call's bot that ended since the last pass, for its busy check
 	attempt     *createAttempt // a CreateBot that failed: its bot may exist
 	kept        []call.Control // busy and chat_check messages the link has not taken yet
+	sent        []sentOwed     // owed controls a link took and has not kept long enough (pending.go)
 	done        map[string]bool
 	markOwed    map[string]bool         // events whose done mark has not landed, tried again at each pass
-	marking     map[string]bool         // done marks running beside the loop
+	writing     map[string]bool         // events whose record a write beside the loop changes: one at a time (pending.go)
+	records     map[string]*eventRecord // events' pending records (pending.go)
 	deleteOwed  map[string][]owedDelete // Done ends' delete_data waiting for the done mark
 	idle        bool                    // the run spec's end_time passed: no more bots
 	rate        rateCount
+
+	// passAfterWrite: a pass's next bot waits for a write of its event's
+	// record, whose end makes the pass again.
+	passAfterWrite bool
 
 	results  chan func() // results of the calls beside the loop, applied on it
 	inflight int         // calls beside the loop whose result the loop has not applied
@@ -220,6 +226,7 @@ type liveBot struct {
 	notices    consentNotices
 
 	leaveKind  calendar.BotEnd // why the bridge asked the bot to leave; zero when it has not
+	leaveAsked time.Time       // when the bridge first asked for the leave
 	leaving    bool            // Attendee took the leave
 	departing  bool            // a leave of a bot beside the call's runs beside the loop
 	lastPoll   time.Time
@@ -237,7 +244,7 @@ func newBridge(s *settings, d *bridgeDeps) *bridge {
 		s: s, api: d.API, link: d.Link, cal: d.Calendar, clock: d.Clock, log: d.Log, faults: d.Faults,
 		sockets: d.Sockets, webhooks: d.Webhooks, audio: d.Audio,
 		others: map[string]*liveBot{}, done: map[string]bool{}, markOwed: map[string]bool{},
-		marking: map[string]bool{}, deleteOwed: map[string][]owedDelete{},
+		writing: map[string]bool{}, records: map[string]*eventRecord{}, deleteOwed: map[string][]owedDelete{},
 		results: make(chan func()),
 	}
 }
@@ -289,8 +296,8 @@ func logID(id string) string {
 }
 
 // tick runs once a second: the run's end time, the bot's time bounds, the
-// rate count's windows, the kept messages, the waiting deletions, and the
-// pass every 30 s.
+// rate count's windows, the kept messages and the owed ones a link took, the
+// waiting deletions, and the pass every 30 s.
 func (b *bridge) tick(ctx context.Context) {
 	now := b.clock.Now()
 	if b.link == nil || !b.link.Up() {
@@ -311,6 +318,7 @@ func (b *bridge) tick(ctx context.Context) {
 	}
 	b.pollOthers(ctx, now)
 	b.closeRate(now)
+	b.confirmSent(ctx, now)
 	b.flushKept()
 	b.deleteDue(ctx, now)
 	if now.Sub(b.lastPass) >= joinEvery {
@@ -441,19 +449,32 @@ func (b *bridge) depart(ctx context.Context, lb *liveBot, limit time.Duration) e
 	return nil
 }
 
-// leave asks Attendee to make the call's bot leave, for kind's reason. T4.4's
-// lost link calls it with EndLinkLost. After a failed chat check the leave is
-// bounded by what is left of its 10 s (R2).
+// leave asks Attendee to make the call's bot leave, for kind's reason, once
+// the reason is on the event's record, so a restart of the bridge before the
+// bot's end reads why it left (spec, the table of ends). T4.4's lost link
+// calls it with EndLinkLost. After a failed chat check the record's write
+// and the leave are bounded by what is left of its 10 s (R2).
 func (b *bridge) leave(ctx context.Context, kind calendar.BotEnd) {
 	lb := b.bot
 	if lb == nil || lb.leaving {
 		return
 	}
 	if lb.leaveKind == 0 {
-		lb.leaveKind = kind
+		lb.leaveKind, lb.leaveAsked = kind, b.clock.Now()
+	}
+	failedCheck := lb.leaveKind == calendar.EndChatCheckFailed
+	recordBy := lb.leaveAsked.Add(leaveRecordWait)
+	if failedCheck {
+		recordBy = lb.admitted.Add(chatCheckWindow + chatLeaveWithin - loopCallLimit)
+	}
+	if !b.recordLeave(ctx, lb, recordBy) {
+		if b.clock.Now().Before(recordBy) {
+			return // asked again at the next tick, or when the running write lands
+		}
+		b.log.Warn(fmt.Sprintf("LEAVE-UNRECORDED bot=%s reason=%s", lb.id, endName(lb.leaveKind)))
 	}
 	limit := loopCallLimit
-	if lb.leaveKind == calendar.EndChatCheckFailed {
+	if failedCheck {
 		if left := lb.admitted.Add(chatCheckWindow + chatLeaveWithin).Sub(b.clock.Now()); left > 0 && left < limit {
 			limit = left
 		}
@@ -463,6 +484,7 @@ func (b *bridge) leave(ctx context.Context, kind calendar.BotEnd) {
 		return
 	}
 	b.log.Info(fmt.Sprintf("LEAVE bot=%s reason=%s", lb.id, endName(lb.leaveKind)))
+	b.writeRecord(ctx, lb.event.ID) // the record the leave did not wait for
 }
 
 // cancel removes the call's bot before its admission, as its event no
@@ -669,12 +691,14 @@ func (b *bridge) reportRate(windows []int) {
 }
 
 // onLink takes the Pi's messages. Each hello is a link-up: the bridge answers
-// it first with its own hello (A1), then sends what waited, then makes a pass.
-// The Pi's other messages are the link's later work (T4.4 on).
+// it first with its own hello (A1), then sends what waited, the owed controls
+// the link before it took and may have lost included, then makes a pass. The
+// Pi's other messages are the link's later work (T4.4 on).
 func (b *bridge) onLink(ctx context.Context, m call.Message) {
 	if m.Control == nil || m.Control.Type != call.TypeHello {
 		return
 	}
+	b.resendSent()
 	now := b.clock.Now()
 	lb := b.bot
 	decided := lb != nil && b.judgeCheck(lb, now)
@@ -724,25 +748,6 @@ func (b *bridge) send(c *call.Control) {
 	}
 	if err := b.link.Send(*c); err != nil {
 		b.log.Warn("LINK-SEND-FAILED type="+c.Type, "error", errorClass(err))
-	}
-}
-
-// keep sends a control message that must reach the Pi, a busy or a
-// chat_check, now or once the link is ready again: the Pi publishes
-// call_not_recorded from either.
-func (b *bridge) keep(c *call.Control) {
-	b.kept = append(b.kept, *c)
-	b.flushKept()
-}
-
-// flushKept sends the kept messages the link has not taken yet, in order.
-func (b *bridge) flushKept() {
-	for len(b.kept) > 0 && b.linkReady() {
-		if err := b.link.Send(b.kept[0]); err != nil {
-			b.log.Warn("LINK-SEND-FAILED type="+b.kept[0].Type, "error", errorClass(err))
-			return
-		}
-		b.kept = b.kept[1:]
 	}
 }
 
@@ -837,35 +842,13 @@ func eventGone(err error) bool {
 }
 
 // markDone records the event done, first in this bridge, then in the
-// calendar beside the loop; a failed write is tried again at each pass. Once
-// it lands, or the calendar no longer has the event, the delete_data that
-// waited for it runs.
+// calendar beside the loop, after any control its record owes (writeRecord);
+// a failed write is tried again at each pass. Once the mark lands, or the
+// calendar no longer has the event, the delete_data that waited for it runs.
 func (b *bridge) markDone(ctx context.Context, id string) {
 	b.done[id] = true
 	b.markOwed[id] = true
-	if b.marking[id] {
-		return
-	}
-	b.marking[id] = true
-	cal := b.cal
-	b.beside(ctx, callLimit, func(cctx context.Context) func() {
-		err := cal.MarkDone(cctx, id)
-		return func() {
-			delete(b.marking, id)
-			switch {
-			case eventGone(err):
-				b.log.Info("MARK-DONE-GONE event=" + id)
-			case err != nil:
-				b.log.Warn("MARK-DONE-FAILED event="+id, "error", errorClass(err))
-				return
-			}
-			delete(b.markOwed, id)
-			for _, d := range b.deleteOwed[id] {
-				b.deleteData(ctx, d.bot)
-			}
-			delete(b.deleteOwed, id)
-		}
-	})
+	b.writeRecord(ctx, id)
 }
 
 // deleteDue runs each delete_data that waited doneWait for its done mark:
@@ -908,7 +891,8 @@ func (b *bridge) deleteData(ctx context.Context, id string) {
 
 // endOf reads how a bot ended from its record, oldest event first, by the
 // spec's table of ends. own is the bridge's reason when it asked the bot to
-// leave; a restarted bridge does not know it, and takes the leave rule.
+// leave; a restarted bridge reads it from the event's record (restoreLeave),
+// and takes the leave rule when the record names none for the bot.
 // MEETING_ENDED's remover is only in the webhook's event metadata, and a
 // removal is Done as an end of the meeting is.
 func endOf(events []botEvent, own calendar.BotEnd) calendar.BotEnd {

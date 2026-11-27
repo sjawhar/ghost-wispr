@@ -7,7 +7,6 @@ import (
 	"time"
 
 	"github.com/sjawhar/ghost-wispr/internal/calendar"
-	"github.com/sjawhar/ghost-wispr/internal/call"
 )
 
 // chatCheckWindow is R2's time for the consent notice's echo, from the
@@ -91,17 +90,20 @@ func (b *bridge) evalCheck(ctx context.Context, lb *liveBot, now time.Time) {
 
 // announceCheck acts on a decided check: the log line, the link's chat_check
 // (kept until the link takes it, so the Pi can publish call_not_recorded) and
-// call messages, and on a failure the leave (R2). A passed check under
-// long_lines posts the test lines.
+// call messages, and on a failure the leave (R2), whose record holds the
+// failed chat_check until a link keeps it. A passed check under long_lines
+// posts the test lines.
 func (b *bridge) announceCheck(ctx context.Context, lb *liveBot) {
-	result := "passed"
+	result := checkResultPassed
 	if lb.check.state == checkFailed {
-		result = "failed"
+		result = checkResultFailed
 	}
 	b.log.Info(fmt.Sprintf("CHAT-CHECK result=%s bot=%s", result, lb.check.sender))
-	b.keep(&call.Control{Type: call.TypeChatCheck, ChatCheck: &call.ChatCheck{Result: result, Event: lb.event.ID}})
+	check := chatCheckControl(result, lb.event.ID)
+	b.keep(&check)
 	if lb.check.state == checkFailed {
 		b.leave(ctx, calendar.EndChatCheckFailed)
+		b.writeRecord(ctx, lb.event.ID) // the owed check, when the leave has not written it
 		return
 	}
 	b.sendCall(&lb.event, botInCall)

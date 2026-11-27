@@ -73,6 +73,11 @@ func (c *watchCalendar) AddJoin(_ context.Context, id string) (int, error) {
 	return 0, errors.New("the watcher only reads")
 }
 
+func (c *watchCalendar) SetPending(_ context.Context, id string, _ calendar.Pending) error {
+	c.t.Errorf("the watcher wrote %s's pending record; it only reads the calendar", id)
+	return errors.New("the watcher only reads")
+}
+
 func (c *watchCalendar) set(events []calendar.Event, err error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()

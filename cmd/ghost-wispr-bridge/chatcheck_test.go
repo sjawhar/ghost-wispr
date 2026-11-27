@@ -216,10 +216,11 @@ func (s *chatcheckStall) first() (time.Time, bool) {
 	return s.reached[0], true
 }
 
-// chatcheckCalendar stalls the calendar's reads while its stall is on.
+// chatcheckCalendar stalls the calendar's reads while its stall is on, and
+// the writes of a pending record while its writes stall is on.
 type chatcheckCalendar struct {
 	*fakeCalendar
-	stall *chatcheckStall
+	stall, writes *chatcheckStall
 }
 
 func (c *chatcheckCalendar) Events(ctx context.Context, from, to time.Time) ([]calendar.Event, error) {
@@ -227,6 +228,13 @@ func (c *chatcheckCalendar) Events(ctx context.Context, from, to time.Time) ([]c
 		return nil, err
 	}
 	return c.fakeCalendar.Events(ctx, from, to)
+}
+
+func (c *chatcheckCalendar) SetPending(ctx context.Context, id string, p calendar.Pending) error {
+	if stalled, err := c.writes.wait(ctx); stalled {
+		return err
+	}
+	return c.fakeCalendar.SetPending(ctx, id, p)
 }
 
 // chatcheckAttendee stalls Attendee's reads of a bot while its stall is on.
@@ -244,20 +252,24 @@ func (a *chatcheckAttendee) Bot(ctx context.Context, id string) (bot, error) {
 
 // R2 and spec Limits: the leave after a failed chat check comes within 10 s
 // of the check's 30 s also while a calendar read or a poll of the bot
-// stalls across the deadline. The test runs runBridge's own loop and moves
+// stalls across the deadline, and while the write of the leave's reason
+// stalls from the deadline on. The test runs runBridge's own loop and moves
 // the clock only while the loop waits for its next tick, so a call that
 // holds the loop fails it.
 func TestAFailedChatCheckLeavesWithin10sWhileACallStalls(t *testing.T) {
-	for _, stalled := range []string{"a calendar read", "a poll of the bot"} {
+	for _, stalled := range []string{"a calendar read", "a poll of the bot", "a write of the leave's reason"} {
 		t.Run(stalled, func(t *testing.T) {
 			clk := newFakeClock(botT0)
 			stall := &chatcheckStall{clock: clk}
 			api := &chatcheckAttendee{fakeAttendee: newFakeAttendee(clk)}
 			cal := &chatcheckCalendar{fakeCalendar: newFakeCalendar(clk, botCalEvent("ev1", botT0.Add(2*time.Minute), botT0.Add(32*time.Minute)))}
-			if stalled == "a calendar read" {
+			switch stalled {
+			case "a calendar read":
 				cal.stall = stall
-			} else {
+			case "a poll of the bot":
 				api.stall = stall
+			default:
+				cal.writes = stall
 			}
 			link := newFakeLink()
 			webhooks := make(chan webhookEvent)
@@ -291,7 +303,10 @@ func TestAFailedChatCheckLeavesWithin10sWhileACallStalls(t *testing.T) {
 			clk.BlockUntil(t, 1)
 
 			at, ok := stall.first()
-			if !ok || !at.Before(admitted.Add(chatCheckWindow)) {
+			switch {
+			case cal.writes != nil && (!ok || at.After(admitted.Add(chatCheckWindow))):
+				t.Fatalf("the stalled write began at %v (made %v), want one at the check's deadline %v", at, ok, admitted.Add(chatCheckWindow))
+			case cal.writes == nil && (!ok || !at.Before(admitted.Add(chatCheckWindow))):
 				t.Fatalf("the stalled call began at %v (made %v), want one before the check's deadline %v", at, ok, admitted.Add(chatCheckWindow))
 			}
 			leaves := api.callsOf("Leave")

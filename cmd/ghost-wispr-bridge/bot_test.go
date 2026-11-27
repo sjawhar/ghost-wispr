@@ -78,6 +78,14 @@ func (s *botStopper) took() {
 	}
 }
 
+// revive lets the fakes take calls again, as the restarted bridge's process
+// does: the stopped one made no call after the stop.
+func (s *botStopper) revive() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.armed, s.dead = false, false
+}
+
 // botCall is one call a fake took.
 type botCall struct {
 	Op, ID, Text string
@@ -368,9 +376,9 @@ func (c *fakeCalendar) Events(_ context.Context, from, to time.Time) ([]calendar
 	}
 	c.calls = append(c.calls, botCall{Op: "Events", At: c.clock.Now()})
 	var out []calendar.Event
-	for _, e := range c.events {
-		if e.End.After(from) && e.Start.Before(to) {
-			out = append(out, e)
+	for i := range c.events {
+		if e := &c.events[i]; e.End.After(from) && e.Start.Before(to) {
+			out = append(out, *e)
 		}
 	}
 	slices.SortStableFunc(out, func(a, b calendar.Event) int { return a.Start.Compare(b.Start) })
@@ -410,6 +418,24 @@ func (c *fakeCalendar) AddJoin(_ context.Context, id string) (int, error) {
 	return 0, fakeCalendarNoEvent(id)
 }
 
+// SetPending sets the event's pending record, as the bot user's own copy
+// keeps it.
+func (c *fakeCalendar) SetPending(_ context.Context, id string, p calendar.Pending) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.stop.isDead() {
+		return errBotStopped
+	}
+	for i := range c.events {
+		if c.events[i].ID == id {
+			c.events[i].Pending = p
+			c.calls = append(c.calls, botCall{Op: "SetPending", ID: id, At: c.clock.Now()})
+			return nil
+		}
+	}
+	return fakeCalendarNoEvent(id)
+}
+
 // fakeCalendarNoEvent is the Calendar API's answer for an event it does not
 // have, as calendar.NewReader passes it on.
 func fakeCalendarNoEvent(id string) error {
@@ -419,9 +445,9 @@ func fakeCalendarNoEvent(id string) error {
 func (c *fakeCalendar) event(id string) calendar.Event {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	for _, e := range c.events {
-		if e.ID == id {
-			return e
+	for i := range c.events {
+		if c.events[i].ID == id {
+			return c.events[i]
 		}
 	}
 	panic("no event " + id)

@@ -290,7 +290,8 @@ func meetCall(id, organizer, start, end, meet string, attendees ...string) *cale
 // message.
 func eventLines(evs []Event) []string {
 	var out []string
-	for _, e := range evs {
+	for i := range evs {
+		e := &evs[i]
 		out = append(out, fmt.Sprintf("%s organizer=%s meet=%s start=%s end=%s done=%v joins=%d",
 			e.ID, e.Organizer, e.MeetURL, e.Start.UTC().Format(time.RFC3339), e.End.UTC().Format(time.RFC3339), e.Done, e.Joins))
 	}
@@ -374,8 +375,8 @@ func TestOnlyListedOrganizersCountWhileTheListIsSet(t *testing.T) {
 			t.Fatalf("%s: Events: %v", tc.name, err)
 		}
 		var ids []string
-		for _, e := range got {
-			ids = append(ids, e.ID)
+		for i := range got {
+			ids = append(ids, got[i].ID)
 		}
 		if !slices.Equal(ids, tc.want) {
 			t.Errorf("%s: events %q, want %q", tc.name, ids, tc.want)
@@ -476,9 +477,176 @@ func TestAnUnreadableJoinsCountAllowsNoNewBot(t *testing.T) {
 	if len(got) != 2 {
 		t.Fatalf("%d events, want 2", len(got))
 	}
-	for _, e := range got {
-		if e.Joins != MaxJoins {
+	for i := range got {
+		if e := &got[i]; e.Joins != MaxJoins {
 			t.Errorf("%s: joins %d, want %d, so no new bot comes", e.ID, e.Joins, MaxJoins)
+		}
+	}
+}
+
+// privateOf gives the private properties the fake holds for id.
+func (f *calendarFake) privateOf(id string) map[string]string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return maps.Clone(f.private[id])
+}
+
+// The bridge's pending record is written to, and cleared on, the bot user's
+// own copy of the occurrence alone, telling no guest; each write keeps the
+// record's other properties, and a done mark keeps the pending record.
+func TestThePendingRecordIsWrittenAndClearedOnTheBotsCopyOfTheOccurrence(t *testing.T) {
+	f, svc := newCalendarFake(t)
+	f.addRecurring(meetCall("weekly", alice, "2026-12-01T17:00:00Z", "2026-12-01T17:30:00Z", "https://meet.google.com/www-xxxx-yyy", botUser), 7*24*time.Hour, 2)
+	const first, second = "weekly_20261201T170000Z", "weekly_20261208T170000Z"
+	r := NewReader(svc, memberFilter)
+	ctx := context.Background()
+	if _, err := r.AddJoin(ctx, second); err != nil {
+		t.Fatalf("AddJoin: %v", err)
+	}
+	read := func() map[string]Event {
+		t.Helper()
+		got, err := r.Events(ctx, time.Date(2026, 11, 30, 0, 0, 0, 0, time.UTC), time.Date(2026, 12, 31, 0, 0, 0, 0, time.UTC))
+		if err != nil {
+			t.Fatalf("Events: %v", err)
+		}
+		out := map[string]Event{}
+		for i := range got {
+			out[got[i].ID] = got[i]
+		}
+		return out
+	}
+	const botID = "bot_Ab12Cd34Ef56Gh78"
+	for _, p := range []Pending{
+		{Leave: EndLeaveRule, Bot: botID},
+		{Leave: EndChatCheckFailed, Bot: botID, ChatCheckFailed: true},
+		{Leave: EndLinkLost, Bot: botID},
+		{Leave: EndSocketFailed, Bot: botID, Busy: true},
+		{Busy: true, ChatCheckFailed: true},
+		{},
+	} {
+		if err := r.SetPending(ctx, second, p); err != nil {
+			t.Fatalf("SetPending %+v: %v", p, err)
+		}
+		evs := read()
+		if got := evs[second]; got.Pending != p || got.Joins != 1 || got.Done {
+			t.Errorf("after SetPending %+v: the occurrence reads pending %+v, joins %d, done %v; want that record, joins 1, not done", p, got.Pending, got.Joins, got.Done)
+		}
+		if got := evs[first].Pending; got != (Pending{}) {
+			t.Errorf("after SetPending %+v on %s: the other occurrence reads pending %+v, want none", p, second, got)
+		}
+		if v := f.privateOf(second)[pendingProperty]; len(v) > maxPropertyValue {
+			t.Errorf("the stored record is %d characters, more than the Calendar API's %d", len(v), maxPropertyValue)
+		}
+	}
+	if v := f.privateOf(second)[pendingProperty]; v != "{}" {
+		t.Errorf("the cleared record is %q, want {}", v)
+	}
+	owed := Pending{Busy: true}
+	if err := r.SetPending(ctx, second, owed); err != nil {
+		t.Fatalf("SetPending: %v", err)
+	}
+	if err := r.MarkDone(ctx, second); err != nil {
+		t.Fatalf("MarkDone: %v", err)
+	}
+	if got := read()[second]; !got.Done || got.Joins != 1 || got.Pending != owed {
+		t.Errorf("after the done mark: done %v, joins %d, pending %+v; want done, joins 1, the owed busy", got.Done, got.Joins, got.Pending)
+	}
+	if len(f.patches) != 9 {
+		t.Fatalf("%d patches, want 9 (a join, seven records and the done mark)", len(f.patches))
+	}
+	for i, p := range f.patches {
+		if p.id != second {
+			t.Errorf("patch %d went to %q, want the occurrence %q", i, p.id, second)
+		}
+		if got := p.query.Get("sendUpdates"); got != "none" {
+			t.Errorf("patch %d: sendUpdates %q, want none (no guest hears of the bot's record)", i, got)
+		}
+		if keys := slices.Sorted(maps.Keys(p.body)); !slices.Equal(keys, []string{"extendedProperties"}) {
+			t.Errorf("patch %d sent the fields %q, want only extendedProperties", i, keys)
+		}
+	}
+}
+
+// A pending record that does not read as one, also one the Calendar API cut
+// at its 1024 characters, is read fail-safe: no new bot comes for its event
+// (its joins read as MaxJoins, so a bridge's leave ends it as Done), and it
+// owes nothing, so nothing is replayed. A readable record beside them reads.
+func TestAnUnreadablePendingRecordMakesNoNewBotAndReplaysNothing(t *testing.T) {
+	f, svc := newCalendarFake(t)
+	unreadable := []string{
+		"",
+		"null",
+		"not json",
+		`{"busy":true} {}`,
+		`{"busy":"yes"}`,
+		`{"busy":true,"note":"x"}`,
+		`{"leave":"link_lost"}`,
+		`{"bot":"bot_1"}`,
+		`{"leave":"teleported","bot":"bot_1"}`,
+		`{"leave":"meeting_ended","bot":"bot_1"}`,
+		`{"leave":"link_lost","bot":"bot 1"}`,
+		`{"leave":"link_lost","bot":"` + strings.Repeat("b", 65) + `"}`,
+		`{"chat_check":"passed"}`,
+		(`{"leave":"link_lost","bot":"bot_1","busy":true,"pad":"` + strings.Repeat("x", 2000) + `"}`)[:1024],
+	}
+	const readable = `{"leave":"link_lost","bot":"bot_1","busy":true}`
+	values := map[string]string{}
+	for i, v := range append(slices.Clone(unreadable), readable) {
+		id := fmt.Sprintf("call-%02d", i)
+		values[id] = v
+		f.add(meetCall(id, alice, "2026-12-01T17:00:00Z", "2026-12-01T18:00:00Z", "https://meet.google.com/aaa-bbbb-ccc", botUser))
+		f.setPrivate(id, map[string]string{"ghostWisprJoins": "1", "ghostWisprPending": v})
+	}
+	got, err := NewReader(svc, memberFilter).Events(context.Background(), readFrom, readTo)
+	if err != nil {
+		t.Fatalf("Events: %v", err)
+	}
+	if len(got) != len(values) {
+		t.Fatalf("%d events, want %d", len(got), len(values))
+	}
+	during := time.Date(2026, 12, 1, 17, 20, 0, 0, time.UTC)
+	for i := range got {
+		e := &got[i]
+		v := values[e.ID]
+		_, joinable := NextToJoin(got[i:i+1], during, true, true, true, false)
+		end := EndResult(EndLinkLost, *e, during)
+		if v == readable {
+			if want := (Pending{Leave: EndLinkLost, Bot: "bot_1", Busy: true}); e.Pending != want || e.Joins != 1 || !joinable || end != NewBot {
+				t.Errorf("the readable record %q: pending %+v, joins %d, NextToJoin %v, a lost link's end %s; want %+v, 1, true, NewBot",
+					v, e.Pending, e.Joins, joinable, resultName(end), want)
+			}
+			continue
+		}
+		if e.Pending != (Pending{}) || e.Joins != MaxJoins || joinable || end != Done {
+			t.Errorf("the record %q: pending %+v, joins %d, NextToJoin %v, a lost link's end %s; want nothing owed, %d, false, Done",
+				v, e.Pending, e.Joins, joinable, resultName(end), MaxJoins)
+		}
+	}
+}
+
+// The longest pending record the bridge writes fits the Calendar API's bound
+// on a property's value: "The maximum size of a property's value is 1024
+// characters, and properties with longer values will be silently truncated"
+// (Calendar API guide "Extended properties", Limits). A record that would not
+// fit, or that is not one, is refused before it is written.
+func TestTheLongestPendingRecordFitsTheCalendarsValueLimit(t *testing.T) {
+	longest := Pending{Leave: EndChatCheckFailed, Bot: strings.Repeat("b", maxBotID), Busy: true, ChatCheckFailed: true}
+	v, err := encodePending(longest)
+	if err != nil {
+		t.Fatalf("encodePending(the longest record): %v", err)
+	}
+	if len(v) > maxPropertyValue {
+		t.Fatalf("the longest record is %d characters, more than %d", len(v), maxPropertyValue)
+	}
+	for _, p := range []Pending{
+		{Leave: EndLinkLost, Bot: strings.Repeat("b", maxBotID+1)},
+		{Leave: EndLinkLost, Bot: "bot 1"},
+		{Leave: EndLinkLost},
+		{Bot: "bot_1"},
+		{Leave: EndMeetingEnded, Bot: "bot_1"},
+	} {
+		if v, err := encodePending(p); err == nil {
+			t.Errorf("encodePending(%+v) = %q, want it refused", p, v)
 		}
 	}
 }

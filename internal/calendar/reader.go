@@ -80,7 +80,7 @@ func (r *apiReader) callEvent(item *calendarapi.Event) (Event, bool, error) {
 	if item.ExtendedProperties != nil {
 		private = item.ExtendedProperties.Private
 	}
-	done, joins := readRecord(private)
+	done, joins, pending := readRecord(private)
 	return Event{
 		ID:        item.Id,
 		Organizer: item.Organizer.Email,
@@ -89,6 +89,7 @@ func (r *apiReader) callEvent(item *calendarapi.Event) (Event, bool, error) {
 		End:       end.UTC(),
 		Done:      done,
 		Joins:     joins,
+		Pending:   pending,
 	}, true, nil
 }
 
@@ -152,12 +153,27 @@ func (r *apiReader) AddJoin(ctx context.Context, id string) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	_, joins := readRecord(private)
-	joins++
+	joins := readJoins(private) + 1
 	if err := r.patchPrivate(ctx, id, withJoins(private, joins)); err != nil {
 		return 0, err
 	}
 	return joins, nil
+}
+
+// SetPending sets the record's ghostWisprPending on the bot user's own copy
+// of the occurrence id. The zero Pending is written as "{}", not deleted:
+// the Calendar API's guide deletes a property only by a patch that sets it to
+// null, and "{}" is the same under either reading of a patch's map.
+func (r *apiReader) SetPending(ctx context.Context, id string, p Pending) error {
+	v, err := encodePending(p)
+	if err != nil {
+		return fmt.Errorf("event %s: %w", id, err)
+	}
+	private, err := r.private(ctx, id)
+	if err != nil {
+		return err
+	}
+	return r.patchPrivate(ctx, id, withPending(private, v))
 }
 
 func (r *apiReader) private(ctx context.Context, id string) (map[string]string, error) {

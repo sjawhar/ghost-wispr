@@ -55,3 +55,38 @@ func TestThePoolStaysUpUntilDoneOr4HoursAfterTheEnd(t *testing.T) {
 		}
 	}
 }
+
+// An event that owes the Pi a control (a busy, or a failed chat_check, that
+// the link has not taken) keeps the pool up also while it is done, until 4
+// hours after its end, so the bridge can send it once the link is back. A
+// done event that owes nothing, a leave reason alone included, does not, and
+// NextToJoin never gives a done event.
+func TestAnEventThatOwesThePiAControlKeepsThePoolUpUntilItsHold(t *testing.T) {
+	owesBusy := Event{ID: "call-1", Start: windowStart, End: windowEnd, Done: true, Pending: Pending{Busy: true}}
+	owesCheck := Event{ID: "call-2", Start: windowStart, End: windowEnd, Joins: 1, Done: true,
+		Pending: Pending{Leave: EndChatCheckFailed, Bot: "bot_1", ChatCheckFailed: true}}
+	leaveOnly := Event{ID: "call-3", Start: windowStart, End: windowEnd, Joins: 1, Done: true,
+		Pending: Pending{Leave: EndLeaveRule, Bot: "bot_1"}}
+	for _, tc := range []struct {
+		name string
+		e    Event
+		now  time.Time
+		want bool
+	}{
+		{"a busy owed, during the call", owesBusy, time.Date(2026, 12, 1, 17, 15, 0, 0, time.UTC), true},
+		{"a busy owed, 1 minute after the end", owesBusy, time.Date(2026, 12, 1, 17, 31, 0, 0, time.UTC), true},
+		{"a busy owed, 4 hours less 1 second after the end", owesBusy, time.Date(2026, 12, 1, 21, 29, 59, 0, time.UTC), true},
+		{"a busy owed, 4 hours after the end", owesBusy, time.Date(2026, 12, 1, 21, 30, 0, 0, time.UTC), false},
+		{"a failed chat check owed, 1 minute after the end", owesCheck, time.Date(2026, 12, 1, 17, 31, 0, 0, time.UTC), true},
+		{"a failed chat check owed, 4 hours after the end", owesCheck, time.Date(2026, 12, 1, 21, 30, 0, 0, time.UTC), false},
+		{"a leave reason alone, 1 minute after the end", leaveOnly, time.Date(2026, 12, 1, 17, 31, 0, 0, time.UTC), false},
+	} {
+		if got := KeepsPoolUp(tc.e, tc.now); got != tc.want {
+			t.Errorf("%s (%s): KeepsPoolUp = %v, want %v", tc.name, tc.now.Format(time.RFC3339), got, tc.want)
+		}
+	}
+	during := time.Date(2026, 12, 1, 17, 15, 0, 0, time.UTC)
+	if got, ok := NextToJoin([]Event{owesBusy, owesCheck}, during, true, true, true, false); ok {
+		t.Errorf("NextToJoin over done events that owe a control = %q, want none", got.ID)
+	}
+}
