@@ -244,6 +244,14 @@ case $1 in
     program=("${arguments[@]:first}")
     if [[ $unit == ghost-wispr-provision ]]; then
       printf '%s\n' "$*" >>"$TEST_LOG.provision-units"
+      # With TEST_PROVISION_START_HOLD, the start waits while that file exists, after the run's
+      # checks and before systemd takes the unit's name: another run can start and end there.
+      if [[ -n ${TEST_PROVISION_START_HOLD:-} ]]; then
+        : >"$TEST_LOG.start-held"
+        while [[ -f $TEST_PROVISION_START_HOLD ]]; do
+          "$TEST_REAL_SLEEP" 0.1
+        done
+      fi
       exec system-unit "$unit" "$directory" "${setenv[@]}" -- "${program[@]}"
     fi
     if [[ " $* " == *' --wait '* ]]; then
@@ -298,6 +306,10 @@ case $1 in
     if [[ $* == *systemd-logind* || $* == *' --user '* ]]; then
       error 'a system file reload or a user call through sudo' "$@"
     fi
+    # reset-failed is the system manager's: the fake systemctl holds the run's units.
+    if [[ ${2:-} == reset-failed ]]; then
+      exec systemctl "${@:2}"
+    fi
     ;;
 esac
 EOF
@@ -343,7 +355,9 @@ done
 shift
 unit_file=$TEST_SYSTEM_UNITS/$name.service
 main=$(sed -n 's/^MainPID=//p' "$unit_file" 2>/dev/null) || main=
-if [[ -n $main ]] && kill -0 "$main" 2>/dev/null; then
+# A unit of the name that is active, or failed and kept, as systemd keeps a failed unit that has no
+# --collect, takes the name: the start fails, as systemd's does.
+if { [[ -n $main ]] && kill -0 "$main" 2>/dev/null; } || grep -qx 'ActiveState=failed' "$unit_file" 2>/dev/null; then
   printf 'Failed to start transient service unit: Unit %s.service was already loaded or has a fragment file.\n' "$name" >&2
   exit 1
 fi
@@ -450,11 +464,24 @@ if [[ ${1:-} != --user ]]; then
     show)
       unit=${!#}
       main=$(main_of "$unit")
-      if alive "$main"; then
-        cat -- "$TEST_SYSTEM_UNITS/${unit%.service}.service"
+      if alive "$main" || grep -qx 'ActiveState=failed' "$TEST_SYSTEM_UNITS/${unit%.service}.service" 2>/dev/null; then
+        shown=$(cat -- "$TEST_SYSTEM_UNITS/${unit%.service}.service")
       else
-        printf 'ActiveState=inactive\nActiveEnterTimestamp=\nMainPID=0\n'
+        shown=$(printf 'ActiveState=inactive\nActiveEnterTimestamp=\nMainPID=0\n')
       fi
+      # show -p PROPERTY --value prints that property's value alone, as systemctl does.
+      if [[ " $* " == *' --value '* && ${2:-} == -p ]]; then
+        sed -n "s/^$3=//p" <<<"$shown"
+      else
+        printf '%s\n' "$shown"
+      fi
+      ;;
+    reset-failed)
+      for unit in "${@:2}"; do
+        if grep -qx 'ActiveState=failed' "$TEST_SYSTEM_UNITS/${unit%.service}.service" 2>/dev/null; then
+          rm -f -- "$TEST_SYSTEM_UNITS/${unit%.service}.service"
+        fi
+      done
       ;;
     stop)
       for unit in "${@:2}"; do
@@ -1266,7 +1293,7 @@ run_unit=$(<"$first_join/provision-units")
 [[ $run_unit == "systemd-run --unit=ghost-wispr-provision --pipe --wait --collect --quiet --property=KillMode=control-group --property=TimeoutStopSec=10s --uid=ghost-wispr "* ]] \
   || fail "the run is not the unit ghost-wispr-provision as ghost-wispr, with its output passed through, waited for, collected and ended whole: $run_unit"
 for setting in --setenv=GHOST_WISPR_PROVISION_IN_UNIT=1 "--setenv=PATH=$bin:" "--setenv=GHOST_WISPR_DEPLOY_DIR=$deploy" \
-  "--working-directory=$PWD /bin/bash $work_dir/p2-stage/provision.sh"; do
+  "--setenv=GHOST_WISPR_PROVISION_STARTED=" "--working-directory=$PWD /bin/bash $work_dir/p2-stage/provision.sh"; do
   [[ $run_unit == *" $setting"* ]] || fail "the run's unit has no $setting: $run_unit"
 done
 [[ -s $first_join/join ]] || fail 'provision.sh started no detached join'
@@ -1744,6 +1771,85 @@ cmp -s -- "$renamed" "$TEST_SERVE_STATE" || fail "a run while a join is active c
 kill "$join_main"
 wait "$join_main" 2>/dev/null || true
 rm -f -- "$system_units/ghost-wispr-provision-join.service"
+
+# The handoff (GPT-6.1 Sol's review of #203, round 6): a run reads both units as inactive, then
+# another run takes the run's name, starts its join and ends, and the first run's unit starts while
+# that join is active. The run checks the join again in its own unit, before any mode changes a
+# file, and refuses with the whole message; here its --key would create a key. Break it catches: a
+# run that checks the join only before its unit starts.
+# hold_start: provision.sh --key runs in the background, held after its checks, before its unit
+# starts; held_run is the job.
+hold_start() {
+  rm -f -- "$TEST_LOG.start-held"
+  : >"$work_dir/start-hold"
+  (
+    TEST_PROVISION_START_HOLD=$work_dir/start-hold RUN_OUT=$work_dir/held-out run_provision "$stage" --key
+    printf '%s\n' "$rc" >"$work_dir/held-rc"
+  ) &
+  held_run=$!
+  for _ in {1..300}; do
+    [[ ! -f $TEST_LOG.start-held ]] || break
+    sleep 0.1
+  done
+  [[ -f $TEST_LOG.start-held ]] || fail "control: the run never reached the start of its unit: $(cat -- "$work_dir/held-out" 2>/dev/null)"
+}
+new_pi
+rm -f -- "$key"
+hold_start
+"$real_sleep" 600 &
+join_main=$!
+printf 'ActiveState=active\nActiveEnterTimestamp=Thu 2026-11-27 14:00:00 UTC\nMainPID=%s\n' "$join_main" \
+  >"$system_units/ghost-wispr-provision-join.service"
+rm -f -- "$work_dir/start-hold"
+wait "$held_run" || true
+[[ $(cat -- "$work_dir/held-rc") == 1 ]] || fail "a run whose unit started while a join is active ended $(cat -- "$work_dir/held-rc"): $(<"$work_dir/held-out")"
+grep -Fq "another provisioning run is going on: ghost-wispr-provision-join.service is active since Thu 2026-11-27 14:00:00 UTC, main PID $join_main; nothing was changed." "$work_dir/held-out" \
+  || fail "a run whose unit started while a join is active did not refuse with the whole message: $(<"$work_dir/held-out")"
+grep -Fq 'sudo systemctl stop ghost-wispr-provision ghost-wispr-provision-join' "$work_dir/held-out" \
+  || fail "the in-unit refusal did not name the stop command: $(<"$work_dir/held-out")"
+[[ ! -e $key ]] || fail "a run whose unit started while a join is active created a key"
+kill "$join_main"
+wait "$join_main" 2>/dev/null || true
+rm -f -- "$system_units/ghost-wispr-provision-join.service"
+# The loser of two starts at once (Sol's round 6): a run that passed its checks finds the run's name
+# taken when its unit starts. It refuses with the whole message, not systemd's bare line. Break it
+# catches: a run that gives the person systemd-run's own error.
+new_pi
+hold_start
+"$real_sleep" 600 &
+other_main=$!
+printf 'ActiveState=active\nActiveEnterTimestamp=Thu 2026-11-27 14:01:00 UTC\nMainPID=%s\n' "$other_main" \
+  >"$system_units/ghost-wispr-provision.service"
+rm -f -- "$work_dir/start-hold"
+wait "$held_run" || true
+[[ $(cat -- "$work_dir/held-rc") == 1 ]] || fail "the loser of two starts ended $(cat -- "$work_dir/held-rc"): $(<"$work_dir/held-out")"
+grep -Fq "another provisioning run is going on: ghost-wispr-provision.service is active since Thu 2026-11-27 14:01:00 UTC, main PID $other_main; nothing was changed." "$work_dir/held-out" \
+  || fail "the loser of two starts did not refuse with the whole message: $(<"$work_dir/held-out")"
+kill "$other_main"
+wait "$other_main" 2>/dev/null || true
+rm -f -- "$system_units/ghost-wispr-provision.service"
+# A failed unit that systemd keeps takes the run's name (Sol's round 6): the run resets it, says so,
+# and goes on. Break it catches: a run that leaves a kept failed unit, whose start then fails.
+new_pi
+printf 'ActiveState=failed\nActiveEnterTimestamp=Thu 2026-11-27 14:02:00 UTC\nMainPID=0\n' >"$system_units/ghost-wispr-provision.service"
+run_provision "$stage" --key
+said 'ghost-wispr provision: reset the failed unit ghost-wispr-provision.service, which a run that failed left' \
+  || fail "a run did not reset and name a kept failed unit: $(<"$work_dir/out")"
+said 'nothing was changed. A new key needs a new certificate request' \
+  || fail "a run after a kept failed unit did not reach provision.sh --key's own check: $(<"$work_dir/out")"
+# Credentials in the caller's environment stay out of the unit's settings, which any local user can
+# read (systemctl show -p Environment; Sol's round 6): only PATH and the provisioning settings go.
+# Break it catches: a run that forwards every GHOST_WISPR_ variable.
+new_pi
+# The two credential names the recorder's deployment exports, each given a dummy value.
+credential_names=(GHOST_WISPR_DISPATCH_TOKEN GHOST_WISPR_DEEPGRAM_API_KEY)
+(
+  export "${credential_names[0]}=dummy-dispatch-canary" "${credential_names[1]}=dummy-deepgram-canary"
+  run_provision "$stage" --key
+)
+unit_line=$(tail -n 1 "$TEST_LOG.provision-units")
+[[ $unit_line != *canary* ]] || fail "the run's unit carries a credential of the caller's environment: $unit_line"
+[[ $unit_line == *"--setenv=GHOST_WISPR_DEPLOY_DIR=$deploy "* ]] || fail "control: the run's unit lost a provisioning setting: $unit_line"
 
 begin serve
 # Serve that is serve.conf's already for the device's name is left as it is: a reset would stop the

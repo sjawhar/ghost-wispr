@@ -185,12 +185,12 @@ func TestRunbookProvisionGivesServeExactlyServeConf(t *testing.T) {
 		"confirms `inactive`", "`/run/ghost-wispr-join`", "`ExecStopPost`",
 		"the transient system unit `ghost-wispr-provision`", "`ghost-wispr-provision-join`", "when it became active and its main PID",
 		"`sudo systemctl stop ghost-wispr-provision ghost-wispr-provision-join`", "An SSH session that ends does not end a run",
-		"`sudo journalctl -u ghost-wispr-provision-join`"} {
+		"`sudo journalctl -u ghost-wispr-provision-join`", "its control group", "`systemctl reset-failed`", "checks the join again"} {
 		if !strings.Contains(section, words) {
 			t.Errorf("the runbook's \"Provision\" does not say %q", words)
 		}
 	}
-	for _, stale := range []string{"each mount other than `/`", "a moment that a page open in a browser shows", "/var/lib/ghost-wispr-join", "ghost-wispr-provision.lock", "ghost-wispr-tailnet-join"} {
+	for _, stale := range []string{"each mount other than `/`", "a moment that a page open in a browser shows", "/var/lib/ghost-wispr-join", "ghost-wispr-provision.lock", "ghost-wispr-tailnet-join", "ends every command of the run with it"} {
 		if strings.Contains(section, stale) {
 			t.Errorf("the runbook's \"Provision\" still says %q", stale)
 		}

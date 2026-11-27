@@ -123,4 +123,36 @@ for shape in nested pipeline jq install openssl timeout; do
     fi
   done
 done
-printf 'provision unit tests passed: 6 commands, each ended by a stop, SIGHUP and a kill\n'
+
+# The unit's settings (pi-lib.sh's provision_unit_settings) carry PATH and the provisioning settings,
+# never a credential of the caller's environment: a unit's Environment property is readable by any
+# local user (GPT-6.1 Sol's review of #203, round 6). Break it catches: settings made of every
+# exported GHOST_WISPR_ variable.
+# The two credential names the recorder's deployment exports, each given a dummy value.
+credential_names=(GHOST_WISPR_DISPATCH_TOKEN GHOST_WISPR_DEEPGRAM_API_KEY)
+export "${credential_names[0]}=dummy-dispatch-canary" "${credential_names[1]}=dummy-deepgram-canary" \
+  GHOST_WISPR_DEPLOY_DIR=/opt/ghost-wispr-unit-test
+unit=$prefix-settings
+started+=("$unit")
+provision_unit_settings
+provision_unit_command "$unit" "$user"
+# shellcheck disable=SC2154 # pi-lib.sh's provision_unit_settings sets it.
+sudo -n "${pl_unit_command[@]}" "${pl_unit_settings[@]}" /bin/sleep 60 </dev/null >/dev/null 2>&1 &
+client=$!
+for _ in {1..100}; do
+  [[ $(systemctl show -p ActiveState --value "$unit.service") == active ]] && break
+  sleep 0.1
+done
+environment=$(systemctl show -p Environment --value "$unit.service")
+[[ $environment == *GHOST_WISPR_DEPLOY_DIR=/opt/ghost-wispr-unit-test* ]] \
+  || fail "control: the unit's Environment lacks a provisioning setting: $environment"
+[[ $environment != *canary* ]] || fail "the unit's Environment, which any local user reads, carries a credential: $environment"
+if id nobody >/dev/null 2>&1; then
+  other=$(sudo -n -u nobody systemctl show -p Environment --value "$unit.service") \
+    || fail "control: another user could not read the unit's Environment"
+  [[ $other != *canary* ]] || fail "another user read a credential in the unit's Environment: $other"
+fi
+sudo -n systemctl stop "$unit.service"
+wait "$client" || true
+unset GHOST_WISPR_DISPATCH_TOKEN GHOST_WISPR_DEEPGRAM_API_KEY GHOST_WISPR_DEPLOY_DIR
+printf 'provision unit tests passed: 6 commands, each ended by a stop, SIGHUP and a kill; no credential in the settings\n'
