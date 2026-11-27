@@ -33,10 +33,11 @@ readonly work_dir
 trap 'rm -rf -- "$work_dir"' EXIT
 
 # The cases of this test, each of which begin names.
-readonly case_names=(bundle-refused not-a-release first-run one-update-start release-files-first
-  credentials-written bootstrap-files no-env-no-system-files groups-and-linger join-command idempotent
-  credentials-same credentials-differ client-id newer-release newer-release-certificate bootstrap-repair
-  serve provision-unit update-fails recorder-unit join route-check manager-env key certificate models)
+readonly case_names=(cleanup bundle-refused not-a-release first-run one-update-start
+  release-files-first credentials-written bootstrap-files no-env-no-system-files groups-and-linger
+  join-command idempotent credentials-same credentials-differ client-id newer-release
+  newer-release-certificate bootstrap-repair serve provision-unit update-fails recorder-unit join
+  route-check manager-env key certificate models)
 current_case=setup
 ran_cases=' '
 
@@ -85,7 +86,9 @@ readonly release_api=https://api.test.invalid/releases/latest status_url=http://
 readonly tailscale_call_timeout=5 \
   uuid_re='[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
 # The fake system manager's transient units: a file NAME.service for each active one
-# (start_system_unit), which the fake systemctl reads and stops.
+# (start_system_unit), which the fake systemctl reads and stops. Each fake unit, the run's, its
+# Serve apply's, notes its session, the control group a unit's stop ends, in TEST_UNIT_SESSIONS, and
+# the test's exit stops each one (stop_fake_units). Once TEST_STOPPING exists, no fake unit starts.
 readonly system_units=$work_dir/system-units
 export TEST_LOG="$work_dir/log" TEST_UID="$uid" TEST_RUNTIME_DIR="$runtime_dir" TEST_DEPLOY="$deploy" \
   TEST_UNIT_DIR="$units" TEST_BINARY="$work_dir/recorder-binary" \
@@ -93,8 +96,64 @@ export TEST_LOG="$work_dir/log" TEST_UID="$uid" TEST_RUNTIME_DIR="$runtime_dir" 
   TEST_SERVE_HOST=ghost-wispr.example-tailnet.ts.net TEST_ROUTE_ALL="$work_dir/route-all" TEST_SUBJECT="$subject" \
   TEST_REAL_DATE="$real_date" TEST_REAL_SLEEP="$real_sleep" TEST_STATE="$state" TEST_RELEASES="$work_dir/releases" \
   TEST_CLOCK="$work_dir/clock" TEST_SYSTEM_UNITS="$system_units" TEST_REAL_JQ="$real_jq" \
-  TEST_REAL_INSTALL="$real_install" TEST_REAL_OPENSSL="$real_openssl"
+  TEST_REAL_INSTALL="$real_install" TEST_REAL_OPENSSL="$real_openssl" \
+  TEST_UNIT_SESSIONS="$work_dir/unit-sessions" TEST_STOPPING="$work_dir/stopping"
 mkdir -p -- "$bin" "$join" "$first_join" "$TEST_RELEASES" "$system_units"
+
+# unit_pids SID... prints the PID of each process of the sessions SID... that is this test's, whose
+# environment holds this test's TEST_LOG: a session ID that the system has since given to another
+# session is not this test's, and none of its processes is printed.
+unit_pids() {
+  local pid sid
+  while read -r pid sid; do
+    [[ " $* " == *" $sid "* ]] || continue
+    if grep -qzx -- "TEST_LOG=$TEST_LOG" "/proc/$pid/environ" 2>/dev/null; then
+      printf '%s\n' "$pid"
+    fi
+  done < <(ps -eo pid=,sid=)
+}
+# stop_fake_units stops each fake unit that the test started and TEST_UNIT_SESSIONS notes, by its
+# session: SIGTERM to each of its processes that unit_pids names, then SIGKILL to any left 5 s
+# later, as a unit's stop does. Then it forgets them.
+stop_fake_units() {
+  local name sid pids sids=()
+  [[ -s $TEST_UNIT_SESSIONS ]] || return 0
+  while read -r name sid; do
+    [[ ! $sid =~ ^[0-9]+$ ]] || sids+=("$sid")
+  done <"$TEST_UNIT_SESSIONS"
+  : >"$TEST_UNIT_SESSIONS"
+  ((${#sids[@]})) || return 0
+  pids=$(unit_pids "${sids[@]}")
+  # shellcheck disable=SC2086 # One PID a word.
+  [[ -z $pids ]] || kill -TERM $pids 2>/dev/null || true
+  for _ in {1..50}; do
+    pids=$(unit_pids "${sids[@]}")
+    [[ -n $pids ]] || return 0
+    "$real_sleep" 0.1
+  done
+  # shellcheck disable=SC2086 # One PID a word.
+  kill -KILL $pids 2>/dev/null || true
+}
+# stop_test runs on each exit of the test, a failed case's among them: no fake unit starts from
+# then on, each fake unit and each background job of the test stops, by its session or its exact
+# PID, and the test's directory goes. A case that fails midway left its units running before.
+# PROVISION_RUN_TEST_KEEP_UNITS, which only the cleanup case sets, plants the old exit: the stops
+# are skipped, so that case can show its check finds what they leave.
+stop_test() {
+  local job
+  : >"$TEST_STOPPING" 2>/dev/null || true
+  if [[ -z ${PROVISION_RUN_TEST_KEEP_UNITS:-} ]]; then
+    stop_fake_units || true
+    for job in $(jobs -p); do
+      kill "$job" 2>/dev/null || true
+    done
+  fi
+  rm -rf -- "$work_dir"
+}
+trap stop_test EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
 
 # hang WHAT: what each fake does in place of a command that never ends. It writes its PID to
 # $TEST_LOG.hung-WHAT, and then waits 600 s.
@@ -260,6 +319,8 @@ case $1 in
           "$TEST_REAL_SLEEP" 0.1
         done
       fi
+      # A start held past the test's exit starts nothing.
+      [[ ! -e $TEST_STOPPING && -d $TEST_SYSTEM_UNITS ]] || exit 1
       exec system-unit "$unit" "$directory" "${setenv[@]}" -- "${program[@]}"
     fi
     if [[ " $* " == *' --wait '* ]]; then
@@ -274,6 +335,11 @@ case $1 in
       fi
       # shellcheck disable=SC2016 # The unit's shell expands its own arguments.
       exec setsid -w bash -c '
+        # The unit notes its session, its PID under setsid, for the test'"'"'s exit to stop; it does
+        # not start once the test stops.
+        if ! printf "serve %s\n" "$$" >>"$TEST_UNIT_SESSIONS" 2>/dev/null || [[ -e $TEST_STOPPING ]]; then
+          exit 1
+        fi
         limit=$1
         shift
         status=0
@@ -361,6 +427,7 @@ while [[ $1 != -- ]]; do
   shift
 done
 shift
+[[ ! -e $TEST_STOPPING && -d $TEST_SYSTEM_UNITS ]] || exit 1
 unit_file=$TEST_SYSTEM_UNITS/$name.service
 main=$(sed -n 's/^MainPID=//p' "$unit_file" 2>/dev/null) || main=
 # A unit of the name that is active, or failed and kept, as systemd keeps a failed unit that has no
@@ -407,6 +474,11 @@ done
 rm -f -- "$main_file"
 printf 'ActiveState=active\nActiveEnterTimestamp=%s\nMainPID=%s\n' \
   "$("$TEST_REAL_DATE" -u '+%a %Y-%m-%d %H:%M:%S UTC')" "$main" >"$unit_file"
+# The unit's session, for the test's exit to stop. A unit that starts while the test stops, whose
+# session that stop may not have read, ends at once.
+if ! printf '%s %s\n' "$name" "$main" >>"$TEST_UNIT_SESSIONS" 2>/dev/null || [[ -e $TEST_STOPPING ]]; then
+  "${0%/*}/session-signal" KILL "$main" || true
+fi
 status=0
 wait "$waiter" || status=$?
 "${0%/*}/session-signal" TERM "$main"
@@ -953,8 +1025,9 @@ make_stage() {
 
 # new_pi makes the fake Pi as provision.sh --key and --certificate leave it: the key and the first
 # certificate, and no other file of Ghost Wispr. Serve serves nothing, the node has not joined yet,
-# no recorder runs, and each log starts empty.
+# no recorder runs, no fake unit of a case before runs, and each log starts empty.
 new_pi() {
+  stop_fake_units
   rm -rf -- "$pi"
   mkdir -p -- "$deploy" "$units" "$key_dir" "$sysroot" "$state"
   printf 'the key\n' >"$key"
@@ -1132,6 +1205,76 @@ serve_now() {
 
 make_stage "$stage"
 readonly joined_status='{"Self":{"Tags":["tag:ghost-wispr"],"DNSName":"ghost-wispr.example-tailnet.ts.net."}}'
+
+# ---------------------------------------------------------------------------------------------------
+# cleanup: a case that fails midway leaves no fake unit of the test running, nor any other process
+# the test started. A planted fault of #208 once failed provision-unit and left its hung run's unit,
+# a provision.sh waiting in sleep 600, running. Run again with PROVISION_RUN_TEST_PLANTED_FAILURE=1
+# and a TMPDIR of its own, this test fails here while three things run that outlive the removal of
+# its directory: a run's unit that hangs in its manager read, as that unit did; a Serve unit whose
+# program sleeps 600 s; and a fake join's main process, a job of the test. Every process the test
+# starts has that TMPDIR in its environment, so the check reads each process's environment, not a
+# name the process may lack. The control: with PROVISION_RUN_TEST_KEEP_UNITS=1 the exit skips its
+# stops, as the test's exit did before, and 3 s after it the check must find the run unit's
+# provision.sh, the Serve unit's program and the job; it then ends what it found by exact PID.
+# Break it catches: an exit that stops no unit or job, the control's.
+begin cleanup
+if [[ -n ${PROVISION_RUN_TEST_PLANTED_FAILURE:-} ]]; then
+  new_pi
+  (TEST_MANAGER_ENV_HANG=1 RUN_OUT=$work_dir/planted-out run_provision "$stage") &
+  (PATH="$bin:$PATH" sudo systemd-run --wait --quiet --collect --unit=ghost-wispr-serve-planted \
+    --property=RuntimeMaxSec=600 "$real_sleep" 600) &
+  "$real_sleep" 600 &
+  for _ in {1..300}; do
+    [[ ! -s $TEST_LOG.hung-show-environment || $(grep -c . "$TEST_UNIT_SESSIONS" 2>/dev/null) != 2 ]] || break
+    sleep 0.1
+  done
+  [[ -s $TEST_LOG.hung-show-environment ]] || fail "control: the planted run never hung: $(cat -- "$work_dir/planted-out" 2>/dev/null)"
+  [[ $(grep -c . "$TEST_UNIT_SESSIONS") == 2 ]] \
+    || fail "control: the planted run's unit and the Serve unit are not both noted: $(cat -- "$TEST_UNIT_SESSIONS")"
+  fail 'the planted failure'
+fi
+# left_by DIR prints the PID of each process whose environment names DIR as its TMPDIR or a path
+# under it.
+left_by() {
+  grep -lzF -e "$1/" -e "TMPDIR=$1" /proc/[0-9]*/environ 2>/dev/null | sed -n 's|^/proc/\([0-9]*\)/environ$|\1|p' || true
+}
+# planted_run DIR [NAME=VALUE...] runs this test with the planted failure, TMPDIR DIR and the
+# settings NAME=VALUE, in an environment of its own, fails unless it failed with the planted
+# failure, and 3 s after its exit sets left to what left_by DIR prints.
+planted_run() {
+  local dir=$1 status=0
+  shift
+  mkdir -p -- "$dir"
+  env -i HOME="$HOME" PATH="$PATH" "$@" PROVISION_RUN_TEST_PLANTED_FAILURE=1 TMPDIR="$dir" \
+    bash "$script_dir/provision_run_test.sh" >"$dir.out" 2>&1 || status=$?
+  if ((status != 1)) || ! grep -Fqx 'provision run test FAILED (cleanup): the planted failure' "$dir.out"; then
+    fail "control: the planted run did not fail with the planted failure (exit $status): $(<"$dir.out")"
+  fi
+  sleep 3
+  left=$(left_by "$dir")
+}
+planted_run "$work_dir/kept" PROVISION_RUN_TEST_KEEP_UNITS=1
+kept_args=$(ps -o args= -p "$(paste -sd, <<<"${left:-0}")" 2>/dev/null || true)
+grep -Eq '^/bin/bash .*/stage/provision\.sh$' <<<"$kept_args" \
+  || fail "control: the check did not find the provision.sh of the planted run's unit: $kept_args"
+grep -Fqx "timeout --kill-after=1s 600s $real_sleep 600" <<<"$kept_args" \
+  || fail "control: the check did not find the planted Serve unit's program: $kept_args"
+(($(grep -Fcx "$real_sleep 600" <<<"$kept_args") >= 3)) \
+  || fail "control: the check did not find the sleeps of the run's hang, the Serve unit and the job: $kept_args"
+# shellcheck disable=SC2086 # One PID a word.
+kill -TERM $left 2>/dev/null || true
+for _ in {1..50}; do
+  left=$(left_by "$work_dir/kept")
+  [[ -n $left ]] || break
+  sleep 0.1
+done
+# shellcheck disable=SC2086 # One PID a word.
+[[ -z $left ]] || kill -KILL $left 2>/dev/null || true
+sleep 0.5
+[[ -z $(left_by "$work_dir/kept") ]] || fail "control: processes of the planted run are left after their stop: $(left_by "$work_dir/kept")"
+planted_run "$work_dir/stopped"
+[[ -z $left ]] || fail "a case that failed midway left processes of the test 3 s after its exit: $(ps -o pid=,args= -p "$(paste -sd, <<<"$left")")"
 
 # ---------------------------------------------------------------------------------------------------
 # bundle-refused: provision.sh reads no bundle. Input on standard input, such as the credential
