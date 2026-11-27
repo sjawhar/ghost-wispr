@@ -835,6 +835,12 @@ the release workflow.
 - `deploy/pi/check-deploy.sh`, run from a tailnet member device, checks that the Pi runs the latest
   release and that the timer installed it.
 
+Each release also has the call bridge's two images in GitHub's container registry, tagged with the
+release's tag: `ghcr.io/sjawhar/ghost-wispr-bridge`, the release build, and
+`ghcr.io/sjawhar/ghost-wispr-bridge-test`, the `callfault` build that the test instance runs.
+`deploy/bridge/Dockerfile` builds both in the release workflow, also for each pull request, and the
+workflow publishes a release only after it has pushed both images.
+
 Follow the [office recorder Pi runbook](docs/pi-setup.md) for the infrastructure the Pi needs, the
 provisioning steps, the update's lines and the acceptance checks.
 
