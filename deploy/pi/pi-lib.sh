@@ -55,6 +55,28 @@ provision_unit_command() {
     --property=TimeoutStopSec=10s "--uid=$2")
 }
 
+# The caller's settings that a run's unit gets: provision.sh's own and those of the nightly update it
+# starts, never a credential. A unit's Environment property is readable by any local user, so a
+# GHOST_WISPR_DISPATCH_TOKEN or GHOST_WISPR_DEEPGRAM_API_KEY that the caller exports stays out
+# (GPT-6.1 Sol's review of #203, round 6).
+# shellcheck disable=SC2034 # provision.sh, which sources this file, reads it.
+PI_LIB_PROVISION_SETTINGS=(GHOST_WISPR_DEPLOY_DIR GHOST_WISPR_UNIT_DIR GHOST_WISPR_SYSTEM_ROOT GHOST_WISPR_IDENTITY_KEY
+  GHOST_WISPR_JOIN_DIR GHOST_WISPR_STATUS_URL GHOST_WISPR_TAILSCALE_CALL_TIMEOUT GHOST_WISPR_RELEASE_API
+  GHOST_WISPR_VERSION_URL)
+
+# provision_unit_settings sets the array pl_unit_settings to the --setenv options of a run's unit:
+# PATH, and each setting of PI_LIB_PROVISION_SETTINGS that the caller sets.
+provision_unit_settings() {
+  local pl_name
+  # shellcheck disable=SC2034 # The caller reads it.
+  pl_unit_settings=("--setenv=PATH=$PATH")
+  for pl_name in "${PI_LIB_PROVISION_SETTINGS[@]}"; do
+    if [[ -n ${!pl_name+set} ]]; then
+      pl_unit_settings+=("--setenv=$pl_name=${!pl_name}")
+    fi
+  done
+}
+
 # provision_units_busy UNIT... prints a line for each UNIT.service that systemd has in another state
 # than inactive or failed: "UNIT.service is STATE since TIME, main PID N". It fails when it cannot
 # read a unit's state.

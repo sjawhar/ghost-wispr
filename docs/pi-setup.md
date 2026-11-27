@@ -265,11 +265,17 @@ restarts the recorder, and a restart ends a conversation that is being recorded.
    `provision.sh` runs as `ghost-wispr`, with passwordless sudo, and refuses data on standard
    input. Each run, of each mode, is the transient system unit `ghost-wispr-provision`, which
    `provision.sh` starts as root for `ghost-wispr` and waits for: its lines reach you as it runs,
-   and its exit status is the run's. One run at a time: while that unit or the join a run starts,
-   `ghost-wispr-provision-join`, is active, a second run fails at once, names the unit, when it
-   became active and its main PID, and changes nothing. To end a run, and its join, run
+   and its exit status is the run's. The unit gets `PATH` and the provisioning settings alone, never
+   a credential that your shell exports, as any local user can read a unit's settings. One run at
+   a time: while that unit or the join a run starts, `ghost-wispr-provision-join`, is active, a
+   second run fails at once, names the unit, when it became active and its main PID, and changes
+   nothing. The run checks the join again in its own unit, before it changes a file, as a join can
+   become active in between; and a run whose start loses to another's gives the same refusal. A
+   unit of either name that systemd keeps failed would take the name, so a run first resets it
+   with `systemctl reset-failed` and says so. To end a run, and its join, run
    `sudo systemctl stop ghost-wispr-provision ghost-wispr-provision-join`, which ends every
-   command of the run with it and makes the run fail (exit 143). An SSH session that ends does not
+   process in the run's unit, its control group, and makes the run fail (exit 143); a root process
+   that moves itself to another unit leaves that boundary. An SSH session that ends does not
    end a run: over Tailscale SSH the session's processes and the unit stay until the run ends. It
    refuses a directory whose files do not match its `manifest.json`, such as a checkout's
    `deploy/pi/`. Before it changes anything, it refuses while the environment of `ghost-wispr`'s
