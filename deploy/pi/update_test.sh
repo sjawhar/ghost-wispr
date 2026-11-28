@@ -24,8 +24,8 @@ readonly real_timeout
 
 # The cases of the spec's check c-update (dispatch://INFRA-5935/spec v5), each of which begin names.
 readonly case_names=(whole-set system-files-unchanged env-lines local-settings-untouched override-refused
-  drop-in-refused rollback-whole-set partial-install same-commit-different-set transition no-binary-yet
-  prev-copy-by-rename busy-session busy-call busy-during-download held-link-versions bad-manifest
+  drop-in-refused rollback-whole-set journald-activation partial-install same-commit-different-set transition
+  no-binary-yet prev-copy-by-rename busy-session busy-call busy-during-download held-link-versions bad-manifest
   secrets-only-change secrets-read-fails pi-secrets-hangs certificate release-and-certificate secrets-mode
   drift launcher unit-limits)
 current_case=setup
@@ -898,8 +898,9 @@ written_after_start() {
 # install_set NAME [DRIVE] puts release NAME's deploy set in place on the fake Pi as update.sh
 # leaves a set it installed and verified: each file where C2 puts it, the config rendered with the
 # shared drive DRIVE when given, an .env of the four owned lines and one operator line, the
-# bootstrap files as provision.sh installs them, deploy.verified naming the set, and the recorder
-# running the installed binary, started after each of these files was written.
+# bootstrap files as provision.sh installs them, deploy.verified naming the set, journald running the
+# installed journald setting (journald-ghost-wispr.conf.applied), and the recorder running the
+# installed binary, started after each of these files was written.
 install_set() {
   local name=$1 drive=${2:-} deploy=$releases/$1/ghost-wispr-pi-deploy file
   for file in "${set_files[@]}" "${bootstrap_files[@]}"; do
@@ -912,6 +913,7 @@ install_set() {
   write_env "$opt/.env" GHOST_WISPR_ADDR=127.0.0.1:8080 GOOGLE_API_USE_CLIENT_CERTIFICATE=false \
     GHOST_WISPR_DEEPGRAM_API_KEY=dg-test-1 GHOST_WISPR_DISPATCH_TOKEN=tok-test-1 GHOST_WISPR_JABRA_MUTE_BUTTON=false
   record_verified "$name"
+  sha "$(installed_path journald-ghost-wispr.conf)" >"$opt/journald-ghost-wispr.conf.applied"
   cp -- "$opt/ghost-wispr" "$state/running-image"
   mark_recorder_started
 }
@@ -1325,6 +1327,8 @@ awk '/udevadm control --reload/ { r = NR } /udevadm trigger/ { t = NR } END { ex
   || fail "whole-set: udev was not reloaded before its trigger: $(<"$state/sudo.log")"
 awk '/restart systemd-journald/ { r = NR } /journalctl --flush/ { f = NR } END { exit !(r && f && r < f) }' "$state/sudo.log" \
   || fail "whole-set: journald did not restart before the journal's flush: $(<"$state/sudo.log")"
+[[ $(cat -- "$opt/journald-ghost-wispr.conf.applied" 2>/dev/null) == "$journald_sum" ]] \
+  || fail "whole-set: did not record the journald setting applied after its restart and flush: $(cat -- "$opt/journald-ghost-wispr.conf.applied" 2>/dev/null)"
 # pi-secrets ran once, from the staged binary (the release's, checked against binary_sha256, not
 # the installed one), with the credential file and the Pi's secret names, under its 60 s bound.
 [[ $(grep -c '^call$' "$state/pi-secrets.log") == 1 ]] || fail "whole-set: pi-secrets ran $(grep -c '^call$' "$state/pi-secrets.log") times"
@@ -1793,6 +1797,55 @@ for answer in 'SESSION|a session and no call' \
   release=b run_update
   expect_run "rollback-whole-set control (${answer#*|} after the restart)" 0 "ghost-wispr update: installed commit $commit_b (invocation test-invocation-7)"
 done
+
+begin journald-activation
+# journald-activation: the first install of the journald setting, whose journald restart fails, is
+# retried (GPT-6.1 Sol's review of #209). The Pi is as the update.sh before the setting left it: no
+# setting installed, none applied, a deploy.verified of the nine files it knew, and a .prev copy of
+# each. The rollback restores each file that has a .prev copy and leaves the new setting installed,
+# as it has none, and records no applied setting. The next run finds the setting's bytes installed
+# already, and restarts journald and flushes the journal all the same, as journald does not run it;
+# then it records the setting applied, and a later run restarts nothing. A run cut short between the
+# install and the restart leaves the same state. Breaks they catch: a run that takes an installed
+# setting for an applied one, so journald never restarts on it and the release is verified; one that
+# records the setting applied before its restart and flush succeed.
+new_pi
+install_set a
+rm -f -- "$(installed_path journald-ghost-wispr.conf)" "$opt/journald-ghost-wispr.conf.applied"
+grep -v '  journald-ghost-wispr\.conf$' "$opt/deploy.verified" >"$work_dir/verified-nine"
+cp -- "$work_dir/verified-nine" "$opt/deploy.verified"
+for file in "${set_files[@]}" .env ghost-wispr; do
+  [[ $file == journald-ghost-wispr.conf ]] || cp -p -- "$(installed_path "$file")" "$opt/$file.prev"
+done
+printf '%s\n' 'systemctl restart systemd-journald' >"$state/fail-sudo"
+release=b run_update
+what='journald-activation (the first install, whose journald restart fails)'
+[[ ! -e $state/fail-sudo ]] || fail "$what: the update never restarted journald"
+expect_run "$what" 10
+expect_line_like "$what" 'ghost-wispr update: could not reload udev, or restart logind or journald; no previous release to restore for journald-ghost-wispr\.conf, which stay as installed; .*'
+cmp -s -- "$releases/b/ghost-wispr-pi-deploy/journald-ghost-wispr.conf" "$(installed_path journald-ghost-wispr.conf)" \
+  || fail "$what: the rollback did not leave release b's journald setting installed"
+[[ ! -e $opt/journald-ghost-wispr.conf.applied ]] \
+  || fail "$what: recorded a journald setting applied, whose restart failed: $(<"$opt/journald-ghost-wispr.conf.applied")"
+cmp -s -- "$work_dir/verified-nine" "$opt/deploy.verified" || fail "$what: changed deploy.verified"
+: >"$state/sudo.log"
+release=b run_update
+what='journald-activation (the retry)'
+expect_run "$what" 0 "ghost-wispr update: installed commit $commit_b (invocation test-invocation-7)"
+expect_verified "$what" b
+journald_sum=$(sha "$(installed_path journald-ghost-wispr.conf)")
+for line in "timeout=30s systemctl restart systemd-journald journald=$journald_sum" "timeout=30s journalctl --flush journald=$journald_sum"; do
+  [[ $(grep -cFx -- "$line" "$state/sudo.log") == 1 ]] || fail "$what: sudo ran no $line once: $(<"$state/sudo.log")"
+done
+awk '/restart systemd-journald/ { r = NR } /journalctl --flush/ { f = NR } END { exit !(r && f && r < f) }' "$state/sudo.log" \
+  || fail "$what: journald did not restart before the journal's flush: $(<"$state/sudo.log")"
+! grep -qF ' install /etc/systemd/journald.conf.d/' "$state/sudo.log" || fail "$what: installed the journald setting again, whose bytes are installed"
+[[ $(cat -- "$opt/journald-ghost-wispr.conf.applied" 2>/dev/null) == "$journald_sum" ]] \
+  || fail "$what: did not record the journald setting applied: $(cat -- "$opt/journald-ghost-wispr.conf.applied" 2>/dev/null)"
+: >"$state/sudo.log"
+release=b run_update
+expect_run 'journald-activation (a run after the retry)' 0 "ghost-wispr update: already current at commit $commit_b"
+! grep -Eq 'journald|journalctl' "$state/sudo.log" || fail "journald-activation: restarted journald on an applied setting: $(<"$state/sudo.log")"
 
 begin partial-install
 # partial-install: an update cut short mid-swap (a power cut, or the launcher's time limit) leaves

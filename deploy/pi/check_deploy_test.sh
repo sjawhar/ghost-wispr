@@ -36,8 +36,8 @@ readonly old=1111111111111111111111111111111111111111 new=2222222222222222222222
 readonly run_old=0000000000000000000000000000000a run_new=0000000000000000000000000000000b
 readonly run_current=0000000000000000000000000000000c run_by_hand=0000000000000000000000000000000d
 mkdir -p "$bin" "$releases"
-real_curl=$(command -v curl) real_cat=$(command -v cat) real_timeout=$(command -v timeout) real_find=$(command -v find)
-readonly real_curl real_cat real_timeout real_find
+real_curl=$(command -v curl) real_cat=$(command -v cat) real_timeout=$(command -v timeout)
+readonly real_curl real_cat real_timeout
 
 # --- The fakes.
 
@@ -145,18 +145,6 @@ fi
 exec "${FAKE_REAL_CAT:?}" "$@"
 EOF
 
-# find. On the fake Pi it refuses each call while state/find-refused exists, as the Pi refuses
-# ghost-wispr a directory it may not read, whatever user runs this test; every other call is the
-# real find.
-cat >"$bin/find" <<'EOF'
-#!/usr/bin/env bash
-if [[ ${FAKE_ON_PI:-} == 1 && -e ${FAKE_STATE:-}/find-refused ]]; then
-  printf "find: '%s': Permission denied\n" "${1:-.}" >&2
-  exit 1
-fi
-exec "${FAKE_REAL_FIND:?}" "$@"
-EOF
-
 # sudo on the fake Pi: ghost-wispr's passwordless sudo, which the driver must call with -n, as no
 # terminal can answer a password prompt. state/sudo-refused stands for a Pi where sudo asks for a
 # password, which -n refuses.
@@ -254,7 +242,7 @@ show() {
 [[ ! -f $root/etc/systemd/journald.conf ]] || show /etc/systemd/journald.conf
 names=$(for dir in /etc /run /usr/lib; do
   [[ ! -d $root$dir/systemd/journald.conf.d ]] \
-    || "$FAKE_REAL_FIND" "$root$dir/systemd/journald.conf.d" -mindepth 1 -maxdepth 1 -name '*.conf' -printf '%f\n'
+    || find "$root$dir/systemd/journald.conf.d" -mindepth 1 -maxdepth 1 -name '*.conf' -printf '%f\n'
 done | LC_ALL=C sort -u)
 for name in $names; do
   for dir in /etc /run /usr/lib; do
@@ -279,12 +267,28 @@ shift
 exec "$@"
 EOF
 
-# systemctl, on the device or the Pi: the driver changes nothing, so any call is noted and refused.
+# systemctl, on the device or the Pi: the driver changes nothing. It reads journald's state with
+# `show systemd-journald -p MainPID --value` and `-p ActiveEnterTimestamp --value --timestamp=unix`,
+# which state/journald-pid and state/journald-started answer, each read noted in
+# log/systemctl-show; state/systemctl-show-fails stands for a Pi where they fail. Any other call is
+# noted in log/systemctl and refused.
 cat >"$bin/systemctl" <<'EOF'
 #!/usr/bin/env bash
-printf '%s\n' "$*" >>"$FAKE_LOG/systemctl"
-echo 'fake systemctl: the acceptance driver must change nothing on the Pi' >&2
-exit 1
+case $* in
+  'show systemd-journald -p MainPID --value') answer=journald-pid ;;
+  'show systemd-journald -p ActiveEnterTimestamp --value --timestamp=unix') answer=journald-started ;;
+  *)
+    printf '%s\n' "$*" >>"$FAKE_LOG/systemctl"
+    echo 'fake systemctl: the acceptance driver must change nothing on the Pi' >&2
+    exit 1
+    ;;
+esac
+printf '%s\n' "$*" >>"$FAKE_LOG/systemctl-show"
+if [[ -e $FAKE_STATE/systemctl-show-fails ]]; then
+  echo 'Failed to connect to bus: No such file or directory' >&2
+  exit 1
+fi
+cat -- "$FAKE_STATE/$answer"
 EOF
 chmod +x "$bin"/*
 
@@ -453,8 +457,22 @@ recorder_applies() {
 # input as it should be, and the latest release the new one. Its journald files are the office
 # Pi's of 2026-11-27 (systemd 257, Raspberry Pi OS): an /etc/systemd/journald.conf with no setting,
 # raspberrypi-sys-mods' 40-rpi-volatile-storage.conf and systemd's syslog.conf, with the release's
-# setting installed as 90-ghost-wispr.conf, and journald writing its journal under
-# /var/log/journal.
+# setting installed as 90-ghost-wispr.conf, each last changed at @1795600000. journald (PID 312)
+# started at @1795600100, after them, and has this machine's /var/log/journal/<id>/system.journal
+# open: pi/root/proc/312/fd holds its descriptors, as /proc holds a process's.
+readonly machine_id=31e1ef849026403294ddccad747a7e62
+readonly card_journal=/var/log/journal/$machine_id/system.journal run_journal=/run/log/journal/$machine_id/system.journal
+# journald_opens PATH...: the fake journald's descriptors are its standard ones, /dev/null, and one
+# for each journal file PATH, in place of any before.
+journald_opens() {
+  local fd=3 path
+  rm -f -- "$root"/proc/312/fd/*
+  ln -s /dev/null "$root/proc/312/fd/0"
+  for path in "$@"; do
+    ln -s "$path" "$root/proc/312/fd/$fd"
+    fd=$((fd + 1))
+  done
+}
 case_count=0
 new_case() {
   name=$1
@@ -464,7 +482,7 @@ new_case() {
   root=$case_dir/pi/root
   units=$home/.config/systemd/user
   mkdir -p "$deploy" "$units" "$state" "$github" "$log" "$root/etc/systemd/journald.conf.d" \
-    "$root/usr/lib/systemd/journald.conf.d" "$root/var/log/journal/31e1ef849026403294ddccad747a7e62"
+    "$root/usr/lib/systemd/journald.conf.d" "$root/var/log/journal/$machine_id" "$root/proc/312/fd"
   printf '%s\n' '#  This file is part of systemd.' '#' '# Entries in this file show the compile time defaults. Local configuration' \
     '# should be created by either modifying this file (or a copy of it placed in' \
     '# /etc/ if the original file is shipped in /usr/), or by creating "drop-ins" in' \
@@ -474,7 +492,12 @@ new_case() {
   printf '%s\n' '# This file is part of systemd.' '' '[Journal]' 'ForwardToSyslog=yes' \
     >"$root/usr/lib/systemd/journald.conf.d/syslog.conf"
   cp -- "$script_dir/files/journald-ghost-wispr.conf" "$root/etc/systemd/journald.conf.d/90-ghost-wispr.conf"
-  printf 'LPKSHHRH the journal\n' >"$root/var/log/journal/31e1ef849026403294ddccad747a7e62/system.journal"
+  printf 'LPKSHHRH the journal\n' >"$root$card_journal"
+  printf '%s\n' "$machine_id" >"$root/etc/machine-id"
+  touch -d @1795600000 -- "$root/etc/systemd/journald.conf" "$root"/{etc,usr/lib}/systemd/journald.conf.d/*.conf
+  printf '312\n' >"$state/journald-pid"
+  printf '@1795600100\n' >"$state/journald-started"
+  journald_opens "$card_journal"
   local stage=$releases/$new/stage/ghost-wispr-pi-deploy
   cp -- "$stage/ghost-wispr-update-launcher.sh" "$deploy/"
   cp -- "$stage/ghost-wispr-update.service" "$stage/ghost-wispr-update.timer" "$units/"
@@ -511,8 +534,8 @@ run_driver() {
   rc=0
   out=$(PATH="$bin:$PATH" FAKE_HOME="$home" FAKE_STATE="$state" FAKE_GITHUB="$github" FAKE_LOG="$log" \
     FAKE_PI_HOST="$PI_HOST" FAKE_RELEASES_API="$releases_api" FAKE_REAL_CURL="$real_curl" FAKE_REAL_CAT="$real_cat" \
-    FAKE_REAL_FIND="$real_find" FAKE_ROOT="$root" GHOST_WISPR_PI_ENV="$env_file" GHOST_WISPR_DEPLOY_DIR="$deploy" \
-    GHOST_WISPR_JOURNAL_DIR="$root/var/log/journal" GHOST_WISPR_RELEASES_API="$releases_api" \
+    FAKE_ROOT="$root" GHOST_WISPR_PI_ENV="$env_file" GHOST_WISPR_DEPLOY_DIR="$deploy" \
+    GHOST_WISPR_PI_ROOT="$root" GHOST_WISPR_RELEASES_API="$releases_api" \
     "$real_timeout" 120 bash "${driver_copy:-$driver}" "$@" 2>&1) || rc=$?
 }
 
@@ -910,14 +933,16 @@ run_driver
 expect_verdicts PASS PASS PASS PASS UNKNOWN PASS PASS PASS
 expect 5 UNKNOWN ghost-wispr-update.service
 
-# sudo -n refused: the journal and the Serve status cannot be read. Break it catches: a driver that
-# takes sudo's refusal for an empty journal or an empty Serve config.
+# sudo -n refused: the journal, the Serve status and journald's descriptors cannot be read. Break it
+# catches: a driver that takes sudo's refusal for an empty journal, an empty Serve config or a
+# journald with no journal open.
 new_case 'sudo -n refused'
 : >"$state/sudo-refused"
 run_driver
-expect_verdicts PASS PASS PASS PASS UNKNOWN PASS UNKNOWN PASS
+expect_verdicts PASS PASS PASS PASS UNKNOWN PASS UNKNOWN UNKNOWN
 expect 5 UNKNOWN sudo
 expect 7 UNKNOWN sudo
+expect 8 UNKNOWN 'cannot list the journal files that journald has open' 'a password is required'
 
 # SSH does not reach the Pi: every check that reads over SSH is UNKNOWN and says so; the checks over
 # Serve still run, checks 2 and 3 among them, which read the recorder's report and no file of the
@@ -1162,15 +1187,16 @@ expect 7 UNKNOWN 'tailscale serve status'
 # on which raspberrypi-sys-mods' 40-rpi-volatile-storage.conf sets Storage=volatile: the release's
 # 90-ghost-wispr.conf comes after it in the order of file names, so its values are the ones journald
 # runs. Breaks they catch: a driver that takes the first value of a setting, not the last, or reads
-# the release's file alone, so the vendor's volatile storage or an older cap passes; one that passes
-# a setting with no journal on the card, which a journald not restarted since the setting went in
-# leaves; one that takes an unreadable setting or directory for a pass.
-journal_file=31e1ef849026403294ddccad747a7e62/system.journal
+# the release's file alone, so the vendor's volatile storage or an older cap passes; one that takes
+# a persistent journal on the card for the one journald writes, which a journald that writes /run
+# leaves (GPT-6.1 Sol's review of #209); one that passes a journald started before its setting
+# changed, which runs the setting before; one that takes an unreadable state for a pass.
 new_case 'the journald setting as the release gives it'
 run_driver
 expect_verdicts PASS PASS PASS PASS PASS PASS PASS PASS
 expect 8 PASS 'Storage=persistent' 'SplitMode=none' 'SystemMaxUse=1G' 'SystemKeepFree=5G' 'SystemMaxFileSize=64M' \
-  'SyncIntervalSec=5m' "$root/var/log/journal/$journal_file"
+  'SyncIntervalSec=5m' "journald (PID 312) writes $card_journal" 'started at @1795600100, after its setting last changed (@1795600000)'
+grep -Fq "find $root/proc/312/fd -maxdepth 1" "$log/sudo" || fail "the driver did not read journald's descriptors with sudo -n: $(cat -- "$log/sudo")"
 new_case "no journald setting of the release installed"
 rm -f -- "$root/etc/systemd/journald.conf.d/90-ghost-wispr.conf"
 run_driver
@@ -1179,6 +1205,7 @@ expect 8 FAIL 'Storage is volatile, from /usr/lib/systemd/journald.conf.d/40-rpi
   "journald-ghost-wispr.conf gives persistent" 'SystemMaxUse is not set'
 new_case "a drop-in after the release's setting that sets volatile storage"
 printf '[Journal]\nStorage=volatile\n' >"$root/usr/lib/systemd/journald.conf.d/95-rpi-volatile.conf"
+touch -d @1795600000 -- "$root/usr/lib/systemd/journald.conf.d/95-rpi-volatile.conf"
 run_driver
 expect_verdicts PASS PASS PASS PASS PASS PASS PASS FAIL
 expect 8 FAIL 'Storage is volatile, from /usr/lib/systemd/journald.conf.d/95-rpi-volatile.conf'
@@ -1186,34 +1213,66 @@ expect 8 FAIL 'Storage is volatile, from /usr/lib/systemd/journald.conf.d/95-rpi
 new_case 'an older journald setting installed'
 awk '{ print /^SystemMaxUse=/ ? "SystemMaxUse=4G" : $0 }' "$script_dir/files/journald-ghost-wispr.conf" \
   >"$root/etc/systemd/journald.conf.d/90-ghost-wispr.conf"
+touch -d @1795600000 -- "$root/etc/systemd/journald.conf.d/90-ghost-wispr.conf"
 run_driver
 expect_verdicts PASS PASS PASS PASS PASS PASS PASS FAIL
 expect 8 FAIL 'SystemMaxUse is 4G, from /etc/systemd/journald.conf.d/90-ghost-wispr.conf' 'gives 1G'
-new_case 'no journal on the card'
-rm -f -- "$root/var/log/journal/$journal_file"
+# Sol's reproduction: a persistent system.journal of 2000-01-01 on the card, which journald wrote
+# before it went back to volatile storage, and the journal it writes now in /run. The setting's
+# files are the release's, as they are after a restore that no restart followed.
+new_case 'a stale journal on the card, and journald writing /run'
+touch -d 2000-01-01 -- "$root$card_journal"
+journald_opens "$run_journal"
 run_driver
 expect_verdicts PASS PASS PASS PASS PASS PASS PASS FAIL
-expect 8 FAIL 'no system.journal' 'in /run'
-new_case 'no journal directory'
-rm -rf -- "$root/var/log/journal"
+expect 8 FAIL "journald (PID 312) writes $run_journal, in /run, which a reboot loses" \
+  "journald (PID 312) does not write $card_journal"
+new_case 'journald writing the card and /run'
+journald_opens "$card_journal" "$run_journal"
 run_driver
 expect_verdicts PASS PASS PASS PASS PASS PASS PASS FAIL
-expect 8 FAIL "$root/var/log/journal does not exist"
+expect 8 FAIL "writes $run_journal, in /run"
+[[ $(verdict_line 8) != *'does not write'* ]] || fail "check 8 says journald does not write the card's journal, which it has open: $(verdict_line 8)"
+new_case 'journald writing the journal of another machine id'
+journald_opens /var/log/journal/0123456789abcdef0123456789abcdef/system.journal
+run_driver
+expect_verdicts PASS PASS PASS PASS PASS PASS PASS FAIL
+expect 8 FAIL "does not write $card_journal"
+new_case 'journald started before its setting changed'
+touch -d @1795600200 -- "$root/etc/systemd/journald.conf.d/90-ghost-wispr.conf"
+run_driver
+expect_verdicts PASS PASS PASS PASS PASS PASS PASS FAIL
+expect 8 FAIL 'journald started at @1795600100, before /etc/systemd/journald.conf.d/90-ghost-wispr.conf changed at @1795600200'
+new_case 'journald not running'
+printf '0\n' >"$state/journald-pid"
+run_driver
+expect_verdicts PASS PASS PASS PASS PASS PASS PASS FAIL
+expect 8 FAIL 'journald is not running (systemctl show systemd-journald gives MainPID 0)'
 new_case 'the journald setting cannot be read'
 : >"$state/systemd-analyze-fails"
 run_driver
 expect_verdicts PASS PASS PASS PASS PASS PASS PASS UNKNOWN
 expect 8 UNKNOWN 'systemd-analyze cat-config systemd/journald.conf' 'Permission denied'
-new_case 'the journal directory cannot be read'
-: >"$state/find-refused"
+new_case "journald's state cannot be read"
+: >"$state/systemctl-show-fails"
 run_driver
 expect_verdicts PASS PASS PASS PASS PASS PASS PASS UNKNOWN
-expect 8 UNKNOWN "$root/var/log/journal" 'Permission denied'
+expect 8 UNKNOWN "cannot read journald's state on the Pi (systemctl show systemd-journald)" 'Failed to connect to bus'
+new_case "the Pi's machine id cannot be read"
+printf '%s\n' "$root/etc/machine-id" >"$state/unreadable"
+run_driver
+expect_verdicts PASS PASS PASS PASS PASS PASS PASS UNKNOWN
+expect 8 UNKNOWN "cannot read the Pi's machine id (/etc/machine-id)" 'Permission denied'
 new_case 'SSH lost while the driver reads the journald setting'
 printf 'systemd-analyze\n' >"$state/ssh-lost-on"
 run_driver
 expect_verdicts PASS PASS PASS PASS PASS PASS PASS UNKNOWN
 expect 8 UNKNOWN SSH
+new_case "SSH lost while the driver reads journald's state"
+printf 'systemd-journald\n' >"$state/ssh-lost-on"
+run_driver
+expect_verdicts PASS PASS PASS PASS PASS PASS PASS UNKNOWN
+expect 8 UNKNOWN 'cannot reach' 'to read what journald runs' SSH
 new_case 'a release with no journald setting'
 mkdir -p "$case_dir/release/stage"
 cp -R -- "$releases/$new/stage/ghost-wispr-pi-deploy" "$case_dir/release/stage/"
