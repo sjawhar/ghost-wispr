@@ -43,6 +43,9 @@ readonly STATUS_URL="${GHOST_WISPR_STATUS_URL:-http://127.0.0.1:8080/api/status}
 readonly VERSION_URL="${GHOST_WISPR_VERSION_URL:-http://127.0.0.1:8080/api/version}"
 readonly BINARY="$DEPLOY_DIR/ghost-wispr"
 readonly VERIFIED="$DEPLOY_DIR/deploy.verified"
+# The SHA-256 of the journald setting that journald last restarted and flushed on (reload_system,
+# journald_applied).
+readonly JOURNALD_APPLIED="$DEPLOY_DIR/journald-ghost-wispr.conf.applied"
 # The record of the update.sh before the deploy set, which installed the binary alone. The first
 # install of a set removes it.
 readonly OLD_VERIFIED="$DEPLOY_DIR/ghost-wispr.verified"
@@ -561,7 +564,8 @@ sudo_install() {
 # its bound: udevadm control --reload, then udevadm trigger; systemctl restart systemd-journald, then
 # journalctl --flush, which moves the boot's journal from /run to /var/log/journal once journald runs
 # with persistent storage. A journald restart keeps the services' log streams open (systemd keeps
-# them in journald's file descriptor store).
+# them in journald's file descriptor store). Once both journald calls succeed, it writes the
+# installed setting's SHA-256 to JOURNALD_APPLIED (journald_applied).
 reload_system() {
   local name
   for name in "$@"; do
@@ -576,15 +580,27 @@ reload_system() {
       journald-ghost-wispr.conf)
         timeout 30s sudo -n systemctl restart systemd-journald || return 1
         timeout 30s sudo -n journalctl --flush || return 1
+        sum "$(installed_path "$name")" >"$JOURNALD_APPLIED.tmp" && mv -f -- "$JOURNALD_APPLIED.tmp" "$JOURNALD_APPLIED" \
+          || return 1
         ;;
     esac
   done
 }
 
+# journald_applied PATH: journald last restarted, and flushed, on the journald setting PATH holds
+# now. A setting installed with no restart that succeeded after it, such as a first install whose
+# restart failed, which a rollback leaves installed as it has no .prev copy, or a run cut short
+# between the install and the restart, is not applied (GPT-6.1 Sol's review of #209).
+journald_applied() {
+  [[ -f $JOURNALD_APPLIED && -f $1 && $(<"$JOURNALD_APPLIED") == "$(sum "$1")" ]]
+}
+
 # swap_in NAME... puts each staged file NAME ($stage/new/NAME) in place, and notes it in swapped,
 # and each system file that changed in changed_system. A system file equal to the installed one is
-# left as it is. device.crt goes in with its version file, device.crt.version, as one change
-# (install_certificate_pair). It returns non-zero at the first file it could not install.
+# left as it is; the journald setting goes to changed_system all the same when journald does not run
+# it yet (journald_applied), so that journald restarts on it. device.crt goes in with its version
+# file, device.crt.version, as one change (install_certificate_pair). It returns non-zero at the
+# first file it could not install.
 swap_in() {
   local name path
   for name in "$@"; do
@@ -596,6 +612,9 @@ swap_in() {
       install_certificate_pair "$stage/new/device.crt" "$certificate_version" || return 1
     elif is_system_file "$name"; then
       if [[ -f $path ]] && cmp -s -- "$stage/new/$name" "$path"; then
+        if [[ $name == journald-ghost-wispr.conf ]] && ! journald_applied "$path"; then
+          changed_system+=("$name")
+        fi
         continue
       fi
       swapped+=("$name")

@@ -1052,8 +1052,9 @@ A run of `update.sh`:
    it keeps a `.prev` copy of each installed file of the set that `deploy.verified` lists. It
    installs the three system files with `sudo -n`, only when they change. Then it reloads the user
    units, reloads udev, restarts logind, or restarts journald and moves the boot's journal to the
-   card (`journalctl --flush`), each when its file changed, restarts the recorder, and waits up to
-   120 s for `/api/version` to answer the release's commit and for `/api/status` to answer a status
+   card (`journalctl --flush`), each when its file changed (journald also when it does not run the
+   installed setting yet, "The Pi's journal"), restarts the recorder, and waits up to 120 s for
+   `/api/version` to answer the release's commit and for `/api/status` to answer a status
    it can read, whose `call`, when it has one, is an object: a release whose status the update
    cannot read would stop each later run at its first status read, before it could install a fix.
    Then it writes `deploy.verified` and prints
@@ -1122,8 +1123,8 @@ the check's input. It exits 1 when one check is not `PASS`.
 6. The protected recordings, which no deploy step may change, still have the SHA-256 that
    `PI_PROTECTED_RECORDINGS` in `pi.env` lists for them.
 7. The three provisioning files on the Pi and Serve's setting match the release.
-8. journald runs the release's `journald-ghost-wispr.conf` ("The Pi's journal"), and
-   `/var/log/journal` holds the journal.
+8. journald runs the release's `journald-ghost-wispr.conf` ("The Pi's journal"): the running
+   journald writes the journal on the card, and started after its setting last changed.
 
 To run an update by hand, start its unit, so the launcher's time limit applies and a start of the
 timer joins it. The command returns when the run ends. Check 5 then fails for that install, which
@@ -1216,9 +1217,13 @@ value wins, so `90-` overrides the vendor's `40-`. It sets `Storage=persistent`;
 so `ghost-wispr`'s units log to the one system journal, as before; a cap of `SystemMaxUse=1G`,
 about seven months at the rate of 2026-11; `SystemKeepFree=5G` for the recordings; files of
 `SystemMaxFileSize=64M`; and journald's default `SyncIntervalSec=5m`: a longer interval writes the
-card less, but loses more of the lines before a power cut. check 8 of `check-deploy.sh` fails when
-another drop-in overrides one of these values, or when journald does not write the journal to the
-card. Boots before the first install of this setting are gone.
+card less, but loses more of the lines before a power cut. The update records the setting that
+journald last restarted and flushed on, in `/opt/ghost-wispr/journald-ghost-wispr.conf.applied`, and
+restarts journald again in each later install until a restart and its flush succeed, as after a
+first install whose restart failed. check 8 of `check-deploy.sh` fails when another drop-in
+overrides one of these values, when the running journald has no journal on the card open, or has
+one in `/run`, or when it started before a file of its setting last changed. Boots before the first
+install of this setting are gone.
 
 List the boots the journal holds, then read the recorder's lines of the boot before this one, and
 that boot's kernel lines (USB devices such as the Jabra):
