@@ -97,7 +97,8 @@ export TEST_LOG="$work_dir/log" TEST_UID="$uid" TEST_RUNTIME_DIR="$runtime_dir" 
   TEST_REAL_DATE="$real_date" TEST_REAL_SLEEP="$real_sleep" TEST_STATE="$state" TEST_RELEASES="$work_dir/releases" \
   TEST_CLOCK="$work_dir/clock" TEST_SYSTEM_UNITS="$system_units" TEST_REAL_JQ="$real_jq" \
   TEST_REAL_INSTALL="$real_install" TEST_REAL_OPENSSL="$real_openssl" \
-  TEST_UNIT_SESSIONS="$work_dir/unit-sessions" TEST_STOPPING="$work_dir/stopping"
+  TEST_UNIT_SESSIONS="$work_dir/unit-sessions" TEST_STOPPING="$work_dir/stopping" \
+  TEST_FAKE_JOURNALD="$script_dir/testdata/fake-journald"
 mkdir -p -- "$bin" "$join" "$first_join" "$TEST_RELEASES" "$system_units"
 
 # unit_pids SID... prints the PID of each process of the sessions SID... that is this test's, whose
@@ -214,8 +215,9 @@ EOF
 # provision.sh installs its own files as ghost-wispr, and the nightly update the system files: any
 # other install with sudo, any udevadm call and a logind restart are errors that the test reports.
 # The nightly update's own calls each have -n: it installs the system files under
-# GHOST_WISPR_SYSTEM_ROOT, reloads udev, restarts logind and journald and flushes the journal, which
-# the log records, and reads Serve's setting.
+# GHOST_WISPR_SYSTEM_ROOT, reloads udev and restarts logind, which the log records, restarts journald,
+# flushes the journal and reads journald's usage line, each of which the fake journald
+# (testdata/fake-journald, state in $TEST_STATE/journald) does, and reads Serve's setting.
 cat >"$bin/sudo" <<'EOF'
 #!/usr/bin/env bash
 # The start of the run's own unit is logged apart, in $TEST_LOG.provision-units: $TEST_LOG holds what
@@ -242,7 +244,18 @@ if [[ ${1:-} == -n ]]; then
       shift
       exec install "$@"
       ;;
-    udevadm | systemctl | journalctl) ;;
+    udevadm) ;;
+    systemctl)
+      if [[ ${*:2} == 'restart systemd-journald' ]]; then
+        exec "$TEST_FAKE_JOURNALD" "$TEST_STATE/journald" restart
+      fi
+      ;;
+    journalctl)
+      if [[ ${*:2} == --flush ]]; then
+        exec "$TEST_FAKE_JOURNALD" "$TEST_STATE/journald" flush
+      fi
+      exec "$TEST_FAKE_JOURNALD" "$TEST_STATE/journald" usage "${@:2}"
+      ;;
     tailscale)
       shift
       exec tailscale "$@"
@@ -536,6 +549,10 @@ else
   printf 'systemctl %s\n' "$*" >>"$TEST_LOG.system-calls"
 fi
 error() { printf 'fake systemctl: %s: systemctl %s\n' "$1" "${*:2}" >>"$TEST_LOG.errors"; }
+# journald's MainPID, which any user may read, is the fake journald's.
+if [[ $* == 'show systemd-journald -p MainPID --value' ]]; then
+  exec "$TEST_FAKE_JOURNALD" "$TEST_STATE/journald" pid
+fi
 if [[ ${1:-} != --user ]]; then
   # The fakes' own directory, which the test's own calls do not have on their PATH.
   session_signal=${0%/*}/session-signal
@@ -1030,7 +1047,8 @@ make_stage() {
 new_pi() {
   stop_fake_units
   rm -rf -- "$pi"
-  mkdir -p -- "$deploy" "$units" "$key_dir" "$sysroot" "$state"
+  mkdir -p -- "$deploy" "$units" "$key_dir" "$sysroot/etc" "$state"
+  printf '31e1ef849026403294ddccad747a7e62\n' >"$sysroot/etc/machine-id"
   printf 'the key\n' >"$key"
   printf 'the certificate\n' >"$deploy/device.crt"
   rm -f -- "$TEST_LOG" "$TEST_LOG".*

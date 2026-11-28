@@ -164,10 +164,23 @@ EOF
 # ghost-wispr's user unit <unit>, one a line; only root reads it (sudo), and the Pi keeps no user
 # journal (--user finds nothing). It answers the match _SYSTEMD_USER_UNIT=<unit>. -o cat prints each
 # message alone; any other output form puts a time, the host and an identifier before it, as the
-# short form does. With no entry it prints "-- No entries --", unless -q.
+# short form does. With no entry it prints "-- No entries --", unless -q. journald's usage lines,
+# one JSON entry a line of state/journald-usage as `journalctl -o json` prints them, answer
+# `-b -q -o json -n 1 _PID=<pid> _TRANSPORT=driver MESSAGE_ID=ec387f577b844b8fa948f33cad9a75e6`:
+# the newest of that PID, to root alone.
 cat >"$bin/journalctl" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
+if [[ " $* " == *' MESSAGE_ID='* ]]; then
+  if [[ $# != 9 || "${*:1:6}" != '-b -q -o json -n 1' || $7 != _PID=* || $8 != _TRANSPORT=driver \
+    || $9 != MESSAGE_ID=ec387f577b844b8fa948f33cad9a75e6 ]]; then
+    printf 'fake journalctl: unexpected arguments: %s\n' "$*" >&2
+    exit 1
+  fi
+  [[ ${FAKE_SUDO:-} == 1 && -f $FAKE_STATE/journald-usage ]] || exit 0
+  jq -c --arg pid "${7#_PID=}" 'select(._PID == $pid)' "$FAKE_STATE/journald-usage" | tail -n 1
+  exit 0
+fi
 unit=
 form=short
 quiet=false
@@ -267,28 +280,23 @@ shift
 exec "$@"
 EOF
 
-# systemctl, on the device or the Pi: the driver changes nothing. It reads journald's state with
-# `show systemd-journald -p MainPID --value` and `-p ActiveEnterTimestamp --value --timestamp=unix`,
-# which state/journald-pid and state/journald-started answer, each read noted in
-# log/systemctl-show; state/systemctl-show-fails stands for a Pi where they fail. Any other call is
+# systemctl, on the device or the Pi: the driver changes nothing. It reads journald's MainPID with
+# `show systemd-journald -p MainPID --value`, which state/journald-pid answers, each read noted in
+# log/systemctl-show; state/systemctl-show-fails stands for a Pi where it fails. Any other call is
 # noted in log/systemctl and refused.
 cat >"$bin/systemctl" <<'EOF'
 #!/usr/bin/env bash
-case $* in
-  'show systemd-journald -p MainPID --value') answer=journald-pid ;;
-  'show systemd-journald -p ActiveEnterTimestamp --value --timestamp=unix') answer=journald-started ;;
-  *)
-    printf '%s\n' "$*" >>"$FAKE_LOG/systemctl"
-    echo 'fake systemctl: the acceptance driver must change nothing on the Pi' >&2
-    exit 1
-    ;;
-esac
+if [[ $* != 'show systemd-journald -p MainPID --value' ]]; then
+  printf '%s\n' "$*" >>"$FAKE_LOG/systemctl"
+  echo 'fake systemctl: the acceptance driver must change nothing on the Pi' >&2
+  exit 1
+fi
 printf '%s\n' "$*" >>"$FAKE_LOG/systemctl-show"
 if [[ -e $FAKE_STATE/systemctl-show-fails ]]; then
   echo 'Failed to connect to bus: No such file or directory' >&2
   exit 1
 fi
-cat -- "$FAKE_STATE/$answer"
+cat -- "$FAKE_STATE/journald-pid"
 EOF
 chmod +x "$bin"/*
 
@@ -458,10 +466,19 @@ recorder_applies() {
 # Pi's of 2026-11-27 (systemd 257, Raspberry Pi OS): an /etc/systemd/journald.conf with no setting,
 # raspberrypi-sys-mods' 40-rpi-volatile-storage.conf and systemd's syslog.conf, with the release's
 # setting installed as 90-ghost-wispr.conf, each last changed at @1795600000. journald (PID 312)
-# started at @1795600100, after them, and has this machine's /var/log/journal/<id>/system.journal
-# open: pi/root/proc/312/fd holds its descriptors, as /proc holds a process's.
+# has this machine's /var/log/journal/<id>/system.journal open (pi/root/proc/312/fd holds its
+# descriptors, as /proc holds a process's), and its usage line reports that journal and the 1 GiB
+# and 5 GiB of the release's setting.
 readonly machine_id=31e1ef849026403294ddccad747a7e62
 readonly card_journal=/var/log/journal/$machine_id/system.journal run_journal=/run/log/journal/$machine_id/system.journal
+# journald_logs PID PATH MAX_USE DISK_KEEP_FREE: journald with PID PID logs its usage line, newest,
+# with those fields, as systemd's journald writes it.
+journald_logs() {
+  jq -cn --arg pid "$1" --arg path "$2" --arg max "$3" --arg free "$4" \
+    '{_PID: $pid, _TRANSPORT: "driver", SYSLOG_IDENTIFIER: "systemd-journald", MESSAGE_ID: "ec387f577b844b8fa948f33cad9a75e6",
+      MESSAGE: "System Journal (\($path)) is 16.0M, max 1.0G, 1.0G free.", JOURNAL_NAME: "System Journal",
+      JOURNAL_PATH: $path, MAX_USE: $max, DISK_KEEP_FREE: $free}' >>"$state/journald-usage"
+}
 # journald_opens PATH...: the fake journald's descriptors are its standard ones, /dev/null, and one
 # for each journal file PATH, in place of any before.
 journald_opens() {
@@ -496,7 +513,7 @@ new_case() {
   printf '%s\n' "$machine_id" >"$root/etc/machine-id"
   touch -d @1795600000 -- "$root/etc/systemd/journald.conf" "$root"/{etc,usr/lib}/systemd/journald.conf.d/*.conf
   printf '312\n' >"$state/journald-pid"
-  printf '@1795600100\n' >"$state/journald-started"
+  journald_logs 312 "/var/log/journal/$machine_id" 1073741824 5368709120
   journald_opens "$card_journal"
   local stage=$releases/$new/stage/ghost-wispr-pi-deploy
   cp -- "$stage/ghost-wispr-update-launcher.sh" "$deploy/"
@@ -1189,14 +1206,18 @@ expect 7 UNKNOWN 'tailscale serve status'
 # runs. Breaks they catch: a driver that takes the first value of a setting, not the last, or reads
 # the release's file alone, so the vendor's volatile storage or an older cap passes; one that takes
 # a persistent journal on the card for the one journald writes, which a journald that writes /run
-# leaves (GPT-6.1 Sol's review of #209); one that passes a journald started before its setting
-# changed, which runs the setting before; one that takes an unreadable state for a pass.
+# leaves (GPT-6.1 Sol's review of #209); one that takes the files for what journald runs, or that
+# reads a clock or a file's change time for it, which a clock step without a real-time clock makes
+# wrong both ways (Sol's round 2); one that takes an unreadable state for a pass.
 new_case 'the journald setting as the release gives it'
 run_driver
 expect_verdicts PASS PASS PASS PASS PASS PASS PASS PASS
 expect 8 PASS 'Storage=persistent' 'SplitMode=none' 'SystemMaxUse=1G' 'SystemKeepFree=5G' 'SystemMaxFileSize=64M' \
-  'SyncIntervalSec=5m' "journald (PID 312) writes $card_journal" 'started at @1795600100, after its setting last changed (@1795600000)'
+  'SyncIntervalSec=5m' "journald (PID 312) writes $card_journal" \
+  "its usage line reports JOURNAL_PATH=/var/log/journal/$machine_id, MAX_USE=1073741824, DISK_KEEP_FREE=5368709120"
 grep -Fq "find $root/proc/312/fd -maxdepth 1" "$log/sudo" || fail "the driver did not read journald's descriptors with sudo -n: $(cat -- "$log/sudo")"
+grep -Fqx 'journalctl -b -q -o json -n 1 _PID=312 _TRANSPORT=driver MESSAGE_ID=ec387f577b844b8fa948f33cad9a75e6' "$log/sudo" \
+  || fail "the driver did not read journald's usage line of its PID with sudo -n: $(cat -- "$log/sudo")"
 new_case "no journald setting of the release installed"
 rm -f -- "$root/etc/systemd/journald.conf.d/90-ghost-wispr.conf"
 run_driver
@@ -1238,11 +1259,46 @@ journald_opens /var/log/journal/0123456789abcdef0123456789abcdef/system.journal
 run_driver
 expect_verdicts PASS PASS PASS PASS PASS PASS PASS FAIL
 expect 8 FAIL "does not write $card_journal"
-new_case 'journald started before its setting changed'
-touch -d @1795600200 -- "$root/etc/systemd/journald.conf.d/90-ghost-wispr.conf"
+# Sol's two clock cases. A Pi with no real-time clock starts journald before network time steps the
+# clock forward, so journald's start looks older than its setting's files: journald runs them, and
+# check 8 passes. A journald that loaded an older cap while the clock ran ahead, then the clock
+# stepped back and the setting was put back with no restart: the files look older than its start,
+# and journald's own usage line shows the cap it runs, so check 8 fails.
+new_case 'a forward clock step after journald started on its setting'
+touch -d @4000000000 -- "$root/etc/systemd/journald.conf.d/90-ghost-wispr.conf"
+run_driver
+expect_verdicts PASS PASS PASS PASS PASS PASS PASS PASS
+new_case 'a backward clock step after journald started on an older cap'
+journald_logs 312 "/var/log/journal/$machine_id" 4294967296 5368709120
+touch -d @1000 -- "$root/etc/systemd/journald.conf.d/90-ghost-wispr.conf"
 run_driver
 expect_verdicts PASS PASS PASS PASS PASS PASS PASS FAIL
-expect 8 FAIL 'journald started at @1795600100, before /etc/systemd/journald.conf.d/90-ghost-wispr.conf changed at @1795600200'
+expect 8 FAIL 'journald (PID 312) runs a setting other than its files give: its usage line reports MAX_USE is 4294967296, not 1073741824'
+# journald's newest usage line counts, and only its own PID's: an earlier journald's line of this
+# boot says nothing about the one that runs now. Breaks they catch: a driver that reads the oldest
+# line, or any PID's.
+new_case 'an older usage line of journald, and a newer one'
+: >"$state/journald-usage"
+journald_logs 312 "/var/log/journal/$machine_id" 4294967296 5368709120
+journald_logs 312 "/var/log/journal/$machine_id" 1073741824 5368709120
+run_driver
+expect_verdicts PASS PASS PASS PASS PASS PASS PASS PASS
+new_case 'a usage line of an earlier journald only'
+: >"$state/journald-usage"
+journald_logs 311 "/var/log/journal/$machine_id" 1073741824 5368709120
+run_driver
+expect_verdicts PASS PASS PASS PASS PASS PASS PASS UNKNOWN
+expect 8 UNKNOWN 'journald (PID 312) has logged no usage line this boot since it started' 'run sudo journalctl --flush on the Pi'
+new_case 'a usage line that reports the journal in /run'
+journald_logs 312 "/run/log/journal/$machine_id" 1073741824 5368709120
+run_driver
+expect_verdicts PASS PASS PASS PASS PASS PASS PASS FAIL
+expect 8 FAIL "its usage line reports JOURNAL_PATH is /run/log/journal/$machine_id, not /var/log/journal/$machine_id"
+new_case 'a usage line that reports another keep-free'
+journald_logs 312 "/var/log/journal/$machine_id" 1073741824 4294967296
+run_driver
+expect_verdicts PASS PASS PASS PASS PASS PASS PASS FAIL
+expect 8 FAIL 'its usage line reports DISK_KEEP_FREE is 4294967296, not 5368709120'
 new_case 'journald not running'
 printf '0\n' >"$state/journald-pid"
 run_driver

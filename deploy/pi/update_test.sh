@@ -113,6 +113,8 @@ sha() {
 }
 
 mkdir -p -- "$bin" "$timeout_bin" "$fakes" "$releases"
+# The fake Pi's journald (deploy/pi/testdata/fake-journald), which the fake sudo and systemctl call.
+cp -- "$script_dir/testdata/fake-journald" "$fakes/journald"
 
 cat >"$fakes/after" <<'EOF'
 #!/usr/bin/env bash
@@ -260,7 +262,8 @@ cat >"$bin/systemctl" <<'EOF'
 #   writes to $TEST_STATE/main-start. The Nth restart does what $TEST_STATE/restart-N says: ok (the
 #   default); fail, a start job that fails while the unit stays active; fail-stop, one whose unit
 #   stops; busy-exec, a start job that fails while the installed binary runs on as a real process.
-# Every other call is logged as it is.
+# Of the system manager, it answers `show systemd-journald -p MainPID --value`, which any user may
+# read, from the fake journald ($TEST_FAKES/journald). Every other call is logged as it is.
 set -euo pipefail
 state=${TEST_STATE:?}
 deploy=${GHOST_WISPR_DEPLOY_DIR:?}
@@ -301,6 +304,9 @@ run_start_pre() {
     fi
   done < <(sed -n 's/^ExecStartPre=//p' "$unit")
 }
+if [[ $* == 'show systemd-journald -p MainPID --value' ]]; then
+  exec "${TEST_FAKES:?}/journald" "$state/journald" pid
+fi
 if [[ ${1:-} != --user ]]; then
   printf 'systemctl without --user, which reaches the system manager: systemctl %s\n' "$*" >>"$state/errors"
   exit 1
@@ -418,9 +424,12 @@ cat >"$bin/sudo" <<'EOF'
 # type one. It runs install for real, into GHOST_WISPR_SYSTEM_ROOT alone, and tailscale (the fake),
 # and logs every call with the timeout it runs under, udevadm with the udev rule it would read, the
 # logind restart with the logind setting, and the journald restart and the journal's flush with the
-# journald setting, in $TEST_STATE/sudo.log. Each udevadm call, each restart and each flush is the
-# event "system-reload". The call that $TEST_STATE/fail-sudo names, as its log line names it after
-# the timeout (such as "udevadm control --reload"), fails, once.
+# journald setting, in $TEST_STATE/sudo.log. The journald restart, the flush and journalctl's read
+# of journald's usage line go to the fake journald ($TEST_FAKES/journald, state in
+# $TEST_STATE/journald). Each udevadm call, each restart and each flush is the event
+# "system-reload". Each line of $TEST_STATE/fail-sudo names a call, as its log line names it after
+# the timeout (such as "udevadm control --reload"): the call the first line names fails, and that
+# line goes, so the lines fail their calls once each, in their order.
 set -euo pipefail
 state=${TEST_STATE:?}
 system_root=${GHOST_WISPR_SYSTEM_ROOT:?}
@@ -432,10 +441,12 @@ unexpected() {
   printf 'fake sudo: unexpected sudo -n %s\n' "$*" >>"$state/errors"
   exit 1
 }
-# made_to_fail LINE ends the call with exit 1, once, when $TEST_STATE/fail-sudo names LINE.
+# made_to_fail LINE ends the call with exit 1 when the first line of $TEST_STATE/fail-sudo is LINE,
+# and removes that line.
 made_to_fail() {
-  if [[ -f $state/fail-sudo && $(<"$state/fail-sudo") == "$1" ]]; then
-    rm -f -- "$state/fail-sudo"
+  if [[ -s $state/fail-sudo && $(head -n 1 -- "$state/fail-sudo") == "$1" ]]; then
+    sed -i 1d -- "$state/fail-sudo"
+    [[ -s $state/fail-sudo ]] || rm -f -- "$state/fail-sudo"
     printf 'timeout=%s %s (made to fail)\n' "$under" "$1" >>"$state/sudo.log"
     exit 1
   fi
@@ -470,17 +481,23 @@ case ${1:-} in
         made_to_fail 'systemctl restart systemd-journald'
         printf 'timeout=%s systemctl restart systemd-journald journald=%s\n' "$under" \
           "$(sum "$system_root/etc/systemd/journald.conf.d/90-ghost-wispr.conf")" >>"$state/sudo.log"
+        "${TEST_FAKES:?}/journald" "$state/journald" restart
         ;;
       *) unexpected "$@" ;;
     esac
     "${TEST_FAKES:?}/after" system-reload
     ;;
   journalctl)
-    [[ ${*:2} == --flush ]] || unexpected "$@"
-    made_to_fail 'journalctl --flush'
-    printf 'timeout=%s journalctl --flush journald=%s\n' "$under" \
-      "$(sum "$system_root/etc/systemd/journald.conf.d/90-ghost-wispr.conf")" >>"$state/sudo.log"
-    "${TEST_FAKES:?}/after" system-reload
+    if [[ ${*:2} == --flush ]]; then
+      made_to_fail 'journalctl --flush'
+      printf 'timeout=%s journalctl --flush journald=%s\n' "$under" \
+        "$(sum "$system_root/etc/systemd/journald.conf.d/90-ghost-wispr.conf")" >>"$state/sudo.log"
+      "${TEST_FAKES:?}/journald" "$state/journald" flush
+      "${TEST_FAKES:?}/after" system-reload
+    else
+      printf 'timeout=%s journalctl %s\n' "$under" "${*:2}" >>"$state/sudo.log"
+      exec "${TEST_FAKES:?}/journald" "$state/journald" usage "${@:2}"
+    fi
     ;;
   tailscale)
     printf 'timeout=%s tailscale %s\n' "$under" "${*:2}" >>"$state/sudo.log"
@@ -851,11 +868,13 @@ record_verified() {
 
 # new_pi makes an empty fake Pi: the recorder's unit active and idle, the device key, the credential
 # file and the installed certificate, Serve as the repository's serve.conf sets it, a user manager
-# that sets no override, and the fake pi-secrets answering the secret values of the default .env.
+# that sets no override, the fake pi-secrets answering the secret values of the default .env, a
+# machine id, and a fake journald (PID 100) that has logged no usage line.
 new_pi() {
   stop_busy_binary
   rm -rf -- "${pi:?}"
   mkdir -p -- "$opt" "$units" "$root/etc/udev/rules.d" "$root/etc/systemd/logind.conf.d" "$state" "$pi/proc/4242"
+  printf '31e1ef849026403294ddccad747a7e62\n' >"$root/etc/machine-id"
   ln -s -- "$state/running-image" "$pi/proc/4242/exe"
   printf 'DEVICE KEY\n' >"$device_key"
   printf '{"type":"external_account"}\n' >"$opt/google-credentials.json"
@@ -898,9 +917,9 @@ written_after_start() {
 # install_set NAME [DRIVE] puts release NAME's deploy set in place on the fake Pi as update.sh
 # leaves a set it installed and verified: each file where C2 puts it, the config rendered with the
 # shared drive DRIVE when given, an .env of the four owned lines and one operator line, the
-# bootstrap files as provision.sh installs them, deploy.verified naming the set, journald running the
-# installed journald setting (journald-ghost-wispr.conf.applied), and the recorder running the
-# installed binary, started after each of these files was written.
+# bootstrap files as provision.sh installs them, deploy.verified naming the set, the fake journald
+# restarted and flushed on the installed journald setting, so its usage line shows it, and the
+# recorder running the installed binary, started after each of these files was written.
 install_set() {
   local name=$1 drive=${2:-} deploy=$releases/$1/ghost-wispr-pi-deploy file
   for file in "${set_files[@]}" "${bootstrap_files[@]}"; do
@@ -913,9 +932,24 @@ install_set() {
   write_env "$opt/.env" GHOST_WISPR_ADDR=127.0.0.1:8080 GOOGLE_API_USE_CLIENT_CERTIFICATE=false \
     GHOST_WISPR_DEEPGRAM_API_KEY=dg-test-1 GHOST_WISPR_DISPATCH_TOKEN=tok-test-1 GHOST_WISPR_JABRA_MUTE_BUTTON=false
   record_verified "$name"
-  sha "$(installed_path journald-ghost-wispr.conf)" >"$opt/journald-ghost-wispr.conf.applied"
+  GHOST_WISPR_SYSTEM_ROOT=$root "$fakes/journald" "$state/journald" apply
   cp -- "$opt/ghost-wispr" "$state/running-image"
   mark_recorder_started
+}
+# journald_runs WHAT [NOT]: the fake journald last started on the journald setting installed now,
+# and its PID has logged a usage line since; with NOT, it does not, and still runs SystemMaxUse=1G.
+journald_runs() {
+  local loaded pid usage
+  loaded=$(cat -- "$state/journald/loaded")
+  pid=$(cat -- "$state/journald/pid")
+  usage=$(jq -c --arg pid "$pid" 'select(._PID == $pid)' "$state/journald/usage" 2>/dev/null | tail -n 1)
+  if [[ -z ${2:-} ]]; then
+    [[ $loaded == "$(systemd-analyze --root="$root" cat-config systemd/journald.conf)" && -n $usage ]] \
+      || fail "$1: journald (PID $pid) does not run the journald setting installed now: it runs [$loaded], usage ${usage:-none}"
+  else
+    [[ $loaded == *SystemMaxUse=1G* && $(sed -n 's/^SystemMaxUse=//p' "$(installed_path journald-ghost-wispr.conf)") == 256M ]] \
+      || fail "$1: control: journald does not run release jb's 1G while the installed setting gives 256M: it runs [$loaded]"
+  fi
 }
 
 # save_installed DIR copies what the fake Pi has installed of the deploy set, its rendered config,
@@ -1327,8 +1361,7 @@ awk '/udevadm control --reload/ { r = NR } /udevadm trigger/ { t = NR } END { ex
   || fail "whole-set: udev was not reloaded before its trigger: $(<"$state/sudo.log")"
 awk '/restart systemd-journald/ { r = NR } /journalctl --flush/ { f = NR } END { exit !(r && f && r < f) }' "$state/sudo.log" \
   || fail "whole-set: journald did not restart before the journal's flush: $(<"$state/sudo.log")"
-[[ $(cat -- "$opt/journald-ghost-wispr.conf.applied" 2>/dev/null) == "$journald_sum" ]] \
-  || fail "whole-set: did not record the journald setting applied after its restart and flush: $(cat -- "$opt/journald-ghost-wispr.conf.applied" 2>/dev/null)"
+journald_runs whole-set
 # pi-secrets ran once, from the staged binary (the release's, checked against binary_sha256, not
 # the installed one), with the credential file and the Pi's secret names, under its 60 s bound.
 [[ $(grep -c '^call$' "$state/pi-secrets.log") == 1 ]] || fail "whole-set: pi-secrets ran $(grep -c '^call$' "$state/pi-secrets.log") times"
@@ -1419,7 +1452,7 @@ install_set a
 release=b run_update
 expect_run system-files-unchanged 0 "ghost-wispr update: installed commit $commit_b (invocation test-invocation-7)"
 expect_set_of system-files-unchanged b
-if grep -Eq 'udevadm|systemd-logind|systemd-journald|journalctl| install ' "$state/sudo.log"; then
+if grep -Eq 'udevadm|systemd-logind|restart systemd-journald|journalctl --flush| install ' "$state/sudo.log"; then
   fail "system-files-unchanged: installed or reloaded an unchanged system file: $(<"$state/sudo.log")"
 fi
 
@@ -1799,19 +1832,121 @@ for answer in 'SESSION|a session and no call' \
 done
 
 begin journald-activation
-# journald-activation: the first install of the journald setting, whose journald restart fails, is
-# retried (GPT-6.1 Sol's review of #209). The Pi is as the update.sh before the setting left it: no
-# setting installed, none applied, a deploy.verified of the nine files it knew, and a .prev copy of
-# each. The rollback restores each file that has a .prev copy and leaves the new setting installed,
-# as it has none, and records no applied setting. The next run finds the setting's bytes installed
-# already, and restarts journald and flushes the journal all the same, as journald does not run it;
-# then it records the setting applied, and a later run restarts nothing. A run cut short between the
-# install and the restart leaves the same state. Breaks they catch: a run that takes an installed
-# setting for an applied one, so journald never restarts on it and the release is verified; one that
-# records the setting applied before its restart and flush succeed.
+# journald-activation: after an install, after a rollback and on the current release, the update
+# makes the running journald run its setting, as journald itself reports it: the newest usage line
+# that journald's current PID logged (MESSAGE_ID ec387f577b844b8fa948f33cad9a75e6) must show the
+# journal on the card and the SystemMaxUse and SystemKeepFree of the setting installed now; else it
+# restarts journald and flushes the journal, which makes the new journald log one, and reads it
+# again. A run that reads no record of its own makes no stale state possible (GPT-6.1 Sol's review
+# of #209, round 2). Releases ja and jc carry the same journald setting, SystemMaxUse=256M; jb's is
+# 1G. Breaks they catch: a run that trusts a record it wrote, or that skips the check on the
+# current release; one that takes any usage line of the PID for a match; one that reads no usage
+# line at all, so journald keeps a setting the files no longer give.
+commit_ja=$(printf '1%.0s' {1..40}) commit_jb=$(printf '2%.0s' {1..40}) commit_jc=$(printf '3%.0s' {1..40})
+readonly commit_ja commit_jb commit_jc
+# journald_release NAME COMMIT MAX_USE builds release NAME, whose journald setting is the
+# repository's with SystemMaxUse=MAX_USE, and whose other system files are the repository's.
+journald_release() {
+  local file
+  same_system_files=1 make_release "$1" "$2"
+  file=$releases/$1/ghost-wispr-pi-deploy/journald-ghost-wispr.conf
+  sed "s/^SystemMaxUse=.*/SystemMaxUse=$3/" "$repo_root/deploy/pi/files/journald-ghost-wispr.conf" >"$file"
+  grep -qx "SystemMaxUse=$3" "$file" || fail "journald_release: $file sets no SystemMaxUse=$3"
+  pack_release "$1"
+}
+journald_release ja "$commit_ja" 256M
+journald_release jb "$commit_jb" 1G
+journald_release jc "$commit_jc" 256M
+cmp -s -- "$releases/ja/ghost-wispr-pi-deploy/journald-ghost-wispr.conf" "$releases/jc/ghost-wispr-pi-deploy/journald-ghost-wispr.conf" \
+  || fail "control: releases ja and jc carry different journald settings"
+# restarted_journald WHAT: this run restarted journald, then flushed the journal, once each.
+restarted_journald() {
+  [[ $(grep -c 'systemctl restart systemd-journald journald=' "$state/sudo.log") == 1 \
+    && $(grep -c 'journalctl --flush journald=' "$state/sudo.log") == 1 ]] \
+    || fail "$1: did not restart journald and flush the journal once each: $(<"$state/sudo.log")"
+  awk '/restart systemd-journald/ { r = NR } /journalctl --flush/ { f = NR } END { exit !(r && f && r < f) }' "$state/sudo.log" \
+    || fail "$1: journald did not restart before the journal's flush: $(<"$state/sudo.log")"
+}
+
+# Sol's first sequence: ja runs; jb's journald restart succeeds and its flush fails, then the
+# rollback's restarts fail, so the rollback leaves ja's setting installed while journald runs jb's
+# 1G and has logged no usage line. jc, which carries ja's setting byte for byte, then installs; its
+# setting is installed already, and journald must restart on it all the same.
+new_pi
+install_set ja
+printf '%s\n' 'journalctl --flush' 'systemctl restart systemd-journald' 'systemctl restart systemd-journald' >"$state/fail-sudo"
+release=jb run_update
+what='journald-activation (a flush and the rollback restarts that fail)'
+[[ ! -e $state/fail-sudo ]] || fail "$what: the update did not reach each journald call made to fail: $(<"$state/fail-sudo")"
+expect_run "$what" 10
+expect_line_like "$what" 'ghost-wispr update: could not reload udev, or restart logind or journald; .*journald does not run its setting: .*'
+journald_runs "$what" not
+: >"$state/sudo.log"
+release=jc run_update
+what='journald-activation (a release that carries the installed setting)'
+expect_run "$what" 0 "ghost-wispr update: installed commit $commit_jc (invocation test-invocation-7)"
+restarted_journald "$what"
+journald_runs "$what"
+# The control: a run that finds journald running its setting restarts nothing.
+: >"$state/sudo.log"
+release=jc run_update
+expect_run 'journald-activation (a run after it)' 0 "ghost-wispr update: already current at commit $commit_jc"
+! grep -Eq 'restart systemd-journald|journalctl --flush' "$state/sudo.log" \
+  || fail "journald-activation: restarted journald, which runs its setting: $(<"$state/sudo.log")"
+grep -Fqx "timeout=30s journalctl -b -q -o json -n 1 _PID=$(<"$state/journald/pid") _TRANSPORT=driver MESSAGE_ID=ec387f577b844b8fa948f33cad9a75e6" "$state/sudo.log" \
+  || fail "journald-activation: did not read the usage line of journald's PID, under its 30 s bound: $(<"$state/sudo.log")"
+
+# Sol's second sequence: jb installs and journald runs it; the recorder then does not answer, and
+# the rollback restores ja's setting, but each journald restart fails. The current release ja then
+# finds journald on jb's 1G, with a usage line that shows it, and restarts it.
+new_pi
+install_set ja
+touch -- "$state/version-mute.after-restart"
+printf '%s\n' 'systemctl restart systemd-journald' 'systemctl restart systemd-journald' >"$state/fail-sudo.after-restart"
+release=jb run_update
+what='journald-activation (a rollback whose journald restarts fail)'
+expect_run "$what" 10
+[[ ! -e $state/fail-sudo ]] || fail "$what: the rollback did not reach each journald restart made to fail: $(<"$state/fail-sudo")"
+journald_runs "$what" not
+rm -f -- "$state/version-mute"
+: >"$state/sudo.log"
+release=ja run_update
+what='journald-activation (the current release, journald on the setting before)'
+expect_run "$what" 0 "ghost-wispr update: already current at commit $commit_ja"
+restarted_journald "$what"
+journald_runs "$what"
+
+# The current release, and a journald that has logged no usage line since it started, as one that
+# a person restarted without a flush: the run restarts it.
+new_pi
+install_set ja
+GHOST_WISPR_SYSTEM_ROOT=$root "$fakes/journald" "$state/journald" restart
+release=ja run_update
+what='journald-activation (a journald with no usage line)'
+expect_run "$what" 0 "ghost-wispr update: already current at commit $commit_ja"
+restarted_journald "$what"
+journald_runs "$what"
+
+# Sol's fourth sequence, by hand: jb's setting installed and journald restarted on it, then ja's
+# put back with no restart. The current release ja finds journald on 1G, and restarts it.
+new_pi
+install_set ja
+cp -- "$releases/jb/ghost-wispr-pi-deploy/journald-ghost-wispr.conf" "$(installed_path journald-ghost-wispr.conf)"
+GHOST_WISPR_SYSTEM_ROOT=$root "$fakes/journald" "$state/journald" apply
+cp -- "$releases/ja/ghost-wispr-pi-deploy/journald-ghost-wispr.conf" "$(installed_path journald-ghost-wispr.conf)"
+journald_runs 'journald-activation (a setting put back by hand)' not
+release=ja run_update
+what='journald-activation (a setting put back by hand, no restart after)'
+expect_run "$what" 0 "ghost-wispr update: already current at commit $commit_ja"
+restarted_journald "$what"
+journald_runs "$what"
+
+# A first install of the setting whose journald restart fails: the rollback leaves it installed, as
+# it has no .prev copy, and makes journald run it, as it does any setting it leaves installed.
 new_pi
 install_set a
-rm -f -- "$(installed_path journald-ghost-wispr.conf)" "$opt/journald-ghost-wispr.conf.applied"
+rm -f -- "$(installed_path journald-ghost-wispr.conf)"
+GHOST_WISPR_SYSTEM_ROOT=$root "$fakes/journald" "$state/journald" apply
 grep -v '  journald-ghost-wispr\.conf$' "$opt/deploy.verified" >"$work_dir/verified-nine"
 cp -- "$work_dir/verified-nine" "$opt/deploy.verified"
 for file in "${set_files[@]}" .env ghost-wispr; do
@@ -1825,27 +1960,8 @@ expect_run "$what" 10
 expect_line_like "$what" 'ghost-wispr update: could not reload udev, or restart logind or journald; no previous release to restore for journald-ghost-wispr\.conf, which stay as installed; .*'
 cmp -s -- "$releases/b/ghost-wispr-pi-deploy/journald-ghost-wispr.conf" "$(installed_path journald-ghost-wispr.conf)" \
   || fail "$what: the rollback did not leave release b's journald setting installed"
-[[ ! -e $opt/journald-ghost-wispr.conf.applied ]] \
-  || fail "$what: recorded a journald setting applied, whose restart failed: $(<"$opt/journald-ghost-wispr.conf.applied")"
+journald_runs "$what"
 cmp -s -- "$work_dir/verified-nine" "$opt/deploy.verified" || fail "$what: changed deploy.verified"
-: >"$state/sudo.log"
-release=b run_update
-what='journald-activation (the retry)'
-expect_run "$what" 0 "ghost-wispr update: installed commit $commit_b (invocation test-invocation-7)"
-expect_verified "$what" b
-journald_sum=$(sha "$(installed_path journald-ghost-wispr.conf)")
-for line in "timeout=30s systemctl restart systemd-journald journald=$journald_sum" "timeout=30s journalctl --flush journald=$journald_sum"; do
-  [[ $(grep -cFx -- "$line" "$state/sudo.log") == 1 ]] || fail "$what: sudo ran no $line once: $(<"$state/sudo.log")"
-done
-awk '/restart systemd-journald/ { r = NR } /journalctl --flush/ { f = NR } END { exit !(r && f && r < f) }' "$state/sudo.log" \
-  || fail "$what: journald did not restart before the journal's flush: $(<"$state/sudo.log")"
-! grep -qF ' install /etc/systemd/journald.conf.d/' "$state/sudo.log" || fail "$what: installed the journald setting again, whose bytes are installed"
-[[ $(cat -- "$opt/journald-ghost-wispr.conf.applied" 2>/dev/null) == "$journald_sum" ]] \
-  || fail "$what: did not record the journald setting applied: $(cat -- "$opt/journald-ghost-wispr.conf.applied" 2>/dev/null)"
-: >"$state/sudo.log"
-release=b run_update
-expect_run 'journald-activation (a run after the retry)' 0 "ghost-wispr update: already current at commit $commit_b"
-! grep -Eq 'journald|journalctl' "$state/sudo.log" || fail "journald-activation: restarted journald on an applied setting: $(<"$state/sudo.log")"
 
 begin partial-install
 # partial-install: an update cut short mid-swap (a power cut, or the launcher's time limit) leaves
