@@ -22,12 +22,13 @@ names the release's commit and the SHA-256 of the binary and of each other file:
 | `ghost-wispr.service` | the nightly update | `~/.config/systemd/user/` |
 | `99-ghost-wispr.rules` | the nightly update | `/etc/udev/rules.d/99-ghost-wispr.rules` |
 | `logind-power-key.conf` | the nightly update | `/etc/systemd/logind.conf.d/50-ghost-wispr-power-key.conf` |
+| `journald-ghost-wispr.conf` | the nightly update | `/etc/systemd/journald.conf.d/90-ghost-wispr.conf` |
 | `ghost-wispr-update-launcher.sh` | `provision.sh` only | `/opt/ghost-wispr/` |
 | `ghost-wispr-update.service`, `ghost-wispr-update.timer` | `provision.sh` only | `~/.config/systemd/user/` |
 | `serve.conf` | `provision.sh` only | Tailscale Serve's setting, one `<port> <proxy target>` line for each HTTPS port |
 | `provision.sh` | a person runs it from the release directory | not installed |
 
-The nightly update installs the first nine files and the binary as one unit ("Update and
+The nightly update installs the first ten files and the binary as one unit ("Update and
 inspect"); `provision.sh` also installs `update.sh`, `pi-lib.sh` and `pi.env`, so that its first
 update can run. The launcher, the update unit and timer, and `serve.conf` reach the Pi only when a
 person runs the release's `provision.sh`, so no release can break the path that installs the next
@@ -1045,16 +1046,19 @@ A run of `update.sh`:
    it, and the next run installs. The refresh at each start of the recorder (`update.sh secrets`)
    still writes the four lines of `.env`.
 6. Installs the whole set, also when the running binary already answers the release's commit: the
-   binary and the nine files, `ghost-wispr.service`, the udev rule and the logind setting included.
-   It renders `ghost-wispr.yaml` with the shared drive of the installed config ("Enable models and
-   Drive sync") and writes `.env` ("The Pi's secrets"). Before the swap it keeps a `.prev` copy of
-   each installed file of the set that `deploy.verified` lists. It installs the two system files
-   with `sudo -n`, only when they change. Then it reloads the user units, reloads udev or restarts
-   logind when their file changed, restarts the recorder, and waits up to 120 s for `/api/version`
-   to answer the release's commit and for `/api/status` to answer a status it can read, whose
-   `call`, when it has one, is an object: a release whose status the update cannot read would stop
-   each later run at its first status read, before it could install a fix. Then it writes
-   `deploy.verified` and prints `ghost-wispr update: installed commit <sha> (invocation <id>)`.
+   binary and the ten files, `ghost-wispr.service`, the udev rule, the logind setting and the
+   journald setting included. It renders `ghost-wispr.yaml` with the shared drive of the installed
+   config ("Enable models and Drive sync") and writes `.env` ("The Pi's secrets"). Before the swap
+   it keeps a `.prev` copy of each installed file of the set that `deploy.verified` lists. It
+   installs the three system files with `sudo -n`, only when they change. Then it reloads the user
+   units, reloads udev, restarts logind, or restarts journald and moves the boot's journal to the
+   card (`journalctl --flush`), each when its file changed (journald also when it does not run the
+   installed setting, "The Pi's journal"), restarts the recorder, and waits up to 120 s for
+   `/api/version` to answer the release's commit and for `/api/status` to answer a status
+   it can read, whose `call`, when it has one, is an object: a release whose status the update
+   cannot read would stop each later run at its first status read, before it could install a fix.
+   Then it writes `deploy.verified` and prints
+   `ghost-wispr update: installed commit <sha> (invocation <id>)`.
    When either answer does not come, it puts back each file from its `.prev` copy, byte for byte,
    and prints `ghost-wispr update: <why>; restored the previous release`. It restarts the recorder
    for that rollback only while the recorder reports no session and no call, and leaves it running
@@ -1102,7 +1106,7 @@ deploy/pi/check-deploy.sh
 
 It checks the latest release, or with `--release COMMIT` the release of that commit. It reads the
 release from GitHub, the recorder over Serve and the Pi over SSH, writes nothing on the Pi, and
-prints `PASS`, `FAIL` or `UNKNOWN` for each of seven checks. `UNKNOWN` means that it could not read
+prints `PASS`, `FAIL` or `UNKNOWN` for each of eight checks. `UNKNOWN` means that it could not read
 the check's input. It exits 1 when one check is not `PASS`.
 
 1. `/api/version` answers the release's commit.
@@ -1119,6 +1123,8 @@ the check's input. It exits 1 when one check is not `PASS`.
 6. The protected recordings, which no deploy step may change, still have the SHA-256 that
    `PI_PROTECTED_RECORDINGS` in `pi.env` lists for them.
 7. The three provisioning files on the Pi and Serve's setting match the release.
+8. journald runs the release's `journald-ghost-wispr.conf` ("The Pi's journal"): the running
+   journald writes the journal on the card, and its own usage line reports the setting's limits.
 
 To run an update by hand, start its unit, so the launcher's time limit applies and a start of the
 timer joins it. The command returns when the run ends. Check 5 then fails for that install, which
@@ -1199,16 +1205,66 @@ those copies already hold the set verified last.
 The models step is the one exception: `provision.sh --models` runs only from the release the Pi runs
 ("Enable models and Drive sync").
 
+## The Pi's journal
+
+The Pi keeps its journal on the card, in `/var/log/journal`, so the lines of a boot before the last
+reboot are there to read. Raspberry Pi OS keeps it in `/run` alone: raspberrypi-sys-mods'
+`40-rpi-volatile-storage.conf`, in `/usr/lib/systemd/journald.conf.d/`, sets `Storage=volatile`.
+The nightly update installs the release's `journald-ghost-wispr.conf` as
+`/etc/systemd/journald.conf.d/90-ghost-wispr.conf` ("The release and its deploy set"). journald
+reads the drop-ins of `/etc`, `/run` and `/usr/lib` in the order of their file names, and a later
+value wins, so `90-` overrides the vendor's `40-`. It sets `Storage=persistent`; `SplitMode=none`,
+so `ghost-wispr`'s units log to the one system journal, as before; a cap of `SystemMaxUse=1G`,
+about seven months at the rate of 2026-11; `SystemKeepFree=5G` for the recordings; files of
+`SystemMaxFileSize=64M`; and journald's default `SyncIntervalSec=5m`: a longer interval writes the
+card less, but loses more of the lines before a power cut.
+
+journald itself reports what it runs. At its start, and at each rotation that
+`journalctl --rotate` asks for, it logs from its own PID a usage line, "System Journal
+(/var/log/journal/<machine-id>) is …, max …, … free." (`MESSAGE_ID`
+`ec387f577b844b8fa948f33cad9a75e6`), whose fields name the journal it writes and the `SystemMaxUse`
+and `SystemKeepFree` it read at its start; it reads its setting at no other time. After each install
+or rollback, and on the current release too, the update reads the newest such line of this boot
+from journald's PID, and compares it with the setting as `systemd-analyze cat-config` gives it.
+When the journal no longer holds the line, as after journald deleted its oldest files under its
+cap, the update asks for a rotation, which makes journald log one, and compares again. When the line
+differs, or still is missing, the update restarts journald, flushes the journal and compares again;
+an install whose journald still differs rolls back. So journald restarts only when it runs another
+setting, as a restart can come during a recording. check 8 of `check-deploy.sh` fails when another
+drop-in overrides one of the release's values, when the running journald has no journal on the
+card open or has one in `/run`, or when its usage line differs from its setting. Neither reads a
+clock or a file's change time: the Pi has no real-time clock, and network time steps its clock.
+The line shows no `SplitMode`, `SystemMaxFileSize` or `SyncIntervalSec`; the update restarts
+journald for any change of its setting's file. Boots before the first install of this setting are
+gone.
+
+When check 8 says journald has logged no usage line that the journal still holds, run
+`sudo -n journalctl --rotate` on the Pi, which makes journald log one and starts new journal files,
+and check again. `journalctl --flush` makes none: once the journal is flushed, it asks journald for
+nothing.
+
+List the boots the journal holds, then read the recorder's lines of the boot before this one, and
+that boot's kernel lines (USB devices such as the Jabra):
+
+```bash
+ssh ghost-wispr@ghost-wispr 'sudo -n journalctl --list-boots'
+ssh ghost-wispr@ghost-wispr 'sudo -n journalctl -b -1 _SYSTEMD_USER_UNIT=ghost-wispr.service -o cat'
+ssh ghost-wispr@ghost-wispr 'sudo -n journalctl -b -1 -k'
+```
+
+The recorder is a unit of `ghost-wispr`'s user manager, so `-u ghost-wispr` finds none of its
+lines: they carry `_SYSTEMD_USER_UNIT=ghost-wispr.service`.
+
 ## A release that changes config
 
 A release carries its config. The nightly update installs the release's whole deploy set together
 ("Update and inspect"): the binary, `ghost-wispr.yaml`, `ghost-wispr.service`, the udev rule, the
-logind setting and the rest of the set. So a release that adds, replaces or removes a config key,
-such as `recording_rules`, `mic_device`, `envoy_hub_url` or a model provider, needs no step of its
-own: merge it, and the Pi installs it in the first run of the night that finds the recorder free. A
-new binary never starts on an old config, and an old binary never runs on a new config. Settings
-saved on the page stay in `/opt/ghost-wispr/ghost-wispr.local.yaml`, which no release changes
-("Settings saved on the page").
+logind setting, the journald setting and the rest of the set. So a release that adds, replaces or
+removes a config key, such as `recording_rules`, `mic_device`, `envoy_hub_url` or a model provider,
+needs no step of its own: merge it, and the Pi installs it in the first run of the night that finds
+the recorder free. A new binary never starts on an old config, and an old binary never runs on a
+new config. Settings saved on the page stay in `/opt/ghost-wispr/ghost-wispr.local.yaml`, which no
+release changes ("Settings saved on the page").
 
 The update restarts the recorder only while it is free. While a session or a call goes on, it
 prints `ghost-wispr update: active session; leaving the current release in place` (or the call's
@@ -1233,7 +1289,7 @@ The morning after the release publishes, check it from a tailnet member device, 
 deploy/pi/check-deploy.sh
 ```
 
-Each of its seven checks must print `PASS` ("Update and inspect"). For a release that changes
+Each of its eight checks must print `PASS` ("Update and inspect"). For a release that changes
 `mic_device` or the Jabra's Mute button, also check the Pi: `/api/status` must hold no
 `No microphone found` warning, and `capture_state` must be `capturing` or `paused`:
 

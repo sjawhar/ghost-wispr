@@ -1,0 +1,72 @@
+#!/usr/bin/env bash
+# fake-journald STATE OP...: the fake Pi's journald, for update_test.sh and provision_run_test.sh,
+# whose fake sudo and systemctl call it. STATE is its directory; GHOST_WISPR_SYSTEM_ROOT is the root
+# of the fake Pi, whose /etc/machine-id and journald setting it reads.
+#
+# As systemd v257's journald does, it reads its setting at its start only (a restart), and logs its
+# usage line, MESSAGE_ID ec387f577b844b8fa948f33cad9a75e6, from its own PID: at its start
+# (src/journal/journald.c), and at each rotation that journalctl --rotate asks for
+# (server_full_rotate). journalctl --flush asks journald for nothing once the journal is flushed
+# (/run/systemd/journal/flushed exists, journalctl-varlink.c's action_flush_to_var), as on a Pi
+# that has booted, so a flush logs no usage line; only a flush before that one does, which the
+# Pi's boot makes. The line holds the journal it writes (/var/log/journal/<machine-id> for
+# Storage=persistent, else /run/log/journal/<machine-id>) and its limits, SystemMaxUse and
+# SystemKeepFree as bytes (coreutils numfmt reads them, 1024 a step), or 4294967296 for a limit the
+# setting leaves out. Its setting is the last value of each key in the files that
+# `systemd-analyze --root=<root> cat-config systemd/journald.conf` prints.
+#
+# OP:
+# - pid: prints its MainPID, 100 at first; that journald has logged nothing.
+# - restart: a new journald, PID one more, which reads its setting and logs its usage line.
+# - flush: nothing, as the journal is flushed.
+# - rotate: logs its usage line.
+# - forget: the journal holds no usage line any more, as when journald deleted the oldest files.
+# - usage ARGS: journalctl ARGS, which must be `-b -q -o json -n 1 _PID=<pid> _TRANSPORT=driver
+#   MESSAGE_ID=<id>`: prints the newest usage line that PID logged.
+# - apply: restart: journald runs the setting as installed now.
+set -euo pipefail
+state=$1 op=$2
+shift 2
+mkdir -p -- "$state"
+pid=$(cat -- "$state/pid" 2>/dev/null || echo 100)
+root=${GHOST_WISPR_SYSTEM_ROOT:?}
+last_value() { grep -E "^$1=" "$state/loaded" 2>/dev/null | tail -n 1 | cut -d= -f2-; }
+bytes() {
+  if [[ -n $1 ]]; then numfmt --from=iec -- "$1"; else echo 4294967296; fi
+}
+usage_line() {
+  local id path
+  id=$(cat -- "$root/etc/machine-id")
+  path=/run/log/journal/$id
+  [[ $(last_value Storage) != persistent ]] || path=/var/log/journal/$id
+  jq -cn --arg pid "$pid" --arg path "$path" --arg max "$(bytes "$(last_value SystemMaxUse)")" \
+    --arg free "$(bytes "$(last_value SystemKeepFree)")" \
+    '{_PID: $pid, _TRANSPORT: "driver", MESSAGE_ID: "ec387f577b844b8fa948f33cad9a75e6",
+      JOURNAL_PATH: $path, MAX_USE: $max, DISK_KEEP_FREE: $free}' >>"$state/usage"
+}
+restart() {
+  pid=$((pid + 1))
+  printf '%s\n' "$pid" >"$state/pid"
+  systemd-analyze --root="$root" cat-config systemd/journald.conf >"$state/loaded" 2>/dev/null || : >"$state/loaded"
+  usage_line
+}
+case $op in
+  pid) printf '%s\n' "$pid" ;;
+  restart | apply) restart ;;
+  flush) ;;
+  rotate) usage_line ;;
+  forget) rm -f -- "$state/usage" ;;
+  usage)
+    if [[ $# != 9 || "${*:1:6}" != '-b -q -o json -n 1' || $7 != _PID=* || $8 != _TRANSPORT=driver \
+      || $9 != MESSAGE_ID=ec387f577b844b8fa948f33cad9a75e6 ]]; then
+      printf 'fake journald: unexpected journalctl arguments: %s\n' "$*" >&2
+      exit 1
+    fi
+    [[ -f $state/usage ]] || exit 0
+    jq -c --arg pid "${7#_PID=}" 'select(._PID == $pid)' "$state/usage" | tail -n 1
+    ;;
+  *)
+    printf 'fake journald: unknown operation %s\n' "$op" >&2
+    exit 1
+    ;;
+esac

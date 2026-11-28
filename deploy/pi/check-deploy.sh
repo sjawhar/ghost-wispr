@@ -28,13 +28,18 @@
 #   6  Each protected recording (PI_PROTECTED_RECORDINGS) has its sha256.
 #   7  The three bootstrap files on the Pi have the sha256 the release's manifest gives them, and
 #      Serve's setting matches the release's serve.conf.
+#   8  journald runs the release's journald-ghost-wispr.conf: each value of it is the one that
+#      `systemd-analyze cat-config systemd/journald.conf` gives last, the running journald has this
+#      machine's /var/log/journal/<machine-id>/system.journal open and no journal in /run, and its
+#      own usage line reports the journal and the SystemMaxUse and SystemKeepFree that the setting
+#      gives. So the journal outlives a reboot, within its cap.
 #
-# It exits 0 when all seven PASS, 1 when any does not, and 2 for a usage error.
+# It exits 0 when all eight PASS, 1 when any does not, and 2 for a usage error.
 set -euo pipefail
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 readonly script_dir
-usage() { sed -n '7,31p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '7,34p' "$0" | sed 's/^# \{0,1\}//'; }
 usage_error() {
   printf 'check-deploy: %s\n' "$*" >&2
   usage >&2
@@ -82,6 +87,11 @@ readonly RELEASES_API="${GHOST_WISPR_RELEASES_API:-https://api.github.com/repos/
 # The bootstrap files: the three files that install every later release, which only provision.sh
 # installs, so a release that changes one reaches the Pi only when a person runs its provision.sh.
 readonly BOOTSTRAP_FILES=(ghost-wispr-update-launcher.sh ghost-wispr-update.service ghost-wispr-update.timer)
+# The release's journald setting (check 8), and the root of the Pi's files that check 8 reads
+# journald's state from: /etc/machine-id, /var/log/journal and /proc/<journald>/fd.
+# GHOST_WISPR_PI_ROOT exists for check_deploy_test.sh, whose fake Pi keeps them in a directory.
+readonly JOURNALD_FILE=journald-ghost-wispr.conf
+readonly PI_ROOT="${GHOST_WISPR_PI_ROOT:-}"
 
 # pi runs a command on the Pi with no input; pi_in gives it this script's input. Each gives up on a
 # Pi it cannot reach in 10 s, or that stops answering for a minute (ssh exits 255), and never waits
@@ -801,6 +811,133 @@ check_bootstrap() {
   fi
 }
 
+# check_journal: check 8.
+check_journal() {
+  local want runs='' status=0 line key value got source differences=() unread=() settings=()
+  local daemon_pid='' daemon_file='' daemon_reports=''
+  if [[ -z $set_dir ]]; then
+    unknown 8 "no release journald setting to compare the Pi's journald with: $set_error"
+    return 0
+  fi
+  if [[ -z $(manifest_sum "$JOURNALD_FILE") ]]; then
+    unknown 8 "the manifest of $release_name's deploy tarball names no $JOURNALD_FILE"
+    return 0
+  fi
+  want=$(journald_conf_values "$JOURNALD_FILE" <"$set_dir/$JOURNALD_FILE")
+  if [[ -z $want ]]; then
+    unknown 8 "$release_name's $JOURNALD_FILE sets nothing in [Journal]"
+    return 0
+  fi
+  pi 'systemd-analyze cat-config systemd/journald.conf' >"$tmp/journald.conf" 2>"$tmp/journald.err" || status=$?
+  if ((status == 255)); then
+    unread+=("cannot reach $PI over SSH to read journald's setting: $(error_of "$tmp/journald.err")")
+  elif ((status != 0)); then
+    unread+=("cannot read journald's setting on the Pi (systemd-analyze cat-config systemd/journald.conf, exit $status): $(error_of "$tmp/journald.err")")
+  else
+    runs=$(journald_conf_values '' <"$tmp/journald.conf")
+    while IFS= read -r line; do
+      key=${line%%=*} value=${line#*=}
+      value=${value%%$'\t'*}
+      settings+=("$key=$value")
+      got=$(awk -F '\t' -v key="$key" 'index($1, key "=") == 1 { print; exit }' <<<"$runs")
+      if [[ -z $got ]]; then
+        differences+=("$key is not set, so journald's default applies; $release_name's $JOURNALD_FILE gives $value")
+        continue
+      fi
+      source=${got#*$'\t'} got=${got%%$'\t'*}
+      got=${got#*=}
+      [[ $got == "$value" ]] \
+        || differences+=("$key is $got, from $source; $release_name's $JOURNALD_FILE gives $value")
+    done <<<"$want"
+  fi
+  check_journald_daemon
+  if ((${#differences[@]} > 0)); then
+    local also=''
+    ((${#unread[@]} == 0)) || also="; and $(joined "${unread[@]}")"
+    fails 8 "$(joined "${differences[@]}")$also"
+  elif ((${#unread[@]} > 0)); then
+    unknown 8 "$(joined "${unread[@]}")"
+  else
+    pass 8 "journald runs $release_name's $JOURNALD_FILE ($(joined "${settings[@]}")); journald (PID $daemon_pid) writes $daemon_file, and its usage line reports $daemon_reports, as its setting gives them. It reports no SplitMode, SystemMaxFileSize or SyncIntervalSec, which check 8 reads from the files alone"
+  fi
+}
+
+# check_journald_daemon adds to check_journal's differences and unread what the running journald
+# itself reports, which the setting's files only say it should (GPT-6.1 Sol's review of #209):
+# - the journal files it has open, from its file descriptors, which only root reads (sudo -n): a
+#   persistent journal stays on the card after journald goes back to /run, so no file there shows
+#   what journald writes now;
+# - its newest usage line of this boot from its MainPID (pi-lib.sh's PI_LIB_JOURNALD_USAGE_ID),
+#   which journald logs at each flush and rotation: the journal it writes and the SystemMaxUse and
+#   SystemKeepFree it read from its setting at its start. Each must be what journald_expected reads
+#   from the setting that cat-config gave ($runs). journald reads its setting at no other time, so
+#   the line is this journald's own; no clock, no file's change time and no record of update.sh's
+#   stands in for it.
+# It sets check_journal's daemon_pid, daemon_file and daemon_reports, for check 8's PASS line.
+check_journald_daemon() {
+  local root command status=0 id path line open=() in_run=() on_card='' card=no usage expected running differences_text
+  root=$(printf %q "$PI_ROOT")
+  command="id=\$(cat $root/etc/machine-id) || exit 4; echo \"machine \$id\"
+pid=\$(systemctl show systemd-journald -p MainPID --value) || exit 5
+echo \"pid \$pid\"
+if [ -d $root/var/log/journal ]; then echo 'card yes'; fi
+if [ \"\$pid\" != 0 ]; then
+  sudo -n find $root/proc/\"\$pid\"/fd -maxdepth 1 -type l -lname '*/journal/*' -printf 'open %l\n' || exit 6
+  usage=\$(sudo -n journalctl -b -q -o json -n 1 _PID=\"\$pid\" _TRANSPORT=driver MESSAGE_ID=$PI_LIB_JOURNALD_USAGE_ID) || exit 7
+  if [ -n \"\$usage\" ]; then printf 'usage %s\n' \"\$usage\"; fi
+fi"
+  pi "$command" >"$tmp/journald.state" 2>"$tmp/journald-state.err" || status=$?
+  case $status in
+    0) ;;
+    255) unread+=("cannot reach $PI over SSH to read what journald runs: $(error_of "$tmp/journald-state.err")") ;;
+    4) unread+=("cannot read the Pi's machine id (/etc/machine-id): $(error_of "$tmp/journald-state.err")") ;;
+    5) unread+=("cannot read journald's state on the Pi (systemctl show systemd-journald): $(error_of "$tmp/journald-state.err")") ;;
+    6) unread+=("cannot list the journal files that journald has open (sudo -n find /proc/<pid>/fd): $(error_of "$tmp/journald-state.err")") ;;
+    7) unread+=("cannot read journald's usage line (sudo -n journalctl MESSAGE_ID=$PI_LIB_JOURNALD_USAGE_ID): $(error_of "$tmp/journald-state.err")") ;;
+    *) unread+=("cannot read what journald runs on the Pi (exit $status): $(error_of "$tmp/journald-state.err")") ;;
+  esac
+  ((status == 0)) || return 0
+  id=$(sed -n 's/^machine //p' "$tmp/journald.state")
+  daemon_pid=$(sed -n 's/^pid //p' "$tmp/journald.state")
+  ! grep -qx 'card yes' "$tmp/journald.state" || card=yes
+  mapfile -t open < <(sed -n 's/^open //p' "$tmp/journald.state")
+  usage=$(sed -n 's/^usage //p' "$tmp/journald.state")
+  if [[ ! $id =~ ^[0-9a-f]{32}$ ]]; then
+    unread+=("the Pi's machine id in /etc/machine-id is not 32 hexadecimal digits: ${id:-empty}")
+    return 0
+  fi
+  if [[ ! $daemon_pid =~ ^[1-9][0-9]*$ ]]; then
+    differences+=("journald is not running (systemctl show systemd-journald gives MainPID ${daemon_pid:-none})")
+    return 0
+  fi
+  daemon_file=/var/log/journal/$id/system.journal
+  for path in "${open[@]}"; do
+    [[ $path != "$daemon_file" ]] || on_card=yes
+    [[ $path != /run/log/journal/* ]] || in_run+=("$path")
+  done
+  if ((${#in_run[@]} > 0)); then
+    differences+=("journald (PID $daemon_pid) writes $(joined "${in_run[@]}"), in /run, which a reboot loses")
+  fi
+  if [[ -z $on_card ]]; then
+    differences+=("journald (PID $daemon_pid) does not write $daemon_file, this machine's journal on the card: it has not restarted since the setting went in, or another setting keeps the journal in /run")
+  fi
+  # With no setting read, there is nothing to compare the usage line with; unread says why.
+  [[ -n $runs ]] || return 0
+  if [[ -z $usage ]] || ! running=$(journald_running "$usage"); then
+    unread+=("journald (PID $daemon_pid) has logged no usage line this boot that the journal still holds, as when journald deleted its oldest files under its cap, so what it runs cannot be read: run sudo -n journalctl --rotate on the Pi, which makes journald log one and starts new journal files, and check again (a flush makes none once the journal is flushed)")
+    return 0
+  fi
+  if ! expected=$(journald_expected "$runs" "$id" "$card"); then
+    unread+=("journald's setting gives Storage=$(journald_value "$runs" Storage), which check 8 does not know")
+    return 0
+  fi
+  differences_text=$(journald_differences "$expected" "$running")
+  while IFS= read -r line; do
+    [[ -z $line ]] || differences+=("journald (PID $daemon_pid) runs a setting other than its files give: its usage line reports $line")
+  done <<<"$differences_text"
+  daemon_reports=$(paste -sd ',' - <<<"$expected" | sed 's/,/, /g')
+}
+
 check_commit
 read_config
 check_settings
@@ -809,6 +946,7 @@ check_status
 check_timer_install
 check_protected
 check_bootstrap
+check_journal
 
-printf 'check-deploy: %s of 7 checks PASS against %s\n' "$((7 - not_passed))" "$release_name" >&2
+printf 'check-deploy: %s of 8 checks PASS against %s\n' "$((8 - not_passed))" "$release_name" >&2
 ((not_passed == 0)) || exit 1

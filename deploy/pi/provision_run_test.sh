@@ -97,7 +97,8 @@ export TEST_LOG="$work_dir/log" TEST_UID="$uid" TEST_RUNTIME_DIR="$runtime_dir" 
   TEST_REAL_DATE="$real_date" TEST_REAL_SLEEP="$real_sleep" TEST_STATE="$state" TEST_RELEASES="$work_dir/releases" \
   TEST_CLOCK="$work_dir/clock" TEST_SYSTEM_UNITS="$system_units" TEST_REAL_JQ="$real_jq" \
   TEST_REAL_INSTALL="$real_install" TEST_REAL_OPENSSL="$real_openssl" \
-  TEST_UNIT_SESSIONS="$work_dir/unit-sessions" TEST_STOPPING="$work_dir/stopping"
+  TEST_UNIT_SESSIONS="$work_dir/unit-sessions" TEST_STOPPING="$work_dir/stopping" \
+  TEST_FAKE_JOURNALD="$script_dir/testdata/fake-journald"
 mkdir -p -- "$bin" "$join" "$first_join" "$TEST_RELEASES" "$system_units"
 
 # unit_pids SID... prints the PID of each process of the sessions SID... that is this test's, whose
@@ -214,8 +215,9 @@ EOF
 # provision.sh installs its own files as ghost-wispr, and the nightly update the system files: any
 # other install with sudo, any udevadm call and a logind restart are errors that the test reports.
 # The nightly update's own calls each have -n: it installs the system files under
-# GHOST_WISPR_SYSTEM_ROOT, reloads udev and restarts logind, which the log records, and reads Serve's
-# setting.
+# GHOST_WISPR_SYSTEM_ROOT, reloads udev and restarts logind, which the log records, restarts journald,
+# flushes the journal and reads journald's usage line, each of which the fake journald
+# (testdata/fake-journald, state in $TEST_STATE/journald) does, and reads Serve's setting.
 cat >"$bin/sudo" <<'EOF'
 #!/usr/bin/env bash
 # The start of the run's own unit is logged apart, in $TEST_LOG.provision-units: $TEST_LOG holds what
@@ -242,7 +244,18 @@ if [[ ${1:-} == -n ]]; then
       shift
       exec install "$@"
       ;;
-    udevadm | systemctl) ;;
+    udevadm) ;;
+    systemctl)
+      if [[ ${*:2} == 'restart systemd-journald' ]]; then
+        exec "$TEST_FAKE_JOURNALD" "$TEST_STATE/journald" restart
+      fi
+      ;;
+    journalctl)
+      if [[ ${*:2} == --flush || ${*:2} == --rotate ]]; then
+        exec "$TEST_FAKE_JOURNALD" "$TEST_STATE/journald" "${2#--}"
+      fi
+      exec "$TEST_FAKE_JOURNALD" "$TEST_STATE/journald" usage "${@:2}"
+      ;;
     tailscale)
       shift
       exec tailscale "$@"
@@ -536,6 +549,10 @@ else
   printf 'systemctl %s\n' "$*" >>"$TEST_LOG.system-calls"
 fi
 error() { printf 'fake systemctl: %s: systemctl %s\n' "$1" "${*:2}" >>"$TEST_LOG.errors"; }
+# journald's MainPID, which any user may read, is the fake journald's.
+if [[ $* == 'show systemd-journald -p MainPID --value' ]]; then
+  exec "$TEST_FAKE_JOURNALD" "$TEST_STATE/journald" pid
+fi
 if [[ ${1:-} != --user ]]; then
   # The fakes' own directory, which the test's own calls do not have on their PATH.
   session_signal=${0%/*}/session-signal
@@ -1030,7 +1047,8 @@ make_stage() {
 new_pi() {
   stop_fake_units
   rm -rf -- "$pi"
-  mkdir -p -- "$deploy" "$units" "$key_dir" "$sysroot" "$state"
+  mkdir -p -- "$deploy" "$units" "$key_dir" "$sysroot/etc" "$state"
+  printf '31e1ef849026403294ddccad747a7e62\n' >"$sysroot/etc/machine-id"
   printf 'the key\n' >"$key"
   printf 'the certificate\n' >"$deploy/device.crt"
   rm -f -- "$TEST_LOG" "$TEST_LOG".*
@@ -1098,7 +1116,8 @@ EOF
     >"$work_dir/build.out" 2>&1 || fail "build-deploy-tarball.sh --stage failed for release $name: $(<"$work_dir/build.out")"
   restage "$dir/ghost-wispr-pi-deploy" pi.env "$script_dir/test-pi.env"
   for file in ghost-wispr.yaml pi.env update.sh pi-lib.sh wait-for-network.sh wait-for-time-sync.sh ghost-wispr.service \
-    99-ghost-wispr.rules logind-power-key.conf ghost-wispr-update-launcher.sh ghost-wispr-update.service ghost-wispr-update.timer; do
+    99-ghost-wispr.rules logind-power-key.conf journald-ghost-wispr.conf ghost-wispr-update-launcher.sh ghost-wispr-update.service \
+    ghost-wispr-update.timer; do
     { cat -- "$dir/ghost-wispr-pi-deploy/$file" && printf '# release %s\n' "$name"; } >"$work_dir/marked"
     restage "$dir/ghost-wispr-pi-deploy" "$file" "$work_dir/marked"
   done
@@ -1132,7 +1151,8 @@ installed_set() {
   local path
   for path in "$deploy"/{ghost-wispr.yaml,pi.env,update.sh,pi-lib.sh,wait-for-network.sh,wait-for-time-sync.sh} \
     "$units/ghost-wispr.service" "$sysroot/etc/udev/rules.d/99-ghost-wispr.rules" \
-    "$sysroot/etc/systemd/logind.conf.d/50-ghost-wispr-power-key.conf" "$deploy"/{ghost-wispr,.env,deploy.verified}; do
+    "$sysroot/etc/systemd/logind.conf.d/50-ghost-wispr-power-key.conf" "$sysroot/etc/systemd/journald.conf.d/90-ghost-wispr.conf" \
+    "$deploy"/{ghost-wispr,.env,deploy.verified}; do
     if [[ -f $path ]]; then
       printf '%s %s\n' "$(sha "$path")" "${path#"$pi"/}"
     else
@@ -1468,13 +1488,14 @@ for entry in "ghost-wispr-update-launcher.sh $deploy 755" "ghost-wispr-update.se
   [[ $(stat -c %a -- "$dir/$name") == "$mode" ]] || fail "$dir/$name has mode $(stat -c %a -- "$dir/$name"), not $mode"
 done
 
-# no-env-no-system-files: the nightly update owns .env, the config, the udev rule and the logind
-# setting. provision.sh writes none of them, and reloads neither udev nor logind.
+# no-env-no-system-files: the nightly update owns .env, the config, the udev rule, the logind
+# setting and the journald setting. provision.sh writes none of them, and reloads none of udev,
+# logind and journald.
 begin no-env-no-system-files
 for name in .env ghost-wispr.yaml; do
   [[ ! -e $deploy/$name ]] || fail "provision.sh wrote $deploy/$name"
 done
-if grep -E 'udev|logind|99-ghost-wispr\.rules|logind-power-key' "$work_dir/first.log" >&2; then
+if grep -E 'udev|logind|journald|99-ghost-wispr\.rules|logind-power-key|journald-ghost-wispr' "$work_dir/first.log" >&2; then
   fail 'provision.sh installed or reloaded a system file itself (above)'
 fi
 

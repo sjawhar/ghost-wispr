@@ -250,12 +250,14 @@ require_release_the_pi_runs() {
 
 # set_file_path NAME prints where the Pi keeps the file NAME of the deploy set, the binary
 # (ghost-wispr) or .env, as update.sh's installed_path does (the plan's contract C2): the recorder's
-# unit in UNIT_DIR, the udev rule and the logind setting under SYSTEM_ROOT, each other in DEPLOY_DIR.
+# unit in UNIT_DIR, the udev rule, the logind setting and the journald setting under SYSTEM_ROOT,
+# each other in DEPLOY_DIR.
 set_file_path() {
   case $1 in
     ghost-wispr.service) printf '%s\n' "$UNIT_DIR/$1" ;;
     99-ghost-wispr.rules) printf '%s\n' "${SYSTEM_ROOT%/}/etc/udev/rules.d/99-ghost-wispr.rules" ;;
     logind-power-key.conf) printf '%s\n' "${SYSTEM_ROOT%/}/etc/systemd/logind.conf.d/50-ghost-wispr-power-key.conf" ;;
+    journald-ghost-wispr.conf) printf '%s\n' "${SYSTEM_ROOT%/}/etc/systemd/journald.conf.d/90-ghost-wispr.conf" ;;
     *) printf '%s\n' "$DEPLOY_DIR/$1" ;;
   esac
 }

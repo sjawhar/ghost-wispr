@@ -2,10 +2,10 @@
 # Tests deploy/pi/build-deploy-tarball.sh, the one script that builds the Pi's deploy tarball, and
 # the steps of .github/workflows/release.yml that build and publish it (dispatch://INFRA-5935/spec
 # R5; the plan's contracts C2 and C6). Each expectation is written out here, not read from the
-# script: the 14 files, the source and the mode of each, and the fields of the manifest.
+# script: the 15 files, the source and the mode of each, and the fields of the manifest.
 #
 # The tarball has one top directory, ghost-wispr-pi-deploy/, and each file is directly in it: the
-# nine files that the nightly update installs, the five provisioning files, and manifest.json. Each
+# ten files that the nightly update installs, the five provisioning files, and manifest.json. Each
 # script (*.sh) has mode 0755 and each other file 0644. manifest.json holds format 1, the commit, the
 # SHA-256 of the binary and of each other file. It holds link_versions when the binary answers
 # `link-versions` with exit 0 and a JSON array of positive integers, and no such key when the binary
@@ -31,9 +31,9 @@ fail() {
   exit 1
 }
 
-# The 14 files of the tarball: the name, the source in the repository, and the mode.
+# The 15 files of the tarball: the name, the source in the repository, and the mode.
 readonly expected_files=(
-  # The nine files that the nightly update installs.
+  # The ten files that the nightly update installs.
   'ghost-wispr.yaml deploy/pi/files/ghost-wispr.yaml 644'
   'pi.env deploy/pi/files/pi.env 644'
   'update.sh deploy/pi/update.sh 755'
@@ -43,6 +43,7 @@ readonly expected_files=(
   'ghost-wispr.service deploy/pi/files/ghost-wispr.service 644'
   '99-ghost-wispr.rules deploy/pi/files/99-ghost-wispr.rules 644'
   'logind-power-key.conf deploy/pi/files/logind-power-key.conf 644'
+  'journald-ghost-wispr.conf deploy/pi/files/journald-ghost-wispr.conf 644'
   # The five provisioning files, which only provision.sh installs.
   'provision.sh deploy/pi/provision.sh 755'
   'ghost-wispr-update-launcher.sh deploy/pi/files/ghost-wispr-update-launcher.sh 755'
@@ -62,7 +63,7 @@ for entry in "${expected_files[@]}"; do
   source_of[$file]=$source
   mode_of[$file]=$mode
 done
-((${#names[@]} == 14)) || fail "the test's own table holds ${#names[@]} files, not the 14 of R5"
+((${#names[@]} == 15)) || fail "the test's own table holds ${#names[@]} files, not the 15 of R5"
 for file in "${names[@]}"; do
   [[ -f $repo_root/${source_of[$file]} ]] || fail "the test's own table names ${source_of[$file]}, which the repository does not hold"
 done
@@ -108,7 +109,7 @@ differences() {
 
 name="the test's table is update.sh's SET_FILES and PROVISIONING_FILES"
 # update.sh's two lists, from a shell that runs their declarations alone: update.sh itself is not
-# sourced. The table's first nine files are the deploy set and its last five the provisioning files.
+# sourced. The table's first ten files are the deploy set and its last five the provisioning files.
 declarations=$(awk '
   /^readonly (SET_FILES|PROVISIONING_FILES)=\(/ { take = 1 }
   take { print }
@@ -119,11 +120,11 @@ update_lists=$(bash --noprofile --norc -euc "$declarations"'
   printf "provisioning %s\n" "${PROVISIONING_FILES[@]}"' 2>&1) \
   || fail "cannot read SET_FILES and PROVISIONING_FILES from deploy/pi/update.sh: $update_lists"
 update_lists=$(LC_ALL=C sort <<<"$update_lists")
-table_lists=$(printf 'set %s\n' "${names[@]:0:9}" && printf 'provisioning %s\n' "${names[@]:9}")
+table_lists=$(printf 'set %s\n' "${names[@]:0:10}" && printf 'provisioning %s\n' "${names[@]:10}")
 table_lists=$(LC_ALL=C sort <<<"$table_lists")
 [[ $update_lists == "$table_lists" ]] || fail "update.sh's lists $(differences "$table_lists" "$update_lists")"
 
-# check_members TARBALL: the entries of TARBALL are ghost-wispr-pi-deploy/, the 14 files in it, and
+# check_members TARBALL: the entries of TARBALL are ghost-wispr-pi-deploy/, the 15 files in it, and
 # its manifest.json, and nothing else.
 check_members() {
   local listing
@@ -145,8 +146,8 @@ check_sum_asset() {
   return 1
 }
 
-# check_set DIR: DIR holds the 14 files and manifest.json and nothing else. Each is a regular file
-# with its mode, and each of the 14 has the bytes of its source.
+# check_set DIR: DIR holds the 15 files and manifest.json and nothing else. Each is a regular file
+# with its mode, and each of the 15 has the bytes of its source.
 check_set() {
   local dir=$1 listing file mode
   listing=$(entries "$dir") || { printf 'cannot list %s\n' "$dir" >&2; return 1; }
@@ -174,7 +175,7 @@ check_set() {
 }
 
 # check_manifest DIR COMMIT BINARY: DIR/manifest.json is format 1 of COMMIT, names the SHA-256 of
-# BINARY, and names each of the 14 files with the SHA-256 of its copy in DIR, and no other file. Its
+# BINARY, and names each of the 15 files with the SHA-256 of its copy in DIR, and no other file. Its
 # keys are those and link_versions, which each case checks itself.
 check_manifest() {
   local dir=$1 manifest=$1/manifest.json binary_sum keys file want have
