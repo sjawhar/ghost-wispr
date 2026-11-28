@@ -183,20 +183,24 @@ const questionHeardSlack = time.Second
 
 // eraseQuestionsHeardIn deletes, in tx, the question log's rows of sessions
 // whose heard span overlaps from to to, widened by questionHeardSlack: the
-// questions whose words a segment deletion took off the unit. It records the
-// span, with no words, for each session (voice_question_erasures), so a
-// question whose write lands after the deletion is refused
+// questions whose words a segment deletion took off the unit. A zero from has
+// no lower bound: every question heard up to to goes. It records the span,
+// with no words, for each session (voice_question_erasures; "" for no lower
+// bound), so a question whose write lands after the deletion is refused
 // (RecordVoiceQuestion): the log writes apart from the answer, and can come
 // late.
 func eraseQuestionsHeardIn(tx *sql.Tx, sessions []string, from, to time.Time) error {
-	from, to = from.Add(-questionHeardSlack), to.Add(questionHeardSlack)
+	lower, upper := "", questionTime(to.Add(questionHeardSlack))
+	if !from.IsZero() {
+		lower = questionTime(from.Add(-questionHeardSlack))
+	}
 	for _, session := range sessions {
-		if _, err := tx.Exec(`INSERT INTO voice_question_erasures(session_id, heard_from, heard_to) VALUES(?, ?, ?)`, session, questionTime(from), questionTime(to)); err != nil {
+		if _, err := tx.Exec(`INSERT INTO voice_question_erasures(session_id, heard_from, heard_to) VALUES(?, ?, ?)`, session, lower, upper); err != nil {
 			return fmt.Errorf("record the erased span of the deleted segment's questions: %w", err)
 		}
 	}
 	placeholders, args := placeholderList(sessions)
-	args = append(args, questionTime(to), questionTime(from))
+	args = append(args, upper, lower)
 	if _, err := tx.Exec(`DELETE FROM voice_questions WHERE session_id IN (`+placeholders+`) AND heard_from <= ? AND heard_to >= ?`, args...); err != nil {
 		return fmt.Errorf("erase the questions heard in the deleted segment: %w", err)
 	}
@@ -222,24 +226,6 @@ func eraseQuestionsHeardInRecording(tx *sql.Tx, sessionID, recording, sha string
 }
 
 func seconds(s float64) time.Duration { return time.Duration(s * float64(time.Second)) }
-
-// untimedHeardFrom is the earliest the words of an untimed segment of
-// session sessionID can have been said: the start of the session it came
-// from (sourceID, segments.untimed_source_id; "" is sessionID itself). An
-// untimed segment keeps no capture time: its stored time is when its result
-// came, and a result can come long after its words, as results replayed
-// after an outage do, so no other segment's stored time bounds its words.
-func untimedHeardFrom(tx *sql.Tx, sessionID, sourceID string) (time.Time, error) {
-	source := sourceID
-	if source == "" {
-		source = sessionID
-	}
-	session, err := getSession(tx, source)
-	if err != nil {
-		return time.Time{}, fmt.Errorf("read the session an untimed segment came from: %w", err)
-	}
-	return session.StartedAt, nil
-}
 
 // unsplice maps a time on recording as its bytes are now (hash sha) to the
 // time on the recording as it was captured: back through each completed cut

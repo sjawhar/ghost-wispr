@@ -351,6 +351,17 @@ type SpeechWaiter interface {
 	WaitSpoken(ctx context.Context) error
 }
 
+// EventCounter is a Session that counts the events it has queued for Events,
+// each handed on in order. The Supervisor reads Events on a goroutine of its
+// own, so when the speaker reports the end of the voice's speech, the
+// transcript of that speech (EventAgentText) may still wait in the queue: the
+// Supervisor judges the speech once it has read as many events as were
+// queued at its end (voiceSpokeLocked). A voice that does not count its
+// events has its speech judged at once, on what was read.
+type EventCounter interface {
+	EventsQueued() uint64
+}
+
 // Event is one thing a Session reports.
 type Event struct {
 	Kind  EventKind

@@ -20,9 +20,9 @@ type openQuestion struct {
 	// the turn end (outcomeOf), at answeredAt.
 	answered   bool
 	answeredAt time.Time
-	// playing: a playback or a speech of a voice that drives its turn began
-	// after Answer returned, which speaks the answer; the end of the speech
-	// is the turn's.
+	// playing: a speech of a voice that drives its turn, begun after Answer
+	// returned, speaks the answer (answerSpeechLocked); the end of that
+	// speech is the turn's.
 	playing bool
 	// cut is how a stop, a barge-in, a never mind or a failure ended the
 	// turn before its answer played to its end; "" while none did.
@@ -61,8 +61,8 @@ func (s *Supervisor) openQuestionLocked(ex *exchange, heard, vendor string, aske
 // hold what the room took back. The row is written now when the outcome is
 // known already: the exchange ended or cut the turn while Answer ran, or a
 // driving voice was given nothing to say (silent). Else it waits for its
-// answer's audio (exchange.answerAwaitsAudio) to play to its end, or for a
-// cut, whatever other turn opens or returns meanwhile. s.mu is held.
+// answer to play to its end (answerSpeechLocked), or for a cut, whatever other
+// turn opens or returns meanwhile. s.mu is held.
 func (s *Supervisor) answeredLocked(ex *exchange, q *openQuestion, x *Exchange, err error, silent bool) {
 	q.answered, q.answeredAt = true, time.Now()
 	q.q.IssueKey = x.IssueKey
@@ -72,28 +72,35 @@ func (s *Supervisor) answeredLocked(ex *exchange, q *openQuestion, x *Exchange, 
 	}
 	if ex.ended || q.cut != "" || silent {
 		s.settleQuestionLocked(ex, q, "")
-		return
 	}
-	ex.answerAwaitsAudio.Store(true)
 }
 
-// answerAudio takes the first audio a driving voice writes through any of
-// ex's playbacks after an answer came (sayPlayback.Write): each answered
-// question of ex is playing now, and the speech it plays in ends its turn
-// (driverSpeechLocked). Audio written into a speech already playing plays as
-// soon as queued, with no speech start of its own: that is its first audio.
-func (s *Supervisor) answerAudio(ex *exchange) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	ex.answerAwaitsAudio.Store(false)
-	now := time.Now()
-	for _, q := range ex.questions {
-		if !q.answered {
-			continue
+// answerSpeechLocked takes a speech of a voice that drives its turn, begun
+// (started) or ended at at, for the question log. Voices B and C name no
+// response in their audio, so the only proof that an answer played is a
+// speech the voice began after the answer came that ended by itself: such a
+// speech plays one answer, the oldest that came before it and none played
+// yet, and its end writes that answer's row. Audio that goes on in a speech
+// begun before an answer came, an acknowledgement's tail or the answer
+// itself, proves nothing, and the answer waits on: a stop then logs it as
+// stopped. A speech the speaker cut ends nothing here: the cut writes its
+// rows (cutDriverLocked, endLocked). s.mu is held.
+func (s *Supervisor) answerSpeechLocked(ex *exchange, started, cancelled bool, at time.Time) {
+	if started {
+		for _, q := range ex.questions {
+			if q.answered && !q.playing && !at.Before(q.answeredAt) {
+				q.playing = true
+				return
+			}
 		}
-		q.playing = true
-		if q.firstAudio.IsZero() && s.voiceSpeaking && s.speechEx == ex {
-			q.firstAudio = now
+		return
+	}
+	if cancelled {
+		return
+	}
+	for _, q := range slices.Clone(ex.questions) {
+		if q.playing {
+			s.settleQuestionLocked(ex, q, "")
 		}
 	}
 }

@@ -80,15 +80,19 @@ func TestReview195ClaimKeepsItsCaptureSpan(t *testing.T) {
 	}
 }
 
-// TestReview195CompletedContinuousSpeechIsNotStopped fails if an answer a
-// driving voice played to its end is logged as stopped when it played in the
-// speech its acknowledgement began: the speech's end, with no cut, is the
-// answer's. The control speaks the answer in a speech of its own.
-func TestReview195CompletedContinuousSpeechIsNotStopped(t *testing.T) {
+// TestReview195AnAnswerInItsAcknowledgementsSpeechIsUnproven fails if an
+// answer a driving voice speaks in a speech of its own is logged as anything
+// but answered, or if one it speaks in the speech its acknowledgement began
+// is logged as answered on a stop: no audio of that speech tells the answer
+// from the acknowledgement's tail (answerSpeechLocked). This probe of Sol's
+// review at 48ca91a1 first required answered for both; the review at
+// 451690d6 showed the acknowledgement's tail would then pass for an answer.
+func TestReview195AnAnswerInItsAcknowledgementsSpeechIsUnproven(t *testing.T) {
 	for _, early := range []bool{false, true} {
-		name := "fresh speech control"
+		name := "a speech of its own control"
+		want := OutcomeAnswered
 		if early {
-			name = "answer continues the acknowledgement"
+			name, want = "the answer continues the acknowledgement", OutcomeStopped
 		}
 		t.Run(name, func(t *testing.T) {
 			r, sess, log := review195Driver(t, newFakeConcierge("ABC-12 is in review."))
@@ -103,8 +107,8 @@ func TestReview195CompletedContinuousSpeechIsNotStopped(t *testing.T) {
 			r.speaker.endSpeech(audio.InputVoice)
 			r.speaker.FlushSpeech()
 			r.s.Stop("Wispr, stop")
-			if q := log.next(t); q.Outcome != OutcomeAnswered {
-				t.Fatalf("an answer played to its end was logged %+v", q)
+			if q := log.next(t); q.Outcome != want {
+				t.Fatalf("logged %+v, want %s", q, want)
 			}
 		})
 	}

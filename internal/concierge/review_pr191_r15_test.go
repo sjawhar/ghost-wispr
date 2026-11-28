@@ -104,13 +104,16 @@ func loopbackVendor(t *testing.T, deepgram bool) (string, <-chan *vendorWire) {
 
 // watchedVoice is a vendor voice whose Open is reported, and whose answer
 // tool calls and results are. starts counts the speech starts of its
-// sessions the Supervisor has received (watchedSession).
+// sessions the Supervisor has received, and beforeEvent, when set, runs
+// before each event is handed to the Supervisor, so a test can hold the
+// Supervisor's read of an event (watchedSession).
 type watchedVoice struct {
-	inner   voice.Voice
-	opened  chan struct{}
-	calls   chan voice.ToolCall
-	results chan json.RawMessage
-	starts  atomic.Int64
+	inner       voice.Voice
+	opened      chan struct{}
+	calls       chan voice.ToolCall
+	results     chan json.RawMessage
+	starts      atomic.Int64
+	beforeEvent atomic.Pointer[func(voice.Event)]
 }
 
 func watch(v voice.Voice) *watchedVoice {
@@ -146,6 +149,9 @@ func watchSession(ctx context.Context, s voice.Session, v *watchedVoice) *watche
 	go func() {
 		defer close(w.events)
 		for e := range s.Events() {
+			if hold := v.beforeEvent.Load(); hold != nil {
+				(*hold)(e)
+			}
 			select {
 			case w.events <- e:
 				if e.Kind == voice.EventSpeechStarted {
@@ -159,6 +165,15 @@ func watchSession(ctx context.Context, s voice.Session, v *watchedVoice) *watche
 }
 
 func (w *watchedSession) Events() <-chan voice.Event { return w.events }
+
+// EventsQueued is the watched session's own count (voice.EventCounter): it
+// hands on every event its session queued, in order.
+func (w *watchedSession) EventsQueued() uint64 {
+	if c, ok := w.Session.(voice.EventCounter); ok {
+		return c.EventsQueued()
+	}
+	return 0
+}
 
 type watchedTools struct {
 	inner voice.ToolRunner

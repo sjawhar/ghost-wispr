@@ -52,6 +52,7 @@ type session struct {
 	writeMu   sync.Mutex
 
 	events   chan voice.Event
+	queued   atomic.Uint64  // events sent on events (EventsQueued)
 	emitters sync.WaitGroup // the goroutines that send events
 	workers  sync.WaitGroup // the others
 
@@ -135,7 +136,10 @@ type pendingCall struct {
 	claimed bool // the run or a Deliver is answering it
 }
 
-var _ voice.Session = (*session)(nil)
+var (
+	_ voice.Session      = (*session)(nil)
+	_ voice.EventCounter = (*session)(nil)
+)
 
 func start(cfg *Config, conn *websocket.Conn, x *voice.Exchange) *session {
 	ctx, cancel := context.WithCancel(context.Background())
@@ -187,9 +191,15 @@ func (s *session) Events() <-chan voice.Event { return s.events }
 func (s *session) emit(e *voice.Event) {
 	select {
 	case s.events <- *e:
+		s.queued.Add(1)
 	case <-s.done:
 	}
 }
+
+// EventsQueued counts the events sent on Events, which the Supervisor reads
+// in order (voice.EventCounter). One taken before the count is raised only
+// makes the count lower than what was read.
+func (s *session) EventsQueued() uint64 { return s.queued.Load() }
 
 // Say has Deepgram speak text word for word, queued behind any speech of
 // its own, and returns once the words' audio is queued to the Output; or

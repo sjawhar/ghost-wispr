@@ -749,10 +749,16 @@ What the voice hears, and where the room's words go:
   A segment delete erases each question whose words were said within a second of the segment's
   span, placed by when the words were said, also after an earlier "Delete text and audio"
   shortened the recording, and a question the unit writes after that delete is not kept. A
-  segment of a merged session that has no recording keeps no time its words were said, so its
-  delete erases every question of the session it came from asked before the segment was stored.
+  segment of a merged session that has no recording keeps no time its words were said, and the
+  unit can replay audio older than a recording after an outage, so its delete erases every
+  question of the session it came from whose words were heard before the segment was stored, with
+  no earlier limit.
   When voice B or C asks for an answer after a stop or "Wispr, never mind", the unit refuses it and
-  keeps nothing of it.
+  keeps nothing of it. Voices B and C name no answer in their audio, so the unit counts an answer
+  of theirs played only when a speech that began after the answer came ends by itself, one answer
+  to a speech, oldest first. An answer spoken in the same speech as the voice's acknowledgement,
+  with no pause between, cannot be told from the acknowledgement, and is logged by how the
+  exchange ends: `stopped` on a stop, else `failed`, as nothing shows it was spoken.
   `ghost-wispr voice questions [--since DATE] [--json]` prints the log, read without writing to
   the database.
 - The `voice_tasks` ledger of questions sent to agents holds none of the room's words: it holds

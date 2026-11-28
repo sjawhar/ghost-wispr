@@ -162,9 +162,6 @@ type cutRig struct {
 	sup     *voice.Supervisor
 	sess    *cutSession
 	driver  *cutDriver
-	// watched is the loopback vendor's voice, when the rig drives one
-	// (openingRig, sol23Open): vendorSpeaks reads its speech starts.
-	watched *watchedVoice
 	// wakeEnd is when the exchange's opening question's last word ended,
 	// by capture: the position of its UtteranceEnd.
 	wakeEnd time.Time

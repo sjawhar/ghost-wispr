@@ -473,12 +473,17 @@ type exchange struct {
 	// change it (Exchange.VoiceAsked); and voiceAskedAt is when it asked: the
 	// ask-back lapses recentKept after (voiceAskExpiredLocked). A later
 	// speech that does not end in a question takes it away (Sol's
-	// twenty-third review of #191).
+	// twenty-third review of #191). eventsRead counts the session's events
+	// read (readEvents), and spoken holds the speeches that ended before
+	// the events queued at their end were read, judged once they are
+	// (judgeSpokenLocked).
 	voiceLine       string
 	voiceAsked      bool
 	voiceAskedAbout string
 	voiceAskedAt    time.Time
 	lastAsked       string
+	eventsRead      uint64
+	spoken          []spokenSpeech
 	// turnParsed* keep the take-back rule's last parse of the current turn's
 	// finals (turnTakeBackLocked): the request, the history and the asker's
 	// words read it on every Room read, and the parse runs again only when
@@ -515,7 +520,10 @@ type exchange struct {
 	followUp     bool       // the exchange waits for a follow-up after Wispr's answer
 	// followUpTurn: the turn now heard began in the follow-up window with no
 	// wake phrase, so it continues the exchange only as a question (R10).
+	// turnInWindow: it began in the follow-up window, as a reply to Wispr's
+	// question or not (judgeSpokenLocked reads it).
 	followUpTurn bool
+	turnInWindow bool
 	// turnByName: the turn now heard began right after the wake phrase, so
 	// its first words are where a name goes (transcript.WriteKeysAfterName).
 	turnByName bool
@@ -631,10 +639,6 @@ type exchange struct {
 	questions          []*openQuestion
 	claimedSpans       map[string][][2]time.Time
 	endedAs            QuestionOutcome
-	// answerAwaitsAudio: an answered question waits for its first audio, so
-	// a playback's next write marks it playing (answerAudio). A playback
-	// reads it on each frame without the lock; it is set under s.mu.
-	answerAwaitsAudio atomic.Bool
 }
 
 // NewSupervisor starts a Supervisor; Close stops it.
@@ -1516,7 +1520,8 @@ func (s *Supervisor) driverHeardLocked(ex *exchange, t *Transcript, words string
 			ex.newTurn, ex.turnFrom = false, ex.turnEnd
 			ex.turn, ex.interim, ex.turnFinal, ex.uttered, ex.heardTo = nil, "", false, false, time.Time{}
 			s.voiceAskExpiredLocked(ex)
-			ex.followUpTurn, ex.turnByName = ex.followUpTimer != nil && !ex.askedBack, false
+			ex.turnInWindow = ex.followUpTimer != nil
+			ex.followUpTurn, ex.turnByName = ex.turnInWindow && !ex.askedBack, false
 			ex.x.Turn++
 			s.roomChangedLocked(ex) // the request's current turn moved (Exchange.Claim)
 		}
@@ -1533,7 +1538,8 @@ func (s *Supervisor) driverHeardLocked(ex *exchange, t *Transcript, words string
 		ex.turnFrom = from
 		ex.turn, ex.interim, ex.turnFinal, ex.uttered, ex.heardTo, ex.reply = nil, "", false, false, time.Time{}, nil
 		s.voiceAskExpiredLocked(ex)
-		ex.followUpTurn, ex.turnByName = ex.followUpTimer != nil && !ex.askedBack, false
+		ex.turnInWindow = ex.followUpTimer != nil
+		ex.followUpTurn, ex.turnByName = ex.turnInWindow && !ex.askedBack, false
 		ex.x.Turn++
 		s.roomChangedLocked(ex)
 		s.turnLocked(ex, t, words)
@@ -1944,8 +1950,9 @@ func (s *Supervisor) readEvents(ex *exchange, sess Session) {
 			// as a question of Wispr's does (Main, after Sol's twenty-second
 			// review of #191): not side talk by the follow-up rule, and read
 			// by the Concierge as a reply to an offer (Exchange.VoiceAsked).
-			// The line is judged whole as the room's next turn begins
-			// (voiceAskedLocked), never on a fragment. A voice that does not
+			// The line is judged whole when the speaker reports the speech
+			// ended, once every event queued by then is read
+			// (voiceSpokeLocked), never on a fragment. A voice that does not
 			// drive its turns speaks the Concierge's lines, whose questions
 			// are its offers already.
 			if ex.drives {
@@ -1979,6 +1986,10 @@ func (s *Supervisor) readEvents(ex *exchange, sess Session) {
 				s.exErrorLocked(ex, ex.x.SessionID)
 			}
 		}
+		// A speech that ended before this event was read is judged once
+		// the events queued at its end are.
+		ex.eventsRead++
+		s.judgeSpokenLocked(ex)
 		s.mu.Unlock()
 	}
 	s.mu.Lock()
@@ -2050,17 +2061,7 @@ func (s *Supervisor) driverSpeechLocked(ex *exchange, started, cancelled bool, a
 	if ex.ended {
 		return
 	}
-	// A speech begun once the answer tool returned speaks its answer, and
-	// its end, with no cut, is the turn's outcome for the question log.
-	for _, q := range slices.Clone(ex.questions) {
-		switch {
-		case !q.answered:
-		case started && !at.Before(q.answeredAt):
-			q.playing = true
-		case !started && !cancelled && q.playing:
-			s.settleQuestionLocked(ex, q, "")
-		}
-	}
+	s.answerSpeechLocked(ex, started, cancelled, at)
 	s.disarmFollowUpLocked(ex)
 	// Each speech the voice starts answers what was said before it; a turn
 	// begun while it spoke ends with the speech when it ends by itself. A cut
@@ -2412,28 +2413,64 @@ func (s *Supervisor) endHoldLocked(ex *exchange) {
 	}
 }
 
-// voiceSpokeLocked judges the transcript of a speech of the voice's own
-// (voiceLine) when the speaker reports that speech's end: once, on the whole
-// completed text, never on a fragment of it. A speech that ended by itself
-// with a question at its end makes the room's next turn a reply to the voice
-// (askedBack, voiceAsked), and records, in its own field and at that moment,
-// the room's question it followed (voiceAskedAbout: the last request the
-// voice took up) and when it asked (voiceAskedAt). A later speech whose last
-// sentence is not a question takes the voice's ask-back away, as does the
-// lapse of recentKept (voiceAskExpiredLocked). A speech a cut ended asked
-// nothing the room heard whole, and a speech with no transcript changes
-// nothing. An ask-back of the Concierge's own line (voiceAsked false) is
-// never cleared here (Sol's twenty-third review of #191).
+// spokenSpeech is a speech of the voice's own that ended, awaiting its
+// judgment (judgeSpokenLocked) until the session's events queued at its end
+// (queued, EventCounter) are read: cancelled, a cut ended it; about, the
+// request the voice last took up when it ended.
+type spokenSpeech struct {
+	queued    uint64
+	cancelled bool
+	about     string
+}
+
+// voiceSpokeLocked takes the speaker's report that a speech of the voice's
+// own ended, and has its transcript (voiceLine) judged once, on the whole
+// completed text, never on a fragment of it (judgeSpokenLocked). The
+// Supervisor reads the session's events on a goroutine of its own, so the
+// transcript, which the voice sent before the speech's audio, can still wait
+// in the session's queue: the speech is judged once every event queued at
+// its end is read (EventCounter), at once when they all are, or when the
+// session does not count them (INFRA-4592; Sol's review of #195).
 func (s *Supervisor) voiceSpokeLocked(ex *exchange, cancelled bool) {
-	line := strings.TrimSpace(ex.voiceLine)
-	ex.voiceLine = ""
-	switch {
-	case cancelled || line == "":
-	case isQuestion(line):
-		ex.askedBack, ex.voiceAsked = true, true
-		ex.voiceAskedAbout, ex.voiceAskedAt = ex.lastAsked, time.Now()
-	case ex.voiceAsked:
-		s.dropVoiceAskLocked(ex)
+	queued := ex.eventsRead
+	if counter, ok := ex.session.(EventCounter); ok {
+		queued = max(queued, counter.EventsQueued())
+	}
+	ex.spoken = append(ex.spoken, spokenSpeech{queued: queued, cancelled: cancelled, about: ex.lastAsked})
+	s.judgeSpokenLocked(ex)
+}
+
+// judgeSpokenLocked judges each ended speech whose events are read, in
+// order. A speech that ended by itself with a question at its end makes the
+// room's next turn a reply to the voice (askedBack, voiceAsked), and records,
+// in its own field, the room's question it followed (voiceAskedAbout: the
+// last request the voice took up when it ended) and when it was judged
+// (voiceAskedAt). A later speech whose last sentence is not a question takes
+// the voice's ask-back away, as does the lapse of recentKept
+// (voiceAskExpiredLocked). A speech a cut ended asked nothing the room heard
+// whole, and a speech with no transcript changes nothing. An ask-back of the
+// Concierge's own line (voiceAsked false) is never cleared here (Sol's
+// twenty-third review of #191). A turn the room began after the last speech
+// ended, before that speech was judged, is a reply or a follow-up by the
+// judgment (followUpTurn).
+func (s *Supervisor) judgeSpokenLocked(ex *exchange) {
+	for len(ex.spoken) > 0 && ex.spoken[0].queued <= ex.eventsRead {
+		sp := ex.spoken[0]
+		ex.spoken = ex.spoken[1:]
+		line := strings.TrimSpace(ex.voiceLine)
+		ex.voiceLine = ""
+		asked := ex.askedBack
+		switch {
+		case sp.cancelled || line == "":
+		case isQuestion(line):
+			ex.askedBack, ex.voiceAsked = true, true
+			ex.voiceAskedAbout, ex.voiceAskedAt = sp.about, time.Now()
+		case ex.voiceAsked:
+			s.dropVoiceAskLocked(ex)
+		}
+		if len(ex.spoken) == 0 && !ex.newTurn && ex.askedBack != asked {
+			ex.followUpTurn = ex.turnInWindow && !ex.askedBack
+		}
 	}
 }
 
@@ -3057,12 +3094,22 @@ func (s *Supervisor) endLocked(ex *exchange, cut bool, reason string) {
 		s.logf("voice: the exchange ended before its recording session (start %d) settled; its %d held timing lines name no session, as its session is unknown", ex.openSeq+1, len(ex.unsent))
 	}
 	// The question log's turn ends with ex: cut by a stop, a barge-in or the
-	// meeting's end, unless a never mind or a failure ended it (endedAs).
+	// meeting's end, unless a never mind or a failure ended it (endedAs). An
+	// answer of a driving voice that no speech of its own played, at an end
+	// with no cut, as the follow-up window's or the idle wait's, is failed:
+	// nothing shows it was spoken (answerSpeechLocked), as the idle wait
+	// takes it for unspoken.
 	how := ex.endedAs
 	if how == "" && silence {
 		how = OutcomeStopped
 	}
-	s.settleQuestionsLocked(ex, how, nil)
+	for _, q := range slices.Clone(ex.questions) {
+		cut := how
+		if cut == "" && ex.drives && q.answered && !q.playing {
+			cut = OutcomeFailed
+		}
+		s.settleQuestionLocked(ex, q, cut)
+	}
 	ex.ended = true
 	s.roomChangedLocked(ex) // a delegation waiting for a final ends its wait
 	if ex.unbindMeeting != nil {
@@ -4000,7 +4047,7 @@ func (o exchangeOutput) Begin() Playback {
 	}
 	// The playback is ex's: the speech its audio starts carries ex on its
 	// start and end (audio.SpeechEvent.Owner), which onSpeech reads.
-	pb := sayPlayback{Playback: o.s.cfg.Speaker.Begin(audio.InputVoice, o.ex), ctx: authority, joins: &frameJoin{}, s: o.s, ex: o.ex}
+	pb := sayPlayback{Playback: o.s.cfg.Speaker.Begin(audio.InputVoice, o.ex), ctx: authority, joins: &frameJoin{}}
 	o.ex.last = pb
 	return pb
 }
@@ -4032,12 +4079,6 @@ type sayPlayback struct {
 	Playback
 	ctx   context.Context
 	joins *frameJoin
-	// s and ex, when set, are the exchange whose answer the playback can
-	// speak: its first audio written after an answer came marks the answer
-	// played (answerAudio), whether the playback began before the answer or
-	// after, as voice B keeps one playback across its audio.
-	s  *Supervisor
-	ex *exchange
 }
 
 // frameJoin keeps the last context a playback was written under, joined with
@@ -4078,13 +4119,7 @@ func (p sayPlayback) Write(ctx context.Context, frame []byte, format audio.Audio
 	if err := both.Err(); err != nil {
 		return err
 	}
-	if err := p.Playback.Write(both, frame, format); err != nil {
-		return err
-	}
-	if p.ex != nil && p.ex.answerAwaitsAudio.Load() {
-		p.s.answerAudio(p.ex)
-	}
-	return nil
+	return p.Playback.Write(both, frame, format)
 }
 
 func (p sayPlayback) Drain(ctx context.Context) error {

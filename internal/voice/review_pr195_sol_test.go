@@ -13,19 +13,28 @@ import (
 // Sol's review of #195 at 17bd4e47 left these probes; each failed there. The
 // stop probe's late call is rejected, not logged: its first form required the
 // Concierge to answer a call that came after the stop, which the review's own
-// remedy forbids.
+// remedy forbids. The playback probe follows the rule of the review at
+// 451690d6 (answerSpeechLocked).
 
-// TestSol195ContinuousPlayback fails if an answer a driving voice writes
-// through the playback its acknowledgement began, as voice B reuses its
-// playback across audio, is logged as stopped though it played to its end. The
-// control writes the answer through a playback of its own.
+// TestSol195ContinuousPlayback fails if an answer a driving voice writes into
+// the speech its acknowledgement began, through that playback or a new one,
+// is logged as answered on a stop, or if one it speaks in a speech of its own
+// is not: voices B and C name no response in their audio, and audio that goes
+// on in a speech begun before the answer came cannot be told from the
+// acknowledgement's tail (TestSolFollowup195AckTailIsNotAnswer), so it proves
+// no answer played. The control ends the acknowledgement's speech before the
+// answer's begins.
 func TestSol195ContinuousPlayback(t *testing.T) {
-	for _, reuse := range []bool{false, true} {
-		name := "new playback control"
-		if reuse {
-			name = "the acknowledgement's playback reused"
-		}
-		t.Run(name, func(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		ackEnds, same bool
+		want          QuestionOutcome
+	}{
+		{"a speech of its own control", true, false, OutcomeAnswered},
+		{"a new playback in the acknowledgement's speech", false, false, OutcomeStopped},
+		{"the acknowledgement's playback reused", false, true, OutcomeStopped},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
 			r, sess, log := review195Driver(t, newFakeConcierge("ABC-12 is in review."))
 			r.heard("what about ABC-12?", true, true)
 			format := audio.AudioFormat{SampleRate: 24000, Channels: 1, Encoding: audio.EncodingPCM16}
@@ -34,19 +43,24 @@ func TestSol195ContinuousPlayback(t *testing.T) {
 				t.Fatal(err)
 			}
 			r.speaker.FlushSpeech()
+			if tc.ackEnds {
+				r.speaker.endSpeech(audio.InputVoice)
+				r.speaker.FlushSpeech()
+			}
 			review195Tool(t, sess, "what about ABC-12?")
-			if !reuse {
+			if !tc.same {
 				pb = sess.x.Out.Begin()
 			}
 			if err := pb.Write(t.Context(), make([]byte, 960), format); err != nil {
 				t.Fatal(err)
 			}
+			r.speaker.FlushSpeech()
 			r.speaker.endSpeech(audio.InputVoice)
 			r.speaker.FlushSpeech()
 			r.s.Stop("Wispr, stop")
 			q := log.next(t)
-			if q.Outcome != OutcomeAnswered || q.FirstAudio == nil {
-				t.Fatalf("an answer played to its end was logged %s, first audio %v", q.Outcome, q.FirstAudio)
+			if q.Outcome != tc.want || (q.FirstAudio != nil) != (tc.want == OutcomeAnswered) {
+				t.Fatalf("logged %s, first audio %v; want %s, with a first audio only for an answer in a speech of its own", q.Outcome, q.FirstAudio, tc.want)
 			}
 		})
 	}

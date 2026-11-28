@@ -24,20 +24,9 @@ import (
 // rule for a speech nothing explains is what decides (Main, after the review).
 
 // vendorSpeaks has GPT-Live speak on the loopback wire, and returns once its
-// speech has reached the Supervisor's speaker and ended there. It ends the
-// speech only once the Supervisor has received the speech's start from
-// GPT-Live's events (watchedVoice.starts), and so every event GPT-Live sent
-// before it, a transcript of the speech among them: a real speaker ends a
-// speech after its audio plays out and GPT-Live's speech gap, this one at
-// once, and without the wait the Supervisor could judge the speech before
-// its transcript came (TestSol191R23QuestionWhileDelegationOpen failed so
-// in Sol's review of #195, a slow read of the transcript shown to be why).
+// speech has reached the Supervisor's speaker and ended there.
 func vendorSpeaks(t *testing.T, w *vendorWire, r *cutRig) {
 	t.Helper()
-	var starts int64
-	if r.watched != nil {
-		starts = r.watched.starts.Load()
-	}
 	pcm := make([]byte, 2*2400)
 	for i := 0; i < len(pcm); i += 2 {
 		binary.LittleEndian.PutUint16(pcm[i:], 4000)
@@ -48,11 +37,11 @@ func vendorSpeaks(t *testing.T, w *vendorWire, r *cutRig) {
 		r.speaker.eventMu.Lock()
 		active := r.speaker.active
 		r.speaker.eventMu.Unlock()
-		if active != nil && (r.watched == nil || r.watched.starts.Load() > starts) {
+		if active != nil {
 			break
 		}
 		if time.Now().After(deadline) {
-			t.Fatal("GPT-Live's speech never reached the speaker, or the Supervisor never took its start")
+			t.Fatal("GPT-Live's speech never reached the speaker")
 		}
 		time.Sleep(5 * time.Millisecond)
 	}

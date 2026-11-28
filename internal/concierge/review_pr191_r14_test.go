@@ -27,7 +27,6 @@ import (
 func openingRig(t *testing.T, v voice.Voice) *cutRig {
 	t.Helper()
 	r := &cutRig{rig: newRig(t), speaker: &cutSpeaker{}}
-	r.watched, _ = v.(*watchedVoice)
 	t.Cleanup(r.concierge.Stop)
 	r.sup = voice.NewSupervisor(&voice.SupervisorConfig{
 		Voice:        func() (voice.Voice, error) { return v, nil },
