@@ -692,7 +692,7 @@ readonly SERVE_READ='timeout 10s sudo -n tailscale serve status --json'
 # The Pi's tailnet name, which tells its own Serve entries from those of another name.
 readonly SELF_READ='timeout 10s tailscale status --self --json'
 check_bootstrap() {
-  local differences=() unread=() missing=() unreadable=() reached=yes status=0 name remote copy drift want serve have self device
+  local differences=() unread=() missing=() unreadable=() reached=yes status=0 name remote copy drift want serve have shape self device
   if [[ -z $set_dir ]]; then
     unknown 7 "no release manifest and serve.conf to compare the Pi's bootstrap files and Serve with: $set_error"
     return 0
@@ -750,7 +750,9 @@ check_bootstrap() {
   fi
 
   # Serve's setting against the release's serve.conf, both read with pi-lib.sh's functions, as
-  # update.sh's drift rule reads them.
+  # update.sh's drift rule reads them. Of the Pi's Serve the line names each handler's port, path
+  # and kind, never its value (serve_lines_from_status's shape): a Text body, a redirect or a proxy
+  # target is what someone set in Serve (GPT-6.1 Sol's review of #208, round 3).
   status=0
   want=$(serve_conf_lines "$set_dir/serve.conf") || status=$?
   if ((status != 0)); then
@@ -773,7 +775,8 @@ check_bootstrap() {
       # The nightly update never changes Serve (spec R16), so nothing but a person's run puts it back.
       differences+=("Serve differs from the release's serve.conf: want $(paste -sd ',' - <<<"$want"), have none: Serve is empty, so the Pi serves no page; run the release's ./provision.sh on the Pi (docs/pi-setup.md, \"Apply a provisioning change\")")
     elif [[ $have != "$want" ]]; then
-      differences+=("Serve differs from the release's serve.conf: want $(paste -sd ',' - <<<"$want"), have $(paste -sd ',' - <<<"$have")")
+      shape=$(serve_lines_from_status "$serve" "$device" shape) || shape=''
+      differences+=("Serve differs from the release's serve.conf: want $(paste -sd ',' - <<<"$want"), have $(paste -sd ',' - <<<"$shape"); read the whole setting on the Pi with: sudo tailscale serve status")
     fi
   fi
 

@@ -1073,10 +1073,12 @@ A run of `update.sh`:
    `ghost-wispr-update.timer`) with the manifest, and the live Tailscale Serve setting with the
    release's `serve.conf`, for the device's tailnet name as `tailscale status --self --json` gives
    it. A Serve entry of another name, such as the one tailscaled keeps under the device's name
-   before a rename, is a line `<port> <proxy target> on <name>`. It prints one drift line for each
-   difference:
+   before a rename, compares as a line `<port> <proxy target> on <name>`. It prints one drift line
+   for each difference. Of the Pi's Serve the line names each handler as `<port> "<path>" <kind>`,
+   never its text, redirect or proxy target, which `sudo tailscale serve status` shows; check 7 of
+   `check-deploy.sh` names it the same way:
    - `ghost-wispr update: provisioning file <name> differs from the release; run the release's provision.sh`
-   - `ghost-wispr update: Serve differs from the release: want <lines>, have <lines>`
+   - `ghost-wispr update: Serve differs from the release: want <lines>, have <port> "<path>" <kind>; read the whole setting with: sudo tailscale serve status`
    - `ghost-wispr update: Serve: UNKNOWN (<why>)`, when it cannot read or parse Serve's setting, or
      read the device's name
 
