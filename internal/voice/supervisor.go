@@ -2086,8 +2086,11 @@ func (s *Supervisor) driverSpeechLocked(ex *exchange, started, cancelled bool, a
 	// Audio of the voice after the answer came, the start of a speech or the
 	// end of one that went on past it, is no evidence the answer went
 	// unspoken: it may have been the answer (INFRA-4592; Sol's review of
-	// #195 at 75c3253).
-	if started || !at.Before(ex.unspokenSince) {
+	// #195 at 75c3253). Each is read by the time the speaker gives it, not
+	// when its report comes: a speech that began and ended before the answer
+	// came, reported after it, played nothing after it (Sol's review at
+	// 14fd94eb).
+	if !at.Before(ex.unspokenSince) {
 		ex.unspokenAnswer = false
 	}
 	if started {
