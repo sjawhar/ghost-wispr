@@ -899,11 +899,28 @@ run_driver
 [[ -e $state/ssh-lost-fired ]] || fail "SSH was never lost: the driver did not read ghost-wispr-update.service: $out"
 expect_verdicts PASS PASS PASS PASS PASS PASS FAIL
 expect 7 FAIL ghost-wispr-update-launcher.sh SSH
+# A Serve that differs: check 7 names each handler of the Pi's Serve by its port, path and kind,
+# never by its value, and the command that shows the whole setting (GPT-6.1 Sol's review of #208,
+# round 3). Break it catches: a line that prints the Pi's proxy target.
 new_case 'a Serve target that differs'
 jq -c '.Web[].Handlers["/"].Proxy = "http://127.0.0.1:9090"' <<<"$good_serve" >"$state/serve.json"
 run_driver
 expect_verdicts PASS PASS PASS PASS PASS PASS FAIL
-expect 7 FAIL Serve 'http://127.0.0.1:9090' 'http://127.0.0.1:8080'
+expect 7 FAIL Serve 'have 443 "/" proxy' 'http://127.0.0.1:8080' 'read the whole setting on the Pi with: sudo tailscale serve status'
+[[ $(verdict_line 7) != *9090* ]] || fail "check 7 names the Pi's proxy target: $(verdict_line 7)"
+# Handlers that hold text someone set, each with a canary: a Text body, a redirect and a proxy
+# target. The control: the Serve status the driver reads holds all three. Break it catches: a check
+# 7 that prints Serve's lines as the comparison reads them, values and all.
+new_case 'Serve handlers that hold text'
+jq -c --arg host "$PI_HOST" '.Web[$host + ":443"].Handlers["/"].Proxy = "http://127.0.0.1:9/dummy-serve-proxy-canary"
+  | .Web[$host + ":443"].Handlers["/note"] = {Text: "dummy-serve-text-canary"}
+  | .TCP["8443"] = {HTTPS: true} | .Web[$host + ":8443"] = {Handlers: {"/": {Redirect: "https://example.test/dummy-serve-redirect-canary"}}}' \
+  <<<"$good_serve" >"$state/serve.json"
+[[ $(grep -o 'dummy-serve-[a-z]*-canary' "$state/serve.json" | grep -c .) == 3 ]] || fail "control: the Serve status holds no three canaries: $(<"$state/serve.json")"
+run_driver
+expect_verdicts PASS PASS PASS PASS PASS PASS FAIL
+expect 7 FAIL 'have 443 "/" proxy,443 "/note" text,8443 "/" redirect'
+! grep -q 'dummy-serve-[a-z]*-canary' <<<"$out" || fail "the driver printed what a Serve handler holds: $out"
 # An empty Serve, as a Serve apply cut short after its reset leaves it (GPT-6.1 Sol's review of #203):
 # the page is not served, and the nightly update never changes Serve (spec R16), so check 7 fails
 # and names the one command that applies serve.conf again. Break it catches: a check 7 whose line
@@ -941,7 +958,7 @@ new_case 'a Serve entry of the name the Pi had before a rename'
 cp -- "$script_dir/testdata/serve-status-after-rename.json" "$state/serve.json"
 run_driver
 expect_verdicts PASS PASS PASS PASS PASS PASS FAIL
-expect 7 FAIL Serve 'http://127.0.0.1:8080 on ghost-wispr-1.example-tailnet.ts.net'
+expect 7 FAIL Serve '443 "/" proxy on ghost-wispr-1.example-tailnet.ts.net'
 new_case "the Pi's tailnet name cannot be read"
 rm -f -- "$state/self.json"
 run_driver
