@@ -19,8 +19,6 @@ readonly work_dir
 readonly pi="$work_dir/pi"
 readonly opt="$pi/opt" units="$pi/units" root="$pi/root" state="$pi/state" device_key="$pi/key.pem"
 readonly releases="$work_dir/releases" bin="$work_dir/bin" timeout_bin="$work_dir/timeout-bin" fakes="$work_dir/fakes"
-real_timeout=$(command -v timeout)
-readonly real_timeout
 
 # The cases of the spec's check c-update (dispatch://INFRA-5935/spec v5), each of which begin names.
 readonly case_names=(whole-set system-files-unchanged env-lines local-settings-untouched override-refused
@@ -544,6 +542,8 @@ if [[ $* != 'serve status --json' ]]; then
   exit 1
 fi
 if [[ -e $state/serve-hang ]]; then
+  # The fake timeout ends the call on this hang, as a real one ends it at its bound.
+  [[ -z ${TEST_TIMEOUT_HANG:-} ]] || : >"$TEST_TIMEOUT_HANG"
   /bin/sleep 30
   printf 'tailscale serve status hung for 30 s and nothing stopped it\n' >>"$state/errors"
   exit 1
@@ -609,14 +609,21 @@ EOF
 
 cat >"$timeout_bin/timeout" <<'EOF'
 #!/usr/bin/env bash
-# The fake timeout. It runs the command under the real timeout ($TEST_REAL_TIMEOUT), for at most
-# TEST_TIMEOUT_REAL real seconds (3 by default), and tells the command through
-# TEST_TIMEOUT_DURATION and TEST_TIMEOUT_KILL_AFTER which bound it runs under. When the real timeout
-# ends a command that hung (124, or 137 after its kill), the test's clock moves on by the bound
-# asked for, and by the kill's grace for a 137, as the real bound would have taken. Each call goes
-# to $TEST_STATE/timeout.log. The fake Pi's network is up: wait-for-network.sh's probe of a TCP
-# port connects at once, and the test opens no connection.
+# The fake timeout. It runs the command in a process group of its own, telling it through
+# TEST_TIMEOUT_DURATION and TEST_TIMEOUT_KILL_AFTER which bound it runs under, and waits for its end
+# or for its hang. A fake that stands for a call that hangs (tailscale's serve-hang, pi-secrets'
+# hang, a launcher's update.sh that hangs) creates the file that TEST_TIMEOUT_HANG names; the fake
+# timeout then ends the command as a real one ends a command past its bound: SIGTERM to its group,
+# then SIGKILL to what is left 1 real second later, for exit 124 or 137. A command still running
+# after its whole bound in real seconds ends the same way. So a call that is only slow, as on a
+# loaded machine, runs to its end; a cap of 3 real seconds on every call once cut such calls off,
+# and failed the update. When it ends a command, the test's clock moves on by the bound asked for,
+# and by the kill's grace for a 137, as the real bound would have taken. Each call goes to
+# $TEST_STATE/timeout.log. The fake Pi's network is up: wait-for-network.sh's probe of a TCP port
+# connects at once, and the test opens no connection.
 set -uo pipefail
+# Job control puts the command in a process group of its own, which a signal to the group ends whole.
+set -m
 state=${TEST_STATE:?}
 kill_after=''
 while (($#)); do
@@ -643,15 +650,39 @@ seconds() {
 }
 want=$(seconds "$duration")
 grace=$(seconds "${kill_after:-0}")
-cap=${TEST_TIMEOUT_REAL:-3}
-real=$((want < cap ? want : cap))
 printf 'kill-after=%s %s %s\n' "${kill_after:-none}" "$duration" "$*" >>"$state/timeout.log"
 if [[ ${1:-} == bash && ${2:-} == -c && ${3:-} == 'exec 3<>/dev/tcp/'* ]]; then
   exit 0
 fi
-TEST_TIMEOUT_DURATION=$duration TEST_TIMEOUT_KILL_AFTER=${kill_after:-none} \
-  "${TEST_REAL_TIMEOUT:?}" --kill-after=1 "$real" "$@"
+hang=$state/timeout-hang.$$
+rm -f -- "$hang"
+# The command's error output is the caller's; the shell's own notes on its job, such as one that a
+# signal ended, go nowhere, as a real timeout prints none.
+exec 3>&2 2>/dev/null
+TEST_TIMEOUT_HANG=$hang TEST_TIMEOUT_DURATION=$duration TEST_TIMEOUT_KILL_AFTER=${kill_after:-none} "$@" 2>&3 3>&- &
+child=$!
+now() { printf '%s\n' "${EPOCHREALTIME/[.,]/}"; }
+deadline=$(($(now) + want * 1000000)) ended=''
+while kill -0 "$child" 2>/dev/null; do
+  if [[ -e $hang ]] || (($(now) >= deadline)); then
+    ended=124
+    kill -TERM -- -"$child" 2>/dev/null || true
+    for _ in {1..20}; do
+      kill -0 "$child" 2>/dev/null || break
+      /bin/sleep 0.05
+    done
+    if kill -0 -- -"$child" 2>/dev/null; then
+      ended=137
+      kill -KILL -- -"$child" 2>/dev/null || true
+    fi
+    break
+  fi
+  /bin/sleep 0.05
+done
+wait "$child"
 status=$?
+rm -f -- "$hang"
+status=${ended:-$status}
 case $status in
   124) echo $(($(<"$state/clock") + want)) >"$state/clock" ;;
   137) echo $(($(<"$state/clock") + want + grace)) >"$state/clock" ;;
@@ -700,6 +731,7 @@ done
 "${TEST_FAKES:?}/after" secrets
 case $(cat -- "$state/pi-secrets-mode" 2>/dev/null || echo ok) in
   hang)
+    [[ -z ${TEST_TIMEOUT_HANG:-} ]] || : >"$TEST_TIMEOUT_HANG"
     /bin/sleep 30
     printf 'pi-secrets hung for 30 s and nothing stopped it\n' >>"$state/errors"
     exit 0
@@ -1085,7 +1117,7 @@ run_update() {
   status=0
   out=$(cd -- "$opt" && env PATH="$bin:$timeout_bin:$PATH" \
     TEST_STATE="$state" TEST_RELEASES="$releases" TEST_RELEASE="${release:-none}" TEST_FAKES="$fakes" \
-    TEST_PI_SECRETS="$fakes/pi-secrets" TEST_REAL_TIMEOUT="$real_timeout" TEST_BUSY_PID="$work_dir/busy.pid" \
+    TEST_PI_SECRETS="$fakes/pi-secrets" TEST_BUSY_PID="$work_dir/busy.pid" \
     TEST_SLOW="${slow:-}" TEST_RESTART_SECONDS="${restart_seconds:-0}" \
     INVOCATION_ID=test-invocation-7 \
     GHOST_WISPR_DEPLOY_DIR="$opt" GHOST_WISPR_UNIT_DIR="$units" GHOST_WISPR_SYSTEM_ROOT="$root" \
@@ -3261,8 +3293,8 @@ fake_update() {
 #!/usr/bin/env bash
 printf '%s\n' '$2' >>"\$TEST_STATE/launcher.log"
 code=\$(cat -- "\$TEST_STATE/$2.exit" 2>/dev/null || echo 0)
-if [[ \$code == hang ]]; then exec /bin/sleep 60; fi
-if [[ \$code == deaf ]]; then trap '' TERM; exec /bin/sleep 120; fi
+if [[ \$code == hang ]]; then [[ -z \${TEST_TIMEOUT_HANG:-} ]] || : >"\$TEST_TIMEOUT_HANG"; exec /bin/sleep 60; fi
+if [[ \$code == deaf ]]; then trap '' TERM; [[ -z \${TEST_TIMEOUT_HANG:-} ]] || : >"\$TEST_TIMEOUT_HANG"; exec /bin/sleep 120; fi
 exit "\$code"
 EOF
   chmod 0755 "$1"
@@ -3286,7 +3318,7 @@ run_launcher() {
   status=0
   # shellcheck disable=SC2086 # Each trigger word is one assignment or none.
   out=$(cd -- "$opt" && env -u TRIGGER_UNIT -u TRIGGER_TIMER_REALTIME_USEC -u GHOST_WISPR_UPDATE_LIMIT \
-    PATH="$bin:${fake_timeout:+$timeout_bin:}$PATH" TEST_REAL_TIMEOUT="$real_timeout" \
+    PATH="$bin:${fake_timeout:+$timeout_bin:}$PATH" \
     TEST_STATE="$state" TEST_RELEASES="$releases" TEST_RELEASE="${release:-none}" TEST_FAKES="$fakes" \
     TEST_PI_SECRETS="$fakes/pi-secrets" TEST_BUSY_PID="$work_dir/busy.pid" TEST_CURL_FAIL="${curl_fail:-}" \
     INVOCATION_ID=test-invocation-9 ${trigger:+TRIGGER_UNIT=ghost-wispr-update.timer} \
