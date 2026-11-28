@@ -28,13 +28,16 @@
 #   6  Each protected recording (PI_PROTECTED_RECORDINGS) has its sha256.
 #   7  The three bootstrap files on the Pi have the sha256 the release's manifest gives them, and
 #      Serve's setting matches the release's serve.conf.
+#   8  journald runs the release's journald-ghost-wispr.conf: each value of it is the one that
+#      `systemd-analyze cat-config systemd/journald.conf` gives last, and /var/log/journal holds a
+#      system.journal, so the journal outlives a reboot, within its cap.
 #
-# It exits 0 when all seven PASS, 1 when any does not, and 2 for a usage error.
+# It exits 0 when all eight PASS, 1 when any does not, and 2 for a usage error.
 set -euo pipefail
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 readonly script_dir
-usage() { sed -n '7,31p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '7,34p' "$0" | sed 's/^# \{0,1\}//'; }
 usage_error() {
   printf 'check-deploy: %s\n' "$*" >&2
   usage >&2
@@ -82,6 +85,10 @@ readonly RELEASES_API="${GHOST_WISPR_RELEASES_API:-https://api.github.com/repos/
 # The bootstrap files: the three files that install every later release, which only provision.sh
 # installs, so a release that changes one reaches the Pi only when a person runs its provision.sh.
 readonly BOOTSTRAP_FILES=(ghost-wispr-update-launcher.sh ghost-wispr-update.service ghost-wispr-update.timer)
+# The release's journald setting (check 8), and the directory of the journal it keeps on the card;
+# GHOST_WISPR_JOURNAL_DIR exists for check_deploy_test.sh.
+readonly JOURNALD_FILE=journald-ghost-wispr.conf
+readonly JOURNAL_DIR="${GHOST_WISPR_JOURNAL_DIR:-/var/log/journal}"
 
 # pi runs a command on the Pi with no input; pi_in gives it this script's input. Each gives up on a
 # Pi it cannot reach in 10 s, or that stops answering for a minute (ssh exits 255), and never waits
@@ -801,6 +808,87 @@ check_bootstrap() {
   fi
 }
 
+# journald_values prints each setting of a journald.conf file, or of `systemd-analyze cat-config`'s
+# output of all of them, that the [Journal] section sets, as "<key>=<value><TAB><file>": its last
+# value, which journald runs, and the file that gives it. In cat-config's output a file starts with
+# a line "# <path>", first or after a blank line; any other line that starts with # or ; is a comment.
+journald_values() {
+  awk -v file="$1" '
+    { line = $0; sub(/^[[:space:]]+/, "", line); sub(/[[:space:]]+$/, "", line) }
+    (NR == 1 || previous == "") && line ~ /^# \/[^[:space:]]+$/ { file = substr(line, 3); section = ""; previous = line; next }
+    { previous = line }
+    line == "" || line ~ /^[#;]/ { next }
+    line ~ /^\[.*\]$/ { section = line; next }
+    section == "[Journal]" && index(line, "=") > 1 {
+      key = substr(line, 1, index(line, "=") - 1); sub(/[[:space:]]+$/, "", key)
+      value = substr(line, index(line, "=") + 1); sub(/^[[:space:]]+/, "", value)
+      if (!(key in got)) keys[++n] = key
+      got[key] = value; from[key] = file
+    }
+    END { for (i = 1; i <= n; i++) printf "%s=%s\t%s\n", keys[i], got[keys[i]], from[keys[i]] }'
+}
+
+# check_journal: check 8.
+check_journal() {
+  local want runs status=0 line key value got source journals differences=() unread=() settings=()
+  if [[ -z $set_dir ]]; then
+    unknown 8 "no release journald setting to compare the Pi's journald with: $set_error"
+    return 0
+  fi
+  if [[ -z $(manifest_sum "$JOURNALD_FILE") ]]; then
+    unknown 8 "the manifest of $release_name's deploy tarball names no $JOURNALD_FILE"
+    return 0
+  fi
+  want=$(journald_values "$JOURNALD_FILE" <"$set_dir/$JOURNALD_FILE")
+  if [[ -z $want ]]; then
+    unknown 8 "$release_name's $JOURNALD_FILE sets nothing in [Journal]"
+    return 0
+  fi
+  pi 'systemd-analyze cat-config systemd/journald.conf' >"$tmp/journald.conf" 2>"$tmp/journald.err" || status=$?
+  if ((status == 255)); then
+    unread+=("cannot reach $PI over SSH to read journald's setting: $(error_of "$tmp/journald.err")")
+  elif ((status != 0)); then
+    unread+=("cannot read journald's setting on the Pi (systemd-analyze cat-config systemd/journald.conf, exit $status): $(error_of "$tmp/journald.err")")
+  else
+    runs=$(journald_values '' <"$tmp/journald.conf")
+    while IFS= read -r line; do
+      key=${line%%=*} value=${line#*=}
+      value=${value%%$'\t'*}
+      settings+=("$key=$value")
+      got=$(awk -F '\t' -v key="$key" 'index($1, key "=") == 1 { print; exit }' <<<"$runs")
+      if [[ -z $got ]]; then
+        differences+=("$key is not set, so journald's default applies; $release_name's $JOURNALD_FILE gives $value")
+        continue
+      fi
+      source=${got#*$'\t'} got=${got%%$'\t'*}
+      got=${got#*=}
+      [[ $got == "$value" ]] \
+        || differences+=("$key is $got, from $source; $release_name's $JOURNALD_FILE gives $value")
+    done <<<"$want"
+  fi
+  status=0
+  journals=$(pi "[ -d '$JOURNAL_DIR' ] || exit 3; find '$JOURNAL_DIR' -mindepth 2 -maxdepth 2 -type f -name system.journal" \
+    2>"$tmp/journal-dir.err") || status=$?
+  if ((status == 255)); then
+    unread+=("cannot reach $PI over SSH to list $JOURNAL_DIR: $(error_of "$tmp/journal-dir.err")")
+  elif ((status == 3)); then
+    differences+=("$JOURNAL_DIR does not exist, so journald keeps the journal in /run and loses it at a reboot")
+  elif ((status != 0)); then
+    unread+=("cannot list $JOURNAL_DIR on the Pi (find, exit $status): $(error_of "$tmp/journal-dir.err")")
+  elif [[ -z $journals ]]; then
+    differences+=("$JOURNAL_DIR holds no system.journal, so journald keeps the journal in /run and loses it at a reboot: it has not restarted since the setting went in, or another setting keeps it there")
+  fi
+  if ((${#differences[@]} > 0)); then
+    local also=''
+    ((${#unread[@]} == 0)) || also="; and $(joined "${unread[@]}")"
+    fails 8 "$(joined "${differences[@]}")$also"
+  elif ((${#unread[@]} > 0)); then
+    unknown 8 "$(joined "${unread[@]}")"
+  else
+    pass 8 "journald runs $release_name's $JOURNALD_FILE ($(joined "${settings[@]}")), and writes the journal to $(head -n 1 <<<"$journals")"
+  fi
+}
+
 check_commit
 read_config
 check_settings
@@ -809,6 +897,7 @@ check_status
 check_timer_install
 check_protected
 check_bootstrap
+check_journal
 
-printf 'check-deploy: %s of 7 checks PASS against %s\n' "$((7 - not_passed))" "$release_name" >&2
+printf 'check-deploy: %s of 8 checks PASS against %s\n' "$((8 - not_passed))" "$release_name" >&2
 ((not_passed == 0)) || exit 1

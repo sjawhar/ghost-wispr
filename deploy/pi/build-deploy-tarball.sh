@@ -8,7 +8,7 @@
 #   build-deploy-tarball.sh --stage COMMIT BINARY DIR
 #       writes the tarball's directory alone into DIR, which must be absent or empty.
 #
-# The tarball has one top directory, ghost-wispr-pi-deploy/, with the 14 files below and
+# The tarball has one top directory, ghost-wispr-pi-deploy/, with the 15 files below and
 # manifest.json directly in it. COMMIT is the release's commit. BINARY is the release's
 # ghost-wispr-linux-arm64, which stays its own release asset: the manifest names its SHA-256, and
 # the build runs `BINARY link-versions`, so it runs where the binary runs. An exit 0 with a JSON
@@ -24,7 +24,7 @@ readonly unknown_line='unknown subcommand "link-versions"'
 
 # Each file of the tarball: its name, its source in the repository, and its mode.
 readonly files=(
-  # The nine files that the nightly update installs with the binary.
+  # The ten files that the nightly update installs with the binary.
   'ghost-wispr.yaml deploy/pi/files/ghost-wispr.yaml 0644'
   'pi.env deploy/pi/files/pi.env 0644'
   'update.sh deploy/pi/update.sh 0755'
@@ -34,6 +34,7 @@ readonly files=(
   'wait-for-time-sync.sh deploy/pi/files/wait-for-time-sync.sh 0755'
   '99-ghost-wispr.rules deploy/pi/files/99-ghost-wispr.rules 0644'
   'logind-power-key.conf deploy/pi/files/logind-power-key.conf 0644'
+  'journald-ghost-wispr.conf deploy/pi/files/journald-ghost-wispr.conf 0644'
   # The five provisioning files, which only provision.sh installs.
   'provision.sh deploy/pi/provision.sh 0755'
   'ghost-wispr-update-launcher.sh deploy/pi/files/ghost-wispr-update-launcher.sh 0755'

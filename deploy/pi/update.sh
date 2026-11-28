@@ -7,7 +7,7 @@
 #                       script owns, the secrets from Secret Manager; install nothing else, and
 #                       restart nothing
 #
-# Each release carries its deploy set in ghost-wispr-pi-deploy.tar.gz, beside its binary: nine files
+# Each release carries its deploy set in ghost-wispr-pi-deploy.tar.gz, beside its binary: ten files
 # and the binary, which this script installs and rolls back together, and the five provisioning
 # files, which only provision.sh installs and this script only compares (the launcher, the update
 # unit and timer, and serve.conf; and provision.sh itself). manifest.json names the SHA-256 of the
@@ -32,7 +32,7 @@ source "$lib"
 
 readonly DEPLOY_DIR="${GHOST_WISPR_DEPLOY_DIR:-/opt/ghost-wispr}"
 readonly UNIT_DIR="${GHOST_WISPR_UNIT_DIR:-${HOME:-/home/ghost-wispr}/.config/systemd/user}"
-# The root under which the udev rule and the logind setting are installed.
+# The root under which the udev rule, the logind setting and the journald setting are installed.
 readonly SYSTEM_ROOT="${GHOST_WISPR_SYSTEM_ROOT:-/}"
 # Where the running recorder's image is read (running_image_is_installed); a test points it at a
 # fake.
@@ -54,7 +54,7 @@ readonly CERTIFICATE_JOURNAL="$DEPLOY_DIR/device.crt.version.new"
 readonly RECHECK_EVERY=120 ROLLBACK_READS=3
 # The deploy set, with the binary, ghost-wispr (C2).
 readonly SET_FILES=(ghost-wispr.yaml pi.env update.sh pi-lib.sh wait-for-network.sh wait-for-time-sync.sh
-  ghost-wispr.service 99-ghost-wispr.rules logind-power-key.conf)
+  ghost-wispr.service 99-ghost-wispr.rules logind-power-key.conf journald-ghost-wispr.conf)
 readonly PROVISIONING_FILES=(provision.sh ghost-wispr-update-launcher.sh ghost-wispr-update.service
   ghost-wispr-update.timer serve.conf)
 readonly NAME_PATTERN='^[A-Za-z0-9_][A-Za-z0-9._-]*$'
@@ -96,6 +96,9 @@ installed_path() {
     ghost-wispr.service) printf '%s\n' "$UNIT_DIR/$1" ;;
     99-ghost-wispr.rules) printf '%s\n' "${SYSTEM_ROOT%/}/etc/udev/rules.d/99-ghost-wispr.rules" ;;
     logind-power-key.conf) printf '%s\n' "${SYSTEM_ROOT%/}/etc/systemd/logind.conf.d/50-ghost-wispr-power-key.conf" ;;
+    # After raspberrypi-sys-mods' 40-rpi-volatile-storage.conf in the order of file names, which
+    # journald reads its drop-ins in, so its Storage=persistent wins over that file's volatile.
+    journald-ghost-wispr.conf) printf '%s\n' "${SYSTEM_ROOT%/}/etc/systemd/journald.conf.d/90-ghost-wispr.conf" ;;
     *) printf '%s\n' "$DEPLOY_DIR/$1" ;;
   esac
 }
@@ -110,7 +113,7 @@ file_mode() {
 }
 
 is_system_file() {
-  [[ $1 == 99-ghost-wispr.rules || $1 == logind-power-key.conf ]]
+  [[ $1 == 99-ghost-wispr.rules || $1 == logind-power-key.conf || $1 == journald-ghost-wispr.conf ]]
 }
 
 make_stage() {
@@ -553,9 +556,12 @@ sudo_install() {
   timeout 30s sudo -n install -D -m 0644 -- "$1" "$2"
 }
 
-# reload_system NAME... reloads udev after the udev rule changed, and restarts logind after the
-# logind setting changed, each sudo -n call under its bound: udevadm control --reload, then udevadm
-# trigger.
+# reload_system NAME... reloads udev after the udev rule changed, restarts logind after the logind
+# setting changed, and restarts journald after the journald setting changed, each sudo -n call under
+# its bound: udevadm control --reload, then udevadm trigger; systemctl restart systemd-journald, then
+# journalctl --flush, which moves the boot's journal from /run to /var/log/journal once journald runs
+# with persistent storage. A journald restart keeps the services' log streams open (systemd keeps
+# them in journald's file descriptor store).
 reload_system() {
   local name
   for name in "$@"; do
@@ -566,6 +572,10 @@ reload_system() {
         ;;
       logind-power-key.conf)
         timeout 30s sudo -n systemctl restart systemd-logind || return 1
+        ;;
+      journald-ghost-wispr.conf)
+        timeout 30s sudo -n systemctl restart systemd-journald || return 1
+        timeout 30s sudo -n journalctl --flush || return 1
         ;;
     esac
   done
@@ -605,10 +615,10 @@ swap_in() {
 # back as one change (install_certificate_pair), from device.crt.prev and the number in
 # device.crt.version.prev; device.crt.prev with no device.crt.version.prev means the Pi had no
 # version file (provision.sh --certificate writes none), and the version file this run swapped in
-# goes. Then it reloads the user units, and reloads udev or restarts logind when their file
-# changed. It sets restore_problems to what it could not do: a reload, or a file swapped in with no
-# .prev copy, which stays as installed; and restore_note to what went back. When no file has a
-# .prev copy it fails with WHY: no previous release to restore (R6). It writes no deploy.verified.
+# goes. Then it reloads the user units, and reloads udev or restarts logind or journald when their
+# file changed. It sets restore_problems to what it could not do: a reload, or a file swapped in
+# with no .prev copy, which stays as installed; and restore_note to what went back. When no file has
+# a .prev copy it fails with WHY: no previous release to restore (R6). It writes no deploy.verified.
 restore_previous() {
   local why=$1 name path prev version names=("${swapped[@]}") restored=() missing=() system=()
   restore_problems='' restore_note='restored the previous release'
@@ -661,7 +671,7 @@ restore_previous() {
     fail "$why; no previous release to restore, so the new files stay installed"
   fi
   systemctl --user daemon-reload || restore_problems+='; could not reload the user manager'
-  reload_system "${system[@]}" || restore_problems+='; could not reload udev or restart logind'
+  reload_system "${system[@]}" || restore_problems+='; could not reload udev, or restart logind or journald'
   if ((${#missing[@]})); then
     restore_problems+="; no previous release to restore for ${missing[*]}, which stay as installed"
   fi
@@ -965,7 +975,7 @@ install_release() {
 
   swap_in "${install_names[@]}" || rollback "could not install the release's files"
   systemctl --user daemon-reload || rollback "could not reload the user manager"
-  reload_system "${changed_system[@]}" || rollback "could not reload udev or restart logind"
+  reload_system "${changed_system[@]}" || rollback "could not reload udev, or restart logind or journald"
   # A session or a call that started during the swap or the reloads stops the run here, with the
   # previous release's files back.
   leave_if_busy_before_restart
