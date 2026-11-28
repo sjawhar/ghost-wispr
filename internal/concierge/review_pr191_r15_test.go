@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -102,12 +103,14 @@ func loopbackVendor(t *testing.T, deepgram bool) (string, <-chan *vendorWire) {
 }
 
 // watchedVoice is a vendor voice whose Open is reported, and whose answer
-// tool calls and results are.
+// tool calls and results are. starts counts the speech starts of its
+// sessions the Supervisor has received (watchedSession).
 type watchedVoice struct {
 	inner   voice.Voice
 	opened  chan struct{}
 	calls   chan voice.ToolCall
 	results chan json.RawMessage
+	starts  atomic.Int64
 }
 
 func watch(v voice.Voice) *watchedVoice {
@@ -120,11 +123,42 @@ func (v *watchedVoice) Open(ctx context.Context, x *voice.Exchange) (voice.Sessi
 	opened := *x
 	opened.Tools = watchedTools{inner: x.Tools, v: v}
 	s, err := v.inner.Open(ctx, &opened)
-	if err == nil {
-		v.opened <- struct{}{}
+	if err != nil {
+		return s, err
 	}
-	return s, err
+	v.opened <- struct{}{}
+	return watchSession(ctx, s, v), nil
 }
+
+// watchedSession hands its session's events to the Supervisor one at a time,
+// on a channel with no buffer, and counts each speech start the Supervisor
+// received (watchedVoice.starts). The Supervisor reads a session's events in
+// order on one goroutine, so once it has received a start it has taken in
+// every event before it. Once ctx, the session's, ends, events no longer
+// read are dropped, until the session's own channel closes.
+type watchedSession struct {
+	voice.Session
+	events chan voice.Event
+}
+
+func watchSession(ctx context.Context, s voice.Session, v *watchedVoice) *watchedSession {
+	w := &watchedSession{Session: s, events: make(chan voice.Event)}
+	go func() {
+		defer close(w.events)
+		for e := range s.Events() {
+			select {
+			case w.events <- e:
+				if e.Kind == voice.EventSpeechStarted {
+					v.starts.Add(1)
+				}
+			case <-ctx.Done():
+			}
+		}
+	}()
+	return w
+}
+
+func (w *watchedSession) Events() <-chan voice.Event { return w.events }
 
 type watchedTools struct {
 	inner voice.ToolRunner

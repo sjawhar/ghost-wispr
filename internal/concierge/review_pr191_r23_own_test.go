@@ -92,7 +92,7 @@ func sol23Open(t *testing.T, opening string, hold <-chan struct{}) (*cutRig, *wa
 		t.Fatal(err)
 	}
 	v := watch(live)
-	r := &cutRig{rig: newRig(t), speaker: &cutSpeaker{}}
+	r := &cutRig{rig: newRig(t), speaker: &cutSpeaker{}, watched: v}
 	t.Cleanup(r.concierge.Stop)
 	capture := &sol23Capture{Concierge: r.concierge, calls: make(chan sol23Snapshot, 20), holdFirst: hold}
 	r.sup = voice.NewSupervisor(&voice.SupervisorConfig{
