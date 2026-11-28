@@ -293,6 +293,16 @@ func scrubBackupSegment(tx *sql.Tx, columns func(table string) (map[string]bool,
 			return fmt.Errorf("clear backup refined words: %w", err)
 		}
 	}
+	// The backup's questions of the affected sessions go whole: placing them
+	// against the deleted segment would need its times in the backup's own
+	// schema, and the backup only serves a rollback.
+	if questions, err := columns("voice_questions"); err != nil {
+		return err
+	} else if questions["session_id"] {
+		if _, err := tx.Exec(`DELETE FROM voice_questions WHERE session_id IN (`+placeholders+`)`, args...); err != nil {
+			return fmt.Errorf("clear backup questions: %w", err)
+		}
+	}
 	if events, err := columns("mcp_events"); err != nil {
 		return err
 	} else if events["payload"] {

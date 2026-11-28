@@ -985,6 +985,52 @@ func (s *SQLiteStore) init(dbPath string) error {
 		return fmt.Errorf("migrate voice_tasks asked number: %w", err)
 	}
 
+	// voice_questions: the question log, one row for each turn the
+	// Concierge handled (voice_questions.go). It holds the room's words: the
+	// turn as heard, a driving voice's wording of it, and Wispr's answer. The
+	// foreign key deletes a session's rows with it, in the delete's own
+	// transaction, so the write-ahead log erase that follows the delete
+	// covers them; a segment deletion erases the rows heard in its segment
+	// (eraseQuestionsHeardIn). heard_from and heard_to are when its words
+	// were said, on the wall clock, which places it among the segments.
+	if _, err := s.db.Exec(`
+		CREATE TABLE IF NOT EXISTS voice_questions (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			session_id TEXT NOT NULL,
+			asked_at TEXT NOT NULL,
+			heard_from TEXT NOT NULL,
+			heard_to TEXT NOT NULL,
+			heard TEXT NOT NULL DEFAULT '',
+			vendor_wording TEXT NOT NULL DEFAULT '',
+			engine TEXT NOT NULL DEFAULT '',
+			issue_key TEXT NOT NULL DEFAULT '',
+			outcome TEXT NOT NULL,
+			answer TEXT NOT NULL DEFAULT '',
+			first_audio_ms INTEGER,
+			took_ms INTEGER NOT NULL,
+			FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
+		);
+		CREATE INDEX IF NOT EXISTS idx_voice_questions_session_id ON voice_questions(session_id, heard_from);
+		CREATE INDEX IF NOT EXISTS idx_voice_questions_asked_at ON voice_questions(asked_at);
+	`); err != nil {
+		return fmt.Errorf("create voice_questions table: %w", err)
+	}
+	// voice_question_erasures: each span a segment deletion erased questions
+	// in, for each session, with no words (eraseQuestionsHeardIn), so a
+	// question whose write lands after the deletion is refused. The foreign
+	// key deletes a session's rows with it.
+	if _, err := s.db.Exec(`
+		CREATE TABLE IF NOT EXISTS voice_question_erasures (
+			session_id TEXT NOT NULL,
+			heard_from TEXT NOT NULL,
+			heard_to TEXT NOT NULL,
+			FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
+		);
+		CREATE INDEX IF NOT EXISTS idx_voice_question_erasures_session_id ON voice_question_erasures(session_id);
+	`); err != nil {
+		return fmt.Errorf("create voice_question_erasures table: %w", err)
+	}
+
 	if _, err := s.db.Exec("CREATE INDEX IF NOT EXISTS idx_sessions_started_at ON sessions(started_at)"); err != nil {
 		return fmt.Errorf("create sessions index: %w", err)
 	}

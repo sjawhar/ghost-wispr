@@ -449,6 +449,9 @@ type fakeVoice struct {
 
 func newFakeVoice() *fakeVoice { return &fakeVoice{opened: make(chan *fakeSession, 16)} }
 
+// Engine names the fake voice for the question log (NamedEngine).
+func (*fakeVoice) Engine() string { return "fake" }
+
 func (v *fakeVoice) failOpens(err error) {
 	v.mu.Lock()
 	defer v.mu.Unlock()
@@ -637,6 +640,10 @@ type fakeConcierge struct {
 	// turnErrs, when set, is what Answer returns for each turn it holds,
 	// saying nothing, as the Concierge does for side talk.
 	turnErrs map[string]error
+	// outcome and issueKey are set on each exchange once its lines are
+	// said, as the Concierge sets Exchange.Outcome and IssueKey.
+	outcome  QuestionOutcome
+	issueKey string
 }
 
 func (c *fakeConcierge) Heard(ctx context.Context, x *Exchange, words string) {
@@ -693,6 +700,9 @@ func (c *fakeConcierge) Answer(ctx context.Context, x *Exchange, turn string, sa
 			return err
 		}
 	}
+	c.mu.Lock()
+	x.Outcome, x.IssueKey = c.outcome, c.issueKey
+	c.mu.Unlock()
 	if c.afterLines != nil {
 		select {
 		case <-c.afterLines:

@@ -133,6 +133,7 @@ With no subcommand, ghost-wispr runs the recorder. Subcommands:
   tts-first-audio    time each sentence on stdin to its first text-to-speech audio (--model, --voice, --clip)
   issue-holder KEY   print the Concierge's issue_holder answer for Dispatch issue KEY
   joined-probe       act as an agent session that joins a meeting, for the joined agents' acceptance (--invitation FILE or --wait-invitation)
+  voice questions    print the meeting voice's question log: each turn the Concierge handled and how it ended (--since DATE, --json)
   play-sound NAME    play one of Wispr's sounds (wake, answer, start or error) once on the speaker
   kws-selftest CLIP  check the paused listener's spotter hears the start phrase in each WAV clip (-tags kws builds)
   speaker-trace      print the slow mixer cycles in each FILE the speaker trace saved, and what held each (-slow D)

@@ -144,6 +144,13 @@ type TurnDriver interface {
 	DrivesTurn() bool
 }
 
+// NamedEngine is implemented by a Voice that names its engine as
+// voice.engine does ("tts", "gptlive" or "dgagent"), for the question log
+// (Question.Engine).
+type NamedEngine interface {
+	Engine() string
+}
+
 // Transcript is one Deepgram result, as the Supervisor reads it.
 type Transcript struct {
 	Text         string
@@ -246,6 +253,12 @@ type SupervisorConfig struct {
 	// tells nobody. It runs on a goroutine of its own, never under the
 	// Supervisor's lock.
 	HandDone func(h *Hand, outcome HandOutcome)
+	// Question gets each turn the Concierge handled once its outcome is
+	// known, for the question log; nil drops them. It runs on a goroutine
+	// of its own, never under the Supervisor's lock, after the turn's answer
+	// was spoken or cut, so nothing it does, a failed write included, can
+	// change the answer.
+	Question func(q *Question)
 	// Segment gets each final transcript segment of the room, for the joined
 	// agents' pointers; nil drops them. It runs on the transcript reader,
 	// never under the Supervisor's lock, and must return at once.
@@ -460,12 +473,17 @@ type exchange struct {
 	// change it (Exchange.VoiceAsked); and voiceAskedAt is when it asked: the
 	// ask-back lapses recentKept after (voiceAskExpiredLocked). A later
 	// speech that does not end in a question takes it away (Sol's
-	// twenty-third review of #191).
+	// twenty-third review of #191). eventsRead counts the session's events
+	// read (readEvents), and spoken holds the speeches that ended before
+	// the events queued at their end were read, judged once they are
+	// (judgeSpokenLocked).
 	voiceLine       string
 	voiceAsked      bool
 	voiceAskedAbout string
 	voiceAskedAt    time.Time
 	lastAsked       string
+	eventsRead      uint64
+	spoken          []spokenSpeech
 	// turnParsed* keep the take-back rule's last parse of the current turn's
 	// finals (turnTakeBackLocked): the request, the history and the asker's
 	// words read it on every Room read, and the parse runs again only when
@@ -502,7 +520,10 @@ type exchange struct {
 	followUp     bool       // the exchange waits for a follow-up after Wispr's answer
 	// followUpTurn: the turn now heard began in the follow-up window with no
 	// wake phrase, so it continues the exchange only as a question (R10).
+	// turnInWindow: it began in the follow-up window, as a reply to Wispr's
+	// question or not (judgeSpokenLocked reads it).
 	followUpTurn bool
+	turnInWindow bool
 	// turnByName: the turn now heard began right after the wake phrase, so
 	// its first words are where a name goes (transcript.WriteKeysAfterName).
 	turnByName bool
@@ -518,9 +539,12 @@ type exchange struct {
 	// question it asked. The Supervisor keeps the newest exchange's after it
 	// ends, and they hold no words.
 	times *exchangeTimes
-	// unspokenAnswer: the answer tool returned words the driving voice has
-	// not begun to speak.
+	// unspokenAnswer: the answer tool returned words, at unspokenSince, and
+	// no audio of the driving voice has played since: no speech began after,
+	// and none went on past that time. Only then is the answer known to be
+	// unspoken, and the idle wait plays the error sound for it (idleWaited).
 	unspokenAnswer bool
+	unspokenSince  time.Time
 	// erred: the error sound played for it (exErrorLocked).
 	erred  bool
 	turnAt time.Time // when the turn was handed to the Concierge, or a held answer chosen to speak
@@ -604,6 +628,20 @@ type exchange struct {
 	// membership's: its end stops them, and exchangeOutput refuses any frame
 	// written once it ended.
 	sayCtx context.Context
+	// engine names its voice (NamedEngine), for the question log.
+	engine string
+	// wordsFrom and wordsTo are when the turn now heard (wordsTurn, its
+	// Exchange.Turn) was said (questionHeardLocked); questions are the turns
+	// the Concierge handles now, oldest first, until the question log has
+	// each (openQuestionLocked); claimedSpans are, by a claimed request's
+	// words, when the words each claim committed were said, oldest first;
+	// endedAs is how the question log tells the end endLocked makes of it,
+	// when a stop's is not right: a never mind or a failure.
+	wordsTurn          uint64
+	wordsFrom, wordsTo time.Time
+	questions          []*openQuestion
+	claimedSpans       map[string][][2]time.Time
+	endedAs            QuestionOutcome
 }
 
 // NewSupervisor starts a Supervisor; Close stops it.
@@ -1287,6 +1325,7 @@ func (s *Supervisor) onTranscriptLocked(t *Transcript) {
 				// The question it cancels leaves the room's recent words,
 				// as a take-back's does (Sol's eleventh review of #191).
 				s.neverMindTurnLocked(ex)
+				ex.endedAs = OutcomeNeverMind
 				s.endLocked(ex, true, "Wispr, never mind")
 			}
 			s.neverMindLocked(s.cfg.Session())
@@ -1484,7 +1523,8 @@ func (s *Supervisor) driverHeardLocked(ex *exchange, t *Transcript, words string
 			ex.newTurn, ex.turnFrom = false, ex.turnEnd
 			ex.turn, ex.interim, ex.turnFinal, ex.uttered, ex.heardTo = nil, "", false, false, time.Time{}
 			s.voiceAskExpiredLocked(ex)
-			ex.followUpTurn, ex.turnByName = ex.followUpTimer != nil && !ex.askedBack, false
+			ex.turnInWindow = ex.followUpTimer != nil
+			ex.followUpTurn, ex.turnByName = ex.turnInWindow && !ex.askedBack, false
 			ex.x.Turn++
 			s.roomChangedLocked(ex) // the request's current turn moved (Exchange.Claim)
 		}
@@ -1501,7 +1541,8 @@ func (s *Supervisor) driverHeardLocked(ex *exchange, t *Transcript, words string
 		ex.turnFrom = from
 		ex.turn, ex.interim, ex.turnFinal, ex.uttered, ex.heardTo, ex.reply = nil, "", false, false, time.Time{}, nil
 		s.voiceAskExpiredLocked(ex)
-		ex.followUpTurn, ex.turnByName = ex.followUpTimer != nil && !ex.askedBack, false
+		ex.turnInWindow = ex.followUpTimer != nil
+		ex.followUpTurn, ex.turnByName = ex.turnInWindow && !ex.askedBack, false
 		ex.x.Turn++
 		s.roomChangedLocked(ex)
 		s.turnLocked(ex, t, words)
@@ -1653,6 +1694,7 @@ func (s *Supervisor) answerSoundLocked() bool {
 func (s *Supervisor) cutDriverLocked(ex *exchange) {
 	ex.cutSpeech = true
 	ex.cutLocked(time.Now())
+	s.settleQuestionsLocked(ex, OutcomeStopped, answered) // the answers it cuts; an Answer still running goes on
 	s.cfg.Speaker.Cancel(audio.InputVoice)
 	if sess := ex.session; sess != nil {
 		s.spawn(sess.Interrupt)
@@ -1745,6 +1787,9 @@ func (s *Supervisor) startLocked(t *Transcript, m transcript.Match) {
 	s.capExchange(ex)
 	if d, ok := voice.(TurnDriver); ok && d.DrivesTurn() {
 		ex.drives = true
+	}
+	if named, ok := voice.(NamedEngine); ok {
+		ex.engine = named.Engine()
 	}
 	ex.dropsAtOpen = s.cfg.Tap.Dropped()
 	s.takeFloorLocked(ex)
@@ -1908,8 +1953,9 @@ func (s *Supervisor) readEvents(ex *exchange, sess Session) {
 			// as a question of Wispr's does (Main, after Sol's twenty-second
 			// review of #191): not side talk by the follow-up rule, and read
 			// by the Concierge as a reply to an offer (Exchange.VoiceAsked).
-			// The line is judged whole as the room's next turn begins
-			// (voiceAskedLocked), never on a fragment. A voice that does not
+			// The line is judged whole when the speaker reports the speech
+			// ended, once every event queued by then is read
+			// (voiceSpokeLocked), never on a fragment. A voice that does not
 			// drive its turns speaks the Concierge's lines, whose questions
 			// are its offers already.
 			if ex.drives {
@@ -1936,17 +1982,23 @@ func (s *Supervisor) readEvents(ex *exchange, sess Session) {
 			if ex.drives && s.ex == ex {
 				// The cut first: it cancels the chime input, and the error
 				// sound begun before it would go with it.
+				ex.endedAs = OutcomeFailed
 				s.endLocked(ex, true, "the voice failed")
 			}
 			if current && ex.answer == nil {
 				s.exErrorLocked(ex, ex.x.SessionID)
 			}
 		}
+		// A speech that ended before this event was read is judged once
+		// the events queued at its end are.
+		ex.eventsRead++
+		s.judgeSpokenLocked(ex)
 		s.mu.Unlock()
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.ex == ex {
+		ex.endedAs = OutcomeFailed
 		s.endLocked(ex, true, "the voice ended by itself")
 	}
 }
@@ -1982,10 +2034,13 @@ func (s *Supervisor) idleWaited(ex *exchange, gen int) {
 		return
 	}
 	unspoken := ex.unspokenAnswer
+	if unspoken {
+		ex.endedAs = OutcomeFailed
+	}
 	s.endLocked(ex, false, "idle")
 	if unspoken {
-		// The voice got an answer to speak and never began it: the room
-		// hears that it failed (R10), not silence.
+		// The voice got an answer to speak and played no audio after it:
+		// the room hears that it failed (R10), not silence.
 		s.logf("voice: the voice did not speak the answer it got")
 		s.errorLocked(ex.x.SessionID)
 	}
@@ -2009,6 +2064,7 @@ func (s *Supervisor) driverSpeechLocked(ex *exchange, started, cancelled bool, a
 	if ex.ended {
 		return
 	}
+	s.answerSpeechLocked(ex, started, cancelled, at)
 	s.disarmFollowUpLocked(ex)
 	// Each speech the voice starts answers what was said before it; a turn
 	// begun while it spoke ends with the speech when it ends by itself. A cut
@@ -2027,8 +2083,17 @@ func (s *Supervisor) driverSpeechLocked(ex *exchange, started, cancelled bool, a
 		}
 		ex.newTurn = true
 	}
-	if started {
+	// Audio of the voice after the answer came, the start of a speech or the
+	// end of one that went on past it, is no evidence the answer went
+	// unspoken: it may have been the answer (INFRA-4592; Sol's review of
+	// #195 at 75c3253). Each is read by the time the speaker gives it, not
+	// when its report comes: a speech that began and ended before the answer
+	// came, reported after it, played nothing after it (Sol's review at
+	// 14fd94eb).
+	if !at.Before(ex.unspokenSince) {
 		ex.unspokenAnswer = false
+	}
+	if started {
 		return
 	}
 	s.voiceSpokeLocked(ex, cancelled)
@@ -2077,6 +2142,7 @@ func (s *Supervisor) turnLocked(ex *exchange, t *Transcript, words string) {
 	// replaced socket can come after the next words' interim.
 	endpoint := t.IsFinal && t.SpeechFinal && ex.endsTurn(t.endsAt())
 	words = strings.TrimSpace(words)
+	ex.questionHeardLocked(t)
 	if t.IsFinal {
 		// A final that replaces the pending interim supersedes it: a
 		// take-back counted on the final must not also see the interim's
@@ -2101,7 +2167,8 @@ func (s *Supervisor) turnLocked(ex *exchange, t *Transcript, words string) {
 			if len(t.Words) > 0 {
 				end = t.endsAt()
 			}
-			own := ownedFinal{turn: ex.x.Turn, seq: seq, end: end, arrived: arrived, text: words, sent: len(words)}
+			from, _ := spanOf(t)
+			own := ownedFinal{turn: ex.x.Turn, seq: seq, from: from, end: end, arrived: arrived, text: words, sent: len(words)}
 			if !ex.answeredTo.IsZero() && !end.After(ex.answeredTo) {
 				// Its words were said before a speech GPT-Live gave by itself,
 				// though Deepgram's final came after it (Exchange.Answered).
@@ -2278,6 +2345,26 @@ func (t exchangeTools) followUpTurn(ctx context.Context) (side bool, turn string
 	}
 }
 
+// awaitSpokenJudged waits until every ended speech of the voice is judged
+// (judgeSpokenLocked): until the session's events queued at each one's end
+// are read. Its error is ctx's, which a stop or the exchange's end cancels
+// (exchangeTools.Run), so an event that never comes holds nothing past them.
+func (t exchangeTools) awaitSpokenJudged(ctx context.Context) error {
+	s := t.s
+	for {
+		s.mu.Lock()
+		pending := len(t.ex.spoken) > 0
+		s.mu.Unlock()
+		if !pending {
+			return nil
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
 // replyTurn is the room's reply to Wispr's own question, for a voice that
 // drives its turn: askedBack reports that the last line the exchange's
 // answer tool returned asked one, and reply is the turn begun since the
@@ -2358,28 +2445,64 @@ func (s *Supervisor) endHoldLocked(ex *exchange) {
 	}
 }
 
-// voiceSpokeLocked judges the transcript of a speech of the voice's own
-// (voiceLine) when the speaker reports that speech's end: once, on the whole
-// completed text, never on a fragment of it. A speech that ended by itself
-// with a question at its end makes the room's next turn a reply to the voice
-// (askedBack, voiceAsked), and records, in its own field and at that moment,
-// the room's question it followed (voiceAskedAbout: the last request the
-// voice took up) and when it asked (voiceAskedAt). A later speech whose last
-// sentence is not a question takes the voice's ask-back away, as does the
-// lapse of recentKept (voiceAskExpiredLocked). A speech a cut ended asked
-// nothing the room heard whole, and a speech with no transcript changes
-// nothing. An ask-back of the Concierge's own line (voiceAsked false) is
-// never cleared here (Sol's twenty-third review of #191).
+// spokenSpeech is a speech of the voice's own that ended, awaiting its
+// judgment (judgeSpokenLocked) until the session's events queued at its end
+// (queued, EventCounter) are read: cancelled, a cut ended it; about, the
+// request the voice last took up when it ended.
+type spokenSpeech struct {
+	queued    uint64
+	cancelled bool
+	about     string
+}
+
+// voiceSpokeLocked takes the speaker's report that a speech of the voice's
+// own ended, and has its transcript (voiceLine) judged once, on the whole
+// completed text, never on a fragment of it (judgeSpokenLocked). The
+// Supervisor reads the session's events on a goroutine of its own, so the
+// transcript, which the voice sent before the speech's audio, can still wait
+// in the session's queue: the speech is judged once every event queued at
+// its end is read (EventCounter), at once when they all are, or when the
+// session does not count them (INFRA-4592; Sol's review of #195).
 func (s *Supervisor) voiceSpokeLocked(ex *exchange, cancelled bool) {
-	line := strings.TrimSpace(ex.voiceLine)
-	ex.voiceLine = ""
-	switch {
-	case cancelled || line == "":
-	case isQuestion(line):
-		ex.askedBack, ex.voiceAsked = true, true
-		ex.voiceAskedAbout, ex.voiceAskedAt = ex.lastAsked, time.Now()
-	case ex.voiceAsked:
-		s.dropVoiceAskLocked(ex)
+	queued := ex.eventsRead
+	if counter, ok := ex.session.(EventCounter); ok {
+		queued = max(queued, counter.EventsQueued())
+	}
+	ex.spoken = append(ex.spoken, spokenSpeech{queued: queued, cancelled: cancelled, about: ex.lastAsked})
+	s.judgeSpokenLocked(ex)
+}
+
+// judgeSpokenLocked judges each ended speech whose events are read, in
+// order. A speech that ended by itself with a question at its end makes the
+// room's next turn a reply to the voice (askedBack, voiceAsked), and records,
+// in its own field, the room's question it followed (voiceAskedAbout: the
+// last request the voice took up when it ended) and when it was judged
+// (voiceAskedAt). A later speech whose last sentence is not a question takes
+// the voice's ask-back away, as does the lapse of recentKept
+// (voiceAskExpiredLocked). A speech a cut ended asked nothing the room heard
+// whole, and a speech with no transcript changes nothing. An ask-back of the
+// Concierge's own line (voiceAsked false) is never cleared here (Sol's
+// twenty-third review of #191). A turn the room began after the last speech
+// ended, before that speech was judged, is a reply or a follow-up by the
+// judgment (followUpTurn).
+func (s *Supervisor) judgeSpokenLocked(ex *exchange) {
+	for len(ex.spoken) > 0 && ex.spoken[0].queued <= ex.eventsRead {
+		sp := ex.spoken[0]
+		ex.spoken = ex.spoken[1:]
+		line := strings.TrimSpace(ex.voiceLine)
+		ex.voiceLine = ""
+		asked := ex.askedBack
+		switch {
+		case sp.cancelled || line == "":
+		case isQuestion(line):
+			ex.askedBack, ex.voiceAsked = true, true
+			ex.voiceAskedAbout, ex.voiceAskedAt = sp.about, time.Now()
+		case ex.voiceAsked:
+			s.dropVoiceAskLocked(ex)
+		}
+		if len(ex.spoken) == 0 && !ex.newTurn && ex.askedBack != asked {
+			ex.followUpTurn = ex.turnInWindow && !ex.askedBack
+		}
 	}
 }
 
@@ -2459,6 +2582,19 @@ func (s *Supervisor) answer(ex *exchange, x *Exchange, turn string) {
 	}
 	s.mu.Lock()
 	sess := ex.session
+	// The question log's row of the turn: a turn cut before the Concierge
+	// got it has none. It keeps the room's words past their last take-back
+	// (x is the model's view, modelViewLocked), never the words taken back;
+	// the Concierge tells the words it read (Exchange.Asked).
+	var q *openQuestion
+	if sess != nil && !ex.ended {
+		heard := turn
+		if s.cfg.TakeBack != nil {
+			heard = x.AskerTurn // turn, or what follows its last take-back, "" when it took itself back whole
+		}
+		x.Asked = heard
+		q = s.openQuestionLocked(ex, heard, "", ex.turnAt, time.Time{}, time.Time{})
+	}
 	s.mu.Unlock()
 	if sess == nil {
 		return
@@ -2480,6 +2616,15 @@ func (s *Supervisor) answer(ex *exchange, x *Exchange, turn string) {
 		defer s.mu.Unlock()
 		ex.said = true
 		ex.askedBack, ex.voiceAsked = isQuestion(text), false
+		if q != nil {
+			q.said = append(q.said, text)
+			if q.firstAudio.IsZero() && s.voiceSpeaking && s.speechEx == ex && s.voiceStarted.Before(called.Wall) {
+				// The speech of the answer before still plays, as the
+				// speaker holds it a moment past its last audio: this text
+				// plays in it, with no start of its own, as soon as queued.
+				q.firstAudio = called.Wall
+			}
+		}
 		if !reportsText && mode == Fact && !ex.factDone && !ex.factPending {
 			// The first fact's audio, for a voice whose Say returns once
 			// the last of its audio is queued: at its speech's start when
@@ -2500,6 +2645,11 @@ func (s *Supervisor) answer(ex *exchange, x *Exchange, turn string) {
 		return nil
 	}
 	err := s.cfg.Concierge.Answer(ex.ctx, x, turn, say)
+	if q != nil {
+		s.mu.Lock()
+		s.answeredLocked(ex, q, x, err, false)
+		s.mu.Unlock()
+	}
 	if errors.Is(err, ErrSideTalk) {
 		// A reply to Wispr's own question that the Concierge took for side
 		// talk: it said nothing, and the exchange closes with no sorry and no
@@ -2547,6 +2697,9 @@ func (s *Supervisor) finish(ex *exchange, sessionID string) bool {
 		}
 	}
 	played := unplayed == nil
+	// The speaker's queued speech events first, so the question log has the
+	// start of a speech whose report still waits (openQuestion.firstAudio).
+	s.cfg.Speaker.FlushSpeech()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.ex != ex || ex.ended {
@@ -2571,6 +2724,7 @@ func (s *Supervisor) finish(ex *exchange, sessionID string) bool {
 		// stop does first; the error sound begins on the new chime input
 		// the cut just opened.
 		s.logf("voice: the answer did not play to its end: %v", unplayed)
+		ex.endedAs = OutcomeFailed
 		s.endLocked(ex, ex.answer != nil, "the voice did not finish")
 		s.exErrorLocked(ex, sessionID)
 		return false
@@ -2580,8 +2734,10 @@ func (s *Supervisor) finish(ex *exchange, sessionID string) bool {
 }
 
 // followUpLocked keeps ex open after Wispr's answer for FollowUpWait: an
-// utterance in it is the next turn, with no wake phrase (R10).
+// utterance in it is the next turn, with no wake phrase (R10). The answer
+// played to its end: the question log has its turn.
 func (s *Supervisor) followUpLocked(ex *exchange) {
+	s.settleQuestionsLocked(ex, "", nil)
 	ex.followUp = true
 	ex.followUpTurn = !ex.askedBack // an answer to Wispr's own question needs none
 	ex.answering = false
@@ -2969,6 +3125,22 @@ func (s *Supervisor) endLocked(ex *exchange, cut bool, reason string) {
 	if ex.x.SessionID == "" && len(ex.unsent) > 0 {
 		s.logf("voice: the exchange ended before its recording session (start %d) settled; its %d held timing lines name no session, as its session is unknown", ex.openSeq+1, len(ex.unsent))
 	}
+	// The question log's turn ends with ex: cut by a stop, a barge-in or the
+	// meeting's end, unless a never mind or a failure ended it (endedAs). An
+	// answer of a driving voice that no speech of its own played, at an end
+	// with no cut, as the follow-up window's, is unconfirmed: nothing failed,
+	// and nothing shows it was spoken (answerSpeechLocked).
+	how := ex.endedAs
+	if how == "" && silence {
+		how = OutcomeStopped
+	}
+	for _, q := range slices.Clone(ex.questions) {
+		cut := how
+		if cut == "" && ex.drives && q.answered && !q.playing {
+			cut = OutcomeUnconfirmed
+		}
+		s.settleQuestionLocked(ex, q, cut)
+	}
 	ex.ended = true
 	s.roomChangedLocked(ex) // a delegation waiting for a final ends its wait
 	if ex.unbindMeeting != nil {
@@ -3133,6 +3305,13 @@ func (s *Supervisor) onSpeech(e *audio.SpeechEvent) {
 	// late report of an ended exchange's speech carries only its spoken.
 	if !e.Started || ex.ended {
 		return
+	}
+	// A start reported late, of a speech begun before the turn was asked, is
+	// no audio of its answer.
+	for _, q := range ex.questions {
+		if q.firstAudio.IsZero() && !e.At.Before(q.q.AskedAt) {
+			q.firstAudio = e.At
+		}
 	}
 	if !ex.turnAt.IsZero() && !ex.firstOutDone {
 		ex.firstOutDone = true
@@ -3436,13 +3615,25 @@ func (s *Supervisor) claimOf(ex *exchange) func(turn, revision uint64) bool {
 		if len(spans) == 0 || words == "" {
 			return false
 		}
-		for _, sp := range spans {
-			ex.owned[sp.final].sent = sp.from
+		var span [2]time.Time // when the claimed words were said, for the question log
+		for i, sp := range spans {
+			own := &ex.owned[sp.final]
+			own.sent = sp.from
+			if i == 0 || own.from.Before(span[0]) {
+				span[0] = own.from
+			}
+			if i == 0 || own.end.After(span[1]) {
+				span[1] = own.end
+			}
 		}
 		if ex.claimedWords == nil {
 			ex.claimedWords = map[string]int{}
 		}
 		ex.claimedWords[words]++
+		if ex.claimedSpans == nil {
+			ex.claimedSpans = map[string][][2]time.Time{}
+		}
+		ex.claimedSpans[words] = append(ex.claimedSpans[words], span)
 		ex.lastAsked = words
 		s.roomChangedLocked(ex)
 		return true
@@ -3456,6 +3647,7 @@ func (s *Supervisor) claimOf(ex *exchange) func(turn, revision uint64) bool {
 type ownedFinal struct {
 	turn    uint64
 	seq     uint64
+	from    time.Time // when its words began, by capture, for the question log
 	end     time.Time // when its words ended, as Deepgram timed them
 	arrived time.Time // when the final reached the Supervisor
 	text    string
@@ -4088,6 +4280,11 @@ type exchangeTools struct {
 // sorry, and plays the error sound: the voice says nothing of its own.
 func (t exchangeTools) Run(ctx context.Context, c ToolCall) (json.RawMessage, error) {
 	s := t.s
+	// The Concierge's calls end with the exchange, whatever context the
+	// vendor's call came with: a stop ends them at once (R10).
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	defer context.AfterFunc(t.ex.ctx, cancel)()
 	s.mu.Lock()
 	s.sessionLocked(t.ex)
 	x := t.ex.x
@@ -4124,6 +4321,13 @@ func (t exchangeTools) Run(ctx context.Context, c ToolCall) (json.RawMessage, er
 	if err := json.Unmarshal(c.Args, &args); err != nil {
 		return nil, errors.New("answer tool: arguments are not an AnswerArgs object")
 	}
+	// Whether the turn is a follow-up or a reply to the voice's own question
+	// rests on the voice's speeches before it: those whose transcript was not
+	// read yet are judged first (judgeSpokenLocked). A stop or the
+	// exchange's end ends the wait.
+	if err := t.awaitSpokenJudged(ctx); err != nil {
+		return nil, err
+	}
 	side, turn := t.followUpTurn(ctx)
 	if side {
 		// Side talk in the follow-up window: no voice answers it, and the
@@ -4144,12 +4348,24 @@ func (t exchangeTools) Run(ctx context.Context, c ToolCall) (json.RawMessage, er
 	// (Exchange.Reply): an endpoint inside a statement leaves the turn only
 	// its end, "can wait" of "okay, ABC-12 can wait", and the Concierge
 	// decides on the whole reply whether it is side talk.
+	vendor := args.Question // the vendor's wording, for the question log
 	reply, askedBack, err := t.replyTurn(ctx)
 	switch {
 	case err != nil:
 		return nil, err
 	case askedBack && reply == "":
+		// Side talk after Wispr's question, which the question log keeps.
 		s.mu.Lock()
+		if t.ex.ended {
+			s.mu.Unlock()
+			return nil, errExchangeEnded
+		}
+		heard, taken := s.pastTakeBack(turn)
+		if taken {
+			vendor = ""
+		}
+		x.Asked = heard
+		s.answeredLocked(t.ex, s.openQuestionLocked(t.ex, heard, vendor, time.Now(), time.Time{}, time.Time{}), &x, ErrSideTalk, true)
 		s.endLocked(t.ex, false, "side talk after Wispr's question")
 		s.mu.Unlock()
 		return json.Marshal(AnswerResult{})
@@ -4162,12 +4378,22 @@ func (t exchangeTools) Run(ctx context.Context, c ToolCall) (json.RawMessage, er
 	// The turn as heard by now: a follow-up's final may have come while
 	// followUpTurn waited for it.
 	s.mu.Lock()
+	// A stop, a never mind or the exchange's end before now answers nothing
+	// more: the call gets no question, its words go nowhere, and the
+	// Concierge is not called. Read with the question's opening, under one
+	// lock, after every wait for the room's words (Sol's review of #195).
+	if t.ex.ended {
+		s.mu.Unlock()
+		return nil, errExchangeEnded
+	}
 	x = t.ex.x
 	// The room's recent words as they are now, aged, and cut by the one
 	// parse over the retained segments (modelViewLocked): the exchange's
 	// copy is as old as the exchange (Sol's eleventh review of #191).
 	x.Recent = s.recentLocked()
 	x = s.modelViewLocked(t.ex, &x)
+	var span [2]time.Time // when the words of a claimed request were said
+	claimed := false
 	if n := t.ex.claimedWords[args.Question]; n > 0 && !askedBack {
 		// A claimed request (Exchange.Claim): the words it committed are the
 		// turn the Concierge answers. The room's current turn can be a later
@@ -4180,7 +4406,41 @@ func (t exchangeTools) Run(ctx context.Context, c ToolCall) (json.RawMessage, er
 		} else {
 			t.ex.claimedWords[args.Question] = n - 1
 		}
+		claimed = true
+		if spans := t.ex.claimedSpans[args.Question]; len(spans) > 0 {
+			span, t.ex.claimedSpans[args.Question] = spans[0], spans[1:]
+			if len(spans) == 1 {
+				delete(t.ex.claimedSpans, args.Question)
+			}
+		}
 	}
+	// The question log's row of the turn: the room's words the Concierge
+	// answers, never those the room took back, and when they were said: a
+	// claimed request's committed words, with the span the claim kept (a
+	// later turn's words may have come since); the reply to Wispr's
+	// question; the turn (AskerTurn, past its last take-back); else the
+	// turn heard. A turn that took words back keeps no vendor's wording,
+	// which may hold them. The Concierge tells the words it read
+	// (Exchange.Asked).
+	heard := turn
+	switch {
+	case claimed:
+		heard = args.Question
+	case askedBack:
+		if cut, taken := s.pastTakeBack(replyOf(t.ex)); taken {
+			heard, vendor = cut, ""
+		} else {
+			heard = reply
+		}
+	default:
+		if _, taken := s.pastTakeBack(finalsOf(t.ex)); taken {
+			heard, vendor = x.AskerTurn, ""
+		} else if strings.TrimSpace(x.AskerTurn) != "" {
+			heard = x.AskerTurn
+		}
+	}
+	x.Asked = heard
+	q := s.openQuestionLocked(t.ex, heard, vendor, time.Now(), span[0], span[1])
 	// A handed turn's words are no later answer's: a vendor that asks again
 	// before the room's next words would get them, and a take-back in them
 	// would cut its new question (Sol's tenth review of #191). They stay
@@ -4226,7 +4486,20 @@ func (t exchangeTools) Run(ctx context.Context, c ToolCall) (json.RawMessage, er
 	t.ex.saidMu.Lock()
 	lines, anySaid, l, firstFact := append([]string(nil), said...), spoken || len(said) > 0, lead, factAt
 	t.ex.saidMu.Unlock()
-	if l != nil && !t.played(l) {
+	leadPlayed := l != nil && t.played(l)
+	// answered gives the question log the Concierge's answer, and the lines
+	// the voice was given for it: the line spoken at once first, then
+	// spoken; silent says the voice was given nothing more to say.
+	answered := func(err error, spoken []string, silent bool) {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		if leadPlayed {
+			q.said = append(q.said, l.text)
+		}
+		q.said = append(q.said, spoken...)
+		s.answeredLocked(t.ex, q, &x, err, silent)
+	}
+	if l != nil && !leadPlayed {
 		// Main's rule on gap H: R5's line naming the issue a search chose
 		// (Lead) always leads; a routing line that never played is dropped
 		// when the answer's first fact was ready within leadLineDropWithin of
@@ -4247,6 +4520,7 @@ func (t exchangeTools) Run(ctx context.Context, c ToolCall) (json.RawMessage, er
 		}
 	}
 	if errors.Is(err, ErrSideTalk) {
+		answered(err, nil, true)
 		// Side talk after Wispr's own question: as side talk in the
 		// follow-up window, no voice answers it, and the window closes (R10).
 		// The vendor gets no words to say.
@@ -4264,19 +4538,23 @@ func (t exchangeTools) Run(ctx context.Context, c ToolCall) (json.RawMessage, er
 			if !anySaid {
 				lines = []string{sorryLine}
 			}
+			answered(err, lines, false)
 			for _, line := range lines {
 				if sayErr := t.speak(ctx, line, Ack); sayErr != nil {
 					s.logf("voice: speak the Concierge's line for a failed answer: %v", sayErr)
 					break
 				}
 			}
+		} else {
+			answered(err, nil, true)
 		}
 		return nil, err
 	}
+	answered(nil, lines, len(lines) == 0)
 	if len(lines) > 0 {
 		s.mu.Lock()
 		t.ex.askedBack, t.ex.voiceAsked = isQuestion(lines[len(lines)-1]), false
-		t.ex.unspokenAnswer = true // until the voice's speech starts
+		t.ex.unspokenAnswer, t.ex.unspokenSince = true, time.Now() // until the voice's audio plays after it
 		s.mu.Unlock()
 	}
 	return json.Marshal(AnswerResult{Say: strings.Join(lines, " "), IssueKey: x.IssueKey})

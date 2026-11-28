@@ -317,14 +317,16 @@ func TestWALEraseCoversVoiceTasks(t *testing.T) {
 	assertDatabaseFilesLack(t, path, secret, kept)
 }
 
-// TestSegmentDeleteLeavesNoVoiceText (c-record): the voice keeps no words of
-// the room, so once a segment is deleted no table holds its words; the
-// session's question keeps only the agent's written answer.
+// TestSegmentDeleteLeavesNoVoiceText (c-record): once a segment is deleted
+// no table holds its words, the question log's row of a question heard in it
+// included; the session's question to an agent keeps only the agent's
+// written answer.
 func TestSegmentDeleteLeavesNoVoiceText(t *testing.T) {
 	store := newTestSQLiteStore(t)
-	segmentTestSession(t, store, "s")
+	started, _ := segmentTestSession(t, store, "s")
 	revision, segments := publishRefinedSegmentTestSession(t, store, "s", "recording.mp3", "b")
 	askVoiceTask(t, store, "task", "s", "the agent's written answer")
+	askVoiceQuestion(t, store, "s", "private deletion token", started.Add(2*time.Second), started.Add(4*time.Second))
 	span := DeletedSpan{AudioPath: "recording.mp3", Start: 2, End: 4, SHA256Before: "b", SHA256After: "a"}
 	if err := store.DeleteRefinedSegmentAudio("s", segments[1].ID, revision, &span); err != nil {
 		t.Fatalf("DeleteRefinedSegmentAudio: %v", err)

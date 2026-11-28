@@ -217,6 +217,9 @@ type voiceDeps struct {
 	// final segments, and how each raised hand came down.
 	segment  func(*voice.Segment)
 	handDone func(*voice.Hand, voice.HandOutcome)
+	// question is the question log: each turn the Concierge handled
+	// (recordQuestion); nil keeps none.
+	question func(*voice.Question)
 }
 
 // waitingLED is the voice's waiting light on the blink(1)'s LED 2, which
@@ -255,6 +258,7 @@ func startVoice(deps *voiceDeps) error {
 		Tap:            deps.tap,
 		Segment:        deps.segment,
 		HandDone:       deps.handDone,
+		Question:       deps.question,
 		Timing:         deps.timing,
 		Logf:           log.Printf,
 	})

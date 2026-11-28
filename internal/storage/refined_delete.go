@@ -37,12 +37,25 @@ func (s *SQLiteStore) deleteUntimedSegmentText(sessionID string, segmentID int64
 	if session.Status == SessionActive {
 		return ErrSegmentSessionActive
 	}
-	var untimedSourceID string
-	if err := tx.QueryRow(`SELECT untimed_source_id FROM segments WHERE id = ? AND session_id = ? AND untimed = 1`, segmentID, sessionID).Scan(&untimedSourceID); err != nil {
+	var untimedSourceID, stored string
+	if err := tx.QueryRow(`SELECT untimed_source_id, timestamp FROM segments WHERE id = ? AND session_id = ? AND untimed = 1`, segmentID, sessionID).Scan(&untimedSourceID, &stored); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return ErrSegmentNotFound
 		}
 		return fmt.Errorf("read untimed segment %d: %w", segmentID, err)
+	}
+	// An untimed segment holds when its live result was stored, after its
+	// words. It keeps no capture time, and its words can have been said long
+	// before, even before its source session's recording began, as words of
+	// audio the transcriber replays after an outage are: every question of
+	// its source session heard up to the time it was stored goes with it.
+	storedAt, err := time.Parse(time.RFC3339Nano, stored)
+	if err != nil {
+		return fmt.Errorf("read untimed segment %d's time: %w", segmentID, err)
+	}
+	questionsOf := untimedSourceID
+	if questionsOf == "" {
+		questionsOf = sessionID
 	}
 	if _, err := tx.Exec(`DELETE FROM segments WHERE id = ? AND session_id = ? AND untimed = 1`, segmentID, sessionID); err != nil {
 		return fmt.Errorf("remove untimed segment %d: %w", segmentID, err)
@@ -99,6 +112,9 @@ func (s *SQLiteStore) deleteUntimedSegmentText(sessionID string, segmentID int64
 	}
 	owners, err := dropDerivedText(tx, sessionID, sources, "untimed deletion")
 	if err != nil {
+		return err
+	}
+	if err := eraseQuestionsHeardIn(tx, []string{questionsOf}, time.Time{}, storedAt); err != nil {
 		return err
 	}
 	owed, earlierOwed, err := recordOwedErase(tx)
@@ -223,6 +239,9 @@ func (s *SQLiteStore) deleteRefinedSegment(sessionID string, segmentID int64, re
 	}
 	owners, err := dropDerivedText(tx, sessionID, sources, "merged deletion")
 	if err != nil {
+		return err
+	}
+	if err := eraseQuestionsHeardInRecording(tx, sessionID, selected.RecordingPath, selected.RecordingSHA256, selected.Start, selected.End, owners); err != nil {
 		return err
 	}
 	if keepAudio {

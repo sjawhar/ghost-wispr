@@ -33,6 +33,7 @@ import (
 	"github.com/gorilla/websocket"
 
 	"github.com/sjawhar/ghost-wispr/internal/audio"
+	"github.com/sjawhar/ghost-wispr/internal/config"
 	"github.com/sjawhar/ghost-wispr/internal/logging"
 	"github.com/sjawhar/ghost-wispr/internal/openaiwif"
 	"github.com/sjawhar/ghost-wispr/internal/providererr"
@@ -153,8 +154,10 @@ type Voice struct {
 }
 
 var (
-	_ voice.Voice      = (*Voice)(nil)
-	_ voice.TurnDriver = (*Voice)(nil)
+	_ voice.Voice        = (*Voice)(nil)
+	_ voice.TurnDriver   = (*Voice)(nil)
+	_ voice.NamedEngine  = (*Voice)(nil)
+	_ voice.EventCounter = (*session)(nil)
 )
 
 // New makes voice B.
@@ -175,6 +178,9 @@ func New(cfg Config) (*Voice, error) {
 // DrivesTurn reports that GPT-Live drives the turn: it decides when to
 // answer and delegates to the Concierge's answer tool.
 func (v *Voice) DrivesTurn() bool { return true }
+
+// Engine names voice B as voice.engine does (voice.NamedEngine).
+func (v *Voice) Engine() string { return config.VoiceEngineGPTLive }
 
 // Open connects to GPT-Live and starts a session for x. It returns once the
 // session has started, so x's tap audio, which it keeps from the start,
@@ -263,10 +269,12 @@ type session struct {
 	wg sync.WaitGroup
 
 	// evQueue holds events for forward to hand to Events, so a slow reader
-	// of Events never stops the socket's reader, and with it the speech.
-	evMu    sync.Mutex
-	evQueue []voice.Event
-	evWake  chan struct{}
+	// of Events never stops the socket's reader, and with it the speech;
+	// evQueued counts every event queued (EventsQueued).
+	evMu     sync.Mutex
+	evQueue  []voice.Event
+	evQueued uint64
+	evWake   chan struct{}
 
 	writeMu sync.Mutex
 	dead    atomic.Bool // the connection is closed
@@ -674,8 +682,17 @@ func (s *session) lostErr() error {
 func (s *session) emit(e *voice.Event) {
 	s.evMu.Lock()
 	s.evQueue = append(s.evQueue, *e)
+	s.evQueued++
 	s.evMu.Unlock()
 	signal(s.evWake)
+}
+
+// EventsQueued counts the events emit has queued for Events, which forward
+// hands on in order (voice.EventCounter).
+func (s *session) EventsQueued() uint64 {
+	s.evMu.Lock()
+	defer s.evMu.Unlock()
+	return s.evQueued
 }
 
 // forward hands queued events to Events, in order, until the session closes.

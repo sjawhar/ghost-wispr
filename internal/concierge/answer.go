@@ -157,9 +157,12 @@ var errSideTalk = fmt.Errorf("concierge: %w", voice.ErrSideTalk)
 // a read, a lookup or the ask, the voice says so and the error wraps
 // voice.ErrUnreachable, for R10's error sound. A reply to "Did you mean …?"
 // that picks nothing and asks nothing is side talk: the voice says nothing
-// and the error wraps voice.ErrSideTalk. An answer, and an ask it leaves
-// running, is work Stop waits for; after Stop, Answer answers nothing and its
-// error wraps voice.ErrUnreachable.
+// and the error wraps voice.ErrSideTalk. Before it returns, it sets
+// x.Outcome to how the turn ended, for the question log, and x.Asked to the
+// room's words it read when it read them past a take-back or as the whole
+// reply. An answer, and an ask it leaves running, is work Stop waits for;
+// after Stop, Answer answers nothing and its error wraps
+// voice.ErrUnreachable.
 func (c *Concierge) Answer(parent context.Context, x *voice.Exchange, turn string, say voice.SayFunc) error {
 	work, leave, ok := c.enter(parent)
 	if !ok {
@@ -189,6 +192,7 @@ func (c *Concierge) answer(parent context.Context, x *voice.Exchange, turn strin
 	defer cancel()
 	// From now, the read-ahead reads nothing more for this turn.
 	c.answerBegins(x)
+	x.Outcome = "" // set below; an error tells side talk and an outage
 	// One reading of the project list decides the turn (projectsView), never
 	// waiting for it.
 	view := c.viewProjects()
@@ -229,6 +233,11 @@ func (c *Concierge) answer(parent context.Context, x *voice.Exchange, turn strin
 	offer, offered := c.pendingOffer(x)
 	reply := roomFinals(x, turn)
 	said := view.replyText(reply)
+	// The question log keeps the room's words this answer reads, never
+	// those a take-back cancelled (voice.Exchange.Asked).
+	if takesItBack(reply) {
+		x.Asked = said
+	}
 	if offered && offer.sideTalkOn(view, said) {
 		c.dropPick(x)
 		c.logger.Info("concierge took a reply to its own question for side talk: it picks nothing, says no key and asks nothing, or takes itself back")
@@ -243,7 +252,7 @@ func (c *Concierge) answer(parent context.Context, x *voice.Exchange, turn strin
 	case takesItBack(reply):
 		turn = said
 	case offered && strings.TrimSpace(x.Reply) != "" && offer.readsReply(view, turn, said):
-		turn = said
+		turn, x.Asked = said, said
 	}
 	// A key said letter by letter is read here, once, so the pick, the
 	// routing line, the search and the ask all see it.
@@ -272,6 +281,23 @@ func (c *Concierge) answer(parent context.Context, x *voice.Exchange, turn strin
 			}
 		}
 	}()
+	// How the turn ended, as the Concierge saw it, for the question log
+	// (voice.Exchange.Outcome): the question sent to the holder; else a
+	// question the answer asked last; else a pick, a key said for "What is
+	// its key?" or a no to the offer; else an answer.
+	var askStarted atomic.Bool
+	outcome := voice.OutcomeAnswered
+	defer func() {
+		said := sp.said()
+		switch {
+		case askStarted.Load():
+			x.Outcome = voice.OutcomeAskedAgent
+		case len(said) > 0 && strings.HasSuffix(strings.TrimSpace(said[len(said)-1]), "?"):
+			x.Outcome = voice.OutcomeAskedBack
+		default:
+			x.Outcome = outcome
+		}
+	}()
 	switch {
 	case ok && picked == "":
 		// A declined offer's reads are dropped, as an answer's are
@@ -280,10 +306,12 @@ func (c *Concierge) answer(parent context.Context, x *voice.Exchange, turn strin
 		// took it through AskerTurn and asked its holder (Sol's review
 		// of #194 at e5cf4d6, R6). Main does so for a key of two digits.
 		c.takeAheadSearches(x)
+		outcome = voice.OutcomeNeverMind
 		return sp.sayText(ctx, "Okay.", voice.Ack)
 	case ok:
-		turn, target = offer.turn, "keys:"+picked
+		turn, target, outcome = offer.turn, "keys:"+picked, voice.OutcomePicked
 	case offered && saysKey(turn):
+		outcome = voice.OutcomePicked
 		var done bool
 		var err error
 		if target, done, err = c.takeKey(ctx, x, view, offer.turn, turn, sp); done {
@@ -296,7 +324,6 @@ func (c *Concierge) answer(parent context.Context, x *voice.Exchange, turn strin
 	// is known, before the rest of the record is read (R7).
 	asking := make(chan askResult, 1)
 
-	var askStarted atomic.Bool
 	var askingKey atomic.Pointer[string]
 	startAsk := func(session string, found *reading) {
 		if askStarted.CompareAndSwap(false, true) {
