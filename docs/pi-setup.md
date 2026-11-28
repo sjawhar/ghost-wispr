@@ -278,9 +278,12 @@ restarts the recorder, and a restart ends a conversation that is being recorded.
    that shows its journal, `sudo journalctl -u <unit>.service -n 20`, but not the journal's lines:
    the join's hold the lines of `tailscale up`, its login URL among them. Then it resets the unit
    with `systemctl reset-failed`, which leaves its journal, and says so. A run copies no unit's
-   lines, and no output of a tailscale command, into its own: both can hold a login URL of
-   Tailscale, such as the one `tailscale serve` prints when the device is logged out. It says how a
-   unit ended and names the command that reads its lines. To end a run, and its join, run
+   lines into its own output: they can hold a login URL of Tailscale, such as the one
+   `tailscale serve` prints when the device is logged out. It says how a unit ended and names the
+   command that reads its lines. Of what tailscale answers it prints only the device's tailnet
+   name and, of Serve's setting, the ports, paths and kinds of handler, never a handler's text,
+   redirect, proxy target or file path: `sudo tailscale serve status` shows the whole setting. To
+   end a run, and its join, run
    `sudo systemctl stop ghost-wispr-provision ghost-wispr-provision-join`, which ends every
    process in the run's unit, its control group, and makes the run fail (exit 143); a root process
    that moves itself to another unit leaves that boundary. An SSH session that ends does not
@@ -333,7 +336,8 @@ restarts the recorder, and a restart ends a conversation that is being recorded.
      `serve.conf` does not hold. From the reset until the last line is applied, the page and
      `/call` are not served. A kill of `provision.sh` or a lost SSH session does not stop the unit,
      so the apply still ends. When the unit fails or does not end in time, `provision.sh` prints
-     `Serve is now [<lines>]`, or `[none]` when the page is not served, and the command to run.
+     `Serve is now [<port> "<path>" <kind>;...]`, or `[none]` when the page is not served, and the
+     command to run.
      When every try failed, or the Pi lost power during the apply, Serve stays empty, and only
      another run of `./provision.sh` puts it back: the nightly update never changes Serve, and
      check 7 of `check-deploy.sh` fails with `have none` and names that command. Then

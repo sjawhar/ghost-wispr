@@ -545,11 +545,14 @@ serve_status_json() {
 # it. When the unit fails or does not end in time, it says what Serve is now
 # and the command to run. Of the unit it prints only how it ended, its exit, and the command that
 # reads its lines, never the lines: tailscale serve prints a login URL when the node is logged out
-# (GPT-6.1 Sol's review of #208, round 2). Then it reads Serve again, as the nightly drift
-# check reads it (pi-lib.sh's serve_lines_from_status), and fails unless it is serve.conf's. It
-# changes nothing in Serve when it cannot read the device's name or Serve.
+# (GPT-6.1 Sol's review of #208, round 2). Of Serve's setting it prints only each port, path and
+# kind of handler (serve_lines_from_status's shape), never a handler's text, redirect, proxy target
+# or file path, which are what someone set in Serve (round 3), and names the command that shows the
+# whole setting. Then it reads Serve again, as the nightly drift check reads it, and fails unless it
+# is serve.conf's. It changes nothing in Serve when it cannot read the device's name or Serve.
 apply_serve() {
-  local self name live have state unit limit now result status=0
+  local self name live have shape state unit limit now result status=0
+  local whole='read the whole setting with: sudo tailscale serve status'
   if ! self=$(timeout --kill-after=5s "${TAILSCALE_CALL_TIMEOUT}s" tailscale status --self --json 2>/dev/null) \
     || ! name=$(device_tailnet_name "$self"); then
     fail "could not read this device's tailnet name (tailscale status --self --json), for which Serve must be serve.conf's: nothing in Serve was changed"
@@ -561,14 +564,15 @@ apply_serve() {
       printf "ghost-wispr provision: Tailscale Serve is serve.conf's already for %s\n" "$name"
       return 0
     fi
-    state=${have:-none}
+    shape=$(serve_lines_from_status "$live" "$name" shape) || shape=''
+    state="[${shape:-none}]"
   else
     state="a setting it cannot read, such as a TCP forward or Funnel"
   fi
   unit="ghost-wispr-serve-$RUN_ID"
   limit=$((10 + (TAILSCALE_CALL_TIMEOUT + 5) * (2 + 4 * ${#serve_words[@]} / 2) + 3 * 2 + 30))
-  printf "ghost-wispr provision: Tailscale Serve for %s is [%s], not serve.conf's: resetting it and applying serve.conf in %s, a unit of its own, which finishes the apply even if this run or its SSH session ends\n" \
-    "$name" "$(paste -sd ';' <<<"$state")" "$unit"
+  printf "ghost-wispr provision: Tailscale Serve for %s is %s, not serve.conf's (%s): resetting it and applying serve.conf in %s, a unit of its own, which finishes the apply even if this run or its SSH session ends\n" \
+    "$name" "$(paste -sd ';' <<<"$state")" "$whole" "$unit"
   install_serve_apply
   sudo systemd-run --wait --quiet --collect --expand-environment=no --unit="$unit" --property=RuntimeMaxSec="$limit" \
     /bin/sh "$SERVE_APPLY" "$STATUS_URL" "${serve_words[@]}" </dev/null || status=$?
@@ -581,11 +585,11 @@ apply_serve() {
     fail "the recorder records a conversation, holds a call or gives no status, so Serve was not reset and nothing in Serve was changed; its journal says why: sudo journalctl -u $unit.service. Run provision.sh again when no conversation is recorded and no call is live"
   fi
   if ((status != 0)); then
-    if live=$(serve_status_json) && now=$(serve_lines_from_status "$live" "$name"); then
+    if live=$(serve_status_json) && now=$(serve_lines_from_status "$live" "$name" shape); then
       if [[ -z $now ]]; then
         now='Serve is now [none], so the page is not served'
       else
-        now="Serve is now [$(paste -sd ';' <<<"$now")], not serve.conf's"
+        now="Serve is now [$(paste -sd ';' <<<"$now")], not serve.conf's ($whole)"
       fi
     else
       now='Serve cannot be read now, so the page may not be served'
@@ -595,9 +599,11 @@ apply_serve() {
   live=$(serve_status_json) \
     || fail "could not read Tailscale Serve's setting (tailscale serve status --json) after provision.sh applied serve.conf"
   have=$(serve_lines_from_status "$live" "$name") \
-    || fail "Tailscale Serve holds a part that provision.sh cannot read after it reset Serve and applied serve.conf: read it with tailscale serve status"
-  [[ $have == "$serve_lines" ]] \
-    || fail "Tailscale Serve's setting is not serve.conf's after provision.sh applied it: want [$(paste -sd ';' <<<"$serve_lines")], have [$(paste -sd ';' <<<"$have")]"
+    || fail "Tailscale Serve holds a part that provision.sh cannot read after it reset Serve and applied serve.conf: $whole"
+  if [[ $have != "$serve_lines" ]]; then
+    shape=$(serve_lines_from_status "$live" "$name" shape) || shape=''
+    fail "Tailscale Serve's setting is not serve.conf's after provision.sh applied it: want [$(paste -sd ';' <<<"$serve_lines")], have [$(paste -sd ';' <<<"${shape:-none}")] ($whole)"
+  fi
 }
 
 # refuse_overrides WHERE HOW NAMES: fails while NAMES, the variables of PI_LIB_CONFIG_FILE_VARIABLE
@@ -961,6 +967,12 @@ if jq -e --arg hostname "$TAILSCALE_HOSTNAME" '
 fi
 
 readonly token_audience="api.tailscale.com/$PI_TAILNET_CLIENT_ID"
+# google-id-token prints the token alone on its standard output, which stays in id_token. Its error
+# output reaches the run's output: it is the one line that says why the join cannot start (a
+# certificate that no longer signs in, say), and it holds neither a token nor any part of what
+# Google answered (internal/googleauth: impersonationError keeps only the status and the code,
+# TestARefusedIDTokenQuotesNothingIAMSent; TestNoCredentialLogsItsTokenAtSDKDebug). The run's unit
+# gets no GOOGLE_SDK_GO_LOGGING_LEVEL from its caller (PI_LIB_PROVISION_SETTINGS).
 id_token=$(env \
   GOOGLE_API_USE_CLIENT_CERTIFICATE=false \
   "$DEPLOY_DIR/ghost-wispr" google-id-token --credentials "$DEPLOY_DIR/google-credentials.json" --audience "$token_audience")

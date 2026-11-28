@@ -101,13 +101,14 @@ export TEST_LOG="$work_dir/log" TEST_UID="$uid" TEST_RUNTIME_DIR="$runtime_dir" 
 mkdir -p -- "$bin" "$join" "$first_join" "$TEST_RELEASES" "$system_units"
 
 # unit_pids SID... prints the PID of each process of the sessions SID... that is this test's, whose
-# environment holds this test's TEST_LOG: a session ID that the system has since given to another
-# session is not this test's, and none of its processes is printed.
+# environment holds this test's TEST_LOG, compared as text: a session ID that the system has since
+# given to another session is not this test's, and none of its processes is printed. As a pattern,
+# the "." of a temporary path would match any character (GPT-6.1 Sol's review of #208, round 3).
 unit_pids() {
   local pid sid
   while read -r pid sid; do
     [[ " $* " == *" $sid "* ]] || continue
-    if grep -qzx -- "TEST_LOG=$TEST_LOG" "/proc/$pid/environ" 2>/dev/null; then
+    if grep -qzxF -- "TEST_LOG=$TEST_LOG" "/proc/$pid/environ" 2>/dev/null; then
       printf '%s\n' "$pid"
     fi
   done < <(ps -eo pid=,sid=)
