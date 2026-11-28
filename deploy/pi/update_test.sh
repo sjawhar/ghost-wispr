@@ -424,8 +424,8 @@ cat >"$bin/sudo" <<'EOF'
 # type one. It runs install for real, into GHOST_WISPR_SYSTEM_ROOT alone, and tailscale (the fake),
 # and logs every call with the timeout it runs under, udevadm with the udev rule it would read, the
 # logind restart with the logind setting, and the journald restart and the journal's flush with the
-# journald setting, in $TEST_STATE/sudo.log. The journald restart, the flush and journalctl's read
-# of journald's usage line go to the fake journald ($TEST_FAKES/journald, state in
+# journald setting, in $TEST_STATE/sudo.log. The journald restart, the flush, the rotation and
+# journalctl's read of journald's usage line go to the fake journald ($TEST_FAKES/journald, state in
 # $TEST_STATE/journald). Each udevadm call, each restart and each flush is the event
 # "system-reload". Each line of $TEST_STATE/fail-sudo names a call, as its log line names it after
 # the timeout (such as "udevadm control --reload"): the call the first line names fails, and that
@@ -494,6 +494,10 @@ case ${1:-} in
         "$(sum "$system_root/etc/systemd/journald.conf.d/90-ghost-wispr.conf")" >>"$state/sudo.log"
       "${TEST_FAKES:?}/journald" "$state/journald" flush
       "${TEST_FAKES:?}/after" system-reload
+    elif [[ ${*:2} == --rotate ]]; then
+      made_to_fail 'journalctl --rotate'
+      printf 'timeout=%s journalctl --rotate\n' "$under" >>"$state/sudo.log"
+      "${TEST_FAKES:?}/journald" "$state/journald" rotate
     else
       printf 'timeout=%s journalctl %s\n' "$under" "${*:2}" >>"$state/sudo.log"
       exec "${TEST_FAKES:?}/journald" "$state/journald" usage "${@:2}"
@@ -1867,6 +1871,13 @@ restarted_journald() {
   awk '/restart systemd-journald/ { r = NR } /journalctl --flush/ { f = NR } END { exit !(r && f && r < f) }' "$state/sudo.log" \
     || fail "$1: journald did not restart before the journal's flush: $(<"$state/sudo.log")"
 }
+# rotated_journald WHAT: this run asked journald to rotate once, and neither restarted journald nor
+# flushed the journal.
+rotated_journald() {
+  if [[ $(grep -c 'journalctl --rotate' "$state/sudo.log") != 1 ]] || grep -Eq 'restart systemd-journald|journalctl --flush' "$state/sudo.log"; then
+    fail "$1: did not rotate the journal once with no journald restart: $(<"$state/sudo.log")"
+  fi
+}
 
 # Sol's first sequence: ja runs; jb's journald restart succeeds and its flush fails, then the
 # rollback's restarts fail, so the rollback leaves ja's setting installed while journald runs jb's
@@ -1916,15 +1927,34 @@ expect_run "$what" 0 "ghost-wispr update: already current at commit $commit_ja"
 restarted_journald "$what"
 journald_runs "$what"
 
-# The current release, and a journald that has logged no usage line since it started, as one that
-# a person restarted without a flush: the run restarts it.
+# The current release, and a journal that no longer holds journald's usage line, as when journald
+# deleted its oldest files under its cap (GPT-6.1 Sol's review of #209, round 3): a flush asks
+# journald for nothing once the journal is flushed, so the run asks for a rotation, after which
+# journald logs the line; the line matches, and journald is not restarted, which could come during a
+# recording. Break it catches: a run that restarts journald for a line that is missing only.
 new_pi
 install_set ja
-GHOST_WISPR_SYSTEM_ROOT=$root "$fakes/journald" "$state/journald" restart
+GHOST_WISPR_SYSTEM_ROOT=$root "$fakes/journald" "$state/journald" forget
 release=ja run_update
-what='journald-activation (a journald with no usage line)'
+what='journald-activation (no usage line, the setting run)'
 expect_run "$what" 0 "ghost-wispr update: already current at commit $commit_ja"
+rotated_journald "$what"
+journald_runs "$what"
+# The same, with journald on jb's 1G while ja's setting is installed: the rotation's line shows 1G,
+# and the run restarts journald.
+new_pi
+install_set ja
+cp -- "$releases/jb/ghost-wispr-pi-deploy/journald-ghost-wispr.conf" "$(installed_path journald-ghost-wispr.conf)"
+GHOST_WISPR_SYSTEM_ROOT=$root "$fakes/journald" "$state/journald" apply
+cp -- "$releases/ja/ghost-wispr-pi-deploy/journald-ghost-wispr.conf" "$(installed_path journald-ghost-wispr.conf)"
+GHOST_WISPR_SYSTEM_ROOT=$root "$fakes/journald" "$state/journald" forget
+release=ja run_update
+what='journald-activation (no usage line, an older setting run)'
+expect_run "$what" 0 "ghost-wispr update: already current at commit $commit_ja"
+[[ $(grep -c 'journalctl --rotate' "$state/sudo.log") == 1 ]] || fail "$what: did not rotate the journal once: $(<"$state/sudo.log")"
 restarted_journald "$what"
+awk '/journalctl --rotate/ { o = NR } /restart systemd-journald/ { r = NR } END { exit !(o && r && o < r) }' "$state/sudo.log" \
+  || fail "$what: did not rotate before the restart: $(<"$state/sudo.log")"
 journald_runs "$what"
 
 # Sol's fourth sequence, by hand: jb's setting installed and journald restarted on it, then ja's

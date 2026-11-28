@@ -251,8 +251,8 @@ if [[ ${1:-} == -n ]]; then
       fi
       ;;
     journalctl)
-      if [[ ${*:2} == --flush ]]; then
-        exec "$TEST_FAKE_JOURNALD" "$TEST_STATE/journald" flush
+      if [[ ${*:2} == --flush || ${*:2} == --rotate ]]; then
+        exec "$TEST_FAKE_JOURNALD" "$TEST_STATE/journald" "${2#--}"
       fi
       exec "$TEST_FAKE_JOURNALD" "$TEST_STATE/journald" usage "${@:2}"
       ;;

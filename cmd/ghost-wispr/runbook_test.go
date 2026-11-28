@@ -534,16 +534,23 @@ func TestRunbookChecksTheMicDeviceAfterARelease(t *testing.T) {
 // that the Pi's journal outlives a reboot, with the drop-in the nightly update
 // installs, its cap, and the command that reads the recorder's lines of the
 // boot before: sudo journalctl -b -1 with _SYSTEMD_USER_UNIT, since the
-// recorder is ghost-wispr's user unit, which -u ghost-wispr does not match; or
-// if the deploy set's table lacks the journald setting and where it goes.
+// recorder is ghost-wispr's user unit, which -u ghost-wispr does not match;
+// if it does not say that a rotation, sudo -n journalctl --rotate, makes
+// journald log a missing usage line, or still tells a flush to, which asks
+// journald for nothing once the journal is flushed; or if the deploy set's
+// table lacks the journald setting and where it goes.
 func TestRunbookReadsTheLogsOfAnEarlierBoot(t *testing.T) {
 	section := runbookSection(t, "## The Pi's journal")
 	for _, words := range []string{"`/etc/systemd/journald.conf.d/90-ghost-wispr.conf`", "`40-rpi-volatile-storage.conf`",
 		"`Storage=persistent`", "`SystemMaxUse=1G`", "`SystemKeepFree=5G`", "sudo -n journalctl --list-boots",
-		"sudo -n journalctl -b -1 _SYSTEMD_USER_UNIT=ghost-wispr.service", "`-u ghost-wispr`", "check 8"} {
+		"sudo -n journalctl -b -1 _SYSTEMD_USER_UNIT=ghost-wispr.service", "`-u ghost-wispr`", "check 8",
+		"`sudo -n journalctl --rotate`", "starts new journal files"} {
 		if !strings.Contains(section, words) {
 			t.Errorf("the runbook's \"The Pi's journal\" does not say %q", words)
 		}
+	}
+	if strings.Contains(section, "run `sudo -n journalctl --flush` on the Pi") {
+		t.Error("the runbook's \"The Pi's journal\" still has a flush make journald log its usage line")
 	}
 	row := "| `journald-ghost-wispr.conf` | the nightly update | `/etc/systemd/journald.conf.d/90-ghost-wispr.conf` |"
 	if !strings.Contains(readRunbook(t), row) {

@@ -1288,7 +1288,10 @@ new_case 'a usage line of an earlier journald only'
 journald_logs 311 "/var/log/journal/$machine_id" 1073741824 5368709120
 run_driver
 expect_verdicts PASS PASS PASS PASS PASS PASS PASS UNKNOWN
-expect 8 UNKNOWN 'journald (PID 312) has logged no usage line this boot since it started' 'run sudo journalctl --flush on the Pi'
+expect 8 UNKNOWN 'journald (PID 312) has logged no usage line this boot that the journal still holds' \
+  'run sudo -n journalctl --rotate on the Pi' 'starts new journal files'
+[[ $(verdict_line 8) != *'journalctl --flush'* ]] \
+  || fail "check 8 advises a flush, which asks journald for nothing once the journal is flushed: $(verdict_line 8)"
 new_case 'a usage line that reports the journal in /run'
 journald_logs 312 "/run/log/journal/$machine_id" 1073741824 5368709120
 run_driver
